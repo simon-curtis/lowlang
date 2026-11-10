@@ -6,6 +6,8 @@
 go install ./cmd/low
 ```
 
+`go test ./editors/` fails when the lexer has a keyword that a grammar or highlight query does not cover.
+
 ## Grammar
 
 ```sh

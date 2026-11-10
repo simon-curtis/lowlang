@@ -13,6 +13,7 @@ import (
 	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
 	"lowlang/internal/hot"
+	"lowlang/internal/lsp"
 )
 
 const usage = `usage:
@@ -20,7 +21,8 @@ const usage = `usage:
   low run <file.low>
   low asm <file.low>
   low ir <file.low>
-  low dev <file.low>`
+  low dev <file.low>
+  low lsp`
 
 type usageError struct{}
 
@@ -52,6 +54,10 @@ func main() {
 }
 
 func run(ctx context.Context, args []string) error {
+	if len(args) == 1 && args[0] == "lsp" {
+		server := lsp.NewServer(os.Stdin, os.Stdout)
+		return server.Run(ctx)
+	}
 	if len(args) < 2 {
 		return usageError{}
 	}

@@ -26,11 +26,15 @@ type Unit struct {
 var preludeSource []byte
 
 func Analyse(path string) (*Unit, error) {
+	return AnalyseWith(path, os.ReadFile)
+}
+
+func AnalyseWith(path string, read func(name string) ([]byte, error)) (*Unit, error) {
 	prelude, err := parsePrelude()
 	if err != nil {
 		return nil, err
 	}
-	modules, err := load(path)
+	modules, err := load(path, read)
 	if err != nil {
 		return nil, err
 	}

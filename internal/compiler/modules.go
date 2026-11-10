@@ -24,9 +24,10 @@ type loader struct {
 	sources []string
 	edges   map[string][]edge
 	pending []edge
+	read    func(name string) ([]byte, error)
 }
 
-func load(path string) (*loader, error) {
+func load(path string, read func(name string) ([]byte, error)) (*loader, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
@@ -41,7 +42,7 @@ func load(path string) (*loader, error) {
 			return nil, fmt.Errorf("%s: no .low files", path)
 		}
 	}
-	l := &loader{root: root(dir), edges: map[string][]edge{}}
+	l := &loader{root: root(dir), edges: map[string][]edge{}, read: read}
 	if err := l.module("", entry); err != nil {
 		return nil, err
 	}
@@ -102,7 +103,7 @@ func (l *loader) imported(e edge) error {
 func (l *loader) module(path string, files []string) error {
 	l.edges[path] = []edge{}
 	for _, name := range files {
-		file, err := parseFile(name)
+		file, err := l.parseFile(name)
 		if err != nil {
 			return err
 		}
@@ -130,8 +131,8 @@ func (l *loader) link(file *ast.File) error {
 	return nil
 }
 
-func parseFile(name string) (*ast.File, error) {
-	src, err := os.ReadFile(name)
+func (l *loader) parseFile(name string) (*ast.File, error) {
+	src, err := l.read(name)
 	if err != nil {
 		return nil, err
 	}
