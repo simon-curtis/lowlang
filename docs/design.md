@@ -716,7 +716,7 @@ fn main() ! io.Error {
 | `std/os` | `args` and `environment` from `/proc/self/cmdline` and `/proc/self/environ`, `env` as `str?`, `pid` and `exit`. |
 | `std/process` | `Command` with arguments, an optional replacement environment, a working directory, `Inherit`, `Piped` or `Null` for each standard stream, and an optional new process group; `start`, `wait`, `kill`, `run`, which feeds input and collects both outputs, `find`, which searches `PATH`, and `success`. |
 | `std/cdp` | The Chrome DevTools Protocol: `launch` starts a headless Chromium with a disposable profile and connects to it, `call` sends a command to the browser or a session and `events` delivers everything else; `open_page` opens a page in its own browser context whose every request, including those of cross-site frames and workers, passes through `Handlers`; `navigate` and `shutdown`. |
-| `std/base64` | `encode` and `decode`. |
+| `std/base64` | `encode` and `decode`, and `encode_url` and `decode_url` for the URL-safe alphabet without padding (RFC 4648 §5), which reject padding, other alphabets and non-zero trailing bits. |
 
 ### Networking
 
