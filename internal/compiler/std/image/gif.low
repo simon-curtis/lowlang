@@ -1,0 +1,608 @@
+import std/io
+
+pub struct Frame {
+    pub image: Image
+    pub delay_ms: i64
+}
+
+struct GifControl {
+    disposal: i64
+    transparent: i64
+    delay: i64
+}
+
+struct GifReader {
+    data: []u8
+    at: i64
+}
+
+struct Lzw {
+    prefix: []u16
+    first: []u8
+    suffix: []u8
+    length: []u16
+}
+
+fn gif_signature(data: []u8) -> bool {
+    starts_with(data, 0, "GIF87a") || starts_with(data, 0, "GIF89a")
+}
+
+fn gif_need(r: *GifReader, n: i64) ! io.Error {
+    if r.at + n > r.data.len {
+        fail Malformed
+    }
+}
+
+fn gif_byte(r: *GifReader) -> i64 ! io.Error {
+    gif_need(r, 1)?
+    r.at += 1
+    i64(r.data[r.at - 1])
+}
+
+fn gif_u16(r: *GifReader) -> i64 ! io.Error {
+    gif_need(r, 2)?
+    r.at += 2
+    io.le16(r.data, r.at - 2)
+}
+
+fn gif_palette(r: *GifReader, flags: i64) -> []u8 ! io.Error {
+    let count = 1 << ((flags & 7) + 1)
+    gif_need(r, count * 3)?
+    let palette = r.data[r.at..r.at + count * 3]
+    r.at += count * 3
+    palette
+}
+
+fn gif_skip_blocks(r: *GifReader) ! io.Error {
+    for {
+        let n = gif_byte(r)?
+        if n == 0 {
+            return
+        }
+        gif_need(r, n)?
+        r.at += n
+    }
+}
+
+fn gif_blocks(r: *GifReader) -> []u8 ! io.Error {
+    let start = r.at
+    var total = 0
+    for {
+        let n = gif_byte(r)?
+        if n == 0 {
+            break
+        }
+        gif_need(r, n)?
+        r.at += n
+        total += n
+    }
+    let out: []u8 = __make(total)
+    var p = start
+    var o = 0
+    for o < total {
+        let n = i64(r.data[p])
+        __memmove(out[o..o + n], r.data[p + 1..p + 1 + n])
+        o += n
+        p += n + 1
+    }
+    out
+}
+
+fn lzw_tables() -> Lzw {
+    Lzw { prefix: __make(4096), first: __make(4096), suffix: __make(4096), length: __make(4096) }
+}
+
+fn lzw_decode(t: Lzw, data: []u8, min_size: i64, out: []u8) -> i64 ! io.Error {
+    if min_size < 2 || min_size > 11 {
+        fail Malformed
+    }
+    let clear = 1 << min_size
+    let eoi = clear + 1
+    for c in 0..clear {
+        t.prefix[c] = 0
+        t.first[c] = u8(c)
+        t.suffix[c] = u8(c)
+        t.length[c] = 1
+    }
+    var size = min_size + 1
+    var next = clear + 2
+    var prev = -1
+    var bits = 0
+    var count = 0
+    var p = 0
+    var o = 0
+    for o < out.len {
+        for count < size && p < data.len {
+            bits = bits | i64(data[p]) << count
+            count += 8
+            p += 1
+        }
+        if count < size {
+            break
+        }
+        let code = bits & ((1 << size) - 1)
+        bits = bits >> size
+        count -= size
+        if code == clear {
+            size = min_size + 1
+            next = clear + 2
+            prev = -1
+            continue
+        }
+        if code == eoi {
+            break
+        }
+        if prev < 0 {
+            if code >= clear {
+                fail Malformed
+            }
+            out[o] = u8(code)
+            o += 1
+            prev = code
+            continue
+        }
+        var head = 0
+        if code < next {
+            head = code
+        } else if code == next {
+            head = prev
+        } else {
+            fail Malformed
+        }
+        if next < 4096 {
+            t.prefix[next] = u16(prev)
+            t.first[next] = t.first[prev]
+            t.suffix[next] = t.first[head]
+            t.length[next] = t.length[prev] + 1
+            next += 1
+            if next == 1 << size && size < 12 {
+                size += 1
+            }
+        }
+        let n = i64(t.length[code])
+        var at = o + n - 1
+        var c = code
+        for at >= o {
+            if at < out.len {
+                out[at] = t.suffix[c]
+            }
+            c = i64(t.prefix[c])
+            at -= 1
+        }
+        o += n
+        prev = code
+    }
+    if o > out.len { out.len } else { o }
+}
+
+fn gif_rows(height: i64, interlaced: bool) -> []i64 {
+    let rows: []i64 = __make(height)
+    if !interlaced {
+        for y in 0..height {
+            rows[y] = y
+        }
+        return rows
+    }
+    let starts = [0, 4, 2, 1]
+    let steps = [8, 8, 4, 2]
+    var i = 0
+    for pass in 0..4 {
+        var y = starts[pass]
+        for y < height {
+            rows[i] = y
+            i += 1
+            y += steps[pass]
+        }
+    }
+    rows
+}
+
+fn gif_draw(canvas: Image, indices: []u8, produced: i64, left: i64, top: i64, width: i64, height: i64, interlaced: bool, palette: []u8, transparent: i64) {
+    let rows = gif_rows(height, interlaced)
+    let out = canvas.pixels
+    let colors = palette.len / 3
+    for i in 0..height {
+        let y = top + rows[i]
+        if y >= canvas.height {
+            continue
+        }
+        for x in 0..width {
+            let s = i * width + x
+            if s >= produced {
+                return
+            }
+            let px = left + x
+            let index = i64(indices[s])
+            if px >= canvas.width || index == transparent || index >= colors {
+                continue
+            }
+            let d = y * canvas.stride + px * 4
+            out[d] = palette[index * 3]
+            out[d + 1] = palette[index * 3 + 1]
+            out[d + 2] = palette[index * 3 + 2]
+            out[d + 3] = 255
+        }
+    }
+}
+
+fn gif_clear(canvas: Image, left: i64, top: i64, width: i64, height: i64) {
+    fill_rect(canvas, left, top, width, height, Rgba { r: 0, g: 0, b: 0, a: 0 })
+}
+
+pub fn decode_gif(data: []u8) -> Image ! io.Error {
+    let frames = gif_decode(data, default_max_pixels(), true)?
+    frames[0].image
+}
+
+pub fn decode_gif_frames(data: []u8) -> []Frame ! io.Error {
+    gif_decode(data, default_max_pixels(), false)
+}
+
+fn gif_decode(data: []u8, max_pixels: i64, first_only: bool) -> []Frame ! io.Error {
+    if !gif_signature(data) {
+        fail Malformed
+    }
+    let r = new(GifReader { data, at: 6 })
+    let width = gif_u16(r)?
+    let height = gif_u16(r)?
+    let flags = gif_byte(r)?
+    gif_byte(r)?
+    gif_byte(r)?
+    var global: []u8 = []
+    if flags & 0x80 != 0 {
+        global = gif_palette(r, flags)?
+    }
+    let canvas = checked_create(width, height, Rgba8, max_pixels)?
+    let t = lzw_tables()
+    var frames: []Frame = []
+    var control = GifControl { disposal: 0, transparent: -1, delay: 0 }
+    var budget = max_pixels
+    for {
+        let kind = gif_byte(r) catch {
+            _ => break
+        }
+        if kind == 0x3B {
+            break
+        }
+        if kind == 0x21 {
+            let label = gif_byte(r)?
+            if label == 0xF9 {
+                let n = gif_byte(r)?
+                gif_need(r, n)?
+                if n >= 4 {
+                    let packed = i64(data[r.at])
+                    control.disposal = packed >> 2 & 7
+                    control.delay = io.le16(data, r.at + 1)
+                    control.transparent = if packed & 1 != 0 { i64(data[r.at + 3]) } else { -1 }
+                }
+                r.at += n
+            }
+            gif_skip_blocks(r)?
+            continue
+        }
+        if kind != 0x2C {
+            fail Malformed
+        }
+        let left = gif_u16(r)?
+        let top = gif_u16(r)?
+        let w = gif_u16(r)?
+        let h = gif_u16(r)?
+        let local = gif_byte(r)?
+        var palette = global
+        if local & 0x80 != 0 {
+            palette = gif_palette(r, local)?
+        }
+        let min_size = gif_byte(r)?
+        let compressed = gif_blocks(r)?
+        budget -= width * height
+        if budget < 0 || w * h > max_pixels {
+            fail TooLarge
+        }
+        let indices: []u8 = __make(w * h)
+        let produced = lzw_decode(t, compressed, min_size, indices)?
+        var saved: []u8 = []
+        if control.disposal == 3 {
+            saved = __make(canvas.pixels.len)
+            __memmove(saved, canvas.pixels)
+        }
+        gif_draw(canvas, indices, produced, left, top, w, h, local & 0x40 != 0, palette, control.transparent)
+        let shot = create(width, height, Rgba8)
+        __memmove(shot.pixels, canvas.pixels)
+        push(mut frames, Frame { image: shot, delay_ms: control.delay * 10 })
+        if first_only {
+            return frames
+        }
+        if control.disposal == 2 {
+            gif_clear(canvas, left, top, w, h)
+        } else if control.disposal == 3 {
+            __memmove(canvas.pixels, saved)
+        }
+        control = GifControl { disposal: 0, transparent: -1, delay: 0 }
+    }
+    if frames.len == 0 {
+        fail Malformed
+    }
+    frames
+}
+
+struct ColorBox {
+    start: i64
+    end: i64
+}
+
+fn box_range(colors: []u32, b: ColorBox, shift: i64) -> i64 {
+    var lo: u32 = 255
+    var hi: u32 = 0
+    for i in b.start..b.end {
+        let v = colors[i] >> u32(shift) & 0xFF
+        if v < lo {
+            lo = v
+        }
+        if v > hi {
+            hi = v
+        }
+    }
+    i64(hi) - i64(lo)
+}
+
+fn sort_by_channel(colors: []u32, scratch: []u32, b: ColorBox, shift: i64) {
+    let counts: []i64 = __make(257)
+    for i in b.start..b.end {
+        counts[i64(colors[i] >> u32(shift) & 0xFF) + 1] += 1
+    }
+    for v in 0..256 {
+        counts[v + 1] += counts[v]
+    }
+    for i in b.start..b.end {
+        let v = i64(colors[i] >> u32(shift) & 0xFF)
+        scratch[b.start + counts[v]] = colors[i]
+        counts[v] += 1
+    }
+    __memmove(colors[b.start..b.end], scratch[b.start..b.end])
+}
+
+pub fn median_cut(img: Image, count: i64) -> []Rgba {
+    var seen: [u32: bool] = [:]
+    var colors: []u32 = []
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let c = get(img, x, y)
+            if c.a < 128 {
+                continue
+            }
+            let key = u32(c.r) << 16 | u32(c.g) << 8 | u32(c.b)
+            if seen[key] == none {
+                seen[key] = true
+                push(mut colors, key)
+            }
+        }
+    }
+    var palette: []Rgba = []
+    if colors.len <= count {
+        for c in colors {
+            push(mut palette, Rgba { r: u8(c >> 16), g: u8(c >> 8), b: u8(c), a: 255 })
+        }
+        return palette
+    }
+    let scratch: []u32 = __make(colors.len)
+    var boxes = [ColorBox { start: 0, end: colors.len }]
+    for boxes.len < count {
+        var pick = -1
+        var pick_shift = 0
+        var widest = 0
+        for i, b in boxes {
+            if b.end - b.start < 2 {
+                continue
+            }
+            for shift in [16, 8, 0] {
+                let range = box_range(colors, b, shift)
+                if range > widest {
+                    widest = range
+                    pick = i
+                    pick_shift = shift
+                }
+            }
+        }
+        if pick < 0 {
+            break
+        }
+        let b = boxes[pick]
+        sort_by_channel(colors, scratch, b, pick_shift)
+        let middle = (b.start + b.end) / 2
+        boxes[pick] = ColorBox { start: b.start, end: middle }
+        push(mut boxes, ColorBox { start: middle, end: b.end })
+    }
+    for b in boxes {
+        var r = 0
+        var g = 0
+        var bl = 0
+        for i in b.start..b.end {
+            r += i64(colors[i] >> 16 & 0xFF)
+            g += i64(colors[i] >> 8 & 0xFF)
+            bl += i64(colors[i] & 0xFF)
+        }
+        let n = b.end - b.start
+        push(mut palette, Rgba { r: u8((r + n / 2) / n), g: u8((g + n / 2) / n), b: u8((bl + n / 2) / n), a: 255 })
+    }
+    palette
+}
+
+fn nearest(palette: []Rgba, r: u8, g: u8, b: u8) -> i64 {
+    var best = 0
+    var best_distance = -1
+    for i, p in palette {
+        let dr = i64(p.r) - i64(r)
+        let dg = i64(p.g) - i64(g)
+        let db = i64(p.b) - i64(b)
+        let distance = dr * dr * 2 + dg * dg * 4 + db * db * 3
+        if best_distance < 0 || distance < best_distance {
+            best = i
+            best_distance = distance
+            if distance == 0 {
+                break
+            }
+        }
+    }
+    best
+}
+
+struct LzwWriter {
+    out: []u8
+    bits: i64
+    count: i64
+}
+
+fn lzw_put(w: *LzwWriter, code: i64, size: i64) {
+    w.bits = w.bits | code << w.count
+    w.count += size
+    for w.count >= 8 {
+        push(mut w.out, u8(w.bits))
+        w.bits = w.bits >> 8
+        w.count -= 8
+    }
+}
+
+fn lzw_encode(indices: []u8, min_size: i64) -> []u8 {
+    let w = new(LzwWriter { out: [], bits: 0, count: 0 })
+    let clear = 1 << min_size
+    let eoi = clear + 1
+    let keys: []i64 = __make(8192)
+    let codes: []i64 = __make(8192)
+    for i in 0..keys.len {
+        keys[i] = -1
+    }
+    var size = min_size + 1
+    var next = clear + 2
+    lzw_put(w, clear, size)
+    if indices.len == 0 {
+        lzw_put(w, eoi, size)
+        return w.out
+    }
+    var prefix = i64(indices[0])
+    for i in 1..indices.len {
+        let k = i64(indices[i])
+        let key = prefix << 8 | k
+        var slot = (key * 2654435761 >> 7) & 8191
+        var found = -1
+        for keys[slot] >= 0 {
+            if keys[slot] == key {
+                found = codes[slot]
+                break
+            }
+            slot = (slot + 1) & 8191
+        }
+        if found >= 0 {
+            prefix = found
+            continue
+        }
+        lzw_put(w, prefix, size)
+        if next < 4096 {
+            keys[slot] = key
+            codes[slot] = next
+            next += 1
+            if next > 1 << size && size < 12 {
+                size += 1
+            }
+        } else {
+            lzw_put(w, clear, size)
+            for j in 0..keys.len {
+                keys[j] = -1
+            }
+            size = min_size + 1
+            next = clear + 2
+        }
+        prefix = k
+    }
+    lzw_put(w, prefix, size)
+    if next == 1 << size && size < 12 {
+        size += 1
+    }
+    lzw_put(w, eoi, size)
+    if w.count > 0 {
+        push(mut w.out, u8(w.bits))
+    }
+    w.out
+}
+
+pub fn encode_gif(img: Image, palette: []Rgba) -> []u8 {
+    let alpha = has_alpha(img.format)
+    let limit = if alpha { 255 } else { 256 }
+    let colors = if palette.len == 0 { median_cut(img, limit) } else if palette.len > limit { palette[..limit] } else { palette }
+    var used = colors.len
+    let transparent = if alpha { used } else { -1 }
+    if alpha {
+        used += 1
+    }
+    var bits = 1
+    for 1 << bits < used {
+        bits += 1
+    }
+    let min_size = if bits < 2 { 2 } else { bits }
+    let indices: []u8 = __make(img.width * img.height)
+    var cache: [u32: u8] = [:]
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let c = get(img, x, y)
+            if alpha && c.a < 128 {
+                indices[y * img.width + x] = u8(transparent)
+                continue
+            }
+            let key = u32(c.r) << 16 | u32(c.g) << 8 | u32(c.b)
+            let index = match cache[key] {
+                some(v) => v
+                none => {
+                    let v = u8(nearest(colors, c.r, c.g, c.b))
+                    cache[key] = v
+                    v
+                }
+            }
+            indices[y * img.width + x] = index
+        }
+    }
+    let packed = lzw_encode(indices, min_size)
+    var out: []u8 = []
+    io.append_str(mut out, "GIF89a")
+    push(mut out, u8(img.width))
+    push(mut out, u8(img.width >> 8))
+    push(mut out, u8(img.height))
+    push(mut out, u8(img.height >> 8))
+    push(mut out, u8(0xF0 | (bits - 1)))
+    push(mut out, 0)
+    push(mut out, 0)
+    for i in 0..1 << bits {
+        if i < colors.len {
+            push(mut out, colors[i].r)
+            push(mut out, colors[i].g)
+            push(mut out, colors[i].b)
+        } else {
+            push(mut out, 0)
+            push(mut out, 0)
+            push(mut out, 0)
+        }
+    }
+    if alpha {
+        for b in [0x21, 0xF9, 4, 1, 0, 0, transparent, 0] {
+            push(mut out, u8(b))
+        }
+    }
+    push(mut out, 0x2C)
+    for _ in 0..4 {
+        push(mut out, 0)
+    }
+    push(mut out, u8(img.width))
+    push(mut out, u8(img.width >> 8))
+    push(mut out, u8(img.height))
+    push(mut out, u8(img.height >> 8))
+    push(mut out, 0)
+    push(mut out, u8(min_size))
+    var p = 0
+    for p < packed.len {
+        let n = if packed.len - p > 255 { 255 } else { packed.len - p }
+        push(mut out, u8(n))
+        io.append(mut out, packed[p..p + n])
+        p += n
+    }
+    push(mut out, 0)
+    push(mut out, 0x3B)
+    out
+}

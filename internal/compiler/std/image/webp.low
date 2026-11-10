@@ -1,0 +1,608 @@
+import std/io
+
+struct Prefix {
+    fast: []u16
+    counts: []i64
+    symbols: []u16
+    single: i64
+}
+
+struct Lossless {
+    data: []u8
+    pos: i64
+    bits: u64
+    count: i64
+    planes: []u8
+}
+
+struct Transform {
+    kind: i64
+    bits: i64
+    width: i64
+    data: []u32
+}
+
+fn webp_signature(data: []u8) -> bool {
+    starts_with(data, 0, "RIFF") && starts_with(data, 8, "WEBP")
+}
+
+fn ll_fill(r: *Lossless) {
+    for r.count <= 56 && r.pos < r.data.len {
+        r.bits = r.bits | u64(r.data[r.pos]) << u64(r.count)
+        r.pos += 1
+        r.count += 8
+    }
+}
+
+fn ll_bits(r: *Lossless, n: i64) -> i64 ! io.Error {
+    if n == 0 {
+        return 0
+    }
+    if r.count < n {
+        ll_fill(r)
+        if r.count < n {
+            fail Malformed
+        }
+    }
+    let v = i64(r.bits & ((u64(1) << u64(n)) - 1))
+    r.bits = r.bits >> u64(n)
+    r.count -= n
+    v
+}
+
+fn reverse_bits(code: i64, length: i64) -> i64 {
+    var out = 0
+    var c = code
+    for _ in 0..length {
+        out = out << 1 | c & 1
+        c = c >> 1
+    }
+    out
+}
+
+fn prefix_from_lengths(lengths: []i64) -> Prefix ! io.Error {
+    let counts: []i64 = __make(16)
+    var used = 0
+    var last = 0
+    for s, l in lengths {
+        if l > 0 {
+            counts[l] += 1
+            used += 1
+            last = s
+        }
+    }
+    if used == 0 {
+        fail Malformed
+    }
+    if used == 1 {
+        return Prefix { fast: [], counts, symbols: [], single: last }
+    }
+    var left = 1
+    for l in 1..16 {
+        left = left * 2 - counts[l]
+        if left < 0 {
+            fail Malformed
+        }
+    }
+    let offsets: []i64 = __make(16)
+    for l in 1..15 {
+        offsets[l + 1] = offsets[l] + counts[l]
+    }
+    let symbols: []u16 = __make(used)
+    for s, l in lengths {
+        if l > 0 {
+            symbols[offsets[l]] = u16(s)
+            offsets[l] += 1
+        }
+    }
+    let fast: []u16 = __make(256)
+    var code = 0
+    var k = 0
+    for l in 1..16 {
+        for _ in 0..counts[l] {
+            if l <= 8 {
+                let rev = reverse_bits(code, l)
+                var at = rev
+                for at < 256 {
+                    fast[at] = u16(i64(symbols[k]) << 4 | l)
+                    at += 1 << l
+                }
+            }
+            code += 1
+            k += 1
+        }
+        code = code << 1
+    }
+    Prefix { fast, counts, symbols, single: -1 }
+}
+
+fn ll_symbol(r: *Lossless, p: Prefix) -> i64 ! io.Error {
+    if p.single >= 0 {
+        return p.single
+    }
+    if r.count < 15 {
+        ll_fill(r)
+    }
+    let entry = i64(p.fast[i64(r.bits & 0xFF)])
+    let length = entry & 15
+    if length > 0 && length <= r.count {
+        r.bits = r.bits >> u64(length)
+        r.count -= length
+        return entry >> 4
+    }
+    var code = 0
+    var first = 0
+    var index = 0
+    for l in 1..16 {
+        code = code | ll_bits(r, 1)?
+        let n = p.counts[l]
+        if code - n < first {
+            return i64(p.symbols[index + code - first])
+        }
+        index += n
+        first = (first + n) << 1
+        code = code << 1
+    }
+    fail Malformed
+}
+
+fn ll_code_order() -> []i64 {
+    [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+}
+
+fn ll_prefix(r: *Lossless, size: i64) -> Prefix ! io.Error {
+    let lengths: []i64 = __make(size)
+    if ll_bits(r, 1)? == 1 {
+        let n = ll_bits(r, 1)? + 1
+        let wide = ll_bits(r, 1)?
+        let s0 = ll_bits(r, 1 + 7 * wide)?
+        if s0 >= size {
+            fail Malformed
+        }
+        lengths[s0] = 1
+        if n == 2 {
+            let s1 = ll_bits(r, 8)?
+            if s1 >= size {
+                fail Malformed
+            }
+            lengths[s1] = 1
+        }
+        return prefix_from_lengths(lengths)
+    }
+    let order = ll_code_order()
+    let code_lengths: []i64 = __make(19)
+    let n = ll_bits(r, 4)? + 4
+    for i in 0..n {
+        code_lengths[order[i]] = ll_bits(r, 3)?
+    }
+    let meta = prefix_from_lengths(code_lengths)?
+    var max_symbol = size
+    if ll_bits(r, 1)? == 1 {
+        let nbits = 2 + 2 * ll_bits(r, 3)?
+        max_symbol = 2 + ll_bits(r, nbits)?
+        if max_symbol > size {
+            fail Malformed
+        }
+    }
+    var previous = 8
+    var s = 0
+    for s < size {
+        if max_symbol == 0 {
+            break
+        }
+        max_symbol -= 1
+        let c = ll_symbol(r, meta)?
+        if c < 16 {
+            lengths[s] = c
+            s += 1
+            if c != 0 {
+                previous = c
+            }
+            continue
+        }
+        var repeat = 0
+        var value = 0
+        if c == 16 {
+            repeat = 3 + ll_bits(r, 2)?
+            value = previous
+        } else if c == 17 {
+            repeat = 3 + ll_bits(r, 3)?
+        } else {
+            repeat = 11 + ll_bits(r, 7)?
+        }
+        if s + repeat > size {
+            fail Malformed
+        }
+        for _ in 0..repeat {
+            lengths[s] = value
+            s += 1
+        }
+    }
+    prefix_from_lengths(lengths)
+}
+
+fn ll_group(r: *Lossless, cache_bits: i64) -> []Prefix ! io.Error {
+    let cache = if cache_bits > 0 { 1 << cache_bits } else { 0 }
+    let sizes = [256 + 24 + cache, 256, 256, 256, 40]
+    var codes: []Prefix = []
+    for size in sizes {
+        push(mut codes, ll_prefix(r, size)?)
+    }
+    codes
+}
+
+fn ll_prefix_value(r: *Lossless, code: i64) -> i64 ! io.Error {
+    if code < 4 {
+        return code + 1
+    }
+    let extra = (code - 2) >> 1
+    let offset = (2 + (code & 1)) << extra
+    offset + ll_bits(r, extra)? + 1
+}
+
+fn ll_plane_codes() -> []u8 {
+    [0x18, 0x07, 0x17, 0x19, 0x28, 0x06, 0x27, 0x29, 0x16, 0x1A, 0x26, 0x2A, 0x38, 0x05, 0x37, 0x39, 0x15, 0x1B, 0x36, 0x3A, 0x25, 0x2B, 0x48, 0x04, 0x47, 0x49, 0x14, 0x1C, 0x35, 0x3B, 0x46, 0x4A, 0x24, 0x2C, 0x58, 0x45, 0x4B, 0x34, 0x3C, 0x03, 0x57, 0x59, 0x13, 0x1D, 0x56, 0x5A, 0x23, 0x2D, 0x44, 0x4C, 0x55, 0x5B, 0x33, 0x3D, 0x68, 0x02, 0x67, 0x69, 0x12, 0x1E, 0x66, 0x6A, 0x22, 0x2E, 0x54, 0x5C, 0x43, 0x4D, 0x65, 0x6B, 0x32, 0x3E, 0x78, 0x01, 0x77, 0x79, 0x53, 0x5D, 0x11, 0x1F, 0x64, 0x6C, 0x42, 0x4E, 0x76, 0x7A, 0x21, 0x2F, 0x75, 0x7B, 0x31, 0x3F, 0x63, 0x6D, 0x52, 0x5E, 0x00, 0x74, 0x7C, 0x41, 0x4F, 0x10, 0x20, 0x62, 0x6E, 0x30, 0x73, 0x7D, 0x51, 0x5F, 0x40, 0x72, 0x7E, 0x61, 0x6F, 0x50, 0x71, 0x7F, 0x60, 0x70]
+}
+
+fn ll_cache_bits(r: *Lossless) -> i64 ! io.Error {
+    if ll_bits(r, 1)? == 0 {
+        return 0
+    }
+    let bits = ll_bits(r, 4)?
+    if bits < 1 || bits > 11 {
+        fail Malformed
+    }
+    bits
+}
+
+fn div_round_up(v: i64, bits: i64) -> i64 {
+    (v + (1 << bits) - 1) >> bits
+}
+
+fn ll_image(r: *Lossless, width: i64, height: i64, main: bool) -> []u32 ! io.Error {
+    let cache_bits = ll_cache_bits(r)?
+    var meta_bits = 0
+    var meta: []u32 = []
+    var meta_width = 0
+    var groups: [][]Prefix = []
+    if main && ll_bits(r, 1)? == 1 {
+        meta_bits = ll_bits(r, 3)? + 2
+        meta_width = div_round_up(width, meta_bits)
+        meta = ll_image(r, meta_width, div_round_up(height, meta_bits), false)?
+        var count = 0
+        for m in meta {
+            let g = i64(m >> 8 & 0xFFFF)
+            if g + 1 > count {
+                count = g + 1
+            }
+        }
+        for _ in 0..count {
+            push(mut groups, ll_group(r, cache_bits)?)
+        }
+    } else {
+        push(mut groups, ll_group(r, cache_bits)?)
+    }
+    let total = width * height
+    let out: []u32 = __make(total)
+    let cache: []u32 = __make(if cache_bits > 0 { 1 << cache_bits } else { 0 })
+    let cache_shift = u32(32 - cache_bits)
+    let planes = r.planes
+    var codes = groups[0]
+    var at = 0
+    var inserted = 0
+    for at < total {
+        if meta_bits > 0 && (at % width) & ((1 << meta_bits) - 1) == 0 {
+            let x = at % width
+            let y = at / width
+            codes = groups[i64(meta[(y >> meta_bits) * meta_width + (x >> meta_bits)] >> 8 & 0xFFFF)]
+        }
+        let g = ll_symbol(r, codes[0])?
+        if g < 256 {
+            let red = ll_symbol(r, codes[1])?
+            let blue = ll_symbol(r, codes[2])?
+            let alpha = ll_symbol(r, codes[3])?
+            out[at] = u32(alpha << 24 | red << 16 | g << 8 | blue)
+            at += 1
+        } else if g < 280 {
+            let length = ll_prefix_value(r, g - 256)?
+            let dcode = ll_prefix_value(r, ll_symbol(r, codes[4])?)?
+            var distance = 0
+            if dcode > 120 {
+                distance = dcode - 120
+            } else {
+                let v = i64(planes[dcode - 1])
+                distance = (v >> 4) * width + 8 - (v & 15)
+                if distance < 1 {
+                    distance = 1
+                }
+            }
+            if distance > at || at + length > total {
+                fail Malformed
+            }
+            for k in 0..length {
+                out[at + k] = out[at + k - distance]
+            }
+            if cache_bits > 0 {
+                for k in 0..length {
+                    let c = out[at + k]
+                    cache[i64((0x1E35A7BD * c) >> cache_shift)] = c
+                }
+                inserted = at + length
+            }
+            at += length
+            if meta_bits > 0 && at < total {
+                let x = at % width
+                let y = at / width
+                codes = groups[i64(meta[(y >> meta_bits) * meta_width + (x >> meta_bits)] >> 8 & 0xFFFF)]
+            }
+            continue
+        } else {
+            let index = g - 280
+            if index >= cache.len {
+                fail Malformed
+            }
+            out[at] = cache[index]
+            at += 1
+        }
+        if cache_bits > 0 {
+            for inserted < at {
+                let c = out[inserted]
+                cache[i64((0x1E35A7BD * c) >> cache_shift)] = c
+                inserted += 1
+            }
+        }
+    }
+    out
+}
+
+fn average2(a: u32, b: u32) -> u32 {
+    ((a ^ b) & 0xFEFEFEFE) >> 1 + (a & b)
+}
+
+fn add_pixels(a: u32, b: u32) -> u32 {
+    let ag = (a & 0xFF00FF00) + (b & 0xFF00FF00)
+    let rb = (a & 0x00FF00FF) + (b & 0x00FF00FF)
+    (ag & 0xFF00FF00) | (rb & 0x00FF00FF)
+}
+
+fn channel_distance(a: u32, b: u32) -> i64 {
+    var sum = 0
+    for shift in 0..4 {
+        let x = i64(a >> u32(shift * 8) & 0xFF)
+        let y = i64(b >> u32(shift * 8) & 0xFF)
+        sum += if x > y { x - y } else { y - x }
+    }
+    sum
+}
+
+fn select_predictor(left: u32, top: u32, corner: u32) -> u32 {
+    if channel_distance(left, corner) <= channel_distance(top, corner) { top } else { left }
+}
+
+fn clamp_full(a: u32, b: u32, c: u32) -> u32 {
+    var out: u32 = 0
+    for shift in 0..4 {
+        let s = u32(shift * 8)
+        let v = i64(a >> s & 0xFF) + i64(b >> s & 0xFF) - i64(c >> s & 0xFF)
+        out = out | u32(clamp(v, 0, 255)) << s
+    }
+    out
+}
+
+fn clamp_half(a: u32, b: u32) -> u32 {
+    var out: u32 = 0
+    for shift in 0..4 {
+        let s = u32(shift * 8)
+        let x = i64(a >> s & 0xFF)
+        let y = i64(b >> s & 0xFF)
+        out = out | u32(clamp(x + (x - y) / 2, 0, 255)) << s
+    }
+    out
+}
+
+fn predict(mode: i64, left: u32, top: u32, top_right: u32, corner: u32) -> u32 {
+    if mode == 0 {
+        0xFF000000
+    } else if mode == 1 {
+        left
+    } else if mode == 2 {
+        top
+    } else if mode == 3 {
+        top_right
+    } else if mode == 4 {
+        corner
+    } else if mode == 5 {
+        average2(average2(left, top_right), top)
+    } else if mode == 6 {
+        average2(left, corner)
+    } else if mode == 7 {
+        average2(left, top)
+    } else if mode == 8 {
+        average2(corner, top)
+    } else if mode == 9 {
+        average2(top, top_right)
+    } else if mode == 10 {
+        average2(average2(left, corner), average2(top, top_right))
+    } else if mode == 11 {
+        select_predictor(left, top, corner)
+    } else if mode == 12 {
+        clamp_full(left, top, corner)
+    } else if mode == 13 {
+        clamp_half(average2(left, top), corner)
+    } else {
+        0xFF000000
+    }
+}
+
+fn inverse_predictor(t: Transform, px: []u32, width: i64, height: i64) {
+    let block_width = div_round_up(width, t.bits)
+    for y in 0..height {
+        let row = y * width
+        for x in 0..width {
+            let at = row + x
+            var p: u32 = 0
+            if y == 0 {
+                p = if x == 0 { 0xFF000000 } else { px[at - 1] }
+            } else if x == 0 {
+                p = px[at - width]
+            } else {
+                let mode = i64(t.data[(y >> t.bits) * block_width + (x >> t.bits)] >> 8 & 15)
+                p = predict(mode, px[at - 1], px[at - width], px[at - width + 1], px[at - width - 1])
+            }
+            px[at] = add_pixels(px[at], p)
+        }
+    }
+}
+
+fn color_delta(t: u32, c: u32) -> i64 {
+    let a = i64(t & 0xFF)
+    let b = i64(c & 0xFF)
+    let sa = if a >= 128 { a - 256 } else { a }
+    let sb = if b >= 128 { b - 256 } else { b }
+    (sa * sb) >> 5
+}
+
+fn inverse_color(t: Transform, px: []u32, width: i64, height: i64) {
+    let block_width = div_round_up(width, t.bits)
+    for y in 0..height {
+        for x in 0..width {
+            let at = y * width + x
+            let e = t.data[(y >> t.bits) * block_width + (x >> t.bits)]
+            let v = px[at]
+            let green = v >> 8 & 0xFF
+            let red = (i64(v >> 16 & 0xFF) + color_delta(e, green)) & 0xFF
+            var blue = i64(v & 0xFF) + color_delta(e >> 8, green)
+            blue = (blue + color_delta(e >> 16, u32(red))) & 0xFF
+            px[at] = (v & 0xFF00FF00) | u32(red) << 16 | u32(blue)
+        }
+    }
+}
+
+fn inverse_green(px: []u32) {
+    for i, v in px {
+        let green = v >> 8 & 0xFF
+        let rb = ((v & 0x00FF00FF) + (green << 16 | green)) & 0x00FF00FF
+        px[i] = (v & 0xFF00FF00) | rb
+    }
+}
+
+fn inverse_indexing(t: Transform, packed: []u32, width: i64, height: i64) -> []u32 {
+    let out: []u32 = __make(width * height)
+    let per = 1 << t.bits
+    let size = 8 >> t.bits
+    let mask = (1 << size) - 1
+    let packed_width = div_round_up(width, t.bits)
+    for y in 0..height {
+        let row = y * packed_width
+        for x in 0..width {
+            let v = i64(packed[row + (x >> t.bits)] >> 8 & 0xFF)
+            let index = v >> ((x & (per - 1)) * size) & mask
+            out[y * width + x] = if index < t.data.len { t.data[index] } else { 0 }
+        }
+    }
+    out
+}
+
+fn ll_decode(data: []u8, max_pixels: i64) -> Image ! io.Error {
+    if data.len < 5 || data[0] != 0x2F {
+        fail Malformed
+    }
+    let r = new(Lossless { data, pos: 1, bits: 0, count: 0, planes: ll_plane_codes() })
+    let width = ll_bits(r, 14)? + 1
+    let height = ll_bits(r, 14)? + 1
+    let alpha = ll_bits(r, 1)? == 1
+    if ll_bits(r, 3)? != 0 {
+        fail Unsupported
+    }
+    if width * height > max_pixels {
+        fail TooLarge
+    }
+    var transforms: []Transform = []
+    var coded_width = width
+    var seen = 0
+    for ll_bits(r, 1)? == 1 {
+        let kind = ll_bits(r, 2)?
+        if seen & (1 << kind) != 0 {
+            fail Malformed
+        }
+        seen = seen | 1 << kind
+        if kind == 0 || kind == 1 {
+            let bits = ll_bits(r, 3)? + 2
+            let sub = ll_image(r, div_round_up(coded_width, bits), div_round_up(height, bits), false)?
+            push(mut transforms, Transform { kind, bits, width: coded_width, data: sub })
+        } else if kind == 2 {
+            push(mut transforms, Transform { kind, bits: 0, width: coded_width, data: [] })
+        } else {
+            let size = ll_bits(r, 8)? + 1
+            let table = ll_image(r, size, 1, false)?
+            for i in 1..size {
+                table[i] = add_pixels(table[i], table[i - 1])
+            }
+            let bits = if size <= 2 { 3 } else if size <= 4 { 2 } else if size <= 16 { 1 } else { 0 }
+            let packed_width = div_round_up(coded_width, bits)
+            push(mut transforms, Transform { kind, bits, width: coded_width, data: table })
+            coded_width = packed_width
+        }
+    }
+    var px = ll_image(r, coded_width, height, true)?
+    var i = transforms.len - 1
+    for i >= 0 {
+        let t = transforms[i]
+        if t.kind == 0 {
+            inverse_predictor(t, px, t.width, height)
+        } else if t.kind == 1 {
+            inverse_color(t, px, t.width, height)
+        } else if t.kind == 2 {
+            inverse_green(px)
+        } else {
+            px = inverse_indexing(t, px, t.width, height)
+        }
+        i -= 1
+    }
+    let format = if alpha { Format.Rgba8 } else { Format.Rgb8 }
+    let img = checked_create(width, height, format, max_pixels)?
+    let out = img.pixels
+    let bpp = bytes_per_pixel(format)
+    for k in 0..width * height {
+        let v = px[k]
+        let d = k * bpp
+        out[d] = u8(v >> 16)
+        out[d + 1] = u8(v >> 8)
+        out[d + 2] = u8(v)
+        if alpha {
+            out[d + 3] = u8(v >> 24)
+        }
+    }
+    img
+}
+
+pub fn decode_webp(data: []u8) -> Image ! io.Error {
+    webp_decode(data, default_max_pixels())
+}
+
+fn webp_decode(data: []u8, max_pixels: i64) -> Image ! io.Error {
+    if !webp_signature(data) || data.len < 20 {
+        fail Malformed
+    }
+    let end = if io.le32(data, 4) + 8 < data.len { io.le32(data, 4) + 8 } else { data.len }
+    var p = 12
+    var unsupported = false
+    for p + 8 <= end {
+        let size = io.le32(data, p + 4)
+        let body = p + 8
+        if size > end - body {
+            fail Malformed
+        }
+        if starts_with(data, p, "VP8L") {
+            return ll_decode(data[body..body + size], max_pixels)
+        }
+        if starts_with(data, p, "VP8 ") || starts_with(data, p, "ANMF") || starts_with(data, p, "ALPH") {
+            unsupported = true
+        }
+        p = body + size + (size & 1)
+    }
+    if unsupported {
+        fail Unsupported
+    }
+    fail Malformed
+}
