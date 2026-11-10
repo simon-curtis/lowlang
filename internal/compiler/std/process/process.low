@@ -1,0 +1,384 @@
+import std/file
+import std/io
+import std/os
+import std/text
+
+pub enum Stdio {
+    Inherit
+    Piped
+    Null
+}
+
+pub struct Command {
+    pub program: str
+    pub args: []str = []
+    pub env: [str: str]? = none
+    pub dir: str = ""
+    pub stdin: Stdio = Inherit
+    pub stdout: Stdio = Inherit
+    pub stderr: Stdio = Inherit
+    pub group: bool = false
+}
+
+pub enum Exit {
+    Exited(code: i64)
+    Signaled(signal: i64)
+}
+
+pub struct Child {
+    pub pid: i64
+    pub stdin: io.Stream?
+    pub stdout: io.Stream?
+    pub stderr: io.Stream?
+    pidfd: i64
+    group: bool
+    status: Exit?
+}
+
+pub struct Output {
+    pub status: Exit
+    pub stdout: []u8
+    pub stderr: []u8
+}
+
+struct Ends {
+    parent: i64
+    child: i64
+}
+
+struct Collected {
+    data: []u8
+    done: chan[bool]
+}
+
+pub fn command(program: str, args: []str) -> Command {
+    Command { program, args }
+}
+
+pub fn success(e: Exit) -> bool {
+    e == Exited(0)
+}
+
+pub fn find(name: str) -> str? {
+    if text.index_byte(name, '/') >= 0 {
+        return if executable(name) { some(name) } else { none }
+    }
+    for dir in text.split(os.env("PATH") ?? "/usr/local/bin:/usr/bin:/bin", ':') {
+        let candidate = "{if dir.len == 0 { "." } else { dir }}/{name}"
+        if executable(candidate) {
+            return some(candidate)
+        }
+    }
+    none
+}
+
+fn executable(path: str) -> bool {
+    let c = c_string(path)
+    if __syscall(21, __slice_ptr(c), 1) != 0 {
+        return false
+    }
+    let found = file.stat(path) catch {
+        _ => return false
+    }
+    !found.dir
+}
+
+fn c_string(s: str) -> []u8 {
+    var b = bytes(s)
+    push(mut b, 0)
+    b
+}
+
+fn pointers(strings: [][]u8) -> []ptr {
+    var out: []ptr = []
+    for s in strings {
+        push(mut out, __slice_ptr(s))
+    }
+    push(mut out, null)
+    out
+}
+
+fn close_fd(fd: i64) {
+    if fd >= 0 {
+        __syscall(3, fd)
+    }
+}
+
+fn open_pipe() -> Ends ! io.Error {
+    let fds = io.buffer(8)
+    io.syscall_result(__syscall(293, __slice_ptr(fds), 0x80000))?
+    Ends { parent: io.le32(fds, 0), child: io.le32(fds, 4) }
+}
+
+fn set_nonblocking(fd: i64) ! io.Error {
+    let flags = io.syscall_result(__syscall(72, fd, 3))?
+    io.syscall_result(__syscall(72, fd, 4, flags | 0x800))?
+}
+
+fn ends(mode: Stdio, input: bool) -> Ends ! io.Error {
+    match mode {
+        Inherit => Ends { parent: -1, child: -1 }
+        Null => {
+            let null_path = c_string("/dev/null")
+            let fd = io.syscall_result(__syscall(257, -100, __slice_ptr(null_path), 0x80002, 0))?
+            Ends { parent: -1, child: fd }
+        }
+        Piped => {
+            let p = open_pipe()?
+            let e = if input { Ends { parent: p.child, child: p.parent } } else { p }
+            set_nonblocking(e.parent) catch {
+                err => {
+                    close_fd(e.parent)
+                    close_fd(e.child)
+                    fail err
+                }
+            }
+            e
+        }
+    }
+}
+
+fn read_fd(fd: i64, buf: []u8) -> i64 ! io.Error {
+    for {
+        let r = __syscall(0, fd, __slice_ptr(buf), buf.len)
+        if r == -11 {
+            wait_readable(fd)
+        } else if r != -4 {
+            return io.syscall_result(r)
+        }
+    }
+}
+
+fn write_fd(fd: i64, data: []u8) -> i64 ! io.Error {
+    for {
+        let r = __syscall(1, fd, __slice_ptr(data), data.len)
+        if r == -11 {
+            wait_writable(fd)
+        } else if r != -4 {
+            return io.syscall_result(r)
+        }
+    }
+}
+
+fn stream(fd: i64) -> io.Stream? {
+    if fd < 0 {
+        return none
+    }
+    some(io.Stream {
+        read: fn(buf) { read_fd(fd, buf) }
+        write: fn(data) { write_fd(fd, data) }
+        close: fn() { __syscall(3, fd) }
+    })
+}
+
+fn environment(c: Command) -> [][]u8 {
+    var out: [][]u8 = []
+    for name, value in c.env ?? os.environment() {
+        push(mut out, c_string("{name}={value}"))
+    }
+    out
+}
+
+fn redirect(fd: i64, target: i64) {
+    if fd >= 0 {
+        __syscall(33, fd, target)
+    }
+}
+
+pub fn start(c: Command) -> *Child ! io.Error {
+    let path = find(c.program) ?? ""
+    if path.len == 0 {
+        fail NotFound
+    }
+    let path_c = c_string(path)
+    var arg_strings: [][]u8 = [c_string(c.program)]
+    for a in c.args {
+        push(mut arg_strings, c_string(a))
+    }
+    let env_strings = environment(c)
+    let argv = pointers(arg_strings)
+    let envp = pointers(env_strings)
+    let dir_c = c_string(c.dir)
+    let input = ends(c.stdin, true)?
+    let output = ends(c.stdout, false) catch {
+        e => {
+            close_fd(input.parent)
+            close_fd(input.child)
+            fail e
+        }
+    }
+    let errors = ends(c.stderr, false) catch {
+        e => {
+            close_fd(input.parent)
+            close_fd(input.child)
+            close_fd(output.parent)
+            close_fd(output.child)
+            fail e
+        }
+    }
+    let report = open_pipe() catch {
+        e => {
+            for fd in [input.parent, input.child, output.parent, output.child, errors.parent, errors.child] {
+                close_fd(fd)
+            }
+            fail e
+        }
+    }
+    let code = io.buffer(4)
+    let has_dir = c.dir.len > 0
+    let group = c.group
+    let pid = __syscall(57)
+    if pid == 0 {
+        if group {
+            __syscall(109, 0, 0)
+        }
+        redirect(input.child, 0)
+        redirect(output.child, 1)
+        redirect(errors.child, 2)
+        var r = 0
+        if has_dir {
+            r = __syscall(80, __slice_ptr(dir_c))
+        }
+        if r == 0 {
+            r = __syscall(59, __slice_ptr(path_c), __slice_ptr(argv), __slice_ptr(envp))
+        }
+        io.set_le32(code, 0, -r)
+        __syscall(1, report.child, __slice_ptr(code), 4)
+        __syscall(231, 127)
+    }
+    for fd in [input.child, output.child, errors.child, report.child] {
+        close_fd(fd)
+    }
+    if pid < 0 {
+        for fd in [input.parent, output.parent, errors.parent, report.parent] {
+            close_fd(fd)
+        }
+        fail io.errno(-pid)
+    }
+    set_nonblocking(report.parent) catch {
+        _ => {}
+    }
+    let n = read_fd(report.parent, code) catch 0
+    close_fd(report.parent)
+    let pidfd = __syscall(434, pid, 0)
+    let child = new(Child { pid, stdin: stream(input.parent), stdout: stream(output.parent), stderr: stream(errors.parent), pidfd, group, status: none })
+    if n == 4 {
+        wait(child) catch {
+            _ => Exited(127)
+        }
+        close_streams(child)
+        fail io.errno(io.le32(code, 0))
+    }
+    child
+}
+
+fn close_streams(c: *Child) {
+    for s in [c.stdin, c.stdout, c.stderr] {
+        match s {
+            some(st) => st.close()
+            none => {}
+        }
+    }
+}
+
+pub fn wait(c: *Child) -> Exit ! io.Error {
+    match c.status {
+        some(done) => return done
+        none => {}
+    }
+    let info = io.buffer(128)
+    if c.pidfd >= 0 {
+        wait_readable(c.pidfd)
+    }
+    for {
+        let r = if c.pidfd >= 0 { __syscall(247, 3, c.pidfd, __slice_ptr(info), 4, 0) } else { __syscall(247, 1, c.pid, __slice_ptr(info), 4, 0) }
+        if r == 0 {
+            break
+        }
+        if r != -4 {
+            fail io.errno(-r)
+        }
+    }
+    close_fd(c.pidfd)
+    c.pidfd = -1
+    let how = io.le32(info, 8)
+    let value = io.le32(info, 24)
+    let status: Exit = if how == 1 { Exited(value) } else { Signaled(value) }
+    c.status = some(status)
+    status
+}
+
+pub fn kill(c: *Child, signal: i64) ! io.Error {
+    if c.status != none {
+        return
+    }
+    if c.group {
+        io.syscall_result(__syscall(62, -c.pid, signal))?
+        return
+    }
+    if c.pidfd >= 0 {
+        io.syscall_result(__syscall(424, c.pidfd, signal, 0, 0))?
+        return
+    }
+    io.syscall_result(__syscall(62, c.pid, signal))?
+}
+
+fn collect(s: io.Stream, into: *Collected) {
+    let buf = io.buffer(65536)
+    for {
+        let n = s.read(buf) catch 0
+        if n == 0 {
+            break
+        }
+        io.append(mut into.data, buf[..n])
+    }
+    s.close()
+    into.done <- true
+}
+
+fn feed(s: io.Stream, data: []u8) {
+    var rest = data
+    for rest.len > 0 {
+        let n = s.write(rest) catch 0
+        if n == 0 {
+            break
+        }
+        rest = rest[n..]
+    }
+    s.close()
+}
+
+pub fn run(c: Command, input: []u8) -> Output ! io.Error {
+    var piped = c
+    piped.stdin = Piped
+    piped.stdout = Piped
+    piped.stderr = Piped
+    let child = start(piped)?
+    let out = new(Collected { data: [], done: chan[bool](1) })
+    let err = new(Collected { data: [], done: chan[bool](1) })
+    match child.stdin {
+        some(s) => {
+            spawn feed(s, input)
+        }
+        none => {}
+    }
+    match child.stdout {
+        some(s) => {
+            spawn collect(s, out)
+        }
+        none => {
+            out.done <- true
+        }
+    }
+    match child.stderr {
+        some(s) => {
+            spawn collect(s, err)
+        }
+        none => {
+            err.done <- true
+        }
+    }
+    <-out.done
+    <-err.done
+    Output { status: wait(child)?, stdout: out.data, stderr: err.data }
+}
