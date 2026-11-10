@@ -33,6 +33,7 @@ type Checker struct {
 	ptrs    map[*types.Type]*types.Type
 	opts    map[*types.Type]*types.Type
 	slices  map[*types.Type]*types.Type
+	maps    map[[2]*types.Type]*types.Type
 	fn      *ast.Func
 	scopes  []map[string]*ast.Local
 	loops   []*loop
@@ -46,6 +47,7 @@ func Check(file *ast.File) (err error) {
 		ptrs:    map[*types.Type]*types.Type{},
 		opts:    map[*types.Type]*types.Type{},
 		slices:  map[*types.Type]*types.Type{},
+		maps:    map[[2]*types.Type]*types.Type{},
 	}
 	defer func() {
 		r := recover()
@@ -75,6 +77,12 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 		return c.pointer(c.resolve(t.Elem))
 	case t.Slice:
 		return c.slice(c.resolve(t.Elem))
+	case t.Map:
+		key := c.resolve(t.Key)
+		if !key.Hashable() {
+			c.fail(t.Key.Pos, "map keys must be integers, bool, str or pointers, found %s", key)
+		}
+		return c.mapOf(key, c.resolve(t.Elem))
 	case t.Optional:
 		return c.optional(c.resolve(t.Elem))
 	}
@@ -95,6 +103,16 @@ func (c *Checker) optional(elem *types.Type) *types.Type {
 		c.layout(o, lexer.Pos{})
 	}
 	return o
+}
+
+func (c *Checker) mapOf(key, value *types.Type) *types.Type {
+	k := [2]*types.Type{key, value}
+	if m, ok := c.maps[k]; ok {
+		return m
+	}
+	m := types.NewMap(key, value)
+	c.maps[k] = m
+	return m
 }
 
 func (c *Checker) slice(elem *types.Type) *types.Type {
@@ -391,8 +409,7 @@ func (c *Checker) let(s *ast.Let) {
 }
 
 func (c *Checker) assign(s *ast.Assign) {
-	place, t := c.place(s.Target, s.Pos, "assign to %s", "cannot assign to this expression")
-	s.Place = place
+	t := c.assignTarget(s)
 	switch s.Op {
 	case lexer.Assign:
 	case lexer.PlusAssign, lexer.MinusAssign, lexer.StarAssign, lexer.SlashAssign:
@@ -408,6 +425,24 @@ func (c *Checker) assign(s *ast.Assign) {
 	if !t.Accepts(value) {
 		c.fail(s.Value.Position(), "cannot assign %s to a place of type %s", value, t)
 	}
+}
+
+func (c *Checker) assignTarget(s *ast.Assign) *types.Type {
+	if entry, ok := s.Target.(*ast.Index); ok {
+		if m := c.plain(entry.X, nil); m.Kind == types.MapKind {
+			c.key(entry.Index, m)
+			entry.Type = c.optional(m.Elem)
+			s.Entry = entry
+			return m.Elem
+		}
+	}
+	place, t := c.place(s.Target, s.Pos, "assign to %s", "cannot assign to this expression")
+	s.Place = place
+	return t
+}
+
+func (c *Checker) key(e ast.Expr, m *types.Type) {
+	c.expectType(e, m.Key)
 }
 
 func (c *Checker) requireNumber(t *types.Type, op lexer.Kind, pos lexer.Pos) {
@@ -520,6 +555,11 @@ func (c *Checker) iteration(s *ast.ForIn) (key, value *types.Type) {
 		return types.I64, t.Elem
 	case types.StrKind:
 		return types.I64, types.U32
+	case types.MapKind:
+		if s.Key == "" {
+			return nil, t.Key
+		}
+		return t.Key, t.Elem
 	}
 	c.fail(s.Iter.Position(), "cannot iterate over %s", t)
 	return nil, nil
@@ -625,6 +665,8 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 		c.slicing(e)
 	case *ast.SliceLit:
 		c.sliceLit(e, unwrap(want))
+	case *ast.MapLit:
+		c.mapLit(e, unwrap(want))
 	case *ast.Interp:
 		c.interp(e)
 	case *ast.Unary:
@@ -710,7 +752,7 @@ func (c *Checker) selector(e *ast.Selector) {
 		return
 	}
 	t := c.plain(e.X, nil)
-	if e.Name == "len" && (t.Kind == types.SliceKind || t == types.Str) {
+	if e.Name == "len" && (t.Kind == types.SliceKind || t.Kind == types.MapKind || t == types.Str) {
 		e.Length = true
 		e.Type = types.I64
 		return
@@ -722,6 +764,10 @@ func (c *Checker) selector(e *ast.Selector) {
 func (c *Checker) index(e *ast.Index) {
 	t := c.plain(e.X, nil)
 	switch {
+	case t.Kind == types.MapKind:
+		c.key(e.Index, t)
+		e.Type = c.optional(t.Elem)
+		return
 	case t.Kind == types.SliceKind:
 		e.Type = t.Elem
 	case t == types.Str:
@@ -766,6 +812,24 @@ func (c *Checker) sliceLit(e *ast.SliceLit, want *types.Type) {
 		c.expectType(el, elem)
 	}
 	e.Type = c.slice(elem)
+}
+
+func (c *Checker) mapLit(e *ast.MapLit, want *types.Type) {
+	if want != nil && want.Kind == types.MapKind {
+		e.Type = want
+	} else if len(e.Keys) == 0 {
+		c.fail(e.Pos, "cannot infer the type of an empty map; annotate it")
+	} else {
+		key := c.plain(e.Keys[0], nil)
+		if !key.Hashable() {
+			c.fail(e.Keys[0].Position(), "map keys must be integers, bool, str or pointers, found %s", key)
+		}
+		e.Type = c.mapOf(key, c.plain(e.Values[0], nil))
+	}
+	for i := range e.Keys {
+		c.expectType(e.Keys[i], e.Type.Key)
+		c.expectType(e.Values[i], e.Type.Elem)
+	}
 }
 
 func (c *Checker) interp(e *ast.Interp) {
@@ -926,6 +990,7 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 
 var builtins = map[string]bool{
 	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
+	"delete": true, "__str_raw": true,
 	"__bits": true, "__str_view": true,
 }
 
@@ -1008,6 +1073,15 @@ func (c *Checker) special(e *ast.Call, name string) bool {
 		} else if t != types.F64 {
 			c.fail(e.Pos, "__bits requires a float")
 		}
+	case "delete":
+		c.deleteEntry(e)
+	case "__str_raw":
+		if len(e.Args) != 2 {
+			c.fail(e.Pos, "__str_raw takes 2 arguments")
+		}
+		c.expectType(e.Args[0], types.I64)
+		c.expectType(e.Args[1], types.I64)
+		e.Builtin, e.Type = name, types.Str
 	case "__str_view":
 		c.single(e, name)
 		c.expectType(e.Args[0], c.slice(types.U8))
@@ -1016,6 +1090,23 @@ func (c *Checker) special(e *ast.Call, name string) bool {
 		return false
 	}
 	return true
+}
+
+func (c *Checker) deleteEntry(e *ast.Call) {
+	if len(e.Args) != 2 {
+		c.fail(e.Pos, "delete takes 2 arguments, found %d", len(e.Args))
+	}
+	r, ok := e.Args[0].(*ast.Ref)
+	if !ok {
+		c.fail(e.Args[0].Position(), "delete needs a mut map; write delete(mut m, key)")
+	}
+	t := c.borrow(r)
+	if t.Kind != types.MapKind {
+		c.fail(r.Pos, "delete needs a map, found %s", t)
+	}
+	c.key(e.Args[1], t)
+	e.Builtin = "delete"
+	e.Type = types.Void
 }
 
 func (c *Checker) push(e *ast.Call) {

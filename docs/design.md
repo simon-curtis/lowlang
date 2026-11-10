@@ -89,6 +89,26 @@ print(xs.len)
 - `xs.len` is the length as `i64`.
 - Elements of `u8`, `u16`, `u32`, `i32` and `f32` are packed at their natural width; other elements take a word each.
 
+### Maps
+
+```low
+let ages = ["ada": 36, "alan": 41]
+ages["grace"] = 85
+print(ages["bob"] ?? -1)
+var counts: [str: i64] = [:]
+counts["a"] += 1
+delete(mut counts, "a")
+for name, age in ages { print("{name} {age}") }
+for name in ages { print(name) }
+```
+
+- `[K: V]` maps keys of an integer type, `bool`, `str` or a pointer type to values of any type. A map is a pointer to a table on the garbage-collected heap, so assigning or passing it shares the table, and `m[k] = v` works through any binding.
+- `[k: v, ...]` builds a map; `[:]` is an empty one and needs an expected type.
+- `m[k]` returns `V?`. `m[k] = v` inserts or replaces. A compound assignment such as `m[k] += 1` starts from a zero value when `k` is missing.
+- `delete(mut m, k)` removes a key; removing a missing key does nothing.
+- `m.len` is the number of entries.
+- `for k, v in m` and `for k in m` visit entries in insertion order. A replaced value keeps its key's position; a deleted and re-inserted key moves to the end. Inserting new keys while iterating may skip or repeat entries.
+
 ### Strings
 
 ```low
@@ -319,7 +339,7 @@ The `low` command lives in `cmd/low`; the pipeline it shares with hot reload liv
 
 The runtime, `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls.
 
-`internal/compiler/prelude.low` is LowLang source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, integer formatting, and float formatting with Burger and Dybvig's free-format algorithm over big integers of 32-bit limbs. Its names start with `__`, which user code cannot use, and two intrinsics are available only there: `__bits` gives a float's bit pattern and `__str_view` turns a `[]u8` into a `str` without copying. Functions unreachable from `main` are dropped, so a program that formats no floats carries none of this code.
+`internal/compiler/prelude.low` is LowLang source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, the map table, integer formatting, and float formatting with Burger and Dybvig's free-format algorithm over big integers of 32-bit limbs. Its names start with `__`, which user code cannot use, and two intrinsics are available only there: `__bits` gives a float's bit pattern and `__str_view` turns a `[]u8` into a `str` without copying. Functions unreachable from `main` are dropped, so a program that formats no floats carries none of this code.
 
 The garbage collector is a non-moving mark-sweep collector in the runtime:
 
@@ -338,6 +358,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - A variable passed as `mut` lives in a frame slot and is accessed with loads and stores; every other variable is pure SSA.
 - Integer division carries its zero and overflow checks inside the instruction.
 - A `str` is two words and a slice three. An element access computes `pointer + index * stride` after a `check` instruction, which compares unsigned and jumps to the index panic; packed elements load with `movzx`, `movsxd` or a 32-bit `mov` and store at their width.
+- A map entry is a run of words in the prelude's `__Map.entries` slice: a live flag, the key and the value. An open-addressing index of entry numbers with linear probing finds them; deleted entries leave tombstones until the next rebuild, which compacts the entries in order and resizes the index to keep it at most three quarters full. Integer, `bool` and pointer keys hash their word; `str` keys hash their bytes with FNV-1a. The compiler reads and writes value words directly in the entries slice, so the prelude needs no generics.
 - `push` and the formatting helpers call the runtime's `rt_grow` and the prelude; the buffer behind an interpolation lives in a frame slot passed as a `mut` argument.
 - Unreachable blocks are pruned after construction.
 
@@ -381,7 +402,7 @@ Mechanism:
 
 ## Implemented
 
-- Types: `i64`, `i32`, `u32`, `u16`, `u8`, `f64`, `f32`, `bool`, `str`, slices `[]T`, structs, enums with payloads, results `T ! E`, pointers `*T`.
+- Types: `i64`, `i32`, `u32`, `u16`, `u8`, `f64`, `f32`, `bool`, `str`, slices `[]T`, maps `[K: V]`, structs, enums with payloads, results `T ! E`, pointers `*T`.
 - `let`, `var`, assignment, `if`/`else`, `for cond`, `for` with `break`/`continue`, `return`.
 - Functions with parameters and return values, recursion.
 - Arithmetic, comparison, logical, bitwise and shift operators; numeric conversions; `sqrt`, `floor` and `exp`.
@@ -390,18 +411,18 @@ Mechanism:
 - `mut` parameters.
 - Pointers, `new`, and a garbage-collected heap.
 - Range, slice and string loops; slice literals, indexing, slicing and `push`; string interpolation, concatenation and comparison.
+- Map literals, lookups, entry assignment, `delete` and map loops.
 - Builtins `print` for numbers, `bool` and `str`; `bytes` and `str`.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. Maps `[K: V]` over integer, `bool`, `str` and pointer keys: literals `[k: v]` and `[:]`, `m[k]` returning `V?`, `m[k] = v`, `delete(mut m, k)`, iteration in insertion order. Assigning a map shares it.
-2. Modules and visibility.
-3. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
-4. Embedded data: Unicode tables, SPIR-V and a fallback font.
-5. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
-6. C interop:
+1. Modules and visibility.
+2. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
+3. Embedded data: Unicode tables, SPIR-V and a fallback font.
+4. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
+5. C interop:
    - `extern fn` declarations.
    - System V ABI thunks: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` and `xmm0` to `xmm7`, struct classification, 16-byte stack alignment.
    - C struct layout with natural alignment, alongside the one-word-per-scalar layout.
@@ -410,14 +431,14 @@ Mechanism:
    - Unmanaged pointer-plus-length views over mmap'd and GPU-mapped memory.
    - Explicit release of file descriptors and mappings.
    - The garbage collector never frees memory held only by C.
-7. Function values, and C-callable function pointers for callbacks.
-8. Generics, with type erasure or dynamic dispatch for custom elements and views.
-9. Green-thread scheduler, channels, `select`:
+6. Function values, and C-callable function pointers for callbacks.
+7. Generics, with type erasure or dynamic dispatch for custom elements and views.
+8. Green-thread scheduler, channels, `select`:
     - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
     - C calls run on a large system stack rather than the green-thread stack.
     - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-10. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-11. GPU UI library modelled on Zed's GPUI, Linux first:
+9. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+10. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation.
@@ -426,5 +447,5 @@ Mechanism:
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-12. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-13. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+11. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+12. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

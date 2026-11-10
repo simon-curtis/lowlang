@@ -367,6 +367,10 @@ func (b *builder) typed(op Op, t *types.Type, args ...*Value) *Value {
 }
 
 func (b *builder) assign(s *ast.Assign) {
+	if s.Entry != nil {
+		b.assignEntry(s)
+		return
+	}
 	t := s.Target.TypeOf()
 	source := t
 	if s.Op == lexer.ShlAssign || s.Op == lexer.ShrAssign {
@@ -420,6 +424,9 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		v.Str = e.Value
 		return []*Value{v, b.constant(int64(len(e.Value)))}
 	case *ast.Index:
+		if e.X.TypeOf().Kind == types.MapKind {
+			return b.lookup(e)
+		}
 		p, _ := ast.PlaceOf(e)
 		if p == nil {
 			p = &ast.Place{Index: e}
@@ -429,6 +436,8 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		return b.slicing(e)
 	case *ast.SliceLit:
 		return b.sliceLit(e)
+	case *ast.MapLit:
+		return b.mapLit(e)
 	case *ast.Interp:
 		return b.interpolate(e)
 	case *ast.Ident:
@@ -467,6 +476,9 @@ func (b *builder) expr(e ast.Expr) []*Value {
 func (b *builder) selector(e *ast.Selector) []*Value {
 	if e.Variant != nil {
 		return b.construct(e.Type, e.Variant, nil)
+	}
+	if e.Length && e.X.TypeOf().Kind == types.MapKind {
+		return b.callNamed("__map_len", b.word(e.X))
 	}
 	if e.Length {
 		return b.value(e.X, e.X.TypeOf())[1:2]

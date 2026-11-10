@@ -16,6 +16,7 @@ const (
 	ResultKind
 	PointerKind
 	SliceKind
+	MapKind
 )
 
 type Type struct {
@@ -24,6 +25,7 @@ type Type struct {
 	Variants []*Variant
 	Fields   []*Field
 	Elem     *Type
+	Key      *Type
 	Ok       *Type
 	Err      *Type
 	Bits     int
@@ -106,6 +108,14 @@ func NewOptional(elem *Type) *Type {
 
 func (t *Type) Accepts(from *Type) bool {
 	return t == from || from == Never || (t.Optional && from == t.Elem)
+}
+
+func NewMap(key, value *Type) *Type {
+	return &Type{Kind: MapKind, Name: fmt.Sprintf("[%s: %s]", key, value), Key: key, Elem: value, size: 1}
+}
+
+func (t *Type) Hashable() bool {
+	return t.Integer() || t.Kind == BoolKind || t.Kind == StrKind || t.Kind == PointerKind
 }
 
 func NewSlice(elem *Type) *Type {

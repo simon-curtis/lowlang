@@ -16,6 +16,8 @@ type TypeName struct {
 	Pointer  bool
 	Slice    bool
 	Optional bool
+	Map      bool
+	Key      *TypeName
 	Elem     *TypeName
 	Pos      lexer.Pos
 }
@@ -163,6 +165,7 @@ type Assign struct {
 	Value  Expr
 	Pos    lexer.Pos
 	Place  *Place
+	Entry  *Index
 }
 
 type ExprStmt struct {
@@ -255,6 +258,13 @@ type SliceLit struct {
 	Typed
 	Elems []Expr
 	Pos   lexer.Pos
+}
+
+type MapLit struct {
+	Typed
+	Keys   []Expr
+	Values []Expr
+	Pos    lexer.Pos
 }
 
 type Interp struct {
@@ -388,6 +398,7 @@ func (n *Index) Position() lexer.Pos     { return n.Pos }
 func (n *Slicing) Position() lexer.Pos   { return n.Pos }
 func (n *SliceLit) Position() lexer.Pos  { return n.Pos }
 func (n *Interp) Position() lexer.Pos    { return n.Pos }
+func (n *MapLit) Position() lexer.Pos    { return n.Pos }
 func (n *ForIn) Position() lexer.Pos     { return n.Pos }
 func (n *Unary) Position() lexer.Pos     { return n.Pos }
 func (n *Binary) Position() lexer.Pos    { return n.Pos }
@@ -420,6 +431,7 @@ func (*Index) expr()     {}
 func (*Slicing) expr()   {}
 func (*SliceLit) expr()  {}
 func (*Interp) expr()    {}
+func (*MapLit) expr()    {}
 func (*Unary) expr()     {}
 func (*Binary) expr()    {}
 func (*Call) expr()      {}

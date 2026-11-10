@@ -241,8 +241,15 @@ func (p *Parser) typeTerm() *ast.TypeName {
 		return &ast.TypeName{Pointer: true, Elem: p.typeTerm(), Pos: pos}
 	case p.at(lexer.LBracket):
 		p.next()
+		if p.at(lexer.RBracket) {
+			p.next()
+			return &ast.TypeName{Slice: true, Elem: p.typeTerm(), Pos: pos}
+		}
+		key := p.typeName()
+		p.expect(lexer.Colon)
+		value := p.typeName()
 		p.expect(lexer.RBracket)
-		return &ast.TypeName{Slice: true, Elem: p.typeTerm(), Pos: pos}
+		return &ast.TypeName{Map: true, Key: key, Elem: value, Pos: pos}
 	}
 	return &ast.TypeName{Name: p.expect(lexer.Ident).Text, Pos: pos}
 }
@@ -481,12 +488,26 @@ func (p *Parser) interpolation(t lexer.Token) *ast.Interp {
 	return n
 }
 
-func (p *Parser) sliceLit() *ast.SliceLit {
-	lit := &ast.SliceLit{Pos: p.expect(lexer.LBracket).Pos}
+func (p *Parser) sliceLit() ast.Expr {
+	pos := p.expect(lexer.LBracket).Pos
+	if p.at(lexer.Colon) {
+		p.next()
+		p.expect(lexer.RBracket)
+		return &ast.MapLit{Pos: pos}
+	}
+	var keys, values []ast.Expr
+	mapped := false
 	p.nested(func() {
 		p.skipNewlines()
 		for !p.at(lexer.RBracket) {
-			lit.Elems = append(lit.Elems, p.expr())
+			keys = append(keys, p.expr())
+			if len(keys) == 1 && p.at(lexer.Colon) {
+				mapped = true
+			}
+			if mapped {
+				p.expect(lexer.Colon)
+				values = append(values, p.expr())
+			}
 			if p.at(lexer.Comma) {
 				p.next()
 			} else if !p.at(lexer.RBracket) {
@@ -496,7 +517,10 @@ func (p *Parser) sliceLit() *ast.SliceLit {
 		}
 	})
 	p.expect(lexer.RBracket)
-	return lit
+	if mapped {
+		return &ast.MapLit{Keys: keys, Values: values, Pos: pos}
+	}
+	return &ast.SliceLit{Elems: keys, Pos: pos}
 }
 
 func (p *Parser) index(x ast.Expr) ast.Expr {

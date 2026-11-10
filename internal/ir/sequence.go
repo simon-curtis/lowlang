@@ -146,6 +146,11 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 	case "push":
 		b.push(e)
 		return nil
+	case "delete":
+		b.deleteEntry(e)
+		return nil
+	case "__str_raw":
+		return []*Value{b.word(arg), b.word(e.Args[1])}
 	case "bytes":
 		return b.callNamed("__bytes", b.value(arg, types.Str)...)
 	case "from_bytes":
@@ -202,6 +207,10 @@ func (b *builder) push(e *ast.Call) {
 func (b *builder) forIn(s *ast.ForIn) {
 	if s.End != nil {
 		b.rangeLoop(s)
+		return
+	}
+	if s.Iter.TypeOf().Kind == types.MapKind {
+		b.mapLoop(s)
 		return
 	}
 	seq := b.value(s.Iter, s.Iter.TypeOf())
