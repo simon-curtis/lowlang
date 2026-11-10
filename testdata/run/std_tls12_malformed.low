@@ -1,0 +1,195 @@
+import std/crypto/x509
+import std/io
+import std/net
+import std/tls
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_blocks(embed("std_tls12/ca.pem"), "CERTIFICATE") {
+        push(mut out, x509.parse(der) catch {
+            _ => return out
+        })
+    }
+    out
+}
+
+fn server_config(pem: str) -> tls.Config ! io.Error {
+    tls.Config { certificates: tls.load_certificates(pem), key: tls.load_key(pem)?, max_version: tls.tls12() }
+}
+
+fn client_config() -> tls.Config {
+    tls.Config { server_name: "localhost", roots: roots(), max_version: tls.tls12(), groups: [0x001D, 0x0017] }
+}
+
+fn drain(c: net.Conn) {
+    let buf = io.buffer(4096)
+    for {
+        let n = net.read(c, buf) catch 0
+        if n == 0 {
+            break
+        }
+    }
+}
+
+fn record(from: net.Conn, to: net.Conn, out: chan[[]u8]) {
+    var seen: []u8 = []
+    let buf = io.buffer(16384)
+    for {
+        let n = net.read(from, buf) catch 0
+        if n == 0 {
+            break
+        }
+        io.append(mut seen, buf[..n])
+        net.write_all(to, buf[..n]) catch {
+            _ => break
+        }
+    }
+    net.shutdown_write(to) catch {
+        _ => {}
+    }
+    out <- seen
+}
+
+struct Capture {
+    client: []u8
+    server: []u8
+}
+
+fn capture(config: tls.Config) -> Capture ! io.Error {
+    let backend = net.listen("127.0.0.1", 0)?
+    let front = net.listen("127.0.0.1", 0)?
+    spawn serve_once(backend, config)
+    let conn = net.connect(front.addr)?
+    let inner = net.accept(front)?
+    let upstream = net.connect(backend.addr)?
+    let from_client = chan[[]u8](1)
+    let from_server = chan[[]u8](1)
+    spawn record(inner, upstream, from_client)
+    spawn record(upstream, inner, from_server)
+    let t = tls.client(net.stream(conn), client_config())?
+    io.write_str(tls.stream(t), "ping\n")?
+    let reply = io.read_line(io.reader(tls.stream(t)))?
+    tls.close(t)
+    let client = (<-from_client) ?? []
+    let server = (<-from_server) ?? []
+    net.close(inner)
+    net.close(upstream)
+    net.close_listener(backend)
+    net.close_listener(front)
+    print("captured {reply}: client sent {client.len} bytes, server sent {server.len} bytes")
+    Capture { client, server }
+}
+
+fn serve_once(l: net.Listener, config: tls.Config) {
+    let c = net.accept(l) catch {
+        _ => return
+    }
+    let t = tls.server(net.stream(c), config) catch {
+        _ => {
+            net.close(c)
+            return
+        }
+    }
+    let s = tls.stream(t)
+    let line = io.read_line(io.reader(s)) catch ""
+    io.write_str(s, "{line}\n") catch {
+        _ => {}
+    }
+    tls.close(t)
+}
+
+fn completed(attempt: fn() -> *tls.Session ! io.Error) -> bool {
+    let t = attempt() catch {
+        _ => return false
+    }
+    t.version > 0
+}
+
+fn serve_all(l: net.Listener, config: tls.Config, count: i64, results: chan[bool]) {
+    for _ in 0..count {
+        let c = net.accept(l) catch {
+            _ => return
+        }
+        let accepted = completed(fn() -> *tls.Session ! io.Error { tls.server(net.stream(c), config) })
+        net.close(c)
+        results <- accepted
+    }
+}
+
+fn variants(data: []u8, dense: i64, stride: i64) -> [][]u8 {
+    var out: [][]u8 = []
+    var at = 0
+    for at < data.len {
+        var flipped: []u8 = []
+        io.append(mut flipped, data)
+        flipped[at] = flipped[at] ^ 0x41
+        push(mut out, flipped)
+        push(mut out, data[..at])
+        at += if at < dense { 1 } else { stride }
+    }
+    out
+}
+
+fn attack_server(config: tls.Config, stream: []u8) ! io.Error {
+    let tries = variants(stream, 160, 11)
+    let l = net.listen("127.0.0.1", 0)?
+    let results = chan[bool](tries.len)
+    spawn serve_all(l, config, tries.len, results)
+    var accepted = 0
+    for bytes in tries {
+        let c = net.connect(l.addr)?
+        net.write_all(c, bytes) catch {
+            _ => {}
+        }
+        net.shutdown_write(c) catch {
+            _ => {}
+        }
+        drain(c)
+        net.close(c)
+        if (<-results) ?? true {
+            accepted += 1
+        }
+    }
+    net.close_listener(l)
+    print("server accepted {accepted} of {tries.len} altered or truncated client streams")
+}
+
+fn fake_server(l: net.Listener, tries: [][]u8) {
+    for bytes in tries {
+        let c = net.accept(l) catch {
+            _ => return
+        }
+        net.write_all(c, bytes) catch {
+            _ => {}
+        }
+        net.shutdown_write(c) catch {
+            _ => {}
+        }
+        drain(c)
+        net.close(c)
+    }
+}
+
+fn attack_client(stream: []u8) ! io.Error {
+    let tries = variants(stream, 100, 17)
+    let l = net.listen("127.0.0.1", 0)?
+    spawn fake_server(l, tries)
+    var accepted = 0
+    for _ in tries {
+        let c = net.connect(l.addr)?
+        let ok = completed(fn() -> *tls.Session ! io.Error { tls.client(net.stream(c), client_config()) })
+        net.close(c)
+        if ok {
+            accepted += 1
+        }
+    }
+    net.close_listener(l)
+    print("client accepted {accepted} of {tries.len} altered or truncated server streams")
+}
+
+fn main() ! io.Error {
+    let config = server_config(embed("std_tls12/rsa.pem"))?
+    let seen = capture(config)?
+    attack_server(server_config(embed("std_tls12/p256.pem"))?, seen.client)?
+    attack_client(seen.server)?
+}

@@ -1,0 +1,244 @@
+import std/crypto/x509
+import std/io
+import std/net
+import std/tls
+
+enum Outcome {
+    Done(t: *tls.Session)
+    Failed(why: str)
+}
+
+fn outcome(attempt: fn() -> *tls.Session ! io.Error) -> Outcome {
+    let t = attempt() catch {
+        Invalid => return Failed("invalid")
+        Unsupported => return Failed("unsupported")
+        Malformed => return Failed("malformed")
+        Refused => return Failed("refused")
+        Eof => return Failed("eof")
+        _ => return Failed("other")
+    }
+    Done(t)
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_blocks(embed("std_tls12/ca.pem"), "CERTIFICATE") {
+        push(mut out, x509.parse(der) catch {
+            _ => return out
+        })
+    }
+    out
+}
+
+struct Tamper {
+    from_client: bool
+    record: i64
+    change: fn([]u8) -> []u8
+}
+
+fn unchanged(record: []u8) -> []u8 {
+    record
+}
+
+fn flip(at: i64) -> fn([]u8) -> []u8 {
+    fn(record: []u8) -> []u8 {
+        var out: []u8 = []
+        io.append(mut out, record)
+        if at < out.len {
+            out[at] = out[at] ^ 0x01
+        }
+        out
+    }
+}
+
+fn hello_extensions(kind: u8, body: []u8) -> i64 {
+    var at = 2 + 32
+    at += 1 + i64(body[at])
+    if kind == 1 {
+        at += 2 + io.be16(body, at)
+        at += 1 + i64(body[at])
+    } else {
+        at += 3
+    }
+    at
+}
+
+fn without_extension(message: []u8, removed: i64) -> []u8 {
+    let body = message[4..]
+    let start = hello_extensions(message[0], body)
+    var kept: []u8 = []
+    var at = start + 2
+    for at < body.len {
+        let kind = io.be16(body, at)
+        let size = io.be16(body, at + 2)
+        if kind != removed {
+            io.append(mut kept, body[at..at + 4 + size])
+        }
+        at += 4 + size
+    }
+    var rebuilt: []u8 = []
+    io.append(mut rebuilt, body[..start])
+    io.put_be16(mut rebuilt, kept.len)
+    io.append(mut rebuilt, kept)
+    var out: []u8 = [message[0]]
+    io.put_be24(mut out, rebuilt.len)
+    io.append(mut out, rebuilt)
+    out
+}
+
+fn strip(removed: i64) -> fn([]u8) -> []u8 {
+    fn(record: []u8) -> []u8 {
+        var payload: []u8 = []
+        var at = 5
+        for at < record.len {
+            let size = 4 + io.be24(record, at + 1)
+            let message = record[at..at + size]
+            let kind = message[0]
+            if kind == 1 || kind == 2 {
+                io.append(mut payload, without_extension(message, removed))
+            } else {
+                io.append(mut payload, message)
+            }
+            at += size
+        }
+        var out: []u8 = [record[0], record[1], record[2]]
+        io.put_be16(mut out, payload.len)
+        io.append(mut out, payload)
+        out
+    }
+}
+
+fn relay(from: net.Conn, to: net.Conn, from_client: bool, tamper: Tamper, alerts: chan[str]) {
+    let r = io.reader(net.stream(from))
+    var seen = ""
+    var index = 0
+    for {
+        let header = io.read_exact(r, 5) catch {
+            _ => break
+        }
+        let body = io.read_exact(r, io.be16(header, 3)) catch {
+            _ => break
+        }
+        var record: []u8 = []
+        io.append(mut record, header)
+        io.append(mut record, body)
+        if tamper.from_client == from_client && tamper.record == index {
+            record = tamper.change(record)
+        }
+        if header[0] == 21 {
+            seen = if body.len == 2 { "{seen} {body[1]}" } else { "{seen} encrypted" }
+        }
+        net.write_all(to, record) catch {
+            _ => break
+        }
+        index += 1
+    }
+    net.shutdown_write(to) catch {
+        _ => {}
+    }
+    alerts <- seen
+}
+
+fn serve(l: net.Listener, config: tls.Config, done: chan[str]) {
+    let c = net.accept(l) catch {
+        _ => {
+            done <- "accept failed"
+            return
+        }
+    }
+    let session = match outcome(fn() -> *tls.Session ! io.Error { tls.server(net.stream(c), config) }) {
+        Done(t) => t
+        Failed(why) => {
+            net.close(c)
+            done <- "server failed ({why})"
+            return
+        }
+    }
+    let s = tls.stream(session)
+    let line = io.read_line(io.reader(s)) catch "read failed"
+    io.write_str(s, "{line}\n") catch {
+        _ => {}
+    }
+    tls.close(session)
+    done <- "server {session.version}"
+}
+
+fn proxy(l: net.Listener, target: net.Addr, tamper: Tamper, report: chan[str]) {
+    let client = net.accept(l) catch {
+        _ => {
+            report <- "accept failed"
+            return
+        }
+    }
+    let server = net.connect(target) catch {
+        _ => {
+            net.close(client)
+            report <- "connect failed"
+            return
+        }
+    }
+    let upstream = chan[str](1)
+    let downstream = chan[str](1)
+    spawn relay(client, server, true, tamper, upstream)
+    spawn relay(server, client, false, tamper, downstream)
+    let sent_by_client = (<-upstream) ?? ""
+    let sent_by_server = (<-downstream) ?? ""
+    net.close(client)
+    net.close(server)
+    report <- "client alerts [{sent_by_client}] server alerts [{sent_by_server}]"
+}
+
+fn attempt(label: str, server: tls.Config, client: tls.Config, tamper: Tamper) ! io.Error {
+    let pem = embed("std_tls12/p256.pem")
+    var config = server
+    config.certificates = tls.load_certificates(pem)
+    config.key = tls.load_key(pem)?
+    let backend = net.listen("127.0.0.1", 0)?
+    let front = net.listen("127.0.0.1", 0)?
+    let done = chan[str](1)
+    let report = chan[str](1)
+    spawn serve(backend, config, done)
+    spawn proxy(front, backend.addr, tamper, report)
+    let conn = net.connect(front.addr)?
+    let result = match outcome(fn() -> *tls.Session ! io.Error { tls.client(net.stream(conn), client) }) {
+        Done(t) => {
+            let s = tls.stream(t)
+            io.write_str(s, "ping\n")?
+            let echoed = io.read_line(io.reader(s)) catch "no reply"
+            tls.close(t)
+            "client {t.version} [{echoed}]"
+        }
+        Failed(why) => {
+            net.close(conn)
+            "client failed ({why})"
+        }
+    }
+    let server_said = (<-done) ?? ""
+    let proxy_said = (<-report) ?? ""
+    net.close_listener(backend)
+    net.close_listener(front)
+    print("{label}: {result}, {server_said}, {proxy_said}")
+}
+
+fn main() ! io.Error {
+    let client = tls.Config { server_name: "localhost", roots: roots() }
+    let client12 = tls.Config { server_name: "localhost", roots: roots(), max_version: tls.tls12() }
+    let server = tls.Config {}
+    let server12 = tls.Config { max_version: tls.tls12() }
+    let untouched = Tamper { from_client: true, record: -1, change: unchanged }
+    attempt("untouched", server, client, untouched)?
+    attempt("untouched 1.2", server12, client, untouched)?
+    attempt("supported_versions stripped, server supports 1.3", server, client, Tamper { from_client: true, record: 0, change: strip(43) })?
+    attempt("supported_versions stripped, server supports only 1.2", server12, client, Tamper { from_client: true, record: 0, change: strip(43) })?
+    attempt("renegotiation_info stripped from the server hello", server12, client12, Tamper { from_client: false, record: 0, change: strip(0xFF01) })?
+    attempt("extended_master_secret stripped from the server hello", server12, client12, Tamper { from_client: false, record: 0, change: strip(23) })?
+    attempt("extended_master_secret stripped from the client hello", server12, client12, Tamper { from_client: true, record: 0, change: strip(23) })?
+    attempt("renegotiation_info stripped from the client hello", server12, client12, Tamper { from_client: true, record: 0, change: strip(0xFF01) })?
+    attempt("server random altered", server12, client12, Tamper { from_client: false, record: 0, change: flip(5 + 4 + 2 + 3) })?
+    attempt("client key exchange altered", server12, client12, Tamper { from_client: true, record: 1, change: flip(5 + 4 + 1) })?
+    attempt("change_cipher_spec altered", server12, client12, Tamper { from_client: true, record: 2, change: flip(5) })?
+    attempt("client finished ciphertext altered", server12, client12, Tamper { from_client: true, record: 3, change: flip(5 + 8 + 2) })?
+    attempt("client finished explicit nonce altered", server12, client12, Tamper { from_client: true, record: 3, change: flip(5 + 2) })?
+    attempt("server finished ciphertext altered", server12, client12, Tamper { from_client: false, record: 2, change: flip(5 + 8 + 2) })?
+    attempt("application data altered", server12, client12, Tamper { from_client: true, record: 4, change: flip(5 + 8 + 1) })?
+}
