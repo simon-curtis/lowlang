@@ -135,10 +135,37 @@ type CompletionList struct {
 	Items        []CompletionItem `json:"items"`
 }
 
+type ReferenceContext struct {
+	IncludeDeclaration bool `json:"includeDeclaration"`
+}
+
+type ReferenceParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+	Context      ReferenceContext       `json:"context"`
+}
+
+type RenameParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+	NewName      string                 `json:"newName"`
+}
+
+type TextEdit struct {
+	Range   Range  `json:"range"`
+	NewText string `json:"newText"`
+}
+
+type WorkspaceEdit struct {
+	Changes map[string][]TextEdit `json:"changes"`
+}
+
 type Capabilities struct {
 	TextDocumentSync       SyncOptions       `json:"textDocumentSync"`
 	HoverProvider          bool              `json:"hoverProvider"`
 	DefinitionProvider     bool              `json:"definitionProvider"`
+	ReferencesProvider     bool              `json:"referencesProvider"`
+	RenameProvider         bool              `json:"renameProvider"`
 	DocumentSymbolProvider bool              `json:"documentSymbolProvider"`
 	CompletionProvider     CompletionOptions `json:"completionProvider"`
 }
@@ -163,6 +190,7 @@ const (
 	syncFull         = 1
 	methodNotFound   = -32601
 	invalidParams    = -32602
+	requestFailed    = -32803
 )
 
 type stream struct {

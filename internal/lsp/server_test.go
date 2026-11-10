@@ -96,6 +96,15 @@ func (c *client) notify(method string, params any) {
 
 func (c *client) request(method string, params any) json.RawMessage {
 	c.t.Helper()
+	result, failure := c.call(method, params)
+	if failure != nil {
+		c.t.Fatalf("%s failed: %s", method, failure.Message)
+	}
+	return result
+}
+
+func (c *client) call(method string, params any) (json.RawMessage, *rpcError) {
+	c.t.Helper()
 	c.next++
 	id := c.next
 	c.send(outgoing{ID: &id, Method: method, Params: params})
@@ -113,10 +122,7 @@ func (c *client) request(method string, params any) json.RawMessage {
 			if m.ID == nil || *m.ID != id {
 				continue
 			}
-			if m.Error != nil {
-				c.t.Fatalf("%s failed: %s", method, m.Error.Message)
-			}
-			return m.Result
+			return m.Result, m.Error
 		case <-timeout:
 			c.t.Fatalf("timed out waiting for %s", method)
 		}

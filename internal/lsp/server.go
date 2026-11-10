@@ -25,6 +25,7 @@ type Server struct {
 	docs      sources
 	units     map[string]*compiler.Unit
 	published map[string][]string
+	fresh     map[string]bool
 	compiles  *scheduler
 	shutdown  bool
 }
@@ -35,6 +36,7 @@ func NewServer(in io.Reader, out io.Writer) *Server {
 		docs:      sources{},
 		units:     map[string]*compiler.Unit{},
 		published: map[string][]string{},
+		fresh:     map[string]bool{},
 		compiles:  newScheduler(),
 	}
 }
@@ -129,6 +131,23 @@ func (s *Server) handle(req request) (bool, error) {
 		return false, s.position(req, s.definition)
 	case "textDocument/completion":
 		return false, s.position(req, s.completion)
+	case "textDocument/references":
+		var p ReferenceParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return false, s.fail(req.ID, invalidParams, err.Error())
+		}
+		locations := s.references(p)
+		return false, s.reply(req.ID, locations)
+	case "textDocument/rename":
+		var p RenameParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return false, s.fail(req.ID, invalidParams, err.Error())
+		}
+		edit, err := s.rename(p)
+		if err != nil {
+			return false, s.fail(req.ID, requestFailed, err.Error())
+		}
+		return false, s.reply(req.ID, edit)
 	case "textDocument/documentSymbol":
 		var p DocumentParams
 		if err := json.Unmarshal(req.Params, &p); err != nil {
@@ -151,6 +170,8 @@ func (s *Server) initialize() InitializeResult {
 			TextDocumentSync:       SyncOptions{OpenClose: true, Change: syncFull, Save: SaveOptions{}},
 			HoverProvider:          true,
 			DefinitionProvider:     true,
+			ReferencesProvider:     true,
+			RenameProvider:         true,
 			DocumentSymbolProvider: true,
 			CompletionProvider:     CompletionOptions{TriggerCharacters: []string{"."}},
 		},
@@ -169,6 +190,7 @@ func (s *Server) document(req request, apply func(path string)) {
 
 func (s *Server) schedule(path string, delay time.Duration) {
 	entry := s.entry(path)
+	s.fresh[entry] = false
 	s.compiles.mark(entry, path, delay)
 }
 
@@ -235,6 +257,7 @@ func (s *Server) finish(r compiled) error {
 	if !current {
 		return nil
 	}
+	s.fresh[entry] = r.err == nil
 	diagnostics := map[string][]Diagnostic{}
 	for path := range s.docs {
 		if s.entry(path) == entry {
