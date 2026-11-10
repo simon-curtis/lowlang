@@ -7,14 +7,16 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/lexer"
+	"lowlang/internal/types"
 )
 
 //go:embed runtime.asm
 var runtime string
 
 type loopLabels struct {
-	top string
-	end string
+	top   string
+	end   string
+	depth int
 }
 
 type Generator struct {
@@ -23,12 +25,19 @@ type Generator struct {
 	labels  int
 	strings map[string]string
 	fn      *ast.Func
+	frame   int
+	depth   int
 	ret     string
 	loops   []loopLabels
 }
 
 func Generate(file *ast.File) string {
 	g := &Generator{strings: map[string]string{}}
+	for _, fn := range file.Funcs {
+		if fn.Name == "main" {
+			g.start(fn)
+		}
+	}
 	for _, fn := range file.Funcs {
 		g.function(fn)
 	}
@@ -54,28 +63,40 @@ func (g *Generator) newLabel() string {
 	return fmt.Sprintf(".L%d", g.labels)
 }
 
-func (g *Generator) function(fn *ast.Func) {
-	g.fn = fn
-	g.ret = g.newLabel()
-	frame := (len(fn.Locals)*8 + 15) &^ 15
-	g.label(fmt.Sprintf("fn_%s", fn.Name))
-	g.emit("push rbp")
-	g.emit("mov rbp, rsp")
-	if frame > 0 {
-		g.emit("sub rsp, %d", frame)
-	}
-	g.expr(fn.Body)
-	g.label(g.ret)
-	g.emit("mov rsp, rbp")
-	g.emit("pop rbp")
-	g.emit("ret")
+func mem(offset int) string {
+	return fmt.Sprintf("qword ptr [rbp%+d]", offset)
 }
 
-func slot(l *ast.Local) string {
-	if l.Param {
-		return fmt.Sprintf("qword ptr [rbp+%d]", 16+8*l.Index)
+func (g *Generator) start(main *ast.Func) {
+	ret := main.RetType
+	g.text.WriteString("\t.globl _start\n_start:\n")
+	if ret.Kind == types.ResultKind {
+		exit := g.newLabel()
+		g.emit("sub rsp, %d", 8*ret.Size())
+		g.emit("call fn_main")
+		g.emit("cmp qword ptr [rsp], 0")
+		g.emit("je %s", exit)
+		g.emit("mov rax, [rsp+8]")
+		g.emit("lea rcx, [rip+%s]", g.variantNames(ret.Err))
+		g.emit("mov rdi, [rcx+8*rax]")
+		g.emit("call rt_error")
+		g.label(exit)
+	} else {
+		g.emit("call fn_main")
 	}
-	return fmt.Sprintf("qword ptr [rbp-%d]", 8*(l.Index+1))
+	g.emit("xor edi, edi")
+	g.emit("mov eax, 60")
+	g.emit("syscall")
+}
+
+func (g *Generator) variantNames(enum *types.Type) string {
+	table := g.newLabel()
+	names := make([]string, len(enum.Variants))
+	for i, v := range enum.Variants {
+		names[i] = g.stringLabel(v.Name)
+	}
+	fmt.Fprintf(&g.data, "\t.p2align 3\n%s:\n\t.quad %s\n", table, strings.Join(names, ","))
+	return table
 }
 
 func (g *Generator) stringLabel(s string) string {
@@ -96,6 +117,116 @@ func (g *Generator) stringLabel(s string) string {
 	return l
 }
 
+func (g *Generator) function(fn *ast.Func) {
+	g.fn = fn
+	g.ret = g.newLabel()
+	g.depth = 0
+	g.frame = (fn.FrameWords*8 + 15) &^ 15
+	g.label(fmt.Sprintf("fn_%s", fn.Name))
+	g.emit("push rbp")
+	g.emit("mov rbp, rsp")
+	if g.frame > 0 {
+		g.emit("sub rsp, %d", g.frame)
+	}
+	g.expr(fn.Body)
+	g.returnValue(fn.Body.Type)
+	g.label(g.ret)
+	g.emit("mov rsp, rbp")
+	g.emit("pop rbp")
+	g.emit("ret")
+}
+
+func (g *Generator) retOffset() int {
+	return 16 + 8*g.fn.ParamWords
+}
+
+func (g *Generator) returnValue(t *types.Type) {
+	ret := g.fn.RetType
+	switch {
+	case t == types.Never:
+	case ret == types.Void:
+		g.discard(t)
+	case t == ret && t.Scalar():
+	case t == ret:
+		g.store(t, g.retOffset())
+	case ret.Kind == types.ResultKind && t == ret.Ok:
+		g.store(t, g.retOffset()+8)
+		g.emit("mov %s, 0", mem(g.retOffset()))
+	default:
+		g.discard(t)
+		g.emit("mov %s, 0", mem(g.retOffset()))
+	}
+}
+
+func (g *Generator) push(operand string) {
+	g.emit("push %s", operand)
+	g.depth++
+}
+
+func (g *Generator) pop(reg string) {
+	g.emit("pop %s", reg)
+	g.depth--
+}
+
+func (g *Generator) reserve(words int) int {
+	if words > 0 {
+		g.emit("sub rsp, %d", 8*words)
+		g.depth += words
+	}
+	return -(g.frame + 8*g.depth)
+}
+
+func (g *Generator) release(words int) {
+	if words > 0 {
+		g.emit("add rsp, %d", 8*words)
+		g.depth -= words
+	}
+}
+
+func (g *Generator) discard(t *types.Type) {
+	g.release(t.StackWords())
+}
+
+func (g *Generator) coerce(from, to *types.Type) {
+	if to == types.Void {
+		g.discard(from)
+	}
+}
+
+func (g *Generator) unwind(depth int) {
+	if g.depth > depth {
+		g.emit("add rsp, %d", 8*(g.depth-depth))
+	}
+}
+
+func (g *Generator) store(t *types.Type, offset int) {
+	if t.Scalar() {
+		g.emit("mov %s, rax", mem(offset))
+		return
+	}
+	for k := range t.StackWords() {
+		g.pop("rax")
+		g.emit("mov %s, rax", mem(offset+8*k))
+	}
+}
+
+func (g *Generator) load(t *types.Type, offset int) {
+	if t.Scalar() {
+		g.emit("mov rax, %s", mem(offset))
+		return
+	}
+	for k := t.Size() - 1; k >= 0; k-- {
+		g.push(mem(offset + 8*k))
+	}
+}
+
+func (g *Generator) copyWords(words, from, to int) {
+	for k := range words {
+		g.emit("mov rax, %s", mem(from+8*k))
+		g.emit("mov %s, rax", mem(to+8*k))
+	}
+}
+
 func (g *Generator) block(b *ast.Block) {
 	for _, s := range b.Stmts {
 		g.stmt(s)
@@ -109,23 +240,40 @@ func (g *Generator) stmt(s ast.Stmt) {
 	switch s := s.(type) {
 	case *ast.Let:
 		g.expr(s.Value)
-		g.emit("mov %s, rax", slot(s.Local))
+		g.store(s.Local.Type, s.Local.Offset)
 	case *ast.Assign:
 		g.assign(s)
 	case *ast.ExprStmt:
 		g.expr(s.X)
+		g.discard(s.X.TypeOf())
 	case *ast.For:
 		g.forStmt(s)
 	case *ast.Break:
-		g.emit("jmp %s", g.loops[len(g.loops)-1].end)
+		l := g.loops[len(g.loops)-1]
+		g.unwind(l.depth)
+		g.emit("jmp %s", l.end)
 	case *ast.Continue:
-		g.emit("jmp %s", g.loops[len(g.loops)-1].top)
+		l := g.loops[len(g.loops)-1]
+		g.unwind(l.depth)
+		g.emit("jmp %s", l.top)
 	case *ast.Return:
-		if s.Value != nil {
-			g.expr(s.Value)
-		}
+		g.returnStmt(s)
+	case *ast.Fail:
+		g.expr(s.Value)
+		g.store(s.Value.TypeOf(), g.retOffset()+8)
+		g.emit("mov %s, 1", mem(g.retOffset()))
 		g.emit("jmp %s", g.ret)
 	}
+}
+
+func (g *Generator) returnStmt(s *ast.Return) {
+	t := types.Void
+	if s.Value != nil {
+		g.expr(s.Value)
+		t = s.Value.TypeOf()
+	}
+	g.returnValue(t)
+	g.emit("jmp %s", g.ret)
 }
 
 var compoundOps = map[lexer.Kind]lexer.Kind{
@@ -137,14 +285,14 @@ func (g *Generator) assign(s *ast.Assign) {
 	g.expr(s.Value)
 	if op, ok := compoundOps[s.Op]; ok {
 		g.emit("mov rcx, rax")
-		g.emit("mov rax, %s", slot(s.Local))
+		g.emit("mov rax, %s", mem(s.Local.Offset))
 		g.arith(op)
 	}
-	g.emit("mov %s, rax", slot(s.Local))
+	g.store(s.Local.Type, s.Local.Offset)
 }
 
 func (g *Generator) forStmt(s *ast.For) {
-	l := loopLabels{top: g.newLabel(), end: g.newLabel()}
+	l := loopLabels{top: g.newLabel(), end: g.newLabel(), depth: g.depth}
 	g.label(l.top)
 	if s.Cond != nil {
 		g.expr(s.Cond)
@@ -153,9 +301,11 @@ func (g *Generator) forStmt(s *ast.For) {
 	}
 	g.loops = append(g.loops, l)
 	g.block(s.Body)
+	g.discard(s.Body.Type)
 	g.loops = g.loops[:len(g.loops)-1]
 	g.emit("jmp %s", l.top)
 	g.label(l.end)
+	g.depth = l.depth
 }
 
 func (g *Generator) expr(e ast.Expr) {
@@ -167,7 +317,13 @@ func (g *Generator) expr(e ast.Expr) {
 	case *ast.BoolLit:
 		g.emit("mov eax, %d", boolInt(e.Value))
 	case *ast.Ident:
-		g.emit("mov rax, %s", slot(e.Local))
+		if e.Variant != nil {
+			g.construct(e.Type, e.Variant, nil)
+			return
+		}
+		g.load(e.Type, e.Local.Offset)
+	case *ast.Selector:
+		g.construct(e.Type, e.Variant, nil)
 	case *ast.Unary:
 		g.unary(e)
 	case *ast.Binary:
@@ -178,6 +334,14 @@ func (g *Generator) expr(e ast.Expr) {
 		g.ifExpr(e)
 	case *ast.Block:
 		g.block(e)
+	case *ast.Match:
+		g.expr(e.X)
+		g.store(e.Temp.Type, e.Temp.Offset)
+		g.dispatch(e.Arms, e.Temp, e.Type)
+	case *ast.Try:
+		g.try(e)
+	case *ast.Catch:
+		g.catch(e)
 	}
 }
 
@@ -207,11 +371,12 @@ func (g *Generator) binary(e *ast.Binary) {
 		g.logical(e)
 		return
 	}
-	g.expr(e.Y)
-	g.emit("push rax")
 	g.expr(e.X)
-	g.emit("pop rcx")
-	if e.X.TypeOf() == ast.Str {
+	g.push("rax")
+	g.expr(e.Y)
+	g.emit("mov rcx, rax")
+	g.pop("rax")
+	if e.X.TypeOf() == types.Str {
 		g.stringCompare(e.Op)
 		return
 	}
@@ -282,33 +447,158 @@ func (g *Generator) logical(e *ast.Binary) {
 }
 
 func (g *Generator) call(e *ast.Call) {
-	if e.Builtin != "" {
+	switch {
+	case e.Builtin != "":
 		g.expr(e.Args[0])
 		g.emit("mov rdi, rax")
 		g.emit("call rt_%s", e.Builtin)
+	case e.Variant != nil:
+		g.construct(e.Type, e.Variant, e.Args)
+	default:
+		g.callFunc(e)
+	}
+}
+
+func (g *Generator) callFunc(e *ast.Call) {
+	fn := e.Target
+	offset := g.reserve(fn.RetType.StackWords() + fn.ParamWords)
+	for i, arg := range e.Args {
+		g.expr(arg)
+		param := fn.ParamTypes[i]
+		g.store(param, offset)
+		offset += 8 * param.Size()
+	}
+	g.emit("call fn_%s", fn.Name)
+	g.release(fn.ParamWords)
+}
+
+func (g *Generator) construct(enum *types.Type, v *types.Variant, args []ast.Expr) {
+	if enum.Scalar() {
+		g.emit("mov eax, %d", v.Tag)
 		return
 	}
-	for i := len(e.Args) - 1; i >= 0; i-- {
-		g.expr(e.Args[i])
-		g.emit("push rax")
-	}
-	g.emit("call fn_%s", e.Name)
-	if n := len(e.Args); n > 0 {
-		g.emit("add rsp, %d", 8*n)
+	base := g.reserve(enum.Size())
+	g.emit("mov %s, %d", mem(base), v.Tag)
+	for i, arg := range args {
+		g.expr(arg)
+		g.store(v.Fields[i], base+8*v.Offsets[i])
 	}
 }
 
 func (g *Generator) ifExpr(e *ast.If) {
+	depth := g.depth
 	otherwise := g.newLabel()
 	done := g.newLabel()
 	g.expr(e.Cond)
 	g.emit("test rax, rax")
 	g.emit("jz %s", otherwise)
 	g.block(e.Then)
+	g.coerce(e.Then.Type, e.Type)
 	g.emit("jmp %s", done)
 	g.label(otherwise)
+	g.depth = depth
 	if e.Else != nil {
 		g.expr(e.Else)
+		g.coerce(e.Else.TypeOf(), e.Type)
 	}
 	g.label(done)
+	g.depth = depth + e.Type.StackWords()
+}
+
+func (g *Generator) dispatch(arms []*ast.Arm, subject *ast.Local, result *types.Type) {
+	depth := g.depth
+	done := g.newLabel()
+	targets := make([]string, len(arms))
+	g.emit("mov rax, %s", mem(subject.Offset))
+	for i, arm := range arms {
+		targets[i] = g.newLabel()
+		if arm.Pattern.Variant == nil {
+			g.emit("jmp %s", targets[i])
+			continue
+		}
+		g.emit("cmp rax, %d", arm.Pattern.Variant.Tag)
+		g.emit("je %s", targets[i])
+	}
+	g.emit("ud2")
+	for i, arm := range arms {
+		g.label(targets[i])
+		g.depth = depth
+		g.bind(arm.Pattern, subject)
+		g.expr(arm.Body)
+		g.coerce(arm.Body.TypeOf(), result)
+		g.emit("jmp %s", done)
+	}
+	g.label(done)
+	g.depth = depth + result.StackWords()
+}
+
+func (g *Generator) bind(p *ast.Pattern, subject *ast.Local) {
+	for i, b := range p.Bindings {
+		if b.Local == nil {
+			continue
+		}
+		from := subject.Offset + 8*p.Variant.Offsets[i]
+		g.copyWords(b.Local.Type.Size(), from, b.Local.Offset)
+	}
+}
+
+func (g *Generator) try(e *ast.Try) {
+	result := e.X.TypeOf()
+	ok := g.newLabel()
+	g.expr(e.X)
+	g.emit("cmp qword ptr [rsp], 0")
+	g.emit("je %s", ok)
+	for k := range result.Err.Size() {
+		g.emit("mov rax, [rsp+%d]", 8+8*k)
+		g.emit("mov %s, rax", mem(g.retOffset()+8+8*k))
+	}
+	g.emit("mov %s, 1", mem(g.retOffset()))
+	g.emit("jmp %s", g.ret)
+	g.label(ok)
+	g.extractOk(result)
+}
+
+func (g *Generator) extractOk(result *types.Type) {
+	n := result.Size()
+	ok := result.Ok
+	if !ok.Scalar() && ok.Size() > 0 {
+		t := ok.Size()
+		for k := t - 1; k >= 0; k-- {
+			g.emit("mov rax, [rsp+%d]", 8+8*k)
+			g.emit("mov [rsp+%d], rax", 8*(n-t)+8*k)
+		}
+		g.release(n - t)
+		return
+	}
+	if ok.Scalar() {
+		g.emit("mov rax, [rsp+8]")
+	}
+	g.release(n)
+}
+
+func (g *Generator) catch(e *ast.Catch) {
+	result := e.X.TypeOf()
+	failed := g.newLabel()
+	done := g.newLabel()
+	g.expr(e.X)
+	depth := g.depth
+	g.emit("cmp qword ptr [rsp], 0")
+	g.emit("jne %s", failed)
+	g.extractOk(result)
+	g.emit("jmp %s", done)
+	g.label(failed)
+	g.depth = depth
+	if e.Fallback != nil {
+		g.release(result.Size())
+		g.expr(e.Fallback)
+	} else {
+		for k := range result.Err.Size() {
+			g.emit("mov rax, [rsp+%d]", 8+8*k)
+			g.emit("mov %s, rax", mem(e.Temp.Offset+8*k))
+		}
+		g.release(result.Size())
+		g.dispatch(e.Arms, e.Temp, e.Type)
+	}
+	g.label(done)
+	g.depth = depth - result.Size() + e.Type.StackWords()
 }

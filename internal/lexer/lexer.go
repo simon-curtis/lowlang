@@ -75,7 +75,7 @@ func (l *Lexer) emit(t Token) {
 
 func (l *Lexer) emitNewline(p Pos) {
 	switch l.last {
-	case Ident, Int, String, True, False, Break, Continue, Return, RParen, RBrace:
+	case Ident, Int, String, True, False, Break, Continue, Return, RParen, RBrace, Question:
 		l.emit(Token{Kind: Newline, Pos: p})
 	}
 }
@@ -172,9 +172,9 @@ var operators = []struct {
 	text string
 	kind Kind
 }{
-	{"->", Arrow}, {"+=", PlusAssign}, {"-=", MinusAssign}, {"*=", StarAssign}, {"/=", SlashAssign},
+	{"->", Arrow}, {"=>", FatArrow}, {"+=", PlusAssign}, {"-=", MinusAssign}, {"*=", StarAssign}, {"/=", SlashAssign},
 	{"&&", AndAnd}, {"||", OrOr}, {"==", Eq}, {"!=", NotEq}, {"<=", LtEq}, {">=", GtEq},
-	{"(", LParen}, {")", RParen}, {"{", LBrace}, {"}", RBrace}, {",", Comma}, {":", Colon},
+	{"(", LParen}, {")", RParen}, {"{", LBrace}, {"}", RBrace}, {",", Comma}, {":", Colon}, {".", Dot}, {"?", Question},
 	{"=", Assign}, {"+", Plus}, {"-", Minus}, {"*", Star}, {"/", Slash}, {"%", Percent},
 	{"!", Not}, {"<", Lt}, {">", Gt},
 }

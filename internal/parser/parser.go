@@ -90,31 +90,77 @@ func (p *Parser) file() *ast.File {
 	f := &ast.File{}
 	p.skipNewlines()
 	for !p.at(lexer.EOF) {
-		f.Funcs = append(f.Funcs, p.fn())
+		switch t := p.tok(); t.Kind {
+		case lexer.Fn:
+			f.Funcs = append(f.Funcs, p.fn())
+		case lexer.Enum:
+			f.Enums = append(f.Enums, p.enum())
+		default:
+			p.fail(t.Pos, "expected fn or enum, found %s", describe(t))
+		}
 		p.skipNewlines()
 	}
 	return f
 }
 
-func (p *Parser) fn() *ast.Func {
-	pos := p.expect(lexer.Fn).Pos
-	name := p.expect(lexer.Ident).Text
+func (p *Parser) list(item func()) {
 	p.expect(lexer.LParen)
-	var params []*ast.Param
 	for !p.at(lexer.RParen) {
-		params = append(params, p.param())
+		item()
 		if !p.at(lexer.RParen) {
 			p.expect(lexer.Comma)
 		}
 	}
 	p.expect(lexer.RParen)
-	var result *ast.TypeName
+}
+
+func (p *Parser) enum() *ast.EnumDecl {
+	pos := p.expect(lexer.Enum).Pos
+	d := &ast.EnumDecl{Name: p.expect(lexer.Ident).Text, Pos: pos}
+	p.expect(lexer.LBrace)
+	p.skipNewlines()
+	for !p.at(lexer.RBrace) {
+		d.Variants = append(d.Variants, p.variant())
+		if p.at(lexer.RBrace) {
+			break
+		}
+		p.expect(lexer.Newline)
+		p.skipNewlines()
+	}
+	p.expect(lexer.RBrace)
+	return d
+}
+
+func (p *Parser) variant() *ast.VariantDecl {
+	name := p.expect(lexer.Ident)
+	v := &ast.VariantDecl{Name: name.Text, Pos: name.Pos}
+	if !p.at(lexer.LParen) {
+		return v
+	}
+	p.list(func() {
+		if p.tokens[p.i+1].Kind == lexer.Colon {
+			p.next()
+			p.next()
+		}
+		v.Fields = append(v.Fields, p.typeName())
+	})
+	return v
+}
+
+func (p *Parser) fn() *ast.Func {
+	pos := p.expect(lexer.Fn).Pos
+	f := &ast.Func{Name: p.expect(lexer.Ident).Text, Pos: pos}
+	p.list(func() { f.Params = append(f.Params, p.param()) })
 	if p.at(lexer.Arrow) {
 		p.next()
-		result = p.typeName()
+		f.Result = p.typeName()
 	}
-	body := p.block()
-	return &ast.Func{Name: name, Params: params, Result: result, Body: body, Pos: pos}
+	if p.at(lexer.Not) {
+		p.next()
+		f.Error = p.typeName()
+	}
+	f.Body = p.block()
+	return f
 }
 
 func (p *Parser) param() *ast.Param {
@@ -179,6 +225,9 @@ func (p *Parser) stmt() ast.Stmt {
 			value = p.expr()
 		}
 		return &ast.Return{Value: value, Pos: t.Pos}
+	case lexer.Fail:
+		p.next()
+		return &ast.Fail{Value: p.expr(), Pos: t.Pos}
 	case lexer.Ident:
 		if op := p.tokens[p.i+1].Kind; assignOps[op] {
 			p.next()
@@ -233,7 +282,7 @@ func (p *Parser) unary() ast.Expr {
 		p.next()
 		return &ast.Unary{Op: t.Kind, X: p.unary(), Pos: t.Pos}
 	}
-	return p.primary()
+	return p.postfix(p.primary())
 }
 
 func (p *Parser) primary() ast.Expr {
@@ -254,9 +303,6 @@ func (p *Parser) primary() ast.Expr {
 		return &ast.BoolLit{Value: t.Kind == lexer.True, Pos: t.Pos}
 	case lexer.Ident:
 		p.next()
-		if p.at(lexer.LParen) {
-			return p.call(t)
-		}
 		return &ast.Ident{Name: t.Text, Pos: t.Pos}
 	case lexer.LParen:
 		p.next()
@@ -267,22 +313,85 @@ func (p *Parser) primary() ast.Expr {
 		return p.ifExpr()
 	case lexer.LBrace:
 		return p.block()
+	case lexer.Match:
+		p.next()
+		x := p.expr()
+		return &ast.Match{X: x, Arms: p.arms(), Pos: t.Pos}
 	}
 	p.fail(t.Pos, "expected expression, found %s", describe(t))
 	return nil
 }
 
-func (p *Parser) call(name lexer.Token) *ast.Call {
-	p.expect(lexer.LParen)
-	var args []ast.Expr
-	for !p.at(lexer.RParen) {
-		args = append(args, p.expr())
-		if !p.at(lexer.RParen) {
-			p.expect(lexer.Comma)
+func (p *Parser) postfix(x ast.Expr) ast.Expr {
+	for {
+		t := p.tok()
+		switch t.Kind {
+		case lexer.LParen:
+			call := &ast.Call{Fn: x, Pos: x.Position()}
+			p.list(func() { call.Args = append(call.Args, p.expr()) })
+			x = call
+		case lexer.Dot:
+			p.next()
+			x = &ast.Selector{X: x, Name: p.expect(lexer.Ident).Text, Pos: x.Position()}
+		case lexer.Question:
+			p.next()
+			x = &ast.Try{X: x, Pos: t.Pos}
+		case lexer.Catch:
+			p.next()
+			x = p.catch(x, t.Pos)
+		default:
+			return x
 		}
 	}
-	p.expect(lexer.RParen)
-	return &ast.Call{Name: name.Text, Args: args, Pos: name.Pos}
+}
+
+func (p *Parser) catch(x ast.Expr, pos lexer.Pos) *ast.Catch {
+	c := &ast.Catch{X: x, Pos: pos}
+	if p.at(lexer.LBrace) {
+		c.Arms = p.arms()
+		return c
+	}
+	c.Fallback = p.unary()
+	return c
+}
+
+func (p *Parser) arms() []*ast.Arm {
+	var arms []*ast.Arm
+	p.expect(lexer.LBrace)
+	p.skipNewlines()
+	for !p.at(lexer.RBrace) {
+		pattern := p.pattern()
+		p.expect(lexer.FatArrow)
+		arms = append(arms, &ast.Arm{Pattern: pattern, Body: p.armBody()})
+		if p.at(lexer.RBrace) {
+			break
+		}
+		p.expect(lexer.Newline)
+		p.skipNewlines()
+	}
+	p.expect(lexer.RBrace)
+	return arms
+}
+
+func (p *Parser) armBody() ast.Expr {
+	switch t := p.tok(); t.Kind {
+	case lexer.Break, lexer.Continue, lexer.Return, lexer.Fail:
+		return &ast.Block{Stmts: []ast.Stmt{p.stmt()}, Pos: t.Pos}
+	}
+	return p.expr()
+}
+
+func (p *Parser) pattern() *ast.Pattern {
+	name := p.expect(lexer.Ident)
+	pat := &ast.Pattern{Name: name.Text, Pos: name.Pos}
+	if !p.at(lexer.LParen) {
+		return pat
+	}
+	p.list(func() {
+		b := p.expect(lexer.Ident)
+		pat.Bindings = append(pat.Bindings, &ast.Binding{Name: b.Text, Pos: b.Pos})
+	})
+	return pat
 }
 
 func (p *Parser) ifExpr() *ast.If {

@@ -73,7 +73,12 @@ fn area(s: Shape) -> f64 {
 }
 ```
 
-`match` must be exhaustive. Variants are in scope inside `match` arms on their enum.
+- `match` must cover every variant, or end with `_`. Arms after `_` and duplicate arms are errors.
+- Patterns bind fields by position; `_` ignores a field, and a bare variant name ignores all of them.
+- An arm body is an expression, or `break`, `continue`, `return` or `fail`.
+- Variants are constructed as `Shape.Circle(2)`. Where the expected type is known (an annotated `let`, an argument, an assignment, a return, `fail`), the bare name works: `let s: Shape = Empty`.
+- Variants with no payload in an enum where no variant has one are a single word. Otherwise an enum is a tag word followed by the largest variant's fields.
+- An enum cannot contain itself until heap allocation exists.
 
 ### Optionals
 
@@ -98,18 +103,27 @@ fn total(a: str, b: str) -> i64 ! ParseError {
     parse(a)? + parse(b)?
 }
 
-fn main() {
-    let n = parse("42") catch e {
+fn validate(n: i64) ! ParseError {
+    if n < 0 { fail BadDigit(n) }
+}
+
+fn main() ! ParseError {
+    let n = parse("42") catch {
         Empty => 0
         BadDigit(at) => at
     }
+    let m = parse("") catch -1
+    validate(n)?
 }
 ```
 
-- `fail v` returns the error `v`.
-- Postfix `?` propagates the error to the caller. The caller's error type must accept it.
-- `catch` handles errors inline with an exhaustive match.
-- A fallible result cannot be discarded or used as a plain value without `?` or `catch`.
+- `fail v` returns the error `v`; `v` is checked against the function's error type, so bare variant names work.
+- Postfix `?` returns the error to the caller, whose error type must be the same enum.
+- `catch { arms }` matches the error exhaustively; `catch value` substitutes a fallback.
+- `fn f() ! E` fails or returns nothing.
+- A result cannot be discarded, bound or passed on without `?` or `catch`, except by returning it from a function with the same result type.
+- When `main` declares `! E` and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2.
+- A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
 
 ### Generics
 
@@ -149,7 +163,11 @@ The `low` command lives in `cmd/low`.
 
 The runtime, `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls.
 
-Code generation is a stack machine: every expression lands in `rax`, intermediates are pushed, and all locals live in the frame. Arguments are pushed right to left and the result returns in `rax`. On fib(38) this runs at 1.5x Go's time, which the SSA IR and register allocator are meant to close.
+Code generation is a stack machine. A one-word value lands in `rax`; a wider value (an enum with payload, a result) is pushed onto the stack with its first word lowest. All locals live in the frame, at offsets assigned by the checker. The generator tracks stack depth so `break` and `continue` can unwind partly built expressions.
+
+Calls reserve stack space for a wide return value and the arguments, then evaluate arguments left to right into it. The callee finds argument 0 at `rbp+16` and writes a wide result just above the arguments; a one-word result returns in `rax`.
+
+On fib(38) this runs at 1.5x Go's time, which the SSA IR and register allocator are meant to close.
 
 ## Tests
 
@@ -157,20 +175,21 @@ Code generation is a stack machine: every expression lands in `rax`, intermediat
 
 ## Implemented
 
-- Types: `i64`, `bool`, `str`.
+- Types: `i64`, `bool`, `str`, enums with payloads, results `T ! E`.
 - `let`, `var`, assignment, `if`/`else`, `for cond`, `for` with `break`/`continue`, `return`.
 - Functions with parameters and return values, recursion.
 - Arithmetic, comparison and logical operators.
+- `match`, `fail`, `?`, `catch`.
 - Builtins `print(i64)`, `print(str)`, `print(bool)`.
 - Target: linux/amd64.
 
 ## Roadmap
 
 1. SSA IR between check and codegen, with register allocation.
-2. Structs, enums, `match`.
-3. Error unions, `fail`, `?`, `catch`.
-4. Heap allocation and tracing GC.
-5. Slices, strings with length, maps.
+2. Structs.
+3. Heap allocation and tracing GC, then recursive enums.
+4. Slices, strings with length, maps.
+5. Optionals.
 6. Generics.
 7. Green-thread scheduler, channels, `select`.
 8. Own assembler and linker replacing `as` and `ld`.

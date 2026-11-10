@@ -9,18 +9,13 @@ rt_nl:
 	.ascii "\n"
 rt_panic_prefix:
 	.ascii "panic: "
+rt_error_prefix:
+	.ascii "error: "
 rt_msg_divzero:
 	.quad 22
 	.ascii "integer divide by zero"
 
 	.text
-	.globl _start
-_start:
-	call fn_main
-	xor edi, edi
-	mov eax, 60
-	syscall
-
 rt_write:
 	push r12
 	push r13
@@ -114,13 +109,12 @@ rt_str_eq:
 1:
 	ret
 
-rt_panic:
+rt_die:
 	push rdi
+	push rcx
 	mov edi, 2
-	lea rsi, [rip+rt_panic_prefix]
-	mov edx, 7
 	call rt_write
-	mov rdi, [rsp]
+	mov rdi, [rsp+8]
 	mov rdx, [rdi]
 	lea rsi, [rdi+8]
 	mov edi, 2
@@ -129,9 +123,21 @@ rt_panic:
 	lea rsi, [rip+rt_nl]
 	mov edx, 1
 	call rt_write
-	mov edi, 2
+	pop rdi
 	mov eax, 60
 	syscall
+
+rt_panic:
+	lea rsi, [rip+rt_panic_prefix]
+	mov edx, 7
+	mov ecx, 2
+	jmp rt_die
+
+rt_error:
+	lea rsi, [rip+rt_error_prefix]
+	mov edx, 7
+	mov ecx, 1
+	jmp rt_die
 
 rt_panic_divzero:
 	lea rdi, [rip+rt_msg_divzero]
