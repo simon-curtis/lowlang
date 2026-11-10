@@ -166,6 +166,7 @@ type EnumDecl struct {
 type VariantDecl struct {
 	Name   string
 	Fields []*TypeName
+	Labels []string
 	Pos    lexer.Pos
 }
 
@@ -216,6 +217,8 @@ type Func struct {
 	ParamTypes  []*types.Type
 	RetType     *types.Type
 	ParamLocals []*Local
+	Bound       map[string]*types.Type
+	Trusted     bool
 }
 
 func (f *Func) ParamSize(i int) int {

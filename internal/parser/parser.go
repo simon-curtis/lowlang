@@ -287,10 +287,12 @@ func (p *Parser) variant() *ast.VariantDecl {
 		return v
 	}
 	p.list(func() {
+		label := ""
 		if p.peek() == lexer.Colon {
-			p.next()
-			p.next()
+			label = p.expect(lexer.Ident).Text
+			p.expect(lexer.Colon)
 		}
+		v.Labels = append(v.Labels, label)
 		v.Fields = append(v.Fields, p.typeName())
 	})
 	return v

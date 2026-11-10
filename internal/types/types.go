@@ -64,6 +64,7 @@ type Variant struct {
 	Name    string
 	Tag     int
 	Fields  []*Type
+	Labels  []string
 	Offsets []int
 }
 

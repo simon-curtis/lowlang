@@ -81,6 +81,7 @@ type Checker struct {
 	defaults        map[*types.Field]ast.Expr
 	checkingDefault map[*types.Field]bool
 	deferring       bool
+	derived         map[string]*ast.Func
 }
 
 func Check(files []*ast.File) (embeds []string, err error) {
@@ -107,6 +108,7 @@ func Check(files []*ast.File) (embeds []string, err error) {
 		fieldSources:    map[*types.Field]*fieldSource{},
 		defaults:        map[*types.Field]ast.Expr{},
 		checkingDefault: map[*types.Field]bool{},
+		derived:         map[string]*ast.Func{},
 	}
 	defer func() {
 		r := recover()
@@ -458,7 +460,7 @@ func (c *Checker) declareVariants(d *ast.EnumDecl, t *types.Type) {
 		if t.Variant(vd.Name) != nil {
 			c.fail(vd.Pos, "variant %s already declared in %s", vd.Name, d.Name)
 		}
-		v := &types.Variant{Name: vd.Name, Tag: i}
+		v := &types.Variant{Name: vd.Name, Tag: i, Labels: vd.Labels}
 		for _, f := range vd.Fields {
 			v.Fields = append(v.Fields, c.contained(f, "an enum variant"))
 		}
@@ -1181,9 +1183,9 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 		}
 		e.Type = c.subjects[len(c.subjects)-1]
 	case *ast.Try:
-		c.try(e)
+		c.try(e, want)
 	case *ast.Catch:
-		c.catch(e)
+		c.catch(e, want)
 	}
 	return e.TypeOf()
 }
@@ -1234,6 +1236,9 @@ func (c *Checker) typeRef(x ast.Expr) *types.Type {
 			return nil
 		}
 		t = c.local().types[x.Name]
+		if bound := c.bound[x.Name]; bound != nil {
+			t = bound
+		}
 	case *ast.Selector:
 		id, ok := x.X.(*ast.Ident)
 		if !ok || !c.isModule(id.Name) {
@@ -1263,7 +1268,7 @@ func (c *Checker) field(t *types.Type, name string, pos lexer.Pos) *types.Field 
 }
 
 func (c *Checker) reachable(f *types.Field, t *types.Type, pos lexer.Pos) {
-	if !f.Pub && t.Module != c.file.Module {
+	if !f.Pub && t.Module != c.file.Module && (c.fn == nil || !c.fn.Trusted) {
 		c.fail(pos, "field %s of %s is private", f.Name, t)
 	}
 }
@@ -1395,6 +1400,8 @@ func (c *Checker) structLit(e *ast.StructLit, want *types.Type) {
 		c.fail(e.Pos, "%s is not generic", e.Name)
 	case e.Module != "":
 		t = c.importedType(e.Module, e.Name, e.Pos)
+	case c.bound[e.Name] != nil:
+		t = c.bound[e.Name]
 	default:
 		t = c.local().types[e.Name]
 	}
@@ -1816,6 +1823,8 @@ func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 		}
 	case "__syscall":
 		c.syscall(e)
+	case "__serialize":
+		c.serializeCall(e)
 	case "__mulhi":
 		if len(e.Args) != 2 {
 			c.fail(e.Pos, "__mulhi takes 2 arguments, found %d", len(e.Args))
@@ -2205,17 +2214,17 @@ func (c *Checker) pattern(p *ast.Pattern, enum *types.Type) {
 	}
 }
 
-func (c *Checker) errorResult(e ast.Expr, keyword string, pos lexer.Pos) *types.Type {
-	t := c.expr(e, nil)
+func (c *Checker) errorResult(e ast.Expr, keyword string, pos lexer.Pos, want *types.Type) *types.Type {
+	t := c.expr(e, want)
 	if t.Kind != types.ResultKind {
 		c.fail(pos, "%s requires an error result, found %s", keyword, t)
 	}
 	return t
 }
 
-func (c *Checker) try(e *ast.Try) {
+func (c *Checker) try(e *ast.Try, want *types.Type) {
 	c.leaving(e.Pos, "?")
-	t := c.errorResult(e.X, "?", e.Pos)
+	t := c.errorResult(e.X, "?", e.Pos, want)
 	ret := c.fn.RetType
 	if ret.Kind != types.ResultKind {
 		c.fail(e.Pos, "? requires %s to declare an error type", c.subject())
@@ -2226,8 +2235,8 @@ func (c *Checker) try(e *ast.Try) {
 	e.Type = t.Ok
 }
 
-func (c *Checker) catch(e *ast.Catch) {
-	t := c.errorResult(e.X, "catch", e.Pos)
+func (c *Checker) catch(e *ast.Catch, want *types.Type) {
+	t := c.errorResult(e.X, "catch", e.Pos, want)
 	e.Type = t.Ok
 	if e.Fallback != nil {
 		c.expectType(e.Fallback, t.Ok)

@@ -78,6 +78,9 @@ func bindings(decls []*ast.TypeParam, args []*types.Type) map[string]*types.Type
 }
 
 func (c *Checker) bindingsOf(fn *ast.Func) map[string]*types.Type {
+	if fn.Bound != nil {
+		return fn.Bound
+	}
 	decl := fn
 	if fn.Template != nil {
 		decl = fn.Template
@@ -241,6 +244,8 @@ func (in *inference) unify(pattern, actual *types.Type) {
 		in.unify(pattern.Elem, actual.Elem)
 	case pattern.Optional:
 		in.unify(pattern.Elem, actual)
+	case pattern.Kind == types.ResultKind && actual.Kind != types.ResultKind:
+		in.unify(pattern.Ok, actual)
 	case pattern.Kind != actual.Kind:
 	case pattern.Kind == types.FuncKind && len(pattern.Params) == len(actual.Params):
 		in.pairs(pattern.Params, actual.Params)
@@ -427,6 +432,9 @@ func (c *Checker) genericTarget(x ast.Expr) *ast.Func {
 }
 
 func (c *Checker) instanceCall(e *ast.Call, inst *ast.Instance, want *types.Type) {
+	if c.derivedCall(e, inst) {
+		return
+	}
 	if id, ok := inst.X.(*ast.Ident); ok && id.Name == "chan" && c.find("chan") == nil && c.local().funcs["chan"] == nil {
 		c.makeChan(e, inst)
 		return
