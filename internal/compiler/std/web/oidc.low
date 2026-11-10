@@ -1,0 +1,271 @@
+import std/crypto
+import std/crypto/hash
+import std/crypto/jose
+import std/http
+import std/io
+import std/json
+import std/text
+import std/time
+
+pub fn jwt(keys: []jose.Jwk, options: jose.Options) -> Middleware {
+    bearer(fn(token: str) -> json.Value? {
+        let claims = jose.verify(token, keys, options) catch {
+            _ => return none
+        }
+        claims.extra
+    })
+}
+
+struct Discovery {
+    issuer: str
+    authorization_endpoint: str = ""
+    token_endpoint: str = ""
+    jwks_uri: str
+}
+
+struct Provider {
+    issuer: str
+    lock: chan[bool]
+    discovery: Discovery?
+    keys: []jose.Jwk
+    fetched: i64
+    forced: i64
+}
+
+fn trimmed(issuer: str) -> str {
+    if text.ends_with(issuer, "/") { issuer[..issuer.len - 1] } else { issuer }
+}
+
+fn discover(p: *Provider) -> Discovery ! io.Error {
+    match p.discovery {
+        some(d) => return d
+        none => {}
+    }
+    let resp = http.get("{trimmed(p.issuer)}/.well-known/openid-configuration")?
+    if resp.status != 200 {
+        fail Refused
+    }
+    let d = json.deserialize[Discovery](resp.body) catch {
+        _ => fail Malformed
+    }
+    if trimmed(d.issuer) != trimmed(p.issuer) {
+        fail Invalid
+    }
+    p.discovery = d
+    d
+}
+
+fn refresh(p: *Provider, force: bool) -> []jose.Jwk ! io.Error {
+    p.lock <- true
+    defer <-p.lock
+    let now = time.now()
+    let stale = now - p.fetched >= 3600
+    let allowed = force && now - p.forced >= 60
+    if p.keys.len > 0 && !stale && !allowed {
+        return p.keys
+    }
+    if allowed {
+        p.forced = now
+    }
+    let d = discover(p)?
+    let resp = http.get(d.jwks_uri)?
+    if resp.status != 200 {
+        fail Refused
+    }
+    p.keys = jose.parse_jwks(resp.body)?
+    p.fetched = now
+    p.keys
+}
+
+fn provider(issuer: str) -> *Provider {
+    new(Provider { issuer, lock: chan[bool](1), discovery: none, keys: [], fetched: 0, forced: 0 })
+}
+
+fn token_options(p: *Provider, audience: str) -> jose.Options {
+    jose.Options { algorithms: ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA"], issuer: p.issuer, audience }
+}
+
+fn token_kid(token: str) -> str {
+    let dot = text.index_byte(token, '.')
+    if dot <= 0 {
+        return ""
+    }
+    let header = match base64url_decode(token[..dot]) {
+        some(h) => h
+        none => return ""
+    }
+    let parsed = json.parse(header) catch {
+        _ => return ""
+    }
+    match json.get(parsed, "kid") {
+        some(v) => match v {
+            Str(s) => s
+            _ => ""
+        }
+        none => ""
+    }
+}
+
+fn known(keys: []jose.Jwk, kid: str) -> bool {
+    for k in keys {
+        if k.kid == kid {
+            return true
+        }
+    }
+    false
+}
+
+fn verify_with(p: *Provider, token: str, audience: str) -> jose.Claims? {
+    var keys = refresh(p, false) catch {
+        _ => return none
+    }
+    let kid = token_kid(token)
+    if kid.len > 0 && !known(keys, kid) {
+        keys = refresh(p, true) catch {
+            _ => return none
+        }
+    }
+    let claims = jose.verify(token, keys, token_options(p, audience)) catch {
+        _ => return none
+    }
+    claims
+}
+
+pub fn oidc(issuer: str, audience: str) -> Middleware {
+    let p = provider(issuer)
+    var m = bearer(fn(token: str) -> json.Value? {
+        match verify_with(p, token, audience) {
+            some(claims) => claims.extra
+            none => none
+        }
+    })
+    m.security = Security {
+        name: "oidc"
+        scheme: json.Value.Object([
+            json.Member { name: "type", value: json.Value.Str("openIdConnect") }
+            json.Member { name: "openIdConnectUrl", value: json.Value.Str("{trimmed(issuer)}/.well-known/openid-configuration") }
+        ])
+    }
+    m
+}
+
+pub struct OidcClient {
+    pub issuer: str
+    pub client_id: str
+    pub client_secret: str = ""
+    pub redirect_uri: str
+    pub scopes: str = "openid profile email"
+}
+
+fn form_encode(s: str) -> str {
+    let hex = "0123456789ABCDEF"
+    var out: []u8 = []
+    for i in 0..s.len {
+        let c = s[i]
+        let plain = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '.' || c == '_' || c == '~'
+        if plain {
+            push(mut out, c)
+        } else {
+            push(mut out, '%')
+            push(mut out, hex[c >> 4])
+            push(mut out, hex[c & 15])
+        }
+    }
+    __str_view(out)
+}
+
+fn query_string(pairs: []http.Header) -> str {
+    var parts: []str = []
+    for p in pairs {
+        push(mut parts, "{form_encode(p.name)}={form_encode(p.value)}")
+    }
+    text.join(parts, "&")
+}
+
+struct TokenResponse {
+    id_token: str = ""
+    access_token: str = ""
+}
+
+fn exchange(p: *Provider, client: OidcClient, code: str, verifier: str) -> jose.Claims ! io.Error {
+    let d = discover(p)?
+    var form: []http.Header = [
+        http.Header { name: "grant_type", value: "authorization_code" }
+        http.Header { name: "code", value: code }
+        http.Header { name: "redirect_uri", value: client.redirect_uri }
+        http.Header { name: "client_id", value: client.client_id }
+        http.Header { name: "code_verifier", value: verifier }
+    ]
+    if client.client_secret.len > 0 {
+        push(mut form, http.Header { name: "client_secret", value: client.client_secret })
+    }
+    let resp = http.post(d.token_endpoint, "application/x-www-form-urlencoded", bytes(query_string(form)))?
+    if resp.status != 200 {
+        fail Refused
+    }
+    let tokens = json.deserialize[TokenResponse](resp.body) catch {
+        _ => fail Malformed
+    }
+    match verify_with(p, tokens.id_token, client.client_id) {
+        some(claims) => claims
+        none => fail Invalid
+    }
+}
+
+fn claim_text(claims: jose.Claims, name: str) -> str {
+    match json.get(claims.extra, name) {
+        some(v) => match v {
+            Str(s) => s
+            _ => ""
+        }
+        none => ""
+    }
+}
+
+pub fn oidc_login(a: *App, login: str, callback: str, client: OidcClient, signed_in: fn(*Context, jose.Claims) -> http.Response) {
+    let p = provider(client.issuer)
+    get(a, login, fn(c: *Context) -> http.Response {
+        let d = discover(p) catch {
+            _ => return problem_response(Status(502, "Bad Gateway", "identity provider unavailable"))
+        }
+        let state = base64url(crypto.random(16))
+        let nonce = base64url(crypto.random(16))
+        let verifier = base64url(crypto.random(32))
+        session_set(c, "oidc_state", state)
+        session_set(c, "oidc_nonce", nonce)
+        session_set(c, "oidc_verifier", verifier)
+        let challenge = base64url(hash.sum(hash.sha256(), bytes(verifier)))
+        let params = query_string([
+            http.Header { name: "response_type", value: "code" }
+            http.Header { name: "client_id", value: client.client_id }
+            http.Header { name: "redirect_uri", value: client.redirect_uri }
+            http.Header { name: "scope", value: client.scopes }
+            http.Header { name: "state", value: state }
+            http.Header { name: "nonce", value: nonce }
+            http.Header { name: "code_challenge", value: challenge }
+            http.Header { name: "code_challenge_method", value: "S256" }
+        ])
+        let separator = if text.index_byte(d.authorization_endpoint, '?') >= 0 { "&" } else { "?" }
+        redirect("{d.authorization_endpoint}{separator}{params}", 302)
+    })
+    get(a, callback, fn(c: *Context) -> http.Response {
+        let expected = session_get(c, "oidc_state") ?? ""
+        let state = query(c, "state") ?? ""
+        let code = query(c, "code") ?? ""
+        if expected.len == 0 || !hash.equal(bytes(expected), bytes(state)) || code.len == 0 {
+            return problem_response(BadRequest("invalid sign-in response"))
+        }
+        let verifier = session_get(c, "oidc_verifier") ?? ""
+        let claims = exchange(p, client, code, verifier) catch {
+            _ => return problem_response(Unauthorized("sign-in failed"))
+        }
+        let nonce = session_get(c, "oidc_nonce") ?? ""
+        if nonce.len == 0 || claim_text(claims, "nonce") != nonce {
+            return problem_response(Unauthorized("sign-in nonce mismatch"))
+        }
+        session_set(c, "oidc_state", "")
+        session_set(c, "oidc_nonce", "")
+        session_set(c, "oidc_verifier", "")
+        signed_in(c, claims)
+    })
+}

@@ -685,6 +685,8 @@ fn main() ! io.Error {
 | `std/crypto/ecdsa` | ECDH and ECDSA on P-256 and P-384, with RFC 6979 nonces and SEC1 private keys. |
 | `std/crypto/rsa` | RSA PKCS#1 v1.5 and PSS signing and verification, and PKCS#1 keys. |
 | `std/crypto/mlkem` | ML-KEM-512, -768 and -1024 (FIPS 203). |
+| `std/crypto/jose` | JSON Web Tokens: compact JWS with HS256/384/512, RS256/384/512, PS256/384/512, ES256, ES384 and EdDSA, JWK sets, and claim checks. |
+| `std/crypto/password` | Argon2id and PBKDF2 password hashes in PHC strings, and BLAKE2b. |
 | `std/crypto/x509` | DER, PEM, certificates, PKCS#8 private keys, the system roots, chain validation and TLS signature schemes. |
 | `std/time` | `now`, in Unix seconds. |
 | `std/simd` | Vector reads and writes, `splat`, `mask`, `blend`, `min`, `max`, lane access, byte shuffles, bit counting and `find_byte`. |
@@ -739,6 +741,7 @@ fn main() ! io.Error {
 - `web.app()` holds routes and middleware. `get`, `post`, `put`, `patch`, `del` and `route` add handlers for paths with `:name` parameters and a trailing `*`; `group` makes a sub-application with a prefix and more middleware, and `mount` adds its routes back. An unknown path is a 404 and a known path with another method a 405 with `Allow`.
 - `endpoint[Req, Res]` and `query_endpoint[Res]` read a JSON body into `Req`, call a handler returning `Res ! web.Problem`, and write the result as JSON or the problem as `application/problem+json`. Their schemas describe the operation in the OpenAPI document that `openapi` serves, along with path parameters and each route's security schemes.
 - Middleware is a struct of a `run` closure and an optional security scheme. `api_key`, `basic` and `bearer` authenticate requests and set `Context.user`; `sessions` keeps a map in a cookie sealed with AES-256-GCM, with the cookie name as associated data and an expiry inside; `csrf` requires the session's token in `X-CSRF-Token` on unsafe methods; `require_session`, `cors`, `logger` and `compress` round them out.
+- `jwt` verifies bearer tokens against a key set with `std/crypto/jose`. `oidc` does the same for an OpenID Connect issuer: it reads the discovery document and the JWKS, refreshes them hourly, and refreshes early, at most once a minute, when a token names a key it does not know. `oidc_login` adds a sign-in route that redirects to the issuer with `state`, `nonce` and a PKCE S256 challenge kept in the session, and a callback route that checks the state, exchanges the code, verifies the ID token and its nonce, and hands the claims to the application.
 
 ## Compiler
 

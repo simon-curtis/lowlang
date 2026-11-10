@@ -1,0 +1,163 @@
+import std/crypto/ecdsa
+import std/crypto/hash
+import std/crypto/jose
+import std/http
+import std/io
+import std/json
+import std/net
+import std/text
+import std/time
+import std/web
+
+struct Idp {
+    issuer: str
+    keys: []jose.Jwk
+    signing: jose.Jwk
+    challenge: str
+    nonce: str
+}
+
+struct Config {
+    issuer: str
+    authorization_endpoint: str
+    token_endpoint: str
+    jwks_uri: str
+}
+
+struct Tokens {
+    id_token: str
+    access_token: str
+}
+
+fn ec_key(kid: str) -> jose.Jwk ! io.Error {
+    let private = ecdsa.generate(P256)
+    let public = ecdsa.public_key(P256, private)?
+    jose.Jwk { kid, key: jose.Key.Ec(P256, public, private), alg: "ES256" }
+}
+
+fn claims(issuer: str, audience: str, subject: str, nonce: str, expires: i64) -> json.Value {
+    json.Value.Object([
+        json.Member { name: "iss", value: json.Value.Str(issuer) }
+        json.Member { name: "aud", value: json.Value.Str(audience) }
+        json.Member { name: "sub", value: json.Value.Str(subject) }
+        json.Member { name: "nonce", value: json.Value.Str(nonce) }
+        json.Member { name: "exp", value: json.Value.Int(expires) }
+    ])
+}
+
+fn identity_provider(idp: *Idp) -> *web.App {
+    let app = web.app()
+    web.get(app, "/.well-known/openid-configuration", fn(c) {
+        web.json_response(200, Config {
+            issuer: idp.issuer
+            authorization_endpoint: "{idp.issuer}/authorize"
+            token_endpoint: "{idp.issuer}/token"
+            jwks_uri: "{idp.issuer}/jwks"
+        })
+    })
+    web.get(app, "/jwks", fn(c) { web.text(200, jose.jwks_json(idp.keys)) })
+    web.post(app, "/token", fn(c) {
+        let form = web.parse_query(str(c.request.body))
+        let verifier = form["code_verifier"] ?? ""
+        let challenge = web.base64url(hash.sum(hash.sha256(), bytes(verifier)))
+        if form["code"] ?? "" != "the-code" || challenge != idp.challenge {
+            return web.text(400, "bad exchange")
+        }
+        let id_token = jose.sign("ES256", idp.signing.kid, idp.signing.key, claims(idp.issuer, "client", "alice", idp.nonce, time.now() + 600)) catch {
+            _ => return web.text(500, "signing failed")
+        }
+        web.json_response(200, Tokens { id_token, access_token: "opaque" })
+    })
+    app
+}
+
+fn call(h: fn(http.Request) -> http.Response, method: str, target: str, headers: []http.Header) -> http.Response {
+    var req = http.request(method, target)
+    req.headers = headers
+    h(req)
+}
+
+fn bearer(token: str) -> []http.Header {
+    [http.Header { name: "authorization", value: "Bearer {token}" }]
+}
+
+fn cookie_of(resp: http.Response) -> str {
+    let set = http.header(resp.headers, "set-cookie") ?? ""
+    let semi = text.index_byte(set, ';')
+    if semi < 0 { set } else { set[..semi] }
+}
+
+fn main() ! io.Error {
+    let l = net.listen("127.0.0.1", 0)?
+    let issuer = "http://127.0.0.1:{l.addr.port}"
+    let first = ec_key("k1")?
+    let idp = new(Idp { issuer, keys: [first], signing: first, challenge: "", nonce: "" })
+    let provider = web.handler(identity_provider(idp))
+    spawn fn() {
+        http.serve(l, provider) catch {
+            _ => {}
+        }
+    }()
+
+    let app = web.app()
+    let api = web.group(app, "/api", [web.oidc(issuer, "client")])
+    web.get(api, "/me", fn(c) { web.text(200, "hello {c.user}") })
+    web.mount(app, api)
+    var secret: []u8 = []
+    for i in 0..32 {
+        push(mut secret, u8(i * 7))
+    }
+    let hmac = jose.Jwk { kid: "h", key: jose.Key.Hmac(secret), alg: "HS256" }
+    let internal = web.group(app, "/internal", [web.jwt([hmac], jose.Options { algorithms: ["HS256"], issuer: "self" })])
+    web.get(internal, "/me", fn(c) { web.text(200, "internal {c.user}") })
+    web.mount(app, internal)
+    var key: []u8 = []
+    for i in 0..32 {
+        push(mut key, u8(255 - i))
+    }
+    let site = web.group(app, "", [web.sessions(web.SessionOptions { key, secure: false })?])
+    web.oidc_login(site, "/login", "/callback", web.OidcClient { issuer, client_id: "client", redirect_uri: "http://app/callback" }, fn(c, signed) {
+        web.session_set(c, "user", signed.sub ?? "")
+        web.text(200, "welcome {signed.sub ?? "?"}")
+    })
+    web.mount(app, site)
+    let h = web.handler(app)
+
+    let now = time.now()
+    let good = jose.sign("ES256", "k1", first.key, claims(issuer, "client", "bob", "", now + 600))?
+    let wrong_audience = jose.sign("ES256", "k1", first.key, claims(issuer, "other", "bob", "", now + 600))?
+    let wrong_issuer = jose.sign("ES256", "k1", first.key, claims("http://evil", "client", "bob", "", now + 600))?
+    let expired = jose.sign("ES256", "k1", first.key, claims(issuer, "client", "bob", "", now - 3600))?
+    for token in [good, wrong_audience, wrong_issuer, expired, "not.a.token"] {
+        let resp = call(h, "GET", "/api/me", bearer(token))
+        print("api {resp.status} {str(resp.body)}")
+    }
+    print("api anonymous {call(h, "GET", "/api/me", []).status}")
+
+    let rotated = ec_key("k2")?
+    idp.keys = [first, rotated]
+    let fresh = jose.sign("ES256", "k2", rotated.key, claims(issuer, "client", "carol", "", now + 600))?
+    let after_rotation = call(h, "GET", "/api/me", bearer(fresh))
+    print("rotated key {after_rotation.status} {str(after_rotation.body)}")
+
+    let internal_token = jose.sign("HS256", "h", hmac.key, json.Value.Object([
+        json.Member { name: "iss", value: json.Value.Str("self") }
+        json.Member { name: "sub", value: json.Value.Str("service") }
+        json.Member { name: "exp", value: json.Value.Int(now + 60) }
+    ]))?
+    let svc = call(h, "GET", "/internal/me", bearer(internal_token))
+    print("internal {svc.status} {str(svc.body)}")
+    print("internal with es256 {call(h, "GET", "/internal/me", bearer(good)).status}")
+
+    let login = call(h, "GET", "/login", [])
+    let location = http.header(login.headers, "location") ?? ""
+    let q = web.parse_query(location[text.index_byte(location, '?') + 1..])
+    print("login {login.status} {text.starts_with(location, "{issuer}/authorize?")} {q["code_challenge_method"] ?? "-"} {q["scope"] ?? "-"}")
+    idp.challenge = q["code_challenge"] ?? ""
+    idp.nonce = q["nonce"] ?? ""
+    let session = http.Header { name: "cookie", value: cookie_of(login) }
+    let forged = call(h, "GET", "/callback?code=the-code&state=forged", [session])
+    print("forged state {forged.status}")
+    let done = call(h, "GET", "/callback?code=the-code&state={q["state"] ?? ""}", [session])
+    print("callback {done.status} {str(done.body)}")
+}
