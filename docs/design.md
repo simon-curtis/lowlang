@@ -30,7 +30,25 @@ count += 1
 fn add(a: i64, b: i64) -> i64 {
     a + b
 }
+
+fn counter() -> fn() -> i64 {
+    var n = 0
+    fn() -> i64 {
+        n += 1
+        n
+    }
+}
+
+let twice = fn(x: i64) -> i64 { x * 2 }
+let ops: [str: fn(i64) -> i64] = ["twice": twice, "negate": negate]
+let parse: fn(str) -> i64 ! ParseError = parse_int
+let square: fn(i64) -> i64 = fn(x) { x * x }
 ```
+
+- A function type is written `fn(i64, mut str) -> bool`, with `! E` for a result that can fail. Two function types are the same when their parameters, `mut` markers and results are.
+- A named function is a value of its function type. `fn(params) -> R { body }` is a closure; parameter and result types may be left out when the expected function type supplies them, and a closure with no written result and no expected type returns nothing.
+- A closure captures the variables it names by reference, as Go does: it reads and assigns the variable itself, and the variable lives as long as any closure holding it. Each loop iteration binds fresh variables, so closures made in different iterations see different ones. A `mut` parameter cannot be captured.
+- A function value is called like a function. Values of function type can be stored in variables, fields, slices and maps, passed and returned; they cannot be compared or printed.
 
 ### Control flow
 
@@ -345,6 +363,21 @@ let pixels = view(buf, 64)
 - `cstr(s)` is a NUL-terminated copy of a string; `str(p)` copies a NUL-terminated `ptr[u8]` back.
 - `extern struct` has C layout: fields in order at their natural alignment, size rounded to the largest alignment. Its fields must have C types. It is used like any struct and its fields are read and written at their own width.
 - Memory may be passed to C for the duration of a call. Memory C keeps after the call must be pinned: `pin(x)` returns the address of a pointer, slice, map or string's data and keeps it alive until `unpin(p)`. Memory C allocates is never touched by the collector.
+- `extern fn(ptr[i64], ptr[i64]) -> i32` is a C function pointer, one word, like C#'s `delegate* unmanaged`. Its parameters and result must have C types. It is a C type, so it can be a parameter, result or `extern struct` field.
+- A top-level LowLang function becomes a C callback where an `extern fn` is expected, if it takes and returns only numbers, `bool`, `ptr` or `extern fn`, with no `mut` parameters. An `extern` function used as a value is its C address. Calling an `extern fn` value makes a C call.
+- A closure reaches C through a `ptr` user-data argument: pin a pointer to the state it needs and pass a top-level callback that loads it.
+
+```low
+extern "c" {
+    fn qsort(base: ptr, n: i64, size: i64, compare: extern fn(ptr[i64], ptr[i64]) -> i32)
+}
+
+fn ascending(a: ptr[i64], b: ptr[i64]) -> i32 {
+    i32(load(a) - load(b))
+}
+
+qsort(data, n, 8, ascending)
+```
 
 ### Defer
 
@@ -448,6 +481,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - An allocation whose type holds no pointers is noscan: `new` of a pointer-free value, and the backing arrays of slices whose elements hold none, such as `[]u8`, `[]i64` and `[]f32`. A noscan object is marked but its contents are never read. Other objects are scanned word by word.
 - Roots come from stack maps. At every call the code generator records the frame words that may hold a heap pointer at that point: the saved callee-saved registers, spill slots of values that may be pointers and are live across the call, and every frame slot. The maps form a table sorted by return address. `rt_alloc` and `rt_grow` record their caller's return address and stack pointer; the collector scans the runtime frames below that conservatively, then follows the `rbp` chain, looking up each frame's return address and scanning only its mapped words. Frames without a map, such as code patched in by hot reload, are scanned whole, and the region above `main` is scanned conservatively.
 - Values in callee-saved registers are found in the save slots of whichever later frame saved them, or among the registers `rt_gc` pushes.
+- C frames are crossed by segment. Before every C call the caller stores its `rbp`, its return address and its `rsp` in `rt_c_fp`, `rt_c_pc` and `rt_c_sp`. A callback thunk builds its frame record from the first two, so the `rbp` chain leads from the thunk straight back to the LowLang caller, and keeps the third in its frame. The thunk's call site has a map of count -1, which tells the collector to scan the C frames between the thunk and the caller's `rsp` conservatively before following the chain. The thunk restores the three globals when it returns, so nested and repeated callbacks see their own caller.
 - Every candidate word, mapped or not, is checked against the heap before it is followed, so a map that names a word holding an integer is harmless.
 - A `ptr` counts as a possible heap pointer, so a `cstr` copy or a pinned object stays alive while LowLang holds its address. `pin` records the address in a table of 65536 roots that every collection scans; `unpin` removes it.
 - Sweeping coalesces adjacent dead objects into free chunks and returns a trailing free run to the end of the heap.
@@ -463,6 +497,10 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Every frame keeps `rsp` 16-byte aligned at its calls, as C requires: frames are rounded to 16 bytes, and `_start` rounds the space it reserves for `main`'s result.
 - An `extern struct` value is its C bytes, one word per eightbyte. Its locals and parameters live in frame slots; a field is loaded or stored at its own width, and a struct literal or a field of a computed value goes through a temporary slot.
 - `defer` keeps a stack of deferred statements per block and lowers them again at every exit from that block.
+- A LowLang function value is two words: a code address and an environment pointer. Code reached through a function value takes the environment as parameter word 0. A closure is checked in place and becomes a function named after its parent, such as `counter..c1`; its environment is a heap array holding a box pointer per captured variable, or 0 when it captures none. A captured variable lives in a heap box allocated when it is bound, and every access, in its own function and in closures, loads and stores through the box. A named function used as a value goes through an adapter, `name..value`, which drops the environment and calls it.
+- A call through a function value moves the code address to `r10` and calls it, passing the environment and the arguments like any call. A call through an `extern fn` value is a `ccall` with the same System V plan as a named C function.
+- A C callback is a thunk, `cb_name`, emitted once per program for every function used as one. It saves the C argument registers, re-extends narrow integers and `bool` from them and from the C stack, calls the function with LowLang's convention and moves a float result to `xmm0`.
+- `funcaddr` gives a function's code address, its thunk, or an `extern` function's address through the GOT. Functions reached only through `funcaddr` are kept.
 - In dev builds every C function gets a global trampoline, `cfn_name: jmp name`, and calls go through it, so a patch can link against the running binary.
 - An `embed` becomes an address and a length. The data is emitted with `.incbin` under a label named by the file's content hash, so a changed file changes the code of every function that embeds it.
 - Every value records whether it may hold a heap pointer. Loads, parameters and call results take this from their type's word layout, where an enum word counts as a pointer if any variant puts one there; constants, typed arithmetic, string literals and frame addresses never do; untyped address arithmetic and anything unclassified count as pointers; a phi holds a pointer if any input may. The prelude stores map entries as `__word`, an integer type the collector scans, because entries hold keys and values of any type.
@@ -492,12 +530,13 @@ On fib(38) this runs at 1.25x Go's time.
 `low dev app.low` or `low dev app/` builds a dev binary, runs it, and watches every source file of every loaded module, every embedded file, and the file lists of their directories. On save:
 
 - A file that fails to compile is reported and the running program is left alone.
-- The program is restarted when the set of linked libraries changes, when a struct or enum layout changes, when an existing function's signature changes, or when `main` changes. A running frame of old code may still call any function, so it must keep the old calling convention and data layout; `main` never returns to pick up new code.
+- The program is restarted when the set of linked libraries changes, when a struct or enum layout changes, when an existing function's signature or a closure's captured variables change, or when `main` changes. A running frame of old code may still call any function, so it must keep the old calling convention and data layout; `main` never returns to pick up new code.
 - Otherwise every function whose generated assembly differs from the running version is recompiled, including callers whose code changed only because a callee did. New functions are included. Heap, stack and all live values are kept.
 
 Mechanism:
 
 - Dev builds call every function through `fn_table`, a writable table of 4096 code addresses, with `call [rip+fn_table+8*i]`. Release builds call directly.
+- In dev builds a function value's code word is the address of its `fn_table` entry and calls through it use `call [r10]`, so a stored function value or closure runs the newest code. Callback thunks call through the table too.
 - At start the dev runtime installs a `SIGUSR1` handler and maps a 64 MB read-execute region at `0x40000000`, close enough to the binary for 32-bit relative references.
 - A patch is assembled with only the changed functions and their strings, then linked at the next free address in that region against the running binary's symbols (`ld -R`). Patched functions get a fresh symbol suffix so they never collide with the originals.
 - `low dev` writes the machine code into the region through `/proc/<pid>/mem`, writes `(index, address)` pairs and a count into a mailbox in the program, and sends `SIGUSR1`. The handler stores each address into `fn_table` with an aligned 8-byte write and clears the count, which `low dev` waits for.
@@ -505,7 +544,7 @@ Mechanism:
 
 ## Tests
 
-`internal/hot` tests reload against running programs: state kept across a code swap, functions added, compile errors leaving the program running, heap data surviving a reload while the collector runs, and restarts on layout and signature changes.
+`internal/hot` tests reload against running programs: state kept across a code swap, functions added, compile errors leaving the program running, heap data surviving a reload while the collector runs, stored function values, closures and callbacks running patched code, and restarts on layout, signature and capture changes.
 
 `go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. A program with a `.needed` file must link exactly those shared libraries; every other program must be static with no interpreter. Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
 
@@ -527,19 +566,19 @@ Mechanism:
 - `extern` blocks naming C libraries and declaring their functions, and dynamic linking against libc when any is named.
 - C interop: System V calls, `extern struct`, `ptr` and `ptr[T]`, `view`, `load`, `store`, `cstr`, `str(p)`, `pin` and `unpin`.
 - `defer`.
+- Function values and closures capturing by reference; `extern fn` C function pointers and C callbacks.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. Function values, and C-callable function pointers for callbacks.
-2. Generics, with type erasure or dynamic dispatch for custom elements and views.
-3. Green-thread scheduler, channels, `select`:
+1. Generics, with type erasure or dynamic dispatch for custom elements and views.
+2. Green-thread scheduler, channels, `select`:
     - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
     - C calls run on a large system stack rather than the green-thread stack.
     - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-4. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-5. GPU UI library modelled on Zed's GPUI, Linux first:
+3. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+4. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
@@ -548,5 +587,5 @@ Mechanism:
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-6. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-7. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+5. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+6. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

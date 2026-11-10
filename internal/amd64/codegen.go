@@ -50,6 +50,7 @@ type frame struct {
 type stackMap struct {
 	label   string
 	offsets []int
+	segment bool
 }
 
 var argRegs = []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
@@ -73,6 +74,11 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 	g.start(prog)
 	if table != nil {
 		g.trampolines(prog.CSymbols)
+	}
+	for _, f := range prog.Funcs {
+		if f.Callback {
+			g.thunk(f)
+		}
 	}
 	var out strings.Builder
 	out.WriteString(runtime)
@@ -461,6 +467,8 @@ func (g *Generator) instr(fr *frame, in *instr) {
 		g.emit("jae rt_panic_index")
 	case ir.OpSlot:
 		g.address(fr.loc(in.dst), fmt.Sprintf("[rbp%+d]", fr.slot(int(v.Aux))))
+	case ir.OpFuncAddr:
+		g.funcAddr(fr.loc(in.dst), v)
 	case ir.OpCall:
 		g.call(fr, in)
 	case ir.OpRuntime:
@@ -536,9 +544,42 @@ func (g *Generator) params(fr *frame, entry *mblock) {
 	g.parallel(moves)
 }
 
+func (g *Generator) funcAddr(dst string, v *ir.Value) {
+	switch {
+	case v.Aux == ir.SymbolAddr:
+		reg := dst
+		if !isReg(dst) {
+			reg = "r10"
+		}
+		g.emit("mov %s, qword ptr [rip+%s@GOTPCREL]", reg, v.Str)
+		g.move(dst, reg)
+	case v.Aux == ir.ThunkAddr:
+		g.address(dst, fmt.Sprintf("[rip+cb_%s]", v.Target.Name))
+	case g.table != nil:
+		g.address(dst, fmt.Sprintf("[rip+fn_table+%d]", 8*g.table[v.Target.Name]))
+	default:
+		g.address(dst, fmt.Sprintf("[rip+%s]", Symbol(v.Target.Name, "")))
+	}
+}
+
+func (g *Generator) callee(v *ir.Value) string {
+	switch {
+	case !v.Indirect:
+		return g.callTarget(v.Target)
+	case g.table != nil:
+		return "qword ptr [r10]"
+	}
+	return "r10"
+}
+
 func (g *Generator) call(fr *frame, in *instr) {
+	args := in.args
 	var moves []pmove
-	for i, a := range in.args {
+	if in.value.Indirect {
+		moves = append(moves, pmove{dst: "r10", src: fr.loc(args[0])})
+		args = args[1:]
+	}
+	for i, a := range args {
 		src := fr.loc(a)
 		if i < len(argRegs) {
 			moves = append(moves, pmove{dst: argRegs[i], src: src})
@@ -551,7 +592,7 @@ func (g *Generator) call(fr *frame, in *instr) {
 		g.emit("mov qword ptr [rsp+%d], %s", 8*(i-len(argRegs)), src)
 	}
 	g.parallel(moves)
-	g.emit("call %s", g.callTarget(in.value.Target))
+	g.emit("call %s", g.callee(in.value))
 	g.safepoint(fr, in)
 }
 
@@ -582,7 +623,10 @@ func (g *Generator) parallel(moves []pmove) {
 }
 
 func (g *Generator) safepoint(fr *frame, in *instr) {
-	label := g.newLabel()
+	g.safepointAt(fr, in, g.newLabel())
+}
+
+func (g *Generator) safepointAt(fr *frame, in *instr, label string) {
 	g.label(label)
 	var offsets []int
 	for i := range fr.saved {
@@ -608,7 +652,11 @@ func (g *Generator) writeMaps(out *strings.Builder) {
 		fmt.Fprintf(out, "\t.quad %s, .Lmap%d\n", m.label, i)
 	}
 	for i, m := range g.maps {
-		fmt.Fprintf(out, ".Lmap%d:\n\t.quad %d\n", i, len(m.offsets))
+		count := len(m.offsets)
+		if m.segment {
+			count = -1
+		}
+		fmt.Fprintf(out, ".Lmap%d:\n\t.quad %d\n", i, count)
 		for _, off := range m.offsets {
 			fmt.Fprintf(out, "\t.quad %d\n", off)
 		}

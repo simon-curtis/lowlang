@@ -335,6 +335,56 @@ func (p *Parser) param() *ast.Param {
 	return &ast.Param{Name: name.Text, Mut: mut, TypeName: p.typeName(), Pos: name.Pos}
 }
 
+func (p *Parser) funcType(pos lexer.Pos, c bool) *ast.TypeName {
+	p.expect(lexer.Fn)
+	t := &ast.TypeName{Func: true, CFunc: c, Pos: pos}
+	p.list(func() {
+		mut := p.at(lexer.Mut)
+		if mut {
+			p.next()
+		}
+		t.Muts = append(t.Muts, mut)
+		t.Params = append(t.Params, p.typeName())
+	})
+	if p.at(lexer.Arrow) {
+		p.next()
+		t.Result = p.typeName()
+	}
+	if p.at(lexer.Not) {
+		p.next()
+		t.Error = p.typeName()
+	}
+	return t
+}
+
+func (p *Parser) closure() *ast.Closure {
+	pos := p.expect(lexer.Fn).Pos
+	c := &ast.Closure{Pos: pos}
+	p.list(func() {
+		mut := p.at(lexer.Mut)
+		if mut {
+			p.next()
+		}
+		name := p.expect(lexer.Ident)
+		param := &ast.Param{Name: name.Text, Mut: mut, Pos: name.Pos}
+		if p.at(lexer.Colon) {
+			p.next()
+			param.TypeName = p.typeName()
+		}
+		c.Params = append(c.Params, param)
+	})
+	if p.at(lexer.Arrow) {
+		p.next()
+		c.Result = p.typeName()
+	}
+	if p.at(lexer.Not) {
+		p.next()
+		c.Error = p.typeName()
+	}
+	c.Body = p.block()
+	return c
+}
+
 func (p *Parser) typeName() *ast.TypeName {
 	t := p.typeTerm()
 	for p.at(lexer.Question) {
@@ -347,6 +397,11 @@ func (p *Parser) typeName() *ast.TypeName {
 func (p *Parser) typeTerm() *ast.TypeName {
 	pos := p.tok().Pos
 	switch {
+	case p.at(lexer.Fn):
+		return p.funcType(pos, false)
+	case p.at(lexer.Extern) && p.peek() == lexer.Fn:
+		p.next()
+		return p.funcType(pos, true)
 	case p.at(lexer.Star):
 		p.next()
 		return &ast.TypeName{Pointer: true, Elem: p.typeTerm(), Pos: pos}
@@ -582,6 +637,8 @@ func (p *Parser) primary() ast.Expr {
 		return p.ifExpr()
 	case lexer.LBrace:
 		return p.block()
+	case lexer.Fn:
+		return p.closure()
 	case lexer.Match:
 		p.next()
 		x := p.condition()

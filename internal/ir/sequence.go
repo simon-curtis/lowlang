@@ -75,15 +75,7 @@ func (b *builder) sliceLit(e *ast.SliceLit) []*Value {
 }
 
 func (b *builder) callNamed(name string, args ...*Value) []*Value {
-	target := b.named[name]
-	call := b.emit(OpCall, args...)
-	call.Target = target
-	results := make([]*Value, target.ResultWords)
-	for k := range results {
-		results[k] = b.result(call, k)
-	}
-	classify(results, target.Ret)
-	return results
+	return b.invoke(b.named[name], args)
 }
 
 func (b *builder) buffer() *Value {

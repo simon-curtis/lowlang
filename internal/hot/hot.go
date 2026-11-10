@@ -433,6 +433,11 @@ func signatures(files []*ast.File) map[string]string {
 				fmt.Fprintf(&b, "%t %s,", p.Mut, fn.ParamTypes[i])
 			}
 			fmt.Fprintf(&b, "-> %s", fn.RetType)
+			if fn.Closure != nil {
+				for _, l := range fn.Closure.Captures {
+					fmt.Fprintf(&b, " %s %s", l.Name, l.Type)
+				}
+			}
 			out[fmt.Sprintf("%s.%s", file.Module, fn.Name)] = b.String()
 		}
 	}

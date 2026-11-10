@@ -91,7 +91,11 @@ func (in *instr) hint() {
 	case in.move:
 		in.dst.copyOf = in.args[0]
 	case in.op == ir.OpCall || in.op == ir.OpRuntime:
-		for i, a := range in.args[:min(len(in.args), len(argRegs))] {
+		args := in.args
+		if in.value.Indirect {
+			args = args[1:]
+		}
+		for i, a := range args[:min(len(args), len(argRegs))] {
 			a.hint = argRegs[i]
 		}
 	}

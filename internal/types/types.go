@@ -1,6 +1,9 @@
 package types
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 type Kind int
 
@@ -18,6 +21,7 @@ const (
 	SliceKind
 	MapKind
 	RawKind
+	FuncKind
 )
 
 type Type struct {
@@ -27,6 +31,9 @@ type Type struct {
 	Fields   []*Field
 	Elem     *Type
 	Key      *Type
+	Params   []*Type
+	Muts     []bool
+	Ret      *Type
 	Ok       *Type
 	Err      *Type
 	Bits     int
@@ -86,6 +93,8 @@ func (t *Type) PointerWords() []bool {
 	switch t.Kind {
 	case PointerKind, MapKind, SliceKind, StrKind, RawKind:
 		words[0] = true
+	case FuncKind:
+		words[len(words)-1] = !t.C
 	case IntKind:
 		words[0] = t == Word
 	case StructKind:
@@ -180,6 +189,35 @@ func StructOf(t *Type) *Type {
 	return t
 }
 
+func NewFunc(params []*Type, muts []bool, ret *Type, c bool) *Type {
+	var b strings.Builder
+	if c {
+		b.WriteString("extern ")
+	}
+	b.WriteString("fn(")
+	for i, p := range params {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if muts[i] {
+			b.WriteString("mut ")
+		}
+		b.WriteString(p.String())
+	}
+	b.WriteString(")")
+	switch {
+	case ret.Kind == ResultKind && ret.Ok == Void:
+		fmt.Fprintf(&b, " %s", ret)
+	case ret != Void:
+		fmt.Fprintf(&b, " -> %s", ret)
+	}
+	size := 2
+	if c {
+		size = 1
+	}
+	return &Type{Kind: FuncKind, Name: b.String(), Params: params, Muts: muts, Ret: ret, C: c, size: size}
+}
+
 func NewRaw(elem *Type) *Type {
 	name := "ptr"
 	if elem != nil {
@@ -194,7 +232,7 @@ func (t *Type) CCompatible() bool {
 		return t != Word
 	case FloatKind, BoolKind, RawKind:
 		return true
-	case StructKind:
+	case StructKind, FuncKind:
 		return t.C
 	}
 	return false

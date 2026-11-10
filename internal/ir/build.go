@@ -27,15 +27,16 @@ type place struct {
 
 type builder struct {
 	ssa
-	cur    *Block
-	decl   *ast.Func
-	funcs  map[*ast.Func]*Func
-	named  map[string]*Func
-	slots  map[*ast.Local]*Value
-	refs   map[*ast.Local]*Value
-	loops  []loopTarget
-	temps  int
-	defers [][]ast.Stmt
+	cur      *Block
+	decl     *ast.Func
+	funcs    map[*ast.Func]*Func
+	adapters map[*ast.Func]*Func
+	named    map[string]*Func
+	slots    map[*ast.Local]*Value
+	refs     map[*ast.Local]*Value
+	loops    []loopTarget
+	temps    int
+	defers   [][]ast.Stmt
 }
 
 func Build(files []*ast.File) *Program {
@@ -45,12 +46,21 @@ func Build(files []*ast.File) *Program {
 	}
 	p := &Program{}
 	funcs := map[*ast.Func]*Func{}
+	adapters := map[*ast.Func]*Func{}
 	named := map[string]*Func{}
 	for _, d := range decls {
-		f := &Func{Name: symbolName(d), ParamWords: paramWords(d), ResultWords: d.RetType.Size(), Ret: d.RetType}
+		f := &Func{Name: symbolName(d), ParamWords: paramWords(d), ResultWords: d.RetType.Size(), Ret: d.RetType, Callback: d.Callback}
+		if d.Callback {
+			f.CParams = d.ParamTypes
+		}
 		funcs[d] = f
 		named[d.Name] = f
 		p.Funcs = append(p.Funcs, f)
+		if d.AsValue {
+			adapter := &Func{Name: fmt.Sprintf("%s..value", f.Name), ParamWords: 1 + f.ParamWords, ResultWords: f.ResultWords, Ret: f.Ret}
+			adapters[d] = adapter
+			p.Funcs = append(p.Funcs, adapter)
+		}
 		if d.Name == "main" && d.File.Module == "" {
 			p.Main = f
 			if d.RetType.Kind == types.ResultKind {
@@ -58,16 +68,25 @@ func Build(files []*ast.File) *Program {
 			}
 		}
 	}
-	for _, d := range decls {
-		b := &builder{
-			ssa:   newSSA(funcs[d]),
-			decl:  d,
-			funcs: funcs,
-			named: named,
-			slots: map[*ast.Local]*Value{},
-			refs:  map[*ast.Local]*Value{},
+	builderFor := func(f *Func, d *ast.Func) *builder {
+		return &builder{
+			ssa:      newSSA(f),
+			decl:     d,
+			funcs:    funcs,
+			adapters: adapters,
+			named:    named,
+			slots:    map[*ast.Local]*Value{},
+			refs:     map[*ast.Local]*Value{},
 		}
+	}
+	for _, d := range decls {
+		b := builderFor(funcs[d], d)
 		b.function()
+		b.finalize()
+	}
+	for d, f := range adapters {
+		b := builderFor(f, d)
+		b.adapter(funcs[d])
 		b.finalize()
 	}
 	p.Funcs = reachable(p.Main, p.Funcs)
@@ -112,7 +131,7 @@ func reachable(main *Func, funcs []*Func) []*Func {
 		seen[f] = true
 		for _, b := range f.Blocks {
 			for _, v := range b.Values {
-				if v.Op == OpCall {
+				if (v.Op == OpCall && !v.Indirect) || (v.Op == OpFuncAddr && v.Target != nil) {
 					visit(v.Target)
 				}
 			}
@@ -137,6 +156,9 @@ func symbolName(d *ast.Func) string {
 
 func paramWords(d *ast.Func) int {
 	words := 0
+	if d.Closure != nil {
+		words = 1
+	}
 	for i := range d.Params {
 		words += d.ParamSize(i)
 	}
@@ -147,6 +169,10 @@ func (b *builder) function() {
 	b.cur = b.fn.newBlock()
 	b.seal(b.cur)
 	word := 0
+	if b.decl.Closure != nil {
+		b.environment(b.decl.Closure.Captures)
+		word = 1
+	}
 	for i, local := range b.decl.ParamLocals {
 		if b.decl.Params[i].Mut {
 			b.refs[local] = b.param(word)
@@ -163,6 +189,35 @@ func (b *builder) function() {
 	}
 	body := b.expr(b.decl.Body)
 	b.ret(b.decl.Body.Type, body)
+}
+
+func (b *builder) environment(captures []*ast.Local) {
+	env := b.param(0)
+	for i, local := range captures {
+		box := b.emit(OpLoad, env)
+		box.Aux = int64(8 * i)
+		b.slots[local] = box
+	}
+}
+
+func (b *builder) adapter(target *Func) {
+	b.cur = b.fn.newBlock()
+	b.seal(b.cur)
+	var args []*Value
+	word := 1
+	for i, t := range b.decl.ParamTypes {
+		words := make([]*Value, b.decl.ParamSize(i))
+		for k := range words {
+			words[k] = b.param(word + k)
+		}
+		if !b.decl.Params[i].Mut {
+			classify(words, t)
+		}
+		args = append(args, words...)
+		word += len(words)
+	}
+	b.cur.Kind = Ret
+	b.cur.Results = b.invoke(target, args)
 }
 
 func (b *builder) param(word int) *Value {
@@ -272,6 +327,12 @@ func (b *builder) word(e ast.Expr) *Value {
 }
 
 func (b *builder) bind(local *ast.Local, words []*Value) {
+	if local.Captured {
+		box := b.runtime("alloc", b.constant(int64(len(words))), b.scan(local.Type))
+		b.slots[local] = box
+		b.store(place{addr: box}, words)
+		return
+	}
 	if local.Addressed || isC(local.Type) {
 		slot := b.emit(OpSlot)
 		slot.Aux = int64(len(b.fn.Slots))
@@ -527,9 +588,17 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		if e.Null {
 			return []*Value{b.constant(0)}
 		}
+		if e.Func != nil {
+			return b.funcValue(e.Func, e.Type)
+		}
 		return b.load(b.place(&ast.Place{Local: e.Local}), e.Type)
 	case *ast.Selector:
+		if e.Func != nil {
+			return b.funcValue(e.Func, e.Type)
+		}
 		return b.selector(e)
+	case *ast.Closure:
+		return b.closure(e)
 	case *ast.StructLit:
 		if isC(e.Type) {
 			return b.cStruct(e)
@@ -647,8 +716,69 @@ func (b *builder) call(e *ast.Call) []*Value {
 		return b.builtin(e)
 	case e.Variant != nil:
 		return b.construct(e.Type, e.Variant, e.Args)
+	case e.Target == nil:
+		return b.callValue(e)
 	}
 	return b.callFunc(e)
+}
+
+func (b *builder) funcAddr(kind int64, target *Func) *Value {
+	v := b.emit(OpFuncAddr)
+	v.Aux = kind
+	v.Target = target
+	v.Scalar = true
+	return v
+}
+
+func (b *builder) funcValue(fn *ast.Func, t *types.Type) []*Value {
+	switch {
+	case fn.Extern != nil:
+		v := b.funcAddr(SymbolAddr, nil)
+		v.Str = fn.Name
+		return []*Value{v}
+	case t.C:
+		return []*Value{b.funcAddr(ThunkAddr, b.funcs[fn])}
+	}
+	return []*Value{b.funcAddr(CodeAddr, b.adapters[fn]), b.constant(0)}
+}
+
+func (b *builder) closure(e *ast.Closure) []*Value {
+	code := b.funcAddr(CodeAddr, b.funcs[e.Func])
+	if len(e.Captures) == 0 {
+		return []*Value{code, b.constant(0)}
+	}
+	env := b.runtime("alloc", b.constant(int64(len(e.Captures))), b.constant(1))
+	for i, local := range e.Captures {
+		b.store(place{addr: env, offset: 8 * i}, []*Value{b.slots[local]})
+	}
+	return []*Value{code, env}
+}
+
+func (b *builder) arguments(args []ast.Expr, params []*types.Type) []*Value {
+	var words []*Value
+	for i, arg := range args {
+		if r, ok := arg.(*ast.Ref); ok {
+			words = append(words, b.address(b.place(r.Place)))
+			continue
+		}
+		words = append(words, b.value(arg, params[i])...)
+	}
+	return words
+}
+
+func (b *builder) callValue(e *ast.Call) []*Value {
+	t := e.Fn.TypeOf()
+	callee := b.value(e.Fn, t)
+	if t.C {
+		return b.cInvoke("", t.Params, t.Ret, callee, e.Args)
+	}
+	args := b.arguments(e.Args, t.Params)
+	signature := &Func{Name: t.Name, ParamWords: 1 + len(args), ResultWords: t.Ret.Size(), Ret: t.Ret}
+	operands := append(callee, args...)
+	call := b.emit(OpCall, operands...)
+	call.Indirect = true
+	call.Target = signature
+	return b.results(call, signature)
 }
 
 func (b *builder) convert(x *Value, from, to *types.Type) *Value {
@@ -710,17 +840,17 @@ func (b *builder) callFunc(e *ast.Call) []*Value {
 	if e.Target.Extern != nil {
 		return b.cCall(e)
 	}
-	target := b.funcs[e.Target]
-	var args []*Value
-	for i, arg := range e.Args {
-		if r, ok := arg.(*ast.Ref); ok {
-			args = append(args, b.address(b.place(r.Place)))
-			continue
-		}
-		args = append(args, b.value(arg, e.Target.ParamTypes[i])...)
-	}
+	args := b.arguments(e.Args, e.Target.ParamTypes)
+	return b.invoke(b.funcs[e.Target], args)
+}
+
+func (b *builder) invoke(target *Func, args []*Value) []*Value {
 	call := b.emit(OpCall, args...)
 	call.Target = target
+	return b.results(call, target)
+}
+
+func (b *builder) results(call *Value, target *Func) []*Value {
 	results := make([]*Value, target.ResultWords)
 	for k := range results {
 		results[k] = b.result(call, k)

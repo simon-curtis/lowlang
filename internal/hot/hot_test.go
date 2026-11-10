@@ -266,6 +266,53 @@ func TestReloadKeepsHeap(t *testing.T) {
 	f.noRestart()
 }
 
+const values = `fn value() -> i64 {
+    VALUE
+}
+
+fn native(n: i64) -> i64 {
+    n + VALUE
+}
+
+fn main() {
+    print(0)
+    let named: fn() -> i64 = value
+    let inline = fn() -> i64 { VALUE }
+    let callback: extern fn(i64) -> i64 = native
+    var n = named() + inline() + callback(0)
+    for n < 6 {
+        n = named() + inline() + callback(0)
+    }
+    print(n)
+}
+`
+
+func TestReloadReachesStoredFunctions(t *testing.T) {
+	f := newFixture(t, strings.ReplaceAll(values, "VALUE", "1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write(strings.ReplaceAll(values, "VALUE", "2"))
+	f.reload()
+	f.waitFor(f.stdout, "0\n6\n")
+	f.waitFor(f.stderr, "low: reloaded ")
+	for _, name := range []string{"main..c1", "native", "value"} {
+		if !strings.Contains(f.stderr.String(), name) {
+			t.Fatalf("%s was not reloaded:\n%s", name, f.stderr)
+		}
+	}
+	f.noRestart()
+}
+
+func TestCaptureChangeRestarts(t *testing.T) {
+	captures := strings.Replace(values, "fn() -> i64 { VALUE }", "fn() -> i64 { one }", 1)
+	captures = strings.Replace(captures, "    let named", "    let one = 1\n    let named", 1)
+	f := newFixture(t, strings.ReplaceAll(captures, "VALUE", "1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write(strings.ReplaceAll(values, "VALUE", "2"))
+	f.reload()
+	f.waitFor(f.stderr, "low: restarted: ")
+	f.waitFor(f.stdout, "0\n0\n6\n")
+}
+
 func TestLayoutChangeRestarts(t *testing.T) {
 	f := newFixture(t, "struct P {\n    x: i64\n}\n\n"+program("1"))
 	f.waitFor(f.stdout, "0\n")

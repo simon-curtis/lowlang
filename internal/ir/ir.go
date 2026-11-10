@@ -46,6 +46,13 @@ const (
 	OpCCall
 	OpRuntime
 	OpResult
+	OpFuncAddr
+)
+
+const (
+	CodeAddr = iota
+	ThunkAddr
+	SymbolAddr
 )
 
 var opNames = [...]string{
@@ -55,6 +62,7 @@ var opNames = [...]string{
 	OpConvert: "convert", OpSqrt: "sqrt", OpFloor: "floor",
 	OpEq: "eq", OpNe: "ne", OpLt: "lt", OpLe: "le", OpGt: "gt", OpGe: "ge",
 	OpLoad: "load", OpStore: "store", OpCheck: "check", OpSlot: "slot", OpCall: "call", OpCCall: "ccall", OpRuntime: "runtime", OpResult: "result",
+	OpFuncAddr: "funcaddr",
 }
 
 func (o Op) String() string {
@@ -70,19 +78,20 @@ func (o Op) HasResult() bool {
 }
 
 type Value struct {
-	ID      int
-	Op      Op
-	Args    []*Value
-	Block   *Block
-	Aux     int64
-	Str     string
-	Target  *Func
-	Plan    *CPlan
-	Type    *types.Type
-	From    *types.Type
-	Scalar  bool
-	Uses    int
-	forward *Value
+	ID       int
+	Op       Op
+	Args     []*Value
+	Block    *Block
+	Aux      int64
+	Str      string
+	Target   *Func
+	Plan     *CPlan
+	Type     *types.Type
+	From     *types.Type
+	Scalar   bool
+	Indirect bool
+	Uses     int
+	forward  *Value
 }
 
 func (v *Value) String() string {
@@ -117,6 +126,8 @@ type Func struct {
 	ParamWords  int
 	ResultWords int
 	Ret         *types.Type
+	Callback    bool
+	CParams     []*types.Type
 	Blocks      []*Block
 	Slots       []int
 	values      int
@@ -178,6 +189,11 @@ func describe(v *Value) string {
 		detail = fmt.Sprintf(" %s", v.Str)
 	case OpCall:
 		detail = fmt.Sprintf(" %s", v.Target.Name)
+	case OpFuncAddr:
+		detail = fmt.Sprintf(" %s", v.Str)
+		if v.Target != nil {
+			detail = fmt.Sprintf(" %s", v.Target.Name)
+		}
 	case OpCCall:
 		detail = fmt.Sprintf(" %s", v.Plan.Symbol)
 	case OpConvert:

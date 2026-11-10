@@ -49,19 +49,24 @@ type Checker struct {
 	scopes    []map[string]*ast.Local
 	loops     []*loop
 	raws      map[*types.Type]*types.Type
+	funcTypes map[string]*types.Type
+	closures  []*ast.Closure
+	counts    map[*ast.Func]int
 	deferring bool
 }
 
 func Check(files []*ast.File) (embeds []string, err error) {
 	c := &Checker{
-		modules: map[string]*scope{},
-		builtin: map[string]*types.Type{"bool": types.Bool, "str": types.Str, "__word": types.Word},
-		results: map[[2]*types.Type]*types.Type{},
-		ptrs:    map[*types.Type]*types.Type{},
-		opts:    map[*types.Type]*types.Type{},
-		slices:  map[*types.Type]*types.Type{},
-		maps:    map[[2]*types.Type]*types.Type{},
-		raws:    map[*types.Type]*types.Type{},
+		modules:   map[string]*scope{},
+		builtin:   map[string]*types.Type{"bool": types.Bool, "str": types.Str, "__word": types.Word},
+		results:   map[[2]*types.Type]*types.Type{},
+		ptrs:      map[*types.Type]*types.Type{},
+		opts:      map[*types.Type]*types.Type{},
+		slices:    map[*types.Type]*types.Type{},
+		maps:      map[[2]*types.Type]*types.Type{},
+		raws:      map[*types.Type]*types.Type{},
+		funcTypes: map[string]*types.Type{},
+		counts:    map[*ast.Func]int{},
 	}
 	defer func() {
 		r := recover()
@@ -159,6 +164,8 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 			return c.raw(nil)
 		}
 		return c.raw(c.resolve(t.Elem))
+	case t.Func:
+		return c.funcTypeName(t)
 	}
 	if t.Module != "" {
 		return c.importedType(t.Module, t.Name, t.Pos)
@@ -171,6 +178,38 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 		c.fail(t.Pos, "unknown type %s", t.Name)
 	}
 	return typ
+}
+
+func (c *Checker) funcTypeName(t *ast.TypeName) *types.Type {
+	params := make([]*types.Type, len(t.Params))
+	for i, p := range t.Params {
+		params[i] = c.resolve(p)
+		if t.CFunc && !params[i].CCompatible() {
+			c.fail(p.Pos, "extern fn parameters must have C types, found %s", params[i])
+		}
+	}
+	ret := c.resultOf(t.Result, t.Error)
+	if t.CFunc && ret != types.Void && !ret.CCompatible() {
+		c.fail(t.Pos, "extern fn results must have C types, found %s", ret)
+	}
+	return c.funcType(params, t.Muts, ret, t.CFunc)
+}
+
+func (c *Checker) funcType(params []*types.Type, muts []bool, ret *types.Type, cfn bool) *types.Type {
+	t := types.NewFunc(params, muts, ret, cfn)
+	if known, ok := c.funcTypes[t.Name]; ok {
+		return known
+	}
+	c.funcTypes[t.Name] = t
+	return t
+}
+
+func (c *Checker) signatureOf(fn *ast.Func, cfn bool) *types.Type {
+	muts := make([]bool, len(fn.Params))
+	for i, p := range fn.Params {
+		muts[i] = p.Mut
+	}
+	return c.funcType(fn.ParamTypes, muts, fn.RetType, cfn)
 }
 
 func (c *Checker) raw(elem *types.Type) *types.Type {
@@ -375,20 +414,20 @@ func (c *Checker) signature(fn *ast.Func) {
 	for _, p := range fn.Params {
 		fn.ParamTypes = append(fn.ParamTypes, c.resolve(p.TypeName))
 	}
-	fn.RetType = c.signatureResult(fn)
+	fn.RetType = c.resultOf(fn.Result, fn.Error)
 }
 
-func (c *Checker) signatureResult(fn *ast.Func) *types.Type {
+func (c *Checker) resultOf(result, errName *ast.TypeName) *types.Type {
 	ok := types.Void
-	if fn.Result != nil {
-		ok = c.resolve(fn.Result)
+	if result != nil {
+		ok = c.resolve(result)
 	}
-	if fn.Error == nil {
+	if errName == nil {
 		return ok
 	}
-	err := c.resolve(fn.Error)
+	err := c.resolve(errName)
 	if err.Kind != types.EnumKind {
-		c.fail(fn.Error.Pos, "error type must be an enum, found %s", err)
+		c.fail(errName.Pos, "error type must be an enum, found %s", err)
 	}
 	return c.result(ok, err)
 }
@@ -405,15 +444,22 @@ func (c *Checker) checkMain() {
 }
 
 func (c *Checker) function(fn *ast.Func) {
-	c.fn = fn
 	c.file = fn.File
-	c.scopes = []map[string]*ast.Local{{}}
+	c.scopes = nil
+	c.body(fn)
+}
+
+func (c *Checker) body(fn *ast.Func) {
+	c.fn = fn
+	c.pushScope()
+	defer c.popScope()
+	params := c.scopes[len(c.scopes)-1]
 	for i, p := range fn.Params {
-		if _, dup := c.scopes[0][p.Name]; dup {
+		if _, dup := params[p.Name]; dup {
 			c.fail(p.Pos, "parameter %s already declared", p.Name)
 		}
-		local := &ast.Local{Name: p.Name, Type: fn.ParamTypes[i], Mutable: p.Mut, Param: true, Ref: p.Mut}
-		c.scopes[0][p.Name] = local
+		local := &ast.Local{Name: p.Name, Type: fn.ParamTypes[i], Mutable: p.Mut, Param: true, Ref: p.Mut, Owner: fn}
+		params[p.Name] = local
 		fn.ParamLocals = append(fn.ParamLocals, local)
 	}
 	body := c.expr(fn.Body, c.okType())
@@ -421,8 +467,84 @@ func (c *Checker) function(fn *ast.Func) {
 		c.handled(fn.Body.Tail, body)
 	}
 	if !c.returnable(body) {
-		c.fail(fn.Body.Pos, "function %s must return %s, body produces %s", fn.Name, c.okType(), body)
+		c.fail(fn.Body.Pos, "%s must return %s, body produces %s", c.subject(), c.okType(), body)
 	}
+}
+
+func (c *Checker) subject() string {
+	if c.fn.Closure != nil {
+		return "the closure"
+	}
+	return fmt.Sprintf("function %s", c.fn.Name)
+}
+
+func (c *Checker) closure(e *ast.Closure, want *types.Type) {
+	want = unwrap(want)
+	if want != nil && (want.Kind != types.FuncKind || want.C || len(want.Params) != len(e.Params)) {
+		want = nil
+	}
+	fn := &ast.Func{Name: c.closureName(), File: c.file, Closure: e, Params: e.Params, Result: e.Result, Error: e.Error, Body: e.Body, Pos: e.Pos}
+	for i, p := range e.Params {
+		switch {
+		case p.TypeName != nil:
+			fn.ParamTypes = append(fn.ParamTypes, c.resolve(p.TypeName))
+		case want != nil:
+			fn.ParamTypes = append(fn.ParamTypes, want.Params[i])
+		default:
+			c.fail(p.Pos, "cannot infer the type of parameter %s; annotate it", p.Name)
+		}
+	}
+	fn.RetType = types.Void
+	switch {
+	case e.Result != nil || e.Error != nil:
+		fn.RetType = c.resultOf(e.Result, e.Error)
+	case want != nil:
+		fn.RetType = want.Ret
+	}
+	e.Func = fn
+	c.file.Funcs = append(c.file.Funcs, fn)
+	outer, loops, deferring := c.fn, c.loops, c.deferring
+	c.closures = append(c.closures, e)
+	c.loops, c.deferring = nil, false
+	c.body(fn)
+	c.closures = c.closures[:len(c.closures)-1]
+	c.fn, c.loops, c.deferring = outer, loops, deferring
+	e.Type = c.signatureOf(fn, false)
+}
+
+func (c *Checker) closureName() string {
+	c.counts[c.fn]++
+	return fmt.Sprintf("%s..c%d", c.fn.Name, c.counts[c.fn])
+}
+
+func (c *Checker) funcValue(fn *ast.Func, want *types.Type, pos lexer.Pos) *types.Type {
+	if fn.Variadic {
+		c.fail(pos, "variadic function %s cannot be used as a value", fn.Name)
+	}
+	want = unwrap(want)
+	callback := fn.Extern == nil && want != nil && want.Kind == types.FuncKind && want.C
+	if callback {
+		c.callback(fn, pos)
+	}
+	if fn.Extern == nil && !callback {
+		fn.AsValue = true
+	}
+	return c.signatureOf(fn, fn.Extern != nil || callback)
+}
+
+func (c *Checker) callback(fn *ast.Func, pos lexer.Pos) {
+	scalar := func(t *types.Type) bool {
+		return t.CCompatible() && t.Kind != types.StructKind
+	}
+	for i, t := range fn.ParamTypes {
+		if fn.Params[i].Mut || !scalar(t) {
+			c.fail(pos, "%s cannot be a C callback: parameter %s must be a number, bool, ptr or extern fn", fn.Name, fn.Params[i].Name)
+		}
+	}
+	if fn.RetType != types.Void && !scalar(fn.RetType) {
+		c.fail(pos, "%s cannot be a C callback: it must return a number, bool, ptr or extern fn", fn.Name)
+	}
+	fn.Callback = true
 }
 
 func (c *Checker) okType() *types.Type {
@@ -444,7 +566,7 @@ func (c *Checker) returnable(t *types.Type) bool {
 }
 
 func (c *Checker) declare(name string, t *types.Type, mutable bool) *ast.Local {
-	l := &ast.Local{Name: name, Type: t, Mutable: mutable}
+	l := &ast.Local{Name: name, Type: t, Mutable: mutable, Owner: c.fn}
 	c.scopes[len(c.scopes)-1][name] = l
 	return l
 }
@@ -463,7 +585,20 @@ func (c *Checker) lookup(name string, pos lexer.Pos) *ast.Local {
 	if l == nil {
 		c.fail(pos, "undefined: %s", name)
 	}
+	c.capture(l, pos)
 	return l
+}
+
+func (c *Checker) capture(l *ast.Local, pos lexer.Pos) {
+	for i := len(c.closures) - 1; i >= 0 && c.closures[i].Func != l.Owner; i-- {
+		if l.Ref {
+			c.fail(pos, "a closure cannot capture mut parameter %s", l.Name)
+		}
+		l.Captured = true
+		if closure := c.closures[i]; !slices.Contains(closure.Captures, l) {
+			closure.Captures = append(closure.Captures, l)
+		}
+	}
 }
 
 func (c *Checker) pushScope() {
@@ -755,7 +890,7 @@ func (c *Checker) ret(s *ast.Return) {
 	}
 	t := c.expr(s.Value, c.okType())
 	if c.okType() == types.Void && t != c.fn.RetType && t != types.Never {
-		c.fail(s.Value.Position(), "function %s does not return a value", c.fn.Name)
+		c.fail(s.Value.Position(), "%s does not return a value", c.subject())
 	}
 	if !c.returnable(t) {
 		c.fail(s.Value.Position(), "expected %s, found %s", c.okType(), t)
@@ -765,7 +900,7 @@ func (c *Checker) ret(s *ast.Return) {
 func (c *Checker) failStmt(s *ast.Fail) {
 	ret := c.fn.RetType
 	if ret.Kind != types.ResultKind {
-		c.fail(s.Pos, "fail requires function %s to declare an error type", c.fn.Name)
+		c.fail(s.Pos, "fail requires %s to declare an error type", c.subject())
 	}
 	c.expectType(s.Value, ret.Err)
 }
@@ -815,7 +950,9 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 	case *ast.Ident:
 		c.ident(e, want)
 	case *ast.Selector:
-		c.selector(e)
+		c.selector(e, want)
+	case *ast.Closure:
+		c.closure(e, want)
 	case *ast.StructLit:
 		c.structLit(e)
 	case *ast.Ref:
@@ -880,6 +1017,11 @@ func (c *Checker) ident(e *ast.Ident, want *types.Type) {
 		}
 		return
 	}
+	if fn, ok := c.local().funcs[e.Name]; ok && c.find(e.Name) == nil {
+		e.Func = fn
+		e.Type = c.funcValue(fn, want, e.Pos)
+		return
+	}
 	e.Local = c.lookup(e.Name, e.Pos)
 	e.Type = e.Local.Type
 }
@@ -926,7 +1068,12 @@ func (c *Checker) reachable(f *types.Field, t *types.Type, pos lexer.Pos) {
 	}
 }
 
-func (c *Checker) selector(e *ast.Selector) {
+func (c *Checker) selector(e *ast.Selector, want *types.Type) {
+	if id, ok := e.X.(*ast.Ident); ok && c.isModule(id.Name) && c.typeRef(e.X) == nil {
+		e.Func = c.importedFunc(id.Name, e.Name, e.Pos)
+		e.Type = c.funcValue(e.Func, want, e.Pos)
+		return
+	}
 	if t := c.typeRef(e.X); t != nil {
 		if t.Kind == types.StructKind {
 			c.fail(e.X.Position(), "%s is a type, not a value", t)
@@ -1207,7 +1354,11 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 			c.math(e, fn.Name, want)
 			return
 		}
-		if t, ok := c.builtin[fn.Name]; ok && t.Number() && c.find(fn.Name) == nil {
+		if c.find(fn.Name) != nil {
+			c.indirect(e)
+			return
+		}
+		if t, ok := c.builtin[fn.Name]; ok && t.Number() {
 			c.convert(e, t)
 			return
 		}
@@ -1221,14 +1372,48 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 		}
 		c.callFunc(e, target)
 	case *ast.Selector:
-		if id, ok := fn.X.(*ast.Ident); ok && c.isModule(id.Name) && c.typeRef(fn.X) == nil {
-			c.callFunc(e, c.importedFunc(id.Name, fn.Name, fn.Pos))
-			return
-		}
-		c.variantCall(e, fn)
+		c.selectorCall(e, fn)
 	default:
-		c.fail(e.Pos, "cannot call this expression")
+		c.indirect(e)
 	}
+}
+
+func (c *Checker) selectorCall(e *ast.Call, sel *ast.Selector) {
+	id, isIdent := sel.X.(*ast.Ident)
+	t := c.typeRef(sel.X)
+	switch {
+	case t != nil:
+		c.variantCall(e, sel, t)
+	case isIdent && c.isModule(id.Name):
+		c.callFunc(e, c.importedFunc(id.Name, sel.Name, sel.Pos))
+	case isIdent && c.find(id.Name) == nil:
+		c.fail(id.Pos, "undefined: %s", id.Name)
+	default:
+		c.indirect(e)
+	}
+}
+
+func (c *Checker) indirect(e *ast.Call) {
+	t := c.plain(e.Fn, nil)
+	if t.Kind != types.FuncKind {
+		c.fail(e.Pos, "cannot call a value of type %s", t)
+	}
+	if len(e.Args) != len(t.Params) {
+		c.fail(e.Pos, "%s takes %d arguments, found %d", t, len(t.Params), len(e.Args))
+	}
+	for i, arg := range e.Args {
+		r, isRef := arg.(*ast.Ref)
+		switch {
+		case t.Muts[i] && isRef:
+			c.ref(r, t.Params[i])
+		case t.Muts[i]:
+			c.fail(arg.Position(), "parameter %d of %s is mut; write mut before the argument", i+1, t)
+		default:
+			c.expectType(arg, t.Params[i])
+		}
+	}
+	c.exclusive(e.Args)
+	e.Type = t.Ret
 }
 
 func (c *Checker) print(e *ast.Call) {
@@ -1442,12 +1627,8 @@ func (c *Checker) convert(e *ast.Call, to *types.Type) {
 	e.Type = to
 }
 
-func (c *Checker) variantCall(e *ast.Call, sel *ast.Selector) {
-	t := c.typeRef(sel.X)
-	if id, ok := sel.X.(*ast.Ident); ok && t == nil && c.find(id.Name) == nil {
-		c.fail(id.Pos, "undefined: %s", id.Name)
-	}
-	if t == nil || t.Kind != types.EnumKind {
+func (c *Checker) variantCall(e *ast.Call, sel *ast.Selector, t *types.Type) {
+	if t.Kind != types.EnumKind {
 		c.fail(e.Pos, "cannot call this expression")
 	}
 	c.construct(e, t, c.variant(t, sel.Name, sel.Pos))
@@ -1618,7 +1799,7 @@ func (c *Checker) try(e *ast.Try) {
 	t := c.errorResult(e.X, "?", e.Pos)
 	ret := c.fn.RetType
 	if ret.Kind != types.ResultKind {
-		c.fail(e.Pos, "? requires function %s to declare an error type", c.fn.Name)
+		c.fail(e.Pos, "? requires %s to declare an error type", c.subject())
 	}
 	if ret.Err != t.Err {
 		c.fail(e.Pos, "cannot propagate %s from function with error type %s", t.Err, ret.Err)

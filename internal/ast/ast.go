@@ -57,6 +57,12 @@ type TypeName struct {
 	Optional bool
 	Map      bool
 	Key      *TypeName
+	Func     bool
+	CFunc    bool
+	Params   []*TypeName
+	Muts     []bool
+	Result   *TypeName
+	Error    *TypeName
 	Elem     *TypeName
 	Pos      lexer.Pos
 }
@@ -145,6 +151,9 @@ type Func struct {
 	File        *File
 	Extern      *Extern
 	Variadic    bool
+	Closure     *Closure
+	AsValue     bool
+	Callback    bool
 	Params      []*Param
 	Result      *TypeName
 	Error       *TypeName
@@ -169,6 +178,8 @@ type Local struct {
 	Param     bool
 	Ref       bool
 	Addressed bool
+	Captured  bool
+	Owner     *Func
 }
 
 type Node interface {
@@ -279,6 +290,7 @@ type Ident struct {
 	Local   *Local
 	Variant *types.Variant
 	Null    bool
+	Func    *Func
 }
 
 type Selector struct {
@@ -289,6 +301,18 @@ type Selector struct {
 	Variant *types.Variant
 	Field   *types.Field
 	Length  bool
+	Func    *Func
+}
+
+type Closure struct {
+	Typed
+	Params   []*Param
+	Result   *TypeName
+	Error    *TypeName
+	Body     *Block
+	Pos      lexer.Pos
+	Func     *Func
+	Captures []*Local
 }
 
 type Index struct {
@@ -452,6 +476,7 @@ func (n *Selector) Position() lexer.Pos  { return n.Pos }
 func (n *StructLit) Position() lexer.Pos { return n.Pos }
 func (n *Ref) Position() lexer.Pos       { return n.Pos }
 func (n *Index) Position() lexer.Pos     { return n.Pos }
+func (n *Closure) Position() lexer.Pos   { return n.Pos }
 func (n *Slicing) Position() lexer.Pos   { return n.Pos }
 func (n *SliceLit) Position() lexer.Pos  { return n.Pos }
 func (n *Interp) Position() lexer.Pos    { return n.Pos }
@@ -486,6 +511,7 @@ func (*Selector) expr()  {}
 func (*StructLit) expr() {}
 func (*Ref) expr()       {}
 func (*Index) expr()     {}
+func (*Closure) expr()   {}
 func (*Slicing) expr()   {}
 func (*SliceLit) expr()  {}
 func (*Interp) expr()    {}

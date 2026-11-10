@@ -76,15 +76,15 @@ func (r *registers) fit(classes []Class) bool {
 	return true
 }
 
-func (b *builder) cPlan(fn *ast.Func, argTypes []*types.Type, mut []bool) *CPlan {
-	plan := &CPlan{Symbol: fn.Name, Ret: fn.RetType}
+func cPlan(symbol string, ret *types.Type, argTypes []*types.Type, mut []bool) *CPlan {
+	plan := &CPlan{Symbol: symbol, Ret: ret}
 	regs := &registers{}
-	if fn.RetType != types.Void {
-		if isC(fn.RetType) && fn.RetType.Bytes > 16 {
+	if ret != types.Void {
+		if isC(ret) && ret.Bytes > 16 {
 			plan.Memory = true
 			regs.ints = 1
 		} else {
-			plan.Results = eightbytes(fn.RetType)
+			plan.Results = eightbytes(ret)
 		}
 	}
 	for i, t := range argTypes {
@@ -106,12 +106,15 @@ func (b *builder) cPlan(fn *ast.Func, argTypes []*types.Type, mut []bool) *CPlan
 }
 
 func (b *builder) cCall(e *ast.Call) []*Value {
-	fn := e.Target
+	return b.cInvoke(e.Target.Name, e.Target.ParamTypes, e.Target.RetType, nil, e.Args)
+}
+
+func (b *builder) cInvoke(symbol string, params []*types.Type, ret *types.Type, callee []*Value, exprs []ast.Expr) []*Value {
 	var args []*Value
 	var argTypes []*types.Type
 	var mut []bool
 	var refs []*ast.Ref
-	for i, arg := range e.Args {
+	for i, arg := range exprs {
 		if r, ok := arg.(*ast.Ref); ok {
 			args = append(args, b.address(b.place(r.Place)))
 			argTypes = append(argTypes, r.Type)
@@ -120,11 +123,11 @@ func (b *builder) cCall(e *ast.Call) []*Value {
 			continue
 		}
 		t := arg.TypeOf()
-		if i < len(fn.ParamTypes) {
-			t = fn.ParamTypes[i]
+		if i < len(params) {
+			t = params[i]
 		}
 		words := b.value(arg, t)
-		if t == types.F32 && i >= len(fn.ParamTypes) {
+		if t == types.F32 && i >= len(params) {
 			words = []*Value{b.convert(words[0], types.F32, types.F64)}
 			t = types.F64
 		}
@@ -132,19 +135,20 @@ func (b *builder) cCall(e *ast.Call) []*Value {
 		argTypes = append(argTypes, t)
 		mut = append(mut, false)
 	}
-	call := b.emit(OpCCall, args...)
-	call.Plan = b.cPlan(fn, argTypes, mut)
-	results := make([]*Value, fn.RetType.Size())
+	operands := append(callee, args...)
+	call := b.emit(OpCCall, operands...)
+	call.Plan = cPlan(symbol, ret, argTypes, mut)
+	results := make([]*Value, ret.Size())
 	for k := range results {
 		results[k] = b.result(call, k)
 	}
-	if width := fn.RetType.Width(); width != nil && len(results) == 1 {
+	if width := ret.Width(); width != nil && len(results) == 1 {
 		if width.Float() {
 			width = types.U32
 		}
 		results[0] = b.convert(results[0], types.I64, width)
 	}
-	classify(results, fn.RetType)
+	classify(results, ret)
 	for _, r := range refs {
 		b.renormalize(r)
 	}

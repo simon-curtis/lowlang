@@ -52,6 +52,15 @@ rt_pins:
 	.zero 524288
 rt_user_sp:
 	.zero 8
+	.globl rt_c_fp
+rt_c_fp:
+	.zero 8
+	.globl rt_c_pc
+rt_c_pc:
+	.zero 8
+	.globl rt_c_sp
+rt_c_sp:
+	.zero 8
 rt_free_small:
 	.zero 512
 
@@ -472,6 +481,8 @@ rt_gc:
 	jz 2f
 	mov rbx, rax
 	mov r12, [rbx]
+	cmp r12, -1
+	je 9f
 5:
 	test r12, r12
 	jz 4f
@@ -490,6 +501,11 @@ rt_gc:
 	mov r12, [r13+8]
 	mov r13, [r13]
 	jmp 1b
+9:
+	lea rdi, [r13+16]
+	mov rsi, [r13-8]
+	call rt_scan_range
+	jmp 4b
 3:
 	mov rdi, r14
 	mov rsi, [rip+rt_stack_top]
