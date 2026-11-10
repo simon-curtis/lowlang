@@ -11,6 +11,7 @@ type vreg struct {
 	start       int
 	end         int
 	crossesCall bool
+	scalar      bool
 	hint        string
 	copyOf      *vreg
 	reg         string
@@ -130,6 +131,7 @@ func (l *lowering) vreg(v *ir.Value) *vreg {
 	r, ok := l.vregs[v]
 	if !ok {
 		r = l.newVreg()
+		r.scalar = v.Scalar
 		if fitsImmediate(v) {
 			r.konst = &v.Aux
 		}
@@ -160,6 +162,7 @@ func (l *lowering) temp(phi *ir.Value) *vreg {
 	r, ok := l.temps[phi]
 	if !ok {
 		r = l.newVreg()
+		r.scalar = phi.Scalar
 		l.temps[phi] = r
 	}
 	return r

@@ -60,11 +60,51 @@ var (
 	U8    = &Type{Kind: IntKind, Name: "u8", Bits: 8, size: 1}
 	F64   = &Type{Kind: FloatKind, Name: "f64", Bits: 64, size: 1}
 	F32   = &Type{Kind: FloatKind, Name: "f32", Bits: 32, size: 1}
+	Word  = &Type{Kind: IntKind, Name: "__word", Bits: 64, Signed: true, size: 1}
 	Bool  = &Type{Kind: BoolKind, Name: "bool", size: 1}
 	Str   = &Type{Kind: StrKind, Name: "str", size: 2}
 )
 
 var Numeric = []*Type{I64, I32, U32, U16, U8, F64, F32}
+
+func (t *Type) HasPointers() bool {
+	for _, p := range t.PointerWords() {
+		if p {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *Type) PointerWords() []bool {
+	words := make([]bool, t.size)
+	switch t.Kind {
+	case PointerKind, MapKind, SliceKind, StrKind:
+		words[0] = true
+	case IntKind:
+		words[0] = t == Word
+	case StructKind:
+		for _, f := range t.Fields {
+			copy(words[f.Offset:], f.Type.PointerWords())
+		}
+	case EnumKind:
+		for _, v := range t.Variants {
+			for i, f := range v.Fields {
+				merge(words[v.Offsets[i]:], f.PointerWords())
+			}
+		}
+	case ResultKind:
+		merge(words[1:], t.Ok.PointerWords())
+		merge(words[1:], t.Err.PointerWords())
+	}
+	return words
+}
+
+func merge(into, from []bool) {
+	for i, p := range from {
+		into[i] = into[i] || p
+	}
+}
 
 func (t *Type) Integer() bool {
 	return t.Kind == IntKind

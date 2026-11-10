@@ -1,6 +1,10 @@
 package ir
 
-import "lowlang/internal/ast"
+import (
+	"slices"
+
+	"lowlang/internal/ast"
+)
 
 type varKey struct {
 	local *ast.Local
@@ -118,6 +122,31 @@ func (s *ssa) finalize() {
 	for s.removeTrivialPhis() {
 	}
 	s.countUses()
+	s.classifyPhis()
+}
+
+func (s *ssa) classifyPhis() {
+	var phis []*Value
+	for _, b := range s.fn.Blocks {
+		for _, v := range b.Values {
+			if v.Op == OpPhi {
+				v.Scalar = true
+				phis = append(phis, v)
+			}
+			if v.Op == OpUndef || v.Op == OpSlot {
+				v.Scalar = true
+			}
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, phi := range phis {
+			if phi.Scalar && slices.ContainsFunc(phi.Args, func(a *Value) bool { return !a.Scalar }) {
+				phi.Scalar = false
+				changed = true
+			}
+		}
+	}
 }
 
 func (s *ssa) prune() {

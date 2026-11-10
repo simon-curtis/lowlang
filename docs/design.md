@@ -376,10 +376,13 @@ The runtime, `internal/amd64/runtime.asm`, is emitted with every program and tal
 The garbage collector is a non-moving mark-sweep collector in the runtime:
 
 - The heap is a 16 GB reservation made with `mmap` and `MAP_NORESERVE`; pages are committed as they are touched.
-- Each object has a one-word header holding its size in words, a mark bit and a free bit. A bitmap records the first word of every object and free chunk, which resolves pointers into the middle of an object, such as a `mut` parameter aimed at a heap field.
+- Each object has a one-word header holding its size in words, a mark bit, a free bit and a noscan bit. A bitmap records the first word of every object and free chunk, which resolves pointers into the middle of an object, such as a `mut` parameter aimed at a heap field.
 - Allocation takes from exact-size free lists for objects under 64 words, then first-fit from a list of larger chunks, splitting them, then from the end of the heap.
 - Collection runs when the words allocated since the last one exceed the words that survived it, with a 4 MB floor.
-- Roots are found by scanning the whole stack conservatively; heap objects are scanned conservatively too. Any word holding a heap address keeps that object alive. Precise scanning needs pointer maps from the register allocator.
+- An allocation whose type holds no pointers is noscan: `new` of a pointer-free value, and the backing arrays of slices whose elements hold none, such as `[]u8`, `[]i64` and `[]f32`. A noscan object is marked but its contents are never read. Other objects are scanned word by word.
+- Roots come from stack maps. At every call the code generator records the frame words that may hold a heap pointer at that point: the saved callee-saved registers, spill slots of values that may be pointers and are live across the call, and every frame slot. The maps form a table sorted by return address. `rt_alloc` and `rt_grow` record their caller's return address and stack pointer; the collector scans the runtime frames below that conservatively, then follows the `rbp` chain, looking up each frame's return address and scanning only its mapped words. Frames without a map, such as code patched in by hot reload, are scanned whole, and the region above `main` is scanned conservatively.
+- Values in callee-saved registers are found in the save slots of whichever later frame saved them, or among the registers `rt_gc` pushes.
+- Every candidate word, mapped or not, is checked against the heap before it is followed, so a map that names a word holding an integer is harmless.
 - Sweeping coalesces adjacent dead objects into free chunks and returns a trailing free run to the end of the heap.
 
 ### IR
@@ -389,6 +392,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Narrow integers are kept sign-extended (`i32`) or zero-extended (`u32`, `u16`, `u8`) in their word; floats are kept as their bit pattern, `f32` zero-extended. Arithmetic, conversion and comparison values carry their type.
 - A variable passed as `mut` lives in a frame slot and is accessed with loads and stores; every other variable is pure SSA.
 - Integer division carries its zero and overflow checks inside the instruction.
+- Every value records whether it may hold a heap pointer. Loads, parameters and call results take this from their type's word layout, where an enum word counts as a pointer if any variant puts one there; constants, typed arithmetic, string literals and frame addresses never do; untyped address arithmetic and anything unclassified count as pointers; a phi holds a pointer if any input may. The prelude stores map entries as `__word`, an integer type the collector scans, because entries hold keys and values of any type.
 - A `str` is two words and a slice three. An element access computes `pointer + index * stride` after a `check` instruction, which compares unsigned and jumps to the index panic; packed elements load with `movzx`, `movsxd` or a 32-bit `mov` and store at their width.
 - A map entry is a run of words in the prelude's `__Map.entries` slice: a live flag, the key and the value. An open-addressing index of entry numbers with linear probing finds them; deleted entries leave tombstones until the next rebuild, which compacts the entries in order and resizes the index to keep it at most three quarters full. Integer, `bool` and pointer keys hash their word; `str` keys hash their bytes with FNV-1a. The compiler reads and writes value words directly in the entries slice, so the prelude needs no generics.
 - `push` and the formatting helpers call the runtime's `rt_grow` and the prelude; the buffer behind an interpolation lives in a frame slot passed as a `mut` argument.
@@ -451,10 +455,9 @@ Mechanism:
 
 ## Roadmap
 
-1. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
-2. Embedded data: Unicode tables, SPIR-V and a fallback font.
-3. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
-4. C interop:
+1. Embedded data: Unicode tables, SPIR-V and a fallback font.
+2. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
+3. C interop:
    - `extern fn` declarations.
    - System V ABI thunks: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` and `xmm0` to `xmm7`, struct classification, 16-byte stack alignment.
    - C struct layout with natural alignment, alongside the one-word-per-scalar layout.
@@ -463,14 +466,14 @@ Mechanism:
    - Unmanaged pointer-plus-length views over mmap'd and GPU-mapped memory.
    - Explicit release of file descriptors and mappings.
    - The garbage collector never frees memory held only by C.
-5. Function values, and C-callable function pointers for callbacks.
-6. Generics, with type erasure or dynamic dispatch for custom elements and views.
-7. Green-thread scheduler, channels, `select`:
+4. Function values, and C-callable function pointers for callbacks.
+5. Generics, with type erasure or dynamic dispatch for custom elements and views.
+6. Green-thread scheduler, channels, `select`:
     - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
     - C calls run on a large system stack rather than the green-thread stack.
     - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-8. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-9. GPU UI library modelled on Zed's GPUI, Linux first:
+7. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+8. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation.
@@ -479,5 +482,5 @@ Mechanism:
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-10. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-11. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+9. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+10. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

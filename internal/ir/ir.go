@@ -77,6 +77,7 @@ type Value struct {
 	Target  *Func
 	Type    *types.Type
 	From    *types.Type
+	Scalar  bool
 	Uses    int
 	forward *Value
 }
@@ -112,6 +113,7 @@ type Func struct {
 	Name        string
 	ParamWords  int
 	ResultWords int
+	Ret         *types.Type
 	Blocks      []*Block
 	Slots       []int
 	values      int

@@ -67,7 +67,7 @@ func (b *builder) sliceLit(e *ast.SliceLit) []*Value {
 	}
 	elem := e.Type.Elem
 	words := (len(e.Elems)*elem.Stride() + 7) / 8
-	ptr := b.runtime("alloc", b.constant(int64(words)))
+	ptr := b.runtime("alloc", b.constant(int64(words)), b.scan(elem))
 	for i, el := range e.Elems {
 		b.store(place{addr: ptr, offset: i * elem.Stride(), scalar: scalarOf(elem)}, b.value(el, elem))
 	}
@@ -82,6 +82,7 @@ func (b *builder) callNamed(name string, args ...*Value) []*Value {
 	for k := range results {
 		results[k] = b.result(call, k)
 	}
+	classify(results, target.Ret)
 	return results
 }
 
@@ -119,7 +120,7 @@ func (b *builder) interpolate(e *ast.Interp) []*Value {
 		}
 		b.appendValue(buf, part)
 	}
-	return b.load(place{addr: buf}, 2)
+	return b.load(place{addr: buf}, types.Str)
 }
 
 func (b *builder) strings(e *ast.Binary) []*Value {
@@ -129,6 +130,7 @@ func (b *builder) strings(e *ast.Binary) []*Value {
 		return b.callNamed("__concat", x[0], x[1], y[0], y[1])
 	}
 	equal := b.runtime("str_eq", x[0], x[1], y[0], y[1])
+	equal.Scalar = true
 	if e.Op == lexer.NotEq {
 		return []*Value{b.typed(OpNot, types.Bool, equal)}
 	}
@@ -180,7 +182,7 @@ func (b *builder) push(e *ast.Call) {
 	stride := int64(elem.Stride())
 	header := b.address(b.place(ref.Place))
 	value := b.value(e.Args[1], elem)
-	slice := b.load(place{addr: header}, 3)
+	slice := b.load(place{addr: header}, ref.Type)
 	ptr, length, capacity := slice[0], slice[1], slice[2]
 	temp := b.newTemp()
 	grow := b.newBlock()
@@ -190,7 +192,7 @@ func (b *builder) push(e *ast.Call) {
 	b.enter(grow)
 	grown := b.emit(OpAdd, b.emit(OpMul, capacity, b.constant(2)), b.constant(4))
 	used := b.emit(OpMul, length, b.constant(stride))
-	moved := b.runtime("grow", ptr, used, b.emit(OpMul, grown, b.constant(stride)))
+	moved := b.runtime("grow", ptr, used, b.emit(OpMul, grown, b.constant(stride)), b.scan(elem))
 	b.store(place{addr: header}, []*Value{moved})
 	b.store(place{addr: header, offset: 16}, []*Value{grown})
 	b.writeTemp(temp, []*Value{moved})
@@ -236,7 +238,7 @@ func (b *builder) forIn(s *ast.ForIn) {
 	} else {
 		elem := s.Iter.TypeOf().Elem
 		at := place{addr: b.scaled(seq[0], i, elem.Stride()), scalar: scalarOf(elem)}
-		b.bind(s.ValueLocal, b.load(at, elem.Size()))
+		b.bind(s.ValueLocal, b.load(at, elem))
 		b.writeTemp(step, []*Value{b.constant(1)})
 	}
 	b.loopBody(s.Body, next, exit)

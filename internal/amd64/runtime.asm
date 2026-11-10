@@ -41,6 +41,10 @@ rt_gc_threshold:
 	.zero 8
 rt_free_large:
 	.zero 8
+rt_user_pc:
+	.zero 8
+rt_user_sp:
+	.zero 8
 rt_free_small:
 	.zero 512
 
@@ -142,11 +146,16 @@ rt_str_eq:
 
 	.globl rt_grow
 rt_grow:
+	mov rax, [rsp]
+	mov [rip+rt_user_pc], rax
+	lea rax, [rsp+8]
+	mov [rip+rt_user_sp], rax
 	push rdi
 	push rsi
+	mov rsi, rcx
 	lea rdi, [rdx+7]
 	shr rdi, 3
-	call rt_alloc
+	call rt_alloc_body
 	pop rcx
 	pop rsi
 	mov rdi, rax
@@ -244,7 +253,7 @@ rt_clear_start:
 
 rt_free_chunk:
 	mov rax, rsi
-	shl rax, 2
+	shl rax, 3
 	or rax, 2
 	mov [rdi], rax
 	lea rcx, [rip+rt_free_large]
@@ -260,6 +269,12 @@ rt_free_chunk:
 
 	.globl rt_alloc
 rt_alloc:
+	mov rax, [rsp]
+	mov [rip+rt_user_pc], rax
+	lea rax, [rsp+8]
+	mov [rip+rt_user_sp], rax
+rt_alloc_body:
+	push rsi
 	lea rsi, [rdi+1]
 	mov rax, [rip+rt_alloc_since]
 	add rax, rsi
@@ -286,7 +301,7 @@ rt_alloc:
 	test rax, rax
 	jz 5f
 	mov rdx, [rax]
-	shr rdx, 2
+	shr rdx, 3
 	cmp rdx, rsi
 	jae 4f
 	lea rcx, [rax+8]
@@ -323,7 +338,12 @@ rt_alloc:
 	pop rax
 6:
 	mov rdx, rsi
-	shl rdx, 2
+	shl rdx, 3
+	pop rcx
+	test rcx, rcx
+	jnz 8f
+	or rdx, 4
+8:
 	mov [rax], rdx
 	lea rdi, [rax+8]
 	lea rcx, [rsi-1]
@@ -392,37 +412,113 @@ rt_gc:
 	push r14
 	push r15
 	mov r15, [rip+rt_mark_base]
-	mov r12, rsp
-	mov r13, [rip+rt_stack_top]
+	mov rdi, rsp
+	mov rsi, [rip+rt_user_sp]
+	call rt_scan_range
+	mov r12, [rip+rt_user_pc]
+	mov r13, rbp
+	mov r14, [rip+rt_user_sp]
 1:
-	cmp r12, r13
-	jae 2f
-	mov rdi, [r12]
+	test r13, r13
+	jz 3f
+	cmp r13, [rip+rt_stack_top]
+	jae 3f
+	mov rdi, r12
+	call rt_lookup_map
+	test rax, rax
+	jz 2f
+	mov rbx, rax
+	mov r12, [rbx]
+5:
+	test r12, r12
+	jz 4f
+	add rbx, 8
+	mov rax, [rbx]
+	mov rdi, [r13+rax]
 	call rt_mark
-	add r12, 8
-	jmp 1b
+	dec r12
+	jmp 5b
 2:
+	mov rdi, r14
+	mov rsi, r13
+	call rt_scan_range
+4:
+	lea r14, [r13+16]
+	mov r12, [r13+8]
+	mov r13, [r13]
+	jmp 1b
+3:
+	mov rdi, r14
+	mov rsi, [rip+rt_stack_top]
+	call rt_scan_range
+6:
 	cmp r15, [rip+rt_mark_base]
-	jbe 4f
+	jbe 8f
 	sub r15, 8
 	mov r12, [r15]
+	test byte ptr [r12], 4
+	jnz 6b
 	mov r13, [r12]
-	shr r13, 2
+	shr r13, 3
 	mov r14d, 1
-3:
+7:
 	cmp r14, r13
-	jae 2b
+	jae 6b
 	mov rdi, [r12+8*r14]
 	call rt_mark
 	inc r14
-	jmp 3b
-4:
+	jmp 7b
+8:
 	call rt_sweep
 	pop r15
 	pop r14
 	pop r13
 	pop r12
 	pop rbx
+	ret
+
+rt_scan_range:
+	push rbx
+	push r12
+	mov rbx, rdi
+	mov r12, rsi
+1:
+	cmp rbx, r12
+	jae 2f
+	mov rdi, [rbx]
+	call rt_mark
+	add rbx, 8
+	jmp 1b
+2:
+	pop r12
+	pop rbx
+	ret
+
+rt_lookup_map:
+	lea r8, [rip+rt_maps]
+	mov rcx, [r8]
+	add r8, 8
+	xor eax, eax
+1:
+	cmp rax, rcx
+	jae 3f
+	lea rdx, [rax+rcx]
+	shr rdx, 1
+	mov r9, rdx
+	shl r9, 4
+	cmp rdi, [r8+r9]
+	je 2f
+	jb 4f
+	lea rax, [rdx+1]
+	jmp 1b
+4:
+	mov rcx, rdx
+	jmp 1b
+2:
+	mov rax, [r8+r9+8]
+	ret
+3:
+	xor eax, eax
 	ret
 
 rt_sweep:
@@ -440,7 +536,7 @@ rt_sweep:
 	jae 5f
 	mov rax, [r12]
 	mov rcx, rax
-	shr rcx, 2
+	shr rcx, 3
 	test eax, 1
 	jz 2f
 	and rax, -2

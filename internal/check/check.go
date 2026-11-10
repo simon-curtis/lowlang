@@ -48,7 +48,7 @@ type Checker struct {
 func Check(files []*ast.File) (err error) {
 	c := &Checker{
 		modules: map[string]*scope{},
-		builtin: map[string]*types.Type{"bool": types.Bool, "str": types.Str},
+		builtin: map[string]*types.Type{"bool": types.Bool, "str": types.Str, "__word": types.Word},
 		results: map[[2]*types.Type]*types.Type{},
 		ptrs:    map[*types.Type]*types.Type{},
 		opts:    map[*types.Type]*types.Type{},
@@ -1197,8 +1197,8 @@ func (c *Checker) special(e *ast.Call, name string) bool {
 		if len(e.Args) != 2 {
 			c.fail(e.Pos, "__str_raw takes 2 arguments")
 		}
-		c.expectType(e.Args[0], types.I64)
-		c.expectType(e.Args[1], types.I64)
+		c.integer(e.Args[0])
+		c.integer(e.Args[1])
 		e.Builtin, e.Type = name, types.Str
 	case "__str_view":
 		c.single(e, name)

@@ -36,12 +36,20 @@ type Generator struct {
 	strings map[string]bool
 	table   map[string]int
 	suffix  string
+	maps    []stackMap
 }
 
 type frame struct {
-	saved   []string
-	slots   []int
-	results int
+	fn        *mfunc
+	saved     []string
+	slots     []int
+	firstSlot int
+	results   int
+}
+
+type stackMap struct {
+	label   string
+	offsets []int
 }
 
 var argRegs = []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
@@ -65,6 +73,7 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 	g.start(prog)
 	var out strings.Builder
 	out.WriteString(runtime)
+	g.writeMaps(&out)
 	if table != nil {
 		out.WriteString(hotRuntimeSource())
 		g.writeTable(&out)
@@ -213,8 +222,9 @@ func (g *Generator) function(f *ir.Func) {
 	g.labels = 0
 	mf := lower(f)
 	spills, saved := mf.allocate()
-	fr := &frame{saved: saved, results: 16 + 8*stackWords(f.ParamWords)}
+	fr := &frame{fn: mf, saved: saved, results: 16 + 8*stackWords(f.ParamWords)}
 	words := len(saved) + spills
+	fr.firstSlot = words + 1
 	for _, n := range f.Slots {
 		words += n
 		fr.slots = append(fr.slots, words)
@@ -505,6 +515,7 @@ func (g *Generator) call(fr *frame, in *instr) {
 	}
 	g.parallel(moves)
 	g.emit("call %s", g.callTarget(in.value.Target))
+	g.safepoint(fr, in)
 }
 
 type pmove struct {
@@ -533,6 +544,40 @@ func (g *Generator) parallel(moves []pmove) {
 	}
 }
 
+func (g *Generator) safepoint(fr *frame, in *instr) {
+	label := g.newLabel()
+	g.label(label)
+	var offsets []int
+	for i := range fr.saved {
+		offsets = append(offsets, -8*(i+1))
+	}
+	for _, r := range fr.fn.vregs {
+		if r.spill >= 0 && !r.scalar && r.start < in.pos && in.pos < r.end {
+			offsets = append(offsets, -8*(len(fr.saved)+r.spill+1))
+		}
+	}
+	if n := len(fr.slots); n > 0 {
+		for word := fr.firstSlot; word <= fr.slots[n-1]; word++ {
+			offsets = append(offsets, -8*word)
+		}
+	}
+	g.maps = append(g.maps, stackMap{label: label, offsets: offsets})
+}
+
+func (g *Generator) writeMaps(out *strings.Builder) {
+	out.WriteString("\n\t.section .rodata\n\t.p2align 3\n\t.globl rt_maps\nrt_maps:\n")
+	fmt.Fprintf(out, "\t.quad %d\n", len(g.maps))
+	for i, m := range g.maps {
+		fmt.Fprintf(out, "\t.quad %s, .Lmap%d\n", m.label, i)
+	}
+	for i, m := range g.maps {
+		fmt.Fprintf(out, ".Lmap%d:\n\t.quad %d\n", i, len(m.offsets))
+		for _, off := range m.offsets {
+			fmt.Fprintf(out, "\t.quad %d\n", off)
+		}
+	}
+}
+
 func (g *Generator) runtimeCall(fr *frame, in *instr) {
 	moves := make([]pmove, len(in.args))
 	for i, a := range in.args {
@@ -540,6 +585,7 @@ func (g *Generator) runtimeCall(fr *frame, in *instr) {
 	}
 	g.parallel(moves)
 	g.emit("call rt_%s", in.value.Str)
+	g.safepoint(fr, in)
 }
 
 func (g *Generator) result(fr *frame, in *instr) {

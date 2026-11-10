@@ -44,7 +44,7 @@ func Build(files []*ast.File) *Program {
 	funcs := map[*ast.Func]*Func{}
 	named := map[string]*Func{}
 	for _, d := range decls {
-		f := &Func{Name: symbolName(d), ParamWords: paramWords(d), ResultWords: d.RetType.Size()}
+		f := &Func{Name: symbolName(d), ParamWords: paramWords(d), ResultWords: d.RetType.Size(), Ret: d.RetType}
 		funcs[d] = f
 		named[d.Name] = f
 		p.Funcs = append(p.Funcs, f)
@@ -126,6 +126,7 @@ func (b *builder) function() {
 		for k := range words {
 			words[k] = b.param(word + k)
 		}
+		classify(words, local.Type)
 		b.bind(local, words)
 		word += len(words)
 	}
@@ -148,7 +149,14 @@ func (b *builder) emit(op Op, args ...*Value) *Value {
 func (b *builder) constant(n int64) *Value {
 	v := b.emit(OpConst)
 	v.Aux = n
+	v.Scalar = true
 	return v
+}
+
+func classify(words []*Value, t *types.Type) {
+	for k, pointer := range t.PointerWords() {
+		words[k].Scalar = !pointer
+	}
 }
 
 func (b *builder) result(call *Value, k int) *Value {
@@ -261,8 +269,8 @@ func (b *builder) place(p *ast.Place) place {
 	return place{local: p.Local, word: p.Offset / 8}
 }
 
-func (b *builder) load(p place, n int) []*Value {
-	words := make([]*Value, n)
+func (b *builder) load(p place, t *types.Type) []*Value {
+	words := make([]*Value, t.Size())
 	for k := range words {
 		if p.addr == nil {
 			words[k] = b.read(varKey{local: p.local, word: p.word + k}, b.cur)
@@ -270,6 +278,7 @@ func (b *builder) load(p place, n int) []*Value {
 		}
 		v := b.typed(OpLoad, p.scalar, p.addr)
 		v.Aux = int64(p.offset + 8*k)
+		v.Scalar = !t.PointerWords()[k]
 		words[k] = v
 	}
 	return words
@@ -376,6 +385,7 @@ var arith = map[lexer.Kind]Op{
 func (b *builder) typed(op Op, t *types.Type, args ...*Value) *Value {
 	v := b.emit(op, args...)
 	v.Type = t
+	v.Scalar = t != nil && !t.HasPointers()
 	return v
 }
 
@@ -392,7 +402,7 @@ func (b *builder) assign(s *ast.Assign) {
 	words := b.value(s.Value, source)
 	p := b.place(s.Place)
 	if op, ok := arith[s.Op]; ok {
-		old := b.load(p, 1)[0]
+		old := b.load(p, t)[0]
 		words = []*Value{b.typed(op, t, old, b.pad(words, 1)[0])}
 	}
 	b.store(p, b.fit(t, words))
@@ -435,6 +445,7 @@ func (b *builder) expr(e ast.Expr) []*Value {
 	case *ast.StrLit:
 		v := b.emit(OpString)
 		v.Str = e.Value
+		v.Scalar = true
 		return []*Value{v, b.constant(int64(len(e.Value)))}
 	case *ast.Index:
 		if e.X.TypeOf().Kind == types.MapKind {
@@ -444,7 +455,7 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		if p == nil {
 			p = &ast.Place{Index: e}
 		}
-		return b.load(b.place(p), e.Type.Size())
+		return b.load(b.place(p), e.Type)
 	case *ast.Slicing:
 		return b.slicing(e)
 	case *ast.SliceLit:
@@ -457,7 +468,7 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		if e.Variant != nil {
 			return b.construct(e.Type, e.Variant, nil)
 		}
-		return b.load(b.place(&ast.Place{Local: e.Local}), e.Type.Size())
+		return b.load(b.place(&ast.Place{Local: e.Local}), e.Type)
 	case *ast.Selector:
 		return b.selector(e)
 	case *ast.StructLit:
@@ -497,7 +508,7 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 		return b.value(e.X, e.X.TypeOf())[1:2]
 	}
 	if p, ok := ast.PlaceOf(e); ok {
-		return b.load(b.place(p), e.Type.Size())
+		return b.load(b.place(p), e.Type)
 	}
 	words := b.value(e.X, e.X.TypeOf())
 	return words[e.Field.Offset : e.Field.Offset+e.Type.Size()]
@@ -506,7 +517,7 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 func (b *builder) unary(e *ast.Unary) []*Value {
 	switch e.Op {
 	case lexer.Star:
-		return b.load(b.place(&ast.Place{Ptr: e.X}), e.Type.Size())
+		return b.load(b.place(&ast.Place{Ptr: e.X}), e.Type)
 	case lexer.Not:
 		return []*Value{b.typed(OpNot, types.Bool, b.word(e.X))}
 	case lexer.Tilde:
@@ -587,15 +598,24 @@ func (b *builder) convert(x *Value, from, to *types.Type) *Value {
 func (b *builder) exp(x *Value, t *types.Type) *Value {
 	call := b.emit(OpRuntime, b.convert(x, t, types.F64))
 	call.Str = "exp"
-	return b.convert(b.result(call, 0), types.F64, t)
+	result := b.result(call, 0)
+	result.Scalar = true
+	return b.convert(result, types.F64, t)
 }
 
 func (b *builder) allocate(arg ast.Expr) *Value {
 	t := arg.TypeOf()
 	words := b.value(arg, t)
-	ptr := b.runtime("alloc", b.constant(int64(t.Size())))
+	ptr := b.runtime("alloc", b.constant(int64(t.Size())), b.scan(t))
 	b.store(place{addr: ptr}, words)
 	return ptr
+}
+
+func (b *builder) scan(t *types.Type) *Value {
+	if t.HasPointers() {
+		return b.constant(1)
+	}
+	return b.constant(0)
 }
 
 func (b *builder) runtime(name string, args ...*Value) *Value {
@@ -637,6 +657,7 @@ func (b *builder) callFunc(e *ast.Call) []*Value {
 	for k := range results {
 		results[k] = b.result(call, k)
 	}
+	classify(results, target.Ret)
 	return results
 }
 

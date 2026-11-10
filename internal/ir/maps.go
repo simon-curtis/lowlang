@@ -18,7 +18,7 @@ func (b *builder) key(e ast.Expr, m *types.Type) []*Value {
 }
 
 func (b *builder) entryField(table, base *Value, offset int) place {
-	entries := b.load(place{addr: table}, 1)[0]
+	entries := b.load(place{addr: table}, types.Word)[0]
 	return place{addr: b.scaled(entries, base, 8), offset: 8 * offset}
 }
 
@@ -53,7 +53,7 @@ func (b *builder) lookup(e *ast.Index) []*Value {
 	done := b.newBlock()
 	b.branch(b.emit(OpLt, base, b.constant(0)), missing, found)
 	b.enter(found)
-	value := b.load(b.entryValue(m, table, base), m.Elem.Size())
+	value := b.load(b.entryValue(m, table, base), m.Elem)
 	b.writeTemp(temp, append([]*Value{b.constant(1)}, value...))
 	b.jump(done)
 	b.enter(missing)
@@ -72,7 +72,7 @@ func (b *builder) assignEntry(s *ast.Assign) {
 	base := b.callNamed("__map_slot", table, key[0], key[1])[0]
 	slot := b.entryValue(m, table, base)
 	if op, ok := arith[s.Op]; ok {
-		old := b.load(slot, 1)[0]
+		old := b.load(slot, m.Elem)[0]
 		value = []*Value{b.typed(op, m.Elem, old, value[0])}
 	}
 	b.store(slot, value)
@@ -80,7 +80,7 @@ func (b *builder) assignEntry(s *ast.Assign) {
 
 func (b *builder) deleteEntry(e *ast.Call) {
 	ref := e.Args[0].(*ast.Ref)
-	table := b.load(b.place(ref.Place), 1)[0]
+	table := b.load(b.place(ref.Place), ref.Type)[0]
 	key := b.key(e.Args[1], ref.Type)
 	b.callNamed("__map_delete", table, key[0], key[1])
 }
@@ -99,12 +99,12 @@ func (b *builder) mapLoop(s *ast.ForIn) {
 	base := b.readTemp(cursor, 1)[0]
 	b.branch(b.emit(OpLt, base, b.constant(0)), exit, body)
 	b.enter(body)
-	key := b.load(b.entryField(table, base, 1), m.Key.Size())
+	key := b.load(b.entryField(table, base, 1), m.Key)
 	if s.KeyLocal == nil {
 		b.bind(s.ValueLocal, key)
 	} else {
 		b.bind(s.KeyLocal, key)
-		b.bind(s.ValueLocal, b.load(b.entryValue(m, table, base), m.Elem.Size()))
+		b.bind(s.ValueLocal, b.load(b.entryValue(m, table, base), m.Elem))
 	}
 	b.loopBody(s.Body, next, exit)
 	b.enter(next)
