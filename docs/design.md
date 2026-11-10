@@ -651,15 +651,21 @@ Mechanism:
 
 ## Roadmap
 
-1. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-2. GPU UI library modelled on Zed's GPUI, Linux first:
+1. `Eq` for structs and enums whose fields are all `Eq`, using structural equality, so `Memo` can hold aggregate values.
+2. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+3. GPU UI library with GPUI's renderer and platform layer and a signal-based state model, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
-    4. Flexbox layout (a Taffy subset); an element tree with `request_layout`, `prepaint` and `paint` phases, where an element is a struct of closures for those phases capturing its own state; styles with partial overrides for hover and active states.
-    5. Input: libxkbcommon keyboard, key repeat, hitboxes, mouse dispatch, focus and tab stops, actions and keymaps.
-    6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
-    7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
-    8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-3. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-4. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+    4. A retained element tree. Components run once at mount and build elements; only the closures that read a signal run again.
+    5. `Signal[T]`, `Memo[T: Eq]` and effects. Reads are tracked through a current-observer scope on the UI thread. A memo whose new value is equal to the old one does not propagate.
+    6. Reactive structure through explicit containers: a dynamic branch, and a keyed dynamic list.
+    7. Incremental layout: a flexbox subset with dirty flags that propagate to ancestors and cached measurements, so a change re-lays out only the affected subtrees.
+    8. Incremental paint: per-element scene fragments are reused, and only dirty elements re-emit primitives.
+    9. Styles with partial overrides for hover and active states, driven by signals.
+    10. Input: libxkbcommon keyboard, key repeat, hitboxes, mouse dispatch, focus and tab stops, actions and keymaps. Focus and hover state are signals.
+    11. Foreground and background executors on the scheduler; a background task's result is written into a signal on the UI thread.
+    12. Text input element whose state is held in signals, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
+    13. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
+4. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+5. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
