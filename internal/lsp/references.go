@@ -8,7 +8,6 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
-	"lowlang/internal/lexer"
 )
 
 type side int
@@ -127,15 +126,6 @@ func (s *Server) renameError(p RenameParams) error {
 		return errors.New("rename needs the program to compile; fix the errors or wait for the check to finish")
 	}
 	return nil
-}
-
-func keyword(name string) bool {
-	for kind := lexer.Fn; kind <= lexer.Select; kind++ {
-		if kind.String() == name {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) rename(p RenameParams) (WorkspaceEdit, error) {

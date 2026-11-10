@@ -1,6 +1,6 @@
 # Editor support
 
-`tree-sitter-low` is the grammar for `.low` files. Zed and Neovim use it directly; VS Code uses the TextMate grammar in `vscode/syntaxes`. All three start `low lsp`, which serves diagnostics, hover, go-to-definition, references, rename, document symbols, completion and signature help. Rename only runs when the program compiles. `low` must be on `PATH`:
+`tree-sitter-low` is the grammar for `.low` files. Zed and Neovim use it directly; VS Code uses the TextMate grammar in `vscode/syntaxes`. All three start `low lsp`, which serves diagnostics, hover, go-to-definition, references, rename, document and workspace symbols, completion, signature help and inlay hints for inferred types. Rename and inlay hints only answer when the program compiles. `low` must be on `PATH`:
 
 ```sh
 go install ./cmd/low

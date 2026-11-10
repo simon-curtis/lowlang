@@ -328,7 +328,7 @@ func (c *cursor) builtins() {
 	for _, name := range builtinConstants {
 		c.add(name, completionConstant, "")
 	}
-	for kind := lexer.Fn; kind <= lexer.Select; kind++ {
-		c.add(kind.String(), completionKeyword, "")
+	for _, word := range keywords() {
+		c.add(word, completionKeyword, "")
 	}
 }

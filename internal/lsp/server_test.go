@@ -33,11 +33,17 @@ type client struct {
 	messages    chan incoming
 	diagnostics map[string][]Diagnostic
 	publishes   map[string]int
+	asked       map[string]int
 	next        int
 	done        chan error
 }
 
 func start(t *testing.T) *client {
+	t.Helper()
+	return startWith(t, InitializeParams{})
+}
+
+func startWith(t *testing.T, init InitializeParams) *client {
 	t.Helper()
 	serverIn, clientOut := io.Pipe()
 	clientIn, serverOut := io.Pipe()
@@ -48,6 +54,7 @@ func start(t *testing.T) *client {
 		messages:    make(chan incoming, 64),
 		diagnostics: map[string][]Diagnostic{},
 		publishes:   map[string]int{},
+		asked:       map[string]int{},
 		done:        make(chan error, 1),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -60,7 +67,7 @@ func start(t *testing.T) *client {
 		cancel()
 		clientOut.Close()
 	})
-	c.request("initialize", map[string]any{})
+	c.request("initialize", init)
 	c.notify("initialized", map[string]any{})
 	return c
 }
@@ -115,7 +122,7 @@ func (c *client) call(method string, params any) (json.RawMessage, *rpcError) {
 			if !ok {
 				c.t.Fatalf("connection closed waiting for %s", method)
 			}
-			if m.Method == "textDocument/publishDiagnostics" {
+			if m.Method != "" {
 				c.record(m)
 				continue
 			}
@@ -131,6 +138,10 @@ func (c *client) call(method string, params any) (json.RawMessage, *rpcError) {
 
 func (c *client) record(m incoming) {
 	c.t.Helper()
+	if m.Method != "textDocument/publishDiagnostics" {
+		c.asked[m.Method]++
+		return
+	}
 	var p PublishDiagnosticsParams
 	if err := json.Unmarshal(m.Params, &p); err != nil {
 		c.t.Fatal(err)
@@ -148,7 +159,7 @@ func (c *client) await(uri string, after int) []Diagnostic {
 			if !ok {
 				c.t.Fatalf("connection closed waiting for diagnostics on %s", uri)
 			}
-			if m.Method == "textDocument/publishDiagnostics" {
+			if m.Method != "" {
 				c.record(m)
 			}
 		case <-timeout:

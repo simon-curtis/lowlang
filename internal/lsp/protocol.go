@@ -181,18 +181,64 @@ type SignatureHelp struct {
 }
 
 type Capabilities struct {
-	TextDocumentSync       SyncOptions          `json:"textDocumentSync"`
-	HoverProvider          bool                 `json:"hoverProvider"`
-	DefinitionProvider     bool                 `json:"definitionProvider"`
-	ReferencesProvider     bool                 `json:"referencesProvider"`
-	RenameProvider         bool                 `json:"renameProvider"`
-	DocumentSymbolProvider bool                 `json:"documentSymbolProvider"`
-	CompletionProvider     CompletionOptions    `json:"completionProvider"`
-	SignatureHelpProvider  SignatureHelpOptions `json:"signatureHelpProvider"`
+	TextDocumentSync        SyncOptions          `json:"textDocumentSync"`
+	HoverProvider           bool                 `json:"hoverProvider"`
+	DefinitionProvider      bool                 `json:"definitionProvider"`
+	ReferencesProvider      bool                 `json:"referencesProvider"`
+	RenameProvider          bool                 `json:"renameProvider"`
+	DocumentSymbolProvider  bool                 `json:"documentSymbolProvider"`
+	CompletionProvider      CompletionOptions    `json:"completionProvider"`
+	SignatureHelpProvider   SignatureHelpOptions `json:"signatureHelpProvider"`
+	InlayHintProvider       bool                 `json:"inlayHintProvider"`
+	WorkspaceSymbolProvider bool                 `json:"workspaceSymbolProvider"`
 }
 
 type ServerInfo struct {
 	Name string `json:"name"`
+}
+
+type InlayHintClient struct {
+	RefreshSupport bool `json:"refreshSupport"`
+}
+
+type WorkspaceClient struct {
+	InlayHint InlayHintClient `json:"inlayHint"`
+}
+
+type ClientCapabilities struct {
+	Workspace WorkspaceClient `json:"workspace"`
+}
+
+type InitializeParams struct {
+	Capabilities ClientCapabilities `json:"capabilities"`
+}
+
+type InlayHintParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Range        Range                  `json:"range"`
+}
+
+type InlayHint struct {
+	Position Position `json:"position"`
+	Label    string   `json:"label"`
+	Kind     int      `json:"kind"`
+}
+
+type WorkspaceSymbolParams struct {
+	Query string `json:"query"`
+}
+
+type SymbolInformation struct {
+	Name          string   `json:"name"`
+	Kind          int      `json:"kind"`
+	Location      Location `json:"location"`
+	ContainerName string   `json:"containerName,omitempty"`
+}
+
+type serverRequest struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Method  string `json:"method"`
 }
 
 type InitializeResult struct {
@@ -212,6 +258,7 @@ const (
 	methodNotFound   = -32601
 	invalidParams    = -32602
 	requestFailed    = -32803
+	hintType         = 1
 )
 
 type stream struct {

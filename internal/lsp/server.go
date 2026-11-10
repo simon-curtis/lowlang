@@ -21,13 +21,15 @@ import (
 var errorPos = regexp.MustCompile(`(?s)^(?:(.*?):)?(\d+):(\d+): (.*)$`)
 
 type Server struct {
-	stream    *stream
-	docs      sources
-	units     map[string]*compiler.Unit
-	published map[string][]string
-	fresh     map[string]bool
-	compiles  *scheduler
-	shutdown  bool
+	stream      *stream
+	docs        sources
+	units       map[string]*compiler.Unit
+	published   map[string][]string
+	fresh       map[string]bool
+	compiles    *scheduler
+	hintRefresh bool
+	requests    int
+	shutdown    bool
 }
 
 func NewServer(in io.Reader, out io.Writer) *Server {
@@ -93,8 +95,28 @@ func (s *Server) receive(ctx context.Context, requests chan<- request, failures 
 
 func (s *Server) handle(req request) (bool, error) {
 	switch req.Method {
+	case "":
+		return false, nil
 	case "initialize":
+		var p InitializeParams
+		if err := json.Unmarshal(req.Params, &p); err == nil {
+			s.hintRefresh = p.Capabilities.Workspace.InlayHint.RefreshSupport
+		}
 		return false, s.reply(req.ID, s.initialize())
+	case "textDocument/inlayHint":
+		var p InlayHintParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return false, s.fail(req.ID, invalidParams, err.Error())
+		}
+		hints := s.inlayHints(p)
+		return false, s.reply(req.ID, hints)
+	case "workspace/symbol":
+		var p WorkspaceSymbolParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return false, s.fail(req.ID, invalidParams, err.Error())
+		}
+		symbols := s.workspaceSymbols(p)
+		return false, s.reply(req.ID, symbols)
 	case "shutdown":
 		s.shutdown = true
 		return false, s.reply(req.ID, nil)
@@ -169,14 +191,16 @@ func (s *Server) handle(req request) (bool, error) {
 func (s *Server) initialize() InitializeResult {
 	return InitializeResult{
 		Capabilities: Capabilities{
-			TextDocumentSync:       SyncOptions{OpenClose: true, Change: syncFull, Save: SaveOptions{}},
-			HoverProvider:          true,
-			DefinitionProvider:     true,
-			ReferencesProvider:     true,
-			RenameProvider:         true,
-			DocumentSymbolProvider: true,
-			CompletionProvider:     CompletionOptions{TriggerCharacters: []string{"."}},
-			SignatureHelpProvider:  SignatureHelpOptions{TriggerCharacters: []string{"(", ","}, RetriggerCharacters: []string{","}},
+			TextDocumentSync:        SyncOptions{OpenClose: true, Change: syncFull, Save: SaveOptions{}},
+			HoverProvider:           true,
+			DefinitionProvider:      true,
+			ReferencesProvider:      true,
+			RenameProvider:          true,
+			DocumentSymbolProvider:  true,
+			CompletionProvider:      CompletionOptions{TriggerCharacters: []string{"."}},
+			SignatureHelpProvider:   SignatureHelpOptions{TriggerCharacters: []string{"(", ","}, RetriggerCharacters: []string{","}},
+			InlayHintProvider:       true,
+			WorkspaceSymbolProvider: true,
 		},
 		ServerInfo: ServerInfo{Name: "low"},
 	}
@@ -261,6 +285,11 @@ func (s *Server) finish(r compiled) error {
 		return nil
 	}
 	s.fresh[entry] = r.err == nil
+	if r.err == nil {
+		if err := s.refreshHints(); err != nil {
+			return err
+		}
+	}
 	diagnostics := map[string][]Diagnostic{}
 	for path := range s.docs {
 		if s.entry(path) == entry {
