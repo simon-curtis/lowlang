@@ -143,6 +143,7 @@ func (b *builder) selectExpr(e *ast.Select) []*Value {
 	b.branch(b.readTemp(done, 1)[0], fired, waiting)
 	b.enter(fired)
 	b.unlockChannels(locks, len(chans))
+	b.callNamed("__sel_wake", w)
 	b.jump(finish)
 	b.enter(waiting)
 	if elseIndex >= 0 {

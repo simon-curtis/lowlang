@@ -16,6 +16,8 @@
 	.set M_LASTTICK, 80
 	.set M_NEXT, 88
 	.set M_FLAG, 96
+	.set M_RUNNEXT, 128
+	.set M_SPINNING, 136
 	.set M_QUEUE, 256
 	.set M_TLS, 2304
 	.set M_TCB, 2328
@@ -130,6 +132,8 @@ rt_sysmon_sleep:
 rt_stop:
 	.zero 8
 rt_sched_lock:
+	.zero 8
+rt_nspinning:
 	.zero 8
 rt_allm:
 	.zero 8*MAXM
@@ -316,10 +320,11 @@ rt_set_idle:
 rt_lock:
 	ENTER_RT
 rt_lock_body:
-	mov eax, 1
-	xchg [rdi], rax
-	test rax, rax
-	jz 3f
+	xor eax, eax
+	mov ecx, 1
+	lock cmpxchg [rdi], rcx
+	jz 9f
+	mov r8d, 100
 1:
 	cmp dword ptr [rip+rt_stop], 0
 	je 2f
@@ -329,19 +334,54 @@ rt_lock_body:
 2:
 	pause
 	cmp qword ptr [rdi], 0
-	jne 1b
-	jmp rt_lock_body
+	jne 3f
+	xor eax, eax
+	mov ecx, 1
+	lock cmpxchg [rdi], rcx
+	jz 9f
 3:
+	dec r8d
+	jnz 1b
+4:
+	mov eax, 2
+	xchg [rdi], rax
+	test rax, rax
+	jz 9f
+	push rdi
+	call rt_lock_sleep
+	pop rdi
+	jmp 4b
+9:
 	mov rax, qword ptr fs:[TLS_M]
 	inc qword ptr [rax+M_LOCKS]
 	ret
 
+rt_lock_sleep:
+	SAVE_ALL
+	mov rax, qword ptr fs:[TLS_G]
+	mov [rax+G_SCANLO], rsp
+	mov rbx, qword ptr fs:[TLS_M]
+	mov eax, STOPPED
+	xchg [rbx+M_STATE], rax
+	mov esi, 2
+	call rt_futex_wait
+	mov edi, STOPPED
+	call rt_m_running
+	RESTORE_ALL
+	ret
+
 	.globl rt_unlock
 rt_unlock:
-	mov qword ptr [rdi], 0
 	mov rax, qword ptr fs:[TLS_M]
 	dec qword ptr [rax+M_LOCKS]
+	xor eax, eax
+	xchg [rdi], rax
+	cmp rax, 2
+	je 1f
 	ret
+1:
+	mov esi, 1
+	jmp rt_futex_wake
 
 	.globl rt_lock_all
 rt_lock_all:
@@ -393,23 +433,29 @@ rt_lock_all:
 
 	.globl rt_unlock_all
 rt_unlock_all:
-	xor ecx, ecx
+	push rbx
+	push r12
+	push r13
+	mov rbx, rdi
+	mov r12, rsi
+	xor r13d, r13d
 1:
-	cmp rcx, rsi
+	cmp r13, r12
 	jae 3f
-	mov rax, [rdi+8*rcx]
-	test rcx, rcx
+	mov rdi, [rbx+8*r13]
+	test r13, r13
 	jz 2f
-	cmp rax, [rdi+8*rcx-8]
+	cmp rdi, [rbx+8*r13-8]
 	je 4f
 2:
-	mov qword ptr [rax], 0
-	mov rdx, qword ptr fs:[TLS_M]
-	dec qword ptr [rdx+M_LOCKS]
+	call rt_unlock
 4:
-	inc rcx
+	inc r13
 	jmp 1b
 3:
+	pop r13
+	pop r12
+	pop rbx
 	ret
 
 	.globl rt_cas
@@ -639,9 +685,14 @@ rt_ready:
 	call rt_spin_unlock
 	cmp qword ptr [rbx+G_LOCKEDM], 0
 	jne 2f
+	mov rax, qword ptr fs:[TLS_M]
 	mov rdi, rbx
+	xchg [rax+M_RUNNEXT], rdi
+	test rdi, rdi
+	jz 3f
 	call rt_runq_put
 	call rt_wakep
+3:
 	pop rbx
 	ret
 2:
@@ -658,6 +709,10 @@ rt_ready:
 	ret
 
 rt_wakep:
+	cmp qword ptr [rip+rt_nspinning], 0
+	je 7f
+	ret
+7:
 	push rbx
 	lea rdi, [rip+rt_sched_lock]
 	call rt_spin_lock
@@ -667,6 +722,8 @@ rt_wakep:
 	mov rax, [rbx+M_NEXT]
 	mov [rip+rt_idle], rax
 	dec qword ptr [rip+rt_nidle]
+	mov qword ptr [rbx+M_SPINNING], 1
+	lock inc qword ptr [rip+rt_nspinning]
 	mov qword ptr [rbx+M_PARK], 1
 	lea rdi, [rip+rt_sched_lock]
 	call rt_spin_unlock
@@ -1074,6 +1131,10 @@ rt_schedule:
 	mov rbx, qword ptr fs:[TLS_M]
 1:
 	call rt_timers_run
+	xor eax, eax
+	xchg [rbx+M_RUNNEXT], rax
+	test rax, rax
+	jnz 9f
 	test qword ptr [rbx+M_TICK], 31
 	jnz 7f
 	cmp qword ptr [rip+rt_nfdwait], 0
@@ -1099,6 +1160,11 @@ rt_schedule:
 	call rt_steal
 	test rax, rax
 	jnz 9f
+	cmp qword ptr [rbx+M_SPINNING], 0
+	je 10f
+	mov qword ptr [rbx+M_SPINNING], 0
+	lock dec qword ptr [rip+rt_nspinning]
+10:
 	lea rdi, [rip+rt_sched_lock]
 	call rt_spin_lock
 	call rt_queues_empty
@@ -1152,6 +1218,16 @@ rt_schedule:
 	jmp 1b
 9:
 	mov r12, rax
+	cmp qword ptr [rbx+M_SPINNING], 0
+	je 11f
+	mov qword ptr [rbx+M_SPINNING], 0
+	lock dec qword ptr [rip+rt_nspinning]
+	jnz 11f
+	call rt_queues_empty
+	test rax, rax
+	jnz 11f
+	call rt_wakep
+11:
 	mov edi, IDLE
 	call rt_m_running
 	mov qword ptr [r12+G_STATUS], G_RUNNING
@@ -1209,11 +1285,27 @@ rt_sysmon:
 	mov rdx, [rax+8*rcx]
 	mov rax, [rdx+M_TICK]
 	cmp qword ptr [rdx+M_STATE], RUNNING
-	jne 3f
+	jne 5f
 	cmp rax, [rdx+M_LASTTICK]
 	jne 3f
 	mov r8, [rdx+M_FLAG]
 	mov byte ptr [r8], 1
+	jmp 3f
+5:
+	cmp qword ptr [rdx+M_STATE], INC
+	jne 3f
+	xor edi, edi
+	xchg [rdx+M_RUNNEXT], rdi
+	test rdi, rdi
+	jz 3f
+	push rcx
+	push rdx
+	push rax
+	call rt_gq_put
+	call rt_wakep
+	pop rax
+	pop rdx
+	pop rcx
 3:
 	mov [rdx+M_LASTTICK], rax
 	inc rcx
