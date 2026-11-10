@@ -74,7 +74,7 @@ const (
 )
 
 func (g *Generator) thunk(f *ir.Func) {
-	g.fn = fmt.Sprintf("cb_%s", f.Name)
+	g.fn = fmt.Sprintf("cb_%s", mangle(f.Name))
 	g.labels = 0
 	fmt.Fprintf(&g.text, "\t.globl %s\n%s:\n", g.fn, g.fn)
 	g.emit("push rbp")

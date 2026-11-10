@@ -57,6 +57,7 @@ type TypeName struct {
 	Optional bool
 	Map      bool
 	Key      *TypeName
+	Args     []*TypeName
 	Func     bool
 	CFunc    bool
 	Params   []*TypeName
@@ -106,13 +107,20 @@ func PlaceOf(e Expr) (*Place, bool) {
 	return nil, false
 }
 
+type TypeParam struct {
+	Name        string
+	Constraints []string
+	Pos         lexer.Pos
+}
+
 type EnumDecl struct {
-	Name     string
-	Pub      bool
-	File     *File
-	Variants []*VariantDecl
-	Pos      lexer.Pos
-	Type     *types.Type
+	Name       string
+	TypeParams []*TypeParam
+	Pub        bool
+	File       *File
+	Variants   []*VariantDecl
+	Pos        lexer.Pos
+	Type       *types.Type
 }
 
 type VariantDecl struct {
@@ -122,13 +130,14 @@ type VariantDecl struct {
 }
 
 type StructDecl struct {
-	Name   string
-	C      bool
-	Pub    bool
-	File   *File
-	Fields []*FieldDecl
-	Pos    lexer.Pos
-	Type   *types.Type
+	Name       string
+	TypeParams []*TypeParam
+	C          bool
+	Pub        bool
+	File       *File
+	Fields     []*FieldDecl
+	Pos        lexer.Pos
+	Type       *types.Type
 }
 
 type FieldDecl struct {
@@ -147,6 +156,9 @@ type Param struct {
 
 type Func struct {
 	Name        string
+	TypeParams  []*TypeParam
+	Template    *Func
+	TypeArgs    []*types.Type
 	Pub         bool
 	File        *File
 	Extern      *Extern
@@ -315,6 +327,14 @@ type Closure struct {
 	Captures []*Local
 }
 
+type Instance struct {
+	Typed
+	X        Expr
+	Types    []*TypeName
+	Fallback Expr
+	Pos      lexer.Pos
+}
+
 type Index struct {
 	Typed
 	X     Expr
@@ -369,10 +389,11 @@ type Ref struct {
 
 type StructLit struct {
 	Typed
-	Module string
-	Name   string
-	Fields []*FieldInit
-	Pos    lexer.Pos
+	Module   string
+	Name     string
+	TypeArgs []*TypeName
+	Fields   []*FieldInit
+	Pos      lexer.Pos
 }
 
 type FieldInit struct {
@@ -476,6 +497,7 @@ func (n *Selector) Position() lexer.Pos  { return n.Pos }
 func (n *StructLit) Position() lexer.Pos { return n.Pos }
 func (n *Ref) Position() lexer.Pos       { return n.Pos }
 func (n *Index) Position() lexer.Pos     { return n.Pos }
+func (n *Instance) Position() lexer.Pos  { return n.Pos }
 func (n *Closure) Position() lexer.Pos   { return n.Pos }
 func (n *Slicing) Position() lexer.Pos   { return n.Pos }
 func (n *SliceLit) Position() lexer.Pos  { return n.Pos }
@@ -511,6 +533,7 @@ func (*Selector) expr()  {}
 func (*StructLit) expr() {}
 func (*Ref) expr()       {}
 func (*Index) expr()     {}
+func (*Instance) expr()  {}
 func (*Closure) expr()   {}
 func (*Slicing) expr()   {}
 func (*SliceLit) expr()  {}

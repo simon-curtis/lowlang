@@ -426,10 +426,50 @@ fn main() {
 ### Generics
 
 ```low
+struct Stack[T] {
+    items: []T
+}
+
+enum Tree[T: Ord] {
+    Node(*Tree[T], T, *Tree[T])
+    Leaf
+}
+
 fn max[T: Ord](a: T, b: T) -> T {
     if a > b { a } else { b }
 }
+
+fn sum[T: Number](xs: []T) -> T {
+    var total: T = 0
+    for x in xs {
+        total += x
+    }
+    total
+}
+
+fn sort[T](mut xs: []T, less: fn(T, T) -> bool) { ... }
+
+print(max(3, 9))
+print(max[u8](200, 100))
+var s = Stack[str] { items: [] }
+let p = Pair { first: 1, second: "x" }
+let t: Tree[i64] = Leaf
+let pick: fn(i64, i64) -> i64 = max
 ```
+
+- Functions, structs and enums take type parameters in brackets after their name. Generic types are written with arguments, `Stack[i64]` or `geometry.Labelled[str]`.
+- A constraint lists what a type parameter supports, joined with `+`:
+  - `Eq` allows `==` and `!=`, and is met by numbers, `bool`, `str` and pointers.
+  - `Ord` adds `<`, `<=`, `>` and `>=`, and is met by numbers.
+  - `Hash` adds use as a map key, and is met by integers, `bool`, `str` and pointers.
+  - `Number` adds arithmetic, numeric literals, conversion with `T(x)` and `print`.
+  - `Integer` adds bitwise operators and shifts and implies `Hash`.
+  - `Float` is met by `f64` and `f32`.
+  - An unconstrained parameter can only be moved, stored and passed. Anything else a generic function needs, such as an ordering of its elements, is passed in as a function value.
+- A generic body is checked once against its constraints, so a missing constraint is reported at the definition, not at a use.
+- Type arguments are inferred from the arguments, then from the expected type. They can be written explicitly as `max[u8](a, b)` or `Stack[str] { ... }`. A generic struct literal or enum variant takes its arguments from the expected type or from its field values. A generic function used as a value takes them from the expected function type.
+- Each distinct set of type arguments compiles to its own copy, `max[i64]` and `max[f64]`, so generic code runs as fast as code written for one type.
+- Values of different kinds that share behaviour, such as the elements of a UI tree, are structs of function values whose closures capture each kind's state.
 
 ### Concurrency
 
@@ -470,7 +510,7 @@ The runtime, `internal/amd64/runtime.asm`, is emitted with every program and tal
 - A dynamic program is linked with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2` against glibc's `crt1.o`, `crti.o` and `crtn.o`, then `-l<name>` for each library and `-lc`. The start files are looked for in `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/lib/x86_64-linux-gnu`. glibc's start-up code calls the generated C `main`, which saves its caller's `rbp`, clears it so the collector's frame walk ends at LowLang's outermost frame, records the stack top, initialises the heap, runs the program and returns 0, letting libc run its exit handlers. An error from `main` still prints and exits with status 1.
 - The runtime never touches `fs`, which glibc owns for thread-local storage in a dynamic program.
 
-`internal/compiler/prelude.low` is LowLang source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, the map table, integer formatting, and float formatting with Burger and Dybvig's free-format algorithm over big integers of 32-bit limbs. Its names start with `__`, which user code cannot use, and two intrinsics are available only there: `__bits` gives a float's bit pattern and `__str_view` turns a `[]u8` into a `str` without copying. Functions unreachable from `main` are dropped, so a program that formats no floats carries none of this code.
+`internal/compiler/prelude.low` is LowLang source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, the generic map table, integer formatting, and float formatting with Burger and Dybvig's free-format algorithm over big integers of 32-bit limbs. Its names start with `__`, which user code cannot use, and four intrinsics are available only there: `__bits` gives a float's bit pattern, `__str_view` turns a `[]u8` into a `str` without copying, `__hash` hashes any `Hash` value, and `__zero` is the all-zero value of its expected type. Functions unreachable from `main` are dropped, so a program that formats no floats carries none of this code.
 
 The garbage collector is a non-moving mark-sweep collector in the runtime:
 
@@ -488,6 +528,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 
 ### IR
 
+- Generic templates never reach the IR. The checker keeps an untouched copy of each generic function's syntax tree, clones it for each distinct set of type arguments and checks the clone with those types bound, producing an ordinary function named like `max[i64]`; generic structs and enums become ordinary types named like `Stack[str]`. Instances are made on demand, checked from a work list, and limited to 1000 per template. Symbols escape every character outside `A-Za-z0-9_.` as `.` and its hex code, so `max[i64]` is `fn_max.5bi64.5d`.
 - SSA is built directly from the checked tree with Braun et al.'s algorithm: variables are read and written per block, phis are created lazily and sealed once a block's predecessors are known, and trivial phis are removed.
 - Every value is one 64-bit word. A struct, enum or result of n words is n SSA values, so aggregates live in registers with no frame temporaries.
 - Narrow integers are kept sign-extended (`i32`) or zero-extended (`u32`, `u16`, `u8`) in their word; floats are kept as their bit pattern, `f32` zero-extended. Arithmetic, conversion and comparison values carry their type.
@@ -503,9 +544,9 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - `funcaddr` gives a function's code address, its thunk, or an `extern` function's address through the GOT. Functions reached only through `funcaddr` are kept.
 - In dev builds every C function gets a global trampoline, `cfn_name: jmp name`, and calls go through it, so a patch can link against the running binary.
 - An `embed` becomes an address and a length. The data is emitted with `.incbin` under a label named by the file's content hash, so a changed file changes the code of every function that embeds it.
-- Every value records whether it may hold a heap pointer. Loads, parameters and call results take this from their type's word layout, where an enum word counts as a pointer if any variant puts one there; constants, typed arithmetic, string literals and frame addresses never do; untyped address arithmetic and anything unclassified count as pointers; a phi holds a pointer if any input may. The prelude stores map entries as `__word`, an integer type the collector scans, because entries hold keys and values of any type.
+- Every value records whether it may hold a heap pointer. Loads, parameters and call results take this from their type's word layout, where an enum word counts as a pointer if any variant puts one there; constants, typed arithmetic, string literals and frame addresses never do; untyped address arithmetic and anything unclassified count as pointers; a phi holds a pointer if any input may.
 - A `str` is two words and a slice three. An element access computes `pointer + index * stride` after a `check` instruction, which compares unsigned and jumps to the index panic; packed elements load with `movzx`, `movsxd` or a 32-bit `mov` and store at their width.
-- A map entry is a run of words in the prelude's `__Map.entries` slice: a live flag, the key and the value. An open-addressing index of entry numbers with linear probing finds them; deleted entries leave tombstones until the next rebuild, which compacts the entries in order and resizes the index to keep it at most three quarters full. Integer, `bool` and pointer keys hash their word; `str` keys hash their bytes with FNV-1a. The compiler reads and writes value words directly in the entries slice, so the prelude needs no generics.
+- A map `[K: V]` is a pointer to the prelude's generic `__Map[K, V]`, whose `entries` slice holds `__Entry[K, V]` records of a live flag, the key and the value. An open-addressing index of entry numbers with linear probing finds them; deleted entries leave tombstones until the next rebuild, which compacts the entries in order and resizes the index to keep it at most three quarters full. Integer, `bool` and pointer keys hash their word; `str` keys hash their bytes with FNV-1a. Every concrete map type instantiates `__map_new`, `__map_get`, `__map_set`, `__map_delete`, `__map_len`, `__map_next`, `__map_key` and `__map_value` for its key and value types, and map literals, lookups, assignments, `delete`, `.len` and loops become calls to them. A compound assignment such as `m[k] += v` is a get, the operation on the value or zero, and a set.
 - `push` and the formatting helpers call the runtime's `rt_grow` and the prelude; the buffer behind an interpolation lives in a frame slot passed as a `mut` argument.
 - Unreachable blocks are pruned after construction.
 
@@ -531,7 +572,7 @@ On fib(38) this runs at 1.25x Go's time.
 
 - A file that fails to compile is reported and the running program is left alone.
 - The program is restarted when the set of linked libraries changes, when a struct or enum layout changes, when an existing function's signature or a closure's captured variables change, or when `main` changes. A running frame of old code may still call any function, so it must keep the old calling convention and data layout; `main` never returns to pick up new code.
-- Otherwise every function whose generated assembly differs from the running version is recompiled, including callers whose code changed only because a callee did. New functions are included. Heap, stack and all live values are kept.
+- Otherwise every function whose generated assembly differs from the running version is recompiled, including callers whose code changed only because a callee did, and every instance of an edited generic function. New functions are included. Heap, stack and all live values are kept.
 
 Mechanism:
 
@@ -544,7 +585,8 @@ Mechanism:
 
 ## Tests
 
-`internal/hot` tests reload against running programs: state kept across a code swap, functions added, compile errors leaving the program running, heap data surviving a reload while the collector runs, stored function values, closures and callbacks running patched code, and restarts on layout, signature and capture changes.
+`internal/hot` tests reload against running programs: state kept across a code swap, functions added, compile errors leaving the program running, heap data surviving a reload while the collector runs, stored function values, closures and callbacks running patched code, instances of an edited generic function patched,
+ and restarts on layout, signature and capture changes.
 
 `go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. A program with a `.needed` file must link exactly those shared libraries; every other program must be static with no interpreter. Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
 
@@ -566,26 +608,27 @@ Mechanism:
 - `extern` blocks naming C libraries and declaring their functions, and dynamic linking against libc when any is named.
 - C interop: System V calls, `extern struct`, `ptr` and `ptr[T]`, `view`, `load`, `store`, `cstr`, `str(p)`, `pin` and `unpin`.
 - `defer`.
+- Generic functions, structs and enums with built-in constraints, compiled per type; maps built on generic prelude code.
 - Function values and closures capturing by reference; `extern fn` C function pointers and C callbacks.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. Generics, with type erasure or dynamic dispatch for custom elements and views.
-2. Green-thread scheduler, channels, `select`:
+1. Green-thread scheduler, channels, `select`:
     - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
     - C calls run on a large system stack rather than the green-thread stack.
     - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-3. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-4. GPU UI library modelled on Zed's GPUI, Linux first:
+2. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+3. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
-    4. Flexbox layout (a Taffy subset); an element tree with `request_layout`, `prepaint` and `paint` phases; styles with partial overrides for hover and active states.
+    4. Flexbox layout (a Taffy subset); an element tree with `request_layout`, `prepaint` and `paint` phases, where an element is a struct of closures for those phases capturing its own state; styles with partial overrides for hover and active states.
+
     5. Input: libxkbcommon keyboard, key repeat, hitboxes, mouse dispatch, focus and tab stops, actions and keymaps.
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-5. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-6. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+4. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+5. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

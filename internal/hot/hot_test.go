@@ -302,6 +302,37 @@ func TestReloadReachesStoredFunctions(t *testing.T) {
 	f.noRestart()
 }
 
+const generic = `fn scale[T: Number](x: T) -> T {
+    x * VALUE
+}
+
+fn main() {
+    print(0)
+    var n = scale(1)
+    var f = scale(1.0)
+    for n < 2 || f < 2.0 {
+        n = scale(1)
+        f = scale(1.0)
+    }
+    print(n)
+}
+`
+
+func TestReloadPatchesInstances(t *testing.T) {
+	f := newFixture(t, strings.ReplaceAll(generic, "VALUE", "1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write(strings.ReplaceAll(generic, "VALUE", "2"))
+	f.reload()
+	f.waitFor(f.stdout, "0\n2\n")
+	f.waitFor(f.stderr, "low: reloaded ")
+	for _, name := range []string{"scale[i64]", "scale[f64]"} {
+		if !strings.Contains(f.stderr.String(), name) {
+			t.Fatalf("%s was not reloaded:\n%s", name, f.stderr)
+		}
+	}
+	f.noRestart()
+}
+
 func TestCaptureChangeRestarts(t *testing.T) {
 	captures := strings.Replace(values, "fn() -> i64 { VALUE }", "fn() -> i64 { one }", 1)
 	captures = strings.Replace(captures, "    let named", "    let one = 1\n    let named", 1)

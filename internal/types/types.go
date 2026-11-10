@@ -22,29 +22,33 @@ const (
 	MapKind
 	RawKind
 	FuncKind
+	ParamKind
 )
 
 type Type struct {
-	Kind     Kind
-	Name     string
-	Variants []*Variant
-	Fields   []*Field
-	Elem     *Type
-	Key      *Type
-	Params   []*Type
-	Muts     []bool
-	Ret      *Type
-	Ok       *Type
-	Err      *Type
-	Bits     int
-	Signed   bool
-	Optional bool
-	Module   string
-	Pub      bool
-	C        bool
-	Bytes    int
-	Align    int
-	size     int
+	Kind       Kind
+	Name       string
+	Variants   []*Variant
+	Fields     []*Field
+	Elem       *Type
+	Key        *Type
+	Params     []*Type
+	Muts       []bool
+	Ret        *Type
+	Ok         *Type
+	Err        *Type
+	Bits       int
+	Signed     bool
+	Optional   bool
+	Module     string
+	Pub        bool
+	C          bool
+	Bytes      int
+	Align      int
+	Constraint Constraint
+	Origin     *Type
+	TypeArgs   []*Type
+	size       int
 }
 
 type Field struct {
@@ -72,7 +76,6 @@ var (
 	U8    = &Type{Kind: IntKind, Name: "u8", Bits: 8, size: 1}
 	F64   = &Type{Kind: FloatKind, Name: "f64", Bits: 64, size: 1}
 	F32   = &Type{Kind: FloatKind, Name: "f32", Bits: 32, size: 1}
-	Word  = &Type{Kind: IntKind, Name: "__word", Bits: 64, Signed: true, size: 1}
 	Bool  = &Type{Kind: BoolKind, Name: "bool", size: 1}
 	Str   = &Type{Kind: StrKind, Name: "str", size: 2}
 )
@@ -91,12 +94,10 @@ func (t *Type) HasPointers() bool {
 func (t *Type) PointerWords() []bool {
 	words := make([]bool, t.size)
 	switch t.Kind {
-	case PointerKind, MapKind, SliceKind, StrKind, RawKind:
+	case PointerKind, MapKind, SliceKind, StrKind, RawKind, ParamKind:
 		words[0] = true
 	case FuncKind:
 		words[len(words)-1] = !t.C
-	case IntKind:
-		words[0] = t == Word
 	case StructKind:
 		for _, f := range t.Fields {
 			if t.C {
@@ -125,19 +126,19 @@ func merge(into, from []bool) {
 }
 
 func (t *Type) Integer() bool {
-	return t.Kind == IntKind
+	return t.Kind == IntKind || t.has(Integer)
 }
 
 func (t *Type) Float() bool {
-	return t.Kind == FloatKind
+	return t.Kind == FloatKind || t.has(Float)
 }
 
 func (t *Type) Number() bool {
-	return t.Integer() || t.Float()
+	return t.Integer() || t.Float() || t.has(Number)
 }
 
 func (t *Type) Holds(n int64) bool {
-	if t.Bits == 64 {
+	if t.Bits == 64 || t.Kind == ParamKind {
 		return t.Signed || n >= 0
 	}
 	if t.Signed {
@@ -179,7 +180,7 @@ func NewMap(key, value *Type) *Type {
 }
 
 func (t *Type) Hashable() bool {
-	return t.Integer() || t.Kind == BoolKind || t.Kind == StrKind || t.Kind == PointerKind
+	return t.Integer() || t.Kind == BoolKind || t.Kind == StrKind || t.Kind == PointerKind || t.has(Hash)
 }
 
 func StructOf(t *Type) *Type {
@@ -228,9 +229,7 @@ func NewRaw(elem *Type) *Type {
 
 func (t *Type) CCompatible() bool {
 	switch t.Kind {
-	case IntKind:
-		return t != Word
-	case FloatKind, BoolKind, RawKind:
+	case IntKind, FloatKind, BoolKind, RawKind:
 		return true
 	case StructKind, FuncKind:
 		return t.C

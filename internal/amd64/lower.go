@@ -64,7 +64,7 @@ func lower(f *ir.Func) *mfunc {
 		temps:  map[*ir.Value]*vreg{},
 	}
 	for _, b := range f.Blocks {
-		mb := &mblock{label: fmt.Sprintf(".L%s_%d", f.Name, b.ID), kind: b.Kind}
+		mb := &mblock{label: fmt.Sprintf(".L%s_%d", mangle(f.Name), b.ID), kind: b.Kind}
 		l.blocks[b] = mb
 		l.fn.blocks = append(l.fn.blocks, mb)
 	}

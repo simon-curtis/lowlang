@@ -31,34 +31,45 @@ type loop struct {
 }
 
 type scope struct {
-	types map[string]*types.Type
-	funcs map[string]*ast.Func
+	types    map[string]*types.Type
+	generics map[string]*generic
+	funcs    map[string]*ast.Func
 }
 
 type Checker struct {
-	modules   map[string]*scope
-	embeds    []string
-	builtin   map[string]*types.Type
-	file      *ast.File
-	results   map[[2]*types.Type]*types.Type
-	ptrs      map[*types.Type]*types.Type
-	opts      map[*types.Type]*types.Type
-	slices    map[*types.Type]*types.Type
-	maps      map[[2]*types.Type]*types.Type
-	fn        *ast.Func
-	scopes    []map[string]*ast.Local
-	loops     []*loop
-	raws      map[*types.Type]*types.Type
-	funcTypes map[string]*types.Type
-	closures  []*ast.Closure
-	counts    map[*ast.Func]int
-	deferring bool
+	modules     map[string]*scope
+	embeds      []string
+	builtin     map[string]*types.Type
+	file        *ast.File
+	results     map[[2]*types.Type]*types.Type
+	ptrs        map[*types.Type]*types.Type
+	opts        map[*types.Type]*types.Type
+	slices      map[*types.Type]*types.Type
+	maps        map[[2]*types.Type]*types.Type
+	fn          *ast.Func
+	scopes      []map[string]*ast.Local
+	loops       []*loop
+	raws        map[*types.Type]*types.Type
+	funcTypes   map[string]*types.Type
+	closures    []*ast.Closure
+	counts      map[*ast.Func]int
+	bound       map[string]*types.Type
+	abstract    bool
+	generics    map[*types.Type]*generic
+	pristine    map[*ast.Func]*ast.Func
+	instances   map[*ast.Func]map[string]*ast.Func
+	pending     []*ast.Func
+	unlaid      []*types.Type
+	laid        bool
+	funcsReady  bool
+	waitingMaps []*types.Type
+	deferring   bool
 }
 
 func Check(files []*ast.File) (embeds []string, err error) {
 	c := &Checker{
 		modules:   map[string]*scope{},
-		builtin:   map[string]*types.Type{"bool": types.Bool, "str": types.Str, "__word": types.Word},
+		builtin:   map[string]*types.Type{"bool": types.Bool, "str": types.Str},
 		results:   map[[2]*types.Type]*types.Type{},
 		ptrs:      map[*types.Type]*types.Type{},
 		opts:      map[*types.Type]*types.Type{},
@@ -67,6 +78,9 @@ func Check(files []*ast.File) (embeds []string, err error) {
 		raws:      map[*types.Type]*types.Type{},
 		funcTypes: map[string]*types.Type{},
 		counts:    map[*ast.Func]int{},
+		generics:  map[*types.Type]*generic{},
+		pristine:  map[*ast.Func]*ast.Func{},
+		instances: map[*ast.Func]map[string]*ast.Func{},
 	}
 	defer func() {
 		r := recover()
@@ -89,7 +103,7 @@ func Check(files []*ast.File) (embeds []string, err error) {
 func (c *Checker) scope(module string) *scope {
 	s, ok := c.modules[module]
 	if !ok {
-		s = &scope{types: map[string]*types.Type{}, funcs: map[string]*ast.Func{}}
+		s = &scope{types: map[string]*types.Type{}, generics: map[string]*generic{}, funcs: map[string]*ast.Func{}}
 		c.modules[module] = s
 	}
 	return s
@@ -167,6 +181,25 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 	case t.Func:
 		return c.funcTypeName(t)
 	}
+	if bound, ok := c.bound[t.Name]; ok && t.Module == "" {
+		if t.Args != nil {
+			c.fail(t.Pos, "type parameter %s takes no type arguments", t.Name)
+		}
+		return bound
+	}
+	if g := c.lookupGeneric(t.Module, t.Name, t.Pos); g != nil {
+		if t.Args == nil {
+			c.fail(t.Pos, "%s needs type arguments", t.Name)
+		}
+		args := make([]*types.Type, len(t.Args))
+		for i, a := range t.Args {
+			args[i] = c.resolve(a)
+		}
+		return c.instantiateType(g, args, t.Pos)
+	}
+	if t.Args != nil {
+		c.fail(t.Pos, "%s is not generic", t.Name)
+	}
 	if t.Module != "" {
 		return c.importedType(t.Module, t.Name, t.Pos)
 	}
@@ -240,6 +273,7 @@ func (c *Checker) mapOf(key, value *types.Type) *types.Type {
 	}
 	m := types.NewMap(key, value)
 	c.maps[k] = m
+	c.mapOps(m)
 	return m
 }
 
@@ -282,16 +316,28 @@ func (c *Checker) check(files []*ast.File) {
 	c.declareTypes(files)
 	c.declareFuncs(files)
 	c.checkMain()
+	var funcs []*ast.Func
 	for _, f := range files {
 		for _, fn := range f.Funcs {
-			c.function(fn)
+			if fn.Template == nil {
+				funcs = append(funcs, fn)
+			}
 		}
+	}
+	for _, fn := range funcs {
+		c.function(fn)
+	}
+	for len(c.pending) > 0 {
+		fn := c.pending[0]
+		c.pending = c.pending[1:]
+		c.function(fn)
 	}
 }
 
 func (c *Checker) declareType(name string, pos lexer.Pos, t *types.Type, pub bool) {
 	_, builtin := c.builtin[name]
-	if _, dup := c.local().types[name]; dup || builtin {
+	_, generic := c.local().generics[name]
+	if _, dup := c.local().types[name]; dup || builtin || generic {
 		c.fail(pos, "type %s already declared", name)
 	}
 	t.Module = c.file.Module
@@ -306,12 +352,23 @@ func (c *Checker) declareTypes(files []*ast.File) {
 			if len(d.Variants) == 0 {
 				c.fail(d.Pos, "enum %s has no variants", d.Name)
 			}
+			if d.TypeParams != nil {
+				c.declareGeneric(d.Name, d.TypeParams, d.Pub, d.Pos).enum = d
+				continue
+			}
 			d.Type = types.NewEnum(qualified(f.Module, d.Name))
 			c.declareType(d.Name, d.Pos, d.Type, d.Pub)
 		}
 		for _, d := range f.Structs {
 			if len(d.Fields) == 0 {
 				c.fail(d.Pos, "struct %s has no fields", d.Name)
+			}
+			if d.TypeParams != nil && d.C {
+				c.fail(d.Pos, "extern struct %s cannot be generic", d.Name)
+			}
+			if d.TypeParams != nil {
+				c.declareGeneric(d.Name, d.TypeParams, d.Pub, d.Pos).strct = d
+				continue
 			}
 			d.Type = types.NewStruct(qualified(f.Module, d.Name))
 			d.Type.C = d.C
@@ -321,10 +378,18 @@ func (c *Checker) declareTypes(files []*ast.File) {
 	for _, f := range files {
 		c.file = f
 		for _, d := range f.Enums {
-			c.declareVariants(d)
+			if d.TypeParams != nil {
+				d.Type = c.origin(c.local().generics[d.Name])
+				continue
+			}
+			c.declareVariants(d, d.Type)
 		}
 		for _, d := range f.Structs {
-			c.declareFields(d)
+			if d.TypeParams != nil {
+				d.Type = c.origin(c.local().generics[d.Name])
+				continue
+			}
+			c.declareFields(d, d.Type)
 		}
 	}
 	for _, f := range files {
@@ -335,6 +400,11 @@ func (c *Checker) declareTypes(files []*ast.File) {
 			c.layout(d.Type, d.Pos)
 		}
 	}
+	for _, t := range c.unlaid {
+		c.layout(t, lexer.Pos{})
+	}
+	c.unlaid = nil
+	c.laid = true
 }
 
 func (c *Checker) layout(t *types.Type, pos lexer.Pos) {
@@ -343,29 +413,29 @@ func (c *Checker) layout(t *types.Type, pos lexer.Pos) {
 	}
 }
 
-func (c *Checker) declareVariants(d *ast.EnumDecl) {
+func (c *Checker) declareVariants(d *ast.EnumDecl, t *types.Type) {
 	for i, vd := range d.Variants {
-		if d.Type.Variant(vd.Name) != nil {
+		if t.Variant(vd.Name) != nil {
 			c.fail(vd.Pos, "variant %s already declared in %s", vd.Name, d.Name)
 		}
 		v := &types.Variant{Name: vd.Name, Tag: i}
 		for _, f := range vd.Fields {
 			v.Fields = append(v.Fields, c.resolve(f))
 		}
-		d.Type.Variants = append(d.Type.Variants, v)
+		t.Variants = append(t.Variants, v)
 	}
 }
 
-func (c *Checker) declareFields(d *ast.StructDecl) {
+func (c *Checker) declareFields(d *ast.StructDecl, st *types.Type) {
 	for _, fd := range d.Fields {
-		if d.Type.Field(fd.Name) != nil {
+		if st.Field(fd.Name) != nil {
 			c.fail(fd.Pos, "field %s already declared in %s", fd.Name, d.Name)
 		}
 		t := c.resolve(fd.TypeName)
 		if d.C && !t.CCompatible() {
 			c.fail(fd.TypeName.Pos, "extern struct fields must have C types, found %s", t)
 		}
-		d.Type.Fields = append(d.Type.Fields, &types.Field{Name: fd.Name, Pub: fd.Pub, Type: t})
+		st.Fields = append(st.Fields, &types.Field{Name: fd.Name, Pub: fd.Pub, Type: t})
 	}
 }
 
@@ -382,6 +452,11 @@ func (c *Checker) declareFuncs(files []*ast.File) {
 			}
 		}
 	}
+	c.funcsReady = true
+	for _, m := range c.waitingMaps {
+		c.mapOps(m)
+	}
+	c.waitingMaps = nil
 }
 
 func (c *Checker) cSignature(fn *ast.Func) {
@@ -403,10 +478,15 @@ func (c *Checker) declareFunc(fn *ast.Func) {
 		c.fail(fn.Pos, "%s is a builtin", fn.Name)
 	}
 	_, builtin := c.builtin[fn.Name]
-	if _, clash := c.local().types[fn.Name]; clash || builtin {
+	_, generic := c.local().generics[fn.Name]
+	if _, clash := c.local().types[fn.Name]; clash || builtin || generic {
 		c.fail(fn.Pos, "function %s has the name of a type", fn.Name)
 	}
-	c.signature(fn)
+	if fn.TypeParams != nil {
+		c.declareGenericFunc(fn)
+	} else {
+		c.signature(fn)
+	}
 	c.local().funcs[fn.Name] = fn
 }
 
@@ -438,13 +518,15 @@ func (c *Checker) checkMain() {
 		c.fail(lexer.Pos{Line: 1, Col: 1}, "missing function main")
 	}
 	ret := main.RetType
-	if len(main.Params) > 0 || (ret != types.Void && (ret.Kind != types.ResultKind || ret.Ok != types.Void)) {
+	if len(main.Params) > 0 || main.TypeParams != nil || (ret != types.Void && (ret.Kind != types.ResultKind || ret.Ok != types.Void)) {
 		c.fail(main.Pos, "main must take no parameters and return nothing or ! E")
 	}
 }
 
 func (c *Checker) function(fn *ast.Func) {
 	c.file = fn.File
+	c.bound = c.bindingsOf(fn)
+	c.abstract = fn.TypeParams != nil
 	c.scopes = nil
 	c.body(fn)
 }
@@ -502,7 +584,9 @@ func (c *Checker) closure(e *ast.Closure, want *types.Type) {
 		fn.RetType = want.Ret
 	}
 	e.Func = fn
-	c.file.Funcs = append(c.file.Funcs, fn)
+	if !c.abstract {
+		c.file.Funcs = append(c.file.Funcs, fn)
+	}
 	outer, loops, deferring := c.fn, c.loops, c.deferring
 	c.closures = append(c.closures, e)
 	c.loops, c.deferring = nil, false
@@ -517,11 +601,18 @@ func (c *Checker) closureName() string {
 	return fmt.Sprintf("%s..c%d", c.fn.Name, c.counts[c.fn])
 }
 
-func (c *Checker) funcValue(fn *ast.Func, want *types.Type, pos lexer.Pos) *types.Type {
+func (c *Checker) funcValue(fn *ast.Func, want *types.Type, pos lexer.Pos) (*ast.Func, *types.Type) {
 	if fn.Variadic {
 		c.fail(pos, "variadic function %s cannot be used as a value", fn.Name)
 	}
 	want = unwrap(want)
+	if fn.TypeParams != nil {
+		inst, abstract := c.genericFuncValue(fn, want, pos)
+		if inst == nil {
+			return fn, abstract
+		}
+		fn = inst
+	}
 	callback := fn.Extern == nil && want != nil && want.Kind == types.FuncKind && want.C
 	if callback {
 		c.callback(fn, pos)
@@ -529,7 +620,7 @@ func (c *Checker) funcValue(fn *ast.Func, want *types.Type, pos lexer.Pos) *type
 	if fn.Extern == nil && !callback {
 		fn.AsValue = true
 	}
-	return c.signatureOf(fn, fn.Extern != nil || callback)
+	return fn, c.signatureOf(fn, fn.Extern != nil || callback)
 }
 
 func (c *Checker) callback(fn *ast.Func, pos lexer.Pos) {
@@ -954,7 +1045,9 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 	case *ast.Closure:
 		c.closure(e, want)
 	case *ast.StructLit:
-		c.structLit(e)
+		c.structLit(e, want)
+	case *ast.Instance:
+		c.fail(e.Pos, "type arguments must be followed by a call")
 	case *ast.Ref:
 		c.fail(e.Pos, "mut is only allowed as an argument to a mut parameter")
 	case *ast.Index:
@@ -1018,8 +1111,7 @@ func (c *Checker) ident(e *ast.Ident, want *types.Type) {
 		return
 	}
 	if fn, ok := c.local().funcs[e.Name]; ok && c.find(e.Name) == nil {
-		e.Func = fn
-		e.Type = c.funcValue(fn, want, e.Pos)
+		e.Func, e.Type = c.funcValue(fn, want, e.Pos)
 		return
 	}
 	e.Local = c.lookup(e.Name, e.Pos)
@@ -1070,10 +1162,17 @@ func (c *Checker) reachable(f *types.Field, t *types.Type, pos lexer.Pos) {
 
 func (c *Checker) selector(e *ast.Selector, want *types.Type) {
 	if id, ok := e.X.(*ast.Ident); ok && c.isModule(id.Name) && c.typeRef(e.X) == nil {
-		e.Func = c.importedFunc(id.Name, e.Name, e.Pos)
-		e.Type = c.funcValue(e.Func, want, e.Pos)
+		if g := c.imported(id.Name, id.Pos).generics[e.Name]; g == nil {
+			e.Func, e.Type = c.funcValue(c.importedFunc(id.Name, e.Name, e.Pos), want, e.Pos)
+			return
+		}
+	}
+	if g := c.genericRef(e.X); g != nil {
+		e.Type, e.Variant, _ = c.genericEnum(g, e.Name, nil, want, e.Pos)
+		c.unitVariant(e.Variant, e.Pos)
 		return
 	}
+
 	if t := c.typeRef(e.X); t != nil {
 		if t.Kind == types.StructKind {
 			c.fail(e.X.Position(), "%s is a type, not a value", t)
@@ -1177,11 +1276,17 @@ func (c *Checker) interp(e *ast.Interp) {
 	e.Type = types.Str
 }
 
-func (c *Checker) structLit(e *ast.StructLit) {
+func (c *Checker) structLit(e *ast.StructLit, want *types.Type) {
 	var t *types.Type
-	if e.Module != "" {
+	checked := map[*ast.FieldInit]*types.Type{}
+	switch g := c.lookupGeneric(e.Module, e.Name, e.Pos); {
+	case g != nil:
+		t = c.genericLitType(e, g, want, checked)
+	case e.TypeArgs != nil:
+		c.fail(e.Pos, "%s is not generic", e.Name)
+	case e.Module != "":
 		t = c.importedType(e.Module, e.Name, e.Pos)
-	} else {
+	default:
 		t = c.local().types[e.Name]
 	}
 	if t == nil || t.Kind != types.StructKind {
@@ -1199,6 +1304,12 @@ func (c *Checker) structLit(e *ast.StructLit) {
 		c.reachable(f, t, init.Pos)
 		given[f] = true
 		init.Field = f
+		if found, ok := checked[init]; ok {
+			if !f.Type.Accepts(found) {
+				c.fail(init.Value.Position(), "expected %s, found %s", f.Type, found)
+			}
+			continue
+		}
 		c.expectType(init.Value, f.Type)
 	}
 	var missing []string
@@ -1310,12 +1421,14 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 		c.requireInteger(c.plain(e.Y, nil), e.Op, e.Y.Position())
 	case lexer.Eq, lexer.NotEq:
 		t := c.operands(e, nil)
-		if !t.Number() && t != types.Bool && t != types.Str && t.Kind != types.PointerKind && t.Kind != types.RawKind {
+		if !t.Comparable() && t != types.Never {
 			c.fail(e.X.Position(), "cannot compare values of type %s", t)
 		}
 		e.Type = types.Bool
 	case lexer.Lt, lexer.LtEq, lexer.Gt, lexer.GtEq:
-		c.requireNumber(c.operands(e, nil), e.Op, e.Pos)
+		if t := c.operands(e, nil); !t.Ordered() && t != types.Never {
+			c.fail(e.Pos, "operator %s requires a number, found %s", e.Op, t)
+		}
 		e.Type = types.Bool
 	case lexer.Percent, lexer.Amp, lexer.Pipe, lexer.Caret:
 		e.Type = c.operands(e, numeric(want))
@@ -1333,7 +1446,7 @@ var builtins = map[string]bool{
 	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
 	"delete": true, "embed": true, "__str_raw": true,
 	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
-	"__bits": true, "__str_view": true,
+	"__bits": true, "__str_view": true, "__hash": true, "__zero": true,
 }
 
 func (c *Checker) call(e *ast.Call, want *types.Type) {
@@ -1347,7 +1460,7 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 			c.allocate(e, want)
 			return
 		}
-		if c.special(e, fn.Name) {
+		if c.special(e, fn.Name, want) {
 			return
 		}
 		if builtins[fn.Name] {
@@ -1356,6 +1469,10 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 		}
 		if c.find(fn.Name) != nil {
 			c.indirect(e)
+			return
+		}
+		if t, ok := c.bound[fn.Name]; ok && t.Number() {
+			c.convert(e, t)
 			return
 		}
 		if t, ok := c.builtin[fn.Name]; ok && t.Number() {
@@ -1370,22 +1487,28 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 		if !ok {
 			c.fail(e.Pos, "undefined function: %s", fn.Name)
 		}
-		c.callFunc(e, target)
+		c.callFunc(e, target, want)
 	case *ast.Selector:
-		c.selectorCall(e, fn)
+		c.selectorCall(e, fn, want)
+	case *ast.Instance:
+		c.instanceCall(e, fn, want)
 	default:
 		c.indirect(e)
 	}
 }
 
-func (c *Checker) selectorCall(e *ast.Call, sel *ast.Selector) {
+func (c *Checker) selectorCall(e *ast.Call, sel *ast.Selector, want *types.Type) {
 	id, isIdent := sel.X.(*ast.Ident)
 	t := c.typeRef(sel.X)
+	g := c.genericRef(sel.X)
 	switch {
 	case t != nil:
 		c.variantCall(e, sel, t)
+	case g != nil:
+		enum, v, found := c.genericEnum(g, sel.Name, e.Args, want, sel.Pos)
+		c.constructChecked(e, enum, v, found)
 	case isIdent && c.isModule(id.Name):
-		c.callFunc(e, c.importedFunc(id.Name, sel.Name, sel.Pos))
+		c.callFunc(e, c.importedFunc(id.Name, sel.Name, sel.Pos), want)
 	case isIdent && c.find(id.Name) == nil:
 		c.fail(id.Pos, "undefined: %s", id.Name)
 	default:
@@ -1430,13 +1553,15 @@ func (c *Checker) print(e *ast.Call) {
 		e.Builtin = "print_bool"
 	case t == types.Str:
 		e.Builtin = "print_str"
+	case t.Kind == types.ParamKind && t.Number():
+		e.Builtin = "print_i64"
 	default:
 		c.fail(e.Args[0].Position(), "cannot print a value of type %s", t)
 	}
 	e.Type = types.Void
 }
 
-func (c *Checker) special(e *ast.Call, name string) bool {
+func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 	switch name {
 	case "push":
 		c.push(e)
@@ -1517,6 +1642,18 @@ func (c *Checker) special(e *ast.Call, name string) bool {
 		c.single(e, name)
 		c.expectType(e.Args[0], c.slice(types.U8))
 		e.Builtin, e.Type = name, types.Str
+	case "__hash":
+		c.single(e, name)
+		if t := c.plain(e.Args[0], nil); !t.Hashable() {
+			c.fail(e.Args[0].Position(), "__hash requires a hashable value, found %s", t)
+		}
+		e.Builtin, e.Type = name, types.I64
+	case "__zero":
+		if len(e.Args) != 0 || want == nil {
+			c.fail(e.Pos, "__zero takes no arguments and needs an expected type")
+		}
+		e.Builtin, e.Type = name, want
+
 	default:
 		return false
 	}
@@ -1650,7 +1787,11 @@ func (c *Checker) allocate(e *ast.Call, want *types.Type) {
 	e.Type = c.pointer(t)
 }
 
-func (c *Checker) callFunc(e *ast.Call, fn *ast.Func) {
+func (c *Checker) callFunc(e *ast.Call, fn *ast.Func, want *types.Type) {
+	if fn.TypeParams != nil {
+		c.genericCall(e, fn, nil, want)
+		return
+	}
 	short := len(e.Args) < len(fn.Params)
 	if short || (len(e.Args) > len(fn.Params) && !fn.Variadic) {
 		c.fail(e.Pos, "%s takes %d arguments, found %d", fn.Name, len(fn.Params), len(e.Args))
@@ -1690,11 +1831,21 @@ func (c *Checker) variadic(arg ast.Expr) {
 }
 
 func (c *Checker) construct(e *ast.Call, enum *types.Type, v *types.Variant) {
+	c.constructChecked(e, enum, v, nil)
+}
+
+func (c *Checker) constructChecked(e *ast.Call, enum *types.Type, v *types.Variant, found []*types.Type) {
 	if len(e.Args) != len(v.Fields) {
 		c.fail(e.Pos, "variant %s takes %d fields, found %d", v.Name, len(v.Fields), len(e.Args))
 	}
 	for i, arg := range e.Args {
-		c.expectType(arg, v.Fields[i])
+		if found == nil {
+			c.expectType(arg, v.Fields[i])
+			continue
+		}
+		if !v.Fields[i].Accepts(found[i]) {
+			c.fail(arg.Position(), "expected %s, found %s", v.Fields[i], found[i])
+		}
 	}
 	e.Variant = v
 	e.Type = enum

@@ -135,6 +135,14 @@ func (b *builder) runtimeVoid(name string, args ...*Value) {
 }
 
 func (b *builder) builtin(e *ast.Call) []*Value {
+	if e.Builtin == "__zero" {
+		zero := b.constant(0)
+		words := make([]*Value, e.Type.Size())
+		for k := range words {
+			words[k] = zero
+		}
+		return words
+	}
 	if words, ok := b.pointerBuiltin(e); ok {
 		return words
 	}
@@ -160,6 +168,12 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 		return b.callNamed("__from_bytes", b.value(arg, arg.TypeOf())...)
 	case "__bits":
 		return []*Value{b.word(arg)}
+	case "__hash":
+		if arg.TypeOf() == types.Str {
+			return b.callNamed("__hash_str", b.value(arg, types.Str)...)
+		}
+		return b.callNamed("__hash_word", b.word(arg))
+
 	case "__str_view":
 		return b.value(arg, arg.TypeOf())[:2]
 	case "print_str":

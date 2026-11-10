@@ -274,6 +274,7 @@ func (p *Parser) importDecl() *ast.Import {
 func (p *Parser) enum() *ast.EnumDecl {
 	pos := p.expect(lexer.Enum).Pos
 	d := &ast.EnumDecl{Name: p.expect(lexer.Ident).Text, Pos: pos}
+	d.TypeParams = p.typeParams()
 	p.lines(func() { d.Variants = append(d.Variants, p.variant()) })
 	return d
 }
@@ -297,6 +298,7 @@ func (p *Parser) variant() *ast.VariantDecl {
 func (p *Parser) structDecl() *ast.StructDecl {
 	pos := p.expect(lexer.Struct).Pos
 	d := &ast.StructDecl{Name: p.expect(lexer.Ident).Text, Pos: pos}
+	d.TypeParams = p.typeParams()
 	p.lines(func() {
 		pub := p.at(lexer.Pub)
 		if pub {
@@ -312,6 +314,7 @@ func (p *Parser) structDecl() *ast.StructDecl {
 func (p *Parser) fn() *ast.Func {
 	pos := p.expect(lexer.Fn).Pos
 	f := &ast.Func{Name: p.expect(lexer.Ident).Text, Pos: pos}
+	f.TypeParams = p.typeParams()
 	p.list(func() { f.Params = append(f.Params, p.param()) })
 	if p.at(lexer.Arrow) {
 		p.next()
@@ -323,6 +326,115 @@ func (p *Parser) fn() *ast.Func {
 	}
 	f.Body = p.block()
 	return f
+}
+
+func (p *Parser) typeParams() []*ast.TypeParam {
+	if !p.at(lexer.LBracket) {
+		return nil
+	}
+	var params []*ast.TypeParam
+	p.brackets(func() {
+		name := p.expect(lexer.Ident)
+		param := &ast.TypeParam{Name: name.Text, Pos: name.Pos}
+		if p.at(lexer.Colon) {
+			p.next()
+			param.Constraints = append(param.Constraints, p.expect(lexer.Ident).Text)
+			for p.at(lexer.Plus) {
+				p.next()
+				param.Constraints = append(param.Constraints, p.expect(lexer.Ident).Text)
+			}
+		}
+		params = append(params, param)
+	})
+	if len(params) == 0 {
+		p.fail(p.tok().Pos, "expected type parameters")
+	}
+	return params
+}
+
+func (p *Parser) brackets(item func()) {
+	p.expect(lexer.LBracket)
+	p.nested(func() {
+		for !p.at(lexer.RBracket) {
+			item()
+			if !p.at(lexer.RBracket) {
+				p.expect(lexer.Comma)
+			}
+		}
+	})
+	p.expect(lexer.RBracket)
+}
+
+func (p *Parser) typeArgs() []*ast.TypeName {
+	var args []*ast.TypeName
+	p.brackets(func() { args = append(args, p.typeName()) })
+	if len(args) == 0 {
+		p.fail(p.tok().Pos, "expected type arguments")
+	}
+	return args
+}
+
+func (p *Parser) attempt(parse func()) (ok bool) {
+	start, noStruct := p.i, p.noStruct
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if _, failed := r.(bailout); !failed {
+			panic(r)
+		}
+		p.i, p.noStruct = start, noStruct
+		ok = false
+	}()
+	parse()
+	return true
+}
+
+func (p *Parser) genericLit(name lexer.Token) *ast.StructLit {
+	if !p.at(lexer.LBracket) || p.noStruct {
+		return nil
+	}
+	var args []*ast.TypeName
+	found := p.attempt(func() {
+		args = p.typeArgs()
+		if !p.at(lexer.LBrace) {
+			p.fail(p.tok().Pos, "expected {")
+		}
+	})
+	if !found {
+		return nil
+	}
+	lit := p.structLit(name)
+	lit.TypeArgs = args
+	return lit
+}
+
+func (p *Parser) instance(x ast.Expr) *ast.Instance {
+	start, pos := p.i, p.tok().Pos
+	var args []*ast.TypeName
+	found := p.attempt(func() {
+		args = p.typeArgs()
+		if !p.at(lexer.LParen) {
+			p.fail(p.tok().Pos, "expected (")
+		}
+	})
+	if !found {
+		return nil
+	}
+	end := p.i
+	p.i = start
+	var fallback ast.Expr
+	if !p.attempt(func() {
+		fallback = p.index(x)
+		if p.i != end {
+			p.fail(p.tok().Pos, "expected (")
+		}
+	}) {
+		fallback = nil
+	}
+	p.i = end
+	return &ast.Instance{X: x, Types: args, Fallback: fallback, Pos: pos}
 }
 
 func (p *Parser) param() *ast.Param {
@@ -427,12 +539,15 @@ func (p *Parser) typeTerm() *ast.TypeName {
 		p.expect(lexer.RBracket)
 		return &ast.TypeName{Raw: true, Elem: elem, Pos: pos}
 	}
-	name := p.expect(lexer.Ident).Text
-	if !p.at(lexer.Dot) {
-		return &ast.TypeName{Name: name, Pos: pos}
+	t := &ast.TypeName{Name: p.expect(lexer.Ident).Text, Pos: pos}
+	if p.at(lexer.Dot) {
+		p.next()
+		t.Module, t.Name = t.Name, p.expect(lexer.Ident).Text
 	}
-	p.next()
-	return &ast.TypeName{Module: name, Name: p.expect(lexer.Ident).Text, Pos: pos}
+	if p.at(lexer.LBracket) {
+		t.Args = p.typeArgs()
+	}
+	return t
 }
 
 func (p *Parser) block() *ast.Block {
@@ -623,6 +738,9 @@ func (p *Parser) primary() ast.Expr {
 		return &ast.BoolLit{Value: t.Kind == lexer.True, Pos: t.Pos}
 	case lexer.Ident:
 		p.next()
+		if lit := p.genericLit(t); lit != nil {
+			return lit
+		}
 		if p.at(lexer.LBrace) && !p.noStruct {
 			return p.structLit(t)
 		}
@@ -777,6 +895,13 @@ func (p *Parser) postfix(x ast.Expr) ast.Expr {
 		case lexer.Dot:
 			p.next()
 			name := p.expect(lexer.Ident)
+			if module, ok := x.(*ast.Ident); ok {
+				if lit := p.genericLit(name); lit != nil {
+					lit.Module = module.Name
+					x = lit
+					continue
+				}
+			}
 			if module, ok := x.(*ast.Ident); ok && p.at(lexer.LBrace) && !p.noStruct {
 				x = p.structLit(name)
 				x.(*ast.StructLit).Module = module.Name
@@ -787,6 +912,10 @@ func (p *Parser) postfix(x ast.Expr) ast.Expr {
 			p.next()
 			x = &ast.Try{X: x, Pos: t.Pos}
 		case lexer.LBracket:
+			if inst := p.instance(x); inst != nil {
+				x = inst
+				continue
+			}
 			x = p.index(x)
 		case lexer.Catch:
 			p.next()

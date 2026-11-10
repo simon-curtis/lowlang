@@ -42,7 +42,11 @@ type builder struct {
 func Build(files []*ast.File) *Program {
 	var decls []*ast.Func
 	for _, file := range files {
-		decls = append(decls, file.Funcs...)
+		for _, d := range file.Funcs {
+			if d.TypeParams == nil {
+				decls = append(decls, d)
+			}
+		}
 	}
 	p := &Program{}
 	funcs := map[*ast.Func]*Func{}
@@ -633,7 +637,7 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 		return b.construct(e.Type, e.Variant, nil)
 	}
 	if e.Length && e.X.TypeOf().Kind == types.MapKind {
-		return b.callNamed("__map_len", b.word(e.X))
+		return b.mapCall("__map_len", e.X.TypeOf(), b.word(e.X))
 	}
 	if e.Length {
 		return b.value(e.X, e.X.TypeOf())[1:2]

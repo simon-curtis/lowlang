@@ -110,7 +110,20 @@ func GeneratePatch(prog *ir.Program, names []string, table map[string]int, suffi
 }
 
 func Symbol(name, suffix string) string {
-	return fmt.Sprintf("fn_%s%s", name, suffix)
+	return fmt.Sprintf("fn_%s%s", mangle(name), suffix)
+}
+
+func mangle(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r == '_' || r == '.' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		default:
+			fmt.Fprintf(&b, ".%x", r)
+		}
+	}
+	return b.String()
 }
 
 func hotRuntimeSource() string {
@@ -251,7 +264,7 @@ func (g *Generator) messageLabel(s string) string {
 }
 
 func (g *Generator) function(f *ir.Func) {
-	g.fn = f.Name
+	g.fn = mangle(f.Name)
 	g.labels = 0
 	mf := lower(f)
 	spills, saved := mf.allocate()
@@ -554,7 +567,7 @@ func (g *Generator) funcAddr(dst string, v *ir.Value) {
 		g.emit("mov %s, qword ptr [rip+%s@GOTPCREL]", reg, v.Str)
 		g.move(dst, reg)
 	case v.Aux == ir.ThunkAddr:
-		g.address(dst, fmt.Sprintf("[rip+cb_%s]", v.Target.Name))
+		g.address(dst, fmt.Sprintf("[rip+cb_%s]", mangle(v.Target.Name)))
 	case g.table != nil:
 		g.address(dst, fmt.Sprintf("[rip+fn_table+%d]", 8*g.table[v.Target.Name]))
 	default:
