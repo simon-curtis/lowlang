@@ -1,0 +1,421 @@
+import std/io
+
+struct Huff {
+    sym: []u8
+    nb: []u8
+    bits: i64
+    weights: []u8
+    ranks: []i64
+    fse: *Fse
+    norm: []i32
+    next: []u32
+}
+
+struct HuffEnc {
+    counts: []i64
+    lens: []u8
+    codes: []u32
+    order: []i64
+    weight: []i64
+    parent: []i64
+    depth: []i64
+    ranks: []i64
+    weights: []u8
+    wcounts: []i64
+    norm: []i32
+    max_symbol: i64
+    bits: i64
+    table: BitOut
+}
+
+fn huff_table() -> *Huff {
+    new(Huff {
+        sym: io.buffer(2048)
+        nb: io.buffer(2048)
+        bits: 0
+        weights: io.buffer(260)
+        ranks: __make(16)
+        fse: fse_table(6)
+        norm: __make(256)
+        next: __make(256)
+    })
+}
+
+fn read_weights(h: *Huff, src: []u8, start: i64, end: i64) -> i64 ! io.Error {
+    let header = i64(src[start])
+    let weights = h.weights
+    if header >= 128 {
+        let n = header - 127
+        if start + 1 + (n + 1) / 2 > end {
+            fail Malformed
+        }
+        for i in 0..n {
+            let b = src[start + 1 + i / 2]
+            weights[i] = if i & 1 == 0 { b >> 4 } else { b & 15 }
+        }
+        return n
+    }
+    let stop = start + 1 + header
+    if header == 0 || stop > end {
+        fail Malformed
+    }
+    var nsym = 0
+    var log = 0
+    let head = read_ncount(src, start + 1, stop, h.norm, 15, 6, mut nsym, mut log)?
+    let fse = h.fse
+    fse_build(fse, h.norm, nsym, log, h.next)
+    var b = bit_in(src, start + 1 + head, stop)?
+    var s1 = read_bits(mut b, log)
+    var s2 = read_bits(mut b, log)
+    var n = 0
+    for {
+        if n > 253 {
+            fail Malformed
+        }
+        weights[n] = fse.sym[s1]
+        n += 1
+        s1 = i64(fse.base[s1]) + read_bits(mut b, i64(fse.nb[s1]))
+        if bits_left(b) < 0 {
+            weights[n] = fse.sym[s2]
+            n += 1
+            break
+        }
+        weights[n] = fse.sym[s2]
+        n += 1
+        s2 = i64(fse.base[s2]) + read_bits(mut b, i64(fse.nb[s2]))
+        if bits_left(b) < 0 {
+            weights[n] = fse.sym[s1]
+            n += 1
+            break
+        }
+    }
+    n
+}
+
+fn read_huffman(h: *Huff, src: []u8, start: i64, end: i64) -> i64 ! io.Error {
+    if start >= end {
+        fail Malformed
+    }
+    let header = i64(src[start])
+    let used = if header >= 128 { 1 + (header - 126) / 2 } else { 1 + header }
+    let n = read_weights(h, src, start, end)?
+    if n > 255 {
+        fail Malformed
+    }
+    let weights = h.weights
+    let ranks = h.ranks
+    for w in 0..16 {
+        ranks[w] = 0
+    }
+    var total = 0
+    for i in 0..n {
+        let w = i64(weights[i])
+        if w > 11 {
+            fail Malformed
+        }
+        ranks[w] += 1
+        if w > 0 {
+            total += 1 << (w - 1)
+        }
+    }
+    if total == 0 {
+        fail Malformed
+    }
+    let bits = highbit(u64(total)) + 1
+    let rest = (1 << bits) - total
+    if bits > 11 || rest & (rest - 1) != 0 {
+        fail Malformed
+    }
+    let last = highbit(u64(rest)) + 1
+    weights[n] = u8(last)
+    ranks[last] += 1
+    var at = 0
+    for w in 1..bits + 1 {
+        let count = ranks[w]
+        ranks[w] = at
+        at += count << (w - 1)
+    }
+    for s in 0..n + 1 {
+        let w = i64(weights[s])
+        if w == 0 {
+            continue
+        }
+        let first = ranks[w]
+        let len = 1 << (w - 1)
+        let nb = u8(bits + 1 - w)
+        for k in first..first + len {
+            h.sym[k] = u8(s)
+            h.nb[k] = nb
+        }
+        ranks[w] = first + len
+    }
+    h.bits = bits
+    used
+}
+
+fn huff_stream(h: *Huff, src: []u8, start: i64, end: i64, dst: []u8, from: i64, to: i64) ! io.Error {
+    var b = bit_in(src, start, end)?
+    let shift = 64 - h.bits
+    let need = 64 - h.bits
+    let sym = h.sym
+    let nb = h.nb
+    for i in from..to {
+        if b.used > need {
+            refill(mut b)
+        }
+        let v = b.bits << b.used >> shift
+        dst[i] = sym[v]
+        b.used += i64(nb[v])
+    }
+    if bits_left(b) != 0 {
+        fail Malformed
+    }
+}
+
+fn huff_encoder() -> *HuffEnc {
+    new(HuffEnc {
+        counts: __make(256)
+        lens: io.buffer(256)
+        codes: __make(256)
+        order: __make(256)
+        weight: __make(512)
+        parent: __make(512)
+        depth: __make(512)
+        ranks: __make(16)
+        weights: io.buffer(256)
+        wcounts: __make(16)
+        norm: __make(16)
+        max_symbol: 0
+        bits: 0
+        table: bit_out(256)
+    })
+}
+
+fn huff_count(h: *HuffEnc, src: []u8) -> i64 {
+    let counts = h.counts
+    for s in 0..256 {
+        counts[s] = 0
+    }
+    for b in src {
+        counts[b] += 1
+    }
+    var distinct = 0
+    for s in 0..256 {
+        if counts[s] > 0 {
+            distinct += 1
+        }
+    }
+    distinct
+}
+
+fn huff_build(h: *HuffEnc, limit: i64) {
+    let counts = h.counts
+    let order = h.order
+    let lens = h.lens
+    var n = 0
+    for s in 0..256 {
+        lens[s] = 0
+        if counts[s] > 0 {
+            var at = n
+            for at > 0 && counts[order[at - 1]] > counts[s] {
+                order[at] = order[at - 1]
+                at -= 1
+            }
+            order[at] = s
+            n += 1
+            h.max_symbol = s
+        }
+    }
+    let weight = h.weight
+    let parent = h.parent
+    for i in 0..n {
+        weight[i] = counts[order[i]]
+    }
+    var leaf = 0
+    var inner = n
+    var made = n
+    for made < 2 * n - 1 {
+        var pick = 0
+        for _ in 0..2 {
+            var node = 0
+            if leaf < n && (inner >= made || weight[leaf] <= weight[inner]) {
+                node = leaf
+                leaf += 1
+            } else {
+                node = inner
+                inner += 1
+            }
+            parent[node] = made
+            pick += weight[node]
+        }
+        weight[made] = pick
+        made += 1
+    }
+    let depth = h.depth
+    depth[2 * n - 2] = 0
+    var i = 2 * n - 3
+    for i >= 0 {
+        depth[i] = depth[parent[i]] + 1
+        i -= 1
+    }
+    var longest = 0
+    for k in 0..n {
+        let d = if depth[k] > limit { limit } else { depth[k] }
+        lens[order[k]] = u8(d)
+        if d > longest {
+            longest = d
+        }
+    }
+    var kraft = 0
+    for k in 0..n {
+        kraft += 1 << (longest - i64(lens[order[k]]))
+    }
+    let full = 1 << longest
+    var k = 0
+    for kraft > full {
+        let s = order[k]
+        if i64(lens[s]) < longest {
+            kraft -= 1 << (longest - i64(lens[s]) - 1)
+            lens[s] += 1
+        } else {
+            k += 1
+            if k == n {
+                k = 0
+            }
+        }
+    }
+    var j = n - 1
+    for kraft < full {
+        let s = order[j]
+        let gain = 1 << (longest - i64(lens[s]))
+        if lens[s] > 1 && kraft + gain <= full {
+            kraft += gain
+            lens[s] -= 1
+        } else {
+            j -= 1
+            if j < 0 {
+                j = n - 1
+            }
+        }
+    }
+    h.bits = longest
+    let ranks = h.ranks
+    for w in 0..16 {
+        ranks[w] = 0
+    }
+    for s in 0..h.max_symbol + 1 {
+        if lens[s] > 0 {
+            ranks[longest + 1 - i64(lens[s])] += 1
+        }
+    }
+    var at = 0
+    for w in 1..longest + 1 {
+        let count = ranks[w]
+        ranks[w] = at
+        at += count << (w - 1)
+    }
+    for s in 0..h.max_symbol + 1 {
+        if lens[s] == 0 {
+            continue
+        }
+        let w = longest + 1 - i64(lens[s])
+        h.codes[s] = u32(ranks[w] >> (w - 1))
+        ranks[w] += 1 << (w - 1)
+    }
+}
+
+fn huff_size(h: *HuffEnc) -> i64 {
+    var bits = 0
+    for s in 0..h.max_symbol + 1 {
+        bits += h.counts[s] * i64(h.lens[s])
+    }
+    bits >> 3
+}
+
+fn compressed_weights(h: *HuffEnc, n: i64, top: i64) -> bool {
+    var distinct = 0
+    for k in 0..top + 1 {
+        if h.wcounts[k] > 0 {
+            distinct += 1
+        }
+    }
+    if n < 2 || distinct < 2 {
+        return false
+    }
+    let weights = h.weights
+    let log = optimal_log(6, n, top)
+    normalize(h.wcounts, top + 1, n, log, h.norm)
+    let e = fse_encoder(h.norm, top + 1, log)
+    reset_bits(mut h.table)
+    put_byte(mut h.table, 0)
+    write_ncount(mut h.table, h.norm, top + 1, log)
+    var i = n
+    var s1 = 0
+    var s2 = 0
+    if n & 1 == 1 {
+        s1 = fse_init(e, i64(weights[i - 1]))
+        s2 = fse_init(e, i64(weights[i - 2]))
+        s1 = fse_encode(mut h.table, e, s1, i64(weights[i - 3]))
+        i -= 3
+    } else {
+        s2 = fse_init(e, i64(weights[i - 1]))
+        s1 = fse_init(e, i64(weights[i - 2]))
+        i -= 2
+    }
+    for i > 0 {
+        s2 = fse_encode(mut h.table, e, s2, i64(weights[i - 1]))
+        s1 = fse_encode(mut h.table, e, s1, i64(weights[i - 2]))
+        i -= 2
+    }
+    fse_flush(mut h.table, e, s2)
+    fse_flush(mut h.table, e, s1)
+    close_bits(mut h.table)
+    let packed = h.table.len - 1
+    h.table.buf[0] = u8(packed)
+    packed < 128 && (n > 128 || packed < (n + 1) / 2)
+}
+
+fn huff_describe(h: *HuffEnc) -> bool {
+    let n = h.max_symbol
+    let weights = h.weights
+    let wcounts = h.wcounts
+    for k in 0..16 {
+        wcounts[k] = 0
+    }
+    var top = 0
+    for s in 0..n {
+        let wt = if h.lens[s] == 0 { 0 } else { h.bits + 1 - i64(h.lens[s]) }
+        weights[s] = u8(wt)
+        wcounts[wt] += 1
+        if wt > top {
+            top = wt
+        }
+    }
+    if compressed_weights(h, n, top) {
+        return true
+    }
+    if n > 128 {
+        return false
+    }
+    reset_bits(mut h.table)
+    put_byte(mut h.table, u8(127 + n))
+    var k = 0
+    for k < n {
+        let lo = if k + 1 < n { weights[k + 1] } else { 0 }
+        put_byte(mut h.table, weights[k] << 4 | lo)
+        k += 2
+    }
+    true
+}
+
+fn huff_encode(h: *HuffEnc, mut w: BitOut, src: []u8) {
+    let codes = h.codes
+    let lens = h.lens
+    var i = src.len
+    for i > 0 {
+        i -= 1
+        let s = src[i]
+        add_bits(mut w, u64(codes[s]), i64(lens[s]))
+    }
+    close_bits(mut w)
+}

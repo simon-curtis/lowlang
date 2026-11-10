@@ -1,0 +1,602 @@
+import std/hash
+import std/io
+
+struct SeqTable {
+    own: *Fse
+    pre: *Fse
+    cur: *Fse
+    ok: bool
+    max_symbol: i64
+}
+
+struct Decoder {
+    r: *io.Reader
+    sink: fn([]u8) ! io.Error
+    limit: i64
+    total: i64
+    head: []u8
+    src: []u8
+    lits: []u8
+    litv: []u8
+    hist: []u8
+    pos: i64
+    emitted: i64
+    frame_out: i64
+    cap: i64
+    target: i64
+    fixed: bool
+    block_max: i64
+    reps: []i64
+    huff: *Huff
+    has_huff: bool
+    ll: *SeqTable
+    of: *SeqTable
+    ml: *SeqTable
+    norm: []i32
+    next: []u32
+    codes: *Codes
+    sum: *hash.Xxh64
+}
+
+fn block_size() -> i64 {
+    1 << 17
+}
+
+fn seq_table(max_symbol: i64, max_log: i64, norm: []i32, log: i64, next: []u32) -> *SeqTable {
+    let pre = fse_table(log)
+    fse_build(pre, norm, norm.len, log, next)
+    let own = fse_table(max_log)
+    new(SeqTable { own, pre, cur: pre, ok: false, max_symbol })
+}
+
+fn decoder(r: *io.Reader, sink: fn([]u8) ! io.Error, limit: i64) -> *Decoder {
+    let next: []u32 = __make(256)
+    new(Decoder {
+        r
+        sink
+        limit
+        total: 0
+        head: io.buffer(32)
+        src: io.buffer(block_size())
+        lits: io.buffer(block_size())
+        litv: []
+        hist: []
+        pos: 0
+        emitted: 0
+        frame_out: 0
+        cap: 0
+        target: 0
+        fixed: false
+        block_max: 0
+        reps: [1, 4, 8]
+        huff: huff_table()
+        has_huff: false
+        ll: seq_table(35, 9, ll_default(), 6, next)
+        of: seq_table(31, 8, of_default(), 5, next)
+        ml: seq_table(52, 9, ml_default(), 6, next)
+        norm: __make(64)
+        next
+        codes: codes()
+        sum: hash.xxh64_new(0)
+    })
+}
+
+fn fill(d: *Decoder, dst: []u8) ! io.Error {
+    var got = 0
+    for got < dst.len {
+        let n = io.read_some(d.r, dst[got..])?
+        if n == 0 {
+            fail Malformed
+        }
+        got += n
+    }
+}
+
+fn little(b: []u8, n: i64) -> i64 {
+    var v = 0
+    for i in 0..n {
+        v |= i64(b[i]) << (8 * i)
+    }
+    v
+}
+
+pub fn decode(r: *io.Reader, sink: fn([]u8) ! io.Error, limit: i64) ! io.Error {
+    let d = decoder(r, sink, limit)
+    var frames = 0
+    for {
+        let got = io.read_some(r, d.head[..4])?
+        if got == 0 {
+            break
+        }
+        fill(d, d.head[got..4])?
+        let magic = io.le32(d.head, 0)
+        if magic == 0xFD2FB528 {
+            frame(d)?
+        } else if magic & 0xFFFFFFF0 == 0x184D2A50 {
+            skip_frame(d)?
+        } else {
+            fail Malformed
+        }
+        frames += 1
+    }
+    if frames == 0 {
+        fail Malformed
+    }
+}
+
+fn skip_frame(d: *Decoder) ! io.Error {
+    fill(d, d.head[..4])?
+    var left = io.le32(d.head, 0)
+    for left > 0 {
+        let n = if left > d.src.len { d.src.len } else { left }
+        fill(d, d.src[..n])?
+        left -= n
+    }
+}
+
+fn frame(d: *Decoder) ! io.Error {
+    fill(d, d.head[..1])?
+    let fhd = i64(d.head[0])
+    let fcs_flag = fhd >> 6
+    let single = fhd >> 5 & 1 == 1
+    let checksum = fhd >> 2 & 1 == 1
+    let dict_flag = fhd & 3
+    if fhd >> 3 & 1 == 1 {
+        fail Malformed
+    }
+    let wd_size = if single { 0 } else { 1 }
+    let did_size = if dict_flag == 3 { 4 } else { dict_flag }
+    var fcs_size = 0
+    if fcs_flag == 0 {
+        fcs_size = if single { 1 } else { 0 }
+    } else {
+        fcs_size = 1 << fcs_flag
+    }
+    let rest = wd_size + did_size + fcs_size
+    fill(d, d.head[..rest])?
+    var window = 0
+    if !single {
+        let wd = i64(d.head[0])
+        let base = 1 << (10 + (wd >> 3))
+        window = base + (base >> 3) * (wd & 7)
+    }
+    if did_size > 0 && little(d.head[wd_size..], did_size) != 0 {
+        fail Unsupported
+    }
+    var fcs = -1
+    if fcs_size > 0 {
+        fcs = little(d.head[wd_size + did_size..], fcs_size)
+        if fcs_size == 2 {
+            fcs += 256
+        }
+        if fcs < 0 {
+            fail TooLarge
+        }
+    }
+    if single {
+        window = fcs
+    }
+    let remaining = max(0, d.limit - d.total)
+    if fcs > remaining {
+        fail TooLarge
+    }
+    if window > 1 << 31 {
+        fail Unsupported
+    }
+    d.block_max = if window < block_size() { window } else { block_size() }
+    prepare(d, fcs, window, remaining)
+    d.reps[0] = 1
+    d.reps[1] = 4
+    d.reps[2] = 8
+    d.has_huff = false
+    d.ll.ok = false
+    d.of.ok = false
+    d.ml.ok = false
+    if checksum {
+        d.sum = hash.xxh64_new(0)
+    }
+    blocks(d, checksum)?
+    if fcs >= 0 && d.frame_out != fcs {
+        fail Malformed
+    }
+    if checksum {
+        fill(d, d.head[..4])?
+        if io.le32(d.head, 0) != i64(hash.xxh64_sum(d.sum) & 0xFFFFFFFF) {
+            fail Malformed
+        }
+    }
+}
+
+fn prepare(d: *Decoder, fcs: i64, window: i64, remaining: i64) {
+    d.cap = min(window, remaining)
+    d.fixed = fcs >= 0 && fcs <= d.cap
+    d.target = if d.fixed { fcs } else { d.cap + max(min(d.cap, 1 << 24), 1 << 18) }
+    d.pos = 0
+    d.emitted = 0
+    d.frame_out = 0
+}
+
+fn room(d: *Decoder) {
+    if d.pos + d.block_max <= d.hist.len {
+        return
+    }
+    if d.hist.len < d.target {
+        let size = min(d.target, max(max(d.hist.len * 2, d.pos + d.block_max), 1 << 20))
+        let grown: []u8 = __make(size)
+        io.copy(grown, d.hist[..d.pos])
+        d.hist = grown
+    } else if !d.fixed {
+        slide_window(d)
+    }
+}
+
+fn blocks(d: *Decoder, checksum: bool) ! io.Error {
+    for {
+        fill(d, d.head[..3])?
+        let h = io.le16(d.head, 0) | i64(d.head[2]) << 16
+        let last = h & 1 == 1
+        let kind = h >> 1 & 3
+        let size = h >> 3
+        if kind == 3 || size > d.block_max {
+            fail Malformed
+        }
+        room(d)
+        if kind == 2 {
+            fill(d, d.src[..size])?
+            compressed(d, size)?
+        } else {
+            if d.pos + size > d.hist.len {
+                fail Malformed
+            }
+            let out = d.hist[d.pos..d.pos + size]
+            if kind == 0 {
+                fill(d, out)?
+            } else {
+                fill(d, d.head[..1])?
+                let v = d.head[0]
+                for i in 0..size {
+                    out[i] = v
+                }
+            }
+            d.pos += size
+        }
+        emit(d, checksum)?
+        if last {
+            break
+        }
+    }
+}
+
+fn slide_window(d: *Decoder) {
+    let keep = if d.pos < d.cap { d.pos } else { d.cap }
+    io.copy(d.hist, d.hist[d.pos - keep..d.pos])
+    d.pos = keep
+    d.emitted = keep
+}
+
+fn emit(d: *Decoder, checksum: bool) ! io.Error {
+    let chunk = d.hist[d.emitted..d.pos]
+    d.emitted = d.pos
+    if chunk.len == 0 {
+        return
+    }
+    d.total += chunk.len
+    d.frame_out += chunk.len
+    if d.total > d.limit {
+        fail TooLarge
+    }
+    if checksum {
+        hash.xxh64_update(d.sum, chunk)
+    }
+    d.sink(chunk)?
+}
+
+fn compressed(d: *Decoder, size: i64) ! io.Error {
+    let at = literals(d, size)?
+    sequences(d, at, size)?
+}
+
+fn literals(d: *Decoder, size: i64) -> i64 ! io.Error {
+    let src = d.src
+    if size < 1 {
+        fail Malformed
+    }
+    let b0 = i64(src[0])
+    let kind = b0 & 3
+    let format = b0 >> 2 & 3
+    if kind < 2 {
+        var regen = 0
+        var head = 0
+        if format & 1 == 0 {
+            regen = b0 >> 3
+            head = 1
+        } else if format == 1 {
+            head = 2
+        } else {
+            head = 3
+        }
+        if head > size {
+            fail Malformed
+        }
+        if head == 2 {
+            regen = b0 >> 4 | i64(src[1]) << 4
+        } else if head == 3 {
+            regen = b0 >> 4 | i64(src[1]) << 4 | i64(src[2]) << 12
+        }
+        if regen > d.block_max {
+            fail Malformed
+        }
+        if kind == 0 {
+            if head + regen > size {
+                fail Malformed
+            }
+            d.litv = src[head..head + regen]
+            return head + regen
+        }
+        if head + 1 > size {
+            fail Malformed
+        }
+        let lits = d.lits[..regen]
+        let v = src[head]
+        for i in 0..regen {
+            lits[i] = v
+        }
+        d.litv = lits
+        return head + 1
+    }
+    let head = if format < 2 { 3 } else { format + 2 }
+    if head > size {
+        fail Malformed
+    }
+    let h = little(src, head)
+    var regen = 0
+    var comp = 0
+    if head == 3 {
+        regen = h >> 4 & 0x3FF
+        comp = h >> 14 & 0x3FF
+    } else if head == 4 {
+        regen = h >> 4 & 0x3FFF
+        comp = h >> 18 & 0x3FFF
+    } else {
+        regen = h >> 4 & 0x3FFFF
+        comp = h >> 22 & 0x3FFFF
+    }
+    let end = head + comp
+    if regen > d.block_max || end > size {
+        fail Malformed
+    }
+    var p = head
+    if kind == 2 {
+        p += read_huffman(d.huff, src, p, end)?
+        d.has_huff = true
+    } else if !d.has_huff {
+        fail Malformed
+    }
+    let lits = d.lits
+    if format == 0 {
+        huff_stream(d.huff, src, p, end, lits, 0, regen)?
+    } else {
+        if p + 6 > end {
+            fail Malformed
+        }
+        let e1 = p + 6 + io.le16(src, p)
+        let e2 = e1 + io.le16(src, p + 2)
+        let e3 = e2 + io.le16(src, p + 4)
+        let seg = (regen + 3) / 4
+        if e3 > end || 3 * seg > regen {
+            fail Malformed
+        }
+        huff_stream(d.huff, src, p + 6, e1, lits, 0, seg)?
+        huff_stream(d.huff, src, e1, e2, lits, seg, 2 * seg)?
+        huff_stream(d.huff, src, e2, e3, lits, 2 * seg, 3 * seg)?
+        huff_stream(d.huff, src, e3, end, lits, 3 * seg, regen)?
+    }
+    d.litv = lits[..regen]
+    end
+}
+
+fn load_table(d: *Decoder, t: *SeqTable, mode: i64, p: i64, size: i64) -> i64 ! io.Error {
+    var at = p
+    if mode == 0 {
+        t.cur = t.pre
+    } else if mode == 1 {
+        if at >= size || i64(d.src[at]) > t.max_symbol {
+            fail Malformed
+        }
+        fse_rle(t.own, d.src[at])
+        t.cur = t.own
+        at += 1
+    } else if mode == 2 {
+        var nsym = 0
+        var log = 0
+        let max_log = if t.max_symbol == 31 { 8 } else { 9 }
+        at += read_ncount(d.src, at, size, d.norm, t.max_symbol, max_log, mut nsym, mut log)?
+        fse_build(t.own, d.norm, nsym, log, d.next)
+        t.cur = t.own
+    } else if !t.ok {
+        fail Malformed
+    }
+    t.ok = true
+    at
+}
+
+fn sequences(d: *Decoder, at: i64, size: i64) ! io.Error {
+    let src = d.src
+    if at >= size {
+        fail Malformed
+    }
+    let b0 = i64(src[at])
+    var nseq = b0
+    var p = at + 1
+    if b0 >= 128 {
+        if b0 < 255 {
+            if at + 2 > size {
+                fail Malformed
+            }
+            nseq = (b0 - 128) << 8 | i64(src[at + 1])
+            p = at + 2
+        } else {
+            if at + 3 > size {
+                fail Malformed
+            }
+            nseq = io.le16(src, at + 1) + 0x7F00
+            p = at + 3
+        }
+    }
+    if nseq == 0 {
+        if p != size {
+            fail Malformed
+        }
+        let lits = d.litv
+        if d.pos + lits.len > d.hist.len {
+            fail Malformed
+        }
+        io.copy(d.hist[d.pos..], lits)
+        d.pos += lits.len
+        return
+    }
+    if p >= size {
+        fail Malformed
+    }
+    let modes = i64(src[p])
+    if modes & 3 != 0 {
+        fail Malformed
+    }
+    p += 1
+    p = load_table(d, d.ll, modes >> 6, p, size)?
+    p = load_table(d, d.of, modes >> 4 & 3, p, size)?
+    p = load_table(d, d.ml, modes >> 2 & 3, p, size)?
+    execute(d, nseq, p, size)?
+}
+
+fn copy_match(hist: []u8, op: i64, offset: i64, n: i64) {
+    let from = op - offset
+    if offset >= n {
+        io.copy(hist[op..op + n], hist[from..from + n])
+        return
+    }
+    if offset == 1 {
+        let v = hist[from]
+        for i in op..op + n {
+            hist[i] = v
+        }
+        return
+    }
+    var done = 0
+    for done < n {
+        var k = offset + done
+        if k > n - done {
+            k = n - done
+        }
+        io.copy(hist[op + done..op + done + k], hist[from..from + k])
+        done += k
+    }
+}
+
+fn execute(d: *Decoder, nseq: i64, p: i64, size: i64) ! io.Error {
+    let ll = d.ll.cur
+    let of = d.of.cur
+    let ml = d.ml.cur
+    let codes = d.codes
+    let ll_base = codes.ll_base
+    let ll_bits = codes.ll_bits
+    let ml_base = codes.ml_base
+    let ml_bits = codes.ml_bits
+    let hist = d.hist
+    let lits = d.litv
+    var b = bit_in(d.src, p, size)?
+    var lls = read_bits(mut b, ll.log)
+    var ofs = read_bits(mut b, of.log)
+    var mls = read_bits(mut b, ml.log)
+    var r1 = d.reps[0]
+    var r2 = d.reps[1]
+    var r3 = d.reps[2]
+    var op = d.pos
+    let oend = if d.pos + d.block_max < hist.len { d.pos + d.block_max } else { hist.len }
+    var lp = 0
+    for k in 0..nseq {
+        let ofc = i64(of.sym[ofs])
+        let mlc = ml.sym[mls]
+        let llc = ll.sym[lls]
+        let offv = (1 << ofc) + read_bits(mut b, ofc)
+        let mlen = i64(ml_base[mlc]) + read_bits(mut b, i64(ml_bits[mlc]))
+        let llen = i64(ll_base[llc]) + read_bits(mut b, i64(ll_bits[llc]))
+        var offset = 0
+        if offv > 3 {
+            offset = offv - 3
+            r3 = r2
+            r2 = r1
+            r1 = offset
+        } else {
+            let index = if llen == 0 { offv + 1 } else { offv }
+            if index == 1 {
+                offset = r1
+            } else if index == 2 {
+                offset = r2
+                r2 = r1
+                r1 = offset
+            } else {
+                offset = if index == 3 { r3 } else { r1 - 1 }
+                if offset == 0 {
+                    fail Malformed
+                }
+                r3 = r2
+                r2 = r1
+                r1 = offset
+            }
+        }
+        if k + 1 < nseq {
+            lls = i64(ll.base[lls]) + read_bits(mut b, i64(ll.nb[lls]))
+            mls = i64(ml.base[mls]) + read_bits(mut b, i64(ml.nb[mls]))
+            ofs = i64(of.base[ofs]) + read_bits(mut b, i64(of.nb[ofs]))
+        }
+        if lp + llen > lits.len || op + llen + mlen > oend {
+            fail Malformed
+        }
+        io.copy(hist[op..op + llen], lits[lp..lp + llen])
+        op += llen
+        lp += llen
+        if offset > op {
+            fail Malformed
+        }
+        copy_match(hist, op, offset, mlen)
+        op += mlen
+    }
+    if bits_left(b) != 0 {
+        fail Malformed
+    }
+    let tail = lits.len - lp
+    if op + tail > oend {
+        fail Malformed
+    }
+    io.copy(hist[op..op + tail], lits[lp..])
+    d.pos = op + tail
+    d.reps[0] = r1
+    d.reps[1] = r2
+    d.reps[2] = r3
+}
+
+struct Collector {
+    data: []u8
+    len: i64
+}
+
+fn collect(c: *Collector, chunk: []u8) {
+    let need = c.len + chunk.len
+    if need > c.data.len {
+        let size = if c.data.len * 2 > need { c.data.len * 2 } else { need }
+        let grown: []u8 = __make(size)
+        io.copy(grown, c.data[..c.len])
+        c.data = grown
+    }
+    io.copy(c.data[c.len..], chunk)
+    c.len = need
+}
+
+pub fn decompress(data: []u8, limit: i64) -> []u8 ! io.Error {
+    let hint = data.len * 4 + 64
+    let c = new(Collector { data: __make(if hint < limit { hint } else if limit > 0 { limit } else { 0 }), len: 0 })
+    let sink: fn([]u8) ! io.Error = fn(chunk) { collect(c, chunk) }
+    decode(io.bytes_reader(data), sink, limit)?
+    c.data[..c.len]
+}

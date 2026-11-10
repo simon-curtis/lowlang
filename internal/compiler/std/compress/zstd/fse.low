@@ -1,0 +1,340 @@
+import std/io
+
+struct Fse {
+    sym: []u8
+    nb: []u8
+    base: []u16
+    log: i64
+}
+
+struct FseEnc {
+    states: []u16
+    delta_bits: []u32
+    delta_state: []i32
+    log: i64
+}
+
+fn fse_table(log: i64) -> *Fse {
+    let size = 1 << log
+    new(Fse { sym: io.buffer(size), nb: io.buffer(size), base: __make(size), log: 0 })
+}
+
+fn fse_rle(t: *Fse, symbol: u8) {
+    t.sym[0] = symbol
+    t.nb[0] = 0
+    t.base[0] = 0
+    t.log = 0
+}
+
+fn spread(norm: []i32, nsym: i64, log: i64, table: []u8) {
+    let size = 1 << log
+    var high = size - 1
+    for s in 0..nsym {
+        if norm[s] == -1 {
+            table[high] = u8(s)
+            high -= 1
+        }
+    }
+    let step = (size >> 1) + (size >> 3) + 3
+    let mask = size - 1
+    var pos = 0
+    for s in 0..nsym {
+        for _ in 0..i64(norm[s]) {
+            table[pos] = u8(s)
+            pos = (pos + step) & mask
+            for pos > high {
+                pos = (pos + step) & mask
+            }
+        }
+    }
+}
+
+fn fse_build(t: *Fse, norm: []i32, nsym: i64, log: i64, next: []u32) {
+    let size = 1 << log
+    spread(norm, nsym, log, t.sym)
+    for s in 0..nsym {
+        next[s] = if norm[s] == -1 { 1 } else { u32(norm[s]) }
+    }
+    for u in 0..size {
+        let s = t.sym[u]
+        let state = next[s]
+        next[s] = state + 1
+        let nb = log - highbit(u64(state))
+        t.nb[u] = u8(nb)
+        t.base[u] = u16((i64(state) << nb) - size)
+    }
+    t.log = log
+}
+
+fn fwd_bits(src: []u8, end: i64, pos: i64, n: i64) -> i64 {
+    var at = pos >> 3
+    var v = 0
+    var shift = 0
+    for shift < 32 {
+        if at < end {
+            v |= i64(src[at]) << shift
+        }
+        at += 1
+        shift += 8
+    }
+    v >> (pos & 7) & ((1 << n) - 1)
+}
+
+fn read_ncount(src: []u8, start: i64, end: i64, norm: []i32, max_symbol: i64, max_log: i64, mut nsym: i64, mut log: i64) -> i64 ! io.Error {
+    if start >= end {
+        fail Malformed
+    }
+    let table_log = (i64(src[start]) & 15) + 5
+    if table_log > max_log {
+        fail Malformed
+    }
+    var pos = start * 8 + 4
+    var remaining = (1 << table_log) + 1
+    var threshold = 1 << table_log
+    var nb = table_log + 1
+    var symbol = 0
+    var zero = false
+    for remaining > 1 {
+        if symbol > max_symbol || pos > end * 8 {
+            fail Malformed
+        }
+        if zero {
+            var repeat = fwd_bits(src, end, pos, 2)
+            pos += 2
+            var skip = repeat
+            for repeat == 3 {
+                if pos > end * 8 {
+                    fail Malformed
+                }
+                repeat = fwd_bits(src, end, pos, 2)
+                pos += 2
+                skip += repeat
+            }
+            if symbol + skip > max_symbol {
+                fail Malformed
+            }
+            for _ in 0..skip {
+                norm[symbol] = 0
+                symbol += 1
+            }
+        }
+        let max = 2 * threshold - 1 - remaining
+        var count = fwd_bits(src, end, pos, nb - 1)
+        if count < max {
+            pos += nb - 1
+        } else {
+            count = fwd_bits(src, end, pos, nb)
+            if count >= threshold {
+                count -= max
+            }
+            pos += nb
+        }
+        count -= 1
+        remaining -= if count < 0 { -count } else { count }
+        norm[symbol] = i32(count)
+        symbol += 1
+        zero = count == 0
+        for remaining < threshold && threshold > 1 {
+            nb -= 1
+            threshold >>= 1
+        }
+    }
+    let used = (pos + 7) >> 3
+    if remaining != 1 || used > end {
+        fail Malformed
+    }
+    for s in symbol..max_symbol + 1 {
+        norm[s] = 0
+    }
+    nsym = symbol
+    log = table_log
+    used - start
+}
+
+fn optimal_log(max_log: i64, total: i64, max_symbol: i64) -> i64 {
+    let from_src = highbit(u64(total - 1)) + 1
+    let from_symbols = highbit(u64(max_symbol)) + 2
+    let min_log = if from_src < from_symbols { from_src } else { from_symbols }
+    var log = max_log
+    let src_bits = highbit(u64(total - 1)) - 2
+    if src_bits < log {
+        log = src_bits
+    }
+    if min_log > log {
+        log = min_log
+    }
+    if log < 5 {
+        log = 5
+    }
+    if log > max_log {
+        log = max_log
+    }
+    log
+}
+
+fn normalize(counts: []i64, nsym: i64, total: i64, log: i64, norm: []i32) {
+    let size = 1 << log
+    var sum = 0
+    for s in 0..nsym {
+        if counts[s] == 0 {
+            norm[s] = 0
+            continue
+        }
+        var n = (counts[s] * size * 2 + total) / (total * 2)
+        if n < 1 {
+            n = 1
+        }
+        norm[s] = i32(n)
+        sum += n
+    }
+    for sum > size {
+        var pick = -1
+        for s in 0..nsym {
+            if norm[s] > 1 && (pick < 0 || counts[s] * i64(norm[pick] - 1) < counts[pick] * i64(norm[s] - 1)) {
+                pick = s
+            }
+        }
+        norm[pick] -= 1
+        sum -= 1
+    }
+    for sum < size {
+        var pick = -1
+        for s in 0..nsym {
+            if norm[s] > 0 && (pick < 0 || counts[s] * i64(norm[pick]) > counts[pick] * i64(norm[s])) {
+                pick = s
+            }
+        }
+        norm[pick] += 1
+        sum += 1
+    }
+}
+
+fn write_ncount(mut w: BitOut, norm: []i32, nsym: i64, log: i64) {
+    let size = 1 << log
+    add_bits(mut w, u64(log - 5), 4)
+    var remaining = size + 1
+    var threshold = size
+    var nb = log + 1
+    var symbol = 0
+    var zero = false
+    for symbol < nsym && remaining > 1 {
+        if zero {
+            var start = symbol
+            for symbol < nsym && norm[symbol] == 0 {
+                symbol += 1
+            }
+            for symbol >= start + 24 {
+                start += 24
+                add_bits(mut w, 0xFFFF, 16)
+            }
+            for symbol >= start + 3 {
+                start += 3
+                add_bits(mut w, 3, 2)
+            }
+            add_bits(mut w, u64(symbol - start), 2)
+        }
+        var count = i64(norm[symbol])
+        symbol += 1
+        let max = 2 * threshold - 1 - remaining
+        remaining -= if count < 0 { -count } else { count }
+        count += 1
+        if count >= threshold {
+            count += max
+        }
+        if count < max {
+            add_bits(mut w, u64(count), nb - 1)
+        } else {
+            add_bits(mut w, u64(count), nb)
+        }
+        zero = count == 1
+        for remaining < threshold {
+            nb -= 1
+            threshold >>= 1
+        }
+    }
+    align_bits(mut w)
+}
+
+fn fse_encoder(norm: []i32, nsym: i64, log: i64) -> *FseEnc {
+    let size = 1 << log
+    let table = io.buffer(size)
+    spread(norm, nsym, log, table)
+    let cumul: []i64 = __make(nsym + 1)
+    for s in 0..nsym {
+        let n = if norm[s] == -1 { 1 } else { i64(norm[s]) }
+        cumul[s + 1] = cumul[s] + n
+    }
+    let states: []u16 = __make(size)
+    for u in 0..size {
+        let s = table[u]
+        states[cumul[s]] = u16(size + u)
+        cumul[s] += 1
+    }
+    let delta_bits: []u32 = __make(nsym)
+    let delta_state: []i32 = __make(nsym)
+    var total = 0
+    for s in 0..nsym {
+        let n = i64(norm[s])
+        if n == 0 {
+            delta_bits[s] = u32(((log + 1) << 16) - size)
+        } else if n == -1 || n == 1 {
+            delta_bits[s] = u32((log << 16) - size)
+            delta_state[s] = i32(total - 1)
+            total += 1
+        } else {
+            let max_out = log - highbit(u64(n - 1))
+            let min_state = n << max_out
+            delta_bits[s] = u32((max_out << 16) - min_state)
+            delta_state[s] = i32(total - n)
+            total += n
+        }
+    }
+    new(FseEnc { states, delta_bits, delta_state, log })
+}
+
+fn fse_rle_encoder() -> *FseEnc {
+    new(FseEnc { states: [], delta_bits: [], delta_state: [], log: 0 })
+}
+
+fn fse_init(e: *FseEnc, symbol: i64) -> i64 {
+    if e.log == 0 {
+        return 0
+    }
+    let delta = i64(e.delta_bits[symbol])
+    let nb = (delta + (1 << 15)) >> 16
+    let value = (nb << 16) - delta
+    i64(e.states[(value >> nb) + i64(e.delta_state[symbol])])
+}
+
+fn fse_encode(mut w: BitOut, e: *FseEnc, state: i64, symbol: i64) -> i64 {
+    if e.log == 0 {
+        return 0
+    }
+    let nb = (state + i64(e.delta_bits[symbol])) >> 16
+    add_bits(mut w, u64(state), nb)
+    i64(e.states[(state >> nb) + i64(e.delta_state[symbol])])
+}
+
+fn fse_flush(mut w: BitOut, e: *FseEnc, state: i64) {
+    add_bits(mut w, u64(state), e.log)
+}
+
+fn log2_fixed(x: i64) -> i64 {
+    let h = highbit(u64(x))
+    (h << 8) + ((x << 8) >> h) - 256
+}
+
+fn fse_cost(counts: []i64, nsym: i64, norm: []i32, norm_len: i64, log: i64) -> i64 {
+    var bits = 0
+    for s in 0..nsym {
+        if counts[s] == 0 {
+            continue
+        }
+        if s >= norm_len || norm[s] == 0 {
+            return 1 << 60
+        }
+        let n = if norm[s] < 0 { 1 } else { i64(norm[s]) }
+        bits += counts[s] * ((log << 8) - log2_fixed(n))
+    }
+    bits >> 8
+}

@@ -1,0 +1,298 @@
+import std/hash
+import std/io
+
+pub struct Encoder {
+    sink: fn([]u8) ! io.Error
+    depth: i64
+    lazy: bool
+    skip: i64
+    hist: []u8
+    fill: i64
+    pos: i64
+    next_insert: i64
+    short: *Chain
+    long: *Chain
+    content_size: i64
+    started: bool
+    sum: *hash.Xxh32
+    out: []u8
+    len: i64
+    m_len: i64
+    m_off: i64
+}
+
+fn block_max() -> i64 {
+    1 << 16
+}
+
+fn min(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+pub fn encoder(level: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
+    make_encoder(level, sink, -1)
+}
+
+fn make_encoder(level: i64, sink: fn([]u8) ! io.Error, content_size: i64) -> *Encoder {
+    let l = if level < 1 { 1 } else if level > 12 { 12 } else { level }
+    let span = if content_size >= 0 && content_size < 1 << 30 { if content_size > 0 { content_size } else { 1 } } else { 2 * history() + 2 * block_max() }
+    new(Encoder {
+        sink
+        depth: 1 << (l - 1)
+        lazy: l >= 3
+        skip: if l < 2 { 6 } else { 8 }
+        hist: __make(span)
+        fill: 0
+        pos: 0
+        next_insert: 0
+        short: chain(4)
+        long: chain(8)
+        content_size
+        started: false
+        sum: hash.xxh32_new(0)
+        out: __make(block_max() + block_max() / 255 + 64)
+        len: 0
+        m_len: 0
+        m_off: 0
+    })
+}
+
+struct Chain {
+    head: []i32
+    links: []i32
+    shift: i64
+}
+
+fn chain(width: i64) -> *Chain {
+    new(Chain { head: __make(1 << 16), links: __make(history()), shift: 64 - 8 * width })
+}
+
+fn hash_at(c: *Chain, b: []u8, i: i64) -> i64 {
+    let v = u64(b[i]) | u64(b[i + 1]) << 8 | u64(b[i + 2]) << 16 | u64(b[i + 3]) << 24 | u64(b[i + 4]) << 32 | u64(b[i + 5]) << 40 | u64(b[i + 6]) << 48 | u64(b[i + 7]) << 56
+    i64((v << c.shift) * 0x9E3779B185EBCA87 >> 48)
+}
+
+fn link(c: *Chain, b: []u8, i: i64) {
+    let h = hash_at(c, b, i)
+    c.links[i & 0xFFFF] = c.head[h]
+    c.head[h] = i32(i + 1)
+}
+
+fn insert_to(e: *Encoder, target: i64) {
+    let hist = e.hist
+    let deep = e.depth > 1
+    for i in e.next_insert..target {
+        link(e.short, hist, i)
+        if deep {
+            link(e.long, hist, i)
+        }
+    }
+    if target > e.next_insert {
+        e.next_insert = target
+    }
+}
+
+fn walk(e: *Encoder, c: *Chain, p: i64, most: i64, tries: i64) {
+    let hist = e.hist
+    let links = c.links
+    let floor = if p > 0xFFFF { p - 0xFFFF } else { 0 }
+    var best = e.m_len
+    var cand = i64(c.head[hash_at(c, hist, p)]) - 1
+    var left = tries
+    for left > 0 && cand >= floor && best < most {
+        if hist[cand + best] == hist[p + best] {
+            var n = 0
+            for n < most && hist[cand + n] == hist[p + n] {
+                n += 1
+            }
+            if n > best {
+                best = n
+                e.m_len = n
+                e.m_off = p - cand
+            }
+        }
+        cand = i64(links[cand & 0xFFFF]) - 1
+        left -= 1
+    }
+}
+
+fn find(e: *Encoder, p: i64, match_end: i64) {
+    insert_to(e, p)
+    let most = match_end - p
+    e.m_len = 3
+    e.m_off = 0
+    if e.depth > 1 {
+        walk(e, e.long, p, most, e.depth)
+        walk(e, e.short, p, most, if e.depth > 8 { e.depth / 4 } else { 2 })
+    } else {
+        walk(e, e.short, p, most, e.depth)
+    }
+    if e.m_len < 4 {
+        e.m_len = 0
+    }
+}
+
+fn put(e: *Encoder, v: u8) {
+    e.out[e.len] = v
+    e.len += 1
+}
+
+fn put_length(e: *Encoder, n: i64) {
+    var rest = n - 15
+    for rest >= 255 {
+        put(e, 255)
+        rest -= 255
+    }
+    put(e, u8(rest))
+}
+
+fn sequence(e: *Encoder, anchor: i64, p: i64, off: i64, len: i64) {
+    let ll = p - anchor
+    let ml = if len > 0 { len - 4 } else { 0 }
+    let token = (if ll < 15 { ll } else { 15 }) << 4 | if ml < 15 { ml } else { 15 }
+    put(e, u8(token))
+    if ll >= 15 {
+        put_length(e, ll)
+    }
+    io.copy(e.out[e.len..], e.hist[anchor..p])
+    e.len += ll
+    if len > 0 {
+        put(e, u8(off))
+        put(e, u8(off >> 8))
+        if ml >= 15 {
+            put_length(e, ml)
+        }
+    }
+}
+
+fn compress_block(e: *Encoder, start: i64, end: i64) {
+    e.len = 0
+    let hist = e.hist
+    let match_end = end - 5
+    let limit = end - 12
+    var anchor = start
+    var p = start
+    for p < limit {
+        find(e, p, match_end)
+        var len = e.m_len
+        var off = e.m_off
+        if len == 0 {
+            p += 1 + ((p - anchor) >> e.skip)
+            continue
+        }
+        if e.lazy && p + 1 < limit {
+            find(e, p + 1, match_end)
+            if e.m_len > len + 1 {
+                p += 1
+                len = e.m_len
+                off = e.m_off
+            }
+        }
+        for p > anchor && p - off > 0 && hist[p - 1] == hist[p - 1 - off] {
+            p -= 1
+            len += 1
+        }
+        sequence(e, anchor, p, off, len)
+        p += len
+        anchor = p
+    }
+    sequence(e, anchor, end, 0, 0)
+}
+
+fn put_le32(mut out: []u8, v: i64) {
+    for i in 0..4 {
+        push(mut out, u8(v >> (8 * i)))
+    }
+}
+
+fn start_frame(e: *Encoder, mut out: []u8) {
+    if e.started {
+        return
+    }
+    e.started = true
+    put_le32(mut out, 0x184D2204)
+    let sized = e.content_size >= 0
+    push(mut out, if sized { 0x4C } else { 0x44 })
+    push(mut out, 0x40)
+    if sized {
+        put_le32(mut out, e.content_size)
+        put_le32(mut out, e.content_size >> 32)
+    }
+    push(mut out, u8(hash.xxh32(out[4..], 0) >> 8))
+}
+
+fn emit_block(e: *Encoder, end: i64) ! io.Error {
+    var out: []u8 = []
+    start_frame(e, mut out)
+    let start = e.pos
+    if end - start >= 13 {
+        compress_block(e, start, end)
+    } else {
+        e.len = end - start
+    }
+    e.pos = end
+    let raw = e.len >= end - start
+    let size = if raw { end - start } else { e.len }
+    put_le32(mut out, if raw { size | 1 << 31 } else { size })
+    e.sink(out)?
+    e.sink(if raw { e.hist[start..end] } else { e.out[..size] })?
+}
+
+fn slide(e: *Encoder) {
+    let delta = e.pos - history()
+    io.copy(e.hist, e.hist[delta..e.fill])
+    e.fill -= delta
+    e.pos -= delta
+    e.next_insert = if e.next_insert > delta { e.next_insert - delta } else { 0 }
+    let d = i32(delta)
+    for t in [e.short.head, e.short.links, e.long.head, e.long.links] {
+        for i in 0..t.len {
+            let v = t[i] - d
+            t[i] = if v > 0 { v } else { 0 }
+        }
+    }
+}
+
+pub fn encode(e: *Encoder, data: []u8) ! io.Error {
+    var at = 0
+    for at < data.len {
+        if e.fill == e.hist.len {
+            slide(e)
+        }
+        let n = io.copy(e.hist[e.fill..], data[at..])
+        hash.xxh32_update(e.sum, data[at..at + n])
+        e.fill += n
+        at += n
+        for e.fill - e.pos >= block_max() {
+            emit_block(e, e.pos + block_max())?
+        }
+    }
+}
+
+pub fn flush(e: *Encoder) ! io.Error {
+    for e.pos < e.fill {
+        emit_block(e, min(e.fill, e.pos + block_max()))?
+    }
+}
+
+pub fn finish(e: *Encoder) ! io.Error {
+    flush(e)?
+    var out: []u8 = []
+    start_frame(e, mut out)
+    put_le32(mut out, 0)
+    put_le32(mut out, i64(hash.xxh32_sum(e.sum)))
+    e.sink(out)?
+}
+
+pub fn compress(data: []u8, level: i64) -> []u8 {
+    let c = new(Collector { data: __make(data.len + data.len / 255 + 64), len: 0 })
+    let sink: fn([]u8) ! io.Error = fn(chunk) { collect(c, chunk) }
+    let e = make_encoder(level, sink, data.len)
+    encode(e, data) catch {
+        _ => {}
+    }
+    finish(e) catch {
+        _ => {}
+    }
+    c.data[..c.len]
+}

@@ -1,0 +1,286 @@
+import std/hash
+import std/io
+
+struct Decoder {
+    r: *io.Reader
+    sink: fn([]u8) ! io.Error
+    limit: i64
+    total: i64
+    head: []u8
+    src: []u8
+    hist: []u8
+    pos: i64
+    emitted: i64
+    sum: *hash.Xxh32
+}
+
+fn history() -> i64 {
+    1 << 16
+}
+
+fn fill(d: *Decoder, dst: []u8) ! io.Error {
+    var got = 0
+    for got < dst.len {
+        let n = io.read_some(d.r, dst[got..])?
+        if n == 0 {
+            fail Malformed
+        }
+        got += n
+    }
+}
+
+pub fn decode(r: *io.Reader, sink: fn([]u8) ! io.Error, limit: i64) ! io.Error {
+    let d = new(Decoder {
+        r
+        sink
+        limit
+        total: 0
+        head: io.buffer(32)
+        src: []
+        hist: []
+        pos: 0
+        emitted: 0
+        sum: hash.xxh32_new(0)
+    })
+    var frames = 0
+    for {
+        let got = io.read_some(r, d.head[..4])?
+        if got == 0 {
+            break
+        }
+        fill(d, d.head[got..4])?
+        let magic = io.le32(d.head, 0)
+        if magic == 0x184D2204 {
+            frame(d)?
+        } else if magic & 0xFFFFFFF0 == 0x184D2A50 {
+            skip_frame(d)?
+        } else if magic == 0x184C2102 {
+            fail Unsupported
+        } else {
+            fail Malformed
+        }
+        frames += 1
+    }
+    if frames == 0 {
+        fail Malformed
+    }
+}
+
+fn skip_frame(d: *Decoder) ! io.Error {
+    fill(d, d.head[..4])?
+    var left = io.le32(d.head, 0)
+    let scratch = io.buffer(4096)
+    for left > 0 {
+        let n = if left > scratch.len { scratch.len } else { left }
+        fill(d, scratch[..n])?
+        left -= n
+    }
+}
+
+fn frame(d: *Decoder) ! io.Error {
+    fill(d, d.head[..2])?
+    let flg = i64(d.head[0])
+    let bd = i64(d.head[1])
+    if flg >> 6 != 1 || flg & 2 != 0 || bd & 0x8F != 0 {
+        fail Malformed
+    }
+    let size_id = bd >> 4 & 7
+    if size_id < 4 {
+        fail Malformed
+    }
+    let independent = flg >> 5 & 1 == 1
+    let block_sums = flg >> 4 & 1 == 1
+    let sized = flg >> 3 & 1 == 1
+    let content_sum = flg >> 2 & 1 == 1
+    let dict = flg & 1 == 1
+    var at = 2
+    if sized {
+        at += 8
+    }
+    if dict {
+        at += 4
+    }
+    fill(d, d.head[2..at + 1])?
+    if i64(hash.xxh32(d.head[..at], 0) >> 8 & 0xFF) != i64(d.head[at]) {
+        fail Malformed
+    }
+    if dict {
+        fail Unsupported
+    }
+    var expected = -1
+    if sized {
+        expected = io.le64(d.head, 2)
+        if expected < 0 || expected > d.limit - d.total {
+            fail TooLarge
+        }
+    }
+    let block_max = 1 << (8 + 2 * size_id)
+    if d.src.len < block_max + 4 {
+        d.src = io.buffer(block_max + 4)
+    }
+    if d.hist.len < history() + 2 * block_max {
+        d.hist = io.buffer(history() + 2 * block_max)
+    }
+    d.pos = 0
+    d.emitted = 0
+    if content_sum {
+        d.sum = hash.xxh32_new(0)
+    }
+    let start_total = d.total
+    for {
+        fill(d, d.head[..4])?
+        let word = io.le32(d.head, 0)
+        if word == 0 {
+            break
+        }
+        let raw = word >> 31 == 1
+        let size = word & 0x7FFFFFFF
+        if size > block_max {
+            fail Malformed
+        }
+        let stored = if block_sums { size + 4 } else { size }
+        if d.pos + block_max + 4 > d.hist.len {
+            let keep = if d.pos < history() { d.pos } else { history() }
+            io.copy(d.hist, d.hist[d.pos - keep..d.pos])
+            d.pos = keep
+            d.emitted = keep
+        }
+        let data = if raw { d.hist[d.pos..d.pos + stored] } else { d.src[..stored] }
+        fill(d, data)?
+        if block_sums && i64(hash.xxh32(data[..size], 0)) != io.le32(data, size) {
+            fail Malformed
+        }
+        if raw {
+            d.pos += size
+        } else {
+            let lowest = if independent { d.pos } else { 0 }
+            d.pos = decode_block(d.src, size, d.hist, d.pos, d.pos + block_max, lowest)?
+        }
+        emit(d, content_sum)?
+    }
+    if content_sum {
+        fill(d, d.head[..4])?
+        if i64(hash.xxh32_sum(d.sum)) != io.le32(d.head, 0) {
+            fail Malformed
+        }
+    }
+    if sized && d.total - start_total != expected {
+        fail Malformed
+    }
+}
+
+fn emit(d: *Decoder, checksum: bool) ! io.Error {
+    let chunk = d.hist[d.emitted..d.pos]
+    d.emitted = d.pos
+    if chunk.len == 0 {
+        return
+    }
+    d.total += chunk.len
+    if d.total > d.limit {
+        fail TooLarge
+    }
+    if checksum {
+        hash.xxh32_update(d.sum, chunk)
+    }
+    d.sink(chunk)?
+}
+
+fn extend(src: []u8, n: i64, mut ip: i64, base: i64) -> i64 ! io.Error {
+    var v = base
+    if base == 15 {
+        for {
+            if ip >= n {
+                fail Malformed
+            }
+            let b = i64(src[ip])
+            ip += 1
+            v += b
+            if b != 255 {
+                break
+            }
+        }
+    }
+    v
+}
+
+fn decode_block(src: []u8, n: i64, out: []u8, start: i64, end: i64, lowest: i64) -> i64 ! io.Error {
+    var ip = 0
+    var op = start
+    for {
+        if ip >= n {
+            fail Malformed
+        }
+        let token = i64(src[ip])
+        ip += 1
+        let ll = extend(src, n, mut ip, token >> 4)?
+        if ip + ll > n || op + ll > end {
+            fail Malformed
+        }
+        io.copy(out[op..op + ll], src[ip..ip + ll])
+        ip += ll
+        op += ll
+        if ip == n {
+            return op
+        }
+        if ip + 2 > n {
+            fail Malformed
+        }
+        let offset = io.le16(src, ip)
+        ip += 2
+        let ml = extend(src, n, mut ip, token & 15)? + 4
+        if offset == 0 || offset > op - lowest || op + ml > end {
+            fail Malformed
+        }
+        copy_match(out, op, offset, ml)
+        op += ml
+    }
+}
+
+fn copy_match(out: []u8, op: i64, offset: i64, n: i64) {
+    let from = op - offset
+    if offset >= n {
+        io.copy(out[op..op + n], out[from..from + n])
+        return
+    }
+    if offset == 1 {
+        let v = out[from]
+        for i in op..op + n {
+            out[i] = v
+        }
+        return
+    }
+    var done = 0
+    for done < n {
+        var k = offset + done
+        if k > n - done {
+            k = n - done
+        }
+        io.copy(out[op + done..op + done + k], out[from..from + k])
+        done += k
+    }
+}
+
+struct Collector {
+    data: []u8
+    len: i64
+}
+
+fn collect(c: *Collector, chunk: []u8) {
+    let need = c.len + chunk.len
+    if need > c.data.len {
+        let size = if c.data.len * 2 > need { c.data.len * 2 } else { need }
+        let grown: []u8 = __make(size)
+        io.copy(grown, c.data[..c.len])
+        c.data = grown
+    }
+    io.copy(c.data[c.len..], chunk)
+    c.len = need
+}
+
+pub fn decompress(data: []u8, limit: i64) -> []u8 ! io.Error {
+    let hint = data.len * 3 + 64
+    let c = new(Collector { data: __make(if hint < limit { hint } else if limit > 0 { limit } else { 0 }), len: 0 })
+    let sink: fn([]u8) ! io.Error = fn(chunk) { collect(c, chunk) }
+    decode(io.bytes_reader(data), sink, limit)?
+    c.data[..c.len]
+}
