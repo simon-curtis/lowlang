@@ -1,0 +1,271 @@
+import std/io
+
+struct Segment {
+    data: []u8
+    offset: i64
+    filled: i64
+}
+
+struct State {
+    lock: chan[bool]
+    segments: []*Segment
+    tail: *Segment?
+    consumed: i64
+    examined: i64
+    committed: i64
+    written: i64
+    writer_done: bool
+    reader_done: bool
+    read_canceled: bool
+    flush_canceled: bool
+    failure: io.Error?
+    reader_wake: chan[bool]
+    writer_wake: chan[bool]
+    pause: i64
+    resume: i64
+    segment_size: i64
+}
+
+pub struct Options {
+    pub pause: i64 = 65536
+    pub resume: i64 = 32768
+    pub segment_size: i64 = 4096
+}
+
+pub struct Reader {
+    state: *State
+}
+
+pub struct Writer {
+    state: *State
+}
+
+pub struct Pipe {
+    pub reader: Reader
+    pub writer: Writer
+}
+
+pub struct Sequence {
+    segments: []*Segment
+    pub start: i64
+    pub end: i64
+}
+
+pub struct ReadResult {
+    pub buffer: Sequence
+    pub completed: bool
+    pub canceled: bool
+}
+
+pub struct FlushResult {
+    pub completed: bool
+    pub canceled: bool
+}
+
+pub fn pipe(options: Options) -> Pipe {
+    let s = new(State {
+        lock: chan[bool](1)
+        segments: []
+        tail: none
+        consumed: 0
+        examined: 0
+        committed: 0
+        written: 0
+        writer_done: false
+        reader_done: false
+        read_canceled: false
+        flush_canceled: false
+        failure: none
+        reader_wake: chan[bool](1)
+        writer_wake: chan[bool](1)
+        pause: options.pause
+        resume: options.resume
+        segment_size: options.segment_size
+    })
+    Pipe { reader: Reader { state: s }, writer: Writer { state: s } }
+}
+
+fn lock(s: *State) {
+    s.lock <- true
+}
+
+fn unlock(s: *State) {
+    <-s.lock
+}
+
+fn signal(c: chan[bool]) {
+    select {
+        c <- true => {}
+        else => {}
+    }
+}
+
+fn sequence(s: *State, start: i64, end: i64) -> Sequence {
+    var segments: []*Segment = []
+    for seg in s.segments {
+        push(mut segments, seg)
+    }
+    Sequence { segments, start, end }
+}
+
+pub fn get_memory(w: Writer, hint: i64) -> []u8 {
+    let s = w.state
+    let want = if hint < 1 { 1 } else { hint }
+    match s.tail {
+        some(tail) => {
+            if tail.data.len - tail.filled >= want {
+                return tail.data[tail.filled..]
+            }
+        }
+        none => {}
+    }
+    let size = if want > s.segment_size { want } else { s.segment_size }
+    let seg = new(Segment { data: __make(size), offset: s.written, filled: 0 })
+    lock(s)
+    push(mut s.segments, seg)
+    unlock(s)
+    s.tail = seg
+    seg.data
+}
+
+pub fn advance(w: Writer, n: i64) {
+    let s = w.state
+    match s.tail {
+        some(tail) => {
+            tail.filled += n
+            s.written += n
+        }
+        none => {}
+    }
+}
+
+pub fn write(w: Writer, data: []u8) {
+    var rest = data
+    for rest.len > 0 {
+        let memory = get_memory(w, 1)
+        let n = __memmove(memory, rest)
+        advance(w, n)
+        rest = rest[n..]
+    }
+}
+
+pub fn flush(w: Writer) -> FlushResult {
+    let s = w.state
+    lock(s)
+    s.committed = s.written
+    signal(s.reader_wake)
+    for !s.reader_done && !s.flush_canceled && s.committed - s.consumed >= s.pause {
+        unlock(s)
+        <-s.writer_wake
+        lock(s)
+    }
+    let result = FlushResult { completed: s.reader_done, canceled: s.flush_canceled }
+    s.flush_canceled = false
+    unlock(s)
+    result
+}
+
+pub fn write_and_flush(w: Writer, data: []u8) -> FlushResult {
+    write(w, data)
+    flush(w)
+}
+
+pub fn complete_writer(w: Writer) {
+    let s = w.state
+    lock(s)
+    s.committed = s.written
+    s.writer_done = true
+    signal(s.reader_wake)
+    unlock(s)
+}
+
+pub fn fail_writer(w: Writer, e: io.Error) {
+    let s = w.state
+    lock(s)
+    s.failure = e
+    s.writer_done = true
+    signal(s.reader_wake)
+    unlock(s)
+}
+
+pub fn cancel_pending_flush(w: Writer) {
+    let s = w.state
+    lock(s)
+    s.flush_canceled = true
+    signal(s.writer_wake)
+    unlock(s)
+}
+
+pub fn read(r: Reader) -> ReadResult ! io.Error {
+    let s = r.state
+    lock(s)
+    for s.committed <= s.examined && !s.writer_done && !s.read_canceled {
+        unlock(s)
+        <-s.reader_wake
+        lock(s)
+    }
+    let canceled = s.read_canceled
+    s.read_canceled = false
+    let result = ReadResult { buffer: sequence(s, s.consumed, s.committed), completed: s.writer_done, canceled }
+    let failure = s.failure
+    unlock(s)
+    match failure {
+        some(e) => {
+            if result.buffer.end == result.buffer.start {
+                fail e
+            }
+        }
+        none => {}
+    }
+    result
+}
+
+pub fn try_read(r: Reader) -> ReadResult? {
+    let s = r.state
+    lock(s)
+    var out: ReadResult? = none
+    if s.committed > s.examined || s.writer_done {
+        out = ReadResult { buffer: sequence(s, s.consumed, s.committed), completed: s.writer_done, canceled: false }
+    }
+    unlock(s)
+    out
+}
+
+pub fn advance_to(r: Reader, consumed: i64, examined: i64) {
+    let s = r.state
+    lock(s)
+    let keep_from = if consumed < s.consumed { s.consumed } else { consumed }
+    s.consumed = if keep_from > s.committed { s.committed } else { keep_from }
+    s.examined = if examined < s.consumed { s.consumed } else { examined }
+    var first = 0
+    for first < s.segments.len - 1 && s.segments[first].offset + s.segments[first].filled <= s.consumed {
+        first += 1
+    }
+    if first > 0 {
+        s.segments = s.segments[first..]
+    }
+    if s.committed - s.consumed < s.resume {
+        signal(s.writer_wake)
+    }
+    unlock(s)
+}
+
+pub fn advance_to_end(r: Reader, result: ReadResult) {
+    advance_to(r, result.buffer.end, result.buffer.end)
+}
+
+pub fn complete_reader(r: Reader) {
+    let s = r.state
+    lock(s)
+    s.reader_done = true
+    signal(s.writer_wake)
+    unlock(s)
+}
+
+pub fn cancel_pending_read(r: Reader) {
+    let s = r.state
+    lock(s)
+    s.read_canceled = true
+    signal(s.reader_wake)
+    unlock(s)
+}
