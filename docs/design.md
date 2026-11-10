@@ -291,10 +291,37 @@ Mechanism:
 
 ## Roadmap
 
-1. Slices, strings with length, maps.
-2. Optionals.
-3. Generics.
-4. Pointer maps from the register allocator, for precise garbage collection.
-5. Green-thread scheduler, channels, `select`.
-6. Own assembler and linker replacing `as` and `ld`.
-7. Further targets: linux/arm64, darwin, windows.
+1. Numeric types `u8`, `u16`, `u32`, `i32`, `f32` and `f64`; bitwise operators and shifts; `sqrt`, `floor` and `exp`.
+2. Slices; byte-level strings with length, UTF-8 iteration, a string builder and number formatting; maps.
+3. Optionals.
+4. Modules and visibility.
+5. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
+6. Embedded data: Unicode tables, SPIR-V and a fallback font.
+7. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
+8. C interop:
+   - `extern fn` declarations.
+   - System V ABI thunks: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` and `xmm0` to `xmm7`, struct classification, 16-byte stack alignment.
+   - C struct layout with natural alignment, alongside the one-word-per-scalar layout.
+   - A nullable raw pointer type separate from `*T`.
+   - C strings.
+   - Unmanaged pointer-plus-length views over mmap'd and GPU-mapped memory.
+   - Explicit release of file descriptors and mappings.
+   - The garbage collector never frees memory held only by C.
+9. Function values, and C-callable function pointers for callbacks.
+10. Generics, with type erasure or dynamic dispatch for custom elements and views.
+11. Green-thread scheduler, channels, `select`:
+    - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
+    - C calls run on a large system stack rather than the green-thread stack.
+    - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
+12. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+13. GPU UI library modelled on Zed's GPUI, Linux first:
+    1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
+    2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
+    3. Text: font discovery, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation.
+    4. Flexbox layout (a Taffy subset); an element tree with `request_layout`, `prepaint` and `paint` phases; styles with partial overrides for hover and active states.
+    5. Input: libxkbcommon keyboard, key repeat, hitboxes, mouse dispatch, focus and tab stops, actions and keymaps.
+    6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
+    7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
+    8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
+14. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+15. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
