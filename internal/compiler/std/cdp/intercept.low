@@ -1,0 +1,155 @@
+import std/json
+
+pub enum Verdict {
+    Continue
+    Fail
+}
+
+pub struct Request {
+    pub url: str
+    pub method: str
+    pub resource: str
+}
+
+pub struct Handlers {
+    pub request: fn(Request) -> Verdict
+    pub response: fn(str, i64)
+    pub failure: fn(str, str)
+}
+
+pub struct Page {
+    pub browser: *Browser
+    pub context: str
+    pub target: str
+    pub session: str
+}
+
+struct Dispatch {
+    browser: *Browser
+    context: str
+    target: str
+    handlers: Handlers
+    ready: chan[str]
+    urls: [str: str]
+}
+
+pub fn open_page(b: *Browser, handlers: Handlers) -> Page ! Error {
+    let c = b.connection
+    let created = call(c, "", "Target.createBrowserContext", [flag("disposeOnDetach", true)])?
+    let context = field_text(created, "browserContextId")
+    call(c, "", "Browser.setDownloadBehavior", [text("behavior", "deny"), text("browserContextId", context)])?
+    let d = new(Dispatch { browser: b, context, target: "", handlers, ready: chan[str](1), urls: [:] })
+    spawn dispatch(d)
+    call(c, "", "Target.setAutoAttach", attach_options())?
+    let target = call(c, "", "Target.createTarget", [text("url", "about:blank"), text("browserContextId", context)])?
+    let session = select {
+        s = <-d.ready => s ?? ""
+        after(10000) => ""
+    }
+    if session.len == 0 {
+        fail Timeout
+    }
+    Page { browser: b, context, target: field_text(target, "targetId"), session }
+}
+
+pub fn navigate(p: Page, url: str, referrer: str) ! Error {
+    var params = [text("url", url)]
+    if referrer.len > 0 {
+        push(mut params, text("referrer", referrer))
+    }
+    let result = call(p.browser.connection, p.session, "Page.navigate", params)?
+    let failed = field_text(result, "errorText")
+    if failed.len > 0 {
+        fail Protocol(failed)
+    }
+}
+
+fn attach_options() -> []json.Member {
+    [flag("autoAttach", true), flag("waitForDebuggerOnStart", true), flag("flatten", true)]
+}
+
+fn dispatch(d: *Dispatch) {
+    for e in events(d.browser.connection) {
+        handle(d, e)
+    }
+}
+
+fn handle(d: *Dispatch, e: Event) {
+    if e.method == "Target.attachedToTarget" {
+        let info = field(e.params, "targetInfo")
+        let first = d.target.len == 0 && field_text(info, "type") == "page" && field_text(info, "browserContextId") == d.context
+        if first {
+            d.target = field_text(info, "targetId")
+        }
+        spawn attached(d, e.params, first)
+    } else if e.method == "Fetch.requestPaused" {
+        spawn paused(d, e.session, e.params)
+    } else if e.method == "Network.requestWillBeSent" {
+        d.urls["{e.session}/{field_text(e.params, "requestId")}"] = field_text(field(e.params, "request"), "url")
+    } else if e.method == "Network.responseReceived" {
+        let r = field(e.params, "response")
+        d.handlers.response(field_text(r, "url"), field_int(r, "status"))
+    } else if e.method == "Network.loadingFailed" {
+        let key = "{e.session}/{field_text(e.params, "requestId")}"
+        d.handlers.failure(d.urls[key] ?? "", field_text(e.params, "errorText"))
+    }
+}
+
+fn attached(d: *Dispatch, params: json.Value, first: bool) {
+    let c = d.browser.connection
+    let session = field_text(params, "sessionId")
+    let info = field(params, "targetInfo")
+    let kind = field_text(info, "type")
+    let id = field_text(info, "targetId")
+    let ours = field_text(info, "browserContextId") == d.context
+    if !ours {
+        attempt(c, session, "Runtime.runIfWaitingForDebugger", [])
+        return
+    }
+    if kind == "page" && !first {
+        attempt(c, "", "Target.closeTarget", [text("targetId", id)])
+        return
+    }
+    prepare(c, session, kind == "page") catch {
+        _ => {}
+    }
+    attempt(c, session, "Runtime.runIfWaitingForDebugger", [])
+    if first {
+        d.ready <- session
+    }
+}
+
+fn prepare(c: *Connection, session: str, page: bool) ! Error {
+    call(c, session, "Fetch.enable", [list("patterns", [json.Value.Object([text("urlPattern", "*")])])])?
+    call(c, session, "Network.enable", [])?
+    if page {
+        call(c, session, "Network.setBypassServiceWorker", [flag("bypass", true)])?
+    }
+    call(c, session, "Target.setAutoAttach", attach_options())?
+}
+
+fn paused(d: *Dispatch, session: str, params: json.Value) {
+    let request = field(params, "request")
+    let r = Request { url: field_text(request, "url"), method: field_text(request, "method"), resource: field_text(params, "resourceType") }
+    let id = field_text(params, "requestId")
+    settle(d.browser.connection, session, id, d.handlers.request(r)) catch {
+        _ => {}
+    }
+}
+
+fn settle(c: *Connection, session: str, id: str, v: Verdict) ! Error {
+    match v {
+        Continue => {
+            call(c, session, "Fetch.continueRequest", [text("requestId", id)])?
+        }
+        Fail => {
+            call(c, session, "Fetch.failRequest", [text("requestId", id), text("errorReason", "Failed")])?
+        }
+    }
+}
+
+fn attempt(c: *Connection, session: str, method: str, params: []json.Member) {
+    call(c, session, method, params) catch {
+        _ => json.Value.Null
+    }
+}

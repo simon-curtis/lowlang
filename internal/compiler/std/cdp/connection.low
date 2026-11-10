@@ -1,0 +1,189 @@
+import std/http/websocket
+import std/io
+import std/json
+
+pub enum Error {
+    Launch(cause: io.Error)
+    Protocol(message: str)
+    Closed
+    Timeout
+}
+
+pub struct Event {
+    pub method: str
+    pub session: str
+    pub params: json.Value
+}
+
+pub struct Connection {
+    socket: *websocket.Socket
+    writing: chan[bool]
+    lock: chan[bool]
+    next: i64
+    waiting: [i64: chan[Reply]]
+    events: chan[Event]
+    closed: bool
+}
+
+struct Reply {
+    result: json.Value
+    error: str
+}
+
+pub fn text(name: str, value: str) -> json.Member {
+    json.Member { name, value: json.Value.Str(value) }
+}
+
+pub fn integer(name: str, value: i64) -> json.Member {
+    json.Member { name, value: json.Value.Int(value) }
+}
+
+pub fn flag(name: str, value: bool) -> json.Member {
+    json.Member { name, value: json.Value.Bool(value) }
+}
+
+pub fn object(name: str, members: []json.Member) -> json.Member {
+    json.Member { name, value: json.Value.Object(members) }
+}
+
+pub fn list(name: str, items: []json.Value) -> json.Member {
+    json.Member { name, value: json.Value.Array(items) }
+}
+
+pub fn field_text(v: json.Value, name: str) -> str {
+    match json.get(v, name) {
+        some(found) => match found {
+            Str(s) => s
+            _ => ""
+        }
+        none => ""
+    }
+}
+
+pub fn field_int(v: json.Value, name: str) -> i64 {
+    match json.get(v, name) {
+        some(found) => match found {
+            Int(n) => n
+            Float(x) => i64(x)
+            _ => 0
+        }
+        none => 0
+    }
+}
+
+pub fn field(v: json.Value, name: str) -> json.Value {
+    json.get(v, name) ?? json.Value.Null
+}
+
+fn connect(url: str) -> *Connection ! io.Error {
+    let socket = websocket.dial(url)?
+    let c = new(Connection { socket, writing: chan[bool](1), lock: chan[bool](1), next: 1, waiting: [:], events: chan[Event](1024), closed: false })
+    spawn pump(c)
+    c
+}
+
+fn pump(c: *Connection) {
+    for {
+        let m = websocket.receive(c.socket) catch {
+            _ => break
+        }
+        let v = json.parse(m.data) catch {
+            _ => continue
+        }
+        route(c, v)
+    }
+    shut(c)
+}
+
+fn route(c: *Connection, v: json.Value) {
+    let id = field_int(v, "id")
+    if id == 0 {
+        c.events <- Event { method: field_text(v, "method"), session: field_text(v, "sessionId"), params: field(v, "params") }
+        return
+    }
+    c.lock <- true
+    let waiter = c.waiting[id]
+    delete(mut c.waiting, id)
+    <-c.lock
+    match waiter {
+        some(w) => {
+            w <- Reply { result: field(v, "result"), error: field_text(field(v, "error"), "message") }
+        }
+        none => {}
+    }
+}
+
+fn shut(c: *Connection) {
+    c.lock <- true
+    c.closed = true
+    let pending = c.waiting
+    c.waiting = [:]
+    <-c.lock
+    for _, w in pending {
+        close(w)
+    }
+    close(c.events)
+}
+
+pub fn events(c: *Connection) -> chan[Event] {
+    c.events
+}
+
+pub fn call(c: *Connection, session: str, method: str, params: []json.Member) -> json.Value ! Error {
+    let w = chan[Reply](1)
+    c.lock <- true
+    if c.closed {
+        <-c.lock
+        fail Closed
+    }
+    let id = c.next
+    c.next += 1
+    c.waiting[id] = w
+    <-c.lock
+    var members = [integer("id", id), text("method", method), object("params", params)]
+    if session.len > 0 {
+        push(mut members, text("sessionId", session))
+    }
+    let message = json.stringify(json.Value.Object(members), 0)
+    c.writing <- true
+    let sent = send(c, message)
+    <-c.writing
+    if !sent {
+        fail Closed
+    }
+    let reply = select {
+        r = <-w => r
+        after(30000) => {
+            forget(c, id)
+            fail Timeout
+        }
+    }
+    match reply {
+        some(r) => {
+            if r.error.len > 0 {
+                fail Protocol(r.error)
+            }
+            r.result
+        }
+        none => fail Closed
+    }
+}
+
+fn send(c: *Connection, message: str) -> bool {
+    websocket.send_text(c.socket, message) catch {
+        _ => return false
+    }
+    true
+}
+
+fn forget(c: *Connection, id: i64) {
+    c.lock <- true
+    delete(mut c.waiting, id)
+    <-c.lock
+}
+
+fn disconnect(c: *Connection) {
+    websocket.close(c.socket, 1000) catch {
+        _ => {}
+    }
+}
