@@ -1735,6 +1735,8 @@ func (c *Checker) selectorCall(e *ast.Call, sel *ast.Selector, want *types.Type)
 	case g != nil:
 		enum, v, found := c.genericEnum(g, sel.Name, e.Args, want, sel.Pos)
 		c.constructChecked(e, enum, v, found)
+	case isIdent && c.isModule(id.Name) && c.generatesRegex(id.Name, sel.Name):
+		c.generatedRegex(e)
 	case isIdent && c.isModule(id.Name):
 		c.callFunc(e, c.importedFunc(id.Name, sel.Name, sel.Pos), want)
 	case isIdent && c.find(id.Name) == nil:

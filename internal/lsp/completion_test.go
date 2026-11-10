@@ -77,6 +77,17 @@ func TestCompletionModuleMembers(t *testing.T) {
 	expect(t, variants, []string{"Square", "Dot"}, []string{"circle"})
 }
 
+func TestCompletionGeneratedRegex(t *testing.T) {
+	c := start(t)
+	f := load(t, "std_regex_api.low")
+	c.open(f, f.src)
+	items := c.completeTyping(f, "fn main() {", "    regex.")
+	expect(t, items, []string{"generated", "compile", "Regex"}, []string{"machine"})
+	if got := items["generated"].Detail; got != "fn generated(pattern: str) -> regex.Regex" {
+		t.Errorf("generated detail = %q", got)
+	}
+}
+
 func TestCompletionFields(t *testing.T) {
 	c := start(t)
 	f := load(t, "structs.low")

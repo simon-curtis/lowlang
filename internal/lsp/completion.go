@@ -8,6 +8,7 @@ import (
 	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
 	"lowlang/internal/lexer"
+	"lowlang/internal/regex"
 	"lowlang/internal/types"
 )
 
@@ -168,6 +169,9 @@ func (c *cursor) moduleMembers(path string, rest []string) {
 	}
 	for _, f := range c.files(path) {
 		c.declarations(f, true)
+	}
+	if path == regex.Module {
+		c.add(regex.Generator, completionFunction, fmt.Sprintf("fn %s(pattern: str) -> regex.Regex", regex.Generator))
 	}
 }
 
