@@ -1738,7 +1738,36 @@ func (c *Checker) method(e *ast.Call, sel *ast.Selector, want *types.Type) {
 	e.Fn = &ast.Ident{Name: sel.Name, Pos: sel.Pos}
 	e.Args = append([]ast.Expr{receiver}, e.Args...)
 	e.Prepended = true
+	if target := c.receiverFunc(t, sel.Name); target != nil {
+		if len(target.Params) > 0 && target.Params[0].Mut {
+			prependMut(e)
+		}
+		c.callFunc(e, target, want)
+		return
+	}
 	c.call(e, want)
+}
+
+func (c *Checker) receiverFunc(t *types.Type, name string) *ast.Func {
+	named := deref(t)
+	if named.Origin != nil {
+		named = named.Origin
+	}
+	if named.Module == c.file.Module || c.callable(name) {
+		return nil
+	}
+	fn := c.scope(named.Module).funcs[name]
+	if fn == nil || !fn.Pub {
+		return nil
+	}
+	return fn
+}
+
+func (c *Checker) callable(name string) bool {
+	_, local := c.local().funcs[name]
+	_, bound := c.bound[name]
+	_, builtin := c.builtin[name]
+	return local || bound || builtin || builtins[name] || c.find(name) != nil
 }
 
 func prependMut(e *ast.Call) {

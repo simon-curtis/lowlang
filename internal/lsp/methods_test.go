@@ -81,3 +81,32 @@ func TestMethodSignatureAndNavigation(t *testing.T) {
 		t.Errorf("definition of norm = %+v", loc.Range.Start)
 	}
 }
+
+const importedMethodsSource = `import std/http
+
+fn host_of(u: http.Url) -> str {
+    u.host
+}
+
+fn show(u: http.Url) -> str {
+    u.authority()
+}
+
+fn main() {
+    print(show(http.Url { scheme: "http", host: "a", port: 80, target: "/" }))
+}
+`
+
+func TestImportedMethods(t *testing.T) {
+	c := start(t)
+	f := scratch(t, "imported.low", importedMethodsSource)
+	if got := c.open(f, f.src); len(got) != 0 {
+		t.Fatalf("diagnostics = %+v", got)
+	}
+	items := c.completeTyping(f, "fn show(u: http.Url) -> str {", "    u.")
+	expect(t, items, []string{"host", "authority", "host_of"}, []string{"default_port", "parse_url"})
+	help := c.signature(f, "fn show(u: http.Url) -> str {", "    u.authority(")
+	if help == nil {
+		t.Errorf("u.authority( help = %+v", help)
+	}
+}

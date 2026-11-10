@@ -178,20 +178,47 @@ func takes(fn *ast.Func, t *types.Type) bool {
 	return len(fn.ParamTypes) > 0 && identical(fn.ParamTypes[0], t)
 }
 
-func (c *cursor) methods(t *types.Type) {
-	for _, f := range c.files(c.file.Module) {
+func receiverModule(t *types.Type) string {
+	if t.Kind == types.PointerKind {
+		t = t.Elem
+	}
+	if t.Origin != nil {
+		t = t.Origin
+	}
+	return t.Module
+}
+
+func (c *cursor) method(t *types.Type, name string) *ast.Func {
+	if fn := c.function(c.file.Module, name, false); fn != nil {
+		return fn
+	}
+	if m := receiverModule(t); m != c.file.Module {
+		return c.function(m, name, true)
+	}
+	return nil
+}
+
+func (c *cursor) moduleMethods(module string, t *types.Type, public bool) {
+	for _, f := range c.files(module) {
 		for _, fn := range f.Funcs {
-			if fn.Template == nil && fn.Closure == nil && takes(fn, t) {
+			if fn.Template == nil && fn.Closure == nil && (fn.Pub || !public) && takes(fn, t) {
 				c.add(fn.Name, completionMethod, signature(fn))
 			}
 		}
 		for _, e := range f.Externs {
 			for _, fn := range e.Funcs {
-				if takes(fn, t) {
+				if (fn.Pub || !public) && takes(fn, t) {
 					c.add(fn.Name, completionMethod, signature(fn))
 				}
 			}
 		}
+	}
+}
+
+func (c *cursor) methods(t *types.Type) {
+	c.moduleMethods(c.file.Module, t, false)
+	if m := receiverModule(t); m != c.file.Module {
+		c.moduleMethods(m, t, true)
 	}
 	for _, l := range c.scope() {
 		if l.Type != nil && l.Type.Kind == types.FuncKind && len(l.Type.Params) > 0 && identical(l.Type.Params[0], t) {
@@ -222,7 +249,7 @@ func (c *cursor) typeOf(segments []segment) *types.Type {
 			t, suffixes, rest = f.Type, next.suffixes, rest[1:]
 			continue
 		}
-		fn := c.function(c.file.Module, next.name, false)
+		fn := c.method(t, next.name)
 		if fn == nil || !takes(fn, t) {
 			return nil
 		}

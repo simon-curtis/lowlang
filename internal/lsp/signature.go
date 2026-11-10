@@ -211,8 +211,12 @@ func (c *cursor) methodShape(src string, paren int) (callShape, int, bool) {
 		shape, ok := valueShape(name, local.Type)
 		return shape, 1, ok
 	}
-	shape, ok := c.funcShape(c.file.Module, name, false)
-	return shape, 1, ok
+	fn := c.method(t, name)
+	if fn == nil {
+		return callShape{}, 0, false
+	}
+	head, params, tail := signatureParts(fn)
+	return callShape{head: head, params: params, tail: tail}, 1, true
 }
 
 func (s callShape) help(commas int) *SignatureHelp {
