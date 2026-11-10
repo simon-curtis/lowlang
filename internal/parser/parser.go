@@ -654,7 +654,7 @@ func (p *Parser) stmt() ast.Stmt {
 	case lexer.Return:
 		p.next()
 		var value ast.Expr
-		if !p.at(lexer.Newline) && !p.at(lexer.RBrace) {
+		if !p.atEnd() {
 			value = p.expr()
 		}
 		return &ast.Return{Value: value, Pos: t.Pos}
@@ -852,7 +852,7 @@ func (p *Parser) selectCase() *ast.SelectCase {
 		c.Kind = ast.SendCase
 	}
 	p.expect(lexer.FatArrow)
-	c.Body = p.armBody()
+	c.Body = p.expr()
 	return c
 }
 
@@ -885,6 +885,8 @@ func (p *Parser) number(t lexer.Token, negative bool, pos lexer.Pos) ast.Expr {
 func (p *Parser) primary() ast.Expr {
 	t := p.tok()
 	switch t.Kind {
+	case lexer.Break, lexer.Continue, lexer.Return, lexer.Fail:
+		return &ast.Block{Stmts: []ast.Stmt{p.stmt()}, Pos: t.Pos}
 	case lexer.Int, lexer.Float:
 		p.next()
 		return p.number(t, false, t.Pos)
@@ -1127,7 +1129,7 @@ func (p *Parser) arms() []*ast.Arm {
 		for !p.at(lexer.RBrace) {
 			pattern := p.pattern()
 			p.expect(lexer.FatArrow)
-			arms = append(arms, &ast.Arm{Pattern: pattern, Body: p.armBody()})
+			arms = append(arms, &ast.Arm{Pattern: pattern, Body: p.expr()})
 			if p.at(lexer.Comma) {
 				p.next()
 			} else if !p.at(lexer.RBrace) {
@@ -1140,12 +1142,12 @@ func (p *Parser) arms() []*ast.Arm {
 	return arms
 }
 
-func (p *Parser) armBody() ast.Expr {
-	switch t := p.tok(); t.Kind {
-	case lexer.Break, lexer.Continue, lexer.Return, lexer.Fail:
-		return &ast.Block{Stmts: []ast.Stmt{p.stmt()}, Pos: t.Pos}
+func (p *Parser) atEnd() bool {
+	switch p.tok().Kind {
+	case lexer.Newline, lexer.RBrace, lexer.RParen, lexer.RBracket, lexer.Comma:
+		return true
 	}
-	return p.expr()
+	return false
 }
 
 func (p *Parser) pattern() *ast.Pattern {

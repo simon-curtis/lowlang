@@ -86,6 +86,7 @@ rows: for row, cells in grid {
 - `for i in a..b` counts from `a` up to but not including `b`; the bounds are integers of one type.
 - `for x in xs` visits each element of a slice, and `for i, x in xs` also binds its index as `i64`.
 - Loop variables are immutable. `continue` moves to the next element.
+- `break`, `continue`, `return` and `fail` are expressions of type never, so they can stand wherever a value is expected: after `??`, in an arm, or as a branch of `if`.
 - A loop can be labelled with `name:` before `for`; `break name` and `continue name` then act on that loop from inside nested loops, running the deferred statements and drops of every block they leave. A label must be used, cannot repeat the label of an enclosing loop, and is not visible inside closures.
 
 ### Numbers
@@ -279,7 +280,7 @@ fn area(s: Shape) -> f64 {
 }
 ```
 
-- `match` must cover every variant, or end with `_`. Arms after `_` and duplicate arms are errors.
+- `match` must cover every variant, or end with `_` or a binding arm. A binding arm is a name starting with a lowercase letter that is not a variant, such as `other => describe(other)`: it matches anything and binds the whole subject. A capitalized name that is not a variant is an error, so a mistyped variant is never taken for a binding. Arms after `_` or a binding arm, and duplicate arms, are errors.
 - An arm that starts with a binary operator tests the subject: `% 3 == 0 => ...` means `subject % 3 == 0`, with the subject on the left and ordinary precedence after it. The subject is evaluated once and arms are tried in order. Such tests work on a subject of any type, including enums (`== Empty`) and the error of a `catch`; a `match` that uses one, or whose subject is not an enum, must end with `_`. Arms are separated by newlines or commas.
 
 ```low
@@ -325,7 +326,7 @@ struct Node {
 
 - `T?` holds either `some(value)` or `none`.
 - A `T` is accepted wherever a `T?` is expected: in an annotated `let`, an assignment, an argument, a field, a return and either branch of an `if` or `match`. `none` and `some(v)` take their type from that expectation.
-- `x ?? fallback` gives the value inside `x`, or evaluates `fallback` when `x` is `none`. The fallback may itself be a `T?`, making the result a `T?`. `??` binds tighter than comparisons and looser than arithmetic, and groups to the right, so `a ?? b ?? 0` tries `a`, then `b`.
+- `x ?? fallback` gives the value inside `x`, or evaluates `fallback` when `x` is `none`. The fallback may itself be a `T?`, making the result a `T?`. The fallback may leave instead, as in `let line = read_line() ?? break`. `??` binds tighter than comparisons and looser than arithmetic, and groups to the right, so `a ?? b ?? 0` tries `a`, then `b`.
 - `match` unwraps an optional with `some(v)` and `none` arms and must cover both.
 - `?` after a type binds to everything before it: `*Node?` is an optional pointer and `[]i64?` an optional slice.
 - An optional is an enum with `none` as tag 0 and `some` as tag 1, so it takes one word more than its value.
@@ -365,7 +366,7 @@ fn main() ! ParseError {
 
 - `fail v` returns the error `v`; `v` is checked against the function's error type, so bare variant names work.
 - Postfix `?` returns the error to the caller, whose error type must be the same enum.
-- `catch { arms }` matches the error exhaustively; `catch value` substitutes a fallback.
+- `catch { arms }` matches the error exhaustively, and a binding arm such as `e => report(e)` receives the whole error; `catch value` substitutes a fallback.
 - `fn f() ! E` fails or returns nothing.
 - A result cannot be discarded, bound or passed on without `?` or `catch`, except by returning it from a function with the same result type.
 - When `main` declares `! E` and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2.

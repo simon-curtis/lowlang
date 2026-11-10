@@ -507,6 +507,7 @@ type Pattern struct {
 	Test     Expr
 	Pos      lexer.Pos
 	Variant  *types.Variant
+	Local    *Local
 }
 
 type Subject struct {

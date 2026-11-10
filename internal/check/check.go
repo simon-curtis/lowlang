@@ -2103,7 +2103,7 @@ func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos lexer.Pos) *
 	wildcard, tested := false, false
 	for _, arm := range arms {
 		if wildcard {
-			c.fail(arm.Pattern.Pos, "unreachable arm after _")
+			c.fail(arm.Pattern.Pos, "unreachable arm; an earlier arm matches everything")
 		}
 		c.pushScope()
 		c.pattern(arm.Pattern, enum)
@@ -2151,6 +2151,13 @@ func (c *Checker) pattern(p *ast.Pattern, enum *types.Type) {
 		c.subjects = c.subjects[:len(c.subjects)-1]
 		return
 	}
+	if binds(p.Name) && (enum.Kind != types.EnumKind || enum.Variant(p.Name) == nil) {
+		if len(p.Bindings) > 0 {
+			c.fail(p.Pos, "%s has no variant %s", enum, p.Name)
+		}
+		p.Local = c.declare(p.Name, enum, false)
+		return
+	}
 	if p.Name != "_" && enum.Kind != types.EnumKind {
 		c.fail(p.Pos, "an arm matching %s starts with an operator, such as == or <", enum)
 	}
@@ -2170,6 +2177,10 @@ func (c *Checker) pattern(p *ast.Pattern, enum *types.Type) {
 			b.Local = c.declare(b.Name, fields[i], false)
 		}
 	}
+}
+
+func binds(name string) bool {
+	return name[0] >= 'a' && name[0] <= 'z'
 }
 
 func (c *Checker) errorResult(e ast.Expr, keyword string, pos lexer.Pos) *types.Type {

@@ -1037,6 +1037,9 @@ func (b *builder) armMatches(p *ast.Pattern, subject []*Value) *Value {
 }
 
 func (b *builder) bindPattern(p *ast.Pattern, subject []*Value) {
+	if p.Local != nil {
+		b.bind(p.Local, subject[:p.Local.Type.Size()])
+	}
 	for i, binding := range p.Bindings {
 		if binding.Local == nil {
 			continue
