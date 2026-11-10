@@ -55,9 +55,9 @@ func (c *cursor) add(label string, kind int, detail string) {
 }
 
 func (c *cursor) complete() []CompletionItem {
-	chain, member := c.receiver()
+	segments, member := c.receiver()
 	if member {
-		c.members(chain)
+		c.members(segments)
 		return c.items
 	}
 	c.locals()
@@ -67,7 +67,7 @@ func (c *cursor) complete() []CompletionItem {
 	return c.items
 }
 
-func (c *cursor) receiver() ([]string, bool) {
+func (c *cursor) receiver() ([]segment, bool) {
 	src := c.text.line(c.line)
 	at := min(c.col, len(src))
 	for at > 0 && isWord(src[at-1]) {
@@ -76,7 +76,8 @@ func (c *cursor) receiver() ([]string, bool) {
 	if at == 0 || src[at-1] != '.' {
 		return nil, false
 	}
-	return chainBefore(src, at-1), true
+	segments, _ := segmentsBefore(src, at-1)
+	return segments, true
 }
 
 func chainBefore(src string, end int) []string {
@@ -110,9 +111,17 @@ func (c *cursor) files(module string) []*ast.File {
 	return files
 }
 
-func (c *cursor) members(chain []string) {
-	if c.file == nil || len(chain) == 0 {
+func (c *cursor) members(segments []segment) {
+	if c.file == nil || len(segments) == 0 {
 		return
+	}
+	chain := make([]string, len(segments))
+	for i, s := range segments {
+		if !s.plain() {
+			c.fields(c.typeOf(segments), nil)
+			return
+		}
+		chain[i] = s.name
 	}
 	first, rest := chain[0], chain[1:]
 	if local := c.local(first); local != nil {

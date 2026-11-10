@@ -92,6 +92,41 @@ func TestCompletionFields(t *testing.T) {
 	expect(t, partial, []string{"x", "y"}, nil)
 }
 
+func TestCompletionAfterCallsAndIndexing(t *testing.T) {
+	c := start(t)
+	f := load(t, "structs.low")
+	c.open(f, f.src)
+	for _, typed := range []string{
+		"    origin().",
+		"    corner(r).",
+		"    add(origin(), Point { x: 1, y: (2) }).",
+		"    r.max.",
+		"    corner(r).x",
+	} {
+		items := c.completeTyping(f, "print(r.label)", typed)
+		expect(t, items, []string{"x", "y"}, []string{"label", "print"})
+	}
+	shapes := scratch(t, "points.low", "struct Point {\n    x: i64\n    y: i64\n}\n\nenum Problem {\n    Bad\n}\n\nfn find(n: i64) -> Point ! Problem {\n    if n < 0 {\n        fail Bad\n    }\n    Point { x: n, y: n }\n}\n\nfn main() ! Problem {\n    let pts = [Point { x: 1, y: 2 }]\n    let pick = fn(i: i64) -> Point { pts[i] }\n    print(pts.len)\n}\n")
+	c.open(shapes, shapes.src)
+	for _, typed := range []string{"    pts[0].", "    find(1)?.", "    pick(0)."} {
+		items := c.completeTyping(shapes, "print(pts.len)", typed)
+		expect(t, items, []string{"x", "y"}, []string{"print"})
+	}
+	if items := c.completeTyping(shapes, "print(pts.len)", "    find(1)."); len(items) != 0 {
+		t.Errorf("fields offered on an unhandled result: %+v", items)
+	}
+}
+
+func TestCompletionAfterModuleCall(t *testing.T) {
+	c := start(t)
+	f := load(t, "modules", "main.low")
+	c.open(f, f.src)
+	items := c.completeTyping(f, "fn main() {", "    geometry.shift(p).")
+	expect(t, items, []string{"x", "y"}, []string{"circle"})
+	private := c.completeTyping(f, "fn main() {", "    geometry.circle(2).")
+	expect(t, private, nil, []string{"radius"})
+}
+
 func TestCompletionScope(t *testing.T) {
 	c := start(t)
 	f := load(t, "structs.low")

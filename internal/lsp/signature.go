@@ -2,7 +2,6 @@ package lsp
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 
 	"lowlang/internal/types"
@@ -99,19 +98,12 @@ func calleeChain(src string, paren int) []string {
 }
 
 func (c *cursor) funcShape(module, name string, public bool) (callShape, bool) {
-	for _, f := range c.files(module) {
-		candidates := slices.Clone(f.Funcs)
-		for _, e := range f.Externs {
-			candidates = append(candidates, e.Funcs...)
-		}
-		for _, fn := range candidates {
-			if fn.Name == name && fn.Template == nil && fn.Closure == nil && (fn.Pub || !public) {
-				head, params, tail := signatureParts(fn)
-				return callShape{head: head, params: params, tail: tail}, true
-			}
-		}
+	fn := c.function(module, name, public)
+	if fn == nil {
+		return callShape{}, false
 	}
-	return callShape{}, false
+	head, params, tail := signatureParts(fn)
+	return callShape{head: head, params: params, tail: tail}, true
 }
 
 func (c *cursor) variantShape(module, enum, name string) (callShape, bool) {
