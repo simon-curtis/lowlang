@@ -478,7 +478,7 @@ func required(c *Checker, f *types.Field) bool {
 func (s *synth) schemaFields(t *types.Type, stack []*types.Type) string {
 	parts := make([]string, len(t.Fields))
 	for i, f := range t.Fields {
-		parts[i] = fmt.Sprintf("Field { name: %s, schema: %s, required: %t }", quoted(f.Name), s.schema(f.Type, stack), required(s.c, f))
+		parts[i] = fmt.Sprintf("Property { name: %s, schema: %s, required: %t }", quoted(f.Name), s.schema(f.Type, stack), required(s.c, f))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -489,7 +489,7 @@ func (s *synth) schemaVariants(t *types.Type, stack []*types.Type) string {
 		fields := make([]string, len(v.Fields))
 		for j, f := range v.Fields {
 			optional := f.Kind == types.EnumKind && f.Optional
-			fields[j] = fmt.Sprintf("Field { name: %s, schema: %s, required: %t }", quoted(labelOf(v, j)), s.schema(f, stack), !optional)
+			fields[j] = fmt.Sprintf("Property { name: %s, schema: %s, required: %t }", quoted(labelOf(v, j)), s.schema(f, stack), !optional)
 		}
 		parts[i] = fmt.Sprintf("Variant { name: %s, labelled: %t, fields: [%s] }", quoted(v.Name), labelled(v), strings.Join(fields, ", "))
 	}

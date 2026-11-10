@@ -689,6 +689,9 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		if e.Func != nil {
 			return b.funcValue(e.Func, e.Type)
 		}
+		if e.Reference != nil {
+			return b.fieldReference(e)
+		}
 		return b.selector(e)
 	case *ast.Closure:
 		return b.closure(e)
@@ -828,6 +831,20 @@ func (b *builder) call(e *ast.Call) []*Value {
 		return b.callValue(e)
 	}
 	return b.callFunc(e)
+}
+
+func (b *builder) fieldReference(e *ast.Selector) []*Value {
+	name := b.emit(OpString)
+	name.Str = e.Reference.Name
+	name.Scalar = true
+	owner := e.Type.TypeArgs[0]
+	index := 0
+	for i, f := range owner.Fields {
+		if f == e.Reference {
+			index = i
+		}
+	}
+	return []*Value{name, b.constant(int64(len(e.Reference.Name))), b.constant(int64(index))}
 }
 
 func (b *builder) funcAddr(kind int64, target *Func) *Value {

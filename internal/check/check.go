@@ -1288,7 +1288,8 @@ func (c *Checker) selector(e *ast.Selector, want *types.Type) {
 
 	if t := c.typeRef(e.X); t != nil {
 		if t.Kind == types.StructKind {
-			c.fail(e.X.Position(), "%s is a type, not a value", t)
+			c.fieldReference(e, t)
+			return
 		}
 		if t.Variant(e.Name) == nil {
 			c.fail(e.Pos, "%s has no variant %s", t, e.Name)
@@ -1306,6 +1307,16 @@ func (c *Checker) selector(e *ast.Selector, want *types.Type) {
 	}
 	e.Field = c.field(deref(t), e.Name, e.Pos)
 	e.Type = e.Field.Type
+}
+
+func (c *Checker) fieldReference(e *ast.Selector, t *types.Type) {
+	f := c.field(t, e.Name, e.Pos)
+	serde, loaded := c.modules[serdeModule]
+	if !loaded || serde.generics["Field"] == nil {
+		c.fail(e.Pos, "%s.%s refers to a field and needs std/serde to be imported", t, e.Name)
+	}
+	e.Reference = f
+	e.Type = c.instantiateType(serde.generics["Field"], []*types.Type{t, f.Type}, e.Pos)
 }
 
 func (c *Checker) index(e *ast.Index) {

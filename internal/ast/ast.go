@@ -365,13 +365,14 @@ type Ident struct {
 
 type Selector struct {
 	Typed
-	X       Expr
-	Name    string
-	Pos     lexer.Pos
-	Variant *types.Variant
-	Field   *types.Field
-	Length  bool
-	Func    *Func
+	X         Expr
+	Name      string
+	Pos       lexer.Pos
+	Variant   *types.Variant
+	Field     *types.Field
+	Reference *types.Field
+	Length    bool
+	Func      *Func
 }
 
 type Closure struct {

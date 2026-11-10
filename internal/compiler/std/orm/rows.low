@@ -1,0 +1,223 @@
+import std/json
+import std/serde
+import std/sql
+import std/text
+
+struct RowCursor {
+    columns: []sql.Column
+    values: []sql.Value
+    index: i64
+    started: bool
+    nested: serde.Reader?
+    depth: i64
+    unit: bool
+}
+
+fn current(c: *RowCursor) -> sql.Value {
+    if c.index < 0 || c.index >= c.values.len {
+        return sql.Value.Null
+    }
+    c.values[c.index]
+}
+
+fn mismatch(c: *RowCursor, what: str) -> serde.Error {
+    serde.Error.Mismatch(what, c.index)
+}
+
+fn delegate(c: *RowCursor) -> serde.Reader ! serde.Error {
+    match c.nested {
+        some(r) => return r
+        none => {}
+    }
+    let source = match current(c) {
+        Text(s) => s
+        _ => fail mismatch(c, "JSON text")
+    }
+    let r = json.source(bytes(source))
+    c.nested = r
+    c.depth = 0
+    r
+}
+
+fn deeper(c: *RowCursor) {
+    c.depth += 1
+}
+
+fn shallower(c: *RowCursor) {
+    c.depth -= 1
+    if c.depth == 0 {
+        c.nested = none
+    }
+}
+
+fn row_reader(c: *RowCursor) -> serde.Reader {
+    serde.Reader {
+        null: fn() -> bool ! serde.Error {
+            match c.nested {
+                some(r) => return r.null()
+                none => {}
+            }
+            match current(c) {
+                Null => true
+                _ => false
+            }
+        }
+        boolean: fn() -> bool ! serde.Error {
+            match c.nested {
+                some(r) => return r.boolean()
+                none => {}
+            }
+            match current(c) {
+                Bool(b) => b
+                Int(n) => n != 0
+                _ => fail mismatch(c, "boolean")
+            }
+        }
+        integer: fn() -> i64 ! serde.Error {
+            match c.nested {
+                some(r) => return r.integer()
+                none => {}
+            }
+            match current(c) {
+                Int(n) => n
+                Bool(b) => if b { 1 } else { 0 }
+                Decimal(d) => text.parse_int(d) catch {
+                    _ => fail mismatch(c, "integer")
+                }
+                Text(s) => text.parse_int(s) catch {
+                    _ => fail mismatch(c, "integer")
+                }
+                _ => fail mismatch(c, "integer")
+            }
+        }
+        unsigned: fn() -> u64 ! serde.Error {
+            match c.nested {
+                some(r) => return r.unsigned()
+                none => {}
+            }
+            match current(c) {
+                Int(n) => {
+                    if n < 0 {
+                        fail serde.Error.Range(c.index)
+                    }
+                    u64(n)
+                }
+                Decimal(d) => {
+                    let parsed = json.source(bytes(d))
+                    parsed.unsigned()?
+                }
+                _ => fail mismatch(c, "unsigned integer")
+            }
+        }
+        float: fn() -> f64 ! serde.Error {
+            match c.nested {
+                some(r) => return r.float()
+                none => {}
+            }
+            match current(c) {
+                Float(x) => x
+                Int(n) => f64(n)
+                Decimal(d) => text.parse_float(d) catch {
+                    _ => fail mismatch(c, "number")
+                }
+                _ => fail mismatch(c, "number")
+            }
+        }
+        text: fn() -> str ! serde.Error {
+            match c.nested {
+                some(r) => return r.text()
+                none => {}
+            }
+            text_of(current(c))
+        }
+        binary: fn() -> []u8 ! serde.Error {
+            match c.nested {
+                some(r) => return r.binary()
+                none => {}
+            }
+            match current(c) {
+                Bytes(b) => b
+                Uuid(b) => b
+                _ => fail mismatch(c, "binary")
+            }
+        }
+        begin_seq: fn() ! serde.Error {
+            let r = delegate(c)?
+            r.begin_seq()?
+            deeper(c)
+        }
+        next_element: fn() -> bool ! serde.Error {
+            let r = delegate(c)?
+            let more = r.next_element()?
+            if !more {
+                shallower(c)
+            }
+            more
+        }
+        begin_map: fn() ! serde.Error {
+            if !c.started {
+                c.started = true
+                return
+            }
+            let r = delegate(c)?
+            r.begin_map()?
+            deeper(c)
+        }
+        next_key: fn() -> str? ! serde.Error {
+            match c.nested {
+                some(r) => {
+                    let key = r.next_key()?
+                    match key {
+                        some(_) => {}
+                        none => shallower(c)
+                    }
+                    return key
+                }
+                none => {}
+            }
+            c.index += 1
+            if c.index >= c.columns.len {
+                return none
+            }
+            c.columns[c.index].name
+        }
+        begin_variant: fn() -> str ! serde.Error {
+            match c.nested {
+                some(r) => {
+                    deeper(c)
+                    return r.begin_variant()
+                }
+                none => {}
+            }
+            let s = match current(c) {
+                Text(s) => s
+                _ => fail mismatch(c, "variant")
+            }
+            if s.len > 0 && s[0] == '{' {
+                let r = delegate(c)?
+                deeper(c)
+                return r.begin_variant()
+            }
+            c.unit = true
+            s
+        }
+        end_variant: fn() ! serde.Error {
+            if c.unit {
+                c.unit = false
+                return
+            }
+            let r = delegate(c)?
+            r.end_variant()?
+            shallower(c)
+        }
+        skip: fn() ! serde.Error {}
+        position: fn() -> i64 { c.index }
+    }
+}
+
+fn map_row[T](columns: []sql.Column, values: []sql.Value) -> T ! sql.Error {
+    let c = new(RowCursor { columns, values, index: -1, started: false, nested: none, depth: 0, unit: false })
+    serde.read[T](row_reader(c)) catch {
+        _ => fail sql.Error.Conversion
+    }
+}
