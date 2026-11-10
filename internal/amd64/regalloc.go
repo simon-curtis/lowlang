@@ -152,6 +152,11 @@ func (mb *mblock) segments() map[*vreg]*segment {
 		touch(r, mb.start)
 	}
 	for _, in := range mb.instrs {
+		if in.isParam() {
+			touch(in.dst, mb.start)
+		}
+	}
+	for _, in := range mb.instrs {
 		for _, a := range in.args {
 			touch(a, in.pos)
 		}
