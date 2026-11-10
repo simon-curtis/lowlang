@@ -652,8 +652,10 @@ fn handle(req: http.Request) -> http.Response {
 }
 
 fn main() ! io.Error {
-    let page = http.get("http://example.com/")?
-    let h2 = http.fetch("GET", "http://127.0.0.1:8080/", [], [], Http2)?
+    let client = http.client().with_bearer_token("token").with_timeout(5000).build()
+    let page = client.get("https://example.com/") catch {
+        _ => return
+    }
     http.serve(net.listen("", 8080)?, handle)?
 }
 ```
@@ -666,9 +668,9 @@ fn main() ! io.Error {
 | `std/file` | `open`, `create`, `append`, `update`, `read`, `write`, `write_all`, `seek`, `sync`, `truncate`, `close`, `info`, `stat`, `exists`, `read_file`, `read_text`, `write_file`, `write_text`, `remove`, `remove_dir`, `rename`, `mkdir`, `mkdir_all`, `list` and `stream`. |
 | `std/net` | IPv4 and IPv6 `Addr`, `parse_ip`, `format_ip`, `parse_addr`, `format`; TCP `listen`, `accept`, `connect`, `dial` and their `_within` forms with a connect timeout, `read`, `write`, `write_all`, `shutdown_write`, `set_nodelay`, read and write timeouts and `stream`; UDP `bind_udp`, `send_to` and `receive_from`; `lookup`, which tries an IP literal, `/etc/hosts`, then A and AAAA queries to each `/etc/resolv.conf` nameserver. |
 | `std/pipe` | Pipelines: a `Pipe` with a `Reader` and `Writer`, segmented buffers, backpressure, `Sequence` and `SequenceReader`, and adapters between pipes and streams. |
-| `std/http` | `Request`, `Response`, `Header`, header helpers, `parse_url`; `serve`, `serve_tls`, `serve_conn` and `serve_stream`; `fetch`, `get` and `post` over `http` and `https`; `connect`. |
+| `std/http` | `Request`, `Response`, `Header`, header helpers, `parse_url`; `serve`, `serve_tls`, `serve_conn` and `serve_stream`; a pooled client configured through `client()` and `with_*` builders, with per-request builders, `send`, `stream_to` and `download`; URL parsing, resolution and encoding; `connect`. |
 | `std/http/websocket` | `accept`, `dial` over `ws` and `wss`, `receive`, `send_text`, `send_binary`, `ping` and `close`. |
-| `std/web` | A router with groups, middleware and typed JSON endpoints, problem details (RFC 9457), an OpenAPI 3.1 document built from the types, cookie sessions, CSRF protection, API key, Basic and bearer authentication, CORS and gzip compression. |
+| `std/web` | A router with groups, middleware and typed JSON endpoints, problem details (RFC 9457), an OpenAPI 3.1 document built from the types, cookie sessions, CSRF protection, API key, Basic and bearer authentication, CORS and response compression. |
 | `std/tls` | TLS 1.3 clients and servers. |
 | `std/serde` | The `Writer` and `Reader` protocols, `write[T]`, `read[T]` and `schema[T]`, which the compiler derives for every type, and `Field[T, F]`. |
 | `std/json` | A reader and writer over UTF-8 bytes, the `Value` document model, and `serialize[T]` and `deserialize[T]` with naming policies. |
@@ -712,7 +714,7 @@ fn main() ! io.Error {
 - HTTP/2 covers framing, HPACK with its dynamic table and Huffman decoding, stream multiplexing, flow control in both directions, SETTINGS, PING, RST_STREAM, GOAWAY and CONTINUATION, and the request validation of RFC 9113 section 8. A reader green thread feeds frames to the connection, each request's handler runs on its own green thread, and the connection selects over frames and finished responses, so every write happens on one green thread. The encoder uses the static table and literals without Huffman coding. It passes h2spec except the test sending a garbage preface, which the shared port reads as an HTTP/1.1 request.
 - A handler that returns status 101 owns the connection: the server writes nothing more and closes it once the handler returns. `http.upgraded()` is that response, returned after a WebSocket session.
 - `Request.connection` is the buffered reader of an HTTP/1.1 connection, which `websocket.accept` writes the handshake to and reads frames from. A WebSocket server requires masked client frames, answers pings, reassembles fragments, checks UTF-8 in text messages, limits messages to 16 MB and echoes a close frame.
-- The client speaks HTTP/1.1 or HTTP/2, one request per connection, over `http` and `https` URLs. It asks for gzip and deflate and decodes them.
+- `http.client()` returns a `Builder[Client]` value whose `with_*` functions return updated copies, and `build` makes a `*Client` that any number of green threads share. `c.request(method, url)` copies the client's settings into a `Builder[Response]`, so headers, authentication, timeouts, redirects, retries, version and decompression can be overridden per request; the type parameter only selects whether `build` or `send` applies. Over HTTP/1.1 a request takes an idle keep-alive connection from a pool keyed by scheme, host and port, dials a new one while the host is under its limit, or queues for one; a sweeper green thread expires idle connections, and a pooled connection that fails before any response byte is retried once on a fresh one. Over TLS the client offers `h2` and `http/1.1` by ALPN and keeps one HTTP/2 connection per host: a reader green thread decodes frames into per-stream queues, request green threads wait on their stream, flow control credits windows as bodies are consumed, and SETTINGS, PING, RST_STREAM, GOAWAY and the peer's stream limit are honoured. One reaper green thread per client enforces whole-request deadlines by shutting down an expired HTTP/1.1 exchange, while HTTP/2 waits select on the deadline and reset the stream. Redirects switch 301, 302 and 303 to GET without a body, keep the method and body on 307 and 308, resolve relative locations and drop `Authorization` and `Cookie` across origins. Responses are decoded from gzip, deflate (zlib or raw), Brotli and Zstandard as they stream, chunked bodies are read and sent, and an optional RFC 6265 cookie jar is shared by the client. Retries apply to connection failures and, for idempotent methods, to transport errors and 429, 502, 503 and 504, with exponential backoff that respects `Retry-After`. Servers set `TCP_NODELAY` so separate HEADERS and DATA writes are not held back by delayed acknowledgements.
 - Request and response bodies are limited to 64 MB.
 
 ### TLS
@@ -761,7 +763,7 @@ fn main() ! io.Error {
 
 - `web.app()` holds routes and middleware. `get`, `post`, `put`, `patch`, `del` and `route` add handlers for paths with `:name` parameters and a trailing `*`; `group` makes a sub-application with a prefix and more middleware, and `mount` adds its routes back. An unknown path is a 404 and a known path with another method a 405 with `Allow`.
 - `endpoint[Req, Res]` and `query_endpoint[Res]` read a JSON body into `Req`, call a handler returning `Res ! web.Problem`, and write the result as JSON or the problem as `application/problem+json`. Their schemas describe the operation in the OpenAPI document that `openapi` serves, along with path parameters and each route's security schemes.
-- Middleware is a struct of a `run` closure and an optional security scheme. `api_key`, `basic` and `bearer` authenticate requests and set `Context.user`; `sessions` keeps a map in a cookie sealed with AES-256-GCM, with the cookie name as associated data and an expiry inside; `csrf` requires the session's token in `X-CSRF-Token` on unsafe methods; `require_session`, `cors`, `logger` and `compress` round them out.
+- Middleware is a struct of a `run` closure and an optional security scheme. `api_key`, `basic` and `bearer` authenticate requests and set `Context.user`; `sessions` keeps a map in a cookie sealed with AES-256-GCM, with the cookie name as associated data and an expiry inside; `csrf` requires the session's token in `X-CSRF-Token` on unsafe methods; `require_session`, `cors`, `logger` and `compress` round them out; `compress` picks Zstandard, Brotli or gzip, in that order, from what `Accept-Encoding` allows.
 - `jwt` verifies bearer tokens against a key set with `std/crypto/jose`. `oidc` does the same for an OpenID Connect issuer: it reads the discovery document and the JWKS, refreshes them hourly, and refreshes early, at most once a minute, when a token names a key it does not know. `oidc_login` adds a sign-in route that redirects to the issuer with `state`, `nonce` and a PKCE S256 challenge kept in the session, and a callback route that checks the state, exchanges the code, verifies the ID token and its nonce, and hands the claims to the application.
 
 ## Compiler

@@ -1,0 +1,204 @@
+import std/http
+import std/io
+import std/net
+import std/text
+
+struct State {
+    accepts: i64
+    flaky: i64
+}
+
+fn query_value(req: http.Request, name: str) -> str {
+    for pair in text.split(req.query, '&') {
+        let eq = text.index_byte(pair, '=')
+        if eq > 0 && pair[..eq] == name {
+            return pair[eq + 1..]
+        }
+    }
+    ""
+}
+
+fn handle(s: *State, req: http.Request) -> http.Response {
+    if req.path == "/slow" {
+        sleep(text.parse_uint(query_value(req, "ms"), 10) catch 0)
+        return http.response(200, "slow")
+    }
+    if req.path == "/flaky" {
+        s.flaky += 1
+        if s.flaky % 3 != 0 {
+            return http.Response { status: 503, headers: [http.Header { name: "retry-after", value: "0" }], body: bytes("busy") }
+        }
+        return http.response(200, "recovered after {s.flaky}")
+    }
+    http.response(200, "{req.method} {req.path}")
+}
+
+fn serve(l: net.Listener, s: *State) {
+    let handler = fn(req: http.Request) -> http.Response { handle(s, req) }
+    for {
+        let c = net.accept(l) catch {
+            _ => return
+        }
+        s.accepts += 1
+        spawn http.serve_conn(c, handler)
+    }
+}
+
+fn closing_server(l: net.Listener, s: *State) {
+    for {
+        let c = net.accept(l) catch {
+            _ => return
+        }
+        s.accepts += 1
+        spawn answer_once(c)
+    }
+}
+
+fn answer_once(c: net.Conn) {
+    defer net.close(c)
+    let r = io.reader(net.stream(c))
+    http.read_request(r) catch {
+        _ => return
+    }
+    net.write_all(c, bytes("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nonce")) catch {
+        _ => {}
+    }
+}
+
+fn result(op: fn() -> http.Response ! http.Error) -> str {
+    let r = op() catch {
+        InvalidUrl(u) => return "invalid url {u}"
+        Connect(_) => return "connect error"
+        Tls(_) => return "tls error"
+        Timeout => return "timeout"
+        TooManyRedirects(n) => return "too many redirects {n}"
+        Protocol(_) => return "protocol error"
+        Decode(_) => return "decode error"
+        Json(_) => return "json error"
+        Status(code) => return "status {code}"
+        Io(_) => return "io error"
+    }
+    "{r.status} {r.text()}"
+}
+
+fn timeouts(base: str) ! http.Error {
+    let c = http.client().with_base_url(base).with_timeout(100).build()
+    print("slow: {result(fn() -> http.Response ! http.Error { c.get("/slow?ms=200") })}")
+    print("after timeout: {result(fn() -> http.Response ! http.Error { c.get("/slow?ms=1") })}")
+    print("override: {result(fn() -> http.Response ! http.Error { c.request("GET", "/slow?ms=100").with_timeout(30).send() })}")
+    print("relaxed: {result(fn() -> http.Response ! http.Error { c.request("GET", "/slow?ms=120").with_timeout(0).send() })}")
+    let single = http.client().with_base_url(base).with_max_connections_per_host(1).build()
+    let done = chan[str](1)
+    spawn background(single, "/slow?ms=120", done)
+    sleep(20)
+    print("queued: {result(fn() -> http.Response ! http.Error { single.request("GET", "/slow?ms=1").with_timeout(40).send() })}")
+    print("background: {(<-done) ?? "-"}")
+    print("slot reused: {result(fn() -> http.Response ! http.Error { single.get("/x") })}")
+}
+
+fn background(c: *http.Client, path: str, done: chan[str]) {
+    done <- result(fn() -> http.Response ! http.Error { c.get(path) })
+}
+
+fn retries(base: str, dead: str) ! http.Error {
+    let c = http.client().with_base_url(base).with_retries(2).build()
+    print("flaky: {result(fn() -> http.Response ! http.Error { c.get("/flaky") })}")
+    let once = http.client().with_base_url(base).build()
+    print("no retry: {result(fn() -> http.Response ! http.Error { once.get("/flaky") })}")
+    print("post not retried: {result(fn() -> http.Response ! http.Error { c.post("/flaky", "text/plain", []) })}")
+    let retrying = http.client().with_retries(1).build()
+    print("dead port: {result(fn() -> http.Response ! http.Error { retrying.get("{dead}/x") })}")
+}
+
+fn stale(base: str, s: *State) ! http.Error {
+    let c = http.client().with_base_url(base).build()
+    for _ in 0..3 {
+        print("stale: {result(fn() -> http.Response ! http.Error { c.get("/") })}")
+    }
+    print("stale accepts {s.accepts}")
+}
+
+fn pooled(base: str, s: *State) ! http.Error {
+    let c = http.client().with_base_url(base).build()
+    var before = s.accepts
+    for _ in 0..20 {
+        c.get("/x")?
+    }
+    print("sequential accepts {s.accepts - before}")
+    before = s.accepts
+    let limited = http.client().with_base_url(base).with_max_connections_per_host(2).build()
+    let done = chan[bool](16)
+    for _ in 0..8 {
+        spawn concurrent(limited, "/slow?ms=20", 1, done)
+    }
+    var good = 0
+    for _ in 0..8 {
+        if (<-done) ?? false {
+            good += 1
+        }
+    }
+    print("limited ok={good} accepts={s.accepts - before}")
+    before = s.accepts
+    let wide = http.client().with_base_url(base).build()
+    let all = chan[bool](64)
+    for _ in 0..50 {
+        spawn concurrent(wide, "/x", 4, all)
+    }
+    good = 0
+    for _ in 0..50 {
+        if (<-all) ?? false {
+            good += 1
+        }
+    }
+    print("concurrent ok={good} accepts<=50={s.accepts - before <= 50}")
+    before = s.accepts
+    let idle = http.client().with_base_url(base).with_idle_timeout(30).build()
+    idle.get("/x")?
+    idle.get("/x")?
+    sleep(70)
+    idle.get("/x")?
+    print("idle accepts {s.accepts - before}")
+    before = s.accepts
+    c.close_idle()
+    c.get("/x")?
+    print("after close_idle accepts {s.accepts - before}")
+}
+
+fn concurrent(c: *http.Client, path: str, n: i64, done: chan[bool]) {
+    for _ in 0..n {
+        let r = c.get(path) catch {
+            _ => {
+                done <- false
+                return
+            }
+        }
+        if r.status != 200 {
+            done <- false
+            return
+        }
+    }
+    done <- true
+}
+
+fn main() ! http.Error {
+    let l = net.listen("127.0.0.1", 0) catch {
+        _ => fail Connect(Refused)
+    }
+    let closing = net.listen("127.0.0.1", 0) catch {
+        _ => fail Connect(Refused)
+    }
+    let closed = net.listen("127.0.0.1", 0) catch {
+        _ => fail Connect(Refused)
+    }
+    let dead = "http://127.0.0.1:{closed.addr.port}"
+    net.close_listener(closed)
+    let base = "http://127.0.0.1:{l.addr.port}"
+    let s = new(State { accepts: 0, flaky: 0 })
+    let once = new(State { accepts: 0, flaky: 0 })
+    spawn serve(l, s)
+    spawn closing_server(closing, once)
+    pooled(base, s)?
+    stale("http://127.0.0.1:{closing.addr.port}", once)?
+    timeouts(base)?
+    retries(base, dead)?
+}

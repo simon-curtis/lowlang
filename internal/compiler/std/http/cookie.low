@@ -1,0 +1,321 @@
+import std/net
+import std/text
+import std/time
+
+struct Cookie {
+    name: str
+    value: str
+    domain: str
+    host_only: bool
+    path: str
+    expires: i64
+    secure: bool
+    created: i64
+}
+
+struct Jar {
+    lock: chan[bool]
+    cookies: []Cookie
+    created: i64
+}
+
+fn new_jar() -> *Jar {
+    new(Jar { lock: chan[bool](1), cookies: [], created: 0 })
+}
+
+fn session_expiry() -> i64 {
+    0x7FFFFFFFFFFFFFFF
+}
+
+fn cookie_delimiter(c: u8) -> bool {
+    c == 0x09 || c >= 0x20 && c <= 0x2F || c >= 0x3B && c <= 0x40 || c >= 0x5B && c <= 0x60 || c >= 0x7B && c <= 0x7E
+}
+
+fn date_tokens(s: str) -> []str {
+    var tokens: []str = []
+    var start = -1
+    for i in 0..s.len {
+        if cookie_delimiter(s[i]) {
+            if start >= 0 {
+                push(mut tokens, s[start..i])
+                start = -1
+            }
+        } else if start < 0 {
+            start = i
+        }
+    }
+    if start >= 0 {
+        push(mut tokens, s[start..])
+    }
+    tokens
+}
+
+fn leading_digits(s: str, low: i64, high: i64) -> i64 {
+    var n = 0
+    var count = 0
+    for count < s.len && s[count] >= '0' && s[count] <= '9' {
+        n = n * 10 + i64(s[count] - '0')
+        count += 1
+    }
+    if count < low || count > high {
+        return -1
+    }
+    n
+}
+
+fn clock(token: str) -> i64 {
+    let parts = text.split(token, ':')
+    if parts.len != 3 {
+        return -1
+    }
+    let h = leading_digits(parts[0], 1, 2)
+    let m = leading_digits(parts[1], 1, 2)
+    let s = leading_digits(parts[2], 1, 2)
+    if h < 0 || m < 0 || s < 0 || parts[0].len > 2 || parts[1].len > 2 {
+        return -1
+    }
+    if h > 23 || m > 59 || s > 59 {
+        return -2
+    }
+    h * 3600 + m * 60 + s
+}
+
+fn month_of(token: str) -> i64 {
+    if token.len < 3 {
+        return -1
+    }
+    let names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    let prefix = text.lower(token[..3])
+    for i, name in names {
+        if prefix == name {
+            return i + 1
+        }
+    }
+    -1
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year }
+    let era = (if y >= 0 { y } else { y - 399 }) / 400
+    let yoe = y - era * 400
+    let mp = (month + 9) % 12
+    let doy = (153 * mp + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+fn parse_cookie_date(s: str) -> i64? {
+    var seconds = -1
+    var day = -1
+    var month = -1
+    var year = -1
+    for token in date_tokens(s) {
+        if seconds == -1 {
+            let t = clock(token)
+            if t == -2 {
+                return none
+            }
+            if t >= 0 {
+                seconds = t
+                continue
+            }
+        }
+        if day < 0 {
+            let d = leading_digits(token, 1, 2)
+            if d >= 0 && token.len <= 2 {
+                day = d
+                continue
+            }
+        }
+        if month < 0 {
+            let m = month_of(token)
+            if m > 0 {
+                month = m
+                continue
+            }
+        }
+        if year < 0 {
+            let y = leading_digits(token, 2, 4)
+            if y >= 0 {
+                year = y
+            }
+        }
+    }
+    if year >= 70 && year <= 99 {
+        year += 1900
+    } else if year >= 0 && year <= 69 {
+        year += 2000
+    }
+    if seconds < 0 || day < 1 || day > 31 || month < 0 || year < 1601 {
+        return none
+    }
+    days_from_civil(year, month, day) * 86400 + seconds
+}
+
+fn default_path(target: str) -> str {
+    let q = text.index_byte(target, '?')
+    let path = if q >= 0 { target[..q] } else { target }
+    if path.len == 0 || path[0] != '/' {
+        return "/"
+    }
+    let slash = text.last_index_byte(path, '/')
+    if slash == 0 { "/" } else { path[..slash] }
+}
+
+fn domain_match(host: str, domain: str) -> bool {
+    if host == domain {
+        return true
+    }
+    if !text.ends_with(host, domain) || host.len <= domain.len || host[host.len - domain.len - 1] != '.' {
+        return false
+    }
+    !ip_literal(host)
+}
+
+fn ip_literal(host: str) -> bool {
+    let parsed = net.parse_ip(host) catch {
+        _ => return false
+    }
+    parsed.len > 0
+}
+
+fn path_match(path: str, cookie_path: str) -> bool {
+    if path == cookie_path {
+        return true
+    }
+    if !text.starts_with(path, cookie_path) {
+        return false
+    }
+    cookie_path[cookie_path.len - 1] == '/' || path[cookie_path.len] == '/'
+}
+
+fn parse_set_cookie(u: Url, line: str, now: i64) -> Cookie? {
+    let parts = text.split(line, ';')
+    let pair = parts[0]
+    let eq = text.index_byte(pair, '=')
+    if eq < 0 {
+        return none
+    }
+    let name = text.trim(pair[..eq])
+    if name.len == 0 {
+        return none
+    }
+    var c = Cookie {
+        name
+        value: text.trim(pair[eq + 1..])
+        domain: u.host
+        host_only: true
+        path: default_path(u.target)
+        expires: session_expiry()
+        secure: false
+        created: 0
+    }
+    var max_age_seen = false
+    for attr in parts[1..] {
+        let at = text.index_byte(attr, '=')
+        let key = text.lower(text.trim(if at >= 0 { attr[..at] } else { attr }))
+        let value = text.trim(if at >= 0 { attr[at + 1..] } else { "" })
+        if key == "max-age" {
+            let negative = value.len > 0 && value[0] == '-'
+            let n = text.parse_uint(if negative { value[1..] } else { value }, 10) catch -1
+            if n >= 0 {
+                max_age_seen = true
+                c.expires = if negative || n == 0 { 0 } else { now + n }
+            }
+        } else if key == "expires" && !max_age_seen {
+            match parse_cookie_date(value) {
+                some(t) => {
+                    c.expires = t
+                }
+                none => {}
+            }
+        } else if key == "domain" && value.len > 0 {
+            let d = text.lower(if value[0] == '.' { value[1..] } else { value })
+            if !domain_match(u.host, d) {
+                return none
+            }
+            c.domain = d
+            c.host_only = false
+        } else if key == "path" {
+            c.path = if value.len > 0 && value[0] == '/' { value } else { default_path(u.target) }
+        } else if key == "secure" {
+            c.secure = true
+        }
+    }
+    c
+}
+
+fn store_cookies(j: *Jar, u: Url, headers: []Header) {
+    let now = time.now()
+    j.lock <- true
+    defer <-j.lock
+    for h in headers {
+        if !text.equal_fold(h.name, "set-cookie") {
+            continue
+        }
+        match parse_set_cookie(u, h.value, now) {
+            some(c) => keep_cookie(j, c, now)
+            none => {}
+        }
+    }
+}
+
+fn keep_cookie(j: *Jar, c: Cookie, now: i64) {
+    var fresh = c
+    j.created += 1
+    fresh.created = j.created
+    var kept: []Cookie = []
+    for old in j.cookies {
+        if old.name == c.name && old.domain == c.domain && old.path == c.path {
+            fresh.created = old.created
+        } else {
+            push(mut kept, old)
+        }
+    }
+    if c.expires > now {
+        push(mut kept, fresh)
+    }
+    j.cookies = kept
+}
+
+fn cookie_header(j: *Jar, u: Url) -> str {
+    let now = time.now()
+    let secure = u.scheme == "https" || u.scheme == "wss"
+    let path = path_of(u.target)
+    j.lock <- true
+    var live: []Cookie = []
+    var chosen: []Cookie = []
+    for c in j.cookies {
+        if c.expires <= now {
+            continue
+        }
+        push(mut live, c)
+        let host_ok = if c.host_only { u.host == c.domain } else { domain_match(u.host, c.domain) }
+        if host_ok && path_match(path, c.path) && (!c.secure || secure) {
+            push(mut chosen, c)
+        }
+    }
+    j.cookies = live
+    <-j.lock
+    for i in 1..chosen.len {
+        var k = i
+        for k > 0 && cookie_before(chosen[k], chosen[k - 1]) {
+            let t = chosen[k]
+            chosen[k] = chosen[k - 1]
+            chosen[k - 1] = t
+            k -= 1
+        }
+    }
+    var parts: []str = []
+    for c in chosen {
+        push(mut parts, "{c.name}={c.value}")
+    }
+    text.join(parts, "; ")
+}
+
+fn cookie_before(a: Cookie, b: Cookie) -> bool {
+    if a.path.len != b.path.len {
+        return a.path.len > b.path.len
+    }
+    a.created < b.created
+}

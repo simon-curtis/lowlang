@@ -1,0 +1,247 @@
+import std/compress/deflate
+import std/crypto/x509
+import std/http
+import std/io
+import std/net
+import std/text
+import std/tls
+
+struct State {
+    accepts: i64
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_blocks(embed("std_tls_ca.pem"), "CERTIFICATE") {
+        push(mut out, x509.parse(der) catch {
+            _ => return out
+        })
+    }
+    out
+}
+
+fn query_value(req: http.Request, name: str) -> str {
+    for pair in text.split(req.query, '&') {
+        let eq = text.index_byte(pair, '=')
+        if eq > 0 && pair[..eq] == name {
+            return http.unescape(pair[eq + 1..]) catch ""
+        }
+    }
+    ""
+}
+
+fn pattern(n: i64) -> []u8 {
+    let out = io.buffer(n)
+    for i in 0..n {
+        out[i] = u8(i * 7 % 251)
+    }
+    out
+}
+
+fn checksum(data: []u8) -> i64 {
+    var sum = 0
+    for b in data {
+        sum = (sum * 31 + i64(b)) % 1000000007
+    }
+    sum
+}
+
+fn handle(req: http.Request) -> http.Response {
+    let p = req.path
+    let v2 = req.version == http.Version.Http2
+    if p == "/big" {
+        return http.Response { status: 200, headers: [], body: pattern(1500000) }
+    }
+    if p == "/upload" {
+        return http.response(200, "{req.body.len} {checksum(req.body)}")
+    }
+    if p == "/slow" {
+        sleep(text.parse_uint(query_value(req, "ms"), 10) catch 0)
+        return http.response(200, "slow")
+    }
+    if p == "/gzip" {
+        let packed = deflate.gzip_compress(bytes("h2 gzip body"), 6)
+        return http.Response { status: 200, headers: [http.Header { name: "content-encoding", value: "gzip" }], body: packed }
+    }
+    if p == "/redirect" {
+        let code = text.parse_uint(query_value(req, "code"), 10) catch 302
+        return http.Response { status: code, headers: [http.Header { name: "location", value: "/echo?from={code}" }], body: [] }
+    }
+    http.response(200, "{req.method} {req.target} h2={v2} {str(req.body)}")
+}
+
+fn secure(c: net.Conn, config: tls.Config) {
+    let t = tls.server(net.stream(c), config) catch {
+        _ => {
+            net.close(c)
+            return
+        }
+    }
+    http.serve_stream(tls.stream(t), handle) catch {
+        _ => {}
+    }
+    tls.close(t)
+}
+
+fn short_lived(c: net.Conn, config: tls.Config) {
+    let t = tls.server(net.stream(c), config) catch {
+        _ => {
+            net.close(c)
+            return
+        }
+    }
+    spawn serve_session(t)
+    sleep(60)
+    tls.close(t)
+}
+
+fn serve_session(t: *tls.Session) {
+    http.serve_stream(tls.stream(t), handle) catch {
+        _ => {}
+    }
+}
+
+fn serve_briefly(l: net.Listener, config: tls.Config, s: *State) {
+    for {
+        let c = net.accept(l) catch {
+            _ => return
+        }
+        s.accepts += 1
+        net.set_nodelay(c, true) catch {
+            _ => {}
+        }
+        spawn short_lived(c, config)
+    }
+}
+
+fn serve(l: net.Listener, config: tls.Config, s: *State) {
+    for {
+        let c = net.accept(l) catch {
+            _ => return
+        }
+        s.accepts += 1
+        net.set_nodelay(c, true) catch {
+            _ => {}
+        }
+        spawn secure(c, config)
+    }
+}
+
+fn result(op: fn() -> http.Response ! http.Error) -> str {
+    let r = op() catch {
+        InvalidUrl(u) => return "invalid url {u}"
+        Connect(_) => return "connect error"
+        Tls(_) => return "tls error"
+        Timeout => return "timeout"
+        TooManyRedirects(n) => return "too many redirects {n}"
+        Protocol(_) => return "protocol error"
+        Decode(_) => return "decode error"
+        Json(_) => return "json error"
+        Status(code) => return "status {code}"
+        Io(_) => return "io error"
+    }
+    "{r.status} {r.text()} {if r.version == http.Version.Http2 { "h2" } else { "h1" }}"
+}
+
+fn worker(c: *http.Client, id: i64, done: chan[i64]) {
+    var ok = 0
+    for i in 0..5 {
+        let r = c.get("/w/{id}/{i}") catch {
+            _ => {
+                done <- ok
+                return
+            }
+        }
+        if r.text() == "GET /w/{id}/{i} h2=true " && r.version == http.Version.Http2 {
+            ok += 1
+        }
+    }
+    done <- ok
+}
+
+fn multiplexed(c: *http.Client, s: *State) {
+    let done = chan[i64](256)
+    for id in 0..200 {
+        spawn worker(c, id, done)
+    }
+    var total = 0
+    for _ in 0..200 {
+        total += (<-done) ?? 0
+    }
+    print("multiplexed ok={total} accepts={s.accepts}")
+}
+
+fn bulk(c: *http.Client) ! http.Error {
+    let data = pattern(1200000)
+    let up = c.post("/upload", "application/octet-stream", data)?
+    print("upload {up.text()} {up.text() == "{data.len} {checksum(data)}"}")
+    let down = c.get("/big")?
+    print("download {down.body.len} {checksum(down.body) == checksum(pattern(1500000))} {down.header_value("content-length") ?? "-"}")
+    var total = 0
+    var chunks = 0
+    c.request("GET", "/big").stream_to(fn(chunk: []u8) ! io.Error {
+        total += chunk.len
+        chunks += 1
+    })?
+    print("streamed {total} chunks>1={chunks > 1}")
+    let reader = io.bytes_reader(pattern(100000))
+    let streamed = c.request("POST", "/upload").with_body_reader(reader, "application/octet-stream").send()?
+    print("streamed upload {streamed.text() == "100000 {checksum(pattern(100000))}"}")
+}
+
+fn behaviours(c: *http.Client, s: *State) {
+    print("gzip: {result(fn() -> http.Response ! http.Error { c.get("/gzip") })}")
+    print("303: {result(fn() -> http.Response ! http.Error { c.request("POST", "/redirect?code=303").with_text("x").send() })}")
+    print("307: {result(fn() -> http.Response ! http.Error { c.request("POST", "/redirect?code=307").with_text("x").send() })}")
+    print("timeout: {result(fn() -> http.Response ! http.Error { c.request("GET", "/slow?ms=300").with_timeout(50).send() })}")
+    print("after timeout: {result(fn() -> http.Response ! http.Error { c.get("/echo") })}")
+    print("head: {result(fn() -> http.Response ! http.Error { c.head("/echo") })}")
+    print("accepts {s.accepts}")
+}
+
+fn main() ! http.Error {
+    let pem = embed("std_tls_ec.pem")
+    let key = tls.load_key(pem) catch {
+        _ => fail Tls(Invalid)
+    }
+    let h2 = tls.Config { certificates: tls.load_certificates(pem), key, alpn: ["h2", "http/1.1"] }
+    var h1 = h2
+    h1.alpn = ["http/1.1"]
+    let l = net.listen("127.0.0.1", 0) catch {
+        _ => fail Connect(Refused)
+    }
+    let old = net.listen("127.0.0.1", 0) catch {
+        _ => fail Connect(Refused)
+    }
+    let s = new(State { accepts: 0 })
+    let o = new(State { accepts: 0 })
+    spawn serve(l, h2, s)
+    spawn serve(old, h1, o)
+    let base = "https://localhost:{l.addr.port}"
+    let c = http.client().with_base_url(base).with_roots(roots()).build()
+    print("first: {result(fn() -> http.Response ! http.Error { c.post("/a", "text/plain", bytes("hi")) })}")
+    multiplexed(c, s)
+    bulk(c)?
+    behaviours(c, s)
+    let fallback = http.client().with_base_url("https://localhost:{old.addr.port}").with_roots(roots()).build()
+    for _ in 0..3 {
+        print("fallback: {result(fn() -> http.Response ! http.Error { fallback.get("/f") })}")
+    }
+    print("fallback accepts {o.accepts}")
+    let brief = net.listen("127.0.0.1", 0) catch {
+        _ => fail Connect(Refused)
+    }
+    let b = new(State { accepts: 0 })
+    spawn serve_briefly(brief, h2, b)
+    let closing = http.client().with_base_url("https://localhost:{brief.addr.port}").with_roots(roots()).build()
+    print("before close: {result(fn() -> http.Response ! http.Error { closing.get("/c1") })}")
+    sleep(120)
+    print("after close: {result(fn() -> http.Response ! http.Error { closing.get("/c2") })}")
+    print("closing accepts {b.accepts}")
+    let forced = http.client().with_base_url(base).with_roots(roots()).with_version(Http1).build()
+    print("forced: {result(fn() -> http.Response ! http.Error { forced.get("/v") })}")
+    let untrusted = http.client().with_base_url(base).build()
+    print("untrusted: {result(fn() -> http.Response ! http.Error { untrusted.get("/u") })}")
+    let insecure = http.client().with_base_url("https://127.0.0.1:{l.addr.port}").with_insecure().build()
+    print("insecure: {result(fn() -> http.Response ! http.Error { insecure.get("/i") })}")
+}

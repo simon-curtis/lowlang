@@ -1,0 +1,434 @@
+import std/io
+import std/net
+import std/tls
+
+struct Wire {
+    conn: net.Conn
+    stream: io.Stream
+    protocol: str
+}
+
+struct Tally {
+    n: i64
+}
+
+struct Conn1 {
+    wire: Wire
+    stream: io.Stream
+    reader: *io.Reader
+    received: *Tally
+    idle_at: i64
+    host: *Host
+}
+
+struct Host {
+    lock: chan[bool]
+    idle: []*Conn1
+    open: i64
+    waiters: []chan[*Conn1?]
+    mux: *Mux?
+    alpn: str
+    dialing: bool
+    dial_waiters: []chan[bool]
+}
+
+enum Phase {
+    Connecting
+    Handshaking
+    Sending
+    Receiving
+    Decoding
+}
+
+struct Attempt {
+    phase: Phase
+    reused: bool
+    stale: bool
+    fresh: bool
+    sinking: bool
+    broken: bool
+    used: *Mux?
+    avoid: *Mux?
+}
+
+struct Job {
+    client: *Client
+    deadline: *Deadline
+    connect_timeout: i64
+    version: Version
+}
+
+enum Route {
+    Single(*Conn1)
+    Multiplexed(*Mux)
+}
+
+fn new_attempt(fresh: bool, avoid: *Mux?) -> *Attempt {
+    new(Attempt { phase: Connecting, reused: false, stale: false, fresh, sinking: false, broken: false, used: none, avoid })
+}
+
+fn host_for(c: *Client, u: Url) -> *Host {
+    let key = origin(u)
+    c.lock <- true
+    defer <-c.lock
+    match c.hosts[key] {
+        some(h) => return h
+        none => {}
+    }
+    let h = new(Host { lock: chan[bool](1), idle: [], open: 0, waiters: [], mux: none, alpn: "", dialing: false, dial_waiters: [] })
+    c.hosts[key] = h
+    h
+}
+
+fn secure_scheme(scheme: str) -> bool {
+    scheme == "https" || scheme == "wss"
+}
+
+fn dial(job: Job, u: Url, alpn: []str, a: *Attempt) -> Wire ! io.Error {
+    a.phase = Connecting
+    let left = remaining(job.deadline)
+    if left < 0 {
+        fail TimedOut
+    }
+    var limit = job.connect_timeout
+    if left > 0 && (limit == 0 || left < limit) {
+        limit = left
+    }
+    let conn = net.dial_within(u.host, u.port, limit)?
+    net.set_nodelay(conn, true) catch {
+        _ => {}
+    }
+    if !secure_scheme(u.scheme) {
+        return Wire { conn, stream: net.stream(conn), protocol: "" }
+    }
+    a.phase = Handshaking
+    let reaper = job.client.reaper
+    attach(reaper, job.deadline, conn.fd)
+    var config = job.client.options.tls
+    config.alpn = alpn
+    if config.server_name.len == 0 {
+        config.server_name = u.host
+    }
+    let shaken = outcome(fn() -> *tls.Session ! io.Error { tls.client(net.stream(conn), config) })
+    detach(reaper, job.deadline)
+    match shaken {
+        Done(t) => Wire { conn, stream: tls.stream(t), protocol: t.protocol }
+        Failed(e) => {
+            net.close(conn)
+            fail e
+        }
+    }
+}
+
+fn new_conn1(w: Wire, host: *Host) -> *Conn1 {
+    let tally = new(Tally { n: 0 })
+    let base = w.stream
+    let counted = io.Stream {
+        read: fn(buf) -> i64 ! io.Error {
+            let n = base.read(buf)?
+            tally.n += n
+            n
+        }
+        write: base.write
+        close: base.close
+    }
+    new(Conn1 { wire: w, stream: counted, reader: io.reader(counted), received: tally, idle_at: 0, host })
+}
+
+fn acquire(job: Job, h: *Host, u: Url, a: *Attempt) -> Route ! io.Error {
+    if job.version == Http2 && secure_scheme(u.scheme) {
+        return acquire_mux(job, h, u, a)
+    }
+    Single(acquire_conn(job, h, u, a)?)
+}
+
+fn acquire_conn(job: Job, h: *Host, u: Url, a: *Attempt) -> *Conn1 ! io.Error {
+    let c = job.client
+    let now = now_ms()
+    var expired_conns: []*Conn1 = []
+    var found: *Conn1? = none
+    h.lock <- true
+    if a.fresh {
+        expired_conns = h.idle
+        h.open -= h.idle.len
+        h.idle = []
+    }
+    for h.idle.len > 0 {
+        let conn = h.idle[h.idle.len - 1]
+        h.idle = h.idle[..h.idle.len - 1]
+        if now - conn.idle_at >= c.options.idle_timeout {
+            push(mut expired_conns, conn)
+            h.open -= 1
+            continue
+        }
+        found = conn
+        break
+    }
+    let limit = c.options.max_per_host
+    var waiter: chan[*Conn1?]? = none
+    if found == none {
+        if limit <= 0 || h.open < limit {
+            h.open += 1
+        } else {
+            let w = chan[*Conn1?](1)
+            push(mut h.waiters, w)
+            waiter = w
+        }
+    }
+    <-h.lock
+    for old in expired_conns {
+        old.wire.stream.close()
+    }
+    match found {
+        some(conn) => {
+            a.reused = true
+            return conn
+        }
+        none => {}
+    }
+    match waiter {
+        some(w) => {
+            match wait_grant(c, h, w, job.deadline)? {
+                some(conn) => {
+                    a.reused = true
+                    return conn
+                }
+                none => {}
+            }
+        }
+        none => {}
+    }
+    let alpn = ["http/1.1"]
+    let dialed = outcome(fn() -> Wire ! io.Error { dial(job, u, alpn, a) })
+    match dialed {
+        Done(w) => new_conn1(w, h)
+        Failed(e) => {
+            vacate(h)
+            fail e
+        }
+    }
+}
+
+fn wait_grant(c: *Client, h: *Host, w: chan[*Conn1?], d: *Deadline) -> *Conn1? ! io.Error {
+    if d.at == 0 {
+        return (<-w) ?? none
+    }
+    let left = remaining(d)
+    var got: *Conn1? = none
+    var granted = false
+    if left > 0 {
+        granted = select {
+            g = <-w => {
+                got = g ?? none
+                true
+            }
+            after(left) => false
+        }
+    }
+    if granted {
+        return got
+    }
+    h.lock <- true
+    var waiting = false
+    var kept: []chan[*Conn1?] = []
+    for x in h.waiters {
+        if x == w {
+            waiting = true
+        } else {
+            push(mut kept, x)
+        }
+    }
+    h.waiters = kept
+    <-h.lock
+    if !waiting {
+        match (<-w) ?? none {
+            some(conn) => release(c, conn, true)
+            none => vacate(h)
+        }
+    }
+    fail TimedOut
+}
+
+fn vacate(h: *Host) {
+    h.lock <- true
+    if h.waiters.len > 0 {
+        let w = h.waiters[0]
+        h.waiters = h.waiters[1..]
+        <-h.lock
+        w <- none
+        return
+    }
+    h.open -= 1
+    <-h.lock
+}
+
+fn release(c: *Client, conn: *Conn1, reusable: bool) {
+    let h = conn.host
+    if !reusable {
+        conn.wire.stream.close()
+        vacate(h)
+        return
+    }
+    conn.idle_at = now_ms()
+    h.lock <- true
+    if h.waiters.len > 0 {
+        let w = h.waiters[0]
+        h.waiters = h.waiters[1..]
+        <-h.lock
+        w <- some(conn)
+        return
+    }
+    push(mut h.idle, conn)
+    <-h.lock
+    keep_tidy(c)
+}
+
+fn wake_all(waiters: []chan[bool]) {
+    for w in waiters {
+        notify(w)
+    }
+}
+
+fn acquire_mux(job: Job, h: *Host, u: Url, a: *Attempt) -> Route ! io.Error {
+    for {
+        h.lock <- true
+        match h.mux {
+            some(m) => {
+                if a.avoid != m && !m.closed && !m.draining {
+                    <-h.lock
+                    a.reused = true
+                    return Multiplexed(m)
+                }
+                h.mux = none
+                <-h.lock
+                drain_mux(m)
+                continue
+            }
+            none => {}
+        }
+        if h.alpn == "http/1.1" {
+            <-h.lock
+            return Single(acquire_conn(job, h, u, a)?)
+        }
+        if h.dialing {
+            let w = chan[bool](1)
+            push(mut h.dial_waiters, w)
+            <-h.lock
+            await(w, job.deadline)?
+            continue
+        }
+        h.dialing = true
+        <-h.lock
+        let alpn = ["h2", "http/1.1"]
+        let dialed = outcome(fn() -> Wire ! io.Error { dial(job, u, alpn, a) })
+        h.lock <- true
+        h.dialing = false
+        let waiters = h.dial_waiters
+        h.dial_waiters = []
+        let wire = match dialed {
+            Done(w) => w
+            Failed(e) => {
+                <-h.lock
+                wake_all(waiters)
+                fail e
+            }
+        }
+        if wire.protocol != "h2" {
+            h.alpn = "http/1.1"
+            h.open += 1
+            <-h.lock
+            wake_all(waiters)
+            return Single(new_conn1(wire, h))
+        }
+        let m = new_mux(h, wire)
+        h.alpn = "h2"
+        h.mux = m
+        <-h.lock
+        wake_all(waiters)
+        start_mux(m)?
+        keep_tidy(job.client)
+        return Multiplexed(m)
+    }
+}
+
+fn keep_tidy(c: *Client) {
+    c.lock <- true
+    if c.tidying {
+        <-c.lock
+        return
+    }
+    c.tidying = true
+    <-c.lock
+    spawn tidy(c)
+}
+
+fn tidy(c: *Client) {
+    let quarter = c.options.idle_timeout / 4
+    let period = if quarter < 10 { 10 } else { quarter }
+    for {
+        sleep(period)
+        if sweep_all(c) {
+            continue
+        }
+        c.lock <- true
+        c.tidying = false
+        <-c.lock
+        if sweep_all(c) {
+            keep_tidy(c)
+        }
+        return
+    }
+}
+
+fn sweep_all(c: *Client) -> bool {
+    c.lock <- true
+    var hosts: []*Host = []
+    for _, h in c.hosts {
+        push(mut hosts, h)
+    }
+    <-c.lock
+    var busy = false
+    for h in hosts {
+        if sweep(c, h) {
+            busy = true
+        }
+    }
+    busy
+}
+
+fn sweep(c: *Client, h: *Host) -> bool {
+    let now = now_ms()
+    let limit = c.options.idle_timeout
+    var stale: []*Conn1 = []
+    var kept: []*Conn1 = []
+    var idle_mux: *Mux? = none
+    h.lock <- true
+    for conn in h.idle {
+        if now - conn.idle_at >= limit {
+            push(mut stale, conn)
+            h.open -= 1
+        } else {
+            push(mut kept, conn)
+        }
+    }
+    h.idle = kept
+    match h.mux {
+        some(m) => {
+            if m.closed || retire_idle(m, now, limit) {
+                h.mux = none
+                idle_mux = m
+            }
+        }
+        none => {}
+    }
+    let busy = h.idle.len > 0 || h.mux != none
+    <-h.lock
+    for conn in stale {
+        conn.wire.stream.close()
+    }
+    match idle_mux {
+        some(m) => shutdown_mux(m)
+        none => {}
+    }
+    busy
+}

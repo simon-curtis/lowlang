@@ -1,0 +1,353 @@
+import std/compress/brotli
+import std/compress/deflate
+import std/compress/zstd
+import std/file
+import std/http
+import std/io
+import std/net
+import std/text
+
+struct State {
+    accepts: i64
+    other: str
+}
+
+struct Point {
+    x: i64
+    label: str
+}
+
+fn query_value(req: http.Request, name: str) -> str {
+    for pair in text.split(req.query, '&') {
+        let eq = text.index_byte(pair, '=')
+        if eq > 0 && pair[..eq] == name {
+            return http.unescape(pair[eq + 1..]) catch ""
+        }
+    }
+    ""
+}
+
+fn with_headers(status: i64, body: []u8, headers: []http.Header) -> http.Response {
+    http.Response { status, headers, body }
+}
+
+fn big_body() -> []u8 {
+    var out: []u8 = []
+    for i in 0..200000 {
+        push(mut out, u8('a' + i % 23))
+    }
+    out
+}
+
+fn handle(s: *State, req: http.Request) -> http.Response {
+    let p = req.path
+    if p == "/echo" {
+        let auth = http.header(req.headers, "authorization") ?? "-"
+        let cookie = http.header(req.headers, "cookie") ?? "-"
+        let kind = http.header(req.headers, "content-type") ?? "-"
+        let te = http.header(req.headers, "transfer-encoding") ?? "-"
+        return http.response(200, "{req.method} {req.target} auth={auth} cookie={cookie} type={kind} te={te} body={str(req.body)}")
+    }
+    if p == "/redirect" {
+        let code = text.parse_uint(query_value(req, "code"), 10) catch 302
+        let to = query_value(req, "to")
+        return with_headers(code, bytes("moved"), [http.Header { name: "location", value: if to.len > 0 { to } else { "/echo" } }])
+    }
+    if p == "/away" {
+        return with_headers(302, [], [http.Header { name: "location", value: "{s.other}/echo" }])
+    }
+    if p == "/loop" {
+        return with_headers(302, [], [http.Header { name: "location", value: "loop" }])
+    }
+    if p == "/setcookie" {
+        return with_headers(200, [], [
+            http.Header { name: "set-cookie", value: "a=1; Path=/" }
+            http.Header { name: "set-cookie", value: "b=2; Path=/echo; Max-Age=3600" }
+            http.Header { name: "set-cookie", value: "c=3; Expires=Thu, 01 Jan 1970 00:00:00 GMT" }
+            http.Header { name: "set-cookie", value: "d=4; Expires=Wed, 21 Oct 2165 07:28:00 GMT" }
+            http.Header { name: "set-cookie", value: "e=5; Domain=example.com" }
+        ])
+    }
+    if p == "/delcookie" {
+        return with_headers(200, [], [http.Header { name: "set-cookie", value: "a=gone; Path=/; Max-Age=0" }])
+    }
+    if p == "/compressed" {
+        let plain = bytes("compressed hello compressed hello compressed hello")
+        let kind = query_value(req, "kind")
+        let data = if kind == "gzip" {
+            deflate.gzip_compress(plain, 6)
+        } else if kind == "deflate" {
+            deflate.zlib_compress(plain, 6)
+        } else if kind == "rawdeflate" {
+            deflate.compress(plain, 6)
+        } else if kind == "br" {
+            brotli.compress(plain, 5)
+        } else {
+            zstd.compress(plain, 3)
+        }
+        let name = if kind == "rawdeflate" { "deflate" } else { kind }
+        return with_headers(200, data, [http.Header { name: "content-encoding", value: name }])
+    }
+    if p == "/big" {
+        let body = big_body()
+        if query_value(req, "gzip") == "1" {
+            return with_headers(200, deflate.gzip_compress(body, 1), [http.Header { name: "content-encoding", value: "gzip" }])
+        }
+        return http.response(200, str(body))
+    }
+    if p == "/json" {
+        return with_headers(200, bytes("{{\"x\":{req.body.len},\"label\":\"{req.method}\"}}"), [http.Header { name: "content-type", value: "application/json" }])
+    }
+    if p == "/status" {
+        return http.response(text.parse_uint(query_value(req, "code"), 10) catch 500, "status")
+    }
+    http.response(404, "missing")
+}
+
+fn serve(l: net.Listener, s: *State) {
+    let handler = fn(req: http.Request) -> http.Response { handle(s, req) }
+    for {
+        let c = net.accept(l) catch {
+            _ => return
+        }
+        s.accepts += 1
+        spawn http.serve_conn(c, handler)
+    }
+}
+
+fn raw_server(l: net.Listener, s: *State) {
+    for {
+        let c = net.accept(l) catch {
+            _ => return
+        }
+        s.accepts += 1
+        spawn raw_conn(c)
+    }
+}
+
+fn raw_conn(c: net.Conn) {
+    defer net.close(c)
+    let r = io.reader(net.stream(c))
+    let req = http.read_request(r) catch {
+        _ => return
+    }
+    var out = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-type: text/plain\r\n\r\n"
+    for part in ["chunk", "ed ", "bo", "dy"] {
+        out = "{out}{text.hex(part.len)};ext=1\r\n{part}\r\n"
+    }
+    out = "{out}0\r\nx-trailer: t\r\n\r\n"
+    if req.path == "/gzip" {
+        let packed = deflate.gzip_compress(bytes("chunked gzip body"), 6)
+        out = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-encoding: gzip\r\n\r\n{text.hex(packed.len)}\r\n{str(packed)}\r\n0\r\n\r\n"
+    }
+    net.write_all(c, bytes(out)) catch {
+        _ => {}
+    }
+}
+
+fn result(op: fn() -> http.Response ! http.Error) -> str {
+    let r = op() catch {
+        InvalidUrl(u) => return "invalid url {u}"
+        Connect(_) => return "connect error"
+        Tls(_) => return "tls error"
+        Timeout => return "timeout"
+        TooManyRedirects(n) => return "too many redirects {n}"
+        Protocol(_) => return "protocol error"
+        Decode(_) => return "decode error"
+        Json(_) => return "json error"
+        Status(code) => return "status {code}"
+        Io(_) => return "io error"
+    }
+    "{r.status} {r.text()}"
+}
+
+fn show(label: str, r: http.Response) {
+    print("{label}: {r.status} {r.text()}")
+}
+
+fn urls() ! io.Error {
+    for s in ["HTTP://User:p%40ss@Example.COM:8080/a/./b/../c?q=1#frag", "https://[2001:db8::1]/x y", "http://h/%7Euser/é"] {
+        let u = http.parse_url(s)?
+        print("{u.scheme} {u.host} {u.port} {u.target} {u.user} {u.password} {http.format_url(u)}")
+    }
+    for bad in ["http://", "nope", "http://[::1", "http://h:99999/", "http://a b/"] {
+        let failed = http.parse_url(bad) catch {
+            _ => {
+                print("rejected {bad}")
+                continue
+            }
+        }
+        print("accepted {failed.host}")
+    }
+    let base = http.parse_url("http://a/b/c/d;p?q")?
+    for r in ["g", "./g", "g/", "/g", "//g", "?y", "g?y", "../g", "../..", "../../../g", "http://x/y#z", ""] {
+        print("{r} -> {http.format_url(http.resolve(base, r)?)}")
+    }
+    print(http.escape("a b&c=d/é~"))
+    print(http.form_encode([http.Field { name: "a b", value: "x&y" }, http.Field { name: "c", value: "1+1" }]))
+    print(http.unescape("a%20b%2Fc")?)
+}
+
+fn basics(c: *http.Client, base: str) ! http.Error {
+    show("get", c.get("/echo?x=1")?)
+    show("head", c.head("/echo")?)
+    show("delete", c.del("/echo")?)
+    show("put", c.put("/echo", "text/plain", bytes("p"))?)
+    show("patch", c.patch("/echo", "text/plain", bytes("q"))?)
+    show("text", c.request("POST", "/echo").with_text("words").send()?)
+    show("form", c.request("POST", "/echo").with_form([http.Field { name: "k", value: "a b" }, http.Field { name: "z", value: "1&2" }]).send()?)
+    show("json", c.request("POST", "/echo").with_json(Point { x: 3, label: "p" }).send()?)
+    show("headers", c.request("GET", "/echo").with_bearer_token("tok").with_header("cookie", "mine=1").send()?)
+    show("basic", c.request("GET", "/echo").with_basic_auth("user", "pw").send()?)
+    show("userinfo", c.get("http://u:p@127.0.0.1:{text.split(base, ':')[2]}/echo")?)
+    let decoded = http.json[Point](c.request("POST", "/json").with_text("abcd").send()?)?
+    print("decoded {decoded.x} {decoded.label}")
+    let parts = [
+        http.text_part("field", "value"),
+        http.file_part("upload", "a\"b.txt", "text/plain", bytes("file contents")),
+    ]
+    let multipart = c.request("POST", "/echo").with_multipart(parts).send()?
+    let body = multipart.text()
+    print("multipart {text.index(body, "type=multipart/form-data; boundary=") > 0} {text.index(body, "name=\"field\"\r\n\r\nvalue\r\n") > 0} {text.index(body, "filename=\"a%22b.txt\"\r\ncontent-type: text/plain\r\n\r\nfile contents\r\n") > 0}")
+    let streamed = c.request("POST", "/echo").with_body_reader(io.bytes_reader(bytes("streamed upload")), "text/plain").send()?
+    show("chunked upload", streamed)
+    let missing = c.get("/nothing")?
+    print("missing {missing.status} {missing.header_value("content-length") ?? "-"}")
+    let checked = missing.ensure_success() catch {
+        Status(code) => {
+            print("ensure_success failed with {code}")
+            missing
+        }
+        _ => missing
+    }
+    print("checked {checked.status}")
+    let fine = c.get("/echo")?.ensure_success()?
+    print("fine {fine.status} {fine.url == "{base}/echo"}")
+}
+
+fn final_path(r: http.Response) -> str {
+    let u = http.parse_url(r.url) catch {
+        _ => return r.url
+    }
+    u.target
+}
+
+fn redirects(c: *http.Client) ! http.Error {
+    for code in [301, 302, 303, 307, 308] {
+        let r = c.request("POST", "/redirect?code={code}&to=echo%3Fhop%3D{code}").with_text("payload").send()?
+        print("{code}: {r.status} {final_path(r)} {r.text()}")
+    }
+    let h = c.head("/redirect?code=302")?
+    print("head: {h.status} {final_path(h)}")
+    let relative = c.get("/redirect?code=302&to=..%2Fredirect%3Fcode%3D301%26to%3D%2Fecho%253Fdeep%253D1")?
+    print("chained: {relative.status} {final_path(relative)}")
+    let stopped = c.request("GET", "/redirect?code=302").with_redirects(0).send()?
+    print("disabled: {stopped.status} {stopped.header_value("location") ?? "-"} {stopped.text()}")
+    print("loop: {result(fn() -> http.Response ! http.Error { c.get("/loop") })}")
+}
+
+fn cross_origin(c: *http.Client) ! http.Error {
+    let r = c.request("GET", "/away").with_bearer_token("secret").with_header("cookie", "own=1").send()?
+    print("cross-origin: {r.text()}")
+    let same = c.request("GET", "/redirect?code=302").with_bearer_token("secret").send()?
+    print("same-origin: {same.text()}")
+}
+
+fn cookies(base: str) ! http.Error {
+    let c = http.client().with_base_url(base).with_cookies().build()
+    c.get("/setcookie")?
+    show("jar", c.get("/echo")?)
+    show("jar root", c.request("GET", "/").with_redirects(0).send()?)
+    print("cookies_for {c.cookies_for("{base}/")}")
+    c.get("/delcookie")?
+    show("after delete", c.request("GET", "/echo").with_header("cookie", "own=1").send()?)
+    let plain = http.client().with_base_url(base).build()
+    show("no jar", plain.get("/echo")?)
+}
+
+fn compression(c: *http.Client) ! http.Error {
+    for kind in ["gzip", "deflate", "rawdeflate", "br", "zstd"] {
+        let r = c.get("/compressed?kind={kind}")?
+        print("{kind}: {r.text()} length={r.header_value("content-length") ?? "-"} encoding={r.header_value("content-encoding") ?? "-"}")
+    }
+    let raw = c.request("GET", "/compressed?kind=gzip").with_decompression(false).send()?
+    print("raw: {raw.body.len} {raw.body[0]} {raw.body[1]} encoding={raw.header_value("content-encoding") ?? "-"}")
+    let h = c.head("/compressed?kind=gzip")?
+    print("head: {h.status} {h.body.len}")
+}
+
+fn checksum(data: []u8) -> i64 {
+    var sum = 0
+    for b in data {
+        sum = (sum * 31 + i64(b)) % 1000000007
+    }
+    sum
+}
+
+fn streaming(c: *http.Client) ! http.Error {
+    let expected = checksum(big_body())
+    for path in ["/big", "/big?gzip=1"] {
+        var chunks = 0
+        var total = 0
+        var sum = 0
+        let r = c.request("GET", path).stream_to(fn(chunk: []u8) ! io.Error {
+            chunks += 1
+            total += chunk.len
+            for b in chunk {
+                sum = (sum * 31 + i64(b)) % 1000000007
+            }
+        })?
+        print("stream {path}: {r.status} chunks>1={chunks > 1} total={total} match={sum == expected} body={r.body.len}")
+    }
+    print("sink failure: {result(fn() -> http.Response ! http.Error { c.request("GET", "/big").stream_to(fn(chunk: []u8) ! io.Error { fail NoSpace }) })}")
+    let path = "/tmp/std_http_client_download.bin"
+    let d = c.request("GET", "/big?gzip=1").download(path)?
+    let saved = file.read_file(path) catch {
+        _ => []
+    }
+    print("download {d.status} {saved.len} {checksum(saved) == expected}")
+    file.remove(path) catch {
+        _ => {}
+    }
+}
+
+fn chunked_responses(base: str, s: *State) ! http.Error {
+    let c = http.client().with_base_url(base).build()
+    let before = s.accepts
+    for _ in 0..3 {
+        show("chunked", c.get("/plain")?)
+    }
+    let g = c.get("/gzip")?
+    print("chunked gzip: {g.text()} {g.header_value("content-length") ?? "-"}")
+    print("raw accepts {s.accepts - before}")
+}
+
+fn main() ! http.Error {
+    urls() catch {
+        _ => print("url checks failed")
+    }
+    let l = net.listen("127.0.0.1", 0) catch {
+        _ => fail Connect(Refused)
+    }
+    let other = net.listen("127.0.0.1", 0) catch {
+        _ => fail Connect(Refused)
+    }
+    let raw = net.listen("127.0.0.1", 0) catch {
+        _ => fail Connect(Refused)
+    }
+    let base = "http://127.0.0.1:{l.addr.port}"
+    let s = new(State { accepts: 0, other: "http://localhost:{other.addr.port}" })
+    let o = new(State { accepts: 0, other: base })
+    let r = new(State { accepts: 0, other: "" })
+    spawn serve(l, s)
+    spawn serve(other, o)
+    spawn raw_server(raw, r)
+    let c = http.client().with_base_url(base).build()
+    basics(c, base)?
+    redirects(c)?
+    cross_origin(c)?
+    cookies(base)?
+    compression(c)?
+    streaming(c)?
+    chunked_responses("http://127.0.0.1:{raw.addr.port}", r)?
+}

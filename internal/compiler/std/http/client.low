@@ -1,8 +1,66 @@
+import std/base64
 import std/compress/deflate
+import std/compress/brotli
+import std/compress/zstd
+import std/crypto
+import std/crypto/x509
+import std/file
 import std/io
+import std/json
 import std/net
+import std/serde
 import std/text
 import std/tls
+
+pub enum Error {
+    InvalidUrl(url: str)
+    Connect(cause: io.Error)
+    Tls(cause: io.Error)
+    Timeout
+    TooManyRedirects(count: i64)
+    Protocol(cause: io.Error)
+    Decode(cause: io.Error)
+    Json(cause: serde.Error)
+    Status(code: i64)
+    Io(cause: io.Error)
+}
+
+pub struct Part {
+    pub name: str
+    pub filename: str = ""
+    pub content_type: str = ""
+    pub data: []u8
+}
+
+pub struct Builder[K] {
+    base_url: str = ""
+    headers: []Header = []
+    timeout: i64 = 0
+    connect_timeout: i64 = 0
+    redirects: i64 = 10
+    retries: i64 = 0
+    cookies: bool = false
+    version: Version = Http2
+    max_per_host: i64 = 0
+    idle_timeout: i64 = 90000
+    decompression: bool = true
+    tls: tls.Config = tls.Config {}
+    client: *Client? = none
+    method: str = "GET"
+    url: str = ""
+    query: []Field = []
+    body: []u8 = []
+    source: *io.Reader? = none
+}
+
+pub struct Client {
+    options: Builder[Client]
+    lock: chan[bool]
+    hosts: [str: *Host]
+    jar: *Jar?
+    reaper: *Reaper
+    tidying: bool
+}
 
 pub struct Connection {
     pub stream: io.Stream
@@ -10,8 +68,91 @@ pub struct Connection {
     pub secure: bool
 }
 
+struct Outgoing {
+    method: str
+    url: Url
+    headers: []Header
+    body: []u8
+    source: *io.Reader?
+}
+
+struct Incoming {
+    status: i64
+    headers: []Header
+    version: Version
+    body: io.Stream
+    length: i64
+    attempt: *Attempt
+    finish: fn(bool)
+}
+
+struct Framing {
+    reader: *io.Reader
+    mode: Mode
+    left: i64
+    first: bool
+    done: bool
+}
+
+enum Mode {
+    Empty
+    Length
+    Chunked
+    UntilClose
+}
+
+struct Head1 {
+    status: i64
+    headers: []Header
+    keep: bool
+}
+
+struct Inflow {
+    pending: []u8
+    done: bool
+}
+
+struct Collector {
+    data: []u8
+    size: i64
+}
+
+enum Outcome[T] {
+    Done(T)
+    Failed(io.Error)
+}
+
+fn outcome[T](op: fn() -> T ! io.Error) -> Outcome[T] {
+    let v = op() catch {
+        NotFound => return Failed(NotFound)
+        Denied => return Failed(Denied)
+        Exists => return Failed(Exists)
+        NotDir => return Failed(NotDir)
+        IsDir => return Failed(IsDir)
+        NotEmpty => return Failed(NotEmpty)
+        Invalid => return Failed(Invalid)
+        NoSpace => return Failed(NoSpace)
+        BrokenPipe => return Failed(BrokenPipe)
+        AddrInUse => return Failed(AddrInUse)
+        AddrUnavailable => return Failed(AddrUnavailable)
+        Unreachable => return Failed(Unreachable)
+        Refused => return Failed(Refused)
+        Reset => return Failed(Reset)
+        Aborted => return Failed(Aborted)
+        TimedOut => return Failed(TimedOut)
+        NotConnected => return Failed(NotConnected)
+        WouldBlock => return Failed(WouldBlock)
+        Eof => return Failed(Eof)
+        Malformed => return Failed(Malformed)
+        TooLarge => return Failed(TooLarge)
+        Unsupported => return Failed(Unsupported)
+        Os(code) => return Failed(Os(code))
+    }
+    Done(v)
+}
+
 pub fn connect(u: Url, protocols: []str) -> Connection ! io.Error {
-    let secure = u.scheme == "https" || u.scheme == "wss"
+    let secure = secure_scheme(u.scheme)
     if !secure && u.scheme != "http" && u.scheme != "ws" {
         fail Unsupported
     }
@@ -23,65 +164,1046 @@ pub fn connect(u: Url, protocols: []str) -> Connection ! io.Error {
     Connection { stream: tls.stream(t), protocol: t.protocol, secure }
 }
 
-pub fn fetch(method: str, url: str, headers: []Header, body: []u8, version: Version) -> Response ! io.Error {
-    let u = parse_url(url)?
-    let alpn = match version {
-        Http2 => ["h2"]
-        Http1 => ["http/1.1"]
-    }
-    let conn = connect(u, alpn)?
-    let s = conn.stream
-    defer s.close()
-    var req = request(method, u.target)
-    req.authority = authority(u)
-    req.headers = headers
-    req.body = body
-    if !has_header(req.headers, "accept-encoding") {
-        set_header(mut req.headers, "accept-encoding", "gzip, deflate")
-    }
-    let resp = match version {
-        Http2 => {
-            if conn.secure && conn.protocol != "h2" {
-                fail Unsupported
-            }
-            send_h2(s, req, if conn.secure { "https" } else { "http" })?
-        }
-        Http1 => {
-            set_header(mut req.headers, "connection", "close")
-            write_request(s, req)?
-            read_response(io.reader(s), method)?
-        }
-    }
-    decoded(resp)
+pub fn client() -> Builder[Client] {
+    Builder[Client] {}
 }
 
-fn decoded(resp: Response) -> Response ! io.Error {
-    let encoding = text.lower(header(resp.headers, "content-encoding") ?? "")
-    if encoding.len == 0 || encoding == "identity" {
-        return resp
-    }
-    var out = resp
-    if encoding == "gzip" || encoding == "x-gzip" {
-        out.body = deflate.gzip_decompress(resp.body, max_body())?
-    } else if encoding == "deflate" {
-        out.body = deflate.zlib_decompress(resp.body, max_body())?
-    } else {
-        return resp
-    }
-    var kept: []Header = []
-    for h in resp.headers {
-        if !text.equal_fold(h.name, "content-encoding") && !text.equal_fold(h.name, "content-length") {
-            push(mut kept, h)
+pub fn build(b: Builder[Client]) -> *Client {
+    new(Client {
+        options: b
+        lock: chan[bool](1)
+        hosts: [:]
+        jar: if b.cookies { some(new_jar()) } else { none }
+        reaper: new_reaper()
+        tidying: false
+    })
+}
+
+pub fn with_header[K](b: Builder[K], name: str, value: str) -> Builder[K] {
+    var out = b
+    var headers: []Header = []
+    for h in b.headers {
+        if !text.equal_fold(h.name, name) {
+            push(mut headers, h)
         }
     }
-    out.headers = kept
+    push(mut headers, Header { name, value })
+    out.headers = headers
     out
 }
 
-pub fn get(url: str) -> Response ! io.Error {
-    fetch("GET", url, [], [], Http1)
+pub fn with_user_agent[K](b: Builder[K], agent: str) -> Builder[K] {
+    with_header(b, "user-agent", agent)
 }
 
-pub fn post(url: str, content_type: str, body: []u8) -> Response ! io.Error {
-    fetch("POST", url, [Header { name: "content-type", value: content_type }], body, Http1)
+pub fn with_bearer_token[K](b: Builder[K], token: str) -> Builder[K] {
+    with_header(b, "authorization", "Bearer {token}")
+}
+
+pub fn with_basic_auth[K](b: Builder[K], user: str, password: str) -> Builder[K] {
+    with_header(b, "authorization", basic_credentials(user, password))
+}
+
+pub fn with_api_key[K](b: Builder[K], name: str, value: str) -> Builder[K] {
+    with_header(b, name, value)
+}
+
+pub fn with_timeout[K](b: Builder[K], millis: i64) -> Builder[K] {
+    var out = b
+    out.timeout = millis
+    out
+}
+
+pub fn with_connect_timeout[K](b: Builder[K], millis: i64) -> Builder[K] {
+    var out = b
+    out.connect_timeout = millis
+    out
+}
+
+pub fn with_redirects[K](b: Builder[K], max: i64) -> Builder[K] {
+    var out = b
+    out.redirects = max
+    out
+}
+
+pub fn with_retries[K](b: Builder[K], n: i64) -> Builder[K] {
+    var out = b
+    out.retries = n
+    out
+}
+
+pub fn with_version[K](b: Builder[K], v: Version) -> Builder[K] {
+    var out = b
+    out.version = v
+    out
+}
+
+pub fn with_decompression[K](b: Builder[K], on: bool) -> Builder[K] {
+    var out = b
+    out.decompression = on
+    out
+}
+
+pub fn with_base_url(b: Builder[Client], url: str) -> Builder[Client] {
+    var out = b
+    out.base_url = url
+    out
+}
+
+pub fn with_cookies(b: Builder[Client]) -> Builder[Client] {
+    var out = b
+    out.cookies = true
+    out
+}
+
+pub fn with_max_connections_per_host(b: Builder[Client], n: i64) -> Builder[Client] {
+    var out = b
+    out.max_per_host = n
+    out
+}
+
+pub fn with_idle_timeout(b: Builder[Client], millis: i64) -> Builder[Client] {
+    var out = b
+    out.idle_timeout = millis
+    out
+}
+
+pub fn with_tls(b: Builder[Client], config: tls.Config) -> Builder[Client] {
+    var out = b
+    out.tls = config
+    out
+}
+
+pub fn with_roots(b: Builder[Client], roots: []x509.Certificate) -> Builder[Client] {
+    var out = b
+    out.tls.roots = roots
+    out
+}
+
+pub fn with_insecure(b: Builder[Client]) -> Builder[Client] {
+    var out = b
+    out.tls.verify = false
+    out
+}
+
+pub fn with_groups(b: Builder[Client], groups: []i64) -> Builder[Client] {
+    var out = b
+    out.tls.groups = groups
+    out
+}
+
+pub fn request(c: *Client, method: str, url: str) -> Builder[Response] {
+    let o = c.options
+    Builder[Response] {
+        headers: o.headers
+        timeout: o.timeout
+        connect_timeout: o.connect_timeout
+        redirects: o.redirects
+        retries: o.retries
+        version: o.version
+        decompression: o.decompression
+        client: c
+        method
+        url
+    }
+}
+
+pub fn with_query(b: Builder[Response], name: str, value: str) -> Builder[Response] {
+    var out = b
+    var query = b.query
+    push(mut query, Field { name, value })
+    out.query = query
+    out
+}
+
+pub fn with_body(b: Builder[Response], body: []u8, content_type: str) -> Builder[Response] {
+    var out = with_header(b, "content-type", content_type)
+    out.body = body
+    out.source = none
+    out
+}
+
+pub fn with_text(b: Builder[Response], body: str) -> Builder[Response] {
+    with_body(b, bytes(body), "text/plain; charset=utf-8")
+}
+
+pub fn with_json[T](b: Builder[Response], value: T) -> Builder[Response] {
+    with_body(b, bytes(json.serialize(value)), "application/json")
+}
+
+pub fn with_form(b: Builder[Response], fields: []Field) -> Builder[Response] {
+    with_body(b, bytes(form_encode(fields)), "application/x-www-form-urlencoded")
+}
+
+pub fn with_multipart(b: Builder[Response], parts: []Part) -> Builder[Response] {
+    let boundary = "lowlang-{text.encode_hex(crypto.random(12))}"
+    var out: []u8 = []
+    for p in parts {
+        text.append(mut out, "--{boundary}\r\ncontent-disposition: form-data; name=\"{quoted(p.name)}\"")
+        if p.filename.len > 0 {
+            text.append(mut out, "; filename=\"{quoted(p.filename)}\"")
+        }
+        text.append(mut out, "\r\n")
+        if p.content_type.len > 0 {
+            text.append(mut out, "content-type: {p.content_type}\r\n")
+        }
+        text.append(mut out, "\r\n")
+        out = joined(out, p.data)
+        text.append(mut out, "\r\n")
+    }
+    text.append(mut out, "--{boundary}--\r\n")
+    with_body(b, out, "multipart/form-data; boundary={boundary}")
+}
+
+pub fn with_body_reader(b: Builder[Response], source: *io.Reader, content_type: str) -> Builder[Response] {
+    var out = with_header(b, "content-type", content_type)
+    out.body = []
+    out.source = source
+    out
+}
+
+pub fn text_part(name: str, value: str) -> Part {
+    Part { name, data: bytes(value) }
+}
+
+pub fn file_part(name: str, filename: str, content_type: str, data: []u8) -> Part {
+    Part { name, filename, content_type, data }
+}
+
+fn quoted(s: str) -> str {
+    var out: []u8 = []
+    for i in 0..s.len {
+        let c = s[i]
+        if c == '"' {
+            text.append(mut out, "%22")
+        } else if c == '\r' {
+            text.append(mut out, "%0D")
+        } else if c == '\n' {
+            text.append(mut out, "%0A")
+        } else {
+            push(mut out, c)
+        }
+    }
+    __str_view(out)
+}
+
+fn joined(a: []u8, b: []u8) -> []u8 {
+    let out: []u8 = __make(a.len + b.len)
+    __memmove(out, a)
+    __memmove(out[a.len..], b)
+    out
+}
+
+fn basic_credentials(user: str, password: str) -> str {
+    "Basic {base64.encode(bytes("{user}:{password}"))}"
+}
+
+pub fn send(b: Builder[Response]) -> Response ! Error {
+    perform(b, true, fn(chunk: []u8) ! io.Error {})
+}
+
+pub fn stream_to(b: Builder[Response], sink: fn([]u8) ! io.Error) -> Response ! Error {
+    perform(b, false, sink)
+}
+
+pub fn download(b: Builder[Response], path: str) -> Response ! Error {
+    let f = file.create(path) catch {
+        _ => fail Io(Denied)
+    }
+    var kept = false
+    defer {
+        file.close(f)
+        if !kept {
+            file.remove(path) catch {
+                _ => {}
+            }
+        }
+    }
+    let resp = perform(b, false, fn(chunk: []u8) ! io.Error { file.write_all(f, chunk)? })?
+    kept = true
+    resp
+}
+
+pub fn get(c: *Client, url: str) -> Response ! Error {
+    send(request(c, "GET", url))
+}
+
+pub fn head(c: *Client, url: str) -> Response ! Error {
+    send(request(c, "HEAD", url))
+}
+
+pub fn del(c: *Client, url: str) -> Response ! Error {
+    send(request(c, "DELETE", url))
+}
+
+pub fn post(c: *Client, url: str, content_type: str, body: []u8) -> Response ! Error {
+    send(with_body(request(c, "POST", url), body, content_type))
+}
+
+pub fn put(c: *Client, url: str, content_type: str, body: []u8) -> Response ! Error {
+    send(with_body(request(c, "PUT", url), body, content_type))
+}
+
+pub fn patch(c: *Client, url: str, content_type: str, body: []u8) -> Response ! Error {
+    send(with_body(request(c, "PATCH", url), body, content_type))
+}
+
+pub fn text(resp: Response) -> str {
+    str(resp.body)
+}
+
+pub fn json[T](resp: Response) -> T ! Error {
+    json.deserialize[T](resp.body) catch {
+        Syntax(at, message) => fail Json(serde.Error.Syntax(at, message))
+        Mismatch(expected, at) => fail Json(serde.Error.Mismatch(expected, at))
+        Missing(field) => fail Json(serde.Error.Missing(field))
+        UnknownVariant(name) => fail Json(serde.Error.UnknownVariant(name))
+        Range(at) => fail Json(serde.Error.Range(at))
+        TooDeep => fail Json(serde.Error.TooDeep)
+    }
+}
+
+pub fn ensure_success(resp: Response) -> Response ! Error {
+    if resp.status < 200 || resp.status > 299 {
+        fail Status(resp.status)
+    }
+    resp
+}
+
+pub fn header_value(resp: Response, name: str) -> str? {
+    header(resp.headers, name)
+}
+
+pub fn header_values(resp: Response, name: str) -> []str {
+    var out: []str = []
+    for h in resp.headers {
+        if text.equal_fold(h.name, name) {
+            push(mut out, h.value)
+        }
+    }
+    out
+}
+
+pub fn cookies_for(c: *Client, url: str) -> str {
+    let u = parse_url(url) catch {
+        _ => return ""
+    }
+    match c.jar {
+        some(j) => cookie_header(j, u)
+        none => ""
+    }
+}
+
+pub fn close_idle(c: *Client) {
+    c.lock <- true
+    var hosts: []*Host = []
+    for _, h in c.hosts {
+        push(mut hosts, h)
+    }
+    <-c.lock
+    for h in hosts {
+        h.lock <- true
+        let idle = h.idle
+        h.idle = []
+        h.open -= idle.len
+        let current = h.mux
+        h.mux = none
+        <-h.lock
+        for conn in idle {
+            conn.wire.stream.close()
+        }
+        match current {
+            some(m) => drain_mux(m)
+            none => {}
+        }
+    }
+}
+
+fn target_url(c: *Client, b: Builder[Response]) -> Url ! io.Error {
+    let base = c.options.base_url
+    var u = if base.len > 0 && scheme_end(b.url) <= 0 { resolve(parse_url(base)?, b.url)? } else { parse_url(b.url)? }
+    if u.scheme != "http" && u.scheme != "https" {
+        fail Unsupported
+    }
+    for q in b.query {
+        u = with_query_pair(u, q.name, q.value)
+    }
+    u
+}
+
+fn request_headers(b: Builder[Response], u: Url) -> []Header {
+    var headers = b.headers
+    if !has_header(headers, "user-agent") {
+        push(mut headers, Header { name: "user-agent", value: "lowlang-http/1" })
+    }
+    if !has_header(headers, "accept") {
+        push(mut headers, Header { name: "accept", value: "*/*" })
+    }
+    if b.decompression && !has_header(headers, "accept-encoding") {
+        push(mut headers, Header { name: "accept-encoding", value: "gzip, deflate, br, zstd" })
+    }
+    if u.user.len > 0 && !has_header(headers, "authorization") {
+        push(mut headers, Header { name: "authorization", value: basic_credentials(u.user, u.password) })
+    }
+    headers
+}
+
+fn without_headers(headers: []Header, names: []str) -> []Header {
+    var out: []Header = []
+    for h in headers {
+        var dropped = false
+        for name in names {
+            if text.equal_fold(h.name, name) {
+                dropped = true
+            }
+        }
+        if !dropped {
+            push(mut out, h)
+        }
+    }
+    out
+}
+
+fn redirect_status(status: i64) -> bool {
+    status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+}
+
+fn perform(b: Builder[Response], collect: bool, sink: fn([]u8) ! io.Error) -> Response ! Error {
+    let c = match b.client {
+        some(c) => c
+        none => fail InvalidUrl(b.url)
+    }
+    var url = target_url(c, b) catch {
+        _ => fail InvalidUrl(b.url)
+    }
+    let d = arm(c.reaper, b.timeout)
+    defer disarm(c.reaper, d)
+    let job = Job { client: c, deadline: d, connect_timeout: b.connect_timeout, version: b.version }
+    var req = Outgoing { method: b.method, url, headers: request_headers(b, url), body: b.body, source: b.source }
+    var hops = 0
+    for {
+        let inc = attempt(job, b, req)?
+        match c.jar {
+            some(j) => store_cookies(j, req.url, inc.headers)
+            none => {}
+        }
+        let location = header(inc.headers, "location") ?? ""
+        let keeps_body = inc.status == 307 || inc.status == 308
+        let follow = b.redirects > 0 && location.len > 0 && redirect_status(inc.status) && !(keeps_body && req.source != none)
+        if !follow {
+            return finish_response(job, inc, req.url, b.decompression, collect, sink)
+        }
+        let next = resolve(req.url, location) catch {
+            _ => {
+                inc.finish(false)
+                fail InvalidUrl(location)
+            }
+        }
+        if next.scheme != "http" && next.scheme != "https" {
+            inc.finish(false)
+            fail InvalidUrl(location)
+        }
+        if hops == b.redirects {
+            inc.finish(false)
+            fail TooManyRedirects(hops)
+        }
+        discard(inc)
+        hops += 1
+        if !keeps_body && req.method != "HEAD" {
+            req.method = "GET"
+            req.body = []
+            req.source = none
+            req.headers = without_headers(req.headers, ["content-type", "content-length", "transfer-encoding"])
+        }
+        if origin(next) != origin(req.url) {
+            req.headers = without_headers(req.headers, ["authorization", "cookie", "proxy-authorization"])
+        }
+        req.url = next
+    }
+}
+
+fn idempotent(method: str) -> bool {
+    method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS" || method == "TRACE"
+}
+
+fn retry_status(status: i64) -> bool {
+    status == 429 || status == 502 || status == 503 || status == 504
+}
+
+fn transport_failure(e: io.Error) -> bool {
+    match e {
+        Reset => true
+        Eof => true
+        BrokenPipe => true
+        Refused => true
+        Unreachable => true
+        Aborted => true
+        NotConnected => true
+        TimedOut => true
+        _ => false
+    }
+}
+
+fn backoff(tries: i64, headers: []Header) -> i64 {
+    let shift = if tries > 6 { 6 } else { tries }
+    var wait = 100 << shift
+    let after = text.parse_uint(text.trim(header(headers, "retry-after") ?? ""), 10) catch -1
+    if after >= 0 && after * 1000 > wait {
+        wait = after * 1000
+    }
+    if wait > 30000 { 30000 } else { wait }
+}
+
+fn fits(d: *Deadline, wait: i64) -> bool {
+    let left = remaining(d)
+    left == 0 || left > wait
+}
+
+fn attempt(job: Job, b: Builder[Response], base: Outgoing) -> Incoming ! Error {
+    let c = job.client
+    let h = host_for(c, base.url)
+    var req = base
+    match c.jar {
+        some(j) => {
+            let jar_cookies = cookie_header(j, req.url)
+            if jar_cookies.len > 0 {
+                let own = header(req.headers, "cookie") ?? ""
+                set_header(mut req.headers, "cookie", if own.len > 0 { "{own}; {jar_cookies}" } else { jar_cookies })
+            }
+        }
+        none => {}
+    }
+    let replayable = req.source == none
+    let safe = idempotent(req.method)
+    var tries = 0
+    var fresh = false
+    var avoid: *Mux? = none
+    var stale_retried = false
+    for {
+        let a = new_attempt(fresh, avoid)
+        fresh = false
+        avoid = none
+        let result = outcome(fn() -> Incoming ! io.Error { open(job, h, req, a) })
+        match result {
+            Done(inc) => {
+                if safe && replayable && tries < b.retries && retry_status(inc.status) {
+                    let wait = backoff(tries, inc.headers)
+                    if fits(job.deadline, wait) {
+                        discard(inc)
+                        sleep(wait)
+                        tries += 1
+                        continue
+                    }
+                }
+                return inc
+            }
+            Failed(e) => {
+                if expired(job.deadline) {
+                    fail Timeout
+                }
+                if a.stale && replayable && !stale_retried {
+                    stale_retried = true
+                    fresh = true
+                    avoid = a.used
+                    continue
+                }
+                let retryable = a.phase == Connecting || safe && a.phase != Handshaking && transport_failure(e)
+                if retryable && replayable && tries < b.retries {
+                    let wait = backoff(tries, [])
+                    if fits(job.deadline, wait) {
+                        sleep(wait)
+                        tries += 1
+                        fresh = true
+                        avoid = a.used
+                        continue
+                    }
+                }
+                fail classify(e, a)
+            }
+        }
+    }
+}
+
+fn classify(e: io.Error, a: *Attempt) -> Error {
+    if a.sinking {
+        return Io(e)
+    }
+    match a.phase {
+        Connecting => if e == io.Error.TimedOut { Timeout } else { Connect(e) }
+        Handshaking => Tls(e)
+        Decoding => if a.broken { transport_error(e) } else { Decode(e) }
+        _ => transport_error(e)
+    }
+}
+
+fn transport_error(e: io.Error) -> Error {
+    match e {
+        Malformed => Protocol(e)
+        TooLarge => Protocol(e)
+        Unsupported => Protocol(e)
+        TimedOut => Timeout
+        _ => Io(e)
+    }
+}
+
+fn open(job: Job, h: *Host, req: Outgoing, a: *Attempt) -> Incoming ! io.Error {
+    match acquire(job, h, req.url, a)? {
+        Single(conn) => exchange1(job, conn, req, a)
+        Multiplexed(m) => exchange2(job, m, req, a)
+    }
+}
+
+fn discard(inc: Incoming) {
+    let buf = io.buffer(16384)
+    var total = 0
+    for total < 1 << 20 {
+        let n = inc.body.read(buf) catch {
+            _ => {
+                inc.finish(false)
+                return
+            }
+        }
+        if n == 0 {
+            inc.finish(true)
+            return
+        }
+        total += n
+    }
+    inc.finish(false)
+}
+
+fn finish_response(job: Job, inc: Incoming, u: Url, decode: bool, collect: bool, sink: fn([]u8) ! io.Error) -> Response ! Error {
+    let a = inc.attempt
+    a.phase = Receiving
+    a.broken = false
+    a.sinking = false
+    let encoding = if decode { text.lower(text.trim(header(inc.headers, "content-encoding") ?? "")) } else { "" }
+    let decoded = encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate" || encoding == "br" || encoding == "zstd"
+    let delivered = outcome(fn() -> []u8 ! io.Error { deliver_body(inc, if decoded { encoding } else { "" }, collect, sink) })
+    let body = match delivered {
+        Done(body) => body
+        Failed(e) => {
+            inc.finish(false)
+            if expired(job.deadline) {
+                fail Timeout
+            }
+            fail classify(e, a)
+        }
+    }
+    inc.finish(true)
+    var headers = inc.headers
+    if decoded {
+        headers = without_headers(headers, ["content-encoding", "content-length"])
+        if collect {
+            push(mut headers, Header { name: "content-length", value: "{body.len}" })
+        }
+    }
+    Response { status: inc.status, headers, body, url: format_url(u), version: inc.version }
+}
+
+fn collect_into(c: *Collector, chunk: []u8) ! io.Error {
+    if c.size + chunk.len > max_body() {
+        fail TooLarge
+    }
+    if c.size + chunk.len > c.data.len {
+        var capacity = c.data.len * 2
+        if capacity < c.size + chunk.len {
+            capacity = c.size + chunk.len
+        }
+        if capacity < 16384 {
+            capacity = 16384
+        }
+        let grown: []u8 = __make(capacity)
+        __memmove(grown, c.data[..c.size])
+        c.data = grown
+    }
+    __memmove(c.data[c.size..], chunk)
+    c.size += chunk.len
+}
+
+fn deliver_body(inc: Incoming, encoding: str, collect: bool, sink: fn([]u8) ! io.Error) -> []u8 ! io.Error {
+    let a = inc.attempt
+    if collect && encoding.len == 0 && inc.length >= 0 {
+        return read_known(inc)
+    }
+    let collector = new(Collector { data: [], size: 0 })
+    let target = fn(chunk: []u8) ! io.Error {
+        a.sinking = true
+        if collect {
+            collect_into(collector, chunk)?
+        } else {
+            sink(chunk)?
+        }
+        a.sinking = false
+    }
+    if encoding.len == 0 {
+        let buf = io.buffer(65536)
+        for {
+            let n = inc.body.read(buf)?
+            if n == 0 {
+                break
+            }
+            target(buf[..n])?
+        }
+        return collector.data[..collector.size]
+    }
+    let first = io.buffer(2)
+    var got = 0
+    for got < 2 {
+        let n = inc.body.read(first[got..])?
+        if n == 0 {
+            break
+        }
+        got += n
+    }
+    if got == 0 {
+        return []
+    }
+    var replay = first[..got]
+    let source = inc.body
+    let joined_stream = io.Stream {
+        read: fn(buf) -> i64 ! io.Error {
+            if replay.len > 0 {
+                let n = io.copy(buf, replay)
+                replay = replay[n..]
+                return n
+            }
+            source.read(buf)
+        }
+        write: source.write
+        close: source.close
+    }
+    let r = io.reader(joined_stream)
+    let limit = if collect { max_body() } else { 1 << 62 }
+    a.phase = Decoding
+    if encoding == "zstd" {
+        zstd.decode(r, target, limit)?
+    } else if encoding == "br" {
+        brotli.decode(r, target, limit)?
+    } else if encoding == "deflate" {
+        let zlib = got == 2 && first[0] & 0x0F == 8 && (i64(first[0]) * 256 + i64(first[1])) % 31 == 0
+        if zlib {
+            deflate.zlib_decode(r, target, limit)?
+        } else {
+            deflate.decode(r, target, limit)?
+        }
+    } else {
+        deflate.gzip_decode(r, target, limit)?
+    }
+    a.phase = Receiving
+    let rest = io.buffer(16384)
+    for io.read_some(r, rest)? > 0 {}
+    collector.data[..collector.size]
+}
+
+fn read_known(inc: Incoming) -> []u8 ! io.Error {
+    if inc.length > max_body() {
+        fail TooLarge
+    }
+    let out: []u8 = __make(inc.length)
+    var got = 0
+    for got < out.len {
+        let n = inc.body.read(out[got..])?
+        if n == 0 {
+            fail Eof
+        }
+        got += n
+    }
+    let probe = io.buffer(1)
+    if inc.body.read(probe)? != 0 {
+        fail Malformed
+    }
+    out
+}
+
+fn exchange1(job: Job, conn: *Conn1, req: Outgoing, a: *Attempt) -> Incoming ! io.Error {
+    let c = job.client
+    attach(c.reaper, job.deadline, conn.wire.conn.fd)
+    let before = conn.received.n
+    let opened = outcome(fn() -> Head1 ! io.Error { start1(conn, req, a) })
+    let head = match opened {
+        Done(h) => h
+        Failed(e) => {
+            a.stale = a.reused && conn.received.n == before
+            detach(c.reaper, job.deadline)
+            release(c, conn, false)
+            fail e
+        }
+    }
+    let framing = new(Framing { reader: conn.reader, mode: Empty, left: 0, first: true, done: false })
+    var length = -1
+    if !bodiless(req.method, head.status) && head.status != 101 {
+        if chunked(head.headers) {
+            framing.mode = Chunked
+        } else {
+            let declared = text.trim(header(head.headers, "content-length") ?? "")
+            if declared.len > 0 {
+                length = text.parse_uint(declared, 10) catch {
+                    _ => {
+                        detach(c.reaper, job.deadline)
+                        release(c, conn, false)
+                        fail Malformed
+                    }
+                }
+                framing.mode = if length > 0 { Length } else { Empty }
+                framing.left = length
+            } else {
+                framing.mode = UntilClose
+            }
+        }
+    } else {
+        length = 0
+    }
+    let reusable = head.keep && head.status != 101 && framing.mode != UntilClose
+    let body = io.Stream {
+        read: fn(buf) -> i64 ! io.Error {
+            a.broken = true
+            let n = framed_read(framing, buf)?
+            a.broken = false
+            n
+        }
+        write: fn(data) -> i64 ! io.Error { fail Unsupported }
+        close: fn() {}
+    }
+    Incoming {
+        status: head.status
+        headers: head.headers
+        version: Http1
+        body
+        length
+        attempt: a
+        finish: fn(ok: bool) {
+            detach(c.reaper, job.deadline)
+            release(c, conn, ok && reusable && framing.done)
+        }
+    }
+}
+
+fn start1(conn: *Conn1, req: Outgoing, a: *Attempt) -> Head1 ! io.Error {
+    a.phase = Sending
+    write_request1(conn.stream, req)?
+    a.phase = Receiving
+    for {
+        let line = io.read_line(conn.reader)?
+        let status = parse_status_line(line)?
+        let headers = read_headers(conn.reader)?
+        if status >= 100 && status < 200 && status != 101 {
+            continue
+        }
+        return Head1 { status, headers, keep: keep_alive(line, headers) }
+    }
+}
+
+fn write_request1(s: io.Stream, req: Outgoing) ! io.Error {
+    var out: []u8 = []
+    text.append(mut out, "{req.method} {req.url.target} HTTP/1.1\r\n")
+    if !has_header(req.headers, "host") {
+        text.append(mut out, "host: {authority(req.url)}\r\n")
+    }
+    write_head(mut out, req.headers)?
+    match req.source {
+        some(src) => {
+            text.append(mut out, "transfer-encoding: chunked\r\n\r\n")
+            io.write_all(s, out)?
+            let buf = io.buffer(16384)
+            for {
+                let n = io.read_some(src, buf)?
+                if n == 0 {
+                    break
+                }
+                var chunk: []u8 = []
+                text.append(mut chunk, "{text.hex(n)}\r\n")
+                chunk = joined(chunk, buf[..n])
+                text.append(mut chunk, "\r\n")
+                io.write_all(s, chunk)?
+            }
+            io.write_str(s, "0\r\n\r\n")?
+        }
+        none => {
+            let sends_length = req.body.len > 0 || req.method == "POST" || req.method == "PUT" || req.method == "PATCH"
+            if sends_length && !has_header(req.headers, "content-length") {
+                text.append(mut out, "content-length: {req.body.len}\r\n")
+            }
+            text.append(mut out, "\r\n")
+            if req.body.len <= 65536 {
+                io.write_all(s, joined(out, req.body))?
+            } else {
+                io.write_all(s, out)?
+                io.write_all(s, req.body)?
+            }
+        }
+    }
+}
+
+fn framed_read(f: *Framing, buf: []u8) -> i64 ! io.Error {
+    if f.done {
+        return 0
+    }
+    match f.mode {
+        Empty => {
+            f.done = true
+            return 0
+        }
+        UntilClose => {
+            let n = io.read_some(f.reader, buf)?
+            if n == 0 {
+                f.done = true
+            }
+            return n
+        }
+        Chunked => {
+            if f.left == 0 {
+                if !f.first && io.read_line(f.reader)?.len != 0 {
+                    fail Malformed
+                }
+                f.first = false
+                let line = io.read_line(f.reader)?
+                let semi = text.index_byte(line, ';')
+                let size = text.parse_uint(text.trim(if semi >= 0 { line[..semi] } else { line }), 16) catch {
+                    _ => fail Malformed
+                }
+                if size == 0 {
+                    read_headers(f.reader)?
+                    f.done = true
+                    return 0
+                }
+                f.left = size
+            }
+        }
+        Length => {}
+    }
+    let want = if buf.len < f.left { buf.len } else { f.left }
+    let n = io.read_some(f.reader, buf[..want])?
+    if n == 0 {
+        fail Eof
+    }
+    f.left -= n
+    if f.mode == Length && f.left == 0 {
+        f.done = true
+    }
+    n
+}
+
+fn exchange2(job: Job, m: *Mux, req: Outgoing, a: *Attempt) -> Incoming ! io.Error {
+    let d = job.deadline
+    a.phase = Sending
+    a.used = m
+    reserve(m, d) catch {
+        TimedOut => fail TimedOut
+        _ => {
+            a.stale = true
+            fail Reset
+        }
+    }
+    let lane = new(Lane { id: 0, events: [], signal: chan[bool](1), window: 0, unacked: 0, ended: false, reset: false })
+    let started = outcome(fn() -> Event ! io.Error { start2(m, lane, req, d, a) })
+    let head = match started {
+        Done(ev) => ev
+        Failed(e) => {
+            finish_lane(m, lane, false)
+            fail e
+        }
+    }
+    let flow = new(Inflow { pending: [], done: false })
+    let declared = text.trim(header(head.headers, "content-length") ?? "")
+    let length = if bodiless(req.method, head.status) { 0 } else { text.parse_uint(declared, 10) catch -1 }
+    let body = io.Stream {
+        read: fn(buf) -> i64 ! io.Error {
+            for flow.pending.len == 0 {
+                if flow.done {
+                    return 0
+                }
+                a.broken = true
+                let ev = next_event(m, lane, d)?
+                match ev.kind {
+                    Data => {
+                        flow.pending = ev.data
+                    }
+                    End => {
+                        flow.done = true
+                        lane.ended = true
+                    }
+                    Head => {}
+                    _ => fail Reset
+                }
+                a.broken = false
+            }
+            let n = io.copy(buf, flow.pending)
+            flow.pending = flow.pending[n..]
+            n
+        }
+        write: fn(data) -> i64 ! io.Error { fail Unsupported }
+        close: fn() {}
+    }
+    Incoming {
+        status: head.status
+        headers: head.headers
+        version: Http2
+        body
+        length
+        attempt: a
+        finish: fn(ok: bool) {
+            finish_lane(m, lane, ok && flow.done)
+        }
+    }
+}
+
+fn start2(m: *Mux, lane: *Lane, req: Outgoing, d: *Deadline, a: *Attempt) -> Event ! io.Error {
+    var fields: []Header = [
+        Header { name: ":method", value: req.method }
+        Header { name: ":scheme", value: req.url.scheme }
+        Header { name: ":authority", value: authority(req.url) }
+        Header { name: ":path", value: req.url.target }
+    ]
+    for h in req.headers {
+        let name = text.lower(h.name)
+        if !valid_name(name) || !valid_value(h.value) {
+            fail Invalid
+        }
+        if connection_specific(name) || name == "host" || name == "te" && h.value != "trailers" {
+            continue
+        }
+        push(mut fields, Header { name, value: h.value })
+    }
+    let streamed = req.source != none
+    let has_body = streamed || req.body.len > 0
+    let sends_length = req.body.len > 0 || req.method == "POST" || req.method == "PUT" || req.method == "PATCH"
+    if !streamed && sends_length && !has_header(req.headers, "content-length") {
+        push(mut fields, Header { name: "content-length", value: "{req.body.len}" })
+    }
+    open_lane(m, lane, fields, !has_body)?
+    match req.source {
+        some(src) => {
+            let buf = io.buffer(16384)
+            for {
+                let n = io.read_some(src, buf)?
+                if n == 0 {
+                    send_data(m, lane, [], true, d)?
+                    break
+                }
+                send_data(m, lane, buf[..n], false, d)?
+            }
+        }
+        none => {
+            if has_body {
+                send_data(m, lane, req.body, true, d)?
+            }
+        }
+    }
+    a.phase = Receiving
+    for {
+        let ev = next_event(m, lane, d)?
+        match ev.kind {
+            Head => return ev
+            Reset => {
+                a.stale = ev.code == 7
+                fail Reset
+            }
+            Lost => {
+                a.stale = a.reused
+                fail Reset
+            }
+            _ => fail Malformed
+        }
+    }
 }

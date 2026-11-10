@@ -1,0 +1,657 @@
+import std/io
+import std/text
+
+struct Event {
+    kind: EventKind
+    status: i64
+    headers: []Header
+    data: []u8
+    flow: i64
+    code: i64
+}
+
+enum EventKind {
+    Head
+    Data
+    End
+    Reset
+    Lost
+}
+
+struct Lane {
+    id: i64
+    events: []Event
+    signal: chan[bool]
+    window: i64
+    unacked: i64
+    ended: bool
+    reset: bool
+}
+
+struct Mux {
+    host: *Host
+    wire: Wire
+    reader: *io.Reader
+    lock: chan[bool]
+    write_lock: chan[bool]
+    lanes: [i64: *Lane]
+    next_id: i64
+    active: i64
+    max_streams: i64
+    initial: i64
+    frame_size: i64
+    window: i64
+    waiters: []chan[bool]
+    statics: []Header
+    decoder: *Hpack
+    closed: bool
+    draining: bool
+    idle_since: i64
+    block: []u8
+    block_stream: i64
+    block_ends: bool
+    credit: i64
+}
+
+fn credit_threshold() -> i64 {
+    1 << 18
+}
+
+fn connection_credit_threshold() -> i64 {
+    1 << 22
+}
+
+fn credit_connection(m: *Mux, n: i64) ! io.Error {
+    m.lock <- true
+    m.credit += n
+    let due = if m.credit >= connection_credit_threshold() { m.credit } else { 0 }
+    if due > 0 {
+        m.credit = 0
+    }
+    <-m.lock
+    if due > 0 {
+        var out: []u8 = []
+        window_update(mut out, 0, due)
+        mux_write(m, out)?
+    }
+}
+
+fn new_mux(h: *Host, w: Wire) -> *Mux {
+    let write_lock = chan[bool](1)
+    write_lock <- true
+    new(Mux {
+        host: h
+        wire: w
+        reader: io.reader(w.stream)
+        lock: chan[bool](1)
+        write_lock
+        lanes: [:]
+        next_id: 1
+        active: 0
+        max_streams: 100
+        initial: 65535
+        frame_size: 16384
+        window: 65535
+        waiters: []
+        statics: static_table()
+        decoder: new_hpack(4096)
+        closed: false
+        draining: false
+        idle_since: now_ms()
+        block: []
+        block_stream: 0
+        block_ends: false
+        credit: 0
+    })
+}
+
+fn start_mux(m: *Mux) ! io.Error {
+    var out: []u8 = []
+    text.append(mut out, preface())
+    settings_frame(mut out, false)
+    let written = outcome(fn() -> bool ! io.Error {
+        io.write_all(m.wire.stream, out)?
+        true
+    })
+    <-m.write_lock
+    match written {
+        Done(_) => {}
+        Failed(e) => {
+            lose_mux(m)
+            fail e
+        }
+    }
+    spawn read_mux(m)
+}
+
+fn mux_write(m: *Mux, out: []u8) ! io.Error {
+    m.write_lock <- true
+    defer <-m.write_lock
+    io.write_all(m.wire.stream, out)?
+}
+
+fn window_update(mut out: []u8, stream: i64, n: i64) {
+    var amount: []u8 = []
+    io.put_be32(mut amount, n)
+    put_frame(mut out, 8, 0, stream, amount)
+}
+
+fn reserve(m: *Mux, d: *Deadline) ! io.Error {
+    for {
+        m.lock <- true
+        if m.closed || m.draining {
+            <-m.lock
+            fail Reset
+        }
+        if m.active < m.max_streams {
+            m.active += 1
+            <-m.lock
+            return
+        }
+        let w = chan[bool](1)
+        push(mut m.waiters, w)
+        <-m.lock
+        await(w, d)?
+    }
+}
+
+fn open_lane(m: *Mux, lane: *Lane, fields: []Header, ends: bool) ! io.Error {
+    m.write_lock <- true
+    defer <-m.write_lock
+    m.lock <- true
+    lane.id = m.next_id
+    m.next_id += 2
+    lane.window = m.initial
+    m.lanes[lane.id] = lane
+    let frame_size = m.frame_size
+    <-m.lock
+    let block = encode(m.statics, fields)
+    var out: []u8 = []
+    var rest = block
+    var kind = 1
+    var flags = if ends { 1 } else { 0 }
+    for {
+        let n = least(rest.len, frame_size)
+        let last = n == rest.len
+        put_frame(mut out, kind, if last { flags | 4 } else { flags }, lane.id, rest[..n])
+        if last {
+            break
+        }
+        rest = rest[n..]
+        kind = 9
+        flags = 0
+    }
+    io.write_all(m.wire.stream, out)?
+}
+
+fn take_window(m: *Mux, lane: *Lane, want: i64, d: *Deadline) -> i64 ! io.Error {
+    for {
+        m.lock <- true
+        if m.closed || lane.reset {
+            <-m.lock
+            fail Reset
+        }
+        let n = least(least(want, m.frame_size), least(m.window, lane.window))
+        if n > 0 {
+            m.window -= n
+            lane.window -= n
+            <-m.lock
+            return n
+        }
+        <-m.lock
+        await(lane.signal, d)?
+    }
+}
+
+fn send_data(m: *Mux, lane: *Lane, data: []u8, last: bool, d: *Deadline) ! io.Error {
+    if data.len == 0 {
+        if last {
+            var out: []u8 = []
+            put_frame(mut out, 0, 1, lane.id, [])
+            mux_write(m, out)?
+        }
+        return
+    }
+    var rest = data
+    for rest.len > 0 {
+        let n = take_window(m, lane, rest.len, d)?
+        var out: []u8 = []
+        put_frame(mut out, 0, if last && n == rest.len { 1 } else { 0 }, lane.id, rest[..n])
+        mux_write(m, out)?
+        rest = rest[n..]
+    }
+}
+
+fn next_event(m: *Mux, lane: *Lane, d: *Deadline) -> Event ! io.Error {
+    for {
+        m.lock <- true
+        if lane.events.len > 0 {
+            let ev = lane.events[0]
+            lane.events = if lane.events.len == 1 { [] } else { lane.events[1..] }
+            <-m.lock
+            if ev.kind == Data {
+                consumed(m, lane, ev.flow)?
+            }
+            return ev
+        }
+        <-m.lock
+        await(lane.signal, d)?
+    }
+}
+
+fn consumed(m: *Mux, lane: *Lane, n: i64) ! io.Error {
+    lane.unacked += n
+    if lane.unacked < credit_threshold() {
+        return
+    }
+    let amount = lane.unacked
+    lane.unacked = 0
+    if !lane.ended {
+        var out: []u8 = []
+        window_update(mut out, lane.id, amount)
+        mux_write(m, out)?
+    }
+    credit_connection(m, amount)?
+}
+
+fn finish_lane(m: *Mux, lane: *Lane, complete: bool) {
+    m.lock <- true
+    delete(mut m.lanes, lane.id)
+    m.active -= 1
+    var leftover = lane.unacked
+    for ev in lane.events {
+        leftover += ev.flow
+    }
+    lane.events = []
+    let waiters = m.waiters
+    m.waiters = []
+    m.idle_since = now_ms()
+    let finished = m.draining && m.active == 0
+    let lost = m.closed
+    <-m.lock
+    wake_all(waiters)
+    if lost {
+        return
+    }
+    var out: []u8 = []
+    if lane.id > 0 && !complete && !lane.ended && !lane.reset {
+        var code: []u8 = []
+        io.put_be32(mut code, 8)
+        put_frame(mut out, 3, 0, lane.id, code)
+    }
+    if out.len > 0 {
+        mux_write(m, out) catch {
+            _ => {}
+        }
+    }
+    credit_connection(m, leftover) catch {
+        _ => {}
+    }
+    if finished {
+        shutdown_mux(m)
+    }
+}
+
+fn retire_idle(m: *Mux, now: i64, limit: i64) -> bool {
+    m.lock <- true
+    let idle = m.active == 0 && now - m.idle_since >= limit
+    if idle {
+        m.draining = true
+    }
+    <-m.lock
+    idle
+}
+
+fn drain_mux(m: *Mux) {
+    m.lock <- true
+    m.draining = true
+    let idle = m.active == 0
+    <-m.lock
+    if idle {
+        shutdown_mux(m)
+    }
+}
+
+fn shutdown_mux(m: *Mux) {
+    m.lock <- true
+    let open = !m.closed
+    m.closed = true
+    <-m.lock
+    if !open {
+        return
+    }
+    var payload: []u8 = []
+    io.put_be32(mut payload, 0)
+    io.put_be32(mut payload, 0)
+    var out: []u8 = []
+    put_frame(mut out, 7, 0, 0, payload)
+    mux_write(m, out) catch {
+        _ => {}
+    }
+    m.wire.stream.close()
+}
+
+fn lose_mux(m: *Mux) {
+    m.lock <- true
+    let open = !m.closed
+    m.closed = true
+    var lanes: []*Lane = []
+    for _, lane in m.lanes {
+        push(mut lane.events, Event { kind: Lost, status: 0, headers: [], data: [], flow: 0, code: 0 })
+        push(mut lanes, lane)
+    }
+    let waiters = m.waiters
+    m.waiters = []
+    <-m.lock
+    for lane in lanes {
+        notify(lane.signal)
+    }
+    wake_all(waiters)
+    let h = m.host
+    h.lock <- true
+    match h.mux {
+        some(current) => {
+            if current == m {
+                h.mux = none
+            }
+        }
+        none => {}
+    }
+    <-h.lock
+    if open {
+        m.wire.stream.close()
+    }
+}
+
+fn read_mux(m: *Mux) {
+    for {
+        let f = read_mux_frame(m.reader) catch {
+            _ => {
+                lose_mux(m)
+                return
+            }
+        }
+        on_mux_frame(m, f) catch {
+            _ => {
+                var payload: []u8 = []
+                io.put_be32(mut payload, 0)
+                io.put_be32(mut payload, 1)
+                var out: []u8 = []
+                put_frame(mut out, 7, 0, 0, payload)
+                mux_write(m, out) catch {
+                    _ => {}
+                }
+                lose_mux(m)
+                return
+            }
+        }
+    }
+}
+
+fn read_mux_frame(r: *io.Reader) -> Frame ! io.Error {
+    let head = io.read_exact(r, 9)?
+    let size = io.be24(head, 0)
+    if size > 16384 {
+        fail TooLarge
+    }
+    let payload = io.read_exact(r, size)?
+    Frame { kind: i64(head[3]), flags: i64(head[4]), stream: io.be32(head, 5) & window_limit(), payload }
+}
+
+fn deliver_event(m: *Mux, id: i64, ev: Event) -> bool {
+    m.lock <- true
+    let target = m.lanes[id]
+    match target {
+        some(lane) => {
+            push(mut lane.events, ev)
+            if ev.kind == Reset {
+                lane.reset = true
+            }
+        }
+        none => {}
+    }
+    <-m.lock
+    match target {
+        some(lane) => {
+            notify(lane.signal)
+            true
+        }
+        none => false
+    }
+}
+
+fn plain_event(kind: EventKind) -> Event {
+    Event { kind, status: 0, headers: [], data: [], flow: 0, code: 0 }
+}
+
+fn mux_unpad(f: Frame) -> []u8 ! io.Error {
+    if f.flags & 0x8 == 0 {
+        return f.payload
+    }
+    if f.payload.len == 0 || i64(f.payload[0]) >= f.payload.len {
+        fail Malformed
+    }
+    f.payload[1..f.payload.len - i64(f.payload[0])]
+}
+
+fn on_mux_frame(m: *Mux, f: Frame) ! io.Error {
+    if m.block_stream != 0 && f.kind != 9 {
+        fail Malformed
+    }
+    if f.kind == 0 {
+        on_mux_data(m, f)?
+    } else if f.kind == 1 {
+        if f.stream == 0 {
+            fail Malformed
+        }
+        var block = mux_unpad(f)?
+        if f.flags & 0x20 != 0 {
+            if block.len < 5 {
+                fail Malformed
+            }
+            block = block[5..]
+        }
+        m.block = []
+        io.append(mut m.block, block)
+        m.block_ends = f.flags & 1 != 0
+        m.block_stream = f.stream
+        if f.flags & 4 != 0 {
+            mux_headers(m)?
+        }
+    } else if f.kind == 9 {
+        if m.block_stream == 0 || f.stream != m.block_stream {
+            fail Malformed
+        }
+        io.append(mut m.block, f.payload)
+        if m.block.len > 1 << 20 {
+            fail TooLarge
+        }
+        if f.flags & 4 != 0 {
+            mux_headers(m)?
+        }
+    } else if f.kind == 3 {
+        if f.payload.len != 4 || f.stream == 0 {
+            fail Malformed
+        }
+        var ev = plain_event(Reset)
+        ev.code = io.be32(f.payload, 0)
+        deliver_event(m, f.stream, ev)
+    } else if f.kind == 4 {
+        on_mux_settings(m, f)?
+    } else if f.kind == 5 {
+        fail Malformed
+    } else if f.kind == 6 {
+        if f.stream != 0 || f.payload.len != 8 {
+            fail Malformed
+        }
+        if f.flags & 1 == 0 {
+            var out: []u8 = []
+            put_frame(mut out, 6, 1, 0, f.payload)
+            mux_write(m, out)?
+        }
+    } else if f.kind == 7 {
+        on_mux_goaway(m, f)?
+    } else if f.kind == 8 {
+        on_mux_window(m, f)?
+    }
+}
+
+fn on_mux_data(m: *Mux, f: Frame) ! io.Error {
+    if f.stream == 0 {
+        fail Malformed
+    }
+    let data = mux_unpad(f)?
+    var ev = plain_event(Data)
+    ev.data = data
+    ev.flow = f.payload.len
+    let known = deliver_event(m, f.stream, ev)
+    if !known {
+        credit_connection(m, f.payload.len)?
+    }
+    if known && f.flags & 1 != 0 {
+        deliver_event(m, f.stream, plain_event(End))
+    }
+}
+
+fn mux_headers(m: *Mux) ! io.Error {
+    let id = m.block_stream
+    let ends = m.block_ends
+    let fields = decode(m.decoder, m.block)?
+    m.block = []
+    m.block_stream = 0
+    let status_text = header(fields, ":status") ?? ""
+    var ev = plain_event(Head)
+    if status_text.len > 0 {
+        ev.status = text.parse_uint(status_text, 10) catch {
+            _ => fail Malformed
+        }
+        if ev.status < 100 || ev.status > 999 {
+            fail Malformed
+        }
+    }
+    var regular: []Header = []
+    for h in fields {
+        if h.name.len == 0 || h.name[0] != ':' {
+            push(mut regular, h)
+        }
+    }
+    ev.headers = regular
+    let informational = ev.status >= 100 && ev.status < 200
+    if !informational {
+        deliver_event(m, id, ev)
+    }
+    if ends {
+        deliver_event(m, id, plain_event(End))
+    }
+}
+
+fn on_mux_settings(m: *Mux, f: Frame) ! io.Error {
+    if f.stream != 0 || f.payload.len % 6 != 0 {
+        fail Malformed
+    }
+    if f.flags & 1 != 0 {
+        return
+    }
+    m.lock <- true
+    var at = 0
+    var bad = false
+    for at < f.payload.len {
+        let id = io.be16(f.payload, at)
+        let value = io.be32(f.payload, at + 2)
+        at += 6
+        if id == 3 {
+            m.max_streams = value
+        } else if id == 4 {
+            if value > window_limit() {
+                bad = true
+            }
+            for _, lane in m.lanes {
+                lane.window += value - m.initial
+            }
+            m.initial = value
+        } else if id == 5 {
+            if value < 16384 || value > 16777215 {
+                bad = true
+            }
+            m.frame_size = least(value, 16384)
+        }
+    }
+    var signals: []chan[bool] = []
+    for _, lane in m.lanes {
+        push(mut signals, lane.signal)
+    }
+    let waiters = m.waiters
+    m.waiters = []
+    <-m.lock
+    if bad {
+        fail Malformed
+    }
+    var out: []u8 = []
+    put_frame(mut out, 4, 1, 0, [])
+    mux_write(m, out)?
+    wake_all(signals)
+    wake_all(waiters)
+}
+
+fn on_mux_goaway(m: *Mux, f: Frame) ! io.Error {
+    if f.stream != 0 || f.payload.len < 8 {
+        fail Malformed
+    }
+    let last = io.be32(f.payload, 0) & window_limit()
+    m.lock <- true
+    m.draining = true
+    var refused: []*Lane = []
+    for id, lane in m.lanes {
+        if id > last {
+            var ev = plain_event(Reset)
+            ev.code = 7
+            push(mut lane.events, ev)
+            lane.reset = true
+            push(mut refused, lane)
+        }
+    }
+    let idle = m.active == 0
+    <-m.lock
+    for lane in refused {
+        notify(lane.signal)
+    }
+    let h = m.host
+    h.lock <- true
+    match h.mux {
+        some(current) => {
+            if current == m {
+                h.mux = none
+            }
+        }
+        none => {}
+    }
+    <-h.lock
+    if idle {
+        shutdown_mux(m)
+    }
+}
+
+fn on_mux_window(m: *Mux, f: Frame) ! io.Error {
+    if f.payload.len != 4 {
+        fail Malformed
+    }
+    let n = io.be32(f.payload, 0) & window_limit()
+    m.lock <- true
+    var signals: []chan[bool] = []
+    if f.stream == 0 {
+        m.window += n
+        for _, lane in m.lanes {
+            push(mut signals, lane.signal)
+        }
+    } else {
+        match m.lanes[f.stream] {
+            some(lane) => {
+                lane.window += n
+                push(mut signals, lane.signal)
+            }
+            none => {}
+        }
+    }
+    <-m.lock
+    wake_all(signals)
+}
