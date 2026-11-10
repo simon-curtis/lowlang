@@ -603,8 +603,19 @@ func (p *Parser) stmt() ast.Stmt {
 	case lexer.Defer:
 		p.next()
 		return &ast.Defer{Body: p.stmt(), Pos: t.Pos}
+	case lexer.Spawn:
+		p.next()
+		call, ok := p.expr().(*ast.Call)
+		if !ok {
+			p.fail(t.Pos, "spawn needs a function call")
+		}
+		return &ast.Spawn{Call: call, Pos: t.Pos}
 	}
 	x := p.expr()
+	if p.at(lexer.LArrow) {
+		p.next()
+		return &ast.Send{Chan: x, Value: p.expr(), Pos: t.Pos}
+	}
 	if op := p.tok().Kind; assignOps[op] {
 		p.next()
 		return &ast.Assign{Target: x, Op: op, Value: p.expr(), Pos: t.Pos}
@@ -682,11 +693,47 @@ func (p *Parser) unary() ast.Expr {
 			return p.postfix(p.number(lit, true, t.Pos))
 		}
 		return &ast.Unary{Op: t.Kind, X: p.unary(), Pos: t.Pos}
-	case lexer.Not, lexer.Star, lexer.Tilde:
+	case lexer.Not, lexer.Star, lexer.Tilde, lexer.LArrow:
 		p.next()
 		return &ast.Unary{Op: t.Kind, X: p.unary(), Pos: t.Pos}
 	}
 	return p.postfix(p.primary())
+}
+
+func (p *Parser) selectExpr() *ast.Select {
+	s := &ast.Select{Pos: p.expect(lexer.Select).Pos}
+	p.lines(func() { s.Cases = append(s.Cases, p.selectCase()) })
+	return s
+}
+
+func (p *Parser) selectCase() *ast.SelectCase {
+	t := p.tok()
+	c := &ast.SelectCase{Pos: t.Pos}
+	switch {
+	case p.at(lexer.Else):
+		p.next()
+		c.Kind = ast.ElseCase
+	case p.at(lexer.Ident) && t.Text == "after" && p.peek() == lexer.LParen:
+		p.next()
+		p.list(func() { c.Value = p.expr() })
+		c.Kind = ast.AfterCase
+	case p.at(lexer.Ident) && p.peek() == lexer.Assign:
+		c.Name = p.next().Text
+		p.next()
+		p.expect(lexer.LArrow)
+		c.Chan = p.expr()
+	case p.at(lexer.LArrow):
+		p.next()
+		c.Chan = p.expr()
+	default:
+		c.Chan = p.expr()
+		p.expect(lexer.LArrow)
+		c.Value = p.expr()
+		c.Kind = ast.SendCase
+	}
+	p.expect(lexer.FatArrow)
+	c.Body = p.armBody()
+	return c
 }
 
 func (p *Parser) number(t lexer.Token, negative bool, pos lexer.Pos) ast.Expr {
@@ -757,6 +804,8 @@ func (p *Parser) primary() ast.Expr {
 		return p.block()
 	case lexer.Fn:
 		return p.closure()
+	case lexer.Select:
+		return p.selectExpr()
 	case lexer.Match:
 		p.next()
 		x := p.condition()

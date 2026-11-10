@@ -488,6 +488,10 @@ func (b *builder) stmt(s ast.Stmt) {
 		b.runDefers(0)
 		b.fail(words)
 		b.dead()
+	case *ast.Spawn:
+		b.block(s.Body)
+	case *ast.Send:
+		b.send(s)
 	case *ast.Defer:
 		top := len(b.defers) - 1
 		b.defers[top] = append(b.defers[top], s.Body)
@@ -541,12 +545,20 @@ func (b *builder) forStmt(s *ast.For) {
 		b.jump(body)
 	}
 	b.enter(body)
-	b.loops = append(b.loops, loopTarget{cont: header, brk: exit, depth: len(b.defers)})
+	latch := b.newBlock()
+	b.loops = append(b.loops, loopTarget{cont: latch, brk: exit, depth: len(b.defers)})
 	b.block(s.Body)
 	b.loops = b.loops[:len(b.loops)-1]
-	b.jump(header)
+	b.jump(latch)
+	b.enter(latch)
+	b.backEdge(header)
 	b.seal(header)
 	b.enter(exit)
+}
+
+func (b *builder) backEdge(header *Block) {
+	b.cur.Poll = true
+	b.jump(header)
 }
 
 func (b *builder) expr(e ast.Expr) []*Value {
@@ -624,6 +636,8 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		return b.block(e)
 	case *ast.Match:
 		return b.dispatch(e.Arms, b.value(e.X, e.X.TypeOf()), e.Type)
+	case *ast.Select:
+		return b.selectExpr(e)
 	case *ast.Try:
 		return b.try(e)
 	case *ast.Catch:
@@ -660,6 +674,8 @@ func (b *builder) unary(e *ast.Unary) []*Value {
 		return []*Value{b.typed(OpNot, types.Bool, b.word(e.X))}
 	case lexer.Tilde:
 		return []*Value{b.typed(OpCompl, e.Type, b.word(e.X))}
+	case lexer.LArrow:
+		return b.receive(e)
 	}
 	return []*Value{b.typed(OpNeg, e.Type, b.word(e.X))}
 }

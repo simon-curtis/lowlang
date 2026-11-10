@@ -55,7 +55,7 @@ func (t *Type) Satisfies(c Constraint) bool {
 
 func (t *Type) Comparable() bool {
 	switch t.Kind {
-	case BoolKind, StrKind, PointerKind, RawKind:
+	case BoolKind, StrKind, PointerKind, RawKind, ChanKind:
 		return true
 	}
 	return t.Number() || t.has(Eq)

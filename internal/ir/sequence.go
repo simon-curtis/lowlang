@@ -135,6 +135,9 @@ func (b *builder) runtimeVoid(name string, args ...*Value) {
 }
 
 func (b *builder) builtin(e *ast.Call) []*Value {
+	if words, ok := b.concurrencyBuiltin(e); ok {
+		return words
+	}
 	if e.Builtin == "__zero" {
 		zero := b.constant(0)
 		words := make([]*Value, e.Type.Size())
@@ -226,6 +229,10 @@ func (b *builder) forIn(s *ast.ForIn) {
 		b.rangeLoop(s)
 		return
 	}
+	if s.Iter.TypeOf().Kind == types.ChanKind {
+		b.chanLoop(s)
+		return
+	}
 	if s.Iter.TypeOf().Kind == types.MapKind {
 		b.mapLoop(s)
 		return
@@ -260,7 +267,7 @@ func (b *builder) forIn(s *ast.ForIn) {
 	b.enter(next)
 	advanced := b.emit(OpAdd, b.readTemp(counter, 1)[0], b.readTemp(step, 1)[0])
 	b.writeTemp(counter, []*Value{advanced})
-	b.jump(header)
+	b.backEdge(header)
 	b.seal(header)
 	b.enter(exit)
 }
@@ -285,7 +292,7 @@ func (b *builder) rangeLoop(s *ast.ForIn) {
 	b.enter(next)
 	advanced := b.typed(OpAdd, t, b.readTemp(counter, 1)[0], b.constant(1))
 	b.writeTemp(counter, []*Value{advanced})
-	b.jump(header)
+	b.backEdge(header)
 	b.seal(header)
 	b.enter(exit)
 }

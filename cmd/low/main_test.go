@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func fixtures(t *testing.T, dir string) []string {
@@ -73,6 +74,8 @@ func runFixture(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, binary)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	runErr := cmd.Run()

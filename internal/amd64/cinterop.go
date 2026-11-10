@@ -7,13 +7,23 @@ import (
 	"lowlang/internal/types"
 )
 
+const (
+	tlsM      = -24
+	tlsG      = -16
+	tlsFlag   = -8
+	gScanLo   = 16
+	gUserSP   = 24
+	gPC       = 32
+	gFP       = 40
+	gLockedM  = 88
+	mG0SP     = 24
+	inC       = 3
+	savedRegs = 5
+	argWords  = 14
+)
+
 func (g *Generator) cCall(fr *frame, in *instr) {
 	plan := in.value.Plan
-	label := g.newLabel()
-	g.emit("lea r10, [rip+%s]", label)
-	g.emit("mov [rip+rt_c_pc], r10")
-	g.emit("mov [rip+rt_c_fp], rbp")
-	g.emit("mov [rip+rt_c_sp], rsp")
 	ints, vectors, stack := 0, 0, 0
 	if plan.Memory {
 		ints = 1
@@ -48,9 +58,41 @@ func (g *Generator) cCall(fr *frame, in *instr) {
 	if plan.Memory {
 		g.emit("lea rdi, [rsp+%d]", 8*plan.StackWords)
 	}
+	label := g.newLabel()
+	g.enterC(label)
+	if plan.StackWords > 0 {
+		g.emit("sub rsp, %d", 16*((plan.StackWords+1)/2))
+		for i := range plan.StackWords {
+			g.emit("mov r11, [r12+%d]", 8*(savedRegs+i))
+			g.emit("mov [rsp+%d], r11", 8*i)
+		}
+	}
 	g.emit("mov eax, %d", plan.Vectors)
 	g.emit("call %s", target)
 	g.safepointAt(fr, in, label)
+	g.emit("mov rsp, r12")
+	g.emit("call rt_exitc")
+	for i := len(calleeSaved) - 1; i >= 0; i-- {
+		g.emit("pop %s", calleeSaved[i])
+	}
+}
+
+func (g *Generator) enterC(label string) {
+	for _, r := range calleeSaved {
+		g.emit("push %s", r)
+	}
+	g.emit("mov rax, qword ptr fs:[%d]", tlsG)
+	g.emit("mov [rax+%d], rsp", gScanLo)
+	g.emit("lea r11, [rsp+%d]", 8*savedRegs)
+	g.emit("mov [rax+%d], r11", gUserSP)
+	g.emit("mov [rax+%d], rbp", gFP)
+	g.emit("lea r11, [rip+%s]", label)
+	g.emit("mov [rax+%d], r11", gPC)
+	g.emit("mov rbx, qword ptr fs:[%d]", tlsM)
+	g.emit("mov r11d, %d", inC)
+	g.emit("xchg [rbx], r11")
+	g.emit("mov r12, rsp")
+	g.emit("mov rsp, [rbx+%d]", mG0SP)
 }
 
 func (g *Generator) cTarget(symbol string) string {
@@ -66,42 +108,82 @@ func (g *Generator) trampolines(symbols []string) {
 	}
 }
 
-const (
-	savedSP   = 8
-	savedInts = 16
-	savedXmms = 64
-	saveWords = 15
-)
-
 func (g *Generator) thunk(f *ir.Func) {
 	g.fn = fmt.Sprintf("cb_%s", mangle(f.Name))
 	g.labels = 0
 	fmt.Fprintf(&g.text, "\t.globl %s\n%s:\n", g.fn, g.fn)
 	g.emit("push rbp")
-	g.emit("push qword ptr [rip+rt_c_pc]")
-	g.emit("push qword ptr [rip+rt_c_fp]")
-	g.emit("mov rbp, rsp")
-	g.emit("sub rsp, %d", (8*(saveWords+stackWords(f.ParamWords))+15)&^15)
-	g.emit("mov r10, [rip+rt_c_sp]")
-	g.emit("mov [rbp-%d], r10", savedSP)
+	for _, r := range calleeSaved {
+		g.emit("push %s", r)
+	}
+	g.emit("mov r13, rsp")
+	g.emit("sub rsp, %d", 8*argWords)
+	g.emit("and rsp, -16")
+	g.emit("mov r12, rsp")
 	for i, r := range argRegs {
-		g.emit("mov [rbp-%d], %s", savedInts+8*i, r)
+		g.emit("mov [r12+%d], %s", 8*i, r)
 	}
 	for i := range 8 {
-		g.emit("movq qword ptr [rbp-%d], xmm%d", savedXmms+8*i, i)
+		g.emit("movq qword ptr [r12+%d], xmm%d", 8*(len(argRegs)+i), i)
 	}
+	g.emit("mov rbx, qword ptr fs:[%d]", tlsM)
+	g.emit("mov edi, %d", inC)
+	g.emit("call rt_m_running")
+	g.emit("mov r14, [rbx+%d]", mG0SP)
+	g.emit("mov [rbx+%d], r12", mG0SP)
+	g.emit("mov r15, qword ptr fs:[%d]", tlsG)
+	g.emit("inc qword ptr [r15+%d]", gLockedM)
+	g.emit("mov rsp, [r15+%d]", gScanLo)
+	g.emit("and rsp, -16")
+	for _, offset := range []int{gScanLo, gUserSP, gPC, gFP, gPC, gFP} {
+		g.emit("push qword ptr [r15+%d]", offset)
+	}
+	g.emit("mov rbp, rsp")
+	g.emit("push r12")
+	g.emit("push r14")
+	g.emit("push qword ptr [r15+%d]", gUserSP)
+	g.emit("sub rsp, 8")
+	if stack := stackWords(f.ParamWords); stack > 0 {
+		g.emit("sub rsp, %d", 16*((stack+1)/2))
+	}
+	g.thunkArgs(f)
+	label := g.newLabel()
+	g.emit("call %s", g.callTarget(f))
+	g.label(label)
+	g.maps = append(g.maps, stackMap{label: label, segment: true})
+	if f.Ret.Float() {
+		g.emit("movq xmm0, rax")
+	}
+	for i, offset := range []int{gFP, gPC, gUserSP, gScanLo} {
+		g.emit("mov rcx, [rbp+%d]", 16+8*i)
+		g.emit("mov [r15+%d], rcx", offset)
+	}
+	g.emit("dec qword ptr [r15+%d]", gLockedM)
+	g.emit("mov rsp, r12")
+	g.emit("mov [rbx+%d], r14", mG0SP)
+	g.emit("mov ecx, %d", inC)
+	g.emit("xchg [rbx], rcx")
+	g.emit("mov rsp, r13")
+	for i := len(calleeSaved) - 1; i >= 0; i-- {
+		g.emit("pop %s", calleeSaved[i])
+	}
+	g.emit("pop rbp")
+	g.emit("ret")
+}
+
+func (g *Generator) thunkArgs(f *ir.Func) {
 	ints, vectors, spilled := 0, 0, 0
 	for k, t := range f.CParams {
 		var src string
 		switch {
 		case t.Float() && vectors < 8:
-			src = fmt.Sprintf("[rbp-%d]", savedXmms+8*vectors)
+			src = fmt.Sprintf("[r12+%d]", 8*(len(argRegs)+vectors))
 			vectors++
 		case !t.Float() && ints < len(argRegs):
-			src = fmt.Sprintf("[rbp-%d]", savedInts+8*ints)
+			src = fmt.Sprintf("[r12+%d]", 8*ints)
 			ints++
 		default:
-			src = fmt.Sprintf("[rbp+%d]", 32+8*spilled)
+			src = fmt.Sprintf("[r13+%d]", 8*(len(calleeSaved)+2+spilled))
 			spilled++
 		}
 		g.emit("%s", widen(t, src))
@@ -111,23 +193,6 @@ func (g *Generator) thunk(f *ir.Func) {
 		}
 		g.emit("mov qword ptr [rsp+%d], r10", 8*(k-len(argRegs)))
 	}
-	label := g.newLabel()
-	g.emit("call %s", g.callTarget(f))
-	g.label(label)
-	g.maps = append(g.maps, stackMap{label: label, segment: true})
-	if f.Ret.Float() {
-		g.emit("movq xmm0, rax")
-	}
-	for _, restore := range []struct {
-		global string
-		offset int
-	}{{"rt_c_fp", 0}, {"rt_c_pc", 8}, {"rt_c_sp", -savedSP}} {
-		g.emit("mov r10, [rbp%+d]", restore.offset)
-		g.emit("mov [rip+%s], r10", restore.global)
-	}
-	g.emit("lea rsp, [rbp+16]")
-	g.emit("pop rbp")
-	g.emit("ret")
 }
 
 func widen(t *types.Type, src string) string {

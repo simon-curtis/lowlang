@@ -546,3 +546,243 @@ fn __map_key[K: Hash, V](m: *__Map[K, V], e: i64) -> K {
 fn __map_value[K: Hash, V](m: *__Map[K, V], e: i64) -> V {
     m.entries[e].value
 }
+
+struct __Waiter {
+    claimed: i64
+    index: i64
+    ok: bool
+    g: ptr
+}
+
+struct __Box[T] {
+    value: T
+}
+
+struct __Wait[T] {
+    w: *__Waiter
+    index: i64
+    box: *__Box[T]
+}
+
+struct __Chan[T] {
+    lock: i64
+    buf: []T
+    head: i64
+    count: i64
+    closed: bool
+    recvq: []__Wait[T]
+    rhead: i64
+    sendq: []__Wait[T]
+    shead: i64
+}
+
+fn __waiter() -> *__Waiter {
+    new(__Waiter { claimed: 0, index: -1, ok: false, g: __current() })
+}
+
+fn __box[T]() -> *__Box[T] {
+    new(__Box { value: __zero() })
+}
+
+fn __claim(w: *__Waiter, index: i64, ok: bool) -> bool {
+    if !__cas(mut w.claimed, 0, 1) {
+        return false
+    }
+    w.index = index
+    w.ok = ok
+    true
+}
+
+fn __pop[T](mut q: []__Wait[T], mut head: i64, ok: bool) -> __Wait[T]? {
+    for head < q.len {
+        let e = q[head]
+        head += 1
+        if __claim(e.w, e.index, ok) {
+            return e
+        }
+    }
+    q = []
+    head = 0
+    none
+}
+
+fn __without[T](q: []__Wait[T], head: i64, w: *__Waiter) -> []__Wait[T] {
+    var kept: []__Wait[T] = []
+    for i in head..q.len {
+        if q[i].w != w {
+            push(mut kept, q[i])
+        }
+    }
+    kept
+}
+
+fn __chan_new[T](cap: i64) -> *__Chan[T] {
+    if cap < 0 {
+        __panic("negative channel capacity")
+    }
+    var buf: []T = []
+    for i in 0..cap {
+        push(mut buf, __zero())
+    }
+    new(__Chan { lock: 0, buf, head: 0, count: 0, closed: false, recvq: [], rhead: 0, sendq: [], shead: 0 })
+}
+
+fn __take[T](c: *__Chan[T]) -> T {
+    let v = c.buf[c.head]
+    c.head = (c.head + 1) % c.buf.len
+    c.count -= 1
+    match __pop(mut c.sendq, mut c.shead, true) {
+        some(s) => {
+            c.buf[(c.head + c.count) % c.buf.len] = s.box.value
+            c.count += 1
+            __ready(s.w.g)
+        }
+        none => {}
+    }
+    v
+}
+
+fn __try_recv[T](c: *__Chan[T], box: *__Box[T]) -> i64 {
+    if c.count > 0 {
+        box.value = __take(c)
+        return 1
+    }
+    match __pop(mut c.sendq, mut c.shead, true) {
+        some(s) => {
+            box.value = s.box.value
+            __ready(s.w.g)
+            return 1
+        }
+        none => {}
+    }
+    if c.closed {
+        return 0
+    }
+    -1
+}
+
+fn __try_send[T](c: *__Chan[T], v: T) -> bool {
+    if c.closed {
+        __panic("send on closed channel")
+    }
+    match __pop(mut c.recvq, mut c.rhead, true) {
+        some(r) => {
+            r.box.value = v
+            __ready(r.w.g)
+            return true
+        }
+        none => {}
+    }
+    if c.count < c.buf.len {
+        c.buf[(c.head + c.count) % c.buf.len] = v
+        c.count += 1
+        return true
+    }
+    false
+}
+
+fn __chan_send[T](c: *__Chan[T], v: T) {
+    let w = __waiter()
+    let box = new(__Box { value: v })
+    __lock(mut c.lock)
+    if __try_send(c, v) {
+        __unlock(mut c.lock)
+        return
+    }
+    push(mut c.sendq, __Wait { w, index: 0, box })
+    __unlock(mut c.lock)
+    __park()
+    if !w.ok {
+        __panic("send on closed channel")
+    }
+}
+
+fn __chan_recv[T](c: *__Chan[T]) -> T? {
+    let w = __waiter()
+    let box: *__Box[T] = __box()
+    __lock(mut c.lock)
+    let got = __try_recv(c, box)
+    if got >= 0 {
+        __unlock(mut c.lock)
+        if got == 1 {
+            return box.value
+        }
+        return none
+    }
+    push(mut c.recvq, __Wait { w, index: 0, box })
+    __unlock(mut c.lock)
+    __park()
+    if w.ok {
+        return box.value
+    }
+    none
+}
+
+fn __chan_close[T](c: *__Chan[T]) {
+    __lock(mut c.lock)
+    if c.closed {
+        __panic("close of closed channel")
+    }
+    c.closed = true
+    for {
+        match __pop(mut c.recvq, mut c.rhead, false) {
+            some(r) => __ready(r.w.g)
+            none => break
+        }
+    }
+    for {
+        match __pop(mut c.sendq, mut c.shead, false) {
+            some(s) => __ready(s.w.g)
+            none => break
+        }
+    }
+    __unlock(mut c.lock)
+}
+
+fn __sel_recv[T](c: *__Chan[T], w: *__Waiter, index: i64, box: *__Box[T]) -> bool {
+    let got = __try_recv(c, box)
+    if got < 0 {
+        return false
+    }
+    w.index = index
+    w.ok = got == 1
+    true
+}
+
+fn __sel_send[T](c: *__Chan[T], w: *__Waiter, index: i64, v: T) -> bool {
+    if !__try_send(c, v) {
+        return false
+    }
+    w.index = index
+    w.ok = true
+    true
+}
+
+fn __sel_wait_recv[T](c: *__Chan[T], w: *__Waiter, index: i64, box: *__Box[T]) {
+    push(mut c.recvq, __Wait { w, index, box })
+}
+
+fn __sel_wait_send[T](c: *__Chan[T], w: *__Waiter, index: i64, v: T) {
+    push(mut c.sendq, __Wait { w, index, box: new(__Box { value: v }) })
+}
+
+fn __sel_cancel_recv[T](c: *__Chan[T], w: *__Waiter) {
+    __lock(mut c.lock)
+    c.recvq = __without(c.recvq, c.rhead, w)
+    c.rhead = 0
+    __unlock(mut c.lock)
+}
+
+fn __sel_cancel_send[T](c: *__Chan[T], w: *__Waiter) {
+    __lock(mut c.lock)
+    c.sendq = __without(c.sendq, c.shead, w)
+    c.shead = 0
+    __unlock(mut c.lock)
+}
+
+fn __sel_value[T](w: *__Waiter, box: *__Box[T]) -> T? {
+    if w.ok {
+        return box.value
+    }
+    none
+}

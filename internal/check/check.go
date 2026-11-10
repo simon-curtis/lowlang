@@ -37,33 +37,36 @@ type scope struct {
 }
 
 type Checker struct {
-	modules     map[string]*scope
-	embeds      []string
-	builtin     map[string]*types.Type
-	file        *ast.File
-	results     map[[2]*types.Type]*types.Type
-	ptrs        map[*types.Type]*types.Type
-	opts        map[*types.Type]*types.Type
-	slices      map[*types.Type]*types.Type
-	maps        map[[2]*types.Type]*types.Type
-	fn          *ast.Func
-	scopes      []map[string]*ast.Local
-	loops       []*loop
-	raws        map[*types.Type]*types.Type
-	funcTypes   map[string]*types.Type
-	closures    []*ast.Closure
-	counts      map[*ast.Func]int
-	bound       map[string]*types.Type
-	abstract    bool
-	generics    map[*types.Type]*generic
-	pristine    map[*ast.Func]*ast.Func
-	instances   map[*ast.Func]map[string]*ast.Func
-	pending     []*ast.Func
-	unlaid      []*types.Type
-	laid        bool
-	funcsReady  bool
-	waitingMaps []*types.Type
-	deferring   bool
+	modules      map[string]*scope
+	embeds       []string
+	builtin      map[string]*types.Type
+	file         *ast.File
+	results      map[[2]*types.Type]*types.Type
+	ptrs         map[*types.Type]*types.Type
+	opts         map[*types.Type]*types.Type
+	slices       map[*types.Type]*types.Type
+	maps         map[[2]*types.Type]*types.Type
+	fn           *ast.Func
+	scopes       []map[string]*ast.Local
+	loops        []*loop
+	raws         map[*types.Type]*types.Type
+	funcTypes    map[string]*types.Type
+	closures     []*ast.Closure
+	counts       map[*ast.Func]int
+	bound        map[string]*types.Type
+	abstract     bool
+	generics     map[*types.Type]*generic
+	pristine     map[*ast.Func]*ast.Func
+	instances    map[*ast.Func]map[string]*ast.Func
+	pending      []*ast.Func
+	unlaid       []*types.Type
+	laid         bool
+	funcsReady   bool
+	waitingMaps  []*types.Type
+	chans        map[*types.Type]*types.Type
+	waitingChans []*types.Type
+	spawns       int
+	deferring    bool
 }
 
 func Check(files []*ast.File) (embeds []string, err error) {
@@ -81,6 +84,7 @@ func Check(files []*ast.File) (embeds []string, err error) {
 		generics:  map[*types.Type]*generic{},
 		pristine:  map[*ast.Func]*ast.Func{},
 		instances: map[*ast.Func]map[string]*ast.Func{},
+		chans:     map[*types.Type]*types.Type{},
 	}
 	defer func() {
 		r := recover()
@@ -186,6 +190,12 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 			c.fail(t.Pos, "type parameter %s takes no type arguments", t.Name)
 		}
 		return bound
+	}
+	if t.Name == "chan" && t.Module == "" {
+		if len(t.Args) != 1 {
+			c.fail(t.Pos, "chan takes 1 type argument")
+		}
+		return c.chanOf(c.resolve(t.Args[0]))
 	}
 	if g := c.lookupGeneric(t.Module, t.Name, t.Pos); g != nil {
 		if t.Args == nil {
@@ -337,7 +347,7 @@ func (c *Checker) check(files []*ast.File) {
 func (c *Checker) declareType(name string, pos lexer.Pos, t *types.Type, pub bool) {
 	_, builtin := c.builtin[name]
 	_, generic := c.local().generics[name]
-	if _, dup := c.local().types[name]; dup || builtin || generic {
+	if _, dup := c.local().types[name]; dup || builtin || generic || name == "chan" {
 		c.fail(pos, "type %s already declared", name)
 	}
 	t.Module = c.file.Module
@@ -457,6 +467,10 @@ func (c *Checker) declareFuncs(files []*ast.File) {
 		c.mapOps(m)
 	}
 	c.waitingMaps = nil
+	for _, t := range c.waitingChans {
+		c.chanOps(t)
+	}
+	c.waitingChans = nil
 }
 
 func (c *Checker) cSignature(fn *ast.Func) {
@@ -751,6 +765,10 @@ func (c *Checker) stmt(s ast.Stmt) bool {
 		return true
 	case *ast.Defer:
 		c.deferStmt(s)
+	case *ast.Spawn:
+		c.spawn(s)
+	case *ast.Send:
+		c.send(s)
 	}
 	return false
 }
@@ -947,6 +965,11 @@ func (c *Checker) iteration(s *ast.ForIn) (key, value *types.Type) {
 			return nil, t.Key
 		}
 		return t.Key, t.Elem
+	case types.ChanKind:
+		if s.Key != "" {
+			c.fail(s.Pos, "a channel loop binds one name")
+		}
+		return nil, t.Elem
 	}
 	c.fail(s.Iter.Position(), "cannot iterate over %s", t)
 	return nil, nil
@@ -1072,6 +1095,8 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 		c.block(e, want)
 	case *ast.Match:
 		c.match(e, want)
+	case *ast.Select:
+		c.selectExpr(e, want)
 	case *ast.Try:
 		c.try(e)
 	case *ast.Catch:
@@ -1349,6 +1374,8 @@ func (c *Checker) unary(e *ast.Unary, want *types.Type) {
 	case lexer.Not:
 		c.expectType(e.X, types.Bool)
 		e.Type = types.Bool
+	case lexer.LArrow:
+		e.Type = c.optional(c.channel(e.X).Elem)
 	case lexer.Tilde:
 		e.Type = c.plain(e.X, numeric(want))
 		c.requireInteger(e.Type, e.Op, e.Pos)
@@ -1447,6 +1474,7 @@ var builtins = map[string]bool{
 	"delete": true, "embed": true, "__str_raw": true,
 	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
 	"__bits": true, "__str_view": true, "__hash": true, "__zero": true,
+	"__spawn": true, "__current": true, "__park": true, "__ready": true, "__lock": true, "__unlock": true, "__cas": true, "__panic": true,
 }
 
 func (c *Checker) call(e *ast.Call, want *types.Type) {
@@ -1562,6 +1590,9 @@ func (c *Checker) print(e *ast.Call) {
 }
 
 func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
+	if c.concurrencyBuiltin(e, name) {
+		return true
+	}
 	switch name {
 	case "push":
 		c.push(e)

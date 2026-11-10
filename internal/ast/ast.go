@@ -26,6 +26,43 @@ type Defer struct {
 	Pos  lexer.Pos
 }
 
+type Spawn struct {
+	Call *Call
+	Body *Block
+	Pos  lexer.Pos
+}
+
+type Send struct {
+	Chan  Expr
+	Value Expr
+	Pos   lexer.Pos
+}
+
+type SelectKind int
+
+const (
+	RecvCase SelectKind = iota
+	SendCase
+	AfterCase
+	ElseCase
+)
+
+type SelectCase struct {
+	Kind  SelectKind
+	Chan  Expr
+	Value Expr
+	Name  string
+	Local *Local
+	Body  Expr
+	Pos   lexer.Pos
+}
+
+type Select struct {
+	Typed
+	Cases []*SelectCase
+	Pos   lexer.Pos
+}
+
 func fieldWidth(e *Selector) *types.Type {
 	if types.StructOf(e.X.TypeOf()).C {
 		return e.Field.Type.Width()
@@ -488,6 +525,9 @@ func (n *Continue) Position() lexer.Pos  { return n.Pos }
 func (n *Return) Position() lexer.Pos    { return n.Pos }
 func (n *Fail) Position() lexer.Pos      { return n.Pos }
 func (n *Defer) Position() lexer.Pos     { return n.Pos }
+func (n *Spawn) Position() lexer.Pos     { return n.Pos }
+func (n *Send) Position() lexer.Pos      { return n.Pos }
+func (n *Select) Position() lexer.Pos    { return n.Pos }
 func (n *IntLit) Position() lexer.Pos    { return n.Pos }
 func (n *FloatLit) Position() lexer.Pos  { return n.Pos }
 func (n *StrLit) Position() lexer.Pos    { return n.Pos }
@@ -521,6 +561,8 @@ func (*Continue) stmt() {}
 func (*Return) stmt()   {}
 func (*Fail) stmt()     {}
 func (*Defer) stmt()    {}
+func (*Spawn) stmt()    {}
+func (*Send) stmt()     {}
 func (*ForIn) stmt()    {}
 
 func (*Block) expr()     {}
@@ -544,5 +586,6 @@ func (*Binary) expr()    {}
 func (*Call) expr()      {}
 func (*If) expr()        {}
 func (*Match) expr()     {}
+func (*Select) expr()    {}
 func (*Try) expr()       {}
 func (*Catch) expr()     {}

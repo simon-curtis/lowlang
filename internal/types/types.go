@@ -23,6 +23,7 @@ const (
 	RawKind
 	FuncKind
 	ParamKind
+	ChanKind
 )
 
 type Type struct {
@@ -94,7 +95,7 @@ func (t *Type) HasPointers() bool {
 func (t *Type) PointerWords() []bool {
 	words := make([]bool, t.size)
 	switch t.Kind {
-	case PointerKind, MapKind, SliceKind, StrKind, RawKind, ParamKind:
+	case PointerKind, MapKind, SliceKind, StrKind, RawKind, ParamKind, ChanKind:
 		words[0] = true
 	case FuncKind:
 		words[len(words)-1] = !t.C
@@ -173,6 +174,10 @@ func (t *Type) Accepts(from *Type) bool {
 		return true
 	}
 	return t == from || from == Never || (t.Optional && from == t.Elem)
+}
+
+func NewChan(elem *Type) *Type {
+	return &Type{Kind: ChanKind, Name: fmt.Sprintf("chan[%s]", elem), Elem: elem, size: 1}
 }
 
 func NewMap(key, value *Type) *Type {

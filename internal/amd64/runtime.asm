@@ -26,7 +26,7 @@ rt_msg_oom:
 
 	.bss
 	.p2align 3
-rt_stack_top:
+rt_heap_lock:
 	.zero 8
 rt_heap_start:
 	.zero 8
@@ -44,23 +44,10 @@ rt_gc_threshold:
 	.zero 8
 rt_free_large:
 	.zero 8
-rt_user_pc:
-	.zero 8
 rt_pin_count:
 	.zero 8
 rt_pins:
 	.zero 524288
-rt_user_sp:
-	.zero 8
-	.globl rt_c_fp
-rt_c_fp:
-	.zero 8
-	.globl rt_c_pc
-rt_c_pc:
-	.zero 8
-	.globl rt_c_sp
-rt_c_sp:
-	.zero 8
 rt_free_small:
 	.zero 512
 
@@ -95,14 +82,47 @@ rt_write:
 
 	.globl rt_print_str
 rt_print_str:
-	mov rdx, rsi
-	mov rsi, rdi
+	push rbx
+	push r12
+	sub rsp, 40
+	mov rbx, rdi
+	mov r12, rsi
+	mov [rsp], rdi
+	mov [rsp+8], rsi
+	lea rax, [rip+rt_nl]
+	mov [rsp+16], rax
+	mov qword ptr [rsp+24], 1
+1:
+	mov edi, 1
+	mov rsi, rsp
+	mov edx, 2
+	mov eax, 20
+	syscall
+	cmp rax, -4
+	je 1b
+	test rax, rax
+	js 3f
+	cmp rax, r12
+	jae 2f
+	lea rsi, [rbx+rax]
+	mov rdx, r12
+	sub rdx, rax
 	mov edi, 1
 	call rt_write
+	xor eax, eax
+	mov r12, rax
+2:
+	cmp rax, r12
+	ja 3f
 	mov edi, 1
 	lea rsi, [rip+rt_nl]
 	mov edx, 1
-	jmp rt_write
+	call rt_write
+3:
+	add rsp, 40
+	pop r12
+	pop rbx
+	ret
 
 	.globl rt_print_bool
 rt_print_bool:
@@ -162,16 +182,18 @@ rt_str_eq:
 
 	.globl rt_grow
 rt_grow:
-	mov rax, [rsp]
-	mov [rip+rt_user_pc], rax
-	lea rax, [rsp+8]
-	mov [rip+rt_user_sp], rax
+	ENTER_RT
 	push rdi
 	push rsi
-	mov rsi, rcx
-	lea rdi, [rdx+7]
+	push rdx
+	push rcx
+	call rt_heap_acquire
+	pop rsi
+	pop rdi
+	add rdi, 7
 	shr rdi, 3
 	call rt_alloc_body
+	mov qword ptr [rip+rt_heap_lock], 0
 	pop rcx
 	pop rsi
 	mov rdi, rax
@@ -180,6 +202,8 @@ rt_grow:
 
 	.globl rt_pin
 rt_pin:
+	ENTER_RT
+	call rt_heap_acquire
 	mov rax, [rip+rt_pin_count]
 	cmp rax, 65536
 	jae 1f
@@ -187,6 +211,7 @@ rt_pin:
 	mov [rcx+8*rax], rdi
 	inc rax
 	mov [rip+rt_pin_count], rax
+	mov qword ptr [rip+rt_heap_lock], 0
 	ret
 1:
 	lea rdi, [rip+rt_msg_pins]
@@ -194,6 +219,8 @@ rt_pin:
 
 	.globl rt_unpin
 rt_unpin:
+	ENTER_RT
+	call rt_heap_acquire
 	mov rax, [rip+rt_pin_count]
 	lea rcx, [rip+rt_pins]
 1:
@@ -208,6 +235,27 @@ rt_unpin:
 	mov [rcx+8*rax], r8
 	mov [rip+rt_pin_count], rdx
 2:
+	mov qword ptr [rip+rt_heap_lock], 0
+	ret
+
+rt_heap_acquire:
+	push rdi
+1:
+	mov eax, 1
+	xchg [rip+rt_heap_lock], rax
+	test rax, rax
+	jz 3f
+2:
+	cmp dword ptr [rip+rt_stop], 0
+	je 4f
+	call rt_stop_here
+4:
+	pause
+	cmp qword ptr [rip+rt_heap_lock], 0
+	jne 2b
+	jmp 1b
+3:
+	pop rdi
 	ret
 
 	.globl rt_panic_index
@@ -244,6 +292,26 @@ rt_error:
 	mov edx, 7
 	mov ecx, 1
 	jmp rt_die
+
+	.globl rt_panic_msg
+rt_panic_msg:
+	push rdi
+	push rsi
+	mov edi, 2
+	lea rsi, [rip+rt_panic_prefix]
+	mov edx, 7
+	call rt_write
+	pop rdx
+	pop rsi
+	mov edi, 2
+	call rt_write
+	mov edi, 2
+	lea rsi, [rip+rt_nl]
+	mov edx, 1
+	call rt_write
+	mov edi, 2
+	mov eax, 231
+	syscall
 
 	.globl rt_panic_divzero
 rt_panic_divzero:
@@ -317,10 +385,14 @@ rt_free_chunk:
 
 	.globl rt_alloc
 rt_alloc:
-	mov rax, [rsp]
-	mov [rip+rt_user_pc], rax
-	lea rax, [rsp+8]
-	mov [rip+rt_user_sp], rax
+	ENTER_RT
+	push rsi
+	call rt_heap_acquire
+	pop rsi
+	call rt_alloc_body
+	mov qword ptr [rip+rt_heap_lock], 0
+	ret
+
 rt_alloc_body:
 	push rsi
 	lea rsi, [rdi+1]
@@ -459,57 +531,28 @@ rt_gc:
 	push r13
 	push r14
 	push r15
+	mov rax, qword ptr fs:[TLS_G]
+	mov [rax+G_SCANLO], rsp
+	call rt_world_stop
 	mov r15, [rip+rt_mark_base]
-	mov rdi, rsp
-	mov rsi, [rip+rt_user_sp]
-	call rt_scan_range
 	lea rdi, [rip+rt_pins]
 	mov rsi, [rip+rt_pin_count]
 	lea rsi, [rdi+8*rsi]
 	call rt_scan_range
-	mov r12, [rip+rt_user_pc]
-	mov r13, rbp
-	mov r14, [rip+rt_user_sp]
+	xor r12d, r12d
 1:
-	test r13, r13
-	jz 3f
-	cmp r13, [rip+rt_stack_top]
-	jae 3f
-	mov rdi, r12
-	call rt_lookup_map
-	test rax, rax
-	jz 2f
-	mov rbx, rax
-	mov r12, [rbx]
-	cmp r12, -1
-	je 9f
-5:
-	test r12, r12
-	jz 4f
-	add rbx, 8
-	mov rax, [rbx]
-	mov rdi, [r13+rax]
-	call rt_mark
-	dec r12
-	jmp 5b
-2:
-	mov rdi, r14
-	mov rsi, r13
-	call rt_scan_range
-4:
-	lea r14, [r13+16]
-	mov r12, [r13+8]
-	mov r13, [r13]
+	cmp r12, [rip+rt_ngs]
+	jae 6f
+	mov rax, [rip+rt_allgs]
+	mov rdi, [rax+8*r12]
+	inc r12
+	mov rax, [rdi+G_STATUS]
+	cmp rax, G_RUNNABLE
+	jb 1b
+	cmp rax, G_WAITING
+	ja 1b
+	call rt_scan_g
 	jmp 1b
-9:
-	lea rdi, [r13+16]
-	mov rsi, [r13-8]
-	call rt_scan_range
-	jmp 4b
-3:
-	mov rdi, r14
-	mov rsi, [rip+rt_stack_top]
-	call rt_scan_range
 6:
 	cmp r15, [rip+rt_mark_base]
 	jbe 8f
@@ -529,6 +572,7 @@ rt_gc:
 	jmp 7b
 8:
 	call rt_sweep
+	call rt_world_start
 	pop r15
 	pop r14
 	pop r13
@@ -536,7 +580,149 @@ rt_gc:
 	pop rbx
 	ret
 
+rt_scan_g:
+	push rbx
+	push r12
+	push r13
+	push r14
+	push qword ptr [rdi+G_HI]
+	mov rbx, rdi
+	cmp qword ptr [rbx+G_PC], 0
+	jne 1f
+	mov rdi, [rbx+G_SCANLO]
+	mov rsi, [rbx+G_HI]
+	call rt_scan_range
+	jmp 8f
+1:
+	mov rdi, [rbx+G_SCANLO]
+	mov rsi, [rbx+G_USERSP]
+	call rt_scan_range
+	mov r12, [rbx+G_PC]
+	mov r13, [rbx+G_FP]
+	mov r14, [rbx+G_USERSP]
+2:
+	test r13, r13
+	jz 7f
+	cmp r13, [rsp]
+	jae 7f
+	mov rdi, r12
+	call rt_lookup_map
+	test rax, rax
+	jz 4f
+	mov rbx, rax
+	mov r12, [rbx]
+	cmp r12, -1
+	je 6f
+3:
+	test r12, r12
+	jz 5f
+	add rbx, 8
+	mov rax, [rbx]
+	mov rdi, [r13+rax]
+	call rt_mark
+	dec r12
+	jmp 3b
+4:
+	mov rdi, r14
+	mov rsi, r13
+	call rt_scan_range
+5:
+	lea r14, [r13+16]
+	mov r12, [r13+8]
+	mov r13, [r13]
+	jmp 2b
+6:
+	mov rdi, [r13-8]
+	mov rsi, [r13-16]
+	call rt_scan_range
+	lea rdi, [r13+16]
+	mov rsi, [r13-24]
+	call rt_scan_range
+	mov r14, [r13-24]
+	mov r12, [r13+8]
+	mov r13, [r13]
+	jmp 2b
+7:
+	mov rdi, r14
+	mov rsi, [rsp]
+	call rt_scan_range
+8:
+	add rsp, 8
+	pop r14
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+rt_world_stop:
+	push rbx
+	push r12
+	mov dword ptr [rip+rt_stop], 1
+	mov r12, qword ptr fs:[TLS_M]
+	xor ebx, ebx
+1:
+	cmp rbx, [rip+rt_nm]
+	jae 2f
+	lea rax, [rip+rt_allm]
+	mov rdi, [rax+8*rbx]
+	mov rax, [rdi+M_FLAG]
+	mov byte ptr [rax], 1
+	inc rbx
+	jmp 1b
+2:
+	xor ebx, ebx
+3:
+	cmp rbx, [rip+rt_nm]
+	jae 6f
+	lea rax, [rip+rt_allm]
+	mov rdi, [rax+8*rbx]
+	inc rbx
+	cmp rdi, r12
+	je 3b
+4:
+	mov rax, [rdi+M_STATE]
+	cmp rax, RUNNING
+	jne 5f
+	pause
+	jmp 4b
+5:
+	test eax, HELD
+	jnz 3b
+	mov rcx, rax
+	or rcx, HELD
+	lock cmpxchg [rdi+M_STATE], rcx
+	jne 4b
+	jmp 3b
+6:
+	pop r12
+	pop rbx
+	ret
+
+rt_world_start:
+	push rbx
+	mov r8, qword ptr fs:[TLS_M]
+	xor ebx, ebx
+1:
+	cmp rbx, [rip+rt_nm]
+	jae 2f
+	lea rax, [rip+rt_allm]
+	mov rdi, [rax+8*rbx]
+	inc rbx
+	cmp rdi, r8
+	je 1b
+	lock and qword ptr [rdi+M_STATE], -9
+	jmp 1b
+2:
+	mov dword ptr [rip+rt_stop], 0
+	lea rdi, [rip+rt_stop]
+	mov esi, 0x7fffffff
+	call rt_futex_wake
+	mov byte ptr fs:[TLS_FLAG], 0
+	pop rbx
+	ret
+
 rt_scan_range:
+
 	push rbx
 	push r12
 	mov rbx, rdi

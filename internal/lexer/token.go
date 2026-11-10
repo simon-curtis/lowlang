@@ -35,6 +35,8 @@ const (
 	Pub
 	Extern
 	Defer
+	Spawn
+	Select
 
 	LParen
 	RParen
@@ -51,6 +53,7 @@ const (
 	Dot
 	Question
 	Coalesce
+	LArrow
 
 	Assign
 	PlusAssign
@@ -90,8 +93,8 @@ var names = map[Kind]string{
 	EOF: "end of file", Newline: "newline", Ident: "identifier", Int: "integer", Float: "float", Char: "character", String: "string",
 	Fn: "fn", Let: "let", Var: "var", If: "if", Else: "else", For: "for",
 	Break: "break", Continue: "continue", Return: "return", True: "true", False: "false",
-	Enum: "enum", Match: "match", Fail: "fail", Catch: "catch", Struct: "struct", Mut: "mut", In: "in", Import: "import", Pub: "pub", Extern: "extern", Defer: "defer",
-	LParen: "(", RParen: ")", LBracket: "[", RBracket: "]", DotDot: "..", Ellipsis: "...", LBrace: "{", RBrace: "}", Comma: ",", Colon: ":", Arrow: "->", FatArrow: "=>", Dot: ".", Question: "?", Coalesce: "??",
+	Enum: "enum", Match: "match", Fail: "fail", Catch: "catch", Struct: "struct", Mut: "mut", In: "in", Import: "import", Pub: "pub", Extern: "extern", Defer: "defer", Spawn: "spawn", Select: "select",
+	LParen: "(", RParen: ")", LBracket: "[", RBracket: "]", DotDot: "..", Ellipsis: "...", LBrace: "{", RBrace: "}", Comma: ",", Colon: ":", Arrow: "->", FatArrow: "=>", Dot: ".", Question: "?", Coalesce: "??", LArrow: "<-",
 	Assign: "=", PlusAssign: "+=", MinusAssign: "-=", StarAssign: "*=", SlashAssign: "/=",
 	PercentAssign: "%=", AmpAssign: "&=", PipeAssign: "|=", CaretAssign: "^=", ShlAssign: "<<=", ShrAssign: ">>=",
 	Plus: "+", Minus: "-", Star: "*", Slash: "/", Percent: "%", Amp: "&", Pipe: "|", Caret: "^", Tilde: "~", Shl: "<<", Shr: ">>", Not: "!",
@@ -108,7 +111,7 @@ func (k Kind) String() string {
 var keywords = map[string]Kind{
 	"fn": Fn, "let": Let, "var": Var, "if": If, "else": Else, "for": For,
 	"break": Break, "continue": Continue, "return": Return, "true": True, "false": False,
-	"enum": Enum, "match": Match, "fail": Fail, "catch": Catch, "struct": Struct, "mut": Mut, "in": In, "import": Import, "pub": Pub, "extern": Extern, "defer": Defer,
+	"enum": Enum, "match": Match, "fail": Fail, "catch": Catch, "struct": Struct, "mut": Mut, "in": In, "import": Import, "pub": Pub, "extern": Extern, "defer": Defer, "spawn": Spawn, "select": Select,
 }
 
 type Pos struct {

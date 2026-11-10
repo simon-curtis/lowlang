@@ -14,6 +14,9 @@ import (
 //go:embed runtime.asm
 var runtime string
 
+//go:embed sched.asm
+var scheduler string
+
 //go:embed hot.asm
 var hotRuntime string
 
@@ -37,6 +40,7 @@ type Generator struct {
 	table   map[string]int
 	suffix  string
 	maps    []stackMap
+	stubs   []pollStub
 }
 
 type frame struct {
@@ -80,7 +84,13 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 			g.thunk(f)
 		}
 	}
+	dynamic := 0
+	if len(prog.Libraries) > 0 {
+		dynamic = 1
+	}
 	var out strings.Builder
+	fmt.Fprintf(&out, "\t.intel_syntax noprefix\n\t.set RT_DYNAMIC, %d\n", dynamic)
+	out.WriteString(scheduler)
 	out.WriteString(runtime)
 	g.writeMaps(&out)
 	if table != nil {
@@ -181,11 +191,23 @@ func (g *Generator) start(prog *ir.Program) {
 	} else {
 		g.text.WriteString("\t.globl _start\n_start:\n")
 	}
-	g.emit("mov [rip+rt_stack_top], rsp")
 	g.emit("call rt_gc_init")
+	g.emit("call rt_sched_init")
 	if g.table != nil {
 		g.emit("call rt_hot_init")
 	}
+	g.emit("lea rdi, [rip+rt_program]")
+	g.emit("call rt_spawn_main")
+	g.emit("mov rax, qword ptr fs:[-24]")
+	g.emit("mov rsp, [rax+16]")
+	g.emit("jmp rt_schedule")
+	g.program(prog, dynamic)
+}
+
+func (g *Generator) program(prog *ir.Program, dynamic bool) {
+	g.text.WriteString("rt_program:\n")
+	g.emit("push rbp")
+	g.emit("mov rbp, rsp")
 	words := prog.Main.ResultWords
 	if words > 2 {
 		g.emit("sub rsp, %d", 16*((words+1)/2))
@@ -205,14 +227,11 @@ func (g *Generator) start(prog *ir.Program) {
 		g.emit("call rt_error")
 		g.label(exit)
 	}
+	g.emit("xor edi, edi")
 	if dynamic {
-		g.emit("mov rsp, [rip+rt_stack_top]")
-		g.emit("pop rbp")
-		g.emit("xor eax, eax")
-		g.emit("ret")
+		g.emit("call exit")
 		return
 	}
-	g.emit("xor edi, edi")
 	g.emit("mov eax, 231")
 	g.emit("syscall")
 }
@@ -293,6 +312,24 @@ func (g *Generator) function(f *ir.Func) {
 		}
 		g.block(fr, mb, next)
 	}
+	for _, stub := range g.stubs {
+		g.label(stub.label)
+		g.emit("call rt_poll")
+		g.emit("jmp %s", stub.resume)
+	}
+	g.stubs = nil
+}
+
+type pollStub struct {
+	label  string
+	resume string
+}
+
+func (g *Generator) poll(resume string) {
+	stub := pollStub{label: g.newLabel(), resume: resume}
+	g.emit("cmp byte ptr fs:[%d], 0", tlsFlag)
+	g.emit("jne %s", stub.label)
+	g.stubs = append(g.stubs, stub)
 }
 
 func outgoing(f *ir.Func) int {
@@ -362,6 +399,9 @@ func (g *Generator) block(fr *frame, mb *mblock, next *mblock) {
 	}
 	switch mb.kind {
 	case ir.Plain:
+		if mb.poll {
+			g.poll(mb.succs[0].label)
+		}
 		if mb.succs[0] != next {
 			g.emit("jmp %s", mb.succs[0].label)
 		}

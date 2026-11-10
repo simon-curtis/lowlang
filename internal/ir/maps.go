@@ -94,7 +94,7 @@ func (b *builder) mapLoop(s *ast.ForIn) {
 	b.enter(next)
 	from := b.emit(OpAdd, at, b.constant(1))
 	b.writeTemp(cursor, b.mapCall("__map_next", m, table, from))
-	b.jump(header)
+	b.backEdge(header)
 	b.seal(header)
 	b.enter(exit)
 }

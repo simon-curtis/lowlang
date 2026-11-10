@@ -311,6 +311,10 @@ func (c *Checker) substitute(t *types.Type, in *inference, pos lexer.Pos) *types
 		if e := sub(t.Elem); e != nil {
 			return c.raw(e)
 		}
+	case t.Kind == types.ChanKind:
+		if e := sub(t.Elem); e != nil {
+			return c.chanOf(e)
+		}
 	case t.Kind == types.MapKind:
 		k, v := sub(t.Key), sub(t.Elem)
 		if k != nil && v != nil {
@@ -423,6 +427,10 @@ func (c *Checker) genericTarget(x ast.Expr) *ast.Func {
 }
 
 func (c *Checker) instanceCall(e *ast.Call, inst *ast.Instance, want *types.Type) {
+	if id, ok := inst.X.(*ast.Ident); ok && id.Name == "chan" && c.find("chan") == nil && c.local().funcs["chan"] == nil {
+		c.makeChan(e, inst)
+		return
+	}
 	if fn := c.genericTarget(inst.X); fn != nil {
 		c.genericCall(e, fn, inst.Types, want)
 		return

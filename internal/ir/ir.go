@@ -115,6 +115,7 @@ type Block struct {
 	Results []*Value
 	Succs   []*Block
 	Preds   []*Block
+	Poll    bool
 }
 
 func (b *Block) String() string {

@@ -31,6 +31,7 @@ type instr struct {
 type mblock struct {
 	label   string
 	kind    ir.Kind
+	poll    bool
 	instrs  []*instr
 	succs   []*mblock
 	control *vreg
@@ -64,7 +65,7 @@ func lower(f *ir.Func) *mfunc {
 		temps:  map[*ir.Value]*vreg{},
 	}
 	for _, b := range f.Blocks {
-		mb := &mblock{label: fmt.Sprintf(".L%s_%d", mangle(f.Name), b.ID), kind: b.Kind}
+		mb := &mblock{label: fmt.Sprintf(".L%s_%d", mangle(f.Name), b.ID), kind: b.Kind, poll: b.Poll}
 		l.blocks[b] = mb
 		l.fn.blocks = append(l.fn.blocks, mb)
 	}

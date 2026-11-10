@@ -474,16 +474,35 @@ let pick: fn(i64, i64) -> i64 = max
 ### Concurrency
 
 ```low
-let results = chan[i64](16)
-spawn worker(results)
-let v = <-results
-select {
-    v = <-results => print(v)
-    timeout(1s) => print("slow")
+fn worker(jobs: chan[i64], results: chan[i64]) {
+    for j in jobs {
+        results <- j * 2
+    }
 }
+
+let jobs = chan[i64](16)
+let results = chan[i64](16)
+spawn worker(jobs, results)
+jobs <- 21
+close(jobs)
+print((<-results) ?? 0)
+let next = select {
+    v = <-results => v ?? -1
+    jobs <- 5 => 0
+    after(100) => -2
+    else => -3
+}
+sleep(10)
+wait_readable(fd)
 ```
 
-`spawn` starts a green thread on the runtime's M:N scheduler.
+- `spawn f(args)` starts a green thread running the call. The function value and the arguments are evaluated before it starts; `mut` arguments are not allowed. A function that can fail must have its error handled inside the spawned call.
+- `chan[T](n)` makes a channel holding up to `n` values; `chan[T]()` is unbuffered, so every send waits for a receiver. A channel is a reference: assigning or passing it shares it.
+- `c <- v` sends, waiting while the buffer is full. `<-c` receives a `T?`, waiting while the channel is empty, and gives `none` once it is closed and drained. `close(c)` wakes every waiter; sending on or closing a closed channel panics.
+- `for v in c` receives until the channel is closed and drained.
+- `select` waits on several operations at once and runs the arm of the first that can proceed. Arms are `name = <-c`, `<-c`, `c <- v`, `after(ms)` and `else`. Channel and value expressions are evaluated first, in order; ready arms are taken in order; `else` runs when nothing is ready; without `else` the green thread waits, and `after(ms)` fires once `ms` milliseconds pass. `select` is an expression like `match`.
+- `sleep(ms)` pauses the green thread. `wait_readable(fd)` and `wait_writable(fd)` wait until a file descriptor is ready, using epoll; one green thread may wait on a descriptor at a time.
+- A program ends when `main` returns, whatever other green threads are doing. When every green thread is waiting and nothing can wake one, the program panics with `every green thread is blocked forever`. A green thread that exhausts its stack panics with `stack overflow`.
 
 ## Compiler
 
@@ -502,13 +521,25 @@ The `low` command lives in `cmd/low`; the pipeline it shares with hot reload liv
 
 `internal/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles. Every file records its module path, and every source position its file, so errors name the file they come from. The checker keeps a scope of types and functions per module; the prelude belongs to the entry module, and its `__` names cannot clash with anything else. A function in module `ui/text` becomes the symbol `fn_ui.text.shout`, and types display with their module path, such as `geometry.Circle`.
 
-The runtime, `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls. It ends the process with `exit_group`, so every thread stops.
+The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls. It ends the process with `exit_group`, so every thread stops.
+
+### Scheduler
+
+- Green threads run on OS threads, one per CPU in the process's affinity mask. Threads are started as work appears, with `clone` in a static program and `pthread_create` in a dynamic one. A thread whose green thread is in a C call does not count against the limit, so another starts while C blocks.
+- Each OS thread keeps a 256-entry run queue; a full queue spills to a global queue. An idle thread takes from its own queue, the global queue every 32 schedules and whenever its own is empty, then expired timers and ready descriptors, then steals from other threads. With nothing to do it sleeps on a futex, or becomes the single poller that blocks in `epoll_wait` until the next timer.
+- A green thread reserves 1 MB of stack with a guard page below it; pages are committed as they are touched, and finished green threads are reused. Its context is its saved registers on its own stack. A fault in the guard page panics with `stack overflow`; any other fault panics with `invalid memory access`.
+- Per-thread state lives in a 24-byte `.tbss` block that sits directly below the thread pointer: the thread record at `fs:-24`, the running green thread at `fs:-16` and the preemption flag at `fs:-8`. A static program sets `fs` with `arch_prctl` and `CLONE_SETTLS`; a dynamic program uses the block glibc allocates for every thread. Generated code uses the fixed offsets, so hot reload patches need no TLS relocations.
+- Every loop back-edge tests the preemption flag. A monitor thread sets it every 10 ms on a thread whose green thread has run since the last check, and the collector sets it everywhere; a set flag calls `rt_poll`, which saves every register and yields or stops for the collector. Code that holds a channel lock does not yield. Recursion without loops is not preempted.
+- `park` and `ready` hand a green thread off with a per-thread lock and a wake token, so a wakeup that arrives before the green thread has finished parking is not lost.
+- Timers are a locked array of deadlines; `sleep` and `select`'s `after` arms add to it, and the poller wakes through an eventfd when an earlier timer arrives. Descriptors are registered with `EPOLLONESHOT`.
+- Channels and `select` are generic prelude code over `__Chan[T]`: a spinlock word, a ring buffer and queues of waiters. A waiter is claimed with compare-and-swap before it is woken, so a `select` waiting on several channels and timers fires exactly once. `select` locks its channels in address order, tries each arm, and otherwise queues a waiter on every channel, parks, and removes the leftovers when woken.
+- C calls run on the OS thread's system stack (8 MB in a static program). Around a C call the generated code pushes the callee-saved registers on the green thread's stack, records where the green thread stopped, marks the thread as in C and switches stacks; on return it marks the thread running again, waiting if a collection is under way.
+- A C callback runs on the green thread's stack. Its thunk marks the thread running, switches back to the green thread's stack below the C call's saved registers, and locks the green thread to the OS thread until it returns, because the C frames live on that OS thread's system stack: if the callback waits, the OS thread waits with it. Callbacks must arrive on the thread that made the C call.
 
 ### Linking
 
-- A static program is linked with `ld -static` and starts at the generated `_start`, which records the stack top, initialises the heap and calls `main`.
-- A dynamic program is linked with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2` against glibc's `crt1.o`, `crti.o` and `crtn.o`, then `-l<name>` for each library and `-lc`. The start files are looked for in `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/lib/x86_64-linux-gnu`. glibc's start-up code calls the generated C `main`, which saves its caller's `rbp`, clears it so the collector's frame walk ends at LowLang's outermost frame, records the stack top, initialises the heap, runs the program and returns 0, letting libc run its exit handlers. An error from `main` still prints and exits with status 1.
-- The runtime never touches `fs`, which glibc owns for thread-local storage in a dynamic program.
+- A static program is linked with `ld -static` and starts at the generated `_start`, which initialises the heap and the scheduler, starts `main` on the first green thread and enters the scheduler on the process stack.
+- A dynamic program is linked with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2` against glibc's `crt1.o`, `crti.o` and `crtn.o`, then `-l<name>` for each library and `-lc`. The start files are looked for in `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/lib/x86_64-linux-gnu`. glibc's start-up code calls the generated C `main`, which does the same; when LowLang's `main` returns the program calls `exit(0)`, letting libc run its exit handlers. An error from `main` still prints and exits with status 1.
 
 `internal/compiler/prelude.low` is LowLang source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, the generic map table, integer formatting, and float formatting with Burger and Dybvig's free-format algorithm over big integers of 32-bit limbs. Its names start with `__`, which user code cannot use, and four intrinsics are available only there: `__bits` gives a float's bit pattern, `__str_view` turns a `[]u8` into a `str` without copying, `__hash` hashes any `Hash` value, and `__zero` is the all-zero value of its expected type. Functions unreachable from `main` are dropped, so a program that formats no floats carries none of this code.
 
@@ -519,9 +550,11 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Allocation takes from exact-size free lists for objects under 64 words, then first-fit from a list of larger chunks, splitting them, then from the end of the heap.
 - Collection runs when the words allocated since the last one exceed the words that survived it, with a 4 MB floor.
 - An allocation whose type holds no pointers is noscan: `new` of a pointer-free value, and the backing arrays of slices whose elements hold none, such as `[]u8`, `[]i64` and `[]f32`. A noscan object is marked but its contents are never read. Other objects are scanned word by word.
-- Roots come from stack maps. At every call the code generator records the frame words that may hold a heap pointer at that point: the saved callee-saved registers, spill slots of values that may be pointers and are live across the call, and every frame slot. The maps form a table sorted by return address. `rt_alloc` and `rt_grow` record their caller's return address and stack pointer; the collector scans the runtime frames below that conservatively, then follows the `rbp` chain, looking up each frame's return address and scanning only its mapped words. Frames without a map, such as code patched in by hot reload, are scanned whole, and the region above `main` is scanned conservatively.
-- Values in callee-saved registers are found in the save slots of whichever later frame saved them, or among the registers `rt_gc` pushes.
-- C frames are crossed by segment. Before every C call the caller stores its `rbp`, its return address and its `rsp` in `rt_c_fp`, `rt_c_pc` and `rt_c_sp`. A callback thunk builds its frame record from the first two, so the `rbp` chain leads from the thunk straight back to the LowLang caller, and keeps the third in its frame. The thunk's call site has a map of count -1, which tells the collector to scan the C frames between the thunk and the caller's `rsp` conservatively before following the chain. The thunk restores the three globals when it returns, so nested and repeated callbacks see their own caller.
+- Allocation and pinning take a heap lock. A collection stops the world: it sets a stop flag and every thread's preemption flag, then waits until each other thread is stopped at a safepoint, idle in the scheduler or in a C call, and holds those threads there until it finishes. Threads waiting for a lock stop for the collector while they wait.
+- Roots come from stack maps. At every call the code generator records the frame words that may hold a heap pointer at that point: the saved callee-saved registers, spill slots of values that may be pointers and are live across the call, and every frame slot. The maps form a table sorted by return address.
+- Every green thread records where it stopped: the return address, stack pointer and frame pointer of the LowLang code that entered the runtime, and the lowest stack word holding registers it saved. The collector scans each live green thread's saved registers conservatively, then follows its `rbp` chain, looking up each frame's return address and scanning only its mapped words, and scans the green thread's first frame conservatively. Frames without a map, such as code patched in by hot reload or a loop interrupted by a preemption check, are scanned whole. A green thread that has not started is scanned whole.
+- Values in callee-saved registers are found in the save slots of whichever later frame saved them, or among the registers saved when the green thread stopped.
+- A callback thunk crosses C frames by segment. Its frame record holds the LowLang caller's frame pointer and return address, so the `rbp` chain leads from the thunk straight back to the caller, and its frame keeps the bounds of the C frames on the system stack and of the registers the C call saved. The thunk's call site has a map of count -1, which tells the collector to scan both regions conservatively before following the chain.
 - Every candidate word, mapped or not, is checked against the heap before it is followed, so a map that names a word holding an integer is harmless.
 - A `ptr` counts as a possible heap pointer, so a `cstr` copy or a pinned object stays alive while LowLang holds its address. `pin` records the address in a table of 65536 roots that every collection scans; `unpin` removes it.
 - Sweeping coalesces adjacent dead objects into free chunks and returns a trailing free run to the end of the heap.
@@ -540,7 +573,9 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - `defer` keeps a stack of deferred statements per block and lowers them again at every exit from that block.
 - A LowLang function value is two words: a code address and an environment pointer. Code reached through a function value takes the environment as parameter word 0. A closure is checked in place and becomes a function named after its parent, such as `counter..c1`; its environment is a heap array holding a box pointer per captured variable, or 0 when it captures none. A captured variable lives in a heap box allocated when it is bound, and every access, in its own function and in closures, loads and stores through the box. A named function used as a value goes through an adapter, `name..value`, which drops the environment and calls it.
 - A call through a function value moves the code address to `r10` and calls it, passing the environment and the arguments like any call. A call through an `extern fn` value is a `ccall` with the same System V plan as a named C function.
-- A C callback is a thunk, `cb_name`, emitted once per program for every function used as one. It saves the C argument registers, re-extends narrow integers and `bool` from them and from the C stack, calls the function with LowLang's convention and moves a float result to `xmm0`.
+- A C callback is a thunk, `cb_name`, emitted once per program for every function used as one. It saves the C argument registers, re-extends narrow integers and `bool` from them and from the C stack, calls the function with LowLang's convention on the green thread's stack and moves a float result to `xmm0`.
+- Every loop's back-edge block is marked; the code generator ends it with `cmp byte ptr fs:[-8], 0` and a branch to an out-of-line `call rt_poll`.
+- `spawn f(a, b)` becomes a block that binds the callee and the arguments to fresh locals and passes a closure calling `f` with them to `rt_spawn`. Sends, receives, `close` and channel loops call the prelude's instances for the element type; `select` calls the prelude's per-arm helpers and the runtime's `rt_lock_all`, `rt_timer_add` and `rt_park`.
 - `funcaddr` gives a function's code address, its thunk, or an `extern` function's address through the GOT. Functions reached only through `funcaddr` are kept.
 - In dev builds every C function gets a global trampoline, `cfn_name: jmp name`, and calls go through it, so a patch can link against the running binary.
 - An `embed` becomes an address and a length. The data is emitted with `.incbin` under a label named by the file's content hash, so a changed file changes the code of every function that embeds it.
@@ -588,7 +623,7 @@ Mechanism:
 `internal/hot` tests reload against running programs: state kept across a code swap, functions added, compile errors leaving the program running, heap data surviving a reload while the collector runs, stored function values, closures and callbacks running patched code, instances of an edited generic function patched,
  and restarts on layout, signature and capture changes.
 
-`go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. A program with a `.needed` file must link exactly those shared libraries; every other program must be static with no interpreter. Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
+`go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it with a one-minute limit and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. A program with a `.needed` file must link exactly those shared libraries; every other program must be static with no interpreter. Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
 
 ## Implemented
 
@@ -610,25 +645,21 @@ Mechanism:
 - `defer`.
 - Generic functions, structs and enums with built-in constraints, compiled per type; maps built on generic prelude code.
 - Function values and closures capturing by reference; `extern fn` C function pointers and C callbacks.
+- Green threads on an M:N scheduler with `spawn`, channels, `select`, `sleep`, descriptor waits through epoll, deadlock detection and stack overflow checks.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. Green-thread scheduler, channels, `select`:
-    - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
-    - C calls run on a large system stack rather than the green-thread stack.
-    - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-2. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-3. GPU UI library modelled on Zed's GPUI, Linux first:
+1. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+2. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
     4. Flexbox layout (a Taffy subset); an element tree with `request_layout`, `prepaint` and `paint` phases, where an element is a struct of closures for those phases capturing its own state; styles with partial overrides for hover and active states.
-
     5. Input: libxkbcommon keyboard, key repeat, hitboxes, mouse dispatch, focus and tab stops, actions and keymaps.
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-4. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-5. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+3. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+4. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
