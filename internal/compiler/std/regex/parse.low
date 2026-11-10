@@ -1,0 +1,580 @@
+import std/slices
+
+struct Range {
+    lo: u32
+    hi: u32
+}
+
+enum Look {
+    TextStart
+    TextEnd
+    EndOrFinalNewline
+    LineStart
+    LineEnd
+    WordBoundary
+    NotWordBoundary
+}
+
+enum Node {
+    Empty
+    Literal(c: u32)
+    Set(ranges: []Range)
+    Assert(look: Look)
+    Capture(index: i64, body: *Node)
+    Concat(items: []Node)
+    Alternate(branches: []Node)
+    Repeat(body: *Node, min: i64, max: i64, greedy: bool)
+}
+
+struct Parsed {
+    root: Node
+    groups: i64
+}
+
+struct Parser {
+    pattern: str
+    pos: i64
+    groups: i64
+}
+
+struct Bounds {
+    min: i64
+    max: i64
+    end: i64
+}
+
+fn max_repeat() -> i64 {
+    10000
+}
+
+fn max_rune() -> u32 {
+    0x10FFFF
+}
+
+fn parse(pattern: str, flags: Flags) -> Parsed ! Error {
+    var p = Parser { pattern, pos: 0, groups: 0 }
+    var scope = flags
+    let root = parse_alternation(mut p, mut scope)?
+    if p.pos < pattern.len {
+        fail Invalid(p.pos, "unbalanced parenthesis")
+    }
+    Parsed { root, groups: p.groups }
+}
+
+fn at_end(p: Parser) -> bool {
+    p.pos >= p.pattern.len
+}
+
+fn peek(p: Parser) -> u8 {
+    p.pattern[p.pos]
+}
+
+fn parse_alternation(mut p: Parser, mut flags: Flags) -> Node ! Error {
+    let first = parse_concat(mut p, mut flags)?
+    var branches = [first]
+    for !at_end(p) && peek(p) == '|' {
+        p.pos += 1
+        let branch = parse_concat(mut p, mut flags)?
+        push(mut branches, branch)
+    }
+    if branches.len == 1 {
+        return first
+    }
+    Alternate(branches)
+}
+
+fn parse_concat(mut p: Parser, mut flags: Flags) -> Node ! Error {
+    var items: []Node = []
+    for !at_end(p) && peek(p) != '|' && peek(p) != ')' {
+        let atom = parse_atom(mut p, mut flags)?
+        match atom {
+            some(node) => {
+                let item = parse_repeat(mut p, node)?
+                push(mut items, item)
+            }
+            none => {}
+        }
+    }
+    if items.len == 0 {
+        return Empty
+    }
+    if items.len == 1 {
+        return items[0]
+    }
+    Concat(items)
+}
+
+fn parse_atom(mut p: Parser, mut flags: Flags) -> Node? ! Error {
+    let start = p.pos
+    match peek(p) {
+        == '(' => return parse_group(mut p, mut flags)?
+        == '[' => return parse_class(mut p, flags)?
+        == '\\' => {
+            let escaped = parse_escape(mut p, false)?
+            return fold_literal(escaped, flags)
+        }
+        == '.' => {
+            p.pos += 1
+            return Set(dot(flags))
+        }
+        == '^' => {
+            p.pos += 1
+            let look: Look = if flags.multiline { LineStart } else { TextStart }
+            return Assert(look)
+        }
+        == '$' => {
+            p.pos += 1
+            let look: Look = if flags.multiline { LineEnd } else { EndOrFinalNewline }
+            return Assert(look)
+        }
+        == '*' => fail Invalid(start, "nothing to repeat")
+        == '+' => fail Invalid(start, "nothing to repeat")
+        == '?' => fail Invalid(start, "nothing to repeat")
+        == '{' => {
+            if scan_bounds(p.pattern, start) != none {
+                fail Invalid(start, "nothing to repeat")
+            }
+        }
+        _ => {}
+    }
+    let r = decode(p.pattern, start)
+    p.pos += r.size
+    fold_literal(Literal(r.code), flags)
+}
+
+fn dot(flags: Flags) -> []Range {
+    if flags.dot_all {
+        return [Range { lo: 0, hi: max_rune() }]
+    }
+    [Range { lo: 0, hi: 9 }, Range { lo: 11, hi: max_rune() }]
+}
+
+fn fold_literal(node: Node, flags: Flags) -> Node {
+    if !flags.ignore_case {
+        return node
+    }
+    match node {
+        Literal(c) => {
+            let folded = fold([Range { lo: c, hi: c }])
+            if folded.len == 1 {
+                return node
+            }
+            Set(folded)
+        }
+        other => other
+    }
+}
+
+fn parse_group(mut p: Parser, mut flags: Flags) -> Node? ! Error {
+    let start = p.pos
+    p.pos += 1
+    if !at_end(p) && peek(p) == '?' {
+        return parse_extension(mut p, mut flags, start)?
+    }
+    p.groups += 1
+    let index = p.groups
+    var inner = flags
+    let body = parse_alternation(mut p, mut inner)?
+    close_group(mut p, start)?
+    Capture(index, new(body))
+}
+
+fn close_group(mut p: Parser, start: i64) ! Error {
+    if at_end(p) {
+        fail Invalid(start, "missing ), unterminated subpattern")
+    }
+    p.pos += 1
+}
+
+fn parse_extension(mut p: Parser, mut flags: Flags, start: i64) -> Node? ! Error {
+    p.pos += 1
+    if at_end(p) {
+        fail Invalid(p.pos, "unexpected end of pattern")
+    }
+    let c = peek(p)
+    if c == '=' || c == '!' {
+        fail Invalid(start, "lookaround is not supported")
+    }
+    if c == '<' {
+        let behind = p.pos + 1 < p.pattern.len && (p.pattern[p.pos + 1] == '=' || p.pattern[p.pos + 1] == '!')
+        if behind {
+            fail Invalid(start, "lookaround is not supported")
+        }
+        fail Invalid(start, "named groups are not supported")
+    }
+    if c == 'P' {
+        fail Invalid(start, "named groups are not supported")
+    }
+    if c != 'i' && c != 'm' && c != 's' && c != '-' && c != ':' {
+        let r = decode(p.pattern, p.pos)
+        fail Invalid(start + 1, "unknown extension {p.pattern[start + 1..p.pos + r.size]}")
+    }
+    parse_flags(mut p, mut flags, start)?
+}
+
+fn parse_flags(mut p: Parser, mut flags: Flags, start: i64) -> Node? ! Error {
+    var scoped = flags
+    var enable = true
+    var flagged = false
+    for {
+        if at_end(p) {
+            fail Invalid(p.pos, "missing -, : or )")
+        }
+        let f = peek(p)
+        p.pos += 1
+        if f == 'i' || f == 'm' || f == 's' {
+            set_flag(mut scoped, f, enable)
+            flagged = true
+            continue
+        }
+        if f != '-' && f != ':' && f != ')' {
+            fail Invalid(p.pos - 1, "unknown flag")
+        }
+        if !enable && !flagged {
+            fail Invalid(p.pos - 1, "missing flag")
+        }
+        if f == '-' {
+            enable = false
+            flagged = false
+            continue
+        }
+        if f == ')' {
+            flags = scoped
+            return none
+        }
+        let body = parse_alternation(mut p, mut scoped)?
+        close_group(mut p, start)?
+        return body
+    }
+}
+
+fn set_flag(mut flags: Flags, f: u8, enable: bool) {
+    if f == 'i' {
+        flags.ignore_case = enable
+    } else if f == 'm' {
+        flags.multiline = enable
+    } else {
+        flags.dot_all = enable
+    }
+}
+
+fn parse_repeat(mut p: Parser, atom: Node) -> Node ! Error {
+    if at_end(p) {
+        return atom
+    }
+    let at = p.pos
+    var min = 0
+    var max = -1
+    match peek(p) {
+        == '*' => {
+            p.pos += 1
+        }
+        == '+' => {
+            min = 1
+            p.pos += 1
+        }
+        == '?' => {
+            max = 1
+            p.pos += 1
+        }
+        == '{' => {
+            let b = scan_bounds(p.pattern, at) ?? return atom
+            check_bounds(at, b)?
+            min = b.min
+            max = b.max
+            p.pos = b.end
+        }
+        _ => return atom
+    }
+    match atom {
+        Assert(_) => fail Invalid(at, "nothing to repeat")
+        _ => {}
+    }
+    var greedy = true
+    if !at_end(p) && peek(p) == '?' {
+        greedy = false
+        p.pos += 1
+    }
+    if starts_repeat(p) {
+        fail Invalid(p.pos, "multiple repeat")
+    }
+    Repeat(new(atom), min, max, greedy)
+}
+
+fn starts_repeat(p: Parser) -> bool {
+    if at_end(p) {
+        return false
+    }
+    let c = peek(p)
+    c == '*' || c == '+' || c == '?' || c == '{' && scan_bounds(p.pattern, p.pos) != none
+}
+
+fn scan_number(s: str, mut i: i64) -> i64 {
+    var n = -1
+    for i < s.len && s[i] >= '0' && s[i] <= '9' {
+        let digit = i64(s[i] - '0')
+        n = if n < 0 { digit } else { n * 10 + digit }
+        if n > max_repeat() {
+            n = max_repeat() + 1
+        }
+        i += 1
+    }
+    n
+}
+
+fn scan_bounds(s: str, at: i64) -> Bounds? {
+    var i = at + 1
+    let low = scan_number(s, mut i)
+    var high = low
+    if i < s.len && s[i] == ',' {
+        i += 1
+        high = scan_number(s, mut i)
+    } else if low < 0 {
+        return none
+    }
+    if i >= s.len || s[i] != '}' {
+        return none
+    }
+    let min = if low < 0 { 0 } else { low }
+    Bounds { min, max: high, end: i + 1 }
+}
+
+fn check_bounds(at: i64, b: Bounds) ! Error {
+    if b.min > max_repeat() || b.max > max_repeat() {
+        fail Invalid(at + 1, "repeat count too large")
+    }
+    if b.max >= 0 && b.min > b.max {
+        fail Invalid(at + 1, "min repeat greater than max repeat")
+    }
+}
+
+fn parse_escape(mut p: Parser, in_class: bool) -> Node ! Error {
+    let start = p.pos
+    p.pos += 1
+    if at_end(p) {
+        fail Invalid(start, "bad escape (end of pattern)")
+    }
+    let c = peek(p)
+    p.pos += 1
+    match c {
+        == 'd' => Set(digits())
+        == 'D' => Set(negate(digits()))
+        == 'w' => Set(word())
+        == 'W' => Set(negate(word()))
+        == 's' => Set(spaces())
+        == 'S' => Set(negate(spaces()))
+        == 'n' => Literal(10)
+        == 't' => Literal(9)
+        == 'r' => Literal(13)
+        == 'f' => Literal(12)
+        == 'v' => Literal(11)
+        == 'a' => Literal(7)
+        == 'x' => Literal(parse_hex(mut p, start, 2)?)
+        == 'u' => Literal(parse_hex(mut p, start, 4)?)
+        == 'U' => Literal(parse_hex(mut p, start, 8)?)
+        == 'b' => if in_class { Literal(8) } else { Assert(WordBoundary) }
+        _ => escape_assertion(mut p, start, c, in_class)?
+    }
+}
+
+fn escape_assertion(mut p: Parser, start: i64, c: u8, in_class: bool) -> Node ! Error {
+    let look: Look = match c {
+        == 'B' => NotWordBoundary
+        == 'A' => TextStart
+        == 'Z' => TextEnd
+        == 'z' => TextEnd
+        _ => return escape_literal(mut p, start, c)?
+    }
+    if in_class {
+        fail Invalid(start, "bad escape {p.pattern[start..p.pos]}")
+    }
+    Assert(look)
+}
+
+fn escape_literal(mut p: Parser, start: i64, c: u8) -> Node ! Error {
+    if c >= '0' && c <= '9' {
+        fail Invalid(start, "backreferences and octal escapes are not supported")
+    }
+    if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' {
+        fail Invalid(start, "bad escape {p.pattern[start..p.pos]}")
+    }
+    let r = decode(p.pattern, start + 1)
+    p.pos = start + 1 + r.size
+    Literal(r.code)
+}
+
+fn parse_hex(mut p: Parser, start: i64, digits: i64) -> u32 ! Error {
+    var value: u32 = 0
+    for i in 0..digits {
+        let d = if at_end(p) { -1 } else { hex_digit(peek(p)) }
+        if d < 0 {
+            fail Invalid(start, "incomplete escape {p.pattern[start..p.pos]}")
+        }
+        value = value * 16 + u32(d)
+        p.pos += 1
+    }
+    if value > max_rune() {
+        fail Invalid(start, "bad escape {p.pattern[start..p.pos]}")
+    }
+    value
+}
+
+fn hex_digit(c: u8) -> i64 {
+    if c >= '0' && c <= '9' {
+        return i64(c - '0')
+    }
+    if c >= 'a' && c <= 'f' {
+        return i64(c - 'a') + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return i64(c - 'A') + 10
+    }
+    -1
+}
+
+fn parse_class(mut p: Parser, flags: Flags) -> Node ! Error {
+    let start = p.pos
+    p.pos += 1
+    var negated = false
+    if !at_end(p) && peek(p) == '^' {
+        negated = true
+        p.pos += 1
+    }
+    var ranges: []Range = []
+    var first = true
+    for {
+        if at_end(p) {
+            fail Invalid(start, "unterminated character set")
+        }
+        if peek(p) == ']' && !first {
+            p.pos += 1
+            break
+        }
+        first = false
+        parse_class_item(mut p, mut ranges)?
+    }
+    if flags.ignore_case {
+        ranges = fold(ranges)
+    }
+    ranges = normalize(ranges)
+    if negated {
+        ranges = negate(ranges)
+    }
+    Set(ranges)
+}
+
+fn parse_class_item(mut p: Parser, mut ranges: []Range) ! Error {
+    let start = p.pos
+    let low = parse_class_atom(mut p)?
+    let dash = p.pos + 1 < p.pattern.len && peek(p) == '-' && p.pattern[p.pos + 1] != ']'
+    if !dash {
+        add_atom(mut ranges, low)
+        return
+    }
+    p.pos += 1
+    let high = parse_class_atom(mut p)?
+    let r = class_range(low, high) ?? fail Invalid(start, "bad character range {p.pattern[start..p.pos]}")
+    push(mut ranges, r)
+}
+
+fn class_range(low: Node, high: Node) -> Range? {
+    let lo = single(low) ?? return none
+    let hi = single(high) ?? return none
+    if hi < lo {
+        return none
+    }
+    Range { lo, hi }
+}
+
+fn parse_class_atom(mut p: Parser) -> Node ! Error {
+    if peek(p) == '\\' {
+        return parse_escape(mut p, true)?
+    }
+    let r = decode(p.pattern, p.pos)
+    p.pos += r.size
+    Literal(r.code)
+}
+
+fn single(n: Node) -> u32? {
+    match n {
+        Literal(c) => c
+        _ => none
+    }
+}
+
+fn add_atom(mut ranges: []Range, atom: Node) {
+    match atom {
+        Literal(c) => push(mut ranges, Range { lo: c, hi: c })
+        Set(set) => {
+            for r in set {
+                push(mut ranges, r)
+            }
+        }
+        _ => {}
+    }
+}
+
+fn digits() -> []Range {
+    [Range { lo: '0', hi: '9' }]
+}
+
+fn word() -> []Range {
+    [Range { lo: '0', hi: '9' }, Range { lo: 'A', hi: 'Z' }, Range { lo: '_', hi: '_' }, Range { lo: 'a', hi: 'z' }]
+}
+
+fn spaces() -> []Range {
+    [Range { lo: 9, hi: 13 }, Range { lo: ' ', hi: ' ' }]
+}
+
+fn fold(ranges: []Range) -> []Range {
+    var out: []Range = []
+    for r in ranges {
+        push(mut out, r)
+        add_shifted(mut out, r, 'A', 'Z', 'a')
+        add_shifted(mut out, r, 'a', 'z', 'A')
+    }
+    normalize(out)
+}
+
+fn add_shifted(mut out: []Range, r: Range, lo: u32, hi: u32, to: u32) {
+    let from = if r.lo > lo { r.lo } else { lo }
+    let until = if r.hi < hi { r.hi } else { hi }
+    if from <= until {
+        push(mut out, Range { lo: from - lo + to, hi: until - lo + to })
+    }
+}
+
+fn normalize(ranges: []Range) -> []Range {
+    var sorted = slices.clone(ranges)
+    sorted |> slices.sort_by(fn(a: Range, b: Range) -> bool { a.lo < b.lo })
+    var out: []Range = []
+    for r in sorted {
+        merge(mut out, r)
+    }
+    out
+}
+
+fn merge(mut out: []Range, r: Range) {
+    if out.len > 0 && r.lo <= out[out.len - 1].hi + 1 {
+        if r.hi > out[out.len - 1].hi {
+            out[out.len - 1].hi = r.hi
+        }
+        return
+    }
+    push(mut out, r)
+}
+
+fn negate(ranges: []Range) -> []Range {
+    var out: []Range = []
+    var next: u32 = 0
+    for r in ranges {
+        if r.lo > next {
+            push(mut out, Range { lo: next, hi: r.lo - 1 })
+        }
+        next = r.hi + 1
+    }
+    if next <= max_rune() {
+        push(mut out, Range { lo: next, hi: max_rune() })
+    }
+    out
+}
