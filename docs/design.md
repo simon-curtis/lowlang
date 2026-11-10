@@ -662,7 +662,7 @@ fn main() ! io.Error {
 }
 ```
 
-`import std/<name>` loads a module of the standard library, which is compiled into `low`; the project root is not searched for it. Every module except `std/math` talks to the kernel through raw syscalls. `std/math` calls libm through an `extern` block, and a library is linked only when reachable code calls it, so a program stays static unless it calls one of libm's functions.
+`import std/<name>` loads a module of the standard library, which is compiled into `low`; the project root is not searched for it. Every module except `std/math` and `std/sql/sqlite` talks to the kernel through raw syscalls. `std/math` calls libm and `std/sql/sqlite` calls libsqlite3 through `extern` blocks, and a library is linked only when reachable code calls it, so a program stays static unless it calls one of their C functions.
 
 | Module | Contents |
 |---|---|
@@ -682,6 +682,7 @@ fn main() ! io.Error {
 | `std/sql` | The driver contract: `Connection`, `Value`, `Rows`, `Error`, `Options` and dialect helpers. |
 | `std/sql/postgres` | A PostgreSQL driver over protocol 3.0, plain or over TLS. |
 | `std/sql/sqlserver` | A Microsoft SQL Server driver over TDS 7.4, plain or over TLS. |
+| `std/sql/sqlite` | SQLite through libsqlite3, linked only when a program calls it: `open` and `open_with` (read-only, create, busy timeout), `exec` for scripts, `query`, `each` and `execute` with `?` or `?N` parameters over cached prepared statements, `last_insert_id`, `begin`, `begin_immediate`, `commit` and `rollback`, `backup` to a file through the online backup API, and `connection` and `connect`, which present a database as an `sql.Connection` for `std/orm`. Calls block their OS thread. |
 | `std/toml` | TOML 1.0.0: a table tree, an encoder, and serde binding. |
 | `std/yaml` | YAML 1.2.2: events, a node tree, an encoder, and serde binding. |
 | `std/otel` | OpenTelemetry traces, metrics and logs with W3C propagation, OTLP/HTTP protobuf and JSON, OTLP/gRPC and console exporters, and the instrumentation used by `std/http`, `std/web`, `std/sql/postgres`, `std/sql/sqlserver` and `std/orm`. |

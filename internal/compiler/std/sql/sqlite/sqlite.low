@@ -1,0 +1,345 @@
+import std/otel
+import std/sql
+
+extern "sqlite3" {
+    fn sqlite3_open_v2(filename: ptr[u8], mut db: ptr, flags: i32, vfs: ptr) -> i32
+    fn sqlite3_close_v2(db: ptr) -> i32
+    fn sqlite3_errmsg(db: ptr) -> ptr[u8]
+    fn sqlite3_extended_errcode(db: ptr) -> i32
+    fn sqlite3_busy_timeout(db: ptr, ms: i32) -> i32
+    fn sqlite3_exec(db: ptr, script: ptr[u8], callback: ptr, arg: ptr, errors: ptr) -> i32
+    fn sqlite3_prepare_v2(db: ptr, text: ptr[u8], n: i32, mut stmt: ptr, tail: ptr) -> i32
+    fn sqlite3_reset(stmt: ptr) -> i32
+    fn sqlite3_clear_bindings(stmt: ptr) -> i32
+    fn sqlite3_finalize(stmt: ptr) -> i32
+    fn sqlite3_step(stmt: ptr) -> i32
+    fn sqlite3_bind_parameter_count(stmt: ptr) -> i32
+    fn sqlite3_bind_null(stmt: ptr, at: i32) -> i32
+    fn sqlite3_bind_int64(stmt: ptr, at: i32, value: i64) -> i32
+    fn sqlite3_bind_double(stmt: ptr, at: i32, value: f64) -> i32
+    fn sqlite3_bind_text(stmt: ptr, at: i32, text: ptr, n: i32, destructor: i64) -> i32
+    fn sqlite3_bind_blob(stmt: ptr, at: i32, data: ptr, n: i32, destructor: i64) -> i32
+    fn sqlite3_bind_zeroblob(stmt: ptr, at: i32, n: i32) -> i32
+    fn sqlite3_column_count(stmt: ptr) -> i32
+    fn sqlite3_column_name(stmt: ptr, at: i32) -> ptr[u8]
+    fn sqlite3_column_decltype(stmt: ptr, at: i32) -> ptr[u8]
+    fn sqlite3_column_type(stmt: ptr, at: i32) -> i32
+    fn sqlite3_column_int64(stmt: ptr, at: i32) -> i64
+    fn sqlite3_column_double(stmt: ptr, at: i32) -> f64
+    fn sqlite3_column_text(stmt: ptr, at: i32) -> ptr[u8]
+    fn sqlite3_column_blob(stmt: ptr, at: i32) -> ptr[u8]
+    fn sqlite3_column_bytes(stmt: ptr, at: i32) -> i32
+    fn sqlite3_changes64(db: ptr) -> i64
+    fn sqlite3_last_insert_rowid(db: ptr) -> i64
+    fn sqlite3_backup_init(dest: ptr, dest_name: ptr[u8], source: ptr, source_name: ptr[u8]) -> ptr
+    fn sqlite3_backup_step(backup: ptr, pages: i32) -> i32
+    fn sqlite3_backup_finish(backup: ptr) -> i32
+}
+
+pub struct Config {
+    pub read_only: bool = false
+    pub create: bool = true
+    pub busy_timeout: i64 = 5000
+}
+
+struct Handle {
+    db: ptr
+    path: str
+    open: bool
+    statements: [str: ptr]
+}
+
+pub struct Database {
+    handle: *Handle
+}
+
+fn transient() -> i64 {
+    -1
+}
+
+fn flags(c: Config) -> i32 {
+    var f: i32 = 0x10040
+    if c.read_only {
+        f = f | 1
+    } else {
+        f = f | 2
+        if c.create {
+            f = f | 4
+        }
+    }
+    f
+}
+
+fn failure(db: ptr, code: i32) -> sql.Error {
+    let primary = code & 0xFF
+    if primary == 5 || primary == 6 {
+        return Busy
+    }
+    if db == null {
+        return Server("{code}", "cannot open database")
+    }
+    Server("{sqlite3_extended_errcode(db)}", str(sqlite3_errmsg(db)))
+}
+
+fn check(h: *Handle, code: i32) ! sql.Error {
+    if code != 0 {
+        fail failure(h.db, code)
+    }
+}
+
+fn live(h: *Handle) ! sql.Error {
+    if !h.open {
+        fail Closed
+    }
+}
+
+pub fn open_with(path: str, c: Config) -> Database ! sql.Error {
+    var db: ptr = null
+    let code = sqlite3_open_v2(cstr(path), mut db, flags(c), null)
+    if code != 0 {
+        let e = failure(db, code)
+        if db != null {
+            sqlite3_close_v2(db)
+        }
+        fail e
+    }
+    sqlite3_busy_timeout(db, i32(c.busy_timeout))
+    Database { handle: new(Handle { db: db, path: path, open: true, statements: [:] }) }
+}
+
+pub fn open(path: str) -> Database ! sql.Error {
+    open_with(path, Config {})?
+}
+
+pub fn close(d: Database) {
+    let h = d.handle
+    if !h.open {
+        return
+    }
+    for text, stmt in h.statements {
+        sqlite3_finalize(stmt)
+    }
+    h.statements = [:]
+    sqlite3_close_v2(h.db)
+    h.open = false
+}
+
+pub fn exec(d: Database, script: str) ! sql.Error {
+    live(d.handle)?
+    check(d.handle, sqlite3_exec(d.handle.db, cstr(script), null, null, null))?
+}
+
+fn prepared(h: *Handle, text: str) -> ptr ! sql.Error {
+    live(h)?
+    match h.statements[text] {
+        some(stmt) => return stmt
+        none => {}
+    }
+    var stmt: ptr = null
+    check(h, sqlite3_prepare_v2(h.db, cstr(text), -1, mut stmt, null))?
+    h.statements[text] = stmt
+    stmt
+}
+
+fn bind_text(stmt: ptr, at: i32, s: str) -> i32 {
+    if s.len == 0 {
+        return sqlite3_bind_text(stmt, at, cstr(""), 0, transient())
+    }
+    let data = pin(s)
+    let code = sqlite3_bind_text(stmt, at, data, i32(s.len), transient())
+    unpin(data)
+    code
+}
+
+fn bind_bytes(stmt: ptr, at: i32, b: []u8) -> i32 {
+    if b.len == 0 {
+        return sqlite3_bind_zeroblob(stmt, at, 0)
+    }
+    let data = pin(b)
+    let code = sqlite3_bind_blob(stmt, at, data, i32(b.len), transient())
+    unpin(data)
+    code
+}
+
+fn bind_value(stmt: ptr, at: i32, v: sql.Value) -> i32 {
+    match v {
+        Null => sqlite3_bind_null(stmt, at)
+        Bool(b) => sqlite3_bind_int64(stmt, at, if b { 1 } else { 0 })
+        Int(n) => sqlite3_bind_int64(stmt, at, n)
+        Float(x) => sqlite3_bind_double(stmt, at, x)
+        Decimal(digits) => bind_text(stmt, at, digits)
+        Text(s) => bind_text(stmt, at, s)
+        Bytes(b) => bind_bytes(stmt, at, b)
+        Uuid(b) => bind_bytes(stmt, at, b)
+        Date(days) => sqlite3_bind_int64(stmt, at, days)
+        Time(micros) => sqlite3_bind_int64(stmt, at, micros)
+        Timestamp(micros) => sqlite3_bind_int64(stmt, at, micros)
+        TimestampTz(micros) => sqlite3_bind_int64(stmt, at, micros)
+    }
+}
+
+fn statement(h: *Handle, text: str, values: []sql.Value) -> ptr ! sql.Error {
+    let stmt = prepared(h, text)?
+    sqlite3_reset(stmt)
+    sqlite3_clear_bindings(stmt)
+    if i64(sqlite3_bind_parameter_count(stmt)) != values.len {
+        fail Conversion
+    }
+    for i, v in values {
+        check(h, bind_value(stmt, i32(i + 1), v))?
+    }
+    stmt
+}
+
+fn optional_text(p: ptr[u8]) -> str {
+    if p == null {
+        return ""
+    }
+    str(p)
+}
+
+fn columns(stmt: ptr) -> []sql.Column {
+    var out: []sql.Column = []
+    for i in 0..i64(sqlite3_column_count(stmt)) {
+        let at = i32(i)
+        push(mut out, sql.Column {
+            name: optional_text(sqlite3_column_name(stmt, at)),
+            kind: optional_text(sqlite3_column_decltype(stmt, at)),
+        })
+    }
+    out
+}
+
+fn bytes_at(stmt: ptr, data: ptr[u8], at: i32) -> []u8 {
+    let n = i64(sqlite3_column_bytes(stmt, at))
+    if n == 0 || data == null {
+        return []
+    }
+    bytes(str(view(data, n)))
+}
+
+fn column_value(stmt: ptr, at: i32) -> sql.Value {
+    match sqlite3_column_type(stmt, at) {
+        == 1 => Int(sqlite3_column_int64(stmt, at))
+        == 2 => Float(sqlite3_column_double(stmt, at))
+        == 3 => Text(str(bytes_at(stmt, sqlite3_column_text(stmt, at), at)))
+        == 4 => Bytes(bytes_at(stmt, sqlite3_column_blob(stmt, at), at))
+        _ => Null
+    }
+}
+
+fn row(stmt: ptr, width: i64) -> []sql.Value {
+    var out: []sql.Value = []
+    for i in 0..width {
+        push(mut out, column_value(stmt, i32(i)))
+    }
+    out
+}
+
+fn walk(h: *Handle, text: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
+    let stmt = statement(h, text, values)?
+    let cols = columns(stmt)
+    for {
+        let code = sqlite3_step(stmt)
+        if code == 101 {
+            sqlite3_reset(stmt)
+            return
+        }
+        if code != 100 {
+            sqlite3_reset(stmt)
+            fail failure(h.db, code)
+        }
+        if !visit(cols, row(stmt, cols.len)) {
+            sqlite3_reset(stmt)
+            return
+        }
+    }
+}
+
+pub fn each(d: Database, text: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
+    walk(d.handle, text, values, visit)?
+}
+
+pub fn query(d: Database, text: str, values: []sql.Value) -> sql.Rows ! sql.Error {
+    var result = sql.Rows { columns: [], rows: [] }
+    let collect = fn(cols: []sql.Column, found: []sql.Value) -> bool {
+        result.columns = cols
+        push(mut result.rows, found)
+        true
+    }
+    walk(d.handle, text, values, collect)?
+    if result.rows.len == 0 {
+        let stmt = statement(d.handle, text, values)?
+        result.columns = columns(stmt)
+        sqlite3_reset(stmt)
+    }
+    result
+}
+
+pub fn execute(d: Database, text: str, values: []sql.Value) -> i64 ! sql.Error {
+    walk(d.handle, text, values, fn(cols: []sql.Column, found: []sql.Value) -> bool { true })?
+    sqlite3_changes64(d.handle.db)
+}
+
+pub fn last_insert_id(d: Database) -> i64 {
+    sqlite3_last_insert_rowid(d.handle.db)
+}
+
+pub fn begin(d: Database) ! sql.Error {
+    exec(d, "BEGIN")?
+}
+
+pub fn begin_immediate(d: Database) ! sql.Error {
+    exec(d, "BEGIN IMMEDIATE")?
+}
+
+pub fn commit(d: Database) ! sql.Error {
+    exec(d, "COMMIT")?
+}
+
+pub fn rollback(d: Database) ! sql.Error {
+    exec(d, "ROLLBACK")?
+}
+
+pub fn backup(d: Database, path: str) ! sql.Error {
+    live(d.handle)?
+    let target = open(path)?
+    let copy = sqlite3_backup_init(target.handle.db, cstr("main"), d.handle.db, cstr("main"))
+    if copy == null {
+        let e = failure(target.handle.db, sqlite3_extended_errcode(target.handle.db))
+        close(target)
+        fail e
+    }
+    var code = sqlite3_backup_step(copy, -1)
+    for code == 5 || code == 6 {
+        sleep(10)
+        code = sqlite3_backup_step(copy, -1)
+    }
+    let finished = sqlite3_backup_finish(copy)
+    close(target)
+    if code != 101 {
+        fail failure(d.handle.db, code)
+    }
+    if finished != 0 {
+        fail failure(d.handle.db, finished)
+    }
+}
+
+pub fn connection(d: Database) -> sql.Connection {
+    let raw = sql.Connection {
+        dialect: Sqlite
+        query: fn(text, values) -> sql.Rows ! sql.Error { query(d, text, values) }
+        each: fn(text, values, visit) ! sql.Error { each(d, text, values, visit)? }
+        execute: fn(text, values) -> i64 ! sql.Error { execute(d, text, values) }
+        begin: fn() ! sql.Error { begin(d)? }
+        commit: fn() ! sql.Error { commit(d)? }
+        rollback: fn() ! sql.Error { rollback(d)? }
+        close: fn() { close(d) }
+    }
+    otel.instrument_sql(raw, "std/sql/sqlite", d.handle.path, "", 0)
+}
+
+pub fn connect(o: sql.Options) -> sql.Connection ! sql.Error {
+    let d = open(o.database)?
+    connection(d)
+}
