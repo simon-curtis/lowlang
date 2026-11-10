@@ -25,14 +25,20 @@ pub enum Exit {
     Signaled(signal: i64)
 }
 
-pub struct Child {
+pub struct ChildHandle {
     pub pid: i64
     pub stdin: io.Stream?
     pub stdout: io.Stream?
     pub stderr: io.Stream?
     pidfd: i64
+    pidfd_guard: *io.Guard
     group: bool
     status: Exit?
+}
+
+pub struct Child {
+    pub handle: *ChildHandle
+    drop dispose_on(handle)
 }
 
 pub struct Output {
@@ -41,9 +47,24 @@ pub struct Output {
     pub stderr: []u8
 }
 
+struct Fd {
+    fd: i64
+    open: bool = true
+    drop {
+        if open {
+            close_fd(fd)
+        }
+    }
+}
+
 struct Ends {
-    parent: i64
-    child: i64
+    parent: Fd
+    child: Fd
+}
+
+struct End {
+    fd: i64
+    guard: *io.Guard
 }
 
 struct Collected {
@@ -104,10 +125,32 @@ fn close_fd(fd: i64) {
     }
 }
 
-fn open_pipe() -> Ends ! io.Error {
+fn shut(mut f: Fd) {
+    close_fd(f.fd)
+    f.open = false
+}
+
+fn keep(mut f: Fd) -> i64 {
+    f.open = false
+    f.fd
+}
+
+fn absent() -> Ends {
+    Ends { parent: Fd { fd: -1 }, child: Fd { fd: -1 } }
+}
+
+fn piped(input: bool) -> Ends ! io.Error {
     let fds = io.buffer(8)
     io.syscall_result(__syscall(293, __slice_ptr(fds), 0x80000))?
-    Ends { parent: io.le32(fds, 0), child: io.le32(fds, 4) }
+    let read = io.le32(fds, 0)
+    let write = io.le32(fds, 4)
+    using e = if input {
+        Ends { parent: Fd { fd: write }, child: Fd { fd: read } }
+    } else {
+        Ends { parent: Fd { fd: read }, child: Fd { fd: write } }
+    }
+    set_nonblocking(e.parent.fd)?
+    e
 }
 
 fn set_nonblocking(fd: i64) ! io.Error {
@@ -117,24 +160,13 @@ fn set_nonblocking(fd: i64) ! io.Error {
 
 fn ends(mode: Stdio, input: bool) -> Ends ! io.Error {
     match mode {
-        Inherit => Ends { parent: -1, child: -1 }
+        Inherit => absent()
         Null => {
             let null_path = c_string("/dev/null")
             let fd = io.syscall_result(__syscall(257, -100, __slice_ptr(null_path), 0x80002, 0))?
-            Ends { parent: -1, child: fd }
+            Ends { parent: Fd { fd: -1 }, child: Fd { fd } }
         }
-        Piped => {
-            let p = open_pipe()?
-            let e = if input { Ends { parent: p.child, child: p.parent } } else { p }
-            set_nonblocking(e.parent) catch {
-                err => {
-                    close_fd(e.parent)
-                    close_fd(e.child)
-                    fail err
-                }
-            }
-            e
-        }
+        Piped => piped(input)?
     }
 }
 
@@ -160,14 +192,25 @@ fn write_fd(fd: i64, data: []u8) -> i64 ! io.Error {
     }
 }
 
+fn read_end(e: End, buf: []u8) -> i64 ! io.Error {
+    using lease = io.enter(e.guard)?
+    read_fd(e.fd, buf)
+}
+
+fn write_end(e: End, data: []u8) -> i64 ! io.Error {
+    using lease = io.enter(e.guard)?
+    write_fd(e.fd, data)
+}
+
 fn stream(fd: i64) -> io.Stream? {
     if fd < 0 {
         return none
     }
+    let e = End { fd, guard: io.guard(fn() {}, fn() { close_fd(fd) }) }
     some(io.Stream {
-        read: fn(buf) { read_fd(fd, buf) }
-        write: fn(data) { write_fd(fd, data) }
-        close: fn() { __syscall(3, fd) }
+        read: fn(buf) { read_end(e, buf) }
+        write: fn(data) { write_end(e, data) }
+        close: fn() { io.retire(e.guard) }
     })
 }
 
@@ -185,7 +228,16 @@ fn redirect(fd: i64, target: i64) {
     }
 }
 
-pub fn start(c: Command) -> *Child ! io.Error {
+pub fn adopt(h: *ChildHandle) -> Child {
+    Child { handle: h }
+}
+
+pub fn start(c: Command) -> Child ! io.Error {
+    let h = start_handle(c)?
+    adopt(h)
+}
+
+pub fn start_handle(c: Command) -> *ChildHandle ! io.Error {
     let path = find(c.program) ?? ""
     if path.len == 0 {
         fail NotFound
@@ -199,31 +251,10 @@ pub fn start(c: Command) -> *Child ! io.Error {
     let argv = pointers(arg_strings)
     let envp = pointers(env_strings)
     let dir_c = c_string(c.dir)
-    let input = ends(c.stdin, true)?
-    let output = ends(c.stdout, false) catch {
-        e => {
-            close_fd(input.parent)
-            close_fd(input.child)
-            fail e
-        }
-    }
-    let errors = ends(c.stderr, false) catch {
-        e => {
-            close_fd(input.parent)
-            close_fd(input.child)
-            close_fd(output.parent)
-            close_fd(output.child)
-            fail e
-        }
-    }
-    let report = open_pipe() catch {
-        e => {
-            for fd in [input.parent, input.child, output.parent, output.child, errors.parent, errors.child] {
-                close_fd(fd)
-            }
-            fail e
-        }
-    }
+    using var input = ends(c.stdin, true)?
+    using var output = ends(c.stdout, false)?
+    using var errors = ends(c.stderr, false)?
+    using var report = piped(false)?
     let code = io.buffer(4)
     let has_dir = c.dir.len > 0
     let group = c.group
@@ -232,9 +263,9 @@ pub fn start(c: Command) -> *Child ! io.Error {
         if group {
             __syscall(109, 0, 0)
         }
-        redirect(input.child, 0)
-        redirect(output.child, 1)
-        redirect(errors.child, 2)
+        redirect(input.child.fd, 0)
+        redirect(output.child.fd, 1)
+        redirect(errors.child.fd, 2)
         var r = 0
         if has_dir {
             r = __syscall(80, __slice_ptr(dir_c))
@@ -243,36 +274,43 @@ pub fn start(c: Command) -> *Child ! io.Error {
             r = __syscall(59, __slice_ptr(path_c), __slice_ptr(argv), __slice_ptr(envp))
         }
         io.set_le32(code, 0, -r)
-        __syscall(1, report.child, __slice_ptr(code), 4)
+        __syscall(1, report.child.fd, __slice_ptr(code), 4)
         __syscall(231, 127)
     }
-    for fd in [input.child, output.child, errors.child, report.child] {
-        close_fd(fd)
-    }
+    shut(mut input.child)
+    shut(mut output.child)
+    shut(mut errors.child)
+    shut(mut report.child)
     if pid < 0 {
-        for fd in [input.parent, output.parent, errors.parent, report.parent] {
-            close_fd(fd)
-        }
         fail io.errno(-pid)
     }
-    set_nonblocking(report.parent) catch {
-        _ => {}
-    }
-    let n = read_fd(report.parent, code) catch 0
-    close_fd(report.parent)
+    let n = read_fd(report.parent.fd, code) catch 0
     let pidfd = __syscall(434, pid, 0)
-    let child = new(Child { pid, stdin: stream(input.parent), stdout: stream(output.parent), stderr: stream(errors.parent), pidfd, group, status: none })
+    let pidfd_guard = io.guard(fn() {}, fn() { close_fd(pidfd) })
+    let stdin = stream(keep(mut input.parent))
+    let stdout = stream(keep(mut output.parent))
+    let stderr = stream(keep(mut errors.parent))
+    let handle = new(ChildHandle { pid, stdin, stdout, stderr, pidfd, pidfd_guard, group, status: none })
     if n == 4 {
-        wait(child) catch {
-            _ => Exited(127)
-        }
-        close_streams(child)
+        using failed = adopt(handle)
         fail io.errno(io.le32(code, 0))
     }
-    child
+    handle
 }
 
-fn close_streams(c: *Child) {
+fn dispose_on(c: *ChildHandle) {
+    if c.status == none {
+        kill_on(c, 9) catch {
+            _ => {}
+        }
+        wait_on(c) catch {
+            _ => Exited(127)
+        }
+    }
+    close_streams(c)
+}
+
+fn close_streams(c: *ChildHandle) {
     for s in [c.stdin, c.stdout, c.stderr] {
         match s {
             some(st) => st.close()
@@ -281,12 +319,17 @@ fn close_streams(c: *Child) {
     }
 }
 
-pub fn wait(c: *Child) -> Exit ! io.Error {
+pub fn wait(c: Child) -> Exit ! io.Error {
+    wait_on(c.handle)
+}
+
+pub fn wait_on(c: *ChildHandle) -> Exit ! io.Error {
     match c.status {
         some(done) => return done
         none => {}
     }
     let info = io.buffer(128)
+    using lease = io.enter(c.pidfd_guard)?
     if c.pidfd >= 0 {
         wait_readable(c.pidfd)
     }
@@ -299,8 +342,7 @@ pub fn wait(c: *Child) -> Exit ! io.Error {
             fail io.errno(-r)
         }
     }
-    close_fd(c.pidfd)
-    c.pidfd = -1
+    io.retire(c.pidfd_guard)
     let how = io.le32(info, 8)
     let value = io.le32(info, 24)
     let status: Exit = if how == 1 { Exited(value) } else { Signaled(value) }
@@ -308,7 +350,11 @@ pub fn wait(c: *Child) -> Exit ! io.Error {
     status
 }
 
-pub fn kill(c: *Child, signal: i64) ! io.Error {
+pub fn kill(c: Child, signal: i64) ! io.Error {
+    kill_on(c.handle, signal)?
+}
+
+pub fn kill_on(c: *ChildHandle, signal: i64) ! io.Error {
     if c.status != none {
         return
     }
@@ -317,6 +363,9 @@ pub fn kill(c: *Child, signal: i64) ! io.Error {
         return
     }
     if c.pidfd >= 0 {
+        using lease = io.enter(c.pidfd_guard) catch {
+            _ => return
+        }
         io.syscall_result(__syscall(424, c.pidfd, signal, 0, 0))?
         return
     }
@@ -349,20 +398,20 @@ fn feed(s: io.Stream, data: []u8) {
 }
 
 pub fn run(c: Command, input: []u8) -> Output ! io.Error {
-    var piped = c
-    piped.stdin = Piped
-    piped.stdout = Piped
-    piped.stderr = Piped
-    let child = start(piped)?
+    var piped_command = c
+    piped_command.stdin = Piped
+    piped_command.stdout = Piped
+    piped_command.stderr = Piped
+    using child = start(piped_command)?
     let out = new(Collected { data: [], done: chan[bool](1) })
     let err = new(Collected { data: [], done: chan[bool](1) })
-    match child.stdin {
+    match child.handle.stdin {
         some(s) => {
             spawn feed(s, input)
         }
         none => {}
     }
-    match child.stdout {
+    match child.handle.stdout {
         some(s) => {
             spawn collect(s, out)
         }
@@ -370,7 +419,7 @@ pub fn run(c: Command, input: []u8) -> Output ! io.Error {
             out.done <- true
         }
     }
-    match child.stderr {
+    match child.handle.stderr {
         some(s) => {
             spawn collect(s, err)
         }

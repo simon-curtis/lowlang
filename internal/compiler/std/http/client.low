@@ -72,6 +72,12 @@ pub struct Connection {
     pub stream: io.Stream
     pub protocol: str
     pub secure: bool
+    detached: bool = false
+    drop {
+        if !detached {
+            stream.close()
+        }
+    }
 }
 
 struct Outgoing {
@@ -163,12 +169,20 @@ pub fn connect(u: Url, protocols: []str) -> Connection ! io.Error {
     if !secure && u.scheme != "http" && u.scheme != "ws" {
         fail Unsupported
     }
+    using var c = net.dial(u.host, u.port)?
     if !secure {
-        let c = net.dial(u.host, u.port)?
-        return Connection { stream: net.stream(c), protocol: "", secure }
+        let plain = net.detach(mut c)
+        return Connection { stream: net.stream_on(plain), protocol: "", secure }
     }
-    let t = tls.dial(u.host, u.port, tls.Config { alpn: protocols })?
-    Connection { stream: tls.stream(t), protocol: t.protocol, secure }
+    let carrier = net.stream(c)
+    let t = tls.client_handle(carrier, tls.Config { alpn: protocols, server_name: u.host })?
+    net.detach(mut c)
+    Connection { stream: tls.stream_on(t), protocol: t.protocol, secure }
+}
+
+pub fn detach(mut c: Connection) -> io.Stream {
+    c.detached = true
+    c.stream
 }
 
 pub fn client() -> Builder[Client] {
@@ -439,20 +453,18 @@ pub fn stream_to(b: Builder[Response], sink: fn([]u8) ! io.Error) -> Response ! 
 }
 
 pub fn download(b: Builder[Response], path: str) -> Response ! Error {
-    let f = file.create(path) catch {
+    using f = file.create(path) catch {
         _ => fail Io(Denied)
     }
-    var kept = false
-    defer {
-        file.close(f)
-        if !kept {
+    let target = f.handle
+    let resp = perform(b, false, fn(chunk: []u8) ! io.Error { file.write_all_on(target, chunk)? }) catch {
+        e => {
             file.remove(path) catch {
                 _ => {}
             }
+            fail e
         }
     }
-    let resp = perform(b, false, fn(chunk: []u8) ! io.Error { file.write_all(f, chunk)? })?
-    kept = true
     resp
 }
 
@@ -624,7 +636,7 @@ fn follow(b: Builder[Response], collect: bool, sink: fn([]u8) ! io.Error) -> Res
         _ => fail InvalidUrl(b.url)
     }
     let d = arm(c.reaper, b.timeout, b.token)
-    defer disarm(c.reaper, d)
+    using armed = Armed { reaper: c.reaper, deadline: d }
     let job = Job { client: c, deadline: d, connect_timeout: b.connect_timeout, version: b.version, prior_knowledge: b.prior_knowledge }
     var req = Outgoing { method: b.method, url, headers: request_headers(b, url), body: b.body, source: b.source }
     let trace = tracing()
@@ -981,14 +993,14 @@ fn read_known(inc: Incoming) -> []u8 ! io.Error {
 
 fn exchange1(job: Job, conn: *Conn1, req: Outgoing, a: *Attempt) -> Incoming ! io.Error {
     let c = job.client
-    attach(c.reaper, job.deadline, conn.wire.conn.fd)
+    track(c.reaper, job.deadline, conn.wire.conn)
     let before = conn.received.n
     let opened = outcome(fn() -> Head1 ! io.Error { start1(conn, req, a) })
     let head = match opened {
         Done(h) => h
         Failed(e) => {
             a.stale = a.reused && conn.received.n == before
-            detach(c.reaper, job.deadline)
+            untrack(c.reaper, job.deadline)
             release(c, conn, false)
             fail e
         }
@@ -1003,7 +1015,7 @@ fn exchange1(job: Job, conn: *Conn1, req: Outgoing, a: *Attempt) -> Incoming ! i
             if declared.len > 0 {
                 length = text.parse_uint(declared, 10) catch {
                     _ => {
-                        detach(c.reaper, job.deadline)
+                        untrack(c.reaper, job.deadline)
                         release(c, conn, false)
                         fail Malformed
                     }
@@ -1036,7 +1048,7 @@ fn exchange1(job: Job, conn: *Conn1, req: Outgoing, a: *Attempt) -> Incoming ! i
         length
         attempt: a
         finish: fn(ok: bool) {
-            detach(c.reaper, job.deadline)
+            untrack(c.reaper, job.deadline)
             release(c, conn, ok && reusable && framing.done)
         }
     }

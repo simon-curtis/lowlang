@@ -275,6 +275,7 @@ type Let struct {
 	Name     string
 	Mutable  bool
 	Using    bool
+	Spawned  bool
 	TypeName *TypeName
 	Value    Expr
 	Pos      lexer.Pos

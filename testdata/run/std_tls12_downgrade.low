@@ -4,11 +4,11 @@ import std/net
 import std/tls
 
 enum Outcome {
-    Done(t: *tls.Session)
+    Done(t: *tls.SessionHandle)
     Failed(why: str)
 }
 
-fn outcome(attempt: fn() -> *tls.Session ! io.Error) -> Outcome {
+fn outcome(attempt: fn() -> *tls.SessionHandle ! io.Error) -> Outcome {
     let t = attempt() catch {
         Invalid => return Failed("invalid")
         Unsupported => return Failed("unsupported")
@@ -108,8 +108,9 @@ fn strip(removed: i64) -> fn([]u8) -> []u8 {
     }
 }
 
-fn relay(from: net.Conn, to: net.Conn, from_client: bool, tamper: Tamper, alerts: chan[str]) {
-    let r = io.reader(net.stream(from))
+fn relay(from: net.ConnHandle, to: net.ConnHandle, from_client: bool, tamper: Tamper, alerts: chan[str]) {
+    let r = io.reader(net.stream_on(from))
+    let sink = net.stream_on(to)
     var seen = ""
     var index = 0
     for {
@@ -128,59 +129,61 @@ fn relay(from: net.Conn, to: net.Conn, from_client: bool, tamper: Tamper, alerts
         if header[0] == 21 {
             seen = if body.len == 2 { "{seen} {body[1]}" } else { "{seen} encrypted" }
         }
-        net.write_all(to, record) catch {
+        io.write_all(sink, record) catch {
             _ => break
         }
         index += 1
     }
-    net.shutdown_write(to) catch {
+    net.shutdown_write_on(to) catch {
         _ => {}
     }
     alerts <- seen
 }
 
-fn serve(l: net.Listener, config: tls.Config, done: chan[str]) {
-    let c = net.accept(l) catch {
+fn serve(l: net.ListenerHandle, config: tls.Config, done: chan[str]) {
+    let h = net.accept_handle(l) catch {
         _ => {
             done <- "accept failed"
             return
         }
     }
-    let session = match outcome(fn() -> *tls.Session ! io.Error { tls.server(net.stream(c), config) }) {
+    using c = net.adopt(h)
+    let wire = net.stream(c)
+    let view = match outcome(fn() -> *tls.SessionHandle ! io.Error { tls.server_handle(wire, config) }) {
         Done(t) => t
         Failed(why) => {
-            net.close(c)
             done <- "server failed ({why})"
             return
         }
     }
+    using session = tls.Session { handle: view }
     let s = tls.stream(session)
     let line = io.read_line(io.reader(s)) catch "read failed"
     io.write_str(s, "{line}\n") catch {
         _ => {}
     }
     tls.close(session)
-    done <- "server {session.version}"
+    done <- "server {view.version}"
 }
 
-fn proxy(l: net.Listener, target: net.Addr, tamper: Tamper, report: chan[str]) {
-    let client = net.accept(l) catch {
+fn proxy(l: net.ListenerHandle, target: net.Addr, tamper: Tamper, report: chan[str]) {
+    let h = net.accept_handle(l) catch {
         _ => {
             report <- "accept failed"
             return
         }
     }
-    let server = net.connect(target) catch {
+    using client = net.adopt(h)
+    using server = net.connect(target) catch {
         _ => {
-            net.close(client)
             report <- "connect failed"
             return
         }
     }
     let upstream = chan[str](1)
     let downstream = chan[str](1)
-    spawn relay(client, server, true, tamper, upstream)
-    spawn relay(server, client, false, tamper, downstream)
+    spawn relay(client.handle, server.handle, true, tamper, upstream)
+    spawn relay(server.handle, client.handle, false, tamper, downstream)
     let sent_by_client = (<-upstream) ?? ""
     let sent_by_server = (<-downstream) ?? ""
     net.close(client)
@@ -193,20 +196,22 @@ fn attempt(label: str, server: tls.Config, client: tls.Config, tamper: Tamper) !
     var config = server
     config.certificates = tls.load_certificates(pem)
     config.key = tls.load_key(pem)?
-    let backend = net.listen("127.0.0.1", 0)?
-    let front = net.listen("127.0.0.1", 0)?
+    using backend = net.listen("127.0.0.1", 0)?
+    using front = net.listen("127.0.0.1", 0)?
     let done = chan[str](1)
     let report = chan[str](1)
-    spawn serve(backend, config, done)
-    spawn proxy(front, backend.addr, tamper, report)
-    let conn = net.connect(front.addr)?
-    let result = match outcome(fn() -> *tls.Session ! io.Error { tls.client(net.stream(conn), client) }) {
-        Done(t) => {
+    spawn serve(backend.handle, config, done)
+    spawn proxy(front.handle, backend.handle.addr, tamper, report)
+    using conn = net.connect(front.handle.addr)?
+    let wire = net.stream(conn)
+    let result = match outcome(fn() -> *tls.SessionHandle ! io.Error { tls.client_handle(wire, client) }) {
+        Done(view) => {
+            using t = tls.Session { handle: view }
             let s = tls.stream(t)
             io.write_str(s, "ping\n")?
             let echoed = io.read_line(io.reader(s)) catch "no reply"
             tls.close(t)
-            "client {t.version} [{echoed}]"
+            "client {view.version} [{echoed}]"
         }
         Failed(why) => {
             net.close(conn)

@@ -337,7 +337,7 @@ func (m *mover) expr(e ast.Expr, ctx moveContext) {
 			m.branches(func() {}, func() { m.expr(e.Fallback, ctx) })
 			return
 		}
-		m.arms(e.Arms, ctx)
+		m.branches(append([]func(){func() {}}, m.armRuns(e.Arms, ctx)...)...)
 	case *ast.Select:
 		var arms []func()
 		for _, sc := range e.Cases {
@@ -355,6 +355,10 @@ func (m *mover) expr(e ast.Expr, ctx moveContext) {
 }
 
 func (m *mover) arms(arms []*ast.Arm, ctx moveContext) {
+	m.branches(m.armRuns(arms, ctx)...)
+}
+
+func (m *mover) armRuns(arms []*ast.Arm, ctx moveContext) []func() {
 	var run []func()
 	for _, arm := range arms {
 		run = append(run, func() {
@@ -364,7 +368,7 @@ func (m *mover) arms(arms []*ast.Arm, ctx moveContext) {
 			m.expr(arm.Body, ctx)
 		})
 	}
-	m.branches(run...)
+	return run
 }
 
 func (m *mover) call(e *ast.Call) {

@@ -4,10 +4,31 @@ import std/http
 import std/io
 import std/text
 
-pub struct Socket {
+pub struct SocketHandle {
     reader: *io.Reader
     client: bool
     closed: bool
+}
+
+pub struct Socket {
+    pub handle: *SocketHandle
+    detached: bool = false
+    drop {
+        if !detached {
+            close_on(handle, 1000) catch {
+                _ => {}
+            }
+        }
+    }
+}
+
+pub fn adopt(h: *SocketHandle) -> Socket {
+    Socket { handle: h }
+}
+
+pub fn detach(mut s: Socket) -> *SocketHandle {
+    s.detached = true
+    s.handle
 }
 
 pub struct Message {
@@ -33,11 +54,11 @@ fn accept_key(key: str) -> str {
     base64.encode(crypto.sha1(bytes("{key}{guid()}")))
 }
 
-fn stream(ws: *Socket) -> io.Stream {
+fn stream(ws: *SocketHandle) -> io.Stream {
     io.reader_stream(ws.reader)
 }
 
-pub fn accept(req: http.Request) -> *Socket ! io.Error {
+pub fn accept(req: http.Request) -> Socket ! io.Error {
     let r = match req.connection {
         some(r) => r
         none => fail Unsupported
@@ -57,15 +78,16 @@ pub fn accept(req: http.Request) -> *Socket ! io.Error {
     }
     let reply = "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept_key(key)}\r\n\r\n"
     io.write_str(io.reader_stream(r), reply)?
-    new(Socket { reader: r, client: false, closed: false })
+    Socket { handle: new(SocketHandle { reader: r, client: false, closed: false }) }
 }
 
-pub fn dial(url: str) -> *Socket ! io.Error {
+pub fn dial(url: str) -> Socket ! io.Error {
     let u = http.parse_url(url)?
     if u.scheme != "ws" && u.scheme != "wss" {
         fail Unsupported
     }
-    let s = http.connect(u, ["http/1.1"])?.stream
+    using var c = http.connect(u, ["http/1.1"])?
+    let s = c.stream
     let key = base64.encode(crypto.random(16))
     var req = http.new_request("GET", u.target)
     req.authority = http.authority(u)
@@ -77,17 +99,14 @@ pub fn dial(url: str) -> *Socket ! io.Error {
     ]
     let r = io.reader(s)
     let resp = handshake(r, req) catch {
-        _ => {
-            s.close()
-            fail Refused
-        }
+        _ => fail Refused
     }
     let accepted = http.header(resp.headers, "sec-websocket-accept") ?? ""
     if resp.status != 101 || accepted != accept_key(key) {
-        s.close()
         fail Refused
     }
-    new(Socket { reader: r, client: true, closed: false })
+    http.detach(mut c)
+    Socket { handle: new(SocketHandle { reader: r, client: true, closed: false }) }
 }
 
 fn handshake(r: *io.Reader, req: http.Request) -> http.Response ! io.Error {
@@ -95,7 +114,7 @@ fn handshake(r: *io.Reader, req: http.Request) -> http.Response ! io.Error {
     http.read_response(r, "GET")
 }
 
-fn read_frame(ws: *Socket) -> Frame ! io.Error {
+fn read_frame(ws: *SocketHandle) -> Frame ! io.Error {
     let b0 = i64(io.read_byte(ws.reader)?)
     let b1 = i64(io.read_byte(ws.reader)?)
     let masked = b1 & 0x80 != 0
@@ -129,7 +148,7 @@ fn read_frame(ws: *Socket) -> Frame ! io.Error {
     Frame { fin, op, payload }
 }
 
-fn write_frame(ws: *Socket, op: i64, payload: []u8) ! io.Error {
+fn write_frame(ws: *SocketHandle, op: i64, payload: []u8) ! io.Error {
     var out: []u8 = []
     push(mut out, u8(0x80 | op))
     let mask: u8 = if ws.client { 0x80 } else { 0 }
@@ -198,7 +217,7 @@ fn valid_utf8(data: []u8) -> bool {
     true
 }
 
-fn violation(ws: *Socket, code: i64) -> io.Error {
+fn violation(ws: *SocketHandle, code: i64) -> io.Error {
     var payload: []u8 = []
     io.put_be16(mut payload, code)
     write_frame(ws, 8, payload) catch {
@@ -208,7 +227,18 @@ fn violation(ws: *Socket, code: i64) -> io.Error {
     Malformed
 }
 
-pub fn receive(ws: *Socket) -> Message ! io.Error {
+pub fn receive(ws: Socket) -> Message ! io.Error {
+    receive_on(ws.handle)
+}
+
+pub fn receive_on(ws: *SocketHandle) -> Message ! io.Error {
+    if ws.closed {
+        fail NotConnected
+    }
+    next_message(ws)
+}
+
+fn next_message(ws: *SocketHandle) -> Message ! io.Error {
     var data: []u8 = []
     var kind = -1
     for {
@@ -254,30 +284,67 @@ pub fn receive(ws: *Socket) -> Message ! io.Error {
     }
 }
 
-pub fn send_text(ws: *Socket, message: str) ! io.Error {
-    write_frame(ws, 1, bytes(message))?
+pub fn send_text(ws: Socket, message: str) ! io.Error {
+    send_text_on(ws.handle, message)
 }
 
-pub fn send_binary(ws: *Socket, data: []u8) ! io.Error {
-    write_frame(ws, 2, data)?
+pub fn send_text_on(ws: *SocketHandle, message: str) ! io.Error {
+    send_frame(ws, 1, bytes(message))
 }
 
-pub fn ping(ws: *Socket, data: []u8) ! io.Error {
-    write_frame(ws, 9, data)?
+pub fn send_binary(ws: Socket, data: []u8) ! io.Error {
+    send_binary_on(ws.handle, data)
 }
 
-pub fn close(ws: *Socket, code: i64) ! io.Error {
-    if !ws.closed {
-        ws.closed = true
-        var payload: []u8 = []
-        io.put_be16(mut payload, code)
-        write_frame(ws, 8, payload)?
-        for {
-            receive(ws) catch {
-                _ => break
-            }
+pub fn send_binary_on(ws: *SocketHandle, data: []u8) ! io.Error {
+    send_frame(ws, 2, data)
+}
+
+pub fn ping(ws: Socket, data: []u8) ! io.Error {
+    ping_on(ws.handle, data)
+}
+
+pub fn ping_on(ws: *SocketHandle, data: []u8) ! io.Error {
+    send_frame(ws, 9, data)
+}
+
+fn send_frame(ws: *SocketHandle, op: i64, payload: []u8) ! io.Error {
+    if ws.closed {
+        fail NotConnected
+    }
+    write_frame(ws, op, payload)?
+}
+
+pub fn close(ws: Socket, code: i64) ! io.Error {
+    close_on(ws.handle, code)
+}
+
+pub fn close_on(ws: *SocketHandle, code: i64) ! io.Error {
+    farewell(ws, code) catch {
+        e => {
+            release(ws)
+            fail e
         }
     }
+    release(ws)
+}
+
+fn farewell(ws: *SocketHandle, code: i64) ! io.Error {
+    if ws.closed {
+        return
+    }
+    ws.closed = true
+    var payload: []u8 = []
+    io.put_be16(mut payload, code)
+    write_frame(ws, 8, payload)?
+    for {
+        next_message(ws) catch {
+            _ => break
+        }
+    }
+}
+
+fn release(ws: *SocketHandle) {
     if ws.client {
         stream(ws).close()
     }

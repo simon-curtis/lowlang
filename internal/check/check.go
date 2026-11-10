@@ -876,6 +876,9 @@ func (c *Checker) let(s *ast.Let) {
 		c.usingBinding(s, t)
 		return
 	}
+	if c.droppable(t) && s.Spawned {
+		c.fail(s.Pos, "spawn cannot take %s; it has drop", t)
+	}
 	if c.droppable(t) {
 		c.fail(s.Pos, "%s has drop; bind it with using", t)
 	}

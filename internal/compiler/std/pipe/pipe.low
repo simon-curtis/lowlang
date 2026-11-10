@@ -33,17 +33,32 @@ pub struct Options {
     pub segment_size: i64 = 4096
 }
 
+pub struct ReaderHandle {
+    state: *State
+}
+
 pub struct Reader {
+    pub handle: ReaderHandle
+    drop complete_reader_on(handle)
+}
+
+pub struct WriterHandle {
     state: *State
 }
 
 pub struct Writer {
-    state: *State
+    pub handle: WriterHandle
+    drop complete_writer_on(handle)
 }
 
 pub struct Pipe {
     pub reader: Reader
     pub writer: Writer
+}
+
+struct Ends {
+    reader: ReaderHandle
+    writer: WriterHandle
 }
 
 pub struct Sequence {
@@ -63,7 +78,7 @@ pub struct FlushResult {
     pub canceled: bool
 }
 
-pub fn pipe(options: Options) -> Pipe {
+fn ends(options: Options) -> Ends {
     let s = new(State {
         lock: chan[bool](1)
         segments: []
@@ -84,7 +99,20 @@ pub fn pipe(options: Options) -> Pipe {
         resume: options.resume
         segment_size: options.segment_size
     })
-    Pipe { reader: Reader { state: s }, writer: Writer { state: s } }
+    Ends { reader: ReaderHandle { state: s }, writer: WriterHandle { state: s } }
+}
+
+pub fn pipe(options: Options) -> Pipe {
+    let e = ends(options)
+    Pipe { reader: adopt_reader(e.reader), writer: adopt_writer(e.writer) }
+}
+
+pub fn adopt_reader(h: ReaderHandle) -> Reader {
+    Reader { handle: h }
+}
+
+pub fn adopt_writer(h: WriterHandle) -> Writer {
+    Writer { handle: h }
 }
 
 fn lock(s: *State) {
@@ -111,7 +139,11 @@ fn sequence(s: *State, start: i64, end: i64) -> Sequence {
 }
 
 pub fn get_memory(w: Writer, hint: i64) -> []u8 {
-    let s = w.state
+    get_memory_on(w.handle, hint)
+}
+
+pub fn get_memory_on(h: WriterHandle, hint: i64) -> []u8 {
+    let s = h.state
     let want = if hint < 1 { 1 } else { hint }
     match s.tail {
         some(tail) => {
@@ -131,7 +163,14 @@ pub fn get_memory(w: Writer, hint: i64) -> []u8 {
 }
 
 pub fn advance(w: Writer, n: i64) {
-    let s = w.state
+    advance_on(w.handle, n)
+}
+
+pub fn advance_on(h: WriterHandle, n: i64) {
+    let s = h.state
+    if s.writer_done {
+        return
+    }
     match s.tail {
         some(tail) => {
             tail.filled += n
@@ -142,56 +181,83 @@ pub fn advance(w: Writer, n: i64) {
 }
 
 pub fn write(w: Writer, data: []u8) {
+    write_on(w.handle, data)
+}
+
+pub fn write_on(h: WriterHandle, data: []u8) {
     var rest = data
     for rest.len > 0 {
-        let memory = get_memory(w, 1)
+        let memory = get_memory_on(h, 1)
         let n = __memmove(memory, rest)
-        advance(w, n)
+        advance_on(h, n)
         rest = rest[n..]
     }
 }
 
 pub fn flush(w: Writer) -> FlushResult {
-    let s = w.state
+    flush_on(w.handle)
+}
+
+pub fn flush_on(h: WriterHandle) -> FlushResult {
+    let s = h.state
     lock(s)
     s.committed = s.written
     signal(s.reader_wake)
-    for !s.reader_done && !s.flush_canceled && !s.reader_waiting && s.committed - s.consumed >= s.pause {
+    for !s.reader_done && !s.writer_done && !s.flush_canceled && !s.reader_waiting && s.committed - s.consumed >= s.pause {
         unlock(s)
         <-s.writer_wake
         lock(s)
     }
-    let result = FlushResult { completed: s.reader_done, canceled: s.flush_canceled }
+    let result = FlushResult { completed: s.reader_done || s.writer_done, canceled: s.flush_canceled }
     s.flush_canceled = false
     unlock(s)
     result
 }
 
 pub fn write_and_flush(w: Writer, data: []u8) -> FlushResult {
-    write(w, data)
-    flush(w)
+    write_and_flush_on(w.handle, data)
+}
+
+pub fn write_and_flush_on(h: WriterHandle, data: []u8) -> FlushResult {
+    write_on(h, data)
+    flush_on(h)
 }
 
 pub fn complete_writer(w: Writer) {
-    let s = w.state
+    complete_writer_on(w.handle)
+}
+
+pub fn complete_writer_on(h: WriterHandle) {
+    let s = h.state
     lock(s)
     s.committed = s.written
     s.writer_done = true
     signal(s.reader_wake)
+    signal(s.writer_wake)
     unlock(s)
 }
 
 pub fn fail_writer(w: Writer, e: io.Error) {
-    let s = w.state
+    fail_writer_on(w.handle, e)
+}
+
+pub fn fail_writer_on(h: WriterHandle, e: io.Error) {
+    let s = h.state
     lock(s)
-    s.failure = e
-    s.writer_done = true
-    signal(s.reader_wake)
+    if !s.writer_done {
+        s.failure = e
+        s.writer_done = true
+        signal(s.reader_wake)
+    }
     unlock(s)
 }
 
 pub fn cancel_pending_flush(w: Writer) {
-    let s = w.state
+    cancel_pending_flush_on(w.handle)
+}
+
+pub fn cancel_pending_flush_on(h: WriterHandle) {
+    let s = h.state
     lock(s)
     s.flush_canceled = true
     signal(s.writer_wake)
@@ -199,9 +265,13 @@ pub fn cancel_pending_flush(w: Writer) {
 }
 
 pub fn read(r: Reader) -> ReadResult ! io.Error {
-    let s = r.state
+    read_on(r.handle)
+}
+
+pub fn read_on(h: ReaderHandle) -> ReadResult ! io.Error {
+    let s = h.state
     lock(s)
-    for s.committed <= s.examined && !s.writer_done && !s.read_canceled {
+    for s.committed <= s.examined && !s.writer_done && !s.read_canceled && !s.reader_done {
         s.reader_waiting = true
         signal(s.writer_wake)
         unlock(s)
@@ -209,6 +279,10 @@ pub fn read(r: Reader) -> ReadResult ! io.Error {
         lock(s)
     }
     s.reader_waiting = false
+    if s.reader_done {
+        unlock(s)
+        fail NotConnected
+    }
     let canceled = s.read_canceled
     s.read_canceled = false
     let result = ReadResult { buffer: sequence(s, s.consumed, s.committed), completed: s.writer_done, canceled }
@@ -226,10 +300,14 @@ pub fn read(r: Reader) -> ReadResult ! io.Error {
 }
 
 pub fn try_read(r: Reader) -> ReadResult? {
-    let s = r.state
+    try_read_on(r.handle)
+}
+
+pub fn try_read_on(h: ReaderHandle) -> ReadResult? {
+    let s = h.state
     lock(s)
     var out: ReadResult? = none
-    if s.committed > s.examined || s.writer_done {
+    if !s.reader_done && (s.committed > s.examined || s.writer_done) {
         out = ReadResult { buffer: sequence(s, s.consumed, s.committed), completed: s.writer_done, canceled: false }
     }
     unlock(s)
@@ -237,7 +315,11 @@ pub fn try_read(r: Reader) -> ReadResult? {
 }
 
 pub fn advance_to(r: Reader, consumed: i64, examined: i64) {
-    let s = r.state
+    advance_to_on(r.handle, consumed, examined)
+}
+
+pub fn advance_to_on(h: ReaderHandle, consumed: i64, examined: i64) {
+    let s = h.state
     lock(s)
     let keep_from = if consumed < s.consumed { s.consumed } else { consumed }
     s.consumed = if keep_from > s.committed { s.committed } else { keep_from }
@@ -256,19 +338,28 @@ pub fn advance_to(r: Reader, consumed: i64, examined: i64) {
 }
 
 pub fn advance_to_end(r: Reader, result: ReadResult) {
-    advance_to(r, result.buffer.end, result.buffer.end)
+    advance_to_on(r.handle, result.buffer.end, result.buffer.end)
 }
 
 pub fn complete_reader(r: Reader) {
-    let s = r.state
+    complete_reader_on(r.handle)
+}
+
+pub fn complete_reader_on(h: ReaderHandle) {
+    let s = h.state
     lock(s)
     s.reader_done = true
     signal(s.writer_wake)
+    signal(s.reader_wake)
     unlock(s)
 }
 
 pub fn cancel_pending_read(r: Reader) {
-    let s = r.state
+    cancel_pending_read_on(r.handle)
+}
+
+pub fn cancel_pending_read_on(h: ReaderHandle) {
+    let s = h.state
     lock(s)
     s.read_canceled = true
     signal(s.reader_wake)

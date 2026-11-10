@@ -1,0 +1,168 @@
+import std/file
+import std/io
+import std/process
+import std/text
+
+fn describe(e: process.Exit) -> str {
+    match e {
+        Exited(code) => "exited {code}"
+        Signaled(signal) => "signaled {signal}"
+    }
+}
+
+fn must(s: io.Stream?) -> io.Stream ! io.Error {
+    match s {
+        some(x) => x
+        none => fail NotConnected
+    }
+}
+
+fn write_outcome(s: io.Stream, data: str) -> str {
+    let n = s.write(bytes(data)) catch {
+        NotConnected => return "not connected"
+        _ => return "other error"
+    }
+    "wrote {n}"
+}
+
+fn read_outcome(s: io.Stream) -> str {
+    let n = s.read(io.buffer(8)) catch {
+        NotConnected => return "not connected"
+        _ => return "other error"
+    }
+    "read {n}"
+}
+
+fn pipes_after_close() ! io.Error {
+    using child = process.start(process.Command { program: "cat", stdin: Piped, stdout: Piped })?
+    let input = must(child.handle.stdin)?
+    let output = must(child.handle.stdout)?
+    io.write_all(input, bytes("ping"))?
+    input.close()
+    input.close()
+    print("write after close: {write_outcome(input, "again")}")
+    print("stdout: {str(io.read_all(output)?)}")
+    output.close()
+    output.close()
+    print("read after close: {read_outcome(output)}")
+    print(describe(process.wait(child)?))
+    process.kill(child, 9)?
+    print(describe(process.wait(child)?))
+}
+
+fn closed_descriptor_is_not_reused() ! io.Error {
+    using child = process.start(process.Command { program: "cat", stdin: Piped, stdout: Null })?
+    let input = must(child.handle.stdin)?
+    input.close()
+    let path = "/tmp/low-std-process-closed-reuse"
+    using reused = file.create(path)?
+    print("write to closed pipe: {write_outcome(input, "leak")}")
+    print("reused file size {file.info(reused)?.size}")
+    file.remove(path)?
+    print(describe(process.wait(child)?))
+}
+
+fn orphan(group: bool) -> i64 ! io.Error {
+    using child = process.start(process.Command { program: "sleep", args: ["30"], group })?
+    child.handle.pid
+}
+
+fn alive(pid: i64) -> bool {
+    let stat = file.read_text("/proc/{pid}/stat") catch {
+        _ => return false
+    }
+    var at = stat.len - 1
+    for at > 0 && stat[at] != ')' {
+        at -= 1
+    }
+    stat[at + 2] != 'Z'
+}
+
+fn settled(pid: i64) -> bool {
+    for _ in 0..200 {
+        if !alive(pid) {
+            return true
+        }
+        sleep(10)
+    }
+    false
+}
+
+fn grandchild() -> i64 ! io.Error {
+    using child = process.start(process.Command {
+        program: "sh"
+        args: ["-c", "sleep 30 & echo $!; wait"]
+        stdout: Piped
+        group: true
+    })?
+    let output = must(child.handle.stdout)?
+    let buf = io.buffer(32)
+    var seen: []u8 = []
+    for text.index_byte(str(seen), '\n') < 0 {
+        let n = output.read(buf)?
+        if n == 0 {
+            break
+        }
+        io.append(mut seen, buf[..n])
+    }
+    let line = text.trim(str(seen))
+    let pid = text.parse_int(line) catch 0
+    print("grandchild alive before drop: {alive(pid)}")
+    pid
+}
+
+fn read_until_released(output: io.Stream, results: chan[str]) {
+    let buf = io.buffer(8)
+    let n = output.read(buf) catch -1
+    results <- "reader returned {n}"
+}
+
+fn spawn_reader(results: chan[str]) ! io.Error {
+    using child = process.start(process.Command { program: "sleep", args: ["30"], stdout: Piped })?
+    let output = must(child.handle.stdout)?
+    spawn read_until_released(output, results)
+    sleep(20)
+}
+
+fn drop_releases_blocked_reader() ! io.Error {
+    let results = chan[str](1)
+    spawn_reader(results)?
+    print((<-results) ?? "")
+}
+
+fn handle_lifecycle() ! io.Error {
+    let h = process.start_handle(process.Command { program: "sleep", args: ["30"], stdout: Piped })?
+    process.kill_on(h, 15)?
+    print(describe(process.wait_on(h)?))
+    print(describe(process.wait_on(h)?))
+    using adopted = process.adopt(h)
+    print(describe(process.wait(adopted)?))
+}
+
+fn descriptors() -> i64 ! io.Error {
+    file.list("/proc/self/fd")?.len
+}
+
+fn churn() ! io.Error {
+    for _ in 0..8 {
+        process.run(process.command("echo", ["x"]), [])?
+        using child = process.start(process.Command { program: "cat", stdin: Piped, stdout: Piped, stderr: Piped })?
+        process.kill(child, 9)?
+    }
+}
+
+fn main() ! io.Error {
+    pipes_after_close()?
+    closed_descriptor_is_not_reused()?
+    let plain = orphan(false)?
+    print("unwaited child gone: {settled(plain)}")
+    let grouped = orphan(true)?
+    print("unwaited group child gone: {settled(grouped)}")
+    let nested = grandchild()?
+    print("grandchild gone after drop: {settled(nested)}")
+    drop_releases_blocked_reader()?
+    handle_lifecycle()?
+    let before = descriptors()?
+    churn()?
+    print("descriptors stable: {descriptors()? == before}")
+}

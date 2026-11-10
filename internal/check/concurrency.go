@@ -74,7 +74,7 @@ func (c *Checker) spawn(s *ast.Spawn) {
 		if _, ok := x.(*ast.Ref); ok {
 			c.fail(x.Position(), "spawn cannot pass mut arguments")
 		}
-		block.Stmts = append(block.Stmts, &ast.Let{Name: name, Value: x, Pos: x.Position()})
+		block.Stmts = append(block.Stmts, &ast.Let{Name: name, Spawned: true, Value: x, Pos: x.Position()})
 		return &ast.Ident{Name: name, Pos: x.Position()}
 	}
 	if !c.namedFunc(call.Fn) {

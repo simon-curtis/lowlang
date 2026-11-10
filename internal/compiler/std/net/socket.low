@@ -5,29 +5,60 @@ pub struct Timeouts {
     pub write: i64
 }
 
-pub struct Conn {
+pub struct ConnHandle {
     pub fd: i64
     pub out: i64
     pub remote: Addr
     pub timeouts: *Timeouts
-    users: *Users
+    guard: *io.Guard
 }
 
-struct Users {
-    lock: i64
-    count: i64
-    closed: bool
+pub struct Conn {
+    pub handle: ConnHandle
+    detached: bool = false
+    drop {
+        if !detached {
+            close_on(handle)
+        }
+    }
+}
+
+pub struct ListenerHandle {
+    pub fd: i64
+    pub addr: Addr
+    guard: *io.Guard
 }
 
 pub struct Listener {
-    pub fd: i64
-    pub addr: Addr
+    pub handle: ListenerHandle
+    detached: bool = false
+    drop {
+        if !detached {
+            close_listener_on(handle)
+        }
+    }
 }
 
-pub struct Socket {
+pub struct SocketHandle {
     pub fd: i64
     pub addr: Addr
     pub timeouts: *Timeouts
+    guard: *io.Guard
+}
+
+pub struct Socket {
+    pub handle: SocketHandle
+    drop close_socket_on(handle)
+}
+
+struct Pending {
+    fd: i64
+    kept: bool
+    drop {
+        if !kept {
+            __syscall(3, fd)
+        }
+    }
 }
 
 pub struct Packet {
@@ -40,9 +71,24 @@ struct Watch {
     fired: bool
 }
 
-fn conn(fd: i64, remote: Addr) -> Conn {
-    let out = __syscall(72, fd, 1030, 0)
-    Conn { fd, out: if out < 0 { fd } else { out }, remote, timeouts: no_timeouts(), users: new(Users { lock: 0, count: 0, closed: false }) }
+fn keep(mut p: Pending) -> i64 {
+    p.kept = true
+    p.fd
+}
+
+fn conn_guard(fd: i64, out: i64) -> *io.Guard {
+    io.guard(fn() { __syscall(48, fd, 2) }, fn() {
+        if out != fd {
+            __syscall(3, out)
+        }
+        __syscall(3, fd)
+    })
+}
+
+fn conn(fd: i64, remote: Addr) -> ConnHandle {
+    let dup = __syscall(72, fd, 1030, 0)
+    let out = if dup < 0 { fd } else { dup }
+    ConnHandle { fd, out, remote, timeouts: no_timeouts(), guard: conn_guard(fd, out) }
 }
 
 fn no_timeouts() -> *Timeouts {
@@ -122,21 +168,17 @@ fn local(fd: i64) -> Addr ! io.Error {
     from_sockaddr(buf)
 }
 
-fn bound(a: Addr, kind: i64) -> i64 ! io.Error {
-    let fd = socket(family(a), kind)?
-    set_int(fd, 1, 2, 1) catch {
-        _ => {
-            __syscall(3, fd)
-            fail Invalid
-        }
+fn bound(a: Addr, kind: i64) -> Pending ! io.Error {
+    using p = Pending { fd: socket(family(a), kind)?, kept: false }
+    set_int(p.fd, 1, 2, 1) catch {
+        _ => fail Invalid
     }
     let sa = sockaddr(a)
-    let r = __syscall(49, fd, __slice_ptr(sa), sa.len)
+    let r = __syscall(49, p.fd, __slice_ptr(sa), sa.len)
     if r < 0 {
-        __syscall(3, fd)
         fail io.errno(-r)
     }
-    fd
+    p
 }
 
 fn resolve_local(host: str) -> []u8 ! io.Error {
@@ -146,24 +188,35 @@ fn resolve_local(host: str) -> []u8 ! io.Error {
     lookup(host)?[0]
 }
 
+fn socket_guard(fd: i64) -> *io.Guard {
+    io.guard(fn() { __syscall(48, fd, 2) }, fn() { __syscall(3, fd) })
+}
+
 pub fn listen(host: str, port: i64) -> Listener ! io.Error {
-    let fd = bound(Addr { ip: resolve_local(host)?, port }, 1)?
-    let r = __syscall(50, fd, 4096)
+    using var p = bound(Addr { ip: resolve_local(host)?, port }, 1)?
+    let r = __syscall(50, p.fd, 4096)
     if r < 0 {
-        __syscall(3, fd)
         fail io.errno(-r)
     }
-    Listener { fd, addr: local(fd)? }
+    let addr = local(p.fd)?
+    let fd = keep(mut p)
+    Listener { handle: ListenerHandle { fd, addr, guard: socket_guard(fd) } }
 }
 
 pub fn accept(l: Listener) -> Conn ! io.Error {
+    let h = accept_handle(l.handle)?
+    adopt(h)
+}
+
+pub fn accept_handle(h: ListenerHandle) -> ConnHandle ! io.Error {
+    using lease = io.enter(h.guard)?
     let buf = io.buffer(28)
     let size = io.buffer(4)
     for {
         io.set_le32(size, 0, 28)
-        let r = __syscall(288, l.fd, __slice_ptr(buf), __slice_ptr(size), 0x80800)
+        let r = __syscall(288, h.fd, __slice_ptr(buf), __slice_ptr(size), 0x80800)
         if r == -11 {
-            wait_readable(l.fd)
+            wait_readable(h.fd)
         } else if r >= 0 {
             return conn(r, from_sockaddr(buf))
         } else if r != -4 && r != -103 {
@@ -172,19 +225,33 @@ pub fn accept(l: Listener) -> Conn ! io.Error {
     }
 }
 
-pub fn close_listener(l: Listener) {
-    __syscall(3, l.fd)
+pub fn adopt(h: ConnHandle) -> Conn {
+    Conn { handle: h }
 }
 
-fn open_stream(a: Addr, device: str, millis: i64) -> i64 ! io.Error {
+pub fn detach(mut c: Conn) -> ConnHandle {
+    c.detached = true
+    c.handle
+}
+
+pub fn detach_listener(mut l: Listener) -> ListenerHandle {
+    l.detached = true
+    l.handle
+}
+
+pub fn close_listener(l: Listener) {
+    close_listener_on(l.handle)
+}
+
+pub fn close_listener_on(h: ListenerHandle) {
+    io.retire(h.guard)
+}
+
+fn open_stream(a: Addr, device: str, millis: i64) -> Conn ! io.Error {
     let fd = socket(family(a), 1)?
+    using c = adopt(conn(fd, a))
     if device.len > 0 {
-        bind_device(fd, device) catch {
-            e => {
-                __syscall(3, fd)
-                fail e
-            }
-        }
+        bind_device(fd, device)?
     }
     let sa = sockaddr(a)
     var r = __syscall(42, fd, __slice_ptr(sa), sa.len)
@@ -193,18 +260,14 @@ fn open_stream(a: Addr, device: str, millis: i64) -> i64 ! io.Error {
     }
     if r == -115 {
         wait(fd, true, millis) catch {
-            _ => {
-                __syscall(3, fd)
-                fail TimedOut
-            }
+            _ => fail TimedOut
         }
         r = -socket_error(fd)
     }
     if r < 0 {
-        __syscall(3, fd)
         fail io.errno(-r)
     }
-    fd
+    c
 }
 
 pub fn connect(a: Addr) -> Conn ! io.Error {
@@ -216,7 +279,7 @@ pub fn connect_within(a: Addr, millis: i64) -> Conn ! io.Error {
 }
 
 pub fn connect_through(a: Addr, device: str, millis: i64) -> Conn ! io.Error {
-    conn(open_stream(a, device, millis)?, a)
+    open_stream(a, device, millis)
 }
 
 pub fn connect_first(ips: [][]u8, port: i64, device: str, millis: i64) -> Conn ! io.Error {
@@ -225,10 +288,10 @@ pub fn connect_first(ips: [][]u8, port: i64, device: str, millis: i64) -> Conn !
     }
     for ip in ips[..ips.len - 1] {
         let a = Addr { ip, port }
-        let fd = open_stream(a, device, millis) catch -1
-        if fd >= 0 {
-            return conn(fd, a)
+        using c = open_stream(a, device, millis) catch {
+            _ => continue
         }
+        return c
     }
     connect_through(Addr { ip: ips[ips.len - 1], port }, device, millis)
 }
@@ -237,11 +300,10 @@ pub fn interface_index(name: str) -> i64 ! io.Error {
     if name.len == 0 || name.len > 15 {
         fail Invalid
     }
-    let fd = socket(2, 2)?
-    defer __syscall(3, fd)
+    using probe = Pending { fd: socket(2, 2)?, kept: false }
     let request = io.buffer(40)
     io.copy(request, bytes(name))
-    let r = __syscall(16, fd, 0x8933, __slice_ptr(request))
+    let r = __syscall(16, probe.fd, 0x8933, __slice_ptr(request))
     if r == -19 {
         fail NotFound
     }
@@ -257,125 +319,119 @@ pub fn dial_within(host: str, port: i64, millis: i64) -> Conn ! io.Error {
     connect_first(lookup(host)?, port, "", millis)
 }
 
-fn enter(c: Conn) ! io.Error {
-    let u = c.users
-    __lock(mut u.lock)
-    if u.closed {
-        __unlock(mut u.lock)
-        fail NotConnected
-    }
-    u.count += 1
-    __unlock(mut u.lock)
-}
-
-fn leave(c: Conn) {
-    let u = c.users
-    __lock(mut u.lock)
-    u.count -= 1
-    let last = u.closed && u.count == 0
-    __unlock(mut u.lock)
-    if last {
-        release(c)
-    }
-}
-
-fn release(c: Conn) {
-    if c.out != c.fd {
-        __syscall(3, c.out)
-    }
-    __syscall(3, c.fd)
-}
-
 pub fn read(c: Conn, buf: []u8) -> i64 ! io.Error {
-    enter(c)?
-    defer leave(c)
-    retry(c.fd, false, c.timeouts.read, fn() -> i64 { __syscall(45, c.fd, __slice_ptr(buf), buf.len, 0, 0, 0) })
+    read_on(c.handle, buf)
+}
+
+pub fn read_on(h: ConnHandle, buf: []u8) -> i64 ! io.Error {
+    using lease = io.enter(h.guard)?
+    retry(h.fd, false, h.timeouts.read, fn() -> i64 { __syscall(45, h.fd, __slice_ptr(buf), buf.len, 0, 0, 0) })
 }
 
 pub fn write(c: Conn, data: []u8) -> i64 ! io.Error {
-    enter(c)?
-    defer leave(c)
-    retry(c.out, true, c.timeouts.write, fn() -> i64 { __syscall(44, c.out, __slice_ptr(data), data.len, 0x4000, 0, 0) })
+    write_on(c.handle, data)
+}
+
+pub fn write_on(h: ConnHandle, data: []u8) -> i64 ! io.Error {
+    using lease = io.enter(h.guard)?
+    retry(h.out, true, h.timeouts.write, fn() -> i64 { __syscall(44, h.out, __slice_ptr(data), data.len, 0x4000, 0, 0) })
 }
 
 pub fn write_all(c: Conn, data: []u8) ! io.Error {
+    write_all_on(c.handle, data)?
+}
+
+pub fn write_all_on(h: ConnHandle, data: []u8) ! io.Error {
     var rest = data
     for rest.len > 0 {
-        let n = write(c, rest)?
+        let n = write_on(h, rest)?
         rest = rest[n..]
     }
 }
 
 pub fn close(c: Conn) {
-    let u = c.users
-    __lock(mut u.lock)
-    if u.closed {
-        __unlock(mut u.lock)
-        return
-    }
-    u.closed = true
-    let idle = u.count == 0
-    __unlock(mut u.lock)
-    __syscall(48, c.fd, 2)
-    if idle {
-        release(c)
-    }
+    close_on(c.handle)
+}
+
+pub fn close_on(h: ConnHandle) {
+    io.retire(h.guard)
 }
 
 pub fn shutdown_write(c: Conn) ! io.Error {
-    io.syscall_result(__syscall(48, c.fd, 1))?
+    shutdown_write_on(c.handle)
+}
+
+pub fn shutdown_write_on(h: ConnHandle) ! io.Error {
+    using lease = io.enter(h.guard)?
+    io.syscall_result(__syscall(48, h.fd, 1))?
 }
 
 pub fn local_addr(c: Conn) -> Addr ! io.Error {
-    local(c.fd)
+    using lease = io.enter(c.handle.guard)?
+    local(c.handle.fd)
 }
 
 pub fn set_nodelay(c: Conn, on: bool) ! io.Error {
-    set_int(c.fd, 6, 1, if on { 1 } else { 0 })?
+    using lease = io.enter(c.handle.guard)?
+    set_int(c.handle.fd, 6, 1, if on { 1 } else { 0 })?
 }
 
 pub fn set_read_timeout(c: Conn, millis: i64) {
-    c.timeouts.read = millis
+    c.handle.timeouts.read = millis
 }
 
 pub fn set_write_timeout(c: Conn, millis: i64) {
-    c.timeouts.write = millis
+    c.handle.timeouts.write = millis
 }
 
 pub fn stream(c: Conn) -> io.Stream {
+    stream_on(c.handle)
+}
+
+pub fn stream_on(h: ConnHandle) -> io.Stream {
     io.Stream {
-        read: fn(buf) { read(c, buf) }
-        write: fn(data) { write(c, data) }
-        close: fn() { close(c) }
+        read: fn(buf) { read_on(h, buf) }
+        write: fn(data) { write_on(h, data) }
+        close: fn() { close_on(h) }
     }
 }
 
 pub fn bind_udp(host: str, port: i64) -> Socket ! io.Error {
-    let fd = bound(Addr { ip: resolve_local(host)?, port }, 2)?
-    Socket { fd, addr: local(fd)?, timeouts: no_timeouts() }
+    using var p = bound(Addr { ip: resolve_local(host)?, port }, 2)?
+    let addr = local(p.fd)?
+    let fd = keep(mut p)
+    Socket { handle: SocketHandle { fd, addr, timeouts: no_timeouts(), guard: socket_guard(fd) } }
 }
 
 pub fn send_to(s: Socket, data: []u8, to: Addr) -> i64 ! io.Error {
+    using lease = io.enter(s.handle.guard)?
+    let h = s.handle
     let sa = sockaddr(to)
-    retry(s.fd, true, s.timeouts.write, fn() -> i64 {
-        __syscall(44, s.fd, __slice_ptr(data), data.len, 0x4000, __slice_ptr(sa), sa.len)
+    retry(h.fd, true, h.timeouts.write, fn() -> i64 {
+        __syscall(44, h.fd, __slice_ptr(data), data.len, 0x4000, __slice_ptr(sa), sa.len)
     })
 }
 
 pub fn receive_from(s: Socket, buf: []u8) -> Packet ! io.Error {
+    using lease = io.enter(s.handle.guard)?
+    let h = s.handle
     let sa = io.buffer(28)
     let size = io.buffer(4)
-    let n = retry(s.fd, false, s.timeouts.read, fn() -> i64 {
+    let n = retry(h.fd, false, h.timeouts.read, fn() -> i64 {
         io.set_le32(size, 0, 28)
-        __syscall(45, s.fd, __slice_ptr(buf), buf.len, 0, __slice_ptr(sa), __slice_ptr(size))
+        __syscall(45, h.fd, __slice_ptr(buf), buf.len, 0, __slice_ptr(sa), __slice_ptr(size))
     })?
     Packet { size: n, from: from_sockaddr(sa) }
 }
 
 pub fn set_receive_timeout(s: Socket, millis: i64) {
-    s.timeouts.read = millis
+    s.handle.timeouts.read = millis
 }
 
 pub fn close_socket(s: Socket) {
-    __syscall(3, s.fd)
+    close_socket_on(s.handle)
+}
+
+pub fn close_socket_on(h: SocketHandle) {
+    io.retire(h.guard)
 }
