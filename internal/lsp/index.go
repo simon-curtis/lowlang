@@ -311,6 +311,11 @@ func (x *index) arms(arms []*ast.Arm, scrutinee *types.Type) {
 			x.expr(a.Body)
 			continue
 		}
+		if a.Pattern.Local != nil {
+			x.add(occurrence{pos: a.Pattern.Pos, name: a.Pattern.Name, node: a.Pattern, local: a.Pattern.Local})
+			x.expr(a.Body)
+			continue
+		}
 		x.add(occurrence{pos: a.Pattern.Pos, name: a.Pattern.Name, node: a.Pattern, parent: scrutinee})
 		for _, b := range a.Pattern.Bindings {
 			x.add(occurrence{pos: b.Pos, name: b.Name, node: b, local: b.Local})
