@@ -1,0 +1,348 @@
+import std/bits/roaring
+
+struct Rng {
+    state: u64
+}
+
+fn next(r: *Rng) -> u64 {
+    r.state = r.state * 6364136223846793005 + 1442695040888963407
+    r.state >> 17
+}
+
+fn below(r: *Rng, n: i64) -> i64 {
+    i64(next(r) % u64(n))
+}
+
+struct Model {
+    bitmap: *roaring.Roaring
+    present: []u8
+}
+
+fn slots() -> []i64 {
+    [0, 1, 0x7FFF, 0xFFFF]
+}
+
+fn value_of(keys: []i64, index: i64) -> u32 {
+    u32((keys[index >> 16] << 16) | (index & 0xFFFF))
+}
+
+fn empty_model() -> Model {
+    var present: []u8 = []
+    for _ in 0..4 * 65536 {
+        push(mut present, 0)
+    }
+    Model { bitmap: roaring.roaring(), present }
+}
+
+fn verify(m: Model, keys: []i64, label: str) -> bool {
+    let list = roaring.members(m.bitmap)
+    var k = 0
+    var first: u32? = none
+    var last: u32? = none
+    for i, v in m.present {
+        if v == 1 {
+            let x = value_of(keys, i)
+            if k >= list.len || list[k] != x {
+                print("{label}: member {k}")
+                return false
+            }
+            if first == none {
+                first = x
+            }
+            last = x
+            k += 1
+        }
+    }
+    if k != list.len || roaring.cardinality(m.bitmap) != k {
+        print("{label}: cardinality {roaring.cardinality(m.bitmap)} members {list.len} expected {k}")
+        return false
+    }
+    if roaring.min(m.bitmap) != first || roaring.max(m.bitmap) != last {
+        print("{label}: min/max")
+        return false
+    }
+    var seen = 0
+    var ordered = true
+    roaring.for_each(m.bitmap, fn(x: u32) -> bool {
+        if seen >= list.len || list[seen] != x {
+            ordered = false
+        }
+        seen += 1
+        true
+    })
+    if !ordered || seen != k {
+        print("{label}: for_each")
+        return false
+    }
+    true
+}
+
+fn probe(m: Model, keys: []i64, r: *Rng, label: str) -> bool {
+    var running = 0
+    var at = 0
+    for i, v in m.present {
+        if v == 1 {
+            running += 1
+        }
+        if (i & 0x3FF) == 0 || below(r, 512) == 0 {
+            let x = value_of(keys, i)
+            if roaring.contains(m.bitmap, x) != (v == 1) {
+                print("{label}: contains {x}")
+                return false
+            }
+            if roaring.rank(m.bitmap, x) != running {
+                print("{label}: rank {x} {roaring.rank(m.bitmap, x)} expected {running}")
+                return false
+            }
+            if v == 1 && roaring.select_at(m.bitmap, running - 1) != x {
+                print("{label}: select {running - 1}")
+                return false
+            }
+        }
+    }
+    roaring.select_at(m.bitmap, running) == none && roaring.select_at(m.bitmap, -1) == none
+}
+
+fn window(r: *Rng) -> i64 {
+    let spans = [16, 300, 6000, 65536]
+    spans[below(r, 4)]
+}
+
+fn mutate(m: Model, keys: []i64, r: *Rng) {
+    let slot = below(r, 4)
+    let span = window(r)
+    let base = below(r, 65536 - span + 1)
+    let kind = below(r, 12)
+    if kind < 4 {
+        let n = 1 + below(r, 3000)
+        let adding = kind < 3
+        for _ in 0..n {
+            let index = (slot << 16) + base + below(r, span)
+            if adding {
+                roaring.add(m.bitmap, value_of(keys, index))
+                m.present[index] = 1
+            } else {
+                roaring.remove(m.bitmap, value_of(keys, index))
+                m.present[index] = 0
+            }
+        }
+    } else if kind < 10 {
+        var lo = (slot << 16) + base + below(r, span)
+        var hi = lo + below(r, span + 1)
+        if hi > (slot + 1) << 16 {
+            hi = (slot + 1) << 16
+        }
+        if keys[slot] == 0 && below(r, 3) == 0 {
+            lo = below(r, 2 * 65536)
+            hi = lo + below(r, 2 * 65536 - lo + 1)
+        }
+        if below(r, 5) == 0 {
+            lo = slot << 16
+            hi = lo + 65536
+        }
+        let adding = kind < 7
+        let start = i64(value_of(keys, lo))
+        let end = start + hi - lo
+        if adding {
+            roaring.add_range(m.bitmap, start, end)
+        } else {
+            roaring.remove_range(m.bitmap, start, end)
+        }
+        for i in lo..hi {
+            m.present[i] = if adding { 1 } else { 0 }
+        }
+    } else if kind == 10 {
+        roaring.run_optimize(m.bitmap)
+    } else {
+        let restored = roaring.deserialize(roaring.serialize(m.bitmap)) catch {
+            _ => roaring.roaring()
+        }
+        if !roaring.equal(restored, m.bitmap) {
+            print("roundtrip mismatch")
+        }
+        roaring.xor_with(m.bitmap, restored)
+        roaring.or_with(m.bitmap, restored)
+    }
+}
+
+fn combine_present(a: []u8, b: []u8, op: i64) -> []u8 {
+    var out: []u8 = []
+    for i, x in a {
+        let y = b[i]
+        let v = if op == 0 { x & y } else if op == 1 { x | y } else if op == 2 { x ^ y } else { x & (1 - y) }
+        push(mut out, v)
+    }
+    out
+}
+
+fn apply(a: *roaring.Roaring, b: *roaring.Roaring, op: i64, inplace: bool) -> *roaring.Roaring {
+    if !inplace {
+        return if op == 0 {
+            roaring.and(a, b)
+        } else if op == 1 {
+            roaring.or(a, b)
+        } else if op == 2 {
+            roaring.xor(a, b)
+        } else {
+            roaring.and_not(a, b)
+        }
+    }
+    let target = roaring.clone(a)
+    if op == 0 {
+        roaring.and_with(target, b)
+    } else if op == 1 {
+        roaring.or_with(target, b)
+    } else if op == 2 {
+        roaring.xor_with(target, b)
+    } else {
+        roaring.and_not_with(target, b)
+    }
+    target
+}
+
+fn check_algebra(a: Model, b: Model, keys: []i64, r: *Rng) -> bool {
+    let snapshot = roaring.serialize(a.bitmap)
+    let snapshot_b = roaring.serialize(b.bitmap)
+    for op in 0..4 {
+        let want = combine_present(a.present, b.present, op)
+        for inplace in [false, true] {
+            let got = Model { bitmap: apply(a.bitmap, b.bitmap, op, inplace), present: want }
+            if !verify(got, keys, "op {op} {inplace}") {
+                return false
+            }
+            if below(r, 4) == 0 && !probe(got, keys, r, "op {op} probe") {
+                return false
+            }
+        }
+    }
+    let self_xor = roaring.clone(a.bitmap)
+    roaring.xor_with(self_xor, self_xor)
+    let self_or = roaring.clone(a.bitmap)
+    roaring.or_with(self_or, self_or)
+    if !roaring.is_empty(self_xor) || !roaring.equal(self_or, a.bitmap) {
+        print("self ops")
+        return false
+    }
+    var a_in_b = true
+    var same = true
+    for i, x in a.present {
+        if x == 1 && b.present[i] == 0 {
+            a_in_b = false
+        }
+        if x != b.present[i] {
+            same = false
+        }
+    }
+    if roaring.is_subset(a.bitmap, b.bitmap) != a_in_b || roaring.equal(a.bitmap, b.bitmap) != same {
+        print("subset/equal")
+        return false
+    }
+    let both = roaring.and(a.bitmap, b.bitmap)
+    if !roaring.is_subset(both, a.bitmap) || !roaring.is_subset(both, b.bitmap) {
+        print("intersection subset")
+        return false
+    }
+    let unchanged_a = roaring.serialize(a.bitmap)
+    let unchanged_b = roaring.serialize(b.bitmap)
+    if unchanged_a.len != snapshot.len || unchanged_b.len != snapshot_b.len {
+        print("operands changed")
+        return false
+    }
+    for i, x in snapshot {
+        if unchanged_a[i] != x {
+            print("operand a changed")
+            return false
+        }
+    }
+    true
+}
+
+fn differential(seed: u64) -> bool {
+    let r = new(Rng { state: seed })
+    let keys = slots()
+    let a = empty_model()
+    let b = empty_model()
+    for step in 0..300 {
+        let target = if below(r, 2) == 0 { a } else { b }
+        mutate(target, keys, r)
+        if step % 25 == 24 {
+            if !verify(a, keys, "a {step}") || !verify(b, keys, "b {step}") {
+                return false
+            }
+        }
+        if step % 50 == 49 {
+            if !probe(a, keys, r, "a probe {step}") || !check_algebra(a, b, keys, r) {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn transitions() -> bool {
+    let r = roaring.roaring()
+    for i in 0..4096 {
+        roaring.add(r, u32(2 * i))
+    }
+    let as_array = roaring.serialize(r).len
+    roaring.add(r, 1)
+    let as_bitmap = roaring.serialize(r).len
+    roaring.remove(r, 1)
+    let back = roaring.serialize(r).len
+    roaring.add_range(r, 0, 8192)
+    let ranged = roaring.serialize(r).len
+    roaring.run_optimize(r)
+    let optimized = roaring.serialize(r).len
+    roaring.remove(r, 100)
+    let split = roaring.serialize(r).len
+    roaring.add(r, 100)
+    let joined = roaring.serialize(r).len
+    print("transitions {as_array} {as_bitmap} {back} {ranged} {optimized} {split} {joined} {roaring.cardinality(r)}")
+    as_array == 8 + 8 + 8192 && as_bitmap == 8 + 8 + 8192 && back == as_array
+}
+
+fn edges() {
+    let r = roaring.roaring()
+    roaring.add(r, 0)
+    roaring.add(r, 65535)
+    roaring.add(r, 65536)
+    roaring.add(r, 0xFFFFFFFF)
+    print("edges {roaring.cardinality(r)} {roaring.min(r) ?? 1} {roaring.max(r) ?? 0} {roaring.rank(r, 65535)} {roaring.rank(r, 0xFFFFFFFE)} {roaring.select_at(r, 2) ?? 0}")
+    roaring.add_range(r, 0xFFFFFFF0, 1 << 32)
+    roaring.add_range(r, 65530, 65542)
+    print("ranges {roaring.cardinality(r)} {roaring.contains(r, 65541)} {roaring.contains(r, 65542)} {roaring.rank(r, 0xFFFFFFFF)}")
+    roaring.remove_range(r, 65535, 65537)
+    roaring.remove_range(r, -5, 1)
+    roaring.remove_range(r, 0xFFFFFFFF, 1 << 40)
+    print("removed {roaring.cardinality(r)} {roaring.contains(r, 65535)} {roaring.contains(r, 65537)} {roaring.min(r) ?? 0} {roaring.max(r) ?? 0}")
+    let full = roaring.roaring()
+    roaring.add_range(full, 0, 1 << 32)
+    print("full {roaring.cardinality(full)} {roaring.contains(full, 0xFFFFFFFF)} {roaring.rank(full, 0xFFFFFFFF)} {roaring.select_at(full, 4294967295) ?? 0} {roaring.serialize(full).len}")
+    roaring.remove_range(full, 1, (1 << 32) - 1)
+    print("ends {roaring.cardinality(full)} {roaring.members(full)[0]} {roaring.members(full)[1]}")
+    roaring.add_range(full, 10, 5)
+    roaring.add_range(full, 1 << 33, 1 << 34)
+    print("noop {roaring.cardinality(full)}")
+    var visited = 0
+    roaring.for_each(r, fn(x: u32) -> bool {
+        visited += 1
+        visited < 3
+    })
+    roaring.clear(full)
+    roaring.add(full, 9)
+    print("stop {visited} cleared {roaring.cardinality(full)} {roaring.min(full) ?? 0}")
+    let e = roaring.roaring()
+    print("empty {roaring.cardinality(e)} {roaring.min(e) ?? 7} {roaring.rank(e, 9)} {roaring.members(e).len} {roaring.serialize(e).len} {roaring.equal(e, roaring.and(r, e))} {roaring.is_subset(e, r)}")
+}
+
+fn main() {
+    var ok = true
+    for seed in [1, 2] {
+        if !differential(u64(seed) * 0x9E3779B97F4A7C15) {
+            ok = false
+        }
+    }
+    print("differential {ok}")
+    print("transition sizes {transitions()}")
+    edges()
+}

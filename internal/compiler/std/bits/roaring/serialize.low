@@ -1,0 +1,216 @@
+import std/bits
+import std/io
+
+fn has_runs(r: *Roaring) -> bool {
+    for i in 0..r.size {
+        if r.containers[i].kind == Run {
+            return true
+        }
+    }
+    false
+}
+
+fn stored_size(c: *Container) -> i64 {
+    if c.kind == Run {
+        2 + 4 * c.runs
+    } else if c.card <= 4096 {
+        2 * c.card
+    } else {
+        8192
+    }
+}
+
+fn header_size(n: i64, runs: bool) -> i64 {
+    if !runs {
+        return 8 + 8 * n
+    }
+    4 + ((n + 7) >> 3) + 4 * n + (if n >= 4 { 4 * n } else { 0 })
+}
+
+pub fn serialized_size(r: *Roaring) -> i64 {
+    var total = header_size(r.size, has_runs(r))
+    for i in 0..r.size {
+        total += stored_size(r.containers[i])
+    }
+    total
+}
+
+fn put_values(out: []u8, at: i64, values: []u16) {
+    for i, v in values {
+        out[at + 2 * i] = u8(v)
+        out[at + 2 * i + 1] = u8(v >> 8)
+    }
+}
+
+fn put_container(out: []u8, at: i64, c: *Container) {
+    if c.kind == Run {
+        io.set_le16(out, at, c.runs)
+        put_values(out, at + 2, c.values[..2 * c.runs])
+    } else if c.card > 4096 {
+        let words = if c.kind == Bitmap { c.words } else { words_of(c) }
+        for i, w in words {
+            for j in 0..8 {
+                out[at + 8 * i + j] = u8(w >> (8 * j))
+            }
+        }
+    } else if c.kind == Array {
+        put_values(out, at, c.values[..c.card])
+    } else {
+        let values: []u16 = __make(c.card)
+        write_values(c, values)
+        put_values(out, at, values)
+    }
+}
+
+pub fn serialize(r: *Roaring) -> []u8 {
+    let runs = has_runs(r)
+    let n = r.size
+    let out: []u8 = __make(serialized_size(r))
+    var at = 0
+    if runs {
+        io.set_le32(out, 0, 12347 | ((n - 1) << 16))
+        for i in 0..n {
+            if r.containers[i].kind == Run {
+                out[4 + (i >> 3)] |= u8(1 << (i & 7))
+            }
+        }
+        at = 4 + ((n + 7) >> 3)
+    } else {
+        io.set_le32(out, 0, 12346)
+        io.set_le32(out, 4, n)
+        at = 8
+    }
+    for i in 0..n {
+        io.set_le16(out, at + 4 * i, i64(r.keys[i]))
+        io.set_le16(out, at + 4 * i + 2, r.containers[i].card - 1)
+    }
+    at += 4 * n
+    let offsets = !runs || n >= 4
+    var position = header_size(n, runs)
+    for i in 0..n {
+        if offsets {
+            io.set_le32(out, at + 4 * i, position)
+        }
+        put_container(out, position, r.containers[i])
+        position += stored_size(r.containers[i])
+    }
+    out
+}
+
+fn read_runs(data: []u8, at: i64, card: i64) -> *Container ! io.Error {
+    if at + 2 > data.len {
+        fail Malformed
+    }
+    let runs = io.le16(data, at)
+    if runs == 0 || at + 2 + 4 * runs > data.len {
+        fail Malformed
+    }
+    let values: []u16 = __make(2 * runs)
+    var total = 0
+    var next = 0
+    for i in 0..runs {
+        let first = io.le16(data, at + 2 + 4 * i)
+        let length = io.le16(data, at + 4 + 4 * i)
+        if first < next || first + length > 65535 {
+            fail Malformed
+        }
+        values[2 * i] = u16(first)
+        values[2 * i + 1] = u16(length)
+        total += length + 1
+        next = first + length + 1
+    }
+    if total != card {
+        fail Malformed
+    }
+    run_container(values, runs, card)
+}
+
+fn read_array(data: []u8, at: i64, card: i64) -> *Container ! io.Error {
+    if at + 2 * card > data.len {
+        fail Malformed
+    }
+    let c = array_container(card)
+    var previous = -1
+    for i in 0..card {
+        let v = io.le16(data, at + 2 * i)
+        if v <= previous {
+            fail Malformed
+        }
+        c.values[i] = u16(v)
+        previous = v
+    }
+    c.card = card
+    c
+}
+
+fn read_bitmap(data: []u8, at: i64, card: i64) -> *Container ! io.Error {
+    if at + 8192 > data.len {
+        fail Malformed
+    }
+    let words: []u64 = __make(1024)
+    var total = 0
+    for i in 0..1024 {
+        var w: u64 = 0
+        for j in 0..8 {
+            w |= u64(data[at + 8 * i + j]) << (8 * j)
+        }
+        words[i] = w
+        total += bits.popcount(w)
+    }
+    if total != card {
+        fail Malformed
+    }
+    bitmap_container(words, card)
+}
+
+pub fn deserialize(data: []u8) -> *Roaring ! io.Error {
+    if data.len < 4 {
+        fail Malformed
+    }
+    let cookie = io.le32(data, 0)
+    let runs = (cookie & 0xFFFF) == 12347
+    var n = 0
+    var at = 0
+    if runs {
+        n = (cookie >> 16) + 1
+        at = 4 + ((n + 7) >> 3)
+    } else if cookie == 12346 {
+        if data.len < 8 {
+            fail Malformed
+        }
+        n = io.le32(data, 4)
+        at = 8
+    } else {
+        fail Malformed
+    }
+    if n > 65536 || header_size(n, runs) > data.len {
+        fail Malformed
+    }
+    let offsets = !runs || n >= 4
+    let offset_at = at + 4 * n
+    var position = header_size(n, runs)
+    let r = with_capacity(n)
+    var previous = -1
+    for i in 0..n {
+        let key = io.le16(data, at + 4 * i)
+        let card = io.le16(data, at + 4 * i + 2) + 1
+        if key <= previous {
+            fail Malformed
+        }
+        previous = key
+        if offsets && io.le32(data, offset_at + 4 * i) != position {
+            fail Malformed
+        }
+        let is_run = runs && (data[4 + (i >> 3)] & u8(1 << (i & 7))) != 0
+        let c = if is_run {
+            read_runs(data, position, card)?
+        } else if card <= 4096 {
+            read_array(data, position, card)?
+        } else {
+            read_bitmap(data, position, card)?
+        }
+        position += stored_size(c)
+        append(r, key, c)
+    }
+    r
+}

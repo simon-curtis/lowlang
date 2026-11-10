@@ -681,6 +681,8 @@ fn main() ! io.Error {
 | `std/compress/zstd` | Zstandard (RFC 8878). |
 | `std/compress/lz4` | LZ4 frames. |
 | `std/hash` | CRC-32, CRC-32C, Adler-32, CRC-64 and xxHash32/64, in one-shot and incremental forms. |
+| `std/bits` | Dense bitsets. |
+| `std/bits/roaring` | Roaring bitmaps with the portable serialization format. |
 | `std/crypto` | `sha1` and `random`, which reads `getrandom`. |
 | `std/crypto/hash` | `Algorithm` and cloneable `Digest`, SHA-256, SHA-384 and SHA-512, HMAC, HKDF and constant-time `equal`. |
 | `std/crypto/sha3` | SHA3-256, SHA3-384, SHA3-512, SHAKE128 and SHAKE256. |
@@ -742,6 +744,7 @@ fn main() ! io.Error {
 - DEFLATE, zlib and gzip decode stored, fixed and dynamic blocks with two-level lookup tables, check Adler-32, CRC-32, ISIZE and the gzip header CRC, and read concatenated gzip members. The encoder uses greedy matching at levels 1 to 3 and lazy matching at 4 to 9 over a hash chain on a 32 KB window, choosing dynamic, fixed or stored encoding per block; `flush` emits a sync flush so streamed output is decodable as it arrives.
 - xz decodes multiple blocks and streams, the none, CRC32, CRC64 and SHA-256 checks, LZMA2 chunks with their resets, and the delta filter; other filters fail with `Unsupported`. The encoder writes LZMA2 with a hash-chain match finder and lazy parsing, a dictionary from 256 KiB to 64 MiB by level, and raw chunks where compression does not pay.
 - `std/compress/zstd` and `std/compress/lz4` each offer `compress(data, level)`, `decompress(data, limit)`, a streaming `decode(reader, sink, limit)` that passes output to the sink one block at a time, and a streaming `Encoder` with `encode`, `flush` and `finish`. The zstd decoder handles every block and literal type, 1- and 4-stream Huffman literals, all four FSE table modes, repeat offsets, skippable and concatenated frames, and the content checksum; its history grows with real output up to the smaller of the window and the remaining limit, so large windows never allocate what the header claims up front. The zstd encoder finds matches with two hash chains keyed on 8-byte and 4- or 5-byte prefixes, with depth and lazy evaluation set by the level, Huffman-codes literals, picks predefined, RLE or custom FSE tables per block by estimated cost, and falls back to raw or RLE blocks. The LZ4 decoder accepts linked and independent blocks, block and content checksums, content sizes and skippable frames; the encoder writes linked 64 KB blocks with a content checksum. Dictionaries and LZ4 legacy frames fail with `Unsupported`.
+- `std/bits` holds a growable `Set` over `[]u64` words; counts use a SWAR popcount and scans (`next_set`, `next_clear`, `min`, `max`, `rank`, `select_at`, `members`) step a word at a time. `std/bits/roaring` holds `Roaring`, a set of `u32` split into 65536-value chunks keyed by the high 16 bits, each held as a sorted `[]u16` array of up to 4096 values, a 1024-word bitmap, or a list of runs. Arrays and bitmaps convert at 4096 values; ranges create runs, and unions and intersections of runs stay runs. Every container tracks its cardinality, so `cardinality` is constant time. Set operations come as new-set and in-place `_with` forms, working word by word on bitmaps and by galloping merge on arrays. `run_optimize` picks the smallest form per container by the Go library's rule, and `serialize` and `deserialize` implement the portable Roaring format byte for byte as Go `roaring/v2` writes it, rejecting any inconsistent length, ordering or cardinality with `Malformed`.
 - Every codec has buffer functions, a streaming decoder that pulls from an `io.Reader`, pushes output to a sink and fails with `TooLarge` past a caller's limit, and a streaming encoder.
 
 ### Web
@@ -930,7 +933,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - Green threads on an M:N scheduler with `spawn`, channels, `select`, `sleep`, descriptor waits through epoll, deadlock detection and stack overflow checks.
 - Derived serialization, deserialization and schemas for every type, and `T.field` references.
 - 128- and 256-bit vector types with lane-wise operators, compiled for AVX2 and SSE2 with dispatch at startup.
-- Standard library: files, networking with DNS, pipelines, HTTP/1.1 and HTTP/2 clients and servers, WebSocket, post-quantum TLS 1.3, JSON, the web framework with OpenAPI and authentication, the SQL driver contract and ORM, DEFLATE/zlib/gzip, xz, Zstandard and LZ4 compression, checksums, and the cryptography TLS needs.
+- Standard library: files, networking with DNS, pipelines, HTTP/1.1 and HTTP/2 clients and servers, WebSocket, post-quantum TLS 1.3, JSON, the web framework with OpenAPI and authentication, the SQL driver contract and ORM, DEFLATE/zlib/gzip, xz, Zstandard and LZ4 compression, bitsets and Roaring bitmaps, checksums, and the cryptography TLS needs.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
