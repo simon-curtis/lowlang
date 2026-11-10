@@ -96,17 +96,22 @@ func Build(files []*ast.File) *Program {
 		b.finalize()
 	}
 	p.Funcs = reachable(p.Main, p.Funcs)
-	p.Libraries = libraries(files)
-	p.CSymbols = cSymbols(files)
+	p.CSymbols = cSymbols(p.Funcs)
+	p.Libraries = libraries(files, p.CSymbols)
 	return p
 }
 
-func cSymbols(files []*ast.File) []string {
+func cSymbols(funcs []*Func) []string {
 	var symbols []string
-	for _, f := range files {
-		for _, e := range f.Externs {
-			for _, fn := range e.Funcs {
-				symbols = append(symbols, fn.Name)
+	for _, f := range funcs {
+		for _, b := range f.Blocks {
+			for _, v := range b.Values {
+				switch {
+				case v.Op == OpCCall && v.Plan.Symbol != "":
+					symbols = append(symbols, v.Plan.Symbol)
+				case v.Op == OpFuncAddr && v.Aux == SymbolAddr:
+					symbols = append(symbols, v.Str)
+				}
 			}
 		}
 	}
@@ -114,17 +119,24 @@ func cSymbols(files []*ast.File) []string {
 	return slices.Compact(symbols)
 }
 
-func libraries(files []*ast.File) []string {
+func libraries(files []*ast.File, used []string) []string {
 	var libs []string
 	for _, f := range files {
 		for _, e := range f.Externs {
-			if !slices.Contains(libs, e.Library) {
+			if !slices.Contains(libs, e.Library) && declaresAny(e, used) {
 				libs = append(libs, e.Library)
 			}
 		}
 	}
 	slices.Sort(libs)
 	return libs
+}
+
+func declaresAny(e *ast.Extern, used []string) bool {
+	return slices.ContainsFunc(e.Funcs, func(fn *ast.Func) bool {
+		_, found := slices.BinarySearch(used, fn.Symbol)
+		return found
+	})
 }
 
 func reachable(main *Func, funcs []*Func) []*Func {
@@ -842,7 +854,7 @@ func (b *builder) funcValue(fn *ast.Func, t *types.Type) []*Value {
 	switch {
 	case fn.Extern != nil:
 		v := b.funcAddr(SymbolAddr, nil)
-		v.Str = fn.Name
+		v.Str = fn.Symbol
 		return []*Value{v}
 	case t.C:
 		return []*Value{b.funcAddr(ThunkAddr, b.funcs[fn])}

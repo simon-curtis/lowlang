@@ -235,7 +235,28 @@ func (p *Parser) externFn(e *ast.Extern) *ast.Func {
 		p.next()
 		f.Result = p.typeName()
 	}
+	f.Symbol = f.Name
+	if p.at(lexer.Assign) {
+		p.next()
+		symbol := p.expect(lexer.String)
+		if !validSymbol(symbol.Text) {
+			p.fail(symbol.Pos, "invalid C symbol %q", symbol.Text)
+		}
+		f.Symbol = symbol.Text
+	}
 	return f
+}
+
+func validSymbol(name string) bool {
+	if name == "" || (name[0] >= '0' && name[0] <= '9') {
+		return false
+	}
+	for _, c := range name {
+		if c != '_' && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func validLibrary(name string) bool {

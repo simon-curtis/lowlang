@@ -3,7 +3,9 @@ package compiler
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"lowlang/internal/ast"
 	"lowlang/internal/lexer"
 	"lowlang/internal/parser"
+	"lowlang/std"
 )
 
 type edge struct {
@@ -43,7 +46,7 @@ func load(path string, read func(name string) ([]byte, error)) (*loader, error) 
 		}
 	}
 	l := &loader{root: root(dir), edges: map[string][]edge{}, read: read}
-	if err := l.module("", entry); err != nil {
+	if err := l.module("", entry, l.read, true); err != nil {
 		return nil, err
 	}
 	for len(l.pending) > 0 {
@@ -89,6 +92,9 @@ func (l *loader) imported(e edge) error {
 	if _, done := l.edges[e.to]; done {
 		return nil
 	}
+	if name, ok := strings.CutPrefix(e.to, "std/"); ok {
+		return l.standard(e, name)
+	}
 	dir := filepath.Join(l.root, filepath.FromSlash(e.to))
 	files, err := sources(dir)
 	if errors.Is(err, os.ErrNotExist) || (err == nil && len(files) == 0) {
@@ -97,19 +103,39 @@ func (l *loader) imported(e edge) error {
 	if err != nil {
 		return err
 	}
-	return l.module(e.to, files)
+	return l.module(e.to, files, l.read, true)
 }
 
-func (l *loader) module(path string, files []string) error {
-	l.edges[path] = []edge{}
+func (l *loader) standard(e edge, name string) error {
+	entries, err := fs.ReadDir(std.Files, name)
+	if err != nil {
+		return fmt.Errorf("%s: cannot find standard module %s", e.pos, e.to)
+	}
+	var files []string
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".low") {
+			files = append(files, path.Join("std", name, entry.Name()))
+		}
+	}
+	return l.module(e.to, files, readStandard, false)
+}
+
+func readStandard(name string) ([]byte, error) {
+	return std.Files.ReadFile(strings.TrimPrefix(name, "std/"))
+}
+
+func (l *loader) module(module string, files []string, read func(name string) ([]byte, error), watched bool) error {
+	l.edges[module] = []edge{}
 	for _, name := range files {
-		file, err := l.parseFile(name)
+		file, err := parseFile(name, read)
 		if err != nil {
 			return err
 		}
-		file.Module = path
+		file.Module = module
 		l.files = append(l.files, file)
-		l.sources = append(l.sources, name)
+		if watched {
+			l.sources = append(l.sources, name)
+		}
 		if err := l.link(file); err != nil {
 			return err
 		}
@@ -131,8 +157,8 @@ func (l *loader) link(file *ast.File) error {
 	return nil
 }
 
-func (l *loader) parseFile(name string) (*ast.File, error) {
-	src, err := l.read(name)
+func parseFile(name string, read func(name string) ([]byte, error)) (*ast.File, error) {
+	src, err := read(name)
 	if err != nil {
 		return nil, err
 	}

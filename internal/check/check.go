@@ -261,12 +261,22 @@ func (c *Checker) funcTypeName(t *ast.TypeName) *types.Type {
 }
 
 func (c *Checker) funcType(params []*types.Type, muts []bool, ret *types.Type, cfn bool) *types.Type {
-	t := types.NewFunc(params, muts, ret, cfn)
-	if known, ok := c.funcTypes[t.Name]; ok {
+	key := funcKey(params, muts, ret, cfn)
+	if known, ok := c.funcTypes[key]; ok {
 		return known
 	}
-	c.funcTypes[t.Name] = t
+	t := types.NewFunc(params, muts, ret, cfn)
+	c.funcTypes[key] = t
 	return t
+}
+
+func funcKey(params []*types.Type, muts []bool, ret *types.Type, cfn bool) string {
+	var b strings.Builder
+	for i, p := range params {
+		fmt.Fprintf(&b, "%p %t,", p, muts[i])
+	}
+	fmt.Fprintf(&b, "%p %t", ret, cfn)
+	return b.String()
 }
 
 func (c *Checker) signatureOf(fn *ast.Func, cfn bool) *types.Type {
@@ -1535,7 +1545,7 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 		e.Type = types.Bool
 	case lexer.Lt, lexer.LtEq, lexer.Gt, lexer.GtEq:
 		if t := c.operands(e, nil); !t.Ordered() && t != types.Never {
-			c.fail(e.Pos, "operator %s requires a number, found %s", e.Op, t)
+			c.fail(e.Pos, "operator %s requires a number or str, found %s", e.Op, t)
 		}
 		e.Type = types.Bool
 	case lexer.Percent, lexer.Amp, lexer.Pipe, lexer.Caret:
@@ -1554,7 +1564,7 @@ var builtins = map[string]bool{
 	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
 	"delete": true, "embed": true, "__str_raw": true,
 	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
-	"__bits": true, "__str_view": true, "__hash": true, "__zero": true,
+	"__bits": true, "__str_view": true, "__extend": true, "__hash": true, "__zero": true,
 	"__spawn": true, "__current": true, "__park": true, "__ready": true, "__lock": true, "__unlock": true, "__cas": true, "__panic": true,
 }
 
@@ -1641,7 +1651,26 @@ func (c *Checker) method(e *ast.Call, sel *ast.Selector, want *types.Type) {
 	e.Fn = &ast.Ident{Name: sel.Name, Pos: sel.Pos}
 	e.Args = append([]ast.Expr{receiver}, e.Args...)
 	e.Prepended = true
+	if fn := c.typeFunc(t, sel.Name); fn != nil {
+		if len(fn.Params) > 0 && fn.Params[0].Mut {
+			prependMut(e)
+		}
+		c.callFunc(e, fn, want)
+		return
+	}
 	c.call(e, want)
+}
+
+func (c *Checker) typeFunc(t *types.Type, name string) *ast.Func {
+	named := deref(t)
+	if named.Kind != types.StructKind && named.Kind != types.EnumKind || named.Module == c.file.Module {
+		return nil
+	}
+	fn := c.scope(named.Module).funcs[name]
+	if fn == nil || !fn.Pub {
+		return nil
+	}
+	return fn
 }
 
 func prependMut(e *ast.Call) {
@@ -1800,6 +1829,16 @@ func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 			c.fail(e.Pos, "__slice_ptr requires a slice")
 		}
 		e.Builtin, e.Type = name, c.raw(t.Elem)
+	case "__extend":
+		if len(e.Args) != 2 {
+			c.fail(e.Pos, "__extend takes 2 arguments")
+		}
+		r, ok := e.Args[0].(*ast.Ref)
+		if !ok || c.borrow(r) != c.slice(types.U8) {
+			c.fail(e.Pos, "__extend needs a mut []u8")
+		}
+		c.expectType(e.Args[1], types.Str)
+		e.Builtin, e.Type = name, types.Void
 	case "__str_view":
 		c.single(e, name)
 		c.expectType(e.Args[0], c.slice(types.U8))

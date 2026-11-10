@@ -180,6 +180,12 @@ rt_str_eq:
 1:
 	ret
 
+	.globl rt_copy
+rt_copy:
+	mov rcx, rdx
+	rep movsb
+	ret
+
 	.globl rt_grow
 rt_grow:
 	ENTER_RT

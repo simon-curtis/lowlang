@@ -61,7 +61,7 @@ let n = input |> parse()?
 - A named function is a value of its function type. `fn(params) -> R { body }` is a closure; parameter and result types may be left out when the expected function type supplies them, and a closure with no written result and no expected type returns nothing.
 - A closure captures the variables it names by reference, as Go does: it reads and assigns the variable itself, and the variable lives as long as any closure holding it. Each loop iteration binds fresh variables, so closures made in different iterations see different ones. A `mut` parameter cannot be captured.
 - A function value is called like a function. Values of function type can be stored in variables, fields, slices and maps, passed and returned; they cannot be compared or printed.
-- `x.f(args)` calls `f(x, args)`, so calls chain left to right: `"ab".repeat(3).first()`. `f` is any function callable by its plain name: a function in the current module, a function value in scope, a generic function or a builtin. A struct field of function type named `f` takes precedence, so `op.apply(v)` calls the stored function. When the first parameter is `mut`, `x` is passed as `mut` and must be a mutable place.
+- `x.f(args)` calls `f(x, args)`, so calls chain left to right: `"ab".repeat(3).first()`. When `x` is a struct or enum declared in another module, `f` is first looked up among that module's `pub` functions, so `b.write(s)` on a `strings.Builder` calls `strings.write`. Otherwise `f` is any function callable by its plain name: a function in the current module, a function value in scope, a generic function or a builtin. A struct field of function type named `f` takes precedence, so `op.apply(v)` calls the stored function. When the first parameter is `mut`, `x` is passed as `mut` and must be a mutable place.
 - `x |> f(args)` also calls `f(x, args)`, and `x |> f` calls `f(x)`. The right side is a call, a function name, a module function such as `text.repeat`, a closure, or a struct field holding a function, so `x |> ops.scale` calls the stored function and never a function named `scale`; any other expression is an error. `|>` has the lowest precedence of the binary operators and groups left to right, so `a + b |> f()` is `f(a + b)`. A trailing `?` applies to the call: `x |> parse()?` is `parse(x)?`. A `mut` first parameter receives `x` as `mut`, as with `x.f(args)`.
 - A line that starts with `|>` or `.` continues the expression on the line before it.
 
@@ -167,7 +167,7 @@ let copy = str(bytes(name))
 - Floats are formatted as the shortest decimal that reads back to the same value: positional for exponents from -6 to 20, otherwise `1.5e-7` or `1e+21`. Infinities print as `inf` and `-inf`, NaN as `NaN`.
 - `'a'` is a code point of type `u32`, or `u8` where one is expected.
 - `bytes(s)` copies a string into a `[]u8`; `str(b)` copies one back.
-- `==` and `!=` compare contents.
+- `==` and `!=` compare contents; `<`, `<=`, `>` and `>=` compare bytes in order, which for UTF-8 is code point order.
 
 ### Structs
 
@@ -408,8 +408,8 @@ let n = strtol(cstr("123abc"), mut end, 10)
 let pixels = view(buf, 64)
 ```
 
-- `extern "name" { ... }` at the top level of a file names a C library and declares its functions, with no bodies. `"c"` is the C library itself. A trailing `...` makes a function variadic. Declarations are private to their module unless marked `pub`.
-- A program that names no library is a static executable with no libc. A program that names any is a dynamic executable linked against libc and each named library.
+- `extern "name" { ... }` at the top level of a file names a C library and declares its functions, with no bodies. `"c"` is the C library itself. A trailing `...` makes a function variadic. `fn errno_location() -> ptr[i32] = "__errno_location"` gives a function a LowLang name different from its C symbol, for symbols that start with `__` or are LowLang keywords. Declarations are private to their module unless marked `pub`.
+- A library is linked when code reachable from `main` calls or takes the address of one of the functions its `extern` block declares, so importing a module that declares C functions costs nothing until one is used. A program that uses no library is a static executable with no libc. A program that uses any is a dynamic executable linked against libc and each used library.
 - C signatures use C types: integers, floats, `bool`, `ptr` and `ptr[T]`, and `extern struct`s by value. A `mut` parameter passes the address of a LowLang place for the duration of the call, as C# passes `ref`; C may read and write through it.
 - `ptr[T]` is a nullable pointer to C memory and `ptr` is `void*`; `null` takes its type from context, and `ptr` converts to and from any `ptr[T]`. `==` and `!=` compare addresses.
 - `view(p, n)` is a `[]T` over `n` elements at `p`, bounds-checked like any slice; `load(p)` and `store(p, v)` read and write one `T`.
@@ -512,7 +512,7 @@ fn main() {
 ```
 
 - A module is a directory: every `.low` file in it shares one namespace, so files of a module need no imports between them.
-- The project root is the nearest directory, starting at the entry, that holds a `low.mod` file; without one it is the entry's directory. `import ui/text` loads `<root>/ui/text/`.
+- The project root is the nearest directory, starting at the entry, that holds a `low.mod` file; without one it is the entry's directory. `import ui/text` loads `<root>/ui/text/`. A path starting with `std/` names a module of the standard library, which is compiled into `low`, so a project directory named `std` cannot be imported.
 - `low build dir` builds the directory as the entry module. `low build file.low` builds that one file as the entry module, without the other files beside it.
 - Imports come before declarations and apply to their file. A module is used through its last path segment, `text.shout(...)`, or through a name given with `import t = ui/text`. Types are written `geometry.Shape` and built with `geometry.Point { ... }`; a variant can be named `geometry.Shape.Dot` or, where the type is expected, `Dot`.
 - Declarations and struct fields are private to their module unless marked `pub`. A `pub` enum's variants are public. A struct with private fields without defaults cannot be built with a literal outside its module.
@@ -555,7 +555,7 @@ let pick: fn(i64, i64) -> i64 = max
 - Functions, structs and enums take type parameters in brackets after their name. Generic types are written with arguments, `Stack[i64]` or `geometry.Labelled[str]`.
 - A constraint lists what a type parameter supports, joined with `+`:
   - `Eq` allows `==` and `!=`, and is met by numbers, `bool`, `str`, pointers, channels, and structs and enums whose fields are all `Eq`.
-  - `Ord` adds `<`, `<=`, `>` and `>=`, and is met by numbers.
+  - `Ord` adds `<`, `<=`, `>` and `>=`, and is met by numbers and `str`.
   - `Hash` adds use as a map key, and is met by integers, `bool`, `str` and pointers.
   - `Number` adds arithmetic, numeric literals, conversion with `T(x)` and `print`.
   - `Integer` adds bitwise operators and shifts and implies `Hash`.
@@ -598,6 +598,33 @@ wait_readable(fd)
 - `select` waits on several operations at once and runs the arm of the first that can proceed. Arms are `name = <-c`, `<-c`, `c <- v`, `after(ms)` and `else`. Channel and value expressions are evaluated first, in order; ready arms are taken in order; `else` runs when nothing is ready; without `else` the green thread waits, and `after(ms)` fires once `ms` milliseconds pass. `select` is an expression like `match`.
 - `sleep(ms)` pauses the green thread. `wait_readable(fd)` and `wait_writable(fd)` wait until a file descriptor is ready, using epoll; one green thread may wait on a descriptor at a time.
 - A program ends when `main` returns, whatever other green threads are doing. When every green thread is waiting and nothing can wake one, the program panics with `every green thread is blocked forever`. A green thread that exhausts its stack panics with `stack overflow`.
+
+### Standard library
+
+```low
+import std/fs
+import std/strings
+
+fn main() ! fs.FsError {
+    let text = fs.read_file("notes.txt")?
+    var out = strings.Builder {}
+    for line in strings.lines(text) {
+        out.write(strings.trim(line) |> strings.to_upper())
+        out.write_char('\n')
+    }
+    fs.write_file("upper.txt", out.build())?
+}
+```
+
+- The standard library is LowLang source under `std/`, embedded in the compiler and imported as `std/<name>`. Its C functions are called through `extern` blocks, so a program links libc or libm only when it reaches one of them.
+- `std/strings`: `Builder` with `write`, `write_byte`, `write_char`, `length` and `build`; `split` (an empty separator splits into code points), `fields`, `lines` (dropping a final empty line and `\r` before `\n`), `chars`, `join`, `repeat`, `replace`, `index` and `last_index` as `i64?` byte offsets, `contains`, `count`, `has_prefix`, `has_suffix`, `trim`, `trim_start`, `trim_end`, `trim_prefix`, `trim_suffix`, ASCII `to_upper` and `to_lower`, `char_count`, `from_char`, and `pad_left` and `pad_right` to a width in code points.
+- `std/conv`: `parse_int`, `parse_radix` (bases 2 to 36), `parse_float` and `parse_bool` fail with `ParseError`: `Empty`, `Invalid(at)` with the byte offset of the first bad character, or `Overflow`. `radix` and `hex` format integers; `fixed(x, places)` formats a float with a fixed number of decimals. `parse_float` uses `strtod` and `fixed` uses `snprintf`, for correctly rounded results.
+- `std/math`: libm's trigonometric, hyperbolic, exponential and rounding functions, `pi`, `tau`, `e`, `infinity`, `nan`, `is_nan`, `is_inf`, generic `abs`, `min`, `max` and `clamp`, and integer `ipow` and `gcd`.
+- `std/slices`: `contains`, `index`, `clone`, `concat`, `reverse`, `map`, `filter`, `fold`, `any`, `all`, `sum`, `min` and `max` as optionals, `sorted`, and an unstable in-place `sort` and `sort_by`: a quicksort with median-of-three pivots that recurses into the smaller side and finishes runs of 16 or fewer with insertion sort. Slices are not named types, so these are called with a pipe: `xs |> slices.sort()`.
+- `std/fs`: `read_file`, `write_file`, `append_file`, `exists`, `remove`, `make_dir`, `remove_dir`, `rename_path` and `list_dir`, failing with `FsError`: `NotFound`, `Denied`, `Exists`, `IsDirectory`, `NotDirectory`, `NotEmpty` or `Other(errno)`. Calls interrupted by a signal are retried, and descriptors are closed by `drop` on every path.
+- `std/io`: `out` and `err` write without a newline and `err_line` with one; `stdin()` returns a `Reader` whose `read_line` returns lines without `\n` or `\r\n` until `none`, and whose `read_all` returns the rest of the input.
+- `std/os`: `env` as `str?`, `set_env`, `unset_env`, `pid`, `exit`, and `args`, read from `/proc/self/cmdline`.
+- `std/time`: `now` returns a monotonic `Instant`; `elapsed` and `between` return a `Duration` in nanoseconds with `micros`, `millis` and `seconds`; `unix` and `unix_nanos` read the wall clock.
 
 ## Compiler
 
@@ -681,7 +708,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Every value records whether it may hold a heap pointer. Loads, parameters and call results take this from their type's word layout, where an enum word counts as a pointer if any variant puts one there; constants, typed arithmetic, string literals and frame addresses never do; untyped address arithmetic and anything unclassified count as pointers; a phi holds a pointer if any input may.
 - A `str` is two words and a slice three. An element access computes `pointer + index * stride` after a `check` instruction, which compares unsigned and jumps to the index panic; packed elements load with `movzx`, `movsxd` or a 32-bit `mov` and store at their width.
 - A map `[K: V]` is a pointer to the prelude's generic `__Map[K, V]`, whose `entries` slice holds `__Entry[K, V]` records of a live flag, the key and the value. An open-addressing index of entry numbers with linear probing finds them; deleted entries leave tombstones until the next rebuild, which compacts the entries in order and resizes the index to keep it at most three quarters full. Integer, `bool` and pointer keys hash their word; `str` keys hash their bytes with FNV-1a. Every concrete map type instantiates `__map_new`, `__map_get`, `__map_set`, `__map_delete`, `__map_len`, `__map_next`, `__map_key` and `__map_value` for its key and value types, and map literals, lookups, assignments, `delete`, `.len` and loops become calls to them. A compound assignment such as `m[k] += v` is a get, the operation on the value or zero, and a set.
-- `push` and the formatting helpers call the runtime's `rt_grow` and the prelude; the buffer behind an interpolation lives in a frame slot passed as a `mut` argument.
+- `push` and the formatting helpers call the runtime's `rt_grow` and the prelude; the buffer behind an interpolation lives in a frame slot passed as a `mut` argument. The prelude appends a whole string to a `[]u8` with `__extend`, which grows the buffer at most once and copies the bytes with the runtime's `rt_copy`, so concatenation, interpolation, `bytes` and `str(b)` copy in bulk. String ordering calls the prelude's `__str_cmp`.
 - Unreachable blocks are pruned after construction.
 
 ### Code generation
@@ -750,12 +777,13 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - Optionals `T?` with `none`, `some`, `??` and implicit wrapping.
 - `mut` parameters.
 - Pointers, `new`, and a garbage-collected heap.
-- Range, slice and string loops; slice literals, indexing, slicing and `push`; string interpolation, concatenation and comparison.
+- Range, slice and string loops; slice literals, indexing, slicing and `push`; string interpolation, concatenation, equality and ordering.
 - Map literals, lookups, entry assignment, `delete` and map loops.
 - Builtins `print` for numbers, `bool` and `str`; `bytes` and `str`.
 - Modules as directories, imports, and `pub` visibility.
+- A standard library of strings, number parsing and formatting, math, slices, files, standard input and output, the process environment and clocks.
 - `embed` for compile-time file contents.
-- `extern` blocks naming C libraries and declaring their functions, and dynamic linking against libc when any is named.
+- `extern` blocks naming C libraries and declaring their functions, and dynamic linking against libc and the libraries whose functions reachable code uses.
 - C interop: System V calls, `extern struct`, `ptr` and `ptr[T]`, `view`, `load`, `store`, `cstr`, `str(p)`, `pin` and `unpin`.
 - `defer`, and droppable structs with `drop` and move-only `using` bindings.
 - Generic functions, structs and enums with built-in constraints, compiled per type; maps built on generic prelude code.
