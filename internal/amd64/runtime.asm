@@ -209,13 +209,22 @@ rt_grow:
 	push rsi
 	push rdx
 	push rcx
-	call rt_heap_acquire
-	pop rsi
-	pop rdi
-	add rdi, 7
+	lea rdi, [rdx+7]
 	shr rdi, 3
+	mov rsi, rcx
+	cmp rdi, 1
+	adc rdi, 0
+	cmp rdi, ALLOC_SMALL
+	ja 1f
+	call rt_alloc_small
+	jmp 2f
+1:
+	call rt_heap_acquire
 	call rt_alloc_body
 	mov qword ptr [rip+rt_heap_lock], 0
+2:
+	pop rcx
+	pop rdx
 	pop rcx
 	pop rsi
 	mov rdi, rax
@@ -370,13 +379,22 @@ rt_set_start:
 	sub rax, [rip+rt_heap_start]
 	shr rax, 3
 	mov rcx, [rip+rt_bitmap]
-	bts qword ptr [rcx], rax
+	lock bts qword ptr [rcx], rax
+	jmp rt_set_summaries
+
+rt_set_summaries:
 	shr rax, 6
 	mov rcx, [rip+rt_summary1]
-	bts qword ptr [rcx], rax
+	bt qword ptr [rcx], rax
+	jc 1f
+	lock bts qword ptr [rcx], rax
+1:
 	shr rax, 6
 	mov rcx, [rip+rt_summary2]
-	bts qword ptr [rcx], rax
+	bt qword ptr [rcx], rax
+	jc 2f
+	lock bts qword ptr [rcx], rax
+2:
 	ret
 
 rt_clear_start:
@@ -417,11 +435,185 @@ rt_free_chunk:
 	.globl rt_alloc
 rt_alloc:
 	ENTER_RT
+	cmp rdi, 1
+	adc rdi, 0
+	cmp rdi, ALLOC_SMALL
+	jbe rt_alloc_small
 	push rsi
 	call rt_heap_acquire
 	pop rsi
 	call rt_alloc_body
 	mov qword ptr [rip+rt_heap_lock], 0
+	ret
+
+rt_alloc_small:
+	lea rdx, [rdi+1]
+1:
+	TLS_GET r8, TLS_M
+	mov rax, [r8+M_ALLOC_CUR]
+	mov r9, [r8+M_ALLOC_END]
+	test rax, rax
+	jz 5f
+	lea rcx, [rax+8*rdx]
+	cmp rcx, r9
+	ja 5f
+	lea r10, [rcx+8]
+	cmp r10, r9
+	jne 2f
+	mov rcx, r9
+	inc rdx
+2:
+	mov [r8+M_ALLOC_CUR], rcx
+	shl rdx, 3
+	test rsi, rsi
+	jnz 3f
+	or rdx, 4
+3:
+	mov [rax], rdx
+	mov r9, rax
+	mov rcx, rax
+	sub rcx, [rip+rt_heap_start]
+	shr rcx, 3
+	mov rdx, [rip+rt_bitmap]
+	cmp rax, [r8+M_ALLOC_LO]
+	jb 4f
+	cmp rax, [r8+M_ALLOC_HI]
+	jae 4f
+	bts qword ptr [rdx], rcx
+	jmp 6f
+4:
+	lock bts qword ptr [rdx], rcx
+6:
+	mov rax, rcx
+	call rt_set_summaries
+	lea rax, [r9+8]
+	ret
+5:
+	push rdx
+	push rsi
+	mov rdi, rdx
+	call rt_alloc_refill
+	pop rsi
+	pop rdx
+	jmp 1b
+
+rt_alloc_retire:
+	test rdi, rdi
+	jz 1f
+	sub rsi, rdi
+	shr rsi, 3
+	cmp rsi, 2
+	jb 1f
+	jmp rt_free_chunk
+1:
+	ret
+
+rt_alloc_refill:
+	push rbx
+	push r12
+	push r13
+	mov r12, rdi
+	call rt_heap_acquire
+	TLS_GET rbx, TLS_M
+	mov rdi, [rbx+M_ALLOC_CUR]
+	mov rsi, [rbx+M_ALLOC_END]
+	mov qword ptr [rbx+M_ALLOC_CUR], 0
+	mov qword ptr [rbx+M_ALLOC_END], 0
+	call rt_alloc_retire
+	mov rax, [rip+rt_alloc_since]
+	add rax, ALLOC_BUFFER
+	mov [rip+rt_alloc_since], rax
+	cmp rax, [rip+rt_gc_threshold]
+	jb 1f
+	call rt_gc
+1:
+	lea rcx, [rip+rt_free_large]
+2:
+	mov rax, [rcx]
+	test rax, rax
+	jz 5f
+	mov rdx, [rax]
+	shr rdx, 3
+	cmp rdx, r12
+	jae 3f
+	lea rcx, [rax+8]
+	jmp 2b
+3:
+	mov r8, [rax+8]
+	mov [rcx], r8
+	mov r13, rdx
+	cmp r13, ALLOC_BUFFER+2
+	jb 8f
+	push rax
+	lea rdi, [rax+8*ALLOC_BUFFER]
+	lea rsi, [r13-ALLOC_BUFFER]
+	call rt_free_chunk
+	pop rax
+	mov r13, ALLOC_BUFFER
+	jmp 8f
+5:
+	mov rcx, 63
+6:
+	cmp rcx, r12
+	jb 7f
+	lea rdx, [rip+rt_free_small]
+	mov rax, [rdx+8*rcx]
+	test rax, rax
+	jnz 4f
+	dec rcx
+	jmp 6b
+4:
+	mov r8, [rax+8]
+	mov [rdx+8*rcx], r8
+	mov r13, rcx
+	jmp 8f
+7:
+	mov r13, ALLOC_BUFFER
+	mov rax, [rip+rt_heap_bump]
+	lea rdx, [rax+8*ALLOC_BUFFER]
+	cmp rdx, [rip+rt_heap_end]
+	ja rt_panic_oom
+	HEAP_COMMIT rdx
+	mov [rip+rt_heap_bump], rdx
+8:
+	mov rdi, rax
+	mov rcx, r13
+	mov rdx, rax
+	xor eax, eax
+	rep stosq
+	mov [rbx+M_ALLOC_CUR], rdx
+	lea rax, [rdx+8*r13]
+	mov [rbx+M_ALLOC_END], rax
+	and rax, -512
+	mov [rbx+M_ALLOC_HI], rax
+	add rdx, 511
+	and rdx, -512
+	mov [rbx+M_ALLOC_LO], rdx
+	mov qword ptr [rip+rt_heap_lock], 0
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+rt_alloc_retire_all:
+	push rbx
+	push r12
+	xor r12d, r12d
+1:
+	cmp r12, [rip+rt_nm]
+	jae 2f
+	lea rax, [rip+rt_allm]
+	mov rbx, [rax+8*r12]
+	inc r12
+	mov rdi, [rbx+M_ALLOC_CUR]
+	mov rsi, [rbx+M_ALLOC_END]
+	mov qword ptr [rbx+M_ALLOC_CUR], 0
+	mov qword ptr [rbx+M_ALLOC_END], 0
+	call rt_alloc_retire
+	jmp 1b
+2:
+	pop r12
+	pop rbx
 	ret
 
 rt_alloc_body:
@@ -615,6 +807,7 @@ rt_gc:
 	TLS_GET rax, TLS_G
 	mov [rax+G_SCANLO], rsp
 	call rt_world_stop
+	call rt_alloc_retire_all
 	mov r15, [rip+rt_mark_base]
 	lea rdi, [rip+rt_pins]
 	mov rsi, [rip+rt_pin_count]
