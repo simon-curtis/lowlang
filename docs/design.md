@@ -312,6 +312,16 @@ print(shader.len)
 - The bytes live in the binary's read-only data, aligned to 16 bytes; nothing is copied at run time. Indexing, slicing, `.len` and `bytes(...)` work as on any string.
 - A missing file is a compile error. `low dev` watches embedded files, and a change to one reloads the functions that embed it.
 
+### C libraries
+
+```low
+extern "vulkan" {}
+extern "wayland-client" {}
+```
+
+- `extern "name" { }` at the top level of a file names a C library the program links. `"c"` is the C library itself.
+- A program that names no library is a static executable with no libc. A program that names any is a dynamic executable linked against libc and each named library.
+
 ### Modules
 
 ```low
@@ -375,13 +385,19 @@ Written in Go. Pipeline:
 | Check | `internal/check` | types attached to the tree |
 | Build IR | `internal/ir` | SSA form, one value per machine word |
 | Codegen | `internal/amd64` | x86-64 GNU assembly |
-| Assemble and link | `as`, `ld` | static ELF binary |
+| Assemble and link | `as`, `ld` | static or dynamic ELF binary |
 
 The `low` command lives in `cmd/low`; the pipeline it shares with hot reload lives in `internal/compiler`. `low ir` prints the SSA form and `low asm` the generated assembly.
 
 `internal/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles. Every file records its module path, and every source position its file, so errors name the file they come from. The checker keeps a scope of types and functions per module; the prelude belongs to the entry module, and its `__` names cannot clash with anything else. A function in module `ui/text` becomes the symbol `fn_ui.text.shout`, and types display with their module path, such as `geometry.Circle`.
 
-The runtime, `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls.
+The runtime, `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls. It ends the process with `exit_group`, so every thread stops.
+
+### Linking
+
+- A static program is linked with `ld -static` and starts at the generated `_start`, which records the stack top, initialises the heap and calls `main`.
+- A dynamic program is linked with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2` against glibc's `crt1.o`, `crti.o` and `crtn.o`, then `-l<name>` for each library and `-lc`. The start files are looked for in `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/lib/x86_64-linux-gnu`. glibc's start-up code calls the generated C `main`, which saves its caller's `rbp`, clears it so the collector's frame walk ends at LowLang's outermost frame, records the stack top, initialises the heap, runs the program and returns 0, letting libc run its exit handlers. An error from `main` still prints and exits with status 1.
+- The runtime never touches `fs`, which glibc owns for thread-local storage in a dynamic program.
 
 `internal/compiler/prelude.low` is LowLang source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, the map table, integer formatting, and float formatting with Burger and Dybvig's free-format algorithm over big integers of 32-bit limbs. Its names start with `__`, which user code cannot use, and two intrinsics are available only there: `__bits` gives a float's bit pattern and `__str_view` turns a `[]u8` into a `str` without copying. Functions unreachable from `main` are dropped, so a program that formats no floats carries none of this code.
 
@@ -432,7 +448,7 @@ On fib(38) this runs at 1.25x Go's time.
 `low dev app.low` or `low dev app/` builds a dev binary, runs it, and watches every source file of every loaded module, every embedded file, and the file lists of their directories. On save:
 
 - A file that fails to compile is reported and the running program is left alone.
-- The program is restarted when a struct or enum layout changes, when an existing function's signature changes, or when `main` changes. A running frame of old code may still call any function, so it must keep the old calling convention and data layout; `main` never returns to pick up new code.
+- The program is restarted when the set of linked libraries changes, when a struct or enum layout changes, when an existing function's signature changes, or when `main` changes. A running frame of old code may still call any function, so it must keep the old calling convention and data layout; `main` never returns to pick up new code.
 - Otherwise every function whose generated assembly differs from the running version is recompiled, including callers whose code changed only because a callee did. New functions are included. Heap, stack and all live values are kept.
 
 Mechanism:
@@ -447,7 +463,7 @@ Mechanism:
 
 `internal/hot` tests reload against running programs: state kept across a code swap, functions added, compile errors leaving the program running, heap data surviving a reload while the collector runs, and restarts on layout and signature changes.
 
-`go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
+`go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. A program with a `.needed` file must link exactly those shared libraries; every other program must be static with no interpreter. Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
 
 ## Implemented
 
@@ -464,14 +480,14 @@ Mechanism:
 - Builtins `print` for numbers, `bool` and `str`; `bytes` and `str`.
 - Modules as directories, imports, and `pub` visibility.
 - `embed` for compile-time file contents.
+- `extern` blocks naming C libraries, and dynamic linking against libc when any is named.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
-2. C interop:
-   - `extern fn` declarations.
+1. C interop:
+   - Function declarations inside `extern` blocks.
    - System V ABI thunks: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` and `xmm0` to `xmm7`, struct classification, 16-byte stack alignment.
    - C struct layout with natural alignment, alongside the one-word-per-scalar layout.
    - A nullable raw pointer type separate from `*T`.
@@ -479,14 +495,14 @@ Mechanism:
    - Unmanaged pointer-plus-length views over mmap'd and GPU-mapped memory.
    - Explicit release of file descriptors and mappings.
    - The garbage collector never frees memory held only by C.
-3. Function values, and C-callable function pointers for callbacks.
-4. Generics, with type erasure or dynamic dispatch for custom elements and views.
-5. Green-thread scheduler, channels, `select`:
+2. Function values, and C-callable function pointers for callbacks.
+3. Generics, with type erasure or dynamic dispatch for custom elements and views.
+4. Green-thread scheduler, channels, `select`:
     - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
     - C calls run on a large system stack rather than the green-thread stack.
     - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-6. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-7. GPU UI library modelled on Zed's GPUI, Linux first:
+5. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+6. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
@@ -495,5 +511,5 @@ Mechanism:
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-8. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-9. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+7. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+8. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

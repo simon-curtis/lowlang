@@ -121,9 +121,10 @@ type Func struct {
 }
 
 type Program struct {
-	Funcs   []*Func
-	Main    *Func
-	MainErr *types.Type
+	Libraries []string
+	Funcs     []*Func
+	Main      *Func
+	MainErr   *types.Type
 }
 
 func (f *Func) newBlock() *Block {

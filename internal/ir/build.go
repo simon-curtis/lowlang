@@ -3,6 +3,7 @@ package ir
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 
 	"lowlang/internal/ast"
@@ -68,7 +69,21 @@ func Build(files []*ast.File) *Program {
 		b.finalize()
 	}
 	p.Funcs = reachable(p.Main, p.Funcs)
+	p.Libraries = libraries(files)
 	return p
+}
+
+func libraries(files []*ast.File) []string {
+	var libs []string
+	for _, f := range files {
+		for _, e := range f.Externs {
+			if !slices.Contains(libs, e.Library) {
+				libs = append(libs, e.Library)
+			}
+		}
+	}
+	slices.Sort(libs)
+	return libs
 }
 
 func reachable(main *Func, funcs []*Func) []*Func {

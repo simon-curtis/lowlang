@@ -178,11 +178,42 @@ func (p *Parser) declaration(f *ast.File) {
 		d := p.structDecl()
 		d.Pub, d.File = pub, f
 		f.Structs = append(f.Structs, d)
+	case lexer.Extern:
+		if pub {
+			p.fail(t.Pos, "extern blocks cannot be pub")
+		}
+		f.Externs = append(f.Externs, p.extern())
 	case lexer.Import:
 		p.fail(t.Pos, "imports must come before declarations")
 	default:
 		p.fail(t.Pos, "expected fn, enum or struct, found %s", describe(t))
 	}
+}
+
+func (p *Parser) extern() *ast.Extern {
+	pos := p.expect(lexer.Extern).Pos
+	name := p.expect(lexer.String)
+	if !validLibrary(name.Text) {
+		p.fail(name.Pos, "invalid library name %q", name.Text)
+	}
+	p.lines(func() {
+		p.fail(p.tok().Pos, "expected }, found %s", describe(p.tok()))
+	})
+	return &ast.Extern{Library: name.Text, Pos: pos}
+}
+
+func validLibrary(name string) bool {
+	if name == "" || name[0] == '-' {
+		return false
+	}
+	for _, c := range name {
+		ok := c == '_' || c == '.' || c == '+' || c == '-' ||
+			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Parser) importDecl() *ast.Import {

@@ -9,9 +9,15 @@ type File struct {
 	Path    string
 	Module  string
 	Imports []*Import
+	Externs []*Extern
 	Enums   []*EnumDecl
 	Structs []*StructDecl
 	Funcs   []*Func
+}
+
+type Extern struct {
+	Library string
+	Pos     lexer.Pos
 }
 
 type Import struct {

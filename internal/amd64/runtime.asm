@@ -182,7 +182,7 @@ rt_die:
 	mov edx, 1
 	call rt_write
 	pop rdi
-	mov eax, 60
+	mov eax, 231
 	syscall
 
 rt_panic:

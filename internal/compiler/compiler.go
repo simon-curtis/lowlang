@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"lowlang/internal/ast"
 	"lowlang/internal/check"
@@ -57,7 +58,7 @@ func Assemble(ctx context.Context, asm, object string) error {
 	return tool(ctx, "as", "-o", object, source)
 }
 
-func Link(ctx context.Context, asm, output string) error {
+func Link(ctx context.Context, asm, output string, libraries []string) error {
 	dir, err := os.MkdirTemp("", "low-build-")
 	if err != nil {
 		return err
@@ -67,7 +68,44 @@ func Link(ctx context.Context, asm, output string) error {
 	if err := Assemble(ctx, asm, object); err != nil {
 		return err
 	}
-	return tool(ctx, "ld", "-static", "-o", output, object)
+	if len(libraries) == 0 {
+		return tool(ctx, "ld", "-static", "-o", output, object)
+	}
+	args, err := dynamicArgs(output, object, libraries)
+	if err != nil {
+		return err
+	}
+	return tool(ctx, "ld", args...)
+}
+
+const dynamicLinker = "/lib64/ld-linux-x86-64.so.2"
+
+var startFileDirs = []string{"/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"}
+
+func startFiles() (string, error) {
+	for _, dir := range startFileDirs {
+		if _, err := os.Stat(filepath.Join(dir, "crt1.o")); err == nil {
+			return dir, nil
+		}
+	}
+	return "", fmt.Errorf("cannot find the C start files (crt1.o) in %s; install the C library development files", strings.Join(startFileDirs, ", "))
+}
+
+func dynamicArgs(output, object string, libraries []string) ([]string, error) {
+	dir, err := startFiles()
+	if err != nil {
+		return nil, err
+	}
+	args := []string{
+		"-o", output, "-dynamic-linker", dynamicLinker, "-L", dir,
+		filepath.Join(dir, "crt1.o"), filepath.Join(dir, "crti.o"), object,
+	}
+	for _, lib := range libraries {
+		if lib != "c" {
+			args = append(args, fmt.Sprintf("-l%s", lib))
+		}
+	}
+	return append(args, "-lc", filepath.Join(dir, "crtn.o")), nil
 }
 
 func LinkAt(ctx context.Context, asm, output, against string, address uint64) error {

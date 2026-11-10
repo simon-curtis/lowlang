@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"debug/elf"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -87,6 +89,30 @@ func runFixture(t *testing.T, path string) {
 		t.Errorf("exit error %v, expected panic %v", runErr, panics)
 	}
 	checkMemory(t, path, cmd.ProcessState)
+	checkLinking(t, path, binary)
+}
+
+func checkLinking(t *testing.T, path, binary string) {
+	f, err := elf.Open(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	needed, err := f.ImportedLibraries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(needed)
+	want, ok := expected(t, path, ".needed")
+	if !ok {
+		if len(needed) > 0 || slices.ContainsFunc(f.Progs, func(p *elf.Prog) bool { return p.Type == elf.PT_INTERP }) {
+			t.Errorf("expected a static binary, found shared libraries %v", needed)
+		}
+		return
+	}
+	if got := strings.Join(needed, "\n"); got != strings.TrimSpace(want) {
+		t.Errorf("shared libraries:\n%s\nwant:\n%s", got, strings.TrimSpace(want))
+	}
 }
 
 func checkMemory(t *testing.T, path string, state *os.ProcessState) {

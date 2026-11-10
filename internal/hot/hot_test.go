@@ -60,6 +60,25 @@ func writeFile(t *testing.T, path, src string) {
 	}
 }
 
+func TestDynamicReload(t *testing.T) {
+	f := newFixture(t, "extern \"c\" {}\n\n"+program("1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write("extern \"c\" {}\n\n" + program("2"))
+	f.reload()
+	f.waitFor(f.stdout, "0\n2\ntrue\n")
+	f.waitFor(f.stderr, "low: reloaded value in")
+	f.noRestart()
+}
+
+func TestLibraryChangeRestarts(t *testing.T) {
+	f := newFixture(t, program("1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write("extern \"m\" {}\n\n" + program("2"))
+	f.reload()
+	f.waitFor(f.stderr, "low: restarted: linked libraries changed")
+	f.waitFor(f.stdout, "0\n0\n2\n")
+}
+
 func TestRunWatchesModules(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "low.mod"), "")

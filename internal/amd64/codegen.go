@@ -151,7 +151,14 @@ func (g *Generator) callTarget(f *ir.Func) string {
 func (g *Generator) start(prog *ir.Program) {
 	g.fn = "start"
 	g.labels = 0
-	g.text.WriteString("\t.globl _start\n_start:\n")
+	dynamic := len(prog.Libraries) > 0
+	if dynamic {
+		g.text.WriteString("\t.globl main\nmain:\n")
+		g.emit("push rbp")
+		g.emit("xor ebp, ebp")
+	} else {
+		g.text.WriteString("\t.globl _start\n_start:\n")
+	}
 	g.emit("mov [rip+rt_stack_top], rsp")
 	g.emit("call rt_gc_init")
 	if g.table != nil {
@@ -176,8 +183,15 @@ func (g *Generator) start(prog *ir.Program) {
 		g.emit("call rt_error")
 		g.label(exit)
 	}
+	if dynamic {
+		g.emit("mov rsp, [rip+rt_stack_top]")
+		g.emit("pop rbp")
+		g.emit("xor eax, eax")
+		g.emit("ret")
+		return
+	}
 	g.emit("xor edi, edi")
-	g.emit("mov eax, 60")
+	g.emit("mov eax, 231")
 	g.emit("syscall")
 }
 

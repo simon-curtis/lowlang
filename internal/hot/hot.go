@@ -43,6 +43,7 @@ type Session struct {
 	funcs      map[string]string
 	signatures map[string]string
 	layout     string
+	libraries  []string
 	next       uint64
 	builds     int
 }
@@ -181,6 +182,9 @@ func (s *Session) Reload(ctx context.Context) error {
 }
 
 func (s *Session) restartReason(unit *compiler.Unit) string {
+	if !slices.Equal(unit.Program.Libraries, s.libraries) {
+		return "linked libraries changed"
+	}
 	if layout(unit.Files) != s.layout {
 		return "type layout changed"
 	}
@@ -221,7 +225,7 @@ func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string)
 	}
 	out := amd64.Generate(unit.Program, table)
 	binary := filepath.Join(s.dir, fmt.Sprintf("app%d", s.builds))
-	if err := compiler.Link(ctx, out.Asm, binary); err != nil {
+	if err := compiler.Link(ctx, out.Asm, binary, unit.Program.Libraries); err != nil {
 		return err
 	}
 	symbols, err := readSymbols(binary)
@@ -239,6 +243,7 @@ func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string)
 	s.binary, s.symbols = binary, symbols
 	s.table, s.funcs = table, out.Funcs
 	s.signatures, s.layout = signatures(unit.Files), layout(unit.Files)
+	s.libraries = unit.Program.Libraries
 	s.next = 0
 	s.logf("%s", reason)
 	return nil

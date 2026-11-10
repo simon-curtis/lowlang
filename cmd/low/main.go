@@ -103,11 +103,12 @@ func compile(path string) (string, error) {
 }
 
 func build(ctx context.Context, path, output string) error {
-	asm, err := compile(path)
+	unit, err := compiler.Analyse(path)
 	if err != nil {
 		return err
 	}
-	return compiler.Link(ctx, asm, output)
+	asm := amd64.Generate(unit.Program, nil).Asm
+	return compiler.Link(ctx, asm, output, unit.Program.Libraries)
 }
 
 func buildAndRun(ctx context.Context, path string) error {
