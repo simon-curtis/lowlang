@@ -1,0 +1,343 @@
+import std/crypto/ecdsa
+import std/crypto/ed25519
+import std/crypto/hash
+import std/crypto/rsa
+import std/io
+
+pub enum PrivateKey {
+    Rsa(key: rsa.PrivateKey)
+    Ecdsa(key: ecdsa.Key)
+    Ed25519(seed: []u8)
+}
+
+enum Scheme {
+    Pkcs1(digest: hash.Algorithm)
+    Pss(digest: hash.Algorithm)
+    Ec(digest: hash.Algorithm, curve: ecdsa.Curve?)
+    Ed
+}
+
+fn rsa_oid() -> str {
+    "1.2.840.113549.1.1.1"
+}
+
+fn ec_oid() -> str {
+    "1.2.840.10045.2.1"
+}
+
+fn ed25519_oid() -> str {
+    "1.3.101.112"
+}
+
+fn curve_by_oid(name: str) -> ecdsa.Curve? {
+    if name == "1.2.840.10045.3.1.7" {
+        return ecdsa.Curve.P256
+    }
+    if name == "1.3.132.0.34" {
+        return ecdsa.Curve.P384
+    }
+    none
+}
+
+fn hash_by_oid(name: str) -> hash.Algorithm? {
+    if name == "2.16.840.1.101.3.4.2.1" {
+        return hash.sha256()
+    }
+    if name == "2.16.840.1.101.3.4.2.2" {
+        return hash.sha384()
+    }
+    if name == "2.16.840.1.101.3.4.2.3" {
+        return hash.sha512()
+    }
+    none
+}
+
+fn scheme_by_code(code: i64) -> Scheme? {
+    if code == 0x0401 {
+        return Scheme.Pkcs1(hash.sha256())
+    }
+    if code == 0x0501 {
+        return Scheme.Pkcs1(hash.sha384())
+    }
+    if code == 0x0601 {
+        return Scheme.Pkcs1(hash.sha512())
+    }
+    if code == 0x0804 {
+        return Scheme.Pss(hash.sha256())
+    }
+    if code == 0x0805 {
+        return Scheme.Pss(hash.sha384())
+    }
+    if code == 0x0806 {
+        return Scheme.Pss(hash.sha512())
+    }
+    if code == 0x0403 {
+        return Scheme.Ec(hash.sha256(), ecdsa.Curve.P256)
+    }
+    if code == 0x0503 {
+        return Scheme.Ec(hash.sha384(), ecdsa.Curve.P384)
+    }
+    if code == 0x0807 {
+        return Scheme.Ed
+    }
+    none
+}
+
+fn hash_parameter(d: *Der, tag: u8) -> hash.Algorithm ! io.Error {
+    let wrapper = enter(d, tag)?
+    let algorithm = algorithm_id(wrapper)?
+    finish(wrapper)?
+    if algorithm.parameters.len > 0 {
+        whole(algorithm.parameters, 0x05)?
+    }
+    match hash_by_oid(algorithm.oid) {
+        some(a) => a
+        none => fail Unsupported
+    }
+}
+
+fn pss_parameters(parameters: []u8) -> hash.Algorithm ! io.Error {
+    let outer = whole(parameters, 0x30)?
+    let d = reader(outer.content)
+    let digest = hash_parameter(d, 0xA0)?
+    let mask = enter(d, 0xA1)?
+    let mgf = expect(mask, 0x30)?
+    finish(mask)?
+    let m = reader(mgf.content)
+    let mgf_id = expect(m, 0x06)?
+    let mgf_name = oid(mgf_id.content)?
+    let mgf_hash = algorithm_id(m)?
+    finish(m)?
+    let mgf_digest = match hash_by_oid(mgf_hash.oid) {
+        some(a) => a
+        none => fail Unsupported
+    }
+    if mgf_name != "1.2.840.113549.1.1.8" || mgf_digest.name != digest.name {
+        fail Unsupported
+    }
+    let salt_wrapper = enter(d, 0xA2)?
+    let salt = expect(salt_wrapper, 0x02)?
+    finish(salt_wrapper)?
+    let salt_length = small_int(salt.content)?
+    if salt_length != digest.size {
+        fail Unsupported
+    }
+    if !done(d) {
+        let trailer_wrapper = enter(d, 0xA3)?
+        let trailer = expect(trailer_wrapper, 0x02)?
+        finish(trailer_wrapper)?
+        let value = small_int(trailer.content)?
+        if value != 1 {
+            fail Malformed
+        }
+    }
+    finish(d)?
+    digest
+}
+
+fn rsa_parameters_valid(parameters: []u8) -> bool {
+    parameters.len == 0 || parameters.len == 2 && parameters[0] == 0x05 && parameters[1] == 0
+}
+
+fn certificate_scheme(c: Certificate) -> Scheme? {
+    let name = c.signature_algorithm
+    let parameters = c.signature_parameters
+    if name == "1.2.840.113549.1.1.11" && rsa_parameters_valid(parameters) {
+        return Scheme.Pkcs1(hash.sha256())
+    }
+    if name == "1.2.840.113549.1.1.12" && rsa_parameters_valid(parameters) {
+        return Scheme.Pkcs1(hash.sha384())
+    }
+    if name == "1.2.840.113549.1.1.13" && rsa_parameters_valid(parameters) {
+        return Scheme.Pkcs1(hash.sha512())
+    }
+    if name == "1.2.840.113549.1.1.10" {
+        let digest = pss_parameters(parameters) catch {
+            _ => return none
+        }
+        return Scheme.Pss(digest)
+    }
+    if parameters.len > 0 {
+        return none
+    }
+    if name == "1.2.840.10045.4.3.2" {
+        return Scheme.Ec(hash.sha256(), none)
+    }
+    if name == "1.2.840.10045.4.3.3" {
+        return Scheme.Ec(hash.sha384(), none)
+    }
+    if name == "1.2.840.10045.4.3.4" {
+        return Scheme.Ec(hash.sha512(), none)
+    }
+    if name == ed25519_oid() {
+        return Scheme.Ed
+    }
+    none
+}
+
+fn rsa_public(key: PublicKeyInfo) -> rsa.PublicKey? {
+    if key.algorithm != rsa_oid() {
+        return none
+    }
+    let parsed = rsa.parse_public(key.key) catch {
+        _ => return none
+    }
+    parsed
+}
+
+fn verify_with(key: PublicKeyInfo, scheme: Scheme, message: []u8, signature: []u8) -> bool {
+    match scheme {
+        Pkcs1(a) => {
+            let public = match rsa_public(key) {
+                some(k) => k
+                none => return false
+            }
+            let digest = hash.sum(a, message)
+            rsa.verify_pkcs1v15(public, a, digest, signature)
+        }
+        Pss(a) => {
+            let public = match rsa_public(key) {
+                some(k) => k
+                none => return false
+            }
+            let digest = hash.sum(a, message)
+            rsa.verify_pss(public, a, digest, signature)
+        }
+        Ec(a, wanted) => {
+            if key.algorithm != ec_oid() {
+                return false
+            }
+            let curve = match curve_by_oid(key.parameters) {
+                some(c) => c
+                none => return false
+            }
+            if wanted != none && wanted != curve {
+                return false
+            }
+            let digest = hash.sum(a, message)
+            ecdsa.verify(curve, key.key, digest, signature)
+        }
+        Ed => key.algorithm == ed25519_oid() && key.key.len == 32 && ed25519.verify(key.key, message, signature)
+    }
+}
+
+pub fn check_signature(issuer: Certificate, subject: Certificate) -> bool {
+    match certificate_scheme(subject) {
+        some(scheme) => verify_with(issuer.public_key, scheme, subject.tbs, subject.signature)
+        none => false
+    }
+}
+
+pub fn verify_signature(key: PublicKeyInfo, scheme: i64, message: []u8, signature: []u8) -> bool {
+    match scheme_by_code(scheme) {
+        some(s) => verify_with(key, s, message, signature)
+        none => false
+    }
+}
+
+pub fn sign(key: PrivateKey, scheme: i64, message: []u8) -> []u8 ! io.Error {
+    let s = match scheme_by_code(scheme) {
+        some(value) => value
+        none => fail Unsupported
+    }
+    match key {
+        Rsa(k) => {
+            match s {
+                Pkcs1(a) => {
+                    let digest = hash.sum(a, message)
+                    return rsa.sign_pkcs1v15(k, a, digest)
+                }
+                Pss(a) => {
+                    let digest = hash.sum(a, message)
+                    return rsa.sign_pss(k, a, digest)
+                }
+                _ => {}
+            }
+        }
+        Ecdsa(k) => {
+            match s {
+                Ec(a, curve) => {
+                    if curve == k.curve {
+                        let digest = hash.sum(a, message)
+                        return ecdsa.sign(k.curve, k.private, digest)
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ed25519(seed) => {
+            match s {
+                Ed => return ed25519.sign(seed, message)
+                _ => {}
+            }
+        }
+    }
+    fail Unsupported
+}
+
+fn pkcs8(body: *Der) -> PrivateKey ! io.Error {
+    let algorithm = algorithm_id(body)?
+    let wrapped = expect(body, 0x04)?
+    for !done(body) {
+        let tag = peek(body)
+        if tag != 0xA0 && tag != 0x81 && tag != 0xA1 {
+            fail Malformed
+        }
+        read(body)?
+    }
+    let inner = wrapped.content
+    if algorithm.oid == rsa_oid() {
+        if !rsa_parameters_valid(algorithm.parameters) {
+            fail Malformed
+        }
+        let k = rsa.parse_private(inner)?
+        return PrivateKey.Rsa(k)
+    }
+    if algorithm.oid == ec_oid() {
+        let p = whole(algorithm.parameters, 0x06)?
+        let curve_name = oid(p.content)?
+        let curve = match curve_by_oid(curve_name) {
+            some(c) => c
+            none => fail Unsupported
+        }
+        let k = ecdsa.parse_private(inner)?
+        if k.curve != curve {
+            fail Malformed
+        }
+        return PrivateKey.Ecdsa(k)
+    }
+    if algorithm.oid == ed25519_oid() {
+        if algorithm.parameters.len != 0 {
+            fail Malformed
+        }
+        let seed = whole(inner, 0x04)?
+        if seed.content.len != 32 {
+            fail Malformed
+        }
+        return PrivateKey.Ed25519(seed.content)
+    }
+    fail Unsupported
+}
+
+pub fn parse_private_key(der: []u8) -> PrivateKey ! io.Error {
+    let outer = whole(der, 0x30)?
+    let body = reader(outer.content)
+    let version = expect(body, 0x02)?
+    let next = peek(body)
+    if next == 0x30 {
+        let v = small_int(version.content)?
+        if v > 1 {
+            fail Unsupported
+        }
+        return pkcs8(body)
+    }
+    if next == 0x02 {
+        let k = rsa.parse_private(der)?
+        return PrivateKey.Rsa(k)
+    }
+    if next == 0x04 {
+        let k = ecdsa.parse_private(der)?
+        return PrivateKey.Ecdsa(k)
+    }
+    fail Malformed
+}
