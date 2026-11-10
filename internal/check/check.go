@@ -225,15 +225,9 @@ func (c *Checker) function(fn *ast.Func) {
 		if _, dup := c.scopes[0][p.Name]; dup {
 			c.fail(p.Pos, "parameter %s already declared", p.Name)
 		}
-		c.scopes[0][p.Name] = &ast.Local{
-			Name:    p.Name,
-			Type:    fn.ParamTypes[i],
-			Mutable: p.Mut,
-			Param:   true,
-			Ref:     p.Mut,
-			Offset:  16 + 8*fn.ParamWords,
-		}
-		fn.ParamWords += fn.ParamSize(i)
+		local := &ast.Local{Name: p.Name, Type: fn.ParamTypes[i], Mutable: p.Mut, Param: true, Ref: p.Mut}
+		c.scopes[0][p.Name] = local
+		fn.ParamLocals = append(fn.ParamLocals, local)
 	}
 	body := c.expr(fn.Body, c.okType())
 	if body.Kind == types.ResultKind && body != fn.RetType {
@@ -263,17 +257,8 @@ func (c *Checker) returnable(t *types.Type) bool {
 }
 
 func (c *Checker) declare(name string, t *types.Type, mutable bool) *ast.Local {
-	l := c.temp(t)
-	l.Name = name
-	l.Mutable = mutable
+	l := &ast.Local{Name: name, Type: t, Mutable: mutable}
 	c.scopes[len(c.scopes)-1][name] = l
-	return l
-}
-
-func (c *Checker) temp(t *types.Type) *ast.Local {
-	c.fn.FrameWords += t.Size()
-	l := &ast.Local{Type: t, Offset: -8 * c.fn.FrameWords}
-	c.fn.Locals = append(c.fn.Locals, l)
 	return l
 }
 
@@ -401,6 +386,9 @@ func (c *Checker) ref(r *ast.Ref, want *types.Type) {
 	place, t := c.place(r.X, r.Pos, "pass %s as mut", "mut argument must be a variable, a field, or a dereferenced pointer")
 	if t != want {
 		c.fail(r.Pos, "expected %s, found %s", want, t)
+	}
+	if place.Local != nil && !place.Local.Ref {
+		place.Local.Addressed = true
 	}
 	r.Place = place
 	r.Type = t
@@ -795,7 +783,6 @@ func (c *Checker) match(e *ast.Match, want *types.Type) {
 	if t.Kind != types.EnumKind {
 		c.fail(e.X.Position(), "cannot match on a value of type %s", t)
 	}
-	e.Temp = c.temp(t)
 	e.Type = c.arms(e.Arms, t, want, e.Pos)
 }
 
@@ -884,7 +871,6 @@ func (c *Checker) catch(e *ast.Catch) {
 		c.expectType(e.Fallback, t.Ok)
 		return
 	}
-	e.Temp = c.temp(t.Err)
 	arms := c.arms(e.Arms, t.Err, t.Ok, e.Pos)
 	if t.Ok != types.Void && arms != t.Ok && arms != types.Never {
 		c.fail(e.Pos, "catch arms must produce %s, found %s", t.Ok, arms)

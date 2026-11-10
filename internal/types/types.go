@@ -82,13 +82,6 @@ func (t *Type) Scalar() bool {
 	return t.size == 1
 }
 
-func (t *Type) StackWords() int {
-	if t.size > 1 {
-		return t.size
-	}
-	return 0
-}
-
 func (t *Type) Field(name string) *Field {
 	for _, f := range t.Fields {
 		if f.Name == name {

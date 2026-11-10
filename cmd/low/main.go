@@ -11,15 +11,16 @@ import (
 	"strings"
 
 	"lowlang/internal/amd64"
-	"lowlang/internal/check"
-	"lowlang/internal/lexer"
-	"lowlang/internal/parser"
+	"lowlang/internal/compiler"
+	"lowlang/internal/hot"
 )
 
 const usage = `usage:
   low build <file.low> [-o output]
   low run <file.low>
-  low asm <file.low>`
+  low asm <file.low>
+  low ir <file.low>
+  low dev <file.low>`
 
 type usageError struct{}
 
@@ -63,6 +64,15 @@ func run(ctx context.Context, args []string) error {
 		}
 		fmt.Print(asm)
 		return nil
+	case "ir":
+		unit, err := compiler.Analyse(path)
+		if err != nil {
+			return err
+		}
+		for _, f := range unit.Program.Funcs {
+			fmt.Print(f)
+		}
+		return nil
 	case "build":
 		output := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 		if len(args) == 4 && args[2] == "-o" {
@@ -73,27 +83,23 @@ func run(ctx context.Context, args []string) error {
 		return build(ctx, path, output)
 	case "run":
 		return buildAndRun(ctx, path)
+	case "dev":
+		session, err := hot.New(path, os.Stdout, os.Stderr)
+		if err != nil {
+			return err
+		}
+		defer session.Close()
+		return session.Run(ctx)
 	}
 	return usageError{}
 }
 
 func compile(path string) (string, error) {
-	src, err := os.ReadFile(path)
+	unit, err := compiler.Analyse(path)
 	if err != nil {
 		return "", err
 	}
-	tokens, err := lexer.Lex(src)
-	if err != nil {
-		return "", fmt.Errorf("%s:%w", path, err)
-	}
-	file, err := parser.Parse(tokens)
-	if err != nil {
-		return "", fmt.Errorf("%s:%w", path, err)
-	}
-	if err := check.Check(file); err != nil {
-		return "", fmt.Errorf("%s:%w", path, err)
-	}
-	return amd64.Generate(file), nil
+	return amd64.Generate(unit.Program, nil).Asm, nil
 }
 
 func build(ctx context.Context, path, output string) error {
@@ -101,20 +107,7 @@ func build(ctx context.Context, path, output string) error {
 	if err != nil {
 		return err
 	}
-	dir, err := os.MkdirTemp("", "low-build-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(dir)
-	source := filepath.Join(dir, "main.s")
-	object := filepath.Join(dir, "main.o")
-	if err := os.WriteFile(source, []byte(asm), 0o644); err != nil {
-		return err
-	}
-	if err := tool(ctx, "as", "-o", object, source); err != nil {
-		return err
-	}
-	return tool(ctx, "ld", "-static", "-o", output, object)
+	return compiler.Link(ctx, asm, output)
 }
 
 func buildAndRun(ctx context.Context, path string) error {
@@ -135,13 +128,4 @@ func buildAndRun(ctx context.Context, path string) error {
 		return exitError{code: exit.ExitCode()}
 	}
 	return err
-}
-
-func tool(ctx context.Context, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s failed: %w\n%s", name, err, out)
-	}
-	return nil
 }

@@ -23,6 +23,9 @@ go build -o low ./cmd/low
 ./low run testdata/run/fib.low
 ./low build testdata/run/fib.low -o fib
 ./low asm testdata/run/fib.low
+./low dev app.low
 ```
+
+`low dev` runs the program and patches changed functions into it on every save, keeping its state.
 
 See [docs/design.md](docs/design.md) for the language design, what is implemented and the roadmap.

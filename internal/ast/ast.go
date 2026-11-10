@@ -83,17 +83,15 @@ type Param struct {
 }
 
 type Func struct {
-	Name       string
-	Params     []*Param
-	Result     *TypeName
-	Error      *TypeName
-	Body       *Block
-	Pos        lexer.Pos
-	ParamTypes []*types.Type
-	RetType    *types.Type
-	Locals     []*Local
-	FrameWords int
-	ParamWords int
+	Name        string
+	Params      []*Param
+	Result      *TypeName
+	Error       *TypeName
+	Body        *Block
+	Pos         lexer.Pos
+	ParamTypes  []*types.Type
+	RetType     *types.Type
+	ParamLocals []*Local
 }
 
 func (f *Func) ParamSize(i int) int {
@@ -104,12 +102,12 @@ func (f *Func) ParamSize(i int) int {
 }
 
 type Local struct {
-	Name    string
-	Type    *types.Type
-	Mutable bool
-	Param   bool
-	Ref     bool
-	Offset  int
+	Name      string
+	Type      *types.Type
+	Mutable   bool
+	Param     bool
+	Ref       bool
+	Addressed bool
 }
 
 type Node interface {
@@ -299,7 +297,6 @@ type Match struct {
 	X    Expr
 	Arms []*Arm
 	Pos  lexer.Pos
-	Temp *Local
 }
 
 type Try struct {
@@ -314,7 +311,6 @@ type Catch struct {
 	Arms     []*Arm
 	Fallback Expr
 	Pos      lexer.Pos
-	Temp     *Local
 }
 
 func (n *Block) Position() lexer.Pos     { return n.Pos }

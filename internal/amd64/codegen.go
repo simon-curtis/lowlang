@@ -3,55 +3,124 @@ package amd64
 import (
 	_ "embed"
 	"fmt"
+	"hash/fnv"
+	"slices"
 	"strings"
 
-	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/ir"
 	"lowlang/internal/types"
 )
 
 //go:embed runtime.asm
 var runtime string
 
-type loopLabels struct {
-	top   string
-	end   string
-	depth int
+//go:embed hot.asm
+var hotRuntime string
+
+const (
+	HotBase   = 0x40000000
+	HotSize   = 64 << 20
+	TableSize = 4096
+)
+
+type Output struct {
+	Asm   string
+	Funcs map[string]string
 }
 
 type Generator struct {
 	text    strings.Builder
 	data    strings.Builder
+	fn      string
 	labels  int
-	strings map[string]string
-	fn      *ast.Func
-	frame   int
-	depth   int
-	ret     string
-	loops   []loopLabels
+	strings map[string]bool
+	table   map[string]int
+	suffix  string
 }
 
-func Generate(file *ast.File) string {
-	g := &Generator{strings: map[string]string{}}
-	for _, fn := range file.Funcs {
-		if fn.Name == "main" {
-			g.start(fn)
-		}
+type frame struct {
+	saved   []string
+	slots   []int
+	results int
+}
+
+var argRegs = []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
+
+func stackWords(params int) int {
+	return max(0, params-len(argRegs))
+}
+
+func newGenerator(table map[string]int, suffix string) *Generator {
+	return &Generator{strings: map[string]bool{}, table: table, suffix: suffix}
+}
+
+func Generate(prog *ir.Program, table map[string]int) Output {
+	g := newGenerator(table, "")
+	funcs := map[string]string{}
+	for _, f := range prog.Funcs {
+		from := g.text.Len()
+		g.function(f)
+		funcs[f.Name] = g.text.String()[from:]
 	}
-	for _, fn := range file.Funcs {
-		g.function(fn)
-	}
+	g.start(prog)
 	var out strings.Builder
 	out.WriteString(runtime)
+	if table != nil {
+		out.WriteString(hotRuntimeSource())
+		g.writeTable(&out)
+	}
 	out.WriteString("\n\t.section .rodata\n")
 	out.WriteString(g.data.String())
 	out.WriteString("\n\t.text\n")
 	out.WriteString(g.text.String())
+	return Output{Asm: out.String(), Funcs: funcs}
+}
+
+func GeneratePatch(prog *ir.Program, names []string, table map[string]int, suffix string) string {
+	g := newGenerator(table, suffix)
+	for _, f := range prog.Funcs {
+		if slices.Contains(names, f.Name) {
+			g.function(f)
+		}
+	}
+	var out strings.Builder
+	out.WriteString("\t.intel_syntax noprefix\n\t.text\n")
+	out.WriteString(g.text.String())
+	out.WriteString("\n\t.section .rodata\n")
+	out.WriteString(g.data.String())
 	return out.String()
 }
 
+func Symbol(name, suffix string) string {
+	return fmt.Sprintf("fn_%s%s", name, suffix)
+}
+
+func hotRuntimeSource() string {
+	return strings.NewReplacer(
+		"HOT_BASE", fmt.Sprint(HotBase),
+		"HOT_SIZE", fmt.Sprint(HotSize),
+		"PATCH_BYTES", fmt.Sprint(16*TableSize),
+	).Replace(hotRuntime)
+}
+
+func (g *Generator) writeTable(out *strings.Builder) {
+	entries := make([]string, TableSize)
+	for i := range entries {
+		entries[i] = "0"
+	}
+	for name, i := range g.table {
+		entries[i] = Symbol(name, "")
+	}
+	out.WriteString("\n\t.data\n\t.p2align 3\n\t.globl fn_table\nfn_table:\n")
+	for _, e := range entries {
+		fmt.Fprintf(out, "\t.quad %s\n", e)
+	}
+}
+
 func (g *Generator) emit(format string, args ...any) {
-	fmt.Fprintf(&g.text, "\t%s\n", fmt.Sprintf(format, args...))
+	g.text.WriteString("\t")
+	fmt.Fprintf(&g.text, format, args...)
+	g.text.WriteString("\n")
 }
 
 func (g *Generator) label(name string) {
@@ -60,31 +129,43 @@ func (g *Generator) label(name string) {
 
 func (g *Generator) newLabel() string {
 	g.labels++
-	return fmt.Sprintf(".L%d", g.labels)
+	return fmt.Sprintf(".L%s_g%d", g.fn, g.labels)
 }
 
-func mem(offset int) string {
-	return fmt.Sprintf("qword ptr [rbp%+d]", offset)
+func (g *Generator) callTarget(f *ir.Func) string {
+	if g.table == nil {
+		return Symbol(f.Name, "")
+	}
+	return fmt.Sprintf("qword ptr [rip+fn_table+%d]", 8*g.table[f.Name])
 }
 
-func (g *Generator) start(main *ast.Func) {
-	ret := main.RetType
+func (g *Generator) start(prog *ir.Program) {
+	g.fn = "start"
+	g.labels = 0
 	g.text.WriteString("\t.globl _start\n_start:\n")
 	g.emit("mov [rip+rt_stack_top], rsp")
 	g.emit("call rt_gc_init")
-	if ret.Kind == types.ResultKind {
+	if g.table != nil {
+		g.emit("call rt_hot_init")
+	}
+	words := prog.Main.ResultWords
+	if words > 2 {
+		g.emit("sub rsp, %d", 8*words)
+	}
+	g.emit("call %s", g.callTarget(prog.Main))
+	if prog.MainErr != nil {
 		exit := g.newLabel()
-		g.emit("sub rsp, %d", 8*ret.Size())
-		g.emit("call fn_main")
-		g.emit("cmp qword ptr [rsp], 0")
+		tag, variant := "rax", "rdx"
+		if words > 2 {
+			tag, variant = "qword ptr [rsp]", "qword ptr [rsp+8]"
+		}
+		g.emit("cmp %s, 0", tag)
 		g.emit("je %s", exit)
-		g.emit("mov rax, [rsp+8]")
-		g.emit("lea rcx, [rip+%s]", g.variantNames(ret.Err))
+		g.emit("mov rax, %s", variant)
+		g.emit("lea rcx, [rip+%s]", g.variantNames(prog.MainErr))
 		g.emit("mov rdi, [rcx+8*rax]")
 		g.emit("call rt_error")
 		g.label(exit)
-	} else {
-		g.emit("call fn_main")
 	}
 	g.emit("xor edi, edi")
 	g.emit("mov eax, 60")
@@ -102,11 +183,13 @@ func (g *Generator) variantNames(enum *types.Type) string {
 }
 
 func (g *Generator) stringLabel(s string) string {
-	if l, ok := g.strings[s]; ok {
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	l := fmt.Sprintf(".Lstr_%x", h.Sum64())
+	if g.strings[l] {
 		return l
 	}
-	l := fmt.Sprintf(".Lstr%d", len(g.strings))
-	g.strings[s] = l
+	g.strings[l] = true
 	fmt.Fprintf(&g.data, "\t.p2align 3\n%s:\n\t.quad %d\n", l, len(s))
 	if len(s) == 0 {
 		return l
@@ -119,373 +202,283 @@ func (g *Generator) stringLabel(s string) string {
 	return l
 }
 
-func (g *Generator) function(fn *ast.Func) {
-	g.fn = fn
-	g.ret = g.newLabel()
-	g.depth = 0
-	g.frame = (fn.FrameWords*8 + 15) &^ 15
-	g.label(symbol(fn))
+func (g *Generator) function(f *ir.Func) {
+	g.fn = f.Name
+	g.labels = 0
+	mf := lower(f)
+	spills, saved := mf.allocate()
+	fr := &frame{saved: saved, results: 16 + 8*stackWords(f.ParamWords)}
+	words := len(saved) + spills
+	for _, n := range f.Slots {
+		words += n
+		fr.slots = append(fr.slots, words)
+	}
+	size := (8*(words+outgoing(f)) + 15) &^ 15
+	g.label(Symbol(f.Name, g.suffix))
 	g.emit("push rbp")
 	g.emit("mov rbp, rsp")
-	if g.frame > 0 {
-		g.emit("sub rsp, %d", g.frame)
+	if size > 0 {
+		g.emit("sub rsp, %d", size)
 	}
-	g.expr(fn.Body)
-	g.returnValue(fn.Body.Type)
-	g.label(g.ret)
+	for i, r := range saved {
+		g.emit("mov qword ptr [rbp-%d], %s", 8*(i+1), r)
+	}
+	g.params(fr, mf.blocks[0])
+	for i, mb := range mf.blocks {
+		var next *mblock
+		if i+1 < len(mf.blocks) {
+			next = mf.blocks[i+1]
+		}
+		g.block(fr, mb, next)
+	}
+}
+
+func outgoing(f *ir.Func) int {
+	most := 0
+	for _, b := range f.Blocks {
+		for _, v := range b.Values {
+			if v.Op != ir.OpCall {
+				continue
+			}
+			words := stackWords(v.Target.ParamWords)
+			if v.Target.ResultWords > 2 {
+				words += v.Target.ResultWords
+			}
+			most = max(most, words)
+		}
+	}
+	return most
+}
+
+func (fr *frame) loc(r *vreg) string {
+	switch {
+	case r.konst != nil:
+		return fmt.Sprintf("%d", *r.konst)
+	case r.reg != "":
+		return r.reg
+	}
+	return fmt.Sprintf("qword ptr [rbp-%d]", 8*(len(fr.saved)+r.spill+1))
+}
+
+func (fr *frame) slot(index int) int {
+	return -8 * fr.slots[index]
+}
+
+func isMem(loc string) bool {
+	return strings.HasPrefix(loc, "qword")
+}
+
+func isReg(loc string) bool {
+	return !isMem(loc) && !isImm(loc)
+}
+
+func isImm(loc string) bool {
+	return loc[0] == '-' || (loc[0] >= '0' && loc[0] <= '9')
+}
+
+func (g *Generator) move(dst, src string) {
+	switch {
+	case dst == src:
+	case isMem(dst) && isMem(src):
+		g.emit("mov r10, %s", src)
+		g.emit("mov %s, r10", dst)
+	default:
+		g.emit("mov %s, %s", dst, src)
+	}
+}
+
+func (g *Generator) block(fr *frame, mb *mblock, next *mblock) {
+	g.label(mb.label)
+	for _, in := range mb.instrs {
+		g.instr(fr, in)
+	}
+	switch mb.kind {
+	case ir.Plain:
+		if mb.succs[0] != next {
+			g.emit("jmp %s", mb.succs[0].label)
+		}
+	case ir.If:
+		g.branch(fr, mb, next)
+	case ir.Ret:
+		g.ret(fr, mb)
+	case ir.Unreachable:
+		g.emit("ud2")
+	}
+}
+
+var conditions = map[ir.Op]string{
+	ir.OpEq: "e", ir.OpNe: "ne", ir.OpLt: "l", ir.OpLe: "le", ir.OpGt: "g", ir.OpGe: "ge",
+}
+
+var inverse = map[string]string{"e": "ne", "ne": "e", "l": "ge", "ge": "l", "le": "g", "g": "le", "nz": "z", "z": "nz"}
+
+func (g *Generator) branch(fr *frame, mb *mblock, next *mblock) {
+	cond := "nz"
+	if mb.fused != nil {
+		g.compare(fr, mb.compare[0], mb.compare[1])
+		cond = conditions[mb.fused.Op]
+	} else {
+		g.test(fr.loc(mb.control))
+	}
+	then, otherwise := mb.succs[0], mb.succs[1]
+	if then == next {
+		g.emit("j%s %s", inverse[cond], otherwise.label)
+		return
+	}
+	g.emit("j%s %s", cond, then.label)
+	if otherwise != next {
+		g.emit("jmp %s", otherwise.label)
+	}
+}
+
+func (g *Generator) test(loc string) {
+	switch {
+	case isReg(loc):
+		g.emit("test %s, %s", loc, loc)
+	case isImm(loc):
+		g.emit("mov r10, %s", loc)
+		g.emit("test r10, r10")
+	default:
+		g.emit("cmp %s, 0", loc)
+	}
+}
+
+func (g *Generator) compare(fr *frame, a, b *vreg) {
+	x := fr.loc(a)
+	if !isReg(x) {
+		g.move("r10", x)
+		x = "r10"
+	}
+	g.emit("cmp %s, %s", x, fr.loc(b))
+}
+
+func (g *Generator) ret(fr *frame, mb *mblock) {
+	if len(mb.results) <= 2 {
+		for i, r := range mb.results {
+			g.move([]string{"rax", "rdx"}[i], fr.loc(r))
+		}
+	} else {
+		for k, r := range mb.results {
+			g.move(fmt.Sprintf("qword ptr [rbp+%d]", fr.results+8*k), fr.loc(r))
+		}
+	}
+	for i, r := range fr.saved {
+		g.emit("mov %s, qword ptr [rbp-%d]", r, 8*(i+1))
+	}
 	g.emit("mov rsp, rbp")
 	g.emit("pop rbp")
 	g.emit("ret")
 }
 
-func symbol(fn *ast.Func) string {
-	return fmt.Sprintf("fn_%s", fn.Name)
-}
+var binops = map[ir.Op]string{ir.OpAdd: "add", ir.OpSub: "sub", ir.OpMul: "imul"}
 
-func (g *Generator) retOffset() int {
-	return 16 + 8*g.fn.ParamWords
-}
-
-func (g *Generator) returnValue(t *types.Type) {
-	ret := g.fn.RetType
-	switch {
-	case t == types.Never:
-	case ret == types.Void:
-		g.discard(t)
-	case t == ret && t.Scalar():
-	case t == ret:
-		g.store(t, g.retOffset())
-	case ret.Kind == types.ResultKind && t == ret.Ok:
-		g.store(t, g.retOffset()+8)
-		g.emit("mov %s, 0", mem(g.retOffset()))
-	default:
-		g.discard(t)
-		g.emit("mov %s, 0", mem(g.retOffset()))
-	}
-}
-
-func (g *Generator) push(operand string) {
-	g.emit("push %s", operand)
-	g.depth++
-}
-
-func (g *Generator) pop(reg string) {
-	g.emit("pop %s", reg)
-	g.depth--
-}
-
-func (g *Generator) reserve(words int) int {
-	if words > 0 {
-		g.emit("sub rsp, %d", 8*words)
-		g.depth += words
-	}
-	return -(g.frame + 8*g.depth)
-}
-
-func (g *Generator) release(words int) {
-	if words > 0 {
-		g.emit("add rsp, %d", 8*words)
-		g.depth -= words
-	}
-}
-
-func (g *Generator) discard(t *types.Type) {
-	g.release(t.StackWords())
-}
-
-func (g *Generator) coerce(from, to *types.Type) {
-	if to == types.Void {
-		g.discard(from)
-	}
-}
-
-func (g *Generator) unwind(depth int) {
-	if g.depth > depth {
-		g.emit("add rsp, %d", 8*(g.depth-depth))
-	}
-}
-
-type address func(word int) string
-
-func frame(offset int) address {
-	return func(word int) string { return mem(offset + 8*word) }
-}
-
-func via(reg string, offset int) address {
-	return func(word int) string { return fmt.Sprintf("qword ptr [%s+%d]", reg, offset+8*word) }
-}
-
-func (g *Generator) at(p *ast.Place) address {
-	switch {
-	case p.Ptr != nil:
-		g.expr(p.Ptr)
-		g.emit("mov rdx, rax")
-		return via("rdx", p.Offset)
-	case p.Local.Ref:
-		g.emit("mov rdx, %s", mem(p.Local.Offset))
-		return via("rdx", p.Offset)
-	}
-	return frame(p.Local.Offset + p.Offset)
-}
-
-func (g *Generator) address(p *ast.Place) {
-	switch {
-	case p.Ptr != nil:
-		g.expr(p.Ptr)
-	case p.Local.Ref:
-		g.emit("mov rax, %s", mem(p.Local.Offset))
-	default:
-		g.emit("lea rax, [rbp%+d]", p.Local.Offset+p.Offset)
+func (g *Generator) instr(fr *frame, in *instr) {
+	if in.move {
+		g.move(fr.loc(in.dst), fr.loc(in.args[0]))
 		return
 	}
-	if p.Offset > 0 {
-		g.emit("add rax, %d", p.Offset)
-	}
-}
-
-func (g *Generator) store(t *types.Type, offset int) {
-	g.storeTo(t, frame(offset))
-}
-
-func (g *Generator) storeTo(t *types.Type, at address) {
-	if t.Scalar() {
-		g.emit("mov %s, rax", at(0))
+	if in.isParam() {
 		return
 	}
-	for k := range t.StackWords() {
-		g.pop("rax")
-		g.emit("mov %s, rax", at(k))
-	}
-}
-
-func (g *Generator) loadFrom(t *types.Type, at address) {
-	if t.Scalar() {
-		g.emit("mov rax, %s", at(0))
-		return
-	}
-	for k := t.Size() - 1; k >= 0; k-- {
-		g.push(at(k))
-	}
-}
-
-func (g *Generator) copyWords(words, from, to int) {
-	for k := range words {
-		g.emit("mov rax, %s", mem(from+8*k))
-		g.emit("mov %s, rax", mem(to+8*k))
-	}
-}
-
-func (g *Generator) block(b *ast.Block) {
-	for _, s := range b.Stmts {
-		g.stmt(s)
-	}
-	if b.Tail != nil {
-		g.expr(b.Tail)
-	}
-}
-
-func (g *Generator) stmt(s ast.Stmt) {
-	switch s := s.(type) {
-	case *ast.Let:
-		g.expr(s.Value)
-		g.store(s.Local.Type, s.Local.Offset)
-	case *ast.Assign:
-		g.assign(s)
-	case *ast.ExprStmt:
-		g.expr(s.X)
-		g.discard(s.X.TypeOf())
-	case *ast.For:
-		g.forStmt(s)
-	case *ast.Break:
-		l := g.loops[len(g.loops)-1]
-		g.unwind(l.depth)
-		g.emit("jmp %s", l.end)
-	case *ast.Continue:
-		l := g.loops[len(g.loops)-1]
-		g.unwind(l.depth)
-		g.emit("jmp %s", l.top)
-	case *ast.Return:
-		g.returnStmt(s)
-	case *ast.Fail:
-		g.expr(s.Value)
-		g.store(s.Value.TypeOf(), g.retOffset()+8)
-		g.emit("mov %s, 1", mem(g.retOffset()))
-		g.emit("jmp %s", g.ret)
-	}
-}
-
-func (g *Generator) returnStmt(s *ast.Return) {
-	t := types.Void
-	if s.Value != nil {
-		g.expr(s.Value)
-		t = s.Value.TypeOf()
-	}
-	g.returnValue(t)
-	g.emit("jmp %s", g.ret)
-}
-
-var compoundOps = map[lexer.Kind]lexer.Kind{
-	lexer.PlusAssign: lexer.Plus, lexer.MinusAssign: lexer.Minus,
-	lexer.StarAssign: lexer.Star, lexer.SlashAssign: lexer.Slash,
-}
-
-func (g *Generator) assign(s *ast.Assign) {
-	t := s.Target.TypeOf()
-	g.expr(s.Value)
-	if t.Scalar() {
-		g.push("rax")
-	}
-	g.address(s.Place)
-	g.emit("mov rdx, rax")
-	if !t.Scalar() {
-		g.storeTo(t, via("rdx", 0))
-		return
-	}
-	g.pop("rax")
-	if op, ok := compoundOps[s.Op]; ok {
-		g.emit("mov rcx, rax")
-		g.emit("mov rax, qword ptr [rdx]")
-		g.push("rdx")
-		g.arith(op)
-		g.pop("rdx")
-	}
-	g.emit("mov qword ptr [rdx], rax")
-}
-
-func (g *Generator) forStmt(s *ast.For) {
-	l := loopLabels{top: g.newLabel(), end: g.newLabel(), depth: g.depth}
-	g.label(l.top)
-	if s.Cond != nil {
-		g.expr(s.Cond)
-		g.emit("test rax, rax")
-		g.emit("jz %s", l.end)
-	}
-	g.loops = append(g.loops, l)
-	g.block(s.Body)
-	g.discard(s.Body.Type)
-	g.loops = g.loops[:len(g.loops)-1]
-	g.emit("jmp %s", l.top)
-	g.label(l.end)
-	g.depth = l.depth
-}
-
-func (g *Generator) expr(e ast.Expr) {
-	switch e := e.(type) {
-	case *ast.IntLit:
-		g.emit("mov rax, %d", e.Value)
-	case *ast.StrLit:
-		g.emit("lea rax, [rip+%s]", g.stringLabel(e.Value))
-	case *ast.BoolLit:
-		g.emit("mov eax, %d", boolInt(e.Value))
-	case *ast.Ident:
-		if e.Variant != nil {
-			g.construct(e.Type, e.Variant, nil)
-			return
-		}
-		g.loadFrom(e.Type, g.at(&ast.Place{Local: e.Local}))
-	case *ast.Selector:
-		g.selector(e)
-	case *ast.StructLit:
-		g.structLit(e)
-	case *ast.Unary:
-		g.unary(e)
-	case *ast.Binary:
-		g.binary(e)
-	case *ast.Call:
-		g.call(e)
-	case *ast.If:
-		g.ifExpr(e)
-	case *ast.Block:
-		g.block(e)
-	case *ast.Match:
-		g.expr(e.X)
-		g.store(e.Temp.Type, e.Temp.Offset)
-		g.dispatch(e.Arms, e.Temp, e.Type)
-	case *ast.Try:
-		g.try(e)
-	case *ast.Catch:
-		g.catch(e)
-	}
-}
-
-func boolInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}
-
-func (g *Generator) unary(e *ast.Unary) {
-	if e.Op == lexer.Star {
-		g.loadFrom(e.Type, g.at(&ast.Place{Ptr: e.X}))
-		return
-	}
-	g.expr(e.X)
-	if e.Op == lexer.Not {
-		g.emit("xor rax, 1")
-		return
-	}
-	g.emit("neg rax")
-}
-
-var setcc = map[lexer.Kind]string{
-	lexer.Eq: "sete", lexer.NotEq: "setne", lexer.Lt: "setl",
-	lexer.LtEq: "setle", lexer.Gt: "setg", lexer.GtEq: "setge",
-}
-
-func (g *Generator) binary(e *ast.Binary) {
-	if e.Op == lexer.AndAnd || e.Op == lexer.OrOr {
-		g.logical(e)
-		return
-	}
-	g.expr(e.X)
-	g.push("rax")
-	g.expr(e.Y)
-	g.emit("mov rcx, rax")
-	g.pop("rax")
-	if e.X.TypeOf() == types.Str {
-		g.stringCompare(e.Op)
-		return
-	}
-	if cc, ok := setcc[e.Op]; ok {
-		g.emit("cmp rax, rcx")
-		g.emit("%s al", cc)
+	v := in.value
+	switch in.op {
+	case ir.OpConst:
+		g.constant(fr.loc(in.dst), v.Aux)
+	case ir.OpString:
+		g.address(fr.loc(in.dst), fmt.Sprintf("[rip+%s]", g.stringLabel(v.Str)))
+	case ir.OpUndef:
+	case ir.OpAdd, ir.OpSub, ir.OpMul:
+		g.binary(fr, in, binops[in.op])
+	case ir.OpDiv, ir.OpRem:
+		g.divide(fr, in)
+	case ir.OpNeg:
+		g.unary(fr, in, "neg r10")
+	case ir.OpNot:
+		g.unary(fr, in, "xor r10, 1")
+	case ir.OpEq, ir.OpNe, ir.OpLt, ir.OpLe, ir.OpGt, ir.OpGe:
+		g.compare(fr, in.args[0], in.args[1])
+		g.emit("set%s al", conditions[in.op])
 		g.emit("movzx eax, al")
+		g.move(fr.loc(in.dst), "rax")
+	case ir.OpLoad:
+		g.move(fr.loc(in.dst), fmt.Sprintf("qword ptr [%s+%d]", g.base(fr.loc(in.args[0])), v.Aux))
+	case ir.OpStore:
+		base := g.base(fr.loc(in.args[0]))
+		value := fr.loc(in.args[1])
+		if isMem(value) {
+			g.move("r11", value)
+			value = "r11"
+		}
+		g.emit("mov qword ptr [%s+%d], %s", base, v.Aux, value)
+	case ir.OpSlot:
+		g.address(fr.loc(in.dst), fmt.Sprintf("[rbp%+d]", fr.slot(int(v.Aux))))
+	case ir.OpCall:
+		g.call(fr, in)
+	case ir.OpRuntime:
+		g.runtimeCall(fr, in)
+	case ir.OpResult:
+		g.result(fr, in)
+	}
+}
+
+func (g *Generator) base(loc string) string {
+	if isReg(loc) {
+		return loc
+	}
+	g.move("r10", loc)
+	return "r10"
+}
+
+func (g *Generator) address(dst, operand string) {
+	if isReg(dst) {
+		g.emit("lea %s, %s", dst, operand)
 		return
 	}
-	g.arith(e.Op)
+	g.emit("lea r10, %s", operand)
+	g.move(dst, "r10")
 }
 
-func (g *Generator) stringCompare(op lexer.Kind) {
-	g.emit("mov rdi, rax")
-	g.emit("mov rsi, rcx")
-	g.emit("call rt_str_eq")
-	if op == lexer.NotEq {
-		g.emit("xor rax, 1")
+func (g *Generator) constant(dst string, n int64) {
+	if isReg(dst) || (n >= -1<<31 && n < 1<<31) {
+		g.emit("mov %s, %d", dst, n)
+		return
+	}
+	g.emit("mov r10, %d", n)
+	g.emit("mov %s, r10", dst)
+}
+
+func (g *Generator) binary(fr *frame, in *instr, op string) {
+	dst, a, b := fr.loc(in.dst), fr.loc(in.args[0]), fr.loc(in.args[1])
+	commutative := in.op != ir.OpSub
+	switch {
+	case isReg(dst) && dst != b:
+		g.move(dst, a)
+		g.emit("%s %s, %s", op, dst, b)
+	case isReg(dst) && commutative:
+		g.emit("%s %s, %s", op, dst, a)
+	default:
+		g.move("r10", a)
+		g.emit("%s r10, %s", op, b)
+		g.move(dst, "r10")
 	}
 }
 
-func (g *Generator) arith(op lexer.Kind) {
-	switch op {
-	case lexer.Plus:
-		g.emit("add rax, rcx")
-	case lexer.Minus:
-		g.emit("sub rax, rcx")
-	case lexer.Star:
-		g.emit("imul rax, rcx")
-	case lexer.Slash, lexer.Percent:
-		g.divide(op)
-	}
+func (g *Generator) unary(fr *frame, in *instr, op string) {
+	g.move("r10", fr.loc(in.args[0]))
+	g.emit("%s", op)
+	g.move(fr.loc(in.dst), "r10")
 }
 
-func (g *Generator) divide(op lexer.Kind) {
+func (g *Generator) divide(fr *frame, in *instr) {
 	normal := g.newLabel()
 	done := g.newLabel()
-	g.emit("test rcx, rcx")
+	g.move("rax", fr.loc(in.args[0]))
+	g.move("r10", fr.loc(in.args[1]))
+	g.emit("test r10, r10")
 	g.emit("jz rt_panic_divzero")
-	g.emit("cmp rcx, -1")
+	g.emit("cmp r10, -1")
 	g.emit("jne %s", normal)
-	if op == lexer.Slash {
+	if in.op == ir.OpDiv {
 		g.emit("neg rax")
 	} else {
 		g.emit("xor eax, eax")
@@ -493,228 +486,92 @@ func (g *Generator) divide(op lexer.Kind) {
 	g.emit("jmp %s", done)
 	g.label(normal)
 	g.emit("cqo")
-	g.emit("idiv rcx")
-	if op == lexer.Percent {
+	g.emit("idiv r10")
+	if in.op == ir.OpRem {
 		g.emit("mov rax, rdx")
 	}
 	g.label(done)
+	g.move(fr.loc(in.dst), "rax")
 }
 
-func (g *Generator) logical(e *ast.Binary) {
-	done := g.newLabel()
-	g.expr(e.X)
-	g.emit("test rax, rax")
-	if e.Op == lexer.AndAnd {
-		g.emit("jz %s", done)
-	} else {
-		g.emit("jnz %s", done)
-	}
-	g.expr(e.Y)
-	g.label(done)
-}
-
-func (g *Generator) call(e *ast.Call) {
-	switch {
-	case e.Builtin == "new":
-		g.allocate(e.Args[0])
-	case e.Builtin != "":
-		g.expr(e.Args[0])
-		g.emit("mov rdi, rax")
-		g.emit("call rt_%s", e.Builtin)
-	case e.Variant != nil:
-		g.construct(e.Type, e.Variant, e.Args)
-	default:
-		g.callFunc(e)
-	}
-}
-
-func (g *Generator) allocate(value ast.Expr) {
-	t := value.TypeOf()
-	g.expr(value)
-	if t.Scalar() {
-		g.push("rax")
-	}
-	g.emit("mov edi, %d", t.Size())
-	g.emit("call rt_alloc")
-	g.emit("mov rdx, rax")
-	if t.Scalar() {
-		g.pop("rcx")
-		g.emit("mov qword ptr [rdx], rcx")
-	} else {
-		g.storeTo(t, via("rdx", 0))
-	}
-	g.emit("mov rax, rdx")
-}
-
-func (g *Generator) callFunc(e *ast.Call) {
-	fn := e.Target
-	offset := g.reserve(fn.RetType.StackWords() + fn.ParamWords)
-	for i, arg := range e.Args {
-		if r, ok := arg.(*ast.Ref); ok {
-			g.address(r.Place)
-			g.emit("mov %s, rax", mem(offset))
-		} else {
-			g.expr(arg)
-			g.store(fn.ParamTypes[i], offset)
-		}
-		offset += 8 * fn.ParamSize(i)
-	}
-	g.emit("call %s", symbol(fn))
-	g.release(fn.ParamWords)
-}
-
-func (g *Generator) construct(enum *types.Type, v *types.Variant, args []ast.Expr) {
-	if enum.Scalar() {
-		g.emit("mov eax, %d", v.Tag)
-		return
-	}
-	base := g.reserve(enum.Size())
-	g.emit("mov %s, %d", mem(base), v.Tag)
-	for i, arg := range args {
-		g.expr(arg)
-		g.store(v.Fields[i], base+8*v.Offsets[i])
-	}
-}
-
-func (g *Generator) selector(e *ast.Selector) {
-	if e.Variant != nil {
-		g.construct(e.Type, e.Variant, nil)
-		return
-	}
-	if p, ok := ast.PlaceOf(e); ok {
-		g.loadFrom(e.Type, g.at(p))
-		return
-	}
-	g.expr(e.X)
-	g.extract(e.X.TypeOf(), e.Field.Offset, e.Type)
-}
-
-func (g *Generator) extract(whole *types.Type, offset int, part *types.Type) {
-	if whole.Scalar() {
-		return
-	}
-	n := whole.Size()
-	size := part.Size()
-	if part.Scalar() {
-		g.emit("mov rax, [rsp+%d]", 8*offset)
-		g.release(n)
-		return
-	}
-	for k := size - 1; k >= 0; k-- {
-		g.emit("mov rax, [rsp+%d]", 8*(offset+k))
-		g.emit("mov [rsp+%d], rax", 8*(n-size+k))
-	}
-	g.release(n - size)
-}
-
-func (g *Generator) structLit(e *ast.StructLit) {
-	if e.Type.Scalar() {
-		g.expr(e.Fields[0].Value)
-		return
-	}
-	base := g.reserve(e.Type.Size())
-	for _, init := range e.Fields {
-		g.expr(init.Value)
-		g.store(init.Field.Type, base+8*init.Field.Offset)
-	}
-}
-
-func (g *Generator) ifExpr(e *ast.If) {
-	depth := g.depth
-	otherwise := g.newLabel()
-	done := g.newLabel()
-	g.expr(e.Cond)
-	g.emit("test rax, rax")
-	g.emit("jz %s", otherwise)
-	g.block(e.Then)
-	g.coerce(e.Then.Type, e.Type)
-	g.emit("jmp %s", done)
-	g.label(otherwise)
-	g.depth = depth
-	if e.Else != nil {
-		g.expr(e.Else)
-		g.coerce(e.Else.TypeOf(), e.Type)
-	}
-	g.label(done)
-	g.depth = depth + e.Type.StackWords()
-}
-
-func (g *Generator) dispatch(arms []*ast.Arm, subject *ast.Local, result *types.Type) {
-	depth := g.depth
-	done := g.newLabel()
-	targets := make([]string, len(arms))
-	g.emit("mov rax, %s", mem(subject.Offset))
-	for i, arm := range arms {
-		targets[i] = g.newLabel()
-		if arm.Pattern.Variant == nil {
-			g.emit("jmp %s", targets[i])
+func (g *Generator) params(fr *frame, entry *mblock) {
+	var moves []pmove
+	for _, in := range entry.instrs {
+		if !in.isParam() || in.value.Uses == 0 {
 			continue
 		}
-		g.emit("cmp rax, %d", arm.Pattern.Variant.Tag)
-		g.emit("je %s", targets[i])
+		k := int(in.value.Aux)
+		src := fmt.Sprintf("qword ptr [rbp+%d]", 16+8*(k-len(argRegs)))
+		if k < len(argRegs) {
+			src = argRegs[k]
+		}
+		moves = append(moves, pmove{dst: fr.loc(in.dst), src: src})
 	}
-	g.emit("ud2")
-	for i, arm := range arms {
-		g.label(targets[i])
-		g.depth = depth
-		g.bind(arm.Pattern, subject)
-		g.expr(arm.Body)
-		g.coerce(arm.Body.TypeOf(), result)
-		g.emit("jmp %s", done)
-	}
-	g.label(done)
-	g.depth = depth + result.StackWords()
+	g.parallel(moves)
 }
 
-func (g *Generator) bind(p *ast.Pattern, subject *ast.Local) {
-	for i, b := range p.Bindings {
-		if b.Local == nil {
+func (g *Generator) call(fr *frame, in *instr) {
+	var moves []pmove
+	for i, a := range in.args {
+		src := fr.loc(a)
+		if i < len(argRegs) {
+			moves = append(moves, pmove{dst: argRegs[i], src: src})
 			continue
 		}
-		from := subject.Offset + 8*p.Variant.Offsets[i]
-		g.copyWords(b.Local.Type.Size(), from, b.Local.Offset)
-	}
-}
-
-func (g *Generator) try(e *ast.Try) {
-	result := e.X.TypeOf()
-	ok := g.newLabel()
-	g.expr(e.X)
-	g.emit("cmp qword ptr [rsp], 0")
-	g.emit("je %s", ok)
-	for k := range result.Err.Size() {
-		g.emit("mov rax, [rsp+%d]", 8+8*k)
-		g.emit("mov %s, rax", mem(g.retOffset()+8+8*k))
-	}
-	g.emit("mov %s, 1", mem(g.retOffset()))
-	g.emit("jmp %s", g.ret)
-	g.label(ok)
-	g.extract(result, 1, result.Ok)
-}
-
-func (g *Generator) catch(e *ast.Catch) {
-	result := e.X.TypeOf()
-	failed := g.newLabel()
-	done := g.newLabel()
-	g.expr(e.X)
-	depth := g.depth
-	g.emit("cmp qword ptr [rsp], 0")
-	g.emit("jne %s", failed)
-	g.extract(result, 1, result.Ok)
-	g.emit("jmp %s", done)
-	g.label(failed)
-	g.depth = depth
-	if e.Fallback != nil {
-		g.release(result.Size())
-		g.expr(e.Fallback)
-	} else {
-		for k := range result.Err.Size() {
-			g.emit("mov rax, [rsp+%d]", 8+8*k)
-			g.emit("mov %s, rax", mem(e.Temp.Offset+8*k))
+		if isMem(src) {
+			g.move("r10", src)
+			src = "r10"
 		}
-		g.release(result.Size())
-		g.dispatch(e.Arms, e.Temp, e.Type)
+		g.emit("mov qword ptr [rsp+%d], %s", 8*(i-len(argRegs)), src)
 	}
-	g.label(done)
-	g.depth = depth - result.Size() + e.Type.StackWords()
+	g.parallel(moves)
+	g.emit("call %s", g.callTarget(in.value.Target))
+}
+
+type pmove struct {
+	dst string
+	src string
+}
+
+func (g *Generator) parallel(moves []pmove) {
+	moves = slices.DeleteFunc(moves, func(m pmove) bool { return m.dst == m.src })
+	for len(moves) > 0 {
+		i := slices.IndexFunc(moves, func(m pmove) bool {
+			return !slices.ContainsFunc(moves, func(o pmove) bool { return o.src == m.dst })
+		})
+		if i < 0 {
+			blocked := moves[0].src
+			g.move("r11", blocked)
+			for j := range moves {
+				if moves[j].src == blocked {
+					moves[j].src = "r11"
+				}
+			}
+			continue
+		}
+		g.move(moves[i].dst, moves[i].src)
+		moves = slices.Delete(moves, i, i+1)
+	}
+}
+
+func (g *Generator) runtimeCall(fr *frame, in *instr) {
+	scratch := []string{"r10", "r11"}
+	for i, a := range in.args {
+		g.move(scratch[i], fr.loc(a))
+	}
+	for i := range in.args {
+		g.move([]string{"rdi", "rsi"}[i], scratch[i])
+	}
+	g.emit("call rt_%s", in.value.Str)
+}
+
+func (g *Generator) result(fr *frame, in *instr) {
+	k := int(in.value.Aux)
+	call := in.call
+	if call.Op == ir.OpRuntime || call.Target.ResultWords <= 2 {
+		g.move(fr.loc(in.dst), []string{"rax", "rdx"}[k])
+		return
+	}
+	g.emit("mov r10, qword ptr [rsp+%d]", 8*(stackWords(call.Target.ParamWords)+k))
+	g.move(fr.loc(in.dst), "r10")
 }

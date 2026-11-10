@@ -70,6 +70,7 @@ rt_write:
 	pop r12
 	ret
 
+	.globl rt_print_str
 rt_print_str:
 	mov rdx, [rdi]
 	lea rsi, [rdi+8]
@@ -80,6 +81,7 @@ rt_print_str:
 	mov edx, 1
 	jmp rt_write
 
+	.globl rt_print_bool
 rt_print_bool:
 	lea rsi, [rip+rt_true]
 	mov edx, 5
@@ -91,6 +93,7 @@ rt_print_bool:
 	mov edi, 1
 	jmp rt_write
 
+	.globl rt_print_i64
 rt_print_i64:
 	sub rsp, 40
 	lea rsi, [rsp+32]
@@ -122,6 +125,7 @@ rt_print_i64:
 	add rsp, 40
 	ret
 
+	.globl rt_str_eq
 rt_str_eq:
 	mov rcx, [rdi]
 	xor eax, eax
@@ -165,6 +169,7 @@ rt_error:
 	mov ecx, 1
 	jmp rt_die
 
+	.globl rt_panic_divzero
 rt_panic_divzero:
 	lea rdi, [rip+rt_msg_divzero]
 	jmp rt_panic
@@ -234,6 +239,7 @@ rt_free_chunk:
 	mov [rcx], rdi
 	jmp rt_set_start
 
+	.globl rt_alloc
 rt_alloc:
 	lea rsi, [rdi+1]
 	mov rax, [rip+rt_alloc_since]

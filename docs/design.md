@@ -217,10 +217,11 @@ Written in Go. Pipeline:
 | Lex | `internal/lexer` | tokens |
 | Parse | `internal/parser` | `internal/ast` tree |
 | Check | `internal/check` | types attached to the tree |
+| Build IR | `internal/ir` | SSA form, one value per machine word |
 | Codegen | `internal/amd64` | x86-64 GNU assembly |
 | Assemble and link | `as`, `ld` | static ELF binary |
 
-The `low` command lives in `cmd/low`.
+The `low` command lives in `cmd/low`; the pipeline it shares with hot reload lives in `internal/compiler`. `low ir` prints the SSA form and `low asm` the generated assembly.
 
 The runtime, `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls.
 
@@ -230,18 +231,50 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Each object has a one-word header holding its size in words, a mark bit and a free bit. A bitmap records the first word of every object and free chunk, which resolves pointers into the middle of an object, such as a `mut` parameter aimed at a heap field.
 - Allocation takes from exact-size free lists for objects under 64 words, then first-fit from a list of larger chunks, splitting them, then from the end of the heap.
 - Collection runs when the words allocated since the last one exceed the words that survived it, with a 4 MB floor.
-- Roots are found by scanning the whole stack conservatively; heap objects are scanned conservatively too. Any word holding a heap address keeps that object alive. Precise scanning needs pointer maps from the compiler, which arrive with the SSA IR.
+- Roots are found by scanning the whole stack conservatively; heap objects are scanned conservatively too. Any word holding a heap address keeps that object alive. Precise scanning needs pointer maps from the register allocator.
 - Sweeping coalesces adjacent dead objects into free chunks and returns a trailing free run to the end of the heap.
 
-Code generation is a stack machine. A one-word value lands in `rax`; a wider value (an enum with payload, a result) is pushed onto the stack with its first word lowest. All locals live in the frame, at offsets assigned by the checker. The generator tracks stack depth so `break` and `continue` can unwind partly built expressions.
+### IR
 
-Calls reserve stack space for a wide return value and the arguments, then evaluate arguments left to right into it. The callee finds argument 0 at `rbp+16` and writes a wide result just above the arguments; a one-word result returns in `rax`.
+- SSA is built directly from the checked tree with Braun et al.'s algorithm: variables are read and written per block, phis are created lazily and sealed once a block's predecessors are known, and trivial phis are removed.
+- Every value is one 64-bit word. A struct, enum or result of n words is n SSA values, so aggregates live in registers with no frame temporaries.
+- A variable passed as `mut` lives in a frame slot and is accessed with loads and stores; every other variable is pure SSA.
+- Integer division carries its zero and overflow checks inside the instruction.
+- Unreachable blocks are pruned after construction.
 
-On fib(38) this runs at 1.5x Go's time, which the SSA IR and register allocator are meant to close.
+### Code generation
+
+- Critical edges are split and each phi becomes a copy into a temporary at the end of every predecessor and a copy out of it at the start of the block.
+- A comparison used only by the branch that ends its block is fused into a `cmp` and conditional jump.
+- Constants that fit in 32 bits are used as immediates and take no register.
+- Registers are assigned by linear scan over the hull of each value's live range. `rcx`, `rsi`, `rdi`, `r8` and `r9` hold values that are not live across a call; `rbx` and `r12` to `r15` hold values that are, and are saved in the prologue when used. Values that find no register are spilled to the frame. `rax`, `rdx`, `r10` and `r11` are scratch.
+- A value used as a call argument prefers that argument's register, and a copy prefers its source's register.
+
+Calls pass the first six argument words in `rdi`, `rsi`, `rdx`, `rcx`, `r8` and `r9` and the rest in an outgoing area at the bottom of the caller's frame, so `rsp` does not move inside a function. Up to two result words return in `rax` and `rdx`; wider results are written to the outgoing area after the stack arguments. Argument and parameter registers are filled with a parallel move that breaks cycles through `r11`.
+
+On fib(38) this runs at 1.25x Go's time.
+
+## Hot reload
+
+`low dev app.low` builds a dev binary, runs it, and watches the source. On save:
+
+- A file that fails to compile is reported and the running program is left alone.
+- The program is restarted when a struct or enum layout changes, when an existing function's signature changes, or when `main` changes. A running frame of old code may still call any function, so it must keep the old calling convention and data layout; `main` never returns to pick up new code.
+- Otherwise every function whose generated assembly differs from the running version is recompiled, including callers whose code changed only because a callee did. New functions are included. Heap, stack and all live values are kept.
+
+Mechanism:
+
+- Dev builds call every function through `fn_table`, a writable table of 4096 code addresses, with `call [rip+fn_table+8*i]`. Release builds call directly.
+- At start the dev runtime installs a `SIGUSR1` handler and maps a 64 MB read-execute region at `0x40000000`, close enough to the binary for 32-bit relative references.
+- A patch is assembled with only the changed functions and their strings, then linked at the next free address in that region against the running binary's symbols (`ld -R`). Patched functions get a fresh symbol suffix so they never collide with the originals.
+- `low dev` writes the machine code into the region through `/proc/<pid>/mem`, writes `(index, address)` pairs and a count into a mailbox in the program, and sends `SIGUSR1`. The handler stores each address into `fn_table` with an aligned 8-byte write and clears the count, which `low dev` waits for.
+- Frames already running keep executing their old code; the next call through the table enters the new code. Old code is never unmapped.
 
 ## Tests
 
-`go test ./...` compiles every `testdata/run/*.low`, runs it and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. Each `testdata/fail/*.low` must fail to compile with the message in its `.err`.
+`internal/hot` tests reload against running programs: state kept across a code swap, functions added, compile errors leaving the program running, heap data surviving a reload while the collector runs, and restarts on layout and signature changes.
+
+`go test ./...` also compiles every `testdata/run/*.low`, runs it and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. Each `testdata/fail/*.low` must fail to compile with the message in its `.err`.
 
 ## Implemented
 
@@ -253,14 +286,15 @@ On fib(38) this runs at 1.5x Go's time, which the SSA IR and register allocator 
 - `mut` parameters.
 - Pointers, `new`, and a garbage-collected heap.
 - Builtins `print(i64)`, `print(str)`, `print(bool)`.
+- Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. SSA IR between check and codegen, with register allocation.
-2. Slices, strings with length, maps.
-3. Optionals.
-4. Generics.
+1. Slices, strings with length, maps.
+2. Optionals.
+3. Generics.
+4. Pointer maps from the register allocator, for precise garbage collection.
 5. Green-thread scheduler, channels, `select`.
 6. Own assembler and linker replacing `as` and `ld`.
 7. Further targets: linux/arm64, darwin, windows.

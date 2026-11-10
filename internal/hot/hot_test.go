@@ -1,0 +1,215 @@
+package hot
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+type fixture struct {
+	t       *testing.T
+	path    string
+	stdout  *syncBuffer
+	stderr  *syncBuffer
+	session *Session
+}
+
+func newFixture(t *testing.T, src string) *fixture {
+	t.Helper()
+	f := &fixture{t: t, path: filepath.Join(t.TempDir(), "app.low"), stdout: &syncBuffer{}, stderr: &syncBuffer{}}
+	f.write(src)
+	session, err := New(f.path, f.stdout, f.stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { session.Close() })
+	f.session = session
+	f.reload()
+	return f
+}
+
+func (f *fixture) write(src string) {
+	f.t.Helper()
+	if err := os.WriteFile(f.path, []byte(src), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *fixture) reload() {
+	f.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := f.session.Reload(ctx); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *fixture) noRestart() {
+	f.t.Helper()
+	if strings.Contains(f.stderr.String(), "restarted") {
+		f.t.Fatalf("program restarted instead of reloading:\n%s", f.stderr)
+	}
+}
+
+func (f *fixture) waitFor(buf *syncBuffer, want string) {
+	f.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), want) {
+		if time.Now().After(deadline) {
+			f.t.Fatalf("timed out waiting for %q\nstdout:\n%s\nstderr:\n%s", want, f.stdout, f.stderr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+const spin = `fn value() -> i64 {
+    VALUE
+}
+
+fn step(n: i64) -> i64 {
+    n + value()
+}
+
+fn main() {
+    print(0)
+    var total = 0
+    var n = value()
+    for n == 1 {
+        total = step(total)
+        n = value()
+    }
+    print(n)
+    print(total > 0)
+}
+`
+
+func program(value string) string {
+	return strings.ReplaceAll(spin, "VALUE", value)
+}
+
+func TestReloadKeepsState(t *testing.T) {
+	f := newFixture(t, program("1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write(program("2"))
+	f.reload()
+	f.waitFor(f.stdout, "0\n2\ntrue\n")
+	f.waitFor(f.stderr, "low: reloaded value in")
+	f.noRestart()
+}
+
+func TestReloadAddsFunction(t *testing.T) {
+	f := newFixture(t, program("1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write(strings.Replace(program("seven() - 4"), "fn main", "fn seven() -> i64 {\n    7\n}\n\nfn main", 1))
+	f.reload()
+	f.waitFor(f.stdout, "0\n3\ntrue\n")
+	f.waitFor(f.stderr, "low: reloaded seven, value in")
+	f.noRestart()
+}
+
+func TestCompileErrorKeepsProgramRunning(t *testing.T) {
+	f := newFixture(t, program("1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write(program("undefined_name"))
+	f.reload()
+	f.waitFor(f.stderr, "undefined: undefined_name")
+	f.write(program("5"))
+	f.reload()
+	f.waitFor(f.stdout, "0\n5\ntrue\n")
+	f.waitFor(f.stderr, "low: reloaded value in")
+	f.noRestart()
+}
+
+const heap = `enum List {
+    Cons(i64, *List)
+    Nil
+}
+
+fn build(n: i64) -> List {
+    if n == 0 {
+        return List.Nil
+    }
+    Cons(n, new(build(n - 1)))
+}
+
+fn total(l: List) -> i64 {
+    match l {
+        Cons(v, rest) => v + total(*rest)
+        Nil => 0
+    }
+}
+
+fn done() -> bool {
+    DONE
+}
+
+fn main() {
+    let list = build(100)
+    print(0)
+    for !done() {
+        let junk = new(build(10))
+    }
+    print(total(list))
+}
+`
+
+func TestReloadKeepsHeap(t *testing.T) {
+	f := newFixture(t, strings.ReplaceAll(heap, "DONE", "false"))
+	f.waitFor(f.stdout, "0\n")
+	scaled := strings.Replace(heap, "v + total(*rest)", "2 * v + total(*rest)", 1)
+	f.write(strings.ReplaceAll(scaled, "DONE", "true"))
+	f.reload()
+	f.waitFor(f.stdout, "0\n10100\n")
+	f.waitFor(f.stderr, "low: reloaded done, total in")
+	f.noRestart()
+}
+
+func TestLayoutChangeRestarts(t *testing.T) {
+	f := newFixture(t, "struct P {\n    x: i64\n}\n\n"+program("1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write("struct P {\n    x: i64\n    y: i64\n}\n\n" + program("2"))
+	f.reload()
+	f.waitFor(f.stderr, "low: restarted: type layout changed")
+	f.waitFor(f.stdout, "0\n0\n2\n")
+}
+
+func TestSignatureChangeRestarts(t *testing.T) {
+	f := newFixture(t, program("1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write(strings.Replace(program("2"), "fn step(n: i64) -> i64 {\n    n + value()", "fn step(n: i64, m: i64) -> i64 {\n    n + m", 1))
+	f.write(strings.Replace(readFile(t, f.path), "step(total)", "step(total, 1)", 1))
+	f.reload()
+	f.waitFor(f.stderr, "low: restarted: ")
+	f.waitFor(f.stdout, "0\n0\n2\n")
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(src)
+}
