@@ -732,6 +732,7 @@ fn main() ! io.Error {
 | `std/container/heap` | A binary `Heap[T]` ordered by a `less` function: `insert`, `pop`, `peek` and `size`. |
 | `std/container/lru` | A least-recently-used `Cache[K, V]` of fixed capacity: `get` (which refreshes the entry), `put` (which returns the evicted key), `contains`, `size` and `keys` from most to least recent, all in constant time over index-linked entries. |
 | `std/container/deque` | A ring-buffer `Deque[T]`: `push_front`, `push_back`, `pop_front`, `pop_back`, `front`, `back`, `at` and `size`, doubling when full. |
+| `std/base32` | RFC 4648 base32 with the standard and extended-hex alphabets: `encode`, `encode_unpadded`, `decode` (case-insensitive, padding optional, failing at the first bad character or on an impossible length), `encode_hex` and `decode_hex`. |
 | `std/base64` | `encode` and `decode`, and `encode_url` and `decode_url` for the URL-safe alphabet without padding (RFC 4648 §5), which reject padding, other alphabets and non-zero trailing bits. |
 
 ### Networking
