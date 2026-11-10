@@ -62,7 +62,7 @@ let n = input |> parse()?
 - A closure captures the variables it names by reference, as Go does: it reads and assigns the variable itself, and the variable lives as long as any closure holding it. Each loop iteration binds fresh variables, so closures made in different iterations see different ones. A `mut` parameter cannot be captured.
 - A function value is called like a function. Values of function type can be stored in variables, fields, slices and maps, passed and returned; they cannot be compared or printed.
 - `x.f(args)` calls `f(x, args)`, so calls chain left to right: `"ab".repeat(3).first()`. `f` is any function callable by its plain name: a function in the current module, a function value in scope, a generic function or a builtin. A struct field of function type named `f` takes precedence, so `op.apply(v)` calls the stored function. When the first parameter is `mut`, `x` is passed as `mut` and must be a mutable place.
-- `x |> f(args)` also calls `f(x, args)`, and `x |> f` calls `f(x)`. The right side is a call, a function name, a module function such as `text.repeat`, a closure or a function-valued field; any other expression is an error. `|>` has the lowest precedence of the binary operators and groups left to right, so `a + b |> f()` is `f(a + b)`. A trailing `?` applies to the call: `x |> parse()?` is `parse(x)?`. A `mut` first parameter receives `x` as `mut`, as with `x.f(args)`.
+- `x |> f(args)` also calls `f(x, args)`, and `x |> f` calls `f(x)`. The right side is a call, a function name, a module function such as `text.repeat`, a closure, or a struct field holding a function, so `x |> ops.scale` calls the stored function and never a function named `scale`; any other expression is an error. `|>` has the lowest precedence of the binary operators and groups left to right, so `a + b |> f()` is `f(a + b)`. A trailing `?` applies to the call: `x |> parse()?` is `parse(x)?`. A `mut` first parameter receives `x` as `mut`, as with `x.f(args)`.
 - A line that starts with `|>` or `.` continues the expression on the line before it.
 
 ### Control flow
@@ -75,11 +75,18 @@ for x in xs { print(x) }
 for i, x in xs { print(i) }
 for n > 0 { n -= 1 }
 for { break }
+
+rows: for row, cells in grid {
+    for col, cell in cells {
+        if cell == want { break rows }
+    }
+}
 ```
 
 - `for i in a..b` counts from `a` up to but not including `b`; the bounds are integers of one type.
 - `for x in xs` visits each element of a slice, and `for i, x in xs` also binds its index as `i64`.
 - Loop variables are immutable. `continue` moves to the next element.
+- A loop can be labelled with `name:` before `for`; `break name` and `continue name` then act on that loop from inside nested loops, running the deferred statements and drops of every block they leave. A label must be used, cannot repeat the label of an enclosing loop, and is not visible inside closures.
 
 ### Numbers
 
@@ -736,7 +743,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 ## Implemented
 
 - Types: `i64`, `i32`, `u32`, `u16`, `u8`, `f64`, `f32`, `bool`, `str`, slices `[]T`, maps `[K: V]`, structs, enums with payloads, results `T ! E`, pointers `*T`.
-- `let`, `var`, assignment, `if`/`else`, `for cond`, `for` with `break`/`continue`, `return`.
+- `let`, `var`, assignment, `if`/`else`, `for cond`, `for` with `break`/`continue` and loop labels, `return`.
 - Functions with parameters and return values, recursion, and `x.f(args)` calls and `x |> f(args)` pipes passing `x` as the first argument.
 - Arithmetic, comparison, logical, bitwise and shift operators; numeric conversions; `sqrt`, `floor` and `exp`.
 - `match`, `fail`, `?`, `catch`.

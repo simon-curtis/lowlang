@@ -295,17 +295,22 @@ type ExprStmt struct {
 }
 
 type For struct {
-	Cond Expr
-	Body *Block
-	Pos  lexer.Pos
+	Label string
+	Cond  Expr
+	Body  *Block
+	Pos   lexer.Pos
 }
 
 type Break struct {
-	Pos lexer.Pos
+	Label string
+	Depth int
+	Pos   lexer.Pos
 }
 
 type Continue struct {
-	Pos lexer.Pos
+	Label string
+	Depth int
+	Pos   lexer.Pos
 }
 
 type Return struct {
@@ -419,6 +424,7 @@ type Interp struct {
 }
 
 type ForIn struct {
+	Label      string
 	Key        string
 	Value      string
 	KeyLocal   *Local
@@ -474,16 +480,16 @@ type Binary struct {
 
 type Call struct {
 	Typed
-	Fn      Expr
-	Args    []Expr
-	Pos     lexer.Pos
-	Piped   bool
-	Target  *Func
-	Builtin string
-	Variant *types.Variant
-	Embed   string
-	Size    int64
-	Digest  uint64
+	Fn        Expr
+	Args      []Expr
+	Pos       lexer.Pos
+	Prepended bool
+	Target    *Func
+	Builtin   string
+	Variant   *types.Variant
+	Embed     string
+	Size      int64
+	Digest    uint64
 }
 
 type If struct {

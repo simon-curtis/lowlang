@@ -619,21 +619,17 @@ func (p *Parser) stmt() ast.Stmt {
 		s.Using = true
 		return s
 	case lexer.For:
-		p.next()
-		if p.at(lexer.Ident) && (p.peek() == lexer.In || p.peek() == lexer.Comma) {
-			return p.forIn(t.Pos)
-		}
-		var cond ast.Expr
-		if !p.at(lexer.LBrace) {
-			cond = p.condition()
-		}
-		return &ast.For{Cond: cond, Body: p.block(), Pos: t.Pos}
+		return p.loop("")
 	case lexer.Break:
 		p.next()
-		return &ast.Break{Pos: t.Pos}
+		return &ast.Break{Label: p.label(), Pos: t.Pos}
 	case lexer.Continue:
 		p.next()
-		return &ast.Continue{Pos: t.Pos}
+		return &ast.Continue{Label: p.label(), Pos: t.Pos}
+	case lexer.Ident:
+		if p.peek() == lexer.Colon {
+			return p.labelled(t)
+		}
 	case lexer.Return:
 		p.next()
 		var value ast.Expr
@@ -667,8 +663,36 @@ func (p *Parser) stmt() ast.Stmt {
 	return &ast.ExprStmt{X: x}
 }
 
-func (p *Parser) forIn(pos lexer.Pos) *ast.ForIn {
-	loop := &ast.ForIn{Value: p.expect(lexer.Ident).Text, Pos: pos}
+func (p *Parser) loop(label string) ast.Stmt {
+	pos := p.expect(lexer.For).Pos
+	if p.at(lexer.Ident) && (p.peek() == lexer.In || p.peek() == lexer.Comma) {
+		return p.forIn(label, pos)
+	}
+	var cond ast.Expr
+	if !p.at(lexer.LBrace) {
+		cond = p.condition()
+	}
+	return &ast.For{Label: label, Cond: cond, Body: p.block(), Pos: pos}
+}
+
+func (p *Parser) labelled(name lexer.Token) ast.Stmt {
+	p.next()
+	p.next()
+	if !p.at(lexer.For) {
+		p.fail(name.Pos, "label %s must be followed by a for loop", name.Text)
+	}
+	return p.loop(name.Text)
+}
+
+func (p *Parser) label() string {
+	if !p.at(lexer.Ident) {
+		return ""
+	}
+	return p.next().Text
+}
+
+func (p *Parser) forIn(label string, pos lexer.Pos) *ast.ForIn {
+	loop := &ast.ForIn{Label: label, Value: p.expect(lexer.Ident).Text, Pos: pos}
 	if p.at(lexer.Comma) {
 		p.next()
 		loop.Key = loop.Value
@@ -746,10 +770,10 @@ func (p *Parser) pipe(x, y ast.Expr, pos lexer.Pos) ast.Expr {
 		return y
 	case *ast.Call:
 		y.Args = append([]ast.Expr{x}, y.Args...)
-		y.Piped = true
+		y.Prepended = true
 		return y
 	case *ast.Ident, *ast.Selector, *ast.Instance, *ast.Closure:
-		return &ast.Call{Fn: y, Args: []ast.Expr{x}, Pos: pos, Piped: true}
+		return &ast.Call{Fn: y, Args: []ast.Expr{x}, Pos: pos, Prepended: true}
 	}
 	p.fail(y.Position(), "the right side of |> must be a function or a call")
 	return nil

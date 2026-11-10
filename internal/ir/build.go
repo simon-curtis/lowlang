@@ -525,12 +525,12 @@ func (b *builder) stmt(s ast.Stmt) {
 	case *ast.ForIn:
 		b.forIn(s)
 	case *ast.Break:
-		loop := b.loops[len(b.loops)-1]
+		loop := b.loops[len(b.loops)-1-s.Depth]
 		b.runDefers(loop.depth)
 		b.jump(loop.brk)
 		b.dead()
 	case *ast.Continue:
-		loop := b.loops[len(b.loops)-1]
+		loop := b.loops[len(b.loops)-1-s.Depth]
 		b.runDefers(loop.depth)
 		b.jump(loop.cont)
 		b.dead()

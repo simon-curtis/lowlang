@@ -126,11 +126,11 @@ func (m *mover) stmt(s ast.Stmt) {
 		m.expr(s.Value, borrow)
 		m.dead = true
 	case *ast.Break:
-		loop := m.loops[len(m.loops)-1]
+		loop := m.loops[len(m.loops)-1-s.Depth]
 		loop.breaks = append(loop.breaks, m.snapshot())
 		m.dead = true
 	case *ast.Continue:
-		loop := m.loops[len(m.loops)-1]
+		loop := m.loops[len(m.loops)-1-s.Depth]
 		loop.continues = append(loop.continues, m.snapshot())
 		m.dead = true
 	case *ast.For:

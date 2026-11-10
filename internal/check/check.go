@@ -27,7 +27,9 @@ type bailout struct {
 }
 
 type loop struct {
+	label  string
 	broken bool
+	used   bool
 }
 
 type scope struct {
@@ -781,11 +783,13 @@ func (c *Checker) stmt(s ast.Stmt) bool {
 		c.forIn(s)
 	case *ast.Break:
 		c.leaving(s.Pos, "break")
-		c.innermostLoop(s.Pos, "break").broken = true
+		var target *loop
+		target, s.Depth = c.target(s.Pos, "break", s.Label)
+		target.broken = true
 		return true
 	case *ast.Continue:
 		c.leaving(s.Pos, "continue")
-		c.innermostLoop(s.Pos, "continue")
+		_, s.Depth = c.target(s.Pos, "continue", s.Label)
 		return true
 	case *ast.Return:
 		c.leaving(s.Pos, "return")
@@ -966,10 +970,9 @@ func (c *Checker) forStmt(s *ast.For) bool {
 	if s.Cond != nil {
 		c.expectType(s.Cond, types.Bool)
 	}
-	l := &loop{}
-	c.loops = append(c.loops, l)
+	l := c.enterLoop(s.Label, s.Pos)
 	c.block(s.Body, nil)
-	c.loops = c.loops[:len(c.loops)-1]
+	c.exitLoop(l, s.Pos)
 	return s.Cond == nil && !l.broken
 }
 
@@ -980,9 +983,9 @@ func (c *Checker) forIn(s *ast.ForIn) {
 		s.KeyLocal = c.declare(s.Key, key, false)
 	}
 	s.ValueLocal = c.declare(s.Value, value, false)
-	c.loops = append(c.loops, &loop{})
+	l := c.enterLoop(s.Label, s.Pos)
 	c.block(s.Body, nil)
-	c.loops = c.loops[:len(c.loops)-1]
+	c.exitLoop(l, s.Pos)
 	c.popScope()
 }
 
@@ -1028,11 +1031,37 @@ func (c *Checker) rangeType(lo, hi ast.Expr) *types.Type {
 	return t
 }
 
-func (c *Checker) innermostLoop(pos lexer.Pos, keyword string) *loop {
-	if len(c.loops) == 0 {
+func (c *Checker) enterLoop(label string, pos lexer.Pos) *loop {
+	for _, outer := range c.loops {
+		if label != "" && outer.label == label {
+			c.fail(pos, "label %s is already used by an enclosing loop", label)
+		}
+	}
+	l := &loop{label: label}
+	c.loops = append(c.loops, l)
+	return l
+}
+
+func (c *Checker) exitLoop(l *loop, pos lexer.Pos) {
+	c.loops = c.loops[:len(c.loops)-1]
+	if l.label != "" && !l.used {
+		c.fail(pos, "label %s is not used", l.label)
+	}
+}
+
+func (c *Checker) target(pos lexer.Pos, keyword, label string) (*loop, int) {
+	if len(c.loops) == 0 && label == "" {
 		c.fail(pos, "%s outside of a loop", keyword)
 	}
-	return c.loops[len(c.loops)-1]
+	for depth := range len(c.loops) {
+		l := c.loops[len(c.loops)-1-depth]
+		if l.label == label || label == "" {
+			l.used = l.used || label != ""
+			return l, depth
+		}
+	}
+	c.fail(pos, "%s %s: no enclosing loop is labelled %s", keyword, label, label)
+	return nil, 0
 }
 
 func (c *Checker) ret(s *ast.Return) {
@@ -1530,8 +1559,8 @@ var builtins = map[string]bool{
 }
 
 func (c *Checker) call(e *ast.Call, want *types.Type) {
-	if e.Piped && c.pipesMut(e.Fn) {
-		e.Args[0] = &ast.Ref{X: e.Args[0], Pos: e.Args[0].Position()}
+	if e.Prepended && c.firstMut(e.Fn) {
+		prependMut(e)
 	}
 	switch fn := e.Fn.(type) {
 	case *ast.Ident:
@@ -1594,6 +1623,8 @@ func (c *Checker) selectorCall(e *ast.Call, sel *ast.Selector, want *types.Type)
 		c.callFunc(e, c.importedFunc(id.Name, sel.Name, sel.Pos), want)
 	case isIdent && c.find(id.Name) == nil:
 		c.fail(id.Pos, "undefined: %s", id.Name)
+	case e.Prepended:
+		c.indirect(e)
 	default:
 		c.method(e, sel, want)
 	}
@@ -1607,19 +1638,29 @@ func (c *Checker) method(e *ast.Call, sel *ast.Selector, want *types.Type) {
 		c.indirect(e)
 		return
 	}
-	var first ast.Expr = receiver
-	if c.receivesMut(sel.Name) {
-		first = &ast.Ref{X: receiver, Pos: sel.X.Position()}
-	}
 	e.Fn = &ast.Ident{Name: sel.Name, Pos: sel.Pos}
-	e.Args = append([]ast.Expr{first}, e.Args...)
+	e.Args = append([]ast.Expr{receiver}, e.Args...)
+	e.Prepended = true
 	c.call(e, want)
 }
 
-func (c *Checker) pipesMut(fn ast.Expr) bool {
+func prependMut(e *ast.Call) {
+	if _, isRef := e.Args[0].(*ast.Ref); !isRef {
+		e.Args[0] = &ast.Ref{X: e.Args[0], Pos: e.Args[0].Position()}
+	}
+}
+
+func (c *Checker) firstMut(fn ast.Expr) bool {
 	switch fn := fn.(type) {
 	case *ast.Ident:
-		return c.receivesMut(fn.Name)
+		if c.find(fn.Name) != nil {
+			return false
+		}
+		if fn.Name == "push" || fn.Name == "delete" {
+			return true
+		}
+		target, ok := c.local().funcs[fn.Name]
+		return ok && len(target.Params) > 0 && target.Params[0].Mut
 	case *ast.Selector:
 		id, isIdent := fn.X.(*ast.Ident)
 		if !isIdent || !c.isModule(id.Name) {
@@ -1631,18 +1672,6 @@ func (c *Checker) pipesMut(fn ast.Expr) bool {
 	return false
 }
 
-func (c *Checker) receivesMut(name string) bool {
-	if local := c.find(name); local != nil {
-		t := local.Type
-		return t.Kind == types.FuncKind && len(t.Muts) > 0 && t.Muts[0]
-	}
-	if name == "push" || name == "delete" {
-		return true
-	}
-	fn, ok := c.local().funcs[name]
-	return ok && len(fn.Params) > 0 && fn.Params[0].Mut
-}
-
 func (c *Checker) indirect(e *ast.Call) {
 	t := c.plain(e.Fn, nil)
 	if t.Kind != types.FuncKind {
@@ -1650,6 +1679,9 @@ func (c *Checker) indirect(e *ast.Call) {
 	}
 	if len(e.Args) != len(t.Params) {
 		c.fail(e.Pos, "%s takes %d arguments, found %d", t, len(t.Params), len(e.Args))
+	}
+	if e.Prepended && t.Muts[0] {
+		prependMut(e)
 	}
 	for i, arg := range e.Args {
 		r, isRef := arg.(*ast.Ref)
@@ -1994,12 +2026,28 @@ func unify(a, b *types.Type) *types.Type {
 
 func (c *Checker) ifExpr(e *ast.If, want *types.Type) {
 	c.expectType(e.Cond, types.Bool)
-	then := c.block(e.Then, want)
 	if e.Else == nil {
+		c.block(e.Then, want)
 		e.Type = types.Void
 		return
 	}
-	e.Type = unify(then, c.expr(e.Else, want))
+	then := c.branch(e.Then, want)
+	e.Type = unify(then, c.branch(e.Else, want))
+}
+
+func (c *Checker) branch(e ast.Expr, want *types.Type) *types.Type {
+	t := c.expr(e, want)
+	if want != nil && want != types.Void && t != types.Never && t.Kind != types.ResultKind && !want.Accepts(t) {
+		c.fail(produced(e).Position(), "expected %s, found %s", want, t)
+	}
+	return t
+}
+
+func produced(e ast.Expr) ast.Expr {
+	if block, ok := e.(*ast.Block); ok && block.Tail != nil {
+		return produced(block.Tail)
+	}
+	return e
 }
 
 func (c *Checker) match(e *ast.Match, want *types.Type) {
@@ -2020,7 +2068,7 @@ func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos lexer.Pos) *
 		}
 		c.pushScope()
 		c.pattern(arm.Pattern, enum)
-		result = unify(result, c.expr(arm.Body, want))
+		result = unify(result, c.branch(arm.Body, want))
 		c.popScope()
 		if arm.Pattern.Test != nil {
 			tested = true
