@@ -806,7 +806,7 @@ The standard library lives in `internal/compiler/std` and is embedded in `low` w
 The garbage collector is a non-moving mark-sweep collector in the runtime:
 
 - The heap is a 16 GB reservation made with `mmap` and `MAP_NORESERVE`; pages are committed as they are touched.
-- Each object has a one-word header holding its size in words, a mark bit, a free bit and a noscan bit. A bitmap records the first word of every object and free chunk, which resolves pointers into the middle of an object, such as a `mut` parameter aimed at a heap field.
+- Each object has a one-word header holding its size in words, a mark bit, a free bit and a noscan bit. A bitmap records the first word of every object and free chunk, which resolves pointers into the middle of an object, such as a `mut` parameter aimed at a heap field. Two summary bitmaps above it hold one bit per non-empty bitmap word and one per non-empty summary word, so finding the start behind an interior pointer skips empty spans 32 KB and 2 MB at a time instead of reading every bitmap word between the pointer and its object's header.
 - Allocation takes from exact-size free lists for objects under 64 words, then first-fit from a list of larger chunks, splitting them, then from the end of the heap.
 - Collection runs when the words allocated since the last one exceed the words that survived it, with a 4 MB floor.
 - An allocation whose type holds no pointers is noscan: `new` of a pointer-free value, and the backing arrays of slices whose elements hold none, such as `[]u8`, `[]i64` and `[]f32`. A noscan object is marked but its contents are never read. Other objects are scanned word by word.
@@ -939,7 +939,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - Green threads on an M:N scheduler with `spawn`, channels, `select`, `sleep`, descriptor waits through epoll, deadlock detection and stack overflow checks.
 - Derived serialization, deserialization and schemas for every type, and `T.field` references.
 - 128- and 256-bit vector types with lane-wise operators, compiled for AVX2 and SSE2 with dispatch at startup.
-- Standard library: files, networking with DNS, pipelines, HTTP/1.1 and HTTP/2 clients and servers, WebSocket, post-quantum TLS 1.3, JSON, the web framework with OpenAPI and authentication, the SQL driver contract and ORM, TOML and XML, DEFLATE/zlib/gzip, xz, Zstandard, LZ4 and Brotli compression, bitsets and Roaring bitmaps, image codecs, checksums, and cryptography: AES-256-GCM, ChaCha20-Poly1305, SHA-2, SHA-3, SHAKE, BLAKE2b, HMAC, HKDF, PBKDF2, Argon2id, X25519, ML-KEM-512/768/1024, Ed25519, ECDSA P-256/P-384, RSA, X.509 and JOSE.
+- Standard library: files, networking with DNS, pipelines, HTTP/1.1 and HTTP/2 clients and servers, WebSocket, post-quantum TLS 1.3, JSON, the web framework with OpenAPI and authentication, the SQL driver contract, a PostgreSQL driver and the ORM, TOML and XML, DEFLATE/zlib/gzip, xz, Zstandard, LZ4 and Brotli compression, bitsets and Roaring bitmaps, image codecs, checksums, and cryptography: AES-256-GCM, ChaCha20-Poly1305, SHA-2, SHA-3, SHAKE, BLAKE2b, HMAC, HKDF, PBKDF2, Argon2id, X25519, ML-KEM-512/768/1024, Ed25519, ECDSA P-256/P-384, RSA, X.509 and JOSE.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 

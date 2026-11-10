@@ -107,6 +107,10 @@ rt_heap_bump:
 	.zero 8
 rt_bitmap:
 	.zero 8
+rt_summary1:
+	.zero 8
+rt_summary2:
+	.zero 8
 rt_mark_base:
 	.zero 8
 rt_alloc_since:
@@ -434,6 +438,12 @@ rt_gc_init:
 	mov rsi, 268435456
 	call rt_mmap
 	mov [rip+rt_bitmap], rax
+	mov rsi, 4194304
+	call rt_mmap
+	mov [rip+rt_summary1], rax
+	mov rsi, 65536
+	call rt_mmap
+	mov [rip+rt_summary2], rax
 	mov rsi, 8589934592
 	call rt_mmap
 	mov [rip+rt_mark_base], rax
@@ -446,6 +456,12 @@ rt_set_start:
 	shr rax, 3
 	mov rcx, [rip+rt_bitmap]
 	bts qword ptr [rcx], rax
+	shr rax, 6
+	mov rcx, [rip+rt_summary1]
+	bts qword ptr [rcx], rax
+	shr rax, 6
+	mov rcx, [rip+rt_summary2]
+	bts qword ptr [rcx], rax
 	ret
 
 rt_clear_start:
@@ -454,6 +470,17 @@ rt_clear_start:
 	shr rax, 3
 	mov rcx, [rip+rt_bitmap]
 	btr qword ptr [rcx], rax
+	shr rax, 6
+	cmp qword ptr [rcx+8*rax], 0
+	jne 1f
+	mov rcx, [rip+rt_summary1]
+	btr qword ptr [rcx], rax
+	shr rax, 6
+	cmp qword ptr [rcx+8*rax], 0
+	jne 1f
+	mov rcx, [rip+rt_summary2]
+	btr qword ptr [rcx], rax
+1:
 	ret
 
 rt_free_chunk:
@@ -567,38 +594,85 @@ rt_alloc_body:
 rt_find:
 	mov r8, [rip+rt_heap_start]
 	cmp rdi, r8
-	jb 3f
+	jb 9f
 	cmp rdi, [rip+rt_heap_bump]
-	jae 3f
+	jae 9f
 	mov rdx, rdi
 	sub rdx, r8
 	shr rdx, 3
 	mov r9, [rip+rt_bitmap]
-	mov rcx, rdx
-	and ecx, 63
-	shr rdx, 6
-	mov rax, [r9+8*rdx]
-	xor ecx, 63
+	mov rax, rdx
+	shr rax, 6
+	mov rax, [r9+8*rax]
+	mov ecx, edx
+	not ecx
 	shl rax, cl
 	test rax, rax
 	jz 1f
 	bsr rax, rax
-	sub rax, rcx
-	jmp 2f
+	lea rax, [rax+rdx-63]
+	jmp 8f
 1:
-	test rdx, rdx
+	shr rdx, 6
+	sub rdx, 1
+	jb 9f
+	mov r9, [rip+rt_summary1]
+	mov rax, rdx
+	shr rax, 6
+	mov rax, [r9+8*rax]
+	mov ecx, edx
+	not ecx
+	shl rax, cl
+	test rax, rax
+	jz 2f
+	bsr rax, rax
+	lea rax, [rax+rdx-63]
+	jmp 7f
+2:
+	shr rdx, 6
+	sub rdx, 1
+	jb 9f
+	mov r9, [rip+rt_summary2]
+	mov rax, rdx
+	shr rax, 6
+	mov rax, [r9+8*rax]
+	mov ecx, edx
+	not ecx
+	shl rax, cl
+	test rax, rax
 	jz 3f
-	dec rdx
+	bsr rax, rax
+	lea rax, [rax+rdx-63]
+	jmp 6f
+3:
+	shr rdx, 6
+4:
+	sub rdx, 1
+	jb 9f
 	mov rax, [r9+8*rdx]
 	test rax, rax
-	jz 1b
+	jz 4b
 	bsr rax, rax
-2:
 	shl rdx, 6
 	add rax, rdx
+6:
+	mov r9, [rip+rt_summary1]
+	mov rdx, rax
+	mov rax, [r9+8*rax]
+	bsr rax, rax
+	shl rdx, 6
+	add rax, rdx
+7:
+	mov r9, [rip+rt_bitmap]
+	mov rdx, rax
+	mov rax, [r9+8*rax]
+	bsr rax, rax
+	shl rdx, 6
+	add rax, rdx
+8:
 	lea rax, [r8+8*rax]
 	ret
-3:
+9:
 	xor eax, eax
 	ret
 
