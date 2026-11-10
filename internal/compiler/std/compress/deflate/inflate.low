@@ -1,0 +1,542 @@
+import std/hash
+import std/io
+
+struct Inflater {
+    source: *io.Reader?
+    input: []u8
+    at: i64
+    end: i64
+    bits: u64
+    count: i64
+    out: []u8
+    pos: i64
+    flushed: i64
+    total: i64
+    member: i64
+    limit: i64
+    sink: fn([]u8) ! io.Error
+    format: Format
+    crc: *hash.Crc32
+    adler: u32
+    one: []u8
+    tables: Tables
+    lens: []u8
+    lit: []u32
+    dist: []u32
+    clen: []u32
+    fixed_lit: []u32
+    fixed_dist: []u32
+}
+
+fn inflater(source: *io.Reader?, input: []u8, end: i64, format: Format, sink: fn([]u8) ! io.Error, limit: i64) -> *Inflater {
+    new(Inflater {
+        source
+        input
+        at: 0
+        end
+        bits: 0
+        count: 0
+        out: __make(98304 + 258)
+        pos: 0
+        flushed: 0
+        total: 0
+        member: 0
+        limit
+        sink
+        format
+        crc: hash.crc32_new()
+        adler: 1
+        one: __make(1)
+        tables: tables()
+        lens: __make(320)
+        lit: __make(1024 + 288 * 32)
+        dist: __make(256 + 30 * 128)
+        clen: __make(128)
+        fixed_lit: []
+        fixed_dist: []
+    })
+}
+
+fn pull(s: *Inflater) -> bool ! io.Error {
+    match s.source {
+        some(r) => {
+            emit(s, s.out[s.flushed..s.pos])?
+            s.flushed = s.pos
+            let n = io.read_some(r, s.input)?
+            s.at = 0
+            s.end = n
+            n > 0
+        }
+        none => false
+    }
+}
+
+fn refill(s: *Inflater, need: i64) ! io.Error {
+    var bits = s.bits
+    var count = s.count
+    for count <= 56 {
+        if s.at == s.end {
+            if count >= need {
+                break
+            }
+            s.bits = bits
+            s.count = count
+            if !pull(s)? {
+                return
+            }
+        }
+        bits |= u64(s.input[s.at]) << u64(count)
+        s.at += 1
+        count += 8
+    }
+    s.bits = bits
+    s.count = count
+}
+
+fn take(s: *Inflater, n: i64) -> i64 ! io.Error {
+    if s.count < n {
+        refill(s, n)?
+        if s.count < n {
+            fail Malformed
+        }
+    }
+    let v = i64(s.bits) & ((1 << n) - 1)
+    s.bits >>= u64(n)
+    s.count -= n
+    v
+}
+
+fn lookup(bits: u64, table: []u32, root: i64) -> u32 {
+    let e = table[i64(bits) & ((1 << root) - 1)]
+    if e & 0x80 == 0 {
+        return e
+    }
+    table[i64(e >> 8) + (i64(bits >> u64(root)) & ((1 << i64(e & 15)) - 1))]
+}
+
+fn symbol(s: *Inflater, table: []u32, root: i64) -> i64 ! io.Error {
+    if s.count < 15 {
+        refill(s, 0)?
+    }
+    var e = lookup(s.bits, table, root)
+    var n = i64(e & 15)
+    if (n == 0 || n > s.count) && s.count < 15 {
+        refill(s, 15)?
+        e = lookup(s.bits, table, root)
+        n = i64(e & 15)
+    }
+    if n == 0 || n > s.count {
+        fail Malformed
+    }
+    s.bits >>= u64(n)
+    s.count -= n
+    i64(e >> 8)
+}
+
+fn align_input(s: *Inflater) {
+    let partial = s.count % 8
+    s.bits >>= u64(partial)
+    s.count -= partial
+}
+
+fn more_input(s: *Inflater) -> bool ! io.Error {
+    s.count >= 8 || s.at < s.end || pull(s)?
+}
+
+fn build_decode_table(lens: []u8, table: []u32, root: i64) ! io.Error {
+    let count: []i64 = __make(16)
+    var longest = 0
+    for l in lens {
+        count[l] += 1
+        if i64(l) > longest {
+            longest = i64(l)
+        }
+    }
+    count[0] = 0
+    var left = 1
+    for len in 1..16 {
+        left = (left << 1) - count[len]
+        if left < 0 {
+            fail Malformed
+        }
+    }
+    let next: []i64 = __make(16)
+    var code = 0
+    for len in 1..16 {
+        code = (code + count[len - 1]) << 1
+        next[len] = code
+    }
+    let size = 1 << root
+    for i in 0..size {
+        table[i] = 0
+    }
+    let sub = if longest > root { longest - root } else { 0 }
+    var spare = size
+    for sym, l in lens {
+        if l == 0 {
+            continue
+        }
+        let n = i64(l)
+        let reversed = reverse(next[n], n)
+        next[n] += 1
+        let entry = u32(sym) << 8 | u32(n)
+        if n <= root {
+            var i = reversed
+            for i < size {
+                table[i] = entry
+                i += 1 << n
+            }
+            continue
+        }
+        let prefix = reversed & (size - 1)
+        var link = table[prefix]
+        if link == 0 {
+            link = u32(spare) << 8 | 0x80 | u32(sub)
+            table[prefix] = link
+            for i in spare..spare + (1 << sub) {
+                table[i] = 0
+            }
+            spare += 1 << sub
+        }
+        let start = i64(link >> 8)
+        var i = reversed >> root
+        for i < 1 << sub {
+            table[start + i] = entry
+            i += 1 << (n - root)
+        }
+    }
+}
+
+fn emit(s: *Inflater, chunk: []u8) ! io.Error {
+    if chunk.len == 0 {
+        return
+    }
+    s.total += chunk.len
+    if s.total > s.limit {
+        fail TooLarge
+    }
+    s.member += chunk.len
+    match s.format {
+        Raw => {}
+        Zlib => {
+            s.adler = hash.adler32_update(s.adler, chunk)
+        }
+        Gzip => hash.crc32_update(s.crc, chunk)
+    }
+    s.sink(chunk)?
+}
+
+fn shift_window(s: *Inflater) ! io.Error {
+    emit(s, s.out[s.flushed..s.pos])?
+    let keep = s.pos - 32768
+    __memmove(s.out, s.out[keep..s.pos])
+    s.pos = 32768
+    s.flushed = 32768
+}
+
+fn read_stored(s: *Inflater) ! io.Error {
+    align_input(s)
+    let len = take(s, 16)?
+    let check = take(s, 16)?
+    if len != ~check & 0xFFFF {
+        fail Malformed
+    }
+    let full = s.out.len - 258
+    var left = len
+    for left > 0 {
+        if s.pos >= full {
+            shift_window(s)?
+        }
+        if s.count >= 8 {
+            s.out[s.pos] = u8(s.bits)
+            s.bits >>= 8
+            s.count -= 8
+            s.pos += 1
+            left -= 1
+            continue
+        }
+        if s.at == s.end && !pull(s)? {
+            fail Malformed
+        }
+        let room = if full - s.pos < left { full - s.pos } else { left }
+        let n = __memmove(s.out[s.pos..s.pos + room], s.input[s.at..s.end])
+        s.at += n
+        s.pos += n
+        left -= n
+    }
+}
+
+fn copy_match(out: []u8, pos: i64, distance: i64, length: i64) {
+    let from = pos - distance
+    if distance >= length && length > 16 {
+        __memmove(out[pos..pos + length], out[from..from + length])
+        return
+    }
+    for i in 0..length {
+        out[pos + i] = out[from + i]
+    }
+}
+
+fn read_codes(s: *Inflater, lit: []u32, dist: []u32) ! io.Error {
+    let t = s.tables
+    let out = s.out
+    let full = out.len - 258
+    for {
+        if s.pos >= full {
+            shift_window(s)?
+        }
+        let sym = symbol(s, lit, 10)?
+        if sym < 256 {
+            out[s.pos] = u8(sym)
+            s.pos += 1
+            continue
+        }
+        if sym == 256 {
+            return
+        }
+        let li = sym - 257
+        if li >= 29 {
+            fail Malformed
+        }
+        let length = t.len_base[li] + take(s, t.len_extra[li])?
+        let ds = symbol(s, dist, 8)?
+        if ds >= 30 {
+            fail Malformed
+        }
+        let distance = t.dist_base[ds] + take(s, t.dist_extra[ds])?
+        if distance > s.pos {
+            fail Malformed
+        }
+        copy_match(out, s.pos, distance, length)
+        s.pos += length
+    }
+}
+
+fn read_fixed(s: *Inflater) ! io.Error {
+    if s.fixed_lit.len == 0 {
+        let lit: []u32 = __make(1024)
+        let dist: []u32 = __make(256)
+        build_decode_table(fixed_lengths(), lit, 10)?
+        build_decode_table(fixed_distance_lengths(), dist, 8)?
+        s.fixed_lit = lit
+        s.fixed_dist = dist
+    }
+    read_codes(s, s.fixed_lit, s.fixed_dist)?
+}
+
+fn read_dynamic(s: *Inflater) ! io.Error {
+    let hlit = take(s, 5)? + 257
+    let hdist = take(s, 5)? + 1
+    let hclen = take(s, 4)? + 4
+    if hlit > 286 || hdist > 30 {
+        fail Malformed
+    }
+    let order = s.tables.order
+    let lens = s.lens
+    for i in 0..19 {
+        lens[i] = 0
+    }
+    for i in 0..hclen {
+        lens[order[i]] = u8(take(s, 3)?)
+    }
+    build_decode_table(lens[..19], s.clen, 7)?
+    let n = hlit + hdist
+    var i = 0
+    for i < n {
+        let sym = symbol(s, s.clen, 7)?
+        if sym < 16 {
+            lens[i] = u8(sym)
+            i += 1
+            continue
+        }
+        var value: u8 = 0
+        var repeat = 0
+        if sym == 16 {
+            if i == 0 {
+                fail Malformed
+            }
+            value = lens[i - 1]
+            repeat = 3 + take(s, 2)?
+        } else if sym == 17 {
+            repeat = 3 + take(s, 3)?
+        } else {
+            repeat = 11 + take(s, 7)?
+        }
+        if i + repeat > n {
+            fail Malformed
+        }
+        for k in i..i + repeat {
+            lens[k] = value
+        }
+        i += repeat
+    }
+    if lens[256] == 0 {
+        fail Malformed
+    }
+    build_decode_table(lens[..hlit], s.lit, 10)?
+    build_decode_table(lens[hlit..n], s.dist, 8)?
+    read_codes(s, s.lit, s.dist)?
+}
+
+fn inflate_stream(s: *Inflater) ! io.Error {
+    s.pos = 0
+    s.flushed = 0
+    for {
+        let last = take(s, 1)?
+        let kind = take(s, 2)?
+        if kind == 0 {
+            read_stored(s)?
+        } else if kind == 1 {
+            read_fixed(s)?
+        } else if kind == 2 {
+            read_dynamic(s)?
+        } else {
+            fail Malformed
+        }
+        if last == 1 {
+            break
+        }
+    }
+    emit(s, s.out[s.flushed..s.pos])?
+    s.flushed = s.pos
+    align_input(s)
+}
+
+fn zlib_member(s: *Inflater) ! io.Error {
+    let cmf = take(s, 8)?
+    let flg = take(s, 8)?
+    if cmf & 15 != 8 || cmf >> 4 > 7 || (cmf << 8 | flg) % 31 != 0 {
+        fail Malformed
+    }
+    if flg & 0x20 != 0 {
+        fail Unsupported
+    }
+    s.adler = 1
+    inflate_stream(s)?
+    var expected = 0
+    for _ in 0..4 {
+        let b = take(s, 8)?
+        expected = expected << 8 | b
+    }
+    if u32(expected) != s.adler {
+        fail Malformed
+    }
+}
+
+fn header_byte(s: *Inflater, header: *hash.Crc32) -> i64 ! io.Error {
+    let b = take(s, 8)?
+    s.one[0] = u8(b)
+    hash.crc32_update(header, s.one)
+    b
+}
+
+fn header_le16(s: *Inflater, header: *hash.Crc32) -> i64 ! io.Error {
+    let low = header_byte(s, header)?
+    let high = header_byte(s, header)?
+    low | high << 8
+}
+
+fn trailer_le32(s: *Inflater) -> i64 ! io.Error {
+    var v = 0
+    for k in 0..4 {
+        let b = take(s, 8)?
+        v |= b << (8 * k)
+    }
+    v
+}
+
+fn gzip_member(s: *Inflater) ! io.Error {
+    let header = hash.crc32_new()
+    let id1 = header_byte(s, header)?
+    let id2 = header_byte(s, header)?
+    let method = header_byte(s, header)?
+    if id1 != 0x1F || id2 != 0x8B || method != 8 {
+        fail Malformed
+    }
+    let flags = header_byte(s, header)?
+    if flags & 0xE0 != 0 {
+        fail Malformed
+    }
+    for _ in 0..6 {
+        header_byte(s, header)?
+    }
+    if flags & 4 != 0 {
+        let xlen = header_le16(s, header)?
+        for _ in 0..xlen {
+            header_byte(s, header)?
+        }
+    }
+    if flags & 8 != 0 {
+        for header_byte(s, header)? != 0 {}
+    }
+    if flags & 16 != 0 {
+        for header_byte(s, header)? != 0 {}
+    }
+    if flags & 2 != 0 {
+        let want = i64(hash.crc32_sum(header)) & 0xFFFF
+        let low = take(s, 8)?
+        let high = take(s, 8)?
+        if low | high << 8 != want {
+            fail Malformed
+        }
+    }
+    s.crc = hash.crc32_new()
+    s.member = 0
+    inflate_stream(s)?
+    let crc = trailer_le32(s)?
+    let size = trailer_le32(s)?
+    if u32(crc) != hash.crc32_sum(s.crc) || size != s.member & 0xFFFFFFFF {
+        fail Malformed
+    }
+}
+
+fn run(s: *Inflater) ! io.Error {
+    match s.format {
+        Raw => inflate_stream(s)?
+        Zlib => zlib_member(s)?
+        Gzip => {
+            gzip_member(s)?
+            for more_input(s)? {
+                gzip_member(s)?
+            }
+        }
+    }
+}
+
+fn decode_stream(r: *io.Reader, format: Format, sink: fn([]u8) ! io.Error, limit: i64) ! io.Error {
+    let input = io.buffer(16384)
+    let s = inflater(r, input, 0, format, sink, limit)
+    run(s)?
+}
+
+fn decode_buffer(data: []u8, format: Format, limit: i64) -> []u8 ! io.Error {
+    let c = collector(data.len * 4 + 64, limit)
+    let sink: fn([]u8) ! io.Error = fn(chunk) { collect(c, chunk) }
+    let s = inflater(none, data, data.len, format, sink, limit)
+    run(s)?
+    contents(c)
+}
+
+pub fn decode(r: *io.Reader, sink: fn([]u8) ! io.Error, limit: i64) ! io.Error {
+    decode_stream(r, Raw, sink, limit)?
+}
+
+pub fn zlib_decode(r: *io.Reader, sink: fn([]u8) ! io.Error, limit: i64) ! io.Error {
+    decode_stream(r, Zlib, sink, limit)?
+}
+
+pub fn gzip_decode(r: *io.Reader, sink: fn([]u8) ! io.Error, limit: i64) ! io.Error {
+    decode_stream(r, Gzip, sink, limit)?
+}
+
+pub fn decompress(data: []u8, limit: i64) -> []u8 ! io.Error {
+    decode_buffer(data, Raw, limit)
+}
+
+pub fn zlib_decompress(data: []u8, limit: i64) -> []u8 ! io.Error {
+    decode_buffer(data, Zlib, limit)
+}
+
+pub fn gzip_decompress(data: []u8, limit: i64) -> []u8 ! io.Error {
+    decode_buffer(data, Gzip, limit)
+}
