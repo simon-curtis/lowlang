@@ -1,0 +1,241 @@
+import std/io
+import std/sql
+import std/text
+
+fn collation() -> []u8 {
+    [0x09, 0x04, 0xD0, 0x00, 0x34]
+}
+
+fn put_wide(mut b: []u8, units: []u8) -> str {
+    push(mut b, 0xE7)
+    if units.len <= 8000 {
+        put_le16(mut b, 8000)
+        io.append(mut b, collation())
+        put_le16(mut b, units.len)
+        io.append(mut b, units)
+        return "nvarchar(4000)"
+    }
+    put_le16(mut b, 0xFFFF)
+    io.append(mut b, collation())
+    put_partial(mut b, units)
+    "nvarchar(max)"
+}
+
+fn put_binary(mut b: []u8, data: []u8) -> str {
+    push(mut b, 0xA5)
+    if data.len <= 8000 {
+        put_le16(mut b, 8000)
+        put_le16(mut b, data.len)
+        io.append(mut b, data)
+        return "varbinary(8000)"
+    }
+    put_le16(mut b, 0xFFFF)
+    put_partial(mut b, data)
+    "varbinary(max)"
+}
+
+fn put_partial(mut b: []u8, data: []u8) {
+    put_le64(mut b, data.len)
+    if data.len > 0 {
+        put_le32(mut b, data.len)
+        io.append(mut b, data)
+    }
+    put_le32(mut b, 0)
+}
+
+fn put_fixed(mut b: []u8, id: u8, v: i64, size: i64) {
+    push(mut b, id)
+    push(mut b, u8(size))
+    push(mut b, u8(size))
+    for i in 0..size {
+        push(mut b, u8(v >> (8 * i)))
+    }
+}
+
+fn put_units(mut b: []u8, v: i64, size: i64) {
+    for i in 0..size {
+        push(mut b, u8(v >> (8 * i)))
+    }
+}
+
+fn day_number(days: i64) -> i64 ! sql.Error {
+    let n = days + days_to_epoch()
+    if days < -days_to_epoch() || n > last_day() {
+        fail Conversion
+    }
+    n
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if a % b != 0 && (a < 0) != (b < 0) { q - 1 } else { q }
+}
+
+fn put_stamp(mut b: []u8, id: u8, micros: i64) ! sql.Error {
+    let days = floor_div(micros, micros_per_day())
+    let day = day_number(days)?
+    let clock = micros - days * micros_per_day()
+    push(mut b, id)
+    push(mut b, 7)
+    push(mut b, if id == 0x2B { 10 } else { 8 })
+    put_units(mut b, clock * 10, 5)
+    put_units(mut b, day, 3)
+    if id == 0x2B {
+        put_units(mut b, 0, 2)
+    }
+}
+
+struct Mantissa {
+    negative: bool
+    low: u64
+    high: u64
+    digits: i64
+    scale: i64
+}
+
+fn mantissa(s: str) -> Mantissa ! sql.Error {
+    var m = Mantissa { negative: false, low: 0, high: 0, digits: 0, scale: 0 }
+    var at = 0
+    if at < s.len && (s[at] == '-' || s[at] == '+') {
+        m.negative = s[at] == '-'
+        at += 1
+    }
+    var seen = false
+    var point = false
+    for at < s.len {
+        let ch = s[at]
+        at += 1
+        if ch == '.' && !point {
+            point = true
+            continue
+        }
+        if ch < '0' || ch > '9' {
+            fail Conversion
+        }
+        seen = true
+        if point {
+            m.scale += 1
+        }
+        if m.digits == 0 && ch == '0' && !point {
+            continue
+        }
+        m.digits += 1
+        if m.digits > 38 {
+            fail Conversion
+        }
+        let d = u64(ch - '0')
+        let low = m.low * 10
+        let carry = __mulhi(m.low, 10)
+        m.low = low + d
+        m.high = m.high * 10 + carry + if m.low < low { 1 } else { 0 }
+    }
+    if !seen || m.scale > 38 {
+        fail Conversion
+    }
+    m
+}
+
+fn put_decimal(mut b: []u8, digits: str) -> str ! sql.Error {
+    let m = mantissa(digits)?
+    push(mut b, 0x6A)
+    push(mut b, 17)
+    push(mut b, 38)
+    push(mut b, u8(m.scale))
+    push(mut b, 17)
+    push(mut b, if m.negative { 0 } else { 1 })
+    put_le64(mut b, i64(m.low))
+    put_le64(mut b, i64(m.high))
+    "decimal(38, {m.scale})"
+}
+
+fn put_value(mut b: []u8, v: sql.Value) -> str ! sql.Error {
+    match v {
+        Null => {
+            push(mut b, 0xE7)
+            put_le16(mut b, 8000)
+            io.append(mut b, collation())
+            put_le16(mut b, 0xFFFF)
+            "nvarchar(4000)"
+        }
+        Bool(x) => {
+            put_fixed(mut b, 0x68, if x { 1 } else { 0 }, 1)
+            "bit"
+        }
+        Int(n) => {
+            put_fixed(mut b, 0x26, n, 8)
+            "bigint"
+        }
+        Float(x) => {
+            if x != x || x > 1.7976931348623157e308 || x < -1.7976931348623157e308 {
+                fail Conversion
+            }
+            put_fixed(mut b, 0x6D, i64(text.float_bits(x)), 8)
+            "float"
+        }
+        Decimal(d) => put_decimal(mut b, d)?
+        Text(s) => put_wide(mut b, utf16(s))
+        Bytes(data) => put_binary(mut b, data)
+        Uuid(data) => {
+            if data.len != 16 {
+                fail Conversion
+            }
+            push(mut b, 0x24)
+            push(mut b, 16)
+            push(mut b, 16)
+            io.append(mut b, guid_order(data))
+            "uniqueidentifier"
+        }
+        Date(days) => {
+            let day = day_number(days)?
+            push(mut b, 0x28)
+            push(mut b, 3)
+            put_units(mut b, day, 3)
+            "date"
+        }
+        Time(micros) => {
+            if micros < 0 || micros >= micros_per_day() {
+                fail Conversion
+            }
+            push(mut b, 0x29)
+            push(mut b, 7)
+            push(mut b, 5)
+            put_units(mut b, micros * 10, 5)
+            "time(7)"
+        }
+        Timestamp(micros) => {
+            put_stamp(mut b, 0x2A, micros)?
+            "datetime2(7)"
+        }
+        TimestampTz(micros) => {
+            put_stamp(mut b, 0x2B, micros)?
+            "datetimeoffset(7)"
+        }
+    }
+}
+
+fn rpc_message(text: str, values: []sql.Value, transaction: []u8) -> []u8 ! sql.Error {
+    var params: []u8 = []
+    var declarations: []u8 = []
+    for i, v in values {
+        put_b_varchar(mut params, "@p{i + 1}")?
+        push(mut params, 0)
+        let declared = put_value(mut params, v)?
+        if i > 0 {
+            io.append_str(mut declarations, ", ")
+        }
+        io.append_str(mut declarations, "@p{i + 1} {declared}")
+    }
+    var b: []u8 = []
+    all_headers(mut b, transaction)
+    put_le16(mut b, 0xFFFF)
+    put_le16(mut b, 10)
+    put_le16(mut b, 0)
+    push(mut b, 0)
+    push(mut b, 0)
+    put_wide(mut b, utf16(text))
+    push(mut b, 0)
+    push(mut b, 0)
+    put_wide(mut b, utf16(__str_view(declarations)))
+    io.append(mut b, params)
+    b
+}
