@@ -484,6 +484,8 @@ rt_alloc:
 
 rt_alloc_body:
 	push rsi
+	cmp rdi, 1
+	adc rdi, 0
 	lea rsi, [rdi+1]
 	mov rax, [rip+rt_alloc_since]
 	add rax, rsi
