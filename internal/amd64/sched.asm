@@ -1,112 +1,3 @@
-
-	.set TLS_M, -24
-	.set TLS_G, -16
-	.set TLS_FLAG, -8
-
-	.set M_STATE, 0
-	.set M_CURG, 8
-	.set M_G0TOP, 16
-	.set M_G0SP, 24
-	.set M_LOCKS, 32
-	.set M_PARK, 40
-	.set M_QLOCK, 48
-	.set M_QHEAD, 56
-	.set M_QTAIL, 64
-	.set M_TICK, 72
-	.set M_LASTTICK, 80
-	.set M_NEXT, 88
-	.set M_FLAG, 96
-	.set M_RUNNEXT, 128
-	.set M_SPINNING, 136
-	.set M_QUEUE, 256
-	.set M_TLS, 2304
-	.set M_TCB, 2328
-	.set M_SIZE, 4096
-
-	.set RUNNING, 1
-	.set IDLE, 2
-	.set INC, 3
-	.set STOPPED, 4
-	.set HELD, 8
-
-	.set G_STATUS, 0
-	.set G_SP, 8
-	.set G_SCANLO, 16
-	.set G_USERSP, 24
-	.set G_PC, 32
-	.set G_FP, 40
-	.set G_HI, 48
-	.set G_LO, 56
-	.set G_LOCK, 64
-	.set G_TOKEN, 72
-	.set G_NEXT, 80
-	.set G_LOCKEDM, 88
-	.set G_CTX, 104
-
-	.set G_FREE, 0
-	.set G_RUNNABLE, 1
-	.set G_RUNNING, 2
-	.set G_WAITING, 3
-
-	.set GUARD, 4096
-	.set STACK, 1048576
-	.set G_MAP, 1056768
-	.set G0_STACK, 8388608
-	.set MAXM, 256
-	.set MAXG, 1048576
-	.set MAXT, 65536
-	.set T_WORDS, 5
-
-	.macro SAVE_ALL
-	push rax
-	push rbx
-	push rcx
-	push rdx
-	push rsi
-	push rdi
-	push rbp
-	push r8
-	push r9
-	push r10
-	push r11
-	push r12
-	push r13
-	push r14
-	push r15
-	.endm
-
-	.macro RESTORE_ALL
-	pop r15
-	pop r14
-	pop r13
-	pop r12
-	pop r11
-	pop r10
-	pop r9
-	pop r8
-	pop rbp
-	pop rdi
-	pop rsi
-	pop rdx
-	pop rcx
-	pop rbx
-	pop rax
-	.endm
-
-	.macro ENTER_RT
-	mov rax, qword ptr fs:[TLS_G]
-	mov r11, [rsp]
-	mov [rax+G_PC], r11
-	lea r11, [rsp+8]
-	mov [rax+G_USERSP], r11
-	mov [rax+G_FP], rbp
-	.endm
-
-	.section .tbss,"awT",@nobits
-	.p2align 3
-rt_tls:
-	.zero 24
-
 	.section .rodata
 rt_msg_deadlock:
 	.quad 37
@@ -123,9 +14,6 @@ rt_msg_timers:
 rt_msg_threads:
 	.quad 22
 	.ascii "too many green threads"
-rt_sysmon_sleep:
-	.quad 0
-	.quad 10000000
 
 	.bss
 	.p2align 3
@@ -170,18 +58,10 @@ rt_ntimers:
 	.zero 8
 rt_timer_seq:
 	.zero 8
-rt_epfd:
-	.zero 8
-rt_evfd:
-	.zero 8
 rt_poller:
 	.zero 8
 rt_nfdwait:
 	.zero 8
-rt_poll_lock:
-	.zero 8
-rt_scratch:
-	.zero 128
 
 	.text
 rt_spin_lock:
@@ -195,10 +75,7 @@ rt_spin_lock:
 	inc ecx
 	cmp ecx, 1000
 	jb 3f
-	push rdi
-	mov eax, 24
-	syscall
-	pop rdi
+	call rt_yield
 	xor ecx, ecx
 3:
 	cmp qword ptr [rdi], 0
@@ -209,21 +86,6 @@ rt_spin_lock:
 
 rt_spin_unlock:
 	mov qword ptr [rdi], 0
-	ret
-
-rt_futex_wait:
-	mov eax, 202
-	mov rdx, rsi
-	mov esi, 128
-	xor r10d, r10d
-	syscall
-	ret
-
-rt_futex_wake:
-	mov eax, 202
-	mov rdx, rsi
-	mov esi, 129
-	syscall
 	ret
 
 rt_gc_wait:
@@ -244,7 +106,7 @@ rt_m_running:
 
 	push rbx
 	push r12
-	mov rbx, qword ptr fs:[TLS_M]
+	TLS_GET rbx, TLS_M
 	mov r12, rdi
 1:
 	mov rax, r12
@@ -299,9 +161,9 @@ rt_exitc:
 
 rt_stop_here:
 	SAVE_ALL
-	mov rax, qword ptr fs:[TLS_G]
+	TLS_GET rax, TLS_G
 	mov [rax+G_SCANLO], rsp
-	mov rbx, qword ptr fs:[TLS_M]
+	TLS_GET rbx, TLS_M
 	mov eax, STOPPED
 	xchg [rbx+M_STATE], rax
 	mov edi, STOPPED
@@ -310,9 +172,9 @@ rt_stop_here:
 	ret
 
 rt_set_idle:
-	mov rcx, qword ptr fs:[TLS_M]
+	TLS_GET rcx, TLS_M
 	mov qword ptr [rcx+M_CURG], 0
-	mov qword ptr fs:[TLS_G], 0
+	TLS_SET TLS_G, 0
 	mov eax, IDLE
 	xchg [rcx+M_STATE], rax
 	ret
@@ -353,15 +215,15 @@ rt_lock_body:
 	pop rdi
 	jmp 4b
 9:
-	mov rax, qword ptr fs:[TLS_M]
+	TLS_GET rax, TLS_M
 	inc qword ptr [rax+M_LOCKS]
 	ret
 
 rt_lock_sleep:
 	SAVE_ALL
-	mov rax, qword ptr fs:[TLS_G]
+	TLS_GET rax, TLS_G
 	mov [rax+G_SCANLO], rsp
-	mov rbx, qword ptr fs:[TLS_M]
+	TLS_GET rbx, TLS_M
 	mov eax, STOPPED
 	xchg [rbx+M_STATE], rax
 	mov esi, 2
@@ -373,7 +235,7 @@ rt_lock_sleep:
 
 	.globl rt_unlock
 rt_unlock:
-	mov rax, qword ptr fs:[TLS_M]
+	TLS_GET rax, TLS_M
 	dec qword ptr [rax+M_LOCKS]
 	xor eax, eax
 	xchg [rdi], rax
@@ -469,39 +331,27 @@ rt_cas:
 
 	.globl rt_current
 rt_current:
-	mov rax, qword ptr fs:[TLS_G]
+	TLS_GET rax, TLS_G
 	ret
 
 	.globl rt_context
 rt_context:
-	mov rax, qword ptr fs:[TLS_G]
+	TLS_GET rax, TLS_G
 	mov rax, [rax+G_CTX]
 	ret
 
 	.globl rt_set_context
 rt_set_context:
-	mov rax, qword ptr fs:[TLS_G]
+	TLS_GET rax, TLS_G
 	mov [rax+G_CTX], rdi
 	ret
 
 	.globl rt_has_context
 rt_has_context:
-	mov rax, qword ptr fs:[TLS_G]
+	TLS_GET rax, TLS_G
 	cmp qword ptr [rax+G_CTX], 0
 	setne al
 	movzx eax, al
-	ret
-
-rt_mmap_stack:
-	mov edx, 3
-	mov r10d, 0x4022
-	mov r8, -1
-	xor r9d, r9d
-	xor edi, edi
-	mov eax, 9
-	syscall
-	cmp rax, -4096
-	ja rt_panic_oom
 	ret
 
 rt_galloc:
@@ -522,14 +372,8 @@ rt_galloc:
 1:
 	lea rdi, [rip+rt_allg_lock]
 	call rt_spin_unlock
-	mov rsi, G_MAP
-	call rt_mmap_stack
+	call rt_os_stack
 	mov rbx, rax
-	mov rdi, rax
-	mov esi, GUARD
-	xor edx, edx
-	mov eax, 10
-	syscall
 	lea rax, [rbx+GUARD+STACK]
 	mov [rax+G_HI], rax
 	mov [rax+G_LO], rbx
@@ -597,7 +441,7 @@ rt_runq_put:
 	push rbx
 	push r12
 	mov r12, rdi
-	mov rbx, qword ptr fs:[TLS_M]
+	TLS_GET rbx, TLS_M
 	lea rdi, [rbx+M_QLOCK]
 	call rt_spin_lock
 	mov rax, [rbx+M_QTAIL]
@@ -655,7 +499,8 @@ rt_steal:
 	lea rax, [rip+rt_allm]
 	mov rdi, [rax+8*r12]
 	inc r12
-	cmp rdi, qword ptr fs:[TLS_M]
+	TLS_GET rax, TLS_M
+	cmp rdi, rax
 	je 1b
 	mov rax, [rdi+M_QHEAD]
 	cmp rax, [rdi+M_QTAIL]
@@ -706,7 +551,7 @@ rt_ready:
 	call rt_spin_unlock
 	cmp qword ptr [rbx+G_LOCKEDM], 0
 	jne 2f
-	mov rax, qword ptr fs:[TLS_M]
+	TLS_GET rax, TLS_M
 	mov rdi, rbx
 	xchg [rax+M_RUNNEXT], rdi
 	test rdi, rdi
@@ -794,16 +639,7 @@ rt_newm:
 	call rt_mmap_stack
 	mov rbx, rax
 	mov qword ptr [rbx+M_STATE], IDLE
-	mov rsi, G0_STACK
-	call rt_mmap_stack
-	add rax, G0_STACK
-	mov [rbx+M_G0TOP], rax
-	mov [rbx+M_G0SP], rax
-	lea rax, [rbx+M_TCB]
-	mov [rax], rax
-	mov [rax+TLS_M], rbx
-	lea rcx, [rax+TLS_FLAG]
-	mov [rbx+M_FLAG], rcx
+	call rt_os_m_prepare
 	mov rcx, [rip+rt_nm]
 	lea rax, [rip+rt_allm]
 	mov [rax+8*rcx], rbx
@@ -811,96 +647,15 @@ rt_newm:
 	mov [rip+rt_nm], rcx
 	lea rdi, [rip+rt_sched_lock]
 	call rt_spin_unlock
-.if RT_DYNAMIC
-	push r13
-	mov r13, rsp
-	and rsp, -16
-	sub rsp, 16
-	mov rdi, rsp
-	xor esi, esi
-	lea rdx, [rip+rt_mstart_c]
-	mov rcx, rbx
-	call pthread_create
-	mov rsp, r13
-	pop r13
-.else
-	mov r12, rbx
-	mov edi, 0xD0F00
-	mov rsi, [rbx+M_G0TOP]
-	xor edx, edx
-	xor r10d, r10d
-	lea r8, [rbx+M_TCB]
-	mov eax, 56
-	syscall
-	test rax, rax
-	jnz 1f
-	mov rbx, r12
-	jmp rt_mstart
-1:
-.endif
+	call rt_os_m_start
 	pop r12
 	pop rbx
-	ret
-
-.if RT_DYNAMIC
-rt_mstart_c:
-	mov rbx, rdi
-	mov qword ptr fs:[TLS_M], rbx
-	mov rax, qword ptr fs:[0]
-	add rax, TLS_FLAG
-	mov [rbx+M_FLAG], rax
-	and rsp, -16
-	mov [rbx+M_G0TOP], rsp
-	mov [rbx+M_G0SP], rsp
-.endif
-rt_mstart:
-	call rt_altstack
-	mov rsp, [rbx+M_G0TOP]
-	jmp rt_schedule
-
-rt_altstack:
-	mov esi, 65536
-	call rt_mmap_stack
-	sub rsp, 32
-	mov [rsp], rax
-	mov dword ptr [rsp+8], 0
-	mov qword ptr [rsp+16], 65536
-	mov rdi, rsp
-	xor esi, esi
-	mov eax, 131
-	syscall
-	add rsp, 32
 	ret
 
 	.globl rt_sched_init
 rt_sched_init:
 	push rbx
-	sub rsp, 128
-	mov rdi, rsp
-	xor eax, eax
-	mov ecx, 16
-	rep stosq
-	xor edi, edi
-	mov esi, 128
-	mov rdx, rsp
-	mov eax, 204
-	syscall
-	xor ecx, ecx
-	xor edx, edx
-1:
-	cmp rcx, 16
-	jae 2f
-	popcnt r8, [rsp+8*rcx]
-	add rdx, r8
-	inc rcx
-	jmp 1b
-2:
-	test rdx, rdx
-	jnz 3f
-	mov edx, 1
-3:
-	mov [rip+rt_ncpu], rdx
-	add rsp, 128
+	call rt_os_init
 	mov rsi, 8*MAXG
 	call rt_mmap_stack
 	mov [rip+rt_allgs], rax
@@ -914,73 +669,14 @@ rt_sched_init:
 	lea rax, [rip+rt_allm]
 	mov [rax], rbx
 	mov qword ptr [rip+rt_nm], 1
-.if RT_DYNAMIC
-	mov qword ptr fs:[TLS_M], rbx
-	mov rax, qword ptr fs:[0]
-	add rax, TLS_FLAG
-	mov [rbx+M_FLAG], rax
-.else
-	lea rsi, [rbx+M_TCB]
-	mov [rsi], rsi
-	mov [rsi+TLS_M], rbx
-	lea rax, [rsi+TLS_FLAG]
-	mov [rbx+M_FLAG], rax
-	mov edi, 0x1002
-	mov eax, 158
-	syscall
-.endif
+	call rt_os_tls
 	lea rax, [rsp+16]
 	and rax, -16
 	mov [rbx+M_G0TOP], rax
 	mov [rbx+M_G0SP], rax
-	call rt_altstack
-	call rt_fault_init
+	call rt_os_signals
 	pop rbx
 	ret
-
-rt_fault_init:
-	sub rsp, 32
-	lea rax, [rip+rt_fault]
-	mov [rsp], rax
-	mov qword ptr [rsp+8], 0x0C000004
-	lea rax, [rip+rt_restorer]
-	mov [rsp+16], rax
-	mov qword ptr [rsp+24], 0
-	mov edi, 11
-	mov rsi, rsp
-	xor edx, edx
-	mov r10d, 8
-	mov eax, 13
-	syscall
-	mov edi, 7
-	mov rsi, rsp
-	xor edx, edx
-	mov r10d, 8
-	mov eax, 13
-	syscall
-	add rsp, 32
-	ret
-
-rt_restorer:
-	mov eax, 15
-	syscall
-
-rt_fault:
-	mov rax, [rsi+16]
-	mov rcx, qword ptr fs:[TLS_G]
-	test rcx, rcx
-	jz 1f
-	mov rdx, [rcx+G_LO]
-	cmp rax, rdx
-	jb 1f
-	add rdx, GUARD
-	cmp rax, rdx
-	jae 1f
-	lea rdi, [rip+rt_msg_overflow]
-	jmp rt_panic
-1:
-	lea rdi, [rip+rt_msg_fault]
-	jmp rt_panic
 
 	.globl rt_spawn
 rt_spawn:
@@ -1009,7 +705,7 @@ rt_spawn:
 	mov qword ptr [rbx+G_TOKEN], 0
 	mov qword ptr [rbx+G_LOCK], 0
 	mov qword ptr [rbx+G_LOCKEDM], 0
-	mov rax, qword ptr fs:[TLS_G]
+	TLS_GET rax, TLS_G
 	test rax, rax
 	jz 1f
 	mov rax, [rax+G_CTX]
@@ -1058,8 +754,9 @@ rt_spawn_main:
 rt_gentry:
 	xor ebp, ebp
 	call rax
-	mov rdi, qword ptr fs:[TLS_G]
-	mov rbx, qword ptr fs:[TLS_M]
+	TLS_GET rdi, TLS_G
+	TLS_GET rbx, TLS_M
+	TEB_ENTER_OS rdi, rbx
 	mov rsp, [rbx+M_G0TOP]
 	mov qword ptr [rdi+G_STATUS], G_FREE
 	mov r12, rdi
@@ -1078,10 +775,11 @@ rt_park:
 	ENTER_RT
 rt_park_body:
 	SAVE_ALL
-	mov r12, qword ptr fs:[TLS_G]
+	TLS_GET r12, TLS_G
 	mov [r12+G_SP], rsp
 	mov [r12+G_SCANLO], rsp
-	mov rbx, qword ptr fs:[TLS_M]
+	TLS_GET rbx, TLS_M
+	TEB_ENTER_OS r12, rbx
 	mov rsp, [rbx+M_G0SP]
 	lea rdi, [r12+G_LOCK]
 	call rt_spin_lock
@@ -1117,12 +815,13 @@ rt_park_body:
 	mov edi, IDLE
 	call rt_m_running
 	mov qword ptr [r12+G_STATUS], G_RUNNING
-	mov qword ptr fs:[TLS_G], r12
+	TLS_SET TLS_G, r12
 	mov [rbx+M_CURG], r12
 	mov rdi, r12
 	jmp rt_resume
 
 rt_resume:
+	TEB_ENTER_G rdi, rbx
 	mov rsp, [rdi+G_SP]
 	RESTORE_ALL
 	ret
@@ -1131,20 +830,21 @@ rt_resume:
 rt_poll:
 	ENTER_RT
 	SAVE_ALL
-	mov byte ptr fs:[TLS_FLAG], 0
+	TLS_CLEAR_FLAG
 	cmp dword ptr [rip+rt_stop], 0
 	je 1f
 	call rt_stop_here
 	jmp 2f
 1:
-	mov rbx, qword ptr fs:[TLS_M]
+	TLS_GET rbx, TLS_M
 	cmp qword ptr [rbx+M_LOCKS], 0
 	jne 2f
-	mov r12, qword ptr fs:[TLS_G]
+	TLS_GET r12, TLS_G
 	cmp qword ptr [r12+G_LOCKEDM], 0
 	jne 2f
 	mov [r12+G_SP], rsp
 	mov [r12+G_SCANLO], rsp
+	TEB_ENTER_OS r12, rbx
 	mov rsp, [rbx+M_G0SP]
 	mov qword ptr [r12+G_STATUS], G_RUNNABLE
 	mov rdi, r12
@@ -1156,7 +856,7 @@ rt_poll:
 	ret
 
 rt_schedule:
-	mov rbx, qword ptr fs:[TLS_M]
+	TLS_GET rbx, TLS_M
 1:
 	call rt_timers_run
 	xor eax, eax
@@ -1261,7 +961,7 @@ rt_schedule:
 	mov edi, IDLE
 	call rt_m_running
 	mov qword ptr [r12+G_STATUS], G_RUNNING
-	mov qword ptr fs:[TLS_G], r12
+	TLS_SET TLS_G, r12
 	mov [rbx+M_CURG], r12
 	inc qword ptr [rbx+M_TICK]
 	mov rdi, r12
@@ -1271,42 +971,13 @@ rt_sysmon_start:
 	mov eax, 1
 	xchg [rip+rt_sysmon_on], rax
 	test rax, rax
-	jnz 1f
-.if RT_DYNAMIC
-	push rbx
-	mov rbx, rsp
-	and rsp, -16
-	sub rsp, 16
-	mov rdi, rsp
-	xor esi, esi
-	lea rdx, [rip+rt_sysmon]
-	xor ecx, ecx
-	call pthread_create
-	mov rsp, rbx
-	pop rbx
-.else
-	mov esi, 65536
-	call rt_mmap_stack
-	lea rsi, [rax+65536]
-	mov edi, 0x50F00
-	xor edx, edx
-	xor r10d, r10d
-	xor r8d, r8d
-	mov eax, 56
-	syscall
-	test rax, rax
-	jz rt_sysmon
-.endif
-1:
+	jz rt_os_sysmon_start
 	ret
 
 rt_sysmon:
 	and rsp, -16
 1:
-	lea rdi, [rip+rt_sysmon_sleep]
-	xor esi, esi
-	mov eax, 35
-	syscall
+	call rt_os_nap
 	xor ecx, ecx
 2:
 	cmp rcx, [rip+rt_nm]
@@ -1347,17 +1018,6 @@ rt_sysmon:
 	je 1b
 	call rt_wakep
 	jmp 1b
-
-rt_now:
-	sub rsp, 24
-	mov edi, 1
-	mov rsi, rsp
-	mov eax, 228
-	syscall
-	imul rax, [rsp], 1000000000
-	add rax, [rsp+8]
-	add rsp, 24
-	ret
 
 rt_timer_insert:
 	push rbx
@@ -1409,7 +1069,7 @@ rt_sleep:
 	push rdi
 	call rt_poll_init
 	pop rdi
-	mov rsi, qword ptr fs:[TLS_G]
+	TLS_GET rsi, TLS_G
 	xor edx, edx
 	xor ecx, ecx
 	call rt_timer_insert
@@ -1424,7 +1084,7 @@ rt_timer_add:
 	pop rcx
 	pop rdx
 	pop rdi
-	mov rsi, qword ptr fs:[TLS_G]
+	TLS_GET rsi, TLS_G
 	jmp rt_timer_insert
 
 	.globl rt_timer_del
@@ -1579,144 +1239,3 @@ rt_timer_timeout:
 	pop r12
 	pop rbx
 	ret
-
-rt_poll_init:
-	cmp qword ptr [rip+rt_epfd], 0
-	je 1f
-	ret
-1:
-	lea rdi, [rip+rt_poll_lock]
-	call rt_spin_lock
-	cmp qword ptr [rip+rt_epfd], 0
-	jne 2f
-	mov edi, 0x80000
-	mov eax, 291
-	syscall
-	mov r8, rax
-	xor edi, edi
-	mov esi, 0x80800
-	mov eax, 290
-	syscall
-	mov [rip+rt_evfd], rax
-	sub rsp, 16
-	mov dword ptr [rsp], 1
-	mov qword ptr [rsp+4], 0
-	mov rdi, r8
-	mov esi, 1
-	mov rdx, rax
-	mov r10, rsp
-	push r8
-	mov eax, 233
-	syscall
-	pop r8
-	add rsp, 16
-	mov [rip+rt_epfd], r8
-2:
-	lea rdi, [rip+rt_poll_lock]
-	jmp rt_spin_unlock
-
-rt_poll_wake:
-	mfence
-	cmp qword ptr [rip+rt_poller], 0
-	je 1f
-	mov rdi, [rip+rt_evfd]
-	test rdi, rdi
-	jz 1f
-	lea rsi, [rip+rt_one]
-	mov edx, 8
-	mov eax, 1
-	syscall
-1:
-	ret
-
-rt_netpoll:
-	cmp qword ptr [rip+rt_epfd], 0
-	jne 1f
-	xor eax, eax
-	ret
-1:
-	push rbx
-	push r12
-	push r13
-	push r14
-	mov r14, rdi
-	sub rsp, 8*12*64/8
-	mov r10, rdi
-	mov rdi, [rip+rt_epfd]
-	mov rsi, rsp
-	mov edx, 64
-	mov eax, 232
-	syscall
-	xor r13d, r13d
-	test rax, rax
-	jle 4f
-	mov r12, rax
-	xor ebx, ebx
-2:
-	cmp rbx, r12
-	jae 4f
-	imul rcx, rbx, 12
-	mov rdi, [rsp+rcx+4]
-	inc rbx
-	test rdi, rdi
-	jnz 3f
-	test r14, r14
-	jz 2b
-	mov rdi, [rip+rt_evfd]
-	lea rsi, [rip+rt_scratch]
-	mov edx, 8
-	xor eax, eax
-	syscall
-	jmp 2b
-3:
-	lock dec qword ptr [rip+rt_nfdwait]
-	call rt_ready
-	inc r13
-	jmp 2b
-4:
-	mov rax, r13
-	add rsp, 8*12*64/8
-	pop r14
-	pop r13
-	pop r12
-	pop rbx
-	ret
-
-	.globl rt_wait_fd
-rt_wait_fd:
-	ENTER_RT
-	push rdi
-	push rsi
-	call rt_poll_init
-	pop rsi
-	pop rdi
-	lock inc qword ptr [rip+rt_nfdwait]
-	sub rsp, 16
-	or esi, 0x40000000
-	mov [rsp], esi
-	mov rax, qword ptr fs:[TLS_G]
-	mov [rsp+4], rax
-	mov rdx, rdi
-	push rdx
-	mov rdi, [rip+rt_epfd]
-	mov esi, 3
-	lea r10, [rsp+8]
-	mov eax, 233
-	syscall
-	pop rdx
-	cmp rax, -2
-	jne 1f
-	mov rdi, [rip+rt_epfd]
-	mov esi, 1
-	mov r10, rsp
-	mov eax, 233
-	syscall
-1:
-	add rsp, 16
-	jmp rt_park_body
-
-	.section .rodata
-	.p2align 3
-rt_one:
-	.quad 1
-	.text

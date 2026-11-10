@@ -1023,7 +1023,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - 128- and 256-bit vector types with lane-wise operators, compiled for AVX2 and SSE2 with dispatch at startup.
 - Standard library: files, networking with DNS, pipelines, HTTP/1.1 and HTTP/2 clients and servers, WebSocket, TLS 1.2 and post-quantum TLS 1.3, JSON, the web framework with OpenAPI and authentication, the SQL driver contract, PostgreSQL and SQL Server drivers and the ORM, TOML, YAML and XML, protobuf, OpenTelemetry, DEFLATE/zlib/gzip, xz, Zstandard, LZ4 and Brotli compression, bitsets and Roaring bitmaps, image codecs, checksums, and cryptography: AES-256-GCM, ChaCha20-Poly1305, SHA-2, SHA-3, SHAKE, BLAKE2b, HMAC, HKDF, PBKDF2, Argon2id, X25519, ML-KEM-512/768/1024, Ed25519, ECDSA P-256/P-384, RSA, X.509 and JOSE.
 - Hot reload with `low dev`.
-- Target: linux/amd64.
+- Targets: linux/amd64, and windows/amd64 with the Win64 C ABI and C libraries imported from DLLs (`"c"` and `"m"` resolve to msvcrt.dll); `low dev` runs on Linux only.
 
 ## Roadmap
 
@@ -1055,4 +1055,4 @@ The UI library is staged under `ui/` until it moves into the standard library as
     12. Text input element whose state is held in signals, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     13. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
 3. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-4. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+4. Further targets: linux/arm64, darwin; macOS (Metal) and Windows backends for the UI library.

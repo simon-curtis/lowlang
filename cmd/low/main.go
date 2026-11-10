@@ -14,13 +14,14 @@ import (
 	"lowlang/internal/compiler"
 	"lowlang/internal/hot"
 	"lowlang/internal/lsp"
+	"lowlang/internal/target"
 )
 
 const usage = `usage:
-  low build <file.low> [-o output]
+  low build <file.low> [-o output] [-target linux/amd64|windows/amd64]
   low run <file.low>
-  low asm <file.low>
-  low ir <file.low>
+  low asm <file.low> [-target linux/amd64|windows/amd64]
+  low ir <file.low> [-target linux/amd64|windows/amd64]
   low dev <file.low>
   low lsp`
 
@@ -63,33 +64,21 @@ func run(ctx context.Context, args []string) error {
 	}
 	cmd, path := args[0], args[1]
 	switch cmd {
-	case "asm":
-		asm, err := compile(path)
+	case "asm", "ir", "build":
+		opts, err := parseOptions(args[2:], cmd == "build")
 		if err != nil {
 			return err
 		}
-		fmt.Print(asm)
-		return nil
-	case "ir":
-		unit, err := compiler.Analyse(path)
-		if err != nil {
-			return err
-		}
-		for _, f := range unit.Program.Funcs {
-			fmt.Print(f)
-		}
-		return nil
-	case "build":
-		output := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-		if len(args) == 4 && args[2] == "-o" {
-			output = args[3]
-		} else if len(args) != 2 {
+		return compileCommand(ctx, cmd, path, opts)
+	case "run":
+		if len(args) != 2 {
 			return usageError{}
 		}
-		return build(ctx, path, output)
-	case "run":
 		return buildAndRun(ctx, path)
 	case "dev":
+		if len(args) != 2 {
+			return usageError{}
+		}
 		session, err := hot.New(path, os.Stdout, os.Stderr)
 		if err != nil {
 			return err
@@ -100,21 +89,75 @@ func run(ctx context.Context, args []string) error {
 	return usageError{}
 }
 
-func compile(path string) (string, error) {
-	unit, err := compiler.Analyse(path)
-	if err != nil {
-		return "", err
-	}
-	return amd64.Generate(unit.Program, nil).Asm, nil
+type options struct {
+	output   string
+	platform target.OS
 }
 
-func build(ctx context.Context, path, output string) error {
-	unit, err := compiler.Analyse(path)
+func parseOptions(args []string, output bool) (options, error) {
+	opts := options{platform: target.Host()}
+	for len(args) > 0 {
+		if len(args) < 2 {
+			return opts, usageError{}
+		}
+		switch {
+		case args[0] == "-o" && output:
+			opts.output = args[1]
+		case args[0] == "-target":
+			platform, err := target.Parse(args[1])
+			if err != nil {
+				return opts, err
+			}
+			opts.platform = platform
+		default:
+			return opts, usageError{}
+		}
+		args = args[2:]
+	}
+	return opts, nil
+}
+
+func compileCommand(ctx context.Context, cmd, path string, opts options) error {
+	unit, err := compiler.Analyse(path, opts.platform)
 	if err != nil {
 		return err
 	}
+	switch cmd {
+	case "ir":
+		for _, f := range unit.Program.Funcs {
+			fmt.Print(f)
+		}
+		return nil
+	case "asm":
+		fmt.Print(amd64.Generate(unit.Program, nil).Asm)
+		return nil
+	}
+	output := opts.output
+	if output == "" {
+		output = defaultOutput(path, opts.platform)
+	}
+	return link(ctx, unit, output)
+}
+
+func defaultOutput(path string, platform target.OS) string {
+	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	if platform == target.Windows {
+		return fmt.Sprintf("%s.exe", name)
+	}
+	return name
+}
+
+func link(ctx context.Context, unit *compiler.Unit, output string) error {
 	asm := amd64.Generate(unit.Program, nil).Asm
-	return compiler.Link(ctx, asm, output, unit.Program.Libraries)
+	return compiler.Link(ctx, asm, output, unit.Program)
+}
+
+func build(ctx context.Context, path, output string, platform target.OS) error {
+	unit, err := compiler.Analyse(path, platform)
+	if err != nil {
+		return err
+	}
+	return link(ctx, unit, output)
 }
 
 func buildAndRun(ctx context.Context, path string) error {
@@ -123,8 +166,8 @@ func buildAndRun(ctx context.Context, path string) error {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	binary := filepath.Join(dir, "main")
-	if err := build(ctx, path, binary); err != nil {
+	binary := filepath.Join(dir, defaultOutput("main", target.Host()))
+	if err := build(ctx, path, binary, target.Host()); err != nil {
 		return err
 	}
 	cmd := exec.CommandContext(ctx, binary)

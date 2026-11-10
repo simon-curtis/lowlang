@@ -10,6 +10,7 @@ import (
 
 	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
+	"lowlang/internal/target"
 )
 
 func load(t *testing.T, names ...string) []*Protocol {
@@ -85,14 +86,14 @@ func TestRegistry(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	unit, err := compiler.Analyse(dir)
+	unit, err := compiler.Analyse(dir, target.Linux)
 	if err != nil {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(dir, "registry")
 	ctx := context.Background()
 	asm := amd64.Generate(unit.Program, nil).Asm
-	if err := compiler.Link(ctx, asm, binary, unit.Program.Libraries); err != nil {
+	if err := compiler.Link(ctx, asm, binary, unit.Program); err != nil {
 		t.Fatal(err)
 	}
 	if os.Getenv("WAYLAND_DISPLAY") == "" {

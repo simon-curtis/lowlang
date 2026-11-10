@@ -22,6 +22,7 @@ import (
 	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
 	"lowlang/internal/ir"
+	"lowlang/internal/target"
 )
 
 type child struct {
@@ -147,7 +148,7 @@ func (s *Session) watched() []string {
 }
 
 func (s *Session) Reload(ctx context.Context) error {
-	unit, err := compiler.Analyse(s.path)
+	unit, err := compiler.Analyse(s.path, target.Linux)
 	if err != nil {
 		s.logf("%v", err)
 		return nil
@@ -229,7 +230,7 @@ func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string)
 	}
 	out := amd64.Generate(unit.Program, table)
 	binary := filepath.Join(s.dir, fmt.Sprintf("app%d", s.builds))
-	if err := compiler.Link(ctx, out.Asm, binary, unit.Program.Libraries); err != nil {
+	if err := compiler.Link(ctx, out.Asm, binary, unit.Program); err != nil {
 		return err
 	}
 	symbols, err := readSymbols(binary)

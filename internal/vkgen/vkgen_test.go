@@ -14,6 +14,7 @@ import (
 
 	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
+	"lowlang/internal/target"
 )
 
 var root = filepath.Join("..", "..", "ui")
@@ -162,14 +163,14 @@ func TestOffscreenRender(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	unit, err := compiler.Analyse(dir)
+	unit, err := compiler.Analyse(dir, target.Linux)
 	if err != nil {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(dir, "offscreen")
 	ctx := context.Background()
 	asm := amd64.Generate(unit.Program, nil).Asm
-	if err := compiler.Link(ctx, asm, binary, unit.Program.Libraries); err != nil {
+	if err := compiler.Link(ctx, asm, binary, unit.Program); err != nil {
 		t.Fatal(err)
 	}
 	out, err := exec.CommandContext(ctx, binary).CombinedOutput()

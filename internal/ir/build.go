@@ -8,6 +8,7 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/lexer"
+	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
 
@@ -28,6 +29,7 @@ type place struct {
 
 type builder struct {
 	ssa
+	os       target.OS
 	cur      *Block
 	decl     *ast.Func
 	funcs    map[*ast.Func]*Func
@@ -41,7 +43,7 @@ type builder struct {
 	subjects [][]*Value
 }
 
-func Build(files []*ast.File) *Program {
+func Build(files []*ast.File, os target.OS) *Program {
 	var decls []*ast.Func
 	for _, file := range files {
 		for _, d := range file.Funcs {
@@ -50,7 +52,7 @@ func Build(files []*ast.File) *Program {
 			}
 		}
 	}
-	p := &Program{}
+	p := &Program{OS: os}
 	funcs := map[*ast.Func]*Func{}
 	adapters := map[*ast.Func]*Func{}
 	named := map[string]*Func{}
@@ -77,6 +79,7 @@ func Build(files []*ast.File) *Program {
 	builderFor := func(f *Func, d *ast.Func) *builder {
 		return &builder{
 			ssa:      newSSA(f),
+			os:       os,
 			decl:     d,
 			funcs:    funcs,
 			adapters: adapters,
@@ -98,6 +101,7 @@ func Build(files []*ast.File) *Program {
 	p.Funcs = reachable(p.Main, p.Funcs)
 	p.CSymbols = cSymbols(p.Funcs)
 	p.Libraries = libraries(files, p.CSymbols)
+	p.Imports = imports(files, p.CSymbols)
 	return p
 }
 
@@ -117,6 +121,24 @@ func cSymbols(funcs []*Func) []string {
 	}
 	slices.Sort(symbols)
 	return slices.Compact(symbols)
+}
+
+func imports(files []*ast.File, used []string) map[string][]string {
+	byLibrary := map[string][]string{}
+	for _, f := range files {
+		for _, e := range f.Externs {
+			for _, fn := range e.Funcs {
+				if _, found := slices.BinarySearch(used, fn.Symbol); found {
+					byLibrary[e.Library] = append(byLibrary[e.Library], fn.Symbol)
+				}
+			}
+		}
+	}
+	for lib, symbols := range byLibrary {
+		slices.Sort(symbols)
+		byLibrary[lib] = slices.Compact(symbols)
+	}
+	return byLibrary
 }
 
 func libraries(files []*ast.File, used []string) []string {

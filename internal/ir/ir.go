@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
 
@@ -139,8 +140,10 @@ type Func struct {
 }
 
 type Program struct {
+	OS        target.OS
 	Libraries []string
 	CSymbols  []string
+	Imports   map[string][]string
 	Funcs     []*Func
 	Main      *Func
 	MainErr   *types.Type

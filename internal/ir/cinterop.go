@@ -2,6 +2,7 @@ package ir
 
 import (
 	"lowlang/internal/ast"
+	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
 
@@ -105,6 +106,47 @@ func cPlan(symbol string, ret *types.Type, argTypes []*types.Type, mut []bool) *
 	return plan
 }
 
+func win64Register(t *types.Type) bool {
+	return !isC(t) || t.Bytes == 1 || t.Bytes == 2 || t.Bytes == 4 || t.Bytes == 8
+}
+
+func win64Class(t *types.Type) Class {
+	if !isC(t) && t.Float() {
+		return Vector
+	}
+	return Integer
+}
+
+func win64Plan(symbol string, ret *types.Type, argTypes []*types.Type, mut []bool) *CPlan {
+	plan := &CPlan{Symbol: symbol, Ret: ret}
+	slots := 0
+	if ret != types.Void {
+		if win64Register(ret) {
+			plan.Results = []Class{win64Class(ret)}
+		} else {
+			plan.Memory = true
+			slots = 1
+		}
+	}
+	for i, t := range argTypes {
+		class := Integer
+		if !mut[i] {
+			class = win64Class(t)
+		}
+		plan.Args = append(plan.Args, class)
+		slots++
+	}
+	plan.StackWords = max(4, slots)
+	return plan
+}
+
+func (b *builder) plan(symbol string, ret *types.Type, argTypes []*types.Type, mut []bool) *CPlan {
+	if b.os == target.Windows {
+		return win64Plan(symbol, ret, argTypes, mut)
+	}
+	return cPlan(symbol, ret, argTypes, mut)
+}
+
 func (b *builder) cCall(e *ast.Call) []*Value {
 	return b.cInvoke(e.Target.Symbol, e.Target.ParamTypes, e.Target.RetType, nil, e.Args)
 }
@@ -131,13 +173,19 @@ func (b *builder) cInvoke(symbol string, params []*types.Type, ret *types.Type, 
 			words = []*Value{b.convert(words[0], types.F32, types.F64)}
 			t = types.F64
 		}
+		if b.os == target.Windows && !win64Register(t) {
+			copied := b.slot(len(words))
+			b.store(place{addr: copied}, words)
+			words = []*Value{copied}
+			t = types.I64
+		}
 		args = append(args, words...)
 		argTypes = append(argTypes, t)
 		mut = append(mut, false)
 	}
 	operands := append(callee, args...)
 	call := b.emit(OpCCall, operands...)
-	call.Plan = cPlan(symbol, ret, argTypes, mut)
+	call.Plan = b.plan(symbol, ret, argTypes, mut)
 	results := make([]*Value, ret.Size())
 	for k := range results {
 		results[k] = b.result(call, k)

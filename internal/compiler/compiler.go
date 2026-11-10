@@ -14,6 +14,7 @@ import (
 	"lowlang/internal/ir"
 	"lowlang/internal/lexer"
 	"lowlang/internal/parser"
+	"lowlang/internal/target"
 )
 
 type Unit struct {
@@ -25,12 +26,12 @@ type Unit struct {
 //go:embed prelude.low
 var preludeSource []byte
 
-func Analyse(path string) (*Unit, error) {
+func Analyse(path string, platform target.OS) (*Unit, error) {
 	unit, err := Check(path, os.ReadFile)
 	if err != nil {
 		return nil, err
 	}
-	unit.Program = ir.Build(unit.Files)
+	unit.Program = ir.Build(unit.Files, platform)
 	return unit, nil
 }
 
@@ -67,24 +68,43 @@ func Assemble(ctx context.Context, asm, object string) error {
 	return tool(ctx, "as", "-o", object, source)
 }
 
-func Link(ctx context.Context, asm, output string, libraries []string) error {
+func Link(ctx context.Context, asm, output string, prog *ir.Program) error {
 	dir, err := os.MkdirTemp("", "low-build-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
+	if prog.OS == target.Windows {
+		return linkWindows(ctx, dir, asm, output)
+	}
 	object := filepath.Join(dir, "main.o")
 	if err := Assemble(ctx, asm, object); err != nil {
 		return err
 	}
-	if len(libraries) == 0 {
+	if len(prog.Libraries) == 0 {
 		return tool(ctx, "ld", "-static", "-o", output, object)
 	}
-	args, err := dynamicArgs(output, object, libraries)
+	args, err := dynamicArgs(output, object, prog.Libraries)
 	if err != nil {
 		return err
 	}
 	return tool(ctx, "ld", args...)
+}
+
+const windowsStack = 8 << 20
+
+func linkWindows(ctx context.Context, dir, asm, output string) error {
+	source := filepath.Join(dir, "main.s")
+	if err := os.WriteFile(source, []byte(asm), 0o644); err != nil {
+		return err
+	}
+	object := filepath.Join(dir, "main.obj")
+	if err := tool(ctx, "clang", "--target=x86_64-pc-windows-msvc", "-c", "-o", object, source); err != nil {
+		return err
+	}
+	return tool(ctx, "lld-link",
+		"/nologo", "/nodefaultlib", "/entry:start", "/subsystem:console",
+		fmt.Sprintf("/stack:%d", windowsStack), fmt.Sprintf("/out:%s", output), object)
 }
 
 const dynamicLinker = "/lib64/ld-linux-x86-64.so.2"

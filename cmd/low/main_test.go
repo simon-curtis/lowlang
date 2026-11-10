@@ -14,6 +14,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"lowlang/internal/compiler"
+	"lowlang/internal/target"
 )
 
 func fixtures(t *testing.T, dir string) []string {
@@ -68,9 +71,8 @@ func TestRun(t *testing.T) {
 }
 
 func runFixture(t *testing.T, path string) {
-	ctx := context.Background()
 	binary := filepath.Join(t.TempDir(), "main")
-	if err := build(ctx, path, binary); err != nil {
+	if err := build(context.Background(), path, binary, target.Linux); err != nil {
 		t.Fatal(err)
 	}
 	environments := [][]string{nil}
@@ -78,19 +80,52 @@ func runFixture(t *testing.T, path string) {
 		environments = append(environments, []string{"LOW_SIMD=sse2"})
 	}
 	for _, env := range environments {
-		state := runBinary(t, ctx, path, binary, env)
-		checkMemory(t, path, state)
+		runWithEnv(t, path, binary, env)
 	}
 	checkLinking(t, path, binary)
 }
 
-func runBinary(t *testing.T, ctx context.Context, path, binary string, env []string) *os.ProcessState {
+func runWithEnv(t *testing.T, path, binary string, env []string) {
 	t.Helper()
-	var stdout, stderr bytes.Buffer
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary)
 	cmd.Env = append(os.Environ(), env...)
+	compareRun(t, path, cmd, env)
+	checkMemory(t, path, cmd.ProcessState)
+}
+
+func TestRunWindows(t *testing.T) {
+	wine, err := exec.LookPath("wine")
+	if err != nil {
+		t.Skip("wine is not installed")
+	}
+	paths := slices.DeleteFunc(fixtures(t, "run"), func(path string) bool {
+		_, glibc := expected(t, path, ".needed")
+		return glibc || strings.HasPrefix(filepath.Base(path), "std_")
+	})
+	for _, path := range append(paths, fixtures(t, "windows")...) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			runWindowsFixture(t, wine, path)
+		})
+	}
+}
+
+func runWindowsFixture(t *testing.T, wine, path string) {
+	binary := filepath.Join(t.TempDir(), "main.exe")
+	if err := build(context.Background(), path, binary, target.Windows); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, wine, binary)
+	cmd.Env = append(os.Environ(), "WINEDEBUG=-all", "DISPLAY=", "WAYLAND_DISPLAY=")
+	compareRun(t, path, cmd, nil)
+}
+
+func compareRun(t *testing.T, path string, cmd *exec.Cmd, env []string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	runErr := cmd.Run()
 
@@ -105,7 +140,6 @@ func runBinary(t *testing.T, ctx context.Context, path, binary string, env []str
 	if panics != (runErr != nil) {
 		t.Errorf("%v exit error %v, expected panic %v", env, runErr, panics)
 	}
-	return cmd.ProcessState
 }
 
 func checkLinking(t *testing.T, path, binary string) {
@@ -162,7 +196,7 @@ func failFixture(t *testing.T, path string) {
 	if !ok {
 		t.Fatal("missing .err fixture")
 	}
-	_, err := compile(path)
+	_, err := compiler.Analyse(path, target.Linux)
 	if err == nil {
 		t.Fatal("compiled without error")
 	}
