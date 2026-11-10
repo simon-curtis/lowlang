@@ -1,8 +1,14 @@
 import std/io
 
+pub struct Timeouts {
+    pub read: i64
+    pub write: i64
+}
+
 pub struct Conn {
     pub fd: i64
     pub remote: Addr
+    pub timeouts: *Timeouts
 }
 
 pub struct Listener {
@@ -13,6 +19,7 @@ pub struct Listener {
 pub struct Socket {
     pub fd: i64
     pub addr: Addr
+    pub timeouts: *Timeouts
 }
 
 pub struct Packet {
@@ -20,18 +27,73 @@ pub struct Packet {
     pub from: Addr
 }
 
-fn interrupted(r: i64) -> bool {
-    r == -4
+struct Watch {
+    done: bool
+    fired: bool
+}
+
+fn no_timeouts() -> *Timeouts {
+    new(Timeouts { read: 0, write: 0 })
+}
+
+fn expire(fd: i64, millis: i64, w: *Watch) {
+    sleep(millis)
+    if !w.done {
+        w.fired = true
+        __syscall(48, fd, 2)
+    }
+}
+
+fn wait(fd: i64, writable: bool, millis: i64) ! io.Error {
+    var w: *Watch? = none
+    if millis > 0 {
+        let watch = new(Watch { done: false, fired: false })
+        spawn expire(fd, millis, watch)
+        w = watch
+    }
+    if writable {
+        wait_writable(fd)
+    } else {
+        wait_readable(fd)
+    }
+    match w {
+        some(watch) => {
+            watch.done = true
+            if watch.fired {
+                fail TimedOut
+            }
+        }
+        none => {}
+    }
+}
+
+fn retry(fd: i64, writable: bool, millis: i64, op: fn() -> i64) -> i64 ! io.Error {
+    for {
+        let r = op()
+        if r == -11 {
+            wait(fd, writable, millis)?
+        } else if r != -4 {
+            return io.syscall_result(r)
+        }
+    }
 }
 
 fn socket(domain: i64, kind: i64) -> i64 ! io.Error {
-    io.syscall_result(__syscall(41, domain, kind | 0x80000, 0))
+    io.syscall_result(__syscall(41, domain, kind | 0x80800, 0))
 }
 
 fn set_int(fd: i64, level: i64, option: i64, value: i64) ! io.Error {
     let v = io.buffer(4)
     io.set_le32(v, 0, value)
     io.syscall_result(__syscall(54, fd, level, option, __slice_ptr(v), 4))?
+}
+
+fn socket_error(fd: i64) -> i64 {
+    let v = io.buffer(4)
+    let size = io.buffer(4)
+    io.set_le32(size, 0, 4)
+    let r = __syscall(55, fd, 1, 4, __slice_ptr(v), __slice_ptr(size))
+    if r < 0 { -r } else { io.le32(v, 0) }
 }
 
 fn local(fd: i64) -> Addr ! io.Error {
@@ -59,9 +121,15 @@ fn bound(a: Addr, kind: i64) -> i64 ! io.Error {
     fd
 }
 
+fn resolve_local(host: str) -> []u8 ! io.Error {
+    if host.len == 0 {
+        return parse_ip("0.0.0.0")
+    }
+    lookup(host)?[0]
+}
+
 pub fn listen(host: str, port: i64) -> Listener ! io.Error {
-    let ip = if host.len == 0 { parse_ip("0.0.0.0")? } else { lookup(host)?[0] }
-    let fd = bound(Addr { ip, port }, 1)?
+    let fd = bound(Addr { ip: resolve_local(host)?, port }, 1)?
     let r = __syscall(50, fd, 4096)
     if r < 0 {
         __syscall(3, fd)
@@ -75,9 +143,13 @@ pub fn accept(l: Listener) -> Conn ! io.Error {
     let size = io.buffer(4)
     for {
         io.set_le32(size, 0, 28)
-        let r = __syscall(288, l.fd, __slice_ptr(buf), __slice_ptr(size), 0x80000)
-        if !interrupted(r) && r != -103 {
-            return Conn { fd: io.syscall_result(r)?, remote: from_sockaddr(buf) }
+        let r = __syscall(288, l.fd, __slice_ptr(buf), __slice_ptr(size), 0x80800)
+        if r == -11 {
+            wait_readable(l.fd)
+        } else if r >= 0 {
+            return Conn { fd: r, remote: from_sockaddr(buf), timeouts: no_timeouts() }
+        } else if r != -4 && r != -103 {
+            fail io.errno(-r)
         }
     }
 }
@@ -86,12 +158,21 @@ pub fn close_listener(l: Listener) {
     __syscall(3, l.fd)
 }
 
-fn open_stream(a: Addr) -> i64 ! io.Error {
+fn open_stream(a: Addr, millis: i64) -> i64 ! io.Error {
     let fd = socket(family(a), 1)?
     let sa = sockaddr(a)
     var r = __syscall(42, fd, __slice_ptr(sa), sa.len)
-    for interrupted(r) {
+    for r == -4 {
         r = __syscall(42, fd, __slice_ptr(sa), sa.len)
+    }
+    if r == -115 {
+        wait(fd, true, millis) catch {
+            _ => {
+                __syscall(3, fd)
+                fail TimedOut
+            }
+        }
+        r = -socket_error(fd)
     }
     if r < 0 {
         __syscall(3, fd)
@@ -101,37 +182,35 @@ fn open_stream(a: Addr) -> i64 ! io.Error {
 }
 
 pub fn connect(a: Addr) -> Conn ! io.Error {
-    Conn { fd: open_stream(a)?, remote: a }
+    connect_within(a, 0)
+}
+
+pub fn connect_within(a: Addr, millis: i64) -> Conn ! io.Error {
+    Conn { fd: open_stream(a, millis)?, remote: a, timeouts: no_timeouts() }
 }
 
 pub fn dial(host: str, port: i64) -> Conn ! io.Error {
+    dial_within(host, port, 0)
+}
+
+pub fn dial_within(host: str, port: i64, millis: i64) -> Conn ! io.Error {
     let ips = lookup(host)?
     for ip in ips[..ips.len - 1] {
         let a = Addr { ip, port }
-        let fd = open_stream(a) catch -1
+        let fd = open_stream(a, millis) catch -1
         if fd >= 0 {
-            return Conn { fd, remote: a }
+            return Conn { fd, remote: a, timeouts: no_timeouts() }
         }
     }
-    connect(Addr { ip: ips[ips.len - 1], port })
+    connect_within(Addr { ip: ips[ips.len - 1], port }, millis)
 }
 
 pub fn read(c: Conn, buf: []u8) -> i64 ! io.Error {
-    for {
-        let r = __syscall(45, c.fd, __slice_ptr(buf), buf.len, 0, 0, 0)
-        if !interrupted(r) {
-            return io.syscall_result(r)
-        }
-    }
+    retry(c.fd, false, c.timeouts.read, fn() -> i64 { __syscall(45, c.fd, __slice_ptr(buf), buf.len, 0, 0, 0) })
 }
 
 pub fn write(c: Conn, data: []u8) -> i64 ! io.Error {
-    for {
-        let r = __syscall(44, c.fd, __slice_ptr(data), data.len, 0x4000, 0, 0)
-        if !interrupted(r) {
-            return io.syscall_result(r)
-        }
-    }
+    retry(c.fd, true, c.timeouts.write, fn() -> i64 { __syscall(44, c.fd, __slice_ptr(data), data.len, 0x4000, 0, 0) })
 }
 
 pub fn write_all(c: Conn, data: []u8) ! io.Error {
@@ -158,19 +237,12 @@ pub fn set_nodelay(c: Conn, on: bool) ! io.Error {
     set_int(c.fd, 6, 1, if on { 1 } else { 0 })?
 }
 
-fn set_timeout(fd: i64, option: i64, millis: i64) ! io.Error {
-    let tv = io.buffer(16)
-    io.set_le64(tv, 0, millis / 1000)
-    io.set_le64(tv, 8, millis % 1000 * 1000)
-    io.syscall_result(__syscall(54, fd, 1, option, __slice_ptr(tv), 16))?
+pub fn set_read_timeout(c: Conn, millis: i64) {
+    c.timeouts.read = millis
 }
 
-pub fn set_read_timeout(c: Conn, millis: i64) ! io.Error {
-    set_timeout(c.fd, 20, millis)?
-}
-
-pub fn set_write_timeout(c: Conn, millis: i64) ! io.Error {
-    set_timeout(c.fd, 21, millis)?
+pub fn set_write_timeout(c: Conn, millis: i64) {
+    c.timeouts.write = millis
 }
 
 pub fn stream(c: Conn) -> io.Stream {
@@ -182,35 +254,29 @@ pub fn stream(c: Conn) -> io.Stream {
 }
 
 pub fn bind_udp(host: str, port: i64) -> Socket ! io.Error {
-    let ip = if host.len == 0 { parse_ip("0.0.0.0")? } else { lookup(host)?[0] }
-    let fd = bound(Addr { ip, port }, 2)?
-    Socket { fd, addr: local(fd)? }
+    let fd = bound(Addr { ip: resolve_local(host)?, port }, 2)?
+    Socket { fd, addr: local(fd)?, timeouts: no_timeouts() }
 }
 
 pub fn send_to(s: Socket, data: []u8, to: Addr) -> i64 ! io.Error {
     let sa = sockaddr(to)
-    for {
-        let r = __syscall(44, s.fd, __slice_ptr(data), data.len, 0x4000, __slice_ptr(sa), sa.len)
-        if !interrupted(r) {
-            return io.syscall_result(r)
-        }
-    }
+    retry(s.fd, true, s.timeouts.write, fn() -> i64 {
+        __syscall(44, s.fd, __slice_ptr(data), data.len, 0x4000, __slice_ptr(sa), sa.len)
+    })
 }
 
 pub fn receive_from(s: Socket, buf: []u8) -> Packet ! io.Error {
     let sa = io.buffer(28)
     let size = io.buffer(4)
-    for {
+    let n = retry(s.fd, false, s.timeouts.read, fn() -> i64 {
         io.set_le32(size, 0, 28)
-        let r = __syscall(45, s.fd, __slice_ptr(buf), buf.len, 0, __slice_ptr(sa), __slice_ptr(size))
-        if !interrupted(r) {
-            return Packet { size: io.syscall_result(r)?, from: from_sockaddr(sa) }
-        }
-    }
+        __syscall(45, s.fd, __slice_ptr(buf), buf.len, 0, __slice_ptr(sa), __slice_ptr(size))
+    })?
+    Packet { size: n, from: from_sockaddr(sa) }
 }
 
-pub fn set_receive_timeout(s: Socket, millis: i64) ! io.Error {
-    set_timeout(s.fd, 20, millis)?
+pub fn set_receive_timeout(s: Socket, millis: i64) {
+    s.timeouts.read = millis
 }
 
 pub fn close_socket(s: Socket) {
