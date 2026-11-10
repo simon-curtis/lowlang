@@ -92,6 +92,27 @@ func (l *Lexer) emitNewline(p Pos) {
 	}
 }
 
+func (l *Lexer) continued() bool {
+	at := l.off
+	for at < len(l.src) {
+		switch c := l.src[at]; {
+		case c == ' ' || c == '\t' || c == '\r' || c == '\n':
+			at++
+		case c == '/' && at+1 < len(l.src) && l.src[at+1] == '/':
+			for at < len(l.src) && l.src[at] != '\n' {
+				at++
+			}
+		case c == '|':
+			return at+1 < len(l.src) && l.src[at+1] == '>'
+		case c == '.':
+			return at+1 >= len(l.src) || l.src[at+1] != '.'
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 func (l *Lexer) skipSpace() {
 	for l.off < len(l.src) {
 		switch c := l.peek(0); {
@@ -112,7 +133,9 @@ func (l *Lexer) next() error {
 	c := l.peek(0)
 	switch {
 	case c == '\n':
-		l.emitNewline(start)
+		if !l.continued() {
+			l.emitNewline(start)
+		}
 		l.advance()
 		return nil
 	case isLetter(c):
@@ -331,7 +354,7 @@ var operators = []struct {
 	kind Kind
 }{
 	{"...", Ellipsis}, {"<<=", ShlAssign}, {">>=", ShrAssign},
-	{"??", Coalesce}, {"<-", LArrow}, {"->", Arrow}, {"=>", FatArrow}, {"%=", PercentAssign}, {"&=", AmpAssign}, {"|=", PipeAssign}, {"^=", CaretAssign},
+	{"??", Coalesce}, {"<-", LArrow}, {"|>", PipeArrow}, {"->", Arrow}, {"=>", FatArrow}, {"%=", PercentAssign}, {"&=", AmpAssign}, {"|=", PipeAssign}, {"^=", CaretAssign},
 	{"<<", Shl}, {">>", Shr}, {"+=", PlusAssign}, {"-=", MinusAssign}, {"*=", StarAssign}, {"/=", SlashAssign},
 	{"&&", AndAnd}, {"||", OrOr}, {"==", Eq}, {"!=", NotEq}, {"<=", LtEq}, {">=", GtEq},
 	{"..", DotDot}, {"(", LParen}, {")", RParen}, {"[", LBracket}, {"]", RBracket}, {"{", LBrace}, {"}", RBrace}, {",", Comma}, {":", Colon}, {".", Dot}, {"?", Question},

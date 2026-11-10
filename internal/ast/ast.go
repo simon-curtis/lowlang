@@ -477,6 +477,7 @@ type Call struct {
 	Fn      Expr
 	Args    []Expr
 	Pos     lexer.Pos
+	Piped   bool
 	Target  *Func
 	Builtin string
 	Variant *types.Variant

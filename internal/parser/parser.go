@@ -701,12 +701,13 @@ func (p *Parser) binding(pos lexer.Pos, mutable bool) *ast.Let {
 }
 
 var precedence = map[lexer.Kind]int{
-	lexer.OrOr:   1,
-	lexer.AndAnd: 2,
-	lexer.Eq:     3, lexer.NotEq: 3, lexer.Lt: 3, lexer.LtEq: 3, lexer.Gt: 3, lexer.GtEq: 3,
-	lexer.Coalesce: 4,
-	lexer.Plus:     5, lexer.Minus: 5, lexer.Pipe: 5, lexer.Caret: 5,
-	lexer.Star: 6, lexer.Slash: 6, lexer.Percent: 6, lexer.Amp: 6, lexer.Shl: 6, lexer.Shr: 6,
+	lexer.PipeArrow: 1,
+	lexer.OrOr:      2,
+	lexer.AndAnd:    3,
+	lexer.Eq:        4, lexer.NotEq: 4, lexer.Lt: 4, lexer.LtEq: 4, lexer.Gt: 4, lexer.GtEq: 4,
+	lexer.Coalesce: 5,
+	lexer.Plus:     6, lexer.Minus: 6, lexer.Pipe: 6, lexer.Caret: 6,
+	lexer.Star: 7, lexer.Slash: 7, lexer.Percent: 7, lexer.Amp: 7, lexer.Shl: 7, lexer.Shr: 7,
 }
 
 func (p *Parser) expr() ast.Expr {
@@ -730,8 +731,28 @@ func (p *Parser) binaryFrom(x ast.Expr, minPrec int) ast.Expr {
 			next = prec
 		}
 		y := p.binary(next)
+		if op.Kind == lexer.PipeArrow {
+			x = p.pipe(x, y, op.Pos)
+			continue
+		}
 		x = &ast.Binary{Op: op.Kind, X: x, Y: y, Pos: op.Pos}
 	}
+}
+
+func (p *Parser) pipe(x, y ast.Expr, pos lexer.Pos) ast.Expr {
+	switch y := y.(type) {
+	case *ast.Try:
+		y.X = p.pipe(x, y.X, pos)
+		return y
+	case *ast.Call:
+		y.Args = append([]ast.Expr{x}, y.Args...)
+		y.Piped = true
+		return y
+	case *ast.Ident, *ast.Selector, *ast.Instance, *ast.Closure:
+		return &ast.Call{Fn: y, Args: []ast.Expr{x}, Pos: pos, Piped: true}
+	}
+	p.fail(y.Position(), "the right side of |> must be a function or a call")
+	return nil
 }
 
 func (p *Parser) unary() ast.Expr {

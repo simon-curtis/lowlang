@@ -56,6 +56,7 @@ const (
 	Question
 	Coalesce
 	LArrow
+	PipeArrow
 
 	Assign
 	PlusAssign
@@ -96,7 +97,7 @@ var names = map[Kind]string{
 	Fn: "fn", Let: "let", Var: "var", If: "if", Else: "else", For: "for",
 	Break: "break", Continue: "continue", Return: "return", True: "true", False: "false",
 	Enum: "enum", Match: "match", Fail: "fail", Catch: "catch", Struct: "struct", Mut: "mut", In: "in", Import: "import", Pub: "pub", Extern: "extern", Defer: "defer", Spawn: "spawn", Select: "select", Using: "using", Drop: "drop",
-	LParen: "(", RParen: ")", LBracket: "[", RBracket: "]", DotDot: "..", Ellipsis: "...", LBrace: "{", RBrace: "}", Comma: ",", Colon: ":", Arrow: "->", FatArrow: "=>", Dot: ".", Question: "?", Coalesce: "??", LArrow: "<-",
+	LParen: "(", RParen: ")", LBracket: "[", RBracket: "]", DotDot: "..", Ellipsis: "...", LBrace: "{", RBrace: "}", Comma: ",", Colon: ":", Arrow: "->", FatArrow: "=>", Dot: ".", Question: "?", Coalesce: "??", LArrow: "<-", PipeArrow: "|>",
 	Assign: "=", PlusAssign: "+=", MinusAssign: "-=", StarAssign: "*=", SlashAssign: "/=",
 	PercentAssign: "%=", AmpAssign: "&=", PipeAssign: "|=", CaretAssign: "^=", ShlAssign: "<<=", ShrAssign: ">>=",
 	Plus: "+", Minus: "-", Star: "*", Slash: "/", Percent: "%", Amp: "&", Pipe: "|", Caret: "^", Tilde: "~", Shl: "<<", Shr: ">>", Not: "!",

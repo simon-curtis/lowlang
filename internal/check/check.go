@@ -1530,6 +1530,9 @@ var builtins = map[string]bool{
 }
 
 func (c *Checker) call(e *ast.Call, want *types.Type) {
+	if e.Piped && c.pipesMut(e.Fn) {
+		e.Args[0] = &ast.Ref{X: e.Args[0], Pos: e.Args[0].Position()}
+	}
 	switch fn := e.Fn.(type) {
 	case *ast.Ident:
 		if fn.Name == "print" {
@@ -1611,6 +1614,21 @@ func (c *Checker) method(e *ast.Call, sel *ast.Selector, want *types.Type) {
 	e.Fn = &ast.Ident{Name: sel.Name, Pos: sel.Pos}
 	e.Args = append([]ast.Expr{first}, e.Args...)
 	c.call(e, want)
+}
+
+func (c *Checker) pipesMut(fn ast.Expr) bool {
+	switch fn := fn.(type) {
+	case *ast.Ident:
+		return c.receivesMut(fn.Name)
+	case *ast.Selector:
+		id, isIdent := fn.X.(*ast.Ident)
+		if !isIdent || !c.isModule(id.Name) {
+			return false
+		}
+		target := c.importedFunc(id.Name, fn.Name, fn.Pos)
+		return len(target.Params) > 0 && target.Params[0].Mut
+	}
+	return false
 }
 
 func (c *Checker) receivesMut(name string) bool {

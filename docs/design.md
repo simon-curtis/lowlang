@@ -50,6 +50,11 @@ fn first(s: str) -> u8 {
 
 "simon".first()
 items.push(4)
+
+let shouted = "hi"
+    |> text.repeat(3)
+    |> first
+let n = input |> parse()?
 ```
 
 - A function type is written `fn(i64, mut str) -> bool`, with `! E` for a result that can fail. Two function types are the same when their parameters, `mut` markers and results are.
@@ -57,6 +62,8 @@ items.push(4)
 - A closure captures the variables it names by reference, as Go does: it reads and assigns the variable itself, and the variable lives as long as any closure holding it. Each loop iteration binds fresh variables, so closures made in different iterations see different ones. A `mut` parameter cannot be captured.
 - A function value is called like a function. Values of function type can be stored in variables, fields, slices and maps, passed and returned; they cannot be compared or printed.
 - `x.f(args)` calls `f(x, args)`, so calls chain left to right: `"ab".repeat(3).first()`. `f` is any function callable by its plain name: a function in the current module, a function value in scope, a generic function or a builtin. A struct field of function type named `f` takes precedence, so `op.apply(v)` calls the stored function. When the first parameter is `mut`, `x` is passed as `mut` and must be a mutable place.
+- `x |> f(args)` also calls `f(x, args)`, and `x |> f` calls `f(x)`. The right side is a call, a function name, a module function such as `text.repeat`, a closure or a function-valued field; any other expression is an error. `|>` has the lowest precedence of the binary operators and groups left to right, so `a + b |> f()` is `f(a + b)`. A trailing `?` applies to the call: `x |> parse()?` is `parse(x)?`. A `mut` first parameter receives `x` as `mut`, as with `x.f(args)`.
+- A line that starts with `|>` or `.` continues the expression on the line before it.
 
 ### Control flow
 
@@ -730,7 +737,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 
 - Types: `i64`, `i32`, `u32`, `u16`, `u8`, `f64`, `f32`, `bool`, `str`, slices `[]T`, maps `[K: V]`, structs, enums with payloads, results `T ! E`, pointers `*T`.
 - `let`, `var`, assignment, `if`/`else`, `for cond`, `for` with `break`/`continue`, `return`.
-- Functions with parameters and return values, recursion, and `x.f(args)` calls passing `x` as the first argument.
+- Functions with parameters and return values, recursion, and `x.f(args)` calls and `x |> f(args)` pipes passing `x` as the first argument.
 - Arithmetic, comparison, logical, bitwise and shift operators; numeric conversions; `sqrt`, `floor` and `exp`.
 - `match`, `fail`, `?`, `catch`.
 - Optionals `T?` with `none`, `some`, `??` and implicit wrapping.
