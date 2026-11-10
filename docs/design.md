@@ -589,6 +589,7 @@ let pick: fn(i64, i64) -> i64 = max
   - `Float` is met by `f64` and `f32`.
   - An unconstrained parameter can only be moved, stored and passed. Anything else a generic function needs, such as an ordering of its elements, is passed in as a function value.
 - A generic body is checked once against its constraints, so a missing constraint is reported at the definition, not at a use.
+- Each generic function's type parameters are its own, so two functions may both name a parameter `T`, and a function type mentioning one is distinct from the same text mentioning the other.
 - Type arguments are inferred from the arguments, then from the expected type. They can be written explicitly as `max[u8](a, b)` or `Stack[str] { ... }`. A generic struct literal or enum variant takes its arguments from the expected type or from its field values. A generic function used as a value takes them from the expected function type.
 - Each distinct set of type arguments compiles to its own copy, `max[i64]` and `max[f64]`, so generic code runs as fast as code written for one type.
 - Values of different kinds that share behaviour, such as the elements of a UI tree, are structs of function values whose closures capture each kind's state.

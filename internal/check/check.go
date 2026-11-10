@@ -271,12 +271,22 @@ func (c *Checker) funcTypeName(t *ast.TypeName) *types.Type {
 }
 
 func (c *Checker) funcType(params []*types.Type, muts []bool, ret *types.Type, cfn bool) *types.Type {
-	t := types.NewFunc(params, muts, ret, cfn)
-	if known, ok := c.funcTypes[t.Name]; ok {
+	key := funcKey(params, muts, ret, cfn)
+	if known, ok := c.funcTypes[key]; ok {
 		return known
 	}
-	c.funcTypes[t.Name] = t
+	t := types.NewFunc(params, muts, ret, cfn)
+	c.funcTypes[key] = t
 	return t
+}
+
+func funcKey(params []*types.Type, muts []bool, ret *types.Type, cfn bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%t %p", cfn, ret)
+	for i, p := range params {
+		fmt.Fprintf(&b, " %t %p", muts[i], p)
+	}
+	return b.String()
 }
 
 func (c *Checker) signatureOf(fn *ast.Func, cfn bool) *types.Type {
