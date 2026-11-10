@@ -170,7 +170,7 @@ func fusible(b *ir.Block) *ir.Value {
 		return nil
 	}
 	last := b.Values[len(b.Values)-1]
-	if last != b.Control || !last.Op.Compare() || last.Uses != 1 {
+	if last != b.Control || !last.Op.Compare() || last.Uses != 1 || isFloat(last.Type) {
 		return nil
 	}
 	return last

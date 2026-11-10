@@ -7,7 +7,8 @@ type Kind int
 const (
 	VoidKind Kind = iota
 	NeverKind
-	I64Kind
+	IntKind
+	FloatKind
 	BoolKind
 	StrKind
 	EnumKind
@@ -24,6 +25,8 @@ type Type struct {
 	Elem     *Type
 	Ok       *Type
 	Err      *Type
+	Bits     int
+	Signed   bool
 	size     int
 }
 
@@ -43,10 +46,41 @@ type Variant struct {
 var (
 	Void  = &Type{Kind: VoidKind, Name: "void"}
 	Never = &Type{Kind: NeverKind, Name: "never"}
-	I64   = &Type{Kind: I64Kind, Name: "i64", size: 1}
+	I64   = &Type{Kind: IntKind, Name: "i64", Bits: 64, Signed: true, size: 1}
+	I32   = &Type{Kind: IntKind, Name: "i32", Bits: 32, Signed: true, size: 1}
+	U32   = &Type{Kind: IntKind, Name: "u32", Bits: 32, size: 1}
+	U16   = &Type{Kind: IntKind, Name: "u16", Bits: 16, size: 1}
+	U8    = &Type{Kind: IntKind, Name: "u8", Bits: 8, size: 1}
+	F64   = &Type{Kind: FloatKind, Name: "f64", Bits: 64, size: 1}
+	F32   = &Type{Kind: FloatKind, Name: "f32", Bits: 32, size: 1}
 	Bool  = &Type{Kind: BoolKind, Name: "bool", size: 1}
 	Str   = &Type{Kind: StrKind, Name: "str", size: 1}
 )
+
+var Numeric = []*Type{I64, I32, U32, U16, U8, F64, F32}
+
+func (t *Type) Integer() bool {
+	return t.Kind == IntKind
+}
+
+func (t *Type) Float() bool {
+	return t.Kind == FloatKind
+}
+
+func (t *Type) Number() bool {
+	return t.Integer() || t.Float()
+}
+
+func (t *Type) Holds(n int64) bool {
+	if t.Bits == 64 {
+		return t.Signed || n >= 0
+	}
+	if t.Signed {
+		limit := int64(1) << (t.Bits - 1)
+		return n >= -limit && n < limit
+	}
+	return n >= 0 && n < int64(1)<<t.Bits
+}
 
 func NewEnum(name string) *Type {
 	return &Type{Kind: EnumKind, Name: name, size: -1}

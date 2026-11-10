@@ -39,7 +39,7 @@ type Checker struct {
 func Check(file *ast.File) (err error) {
 	c := &Checker{
 		funcs:   map[string]*ast.Func{},
-		named:   map[string]*types.Type{"i64": types.I64, "bool": types.Bool, "str": types.Str},
+		named:   map[string]*types.Type{"bool": types.Bool, "str": types.Str},
 		results: map[[2]*types.Type]*types.Type{},
 		ptrs:    map[*types.Type]*types.Type{},
 	}
@@ -54,6 +54,9 @@ func Check(file *ast.File) (err error) {
 		}
 		err = b.err
 	}()
+	for _, t := range types.Numeric {
+		c.named[t.Name] = t
+	}
 	c.file(file)
 	return nil
 }
@@ -177,8 +180,11 @@ func (c *Checker) declareFuncs(funcs []*ast.Func) {
 		if _, dup := c.funcs[fn.Name]; dup {
 			c.fail(fn.Pos, "function %s already declared", fn.Name)
 		}
-		if fn.Name == "print" || fn.Name == "new" {
+		if builtins[fn.Name] {
 			c.fail(fn.Pos, "%s is a builtin", fn.Name)
+		}
+		if _, clash := c.named[fn.Name]; clash {
+			c.fail(fn.Pos, "function %s has the name of a type", fn.Name)
 		}
 		c.signature(fn)
 		c.funcs[fn.Name] = fn
@@ -351,14 +357,34 @@ func (c *Checker) let(s *ast.Let) {
 
 func (c *Checker) assign(s *ast.Assign) {
 	place, t := c.place(s.Target, s.Pos, "assign to %s", "cannot assign to this expression")
+	s.Place = place
+	switch s.Op {
+	case lexer.Assign:
+	case lexer.PlusAssign, lexer.MinusAssign, lexer.StarAssign, lexer.SlashAssign:
+		c.requireNumber(t, s.Op, s.Pos)
+	default:
+		c.requireInteger(t, s.Op, s.Pos)
+	}
+	if s.Op == lexer.ShlAssign || s.Op == lexer.ShrAssign {
+		c.requireInteger(c.plain(s.Value, nil), s.Op, s.Value.Position())
+		return
+	}
 	value := c.plain(s.Value, t)
 	if value != t && value != types.Never {
 		c.fail(s.Value.Position(), "cannot assign %s to a place of type %s", value, t)
 	}
-	if s.Op != lexer.Assign && t != types.I64 {
-		c.fail(s.Pos, "operator %s requires i64, found %s", s.Op, t)
+}
+
+func (c *Checker) requireNumber(t *types.Type, op lexer.Kind, pos lexer.Pos) {
+	if !t.Number() && t != types.Never {
+		c.fail(pos, "operator %s requires a number, found %s", op, t)
 	}
-	s.Place = place
+}
+
+func (c *Checker) requireInteger(t *types.Type, op lexer.Kind, pos lexer.Pos) {
+	if !t.Integer() && t != types.Never {
+		c.fail(pos, "operator %s requires an integer, found %s", op, t)
+	}
 }
 
 func (c *Checker) mutable(root *ast.Local, pos lexer.Pos, action string) {
@@ -481,6 +507,17 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 	switch e := e.(type) {
 	case *ast.IntLit:
 		e.Type = types.I64
+		if want != nil && want.Number() {
+			e.Type = want
+		}
+		if e.Type.Integer() && !e.Type.Holds(e.Value) {
+			c.fail(e.Pos, "%d overflows %s", e.Value, e.Type)
+		}
+	case *ast.FloatLit:
+		e.Type = types.F64
+		if want != nil && want.Float() {
+			e.Type = want
+		}
 	case *ast.StrLit:
 		e.Type = types.Str
 	case *ast.BoolLit:
@@ -494,9 +531,9 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 	case *ast.Ref:
 		c.fail(e.Pos, "mut is only allowed as an argument to a mut parameter")
 	case *ast.Unary:
-		c.unary(e)
+		c.unary(e, want)
 	case *ast.Binary:
-		c.binary(e)
+		c.binary(e, want)
 	case *ast.Call:
 		c.call(e, want)
 	case *ast.If:
@@ -615,7 +652,7 @@ func (c *Checker) unitVariant(v *types.Variant, pos lexer.Pos) {
 	}
 }
 
-func (c *Checker) unary(e *ast.Unary) {
+func (c *Checker) unary(e *ast.Unary, want *types.Type) {
 	switch e.Op {
 	case lexer.Star:
 		t := c.plain(e.X, nil)
@@ -626,37 +663,69 @@ func (c *Checker) unary(e *ast.Unary) {
 	case lexer.Not:
 		c.expectType(e.X, types.Bool)
 		e.Type = types.Bool
+	case lexer.Tilde:
+		e.Type = c.plain(e.X, numeric(want))
+		c.requireInteger(e.Type, e.Op, e.Pos)
 	default:
-		c.expectType(e.X, types.I64)
-		e.Type = types.I64
+		e.Type = c.plain(e.X, numeric(want))
+		c.requireNumber(e.Type, e.Op, e.Pos)
 	}
 }
 
-func (c *Checker) binary(e *ast.Binary) {
+func numeric(want *types.Type) *types.Type {
+	if want != nil && want.Number() {
+		return want
+	}
+	return nil
+}
+
+func literal(e ast.Expr) bool {
+	switch e.(type) {
+	case *ast.IntLit, *ast.FloatLit:
+		return true
+	}
+	return false
+}
+
+func (c *Checker) operands(e *ast.Binary, want *types.Type) *types.Type {
+	first, second := e.X, e.Y
+	if literal(first) && !literal(second) {
+		first, second = second, first
+	}
+	t := c.plain(first, want)
+	c.expectType(second, t)
+	return t
+}
+
+func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 	switch e.Op {
 	case lexer.AndAnd, lexer.OrOr:
 		c.expectType(e.X, types.Bool)
 		c.expectType(e.Y, types.Bool)
 		e.Type = types.Bool
+	case lexer.Shl, lexer.Shr:
+		e.Type = c.plain(e.X, numeric(want))
+		c.requireInteger(e.Type, e.Op, e.X.Position())
+		c.requireInteger(c.plain(e.Y, nil), e.Op, e.Y.Position())
 	case lexer.Eq, lexer.NotEq:
-		x := c.plain(e.X, nil)
-		if x != types.I64 && x != types.Bool && x != types.Str && x.Kind != types.PointerKind {
-			c.fail(e.X.Position(), "cannot compare values of type %s", x)
+		t := c.operands(e, nil)
+		if !t.Number() && t != types.Bool && t != types.Str && t.Kind != types.PointerKind {
+			c.fail(e.X.Position(), "cannot compare values of type %s", t)
 		}
-		c.expectType(e.Y, x)
 		e.Type = types.Bool
 	case lexer.Lt, lexer.LtEq, lexer.Gt, lexer.GtEq:
-		c.expectType(e.X, types.I64)
-		c.expectType(e.Y, types.I64)
+		c.requireNumber(c.operands(e, nil), e.Op, e.Pos)
 		e.Type = types.Bool
+	case lexer.Percent, lexer.Amp, lexer.Pipe, lexer.Caret:
+		e.Type = c.operands(e, numeric(want))
+		c.requireInteger(e.Type, e.Op, e.Pos)
 	default:
-		c.expectType(e.X, types.I64)
-		c.expectType(e.Y, types.I64)
-		e.Type = types.I64
+		e.Type = c.operands(e, numeric(want))
+		c.requireNumber(e.Type, e.Op, e.Pos)
 	}
 }
 
-var printable = map[*types.Type]string{types.I64: "print_i64", types.Str: "print_str", types.Bool: "print_bool"}
+var builtins = map[string]bool{"print": true, "new": true, "sqrt": true, "floor": true, "exp": true}
 
 func (c *Checker) call(e *ast.Call, want *types.Type) {
 	switch fn := e.Fn.(type) {
@@ -667,6 +736,14 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 		}
 		if fn.Name == "new" {
 			c.allocate(e, want)
+			return
+		}
+		if builtins[fn.Name] {
+			c.math(e, fn.Name, want)
+			return
+		}
+		if t, ok := c.named[fn.Name]; ok && t.Number() && c.find(fn.Name) == nil {
+			c.convert(e, t)
 			return
 		}
 		if v := c.inferVariant(want, fn.Name); v != nil {
@@ -690,12 +767,47 @@ func (c *Checker) print(e *ast.Call) {
 		c.fail(e.Pos, "print takes 1 argument, found %d", len(e.Args))
 	}
 	t := c.plain(e.Args[0], nil)
-	builtin, ok := printable[t]
-	if !ok {
+	switch {
+	case t.Integer():
+		e.Builtin = "print_i64"
+	case t == types.Bool:
+		e.Builtin = "print_bool"
+	case t == types.Str:
+		e.Builtin = "print_str"
+	default:
 		c.fail(e.Args[0].Position(), "cannot print a value of type %s", t)
 	}
-	e.Builtin = builtin
 	e.Type = types.Void
+}
+
+func (c *Checker) single(e *ast.Call, name string) {
+	if len(e.Args) != 1 {
+		c.fail(e.Pos, "%s takes 1 argument, found %d", name, len(e.Args))
+	}
+}
+
+func (c *Checker) math(e *ast.Call, name string, want *types.Type) {
+	c.single(e, name)
+	arg := types.F64
+	if want != nil && want.Float() {
+		arg = want
+	}
+	t := c.plain(e.Args[0], arg)
+	if !t.Float() {
+		c.fail(e.Args[0].Position(), "%s requires f32 or f64, found %s", name, t)
+	}
+	e.Builtin = name
+	e.Type = t
+}
+
+func (c *Checker) convert(e *ast.Call, to *types.Type) {
+	c.single(e, to.Name)
+	t := c.plain(e.Args[0], nil)
+	if !t.Number() {
+		c.fail(e.Args[0].Position(), "cannot convert %s to %s", t, to)
+	}
+	e.Builtin = "convert"
+	e.Type = to
 }
 
 func (c *Checker) variantCall(e *ast.Call, sel *ast.Selector) {

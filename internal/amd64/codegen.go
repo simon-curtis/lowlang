@@ -306,17 +306,11 @@ func (g *Generator) block(fr *frame, mb *mblock, next *mblock) {
 	}
 }
 
-var conditions = map[ir.Op]string{
-	ir.OpEq: "e", ir.OpNe: "ne", ir.OpLt: "l", ir.OpLe: "le", ir.OpGt: "g", ir.OpGe: "ge",
-}
-
-var inverse = map[string]string{"e": "ne", "ne": "e", "l": "ge", "ge": "l", "le": "g", "g": "le", "nz": "z", "z": "nz"}
-
 func (g *Generator) branch(fr *frame, mb *mblock, next *mblock) {
 	cond := "nz"
 	if mb.fused != nil {
 		g.compare(fr, mb.compare[0], mb.compare[1])
-		cond = conditions[mb.fused.Op]
+		cond = condition(mb.fused)
 	} else {
 		g.test(fr.loc(mb.control))
 	}
@@ -370,7 +364,9 @@ func (g *Generator) ret(fr *frame, mb *mblock) {
 	g.emit("ret")
 }
 
-var binops = map[ir.Op]string{ir.OpAdd: "add", ir.OpSub: "sub", ir.OpMul: "imul"}
+var binops = map[ir.Op]string{
+	ir.OpAdd: "add", ir.OpSub: "sub", ir.OpMul: "imul", ir.OpAnd: "and", ir.OpOr: "or", ir.OpXor: "xor",
+}
 
 func (g *Generator) instr(fr *frame, in *instr) {
 	if in.move {
@@ -388,18 +384,23 @@ func (g *Generator) instr(fr *frame, in *instr) {
 		g.address(fr.loc(in.dst), fmt.Sprintf("[rip+%s]", g.stringLabel(v.Str)))
 	case ir.OpUndef:
 	case ir.OpAdd, ir.OpSub, ir.OpMul:
+		g.arithmetic(fr, in, map[ir.Op]string{ir.OpAdd: "add", ir.OpSub: "sub", ir.OpMul: "mul"}[in.op])
+	case ir.OpAnd, ir.OpOr, ir.OpXor:
 		g.binary(fr, in, binops[in.op])
+	case ir.OpShl, ir.OpShr:
+		g.shift(fr, in)
 	case ir.OpDiv, ir.OpRem:
 		g.divide(fr, in)
-	case ir.OpNeg:
-		g.unary(fr, in, "neg r10")
+	case ir.OpNeg, ir.OpCompl:
+		g.negate(fr, in)
 	case ir.OpNot:
 		g.unary(fr, in, "xor r10, 1")
+	case ir.OpConvert:
+		g.convert(fr, in)
+	case ir.OpSqrt, ir.OpFloor:
+		g.floatUnary(fr, in)
 	case ir.OpEq, ir.OpNe, ir.OpLt, ir.OpLe, ir.OpGt, ir.OpGe:
-		g.compare(fr, in.args[0], in.args[1])
-		g.emit("set%s al", conditions[in.op])
-		g.emit("movzx eax, al")
-		g.move(fr.loc(in.dst), "rax")
+		g.compareValues(fr, in)
 	case ir.OpLoad:
 		g.move(fr.loc(in.dst), fmt.Sprintf("qword ptr [%s+%d]", g.base(fr.loc(in.args[0])), v.Aux))
 	case ir.OpStore:
@@ -467,31 +468,6 @@ func (g *Generator) unary(fr *frame, in *instr, op string) {
 	g.move("r10", fr.loc(in.args[0]))
 	g.emit("%s", op)
 	g.move(fr.loc(in.dst), "r10")
-}
-
-func (g *Generator) divide(fr *frame, in *instr) {
-	normal := g.newLabel()
-	done := g.newLabel()
-	g.move("rax", fr.loc(in.args[0]))
-	g.move("r10", fr.loc(in.args[1]))
-	g.emit("test r10, r10")
-	g.emit("jz rt_panic_divzero")
-	g.emit("cmp r10, -1")
-	g.emit("jne %s", normal)
-	if in.op == ir.OpDiv {
-		g.emit("neg rax")
-	} else {
-		g.emit("xor eax, eax")
-	}
-	g.emit("jmp %s", done)
-	g.label(normal)
-	g.emit("cqo")
-	g.emit("idiv r10")
-	if in.op == ir.OpRem {
-		g.emit("mov rax, rdx")
-	}
-	g.label(done)
-	g.move(fr.loc(in.dst), "rax")
 }
 
 func (g *Generator) params(fr *frame, entry *mblock) {

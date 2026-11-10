@@ -191,6 +191,12 @@ type IntLit struct {
 	Pos   lexer.Pos
 }
 
+type FloatLit struct {
+	Typed
+	Value float64
+	Pos   lexer.Pos
+}
+
 type StrLit struct {
 	Typed
 	Value string
@@ -323,6 +329,7 @@ func (n *Continue) Position() lexer.Pos  { return n.Pos }
 func (n *Return) Position() lexer.Pos    { return n.Pos }
 func (n *Fail) Position() lexer.Pos      { return n.Pos }
 func (n *IntLit) Position() lexer.Pos    { return n.Pos }
+func (n *FloatLit) Position() lexer.Pos  { return n.Pos }
 func (n *StrLit) Position() lexer.Pos    { return n.Pos }
 func (n *BoolLit) Position() lexer.Pos   { return n.Pos }
 func (n *Ident) Position() lexer.Pos     { return n.Pos }
@@ -348,6 +355,7 @@ func (*Fail) stmt()     {}
 
 func (*Block) expr()     {}
 func (*IntLit) expr()    {}
+func (*FloatLit) expr()  {}
 func (*StrLit) expr()    {}
 func (*BoolLit) expr()   {}
 func (*Ident) expr()     {}

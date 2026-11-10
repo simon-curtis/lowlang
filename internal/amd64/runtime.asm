@@ -465,3 +465,83 @@ rt_sweep:
 	mov [rip+rt_gc_threshold], rax
 	mov qword ptr [rip+rt_alloc_since], 0
 	ret
+
+	.section .rodata
+	.p2align 3
+rt_exp_max:
+	.double 709.782712893384
+rt_exp_min:
+	.double -745.1332191019411
+rt_exp_log2e:
+	.double 1.4426950408889634
+rt_exp_ln2hi:
+	.double 6.93147180369123816490e-01
+rt_exp_ln2lo:
+	.double 1.90821492927058770002e-10
+rt_exp_coef:
+	.double 1.6059043836821613e-10
+	.double 2.08767569878681e-09
+	.double 2.505210838544172e-08
+	.double 2.755731922398589e-07
+	.double 2.7557319223985893e-06
+	.double 2.48015873015873e-05
+	.double 0.0001984126984126984
+	.double 0.001388888888888889
+	.double 0.008333333333333333
+	.double 0.041666666666666664
+	.double 0.16666666666666666
+	.double 0.5
+	.double 1.0
+	.double 1.0
+
+	.text
+	.globl rt_exp
+rt_exp:
+	movq xmm0, rdi
+	ucomisd xmm0, xmm0
+	jp 3f
+	ucomisd xmm0, [rip+rt_exp_max]
+	ja 4f
+	movsd xmm1, [rip+rt_exp_min]
+	ucomisd xmm1, xmm0
+	ja 5f
+	movsd xmm1, xmm0
+	mulsd xmm1, [rip+rt_exp_log2e]
+	cvtsd2si rax, xmm1
+	cvtsi2sd xmm2, rax
+	movsd xmm3, xmm2
+	mulsd xmm3, [rip+rt_exp_ln2hi]
+	subsd xmm0, xmm3
+	mulsd xmm2, [rip+rt_exp_ln2lo]
+	subsd xmm0, xmm2
+	lea rcx, [rip+rt_exp_coef]
+	movsd xmm1, [rcx]
+	mov edx, 1
+1:
+	mulsd xmm1, xmm0
+	addsd xmm1, [rcx+8*rdx]
+	inc edx
+	cmp edx, 14
+	jb 1b
+	mov rdx, rax
+	sar rdx, 1
+	sub rax, rdx
+	add rdx, 1023
+	shl rdx, 52
+	movq xmm2, rdx
+	mulsd xmm1, xmm2
+	add rax, 1023
+	shl rax, 52
+	movq xmm2, rax
+	mulsd xmm1, xmm2
+	movq rax, xmm1
+	ret
+3:
+	mov rax, rdi
+	ret
+4:
+	mov rax, 0x7ff0000000000000
+	ret
+5:
+	xor eax, eax
+	ret

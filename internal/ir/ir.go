@@ -22,6 +22,15 @@ const (
 	OpRem
 	OpNeg
 	OpNot
+	OpAnd
+	OpOr
+	OpXor
+	OpShl
+	OpShr
+	OpCompl
+	OpConvert
+	OpSqrt
+	OpFloor
 	OpEq
 	OpNe
 	OpLt
@@ -39,6 +48,8 @@ const (
 var opNames = [...]string{
 	OpConst: "const", OpString: "string", OpParam: "param", OpUndef: "undef", OpPhi: "phi",
 	OpAdd: "add", OpSub: "sub", OpMul: "mul", OpDiv: "div", OpRem: "rem", OpNeg: "neg", OpNot: "not",
+	OpAnd: "and", OpOr: "or", OpXor: "xor", OpShl: "shl", OpShr: "shr", OpCompl: "compl",
+	OpConvert: "convert", OpSqrt: "sqrt", OpFloor: "floor",
 	OpEq: "eq", OpNe: "ne", OpLt: "lt", OpLe: "le", OpGt: "gt", OpGe: "ge",
 	OpLoad: "load", OpStore: "store", OpSlot: "slot", OpCall: "call", OpRuntime: "runtime", OpResult: "result",
 }
@@ -63,6 +74,8 @@ type Value struct {
 	Aux     int64
 	Str     string
 	Target  *Func
+	Type    *types.Type
+	From    *types.Type
 	Uses    int
 	forward *Value
 }
@@ -157,6 +170,11 @@ func describe(v *Value) string {
 		detail = fmt.Sprintf(" %s", v.Str)
 	case OpCall:
 		detail = fmt.Sprintf(" %s", v.Target.Name)
+	case OpConvert:
+		detail = fmt.Sprintf(" %s->%s", v.From, v.Type)
+	}
+	if v.Type != nil && v.Op != OpConvert {
+		detail = fmt.Sprintf("%s:%s", detail, v.Type)
 	}
 	return fmt.Sprintf("%s = %s%s %v", v, v.Op, detail, v.Args)
 }

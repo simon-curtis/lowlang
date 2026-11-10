@@ -9,6 +9,7 @@ const (
 	Newline
 	Ident
 	Int
+	Float
 	String
 
 	Fn
@@ -45,12 +46,24 @@ const (
 	MinusAssign
 	StarAssign
 	SlashAssign
+	PercentAssign
+	AmpAssign
+	PipeAssign
+	CaretAssign
+	ShlAssign
+	ShrAssign
 
 	Plus
 	Minus
 	Star
 	Slash
 	Percent
+	Amp
+	Pipe
+	Caret
+	Tilde
+	Shl
+	Shr
 	Not
 	AndAnd
 	OrOr
@@ -63,13 +76,14 @@ const (
 )
 
 var names = map[Kind]string{
-	EOF: "end of file", Newline: "newline", Ident: "identifier", Int: "integer", String: "string",
+	EOF: "end of file", Newline: "newline", Ident: "identifier", Int: "integer", Float: "float", String: "string",
 	Fn: "fn", Let: "let", Var: "var", If: "if", Else: "else", For: "for",
 	Break: "break", Continue: "continue", Return: "return", True: "true", False: "false",
 	Enum: "enum", Match: "match", Fail: "fail", Catch: "catch", Struct: "struct", Mut: "mut",
 	LParen: "(", RParen: ")", LBrace: "{", RBrace: "}", Comma: ",", Colon: ":", Arrow: "->", FatArrow: "=>", Dot: ".", Question: "?",
 	Assign: "=", PlusAssign: "+=", MinusAssign: "-=", StarAssign: "*=", SlashAssign: "/=",
-	Plus: "+", Minus: "-", Star: "*", Slash: "/", Percent: "%", Not: "!",
+	PercentAssign: "%=", AmpAssign: "&=", PipeAssign: "|=", CaretAssign: "^=", ShlAssign: "<<=", ShrAssign: ">>=",
+	Plus: "+", Minus: "-", Star: "*", Slash: "/", Percent: "%", Amp: "&", Pipe: "|", Caret: "^", Tilde: "~", Shl: "<<", Shr: ">>", Not: "!",
 	AndAnd: "&&", OrOr: "||", Eq: "==", NotEq: "!=", Lt: "<", LtEq: "<=", Gt: ">", GtEq: ">=",
 }
 

@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 
 	"lowlang/internal/ast"
@@ -77,7 +78,7 @@ func (p *Parser) expect(k lexer.Kind) lexer.Token {
 
 func describe(t lexer.Token) string {
 	switch t.Kind {
-	case lexer.Ident, lexer.Int:
+	case lexer.Ident, lexer.Int, lexer.Float:
 		return fmt.Sprintf("%s %s", t.Kind, t.Text)
 	case lexer.String:
 		return fmt.Sprintf("string %q", t.Text)
@@ -239,7 +240,9 @@ func (p *Parser) block() *ast.Block {
 
 var assignOps = map[lexer.Kind]bool{
 	lexer.Assign: true, lexer.PlusAssign: true, lexer.MinusAssign: true,
-	lexer.StarAssign: true, lexer.SlashAssign: true,
+	lexer.StarAssign: true, lexer.SlashAssign: true, lexer.PercentAssign: true,
+	lexer.AmpAssign: true, lexer.PipeAssign: true, lexer.CaretAssign: true,
+	lexer.ShlAssign: true, lexer.ShrAssign: true,
 }
 
 func (p *Parser) stmt() ast.Stmt {
@@ -295,8 +298,8 @@ var precedence = map[lexer.Kind]int{
 	lexer.OrOr:   1,
 	lexer.AndAnd: 2,
 	lexer.Eq:     3, lexer.NotEq: 3, lexer.Lt: 3, lexer.LtEq: 3, lexer.Gt: 3, lexer.GtEq: 3,
-	lexer.Plus: 4, lexer.Minus: 4,
-	lexer.Star: 5, lexer.Slash: 5, lexer.Percent: 5,
+	lexer.Plus: 4, lexer.Minus: 4, lexer.Pipe: 4, lexer.Caret: 4,
+	lexer.Star: 5, lexer.Slash: 5, lexer.Percent: 5, lexer.Amp: 5, lexer.Shl: 5, lexer.Shr: 5,
 }
 
 func (p *Parser) expr() ast.Expr {
@@ -319,23 +322,53 @@ func (p *Parser) binary(minPrec int) ast.Expr {
 
 func (p *Parser) unary() ast.Expr {
 	t := p.tok()
-	if t.Kind == lexer.Minus || t.Kind == lexer.Not || t.Kind == lexer.Star {
+	switch t.Kind {
+	case lexer.Minus:
+		p.next()
+		if lit := p.tok(); lit.Kind == lexer.Int || lit.Kind == lexer.Float {
+			p.next()
+			return p.postfix(p.number(lit, true, t.Pos))
+		}
+		return &ast.Unary{Op: t.Kind, X: p.unary(), Pos: t.Pos}
+	case lexer.Not, lexer.Star, lexer.Tilde:
 		p.next()
 		return &ast.Unary{Op: t.Kind, X: p.unary(), Pos: t.Pos}
 	}
 	return p.postfix(p.primary())
 }
 
+func (p *Parser) number(t lexer.Token, negative bool, pos lexer.Pos) ast.Expr {
+	if t.Kind == lexer.Float {
+		v, err := strconv.ParseFloat(t.Text, 64)
+		if err != nil {
+			p.fail(t.Pos, "invalid float literal %s", t.Text)
+		}
+		if negative {
+			v = -v
+		}
+		return &ast.FloatLit{Value: v, Pos: pos}
+	}
+	u, err := strconv.ParseUint(t.Text, 0, 64)
+	limit := uint64(math.MaxInt64)
+	if negative {
+		limit++
+	}
+	if err != nil || u > limit {
+		p.fail(t.Pos, "integer %s out of range", t.Text)
+	}
+	v := int64(u)
+	if negative {
+		v = -v
+	}
+	return &ast.IntLit{Value: v, Pos: pos}
+}
+
 func (p *Parser) primary() ast.Expr {
 	t := p.tok()
 	switch t.Kind {
-	case lexer.Int:
+	case lexer.Int, lexer.Float:
 		p.next()
-		v, err := strconv.ParseInt(t.Text, 10, 64)
-		if err != nil {
-			p.fail(t.Pos, "integer %s out of range", t.Text)
-		}
-		return &ast.IntLit{Value: v, Pos: t.Pos}
+		return p.number(t, false, t.Pos)
 	case lexer.String:
 		p.next()
 		return &ast.StrLit{Value: t.Text, Pos: t.Pos}

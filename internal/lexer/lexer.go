@@ -75,7 +75,7 @@ func (l *Lexer) emit(t Token) {
 
 func (l *Lexer) emitNewline(p Pos) {
 	switch l.last {
-	case Ident, Int, String, True, False, Break, Continue, Return, RParen, RBrace, Question:
+	case Ident, Int, Float, String, True, False, Break, Continue, Return, RParen, RBrace, Question:
 		l.emit(Token{Kind: Newline, Pos: p})
 	}
 }
@@ -130,11 +130,40 @@ func (l *Lexer) ident(start Pos) {
 
 func (l *Lexer) number(start Pos) {
 	from := l.off
-	for l.off < len(l.src) && (isDigit(l.peek(0)) || l.peek(0) == '_') {
+	kind := Int
+	if l.peek(0) == '0' && (l.peek(1) == 'x' || l.peek(1) == 'b') {
+		l.advance()
+		l.advance()
+		l.digits(isHexDigit)
+		l.emitNumber(kind, from, start)
+		return
+	}
+	l.digits(isDigit)
+	if l.peek(0) == '.' && isDigit(l.peek(1)) {
+		kind = Float
+		l.advance()
+		l.digits(isDigit)
+	}
+	if e := l.peek(0); e == 'e' || e == 'E' {
+		kind = Float
+		l.advance()
+		if s := l.peek(0); s == '+' || s == '-' {
+			l.advance()
+		}
+		l.digits(isDigit)
+	}
+	l.emitNumber(kind, from, start)
+}
+
+func (l *Lexer) digits(accept func(byte) bool) {
+	for l.off < len(l.src) && (accept(l.peek(0)) || l.peek(0) == '_') {
 		l.advance()
 	}
+}
+
+func (l *Lexer) emitNumber(kind Kind, from int, start Pos) {
 	text := strings.ReplaceAll(string(l.src[from:l.off]), "_", "")
-	l.emit(Token{Kind: Int, Text: text, Pos: start})
+	l.emit(Token{Kind: kind, Text: text, Pos: start})
 }
 
 var escapes = map[byte]byte{'n': '\n', 't': '\t', 'r': '\r', '0': 0, '\\': '\\', '"': '"'}
@@ -172,11 +201,13 @@ var operators = []struct {
 	text string
 	kind Kind
 }{
-	{"->", Arrow}, {"=>", FatArrow}, {"+=", PlusAssign}, {"-=", MinusAssign}, {"*=", StarAssign}, {"/=", SlashAssign},
+	{"<<=", ShlAssign}, {">>=", ShrAssign},
+	{"->", Arrow}, {"=>", FatArrow}, {"%=", PercentAssign}, {"&=", AmpAssign}, {"|=", PipeAssign}, {"^=", CaretAssign},
+	{"<<", Shl}, {">>", Shr}, {"+=", PlusAssign}, {"-=", MinusAssign}, {"*=", StarAssign}, {"/=", SlashAssign},
 	{"&&", AndAnd}, {"||", OrOr}, {"==", Eq}, {"!=", NotEq}, {"<=", LtEq}, {">=", GtEq},
 	{"(", LParen}, {")", RParen}, {"{", LBrace}, {"}", RBrace}, {",", Comma}, {":", Colon}, {".", Dot}, {"?", Question},
 	{"=", Assign}, {"+", Plus}, {"-", Minus}, {"*", Star}, {"/", Slash}, {"%", Percent},
-	{"!", Not}, {"<", Lt}, {">", Gt},
+	{"!", Not}, {"<", Lt}, {">", Gt}, {"&", Amp}, {"|", Pipe}, {"^", Caret}, {"~", Tilde},
 }
 
 func (l *Lexer) operator(start Pos) error {
@@ -196,6 +227,10 @@ func (l *Lexer) operator(start Pos) error {
 
 func isLetter(c byte) bool {
 	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isHexDigit(c byte) bool {
+	return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
 func isDigit(c byte) bool {

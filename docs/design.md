@@ -42,6 +42,28 @@ for n > 0 { n -= 1 }
 for { break }
 ```
 
+### Numbers
+
+```low
+let mask: u32 = 0xFF00
+var flags: u8 = 0b0000_0101
+flags |= 1 << 4
+let shifted = mask >> 8
+let ratio: f32 = 0.5
+let length = sqrt(3.0 * 3.0 + 4.0 * 4.0)
+let whole = i64(floor(length))
+let byte = u8(300)
+```
+
+- Integer types are `i64`, `i32`, `u32`, `u16` and `u8`; float types are `f64` and `f32`.
+- Integer arithmetic wraps at the type's width. Division by zero panics.
+- An integer literal takes the type the context expects, including the other operand of a binary operator, and must fit it; otherwise it is `i64`. A float literal is `f64` unless an `f32` is expected. Literals are decimal, `0x` hexadecimal or `0b` binary, with `_` separators, and floats may have an exponent.
+- Operands of a binary operator have the same type; conversions are explicit calls such as `u8(x)`, `f64(n)` and `i64(f)`. Integer conversions truncate or extend, float to integer truncates toward zero.
+- `&`, `|`, `^`, `~`, `<<` and `>>` work on integers. `>>` is arithmetic on signed types and logical on unsigned ones. The shift count may be any integer type; a count of 64 or more, or a negative one, gives 0, or the sign fill for `>>` on a negative signed value.
+- `%` is integer only. Floats follow IEEE 754: division by zero gives an infinity, and comparisons with NaN are false except `!=`.
+- `sqrt`, `floor` and `exp` take and return `f32` or `f64`.
+- `print` accepts any integer type.
+
 ### Structs
 
 ```low
@@ -238,6 +260,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 
 - SSA is built directly from the checked tree with Braun et al.'s algorithm: variables are read and written per block, phis are created lazily and sealed once a block's predecessors are known, and trivial phis are removed.
 - Every value is one 64-bit word. A struct, enum or result of n words is n SSA values, so aggregates live in registers with no frame temporaries.
+- Narrow integers are kept sign-extended (`i32`) or zero-extended (`u32`, `u16`, `u8`) in their word; floats are kept as their bit pattern, `f32` zero-extended. Arithmetic, conversion and comparison values carry their type.
 - A variable passed as `mut` lives in a frame slot and is accessed with loads and stores; every other variable is pure SSA.
 - Integer division carries its zero and overflow checks inside the instruction.
 - Unreachable blocks are pruned after construction.
@@ -247,6 +270,10 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Critical edges are split and each phi becomes a copy into a temporary at the end of every predecessor and a copy out of it at the start of the block.
 - A comparison used only by the branch that ends its block is fused into a `cmp` and conditional jump.
 - Constants that fit in 32 bits are used as immediates and take no register.
+- Results of narrow integer operations that can leave the type's range are re-extended with `movsxd`, `movzx` or a 32-bit `mov`. Unsigned comparisons and branches use the unsigned condition codes, and unsigned division uses `div`.
+- Float operations load their operands into `xmm0` and `xmm1`, run the scalar SSE instruction (`addsd`, `ucomiss`, `cvttsd2si`, `sqrtsd`, `roundsd` and so on) and move the result back. Float comparisons are materialised rather than fused, so NaN checks use the parity flag.
+- Variable shift counts go through `cl`, with `rcx` saved in `r11` around the shift; counts above 63 take a separate path.
+- `exp` is a runtime routine: range reduction by `ln 2` split into high and low parts, a degree-13 polynomial, and scaling by two powers of two so subnormal results stay in range.
 - Registers are assigned by linear scan over the hull of each value's live range. `rcx`, `rsi`, `rdi`, `r8` and `r9` hold values that are not live across a call; `rbx` and `r12` to `r15` hold values that are, and are saved in the prologue when used. Values that find no register are spilled to the frame. `rax`, `rdx`, `r10` and `r11` are scratch.
 - A value used as a call argument prefers that argument's register, and a copy prefers its source's register.
 
@@ -278,10 +305,10 @@ Mechanism:
 
 ## Implemented
 
-- Types: `i64`, `bool`, `str`, structs, enums with payloads, results `T ! E`, pointers `*T`.
+- Types: `i64`, `i32`, `u32`, `u16`, `u8`, `f64`, `f32`, `bool`, `str`, structs, enums with payloads, results `T ! E`, pointers `*T`.
 - `let`, `var`, assignment, `if`/`else`, `for cond`, `for` with `break`/`continue`, `return`.
 - Functions with parameters and return values, recursion.
-- Arithmetic, comparison and logical operators.
+- Arithmetic, comparison, logical, bitwise and shift operators; numeric conversions; `sqrt`, `floor` and `exp`.
 - `match`, `fail`, `?`, `catch`.
 - `mut` parameters.
 - Pointers, `new`, and a garbage-collected heap.
@@ -291,14 +318,13 @@ Mechanism:
 
 ## Roadmap
 
-1. Numeric types `u8`, `u16`, `u32`, `i32`, `f32` and `f64`; bitwise operators and shifts; `sqrt`, `floor` and `exp`.
-2. Slices; byte-level strings with length, UTF-8 iteration, a string builder and number formatting; maps.
-3. Optionals.
-4. Modules and visibility.
-5. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
-6. Embedded data: Unicode tables, SPIR-V and a fallback font.
-7. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
-8. C interop:
+1. Slices; byte-level strings with length, UTF-8 iteration, a string builder and number formatting; maps.
+2. Optionals.
+3. Modules and visibility.
+4. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
+5. Embedded data: Unicode tables, SPIR-V and a fallback font.
+6. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
+7. C interop:
    - `extern fn` declarations.
    - System V ABI thunks: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` and `xmm0` to `xmm7`, struct classification, 16-byte stack alignment.
    - C struct layout with natural alignment, alongside the one-word-per-scalar layout.
@@ -307,14 +333,14 @@ Mechanism:
    - Unmanaged pointer-plus-length views over mmap'd and GPU-mapped memory.
    - Explicit release of file descriptors and mappings.
    - The garbage collector never frees memory held only by C.
-9. Function values, and C-callable function pointers for callbacks.
-10. Generics, with type erasure or dynamic dispatch for custom elements and views.
-11. Green-thread scheduler, channels, `select`:
+8. Function values, and C-callable function pointers for callbacks.
+9. Generics, with type erasure or dynamic dispatch for custom elements and views.
+10. Green-thread scheduler, channels, `select`:
     - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
     - C calls run on a large system stack rather than the green-thread stack.
     - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-12. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-13. GPU UI library modelled on Zed's GPUI, Linux first:
+11. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+12. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation.
@@ -323,5 +349,5 @@ Mechanism:
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-14. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-15. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+13. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+14. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

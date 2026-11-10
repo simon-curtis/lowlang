@@ -1,6 +1,8 @@
 package ir
 
 import (
+	"math"
+
 	"lowlang/internal/ast"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
@@ -304,19 +306,28 @@ func (b *builder) stmt(s ast.Stmt) {
 
 var arith = map[lexer.Kind]Op{
 	lexer.Plus: OpAdd, lexer.Minus: OpSub, lexer.Star: OpMul, lexer.Slash: OpDiv, lexer.Percent: OpRem,
+	lexer.Amp: OpAnd, lexer.Pipe: OpOr, lexer.Caret: OpXor, lexer.Shl: OpShl, lexer.Shr: OpShr,
 	lexer.PlusAssign: OpAdd, lexer.MinusAssign: OpSub, lexer.StarAssign: OpMul, lexer.SlashAssign: OpDiv,
+	lexer.PercentAssign: OpRem, lexer.AmpAssign: OpAnd, lexer.PipeAssign: OpOr, lexer.CaretAssign: OpXor,
+	lexer.ShlAssign: OpShl, lexer.ShrAssign: OpShr,
 	lexer.Eq: OpEq, lexer.NotEq: OpNe, lexer.Lt: OpLt, lexer.LtEq: OpLe, lexer.Gt: OpGt, lexer.GtEq: OpGe,
+}
+
+func (b *builder) typed(op Op, t *types.Type, args ...*Value) *Value {
+	v := b.emit(op, args...)
+	v.Type = t
+	return v
 }
 
 func (b *builder) assign(s *ast.Assign) {
 	t := s.Target.TypeOf()
-	words := b.value(s.Value, t)
+	words := b.value(s.Value, s.Value.TypeOf())
 	p := b.place(s.Place)
 	if op, ok := arith[s.Op]; ok {
 		old := b.load(p, 1)[0]
-		words = []*Value{b.emit(op, old, words[0])}
+		words = []*Value{b.typed(op, t, old, b.pad(words, 1)[0])}
 	}
-	b.store(p, words)
+	b.store(p, b.fit(t, words))
 }
 
 func (b *builder) forStmt(s *ast.For) {
@@ -342,7 +353,12 @@ func (b *builder) forStmt(s *ast.For) {
 func (b *builder) expr(e ast.Expr) []*Value {
 	switch e := e.(type) {
 	case *ast.IntLit:
+		if e.Type.Float() {
+			return []*Value{b.constant(floatBits(e.Type, float64(e.Value)))}
+		}
 		return []*Value{b.constant(e.Value)}
+	case *ast.FloatLit:
+		return []*Value{b.constant(floatBits(e.Type, e.Value))}
 	case *ast.BoolLit:
 		if e.Value {
 			return []*Value{b.constant(1)}
@@ -401,9 +417,18 @@ func (b *builder) unary(e *ast.Unary) []*Value {
 	case lexer.Star:
 		return b.load(b.place(&ast.Place{Ptr: e.X}), e.Type.Size())
 	case lexer.Not:
-		return []*Value{b.emit(OpNot, b.word(e.X))}
+		return []*Value{b.typed(OpNot, types.Bool, b.word(e.X))}
+	case lexer.Tilde:
+		return []*Value{b.typed(OpCompl, e.Type, b.word(e.X))}
 	}
-	return []*Value{b.emit(OpNeg, b.word(e.X))}
+	return []*Value{b.typed(OpNeg, e.Type, b.word(e.X))}
+}
+
+func floatBits(t *types.Type, f float64) int64 {
+	if t.Bits == 32 {
+		return int64(math.Float32bits(float32(f)))
+	}
+	return int64(math.Float64bits(f))
 }
 
 func (b *builder) binary(e *ast.Binary) []*Value {
@@ -413,7 +438,7 @@ func (b *builder) binary(e *ast.Binary) []*Value {
 	x := b.word(e.X)
 	y := b.word(e.Y)
 	if e.X.TypeOf() != types.Str {
-		return []*Value{b.emit(arith[e.Op], x, y)}
+		return []*Value{b.typed(arith[e.Op], e.X.TypeOf(), x, y)}
 	}
 	call := b.emit(OpRuntime, x, y)
 	call.Str = "str_eq"
@@ -446,6 +471,14 @@ func (b *builder) call(e *ast.Call) []*Value {
 	switch {
 	case e.Builtin == "new":
 		return []*Value{b.allocate(e.Args[0])}
+	case e.Builtin == "convert":
+		return []*Value{b.convert(b.word(e.Args[0]), e.Args[0].TypeOf(), e.Type)}
+	case e.Builtin == "sqrt":
+		return []*Value{b.typed(OpSqrt, e.Type, b.word(e.Args[0]))}
+	case e.Builtin == "floor":
+		return []*Value{b.typed(OpFloor, e.Type, b.word(e.Args[0]))}
+	case e.Builtin == "exp":
+		return []*Value{b.exp(b.word(e.Args[0]), e.Type)}
 	case e.Builtin != "":
 		call := b.emit(OpRuntime, b.word(e.Args[0]))
 		call.Str = e.Builtin
@@ -454,6 +487,21 @@ func (b *builder) call(e *ast.Call) []*Value {
 		return b.construct(e.Type, e.Variant, e.Args)
 	}
 	return b.callFunc(e)
+}
+
+func (b *builder) convert(x *Value, from, to *types.Type) *Value {
+	if from == to {
+		return x
+	}
+	v := b.typed(OpConvert, to, x)
+	v.From = from
+	return v
+}
+
+func (b *builder) exp(x *Value, t *types.Type) *Value {
+	call := b.emit(OpRuntime, b.convert(x, t, types.F64))
+	call.Str = "exp"
+	return b.convert(b.result(call, 0), types.F64, t)
 }
 
 func (b *builder) allocate(arg ast.Expr) *Value {
