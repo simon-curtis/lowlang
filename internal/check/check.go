@@ -2083,16 +2083,36 @@ func (c *Checker) ifExpr(e *ast.If, want *types.Type) {
 		e.Type = types.Void
 		return
 	}
-	then := c.branch(e.Then, want)
-	e.Type = unify(then, c.branch(e.Else, want))
+	then := c.branch(e.Then, want, want)
+	hint := want
+	if hint == nil && then.Number() && bareNumber(e.Else) {
+		hint = then
+	}
+	other := c.branch(e.Else, hint, want)
+	if want == nil && bareNumber(e.Then) && other.Number() {
+		then = c.block(e.Then, other)
+	}
+	e.Type = unify(then, other)
 }
 
-func (c *Checker) branch(e ast.Expr, want *types.Type) *types.Type {
-	t := c.expr(e, want)
+func (c *Checker) branch(e ast.Expr, hint, want *types.Type) *types.Type {
+	t := c.expr(e, hint)
 	if want != nil && want != types.Void && t != types.Never && t.Kind != types.ResultKind && !want.Accepts(t) {
 		c.fail(produced(e).Position(), "expected %s, found %s", want, t)
 	}
 	return t
+}
+
+func bareNumber(e ast.Expr) bool {
+	block, ok := e.(*ast.Block)
+	if !ok || len(block.Stmts) > 0 {
+		return false
+	}
+	switch block.Tail.(type) {
+	case *ast.IntLit, *ast.FloatLit:
+		return true
+	}
+	return false
 }
 
 func produced(e ast.Expr) ast.Expr {
@@ -2120,7 +2140,7 @@ func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos lexer.Pos) *
 		}
 		c.pushScope()
 		c.pattern(arm.Pattern, enum)
-		result = unify(result, c.branch(arm.Body, want))
+		result = unify(result, c.branch(arm.Body, want, want))
 		c.popScope()
 		if arm.Pattern.Test != nil {
 			tested = true
