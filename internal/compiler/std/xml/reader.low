@@ -1,0 +1,1258 @@
+import std/simd
+import strings = std/text
+
+pub struct Name {
+    pub prefix: str
+    pub local: str
+    pub namespace: str
+}
+
+pub struct Attribute {
+    pub name: Name
+    pub value: str
+}
+
+pub struct Position {
+    pub line: i64
+    pub column: i64
+}
+
+pub enum Token {
+    StartElement(name: Name, attributes: []Attribute, empty: bool)
+    EndElement(name: Name)
+    Text(value: str)
+    CData(value: str)
+    Comment(value: str)
+    Instruction(target: str, data: str)
+    Doctype(value: str)
+    End
+}
+
+pub enum Error {
+    Malformed(line: i64, column: i64, message: str)
+    Limit(line: i64, column: i64, message: str)
+    Unsupported(message: str)
+}
+
+struct Entity {
+    value: []u8
+    external: bool
+    unparsed: bool
+    expanding: bool
+}
+
+struct Input {
+    data: []u8
+    pos: i64
+    entity: *Entity?
+    level: i64
+}
+
+struct Binding {
+    prefix: str
+    uri: str
+}
+
+struct Open {
+    qname: str
+    name: Name
+    bindings: i64
+    inputs: i64
+}
+
+struct Raw {
+    qname: str
+    value: str
+    at: i64
+}
+
+struct Declared {
+    name: str
+    value: str?
+    tokenized: bool
+}
+
+struct Reference {
+    name: str
+    code: u32
+}
+
+pub struct Reader {
+    doc: []u8
+    data: []u8
+    pos: i64
+    entity: *Entity?
+    level: i64
+    saved: []Input
+    origin: i64
+    entities: [str: *Entity]
+    bindings: []Binding
+    bound: i64
+    open: []Open
+    depth: i64
+    started: bool
+    doctype_seen: bool
+    root_seen: bool
+    finished: bool
+    undeclared_allowed: bool
+    declarations_skipped: bool
+    declared: [str: []Declared]
+    raws: []Raw
+    atoms: [str: str]
+    failure: Error?
+    token_at: i64
+    expanded: i64
+    expansion_limit: i64
+    max_depth: i64
+    names: []u8
+    line_offset: i64
+    line: i64
+    line_start: i64
+}
+
+fn xml_namespace() -> str {
+    "http://www.w3.org/XML/1998/namespace"
+}
+
+fn xmlns_namespace() -> str {
+    "http://www.w3.org/2000/xmlns/"
+}
+
+pub fn reader(data: []u8) -> *Reader {
+    var failure: Error? = none
+    var content = data
+    if data.len >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+        content = data[3..]
+    } else if data.len >= 2 && ((data[0] == 0xFE && data[1] == 0xFF) || (data[0] == 0xFF && data[1] == 0xFE)) {
+        content = utf16(data, 2, data[0] == 0xFE, mut failure)
+    } else if data.len >= 4 && data[0] == 0 && data[1] == '<' && data[2] == 0 && data[3] == '?' {
+        content = utf16(data, 0, true, mut failure)
+    } else if data.len >= 4 && data[0] == '<' && data[1] == 0 && data[2] == '?' && data[3] == 0 {
+        content = utf16(data, 0, false, mut failure)
+    } else {
+        let encoding = strings.lower(declared_encoding(data))
+        if encoding == "iso-8859-1" || encoding == "latin1" || encoding == "iso_8859-1" || encoding == "l1" {
+            content = from_latin1(data)
+        } else if encoding == "utf-16" || encoding == "utf-16le" || encoding == "utf-16be" {
+            failure = Error.Malformed(1, 1, "document labelled {encoding} has no byte order mark")
+        } else if encoding != "" && encoding != "utf-8" && encoding != "us-ascii" && encoding != "ascii" {
+            failure = Error.Unsupported("encoding {encoding}")
+        }
+    }
+    let normalized = normalize_newlines(content)
+    new(Reader {
+        doc: normalized
+        data: normalized
+        pos: 0
+        entity: none
+        level: 0
+        saved: []
+        origin: 0
+        entities: [:]
+        bindings: []
+        bound: 0
+        open: []
+        depth: 0
+        started: false
+        doctype_seen: false
+        root_seen: false
+        finished: false
+        undeclared_allowed: false
+        declarations_skipped: false
+        declared: [:]
+        raws: []
+        atoms: [:]
+        failure
+        token_at: 0
+        expanded: 0
+        expansion_limit: 1048576 + 8 * normalized.len
+        max_depth: 1024
+        names: name_table()
+        line_offset: 0
+        line: 1
+        line_start: 0
+    })
+}
+
+fn utf16(data: []u8, start: i64, big: bool, mut failure: Error?) -> []u8 {
+    match from_utf16(data, start, big) {
+        some(converted) => converted
+        none => {
+            failure = Error.Malformed(1, 1, "invalid UTF-16")
+            []
+        }
+    }
+}
+
+fn declared_encoding(data: []u8) -> str {
+    if data.len < 6 || __str_view(data[..5]) != "<?xml" || !space(data[5]) {
+        return ""
+    }
+    var end = 5
+    for end + 1 < data.len && !(data[end] == '?' && data[end + 1] == '>') {
+        end += 1
+    }
+    let decl = __str_view(data[5..end])
+    let at = strings.index(decl, "encoding")
+    if at < 0 {
+        return ""
+    }
+    var i = at + 8
+    for i < decl.len && (space(decl[i]) || decl[i] == '=') {
+        i += 1
+    }
+    if i >= decl.len || (decl[i] != '"' && decl[i] != '\'') {
+        return ""
+    }
+    let quote = decl[i]
+    let from = i + 1
+    var to = from
+    for to < decl.len && decl[to] != quote {
+        to += 1
+    }
+    decl[from..to]
+}
+
+pub fn position(r: *Reader) -> Position {
+    locate(r, r.token_at)
+}
+
+fn locate(r: *Reader, offset: i64) -> Position {
+    let at = if offset > r.doc.len { r.doc.len } else { offset }
+    if at < r.line_offset {
+        r.line_offset = 0
+        r.line = 1
+        r.line_start = 0
+    }
+    var i = r.line_offset
+    for {
+        let nl = simd.find_byte(r.doc, i, at, '\n')
+        if nl < 0 {
+            break
+        }
+        r.line += 1
+        r.line_start = nl + 1
+        i = nl + 1
+    }
+    r.line_offset = at
+    var column = 1
+    for k in r.line_start..at {
+        if (r.doc[k] & 0xC0) != 0x80 {
+            column += 1
+        }
+    }
+    Position { line: r.line, column }
+}
+
+fn here(r: *Reader) -> i64 {
+    if r.saved.len > 0 { r.origin } else { r.pos }
+}
+
+fn malformed(r: *Reader, message: str) -> Error {
+    malformed_at(r, r.pos, message)
+}
+
+fn malformed_at(r: *Reader, at: i64, message: str) -> Error {
+    let p = locate(r, if r.saved.len > 0 { r.origin } else { at })
+    Error.Malformed(p.line, p.column, message)
+}
+
+fn limit(r: *Reader, message: str) -> Error {
+    let p = locate(r, here(r))
+    Error.Limit(p.line, p.column, message)
+}
+
+fn at_text(r: *Reader, s: str) -> bool {
+    if r.pos + s.len > r.data.len {
+        return false
+    }
+    for i in 0..s.len {
+        if r.data[r.pos + i] != s[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn skip_space(r: *Reader) -> bool {
+    let from = r.pos
+    let d = r.data
+    var pos = r.pos
+    for pos < d.len {
+        let c = d[pos]
+        if c != ' ' && c != '\n' && c != '\t' && c != '\r' {
+            break
+        }
+        pos += 1
+    }
+    r.pos = pos
+    pos > from
+}
+
+fn require_space(r: *Reader) ! Error {
+    if !skip_space(r) {
+        fail malformed(r, "expected whitespace")
+    }
+}
+
+fn expect(r: *Reader, s: str) ! Error {
+    if !at_text(r, s) {
+        fail malformed(r, "expected '{s}'")
+    }
+    r.pos += s.len
+}
+
+pub fn next(r: *Reader) -> Token ! Error {
+    match r.failure {
+        some(e) => fail e
+        none => {}
+    }
+    if r.finished {
+        return End
+    }
+    if !r.started {
+        r.started = true
+        if r.data.len > 5 && at_text(r, "<?xml") && space(r.data[5]) {
+            declaration(r)?
+        }
+    }
+    for {
+        if r.pos >= r.data.len {
+            if r.saved.len > 0 {
+                leave(r)?
+                continue
+            }
+            r.token_at = r.pos
+            if r.depth > 0 {
+                fail malformed(r, "unclosed element <{r.open[r.depth - 1].qname}>")
+            }
+            if !r.root_seen {
+                fail malformed(r, "no root element")
+            }
+            r.finished = true
+            return End
+        }
+        r.token_at = here(r)
+        if r.data[r.pos] == '<' {
+            return markup(r)
+        }
+        if r.depth == 0 {
+            skip_space(r)
+            if r.pos < r.data.len && r.data[r.pos] != '<' {
+                fail malformed(r, "text outside the root element")
+            }
+            continue
+        }
+        match content_text(r)? {
+            some(t) => return t
+            none => {}
+        }
+    }
+}
+
+fn declaration(r: *Reader) ! Error {
+    r.pos = 5
+    skip_space(r)
+    expect(r, "version")?
+    let version = pseudo_value(r)?
+    if version.len < 3 || version[0..2] != "1." {
+        fail malformed(r, "unsupported XML version {version}")
+    }
+    for i in 2..version.len {
+        if version[i] < '0' || version[i] > '9' {
+            fail malformed(r, "malformed XML version {version}")
+        }
+    }
+    var spaced = skip_space(r)
+    if spaced && at_text(r, "encoding") {
+        r.pos += 8
+        let encoding = pseudo_value(r)?
+        if !encoding_name(encoding) {
+            fail malformed(r, "malformed encoding name")
+        }
+        spaced = skip_space(r)
+    }
+    if spaced && at_text(r, "standalone") {
+        r.pos += 10
+        let standalone = pseudo_value(r)?
+        if standalone != "yes" && standalone != "no" {
+            fail malformed(r, "standalone must be yes or no")
+        }
+        skip_space(r)
+    }
+    expect(r, "?>")?
+}
+
+fn encoding_name(s: str) -> bool {
+    if s.len == 0 || !((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z')) {
+        return false
+    }
+    for i in 1..s.len {
+        let c = s[i]
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+            return false
+        }
+    }
+    true
+}
+
+fn pseudo_value(r: *Reader) -> str ! Error {
+    skip_space(r)
+    expect(r, "=")?
+    skip_space(r)
+    if r.pos >= r.data.len || (r.data[r.pos] != '"' && r.data[r.pos] != '\'') {
+        fail malformed(r, "expected a quoted value")
+    }
+    let quote = r.data[r.pos]
+    let from = r.pos + 1
+    let to = simd.find_byte(r.data, from, r.data.len, quote)
+    if to < 0 {
+        fail malformed(r, "unterminated value")
+    }
+    r.pos = to + 1
+    __str_view(r.data[from..to])
+}
+
+fn markup(r: *Reader) -> Token ! Error {
+    let second = if r.pos + 1 < r.data.len { r.data[r.pos + 1] } else { 0 }
+    if second == '/' {
+        return end_tag(r)
+    }
+    if second == '?' {
+        return instruction(r)
+    }
+    if second != '!' {
+        return start_tag(r)
+    }
+    if at_text(r, "<!--") {
+        return comment(r)
+    }
+    if at_text(r, "<![CDATA[") {
+        if r.depth == 0 {
+            fail malformed(r, "CDATA section outside the root element")
+        }
+        return cdata(r)
+    }
+    if at_text(r, "<!DOCTYPE") {
+        if r.root_seen || r.doctype_seen {
+            fail malformed(r, "misplaced document type declaration")
+        }
+        r.doctype_seen = true
+        return doctype(r)
+    }
+    fail malformed(r, "unknown markup declaration")
+}
+
+fn scan_name(r: *Reader) -> str ! Error {
+    let d = r.data
+    let start = r.pos
+    if r.pos >= d.len {
+        fail malformed(r, "expected a name")
+    }
+    let first = d[r.pos]
+    if first < 0x80 {
+        if r.names[first] != 2 {
+            fail malformed(r, "expected a name")
+        }
+        r.pos += 1
+    } else {
+        let ch = decode_utf8(d, r.pos)
+        if ch.size == 0 {
+            fail malformed(r, "invalid UTF-8")
+        }
+        if !name_start_code(ch.code) {
+            fail malformed(r, "expected a name")
+        }
+        r.pos += ch.size
+    }
+    for r.pos < d.len {
+        let c = d[r.pos]
+        if c < 0x80 {
+            if r.names[c] == 0 {
+                break
+            }
+            r.pos += 1
+        } else {
+            let ch = decode_utf8(d, r.pos)
+            if ch.size == 0 {
+                fail malformed(r, "invalid UTF-8")
+            }
+            if !name_code(ch.code) {
+                break
+            }
+            r.pos += ch.size
+        }
+    }
+    __str_view(d[start..r.pos])
+}
+
+fn check_chars(r: *Reader, from: i64, to: i64) ! Error {
+    let d = r.data
+    let control: u8x32 = simd.splat[u8x32, u8](0x20)
+    let ascii: u8x32 = simd.splat[u8x32, u8](0x7F)
+    var i = from
+    for i < to {
+        if i + 32 <= to {
+            let chunk: u8x32 = simd.read(d, i)
+            let special = simd.mask((chunk < control) | (chunk > ascii))
+            if special == 0 {
+                i += 32
+                continue
+            }
+            i += simd.trailing_zeros(special)
+        }
+        let c = d[i]
+        if c < 0x20 {
+            if c != '\t' && c != '\n' {
+                r.pos = i
+                fail malformed(r, "illegal character")
+            }
+            i += 1
+        } else if c < 0x80 {
+            i += 1
+        } else {
+            let ch = decode_utf8(d, i)
+            if ch.size == 0 || !legal_char(ch.code) {
+                r.pos = i
+                fail malformed(r, "illegal character")
+            }
+            i += ch.size
+        }
+    }
+}
+
+fn comment(r: *Reader) -> Token ! Error {
+    r.pos += 4
+    let start = r.pos
+    var from = start
+    for {
+        let dash = simd.find_byte(r.data, from, r.data.len, '-')
+        if dash < 0 || dash + 1 >= r.data.len {
+            r.pos = r.data.len
+            fail malformed(r, "unterminated comment")
+        }
+        if r.data[dash + 1] == '-' {
+            if dash + 2 >= r.data.len || r.data[dash + 2] != '>' {
+                r.pos = dash
+                fail malformed(r, "'--' inside a comment")
+            }
+            check_chars(r, start, dash)?
+            r.pos = dash + 3
+            return Comment(__str_view(r.data[start..dash]))
+        }
+        from = dash + 1
+    }
+}
+
+fn find_text(r: *Reader, from: i64, s: str) -> i64 {
+    var i = from
+    for {
+        let hit = simd.find_byte(r.data, i, r.data.len, s[0])
+        if hit < 0 || hit + s.len > r.data.len {
+            return -1
+        }
+        var same = true
+        for k in 1..s.len {
+            if r.data[hit + k] != s[k] {
+                same = false
+                break
+            }
+        }
+        if same {
+            return hit
+        }
+        i = hit + 1
+    }
+}
+
+fn instruction(r: *Reader) -> Token ! Error {
+    r.pos += 2
+    let target = atom(r, scan_name(r)?)
+    if strings.equal_fold(target, "xml") {
+        fail malformed(r, "XML declaration allowed only at the start of the document")
+    }
+    if strings.index_byte(target, ':') >= 0 {
+        fail malformed(r, "colon in processing instruction target")
+    }
+    if at_text(r, "?>") {
+        r.pos += 2
+        return Instruction(target, "")
+    }
+    require_space(r)?
+    let start = r.pos
+    let end = find_text(r, start, "?>")
+    if end < 0 {
+        r.pos = r.data.len
+        fail malformed(r, "unterminated processing instruction")
+    }
+    check_chars(r, start, end)?
+    r.pos = end + 2
+    Instruction(target, __str_view(r.data[start..end]))
+}
+
+fn cdata(r: *Reader) -> Token ! Error {
+    r.pos += 9
+    let start = r.pos
+    let end = find_text(r, start, "]]>")
+    if end < 0 {
+        r.pos = r.data.len
+        fail malformed(r, "unterminated CDATA section")
+    }
+    check_chars(r, start, end)?
+    r.pos = end + 3
+    CData(__str_view(r.data[start..end]))
+}
+
+fn split_name(r: *Reader, qname: str, at: i64) -> Name ! Error {
+    let colon = strings.index_byte(qname, ':')
+    if colon < 0 {
+        return Name { prefix: "", local: qname, namespace: "" }
+    }
+    let local = qname[colon + 1..]
+    if colon == 0 || strings.index_byte(local, ':') >= 0 || !ncname_start(r, local) {
+        fail malformed_at(r, at, "malformed qualified name {qname}")
+    }
+    Name { prefix: qname[..colon], local, namespace: "" }
+}
+
+fn ncname_start(r: *Reader, s: str) -> bool {
+    for c in s {
+        if c < 0x80 {
+            return r.names[c] == 2 && c != ':'
+        }
+        return name_start_code(c)
+    }
+    false
+}
+
+fn resolve(r: *Reader, prefix: str) -> str? {
+    if prefix == "xml" {
+        return xml_namespace()
+    }
+    var i = r.bound - 1
+    for i >= 0 {
+        if r.bindings[i].prefix == prefix {
+            return r.bindings[i].uri
+        }
+        i -= 1
+    }
+    if prefix == "" {
+        return ""
+    }
+    none
+}
+
+fn bind(r: *Reader, prefix: str, uri: str) {
+    let b = Binding { prefix, uri: atom(r, uri) }
+    if r.bound < r.bindings.len {
+        r.bindings[r.bound] = b
+    } else {
+        push(mut r.bindings, b)
+    }
+    r.bound += 1
+}
+
+fn atom(r: *Reader, s: str) -> str {
+    match r.atoms[s] {
+        some(known) => known
+        none => {
+            var copy = buffer(s.len)
+            put_str(mut copy, s)
+            let owned = __str_view(copy.data)
+            r.atoms[owned] = owned
+            owned
+        }
+    }
+}
+
+fn add_raw(r: *Reader, count: i64, raw: Raw) -> i64 {
+    if count < r.raws.len {
+        r.raws[count] = raw
+    } else {
+        push(mut r.raws, raw)
+    }
+    count + 1
+}
+
+fn declare(r: *Reader, raw: Raw) ! Error {
+    if raw.qname.len < 5 || raw.qname[0] != 'x' {
+        return
+    }
+    if raw.qname == "xmlns" {
+        if raw.value == xml_namespace() || raw.value == xmlns_namespace() {
+            fail malformed_at(r, raw.at, "reserved namespace cannot be the default namespace")
+        }
+        bind(r, "", raw.value)
+        return
+    }
+    if raw.qname.len < 6 || raw.qname[..6] != "xmlns:" {
+        return
+    }
+    let prefix = raw.qname[6..]
+    if strings.index_byte(prefix, ':') >= 0 || !ncname_start(r, prefix) {
+        fail malformed_at(r, raw.at, "malformed namespace prefix")
+    }
+    if prefix == "xmlns" {
+        fail malformed_at(r, raw.at, "the xmlns prefix cannot be declared")
+    }
+    if prefix == "xml" {
+        if raw.value != xml_namespace() {
+            fail malformed_at(r, raw.at, "the xml prefix cannot be rebound")
+        }
+        return
+    }
+    if raw.value == xml_namespace() || raw.value == xmlns_namespace() {
+        fail malformed_at(r, raw.at, "reserved namespace bound to prefix {prefix}")
+    }
+    if raw.value == "" {
+        fail malformed_at(r, raw.at, "empty namespace for prefix {prefix}")
+    }
+    bind(r, prefix, raw.value)
+}
+
+fn element_name(r: *Reader, qname: str, at: i64) -> Name ! Error {
+    var name = split_name(r, qname, at)?
+    if name.prefix == "xmlns" {
+        fail malformed_at(r, at, "element name uses the xmlns prefix")
+    }
+    name.namespace = namespace_of(r, name.prefix, at)?
+    name
+}
+
+fn attribute_name(r: *Reader, raw: Raw) -> Name ! Error {
+    if raw.qname == "xmlns" {
+        return Name { prefix: "", local: "xmlns", namespace: xmlns_namespace() }
+    }
+    var name = split_name(r, raw.qname, raw.at)?
+    if name.prefix == "xmlns" {
+        name.namespace = xmlns_namespace()
+    } else if name.prefix != "" {
+        name.namespace = namespace_of(r, name.prefix, raw.at)?
+    }
+    name
+}
+
+fn start_tag(r: *Reader) -> Token ! Error {
+    let begin = r.pos
+    r.pos += 1
+    let qname = atom(r, scan_name(r)?)
+    var count = 0
+    var empty = false
+    for {
+        let spaced = skip_space(r)
+        if r.pos >= r.data.len {
+            fail malformed(r, "unterminated start tag")
+        }
+        let c = r.data[r.pos]
+        if c == '>' {
+            r.pos += 1
+            break
+        }
+        if c == '/' {
+            r.pos += 1
+            expect(r, ">")?
+            empty = true
+            break
+        }
+        if !spaced {
+            fail malformed(r, "expected whitespace before an attribute")
+        }
+        let at = r.pos
+        let aname = scan_name(r)?
+        skip_space(r)
+        expect(r, "=")?
+        skip_space(r)
+        let value = attribute_value(r)?
+        count = add_raw(r, count, Raw { qname: atom(r, aname), value, at })
+    }
+    if r.depth == 0 && r.root_seen {
+        fail malformed_at(r, begin, "content after the root element")
+    }
+    if r.depth >= r.max_depth {
+        fail limit(r, "elements nested deeper than {r.max_depth}")
+    }
+    r.root_seen = true
+    if r.declared.len > 0 {
+        count = apply_declarations(r, qname, count, begin)
+    }
+    let raws = r.raws[..count]
+    let mark = r.bound
+    for raw in raws {
+        declare(r, raw)?
+    }
+    let name = element_name(r, qname, begin)?
+    let attributes: []Attribute = __make(count)
+    for i, raw in raws {
+        let an = attribute_name(r, raw)?
+        attributes[i] = Attribute { name: an, value: raw.value }
+    }
+    unique(r, raws, attributes)?
+    for i in 0..count {
+        r.raws[i].value = ""
+    }
+    if empty {
+        r.bound = mark
+    } else {
+        let o = Open { qname, name, bindings: mark, inputs: r.saved.len }
+        if r.depth < r.open.len {
+            r.open[r.depth] = o
+        } else {
+            push(mut r.open, o)
+        }
+        r.depth += 1
+    }
+    StartElement(name, attributes, empty)
+}
+
+fn unique(r: *Reader, raws: []Raw, attributes: []Attribute) ! Error {
+    if raws.len <= 8 {
+        for i in 1..raws.len {
+            for j in 0..i {
+                if raws[i].qname == raws[j].qname {
+                    fail malformed_at(r, raws[i].at, "duplicate attribute {raws[i].qname}")
+                }
+                let a = attributes[i].name
+                let b = attributes[j].name
+                if a.namespace != "" && a.namespace == b.namespace && a.local == b.local {
+                    fail malformed_at(r, raws[i].at, "duplicate attribute {a.local} in namespace {a.namespace}")
+                }
+            }
+        }
+        return
+    }
+    var seen: [str: bool] = [:]
+    for i, raw in raws {
+        let a = attributes[i].name
+        let expanded = "{a.namespace} {a.local}"
+        if seen[raw.qname] != none || (a.namespace != "" && seen[expanded] != none) {
+            fail malformed_at(r, raw.at, "duplicate attribute {raw.qname}")
+        }
+        seen[raw.qname] = true
+        if a.namespace != "" {
+            seen[expanded] = true
+        }
+    }
+}
+
+fn end_tag(r: *Reader) -> Token ! Error {
+    let begin = r.pos
+    r.pos += 2
+    let qname = scan_name(r)?
+    skip_space(r)
+    expect(r, ">")?
+    if r.depth == 0 {
+        fail malformed_at(r, begin, "unexpected end tag </{qname}>")
+    }
+    let top = r.open[r.depth - 1]
+    if top.qname != qname {
+        fail malformed_at(r, begin, "end tag </{qname}> does not match <{top.qname}>")
+    }
+    if top.inputs != r.saved.len {
+        fail malformed_at(r, begin, "element crosses an entity boundary")
+    }
+    r.depth -= 1
+    r.bound = top.bindings
+    EndElement(top.name)
+}
+
+fn reference(r: *Reader) -> Reference ! Error {
+    let begin = r.pos
+    r.pos += 1
+    if r.pos < r.data.len && r.data[r.pos] == '#' {
+        let end = simd.find_byte(r.data, r.pos, r.data.len, ';')
+        let code = if end < 0 { -1 } else { char_value(r.data[r.pos + 1..end]) }
+        if code < 0 {
+            r.pos = begin
+            fail malformed(r, "malformed character reference")
+        }
+        r.pos = end + 1
+        return Reference { name: "", code: u32(code) }
+    }
+    let name = scan_name(r)?
+    expect(r, ";")?
+    Reference { name, code: predefined(name) }
+}
+
+fn predefined(name: str) -> u32 {
+    if name == "lt" {
+        return '<'
+    }
+    if name == "gt" {
+        return '>'
+    }
+    if name == "amp" {
+        return '&'
+    }
+    if name == "apos" {
+        return '\''
+    }
+    if name == "quot" {
+        return '"'
+    }
+    0
+}
+
+fn lookup(r: *Reader, name: str, at: i64, in_attribute: bool) -> *Entity? ! Error {
+    let e = match r.entities[name] {
+        some(found) => found
+        none => {
+            if r.undeclared_allowed && !in_attribute {
+                return none
+            }
+            fail malformed_at(r, at, "undeclared entity {name}")
+        }
+    }
+    if e.unparsed {
+        fail malformed_at(r, at, "reference to unparsed entity {name}")
+    }
+    if e.external {
+        if in_attribute {
+            fail malformed_at(r, at, "external entity {name} in an attribute value")
+        }
+        return none
+    }
+    if e.expanding {
+        fail malformed_at(r, at, "entity {name} refers to itself")
+    }
+    r.expanded += e.value.len
+    if r.expanded > r.expansion_limit {
+        fail limit(r, "entity expansion exceeds {r.expansion_limit} bytes")
+    }
+    e
+}
+
+fn attribute_value(r: *Reader) -> str ! Error {
+    if r.pos >= r.data.len || (r.data[r.pos] != '"' && r.data[r.pos] != '\'') {
+        fail malformed(r, "expected a quoted attribute value")
+    }
+    let d = r.data
+    let quote = d[r.pos]
+    r.pos += 1
+    let start = r.pos
+    let quotes: u8x32 = simd.splat[u8x32, u8](quote)
+    let lt: u8x32 = simd.splat[u8x32, u8]('<')
+    let amp: u8x32 = simd.splat[u8x32, u8]('&')
+    let control: u8x32 = simd.splat[u8x32, u8](0x20)
+    let ascii: u8x32 = simd.splat[u8x32, u8](0x7F)
+    var pos = start
+    for {
+        if pos + 32 <= d.len {
+            let chunk: u8x32 = simd.read(d, pos)
+            let special = simd.mask((chunk == quotes) | (chunk == lt) | (chunk == amp) | (chunk < control) | (chunk > ascii))
+            if special == 0 {
+                pos += 32
+                continue
+            }
+            pos += simd.trailing_zeros(special)
+        }
+        if pos >= d.len {
+            r.pos = pos
+            fail malformed(r, "unterminated attribute value")
+        }
+        let c = d[pos]
+        if c == quote {
+            r.pos = pos + 1
+            return __str_view(d[start..pos])
+        }
+        if c == '<' {
+            r.pos = pos
+            fail malformed(r, "'<' in attribute value")
+        }
+        if c == '&' || c == '\t' || c == '\n' {
+            break
+        }
+        if c < 0x20 {
+            r.pos = pos
+            fail malformed(r, "illegal character")
+        }
+        if c < 0x80 {
+            pos += 1
+        } else {
+            let ch = decode_utf8(d, pos)
+            if ch.size == 0 || !legal_char(ch.code) {
+                r.pos = pos
+                fail malformed(r, "illegal character")
+            }
+            pos += ch.size
+        }
+    }
+    var out = buffer(pos - start + 32)
+    put_bytes(mut out, d[start..pos])
+    r.pos = pos
+    for {
+        if r.pos >= d.len {
+            fail malformed(r, "unterminated attribute value")
+        }
+        let c = d[r.pos]
+        if c == quote {
+            r.pos += 1
+            return __str_view(contents(out))
+        }
+        if c == '<' {
+            fail malformed(r, "'<' in attribute value")
+        }
+        if c == '&' {
+            let at = r.pos
+            let ref = reference(r)?
+            if ref.code != 0 {
+                put_code(mut out, ref.code)
+            } else {
+                match lookup(r, ref.name, at, true)? {
+                    some(e) => replacement_value(r, mut out, e, at, 1)?
+                    none => {}
+                }
+            }
+            continue
+        }
+        if c == ' ' || c == '\n' || c == '\t' {
+            put(mut out, ' ')
+            r.pos += 1
+            continue
+        }
+        if c < 0x20 {
+            fail malformed(r, "illegal character")
+        }
+        if c < 0x80 {
+            put(mut out, c)
+            r.pos += 1
+        } else {
+            let ch = decode_utf8(d, r.pos)
+            if ch.size == 0 || !legal_char(ch.code) {
+                fail malformed(r, "illegal character")
+            }
+            put_bytes(mut out, d[r.pos..r.pos + ch.size])
+            r.pos += ch.size
+        }
+    }
+}
+
+fn replacement_value(r: *Reader, mut out: Buffer, e: *Entity, at: i64, nesting: i64) ! Error {
+    if nesting > 40 {
+        fail limit(r, "entities nested deeper than 40")
+    }
+    e.expanding = true
+    let v = e.value
+    var i = 0
+    for i < v.len {
+        let c = v[i]
+        if c == '<' {
+            fail malformed_at(r, at, "'<' in the replacement text of an entity used in an attribute value")
+        }
+        if c == '&' {
+            let end = simd.find_byte(v, i, v.len, ';')
+            if end < 0 {
+                fail malformed_at(r, at, "malformed reference in entity replacement text")
+            }
+            let body = v[i + 1..end]
+            if body.len > 0 && body[0] == '#' {
+                let code = char_value(body[1..])
+                if code < 0 {
+                    fail malformed_at(r, at, "malformed character reference in entity replacement text")
+                }
+                put_code(mut out, u32(code))
+                i = end + 1
+                continue
+            }
+            let name = __str_view(body)
+            let code = predefined(name)
+            if code != 0 {
+                put(mut out, u8(code))
+            } else {
+                match lookup(r, name, at, true)? {
+                    some(inner) => replacement_value(r, mut out, inner, at, nesting + 1)?
+                    none => {}
+                }
+            }
+            i = end + 1
+            continue
+        }
+        put(mut out, if space(c) { ' ' } else { c })
+        i += 1
+    }
+    e.expanding = false
+}
+
+fn content_text(r: *Reader) -> Token? ! Error {
+    let d = r.data
+    let start = r.pos
+    let lt: u8x32 = simd.splat[u8x32, u8]('<')
+    let amp: u8x32 = simd.splat[u8x32, u8]('&')
+    let bracket: u8x32 = simd.splat[u8x32, u8](']')
+    let control: u8x32 = simd.splat[u8x32, u8](0x20)
+    let ascii: u8x32 = simd.splat[u8x32, u8](0x7F)
+    var out = buffer(0)
+    var copying = false
+    var run = start
+    var pos = start
+    for pos < d.len {
+        if pos + 32 <= d.len {
+            let chunk: u8x32 = simd.read(d, pos)
+            let special = simd.mask((chunk == lt) | (chunk == amp) | (chunk == bracket) | (chunk < control) | (chunk > ascii))
+            if special == 0 {
+                pos += 32
+                continue
+            }
+            pos += simd.trailing_zeros(special)
+        }
+        let c = d[pos]
+        if c == '<' {
+            break
+        }
+        if c == '&' {
+            r.pos = pos
+            let ref = reference(r)?
+            if ref.code == 0 {
+                if pos > start {
+                    r.pos = pos
+                    break
+                }
+                enter(r, ref.name, pos)?
+                return none
+            }
+            copying = true
+            put_bytes(mut out, d[run..pos])
+            put_code(mut out, ref.code)
+            pos = r.pos
+            run = pos
+            continue
+        }
+        if c == ']' {
+            if pos + 2 < d.len && d[pos + 1] == ']' && d[pos + 2] == '>' {
+                r.pos = pos
+                fail malformed(r, "']]>' in content")
+            }
+            pos += 1
+        } else if c < 0x20 {
+            if c != '\t' && c != '\n' {
+                r.pos = pos
+                fail malformed(r, "illegal character")
+            }
+            pos += 1
+        } else if c < 0x80 {
+            pos += 1
+        } else {
+            let ch = decode_utf8(d, pos)
+            if ch.size == 0 || !legal_char(ch.code) {
+                r.pos = pos
+                fail malformed(r, "illegal character")
+            }
+            pos += ch.size
+        }
+    }
+    r.pos = pos
+    if copying {
+        put_bytes(mut out, d[run..pos])
+        return Text(__str_view(contents(out)))
+    }
+    if pos == start {
+        return none
+    }
+    Text(__str_view(d[start..pos]))
+}
+
+fn enter(r: *Reader, name: str, at: i64) ! Error {
+    let e = match lookup(r, name, at, false)? {
+        some(found) => found
+        none => return
+    }
+    if r.saved.len >= 40 {
+        fail limit(r, "entities nested deeper than 40")
+    }
+    if r.saved.len == 0 {
+        r.origin = at
+    }
+    push(mut r.saved, Input { data: r.data, pos: r.pos, entity: r.entity, level: r.level })
+    e.expanding = true
+    r.data = e.value
+    r.pos = 0
+    r.entity = e
+    r.level = r.depth
+}
+
+fn leave(r: *Reader) ! Error {
+    if r.depth != r.level {
+        fail malformed(r, "element in entity replacement text is not closed")
+    }
+    match r.entity {
+        some(e) => {
+            e.expanding = false
+        }
+        none => {}
+    }
+    let outer = r.saved[r.saved.len - 1]
+    r.saved = r.saved[..r.saved.len - 1]
+    r.data = outer.data
+    r.pos = outer.pos
+    r.entity = outer.entity
+    r.level = outer.level
+}
+
+fn char_value(digits: []u8) -> i64 {
+    var hex = false
+    var from = 0
+    if digits.len > 0 && digits[0] == 'x' {
+        hex = true
+        from = 1
+    }
+    if from >= digits.len {
+        return -1
+    }
+    var code = 0
+    for i in from..digits.len {
+        let c = digits[i]
+        var v = 16
+        if c >= '0' && c <= '9' {
+            v = i64(c - '0')
+        } else if hex && c >= 'a' && c <= 'f' {
+            v = i64(c - 'a') + 10
+        } else if hex && c >= 'A' && c <= 'F' {
+            v = i64(c - 'A') + 10
+        }
+        if v >= (if hex { 16 } else { 10 }) {
+            return -1
+        }
+        code = code * (if hex { 16 } else { 10 }) + v
+        if code > 0x10FFFF {
+            return -1
+        }
+    }
+    if !legal_char(u32(code)) {
+        return -1
+    }
+    code
+}
+
+fn namespace_of(r: *Reader, prefix: str, at: i64) -> str ! Error {
+    match resolve(r, prefix) {
+        some(uri) => uri
+        none => fail malformed_at(r, at, "undeclared namespace prefix {prefix}")
+    }
+}
+
+fn apply_declarations(r: *Reader, qname: str, given: i64, at: i64) -> i64 {
+    let declared = match r.declared[qname] {
+        some(d) => d
+        none => return given
+    }
+    var count = given
+    for d in declared {
+        var found = false
+        for i in 0..given {
+            if r.raws[i].qname == d.name {
+                found = true
+                if d.tokenized {
+                    r.raws[i].value = collapse(r.raws[i].value)
+                }
+            }
+        }
+        if !found {
+            match d.value {
+                some(v) => {
+                    count = add_raw(r, count, Raw { qname: d.name, value: v, at })
+                }
+                none => {}
+            }
+        }
+    }
+    count
+}

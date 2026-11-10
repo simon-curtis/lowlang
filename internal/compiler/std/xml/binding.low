@@ -1,0 +1,405 @@
+import std/base64
+import std/serde
+import strings = std/text
+
+enum Item {
+    Missing
+    Root(*Element)
+    One(*Element)
+    Many([]*Element)
+    Value(str)
+    Body(*Element)
+}
+
+struct Frame {
+    keys: []str
+    items: []Item
+    index: i64
+}
+
+struct Cursor {
+    current: Item
+    frames: []Frame
+}
+
+fn instance_namespace() -> str {
+    "http://www.w3.org/2001/XMLSchema-instance"
+}
+
+fn element_of(item: Item) -> *Element? {
+    match item {
+        Root(e) => e
+        One(e) => e
+        Body(e) => e
+        Many(xs) => if xs.len == 1 { some(xs[0]) } else { none }
+        _ => none
+    }
+}
+
+fn take(c: *Cursor) -> Item {
+    let item = c.current
+    c.current = Missing
+    item
+}
+
+fn scalar(c: *Cursor, what: str) -> str ! serde.Error {
+    let item = take(c)
+    match item {
+        Value(s) => return s
+        Missing => fail serde.Error.Mismatch(what, 0)
+        _ => {}
+    }
+    match element_of(item) {
+        some(e) => text(e)
+        none => fail serde.Error.Mismatch(what, 0)
+    }
+}
+
+fn trimmed(c: *Cursor, what: str) -> str ! serde.Error {
+    strings.trim(scalar(c, what)?)
+}
+
+fn nil(e: *Element) -> bool {
+    for a in e.attributes {
+        if a.name.local == "nil" && a.name.namespace == instance_namespace() {
+            let v = strings.trim(a.value)
+            return v == "true" || v == "1"
+        }
+    }
+    false
+}
+
+fn parse_digits(s: str, what: str) -> u64 ! serde.Error {
+    if s.len == 0 {
+        fail serde.Error.Mismatch(what, 0)
+    }
+    var n: u64 = 0
+    for i in (if s[0] == '+' { 1 } else { 0 })..s.len {
+        let c = s[i]
+        if c < '0' || c > '9' {
+            fail serde.Error.Mismatch(what, 0)
+        }
+        let d = u64(c - '0')
+        if n > (0xFFFFFFFFFFFFFFFF - d) / 10 {
+            fail serde.Error.Range(0)
+        }
+        n = n * 10 + d
+    }
+    n
+}
+
+fn parse_integer(s: str) -> i64 ! serde.Error {
+    let negative = s.len > 0 && s[0] == '-'
+    let magnitude = parse_digits(if negative { s[1..] } else { s }, "integer")?
+    if negative {
+        if magnitude > 0x8000000000000000 {
+            fail serde.Error.Range(0)
+        }
+        return i64(0 - magnitude)
+    }
+    if magnitude > 0x7FFFFFFFFFFFFFFF {
+        fail serde.Error.Range(0)
+    }
+    i64(magnitude)
+}
+
+fn parse_double(s: str) -> f64 ! serde.Error {
+    if s == "INF" || s == "+INF" {
+        return 1.0 / 0.0
+    }
+    if s == "-INF" {
+        return -1.0 / 0.0
+    }
+    if s == "NaN" {
+        return 0.0 / 0.0
+    }
+    strings.parse_float(s) catch {
+        _ => fail serde.Error.Mismatch("number", 0)
+    }
+}
+
+fn open_frame(c: *Cursor, keys: []str, items: []Item) {
+    push(mut c.frames, Frame { keys, items, index: 0 })
+}
+
+fn sequence_items(item: Item) -> []Item {
+    var items: []Item = []
+    match item {
+        Many(xs) => {
+            for x in xs {
+                push(mut items, Item.One(x))
+            }
+        }
+        One(e) => push(mut items, Item.One(e))
+        Root(e) => {
+            for x in children(e, "*") {
+                push(mut items, Item.One(x))
+            }
+        }
+        Body(e) => {
+            for x in children(e, "*") {
+                push(mut items, Item.One(x))
+            }
+        }
+        Value(s) => {
+            for word in strings.split(s, ' ') {
+                if word != "" {
+                    push(mut items, Item.Value(word))
+                }
+            }
+        }
+        Missing => {}
+    }
+    items
+}
+
+fn begin_map(c: *Cursor) ! serde.Error {
+    let item = take(c)
+    var keys: []str = []
+    var items: []Item = []
+    match element_of(item) {
+        some(e) => {
+            for a in e.attributes {
+                if a.name.namespace != xmlns_namespace() && a.name.namespace != instance_namespace() {
+                    push(mut keys, a.name.local)
+                    push(mut items, Item.Value(a.value))
+                }
+            }
+            var groups: [str: i64] = [:]
+            var members: [][]*Element = []
+            let first = keys.len
+            for n in e.children {
+                match n {
+                    Element(x) => {
+                        match groups[x.name.local] {
+                            some(g) => push(mut members[g], x)
+                            none => {
+                                groups[x.name.local] = members.len
+                                push(mut members, [x])
+                                push(mut keys, x.name.local)
+                                push(mut items, Item.Missing)
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for g, xs in members {
+                items[first + g] = if xs.len == 1 { Item.One(xs[0]) } else { Item.Many(xs) }
+            }
+        }
+        none => {
+            match item {
+                Missing => {}
+                _ => fail serde.Error.Mismatch("element", 0)
+            }
+        }
+    }
+    open_frame(c, keys, items)
+}
+
+fn advance(c: *Cursor) -> i64 {
+    let top = c.frames.len - 1
+    let i = c.frames[top].index
+    if i >= c.frames[top].items.len {
+        c.frames = c.frames[..top]
+        return -1
+    }
+    c.frames[top].index = i + 1
+    c.current = c.frames[top].items[i]
+    i
+}
+
+fn source(c: *Cursor) -> serde.Reader {
+    serde.Reader {
+        null: fn() -> bool ! serde.Error {
+            match element_of(c.current) {
+                some(e) => {
+                    if nil(e) {
+                        c.current = Missing
+                        return true
+                    }
+                }
+                none => {}
+            }
+            false
+        }
+        boolean: fn() -> bool ! serde.Error {
+            let s = trimmed(c, "boolean")?
+            if s == "true" || s == "1" {
+                return true
+            }
+            if s != "false" && s != "0" {
+                fail serde.Error.Mismatch("boolean", 0)
+            }
+            false
+        }
+        integer: fn() -> i64 ! serde.Error {
+            parse_integer(trimmed(c, "integer")?)
+        }
+        unsigned: fn() -> u64 ! serde.Error {
+            parse_digits(trimmed(c, "unsigned integer")?, "unsigned integer")
+        }
+        float: fn() -> f64 ! serde.Error {
+            parse_double(trimmed(c, "number")?)
+        }
+        text: fn() -> str ! serde.Error {
+            scalar(c, "text")
+        }
+        binary: fn() -> []u8 ! serde.Error {
+            let s = trimmed(c, "base64")?
+            base64.decode(s) catch {
+                _ => fail serde.Error.Mismatch("base64", 0)
+            }
+        }
+        begin_seq: fn() ! serde.Error {
+            let item = take(c)
+            open_frame(c, [], sequence_items(item))
+        }
+        next_element: fn() -> bool ! serde.Error {
+            advance(c) >= 0
+        }
+        begin_map: fn() ! serde.Error {
+            begin_map(c)?
+        }
+        next_key: fn() -> str? ! serde.Error {
+            let top = c.frames.len - 1
+            let i = advance(c)
+            if i < 0 {
+                return none
+            }
+            c.frames[top].keys[i]
+        }
+        begin_variant: fn() -> str ! serde.Error {
+            let item = take(c)
+            match item {
+                Value(s) => return strings.trim(s)
+                _ => {}
+            }
+            let e = match element_of(item) {
+                some(found) => found
+                none => fail serde.Error.Mismatch("variant", 0)
+            }
+            match first_child(e) {
+                some(body) => {
+                    c.current = Body(body)
+                    body.name.local
+                }
+                none => strings.trim(text(e))
+            }
+        }
+        end_variant: fn() ! serde.Error {}
+        skip: fn() ! serde.Error {
+            c.current = Missing
+        }
+        position: fn() -> i64 { 0 }
+    }
+}
+
+pub fn deserialize[T](data: []u8) -> T ! serde.Error {
+    let root = parse(data) catch {
+        Malformed(line, column, message) => fail serde.Error.Syntax(line, "{line}:{column}: {message}")
+        Limit(line, column, message) => fail serde.Error.Syntax(line, "{line}:{column}: {message}")
+        Unsupported(message) => fail serde.Error.Syntax(0, message)
+    }
+    let c = new(Cursor { current: Root(root), frames: [] })
+    serde.read(source(c))
+}
+
+struct Emitter {
+    w: *Writer
+    name: str
+    body: bool
+    saved: []str
+    owned: []bool
+}
+
+fn leaf(o: *Emitter, value: str) {
+    start_element(o.w, o.name)
+    write_text(o.w, value)
+    end_element(o.w)
+}
+
+fn enter_composite(o: *Emitter, element: bool) {
+    push(mut o.saved, o.name)
+    push(mut o.owned, element)
+    if element {
+        start_element(o.w, o.name)
+    }
+}
+
+fn exit_composite(o: *Emitter) {
+    let top = o.saved.len - 1
+    if o.owned[top] {
+        end_element(o.w)
+    }
+    o.name = o.saved[top]
+    o.saved = o.saved[..top]
+    o.owned = o.owned[..top]
+}
+
+fn begin_container(o: *Emitter) {
+    let body = o.body
+    o.body = false
+    enter_composite(o, !body)
+}
+
+fn format_double(x: f64) -> str {
+    if x != x {
+        return "NaN"
+    }
+    if x > 1.7976931348623157e308 {
+        return "INF"
+    }
+    if x < -1.7976931348623157e308 {
+        return "-INF"
+    }
+    "{x}"
+}
+
+fn sink(o: *Emitter) -> serde.Writer {
+    serde.Writer {
+        null: fn() {}
+        boolean: fn(v) { leaf(o, if v { "true" } else { "false" }) }
+        integer: fn(n) { leaf(o, "{n}") }
+        unsigned: fn(n) { leaf(o, "{n}") }
+        float: fn(x) { leaf(o, format_double(x)) }
+        text: fn(s) { leaf(o, s) }
+        binary: fn(b) { leaf(o, base64.encode(b)) }
+        begin_seq: fn(n) {
+            let body = o.body
+            o.body = false
+            let wrapped = body || o.saved.len == 0
+            enter_composite(o, !body && wrapped)
+            if wrapped {
+                o.name = "item"
+            }
+        }
+        end_seq: fn() { exit_composite(o) }
+        begin_map: fn(n) { begin_container(o) }
+        key: fn(k) { o.name = k }
+        end_map: fn() { exit_composite(o) }
+        begin_struct: fn(name, n) { begin_container(o) }
+        field: fn(name) { o.name = name }
+        end_struct: fn() { exit_composite(o) }
+        unit_variant: fn(e, v) { leaf(o, v) }
+        begin_variant: fn(e, v, n) {
+            enter_composite(o, true)
+            start_element(o.w, v)
+            o.body = true
+        }
+        end_variant: fn() {
+            end_element(o.w)
+            exit_composite(o)
+        }
+    }
+}
+
+pub fn serialize_value[T](root: str, v: T) -> str {
+    let o = new(Emitter { w: writer(false), name: root, body: false, saved: [], owned: [] })
+    serde.write(v, sink(o))
+    if o.w.n == 0 {
+        start_element(o.w, root)
+    }
+    finish(o.w)
+}
