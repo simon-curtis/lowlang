@@ -73,26 +73,39 @@ func runFixture(t *testing.T, path string) {
 	if err := build(ctx, path, binary); err != nil {
 		t.Fatal(err)
 	}
+	environments := [][]string{nil}
+	if name := filepath.Base(path); strings.HasPrefix(name, "simd") || strings.HasPrefix(name, "std_") {
+		environments = append(environments, []string{"LOW_SIMD=sse2"})
+	}
+	for _, env := range environments {
+		state := runBinary(t, ctx, path, binary, env)
+		checkMemory(t, path, state)
+	}
+	checkLinking(t, path, binary)
+}
+
+func runBinary(t *testing.T, ctx context.Context, path, binary string, env []string) *os.ProcessState {
+	t.Helper()
 	var stdout, stderr bytes.Buffer
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary)
+	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	runErr := cmd.Run()
 
 	wantOut, _ := expected(t, path, ".out")
 	if got := stdout.String(); got != wantOut {
-		t.Errorf("stdout:\n%s\nwant:\n%s", got, wantOut)
+		t.Errorf("%v stdout:\n%s\nwant:\n%s", env, got, wantOut)
 	}
 	wantErr, panics := expected(t, path, ".err")
 	if got := stderr.String(); got != wantErr {
-		t.Errorf("stderr:\n%s\nwant:\n%s", got, wantErr)
+		t.Errorf("%v stderr:\n%s\nwant:\n%s", env, got, wantErr)
 	}
 	if panics != (runErr != nil) {
-		t.Errorf("exit error %v, expected panic %v", runErr, panics)
+		t.Errorf("%v exit error %v, expected panic %v", env, runErr, panics)
 	}
-	checkMemory(t, path, cmd.ProcessState)
-	checkLinking(t, path, binary)
+	return cmd.ProcessState
 }
 
 func checkLinking(t *testing.T, path, binary string) {

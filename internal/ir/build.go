@@ -339,7 +339,7 @@ func (b *builder) bind(local *ast.Local, words []*Value) {
 		b.store(place{addr: box}, words)
 		return
 	}
-	if local.Addressed || isC(local.Type) {
+	if local.Addressed || isC(local.Type) || isVector(local.Type) {
 		slot := b.emit(OpSlot)
 		slot.Aux = int64(len(b.fn.Slots))
 		b.fn.Slots = append(b.fn.Slots, len(words))
@@ -508,7 +508,11 @@ func (b *builder) runDefers(from int) {
 func (b *builder) stmt(s ast.Stmt) {
 	switch s := s.(type) {
 	case *ast.Let:
-		b.bind(s.Local, b.value(s.Value, s.Local.Type))
+		if isVector(s.Local.Type) && !s.Local.Captured {
+			b.bindVector(s.Local, s.Value)
+		} else {
+			b.bind(s.Local, b.value(s.Value, s.Local.Type))
+		}
 		if s.Flag != nil {
 			b.bind(s.Flag, []*Value{b.constant(1)})
 		}
@@ -580,6 +584,10 @@ func (b *builder) assign(s *ast.Assign) {
 		b.assignEntry(s)
 		return
 	}
+	if isVector(s.Target.TypeOf()) {
+		b.assignVector(s)
+		return
+	}
 	t := s.Target.TypeOf()
 	source := t
 	if s.Op == lexer.ShlAssign || s.Op == lexer.ShrAssign {
@@ -633,6 +641,11 @@ func (b *builder) backEdge(header *Block) {
 }
 
 func (b *builder) expr(e ast.Expr) []*Value {
+	if t := e.TypeOf(); isVector(t) {
+		if addr := b.vectorNode(e); addr != nil {
+			return b.load(place{addr: addr}, t)
+		}
+	}
 	switch e := e.(type) {
 	case *ast.IntLit:
 		if e.Type.Float() {

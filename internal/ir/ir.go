@@ -48,6 +48,9 @@ const (
 	OpResult
 	OpFuncAddr
 	OpMulHigh
+	OpVector
+	OpVectorScalar
+	OpTrailingZeros
 )
 
 const (
@@ -63,7 +66,7 @@ var opNames = [...]string{
 	OpConvert: "convert", OpSqrt: "sqrt", OpFloor: "floor",
 	OpEq: "eq", OpNe: "ne", OpLt: "lt", OpLe: "le", OpGt: "gt", OpGe: "ge",
 	OpLoad: "load", OpStore: "store", OpCheck: "check", OpSlot: "slot", OpCall: "call", OpCCall: "ccall", OpRuntime: "runtime", OpResult: "result",
-	OpFuncAddr: "funcaddr", OpMulHigh: "mulhigh",
+	OpFuncAddr: "funcaddr", OpMulHigh: "mulhigh", OpVector: "vector", OpVectorScalar: "vectorscalar", OpTrailingZeros: "ctz",
 }
 
 func (o Op) String() string {
@@ -75,7 +78,7 @@ func (o Op) Compare() bool {
 }
 
 func (o Op) HasResult() bool {
-	return o != OpStore && o != OpCall && o != OpCCall && o != OpRuntime && o != OpCheck
+	return o != OpStore && o != OpCall && o != OpCCall && o != OpRuntime && o != OpCheck && o != OpVector
 }
 
 type Value struct {
@@ -200,6 +203,8 @@ func describe(v *Value) string {
 		detail = fmt.Sprintf(" %s", v.Plan.Symbol)
 	case OpConvert:
 		detail = fmt.Sprintf(" %s->%s", v.From, v.Type)
+	case OpVector, OpVectorScalar:
+		detail = fmt.Sprintf(" %s", VectorOp(v.Aux))
 	}
 	if v.Type != nil && v.Op != OpConvert {
 		detail = fmt.Sprintf("%s:%s", detail, v.Type)

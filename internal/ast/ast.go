@@ -291,6 +291,7 @@ type Assign struct {
 	Entry   *Index
 	Release Stmt
 	Flag    *Local
+	Splat   bool
 }
 
 type ExprStmt struct {
@@ -477,10 +478,12 @@ type Unary struct {
 
 type Binary struct {
 	Typed
-	Op  lexer.Kind
-	X   Expr
-	Y   Expr
-	Pos lexer.Pos
+	Op     lexer.Kind
+	X      Expr
+	Y      Expr
+	SplatX bool
+	SplatY bool
+	Pos    lexer.Pos
 }
 
 type Call struct {

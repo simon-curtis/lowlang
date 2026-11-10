@@ -14,6 +14,7 @@ const (
 	Number
 	Integer
 	Float
+	Vector
 )
 
 var Constraints = map[string]Constraint{
@@ -23,6 +24,7 @@ var Constraints = map[string]Constraint{
 	"Number":  Number | Ord | Eq,
 	"Integer": Integer | Number | Ord | Eq | Hash,
 	"Float":   Float | Number | Ord | Eq,
+	"Vector":  Vector,
 }
 
 func NewParam(name string, c Constraint) *Type {
@@ -44,6 +46,7 @@ func (t *Type) Satisfies(c Constraint) bool {
 		{Number, t.Number},
 		{Integer, t.Integer},
 		{Float, t.Float},
+		{Vector, func() bool { return t.Kind == VectorKind }},
 	}
 	for _, check := range checks {
 		if c&check.bit != 0 && !check.ok() {

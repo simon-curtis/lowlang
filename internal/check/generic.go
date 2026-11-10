@@ -411,6 +411,7 @@ func (c *Checker) genericCall(e *ast.Call, fn *ast.Func, explicit []*ast.TypeNam
 		e.Target = c.instance(fn, args, e.Pos)
 	}
 	e.Type = c.substitute(fn.RetType, in, e.Pos)
+	c.forwarded(e, fn)
 }
 
 func (c *Checker) genericTarget(x ast.Expr) *ast.Func {

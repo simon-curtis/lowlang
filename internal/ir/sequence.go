@@ -151,6 +151,9 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 	if words, ok := b.pointerBuiltin(e); ok {
 		return words
 	}
+	if words, ok := b.vectorBuiltin(e); ok {
+		return words
+	}
 	arg := e.Args[0]
 	switch e.Builtin {
 	case "push":
@@ -183,6 +186,8 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 		return b.value(arg, arg.TypeOf())[:2]
 	case "__syscall":
 		return []*Value{b.syscall(e.Args)}
+	case "__ctz":
+		return []*Value{b.typed(OpTrailingZeros, types.I64, b.word(arg))}
 	case "__mulhi":
 		return []*Value{b.typed(OpMulHigh, types.U64, b.word(arg), b.word(e.Args[1]))}
 	case "__make":

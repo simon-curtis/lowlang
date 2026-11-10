@@ -24,6 +24,7 @@ const (
 	FuncKind
 	ParamKind
 	ChanKind
+	VectorKind
 )
 
 type Type struct {
@@ -48,6 +49,7 @@ type Type struct {
 	Align      int
 	Constraint Constraint
 	Origin     *Type
+	Lanes      int
 	TypeArgs   []*Type
 	size       int
 }

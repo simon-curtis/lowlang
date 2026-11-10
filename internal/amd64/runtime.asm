@@ -1,6 +1,77 @@
 	.intel_syntax noprefix
 
 	.section .rodata
+	.p2align 5
+	.globl rt_vsign8
+rt_vsign8:
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.byte 0x80
+	.globl rt_vsign16
+rt_vsign16:
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.short 0x8000
+	.globl rt_vsign32
+rt_vsign32:
+	.long 0x80000000
+	.long 0x80000000
+	.long 0x80000000
+	.long 0x80000000
+	.long 0x80000000
+	.long 0x80000000
+	.long 0x80000000
+	.long 0x80000000
+	.globl rt_vsign64
+rt_vsign64:
+	.quad 0x8000000000000000
+	.quad 0x8000000000000000
+	.quad 0x8000000000000000
+	.quad 0x8000000000000000
+rt_simd_env:
+	.asciz "LOW_SIMD=sse2"
 rt_true:
 	.ascii "true\n"
 rt_false:
@@ -922,4 +993,54 @@ rt_exp:
 	ret
 5:
 	xor eax, eax
+	ret
+
+	.data
+	.globl rt_avx2
+rt_avx2:
+	.byte 0
+
+	.text
+	.globl rt_cpu_init
+rt_cpu_init:
+	push rbx
+	push r12
+	mov r12, rdi
+	mov eax, 1
+	xor ecx, ecx
+	cpuid
+	mov r8d, ecx
+	and r8d, 0x18000000
+	cmp r8d, 0x18000000
+	jne 3f
+	xor ecx, ecx
+	xgetbv
+	and eax, 6
+	cmp eax, 6
+	jne 3f
+	mov eax, 7
+	xor ecx, ecx
+	cpuid
+	test ebx, 32
+	jz 3f
+	mov byte ptr [rip+rt_avx2], 1
+3:
+	test r12, r12
+	jz 9f
+4:
+	mov rsi, [r12]
+	test rsi, rsi
+	jz 9f
+	lea rdi, [rip+rt_simd_env]
+	mov ecx, 14
+	repe cmpsb
+	jne 5f
+	mov byte ptr [rip+rt_avx2], 0
+	jmp 9f
+5:
+	add r12, 8
+	jmp 4b
+9:
+	pop r12
+	pop rbx
 	ret

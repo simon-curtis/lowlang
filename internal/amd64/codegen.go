@@ -41,14 +41,17 @@ type Generator struct {
 	suffix  string
 	maps    []stackMap
 	stubs   []pollStub
+	tier    tier
+	cache   *vectorCache
 }
 
 type frame struct {
-	fn        *mfunc
-	saved     []string
-	slots     []int
-	firstSlot int
-	results   int
+	fn            *mfunc
+	saved         []string
+	slots         []int
+	firstSlot     int
+	vectorScratch int
+	results       int
 }
 
 type stackMap struct {
@@ -188,9 +191,13 @@ func (g *Generator) start(prog *ir.Program) {
 		g.text.WriteString("\t.globl main\nmain:\n")
 		g.emit("push rbp")
 		g.emit("xor ebp, ebp")
+		g.emit("mov rdi, rdx")
 	} else {
 		g.text.WriteString("\t.globl _start\n_start:\n")
+		g.emit("mov rax, [rsp]")
+		g.emit("lea rdi, [rsp+8*rax+16]")
 	}
+	g.emit("call rt_cpu_init")
 	g.emit("call rt_gc_init")
 	g.emit("call rt_sched_init")
 	if g.table != nil {
@@ -283,9 +290,30 @@ func (g *Generator) messageLabel(s string) string {
 }
 
 func (g *Generator) function(f *ir.Func) {
-	g.fn = mangle(f.Name)
+	symbol := Symbol(f.Name, g.suffix)
+	if !usesVectors(f) {
+		g.tier = baseline
+		g.body(f, symbol, mangle(f.Name), false)
+		return
+	}
+	g.label(symbol)
+	g.emit("cmp byte ptr [rip+rt_avx2], 0")
+	g.emit("jne %s.avx2", symbol)
+	g.emit("jmp %s.sse2", symbol)
+	g.tier = avx2
+	g.body(f, fmt.Sprintf("%s.avx2", symbol), fmt.Sprintf("%s.avx2", mangle(f.Name)), true)
+	g.tier = baseline
+	g.body(f, fmt.Sprintf("%s.sse2", symbol), fmt.Sprintf("%s.sse2", mangle(f.Name)), true)
+}
+
+func (g *Generator) body(f *ir.Func, symbol, prefix string, vectors bool) {
+	g.fn = prefix
 	g.labels = 0
-	mf := lower(f)
+	g.cache = nil
+	if vectors && g.tier == avx2 {
+		g.cache = vectorTemps(f)
+	}
+	mf := lower(f, prefix)
 	spills, saved := mf.allocate()
 	fr := &frame{fn: mf, saved: saved, results: 16 + 8*stackWords(f.ParamWords)}
 	words := len(saved) + spills
@@ -294,8 +322,12 @@ func (g *Generator) function(f *ir.Func) {
 		words += n
 		fr.slots = append(fr.slots, words)
 	}
+	if vectors {
+		words += vectorScratchWords
+		fr.vectorScratch = -8 * words
+	}
 	size := (8*(words+outgoing(f)) + 15) &^ 15
-	g.label(Symbol(f.Name, g.suffix))
+	g.label(symbol)
 	g.emit("push rbp")
 	g.emit("mov rbp, rsp")
 	if size > 0 {
@@ -314,6 +346,7 @@ func (g *Generator) function(f *ir.Func) {
 	}
 	for _, stub := range g.stubs {
 		g.label(stub.label)
+		g.leaveVectors()
 		g.emit("call rt_poll")
 		g.emit("jmp %s", stub.resume)
 	}
@@ -394,6 +427,9 @@ func (g *Generator) move(dst, src string) {
 
 func (g *Generator) block(fr *frame, mb *mblock, next *mblock) {
 	g.label(mb.label)
+	if g.cache != nil {
+		g.cache.reset()
+	}
 	for _, in := range mb.instrs {
 		g.instr(fr, in)
 	}
@@ -469,6 +505,7 @@ func (g *Generator) ret(fr *frame, mb *mblock) {
 	}
 	g.emit("mov rsp, rbp")
 	g.emit("pop rbp")
+	g.leaveVectors()
 	g.emit("ret")
 }
 
@@ -499,6 +536,14 @@ func (g *Generator) instr(fr *frame, in *instr) {
 		g.binary(fr, in, binops[in.op])
 	case ir.OpMulHigh:
 		g.mulHigh(fr, in)
+	case ir.OpVector, ir.OpVectorScalar:
+		g.vector(fr, in)
+	case ir.OpTrailingZeros:
+		g.move("rax", fr.loc(in.args[0]))
+		g.emit("mov edx, 64")
+		g.emit("bsf rax, rax")
+		g.emit("cmovz rax, rdx")
+		g.move(fr.loc(in.dst), "rax")
 	case ir.OpShl, ir.OpShr:
 		g.shift(fr, in)
 	case ir.OpDiv, ir.OpRem:
@@ -647,6 +692,7 @@ func (g *Generator) call(fr *frame, in *instr) {
 		g.emit("mov qword ptr [rsp+%d], %s", 8*(i-len(argRegs)), src)
 	}
 	g.parallel(moves)
+	g.leaveVectors()
 	g.emit("call %s", g.callee(in.value))
 	g.safepoint(fr, in)
 }
@@ -734,6 +780,7 @@ func (g *Generator) runtimeCall(fr *frame, in *instr) {
 		g.emit("syscall")
 		return
 	}
+	g.leaveVectors()
 	g.emit("call rt_%s", in.value.Str)
 	g.safepoint(fr, in)
 }

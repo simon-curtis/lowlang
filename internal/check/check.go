@@ -124,6 +124,9 @@ func Check(files []*ast.File) (embeds []string, err error) {
 	for _, t := range types.Numeric {
 		c.builtin[t.Name] = t
 	}
+	for _, t := range types.Vectors {
+		c.builtin[t.Name] = t
+	}
 	c.check(files)
 	return c.embeds, nil
 }
@@ -865,9 +868,12 @@ func (c *Checker) let(s *ast.Let) {
 
 func (c *Checker) assign(s *ast.Assign) {
 	t := c.assignTarget(s)
-	switch s.Op {
-	case lexer.Assign:
-	case lexer.PlusAssign, lexer.MinusAssign, lexer.StarAssign, lexer.SlashAssign:
+	switch {
+	case s.Op == lexer.Assign:
+	case isVector(t):
+		c.vectorAssign(s, t)
+		return
+	case s.Op == lexer.PlusAssign || s.Op == lexer.MinusAssign || s.Op == lexer.StarAssign || s.Op == lexer.SlashAssign:
 		c.requireNumber(t, s.Op, s.Pos)
 	default:
 		c.requireInteger(t, s.Op, s.Pos)
@@ -1484,10 +1490,18 @@ func (c *Checker) unary(e *ast.Unary, want *types.Type) {
 	case lexer.LArrow:
 		e.Type = c.optional(c.channel(e.X).Elem)
 	case lexer.Tilde:
-		e.Type = c.plain(e.X, numeric(want))
+		e.Type = c.plain(e.X, arithmetic(want))
+		if isVector(e.Type) {
+			c.vectorUnary(e, e.Type)
+			return
+		}
 		c.requireInteger(e.Type, e.Op, e.Pos)
 	default:
-		e.Type = c.plain(e.X, numeric(want))
+		e.Type = c.plain(e.X, arithmetic(want))
+		if isVector(e.Type) {
+			c.vectorUnary(e, e.Type)
+			return
+		}
 		c.requireNumber(e.Type, e.Op, e.Pos)
 	}
 }
@@ -1537,8 +1551,40 @@ func (c *Checker) operands(e *ast.Binary, want *types.Type) *types.Type {
 		first, second = second, first
 	}
 	t := c.plain(first, want)
-	c.expectType(second, t)
+	var s *types.Type
+	if isVector(t) && literal(second) {
+		s = c.plain(second, t.Elem)
+	} else {
+		s = c.plain(second, t)
+	}
+	switch {
+	case isVector(t) && isVector(s):
+		if s != t {
+			c.fail(second.Position(), "expected %s, found %s", t, s)
+		}
+	case isVector(t):
+		if !t.Elem.Accepts(s) {
+			c.fail(second.Position(), "expected %s or %s, found %s", t, t.Elem, s)
+		}
+		c.splat(e, second)
+	case isVector(s):
+		if !s.Elem.Accepts(t) {
+			c.fail(first.Position(), "expected %s or %s, found %s", s, s.Elem, t)
+		}
+		c.splat(e, first)
+		t = s
+	case !t.Accepts(s):
+		c.fail(second.Position(), "expected %s, found %s", t, s)
+	}
 	return t
+}
+
+func (c *Checker) splat(e *ast.Binary, operand ast.Expr) {
+	if operand == e.X {
+		e.SplatX = true
+	} else {
+		e.SplatY = true
+	}
 }
 
 func (c *Checker) binary(e *ast.Binary, want *types.Type) {
@@ -1550,25 +1596,46 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 	case lexer.Coalesce:
 		c.coalesce(e)
 	case lexer.Shl, lexer.Shr:
-		e.Type = c.plain(e.X, numeric(want))
+		e.Type = c.plain(e.X, arithmetic(want))
+		if isVector(e.Type) {
+			c.vectorShift(e, e.Type)
+			return
+		}
 		c.requireInteger(e.Type, e.Op, e.X.Position())
 		c.requireInteger(c.plain(e.Y, nil), e.Op, e.Y.Position())
 	case lexer.Eq, lexer.NotEq:
 		t := c.operands(e, nil)
+		if isVector(t) {
+			c.vectorOperator(e, t)
+			return
+		}
 		if !t.Comparable() && t != types.Never {
 			c.fail(e.X.Position(), "cannot compare values of type %s", t)
 		}
 		e.Type = types.Bool
 	case lexer.Lt, lexer.LtEq, lexer.Gt, lexer.GtEq:
-		if t := c.operands(e, nil); !t.Ordered() && t != types.Never {
+		t := c.operands(e, nil)
+		if isVector(t) {
+			c.vectorOperator(e, t)
+			return
+		}
+		if !t.Ordered() && t != types.Never {
 			c.fail(e.Pos, "operator %s requires a number, found %s", e.Op, t)
 		}
 		e.Type = types.Bool
 	case lexer.Percent, lexer.Amp, lexer.Pipe, lexer.Caret:
-		e.Type = c.operands(e, numeric(want))
+		e.Type = c.operands(e, arithmetic(want))
+		if isVector(e.Type) {
+			c.vectorOperator(e, e.Type)
+			return
+		}
 		c.requireInteger(e.Type, e.Op, e.Pos)
 	default:
-		e.Type = c.operands(e, numeric(want))
+		e.Type = c.operands(e, arithmetic(want))
+		if isVector(e.Type) {
+			c.vectorOperator(e, e.Type)
+			return
+		}
 		if e.Op == lexer.Plus && e.Type == types.Str {
 			return
 		}
@@ -1580,7 +1647,7 @@ var builtins = map[string]bool{
 	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
 	"delete": true, "embed": true, "__str_raw": true,
 	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
-	"__bits": true, "__str_view": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true,
+	"__bits": true, "__str_view": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true, "__ctz": true,
 	"__spawn": true, "__current": true, "__park": true, "__ready": true, "__lock": true, "__unlock": true, "__cas": true, "__panic": true,
 }
 
@@ -1615,6 +1682,10 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 		}
 		if t, ok := c.builtin[fn.Name]; ok && t.Number() {
 			c.convert(e, t)
+			return
+		}
+		if t, ok := c.builtin[fn.Name]; ok && isVector(t) {
+			c.vectorCast(e, t)
 			return
 		}
 		if enum, v := c.inferVariant(want, fn.Name); v != nil {
@@ -1836,6 +1907,12 @@ func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 		c.syscall(e)
 	case "__serialize":
 		c.serializeCall(e)
+	case "__vload", "__vstore", "__vsplat", "__vmask", "__vshuffle", "__vselect", "__vmin", "__vmax", "__vlane", "__vwith":
+		c.vectorIntrinsic(e, name, want)
+	case "__ctz":
+		c.single(e, name)
+		c.expectType(e.Args[0], types.U64)
+		e.Builtin, e.Type = name, types.I64
 	case "__mulhi":
 		if len(e.Args) != 2 {
 			c.fail(e.Pos, "__mulhi takes 2 arguments, found %d", len(e.Args))
@@ -2041,6 +2118,7 @@ func (c *Checker) callFunc(e *ast.Call, fn *ast.Func, want *types.Type) {
 	c.exclusive(e.Args)
 	e.Target = fn
 	e.Type = fn.RetType
+	c.forwarded(e, fn)
 }
 
 func (c *Checker) argument(arg ast.Expr, fn *ast.Func, i int) {

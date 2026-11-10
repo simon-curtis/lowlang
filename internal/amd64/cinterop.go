@@ -67,6 +67,7 @@ func (g *Generator) cCall(fr *frame, in *instr) {
 			g.emit("mov [rsp+%d], r11", 8*i)
 		}
 	}
+	g.leaveVectors()
 	g.emit("mov eax, %d", plan.Vectors)
 	g.emit("call %s", target)
 	g.safepointAt(fr, in, label)

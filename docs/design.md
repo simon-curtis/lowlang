@@ -111,6 +111,32 @@ let byte = u8(300)
 - `sqrt`, `floor` and `exp` take and return `f32` or `f64`.
 - `print` accepts any integer type.
 
+### Vectors
+
+```low
+import std/simd
+
+fn find(data: []u8, c: u8) -> i64 {
+    let needle: u8x32 = simd.splat(c)
+    var i = 0
+    for i + 32 <= data.len {
+        let chunk: u8x32 = simd.read(data, i)
+        let hits = simd.mask(chunk == needle)
+        if hits != 0 {
+            return i + simd.trailing_zeros(hits)
+        }
+        i += 32
+    }
+    -1
+}
+```
+
+- Vector types are 128 or 256 bits of one lane type: `u8x16`, `u8x32`, `u16x8`, `u16x16`, `i32x4`, `i32x8`, `u32x4`, `u32x8`, `i64x2`, `i64x4`, `u64x2`, `u64x4`, `f32x4`, `f32x8`, `f64x2` and `f64x4`.
+- `+`, `-`, `*`, `&`, `|`, `^`, `~` and unary `-` work lane by lane, `/` on float lanes, and `<<` and `>>` on integer lanes by a scalar count, arithmetic on signed lanes. Comparisons work lane by lane and give a vector of the same type whose lanes are all ones or all zeros; unsigned lanes compare unsigned. A scalar operand of the lane type is broadcast, so `chunk == '"'` compares every lane. Compound assignments work the same way.
+- `u8x32(v)` reinterprets a vector of the same width.
+- `std/simd` provides `read` and `write` between a vector and a slice at an element index, `read_str`, `splat`, `mask` (one bit per lane from its top bit), `any`, `blend`, `min`, `max`, `lane`, `with_lane`, `shuffle` and `shuffle16` (a byte table lookup within each 16-byte half, zero where the index has its top bit set), `trailing_zeros`, `count_ones` and `find_byte`. Reads and writes are bounds-checked.
+- Vectors are values: they can be passed, returned, stored in fields and slices, and compared lane by lane, but not with `==` as a whole or printed.
+
 ### Slices
 
 ```low
@@ -661,6 +687,7 @@ fn main() ! io.Error {
 | `std/crypto/mlkem` | ML-KEM-512, -768 and -1024 (FIPS 203). |
 | `std/crypto/x509` | DER, PEM, certificates, PKCS#8 private keys, the system roots, chain validation and TLS signature schemes. |
 | `std/time` | `now`, in Unix seconds. |
+| `std/simd` | Vector reads and writes, `splat`, `mask`, `blend`, `min`, `max`, lane access, byte shuffles, bit counting and `find_byte`. |
 | `std/text` | integer and correctly rounded float parsing, hex encoding, `trim`, `split`, `join`, `index`, case folding and comma-separated token lists. |
 | `std/base64` | `encode` and `decode`. |
 
@@ -818,6 +845,15 @@ Calls pass the first six argument words in `rdi`, `rsi`, `rdx`, `rcx`, `r8` and 
 
 On fib(38) this runs at 1.25x Go's time.
 
+
+### Vectors
+
+- A vector local lives in a frame slot, like a variable passed as `mut`, and a vector expression evaluates to the address of a slot holding its result. A vector operation is one IR instruction, `vector`, taking the destination and operand addresses, or `vectorscalar` for `mask`. At calls, returns, fields and other aggregates a vector is its words, loaded from or stored to a slot. A `let` of a computed vector adopts the slot of the result instead of copying it.
+- A function containing vector instructions is compiled twice. Its symbol is a stub that jumps to the AVX2 version when the CPU and the operating system support AVX2, and to the SSE2 version otherwise; `rt_cpu_init` checks `cpuid` and `xgetbv` at startup. `LOW_SIMD=sse2` in the environment selects the SSE2 versions, which the fixture runner uses to test both.
+- The AVX2 version uses three-operand VEX instructions on `ymm` registers. A slot written once and read only by vector instructions later in the same block, with no call in between, is kept in `ymm8` to `ymm15` instead of memory. `vzeroupper` runs before every call and return of such a function.
+- The SSE2 version splits 256-bit operations into two 128-bit halves and keeps every vector in memory.
+- An operation without an instruction in the version being generated runs as a scalar loop over the lanes in a scratch area of the frame: `pshufb` on SSE2, 64-bit multiplication, minimum, maximum and comparison where unavailable, byte shifts and arithmetic 64-bit shifts. Unsigned comparisons flip the sign bit of both operands and compare signed.
+
 ## Hot reload
 
 `low dev app.low` or `low dev app/` builds a dev binary, runs it, and watches every source file of every loaded module, every embedded file, and the file lists of their directories. On save:
@@ -882,6 +918,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - Function values and closures capturing by reference; `extern fn` C function pointers and C callbacks.
 - Green threads on an M:N scheduler with `spawn`, channels, `select`, `sleep`, descriptor waits through epoll, deadlock detection and stack overflow checks.
 - Derived serialization, deserialization and schemas for every type, and `T.field` references.
+- 128- and 256-bit vector types with lane-wise operators, compiled for AVX2 and SSE2 with dispatch at startup.
 - Standard library: files, networking with DNS, pipelines, HTTP/1.1 and HTTP/2 clients and servers, WebSocket, post-quantum TLS 1.3, JSON, the web framework with OpenAPI and authentication, the SQL driver contract and ORM, DEFLATE/zlib/gzip and xz compression, checksums, and the cryptography TLS needs.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
@@ -889,8 +926,9 @@ The UI library is staged under `ui/` until it moves into the standard library as
 ## Roadmap
 
 1. Standard library, written in LowLang:
-    1. QUIC (RFC 9000, 9001 and 9002) over UDP with the TLS 1.3 handshake, loss recovery and congestion control; HTTP/3 (RFC 9114) with QPACK (RFC 9204).
-    2. WebRTC data channels: ICE with STUN, DTLS, SCTP over DTLS and the data channel establishment protocol; media over SRTP.
+    1. Vector values in registers across blocks and calls, and an AVX-512 version.
+    2. QUIC (RFC 9000, 9001 and 9002) over UDP with the TLS 1.3 handshake, loss recovery and congestion control; HTTP/3 (RFC 9114) with QPACK (RFC 9204).
+    3. WebRTC data channels: ICE with STUN, DTLS, SCTP over DTLS and the data channel establishment protocol; media over SRTP.
 2. GPU UI library with GPUI's renderer and platform layer and a signal-based state model, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
