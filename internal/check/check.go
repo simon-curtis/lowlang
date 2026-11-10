@@ -31,6 +31,7 @@ type Checker struct {
 	named   map[string]*types.Type
 	results map[[2]*types.Type]*types.Type
 	ptrs    map[*types.Type]*types.Type
+	slices  map[*types.Type]*types.Type
 	fn      *ast.Func
 	scopes  []map[string]*ast.Local
 	loops   []*loop
@@ -42,6 +43,7 @@ func Check(file *ast.File) (err error) {
 		named:   map[string]*types.Type{"bool": types.Bool, "str": types.Str},
 		results: map[[2]*types.Type]*types.Type{},
 		ptrs:    map[*types.Type]*types.Type{},
+		slices:  map[*types.Type]*types.Type{},
 	}
 	defer func() {
 		r := recover()
@@ -66,14 +68,26 @@ func (c *Checker) fail(pos lexer.Pos, format string, args ...any) {
 }
 
 func (c *Checker) resolve(t *ast.TypeName) *types.Type {
+	switch {
+	case t.Pointer:
+		return c.pointer(c.resolve(t.Elem))
+	case t.Slice:
+		return c.slice(c.resolve(t.Elem))
+	}
 	typ, ok := c.named[t.Name]
 	if !ok {
 		c.fail(t.Pos, "unknown type %s", t.Name)
 	}
-	for range t.Pointers {
-		typ = c.pointer(typ)
-	}
 	return typ
+}
+
+func (c *Checker) slice(elem *types.Type) *types.Type {
+	if s, ok := c.slices[elem]; ok {
+		return s
+	}
+	s := types.NewSlice(elem)
+	c.slices[elem] = s
+	return s
 }
 
 func (c *Checker) pointer(elem *types.Type) *types.Type {
@@ -324,6 +338,8 @@ func (c *Checker) stmt(s ast.Stmt) bool {
 		return t == types.Never
 	case *ast.For:
 		return c.forStmt(s)
+	case *ast.ForIn:
+		c.forIn(s)
 	case *ast.Break:
 		c.innermostLoop(s.Pos, "break").broken = true
 		return true
@@ -409,15 +425,19 @@ func (c *Checker) place(e ast.Expr, pos lexer.Pos, action, invalid string) (*ast
 }
 
 func (c *Checker) ref(r *ast.Ref, want *types.Type) {
-	place, t := c.place(r.X, r.Pos, "pass %s as mut", "mut argument must be a variable, a field, or a dereferenced pointer")
-	if t != want {
+	if t := c.borrow(r); t != want {
 		c.fail(r.Pos, "expected %s, found %s", want, t)
 	}
+}
+
+func (c *Checker) borrow(r *ast.Ref) *types.Type {
+	place, t := c.place(r.X, r.Pos, "pass %s as mut", "mut argument must be a variable, a field, an element or a dereferenced pointer")
 	if place.Local != nil && !place.Local.Ref {
 		place.Local.Addressed = true
 	}
 	r.Place = place
 	r.Type = t
+	return t
 }
 
 func (c *Checker) exclusive(args []ast.Expr) {
@@ -452,6 +472,51 @@ func (c *Checker) forStmt(s *ast.For) bool {
 	c.block(s.Body, nil)
 	c.loops = c.loops[:len(c.loops)-1]
 	return s.Cond == nil && !l.broken
+}
+
+func (c *Checker) forIn(s *ast.ForIn) {
+	key, value := c.iteration(s)
+	c.pushScope()
+	if s.Key != "" {
+		s.KeyLocal = c.declare(s.Key, key, false)
+	}
+	s.ValueLocal = c.declare(s.Value, value, false)
+	c.loops = append(c.loops, &loop{})
+	c.block(s.Body, nil)
+	c.loops = c.loops[:len(c.loops)-1]
+	c.popScope()
+}
+
+func (c *Checker) iteration(s *ast.ForIn) (key, value *types.Type) {
+	if s.End != nil {
+		if s.Key != "" {
+			c.fail(s.Pos, "a range loop binds one name")
+		}
+		t := c.rangeType(s.Iter, s.End)
+		return nil, t
+	}
+	t := c.plain(s.Iter, nil)
+	switch t.Kind {
+	case types.SliceKind:
+		return types.I64, t.Elem
+	case types.StrKind:
+		return types.I64, types.U32
+	}
+	c.fail(s.Iter.Position(), "cannot iterate over %s", t)
+	return nil, nil
+}
+
+func (c *Checker) rangeType(lo, hi ast.Expr) *types.Type {
+	first, second := lo, hi
+	if literal(first) && !literal(second) {
+		first, second = second, first
+	}
+	t := c.plain(first, nil)
+	c.expectType(second, t)
+	if !t.Integer() {
+		c.fail(lo.Position(), "range bounds must be integers, found %s", t)
+	}
+	return t
 }
 
 func (c *Checker) innermostLoop(pos lexer.Pos, keyword string) *loop {
@@ -507,6 +572,9 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 	switch e := e.(type) {
 	case *ast.IntLit:
 		e.Type = types.I64
+		if e.Char {
+			e.Type = types.U32
+		}
 		if want != nil && want.Number() {
 			e.Type = want
 		}
@@ -530,6 +598,14 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 		c.structLit(e)
 	case *ast.Ref:
 		c.fail(e.Pos, "mut is only allowed as an argument to a mut parameter")
+	case *ast.Index:
+		c.index(e)
+	case *ast.Slicing:
+		c.slicing(e)
+	case *ast.SliceLit:
+		c.sliceLit(e, want)
+	case *ast.Interp:
+		c.interp(e)
 	case *ast.Unary:
 		c.unary(e, want)
 	case *ast.Binary:
@@ -604,8 +680,73 @@ func (c *Checker) selector(e *ast.Selector) {
 		e.Type = t
 		return
 	}
-	e.Field = c.field(deref(c.plain(e.X, nil)), e.Name, e.Pos)
+	t := c.plain(e.X, nil)
+	if e.Name == "len" && (t.Kind == types.SliceKind || t == types.Str) {
+		e.Length = true
+		e.Type = types.I64
+		return
+	}
+	e.Field = c.field(deref(t), e.Name, e.Pos)
 	e.Type = e.Field.Type
+}
+
+func (c *Checker) index(e *ast.Index) {
+	t := c.plain(e.X, nil)
+	switch {
+	case t.Kind == types.SliceKind:
+		e.Type = t.Elem
+	case t == types.Str:
+		e.Type = types.U8
+	default:
+		c.fail(e.Pos, "cannot index a value of type %s", t)
+	}
+	c.integer(e.Index)
+}
+
+func (c *Checker) integer(e ast.Expr) {
+	if t := c.plain(e, nil); !t.Integer() && t != types.Never {
+		c.fail(e.Position(), "expected an integer, found %s", t)
+	}
+}
+
+func (c *Checker) slicing(e *ast.Slicing) {
+	e.Type = c.plain(e.X, nil)
+	if e.Type.Kind != types.SliceKind && e.Type != types.Str {
+		c.fail(e.Pos, "cannot slice a value of type %s", e.Type)
+	}
+	for _, bound := range []ast.Expr{e.Lo, e.Hi} {
+		if bound != nil {
+			c.integer(bound)
+		}
+	}
+}
+
+func (c *Checker) sliceLit(e *ast.SliceLit, want *types.Type) {
+	if want != nil && want.Kind == types.SliceKind {
+		e.Type = want
+		for _, el := range e.Elems {
+			c.expectType(el, want.Elem)
+		}
+		return
+	}
+	if len(e.Elems) == 0 {
+		c.fail(e.Pos, "cannot infer the type of an empty slice; annotate it")
+	}
+	elem := c.plain(e.Elems[0], nil)
+	for _, el := range e.Elems[1:] {
+		c.expectType(el, elem)
+	}
+	e.Type = c.slice(elem)
+}
+
+func (c *Checker) interp(e *ast.Interp) {
+	for _, part := range e.Parts {
+		t := c.plain(part, nil)
+		if !t.Number() && t != types.Bool && t != types.Str {
+			c.fail(part.Position(), "cannot interpolate a value of type %s", t)
+		}
+	}
+	e.Type = types.Str
 }
 
 func (c *Checker) structLit(e *ast.StructLit) {
@@ -721,11 +862,17 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 		c.requireInteger(e.Type, e.Op, e.Pos)
 	default:
 		e.Type = c.operands(e, numeric(want))
+		if e.Op == lexer.Plus && e.Type == types.Str {
+			return
+		}
 		c.requireNumber(e.Type, e.Op, e.Pos)
 	}
 }
 
-var builtins = map[string]bool{"print": true, "new": true, "sqrt": true, "floor": true, "exp": true}
+var builtins = map[string]bool{
+	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
+	"__bits": true, "__str_view": true,
+}
 
 func (c *Checker) call(e *ast.Call, want *types.Type) {
 	switch fn := e.Fn.(type) {
@@ -736,6 +883,9 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 		}
 		if fn.Name == "new" {
 			c.allocate(e, want)
+			return
+		}
+		if c.special(e, fn.Name) {
 			return
 		}
 		if builtins[fn.Name] {
@@ -770,6 +920,8 @@ func (c *Checker) print(e *ast.Call) {
 	switch {
 	case t.Integer():
 		e.Builtin = "print_i64"
+	case t.Float():
+		e.Builtin = "print_float"
 	case t == types.Bool:
 		e.Builtin = "print_bool"
 	case t == types.Str:
@@ -777,6 +929,54 @@ func (c *Checker) print(e *ast.Call) {
 	default:
 		c.fail(e.Args[0].Position(), "cannot print a value of type %s", t)
 	}
+	e.Type = types.Void
+}
+
+func (c *Checker) special(e *ast.Call, name string) bool {
+	switch name {
+	case "push":
+		c.push(e)
+	case "bytes":
+		c.single(e, name)
+		c.expectType(e.Args[0], types.Str)
+		e.Builtin, e.Type = name, c.slice(types.U8)
+	case "str":
+		c.single(e, name)
+		c.expectType(e.Args[0], c.slice(types.U8))
+		e.Builtin, e.Type = "from_bytes", types.Str
+	case "__bits":
+		c.single(e, name)
+		t := c.plain(e.Args[0], nil)
+		e.Builtin, e.Type = name, types.I64
+		if t == types.F32 {
+			e.Type = types.U32
+		} else if t != types.F64 {
+			c.fail(e.Pos, "__bits requires a float")
+		}
+	case "__str_view":
+		c.single(e, name)
+		c.expectType(e.Args[0], c.slice(types.U8))
+		e.Builtin, e.Type = name, types.Str
+	default:
+		return false
+	}
+	return true
+}
+
+func (c *Checker) push(e *ast.Call) {
+	if len(e.Args) != 2 {
+		c.fail(e.Pos, "push takes 2 arguments, found %d", len(e.Args))
+	}
+	r, ok := e.Args[0].(*ast.Ref)
+	if !ok {
+		c.fail(e.Args[0].Position(), "push needs a mut slice; write push(mut s, value)")
+	}
+	t := c.borrow(r)
+	if t.Kind != types.SliceKind {
+		c.fail(r.Pos, "push needs a slice, found %s", t)
+	}
+	c.expectType(e.Args[1], t.Elem)
+	e.Builtin = "push"
 	e.Type = types.Void
 }
 

@@ -12,14 +12,17 @@ type File struct {
 }
 
 type TypeName struct {
-	Name     string
-	Pointers int
-	Pos      lexer.Pos
+	Name    string
+	Pointer bool
+	Slice   bool
+	Elem    *TypeName
+	Pos     lexer.Pos
 }
 
 type Place struct {
 	Local  *Local
 	Ptr    Expr
+	Index  *Index
 	Offset int
 }
 
@@ -40,7 +43,11 @@ func PlaceOf(e Expr) (*Place, bool) {
 		if !ok {
 			return nil, false
 		}
-		return &Place{Local: p.Local, Ptr: p.Ptr, Offset: p.Offset + 8*e.Field.Offset}, true
+		return &Place{Local: p.Local, Ptr: p.Ptr, Index: p.Index, Offset: p.Offset + 8*e.Field.Offset}, true
+	case *Index:
+		if e.X.TypeOf().Kind == types.SliceKind {
+			return &Place{Index: e}, true
+		}
 	case *Unary:
 		if e.Op == lexer.Star {
 			return &Place{Ptr: e.X}, true
@@ -188,6 +195,7 @@ type Fail struct {
 type IntLit struct {
 	Typed
 	Value int64
+	Char  bool
 	Pos   lexer.Pos
 }
 
@@ -224,6 +232,45 @@ type Selector struct {
 	Pos     lexer.Pos
 	Variant *types.Variant
 	Field   *types.Field
+	Length  bool
+}
+
+type Index struct {
+	Typed
+	X     Expr
+	Index Expr
+	Pos   lexer.Pos
+}
+
+type Slicing struct {
+	Typed
+	X   Expr
+	Lo  Expr
+	Hi  Expr
+	Pos lexer.Pos
+}
+
+type SliceLit struct {
+	Typed
+	Elems []Expr
+	Pos   lexer.Pos
+}
+
+type Interp struct {
+	Typed
+	Parts []Expr
+	Pos   lexer.Pos
+}
+
+type ForIn struct {
+	Key        string
+	Value      string
+	KeyLocal   *Local
+	ValueLocal *Local
+	Iter       Expr
+	End        Expr
+	Body       *Block
+	Pos        lexer.Pos
 }
 
 type Ref struct {
@@ -336,6 +383,11 @@ func (n *Ident) Position() lexer.Pos     { return n.Pos }
 func (n *Selector) Position() lexer.Pos  { return n.Pos }
 func (n *StructLit) Position() lexer.Pos { return n.Pos }
 func (n *Ref) Position() lexer.Pos       { return n.Pos }
+func (n *Index) Position() lexer.Pos     { return n.Pos }
+func (n *Slicing) Position() lexer.Pos   { return n.Pos }
+func (n *SliceLit) Position() lexer.Pos  { return n.Pos }
+func (n *Interp) Position() lexer.Pos    { return n.Pos }
+func (n *ForIn) Position() lexer.Pos     { return n.Pos }
 func (n *Unary) Position() lexer.Pos     { return n.Pos }
 func (n *Binary) Position() lexer.Pos    { return n.Pos }
 func (n *Call) Position() lexer.Pos      { return n.Pos }
@@ -352,6 +404,7 @@ func (*Break) stmt()    {}
 func (*Continue) stmt() {}
 func (*Return) stmt()   {}
 func (*Fail) stmt()     {}
+func (*ForIn) stmt()    {}
 
 func (*Block) expr()     {}
 func (*IntLit) expr()    {}
@@ -362,6 +415,10 @@ func (*Ident) expr()     {}
 func (*Selector) expr()  {}
 func (*StructLit) expr() {}
 func (*Ref) expr()       {}
+func (*Index) expr()     {}
+func (*Slicing) expr()   {}
+func (*SliceLit) expr()  {}
+func (*Interp) expr()    {}
 func (*Unary) expr()     {}
 func (*Binary) expr()    {}
 func (*Call) expr()      {}

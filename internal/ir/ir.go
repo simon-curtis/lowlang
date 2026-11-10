@@ -39,6 +39,7 @@ const (
 	OpGe
 	OpLoad
 	OpStore
+	OpCheck
 	OpSlot
 	OpCall
 	OpRuntime
@@ -51,7 +52,7 @@ var opNames = [...]string{
 	OpAnd: "and", OpOr: "or", OpXor: "xor", OpShl: "shl", OpShr: "shr", OpCompl: "compl",
 	OpConvert: "convert", OpSqrt: "sqrt", OpFloor: "floor",
 	OpEq: "eq", OpNe: "ne", OpLt: "lt", OpLe: "le", OpGt: "gt", OpGe: "ge",
-	OpLoad: "load", OpStore: "store", OpSlot: "slot", OpCall: "call", OpRuntime: "runtime", OpResult: "result",
+	OpLoad: "load", OpStore: "store", OpCheck: "check", OpSlot: "slot", OpCall: "call", OpRuntime: "runtime", OpResult: "result",
 }
 
 func (o Op) String() string {
@@ -63,7 +64,7 @@ func (o Op) Compare() bool {
 }
 
 func (o Op) HasResult() bool {
-	return o != OpStore && o != OpCall && o != OpRuntime
+	return o != OpStore && o != OpCall && o != OpRuntime && o != OpCheck
 }
 
 type Value struct {

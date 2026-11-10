@@ -15,6 +15,7 @@ const (
 	StructKind
 	ResultKind
 	PointerKind
+	SliceKind
 )
 
 type Type struct {
@@ -54,7 +55,7 @@ var (
 	F64   = &Type{Kind: FloatKind, Name: "f64", Bits: 64, size: 1}
 	F32   = &Type{Kind: FloatKind, Name: "f32", Bits: 32, size: 1}
 	Bool  = &Type{Kind: BoolKind, Name: "bool", size: 1}
-	Str   = &Type{Kind: StrKind, Name: "str", size: 1}
+	Str   = &Type{Kind: StrKind, Name: "str", size: 2}
 )
 
 var Numeric = []*Type{I64, I32, U32, U16, U8, F64, F32}
@@ -92,6 +93,21 @@ func NewStruct(name string) *Type {
 
 func NewPointer(elem *Type) *Type {
 	return &Type{Kind: PointerKind, Name: fmt.Sprintf("*%s", elem), Elem: elem, size: 1}
+}
+
+func NewSlice(elem *Type) *Type {
+	return &Type{Kind: SliceKind, Name: fmt.Sprintf("[]%s", elem), Elem: elem, size: 3}
+}
+
+func (t *Type) Packed() bool {
+	return (t.Kind == IntKind || t.Kind == FloatKind) && t.Bits < 64
+}
+
+func (t *Type) Stride() int {
+	if t.Packed() {
+		return t.Bits / 8
+	}
+	return 8 * t.size
 }
 
 func NewResult(ok, err *Type) *Type {

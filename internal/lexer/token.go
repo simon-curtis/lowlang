@@ -10,6 +10,7 @@ const (
 	Ident
 	Int
 	Float
+	Char
 	String
 
 	Fn
@@ -29,9 +30,13 @@ const (
 	Catch
 	Struct
 	Mut
+	In
 
 	LParen
 	RParen
+	LBracket
+	RBracket
+	DotDot
 	LBrace
 	RBrace
 	Comma
@@ -76,11 +81,11 @@ const (
 )
 
 var names = map[Kind]string{
-	EOF: "end of file", Newline: "newline", Ident: "identifier", Int: "integer", Float: "float", String: "string",
+	EOF: "end of file", Newline: "newline", Ident: "identifier", Int: "integer", Float: "float", Char: "character", String: "string",
 	Fn: "fn", Let: "let", Var: "var", If: "if", Else: "else", For: "for",
 	Break: "break", Continue: "continue", Return: "return", True: "true", False: "false",
-	Enum: "enum", Match: "match", Fail: "fail", Catch: "catch", Struct: "struct", Mut: "mut",
-	LParen: "(", RParen: ")", LBrace: "{", RBrace: "}", Comma: ",", Colon: ":", Arrow: "->", FatArrow: "=>", Dot: ".", Question: "?",
+	Enum: "enum", Match: "match", Fail: "fail", Catch: "catch", Struct: "struct", Mut: "mut", In: "in",
+	LParen: "(", RParen: ")", LBracket: "[", RBracket: "]", DotDot: "..", LBrace: "{", RBrace: "}", Comma: ",", Colon: ":", Arrow: "->", FatArrow: "=>", Dot: ".", Question: "?",
 	Assign: "=", PlusAssign: "+=", MinusAssign: "-=", StarAssign: "*=", SlashAssign: "/=",
 	PercentAssign: "%=", AmpAssign: "&=", PipeAssign: "|=", CaretAssign: "^=", ShlAssign: "<<=", ShrAssign: ">>=",
 	Plus: "+", Minus: "-", Star: "*", Slash: "/", Percent: "%", Amp: "&", Pipe: "|", Caret: "^", Tilde: "~", Shl: "<<", Shr: ">>", Not: "!",
@@ -97,7 +102,7 @@ func (k Kind) String() string {
 var keywords = map[string]Kind{
 	"fn": Fn, "let": Let, "var": Var, "if": If, "else": Else, "for": For,
 	"break": Break, "continue": Continue, "return": Return, "true": True, "false": False,
-	"enum": Enum, "match": Match, "fail": Fail, "catch": Catch, "struct": Struct, "mut": Mut,
+	"enum": Enum, "match": Match, "fail": Fail, "catch": Catch, "struct": Struct, "mut": Mut, "in": In,
 }
 
 type Pos struct {
@@ -109,8 +114,15 @@ func (p Pos) String() string {
 	return fmt.Sprintf("%d:%d", p.Line, p.Col)
 }
 
-type Token struct {
-	Kind Kind
+type Part struct {
 	Text string
+	Expr bool
 	Pos  Pos
+}
+
+type Token struct {
+	Kind  Kind
+	Text  string
+	Parts []Part
+	Pos   Pos
 }

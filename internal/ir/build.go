@@ -18,6 +18,7 @@ type place struct {
 	word   int
 	addr   *Value
 	offset int
+	scalar *types.Type
 }
 
 type builder struct {
@@ -25,6 +26,7 @@ type builder struct {
 	cur   *Block
 	decl  *ast.Func
 	funcs map[*ast.Func]*Func
+	named map[string]*Func
 	slots map[*ast.Local]*Value
 	refs  map[*ast.Local]*Value
 	loops []loopTarget
@@ -34,9 +36,11 @@ type builder struct {
 func Build(file *ast.File) *Program {
 	p := &Program{}
 	funcs := map[*ast.Func]*Func{}
+	named := map[string]*Func{}
 	for _, d := range file.Funcs {
 		f := &Func{Name: d.Name, ParamWords: paramWords(d), ResultWords: d.RetType.Size()}
 		funcs[d] = f
+		named[d.Name] = f
 		p.Funcs = append(p.Funcs, f)
 		if d.Name == "main" {
 			p.Main = f
@@ -50,13 +54,41 @@ func Build(file *ast.File) *Program {
 			ssa:   newSSA(funcs[d]),
 			decl:  d,
 			funcs: funcs,
+			named: named,
 			slots: map[*ast.Local]*Value{},
 			refs:  map[*ast.Local]*Value{},
 		}
 		b.function()
 		b.finalize()
 	}
+	p.Funcs = reachable(p.Main, p.Funcs)
 	return p
+}
+
+func reachable(main *Func, funcs []*Func) []*Func {
+	seen := map[*Func]bool{}
+	var visit func(f *Func)
+	visit = func(f *Func) {
+		if seen[f] {
+			return
+		}
+		seen[f] = true
+		for _, b := range f.Blocks {
+			for _, v := range b.Values {
+				if v.Op == OpCall {
+					visit(v.Target)
+				}
+			}
+		}
+	}
+	visit(main)
+	var kept []*Func
+	for _, f := range funcs {
+		if seen[f] {
+			kept = append(kept, f)
+		}
+	}
+	return kept
 }
 
 func paramWords(d *ast.Func) int {
@@ -196,6 +228,10 @@ func (b *builder) place(p *ast.Place) place {
 	switch {
 	case p.Ptr != nil:
 		return place{addr: b.word(p.Ptr), offset: p.Offset}
+	case p.Index != nil:
+		element := b.element(p.Index)
+		element.offset += p.Offset
+		return element
 	case p.Local.Ref:
 		return place{addr: b.refs[p.Local], offset: p.Offset}
 	}
@@ -212,7 +248,7 @@ func (b *builder) load(p place, n int) []*Value {
 			words[k] = b.read(varKey{local: p.local, word: p.word + k}, b.cur)
 			continue
 		}
-		v := b.emit(OpLoad, p.addr)
+		v := b.typed(OpLoad, p.scalar, p.addr)
 		v.Aux = int64(p.offset + 8*k)
 		words[k] = v
 	}
@@ -225,7 +261,7 @@ func (b *builder) store(p place, words []*Value) {
 			b.write(varKey{local: p.local, word: p.word + k}, b.cur, w)
 			continue
 		}
-		v := b.emit(OpStore, p.addr, w)
+		v := b.typed(OpStore, p.scalar, p.addr, w)
 		v.Aux = int64(p.offset + 8*k)
 	}
 }
@@ -283,6 +319,8 @@ func (b *builder) stmt(s ast.Stmt) {
 		b.expr(s.X)
 	case *ast.For:
 		b.forStmt(s)
+	case *ast.ForIn:
+		b.forIn(s)
 	case *ast.Break:
 		b.jump(b.loops[len(b.loops)-1].brk)
 		b.dead()
@@ -367,7 +405,19 @@ func (b *builder) expr(e ast.Expr) []*Value {
 	case *ast.StrLit:
 		v := b.emit(OpString)
 		v.Str = e.Value
-		return []*Value{v}
+		return []*Value{v, b.constant(int64(len(e.Value)))}
+	case *ast.Index:
+		p, _ := ast.PlaceOf(e)
+		if p == nil {
+			p = &ast.Place{Index: e}
+		}
+		return b.load(b.place(p), e.Type.Size())
+	case *ast.Slicing:
+		return b.slicing(e)
+	case *ast.SliceLit:
+		return b.sliceLit(e)
+	case *ast.Interp:
+		return b.interpolate(e)
 	case *ast.Ident:
 		if e.Variant != nil {
 			return b.construct(e.Type, e.Variant, nil)
@@ -405,6 +455,9 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 	if e.Variant != nil {
 		return b.construct(e.Type, e.Variant, nil)
 	}
+	if e.Length {
+		return b.value(e.X, e.X.TypeOf())[1:2]
+	}
 	if p, ok := ast.PlaceOf(e); ok {
 		return b.load(b.place(p), e.Type.Size())
 	}
@@ -435,18 +488,12 @@ func (b *builder) binary(e *ast.Binary) []*Value {
 	if e.Op == lexer.AndAnd || e.Op == lexer.OrOr {
 		return b.logical(e)
 	}
+	if e.X.TypeOf() == types.Str {
+		return b.strings(e)
+	}
 	x := b.word(e.X)
 	y := b.word(e.Y)
-	if e.X.TypeOf() != types.Str {
-		return []*Value{b.typed(arith[e.Op], e.X.TypeOf(), x, y)}
-	}
-	call := b.emit(OpRuntime, x, y)
-	call.Str = "str_eq"
-	equal := b.result(call, 0)
-	if e.Op == lexer.NotEq {
-		return []*Value{b.emit(OpNot, equal)}
-	}
-	return []*Value{equal}
+	return []*Value{b.typed(arith[e.Op], e.X.TypeOf(), x, y)}
 }
 
 func (b *builder) logical(e *ast.Binary) []*Value {
@@ -480,9 +527,7 @@ func (b *builder) call(e *ast.Call) []*Value {
 	case e.Builtin == "exp":
 		return []*Value{b.exp(b.word(e.Args[0]), e.Type)}
 	case e.Builtin != "":
-		call := b.emit(OpRuntime, b.word(e.Args[0]))
-		call.Str = e.Builtin
-		return nil
+		return b.builtin(e)
 	case e.Variant != nil:
 		return b.construct(e.Type, e.Variant, e.Args)
 	}
@@ -507,11 +552,15 @@ func (b *builder) exp(x *Value, t *types.Type) *Value {
 func (b *builder) allocate(arg ast.Expr) *Value {
 	t := arg.TypeOf()
 	words := b.value(arg, t)
-	call := b.emit(OpRuntime, b.constant(int64(t.Size())))
-	call.Str = "alloc"
-	ptr := b.result(call, 0)
+	ptr := b.runtime("alloc", b.constant(int64(t.Size())))
 	b.store(place{addr: ptr}, words)
 	return ptr
+}
+
+func (b *builder) runtime(name string, args ...*Value) *Value {
+	call := b.emit(OpRuntime, args...)
+	call.Str = name
+	return b.result(call, 0)
 }
 
 func (b *builder) construct(enum *types.Type, v *types.Variant, args []ast.Expr) []*Value {

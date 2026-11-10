@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,8 +20,15 @@ type Unit struct {
 	Program *ir.Program
 }
 
+//go:embed prelude.low
+var preludeSource []byte
+
 func Analyse(path string) (*Unit, error) {
 	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	prelude, err := parsePrelude()
 	if err != nil {
 		return nil, err
 	}
@@ -32,10 +40,25 @@ func Analyse(path string) (*Unit, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s:%w", path, err)
 	}
+	file.Enums = append(prelude.Enums, file.Enums...)
+	file.Structs = append(prelude.Structs, file.Structs...)
+	file.Funcs = append(prelude.Funcs, file.Funcs...)
 	if err := check.Check(file); err != nil {
 		return nil, fmt.Errorf("%s:%w", path, err)
 	}
 	return &Unit{File: file, Program: ir.Build(file)}, nil
+}
+
+func parsePrelude() (*ast.File, error) {
+	tokens, err := lexer.LexPrelude(preludeSource)
+	if err != nil {
+		return nil, fmt.Errorf("prelude.low:%w", err)
+	}
+	file, err := parser.ParsePrelude(tokens)
+	if err != nil {
+		return nil, fmt.Errorf("prelude.low:%w", err)
+	}
+	return file, nil
 }
 
 func Assemble(ctx context.Context, asm, object string) error {

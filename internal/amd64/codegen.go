@@ -176,7 +176,7 @@ func (g *Generator) variantNames(enum *types.Type) string {
 	table := g.newLabel()
 	names := make([]string, len(enum.Variants))
 	for i, v := range enum.Variants {
-		names[i] = g.stringLabel(v.Name)
+		names[i] = g.messageLabel(v.Name)
 	}
 	fmt.Fprintf(&g.data, "\t.p2align 3\n%s:\n\t.quad %s\n", table, strings.Join(names, ","))
 	return table
@@ -190,7 +190,7 @@ func (g *Generator) stringLabel(s string) string {
 		return l
 	}
 	g.strings[l] = true
-	fmt.Fprintf(&g.data, "\t.p2align 3\n%s:\n\t.quad %d\n", l, len(s))
+	fmt.Fprintf(&g.data, "%s:\n", l)
 	if len(s) == 0 {
 		return l
 	}
@@ -199,6 +199,12 @@ func (g *Generator) stringLabel(s string) string {
 		bytes[i] = fmt.Sprintf("%d", s[i])
 	}
 	fmt.Fprintf(&g.data, "\t.byte %s\n", strings.Join(bytes, ","))
+	return l
+}
+
+func (g *Generator) messageLabel(s string) string {
+	l := g.newLabel()
+	fmt.Fprintf(&g.data, "\t.p2align 3\n%s:\n\t.quad %d\n\t.ascii %q\n", l, len(s), s)
 	return l
 }
 
@@ -402,15 +408,12 @@ func (g *Generator) instr(fr *frame, in *instr) {
 	case ir.OpEq, ir.OpNe, ir.OpLt, ir.OpLe, ir.OpGt, ir.OpGe:
 		g.compareValues(fr, in)
 	case ir.OpLoad:
-		g.move(fr.loc(in.dst), fmt.Sprintf("qword ptr [%s+%d]", g.base(fr.loc(in.args[0])), v.Aux))
+		g.load(fr, in)
 	case ir.OpStore:
-		base := g.base(fr.loc(in.args[0]))
-		value := fr.loc(in.args[1])
-		if isMem(value) {
-			g.move("r11", value)
-			value = "r11"
-		}
-		g.emit("mov qword ptr [%s+%d], %s", base, v.Aux, value)
+		g.store(fr, in)
+	case ir.OpCheck:
+		g.compare(fr, in.args[0], in.args[1])
+		g.emit("jae rt_panic_index")
 	case ir.OpSlot:
 		g.address(fr.loc(in.dst), fmt.Sprintf("[rbp%+d]", fr.slot(int(v.Aux))))
 	case ir.OpCall:
@@ -531,13 +534,11 @@ func (g *Generator) parallel(moves []pmove) {
 }
 
 func (g *Generator) runtimeCall(fr *frame, in *instr) {
-	scratch := []string{"r10", "r11"}
+	moves := make([]pmove, len(in.args))
 	for i, a := range in.args {
-		g.move(scratch[i], fr.loc(a))
+		moves[i] = pmove{dst: argRegs[i], src: fr.loc(a)}
 	}
-	for i := range in.args {
-		g.move([]string{"rdi", "rsi"}[i], scratch[i])
-	}
+	g.parallel(moves)
 	g.emit("call rt_%s", in.value.Str)
 }
 

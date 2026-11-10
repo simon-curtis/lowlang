@@ -2,7 +2,9 @@ package lexer
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 type Error struct {
@@ -15,16 +17,25 @@ func (e *Error) Error() string {
 }
 
 type Lexer struct {
-	src    []byte
-	off    int
-	line   int
-	col    int
-	last   Kind
-	tokens []Token
+	src     []byte
+	off     int
+	line    int
+	col     int
+	last    Kind
+	tokens  []Token
+	prelude bool
 }
 
 func Lex(src []byte) ([]Token, error) {
-	l := &Lexer{src: src, line: 1, col: 1, last: Newline}
+	return LexAt(src, Pos{Line: 1, Col: 1}, false)
+}
+
+func LexPrelude(src []byte) ([]Token, error) {
+	return LexAt(src, Pos{Line: 1, Col: 1}, true)
+}
+
+func LexAt(src []byte, at Pos, prelude bool) ([]Token, error) {
+	l := &Lexer{src: src, line: at.Line, col: at.Col, last: Newline, prelude: prelude}
 	if err := l.run(); err != nil {
 		return nil, err
 	}
@@ -75,7 +86,7 @@ func (l *Lexer) emit(t Token) {
 
 func (l *Lexer) emitNewline(p Pos) {
 	switch l.last {
-	case Ident, Int, Float, String, True, False, Break, Continue, Return, RParen, RBrace, Question:
+	case Ident, Int, Float, Char, String, True, False, Break, Continue, Return, RParen, RBrace, RBracket, Question:
 		l.emit(Token{Kind: Newline, Pos: p})
 	}
 }
@@ -104,28 +115,33 @@ func (l *Lexer) next() error {
 		l.advance()
 		return nil
 	case isLetter(c):
-		l.ident(start)
-		return nil
+		return l.ident(start)
 	case isDigit(c):
 		l.number(start)
 		return nil
 	case c == '"':
 		return l.string(start)
+	case c == '\'':
+		return l.char(start)
 	}
 	return l.operator(start)
 }
 
-func (l *Lexer) ident(start Pos) {
+func (l *Lexer) ident(start Pos) error {
 	from := l.off
 	for l.off < len(l.src) && (isLetter(l.peek(0)) || isDigit(l.peek(0))) {
 		l.advance()
 	}
 	text := string(l.src[from:l.off])
+	if strings.HasPrefix(text, "__") && !l.prelude {
+		return &Error{Pos: start, Msg: "names starting with __ are reserved"}
+	}
 	kind, ok := keywords[text]
 	if !ok {
 		kind = Ident
 	}
 	l.emit(Token{Kind: kind, Text: text, Pos: start})
+	return nil
 }
 
 func (l *Lexer) number(start Pos) {
@@ -166,34 +182,146 @@ func (l *Lexer) emitNumber(kind Kind, from int, start Pos) {
 	l.emit(Token{Kind: kind, Text: text, Pos: start})
 }
 
-var escapes = map[byte]byte{'n': '\n', 't': '\t', 'r': '\r', '0': 0, '\\': '\\', '"': '"'}
+var escapes = map[byte]byte{'n': '\n', 't': '\t', 'r': '\r', '0': 0, '\\': '\\', '"': '"', '\'': '\''}
+
+func (l *Lexer) unterminated() bool {
+	return l.off >= len(l.src) || l.peek(0) == '\n'
+}
+
+func (l *Lexer) escape(b *strings.Builder) error {
+	pos := l.pos()
+	l.advance()
+	if l.unterminated() {
+		return &Error{Pos: pos, Msg: "unterminated escape sequence"}
+	}
+	e, ok := escapes[l.advance()]
+	if !ok {
+		return &Error{Pos: pos, Msg: "unknown escape sequence"}
+	}
+	b.WriteByte(e)
+	return nil
+}
 
 func (l *Lexer) string(start Pos) error {
 	l.advance()
+	var parts []Part
 	var b strings.Builder
 	for {
-		if l.off >= len(l.src) || l.peek(0) == '\n' {
+		if l.unterminated() {
 			return &Error{Pos: start, Msg: "unterminated string"}
 		}
-		c := l.advance()
-		if c == '"' {
-			break
+		c, next := l.peek(0), l.peek(1)
+		switch {
+		case c == '"':
+			l.advance()
+			return l.emitString(start, parts, b.String())
+		case (c == '{' && next == '{') || (c == '}' && next == '}'):
+			l.advance()
+			b.WriteByte(l.advance())
+		case c == '}':
+			return &Error{Pos: l.pos(), Msg: "unmatched } in string; write }}"}
+		case c == '{':
+			parts = append(parts, Part{Text: b.String()})
+			b.Reset()
+			part, err := l.interpolation()
+			if err != nil {
+				return err
+			}
+			parts = append(parts, part)
+		case c == '\\':
+			if err := l.escape(&b); err != nil {
+				return err
+			}
+		default:
+			b.WriteByte(l.advance())
 		}
-		if c != '\\' {
-			b.WriteByte(c)
+	}
+}
+
+func (l *Lexer) emitString(start Pos, parts []Part, tail string) error {
+	if parts == nil {
+		l.emit(Token{Kind: String, Text: tail, Pos: start})
+		return nil
+	}
+	parts = append(parts, Part{Text: tail})
+	l.emit(Token{Kind: String, Parts: parts, Pos: start})
+	return nil
+}
+
+func (l *Lexer) interpolation() (Part, error) {
+	open := l.pos()
+	l.advance()
+	pos := l.pos()
+	from := l.off
+	depth := 0
+	for {
+		if l.unterminated() {
+			return Part{}, &Error{Pos: open, Msg: "unterminated interpolation"}
+		}
+		switch l.peek(0) {
+		case '{':
+			depth++
+		case '}':
+			if depth == 0 {
+				text := string(l.src[from:l.off])
+				l.advance()
+				if strings.TrimSpace(text) == "" {
+					return Part{}, &Error{Pos: open, Msg: "empty interpolation"}
+				}
+				return Part{Text: text, Expr: true, Pos: pos}, nil
+			}
+			depth--
+		case '"', '\'':
+			if err := l.skipQuoted(open); err != nil {
+				return Part{}, err
+			}
 			continue
 		}
-		escPos := l.pos()
-		if l.off >= len(l.src) {
-			return &Error{Pos: start, Msg: "unterminated string"}
-		}
-		e, ok := escapes[l.advance()]
-		if !ok {
-			return &Error{Pos: escPos, Msg: "unknown escape sequence"}
-		}
-		b.WriteByte(e)
+		l.advance()
 	}
-	l.emit(Token{Kind: String, Text: b.String(), Pos: start})
+}
+
+func (l *Lexer) skipQuoted(open Pos) error {
+	quote := l.advance()
+	for {
+		if l.unterminated() {
+			return &Error{Pos: open, Msg: "unterminated interpolation"}
+		}
+		c := l.advance()
+		if c == quote {
+			return nil
+		}
+		if c == '\\' && !l.unterminated() {
+			l.advance()
+		}
+	}
+}
+
+func (l *Lexer) char(start Pos) error {
+	l.advance()
+	var b strings.Builder
+	switch {
+	case l.unterminated() || l.peek(0) == '\'':
+		return &Error{Pos: start, Msg: "empty character literal"}
+	case l.peek(0) == '\\':
+		if err := l.escape(&b); err != nil {
+			return err
+		}
+	default:
+		r, size := utf8.DecodeRune(l.src[l.off:])
+		if r == utf8.RuneError {
+			return &Error{Pos: start, Msg: "invalid UTF-8 in character literal"}
+		}
+		for range size {
+			b.WriteByte(l.advance())
+		}
+	}
+	if l.unterminated() || l.peek(0) != '\'' {
+		return &Error{Pos: start, Msg: "character literal must hold one character"}
+	}
+	l.advance()
+	r, _ := utf8.DecodeRuneInString(b.String())
+	l.emit(Token{Kind: Char, Text: strconv.Itoa(int(r)), Pos: start})
 	return nil
 }
 
@@ -205,7 +333,7 @@ var operators = []struct {
 	{"->", Arrow}, {"=>", FatArrow}, {"%=", PercentAssign}, {"&=", AmpAssign}, {"|=", PipeAssign}, {"^=", CaretAssign},
 	{"<<", Shl}, {">>", Shr}, {"+=", PlusAssign}, {"-=", MinusAssign}, {"*=", StarAssign}, {"/=", SlashAssign},
 	{"&&", AndAnd}, {"||", OrOr}, {"==", Eq}, {"!=", NotEq}, {"<=", LtEq}, {">=", GtEq},
-	{"(", LParen}, {")", RParen}, {"{", LBrace}, {"}", RBrace}, {",", Comma}, {":", Colon}, {".", Dot}, {"?", Question},
+	{"..", DotDot}, {"(", LParen}, {")", RParen}, {"[", LBracket}, {"]", RBracket}, {"{", LBrace}, {"}", RBrace}, {",", Comma}, {":", Colon}, {".", Dot}, {"?", Question},
 	{"=", Assign}, {"+", Plus}, {"-", Minus}, {"*", Star}, {"/", Slash}, {"%", Percent},
 	{"!", Not}, {"<", Lt}, {">", Gt}, {"&", Amp}, {"|", Pipe}, {"^", Caret}, {"~", Tilde},
 }

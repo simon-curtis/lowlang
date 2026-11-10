@@ -1,6 +1,7 @@
 package amd64
 
 import (
+	"fmt"
 	"strconv"
 
 	"lowlang/internal/ir"
@@ -281,4 +282,48 @@ func (g *Generator) floatUnary(fr *frame, in *instr) {
 		g.emit("rounds%s xmm0, xmm0, 1", precision(t))
 	}
 	g.fromXmm(fr.loc(in.dst), t)
+}
+
+var widths = map[int]string{8: "byte", 16: "word", 32: "dword"}
+
+func (g *Generator) load(fr *frame, in *instr) {
+	t := in.value.Type
+	memory := fmt.Sprintf("[%s+%d]", g.base(fr.loc(in.args[0])), in.value.Aux)
+	dst := fr.loc(in.dst)
+	if t == nil {
+		g.move(dst, fmt.Sprintf("qword ptr %s", memory))
+		return
+	}
+	reg := dst
+	if !isReg(dst) {
+		reg = "r10"
+	}
+	sized := fmt.Sprintf("%s ptr %s", widths[t.Bits], memory)
+	switch {
+	case t.Integer() && t.Signed:
+		g.emit("movsxd %s, %s", reg, sized)
+	case t.Bits == 32:
+		g.emit("mov %s, %s", narrow[reg][0], sized)
+	default:
+		g.emit("movzx %s, %s", narrow[reg][0], sized)
+	}
+	g.move(dst, reg)
+}
+
+func (g *Generator) store(fr *frame, in *instr) {
+	t := in.value.Type
+	base := g.base(fr.loc(in.args[0]))
+	value := fr.loc(in.args[1])
+	if isMem(value) {
+		g.move("r11", value)
+		value = "r11"
+	}
+	width := "qword"
+	if t != nil {
+		width = widths[t.Bits]
+		if isReg(value) {
+			value = narrow[value][map[int]int{8: 2, 16: 1, 32: 0}[t.Bits]]
+		}
+	}
+	g.emit("mov %s ptr [%s+%d], %s", width, base, in.value.Aux, value)
 }

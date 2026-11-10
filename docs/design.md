@@ -38,9 +38,15 @@ fn add(a: i64, b: i64) -> i64 {
 if n > 0 { print(n) } else { print(0) }
 
 for i in 0..10 { print(i) }
+for x in xs { print(x) }
+for i, x in xs { print(i) }
 for n > 0 { n -= 1 }
 for { break }
 ```
+
+- `for i in a..b` counts from `a` up to but not including `b`; the bounds are integers of one type.
+- `for x in xs` visits each element of a slice, and `for i, x in xs` also binds its index as `i64`.
+- Loop variables are immutable. `continue` moves to the next element.
 
 ### Numbers
 
@@ -63,6 +69,45 @@ let byte = u8(300)
 - `%` is integer only. Floats follow IEEE 754: division by zero gives an infinity, and comparisons with NaN are false except `!=`.
 - `sqrt`, `floor` and `exp` take and return `f32` or `f64`.
 - `print` accepts any integer type.
+
+### Slices
+
+```low
+let xs = [3, 1, 4]
+var squares: []i64 = []
+push(mut squares, 9)
+let middle = xs[1..3]
+xs[0] = 10
+print(xs.len)
+```
+
+- `[]T` is a pointer, a length and a capacity over garbage-collected memory. Assigning or passing a slice shares its elements.
+- `[a, b]` builds a slice; an empty `[]` needs an expected type.
+- `xs[i]` reads or writes an element and panics when `i` is outside `0..xs.len`. Any integer type indexes.
+- `xs[a..b]`, `xs[..b]` and `xs[a..]` share the elements in that range. The result's capacity equals its length, so `push` onto it always copies and never overwrites the parent.
+- `push(mut xs, v)` appends, growing the capacity to twice plus four when full.
+- `xs.len` is the length as `i64`.
+- Elements of `u8`, `u16`, `u32`, `i32` and `f32` are packed at their natural width; other elements take a word each.
+
+### Strings
+
+```low
+let name = "Ada"
+let line = "{name} is {age}, ratio {score / 2.0}"
+let full = name + " Lovelace"
+for c in "héllo" { print(c) }
+let first: u8 = name[0]
+let copy = str(bytes(name))
+```
+
+- `str` is an immutable pointer and length over UTF-8 bytes.
+- `s.len` is the length in bytes, `s[i]` reads a byte as `u8`, and `s[a..b]` shares a byte range.
+- `for c in s` visits code points as `u32`, and `for i, c in s` also binds each code point's byte offset. Invalid UTF-8 yields U+FFFD for one byte.
+- `"{expr}"` interpolates a number, `bool` or `str`; `{{` and `}}` are literal braces. `a + b` concatenates.
+- Floats are formatted as the shortest decimal that reads back to the same value: positional for exponents from -6 to 20, otherwise `1.5e-7` or `1e+21`. Infinities print as `inf` and `-inf`, NaN as `NaN`.
+- `'a'` is a code point of type `u32`, or `u8` where one is expected.
+- `bytes(s)` copies a string into a `[]u8`; `str(b)` copies one back.
+- `==` and `!=` compare contents.
 
 ### Structs
 
@@ -247,6 +292,8 @@ The `low` command lives in `cmd/low`; the pipeline it shares with hot reload liv
 
 The runtime, `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls.
 
+`internal/compiler/prelude.low` is LowLang source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, integer formatting, and float formatting with Burger and Dybvig's free-format algorithm over big integers of 32-bit limbs. Its names start with `__`, which user code cannot use, and two intrinsics are available only there: `__bits` gives a float's bit pattern and `__str_view` turns a `[]u8` into a `str` without copying. Functions unreachable from `main` are dropped, so a program that formats no floats carries none of this code.
+
 The garbage collector is a non-moving mark-sweep collector in the runtime:
 
 - The heap is a 16 GB reservation made with `mmap` and `MAP_NORESERVE`; pages are committed as they are touched.
@@ -263,6 +310,8 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Narrow integers are kept sign-extended (`i32`) or zero-extended (`u32`, `u16`, `u8`) in their word; floats are kept as their bit pattern, `f32` zero-extended. Arithmetic, conversion and comparison values carry their type.
 - A variable passed as `mut` lives in a frame slot and is accessed with loads and stores; every other variable is pure SSA.
 - Integer division carries its zero and overflow checks inside the instruction.
+- A `str` is two words and a slice three. An element access computes `pointer + index * stride` after a `check` instruction, which compares unsigned and jumps to the index panic; packed elements load with `movzx`, `movsxd` or a 32-bit `mov` and store at their width.
+- `push` and the formatting helpers call the runtime's `rt_grow` and the prelude; the buffer behind an interpolation lives in a frame slot passed as a `mut` argument.
 - Unreachable blocks are pruned after construction.
 
 ### Code generation
@@ -305,21 +354,22 @@ Mechanism:
 
 ## Implemented
 
-- Types: `i64`, `i32`, `u32`, `u16`, `u8`, `f64`, `f32`, `bool`, `str`, structs, enums with payloads, results `T ! E`, pointers `*T`.
+- Types: `i64`, `i32`, `u32`, `u16`, `u8`, `f64`, `f32`, `bool`, `str`, slices `[]T`, structs, enums with payloads, results `T ! E`, pointers `*T`.
 - `let`, `var`, assignment, `if`/`else`, `for cond`, `for` with `break`/`continue`, `return`.
 - Functions with parameters and return values, recursion.
 - Arithmetic, comparison, logical, bitwise and shift operators; numeric conversions; `sqrt`, `floor` and `exp`.
 - `match`, `fail`, `?`, `catch`.
 - `mut` parameters.
 - Pointers, `new`, and a garbage-collected heap.
-- Builtins `print(i64)`, `print(str)`, `print(bool)`.
+- Range, slice and string loops; slice literals, indexing, slicing and `push`; string interpolation, concatenation and comparison.
+- Builtins `print` for numbers, `bool` and `str`; `bytes` and `str`.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. Slices; byte-level strings with length, UTF-8 iteration, a string builder and number formatting; maps.
-2. Optionals.
+1. Optionals.
+2. Maps `[K: V]` over integer, `bool`, `str` and pointer keys: literals `[k: v]` and `[:]`, `m[k]` returning `V?`, `m[k] = v`, `delete(mut m, k)`, iteration in insertion order. Assigning a map shares it.
 3. Modules and visibility.
 4. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
 5. Embedded data: Unicode tables, SPIR-V and a fallback font.

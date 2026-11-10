@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -26,10 +27,18 @@ type Parser struct {
 	tokens   []lexer.Token
 	i        int
 	noStruct bool
+	prelude  bool
 }
 
-func Parse(tokens []lexer.Token) (file *ast.File, err error) {
-	p := &Parser{tokens: tokens}
+func Parse(tokens []lexer.Token) (*ast.File, error) {
+	return parse(&Parser{tokens: tokens})
+}
+
+func ParsePrelude(tokens []lexer.Token) (*ast.File, error) {
+	return parse(&Parser{tokens: tokens, prelude: true})
+}
+
+func parse(p *Parser) (file *ast.File, err error) {
 	defer func() {
 		r := recover()
 		if r == nil {
@@ -217,13 +226,16 @@ func (p *Parser) param() *ast.Param {
 
 func (p *Parser) typeName() *ast.TypeName {
 	pos := p.tok().Pos
-	pointers := 0
-	for p.at(lexer.Star) {
+	switch {
+	case p.at(lexer.Star):
 		p.next()
-		pointers++
+		return &ast.TypeName{Pointer: true, Elem: p.typeName(), Pos: pos}
+	case p.at(lexer.LBracket):
+		p.next()
+		p.expect(lexer.RBracket)
+		return &ast.TypeName{Slice: true, Elem: p.typeName(), Pos: pos}
 	}
-	t := p.expect(lexer.Ident)
-	return &ast.TypeName{Name: t.Text, Pointers: pointers, Pos: pos}
+	return &ast.TypeName{Name: p.expect(lexer.Ident).Text, Pos: pos}
 }
 
 func (p *Parser) block() *ast.Block {
@@ -252,6 +264,9 @@ func (p *Parser) stmt() ast.Stmt {
 		return p.let()
 	case lexer.For:
 		p.next()
+		if p.at(lexer.Ident) && (p.peek() == lexer.In || p.peek() == lexer.Comma) {
+			return p.forIn(t.Pos)
+		}
 		var cond ast.Expr
 		if !p.at(lexer.LBrace) {
 			cond = p.condition()
@@ -280,6 +295,23 @@ func (p *Parser) stmt() ast.Stmt {
 		return &ast.Assign{Target: x, Op: op, Value: p.expr(), Pos: t.Pos}
 	}
 	return &ast.ExprStmt{X: x}
+}
+
+func (p *Parser) forIn(pos lexer.Pos) *ast.ForIn {
+	loop := &ast.ForIn{Value: p.expect(lexer.Ident).Text, Pos: pos}
+	if p.at(lexer.Comma) {
+		p.next()
+		loop.Key = loop.Value
+		loop.Value = p.expect(lexer.Ident).Text
+	}
+	p.expect(lexer.In)
+	loop.Iter = p.condition()
+	if p.at(lexer.DotDot) {
+		p.next()
+		loop.End = p.condition()
+	}
+	loop.Body = p.block()
+	return loop
 }
 
 func (p *Parser) let() *ast.Let {
@@ -371,7 +403,16 @@ func (p *Parser) primary() ast.Expr {
 		return p.number(t, false, t.Pos)
 	case lexer.String:
 		p.next()
+		if t.Parts != nil {
+			return p.interpolation(t)
+		}
 		return &ast.StrLit{Value: t.Text, Pos: t.Pos}
+	case lexer.Char:
+		p.next()
+		code, _ := strconv.ParseInt(t.Text, 10, 64)
+		return &ast.IntLit{Value: code, Char: true, Pos: t.Pos}
+	case lexer.LBracket:
+		return p.sliceLit()
 	case lexer.True, lexer.False:
 		p.next()
 		return &ast.BoolLit{Value: t.Kind == lexer.True, Pos: t.Pos}
@@ -398,6 +439,76 @@ func (p *Parser) primary() ast.Expr {
 	}
 	p.fail(t.Pos, "expected expression, found %s", describe(t))
 	return nil
+}
+
+func (p *Parser) interpolation(t lexer.Token) *ast.Interp {
+	n := &ast.Interp{Pos: t.Pos}
+	for _, part := range t.Parts {
+		if !part.Expr {
+			n.Parts = append(n.Parts, &ast.StrLit{Value: part.Text, Pos: t.Pos})
+			continue
+		}
+		tokens, err := lexer.LexAt([]byte(part.Text), part.Pos, p.prelude)
+		if err != nil {
+			var lexErr *lexer.Error
+			if errors.As(err, &lexErr) {
+				p.fail(lexErr.Pos, "%s", lexErr.Msg)
+			}
+			p.fail(part.Pos, "%v", err)
+		}
+		inner := &Parser{tokens: tokens, prelude: p.prelude}
+		x := inner.expr()
+		inner.skipNewlines()
+		if !inner.at(lexer.EOF) {
+			inner.fail(inner.tok().Pos, "unexpected %s in interpolation", describe(inner.tok()))
+		}
+		n.Parts = append(n.Parts, x)
+	}
+	return n
+}
+
+func (p *Parser) sliceLit() *ast.SliceLit {
+	lit := &ast.SliceLit{Pos: p.expect(lexer.LBracket).Pos}
+	p.nested(func() {
+		p.skipNewlines()
+		for !p.at(lexer.RBracket) {
+			lit.Elems = append(lit.Elems, p.expr())
+			if p.at(lexer.Comma) {
+				p.next()
+			} else if !p.at(lexer.RBracket) {
+				p.expect(lexer.Newline)
+			}
+			p.skipNewlines()
+		}
+	})
+	p.expect(lexer.RBracket)
+	return lit
+}
+
+func (p *Parser) index(x ast.Expr) ast.Expr {
+	pos := p.expect(lexer.LBracket).Pos
+	var lo, hi ast.Expr
+	sliced := false
+	p.nested(func() {
+		if !p.at(lexer.DotDot) {
+			lo = p.expr()
+		}
+		if p.at(lexer.DotDot) {
+			p.next()
+			sliced = true
+			if !p.at(lexer.RBracket) {
+				hi = p.expr()
+			}
+		}
+	})
+	p.expect(lexer.RBracket)
+	if sliced {
+		return &ast.Slicing{X: x, Lo: lo, Hi: hi, Pos: pos}
+	}
+	if lo == nil {
+		p.fail(pos, "missing index")
+	}
+	return &ast.Index{X: x, Index: lo, Pos: pos}
 }
 
 func (p *Parser) structLit(name lexer.Token) *ast.StructLit {
@@ -446,6 +557,8 @@ func (p *Parser) postfix(x ast.Expr) ast.Expr {
 		case lexer.Question:
 			p.next()
 			x = &ast.Try{X: x, Pos: t.Pos}
+		case lexer.LBracket:
+			x = p.index(x)
 		case lexer.Catch:
 			p.next()
 			x = p.catch(x, t.Pos)

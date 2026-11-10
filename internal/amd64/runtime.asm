@@ -14,6 +14,9 @@ rt_error_prefix:
 rt_msg_divzero:
 	.quad 22
 	.ascii "integer divide by zero"
+rt_msg_index:
+	.quad 18
+	.ascii "index out of range"
 rt_msg_oom:
 	.quad 13
 	.ascii "out of memory"
@@ -72,8 +75,8 @@ rt_write:
 
 	.globl rt_print_str
 rt_print_str:
-	mov rdx, [rdi]
-	lea rsi, [rdi+8]
+	mov rdx, rsi
+	mov rsi, rdi
 	mov edi, 1
 	call rt_write
 	mov edi, 1
@@ -127,17 +130,33 @@ rt_print_i64:
 
 	.globl rt_str_eq
 rt_str_eq:
-	mov rcx, [rdi]
 	xor eax, eax
-	cmp rcx, [rsi]
+	cmp rsi, rcx
 	jne 1f
-	add rdi, 8
-	add rsi, 8
+	mov rsi, rdx
 	test rcx, rcx
 	repe cmpsb
 	sete al
 1:
 	ret
+
+	.globl rt_grow
+rt_grow:
+	push rdi
+	push rsi
+	lea rdi, [rdx+7]
+	shr rdi, 3
+	call rt_alloc
+	pop rcx
+	pop rsi
+	mov rdi, rax
+	rep movsb
+	ret
+
+	.globl rt_panic_index
+rt_panic_index:
+	lea rdi, [rip+rt_msg_index]
+	jmp rt_panic
 
 rt_die:
 	push rdi
