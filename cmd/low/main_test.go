@@ -106,6 +106,7 @@ func TestRunWindows(t *testing.T) {
 	})
 	for _, path := range append(paths, fixtures(t, "windows")...) {
 		t.Run(filepath.Base(path), func(t *testing.T) {
+			t.Parallel()
 			runWindowsFixture(t, wine, path)
 		})
 	}
