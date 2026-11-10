@@ -1,0 +1,279 @@
+import std/serde
+
+struct Frame {
+    items: []*Node
+    pairs: []Pair
+    index: i64
+}
+
+struct Cursor {
+    pending: *Node?
+    frames: []*Frame
+    line: i64
+}
+
+fn pending_node(c: *Cursor) -> *Node ! serde.Error {
+    match c.pending {
+        some(n) => {
+            c.pending = none
+            c.line = n.line
+            n
+        }
+        none => fail serde.Error.Syntax(c.line, "no value to read")
+    }
+}
+
+fn mismatch(c: *Cursor, what: str) -> serde.Error {
+    serde.Error.Mismatch(what, c.line)
+}
+
+fn top_frame(c: *Cursor) -> *Frame ! serde.Error {
+    if c.frames.len == 0 {
+        fail serde.Error.Syntax(c.line, "no open sequence or mapping")
+    }
+    c.frames[c.frames.len - 1]
+}
+
+fn pop_frame(c: *Cursor) {
+    c.frames = c.frames[..c.frames.len - 1]
+}
+
+fn key_text(n: *Node) -> str? {
+    match n.value {
+        Str(s) => s
+        Int(v) => "{v}"
+        Bool(b) => if b { "true" } else { "false" }
+        Float(x) => "{x}"
+        Null => "null"
+        _ => none
+    }
+}
+
+fn node_reader(c: *Cursor) -> serde.Reader {
+    serde.Reader {
+        null: fn() -> bool ! serde.Error {
+            match c.pending {
+                some(n) => {
+                    if is_null(n) {
+                        pending_node(c)?
+                        return true
+                    }
+                    false
+                }
+                none => false
+            }
+        }
+        boolean: fn() -> bool ! serde.Error {
+            match pending_node(c)?.value {
+                Bool(b) => b
+                _ => fail mismatch(c, "bool")
+            }
+        }
+        integer: fn() -> i64 ! serde.Error {
+            match pending_node(c)?.value {
+                Int(v) => v
+                _ => fail mismatch(c, "integer")
+            }
+        }
+        unsigned: fn() -> u64 ! serde.Error {
+            match pending_node(c)?.value {
+                Int(v) => {
+                    if v < 0 {
+                        fail serde.Error.Range(c.line)
+                    }
+                    u64(v)
+                }
+                _ => fail mismatch(c, "integer")
+            }
+        }
+        float: fn() -> f64 ! serde.Error {
+            match pending_node(c)?.value {
+                Float(x) => x
+                Int(v) => f64(v)
+                _ => fail mismatch(c, "float")
+            }
+        }
+        text: fn() -> str ! serde.Error {
+            match pending_node(c)?.value {
+                Str(s) => s
+                _ => fail mismatch(c, "string")
+            }
+        }
+        binary: fn() -> []u8 ! serde.Error {
+            match pending_node(c)?.value {
+                Binary(data) => data
+                _ => fail mismatch(c, "binary")
+            }
+        }
+        begin_seq: fn() ! serde.Error {
+            match pending_node(c)?.value {
+                Seq(items) => push(mut c.frames, new(Frame { items, pairs: [], index: 0 }))
+                _ => fail mismatch(c, "sequence")
+            }
+        }
+        next_element: fn() -> bool ! serde.Error {
+            let f = top_frame(c)?
+            if f.index >= f.items.len {
+                pop_frame(c)
+                return false
+            }
+            c.pending = f.items[f.index]
+            f.index += 1
+            true
+        }
+        begin_map: fn() ! serde.Error {
+            match pending_node(c)?.value {
+                Map(pairs) => push(mut c.frames, new(Frame { items: [], pairs, index: 0 }))
+                _ => fail mismatch(c, "mapping")
+            }
+        }
+        next_key: fn() -> str? ! serde.Error {
+            let f = top_frame(c)?
+            if f.index >= f.pairs.len {
+                pop_frame(c)
+                return none
+            }
+            let p = f.pairs[f.index]
+            f.index += 1
+            c.line = p.key.line
+            let k = match key_text(p.key) {
+                some(found) => found
+                none => fail mismatch(c, "scalar key")
+            }
+            c.pending = p.value
+            k
+        }
+        begin_variant: fn() -> str ! serde.Error {
+            let n = pending_node(c)?
+            match n.value {
+                Str(name) => name
+                Map(pairs) => {
+                    if pairs.len != 1 {
+                        fail mismatch(c, "mapping with one key naming the variant")
+                    }
+                    let name = match pairs[0].key.value {
+                        Str(found) => found
+                        _ => fail mismatch(c, "variant name")
+                    }
+                    c.pending = pairs[0].value
+                    name
+                }
+                _ => fail mismatch(c, "variant")
+            }
+        }
+        end_variant: fn() ! serde.Error {}
+        skip: fn() ! serde.Error {
+            pending_node(c)?
+        }
+        position: fn() -> i64 { c.line }
+    }
+}
+
+pub fn from_node[T](n: *Node) -> T ! serde.Error {
+    let c = new(Cursor { pending: n, frames: [], line: n.line })
+    serde.read(node_reader(c))
+}
+
+pub fn deserialize[T](source: str) -> T ! serde.Error {
+    deserialize_with(source, Options {})
+}
+
+pub fn deserialize_with[T](source: str, options: Options) -> T ! serde.Error {
+    let n = parse_with(source, options) catch {
+        Syntax(line, column, message) => fail serde.Error.Syntax(line, "{message} at line {line}, column {column}")
+        TooManyNodes(line, column) => fail serde.Error.Syntax(line, "alias expansion exceeds the node budget at line {line}, column {column}")
+    }
+    from_node(n)
+}
+
+struct Build {
+    sequence: bool
+    items: []*Node
+    pairs: []Pair
+    key: *Node
+}
+
+struct Builder {
+    frames: []*Build
+    result: *Node?
+    failure: serde.Error?
+}
+
+fn deliver(b: *Builder, v: Value) {
+    let n = node(v)
+    if b.frames.len == 0 {
+        b.result = n
+        return
+    }
+    let top = b.frames[b.frames.len - 1]
+    if top.sequence {
+        push(mut top.items, n)
+    } else {
+        push(mut top.pairs, Pair { key: top.key, value: n })
+    }
+}
+
+fn open_frame(b: *Builder, sequence: bool, key: str) {
+    let items: []*Node = []
+    let pairs: []Pair = []
+    push(mut b.frames, new(Build { sequence, items, pairs, key: node(Str(key)) }))
+}
+
+fn close_frame(b: *Builder) {
+    let top = b.frames[b.frames.len - 1]
+    b.frames = b.frames[..b.frames.len - 1]
+    if top.sequence {
+        deliver(b, Seq(top.items))
+    } else {
+        deliver(b, Map(top.pairs))
+    }
+}
+
+fn set_key(b: *Builder, k: str) {
+    b.frames[b.frames.len - 1].key = node(Str(k))
+}
+
+fn node_writer(b: *Builder) -> serde.Writer {
+    serde.Writer {
+        null: fn() { deliver(b, Null) }
+        boolean: fn(v) { deliver(b, Bool(v)) }
+        integer: fn(n) { deliver(b, Int(n)) }
+        unsigned: fn(n) {
+            if n > 0x7FFFFFFFFFFFFFFF {
+                if b.failure == none {
+                    b.failure = serde.Error.Range(0)
+                }
+            }
+            deliver(b, Int(i64(n)))
+        }
+        float: fn(x) { deliver(b, Float(x)) }
+        text: fn(s) { deliver(b, Str(s)) }
+        binary: fn(data) { deliver(b, Binary(data)) }
+        begin_seq: fn(n) { open_frame(b, true, "") }
+        end_seq: fn() { close_frame(b) }
+        begin_map: fn(n) { open_frame(b, false, "") }
+        key: fn(k) { set_key(b, k) }
+        end_map: fn() { close_frame(b) }
+        begin_struct: fn(name, n) { open_frame(b, false, "") }
+        field: fn(name) { set_key(b, name) }
+        end_struct: fn() { close_frame(b) }
+        unit_variant: fn(e, v) { deliver(b, Str(v)) }
+        begin_variant: fn(e, v, n) { open_frame(b, false, v) }
+        end_variant: fn() { close_frame(b) }
+    }
+}
+
+pub fn to_node[T](v: T) -> *Node ! serde.Error {
+    let b = new(Builder { frames: [], result: none, failure: none })
+    serde.write(v, node_writer(b))
+    match b.failure {
+        some(e) => fail e
+        none => {}
+    }
+    b.result ?? node(Null)
+}
+
+pub fn serialize[T](v: T) -> str ! serde.Error {
+    let n = to_node(v)?
+    encode(n)
+}

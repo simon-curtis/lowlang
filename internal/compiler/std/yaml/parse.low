@@ -1,0 +1,364 @@
+struct Parser {
+    tokens: []Token
+    pos: i64
+    events: []Event
+    handles: [str: str]
+    depth: i64
+    max_depth: i64
+}
+
+pub fn events(source: str) -> []Event ! Error {
+    events_with(source, Options {})
+}
+
+pub fn events_with(source: str, options: Options) -> []Event ! Error {
+    let tokens = scan(source)?
+    let p = new(Parser { tokens, pos: 0, events: [], handles: [:], depth: 0, max_depth: options.max_depth })
+    stream(p)?
+    p.events
+}
+
+fn peek(p: *Parser) -> Token {
+    p.tokens[p.pos]
+}
+
+fn kind(p: *Parser) -> TokenKind {
+    p.tokens[p.pos].kind
+}
+
+fn is(p: *Parser, k: TokenKind) -> bool {
+    p.tokens[p.pos].kind == k
+}
+
+fn take(p: *Parser) -> Token {
+    let t = p.tokens[p.pos]
+    if t.kind != StreamEnd {
+        p.pos += 1
+    }
+    t
+}
+
+fn error_token(t: Token, message: str) -> Error {
+    Syntax(t.line + 1, t.column + 1, message)
+}
+
+fn emit(p: *Parser, e: Event) {
+    push(mut p.events, e)
+}
+
+fn stream(p: *Parser) ! Error {
+    emit(p, Event { kind: StreamStart, line: 1, column: 1 })
+    var open_ended = true
+    for {
+        for is(p, DocumentEnd) {
+            take(p)
+            open_ended = true
+        }
+        if is(p, StreamEnd) {
+            break
+        }
+        let directives = is(p, VersionDirective) || is(p, TagDirective)
+        if directives && !open_ended {
+            fail error_token(peek(p), "directives must follow a document end marker")
+        }
+        open_ended = document(p)?
+    }
+    let t = peek(p)
+    emit(p, Event { kind: StreamEnd, line: t.line + 1, column: t.column + 1 })
+}
+
+fn document(p: *Parser) -> bool ! Error {
+    p.handles = [:]
+    var version = false
+    var directives = false
+    for is(p, VersionDirective) || is(p, TagDirective) {
+        let t = take(p)
+        directives = true
+        if t.kind == VersionDirective {
+            if version {
+                fail error_token(t, "found a duplicate %YAML directive")
+            }
+            version = true
+            if t.text[0] != '1' || t.text[1] != '.' {
+                fail error_token(t, "found an incompatible YAML document")
+            }
+        } else {
+            match p.handles[t.text] {
+                some(_) => fail error_token(t, "found a duplicate %TAG directive")
+                none => {}
+            }
+            p.handles[t.text] = t.suffix
+        }
+    }
+    let start = peek(p)
+    let explicit = start.kind == DocumentStart
+    if directives && !explicit {
+        fail error_token(start, "did not find expected <document start>")
+    }
+    if explicit {
+        take(p)
+    }
+    emit(p, Event { kind: DocumentStart, explicit, line: start.line + 1, column: start.column + 1 })
+    let k = kind(p)
+    if explicit && (k == DocumentStart || k == DocumentEnd || k == StreamEnd || k == VersionDirective || k == TagDirective) {
+        empty_scalar(p, peek(p), "", "")
+    } else {
+        parse_node(p, true, false)?
+    }
+    let t = peek(p)
+    if t.kind == DocumentEnd {
+        take(p)
+        emit(p, Event { kind: DocumentEnd, explicit: true, line: t.line + 1, column: t.column + 1 })
+        return true
+    }
+    if t.kind != DocumentStart && t.kind != StreamEnd {
+        fail error_token(t, "did not find expected <document start>")
+    }
+    emit(p, Event { kind: DocumentEnd, line: t.line + 1, column: t.column + 1 })
+    t.kind == StreamEnd
+}
+
+fn empty_scalar(p: *Parser, at: Token, anchor: str, tag: str) {
+    emit(p, Event { kind: Scalar, anchor, tag, line: at.line + 1, column: at.column + 1 })
+}
+
+fn resolve_tag(p: *Parser, t: Token) -> str ! Error {
+    if t.text.len == 0 {
+        return t.suffix
+    }
+    match p.handles[t.text] {
+        some(prefix) => return "{prefix}{t.suffix}"
+        none => {}
+    }
+    if t.text == "!" {
+        return "!{t.suffix}"
+    }
+    if t.text == "!!" {
+        return "tag:yaml.org,2002:{t.suffix}"
+    }
+    fail error_token(t, "found an undefined tag handle")
+}
+
+fn enter(p: *Parser, t: Token) ! Error {
+    p.depth += 1
+    if p.depth > p.max_depth {
+        fail error_token(t, "exceeded the maximum nesting depth")
+    }
+}
+
+fn parse_node(p: *Parser, block: bool, indentless: bool) ! Error {
+    let start = peek(p)
+    if start.kind == Alias {
+        take(p)
+        emit(p, Event { kind: Alias, anchor: start.text, line: start.line + 1, column: start.column + 1 })
+        return
+    }
+    var anchor = ""
+    var tag = ""
+    var has_anchor = false
+    var has_tag = false
+    for is(p, Anchor) || is(p, Tag) {
+        let t = take(p)
+        if t.kind == Anchor {
+            if has_anchor {
+                fail error_token(t, "found a second anchor on one node")
+            }
+            has_anchor = true
+            anchor = t.text
+        } else {
+            if has_tag {
+                fail error_token(t, "found a second tag on one node")
+            }
+            has_tag = true
+            tag = resolve_tag(p, t)?
+        }
+    }
+    let t = peek(p)
+    let k = t.kind
+    if indentless && k == BlockEntry {
+        indentless_sequence(p, anchor, tag, t)?
+    } else if k == Scalar {
+        take(p)
+        emit(p, Event { kind: Scalar, anchor, tag, value: t.text, style: t.style, line: t.line + 1, column: t.column + 1 })
+    } else if k == FlowSequenceStart {
+        flow_sequence(p, anchor, tag)?
+    } else if k == FlowMappingStart {
+        flow_mapping(p, anchor, tag)?
+    } else if block && k == BlockSequenceStart {
+        block_sequence(p, anchor, tag)?
+    } else if block && k == BlockMappingStart {
+        block_mapping(p, anchor, tag)?
+    } else if has_anchor || has_tag {
+        empty_scalar(p, start, anchor, tag)
+    } else {
+        fail error_token(t, "did not find expected node content")
+    }
+}
+
+fn block_sequence(p: *Parser, anchor: str, tag: str) ! Error {
+    let start = take(p)
+    enter(p, start)?
+    emit(p, Event { kind: SequenceStart, anchor, tag, style: Block, line: start.line + 1, column: start.column + 1 })
+    for {
+        let t = peek(p)
+        if t.kind == BlockEnd {
+            take(p)
+            break
+        }
+        if t.kind != BlockEntry {
+            fail error_token(t, "did not find expected '-' indicator")
+        }
+        take(p)
+        if is(p, BlockEntry) || is(p, BlockEnd) {
+            empty_scalar(p, t, "", "")
+        } else {
+            parse_node(p, true, false)?
+        }
+    }
+    p.depth -= 1
+    let end = peek(p)
+    emit(p, Event { kind: SequenceEnd, line: end.line + 1, column: end.column + 1 })
+}
+
+fn indentless_sequence(p: *Parser, anchor: str, tag: str, start: Token) ! Error {
+    enter(p, start)?
+    emit(p, Event { kind: SequenceStart, anchor, tag, style: Block, line: start.line + 1, column: start.column + 1 })
+    for is(p, BlockEntry) {
+        let t = take(p)
+        let k = kind(p)
+        if k == BlockEntry || k == Key || k == Value || k == BlockEnd {
+            empty_scalar(p, t, "", "")
+        } else {
+            parse_node(p, true, false)?
+        }
+    }
+    p.depth -= 1
+    let end = peek(p)
+    emit(p, Event { kind: SequenceEnd, line: end.line + 1, column: end.column + 1 })
+}
+
+fn block_mapping(p: *Parser, anchor: str, tag: str) ! Error {
+    let start = take(p)
+    enter(p, start)?
+    emit(p, Event { kind: MappingStart, anchor, tag, style: Block, line: start.line + 1, column: start.column + 1 })
+    for {
+        let t = peek(p)
+        if t.kind == BlockEnd {
+            take(p)
+            break
+        }
+        if t.kind == Key {
+            take(p)
+            let k = kind(p)
+            if k == Key || k == Value || k == BlockEnd {
+                empty_scalar(p, t, "", "")
+            } else {
+                parse_node(p, true, true)?
+            }
+        } else if t.kind == Value {
+            empty_scalar(p, t, "", "")
+        } else {
+            fail error_token(t, "did not find expected key")
+        }
+        let v = peek(p)
+        if v.kind == Value {
+            take(p)
+            let k = kind(p)
+            if k == Key || k == Value || k == BlockEnd {
+                empty_scalar(p, v, "", "")
+            } else {
+                parse_node(p, true, true)?
+            }
+        } else {
+            empty_scalar(p, v, "", "")
+        }
+    }
+    p.depth -= 1
+    let end = peek(p)
+    emit(p, Event { kind: MappingEnd, line: end.line + 1, column: end.column + 1 })
+}
+
+fn flow_pair_value(p: *Parser, close: TokenKind) ! Error {
+    let v = peek(p)
+    if v.kind != Value {
+        empty_scalar(p, v, "", "")
+        return
+    }
+    take(p)
+    let k = kind(p)
+    if k == FlowEntry || k == close {
+        empty_scalar(p, v, "", "")
+    } else {
+        parse_node(p, false, false)?
+    }
+}
+
+fn flow_pair_key(p: *Parser, close: TokenKind) ! Error {
+    let t = peek(p)
+    if t.kind == Key {
+        take(p)
+        let k = kind(p)
+        if k == Value || k == FlowEntry || k == close {
+            empty_scalar(p, t, "", "")
+        } else {
+            parse_node(p, false, false)?
+        }
+    } else if t.kind == Value {
+        empty_scalar(p, t, "", "")
+    } else {
+        parse_node(p, false, false)?
+    }
+}
+
+fn flow_separator(p: *Parser, close: TokenKind, first: bool) -> bool ! Error {
+    if is(p, close) {
+        return false
+    }
+    if !first {
+        if !is(p, FlowEntry) {
+            fail error_token(peek(p), "did not find expected ',' or the end of a flow collection")
+        }
+        take(p)
+        if is(p, close) {
+            return false
+        }
+    }
+    true
+}
+
+fn flow_sequence(p: *Parser, anchor: str, tag: str) ! Error {
+    let start = take(p)
+    enter(p, start)?
+    emit(p, Event { kind: SequenceStart, anchor, tag, style: Flow, line: start.line + 1, column: start.column + 1 })
+    var first = true
+    for flow_separator(p, FlowSequenceEnd, first)? {
+        first = false
+        let t = peek(p)
+        if t.kind == Key || t.kind == Value {
+            emit(p, Event { kind: MappingStart, style: Flow, line: t.line + 1, column: t.column + 1 })
+            flow_pair_key(p, FlowSequenceEnd)?
+            flow_pair_value(p, FlowSequenceEnd)?
+            emit(p, Event { kind: MappingEnd, line: t.line + 1, column: t.column + 1 })
+        } else {
+            parse_node(p, false, false)?
+        }
+    }
+    p.depth -= 1
+    let end = take(p)
+    emit(p, Event { kind: SequenceEnd, line: end.line + 1, column: end.column + 1 })
+}
+
+fn flow_mapping(p: *Parser, anchor: str, tag: str) ! Error {
+    let start = take(p)
+    enter(p, start)?
+    emit(p, Event { kind: MappingStart, anchor, tag, style: Flow, line: start.line + 1, column: start.column + 1 })
+    var first = true
+    for flow_separator(p, FlowMappingEnd, first)? {
+        first = false
+        flow_pair_key(p, FlowMappingEnd)?
+        flow_pair_value(p, FlowMappingEnd)?
+    }
+    p.depth -= 1
+    let end = take(p)
+    emit(p, Event { kind: MappingEnd, line: end.line + 1, column: end.column + 1 })
+}

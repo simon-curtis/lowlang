@@ -1,0 +1,1265 @@
+import std/simd
+
+enum TokenKind {
+    StreamEnd
+    VersionDirective
+    TagDirective
+    DocumentStart
+    DocumentEnd
+    BlockSequenceStart
+    BlockMappingStart
+    BlockEnd
+    FlowSequenceStart
+    FlowSequenceEnd
+    FlowMappingStart
+    FlowMappingEnd
+    BlockEntry
+    FlowEntry
+    Key
+    Value
+    Alias
+    Anchor
+    Tag
+    Scalar
+}
+
+struct Token {
+    kind: TokenKind
+    line: i64
+    column: i64
+    text: str = ""
+    suffix: str = ""
+    style: Style = Plain
+}
+
+struct SimpleKey {
+    possible: bool
+    required: bool
+    index: i64
+    pos: i64
+    line: i64
+    column: i64
+    tabbed: bool
+}
+
+struct Mark {
+    pos: i64
+    line: i64
+    line_start: i64
+    wide: i64
+}
+
+struct Scanner {
+    src: str
+    pos: i64
+    line: i64
+    line_start: i64
+    wide: i64
+    tokens: []Token
+    indent: i64
+    indents: []i64
+    allowed: bool
+    keys: []SimpleKey
+    flow: i64
+    json: bool
+    kinds: []u8
+    token_line: i64
+    spaces: i64
+    tabbed: bool
+    done: bool
+}
+
+fn no_key() -> SimpleKey {
+    SimpleKey { possible: false, required: false, index: 0, pos: 0, line: 0, column: 0, tabbed: false }
+}
+
+fn scan(source: str) -> []Token ! Error {
+    let src = prepared(source)?
+    let s = new(Scanner {
+        src
+        pos: 0
+        line: 0
+        line_start: 0
+        wide: 0
+        tokens: []
+        indent: -1
+        indents: []
+        allowed: true
+        keys: [no_key()]
+        flow: 0
+        json: false
+        kinds: []
+        token_line: -1
+        spaces: 0
+        tabbed: false
+        done: false
+    })
+    for !s.done {
+        fetch(s)?
+    }
+    s.tokens
+}
+
+fn printable_ascii(c: u8) -> bool {
+    (c >= 0x20 && c < 0x7F) || c == '\n' || c == '\t' || c == '\r'
+}
+
+fn invalid_at(source: str, at: i64) -> Error {
+    var line = 1
+    var start = 0
+    for i in 0..at {
+        if source[i] == '\n' {
+            line += 1
+            start = i + 1
+        }
+    }
+    Syntax(line, at - start + 1, "invalid character in stream")
+}
+
+fn rune_length(source: str, i: i64) -> i64 {
+    let c = source[i]
+    var need = 0
+    var low: u8 = 0x80
+    var high: u8 = 0xBF
+    var cp = 0
+    if c >= 0xC2 && c <= 0xDF {
+        need = 1
+        cp = i64(c & 0x1F)
+    } else if c >= 0xE0 && c <= 0xEF {
+        need = 2
+        cp = i64(c & 0x0F)
+        if c == 0xE0 {
+            low = 0xA0
+        } else if c == 0xED {
+            high = 0x9F
+        }
+    } else if c >= 0xF0 && c <= 0xF4 {
+        need = 3
+        cp = i64(c & 0x07)
+        if c == 0xF0 {
+            low = 0x90
+        } else if c == 0xF4 {
+            high = 0x8F
+        }
+    } else {
+        return -1
+    }
+    if i + need >= source.len {
+        return -1
+    }
+    for k in 1..need + 1 {
+        let b = source[i + k]
+        let lo = if k == 1 { low } else { u8(0x80) }
+        let hi = if k == 1 { high } else { u8(0xBF) }
+        if b < lo || b > hi {
+            return -1
+        }
+        cp = (cp << 6) | i64(b & 0x3F)
+    }
+    if (cp >= 0x80 && cp < 0xA0 && cp != 0x85) || cp == 0xFFFE || cp == 0xFFFF {
+        return -1
+    }
+    need + 1
+}
+
+fn prepared(source: str) -> str ! Error {
+    let low: u8x32 = simd.splat[u8x32, u8](0x20)
+    let high: u8x32 = simd.splat[u8x32, u8](0x7E)
+    var carriage = false
+    var i = 0
+    for i < source.len {
+        if i + 32 <= source.len {
+            let chunk: u8x32 = simd.read_str(source, i)
+            let odd = simd.mask((chunk < low) | (chunk > high))
+            if odd == 0 {
+                i += 32
+                continue
+            }
+            i += simd.trailing_zeros(odd)
+        }
+        let c = source[i]
+        if c < 0x80 {
+            if !printable_ascii(c) {
+                fail invalid_at(source, i)
+            }
+            if c == '\r' {
+                carriage = true
+            }
+            i += 1
+            continue
+        }
+        let n = rune_length(source, i)
+        if n < 0 {
+            fail invalid_at(source, i)
+        }
+        i += n
+    }
+    if !carriage {
+        return source
+    }
+    let out: []u8 = __make(source.len)
+    var n = 0
+    var k = 0
+    for k < source.len {
+        let c = source[k]
+        if c == '\r' {
+            out[n] = '\n'
+            if k + 1 < source.len && source[k + 1] == '\n' {
+                k += 1
+            }
+        } else {
+            out[n] = c
+        }
+        n += 1
+        k += 1
+    }
+    __str_view(out[..n])
+}
+
+fn mark(s: *Scanner) -> Mark {
+    Mark { pos: s.pos, line: s.line, line_start: s.line_start, wide: s.wide }
+}
+
+fn restore(s: *Scanner, m: Mark) {
+    s.pos = m.pos
+    s.line = m.line
+    s.line_start = m.line_start
+    s.wide = m.wide
+}
+
+fn col(s: *Scanner) -> i64 {
+    s.pos - s.line_start - s.wide
+}
+
+fn byte_at(s: *Scanner, i: i64) -> u8 {
+    if i < s.src.len { s.src[i] } else { 0 }
+}
+
+fn cur(s: *Scanner) -> u8 {
+    byte_at(s, s.pos)
+}
+
+fn next(s: *Scanner) -> u8 {
+    byte_at(s, s.pos + 1)
+}
+
+fn eof(s: *Scanner) -> bool {
+    s.pos >= s.src.len
+}
+
+fn blank(c: u8) -> bool {
+    c == ' ' || c == '\t'
+}
+
+fn blankz(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == 0
+}
+
+fn flow_indicator(c: u8) -> bool {
+    c == ',' || c == '[' || c == ']' || c == '{' || c == '}'
+}
+
+fn indicator(c: u8) -> bool {
+    c == '-' || c == '?' || c == ':' || c == ',' || c == '[' || c == ']' || c == '{' || c == '}' || c == '#' || c == '&' || c == '*' || c == '!' || c == '|' || c == '>' || c == '\'' || c == '"' || c == '%' || c == '@' || c == '`'
+}
+
+fn advance(s: *Scanner) {
+    let c = s.src[s.pos]
+    if c == '\n' {
+        s.pos += 1
+        s.line += 1
+        s.line_start = s.pos
+        s.wide = 0
+        return
+    }
+    if c < 0x80 {
+        s.pos += 1
+        return
+    }
+    var n = 2
+    if c >= 0xF0 {
+        n = 4
+    } else if c >= 0xE0 {
+        n = 3
+    }
+    s.pos += n
+    s.wide += n - 1
+}
+
+fn copy_char(s: *Scanner, mut out: []u8) {
+    let start = s.pos
+    advance(s)
+    for i in start..s.pos {
+        push(mut out, s.src[i])
+    }
+}
+
+fn error_here(s: *Scanner, message: str) -> Error {
+    Syntax(s.line + 1, col(s) + 1, message)
+}
+
+fn error_at(line: i64, column: i64, message: str) -> Error {
+    Syntax(line + 1, column + 1, message)
+}
+
+fn add(s: *Scanner, t: Token) {
+    push(mut s.tokens, t)
+}
+
+fn insert(s: *Scanner, at: i64, t: Token) {
+    push(mut s.tokens, t)
+    var i = s.tokens.len - 1
+    for i > at {
+        s.tokens[i] = s.tokens[i - 1]
+        i -= 1
+    }
+    s.tokens[at] = t
+}
+
+fn document_marker(s: *Scanner) -> bool {
+    if col(s) != 0 || s.pos + 3 > s.src.len {
+        return false
+    }
+    let c = s.src[s.pos]
+    if c != '-' && c != '.' {
+        return false
+    }
+    s.src[s.pos + 1] == c && s.src[s.pos + 2] == c && blankz(byte_at(s, s.pos + 3))
+}
+
+fn skip_comment(s: *Scanner) {
+    let end = simd.find_byte_str(s.src, s.pos, s.src.len, '\n')
+    s.pos = if end < 0 { s.src.len } else { end }
+}
+
+fn skip_bom(s: *Scanner) {
+    if s.pos == s.line_start && s.pos + 3 <= s.src.len && s.src[s.pos] == 0xEF && s.src[s.pos + 1] == 0xBB && s.src[s.pos + 2] == 0xBF {
+        s.pos += 3
+        s.line_start += 3
+    }
+}
+
+fn skip_to_token(s: *Scanner) ! Error {
+    s.tabbed = false
+    for {
+        skip_bom(s)
+        if s.pos == s.line_start {
+            for cur(s) == ' ' {
+                s.pos += 1
+            }
+            s.spaces = col(s)
+        }
+        for blank(cur(s)) {
+            if cur(s) == '\t' {
+                s.tabbed = true
+            }
+            s.pos += 1
+        }
+        if cur(s) == '#' {
+            if s.pos > s.line_start && !blank(s.src[s.pos - 1]) {
+                fail error_here(s, "a comment must be separated from content by whitespace")
+            }
+            skip_comment(s)
+        }
+        if cur(s) == '\n' {
+            advance(s)
+            s.tabbed = false
+            if s.flow == 0 {
+                s.allowed = true
+            }
+            continue
+        }
+        break
+    }
+}
+
+fn stale_keys(s: *Scanner) ! Error {
+    for i in 0..s.keys.len {
+        let k = s.keys[i]
+        let single_line = i == 0 || s.kinds[i - 1] == '['
+        if k.possible && ((single_line && k.line != s.line) || s.pos > k.pos + 1024) {
+            if k.required {
+                fail error_at(k.line, k.column, "could not find expected ':'")
+            }
+            s.keys[i].possible = false
+        }
+    }
+}
+
+fn save_key(s: *Scanner) ! Error {
+    let column = col(s)
+    let required = s.flow == 0 && s.indent == column
+    if !s.allowed {
+        return
+    }
+    remove_key(s)?
+    s.keys[s.keys.len - 1] = SimpleKey { possible: true, required, index: s.tokens.len, pos: s.pos, line: s.line, column, tabbed: s.tabbed }
+}
+
+fn remove_key(s: *Scanner) ! Error {
+    let k = s.keys[s.keys.len - 1]
+    if k.possible && k.required {
+        fail error_at(k.line, k.column, "could not find expected ':'")
+    }
+    s.keys[s.keys.len - 1].possible = false
+}
+
+fn roll_indent(s: *Scanner, column: i64, at: i64, kind: TokenKind, line: i64, tabbed: bool) ! Error {
+    if s.flow > 0 || s.indent >= column {
+        return
+    }
+    if tabbed {
+        fail error_at(line, column, "found a tab character used as indentation of a block collection")
+    }
+    push(mut s.indents, s.indent)
+    s.indent = column
+    let t = Token { kind, line, column }
+    if at < 0 {
+        add(s, t)
+    } else {
+        insert(s, at, t)
+    }
+}
+
+fn unroll_indent(s: *Scanner, column: i64) {
+    if s.flow > 0 {
+        return
+    }
+    for s.indent > column {
+        add(s, Token { kind: BlockEnd, line: s.line, column: col(s) })
+        s.indent = s.indents[s.indents.len - 1]
+        s.indents = s.indents[..s.indents.len - 1]
+    }
+}
+
+fn fetch(s: *Scanner) ! Error {
+    skip_to_token(s)?
+    stale_keys(s)?
+    let column = col(s)
+    unroll_indent(s, column)
+    if eof(s) {
+        unroll_indent(s, -1)
+        remove_key(s)?
+        s.allowed = false
+        add(s, Token { kind: StreamEnd, line: s.line, column })
+        s.done = true
+        return
+    }
+    let c = cur(s)
+    let json = s.json
+    s.json = false
+    let first_on_line = s.token_line != s.line
+    if first_on_line && s.spaces <= s.indent {
+        if s.flow > 0 {
+            fail error_here(s, "flow content must be indented more than the enclosing block")
+        }
+        if s.tabbed {
+            fail error_here(s, "found a tab character used as indentation")
+        }
+    }
+    if column == 0 && c == '%' {
+        directive(s)?
+    } else if document_marker(s) {
+        document_indicator(s, if c == '-' { DocumentStart } else { DocumentEnd })?
+    } else if c == '[' || c == '{' {
+        flow_start(s, if c == '[' { FlowSequenceStart } else { FlowMappingStart })?
+    } else if c == ']' || c == '}' {
+        flow_end(s, if c == ']' { FlowSequenceEnd } else { FlowMappingEnd })?
+    } else if c == ',' {
+        flow_entry(s)?
+    } else if c == '-' && blankz(next(s)) {
+        block_entry(s)?
+    } else if c == '?' && blankz(next(s)) {
+        key_indicator(s)?
+    } else if c == ':' && (blankz(next(s)) || (s.flow > 0 && (flow_indicator(next(s)) || json))) {
+        value_indicator(s)?
+    } else if c == '*' {
+        save_key(s)?
+        s.allowed = false
+        anchor(s, Alias)?
+    } else if c == '&' {
+        save_key(s)?
+        s.allowed = false
+        anchor(s, Anchor)?
+    } else if c == '!' {
+        save_key(s)?
+        s.allowed = false
+        tag(s)?
+    } else if (c == '|' || c == '>') && s.flow == 0 {
+        remove_key(s)?
+        s.allowed = true
+        block_scalar(s, c == '|')?
+        return
+    } else if c == '\'' || c == '"' {
+        save_key(s)?
+        s.allowed = false
+        quoted_scalar(s, c == '"')?
+        s.json = s.flow > 0
+    } else if plain_start(s, c) {
+        save_key(s)?
+        s.allowed = false
+        plain_scalar(s)?
+    } else {
+        fail error_here(s, "found a character that cannot start any token")
+    }
+    s.token_line = s.line
+}
+
+fn plain_start(s: *Scanner, c: u8) -> bool {
+    if !blankz(c) && !indicator(c) {
+        return true
+    }
+    let n = next(s)
+    (c == '-' || c == '?' || c == ':') && !blankz(n) && (s.flow == 0 || !flow_indicator(n))
+}
+
+fn document_indicator(s: *Scanner, kind: TokenKind) ! Error {
+    unroll_indent(s, -1)
+    remove_key(s)?
+    s.allowed = false
+    let line = s.line
+    s.pos += 3
+    add(s, Token { kind, line, column: 0 })
+    if kind == DocumentEnd {
+        line_end(s)?
+    }
+}
+
+fn flow_start(s: *Scanner, kind: TokenKind) ! Error {
+    save_key(s)?
+    push(mut s.keys, no_key())
+    push(mut s.kinds, s.src[s.pos])
+    s.flow += 1
+    s.allowed = true
+    add(s, Token { kind, line: s.line, column: col(s) })
+    s.pos += 1
+}
+
+fn flow_end(s: *Scanner, kind: TokenKind) ! Error {
+    remove_key(s)?
+    if s.flow > 0 {
+        s.flow -= 1
+        s.keys = s.keys[..s.keys.len - 1]
+        s.kinds = s.kinds[..s.kinds.len - 1]
+    }
+    s.allowed = false
+    add(s, Token { kind, line: s.line, column: col(s) })
+    s.pos += 1
+    s.json = s.flow > 0
+}
+
+fn flow_entry(s: *Scanner) ! Error {
+    remove_key(s)?
+    s.allowed = true
+    add(s, Token { kind: FlowEntry, line: s.line, column: col(s) })
+    s.pos += 1
+}
+
+fn block_entry(s: *Scanner) ! Error {
+    if s.flow > 0 {
+        fail error_here(s, "block sequence entries are not allowed in a flow collection")
+    }
+    if !s.allowed {
+        fail error_here(s, "block sequence entries are not allowed in this context")
+    }
+    roll_indent(s, col(s), -1, BlockSequenceStart, s.line, s.tabbed)?
+    remove_key(s)?
+    s.allowed = true
+    add(s, Token { kind: BlockEntry, line: s.line, column: col(s) })
+    s.pos += 1
+}
+
+fn key_indicator(s: *Scanner) ! Error {
+    if s.flow == 0 {
+        if !s.allowed {
+            fail error_here(s, "mapping keys are not allowed in this context")
+        }
+        roll_indent(s, col(s), -1, BlockMappingStart, s.line, s.tabbed)?
+    }
+    remove_key(s)?
+    s.allowed = s.flow == 0
+    add(s, Token { kind: Key, line: s.line, column: col(s) })
+    s.pos += 1
+}
+
+fn value_indicator(s: *Scanner) ! Error {
+    let k = s.keys[s.keys.len - 1]
+    if k.possible {
+        insert(s, k.index, Token { kind: Key, line: k.line, column: k.column })
+        roll_indent(s, k.column, k.index, BlockMappingStart, k.line, k.tabbed)?
+        s.keys[s.keys.len - 1].possible = false
+        s.allowed = false
+    } else {
+        if s.flow == 0 {
+            if !s.allowed {
+                fail error_here(s, "mapping values are not allowed in this context")
+            }
+            roll_indent(s, col(s), -1, BlockMappingStart, s.line, s.tabbed)?
+        }
+        s.allowed = s.flow == 0
+    }
+    add(s, Token { kind: Value, line: s.line, column: col(s) })
+    s.pos += 1
+}
+
+fn directive(s: *Scanner) ! Error {
+    unroll_indent(s, -1)
+    remove_key(s)?
+    s.allowed = false
+    let line = s.line
+    s.pos += 1
+    let name = word(s)
+    if name.len == 0 {
+        fail error_here(s, "expected a directive name")
+    }
+    if name == "YAML" {
+        skip_blanks_required(s)?
+        let start = s.pos
+        for !blankz(cur(s)) {
+            advance(s)
+        }
+        let version = s.src[start..s.pos]
+        if !valid_version(version) {
+            fail error_at(line, start - s.line_start, "invalid %YAML version")
+        }
+        add(s, Token { kind: VersionDirective, line, column: 0, text: version })
+    } else if name == "TAG" {
+        skip_blanks_required(s)?
+        let handle = tag_handle(s)?
+        if handle.len == 0 || handle[handle.len - 1] != '!' {
+            fail error_here(s, "invalid %TAG handle")
+        }
+        skip_blanks_required(s)?
+        let prefix = tag_uri(s, true)?
+        if prefix.len == 0 {
+            fail error_here(s, "expected a %TAG prefix")
+        }
+        add(s, Token { kind: TagDirective, line, column: 0, text: handle, suffix: prefix })
+    } else {
+        for !eof(s) && cur(s) != '\n' {
+            if cur(s) == '#' && blank(s.src[s.pos - 1]) {
+                break
+            }
+            advance(s)
+        }
+    }
+    line_end(s)?
+}
+
+fn valid_version(v: str) -> bool {
+    var dots = 0
+    var digits = 0
+    for i in 0..v.len {
+        let c = v[i]
+        if c == '.' {
+            if digits == 0 {
+                return false
+            }
+            dots += 1
+            digits = 0
+        } else if c >= '0' && c <= '9' {
+            digits += 1
+        } else {
+            return false
+        }
+    }
+    dots == 1 && digits > 0
+}
+
+fn word(s: *Scanner) -> str {
+    let start = s.pos
+    for !eof(s) {
+        let c = cur(s)
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+            s.pos += 1
+        } else {
+            break
+        }
+    }
+    s.src[start..s.pos]
+}
+
+fn skip_blanks_required(s: *Scanner) ! Error {
+    if !blank(cur(s)) {
+        fail error_here(s, "expected whitespace")
+    }
+    for blank(cur(s)) {
+        s.pos += 1
+    }
+}
+
+fn line_end(s: *Scanner) ! Error {
+    for blank(cur(s)) {
+        s.pos += 1
+    }
+    if cur(s) == '#' {
+        if !blank(s.src[s.pos - 1]) {
+            fail error_here(s, "a comment must be separated from content by whitespace")
+        }
+        skip_comment(s)
+    }
+    if !eof(s) && cur(s) != '\n' {
+        fail error_here(s, "did not find expected comment or line break")
+    }
+}
+
+fn anchor(s: *Scanner, kind: TokenKind) ! Error {
+    let line = s.line
+    let column = col(s)
+    s.pos += 1
+    let start = s.pos
+    for !eof(s) && !blankz(cur(s)) && !flow_indicator(cur(s)) {
+        advance(s)
+    }
+    if s.pos == start {
+        fail error_here(s, "expected an anchor name")
+    }
+    add(s, Token { kind, line, column, text: s.src[start..s.pos] })
+}
+
+fn tag_handle(s: *Scanner) -> str ! Error {
+    let start = s.pos
+    if cur(s) != '!' {
+        fail error_here(s, "expected '!'")
+    }
+    s.pos += 1
+    word(s)
+    if cur(s) == '!' {
+        s.pos += 1
+    }
+    s.src[start..s.pos]
+}
+
+fn hex_value(c: u8) -> i64 {
+    if c >= '0' && c <= '9' {
+        return i64(c - '0')
+    }
+    if c >= 'a' && c <= 'f' {
+        return i64(c - 'a') + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return i64(c - 'A') + 10
+    }
+    -1
+}
+
+fn uri_char(c: u8, verbatim: bool) -> bool {
+    if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+        return true
+    }
+    if c == '-' || c == '#' || c == ';' || c == '/' || c == '?' || c == ':' || c == '@' || c == '&' || c == '=' || c == '+' || c == '$' || c == '_' || c == '.' || c == '~' || c == '*' || c == '\'' || c == '(' || c == ')' || c == '%' {
+        return true
+    }
+    verbatim && (c == '!' || c == ',' || c == '[' || c == ']')
+}
+
+fn tag_uri(s: *Scanner, verbatim: bool) -> str ! Error {
+    let start = s.pos
+    var escaped = false
+    for !eof(s) && uri_char(cur(s), verbatim) {
+        if cur(s) == '%' {
+            if hex_value(byte_at(s, s.pos + 1)) < 0 || hex_value(byte_at(s, s.pos + 2)) < 0 {
+                fail error_here(s, "invalid URI escape")
+            }
+            escaped = true
+            s.pos += 3
+        } else {
+            s.pos += 1
+        }
+    }
+    let raw = s.src[start..s.pos]
+    if !escaped {
+        return raw
+    }
+    var out: []u8 = []
+    var i = 0
+    for i < raw.len {
+        if raw[i] == '%' {
+            push(mut out, u8(hex_value(raw[i + 1]) * 16 + hex_value(raw[i + 2])))
+            i += 3
+        } else {
+            push(mut out, raw[i])
+            i += 1
+        }
+    }
+    __str_view(out)
+}
+
+fn tag(s: *Scanner) ! Error {
+    let line = s.line
+    let column = col(s)
+    var handle = ""
+    var suffix = ""
+    if next(s) == '<' {
+        s.pos += 2
+        suffix = tag_uri(s, true)?
+        if cur(s) != '>' || suffix.len == 0 {
+            fail error_here(s, "did not find the expected '>' of a verbatim tag")
+        }
+        s.pos += 1
+    } else {
+        handle = tag_handle(s)?
+        if handle.len > 1 && handle[handle.len - 1] == '!' {
+            suffix = tag_uri(s, false)?
+            if suffix.len == 0 {
+                fail error_here(s, "expected a tag suffix")
+            }
+        } else {
+            let rest = tag_uri(s, false)?
+            suffix = "{handle[1..]}{rest}"
+            handle = "!"
+            if suffix.len == 0 {
+                handle = ""
+                suffix = "!"
+            }
+        }
+    }
+    let c = cur(s)
+    if !blankz(c) && !(s.flow > 0 && flow_indicator(c)) {
+        fail error_here(s, "did not find expected whitespace or line break after a tag")
+    }
+    add(s, Token { kind: Tag, line, column, text: handle, suffix })
+}
+
+fn plain_scalar(s: *Scanner) ! Error {
+    let line = s.line
+    let column = col(s)
+    let min = s.indent + 1
+    let space: u8x32 = simd.splat[u8x32, u8](' ')
+    let tab: u8x32 = simd.splat[u8x32, u8]('\t')
+    let newline: u8x32 = simd.splat[u8x32, u8]('\n')
+    let colon: u8x32 = simd.splat[u8x32, u8](':')
+    let comma: u8x32 = simd.splat[u8x32, u8](',')
+    let bracket: u8x32 = simd.splat[u8x32, u8]('[')
+    let close_bracket: u8x32 = simd.splat[u8x32, u8](']')
+    let brace: u8x32 = simd.splat[u8x32, u8]('{')
+    let close_brace: u8x32 = simd.splat[u8x32, u8]('}')
+    let top: u8x32 = simd.splat[u8x32, u8](0xC0)
+    let continuation: u8x32 = simd.splat[u8x32, u8](0x80)
+    var out: []u8 = []
+    var folded = false
+    var pending = false
+    var breaks = 0
+    var next_start = 0
+    var run_start = s.pos
+    var run_end = s.pos
+    var end = mark(s)
+    for {
+        if document_marker(s) || cur(s) == '#' {
+            break
+        }
+        let segment = s.pos
+        for s.pos < s.src.len {
+            if s.pos + 32 <= s.src.len {
+                let chunk: u8x32 = simd.read_str(s.src, s.pos)
+                var special = (chunk == space) | (chunk == tab) | (chunk == newline) | (chunk == colon)
+                if s.flow > 0 {
+                    special = special | (chunk == comma) | (chunk == bracket) | (chunk == close_bracket) | (chunk == brace) | (chunk == close_brace)
+                }
+                let stops = simd.mask(special)
+                let run = if stops == 0 { 32 } else { simd.trailing_zeros(stops) }
+                if run > 0 {
+                    let tails = simd.mask((chunk & top) == continuation)
+                    let within = if run == 32 { tails } else { tails & ((u64(1) << u64(run)) - 1) }
+                    s.wide += simd.count_ones(within)
+                    s.pos += run
+                    continue
+                }
+            }
+            let c = s.src[s.pos]
+            if blankz(c) {
+                break
+            }
+            if c == ':' {
+                let n = next(s)
+                if blankz(n) || (s.flow > 0 && flow_indicator(n)) {
+                    break
+                }
+            } else if s.flow > 0 && flow_indicator(c) {
+                break
+            }
+            advance(s)
+        }
+        if s.pos == segment {
+            break
+        }
+        if pending {
+            for i in run_start..run_end {
+                push(mut out, s.src[i])
+            }
+            fold(mut out, breaks)
+            run_start = next_start
+            folded = true
+            pending = false
+        }
+        run_end = s.pos
+        end = mark(s)
+        for blank(cur(s)) {
+            s.pos += 1
+        }
+        if cur(s) != '\n' {
+            if eof(s) || cur(s) == '#' {
+                break
+            }
+            continue
+        }
+        var count = 0
+        var spaces = 0
+        var tabbed = false
+        for blank(cur(s)) || cur(s) == '\n' {
+            if cur(s) == '\n' {
+                advance(s)
+                count += 1
+                spaces = 0
+                tabbed = false
+            } else {
+                if cur(s) == '\t' {
+                    tabbed = true
+                } else if !tabbed {
+                    spaces += 1
+                }
+                s.pos += 1
+            }
+        }
+        if eof(s) || (s.flow == 0 && spaces < min) {
+            break
+        }
+        breaks = count
+        next_start = s.pos
+        pending = true
+    }
+    restore(s, end)
+    if !folded {
+        add(s, Token { kind: Scalar, line, column, text: s.src[run_start..run_end] })
+        return
+    }
+    for i in run_start..run_end {
+        push(mut out, s.src[i])
+    }
+    add(s, Token { kind: Scalar, line, column, text: __str_view(out) })
+}
+
+fn fold(mut out: []u8, breaks: i64) {
+    if breaks == 1 {
+        push(mut out, ' ')
+        return
+    }
+    for i in 1..breaks {
+        push(mut out, '\n')
+    }
+}
+
+fn quoted_scalar(s: *Scanner, double: bool) ! Error {
+    let line = s.line
+    let column = col(s)
+    let quote: u8 = if double { '"' } else { '\'' }
+    let quotes: u8x32 = simd.splat[u8x32, u8](quote)
+    let backslash: u8x32 = simd.splat[u8x32, u8]('\\')
+    let space: u8x32 = simd.splat[u8x32, u8](' ')
+    let tab: u8x32 = simd.splat[u8x32, u8]('\t')
+    let newline: u8x32 = simd.splat[u8x32, u8]('\n')
+    s.pos += 1
+    var out: []u8 = []
+    for {
+        if document_marker(s) {
+            fail error_here(s, "found a document marker inside a quoted scalar")
+        }
+        if eof(s) {
+            fail error_at(line, column, "found unexpected end of stream inside a quoted scalar")
+        }
+        var leading_blanks = false
+        for !eof(s) && !blankz(cur(s)) {
+            if s.pos + 32 <= s.src.len {
+                let chunk: u8x32 = simd.read_str(s.src, s.pos)
+                let stops = simd.mask((chunk == quotes) | (chunk == backslash) | (chunk == space) | (chunk == tab) | (chunk == newline) | (chunk > u8(0x7F)))
+                let run = if stops == 0 { 32 } else { simd.trailing_zeros(stops) }
+                if run > 0 {
+                    for i in s.pos..s.pos + run {
+                        push(mut out, s.src[i])
+                    }
+                    s.pos += run
+                    continue
+                }
+            }
+            let c = cur(s)
+            if !double && c == '\'' && next(s) == '\'' {
+                push(mut out, '\'')
+                s.pos += 2
+            } else if c == quote {
+                break
+            } else if double && c == '\\' && next(s) == '\n' {
+                s.pos += 1
+                advance(s)
+                leading_blanks = true
+                break
+            } else if double && c == '\\' {
+                escape(s, mut out)?
+            } else {
+                copy_char(s, mut out)
+            }
+        }
+        if cur(s) == quote {
+            break
+        }
+        let whitespace = out.len
+        var real_break = false
+        var trailing = 0
+        var spaces = 0
+        var tabbed = false
+        for blank(cur(s)) || cur(s) == '\n' {
+            if blank(cur(s)) {
+                if !leading_blanks {
+                    push(mut out, cur(s))
+                }
+                if cur(s) == '\t' {
+                    tabbed = true
+                } else if !tabbed {
+                    spaces += 1
+                }
+                s.pos += 1
+            } else {
+                advance(s)
+                spaces = 0
+                tabbed = false
+                if !leading_blanks {
+                    out = out[..whitespace]
+                    leading_blanks = true
+                    real_break = true
+                } else {
+                    trailing += 1
+                }
+            }
+        }
+        if leading_blanks {
+            if s.flow == 0 && !eof(s) && spaces <= s.indent {
+                fail error_here(s, "quoted scalar continuation lines must be indented")
+            }
+            if real_break && trailing == 0 {
+                push(mut out, ' ')
+            }
+            for i in 0..trailing {
+                push(mut out, '\n')
+            }
+        }
+    }
+    s.pos += 1
+    add(s, Token { kind: Scalar, line, column, text: __str_view(out), style: if double { DoubleQuoted } else { SingleQuoted } })
+}
+
+fn escape(s: *Scanner, mut out: []u8) ! Error {
+    let c = next(s)
+    var width = 0
+    var code: u8 = 0
+    if c == '0' {
+        code = 0
+    } else if c == 'a' {
+        code = 7
+    } else if c == 'b' {
+        code = 8
+    } else if c == 't' || c == '\t' {
+        code = '\t'
+    } else if c == 'n' {
+        code = '\n'
+    } else if c == 'v' {
+        code = 11
+    } else if c == 'f' {
+        code = 12
+    } else if c == 'r' {
+        code = '\r'
+    } else if c == 'e' {
+        code = 27
+    } else if c == ' ' || c == '"' || c == '/' || c == '\\' {
+        code = c
+    } else if c == 'N' {
+        append_rune(mut out, 0x85)
+        s.pos += 2
+        return
+    } else if c == '_' {
+        append_rune(mut out, 0xA0)
+        s.pos += 2
+        return
+    } else if c == 'L' {
+        append_rune(mut out, 0x2028)
+        s.pos += 2
+        return
+    } else if c == 'P' {
+        append_rune(mut out, 0x2029)
+        s.pos += 2
+        return
+    } else if c == 'x' {
+        width = 2
+    } else if c == 'u' {
+        width = 4
+    } else if c == 'U' {
+        width = 8
+    } else {
+        fail error_here(s, "found an unknown escape character")
+    }
+    if width == 0 {
+        push(mut out, code)
+        s.pos += 2
+        return
+    }
+    var cp = 0
+    for k in 0..width {
+        let d = hex_value(byte_at(s, s.pos + 2 + k))
+        if d < 0 {
+            fail error_here(s, "did not find the expected hexadecimal digits of an escape")
+        }
+        cp = cp * 16 + d
+    }
+    if (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF {
+        fail error_here(s, "found an invalid Unicode code point in an escape")
+    }
+    append_rune(mut out, cp)
+    s.pos += 2 + width
+}
+
+fn append_rune(mut out: []u8, cp: i64) {
+    if cp < 0x80 {
+        push(mut out, u8(cp))
+    } else if cp < 0x800 {
+        push(mut out, u8(0xC0 | (cp >> 6)))
+        push(mut out, u8(0x80 | (cp & 0x3F)))
+    } else if cp < 0x10000 {
+        push(mut out, u8(0xE0 | (cp >> 12)))
+        push(mut out, u8(0x80 | ((cp >> 6) & 0x3F)))
+        push(mut out, u8(0x80 | (cp & 0x3F)))
+    } else {
+        push(mut out, u8(0xF0 | (cp >> 18)))
+        push(mut out, u8(0x80 | ((cp >> 12) & 0x3F)))
+        push(mut out, u8(0x80 | ((cp >> 6) & 0x3F)))
+        push(mut out, u8(0x80 | (cp & 0x3F)))
+    }
+}
+
+fn block_scalar(s: *Scanner, literal: bool) ! Error {
+    let line = s.line
+    let column = col(s)
+    s.pos += 1
+    var chomp = 0
+    var increment = 0
+    for k in 0..2 {
+        let c = cur(s)
+        if (c == '+' || c == '-') && chomp == 0 {
+            chomp = if c == '+' { 1 } else { -1 }
+            s.pos += 1
+        } else if c >= '1' && c <= '9' && increment == 0 {
+            increment = i64(c - '0')
+            s.pos += 1
+        } else if c == '0' {
+            fail error_here(s, "found an indentation indicator equal to 0")
+        }
+    }
+    if !blankz(cur(s)) && cur(s) != '#' {
+        fail error_here(s, "did not find expected comment or line break")
+    }
+    line_end(s)?
+    let style: Style = if literal { Literal } else { Folded }
+    if eof(s) {
+        add(s, Token { kind: Scalar, line, column, style })
+        return
+    }
+    advance(s)
+    var indent = -1
+    if increment > 0 {
+        indent = s.indent + increment
+        if indent < 0 {
+            indent = increment
+        }
+    }
+    var out: []u8 = []
+    var trailing = 0
+    var leading_break = false
+    var leading_blank = false
+    indent = block_breaks(s, indent, mut trailing)?
+    for col(s) == indent && !eof(s) {
+        if document_marker(s) {
+            break
+        }
+        let trailing_blank = blank(cur(s))
+        if !literal && leading_break && !leading_blank && !trailing_blank {
+            if trailing == 0 {
+                push(mut out, ' ')
+            }
+        } else if leading_break {
+            push(mut out, '\n')
+        }
+        leading_break = false
+        for i in 0..trailing {
+            push(mut out, '\n')
+        }
+        trailing = 0
+        leading_blank = blank(cur(s))
+        let start = s.pos
+        let found = simd.find_byte_str(s.src, s.pos, s.src.len, '\n')
+        let stop = if found < 0 { s.src.len } else { found }
+        for i in start..stop {
+            push(mut out, s.src[i])
+        }
+        s.pos = stop
+        if eof(s) {
+            leading_break = true
+            break
+        }
+        advance(s)
+        leading_break = true
+        indent = block_breaks(s, indent, mut trailing)?
+    }
+    if chomp != -1 && leading_break {
+        push(mut out, '\n')
+    }
+    if chomp == 1 {
+        for i in 0..trailing {
+            push(mut out, '\n')
+        }
+    }
+    add(s, Token { kind: Scalar, line, column, text: __str_view(out), style })
+    s.token_line = s.line - 1
+    if !eof(s) {
+        s.pos = s.line_start
+        s.wide = 0
+    }
+}
+
+fn block_breaks(s: *Scanner, indent: i64, mut trailing: i64) -> i64 ! Error {
+    var widest = 0
+    for {
+        for (indent < 0 || col(s) < indent) && cur(s) == ' ' {
+            s.pos += 1
+        }
+        if indent < 0 && cur(s) == '\t' && col(s) < s.indent + 1 {
+            fail error_here(s, "found a tab character where an indentation space is expected")
+        }
+        if eof(s) {
+            if s.pos > s.line_start {
+                if indent < 0 && col(s) > widest {
+                    widest = col(s)
+                }
+                trailing += 1
+            }
+            break
+        }
+        if cur(s) != '\n' {
+            break
+        }
+        if indent < 0 && col(s) > widest {
+            widest = col(s)
+        }
+        advance(s)
+        trailing += 1
+    }
+    if indent >= 0 {
+        return indent
+    }
+    var detected = col(s)
+    if eof(s) {
+        detected = widest
+    } else if widest > detected {
+        fail error_here(s, "a leading empty line has more spaces than the first content line")
+    }
+    if detected < s.indent + 1 {
+        detected = s.indent + 1
+    }
+    detected
+}

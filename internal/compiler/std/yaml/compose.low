@@ -1,0 +1,345 @@
+import std/base64
+import std/text
+
+struct Composer {
+    events: []Event
+    pos: i64
+    anchors: [str: *Node]
+    sizes: [*Node: i64]
+    count: i64
+    max_nodes: i64
+}
+
+pub fn parse(source: str) -> *Node ! Error {
+    parse_with(source, Options {})
+}
+
+pub fn parse_with(source: str, options: Options) -> *Node ! Error {
+    let documents = parse_all_with(source, options)?
+    if documents.len > 1 {
+        fail Syntax(documents[1].line, 1, "expected a single document in the stream")
+    }
+    if documents.len == 0 {
+        return node(Null)
+    }
+    documents[0]
+}
+
+pub fn parse_all(source: str) -> []*Node ! Error {
+    parse_all_with(source, Options {})
+}
+
+pub fn parse_all_with(source: str, options: Options) -> []*Node ! Error {
+    let c = new(Composer { events: events_with(source, options)?, pos: 1, anchors: [:], sizes: [:], count: 0, max_nodes: options.max_nodes })
+    var documents: []*Node = []
+    for c.events[c.pos].kind == DocumentStart {
+        c.pos += 1
+        c.anchors = [:]
+        push(mut documents, compose(c)?)
+        c.pos += 1
+    }
+    documents
+}
+
+fn grow(c: *Composer, n: i64, e: Event) ! Error {
+    c.count += n
+    if c.count > c.max_nodes {
+        fail TooManyNodes(e.line, e.column)
+    }
+}
+
+fn remember(c: *Composer, e: Event, n: *Node, before: i64) {
+    if e.anchor.len == 0 {
+        return
+    }
+    c.anchors[e.anchor] = n
+    c.sizes[n] = c.count - before
+}
+
+fn compose(c: *Composer) -> *Node ! Error {
+    let e = c.events[c.pos]
+    c.pos += 1
+    let before = c.count
+    match e.kind {
+        Alias => {
+            let target = match c.anchors[e.anchor] {
+                some(found) => found
+                none => fail Syntax(e.line, e.column, "found an undefined alias")
+            }
+            grow(c, c.sizes[target] ?? 1, e)?
+            return target
+        }
+        Scalar => {
+            grow(c, 1, e)?
+            let n = new(Node { value: scalar_value(e)?, tag: e.tag, anchor: e.anchor, style: e.style, line: e.line, column: e.column })
+            remember(c, e, n, before)
+            return n
+        }
+        SequenceStart => {
+            if scalar_tag(e.tag) || e.tag == core_tag("map") {
+                fail Syntax(e.line, e.column, "a sequence cannot have the tag {e.tag}")
+            }
+            grow(c, 1, e)?
+            var items: []*Node = []
+            for c.events[c.pos].kind != SequenceEnd {
+                push(mut items, compose(c)?)
+            }
+            c.pos += 1
+            let n = new(Node { value: Seq(items), tag: e.tag, anchor: e.anchor, style: e.style, line: e.line, column: e.column })
+            remember(c, e, n, before)
+            return n
+        }
+        MappingStart => {
+            if scalar_tag(e.tag) || e.tag == core_tag("seq") {
+                fail Syntax(e.line, e.column, "a mapping cannot have the tag {e.tag}")
+            }
+            grow(c, 1, e)?
+            var pairs: []Pair = []
+            var seen: [str: bool] = [:]
+            for c.events[c.pos].kind != MappingEnd {
+                let key = compose(c)?
+                match identity(key) {
+                    some(id) => {
+                        if seen[id] ?? false {
+                            fail Syntax(key.line, key.column, "found a duplicate mapping key")
+                        }
+                        seen[id] = true
+                    }
+                    none => {}
+                }
+                let value = compose(c)?
+                push(mut pairs, Pair { key, value })
+            }
+            c.pos += 1
+            let n = new(Node { value: Map(pairs), tag: e.tag, anchor: e.anchor, style: e.style, line: e.line, column: e.column })
+            remember(c, e, n, before)
+            return n
+        }
+        _ => fail Syntax(e.line, e.column, "unexpected event")
+    }
+}
+
+fn scalar_tag(tag: str) -> bool {
+    if !text.starts_with(tag, "tag:yaml.org,2002:") {
+        return false
+    }
+    let name = tag[18..]
+    name == "str" || name == "null" || name == "bool" || name == "int" || name == "float" || name == "binary"
+}
+
+fn identity(n: *Node) -> str? {
+    match n.value {
+        Null => "~"
+        Bool(b) => if b { "?true" } else { "?false" }
+        Int(v) => "#{v}"
+        Float(x) => "%{x}"
+        Str(s) => {
+            let tag = if n.tag == "!" || n.tag == core_tag("str") { "" } else { n.tag }
+            "{tag}!{s}"
+        }
+        _ => none
+    }
+}
+
+fn core_tag(name: str) -> str {
+    "tag:yaml.org,2002:{name}"
+}
+
+fn scalar_value(e: Event) -> Value ! Error {
+    let tag = e.tag
+    let s = e.value
+    if tag == "" {
+        if e.style == Plain {
+            return resolve(s)?
+        }
+        return Str(s)
+    }
+    if tag == "!" || tag == core_tag("str") {
+        return Str(s)
+    }
+    if tag == core_tag("null") {
+        if s.len == 0 || null_text(s) {
+            return Null
+        }
+    } else if tag == core_tag("bool") {
+        match bool_text(s) {
+            some(b) => return Bool(b)
+            none => {}
+        }
+    } else if tag == core_tag("int") {
+        match int_text(s, e)? {
+            some(n) => return Int(n)
+            none => {}
+        }
+    } else if tag == core_tag("float") {
+        match float_text(s) {
+            some(x) => return Float(x)
+            none => {}
+        }
+        match int_text(s, e)? {
+            some(n) => return Float(f64(n))
+            none => {}
+        }
+    } else if tag == core_tag("binary") {
+        return Binary(binary_text(s, e)?)
+    } else if tag == core_tag("seq") || tag == core_tag("map") {
+        fail Syntax(e.line, e.column, "a scalar cannot have the tag {tag}")
+    } else {
+        return Str(s)
+    }
+    fail Syntax(e.line, e.column, "the scalar does not match its tag {tag}")
+}
+
+fn resolve(s: str) -> Value ! Error {
+    if s.len == 0 || null_text(s) {
+        return Null
+    }
+    let c = s[0]
+    if !((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 't' || c == 'T' || c == 'f' || c == 'F') {
+        return Str(s)
+    }
+    match bool_text(s) {
+        some(b) => return Bool(b)
+        none => {}
+    }
+    let probe = Event { kind: Scalar, value: s, line: 0, column: 0 }
+    match int_text(s, probe) catch none {
+        some(n) => return Int(n)
+        none => {}
+    }
+    match float_text(s) {
+        some(x) => return Float(x)
+        none => {}
+    }
+    Str(s)
+}
+
+fn null_text(s: str) -> bool {
+    s == "~" || s == "null" || s == "Null" || s == "NULL"
+}
+
+fn bool_text(s: str) -> bool? {
+    if s == "true" || s == "True" || s == "TRUE" {
+        return true
+    }
+    if s == "false" || s == "False" || s == "FALSE" {
+        return false
+    }
+    none
+}
+
+fn digits(s: str, from: i64, base: i64) -> bool {
+    if from >= s.len {
+        return false
+    }
+    for i in from..s.len {
+        let c = s[i]
+        var ok = false
+        if base == 16 {
+            ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+        } else if base == 8 {
+            ok = c >= '0' && c <= '7'
+        } else {
+            ok = c >= '0' && c <= '9'
+        }
+        if !ok {
+            return false
+        }
+    }
+    true
+}
+
+fn int_text(s: str, e: Event) -> i64? ! Error {
+    var base = 10
+    var start = 0
+    var negative = false
+    if s.len > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'o') {
+        base = if s[1] == 'x' { 16 } else { 8 }
+        start = 2
+    } else if s.len > 0 && (s[0] == '-' || s[0] == '+') {
+        negative = s[0] == '-'
+        start = 1
+    }
+    if !digits(s, start, base) {
+        return none
+    }
+    if negative {
+        var n = 0
+        for i in start..s.len {
+            let d = i64(s[i] - '0')
+            if n < (-0x7FFFFFFFFFFFFFFF - 1 + d) / 10 {
+                fail Syntax(e.line, e.column, "integer out of range")
+            }
+            n = n * 10 - d
+        }
+        return n
+    }
+    let n = text.parse_uint(s[start..], base) catch {
+        _ => fail Syntax(e.line, e.column, "integer out of range")
+    }
+    n
+}
+
+fn float_text(s: str) -> f64? {
+    var i = 0
+    var negative = false
+    if s.len > 0 && (s[0] == '-' || s[0] == '+') {
+        negative = s[0] == '-'
+        i = 1
+    }
+    let rest = s[i..]
+    if rest == ".inf" || rest == ".Inf" || rest == ".INF" {
+        let inf = text.float_from_bits(0x7FF0000000000000)
+        return if negative { -inf } else { inf }
+    }
+    if i == 0 && (rest == ".nan" || rest == ".NaN" || rest == ".NAN") {
+        return text.float_from_bits(0x7FF8000000000000)
+    }
+    var whole = 0
+    for i < s.len && s[i] >= '0' && s[i] <= '9' {
+        whole += 1
+        i += 1
+    }
+    var fraction = 0
+    if i < s.len && s[i] == '.' {
+        i += 1
+        for i < s.len && s[i] >= '0' && s[i] <= '9' {
+            fraction += 1
+            i += 1
+        }
+    }
+    if whole == 0 && fraction == 0 {
+        return none
+    }
+    if i < s.len && (s[i] == 'e' || s[i] == 'E') {
+        i += 1
+        if i < s.len && (s[i] == '-' || s[i] == '+') {
+            i += 1
+        }
+        if !digits(s, i, 10) {
+            return none
+        }
+        i = s.len
+    }
+    if i != s.len {
+        return none
+    }
+    let x = text.parse_float(s) catch {
+        _ => return none
+    }
+    x
+}
+
+fn binary_text(s: str, e: Event) -> []u8 ! Error {
+    var packed: []u8 = []
+    for i in 0..s.len {
+        let c = s[i]
+        if c != ' ' && c != '\n' && c != '\t' {
+            push(mut packed, c)
+        }
+    }
+    let data = base64.decode(__str_view(packed)) catch {
+        _ => fail Syntax(e.line, e.column, "invalid base64 in a binary scalar")
+    }
+    data
+}
