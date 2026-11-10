@@ -1,0 +1,371 @@
+import std/file
+import std/io
+import std/text
+
+struct Kind {
+    offset: i64
+    dst: bool
+    abbreviation: str
+}
+
+enum Day {
+    Julian(n: i64)
+    Ordinal(n: i64)
+    Nth(month: i64, week: i64, weekday: i64)
+}
+
+struct Change {
+    day: Day
+    time: i64
+}
+
+struct Daylight {
+    kind: Kind
+    start: Change
+    end: Change
+}
+
+struct Footer {
+    standard: Kind
+    daylight: Daylight?
+}
+
+pub struct Zone {
+    pub name: str
+    times: []i64
+    types: []i64
+    kinds: []Kind
+    footer: Footer?
+}
+
+pub struct Zoned {
+    pub instant: Instant
+    pub abbreviation: str
+    pub dst: bool
+}
+
+struct Header {
+    utc_count: i64
+    standard_count: i64
+    leap_count: i64
+    time_count: i64
+    type_count: i64
+    char_count: i64
+}
+
+fn zone_root() -> str {
+    "/usr/share/zoneinfo"
+}
+
+pub fn load_zone(name: str) -> Zone ! io.Error {
+    if name.len == 0 || name[0] == '/' || text.contains(name, "..") {
+        fail Invalid
+    }
+    let data = file.read_file("{zone_root()}/{name}") catch {
+        IsDir => fail NotFound
+        NotDir => fail NotFound
+        e => fail e
+    }
+    decode_zone(name, data)
+}
+
+fn signed32(b: []u8, at: i64) -> i64 {
+    let v = io.be32(b, at)
+    if v >= 0x80000000 { v - 0x100000000 } else { v }
+}
+
+fn header(data: []u8, at: i64) -> Header ! io.Error {
+    if data.len < at + 44 || data[at] != 'T' || data[at + 1] != 'Z' || data[at + 2] != 'i' || data[at + 3] != 'f' {
+        fail Malformed
+    }
+    let h = Header {
+        utc_count: io.be32(data, at + 20)
+        standard_count: io.be32(data, at + 24)
+        leap_count: io.be32(data, at + 28)
+        time_count: io.be32(data, at + 32)
+        type_count: io.be32(data, at + 36)
+        char_count: io.be32(data, at + 40)
+    }
+    if h.type_count == 0 || data.len < at + 44 + body_size(h, 4) {
+        fail Malformed
+    }
+    h
+}
+
+fn body_size(h: Header, width: i64) -> i64 {
+    h.time_count * (width + 1) + h.type_count * 6 + h.char_count + h.leap_count * (width + 4) + h.standard_count + h.utc_count
+}
+
+pub fn decode_zone(name: str, data: []u8) -> Zone ! io.Error {
+    let first = header(data, 0)?
+    if data[4] == 0 {
+        return body(name, data, first, 44, 4, none)
+    }
+    let at = 44 + body_size(first, 4)
+    let h = header(data, at)?
+    let end = at + 44 + body_size(h, 8)
+    if data.len < end {
+        fail Malformed
+    }
+    let rule = footer(data, end)?
+    body(name, data, h, at + 44, 8, rule)
+}
+
+fn transition_time(data: []u8, at: i64, width: i64, i: i64) -> i64 {
+    if width == 8 { io.be64(data, at + i * 8) } else { signed32(data, at + i * 4) }
+}
+
+fn time_type(data: []u8, at: i64, h: Header) -> i64 ! io.Error {
+    let t = i64(data[at])
+    if t >= h.type_count {
+        fail Malformed
+    }
+    t
+}
+
+fn kind(data: []u8, at: i64, chars: []u8) -> Kind ! io.Error {
+    let name = abbreviation(chars, i64(data[at + 5]))?
+    Kind { offset: signed32(data, at), dst: data[at + 4] != 0, abbreviation: name }
+}
+
+fn body(name: str, data: []u8, h: Header, at: i64, width: i64, footer: Footer?) -> Zone ! io.Error {
+    var times: []i64 = []
+    var types: []i64 = []
+    let index_at = at + h.time_count * width
+    for i in 0..h.time_count {
+        push(mut times, transition_time(data, at, width, i))
+        push(mut types, time_type(data, index_at + i, h)?)
+    }
+    let kinds_at = index_at + h.time_count
+    let chars_at = kinds_at + h.type_count * 6
+    let chars = data[chars_at..chars_at + h.char_count]
+    var kinds: []Kind = []
+    for i in 0..h.type_count {
+        push(mut kinds, kind(data, kinds_at + i * 6, chars)?)
+    }
+    Zone { name, times, types, kinds, footer }
+}
+
+fn abbreviation(chars: []u8, at: i64) -> str ! io.Error {
+    if at >= chars.len {
+        fail Malformed
+    }
+    var end = at
+    for end < chars.len && chars[end] != 0 {
+        end += 1
+    }
+    str(chars[at..end])
+}
+
+fn footer(data: []u8, at: i64) -> Footer? ! io.Error {
+    if at >= data.len || data[at] != '\n' {
+        fail Malformed
+    }
+    var end = at + 1
+    for end < data.len && data[end] != '\n' {
+        end += 1
+    }
+    if end >= data.len {
+        fail Malformed
+    }
+    if end == at + 1 {
+        return none
+    }
+    let rule = str(data[at + 1..end])
+    parse_rule(rule) catch {
+        _ => fail Malformed
+    }
+}
+
+fn parse_rule(s: str) -> Footer ! io.Error {
+    var p = Scan { s, at: 0 }
+    let standard_name = rule_name(mut p)?
+    let standard_offset = -rule_offset(mut p)?
+    let standard = Kind { offset: standard_offset, dst: false, abbreviation: standard_name }
+    if p.at == s.len {
+        return Footer { standard, daylight: none }
+    }
+    let daylight_name = rule_name(mut p)?
+    var offset = standard.offset + 3600
+    if p.at < s.len && s[p.at] != ',' {
+        offset = -rule_offset(mut p)?
+    }
+    expect(mut p, ',')?
+    let start = change(mut p)?
+    expect(mut p, ',')?
+    let end = change(mut p)?
+    finish(p)?
+    let summer = Kind { offset, dst: true, abbreviation: daylight_name }
+    Footer { standard, daylight: Daylight { kind: summer, start, end } }
+}
+
+fn name_byte(c: u8) -> bool {
+    c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+}
+
+fn rule_name(mut p: Scan) -> str ! io.Error {
+    let quoted = accept(mut p, '<')
+    let start = p.at
+    for p.at < p.s.len && (if quoted { p.s[p.at] != '>' } else { name_byte(p.s[p.at]) }) {
+        p.at += 1
+    }
+    let name = p.s[start..p.at]
+    if quoted {
+        expect(mut p, '>')?
+    }
+    if name.len < 3 {
+        fail Malformed
+    }
+    name
+}
+
+fn rule_offset(mut p: Scan) -> i64 ! io.Error {
+    let negative = accept(mut p, '-')
+    if !negative {
+        accept(mut p, '+')
+    }
+    var seconds = digits(mut p, 1, 3)? * 3600
+    if accept(mut p, ':') {
+        seconds += digits(mut p, 2, 2)? * 60
+        if accept(mut p, ':') {
+            seconds += digits(mut p, 2, 2)?
+        }
+    }
+    if negative { -seconds } else { seconds }
+}
+
+fn rule_day(mut p: Scan) -> Day ! io.Error {
+    if accept(mut p, 'J') {
+        let n = digits(mut p, 1, 3)?
+        if n < 1 || n > 365 {
+            fail Malformed
+        }
+        return Julian(n)
+    }
+    if accept(mut p, 'M') {
+        let month = digits(mut p, 1, 2)?
+        expect(mut p, '.')?
+        let week = digits(mut p, 1, 1)?
+        expect(mut p, '.')?
+        let weekday = digits(mut p, 1, 1)?
+        if month < 1 || month > 12 || week < 1 || week > 5 || weekday > 6 {
+            fail Malformed
+        }
+        return Nth(month, week, weekday)
+    }
+    let n = digits(mut p, 1, 3)?
+    if n > 365 {
+        fail Malformed
+    }
+    Ordinal(n)
+}
+
+fn change(mut p: Scan) -> Change ! io.Error {
+    let day = rule_day(mut p)?
+    let time = if accept(mut p, '/') { rule_offset(mut p)? } else { 7200 }
+    Change { day, time }
+}
+
+fn day_number(d: Day, year: i64) -> i64 {
+    let first = days_from_civil(year, 1, 1)
+    match d {
+        Julian(n) => first + n - 1 + if leap_year(year) && n >= 60 { 1 } else { 0 }
+        Ordinal(n) => first + n
+        Nth(month, week, weekday) => {
+            let start = days_from_civil(year, month, 1)
+            var day = floor_mod(weekday - floor_mod(start + 4, 7), 7) + (week - 1) * 7
+            if day >= days_in_month(year, month) {
+                day -= 7
+            }
+            start + day
+        }
+    }
+}
+
+fn wall_seconds(c: Change, year: i64) -> i64 {
+    day_number(c.day, year) * seconds_per_day() + c.time
+}
+
+fn year_of(seconds: i64) -> i64 {
+    civil_from_days(floor_div(seconds, seconds_per_day())).year
+}
+
+fn within(t: i64, start: i64, end: i64) -> bool {
+    if start < end { start <= t && t < end } else { !(end <= t && t < start) }
+}
+
+fn footer_at(f: Footer, seconds: i64) -> Kind {
+    let d = f.daylight ?? return f.standard
+    let year = year_of(seconds)
+    let start = wall_seconds(d.start, year) - f.standard.offset
+    let end = wall_seconds(d.end, year) - d.kind.offset
+    if within(seconds, start, end) { d.kind } else { f.standard }
+}
+
+fn footer_wall(f: Footer, wall: i64) -> Kind {
+    let d = f.daylight ?? return f.standard
+    let year = year_of(wall)
+    var start = wall_seconds(d.start, year)
+    var end = wall_seconds(d.end, year)
+    let diff = d.kind.offset - f.standard.offset
+    if diff >= 0 {
+        start += diff
+    } else {
+        end -= diff
+    }
+    if within(wall, start, end) { d.kind } else { f.standard }
+}
+
+fn before_first(z: Zone) -> Kind {
+    for k in z.kinds {
+        if !k.dst {
+            return k
+        }
+    }
+    z.kinds[z.types[0]]
+}
+
+fn after_last(z: Zone, seconds: i64, wall: bool) -> Kind {
+    match z.footer {
+        some(f) => if wall { footer_wall(f, seconds) } else { footer_at(f, seconds) }
+        none => if z.types.len > 0 { z.kinds[z.types[z.types.len - 1]] } else { z.kinds[0] }
+    }
+}
+
+fn wall_threshold(z: Zone, i: i64) -> i64 {
+    let before = if i == 0 { z.kinds[0].offset } else { z.kinds[z.types[i - 1]].offset }
+    let after = z.kinds[z.types[i]].offset
+    z.times[i] + if before > after { before } else { after }
+}
+
+fn locate(z: Zone, seconds: i64, wall: bool) -> Kind {
+    let n = z.times.len
+    let threshold = fn(i: i64) -> i64 { if wall { wall_threshold(z, i) } else { z.times[i] } }
+    if n == 0 || seconds > threshold(n - 1) {
+        return after_last(z, seconds, wall)
+    }
+    if seconds < threshold(0) {
+        return before_first(z)
+    }
+    var low = 0
+    var high = n
+    for low < high {
+        let mid = (low + high) / 2
+        if threshold(mid) <= seconds {
+            low = mid + 1
+        } else {
+            high = mid
+        }
+    }
+    z.kinds[z.types[low - 1]]
+}
+
+pub fn in_zone(z: Zone, seconds: i64) -> Zoned {
+    let k = locate(z, seconds, false)
+    Zoned { instant: at_offset(seconds, k.offset), abbreviation: k.abbreviation, dst: k.dst }
+}
+
+pub fn localize(z: Zone, local: DateTime) -> Instant {
+    let k = locate(z, to_unix(local), true)
+    Instant { local, offset: k.offset }
+}
