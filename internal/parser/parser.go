@@ -225,15 +225,24 @@ func (p *Parser) param() *ast.Param {
 }
 
 func (p *Parser) typeName() *ast.TypeName {
+	t := p.typeTerm()
+	for p.at(lexer.Question) {
+		p.next()
+		t = &ast.TypeName{Optional: true, Elem: t, Pos: t.Pos}
+	}
+	return t
+}
+
+func (p *Parser) typeTerm() *ast.TypeName {
 	pos := p.tok().Pos
 	switch {
 	case p.at(lexer.Star):
 		p.next()
-		return &ast.TypeName{Pointer: true, Elem: p.typeName(), Pos: pos}
+		return &ast.TypeName{Pointer: true, Elem: p.typeTerm(), Pos: pos}
 	case p.at(lexer.LBracket):
 		p.next()
 		p.expect(lexer.RBracket)
-		return &ast.TypeName{Slice: true, Elem: p.typeName(), Pos: pos}
+		return &ast.TypeName{Slice: true, Elem: p.typeTerm(), Pos: pos}
 	}
 	return &ast.TypeName{Name: p.expect(lexer.Ident).Text, Pos: pos}
 }
@@ -330,8 +339,9 @@ var precedence = map[lexer.Kind]int{
 	lexer.OrOr:   1,
 	lexer.AndAnd: 2,
 	lexer.Eq:     3, lexer.NotEq: 3, lexer.Lt: 3, lexer.LtEq: 3, lexer.Gt: 3, lexer.GtEq: 3,
-	lexer.Plus: 4, lexer.Minus: 4, lexer.Pipe: 4, lexer.Caret: 4,
-	lexer.Star: 5, lexer.Slash: 5, lexer.Percent: 5, lexer.Amp: 5, lexer.Shl: 5, lexer.Shr: 5,
+	lexer.Coalesce: 4,
+	lexer.Plus:     5, lexer.Minus: 5, lexer.Pipe: 5, lexer.Caret: 5,
+	lexer.Star: 6, lexer.Slash: 6, lexer.Percent: 6, lexer.Amp: 6, lexer.Shl: 6, lexer.Shr: 6,
 }
 
 func (p *Parser) expr() ast.Expr {
@@ -347,7 +357,11 @@ func (p *Parser) binary(minPrec int) ast.Expr {
 			return x
 		}
 		p.next()
-		y := p.binary(prec + 1)
+		next := prec + 1
+		if op.Kind == lexer.Coalesce {
+			next = prec
+		}
+		y := p.binary(next)
 		x = &ast.Binary{Op: op.Kind, X: x, Y: y, Pos: op.Pos}
 	}
 }

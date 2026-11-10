@@ -205,7 +205,14 @@ func (b *builder) fit(to *types.Type, words []*Value) []*Value {
 }
 
 func (b *builder) value(e ast.Expr, want *types.Type) []*Value {
-	return b.fit(want, b.expr(e))
+	return b.coerce(e.TypeOf(), want, b.expr(e))
+}
+
+func (b *builder) coerce(from, to *types.Type, words []*Value) []*Value {
+	if to.Optional && from == to.Elem {
+		words = append([]*Value{b.constant(1)}, words...)
+	}
+	return b.fit(to, words)
 }
 
 func (b *builder) word(e ast.Expr) *Value {
@@ -282,10 +289,12 @@ func (b *builder) ret(t *types.Type, words []*Value) {
 		results = b.fit(ret, words)
 	case ret.Kind == types.ResultKind:
 		results = []*Value{b.constant(0)}
-		if t == ret.Ok {
-			results = append(results, words...)
+		if ret.Ok.Accepts(t) {
+			results = append(results, b.coerce(t, ret.Ok, words)...)
 		}
 		results = b.pad(results, ret.Size())
+	case ret.Accepts(t):
+		results = b.coerce(t, ret, words)
 	default:
 		results = b.pad(nil, ret.Size())
 	}
@@ -359,7 +368,11 @@ func (b *builder) typed(op Op, t *types.Type, args ...*Value) *Value {
 
 func (b *builder) assign(s *ast.Assign) {
 	t := s.Target.TypeOf()
-	words := b.value(s.Value, s.Value.TypeOf())
+	source := t
+	if s.Op == lexer.ShlAssign || s.Op == lexer.ShrAssign {
+		source = s.Value.TypeOf()
+	}
+	words := b.value(s.Value, source)
 	p := b.place(s.Place)
 	if op, ok := arith[s.Op]; ok {
 		old := b.load(p, 1)[0]
@@ -488,6 +501,9 @@ func (b *builder) binary(e *ast.Binary) []*Value {
 	if e.Op == lexer.AndAnd || e.Op == lexer.OrOr {
 		return b.logical(e)
 	}
+	if e.Op == lexer.Coalesce {
+		return b.coalesce(e)
+	}
 	if e.X.TypeOf() == types.Str {
 		return b.strings(e)
 	}
@@ -606,11 +622,11 @@ func (b *builder) ifExpr(e *ast.If) []*Value {
 	done := b.newBlock()
 	b.branch(b.word(e.Cond), then, otherwise)
 	b.enter(then)
-	b.writeTemp(temp, b.fit(e.Type, b.block(e.Then)))
+	b.writeTemp(temp, b.value(e.Then, e.Type))
 	b.jump(done)
 	b.enter(otherwise)
 	if e.Else != nil {
-		b.writeTemp(temp, b.fit(e.Type, b.expr(e.Else)))
+		b.writeTemp(temp, b.value(e.Else, e.Type))
 	}
 	b.jump(done)
 	b.enter(done)
@@ -639,7 +655,7 @@ func (b *builder) dispatch(arms []*ast.Arm, subject []*Value, result *types.Type
 		}
 		b.enter(targets[i])
 		b.bindPattern(arm.Pattern, subject)
-		b.writeTemp(temp, b.fit(result, b.expr(arm.Body)))
+		b.writeTemp(temp, b.value(arm.Body, result))
 		b.jump(done)
 	}
 	b.enter(done)

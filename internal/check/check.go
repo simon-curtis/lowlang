@@ -31,6 +31,7 @@ type Checker struct {
 	named   map[string]*types.Type
 	results map[[2]*types.Type]*types.Type
 	ptrs    map[*types.Type]*types.Type
+	opts    map[*types.Type]*types.Type
 	slices  map[*types.Type]*types.Type
 	fn      *ast.Func
 	scopes  []map[string]*ast.Local
@@ -43,6 +44,7 @@ func Check(file *ast.File) (err error) {
 		named:   map[string]*types.Type{"bool": types.Bool, "str": types.Str},
 		results: map[[2]*types.Type]*types.Type{},
 		ptrs:    map[*types.Type]*types.Type{},
+		opts:    map[*types.Type]*types.Type{},
 		slices:  map[*types.Type]*types.Type{},
 	}
 	defer func() {
@@ -73,12 +75,26 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 		return c.pointer(c.resolve(t.Elem))
 	case t.Slice:
 		return c.slice(c.resolve(t.Elem))
+	case t.Optional:
+		return c.optional(c.resolve(t.Elem))
 	}
 	typ, ok := c.named[t.Name]
 	if !ok {
 		c.fail(t.Pos, "unknown type %s", t.Name)
 	}
 	return typ
+}
+
+func (c *Checker) optional(elem *types.Type) *types.Type {
+	if o, ok := c.opts[elem]; ok {
+		return o
+	}
+	o := types.NewOptional(elem)
+	c.opts[elem] = o
+	if elem.Size() > 0 {
+		c.layout(o, lexer.Pos{})
+	}
+	return o
 }
 
 func (c *Checker) slice(elem *types.Type) *types.Type {
@@ -268,7 +284,7 @@ func (c *Checker) okType() *types.Type {
 func (c *Checker) returnable(t *types.Type) bool {
 	ret := c.fn.RetType
 	switch {
-	case t == types.Never || t == ret || t == c.okType():
+	case ret.Accepts(t) || c.okType().Accepts(t):
 		return true
 	case t.Kind == types.ResultKind:
 		return false
@@ -365,8 +381,11 @@ func (c *Checker) let(s *ast.Let) {
 	if t == types.Void || t == types.Never {
 		c.fail(s.Value.Position(), "cannot bind a value of type %s", t)
 	}
-	if want != nil && want != t {
+	if want != nil && !want.Accepts(t) {
 		c.fail(s.Value.Position(), "cannot use %s as %s", t, want)
+	}
+	if want != nil {
+		t = want
 	}
 	s.Local = c.declare(s.Name, t, s.Mutable)
 }
@@ -386,7 +405,7 @@ func (c *Checker) assign(s *ast.Assign) {
 		return
 	}
 	value := c.plain(s.Value, t)
-	if value != t && value != types.Never {
+	if !t.Accepts(value) {
 		c.fail(s.Value.Position(), "cannot assign %s to a place of type %s", value, t)
 	}
 }
@@ -563,7 +582,7 @@ func (c *Checker) plain(e ast.Expr, want *types.Type) *types.Type {
 }
 
 func (c *Checker) expectType(e ast.Expr, want *types.Type) {
-	if got := c.plain(e, want); got != want && got != types.Never {
+	if got := c.plain(e, want); !want.Accepts(got) {
 		c.fail(e.Position(), "expected %s, found %s", want, got)
 	}
 }
@@ -571,6 +590,7 @@ func (c *Checker) expectType(e ast.Expr, want *types.Type) {
 func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 	switch e := e.(type) {
 	case *ast.IntLit:
+		want = unwrap(want)
 		e.Type = types.I64
 		if e.Char {
 			e.Type = types.U32
@@ -582,6 +602,7 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 			c.fail(e.Pos, "%d overflows %s", e.Value, e.Type)
 		}
 	case *ast.FloatLit:
+		want = unwrap(want)
 		e.Type = types.F64
 		if want != nil && want.Float() {
 			e.Type = want
@@ -603,7 +624,7 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 	case *ast.Slicing:
 		c.slicing(e)
 	case *ast.SliceLit:
-		c.sliceLit(e, want)
+		c.sliceLit(e, unwrap(want))
 	case *ast.Interp:
 		c.interp(e)
 	case *ast.Unary:
@@ -626,19 +647,27 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 	return e.TypeOf()
 }
 
-func (c *Checker) inferVariant(want *types.Type, name string) *types.Variant {
-	if want == nil || want.Kind != types.EnumKind {
-		return nil
+func (c *Checker) inferVariant(want *types.Type, name string) (*types.Type, *types.Variant) {
+	for _, t := range []*types.Type{want, unwrap(want)} {
+		if t == nil || t.Kind != types.EnumKind {
+			continue
+		}
+		if v := t.Variant(name); v != nil {
+			return t, v
+		}
 	}
-	return want.Variant(name)
+	return nil, nil
 }
 
 func (c *Checker) ident(e *ast.Ident, want *types.Type) {
-	if v := c.inferVariant(want, e.Name); v != nil {
+	if enum, v := c.inferVariant(want, e.Name); v != nil {
 		c.unitVariant(v, e.Pos)
 		e.Variant = v
-		e.Type = want
+		e.Type = enum
 		return
+	}
+	if e.Name == "none" && c.find(e.Name) == nil {
+		c.fail(e.Pos, "cannot infer the type of none; annotate the binding")
 	}
 	e.Local = c.lookup(e.Name, e.Pos)
 	e.Type = e.Local.Type
@@ -813,7 +842,15 @@ func (c *Checker) unary(e *ast.Unary, want *types.Type) {
 	}
 }
 
+func unwrap(want *types.Type) *types.Type {
+	if want != nil && want.Optional {
+		return want.Elem
+	}
+	return want
+}
+
 func numeric(want *types.Type) *types.Type {
+	want = unwrap(want)
 	if want != nil && want.Number() {
 		return want
 	}
@@ -826,6 +863,22 @@ func literal(e ast.Expr) bool {
 		return true
 	}
 	return false
+}
+
+func (c *Checker) coalesce(e *ast.Binary) {
+	x := c.plain(e.X, nil)
+	if !x.Optional {
+		c.fail(e.X.Position(), "?? requires an optional, found %s", x)
+	}
+	y := c.plain(e.Y, x.Elem)
+	switch {
+	case x.Elem.Accepts(y):
+		e.Type = x.Elem
+	case y == x:
+		e.Type = x
+	default:
+		c.fail(e.Y.Position(), "expected %s, found %s", x.Elem, y)
+	}
 }
 
 func (c *Checker) operands(e *ast.Binary, want *types.Type) *types.Type {
@@ -844,6 +897,8 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 		c.expectType(e.X, types.Bool)
 		c.expectType(e.Y, types.Bool)
 		e.Type = types.Bool
+	case lexer.Coalesce:
+		c.coalesce(e)
 	case lexer.Shl, lexer.Shr:
 		e.Type = c.plain(e.X, numeric(want))
 		c.requireInteger(e.Type, e.Op, e.X.Position())
@@ -896,8 +951,8 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 			c.convert(e, t)
 			return
 		}
-		if v := c.inferVariant(want, fn.Name); v != nil {
-			c.construct(e, want, v)
+		if enum, v := c.inferVariant(want, fn.Name); v != nil {
+			c.construct(e, enum, v)
 			return
 		}
 		target, ok := c.funcs[fn.Name]
@@ -1072,9 +1127,9 @@ func (c *Checker) construct(e *ast.Call, enum *types.Type, v *types.Variant) {
 
 func unify(a, b *types.Type) *types.Type {
 	switch {
-	case a == b || b == types.Never:
+	case a.Accepts(b):
 		return a
-	case a == types.Never:
+	case b.Accepts(a):
 		return b
 	}
 	return types.Void

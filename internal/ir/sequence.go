@@ -270,3 +270,25 @@ func (b *builder) loopBody(body *ast.Block, next, exit *Block) {
 	b.loops = b.loops[:len(b.loops)-1]
 	b.jump(next)
 }
+
+func (b *builder) coalesce(e *ast.Binary) []*Value {
+	optional := e.X.TypeOf()
+	words := b.value(e.X, optional)
+	temp := b.newTemp()
+	present := b.newBlock()
+	absent := b.newBlock()
+	done := b.newBlock()
+	b.branch(words[0], present, absent)
+	b.enter(present)
+	if e.Type == optional {
+		b.writeTemp(temp, words)
+	} else {
+		b.writeTemp(temp, words[1:])
+	}
+	b.jump(done)
+	b.enter(absent)
+	b.writeTemp(temp, b.value(e.Y, e.Type))
+	b.jump(done)
+	b.enter(done)
+	return b.readTemp(temp, e.Type.Size())
+}

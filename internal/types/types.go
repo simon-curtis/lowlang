@@ -28,6 +28,7 @@ type Type struct {
 	Err      *Type
 	Bits     int
 	Signed   bool
+	Optional bool
 	size     int
 }
 
@@ -93,6 +94,18 @@ func NewStruct(name string) *Type {
 
 func NewPointer(elem *Type) *Type {
 	return &Type{Kind: PointerKind, Name: fmt.Sprintf("*%s", elem), Elem: elem, size: 1}
+}
+
+func NewOptional(elem *Type) *Type {
+	t := NewEnum(fmt.Sprintf("%s?", elem))
+	t.Optional = true
+	t.Elem = elem
+	t.Variants = []*Variant{{Name: "none", Tag: 0}, {Name: "some", Tag: 1, Fields: []*Type{elem}}}
+	return t
+}
+
+func (t *Type) Accepts(from *Type) bool {
+	return t == from || from == Never || (t.Optional && from == t.Elem)
 }
 
 func NewSlice(elem *Type) *Type {

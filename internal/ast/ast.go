@@ -12,11 +12,12 @@ type File struct {
 }
 
 type TypeName struct {
-	Name    string
-	Pointer bool
-	Slice   bool
-	Elem    *TypeName
-	Pos     lexer.Pos
+	Name     string
+	Pointer  bool
+	Slice    bool
+	Optional bool
+	Elem     *TypeName
+	Pos      lexer.Pos
 }
 
 type Place struct {

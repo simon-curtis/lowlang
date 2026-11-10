@@ -210,7 +210,34 @@ fn area(s: Shape) -> f64 {
 
 ### Optionals
 
-`T?` is either a value or `none`. `x ?? fallback` unwraps with a default.
+```low
+fn find(xs: []i64, target: i64) -> i64? {
+    for i, x in xs {
+        if x == target {
+            return i
+        }
+    }
+    none
+}
+
+let index = find(xs, 7) ?? -1
+match find(xs, 4) {
+    some(i) => print("at {i}")
+    none => print("missing")
+}
+
+struct Node {
+    value: i64
+    next: *Node?
+}
+```
+
+- `T?` holds either `some(value)` or `none`.
+- A `T` is accepted wherever a `T?` is expected: in an annotated `let`, an assignment, an argument, a field, a return and either branch of an `if` or `match`. `none` and `some(v)` take their type from that expectation.
+- `x ?? fallback` gives the value inside `x`, or evaluates `fallback` when `x` is `none`. The fallback may itself be a `T?`, making the result a `T?`. `??` binds tighter than comparisons and looser than arithmetic, and groups to the right, so `a ?? b ?? 0` tries `a`, then `b`.
+- `match` unwraps an optional with `some(v)` and `none` arms and must cover both.
+- `?` after a type binds to everything before it: `*Node?` is an optional pointer and `[]i64?` an optional slice.
+- An optional is an enum with `none` as tag 0 and `some` as tag 1, so it takes one word more than its value.
 
 ### Errors
 
@@ -359,6 +386,7 @@ Mechanism:
 - Functions with parameters and return values, recursion.
 - Arithmetic, comparison, logical, bitwise and shift operators; numeric conversions; `sqrt`, `floor` and `exp`.
 - `match`, `fail`, `?`, `catch`.
+- Optionals `T?` with `none`, `some`, `??` and implicit wrapping.
 - `mut` parameters.
 - Pointers, `new`, and a garbage-collected heap.
 - Range, slice and string loops; slice literals, indexing, slicing and `push`; string interpolation, concatenation and comparison.
@@ -368,13 +396,12 @@ Mechanism:
 
 ## Roadmap
 
-1. Optionals.
-2. Maps `[K: V]` over integer, `bool`, `str` and pointer keys: literals `[k: v]` and `[:]`, `m[k]` returning `V?`, `m[k] = v`, `delete(mut m, k)`, iteration in insertion order. Assigning a map shares it.
-3. Modules and visibility.
-4. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
-5. Embedded data: Unicode tables, SPIR-V and a fallback font.
-6. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
-7. C interop:
+1. Maps `[K: V]` over integer, `bool`, `str` and pointer keys: literals `[k: v]` and `[:]`, `m[k]` returning `V?`, `m[k] = v`, `delete(mut m, k)`, iteration in insertion order. Assigning a map shares it.
+2. Modules and visibility.
+3. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
+4. Embedded data: Unicode tables, SPIR-V and a fallback font.
+5. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
+6. C interop:
    - `extern fn` declarations.
    - System V ABI thunks: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` and `xmm0` to `xmm7`, struct classification, 16-byte stack alignment.
    - C struct layout with natural alignment, alongside the one-word-per-scalar layout.
@@ -383,14 +410,14 @@ Mechanism:
    - Unmanaged pointer-plus-length views over mmap'd and GPU-mapped memory.
    - Explicit release of file descriptors and mappings.
    - The garbage collector never frees memory held only by C.
-8. Function values, and C-callable function pointers for callbacks.
-9. Generics, with type erasure or dynamic dispatch for custom elements and views.
-10. Green-thread scheduler, channels, `select`:
+7. Function values, and C-callable function pointers for callbacks.
+8. Generics, with type erasure or dynamic dispatch for custom elements and views.
+9. Green-thread scheduler, channels, `select`:
     - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
     - C calls run on a large system stack rather than the green-thread stack.
     - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-11. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-12. GPU UI library modelled on Zed's GPUI, Linux first:
+10. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+11. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation.
@@ -399,5 +426,5 @@ Mechanism:
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-13. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-14. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+12. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+13. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
