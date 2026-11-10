@@ -41,6 +41,7 @@
 	.set G_TOKEN, 72
 	.set G_NEXT, 80
 	.set G_LOCKEDM, 88
+	.set G_CTX, 104
 
 	.set G_FREE, 0
 	.set G_RUNNABLE, 1
@@ -469,6 +470,26 @@ rt_cas:
 	.globl rt_current
 rt_current:
 	mov rax, qword ptr fs:[TLS_G]
+	ret
+
+	.globl rt_context
+rt_context:
+	mov rax, qword ptr fs:[TLS_G]
+	mov rax, [rax+G_CTX]
+	ret
+
+	.globl rt_set_context
+rt_set_context:
+	mov rax, qword ptr fs:[TLS_G]
+	mov [rax+G_CTX], rdi
+	ret
+
+	.globl rt_has_context
+rt_has_context:
+	mov rax, qword ptr fs:[TLS_G]
+	cmp qword ptr [rax+G_CTX], 0
+	setne al
+	movzx eax, al
 	ret
 
 rt_mmap_stack:
@@ -988,6 +1009,12 @@ rt_spawn:
 	mov qword ptr [rbx+G_TOKEN], 0
 	mov qword ptr [rbx+G_LOCK], 0
 	mov qword ptr [rbx+G_LOCKEDM], 0
+	mov rax, qword ptr fs:[TLS_G]
+	test rax, rax
+	jz 1f
+	mov rax, [rax+G_CTX]
+1:
+	mov [rbx+G_CTX], rax
 	mov qword ptr [rbx+G_STATUS], G_RUNNABLE
 	mov rdi, rbx
 	call rt_runq_put
@@ -1019,6 +1046,7 @@ rt_spawn_main:
 	lea rax, [rcx-128]
 	mov [rbx+G_SP], rax
 	mov [rbx+G_SCANLO], rax
+	mov qword ptr [rbx+G_CTX], 0
 	mov qword ptr [rbx+G_STATUS], G_RUNNABLE
 	mov rdi, rbx
 	call rt_gq_put

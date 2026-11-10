@@ -678,6 +678,8 @@ rt_scan_g:
 	push r14
 	push qword ptr [rdi+G_HI]
 	mov rbx, rdi
+	mov rdi, [rbx+G_CTX]
+	call rt_mark
 	cmp qword ptr [rbx+G_PC], 0
 	jne 1f
 	mov rdi, [rbx+G_SCANLO]

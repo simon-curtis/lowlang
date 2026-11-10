@@ -46,6 +46,14 @@ func (b *builder) concurrencyBuiltin(e *ast.Call) ([]*Value, bool) {
 		return []*Value{g}, true
 	case "__park":
 		b.runtimeVoid("park")
+	case "__context":
+		return []*Value{b.runtime("context")}, true
+	case "__set_context":
+		b.runtimeVoid("set_context", b.word(e.Args[0]))
+	case "__has_context":
+		has := b.runtime("has_context")
+		has.Scalar = true
+		return []*Value{has}, true
 	case "__ready":
 		b.runtimeVoid("ready", b.word(e.Args[0]))
 	case "__lock", "__unlock":

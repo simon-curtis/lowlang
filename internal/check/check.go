@@ -1654,6 +1654,7 @@ var builtins = map[string]bool{
 	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
 	"__bits": true, "__str_view": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true, "__ctz": true,
 	"__spawn": true, "__current": true, "__park": true, "__ready": true, "__lock": true, "__unlock": true, "__cas": true, "__panic": true,
+	"__context": true, "__set_context": true, "__has_context": true,
 }
 
 func (c *Checker) call(e *ast.Call, want *types.Type) {
@@ -1989,6 +1990,22 @@ func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 			c.fail(e.Pos, "__zero takes no arguments and needs an expected type")
 		}
 		e.Builtin, e.Type = name, want
+	case "__context":
+		if len(e.Args) != 0 || want == nil || want.Kind != types.PointerKind {
+			c.fail(e.Pos, "__context takes no arguments and needs an expected pointer type")
+		}
+		e.Builtin, e.Type = name, want
+	case "__set_context":
+		c.single(e, name)
+		if t := c.plain(e.Args[0], nil); t.Kind != types.PointerKind {
+			c.fail(e.Args[0].Position(), "__set_context needs a pointer, found %s", t)
+		}
+		e.Builtin, e.Type = name, types.Void
+	case "__has_context":
+		if len(e.Args) != 0 {
+			c.fail(e.Pos, "__has_context takes no arguments")
+		}
+		e.Builtin, e.Type = name, types.Bool
 
 	default:
 		return false
