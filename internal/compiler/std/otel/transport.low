@@ -1,15 +1,19 @@
+import std/base64
 import std/compress/deflate
 import std/crypto
 import std/http
+import std/io
+import std/protobuf
 import std/text
 
 pub enum Protocol {
     HttpProtobuf
     HttpJson
+    Grpc
 }
 
 pub struct OtlpOptions {
-    pub endpoint: str = "http://localhost:4318"
+    pub endpoint: str = ""
     pub traces_endpoint: str = ""
     pub metrics_endpoint: str = ""
     pub logs_endpoint: str = ""
@@ -22,11 +26,51 @@ pub struct OtlpOptions {
     pub max_backoff: i64 = 30000
 }
 
-fn signal_url(o: OtlpOptions, specific: str, path: str) -> str {
+struct Verdict {
+    delivered: bool
+    retry: bool
+    wait: i64
+}
+
+fn delivered() -> Verdict {
+    Verdict { delivered: true, retry: false, wait: -1 }
+}
+
+fn rejected() -> Verdict {
+    Verdict { delivered: false, retry: false, wait: -1 }
+}
+
+fn retry_after_ms(wait: i64) -> Verdict {
+    Verdict { delivered: false, retry: true, wait }
+}
+
+fn grpc(o: OtlpOptions) -> bool {
+    match o.protocol {
+        Grpc => true
+        _ => false
+    }
+}
+
+pub fn endpoint_of(o: OtlpOptions) -> str {
+    if o.endpoint.len > 0 {
+        return o.endpoint
+    }
+    if grpc(o) { "http://localhost:4317" } else { "http://localhost:4318" }
+}
+
+fn signal_url(o: OtlpOptions, specific: str, path: str, service: str) -> str {
+    if grpc(o) {
+        let target = if specific.len > 0 { specific } else { endpoint_of(o) }
+        let u = http.parse_url(target) catch {
+            _ => return target
+        }
+        return "{http.origin(u)}/opentelemetry.proto.collector.{service}/Export"
+    }
     if specific.len > 0 {
         return specific
     }
-    let base = if text.ends_with(o.endpoint, "/") { o.endpoint[..o.endpoint.len - 1] } else { o.endpoint }
+    let endpoint = endpoint_of(o)
+    let base = if text.ends_with(endpoint, "/") { endpoint[..endpoint.len - 1] } else { endpoint }
     "{base}{path}"
 }
 
@@ -50,12 +94,14 @@ fn jittered(ms: i64) -> i64 {
 }
 
 fn exporter_client(o: OtlpOptions) -> *http.Client {
-    http.client()
+    let base = http.client()
         .with_timeout(o.timeout)
-        .with_version(Http1)
         .with_retries(0)
         .with_decompression(false)
-        .build()
+    if grpc(o) {
+        return base.with_version(Http2).with_prior_knowledge(true).build()
+    }
+    base.with_version(Http1).build()
 }
 
 fn post(client: *http.Client, url: str, headers: []http.Header, content_type: str, payload: []u8) -> http.Response? {
@@ -70,6 +116,141 @@ fn post(client: *http.Client, url: str, headers: []http.Header, content_type: st
     resp
 }
 
+fn http_verdict(resp: http.Response) -> Verdict {
+    if resp.status >= 200 && resp.status < 300 {
+        return delivered()
+    }
+    if !retryable(resp.status) {
+        return rejected()
+    }
+    retry_after_ms(retry_after(resp))
+}
+
+fn grpc_frame(body: []u8, compressed: bool) -> []u8 {
+    let out: []u8 = __make(5 + body.len)
+    out[0] = if compressed { 1 } else { 0 }
+    out[1] = u8(body.len >> 24)
+    out[2] = u8(body.len >> 16)
+    out[3] = u8(body.len >> 8)
+    out[4] = u8(body.len)
+    __memmove(out[5..], body)
+    out
+}
+
+fn grpc_value(resp: http.Response, name: str) -> str? {
+    match http.header(resp.trailers, name) {
+        some(v) => some(v)
+        none => http.header(resp.headers, name)
+    }
+}
+
+fn padded(s: str) -> str {
+    let missing = (4 - s.len % 4) % 4
+    if missing == 2 { "{s}==" } else if missing == 1 { "{s}=" } else { s }
+}
+
+fn duration_ms(data: []u8) -> i64 ! io.Error {
+    var seconds = 0
+    var nanos = 0
+    let d = protobuf.decoder(data)
+    for {
+        let f = match d.next()? {
+            some(x) => x
+            none => break
+        }
+        if f.number == 1 {
+            seconds = f.as_int64()?
+        } else if f.number == 2 {
+            nanos = i64(f.as_int32()?)
+        }
+    }
+    seconds * 1000 + nanos / 1000000
+}
+
+fn retry_info_delay(any: []u8) -> i64 ! io.Error {
+    var type_url = ""
+    var value: []u8 = []
+    let d = protobuf.decoder(any)
+    for {
+        let f = match d.next()? {
+            some(x) => x
+            none => break
+        }
+        if f.number == 1 {
+            type_url = f.as_string()?
+        } else if f.number == 2 {
+            value = f.as_bytes()?
+        }
+    }
+    if type_url != "type.googleapis.com/google.rpc.RetryInfo" {
+        return -1
+    }
+    let r = protobuf.decoder(value)
+    for {
+        let f = match r.next()? {
+            some(x) => x
+            none => break
+        }
+        if f.number == 1 {
+            return duration_ms(f.as_bytes()?)
+        }
+    }
+    0
+}
+
+fn retry_delay(resp: http.Response) -> i64 {
+    let encoded = text.trim(grpc_value(resp, "grpc-status-details-bin") ?? "")
+    if encoded.len == 0 {
+        return -1
+    }
+    let status = base64.decode(padded(encoded)) catch {
+        _ => return -1
+    }
+    let d = protobuf.decoder(status)
+    for {
+        let f = d.next() catch {
+            _ => return -1
+        }
+        let field = match f {
+            some(x) => x
+            none => return -1
+        }
+        if field.number == 3 {
+            let any = field.as_bytes() catch {
+                _ => return -1
+            }
+            let delay = retry_info_delay(any) catch -1
+            if delay >= 0 {
+                return delay
+            }
+        }
+    }
+}
+
+fn grpc_retryable(code: i64) -> bool {
+    code == 1 || code == 4 || code == 10 || code == 11 || code == 14 || code == 15
+}
+
+fn grpc_verdict(resp: http.Response) -> Verdict {
+    if resp.status != 200 {
+        return http_verdict(resp)
+    }
+    let code = text.parse_uint(text.trim(grpc_value(resp, "grpc-status") ?? ""), 10) catch {
+        _ => return rejected()
+    }
+    if code == 0 {
+        return delivered()
+    }
+    if grpc_retryable(code) {
+        return retry_after_ms(retry_delay(resp))
+    }
+    if code == 8 {
+        let delay = retry_delay(resp)
+        return if delay >= 0 { retry_after_ms(delay) } else { rejected() }
+    }
+    rejected()
+}
+
 fn send(client: *http.Client, o: OtlpOptions, url: str, body: []u8) -> bool {
     let outer = attach(suppressed(current()))
     defer detach(outer)
@@ -77,33 +258,43 @@ fn send(client: *http.Client, o: OtlpOptions, url: str, body: []u8) -> bool {
     for h in o.headers {
         push(mut headers, h)
     }
-    let content_type = match o.protocol {
-        HttpProtobuf => "application/x-protobuf"
-        HttpJson => "application/json"
-    }
     http.set_header(mut headers, "user-agent", "OTel-OTLP-Exporter-LowLang")
-    var payload = body
-    if o.gzip {
-        payload = deflate.gzip_compress(body, 6)
+    let compressed = if o.gzip { deflate.gzip_compress(body, 6) } else { body }
+    var content_type = "application/x-protobuf"
+    var payload = compressed
+    match o.protocol {
+        Grpc => {
+            content_type = "application/grpc"
+            payload = grpc_frame(compressed, o.gzip)
+            http.set_header(mut headers, "te", "trailers")
+            http.set_header(mut headers, "grpc-timeout", "{o.timeout}m")
+            if o.gzip {
+                http.set_header(mut headers, "grpc-encoding", "gzip")
+            }
+        }
+        HttpJson => {
+            content_type = "application/json"
+        }
+        HttpProtobuf => {}
+    }
+    if o.gzip && !grpc(o) {
         http.set_header(mut headers, "content-encoding", "gzip")
     }
     var backoff = o.backoff
     for attempt in 0..o.attempts {
         var wait = jittered(backoff)
-        match post(client, url, headers, content_type, payload) {
-            some(resp) => {
-                if resp.status >= 200 && resp.status < 300 {
-                    return true
-                }
-                if !retryable(resp.status) {
-                    return false
-                }
-                let hinted = retry_after(resp)
-                if hinted >= 0 {
-                    wait = hinted
-                }
-            }
-            none => {}
+        let verdict = match post(client, url, headers, content_type, payload) {
+            some(resp) => if grpc(o) { grpc_verdict(resp) } else { http_verdict(resp) }
+            none => retry_after_ms(-1)
+        }
+        if verdict.delivered {
+            return true
+        }
+        if !verdict.retry {
+            return false
+        }
+        if verdict.wait >= 0 {
+            wait = verdict.wait
         }
         if attempt + 1 < o.attempts {
             sleep(wait)
@@ -116,12 +307,12 @@ fn send(client: *http.Client, o: OtlpOptions, url: str, body: []u8) -> bool {
 fn json_protocol(o: OtlpOptions) -> bool {
     match o.protocol {
         HttpJson => true
-        HttpProtobuf => false
+        _ => false
     }
 }
 
 pub fn otlp_span_exporter(o: OtlpOptions) -> SpanExporter {
-    let url = signal_url(o, o.traces_endpoint, "/v1/traces")
+    let url = signal_url(o, o.traces_endpoint, "/v1/traces", "trace.v1.TraceService")
     let open = new(true)
     let client = exporter_client(o)
     SpanExporter {
@@ -136,7 +327,7 @@ pub fn otlp_span_exporter(o: OtlpOptions) -> SpanExporter {
 }
 
 pub fn otlp_metric_exporter(o: OtlpOptions) -> MetricExporter {
-    let url = signal_url(o, o.metrics_endpoint, "/v1/metrics")
+    let url = signal_url(o, o.metrics_endpoint, "/v1/metrics", "metrics.v1.MetricsService")
     let open = new(true)
     let client = exporter_client(o)
     MetricExporter {
@@ -151,7 +342,7 @@ pub fn otlp_metric_exporter(o: OtlpOptions) -> MetricExporter {
 }
 
 pub fn otlp_log_exporter(o: OtlpOptions) -> LogExporter {
-    let url = signal_url(o, o.logs_endpoint, "/v1/logs")
+    let url = signal_url(o, o.logs_endpoint, "/v1/logs", "logs.v1.LogsService")
     let open = new(true)
     let client = exporter_client(o)
     LogExporter {

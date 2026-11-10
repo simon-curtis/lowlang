@@ -1077,13 +1077,218 @@ rt_exp:
 	.globl rt_avx2
 rt_avx2:
 	.byte 0
+rt_vdso_clock:
+	.quad 0
+
+	.section .rodata
+rt_vdso_clock_name:
+	.asciz "__vdso_clock_gettime"
 
 	.text
+rt_vdso_init:
+	push rbx
+	push r12
+	push r13
+	push r14
+	push r15
+	test rdi, rdi
+	jz 9f
+1:
+	mov rax, [rdi]
+	add rdi, 8
+	test rax, rax
+	jnz 1b
+2:
+	mov rax, [rdi]
+	test rax, rax
+	jz 9f
+	cmp rax, 33
+	je 3f
+	add rdi, 16
+	jmp 2b
+3:
+	mov r8, [rdi+8]
+	test r8, r8
+	jz 9f
+	cmp dword ptr [r8], 0x464c457f
+	jne 9f
+	cmp word ptr [r8+4], 0x0102
+	jne 9f
+	mov rsi, [r8+32]
+	add rsi, r8
+	movzx ecx, word ptr [r8+56]
+	movzx edx, word ptr [r8+54]
+	xor r9d, r9d
+	xor r10d, r10d
+	xor r11d, r11d
+4:
+	test ecx, ecx
+	jz 6f
+	mov eax, [rsi]
+	cmp eax, 1
+	jne 5f
+	test r11d, r11d
+	jnz 51f
+	mov r9, r8
+	add r9, [rsi+8]
+	sub r9, [rsi+16]
+	mov r11d, 1
+	jmp 51f
+5:
+	cmp eax, 2
+	jne 51f
+	mov r10, [rsi+8]
+	add r10, r8
+51:
+	add rsi, rdx
+	dec ecx
+	jmp 4b
+6:
+	test r11d, r11d
+	jz 9f
+	test r10, r10
+	jz 9f
+	xor r12d, r12d
+	xor r13d, r13d
+	xor r14d, r14d
+	xor r15d, r15d
+7:
+	mov rax, [r10]
+	test rax, rax
+	jz 8f
+	mov rcx, [r10+8]
+	add rcx, r9
+	add r10, 16
+	cmp rax, 5
+	jne 71f
+	mov r12, rcx
+	jmp 7b
+71:
+	cmp rax, 6
+	jne 72f
+	mov r13, rcx
+	jmp 7b
+72:
+	cmp rax, 4
+	jne 73f
+	mov r14, rcx
+	jmp 7b
+73:
+	cmp rax, 0x6ffffef5
+	jne 7b
+	mov r15, rcx
+	jmp 7b
+8:
+	test r12, r12
+	jz 9f
+	test r13, r13
+	jz 9f
+	test r14, r14
+	jz 81f
+	mov ebx, [r14+4]
+	jmp 85f
+81:
+	test r15, r15
+	jz 9f
+	mov ecx, [r15]
+	mov esi, [r15+4]
+	mov eax, [r15+8]
+	lea rdx, [r15+16+8*rax]
+	xor ebx, ebx
+	xor eax, eax
+82:
+	cmp eax, ecx
+	jae 83f
+	cmp ebx, [rdx+4*rax]
+	cmovb ebx, [rdx+4*rax]
+	inc eax
+	jmp 82b
+83:
+	lea rdx, [rdx+4*rcx]
+	cmp ebx, esi
+	jae 84f
+	mov ebx, esi
+	jmp 85f
+84:
+	mov eax, ebx
+	sub eax, esi
+	test dword ptr [rdx+4*rax], 1
+	jnz 841f
+	inc ebx
+	jmp 84b
+841:
+	inc ebx
+85:
+	xor ecx, ecx
+86:
+	cmp ecx, ebx
+	jae 9f
+	lea rax, [rcx+2*rcx]
+	lea rax, [r13+8*rax]
+	inc ecx
+	movzx edx, byte ptr [rax+4]
+	mov esi, edx
+	and esi, 15
+	cmp esi, 2
+	jne 86b
+	shr edx, 4
+	dec edx
+	cmp edx, 1
+	ja 86b
+	cmp word ptr [rax+6], 0
+	je 86b
+	mov esi, [rax]
+	add rsi, r12
+	lea rdi, [rip+rt_vdso_clock_name]
+87:
+	movzx edx, byte ptr [rdi]
+	cmp dl, [rsi]
+	jne 86b
+	inc rdi
+	inc rsi
+	test dl, dl
+	jnz 87b
+	mov rax, [rax+8]
+	add rax, r9
+	mov [rip+rt_vdso_clock], rax
+9:
+	pop r15
+	pop r14
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+	.globl rt_clock_nanos
+rt_clock_nanos:
+	sub rsp, 24
+	mov rsi, rsp
+	mov rax, [rip+rt_vdso_clock]
+	test rax, rax
+	jz 1f
+	call rax
+	jmp 2f
+1:
+	mov eax, 228
+	syscall
+2:
+	test rax, rax
+	jnz 3f
+	imul rax, [rsp], 1000000000
+	add rax, [rsp+8]
+	add rsp, 24
+	ret
+3:
+	xor eax, eax
+	add rsp, 24
+	ret
+
 	.globl rt_cpu_init
 rt_cpu_init:
 	push rbx
 	push r12
 	mov r12, rdi
+	call rt_vdso_init
 	mov eax, 1
 	xor ecx, ecx
 	cpuid

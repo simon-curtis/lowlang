@@ -188,6 +188,10 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 		return []*Value{b.syscall(e.Args)}
 	case "__ctz":
 		return []*Value{b.typed(OpTrailingZeros, types.I64, b.word(arg))}
+	case "__clock_nanos":
+		nanos := b.runtime("clock_nanos", b.word(arg))
+		nanos.Scalar = true
+		return []*Value{nanos}
 	case "__mulhi":
 		return []*Value{b.typed(OpMulHigh, types.U64, b.word(arg), b.word(e.Args[1]))}
 	case "__make":

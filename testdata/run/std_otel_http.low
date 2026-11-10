@@ -1,0 +1,178 @@
+import std/http
+import std/net
+import std/otel
+import std/text
+import std/web
+
+struct Store {
+    spans: []*otel.SpanData
+}
+
+struct Ports {
+    plain: i64
+    app: i64
+}
+
+fn direct(ports: *Ports, flaky: *i64) -> fn(http.Request) -> http.Response {
+    fn(req: http.Request) -> http.Response {
+        if req.path == "/echo" {
+            let parent = http.header(req.headers, "traceparent") ?? "none"
+            let shown = if parent == "none" { "none" } else { "present" }
+            return http.response(200, "{shown} baggage={http.header(req.headers, "baggage") ?? "none"}")
+        }
+        if req.path == "/redirect" {
+            var resp = http.response(302, "")
+            http.set_header(mut resp.headers, "location", "/echo")
+            return resp
+        }
+        if req.path == "/flaky" {
+            *flaky += 1
+            if *flaky == 1 {
+                var resp = http.response(503, "")
+                http.set_header(mut resp.headers, "retry-after", "0")
+                return resp
+            }
+            return http.response(200, "recovered")
+        }
+        if req.path == "/hop" {
+            let c = http.client().build()
+            let inner = c.get("http://127.0.0.1:{ports.app}/users/7") catch {
+                _ => return http.response(502, "")
+            }
+            return http.response(inner.status, inner.text())
+        }
+        http.response(404, "")
+    }
+}
+
+fn app() -> *web.App {
+    let a = web.app()
+    a.get("/users/:id", fn(c: *web.Context) -> http.Response { web.text(200, "user {web.param(c, "id")}") })
+    a
+}
+
+fn kind_name(k: otel.Kind) -> str {
+    match k {
+        Server => "server"
+        Client => "client"
+        _ => "internal"
+    }
+}
+
+fn parent_name(s: *Store, d: *otel.SpanData) -> str {
+    if !otel.valid(d.parent) {
+        return "root"
+    }
+    for p in s.spans {
+        if p.context.span_id == d.parent.span_id {
+            return "{kind_name(p.kind)} {p.name}"
+        }
+    }
+    "unknown"
+}
+
+fn masked(s: str, ports: *Ports) -> str {
+    var out = s
+    for pair in [["{ports.plain}", "PLAIN"], ["{ports.app}", "APP"]] {
+        var parts: []str = []
+        var rest = out
+        for {
+            let at = text.index(rest, pair[0])
+            if at < 0 {
+                push(mut parts, rest)
+                break
+            }
+            push(mut parts, rest[..at])
+            rest = rest[at + pair[0].len..]
+        }
+        out = text.join(parts, pair[1])
+    }
+    out
+}
+
+fn listen(l: net.Listener, handler: fn(http.Request) -> http.Response) {
+    http.serve(l, handler) catch {
+        _ => {}
+    }
+}
+
+fn body(r: http.Response) -> str {
+    r.text()
+}
+
+fn main() {
+    let s = new(Store { spans: [] })
+    let sdk = otel.install(otel.Config {
+        span_processors: [otel.simple_span_processor(otel.SpanExporter {
+            export: fn(spans) -> bool {
+                for d in spans {
+                    push(mut s.spans, d)
+                }
+                true
+            }
+            shutdown: fn() {}
+        })]
+        metric_readers: [otel.MetricReader { exporter: otel.MetricExporter { export: fn(b) -> bool { true }, shutdown: fn() {} }, interval: 0 }]
+    })
+    let plain = net.listen("127.0.0.1", 0) catch {
+        _ => return
+    }
+    let served_app = net.listen("127.0.0.1", 0) catch {
+        _ => return
+    }
+    let ports = new(Ports { plain: plain.addr.port, app: served_app.addr.port })
+    let flaky = new(0)
+    spawn listen(plain, direct(ports, flaky))
+    spawn listen(served_app, web.handler(app()))
+    let client = http.client().with_retries(2).build()
+    let h2c = http.client().with_prior_knowledge(true).build()
+    let base = "http://user:secret@127.0.0.1:{ports.plain}"
+    let carried = otel.set_baggage(otel.current(), "tenant", "acme")
+    let outer = otel.attach(carried)
+    otel.span("checkout", fn(root: otel.Span) {
+        let hop = client.get("{base}/hop?trace=1") catch {
+            _ => return
+        }
+        print("hop {hop.status} {body(hop)}")
+        let redirected = client.get("{base}/redirect") catch {
+            _ => return
+        }
+        print("redirect {redirected.status} {body(redirected)}")
+        let recovered = client.get("{base}/flaky") catch {
+            _ => return
+        }
+        print("flaky {recovered.status} {body(recovered)}")
+        let multiplexed = h2c.get("{base}/echo") catch {
+            _ => return
+        }
+        print("h2c {multiplexed.status} {multiplexed.version == Http2} {body(multiplexed)}")
+        let refused = client.post("http://127.0.0.1:1/never", "text/plain", bytes("x")) catch {
+            Connect(_) => http.response(0, "connect failed")
+            _ => http.response(0, "other failure")
+        }
+        print("refused {body(refused)}")
+        let quiet = otel.attach(otel.suppressed(otel.current()))
+        let unseen = client.get("{base}/echo") catch {
+            _ => return
+        }
+        otel.detach(quiet)
+        print("suppressed {unseen.status} {body(unseen)}")
+    })
+    otel.detach(outer)
+    let trace = s.spans[s.spans.len - 1].context
+    for d in s.spans {
+        let same = if d.context.trace_hi == trace.trace_hi && d.context.trace_lo == trace.trace_lo { "same" } else { "other" }
+        print("{kind_name(d.kind)} \"{d.name}\" scope={d.scope.name} parent={parent_name(s, d)} trace={same}")
+        print("  {masked(otel.format_attributes(d.attributes), ports)}")
+    }
+    let batch = otel.collect(sdk, 0)
+    for m in batch.metrics {
+        if m.name == "http.client.request.duration" || m.name == "http.server.request.duration" {
+            print("metric {m.scope.name} {m.name} unit={m.unit}")
+            for p in m.points {
+                print("  count={p.count} {masked(otel.format_attributes(p.attributes), ports)}")
+            }
+        }
+    }
+    sdk.shutdown()
+}

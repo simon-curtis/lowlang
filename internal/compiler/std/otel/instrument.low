@@ -4,7 +4,7 @@ import std/text
 
 struct CallState {
     span: Span
-    outer: *Context
+    outer: *Context?
     begun: i64
     category: str
     scope: str
@@ -31,6 +31,10 @@ pub fn recording(c: Call) -> bool {
 
 fn known_method(m: str) -> bool {
     m == "GET" || m == "HEAD" || m == "POST" || m == "PUT" || m == "DELETE" || m == "CONNECT" || m == "OPTIONS" || m == "TRACE" || m == "PATCH"
+}
+
+fn span_method(m: str) -> str {
+    if m == "_OTHER" { "HTTP" } else { m }
 }
 
 fn host_only(authority: str) -> str {
@@ -68,7 +72,7 @@ pub fn tag_int(c: Call, key: str, value: i64) {
 
 fn begin(sdk: *Sdk, parent: *Context, scope: str, category: str, name: str, kind: Kind, method: str, facts: []Attribute) -> Call {
     let s = start_with(Tracer { scope: Scope { name: scope } }, name, StartOptions { kind, parent: some(parent), attributes: facts })
-    let state = new(CallState { span: s, outer: current(), begun: monotonic_nanos(), category, scope, method, facts, lock: 0 })
+    let state = new(CallState { span: s, outer: some(current()), begun: monotonic_nanos(), category, scope, method, facts, lock: 0 })
     if category.len > 0 {
         var next = *parent
         next.span = s
@@ -101,7 +105,10 @@ fn finish(c: Call, metric: str, description: str, keys: []str) {
     }
     let elapsed = f64(monotonic_nanos() - s.begun) / 1000000000.0
     end(s.span)
-    detach(s.outer)
+    match s.outer {
+        some(o) => detach(o)
+        none => {}
+    }
     __lock(mut s.lock)
     let facts = selected(s.facts, keys)
     __unlock(mut s.lock)
@@ -114,7 +121,16 @@ pub fn server_span(scope: str, r: http.Request) -> Call {
         some(x) => x
         none => return idle()
     }
-    let parent = extract_into(current(), r.headers)
+    let enclosing = current()
+    match enclosing.call {
+        some(outer) => {
+            if outer.category == "http.server" {
+                return Call { state: outer, owned: false }
+            }
+        }
+        none => {}
+    }
+    let parent = extract_into(enclosing, r.headers)
     let method = if known_method(r.method) { r.method } else { "_OTHER" }
     var facts = [string("http.request.method", method), string("url.path", r.path)]
     if method != r.method {
@@ -136,7 +152,7 @@ pub fn server_span(scope: str, r: http.Request) -> Call {
         Http2 => "2"
     }
     push(mut facts, string("network.protocol.version", version))
-    begin(sdk, parent, scope, "", method, Server, method, facts)
+    begin(sdk, parent, scope, "http.server", span_method(method), Server, method, facts)
 }
 
 pub fn end_server(c: Call, route: str, status: i64) {
@@ -145,7 +161,7 @@ pub fn end_server(c: Call, route: str, status: i64) {
         none => return
     }
     if route.len > 0 {
-        update_name(s.span, "{s.method} {route}")
+        update_name(s.span, "{span_method(s.method)} {route}")
         tag(c, "http.route", route)
     }
     tag_int(c, "http.response.status_code", status)
@@ -156,6 +172,63 @@ pub fn end_server(c: Call, route: str, status: i64) {
     finish(c, "http.server.request.duration", "Duration of HTTP server requests.", [
         "http.request.method", "http.route", "http.response.status_code", "network.protocol.version", "error.type",
     ])
+}
+
+fn serve_traced(r: http.Request, handler: fn(http.Request) -> http.Response) -> http.Response {
+    let call = server_span("std/http", r)
+    let resp = handler(r)
+    end_server(call, "", resp.status)
+    resp
+}
+
+fn client_attempt(s: http.Sending) -> http.Sent {
+    let parent = current()
+    let method = if known_method(s.method) { s.method } else { "_OTHER" }
+    var facts = [
+        string("http.request.method", method), string("server.address", s.url.host), int("server.port", s.url.port),
+        string("url.full", http.format_url(s.url)),
+    ]
+    if method != s.method {
+        push(mut facts, string("http.request.method_original", s.method))
+    }
+    if s.resend > 0 {
+        push(mut facts, int("http.request.resend_count", s.resend))
+    }
+    let span = start_with(Tracer { scope: Scope { name: "std/http" } }, span_method(method), StartOptions { kind: Client, parent: some(parent), attributes: facts })
+    var headers: []http.Header = []
+    for h in s.headers {
+        push(mut headers, h)
+    }
+    let carrier = with_span(parent, span)
+    inject(carrier, mut headers)
+    let state = new(CallState { span, outer: none, begun: monotonic_nanos(), category: "", scope: "std/http", method, facts, lock: 0 })
+    let call = Call { state, owned: true }
+    http.Sent { headers, done: fn(status: i64, version: str, error_type: str) { end_client(call, status, version, error_type) } }
+}
+
+fn end_client(c: Call, status: i64, version: str, error_type: str) {
+    let s = match c.state {
+        some(x) => x
+        none => return
+    }
+    if version.len > 0 {
+        tag(c, "network.protocol.version", version)
+    }
+    if status > 0 {
+        tag_int(c, "http.response.status_code", status)
+    }
+    let failure = if error_type.len > 0 { error_type } else if status >= 400 { "{status}" } else { "" }
+    if failure.len > 0 {
+        tag(c, "error.type", failure)
+        set_status(s.span, Failed(""))
+    }
+    finish(c, "http.client.request.duration", "Duration of HTTP client requests.", [
+        "http.request.method", "server.address", "server.port", "network.protocol.version", "http.response.status_code", "error.type",
+    ])
+}
+
+fn http_observer() -> *http.Observer {
+    new(http.Observer { serve: serve_traced, send: client_attempt })
 }
 
 fn first_word(query: str) -> str {

@@ -1,0 +1,128 @@
+import std/io
+import std/otel
+import std/sql
+import std/sql/sqlserver
+
+struct Fake {
+    input: []u8
+    at: i64
+}
+
+fn fake_stream(f: *Fake) -> io.Stream {
+    io.Stream {
+        read: fn(buf) -> i64 ! io.Error {
+            let n = io.copy(buf, f.input[f.at..])
+            f.at += n
+            n
+        }
+        write: fn(data) -> i64 ! io.Error { data.len }
+        close: fn() {}
+    }
+}
+
+fn le(mut b: []u8, v: i64, n: i64) {
+    for i in 0..n {
+        push(mut b, u8(v >> (8 * i)))
+    }
+}
+
+fn b_varchar(mut b: []u8, s: str) {
+    push(mut b, u8(s.len))
+    for i in 0..s.len {
+        le(mut b, i64(s[i]), 2)
+    }
+}
+
+fn us_varchar(mut b: []u8, s: str) {
+    le(mut b, s.len, 2)
+    for i in 0..s.len {
+        le(mut b, i64(s[i]), 2)
+    }
+}
+
+fn message(mut b: []u8, payload: []u8) {
+    push(mut b, 0x04)
+    push(mut b, 1)
+    io.put_be16(mut b, payload.len + 8)
+    io.append(mut b, [0, 0, 1, 0])
+    io.append(mut b, payload)
+}
+
+fn done(mut b: []u8, kind: u8, status: i64, count: i64) {
+    push(mut b, kind)
+    le(mut b, status, 2)
+    le(mut b, 0xC1, 2)
+    le(mut b, count, 8)
+}
+
+fn server_error(mut b: []u8, number: i64, text: str) {
+    var body: []u8 = []
+    le(mut body, number, 4)
+    push(mut body, 1)
+    push(mut body, 16)
+    us_varchar(mut body, text)
+    b_varchar(mut body, "db1")
+    b_varchar(mut body, "")
+    le(mut body, 1, 4)
+    push(mut b, 0xAA)
+    le(mut b, body.len, 2)
+    io.append(mut b, body)
+}
+
+fn script() -> []u8 {
+    var b: []u8 = []
+    message(mut b, [0, 0, 11, 0, 6, 1, 0, 17, 0, 1, 0xFF, 16, 0, 0x10, 0xDB, 0, 0, 2])
+    var login: []u8 = []
+    var ack: []u8 = [1, 4, 0, 0, 0x74]
+    b_varchar(mut ack, "Microsoft SQL Server")
+    io.append(mut ack, [16, 0, 0x10, 0xDB])
+    push(mut login, 0xAD)
+    le(mut login, ack.len, 2)
+    io.append(mut login, ack)
+    done(mut login, 0xFD, 0, 0)
+    message(mut b, login)
+    var t: []u8 = []
+    done(mut t, 0xFD, 0x10, 3)
+    message(mut b, t)
+    t = []
+    server_error(mut t, 208, "Invalid object name 'nope'.")
+    done(mut t, 0xFD, 0x02, 0)
+    message(mut b, t)
+    b
+}
+
+fn main() {
+    let collected: []*otel.SpanData = []
+    let spans = new(collected)
+    let sdk = otel.install(otel.Config {
+        span_processors: [otel.simple_span_processor(otel.SpanExporter {
+            export: fn(batch) -> bool {
+                for d in batch {
+                    push(mut *spans, d)
+                }
+                true
+            }
+            shutdown: fn() {}
+        })]
+    })
+    let f = new(Fake { input: script(), at: 0 })
+    let db = sqlserver.connect_stream(fake_stream(f), sql.Options { host: "mssql.internal", user: "u", password: "p", database: "shop" }) catch {
+        _ => {
+            print("connect failed")
+            return
+        }
+    }
+    let updated = db.execute("update stock set n = n - 1", []) catch -1
+    print("updated {updated}")
+    let missing = db.execute("delete from nope", []) catch -1
+    print("missing {missing}")
+    for d in *spans {
+        let status = match d.status {
+            Failed(m) => "error({m})"
+            _ => "unset"
+        }
+        print("\"{d.name}\" scope={d.scope.name} status={status}")
+        print("  {otel.format_attributes(d.attributes)}")
+    }
+    sdk.shutdown()
+}

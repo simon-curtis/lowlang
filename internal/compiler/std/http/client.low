@@ -41,6 +41,7 @@ pub struct Builder[K] {
     retries: i64 = 0
     cookies: bool = false
     version: Version = Http2
+    prior_knowledge: bool = false
     max_per_host: i64 = 0
     idle_timeout: i64 = 90000
     decompression: bool = true
@@ -88,6 +89,7 @@ struct Incoming {
 
 struct Framing {
     reader: *io.Reader
+    attempt: *Attempt
     mode: Mode
     left: i64
     first: bool
@@ -238,6 +240,12 @@ pub fn with_version[K](b: Builder[K], v: Version) -> Builder[K] {
     out
 }
 
+pub fn with_prior_knowledge[K](b: Builder[K], on: bool) -> Builder[K] {
+    var out = b
+    out.prior_knowledge = on
+    out
+}
+
 pub fn with_decompression[K](b: Builder[K], on: bool) -> Builder[K] {
     var out = b
     out.decompression = on
@@ -301,6 +309,7 @@ pub fn request(c: *Client, method: str, url: str) -> Builder[Response] {
         redirects: o.redirects
         retries: o.retries
         version: o.version
+        prior_knowledge: o.prior_knowledge
         decompression: o.decompression
         client: c
         method
@@ -578,11 +587,12 @@ fn perform(b: Builder[Response], collect: bool, sink: fn([]u8) ! io.Error) -> Re
     }
     let d = arm(c.reaper, b.timeout)
     defer disarm(c.reaper, d)
-    let job = Job { client: c, deadline: d, connect_timeout: b.connect_timeout, version: b.version }
+    let job = Job { client: c, deadline: d, connect_timeout: b.connect_timeout, version: b.version, prior_knowledge: b.prior_knowledge }
     var req = Outgoing { method: b.method, url, headers: request_headers(b, url), body: b.body, source: b.source }
+    let trace = tracing()
     var hops = 0
     for {
-        let inc = attempt(job, b, req)?
+        let inc = attempt(job, b, req, trace)?
         match c.jar {
             some(j) => store_cookies(j, req.url, inc.headers)
             none => {}
@@ -591,23 +601,28 @@ fn perform(b: Builder[Response], collect: bool, sink: fn([]u8) ! io.Error) -> Re
         let keeps_body = inc.status == 307 || inc.status == 308
         let follow = b.redirects > 0 && location.len > 0 && redirect_status(inc.status) && !(keeps_body && req.source != none)
         if !follow {
-            return finish_response(job, inc, req.url, b.decompression, collect, sink)
+            return finish_response(job, inc, req.url, b.decompression, collect, sink, trace)
         }
+        let version = version_text(inc.version)
         let next = resolve(req.url, location) catch {
             _ => {
                 inc.finish(false)
+                settle(trace, inc.status, version, "InvalidUrl")
                 fail InvalidUrl(location)
             }
         }
         if next.scheme != "http" && next.scheme != "https" {
             inc.finish(false)
+            settle(trace, inc.status, version, "InvalidUrl")
             fail InvalidUrl(location)
         }
         if hops == b.redirects {
             inc.finish(false)
+            settle(trace, inc.status, version, "TooManyRedirects")
             fail TooManyRedirects(hops)
         }
         discard(inc)
+        settle(trace, inc.status, version, "")
         hops += 1
         if !keeps_body && req.method != "HEAD" {
             req.method = "GET"
@@ -659,7 +674,7 @@ fn fits(d: *Deadline, wait: i64) -> bool {
     left == 0 || left > wait
 }
 
-fn attempt(job: Job, b: Builder[Response], base: Outgoing) -> Incoming ! Error {
+fn attempt(job: Job, b: Builder[Response], base: Outgoing, trace: *Trace?) -> Incoming ! Error {
     let c = job.client
     let h = host_for(c, base.url)
     var req = base
@@ -683,13 +698,15 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing) -> Incoming ! Error {
         let a = new_attempt(fresh, avoid)
         fresh = false
         avoid = none
-        let result = outcome(fn() -> Incoming ! io.Error { open(job, h, req, a) })
+        let announced = announce(trace, req)
+        let result = outcome(fn() -> Incoming ! io.Error { open(job, h, announced, a) })
         match result {
             Done(inc) => {
                 if safe && replayable && tries < b.retries && retry_status(inc.status) {
                     let wait = backoff(tries, inc.headers)
                     if fits(job.deadline, wait) {
                         discard(inc)
+                        settle(trace, inc.status, version_text(inc.version), "")
                         sleep(wait)
                         tries += 1
                         continue
@@ -699,8 +716,11 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing) -> Incoming ! Error {
             }
             Failed(e) => {
                 if expired(job.deadline) {
+                    settle(trace, 0, "", "Timeout")
                     fail Timeout
                 }
+                let failure = classify(e, a)
+                settle(trace, 0, "", error_name(failure))
                 if a.stale && replayable && !stale_retried {
                     stale_retried = true
                     fresh = true
@@ -718,7 +738,7 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing) -> Incoming ! Error {
                         continue
                     }
                 }
-                fail classify(e, a)
+                fail failure
             }
         }
     }
@@ -772,7 +792,7 @@ fn discard(inc: Incoming) {
     inc.finish(false)
 }
 
-fn finish_response(job: Job, inc: Incoming, u: Url, decode: bool, collect: bool, sink: fn([]u8) ! io.Error) -> Response ! Error {
+fn finish_response(job: Job, inc: Incoming, u: Url, decode: bool, collect: bool, sink: fn([]u8) ! io.Error, trace: *Trace?) -> Response ! Error {
     let a = inc.attempt
     a.phase = Receiving
     a.broken = false
@@ -784,13 +804,18 @@ fn finish_response(job: Job, inc: Incoming, u: Url, decode: bool, collect: bool,
         Done(body) => body
         Failed(e) => {
             inc.finish(false)
+            let version = version_text(inc.version)
             if expired(job.deadline) {
+                settle(trace, inc.status, version, "Timeout")
                 fail Timeout
             }
-            fail classify(e, a)
+            let failure = classify(e, a)
+            settle(trace, inc.status, version, error_name(failure))
+            fail failure
         }
     }
     inc.finish(true)
+    settle(trace, inc.status, version_text(inc.version), "")
     var headers = inc.headers
     if decoded {
         headers = without_headers(headers, ["content-encoding", "content-length"])
@@ -798,7 +823,7 @@ fn finish_response(job: Job, inc: Incoming, u: Url, decode: bool, collect: bool,
             push(mut headers, Header { name: "content-length", value: "{body.len}" })
         }
     }
-    Response { status: inc.status, headers, body, url: format_url(u), version: inc.version }
+    Response { status: inc.status, headers, body, url: format_url(u), version: inc.version, trailers: a.trailers }
 }
 
 fn collect_into(c: *Collector, chunk: []u8) ! io.Error {
@@ -930,7 +955,7 @@ fn exchange1(job: Job, conn: *Conn1, req: Outgoing, a: *Attempt) -> Incoming ! i
             fail e
         }
     }
-    let framing = new(Framing { reader: conn.reader, mode: Empty, left: 0, first: true, done: false })
+    let framing = new(Framing { reader: conn.reader, attempt: a, mode: Empty, left: 0, first: true, done: false })
     var length = -1
     if !bodiless(req.method, head.status) && head.status != 101 {
         if chunked(head.headers) {
@@ -1063,7 +1088,7 @@ fn framed_read(f: *Framing, buf: []u8) -> i64 ! io.Error {
                     _ => fail Malformed
                 }
                 if size == 0 {
-                    read_headers(f.reader)?
+                    f.attempt.trailers = read_headers(f.reader)?
                     f.done = true
                     return 0
                 }
@@ -1123,7 +1148,9 @@ fn exchange2(job: Job, m: *Mux, req: Outgoing, a: *Attempt) -> Incoming ! io.Err
                         flow.done = true
                         lane.ended = true
                     }
-                    Head => {}
+                    Head => {
+                        a.trailers = ev.headers
+                    }
                     _ => fail Reset
                 }
                 a.broken = false
