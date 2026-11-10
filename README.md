@@ -24,7 +24,10 @@ go build -o low ./cmd/low
 ./low build testdata/run/fib.low -o fib
 ./low asm testdata/run/fib.low
 ./low dev app.low
+./low run app/
 ```
+
+A directory is a module; `import ui/text` loads `ui/text/` under the project root, which a `low.mod` file marks.
 
 `low dev` runs the program and patches changed functions into it on every save, keeping its state.
 

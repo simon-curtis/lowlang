@@ -1,7 +1,9 @@
 package ir
 
 import (
+	"fmt"
 	"math"
+	"strings"
 
 	"lowlang/internal/ast"
 	"lowlang/internal/lexer"
@@ -33,23 +35,27 @@ type builder struct {
 	temps int
 }
 
-func Build(file *ast.File) *Program {
+func Build(files []*ast.File) *Program {
+	var decls []*ast.Func
+	for _, file := range files {
+		decls = append(decls, file.Funcs...)
+	}
 	p := &Program{}
 	funcs := map[*ast.Func]*Func{}
 	named := map[string]*Func{}
-	for _, d := range file.Funcs {
-		f := &Func{Name: d.Name, ParamWords: paramWords(d), ResultWords: d.RetType.Size()}
+	for _, d := range decls {
+		f := &Func{Name: symbolName(d), ParamWords: paramWords(d), ResultWords: d.RetType.Size()}
 		funcs[d] = f
 		named[d.Name] = f
 		p.Funcs = append(p.Funcs, f)
-		if d.Name == "main" {
+		if d.Name == "main" && d.File.Module == "" {
 			p.Main = f
 			if d.RetType.Kind == types.ResultKind {
 				p.MainErr = d.RetType.Err
 			}
 		}
 	}
-	for _, d := range file.Funcs {
+	for _, d := range decls {
 		b := &builder{
 			ssa:   newSSA(funcs[d]),
 			decl:  d,
@@ -89,6 +95,13 @@ func reachable(main *Func, funcs []*Func) []*Func {
 		}
 	}
 	return kept
+}
+
+func symbolName(d *ast.Func) string {
+	if d.File.Module == "" {
+		return d.Name
+	}
+	return fmt.Sprintf("%s.%s", strings.ReplaceAll(d.File.Module, "/", "."), d.Name)
 }
 
 func paramWords(d *ast.Func) int {

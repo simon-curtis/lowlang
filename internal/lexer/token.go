@@ -31,6 +31,8 @@ const (
 	Struct
 	Mut
 	In
+	Import
+	Pub
 
 	LParen
 	RParen
@@ -85,7 +87,7 @@ var names = map[Kind]string{
 	EOF: "end of file", Newline: "newline", Ident: "identifier", Int: "integer", Float: "float", Char: "character", String: "string",
 	Fn: "fn", Let: "let", Var: "var", If: "if", Else: "else", For: "for",
 	Break: "break", Continue: "continue", Return: "return", True: "true", False: "false",
-	Enum: "enum", Match: "match", Fail: "fail", Catch: "catch", Struct: "struct", Mut: "mut", In: "in",
+	Enum: "enum", Match: "match", Fail: "fail", Catch: "catch", Struct: "struct", Mut: "mut", In: "in", Import: "import", Pub: "pub",
 	LParen: "(", RParen: ")", LBracket: "[", RBracket: "]", DotDot: "..", LBrace: "{", RBrace: "}", Comma: ",", Colon: ":", Arrow: "->", FatArrow: "=>", Dot: ".", Question: "?", Coalesce: "??",
 	Assign: "=", PlusAssign: "+=", MinusAssign: "-=", StarAssign: "*=", SlashAssign: "/=",
 	PercentAssign: "%=", AmpAssign: "&=", PipeAssign: "|=", CaretAssign: "^=", ShlAssign: "<<=", ShrAssign: ">>=",
@@ -103,16 +105,20 @@ func (k Kind) String() string {
 var keywords = map[string]Kind{
 	"fn": Fn, "let": Let, "var": Var, "if": If, "else": Else, "for": For,
 	"break": Break, "continue": Continue, "return": Return, "true": True, "false": False,
-	"enum": Enum, "match": Match, "fail": Fail, "catch": Catch, "struct": Struct, "mut": Mut, "in": In,
+	"enum": Enum, "match": Match, "fail": Fail, "catch": Catch, "struct": Struct, "mut": Mut, "in": In, "import": Import, "pub": Pub,
 }
 
 type Pos struct {
+	File string
 	Line int
 	Col  int
 }
 
 func (p Pos) String() string {
-	return fmt.Sprintf("%d:%d", p.Line, p.Col)
+	if p.File == "" {
+		return fmt.Sprintf("%d:%d", p.Line, p.Col)
+	}
+	return fmt.Sprintf("%s:%d:%d", p.File, p.Line, p.Col)
 }
 
 type Part struct {

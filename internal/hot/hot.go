@@ -32,6 +32,7 @@ type child struct {
 
 type Session struct {
 	path       string
+	sources    []string
 	stdout     io.Writer
 	stderr     io.Writer
 	dir        string
@@ -64,10 +65,10 @@ func (s *Session) logf(format string, args ...any) {
 }
 
 func (s *Session) Run(ctx context.Context) error {
-	last := s.stamp()
 	if err := s.Reload(ctx); err != nil {
 		return err
 	}
+	last := s.stamp()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -107,13 +108,40 @@ func (s *Session) exited() <-chan error {
 }
 
 func (s *Session) stamp() uint64 {
-	src, err := os.ReadFile(s.path)
-	if err != nil {
-		return 0
-	}
 	h := fnv.New64a()
-	h.Write(src)
+	dirs := map[string]bool{}
+	for _, path := range s.watched() {
+		h.Write([]byte(path))
+		if src, err := os.ReadFile(path); err == nil {
+			h.Write(src)
+		}
+		dirs[filepath.Dir(path)] = true
+	}
+	for _, dir := range slices.Sorted(maps.Keys(dirs)) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			h.Write([]byte(e.Name()))
+		}
+	}
 	return h.Sum64()
+}
+
+func (s *Session) watched() []string {
+	if len(s.sources) > 0 {
+		return s.sources
+	}
+	entries, err := os.ReadDir(s.path)
+	if err != nil {
+		return []string{s.path}
+	}
+	var paths []string
+	for _, e := range entries {
+		paths = append(paths, filepath.Join(s.path, e.Name()))
+	}
+	return paths
 }
 
 func (s *Session) Reload(ctx context.Context) error {
@@ -122,6 +150,7 @@ func (s *Session) Reload(ctx context.Context) error {
 		s.logf("%v", err)
 		return nil
 	}
+	s.sources = unit.Sources
 	if s.child == nil {
 		return s.start(ctx, unit, "started")
 	}
@@ -146,16 +175,16 @@ func (s *Session) Reload(ctx context.Context) error {
 		return s.restart(ctx, unit, fmt.Sprintf("reload failed: %v", err))
 	}
 	s.table, s.funcs = table, out.Funcs
-	s.signatures = signatures(unit.File)
+	s.signatures = signatures(unit.Files)
 	s.logf("reloaded %s in %s", strings.Join(changed, ", "), time.Since(began).Round(time.Millisecond))
 	return nil
 }
 
 func (s *Session) restartReason(unit *compiler.Unit) string {
-	if layout(unit.File) != s.layout {
+	if layout(unit.Files) != s.layout {
 		return "type layout changed"
 	}
-	for name, sig := range signatures(unit.File) {
+	for name, sig := range signatures(unit.Files) {
 		if old, ok := s.signatures[name]; ok && old != sig {
 			return fmt.Sprintf("signature of %s changed", name)
 		}
@@ -209,7 +238,7 @@ func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string)
 	s.child = c
 	s.binary, s.symbols = binary, symbols
 	s.table, s.funcs = table, out.Funcs
-	s.signatures, s.layout = signatures(unit.File), layout(unit.File)
+	s.signatures, s.layout = signatures(unit.Files), layout(unit.Files)
 	s.next = 0
 	s.logf("%s", reason)
 	return nil
@@ -369,34 +398,38 @@ func poll(ctx context.Context, ready func() (bool, error)) error {
 	}
 }
 
-func layout(file *ast.File) string {
+func layout(files []*ast.File) string {
 	var b strings.Builder
-	for _, d := range file.Enums {
-		fmt.Fprintf(&b, "enum %s", d.Name)
-		for _, v := range d.Type.Variants {
-			fmt.Fprintf(&b, " %s%v", v.Name, v.Fields)
+	for _, file := range files {
+		for _, d := range file.Enums {
+			fmt.Fprintf(&b, "enum %s", d.Type.Name)
+			for _, v := range d.Type.Variants {
+				fmt.Fprintf(&b, " %s%v", v.Name, v.Fields)
+			}
+			b.WriteString(";")
 		}
-		b.WriteString(";")
-	}
-	for _, d := range file.Structs {
-		fmt.Fprintf(&b, "struct %s", d.Name)
-		for _, f := range d.Type.Fields {
-			fmt.Fprintf(&b, " %s:%s", f.Name, f.Type)
+		for _, d := range file.Structs {
+			fmt.Fprintf(&b, "struct %s", d.Type.Name)
+			for _, f := range d.Type.Fields {
+				fmt.Fprintf(&b, " %s:%s", f.Name, f.Type)
+			}
+			b.WriteString(";")
 		}
-		b.WriteString(";")
 	}
 	return b.String()
 }
 
-func signatures(file *ast.File) map[string]string {
+func signatures(files []*ast.File) map[string]string {
 	out := map[string]string{}
-	for _, fn := range file.Funcs {
-		var b strings.Builder
-		for i, p := range fn.Params {
-			fmt.Fprintf(&b, "%t %s,", p.Mut, fn.ParamTypes[i])
+	for _, file := range files {
+		for _, fn := range file.Funcs {
+			var b strings.Builder
+			for i, p := range fn.Params {
+				fmt.Fprintf(&b, "%t %s,", p.Mut, fn.ParamTypes[i])
+			}
+			fmt.Fprintf(&b, "-> %s", fn.RetType)
+			out[fmt.Sprintf("%s.%s", file.Module, fn.Name)] = b.String()
 		}
-		fmt.Fprintf(&b, "-> %s", fn.RetType)
-		out[fn.Name] = b.String()
 	}
 	return out
 }

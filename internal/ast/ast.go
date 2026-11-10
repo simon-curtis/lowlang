@@ -6,12 +6,31 @@ import (
 )
 
 type File struct {
+	Path    string
+	Module  string
+	Imports []*Import
 	Enums   []*EnumDecl
 	Structs []*StructDecl
 	Funcs   []*Func
 }
 
+type Import struct {
+	Alias string
+	Path  string
+	Pos   lexer.Pos
+}
+
+func (f *File) Imported(alias string) (string, bool) {
+	for _, imp := range f.Imports {
+		if imp.Alias == alias {
+			return imp.Path, true
+		}
+	}
+	return "", false
+}
+
 type TypeName struct {
+	Module   string
 	Name     string
 	Pointer  bool
 	Slice    bool
@@ -61,6 +80,8 @@ func PlaceOf(e Expr) (*Place, bool) {
 
 type EnumDecl struct {
 	Name     string
+	Pub      bool
+	File     *File
 	Variants []*VariantDecl
 	Pos      lexer.Pos
 	Type     *types.Type
@@ -74,6 +95,8 @@ type VariantDecl struct {
 
 type StructDecl struct {
 	Name   string
+	Pub    bool
+	File   *File
 	Fields []*FieldDecl
 	Pos    lexer.Pos
 	Type   *types.Type
@@ -81,6 +104,7 @@ type StructDecl struct {
 
 type FieldDecl struct {
 	Name     string
+	Pub      bool
 	TypeName *TypeName
 	Pos      lexer.Pos
 }
@@ -94,6 +118,8 @@ type Param struct {
 
 type Func struct {
 	Name        string
+	Pub         bool
+	File        *File
 	Params      []*Param
 	Result      *TypeName
 	Error       *TypeName
@@ -293,6 +319,7 @@ type Ref struct {
 
 type StructLit struct {
 	Typed
+	Module string
 	Name   string
 	Fields []*FieldInit
 	Pos    lexer.Pos

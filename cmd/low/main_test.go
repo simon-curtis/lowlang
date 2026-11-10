@@ -15,14 +15,33 @@ import (
 
 func fixtures(t *testing.T, dir string) []string {
 	t.Helper()
-	paths, err := filepath.Glob(filepath.Join("..", "..", "testdata", dir, "*.low"))
+	base := filepath.Join("..", "..", "testdata", dir)
+	entries, err := os.ReadDir(base)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var paths []string
+	for _, e := range entries {
+		if e.IsDir() || strings.HasSuffix(e.Name(), ".low") {
+			paths = append(paths, filepath.Join(base, e.Name()))
+		}
 	}
 	if len(paths) == 0 {
 		t.Fatalf("no fixtures in testdata/%s", dir)
 	}
 	return paths
+}
+
+func relative(t *testing.T, message, path string) string {
+	t.Helper()
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range []string{abs + "/", path + "/", path + ":"} {
+		message = strings.ReplaceAll(message, prefix, "")
+	}
+	return message
 }
 
 func expected(t *testing.T, path, ext string) (string, bool) {
@@ -105,7 +124,7 @@ func failFixture(t *testing.T, path string) {
 	if err == nil {
 		t.Fatal("compiled without error")
 	}
-	got := strings.TrimPrefix(err.Error(), path+":")
+	got := relative(t, err.Error(), path)
 	if got != strings.TrimSpace(want) {
 		t.Errorf("error %q, want %q", got, strings.TrimSpace(want))
 	}

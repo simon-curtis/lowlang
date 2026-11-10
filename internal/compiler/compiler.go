@@ -16,49 +16,36 @@ import (
 )
 
 type Unit struct {
-	File    *ast.File
+	Files   []*ast.File
 	Program *ir.Program
+	Sources []string
 }
 
 //go:embed prelude.low
 var preludeSource []byte
 
 func Analyse(path string) (*Unit, error) {
-	src, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
 	prelude, err := parsePrelude()
 	if err != nil {
 		return nil, err
 	}
-	tokens, err := lexer.Lex(src)
+	modules, err := load(path)
 	if err != nil {
-		return nil, fmt.Errorf("%s:%w", path, err)
+		return nil, err
 	}
-	file, err := parser.Parse(tokens)
-	if err != nil {
-		return nil, fmt.Errorf("%s:%w", path, err)
+	files := append([]*ast.File{prelude}, modules.files...)
+	if err := check.Check(files); err != nil {
+		return nil, err
 	}
-	file.Enums = append(prelude.Enums, file.Enums...)
-	file.Structs = append(prelude.Structs, file.Structs...)
-	file.Funcs = append(prelude.Funcs, file.Funcs...)
-	if err := check.Check(file); err != nil {
-		return nil, fmt.Errorf("%s:%w", path, err)
-	}
-	return &Unit{File: file, Program: ir.Build(file)}, nil
+	return &Unit{Files: files, Program: ir.Build(files), Sources: modules.sources}, nil
 }
 
 func parsePrelude() (*ast.File, error) {
 	tokens, err := lexer.LexPrelude(preludeSource)
 	if err != nil {
-		return nil, fmt.Errorf("prelude.low:%w", err)
+		return nil, err
 	}
-	file, err := parser.ParsePrelude(tokens)
-	if err != nil {
-		return nil, fmt.Errorf("prelude.low:%w", err)
-	}
-	return file, nil
+	return parser.ParsePrelude(tokens)
 }
 
 func Assemble(ctx context.Context, asm, object string) error {

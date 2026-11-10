@@ -26,9 +26,15 @@ type loop struct {
 	broken bool
 }
 
+type scope struct {
+	types map[string]*types.Type
+	funcs map[string]*ast.Func
+}
+
 type Checker struct {
-	funcs   map[string]*ast.Func
-	named   map[string]*types.Type
+	modules map[string]*scope
+	builtin map[string]*types.Type
+	file    *ast.File
 	results map[[2]*types.Type]*types.Type
 	ptrs    map[*types.Type]*types.Type
 	opts    map[*types.Type]*types.Type
@@ -39,10 +45,10 @@ type Checker struct {
 	loops   []*loop
 }
 
-func Check(file *ast.File) (err error) {
+func Check(files []*ast.File) (err error) {
 	c := &Checker{
-		funcs:   map[string]*ast.Func{},
-		named:   map[string]*types.Type{"bool": types.Bool, "str": types.Str},
+		modules: map[string]*scope{},
+		builtin: map[string]*types.Type{"bool": types.Bool, "str": types.Str},
 		results: map[[2]*types.Type]*types.Type{},
 		ptrs:    map[*types.Type]*types.Type{},
 		opts:    map[*types.Type]*types.Type{},
@@ -61,10 +67,65 @@ func Check(file *ast.File) (err error) {
 		err = b.err
 	}()
 	for _, t := range types.Numeric {
-		c.named[t.Name] = t
+		c.builtin[t.Name] = t
 	}
-	c.file(file)
+	c.check(files)
 	return nil
+}
+
+func (c *Checker) scope(module string) *scope {
+	s, ok := c.modules[module]
+	if !ok {
+		s = &scope{types: map[string]*types.Type{}, funcs: map[string]*ast.Func{}}
+		c.modules[module] = s
+	}
+	return s
+}
+
+func (c *Checker) local() *scope {
+	return c.scope(c.file.Module)
+}
+
+func qualified(module, name string) string {
+	if module == "" {
+		return name
+	}
+	return fmt.Sprintf("%s.%s", module, name)
+}
+
+func (c *Checker) imported(alias string, pos lexer.Pos) *scope {
+	path, ok := c.file.Imported(alias)
+	if !ok {
+		c.fail(pos, "unknown module %s", alias)
+	}
+	return c.scope(path)
+}
+
+func (c *Checker) isModule(name string) bool {
+	_, ok := c.file.Imported(name)
+	return ok && c.find(name) == nil
+}
+
+func (c *Checker) importedType(alias, name string, pos lexer.Pos) *types.Type {
+	t := c.imported(alias, pos).types[name]
+	if t == nil {
+		c.fail(pos, "module %s has no type %s", alias, name)
+	}
+	if !t.Pub {
+		c.fail(pos, "%s.%s is private", alias, name)
+	}
+	return t
+}
+
+func (c *Checker) importedFunc(alias, name string, pos lexer.Pos) *ast.Func {
+	fn := c.imported(alias, pos).funcs[name]
+	if fn == nil {
+		c.fail(pos, "module %s has no function %s", alias, name)
+	}
+	if !fn.Pub {
+		c.fail(pos, "%s.%s is private", alias, name)
+	}
+	return fn
 }
 
 func (c *Checker) fail(pos lexer.Pos, format string, args ...any) {
@@ -86,7 +147,13 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 	case t.Optional:
 		return c.optional(c.resolve(t.Elem))
 	}
-	typ, ok := c.named[t.Name]
+	if t.Module != "" {
+		return c.importedType(t.Module, t.Name, t.Pos)
+	}
+	if typ, ok := c.builtin[t.Name]; ok {
+		return typ
+	}
+	typ, ok := c.local().types[t.Name]
 	if !ok {
 		c.fail(t.Pos, "unknown type %s", t.Name)
 	}
@@ -150,48 +217,61 @@ func (c *Checker) result(ok, err *types.Type) *types.Type {
 	return r
 }
 
-func (c *Checker) file(file *ast.File) {
-	c.declareTypes(file)
-	c.declareFuncs(file.Funcs)
+func (c *Checker) check(files []*ast.File) {
+	c.declareTypes(files)
+	c.declareFuncs(files)
 	c.checkMain()
-	for _, fn := range file.Funcs {
-		c.function(fn)
+	for _, f := range files {
+		for _, fn := range f.Funcs {
+			c.function(fn)
+		}
 	}
 }
 
-func (c *Checker) declareType(name string, pos lexer.Pos, t *types.Type) {
-	if _, dup := c.named[name]; dup {
+func (c *Checker) declareType(name string, pos lexer.Pos, t *types.Type, pub bool) {
+	_, builtin := c.builtin[name]
+	if _, dup := c.local().types[name]; dup || builtin {
 		c.fail(pos, "type %s already declared", name)
 	}
-	c.named[name] = t
+	t.Module = c.file.Module
+	t.Pub = pub
+	c.local().types[name] = t
 }
 
-func (c *Checker) declareTypes(file *ast.File) {
-	for _, d := range file.Enums {
-		if len(d.Variants) == 0 {
-			c.fail(d.Pos, "enum %s has no variants", d.Name)
+func (c *Checker) declareTypes(files []*ast.File) {
+	for _, f := range files {
+		c.file = f
+		for _, d := range f.Enums {
+			if len(d.Variants) == 0 {
+				c.fail(d.Pos, "enum %s has no variants", d.Name)
+			}
+			d.Type = types.NewEnum(qualified(f.Module, d.Name))
+			c.declareType(d.Name, d.Pos, d.Type, d.Pub)
 		}
-		d.Type = types.NewEnum(d.Name)
-		c.declareType(d.Name, d.Pos, d.Type)
-	}
-	for _, d := range file.Structs {
-		if len(d.Fields) == 0 {
-			c.fail(d.Pos, "struct %s has no fields", d.Name)
+		for _, d := range f.Structs {
+			if len(d.Fields) == 0 {
+				c.fail(d.Pos, "struct %s has no fields", d.Name)
+			}
+			d.Type = types.NewStruct(qualified(f.Module, d.Name))
+			c.declareType(d.Name, d.Pos, d.Type, d.Pub)
 		}
-		d.Type = types.NewStruct(d.Name)
-		c.declareType(d.Name, d.Pos, d.Type)
 	}
-	for _, d := range file.Enums {
-		c.declareVariants(d)
+	for _, f := range files {
+		c.file = f
+		for _, d := range f.Enums {
+			c.declareVariants(d)
+		}
+		for _, d := range f.Structs {
+			c.declareFields(d)
+		}
 	}
-	for _, d := range file.Structs {
-		c.declareFields(d)
-	}
-	for _, d := range file.Enums {
-		c.layout(d.Type, d.Pos)
-	}
-	for _, d := range file.Structs {
-		c.layout(d.Type, d.Pos)
+	for _, f := range files {
+		for _, d := range f.Enums {
+			c.layout(d.Type, d.Pos)
+		}
+		for _, d := range f.Structs {
+			c.layout(d.Type, d.Pos)
+		}
 	}
 }
 
@@ -219,24 +299,32 @@ func (c *Checker) declareFields(d *ast.StructDecl) {
 		if d.Type.Field(fd.Name) != nil {
 			c.fail(fd.Pos, "field %s already declared in %s", fd.Name, d.Name)
 		}
-		d.Type.Fields = append(d.Type.Fields, &types.Field{Name: fd.Name, Type: c.resolve(fd.TypeName)})
+		d.Type.Fields = append(d.Type.Fields, &types.Field{Name: fd.Name, Pub: fd.Pub, Type: c.resolve(fd.TypeName)})
 	}
 }
 
-func (c *Checker) declareFuncs(funcs []*ast.Func) {
-	for _, fn := range funcs {
-		if _, dup := c.funcs[fn.Name]; dup {
-			c.fail(fn.Pos, "function %s already declared", fn.Name)
+func (c *Checker) declareFuncs(files []*ast.File) {
+	for _, f := range files {
+		c.file = f
+		for _, fn := range f.Funcs {
+			c.declareFunc(fn)
 		}
-		if builtins[fn.Name] {
-			c.fail(fn.Pos, "%s is a builtin", fn.Name)
-		}
-		if _, clash := c.named[fn.Name]; clash {
-			c.fail(fn.Pos, "function %s has the name of a type", fn.Name)
-		}
-		c.signature(fn)
-		c.funcs[fn.Name] = fn
 	}
+}
+
+func (c *Checker) declareFunc(fn *ast.Func) {
+	if _, dup := c.local().funcs[fn.Name]; dup {
+		c.fail(fn.Pos, "function %s already declared", fn.Name)
+	}
+	if builtins[fn.Name] {
+		c.fail(fn.Pos, "%s is a builtin", fn.Name)
+	}
+	_, builtin := c.builtin[fn.Name]
+	if _, clash := c.local().types[fn.Name]; clash || builtin {
+		c.fail(fn.Pos, "function %s has the name of a type", fn.Name)
+	}
+	c.signature(fn)
+	c.local().funcs[fn.Name] = fn
 }
 
 func (c *Checker) signature(fn *ast.Func) {
@@ -262,7 +350,7 @@ func (c *Checker) signatureResult(fn *ast.Func) *types.Type {
 }
 
 func (c *Checker) checkMain() {
-	main, ok := c.funcs["main"]
+	main, ok := c.scope("").funcs["main"]
 	if !ok {
 		c.fail(lexer.Pos{Line: 1, Col: 1}, "missing function main")
 	}
@@ -274,6 +362,7 @@ func (c *Checker) checkMain() {
 
 func (c *Checker) function(fn *ast.Func) {
 	c.fn = fn
+	c.file = fn.File
 	c.scopes = []map[string]*ast.Local{{}}
 	for i, p := range fn.Params {
 		if _, dup := c.scopes[0][p.Name]; dup {
@@ -716,11 +805,23 @@ func (c *Checker) ident(e *ast.Ident, want *types.Type) {
 }
 
 func (c *Checker) typeRef(x ast.Expr) *types.Type {
-	id, ok := x.(*ast.Ident)
-	if !ok || c.find(id.Name) != nil {
-		return nil
+	var t *types.Type
+	switch x := x.(type) {
+	case *ast.Ident:
+		if c.find(x.Name) != nil {
+			return nil
+		}
+		t = c.local().types[x.Name]
+	case *ast.Selector:
+		id, ok := x.X.(*ast.Ident)
+		if !ok || !c.isModule(id.Name) {
+			return nil
+		}
+		if c.imported(id.Name, id.Pos).types[x.Name] == nil {
+			return nil
+		}
+		t = c.importedType(id.Name, x.Name, x.Pos)
 	}
-	t := c.named[id.Name]
 	if t == nil || (t.Kind != types.EnumKind && t.Kind != types.StructKind) {
 		return nil
 	}
@@ -735,7 +836,14 @@ func (c *Checker) field(t *types.Type, name string, pos lexer.Pos) *types.Field 
 	if f == nil {
 		c.fail(pos, "%s has no field %s", t, name)
 	}
+	c.reachable(f, t, pos)
 	return f
+}
+
+func (c *Checker) reachable(f *types.Field, t *types.Type, pos lexer.Pos) {
+	if !f.Pub && t.Module != c.file.Module {
+		c.fail(pos, "field %s of %s is private", f.Name, t)
+	}
 }
 
 func (c *Checker) selector(e *ast.Selector) {
@@ -843,7 +951,12 @@ func (c *Checker) interp(e *ast.Interp) {
 }
 
 func (c *Checker) structLit(e *ast.StructLit) {
-	t := c.named[e.Name]
+	var t *types.Type
+	if e.Module != "" {
+		t = c.importedType(e.Module, e.Name, e.Pos)
+	} else {
+		t = c.local().types[e.Name]
+	}
 	if t == nil || t.Kind != types.StructKind {
 		c.fail(e.Pos, "%s is not a struct", e.Name)
 	}
@@ -856,6 +969,7 @@ func (c *Checker) structLit(e *ast.StructLit) {
 		if given[f] {
 			c.fail(init.Pos, "field %s given twice", init.Name)
 		}
+		c.reachable(f, t, init.Pos)
 		given[f] = true
 		init.Field = f
 		c.expectType(init.Value, f.Type)
@@ -1012,7 +1126,7 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 			c.math(e, fn.Name, want)
 			return
 		}
-		if t, ok := c.named[fn.Name]; ok && t.Number() && c.find(fn.Name) == nil {
+		if t, ok := c.builtin[fn.Name]; ok && t.Number() && c.find(fn.Name) == nil {
 			c.convert(e, t)
 			return
 		}
@@ -1020,12 +1134,16 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 			c.construct(e, enum, v)
 			return
 		}
-		target, ok := c.funcs[fn.Name]
+		target, ok := c.local().funcs[fn.Name]
 		if !ok {
 			c.fail(e.Pos, "undefined function: %s", fn.Name)
 		}
 		c.callFunc(e, target)
 	case *ast.Selector:
+		if id, ok := fn.X.(*ast.Ident); ok && c.isModule(id.Name) && c.typeRef(fn.X) == nil {
+			c.callFunc(e, c.importedFunc(id.Name, fn.Name, fn.Pos))
+			return
+		}
 		c.variantCall(e, fn)
 	default:
 		c.fail(e.Pos, "cannot call this expression")
@@ -1158,6 +1276,9 @@ func (c *Checker) convert(e *ast.Call, to *types.Type) {
 
 func (c *Checker) variantCall(e *ast.Call, sel *ast.Selector) {
 	t := c.typeRef(sel.X)
+	if id, ok := sel.X.(*ast.Ident); ok && t == nil && c.find(id.Name) == nil {
+		c.fail(id.Pos, "undefined: %s", id.Name)
+	}
 	if t == nil || t.Kind != types.EnumKind {
 		c.fail(e.Pos, "cannot call this expression")
 	}

@@ -50,6 +50,42 @@ func newFixture(t *testing.T, src string) *fixture {
 	return f
 }
 
+func writeFile(t *testing.T, path, src string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunWatchesModules(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "low.mod"), "")
+	writeFile(t, filepath.Join(dir, "main.low"), "import lib\n\nfn main() {\n    print(0)\n    var n = lib.value()\n    for n == 1 {\n        n = lib.value()\n    }\n    print(n)\n}\n")
+	library := filepath.Join(dir, "lib", "lib.low")
+	writeFile(t, library, "pub fn value() -> i64 {\n    1\n}\n")
+	f := &fixture{t: t, stdout: &syncBuffer{}, stderr: &syncBuffer{}}
+	session, err := New(dir, f.stdout, f.stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- session.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+		session.Close()
+	})
+	f.waitFor(f.stdout, "0\n")
+	writeFile(t, library, "pub fn value() -> i64 {\n    4\n}\n")
+	f.waitFor(f.stdout, "0\n4\n")
+	f.waitFor(f.stderr, "low: reloaded lib.value in")
+	f.noRestart()
+}
+
 func (f *fixture) write(src string) {
 	f.t.Helper()
 	if err := os.WriteFile(f.path, []byte(src), 0o644); err != nil {

@@ -18,6 +18,7 @@ func (e *Error) Error() string {
 
 type Lexer struct {
 	src     []byte
+	file    string
 	off     int
 	line    int
 	col     int
@@ -26,16 +27,16 @@ type Lexer struct {
 	prelude bool
 }
 
-func Lex(src []byte) ([]Token, error) {
-	return LexAt(src, Pos{Line: 1, Col: 1}, false)
+func Lex(src []byte, file string) ([]Token, error) {
+	return LexAt(src, Pos{File: file, Line: 1, Col: 1}, false)
 }
 
 func LexPrelude(src []byte) ([]Token, error) {
-	return LexAt(src, Pos{Line: 1, Col: 1}, true)
+	return LexAt(src, Pos{File: "prelude.low", Line: 1, Col: 1}, true)
 }
 
 func LexAt(src []byte, at Pos, prelude bool) ([]Token, error) {
-	l := &Lexer{src: src, line: at.Line, col: at.Col, last: Newline, prelude: prelude}
+	l := &Lexer{src: src, file: at.File, line: at.Line, col: at.Col, last: Newline, prelude: prelude}
 	if err := l.run(); err != nil {
 		return nil, err
 	}
@@ -57,7 +58,7 @@ func (l *Lexer) run() error {
 }
 
 func (l *Lexer) pos() Pos {
-	return Pos{Line: l.line, Col: l.col}
+	return Pos{File: l.file, Line: l.line, Col: l.col}
 }
 
 func (l *Lexer) peek(ahead int) byte {

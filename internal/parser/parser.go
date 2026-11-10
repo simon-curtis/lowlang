@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 
 	"lowlang/internal/ast"
 	"lowlang/internal/lexer"
@@ -148,20 +149,60 @@ func (p *Parser) lines(item func()) {
 func (p *Parser) file() *ast.File {
 	f := &ast.File{}
 	p.skipNewlines()
+	for p.at(lexer.Import) {
+		f.Imports = append(f.Imports, p.importDecl())
+		p.skipNewlines()
+	}
 	for !p.at(lexer.EOF) {
-		switch t := p.tok(); t.Kind {
-		case lexer.Fn:
-			f.Funcs = append(f.Funcs, p.fn())
-		case lexer.Enum:
-			f.Enums = append(f.Enums, p.enum())
-		case lexer.Struct:
-			f.Structs = append(f.Structs, p.structDecl())
-		default:
-			p.fail(t.Pos, "expected fn, enum or struct, found %s", describe(t))
-		}
+		p.declaration(f)
 		p.skipNewlines()
 	}
 	return f
+}
+
+func (p *Parser) declaration(f *ast.File) {
+	pub := p.at(lexer.Pub)
+	if pub {
+		p.next()
+	}
+	switch t := p.tok(); t.Kind {
+	case lexer.Fn:
+		d := p.fn()
+		d.Pub, d.File = pub, f
+		f.Funcs = append(f.Funcs, d)
+	case lexer.Enum:
+		d := p.enum()
+		d.Pub, d.File = pub, f
+		f.Enums = append(f.Enums, d)
+	case lexer.Struct:
+		d := p.structDecl()
+		d.Pub, d.File = pub, f
+		f.Structs = append(f.Structs, d)
+	case lexer.Import:
+		p.fail(t.Pos, "imports must come before declarations")
+	default:
+		p.fail(t.Pos, "expected fn, enum or struct, found %s", describe(t))
+	}
+}
+
+func (p *Parser) importDecl() *ast.Import {
+	pos := p.expect(lexer.Import).Pos
+	first := p.expect(lexer.Ident).Text
+	alias := ""
+	if p.at(lexer.Assign) {
+		p.next()
+		alias = first
+		first = p.expect(lexer.Ident).Text
+	}
+	segments := []string{first}
+	for p.at(lexer.Slash) {
+		p.next()
+		segments = append(segments, p.expect(lexer.Ident).Text)
+	}
+	if alias == "" {
+		alias = segments[len(segments)-1]
+	}
+	return &ast.Import{Alias: alias, Path: strings.Join(segments, "/"), Pos: pos}
 }
 
 func (p *Parser) enum() *ast.EnumDecl {
@@ -191,9 +232,13 @@ func (p *Parser) structDecl() *ast.StructDecl {
 	pos := p.expect(lexer.Struct).Pos
 	d := &ast.StructDecl{Name: p.expect(lexer.Ident).Text, Pos: pos}
 	p.lines(func() {
+		pub := p.at(lexer.Pub)
+		if pub {
+			p.next()
+		}
 		name := p.expect(lexer.Ident)
 		p.expect(lexer.Colon)
-		d.Fields = append(d.Fields, &ast.FieldDecl{Name: name.Text, TypeName: p.typeName(), Pos: name.Pos})
+		d.Fields = append(d.Fields, &ast.FieldDecl{Name: name.Text, Pub: pub, TypeName: p.typeName(), Pos: name.Pos})
 	})
 	return d
 }
@@ -251,7 +296,12 @@ func (p *Parser) typeTerm() *ast.TypeName {
 		p.expect(lexer.RBracket)
 		return &ast.TypeName{Map: true, Key: key, Elem: value, Pos: pos}
 	}
-	return &ast.TypeName{Name: p.expect(lexer.Ident).Text, Pos: pos}
+	name := p.expect(lexer.Ident).Text
+	if !p.at(lexer.Dot) {
+		return &ast.TypeName{Name: name, Pos: pos}
+	}
+	p.next()
+	return &ast.TypeName{Module: name, Name: p.expect(lexer.Ident).Text, Pos: pos}
 }
 
 func (p *Parser) block() *ast.Block {
@@ -591,6 +641,11 @@ func (p *Parser) postfix(x ast.Expr) ast.Expr {
 		case lexer.Dot:
 			p.next()
 			name := p.expect(lexer.Ident)
+			if module, ok := x.(*ast.Ident); ok && p.at(lexer.LBrace) && !p.noStruct {
+				x = p.structLit(name)
+				x.(*ast.StructLit).Module = module.Name
+				continue
+			}
 			x = &ast.Selector{X: x, Name: name.Text, Pos: name.Pos}
 		case lexer.Question:
 			p.next()

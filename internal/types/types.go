@@ -31,11 +31,14 @@ type Type struct {
 	Bits     int
 	Signed   bool
 	Optional bool
+	Module   string
+	Pub      bool
 	size     int
 }
 
 type Field struct {
 	Name   string
+	Pub    bool
 	Type   *Type
 	Offset int
 }

@@ -300,6 +300,36 @@ fn main() ! ParseError {
 - When `main` declares `! E` and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2.
 - A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
 
+### Modules
+
+```low
+import geometry
+import t = ui/text
+
+pub struct Circle {
+    pub radius: f64
+    cache: f64
+}
+
+pub fn area(c: Circle) -> f64 {
+    3.14159 * c.radius * c.radius
+}
+
+fn main() {
+    let c = geometry.circle(2.0)
+    print(geometry.area(c))
+    let s: geometry.Shape = Square(3)
+    print(t.shout("hi"))
+}
+```
+
+- A module is a directory: every `.low` file in it shares one namespace, so files of a module need no imports between them.
+- The project root is the nearest directory, starting at the entry, that holds a `low.mod` file; without one it is the entry's directory. `import ui/text` loads `<root>/ui/text/`.
+- `low build dir` builds the directory as the entry module. `low build file.low` builds that one file as the entry module, without the other files beside it.
+- Imports come before declarations and apply to their file. A module is used through its last path segment, `text.shout(...)`, or through a name given with `import t = ui/text`. Types are written `geometry.Shape` and built with `geometry.Point { ... }`; a variant can be named `geometry.Shape.Dot` or, where the type is expected, `Dot`.
+- Declarations and struct fields are private to their module unless marked `pub`. A `pub` enum's variants are public. A struct with private fields cannot be built with a literal outside its module.
+- An import cycle is an error, and so is importing two modules under one name.
+
 ### Generics
 
 ```low
@@ -336,6 +366,8 @@ Written in Go. Pipeline:
 | Assemble and link | `as`, `ld` | static ELF binary |
 
 The `low` command lives in `cmd/low`; the pipeline it shares with hot reload lives in `internal/compiler`. `low ir` prints the SSA form and `low asm` the generated assembly.
+
+`internal/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles. Every file records its module path, and every source position its file, so errors name the file they come from. The checker keeps a scope of types and functions per module; the prelude belongs to the entry module, and its `__` names cannot clash with anything else. A function in module `ui/text` becomes the symbol `fn_ui.text.shout`, and types display with their module path, such as `geometry.Circle`.
 
 The runtime, `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls.
 
@@ -380,7 +412,7 @@ On fib(38) this runs at 1.25x Go's time.
 
 ## Hot reload
 
-`low dev app.low` builds a dev binary, runs it, and watches the source. On save:
+`low dev app.low` or `low dev app/` builds a dev binary, runs it, and watches every source file of every loaded module, along with the file lists of their directories. On save:
 
 - A file that fails to compile is reported and the running program is left alone.
 - The program is restarted when a struct or enum layout changes, when an existing function's signature changes, or when `main` changes. A running frame of old code may still call any function, so it must keep the old calling convention and data layout; `main` never returns to pick up new code.
@@ -398,7 +430,7 @@ Mechanism:
 
 `internal/hot` tests reload against running programs: state kept across a code swap, functions added, compile errors leaving the program running, heap data surviving a reload while the collector runs, and restarts on layout and signature changes.
 
-`go test ./...` also compiles every `testdata/run/*.low`, runs it and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. Each `testdata/fail/*.low` must fail to compile with the message in its `.err`.
+`go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
 
 ## Implemented
 
@@ -413,16 +445,16 @@ Mechanism:
 - Range, slice and string loops; slice literals, indexing, slicing and `push`; string interpolation, concatenation and comparison.
 - Map literals, lookups, entry assignment, `delete` and map loops.
 - Builtins `print` for numbers, `bool` and `str`; `bytes` and `str`.
+- Modules as directories, imports, and `pub` visibility.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. Modules and visibility.
-2. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
-3. Embedded data: Unicode tables, SPIR-V and a fallback font.
-4. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
-5. C interop:
+1. Pointer maps from the register allocator, for precise garbage collection; noscan allocations for pixel and atlas buffers.
+2. Embedded data: Unicode tables, SPIR-V and a fallback font.
+3. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
+4. C interop:
    - `extern fn` declarations.
    - System V ABI thunks: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` and `xmm0` to `xmm7`, struct classification, 16-byte stack alignment.
    - C struct layout with natural alignment, alongside the one-word-per-scalar layout.
@@ -431,14 +463,14 @@ Mechanism:
    - Unmanaged pointer-plus-length views over mmap'd and GPU-mapped memory.
    - Explicit release of file descriptors and mappings.
    - The garbage collector never frees memory held only by C.
-6. Function values, and C-callable function pointers for callbacks.
-7. Generics, with type erasure or dynamic dispatch for custom elements and views.
-8. Green-thread scheduler, channels, `select`:
+5. Function values, and C-callable function pointers for callbacks.
+6. Generics, with type erasure or dynamic dispatch for custom elements and views.
+7. Green-thread scheduler, channels, `select`:
     - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
     - C calls run on a large system stack rather than the green-thread stack.
     - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-9. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-10. GPU UI library modelled on Zed's GPUI, Linux first:
+8. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+9. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation.
@@ -447,5 +479,5 @@ Mechanism:
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-11. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-12. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+10. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+11. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
