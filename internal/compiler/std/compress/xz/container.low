@@ -1,0 +1,392 @@
+import std/io
+import checksum = std/hash
+import std/crypto/hash
+
+struct Check {
+    size: i64
+    update: fn([]u8)
+    finish: fn() -> []u8
+}
+
+struct Delta {
+    distance: u8
+    history: []u8
+    pos: u8
+    out: []u8
+}
+
+struct Out {
+    data: []u8
+    len: i64
+}
+
+struct Xz {
+    r: *io.Reader
+    sink: fn([]u8) ! io.Error
+    limit: i64
+    produced: i64
+    lz: *Decoder
+    input: []u8
+    head: []u8
+    chunk_head: []u8
+}
+
+fn out_buffer() -> *Out {
+    new(Out { data: [], len: 0 })
+}
+
+fn append_out(o: *Out, b: []u8) {
+    if o.len + b.len > o.data.len {
+        var n = o.data.len * 2
+        if n < o.len + b.len {
+            n = o.len + b.len
+        }
+        if n < 4096 {
+            n = 4096
+        }
+        let grown: []u8 = __make(n)
+        __memmove(grown, o.data[..o.len])
+        o.data = grown
+    }
+    o.len += __memmove(o.data[o.len..], b)
+}
+
+fn out_bytes(o: *Out) -> []u8 {
+    o.data[..o.len]
+}
+
+fn le_bytes(v: u64, n: i64) -> []u8 {
+    let out: []u8 = __make(n)
+    for i in 0..n {
+        out[i] = u8(v >> u64(8 * i))
+    }
+    out
+}
+
+fn check_for(kind: i64) -> Check ! io.Error {
+    if kind == 0 {
+        return Check { size: 0, update: fn(b) {}, finish: fn() -> []u8 { le_bytes(0, 0) } }
+    }
+    if kind == 1 {
+        let c = checksum.crc32_new()
+        return Check {
+            size: 4
+            update: fn(b) { checksum.crc32_update(c, b) }
+            finish: fn() -> []u8 { le_bytes(u64(checksum.crc32_sum(c)), 4) }
+        }
+    }
+    if kind == 4 {
+        let c = checksum.crc64_new()
+        return Check {
+            size: 8
+            update: fn(b) { checksum.crc64_update(c, b) }
+            finish: fn() -> []u8 { le_bytes(checksum.crc64_sum(c), 8) }
+        }
+    }
+    if kind == 10 {
+        let digest = hash.sha256().digest()
+        return Check { size: 32, update: digest.update, finish: digest.finish }
+    }
+    fail Unsupported
+}
+
+fn delta_decode(dl: *Delta, data: []u8) -> []u8 {
+    if dl.out.len < data.len {
+        dl.out = __make(data.len)
+    }
+    let out = dl.out
+    let h = dl.history
+    let distance = dl.distance
+    var pos = dl.pos
+    for i in 0..data.len {
+        let b = data[i] + h[distance + pos]
+        out[i] = b
+        h[pos] = b
+        pos -= 1
+    }
+    dl.pos = pos
+    out[..data.len]
+}
+
+fn vli_at(b: []u8, mut at: i64, end: i64) -> i64 ! io.Error {
+    var v = 0
+    for i in 0..9 {
+        if at >= end {
+            fail Malformed
+        }
+        let c = b[at]
+        at += 1
+        if i > 0 && c == 0 {
+            fail Malformed
+        }
+        v |= i64(c & 0x7F) << (7 * i)
+        if c & 0x80 == 0 {
+            return v
+        }
+    }
+    fail Malformed
+}
+
+fn index_vli(x: *Xz, mut index: []u8) -> i64 ! io.Error {
+    let start = index.len
+    for {
+        read_full(x.r, x.chunk_head[..1])?
+        let c = x.chunk_head[0]
+        push(mut index, c)
+        if c & 0x80 == 0 || index.len - start == 9 {
+            break
+        }
+    }
+    var at = start
+    vli_at(index, mut at, index.len)
+}
+
+fn decode_index(x: *Xz, unpadded: []i64, sizes: []i64) -> i64 ! io.Error {
+    var index: []u8 = [0]
+    let count = index_vli(x, mut index)?
+    if count != unpadded.len {
+        fail Malformed
+    }
+    for i in 0..count {
+        let u = index_vli(x, mut index)?
+        let s = index_vli(x, mut index)?
+        if u != unpadded[i] || s != sizes[i] {
+            fail Malformed
+        }
+    }
+    let h = x.chunk_head
+    for index.len % 4 != 0 {
+        read_full(x.r, h[..1])?
+        if h[0] != 0 {
+            fail Malformed
+        }
+        push(mut index, 0)
+    }
+    read_full(x.r, h[..4])?
+    if checksum.crc32(index) != u32(io.le32(h, 0)) {
+        fail Malformed
+    }
+    index.len + 4
+}
+
+fn decode_block(x: *Xz, first: u8, kind: i64, mut unpadded: []i64, mut sizes: []i64) ! io.Error {
+    let size = (i64(first) + 1) * 4
+    let h = x.head
+    h[0] = first
+    read_full(x.r, h[1..size])?
+    let end = size - 4
+    if checksum.crc32(h[..end]) != u32(io.le32(h, end)) {
+        fail Malformed
+    }
+    let flags = h[1]
+    if flags & 0x3C != 0 {
+        fail Unsupported
+    }
+    var at = 2
+    var compressed_size = -1
+    var uncompressed_size = -1
+    if flags & 0x40 != 0 {
+        compressed_size = vli_at(h, mut at, end)?
+        if compressed_size == 0 {
+            fail Malformed
+        }
+    }
+    if flags & 0x80 != 0 {
+        uncompressed_size = vli_at(h, mut at, end)?
+    }
+    let count = i64(flags & 3) + 1
+    var deltas: []*Delta = []
+    var dict = 0
+    for i in 0..count {
+        let id = vli_at(h, mut at, end)?
+        let props = vli_at(h, mut at, end)?
+        if props > end - at {
+            fail Malformed
+        }
+        let last = i == count - 1
+        if id == 0x21 {
+            if !last {
+                fail Unsupported
+            }
+            if props != 1 {
+                fail Malformed
+            }
+            if h[at] & 0xC0 != 0 {
+                fail Unsupported
+            }
+            if h[at] > 40 {
+                fail Malformed
+            }
+            dict = dictionary_size(h[at])
+        } else if id == 0x03 {
+            if last || props != 1 {
+                fail Malformed
+            }
+            push(mut deltas, new(Delta { distance: h[at] + 1, history: __make(256), pos: 0, out: [] }))
+        } else {
+            fail Unsupported
+        }
+        at += props
+    }
+    for at < end {
+        if h[at] != 0 {
+            fail Unsupported
+        }
+        at += 1
+    }
+    let check = check_for(kind)?
+    var produced = 0
+    let d = x.lz
+    set_cap(d, window_cap(dict, x.limit - x.produced))
+    d.emit = fn(chunk) {
+        var out = chunk
+        var i = deltas.len - 1
+        for i >= 0 {
+            out = delta_decode(deltas[i], out)
+            i -= 1
+        }
+        if out.len > x.limit - x.produced {
+            fail TooLarge
+        }
+        x.produced += out.len
+        produced += out.len
+        check.update(out)
+        x.sink(out)?
+    }
+    let compressed = decode_lzma2(x.r, d, x.input, x.chunk_head)?
+    if compressed_size >= 0 && compressed_size != compressed {
+        fail Malformed
+    }
+    if uncompressed_size >= 0 && uncompressed_size != produced {
+        fail Malformed
+    }
+    let pad = (4 - compressed % 4) % 4
+    read_full(x.r, h[..pad + check.size])?
+    for i in 0..pad {
+        if h[i] != 0 {
+            fail Malformed
+        }
+    }
+    let want = check.finish()
+    for i in 0..check.size {
+        if h[pad + i] != want[i] {
+            fail Malformed
+        }
+    }
+    push(mut unpadded, size + compressed + check.size)
+    push(mut sizes, produced)
+}
+
+fn decode_stream(x: *Xz) ! io.Error {
+    let h = x.head
+    if h[0] != 0xFD || h[1] != 0x37 || h[2] != 0x7A || h[3] != 0x58 || h[4] != 0x5A || h[5] != 0 {
+        fail Malformed
+    }
+    if checksum.crc32(h[6..8]) != u32(io.le32(h, 8)) {
+        fail Malformed
+    }
+    if h[6] != 0 || h[7] > 0x0F {
+        fail Unsupported
+    }
+    let flags = h[7]
+    let kind = i64(flags)
+    var unpadded: []i64 = []
+    var sizes: []i64 = []
+    for {
+        read_full(x.r, h[..1])?
+        if h[0] == 0 {
+            break
+        }
+        decode_block(x, h[0], kind, mut unpadded, mut sizes)?
+    }
+    let index_size = decode_index(x, unpadded, sizes)?
+    read_full(x.r, h[..12])?
+    if checksum.crc32(h[4..10]) != u32(io.le32(h, 0)) {
+        fail Malformed
+    }
+    if (io.le32(h, 4) + 1) * 4 != index_size {
+        fail Malformed
+    }
+    if h[8] != 0 || h[9] != flags || h[10] != 0x59 || h[11] != 0x5A {
+        fail Malformed
+    }
+}
+
+pub fn decode(r: *io.Reader, sink: fn([]u8) ! io.Error, limit: i64) ! io.Error {
+    let x = new(Xz {
+        r
+        sink
+        limit
+        produced: 0
+        lz: decoder(4096, sink)
+        input: __make(65536)
+        head: __make(1024)
+        chunk_head: __make(16)
+    })
+    let h = x.head
+    read_full(r, h[..12])?
+    decode_stream(x)?
+    for {
+        let n = read_available(r, h[..4])?
+        if n == 0 {
+            return
+        }
+        if n < 4 {
+            fail Malformed
+        }
+        if h[0] == 0 && h[1] == 0 && h[2] == 0 && h[3] == 0 {
+            continue
+        }
+        read_full(r, h[4..12])?
+        decode_stream(x)?
+    }
+}
+
+pub fn decompress(data: []u8, limit: i64) -> []u8 ! io.Error {
+    let out = out_buffer()
+    let sink: fn([]u8) ! io.Error = fn(chunk) { append_out(out, chunk) }
+    decode(io.bytes_reader(data), sink, limit)?
+    out_bytes(out)
+}
+
+pub fn lzma_decompress(data: []u8, limit: i64) -> []u8 ! io.Error {
+    if data.len < 13 {
+        fail Malformed
+    }
+    let dict = io.le32(data, 1)
+    let known = io.le32(data, 5) != 0xFFFFFFFF || io.le32(data, 9) != 0xFFFFFFFF
+    let size = io.le64(data, 5)
+    if known && (size < 0 || size > limit) {
+        fail TooLarge
+    }
+    var bound = limit
+    if known {
+        bound = size
+    }
+    if bound > 0x3FFFFFFFFFFFFFFF {
+        bound = 0x3FFFFFFFFFFFFFFF
+    }
+    let goal = if known { size } else { bound + 1 }
+    let out = out_buffer()
+    let emit: fn([]u8) ! io.Error = fn(chunk) {
+        if chunk.len > limit - out.len {
+            fail TooLarge
+        }
+        append_out(out, chunk)
+    }
+    let d = decoder(window_cap(dict, bound), emit)
+    if !set_properties_byte(d.model, data[0]) {
+        fail Malformed
+    }
+    reset(d.model)
+    start_range(d, data[13..])
+    if d.bad {
+        fail Malformed
+    }
+    decode_until(d, goal)?
+    flush(d)?
+    if d.ended && (known && d.total != size || d.code != 0) {
+        fail Malformed
+    }
+    out_bytes(out)
+}

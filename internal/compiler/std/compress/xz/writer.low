@@ -1,0 +1,152 @@
+import std/io
+import checksum = std/hash
+
+pub struct Encoder {
+    lz: *Lz
+    sink: fn([]u8) ! io.Error
+    crc: *checksum.Crc64
+    total: i64
+    compressed: i64
+    stream_started: bool
+    block_started: bool
+    finished: bool
+}
+
+fn put_vli(mut b: []u8, v: i64) {
+    var rest = v
+    for rest >= 0x80 {
+        push(mut b, u8(rest & 0x7F | 0x80))
+        rest = rest >> 7
+    }
+    push(mut b, u8(rest))
+}
+
+fn append_crc32(mut b: []u8, from: i64) {
+    let crc = checksum.crc32(b[from..])
+    io.append(mut b, le_bytes(u64(crc), 4))
+}
+
+fn start_stream(e: *Encoder) ! io.Error {
+    if e.stream_started {
+        return
+    }
+    e.stream_started = true
+    var h: []u8 = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0, 0, 4]
+    append_crc32(mut h, 6)
+    e.sink(h)?
+}
+
+fn start_block(e: *Encoder) ! io.Error {
+    if e.block_started {
+        return
+    }
+    start_stream(e)?
+    e.block_started = true
+    var h: []u8 = [2, 0, 0x21, 1, dictionary_byte(e.lz.dict), 0, 0, 0]
+    append_crc32(mut h, 0)
+    e.sink(h)?
+}
+
+fn make_encoder(level: i64, sink: fn([]u8) ! io.Error, hint: i64) -> *Encoder {
+    let l = clamp_level(level)
+    let lz = lz_new(l, fitted_dict(l, hint), hint, true)
+    let e = new(Encoder {
+        lz
+        sink
+        crc: checksum.crc64_new()
+        total: 0
+        compressed: 0
+        stream_started: false
+        block_started: false
+        finished: false
+    })
+    lz.emit = fn(chunk) {
+        start_block(e)?
+        e.compressed += chunk.len
+        e.sink(chunk)?
+    }
+    e
+}
+
+pub fn encoder(level: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
+    make_encoder(level, sink, -1)
+}
+
+pub fn encode(e: *Encoder, data: []u8) ! io.Error {
+    if e.finished {
+        fail Invalid
+    }
+    checksum.crc64_update(e.crc, data)
+    e.total += data.len
+    feed(e.lz, data)?
+}
+
+pub fn finish(e: *Encoder) ! io.Error {
+    if e.finished {
+        fail Invalid
+    }
+    e.finished = true
+    finish_chunks(e.lz)?
+    start_stream(e)?
+    var tail: []u8 = []
+    var index: []u8 = [0]
+    if e.total > 0 {
+        let end: []u8 = [0]
+        e.lz.emit(end)?
+        for _ in 0..(4 - e.compressed % 4) % 4 {
+            push(mut tail, 0)
+        }
+        io.append(mut tail, le_bytes(checksum.crc64_sum(e.crc), 8))
+        put_vli(mut index, 1)
+        put_vli(mut index, 12 + e.compressed + 8)
+        put_vli(mut index, e.total)
+    } else {
+        put_vli(mut index, 0)
+    }
+    for index.len % 4 != 0 {
+        push(mut index, 0)
+    }
+    append_crc32(mut index, 0)
+    io.append(mut tail, index)
+    var footer: []u8 = le_bytes(u64(index.len / 4 - 1), 4)
+    push(mut footer, 0)
+    push(mut footer, 4)
+    io.append(mut tail, le_bytes(u64(checksum.crc32(footer)), 4))
+    io.append(mut tail, footer)
+    push(mut tail, 0x59)
+    push(mut tail, 0x5A)
+    e.sink(tail)?
+}
+
+pub fn compress(data: []u8, level: i64) -> []u8 {
+    let out = out_buffer()
+    let sink: fn([]u8) ! io.Error = fn(chunk) { append_out(out, chunk) }
+    let e = make_encoder(level, sink, data.len)
+    encode(e, data) catch {
+        _ => {}
+    }
+    finish(e) catch {
+        _ => {}
+    }
+    out_bytes(out)
+}
+
+pub fn lzma_compress(data: []u8, level: i64) -> []u8 {
+    let l = clamp_level(level)
+    let dict = fitted_dict(l, data.len)
+    let lz = lz_new(l, dict, data.len, false)
+    feed(lz, data) catch {
+        _ => {}
+    }
+    pump(lz, true) catch {
+        _ => {}
+    }
+    flush_encoder(lz)
+    var out: []u8 = [properties_byte(lz.model)]
+    io.append(mut out, le_bytes(u64(dict), 4))
+    io.append(mut out, le_bytes(u64(data.len), 8))
+    let body: []u8 = __make(out.len + lz.olen)
+    __memmove(body, out)
+    __memmove(body[out.len..], lz.out[..lz.olen])
+    body
+}

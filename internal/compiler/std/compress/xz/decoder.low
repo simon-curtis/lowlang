@@ -1,0 +1,384 @@
+import std/io
+
+struct Decoder {
+    model: *Model
+    range: u32
+    code: u32
+    input: []u8
+    at: i64
+    overrun: bool
+    win: []u8
+    cap: i64
+    wpos: i64
+    full: i64
+    flushed: i64
+    total: i64
+    pending: i64
+    ended: bool
+    bad: bool
+    emit: fn([]u8) ! io.Error
+}
+
+fn decoder(cap: i64, emit: fn([]u8) ! io.Error) -> *Decoder {
+    new(Decoder {
+        model: model(0, 0, 0)
+        range: 0
+        code: 0
+        input: []
+        at: 0
+        overrun: false
+        win: []
+        cap
+        wpos: 0
+        full: 0
+        flushed: 0
+        total: 0
+        pending: 0
+        ended: false
+        bad: false
+        emit
+    })
+}
+
+fn window_cap(dict: i64, remaining: i64) -> i64 {
+    var cap = dict
+    if remaining < cap {
+        cap = remaining + 1
+    }
+    if cap < 4096 {
+        cap = 4096
+    }
+    cap
+}
+
+fn set_cap(d: *Decoder, cap: i64) {
+    d.cap = cap
+    if d.win.len > cap {
+        d.win = d.win[..cap]
+    }
+}
+
+fn reset_dictionary(d: *Decoder) {
+    d.wpos = 0
+    d.flushed = 0
+    d.full = 0
+    d.total = 0
+    d.pending = 0
+}
+
+fn start_range(d: *Decoder, input: []u8) {
+    d.input = input
+    d.overrun = false
+    d.ended = false
+    d.bad = false
+    d.range = 0xFFFFFFFF
+    if input.len < 5 || input[0] != 0 {
+        d.bad = true
+        d.at = input.len
+        return
+    }
+    d.code = u32(io.be32(input, 1))
+    d.at = 5
+}
+
+fn next_input(d: *Decoder) -> u32 {
+    if d.at < d.input.len {
+        let b = d.input[d.at]
+        d.at += 1
+        return u32(b)
+    }
+    d.overrun = true
+    0
+}
+
+fn dbit(d: *Decoder, p: []u16, i: i64) -> i64 {
+    let prob = p[i]
+    let bound = (d.range >> 11) * u32(prob)
+    var b = 0
+    if d.code < bound {
+        d.range = bound
+        p[i] = prob + ((2048 - prob) >> 5)
+    } else {
+        d.range -= bound
+        d.code -= bound
+        p[i] = prob - (prob >> 5)
+        b = 1
+    }
+    if d.range < 0x1000000 {
+        d.range = d.range << 8
+        d.code = d.code << 8 | next_input(d)
+    }
+    b
+}
+
+fn dtree(d: *Decoder, p: []u16, base: i64, bits: i64) -> i64 {
+    var m = 1
+    for _ in 0..bits {
+        m = m << 1 | dbit(d, p, base + m)
+    }
+    m - (1 << bits)
+}
+
+fn dreverse(d: *Decoder, p: []u16, base: i64, bits: i64) -> i64 {
+    var m = 1
+    var v = 0
+    for i in 0..bits {
+        let b = dbit(d, p, base + m)
+        m = m << 1 | b
+        v |= b << i
+    }
+    v
+}
+
+fn ddirect(d: *Decoder, bits: i64) -> i64 {
+    var v = 0
+    for _ in 0..bits {
+        d.range = d.range >> 1
+        var b = 0
+        if d.code >= d.range {
+            d.code -= d.range
+            b = 1
+        }
+        v = v << 1 | b
+        if d.range < 0x1000000 {
+            d.range = d.range << 8
+            d.code = d.code << 8 | next_input(d)
+        }
+    }
+    v
+}
+
+fn decode_len(d: *Decoder, l: LenProbs, pos_state: i64) -> i64 {
+    if dbit(d, l.choice, 0) == 0 {
+        return 2 + dtree(d, l.low, pos_state * 8, 3)
+    }
+    if dbit(d, l.choice, 1) == 0 {
+        return 10 + dtree(d, l.mid, pos_state * 8, 3)
+    }
+    18 + dtree(d, l.high, 0, 8)
+}
+
+fn decode_distance(d: *Decoder, m: *Model, len: i64) -> i64 {
+    var lps = len - 2
+    if lps > 3 {
+        lps = 3
+    }
+    let slot = dtree(d, m.pos_slot, lps * 64, 6)
+    if slot < 4 {
+        return slot
+    }
+    let footer = (slot >> 1) - 1
+    let base = (2 | (slot & 1)) << footer
+    if slot < 14 {
+        return base + dreverse(d, m.spec_pos, base - slot - 1, footer)
+    }
+    base + (ddirect(d, footer - 4) << 4) + dreverse(d, m.align, 0, 4)
+}
+
+fn back(d: *Decoder, dist: i64) -> u8 {
+    var i = d.wpos - dist - 1
+    if i < 0 {
+        i += d.win.len
+    }
+    d.win[i]
+}
+
+fn put(d: *Decoder, b: u8) {
+    d.win[d.wpos] = b
+    d.wpos += 1
+    d.total += 1
+    if d.full < d.win.len {
+        d.full += 1
+    }
+}
+
+fn decode_literal(d: *Decoder, m: *Model) {
+    var prev = 0
+    if d.full > 0 {
+        prev = i64(back(d, 0))
+    }
+    let base = 0x300 * (((d.total & ((1 << m.lp) - 1)) << m.lc) + (prev >> (8 - m.lc)))
+    let lit = m.literal
+    var sym = 1
+    if m.state < 7 {
+        for sym < 0x100 {
+            sym = sym << 1 | dbit(d, lit, base + sym)
+        }
+    } else {
+        var match_byte = i64(back(d, m.rep0))
+        var offs = 0x100
+        for sym < 0x100 {
+            match_byte = match_byte << 1
+            let match_bit = match_byte & offs
+            let b = dbit(d, lit, base + offs + match_bit + sym)
+            sym = sym << 1 | b
+            if b == 1 {
+                offs = match_bit
+            } else {
+                offs &= ~match_bit
+            }
+        }
+    }
+    put(d, u8(sym))
+    m.state = after_literal(m.state)
+}
+
+fn copy_match(d: *Decoder, limit: i64) {
+    var n = d.pending
+    if n > limit - d.wpos {
+        n = limit - d.wpos
+    }
+    d.pending -= n
+    d.total += n
+    d.full += n
+    if d.full > d.win.len {
+        d.full = d.win.len
+    }
+    let win = d.win
+    let dist = d.model.rep0 + 1
+    var left = n
+    for left > 0 {
+        var src = d.wpos - dist
+        if src < 0 {
+            src += win.len
+        }
+        var seg = left
+        if seg > win.len - src {
+            seg = win.len - src
+        }
+        let dst = d.wpos
+        if dist >= seg {
+            __memmove(win[dst..dst + seg], win[src..src + seg])
+        } else {
+            for i in 0..seg {
+                win[dst + i] = win[src + i]
+            }
+        }
+        d.wpos += seg
+        left -= seg
+    }
+}
+
+fn run(d: *Decoder, goal: i64) {
+    let m = d.model
+    var limit = d.wpos + goal - d.total
+    if limit > d.win.len {
+        limit = d.win.len
+    }
+    if d.pending > 0 {
+        copy_match(d, limit)
+    }
+    let pb_mask = (1 << m.pb) - 1
+    for d.wpos < limit && !d.overrun {
+        let pos_state = d.total & pb_mask
+        let s = m.state
+        if dbit(d, m.is_match, s * 16 + pos_state) == 0 {
+            decode_literal(d, m)
+            continue
+        }
+        if dbit(d, m.is_rep, s) == 0 {
+            let len = decode_len(d, m.match_len, pos_state)
+            m.state = after_match(s)
+            m.rep3 = m.rep2
+            m.rep2 = m.rep1
+            m.rep1 = m.rep0
+            let dist = decode_distance(d, m, len)
+            if dist == 0xFFFFFFFF {
+                d.ended = true
+                return
+            }
+            m.rep0 = dist
+            d.pending = len
+        } else {
+            if dbit(d, m.is_rep_g0, s) == 0 {
+                if dbit(d, m.is_rep0_long, s * 16 + pos_state) == 0 {
+                    if m.rep0 >= d.full {
+                        d.bad = true
+                        return
+                    }
+                    m.state = after_short_rep(s)
+                    put(d, back(d, m.rep0))
+                    continue
+                }
+            } else {
+                var dist = 0
+                if dbit(d, m.is_rep_g1, s) == 0 {
+                    dist = m.rep1
+                } else {
+                    if dbit(d, m.is_rep_g2, s) == 0 {
+                        dist = m.rep2
+                    } else {
+                        dist = m.rep3
+                        m.rep3 = m.rep2
+                    }
+                    m.rep2 = m.rep1
+                }
+                m.rep1 = m.rep0
+                m.rep0 = dist
+            }
+            d.pending = decode_len(d, m.rep_len, pos_state)
+            m.state = after_rep(s)
+        }
+        if m.rep0 >= d.full {
+            d.bad = true
+            return
+        }
+        copy_match(d, limit)
+    }
+}
+
+fn flush(d: *Decoder) ! io.Error {
+    if d.wpos > d.flushed {
+        let chunk = d.win[d.flushed..d.wpos]
+        d.flushed = d.wpos
+        d.emit(chunk)?
+    }
+}
+
+fn make_room(d: *Decoder) ! io.Error {
+    if d.win.len < d.cap {
+        var n = d.win.len * 2
+        if n < 65536 {
+            n = 65536
+        }
+        if n > d.cap {
+            n = d.cap
+        }
+        let grown: []u8 = __make(n)
+        __memmove(grown, d.win[..d.wpos])
+        d.win = grown
+        return
+    }
+    flush(d)?
+    d.wpos = 0
+    d.flushed = 0
+}
+
+fn decode_until(d: *Decoder, goal: i64) ! io.Error {
+    for d.total < goal && !d.ended {
+        if d.wpos == d.win.len {
+            make_room(d)?
+        }
+        run(d, goal)
+        if d.bad || d.overrun {
+            fail Malformed
+        }
+    }
+}
+
+fn put_raw(d: *Decoder, data: []u8) ! io.Error {
+    var rest = data
+    for rest.len > 0 {
+        if d.wpos == d.win.len {
+            make_room(d)?
+        }
+        let n = __memmove(d.win[d.wpos..], rest)
+        d.wpos += n
+        d.total += n
+        d.full += n
+        if d.full > d.win.len {
+            d.full = d.win.len
+        }
+        rest = rest[n..]
+    }
+}

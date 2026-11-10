@@ -1,0 +1,727 @@
+import std/io
+
+struct Matches {
+    lens: []i64
+    dists: []i64
+    count: i64
+}
+
+struct Lz {
+    model: *Model
+    low: u64
+    range: u32
+    cache: u8
+    cache_size: i64
+    out: []u8
+    olen: i64
+    mark: i64
+    buf: []u8
+    base: i64
+    pos: i64
+    end: i64
+    hashed: i64
+    window: i64
+    hint: i64
+    dict: i64
+    head: []u32
+    head_shift: u32
+    near: []u32
+    prev: []u32
+    prev_cap: i64
+    depth: i64
+    nice: i64
+    cur: *Matches
+    next: *Matches
+    next_at: i64
+    choice_len: i64
+    choice_back: i64
+    chunked: bool
+    chunk_open: bool
+    chunk_start: i64
+    reset_bits: i64
+    need_dictionary: bool
+    need_properties: bool
+    need_state: bool
+    emit: fn([]u8) ! io.Error
+}
+
+fn matches() -> *Matches {
+    new(Matches { lens: __make(280), dists: __make(280), count: 0 })
+}
+
+fn preset_dict(level: i64) -> i64 {
+    if level == 0 { 1 << 18 } else if level == 1 { 1 << 20 } else if level == 2 { 1 << 21 } else if level <= 4 { 1 << 22 } else if level <= 6 { 1 << 23 } else if level == 7 { 1 << 24 } else if level == 8 { 1 << 25 } else { 1 << 26 }
+}
+
+fn preset_depth(level: i64) -> i64 {
+    if level <= 1 { 4 << level } else if level <= 3 { 12 * level } else if level <= 6 { 16 * level } else { 48 << (level - 7) }
+}
+
+fn preset_nice(level: i64) -> i64 {
+    if level <= 1 { 32 } else if level <= 3 { 48 } else if level <= 5 { 64 } else if level == 6 { 128 } else { 273 }
+}
+
+fn clamp_level(level: i64) -> i64 {
+    if level < 0 { 0 } else if level > 9 { 9 } else { level }
+}
+
+fn fitted_dict(level: i64, hint: i64) -> i64 {
+    var dict = preset_dict(level)
+    if hint >= 0 {
+        var fit = 4096
+        for fit < hint && fit < dict {
+            fit = fit << 1
+        }
+        if fit < dict {
+            dict = fit
+        }
+    }
+    dict
+}
+
+fn lz_new(level: i64, dict: i64, hint: i64, chunked: bool) -> *Lz {
+    var prev_cap = 4096
+    for prev_cap < dict {
+        prev_cap = prev_cap << 1
+    }
+    let head_bits: u32 = if level <= 1 { 16 } else if level <= 4 { 18 } else { 20 }
+    let mark = if chunked { 6 } else { 0 }
+    let out_size = if chunked { 65536 + 1024 } else { 65536 }
+    new(Lz {
+        model: model(3, 0, 2)
+        low: 0
+        range: 0xFFFFFFFF
+        cache: 0
+        cache_size: 1
+        out: __make(out_size)
+        olen: mark
+        mark
+        buf: []
+        base: 0
+        pos: 0
+        end: 0
+        hashed: 0
+        window: 2 * prev_cap + (1 << 22)
+        hint
+        dict
+        head: __make(1 << head_bits)
+        head_shift: 32 - head_bits
+        near: __make(1 << 16)
+        prev: []
+        prev_cap
+        depth: preset_depth(level)
+        nice: preset_nice(level)
+        cur: matches()
+        next: matches()
+        next_at: -1
+        choice_len: 0
+        choice_back: 0
+        chunked
+        chunk_open: false
+        chunk_start: 0
+        reset_bits: 0
+        need_dictionary: true
+        need_properties: true
+        need_state: false
+        emit: fn(b) {}
+    })
+}
+
+fn put_out(lz: *Lz, b: u8) {
+    if lz.olen == lz.out.len {
+        let grown: []u8 = __make(lz.out.len * 2)
+        __memmove(grown, lz.out)
+        lz.out = grown
+    }
+    lz.out[lz.olen] = b
+    lz.olen += 1
+}
+
+fn shift_low(lz: *Lz) {
+    if lz.low < 0xFF000000 || lz.low >= 0x100000000 {
+        let carry = u8(lz.low >> 32)
+        var temp = lz.cache
+        for {
+            put_out(lz, temp + carry)
+            temp = 0xFF
+            lz.cache_size -= 1
+            if lz.cache_size == 0 {
+                break
+            }
+        }
+        lz.cache = u8(lz.low >> 24)
+    }
+    lz.cache_size += 1
+    lz.low = (lz.low & 0xFFFFFF) << 8
+}
+
+fn start_encoder(lz: *Lz) {
+    lz.low = 0
+    lz.range = 0xFFFFFFFF
+    lz.cache = 0
+    lz.cache_size = 1
+    lz.olen = lz.mark
+}
+
+fn flush_encoder(lz: *Lz) {
+    for _ in 0..5 {
+        shift_low(lz)
+    }
+}
+
+fn ebit(lz: *Lz, p: []u16, i: i64, b: i64) {
+    let prob = p[i]
+    let bound = (lz.range >> 11) * u32(prob)
+    if b == 0 {
+        lz.range = bound
+        p[i] = prob + ((2048 - prob) >> 5)
+    } else {
+        lz.low += u64(bound)
+        lz.range -= bound
+        p[i] = prob - (prob >> 5)
+    }
+    if lz.range < 0x1000000 {
+        lz.range = lz.range << 8
+        shift_low(lz)
+    }
+}
+
+fn etree(lz: *Lz, p: []u16, base: i64, bits: i64, v: i64) {
+    var m = 1
+    var i = bits - 1
+    for i >= 0 {
+        let b = v >> i & 1
+        ebit(lz, p, base + m, b)
+        m = m << 1 | b
+        i -= 1
+    }
+}
+
+fn ereverse(lz: *Lz, p: []u16, base: i64, bits: i64, v: i64) {
+    var m = 1
+    for i in 0..bits {
+        let b = v >> i & 1
+        ebit(lz, p, base + m, b)
+        m = m << 1 | b
+    }
+}
+
+fn edirect(lz: *Lz, bits: i64, v: i64) {
+    var i = bits - 1
+    for i >= 0 {
+        lz.range = lz.range >> 1
+        if v >> i & 1 == 1 {
+            lz.low += u64(lz.range)
+        }
+        if lz.range < 0x1000000 {
+            lz.range = lz.range << 8
+            shift_low(lz)
+        }
+        i -= 1
+    }
+}
+
+fn encode_len(lz: *Lz, l: LenProbs, len: i64, pos_state: i64) {
+    let v = len - 2
+    if v < 8 {
+        ebit(lz, l.choice, 0, 0)
+        etree(lz, l.low, pos_state * 8, 3, v)
+    } else if v < 16 {
+        ebit(lz, l.choice, 0, 1)
+        ebit(lz, l.choice, 1, 0)
+        etree(lz, l.mid, pos_state * 8, 3, v - 8)
+    } else {
+        ebit(lz, l.choice, 0, 1)
+        ebit(lz, l.choice, 1, 1)
+        etree(lz, l.high, 0, 8, v - 16)
+    }
+}
+
+fn distance_slot(dist: i64) -> i64 {
+    if dist < 4 {
+        return dist
+    }
+    var n = 0
+    var t = dist
+    for t >= 2 {
+        t = t >> 1
+        n += 1
+    }
+    2 * n + (dist >> (n - 1) & 1)
+}
+
+fn encode_distance(lz: *Lz, m: *Model, dist: i64, len: i64) {
+    var lps = len - 2
+    if lps > 3 {
+        lps = 3
+    }
+    let slot = distance_slot(dist)
+    etree(lz, m.pos_slot, lps * 64, 6, slot)
+    if slot < 4 {
+        return
+    }
+    let footer = (slot >> 1) - 1
+    let base = (2 | (slot & 1)) << footer
+    let reduced = dist - base
+    if slot < 14 {
+        ereverse(lz, m.spec_pos, base - slot - 1, footer, reduced)
+    } else {
+        edirect(lz, footer - 4, reduced >> 4)
+        ereverse(lz, m.align, 0, 4, reduced & 15)
+    }
+}
+
+fn encode_literal(lz: *Lz, m: *Model) {
+    let p = lz.pos
+    let total = lz.base + p
+    var prev = 0
+    if total > 0 {
+        prev = i64(lz.buf[p - 1])
+    }
+    let base = 0x300 * (((total & ((1 << m.lp) - 1)) << m.lc) + (prev >> (8 - m.lc)))
+    let lit = m.literal
+    let sym = i64(lz.buf[p])
+    var t = 1
+    if m.state < 7 {
+        var i = 7
+        for i >= 0 {
+            let b = sym >> i & 1
+            ebit(lz, lit, base + t, b)
+            t = t << 1 | b
+            i -= 1
+        }
+    } else {
+        var match_byte = i64(lz.buf[p - m.rep0 - 1])
+        var offs = 0x100
+        var i = 7
+        for i >= 0 {
+            match_byte = match_byte << 1
+            let match_bit = match_byte & offs
+            let b = sym >> i & 1
+            ebit(lz, lit, base + offs + match_bit + t, b)
+            t = t << 1 | b
+            if b == 1 {
+                offs = match_bit
+            } else {
+                offs &= ~match_bit
+            }
+            i -= 1
+        }
+    }
+    m.state = after_literal(m.state)
+}
+
+fn encode_rep(lz: *Lz, m: *Model, index: i64, len: i64, pos_state: i64) {
+    let s = m.state
+    ebit(lz, m.is_match, s * 16 + pos_state, 1)
+    ebit(lz, m.is_rep, s, 1)
+    if index == 0 {
+        ebit(lz, m.is_rep_g0, s, 0)
+        ebit(lz, m.is_rep0_long, s * 16 + pos_state, 1)
+    } else {
+        ebit(lz, m.is_rep_g0, s, 1)
+        var dist = m.rep1
+        if index == 1 {
+            ebit(lz, m.is_rep_g1, s, 0)
+        } else {
+            ebit(lz, m.is_rep_g1, s, 1)
+            ebit(lz, m.is_rep_g2, s, index - 2)
+            if index == 2 {
+                dist = m.rep2
+            } else {
+                dist = m.rep3
+                m.rep3 = m.rep2
+            }
+            m.rep2 = m.rep1
+        }
+        m.rep1 = m.rep0
+        m.rep0 = dist
+    }
+    encode_len(lz, m.rep_len, len, pos_state)
+    m.state = after_rep(s)
+}
+
+fn encode_match(lz: *Lz, m: *Model, dist: i64, len: i64, pos_state: i64) {
+    let s = m.state
+    ebit(lz, m.is_match, s * 16 + pos_state, 1)
+    ebit(lz, m.is_rep, s, 0)
+    encode_len(lz, m.match_len, len, pos_state)
+    encode_distance(lz, m, dist, len)
+    m.rep3 = m.rep2
+    m.rep2 = m.rep1
+    m.rep1 = m.rep0
+    m.rep0 = dist
+    m.state = after_match(s)
+}
+
+fn hash4(lz: *Lz, p: i64) -> i64 {
+    let b = lz.buf
+    let v = u32(b[p]) | u32(b[p + 1]) << 8 | u32(b[p + 2]) << 16 | u32(b[p + 3]) << 24
+    i64(v * 2654435761 >> lz.head_shift)
+}
+
+fn hash3(lz: *Lz, p: i64) -> i64 {
+    let b = lz.buf
+    let v = u32(b[p]) | u32(b[p + 1]) << 8 | u32(b[p + 2]) << 16
+    i64(v * 506832829 >> 16)
+}
+
+fn insert(lz: *Lz, p: i64) {
+    let h4 = hash4(lz, p)
+    lz.prev[p & (lz.prev.len - 1)] = lz.head[h4]
+    lz.head[h4] = u32(p + 1)
+    lz.near[hash3(lz, p)] = u32(p + 1)
+}
+
+fn catch_up(lz: *Lz, target: i64) {
+    var p = lz.hashed
+    let last = lz.end - 4
+    for p < target {
+        if p <= last {
+            insert(lz, p)
+        }
+        p += 1
+    }
+    if target > lz.hashed {
+        lz.hashed = target
+    }
+}
+
+fn record(into: *Matches, len: i64, dist: i64) {
+    into.lens[into.count] = len
+    into.dists[into.count] = dist
+    into.count += 1
+}
+
+fn find(lz: *Lz, p: i64, into: *Matches) {
+    catch_up(lz, p)
+    into.count = 0
+    var max_len = lz.end - p
+    if max_len > 273 {
+        max_len = 273
+    }
+    if max_len < 4 {
+        lz.hashed = p + 1
+        return
+    }
+    let b = lz.buf
+    let h4 = hash4(lz, p)
+    let h3 = hash3(lz, p)
+    var best = 2
+    let near = i64(lz.near[h3]) - 1
+    if near >= 0 && p - near <= lz.dict && b[near] == b[p] && b[near + 1] == b[p + 1] && b[near + 2] == b[p + 2] {
+        var len = 3
+        for len < max_len && b[near + len] == b[p + len] {
+            len += 1
+        }
+        record(into, len, p - near - 1)
+        best = len
+    }
+    let mask = lz.prev.len - 1
+    var cand = i64(lz.head[h4]) - 1
+    lz.prev[p & mask] = lz.head[h4]
+    lz.head[h4] = u32(p + 1)
+    lz.near[h3] = u32(p + 1)
+    lz.hashed = p + 1
+    var steps = lz.depth
+    let nice = lz.nice
+    for cand >= 0 && steps > 0 && best < max_len && best < nice && p - cand <= lz.dict {
+        if b[cand + best] == b[p + best] && b[cand] == b[p] {
+            var len = 1
+            for len < max_len && b[cand + len] == b[p + len] {
+                len += 1
+            }
+            if len > best {
+                record(into, len, p - cand - 1)
+                best = len
+            }
+        }
+        let next = i64(lz.prev[cand & mask]) - 1
+        if next >= cand {
+            break
+        }
+        cand = next
+        steps -= 1
+    }
+}
+
+fn rep_length(lz: *Lz, p: i64, dist: i64, limit: i64) -> i64 {
+    let src = p - dist - 1
+    if src < 0 {
+        return 0
+    }
+    let b = lz.buf
+    var n = 0
+    for n < limit && b[src + n] == b[p + n] {
+        n += 1
+    }
+    n
+}
+
+fn rep_distance(m: *Model, i: i64) -> i64 {
+    if i == 0 { m.rep0 } else if i == 1 { m.rep1 } else if i == 2 { m.rep2 } else { m.rep3 }
+}
+
+fn change_pair(small: i64, big: i64) -> bool {
+    big >> 7 > small
+}
+
+fn choose_literal(lz: *Lz) {
+    lz.choice_len = 1
+    lz.choice_back = -1
+}
+
+fn choose(lz: *Lz) {
+    let pos = lz.pos
+    let m = lz.model
+    var avail = lz.end - pos
+    if avail > 273 {
+        avail = 273
+    }
+    var cur = lz.cur
+    if lz.next_at == pos {
+        lz.cur = lz.next
+        lz.next = cur
+        cur = lz.cur
+    } else {
+        find(lz, pos, cur)
+    }
+    lz.next_at = -1
+    if avail < 2 {
+        choose_literal(lz)
+        return
+    }
+    var rep_len = 0
+    var rep_index = 0
+    for i in 0..4 {
+        let len = rep_length(lz, pos, rep_distance(m, i), avail)
+        if len >= lz.nice {
+            lz.choice_len = len
+            lz.choice_back = i
+            return
+        }
+        if len > rep_len {
+            rep_len = len
+            rep_index = i
+        }
+    }
+    var main_len = 0
+    var main_dist = 0
+    var k = cur.count - 1
+    if k >= 0 {
+        main_len = cur.lens[k]
+        main_dist = cur.dists[k]
+        if main_len >= lz.nice {
+            lz.choice_len = main_len
+            lz.choice_back = main_dist + 4
+            return
+        }
+        for k > 0 && main_len == cur.lens[k - 1] + 1 && change_pair(cur.dists[k - 1], main_dist) {
+            k -= 1
+            main_len = cur.lens[k]
+            main_dist = cur.dists[k]
+        }
+        if main_len == 3 && main_dist >= 0x4000 {
+            main_len = 1
+        }
+    }
+    if rep_len >= 2 && (rep_len + 1 >= main_len || rep_len + 2 >= main_len && main_dist >= 1 << 9 || rep_len + 3 >= main_len && main_dist >= 1 << 15) {
+        lz.choice_len = rep_len
+        lz.choice_back = rep_index
+        return
+    }
+    if main_len < 2 || avail <= 2 {
+        choose_literal(lz)
+        return
+    }
+    let next = lz.next
+    find(lz, pos + 1, next)
+    lz.next_at = pos + 1
+    if next.count > 0 {
+        let new_len = next.lens[next.count - 1]
+        let new_dist = next.dists[next.count - 1]
+        if new_len >= main_len && new_dist < main_dist || new_len == main_len + 1 && !change_pair(main_dist, new_dist) || new_len > main_len + 1 || new_len + 1 >= main_len && main_len >= 3 && change_pair(new_dist, main_dist) {
+            choose_literal(lz)
+            return
+        }
+    }
+    let limit = if main_len - 1 > 2 { main_len - 1 } else { 2 }
+    for i in 0..4 {
+        if rep_length(lz, pos + 1, rep_distance(m, i), limit) >= limit {
+            choose_literal(lz)
+            return
+        }
+    }
+    lz.choice_len = main_len
+    lz.choice_back = main_dist + 4
+}
+
+fn step(lz: *Lz) {
+    choose(lz)
+    let m = lz.model
+    let len = lz.choice_len
+    let back = lz.choice_back
+    let pos_state = (lz.base + lz.pos) & ((1 << m.pb) - 1)
+    if back < 0 {
+        ebit(lz, m.is_match, m.state * 16 + pos_state, 0)
+        encode_literal(lz, m)
+    } else if back < 4 {
+        encode_rep(lz, m, back, len, pos_state)
+    } else {
+        encode_match(lz, m, back - 4, len, pos_state)
+    }
+    lz.pos += len
+}
+
+fn open_chunk(lz: *Lz) {
+    lz.reset_bits = if lz.need_dictionary { 3 } else if lz.need_properties { 2 } else if lz.need_state { 1 } else { 0 }
+    if lz.reset_bits > 0 {
+        reset(lz.model)
+    }
+    start_encoder(lz)
+    lz.chunk_start = lz.pos
+    lz.chunk_open = true
+}
+
+fn close_chunk(lz: *Lz) ! io.Error {
+    lz.chunk_open = false
+    flush_encoder(lz)
+    let unpacked = lz.pos - lz.chunk_start
+    let packed = lz.olen - lz.mark
+    if unpacked == 0 {
+        return
+    }
+    let out = lz.out
+    if packed >= unpacked {
+        var at = lz.chunk_start
+        for at < lz.pos {
+            var n = lz.pos - at
+            if n > 65536 {
+                n = 65536
+            }
+            out[0] = if lz.need_dictionary { 1 } else { 2 }
+            out[1] = u8((n - 1) >> 8)
+            out[2] = u8(n - 1)
+            __memmove(out[3..3 + n], lz.buf[at..at + n])
+            lz.need_dictionary = false
+            lz.emit(out[..3 + n])?
+            at += n
+        }
+        lz.need_state = true
+        return
+    }
+    let u = unpacked - 1
+    let p = packed - 1
+    var start = 1
+    if lz.reset_bits >= 2 {
+        start = 0
+        out[5] = properties_byte(lz.model)
+    }
+    out[start] = u8(0x80 | lz.reset_bits << 5 | u >> 16)
+    out[start + 1] = u8(u >> 8)
+    out[start + 2] = u8(u)
+    out[start + 3] = u8(p >> 8)
+    out[start + 4] = u8(p)
+    lz.need_dictionary = false
+    lz.need_properties = false
+    lz.need_state = false
+    lz.emit(out[start..lz.olen])?
+}
+
+fn pump(lz: *Lz, final: bool) ! io.Error {
+    let stop = if final { lz.end } else { lz.end - 274 }
+    for lz.pos < stop {
+        if lz.chunked {
+            if !lz.chunk_open {
+                open_chunk(lz)
+            } else if lz.pos - lz.chunk_start > (1 << 21) - 274 || lz.olen - lz.mark + lz.cache_size > 65536 - 64 {
+                close_chunk(lz)?
+                continue
+            }
+        }
+        step(lz)
+    }
+}
+
+fn rebase(t: []u32, shift: i64) {
+    let s = u32(shift)
+    for i in 0..t.len {
+        let v = t[i]
+        t[i] = if v > s { v - s } else { 0 }
+    }
+}
+
+fn grow(lz: *Lz, size: i64) {
+    let grown: []u8 = __make(size)
+    __memmove(grown, lz.buf[..lz.end])
+    lz.buf = grown
+    if lz.prev.len < lz.prev_cap {
+        var n = 4096
+        for n < size && n < lz.prev_cap {
+            n = n << 1
+        }
+        if n > lz.prev.len {
+            let prev: []u32 = __make(n)
+            __memmove(prev, lz.prev)
+            lz.prev = prev
+        }
+    }
+}
+
+fn make_space(lz: *Lz) {
+    if lz.buf.len < lz.window {
+        var n = lz.buf.len * 2
+        if n < lz.hint {
+            n = lz.hint
+        }
+        if n < 65536 {
+            n = 65536
+        }
+        if n > lz.window {
+            n = lz.window
+        }
+        grow(lz, n)
+        return
+    }
+    var keep = lz.pos - lz.dict
+    if lz.chunk_open && lz.chunk_start < keep {
+        keep = lz.chunk_start
+    }
+    let shift = keep / lz.prev_cap * lz.prev_cap
+    if shift <= 0 {
+        grow(lz, lz.buf.len * 2)
+        return
+    }
+    __memmove(lz.buf, lz.buf[shift..lz.end])
+    lz.end -= shift
+    lz.pos -= shift
+    lz.hashed -= shift
+    lz.chunk_start -= shift
+    lz.base += shift
+    if lz.next_at >= 0 {
+        lz.next_at -= shift
+    }
+    rebase(lz.head, shift)
+    rebase(lz.near, shift)
+    rebase(lz.prev, shift)
+}
+
+fn feed(lz: *Lz, data: []u8) ! io.Error {
+    var rest = data
+    for rest.len > 0 {
+        if lz.end == lz.buf.len {
+            make_space(lz)
+        }
+        let n = __memmove(lz.buf[lz.end..], rest)
+        lz.end += n
+        rest = rest[n..]
+        pump(lz, false)?
+    }
+}
+
+fn finish_chunks(lz: *Lz) ! io.Error {
+    pump(lz, true)?
+    if lz.chunk_open {
+        close_chunk(lz)?
+    }
+}
