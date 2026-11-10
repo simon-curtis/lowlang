@@ -1,0 +1,244 @@
+import std/io
+
+struct Argon2 {
+    memory: []u64
+    lanes: i64
+    lane_length: i64
+    segment_length: i64
+    passes: i64
+    blocks: i64
+    r: []u64
+    t: []u64
+    zero: []u64
+    input: []u64
+    address: []u64
+}
+
+fn append_le32(mut out: []u8, v: i64) {
+    push(mut out, u8(v))
+    push(mut out, u8(v >> 8))
+    push(mut out, u8(v >> 16))
+    push(mut out, u8(v >> 24))
+}
+
+fn hprime(input: []u8, length: i64) -> []u8 {
+    var prefixed: []u8 = []
+    append_le32(mut prefixed, length)
+    io.append(mut prefixed, input)
+    if length <= 64 {
+        return blake2b(prefixed, length, [])
+    }
+    let out: []u8 = __make(length)
+    var v = blake2b(prefixed, 64, [])
+    __memmove(out, v[..32])
+    var at = 32
+    for length - at > 64 {
+        v = blake2b(v, 64, [])
+        __memmove(out[at..], v[..32])
+        at += 32
+    }
+    let rest = blake2b(v, length - at, [])
+    __memmove(out[at..], rest)
+    out
+}
+
+fn blamka(x: u64, y: u64) -> u64 {
+    x + y + 2 * (x & 0xFFFFFFFF) * (y & 0xFFFFFFFF)
+}
+
+fn argon2_mix(v: []u64, a: i64, b: i64, c: i64, d: i64) {
+    v[a] = blamka(v[a], v[b])
+    v[d] = rotr(v[d] ^ v[a], 32)
+    v[c] = blamka(v[c], v[d])
+    v[b] = rotr(v[b] ^ v[c], 24)
+    v[a] = blamka(v[a], v[b])
+    v[d] = rotr(v[d] ^ v[a], 16)
+    v[c] = blamka(v[c], v[d])
+    v[b] = rotr(v[b] ^ v[c], 63)
+}
+
+fn permute(v: []u64, base: i64, step: i64) {
+    let i2 = base + step
+    let i4 = base + 2 * step
+    let i6 = base + 3 * step
+    let i8 = base + 4 * step
+    let i10 = base + 5 * step
+    let i12 = base + 6 * step
+    let i14 = base + 7 * step
+    argon2_mix(v, base, i4, i8, i12)
+    argon2_mix(v, base + 1, i4 + 1, i8 + 1, i12 + 1)
+    argon2_mix(v, i2, i6, i10, i14)
+    argon2_mix(v, i2 + 1, i6 + 1, i10 + 1, i14 + 1)
+    argon2_mix(v, base, i4 + 1, i10, i14 + 1)
+    argon2_mix(v, base + 1, i6, i10 + 1, i12)
+    argon2_mix(v, i2, i6 + 1, i8, i12 + 1)
+    argon2_mix(v, i2 + 1, i4, i8 + 1, i14)
+}
+
+fn fill_block(s: *Argon2, x: []u64, y: []u64, out: []u64, accumulate: bool) {
+    let r = s.r
+    let t = s.t
+    for i in 0..128 {
+        let v = x[i] ^ y[i]
+        r[i] = v
+        t[i] = if accumulate { v ^ out[i] } else { v }
+    }
+    for i in 0..8 {
+        permute(r, 16 * i, 2)
+    }
+    for i in 0..8 {
+        permute(r, 2 * i, 16)
+    }
+    for i in 0..128 {
+        out[i] = t[i] ^ r[i]
+    }
+}
+
+fn block(s: *Argon2, index: i64) -> []u64 {
+    s.memory[128 * index..128 * index + 128]
+}
+
+fn next_addresses(s: *Argon2) {
+    s.input[6] += 1
+    fill_block(s, s.zero, s.input, s.address, false)
+    fill_block(s, s.zero, s.address, s.address, false)
+}
+
+fn reference_index(s: *Argon2, pass: i64, slice: i64, index: i64, pseudo: u64, same_lane: bool) -> i64 {
+    let segment = s.segment_length
+    let current = if index == 0 { -1 } else { 0 }
+    var area = 0
+    if pass == 0 {
+        if slice == 0 {
+            area = index - 1
+        } else if same_lane {
+            area = slice * segment + index - 1
+        } else {
+            area = slice * segment + current
+        }
+    } else if same_lane {
+        area = s.lane_length - segment + index - 1
+    } else {
+        area = s.lane_length - segment + current
+    }
+    let low = pseudo & 0xFFFFFFFF
+    let squared = (low * low) >> 32
+    let relative = u64(area) - 1 - ((u64(area) * squared) >> 32)
+    var start = 0
+    if pass != 0 && slice != 3 {
+        start = (slice + 1) * segment
+    }
+    (start + i64(relative)) % s.lane_length
+}
+
+fn fill_segment(s: *Argon2, pass: i64, slice: i64, lane: i64) {
+    let independent = pass == 0 && slice < 2
+    if independent {
+        for i in 0..128 {
+            s.input[i] = 0
+        }
+        s.input[0] = u64(pass)
+        s.input[1] = u64(lane)
+        s.input[2] = u64(slice)
+        s.input[3] = u64(s.blocks)
+        s.input[4] = u64(s.passes)
+        s.input[5] = 2
+    }
+    var first = 0
+    if pass == 0 && slice == 0 {
+        first = 2
+        if independent {
+            next_addresses(s)
+        }
+    }
+    let lane_start = lane * s.lane_length
+    var current = lane_start + slice * s.segment_length + first
+    var previous = if current % s.lane_length == 0 { current + s.lane_length - 1 } else { current - 1 }
+    for i in first..s.segment_length {
+        if current % s.lane_length == 1 {
+            previous = current - 1
+        }
+        if independent && i % 128 == 0 {
+            next_addresses(s)
+        }
+        let pseudo = if independent { s.address[i % 128] } else { s.memory[128 * previous] }
+        var reference_lane = i64(pseudo >> 32) % s.lanes
+        if pass == 0 && slice == 0 {
+            reference_lane = lane
+        }
+        let index = reference_index(s, pass, slice, i, pseudo, reference_lane == lane)
+        let reference = block(s, s.lane_length * reference_lane + index)
+        fill_block(s, block(s, previous), reference, block(s, current), pass != 0)
+        current += 1
+        previous += 1
+    }
+}
+
+fn load_block(s: *Argon2, index: i64, data: []u8) {
+    let target = block(s, index)
+    for i in 0..128 {
+        target[i] = u64(io.le64(data, 8 * i))
+    }
+}
+
+pub fn argon2id_keyed(password: []u8, salt: []u8, secret: []u8, associated: []u8, t: i64, m: i64, p: i64, length: i64) -> []u8 {
+    if p < 1 || p > 0xFFFFFF || t < 1 || m < 8 * p || m > 0xFFFFFFFF || length < 4 || salt.len < 8 {
+        return []
+    }
+    var seed: []u8 = []
+    append_le32(mut seed, p)
+    append_le32(mut seed, length)
+    append_le32(mut seed, m)
+    append_le32(mut seed, t)
+    append_le32(mut seed, 0x13)
+    append_le32(mut seed, 2)
+    append_le32(mut seed, password.len)
+    io.append(mut seed, password)
+    append_le32(mut seed, salt.len)
+    io.append(mut seed, salt)
+    append_le32(mut seed, secret.len)
+    io.append(mut seed, secret)
+    append_le32(mut seed, associated.len)
+    io.append(mut seed, associated)
+    let h0 = blake2b(seed, 64, [])
+    let blocks = 4 * p * (m / (4 * p))
+    let lane_length = blocks / p
+    let s = new(Argon2 {
+        memory: __make(128 * blocks), lanes: p, lane_length, segment_length: lane_length / 4,
+        passes: t, blocks, r: __make(128), t: __make(128), zero: __make(128), input: __make(128),
+        address: __make(128),
+    })
+    let starter: []u8 = __make(72)
+    __memmove(starter, h0)
+    for lane in 0..p {
+        for j in 0..2 {
+            io.set_le32(starter, 64, j)
+            io.set_le32(starter, 68, lane)
+            let bytes_block = hprime(starter, 1024)
+            load_block(s, lane * lane_length + j, bytes_block)
+        }
+    }
+    for pass in 0..t {
+        for slice in 0..4 {
+            for lane in 0..p {
+                fill_segment(s, pass, slice, lane)
+            }
+        }
+    }
+    let last: []u64 = __make(128)
+    for lane in 0..p {
+        let b = block(s, lane * lane_length + lane_length - 1)
+        for i in 0..128 {
+            last[i] ^= b[i]
+        }
+    }
+    let final: []u8 = __make(1024)
+    for i in 0..128 {
+        io.set_le64(final, 8 * i, i64(last[i]))
+    }
+    hprime(final, length)
+}
+
+pub fn argon2id(password: []u8, salt: []u8, t: i64, m: i64, p: i64, length: i64) -> []u8 {
+    argon2id_keyed(password, salt, [], [], t, m, p, length)
+}

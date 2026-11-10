@@ -1,0 +1,240 @@
+import std/crypto/ecdsa
+import std/crypto/ed25519
+import std/crypto/hash
+import std/crypto/rsa
+import std/io
+import std/json
+import std/text
+
+enum Family {
+    Hs
+    Rs
+    Ps
+    Es(curve: ecdsa.Curve)
+    Eddsa
+}
+
+struct Method {
+    family: Family
+    digest: hash.Algorithm
+}
+
+fn digest_by_bits(bits: str) -> hash.Algorithm? {
+    if bits == "256" {
+        return hash.sha256()
+    }
+    if bits == "384" {
+        return hash.sha384()
+    }
+    if bits == "512" {
+        return hash.sha512()
+    }
+    none
+}
+
+fn method(alg: str) -> Method? {
+    if alg == "EdDSA" {
+        return Method { family: Eddsa, digest: hash.sha512() }
+    }
+    if alg.len != 5 {
+        return none
+    }
+    let digest = match digest_by_bits(alg[2..]) {
+        some(d) => d
+        none => return none
+    }
+    let prefix = alg[..2]
+    if prefix == "HS" {
+        return Method { family: Hs, digest }
+    }
+    if prefix == "RS" {
+        return Method { family: Rs, digest }
+    }
+    if prefix == "PS" {
+        return Method { family: Ps, digest }
+    }
+    if alg == "ES256" {
+        return Method { family: Es(ecdsa.Curve.P256), digest }
+    }
+    if alg == "ES384" {
+        return Method { family: Es(ecdsa.Curve.P384), digest }
+    }
+    none
+}
+
+fn suits(m: Method, key: Key) -> bool {
+    match m.family {
+        Hs => match key {
+            Hmac(secret) => secret.len >= m.digest.size
+            _ => false
+        }
+        Rs => match key {
+            Rsa(_, _) => true
+            _ => false
+        }
+        Ps => match key {
+            Rsa(_, _) => true
+            _ => false
+        }
+        Es(curve) => match key {
+            Ec(key_curve, _, _) => key_curve == curve
+            _ => false
+        }
+        Eddsa => match key {
+            Ed(_, _) => true
+            _ => false
+        }
+    }
+}
+
+fn create(m: Method, key: Key, input: []u8) -> []u8 ! io.Error {
+    if !suits(m, key) {
+        fail Invalid
+    }
+    match key {
+        Hmac(secret) => hash.hmac(m.digest, secret, input)
+        Rsa(_, private) => match private {
+            some(k) => {
+                let digest = hash.sum(m.digest, input)
+                if m.family == Ps {
+                    rsa.sign_pss(k, m.digest, digest)?
+                } else {
+                    rsa.sign_pkcs1v15(k, m.digest, digest)?
+                }
+            }
+            none => fail Invalid
+        }
+        Ec(curve, _, private) => match private {
+            some(d) => {
+                let digest = hash.sum(m.digest, input)
+                ecdsa.sign_raw(curve, d, digest)?
+            }
+            none => fail Invalid
+        }
+        Ed(_, seed) => match seed {
+            some(s) => {
+                if s.len != 32 {
+                    fail Invalid
+                }
+                ed25519.sign(s, input)
+            }
+            none => fail Invalid
+        }
+    }
+}
+
+fn check(m: Method, key: Key, input: []u8, signature: []u8) -> bool {
+    if !suits(m, key) {
+        return false
+    }
+    match key {
+        Hmac(secret) => {
+            let expected = hash.hmac(m.digest, secret, input)
+            hash.equal(expected, signature)
+        }
+        Rsa(public, _) => {
+            let digest = hash.sum(m.digest, input)
+            if m.family == Ps {
+                rsa.verify_pss(public, m.digest, digest, signature)
+            } else {
+                rsa.verify_pkcs1v15(public, m.digest, digest, signature)
+            }
+        }
+        Ec(curve, public, _) => {
+            let digest = hash.sum(m.digest, input)
+            ecdsa.verify_raw(curve, public, digest, signature)
+        }
+        Ed(public, _) => public.len == 32 && ed25519.verify(public, input, signature)
+    }
+}
+
+fn unique_object(data: []u8) -> json.Value ! io.Error {
+    let v = json.parse(data) catch {
+        _ => fail Malformed
+    }
+    let members = match v {
+        Object(list) => list
+        _ => fail Malformed
+    }
+    var seen: [str: bool] = [:]
+    for m in members {
+        if seen[m.name] ?? false {
+            fail Malformed
+        }
+        seen[m.name] = true
+    }
+    v
+}
+
+pub fn sign(alg: str, kid: str, key: Key, payload: json.Value) -> str ! io.Error {
+    let m = match method(alg) {
+        some(found) => found
+        none => fail Invalid
+    }
+    var members: []json.Member = [
+        json.Member { name: "alg", value: Str(alg) },
+        json.Member { name: "typ", value: Str("JWT") },
+    ]
+    if kid.len > 0 {
+        push(mut members, json.Member { name: "kid", value: Str(kid) })
+    }
+    let header = json.stringify(json.Value.Object(members), 0)
+    let body = json.stringify(payload, 0)
+    let input = "{encode(bytes(header))}.{encode(bytes(body))}"
+    let signature = create(m, key, bytes(input))?
+    "{input}.{encode(signature)}"
+}
+
+pub fn verify_jws(token: str, keys: []Jwk, algorithms: []str) -> []u8 ! io.Error {
+    let parts = text.split(token, '.')
+    if parts.len != 3 {
+        fail Malformed
+    }
+    let header_bytes = match decode(parts[0]) {
+        some(b) => b
+        none => fail Malformed
+    }
+    let header = unique_object(header_bytes)?
+    let alg = match json.get(header, "alg") ?? json.Value.Null {
+        Str(s) => s
+        _ => fail Malformed
+    }
+    let kid = match json.get(header, "kid") ?? json.Value.Null {
+        Str(s) => s
+        Null => ""
+        _ => fail Malformed
+    }
+    match json.get(header, "crit") {
+        some(_) => fail Invalid
+        none => {}
+    }
+    var allowed = false
+    for a in algorithms {
+        if a == alg {
+            allowed = true
+        }
+    }
+    if !allowed {
+        fail Invalid
+    }
+    let m = match method(alg) {
+        some(found) => found
+        none => fail Invalid
+    }
+    let payload = match decode(parts[1]) {
+        some(b) => b
+        none => fail Malformed
+    }
+    let signature = match decode(parts[2]) {
+        some(b) => b
+        none => fail Malformed
+    }
+    let input = bytes(token[..parts[0].len + 1 + parts[1].len])
+    for k in keys {
+        let selected = (kid.len == 0 || k.kid == kid) && (k.alg.len == 0 || k.alg == alg)
+        if selected && check(m, k.key, input, signature) {
+            return payload
+        }
+    }
+    fail Invalid
+}
