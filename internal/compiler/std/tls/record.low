@@ -1,0 +1,163 @@
+import std/io
+
+struct Record {
+    kind: i64
+    data: []u8
+}
+
+struct Channel {
+    stream: io.Stream
+    reader: *io.Reader
+    read_key: *Protection?
+    write_key: *Protection?
+    write_lock: chan[bool]
+    pending: []u8
+    plaintext_version: i64
+    closed: bool
+}
+
+fn channel(s: io.Stream) -> *Channel {
+    new(Channel {
+        stream: s
+        reader: io.reader(s)
+        read_key: none
+        write_key: none
+        write_lock: chan[bool](1)
+        pending: []
+        plaintext_version: 0x0303
+        closed: false
+    })
+}
+
+fn write_record(c: *Channel, kind: i64, payload: []u8) ! io.Error {
+    c.write_lock <- true
+    defer <-c.write_lock
+    write_locked(c, kind, payload)?
+}
+
+fn write_locked(c: *Channel, kind: i64, payload: []u8) ! io.Error {
+    var out: []u8 = []
+    var at = 0
+    for at == 0 || at < payload.len {
+        let size = if payload.len - at > 16384 { 16384 } else { payload.len - at }
+        seal_into(c, mut out, kind, payload[at..at + size])
+        at += size
+        if payload.len == 0 {
+            break
+        }
+    }
+    io.write_all(c.stream, out)?
+}
+
+fn seal_into(c: *Channel, mut out: []u8, kind: i64, fragment: []u8) {
+    match c.write_key {
+        some(key) => {
+            var inner: []u8 = []
+            io.append(mut inner, fragment)
+            push(mut inner, u8(kind))
+            var header: []u8 = [23, 3, 3]
+            io.put_be16(mut header, inner.len + key.cipher.tag_size)
+            let sealed = key.cipher.seal(nonce(key), inner, header)
+            io.append(mut out, header)
+            io.append(mut out, sealed)
+        }
+        none => {
+            push(mut out, u8(kind))
+            io.put_be16(mut out, c.plaintext_version)
+            io.put_be16(mut out, fragment.len)
+            io.append(mut out, fragment)
+        }
+    }
+}
+
+fn read_record(c: *Channel) -> Record ! io.Error {
+    for {
+        let header = io.read_exact(c.reader, 5)?
+        let kind = i64(header[0])
+        let size = io.be16(header, 3)
+        if size > 16384 + 256 {
+            fail Malformed
+        }
+        let body = io.read_exact(c.reader, size)?
+        if kind == 20 {
+            continue
+        }
+        match c.read_key {
+            some(key) => {
+                if kind != 23 {
+                    if kind == 21 {
+                        return Record { kind, data: body }
+                    }
+                    fail Malformed
+                }
+                let inner = key.cipher.open(nonce(key), body, header) catch {
+                    _ => fail Invalid
+                }
+                var end = inner.len
+                for end > 0 && inner[end - 1] == 0 {
+                    end -= 1
+                }
+                if end == 0 || end - 1 > 16384 {
+                    fail Malformed
+                }
+                return Record { kind: i64(inner[end - 1]), data: inner[..end - 1] }
+            }
+            none => {
+                if size > 16384 {
+                    fail Malformed
+                }
+                return Record { kind, data: body }
+            }
+        }
+    }
+}
+
+struct Message {
+    kind: i64
+    body: []u8
+    raw: []u8
+}
+
+fn read_handshake(c: *Channel) -> Message ! io.Error {
+    for c.pending.len < 4 || c.pending.len < 4 + io.be24(c.pending, 1) {
+        let r = read_record(c)?
+        if r.kind == 21 {
+            fail alert(r.data)
+        }
+        if r.kind != 22 {
+            fail Malformed
+        }
+        io.append(mut c.pending, r.data)
+        if c.pending.len >= 4 && io.be24(c.pending, 1) > 65536 {
+            fail TooLarge
+        }
+    }
+    let size = 4 + io.be24(c.pending, 1)
+    var raw: []u8 = []
+    io.append(mut raw, c.pending[..size])
+    var rest: []u8 = []
+    io.append(mut rest, c.pending[size..])
+    c.pending = rest
+    Message { kind: i64(raw[0]), body: raw[4..], raw }
+}
+
+fn alert(data: []u8) -> io.Error {
+    if data.len >= 2 && data[1] == 0 {
+        return io.Error.Eof
+    }
+    io.Error.Refused
+}
+
+fn send_alert(c: *Channel, description: i64) {
+    write_record(c, 21, [2, u8(description)]) catch {
+        _ => {}
+    }
+}
+
+fn handshake_message(kind: i64, body: []u8) -> []u8 {
+    var out: []u8 = []
+    push(mut out, u8(kind))
+    io.put_be24(mut out, body.len)
+    io.append(mut out, body)
+    out
+}

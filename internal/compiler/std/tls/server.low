@@ -1,0 +1,289 @@
+import std/crypto
+import std/crypto/ecdsa
+import std/crypto/hash
+import std/crypto/x509
+import std/io
+
+struct KeyShareEntry {
+    group: i64
+    key: []u8
+}
+
+struct ClientHello {
+    session_id: []u8
+    suites: []i64
+    versions: []i64
+    groups: []i64
+    shares: []KeyShareEntry
+    schemes: []i64
+    protocols: []str
+}
+
+fn parse_client_hello(body: []u8) -> ClientHello ! io.Error {
+    let c = cursor(body)
+    u16_of(c)?
+    take(c, 32)?
+    let session_id = vector8(c)?
+    if session_id.len > 32 {
+        fail Malformed
+    }
+    let suites_raw = cursor(vector16(c)?)
+    var suites: []i64 = []
+    for left(suites_raw) > 0 {
+        push(mut suites, u16_of(suites_raw)?)
+    }
+    vector8(c)?
+    let exts = extensions(c)?
+    end(c)?
+    var versions: []i64 = []
+    match find(exts, 43) {
+        some(raw) => {
+            let vc = cursor(raw)
+            let list = cursor(vector8(vc)?)
+            for left(list) > 0 {
+                push(mut versions, u16_of(list)?)
+            }
+        }
+        none => {}
+    }
+    var groups: []i64 = []
+    match find(exts, 10) {
+        some(raw) => {
+            groups = u16_list(raw)?
+        }
+        none => {}
+    }
+    var schemes: []i64 = []
+    match find(exts, 13) {
+        some(raw) => {
+            schemes = u16_list(raw)?
+        }
+        none => {}
+    }
+    var shares: []KeyShareEntry = []
+    match find(exts, 51) {
+        some(raw) => {
+            let sc = cursor(raw)
+            let list = cursor(vector16(sc)?)
+            for left(list) > 0 {
+                let group = u16_of(list)?
+                push(mut shares, KeyShareEntry { group, key: vector16(list)? })
+            }
+        }
+        none => {}
+    }
+    var protocols: []str = []
+    match find(exts, 16) {
+        some(raw) => {
+            let ac = cursor(raw)
+            let list = cursor(vector16(ac)?)
+            for left(list) > 0 {
+                push(mut protocols, str(vector8(list)?))
+            }
+        }
+        none => {}
+    }
+    ClientHello { session_id, suites, versions, groups, shares, schemes, protocols }
+}
+
+fn server_hello(random: []u8, session_id: []u8, suite: Suite, group: i64, key: []u8, retry: bool) -> []u8 {
+    var body: []u8 = []
+    io.put_be16(mut body, 0x0303)
+    io.append(mut body, random)
+    put_vector8(mut body, session_id)
+    io.put_be16(mut body, suite_code(suite))
+    push(mut body, 0)
+    var exts: []u8 = []
+    put_extension(mut exts, 43, [3, 4])
+    var share: []u8 = []
+    io.put_be16(mut share, group)
+    if !retry {
+        put_vector16(mut share, key)
+    }
+    put_extension(mut exts, 51, share)
+    put_vector16(mut body, exts)
+    handshake_message(2, body)
+}
+
+fn choose_suite(offered: []i64) -> Suite? {
+    for code in [0x1301, 0x1303, 0x1302] {
+        if contains(offered, code) {
+            return suite_of(code)
+        }
+    }
+    none
+}
+
+fn key_schemes(key: x509.PrivateKey) -> []i64 {
+    match key {
+        Rsa(_) => [0x0804, 0x0805, 0x0806]
+        Ecdsa(k) => match k.curve {
+            P256 => [0x0403]
+            P384 => [0x0503]
+        }
+        Ed25519(_) => [0x0807]
+    }
+}
+
+fn choose_scheme(key: x509.PrivateKey, offered: []i64) -> i64 {
+    for s in key_schemes(key) {
+        if contains(offered, s) {
+            return s
+        }
+    }
+    -1
+}
+
+fn share_of(hello: ClientHello, group: i64) -> KeyShareEntry? {
+    for s in hello.shares {
+        if s.group == group {
+            return s
+        }
+    }
+    none
+}
+
+fn preferred_group(hello: ClientHello, groups: []i64) -> i64 {
+    for g in groups {
+        let shared = match share_of(hello, g) {
+            some(_) => true
+            none => false
+        }
+        if supported_group(g) && (shared || contains(hello.groups, g)) {
+            return g
+        }
+    }
+    -1
+}
+
+fn encrypted_extensions(protocol: str) -> []u8 {
+    var exts: []u8 = []
+    if protocol.len > 0 {
+        var names: []u8 = []
+        put_vector8(mut names, bytes(protocol))
+        var alpn: []u8 = []
+        put_vector16(mut alpn, names)
+        put_extension(mut exts, 16, alpn)
+    }
+    var body: []u8 = []
+    put_vector16(mut body, exts)
+    handshake_message(8, body)
+}
+
+fn choose_protocol(offered: []str, supported: []str) -> str {
+    for p in supported {
+        for o in offered {
+            if o == p {
+                return p
+            }
+        }
+    }
+    ""
+}
+
+fn refuse(c: *Channel, description: i64) -> io.Error {
+    send_alert(c, description)
+    io.Error.Unsupported
+}
+
+pub fn server(s: io.Stream, config: Config) -> *Session ! io.Error {
+    let key = match config.key {
+        some(k) => k
+        none => fail Invalid
+    }
+    if config.certificates.len == 0 {
+        fail Invalid
+    }
+    let c = channel(s)
+    var m = expect_message(c, 1)?
+    var hello = parse_client_hello(m.body)?
+    var transcript: []u8 = []
+    io.append(mut transcript, m.raw)
+    if !contains(hello.versions, 0x0304) {
+        fail refuse(c, 70)
+    }
+    let suite = match choose_suite(hello.suites) {
+        some(found) => found
+        none => fail refuse(c, 40)
+    }
+    let scheme = choose_scheme(key, hello.schemes)
+    if scheme < 0 {
+        fail refuse(c, 40)
+    }
+    let group = preferred_group(hello, config.groups)
+    if group < 0 {
+        fail refuse(c, 40)
+    }
+    var share = share_of(hello, group)
+    let offered = match share {
+        some(_) => true
+        none => false
+    }
+    if !offered {
+        let retry = server_hello(retry_random(), hello.session_id, suite, group, [], true)
+        transcript = message_hash(suite_hash(suite), transcript)
+        io.append(mut transcript, retry)
+        write_record(c, 22, retry)?
+        write_record(c, 20, [1])?
+        m = expect_message(c, 1)?
+        hello = parse_client_hello(m.body)?
+        io.append(mut transcript, m.raw)
+        share = share_of(hello, group)
+    }
+    let entry = match share {
+        some(e) => e
+        none => fail refuse(c, 47)
+    }
+    let exchanged = server_exchange(entry.group, entry.key) catch {
+        _ => fail refuse(c, 47)
+    }
+    let reply = server_hello(crypto.random(32), hello.session_id, suite, entry.group, exchanged.public, false)
+    io.append(mut transcript, reply)
+    write_record(c, 22, reply)?
+    write_record(c, 20, [1])?
+    let k = schedule(suite, exchanged.secret, transcript)
+    c.write_key = protection(suite, k.server_handshake)?
+    c.read_key = protection(suite, k.client_handshake)?
+    let protocol = choose_protocol(hello.protocols, config.alpn)
+    var flight: []u8 = []
+    let ee = encrypted_extensions(protocol)
+    io.append(mut transcript, ee)
+    io.append(mut flight, ee)
+    let cert = certificate_message([], config.certificates)
+    io.append(mut transcript, cert)
+    io.append(mut flight, cert)
+    var cv_body: []u8 = []
+    io.put_be16(mut cv_body, scheme)
+    put_vector16(mut cv_body, x509.sign(key, scheme, verify_content(k.hash, transcript, true))?)
+    let cv = handshake_message(15, cv_body)
+    io.append(mut transcript, cv)
+    io.append(mut flight, cv)
+    let fin = handshake_message(20, finished(k, k.server_handshake, transcript))
+    io.append(mut transcript, fin)
+    io.append(mut flight, fin)
+    write_record(c, 22, flight)?
+    let client_app = derive_secret(k.hash, k.master, "c ap traffic", transcript)
+    let server_app = derive_secret(k.hash, k.master, "s ap traffic", transcript)
+    let client_fin = expect_message(c, 20)?
+    if !hash.equal(client_fin.body, finished(k, k.client_handshake, transcript)) {
+        send_alert(c, 51)
+        fail Invalid
+    }
+    c.write_key = protection(suite, server_app)?
+    c.read_key = protection(suite, client_app)?
+    session(c, protocol, entry.group, suite, [])
+}
+
+pub fn load_key(pem: str) -> x509.PrivateKey ! io.Error {
+    for label in ["PRIVATE KEY", "EC PRIVATE KEY", "RSA PRIVATE KEY"] {
+        let blocks = x509.pem_blocks(pem, label)
+        if blocks.len > 0 {
+            return x509.parse_private_key(blocks[0])
+        }
+    }
+    fail Invalid
+}
+
+pub fn load_certificates(pem: str) -> [][]u8 {
+    x509.pem_blocks(pem, "CERTIFICATE")
+}
