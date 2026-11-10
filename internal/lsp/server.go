@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"time"
 
 	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
@@ -21,18 +22,20 @@ var errorPos = regexp.MustCompile(`(?s)^(?:(.*?):)?(\d+):(\d+): (.*)$`)
 
 type Server struct {
 	stream    *stream
-	docs      map[string][]byte
+	docs      sources
 	units     map[string]*compiler.Unit
 	published map[string][]string
+	compiles  *scheduler
 	shutdown  bool
 }
 
 func NewServer(in io.Reader, out io.Writer) *Server {
 	return &Server{
 		stream:    newStream(in, out),
-		docs:      map[string][]byte{},
+		docs:      sources{},
 		units:     map[string]*compiler.Unit{},
 		published: map[string][]string{},
+		compiles:  newScheduler(),
 	}
 }
 
@@ -49,6 +52,13 @@ func (s *Server) Run(ctx context.Context) error {
 				return nil
 			}
 			return err
+		case <-s.compiles.timer.C:
+			s.compiles.next(ctx, s.docs)
+		case result := <-s.compiles.results:
+			if err := s.finish(result); err != nil {
+				return err
+			}
+			s.compiles.next(ctx, s.docs)
 		case req := <-requests:
 			exit, err := s.handle(req)
 			if err != nil {
@@ -95,7 +105,8 @@ func (s *Server) handle(req request) (bool, error) {
 		}
 		path := pathOf(p.TextDocument.URI)
 		s.docs[path] = []byte(p.TextDocument.Text)
-		return false, s.analyse(path)
+		s.schedule(path, 0)
+		return false, nil
 	case "textDocument/didChange":
 		var p DidChangeParams
 		if json.Unmarshal(req.Params, &p) != nil || len(p.ContentChanges) == 0 {
@@ -104,15 +115,20 @@ func (s *Server) handle(req request) (bool, error) {
 		path := pathOf(p.TextDocument.URI)
 		latest := p.ContentChanges[len(p.ContentChanges)-1]
 		s.docs[path] = []byte(latest.Text)
-		return false, s.analyse(path)
+		s.schedule(path, debounce)
+		return false, nil
 	case "textDocument/didSave":
-		return false, s.document(req, s.analyse)
+		s.document(req, s.save)
+		return false, nil
 	case "textDocument/didClose":
-		return false, s.document(req, s.close)
+		s.document(req, s.close)
+		return false, nil
 	case "textDocument/hover":
 		return false, s.position(req, s.hover)
 	case "textDocument/definition":
 		return false, s.position(req, s.definition)
+	case "textDocument/completion":
+		return false, s.position(req, s.completion)
 	case "textDocument/documentSymbol":
 		var p DocumentParams
 		if err := json.Unmarshal(req.Params, &p); err != nil {
@@ -136,23 +152,33 @@ func (s *Server) initialize() InitializeResult {
 			HoverProvider:          true,
 			DefinitionProvider:     true,
 			DocumentSymbolProvider: true,
+			CompletionProvider:     CompletionOptions{TriggerCharacters: []string{"."}},
 		},
 		ServerInfo: ServerInfo{Name: "low"},
 	}
 }
 
-func (s *Server) document(req request, apply func(path string) error) error {
+func (s *Server) document(req request, apply func(path string)) {
 	var p DocumentParams
 	if json.Unmarshal(req.Params, &p) != nil {
-		return nil
+		return
 	}
 	path := pathOf(p.TextDocument.URI)
-	return apply(path)
+	apply(path)
 }
 
-func (s *Server) close(path string) error {
+func (s *Server) schedule(path string, delay time.Duration) {
+	entry := s.entry(path)
+	s.compiles.mark(entry, path, delay)
+}
+
+func (s *Server) save(path string) {
+	s.schedule(path, 0)
+}
+
+func (s *Server) close(path string) {
 	delete(s.docs, path)
-	return s.analyse(path)
+	s.schedule(path, 0)
 }
 
 func (s *Server) position(req request, answer func(TextDocumentPositionParams) any) error {
@@ -180,16 +206,8 @@ func (s *Server) notify(method string, params any) error {
 	return s.stream.write(notification{JSONRPC: "2.0", Method: method, Params: params})
 }
 
-func (s *Server) read(name string) ([]byte, error) {
-	clean := filepath.Clean(name)
-	if src, ok := s.docs[clean]; ok {
-		return src, nil
-	}
-	return os.ReadFile(name)
-}
-
 func (s *Server) text(path string) text {
-	src, err := s.read(path)
+	src, err := s.docs.read(path)
 	if err != nil {
 		return text{}
 	}
@@ -208,23 +226,23 @@ func (s *Server) entry(path string) string {
 	}
 }
 
-func (s *Server) check(entry string) (unit *compiler.Unit, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("internal compiler error: %v", r)
-		}
-	}()
-	return compiler.AnalyseWith(entry, s.read)
-}
-
-func (s *Server) analyse(path string) error {
-	entry := s.entry(path)
-	unit, err := s.check(entry)
+func (s *Server) finish(r compiled) error {
+	current := s.compiles.finish(r)
+	entry := r.job.entry
+	if r.err == nil {
+		s.units[entry] = r.unit
+	}
+	if !current {
+		return nil
+	}
 	diagnostics := map[string][]Diagnostic{}
-	if err == nil {
-		s.units[entry] = unit
-	} else {
-		uri, d := s.diagnose(err, path)
+	for path := range s.docs {
+		if s.entry(path) == entry {
+			diagnostics[uriOf(path)] = []Diagnostic{}
+		}
+	}
+	if r.err != nil {
+		uri, d := s.diagnose(r.err, r.job.path)
 		diagnostics[uri] = append(diagnostics[uri], d)
 	}
 	return s.publish(entry, diagnostics)
@@ -313,6 +331,21 @@ func (s *Server) definition(p TextDocumentPositionParams) any {
 	return s.locate(tg)
 }
 
+func (s *Server) completion(p TextDocumentPositionParams) any {
+	path := pathOf(p.TextDocument.URI)
+	t := s.text(path)
+	c := &completer{
+		unit: s.units[s.entry(path)],
+		file: s.checked(path),
+		text: t,
+		line: p.Position.Line,
+		col:  t.byteCol(p.Position.Line, p.Position.Character),
+		seen: map[string]bool{},
+	}
+	items := c.complete()
+	return CompletionList{Items: items}
+}
+
 func (s *Server) locate(tg target) Location {
 	t := s.text(tg.path)
 	pos := tg.pos
@@ -323,7 +356,7 @@ func (s *Server) locate(tg target) Location {
 }
 
 func (s *Server) parsed(path string) *ast.File {
-	src, err := s.read(path)
+	src, err := s.docs.read(path)
 	if err != nil {
 		return nil
 	}

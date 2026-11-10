@@ -120,11 +120,27 @@ type SyncOptions struct {
 	Save      SaveOptions `json:"save"`
 }
 
+type CompletionOptions struct {
+	TriggerCharacters []string `json:"triggerCharacters"`
+}
+
+type CompletionItem struct {
+	Label  string `json:"label"`
+	Kind   int    `json:"kind"`
+	Detail string `json:"detail,omitempty"`
+}
+
+type CompletionList struct {
+	IsIncomplete bool             `json:"isIncomplete"`
+	Items        []CompletionItem `json:"items"`
+}
+
 type Capabilities struct {
-	TextDocumentSync       SyncOptions `json:"textDocumentSync"`
-	HoverProvider          bool        `json:"hoverProvider"`
-	DefinitionProvider     bool        `json:"definitionProvider"`
-	DocumentSymbolProvider bool        `json:"documentSymbolProvider"`
+	TextDocumentSync       SyncOptions       `json:"textDocumentSync"`
+	HoverProvider          bool              `json:"hoverProvider"`
+	DefinitionProvider     bool              `json:"definitionProvider"`
+	DocumentSymbolProvider bool              `json:"documentSymbolProvider"`
+	CompletionProvider     CompletionOptions `json:"completionProvider"`
 }
 
 type ServerInfo struct {

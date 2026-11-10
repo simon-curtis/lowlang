@@ -3,6 +3,7 @@ package lsp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -31,6 +32,7 @@ type client struct {
 	to          *stream
 	messages    chan incoming
 	diagnostics map[string][]Diagnostic
+	publishes   map[string]int
 	next        int
 	done        chan error
 }
@@ -45,6 +47,7 @@ func start(t *testing.T) *client {
 		to:          &stream{out: clientOut},
 		messages:    make(chan incoming, 64),
 		diagnostics: map[string][]Diagnostic{},
+		publishes:   map[string]int{},
 		done:        make(chan error, 1),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -104,11 +107,7 @@ func (c *client) request(method string, params any) json.RawMessage {
 				c.t.Fatalf("connection closed waiting for %s", method)
 			}
 			if m.Method == "textDocument/publishDiagnostics" {
-				var p PublishDiagnosticsParams
-				if err := json.Unmarshal(m.Params, &p); err != nil {
-					c.t.Fatal(err)
-				}
-				c.diagnostics[p.URI] = p.Diagnostics
+				c.record(m)
 				continue
 			}
 			if m.ID == nil || *m.ID != id {
@@ -122,6 +121,43 @@ func (c *client) request(method string, params any) json.RawMessage {
 			c.t.Fatalf("timed out waiting for %s", method)
 		}
 	}
+}
+
+func (c *client) record(m incoming) {
+	c.t.Helper()
+	var p PublishDiagnosticsParams
+	if err := json.Unmarshal(m.Params, &p); err != nil {
+		c.t.Fatal(err)
+	}
+	c.diagnostics[p.URI] = p.Diagnostics
+	c.publishes[p.URI]++
+}
+
+func (c *client) await(uri string, after int) []Diagnostic {
+	c.t.Helper()
+	timeout := time.After(10 * time.Second)
+	for c.publishes[uri] <= after {
+		select {
+		case m, ok := <-c.messages:
+			if !ok {
+				c.t.Fatalf("connection closed waiting for diagnostics on %s", uri)
+			}
+			if m.Method == "textDocument/publishDiagnostics" {
+				c.record(m)
+			}
+		case <-timeout:
+			c.t.Fatalf("timed out waiting for diagnostics on %s", uri)
+		}
+	}
+	return c.diagnostics[uri]
+}
+
+func (c *client) change(f fixture, text string) []Diagnostic {
+	c.t.Helper()
+	before := c.publishes[f.uri]
+	change := DidChangeParams{TextDocument: TextDocumentIdentifier{URI: f.uri}, ContentChanges: []ContentChange{{Text: text}}}
+	c.notify("textDocument/didChange", change)
+	return c.await(f.uri, before)
 }
 
 type fixture struct {
@@ -155,10 +191,11 @@ func (f fixture) at(t *testing.T, needle string, offset int) Position {
 	return Position{}
 }
 
-func (c *client) open(f fixture, text string) {
+func (c *client) open(f fixture, text string) []Diagnostic {
 	c.t.Helper()
+	before := c.publishes[f.uri]
 	c.notify("textDocument/didOpen", DidOpenParams{TextDocument: TextDocumentItem{URI: f.uri, Text: text}})
-	c.symbols(f)
+	return c.await(f.uri, before)
 }
 
 func (c *client) symbols(f fixture) []DocumentSymbol {
@@ -203,8 +240,7 @@ func TestDiagnosticsFollowOverlay(t *testing.T) {
 	c := start(t)
 	f := load(t, "enums.low")
 	broken := f.src + "\nfn broken() {\n    let x: i64 = \"s\"\n}\n"
-	c.open(f, broken)
-	got := c.diagnostics[f.uri]
+	got := c.open(f, broken)
 	if len(got) != 1 {
 		t.Fatalf("diagnostics = %+v, want one", got)
 	}
@@ -212,12 +248,43 @@ func TestDiagnosticsFollowOverlay(t *testing.T) {
 	if got[0].Range.Start.Line != wantLine {
 		t.Errorf("diagnostic line = %d, want %d (%s)", got[0].Range.Start.Line, wantLine, got[0].Message)
 	}
-	change := DidChangeParams{TextDocument: TextDocumentIdentifier{URI: f.uri}, ContentChanges: []ContentChange{{Text: f.src}}}
-	c.notify("textDocument/didChange", change)
-	c.symbols(f)
-	if got := c.diagnostics[f.uri]; len(got) != 0 {
+	if got := c.change(f, f.src); len(got) != 0 {
 		t.Errorf("diagnostics after fix = %+v, want none", got)
 	}
+}
+
+func TestRapidEditsPublishOnlyTheLatest(t *testing.T) {
+	c := start(t)
+	f := load(t, "enums.low")
+	c.open(f, f.src)
+	before := c.publishes[f.uri]
+	for i := range 5 {
+		broken := fmt.Sprintf("%s\nfn broken%d() {\n    let x: i64 = \"s\"\n}\n", f.src, i)
+		change := DidChangeParams{TextDocument: TextDocumentIdentifier{URI: f.uri}, ContentChanges: []ContentChange{{Text: broken}}}
+		c.notify("textDocument/didChange", change)
+	}
+	if got := c.change(f, f.src); len(got) != 0 {
+		t.Errorf("diagnostics = %+v, want none from the superseded edits", got)
+	}
+	if published := c.publishes[f.uri] - before; published != 1 {
+		t.Errorf("published %d times for six edits, want 1", published)
+	}
+}
+
+func TestHoverDoesNotWaitForPendingCompile(t *testing.T) {
+	c := start(t)
+	f := load(t, "enums.low")
+	c.open(f, f.src)
+	before := c.publishes[f.uri]
+	change := DidChangeParams{TextDocument: TextDocumentIdentifier{URI: f.uri}, ContentChanges: []ContentChange{{Text: f.src}}}
+	c.notify("textDocument/didChange", change)
+	if got := c.hover(f, f.at(t, "print(area(big))", 11)); !strings.Contains(got, "let big: Shape") {
+		t.Errorf("hover during pending compile = %q", got)
+	}
+	if c.publishes[f.uri] != before {
+		t.Errorf("hover waited for the debounced compile")
+	}
+	c.await(f.uri, before)
 }
 
 func TestHover(t *testing.T) {
