@@ -1,0 +1,160 @@
+import std/http
+import std/io
+import std/json
+import std/text
+import std/web
+
+struct CreateTodo {
+    title: str
+    priority: i32 = 1
+}
+
+enum State {
+    Open
+    Done
+}
+
+struct Todo {
+    id: i64
+    title: str
+    priority: i32
+    state: State
+    owner: str
+}
+
+struct Store {
+    todos: []Todo
+}
+
+fn build() -> *web.App ! io.Error {
+    let store = new(Store { todos: [] })
+    let app = web.app()
+    web.get(app, "/health", fn(c) { web.text(200, "ok") })
+    web.get(app, "/files/*", fn(c) { web.text(200, "file {web.param(c, "*")}") })
+    web.get(app, "/search", fn(c) { web.text(200, "q={web.query(c, "q") ?? "-"} page={web.query(c, "page") ?? "1"}") })
+    let api = web.group(app, "/api", [web.api_key("x-api-key", fn(key) -> str? {
+        if key == "secret" { "alice" } else { none }
+    })])
+    web.describe(web.query_endpoint[[]Todo](api, "GET", "/todos", fn(c) -> []Todo ! web.Problem { store.todos }), "List todos", ["todos"])
+    web.describe(web.endpoint[CreateTodo, Todo](api, "POST", "/todos", 201, fn(c, body) -> Todo ! web.Problem {
+        if body.title.len == 0 {
+            fail Unprocessable("title is required")
+        }
+        let todo = Todo { id: store.todos.len + 1, title: body.title, priority: body.priority, state: Open, owner: c.user }
+        push(mut store.todos, todo)
+        todo
+    }), "Create a todo", ["todos"])
+    web.query_endpoint[Todo](api, "GET", "/todos/:id", fn(c) -> Todo ! web.Problem {
+        let id = web.param_int(c, "id")?
+        for t in store.todos {
+            if t.id == id {
+                return t
+            }
+        }
+        fail NotFound
+    })
+    web.mount(app, api)
+    let admin = web.group(app, "/admin", [web.basic("admin", fn(user, password) -> str? {
+        if user == "root" && password == "hunter2" { user } else { none }
+    })])
+    web.get(admin, "/whoami", fn(c) { web.text(200, "you are {c.user}") })
+    web.mount(app, admin)
+    var key: []u8 = []
+    for i in 0..32 {
+        push(mut key, u8(i))
+    }
+    let site = web.group(app, "/site", [web.sessions(web.SessionOptions { key })?, web.csrf()])
+    web.get(site, "/token", fn(c) { web.text(200, web.csrf_token(c)) })
+    web.post(site, "/login", fn(c) {
+        web.session_set(c, "user", "bob")
+        web.text(200, "signed in")
+    })
+    let members = web.group(site, "/members", [web.require_session("user")])
+    web.get(members, "/me", fn(c) { web.text(200, "member {c.user}") })
+    web.post(members, "/logout", fn(c) {
+        web.session_clear(c)
+        web.no_content()
+    })
+    web.mount(app, site)
+    web.mount(app, members)
+    web.openapi(app, "/openapi.json", web.Info { title: "Todos", version: "1.0.0" })
+    app
+}
+
+fn call(h: fn(http.Request) -> http.Response, method: str, target: str, headers: []http.Header, body: str) -> http.Response {
+    var req = http.request(method, target)
+    req.headers = headers
+    req.body = bytes(body)
+    h(req)
+}
+
+fn show(label: str, resp: http.Response) {
+    print("{label}: {resp.status} {str(resp.body)}")
+}
+
+fn cookie_of(resp: http.Response) -> str {
+    let set = http.header(resp.headers, "set-cookie") ?? ""
+    let semi = text.index_byte(set, ';')
+    if semi < 0 { set } else { set[..semi] }
+}
+
+fn main() ! io.Error {
+    let h = web.handler(build()?)
+    let key: []http.Header = [http.Header { name: "x-api-key", value: "secret" }]
+    show("health", call(h, "GET", "/health", [], ""))
+    show("wildcard", call(h, "GET", "/files/a/b%20c.txt", [], ""))
+    show("query", call(h, "GET", "/search?q=low+lang%21&x", [], ""))
+    show("no key", call(h, "GET", "/api/todos", [], ""))
+    show("create", call(h, "POST", "/api/todos", key, "{{\"title\": \"write docs\"}}"))
+    show("create empty", call(h, "POST", "/api/todos", key, "{{\"title\": \"\"}}"))
+    show("create wrong type", call(h, "POST", "/api/todos", key, "{{\"title\": 5}}"))
+    show("create bad json", call(h, "POST", "/api/todos", key, "{{\"title\""))
+    show("list", call(h, "GET", "/api/todos", key, ""))
+    show("one", call(h, "GET", "/api/todos/1", key, ""))
+    show("missing", call(h, "GET", "/api/todos/9", key, ""))
+    show("not a number", call(h, "GET", "/api/todos/x", key, ""))
+    let wrong = call(h, "DELETE", "/api/todos/1", key, "")
+    show("wrong method", wrong)
+    print("allow: {http.header(wrong.headers, "allow") ?? "-"}")
+    show("unknown", call(h, "GET", "/nope", [], ""))
+    show("basic", call(h, "GET", "/admin/whoami", [http.Header { name: "authorization", value: "Basic cm9vdDpodW50ZXIy" }], ""))
+    let denied = call(h, "GET", "/admin/whoami", [http.Header { name: "authorization", value: "Basic cm9vdDp4" }], "")
+    print("basic denied: {denied.status} {http.header(denied.headers, "www-authenticate") ?? "-"}")
+    show("members anonymous", call(h, "GET", "/site/members/me", [], ""))
+    show("login without csrf", call(h, "POST", "/site/login", [], ""))
+    let issued = call(h, "GET", "/site/token", [], "")
+    let token = str(issued.body)
+    let anonymous = http.Header { name: "cookie", value: cookie_of(issued) }
+    let csrf = http.Header { name: "x-csrf-token", value: token }
+    show("login wrong token", call(h, "POST", "/site/login", [anonymous, http.Header { name: "x-csrf-token", value: "nope" }], ""))
+    let login = call(h, "POST", "/site/login", [anonymous, csrf], "")
+    show("login", login)
+    let signed = http.Header { name: "cookie", value: cookie_of(login) }
+    show("member", call(h, "GET", "/site/members/me", [signed], ""))
+    let value = signed.value
+    let middle = value.len - 10
+    var forged_bytes: []u8 = []
+    for i in 0..value.len {
+        let c = value[i]
+        push(mut forged_bytes, if i == middle { if c == 'A' { 'B' } else { 'A' } } else { c })
+    }
+    show("forged cookie", call(h, "GET", "/site/members/me", [http.Header { name: "cookie", value: str(forged_bytes) }], ""))
+    let out = call(h, "POST", "/site/members/logout", [signed, csrf], "")
+    print("logout: {out.status} {cookie_of(out)}")
+    let doc = call(h, "GET", "/openapi.json", [], "")
+    let parsed = json.parse(doc.body) catch {
+        _ => return
+    }
+    let paths = json.get(parsed, "paths") ?? json.Value.Null
+    match paths {
+        Object(members) => {
+            for m in members {
+                print("path {m.name}")
+            }
+        }
+        _ => {}
+    }
+    let components = json.get(parsed, "components") ?? json.Value.Null
+    print(json.stringify(json.get(components, "securitySchemes") ?? json.Value.Null, 0))
+    print(json.stringify(json.get(json.get(components, "schemas") ?? json.Value.Null, "CreateTodo") ?? json.Value.Null, 0))
+}

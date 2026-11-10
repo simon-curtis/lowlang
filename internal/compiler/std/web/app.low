@@ -1,0 +1,248 @@
+import std/http
+import std/json
+import std/serde
+import std/text
+
+pub struct Security {
+    pub name: str
+    pub scheme: json.Value
+}
+
+pub struct Middleware {
+    pub run: fn(*Context, fn() -> http.Response) -> http.Response
+    pub security: Security?
+}
+
+pub struct Context {
+    pub request: http.Request
+    pub params: [str: str]
+    pub user: str
+    pub claims: json.Value
+    pub values: [str: str]
+    pub response_headers: []http.Header
+    pub session: *Session?
+}
+
+pub struct Operation {
+    pub summary: str = ""
+    pub description: str = ""
+    pub tags: []str = []
+    pub request: serde.Schema?
+    pub response: serde.Schema?
+    pub status: i64 = 200
+}
+
+struct Route {
+    method: str
+    pattern: str
+    segments: []str
+    handler: fn(*Context) -> http.Response
+    middleware: []Middleware
+    operation: *Operation
+}
+
+pub struct App {
+    routes: []*Route
+    middleware: []Middleware
+    prefix: str
+}
+
+pub fn app() -> *App {
+    new(App { routes: [], middleware: [], prefix: "" })
+}
+
+pub fn use(a: *App, m: Middleware) {
+    push(mut a.middleware, m)
+}
+
+fn split_path(path: str) -> []str {
+    var out: []str = []
+    for part in text.split(path, '/') {
+        if part.len > 0 {
+            push(mut out, part)
+        }
+    }
+    out
+}
+
+pub fn route(a: *App, method: str, path: str, handler: fn(*Context) -> http.Response) -> *Operation {
+    let full = "{a.prefix}{path}"
+    let op = new(Operation { request: none, response: none })
+    var middleware: []Middleware = []
+    for m in a.middleware {
+        push(mut middleware, m)
+    }
+    push(mut a.routes, new(Route { method, pattern: full, segments: split_path(full), handler, middleware, operation: op }))
+    op
+}
+
+pub fn get(a: *App, path: str, handler: fn(*Context) -> http.Response) -> *Operation {
+    route(a, "GET", path, handler)
+}
+
+pub fn post(a: *App, path: str, handler: fn(*Context) -> http.Response) -> *Operation {
+    route(a, "POST", path, handler)
+}
+
+pub fn put(a: *App, path: str, handler: fn(*Context) -> http.Response) -> *Operation {
+    route(a, "PUT", path, handler)
+}
+
+pub fn patch(a: *App, path: str, handler: fn(*Context) -> http.Response) -> *Operation {
+    route(a, "PATCH", path, handler)
+}
+
+pub fn del(a: *App, path: str, handler: fn(*Context) -> http.Response) -> *Operation {
+    route(a, "DELETE", path, handler)
+}
+
+pub fn group(a: *App, prefix: str, middleware: []Middleware) -> *App {
+    var combined: []Middleware = []
+    for m in a.middleware {
+        push(mut combined, m)
+    }
+    for m in middleware {
+        push(mut combined, m)
+    }
+    new(App { routes: [], middleware: combined, prefix: "{a.prefix}{prefix}" })
+}
+
+pub fn mount(a: *App, child: *App) {
+    for r in child.routes {
+        push(mut a.routes, r)
+    }
+}
+
+pub fn describe(op: *Operation, summary: str, tags: []str) {
+    op.summary = summary
+    op.tags = tags
+}
+
+fn matches(r: *Route, segments: []str) -> [str: str]? {
+    var params: [str: str] = [:]
+    let wildcard = r.segments.len > 0 && r.segments[r.segments.len - 1] == "*"
+    if wildcard && segments.len < r.segments.len - 1 || !wildcard && segments.len != r.segments.len {
+        return none
+    }
+    for i, s in r.segments {
+        if s == "*" {
+            var rest: []str = []
+            for part in segments[i..] {
+                push(mut rest, percent_decode(part))
+            }
+            params["*"] = text.join(rest, "/")
+            return params
+        }
+        if s.len > 0 && s[0] == ':' {
+            params[s[1..]] = percent_decode(segments[i])
+        } else if s != segments[i] {
+            return none
+        }
+    }
+    params
+}
+
+fn chain(c: *Context, middleware: []Middleware, at: i64, handler: fn(*Context) -> http.Response) -> http.Response {
+    if at == middleware.len {
+        return handler(c)
+    }
+    middleware[at].run(c, fn() -> http.Response { chain(c, middleware, at + 1, handler) })
+}
+
+fn dispatch(a: *App, req: http.Request) -> http.Response {
+    let segments = split_path(req.path)
+    var allowed: []str = []
+    for r in a.routes {
+        let params = match matches(r, segments) {
+            some(p) => p
+            none => continue
+        }
+        if r.method != req.method && !(req.method == "HEAD" && r.method == "GET") {
+            push(mut allowed, r.method)
+            continue
+        }
+        let c = new(Context { request: req, params, user: "", claims: json.Value.Null, values: [:], response_headers: [], session: none })
+        var resp = chain(c, r.middleware, 0, r.handler)
+        for h in c.response_headers {
+            http.add_header(mut resp.headers, h.name, h.value)
+        }
+        return resp
+    }
+    if allowed.len > 0 {
+        var resp = problem_response(Status(405, "Method Not Allowed", ""))
+        http.set_header(mut resp.headers, "allow", text.join(allowed, ", "))
+        return resp
+    }
+    problem_response(NotFound)
+}
+
+pub fn handler(a: *App) -> fn(http.Request) -> http.Response {
+    fn(req) { dispatch(a, req) }
+}
+
+pub fn param(c: *Context, name: str) -> str {
+    c.params[name] ?? ""
+}
+
+pub fn param_int(c: *Context, name: str) -> i64 ! Problem {
+    text.parse_int(param(c, name)) catch {
+        _ => fail BadRequest("path parameter {name} must be an integer")
+    }
+}
+
+pub fn header(c: *Context, name: str) -> str? {
+    http.header(c.request.headers, name)
+}
+
+pub fn set_header(c: *Context, name: str, value: str) {
+    push(mut c.response_headers, http.Header { name, value })
+}
+
+fn hex_value(c: u8) -> i64 {
+    if c >= '0' && c <= '9' {
+        return i64(c - '0')
+    }
+    if c >= 'a' && c <= 'f' {
+        return i64(c - 'a') + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return i64(c - 'A') + 10
+    }
+    -1
+}
+
+pub fn percent_decode(s: str) -> str {
+    var out: []u8 = []
+    var i = 0
+    for i < s.len {
+        let c = s[i]
+        if c == '%' && i + 2 < s.len && hex_value(s[i + 1]) >= 0 && hex_value(s[i + 2]) >= 0 {
+            push(mut out, u8(hex_value(s[i + 1]) << 4 | hex_value(s[i + 2])))
+            i += 3
+            continue
+        }
+        push(mut out, if c == '+' { ' ' } else { c })
+        i += 1
+    }
+    __str_view(out)
+}
+
+pub fn parse_query(query: str) -> [str: str] {
+    var out: [str: str] = [:]
+    for pair in text.split(query, '&') {
+        if pair.len == 0 {
+            continue
+        }
+        let eq = text.index_byte(pair, '=')
+        if eq < 0 {
+            out[percent_decode(pair)] = ""
+        } else {
+            out[percent_decode(pair[..eq])] = percent_decode(pair[eq + 1..])
+        }
+    }
+    out
+}
+
+pub fn query(c: *Context, name: str) -> str? {
+    parse_query(c.request.query)[name]
+}

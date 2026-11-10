@@ -1,0 +1,248 @@
+import std/base64
+import std/crypto
+import std/crypto/aead
+import std/crypto/hash
+import std/http
+import std/io
+import std/json
+import std/text
+import std/time
+
+pub struct Session {
+    pub values: [str: str]
+    changed: bool
+    cleared: bool
+}
+
+pub struct SessionOptions {
+    pub key: []u8
+    pub cookie: str = "session"
+    pub max_age: i64 = 86400
+    pub secure: bool = true
+    pub same_site: str = "Lax"
+    pub path: str = "/"
+}
+
+struct Stored {
+    expires: i64
+    values: [str: str]
+}
+
+pub fn base64url(data: []u8) -> str {
+    let standard = base64.encode(data)
+    var out: []u8 = []
+    for i in 0..standard.len {
+        let c = standard[i]
+        if c == '=' {
+            break
+        }
+        push(mut out, if c == '+' { '-' } else if c == '/' { '_' } else { c })
+    }
+    __str_view(out)
+}
+
+pub fn base64url_decode(s: str) -> []u8? {
+    var out: []u8 = []
+    for i in 0..s.len {
+        let c = s[i]
+        push(mut out, if c == '-' { '+' } else if c == '_' { '/' } else { c })
+    }
+    for out.len % 4 != 0 {
+        push(mut out, '=')
+    }
+    let decoded = base64.decode(__str_view(out)) catch {
+        _ => return none
+    }
+    decoded
+}
+
+pub fn cookies(c: *Context) -> [str: str] {
+    var out: [str: str] = [:]
+    for h in c.request.headers {
+        if !text.equal_fold(h.name, "cookie") {
+            continue
+        }
+        for part in text.split(h.value, ';') {
+            let pair = text.trim(part)
+            let eq = text.index_byte(pair, '=')
+            if eq > 0 {
+                out[pair[..eq]] = pair[eq + 1..]
+            }
+        }
+    }
+    out
+}
+
+pub struct Cookie {
+    pub name: str
+    pub value: str
+    pub path: str = "/"
+    pub max_age: i64 = -1
+    pub http_only: bool = true
+    pub secure: bool = true
+    pub same_site: str = "Lax"
+}
+
+pub fn set_cookie(c: *Context, cookie: Cookie) {
+    var parts: []str = ["{cookie.name}={cookie.value}", "Path={cookie.path}"]
+    if cookie.max_age >= 0 {
+        push(mut parts, "Max-Age={cookie.max_age}")
+    }
+    if cookie.http_only {
+        push(mut parts, "HttpOnly")
+    }
+    if cookie.secure {
+        push(mut parts, "Secure")
+    }
+    if cookie.same_site.len > 0 {
+        push(mut parts, "SameSite={cookie.same_site}")
+    }
+    set_header(c, "set-cookie", text.join(parts, "; "))
+}
+
+fn open_session(cipher: aead.Aead, name: str, raw: str) -> [str: str]? {
+    let data = match base64url_decode(raw) {
+        some(d) => d
+        none => return none
+    }
+    if data.len < 12 + 16 {
+        return none
+    }
+    let plain = cipher.open(data[..12], data[12..], bytes(name)) catch {
+        _ => return none
+    }
+    let stored = json.deserialize[Stored](plain) catch {
+        _ => return none
+    }
+    if stored.expires < time.now() {
+        return none
+    }
+    stored.values
+}
+
+fn seal_session(cipher: aead.Aead, name: str, values: [str: str], max_age: i64) -> str {
+    let nonce = crypto.random(12)
+    let plain = bytes(json.serialize(Stored { expires: time.now() + max_age, values }))
+    var out: []u8 = []
+    for b in nonce {
+        push(mut out, b)
+    }
+    for b in cipher.seal(nonce, plain, bytes(name)) {
+        push(mut out, b)
+    }
+    base64url(out)
+}
+
+pub fn sessions(o: SessionOptions) -> Middleware ! io.Error {
+    if o.key.len != 32 {
+        fail Invalid
+    }
+    let cipher = aead.aes_gcm(o.key)?
+    Middleware {
+        run: fn(c: *Context, next: fn() -> http.Response) -> http.Response {
+            var values: [str: str] = [:]
+            match cookies(c)[o.cookie] {
+                some(raw) => {
+                    match open_session(cipher, o.cookie, raw) {
+                        some(v) => {
+                            values = v
+                        }
+                        none => {}
+                    }
+                }
+                none => {}
+            }
+            let s = new(Session { values, changed: false, cleared: false })
+            c.session = s
+            let resp = next()
+            if s.cleared {
+                set_cookie(c, Cookie { name: o.cookie, value: "", path: o.path, max_age: 0, secure: o.secure, same_site: o.same_site })
+            } else if s.changed {
+                let sealed = seal_session(cipher, o.cookie, s.values, o.max_age)
+                set_cookie(c, Cookie { name: o.cookie, value: sealed, path: o.path, max_age: o.max_age, secure: o.secure, same_site: o.same_site })
+            }
+            resp
+        }
+        security: Security {
+            name: "session"
+            scheme: json.Value.Object([
+                json.Member { name: "type", value: json.Value.Str("apiKey") }
+                json.Member { name: "in", value: json.Value.Str("cookie") }
+                json.Member { name: "name", value: json.Value.Str(o.cookie) }
+            ])
+        }
+    }
+}
+
+fn current(c: *Context) -> *Session {
+    match c.session {
+        some(s) => s
+        none => {
+            let s = new(Session { values: [:], changed: false, cleared: false })
+            c.session = s
+            s
+        }
+    }
+}
+
+pub fn session_get(c: *Context, key: str) -> str? {
+    current(c).values[key]
+}
+
+pub fn session_set(c: *Context, key: str, value: str) {
+    let s = current(c)
+    s.values[key] = value
+    s.changed = true
+}
+
+pub fn session_clear(c: *Context) {
+    let s = current(c)
+    s.values = [:]
+    s.cleared = true
+}
+
+pub fn csrf_token(c: *Context) -> str {
+    match session_get(c, "csrf") {
+        some(t) => t
+        none => {
+            let t = text.encode_hex(crypto.random(32))
+            session_set(c, "csrf", t)
+            t
+        }
+    }
+}
+
+fn unsafe_method(m: str) -> bool {
+    m != "GET" && m != "HEAD" && m != "OPTIONS"
+}
+
+pub fn csrf() -> Middleware {
+    Middleware {
+        run: fn(c: *Context, next: fn() -> http.Response) -> http.Response {
+            if unsafe_method(c.request.method) {
+                let expected = session_get(c, "csrf") ?? ""
+                let given = header(c, "x-csrf-token") ?? ""
+                if expected.len == 0 || !hash.equal(bytes(expected), bytes(given)) {
+                    return problem_response(Forbidden("missing or invalid CSRF token"))
+                }
+            }
+            next()
+        }
+        security: none
+    }
+}
+
+pub fn require_session(key: str) -> Middleware {
+    Middleware {
+        run: fn(c: *Context, next: fn() -> http.Response) -> http.Response {
+            match session_get(c, key) {
+                some(user) => {
+                    c.user = user
+                    next()
+                }
+                none => problem_response(Unauthorized("sign in required"))
+            }
+        }
+        security: none
+    }
+}

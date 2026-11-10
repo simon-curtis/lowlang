@@ -1,0 +1,280 @@
+import std/http
+import std/json
+import std/serde
+import std/text
+
+pub struct Info {
+    pub title: str
+    pub version: str
+    pub description: str = ""
+}
+
+struct Components {
+    names: []str
+    schemas: [str: json.Value]
+}
+
+fn member(name: str, value: json.Value) -> json.Member {
+    json.Member { name, value }
+}
+
+fn string_value(s: str) -> json.Value {
+    json.Value.Str(s)
+}
+
+fn object(members: []json.Member) -> json.Value {
+    json.Value.Object(members)
+}
+
+fn component_name(name: str) -> str {
+    var out: []u8 = []
+    for i in 0..name.len {
+        let c = name[i]
+        if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '.' || c == '-' {
+            push(mut out, c)
+        } else {
+            push(mut out, '_')
+        }
+    }
+    __str_view(out)
+}
+
+fn present(m: [str: json.Value], key: str) -> bool {
+    match m[key] {
+        some(_) => true
+        none => false
+    }
+}
+
+fn reference(name: str) -> json.Value {
+    object([member("$ref", string_value("#/components/schemas/{component_name(name)}"))])
+}
+
+fn properties(c: *Components, fields: []serde.Property) -> json.Value {
+    var props: []json.Member = []
+    var required: []json.Value = []
+    for f in fields {
+        push(mut props, member(f.name, schema_json(c, f.schema)))
+        if f.required {
+            push(mut required, string_value(f.name))
+        }
+    }
+    var out: []json.Member = [member("type", string_value("object")), member("properties", object(props))]
+    if required.len > 0 {
+        push(mut out, member("required", json.Value.Array(required)))
+    }
+    object(out)
+}
+
+fn variant_schema(c: *Components, v: serde.Variant) -> json.Value {
+    if v.fields.len == 0 {
+        return object([member("const", string_value(v.name))])
+    }
+    var payload = properties(c, v.fields)
+    if !v.labelled {
+        var items: []json.Value = []
+        for f in v.fields {
+            push(mut items, schema_json(c, f.schema))
+        }
+        payload = object([member("type", string_value("array")), member("prefixItems", json.Value.Array(items)), member("items", json.Value.Bool(false))])
+    }
+    object([
+        member("type", string_value("object"))
+        member("properties", object([member(v.name, payload)]))
+        member("required", json.Value.Array([string_value(v.name)]))
+        member("additionalProperties", json.Value.Bool(false))
+    ])
+}
+
+fn named(c: *Components, s: serde.Schema, build: fn() -> json.Value) -> json.Value {
+    let key = component_name(s.name)
+    if !present(c.schemas, key) {
+        c.schemas[key] = json.Value.Null
+        push(mut c.names, key)
+        c.schemas[key] = build()
+    }
+    reference(s.name)
+}
+
+fn schema_json(c: *Components, s: serde.Schema) -> json.Value {
+    match s.kind {
+        Bool => object([member("type", string_value("boolean"))])
+        Int => object([member("type", string_value("integer")), member("format", string_value(if s.bits > 32 { "int64" } else { "int32" }))])
+        Uint => object([member("type", string_value("integer")), member("minimum", json.Value.Int(0))])
+        Float => object([member("type", string_value("number")), member("format", string_value(if s.bits == 32 { "float" } else { "double" }))])
+        Text => object([member("type", string_value("string"))])
+        Binary => object([member("type", string_value("string")), member("contentEncoding", string_value("base64"))])
+        Seq => object([member("type", string_value("array")), member("items", schema_json(c, s.items[0]))])
+        Map => object([member("type", string_value("object")), member("additionalProperties", schema_json(c, s.items[1]))])
+        Optional => object([member("oneOf", json.Value.Array([schema_json(c, s.items[0]), object([member("type", string_value("null"))])]))])
+        Struct => named(c, s, fn() -> json.Value { properties(c, s.fields) })
+        Enum => named(c, s, fn() -> json.Value {
+            var all_units = true
+            for v in s.variants {
+                if v.fields.len > 0 {
+                    all_units = false
+                }
+            }
+            if all_units {
+                var names: []json.Value = []
+                for v in s.variants {
+                    push(mut names, string_value(v.name))
+                }
+                return object([member("type", string_value("string")), member("enum", json.Value.Array(names))])
+            }
+            var options: []json.Value = []
+            for v in s.variants {
+                push(mut options, variant_schema(c, v))
+            }
+            object([member("oneOf", json.Value.Array(options))])
+        })
+        Ref => reference(s.name)
+    }
+}
+
+fn path_template(pattern: str) -> str {
+    var parts: []str = []
+    for seg in text.split(pattern, '/') {
+        if seg.len > 1 && seg[0] == ':' {
+            push(mut parts, "{{{seg[1..]}}}")
+        } else {
+            push(mut parts, seg)
+        }
+    }
+    text.join(parts, "/")
+}
+
+fn operation_json(c: *Components, r: *Route, schemes: []str) -> json.Value {
+    let op = r.operation
+    var members: []json.Member = []
+    if op.summary.len > 0 {
+        push(mut members, member("summary", string_value(op.summary)))
+    }
+    if op.description.len > 0 {
+        push(mut members, member("description", string_value(op.description)))
+    }
+    if op.tags.len > 0 {
+        var tags: []json.Value = []
+        for t in op.tags {
+            push(mut tags, string_value(t))
+        }
+        push(mut members, member("tags", json.Value.Array(tags)))
+    }
+    var params: []json.Value = []
+    for seg in r.segments {
+        if seg.len > 1 && seg[0] == ':' {
+            push(mut params, object([
+                member("name", string_value(seg[1..]))
+                member("in", string_value("path"))
+                member("required", json.Value.Bool(true))
+                member("schema", object([member("type", string_value("string"))]))
+            ]))
+        }
+    }
+    if params.len > 0 {
+        push(mut members, member("parameters", json.Value.Array(params)))
+    }
+    match op.request {
+        some(s) => push(mut members, member("requestBody", object([
+            member("required", json.Value.Bool(true))
+            member("content", object([member("application/json", object([member("schema", schema_json(c, s))]))]))
+        ])))
+        none => {}
+    }
+    var responses: []json.Member = []
+    match op.response {
+        some(s) => push(mut responses, member("{op.status}", object([
+            member("description", string_value(http.status_text(op.status)))
+            member("content", object([member("application/json", object([member("schema", schema_json(c, s))]))]))
+        ])))
+        none => push(mut responses, member("200", object([member("description", string_value("OK"))])))
+    }
+    push(mut responses, member("default", object([
+        member("description", string_value("Problem details"))
+        member("content", object([member("application/problem+json", object([member("schema", reference("Problem"))]))]))
+    ])))
+    push(mut members, member("responses", object(responses)))
+    if schemes.len > 0 {
+        var alternatives: []json.Value = []
+        for name in schemes {
+            push(mut alternatives, object([member(name, json.Value.Array([]))]))
+        }
+        push(mut members, member("security", json.Value.Array(alternatives)))
+    }
+    object(members)
+}
+
+pub fn openapi_document(a: *App, info: Info) -> json.Value {
+    let c = new(Components { names: [], schemas: [:] })
+    c.schemas["Problem"] = properties(c, [
+        serde.Property { name: "type", schema: serde.Schema { kind: Text }, required: true }
+        serde.Property { name: "title", schema: serde.Schema { kind: Text }, required: true }
+        serde.Property { name: "status", schema: serde.Schema { kind: Int, bits: 64 }, required: true }
+        serde.Property { name: "detail", schema: serde.Schema { kind: Text }, required: false }
+    ])
+    push(mut c.names, "Problem")
+    var paths: []str = []
+    var path_items: [str: []json.Member] = [:]
+    var security: [str: json.Value] = [:]
+    var security_names: []str = []
+    for r in a.routes {
+        var schemes: []str = []
+        for m in r.middleware {
+            match m.security {
+                some(sec) => {
+                    push(mut schemes, sec.name)
+                    if !present(security, sec.name) {
+                        push(mut security_names, sec.name)
+                    }
+                    security[sec.name] = sec.scheme
+                }
+                none => {}
+            }
+        }
+        let template = path_template(r.pattern)
+        var ops = match path_items[template] {
+            some(existing) => existing
+            none => {
+                push(mut paths, template)
+                let fresh: []json.Member = []
+                fresh
+            }
+        }
+        push(mut ops, member(text.lower(r.method), operation_json(c, r, schemes)))
+        path_items[template] = ops
+    }
+    var path_members: []json.Member = []
+    for p in paths {
+        push(mut path_members, member(p, object(path_items[p] ?? [])))
+    }
+    var component_members: []json.Member = []
+    for n in c.names {
+        push(mut component_members, member(n, c.schemas[n] ?? json.Value.Null))
+    }
+    var components: []json.Member = [member("schemas", object(component_members))]
+    if security_names.len > 0 {
+        var schemes: []json.Member = []
+        for n in security_names {
+            push(mut schemes, member(n, security[n] ?? json.Value.Null))
+        }
+        push(mut components, member("securitySchemes", object(schemes)))
+    }
+    var info_members: []json.Member = [member("title", string_value(info.title)), member("version", string_value(info.version))]
+    if info.description.len > 0 {
+        push(mut info_members, member("description", string_value(info.description)))
+    }
+    object([
+        member("openapi", string_value("3.1.0"))
+        member("info", object(info_members))
+        member("paths", object(path_members))
+        member("components", object(components))
+    ])
+}
+
+pub fn openapi(a: *App, path: str, info: Info) {
+    get(a, path, fn(c: *Context) -> http.Response {
+        var resp = http.response(200, json.stringify(openapi_document(a, info), 2))
+        http.set_header(mut resp.headers, "content-type", "application/json")
+        resp
+    })
+}
