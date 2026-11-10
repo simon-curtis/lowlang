@@ -1326,6 +1326,9 @@ func (c *Checker) selector(e *ast.Selector, want *types.Type) {
 		e.Type = types.I64
 		return
 	}
+	if deref(t).Field(e.Name) == nil {
+		c.shadowedModule(e.X, e.Name)
+	}
 	e.Field = c.field(deref(t), e.Name, e.Pos)
 	e.Type = e.Field.Type
 }
@@ -1761,7 +1764,20 @@ func (c *Checker) method(e *ast.Call, sel *ast.Selector, want *types.Type) {
 		c.callFunc(e, target, want)
 		return
 	}
+	if !c.callable(sel.Name) {
+		c.shadowedModule(sel.X, sel.Name)
+	}
 	c.call(e, want)
+}
+
+func (c *Checker) shadowedModule(x ast.Expr, name string) {
+	id, ok := x.(*ast.Ident)
+	if !ok {
+		return
+	}
+	if path, imported := c.file.Imported(id.Name); imported {
+		c.fail(id.Pos, "%s is a local here, not the module %s; rename the local to use %s.%s", id.Name, path, id.Name, name)
+	}
 }
 
 func (c *Checker) receiverFunc(t *types.Type, name string) *ast.Func {
