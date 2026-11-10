@@ -720,7 +720,7 @@ fn main() ! io.Error {
 | `std/os` | `args` and `environment` from `/proc/self/cmdline` and `/proc/self/environ`, `env` as `str?`, `pid` and `exit`. |
 | `std/process` | `Command` with arguments, an optional replacement environment, a working directory, `Inherit`, `Piped` or `Null` for each standard stream, and an optional new process group; `start`, `wait`, `kill`, `run`, which feeds input and collects both outputs, `find`, which searches `PATH`, and `success`. |
 | `std/cdp` | The Chrome DevTools Protocol: `launch` starts a headless Chromium with a disposable profile and connects to it, `call` sends a command to the browser or a session and `events` delivers everything else; `open_page` opens a page in its own browser context whose every request, including those of cross-site frames and workers, passes through `Handlers`; `navigate` and `shutdown`. |
-| `std/path` | Slash-separated path manipulation: `clean` (lexical, resolving `.` and `..`), `join`, `base`, `dir`, `ext`, `stem` and `is_absolute`. |
+| `std/path` | Slash-separated path manipulation: `clean` (lexical, resolving `.` and `..`), `join`, `base`, `dir`, `ext`, `stem` and `is_absolute`; `matches` for shell globs with `*`, `?`, `[...]` classes (ranges, `!` or `^` negation) and `\` escapes, where no wildcard crosses a `/`. |
 | `std/sync` | `Mutex` with `lock`, `try_lock`, `unlock` and `locked`; `WaitGroup` with `add`, `done` and `wait`; `Once` with `run`. All are built on channels, so a waiting green thread parks instead of spinning. |
 | `std/rand` | A seedable, non-cryptographic xoshiro256** generator: `seeded`, `rng` (seeded from `std/crypto`), `next`, unbiased `below` and `between`, `float`, `chance`, `shuffle` and `pick`. Use `std/crypto` for secrets. |
 | `std/uuid` | Random v4 and time-ordered v7 UUIDs, `format`, `parse` with the offset of the first bad character, `version`, `timestamp` for v7, `equal` and `nil`. |
@@ -728,6 +728,8 @@ fn main() ! io.Error {
 | `std/flag` | Command-line flags from `Spec`s with help text, booleans and defaults: `--name value`, `--name=value`, single-dash forms and `--`; `get`, `enabled`, `number`, the remaining arguments, and `usage`. |
 | `std/log` | Leveled line logging, `debug`, `info`, `warn` and `error`, to a descriptor (stderr by default) as `level prefix: message`, without timestamps so journald and other collectors add their own. `with_prefix` nests a prefix. |
 | `std/container/heap` | A binary `Heap[T]` ordered by a `less` function: `insert`, `pop`, `peek` and `size`. |
+| `std/container/lru` | A least-recently-used `Cache[K, V]` of fixed capacity: `get` (which refreshes the entry), `put` (which returns the evicted key), `contains`, `size` and `keys` from most to least recent, all in constant time over index-linked entries. |
+| `std/container/deque` | A ring-buffer `Deque[T]`: `push_front`, `push_back`, `pop_front`, `pop_back`, `front`, `back`, `at` and `size`, doubling when full. |
 | `std/base64` | `encode` and `decode`, and `encode_url` and `decode_url` for the URL-safe alphabet without padding (RFC 4648 §5), which reject padding, other alphabets and non-zero trailing bits. |
 
 ### Networking
