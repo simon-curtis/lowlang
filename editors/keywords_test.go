@@ -31,7 +31,7 @@ var grammarFiles = []grammarFile{
 
 func keywords() []string {
 	var words []string
-	for kind := lexer.Fn; kind <= lexer.Select; kind++ {
+	for kind := lexer.Fn; kind < lexer.LParen; kind++ {
 		words = append(words, kind.String())
 	}
 	return words

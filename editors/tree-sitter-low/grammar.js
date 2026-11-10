@@ -27,6 +27,8 @@ module.exports = grammar({
   conflicts: $ => [
     [$._expression, $._type_name],
     [$._expression, $.scoped_type_identifier],
+    [$.struct_literal],
+    [$.call_expression],
   ],
 
   supertypes: $ => [$._expression, $._statement, $._type, $._declaration],
@@ -123,14 +125,17 @@ module.exports = grammar({
       field('body', $.field_declaration_list),
     ),
 
-    field_declaration_list: $ => seq('{', lines($, $.field_declaration), '}'),
+    field_declaration_list: $ => seq('{', lines($, choice($.field_declaration, $.drop_declaration)), '}'),
 
     field_declaration: $ => seq(
       optional($.visibility),
       field('name', alias($.identifier, $.field_identifier)),
       ':',
       field('type', $._type),
+      optional(seq('=', field('default', $._expression))),
     ),
+
+    drop_declaration: $ => seq('drop', field('body', $._statement)),
 
     enum_declaration: $ => seq(
       optional($.visibility),
@@ -202,6 +207,7 @@ module.exports = grammar({
 
     _statement: $ => choice(
       $.let_declaration,
+      $.using_declaration,
       $.assignment_statement,
       $.send_statement,
       $.for_statement,
@@ -219,6 +225,15 @@ module.exports = grammar({
 
     let_declaration: $ => seq(
       choice('let', 'var'),
+      field('name', $.identifier),
+      optional(seq(':', field('type', $._type))),
+      '=',
+      field('value', $._expression),
+    ),
+
+    using_declaration: $ => seq(
+      'using',
+      optional('var'),
       field('name', $.identifier),
       optional(seq(':', field('type', $._type))),
       '=',
@@ -364,7 +379,10 @@ module.exports = grammar({
     call_expression: $ => prec(PREC.postfix, seq(
       field('function', $._expression),
       field('arguments', $.arguments),
+      optional(field('children', prec.dynamic(-1, $.children))),
     )),
+
+    children: $ => seq('{', separated($, $._expression), '}'),
 
     arguments: $ => seq('(', commaSep(choice($._expression, $.mutable_argument)), ')'),
 
@@ -400,10 +418,11 @@ module.exports = grammar({
       field('handler', choice($.match_block, $._expression)),
     )),
 
-    struct_literal: $ => seq(
+    struct_literal: $ => prec(0, seq(
       field('name', choice($._type_name, $.scoped_type_identifier, $.generic_type)),
       field('body', $.field_initializer_list),
-    ),
+      optional(field('children', prec.dynamic(-1, $.children))),
+    )),
 
     field_initializer_list: $ => seq('{', separated($, $.field_initializer), '}'),
 
@@ -447,13 +466,37 @@ module.exports = grammar({
       field('body', $.match_block),
     ),
 
-    match_block: $ => prec(1, seq('{', lines($, $.match_arm), '}')),
+    match_block: $ => prec(1, seq('{', separated($, $.match_arm), '}')),
 
     match_arm: $ => seq(
-      field('pattern', $.pattern),
+      field('pattern', choice($.pattern, $.test_pattern)),
       '=>',
       field('value', $._arm_body),
     ),
+
+    test_pattern: $ => {
+      const table = [
+        [PREC.compare, choice('==', '!=', '<', '<=', '>', '>=')],
+        [PREC.coalesce, '??'],
+        [PREC.additive, choice('+', '-', '|', '^')],
+        [PREC.multiplicative, choice('*', '/', '%', '&', '<<', '>>')],
+      ];
+      const opening = table.map(([precedence, operator]) => prec.left(precedence, seq(
+        field('operator', operator),
+        field('right', $._expression),
+      )));
+      const extended = table.map(([precedence, operator]) => prec.left(precedence, seq(
+        field('left', $.test_pattern),
+        field('operator', operator),
+        field('right', $._expression),
+      )));
+      const joined = [[PREC.or, '||'], [PREC.and, '&&']].map(([precedence, operator]) => prec.left(precedence, seq(
+        field('left', $.test_pattern),
+        field('operator', operator),
+        field('right', $.test_pattern),
+      )));
+      return choice(...opening, ...extended, ...joined);
+    },
 
     _arm_body: $ => choice(
       $._expression,

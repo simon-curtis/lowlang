@@ -83,6 +83,8 @@
   "defer"
   "spawn"
   "select"
+  "using"
+  "drop"
 ] @keyword
 
 "import" @keyword.import
