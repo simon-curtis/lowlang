@@ -1,0 +1,451 @@
+import std/crypto
+import std/crypto/hash
+import std/crypto/sha3
+import std/io
+
+pub enum Level {
+    Kem512
+    Kem768
+    Kem1024
+}
+
+pub struct Keys {
+    pub encapsulation: []u8
+    pub decapsulation: []u8
+}
+
+pub struct Encapsulated {
+    pub ciphertext: []u8
+    pub shared: []u8
+}
+
+struct Scheme {
+    k: i64
+    eta1: i64
+    eta2: i64
+    du: i64
+    dv: i64
+    zetas: []i64
+    gammas: []i64
+}
+
+fn bit_reverse7(x: i64) -> i64 {
+    var r = 0
+    for b in 0..7 {
+        r |= (x >> b & 1) << (6 - b)
+    }
+    r
+}
+
+fn scheme(level: Level) -> Scheme {
+    let powers: []i64 = __make(256)
+    var p = 1
+    for i in 0..256 {
+        powers[i] = p
+        p = p * 17 % 3329
+    }
+    let zetas: []i64 = __make(128)
+    let gammas: []i64 = __make(128)
+    for i in 0..128 {
+        zetas[i] = powers[bit_reverse7(i)]
+        gammas[i] = powers[2 * bit_reverse7(i) + 1]
+    }
+    match level {
+        Kem512 => Scheme { k: 2, eta1: 3, eta2: 2, du: 10, dv: 4, zetas, gammas }
+        Kem768 => Scheme { k: 3, eta1: 2, eta2: 2, du: 10, dv: 4, zetas, gammas }
+        Kem1024 => Scheme { k: 4, eta1: 2, eta2: 2, du: 11, dv: 5, zetas, gammas }
+    }
+}
+
+fn encapsulation_size(s: Scheme) -> i64 {
+    384 * s.k + 32
+}
+
+fn decapsulation_size(s: Scheme) -> i64 {
+    768 * s.k + 96
+}
+
+fn ciphertext_size(s: Scheme) -> i64 {
+    32 * (s.du * s.k + s.dv)
+}
+
+fn reduce(x: i64) -> i64 {
+    let r = x - (x * 1290167 >> 32) * 3329
+    let t = r - 3329
+    t + (t >> 63 & 3329)
+}
+
+fn add_q(a: i64, b: i64) -> i64 {
+    let t = a + b - 3329
+    t + (t >> 63 & 3329)
+}
+
+fn sub_q(a: i64, b: i64) -> i64 {
+    let t = a - b
+    t + (t >> 63 & 3329)
+}
+
+fn divide_q(n: i64) -> i64 {
+    let t = n * 1290167 >> 32
+    let r = n - t * 3329
+    t + ((3328 - r) >> 63 & 1)
+}
+
+fn compress(x: i64, d: i64) -> i64 {
+    divide_q((x << d) + 1664) & ((1 << d) - 1)
+}
+
+fn decompress(y: i64, d: i64) -> i64 {
+    (y * 3329 + (1 << (d - 1))) >> d
+}
+
+fn ntt(s: Scheme, f: []i64) {
+    let zetas = s.zetas
+    var i = 1
+    var len = 128
+    for len >= 2 {
+        var start = 0
+        for start < 256 {
+            let z = zetas[i]
+            i += 1
+            for j in start..start + len {
+                let t = reduce(z * f[j + len])
+                f[j + len] = sub_q(f[j], t)
+                f[j] = add_q(f[j], t)
+            }
+            start += 2 * len
+        }
+        len >>= 1
+    }
+}
+
+fn inverse_ntt(s: Scheme, f: []i64) {
+    let zetas = s.zetas
+    var i = 127
+    var len = 2
+    for len <= 128 {
+        var start = 0
+        for start < 256 {
+            let z = zetas[i]
+            i -= 1
+            for j in start..start + len {
+                let t = f[j]
+                f[j] = add_q(t, f[j + len])
+                f[j + len] = reduce(z * sub_q(f[j + len], t))
+            }
+            start += 2 * len
+        }
+        len <<= 1
+    }
+    for j in 0..256 {
+        f[j] = reduce(f[j] * 3303)
+    }
+}
+
+fn multiply_add(s: Scheme, acc: []i64, a: []i64, b: []i64) {
+    let gammas = s.gammas
+    for i in 0..128 {
+        let a0 = a[2 * i]
+        let a1 = a[2 * i + 1]
+        let b0 = b[2 * i]
+        let b1 = b[2 * i + 1]
+        let c0 = reduce(a0 * b0 + reduce(a1 * b1) * gammas[i])
+        let c1 = reduce(a0 * b1 + a1 * b0)
+        acc[2 * i] = add_q(acc[2 * i], c0)
+        acc[2 * i + 1] = add_q(acc[2 * i + 1], c1)
+    }
+}
+
+fn add_poly(acc: []i64, f: []i64) {
+    for i in 0..256 {
+        acc[i] = add_q(acc[i], f[i])
+    }
+}
+
+fn sample_ntt(rho: []u8, a: i64, b: i64) -> []i64 {
+    let seed: []u8 = __make(34)
+    __memmove(seed, rho)
+    seed[32] = u8(a)
+    seed[33] = u8(b)
+    let xof = sha3.shake128()
+    sha3.absorb(xof, seed)
+    let f: []i64 = __make(256)
+    var count = 0
+    for count < 256 {
+        let block = sha3.squeeze(xof, 168)
+        var p = 0
+        for p < 168 && count < 256 {
+            let d1 = i64(block[p]) | (i64(block[p + 1]) & 15) << 8
+            let d2 = i64(block[p + 1]) >> 4 | i64(block[p + 2]) << 4
+            if d1 < 3329 {
+                f[count] = d1
+                count += 1
+            }
+            if d2 < 3329 && count < 256 {
+                f[count] = d2
+                count += 1
+            }
+            p += 3
+        }
+    }
+    f
+}
+
+fn matrix(s: Scheme, rho: []u8) -> [][]i64 {
+    var a: [][]i64 = []
+    for i in 0..s.k {
+        for j in 0..s.k {
+            push(mut a, sample_ntt(rho, j, i))
+        }
+    }
+    a
+}
+
+fn bit(b: []u8, at: i64) -> i64 {
+    i64(b[at >> 3]) >> (at & 7) & 1
+}
+
+fn sample_cbd(seed: []u8, nonce: i64, eta: i64) -> []i64 {
+    let input: []u8 = __make(33)
+    __memmove(input, seed)
+    input[32] = u8(nonce)
+    let prf = sha3.shake256()
+    sha3.absorb(prf, input)
+    let b = sha3.squeeze(prf, 64 * eta)
+    let f: []i64 = __make(256)
+    for i in 0..256 {
+        var x = 0
+        var y = 0
+        for j in 0..eta {
+            x += bit(b, 2 * i * eta + j)
+            y += bit(b, 2 * i * eta + eta + j)
+        }
+        f[i] = sub_q(x, y)
+    }
+    f
+}
+
+fn encode(out: []u8, at: i64, f: []i64, d: i64) {
+    var acc: u64 = 0
+    var bits = 0
+    var p = at
+    for i in 0..256 {
+        acc |= u64(f[i]) << bits
+        bits += d
+        for bits >= 8 {
+            out[p] = u8(acc)
+            acc >>= 8
+            bits -= 8
+            p += 1
+        }
+    }
+}
+
+fn decode(b: []u8, at: i64, d: i64) -> []i64 {
+    let f: []i64 = __make(256)
+    let mask: u64 = (1 << u64(d)) - 1
+    var acc: u64 = 0
+    var bits = 0
+    var p = at
+    for i in 0..256 {
+        for bits < d {
+            acc |= u64(b[p]) << bits
+            bits += 8
+            p += 1
+        }
+        f[i] = i64(acc & mask)
+        acc >>= d
+        bits -= d
+    }
+    f
+}
+
+fn decode_q(b: []u8, at: i64) -> []i64 {
+    let f = decode(b, at, 12)
+    for i in 0..256 {
+        let t = f[i] - 3329
+        f[i] = t + (t >> 63 & 3329)
+    }
+    f
+}
+
+fn concat(a: []u8, b: []u8) -> []u8 {
+    let out: []u8 = __make(a.len + b.len)
+    __memmove(out, a)
+    __memmove(out[a.len..], b)
+    out
+}
+
+fn shake256(a: []u8, b: []u8, n: i64) -> []u8 {
+    let x = sha3.shake256()
+    sha3.absorb(x, a)
+    sha3.absorb(x, b)
+    sha3.squeeze(x, n)
+}
+
+fn generate_internal(s: Scheme, d: []u8, z: []u8) -> Keys {
+    let k = s.k
+    let seed: []u8 = [u8(k)]
+    let expanded = concat(d, seed)
+    let g = hash.sum(sha3.sha3_512(), expanded)
+    let rho = g[..32]
+    let sigma = g[32..]
+    let a = matrix(s, rho)
+    var secret: [][]i64 = []
+    for i in 0..k {
+        let p = sample_cbd(sigma, i, s.eta1)
+        ntt(s, p)
+        push(mut secret, p)
+    }
+    let ek: []u8 = __make(encapsulation_size(s))
+    let dk: []u8 = __make(decapsulation_size(s))
+    for i in 0..k {
+        let t = sample_cbd(sigma, k + i, s.eta1)
+        ntt(s, t)
+        for j in 0..k {
+            multiply_add(s, t, a[i * k + j], secret[j])
+        }
+        encode(ek, 384 * i, t, 12)
+        encode(dk, 384 * i, secret[i], 12)
+    }
+    __memmove(ek[384 * k..], rho)
+    __memmove(dk[384 * k..], ek)
+    let h = hash.sum(sha3.sha3_256(), ek)
+    __memmove(dk[768 * k + 32..], h)
+    __memmove(dk[768 * k + 64..], z)
+    Keys { encapsulation: ek, decapsulation: dk }
+}
+
+fn encrypt(s: Scheme, ek: []u8, m: []u8, r: []u8) -> []u8 {
+    let k = s.k
+    let rho = ek[384 * k..384 * k + 32]
+    let a = matrix(s, rho)
+    var y: [][]i64 = []
+    for i in 0..k {
+        let p = sample_cbd(r, i, s.eta1)
+        ntt(s, p)
+        push(mut y, p)
+    }
+    let c: []u8 = __make(ciphertext_size(s))
+    for i in 0..k {
+        let u: []i64 = __make(256)
+        for j in 0..k {
+            multiply_add(s, u, a[j * k + i], y[j])
+        }
+        inverse_ntt(s, u)
+        add_poly(u, sample_cbd(r, k + i, s.eta2))
+        for n in 0..256 {
+            u[n] = compress(u[n], s.du)
+        }
+        encode(c, 32 * s.du * i, u, s.du)
+    }
+    let v: []i64 = __make(256)
+    for i in 0..k {
+        multiply_add(s, v, decode_q(ek, 384 * i), y[i])
+    }
+    inverse_ntt(s, v)
+    add_poly(v, sample_cbd(r, 2 * k, s.eta2))
+    for n in 0..256 {
+        v[n] = compress(add_q(v[n], bit(m, n) * 1665), s.dv)
+    }
+    encode(c, 32 * s.du * k, v, s.dv)
+    c
+}
+
+fn decrypt(s: Scheme, dk: []u8, c: []u8) -> []u8 {
+    let k = s.k
+    let w: []i64 = __make(256)
+    for i in 0..k {
+        let u = decode(c, 32 * s.du * i, s.du)
+        for n in 0..256 {
+            u[n] = decompress(u[n], s.du)
+        }
+        ntt(s, u)
+        multiply_add(s, w, decode_q(dk, 384 * i), u)
+    }
+    inverse_ntt(s, w)
+    let v = decode(c, 32 * s.du * k, s.dv)
+    let m: []u8 = __make(32)
+    for n in 0..256 {
+        let x = compress(sub_q(decompress(v[n], s.dv), w[n]), 1)
+        m[n >> 3] |= u8(x << (n & 7))
+    }
+    m
+}
+
+fn encapsulate_internal(s: Scheme, ek: []u8, m: []u8) -> Encapsulated {
+    let h = hash.sum(sha3.sha3_256(), ek)
+    let input = concat(m, h)
+    let g = hash.sum(sha3.sha3_512(), input)
+    let c = encrypt(s, ek, m, g[32..])
+    Encapsulated { ciphertext: c, shared: g[..32] }
+}
+
+fn check_encapsulation_key(s: Scheme, ek: []u8) ! io.Error {
+    if ek.len != encapsulation_size(s) {
+        fail Invalid
+    }
+    var over = 0
+    for i in 0..s.k {
+        for x in decode(ek, 384 * i, 12) {
+            over |= 3328 - x
+        }
+    }
+    if over < 0 {
+        fail Invalid
+    }
+}
+
+pub fn generate_seeded(level: Level, d: []u8, z: []u8) -> Keys {
+    generate_internal(scheme(level), d, z)
+}
+
+pub fn generate(level: Level) -> Keys {
+    let d = crypto.random(32)
+    let z = crypto.random(32)
+    generate_seeded(level, d, z)
+}
+
+pub fn encapsulate_seeded(level: Level, ek: []u8, m: []u8) -> Encapsulated ! io.Error {
+    let s = scheme(level)
+    check_encapsulation_key(s, ek)?
+    if m.len != 32 {
+        fail Invalid
+    }
+    encapsulate_internal(s, ek, m)
+}
+
+pub fn encapsulate(level: Level, ek: []u8) -> Encapsulated ! io.Error {
+    let m = crypto.random(32)
+    encapsulate_seeded(level, ek, m)
+}
+
+pub fn decapsulate(level: Level, dk: []u8, ciphertext: []u8) -> []u8 ! io.Error {
+    let s = scheme(level)
+    let k = s.k
+    if dk.len != decapsulation_size(s) || ciphertext.len != ciphertext_size(s) {
+        fail Invalid
+    }
+    let ek = dk[384 * k..768 * k + 32]
+    let h = dk[768 * k + 32..768 * k + 64]
+    let z = dk[768 * k + 64..]
+    let ek_hash = hash.sum(sha3.sha3_256(), ek)
+    if !hash.equal(ek_hash, h) {
+        fail Invalid
+    }
+    let m = decrypt(s, dk, ciphertext)
+    let input = concat(m, h)
+    let g = hash.sum(sha3.sha3_512(), input)
+    let rejected = shake256(z, ciphertext, 32)
+    let expected = encrypt(s, ek, m, g[32..])
+    var diff: u8 = 0
+    for i in 0..ciphertext.len {
+        diff |= ciphertext[i] ^ expected[i]
+    }
+    let keep = u8((i64(diff) - 1) >> 8)
+    let shared: []u8 = __make(32)
+    for i in 0..32 {
+        shared[i] = g[i] & keep | rejected[i] & ~keep
+    }
+    shared
+}
