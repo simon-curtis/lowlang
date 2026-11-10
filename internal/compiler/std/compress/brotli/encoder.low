@@ -1,0 +1,784 @@
+import std/io
+
+pub struct Encoder {
+    level: i64
+    sink: fn([]u8) ! io.Error
+    finished: bool
+    max_distance: i64
+    full: i64
+    block: i64
+    hist: []u8
+    start: i64
+    fill: i64
+    done: i64
+    inserted: i64
+    head: []u32
+    chain: []u32
+    hash_shift: u32
+    depth: i64
+    nice: i64
+    lazy: bool
+    distances: []i64
+    saved: []i64
+    last: i64
+    inserts: []u32
+    copies: []u32
+    dcodes: []u32
+    dextras: []u32
+    commands: i64
+    writer: *BitWriter
+    builder: *CodeBuilder
+    tables: Tables
+    command_freq: []i64
+    distance_freq: []i64
+    length_freq: []i64
+    literals: *LiteralModel
+    command_code: *Code
+    distance_code: *Code
+    length_code: *Code
+    run_syms: []u8
+    run_extra: []u8
+}
+
+struct Match {
+    len: i64
+    distance: i64
+    score: i64
+}
+
+fn window_bits(size: i64) -> i64 {
+    var bits = 10
+    for bits < 22 && (1 << bits) - 16 < size {
+        bits += 1
+    }
+    bits
+}
+
+fn new_encoder(level: i64, bits: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
+    let clamped = if level < 0 { 0 } else if level > 11 { 11 } else { level }
+    let full = 1 << bits
+    let block = if full < 1 << 18 { full } else { 1 << 18 }
+    let hash_bits = if clamped < 4 { 15 } else { 17 }
+    let hist_size = if 2 * full < 65536 { 2 * full } else { 65536 }
+    let chain_size = if full < 65536 { full } else { 65536 }
+    let e = new(Encoder {
+        level: clamped
+        sink
+        finished: false
+        max_distance: full - 16
+        full
+        block
+        hist: __make(hist_size)
+        start: 0
+        fill: 0
+        done: 0
+        inserted: 0
+        head: __make(1 << hash_bits)
+        chain: __make(chain_size)
+        hash_shift: u32(32 - hash_bits)
+        depth: if clamped <= 1 { 1 } else { 1 << (clamped - 1) }
+        nice: if clamped < 5 { 32 } else { 16 << (clamped / 2) }
+        lazy: clamped >= 4
+        distances: [16, 15, 11, 4]
+        saved: __make(4)
+        last: 0
+        inserts: __make(1024)
+        copies: __make(1024)
+        dcodes: __make(1024)
+        dextras: __make(1024)
+        commands: 0
+        writer: bit_writer()
+        builder: code_builder()
+        tables: tables()
+        command_freq: __make(704)
+        distance_freq: __make(64)
+        length_freq: __make(18)
+        literals: literal_model(if clamped < 5 { 1 } else { clamped * 3 - 11 })
+        command_code: code(704)
+        distance_code: code(64)
+        length_code: code(18)
+        run_syms: __make(720)
+        run_extra: __make(720)
+    })
+    write_window_bits(e.writer, bits)
+    e
+}
+
+pub fn encoder(level: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
+    new_encoder(level, 22, sink)
+}
+
+fn write_window_bits(w: *BitWriter, bits: i64) {
+    if bits == 16 {
+        put(w, 0, 1)
+    } else if bits == 17 {
+        put(w, 1, 7)
+    } else if bits > 17 {
+        put(w, 1, 1)
+        put(w, bits - 17, 3)
+    } else {
+        put(w, 1, 1)
+        put(w, 0, 3)
+        put(w, bits - 8, 3)
+    }
+}
+
+fn emit_output(e: *Encoder) ! io.Error {
+    let w = e.writer
+    drain(w)
+    if w.len == 0 {
+        return
+    }
+    let chunk = w.data[..w.len]
+    w.len = 0
+    e.sink(chunk)?
+}
+
+fn make_room(e: *Encoder) {
+    if e.hist.len < 2 * e.full {
+        let grown: []u8 = __make(e.hist.len * 2)
+        __memmove(grown, e.hist[..e.fill])
+        e.hist = grown
+        return
+    }
+    let stale = e.done - e.max_distance - e.start
+    __memmove(e.hist, e.hist[stale..e.fill])
+    e.start += stale
+    e.fill -= stale
+}
+
+pub fn encode(e: *Encoder, data: []u8) ! io.Error {
+    if e.finished {
+        fail Invalid
+    }
+    var rest = data
+    for rest.len > 0 {
+        if e.fill == e.hist.len {
+            make_room(e)
+        }
+        let n = __memmove(e.hist[e.fill..], rest)
+        e.fill += n
+        rest = rest[n..]
+        for e.start + e.fill - e.done >= e.block {
+            write_block(e, e.block)
+            emit_output(e)?
+        }
+    }
+}
+
+fn write_pending(e: *Encoder) {
+    let pending = e.start + e.fill - e.done
+    if pending > 0 {
+        write_block(e, pending)
+    }
+}
+
+pub fn flush(e: *Encoder) ! io.Error {
+    if e.finished {
+        fail Invalid
+    }
+    write_pending(e)
+    put(e.writer, 0, 1)
+    put(e.writer, 3, 2)
+    put(e.writer, 0, 3)
+    align_writer(e.writer)
+    emit_output(e)?
+}
+
+pub fn finish(e: *Encoder) ! io.Error {
+    if e.finished {
+        fail Invalid
+    }
+    write_pending(e)
+    put(e.writer, 3, 2)
+    align_writer(e.writer)
+    e.finished = true
+    emit_output(e)?
+}
+
+fn write_length_header(w: *BitWriter, length: i64) {
+    let m = length - 1
+    let nibbles = if m < 1 << 16 { 4 } else if m < 1 << 20 { 5 } else { 6 }
+    put(w, 0, 1)
+    put(w, nibbles - 4, 2)
+    put(w, m, 4 * nibbles)
+}
+
+fn write_uncompressed(e: *Encoder, length: i64) {
+    let w = e.writer
+    write_length_header(w, length)
+    put(w, 1, 1)
+    align_writer(w)
+    let at = e.done - e.start
+    put_bytes_aligned(w, e.hist[at..at + length])
+}
+
+fn write_block(e: *Encoder, length: i64) {
+    if e.level == 0 {
+        write_uncompressed(e, length)
+        e.done += length
+        return
+    }
+    let w = e.writer
+    drain(w)
+    let mark = w.len
+    let acc = w.acc
+    let count = w.count
+    __memmove(e.saved, e.distances)
+    let last = e.last
+    parse(e, e.done, e.done + length)
+    write_compressed(e, length)
+    drain(w)
+    if w.len - mark > length + 3 {
+        w.len = mark
+        w.acc = acc
+        w.count = count
+        __memmove(e.distances, e.saved)
+        e.last = last
+        write_uncompressed(e, length)
+    }
+    e.done += length
+}
+
+fn hash_at(e: *Encoder, i: i64) -> i64 {
+    let h = e.hist
+    let v = u32(h[i]) | u32(h[i + 1]) << 8 | u32(h[i + 2]) << 16 | u32(h[i + 3]) << 24
+    i64((v * 0x1E35A7BD) >> e.hash_shift)
+}
+
+fn grow_chain(e: *Encoder, need: i64) {
+    var size = e.chain.len
+    for size < need && size < e.full {
+        size *= 2
+    }
+    if size == e.chain.len {
+        return
+    }
+    let grown: []u32 = __make(size)
+    __memmove(grown, e.chain)
+    e.chain = grown
+}
+
+fn insert_until(e: *Encoder, p: i64) {
+    let available = e.start + e.fill - 4
+    let stop = if p <= available { p } else { available + 1 }
+    if stop > e.chain.len && e.chain.len < e.full {
+        grow_chain(e, stop)
+    }
+    let mask = e.chain.len - 1
+    var q = e.inserted
+    for q < stop {
+        let h = hash_at(e, q - e.start)
+        e.chain[q & mask] = e.head[h]
+        e.head[h] = u32(q)
+        q += 1
+    }
+    if p > e.inserted {
+        e.inserted = p
+    }
+}
+
+fn match_length(h: []u8, a: i64, b: i64, limit: i64) -> i64 {
+    var n = 0
+    for n < limit && h[a + n] == h[b + n] {
+        n += 1
+    }
+    n
+}
+
+fn log2_floor(v: i64) -> i64 {
+    var n = 0
+    var x = v
+    for x > 1 {
+        x >>= 1
+        n += 1
+    }
+    n
+}
+
+fn recent_distance(e: *Encoder, back: i64) -> i64 {
+    e.distances[(e.last - back) & 3]
+}
+
+fn find_match(e: *Encoder, p: i64, end: i64) -> Match {
+    var best = Match { len: 0, distance: 0, score: 100 }
+    let limit = end - p
+    if limit < 3 {
+        return best
+    }
+    let h = e.hist
+    let i = p - e.start
+    let reach = if p - e.start < e.max_distance { p - e.start } else { e.max_distance }
+    for k in 0..4 {
+        let d = recent_distance(e, k + 1)
+        if d > reach || h[i - d] != h[i] {
+            continue
+        }
+        let len = match_length(h, i - d, i, limit)
+        if len >= 3 {
+            let score = 135 * len + if k == 0 { 15 } else { -40 }
+            if score > best.score {
+                best = Match { len, distance: d, score }
+            }
+        }
+    }
+    if limit < 4 || i + 4 > e.fill {
+        return best
+    }
+    let mask = e.chain.len - 1
+    var candidate = e.head[hash_at(e, i)]
+    var previous = 0
+    for _ in 0..e.depth {
+        let d = i64(u32(p) - candidate)
+        if d <= previous || d > reach {
+            break
+        }
+        previous = d
+        let j = i - d
+        if best.len < limit && h[j + best.len] == h[i + best.len] {
+            let len = match_length(h, j, i, limit)
+            if len >= 4 {
+                let score = 135 * len - 30 * log2_floor(d)
+                if score > best.score {
+                    best = Match { len, distance: d, score }
+                    if len >= e.nice {
+                        break
+                    }
+                }
+            }
+        }
+        candidate = e.chain[(p - d) & mask]
+    }
+    best
+}
+
+fn grow_commands(e: *Encoder) {
+    let size = e.inserts.len * 2
+    let inserts: []u32 = __make(size)
+    let copies: []u32 = __make(size)
+    let dcodes: []u32 = __make(size)
+    let dextras: []u32 = __make(size)
+    __memmove(inserts, e.inserts)
+    __memmove(copies, e.copies)
+    __memmove(dcodes, e.dcodes)
+    __memmove(dextras, e.dextras)
+    e.inserts = inserts
+    e.copies = copies
+    e.dcodes = dcodes
+    e.dextras = dextras
+}
+
+fn short_code(e: *Encoder, d: i64) -> i64 {
+    for k in 0..4 {
+        if recent_distance(e, k + 1) == d {
+            return k
+        }
+    }
+    let deltas: []i64 = [-1, 1, -2, 2, -3, 3]
+    for k in 0..6 {
+        if recent_distance(e, 1) + deltas[k] == d {
+            return 4 + k
+        }
+        if recent_distance(e, 2) + deltas[k] == d {
+            return 10 + k
+        }
+    }
+    -1
+}
+
+fn add_command(e: *Encoder, insert: i64, copy: i64, distance: i64) {
+    if e.commands == e.inserts.len {
+        grow_commands(e)
+    }
+    let n = e.commands
+    e.inserts[n] = u32(insert)
+    e.copies[n] = u32(copy)
+    e.commands = n + 1
+    if distance == 0 {
+        e.dcodes[n] = 0xFFFF
+        return
+    }
+    var code = short_code(e, distance)
+    var extra = 0
+    if code < 0 {
+        let x = distance + 3
+        let width = log2_floor(x) - 1
+        let high = (x >> width) & 1
+        code = 16 + 2 * (width - 1) + high
+        extra = x - ((2 + high) << width)
+    }
+    e.dcodes[n] = u32(code)
+    e.dextras[n] = u32(extra)
+    if code != 0 {
+        e.distances[e.last & 3] = distance
+        e.last += 1
+    }
+}
+
+fn parse(e: *Encoder, from: i64, end: i64) {
+    e.commands = 0
+    var p = from
+    var literals = from
+    for p < end {
+        insert_until(e, p)
+        var m = find_match(e, p, end)
+        if m.len == 0 {
+            p += 1
+            continue
+        }
+        if e.lazy {
+            for _ in 0..4 {
+                if p + 1 >= end {
+                    break
+                }
+                insert_until(e, p + 1)
+                let next = find_match(e, p + 1, end)
+                if next.score <= m.score + 175 {
+                    break
+                }
+                p += 1
+                m = next
+            }
+        }
+        add_command(e, p - literals, m.len, m.distance)
+        p += m.len
+        literals = p
+    }
+    if literals < end {
+        add_command(e, end - literals, 2, 0)
+    }
+}
+
+fn insert_code(t: Tables, n: i64) -> i64 {
+    if n < 6 {
+        return n
+    }
+    var c = 23
+    for t.insert_base[c] > n {
+        c -= 1
+    }
+    c
+}
+
+fn copy_code(t: Tables, n: i64) -> i64 {
+    if n < 10 {
+        return n - 2
+    }
+    var c = 23
+    for t.copy_base[c] > n {
+        c -= 1
+    }
+    c
+}
+
+fn command_symbol(insert: i64, copy: i64, implicit: bool) -> i64 {
+    let low = (insert & 7) << 3 | (copy & 7)
+    if implicit && insert < 8 && copy < 16 {
+        return (copy >> 3) << 6 | low
+    }
+    let cells: []i64 = [2, 3, 6, 4, 5, 8, 7, 9, 10]
+    cells[3 * (insert >> 3) + (copy >> 3)] << 6 | low
+}
+
+fn distance_bits(code: i64) -> i64 {
+    if code < 16 {
+        0
+    } else {
+        1 + ((code - 16) >> 1)
+    }
+}
+
+fn clear(freq: []i64) {
+    for i in 0..freq.len {
+        freq[i] = 0
+    }
+}
+
+fn literal_context(h: []u8, k: i64, abs: i64, lut: []u8) -> i64 {
+    let p1 = if abs >= 1 { i64(h[k - 1]) } else { 0 }
+    let p2 = if abs >= 2 { i64(h[k - 2]) } else { 0 }
+    i64(lut[1024 + p1] | lut[1280 + p2])
+}
+
+fn write_var_uint8(w: *BitWriter, v: i64) {
+    if v == 0 {
+        put(w, 0, 1)
+        return
+    }
+    let width = log2_floor(v)
+    put(w, 1, 1)
+    put(w, width, 3)
+    put(w, v - (1 << width), width)
+}
+
+fn write_context_map(e: *Encoder) {
+    let m = e.literals
+    let n = m.clusters
+    let order = m.mtf
+    for i in 0..64 {
+        order[i] = u8(i)
+    }
+    let values: []u8 = __make(64)
+    clear(m.map_freq)
+    for ctx in 0..64 {
+        let v = m.map[ctx]
+        var at = 0
+        for order[at] != v {
+            at += 1
+        }
+        for j in 0..at {
+            order[at - j] = order[at - j - 1]
+        }
+        order[0] = v
+        values[ctx] = u8(at)
+        m.map_freq[at] += 1
+    }
+    let w = e.writer
+    put(w, 0, 1)
+    write_code(e, m.map_freq[..n], m.map_code, n)
+    for v in values {
+        put_code(w, m.map_code, i64(v))
+    }
+    put(w, 1, 1)
+}
+
+fn write_compressed(e: *Encoder, length: i64) {
+    let t = e.tables
+    let lut = t.context
+    let h = e.hist
+    let m = e.literals
+    clear(m.hist)
+    clear(e.command_freq)
+    clear(e.distance_freq)
+    var at = e.done - e.start
+    for n in 0..e.commands {
+        let insert = i64(e.inserts[n])
+        for k in at..at + insert {
+            m.hist[literal_context(h, k, k + e.start, lut) * 256 + i64(h[k])] += 1
+        }
+        at += insert + i64(e.copies[n])
+        let dcode = i64(e.dcodes[n])
+        let ic = insert_code(t, insert)
+        let cc = copy_code(t, i64(e.copies[n]))
+        let sym = command_symbol(ic, cc, dcode == 0 || dcode == 0xFFFF)
+        e.command_freq[sym] += 1
+        if sym >= 128 && dcode != 0xFFFF {
+            e.distance_freq[dcode] += 1
+        }
+    }
+    cluster_literals(m)
+    let w = e.writer
+    write_length_header(w, length)
+    put(w, 0, 1)
+    put(w, 0, 3)
+    put(w, 0, 6)
+    put(w, 2, 2)
+    write_var_uint8(w, m.clusters - 1)
+    if m.clusters > 1 {
+        write_context_map(e)
+    }
+    put(w, 0, 1)
+    for id in 0..m.clusters {
+        write_code(e, cluster_freq(m, id), m.codes[id], 256)
+    }
+    write_code(e, e.command_freq, e.command_code, 704)
+    write_code(e, e.distance_freq, e.distance_code, 64)
+    at = e.done - e.start
+    for n in 0..e.commands {
+        let insert = i64(e.inserts[n])
+        let copy = i64(e.copies[n])
+        let dcode = i64(e.dcodes[n])
+        let ic = insert_code(t, insert)
+        let cc = copy_code(t, copy)
+        let sym = command_symbol(ic, cc, dcode == 0 || dcode == 0xFFFF)
+        put_code(w, e.command_code, sym)
+        put(w, insert - t.insert_base[ic], t.insert_extra[ic])
+        put(w, copy - t.copy_base[cc], t.copy_extra[cc])
+        for k in at..at + insert {
+            let ctx = literal_context(h, k, k + e.start, lut)
+            put_code(w, m.codes[m.map[ctx]], i64(h[k]))
+        }
+        at += insert + copy
+        if sym >= 128 && dcode != 0xFFFF {
+            put_code(w, e.distance_code, dcode)
+            put(w, i64(e.dextras[n]), distance_bits(dcode))
+        }
+    }
+}
+
+fn write_simple_code(w: *BitWriter, c: *Code, alphabet: i64) {
+    let width = bit_length(alphabet - 1)
+    put(w, 1, 2)
+    if c.used <= 1 {
+        put(w, 0, 2)
+        put(w, c.first, width)
+        return
+    }
+    let symbols: []i64 = [0, 0, 0, 0]
+    var n = 0
+    for len in 1..4 {
+        for sym in 0..alphabet {
+            if i64(c.lens[sym]) == len {
+                symbols[n] = sym
+                n += 1
+            }
+        }
+    }
+    put(w, n - 1, 2)
+    for i in 0..n {
+        put(w, symbols[i], width)
+    }
+    if n == 4 {
+        put(w, if c.lens[symbols[0]] == 1 { 1 } else { 0 }, 1)
+    }
+}
+
+fn add_run_symbol(e: *Encoder, at: i64, sym: u8, extra: u8) -> i64 {
+    e.run_syms[at] = sym
+    e.run_extra[at] = extra
+    at + 1
+}
+
+fn reverse_runs(e: *Encoder, from: i64, to: i64) {
+    var a = from
+    var b = to - 1
+    for a < b {
+        let s = e.run_syms[a]
+        e.run_syms[a] = e.run_syms[b]
+        e.run_syms[b] = s
+        let x = e.run_extra[a]
+        e.run_extra[a] = e.run_extra[b]
+        e.run_extra[b] = x
+        a += 1
+        b -= 1
+    }
+}
+
+fn add_zero_run(e: *Encoder, at: i64, count: i64) -> i64 {
+    var n = at
+    var reps = count
+    if reps == 11 {
+        n = add_run_symbol(e, n, 0, 0)
+        reps -= 1
+    }
+    if reps < 3 {
+        for _ in 0..reps {
+            n = add_run_symbol(e, n, 0, 0)
+        }
+        return n
+    }
+    let start = n
+    reps -= 3
+    for {
+        n = add_run_symbol(e, n, 17, u8(reps & 7))
+        reps >>= 3
+        if reps == 0 {
+            break
+        }
+        reps -= 1
+    }
+    reverse_runs(e, start, n)
+    n
+}
+
+fn add_value_run(e: *Encoder, at: i64, previous: u8, value: u8, count: i64) -> i64 {
+    var n = at
+    var reps = count
+    if previous != value {
+        n = add_run_symbol(e, n, value, 0)
+        reps -= 1
+    }
+    if reps == 7 {
+        n = add_run_symbol(e, n, value, 0)
+        reps -= 1
+    }
+    if reps < 3 {
+        for _ in 0..reps {
+            n = add_run_symbol(e, n, value, 0)
+        }
+        return n
+    }
+    let start = n
+    reps -= 3
+    for {
+        n = add_run_symbol(e, n, 16, u8(reps & 3))
+        reps >>= 2
+        if reps == 0 {
+            break
+        }
+        reps -= 1
+    }
+    reverse_runs(e, start, n)
+    n
+}
+
+fn write_code(e: *Encoder, freq: []i64, c: *Code, alphabet: i64) {
+    let w = e.writer
+    huffman(e.builder, freq, c, 15)
+    if c.used <= 4 {
+        write_simple_code(w, c, alphabet)
+        return
+    }
+    let lens = c.lens
+    var end = alphabet
+    for lens[end - 1] == 0 {
+        end -= 1
+    }
+    var runs = 0
+    var previous: u8 = 8
+    var i = 0
+    for i < end {
+        let value = lens[i]
+        var j = i + 1
+        for j < end && lens[j] == value {
+            j += 1
+        }
+        if value == 0 {
+            runs = add_zero_run(e, runs, j - i)
+        } else {
+            runs = add_value_run(e, runs, previous, value, j - i)
+            previous = value
+        }
+        i = j
+    }
+    let lf = e.length_freq
+    clear(lf)
+    for k in 0..runs {
+        lf[e.run_syms[k]] += 1
+    }
+    let lc = e.length_code
+    huffman(e.builder, lf, lc, 5)
+    let single = lc.used == 1
+    if single {
+        lc.lens[lc.first] = 1
+    }
+    let order = e.tables.code_order
+    var skip = 0
+    if lc.lens[order[0]] == 0 && lc.lens[order[1]] == 0 {
+        skip = if lc.lens[order[2]] == 0 { 3 } else { 2 }
+    }
+    var stored = 18
+    if !single {
+        for lc.lens[order[stored - 1]] == 0 {
+            stored -= 1
+        }
+    }
+    put(w, skip, 2)
+    let value_bits: []i64 = [0, 7, 3, 2, 1, 15]
+    let value_lens: []i64 = [2, 4, 3, 2, 2, 4]
+    for k in skip..stored {
+        let v = i64(lc.lens[order[k]])
+        put(w, value_bits[v], value_lens[v])
+    }
+    for k in 0..runs {
+        let sym = i64(e.run_syms[k])
+        if !single {
+            put_code(w, lc, sym)
+        }
+        if sym == 16 {
+            put(w, i64(e.run_extra[k]), 2)
+        } else if sym == 17 {
+            put(w, i64(e.run_extra[k]), 3)
+        }
+    }
+}

@@ -1,0 +1,761 @@
+import std/io
+
+struct Category {
+    types: i64
+    current: i64
+    previous: i64
+    left: i64
+    type_tree: i64
+    length_tree: i64
+}
+
+struct Decoder {
+    source: *io.Reader
+    input: []u8
+    at: i64
+    end: i64
+    eof: bool
+    bits: u64
+    count: i64
+    sink: fn([]u8) ! io.Error
+    limit: i64
+    emitted: i64
+    ring: []u8
+    pos: i64
+    flushed: i64
+    produced: i64
+    window: i64
+    full: i64
+    tables: Tables
+    words: str
+    affixes: []str
+    triples: []u8
+    word: []u8
+    builder: *TableBuilder
+    lens: []u8
+    distances: []i64
+    last: i64
+    categories: []Category
+    literal_trees: []i64
+    command_trees: []i64
+    distance_trees: []i64
+    literal_map: []u8
+    distance_map: []u8
+    modes: []u8
+    mtf: []u8
+    postfix: i64
+    direct: i64
+}
+
+fn decoder(source: *io.Reader, sink: fn([]u8) ! io.Error, limit: i64) -> *Decoder {
+    let categories: []Category = __make(3)
+    new(Decoder {
+        source
+        input: __make(16384)
+        at: 0
+        end: 0
+        eof: false
+        bits: 0
+        count: 0
+        sink
+        limit
+        emitted: 0
+        ring: []
+        pos: 0
+        flushed: 0
+        produced: 0
+        window: 0
+        full: 0
+        tables: tables()
+        words: ""
+        affixes: []
+        triples: []
+        word: __make(64)
+        builder: table_builder()
+        lens: __make(704)
+        distances: [16, 15, 11, 4]
+        last: 0
+        categories
+        literal_trees: __make(256)
+        command_trees: __make(256)
+        distance_trees: __make(256)
+        literal_map: __make(64 * 256)
+        distance_map: __make(4 * 256)
+        modes: __make(256)
+        mtf: __make(256)
+        postfix: 0
+        direct: 0
+    })
+}
+
+fn emit(d: *Decoder) ! io.Error {
+    if d.flushed == d.pos {
+        return
+    }
+    let chunk = d.ring[d.flushed..d.pos]
+    d.emitted += chunk.len
+    if d.emitted > d.limit {
+        fail TooLarge
+    }
+    d.flushed = d.pos
+    d.sink(chunk)?
+}
+
+fn pull(d: *Decoder) -> bool ! io.Error {
+    if d.eof {
+        return false
+    }
+    emit(d)?
+    let n = io.read_some(d.source, d.input)?
+    d.at = 0
+    d.end = n
+    if n == 0 {
+        d.eof = true
+    }
+    n > 0
+}
+
+fn refill(d: *Decoder, need: i64) ! io.Error {
+    for d.count <= 56 {
+        if d.at == d.end {
+            if d.count >= need || !pull(d)? {
+                return
+            }
+        }
+        d.bits |= u64(d.input[d.at]) << u64(d.count)
+        d.at += 1
+        d.count += 8
+    }
+}
+
+fn take(d: *Decoder, n: i64) -> i64 ! io.Error {
+    if d.count < n {
+        refill(d, n)?
+        if d.count < n {
+            fail Malformed
+        }
+    }
+    let v = i64(d.bits) & ((1 << n) - 1)
+    d.bits >>= u64(n)
+    d.count -= n
+    v
+}
+
+fn lookup(pool: []u32, base: i64, bits: u64) -> u32 {
+    let e = pool[base + i64(bits & 255)]
+    if e & 0x80 == 0 {
+        return e
+    }
+    pool[base + i64(e >> 8) + (i64(bits >> 8) & ((1 << i64(e & 15)) - 1))]
+}
+
+fn symbol(d: *Decoder, base: i64) -> i64 ! io.Error {
+    if d.count < 15 {
+        refill(d, 0)?
+    }
+    let pool = d.builder.pool
+    var e = lookup(pool, base, d.bits)
+    var n = i64(e & 15)
+    if n > d.count {
+        refill(d, 15)?
+        e = lookup(pool, base, d.bits)
+        n = i64(e & 15)
+        if n > d.count {
+            fail Malformed
+        }
+    }
+    d.bits >>= u64(n)
+    d.count -= n
+    i64(e >> 8)
+}
+
+fn skip_padding(d: *Decoder) ! io.Error {
+    if take(d, d.count % 8)? != 0 {
+        fail Malformed
+    }
+}
+
+fn read_window(d: *Decoder) ! io.Error {
+    var bits = 16
+    if take(d, 1)? == 1 {
+        let n = take(d, 3)?
+        if n != 0 {
+            bits = 17 + n
+        } else {
+            let m = take(d, 3)?
+            if m == 1 {
+                fail Malformed
+            }
+            bits = if m == 0 { 17 } else { 8 + m }
+        }
+    }
+    d.full = 1 << bits
+    d.window = d.full - 16
+    let size = if d.full < 65536 { d.full } else { 65536 }
+    d.ring = __make(size)
+}
+
+fn advance_ring(d: *Decoder) ! io.Error {
+    if d.ring.len < d.full {
+        let grown: []u8 = __make(d.ring.len * 2)
+        __memmove(grown, d.ring[..d.pos])
+        d.ring = grown
+        return
+    }
+    emit(d)?
+    d.pos = 0
+    d.flushed = 0
+}
+
+fn put_bytes(d: *Decoder, data: []u8) ! io.Error {
+    var rest = data
+    for rest.len > 0 {
+        let n = __memmove(d.ring[d.pos..], rest)
+        d.pos += n
+        d.produced += n
+        rest = rest[n..]
+        if d.pos == d.ring.len {
+            advance_ring(d)?
+        }
+    }
+}
+
+fn copy_back(d: *Decoder, distance: i64, length: i64) ! io.Error {
+    var from = (d.pos - distance) & (d.ring.len - 1)
+    var left = length
+    for left > 0 {
+        let ring = d.ring
+        var n = ring.len - d.pos
+        if ring.len - from < n {
+            n = ring.len - from
+        }
+        if left < n {
+            n = left
+        }
+        let to = d.pos
+        if from < to && to - from < n {
+            for i in 0..n {
+                ring[to + i] = ring[from + i]
+            }
+        } else {
+            __memmove(ring[to..to + n], ring[from..from + n])
+        }
+        d.pos += n
+        d.produced += n
+        from += n
+        left -= n
+        if d.pos == ring.len {
+            advance_ring(d)?
+        }
+        if from == d.ring.len {
+            from = 0
+        }
+    }
+}
+
+fn last_byte(d: *Decoder, back: i64) -> i64 {
+    if d.produced < back {
+        return 0
+    }
+    i64(d.ring[(d.pos - back) & (d.ring.len - 1)])
+}
+
+fn var_uint8(d: *Decoder) -> i64 ! io.Error {
+    if take(d, 1)? == 0 {
+        return 0
+    }
+    let n = take(d, 3)?
+    if n == 0 {
+        return 1
+    }
+    (1 << n) + take(d, n)?
+}
+
+fn read_simple_prefix(d: *Decoder, alphabet: i64) -> i64 ! io.Error {
+    let lens = d.lens[..alphabet]
+    for i in 0..alphabet {
+        lens[i] = 0
+    }
+    let count = take(d, 2)? + 1
+    let width = bit_length(alphabet - 1)
+    let symbols: []i64 = [0, 0, 0, 0]
+    for i in 0..count {
+        let s = take(d, width)?
+        if s >= alphabet || lens[s] != 0 {
+            fail Malformed
+        }
+        symbols[i] = s
+        lens[s] = 1
+    }
+    if count == 3 {
+        lens[symbols[1]] = 2
+        lens[symbols[2]] = 2
+    } else if count == 4 {
+        if take(d, 1)? == 0 {
+            for s in symbols {
+                lens[s] = 2
+            }
+        } else {
+            lens[symbols[1]] = 2
+            lens[symbols[2]] = 3
+            lens[symbols[3]] = 3
+        }
+    }
+    build_table(d.builder, lens)
+}
+
+fn read_code_length_code(d: *Decoder, skip: i64) -> i64 ! io.Error {
+    let lens = d.lens[..18]
+    for i in 0..18 {
+        lens[i] = 0
+    }
+    let prefix_len: []i64 = [2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4]
+    let prefix_value: []u8 = [0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5]
+    var space = 32
+    var codes = 0
+    for i in skip..18 {
+        if d.count < 4 {
+            refill(d, 4)?
+        }
+        let peek = i64(d.bits & 15)
+        let n = prefix_len[peek]
+        if n > d.count {
+            fail Malformed
+        }
+        d.bits >>= u64(n)
+        d.count -= n
+        let v = prefix_value[peek]
+        lens[d.tables.code_order[i]] = v
+        if v != 0 {
+            space -= 32 >> i64(v)
+            codes += 1
+            if space <= 0 {
+                break
+            }
+        }
+    }
+    if codes != 1 && space != 0 {
+        fail Malformed
+    }
+    build_table(d.builder, lens)
+}
+
+fn read_prefix(d: *Decoder, alphabet: i64) -> i64 ! io.Error {
+    let skip = take(d, 2)?
+    if skip == 1 {
+        return read_simple_prefix(d, alphabet)
+    }
+    let mark = d.builder.used
+    let code = read_code_length_code(d, skip)?
+    let lens = d.lens[..alphabet]
+    for i in 0..alphabet {
+        lens[i] = 0
+    }
+    var i = 0
+    var previous: u8 = 8
+    var repeat = 0
+    var repeat_len: u8 = 0
+    var space = 32768
+    for i < alphabet && space > 0 {
+        let sym = symbol(d, code)?
+        if sym < 16 {
+            lens[i] = u8(sym)
+            i += 1
+            repeat = 0
+            if sym != 0 {
+                previous = u8(sym)
+                space -= 32768 >> sym
+            }
+            continue
+        }
+        let extra = if sym == 16 { 2 } else { 3 }
+        let value = if sym == 16 { previous } else { 0 }
+        if repeat_len != value {
+            repeat = 0
+            repeat_len = value
+        }
+        let old = repeat
+        if repeat > 0 {
+            repeat = (repeat - 2) << extra
+        }
+        repeat += take(d, extra)? + 3
+        let delta = repeat - old
+        if i + delta > alphabet {
+            fail Malformed
+        }
+        for k in i..i + delta {
+            lens[k] = value
+        }
+        i += delta
+        if value != 0 {
+            space -= delta * (32768 >> i64(value))
+        }
+    }
+    if space != 0 {
+        fail Malformed
+    }
+    d.builder.used = mark
+    build_table(d.builder, lens)
+}
+
+fn block_length(d: *Decoder, tree: i64) -> i64 ! io.Error {
+    let sym = symbol(d, tree)?
+    d.tables.block_base[sym] + take(d, d.tables.block_extra[sym])?
+}
+
+fn switch_block(d: *Decoder, c: i64) ! io.Error {
+    var cat = d.categories[c]
+    let sym = symbol(d, cat.type_tree)?
+    var next = if sym == 0 { cat.previous } else if sym == 1 { cat.current + 1 } else { sym - 2 }
+    if next >= cat.types {
+        next -= cat.types
+    }
+    cat.previous = cat.current
+    cat.current = next
+    cat.left = block_length(d, cat.length_tree)?
+    d.categories[c] = cat
+}
+
+fn read_context_map(d: *Decoder, trees: i64, map: []u8) ! io.Error {
+    for i in 0..map.len {
+        map[i] = 0
+    }
+    if trees == 1 {
+        return
+    }
+    let rle = if take(d, 1)? == 1 { take(d, 4)? + 1 } else { 0 }
+    let tree = read_prefix(d, trees + rle)?
+    var i = 0
+    for i < map.len {
+        let sym = symbol(d, tree)?
+        if sym == 0 {
+            i += 1
+        } else if sym <= rle {
+            i += (1 << sym) + take(d, sym)?
+            if i > map.len {
+                fail Malformed
+            }
+        } else {
+            map[i] = u8(sym - rle)
+            i += 1
+        }
+    }
+    if take(d, 1)? == 1 {
+        let mtf = d.mtf
+        for k in 0..256 {
+            mtf[k] = u8(k)
+        }
+        for k in 0..map.len {
+            let index = i64(map[k])
+            let v = mtf[index]
+            map[k] = v
+            var j = index
+            for j > 0 {
+                mtf[j] = mtf[j - 1]
+                j -= 1
+            }
+            mtf[0] = v
+        }
+    }
+}
+
+fn read_trees(d: *Decoder, trees: []i64, count: i64, alphabet: i64) ! io.Error {
+    for i in 0..count {
+        trees[i] = read_prefix(d, alphabet)?
+    }
+}
+
+fn read_header(d: *Decoder) ! io.Error {
+    d.builder.used = 0
+    for c in 0..3 {
+        let types = var_uint8(d)? + 1
+        var cat = Category { types, current: 0, previous: 1, left: 1 << 30, type_tree: 0, length_tree: 0 }
+        if types >= 2 {
+            cat.type_tree = read_prefix(d, types + 2)?
+            cat.length_tree = read_prefix(d, 26)?
+            cat.left = block_length(d, cat.length_tree)?
+        }
+        d.categories[c] = cat
+    }
+    d.postfix = take(d, 2)?
+    d.direct = take(d, 4)? << d.postfix
+    let literal_types = d.categories[0].types
+    for i in 0..literal_types {
+        d.modes[i] = u8(take(d, 2)?)
+    }
+    let literal_trees = var_uint8(d)? + 1
+    read_context_map(d, literal_trees, d.literal_map[..64 * literal_types])?
+    let distance_trees = var_uint8(d)? + 1
+    read_context_map(d, distance_trees, d.distance_map[..4 * d.categories[2].types])?
+    read_trees(d, d.literal_trees, literal_trees, 256)?
+    read_trees(d, d.command_trees, d.categories[1].types, 704)?
+    read_trees(d, d.distance_trees, distance_trees, 16 + d.direct + (48 << d.postfix))?
+}
+
+fn next_block(d: *Decoder, c: i64) ! io.Error {
+    if d.categories[c].left == 0 {
+        switch_block(d, c)?
+    }
+    d.categories[c].left -= 1
+}
+
+fn recent(d: *Decoder, back: i64) -> i64 {
+    d.distances[(d.last - back) & 3]
+}
+
+fn distance_from(d: *Decoder, code: i64) -> i64 ! io.Error {
+    if code < 16 {
+        let deltas: []i64 = [0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3]
+        let back = if code < 4 { code + 1 } else if code < 10 { 1 } else { 2 }
+        let distance = recent(d, back) + deltas[code]
+        if distance <= 0 {
+            fail Malformed
+        }
+        return distance
+    }
+    if code < 16 + d.direct {
+        return code - 15
+    }
+    let rest = code - d.direct - 16
+    let width = 1 + (rest >> (d.postfix + 1))
+    let high = (rest >> d.postfix) & 1
+    let low = rest & ((1 << d.postfix) - 1)
+    let offset = ((2 + high) << width) - 4
+    ((offset + take(d, width)?) << d.postfix) + low + d.direct + 1
+}
+
+fn load_dictionary(d: *Decoder) {
+    d.words = embed("dictionary.bin")
+    d.affixes = transform_affixes()
+    d.triples = transform_triples()
+}
+
+fn uppercase(word: []u8, at: i64, len: i64) -> i64 {
+    let c = word[at]
+    if c < 192 {
+        if c >= 'a' && c <= 'z' {
+            word[at] = c ^ 32
+        }
+        return 1
+    }
+    if c < 224 {
+        if at + 1 < len {
+            word[at + 1] ^= 32
+        }
+        return 2
+    }
+    if at + 2 < len {
+        word[at + 2] ^= 5
+    }
+    3
+}
+
+fn put_word(d: *Decoder, copy: i64, distance: i64, max_distance: i64, remaining: i64) -> i64 ! io.Error {
+    if copy < 4 || copy > 24 {
+        fail Malformed
+    }
+    let t = d.tables
+    let id = distance - max_distance - 1
+    let width = t.word_bits[copy]
+    let transform = id >> width
+    if transform >= 121 {
+        fail Malformed
+    }
+    if d.words.len == 0 {
+        load_dictionary(d)
+    }
+    let start = t.word_offset[copy] + (id & ((1 << width) - 1)) * copy
+    let kind = i64(d.triples[3 * transform + 1])
+    var from = start
+    var len = copy
+    if kind >= 1 && kind <= 9 {
+        len = if kind > len { 0 } else { len - kind }
+    } else if kind >= 12 {
+        let cut = if kind - 11 > len { len } else { kind - 11 }
+        from += cut
+        len -= cut
+    }
+    let prefix = d.affixes[d.triples[3 * transform]]
+    let suffix = d.affixes[d.triples[3 * transform + 2]]
+    let word = d.word
+    var n = 0
+    for i in 0..prefix.len {
+        word[n] = prefix[i]
+        n += 1
+    }
+    let body = n
+    __memmove(word[n..n + len], d.words[from..from + len])
+    n += len
+    if kind == 10 && len > 0 {
+        uppercase(word, body, n)
+    } else if kind == 11 {
+        var at = body
+        for at < n {
+            at += uppercase(word, at, n)
+        }
+    }
+    for i in 0..suffix.len {
+        word[n] = suffix[i]
+        n += 1
+    }
+    if n > remaining {
+        fail Malformed
+    }
+    put_bytes(d, word[..n])?
+    n
+}
+
+fn read_literals(d: *Decoder, count: i64) ! io.Error {
+    let lut = d.tables.context
+    var p1 = last_byte(d, 1)
+    var p2 = last_byte(d, 2)
+    var mode = i64(d.modes[d.categories[0].current]) * 512
+    var map = d.categories[0].current * 64
+    for _ in 0..count {
+        if d.categories[0].left == 0 {
+            switch_block(d, 0)?
+            mode = i64(d.modes[d.categories[0].current]) * 512
+            map = d.categories[0].current * 64
+        }
+        d.categories[0].left -= 1
+        let context = i64(lut[mode + p1] | lut[mode + 256 + p2])
+        let b = symbol(d, d.literal_trees[d.literal_map[map + context]])?
+        d.ring[d.pos] = u8(b)
+        d.pos += 1
+        d.produced += 1
+        if d.pos == d.ring.len {
+            advance_ring(d)?
+        }
+        p2 = p1
+        p1 = b
+    }
+}
+
+fn read_commands(d: *Decoder, length: i64) ! io.Error {
+    let t = d.tables
+    let insert_high: []i64 = [0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16]
+    let copy_high: []i64 = [0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16]
+    var remaining = length
+    for remaining > 0 {
+        next_block(d, 1)?
+        let cmd = symbol(d, d.command_trees[d.categories[1].current])?
+        let cell = cmd >> 6
+        let insert_code = insert_high[cell] + ((cmd >> 3) & 7)
+        let copy_code = copy_high[cell] + (cmd & 7)
+        let insert = t.insert_base[insert_code] + take(d, t.insert_extra[insert_code])?
+        let copy = t.copy_base[copy_code] + take(d, t.copy_extra[copy_code])?
+        if insert > remaining {
+            fail Malformed
+        }
+        read_literals(d, insert)?
+        remaining -= insert
+        if remaining == 0 {
+            break
+        }
+        var code = 0
+        var distance = 0
+        if cell < 2 {
+            distance = recent(d, 1)
+        } else {
+            next_block(d, 2)?
+            let context = if copy > 4 { 3 } else { copy - 2 }
+            let tree = d.distance_trees[d.distance_map[4 * d.categories[2].current + context]]
+            code = symbol(d, tree)?
+            distance = distance_from(d, code)?
+        }
+        let max_distance = if d.produced < d.window { d.produced } else { d.window }
+        if distance > max_distance {
+            remaining -= put_word(d, copy, distance, max_distance, remaining)?
+            continue
+        }
+        if code != 0 {
+            d.distances[d.last & 3] = distance
+            d.last += 1
+        }
+        if copy > remaining {
+            fail Malformed
+        }
+        copy_back(d, distance, copy)?
+        remaining -= copy
+    }
+}
+
+fn read_uncompressed(d: *Decoder, length: i64) ! io.Error {
+    skip_padding(d)?
+    var left = length
+    for left > 0 && d.count >= 8 {
+        let one: []u8 = [u8(d.bits)]
+        put_bytes(d, one)?
+        d.bits >>= 8
+        d.count -= 8
+        left -= 1
+    }
+    for left > 0 {
+        if d.at == d.end && !pull(d)? {
+            fail Malformed
+        }
+        let n = if d.end - d.at < left { d.end - d.at } else { left }
+        put_bytes(d, d.input[d.at..d.at + n])?
+        d.at += n
+        left -= n
+    }
+}
+
+fn skip_metadata(d: *Decoder) ! io.Error {
+    if take(d, 1)? != 0 {
+        fail Malformed
+    }
+    let width = take(d, 2)?
+    var length = 0
+    for i in 0..width {
+        let b = take(d, 8)?
+        if i == width - 1 && width > 1 && b == 0 {
+            fail Malformed
+        }
+        length |= b << (8 * i)
+    }
+    if width > 0 {
+        length += 1
+    }
+    skip_padding(d)?
+    for _ in 0..length {
+        take(d, 8)?
+    }
+}
+
+fn read_meta_block(d: *Decoder) -> bool ! io.Error {
+    let last = take(d, 1)? == 1
+    if last && take(d, 1)? == 1 {
+        return true
+    }
+    let nibbles = take(d, 2)? + 4
+    if nibbles == 7 {
+        skip_metadata(d)?
+        return last
+    }
+    var length = 0
+    for i in 0..nibbles {
+        let v = take(d, 4)?
+        if i == nibbles - 1 && nibbles > 4 && v == 0 {
+            fail Malformed
+        }
+        length |= v << (4 * i)
+    }
+    length += 1
+    if !last && take(d, 1)? == 1 {
+        read_uncompressed(d, length)?
+        emit(d)?
+        return false
+    }
+    read_header(d)?
+    read_commands(d, length)?
+    emit(d)?
+    last
+}
+
+fn decode_stream(d: *Decoder) ! io.Error {
+    read_window(d)?
+    for !read_meta_block(d)? {}
+    skip_padding(d)?
+    emit(d)?
+}
