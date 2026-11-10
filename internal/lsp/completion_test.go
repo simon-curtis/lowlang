@@ -127,12 +127,38 @@ func TestCompletionAfterModuleCall(t *testing.T) {
 	expect(t, private, nil, []string{"radius"})
 }
 
+func TestCompiledLine(t *testing.T) {
+	compiled := newText([]byte("a\nb\nc\nd"))
+	cases := []struct {
+		now  string
+		line int
+		want int
+	}{
+		{"a\nb\nc\nd", 2, 2},
+		{"a\nx\nb\nc\nd", 0, 0},
+		{"a\nx\nb\nc\nd", 1, 0},
+		{"a\nx\nb\nc\nd", 3, 2},
+		{"a\nx\ny\nz\nd", 2, 0},
+		{"a\nx\ny\nz\nd", 4, 3},
+		{"a\nd", 1, 3},
+		{"x\nb\nc\nd", 0, -1},
+	}
+	for _, tc := range cases {
+		c := &cursor{text: newText([]byte(tc.now)), compiled: compiled, line: tc.line}
+		if got := c.compiledLine(); got != tc.want {
+			t.Errorf("%q line %d -> %d, want %d", tc.now, tc.line, got, tc.want)
+		}
+	}
+}
+
 func TestCompletionScope(t *testing.T) {
 	c := start(t)
 	f := load(t, "structs.low")
 	c.open(f, f.src)
 	items := c.completeTyping(f, "print(r.label)", "    sn")
-	expect(t, items, []string{"p", "q", "r", "snapshot", "manhattan", "Point", "Shape", "Box", "print", "i64", "match", "none"}, []string{"n", "a", "b"})
+	expect(t, items, []string{"p", "q", "r", "manhattan", "Point", "Shape", "Box", "print", "i64", "match", "none"}, []string{"n", "a", "b", "snapshot", "m"})
+	later := c.completeTyping(f, "let snapshot = r", "    sn")
+	expect(t, later, []string{"r", "snapshot"}, []string{"m"})
 	if got := items["r"].Detail; got != "Rect" {
 		t.Errorf("r detail = %q", got)
 	}
@@ -146,7 +172,9 @@ func TestCompletionImportsAndHelpers(t *testing.T) {
 	f := load(t, "modules", "main.low")
 	c.open(f, f.src)
 	items := c.completeTyping(f, "fn main() {", "    ")
-	expect(t, items, []string{"geometry", "t", "helper", "main", "c", "q"}, []string{"circle", "offset"})
+	expect(t, items, []string{"geometry", "t", "helper", "main"}, []string{"circle", "offset", "c", "q"})
+	later := c.completeTyping(f, "q.x += 10", "    ")
+	expect(t, later, []string{"c", "s", "p", "q"}, []string{"l", "m", "typed"})
 }
 
 func TestCompletionWithoutCompile(t *testing.T) {

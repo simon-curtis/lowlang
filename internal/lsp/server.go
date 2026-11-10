@@ -21,25 +21,27 @@ import (
 var errorPos = regexp.MustCompile(`(?s)^(?:(.*?):)?(\d+):(\d+): (.*)$`)
 
 type Server struct {
-	stream      *stream
-	docs        sources
-	units       map[string]*compiler.Unit
-	published   map[string][]string
-	fresh       map[string]bool
-	compiles    *scheduler
-	hintRefresh bool
-	requests    int
-	shutdown    bool
+	stream       *stream
+	docs         sources
+	units        map[string]*compiler.Unit
+	published    map[string][]string
+	fresh        map[string]bool
+	compiledDocs map[string]sources
+	compiles     *scheduler
+	hintRefresh  bool
+	requests     int
+	shutdown     bool
 }
 
 func NewServer(in io.Reader, out io.Writer) *Server {
 	return &Server{
-		stream:    newStream(in, out),
-		docs:      sources{},
-		units:     map[string]*compiler.Unit{},
-		published: map[string][]string{},
-		fresh:     map[string]bool{},
-		compiles:  newScheduler(),
+		stream:       newStream(in, out),
+		docs:         sources{},
+		units:        map[string]*compiler.Unit{},
+		published:    map[string][]string{},
+		fresh:        map[string]bool{},
+		compiledDocs: map[string]sources{},
+		compiles:     newScheduler(),
 	}
 }
 
@@ -280,6 +282,7 @@ func (s *Server) finish(r compiled) error {
 	entry := r.job.entry
 	if r.err == nil {
 		s.units[entry] = r.unit
+		s.compiledDocs[entry] = r.job.docs
 	}
 	if !current {
 		return nil
@@ -388,15 +391,29 @@ func (s *Server) definition(p TextDocumentPositionParams) any {
 
 func (s *Server) cursorAt(p TextDocumentPositionParams) *cursor {
 	path := pathOf(p.TextDocument.URI)
+	entry := s.entry(path)
 	t := s.text(path)
 	return &cursor{
-		unit: s.units[s.entry(path)],
-		file: s.checked(path),
-		text: t,
-		line: p.Position.Line,
-		col:  t.byteCol(p.Position.Line, p.Position.Character),
-		seen: map[string]bool{},
+		unit:     s.units[entry],
+		file:     s.checked(path),
+		text:     t,
+		compiled: s.compiledText(entry, path),
+		line:     p.Position.Line,
+		col:      t.byteCol(p.Position.Line, p.Position.Character),
+		seen:     map[string]bool{},
 	}
+}
+
+func (s *Server) compiledText(entry, path string) text {
+	docs, ok := s.compiledDocs[entry]
+	if !ok {
+		return text{}
+	}
+	src, err := docs.read(path)
+	if err != nil {
+		return text{}
+	}
+	return newText(src)
 }
 
 func (s *Server) completion(p TextDocumentPositionParams) any {

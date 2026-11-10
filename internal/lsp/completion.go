@@ -37,13 +37,33 @@ var builtinConstants = []string{"true", "false", "none", "null"}
 var funcHeader = regexp.MustCompile(`^(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
 
 type cursor struct {
-	unit  *compiler.Unit
-	file  *ast.File
-	text  text
-	line  int
-	col   int
-	items []CompletionItem
-	seen  map[string]bool
+	unit     *compiler.Unit
+	file     *ast.File
+	text     text
+	compiled text
+	line     int
+	col      int
+	items    []CompletionItem
+	seen     map[string]bool
+}
+
+func (c *cursor) compiledLine() int {
+	old, now := c.compiled.lines, c.text.lines
+	prefix := 0
+	for prefix < len(old) && prefix < len(now) && old[prefix] == now[prefix] {
+		prefix++
+	}
+	suffix := 0
+	for suffix < len(old)-prefix && suffix < len(now)-prefix && old[len(old)-1-suffix] == now[len(now)-1-suffix] {
+		suffix++
+	}
+	switch {
+	case c.line < prefix:
+		return c.line
+	case c.line >= len(now)-suffix:
+		return c.line - len(now) + len(old)
+	}
+	return prefix - 1
 }
 
 func (c *cursor) add(label string, kind int, detail string) {
@@ -244,7 +264,8 @@ func (c *cursor) scope() []*ast.Local {
 		return nil
 	}
 	from, to := c.span(f)
-	x := newIndex(c.file, c.text)
+	to = min(to, c.compiledLine()+2)
+	x := newIndex(c.file, c.compiled)
 	var locals []*ast.Local
 	for _, o := range x.occurrences {
 		if o.local != nil && o.pos.Line >= from && o.pos.Line < to {
