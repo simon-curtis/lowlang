@@ -65,6 +65,9 @@ func expected(t *testing.T, path, ext string) (string, bool) {
 func TestRun(t *testing.T) {
 	for _, path := range fixtures(t, "run") {
 		t.Run(filepath.Base(path), func(t *testing.T) {
+			if _, measured := expected(t, path, ".maxrss"); !measured {
+				t.Parallel()
+			}
 			runFixture(t, path)
 		})
 	}
