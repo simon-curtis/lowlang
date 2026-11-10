@@ -1141,6 +1141,8 @@ rt_schedule:
 	je 8f
 	xor edi, edi
 	call rt_netpoll
+	test rax, rax
+	jnz 1b
 8:
 	call rt_gq_get
 	test rax, rax
