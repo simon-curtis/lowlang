@@ -34,10 +34,11 @@ func Analyse(path string) (*Unit, error) {
 		return nil, err
 	}
 	files := append([]*ast.File{prelude}, modules.files...)
-	if err := check.Check(files); err != nil {
+	embeds, err := check.Check(files)
+	if err != nil {
 		return nil, err
 	}
-	return &Unit{Files: files, Program: ir.Build(files), Sources: modules.sources}, nil
+	return &Unit{Files: files, Program: ir.Build(files), Sources: append(modules.sources, embeds...)}, nil
 }
 
 func parsePrelude() (*ast.File, error) {

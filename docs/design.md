@@ -300,6 +300,18 @@ fn main() ! ParseError {
 - When `main` declares `! E` and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2.
 - A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
 
+### Embedded data
+
+```low
+let shader = embed("shaders/quad.spv")
+let font = embed("fonts/fallback.ttf")
+print(shader.len)
+```
+
+- `embed("path")` is the contents of a file as a `str`, read at compile time. The path must be a string literal and is relative to the directory of the file that calls `embed`, so a module carries its own assets.
+- The bytes live in the binary's read-only data, aligned to 16 bytes; nothing is copied at run time. Indexing, slicing, `.len` and `bytes(...)` work as on any string.
+- A missing file is a compile error. `low dev` watches embedded files, and a change to one reloads the functions that embed it.
+
 ### Modules
 
 ```low
@@ -392,6 +404,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Narrow integers are kept sign-extended (`i32`) or zero-extended (`u32`, `u16`, `u8`) in their word; floats are kept as their bit pattern, `f32` zero-extended. Arithmetic, conversion and comparison values carry their type.
 - A variable passed as `mut` lives in a frame slot and is accessed with loads and stores; every other variable is pure SSA.
 - Integer division carries its zero and overflow checks inside the instruction.
+- An `embed` becomes an address and a length. The data is emitted with `.incbin` under a label named by the file's content hash, so a changed file changes the code of every function that embeds it.
 - Every value records whether it may hold a heap pointer. Loads, parameters and call results take this from their type's word layout, where an enum word counts as a pointer if any variant puts one there; constants, typed arithmetic, string literals and frame addresses never do; untyped address arithmetic and anything unclassified count as pointers; a phi holds a pointer if any input may. The prelude stores map entries as `__word`, an integer type the collector scans, because entries hold keys and values of any type.
 - A `str` is two words and a slice three. An element access computes `pointer + index * stride` after a `check` instruction, which compares unsigned and jumps to the index panic; packed elements load with `movzx`, `movsxd` or a 32-bit `mov` and store at their width.
 - A map entry is a run of words in the prelude's `__Map.entries` slice: a live flag, the key and the value. An open-addressing index of entry numbers with linear probing finds them; deleted entries leave tombstones until the next rebuild, which compacts the entries in order and resizes the index to keep it at most three quarters full. Integer, `bool` and pointer keys hash their word; `str` keys hash their bytes with FNV-1a. The compiler reads and writes value words directly in the entries slice, so the prelude needs no generics.
@@ -416,7 +429,7 @@ On fib(38) this runs at 1.25x Go's time.
 
 ## Hot reload
 
-`low dev app.low` or `low dev app/` builds a dev binary, runs it, and watches every source file of every loaded module, along with the file lists of their directories. On save:
+`low dev app.low` or `low dev app/` builds a dev binary, runs it, and watches every source file of every loaded module, every embedded file, and the file lists of their directories. On save:
 
 - A file that fails to compile is reported and the running program is left alone.
 - The program is restarted when a struct or enum layout changes, when an existing function's signature changes, or when `main` changes. A running frame of old code may still call any function, so it must keep the old calling convention and data layout; `main` never returns to pick up new code.
@@ -450,14 +463,14 @@ Mechanism:
 - Map literals, lookups, entry assignment, `delete` and map loops.
 - Builtins `print` for numbers, `bool` and `str`; `bytes` and `str`.
 - Modules as directories, imports, and `pub` visibility.
+- `embed` for compile-time file contents.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. Embedded data: Unicode tables, SPIR-V and a fallback font.
-2. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
-3. C interop:
+1. Dynamic ELF output: programs that use C libraries link libc and libvulkan dynamically with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc ...`. Programs that use none stay static with no libc.
+2. C interop:
    - `extern fn` declarations.
    - System V ABI thunks: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` and `xmm0` to `xmm7`, struct classification, 16-byte stack alignment.
    - C struct layout with natural alignment, alongside the one-word-per-scalar layout.
@@ -466,21 +479,21 @@ Mechanism:
    - Unmanaged pointer-plus-length views over mmap'd and GPU-mapped memory.
    - Explicit release of file descriptors and mappings.
    - The garbage collector never frees memory held only by C.
-4. Function values, and C-callable function pointers for callbacks.
-5. Generics, with type erasure or dynamic dispatch for custom elements and views.
-6. Green-thread scheduler, channels, `select`:
+3. Function values, and C-callable function pointers for callbacks.
+4. Generics, with type erasure or dynamic dispatch for custom elements and views.
+5. Green-thread scheduler, channels, `select`:
     - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
     - C calls run on a large system stack rather than the green-thread stack.
     - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-7. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-8. GPU UI library modelled on Zed's GPUI, Linux first:
+6. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+7. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
-    3. Text: font discovery, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation.
+    3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
     4. Flexbox layout (a Taffy subset); an element tree with `request_layout`, `prepaint` and `paint` phases; styles with partial overrides for hover and active states.
     5. Input: libxkbcommon keyboard, key repeat, hitboxes, mouse dispatch, focus and tab stops, actions and keymaps.
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-9. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-10. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+8. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+9. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

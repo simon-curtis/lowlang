@@ -12,6 +12,7 @@ type Op int
 const (
 	OpConst Op = iota
 	OpString
+	OpEmbed
 	OpParam
 	OpUndef
 	OpPhi
@@ -47,7 +48,7 @@ const (
 )
 
 var opNames = [...]string{
-	OpConst: "const", OpString: "string", OpParam: "param", OpUndef: "undef", OpPhi: "phi",
+	OpConst: "const", OpString: "string", OpEmbed: "embed", OpParam: "param", OpUndef: "undef", OpPhi: "phi",
 	OpAdd: "add", OpSub: "sub", OpMul: "mul", OpDiv: "div", OpRem: "rem", OpNeg: "neg", OpNot: "not",
 	OpAnd: "and", OpOr: "or", OpXor: "xor", OpShl: "shl", OpShr: "shr", OpCompl: "compl",
 	OpConvert: "convert", OpSqrt: "sqrt", OpFloor: "floor",
@@ -167,7 +168,7 @@ func describe(v *Value) string {
 	switch v.Op {
 	case OpConst, OpParam, OpSlot, OpResult, OpLoad, OpStore:
 		detail = fmt.Sprintf(" #%d", v.Aux)
-	case OpString:
+	case OpString, OpEmbed:
 		detail = fmt.Sprintf(" %q", v.Str)
 	case OpRuntime:
 		detail = fmt.Sprintf(" %s", v.Str)

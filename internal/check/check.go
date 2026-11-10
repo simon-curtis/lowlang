@@ -2,6 +2,10 @@ package check
 
 import (
 	"fmt"
+	"hash/fnv"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 
 	"lowlang/internal/ast"
@@ -33,6 +37,7 @@ type scope struct {
 
 type Checker struct {
 	modules map[string]*scope
+	embeds  []string
 	builtin map[string]*types.Type
 	file    *ast.File
 	results map[[2]*types.Type]*types.Type
@@ -45,7 +50,7 @@ type Checker struct {
 	loops   []*loop
 }
 
-func Check(files []*ast.File) (err error) {
+func Check(files []*ast.File) (embeds []string, err error) {
 	c := &Checker{
 		modules: map[string]*scope{},
 		builtin: map[string]*types.Type{"bool": types.Bool, "str": types.Str, "__word": types.Word},
@@ -70,7 +75,7 @@ func Check(files []*ast.File) (err error) {
 		c.builtin[t.Name] = t
 	}
 	c.check(files)
-	return nil
+	return c.embeds, nil
 }
 
 func (c *Checker) scope(module string) *scope {
@@ -1104,7 +1109,7 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 
 var builtins = map[string]bool{
 	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
-	"delete": true, "__str_raw": true,
+	"delete": true, "embed": true, "__str_raw": true,
 	"__bits": true, "__str_view": true,
 }
 
@@ -1193,6 +1198,8 @@ func (c *Checker) special(e *ast.Call, name string) bool {
 		}
 	case "delete":
 		c.deleteEntry(e)
+	case "embed":
+		c.embed(e)
 	case "__str_raw":
 		if len(e.Args) != 2 {
 			c.fail(e.Pos, "__str_raw takes 2 arguments")
@@ -1208,6 +1215,32 @@ func (c *Checker) special(e *ast.Call, name string) bool {
 		return false
 	}
 	return true
+}
+
+func (c *Checker) embed(e *ast.Call) {
+	c.single(e, "embed")
+	lit, ok := e.Args[0].(*ast.StrLit)
+	if !ok {
+		c.fail(e.Args[0].Position(), "embed needs a string literal path")
+	}
+	path := lit.Value
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(filepath.Dir(c.file.Path), path)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		c.fail(lit.Pos, "cannot embed %s: %v", lit.Value, err)
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		c.fail(lit.Pos, "cannot embed %s: no such file", lit.Value)
+	}
+	if !slices.Contains(c.embeds, abs) {
+		c.embeds = append(c.embeds, abs)
+	}
+	digest := fnv.New64a()
+	digest.Write(data)
+	e.Builtin, e.Embed, e.Size, e.Digest, e.Type = "embed", abs, int64(len(data)), digest.Sum64(), types.Str
 }
 
 func (c *Checker) deleteEntry(e *ast.Call) {

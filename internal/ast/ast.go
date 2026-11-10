@@ -355,6 +355,9 @@ type Call struct {
 	Target  *Func
 	Builtin string
 	Variant *types.Variant
+	Embed   string
+	Size    int64
+	Digest  uint64
 }
 
 type If struct {

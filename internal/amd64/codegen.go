@@ -211,6 +211,16 @@ func (g *Generator) stringLabel(s string) string {
 	return l
 }
 
+func (g *Generator) embedLabel(path string, digest uint64) string {
+	l := fmt.Sprintf(".Lembed_%x", digest)
+	if g.strings[l] {
+		return l
+	}
+	g.strings[l] = true
+	fmt.Fprintf(&g.data, "\t.p2align 4\n%s:\n\t.incbin %q\n", l, path)
+	return l
+}
+
 func (g *Generator) messageLabel(s string) string {
 	l := g.newLabel()
 	fmt.Fprintf(&g.data, "\t.p2align 3\n%s:\n\t.quad %d\n\t.ascii %q\n", l, len(s), s)
@@ -396,6 +406,8 @@ func (g *Generator) instr(fr *frame, in *instr) {
 	switch in.op {
 	case ir.OpConst:
 		g.constant(fr.loc(in.dst), v.Aux)
+	case ir.OpEmbed:
+		g.address(fr.loc(in.dst), fmt.Sprintf("[rip+%s]", g.embedLabel(v.Str, uint64(v.Aux))))
 	case ir.OpString:
 		g.address(fr.loc(in.dst), fmt.Sprintf("[rip+%s]", g.stringLabel(v.Str)))
 	case ir.OpUndef:

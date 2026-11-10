@@ -151,6 +151,12 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 	case "delete":
 		b.deleteEntry(e)
 		return nil
+	case "embed":
+		v := b.emit(OpEmbed)
+		v.Str = e.Embed
+		v.Aux = int64(e.Digest)
+		v.Scalar = true
+		return []*Value{v, b.constant(e.Size)}
 	case "__str_raw":
 		return []*Value{b.word(arg), b.word(e.Args[1])}
 	case "bytes":

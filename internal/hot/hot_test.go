@@ -86,6 +86,20 @@ func TestRunWatchesModules(t *testing.T) {
 	f.noRestart()
 }
 
+func TestReloadOnEmbeddedChange(t *testing.T) {
+	f := newFixture(t, "fn value() -> i64 {\n    embed(\"n.txt\").len\n}\n\nfn main() {\n    print(0)\n    var n = value()\n    for n == 1 {\n        n = value()\n    }\n    print(n)\n}\n")
+	f.waitFor(f.stderr, "n.txt: no such file")
+	data := filepath.Join(filepath.Dir(f.path), "n.txt")
+	writeFile(t, data, "a")
+	f.reload()
+	f.waitFor(f.stdout, "0\n")
+	writeFile(t, data, "abc")
+	f.reload()
+	f.waitFor(f.stdout, "0\n3\n")
+	f.waitFor(f.stderr, "low: reloaded value in")
+	f.noRestart()
+}
+
 func (f *fixture) write(src string) {
 	f.t.Helper()
 	if err := os.WriteFile(f.path, []byte(src), 0o644); err != nil {
