@@ -173,6 +173,7 @@ print(len(p) + len(q))
 
 - Literals name every field, separated by commas or newlines; `x` alone means `x: x`.
 - Structs are values: assignment and argument passing copy them.
+- `==` and `!=` compare structs field by field when every field can be compared: numbers, `bool`, `str`, pointers, channels, and structs and enums made of them. Each field uses its own `==`, so strings compare by content, floats by value, and pointers by identity.
 - Fields are assigned through a `var` binding or a `mut` parameter, at any depth: `r.max.x = 1`. Other parameters are immutable.
 - A struct literal cannot appear directly in an `if`, `for` or `match` condition; wrap it in parentheses.
 - A struct cannot contain itself by value; it can hold a `*` pointer to its own type.
@@ -245,6 +246,7 @@ fn area(s: Shape) -> f64 {
 - Variants are constructed as `Shape.Circle(2)`. Where the expected type is known (an annotated `let`, an argument, an assignment, a return, `fail`), the bare name works: `let s: Shape = Empty`.
 - Variants with no payload in an enum where no variant has one are a single word. Otherwise an enum is a tag word followed by the largest variant's fields.
 - An enum cannot contain itself by value; it can hold a `*` pointer to its own type.
+- `==` and `!=` compare enums whose variant fields can all be compared: equal values have the same variant and equal fields. Optionals compare the same way, so `x == none` and `x == 5` work on an `i64?`.
 
 ### Optionals
 
@@ -459,7 +461,7 @@ let pick: fn(i64, i64) -> i64 = max
 
 - Functions, structs and enums take type parameters in brackets after their name. Generic types are written with arguments, `Stack[i64]` or `geometry.Labelled[str]`.
 - A constraint lists what a type parameter supports, joined with `+`:
-  - `Eq` allows `==` and `!=`, and is met by numbers, `bool`, `str` and pointers.
+  - `Eq` allows `==` and `!=`, and is met by numbers, `bool`, `str`, pointers, channels, and structs and enums whose fields are all `Eq`.
   - `Ord` adds `<`, `<=`, `>` and `>=`, and is met by numbers.
   - `Hash` adds use as a map key, and is met by integers, `bool`, `str` and pointers.
   - `Number` adds arithmetic, numeric literals, conversion with `T(x)` and `print`.
@@ -571,6 +573,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Every frame keeps `rsp` 16-byte aligned at its calls, as C requires: frames are rounded to 16 bytes, and `_start` rounds the space it reserves for `main`'s result.
 - An `extern struct` value is its C bytes, one word per eightbyte. Its locals and parameters live in frame slots; a field is loaded or stored at its own width, and a struct literal or a field of a computed value goes through a temporary slot.
 - `defer` keeps a stack of deferred statements per block and lowers them again at every exit from that block.
+- `==` on a struct is the conjunction of its fields' comparisons. On an enum it compares tags, then branches on the tag to compare only that variant's fields, since the other payload words are undefined. An `extern struct` is stored in two frame slots and compared field by field at each field's offset and width, so padding is ignored.
 - A LowLang function value is two words: a code address and an environment pointer. Code reached through a function value takes the environment as parameter word 0. A closure is checked in place and becomes a function named after its parent, such as `counter..c1`; its environment is a heap array holding a box pointer per captured variable, or 0 when it captures none. A captured variable lives in a heap box allocated when it is bound, and every access, in its own function and in closures, loads and stores through the box. A named function used as a value goes through an adapter, `name..value`, which drops the environment and calls it.
 - A call through a function value moves the code address to `r10` and calls it, passing the environment and the arguments like any call. A call through an `extern fn` value is a `ccall` with the same System V plan as a named C function.
 - A C callback is a thunk, `cb_name`, emitted once per program for every function used as one. It saves the C argument registers, re-extends narrow integers and `bool` from them and from the C stack, calls the function with LowLang's convention on the green thread's stack and moves a float result to `xmm0`.
@@ -644,6 +647,7 @@ Mechanism:
 - C interop: System V calls, `extern struct`, `ptr` and `ptr[T]`, `view`, `load`, `store`, `cstr`, `str(p)`, `pin` and `unpin`.
 - `defer`.
 - Generic functions, structs and enums with built-in constraints, compiled per type; maps built on generic prelude code.
+- Structural `==` and `!=` on structs and enums.
 - Function values and closures capturing by reference; `extern fn` C function pointers and C callbacks.
 - Green threads on an M:N scheduler with `spawn`, channels, `select`, `sleep`, descriptor waits through epoll, deadlock detection and stack overflow checks.
 - Hot reload with `low dev`.
@@ -651,9 +655,8 @@ Mechanism:
 
 ## Roadmap
 
-1. `Eq` for structs and enums whose fields are all `Eq`, using structural equality, so `Memo` can hold aggregate values.
-2. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-3. GPU UI library with GPUI's renderer and platform layer and a signal-based state model, Linux first:
+1. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+2. GPU UI library with GPUI's renderer and platform layer and a signal-based state model, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
@@ -667,5 +670,5 @@ Mechanism:
     11. Foreground and background executors on the scheduler; a background task's result is written into a signal on the UI thread.
     12. Text input element whose state is held in signals, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     13. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-4. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-5. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+3. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+4. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

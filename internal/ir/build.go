@@ -697,6 +697,15 @@ func (b *builder) binary(e *ast.Binary) []*Value {
 	if e.X.TypeOf() == types.Str {
 		return b.strings(e)
 	}
+	if t := e.X.TypeOf(); aggregate(t) {
+		x := b.value(e.X, t)
+		y := b.value(e.Y, t)
+		same := b.equal(t, x, y)
+		if e.Op == lexer.NotEq {
+			same = b.typed(OpNot, types.Bool, same)
+		}
+		return []*Value{same}
+	}
 	x := b.word(e.X)
 	y := b.word(e.Y)
 	return []*Value{b.typed(arith[e.Op], e.X.TypeOf(), x, y)}

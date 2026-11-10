@@ -57,6 +57,22 @@ func (t *Type) Comparable() bool {
 	switch t.Kind {
 	case BoolKind, StrKind, PointerKind, RawKind, ChanKind:
 		return true
+	case StructKind:
+		for _, f := range t.Fields {
+			if !f.Type.Comparable() {
+				return false
+			}
+		}
+		return true
+	case EnumKind:
+		for _, v := range t.Variants {
+			for _, f := range v.Fields {
+				if !f.Comparable() {
+					return false
+				}
+			}
+		}
+		return true
 	}
 	return t.Number() || t.has(Eq)
 }
