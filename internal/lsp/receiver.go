@@ -1,6 +1,9 @@
 package lsp
 
 import (
+	"fmt"
+	"strings"
+
 	"lowlang/internal/ast"
 	"lowlang/internal/types"
 )
@@ -132,6 +135,79 @@ func (c *cursor) head(segments []segment) (*types.Type, []byte, []segment) {
 	return t, rest, segments[1:]
 }
 
+func identical(a, b *types.Type) bool {
+	return a != nil && b != nil && (a == b || a.String() == b.String())
+}
+
+func typeParamNames(params []*ast.TypeParam) map[string]bool {
+	names := map[string]bool{}
+	for _, p := range params {
+		names[p.Name] = true
+	}
+	return names
+}
+
+func fits(tn *ast.TypeName, t *types.Type, params map[string]bool) bool {
+	switch {
+	case tn == nil || t == nil:
+		return false
+	case tn.Name != "" && params[tn.Name] && len(tn.Args) == 0:
+		return true
+	case tn.Slice:
+		return t.Kind == types.SliceKind && fits(tn.Elem, t.Elem, params)
+	case tn.Map:
+		return t.Kind == types.MapKind && fits(tn.Key, t.Key, params) && fits(tn.Elem, t.Elem, params)
+	case tn.Pointer:
+		return t.Kind == types.PointerKind && fits(tn.Elem, t.Elem, params)
+	case tn.Optional:
+		return t.Optional && fits(tn.Elem, t.Elem, params)
+	case len(tn.Args) > 0:
+		base, _, _ := strings.Cut(t.String(), "[")
+		return base == tn.Name || strings.HasSuffix(base, fmt.Sprintf(".%s", tn.Name))
+	}
+	return t.String() == typeNameString(tn)
+}
+
+func takes(fn *ast.Func, t *types.Type) bool {
+	if len(fn.Params) == 0 {
+		return false
+	}
+	if len(fn.TypeParams) > 0 {
+		return fits(fn.Params[0].TypeName, t, typeParamNames(fn.TypeParams))
+	}
+	return len(fn.ParamTypes) > 0 && identical(fn.ParamTypes[0], t)
+}
+
+func (c *cursor) methods(t *types.Type) {
+	for _, f := range c.files(c.file.Module) {
+		for _, fn := range f.Funcs {
+			if fn.Template == nil && fn.Closure == nil && takes(fn, t) {
+				c.add(fn.Name, completionMethod, signature(fn))
+			}
+		}
+		for _, e := range f.Externs {
+			for _, fn := range e.Funcs {
+				if takes(fn, t) {
+					c.add(fn.Name, completionMethod, signature(fn))
+				}
+			}
+		}
+	}
+	for _, l := range c.scope() {
+		if l.Type != nil && l.Type.Kind == types.FuncKind && len(l.Type.Params) > 0 && identical(l.Type.Params[0], t) {
+			c.add(l.Name, completionMethod, l.Type.String())
+		}
+	}
+	switch t.Kind {
+	case types.SliceKind:
+		c.add("push", completionMethod, "builtin")
+	case types.MapKind:
+		c.add("delete", completionMethod, "builtin")
+	case types.ChanKind:
+		c.add("close", completionMethod, "builtin")
+	}
+}
+
 func (c *cursor) typeOf(segments []segment) *types.Type {
 	t, suffixes, rest := c.head(segments)
 	for {
@@ -141,10 +217,16 @@ func (c *cursor) typeOf(segments []segment) *types.Type {
 		if t == nil || len(rest) == 0 {
 			return t
 		}
-		f := types.StructOf(t).Field(rest[0].name)
-		if f == nil {
+		next := rest[0]
+		if f := types.StructOf(t).Field(next.name); f != nil {
+			t, suffixes, rest = f.Type, next.suffixes, rest[1:]
+			continue
+		}
+		fn := c.function(c.file.Module, next.name, false)
+		if fn == nil || !takes(fn, t) {
 			return nil
 		}
-		t, suffixes, rest = f.Type, rest[0].suffixes, rest[1:]
+		t, suffixes = called(fn, next.suffixes)
+		rest = rest[1:]
 	}
 }

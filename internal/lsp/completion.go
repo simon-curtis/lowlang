@@ -12,6 +12,7 @@ import (
 )
 
 const (
+	completionMethod     = 2
 	completionFunction   = 3
 	completionField      = 5
 	completionVariable   = 6
@@ -209,6 +210,7 @@ func (c *cursor) fields(t *types.Type, path []string) {
 	case types.SliceKind, types.MapKind, types.StrKind:
 		c.add("len", completionProperty, "i64")
 	}
+	c.methods(t)
 }
 
 func (c *cursor) headerLine() (int, string) {

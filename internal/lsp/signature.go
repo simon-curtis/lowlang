@@ -179,6 +179,9 @@ func (c *cursor) signatureHelp() *SignatureHelp {
 		return nil
 	}
 	src := c.text.line(call.line)
+	if shape, offset, ok := c.methodShape(src, call.col); ok {
+		return shape.help(call.commas + offset)
+	}
 	chain := calleeChain(src, call.col)
 	if len(chain) == 0 {
 		return nil
@@ -188,6 +191,28 @@ func (c *cursor) signatureHelp() *SignatureHelp {
 		return nil
 	}
 	return shape.help(call.commas)
+}
+
+func (c *cursor) methodShape(src string, paren int) (callShape, int, bool) {
+	segments, ok := segmentsBefore(src, paren)
+	if !ok || len(segments) < 2 || !segments[len(segments)-1].plain() {
+		return callShape{}, 0, false
+	}
+	t := c.typeOf(segments[:len(segments)-1])
+	if t == nil {
+		return callShape{}, 0, false
+	}
+	name := segments[len(segments)-1].name
+	if f := types.StructOf(t).Field(name); f != nil && f.Type.Kind == types.FuncKind {
+		shape, ok := valueShape(name, f.Type)
+		return shape, 0, ok
+	}
+	if local := c.local(name); local != nil {
+		shape, ok := valueShape(name, local.Type)
+		return shape, 1, ok
+	}
+	shape, ok := c.funcShape(c.file.Module, name, false)
+	return shape, 1, ok
 }
 
 func (s callShape) help(commas int) *SignatureHelp {

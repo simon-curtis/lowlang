@@ -213,6 +213,8 @@ func (x *index) expr(e ast.Expr) {
 		x.structLit(e)
 	case *ast.Ref:
 		x.expr(e.X)
+	case *ast.Receiver:
+		x.expr(e.X)
 	case *ast.Index:
 		x.expr(e.X)
 		x.expr(e.Index)
