@@ -497,6 +497,8 @@ func (g *Generator) instr(fr *frame, in *instr) {
 		g.arithmetic(fr, in, map[ir.Op]string{ir.OpAdd: "add", ir.OpSub: "sub", ir.OpMul: "mul"}[in.op])
 	case ir.OpAnd, ir.OpOr, ir.OpXor:
 		g.binary(fr, in, binops[in.op])
+	case ir.OpMulHigh:
+		g.mulHigh(fr, in)
 	case ir.OpShl, ir.OpShr:
 		g.shift(fr, in)
 	case ir.OpDiv, ir.OpRem:
@@ -716,12 +718,22 @@ func (g *Generator) writeMaps(out *strings.Builder) {
 	}
 }
 
+var syscallRegs = []string{"rax", "rdi", "rsi", "rdx", "r10", "r8", "r9"}
+
 func (g *Generator) runtimeCall(fr *frame, in *instr) {
+	regs := argRegs
+	if in.value.Str == "syscall" {
+		regs = syscallRegs
+	}
 	moves := make([]pmove, len(in.args))
 	for i, a := range in.args {
-		moves[i] = pmove{dst: argRegs[i], src: fr.loc(a)}
+		moves[i] = pmove{dst: regs[i], src: fr.loc(a)}
 	}
 	g.parallel(moves)
+	if in.value.Str == "syscall" {
+		g.emit("syscall")
+		return
+	}
 	g.emit("call rt_%s", in.value.Str)
 	g.safepoint(fr, in)
 }

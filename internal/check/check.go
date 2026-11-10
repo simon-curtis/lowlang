@@ -341,6 +341,11 @@ func (c *Checker) result(ok, err *types.Type) *types.Type {
 	}
 	r := types.NewResult(ok, err)
 	c.results[key] = r
+	if c.laid {
+		c.layout(r, lexer.Pos{})
+	} else {
+		c.unlaid = append(c.unlaid, r)
+	}
 	return r
 }
 
@@ -1117,7 +1122,10 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 		if want != nil && want.Number() {
 			e.Type = want
 		}
-		if e.Type.Integer() && !e.Type.Holds(e.Value) {
+		if e.Wide && e.Type != types.U64 {
+			c.fail(e.Pos, "%d overflows %s", uint64(e.Value), e.Type)
+		}
+		if !e.Wide && e.Type.Integer() && !e.Type.Holds(e.Value) {
 			c.fail(e.Pos, "%d overflows %s", e.Value, e.Type)
 		}
 	case *ast.FloatLit:
@@ -1554,7 +1562,7 @@ var builtins = map[string]bool{
 	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
 	"delete": true, "embed": true, "__str_raw": true,
 	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
-	"__bits": true, "__str_view": true, "__hash": true, "__zero": true,
+	"__bits": true, "__str_view": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true,
 	"__spawn": true, "__current": true, "__park": true, "__ready": true, "__lock": true, "__unlock": true, "__cas": true, "__panic": true,
 }
 
@@ -1704,6 +1712,8 @@ func (c *Checker) print(e *ast.Call) {
 	}
 	t := c.plain(e.Args[0], nil)
 	switch {
+	case t == types.U64:
+		e.Builtin = "print_u64"
 	case t.Integer():
 		e.Builtin = "print_i64"
 	case t.Float():
@@ -1796,10 +1806,40 @@ func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 	case "__slice_ptr":
 		c.single(e, name)
 		t := c.plain(e.Args[0], nil)
-		if t.Kind != types.SliceKind {
-			c.fail(e.Pos, "__slice_ptr requires a slice")
+		switch {
+		case t == types.Str:
+			e.Builtin, e.Type = name, c.raw(types.U8)
+		case t.Kind == types.SliceKind:
+			e.Builtin, e.Type = name, c.raw(t.Elem)
+		default:
+			c.fail(e.Pos, "__slice_ptr requires a slice or str")
 		}
-		e.Builtin, e.Type = name, c.raw(t.Elem)
+	case "__syscall":
+		c.syscall(e)
+	case "__mulhi":
+		if len(e.Args) != 2 {
+			c.fail(e.Pos, "__mulhi takes 2 arguments, found %d", len(e.Args))
+		}
+		c.expectType(e.Args[0], types.U64)
+		c.expectType(e.Args[1], types.U64)
+		e.Builtin, e.Type = name, types.U64
+	case "__make":
+		c.single(e, name)
+		if want == nil || want.Kind != types.SliceKind {
+			c.fail(e.Pos, "__make needs an expected slice type")
+		}
+		c.integer(e.Args[0])
+		e.Builtin, e.Type = name, want
+	case "__memmove":
+		if len(e.Args) != 2 {
+			c.fail(e.Pos, "__memmove takes 2 arguments, found %d", len(e.Args))
+		}
+		dst := c.plain(e.Args[0], nil)
+		if dst.Kind != types.SliceKind {
+			c.fail(e.Args[0].Position(), "__memmove needs a slice, found %s", dst)
+		}
+		c.expectType(e.Args[1], dst)
+		e.Builtin, e.Type = name, types.I64
 	case "__str_view":
 		c.single(e, name)
 		c.expectType(e.Args[0], c.slice(types.U8))
@@ -1894,6 +1934,18 @@ func (c *Checker) push(e *ast.Call) {
 	c.expectType(e.Args[1], t.Elem)
 	e.Builtin = "push"
 	e.Type = types.Void
+}
+
+func (c *Checker) syscall(e *ast.Call) {
+	if len(e.Args) < 1 || len(e.Args) > 7 {
+		c.fail(e.Pos, "__syscall takes a number and up to 6 arguments, found %d", len(e.Args))
+	}
+	for _, arg := range e.Args {
+		if t := c.plain(arg, nil); !t.Integer() && t.Kind != types.RawKind && t != types.Bool {
+			c.fail(arg.Position(), "__syscall arguments are integers, bool or ptr, found %s", t)
+		}
+	}
+	e.Builtin, e.Type = "__syscall", types.I64
 }
 
 func (c *Checker) single(e *ast.Call, name string) {

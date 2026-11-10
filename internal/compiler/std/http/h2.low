@@ -1,0 +1,660 @@
+import std/io
+import std/text
+
+struct Frame {
+    kind: i64
+    flags: i64
+    stream: i64
+    payload: []u8
+}
+
+struct Exchange {
+    id: i64
+    fields: []Header
+    trailers: bool
+    block: []u8
+    ends: bool
+    body: []u8
+    received: bool
+    window: i64
+    out: []u8
+    queued: bool
+    status: i64
+}
+
+struct Peer {
+    stream: io.Stream
+    reader: *io.Reader
+    server: bool
+    decoder: *Hpack
+    statics: []Header
+    exchanges: [i64: *Exchange]
+    dropped: [i64: bool]
+    window: i64
+    initial: i64
+    frame_size: i64
+    last: i64
+    pending: i64
+    settled: bool
+    code: i64
+    complete: fn(*Peer, *Exchange) ! io.Error
+}
+
+fn preface() -> str {
+    "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+}
+
+fn window_limit() -> i64 {
+    0x7FFFFFFF
+}
+
+fn new_peer(s: io.Stream, r: *io.Reader, server: bool, complete: fn(*Peer, *Exchange) ! io.Error) -> *Peer {
+    new(Peer {
+        stream: s
+        reader: r
+        server
+        decoder: new_hpack(4096)
+        statics: static_table()
+        exchanges: [:]
+        dropped: [:]
+        window: 65535
+        initial: 65535
+        frame_size: 16384
+        last: 0
+        pending: 0
+        settled: false
+        code: 0
+        complete
+    })
+}
+
+fn new_exchange(p: *Peer, id: i64) -> *Exchange {
+    let e = new(Exchange {
+        id
+        fields: []
+        trailers: false
+        block: []
+        ends: false
+        body: []
+        received: false
+        window: p.initial
+        out: []
+        queued: false
+        status: 0
+    })
+    p.exchanges[id] = e
+    e
+}
+
+fn protocol(p: *Peer, code: i64) -> io.Error {
+    p.code = code
+    go_away(p)
+    Malformed
+}
+
+fn least(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+fn put_frame(mut out: []u8, kind: i64, flags: i64, stream: i64, payload: []u8) {
+    io.put_be24(mut out, payload.len)
+    push(mut out, u8(kind))
+    push(mut out, u8(flags))
+    io.put_be32(mut out, stream)
+    io.append(mut out, payload)
+}
+
+fn send_frame(p: *Peer, kind: i64, flags: i64, stream: i64, payload: []u8) ! io.Error {
+    var out: []u8 = []
+    put_frame(mut out, kind, flags, stream, payload)
+    io.write_all(p.stream, out)?
+}
+
+fn read_frame(p: *Peer) -> Frame ! io.Error {
+    let head = io.read_exact(p.reader, 9)?
+    let size = io.be24(head, 0)
+    if size > 16384 {
+        fail protocol(p, 6)
+    }
+    let payload = io.read_exact(p.reader, size)?
+    Frame { kind: i64(head[3]), flags: i64(head[4]), stream: io.be32(head, 5) & window_limit(), payload }
+}
+
+fn settings_frame(mut out: []u8, server: bool) {
+    var payload: []u8 = []
+    if server {
+        io.put_be16(mut payload, 3)
+        io.put_be32(mut payload, 100)
+    } else {
+        io.put_be16(mut payload, 2)
+        io.put_be32(mut payload, 0)
+    }
+    io.put_be16(mut payload, 4)
+    io.put_be32(mut payload, 1 << 20)
+    put_frame(mut out, 4, 0, 0, payload)
+    var grow: []u8 = []
+    io.put_be32(mut grow, (1 << 30) - 65535)
+    put_frame(mut out, 8, 0, 0, grow)
+}
+
+fn credit(p: *Peer, stream: i64, n: i64) ! io.Error {
+    if n == 0 {
+        return
+    }
+    var out: []u8 = []
+    var amount: []u8 = []
+    io.put_be32(mut amount, n)
+    put_frame(mut out, 8, 0, 0, amount)
+    if stream > 0 {
+        put_frame(mut out, 8, 0, stream, amount)
+    }
+    io.write_all(p.stream, out)?
+}
+
+fn unpad(p: *Peer, f: Frame) -> []u8 ! io.Error {
+    if f.flags & 0x8 == 0 {
+        return f.payload
+    }
+    if f.payload.len == 0 || i64(f.payload[0]) >= f.payload.len {
+        fail protocol(p, 1)
+    }
+    f.payload[1..f.payload.len - i64(f.payload[0])]
+}
+
+fn on_settings(p: *Peer, f: Frame) ! io.Error {
+    if f.stream != 0 || (f.flags & 1 != 0 && f.payload.len != 0) || f.payload.len % 6 != 0 {
+        fail protocol(p, 6)
+    }
+    if f.flags & 1 != 0 {
+        return
+    }
+    p.settled = true
+    var at = 0
+    for at < f.payload.len {
+        let id = io.be16(f.payload, at)
+        let value = io.be32(f.payload, at + 2)
+        at += 6
+        if id == 2 && value > 1 {
+            fail protocol(p, 1)
+        }
+        if id == 4 {
+            if value > window_limit() {
+                fail protocol(p, 3)
+            }
+            for _, e in p.exchanges {
+                e.window += value - p.initial
+            }
+            p.initial = value
+        }
+        if id == 5 {
+            if value < 16384 || value > 16777215 {
+                fail protocol(p, 1)
+            }
+            p.frame_size = value
+        }
+    }
+    send_frame(p, 4, 1, 0, [])?
+}
+
+fn on_window(p: *Peer, f: Frame) ! io.Error {
+    if f.payload.len != 4 {
+        fail protocol(p, 6)
+    }
+    let n = io.be32(f.payload, 0) & window_limit()
+    if f.stream == 0 {
+        if n == 0 {
+            fail protocol(p, 1)
+        }
+        p.window += n
+        if p.window > window_limit() {
+            fail protocol(p, 3)
+        }
+        return
+    }
+    match p.exchanges[f.stream] {
+        some(e) => {
+            if n == 0 {
+                reset(p, e.id, 1)?
+                return
+            }
+            e.window += n
+            if e.window > window_limit() {
+                reset(p, e.id, 3)?
+            }
+        }
+        none => {
+            if idle(p, f.stream) {
+                fail protocol(p, 1)
+            }
+        }
+    }
+}
+
+fn reset(p: *Peer, id: i64, code: i64) ! io.Error {
+    var payload: []u8 = []
+    io.put_be32(mut payload, code)
+    send_frame(p, 3, 0, id, payload)?
+    delete(mut p.exchanges, id)
+    p.dropped[id] = true
+}
+
+fn idle(p: *Peer, id: i64) -> bool {
+    id > p.last
+}
+
+fn opened(p: *Peer, id: i64) -> *Exchange ! io.Error {
+    match p.exchanges[id] {
+        some(e) => return e
+        none => {}
+    }
+    if !p.server || id % 2 == 0 {
+        fail protocol(p, 1)
+    }
+    if !idle(p, id) {
+        fail protocol(p, 5)
+    }
+    p.last = id
+    new_exchange(p, id)
+}
+
+fn valid_request(fields: []Header) -> bool {
+    var seen: [str: bool] = [:]
+    var regular = false
+    var method = ""
+    for h in fields {
+        if h.name.len > 0 && h.name[0] == ':' {
+            let known = h.name == ":method" || h.name == ":scheme" || h.name == ":authority" || h.name == ":path"
+            if regular || !known || (seen[h.name] ?? false) || (h.name == ":path" && h.value.len == 0) {
+                return false
+            }
+            seen[h.name] = true
+            if h.name == ":method" {
+                method = h.value
+            }
+            continue
+        }
+        regular = true
+        if connection_specific(h.name) || (h.name == "te" && h.value != "trailers") {
+            return false
+        }
+    }
+    if method == "CONNECT" {
+        return seen[":authority"] ?? false
+    }
+    method.len > 0 && (seen[":scheme"] ?? false) && (seen[":path"] ?? false)
+}
+
+fn has_pseudo(fields: []Header) -> bool {
+    for h in fields {
+        if h.name.len > 0 && h.name[0] == ':' {
+            return true
+        }
+    }
+    false
+}
+
+fn on_headers(p: *Peer, f: Frame) ! io.Error {
+    if f.stream == 0 {
+        fail protocol(p, 1)
+    }
+    var block = unpad(p, f)?
+    if f.flags & 0x20 != 0 {
+        if block.len < 5 {
+            fail protocol(p, 6)
+        }
+        if io.be32(block, 0) & window_limit() == f.stream {
+            fail protocol(p, 1)
+        }
+        block = block[5..]
+    }
+    let e = opened(p, f.stream)?
+    if e.received {
+        fail protocol(p, 5)
+    }
+    e.block = []
+    io.append(mut e.block, block)
+    e.ends = f.flags & 1 != 0
+    if f.flags & 4 == 0 {
+        p.pending = f.stream
+        return
+    }
+    finish_block(p, e)?
+}
+
+fn on_continuation(p: *Peer, f: Frame) ! io.Error {
+    if p.pending == 0 || f.stream != p.pending {
+        fail protocol(p, 1)
+    }
+    let e = p.exchanges[f.stream] ?? new_exchange(p, f.stream)
+    io.append(mut e.block, f.payload)
+    if e.block.len > 1 << 20 {
+        fail protocol(p, 11)
+    }
+    if f.flags & 4 != 0 {
+        p.pending = 0
+        finish_block(p, e)?
+    }
+}
+
+fn finish_block(p: *Peer, e: *Exchange) ! io.Error {
+    let fields = decode(p.decoder, e.block) catch {
+        TooLarge => fail protocol(p, 11)
+        _ => fail protocol(p, 9)
+    }
+    e.block = []
+    if e.trailers {
+        if !e.ends {
+            fail protocol(p, 1)
+        }
+        if has_pseudo(fields) {
+            reset(p, e.id, 1)?
+            return
+        }
+    } else {
+        for h in fields {
+            if h.name != text.lower(h.name) {
+                reset(p, e.id, 1)?
+                return
+            }
+        }
+        if p.server && !valid_request(fields) {
+            reset(p, e.id, 1)?
+            return
+        }
+        if p.server && p.exchanges.len > 100 {
+            reset(p, e.id, 7)?
+            return
+        }
+        e.fields = fields
+        e.trailers = true
+        if !p.server {
+            let status = header(fields, ":status") ?? ""
+            e.status = text.parse_uint(status, 10) catch {
+                _ => fail protocol(p, 1)
+            }
+            if e.status >= 100 && e.status < 200 {
+                e.trailers = false
+            }
+        }
+    }
+    if e.ends {
+        end_remote(p, e)?
+    }
+}
+
+fn end_remote(p: *Peer, e: *Exchange) ! io.Error {
+    e.received = true
+    let declared = header(e.fields, "content-length") ?? ""
+    if p.server && declared.len > 0 && declared != "{e.body.len}" {
+        reset(p, e.id, 1)?
+        return
+    }
+    p.complete(p, e)?
+}
+
+fn on_data(p: *Peer, f: Frame) ! io.Error {
+    if f.stream == 0 {
+        fail protocol(p, 1)
+    }
+    let data = unpad(p, f)?
+    match p.exchanges[f.stream] {
+        some(e) => {
+            if e.received || !e.trailers {
+                fail protocol(p, 5)
+            }
+            if e.body.len + data.len > max_body() {
+                reset(p, e.id, 11)?
+                credit(p, 0, f.payload.len)?
+                return
+            }
+            io.append(mut e.body, data)
+            let ends = f.flags & 1 != 0
+            credit(p, if ends { 0 } else { e.id }, f.payload.len)?
+            if ends {
+                end_remote(p, e)?
+            }
+        }
+        none => {
+            if idle(p, f.stream) {
+                fail protocol(p, 1)
+            }
+            if !(p.dropped[f.stream] ?? false) {
+                fail protocol(p, 5)
+            }
+            credit(p, 0, f.payload.len)?
+        }
+    }
+}
+
+fn on_frame(p: *Peer, f: Frame) ! io.Error {
+    if p.pending != 0 && f.kind != 9 {
+        fail protocol(p, 1)
+    }
+    if !p.settled && f.kind != 4 {
+        fail protocol(p, 1)
+    }
+    if f.kind == 0 {
+        on_data(p, f)?
+    } else if f.kind == 1 {
+        on_headers(p, f)?
+    } else if f.kind == 2 {
+        if f.stream == 0 {
+            fail protocol(p, 1)
+        }
+        if f.payload.len != 5 {
+            fail protocol(p, 6)
+        }
+        if io.be32(f.payload, 0) & window_limit() == f.stream {
+            reset(p, f.stream, 1)?
+        }
+    } else if f.kind == 3 {
+        if f.stream == 0 || idle(p, f.stream) {
+            fail protocol(p, 1)
+        }
+        if f.payload.len != 4 {
+            fail protocol(p, 6)
+        }
+        if !p.server && f.stream == 1 {
+            fail Reset
+        }
+        delete(mut p.exchanges, f.stream)
+    } else if f.kind == 4 {
+        on_settings(p, f)?
+    } else if f.kind == 5 {
+        fail protocol(p, 1)
+    } else if f.kind == 6 {
+        if f.stream != 0 || f.payload.len != 8 {
+            fail protocol(p, 6)
+        }
+        if f.flags & 1 == 0 {
+            send_frame(p, 6, 1, 0, f.payload)?
+        }
+    } else if f.kind == 7 {
+        if f.stream != 0 {
+            fail protocol(p, 1)
+        }
+    } else if f.kind == 8 {
+        on_window(p, f)?
+    } else if f.kind == 9 {
+        on_continuation(p, f)?
+    }
+}
+
+fn header_frames(p: *Peer, mut out: []u8, id: i64, fields: []Header, ends: bool) {
+    let block = encode(p.statics, fields)
+    var rest = block
+    var flags = if ends { 1 } else { 0 }
+    var kind = 1
+    for {
+        let n = if rest.len < p.frame_size { rest.len } else { p.frame_size }
+        let last = n == rest.len
+        put_frame(mut out, kind, if last { flags | 4 } else { flags }, id, rest[..n])
+        if last {
+            return
+        }
+        rest = rest[n..]
+        kind = 9
+        flags = 0
+    }
+}
+
+fn queue(p: *Peer, e: *Exchange, fields: []Header, body: []u8) ! io.Error {
+    var out: []u8 = []
+    header_frames(p, mut out, e.id, fields, body.len == 0)
+    io.write_all(p.stream, out)?
+    e.out = body
+    e.queued = true
+    if body.len == 0 {
+        sent(p, e)
+    }
+}
+
+fn sent(p: *Peer, e: *Exchange) {
+    if e.received {
+        delete(mut p.exchanges, e.id)
+    }
+}
+
+fn flush(p: *Peer) ! io.Error {
+    var out: []u8 = []
+    var finished: []*Exchange = []
+    for _, e in p.exchanges {
+        for e.queued && e.out.len > 0 && p.window > 0 && e.window > 0 {
+            let n = least(least(e.out.len, p.frame_size), least(p.window, e.window))
+            let last = n == e.out.len
+            put_frame(mut out, 0, if last { 1 } else { 0 }, e.id, e.out[..n])
+            e.out = e.out[n..]
+            p.window -= n
+            e.window -= n
+            if last {
+                push(mut finished, e)
+            }
+        }
+    }
+    io.write_all(p.stream, out)?
+    for e in finished {
+        e.queued = false
+        sent(p, e)
+    }
+}
+
+fn go_away(p: *Peer) {
+    var payload: []u8 = []
+    io.put_be32(mut payload, p.last)
+    io.put_be32(mut payload, p.code)
+    send_frame(p, 7, 0, 0, payload) catch {
+        _ => {}
+    }
+}
+
+fn drive(p: *Peer, done: fn() -> bool) ! io.Error {
+    for {
+        flush(p)?
+        if done() {
+            return
+        }
+        let f = read_frame(p)?
+        on_frame(p, f)?
+    }
+}
+
+fn request_from(e: *Exchange) -> Request ! io.Error {
+    var method = ""
+    var target = ""
+    var authority = ""
+    var headers: []Header = []
+    for h in e.fields {
+        if h.name == ":method" {
+            method = h.value
+        } else if h.name == ":path" {
+            target = h.value
+        } else if h.name == ":authority" {
+            authority = h.value
+        } else if h.name.len > 0 && h.name[0] == ':' {
+            if h.name != ":scheme" {
+                fail Malformed
+            }
+        } else {
+            push(mut headers, h)
+        }
+    }
+    if method.len == 0 || target.len == 0 {
+        fail Malformed
+    }
+    var req = request(method, target)
+    req.headers = headers
+    req.body = e.body
+    req.version = Http2
+    req.authority = if authority.len > 0 { authority } else { header(headers, "host") ?? "" }
+    req
+}
+
+fn connection_specific(name: str) -> bool {
+    name == "connection" || name == "keep-alive" || name == "transfer-encoding" || name == "upgrade" || name == "proxy-connection"
+}
+
+fn serve_h2(s: io.Stream, r: *io.Reader, handler: fn(Request) -> Response) ! io.Error {
+    let complete = fn(p: *Peer, e: *Exchange) ! io.Error {
+        let req = request_from(e) catch {
+            _ => {
+                reset(p, e.id, 1)?
+                return
+            }
+        }
+        let resp = handler(req)
+        var fields: []Header = [Header { name: ":status", value: "{resp.status}" }]
+        for h in resp.headers {
+            if !connection_specific(text.lower(h.name)) {
+                push(mut fields, h)
+            }
+        }
+        var body = resp.body
+        if bodiless(req.method, resp.status) {
+            body = []
+        }
+        if !has_header(resp.headers, "content-length") {
+            push(mut fields, Header { name: "content-length", value: "{body.len}" })
+        }
+        queue(p, e, fields, body)?
+    }
+    let p = new_peer(s, r, true, complete)
+    var out: []u8 = []
+    settings_frame(mut out, true)
+    io.write_all(s, out)?
+    drive(p, fn() -> bool { false })?
+}
+
+fn send_h2(s: io.Stream, req: Request) -> Response ! io.Error {
+    let r = io.reader(s)
+    let complete = fn(p: *Peer, e: *Exchange) ! io.Error {}
+    let p = new_peer(s, r, false, complete)
+    var out: []u8 = []
+    text.append(mut out, preface())
+    settings_frame(mut out, false)
+    io.write_all(s, out)?
+    let e = new_exchange(p, 1)
+    e.trailers = false
+    var fields: []Header = [
+        Header { name: ":method", value: req.method }
+        Header { name: ":scheme", value: "http" }
+        Header { name: ":authority", value: req.authority }
+        Header { name: ":path", value: req.target }
+    ]
+    p.last = 1
+    for h in req.headers {
+        let name = text.lower(h.name)
+        if !connection_specific(name) && name != "host" {
+            push(mut fields, Header { name, value: h.value })
+        }
+    }
+    queue(p, e, fields, req.body)?
+    drive(p, fn() -> bool { e.received })?
+    go_away(p)
+    var headers: []Header = []
+    for h in e.fields {
+        if h.name.len > 0 && h.name[0] != ':' {
+            push(mut headers, h)
+        }
+    }
+    Response { status: e.status, headers, body: e.body }
+}

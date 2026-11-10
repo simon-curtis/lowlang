@@ -1,0 +1,286 @@
+import std/base64
+import std/crypto
+import std/http
+import std/io
+import std/net
+import std/text
+
+pub struct Socket {
+    reader: *io.Reader
+    client: bool
+    closed: bool
+}
+
+pub struct Message {
+    pub text: bool
+    pub data: []u8
+}
+
+struct Frame {
+    fin: bool
+    op: i64
+    payload: []u8
+}
+
+fn guid() -> str {
+    "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+}
+
+fn max_message() -> i64 {
+    1 << 24
+}
+
+fn accept_key(key: str) -> str {
+    base64.encode(crypto.sha1(bytes("{key}{guid()}")))
+}
+
+fn stream(ws: *Socket) -> io.Stream {
+    io.reader_stream(ws.reader)
+}
+
+pub fn accept(req: http.Request) -> *Socket ! io.Error {
+    let r = match req.connection {
+        some(r) => r
+        none => fail Unsupported
+    }
+    let upgrade = http.header(req.headers, "upgrade") ?? ""
+    let connection = http.header(req.headers, "connection") ?? ""
+    let version = http.header(req.headers, "sec-websocket-version") ?? ""
+    let key = http.header(req.headers, "sec-websocket-key") ?? ""
+    let nonce = base64.decode(key) catch {
+        _ => fail Malformed
+    }
+    if req.method != "GET" || !text.has_token(upgrade, "websocket") || !text.has_token(connection, "upgrade") {
+        fail Malformed
+    }
+    if version != "13" || nonce.len != 16 {
+        fail Malformed
+    }
+    let reply = "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept_key(key)}\r\n\r\n"
+    io.write_str(io.reader_stream(r), reply)?
+    new(Socket { reader: r, client: false, closed: false })
+}
+
+pub fn dial(url: str) -> *Socket ! io.Error {
+    let u = http.parse_url(url)?
+    if u.scheme != "ws" {
+        fail Unsupported
+    }
+    let c = net.dial(u.host, u.port)?
+    let s = net.stream(c)
+    let key = base64.encode(crypto.random(16))
+    var req = http.request("GET", u.target)
+    req.authority = http.authority(u)
+    req.headers = [
+        http.Header { name: "upgrade", value: "websocket" }
+        http.Header { name: "connection", value: "Upgrade" }
+        http.Header { name: "sec-websocket-key", value: key }
+        http.Header { name: "sec-websocket-version", value: "13" }
+    ]
+    let r = io.reader(s)
+    let resp = handshake(r, req) catch {
+        _ => {
+            net.close(c)
+            fail Refused
+        }
+    }
+    let accepted = http.header(resp.headers, "sec-websocket-accept") ?? ""
+    if resp.status != 101 || accepted != accept_key(key) {
+        net.close(c)
+        fail Refused
+    }
+    new(Socket { reader: r, client: true, closed: false })
+}
+
+fn handshake(r: *io.Reader, req: http.Request) -> http.Response ! io.Error {
+    http.write_request(io.reader_stream(r), req)?
+    http.read_response(r, "GET")
+}
+
+fn read_frame(ws: *Socket) -> Frame ! io.Error {
+    let b0 = i64(io.read_byte(ws.reader)?)
+    let b1 = i64(io.read_byte(ws.reader)?)
+    let masked = b1 & 0x80 != 0
+    let op = b0 & 0xF
+    if b0 & 0x70 != 0 || masked == ws.client || (op > 2 && op < 8) || op > 10 {
+        fail Malformed
+    }
+    var size = b1 & 0x7F
+    if size == 126 {
+        size = io.be16(io.read_exact(ws.reader, 2)?, 0)
+    } else if size == 127 {
+        size = io.be64(io.read_exact(ws.reader, 8)?, 0)
+    }
+    let fin = b0 & 0x80 != 0
+    if op >= 8 && (size > 125 || !fin) {
+        fail Malformed
+    }
+    if size < 0 || size > max_message() {
+        fail TooLarge
+    }
+    var key: []u8 = []
+    if masked {
+        key = io.read_exact(ws.reader, 4)?
+    }
+    let payload = io.read_exact(ws.reader, size)?
+    if masked {
+        for i in 0..size {
+            payload[i] = payload[i] ^ key[i % 4]
+        }
+    }
+    Frame { fin, op, payload }
+}
+
+fn write_frame(ws: *Socket, op: i64, payload: []u8) ! io.Error {
+    var out: []u8 = []
+    push(mut out, u8(0x80 | op))
+    let mask: u8 = if ws.client { 0x80 } else { 0 }
+    if payload.len < 126 {
+        push(mut out, mask | u8(payload.len))
+    } else if payload.len < 65536 {
+        push(mut out, mask | 126)
+        io.put_be16(mut out, payload.len)
+    } else {
+        push(mut out, mask | 127)
+        io.put_be64(mut out, payload.len)
+    }
+    if !ws.client {
+        io.append(mut out, payload)
+        return io.write_all(stream(ws), out)
+    }
+    let key = crypto.random(4)
+    io.append(mut out, key)
+    for i, b in payload {
+        push(mut out, b ^ key[i % 4])
+    }
+    io.write_all(stream(ws), out)?
+}
+
+fn valid_utf8(data: []u8) -> bool {
+    let s = __str_view(data)
+    var i = 0
+    for i < s.len {
+        let c = s[i]
+        var need = 0
+        var min: u32 = 0
+        var code: u32 = 0
+        if c < 0x80 {
+            i += 1
+            continue
+        } else if c & 0xE0 == 0xC0 {
+            need = 1
+            min = 0x80
+            code = u32(c & 0x1F)
+        } else if c & 0xF0 == 0xE0 {
+            need = 2
+            min = 0x800
+            code = u32(c & 0x0F)
+        } else if c & 0xF8 == 0xF0 {
+            need = 3
+            min = 0x10000
+            code = u32(c & 0x07)
+        } else {
+            return false
+        }
+        if i + need >= s.len {
+            return false
+        }
+        for k in 1..need + 1 {
+            let next = s[i + k]
+            if next & 0xC0 != 0x80 {
+                return false
+            }
+            code = code << 6 | u32(next & 0x3F)
+        }
+        if code < min || code > 0x10FFFF || (code >= 0xD800 && code < 0xE000) {
+            return false
+        }
+        i += need + 1
+    }
+    true
+}
+
+fn violation(ws: *Socket, code: i64) -> io.Error {
+    var payload: []u8 = []
+    io.put_be16(mut payload, code)
+    write_frame(ws, 8, payload) catch {
+        _ => {}
+    }
+    ws.closed = true
+    Malformed
+}
+
+pub fn receive(ws: *Socket) -> Message ! io.Error {
+    var data: []u8 = []
+    var kind = -1
+    for {
+        let f = read_frame(ws) catch {
+            Malformed => fail violation(ws, 1002)
+            TooLarge => fail violation(ws, 1009)
+            Eof => fail Eof
+            _ => fail Reset
+        }
+        if f.op == 9 {
+            write_frame(ws, 10, f.payload)?
+            continue
+        }
+        if f.op == 10 {
+            continue
+        }
+        if f.op == 8 {
+            if f.payload.len == 1 || f.payload.len > 1 && !valid_utf8(f.payload[2..]) {
+                fail violation(ws, 1002)
+            }
+            if !ws.closed {
+                ws.closed = true
+                write_frame(ws, 8, if f.payload.len >= 2 { f.payload[..2] } else { [] })?
+            }
+            fail Eof
+        }
+        if f.op == 0 && kind < 0 || f.op != 0 && kind >= 0 {
+            fail violation(ws, 1002)
+        }
+        if f.op != 0 {
+            kind = f.op
+        }
+        if data.len + f.payload.len > max_message() {
+            fail violation(ws, 1009)
+        }
+        io.append(mut data, f.payload)
+        if f.fin {
+            if kind == 1 && !valid_utf8(data) {
+                fail violation(ws, 1007)
+            }
+            return Message { text: kind == 1, data }
+        }
+    }
+}
+
+pub fn send_text(ws: *Socket, message: str) ! io.Error {
+    write_frame(ws, 1, bytes(message))?
+}
+
+pub fn send_binary(ws: *Socket, data: []u8) ! io.Error {
+    write_frame(ws, 2, data)?
+}
+
+pub fn ping(ws: *Socket, data: []u8) ! io.Error {
+    write_frame(ws, 9, data)?
+}
+
+pub fn close(ws: *Socket, code: i64) ! io.Error {
+    if !ws.closed {
+        ws.closed = true
+        var payload: []u8 = []
+        io.put_be16(mut payload, code)
+        write_frame(ws, 8, payload)?
+        for {
+            receive(ws) catch {
+                _ => break
+            }
+        }
+    }
+    if ws.client {
+        stream(ws).close()
+    }
+}

@@ -257,10 +257,18 @@ func (g *Generator) convert(fr *frame, in *instr) {
 		g.move("r10", src)
 		g.normalize("r10", to)
 		g.move(dst, "r10")
+	case from == types.U64:
+		g.move("r10", src)
+		g.unsignedToFloat(precision(to))
+		g.fromXmm(dst, to)
 	case from.Integer():
 		g.move("r10", src)
 		g.emit("cvtsi2s%s xmm0, r10", precision(to))
 		g.fromXmm(dst, to)
+	case to == types.U64:
+		g.toXmm("xmm0", src)
+		g.floatToUnsigned(precision(from))
+		g.move(dst, "r10")
 	case to.Integer():
 		g.toXmm("xmm0", src)
 		g.emit("cvtts%s2si r10, xmm0", precision(from))
@@ -271,6 +279,50 @@ func (g *Generator) convert(fr *frame, in *instr) {
 		g.emit("cvts%s2s%s xmm0, xmm0", precision(from), precision(to))
 		g.fromXmm(dst, to)
 	}
+}
+
+func (g *Generator) unsignedToFloat(p string) {
+	big := g.newLabel()
+	done := g.newLabel()
+	g.emit("test r10, r10")
+	g.emit("js %s", big)
+	g.emit("cvtsi2s%s xmm0, r10", p)
+	g.emit("jmp %s", done)
+	g.label(big)
+	g.emit("mov r11, r10")
+	g.emit("shr r10, 1")
+	g.emit("and r11d, 1")
+	g.emit("or r10, r11")
+	g.emit("cvtsi2s%s xmm0, r10", p)
+	g.emit("adds%s xmm0, xmm0", p)
+	g.label(done)
+}
+
+func (g *Generator) floatToUnsigned(p string) {
+	big := g.newLabel()
+	done := g.newLabel()
+	limit := int64(0x43E0000000000000)
+	if p == "s" {
+		limit = 0x5F000000
+	}
+	g.emit("mov r10, %d", limit)
+	g.emit("movq xmm1, r10")
+	g.emit("ucomis%s xmm0, xmm1", p)
+	g.emit("jae %s", big)
+	g.emit("cvtts%s2si r10, xmm0", p)
+	g.emit("jmp %s", done)
+	g.label(big)
+	g.emit("subs%s xmm0, xmm1", p)
+	g.emit("cvtts%s2si r10, xmm0", p)
+	g.emit("btc r10, 63")
+	g.label(done)
+}
+
+func (g *Generator) mulHigh(fr *frame, in *instr) {
+	g.move("rax", fr.loc(in.args[0]))
+	g.move("r10", fr.loc(in.args[1]))
+	g.emit("mul r10")
+	g.move(fr.loc(in.dst), "rdx")
 }
 
 func (g *Generator) floatUnary(fr *frame, in *instr) {

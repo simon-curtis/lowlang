@@ -92,12 +92,15 @@ func (in *instr) hint() {
 	case in.move:
 		in.dst.copyOf = in.args[0]
 	case in.op == ir.OpCall || in.op == ir.OpRuntime:
-		args := in.args
+		args, regs := in.args, argRegs
 		if in.value.Indirect {
 			args = args[1:]
 		}
-		for i, a := range args[:min(len(args), len(argRegs))] {
-			a.hint = argRegs[i]
+		if in.op == ir.OpRuntime && in.value.Str == "syscall" {
+			regs = syscallRegs
+		}
+		for i, a := range args[:min(len(args), len(regs))] {
+			a.hint = regs[i]
 		}
 	}
 }

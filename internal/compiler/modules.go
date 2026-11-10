@@ -1,8 +1,10 @@
 package compiler
 
 import (
+	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +14,13 @@ import (
 	"lowlang/internal/lexer"
 	"lowlang/internal/parser"
 )
+
+//go:embed std
+var stdFS embed.FS
+
+func isStd(module string) bool {
+	return module == "std" || strings.HasPrefix(module, "std/")
+}
 
 type edge struct {
 	to  string
@@ -89,6 +98,9 @@ func (l *loader) imported(e edge) error {
 	if _, done := l.edges[e.to]; done {
 		return nil
 	}
+	if isStd(e.to) {
+		return l.std(e)
+	}
 	dir := filepath.Join(l.root, filepath.FromSlash(e.to))
 	files, err := sources(dir)
 	if errors.Is(err, os.ErrNotExist) || (err == nil && len(files) == 0) {
@@ -100,16 +112,37 @@ func (l *loader) imported(e edge) error {
 	return l.module(e.to, files)
 }
 
+func (l *loader) std(e edge) error {
+	entries, err := fs.ReadDir(stdFS, e.to)
+	missing := fmt.Errorf("%s: cannot find module %s in the standard library", e.pos, e.to)
+	if err != nil {
+		return missing
+	}
+	var files []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".low") {
+			files = append(files, fmt.Sprintf("%s/%s", e.to, entry.Name()))
+		}
+	}
+	if len(files) == 0 {
+		return missing
+	}
+	return l.module(e.to, files)
+}
+
 func (l *loader) module(path string, files []string) error {
 	l.edges[path] = []edge{}
+	std := isStd(path)
 	for _, name := range files {
-		file, err := l.parseFile(name)
+		file, err := l.parseFile(name, std)
 		if err != nil {
 			return err
 		}
 		file.Module = path
 		l.files = append(l.files, file)
-		l.sources = append(l.sources, name)
+		if !std {
+			l.sources = append(l.sources, name)
+		}
 		if err := l.link(file); err != nil {
 			return err
 		}
@@ -131,7 +164,10 @@ func (l *loader) link(file *ast.File) error {
 	return nil
 }
 
-func (l *loader) parseFile(name string) (*ast.File, error) {
+func (l *loader) parseFile(name string, std bool) (*ast.File, error) {
+	if std {
+		return parseStd(name)
+	}
 	src, err := l.read(name)
 	if err != nil {
 		return nil, err
@@ -182,4 +218,21 @@ func display(modules []string) []string {
 		}
 	}
 	return out
+}
+
+func parseStd(name string) (*ast.File, error) {
+	src, err := stdFS.ReadFile(name)
+	if err != nil {
+		return nil, err
+	}
+	tokens, err := lexer.LexAt(src, lexer.Pos{File: name, Line: 1, Col: 1}, true)
+	if err != nil {
+		return nil, err
+	}
+	file, err := parser.ParsePrelude(tokens)
+	if err != nil {
+		return nil, err
+	}
+	file.Path = name
+	return file, nil
 }

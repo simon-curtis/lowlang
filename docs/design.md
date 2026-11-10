@@ -599,6 +599,59 @@ wait_readable(fd)
 - `sleep(ms)` pauses the green thread. `wait_readable(fd)` and `wait_writable(fd)` wait until a file descriptor is ready, using epoll; one green thread may wait on a descriptor at a time.
 - A program ends when `main` returns, whatever other green threads are doing. When every green thread is waiting and nothing can wake one, the program panics with `every green thread is blocked forever`. A green thread that exhausts its stack panics with `stack overflow`.
 
+## Standard library
+
+```low
+import std/file
+import std/http
+import std/http/websocket
+import std/io
+import std/net
+
+fn handle(req: http.Request) -> http.Response {
+    if req.path == "/chat" {
+        let ws = websocket.accept(req) catch {
+            _ => return http.response(400, "")
+        }
+        let m = websocket.receive(ws) catch {
+            _ => return http.upgraded()
+        }
+        websocket.send_text(ws, str(m.data)) catch {
+            _ => {}
+        }
+        return http.upgraded()
+    }
+    http.response(200, file.read_text("index.html") catch "missing")
+}
+
+fn main() ! io.Error {
+    let page = http.get("http://example.com/")?
+    let h2 = http.fetch("GET", "http://127.0.0.1:8080/", [], [], Http2)?
+    http.serve(net.listen("", 8080)?, handle)?
+}
+```
+
+`import std/<name>` loads a module of the standard library, which is compiled into `low`; the project root is not searched for it. Every module talks to the kernel through raw syscalls, so programs using it stay static.
+
+| Module | Contents |
+|---|---|
+| `std/io` | `Error`, the error type shared by `file`, `net` and `http`; `Stream`, a struct of `read`, `write` and `close` closures; a buffered `Reader` with `read_line`, `read_exact`, `read_some` and `read_byte`; `write_all`, `read_all`, `buffer(n)` and big- and little-endian byte helpers. |
+| `std/file` | `open`, `create`, `append`, `update`, `read`, `write`, `write_all`, `seek`, `sync`, `truncate`, `close`, `info`, `stat`, `exists`, `read_file`, `read_text`, `write_file`, `write_text`, `remove`, `remove_dir`, `rename`, `mkdir`, `mkdir_all`, `list` and `stream`. |
+| `std/net` | IPv4 and IPv6 `Addr`, `parse_ip`, `format_ip`, `parse_addr`, `format`; TCP `listen`, `accept`, `connect`, `dial`, `read`, `write`, `write_all`, `shutdown_write`, `set_nodelay`, read and write timeouts and `stream`; UDP `bind_udp`, `send_to` and `receive_from`; `lookup`, which tries an IP literal, `/etc/hosts`, then A and AAAA queries to each `/etc/resolv.conf` nameserver. |
+| `std/http` | `Request`, `Response`, `Header`, header helpers, `parse_url`; `serve`, `serve_conn` and `serve_stream`; `fetch`, `get` and `post`. |
+| `std/http/websocket` | `accept`, `dial`, `receive`, `send_text`, `send_binary`, `ping` and `close`. |
+| `std/text` | integer parsing and hex formatting, `trim`, `split`, `join`, `index`, case folding and comma-separated token lists. |
+| `std/base64` | `encode` and `decode`. |
+| `std/crypto` | `sha1` and `random`, which reads `getrandom`. |
+
+- A server speaks HTTP/1.1 and HTTP/2 on the same port. A connection that opens with the HTTP/2 preface is served as HTTP/2 with prior knowledge (h2c); any other is HTTP/1.1 with keep-alive, pipelining, chunked bodies and `Expect: 100-continue`. The `h2c` upgrade from HTTP/1.1, deprecated by RFC 9113, is not offered.
+- HTTP/2 covers framing, HPACK with its dynamic table and Huffman decoding, stream multiplexing, flow control in both directions, SETTINGS, PING, RST_STREAM, GOAWAY and CONTINUATION, and the request validation of RFC 9113 section 8. The encoder uses the static table and literals without Huffman coding. It passes h2spec except the test sending a garbage preface, which the shared port reads as an HTTP/1.1 request.
+- `serve` handles connections one at a time, and HTTP/2 streams on a connection in the order their requests complete.
+- A handler that returns status 101 owns the connection: the server writes nothing more and closes it once the handler returns. `http.upgraded()` is that response, returned after a WebSocket session.
+- `Request.connection` is the buffered reader of an HTTP/1.1 connection, which `websocket.accept` writes the handshake to and reads frames from. A WebSocket server requires masked client frames, answers pings, reassembles fragments, checks UTF-8 in text messages, limits messages to 16 MB and echoes a close frame.
+- The client speaks HTTP/1.1 or HTTP/2 with prior knowledge, one request per connection, over `http` URLs. `https` and `wss` URLs fail with `Unsupported`.
+- Request and response bodies are limited to 64 MB.
+
 ## Compiler
 
 Written in Go. Pipeline:
@@ -639,6 +692,8 @@ The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emi
 - A dynamic program is linked with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2` against glibc's `crt1.o`, `crti.o` and `crtn.o`, then `-l<name>` for each library and `-lc`. The start files are looked for in `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/lib/x86_64-linux-gnu`. glibc's start-up code calls the generated C `main`, which does the same; when LowLang's `main` returns the program calls `exit(0)`, letting libc run its exit handlers. An error from `main` still prints and exits with status 1.
 
 `internal/compiler/prelude.low` is LowLang source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, the generic map table, integer formatting, and float formatting with Burger and Dybvig's free-format algorithm over big integers of 32-bit limbs. Its names start with `__`, which user code cannot use, and four intrinsics are available only there: `__bits` gives a float's bit pattern, `__str_view` turns a `[]u8` into a `str` without copying, `__hash` hashes any `Hash` value, and `__zero` is the all-zero value of its expected type. Functions unreachable from `main` are dropped, so a program that formats no floats carries none of this code.
+
+The standard library lives in `internal/compiler/std` and is embedded in `low` with `go:embed`. An import whose path is `std` or starts with `std/` is read from there, never from the project root. Its files are lexed like the prelude, so they may use `__` names and intrinsics, and they are left out of the sources `low dev` watches. Two intrinsics serve it: `__syscall(n, args...)` makes Linux syscall `n` with up to six integer, `bool` or `ptr` arguments and returns `rax` as `i64`, a negative errno on failure; `__slice_ptr(x)` gives the data address of a slice or `str` as a `ptr[T]`. `__syscall` lowers to a runtime-call instruction that the code generator emits inline: it moves the arguments into `rax`, `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9` with the parallel move and executes `syscall`. Being a call, it keeps no value in a caller-saved register across it, which covers the `rcx` and `r11` the kernel clobbers.
 
 The garbage collector is a non-moving mark-sweep collector in the runtime:
 
@@ -763,12 +818,18 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - Field defaults and trailing children blocks for struct literals and calls.
 - Function values and closures capturing by reference; `extern fn` C function pointers and C callbacks.
 - Green threads on an M:N scheduler with `spawn`, channels, `select`, `sleep`, descriptor waits through epoll, deadlock detection and stack overflow checks.
+- Standard library: `std/io`, `std/file`, `std/net` with a DNS resolver, `std/http` with HTTP/1.1 and HTTP/2 servers and clients, `std/http/websocket`, `std/text`, `std/base64` and `std/crypto`.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. GPU UI library with GPUI's renderer and platform layer and a signal-based state model, Linux first:
+1. Standard library, written in LowLang:
+    1. Serve each connection and each HTTP/2 stream on its own green thread, and wait for socket readiness through the netpoller.
+    2. TLS 1.3 (RFC 8446): X25519 and P-256 key exchange, AES-GCM and ChaCha20-Poly1305, SHA-256 and SHA-384, HKDF, X.509 chain validation with ECDSA and RSA-PSS against the system roots, and ALPN, giving `https`, `wss` and HTTP/2 over TLS.
+    3. QUIC (RFC 9000, 9001 and 9002) over UDP with the TLS 1.3 handshake, loss recovery and congestion control; HTTP/3 (RFC 9114) with QPACK (RFC 9204).
+    4. WebRTC data channels: ICE with STUN, DTLS, SCTP over DTLS and the data channel establishment protocol; media over SRTP.
+2. GPU UI library with GPUI's renderer and platform layer and a signal-based state model, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
@@ -782,5 +843,5 @@ The UI library is staged under `ui/` until it moves into the standard library as
     11. Foreground and background executors on the scheduler; a background task's result is written into a signal on the UI thread.
     12. Text input element whose state is held in signals, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     13. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-2. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-3. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+3. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+4. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

@@ -847,18 +847,14 @@ func (p *Parser) number(t lexer.Token, negative bool, pos lexer.Pos) ast.Expr {
 		return &ast.FloatLit{Value: v, Pos: pos}
 	}
 	u, err := strconv.ParseUint(t.Text, 0, 64)
-	limit := uint64(math.MaxInt64)
-	if negative {
-		limit++
-	}
-	if err != nil || u > limit {
+	if err != nil || (negative && u > uint64(math.MaxInt64)+1) {
 		p.fail(t.Pos, "integer %s out of range", t.Text)
 	}
 	v := int64(u)
 	if negative {
 		v = -v
 	}
-	return &ast.IntLit{Value: v, Pos: pos}
+	return &ast.IntLit{Value: v, Wide: !negative && u > uint64(math.MaxInt64), Pos: pos}
 }
 
 func (p *Parser) primary() ast.Expr {

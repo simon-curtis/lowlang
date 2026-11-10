@@ -327,6 +327,7 @@ type IntLit struct {
 	Typed
 	Value int64
 	Char  bool
+	Wide  bool
 	Pos   lexer.Pos
 }
 

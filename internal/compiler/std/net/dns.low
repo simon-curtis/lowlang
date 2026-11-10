@@ -1,0 +1,170 @@
+import std/file
+import std/io
+import std/text
+
+pub fn lookup(host: str) -> [][]u8 ! io.Error {
+    let literal: []u8 = parse_ip(host) catch []
+    if literal.len > 0 {
+        return [literal]
+    }
+    let listed = from_hosts(host)
+    if listed.len > 0 {
+        return listed
+    }
+    if text.equal_fold(host, "localhost") {
+        return [parse_ip("127.0.0.1")?, parse_ip("::1")?]
+    }
+    var found: [][]u8 = []
+    for server in nameservers() {
+        for kind in [1, 28] {
+            for ip in query(server, host, kind) catch [] {
+                push(mut found, ip)
+            }
+        }
+        if found.len > 0 {
+            return found
+        }
+    }
+    fail NotFound
+}
+
+fn fields(line: str) -> []str {
+    var out: []str = []
+    let hash = text.index_byte(line, '#')
+    let content = if hash >= 0 { line[..hash] } else { line }
+    for part in text.split(text.trim(content), ' ') {
+        for piece in text.split(part, '\t') {
+            if piece.len > 0 {
+                push(mut out, piece)
+            }
+        }
+    }
+    out
+}
+
+fn from_hosts(host: str) -> [][]u8 {
+    var found: [][]u8 = []
+    let hosts = file.read_text("/etc/hosts") catch ""
+    for line in text.split(hosts, '\n') {
+        let f = fields(line)
+        if f.len < 2 {
+            continue
+        }
+        for name in f[1..] {
+            if text.equal_fold(name, host) {
+                let ip: []u8 = parse_ip(f[0]) catch []
+                if ip.len > 0 {
+                    push(mut found, ip)
+                }
+            }
+        }
+    }
+    found
+}
+
+fn nameservers() -> [][]u8 {
+    var servers: [][]u8 = []
+    let conf = file.read_text("/etc/resolv.conf") catch ""
+    for line in text.split(conf, '\n') {
+        let f = fields(line)
+        if f.len >= 2 && f[0] == "nameserver" {
+            let ip: []u8 = parse_ip(f[1]) catch []
+            if ip.len > 0 {
+                push(mut servers, ip)
+            }
+        }
+    }
+    if servers.len == 0 {
+        push(mut servers, parse_ip("127.0.0.1") catch [])
+    }
+    servers
+}
+
+fn question(host: str, kind: i64, id: i64) -> []u8 {
+    var q: []u8 = []
+    io.put_be16(mut q, id)
+    io.put_be16(mut q, 0x0100)
+    io.put_be16(mut q, 1)
+    io.put_be16(mut q, 0)
+    io.put_be32(mut q, 0)
+    for label in text.split(host, '.') {
+        if label.len > 0 {
+            push(mut q, u8(label.len))
+            text.append(mut q, label)
+        }
+    }
+    push(mut q, 0)
+    io.put_be16(mut q, kind)
+    io.put_be16(mut q, 1)
+    q
+}
+
+fn skip_name(msg: []u8, from: i64) -> i64 ! io.Error {
+    var at = from
+    for {
+        if at >= msg.len {
+            fail Malformed
+        }
+        let n = i64(msg[at])
+        if n == 0 {
+            return at + 1
+        }
+        if n & 0xC0 == 0xC0 {
+            return at + 2
+        }
+        at += n + 1
+    }
+}
+
+fn query(server: []u8, host: str, kind: i64) -> [][]u8 ! io.Error {
+    let s = bind_udp(if v6(server) { "::" } else { "" }, 0)?
+    defer close_socket(s)
+    set_receive_timeout(s, 2000)?
+    let random = io.buffer(2)
+    __syscall(318, __slice_ptr(random), 2, 0)
+    let id = io.be16(random, 0)
+    let to = Addr { ip: server, port: 53 }
+    let msg = io.buffer(1500)
+    for _ in 0..2 {
+        send_to(s, question(host, kind, id), to)?
+        let p = receive_from(s, msg) catch {
+            TimedOut => continue
+            WouldBlock => continue
+            _ => fail Unreachable
+        }
+        if p.size >= 12 && io.be16(msg, 0) == id {
+            return answers(msg[..p.size], kind)
+        }
+    }
+    fail TimedOut
+}
+
+fn answers(msg: []u8, kind: i64) -> [][]u8 ! io.Error {
+    if io.be16(msg, 2) & 0xF != 0 {
+        fail NotFound
+    }
+    var at = 12
+    for _ in 0..io.be16(msg, 4) {
+        at = skip_name(msg, at)? + 4
+    }
+    var found: [][]u8 = []
+    for _ in 0..io.be16(msg, 6) {
+        at = skip_name(msg, at)?
+        if at + 10 > msg.len {
+            fail Malformed
+        }
+        let rtype = io.be16(msg, at)
+        let size = io.be16(msg, at + 8)
+        at += 10
+        if at + size > msg.len {
+            fail Malformed
+        }
+        if rtype == kind && (size == 4 || size == 16) {
+            var ip: []u8 = []
+            io.append(mut ip, msg[at..at + size])
+            push(mut found, ip)
+        }
+        at += size
+    }
+    found
+}

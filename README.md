@@ -31,4 +31,6 @@ A directory is a module; `import ui/text` loads `ui/text/` under the project roo
 
 `low dev` runs the program and patches changed functions into it on every save, keeping its state.
 
-See [docs/design.md](docs/design.md) for the language design, what is implemented and the roadmap.
+The standard library is imported as `std/...`: `io`, `file`, `net`, `http`, `http/websocket`, `text`, `base64` and `crypto`.
+
+See [docs/design.md](docs/design.md) for the language design, the standard library, what is implemented and the roadmap.

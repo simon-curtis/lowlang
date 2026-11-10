@@ -1,0 +1,204 @@
+import std/io
+import std/text
+
+fn max_body() -> i64 {
+    1 << 26
+}
+
+fn read_headers(r: *io.Reader) -> []Header ! io.Error {
+    var headers: []Header = []
+    for {
+        let line = io.read_line(r)?
+        if line.len == 0 {
+            return headers
+        }
+        if headers.len == 100 {
+            fail TooLarge
+        }
+        let colon = text.index_byte(line, ':')
+        if colon <= 0 || !valid_name(line[..colon]) {
+            fail Malformed
+        }
+        push(mut headers, Header { name: text.lower(line[..colon]), value: text.trim(line[colon + 1..]) })
+    }
+}
+
+fn content_length(headers: []Header) -> i64 ! io.Error {
+    let value = header(headers, "content-length") ?? ""
+    if value.len == 0 {
+        return -1
+    }
+    let n = text.parse_uint(value, 10) catch {
+        _ => fail Malformed
+    }
+    if n > max_body() {
+        fail TooLarge
+    }
+    n
+}
+
+fn chunked(headers: []Header) -> bool {
+    text.has_token(header(headers, "transfer-encoding") ?? "", "chunked")
+}
+
+fn read_chunked(r: *io.Reader) -> []u8 ! io.Error {
+    var body: []u8 = []
+    for {
+        let line = io.read_line(r)?
+        let semi = text.index_byte(line, ';')
+        let size_text = text.trim(if semi >= 0 { line[..semi] } else { line })
+        let size = text.parse_uint(size_text, 16) catch {
+            _ => fail Malformed
+        }
+        if size == 0 {
+            read_headers(r)?
+            return body
+        }
+        if body.len + size > max_body() {
+            fail TooLarge
+        }
+        io.append(mut body, io.read_exact(r, size)?)
+        if io.read_line(r)?.len != 0 {
+            fail Malformed
+        }
+    }
+}
+
+fn read_until_close(r: *io.Reader) -> []u8 ! io.Error {
+    var body: []u8 = []
+    let chunk = io.buffer(16384)
+    for {
+        let n = io.read_some(r, chunk)?
+        if n == 0 {
+            return body
+        }
+        if body.len + n > max_body() {
+            fail TooLarge
+        }
+        io.append(mut body, chunk[..n])
+    }
+}
+
+fn parse_request_line(line: str) -> Request ! io.Error {
+    let parts = text.split(line, ' ')
+    if parts.len != 3 || parts[0].len == 0 || parts[1].len == 0 || !valid_name(parts[0]) {
+        fail Malformed
+    }
+    if parts[2] != "HTTP/1.1" && parts[2] != "HTTP/1.0" {
+        fail Unsupported
+    }
+    request(parts[0], parts[1])
+}
+
+fn read_request_rest(r: *io.Reader, line: str) -> Request ! io.Error {
+    var req = parse_request_line(line)?
+    req.headers = read_headers(r)?
+    req.authority = header(req.headers, "host") ?? ""
+    req.connection = r
+    if text.has_token(header(req.headers, "expect") ?? "", "100-continue") {
+        io.write_str(io.reader_stream(r), "HTTP/1.1 100 Continue\r\n\r\n")?
+    }
+    if chunked(req.headers) {
+        req.body = read_chunked(r)?
+        return req
+    }
+    let n = content_length(req.headers)?
+    if n > 0 {
+        req.body = io.read_exact(r, n)?
+    }
+    req
+}
+
+pub fn read_request(r: *io.Reader) -> Request ! io.Error {
+    var line = io.read_line(r)?
+    for line.len == 0 {
+        line = io.read_line(r)?
+    }
+    read_request_rest(r, line)
+}
+
+fn keep_alive(line: str, headers: []Header) -> bool {
+    let connection = header(headers, "connection") ?? ""
+    if text.ends_with(line, "HTTP/1.0") {
+        return text.has_token(connection, "keep-alive")
+    }
+    !text.has_token(connection, "close")
+}
+
+fn write_head(mut out: []u8, headers: []Header) ! io.Error {
+    for h in headers {
+        if !valid_name(h.name) || !valid_value(h.value) {
+            fail Invalid
+        }
+        text.append(mut out, h.name)
+        text.append(mut out, ": ")
+        text.append(mut out, h.value)
+        text.append(mut out, "\r\n")
+    }
+}
+
+pub fn write_response(s: io.Stream, method: str, resp: Response, closing: bool) ! io.Error {
+    var out: []u8 = []
+    text.append(mut out, "HTTP/1.1 {resp.status} {status_text(resp.status)}\r\n")
+    write_head(mut out, resp.headers)?
+    let empty = bodiless(method, resp.status)
+    if !has_header(resp.headers, "content-length") && !(resp.status < 200 || resp.status == 204) {
+        text.append(mut out, "content-length: {resp.body.len}\r\n")
+    }
+    if closing && resp.status != 101 {
+        text.append(mut out, "connection: close\r\n")
+    }
+    text.append(mut out, "\r\n")
+    if !empty {
+        io.append(mut out, resp.body)
+    }
+    io.write_all(s, out)?
+}
+
+pub fn write_request(s: io.Stream, req: Request) ! io.Error {
+    var out: []u8 = []
+    text.append(mut out, "{req.method} {req.target} HTTP/1.1\r\n")
+    if !has_header(req.headers, "host") {
+        text.append(mut out, "host: {req.authority}\r\n")
+    }
+    write_head(mut out, req.headers)?
+    if req.body.len > 0 || req.method == "POST" || req.method == "PUT" || req.method == "PATCH" {
+        if !has_header(req.headers, "content-length") {
+            text.append(mut out, "content-length: {req.body.len}\r\n")
+        }
+    }
+    text.append(mut out, "\r\n")
+    io.append(mut out, req.body)
+    io.write_all(s, out)?
+}
+
+fn parse_status_line(line: str) -> i64 ! io.Error {
+    if !text.starts_with(line, "HTTP/1.") || line.len < 12 || line[8] != ' ' {
+        fail Malformed
+    }
+    text.parse_uint(line[9..12], 10) catch {
+        _ => fail Malformed
+    }
+}
+
+pub fn read_response(r: *io.Reader, method: str) -> Response ! io.Error {
+    for {
+        let line = io.read_line(r)?
+        let status = parse_status_line(line)?
+        let headers = read_headers(r)?
+        if status >= 100 && status < 200 && status != 101 {
+            continue
+        }
+        var resp = Response { status, headers, body: [] }
+        if bodiless(method, status) {
+            return resp
+        }
+        if chunked(headers) {
+            resp.body = read_chunked(r)?
+            return resp
+        }
+        let n = content_length(headers)?
+        resp.body = if n >= 0 { io.read_exact(r, n)? } else { read_until_close(r)? }
+        return resp
+    }
+}

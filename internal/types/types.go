@@ -72,6 +72,7 @@ var (
 	Never = &Type{Kind: NeverKind, Name: "never"}
 	I64   = &Type{Kind: IntKind, Name: "i64", Bits: 64, Signed: true, size: 1}
 	I32   = &Type{Kind: IntKind, Name: "i32", Bits: 32, Signed: true, size: 1}
+	U64   = &Type{Kind: IntKind, Name: "u64", Bits: 64, size: 1}
 	U32   = &Type{Kind: IntKind, Name: "u32", Bits: 32, size: 1}
 	U16   = &Type{Kind: IntKind, Name: "u16", Bits: 16, size: 1}
 	U8    = &Type{Kind: IntKind, Name: "u8", Bits: 8, size: 1}
@@ -81,7 +82,7 @@ var (
 	Str   = &Type{Kind: StrKind, Name: "str", size: 2}
 )
 
-var Numeric = []*Type{I64, I32, U32, U16, U8, F64, F32}
+var Numeric = []*Type{I64, I32, U64, U32, U16, U8, F64, F32}
 
 func (t *Type) HasPointers() bool {
 	for _, p := range t.PointerWords() {
@@ -297,7 +298,7 @@ func (t *Type) Stride() int {
 }
 
 func NewResult(ok, err *Type) *Type {
-	return &Type{Kind: ResultKind, Ok: ok, Err: err, size: 1 + max(ok.Size(), err.Size())}
+	return &Type{Kind: ResultKind, Ok: ok, Err: err, size: -1}
 }
 
 func (t *Type) String() string {
@@ -345,6 +346,9 @@ func (e *CycleError) Error() string {
 }
 
 func (t *Type) Layout() error {
+	if t.Kind == ResultKind {
+		return t.resultLayout()
+	}
 	if (t.Kind != EnumKind && t.Kind != StructKind) || t.size > 0 {
 		return nil
 	}
@@ -367,6 +371,19 @@ func (t *Type) Layout() error {
 		payload = max(payload, words)
 	}
 	t.size = 1 + payload
+	return nil
+}
+
+func (t *Type) resultLayout() error {
+	if t.size > 0 {
+		return nil
+	}
+	for _, part := range []*Type{t.Ok, t.Err} {
+		if err := part.Layout(); err != nil {
+			return err
+		}
+	}
+	t.size = 1 + max(t.Ok.Size(), t.Err.Size())
 	return nil
 }
 

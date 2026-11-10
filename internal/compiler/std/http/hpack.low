@@ -1,0 +1,222 @@
+import std/io
+import std/text
+
+struct Hpack {
+    statics: []Header
+    table: []Header
+    size: i64
+    max: i64
+    limit: i64
+    codes: [i64: i64]
+}
+
+fn new_hpack(limit: i64) -> *Hpack {
+    var codes: [i64: i64] = [:]
+    let bits = huffman_codes()
+    let lengths = huffman_lengths()
+    for sym in 0..256 {
+        codes[i64(lengths[sym]) << 32 | bits[sym]] = sym
+    }
+    new(Hpack { statics: static_table(), table: [], size: 0, max: limit, limit, codes })
+}
+
+fn entry_size(h: Header) -> i64 {
+    32 + h.name.len + h.value.len
+}
+
+fn evict(t: *Hpack) {
+    for t.size > t.max && t.table.len > 0 {
+        t.size -= entry_size(t.table[t.table.len - 1])
+        t.table = t.table[..t.table.len - 1]
+    }
+}
+
+fn insert(t: *Hpack, h: Header) {
+    let size = entry_size(h)
+    if size > t.max {
+        t.table = []
+        t.size = 0
+        return
+    }
+    var table: []Header = [h]
+    for old in t.table {
+        push(mut table, old)
+    }
+    t.table = table
+    t.size += size
+    evict(t)
+}
+
+fn lookup(t: *Hpack, index: i64) -> Header ! io.Error {
+    if index >= 1 && index <= t.statics.len {
+        return t.statics[index - 1]
+    }
+    let k = index - t.statics.len - 1
+    if index < 1 || k >= t.table.len {
+        fail Malformed
+    }
+    t.table[k]
+}
+
+fn read_int(b: []u8, mut at: i64, prefix: i64) -> i64 ! io.Error {
+    if at >= b.len {
+        fail Malformed
+    }
+    let mask = (1 << prefix) - 1
+    var n = i64(b[at]) & mask
+    at += 1
+    if n < mask {
+        return n
+    }
+    var shift = 0
+    for {
+        if at >= b.len || shift > 56 {
+            fail Malformed
+        }
+        let c = i64(b[at])
+        at += 1
+        n += (c & 0x7F) << shift
+        shift += 7
+        if c & 0x80 == 0 {
+            return n
+        }
+    }
+}
+
+fn read_string(t: *Hpack, b: []u8, mut at: i64) -> str ! io.Error {
+    if at >= b.len {
+        fail Malformed
+    }
+    let huffman = b[at] & 0x80 != 0
+    let n = read_int(b, mut at, 7)?
+    if at + n > b.len {
+        fail Malformed
+    }
+    let raw = b[at..at + n]
+    at += n
+    if huffman {
+        return huffman_decode(t, raw)
+    }
+    str(raw)
+}
+
+fn huffman_decode(t: *Hpack, raw: []u8) -> str ! io.Error {
+    var out: []u8 = []
+    var code = 0
+    var length = 0
+    for byte in raw {
+        var bit = 7
+        for bit >= 0 {
+            code = code << 1 | i64(byte) >> bit & 1
+            length += 1
+            if length >= 5 {
+                let sym = t.codes[length << 32 | code] ?? -1
+                if sym >= 0 {
+                    push(mut out, u8(sym))
+                    code = 0
+                    length = 0
+                } else if length >= 30 {
+                    fail Malformed
+                }
+            }
+            bit -= 1
+        }
+    }
+    if length > 7 || code != (1 << length) - 1 {
+        fail Malformed
+    }
+    __str_view(out)
+}
+
+fn decode(t: *Hpack, block: []u8) -> []Header ! io.Error {
+    var fields: []Header = []
+    var at = 0
+    var size = 0
+    for at < block.len {
+        let c = block[at]
+        if c & 0x80 != 0 {
+            push(mut fields, lookup(t, read_int(block, mut at, 7)?)?)
+        } else if c & 0xE0 == 0x20 {
+            if fields.len > 0 {
+                fail Malformed
+            }
+            let max = read_int(block, mut at, 5)?
+            if max > t.limit {
+                fail Malformed
+            }
+            t.max = max
+            evict(t)
+            continue
+        } else {
+            let indexed = c & 0xC0 == 0x40
+            let prefix = if indexed { 6 } else { 4 }
+            let index = read_int(block, mut at, prefix)?
+            var name = ""
+            if index > 0 {
+                name = lookup(t, index)?.name
+            } else {
+                name = read_string(t, block, mut at)?
+            }
+            let h = Header { name, value: read_string(t, block, mut at)? }
+            if indexed {
+                insert(t, h)
+            }
+            push(mut fields, h)
+        }
+        size += entry_size(fields[fields.len - 1])
+        if size > 1 << 20 {
+            fail TooLarge
+        }
+    }
+    fields
+}
+
+fn encode_int(mut out: []u8, first: u8, prefix: i64, n: i64) {
+    let mask = (1 << prefix) - 1
+    if n < mask {
+        push(mut out, first | u8(n))
+        return
+    }
+    push(mut out, first | u8(mask))
+    var rest = n - mask
+    for rest >= 0x80 {
+        push(mut out, u8(rest & 0x7F | 0x80))
+        rest = rest >> 7
+    }
+    push(mut out, u8(rest))
+}
+
+fn encode_string(mut out: []u8, s: str) {
+    encode_int(mut out, 0, 7, s.len)
+    text.append(mut out, s)
+}
+
+fn encode(statics: []Header, fields: []Header) -> []u8 {
+    var out: []u8 = []
+    for f in fields {
+        let name = text.lower(f.name)
+        var name_index = 0
+        var full_index = 0
+        for i, s in statics {
+            if s.name == name {
+                if name_index == 0 {
+                    name_index = i + 1
+                }
+                if s.value == f.value {
+                    full_index = i + 1
+                    break
+                }
+            }
+        }
+        if full_index > 0 {
+            encode_int(mut out, 0x80, 7, full_index)
+            continue
+        }
+        encode_int(mut out, 0, 4, name_index)
+        if name_index == 0 {
+            encode_string(mut out, name)
+        }
+        encode_string(mut out, f.value)
+    }
+    out
+}

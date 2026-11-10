@@ -47,6 +47,7 @@ const (
 	OpRuntime
 	OpResult
 	OpFuncAddr
+	OpMulHigh
 )
 
 const (
@@ -62,7 +63,7 @@ var opNames = [...]string{
 	OpConvert: "convert", OpSqrt: "sqrt", OpFloor: "floor",
 	OpEq: "eq", OpNe: "ne", OpLt: "lt", OpLe: "le", OpGt: "gt", OpGe: "ge",
 	OpLoad: "load", OpStore: "store", OpCheck: "check", OpSlot: "slot", OpCall: "call", OpCCall: "ccall", OpRuntime: "runtime", OpResult: "result",
-	OpFuncAddr: "funcaddr",
+	OpFuncAddr: "funcaddr", OpMulHigh: "mulhigh",
 }
 
 func (o Op) String() string {

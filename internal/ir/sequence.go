@@ -99,6 +99,8 @@ func (b *builder) appendValue(buf *Value, part ast.Expr) {
 		b.callNamed("__append_f64", buf, words[0])
 	case t == types.F32:
 		b.callNamed("__append_f32", buf, words[0])
+	case t == types.U64:
+		b.callNamed("__append_u64", buf, words[0])
 	default:
 		b.callNamed("__append_i64", buf, words[0])
 	}
@@ -179,6 +181,17 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 
 	case "__str_view":
 		return b.value(arg, arg.TypeOf())[:2]
+	case "__syscall":
+		return []*Value{b.syscall(e.Args)}
+	case "__mulhi":
+		return []*Value{b.typed(OpMulHigh, types.U64, b.word(arg), b.word(e.Args[1]))}
+	case "__make":
+		return b.make(e.Type.Elem, b.word(arg))
+	case "__memmove":
+		return []*Value{b.copySlice(e)}
+	case "print_u64":
+		b.runtimeVoid("print_str", b.callNamed("__format_u64", b.word(arg))...)
+		return nil
 	case "print_str":
 		b.runtimeVoid("print_str", b.value(arg, types.Str)...)
 		return nil
@@ -192,6 +205,32 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 	}
 	b.runtimeVoid(e.Builtin, b.word(arg))
 	return nil
+}
+
+func (b *builder) make(elem *types.Type, n *Value) []*Value {
+	zero := b.constant(0)
+	bytes := b.emit(OpMul, n, b.constant(int64(elem.Stride())))
+	return []*Value{b.runtime("grow", zero, zero, bytes, b.scan(elem)), n, n}
+}
+
+func (b *builder) copySlice(e *ast.Call) *Value {
+	t := e.Args[0].TypeOf()
+	dst := b.value(e.Args[0], t)
+	src := b.value(e.Args[1], t)
+	n := b.callNamed("__min", dst[1], src[1])[0]
+	stride := b.constant(int64(t.Elem.Stride()))
+	b.runtimeVoid("memmove", dst[0], src[0], b.emit(OpMul, n, stride))
+	return n
+}
+
+func (b *builder) syscall(args []ast.Expr) *Value {
+	words := make([]*Value, len(args))
+	for i, arg := range args {
+		words[i] = b.word(arg)
+	}
+	result := b.runtime("syscall", words...)
+	result.Scalar = true
+	return result
 }
 
 func (b *builder) push(e *ast.Call) {

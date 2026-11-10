@@ -180,6 +180,24 @@ rt_str_eq:
 1:
 	ret
 
+	.globl rt_memmove
+rt_memmove:
+	mov rcx, rdx
+	cmp rdi, rsi
+	jbe 1f
+	lea rax, [rsi+rdx]
+	cmp rdi, rax
+	jae 1f
+	lea rsi, [rsi+rdx-1]
+	lea rdi, [rdi+rdx-1]
+	std
+	rep movsb
+	cld
+	ret
+1:
+	rep movsb
+	ret
+
 	.globl rt_grow
 rt_grow:
 	ENTER_RT
