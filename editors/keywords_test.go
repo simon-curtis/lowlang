@@ -16,11 +16,9 @@ type grammarFile struct {
 }
 
 var keywordNodes = map[string]string{
-	"true":     "(boolean)",
-	"false":    "(boolean)",
-	"break":    "(break_statement)",
-	"continue": "(continue_statement)",
-	"pub":      "(visibility)",
+	"true":  "(boolean)",
+	"false": "(boolean)",
+	"pub":   "(visibility)",
 }
 
 var grammarFiles = []grammarFile{

@@ -149,6 +149,42 @@ func TestRenameFieldExpandsShorthand(t *testing.T) {
 	compiles(t, f.path, param)
 }
 
+func TestRenameBindingArm(t *testing.T) {
+	c := start(t)
+	src := `enum Oops {
+    Bad(i64)
+    Worse
+}
+
+fn risky(n: i64) -> i64 ! Oops {
+    if n > 2 {
+        fail Bad(n)
+    }
+    n
+}
+
+fn describe(e: Oops) -> i64 {
+    match e {
+        Bad(n) => n
+        Worse => 0
+    }
+}
+
+fn main() {
+    print(risky(5) catch {
+        problem => describe(problem)
+    })
+}
+`
+	f := scratch(t, "binding.low", src)
+	c.open(f, f.src)
+	edited := c.renamed(f, f.at(t, "problem =>", 0), "err")
+	if got := string(edited[f.path]); !strings.Contains(got, "err => describe(err)") {
+		t.Errorf("binding arm rename:\n%s", got)
+	}
+	compiles(t, f.path, edited)
+}
+
 func TestRenameAcrossModules(t *testing.T) {
 	c := start(t)
 	f := load(t, "modules", "main.low")

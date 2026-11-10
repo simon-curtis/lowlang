@@ -218,11 +218,18 @@ func (g *Generator) start(prog *ir.Program) {
 		g.text.WriteString("\t.globl main\nmain:\n")
 		g.emit("push rbp")
 		g.emit("xor ebp, ebp")
+		g.emit("mov [rip+rt_arg_count], rdi")
+		g.emit("mov [rip+rt_arg_values], rsi")
+		g.emit("mov [rip+rt_env_values], rdx")
 		g.emit("mov rdi, rdx")
 	default:
 		g.text.WriteString("\t.globl _start\n_start:\n")
 		g.emit("mov rax, [rsp]")
+		g.emit("mov [rip+rt_arg_count], rax")
+		g.emit("lea rcx, [rsp+8]")
+		g.emit("mov [rip+rt_arg_values], rcx")
 		g.emit("lea rdi, [rsp+8*rax+16]")
+		g.emit("mov [rip+rt_env_values], rdi")
 	}
 	g.emit("call rt_cpu_init")
 	g.emit("call rt_gc_init")

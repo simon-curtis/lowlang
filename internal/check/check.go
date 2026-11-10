@@ -1662,7 +1662,7 @@ var builtins = map[string]bool{
 	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
 	"delete": true, "embed": true, "__str_raw": true,
 	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
-	"__bits": true, "__str_view": true, "__extend": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true, "__ctz": true, "__clock_nanos": true,
+	"__bits": true, "__str_view": true, "__extend": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true, "__ctz": true, "__clock_nanos": true, "__argc": true, "__argv": true, "__envv": true,
 	"__spawn": true, "__current": true, "__park": true, "__ready": true, "__lock": true, "__unlock": true, "__cas": true, "__panic": true,
 	"__context": true, "__set_context": true, "__has_context": true,
 }
@@ -1962,6 +1962,15 @@ func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 		c.single(e, name)
 		c.expectType(e.Args[0], types.I64)
 		e.Builtin, e.Type = name, types.I64
+	case "__argc":
+		if len(e.Args) != 0 {
+			c.fail(e.Pos, "__argc takes no arguments")
+		}
+		e.Builtin, e.Type = name, types.I64
+	case "__argv", "__envv":
+		c.single(e, name)
+		c.expectType(e.Args[0], types.I64)
+		e.Builtin, e.Type = name, c.raw(types.U8)
 	case "__mulhi":
 		if len(e.Args) != 2 {
 			c.fail(e.Pos, "__mulhi takes 2 arguments, found %d", len(e.Args))

@@ -8,6 +8,7 @@ local result = vim.system({
   "cc", "-shared", "-fPIC", "-O2",
   "-I", source,
   vim.fs.joinpath(source, "parser.c"),
+  vim.fs.joinpath(source, "scanner.c"),
   "-o", output,
 }):wait()
 

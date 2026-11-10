@@ -144,6 +144,11 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 	if words, ok := b.concurrencyBuiltin(e); ok {
 		return words
 	}
+	if e.Builtin == "__argc" {
+		count := b.runtime("argc")
+		count.Scalar = true
+		return []*Value{count}
+	}
 	if e.Builtin == "__zero" {
 		zero := b.constant(0)
 		words := make([]*Value, e.Type.Size())
@@ -195,6 +200,10 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 		return []*Value{b.syscall(e.Args)}
 	case "__ctz":
 		return []*Value{b.typed(OpTrailingZeros, types.I64, b.word(arg))}
+	case "__argv", "__envv":
+		entry := b.runtime(e.Builtin[2:], b.word(arg))
+		entry.Scalar = true
+		return []*Value{entry}
 	case "__clock_nanos":
 		nanos := b.runtime("clock_nanos", b.word(arg))
 		nanos.Scalar = true

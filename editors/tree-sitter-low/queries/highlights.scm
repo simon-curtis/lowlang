@@ -101,9 +101,11 @@
 ] @keyword.repeat
 
 [
-  (break_statement)
-  (continue_statement)
+  "break"
+  "continue"
 ] @keyword.repeat
+
+(label_identifier) @label
 
 "return" @keyword.return
 

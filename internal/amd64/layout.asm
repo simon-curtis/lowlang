@@ -20,6 +20,12 @@
 	.set M_OSDEALLOC, 120
 	.set M_RUNNEXT, 128
 	.set M_SPINNING, 136
+	.set M_ALLOC_CUR, 144
+	.set M_ALLOC_END, 152
+	.set M_ALLOC_LO, 160
+	.set M_ALLOC_HI, 168
+	.set ALLOC_SMALL, 255
+	.set ALLOC_BUFFER, 4096
 	.set M_QUEUE, 256
 	.set M_TLS, 2304
 	.set M_TCB, 2328

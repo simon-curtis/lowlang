@@ -233,6 +233,9 @@ func (q *query) definition() (target, bool) {
 			return q.moduleTarget(path)
 		}
 	case *ast.Pattern:
+		if n.Local != nil {
+			return q.localTarget(n.Local)
+		}
 		return q.variantTarget(q.occ.parent, n.Name)
 	case *ast.Binding:
 		return q.localTarget(n.Local)
@@ -284,6 +287,9 @@ func (q *query) hover() string {
 	case *ast.Import:
 		return fmt.Sprintf("import %s", n.Path)
 	case *ast.Pattern:
+		if n.Local != nil {
+			return q.localText(n.Local)
+		}
 		if n.Variant != nil {
 			return variantText(q.occ.parent, n.Variant)
 		}

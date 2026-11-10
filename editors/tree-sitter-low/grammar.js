@@ -1,4 +1,5 @@
 const PREC = {
+  pipe: 0,
   or: 1,
   and: 2,
   compare: 3,
@@ -24,11 +25,15 @@ module.exports = grammar({
 
   extras: $ => [$.comment, /\s/],
 
+  externals: $ => [$._newline],
+
   conflicts: $ => [
     [$._expression, $._type_name],
     [$._expression, $.scoped_type_identifier],
     [$.struct_literal],
     [$.call_expression],
+    [$._type_name, $.closure_parameter],
+    [$.function_type_parameters, $.closure_parameters],
   ],
 
   supertypes: $ => [$._expression, $._statement, $._type, $._declaration],
@@ -38,8 +43,6 @@ module.exports = grammar({
       repeat($.import_declaration),
       repeat($._declaration),
     ),
-
-    _newline: _ => '\n',
 
     comment: _ => token(seq('//', /[^\n]*/)),
 
@@ -110,6 +113,7 @@ module.exports = grammar({
       field('name', $.identifier),
       field('parameters', $.extern_parameters),
       optional(seq('->', field('result', $._type))),
+      optional(seq('=', field('symbol', $.string))),
     ),
 
     extern_parameters: $ => seq('(', commaSep(choice($.parameter, $.variadic)), ')'),
@@ -212,10 +216,6 @@ module.exports = grammar({
       $.send_statement,
       $.for_statement,
       $.for_in_statement,
-      $.break_statement,
-      $.continue_statement,
-      $.return_statement,
-      $.fail_statement,
       $.defer_statement,
       $.spawn_statement,
       $.expression_statement,
@@ -252,13 +252,17 @@ module.exports = grammar({
       field('value', $._expression),
     ),
 
+    label: $ => seq(field('name', alias($.identifier, $.label_identifier)), ':'),
+
     for_statement: $ => seq(
+      optional($.label),
       'for',
       optional(field('condition', $._expression)),
       field('body', $.block),
     ),
 
     for_in_statement: $ => seq(
+      optional($.label),
       'for',
       optional(seq(field('key', $.identifier), ',')),
       field('value', $.identifier),
@@ -268,13 +272,13 @@ module.exports = grammar({
       field('body', $.block),
     ),
 
-    break_statement: _ => 'break',
+    break_expression: $ => prec.right(seq('break', optional(field('label', alias($.identifier, $.label_identifier))))),
 
-    continue_statement: _ => 'continue',
+    continue_expression: $ => prec.right(seq('continue', optional(field('label', alias($.identifier, $.label_identifier))))),
 
-    return_statement: $ => prec.right(seq('return', optional(field('value', $._expression)))),
+    return_expression: $ => prec.right(seq('return', optional(field('value', $._expression)))),
 
-    fail_statement: $ => seq('fail', field('value', $._expression)),
+    fail_expression: $ => prec.right(seq('fail', field('value', $._expression))),
 
     defer_statement: $ => seq('defer', field('body', $._statement)),
 
@@ -303,6 +307,10 @@ module.exports = grammar({
       $.if_expression,
       $.match_expression,
       $.select_expression,
+      $.break_expression,
+      $.continue_expression,
+      $.return_expression,
+      $.fail_expression,
       $.block,
     ),
 
@@ -357,6 +365,7 @@ module.exports = grammar({
 
     binary_expression: $ => {
       const table = [
+        [PREC.pipe, '|>'],
         [PREC.or, '||'],
         [PREC.and, '&&'],
         [PREC.compare, choice('==', '!=', '<', '<=', '>', '>=')],
@@ -378,6 +387,7 @@ module.exports = grammar({
 
     call_expression: $ => prec(PREC.postfix, seq(
       field('function', $._expression),
+      optional(field('type_arguments', prec.dynamic(1, $.type_arguments))),
       field('arguments', $.arguments),
       optional(field('children', prec.dynamic(-1, $.children))),
     )),
@@ -471,7 +481,7 @@ module.exports = grammar({
     match_arm: $ => seq(
       field('pattern', choice($.pattern, $.test_pattern)),
       '=>',
-      field('value', $._arm_body),
+      field('value', $._expression),
     ),
 
     test_pattern: $ => {
@@ -498,14 +508,6 @@ module.exports = grammar({
       return choice(...opening, ...extended, ...joined);
     },
 
-    _arm_body: $ => choice(
-      $._expression,
-      $.break_statement,
-      $.continue_statement,
-      $.return_statement,
-      $.fail_statement,
-    ),
-
     pattern: $ => prec(1, seq(
       field('variant', $.identifier),
       optional(seq('(', commaSep(field('binding', $.identifier)), ')')),
@@ -521,7 +523,7 @@ module.exports = grammar({
         seq(field('channel', $._expression), '<-', field('value', $._expression)),
       ),
       '=>',
-      field('body', $._arm_body),
+      field('body', $._expression),
     ),
   },
 });
