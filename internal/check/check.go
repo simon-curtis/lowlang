@@ -79,7 +79,7 @@ func (c *Checker) result(ok, err *types.Type) *types.Type {
 }
 
 func (c *Checker) file(file *ast.File) {
-	c.declareEnums(file.Enums)
+	c.declareTypes(file)
 	c.declareFuncs(file.Funcs)
 	c.checkMain()
 	for _, fn := range file.Funcs {
@@ -87,24 +87,45 @@ func (c *Checker) file(file *ast.File) {
 	}
 }
 
-func (c *Checker) declareEnums(enums []*ast.EnumDecl) {
-	for _, d := range enums {
-		if _, dup := c.named[d.Name]; dup {
-			c.fail(d.Pos, "type %s already declared", d.Name)
-		}
+func (c *Checker) declareType(name string, pos lexer.Pos, t *types.Type) {
+	if _, dup := c.named[name]; dup {
+		c.fail(pos, "type %s already declared", name)
+	}
+	c.named[name] = t
+}
+
+func (c *Checker) declareTypes(file *ast.File) {
+	for _, d := range file.Enums {
 		if len(d.Variants) == 0 {
 			c.fail(d.Pos, "enum %s has no variants", d.Name)
 		}
 		d.Type = types.NewEnum(d.Name)
-		c.named[d.Name] = d.Type
+		c.declareType(d.Name, d.Pos, d.Type)
 	}
-	for _, d := range enums {
+	for _, d := range file.Structs {
+		if len(d.Fields) == 0 {
+			c.fail(d.Pos, "struct %s has no fields", d.Name)
+		}
+		d.Type = types.NewStruct(d.Name)
+		c.declareType(d.Name, d.Pos, d.Type)
+	}
+	for _, d := range file.Enums {
 		c.declareVariants(d)
 	}
-	for _, d := range enums {
-		if err := d.Type.Layout(); err != nil {
-			c.fail(d.Pos, "%s", err)
-		}
+	for _, d := range file.Structs {
+		c.declareFields(d)
+	}
+	for _, d := range file.Enums {
+		c.layout(d.Type, d.Pos)
+	}
+	for _, d := range file.Structs {
+		c.layout(d.Type, d.Pos)
+	}
+}
+
+func (c *Checker) layout(t *types.Type, pos lexer.Pos) {
+	if err := t.Layout(); err != nil {
+		c.fail(pos, "%s", err)
 	}
 }
 
@@ -121,6 +142,15 @@ func (c *Checker) declareVariants(d *ast.EnumDecl) {
 	}
 }
 
+func (c *Checker) declareFields(d *ast.StructDecl) {
+	for _, fd := range d.Fields {
+		if d.Type.Field(fd.Name) != nil {
+			c.fail(fd.Pos, "field %s already declared in %s", fd.Name, d.Name)
+		}
+		d.Type.Fields = append(d.Type.Fields, &types.Field{Name: fd.Name, Type: c.resolve(fd.TypeName)})
+	}
+}
+
 func (c *Checker) declareFuncs(funcs []*ast.Func) {
 	for _, fn := range funcs {
 		if _, dup := c.funcs[fn.Name]; dup {
@@ -129,12 +159,16 @@ func (c *Checker) declareFuncs(funcs []*ast.Func) {
 		if fn.Name == "print" {
 			c.fail(fn.Pos, "print is a builtin")
 		}
-		for _, p := range fn.Params {
-			fn.ParamTypes = append(fn.ParamTypes, c.resolve(p.TypeName))
-		}
-		fn.RetType = c.signatureResult(fn)
+		c.signature(fn)
 		c.funcs[fn.Name] = fn
 	}
+}
+
+func (c *Checker) signature(fn *ast.Func) {
+	for _, p := range fn.Params {
+		fn.ParamTypes = append(fn.ParamTypes, c.resolve(p.TypeName))
+	}
+	fn.RetType = c.signatureResult(fn)
 }
 
 func (c *Checker) signatureResult(fn *ast.Func) *types.Type {
@@ -170,9 +204,15 @@ func (c *Checker) function(fn *ast.Func) {
 		if _, dup := c.scopes[0][p.Name]; dup {
 			c.fail(p.Pos, "parameter %s already declared", p.Name)
 		}
-		t := fn.ParamTypes[i]
-		c.scopes[0][p.Name] = &ast.Local{Name: p.Name, Type: t, Offset: 16 + 8*fn.ParamWords}
-		fn.ParamWords += t.Size()
+		c.scopes[0][p.Name] = &ast.Local{
+			Name:    p.Name,
+			Type:    fn.ParamTypes[i],
+			Mutable: p.Mut,
+			Param:   true,
+			Ref:     p.Mut,
+			Offset:  16 + 8*fn.ParamWords,
+		}
+		fn.ParamWords += fn.ParamSize(i)
 	}
 	body := c.expr(fn.Body, c.okType())
 	if body.Kind == types.ResultKind && body != fn.RetType {
@@ -216,14 +256,21 @@ func (c *Checker) temp(t *types.Type) *ast.Local {
 	return l
 }
 
-func (c *Checker) lookup(name string, pos lexer.Pos) *ast.Local {
+func (c *Checker) find(name string) *ast.Local {
 	for i := len(c.scopes) - 1; i >= 0; i-- {
 		if l, ok := c.scopes[i][name]; ok {
 			return l
 		}
 	}
-	c.fail(pos, "undefined: %s", name)
 	return nil
+}
+
+func (c *Checker) lookup(name string, pos lexer.Pos) *ast.Local {
+	l := c.find(name)
+	if l == nil {
+		c.fail(pos, "undefined: %s", name)
+	}
+	return l
 }
 
 func (c *Checker) pushScope() {
@@ -297,18 +344,86 @@ func (c *Checker) let(s *ast.Let) {
 }
 
 func (c *Checker) assign(s *ast.Assign) {
-	l := c.lookup(s.Name, s.Pos)
-	if !l.Mutable {
-		c.fail(s.Pos, "cannot assign to %s, declared with let", s.Name)
+	root, offset, t, ok := c.place(s.Target)
+	if !ok {
+		c.fail(s.Target.Position(), "cannot assign to this expression")
 	}
-	t := c.plain(s.Value, l.Type)
-	if t != l.Type && t != types.Never {
-		c.fail(s.Value.Position(), "cannot assign %s to %s of type %s", t, s.Name, l.Type)
+	c.mutable(root, s.Pos, "assign to %s")
+	value := c.plain(s.Value, t)
+	if value != t && value != types.Never {
+		c.fail(s.Value.Position(), "cannot assign %s to a place of type %s", value, t)
 	}
-	if s.Op != lexer.Assign && l.Type != types.I64 {
-		c.fail(s.Pos, "operator %s requires i64, found %s", s.Op, l.Type)
+	if s.Op != lexer.Assign && t != types.I64 {
+		c.fail(s.Pos, "operator %s requires i64, found %s", s.Op, t)
 	}
-	s.Local = l
+	s.Root = root
+	s.Offset = offset
+}
+
+func (c *Checker) mutable(root *ast.Local, pos lexer.Pos, action string) {
+	switch {
+	case root.Param && !root.Ref:
+		c.fail(pos, "cannot %s; declare the parameter mut", fmt.Sprintf(action, root.Name))
+	case !root.Mutable:
+		c.fail(pos, "cannot %s, declared with let", fmt.Sprintf(action, root.Name))
+	}
+}
+
+func (c *Checker) place(e ast.Expr) (*ast.Local, int, *types.Type, bool) {
+	switch e := e.(type) {
+	case *ast.Ident:
+		e.Local = c.lookup(e.Name, e.Pos)
+		e.Type = e.Local.Type
+		return e.Local, 0, e.Type, true
+	case *ast.Selector:
+		if c.typeRef(e.X) != nil {
+			return nil, 0, nil, false
+		}
+		root, offset, t, ok := c.place(e.X)
+		if !ok {
+			return nil, 0, nil, false
+		}
+		e.Field = c.field(t, e.Name, e.Pos)
+		e.Type = e.Field.Type
+		return root, offset + 8*e.Field.Offset, e.Type, true
+	}
+	return nil, 0, nil, false
+}
+
+func (c *Checker) ref(r *ast.Ref, want *types.Type) {
+	root, offset, t, ok := c.place(r.X)
+	if !ok {
+		c.fail(r.Pos, "mut argument must be a variable or a field of one")
+	}
+	c.mutable(root, r.Pos, "pass %s as mut")
+	if t != want {
+		c.fail(r.Pos, "expected %s, found %s", want, t)
+	}
+	r.Root = root
+	r.Offset = offset
+	r.Type = t
+}
+
+func (c *Checker) exclusive(args []ast.Expr) {
+	var refs []*ast.Ref
+	for _, arg := range args {
+		r, ok := arg.(*ast.Ref)
+		if !ok {
+			continue
+		}
+		for _, other := range refs {
+			if overlaps(r, other) {
+				c.fail(r.Pos, "%s is already passed as mut in this call", r.Root.Name)
+			}
+		}
+		refs = append(refs, r)
+	}
+}
+
+func overlaps(a, b *ast.Ref) bool {
+	return a.Root == b.Root &&
+		a.Offset < b.Offset+8*b.Type.Size() &&
+		b.Offset < a.Offset+8*a.Type.Size()
 }
 
 func (c *Checker) forStmt(s *ast.For) bool {
@@ -382,10 +497,11 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 	case *ast.Ident:
 		c.ident(e, want)
 	case *ast.Selector:
-		enum := c.enumNamed(e.X)
-		e.Variant = c.variant(enum, e.Name, e.Pos)
-		c.unitVariant(e.Variant, e.Pos)
-		e.Type = enum
+		c.selector(e)
+	case *ast.StructLit:
+		c.structLit(e)
+	case *ast.Ref:
+		c.fail(e.Pos, "mut is only allowed as an argument to a mut parameter")
 	case *ast.Unary:
 		c.unary(e)
 	case *ast.Binary:
@@ -424,16 +540,74 @@ func (c *Checker) ident(e *ast.Ident, want *types.Type) {
 	e.Type = e.Local.Type
 }
 
-func (c *Checker) enumNamed(x ast.Expr) *types.Type {
+func (c *Checker) typeRef(x ast.Expr) *types.Type {
 	id, ok := x.(*ast.Ident)
-	if !ok {
-		c.fail(x.Position(), "expected an enum name")
+	if !ok || c.find(id.Name) != nil {
+		return nil
 	}
-	t, ok := c.named[id.Name]
-	if !ok || t.Kind != types.EnumKind {
-		c.fail(id.Pos, "%s is not an enum", id.Name)
+	t := c.named[id.Name]
+	if t == nil || (t.Kind != types.EnumKind && t.Kind != types.StructKind) {
+		return nil
 	}
 	return t
+}
+
+func (c *Checker) field(t *types.Type, name string, pos lexer.Pos) *types.Field {
+	if t.Kind != types.StructKind {
+		c.fail(pos, "%s has no field %s", t, name)
+	}
+	f := t.Field(name)
+	if f == nil {
+		c.fail(pos, "%s has no field %s", t, name)
+	}
+	return f
+}
+
+func (c *Checker) selector(e *ast.Selector) {
+	if t := c.typeRef(e.X); t != nil {
+		if t.Kind == types.StructKind {
+			c.fail(e.X.Position(), "%s is a type, not a value", t)
+		}
+		if t.Variant(e.Name) == nil {
+			c.fail(e.Pos, "%s has no variant %s", t, e.Name)
+		}
+		e.Variant = t.Variant(e.Name)
+		c.unitVariant(e.Variant, e.Pos)
+		e.Type = t
+		return
+	}
+	e.Field = c.field(c.plain(e.X, nil), e.Name, e.Pos)
+	e.Type = e.Field.Type
+}
+
+func (c *Checker) structLit(e *ast.StructLit) {
+	t := c.named[e.Name]
+	if t == nil || t.Kind != types.StructKind {
+		c.fail(e.Pos, "%s is not a struct", e.Name)
+	}
+	given := map[*types.Field]bool{}
+	for _, init := range e.Fields {
+		f := t.Field(init.Name)
+		if f == nil {
+			c.fail(init.Pos, "%s has no field %s", t, init.Name)
+		}
+		if given[f] {
+			c.fail(init.Pos, "field %s given twice", init.Name)
+		}
+		given[f] = true
+		init.Field = f
+		c.expectType(init.Value, f.Type)
+	}
+	var missing []string
+	for _, f := range t.Fields {
+		if !given[f] {
+			missing = append(missing, f.Name)
+		}
+	}
+	if len(missing) > 0 {
+		c.fail(e.Pos, "missing fields for %s: %s", t, strings.Join(missing, ", "))
+	}
+	e.Type = t
 }
 
 func (c *Checker) variant(enum *types.Type, name string, pos lexer.Pos) *types.Variant {
@@ -496,10 +670,13 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 			c.construct(e, want, v)
 			return
 		}
-		c.callFunc(e, fn)
+		target, ok := c.funcs[fn.Name]
+		if !ok {
+			c.fail(e.Pos, "undefined function: %s", fn.Name)
+		}
+		c.callFunc(e, target)
 	case *ast.Selector:
-		enum := c.enumNamed(fn.X)
-		c.construct(e, enum, c.variant(enum, fn.Name, fn.Pos))
+		c.variantCall(e, fn)
 	default:
 		c.fail(e.Pos, "cannot call this expression")
 	}
@@ -518,19 +695,37 @@ func (c *Checker) print(e *ast.Call) {
 	e.Type = types.Void
 }
 
-func (c *Checker) callFunc(e *ast.Call, name *ast.Ident) {
-	fn, ok := c.funcs[name.Name]
-	if !ok {
-		c.fail(e.Pos, "undefined function: %s", name.Name)
+func (c *Checker) variantCall(e *ast.Call, sel *ast.Selector) {
+	t := c.typeRef(sel.X)
+	if t == nil || t.Kind != types.EnumKind {
+		c.fail(e.Pos, "cannot call this expression")
 	}
+	c.construct(e, t, c.variant(t, sel.Name, sel.Pos))
+}
+
+func (c *Checker) callFunc(e *ast.Call, fn *ast.Func) {
 	if len(e.Args) != len(fn.Params) {
 		c.fail(e.Pos, "%s takes %d arguments, found %d", fn.Name, len(fn.Params), len(e.Args))
 	}
 	for i, arg := range e.Args {
-		c.expectType(arg, fn.ParamTypes[i])
+		c.argument(arg, fn, i)
 	}
+	c.exclusive(e.Args)
 	e.Target = fn
 	e.Type = fn.RetType
+}
+
+func (c *Checker) argument(arg ast.Expr, fn *ast.Func, i int) {
+	r, isRef := arg.(*ast.Ref)
+	param := fn.Params[i]
+	switch {
+	case param.Mut && isRef:
+		c.ref(r, fn.ParamTypes[i])
+	case param.Mut:
+		c.fail(arg.Position(), "parameter %s of %s is mut; write mut before the argument", param.Name, fn.Name)
+	default:
+		c.expectType(arg, fn.ParamTypes[i])
+	}
 }
 
 func (c *Checker) construct(e *ast.Call, enum *types.Type, v *types.Variant) {

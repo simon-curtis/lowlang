@@ -11,6 +11,7 @@ const (
 	BoolKind
 	StrKind
 	EnumKind
+	StructKind
 	ResultKind
 )
 
@@ -18,9 +19,16 @@ type Type struct {
 	Kind     Kind
 	Name     string
 	Variants []*Variant
+	Fields   []*Field
 	Ok       *Type
 	Err      *Type
 	size     int
+}
+
+type Field struct {
+	Name   string
+	Type   *Type
+	Offset int
 }
 
 type Variant struct {
@@ -40,6 +48,10 @@ var (
 
 func NewEnum(name string) *Type {
 	return &Type{Kind: EnumKind, Name: name, size: -1}
+}
+
+func NewStruct(name string) *Type {
+	return &Type{Kind: StructKind, Name: name, size: -1}
 }
 
 func NewResult(ok, err *Type) *Type {
@@ -71,6 +83,15 @@ func (t *Type) StackWords() int {
 	return 0
 }
 
+func (t *Type) Field(name string) *Field {
+	for _, f := range t.Fields {
+		if f.Name == name {
+			return f
+		}
+	}
+	return nil
+}
+
 func (t *Type) Variant(name string) *Variant {
 	for _, v := range t.Variants {
 		if v.Name == name {
@@ -81,21 +102,24 @@ func (t *Type) Variant(name string) *Variant {
 }
 
 type CycleError struct {
-	Enum *Type
+	Type *Type
 }
 
 func (e *CycleError) Error() string {
-	return fmt.Sprintf("enum %s contains itself and has infinite size", e.Enum.Name)
+	return fmt.Sprintf("%s contains itself and has infinite size", e.Type.Name)
 }
 
 func (t *Type) Layout() error {
-	if t.Kind != EnumKind || t.size > 0 {
+	if (t.Kind != EnumKind && t.Kind != StructKind) || t.size > 0 {
 		return nil
 	}
 	if t.size == 0 {
-		return &CycleError{Enum: t}
+		return &CycleError{Type: t}
 	}
 	t.size = 0
+	if t.Kind == StructKind {
+		return t.structLayout()
+	}
 	payload := 0
 	for _, v := range t.Variants {
 		words, err := v.layout()
@@ -105,6 +129,19 @@ func (t *Type) Layout() error {
 		payload = max(payload, words)
 	}
 	t.size = 1 + payload
+	return nil
+}
+
+func (t *Type) structLayout() error {
+	words := 0
+	for _, f := range t.Fields {
+		if err := f.Type.Layout(); err != nil {
+			return err
+		}
+		f.Offset = words
+		words += f.Type.Size()
+	}
+	t.size = words
 	return nil
 }
 

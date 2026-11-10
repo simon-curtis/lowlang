@@ -22,8 +22,9 @@ type bailout struct {
 }
 
 type Parser struct {
-	tokens []lexer.Token
-	i      int
+	tokens   []lexer.Token
+	i        int
+	noStruct bool
 }
 
 func Parse(tokens []lexer.Token) (file *ast.File, err error) {
@@ -44,6 +45,10 @@ func Parse(tokens []lexer.Token) (file *ast.File, err error) {
 
 func (p *Parser) tok() lexer.Token {
 	return p.tokens[p.i]
+}
+
+func (p *Parser) peek() lexer.Kind {
+	return p.tokens[min(p.i+1, len(p.tokens)-1)].Kind
 }
 
 func (p *Parser) at(k lexer.Kind) bool {
@@ -86,6 +91,50 @@ func (p *Parser) skipNewlines() {
 	}
 }
 
+func (p *Parser) nested(parse func()) {
+	saved := p.noStruct
+	p.noStruct = false
+	parse()
+	p.noStruct = saved
+}
+
+func (p *Parser) condition() ast.Expr {
+	saved := p.noStruct
+	p.noStruct = true
+	x := p.expr()
+	p.noStruct = saved
+	return x
+}
+
+func (p *Parser) list(item func()) {
+	p.expect(lexer.LParen)
+	p.nested(func() {
+		for !p.at(lexer.RParen) {
+			item()
+			if !p.at(lexer.RParen) {
+				p.expect(lexer.Comma)
+			}
+		}
+	})
+	p.expect(lexer.RParen)
+}
+
+func (p *Parser) lines(item func()) {
+	p.expect(lexer.LBrace)
+	p.nested(func() {
+		p.skipNewlines()
+		for !p.at(lexer.RBrace) {
+			item()
+			if p.at(lexer.RBrace) {
+				break
+			}
+			p.expect(lexer.Newline)
+			p.skipNewlines()
+		}
+	})
+	p.expect(lexer.RBrace)
+}
+
 func (p *Parser) file() *ast.File {
 	f := &ast.File{}
 	p.skipNewlines()
@@ -95,39 +144,20 @@ func (p *Parser) file() *ast.File {
 			f.Funcs = append(f.Funcs, p.fn())
 		case lexer.Enum:
 			f.Enums = append(f.Enums, p.enum())
+		case lexer.Struct:
+			f.Structs = append(f.Structs, p.structDecl())
 		default:
-			p.fail(t.Pos, "expected fn or enum, found %s", describe(t))
+			p.fail(t.Pos, "expected fn, enum or struct, found %s", describe(t))
 		}
 		p.skipNewlines()
 	}
 	return f
 }
 
-func (p *Parser) list(item func()) {
-	p.expect(lexer.LParen)
-	for !p.at(lexer.RParen) {
-		item()
-		if !p.at(lexer.RParen) {
-			p.expect(lexer.Comma)
-		}
-	}
-	p.expect(lexer.RParen)
-}
-
 func (p *Parser) enum() *ast.EnumDecl {
 	pos := p.expect(lexer.Enum).Pos
 	d := &ast.EnumDecl{Name: p.expect(lexer.Ident).Text, Pos: pos}
-	p.expect(lexer.LBrace)
-	p.skipNewlines()
-	for !p.at(lexer.RBrace) {
-		d.Variants = append(d.Variants, p.variant())
-		if p.at(lexer.RBrace) {
-			break
-		}
-		p.expect(lexer.Newline)
-		p.skipNewlines()
-	}
-	p.expect(lexer.RBrace)
+	p.lines(func() { d.Variants = append(d.Variants, p.variant()) })
 	return d
 }
 
@@ -138,13 +168,24 @@ func (p *Parser) variant() *ast.VariantDecl {
 		return v
 	}
 	p.list(func() {
-		if p.tokens[p.i+1].Kind == lexer.Colon {
+		if p.peek() == lexer.Colon {
 			p.next()
 			p.next()
 		}
 		v.Fields = append(v.Fields, p.typeName())
 	})
 	return v
+}
+
+func (p *Parser) structDecl() *ast.StructDecl {
+	pos := p.expect(lexer.Struct).Pos
+	d := &ast.StructDecl{Name: p.expect(lexer.Ident).Text, Pos: pos}
+	p.lines(func() {
+		name := p.expect(lexer.Ident)
+		p.expect(lexer.Colon)
+		d.Fields = append(d.Fields, &ast.FieldDecl{Name: name.Text, TypeName: p.typeName(), Pos: name.Pos})
+	})
+	return d
 }
 
 func (p *Parser) fn() *ast.Func {
@@ -164,9 +205,13 @@ func (p *Parser) fn() *ast.Func {
 }
 
 func (p *Parser) param() *ast.Param {
+	mut := p.at(lexer.Mut)
+	if mut {
+		p.next()
+	}
 	name := p.expect(lexer.Ident)
 	p.expect(lexer.Colon)
-	return &ast.Param{Name: name.Text, TypeName: p.typeName(), Pos: name.Pos}
+	return &ast.Param{Name: name.Text, Mut: mut, TypeName: p.typeName(), Pos: name.Pos}
 }
 
 func (p *Parser) typeName() *ast.TypeName {
@@ -175,17 +220,8 @@ func (p *Parser) typeName() *ast.TypeName {
 }
 
 func (p *Parser) block() *ast.Block {
-	b := &ast.Block{Pos: p.expect(lexer.LBrace).Pos}
-	p.skipNewlines()
-	for !p.at(lexer.RBrace) {
-		b.Stmts = append(b.Stmts, p.stmt())
-		if p.at(lexer.RBrace) {
-			break
-		}
-		p.expect(lexer.Newline)
-		p.skipNewlines()
-	}
-	p.expect(lexer.RBrace)
+	b := &ast.Block{Pos: p.tok().Pos}
+	p.lines(func() { b.Stmts = append(b.Stmts, p.stmt()) })
 	if n := len(b.Stmts); n > 0 {
 		if es, ok := b.Stmts[n-1].(*ast.ExprStmt); ok {
 			b.Tail = es.X
@@ -209,7 +245,7 @@ func (p *Parser) stmt() ast.Stmt {
 		p.next()
 		var cond ast.Expr
 		if !p.at(lexer.LBrace) {
-			cond = p.expr()
+			cond = p.condition()
 		}
 		return &ast.For{Cond: cond, Body: p.block(), Pos: t.Pos}
 	case lexer.Break:
@@ -228,14 +264,13 @@ func (p *Parser) stmt() ast.Stmt {
 	case lexer.Fail:
 		p.next()
 		return &ast.Fail{Value: p.expr(), Pos: t.Pos}
-	case lexer.Ident:
-		if op := p.tokens[p.i+1].Kind; assignOps[op] {
-			p.next()
-			p.next()
-			return &ast.Assign{Name: t.Text, Op: op, Value: p.expr(), Pos: t.Pos}
-		}
 	}
-	return &ast.ExprStmt{X: p.expr()}
+	x := p.expr()
+	if op := p.tok().Kind; assignOps[op] {
+		p.next()
+		return &ast.Assign{Target: x, Op: op, Value: p.expr(), Pos: t.Pos}
+	}
+	return &ast.ExprStmt{X: x}
 }
 
 func (p *Parser) let() *ast.Let {
@@ -303,10 +338,14 @@ func (p *Parser) primary() ast.Expr {
 		return &ast.BoolLit{Value: t.Kind == lexer.True, Pos: t.Pos}
 	case lexer.Ident:
 		p.next()
+		if p.at(lexer.LBrace) && !p.noStruct {
+			return p.structLit(t)
+		}
 		return &ast.Ident{Name: t.Text, Pos: t.Pos}
 	case lexer.LParen:
 		p.next()
-		x := p.expr()
+		var x ast.Expr
+		p.nested(func() { x = p.expr() })
 		p.expect(lexer.RParen)
 		return x
 	case lexer.If:
@@ -315,11 +354,42 @@ func (p *Parser) primary() ast.Expr {
 		return p.block()
 	case lexer.Match:
 		p.next()
-		x := p.expr()
+		x := p.condition()
 		return &ast.Match{X: x, Arms: p.arms(), Pos: t.Pos}
 	}
 	p.fail(t.Pos, "expected expression, found %s", describe(t))
 	return nil
+}
+
+func (p *Parser) structLit(name lexer.Token) *ast.StructLit {
+	lit := &ast.StructLit{Name: name.Text, Pos: name.Pos}
+	p.expect(lexer.LBrace)
+	p.nested(func() {
+		p.skipNewlines()
+		for !p.at(lexer.RBrace) {
+			lit.Fields = append(lit.Fields, p.fieldInit())
+			if p.at(lexer.Comma) {
+				p.next()
+			} else if !p.at(lexer.RBrace) {
+				p.expect(lexer.Newline)
+			}
+			p.skipNewlines()
+		}
+	})
+	p.expect(lexer.RBrace)
+	return lit
+}
+
+func (p *Parser) fieldInit() *ast.FieldInit {
+	name := p.expect(lexer.Ident)
+	init := &ast.FieldInit{Name: name.Text, Pos: name.Pos}
+	if !p.at(lexer.Colon) {
+		init.Value = &ast.Ident{Name: name.Text, Pos: name.Pos}
+		return init
+	}
+	p.next()
+	init.Value = p.expr()
+	return init
 }
 
 func (p *Parser) postfix(x ast.Expr) ast.Expr {
@@ -328,11 +398,12 @@ func (p *Parser) postfix(x ast.Expr) ast.Expr {
 		switch t.Kind {
 		case lexer.LParen:
 			call := &ast.Call{Fn: x, Pos: x.Position()}
-			p.list(func() { call.Args = append(call.Args, p.expr()) })
+			p.list(func() { call.Args = append(call.Args, p.arg()) })
 			x = call
 		case lexer.Dot:
 			p.next()
-			x = &ast.Selector{X: x, Name: p.expect(lexer.Ident).Text, Pos: x.Position()}
+			name := p.expect(lexer.Ident)
+			x = &ast.Selector{X: x, Name: name.Text, Pos: name.Pos}
 		case lexer.Question:
 			p.next()
 			x = &ast.Try{X: x, Pos: t.Pos}
@@ -343,6 +414,14 @@ func (p *Parser) postfix(x ast.Expr) ast.Expr {
 			return x
 		}
 	}
+}
+
+func (p *Parser) arg() ast.Expr {
+	if !p.at(lexer.Mut) {
+		return p.expr()
+	}
+	pos := p.next().Pos
+	return &ast.Ref{X: p.expr(), Pos: pos}
 }
 
 func (p *Parser) catch(x ast.Expr, pos lexer.Pos) *ast.Catch {
@@ -357,19 +436,11 @@ func (p *Parser) catch(x ast.Expr, pos lexer.Pos) *ast.Catch {
 
 func (p *Parser) arms() []*ast.Arm {
 	var arms []*ast.Arm
-	p.expect(lexer.LBrace)
-	p.skipNewlines()
-	for !p.at(lexer.RBrace) {
+	p.lines(func() {
 		pattern := p.pattern()
 		p.expect(lexer.FatArrow)
 		arms = append(arms, &ast.Arm{Pattern: pattern, Body: p.armBody()})
-		if p.at(lexer.RBrace) {
-			break
-		}
-		p.expect(lexer.Newline)
-		p.skipNewlines()
-	}
-	p.expect(lexer.RBrace)
+	})
 	return arms
 }
 
@@ -396,7 +467,7 @@ func (p *Parser) pattern() *ast.Pattern {
 
 func (p *Parser) ifExpr() *ast.If {
 	pos := p.expect(lexer.If).Pos
-	cond := p.expr()
+	cond := p.condition()
 	then := p.block()
 	n := &ast.If{Cond: cond, Then: then, Pos: pos}
 	if !p.at(lexer.Else) {

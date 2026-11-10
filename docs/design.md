@@ -8,7 +8,7 @@ LowLang compiles to static native binaries with no libc dependency, has a tracin
 - Runtime speed comparable to Go.
 - Exhaustive enums with payloads.
 - Errors as values, propagated with one character, impossible to ignore.
-- A small language: one way to loop, one way to declare, no inheritance.
+- A small language: one way to loop, one way to declare, data and functions with no methods or inheritance.
 
 ## Syntax
 
@@ -42,7 +42,7 @@ for n > 0 { n -= 1 }
 for { break }
 ```
 
-### Structs and methods
+### Structs
 
 ```low
 struct Point {
@@ -50,10 +50,48 @@ struct Point {
     y: f64
 }
 
-impl Point {
-    fn len(self) -> f64 { sqrt(self.x * self.x + self.y * self.y) }
+fn len(p: Point) -> f64 {
+    sqrt(p.x * p.x + p.y * p.y)
 }
+
+fn shift(mut p: Point, dx: f64) {
+    p.x += dx
+}
+
+var p = Point { x: 3.0, y: 4.0 }
+p.x += 1.0
+shift(mut p, 2.0)
+let x = 1.0
+let q = Point { x, y: 2.0 }
+print(len(p) + len(q))
 ```
+
+- Literals name every field, separated by commas or newlines; `x` alone means `x: x`.
+- Structs are values: assignment and argument passing copy them.
+- Fields are assigned through a `var` binding or a `mut` parameter, at any depth: `r.max.x = 1`. Other parameters are immutable.
+- A struct literal cannot appear directly in an `if`, `for` or `match` condition; wrap it in parentheses.
+- A struct cannot contain itself until heap allocation exists.
+- Fields are laid out in declaration order, one word per scalar, with no padding.
+
+### References
+
+```low
+fn swap(mut a: i64, mut b: i64) {
+    let t = a
+    a = b
+    b = t
+}
+
+var x = 1
+var y = 2
+swap(mut x, mut y)
+```
+
+- A `mut` parameter refers to the caller's variable; reads and writes go through to it. The call site writes `mut` before the argument.
+- A `mut` argument must be a `var` binding, a `mut` parameter, or a field of either.
+- One call cannot pass overlapping places as `mut`: `swap(mut p.x, mut p.x)` is rejected, while `swap(mut p.x, mut p.y)` is allowed. Two `mut` parameters therefore never alias.
+- References exist only as parameters. They cannot be stored, returned or bound with `let`, so they never outlive the variable they refer to.
+- A `mut` parameter occupies one word holding the address of the place.
 
 ### Enums
 
@@ -175,22 +213,22 @@ On fib(38) this runs at 1.5x Go's time, which the SSA IR and register allocator 
 
 ## Implemented
 
-- Types: `i64`, `bool`, `str`, enums with payloads, results `T ! E`.
+- Types: `i64`, `bool`, `str`, structs, enums with payloads, results `T ! E`.
 - `let`, `var`, assignment, `if`/`else`, `for cond`, `for` with `break`/`continue`, `return`.
 - Functions with parameters and return values, recursion.
 - Arithmetic, comparison and logical operators.
 - `match`, `fail`, `?`, `catch`.
+- `mut` parameters.
 - Builtins `print(i64)`, `print(str)`, `print(bool)`.
 - Target: linux/amd64.
 
 ## Roadmap
 
 1. SSA IR between check and codegen, with register allocation.
-2. Structs.
-3. Heap allocation and tracing GC, then recursive enums.
-4. Slices, strings with length, maps.
-5. Optionals.
-6. Generics.
-7. Green-thread scheduler, channels, `select`.
-8. Own assembler and linker replacing `as` and `ld`.
-9. Further targets: linux/arm64, darwin, windows.
+2. Heap allocation and tracing GC, with pointers for shared and recursive structs and enums.
+3. Slices, strings with length, maps.
+4. Optionals.
+5. Generics.
+6. Green-thread scheduler, channels, `select`.
+7. Own assembler and linker replacing `as` and `ld`.
+8. Further targets: linux/arm64, darwin, windows.

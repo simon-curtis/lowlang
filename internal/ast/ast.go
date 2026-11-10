@@ -6,8 +6,9 @@ import (
 )
 
 type File struct {
-	Enums []*EnumDecl
-	Funcs []*Func
+	Enums   []*EnumDecl
+	Structs []*StructDecl
+	Funcs   []*Func
 }
 
 type TypeName struct {
@@ -28,8 +29,22 @@ type VariantDecl struct {
 	Pos    lexer.Pos
 }
 
+type StructDecl struct {
+	Name   string
+	Fields []*FieldDecl
+	Pos    lexer.Pos
+	Type   *types.Type
+}
+
+type FieldDecl struct {
+	Name     string
+	TypeName *TypeName
+	Pos      lexer.Pos
+}
+
 type Param struct {
 	Name     string
+	Mut      bool
 	TypeName *TypeName
 	Pos      lexer.Pos
 }
@@ -48,10 +63,19 @@ type Func struct {
 	ParamWords int
 }
 
+func (f *Func) ParamSize(i int) int {
+	if f.Params[i].Mut {
+		return 1
+	}
+	return f.ParamTypes[i].Size()
+}
+
 type Local struct {
 	Name    string
 	Type    *types.Type
 	Mutable bool
+	Param   bool
+	Ref     bool
 	Offset  int
 }
 
@@ -95,11 +119,12 @@ type Let struct {
 }
 
 type Assign struct {
-	Name  string
-	Op    lexer.Kind
-	Value Expr
-	Pos   lexer.Pos
-	Local *Local
+	Target Expr
+	Op     lexer.Kind
+	Value  Expr
+	Pos    lexer.Pos
+	Root   *Local
+	Offset int
 }
 
 type ExprStmt struct {
@@ -162,6 +187,29 @@ type Selector struct {
 	Name    string
 	Pos     lexer.Pos
 	Variant *types.Variant
+	Field   *types.Field
+}
+
+type Ref struct {
+	Typed
+	X      Expr
+	Pos    lexer.Pos
+	Root   *Local
+	Offset int
+}
+
+type StructLit struct {
+	Typed
+	Name   string
+	Fields []*FieldInit
+	Pos    lexer.Pos
+}
+
+type FieldInit struct {
+	Name  string
+	Value Expr
+	Pos   lexer.Pos
+	Field *types.Field
 }
 
 type Unary struct {
@@ -238,27 +286,29 @@ type Catch struct {
 	Temp     *Local
 }
 
-func (n *Block) Position() lexer.Pos    { return n.Pos }
-func (n *Let) Position() lexer.Pos      { return n.Pos }
-func (n *Assign) Position() lexer.Pos   { return n.Pos }
-func (n *ExprStmt) Position() lexer.Pos { return n.X.Position() }
-func (n *For) Position() lexer.Pos      { return n.Pos }
-func (n *Break) Position() lexer.Pos    { return n.Pos }
-func (n *Continue) Position() lexer.Pos { return n.Pos }
-func (n *Return) Position() lexer.Pos   { return n.Pos }
-func (n *Fail) Position() lexer.Pos     { return n.Pos }
-func (n *IntLit) Position() lexer.Pos   { return n.Pos }
-func (n *StrLit) Position() lexer.Pos   { return n.Pos }
-func (n *BoolLit) Position() lexer.Pos  { return n.Pos }
-func (n *Ident) Position() lexer.Pos    { return n.Pos }
-func (n *Selector) Position() lexer.Pos { return n.Pos }
-func (n *Unary) Position() lexer.Pos    { return n.Pos }
-func (n *Binary) Position() lexer.Pos   { return n.Pos }
-func (n *Call) Position() lexer.Pos     { return n.Pos }
-func (n *If) Position() lexer.Pos       { return n.Pos }
-func (n *Match) Position() lexer.Pos    { return n.Pos }
-func (n *Try) Position() lexer.Pos      { return n.Pos }
-func (n *Catch) Position() lexer.Pos    { return n.Pos }
+func (n *Block) Position() lexer.Pos     { return n.Pos }
+func (n *Let) Position() lexer.Pos       { return n.Pos }
+func (n *Assign) Position() lexer.Pos    { return n.Pos }
+func (n *ExprStmt) Position() lexer.Pos  { return n.X.Position() }
+func (n *For) Position() lexer.Pos       { return n.Pos }
+func (n *Break) Position() lexer.Pos     { return n.Pos }
+func (n *Continue) Position() lexer.Pos  { return n.Pos }
+func (n *Return) Position() lexer.Pos    { return n.Pos }
+func (n *Fail) Position() lexer.Pos      { return n.Pos }
+func (n *IntLit) Position() lexer.Pos    { return n.Pos }
+func (n *StrLit) Position() lexer.Pos    { return n.Pos }
+func (n *BoolLit) Position() lexer.Pos   { return n.Pos }
+func (n *Ident) Position() lexer.Pos     { return n.Pos }
+func (n *Selector) Position() lexer.Pos  { return n.Pos }
+func (n *StructLit) Position() lexer.Pos { return n.Pos }
+func (n *Ref) Position() lexer.Pos       { return n.Pos }
+func (n *Unary) Position() lexer.Pos     { return n.Pos }
+func (n *Binary) Position() lexer.Pos    { return n.Pos }
+func (n *Call) Position() lexer.Pos      { return n.Pos }
+func (n *If) Position() lexer.Pos        { return n.Pos }
+func (n *Match) Position() lexer.Pos     { return n.Pos }
+func (n *Try) Position() lexer.Pos       { return n.Pos }
+func (n *Catch) Position() lexer.Pos     { return n.Pos }
 
 func (*Let) stmt()      {}
 func (*Assign) stmt()   {}
@@ -269,16 +319,18 @@ func (*Continue) stmt() {}
 func (*Return) stmt()   {}
 func (*Fail) stmt()     {}
 
-func (*Block) expr()    {}
-func (*IntLit) expr()   {}
-func (*StrLit) expr()   {}
-func (*BoolLit) expr()  {}
-func (*Ident) expr()    {}
-func (*Selector) expr() {}
-func (*Unary) expr()    {}
-func (*Binary) expr()   {}
-func (*Call) expr()     {}
-func (*If) expr()       {}
-func (*Match) expr()    {}
-func (*Try) expr()      {}
-func (*Catch) expr()    {}
+func (*Block) expr()     {}
+func (*IntLit) expr()    {}
+func (*StrLit) expr()    {}
+func (*BoolLit) expr()   {}
+func (*Ident) expr()     {}
+func (*Selector) expr()  {}
+func (*StructLit) expr() {}
+func (*Ref) expr()       {}
+func (*Unary) expr()     {}
+func (*Binary) expr()    {}
+func (*Call) expr()      {}
+func (*If) expr()        {}
+func (*Match) expr()     {}
+func (*Try) expr()       {}
+func (*Catch) expr()     {}

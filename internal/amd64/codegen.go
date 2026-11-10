@@ -122,7 +122,7 @@ func (g *Generator) function(fn *ast.Func) {
 	g.ret = g.newLabel()
 	g.depth = 0
 	g.frame = (fn.FrameWords*8 + 15) &^ 15
-	g.label(fmt.Sprintf("fn_%s", fn.Name))
+	g.label(symbol(fn))
 	g.emit("push rbp")
 	g.emit("mov rbp, rsp")
 	if g.frame > 0 {
@@ -134,6 +134,10 @@ func (g *Generator) function(fn *ast.Func) {
 	g.emit("mov rsp, rbp")
 	g.emit("pop rbp")
 	g.emit("ret")
+}
+
+func symbol(fn *ast.Func) string {
+	return fmt.Sprintf("fn_%s", fn.Name)
 }
 
 func (g *Generator) retOffset() int {
@@ -199,24 +203,53 @@ func (g *Generator) unwind(depth int) {
 	}
 }
 
+type address func(word int) string
+
+func frame(offset int) address {
+	return func(word int) string { return mem(offset + 8*word) }
+}
+
+func (g *Generator) at(l *ast.Local, offset int) address {
+	if !l.Ref {
+		return frame(l.Offset + offset)
+	}
+	g.emit("mov rdx, %s", mem(l.Offset))
+	return func(word int) string { return fmt.Sprintf("qword ptr [rdx+%d]", offset+8*word) }
+}
+
+func (g *Generator) address(l *ast.Local, offset int) {
+	if !l.Ref {
+		g.emit("lea rax, [rbp%+d]", l.Offset+offset)
+		return
+	}
+	g.emit("mov rax, %s", mem(l.Offset))
+	if offset > 0 {
+		g.emit("add rax, %d", offset)
+	}
+}
+
 func (g *Generator) store(t *types.Type, offset int) {
+	g.storeTo(t, frame(offset))
+}
+
+func (g *Generator) storeTo(t *types.Type, at address) {
 	if t.Scalar() {
-		g.emit("mov %s, rax", mem(offset))
+		g.emit("mov %s, rax", at(0))
 		return
 	}
 	for k := range t.StackWords() {
 		g.pop("rax")
-		g.emit("mov %s, rax", mem(offset+8*k))
+		g.emit("mov %s, rax", at(k))
 	}
 }
 
-func (g *Generator) load(t *types.Type, offset int) {
+func (g *Generator) loadFrom(t *types.Type, at address) {
 	if t.Scalar() {
-		g.emit("mov rax, %s", mem(offset))
+		g.emit("mov rax, %s", at(0))
 		return
 	}
 	for k := t.Size() - 1; k >= 0; k-- {
-		g.push(mem(offset + 8*k))
+		g.push(at(k))
 	}
 }
 
@@ -285,10 +318,10 @@ func (g *Generator) assign(s *ast.Assign) {
 	g.expr(s.Value)
 	if op, ok := compoundOps[s.Op]; ok {
 		g.emit("mov rcx, rax")
-		g.emit("mov rax, %s", mem(s.Local.Offset))
+		g.emit("mov rax, %s", g.at(s.Root, s.Offset)(0))
 		g.arith(op)
 	}
-	g.store(s.Local.Type, s.Local.Offset)
+	g.storeTo(s.Target.TypeOf(), g.at(s.Root, s.Offset))
 }
 
 func (g *Generator) forStmt(s *ast.For) {
@@ -321,9 +354,11 @@ func (g *Generator) expr(e ast.Expr) {
 			g.construct(e.Type, e.Variant, nil)
 			return
 		}
-		g.load(e.Type, e.Local.Offset)
+		g.loadFrom(e.Type, g.at(e.Local, 0))
 	case *ast.Selector:
-		g.construct(e.Type, e.Variant, nil)
+		g.selector(e)
+	case *ast.StructLit:
+		g.structLit(e)
 	case *ast.Unary:
 		g.unary(e)
 	case *ast.Binary:
@@ -463,12 +498,16 @@ func (g *Generator) callFunc(e *ast.Call) {
 	fn := e.Target
 	offset := g.reserve(fn.RetType.StackWords() + fn.ParamWords)
 	for i, arg := range e.Args {
-		g.expr(arg)
-		param := fn.ParamTypes[i]
-		g.store(param, offset)
-		offset += 8 * param.Size()
+		if r, ok := arg.(*ast.Ref); ok {
+			g.address(r.Root, r.Offset)
+			g.emit("mov %s, rax", mem(offset))
+		} else {
+			g.expr(arg)
+			g.store(fn.ParamTypes[i], offset)
+		}
+		offset += 8 * fn.ParamSize(i)
 	}
-	g.emit("call fn_%s", fn.Name)
+	g.emit("call %s", symbol(fn))
 	g.release(fn.ParamWords)
 }
 
@@ -482,6 +521,66 @@ func (g *Generator) construct(enum *types.Type, v *types.Variant, args []ast.Exp
 	for i, arg := range args {
 		g.expr(arg)
 		g.store(v.Fields[i], base+8*v.Offsets[i])
+	}
+}
+
+func (g *Generator) selector(e *ast.Selector) {
+	if e.Variant != nil {
+		g.construct(e.Type, e.Variant, nil)
+		return
+	}
+	if root, offset, ok := place(e); ok {
+		g.loadFrom(e.Type, g.at(root, offset))
+		return
+	}
+	g.expr(e.X)
+	g.extract(e.X.TypeOf(), e.Field.Offset, e.Type)
+}
+
+func place(e ast.Expr) (*ast.Local, int, bool) {
+	switch e := e.(type) {
+	case *ast.Ident:
+		if e.Local != nil {
+			return e.Local, 0, true
+		}
+	case *ast.Selector:
+		if e.Field == nil {
+			return nil, 0, false
+		}
+		if root, offset, ok := place(e.X); ok {
+			return root, offset + 8*e.Field.Offset, true
+		}
+	}
+	return nil, 0, false
+}
+
+func (g *Generator) extract(whole *types.Type, offset int, part *types.Type) {
+	if whole.Scalar() {
+		return
+	}
+	n := whole.Size()
+	size := part.Size()
+	if part.Scalar() {
+		g.emit("mov rax, [rsp+%d]", 8*offset)
+		g.release(n)
+		return
+	}
+	for k := size - 1; k >= 0; k-- {
+		g.emit("mov rax, [rsp+%d]", 8*(offset+k))
+		g.emit("mov [rsp+%d], rax", 8*(n-size+k))
+	}
+	g.release(n - size)
+}
+
+func (g *Generator) structLit(e *ast.StructLit) {
+	if e.Type.Scalar() {
+		g.expr(e.Fields[0].Value)
+		return
+	}
+	base := g.reserve(e.Type.Size())
+	for _, init := range e.Fields {
+		g.expr(init.Value)
+		g.store(init.Field.Type, base+8*init.Field.Offset)
 	}
 }
 
@@ -555,25 +654,7 @@ func (g *Generator) try(e *ast.Try) {
 	g.emit("mov %s, 1", mem(g.retOffset()))
 	g.emit("jmp %s", g.ret)
 	g.label(ok)
-	g.extractOk(result)
-}
-
-func (g *Generator) extractOk(result *types.Type) {
-	n := result.Size()
-	ok := result.Ok
-	if !ok.Scalar() && ok.Size() > 0 {
-		t := ok.Size()
-		for k := t - 1; k >= 0; k-- {
-			g.emit("mov rax, [rsp+%d]", 8+8*k)
-			g.emit("mov [rsp+%d], rax", 8*(n-t)+8*k)
-		}
-		g.release(n - t)
-		return
-	}
-	if ok.Scalar() {
-		g.emit("mov rax, [rsp+8]")
-	}
-	g.release(n)
+	g.extract(result, 1, result.Ok)
 }
 
 func (g *Generator) catch(e *ast.Catch) {
@@ -584,7 +665,7 @@ func (g *Generator) catch(e *ast.Catch) {
 	depth := g.depth
 	g.emit("cmp qword ptr [rsp], 0")
 	g.emit("jne %s", failed)
-	g.extractOk(result)
+	g.extract(result, 1, result.Ok)
 	g.emit("jmp %s", done)
 	g.label(failed)
 	g.depth = depth

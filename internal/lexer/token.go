@@ -26,6 +26,8 @@ const (
 	Match
 	Fail
 	Catch
+	Struct
+	Mut
 
 	LParen
 	RParen
@@ -64,7 +66,7 @@ var names = map[Kind]string{
 	EOF: "end of file", Newline: "newline", Ident: "identifier", Int: "integer", String: "string",
 	Fn: "fn", Let: "let", Var: "var", If: "if", Else: "else", For: "for",
 	Break: "break", Continue: "continue", Return: "return", True: "true", False: "false",
-	Enum: "enum", Match: "match", Fail: "fail", Catch: "catch",
+	Enum: "enum", Match: "match", Fail: "fail", Catch: "catch", Struct: "struct", Mut: "mut",
 	LParen: "(", RParen: ")", LBrace: "{", RBrace: "}", Comma: ",", Colon: ":", Arrow: "->", FatArrow: "=>", Dot: ".", Question: "?",
 	Assign: "=", PlusAssign: "+=", MinusAssign: "-=", StarAssign: "*=", SlashAssign: "/=",
 	Plus: "+", Minus: "-", Star: "*", Slash: "/", Percent: "%", Not: "!",
@@ -81,7 +83,7 @@ func (k Kind) String() string {
 var keywords = map[string]Kind{
 	"fn": Fn, "let": Let, "var": Var, "if": If, "else": Else, "for": For,
 	"break": Break, "continue": Continue, "return": Return, "true": True, "false": False,
-	"enum": Enum, "match": Match, "fail": Fail, "catch": Catch,
+	"enum": Enum, "match": Match, "fail": Fail, "catch": Catch, "struct": Struct, "mut": Mut,
 }
 
 type Pos struct {
