@@ -6,20 +6,56 @@ import std/net
 import std/time
 
 struct ServerHello {
-    retry: bool
+    hello_version: i64
+    random: []u8
     session_id: []u8
+    code: i64
+    exts: []Extension
+}
+
+struct Hello13 {
+    retry: bool
     suite: Suite
     group: i64
     key: []u8
     cookie: []u8
 }
 
-fn client_hello(config: Config, random: []u8, session_id: []u8, shares: []Share, cookie: []u8) -> []u8 {
+struct Offer {
+    random: []u8
+    session_id: []u8
+    suites: []i64
+    groups: []i64
+}
+
+fn offered_suites(config: Config) -> []i64 {
+    var out: []i64 = []
+    for code in config.cipher_suites {
+        let usable = suite_of(code) != none && offers13(config) || suite12_of(code) != none && offers12(config)
+        if usable && !contains(out, code) {
+            push(mut out, code)
+        }
+    }
+    out
+}
+
+fn offered_groups(config: Config) -> []i64 {
+    var out: []i64 = []
+    for g in config.groups {
+        let usable = supported_group(g) && (offers13(config) || g != x25519_mlkem768())
+        if usable && !contains(out, g) {
+            push(mut out, g)
+        }
+    }
+    out
+}
+
+fn client_hello(config: Config, offer: Offer, shares: []Share, cookie: []u8) -> []u8 {
     var body: []u8 = []
     io.put_be16(mut body, 0x0303)
-    io.append(mut body, random)
-    put_vector8(mut body, session_id)
-    put_u16_list(mut body, [0x1301, 0x1303, 0x1302])
+    io.append(mut body, offer.random)
+    put_vector8(mut body, offer.session_id)
+    put_u16_list(mut body, offer.suites)
     put_vector8(mut body, [0])
     var exts: []u8 = []
     let literal_ip: []u8 = net.parse_ip(config.server_name) catch []
@@ -30,23 +66,31 @@ fn client_hello(config: Config, random: []u8, session_id: []u8, shares: []Share,
         put_vector16(mut list, name)
         put_extension(mut exts, 0, list)
     }
-    var versions: []u8 = []
-    put_vector8(mut versions, [3, 4])
-    put_extension(mut exts, 43, versions)
+    if offers13(config) {
+        var listed: []u8 = [3, 4]
+        if offers12(config) {
+            io.append(mut listed, [3, 3])
+        }
+        var versions: []u8 = []
+        put_vector8(mut versions, listed)
+        put_extension(mut exts, 43, versions)
+    }
     var groups: []u8 = []
-    put_u16_list(mut groups, config.groups)
+    put_u16_list(mut groups, offer.groups)
     put_extension(mut exts, 10, groups)
     var schemes: []u8 = []
     put_u16_list(mut schemes, signature_schemes())
     put_extension(mut exts, 13, schemes)
-    var entries: []u8 = []
-    for s in shares {
-        io.put_be16(mut entries, s.group)
-        put_vector16(mut entries, s.public)
+    if offers13(config) {
+        var entries: []u8 = []
+        for s in shares {
+            io.put_be16(mut entries, s.group)
+            put_vector16(mut entries, s.public)
+        }
+        var key_share: []u8 = []
+        put_vector16(mut key_share, entries)
+        put_extension(mut exts, 51, key_share)
     }
-    var key_share: []u8 = []
-    put_vector16(mut key_share, entries)
-    put_extension(mut exts, 51, key_share)
     if config.alpn.len > 0 {
         var names: []u8 = []
         for p in config.alpn {
@@ -55,6 +99,11 @@ fn client_hello(config: Config, random: []u8, session_id: []u8, shares: []Share,
         var alpn: []u8 = []
         put_vector16(mut alpn, names)
         put_extension(mut exts, 16, alpn)
+    }
+    if offers12(config) {
+        put_extension(mut exts, 11, [1, 0])
+        put_extension(mut exts, 23, [])
+        put_extension(mut exts, 0xFF01, [0])
     }
     if cookie.len > 0 {
         var body_cookie: []u8 = []
@@ -67,29 +116,57 @@ fn client_hello(config: Config, random: []u8, session_id: []u8, shares: []Share,
 
 fn parse_server_hello(body: []u8) -> ServerHello ! io.Error {
     let c = cursor(body)
-    u16_of(c)?
+    let hello_version = u16_of(c)?
     let random = take(c, 32)?
     let session_id = vector8(c)?
-    let suite = match suite_of(u16_of(c)?) {
-        some(found) => found
-        none => fail Unsupported
-    }
+    let code = u16_of(c)?
     if u8_of(c)? != 0 {
         fail Malformed
     }
-    let exts = extensions(c)?
+    var exts: []Extension = []
+    if left(c) > 0 {
+        exts = extensions(c)?
+    }
     end(c)?
-    let retry = hash.equal(random, retry_random())
-    let version = match find(exts, 43) {
-        some(found) => found
-        none => fail Unsupported
+    ServerHello { hello_version, random, session_id, code, exts }
+}
+
+fn downgrade_sentinel(last: u8) -> []u8 {
+    [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, last]
+}
+
+fn negotiate_version(c: *Channel, config: Config, hello: ServerHello) -> i64 ! io.Error {
+    match find(hello.exts, 43) {
+        some(selected) => {
+            if selected.len != 2 || io.be16(selected, 0) != 0x0304 || !offers13(config) || hello.hello_version != 0x0303 {
+                fail abort(c, 47, Unsupported)
+            }
+            return 0x0304
+        }
+        none => {}
     }
-    if version.len != 2 || io.be16(version, 0) != 0x0304 {
-        fail Unsupported
+    if hello.hello_version != 0x0303 || !offers12(config) {
+        fail abort(c, 70, Unsupported)
     }
-    let share = match find(exts, 51) {
+    let tail = hello.random[24..]
+    if offers13(config) && (hash.equal(tail, downgrade_sentinel(1)) || hash.equal(tail, downgrade_sentinel(0))) {
+        fail abort(c, 47, Invalid)
+    }
+    0x0303
+}
+
+fn hello13(c: *Channel, offer: Offer, hello: ServerHello) -> Hello13 ! io.Error {
+    let suite = match suite_of(hello.code) {
         some(found) => found
-        none => fail Malformed
+        none => fail abort(c, 47, Unsupported)
+    }
+    if !contains(offer.suites, hello.code) {
+        fail abort(c, 47, Unsupported)
+    }
+    let retry = hash.equal(hello.random, retry_random())
+    let share = match find(hello.exts, 51) {
+        some(found) => found
+        none => fail abort(c, 109, Malformed)
     }
     let sc = cursor(share)
     let group = u16_of(sc)?
@@ -99,27 +176,30 @@ fn parse_server_hello(body: []u8) -> ServerHello ! io.Error {
     }
     end(sc)?
     var cookie: []u8 = []
-    match find(exts, 44) {
+    match find(hello.exts, 44) {
         some(raw) => {
             let cc = cursor(raw)
             cookie = vector16(cc)?
         }
         none => {}
     }
-    ServerHello { retry, session_id, suite, group, key, cookie }
+    Hello13 { retry, suite, group, key, cookie }
 }
 
-fn negotiated_protocol(body: []u8) -> str ! io.Error {
-    let c = cursor(body)
-    let exts = extensions(c)?
-    end(c)?
+fn negotiated_protocol(c: *Channel, config: Config, exts: []Extension) -> str ! io.Error {
     match find(exts, 16) {
         some(raw) => {
             let ac = cursor(raw)
             let list = cursor(vector16(ac)?)
+            end(ac)?
             let name = str(vector8(list)?)
             end(list)?
-            name
+            for p in config.alpn {
+                if p == name {
+                    return name
+                }
+            }
+            fail abort(c, 47, Malformed)
         }
         none => ""
     }
@@ -145,60 +225,107 @@ fn verify_server(config: Config, chain: []x509.Certificate) ! io.Error {
     x509.verify_chain(chain[0], chain[1..], roots, config.server_name, time.now())?
 }
 
+fn checked_server(c: *Channel, config: Config, chain: []x509.Certificate) ! io.Error {
+    verify_server(config, chain) catch {
+        _ => fail abort(c, 42, Invalid)
+    }
+}
+
 pub fn client(s: io.Stream, config: Config) -> *Session ! io.Error {
+    let offer = Offer {
+        random: crypto.random(32)
+        session_id: crypto.random(32)
+        suites: offered_suites(config)
+        groups: offered_groups(config)
+    }
+    if !versions_valid(config) || offer.suites.len == 0 || offer.groups.len == 0 {
+        fail Invalid
+    }
     let c = channel(s)
     c.plaintext_version = 0x0301
-    var shares: []Share = [client_share(config.groups[0])?]
-    if config.groups[0] == x25519_mlkem768() && contains(config.groups, group_x25519()) {
-        push(mut shares, client_share(group_x25519())?)
+    var shares: []Share = []
+    if offers13(config) {
+        let first_group = offer.groups[0]
+        push(mut shares, client_share(first_group)?)
+        if first_group == x25519_mlkem768() && contains(offer.groups, group_x25519()) {
+            push(mut shares, client_share(group_x25519())?)
+        }
     }
-    let random = crypto.random(32)
-    let session_id = crypto.random(32)
-    let first = client_hello(config, random, session_id, shares, [])
-    var transcript: []u8 = []
-    io.append(mut transcript, first)
+    let first = client_hello(config, offer, shares, [])
     write_record(c, 22, first)?
     c.plaintext_version = 0x0303
-    var m = expect_message(c, 2)?
-    var hello = parse_server_hello(m.body)?
+    let m = expect_message(c, 2)?
+    let hello = parse_server_hello(m.body) catch {
+        _ => fail abort(c, 50, Malformed)
+    }
+    c.version = negotiate_version(c, config, hello)?
+    var transcript: []u8 = []
+    io.append(mut transcript, first)
+    if c.version == 0x0303 {
+        io.append(mut transcript, m.raw)
+        return client12(c, config, offer, transcript, hello)
+    }
+    client13(c, config, offer, shares, transcript, m, hello)
+}
+
+fn client13(c: *Channel, config: Config, offer: Offer, offered_shares: []Share, first: []u8, first_reply: Message, first_hello: ServerHello) -> *Session ! io.Error {
+    var shares = offered_shares
+    var transcript = first
+    var m = first_reply
+    var echoed = first_hello.session_id
+    var hello = hello13(c, offer, first_hello)?
     if hello.retry {
-        if !contains(config.groups, hello.group) || !supported_group(hello.group) {
-            fail Unsupported
+        if !contains(offer.groups, hello.group) {
+            fail abort(c, 47, Unsupported)
         }
         for s in shares {
             if s.group == hello.group {
-                fail Malformed
+                fail abort(c, 47, Malformed)
             }
         }
         transcript = message_hash(suite_hash(hello.suite), transcript)
         io.append(mut transcript, m.raw)
         shares = [client_share(hello.group)?]
-        let second = client_hello(config, random, session_id, shares, hello.cookie)
+        let second = client_hello(config, offer, shares, hello.cookie)
         io.append(mut transcript, second)
         write_record(c, 22, second)?
         m = expect_message(c, 2)?
-        hello = parse_server_hello(m.body)?
+        let again = parse_server_hello(m.body) catch {
+            _ => fail abort(c, 50, Malformed)
+        }
+        if negotiate_version(c, config, again)? != 0x0304 {
+            fail abort(c, 47, Malformed)
+        }
+        echoed = again.session_id
+        hello = hello13(c, offer, again)?
         if hello.retry {
-            fail Malformed
+            fail abort(c, 10, Malformed)
         }
     }
     io.append(mut transcript, m.raw)
-    if !hash.equal(hello.session_id, session_id) {
-        fail Malformed
+    if !hash.equal(echoed, offer.session_id) {
+        fail abort(c, 47, Malformed)
     }
     var secret: []u8 = []
     for s in shares {
         if s.group == hello.group {
-            secret = client_secret(s, hello.key)?
+            secret = client_secret(s, hello.key) catch {
+                _ => fail abort(c, 47, Invalid)
+            }
         }
     }
     if secret.len == 0 {
-        fail Malformed
+        fail abort(c, 47, Malformed)
     }
     let k = schedule(hello.suite, secret, transcript)
     c.read_key = protection(hello.suite, k.server_handshake)?
     let ee = expect_message(c, 8)?
-    let protocol = negotiated_protocol(ee.body)?
+    let ec = cursor(ee.body)
+    let ee_exts = extensions(ec) catch {
+        _ => fail abort(c, 50, Malformed)
+    }
+    end(ec)?
+    let protocol = negotiated_protocol(c, config, ee_exts)?
     io.append(mut transcript, ee.raw)
     var next = read_handshake(c)?
     var requested = false
@@ -210,30 +337,26 @@ pub fn client(s: io.Stream, config: Config) -> *Session ! io.Error {
         next = read_handshake(c)?
     }
     if next.kind != 11 {
-        fail Malformed
+        fail abort(c, 10, Malformed)
     }
-    let chain = parse_certificates(next.body)?
+    let chain = parse_certificates(next.body) catch {
+        _ => fail abort(c, 50, Malformed)
+    }
     io.append(mut transcript, next.raw)
-    verify_server(config, chain) catch {
-        _ => {
-            send_alert(c, 42)
-            fail Invalid
-        }
-    }
+    checked_server(c, config, chain)?
     let cv = expect_message(c, 15)?
     let vc = cursor(cv.body)
     let scheme = u16_of(vc)?
     let signature = vector16(vc)?
     end(vc)?
-    if !contains(signature_schemes(), scheme) || !x509.verify_signature(chain[0].public_key, scheme, verify_content(k.hash, transcript, true), signature) {
-        send_alert(c, 51)
-        fail Invalid
+    let content = verify_content(k.hash, transcript, true)
+    if !contains(signature_schemes(), scheme) || !x509.verify_signature(chain[0].public_key, scheme, content, signature) {
+        fail abort(c, 51, Invalid)
     }
     io.append(mut transcript, cv.raw)
     let fin = expect_message(c, 20)?
     if !hash.equal(fin.body, finished(k, k.server_handshake, transcript)) {
-        send_alert(c, 51)
-        fail Invalid
+        fail abort(c, 51, Invalid)
     }
     io.append(mut transcript, fin.raw)
     let client_app = derive_secret(k.hash, k.master, "c ap traffic", transcript)
@@ -249,7 +372,7 @@ pub fn client(s: io.Stream, config: Config) -> *Session ! io.Error {
     write_record(c, 22, flight)?
     c.write_key = protection(hello.suite, client_app)?
     c.read_key = protection(hello.suite, server_app)?
-    session(c, protocol, hello.group, hello.suite, chain)
+    session(c, protocol, hello.group, hello.suite, suite_code(hello.suite), chain)
 }
 
 pub fn dial(host: str, port: i64, config: Config) -> *Session ! io.Error {

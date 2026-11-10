@@ -1,0 +1,155 @@
+import std/crypto
+import std/crypto/hash
+import std/crypto/x509
+import std/io
+
+fn choose_suite12(preferred: []i64, key: x509.PrivateKey, offered: []i64) -> i64 {
+    let ecdsa_key = match key {
+        Rsa(_) => false
+        _ => true
+    }
+    for code in preferred {
+        if suite12_of(code) != none && contains(offered, code) && signs_with_ecdsa(code) == ecdsa_key {
+            return code
+        }
+    }
+    -1
+}
+
+fn certificate_curve_offered(key: x509.PrivateKey, offered: []i64) -> bool {
+    match key {
+        Ecdsa(k) => contains(offered, match k.curve {
+            P256 => group_p256()
+            P384 => group_p384()
+        })
+        _ => true
+    }
+}
+
+fn choose_group12(preferred: []i64, offered: []i64) -> i64 {
+    for g in preferred {
+        if g != x25519_mlkem768() && supported_group(g) && contains(offered, g) {
+            return g
+        }
+    }
+    -1
+}
+
+fn server_hello12(random: []u8, code: i64, secure: bool, points: bool, protocol: str) -> []u8 {
+    var body: []u8 = []
+    io.put_be16(mut body, 0x0303)
+    io.append(mut body, random)
+    put_vector8(mut body, [])
+    io.put_be16(mut body, code)
+    push(mut body, 0)
+    var exts: []u8 = []
+    if secure {
+        put_extension(mut exts, 0xFF01, [0])
+    }
+    put_extension(mut exts, 23, [])
+    if points {
+        put_extension(mut exts, 11, [1, 0])
+    }
+    alpn_extension(mut exts, protocol)
+    put_vector16(mut body, exts)
+    handshake_message(2, body)
+}
+
+fn renegotiation_offered(c: *Channel, hello: ClientHello) -> bool ! io.Error {
+    match find(hello.exts, 0xFF01) {
+        some(r) => {
+            if r.len != 1 || r[0] != 0 {
+                fail refuse(c, 40)
+            }
+            true
+        }
+        none => contains(hello.suites, 0x00FF)
+    }
+}
+
+fn server12(c: *Channel, config: Config, key: x509.PrivateKey, hello: ClientHello, first: []u8) -> *Session ! io.Error {
+    let extended = find(hello.exts, 23) ?? [1]
+    if extended.len != 0 {
+        fail refuse(c, 40)
+    }
+    let secure = renegotiation_offered(c, hello)?
+    var null_compression = false
+    for m in hello.compressions {
+        if m == 0 {
+            null_compression = true
+        }
+    }
+    if !null_compression {
+        fail refuse(c, 47)
+    }
+    uncompressed_points(c, hello.exts)?
+    let points = match find(hello.exts, 11) {
+        some(_) => true
+        none => false
+    }
+    let code = choose_suite12(config.cipher_suites, key, hello.suites)
+    let suite = match suite12_of(code) {
+        some(found) => found
+        none => fail refuse(c, 40)
+    }
+    let scheme = choose_scheme(key_schemes12(key), hello.schemes)
+    if scheme < 0 {
+        fail refuse(c, 40)
+    }
+    let group = choose_group12(config.groups, hello.groups)
+    if group < 0 || !certificate_curve_offered(key, hello.groups) {
+        fail refuse(c, 40)
+    }
+    let protocol = choose_protocol(hello.protocols, config.alpn)
+    let random = crypto.random(32)
+    if offers13(config) {
+        io.copy(random[24..], downgrade_sentinel(1))
+    }
+    let share = client_share(group)?
+    var params: []u8 = [3]
+    io.put_be16(mut params, group)
+    put_vector8(mut params, share.public)
+    var signed: []u8 = []
+    io.append(mut signed, hello.random)
+    io.append(mut signed, random)
+    io.append(mut signed, params)
+    let signature = sign12(key, scheme, signed)?
+    var exchange: []u8 = []
+    io.append(mut exchange, params)
+    io.put_be16(mut exchange, scheme)
+    put_vector16(mut exchange, signature)
+    var flight: []u8 = []
+    io.append(mut flight, server_hello12(random, code, secure, points, protocol))
+    io.append(mut flight, certificate_message12(config.certificates))
+    io.append(mut flight, handshake_message(12, exchange))
+    io.append(mut flight, handshake_message(14, []))
+    var transcript = first
+    io.append(mut transcript, flight)
+    write_record(c, 22, flight)?
+    let key_exchange = expect_message(c, 16)?
+    let kc = cursor(key_exchange.body)
+    let public = vector8(kc) catch {
+        _ => fail abort(c, 50, Malformed)
+    }
+    end(kc) catch {
+        _ => fail abort(c, 50, Malformed)
+    }
+    let premaster = client_secret(share, public) catch {
+        _ => fail abort(c, 47, Invalid)
+    }
+    io.append(mut transcript, key_exchange.raw)
+    let h = suite_hash(suite)
+    let master = extended_master_secret(h, premaster, transcript)
+    let keys = keys12(suite, master, hello.random, random)?
+    read_change_cipher(c)?
+    c.read_key = keys.client
+    let fin = expect_message(c, 20)?
+    let expected = verify_data(h, master, "client finished", transcript)
+    if !hash.equal(fin.body, expected) {
+        fail abort(c, 51, Invalid)
+    }
+    io.append(mut transcript, fin.raw)
+    let server_finished = handshake_message(20, verify_data(h, master, "server finished", transcript))
+    write_change_cipher(c, [], keys.server, server_finished)?
+    session(c, protocol, group, suite, code, [])
+}

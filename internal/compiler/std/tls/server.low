@@ -10,8 +10,12 @@ struct KeyShareEntry {
 }
 
 struct ClientHello {
+    hello_version: i64
+    random: []u8
     session_id: []u8
     suites: []i64
+    compressions: []u8
+    exts: []Extension
     versions: []i64
     groups: []i64
     shares: []KeyShareEntry
@@ -21,8 +25,8 @@ struct ClientHello {
 
 fn parse_client_hello(body: []u8) -> ClientHello ! io.Error {
     let c = cursor(body)
-    u16_of(c)?
-    take(c, 32)?
+    let hello_version = u16_of(c)?
+    let random = take(c, 32)?
     let session_id = vector8(c)?
     if session_id.len > 32 {
         fail Malformed
@@ -32,14 +36,18 @@ fn parse_client_hello(body: []u8) -> ClientHello ! io.Error {
     for left(suites_raw) > 0 {
         push(mut suites, u16_of(suites_raw)?)
     }
-    vector8(c)?
-    let exts = extensions(c)?
+    let compressions = vector8(c)?
+    var exts: []Extension = []
+    if left(c) > 0 {
+        exts = extensions(c)?
+    }
     end(c)?
     var versions: []i64 = []
     match find(exts, 43) {
         some(raw) => {
             let vc = cursor(raw)
             let list = cursor(vector8(vc)?)
+            end(vc)?
             for left(list) > 0 {
                 push(mut versions, u16_of(list)?)
             }
@@ -83,7 +91,7 @@ fn parse_client_hello(body: []u8) -> ClientHello ! io.Error {
         }
         none => {}
     }
-    ClientHello { session_id, suites, versions, groups, shares, schemes, protocols }
+    ClientHello { hello_version, random, session_id, suites, compressions, exts, versions, groups, shares, schemes, protocols }
 }
 
 fn server_hello(random: []u8, session_id: []u8, suite: Suite, group: i64, key: []u8, retry: bool) -> []u8 {
@@ -105,10 +113,11 @@ fn server_hello(random: []u8, session_id: []u8, suite: Suite, group: i64, key: [
     handshake_message(2, body)
 }
 
-fn choose_suite(offered: []i64) -> Suite? {
-    for code in [0x1301, 0x1303, 0x1302] {
-        if contains(offered, code) {
-            return suite_of(code)
+fn choose_suite(preferred: []i64, offered: []i64) -> Suite? {
+    for code in preferred {
+        let suite = suite_of(code)
+        if suite != none && contains(offered, code) {
+            return suite
         }
     }
     none
@@ -125,8 +134,8 @@ fn key_schemes(key: x509.PrivateKey) -> []i64 {
     }
 }
 
-fn choose_scheme(key: x509.PrivateKey, offered: []i64) -> i64 {
-    for s in key_schemes(key) {
+fn choose_scheme(candidates: []i64, offered: []i64) -> i64 {
+    for s in candidates {
         if contains(offered, s) {
             return s
         }
@@ -156,15 +165,20 @@ fn preferred_group(hello: ClientHello, groups: []i64) -> i64 {
     -1
 }
 
+fn alpn_extension(mut exts: []u8, protocol: str) {
+    if protocol.len == 0 {
+        return
+    }
+    var names: []u8 = []
+    put_vector8(mut names, bytes(protocol))
+    var alpn: []u8 = []
+    put_vector16(mut alpn, names)
+    put_extension(mut exts, 16, alpn)
+}
+
 fn encrypted_extensions(protocol: str) -> []u8 {
     var exts: []u8 = []
-    if protocol.len > 0 {
-        var names: []u8 = []
-        put_vector8(mut names, bytes(protocol))
-        var alpn: []u8 = []
-        put_vector16(mut alpn, names)
-        put_extension(mut exts, 16, alpn)
-    }
+    alpn_extension(mut exts, protocol)
     var body: []u8 = []
     put_vector16(mut body, exts)
     handshake_message(8, body)
@@ -182,8 +196,23 @@ fn choose_protocol(offered: []str, supported: []str) -> str {
 }
 
 fn refuse(c: *Channel, description: i64) -> io.Error {
-    send_alert(c, description)
-    io.Error.Unsupported
+    abort(c, description, Unsupported)
+}
+
+fn choose_version(config: Config, hello: ClientHello) -> i64 {
+    if hello.versions.len > 0 {
+        if offers13(config) && contains(hello.versions, 0x0304) {
+            return 0x0304
+        }
+        if offers12(config) && contains(hello.versions, 0x0303) {
+            return 0x0303
+        }
+        return -1
+    }
+    if offers12(config) && hello.hello_version >= 0x0303 {
+        return 0x0303
+    }
+    -1
 }
 
 pub fn server(s: io.Stream, config: Config) -> *Session ! io.Error {
@@ -191,22 +220,36 @@ pub fn server(s: io.Stream, config: Config) -> *Session ! io.Error {
         some(k) => k
         none => fail Invalid
     }
-    if config.certificates.len == 0 {
+    if config.certificates.len == 0 || !versions_valid(config) {
         fail Invalid
     }
     let c = channel(s)
-    var m = expect_message(c, 1)?
-    var hello = parse_client_hello(m.body)?
-    var transcript: []u8 = []
-    io.append(mut transcript, m.raw)
-    if !contains(hello.versions, 0x0304) {
+    let m = expect_message(c, 1)?
+    let hello = parse_client_hello(m.body) catch {
+        _ => fail abort(c, 50, Malformed)
+    }
+    let version = choose_version(config, hello)
+    if version < 0 {
         fail refuse(c, 70)
     }
-    let suite = match choose_suite(hello.suites) {
+    if contains(hello.suites, 0x5600) && version < config.max_version {
+        fail refuse(c, 86)
+    }
+    c.version = version
+    if version == 0x0303 {
+        return server12(c, config, key, hello, m.raw)
+    }
+    server13(c, config, key, hello, m.raw)
+}
+
+fn server13(c: *Channel, config: Config, key: x509.PrivateKey, first_hello: ClientHello, first: []u8) -> *Session ! io.Error {
+    var hello = first_hello
+    var transcript = first
+    let suite = match choose_suite(config.cipher_suites, hello.suites) {
         some(found) => found
         none => fail refuse(c, 40)
     }
-    let scheme = choose_scheme(key, hello.schemes)
+    let scheme = choose_scheme(key_schemes(key), hello.schemes)
     if scheme < 0 {
         fail refuse(c, 40)
     }
@@ -225,8 +268,10 @@ pub fn server(s: io.Stream, config: Config) -> *Session ! io.Error {
         io.append(mut transcript, retry)
         write_record(c, 22, retry)?
         write_record(c, 20, [1])?
-        m = expect_message(c, 1)?
-        hello = parse_client_hello(m.body)?
+        let m = expect_message(c, 1)?
+        hello = parse_client_hello(m.body) catch {
+            _ => fail abort(c, 50, Malformed)
+        }
         io.append(mut transcript, m.raw)
         share = share_of(hello, group)
     }
@@ -266,12 +311,11 @@ pub fn server(s: io.Stream, config: Config) -> *Session ! io.Error {
     let server_app = derive_secret(k.hash, k.master, "s ap traffic", transcript)
     let client_fin = expect_message(c, 20)?
     if !hash.equal(client_fin.body, finished(k, k.client_handshake, transcript)) {
-        send_alert(c, 51)
-        fail Invalid
+        fail abort(c, 51, Invalid)
     }
     c.write_key = protection(suite, server_app)?
     c.read_key = protection(suite, client_app)?
-    session(c, protocol, entry.group, suite, [])
+    session(c, protocol, entry.group, suite, suite_code(suite), [])
 }
 
 pub fn load_key(pem: str) -> x509.PrivateKey ! io.Error {
