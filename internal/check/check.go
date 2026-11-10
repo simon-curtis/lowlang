@@ -36,18 +36,20 @@ type scope struct {
 }
 
 type Checker struct {
-	modules map[string]*scope
-	embeds  []string
-	builtin map[string]*types.Type
-	file    *ast.File
-	results map[[2]*types.Type]*types.Type
-	ptrs    map[*types.Type]*types.Type
-	opts    map[*types.Type]*types.Type
-	slices  map[*types.Type]*types.Type
-	maps    map[[2]*types.Type]*types.Type
-	fn      *ast.Func
-	scopes  []map[string]*ast.Local
-	loops   []*loop
+	modules   map[string]*scope
+	embeds    []string
+	builtin   map[string]*types.Type
+	file      *ast.File
+	results   map[[2]*types.Type]*types.Type
+	ptrs      map[*types.Type]*types.Type
+	opts      map[*types.Type]*types.Type
+	slices    map[*types.Type]*types.Type
+	maps      map[[2]*types.Type]*types.Type
+	fn        *ast.Func
+	scopes    []map[string]*ast.Local
+	loops     []*loop
+	raws      map[*types.Type]*types.Type
+	deferring bool
 }
 
 func Check(files []*ast.File) (embeds []string, err error) {
@@ -59,6 +61,7 @@ func Check(files []*ast.File) (embeds []string, err error) {
 		opts:    map[*types.Type]*types.Type{},
 		slices:  map[*types.Type]*types.Type{},
 		maps:    map[[2]*types.Type]*types.Type{},
+		raws:    map[*types.Type]*types.Type{},
 	}
 	defer func() {
 		r := recover()
@@ -151,6 +154,11 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 		return c.mapOf(key, c.resolve(t.Elem))
 	case t.Optional:
 		return c.optional(c.resolve(t.Elem))
+	case t.Raw:
+		if t.Elem == nil {
+			return c.raw(nil)
+		}
+		return c.raw(c.resolve(t.Elem))
 	}
 	if t.Module != "" {
 		return c.importedType(t.Module, t.Name, t.Pos)
@@ -163,6 +171,15 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 		c.fail(t.Pos, "unknown type %s", t.Name)
 	}
 	return typ
+}
+
+func (c *Checker) raw(elem *types.Type) *types.Type {
+	if r, ok := c.raws[elem]; ok {
+		return r
+	}
+	r := types.NewRaw(elem)
+	c.raws[elem] = r
+	return r
 }
 
 func (c *Checker) optional(elem *types.Type) *types.Type {
@@ -258,6 +275,7 @@ func (c *Checker) declareTypes(files []*ast.File) {
 				c.fail(d.Pos, "struct %s has no fields", d.Name)
 			}
 			d.Type = types.NewStruct(qualified(f.Module, d.Name))
+			d.Type.C = d.C
 			c.declareType(d.Name, d.Pos, d.Type, d.Pub)
 		}
 	}
@@ -304,7 +322,11 @@ func (c *Checker) declareFields(d *ast.StructDecl) {
 		if d.Type.Field(fd.Name) != nil {
 			c.fail(fd.Pos, "field %s already declared in %s", fd.Name, d.Name)
 		}
-		d.Type.Fields = append(d.Type.Fields, &types.Field{Name: fd.Name, Pub: fd.Pub, Type: c.resolve(fd.TypeName)})
+		t := c.resolve(fd.TypeName)
+		if d.C && !t.CCompatible() {
+			c.fail(fd.TypeName.Pos, "extern struct fields must have C types, found %s", t)
+		}
+		d.Type.Fields = append(d.Type.Fields, &types.Field{Name: fd.Name, Pub: fd.Pub, Type: t})
 	}
 }
 
@@ -314,6 +336,23 @@ func (c *Checker) declareFuncs(files []*ast.File) {
 		for _, fn := range f.Funcs {
 			c.declareFunc(fn)
 		}
+		for _, e := range f.Externs {
+			for _, fn := range e.Funcs {
+				c.declareFunc(fn)
+				c.cSignature(fn)
+			}
+		}
+	}
+}
+
+func (c *Checker) cSignature(fn *ast.Func) {
+	for i, p := range fn.Params {
+		if !fn.ParamTypes[i].CCompatible() {
+			c.fail(p.TypeName.Pos, "extern parameters must have C types, found %s", fn.ParamTypes[i])
+		}
+	}
+	if fn.RetType != types.Void && !fn.RetType.CCompatible() {
+		c.fail(fn.Result.Pos, "extern results must have C types, found %s", fn.RetType)
 	}
 }
 
@@ -469,19 +508,47 @@ func (c *Checker) stmt(s ast.Stmt) bool {
 	case *ast.ForIn:
 		c.forIn(s)
 	case *ast.Break:
+		c.leaving(s.Pos, "break")
 		c.innermostLoop(s.Pos, "break").broken = true
 		return true
 	case *ast.Continue:
+		c.leaving(s.Pos, "continue")
 		c.innermostLoop(s.Pos, "continue")
 		return true
 	case *ast.Return:
+		c.leaving(s.Pos, "return")
 		c.ret(s)
 		return true
 	case *ast.Fail:
+		c.leaving(s.Pos, "fail")
 		c.failStmt(s)
 		return true
+	case *ast.Defer:
+		c.deferStmt(s)
 	}
 	return false
+}
+
+func (c *Checker) deferStmt(s *ast.Defer) {
+	if c.deferring {
+		c.fail(s.Pos, "defer cannot be nested in a deferred statement")
+	}
+	c.deferring = true
+	loops := c.loops
+	c.loops = nil
+	c.pushScope()
+	if c.stmt(s.Body) {
+		c.fail(s.Pos, "a deferred statement cannot leave its scope")
+	}
+	c.popScope()
+	c.loops = loops
+	c.deferring = false
+}
+
+func (c *Checker) leaving(pos lexer.Pos, keyword string) {
+	if c.deferring {
+		c.fail(pos, "%s cannot appear in a deferred statement", keyword)
+	}
 }
 
 func (c *Checker) let(s *ast.Let) {
@@ -805,6 +872,14 @@ func (c *Checker) ident(e *ast.Ident, want *types.Type) {
 	if e.Name == "none" && c.find(e.Name) == nil {
 		c.fail(e.Pos, "cannot infer the type of none; annotate the binding")
 	}
+	if e.Name == "null" && c.find(e.Name) == nil {
+		e.Null = true
+		e.Type = c.raw(nil)
+		if w := unwrap(want); w != nil && w.Kind == types.RawKind {
+			e.Type = w
+		}
+		return
+	}
 	e.Local = c.lookup(e.Name, e.Pos)
 	e.Type = e.Local.Type
 }
@@ -1088,7 +1163,7 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 		c.requireInteger(c.plain(e.Y, nil), e.Op, e.Y.Position())
 	case lexer.Eq, lexer.NotEq:
 		t := c.operands(e, nil)
-		if !t.Number() && t != types.Bool && t != types.Str && t.Kind != types.PointerKind {
+		if !t.Number() && t != types.Bool && t != types.Str && t.Kind != types.PointerKind && t.Kind != types.RawKind {
 			c.fail(e.X.Position(), "cannot compare values of type %s", t)
 		}
 		e.Type = types.Bool
@@ -1110,6 +1185,7 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 var builtins = map[string]bool{
 	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
 	"delete": true, "embed": true, "__str_raw": true,
+	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
 	"__bits": true, "__str_view": true,
 }
 
@@ -1185,8 +1261,46 @@ func (c *Checker) special(e *ast.Call, name string) bool {
 		e.Builtin, e.Type = name, c.slice(types.U8)
 	case "str":
 		c.single(e, name)
-		c.expectType(e.Args[0], c.slice(types.U8))
 		e.Builtin, e.Type = "from_bytes", types.Str
+		if t := c.plain(e.Args[0], nil); t.Kind == types.RawKind {
+			c.cString(e.Args[0], t)
+			e.Builtin = "from_cstr"
+		} else if t != c.slice(types.U8) {
+			c.fail(e.Args[0].Position(), "str takes []u8 or ptr[u8], found %s", t)
+		}
+	case "cstr":
+		c.single(e, name)
+		c.expectType(e.Args[0], types.Str)
+		e.Builtin, e.Type = name, c.raw(types.U8)
+	case "view":
+		if len(e.Args) != 2 {
+			c.fail(e.Pos, "view takes 2 arguments, found %d", len(e.Args))
+		}
+		elem := c.typedRaw(e.Args[0], name)
+		c.integer(e.Args[1])
+		e.Builtin, e.Type = name, c.slice(elem)
+	case "load":
+		c.single(e, name)
+		e.Builtin, e.Type = name, c.typedRaw(e.Args[0], name)
+	case "store":
+		if len(e.Args) != 2 {
+			c.fail(e.Pos, "store takes 2 arguments, found %d", len(e.Args))
+		}
+		c.expectType(e.Args[1], c.typedRaw(e.Args[0], name))
+		e.Builtin, e.Type = name, types.Void
+	case "pin":
+		c.single(e, name)
+		t := c.plain(e.Args[0], nil)
+		if t.Kind != types.PointerKind && t.Kind != types.SliceKind && t.Kind != types.MapKind && t != types.Str {
+			c.fail(e.Args[0].Position(), "pin takes a pointer, slice, map or str, found %s", t)
+		}
+		e.Builtin, e.Type = name, c.raw(nil)
+	case "unpin":
+		c.single(e, name)
+		if t := c.plain(e.Args[0], nil); t.Kind != types.RawKind {
+			c.fail(e.Args[0].Position(), "unpin takes the ptr returned by pin, found %s", t)
+		}
+		e.Builtin, e.Type = name, types.Void
 	case "__bits":
 		c.single(e, name)
 		t := c.plain(e.Args[0], nil)
@@ -1207,6 +1321,13 @@ func (c *Checker) special(e *ast.Call, name string) bool {
 		c.integer(e.Args[0])
 		c.integer(e.Args[1])
 		e.Builtin, e.Type = name, types.Str
+	case "__slice_ptr":
+		c.single(e, name)
+		t := c.plain(e.Args[0], nil)
+		if t.Kind != types.SliceKind {
+			c.fail(e.Pos, "__slice_ptr requires a slice")
+		}
+		e.Builtin, e.Type = name, c.raw(t.Elem)
 	case "__str_view":
 		c.single(e, name)
 		c.expectType(e.Args[0], c.slice(types.U8))
@@ -1258,6 +1379,20 @@ func (c *Checker) deleteEntry(e *ast.Call) {
 	c.key(e.Args[1], t)
 	e.Builtin = "delete"
 	e.Type = types.Void
+}
+
+func (c *Checker) typedRaw(e ast.Expr, name string) *types.Type {
+	t := c.plain(e, nil)
+	if t.Kind != types.RawKind || t.Elem == nil {
+		c.fail(e.Position(), "%s needs a typed ptr[T], found %s", name, t)
+	}
+	return t.Elem
+}
+
+func (c *Checker) cString(e ast.Expr, t *types.Type) {
+	if t.Elem != nil && t.Elem != types.U8 {
+		c.fail(e.Position(), "str takes ptr[u8], found %s", t)
+	}
 }
 
 func (c *Checker) push(e *ast.Call) {
@@ -1335,10 +1470,15 @@ func (c *Checker) allocate(e *ast.Call, want *types.Type) {
 }
 
 func (c *Checker) callFunc(e *ast.Call, fn *ast.Func) {
-	if len(e.Args) != len(fn.Params) {
+	short := len(e.Args) < len(fn.Params)
+	if short || (len(e.Args) > len(fn.Params) && !fn.Variadic) {
 		c.fail(e.Pos, "%s takes %d arguments, found %d", fn.Name, len(fn.Params), len(e.Args))
 	}
 	for i, arg := range e.Args {
+		if i >= len(fn.Params) {
+			c.variadic(arg)
+			continue
+		}
 		c.argument(arg, fn, i)
 	}
 	c.exclusive(e.Args)
@@ -1356,6 +1496,15 @@ func (c *Checker) argument(arg ast.Expr, fn *ast.Func, i int) {
 		c.fail(arg.Position(), "parameter %s of %s is mut; write mut before the argument", param.Name, fn.Name)
 	default:
 		c.expectType(arg, fn.ParamTypes[i])
+	}
+}
+
+func (c *Checker) variadic(arg ast.Expr) {
+	if _, ok := arg.(*ast.Ref); ok {
+		c.fail(arg.Position(), "variadic arguments cannot be mut")
+	}
+	if t := c.plain(arg, nil); !t.CCompatible() || t.Kind == types.StructKind {
+		c.fail(arg.Position(), "variadic arguments must be numbers, bool or ptr, found %s", t)
 	}
 }
 
@@ -1465,6 +1614,7 @@ func (c *Checker) errorResult(e ast.Expr, keyword string, pos lexer.Pos) *types.
 }
 
 func (c *Checker) try(e *ast.Try) {
+	c.leaving(e.Pos, "?")
 	t := c.errorResult(e.X, "?", e.Pos)
 	ret := c.fn.RetType
 	if ret.Kind != types.ResultKind {

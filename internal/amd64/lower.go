@@ -192,7 +192,7 @@ func (l *lowering) block(b *ir.Block) {
 		case ir.OpPhi:
 			in.move = true
 			in.args = []*vreg{l.temp(v)}
-		case ir.OpCall, ir.OpRuntime:
+		case ir.OpCall, ir.OpCCall, ir.OpRuntime:
 			call = v
 		case ir.OpResult:
 			in.call = call

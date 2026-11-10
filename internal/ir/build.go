@@ -12,8 +12,9 @@ import (
 )
 
 type loopTarget struct {
-	cont *Block
-	brk  *Block
+	cont  *Block
+	brk   *Block
+	depth int
 }
 
 type place struct {
@@ -26,14 +27,15 @@ type place struct {
 
 type builder struct {
 	ssa
-	cur   *Block
-	decl  *ast.Func
-	funcs map[*ast.Func]*Func
-	named map[string]*Func
-	slots map[*ast.Local]*Value
-	refs  map[*ast.Local]*Value
-	loops []loopTarget
-	temps int
+	cur    *Block
+	decl   *ast.Func
+	funcs  map[*ast.Func]*Func
+	named  map[string]*Func
+	slots  map[*ast.Local]*Value
+	refs   map[*ast.Local]*Value
+	loops  []loopTarget
+	temps  int
+	defers [][]ast.Stmt
 }
 
 func Build(files []*ast.File) *Program {
@@ -70,7 +72,21 @@ func Build(files []*ast.File) *Program {
 	}
 	p.Funcs = reachable(p.Main, p.Funcs)
 	p.Libraries = libraries(files)
+	p.CSymbols = cSymbols(files)
 	return p
+}
+
+func cSymbols(files []*ast.File) []string {
+	var symbols []string
+	for _, f := range files {
+		for _, e := range f.Externs {
+			for _, fn := range e.Funcs {
+				symbols = append(symbols, fn.Name)
+			}
+		}
+	}
+	slices.Sort(symbols)
+	return slices.Compact(symbols)
 }
 
 func libraries(files []*ast.File) []string {
@@ -256,7 +272,7 @@ func (b *builder) word(e ast.Expr) *Value {
 }
 
 func (b *builder) bind(local *ast.Local, words []*Value) {
-	if local.Addressed {
+	if local.Addressed || isC(local.Type) {
 		slot := b.emit(OpSlot)
 		slot.Aux = int64(len(b.fn.Slots))
 		b.fn.Slots = append(b.fn.Slots, len(words))
@@ -270,16 +286,19 @@ func (b *builder) bind(local *ast.Local, words []*Value) {
 func (b *builder) place(p *ast.Place) place {
 	switch {
 	case p.Ptr != nil:
-		return place{addr: b.word(p.Ptr), offset: p.Offset}
+		return place{addr: b.word(p.Ptr), offset: p.Offset, scalar: p.Width}
 	case p.Index != nil:
 		element := b.element(p.Index)
 		element.offset += p.Offset
+		if p.Width != nil {
+			element.scalar = p.Width
+		}
 		return element
 	case p.Local.Ref:
-		return place{addr: b.refs[p.Local], offset: p.Offset}
+		return place{addr: b.refs[p.Local], offset: p.Offset, scalar: p.Width}
 	}
 	if slot, ok := b.slots[p.Local]; ok {
-		return place{addr: slot, offset: p.Offset}
+		return place{addr: slot, offset: p.Offset, scalar: p.Width}
 	}
 	return place{local: p.Local, word: p.Offset / 8}
 }
@@ -346,13 +365,25 @@ func (b *builder) fail(errWords []*Value) {
 }
 
 func (b *builder) block(blk *ast.Block) []*Value {
+	b.defers = append(b.defers, nil)
 	for _, s := range blk.Stmts {
 		b.stmt(s)
 	}
-	if blk.Tail == nil {
-		return nil
+	var words []*Value
+	if blk.Tail != nil {
+		words = b.expr(blk.Tail)
 	}
-	return b.expr(blk.Tail)
+	b.runDefers(len(b.defers) - 1)
+	b.defers = b.defers[:len(b.defers)-1]
+	return words
+}
+
+func (b *builder) runDefers(from int) {
+	for i := len(b.defers) - 1; i >= from; i-- {
+		for j := len(b.defers[i]) - 1; j >= 0; j-- {
+			b.stmt(b.defers[i][j])
+		}
+	}
 }
 
 func (b *builder) stmt(s ast.Stmt) {
@@ -368,10 +399,14 @@ func (b *builder) stmt(s ast.Stmt) {
 	case *ast.ForIn:
 		b.forIn(s)
 	case *ast.Break:
-		b.jump(b.loops[len(b.loops)-1].brk)
+		loop := b.loops[len(b.loops)-1]
+		b.runDefers(loop.depth)
+		b.jump(loop.brk)
 		b.dead()
 	case *ast.Continue:
-		b.jump(b.loops[len(b.loops)-1].cont)
+		loop := b.loops[len(b.loops)-1]
+		b.runDefers(loop.depth)
+		b.jump(loop.cont)
 		b.dead()
 	case *ast.Return:
 		t := types.Void
@@ -380,11 +415,17 @@ func (b *builder) stmt(s ast.Stmt) {
 			t = s.Value.TypeOf()
 			words = b.expr(s.Value)
 		}
+		b.runDefers(0)
 		b.ret(t, words)
 		b.dead()
 	case *ast.Fail:
-		b.fail(b.value(s.Value, s.Value.TypeOf()))
+		words := b.value(s.Value, s.Value.TypeOf())
+		b.runDefers(0)
+		b.fail(words)
 		b.dead()
+	case *ast.Defer:
+		top := len(b.defers) - 1
+		b.defers[top] = append(b.defers[top], s.Body)
 	}
 }
 
@@ -435,7 +476,7 @@ func (b *builder) forStmt(s *ast.For) {
 		b.jump(body)
 	}
 	b.enter(body)
-	b.loops = append(b.loops, loopTarget{cont: header, brk: exit})
+	b.loops = append(b.loops, loopTarget{cont: header, brk: exit, depth: len(b.defers)})
 	b.block(s.Body)
 	b.loops = b.loops[:len(b.loops)-1]
 	b.jump(header)
@@ -483,10 +524,16 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		if e.Variant != nil {
 			return b.construct(e.Type, e.Variant, nil)
 		}
+		if e.Null {
+			return []*Value{b.constant(0)}
+		}
 		return b.load(b.place(&ast.Place{Local: e.Local}), e.Type)
 	case *ast.Selector:
 		return b.selector(e)
 	case *ast.StructLit:
+		if isC(e.Type) {
+			return b.cStruct(e)
+		}
 		words := make([]*Value, e.Type.Size())
 		for _, init := range e.Fields {
 			copy(words[init.Field.Offset:], b.value(init.Value, init.Field.Type))
@@ -524,6 +571,9 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 	}
 	if p, ok := ast.PlaceOf(e); ok {
 		return b.load(b.place(p), e.Type)
+	}
+	if isC(e.X.TypeOf()) {
+		return b.cField(e)
 	}
 	words := b.value(e.X, e.X.TypeOf())
 	return words[e.Field.Offset : e.Field.Offset+e.Type.Size()]
@@ -657,6 +707,9 @@ func (b *builder) construct(enum *types.Type, v *types.Variant, args []ast.Expr)
 }
 
 func (b *builder) callFunc(e *ast.Call) []*Value {
+	if e.Target.Extern != nil {
+		return b.cCall(e)
+	}
 	target := b.funcs[e.Target]
 	var args []*Value
 	for i, arg := range e.Args {
@@ -740,6 +793,7 @@ func (b *builder) try(e *ast.Try) []*Value {
 	failed := b.newBlock()
 	b.branch(words[0], failed, ok)
 	b.enter(failed)
+	b.runDefers(0)
 	b.fail(words[1 : 1+r.Err.Size()])
 	b.enter(ok)
 	return words[1 : 1+r.Ok.Size()]

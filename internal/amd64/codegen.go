@@ -71,6 +71,9 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 		funcs[f.Name] = g.text.String()[from:]
 	}
 	g.start(prog)
+	if table != nil {
+		g.trampolines(prog.CSymbols)
+	}
 	var out strings.Builder
 	out.WriteString(runtime)
 	g.writeMaps(&out)
@@ -166,7 +169,7 @@ func (g *Generator) start(prog *ir.Program) {
 	}
 	words := prog.Main.ResultWords
 	if words > 2 {
-		g.emit("sub rsp, %d", 8*words)
+		g.emit("sub rsp, %d", 16*((words+1)/2))
 	}
 	g.emit("call %s", g.callTarget(prog.Main))
 	if prog.MainErr != nil {
@@ -277,14 +280,20 @@ func outgoing(f *ir.Func) int {
 	most := 0
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			if v.Op != ir.OpCall {
-				continue
+			switch v.Op {
+			case ir.OpCall:
+				words := stackWords(v.Target.ParamWords)
+				if v.Target.ResultWords > 2 {
+					words += v.Target.ResultWords
+				}
+				most = max(most, words)
+			case ir.OpCCall:
+				words := v.Plan.StackWords
+				if v.Plan.Memory {
+					words += v.Plan.Ret.Size()
+				}
+				most = max(most, words)
 			}
-			words := stackWords(v.Target.ParamWords)
-			if v.Target.ResultWords > 2 {
-				words += v.Target.ResultWords
-			}
-			most = max(most, words)
 		}
 	}
 	return most
@@ -456,6 +465,8 @@ func (g *Generator) instr(fr *frame, in *instr) {
 		g.call(fr, in)
 	case ir.OpRuntime:
 		g.runtimeCall(fr, in)
+	case ir.OpCCall:
+		g.cCall(fr, in)
 	case ir.OpResult:
 		g.result(fr, in)
 	}
@@ -617,6 +628,10 @@ func (g *Generator) runtimeCall(fr *frame, in *instr) {
 func (g *Generator) result(fr *frame, in *instr) {
 	k := int(in.value.Aux)
 	call := in.call
+	if call.Op == ir.OpCCall {
+		g.cResult(fr, in, call.Plan, k)
+		return
+	}
 	if call.Op == ir.OpRuntime || call.Target.ResultWords <= 2 {
 		g.move(fr.loc(in.dst), []string{"rax", "rdx"}[k])
 		return

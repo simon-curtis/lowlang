@@ -108,7 +108,7 @@ func (f *mfunc) intervals() {
 }
 
 func (in *instr) isCall() bool {
-	return !in.move && (in.op == ir.OpCall || in.op == ir.OpRuntime)
+	return !in.move && (in.op == ir.OpCall || in.op == ir.OpCCall || in.op == ir.OpRuntime)
 }
 
 type segment struct {

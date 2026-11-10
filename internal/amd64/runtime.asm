@@ -14,6 +14,9 @@ rt_error_prefix:
 rt_msg_divzero:
 	.quad 22
 	.ascii "integer divide by zero"
+rt_msg_pins:
+	.quad 13
+	.ascii "too many pins"
 rt_msg_index:
 	.quad 18
 	.ascii "index out of range"
@@ -43,6 +46,10 @@ rt_free_large:
 	.zero 8
 rt_user_pc:
 	.zero 8
+rt_pin_count:
+	.zero 8
+rt_pins:
+	.zero 524288
 rt_user_sp:
 	.zero 8
 rt_free_small:
@@ -160,6 +167,38 @@ rt_grow:
 	pop rsi
 	mov rdi, rax
 	rep movsb
+	ret
+
+	.globl rt_pin
+rt_pin:
+	mov rax, [rip+rt_pin_count]
+	cmp rax, 65536
+	jae 1f
+	lea rcx, [rip+rt_pins]
+	mov [rcx+8*rax], rdi
+	inc rax
+	mov [rip+rt_pin_count], rax
+	ret
+1:
+	lea rdi, [rip+rt_msg_pins]
+	jmp rt_panic
+
+	.globl rt_unpin
+rt_unpin:
+	mov rax, [rip+rt_pin_count]
+	lea rcx, [rip+rt_pins]
+1:
+	test rax, rax
+	jz 2f
+	dec rax
+	cmp [rcx+8*rax], rdi
+	jne 1b
+	mov rdx, [rip+rt_pin_count]
+	dec rdx
+	mov r8, [rcx+8*rdx]
+	mov [rcx+8*rax], r8
+	mov [rip+rt_pin_count], rdx
+2:
 	ret
 
 	.globl rt_panic_index
@@ -414,6 +453,10 @@ rt_gc:
 	mov r15, [rip+rt_mark_base]
 	mov rdi, rsp
 	mov rsi, [rip+rt_user_sp]
+	call rt_scan_range
+	lea rdi, [rip+rt_pins]
+	mov rsi, [rip+rt_pin_count]
+	lea rsi, [rdi+8*rsi]
 	call rt_scan_range
 	mov r12, [rip+rt_user_pc]
 	mov r13, rbp

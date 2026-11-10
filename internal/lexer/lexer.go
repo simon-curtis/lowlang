@@ -330,7 +330,7 @@ var operators = []struct {
 	text string
 	kind Kind
 }{
-	{"<<=", ShlAssign}, {">>=", ShrAssign},
+	{"...", Ellipsis}, {"<<=", ShlAssign}, {">>=", ShrAssign},
 	{"??", Coalesce}, {"->", Arrow}, {"=>", FatArrow}, {"%=", PercentAssign}, {"&=", AmpAssign}, {"|=", PipeAssign}, {"^=", CaretAssign},
 	{"<<", Shl}, {">>", Shr}, {"+=", PlusAssign}, {"-=", MinusAssign}, {"*=", StarAssign}, {"/=", SlashAssign},
 	{"&&", AndAnd}, {"||", OrOr}, {"==", Eq}, {"!=", NotEq}, {"<=", LtEq}, {">=", GtEq},

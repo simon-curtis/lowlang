@@ -17,6 +17,7 @@ const (
 	PointerKind
 	SliceKind
 	MapKind
+	RawKind
 )
 
 type Type struct {
@@ -33,11 +34,15 @@ type Type struct {
 	Optional bool
 	Module   string
 	Pub      bool
+	C        bool
+	Bytes    int
+	Align    int
 	size     int
 }
 
 type Field struct {
 	Name   string
+	Bytes  int
 	Pub    bool
 	Type   *Type
 	Offset int
@@ -79,12 +84,16 @@ func (t *Type) HasPointers() bool {
 func (t *Type) PointerWords() []bool {
 	words := make([]bool, t.size)
 	switch t.Kind {
-	case PointerKind, MapKind, SliceKind, StrKind:
+	case PointerKind, MapKind, SliceKind, StrKind, RawKind:
 		words[0] = true
 	case IntKind:
 		words[0] = t == Word
 	case StructKind:
 		for _, f := range t.Fields {
+			if t.C {
+				merge(words[f.Bytes/8:], f.Type.PointerWords())
+				continue
+			}
 			copy(words[f.Offset:], f.Type.PointerWords())
 		}
 	case EnumKind:
@@ -150,6 +159,9 @@ func NewOptional(elem *Type) *Type {
 }
 
 func (t *Type) Accepts(from *Type) bool {
+	if t.Kind == RawKind && from.Kind == RawKind && (t.Elem == nil || from.Elem == nil) {
+		return true
+	}
 	return t == from || from == Never || (t.Optional && from == t.Elem)
 }
 
@@ -161,6 +173,62 @@ func (t *Type) Hashable() bool {
 	return t.Integer() || t.Kind == BoolKind || t.Kind == StrKind || t.Kind == PointerKind
 }
 
+func StructOf(t *Type) *Type {
+	if t.Kind == PointerKind {
+		return t.Elem
+	}
+	return t
+}
+
+func NewRaw(elem *Type) *Type {
+	name := "ptr"
+	if elem != nil {
+		name = fmt.Sprintf("ptr[%s]", elem)
+	}
+	return &Type{Kind: RawKind, Name: name, Elem: elem, size: 1}
+}
+
+func (t *Type) CCompatible() bool {
+	switch t.Kind {
+	case IntKind:
+		return t != Word
+	case FloatKind, BoolKind, RawKind:
+		return true
+	case StructKind:
+		return t.C
+	}
+	return false
+}
+
+func (t *Type) CSize() int {
+	switch {
+	case t.Kind == BoolKind:
+		return 1
+	case t.Kind == StructKind && t.C:
+		return t.Bytes
+	case t.Packed():
+		return t.Bits / 8
+	}
+	return 8
+}
+
+func (t *Type) CAlign() int {
+	if t.Kind == StructKind && t.C {
+		return t.Align
+	}
+	return t.CSize()
+}
+
+func (t *Type) Width() *Type {
+	switch {
+	case t.Kind == BoolKind:
+		return U8
+	case t.Packed():
+		return t
+	}
+	return nil
+}
+
 func NewSlice(elem *Type) *Type {
 	return &Type{Kind: SliceKind, Name: fmt.Sprintf("[]%s", elem), Elem: elem, size: 3}
 }
@@ -170,8 +238,11 @@ func (t *Type) Packed() bool {
 }
 
 func (t *Type) Stride() int {
-	if t.Packed() {
+	switch {
+	case t.Packed():
 		return t.Bits / 8
+	case t.Kind == StructKind && t.C:
+		return t.Bytes
 	}
 	return 8 * t.size
 }
@@ -232,6 +303,9 @@ func (t *Type) Layout() error {
 		return &CycleError{Type: t}
 	}
 	t.size = 0
+	if t.Kind == StructKind && t.C {
+		return t.cLayout()
+	}
 	if t.Kind == StructKind {
 		return t.structLayout()
 	}
@@ -254,9 +328,28 @@ func (t *Type) structLayout() error {
 			return err
 		}
 		f.Offset = words
+		f.Bytes = 8 * words
 		words += f.Type.Size()
 	}
 	t.size = words
+	return nil
+}
+
+func (t *Type) cLayout() error {
+	offset, align := 0, 1
+	for _, f := range t.Fields {
+		if err := f.Type.Layout(); err != nil {
+			return err
+		}
+		a := f.Type.CAlign()
+		offset = (offset + a - 1) / a * a
+		f.Bytes = offset
+		offset += f.Type.CSize()
+		align = max(align, a)
+	}
+	t.Align = align
+	t.Bytes = (offset + align - 1) / align * align
+	t.size = (t.Bytes + 7) / 8
 	return nil
 }
 

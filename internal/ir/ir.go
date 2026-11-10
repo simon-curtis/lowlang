@@ -43,6 +43,7 @@ const (
 	OpCheck
 	OpSlot
 	OpCall
+	OpCCall
 	OpRuntime
 	OpResult
 )
@@ -53,7 +54,7 @@ var opNames = [...]string{
 	OpAnd: "and", OpOr: "or", OpXor: "xor", OpShl: "shl", OpShr: "shr", OpCompl: "compl",
 	OpConvert: "convert", OpSqrt: "sqrt", OpFloor: "floor",
 	OpEq: "eq", OpNe: "ne", OpLt: "lt", OpLe: "le", OpGt: "gt", OpGe: "ge",
-	OpLoad: "load", OpStore: "store", OpCheck: "check", OpSlot: "slot", OpCall: "call", OpRuntime: "runtime", OpResult: "result",
+	OpLoad: "load", OpStore: "store", OpCheck: "check", OpSlot: "slot", OpCall: "call", OpCCall: "ccall", OpRuntime: "runtime", OpResult: "result",
 }
 
 func (o Op) String() string {
@@ -65,7 +66,7 @@ func (o Op) Compare() bool {
 }
 
 func (o Op) HasResult() bool {
-	return o != OpStore && o != OpCall && o != OpRuntime && o != OpCheck
+	return o != OpStore && o != OpCall && o != OpCCall && o != OpRuntime && o != OpCheck
 }
 
 type Value struct {
@@ -76,6 +77,7 @@ type Value struct {
 	Aux     int64
 	Str     string
 	Target  *Func
+	Plan    *CPlan
 	Type    *types.Type
 	From    *types.Type
 	Scalar  bool
@@ -122,6 +124,7 @@ type Func struct {
 
 type Program struct {
 	Libraries []string
+	CSymbols  []string
 	Funcs     []*Func
 	Main      *Func
 	MainErr   *types.Type
@@ -175,6 +178,8 @@ func describe(v *Value) string {
 		detail = fmt.Sprintf(" %s", v.Str)
 	case OpCall:
 		detail = fmt.Sprintf(" %s", v.Target.Name)
+	case OpCCall:
+		detail = fmt.Sprintf(" %s", v.Plan.Symbol)
 	case OpConvert:
 		detail = fmt.Sprintf(" %s->%s", v.From, v.Type)
 	}

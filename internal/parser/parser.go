@@ -179,10 +179,21 @@ func (p *Parser) declaration(f *ast.File) {
 		d.Pub, d.File = pub, f
 		f.Structs = append(f.Structs, d)
 	case lexer.Extern:
+		if p.peek() == lexer.Struct {
+			p.next()
+			d := p.structDecl()
+			d.Pub, d.File, d.C = pub, f, true
+			f.Structs = append(f.Structs, d)
+			return
+		}
 		if pub {
 			p.fail(t.Pos, "extern blocks cannot be pub")
 		}
-		f.Externs = append(f.Externs, p.extern())
+		e := p.extern()
+		for _, fn := range e.Funcs {
+			fn.File = f
+		}
+		f.Externs = append(f.Externs, e)
 	case lexer.Import:
 		p.fail(t.Pos, "imports must come before declarations")
 	default:
@@ -196,10 +207,34 @@ func (p *Parser) extern() *ast.Extern {
 	if !validLibrary(name.Text) {
 		p.fail(name.Pos, "invalid library name %q", name.Text)
 	}
-	p.lines(func() {
-		p.fail(p.tok().Pos, "expected }, found %s", describe(p.tok()))
+	e := &ast.Extern{Library: name.Text, Pos: pos}
+	p.lines(func() { e.Funcs = append(e.Funcs, p.externFn(e)) })
+	return e
+}
+
+func (p *Parser) externFn(e *ast.Extern) *ast.Func {
+	pub := p.at(lexer.Pub)
+	if pub {
+		p.next()
+	}
+	pos := p.expect(lexer.Fn).Pos
+	f := &ast.Func{Name: p.expect(lexer.Ident).Text, Pub: pub, Extern: e, Pos: pos}
+	p.list(func() {
+		if f.Variadic {
+			p.fail(p.tok().Pos, "... must be the last parameter")
+		}
+		if p.at(lexer.Ellipsis) {
+			p.next()
+			f.Variadic = true
+			return
+		}
+		f.Params = append(f.Params, p.param())
 	})
-	return &ast.Extern{Library: name.Text, Pos: pos}
+	if p.at(lexer.Arrow) {
+		p.next()
+		f.Result = p.typeName()
+	}
+	return f
 }
 
 func validLibrary(name string) bool {
@@ -327,6 +362,16 @@ func (p *Parser) typeTerm() *ast.TypeName {
 		p.expect(lexer.RBracket)
 		return &ast.TypeName{Map: true, Key: key, Elem: value, Pos: pos}
 	}
+	if p.at(lexer.Ident) && p.tok().Text == "ptr" {
+		p.next()
+		if !p.at(lexer.LBracket) {
+			return &ast.TypeName{Raw: true, Pos: pos}
+		}
+		p.next()
+		elem := p.typeName()
+		p.expect(lexer.RBracket)
+		return &ast.TypeName{Raw: true, Elem: elem, Pos: pos}
+	}
 	name := p.expect(lexer.Ident).Text
 	if !p.at(lexer.Dot) {
 		return &ast.TypeName{Name: name, Pos: pos}
@@ -385,6 +430,9 @@ func (p *Parser) stmt() ast.Stmt {
 	case lexer.Fail:
 		p.next()
 		return &ast.Fail{Value: p.expr(), Pos: t.Pos}
+	case lexer.Defer:
+		p.next()
+		return &ast.Defer{Body: p.stmt(), Pos: t.Pos}
 	}
 	x := p.expr()
 	if op := p.tok().Kind; assignOps[op] {

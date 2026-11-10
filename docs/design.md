@@ -312,15 +312,53 @@ print(shader.len)
 - The bytes live in the binary's read-only data, aligned to 16 bytes; nothing is copied at run time. Indexing, slicing, `.len` and `bytes(...)` work as on any string.
 - A missing file is a compile error. `low dev` watches embedded files, and a change to one reloads the functions that embed it.
 
-### C libraries
+### C interop
 
 ```low
-extern "vulkan" {}
-extern "wayland-client" {}
+extern "c" {
+    fn malloc(n: i64) -> ptr
+    fn free(p: ptr)
+    fn strtol(s: ptr[u8], mut end: ptr, base: i32) -> i64
+    fn snprintf(buf: ptr[u8], n: i64, format: ptr[u8], ...) -> i32
+    pub fn div(a: i32, b: i32) -> DivT
+}
+
+extern struct DivT {
+    quot: i32
+    rem: i32
+}
+
+let buf: ptr[u8] = malloc(64)
+defer free(buf)
+snprintf(buf, 64, cstr("%d-%.2f"), 42, 3.14159)
+print(str(buf))
+var end: ptr = null
+let n = strtol(cstr("123abc"), mut end, 10)
+let pixels = view(buf, 64)
 ```
 
-- `extern "name" { }` at the top level of a file names a C library the program links. `"c"` is the C library itself.
+- `extern "name" { ... }` at the top level of a file names a C library and declares its functions, with no bodies. `"c"` is the C library itself. A trailing `...` makes a function variadic. Declarations are private to their module unless marked `pub`.
 - A program that names no library is a static executable with no libc. A program that names any is a dynamic executable linked against libc and each named library.
+- C signatures use C types: integers, floats, `bool`, `ptr` and `ptr[T]`, and `extern struct`s by value. A `mut` parameter passes the address of a LowLang place for the duration of the call, as C# passes `ref`; C may read and write through it.
+- `ptr[T]` is a nullable pointer to C memory and `ptr` is `void*`; `null` takes its type from context, and `ptr` converts to and from any `ptr[T]`. `==` and `!=` compare addresses.
+- `view(p, n)` is a `[]T` over `n` elements at `p`, bounds-checked like any slice; `load(p)` and `store(p, v)` read and write one `T`.
+- `cstr(s)` is a NUL-terminated copy of a string; `str(p)` copies a NUL-terminated `ptr[u8]` back.
+- `extern struct` has C layout: fields in order at their natural alignment, size rounded to the largest alignment. Its fields must have C types. It is used like any struct and its fields are read and written at their own width.
+- Memory may be passed to C for the duration of a call. Memory C keeps after the call must be pinned: `pin(x)` returns the address of a pointer, slice, map or string's data and keeps it alive until `unpin(p)`. Memory C allocates is never touched by the collector.
+
+### Defer
+
+```low
+let fd = open(path)?
+defer close(fd)
+defer {
+    let summary = "closing {path}"
+    log(summary)
+}
+```
+
+- `defer` runs a statement when its enclosing block exits: at the end of the block, on `return`, `fail` or a propagated `?`, and when `break` or `continue` leaves it. Deferred statements of a block run last first.
+- The statement runs at exit and sees variables as they are then. It cannot `return`, `fail`, use `?`, `break`, `continue` or contain another `defer`.
 
 ### Modules
 
@@ -411,6 +449,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Roots come from stack maps. At every call the code generator records the frame words that may hold a heap pointer at that point: the saved callee-saved registers, spill slots of values that may be pointers and are live across the call, and every frame slot. The maps form a table sorted by return address. `rt_alloc` and `rt_grow` record their caller's return address and stack pointer; the collector scans the runtime frames below that conservatively, then follows the `rbp` chain, looking up each frame's return address and scanning only its mapped words. Frames without a map, such as code patched in by hot reload, are scanned whole, and the region above `main` is scanned conservatively.
 - Values in callee-saved registers are found in the save slots of whichever later frame saved them, or among the registers `rt_gc` pushes.
 - Every candidate word, mapped or not, is checked against the heap before it is followed, so a map that names a word holding an integer is harmless.
+- A `ptr` counts as a possible heap pointer, so a `cstr` copy or a pinned object stays alive while LowLang holds its address. `pin` records the address in a table of 65536 roots that every collection scans; `unpin` removes it.
 - Sweeping coalesces adjacent dead objects into free chunks and returns a trailing free run to the end of the heap.
 
 ### IR
@@ -420,6 +459,11 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Narrow integers are kept sign-extended (`i32`) or zero-extended (`u32`, `u16`, `u8`) in their word; floats are kept as their bit pattern, `f32` zero-extended. Arithmetic, conversion and comparison values carry their type.
 - A variable passed as `mut` lives in a frame slot and is accessed with loads and stores; every other variable is pure SSA.
 - Integer division carries its zero and overflow checks inside the instruction.
+- A call to a C function becomes a `ccall` carrying its System V AMD64 plan. Each argument word is classified: integers, `bool` and pointers take `rdi`, `rsi`, `rdx`, `rcx`, `r8` and `r9`; floats take `xmm0` to `xmm7`; an `extern struct` of at most 16 bytes is split into eightbytes that go to vector registers when every field in them is a float and to integer registers otherwise; a larger struct, or one that does not fit in the registers still free, goes on the stack. Variadic `f32` arguments are widened to `f64`, and `al` holds the number of vector registers used. A struct result of at most 16 bytes comes back in `rax`, `rdx`, `xmm0` and `xmm1` by class; a larger one is written to a buffer whose address goes in `rdi`. Narrow integer, `bool` and `f32` results are re-extended, and so are narrow places passed as `mut` once the call returns.
+- Every frame keeps `rsp` 16-byte aligned at its calls, as C requires: frames are rounded to 16 bytes, and `_start` rounds the space it reserves for `main`'s result.
+- An `extern struct` value is its C bytes, one word per eightbyte. Its locals and parameters live in frame slots; a field is loaded or stored at its own width, and a struct literal or a field of a computed value goes through a temporary slot.
+- `defer` keeps a stack of deferred statements per block and lowers them again at every exit from that block.
+- In dev builds every C function gets a global trampoline, `cfn_name: jmp name`, and calls go through it, so a patch can link against the running binary.
 - An `embed` becomes an address and a length. The data is emitted with `.incbin` under a label named by the file's content hash, so a changed file changes the code of every function that embeds it.
 - Every value records whether it may hold a heap pointer. Loads, parameters and call results take this from their type's word layout, where an enum word counts as a pointer if any variant puts one there; constants, typed arithmetic, string literals and frame addresses never do; untyped address arithmetic and anything unclassified count as pointers; a phi holds a pointer if any input may. The prelude stores map entries as `__word`, an integer type the collector scans, because entries hold keys and values of any type.
 - A `str` is two words and a slice three. An element access computes `pointer + index * stride` after a `check` instruction, which compares unsigned and jumps to the index panic; packed elements load with `movzx`, `movsxd` or a 32-bit `mov` and store at their width.
@@ -480,29 +524,22 @@ Mechanism:
 - Builtins `print` for numbers, `bool` and `str`; `bytes` and `str`.
 - Modules as directories, imports, and `pub` visibility.
 - `embed` for compile-time file contents.
-- `extern` blocks naming C libraries, and dynamic linking against libc when any is named.
+- `extern` blocks naming C libraries and declaring their functions, and dynamic linking against libc when any is named.
+- C interop: System V calls, `extern struct`, `ptr` and `ptr[T]`, `view`, `load`, `store`, `cstr`, `str(p)`, `pin` and `unpin`.
+- `defer`.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
-1. C interop:
-   - Function declarations inside `extern` blocks.
-   - System V ABI thunks: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` and `xmm0` to `xmm7`, struct classification, 16-byte stack alignment.
-   - C struct layout with natural alignment, alongside the one-word-per-scalar layout.
-   - A nullable raw pointer type separate from `*T`.
-   - C strings.
-   - Unmanaged pointer-plus-length views over mmap'd and GPU-mapped memory.
-   - Explicit release of file descriptors and mappings.
-   - The garbage collector never frees memory held only by C.
-2. Function values, and C-callable function pointers for callbacks.
-3. Generics, with type erasure or dynamic dispatch for custom elements and views.
-4. Green-thread scheduler, channels, `select`:
+1. Function values, and C-callable function pointers for callbacks.
+2. Generics, with type erasure or dynamic dispatch for custom elements and views.
+3. Green-thread scheduler, channels, `select`:
     - OS threads are created with `pthread_create` when libc is linked, leaving TLS (`fs`) to glibc.
     - C calls run on a large system stack rather than the green-thread stack.
     - A netpoller (epoll) waits on file descriptors, timerfds and channels together.
-5. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-6. GPU UI library modelled on Zed's GPUI, Linux first:
+4. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
+5. GPU UI library modelled on Zed's GPUI, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
@@ -511,5 +548,5 @@ Mechanism:
     6. App and entity model with notify, observe and subscribe; foreground and background executors on the scheduler.
     7. Text input element, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     8. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-7. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-8. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+6. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+7. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

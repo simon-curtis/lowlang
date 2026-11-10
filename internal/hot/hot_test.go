@@ -70,6 +70,17 @@ func TestDynamicReload(t *testing.T) {
 	f.noRestart()
 }
 
+func TestReloadCallingC(t *testing.T) {
+	c := "extern \"c\" {\n    fn labs(n: i64) -> i64\n}\n\n"
+	f := newFixture(t, c+program("1"))
+	f.waitFor(f.stdout, "0\n")
+	f.write(c + program("labs(-6)"))
+	f.reload()
+	f.waitFor(f.stdout, "0\n6\ntrue\n")
+	f.waitFor(f.stderr, "low: reloaded value in")
+	f.noRestart()
+}
+
 func TestLibraryChangeRestarts(t *testing.T) {
 	f := newFixture(t, program("1"))
 	f.waitFor(f.stdout, "0\n")

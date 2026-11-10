@@ -17,7 +17,20 @@ type File struct {
 
 type Extern struct {
 	Library string
+	Funcs   []*Func
 	Pos     lexer.Pos
+}
+
+type Defer struct {
+	Body Stmt
+	Pos  lexer.Pos
+}
+
+func fieldWidth(e *Selector) *types.Type {
+	if types.StructOf(e.X.TypeOf()).C {
+		return e.Field.Type.Width()
+	}
+	return nil
 }
 
 type Import struct {
@@ -39,6 +52,7 @@ type TypeName struct {
 	Module   string
 	Name     string
 	Pointer  bool
+	Raw      bool
 	Slice    bool
 	Optional bool
 	Map      bool
@@ -52,6 +66,7 @@ type Place struct {
 	Ptr    Expr
 	Index  *Index
 	Offset int
+	Width  *types.Type
 }
 
 func PlaceOf(e Expr) (*Place, bool) {
@@ -64,14 +79,15 @@ func PlaceOf(e Expr) (*Place, bool) {
 		if e.Field == nil {
 			return nil, false
 		}
+		width := fieldWidth(e)
 		if e.X.TypeOf().Kind == types.PointerKind {
-			return &Place{Ptr: e.X, Offset: 8 * e.Field.Offset}, true
+			return &Place{Ptr: e.X, Offset: e.Field.Bytes, Width: width}, true
 		}
 		p, ok := PlaceOf(e.X)
 		if !ok {
 			return nil, false
 		}
-		return &Place{Local: p.Local, Ptr: p.Ptr, Index: p.Index, Offset: p.Offset + 8*e.Field.Offset}, true
+		return &Place{Local: p.Local, Ptr: p.Ptr, Index: p.Index, Offset: p.Offset + e.Field.Bytes, Width: width}, true
 	case *Index:
 		if e.X.TypeOf().Kind == types.SliceKind {
 			return &Place{Index: e}, true
@@ -101,6 +117,7 @@ type VariantDecl struct {
 
 type StructDecl struct {
 	Name   string
+	C      bool
 	Pub    bool
 	File   *File
 	Fields []*FieldDecl
@@ -126,6 +143,8 @@ type Func struct {
 	Name        string
 	Pub         bool
 	File        *File
+	Extern      *Extern
+	Variadic    bool
 	Params      []*Param
 	Result      *TypeName
 	Error       *TypeName
@@ -259,6 +278,7 @@ type Ident struct {
 	Pos     lexer.Pos
 	Local   *Local
 	Variant *types.Variant
+	Null    bool
 }
 
 type Selector struct {
@@ -422,6 +442,7 @@ func (n *Break) Position() lexer.Pos     { return n.Pos }
 func (n *Continue) Position() lexer.Pos  { return n.Pos }
 func (n *Return) Position() lexer.Pos    { return n.Pos }
 func (n *Fail) Position() lexer.Pos      { return n.Pos }
+func (n *Defer) Position() lexer.Pos     { return n.Pos }
 func (n *IntLit) Position() lexer.Pos    { return n.Pos }
 func (n *FloatLit) Position() lexer.Pos  { return n.Pos }
 func (n *StrLit) Position() lexer.Pos    { return n.Pos }
@@ -452,6 +473,7 @@ func (*Break) stmt()    {}
 func (*Continue) stmt() {}
 func (*Return) stmt()   {}
 func (*Fail) stmt()     {}
+func (*Defer) stmt()    {}
 func (*ForIn) stmt()    {}
 
 func (*Block) expr()     {}

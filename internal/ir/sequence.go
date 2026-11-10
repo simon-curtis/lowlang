@@ -143,6 +143,9 @@ func (b *builder) runtimeVoid(name string, args ...*Value) {
 }
 
 func (b *builder) builtin(e *ast.Call) []*Value {
+	if words, ok := b.pointerBuiltin(e); ok {
+		return words
+	}
 	arg := e.Args[0]
 	switch e.Builtin {
 	case "push":
@@ -282,7 +285,7 @@ func (b *builder) rangeLoop(s *ast.ForIn) {
 }
 
 func (b *builder) loopBody(body *ast.Block, next, exit *Block) {
-	b.loops = append(b.loops, loopTarget{cont: next, brk: exit})
+	b.loops = append(b.loops, loopTarget{cont: next, brk: exit, depth: len(b.defers)})
 	b.block(body)
 	b.loops = b.loops[:len(b.loops)-1]
 	b.jump(next)
