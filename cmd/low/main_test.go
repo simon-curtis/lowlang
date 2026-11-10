@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -64,6 +66,25 @@ func runFixture(t *testing.T, path string) {
 	}
 	if panics != (runErr != nil) {
 		t.Errorf("exit error %v, expected panic %v", runErr, panics)
+	}
+	checkMemory(t, path, cmd.ProcessState)
+}
+
+func checkMemory(t *testing.T, path string, state *os.ProcessState) {
+	limit, ok := expected(t, path, ".maxrss")
+	if !ok {
+		return
+	}
+	kb, err := strconv.ParseInt(strings.TrimSpace(limit), 10, 64)
+	if err != nil {
+		t.Fatalf("invalid .maxrss: %v", err)
+	}
+	usage, ok := state.SysUsage().(*syscall.Rusage)
+	if !ok {
+		t.Fatal("resource usage unavailable")
+	}
+	if usage.Maxrss > kb {
+		t.Errorf("peak memory %d KB exceeds %d KB", usage.Maxrss, kb)
 	}
 }
 

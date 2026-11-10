@@ -13,6 +13,7 @@ const (
 	EnumKind
 	StructKind
 	ResultKind
+	PointerKind
 )
 
 type Type struct {
@@ -20,6 +21,7 @@ type Type struct {
 	Name     string
 	Variants []*Variant
 	Fields   []*Field
+	Elem     *Type
 	Ok       *Type
 	Err      *Type
 	size     int
@@ -52,6 +54,10 @@ func NewEnum(name string) *Type {
 
 func NewStruct(name string) *Type {
 	return &Type{Kind: StructKind, Name: name, size: -1}
+}
+
+func NewPointer(elem *Type) *Type {
+	return &Type{Kind: PointerKind, Name: fmt.Sprintf("*%s", elem), Elem: elem, size: 1}
 }
 
 func NewResult(ok, err *Type) *Type {

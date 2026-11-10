@@ -70,6 +70,8 @@ func mem(offset int) string {
 func (g *Generator) start(main *ast.Func) {
 	ret := main.RetType
 	g.text.WriteString("\t.globl _start\n_start:\n")
+	g.emit("mov [rip+rt_stack_top], rsp")
+	g.emit("call rt_gc_init")
 	if ret.Kind == types.ResultKind {
 		exit := g.newLabel()
 		g.emit("sub rsp, %d", 8*ret.Size())
@@ -209,22 +211,35 @@ func frame(offset int) address {
 	return func(word int) string { return mem(offset + 8*word) }
 }
 
-func (g *Generator) at(l *ast.Local, offset int) address {
-	if !l.Ref {
-		return frame(l.Offset + offset)
-	}
-	g.emit("mov rdx, %s", mem(l.Offset))
-	return func(word int) string { return fmt.Sprintf("qword ptr [rdx+%d]", offset+8*word) }
+func via(reg string, offset int) address {
+	return func(word int) string { return fmt.Sprintf("qword ptr [%s+%d]", reg, offset+8*word) }
 }
 
-func (g *Generator) address(l *ast.Local, offset int) {
-	if !l.Ref {
-		g.emit("lea rax, [rbp%+d]", l.Offset+offset)
+func (g *Generator) at(p *ast.Place) address {
+	switch {
+	case p.Ptr != nil:
+		g.expr(p.Ptr)
+		g.emit("mov rdx, rax")
+		return via("rdx", p.Offset)
+	case p.Local.Ref:
+		g.emit("mov rdx, %s", mem(p.Local.Offset))
+		return via("rdx", p.Offset)
+	}
+	return frame(p.Local.Offset + p.Offset)
+}
+
+func (g *Generator) address(p *ast.Place) {
+	switch {
+	case p.Ptr != nil:
+		g.expr(p.Ptr)
+	case p.Local.Ref:
+		g.emit("mov rax, %s", mem(p.Local.Offset))
+	default:
+		g.emit("lea rax, [rbp%+d]", p.Local.Offset+p.Offset)
 		return
 	}
-	g.emit("mov rax, %s", mem(l.Offset))
-	if offset > 0 {
-		g.emit("add rax, %d", offset)
+	if p.Offset > 0 {
+		g.emit("add rax, %d", p.Offset)
 	}
 }
 
@@ -315,13 +330,26 @@ var compoundOps = map[lexer.Kind]lexer.Kind{
 }
 
 func (g *Generator) assign(s *ast.Assign) {
+	t := s.Target.TypeOf()
 	g.expr(s.Value)
+	if t.Scalar() {
+		g.push("rax")
+	}
+	g.address(s.Place)
+	g.emit("mov rdx, rax")
+	if !t.Scalar() {
+		g.storeTo(t, via("rdx", 0))
+		return
+	}
+	g.pop("rax")
 	if op, ok := compoundOps[s.Op]; ok {
 		g.emit("mov rcx, rax")
-		g.emit("mov rax, %s", g.at(s.Root, s.Offset)(0))
+		g.emit("mov rax, qword ptr [rdx]")
+		g.push("rdx")
 		g.arith(op)
+		g.pop("rdx")
 	}
-	g.storeTo(s.Target.TypeOf(), g.at(s.Root, s.Offset))
+	g.emit("mov qword ptr [rdx], rax")
 }
 
 func (g *Generator) forStmt(s *ast.For) {
@@ -354,7 +382,7 @@ func (g *Generator) expr(e ast.Expr) {
 			g.construct(e.Type, e.Variant, nil)
 			return
 		}
-		g.loadFrom(e.Type, g.at(e.Local, 0))
+		g.loadFrom(e.Type, g.at(&ast.Place{Local: e.Local}))
 	case *ast.Selector:
 		g.selector(e)
 	case *ast.StructLit:
@@ -388,6 +416,10 @@ func boolInt(b bool) int {
 }
 
 func (g *Generator) unary(e *ast.Unary) {
+	if e.Op == lexer.Star {
+		g.loadFrom(e.Type, g.at(&ast.Place{Ptr: e.X}))
+		return
+	}
 	g.expr(e.X)
 	if e.Op == lexer.Not {
 		g.emit("xor rax, 1")
@@ -483,6 +515,8 @@ func (g *Generator) logical(e *ast.Binary) {
 
 func (g *Generator) call(e *ast.Call) {
 	switch {
+	case e.Builtin == "new":
+		g.allocate(e.Args[0])
 	case e.Builtin != "":
 		g.expr(e.Args[0])
 		g.emit("mov rdi, rax")
@@ -494,12 +528,30 @@ func (g *Generator) call(e *ast.Call) {
 	}
 }
 
+func (g *Generator) allocate(value ast.Expr) {
+	t := value.TypeOf()
+	g.expr(value)
+	if t.Scalar() {
+		g.push("rax")
+	}
+	g.emit("mov edi, %d", t.Size())
+	g.emit("call rt_alloc")
+	g.emit("mov rdx, rax")
+	if t.Scalar() {
+		g.pop("rcx")
+		g.emit("mov qword ptr [rdx], rcx")
+	} else {
+		g.storeTo(t, via("rdx", 0))
+	}
+	g.emit("mov rax, rdx")
+}
+
 func (g *Generator) callFunc(e *ast.Call) {
 	fn := e.Target
 	offset := g.reserve(fn.RetType.StackWords() + fn.ParamWords)
 	for i, arg := range e.Args {
 		if r, ok := arg.(*ast.Ref); ok {
-			g.address(r.Root, r.Offset)
+			g.address(r.Place)
 			g.emit("mov %s, rax", mem(offset))
 		} else {
 			g.expr(arg)
@@ -529,29 +581,12 @@ func (g *Generator) selector(e *ast.Selector) {
 		g.construct(e.Type, e.Variant, nil)
 		return
 	}
-	if root, offset, ok := place(e); ok {
-		g.loadFrom(e.Type, g.at(root, offset))
+	if p, ok := ast.PlaceOf(e); ok {
+		g.loadFrom(e.Type, g.at(p))
 		return
 	}
 	g.expr(e.X)
 	g.extract(e.X.TypeOf(), e.Field.Offset, e.Type)
-}
-
-func place(e ast.Expr) (*ast.Local, int, bool) {
-	switch e := e.(type) {
-	case *ast.Ident:
-		if e.Local != nil {
-			return e.Local, 0, true
-		}
-	case *ast.Selector:
-		if e.Field == nil {
-			return nil, 0, false
-		}
-		if root, offset, ok := place(e.X); ok {
-			return root, offset + 8*e.Field.Offset, true
-		}
-	}
-	return nil, 0, false
 }
 
 func (g *Generator) extract(whole *types.Type, offset int, part *types.Type) {

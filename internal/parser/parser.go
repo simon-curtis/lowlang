@@ -215,8 +215,14 @@ func (p *Parser) param() *ast.Param {
 }
 
 func (p *Parser) typeName() *ast.TypeName {
+	pos := p.tok().Pos
+	pointers := 0
+	for p.at(lexer.Star) {
+		p.next()
+		pointers++
+	}
 	t := p.expect(lexer.Ident)
-	return &ast.TypeName{Name: t.Text, Pos: t.Pos}
+	return &ast.TypeName{Name: t.Text, Pointers: pointers, Pos: pos}
 }
 
 func (p *Parser) block() *ast.Block {
@@ -313,7 +319,7 @@ func (p *Parser) binary(minPrec int) ast.Expr {
 
 func (p *Parser) unary() ast.Expr {
 	t := p.tok()
-	if t.Kind == lexer.Minus || t.Kind == lexer.Not {
+	if t.Kind == lexer.Minus || t.Kind == lexer.Not || t.Kind == lexer.Star {
 		p.next()
 		return &ast.Unary{Op: t.Kind, X: p.unary(), Pos: t.Pos}
 	}

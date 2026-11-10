@@ -12,8 +12,41 @@ type File struct {
 }
 
 type TypeName struct {
-	Name string
-	Pos  lexer.Pos
+	Name     string
+	Pointers int
+	Pos      lexer.Pos
+}
+
+type Place struct {
+	Local  *Local
+	Ptr    Expr
+	Offset int
+}
+
+func PlaceOf(e Expr) (*Place, bool) {
+	switch e := e.(type) {
+	case *Ident:
+		if e.Local != nil {
+			return &Place{Local: e.Local}, true
+		}
+	case *Selector:
+		if e.Field == nil {
+			return nil, false
+		}
+		if e.X.TypeOf().Kind == types.PointerKind {
+			return &Place{Ptr: e.X, Offset: 8 * e.Field.Offset}, true
+		}
+		p, ok := PlaceOf(e.X)
+		if !ok {
+			return nil, false
+		}
+		return &Place{Local: p.Local, Ptr: p.Ptr, Offset: p.Offset + 8*e.Field.Offset}, true
+	case *Unary:
+		if e.Op == lexer.Star {
+			return &Place{Ptr: e.X}, true
+		}
+	}
+	return nil, false
 }
 
 type EnumDecl struct {
@@ -123,8 +156,7 @@ type Assign struct {
 	Op     lexer.Kind
 	Value  Expr
 	Pos    lexer.Pos
-	Root   *Local
-	Offset int
+	Place  *Place
 }
 
 type ExprStmt struct {
@@ -192,10 +224,9 @@ type Selector struct {
 
 type Ref struct {
 	Typed
-	X      Expr
-	Pos    lexer.Pos
-	Root   *Local
-	Offset int
+	X     Expr
+	Pos   lexer.Pos
+	Place *Place
 }
 
 type StructLit struct {

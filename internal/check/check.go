@@ -30,6 +30,7 @@ type Checker struct {
 	funcs   map[string]*ast.Func
 	named   map[string]*types.Type
 	results map[[2]*types.Type]*types.Type
+	ptrs    map[*types.Type]*types.Type
 	fn      *ast.Func
 	scopes  []map[string]*ast.Local
 	loops   []*loop
@@ -40,6 +41,7 @@ func Check(file *ast.File) (err error) {
 		funcs:   map[string]*ast.Func{},
 		named:   map[string]*types.Type{"i64": types.I64, "bool": types.Bool, "str": types.Str},
 		results: map[[2]*types.Type]*types.Type{},
+		ptrs:    map[*types.Type]*types.Type{},
 	}
 	defer func() {
 		r := recover()
@@ -65,7 +67,26 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 	if !ok {
 		c.fail(t.Pos, "unknown type %s", t.Name)
 	}
+	for range t.Pointers {
+		typ = c.pointer(typ)
+	}
 	return typ
+}
+
+func (c *Checker) pointer(elem *types.Type) *types.Type {
+	if p, ok := c.ptrs[elem]; ok {
+		return p
+	}
+	p := types.NewPointer(elem)
+	c.ptrs[elem] = p
+	return p
+}
+
+func deref(t *types.Type) *types.Type {
+	if t.Kind == types.PointerKind {
+		return t.Elem
+	}
+	return t
 }
 
 func (c *Checker) result(ok, err *types.Type) *types.Type {
@@ -156,8 +177,8 @@ func (c *Checker) declareFuncs(funcs []*ast.Func) {
 		if _, dup := c.funcs[fn.Name]; dup {
 			c.fail(fn.Pos, "function %s already declared", fn.Name)
 		}
-		if fn.Name == "print" {
-			c.fail(fn.Pos, "print is a builtin")
+		if fn.Name == "print" || fn.Name == "new" {
+			c.fail(fn.Pos, "%s is a builtin", fn.Name)
 		}
 		c.signature(fn)
 		c.funcs[fn.Name] = fn
@@ -344,11 +365,7 @@ func (c *Checker) let(s *ast.Let) {
 }
 
 func (c *Checker) assign(s *ast.Assign) {
-	root, offset, t, ok := c.place(s.Target)
-	if !ok {
-		c.fail(s.Target.Position(), "cannot assign to this expression")
-	}
-	c.mutable(root, s.Pos, "assign to %s")
+	place, t := c.place(s.Target, s.Pos, "assign to %s", "cannot assign to this expression")
 	value := c.plain(s.Value, t)
 	if value != t && value != types.Never {
 		c.fail(s.Value.Position(), "cannot assign %s to a place of type %s", value, t)
@@ -356,8 +373,7 @@ func (c *Checker) assign(s *ast.Assign) {
 	if s.Op != lexer.Assign && t != types.I64 {
 		c.fail(s.Pos, "operator %s requires i64, found %s", s.Op, t)
 	}
-	s.Root = root
-	s.Offset = offset
+	s.Place = place
 }
 
 func (c *Checker) mutable(root *ast.Local, pos lexer.Pos, action string) {
@@ -369,38 +385,24 @@ func (c *Checker) mutable(root *ast.Local, pos lexer.Pos, action string) {
 	}
 }
 
-func (c *Checker) place(e ast.Expr) (*ast.Local, int, *types.Type, bool) {
-	switch e := e.(type) {
-	case *ast.Ident:
-		e.Local = c.lookup(e.Name, e.Pos)
-		e.Type = e.Local.Type
-		return e.Local, 0, e.Type, true
-	case *ast.Selector:
-		if c.typeRef(e.X) != nil {
-			return nil, 0, nil, false
-		}
-		root, offset, t, ok := c.place(e.X)
-		if !ok {
-			return nil, 0, nil, false
-		}
-		e.Field = c.field(t, e.Name, e.Pos)
-		e.Type = e.Field.Type
-		return root, offset + 8*e.Field.Offset, e.Type, true
+func (c *Checker) place(e ast.Expr, pos lexer.Pos, action, invalid string) (*ast.Place, *types.Type) {
+	t := c.plain(e, nil)
+	place, ok := ast.PlaceOf(e)
+	if !ok {
+		c.fail(pos, "%s", invalid)
 	}
-	return nil, 0, nil, false
+	if place.Local != nil {
+		c.mutable(place.Local, pos, action)
+	}
+	return place, t
 }
 
 func (c *Checker) ref(r *ast.Ref, want *types.Type) {
-	root, offset, t, ok := c.place(r.X)
-	if !ok {
-		c.fail(r.Pos, "mut argument must be a variable or a field of one")
-	}
-	c.mutable(root, r.Pos, "pass %s as mut")
+	place, t := c.place(r.X, r.Pos, "pass %s as mut", "mut argument must be a variable, a field, or a dereferenced pointer")
 	if t != want {
 		c.fail(r.Pos, "expected %s, found %s", want, t)
 	}
-	r.Root = root
-	r.Offset = offset
+	r.Place = place
 	r.Type = t
 }
 
@@ -413,7 +415,7 @@ func (c *Checker) exclusive(args []ast.Expr) {
 		}
 		for _, other := range refs {
 			if overlaps(r, other) {
-				c.fail(r.Pos, "%s is already passed as mut in this call", r.Root.Name)
+				c.fail(r.Pos, "%s is already passed as mut in this call", r.Place.Local.Name)
 			}
 		}
 		refs = append(refs, r)
@@ -421,9 +423,10 @@ func (c *Checker) exclusive(args []ast.Expr) {
 }
 
 func overlaps(a, b *ast.Ref) bool {
-	return a.Root == b.Root &&
-		a.Offset < b.Offset+8*b.Type.Size() &&
-		b.Offset < a.Offset+8*a.Type.Size()
+	pa, pb := a.Place, b.Place
+	return pa.Local != nil && pa.Local == pb.Local &&
+		pa.Offset < pb.Offset+8*b.Type.Size() &&
+		pb.Offset < pa.Offset+8*a.Type.Size()
 }
 
 func (c *Checker) forStmt(s *ast.For) bool {
@@ -576,7 +579,7 @@ func (c *Checker) selector(e *ast.Selector) {
 		e.Type = t
 		return
 	}
-	e.Field = c.field(c.plain(e.X, nil), e.Name, e.Pos)
+	e.Field = c.field(deref(c.plain(e.X, nil)), e.Name, e.Pos)
 	e.Type = e.Field.Type
 }
 
@@ -625,12 +628,20 @@ func (c *Checker) unitVariant(v *types.Variant, pos lexer.Pos) {
 }
 
 func (c *Checker) unary(e *ast.Unary) {
-	want := types.I64
-	if e.Op == lexer.Not {
-		want = types.Bool
+	switch e.Op {
+	case lexer.Star:
+		t := c.plain(e.X, nil)
+		if t.Kind != types.PointerKind {
+			c.fail(e.Pos, "cannot dereference a value of type %s", t)
+		}
+		e.Type = t.Elem
+	case lexer.Not:
+		c.expectType(e.X, types.Bool)
+		e.Type = types.Bool
+	default:
+		c.expectType(e.X, types.I64)
+		e.Type = types.I64
 	}
-	c.expectType(e.X, want)
-	e.Type = want
 }
 
 func (c *Checker) binary(e *ast.Binary) {
@@ -641,7 +652,7 @@ func (c *Checker) binary(e *ast.Binary) {
 		e.Type = types.Bool
 	case lexer.Eq, lexer.NotEq:
 		x := c.plain(e.X, nil)
-		if x != types.I64 && x != types.Bool && x != types.Str {
+		if x != types.I64 && x != types.Bool && x != types.Str && x.Kind != types.PointerKind {
 			c.fail(e.X.Position(), "cannot compare values of type %s", x)
 		}
 		c.expectType(e.Y, x)
@@ -664,6 +675,10 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 	case *ast.Ident:
 		if fn.Name == "print" {
 			c.print(e)
+			return
+		}
+		if fn.Name == "new" {
+			c.allocate(e, want)
 			return
 		}
 		if v := c.inferVariant(want, fn.Name); v != nil {
@@ -701,6 +716,22 @@ func (c *Checker) variantCall(e *ast.Call, sel *ast.Selector) {
 		c.fail(e.Pos, "cannot call this expression")
 	}
 	c.construct(e, t, c.variant(t, sel.Name, sel.Pos))
+}
+
+func (c *Checker) allocate(e *ast.Call, want *types.Type) {
+	if len(e.Args) != 1 {
+		c.fail(e.Pos, "new takes 1 argument, found %d", len(e.Args))
+	}
+	var elem *types.Type
+	if want != nil && want.Kind == types.PointerKind {
+		elem = want.Elem
+	}
+	t := c.plain(e.Args[0], elem)
+	if t == types.Void || t == types.Never {
+		c.fail(e.Args[0].Position(), "cannot allocate a value of type %s", t)
+	}
+	e.Builtin = "new"
+	e.Type = c.pointer(t)
 }
 
 func (c *Checker) callFunc(e *ast.Call, fn *ast.Func) {

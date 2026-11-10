@@ -70,7 +70,7 @@ print(len(p) + len(q))
 - Structs are values: assignment and argument passing copy them.
 - Fields are assigned through a `var` binding or a `mut` parameter, at any depth: `r.max.x = 1`. Other parameters are immutable.
 - A struct literal cannot appear directly in an `if`, `for` or `match` condition; wrap it in parentheses.
-- A struct cannot contain itself until heap allocation exists.
+- A struct cannot contain itself by value; it can hold a `*` pointer to its own type.
 - Fields are laid out in declaration order, one word per scalar, with no padding.
 
 ### References
@@ -92,6 +92,29 @@ swap(mut x, mut y)
 - One call cannot pass overlapping places as `mut`: `swap(mut p.x, mut p.x)` is rejected, while `swap(mut p.x, mut p.y)` is allowed. Two `mut` parameters therefore never alias.
 - References exist only as parameters. They cannot be stored, returned or bound with `let`, so they never outlive the variable they refer to.
 - A `mut` parameter occupies one word holding the address of the place.
+
+### Pointers
+
+```low
+enum List {
+    Cons(i64, *List)
+    Nil
+}
+
+var list = List.Nil
+list = Cons(1, new(list))
+
+let c = new(Counter { hits: 0 })
+c.hits += 1
+bump(mut *c)
+let copy = *c
+```
+
+- `new(value)` copies a value onto the garbage-collected heap and returns a `*T`. Pointers are never null.
+- `p.field` reads and writes through the pointer; `*p` is the whole value, readable, assignable and passable as `mut`.
+- The object behind a pointer is mutable through any pointer to it, including one held by `let`.
+- `==` and `!=` on pointers compare identity.
+- `mut` arguments through pointers are not checked for overlap, since two pointers may refer to the same object.
 
 ### Enums
 
@@ -116,7 +139,7 @@ fn area(s: Shape) -> f64 {
 - An arm body is an expression, or `break`, `continue`, `return` or `fail`.
 - Variants are constructed as `Shape.Circle(2)`. Where the expected type is known (an annotated `let`, an argument, an assignment, a return, `fail`), the bare name works: `let s: Shape = Empty`.
 - Variants with no payload in an enum where no variant has one are a single word. Otherwise an enum is a tag word followed by the largest variant's fields.
-- An enum cannot contain itself until heap allocation exists.
+- An enum cannot contain itself by value; it can hold a `*` pointer to its own type.
 
 ### Optionals
 
@@ -201,6 +224,15 @@ The `low` command lives in `cmd/low`.
 
 The runtime, `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls.
 
+The garbage collector is a non-moving mark-sweep collector in the runtime:
+
+- The heap is a 16 GB reservation made with `mmap` and `MAP_NORESERVE`; pages are committed as they are touched.
+- Each object has a one-word header holding its size in words, a mark bit and a free bit. A bitmap records the first word of every object and free chunk, which resolves pointers into the middle of an object, such as a `mut` parameter aimed at a heap field.
+- Allocation takes from exact-size free lists for objects under 64 words, then first-fit from a list of larger chunks, splitting them, then from the end of the heap.
+- Collection runs when the words allocated since the last one exceed the words that survived it, with a 4 MB floor.
+- Roots are found by scanning the whole stack conservatively; heap objects are scanned conservatively too. Any word holding a heap address keeps that object alive. Precise scanning needs pointer maps from the compiler, which arrive with the SSA IR.
+- Sweeping coalesces adjacent dead objects into free chunks and returns a trailing free run to the end of the heap.
+
 Code generation is a stack machine. A one-word value lands in `rax`; a wider value (an enum with payload, a result) is pushed onto the stack with its first word lowest. All locals live in the frame, at offsets assigned by the checker. The generator tracks stack depth so `break` and `continue` can unwind partly built expressions.
 
 Calls reserve stack space for a wide return value and the arguments, then evaluate arguments left to right into it. The callee finds argument 0 at `rbp+16` and writes a wide result just above the arguments; a one-word result returns in `rax`.
@@ -209,26 +241,26 @@ On fib(38) this runs at 1.5x Go's time, which the SSA IR and register allocator 
 
 ## Tests
 
-`go test ./...` compiles every `testdata/run/*.low`, runs it and compares stdout with `.out` and stderr with `.err`. Each `testdata/fail/*.low` must fail to compile with the message in its `.err`.
+`go test ./...` compiles every `testdata/run/*.low`, runs it and compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. Each `testdata/fail/*.low` must fail to compile with the message in its `.err`.
 
 ## Implemented
 
-- Types: `i64`, `bool`, `str`, structs, enums with payloads, results `T ! E`.
+- Types: `i64`, `bool`, `str`, structs, enums with payloads, results `T ! E`, pointers `*T`.
 - `let`, `var`, assignment, `if`/`else`, `for cond`, `for` with `break`/`continue`, `return`.
 - Functions with parameters and return values, recursion.
 - Arithmetic, comparison and logical operators.
 - `match`, `fail`, `?`, `catch`.
 - `mut` parameters.
+- Pointers, `new`, and a garbage-collected heap.
 - Builtins `print(i64)`, `print(str)`, `print(bool)`.
 - Target: linux/amd64.
 
 ## Roadmap
 
 1. SSA IR between check and codegen, with register allocation.
-2. Heap allocation and tracing GC, with pointers for shared and recursive structs and enums.
-3. Slices, strings with length, maps.
-4. Optionals.
-5. Generics.
-6. Green-thread scheduler, channels, `select`.
-7. Own assembler and linker replacing `as` and `ld`.
-8. Further targets: linux/arm64, darwin, windows.
+2. Slices, strings with length, maps.
+3. Optionals.
+4. Generics.
+5. Green-thread scheduler, channels, `select`.
+6. Own assembler and linker replacing `as` and `ld`.
+7. Further targets: linux/arm64, darwin, windows.
