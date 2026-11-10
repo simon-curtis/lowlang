@@ -1635,7 +1635,7 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 			return
 		}
 		if !t.Ordered() && t != types.Never {
-			c.fail(e.Pos, "operator %s requires a number, found %s", e.Op, t)
+			c.fail(e.Pos, "operator %s requires a number or str, found %s", e.Op, t)
 		}
 		e.Type = types.Bool
 	case lexer.Percent, lexer.Amp, lexer.Pipe, lexer.Caret:
@@ -1662,7 +1662,7 @@ var builtins = map[string]bool{
 	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
 	"delete": true, "embed": true, "__str_raw": true,
 	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
-	"__bits": true, "__str_view": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true, "__ctz": true, "__clock_nanos": true,
+	"__bits": true, "__str_view": true, "__extend": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true, "__ctz": true, "__clock_nanos": true,
 	"__spawn": true, "__current": true, "__park": true, "__ready": true, "__lock": true, "__unlock": true, "__cas": true, "__panic": true,
 	"__context": true, "__set_context": true, "__has_context": true,
 }
@@ -1989,6 +1989,16 @@ func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 			c.fail(e.Args[1].Position(), "expected %s, found %s", dst, src)
 		}
 		e.Builtin, e.Type = name, types.I64
+	case "__extend":
+		if len(e.Args) != 2 {
+			c.fail(e.Pos, "__extend takes 2 arguments")
+		}
+		r, ok := e.Args[0].(*ast.Ref)
+		if !ok || c.borrow(r) != c.slice(types.U8) {
+			c.fail(e.Pos, "__extend needs a mut []u8")
+		}
+		c.expectType(e.Args[1], types.Str)
+		e.Builtin, e.Type = name, types.Void
 	case "__str_view":
 		c.single(e, name)
 		c.expectType(e.Args[0], c.slice(types.U8))
@@ -2349,7 +2359,7 @@ func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos lexer.Pos) *
 	wildcard, tested := false, false
 	for _, arm := range arms {
 		if wildcard {
-			c.fail(arm.Pattern.Pos, "unreachable arm after _")
+			c.fail(arm.Pattern.Pos, "unreachable arm; an earlier arm matches everything")
 		}
 		c.pushScope()
 		c.pattern(arm.Pattern, enum)
@@ -2397,6 +2407,13 @@ func (c *Checker) pattern(p *ast.Pattern, enum *types.Type) {
 		c.subjects = c.subjects[:len(c.subjects)-1]
 		return
 	}
+	if binds(p.Name) && (enum.Kind != types.EnumKind || enum.Variant(p.Name) == nil) {
+		if len(p.Bindings) > 0 {
+			c.fail(p.Pos, "%s has no variant %s", enum, p.Name)
+		}
+		p.Local = c.declare(p.Name, enum, false)
+		return
+	}
 	if p.Name != "_" && enum.Kind != types.EnumKind {
 		c.fail(p.Pos, "an arm matching %s starts with an operator, such as == or <", enum)
 	}
@@ -2416,6 +2433,10 @@ func (c *Checker) pattern(p *ast.Pattern, enum *types.Type) {
 			b.Local = c.declare(b.Name, fields[i], false)
 		}
 	}
+}
+
+func binds(name string) bool {
+	return name[0] >= 'a' && name[0] <= 'z'
 }
 
 func (c *Checker) errorResult(e ast.Expr, keyword string, pos lexer.Pos, want *types.Type) *types.Type {

@@ -123,6 +123,10 @@ func (b *builder) strings(e *ast.Binary) []*Value {
 	if e.Op == lexer.Plus {
 		return b.callNamed("__concat", x[0], x[1], y[0], y[1])
 	}
+	if e.Op != lexer.Eq && e.Op != lexer.NotEq {
+		order := b.callNamed("__str_cmp", x[0], x[1], y[0], y[1])[0]
+		return []*Value{b.typed(arith[e.Op], types.I64, order, b.constant(0))}
+	}
 	equal := b.runtime("str_eq", x[0], x[1], y[0], y[1])
 	equal.Scalar = true
 	if e.Op == lexer.NotEq {
@@ -158,6 +162,9 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 	switch e.Builtin {
 	case "push":
 		b.push(e)
+		return nil
+	case "__extend":
+		b.extend(e)
 		return nil
 	case "delete":
 		b.deleteEntry(e)
@@ -240,6 +247,34 @@ func (b *builder) syscall(args []ast.Expr) *Value {
 	result := b.runtime("syscall", words...)
 	result.Scalar = true
 	return result
+}
+
+func (b *builder) extend(e *ast.Call) {
+	ref := e.Args[0].(*ast.Ref)
+	header := b.address(b.place(ref.Place))
+	src := b.value(e.Args[1], types.Str)
+	slice := b.load(place{addr: header}, ref.Type)
+	ptr, length, capacity := slice[0], slice[1], slice[2]
+	needed := b.emit(OpAdd, length, src[1])
+	temp := b.newTemp()
+	grow := b.newBlock()
+	keep := b.newBlock()
+	done := b.newBlock()
+	b.branch(b.emit(OpGt, needed, capacity), grow, keep)
+	b.enter(grow)
+	grown := b.emit(OpAdd, b.emit(OpMul, capacity, b.constant(2)), b.emit(OpAdd, src[1], b.constant(4)))
+	moved := b.runtime("grow", ptr, length, grown, b.constant(0))
+	b.store(place{addr: header}, []*Value{moved})
+	b.store(place{addr: header, offset: 16}, []*Value{grown})
+	b.writeTemp(temp, []*Value{moved})
+	b.jump(done)
+	b.enter(keep)
+	b.writeTemp(temp, []*Value{ptr})
+	b.jump(done)
+	b.enter(done)
+	base := b.readTemp(temp, 1)[0]
+	b.runtimeVoid("memmove", b.emit(OpAdd, base, length), src[0], src[1])
+	b.store(place{addr: header, offset: 8}, []*Value{needed})
 }
 
 func (b *builder) push(e *ast.Call) {

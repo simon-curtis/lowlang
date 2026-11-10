@@ -81,7 +81,7 @@ func (t *Type) Comparable() bool {
 }
 
 func (t *Type) Ordered() bool {
-	return t.Number() || t.has(Ord)
+	return t.Number() || t == Str || t.has(Ord)
 }
 
 func (t *Type) Abstract() bool {

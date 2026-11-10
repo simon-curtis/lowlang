@@ -106,7 +106,7 @@ func cPlan(symbol string, ret *types.Type, argTypes []*types.Type, mut []bool) *
 }
 
 func (b *builder) cCall(e *ast.Call) []*Value {
-	return b.cInvoke(e.Target.Name, e.Target.ParamTypes, e.Target.RetType, nil, e.Args)
+	return b.cInvoke(e.Target.Symbol, e.Target.ParamTypes, e.Target.RetType, nil, e.Args)
 }
 
 func (b *builder) cInvoke(symbol string, params []*types.Type, ret *types.Type, callee []*Value, exprs []ast.Expr) []*Value {

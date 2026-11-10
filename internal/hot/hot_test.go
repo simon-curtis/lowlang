@@ -72,7 +72,7 @@ func TestDynamicReload(t *testing.T) {
 
 func TestReloadCallingC(t *testing.T) {
 	c := "extern \"c\" {\n    fn labs(n: i64) -> i64\n}\n\n"
-	f := newFixture(t, c+program("1"))
+	f := newFixture(t, c+program("labs(1)"))
 	f.waitFor(f.stdout, "0\n")
 	f.write(c + program("labs(-6)"))
 	f.reload()
@@ -84,7 +84,7 @@ func TestReloadCallingC(t *testing.T) {
 func TestLibraryChangeRestarts(t *testing.T) {
 	f := newFixture(t, program("1"))
 	f.waitFor(f.stdout, "0\n")
-	f.write("extern \"m\" {}\n\n" + program("2"))
+	f.write("extern \"m\" {\n    fn cbrt(x: f64) -> f64\n}\n\n" + program("i64(cbrt(8.0))"))
 	f.reload()
 	f.waitFor(f.stderr, "low: restarted: linked libraries changed")
 	f.waitFor(f.stdout, "0\n0\n2\n")

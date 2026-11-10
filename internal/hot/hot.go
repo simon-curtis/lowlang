@@ -44,6 +44,7 @@ type Session struct {
 	signatures map[string]string
 	layout     string
 	libraries  []string
+	cSymbols   []string
 	next       uint64
 	builds     int
 }
@@ -185,6 +186,9 @@ func (s *Session) restartReason(unit *compiler.Unit) string {
 	if !slices.Equal(unit.Program.Libraries, s.libraries) {
 		return "linked libraries changed"
 	}
+	if !slices.Equal(unit.Program.CSymbols, s.cSymbols) {
+		return "called C functions changed"
+	}
 	if layout(unit.Files) != s.layout {
 		return "type layout changed"
 	}
@@ -244,6 +248,7 @@ func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string)
 	s.table, s.funcs = table, out.Funcs
 	s.signatures, s.layout = signatures(unit.Files), layout(unit.Files)
 	s.libraries = unit.Program.Libraries
+	s.cSymbols = unit.Program.CSymbols
 	s.next = 0
 	s.logf("%s", reason)
 	return nil

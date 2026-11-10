@@ -205,6 +205,7 @@ type Func struct {
 	Pub         bool
 	File        *File
 	Extern      *Extern
+	Symbol      string
 	Variadic    bool
 	Closure     *Closure
 	AsValue     bool
@@ -514,6 +515,7 @@ type Pattern struct {
 	Test     Expr
 	Pos      lexer.Pos
 	Variant  *types.Variant
+	Local    *Local
 }
 
 type Subject struct {

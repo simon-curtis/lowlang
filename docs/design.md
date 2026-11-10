@@ -86,6 +86,7 @@ rows: for row, cells in grid {
 - `for i in a..b` counts from `a` up to but not including `b`; the bounds are integers of one type.
 - `for x in xs` visits each element of a slice, and `for i, x in xs` also binds its index as `i64`.
 - Loop variables are immutable. `continue` moves to the next element.
+- `break`, `continue`, `return` and `fail` are expressions of type never, so they can stand wherever a value is expected: after `??`, in an arm, or as a branch of `if`.
 - A loop can be labelled with `name:` before `for`; `break name` and `continue name` then act on that loop from inside nested loops, running the deferred statements and drops of every block they leave. A label must be used, cannot repeat the label of an enclosing loop, and is not visible inside closures.
 
 ### Numbers
@@ -194,7 +195,7 @@ let copy = str(bytes(name))
 - Floats are formatted as the shortest decimal that reads back to the same value: positional for exponents from -6 to 20, otherwise `1.5e-7` or `1e+21`. Infinities print as `inf` and `-inf`, NaN as `NaN`.
 - `'a'` is a code point of type `u32`, or `u8` where one is expected.
 - `bytes(s)` copies a string into a `[]u8`; `str(b)` copies one back.
-- `==` and `!=` compare contents.
+- `==` and `!=` compare contents; `<`, `<=`, `>` and `>=` compare bytes in order, which for UTF-8 is code point order.
 
 ### Structs
 
@@ -306,7 +307,7 @@ fn area(s: Shape) -> f64 {
 }
 ```
 
-- `match` must cover every variant, or end with `_`. Arms after `_` and duplicate arms are errors.
+- `match` must cover every variant, or end with `_` or a binding arm. A binding arm is a name starting with a lowercase letter that is not a variant, such as `other => describe(other)`: it matches anything and binds the whole subject. A capitalized name that is not a variant is an error, so a mistyped variant is never taken for a binding. Arms after `_` or a binding arm, and duplicate arms, are errors.
 - An arm that starts with a binary operator tests the subject: `% 3 == 0 => ...` means `subject % 3 == 0`, with the subject on the left and ordinary precedence after it. The subject is evaluated once and arms are tried in order. Such tests work on a subject of any type, including enums (`== Empty`) and the error of a `catch`; a `match` that uses one, or whose subject is not an enum, must end with `_`. Arms are separated by newlines or commas.
 
 ```low
@@ -352,7 +353,7 @@ struct Node {
 
 - `T?` holds either `some(value)` or `none`.
 - A `T` is accepted wherever a `T?` is expected: in an annotated `let`, an assignment, an argument, a field, a return and either branch of an `if` or `match`. `none` and `some(v)` take their type from that expectation.
-- `x ?? fallback` gives the value inside `x`, or evaluates `fallback` when `x` is `none`. The fallback may itself be a `T?`, making the result a `T?`. `??` binds tighter than comparisons and looser than arithmetic, and groups to the right, so `a ?? b ?? 0` tries `a`, then `b`.
+- `x ?? fallback` gives the value inside `x`, or evaluates `fallback` when `x` is `none`. The fallback may itself be a `T?`, making the result a `T?`. The fallback may leave instead, as in `let line = read_line() ?? break`. `??` binds tighter than comparisons and looser than arithmetic, and groups to the right, so `a ?? b ?? 0` tries `a`, then `b`.
 - `match` unwraps an optional with `some(v)` and `none` arms and must cover both.
 - `?` after a type binds to everything before it: `*Node?` is an optional pointer and `[]i64?` an optional slice.
 - An optional is an enum with `none` as tag 0 and `some` as tag 1, so it takes one word more than its value.
@@ -392,7 +393,7 @@ fn main() ! ParseError {
 
 - `fail v` returns the error `v`; `v` is checked against the function's error type, so bare variant names work.
 - Postfix `?` returns the error to the caller, whose error type must be the same enum.
-- `catch { arms }` matches the error exhaustively; `catch value` substitutes a fallback.
+- `catch { arms }` matches the error exhaustively, and a binding arm such as `e => report(e)` receives the whole error; `catch value` substitutes a fallback.
 - `fn f() ! E` fails or returns nothing.
 - A result cannot be discarded, bound or passed on without `?` or `catch`, except by returning it from a function with the same result type.
 - When `main` declares `! E` and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2.
@@ -435,8 +436,8 @@ let n = strtol(cstr("123abc"), mut end, 10)
 let pixels = view(buf, 64)
 ```
 
-- `extern "name" { ... }` at the top level of a file names a C library and declares its functions, with no bodies. `"c"` is the C library itself. A trailing `...` makes a function variadic. Declarations are private to their module unless marked `pub`.
-- A program that names no library is a static executable with no libc. A program that names any is a dynamic executable linked against libc and each named library.
+- `extern "name" { ... }` at the top level of a file names a C library and declares its functions, with no bodies. `"c"` is the C library itself. A trailing `...` makes a function variadic. `fn errno_location() -> ptr[i32] = "__errno_location"` gives a function a LowLang name different from its C symbol, for symbols that start with `__` or are LowLang keywords. Declarations are private to their module unless marked `pub`.
+- A library is linked when code reachable from `main` calls or takes the address of one of the functions its `extern` block declares, so importing a module that declares C functions costs nothing until one is used. A program that uses no library is a static executable with no libc. A program that uses any is a dynamic executable linked against libc and each used library.
 - C signatures use C types: integers, floats, `bool`, `ptr` and `ptr[T]`, and `extern struct`s by value. A `mut` parameter passes the address of a LowLang place for the duration of the call, as C# passes `ref`; C may read and write through it.
 - `ptr[T]` is a nullable pointer to C memory and `ptr` is `void*`; `null` takes its type from context, and `ptr` converts to and from any `ptr[T]`. `==` and `!=` compare addresses.
 - `view(p, n)` is a `[]T` over `n` elements at `p`, bounds-checked like any slice; `load(p)` and `store(p, v)` read and write one `T`.
@@ -539,7 +540,7 @@ fn main() {
 ```
 
 - A module is a directory: every `.low` file in it shares one namespace, so files of a module need no imports between them.
-- The project root is the nearest directory, starting at the entry, that holds a `low.mod` file; without one it is the entry's directory. `import ui/text` loads `<root>/ui/text/`.
+- The project root is the nearest directory, starting at the entry, that holds a `low.mod` file; without one it is the entry's directory. `import ui/text` loads `<root>/ui/text/`. A path starting with `std/` names a module of the standard library, which is compiled into `low`, so a project directory named `std` cannot be imported.
 - `low build dir` builds the directory as the entry module. `low build file.low` builds that one file as the entry module, without the other files beside it.
 - Imports come before declarations and apply to their file. A module is used through its last path segment, `text.shout(...)`, or through a name given with `import t = ui/text`. Types are written `geometry.Shape` and built with `geometry.Point { ... }`; a variant can be named `geometry.Shape.Dot` or, where the type is expected, `Dot`.
 - Declarations and struct fields are private to their module unless marked `pub`. A `pub` enum's variants are public. A struct with private fields without defaults cannot be built with a literal outside its module.
@@ -582,7 +583,7 @@ let pick: fn(i64, i64) -> i64 = max
 - Functions, structs and enums take type parameters in brackets after their name. Generic types are written with arguments, `Stack[i64]` or `geometry.Labelled[str]`.
 - A constraint lists what a type parameter supports, joined with `+`:
   - `Eq` allows `==` and `!=`, and is met by numbers, `bool`, `str`, pointers, channels, and structs and enums whose fields are all `Eq`.
-  - `Ord` adds `<`, `<=`, `>` and `>=`, and is met by numbers.
+  - `Ord` adds `<`, `<=`, `>` and `>=`, and is met by numbers and `str`.
   - `Hash` adds use as a map key, and is met by integers, `bool`, `str` and pointers.
   - `Number` adds arithmetic, numeric literals, conversion with `T(x)` and `print`.
   - `Integer` adds bitwise operators and shifts and implies `Hash`.
@@ -661,7 +662,7 @@ fn main() ! io.Error {
 }
 ```
 
-`import std/<name>` loads a module of the standard library, which is compiled into `low`; the project root is not searched for it. Every module talks to the kernel through raw syscalls, so programs using it stay static.
+`import std/<name>` loads a module of the standard library, which is compiled into `low`; the project root is not searched for it. Every module except `std/math` talks to the kernel through raw syscalls. `std/math` calls libm through an `extern` block, and a library is linked only when reachable code calls it, so a program stays static unless it calls one of libm's functions.
 
 | Module | Contents |
 |---|---|
@@ -706,7 +707,10 @@ fn main() ! io.Error {
 | `std/crypto/x509` | DER, PEM, certificates, PKCS#8 private keys, the system roots, chain validation and TLS signature schemes. |
 | `std/time` | `now`, in Unix seconds. |
 | `std/simd` | Vector reads and writes, `splat`, `mask`, `blend`, `min`, `max`, lane access, byte shuffles, bit counting and `find_byte`. |
-| `std/text` | integer and correctly rounded float parsing, hex encoding, `trim`, `split`, `join`, `index`, case folding and comma-separated token lists. |
+| `std/text` | Integer parsing in any base from 2 to 36, correctly rounded float parsing, `parse_bool`, `radix`, `hex` and hex encoding, and `fixed(x, places)`, which rounds half to even on the exact binary value. `trim` and its start, end, prefix and suffix forms; `split` on a byte, `split_str` on a string (an empty separator splits into code points), `fields`, `lines` (dropping a final empty line and `\r` before `\n`), `chars` and `join`; `index`, `last_index`, `contains`, `count`, `starts_with` and `ends_with`; `repeat` and `replace`; ASCII `upper`, `lower` and case folding; `char_count`, `from_char`, `pad_left` and `pad_right` to a width in code points; `append` and `append_char` onto a `[]u8`; and comma-separated token lists. |
+| `std/math` | libm's trigonometric, hyperbolic, exponential and rounding functions, `pi`, `tau`, `e`, `infinity`, `nan`, `is_nan`, `is_inf`, generic `abs`, `min`, `max` and `clamp`, and integer `ipow` and `gcd`. |
+| `std/slices` | `contains`, `index`, `clone`, `concat`, `reverse`, `map`, `filter`, `fold`, `any`, `all`, `sum`, `min` and `max` as optionals, `sorted`, and an unstable in-place `sort` and `sort_by`: a quicksort with median-of-three pivots that recurses into the smaller side and finishes runs of 16 or fewer with insertion sort. Slices are not named types, so these are called with a pipe: `xs \|> slices.sort()`. |
+| `std/os` | `args` and `environment` from `/proc/self/cmdline` and `/proc/self/environ`, `env` as `str?`, `pid` and `exit`. |
 | `std/base64` | `encode` and `decode`. |
 
 ### Networking
@@ -858,7 +862,7 @@ The derivations are generated as source. When the checker meets `__serialize(v, 
 - Every value records whether it may hold a heap pointer. Loads, parameters and call results take this from their type's word layout, where an enum word counts as a pointer if any variant puts one there; constants, typed arithmetic, string literals and frame addresses never do; untyped address arithmetic and anything unclassified count as pointers; a phi holds a pointer if any input may.
 - A `str` is two words and a slice three. An element access computes `pointer + index * stride` after a `check` instruction, which compares unsigned and jumps to the index panic; packed elements load with `movzx`, `movsxd` or a 32-bit `mov` and store at their width.
 - A map `[K: V]` is a pointer to the prelude's generic `__Map[K, V]`, whose `entries` slice holds `__Entry[K, V]` records of a live flag, the key and the value. An open-addressing index of entry numbers with linear probing finds them; deleted entries leave tombstones until the next rebuild, which compacts the entries in order and resizes the index to keep it at most three quarters full. Integer, `bool` and pointer keys hash their word; `str` keys hash their bytes with FNV-1a. Every concrete map type instantiates `__map_new`, `__map_get`, `__map_set`, `__map_delete`, `__map_len`, `__map_next`, `__map_key` and `__map_value` for its key and value types, and map literals, lookups, assignments, `delete`, `.len` and loops become calls to them. A compound assignment such as `m[k] += v` is a get, the operation on the value or zero, and a set.
-- `push` and the formatting helpers call the runtime's `rt_grow` and the prelude; the buffer behind an interpolation lives in a frame slot passed as a `mut` argument.
+- `push` and the formatting helpers call the runtime's `rt_grow` and the prelude; the buffer behind an interpolation lives in a frame slot passed as a `mut` argument. The prelude appends a whole string to a `[]u8` with `__extend`, which grows the buffer at most once and copies the bytes with the runtime's `rt_copy`, so concatenation, interpolation, `bytes` and `str(b)` copy in bulk. String ordering calls the prelude's `__str_cmp`.
 - Unreachable blocks are pruned after construction.
 
 ### Code generation
@@ -936,12 +940,13 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - Optionals `T?` with `none`, `some`, `??` and implicit wrapping.
 - `mut` parameters.
 - Pointers, `new`, and a garbage-collected heap.
-- Range, slice and string loops; slice literals, indexing, slicing and `push`; string interpolation, concatenation and comparison.
+- Range, slice and string loops; slice literals, indexing, slicing and `push`; string interpolation, concatenation, equality and ordering.
 - Map literals, lookups, entry assignment, `delete` and map loops.
 - Builtins `print` for numbers, `bool` and `str`; `bytes` and `str`.
 - Modules as directories, imports, and `pub` visibility.
+- A standard library of strings, number parsing and formatting, math, slices, files, standard input and output, the process environment and clocks.
 - `embed` for compile-time file contents.
-- `extern` blocks naming C libraries and declaring their functions, and dynamic linking against libc when any is named.
+- `extern` blocks naming C libraries and declaring their functions, and dynamic linking against libc and the libraries whose functions reachable code uses.
 - C interop: System V calls, `extern struct`, `ptr` and `ptr[T]`, `view`, `load`, `store`, `cstr`, `str(p)`, `pin` and `unpin`.
 - `defer`, and droppable structs with `drop` and move-only `using` bindings.
 - Generic functions, structs and enums with built-in constraints, compiled per type; maps built on generic prelude code.
