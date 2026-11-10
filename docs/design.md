@@ -673,6 +673,8 @@ fn main() ! io.Error {
 | `std/serde` | The `Writer` and `Reader` protocols, `write[T]`, `read[T]` and `schema[T]`, which the compiler derives for every type, and `Field[T, F]`. |
 | `std/json` | A reader and writer over UTF-8 bytes, the `Value` document model, and `serialize[T]` and `deserialize[T]` with naming policies. |
 | `std/sql` | The driver contract: `Connection`, `Value`, `Rows`, `Error`, `Options` and dialect helpers. |
+| `std/sql/postgres` | A PostgreSQL driver over protocol 3.0, plain or over TLS. |
+| `std/toml` | TOML 1.0.0: a table tree, an encoder, and serde binding. |
 | `std/orm` | Typed queries over field references, row mapping, inserts, updates and deletes, tables created from types, and raw queries mapped onto structs. |
 | `std/compress/deflate` | DEFLATE, zlib and gzip. |
 | `std/compress/xz` | xz with LZMA2, and `.lzma`. |
@@ -728,6 +730,9 @@ fn main() ! io.Error {
 - `json.Reader` tokenizes UTF-8 bytes like .NET's `Utf8JsonReader`, strictly per RFC 8259, with a depth limit of 64, returning strings without copying unless they contain escapes. Numbers are parsed as integers or correctly rounded floats.
 - `json.serialize_with` and `json.deserialize_with` take `Options` for indentation, field naming (`Unchanged`, `CamelCase`, `SnakeCase`) and maximum depth. Binary data is base64; non-finite floats are written as `null`.
 - `std/orm` builds queries from conditions over field references, such as `orm.filter(orm.from(users), orm.ge(User.age, 18))`, which are type-checked against the field. It renders them for Postgres or SQL Server, maps rows onto structs, stores nested values as JSON columns, creates tables from types with an identity key named `id`, and returns generated keys from inserts.
+- `sql.Value` holds dates as days since 1970-01-01, times as microseconds since midnight, timestamps as microseconds since 1970-01-01 UTC, infinite dates and timestamps as the `i64` maximum and minimum, and UUIDs as 16 bytes. A connection serves one green thread at a time; a call made while another is running fails with `Busy`. `orm.transaction` rolls back on any error from its body and fails with that error.
+- `std/sql/postgres` authenticates with SCRAM-SHA-256, MD5 or cleartext, uses the simple protocol for statements without parameters and the extended protocol with a 64-entry prepared statement cache otherwise, streams `each` in batches of 512 rows, reads results as text decoded by type OID, and keeps a connection usable after a server error. A timeout sends a CancelRequest and closes the connection. `connect_tls` upgrades with SSLRequest and `std/tls`.
+- `std/toml` parses into ordered tables and applies every rule of TOML 1.0.0, including the restrictions on redefining tables through headers, dotted keys, inline tables and arrays of tables; it agrees with Python's `tomllib` on the toml-test suite. Errors carry a line and column. `encode` writes plain values first and then `[table]` and `[[array]]` sections. `serialize` and `deserialize` bind types through serde, reading date-times as RFC 3339 text.
 - Pipes block through channels. A writer flushing more than the pause threshold waits until the reader brings the unconsumed bytes below the resume threshold, or until the reader itself waits for more data, so a message larger than the thresholds cannot deadlock the pipe.
 
 ### Compression

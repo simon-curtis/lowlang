@@ -1,0 +1,406 @@
+import std/io
+import std/sql
+import std/sql/postgres
+import std/text
+
+struct Fake {
+    input: []u8
+    at: i64
+    output: []u8
+}
+
+fn fake_stream(f: *Fake) -> io.Stream {
+    io.Stream {
+        read: fn(buf) -> i64 ! io.Error {
+            let n = io.copy(buf, f.input[f.at..])
+            f.at += n
+            n
+        }
+        write: fn(data) -> i64 ! io.Error {
+            io.append(mut f.output, data)
+            data.len
+        }
+        close: fn() {}
+    }
+}
+
+fn message(mut b: []u8, kind: u8, body: []u8) {
+    push(mut b, kind)
+    io.put_be32(mut b, body.len + 4)
+    io.append(mut b, body)
+}
+
+fn put_cstring(mut b: []u8, s: str) {
+    io.append_str(mut b, s)
+    push(mut b, 0)
+}
+
+fn auth(mut b: []u8, code: i64, extra: []u8) {
+    var body: []u8 = []
+    io.put_be32(mut body, code)
+    io.append(mut body, extra)
+    message(mut b, 'R', body)
+}
+
+fn ready(mut b: []u8, status: u8) {
+    message(mut b, 'Z', [status])
+}
+
+fn complete(mut b: []u8, tag: str) {
+    var body: []u8 = []
+    put_cstring(mut body, tag)
+    message(mut b, 'C', body)
+}
+
+fn empty(mut b: []u8, kind: u8) {
+    message(mut b, kind, [])
+}
+
+fn columns(mut b: []u8, names: []str, oids: []i64) {
+    var body: []u8 = []
+    io.put_be16(mut body, names.len)
+    for i, n in names {
+        put_cstring(mut body, n)
+        io.put_be32(mut body, 0)
+        io.put_be16(mut body, 0)
+        io.put_be32(mut body, oids[i])
+        io.put_be16(mut body, 0)
+        io.put_be32(mut body, -1)
+        io.put_be16(mut body, 0)
+    }
+    message(mut b, 'T', body)
+}
+
+fn row(mut b: []u8, values: []str, nulls: []bool) {
+    var body: []u8 = []
+    io.put_be16(mut body, values.len)
+    for i, v in values {
+        if nulls[i] {
+            io.put_be32(mut body, -1)
+        } else {
+            io.put_be32(mut body, v.len)
+            io.append_str(mut body, v)
+        }
+    }
+    message(mut b, 'D', body)
+}
+
+fn data_row(mut b: []u8, values: []str) {
+    var nulls: []bool = []
+    for v in values {
+        push(mut nulls, false)
+    }
+    row(mut b, values, nulls)
+}
+
+fn null_row(mut b: []u8, n: i64) {
+    var values: []str = []
+    var nulls: []bool = []
+    for _ in 0..n {
+        push(mut values, "")
+        push(mut nulls, true)
+    }
+    row(mut b, values, nulls)
+}
+
+fn server_error(mut b: []u8, kind: u8, code: str, text: str) {
+    var body: []u8 = []
+    push(mut body, 'S')
+    put_cstring(mut body, "ERROR")
+    push(mut body, 'V')
+    put_cstring(mut body, "ERROR")
+    push(mut body, 'C')
+    put_cstring(mut body, code)
+    push(mut body, 'M')
+    put_cstring(mut body, text)
+    push(mut body, 0)
+    message(mut b, kind, body)
+}
+
+fn escaped(data: []u8) -> str {
+    var out: []u8 = []
+    for c in data {
+        if c >= 0x20 && c < 0x7F && c != '\\' {
+            push(mut out, c)
+        } else {
+            io.append_str(mut out, "\\{text.hex(i64(c))}")
+        }
+    }
+    str(out)
+}
+
+fn transcript(data: []u8) {
+    let first = io.be32(data, 0)
+    print("> startup {escaped(data[8..first])}")
+    var at = first
+    for at < data.len {
+        let size = io.be32(data, at + 1)
+        print("> {str([data[at]])} {escaped(data[at + 5..at + 1 + size])}")
+        at += 1 + size
+    }
+}
+
+fn show(v: sql.Value) -> str {
+    match v {
+        Null => "NULL"
+        Bool(b) => "Bool({b})"
+        Int(n) => "Int({n})"
+        Float(x) => "Float({x})"
+        Decimal(d) => "Decimal({d})"
+        Text(s) => "Text({s})"
+        Bytes(b) => "Bytes({text.encode_hex(b)})"
+        Uuid(b) => "Uuid({text.encode_hex(b)})"
+        Date(d) => "Date({d})"
+        Time(t) => "Time({t})"
+        Timestamp(t) => "Timestamp({t})"
+        TimestampTz(t) => "TimestampTz({t})"
+    }
+}
+
+fn attempt(work: fn() ! sql.Error) -> str {
+    work() catch {
+        Connect => return "Connect"
+        Authentication => return "Authentication"
+        Closed => return "Closed"
+        Timeout => return "Timeout"
+        Protocol => return "Protocol"
+        Unsupported => return "Unsupported"
+        Conversion => return "Conversion"
+        Busy => return "Busy"
+        Server(code, message) => return "Server({code}, {message})"
+    }
+    "ok"
+}
+
+fn scram_vector() {
+    let s = postgres.scram("user", "pencil", "rOprNGfwEbeRWgbNEkqO")
+    print(postgres.scram_first(s))
+    let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    print("final {attempt(fn() ! sql.Error { print(postgres.scram_final(s, server_first)?) })}")
+    print("verify {attempt(fn() ! sql.Error { postgres.scram_verify(s, "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")? })}")
+    print("forged {attempt(fn() ! sql.Error { postgres.scram_verify(s, "v=AAAATRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")? })}")
+    print("server error {attempt(fn() ! sql.Error { postgres.scram_verify(s, "e=invalid-proof")? })}")
+    let other = postgres.scram("a,b=c", "x", "abc")
+    print(postgres.scram_first(other))
+    print("unverified {attempt(fn() ! sql.Error { postgres.scram_verify(other, "v=AAAA")? })}")
+    print("foreign nonce {attempt(fn() ! sql.Error { print(postgres.scram_final(other, "r=xyz,s=AAAA,i=1")?) })}")
+    print("zero iterations {attempt(fn() ! sql.Error { print(postgres.scram_final(other, "r=abcdef,s=AAAA,i=0")?) })}")
+    print("missing count {attempt(fn() ! sql.Error { print(postgres.scram_final(other, "r=abcdef,s=AAAA")?) })}")
+    print("bad salt {attempt(fn() ! sql.Error { print(postgres.scram_final(other, "r=abcdef,s=!!,i=1")?) })}")
+    print("extension {attempt(fn() ! sql.Error { print(postgres.scram_final(other, "m=x,r=abcdef,s=AAAA,i=1")?) })}")
+}
+
+fn md5_vectors() {
+    let inputs = ["", "a", "abc", "message digest", "abcdefghijklmnopqrstuvwxyz",
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+        "12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+        "0123456789012345678901234567890123456789012345678901234", "01234567890123456789012345678901234567890123456789012345"]
+    for s in inputs {
+        print("md5 {s.len} {text.encode_hex(postgres.md5(bytes(s)))}")
+    }
+}
+
+fn script() -> []u8 {
+    var b: []u8 = []
+    auth(mut b, 5, [1, 2, 3, 4])
+    auth(mut b, 0, [])
+    var status: []u8 = []
+    put_cstring(mut status, "server_version")
+    put_cstring(mut status, "17.0")
+    message(mut b, 'S', status)
+    message(mut b, 'K', [0, 0, 0, 42, 0, 0, 0, 7])
+    ready(mut b, 'I')
+
+    empty(mut b, '1')
+    empty(mut b, '2')
+    columns(mut b, ["b", "i2", "i4", "i8", "f4", "f8", "n", "t", "bin", "u", "d", "tm", "ts", "tz", "j", "iv", "x"],
+        [16, 21, 23, 20, 700, 701, 1700, 25, 17, 2950, 1082, 1083, 1114, 1184, 3802, 1186, 99999])
+    data_row(mut b, ["t", "-32768", "2147483647", "-9223372036854775808", "1.5", "-Infinity", "-0.000120", "héllo",
+        "\\x00ff10", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "0044-03-15 BC", "23:59:59.5",
+        "2000-02-29 12:00:00.000001", "2024-01-02 03:04:05.5+05:30", "{{\"k\": [1]}}", "1 day", "raw"])
+    null_row(mut b, 17)
+    complete(mut b, "SELECT 2")
+    ready(mut b, 'I')
+
+    empty(mut b, '1')
+    empty(mut b, '2')
+    empty(mut b, 'n')
+    complete(mut b, "SELECT 0")
+    ready(mut b, 'I')
+
+    empty(mut b, '2')
+    empty(mut b, 'n')
+    complete(mut b, "SELECT 0")
+    ready(mut b, 'I')
+
+    complete(mut b, "UPDATE 3")
+    ready(mut b, 'I')
+
+    server_error(mut b, 'N', "01000", "just a notice")
+    server_error(mut b, 'E', "42P01", "relation \"t\" does not exist")
+    ready(mut b, 'I')
+
+    complete(mut b, "BEGIN")
+    ready(mut b, 'T')
+    complete(mut b, "INSERT 0 1")
+    ready(mut b, 'T')
+    server_error(mut b, 'E', "22P02", "invalid input syntax")
+    ready(mut b, 'E')
+    complete(mut b, "ROLLBACK")
+    ready(mut b, 'I')
+
+    empty(mut b, '1')
+    empty(mut b, '2')
+    columns(mut b, ["g"], [20])
+    data_row(mut b, ["1"])
+    data_row(mut b, ["2"])
+    empty(mut b, 's')
+    data_row(mut b, ["3"])
+    complete(mut b, "SELECT 3")
+    ready(mut b, 'I')
+
+    empty(mut b, '1')
+    empty(mut b, '2')
+    columns(mut b, ["g"], [20])
+    data_row(mut b, ["1"])
+    data_row(mut b, ["2"])
+    empty(mut b, 's')
+    ready(mut b, 'I')
+
+    columns(mut b, ["flag"], [16])
+    data_row(mut b, ["x"])
+    data_row(mut b, ["t"])
+    complete(mut b, "SELECT 2")
+    ready(mut b, 'I')
+
+    columns(mut b, ["one"], [23])
+    data_row(mut b, ["1"])
+    complete(mut b, "SELECT 1")
+    ready(mut b, 'I')
+
+    columns(mut b, ["a"], [25])
+    message(mut b, 'D', [0, 1, 0, 0, 0, 9, 'a'])
+    b
+}
+
+fn parameters() -> []sql.Value {
+    [
+        sql.Value.Null,
+        sql.Value.Bool(true),
+        sql.Value.Int(-5),
+        sql.Value.Float(1.0 / 0.0),
+        sql.Value.Float(-0.25),
+        sql.Value.Decimal("1.50"),
+        sql.Value.Text("é"),
+        sql.Value.Bytes([0, 255, 16]),
+        sql.Value.Uuid([0xa0, 0xee, 0xbc, 0x99, 0x9c, 0x0b, 0x4e, 0xf8, 0xbb, 0x6d, 0x6b, 0xb9, 0xbd, 0x38, 0x0a, 0x11]),
+        sql.Value.Date(-719528),
+        sql.Value.Time(1),
+        sql.Value.Timestamp(-1),
+        sql.Value.TimestampTz(1704164645123456),
+    ]
+}
+
+fn session() ! sql.Error {
+    let f = new(Fake { input: script(), at: 0, output: [] })
+    let db = postgres.connect_stream(fake_stream(f), sql.Options { user: "alice", password: "secret", database: "shop" })?
+    let text = "SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13"
+    let r = db.query(text, parameters())?
+    for i, c in r.columns {
+        print("{c.name} {c.kind} {show(r.rows[0][i])} {show(r.rows[1][i])}")
+    }
+    db.query(text, parameters())?
+    db.query(text, parameters())?
+    print("updated {db.execute("UPDATE t SET x = 1", [])?}")
+    print("missing table {attempt(fn() ! sql.Error { db.execute("SELECT * FROM t", [])? })}")
+    db.begin()?
+    db.execute("INSERT INTO t VALUES (1)", [])?
+    print("bad insert {attempt(fn() ! sql.Error { db.execute("INSERT INTO t VALUES ('x')", [])? })}")
+    print("commit {attempt(db.commit)}")
+    db.each("SELECT g FROM s", [], fn(cols, values) -> bool {
+        print("each {cols[0].name} {show(values[0])}")
+        true
+    })?
+    db.each("SELECT g FROM s", [], fn(cols, values) -> bool {
+        print("stop at {show(values[0])}")
+        false
+    })?
+    print("bad bool {attempt(fn() ! sql.Error { db.query("SELECT flag", [])? })}")
+    print("one {show(db.query("SELECT 1", [])?.rows[0][0])}")
+    print("truncated row {attempt(fn() ! sql.Error { db.query("SELECT a", [])? })}")
+    print("after protocol error {attempt(fn() ! sql.Error { db.query("SELECT 1", [])? })}")
+    transcript(f.output)
+}
+
+fn cleartext() ! sql.Error {
+    var b: []u8 = []
+    auth(mut b, 3, [])
+    auth(mut b, 0, [])
+    ready(mut b, 'I')
+    let f = new(Fake { input: b, at: 0, output: [] })
+    let db = postgres.connect_stream(fake_stream(f), sql.Options { user: "bob", password: "hunter2", application: "" })?
+    db.close()
+    print("after close {attempt(fn() ! sql.Error { db.begin()? })}")
+    transcript(f.output)
+}
+
+fn handshake(label: str, input: []u8) {
+    let f = new(Fake { input, at: 0, output: [] })
+    print("{label} {attempt(fn() ! sql.Error { postgres.connect_stream(fake_stream(f), sql.Options { user: "u", password: "p" })?.close() })}")
+}
+
+fn handshakes() {
+    var refused: []u8 = []
+    server_error(mut refused, 'E', "28P01", "password authentication failed for user \"u\"")
+    handshake("refused", refused)
+    var kerberos: []u8 = []
+    auth(mut kerberos, 2, [])
+    handshake("kerberos", kerberos)
+    var mechanisms: []u8 = []
+    put_cstring(mut mechanisms, "SCRAM-SHA-256-PLUS")
+    push(mut mechanisms, 0)
+    var plus: []u8 = []
+    auth(mut plus, 10, mechanisms)
+    handshake("plus only", plus)
+    mechanisms = []
+    put_cstring(mut mechanisms, "SCRAM-SHA-256")
+    push(mut mechanisms, 0)
+    var skipped: []u8 = []
+    auth(mut skipped, 10, mechanisms)
+    auth(mut skipped, 0, [])
+    ready(mut skipped, 'I')
+    handshake("ok without server signature", skipped)
+    var early: []u8 = []
+    auth(mut early, 11, bytes("r=x,s=AAAA,i=1"))
+    handshake("continue before start", early)
+    var oversized: []u8 = []
+    push(mut oversized, 'R')
+    io.put_be32(mut oversized, 0x7FFFFFFF)
+    handshake("oversized", oversized)
+    var short: []u8 = []
+    push(mut short, 'R')
+    io.put_be32(mut short, 2)
+    handshake("short length", short)
+    var truncated: []u8 = []
+    message(mut truncated, 'R', [0, 0])
+    handshake("truncated auth", truncated)
+    var eof: []u8 = []
+    auth(mut eof, 0, [])
+    handshake("eof", eof)
+    var status: []u8 = []
+    auth(mut status, 0, [])
+    ready(mut status, 'Q')
+    handshake("bad status", status)
+    var unknown: []u8 = []
+    auth(mut unknown, 0, [])
+    message(mut unknown, '!', [])
+    handshake("unknown message", unknown)
+}
+
+fn main() ! sql.Error {
+    scram_vector()
+    md5_vectors()
+    session()?
+    cleartext()?
+    handshakes()
+}

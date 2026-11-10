@@ -1,0 +1,126 @@
+import std/base64
+import std/crypto/hash
+import std/io
+import std/sql
+import std/text
+
+pub struct Scram {
+    password: str
+    nonce: str
+    first_bare: str
+    server_signature: []u8
+}
+
+pub fn scram(user: str, password: str, nonce: str) -> *Scram {
+    var name: []u8 = []
+    for i in 0..user.len {
+        if user[i] == ',' {
+            io.append_str(mut name, "=2C")
+        } else if user[i] == '=' {
+            io.append_str(mut name, "=3D")
+        } else {
+            push(mut name, user[i])
+        }
+    }
+    let first_bare = "n={__str_view(name)},r={nonce}"
+    new(Scram { password, nonce, first_bare, server_signature: [] })
+}
+
+pub fn scram_first(s: *Scram) -> str {
+    "n,,{s.first_bare}"
+}
+
+fn attribute(message: str, key: u8) -> str ! sql.Error {
+    for part in text.split(message, ',') {
+        if part.len >= 2 && part[0] == key && part[1] == '=' {
+            return part[2..]
+        }
+    }
+    fail Protocol
+}
+
+fn pbkdf2(password: []u8, salt: []u8, iterations: i64) -> []u8 {
+    let a = hash.sha256()
+    var key = password
+    if key.len > a.block {
+        key = hash.sum(a, password)
+    }
+    let inner_pad: []u8 = __make(a.block)
+    let outer_pad: []u8 = __make(a.block)
+    for i in 0..a.block {
+        let b = if i < key.len { key[i] } else { 0 }
+        inner_pad[i] = b ^ 0x36
+        outer_pad[i] = b ^ 0x5C
+    }
+    let inner = a.digest()
+    inner.update(inner_pad)
+    let outer = a.digest()
+    outer.update(outer_pad)
+    let prf = fn(message: []u8) -> []u8 {
+        let i = inner.clone()
+        i.update(message)
+        let first = i.finish()
+        let o = outer.clone()
+        o.update(first)
+        o.finish()
+    }
+    var block = salt
+    io.append(mut block, [0, 0, 0, 1])
+    var u = prf(block)
+    let out: []u8 = __make(u.len)
+    __memmove(out, u)
+    for _ in 1..iterations {
+        u = prf(u)
+        for j in 0..out.len {
+            out[j] ^= u[j]
+        }
+    }
+    out
+}
+
+pub fn scram_final(s: *Scram, server_first: str) -> str ! sql.Error {
+    if server_first.len > 0 && server_first[0] == 'm' {
+        fail Unsupported
+    }
+    let combined = attribute(server_first, 'r')?
+    let encoded_salt = attribute(server_first, 's')?
+    let count = attribute(server_first, 'i')?
+    if combined.len <= s.nonce.len || !text.starts_with(combined, s.nonce) {
+        fail Protocol
+    }
+    let iterations = text.parse_uint(count, 10) catch {
+        _ => fail Protocol
+    }
+    if iterations < 1 {
+        fail Protocol
+    }
+    let salt = base64.decode(encoded_salt) catch {
+        _ => fail Protocol
+    }
+    let a = hash.sha256()
+    let salted = pbkdf2(bytes(s.password), salt, iterations)
+    let client_key = hash.hmac(a, salted, bytes("Client Key"))
+    let stored_key = hash.sum(a, client_key)
+    let without_proof = "c=biws,r={combined}"
+    let auth = bytes("{s.first_bare},{server_first},{without_proof}")
+    let proof = hash.hmac(a, stored_key, auth)
+    for i in 0..proof.len {
+        proof[i] ^= client_key[i]
+    }
+    let server_key = hash.hmac(a, salted, bytes("Server Key"))
+    s.server_signature = hash.hmac(a, server_key, auth)
+    "{without_proof},p={base64.encode(proof)}"
+}
+
+pub fn scram_verify(s: *Scram, server_final: str) ! sql.Error {
+    if text.starts_with(server_final, "e=") {
+        fail Authentication
+    }
+    let encoded = attribute(server_final, 'v')?
+    let signature = base64.decode(encoded) catch {
+        _ => fail Protocol
+    }
+    if s.server_signature.len == 0 || !hash.equal(signature, s.server_signature) {
+        fail Authentication
+    }
+}

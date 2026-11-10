@@ -1,0 +1,616 @@
+import std/base64
+import std/crypto
+import std/io
+import std/net
+import std/sql
+import std/text
+import std/tls
+
+struct Conn {
+    stream: io.Stream
+    reader: *io.Reader
+    status: u8
+    iso_dates: bool
+    process: i64
+    secret: []u8
+    cancel: fn(i64, []u8)
+    types: [i64: TypeInfo]
+    statements: [str: str]
+    seen: [str: bool]
+    parsing: str
+    parsing_name: str
+    counter: i64
+    busy: bool
+    closed: bool
+}
+
+fn statement_capacity() -> i64 {
+    64
+}
+
+fn seen_capacity() -> i64 {
+    256
+}
+
+fn each_batch() -> i64 {
+    512
+}
+
+fn abandon(c: *Conn, timed_out: bool) -> sql.Error {
+    if !c.closed {
+        c.closed = true
+        if timed_out {
+            c.cancel(c.process, c.secret)
+        }
+        c.stream.close()
+    }
+    if timed_out { sql.Error.Timeout } else { sql.Error.Closed }
+}
+
+fn send(c: *Conn, data: []u8) ! sql.Error {
+    io.write_all(c.stream, data) catch {
+        TimedOut => fail abandon(c, true)
+        _ => fail abandon(c, false)
+    }
+}
+
+fn read_byte(c: *Conn) -> u8 ! sql.Error {
+    io.read_byte(c.reader) catch {
+        TimedOut => fail abandon(c, true)
+        _ => fail abandon(c, false)
+    }
+}
+
+fn receive(c: *Conn) -> Message ! sql.Error {
+    let kind = read_byte(c)?
+    var length = 0
+    for _ in 0..4 {
+        length = length << 8 | i64(read_byte(c)?)
+    }
+    if length < 4 || length > max_message() {
+        abandon(c, false)
+        fail Protocol
+    }
+    let body = io.read_exact(c.reader, length - 4) catch {
+        TimedOut => fail abandon(c, true)
+        _ => fail abandon(c, false)
+    }
+    Message { kind, body, at: 0 }
+}
+
+fn parameter_status(c: *Conn, mut m: Message) ! sql.Error {
+    let name = cstring(mut m)?
+    let value = cstring(mut m)?
+    if name == "DateStyle" {
+        c.iso_dates = text.starts_with(value, "ISO")
+    }
+}
+
+fn ready(c: *Conn, mut m: Message) ! sql.Error {
+    let status = byte_of(mut m)?
+    if status != 'I' && status != 'T' && status != 'E' {
+        fail Protocol
+    }
+    c.status = status
+    c.parsing = ""
+}
+
+fn background(c: *Conn, mut m: Message) -> bool ! sql.Error {
+    if m.kind == 'S' {
+        parameter_status(c, mut m)?
+        return true
+    }
+    m.kind == 'N' || m.kind == 'A'
+}
+
+struct Exchange {
+    batch: i64
+    columns: []sql.Column
+    kinds: []Kind
+    failure: sql.Error?
+    stopped: bool
+    synced: bool
+    count: i64
+}
+
+fn columns_of(c: *Conn, mut m: Message, x: *Exchange) ! sql.Error {
+    let n = int16(mut m)?
+    let columns: []sql.Column = __make(n)
+    let kinds: []Kind = __make(n)
+    for i in 0..n {
+        let name = cstring(mut m)?
+        take(mut m, 6)?
+        let oid = i64(u32(int32(mut m)?))
+        take(mut m, 6)?
+        if int16(mut m)? != 0 {
+            fail Protocol
+        }
+        let info = c.types[oid] ?? TypeInfo { name: "{oid}", kind: Textual }
+        columns[i] = sql.Column { name, kind: info.name }
+        kinds[i] = info.kind
+    }
+    x.columns = columns
+    x.kinds = kinds
+}
+
+fn row_of(c: *Conn, mut m: Message, x: *Exchange) -> []sql.Value ! sql.Error {
+    let n = int16(mut m)?
+    if n != x.kinds.len {
+        fail Protocol
+    }
+    let row: []sql.Value = __make(n)
+    for i in 0..n {
+        let size = int32(mut m)?
+        if size < 0 {
+            row[i] = sql.Value.Null
+            continue
+        }
+        let raw = __str_view(take(mut m, size)?)
+        let kind = x.kinds[i]
+        if !c.iso_dates && (kind == Day || kind == Stamp || kind == StampZone) {
+            fail Conversion
+        }
+        row[i] = decode(kind, raw)?
+    }
+    row
+}
+
+fn sync(c: *Conn, x: *Exchange) ! sql.Error {
+    if x.synced {
+        return
+    }
+    x.synced = true
+    var b: []u8 = []
+    put_empty(mut b, 'S')
+    send(c, b)?
+}
+
+fn more(c: *Conn, x: *Exchange) ! sql.Error {
+    var b: []u8 = []
+    put_execute(mut b, x.batch)
+    put_empty(mut b, 'H')
+    send(c, b)?
+}
+
+fn on_row(c: *Conn, mut m: Message, x: *Exchange, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
+    if x.stopped {
+        return
+    }
+    let row = row_of(c, mut m, x) catch {
+        Conversion => {
+            x.failure = sql.Error.Conversion
+            x.stopped = true
+            return
+        }
+        _ => fail Protocol
+    }
+    if !visit(x.columns, row) {
+        x.stopped = true
+    }
+}
+
+fn on_error(c: *Conn, mut m: Message, x: *Exchange) ! sql.Error {
+    let n = notice(mut m)?
+    let e = server_error(n)
+    if n.severity == "FATAL" || n.severity == "PANIC" {
+        abandon(c, false)
+        fail e
+    }
+    if n.code == "26000" {
+        c.statements = [:]
+    }
+    if x.failure == none {
+        x.failure = e
+    }
+    x.stopped = true
+    sync(c, x)?
+}
+
+fn on_copy_in(c: *Conn) ! sql.Error {
+    var b: []u8 = []
+    put_copy_fail(mut b, "COPY FROM STDIN is not supported")
+    send(c, b)?
+}
+
+fn drive(c: *Conn, batch: i64, describe: fn([]sql.Column), visit: fn([]sql.Column, []sql.Value) -> bool) -> i64 ! sql.Error {
+    let x = new(Exchange { batch, columns: [], kinds: [], failure: none, stopped: false, synced: batch == 0, count: 0 })
+    for {
+        var m = receive(c)?
+        let k = m.kind
+        if k == 'Z' {
+            ready(c, mut m)?
+            match x.failure {
+                some(e) => fail e
+                none => return x.count
+            }
+        } else if k == 'D' {
+            on_row(c, mut m, x, visit)?
+        } else if k == 'T' {
+            columns_of(c, mut m, x)?
+            describe(x.columns)
+        } else if k == 'C' {
+            x.count += command_count(cstring(mut m)?)
+            sync(c, x)?
+        } else if k == 'E' {
+            on_error(c, mut m, x)?
+        } else if k == 's' {
+            if x.stopped {
+                sync(c, x)?
+            } else {
+                more(c, x)?
+            }
+        } else if k == 'I' {
+            sync(c, x)?
+        } else if k == '1' {
+            if c.parsing.len > 0 {
+                c.statements[c.parsing] = c.parsing_name
+            }
+        } else if k == 'G' || k == 'W' {
+            on_copy_in(c)?
+        } else if k == '2' || k == '3' || k == 'n' || k == 't' || k == 'H' || k == 'd' || k == 'c' {
+            continue
+        } else if !background(c, mut m)? {
+            fail Protocol
+        }
+    }
+}
+
+fn checked(sql_text: str) ! sql.Error {
+    if text.index_byte(sql_text, 0) >= 0 {
+        fail Conversion
+    }
+}
+
+fn simple(c: *Conn, sql_text: str) ! sql.Error {
+    checked(sql_text)?
+    var b: []u8 = []
+    put_query(mut b, sql_text)
+    send(c, b)?
+}
+
+fn statement_key(sql_text: str, oids: []i64) -> str {
+    var key: []u8 = []
+    for oid in oids {
+        io.append_str(mut key, "{oid},")
+    }
+    push(mut key, 0)
+    io.append_str(mut key, sql_text)
+    __str_view(key)
+}
+
+fn prepare(c: *Conn, mut b: []u8, sql_text: str, oids: []i64) -> str {
+    let key = statement_key(sql_text, oids)
+    match c.statements[key] {
+        some(name) => return name
+        none => {}
+    }
+    if c.seen[key] == none {
+        if c.seen.len >= seen_capacity() {
+            c.seen = [:]
+        }
+        c.seen[key] = true
+        put_parse(mut b, "", sql_text, oids)
+        return ""
+    }
+    if c.statements.len >= statement_capacity() {
+        for old, name in c.statements {
+            put_close_statement(mut b, name)
+            delete(mut c.statements, old)
+            break
+        }
+    }
+    c.counter += 1
+    let name = "lowlang_{c.counter}"
+    put_parse(mut b, name, sql_text, oids)
+    c.parsing = key
+    c.parsing_name = name
+    name
+}
+
+fn extended(c: *Conn, sql_text: str, values: []sql.Value, batch: i64) ! sql.Error {
+    checked(sql_text)?
+    if values.len > 65535 {
+        fail Conversion
+    }
+    let p = parameters(values)?
+    var b: []u8 = []
+    let name = prepare(c, mut b, sql_text, p.oids)
+    put_bind(mut b, name, p)
+    put_describe_portal(mut b)
+    put_execute(mut b, batch)
+    put_empty(mut b, if batch == 0 { 'S' } else { 'H' })
+    send(c, b)?
+}
+
+fn ignore_columns(columns: []sql.Column) {}
+
+fn ignore_row(columns: []sql.Column, row: []sql.Value) -> bool {
+    true
+}
+
+fn query(c: *Conn, sql_text: str, values: []sql.Value) -> sql.Rows ! sql.Error {
+    if values.len == 0 {
+        simple(c, sql_text)?
+    } else {
+        extended(c, sql_text, values, 0)?
+    }
+    var columns: []sql.Column = []
+    var rows: [][]sql.Value = []
+    drive(c, 0, fn(described) {
+        columns = described
+        rows = []
+    }, fn(cols, row) -> bool {
+        push(mut rows, row)
+        true
+    })?
+    sql.Rows { columns, rows }
+}
+
+fn execute(c: *Conn, sql_text: str, values: []sql.Value) -> i64 ! sql.Error {
+    if values.len == 0 {
+        simple(c, sql_text)?
+    } else {
+        extended(c, sql_text, values, 0)?
+    }
+    drive(c, 0, ignore_columns, ignore_row)
+}
+
+fn each(c: *Conn, sql_text: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
+    extended(c, sql_text, values, each_batch())?
+    drive(c, each_batch(), ignore_columns, visit)?
+}
+
+fn commit(c: *Conn) ! sql.Error {
+    if c.status == 'E' {
+        execute(c, "ROLLBACK", [])?
+        fail sql.Error.Server("25P02", "current transaction is aborted; rolled back instead of committed")
+    }
+    execute(c, "COMMIT", [])?
+}
+
+fn guarded[T](c: *Conn, work: fn() -> T ! sql.Error) -> T ! sql.Error {
+    if c.closed {
+        fail Closed
+    }
+    if c.busy {
+        fail Busy
+    }
+    c.busy = true
+    defer c.busy = false
+    work() catch {
+        Protocol => {
+            abandon(c, false)
+            fail Protocol
+        }
+        Connect => fail Connect
+        Authentication => fail Authentication
+        Closed => fail Closed
+        Timeout => fail Timeout
+        Unsupported => fail Unsupported
+        Conversion => fail Conversion
+        Busy => fail Busy
+        Server(code, message) => fail Server(code, message)
+    }
+}
+
+fn terminate(c: *Conn) {
+    if c.closed {
+        return
+    }
+    c.closed = true
+    if !c.busy {
+        var b: []u8 = []
+        put_empty(mut b, 'X')
+        io.write_all(c.stream, b) catch {
+            _ => {}
+        }
+    }
+    c.stream.close()
+}
+
+fn authenticate(c: *Conn, o: sql.Options) ! sql.Error {
+    send(c, startup_message(o))?
+    var exchange: *Scram? = none
+    var verified = false
+    for {
+        var m = receive(c)?
+        if m.kind == 'R' {
+            let code = int32(mut m)?
+            if code == 0 {
+                if exchange != none && !verified {
+                    fail Authentication
+                }
+            } else if code == 3 {
+                send(c, password_message(o.password))?
+            } else if code == 5 {
+                let salt = take(mut m, 4)?
+                send(c, password_message(md5_password(o.user, o.password, salt)))?
+            } else if code == 10 {
+                var offered = false
+                for {
+                    let mechanism = cstring(mut m)?
+                    if mechanism.len == 0 {
+                        break
+                    }
+                    offered = offered || mechanism == "SCRAM-SHA-256"
+                }
+                if !offered {
+                    fail Unsupported
+                }
+                let s = scram(o.user, o.password, base64.encode(crypto.random(18)))
+                exchange = s
+                send(c, sasl_initial("SCRAM-SHA-256", scram_first(s)))?
+            } else if code == 11 {
+                match exchange {
+                    some(s) => {
+                        let reply = scram_final(s, __str_view(rest(mut m)))?
+                        send(c, sasl_response(reply))?
+                    }
+                    none => fail Protocol
+                }
+            } else if code == 12 {
+                match exchange {
+                    some(s) => scram_verify(s, __str_view(rest(mut m)))?
+                    none => fail Protocol
+                }
+                verified = true
+            } else {
+                fail Unsupported
+            }
+        } else if m.kind == 'E' {
+            fail server_error(notice(mut m)?)
+        } else if m.kind == 'K' {
+            c.process = int32(mut m)?
+            c.secret = rest(mut m)
+        } else if m.kind == 'Z' {
+            ready(c, mut m)?
+            return
+        } else if m.kind != 'v' && !background(c, mut m)? {
+            fail Protocol
+        }
+    }
+}
+
+fn open(s: io.Stream, o: sql.Options, cancel: fn(i64, []u8)) -> sql.Connection ! sql.Error {
+    let c = new(Conn {
+        stream: s
+        reader: io.reader(s)
+        status: 'I'
+        iso_dates: true
+        process: 0
+        secret: []
+        cancel
+        types: type_table()
+        statements: [:]
+        seen: [:]
+        parsing: ""
+        parsing_name: ""
+        counter: 0
+        busy: false
+        closed: false
+    })
+    guarded(c, fn() -> bool ! sql.Error {
+        authenticate(c, o)?
+        true
+    }) catch {
+        Connect => fail closed_with(c, sql.Error.Connect)
+        Authentication => fail closed_with(c, sql.Error.Authentication)
+        Closed => fail closed_with(c, sql.Error.Closed)
+        Timeout => fail closed_with(c, sql.Error.Timeout)
+        Protocol => fail closed_with(c, sql.Error.Protocol)
+        Unsupported => fail closed_with(c, sql.Error.Unsupported)
+        Conversion => fail closed_with(c, sql.Error.Conversion)
+        Busy => fail closed_with(c, sql.Error.Busy)
+        Server(code, message) => fail closed_with(c, sql.Error.Server(code, message))
+    }
+    sql.Connection {
+        dialect: Postgres
+        query: fn(sql_text, values) -> sql.Rows ! sql.Error {
+            guarded(c, fn() -> sql.Rows ! sql.Error { query(c, sql_text, values) })
+        }
+        each: fn(sql_text, values, visit) ! sql.Error {
+            guarded(c, fn() -> bool ! sql.Error {
+                each(c, sql_text, values, visit)?
+                true
+            })?
+        }
+        execute: fn(sql_text, values) -> i64 ! sql.Error {
+            guarded(c, fn() -> i64 ! sql.Error { execute(c, sql_text, values) })
+        }
+        begin: fn() ! sql.Error {
+            guarded(c, fn() -> i64 ! sql.Error { execute(c, "BEGIN", []) })?
+        }
+        commit: fn() ! sql.Error {
+            guarded(c, fn() -> bool ! sql.Error {
+                commit(c)?
+                true
+            })?
+        }
+        rollback: fn() ! sql.Error {
+            guarded(c, fn() -> i64 ! sql.Error { execute(c, "ROLLBACK", []) })?
+        }
+        close: fn() { terminate(c) }
+    }
+}
+
+fn closed_with(c: *Conn, e: sql.Error) -> sql.Error {
+    terminate(c)
+    e
+}
+
+fn port_of(o: sql.Options) -> i64 {
+    if o.port == 0 { 5432 } else { o.port }
+}
+
+fn dial(o: sql.Options) -> net.Conn ! sql.Error {
+    let conn = net.dial_within(o.host, port_of(o), o.timeout) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    net.set_read_timeout(conn, o.timeout)
+    net.set_write_timeout(conn, o.timeout)
+    conn
+}
+
+fn canceller(o: sql.Options) -> fn(i64, []u8) {
+    fn(process: i64, secret: []u8) {
+        let conn = net.dial_within(o.host, port_of(o), o.timeout) catch {
+            _ => return
+        }
+        net.write_all(conn, cancel_request(process, secret)) catch {
+            _ => {}
+        }
+        net.close(conn)
+    }
+}
+
+pub fn connect(o: sql.Options) -> sql.Connection ! sql.Error {
+    let conn = dial(o)?
+    open(net.stream(conn), o, canceller(o))
+}
+
+pub fn connect_stream(s: io.Stream, o: sql.Options) -> sql.Connection ! sql.Error {
+    open(s, o, fn(process: i64, secret: []u8) {})
+}
+
+pub fn connect_tls(o: sql.Options, config: tls.Config) -> sql.Connection ! sql.Error {
+    let conn = dial(o)?
+    let answer: []u8 = __make(1)
+    let n = negotiate(conn, answer) catch {
+        TimedOut => {
+            net.close(conn)
+            fail Timeout
+        }
+        _ => {
+            net.close(conn)
+            fail Connect
+        }
+    }
+    if n != 1 || answer[0] != 'S' {
+        net.close(conn)
+        if n == 1 && answer[0] == 'N' {
+            fail Unsupported
+        }
+        fail Protocol
+    }
+    var named = config
+    if named.server_name.len == 0 {
+        named.server_name = o.host
+    }
+    let session = tls.client(net.stream(conn), named) catch {
+        TimedOut => {
+            net.close(conn)
+            fail Timeout
+        }
+        _ => {
+            net.close(conn)
+            fail Connect
+        }
+    }
+    open(tls.stream(session), o, canceller(o))
+}
+
+fn negotiate(conn: net.Conn, answer: []u8) -> i64 ! io.Error {
+    net.write_all(conn, ssl_request())?
+    net.read(conn, answer)
+}

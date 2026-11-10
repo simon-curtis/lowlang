@@ -1,0 +1,923 @@
+import std/text
+
+enum Origin {
+    Implicit
+    Header
+    Dotted
+    Inline
+}
+
+struct Parser {
+    src: str
+    pos: i64
+    root: *Table
+    current: *Table
+    origins: [*Table: Origin]
+    depth: i64
+}
+
+fn parser(src: str) -> *Parser {
+    let root = new_table()
+    new(Parser { src, pos: 0, root, current: root, origins: [:], depth: 0 })
+}
+
+fn max_depth() -> i64 {
+    128
+}
+
+pub fn parse(source: str) -> *Table ! Error {
+    let p = parser(normalized(source))
+    check_utf8(p)?
+    if starts(p, __str_view([0xEF, 0xBB, 0xBF])) {
+        p.pos = 3
+    }
+    for {
+        skip_space(p)
+        if p.pos >= p.src.len {
+            break
+        }
+        let c = p.src[p.pos]
+        if c == '[' {
+            if starts(p, "[[") {
+                array_header(p)?
+            } else {
+                table_header(p)?
+            }
+            skip_space(p)
+        } else if c != '#' && c != '\n' {
+            key_value(p, p.current)?
+            skip_space(p)
+        }
+        end_of_line(p)?
+    }
+    p.root
+}
+
+fn normalized(source: str) -> str {
+    if text.index_byte(source, '\r') < 0 {
+        return source
+    }
+    let out: []u8 = __make(source.len)
+    var n = 0
+    var i = 0
+    for i < source.len {
+        if source[i] == '\r' && i + 1 < source.len && source[i + 1] == '\n' {
+            i += 1
+        }
+        out[n] = source[i]
+        n += 1
+        i += 1
+    }
+    __str_view(out[..n])
+}
+
+fn fail_at(p: *Parser, at: i64, message: str) -> Error {
+    var line = 1
+    var start = 0
+    let end = if at < p.src.len { at } else { p.src.len }
+    for i in 0..end {
+        if p.src[i] == '\n' {
+            line += 1
+            start = i + 1
+        }
+    }
+    Syntax(line, at - start + 1, message)
+}
+
+fn check_utf8(p: *Parser) ! Error {
+    let s = p.src
+    var i = 0
+    for i < s.len {
+        let c = s[i]
+        if c < 0x80 {
+            i += 1
+            continue
+        }
+        var need = 0
+        var low: u8 = 0x80
+        var high: u8 = 0xBF
+        if c >= 0xC2 && c <= 0xDF {
+            need = 1
+        } else if c >= 0xE0 && c <= 0xEF {
+            need = 2
+            if c == 0xE0 {
+                low = 0xA0
+            } else if c == 0xED {
+                high = 0x9F
+            }
+        } else if c >= 0xF0 && c <= 0xF4 {
+            need = 3
+            if c == 0xF0 {
+                low = 0x90
+            } else if c == 0xF4 {
+                high = 0x8F
+            }
+        } else {
+            fail fail_at(p, i, "invalid UTF-8")
+        }
+        if i + need >= s.len {
+            fail fail_at(p, i, "invalid UTF-8")
+        }
+        for k in 1..need + 1 {
+            let b = s[i + k]
+            let lo = if k == 1 { low } else { u8(0x80) }
+            let hi = if k == 1 { high } else { u8(0xBF) }
+            if b < lo || b > hi {
+                fail fail_at(p, i, "invalid UTF-8")
+            }
+        }
+        i += need + 1
+    }
+}
+
+fn starts(p: *Parser, prefix: str) -> bool {
+    p.pos + prefix.len <= p.src.len && p.src[p.pos..p.pos + prefix.len] == prefix
+}
+
+fn peek(p: *Parser) -> u8 {
+    if p.pos < p.src.len { p.src[p.pos] } else { 0 }
+}
+
+fn skip_space(p: *Parser) {
+    for p.pos < p.src.len && (p.src[p.pos] == ' ' || p.src[p.pos] == '\t') {
+        p.pos += 1
+    }
+}
+
+fn control(c: u8) -> bool {
+    (c < 0x20 && c != '\t') || c == 0x7F
+}
+
+fn skip_comment(p: *Parser) ! Error {
+    if peek(p) != '#' {
+        return
+    }
+    p.pos += 1
+    for p.pos < p.src.len && p.src[p.pos] != '\n' {
+        if control(p.src[p.pos]) {
+            fail fail_at(p, p.pos, "control character in comment")
+        }
+        p.pos += 1
+    }
+}
+
+fn end_of_line(p: *Parser) ! Error {
+    skip_comment(p)?
+    if p.pos >= p.src.len {
+        return
+    }
+    if p.src[p.pos] != '\n' {
+        fail fail_at(p, p.pos, "expected a newline after the statement")
+    }
+    p.pos += 1
+}
+
+fn skip_array_space(p: *Parser) ! Error {
+    for {
+        let before = p.pos
+        for p.pos < p.src.len && (p.src[p.pos] == ' ' || p.src[p.pos] == '\t' || p.src[p.pos] == '\n') {
+            p.pos += 1
+        }
+        skip_comment(p)?
+        if p.pos == before {
+            return
+        }
+    }
+}
+
+fn bare_key_char(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'
+}
+
+fn key_part(p: *Parser) -> str ! Error {
+    let c = peek(p)
+    if bare_key_char(c) {
+        let start = p.pos
+        for p.pos < p.src.len && bare_key_char(p.src[p.pos]) {
+            p.pos += 1
+        }
+        return p.src[start..p.pos]
+    }
+    if c == '"' {
+        p.pos += 1
+        return basic_string(p, false)
+    }
+    if c == '\'' {
+        p.pos += 1
+        return literal_string(p)
+    }
+    fail fail_at(p, p.pos, "expected a key")
+}
+
+fn key(p: *Parser) -> []str ! Error {
+    var parts: []str = [key_part(p)?]
+    skip_space(p)
+    for peek(p) == '.' {
+        p.pos += 1
+        skip_space(p)
+        push(mut parts, key_part(p)?)
+        skip_space(p)
+    }
+    parts
+}
+
+fn key_path(path: str) -> []str? {
+    let p = parser(path)
+    skip_space(p)
+    let parts = key(p) catch {
+        _ => return none
+    }
+    if p.pos != path.len {
+        return none
+    }
+    parts
+}
+
+fn origin(p: *Parser, t: *Table) -> Origin {
+    p.origins[t] ?? Implicit
+}
+
+fn header_parent(p: *Parser, parts: []str, at: i64) -> *Table ! Error {
+    var t = p.root
+    for part in parts[..parts.len - 1] {
+        match t.values[part] {
+            none => {
+                let created = new_table()
+                insert(t, part, Table(created))
+                t = created
+            }
+            some(v) => match v {
+                Table(inner) => {
+                    if origin(p, inner) == Inline {
+                        fail fail_at(p, at, "cannot extend an inline table")
+                    }
+                    t = inner
+                }
+                Array(items) => {
+                    t = match last_header_table(p, items) {
+                        some(last) => last
+                        none => fail fail_at(p, at, "cannot extend a static array")
+                    }
+                }
+                _ => fail fail_at(p, at, "key '{part}' is not a table")
+            }
+        }
+    }
+    t
+}
+
+fn last_header_table(p: *Parser, items: []Value) -> *Table? {
+    if items.len == 0 {
+        return none
+    }
+    match items[items.len - 1] {
+        Table(last) => if origin(p, last) == Inline { none } else { last }
+        _ => none
+    }
+}
+
+fn header_key(p: *Parser, open: i64) -> []str ! Error {
+    p.pos += open
+    skip_space(p)
+    key(p)
+}
+
+fn close_header(p: *Parser, close: str) ! Error {
+    if !starts(p, close) {
+        fail fail_at(p, p.pos, "expected '{close}' after the table name")
+    }
+    p.pos += close.len
+}
+
+fn table_header(p: *Parser) ! Error {
+    let at = p.pos
+    let parts = header_key(p, 1)?
+    close_header(p, "]")?
+    let parent = header_parent(p, parts, at)?
+    let name = parts[parts.len - 1]
+    match parent.values[name] {
+        none => {
+            let created = new_table()
+            insert(parent, name, Table(created))
+            p.origins[created] = Header
+            p.current = created
+        }
+        some(v) => match v {
+            Table(existing) => {
+                if origin(p, existing) != Implicit {
+                    fail fail_at(p, at, "table '{name}' is already defined")
+                }
+                p.origins[existing] = Header
+                p.current = existing
+            }
+            _ => fail fail_at(p, at, "key '{name}' is already defined")
+        }
+    }
+}
+
+fn array_header(p: *Parser) ! Error {
+    let at = p.pos
+    let parts = header_key(p, 2)?
+    close_header(p, "]]")?
+    let parent = header_parent(p, parts, at)?
+    let name = parts[parts.len - 1]
+    let created = new_table()
+    p.origins[created] = Header
+    match parent.values[name] {
+        none => {
+            let items: []Value = [Table(created)]
+            insert(parent, name, Array(items))
+        }
+        some(v) => match v {
+            Array(items) => {
+                if last_header_table(p, items) == none {
+                    fail fail_at(p, at, "cannot append to static array '{name}'")
+                }
+                var grown = items
+                push(mut grown, Table(created))
+                parent.values[name] = Array(grown)
+            }
+            _ => fail fail_at(p, at, "key '{name}' is already defined")
+        }
+    }
+    p.current = created
+}
+
+fn key_value(p: *Parser, target: *Table) ! Error {
+    let at = p.pos
+    let parts = key(p)?
+    if peek(p) != '=' {
+        fail fail_at(p, p.pos, "expected '=' after the key")
+    }
+    p.pos += 1
+    skip_space(p)
+    let v = value(p)?
+    var t = target
+    for part in parts[..parts.len - 1] {
+        match t.values[part] {
+            none => {
+                let created = new_table()
+                insert(t, part, Table(created))
+                p.origins[created] = Dotted
+                t = created
+            }
+            some(existing) => match existing {
+                Table(inner) => {
+                    let o = origin(p, inner)
+                    if o == Header || o == Inline {
+                        fail fail_at(p, at, "cannot add keys to table '{part}' with a dotted key")
+                    }
+                    p.origins[inner] = Dotted
+                    t = inner
+                }
+                _ => fail fail_at(p, at, "key '{part}' is not a table")
+            }
+        }
+    }
+    let name = parts[parts.len - 1]
+    match t.values[name] {
+        some(_) => fail fail_at(p, at, "key '{name}' is already defined")
+        none => insert(t, name, v)
+    }
+}
+
+fn value(p: *Parser) -> Value ! Error {
+    let c = peek(p)
+    if c == '"' {
+        if starts(p, "\"\"\"") {
+            p.pos += 3
+            return Str(multiline_basic(p)?)
+        }
+        p.pos += 1
+        return Str(basic_string(p, false)?)
+    }
+    if c == '\'' {
+        if starts(p, "'''") {
+            p.pos += 3
+            return Str(multiline_literal(p)?)
+        }
+        p.pos += 1
+        return Str(literal_string(p)?)
+    }
+    if c == '[' {
+        return array_value(p)
+    }
+    if c == '{' {
+        return inline_table(p)
+    }
+    if starts(p, "true") {
+        p.pos += 4
+        return Bool(true)
+    }
+    if starts(p, "false") {
+        p.pos += 5
+        return Bool(false)
+    }
+    if digits_ahead(p, 4) && p.pos + 4 < p.src.len && p.src[p.pos + 4] == '-' {
+        return date_value(p)
+    }
+    if digits_ahead(p, 2) && p.pos + 2 < p.src.len && p.src[p.pos + 2] == ':' {
+        let d = time_of_day(p, DateTime {})?
+        return LocalTime(d)
+    }
+    number(p)
+}
+
+fn enter(p: *Parser) ! Error {
+    p.depth += 1
+    if p.depth > max_depth() {
+        fail fail_at(p, p.pos, "values nested too deeply")
+    }
+}
+
+fn array_value(p: *Parser) -> Value ! Error {
+    enter(p)?
+    p.pos += 1
+    var items: []Value = []
+    skip_array_space(p)?
+    for peek(p) != ']' {
+        push(mut items, value(p)?)
+        skip_array_space(p)?
+        let c = peek(p)
+        if c == ']' {
+            break
+        }
+        if c != ',' {
+            fail fail_at(p, p.pos, "expected ',' or ']' in array")
+        }
+        p.pos += 1
+        skip_array_space(p)?
+    }
+    p.pos += 1
+    p.depth -= 1
+    Array(items)
+}
+
+fn inline_table(p: *Parser) -> Value ! Error {
+    enter(p)?
+    p.pos += 1
+    let t = new_table()
+    skip_space(p)
+    if peek(p) == '}' {
+        p.pos += 1
+    } else {
+        for {
+            key_value(p, t)?
+            skip_space(p)
+            let c = peek(p)
+            if c == '}' {
+                p.pos += 1
+                break
+            }
+            if c != ',' {
+                fail fail_at(p, p.pos, "expected ',' or '}}' in inline table")
+            }
+            p.pos += 1
+            skip_space(p)
+        }
+    }
+    freeze(p, t)
+    p.depth -= 1
+    Table(t)
+}
+
+fn freeze(p: *Parser, t: *Table) {
+    p.origins[t] = Inline
+    for _, v in t.values {
+        freeze_value(p, v)
+    }
+}
+
+fn freeze_value(p: *Parser, v: Value) {
+    match v {
+        Table(inner) => freeze(p, inner)
+        Array(items) => {
+            for item in items {
+                freeze_value(p, item)
+            }
+        }
+        _ => {}
+    }
+}
+
+fn hex_value(c: u8) -> i64 {
+    if c >= '0' && c <= '9' {
+        return i64(c - '0')
+    }
+    if c >= 'a' && c <= 'f' {
+        return i64(c - 'a') + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return i64(c - 'A') + 10
+    }
+    -1
+}
+
+fn push_code_point(mut out: []u8, cp: i64) {
+    if cp < 0x80 {
+        push(mut out, u8(cp))
+    } else if cp < 0x800 {
+        push(mut out, u8(0xC0 | (cp >> 6)))
+        push(mut out, u8(0x80 | (cp & 0x3F)))
+    } else if cp < 0x10000 {
+        push(mut out, u8(0xE0 | (cp >> 12)))
+        push(mut out, u8(0x80 | ((cp >> 6) & 0x3F)))
+        push(mut out, u8(0x80 | (cp & 0x3F)))
+    } else {
+        push(mut out, u8(0xF0 | (cp >> 18)))
+        push(mut out, u8(0x80 | ((cp >> 12) & 0x3F)))
+        push(mut out, u8(0x80 | ((cp >> 6) & 0x3F)))
+        push(mut out, u8(0x80 | (cp & 0x3F)))
+    }
+}
+
+fn unicode_escape(p: *Parser, mut out: []u8, width: i64) ! Error {
+    if p.pos + width > p.src.len {
+        fail fail_at(p, p.pos, "incomplete unicode escape")
+    }
+    var cp = 0
+    for i in 0..width {
+        let d = hex_value(p.src[p.pos + i])
+        if d < 0 {
+            fail fail_at(p, p.pos, "invalid unicode escape")
+        }
+        cp = cp * 16 + d
+    }
+    if (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF {
+        fail fail_at(p, p.pos, "escape is not a unicode scalar value")
+    }
+    p.pos += width
+    push_code_point(mut out, cp)
+}
+
+fn escape(p: *Parser, mut out: []u8, multiline: bool) ! Error {
+    let at = p.pos
+    p.pos += 1
+    let c = peek(p)
+    if multiline && (c == ' ' || c == '\t' || c == '\n') {
+        skip_space(p)
+        if peek(p) != '\n' {
+            fail fail_at(p, at, "invalid escape")
+        }
+        for p.pos < p.src.len && (p.src[p.pos] == ' ' || p.src[p.pos] == '\t' || p.src[p.pos] == '\n') {
+            p.pos += 1
+        }
+        return
+    }
+    p.pos += 1
+    if c == 'b' {
+        push(mut out, 0x08)
+    } else if c == 't' {
+        push(mut out, '\t')
+    } else if c == 'n' {
+        push(mut out, '\n')
+    } else if c == 'f' {
+        push(mut out, 0x0C)
+    } else if c == 'r' {
+        push(mut out, '\r')
+    } else if c == '"' {
+        push(mut out, '"')
+    } else if c == '\\' {
+        push(mut out, '\\')
+    } else if c == 'u' {
+        unicode_escape(p, mut out, 4)?
+    } else if c == 'U' {
+        unicode_escape(p, mut out, 8)?
+    } else {
+        fail fail_at(p, at, "invalid escape")
+    }
+}
+
+fn basic_string(p: *Parser, multiline: bool) -> str ! Error {
+    var out: []u8 = []
+    var start = p.pos
+    for {
+        if p.pos >= p.src.len {
+            fail fail_at(p, p.pos, "unterminated string")
+        }
+        let c = p.src[p.pos]
+        if c == '"' {
+            if !multiline {
+                text.append(mut out, p.src[start..p.pos])
+                p.pos += 1
+                return __str_view(out)
+            }
+            if starts(p, "\"\"\"") {
+                text.append(mut out, p.src[start..p.pos])
+                p.pos += 3
+                return __str_view(out)
+            }
+            p.pos += 1
+        } else if c == '\\' {
+            text.append(mut out, p.src[start..p.pos])
+            escape(p, mut out, multiline)?
+            start = p.pos
+        } else if control(c) && !(multiline && c == '\n') {
+            fail fail_at(p, p.pos, "control character in string")
+        } else {
+            p.pos += 1
+        }
+    }
+}
+
+fn literal_string(p: *Parser) -> str ! Error {
+    let start = p.pos
+    for {
+        if p.pos >= p.src.len || p.src[p.pos] == '\n' {
+            fail fail_at(p, p.pos, "unterminated string")
+        }
+        let c = p.src[p.pos]
+        if c == '\'' {
+            p.pos += 1
+            return p.src[start..p.pos - 1]
+        }
+        if control(c) {
+            fail fail_at(p, p.pos, "control character in string")
+        }
+        p.pos += 1
+    }
+}
+
+fn skip_first_newline(p: *Parser) {
+    if peek(p) == '\n' {
+        p.pos += 1
+    }
+}
+
+fn trailing_quotes(p: *Parser, body: str, quote: u8) -> str {
+    var extra = 0
+    for extra < 2 && peek(p) == quote {
+        p.pos += 1
+        extra += 1
+    }
+    if extra == 0 {
+        return body
+    }
+    var out = bytes(body)
+    for _ in 0..extra {
+        push(mut out, quote)
+    }
+    __str_view(out)
+}
+
+fn multiline_basic(p: *Parser) -> str ! Error {
+    skip_first_newline(p)
+    let body = basic_string(p, true)?
+    trailing_quotes(p, body, '"')
+}
+
+fn multiline_literal(p: *Parser) -> str ! Error {
+    skip_first_newline(p)
+    let start = p.pos
+    for !starts(p, "'''") {
+        if p.pos >= p.src.len {
+            fail fail_at(p, p.pos, "unterminated string")
+        }
+        let c = p.src[p.pos]
+        if control(c) && c != '\n' {
+            fail fail_at(p, p.pos, "control character in string")
+        }
+        p.pos += 1
+    }
+    let body = p.src[start..p.pos]
+    p.pos += 3
+    trailing_quotes(p, body, '\'')
+}
+
+fn digits_ahead(p: *Parser, n: i64) -> bool {
+    if p.pos + n > p.src.len {
+        return false
+    }
+    for i in 0..n {
+        let c = p.src[p.pos + i]
+        if c < '0' || c > '9' {
+            return false
+        }
+    }
+    true
+}
+
+fn fixed_digits(p: *Parser, n: i64, low: i64, high: i64, what: str) -> i64 ! Error {
+    if !digits_ahead(p, n) {
+        fail fail_at(p, p.pos, "expected {what}")
+    }
+    var v = 0
+    for i in 0..n {
+        v = v * 10 + i64(p.src[p.pos + i] - '0')
+    }
+    if v < low || v > high {
+        fail fail_at(p, p.pos, "{what} out of range")
+    }
+    p.pos += n
+    v
+}
+
+fn expect_byte(p: *Parser, c: u8, what: str) ! Error {
+    if peek(p) != c {
+        fail fail_at(p, p.pos, "expected {what}")
+    }
+    p.pos += 1
+}
+
+fn leap(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    if month == 2 {
+        return if leap(year) { 29 } else { 28 }
+    }
+    if month == 4 || month == 6 || month == 9 || month == 11 {
+        return 30
+    }
+    31
+}
+
+fn date_value(p: *Parser) -> Value ! Error {
+    let at = p.pos
+    var d = DateTime {}
+    d.year = fixed_digits(p, 4, 0, 9999, "year")?
+    expect_byte(p, '-', "'-'")?
+    d.month = fixed_digits(p, 2, 1, 12, "month")?
+    expect_byte(p, '-', "'-'")?
+    d.day = fixed_digits(p, 2, 1, 31, "day")?
+    if d.day > days_in_month(d.year, d.month) {
+        fail fail_at(p, at, "day out of range for the month")
+    }
+    let c = peek(p)
+    let separated = c == 'T' || c == 't' || (c == ' ' && p.pos + 3 < p.src.len && p.src[p.pos + 3] == ':')
+    if !separated {
+        return LocalDate(d)
+    }
+    p.pos += 1
+    d = time_of_day(p, d)?
+    let z = peek(p)
+    if z == 'Z' || z == 'z' {
+        p.pos += 1
+        return OffsetDateTime(d)
+    }
+    if z == '+' || z == '-' {
+        p.pos += 1
+        let hours = fixed_digits(p, 2, 0, 23, "offset hour")?
+        expect_byte(p, ':', "':'")?
+        let minutes = fixed_digits(p, 2, 0, 59, "offset minute")?
+        let magnitude = hours * 60 + minutes
+        d.offset = if z == '-' { -magnitude } else { magnitude }
+        return OffsetDateTime(d)
+    }
+    LocalDateTime(d)
+}
+
+fn time_of_day(p: *Parser, base: DateTime) -> DateTime ! Error {
+    var d = base
+    d.hour = fixed_digits(p, 2, 0, 23, "hour")?
+    expect_byte(p, ':', "':'")?
+    d.minute = fixed_digits(p, 2, 0, 59, "minute")?
+    expect_byte(p, ':', "':'")?
+    d.second = fixed_digits(p, 2, 0, 59, "second")?
+    if peek(p) != '.' {
+        return d
+    }
+    p.pos += 1
+    if !digits_ahead(p, 1) {
+        fail fail_at(p, p.pos, "expected fractional seconds")
+    }
+    var scale = 100000000
+    for digits_ahead(p, 1) {
+        d.nanosecond += i64(p.src[p.pos] - '0') * scale
+        scale = scale / 10
+        p.pos += 1
+    }
+    d
+}
+
+fn digit_run(p: *Parser, base: i64, mut out: []u8) ! Error {
+    if p.pos >= p.src.len || hex_value(p.src[p.pos]) < 0 || hex_value(p.src[p.pos]) >= base {
+        fail fail_at(p, p.pos, "expected a digit")
+    }
+    for p.pos < p.src.len {
+        let c = p.src[p.pos]
+        let d = hex_value(c)
+        if d >= 0 && d < base {
+            push(mut out, c)
+            p.pos += 1
+        } else if c == '_' {
+            p.pos += 1
+            let next = peek(p)
+            if hex_value(next) < 0 || hex_value(next) >= base {
+                fail fail_at(p, p.pos, "'_' must be between digits")
+            }
+        } else {
+            return
+        }
+    }
+}
+
+fn special_float(p: *Parser, negative: bool) -> Value? {
+    var v = 0.0
+    if starts(p, "inf") {
+        v = 1.0 / 0.0
+    } else if starts(p, "nan") {
+        v = text.float_from_bits(0x7FF8000000000000)
+    } else {
+        return none
+    }
+    p.pos += 3
+    if negative { Float(-v) } else { Float(v) }
+}
+
+fn number(p: *Parser) -> Value ! Error {
+    let at = p.pos
+    var c = peek(p)
+    if !(c >= '0' && c <= '9') && c != '+' && c != '-' && c != 'i' && c != 'n' {
+        fail fail_at(p, at, "expected a value")
+    }
+    if c == '0' && p.pos + 1 < p.src.len {
+        let marker = p.src[p.pos + 1]
+        var base = 0
+        if marker == 'x' {
+            base = 16
+        } else if marker == 'o' {
+            base = 8
+        } else if marker == 'b' {
+            base = 2
+        }
+        if base != 0 {
+            p.pos += 2
+            var digits: []u8 = []
+            digit_run(p, base, mut digits)?
+            let n = text.parse_uint(__str_view(digits), base) catch {
+                _ => fail fail_at(p, at, "integer out of range")
+            }
+            return Int(n)
+        }
+    }
+    var negative = false
+    var digits: []u8 = []
+    if c == '+' || c == '-' {
+        negative = c == '-'
+        if negative {
+            push(mut digits, '-')
+        }
+        p.pos += 1
+        c = peek(p)
+    }
+    match special_float(p, negative) {
+        some(v) => return v
+        none => {}
+    }
+    if c == '0' {
+        push(mut digits, '0')
+        p.pos += 1
+    } else {
+        digit_run(p, 10, mut digits)?
+    }
+    var is_float = false
+    if peek(p) == '.' {
+        is_float = true
+        push(mut digits, '.')
+        p.pos += 1
+        digit_run(p, 10, mut digits)?
+    }
+    let e = peek(p)
+    if e == 'e' || e == 'E' {
+        is_float = true
+        push(mut digits, 'e')
+        p.pos += 1
+        let sign = peek(p)
+        if sign == '+' || sign == '-' {
+            push(mut digits, sign)
+            p.pos += 1
+        }
+        digit_run(p, 10, mut digits)?
+    }
+    let literal = __str_view(digits)
+    if is_float {
+        let x = text.parse_float(literal) catch {
+            _ => fail fail_at(p, at, "invalid float")
+        }
+        return Float(x)
+    }
+    if digits_ahead(p, 1) {
+        fail fail_at(p, p.pos, "leading zeros are not allowed")
+    }
+    match signed_decimal(literal) {
+        some(n) => Int(n)
+        none => fail fail_at(p, at, "integer out of range")
+    }
+}
+
+fn signed_decimal(literal: str) -> i64? {
+    let negative = literal[0] == '-'
+    let start = if negative { 1 } else { 0 }
+    let limit: u64 = if negative { 0x8000000000000000 } else { 0x7FFFFFFFFFFFFFFF }
+    var n: u64 = 0
+    for i in start..literal.len {
+        let d = u64(literal[i] - '0')
+        if n > (limit - d) / 10 {
+            return none
+        }
+        n = n * 10 + d
+    }
+    if negative { -i64(n) } else { i64(n) }
+}

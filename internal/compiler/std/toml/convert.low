@@ -1,0 +1,272 @@
+import std/base64
+import std/serde
+
+struct Frame {
+    items: []Value
+    table: *Table
+    index: i64
+}
+
+struct Cursor {
+    pending: Value?
+    frames: []*Frame
+    count: i64
+    empty: *Table
+}
+
+fn take(c: *Cursor) -> Value ! serde.Error {
+    match c.pending {
+        some(v) => {
+            c.pending = none
+            c.count += 1
+            v
+        }
+        none => fail serde.Error.Syntax(c.count, "no value to read")
+    }
+}
+
+fn mismatch(c: *Cursor, what: str) -> serde.Error {
+    serde.Error.Mismatch(what, c.count)
+}
+
+fn top_frame(c: *Cursor) -> *Frame ! serde.Error {
+    if c.frames.len == 0 {
+        fail serde.Error.Syntax(c.count, "no open array or table")
+    }
+    c.frames[c.frames.len - 1]
+}
+
+fn pop_frame(c: *Cursor) {
+    c.frames = c.frames[..c.frames.len - 1]
+}
+
+fn table_reader(c: *Cursor) -> serde.Reader {
+    serde.Reader {
+        null: fn() -> bool ! serde.Error { false }
+        boolean: fn() -> bool ! serde.Error {
+            match take(c)? {
+                Bool(b) => b
+                _ => fail mismatch(c, "bool")
+            }
+        }
+        integer: fn() -> i64 ! serde.Error {
+            match take(c)? {
+                Int(n) => n
+                _ => fail mismatch(c, "integer")
+            }
+        }
+        unsigned: fn() -> u64 ! serde.Error {
+            match take(c)? {
+                Int(n) => {
+                    if n < 0 {
+                        fail serde.Error.Range(c.count)
+                    }
+                    u64(n)
+                }
+                _ => fail mismatch(c, "integer")
+            }
+        }
+        float: fn() -> f64 ! serde.Error {
+            match take(c)? {
+                Float(x) => x
+                Int(n) => f64(n)
+                _ => fail mismatch(c, "float")
+            }
+        }
+        text: fn() -> str ! serde.Error {
+            let v = take(c)?
+            match v {
+                Str(s) => return s
+                _ => {}
+            }
+            match datetime_text(v) {
+                some(s) => s
+                none => fail mismatch(c, "string")
+            }
+        }
+        binary: fn() -> []u8 ! serde.Error {
+            match take(c)? {
+                Str(s) => base64.decode(s) catch {
+                    _ => fail mismatch(c, "base64")
+                }
+                _ => fail mismatch(c, "base64 string")
+            }
+        }
+        begin_seq: fn() ! serde.Error {
+            match take(c)? {
+                Array(items) => push(mut c.frames, new(Frame { items, table: c.empty, index: 0 }))
+                _ => fail mismatch(c, "array")
+            }
+        }
+        next_element: fn() -> bool ! serde.Error {
+            let f = top_frame(c)?
+            if f.index >= f.items.len {
+                pop_frame(c)
+                return false
+            }
+            c.pending = f.items[f.index]
+            f.index += 1
+            true
+        }
+        begin_map: fn() ! serde.Error {
+            match take(c)? {
+                Table(t) => push(mut c.frames, new(Frame { items: [], table: t, index: 0 }))
+                _ => fail mismatch(c, "table")
+            }
+        }
+        next_key: fn() -> str? ! serde.Error {
+            let f = top_frame(c)?
+            if f.index >= f.table.keys.len {
+                pop_frame(c)
+                return none
+            }
+            let k = f.table.keys[f.index]
+            c.pending = f.table.values[k]
+            f.index += 1
+            k
+        }
+        begin_variant: fn() -> str ! serde.Error {
+            match take(c)? {
+                Str(name) => name
+                Table(t) => {
+                    if t.keys.len != 1 {
+                        fail mismatch(c, "table with one key naming the variant")
+                    }
+                    let name = t.keys[0]
+                    c.pending = t.values[name]
+                    name
+                }
+                _ => fail mismatch(c, "variant")
+            }
+        }
+        end_variant: fn() ! serde.Error {}
+        skip: fn() ! serde.Error {
+            take(c)?
+        }
+        position: fn() -> i64 { c.count }
+    }
+}
+
+pub fn from_table[T](t: *Table) -> T ! serde.Error {
+    let c = new(Cursor { pending: Table(t), frames: [], count: 0, empty: new_table() })
+    serde.read(table_reader(c))
+}
+
+pub fn deserialize[T](source: str) -> T ! serde.Error {
+    let t = parse(source) catch {
+        Syntax(line, column, message) => fail serde.Error.Syntax(line, "{message} at line {line}, column {column}")
+    }
+    from_table(t)
+}
+
+struct Build {
+    is_table: bool
+    table: *Table
+    items: []Value
+    key: str
+}
+
+struct Builder {
+    frames: []*Build
+    result: Value?
+    failure: serde.Error?
+}
+
+fn failed(b: *Builder, e: serde.Error) {
+    if b.failure == none {
+        b.failure = e
+    }
+}
+
+fn deliver(b: *Builder, v: Value) {
+    if b.frames.len == 0 {
+        b.result = v
+        return
+    }
+    let top = b.frames[b.frames.len - 1]
+    if top.is_table {
+        insert(top.table, top.key, v)
+    } else {
+        push(mut top.items, v)
+    }
+}
+
+fn open_table(b: *Builder, key: str) {
+    push(mut b.frames, new(Build { is_table: true, table: new_table(), items: [], key }))
+}
+
+fn close(b: *Builder) {
+    let top = b.frames[b.frames.len - 1]
+    b.frames = b.frames[..b.frames.len - 1]
+    if top.is_table {
+        deliver(b, Table(top.table))
+    } else {
+        deliver(b, Array(top.items))
+    }
+}
+
+fn set_key(b: *Builder, k: str) {
+    b.frames[b.frames.len - 1].key = k
+}
+
+fn null_value(b: *Builder) {
+    if b.frames.len == 0 {
+        failed(b, serde.Error.Mismatch("a table at the top level", 0))
+        return
+    }
+    if !b.frames[b.frames.len - 1].is_table {
+        failed(b, serde.Error.Mismatch("a value in an array, which cannot hold none", 0))
+    }
+}
+
+fn table_writer(b: *Builder) -> serde.Writer {
+    serde.Writer {
+        null: fn() { null_value(b) }
+        boolean: fn(v) { deliver(b, Bool(v)) }
+        integer: fn(n) { deliver(b, Int(n)) }
+        unsigned: fn(n) {
+            if n > 0x7FFFFFFFFFFFFFFF {
+                failed(b, serde.Error.Range(0))
+            }
+            deliver(b, Int(i64(n)))
+        }
+        float: fn(x) { deliver(b, Float(x)) }
+        text: fn(s) { deliver(b, Str(s)) }
+        binary: fn(data) { deliver(b, Str(base64.encode(data))) }
+        begin_seq: fn(n) {
+            let items: []Value = __make(0)
+            push(mut b.frames, new(Build { is_table: false, table: new_table(), items, key: "" }))
+        }
+        end_seq: fn() { close(b) }
+        begin_map: fn(n) { open_table(b, "") }
+        key: fn(k) { set_key(b, k) }
+        end_map: fn() { close(b) }
+        begin_struct: fn(name, n) { open_table(b, "") }
+        field: fn(name) { set_key(b, name) }
+        end_struct: fn() { close(b) }
+        unit_variant: fn(e, v) { deliver(b, Str(v)) }
+        begin_variant: fn(e, v, n) { open_table(b, v) }
+        end_variant: fn() { close(b) }
+    }
+}
+
+pub fn to_table[T](v: T) -> *Table ! serde.Error {
+    let b = new(Builder { frames: [], result: none, failure: none })
+    serde.write(v, table_writer(b))
+    match b.failure {
+        some(e) => fail e
+        none => {}
+    }
+    match b.result {
+        some(r) => match r {
+            Table(t) => t
+            _ => fail serde.Error.Mismatch("a table at the top level", 0)
+        }
+        none => fail serde.Error.Mismatch("a table at the top level", 0)
+    }
+}
+
+pub fn serialize[T](v: T) -> str ! serde.Error {
+    let t = to_table(v)?
+    encode(t)
+}
