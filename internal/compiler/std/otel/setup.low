@@ -1,0 +1,179 @@
+import std/http
+import std/text
+
+fn env_int(env: [str: str], name: str, fallback: i64) -> i64 {
+    let raw = text.trim(env[name] ?? "")
+    if raw.len == 0 {
+        return fallback
+    }
+    let n = text.parse_uint(raw, 10) catch -1
+    if n < 0 { fallback } else { n }
+}
+
+fn env_list(env: [str: str], name: str, fallback: str) -> []str {
+    let raw = text.trim(env[name] ?? "")
+    var out: []str = []
+    for part in text.split(if raw.len > 0 { raw } else { fallback }, ',') {
+        let item = text.lower(text.trim(part))
+        if item.len > 0 {
+            push(mut out, item)
+        }
+    }
+    out
+}
+
+fn has(items: []str, want: str) -> bool {
+    for item in items {
+        if item == want {
+            return true
+        }
+    }
+    false
+}
+
+fn signal_env(env: [str: str], signal: str, suffix: str) -> str {
+    let specific = env["OTEL_EXPORTER_OTLP_{signal}_{suffix}"] ?? ""
+    if specific.len > 0 {
+        return specific
+    }
+    env["OTEL_EXPORTER_OTLP_{suffix}"] ?? ""
+}
+
+fn parse_headers(s: str) -> []http.Header {
+    var out: []http.Header = []
+    for a in parse_pairs(s) {
+        push(mut out, http.Header { name: a.key, value: format_value(a.value) })
+    }
+    out
+}
+
+pub fn otlp_options_from_env(env: [str: str], signal: str) -> OtlpOptions {
+    var o = OtlpOptions {}
+    let base = env["OTEL_EXPORTER_OTLP_ENDPOINT"] ?? ""
+    if base.len > 0 {
+        o.endpoint = base
+    }
+    let specific = env["OTEL_EXPORTER_OTLP_{signal}_ENDPOINT"] ?? ""
+    if signal == "TRACES" {
+        o.traces_endpoint = specific
+    } else if signal == "METRICS" {
+        o.metrics_endpoint = specific
+    } else {
+        o.logs_endpoint = specific
+    }
+    o.headers = parse_headers(env["OTEL_EXPORTER_OTLP_HEADERS"] ?? "")
+    for h in parse_headers(env["OTEL_EXPORTER_OTLP_{signal}_HEADERS"] ?? "") {
+        http.set_header(mut o.headers, h.name, h.value)
+    }
+    if text.lower(text.trim(signal_env(env, signal, "PROTOCOL"))) == "http/json" {
+        o.protocol = HttpJson
+    }
+    o.gzip = text.lower(text.trim(signal_env(env, signal, "COMPRESSION"))) == "gzip"
+    let timeout = text.trim(signal_env(env, signal, "TIMEOUT"))
+    if timeout.len > 0 {
+        o.timeout = text.parse_uint(timeout, 10) catch o.timeout
+    }
+    o
+}
+
+fn ratio_arg(env: [str: str]) -> f64 {
+    let raw = text.trim(env["OTEL_TRACES_SAMPLER_ARG"] ?? "")
+    let ratio = text.parse_float(raw) catch 1.0
+    if ratio < 0.0 || ratio > 1.0 { 1.0 } else { ratio }
+}
+
+pub fn sampler_from_env(env: [str: str]) -> Sampler {
+    let name = text.lower(text.trim(env["OTEL_TRACES_SAMPLER"] ?? "parentbased_always_on"))
+    if name == "always_on" {
+        return AlwaysOn
+    }
+    if name == "always_off" {
+        return AlwaysOff
+    }
+    if name == "traceidratio" {
+        return TraceIdRatio(ratio_arg(env))
+    }
+    if name == "parentbased_always_off" {
+        return parent_based(AlwaysOff)
+    }
+    if name == "parentbased_traceidratio" {
+        return parent_based(TraceIdRatio(ratio_arg(env)))
+    }
+    parent_based(AlwaysOn)
+}
+
+fn batch_from_env(env: [str: str], prefix: str, delay: i64) -> BatchOptions {
+    BatchOptions {
+        max_queue: env_int(env, "{prefix}_MAX_QUEUE_SIZE", 2048)
+        max_batch: env_int(env, "{prefix}_MAX_EXPORT_BATCH_SIZE", 512)
+        delay: env_int(env, "{prefix}_SCHEDULE_DELAY", delay)
+        timeout: env_int(env, "{prefix}_EXPORT_TIMEOUT", 30000)
+    }
+}
+
+fn preference_from_env(env: [str: str]) -> Preference {
+    let name = text.lower(text.trim(env["OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"] ?? ""))
+    if name == "delta" {
+        return PreferDelta
+    }
+    if name == "lowmemory" {
+        return LowMemory
+    }
+    PreferCumulative
+}
+
+pub fn config_from_env(env: [str: str]) -> Config {
+    let general = env_int(env, "OTEL_ATTRIBUTE_COUNT_LIMIT", 128)
+    let limits = Limits {
+        attributes: env_int(env, "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", general)
+        events: env_int(env, "OTEL_SPAN_EVENT_COUNT_LIMIT", 128)
+        links: env_int(env, "OTEL_SPAN_LINK_COUNT_LIMIT", 128)
+        attributes_per_event: env_int(env, "OTEL_EVENT_ATTRIBUTE_COUNT_LIMIT", general)
+        attributes_per_link: env_int(env, "OTEL_LINK_ATTRIBUTE_COUNT_LIMIT", general)
+    }
+    let propagation = env_list(env, "OTEL_PROPAGATORS", "tracecontext,baggage")
+    var spans: []SpanProcessor = []
+    for name in env_list(env, "OTEL_TRACES_EXPORTER", "otlp") {
+        let options = batch_from_env(env, "OTEL_BSP", 5000)
+        if name == "otlp" {
+            push(mut spans, batch_span_processor(otlp_span_exporter(otlp_options_from_env(env, "TRACES")), options))
+        } else if name == "console" {
+            push(mut spans, simple_span_processor(console_span_exporter(stderr_writer())))
+        }
+    }
+    var readers: []MetricReader = []
+    for name in env_list(env, "OTEL_METRICS_EXPORTER", "otlp") {
+        let interval = env_int(env, "OTEL_METRIC_EXPORT_INTERVAL", 60000)
+        let timeout = env_int(env, "OTEL_METRIC_EXPORT_TIMEOUT", 30000)
+        if name == "otlp" {
+            push(mut readers, MetricReader { exporter: otlp_metric_exporter(otlp_options_from_env(env, "METRICS")), interval, timeout, preference: preference_from_env(env) })
+        } else if name == "console" {
+            push(mut readers, MetricReader { exporter: console_metric_exporter(stderr_writer()), interval, timeout })
+        }
+    }
+    var logs: []LogProcessor = []
+    for name in env_list(env, "OTEL_LOGS_EXPORTER", "otlp") {
+        if name == "otlp" {
+            push(mut logs, batch_log_processor(otlp_log_exporter(otlp_options_from_env(env, "LOGS")), batch_from_env(env, "OTEL_BLRP", 1000)))
+        } else if name == "console" {
+            push(mut logs, simple_log_processor(console_log_exporter(stderr_writer())))
+        }
+    }
+    Config {
+        resource: default_resource(env)
+        sampler: sampler_from_env(env)
+        limits
+        propagators: Propagators { trace_context: has(propagation, "tracecontext"), baggage: has(propagation, "baggage") }
+        span_processors: spans
+        metric_readers: readers
+        log_processors: logs
+    }
+}
+
+pub fn setup_from_env() -> *Sdk? {
+    let env = environment()
+    if text.lower(text.trim(env["OTEL_SDK_DISABLED"] ?? "")) == "true" {
+        return none
+    }
+    install(config_from_env(env))
+}

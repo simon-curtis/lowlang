@@ -1,0 +1,440 @@
+import std/crypto
+
+pub struct SpanContext {
+    pub trace_hi: u64
+    pub trace_lo: u64
+    pub span_id: u64
+    pub flags: u8
+    pub state: str
+    pub remote: bool
+}
+
+pub enum Kind {
+    Internal
+    Server
+    Client
+    Producer
+    Consumer
+}
+
+pub enum Status {
+    Unset
+    Ok
+    Failed(message: str)
+}
+
+pub struct Event {
+    pub name: str
+    pub time: i64
+    pub attributes: []Attribute
+    pub dropped: i64
+}
+
+pub struct Link {
+    pub context: SpanContext
+    pub attributes: []Attribute = []
+    pub dropped: i64 = 0
+}
+
+pub struct Scope {
+    pub name: str
+    pub version: str = ""
+    pub schema_url: str = ""
+}
+
+pub struct SpanData {
+    pub name: str
+    pub kind: Kind
+    pub context: SpanContext
+    pub parent: SpanContext
+    pub scope: Scope
+    pub resource: *Resource
+    pub start: i64
+    pub end: i64
+    pub attributes: []Attribute
+    pub events: []Event
+    pub links: []Link
+    pub status: Status
+    pub dropped_attributes: i64
+    pub dropped_events: i64
+    pub dropped_links: i64
+    lock: i64
+    ended: bool
+    sdk: *Sdk
+}
+
+pub struct Span {
+    pub context: SpanContext
+    data: *SpanData?
+}
+
+pub struct Tracer {
+    pub scope: Scope
+}
+
+pub struct StartOptions {
+    pub kind: Kind = Internal
+    pub parent: *Context? = none
+    pub attributes: []Attribute = []
+    pub links: []Link = []
+    pub start: i64 = 0
+}
+
+struct Random {
+    lock: i64
+    s0: u64
+    s1: u64
+    s2: u64
+    s3: u64
+}
+
+fn seeded() -> *Random {
+    let seed = crypto.random(32)
+    var words: []u64 = [0, 0, 0, 0]
+    for i in 0..32 {
+        words[i / 8] |= u64(seed[i]) << u64(i % 8 * 8)
+    }
+    if words[0] | words[1] | words[2] | words[3] == 0 {
+        words[0] = 1
+    }
+    new(Random { lock: 0, s0: words[0], s1: words[1], s2: words[2], s3: words[3] })
+}
+
+fn rotl(x: u64, k: u64) -> u64 {
+    x << k | x >> (64 - k)
+}
+
+fn next_random(r: *Random) -> u64 {
+    __lock(mut r.lock)
+    let result = rotl(r.s1 * 5, 7) * 9
+    let t = r.s1 << 17
+    r.s2 ^= r.s0
+    r.s3 ^= r.s1
+    r.s1 ^= r.s2
+    r.s0 ^= r.s3
+    r.s2 ^= t
+    r.s3 = rotl(r.s3, 45)
+    __unlock(mut r.lock)
+    result
+}
+
+fn nonzero_random(r: *Random) -> u64 {
+    for {
+        let v = next_random(r)
+        if v != 0 {
+            return v
+        }
+    }
+}
+
+pub fn invalid_context() -> SpanContext {
+    SpanContext { trace_hi: 0, trace_lo: 0, span_id: 0, flags: 0, state: "", remote: false }
+}
+
+fn invalid_span() -> Span {
+    Span { context: invalid_context(), data: none }
+}
+
+pub fn wrap_context(sc: SpanContext) -> Span {
+    Span { context: sc, data: none }
+}
+
+pub fn valid(sc: SpanContext) -> bool {
+    sc.trace_hi | sc.trace_lo != 0 && sc.span_id != 0
+}
+
+pub fn sampled(sc: SpanContext) -> bool {
+    sc.flags & 1 != 0
+}
+
+fn hex64(v: u64) -> str {
+    let digits = "0123456789abcdef"
+    let out: []u8 = __make(16)
+    for i in 0..16 {
+        out[i] = digits[i64(v >> u64(60 - i * 4) & 0xF)]
+    }
+    __str_view(out)
+}
+
+pub fn trace_id_hex(sc: SpanContext) -> str {
+    "{hex64(sc.trace_hi)}{hex64(sc.trace_lo)}"
+}
+
+pub fn span_id_hex(sc: SpanContext) -> str {
+    hex64(sc.span_id)
+}
+
+fn put_be64(out: []u8, at: i64, v: u64) {
+    for i in 0..8 {
+        out[at + i] = u8(v >> u64(56 - i * 8))
+    }
+}
+
+pub fn trace_id_bytes(sc: SpanContext) -> []u8 {
+    let out: []u8 = __make(16)
+    put_be64(out, 0, sc.trace_hi)
+    put_be64(out, 8, sc.trace_lo)
+    out
+}
+
+pub fn span_id_bytes(sc: SpanContext) -> []u8 {
+    let out: []u8 = __make(8)
+    put_be64(out, 0, sc.span_id)
+    out
+}
+
+pub fn tracer(name: str) -> Tracer {
+    Tracer { scope: Scope { name } }
+}
+
+pub fn start(t: Tracer, name: str) -> Span {
+    start_with(t, name, StartOptions {})
+}
+
+fn parent_of(o: StartOptions) -> Context {
+    match o.parent {
+        some(p) => *p
+        none => {
+            if __has_context() {
+                let c: *Context = __context()
+                return *c
+            }
+            Context { span: invalid_span(), baggage: [], suppressed: false, call: none, sdk: none }
+        }
+    }
+}
+
+pub fn start_with(t: Tracer, name: str, o: StartOptions) -> Span {
+    let parent = parent_of(o)
+    let parent_span = parent.span.context
+    let sdk = match parent.sdk {
+        some(s) => s
+        none => return Span { context: parent_span, data: none }
+    }
+    if parent.suppressed || sdk.span_processors.len == 0 || sdk.stopped {
+        return Span { context: parent_span, data: none }
+    }
+    var context = SpanContext {
+        trace_hi: parent_span.trace_hi
+        trace_lo: parent_span.trace_lo
+        span_id: nonzero_random(sdk.random)
+        flags: 0
+        state: parent_span.state
+        remote: false
+    }
+    if !valid(parent_span) {
+        context.trace_hi = next_random(sdk.random)
+        context.trace_lo = nonzero_random(sdk.random)
+        context.state = ""
+    }
+    if !should_sample(sdk.sampler, parent_span, context.trace_lo) {
+        return Span { context, data: none }
+    }
+    context.flags = 1
+    let limits = sdk.limits
+    let attributes = limited(o.attributes, limits.attributes)
+    var links: []Link = []
+    for l in o.links {
+        if links.len < limits.links {
+            push(mut links, Link { context: l.context, attributes: limited(l.attributes, limits.attributes_per_link), dropped: 0 })
+        }
+    }
+    let data = new(SpanData {
+        name
+        kind: o.kind
+        context
+        parent: if valid(parent_span) { parent_span } else { invalid_context() }
+        scope: t.scope
+        resource: sdk.resource
+        start: if o.start > 0 { o.start } else { now_nanos() }
+        end: 0
+        attributes
+        events: []
+        links
+        status: Unset
+        dropped_attributes: o.attributes.len - attributes.len
+        dropped_events: 0
+        dropped_links: o.links.len - links.len
+        lock: 0
+        ended: false
+        sdk
+    })
+    for p in sdk.span_processors {
+        p.on_start(data)
+    }
+    Span { context, data }
+}
+
+pub fn is_recording(s: Span) -> bool {
+    match s.data {
+        some(d) => !d.ended
+        none => false
+    }
+}
+
+pub fn set_attribute(s: Span, a: Attribute) {
+    let d = match s.data {
+        some(x) => x
+        none => return
+    }
+    __lock(mut d.lock)
+    if !d.ended && !upsert(mut d.attributes, a, d.sdk.limits.attributes) {
+        d.dropped_attributes += 1
+    }
+    __unlock(mut d.lock)
+}
+
+pub fn set_attributes(s: Span, attributes: []Attribute) {
+    for a in attributes {
+        set_attribute(s, a)
+    }
+}
+
+pub fn set_string(s: Span, key: str, value: str) {
+    match s.data {
+        some(_) => set_attribute(s, string(key, value))
+        none => {}
+    }
+}
+
+pub fn set_int(s: Span, key: str, value: i64) {
+    match s.data {
+        some(_) => set_attribute(s, int(key, value))
+        none => {}
+    }
+}
+
+pub fn add_event(s: Span, name: str, attributes: []Attribute) {
+    add_event_at(s, name, attributes, 0)
+}
+
+pub fn add_event_at(s: Span, name: str, attributes: []Attribute, time: i64) {
+    let d = match s.data {
+        some(x) => x
+        none => return
+    }
+    let limit = d.sdk.limits.attributes_per_event
+    let kept = limited(attributes, limit)
+    let e = Event { name, time: if time > 0 { time } else { now_nanos() }, attributes: kept, dropped: attributes.len - kept.len }
+    __lock(mut d.lock)
+    if !d.ended {
+        if d.events.len < d.sdk.limits.events {
+            push(mut d.events, e)
+        } else {
+            d.dropped_events += 1
+        }
+    }
+    __unlock(mut d.lock)
+}
+
+pub fn add_link(s: Span, l: Link) {
+    let d = match s.data {
+        some(x) => x
+        none => return
+    }
+    let kept = Link { context: l.context, attributes: limited(l.attributes, d.sdk.limits.attributes_per_link), dropped: 0 }
+    __lock(mut d.lock)
+    if !d.ended {
+        if d.links.len < d.sdk.limits.links {
+            push(mut d.links, kept)
+        } else {
+            d.dropped_links += 1
+        }
+    }
+    __unlock(mut d.lock)
+}
+
+pub fn set_status(s: Span, status: Status) {
+    let d = match s.data {
+        some(x) => x
+        none => return
+    }
+    __lock(mut d.lock)
+    if !d.ended {
+        match status {
+            Unset => {}
+            Ok => {
+                d.status = Ok
+            }
+            Failed(m) => {
+                match d.status {
+                    Ok => {}
+                    _ => {
+                        d.status = Failed(m)
+                    }
+                }
+            }
+        }
+    }
+    __unlock(mut d.lock)
+}
+
+pub fn update_name(s: Span, name: str) {
+    let d = match s.data {
+        some(x) => x
+        none => return
+    }
+    __lock(mut d.lock)
+    if !d.ended {
+        d.name = name
+    }
+    __unlock(mut d.lock)
+}
+
+pub fn record_exception(s: Span, kind: str, message: str) {
+    match s.data {
+        some(_) => add_event(s, "exception", [string("exception.type", kind), string("exception.message", message)])
+        none => {}
+    }
+}
+
+pub fn end(s: Span) {
+    end_at(s, 0)
+}
+
+pub fn end_at(s: Span, time: i64) {
+    let d = match s.data {
+        some(x) => x
+        none => return
+    }
+    __lock(mut d.lock)
+    if d.ended {
+        __unlock(mut d.lock)
+        return
+    }
+    d.end = if time > 0 { time } else { now_nanos() }
+    d.ended = true
+    __unlock(mut d.lock)
+    for p in d.sdk.span_processors {
+        p.on_end(d)
+    }
+}
+
+
+fn enter(s: Span) -> *Context? {
+    match s.data {
+        some(_) => attach(with_span(current(), s))
+        none => none
+    }
+}
+
+fn leave(s: Span, outer: *Context?) {
+    match outer {
+        some(p) => {
+            detach(p)
+            end(s)
+        }
+        none => {}
+    }
+}
+
+pub fn span[R](name: str, body: fn(Span) -> R) -> R {
+    in_span(tracer("std/otel"), name, body)
+}
+
+pub fn in_span[T](t: Tracer, name: str, body: fn(Span) -> T) -> T {
+    let s = start(t, name)
+    let outer = enter(s)
+    defer leave(s, outer)
+    body(s)
+}

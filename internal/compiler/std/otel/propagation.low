@@ -1,0 +1,326 @@
+import std/http
+import std/text
+
+fn hex_value(c: u8) -> i64 {
+    if c >= '0' && c <= '9' {
+        return i64(c - '0')
+    }
+    if c >= 'a' && c <= 'f' {
+        return i64(c - 'a') + 10
+    }
+    -1
+}
+
+fn parse_hex(s: str) -> u64? {
+    var v: u64 = 0
+    for i in 0..s.len {
+        let d = hex_value(s[i])
+        if d < 0 {
+            return none
+        }
+        v = v << 4 | u64(d)
+    }
+    v
+}
+
+pub fn parse_traceparent(value: str) -> SpanContext? {
+    let s = text.trim(value)
+    if s.len < 55 || s[2] != '-' || s[35] != '-' || s[52] != '-' {
+        return none
+    }
+    let version = match parse_hex(s[..2]) {
+        some(x) => x
+        none => return none
+    }
+    if version == 0xff || version == 0 && s.len != 55 || version > 0 && s.len > 55 && s[55] != '-' {
+        return none
+    }
+    let hi = match parse_hex(s[3..19]) {
+        some(x) => x
+        none => return none
+    }
+    let lo = match parse_hex(s[19..35]) {
+        some(x) => x
+        none => return none
+    }
+    let span = match parse_hex(s[36..52]) {
+        some(x) => x
+        none => return none
+    }
+    let flags = match parse_hex(s[53..55]) {
+        some(x) => x
+        none => return none
+    }
+    if hi | lo == 0 || span == 0 {
+        return none
+    }
+    SpanContext { trace_hi: hi, trace_lo: lo, span_id: span, flags: u8(flags) & 1, state: "", remote: true }
+}
+
+pub fn format_traceparent(sc: SpanContext) -> str {
+    let flags = if sampled(sc) { "01" } else { "00" }
+    "00-{trace_id_hex(sc)}-{span_id_hex(sc)}-{flags}"
+}
+
+fn key_byte(c: u8) -> bool {
+    c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-' || c == '*' || c == '/'
+}
+
+fn valid_state_key(k: str) -> bool {
+    if k.len == 0 || k.len > 256 {
+        return false
+    }
+    let at = text.index_byte(k, '@')
+    if at < 0 {
+        if !(k[0] >= 'a' && k[0] <= 'z') {
+            return false
+        }
+        for i in 0..k.len {
+            if !key_byte(k[i]) {
+                return false
+            }
+        }
+        return true
+    }
+    let tenant = k[..at]
+    let system = k[at + 1..]
+    if tenant.len == 0 || tenant.len > 241 || system.len == 0 || system.len > 14 {
+        return false
+    }
+    if !(tenant[0] >= 'a' && tenant[0] <= 'z' || tenant[0] >= '0' && tenant[0] <= '9') || !(system[0] >= 'a' && system[0] <= 'z') {
+        return false
+    }
+    for i in 0..tenant.len {
+        if !key_byte(tenant[i]) {
+            return false
+        }
+    }
+    for i in 0..system.len {
+        if !key_byte(system[i]) {
+            return false
+        }
+    }
+    true
+}
+
+fn valid_state_value(v: str) -> bool {
+    if v.len == 0 || v.len > 256 || v[v.len - 1] == ' ' {
+        return false
+    }
+    for i in 0..v.len {
+        let c = v[i]
+        if c < 0x20 || c > 0x7e || c == ',' || c == '=' {
+            return false
+        }
+    }
+    true
+}
+
+pub fn normalize_tracestate(value: str) -> str? {
+    var members: []str = []
+    var keys: [str: bool] = [:]
+    for part in text.split(value, ',') {
+        let member = text.trim(part)
+        if member.len == 0 {
+            continue
+        }
+        let eq = text.index_byte(member, '=')
+        if eq <= 0 {
+            return none
+        }
+        let key = member[..eq]
+        if !valid_state_key(key) || !valid_state_value(member[eq + 1..]) || keys[key] ?? false {
+            return none
+        }
+        keys[key] = true
+        push(mut members, member)
+    }
+    if members.len > 32 {
+        return none
+    }
+    text.join(members, ",")
+}
+
+fn token_byte(c: u8) -> bool {
+    if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+        return true
+    }
+    text.index_byte("!#$%&'*+-.^_`|~", c) >= 0
+}
+
+fn valid_token(s: str) -> bool {
+    if s.len == 0 {
+        return false
+    }
+    for i in 0..s.len {
+        if !token_byte(s[i]) {
+            return false
+        }
+    }
+    true
+}
+
+fn baggage_decode(s: str) -> str? {
+    var out: []u8 = []
+    var i = 0
+    for i < s.len {
+        let c = s[i]
+        if c == '%' {
+            if i + 2 >= s.len {
+                return none
+            }
+            let hi = hex_digit(s[i + 1])
+            let lo = hex_digit(s[i + 2])
+            if hi < 0 || lo < 0 {
+                return none
+            }
+            push(mut out, u8(hi << 4 | lo))
+            i += 3
+            continue
+        }
+        if c < 0x21 || c > 0x7e || c == '"' || c == ',' || c == ';' || c == '\\' {
+            return none
+        }
+        push(mut out, c)
+        i += 1
+    }
+    __str_view(out)
+}
+
+fn baggage_encode(s: str) -> str {
+    let digits = "0123456789ABCDEF"
+    var out: []u8 = []
+    for i in 0..s.len {
+        let c = s[i]
+        if c > 0x20 && c < 0x7f && c != '"' && c != ',' && c != ';' && c != '\\' && c != '%' {
+            push(mut out, c)
+        } else {
+            push(mut out, '%')
+            push(mut out, digits[c >> 4])
+            push(mut out, digits[c & 0xF])
+        }
+    }
+    __str_view(out)
+}
+
+pub fn parse_baggage(value: str) -> []Entry {
+    var out: []Entry = []
+    if value.len > 8192 {
+        return out
+    }
+    for part in text.split(value, ',') {
+        let semi = text.index_byte(part, ';')
+        let pair = if semi >= 0 { part[..semi] } else { part }
+        let metadata = if semi >= 0 { text.trim(part[semi + 1..]) } else { "" }
+        let eq = text.index_byte(pair, '=')
+        if eq <= 0 {
+            continue
+        }
+        let key = text.trim(pair[..eq])
+        if !valid_token(key) {
+            continue
+        }
+        let decoded = match baggage_decode(text.trim(pair[eq + 1..])) {
+            some(x) => x
+            none => continue
+        }
+        var found = false
+        for i, e in out {
+            if e.key == key {
+                out[i] = Entry { key, value: decoded, metadata }
+                found = true
+            }
+        }
+        if !found && out.len < 180 {
+            push(mut out, Entry { key, value: decoded, metadata })
+        }
+    }
+    out
+}
+
+pub fn format_baggage(entries: []Entry) -> str {
+    var parts: []str = []
+    var size = 0
+    for e in entries {
+        if !valid_token(e.key) {
+            continue
+        }
+        let member = if e.metadata.len > 0 { "{e.key}={baggage_encode(e.value)};{e.metadata}" } else { "{e.key}={baggage_encode(e.value)}" }
+        if parts.len >= 180 || size + member.len + 1 > 8192 {
+            break
+        }
+        size += member.len + 1
+        push(mut parts, member)
+    }
+    text.join(parts, ",")
+}
+
+fn propagators_of(c: *Context) -> Propagators {
+    match c.sdk {
+        some(s) => s.propagators
+        none => Propagators {}
+    }
+}
+
+pub fn inject(c: *Context, mut headers: []http.Header) {
+    let p = propagators_of(c)
+    let sc = c.span.context
+    if p.trace_context && valid(sc) {
+        http.set_header(mut headers, "traceparent", format_traceparent(sc))
+        if sc.state.len > 0 {
+            http.set_header(mut headers, "tracestate", sc.state)
+        }
+    }
+    if p.baggage && c.baggage.len > 0 {
+        let value = format_baggage(c.baggage)
+        if value.len > 0 {
+            http.set_header(mut headers, "baggage", value)
+        }
+    }
+}
+
+fn joined_header(headers: []http.Header, name: str) -> str {
+    var parts: []str = []
+    for h in headers {
+        if text.equal_fold(h.name, name) {
+            push(mut parts, h.value)
+        }
+    }
+    text.join(parts, ",")
+}
+
+pub fn extract_into(c: *Context, headers: []http.Header) -> *Context {
+    let p = propagators_of(c)
+    var next = *c
+    var changed = false
+    if p.trace_context {
+        match parse_traceparent(http.header(headers, "traceparent") ?? "") {
+            some(sc) => {
+                var remote = sc
+                remote.state = normalize_tracestate(joined_header(headers, "tracestate")) ?? ""
+                next.span = Span { context: remote, data: none }
+                next.call = none
+                changed = true
+            }
+            none => {}
+        }
+    }
+    if p.baggage {
+        let value = joined_header(headers, "baggage")
+        if value.len > 0 {
+            let entries = parse_baggage(value)
+            if entries.len > 0 {
+                next.baggage = entries
+                changed = true
+            }
+        }
+    }
+    if !changed {
+        return c
+    }
+    new(next)
+}
+
+pub fn extract(headers: []http.Header) -> *Context {
+    extract_into(current(), headers)
+}

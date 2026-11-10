@@ -1,0 +1,294 @@
+import std/otel
+
+struct Store {
+    spans: []*otel.SpanData
+    lock: chan[bool]
+}
+
+fn new_store() -> *Store {
+    new(Store { spans: [], lock: chan[bool](1) })
+}
+
+fn memory(s: *Store) -> otel.SpanExporter {
+    otel.SpanExporter {
+        export: fn(spans) -> bool {
+            s.lock <- true
+            for d in spans {
+                push(mut s.spans, d)
+            }
+            <-s.lock
+            true
+        }
+        shutdown: fn() {}
+    }
+}
+
+fn install(s: *Store, sampler: otel.Sampler) -> *otel.Sdk {
+    otel.install(otel.Config {
+        resource: new(otel.Resource { attributes: [otel.string("service.name", "fixture")] })
+        sampler
+        span_processors: [otel.simple_span_processor(memory(s))]
+    })
+}
+
+fn find(s: *Store, name: str) -> *otel.SpanData? {
+    for d in s.spans {
+        if d.name == name {
+            return d
+        }
+    }
+    none
+}
+
+fn parent_name(s: *Store, d: *otel.SpanData) -> str {
+    if !otel.valid(d.parent) {
+        return "root"
+    }
+    for p in s.spans {
+        if p.context.span_id == d.parent.span_id && p.context.trace_lo == d.context.trace_lo {
+            return p.name
+        }
+    }
+    "remote"
+}
+
+fn kind_name(k: otel.Kind) -> str {
+    match k {
+        Internal => "internal"
+        Server => "server"
+        Client => "client"
+        Producer => "producer"
+        Consumer => "consumer"
+    }
+}
+
+fn status_name(st: otel.Status) -> str {
+    match st {
+        Unset => "unset"
+        Ok => "ok"
+        Failed(m) => "error {m}"
+    }
+}
+
+fn without_provider() {
+    print("enabled {otel.enabled()}")
+    let n = otel.span("noop", fn(sp: otel.Span) -> i64 {
+        sp.set_string("ignored", "x")
+        print("noop recording {sp.is_recording()} valid {otel.valid(sp.context)}")
+        41 + 1
+    })
+    print("noop result {n}")
+}
+
+fn nested_work(depth: i64) -> i64 {
+    otel.span("level {depth}", fn(sp: otel.Span) -> i64 {
+        if depth == 0 {
+            return 0
+        }
+        nested_work(depth - 1) + 1
+    })
+}
+
+fn parenting() {
+    let s = new_store()
+    let sdk = install(s, AlwaysOn)
+    print("enabled {otel.enabled()}")
+    otel.span("request", fn(sp: otel.Span) -> bool {
+        nested_work(2)
+        let done = chan[bool](1)
+        spawn spawned(done)
+        <-done
+        true
+    })
+    let root = match find(s, "request") {
+        some(x) => x
+        none => return
+    }
+    for d in s.spans {
+        print("{d.name} parent={parent_name(s, d)} same_trace={d.context.trace_hi == root.context.trace_hi && d.context.trace_lo == root.context.trace_lo} sampled={otel.sampled(d.context)} ended={d.end >= d.start}")
+    }
+    print("current after {otel.valid(otel.current_span().context)}")
+    otel.shutdown(sdk)
+}
+
+fn spawned(done: chan[bool]) {
+    otel.span("spawned", fn(sp: otel.Span) -> bool {
+        otel.span("spawned child", fn(inner: otel.Span) -> bool { true })
+    })
+    done <- true
+}
+
+fn full_span() {
+    let s = new_store()
+    install(s, AlwaysOn)
+    let t = otel.tracer("fixture/tracer")
+    let other = otel.SpanContext { trace_hi: 1, trace_lo: 2, span_id: 3, flags: 1, state: "k=v", remote: true }
+    let sp = t.start_with("full", otel.StartOptions {
+        kind: Client
+        attributes: [otel.string("s", "text"), otel.int("i", -7), otel.boolean("b", true), otel.double("d", 2.5)]
+        links: [otel.Link { context: other, attributes: [otel.string("why", "batch")] }]
+    })
+    sp.set_attribute(otel.blob("bytes", [0, 255]))
+    sp.set_attribute(otel.strings("list", ["a", "b"]))
+    sp.set_attribute(otel.ints("nums", [1, 2]))
+    sp.set_attribute(otel.attr("map", Map([otel.string("inner", "x")])))
+    sp.set_attribute(otel.int("i", 8))
+    sp.add_event("cache miss", [otel.string("key", "user:1")])
+    sp.record_exception("io.Error", "Refused")
+    sp.set_status(Failed("boom"))
+    sp.update_name("full renamed")
+    sp.end()
+    sp.set_attribute(otel.string("late", "ignored"))
+    sp.end()
+    let d = match find(s, "full renamed") {
+        some(x) => x
+        none => return
+    }
+    print("{d.name} kind={kind_name(d.kind)} scope={d.scope.name} status={status_name(d.status)} recording={sp.is_recording()}")
+    print("attributes {otel.format_attributes(d.attributes)}")
+    for e in d.events {
+        print("event {e.name} {otel.format_attributes(e.attributes)}")
+    }
+    for l in d.links {
+        print("link {otel.trace_id_hex(l.context)} {otel.span_id_hex(l.context)} {l.context.state} {otel.format_attributes(l.attributes)}")
+    }
+    print("resource {otel.format_attributes(d.resource.attributes)}")
+    print("exports {s.spans.len}")
+    let ok = t.start("ok")
+    ok.set_status(Ok)
+    ok.set_status(Failed("later"))
+    ok.end()
+    match find(s, "ok") {
+        some(d) => print("ok status {status_name(d.status)}")
+        none => {}
+    }
+}
+
+fn limits() {
+    let s = new_store()
+    otel.install(otel.Config {
+        limits: otel.Limits { attributes: 2, events: 1 }
+        span_processors: [otel.simple_span_processor(memory(s))]
+    })
+    let sp = otel.tracer("limits").start("limited")
+    sp.set_attribute(otel.int("a", 1))
+    sp.set_attribute(otel.int("b", 2))
+    sp.set_attribute(otel.int("c", 3))
+    sp.set_attribute(otel.int("a", 4))
+    sp.add_event("one", [])
+    sp.add_event("two", [])
+    sp.end()
+    let d = match find(s, "limited") {
+        some(x) => x
+        none => return
+    }
+    print("limited {otel.format_attributes(d.attributes)} dropped={d.dropped_attributes} events={d.events.len} dropped_events={d.dropped_events}")
+}
+
+fn sampling() {
+    let s = new_store()
+    install(s, AlwaysOff)
+    let off = otel.tracer("t").start("off")
+    print("always off recording {off.is_recording()} sampled {otel.sampled(off.context)} valid {otel.valid(off.context)}")
+    off.end()
+    print("always off exported {s.spans.len}")
+    let none_parent = otel.invalid_context()
+    let sampled_remote = otel.SpanContext { trace_hi: 1, trace_lo: 1, span_id: 1, flags: 1, state: "", remote: true }
+    let unsampled_remote = otel.SpanContext { trace_hi: 1, trace_lo: 1, span_id: 1, flags: 0, state: "", remote: true }
+    let sampled_local = otel.SpanContext { trace_hi: 1, trace_lo: 1, span_id: 1, flags: 1, state: "", remote: false }
+    let unsampled_local = otel.SpanContext { trace_hi: 1, trace_lo: 1, span_id: 1, flags: 0, state: "", remote: false }
+    let half = otel.Sampler.TraceIdRatio(0.5)
+    let low: u64 = 0x7FFFFFFFFFFFFFFE
+    let high: u64 = 0x8000000000000000
+    print("ratio 0.5 low {otel.should_sample(half, none_parent, low)} high {otel.should_sample(half, none_parent, high)}")
+    print("ratio 0 {otel.should_sample(otel.Sampler.TraceIdRatio(0.0), none_parent, 0)} ratio 1 {otel.should_sample(otel.Sampler.TraceIdRatio(1.0), none_parent, 0xFFFFFFFFFFFFFFFF)}")
+    let tenth = otel.Sampler.TraceIdRatio(0.1)
+    var kept = 0
+    var x: u64 = 0x9E3779B97F4A7C15
+    for _ in 0..10000 {
+        x ^= x << 13
+        x ^= x >> 7
+        x ^= x << 17
+        if otel.should_sample(tenth, none_parent, x) {
+            kept += 1
+        }
+    }
+    print("ratio 0.1 kept about a tenth {kept > 900 && kept < 1100}")
+    let pb = otel.parent_based(AlwaysOff)
+    print("parent based root {otel.should_sample(pb, none_parent, 0)}")
+    print("parent based remote sampled {otel.should_sample(pb, sampled_remote, 0)} unsampled {otel.should_sample(pb, unsampled_remote, 0)}")
+    print("parent based local sampled {otel.should_sample(pb, sampled_local, 0)} unsampled {otel.should_sample(pb, unsampled_local, 0)}")
+    let custom = otel.Sampler.ParentBased(new(otel.ParentSamplers { root: AlwaysOn, remote_not_sampled: AlwaysOn, local_sampled: AlwaysOff }))
+    print("custom remote unsampled {otel.should_sample(custom, unsampled_remote, 0)} local sampled {otel.should_sample(custom, sampled_local, 0)}")
+    print(otel.description(otel.parent_based(otel.Sampler.TraceIdRatio(0.25))))
+    install(s, otel.parent_based(AlwaysOff))
+    let remote = otel.current().with_span(otel.wrap_context(sampled_remote))
+    let child = otel.tracer("t").start_with("child of sampled remote", otel.StartOptions { parent: remote })
+    print("child of sampled remote recording {child.is_recording()} trace kept {child.context.trace_lo == 1}")
+    child.end()
+}
+
+fn batching() {
+    let s = new_store()
+    let exports = chan[i64](64)
+    let exporter = otel.SpanExporter {
+        export: fn(spans) -> bool {
+            exports <- spans.len
+            true
+        }
+        shutdown: fn() { print("exporter shut down") }
+    }
+    let p = otel.batch_span_processor(exporter, otel.BatchOptions { max_queue: 4, max_batch: 2, delay: 60000, timeout: 1000 })
+    let sdk = otel.install(otel.Config { span_processors: [p] })
+    let t = otel.tracer("batch")
+    for i in 0..3 {
+        t.start("s{i}").end()
+    }
+    print("size export {(<-exports) ?? -1}")
+    print("flush {sdk.force_flush()} {(<-exports) ?? -1}")
+    let gate = chan[bool]()
+    let delivered = chan[i64](64)
+    let blocking = otel.SpanExporter {
+        export: fn(spans) -> bool {
+            <-gate
+            delivered <- spans.len
+            true
+        }
+        shutdown: fn() {}
+    }
+    let q = otel.batch_span_processor(blocking, otel.BatchOptions { max_queue: 2, max_batch: 1, delay: 60000, timeout: 1000 })
+    let sdk2 = otel.install(otel.Config { span_processors: [q] })
+    for i in 0..10 {
+        t.start("q{i}").end()
+    }
+    let dropped = otel.dropped_spans(sdk2)
+    print("dropped while exporter blocked {dropped == 7 || dropped == 8}")
+    var total = 0
+    for total + dropped < 10 {
+        gate <- true
+        total += (<-delivered) ?? 0
+    }
+    print("queued spans delivered {total + dropped == 10}")
+    let timed = otel.batch_span_processor(exporter, otel.BatchOptions { delay: 20, timeout: 1000 })
+    let sdk3 = otel.install(otel.Config { span_processors: [timed] })
+    t.start("timed").end()
+    let waited = select {
+        n = <-exports => n ?? -1
+        after(2000) => -2
+    }
+    print("timed export {waited}")
+    print("shutdown {sdk3.shutdown()} again {sdk3.shutdown()}")
+    t.start("after shutdown").end()
+    print("recording after shutdown {t.start("x").is_recording()}")
+    sdk.shutdown()
+    sdk2.shutdown()
+}
+
+fn main() {
+    without_provider()
+    parenting()
+    full_span()
+    limits()
+    sampling()
+    batching()
+}

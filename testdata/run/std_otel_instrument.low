@@ -1,0 +1,146 @@
+import std/http
+import std/orm
+import std/otel
+import std/sql
+import std/web
+
+struct User {
+    id: i64
+    name: str
+}
+
+struct Store {
+    spans: []*otel.SpanData
+}
+
+fn fake_db(fail_next: *bool) -> sql.Connection {
+    let rows = sql.Rows {
+        columns: [sql.Column { name: "id", kind: "int8" }, sql.Column { name: "name", kind: "text" }]
+        rows: [[sql.Value.Int(1), sql.Value.Text("ada")]]
+    }
+    let raw = sql.Connection {
+        dialect: Postgres
+        query: fn(text, values) -> sql.Rows ! sql.Error {
+            if *fail_next {
+                *fail_next = false
+                fail Server("23505", "duplicate key")
+            }
+            rows
+        }
+        each: fn(text, values, visit) ! sql.Error {
+            visit(rows.columns, rows.rows[0])
+        }
+        execute: fn(text, values) -> i64 ! sql.Error { 1 }
+        begin: fn() ! sql.Error {}
+        commit: fn() ! sql.Error {}
+        rollback: fn() ! sql.Error {}
+        close: fn() {}
+    }
+    otel.instrument_sql(raw, "std/sql/postgres", "shop", "db.internal", 5432)
+}
+
+fn app(db: sql.Connection) -> *web.App {
+    let a = web.app()
+    let users = orm.table[User]("users")
+    a.get("/users/:id", fn(c: *web.Context) -> http.Response {
+        let found = orm.list(db, orm.from(users)) catch {
+            _ => return web.text(500, "db")
+        }
+        web.text(200, found[0].name)
+    })
+    a.post("/users", fn(c: *web.Context) -> http.Response {
+        orm.insert(db, users, User { id: 0, name: "dup" }) catch {
+            _ => return web.text(503, "conflict")
+        }
+        web.text(201, "")
+    })
+    a.get("/raw", fn(c: *web.Context) -> http.Response {
+        db.execute("  update users set name = $1", [sql.Value.Text("x")]) catch {
+            _ => return web.text(500, "")
+        }
+        web.text(200, "")
+    })
+    a
+}
+
+fn request(method: str, target: str, headers: []http.Header) -> http.Request {
+    var r = http.new_request(method, target)
+    r.headers = headers
+    r.authority = "shop.example:8443"
+    r
+}
+
+fn kind_name(k: otel.Kind) -> str {
+    match k {
+        Internal => "internal"
+        Server => "server"
+        Client => "client"
+        Producer => "producer"
+        Consumer => "consumer"
+    }
+}
+
+fn status_name(st: otel.Status) -> str {
+    match st {
+        Unset => "unset"
+        Ok => "ok"
+        Failed(m) => "error({m})"
+    }
+}
+
+fn parent_name(s: *Store, d: *otel.SpanData) -> str {
+    if !otel.valid(d.parent) {
+        return "root"
+    }
+    if d.parent.span_id == 0x00f067aa0ba902b7 {
+        return "remote caller"
+    }
+    for p in s.spans {
+        if p.context.span_id == d.parent.span_id {
+            return p.name
+        }
+    }
+    "unknown"
+}
+
+fn main() {
+    let fail_next = new(false)
+    let db = fake_db(fail_next)
+    let handler = web.handler(app(db))
+    let s = new(Store { spans: [] })
+    let sdk = otel.install(otel.Config {
+        span_processors: [otel.simple_span_processor(otel.SpanExporter {
+            export: fn(spans) -> bool {
+                for d in spans {
+                    push(mut s.spans, d)
+                }
+                true
+            }
+            shutdown: fn() {}
+        })]
+        metric_readers: [otel.MetricReader { exporter: otel.MetricExporter { export: fn(b) -> bool { true }, shutdown: fn() {} }, interval: 0 }]
+    })
+    let traced = [http.Header { name: "traceparent", value: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" }, http.Header { name: "user-agent", value: "fixture" }]
+    print("GET /users/7 {handler(request("GET", "/users/7?expand=1", traced)).status}")
+    *fail_next = true
+    print("POST /users {handler(request("POST", "/users", [])).status}")
+    print("GET /raw {handler(request("GET", "/raw", [])).status}")
+    print("GET /missing {handler(request("GET", "/missing", [])).status}")
+    print("PURGE /users/1 {handler(request("PURGE", "/users/1", [])).status}")
+    for d in s.spans {
+        print("{kind_name(d.kind)} \"{d.name}\" scope={d.scope.name} parent={parent_name(s, d)} status={status_name(d.status)}")
+        print("  {otel.format_attributes(d.attributes)}")
+    }
+    let roots = s.spans.len
+    print("spans {roots}")
+    let batch = otel.collect(sdk, 0)
+    for m in batch.metrics {
+        print("metric {m.scope.name} {m.name} unit={m.unit}")
+        for p in m.points {
+            print("  count={p.count} {otel.format_attributes(p.attributes)}")
+        }
+    }
+    sdk.shutdown()
+    let outside = orm.list(db, orm.from(orm.table[User]("users"))) catch []
+    print("after shutdown rows {outside.len} spans {s.spans.len}")
+}

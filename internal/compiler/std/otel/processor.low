@@ -1,0 +1,219 @@
+pub struct BatchOptions {
+    pub max_queue: i64 = 2048
+    pub max_batch: i64 = 512
+    pub delay: i64 = 5000
+    pub timeout: i64 = 30000
+}
+
+pub struct SpanExporter {
+    pub export: fn([]*SpanData) -> bool
+    pub shutdown: fn()
+}
+
+pub struct SpanProcessor {
+    pub on_start: fn(*SpanData)
+    pub on_end: fn(*SpanData)
+    pub force_flush: fn() -> bool
+    pub shutdown: fn() -> bool
+    pub dropped: fn() -> i64
+}
+
+struct Command {
+    reply: chan[bool]
+    stop: bool
+}
+
+enum Item {
+    SpanItem(data: *SpanData)
+    LogItem(data: *LogData)
+}
+
+struct Batcher {
+    queue: chan[Item]
+    control: chan[Command]
+    options: BatchOptions
+    export: fn([]Item) -> bool
+    finish: fn()
+    lock: i64
+    dropped: i64
+    stopped: bool
+}
+
+fn batcher(options: BatchOptions, export: fn([]Item) -> bool, finish: fn()) -> *Batcher {
+    let b = new(Batcher {
+        queue: chan[Item](options.max_queue)
+        control: chan[Command](1)
+        options
+        export
+        finish
+        lock: 0
+        dropped: 0
+        stopped: false
+    })
+    spawn work(b)
+    b
+}
+
+fn offer(b: *Batcher, v: Item) {
+    if b.stopped {
+        return
+    }
+    let sent = select {
+        b.queue <- v => true
+        else => false
+    }
+    if !sent {
+        __lock(mut b.lock)
+        b.dropped += 1
+        __unlock(mut b.lock)
+    }
+}
+
+fn dropped_count(b: *Batcher) -> i64 {
+    __lock(mut b.lock)
+    let n = b.dropped
+    __unlock(mut b.lock)
+    n
+}
+
+fn ship(b: *Batcher, batch: []Item) -> bool {
+    var ok = true
+    var at = 0
+    for at < batch.len {
+        let end = if at + b.options.max_batch < batch.len { at + b.options.max_batch } else { batch.len }
+        ok = b.export(batch[at..end]) && ok
+        at = end
+    }
+    ok
+}
+
+fn drain(b: *Batcher, mut batch: []Item) {
+    for {
+        let more = select {
+            v = <-b.queue => {
+                match v {
+                    some(x) => {
+                        push(mut batch, x)
+                        true
+                    }
+                    none => false
+                }
+            }
+            else => false
+        }
+        if !more {
+            return
+        }
+    }
+}
+
+fn work(b: *Batcher) {
+    var batch: []Item = []
+    var deadline = monotonic_millis() + b.options.delay
+    for {
+        var wait = deadline - monotonic_millis()
+        if wait < 0 {
+            wait = 0
+        }
+        let command: Command? = select {
+            v = <-b.queue => {
+                match v {
+                    some(x) => push(mut batch, x)
+                    none => {}
+                }
+                if batch.len >= b.options.max_batch {
+                    ship(b, batch)
+                    batch = []
+                    deadline = monotonic_millis() + b.options.delay
+                }
+                none
+            }
+            c = <-b.control => c
+            after(wait) => {
+                if batch.len > 0 {
+                    ship(b, batch)
+                    batch = []
+                }
+                deadline = monotonic_millis() + b.options.delay
+                none
+            }
+        }
+        match command {
+            some(c) => {
+                drain(b, mut batch)
+                let ok = ship(b, batch)
+                batch = []
+                deadline = monotonic_millis() + b.options.delay
+                if c.stop {
+                    b.finish()
+                    c.reply <- ok
+                    return
+                }
+                c.reply <- ok
+            }
+            none => {}
+        }
+    }
+}
+
+fn request(b: *Batcher, stop: bool) -> bool {
+    if b.stopped {
+        return false
+    }
+    if stop {
+        b.stopped = true
+    }
+    let reply = chan[bool](1)
+    let sent = select {
+        b.control <- Command { reply, stop } => true
+        after(b.options.timeout) => false
+    }
+    if !sent {
+        return false
+    }
+    select {
+        r = <-reply => r ?? false
+        after(b.options.timeout) => false
+    }
+}
+
+pub fn batch_span_processor(exporter: SpanExporter, options: BatchOptions) -> SpanProcessor {
+    let b = batcher(options, fn(items: []Item) -> bool {
+        var spans: []*SpanData = []
+        for item in items {
+            match item {
+                SpanItem(d) => push(mut spans, d)
+                _ => {}
+            }
+        }
+        exporter.export(spans)
+    }, exporter.shutdown)
+    SpanProcessor {
+        on_start: fn(d) {}
+        on_end: fn(d) {
+            if sampled(d.context) {
+                offer(b, SpanItem(d))
+            }
+        }
+        force_flush: fn() -> bool { request(b, false) }
+        shutdown: fn() -> bool { request(b, true) }
+        dropped: fn() -> i64 { dropped_count(b) }
+    }
+}
+
+pub fn simple_span_processor(exporter: SpanExporter) -> SpanProcessor {
+    SpanProcessor {
+        on_start: fn(d) {}
+        on_end: fn(d) {
+            if sampled(d.context) {
+                exporter.export([d])
+            }
+        }
+        force_flush: fn() -> bool { true }
+        shutdown: fn() -> bool {
+            exporter.shutdown()
+            true
+        }
+        dropped: fn() -> i64 { 0 }
+    }
+}

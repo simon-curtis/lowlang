@@ -1,0 +1,672 @@
+import std/base64
+import std/compress/deflate
+import std/http
+import std/io
+import std/json
+import std/net
+import std/otel
+import std/protobuf
+import std/text
+
+struct Received {
+    path: str
+    content_type: str
+    encoding: str
+    body: []u8
+}
+
+struct Collector {
+    received: chan[Received]
+    statuses: chan[i64]
+    port: i64
+}
+
+fn collector() -> *Collector ! io.Error {
+    let l = net.listen("127.0.0.1", 0)?
+    let c = new(Collector { received: chan[Received](64), statuses: chan[i64](16), port: l.addr.port })
+    spawn serve(l, c)
+    c
+}
+
+fn serve(l: net.Listener, c: *Collector) {
+    http.serve(l, fn(req: http.Request) -> http.Response {
+        let status = select {
+            s = <-c.statuses => s ?? 200
+            else => 200
+        }
+        c.received <- Received {
+            path: req.path
+            content_type: http.header(req.headers, "content-type") ?? ""
+            encoding: http.header(req.headers, "content-encoding") ?? ""
+            body: req.body
+        }
+        var resp = http.response(status, "")
+        if status == 503 {
+            http.set_header(mut resp.headers, "retry-after", "0")
+        }
+        resp
+    }) catch {
+        _ => {}
+    }
+}
+
+fn receive(c: *Collector) -> Received {
+    select {
+        r = <-c.received => r ?? Received { path: "closed", content_type: "", encoding: "", body: [] }
+        after(5000) => Received { path: "timeout", content_type: "", encoding: "", body: [] }
+    }
+}
+
+fn all(data: []u8) -> []protobuf.Field {
+    var out: []protobuf.Field = []
+    let d = protobuf.decoder(data)
+    for {
+        let f = d.next() catch {
+            _ => return out
+        }
+        match f {
+            some(x) => push(mut out, x)
+            none => return out
+        }
+    }
+}
+
+fn each(data: []u8, number: i64) -> []protobuf.Field {
+    var out: []protobuf.Field = []
+    for f in all(data) {
+        if f.number == number {
+            push(mut out, f)
+        }
+    }
+    out
+}
+
+fn one(data: []u8, number: i64) -> protobuf.Field? {
+    let found = each(data, number)
+    if found.len == 0 {
+        return none
+    }
+    found[found.len - 1]
+}
+
+fn pb_text(data: []u8, number: i64) -> str {
+    match one(data, number) {
+        some(f) => str(f.data)
+        none => ""
+    }
+}
+
+fn pb_int(data: []u8, number: i64) -> i64 {
+    match one(data, number) {
+        some(f) => i64(f.value)
+        none => 0
+    }
+}
+
+fn pb_hex(data: []u8, number: i64) -> str {
+    match one(data, number) {
+        some(f) => text.encode_hex(f.data)
+        none => ""
+    }
+}
+
+fn pb_double(f: protobuf.Field) -> f64 {
+    f.as_double() catch 0.0
+}
+
+fn pb_any(data: []u8) -> str {
+    for f in all(data) {
+        if f.number == 1 {
+            return "s:{str(f.data)}"
+        }
+        if f.number == 2 {
+            return "b:{f.value != 0}"
+        }
+        if f.number == 3 {
+            return "i:{i64(f.value)}"
+        }
+        if f.number == 4 {
+            return "d:{pb_double(f)}"
+        }
+        if f.number == 5 {
+            var parts: []str = []
+            for v in each(f.data, 1) {
+                push(mut parts, pb_any(v.data))
+            }
+            return "a:[{text.join(parts, ",")}]"
+        }
+        if f.number == 6 {
+            return "m:{{{pb_attributes(f.data, 1)}}}"
+        }
+        if f.number == 7 {
+            return "x:{text.encode_hex(f.data)}"
+        }
+    }
+    "empty"
+}
+
+fn pb_attributes(data: []u8, number: i64) -> str {
+    var parts: []str = []
+    for kv in each(data, number) {
+        let value = match one(kv.data, 2) {
+            some(v) => pb_any(v.data)
+            none => "missing"
+        }
+        push(mut parts, "{pb_text(kv.data, 1)}={value}")
+    }
+    text.join(parts, " ")
+}
+
+fn pb_scope(data: []u8) -> str {
+    match one(data, 1) {
+        some(s) => "scope {pb_text(s.data, 1)} {pb_text(s.data, 2)}"
+        none => "scope missing"
+    }
+}
+
+fn pb_resource(data: []u8) -> str {
+    match one(data, 1) {
+        some(r) => "resource {pb_attributes(r.data, 1)}"
+        none => "resource missing"
+    }
+}
+
+fn pb_traces(body: []u8) -> []str {
+    var lines: []str = []
+    for rs in each(body, 1) {
+        push(mut lines, pb_resource(rs.data))
+        for ss in each(rs.data, 2) {
+            push(mut lines, pb_scope(ss.data))
+            for sp in each(ss.data, 2) {
+                let d = sp.data
+                var status = "unset"
+                match one(d, 15) {
+                    some(st) => {
+                        status = "{pb_int(st.data, 3)}:{pb_text(st.data, 2)}"
+                    }
+                    none => {}
+                }
+                let times = (one(d, 7) ?? protobuf.Field { number: 0, wire: Varint, value: 0, data: [] }).value
+                let ends = (one(d, 8) ?? protobuf.Field { number: 0, wire: Varint, value: 0, data: [] }).value
+                push(mut lines, "span \"{pb_text(d, 5)}\" kind={pb_int(d, 6)} trace={pb_hex(d, 1)} span={pb_hex(d, 2)} parent={pb_hex(d, 4)} state={pb_text(d, 3)} timed={times > 0 && ends >= times} flags={pb_int(d, 16)} status={status}")
+                push(mut lines, "  attributes {pb_attributes(d, 9)}")
+                for e in each(d, 11) {
+                    push(mut lines, "  event \"{pb_text(e.data, 2)}\" timed={pb_int(e.data, 1) > 0} {pb_attributes(e.data, 3)}")
+                }
+                for l in each(d, 13) {
+                    push(mut lines, "  link trace={pb_hex(l.data, 1)} span={pb_hex(l.data, 2)} state={pb_text(l.data, 3)} flags={pb_int(l.data, 6)} {pb_attributes(l.data, 4)}")
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn pb_metrics(body: []u8) -> []str {
+    var lines: []str = []
+    for rm in each(body, 1) {
+        push(mut lines, pb_resource(rm.data))
+        for sm in each(rm.data, 2) {
+            push(mut lines, pb_scope(sm.data))
+            for m in each(sm.data, 2) {
+                let d = m.data
+                push(mut lines, "metric {pb_text(d, 1)} unit={pb_text(d, 3)} description={pb_text(d, 2)}")
+                match one(d, 7) {
+                    some(sum) => {
+                        push(mut lines, "  sum temporality={pb_int(sum.data, 2)} monotonic={pb_int(sum.data, 3)}")
+                        for p in each(sum.data, 1) {
+                            var value = "none"
+                            match one(p.data, 6) {
+                                some(f) => {
+                                    value = "int {i64(f.value)}"
+                                }
+                                none => {}
+                            }
+                            match one(p.data, 4) {
+                                some(f) => {
+                                    value = "double {pb_double(f)}"
+                                }
+                                none => {}
+                            }
+                            push(mut lines, "  point {value} timed={pb_int(p.data, 3) != 0 && pb_int(p.data, 2) != 0} {pb_attributes(p.data, 7)}")
+                        }
+                    }
+                    none => {}
+                }
+                match one(d, 9) {
+                    some(h) => {
+                        push(mut lines, "  histogram temporality={pb_int(h.data, 2)}")
+                        for p in each(h.data, 1) {
+                            let counts: []u64 = match one(p.data, 6) {
+                                some(f) => f.unpack_fixed64() catch []
+                                none => []
+                            }
+                            let bounds: []f64 = match one(p.data, 7) {
+                                some(f) => f.unpack_doubles() catch []
+                                none => []
+                            }
+                            var cs: []str = []
+                            for c in counts {
+                                push(mut cs, "{c}")
+                            }
+                            var bs: []str = []
+                            for b in bounds {
+                                push(mut bs, "{b}")
+                            }
+                            let sum = match one(p.data, 5) {
+                                some(f) => pb_double(f)
+                                none => -1.0
+                            }
+                            let min = match one(p.data, 11) {
+                                some(f) => pb_double(f)
+                                none => -1.0
+                            }
+                            let max = match one(p.data, 12) {
+                                some(f) => pb_double(f)
+                                none => -1.0
+                            }
+                            push(mut lines, "  point count={pb_int(p.data, 4)} sum={sum} min={min} max={max} buckets=[{text.join(cs, ",")}] bounds=[{text.join(bs, ",")}] {pb_attributes(p.data, 9)}")
+                        }
+                    }
+                    none => {}
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn pb_logs(body: []u8) -> []str {
+    var lines: []str = []
+    for rl in each(body, 1) {
+        push(mut lines, pb_resource(rl.data))
+        for sl in each(rl.data, 2) {
+            push(mut lines, pb_scope(sl.data))
+            for r in each(sl.data, 2) {
+                let d = r.data
+                let body_text = match one(d, 5) {
+                    some(b) => pb_any(b.data)
+                    none => "none"
+                }
+                push(mut lines, "log severity={pb_int(d, 2)} text={pb_text(d, 3)} body={body_text} trace={pb_hex(d, 9)} span={pb_hex(d, 10)} flags={pb_int(d, 8)} timed={pb_int(d, 1) != 0 && pb_int(d, 11) != 0} {pb_attributes(d, 6)}")
+            }
+        }
+    }
+    lines
+}
+
+fn jget(v: json.Value, name: str) -> json.Value {
+    json.get(v, name) ?? json.Value.Null
+}
+
+fn jlist(v: json.Value, name: str) -> []json.Value {
+    match jget(v, name) {
+        Array(items) => items
+        _ => []
+    }
+}
+
+fn jtext(v: json.Value, name: str) -> str {
+    match jget(v, name) {
+        Str(s) => s
+        Int(n) => "{n}"
+        _ => ""
+    }
+}
+
+fn jnum(v: json.Value) -> f64 {
+    match v {
+        Int(n) => f64(n)
+        Float(x) => x
+        Str(s) => text.parse_float(s) catch 0.0
+        _ => 0.0
+    }
+}
+
+fn jint(v: json.Value, name: str) -> i64 {
+    match jget(v, name) {
+        Int(n) => n
+        Str(s) => text.parse_int(s) catch 0
+        Bool(b) => if b { 1 } else { 0 }
+        _ => 0
+    }
+}
+
+fn jhas(v: json.Value, name: str) -> bool {
+    match json.get(v, name) {
+        some(_) => true
+        none => false
+    }
+}
+
+fn j_any(v: json.Value) -> str {
+    if jhas(v, "stringValue") {
+        return "s:{jtext(v, "stringValue")}"
+    }
+    if jhas(v, "boolValue") {
+        return match jget(v, "boolValue") {
+            Bool(b) => "b:{b}"
+            _ => "b:?"
+        }
+    }
+    if jhas(v, "intValue") {
+        return "i:{jint(v, "intValue")}"
+    }
+    if jhas(v, "doubleValue") {
+        return "d:{jnum(jget(v, "doubleValue"))}"
+    }
+    if jhas(v, "arrayValue") {
+        var parts: []str = []
+        for x in jlist(jget(v, "arrayValue"), "values") {
+            push(mut parts, j_any(x))
+        }
+        return "a:[{text.join(parts, ",")}]"
+    }
+    if jhas(v, "kvlistValue") {
+        return "m:{{{j_attributes(jget(v, "kvlistValue"), "values")}}}"
+    }
+    if jhas(v, "bytesValue") {
+        let raw = base64.decode(jtext(v, "bytesValue")) catch []
+        return "x:{text.encode_hex(raw)}"
+    }
+    "empty"
+}
+
+fn j_attributes(v: json.Value, name: str) -> str {
+    var parts: []str = []
+    for kv in jlist(v, name) {
+        push(mut parts, "{jtext(kv, "key")}={j_any(jget(kv, "value"))}")
+    }
+    text.join(parts, " ")
+}
+
+fn j_resource(v: json.Value) -> str {
+    "resource {j_attributes(jget(v, "resource"), "attributes")}"
+}
+
+fn j_scope(v: json.Value) -> str {
+    let s = jget(v, "scope")
+    "scope {jtext(s, "name")} {jtext(s, "version")}"
+}
+
+fn j_traces(body: []u8) -> []str {
+    var lines: []str = []
+    let root = json.parse(body) catch json.Value.Null
+    for rs in jlist(root, "resourceSpans") {
+        push(mut lines, j_resource(rs))
+        for ss in jlist(rs, "scopeSpans") {
+            push(mut lines, j_scope(ss))
+            for d in jlist(ss, "spans") {
+                var status = "unset"
+                if jhas(d, "status") {
+                    let st = jget(d, "status")
+                    status = "{jint(st, "code")}:{jtext(st, "message")}"
+                }
+                let start = jint(d, "startTimeUnixNano")
+                push(mut lines, "span \"{jtext(d, "name")}\" kind={jint(d, "kind")} trace={jtext(d, "traceId")} span={jtext(d, "spanId")} parent={jtext(d, "parentSpanId")} state={jtext(d, "traceState")} timed={start > 0 && jint(d, "endTimeUnixNano") >= start} flags={jint(d, "flags")} status={status}")
+                push(mut lines, "  attributes {j_attributes(d, "attributes")}")
+                for e in jlist(d, "events") {
+                    push(mut lines, "  event \"{jtext(e, "name")}\" timed={jint(e, "timeUnixNano") > 0} {j_attributes(e, "attributes")}")
+                }
+                for l in jlist(d, "links") {
+                    push(mut lines, "  link trace={jtext(l, "traceId")} span={jtext(l, "spanId")} state={jtext(l, "traceState")} flags={jint(l, "flags")} {j_attributes(l, "attributes")}")
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn j_metrics(body: []u8) -> []str {
+    var lines: []str = []
+    let root = json.parse(body) catch json.Value.Null
+    for rm in jlist(root, "resourceMetrics") {
+        push(mut lines, j_resource(rm))
+        for sm in jlist(rm, "scopeMetrics") {
+            push(mut lines, j_scope(sm))
+            for m in jlist(sm, "metrics") {
+                push(mut lines, "metric {jtext(m, "name")} unit={jtext(m, "unit")} description={jtext(m, "description")}")
+                if jhas(m, "sum") {
+                    let sum = jget(m, "sum")
+                    push(mut lines, "  sum temporality={jint(sum, "aggregationTemporality")} monotonic={jint(sum, "isMonotonic")}")
+                    for p in jlist(sum, "dataPoints") {
+                        var value = "none"
+                        if jhas(p, "asInt") {
+                            value = "int {jint(p, "asInt")}"
+                        }
+                        if jhas(p, "asDouble") {
+                            value = "double {jnum(jget(p, "asDouble"))}"
+                        }
+                        push(mut lines, "  point {value} timed={jint(p, "timeUnixNano") != 0 && jint(p, "startTimeUnixNano") != 0} {j_attributes(p, "attributes")}")
+                    }
+                }
+                if jhas(m, "histogram") {
+                    let h = jget(m, "histogram")
+                    push(mut lines, "  histogram temporality={jint(h, "aggregationTemporality")}")
+                    for p in jlist(h, "dataPoints") {
+                        var cs: []str = []
+                        for c in jlist(p, "bucketCounts") {
+                            push(mut cs, "{i64(jnum(c))}")
+                        }
+                        var bs: []str = []
+                        for b in jlist(p, "explicitBounds") {
+                            push(mut bs, "{jnum(b)}")
+                        }
+                        let sum = if jhas(p, "sum") { jnum(jget(p, "sum")) } else { -1.0 }
+                        let min = if jhas(p, "min") { jnum(jget(p, "min")) } else { -1.0 }
+                        let max = if jhas(p, "max") { jnum(jget(p, "max")) } else { -1.0 }
+                        push(mut lines, "  point count={jint(p, "count")} sum={sum} min={min} max={max} buckets=[{text.join(cs, ",")}] bounds=[{text.join(bs, ",")}] {j_attributes(p, "attributes")}")
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn j_logs(body: []u8) -> []str {
+    var lines: []str = []
+    let root = json.parse(body) catch json.Value.Null
+    for rl in jlist(root, "resourceLogs") {
+        push(mut lines, j_resource(rl))
+        for sl in jlist(rl, "scopeLogs") {
+            push(mut lines, j_scope(sl))
+            for d in jlist(sl, "logRecords") {
+                let body_text = if jhas(d, "body") { j_any(jget(d, "body")) } else { "none" }
+                push(mut lines, "log severity={jint(d, "severityNumber")} text={jtext(d, "severityText")} body={body_text} trace={jtext(d, "traceId")} span={jtext(d, "spanId")} flags={jint(d, "flags")} timed={jint(d, "timeUnixNano") != 0 && jint(d, "observedTimeUnixNano") != 0} {j_attributes(d, "attributes")}")
+            }
+        }
+    }
+    lines
+}
+
+struct Ids {
+    names: [str: str]
+}
+
+fn masked(lines: []str, ids: *Ids) -> []str {
+    var out: []str = []
+    for line in lines {
+        var l = line
+        for hex, name in ids.names {
+            for {
+                let at = text.index(l, hex)
+                if at < 0 {
+                    break
+                }
+                l = "{l[..at]}<{name}>{l[at + hex.len..]}"
+            }
+        }
+        push(mut out, l)
+    }
+    out
+}
+
+fn emit_signals(ids: *Ids) {
+    let t = otel.tracer("fixture/export")
+    let log = otel.logger("fixture/log")
+    let remote = otel.SpanContext { trace_hi: 0x0102030405060708, trace_lo: 0x090a0b0c0d0e0f10, span_id: 0x1112131415161718, flags: 1, state: "vendor=x", remote: true }
+    ids.names[otel.trace_id_hex(remote)] = "linked trace"
+    ids.names[otel.span_id_hex(remote)] = "linked span"
+    let parent = t.start_with("checkout", otel.StartOptions {
+        kind: Server
+        attributes: [
+            otel.string("http.request.method", "POST"), otel.int("http.response.status_code", 500), otel.boolean("retry", false),
+            otel.double("ratio", 0.75), otel.blob("digest", [222, 173]), otel.strings("tags", ["a", "b"]), otel.ints("sizes", [1, 2]),
+            otel.attr("nested", Map([otel.string("k", "v"), otel.int("n", 3)])),
+        ]
+        links: [otel.Link { context: remote, attributes: [otel.string("link.reason", "fan-in")] }]
+    })
+    ids.names[otel.trace_id_hex(parent.context)] = "trace"
+    ids.names[otel.span_id_hex(parent.context)] = "checkout"
+    let outer = otel.attach(otel.current().with_span(parent))
+    let child = t.start_with("charge card", otel.StartOptions { kind: Client })
+    ids.names[otel.span_id_hex(child.context)] = "charge card"
+    let inner = otel.attach(otel.current().with_span(child))
+    log.emit(otel.LogRecord { time: otel.now_nanos(), severity: 17, body: Str("card declined"), attributes: [otel.string("card.brand", "visa")] })
+    otel.detach(inner)
+    child.add_event("retrying", [otel.int("attempt", 2)])
+    child.set_status(Ok)
+    child.end()
+    parent.record_exception("PaymentError", "declined")
+    parent.set_status(Failed("payment failed"))
+    parent.end()
+    otel.detach(outer)
+    log.warn("outside any span", [])
+    let m = otel.meter("fixture/meter")
+    let orders = otel.counter[i64](m, "orders", "{{order}}", "Orders placed")
+    orders.add(3, [otel.string("region", "eu")])
+    orders.add(4, [otel.string("region", "us")])
+    let load = otel.up_down_counter[f64](m, "load", "1", "")
+    load.add(1.5, [])
+    let latency = otel.histogram[f64](m, "latency", "s", "", [0.1, 1.0])
+    latency.record(0.05, [])
+    latency.record(0.5, [])
+    latency.record(2.0, [])
+}
+
+fn sdk_for(c: *Collector, protocol: otel.Protocol, gzip: bool) -> *otel.Sdk {
+    let o = otel.OtlpOptions { endpoint: "http://127.0.0.1:{c.port}", protocol, gzip, timeout: 3000, backoff: 1 }
+    otel.install(otel.Config {
+        resource: new(otel.Resource { attributes: [otel.string("service.name", "export-test"), otel.int("pid.fixed", 7)] })
+        span_processors: [otel.batch_span_processor(otel.otlp_span_exporter(o), otel.BatchOptions { delay: 60000 })]
+        log_processors: [otel.batch_log_processor(otel.otlp_log_exporter(o), otel.BatchOptions { delay: 60000 })]
+        metric_readers: [otel.MetricReader { exporter: otel.otlp_metric_exporter(o), interval: 0, preference: PreferDelta }]
+    })
+}
+
+fn decode(r: Received, json_format: bool) -> []str {
+    var body = r.body
+    if r.encoding == "gzip" {
+        body = deflate.gzip_decompress(r.body, 1 << 24) catch []
+    }
+    if r.path == "/v1/traces" {
+        return if json_format { j_traces(body) } else { pb_traces(body) }
+    }
+    if r.path == "/v1/metrics" {
+        return if json_format { j_metrics(body) } else { pb_metrics(body) }
+    }
+    if json_format { j_logs(body) } else { pb_logs(body) }
+}
+
+fn round(c: *Collector, protocol: otel.Protocol, gzip: bool, json_format: bool) -> []str {
+    let ids = new(Ids { names: [:] })
+    let sdk = sdk_for(c, protocol, gzip)
+    emit_signals(ids)
+    print("flush {sdk.force_flush()}")
+    var by_path: [str: []str] = [:]
+    for _ in 0..3 {
+        let r = receive(c)
+        print("received {r.path} {r.content_type} encoding=[{r.encoding}]")
+        by_path[r.path] = masked(decode(r, json_format), ids)
+    }
+    print("shutdown {sdk.shutdown()}")
+    let last = receive(c)
+    print("final collection on shutdown {last.path}")
+    var lines: []str = []
+    for path in ["/v1/traces", "/v1/metrics", "/v1/logs"] {
+        for line in by_path[path] ?? [] {
+            push(mut lines, line)
+        }
+    }
+    lines
+}
+
+fn retries(c: *Collector) {
+    let o = otel.OtlpOptions { endpoint: "http://127.0.0.1:{c.port}/", timeout: 3000, backoff: 1, attempts: 3 }
+    let exporter = otel.otlp_span_exporter(o)
+    var captured: []*otel.SpanData = []
+    let sdk = otel.install(otel.Config {
+        span_processors: [otel.simple_span_processor(otel.SpanExporter {
+            export: fn(spans) -> bool {
+                for d in spans {
+                    push(mut captured, d)
+                }
+                true
+            }
+            shutdown: fn() {}
+        })]
+    })
+    otel.tracer("retry").start("retried").end()
+    sdk.shutdown()
+    let data = captured
+    c.statuses <- 503
+    c.statuses <- 429
+    print("retry after 503 and 429 {exporter.export(data)}")
+    print("requests {receive(c).path} {receive(c).path} {receive(c).path}")
+    c.statuses <- 400
+    print("400 is final {exporter.export(data)}")
+    print("requests {receive(c).path}")
+    c.statuses <- 502
+    c.statuses <- 504
+    c.statuses <- 503
+    print("gives up after attempts {exporter.export(data)}")
+    print("requests {receive(c).path} {receive(c).path} {receive(c).path}")
+    let leftover = select {
+        r = <-c.received => "unexpected {(r ?? Received { path: "", content_type: "", encoding: "", body: [] }).path}"
+        after(50) => "none"
+    }
+    print("extra requests {leftover}")
+}
+
+fn console() {
+    var lines: []str = []
+    let sdk = otel.install(otel.Config {
+        resource: new(otel.Resource { attributes: [otel.string("service.name", "console")] })
+        span_processors: [otel.simple_span_processor(otel.console_span_exporter(fn(line: str) { push(mut lines, line) }))]
+        log_processors: [otel.simple_log_processor(otel.console_log_exporter(fn(line: str) { push(mut lines, line) }))]
+    })
+    otel.span("printed", fn(sp: otel.Span) -> bool {
+        sp.set_string("k", "v")
+        sp.add_event("tick", [])
+        otel.logger("console").info("hello", [otel.int("n", 1)])
+        true
+    })
+    sdk.shutdown()
+    for line in lines {
+        let traced = text.index(line, " trace=")
+        let timed = text.index(line, " at=")
+        let cut = if traced > 0 { traced } else { timed }
+        print("console {if cut > 0 { line[..cut] } else { line }} has_trace={traced > 0}")
+    }
+}
+
+fn main() ! io.Error {
+    let c = collector()?
+    let proto = round(c, HttpProtobuf, false, false)
+    for line in proto {
+        print(line)
+    }
+    let json_lines = round(c, HttpJson, true, true)
+    var same = proto.len == json_lines.len
+    for i in 0..proto.len {
+        if same && proto[i] != json_lines[i] {
+            print("differs: {proto[i]}")
+            print("   json: {json_lines[i]}")
+            same = false
+        }
+    }
+    print("json decodes to the same telemetry {same}")
+    retries(c)
+    console()
+}

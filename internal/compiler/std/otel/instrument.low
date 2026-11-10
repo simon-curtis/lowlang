@@ -1,0 +1,342 @@
+import std/http
+import std/sql
+import std/text
+
+struct CallState {
+    span: Span
+    outer: *Context
+    begun: i64
+    category: str
+    scope: str
+    method: str
+    facts: []Attribute
+    lock: i64
+}
+
+pub struct Call {
+    state: *CallState?
+    owned: bool
+}
+
+fn idle() -> Call {
+    Call { state: none, owned: false }
+}
+
+pub fn recording(c: Call) -> bool {
+    match c.state {
+        some(_) => true
+        none => false
+    }
+}
+
+fn known_method(m: str) -> bool {
+    m == "GET" || m == "HEAD" || m == "POST" || m == "PUT" || m == "DELETE" || m == "CONNECT" || m == "OPTIONS" || m == "TRACE" || m == "PATCH"
+}
+
+fn host_only(authority: str) -> str {
+    if authority.len > 0 && authority[0] == '[' {
+        let close = text.index_byte(authority, ']')
+        return if close > 0 { authority[1..close] } else { authority }
+    }
+    let colon = text.last_index_byte(authority, ':')
+    if colon >= 0 { authority[..colon] } else { authority }
+}
+
+pub fn tag(c: Call, key: str, value: str) {
+    let s = match c.state {
+        some(x) => x
+        none => return
+    }
+    let a = string(key, value)
+    __lock(mut s.lock)
+    upsert(mut s.facts, a, 1 << 20)
+    __unlock(mut s.lock)
+    set_attribute(s.span, a)
+}
+
+pub fn tag_int(c: Call, key: str, value: i64) {
+    let s = match c.state {
+        some(x) => x
+        none => return
+    }
+    let a = int(key, value)
+    __lock(mut s.lock)
+    upsert(mut s.facts, a, 1 << 20)
+    __unlock(mut s.lock)
+    set_attribute(s.span, a)
+}
+
+fn begin(sdk: *Sdk, parent: *Context, scope: str, category: str, name: str, kind: Kind, method: str, facts: []Attribute) -> Call {
+    let s = start_with(Tracer { scope: Scope { name: scope } }, name, StartOptions { kind, parent: some(parent), attributes: facts })
+    let state = new(CallState { span: s, outer: current(), begun: monotonic_nanos(), category, scope, method, facts, lock: 0 })
+    if category.len > 0 {
+        var next = *parent
+        next.span = s
+        next.call = some(state)
+        __set_context(new(next))
+    } else {
+        __set_context(with_span(parent, s))
+    }
+    Call { state, owned: true }
+}
+
+fn selected(facts: []Attribute, keys: []str) -> []Attribute {
+    var out: []Attribute = []
+    for k in keys {
+        match lookup(facts, k) {
+            some(v) => push(mut out, Attribute { key: k, value: v })
+            none => {}
+        }
+    }
+    out
+}
+
+fn finish(c: Call, metric: str, description: str, keys: []str) {
+    let s = match c.state {
+        some(x) => x
+        none => return
+    }
+    if !c.owned {
+        return
+    }
+    let elapsed = f64(monotonic_nanos() - s.begun) / 1000000000.0
+    end(s.span)
+    detach(s.outer)
+    __lock(mut s.lock)
+    let facts = selected(s.facts, keys)
+    __unlock(mut s.lock)
+    let h = histogram[f64](Meter { scope: Scope { name: s.scope } }, metric, "s", description, duration_bounds())
+    h.record(elapsed, facts)
+}
+
+pub fn server_span(scope: str, r: http.Request) -> Call {
+    let sdk = match active_sdk() {
+        some(x) => x
+        none => return idle()
+    }
+    let parent = extract_into(current(), r.headers)
+    let method = if known_method(r.method) { r.method } else { "_OTHER" }
+    var facts = [string("http.request.method", method), string("url.path", r.path)]
+    if method != r.method {
+        push(mut facts, string("http.request.method_original", r.method))
+    }
+    if r.query.len > 0 {
+        push(mut facts, string("url.query", r.query))
+    }
+    let authority = if r.authority.len > 0 { r.authority } else { http.header(r.headers, "host") ?? "" }
+    if authority.len > 0 {
+        push(mut facts, string("server.address", host_only(authority)))
+    }
+    match http.header(r.headers, "user-agent") {
+        some(agent) => push(mut facts, string("user_agent.original", agent))
+        none => {}
+    }
+    let version = match r.version {
+        Http1 => "1.1"
+        Http2 => "2"
+    }
+    push(mut facts, string("network.protocol.version", version))
+    begin(sdk, parent, scope, "", method, Server, method, facts)
+}
+
+pub fn end_server(c: Call, route: str, status: i64) {
+    let s = match c.state {
+        some(x) => x
+        none => return
+    }
+    if route.len > 0 {
+        update_name(s.span, "{s.method} {route}")
+        tag(c, "http.route", route)
+    }
+    tag_int(c, "http.response.status_code", status)
+    if status >= 500 {
+        tag(c, "error.type", "{status}")
+        set_status(s.span, Failed(""))
+    }
+    finish(c, "http.server.request.duration", "Duration of HTTP server requests.", [
+        "http.request.method", "http.route", "http.response.status_code", "network.protocol.version", "error.type",
+    ])
+}
+
+fn first_word(query: str) -> str {
+    let trimmed = text.trim(query)
+    var n = 0
+    for n < trimmed.len && (trimmed[n] >= 'a' && trimmed[n] <= 'z' || trimmed[n] >= 'A' && trimmed[n] <= 'Z') {
+        n += 1
+    }
+    var out: []u8 = []
+    for i in 0..n {
+        let c = trimmed[i]
+        push(mut out, if c >= 'a' && c <= 'z' { c - 32 } else { c })
+    }
+    __str_view(out)
+}
+
+pub fn db_span(scope: str, system: str, operation: str, collection: str, query: str) -> Call {
+    let sdk = match active_sdk() {
+        some(x) => x
+        none => return idle()
+    }
+    let parent = current()
+    match parent.call {
+        some(outer) => {
+            if outer.category == "db" {
+                return Call { state: outer, owned: false }
+            }
+        }
+        none => {}
+    }
+    let op = if operation.len > 0 { operation } else { first_word(query) }
+    var facts = [string("db.system.name", system)]
+    if op.len > 0 {
+        push(mut facts, string("db.operation.name", op))
+    }
+    if collection.len > 0 {
+        push(mut facts, string("db.collection.name", collection))
+    }
+    if query.len > 0 {
+        push(mut facts, string("db.query.text", query))
+    }
+    let name = if op.len > 0 && collection.len > 0 { "{op} {collection}" } else if op.len > 0 { op } else { system }
+    begin(sdk, parent, scope, "db", name, Client, op, facts)
+}
+
+pub fn end_with(c: Call, error_type: str) {
+    let s = match c.state {
+        some(x) => x
+        none => return
+    }
+    if !c.owned {
+        return
+    }
+    if error_type.len > 0 {
+        tag(c, "error.type", error_type)
+        set_status(s.span, Failed(error_type))
+    }
+    finish(c, "db.client.operation.duration", "Duration of database client operations.", [
+        "db.system.name", "db.namespace", "db.operation.name", "db.collection.name", "db.response.status_code",
+        "server.address", "server.port", "error.type",
+    ])
+}
+
+pub fn system_name(d: sql.Dialect) -> str {
+    match d {
+        Postgres => "postgresql"
+        SqlServer => "microsoft.sql_server"
+    }
+}
+
+fn traced_sql[V](c: Call, work: fn() -> V ! sql.Error) -> V ! sql.Error {
+    let out = work() catch {
+        Connect => {
+            end_with(c, "Connect")
+            fail Connect
+        }
+        Authentication => {
+            end_with(c, "Authentication")
+            fail Authentication
+        }
+        Closed => {
+            end_with(c, "Closed")
+            fail Closed
+        }
+        Timeout => {
+            end_with(c, "Timeout")
+            fail Timeout
+        }
+        Protocol => {
+            end_with(c, "Protocol")
+            fail Protocol
+        }
+        Unsupported => {
+            end_with(c, "Unsupported")
+            fail Unsupported
+        }
+        Conversion => {
+            end_with(c, "Conversion")
+            fail Conversion
+        }
+        Busy => {
+            end_with(c, "Busy")
+            fail Busy
+        }
+        Server(code, message) => {
+            tag(c, "db.response.status_code", code)
+            end_with(c, code)
+            fail Server(code, message)
+        }
+    }
+    end_with(c, "")
+    out
+}
+
+pub fn sql_query(db: sql.Connection, scope: str, operation: str, collection: str, query: str, values: []sql.Value) -> sql.Rows ! sql.Error {
+    let c = db_span(scope, system_name(db.dialect), operation, collection, query)
+    if !recording(c) {
+        return db.query(query, values)
+    }
+    traced_sql(c, fn() -> sql.Rows ! sql.Error { db.query(query, values) })
+}
+
+pub fn sql_execute(db: sql.Connection, scope: str, operation: str, collection: str, query: str, values: []sql.Value) -> i64 ! sql.Error {
+    let c = db_span(scope, system_name(db.dialect), operation, collection, query)
+    if !recording(c) {
+        return db.execute(query, values)
+    }
+    traced_sql(c, fn() -> i64 ! sql.Error { db.execute(query, values) })
+}
+
+pub fn sql_each(db: sql.Connection, scope: str, operation: str, collection: str, query: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
+    let c = db_span(scope, system_name(db.dialect), operation, collection, query)
+    if !recording(c) {
+        return db.each(query, values, visit)
+    }
+    traced_sql(c, fn() -> bool ! sql.Error {
+        db.each(query, values, visit)?
+        true
+    })?
+}
+
+pub fn instrument_sql(db: sql.Connection, scope: str, namespace: str, server: str, port: i64) -> sql.Connection {
+    let endpoint = fn(c: Call) {
+        if namespace.len > 0 {
+            tag(c, "db.namespace", namespace)
+        }
+        tag(c, "server.address", server)
+        tag_int(c, "server.port", port)
+    }
+    sql.Connection {
+        dialect: db.dialect
+        query: fn(query, values) -> sql.Rows ! sql.Error {
+            let c = db_span(scope, system_name(db.dialect), "", "", query)
+            if !recording(c) {
+                return db.query(query, values)
+            }
+            endpoint(c)
+            traced_sql(c, fn() -> sql.Rows ! sql.Error { db.query(query, values) })
+        }
+        each: fn(query, values, visit) ! sql.Error {
+            let c = db_span(scope, system_name(db.dialect), "", "", query)
+            if !recording(c) {
+                return db.each(query, values, visit)
+            }
+            endpoint(c)
+            traced_sql(c, fn() -> bool ! sql.Error {
+                db.each(query, values, visit)?
+                true
+            })?
+        }
+        execute: fn(query, values) -> i64 ! sql.Error {
+            let c = db_span(scope, system_name(db.dialect), "", "", query)
+            if !recording(c) {
+                return db.execute(query, values)
+            }
+            endpoint(c)
+            traced_sql(c, fn() -> i64 ! sql.Error { db.execute(query, values) })
+        }
+        begin: db.begin
+        commit: db.commit
+        rollback: db.rollback
+        close: db.close
+    }
+}

@@ -1,0 +1,166 @@
+import std/compress/deflate
+import std/crypto
+import std/http
+import std/text
+
+pub enum Protocol {
+    HttpProtobuf
+    HttpJson
+}
+
+pub struct OtlpOptions {
+    pub endpoint: str = "http://localhost:4318"
+    pub traces_endpoint: str = ""
+    pub metrics_endpoint: str = ""
+    pub logs_endpoint: str = ""
+    pub headers: []http.Header = []
+    pub protocol: Protocol = HttpProtobuf
+    pub gzip: bool = false
+    pub timeout: i64 = 10000
+    pub attempts: i64 = 5
+    pub backoff: i64 = 1000
+    pub max_backoff: i64 = 30000
+}
+
+fn signal_url(o: OtlpOptions, specific: str, path: str) -> str {
+    if specific.len > 0 {
+        return specific
+    }
+    let base = if text.ends_with(o.endpoint, "/") { o.endpoint[..o.endpoint.len - 1] } else { o.endpoint }
+    "{base}{path}"
+}
+
+fn retryable(status: i64) -> bool {
+    status == 429 || status == 502 || status == 503 || status == 504
+}
+
+fn retry_after(resp: http.Response) -> i64 {
+    let value = text.trim(http.header(resp.headers, "retry-after") ?? "")
+    let seconds = text.parse_uint(value, 10) catch -1
+    if seconds < 0 { -1 } else { seconds * 1000 }
+}
+
+fn jittered(ms: i64) -> i64 {
+    let r = crypto.random(2)
+    let spread = ms / 5
+    if spread <= 0 {
+        return ms
+    }
+    ms - spread + (i64(r[0]) << 8 | i64(r[1])) % (2 * spread + 1)
+}
+
+fn exporter_client(o: OtlpOptions) -> *http.Client {
+    http.client()
+        .with_timeout(o.timeout)
+        .with_version(Http1)
+        .with_retries(0)
+        .with_decompression(false)
+        .build()
+}
+
+fn post(client: *http.Client, url: str, headers: []http.Header, content_type: str, payload: []u8) -> http.Response? {
+    let base = http.request(client, "POST", url)
+    var b = http.with_body(base, payload, content_type)
+    for h in headers {
+        b = http.with_header(b, h.name, h.value)
+    }
+    let resp = http.send(b) catch {
+        _ => return none
+    }
+    resp
+}
+
+fn send(client: *http.Client, o: OtlpOptions, url: str, body: []u8) -> bool {
+    let outer = attach(suppressed(current()))
+    defer detach(outer)
+    var headers: []http.Header = []
+    for h in o.headers {
+        push(mut headers, h)
+    }
+    let content_type = match o.protocol {
+        HttpProtobuf => "application/x-protobuf"
+        HttpJson => "application/json"
+    }
+    http.set_header(mut headers, "user-agent", "OTel-OTLP-Exporter-LowLang")
+    var payload = body
+    if o.gzip {
+        payload = deflate.gzip_compress(body, 6)
+        http.set_header(mut headers, "content-encoding", "gzip")
+    }
+    var backoff = o.backoff
+    for attempt in 0..o.attempts {
+        var wait = jittered(backoff)
+        match post(client, url, headers, content_type, payload) {
+            some(resp) => {
+                if resp.status >= 200 && resp.status < 300 {
+                    return true
+                }
+                if !retryable(resp.status) {
+                    return false
+                }
+                let hinted = retry_after(resp)
+                if hinted >= 0 {
+                    wait = hinted
+                }
+            }
+            none => {}
+        }
+        if attempt + 1 < o.attempts {
+            sleep(wait)
+        }
+        backoff = if backoff * 2 > o.max_backoff { o.max_backoff } else { backoff * 2 }
+    }
+    false
+}
+
+fn json_protocol(o: OtlpOptions) -> bool {
+    match o.protocol {
+        HttpJson => true
+        HttpProtobuf => false
+    }
+}
+
+pub fn otlp_span_exporter(o: OtlpOptions) -> SpanExporter {
+    let url = signal_url(o, o.traces_endpoint, "/v1/traces")
+    let open = new(true)
+    let client = exporter_client(o)
+    SpanExporter {
+        export: fn(spans) -> bool {
+            if !*open || spans.len == 0 {
+                return *open
+            }
+            send(client, o, url, encode_traces(spans, json_protocol(o)))
+        }
+        shutdown: fn() { *open = false }
+    }
+}
+
+pub fn otlp_metric_exporter(o: OtlpOptions) -> MetricExporter {
+    let url = signal_url(o, o.metrics_endpoint, "/v1/metrics")
+    let open = new(true)
+    let client = exporter_client(o)
+    MetricExporter {
+        export: fn(batch) -> bool {
+            if !*open {
+                return false
+            }
+            send(client, o, url, encode_metrics(batch, json_protocol(o)))
+        }
+        shutdown: fn() { *open = false }
+    }
+}
+
+pub fn otlp_log_exporter(o: OtlpOptions) -> LogExporter {
+    let url = signal_url(o, o.logs_endpoint, "/v1/logs")
+    let open = new(true)
+    let client = exporter_client(o)
+    LogExporter {
+        export: fn(logs) -> bool {
+            if !*open || logs.len == 0 {
+                return *open
+            }
+            send(client, o, url, encode_logs(logs, json_protocol(o)))
+        }
+        shutdown: fn() { *open = false }
+    }
+}
