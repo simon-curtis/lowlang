@@ -306,9 +306,35 @@ func (p *Parser) structDecl() *ast.StructDecl {
 		}
 		name := p.expect(lexer.Ident)
 		p.expect(lexer.Colon)
-		d.Fields = append(d.Fields, &ast.FieldDecl{Name: name.Text, Pub: pub, TypeName: p.typeName(), Pos: name.Pos})
+		field := &ast.FieldDecl{Name: name.Text, Pub: pub, TypeName: p.typeName(), Pos: name.Pos}
+		if p.at(lexer.Assign) {
+			p.next()
+			field.Default = p.expr()
+		}
+		d.Fields = append(d.Fields, field)
 	})
 	return d
+}
+
+func (p *Parser) trailing() *ast.SliceLit {
+	if !p.at(lexer.LBrace) || p.noStruct {
+		return nil
+	}
+	lit := &ast.SliceLit{Pos: p.next().Pos}
+	p.nested(func() {
+		p.skipNewlines()
+		for !p.at(lexer.RBrace) {
+			lit.Elems = append(lit.Elems, p.expr())
+			if p.at(lexer.Comma) {
+				p.next()
+			} else if !p.at(lexer.RBrace) {
+				p.expect(lexer.Newline)
+			}
+			p.skipNewlines()
+		}
+	})
+	p.expect(lexer.RBrace)
+	return lit
 }
 
 func (p *Parser) fn() *ast.Func {
@@ -918,6 +944,9 @@ func (p *Parser) structLit(name lexer.Token) *ast.StructLit {
 		}
 	})
 	p.expect(lexer.RBrace)
+	if children := p.trailing(); children != nil {
+		lit.Fields = append(lit.Fields, &ast.FieldInit{Name: "children", Value: children, Pos: children.Pos})
+	}
 	return lit
 }
 
@@ -940,6 +969,9 @@ func (p *Parser) postfix(x ast.Expr) ast.Expr {
 		case lexer.LParen:
 			call := &ast.Call{Fn: x, Pos: x.Position()}
 			p.list(func() { call.Args = append(call.Args, p.arg()) })
+			if children := p.trailing(); children != nil {
+				call.Args = append(call.Args, children)
+			}
 			x = call
 		case lexer.Dot:
 			p.next()

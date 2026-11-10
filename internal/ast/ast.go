@@ -181,6 +181,7 @@ type FieldDecl struct {
 	Name     string
 	Pub      bool
 	TypeName *TypeName
+	Default  Expr
 	Pos      lexer.Pos
 }
 

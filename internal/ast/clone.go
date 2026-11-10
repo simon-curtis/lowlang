@@ -21,6 +21,10 @@ func CloneFunc(f *Func) *Func {
 	return &c
 }
 
+func CloneExpr(e Expr) Expr {
+	return clone(e)
+}
+
 func clone[T any](v T) T {
 	copied := deep(reflect.ValueOf(&v).Elem())
 	return copied.Interface().(T)

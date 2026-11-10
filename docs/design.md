@@ -169,9 +169,26 @@ shift(mut p, 2.0)
 let x = 1.0
 let q = Point { x, y: 2.0 }
 print(len(p) + len(q))
+
+struct Div {
+    padding: f64 = 0.0
+    align: Align = Start
+    on_click: fn() = fn() {}
+    children: []Element = []
+}
+
+let page = Div { padding: 8.0 } {
+    Label(Text { value: "title" })
+    Box(Div { align: Center } {
+        button("ok")
+        button("cancel")
+    })
+}
 ```
 
-- Literals name every field, separated by commas or newlines; `x` alone means `x: x`.
+- Literals name their fields, separated by commas or newlines; `x` alone means `x: x`. A field declared with `= expr` may be left out, and every other field must be given.
+- A default is any expression. It is checked once against the field's type, in the declaring module's scope, with no access to locals or other fields, and evaluated at every literal that leaves the field out, after the written fields. A field with a default can be left out of a literal in another module even when it is private.
+- A brace block on the same line after a struct literal holds its children: the entries, one per line or separated by commas, become a slice literal for the struct's `children` field. After a call, the block becomes a slice literal passed as the last argument, so a function such as `fn button(label: str, children: []Element) -> Element` takes children the same way. A trailing block is not allowed where a struct literal is not, such as an `if` condition.
 - Structs are values: assignment and argument passing copy them.
 - `==` and `!=` compare structs field by field when every field can be compared: numbers, `bool`, `str`, pointers, channels, and structs and enums made of them. Each field uses its own `==`, so strings compare by content, floats by value, and pointers by identity.
 - Fields are assigned through a `var` binding or a `mut` parameter, at any depth: `r.max.x = 1`. Other parameters are immutable.
@@ -422,7 +439,7 @@ fn main() {
 - The project root is the nearest directory, starting at the entry, that holds a `low.mod` file; without one it is the entry's directory. `import ui/text` loads `<root>/ui/text/`.
 - `low build dir` builds the directory as the entry module. `low build file.low` builds that one file as the entry module, without the other files beside it.
 - Imports come before declarations and apply to their file. A module is used through its last path segment, `text.shout(...)`, or through a name given with `import t = ui/text`. Types are written `geometry.Shape` and built with `geometry.Point { ... }`; a variant can be named `geometry.Shape.Dot` or, where the type is expected, `Dot`.
-- Declarations and struct fields are private to their module unless marked `pub`. A `pub` enum's variants are public. A struct with private fields cannot be built with a literal outside its module.
+- Declarations and struct fields are private to their module unless marked `pub`. A `pub` enum's variants are public. A struct with private fields without defaults cannot be built with a literal outside its module.
 - An import cycle is an error, and so is importing two modules under one name.
 
 ### Generics
@@ -648,6 +665,7 @@ Mechanism:
 - `defer`.
 - Generic functions, structs and enums with built-in constraints, compiled per type; maps built on generic prelude code.
 - Structural `==` and `!=` on structs and enums.
+- Field defaults and trailing children blocks for struct literals and calls.
 - Function values and closures capturing by reference; `extern fn` C function pointers and C callbacks.
 - Green threads on an M:N scheduler with `spawn`, channels, `select`, `sleep`, descriptor waits through epoll, deadlock detection and stack overflow checks.
 - Hot reload with `low dev`.
@@ -655,8 +673,7 @@ Mechanism:
 
 ## Roadmap
 
-1. Builder or default-field syntax for element trees (`div`, `flex`, `padding`, `child` style).
-2. GPU UI library with GPUI's renderer and platform layer and a signal-based state model, Linux first:
+1. GPU UI library with GPUI's renderer and platform layer and a signal-based state model, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
     3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
@@ -670,5 +687,5 @@ Mechanism:
     11. Foreground and background executors on the scheduler; a background task's result is written into a signal on the UI thread.
     12. Text input element whose state is held in signals, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     13. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-3. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-4. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.
+2. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
+3. Further targets: linux/arm64, darwin, windows; macOS (Metal) and Windows backends for the UI library.

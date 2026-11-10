@@ -37,54 +37,60 @@ type scope struct {
 }
 
 type Checker struct {
-	modules      map[string]*scope
-	embeds       []string
-	builtin      map[string]*types.Type
-	file         *ast.File
-	results      map[[2]*types.Type]*types.Type
-	ptrs         map[*types.Type]*types.Type
-	opts         map[*types.Type]*types.Type
-	slices       map[*types.Type]*types.Type
-	maps         map[[2]*types.Type]*types.Type
-	fn           *ast.Func
-	scopes       []map[string]*ast.Local
-	loops        []*loop
-	raws         map[*types.Type]*types.Type
-	funcTypes    map[string]*types.Type
-	closures     []*ast.Closure
-	counts       map[*ast.Func]int
-	bound        map[string]*types.Type
-	abstract     bool
-	generics     map[*types.Type]*generic
-	pristine     map[*ast.Func]*ast.Func
-	instances    map[*ast.Func]map[string]*ast.Func
-	pending      []*ast.Func
-	unlaid       []*types.Type
-	laid         bool
-	funcsReady   bool
-	waitingMaps  []*types.Type
-	chans        map[*types.Type]*types.Type
-	waitingChans []*types.Type
-	spawns       int
-	deferring    bool
+	modules         map[string]*scope
+	embeds          []string
+	builtin         map[string]*types.Type
+	file            *ast.File
+	results         map[[2]*types.Type]*types.Type
+	ptrs            map[*types.Type]*types.Type
+	opts            map[*types.Type]*types.Type
+	slices          map[*types.Type]*types.Type
+	maps            map[[2]*types.Type]*types.Type
+	fn              *ast.Func
+	scopes          []map[string]*ast.Local
+	loops           []*loop
+	raws            map[*types.Type]*types.Type
+	funcTypes       map[string]*types.Type
+	closures        []*ast.Closure
+	counts          map[*ast.Func]int
+	bound           map[string]*types.Type
+	abstract        bool
+	generics        map[*types.Type]*generic
+	pristine        map[*ast.Func]*ast.Func
+	instances       map[*ast.Func]map[string]*ast.Func
+	pending         []*ast.Func
+	unlaid          []*types.Type
+	laid            bool
+	funcsReady      bool
+	waitingMaps     []*types.Type
+	chans           map[*types.Type]*types.Type
+	waitingChans    []*types.Type
+	spawns          int
+	fieldSources    map[*types.Field]*fieldSource
+	defaults        map[*types.Field]ast.Expr
+	checkingDefault map[*types.Field]bool
+	deferring       bool
 }
 
 func Check(files []*ast.File) (embeds []string, err error) {
 	c := &Checker{
-		modules:   map[string]*scope{},
-		builtin:   map[string]*types.Type{"bool": types.Bool, "str": types.Str},
-		results:   map[[2]*types.Type]*types.Type{},
-		ptrs:      map[*types.Type]*types.Type{},
-		opts:      map[*types.Type]*types.Type{},
-		slices:    map[*types.Type]*types.Type{},
-		maps:      map[[2]*types.Type]*types.Type{},
-		raws:      map[*types.Type]*types.Type{},
-		funcTypes: map[string]*types.Type{},
-		counts:    map[*ast.Func]int{},
-		generics:  map[*types.Type]*generic{},
-		pristine:  map[*ast.Func]*ast.Func{},
-		instances: map[*ast.Func]map[string]*ast.Func{},
-		chans:     map[*types.Type]*types.Type{},
+		modules:         map[string]*scope{},
+		builtin:         map[string]*types.Type{"bool": types.Bool, "str": types.Str},
+		results:         map[[2]*types.Type]*types.Type{},
+		ptrs:            map[*types.Type]*types.Type{},
+		opts:            map[*types.Type]*types.Type{},
+		slices:          map[*types.Type]*types.Type{},
+		maps:            map[[2]*types.Type]*types.Type{},
+		raws:            map[*types.Type]*types.Type{},
+		funcTypes:       map[string]*types.Type{},
+		counts:          map[*ast.Func]int{},
+		generics:        map[*types.Type]*generic{},
+		pristine:        map[*ast.Func]*ast.Func{},
+		instances:       map[*ast.Func]map[string]*ast.Func{},
+		chans:           map[*types.Type]*types.Type{},
+		fieldSources:    map[*types.Field]*fieldSource{},
+		defaults:        map[*types.Field]ast.Expr{},
+		checkingDefault: map[*types.Field]bool{},
 	}
 	defer func() {
 		r := recover()
@@ -325,6 +331,7 @@ func (c *Checker) result(ok, err *types.Type) *types.Type {
 func (c *Checker) check(files []*ast.File) {
 	c.declareTypes(files)
 	c.declareFuncs(files)
+	c.checkDefaults(files)
 	c.checkMain()
 	var funcs []*ast.Func
 	for _, f := range files {
@@ -445,7 +452,9 @@ func (c *Checker) declareFields(d *ast.StructDecl, st *types.Type) {
 		if d.C && !t.CCompatible() {
 			c.fail(fd.TypeName.Pos, "extern struct fields must have C types, found %s", t)
 		}
-		st.Fields = append(st.Fields, &types.Field{Name: fd.Name, Pub: fd.Pub, Type: t})
+		field := &types.Field{Name: fd.Name, Pub: fd.Pub, Type: t}
+		st.Fields = append(st.Fields, field)
+		c.recordDefault(d, st, fd, field)
 	}
 }
 
@@ -1339,9 +1348,14 @@ func (c *Checker) structLit(e *ast.StructLit, want *types.Type) {
 	}
 	var missing []string
 	for _, f := range t.Fields {
-		if !given[f] {
-			missing = append(missing, f.Name)
+		if given[f] {
+			continue
 		}
+		if def := c.defaultOf(f); def != nil {
+			e.Fields = append(e.Fields, &ast.FieldInit{Name: f.Name, Value: def, Pos: e.Pos, Field: f})
+			continue
+		}
+		missing = append(missing, f.Name)
 	}
 	if len(missing) > 0 {
 		c.fail(e.Pos, "missing fields for %s: %s", t, strings.Join(missing, ", "))
