@@ -299,7 +299,7 @@ func (q *query) hover() string {
 		return typeParamText(n)
 	}
 	if q.occ.local != nil {
-		return localText(q.occ.local)
+		return q.localText(q.occ.local)
 	}
 	return ""
 }
@@ -307,7 +307,7 @@ func (q *query) hover() string {
 func (q *query) identHover(n *ast.Ident) string {
 	switch {
 	case n.Local != nil:
-		return localText(n.Local)
+		return q.localText(n.Local)
 	case n.Func != nil:
 		return signature(n.Func)
 	case n.Variant != nil:
@@ -329,9 +329,22 @@ func typed(name string, t *types.Type) string {
 	return fmt.Sprintf("%s: %s", name, t)
 }
 
-func localText(l *ast.Local) string {
+func (q *query) using(l *ast.Local) bool {
+	d := q.index.declaration(l)
+	if d == nil {
+		return false
+	}
+	let, ok := d.node.(*ast.Let)
+	return ok && let.Using
+}
+
+func (q *query) localText(l *ast.Local) string {
 	keyword := "let "
 	switch {
+	case q.using(l) && l.Mutable:
+		keyword = "using var "
+	case q.using(l):
+		keyword = "using "
 	case l.Param && l.Ref:
 		keyword = "mut "
 	case l.Param:

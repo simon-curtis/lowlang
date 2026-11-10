@@ -67,7 +67,9 @@ func (x *index) declarations() {
 		for _, f := range d.Fields {
 			x.add(occurrence{pos: f.Pos, name: f.Name, node: f})
 			x.typeName(f.TypeName)
+			x.expr(f.Default)
 		}
+		x.stmt(d.Drop)
 	}
 	for _, d := range x.file.Enums {
 		x.add(occurrence{pos: x.text.nameAfter(d.Pos, d.Name), name: d.Name, node: d})
@@ -302,6 +304,11 @@ func (x *index) catch(e *ast.Catch) {
 
 func (x *index) arms(arms []*ast.Arm, scrutinee *types.Type) {
 	for _, a := range arms {
+		if a.Pattern.Test != nil {
+			x.expr(a.Pattern.Test)
+			x.expr(a.Body)
+			continue
+		}
 		x.add(occurrence{pos: a.Pattern.Pos, name: a.Pattern.Name, node: a.Pattern, parent: scrutinee})
 		for _, b := range a.Pattern.Bindings {
 			x.add(occurrence{pos: b.Pos, name: b.Name, node: b, local: b.Local})
