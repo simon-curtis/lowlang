@@ -1,0 +1,320 @@
+import std/io
+import std/text
+
+pub struct Options {
+    pub max_depth: i64 = 64
+    pub max_length: i64 = 16777216
+}
+
+pub struct Item {
+    pub value: Value
+    pub length: i64
+}
+
+struct Decoder {
+    data: []u8
+    pos: i64
+    options: Options
+    depth: i64
+}
+
+struct Head {
+    major: u8
+    info: u8
+    argument: u64
+}
+
+pub fn decode(data: []u8) -> Value ! io.Error {
+    decode_with(data, Options {})
+}
+
+pub fn decode_with(data: []u8, options: Options) -> Value ! io.Error {
+    let first = decode_first(data, options)?
+    if first.length != data.len {
+        fail Malformed
+    }
+    first.value
+}
+
+pub fn decode_first(data: []u8, options: Options) -> Item ! io.Error {
+    let d = new(Decoder { data, pos: 0, options, depth: 0 })
+    let value = item(d)?
+    Item { value, length: d.pos }
+}
+
+fn remaining(d: *Decoder) -> i64 {
+    d.data.len - d.pos
+}
+
+fn read_head(d: *Decoder) -> Head ! io.Error {
+    if d.pos >= d.data.len {
+        fail Malformed
+    }
+    let initial = d.data[d.pos]
+    d.pos += 1
+    let major = initial >> 5
+    let info = initial & 0x1F
+    if info < 24 || info == 31 {
+        return Head { major, info, argument: u64(info) }
+    }
+    if info > 27 {
+        fail Malformed
+    }
+    let size = i64(1) << i64(info - 24)
+    if size > remaining(d) {
+        fail Malformed
+    }
+    var argument: u64 = 0
+    for i in 0..size {
+        argument = argument << 8 | u64(d.data[d.pos + i])
+    }
+    d.pos += size
+    Head { major, info, argument }
+}
+
+fn at_break(d: *Decoder) -> bool ! io.Error {
+    if d.pos >= d.data.len {
+        fail Malformed
+    }
+    if d.data[d.pos] == 0xFF {
+        d.pos += 1
+        return true
+    }
+    false
+}
+
+fn count(d: *Decoder, h: Head, width: i64) -> i64 ! io.Error {
+    if h.argument > u64(d.options.max_length) {
+        fail TooLarge
+    }
+    let n = i64(h.argument)
+    if n > remaining(d) / width {
+        fail Malformed
+    }
+    n
+}
+
+fn enter(d: *Decoder) ! io.Error {
+    d.depth += 1
+    if d.depth > d.options.max_depth {
+        fail TooLarge
+    }
+}
+
+fn item(d: *Decoder) -> Value ! io.Error {
+    let h = read_head(d)?
+    let indefinite = h.info == 31
+    if h.major == 7 {
+        return simple(d, h)
+    }
+    if indefinite && (h.major < 2 || h.major == 6) {
+        fail Malformed
+    }
+    if h.major == 0 {
+        return Unsigned(h.argument)
+    }
+    if h.major == 1 {
+        return Negative(h.argument)
+    }
+    if h.major == 2 {
+        let data = string(d, h)?
+        return Bytes(data)
+    }
+    if h.major == 3 {
+        let raw = string(d, h)?
+        if !valid_utf8(raw) {
+            fail Malformed
+        }
+        return Text(__str_view(raw))
+    }
+    enter(d)?
+    let v = if h.major == 4 { array(d, h)? } else if h.major == 5 { map(d, h)? } else { tag(d, h)? }
+    d.depth -= 1
+    v
+}
+
+fn tag(d: *Decoder, h: Head) -> Value ! io.Error {
+    let content = item(d)?
+    Tag(h.argument, new(content))
+}
+
+fn string(d: *Decoder, h: Head) -> []u8 ! io.Error {
+    if h.info != 31 {
+        let n = count(d, h, 1)?
+        let out: []u8 = __make(n)
+        __memmove(out, d.data[d.pos..d.pos + n])
+        d.pos += n
+        return out
+    }
+    var out: []u8 = []
+    for !at_break(d)? {
+        let chunk = read_head(d)?
+        if chunk.major != h.major || chunk.info == 31 {
+            fail Malformed
+        }
+        let n = count(d, chunk, 1)?
+        if out.len + n > d.options.max_length {
+            fail TooLarge
+        }
+        for b in d.data[d.pos..d.pos + n] {
+            push(mut out, b)
+        }
+        d.pos += n
+    }
+    out
+}
+
+fn array(d: *Decoder, h: Head) -> Value ! io.Error {
+    var items: []Value = []
+    if h.info != 31 {
+        let n = count(d, h, 1)?
+        for _ in 0..n {
+            push(mut items, item(d)?)
+        }
+        return Array(items)
+    }
+    for !at_break(d)? {
+        if items.len >= d.options.max_length {
+            fail TooLarge
+        }
+        push(mut items, item(d)?)
+    }
+    Array(items)
+}
+
+fn map(d: *Decoder, h: Head) -> Value ! io.Error {
+    var entries: []Entry = []
+    let seen: [str: bool] = [:]
+    if h.info != 31 {
+        let n = count(d, h, 2)?
+        for _ in 0..n {
+            push(mut entries, entry(d, seen)?)
+        }
+        return Map(entries)
+    }
+    for !at_break(d)? {
+        if entries.len >= d.options.max_length {
+            fail TooLarge
+        }
+        push(mut entries, entry(d, seen)?)
+    }
+    Map(entries)
+}
+
+fn entry(d: *Decoder, seen: [str: bool]) -> Entry ! io.Error {
+    let key = item(d)?
+    let encoded = __str_view(encode(key))
+    if seen[encoded] ?? false {
+        fail Malformed
+    }
+    seen[encoded] = true
+    let value = item(d)?
+    Entry { key, value }
+}
+
+fn simple(d: *Decoder, h: Head) -> Value ! io.Error {
+    if h.info < 20 {
+        return Simple(h.info)
+    }
+    if h.info == 20 || h.info == 21 {
+        return Bool(h.info == 21)
+    }
+    if h.info == 22 {
+        return Null
+    }
+    if h.info == 23 {
+        return Undefined
+    }
+    if h.info == 24 {
+        if h.argument < 32 {
+            fail Malformed
+        }
+        return Simple(u8(h.argument))
+    }
+    if h.info == 25 {
+        return Float(from_half(h.argument))
+    }
+    if h.info == 26 {
+        return Float(from_single(h.argument))
+    }
+    if h.info == 27 {
+        return Float(text.float_from_bits(h.argument))
+    }
+    fail Malformed
+}
+
+fn signed(sign: u64, magnitude: f64) -> f64 {
+    text.float_from_bits(sign | text.float_bits(magnitude))
+}
+
+fn from_half(h: u64) -> f64 {
+    let sign = h >> 15 << 63
+    let exponent = h >> 10 & 0x1F
+    let mantissa = h & 0x3FF
+    if exponent == 0 {
+        return signed(sign, f64(i64(mantissa)) * text.float_from_bits(999 << 52))
+    }
+    if exponent == 31 {
+        return text.float_from_bits(sign | 0x7FF0000000000000 | mantissa << 42)
+    }
+    text.float_from_bits(sign | (exponent + 1008) << 52 | mantissa << 42)
+}
+
+fn from_single(s: u64) -> f64 {
+    let sign = s >> 31 << 63
+    let exponent = s >> 23 & 0xFF
+    let mantissa = s & 0x7FFFFF
+    if exponent == 0 {
+        return signed(sign, f64(i64(mantissa)) * text.float_from_bits(874 << 52))
+    }
+    if exponent == 255 {
+        return text.float_from_bits(sign | 0x7FF0000000000000 | mantissa << 29)
+    }
+    text.float_from_bits(sign | (exponent + 896) << 52 | mantissa << 29)
+}
+
+fn valid_utf8(b: []u8) -> bool {
+    var i = 0
+    for i < b.len {
+        let c = b[i]
+        if c < 0x80 {
+            i += 1
+            continue
+        }
+        var need = 0
+        var low: u8 = 0x80
+        var high: u8 = 0xBF
+        if c >= 0xC2 && c <= 0xDF {
+            need = 1
+        } else if c >= 0xE0 && c <= 0xEF {
+            need = 2
+            if c == 0xE0 {
+                low = 0xA0
+            } else if c == 0xED {
+                high = 0x9F
+            }
+        } else if c >= 0xF0 && c <= 0xF4 {
+            need = 3
+            if c == 0xF0 {
+                low = 0x90
+            } else if c == 0xF4 {
+                high = 0x8F
+            }
+        } else {
+            return false
+        }
+        if i + need >= b.len {
+            return false
+        }
+        if b[i + 1] < low || b[i + 1] > high {
+            return false
+        }
+        for j in 2..need + 1 {
+            if b[i + j] < 0x80 || b[i + j] > 0xBF {
+                return false
+            }
+        }
+        i += need + 1
+    }
+    true
+}

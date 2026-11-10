@@ -1,0 +1,295 @@
+import std/base64
+import std/cbor
+import std/crypto/hash
+import std/json
+
+pub enum Error {
+    MalformedCredential(field: str)
+    IdMismatch
+    WrongCredentialType(found: str)
+    MalformedClientData
+    WrongClientDataType(found: str)
+    ChallengeMismatch
+    OriginMismatch(found: str)
+    MalformedAttestationObject
+    UnsupportedAttestation(format: str)
+    UnexpectedAttestationStatement
+    MalformedAuthenticatorData
+    RpIdHashMismatch
+    UserNotPresent
+    UserNotVerified
+    MissingCredentialData
+    InconsistentBackupFlags
+    MalformedPublicKey
+    UnsupportedAlgorithm(alg: i64)
+    BadSignature
+    SignCountRegression(received: i64, stored: i64)
+}
+
+pub struct Expected {
+    pub challenge: []u8
+    pub rp_id: str
+    pub origin: str
+    pub require_user_verification: bool = false
+}
+
+pub struct Registration {
+    pub credential_id: []u8
+    pub public_key: []u8
+    pub sign_count: i64
+    pub aaguid: []u8
+    pub user_verified: bool
+    pub multi_device: bool
+    pub backed_up: bool
+}
+
+pub struct Authentication {
+    pub credential_id: []u8
+    pub new_sign_count: i64
+    pub user_verified: bool
+    pub multi_device: bool
+    pub backed_up: bool
+}
+
+struct AuthenticatorData {
+    rp_id_hash: []u8
+    flags: u8
+    sign_count: i64
+    aaguid: []u8
+    credential_id: []u8
+    public_key: []u8
+}
+
+struct Credential {
+    raw_id: []u8
+    client_data: []u8
+    response: json.Value
+}
+
+fn property(v: json.Value, name: str) -> json.Value {
+    json.get(v, name) ?? json.Value.Null
+}
+
+fn text_field(v: json.Value, name: str) -> str ! Error {
+    match property(v, name) {
+        Str(s) => s
+        _ => fail MalformedCredential(name)
+    }
+}
+
+fn unpadded(s: str) -> []u8? {
+    var end = s.len
+    for end > 0 && s.len - end < 2 && s[end - 1] == '=' {
+        end -= 1
+    }
+    let data = base64.decode_url(s[..end]) catch {
+        _ => return none
+    }
+    data
+}
+
+fn binary_field(v: json.Value, name: str) -> []u8 ! Error {
+    let s = text_field(v, name)?
+    unpadded(s) ?? fail MalformedCredential(name)
+}
+
+fn credential(v: json.Value) -> Credential ! Error {
+    let id = text_field(v, "id")?
+    let raw_id = binary_field(v, "rawId")?
+    let response = property(v, "response")
+    match response {
+        Object(_) => {}
+        _ => fail MalformedCredential("response")
+    }
+    let client_data = binary_field(response, "clientDataJSON")?
+    let kind = text_field(v, "type")?
+    if base64.encode_url(raw_id) != id {
+        fail IdMismatch
+    }
+    if kind != "public-key" {
+        fail WrongCredentialType(kind)
+    }
+    Credential { raw_id, client_data, response }
+}
+
+fn client_text(v: json.Value, name: str) -> str ! Error {
+    match property(v, name) {
+        Str(s) => s
+        _ => fail MalformedClientData
+    }
+}
+
+fn check_client_data(data: []u8, kind: str, expected: Expected) ! Error {
+    let v = json.parse(data) catch {
+        _ => fail MalformedClientData
+    }
+    match v {
+        Object(_) => {}
+        _ => fail MalformedClientData
+    }
+    let found_kind = client_text(v, "type")?
+    let challenge_text = client_text(v, "challenge")?
+    let origin = client_text(v, "origin")?
+    let challenge = unpadded(challenge_text) ?? fail MalformedClientData
+    if found_kind != kind {
+        fail WrongClientDataType(found_kind)
+    }
+    if !hash.equal(challenge, expected.challenge) {
+        fail ChallengeMismatch
+    }
+    if origin != expected.origin {
+        fail OriginMismatch(origin)
+    }
+}
+
+fn flag(flags: u8, bit: u8) -> bool {
+    flags & bit != 0
+}
+
+fn parse_authenticator_data(data: []u8) -> AuthenticatorData ! Error {
+    if data.len < 37 {
+        fail MalformedAuthenticatorData
+    }
+    let flags = data[32]
+    var sign_count = 0
+    for b in data[33..37] {
+        sign_count = sign_count << 8 | i64(b)
+    }
+    var out = AuthenticatorData { rp_id_hash: data[..32], flags, sign_count, aaguid: [], credential_id: [], public_key: [] }
+    var at = 37
+    let limits = cbor.Options { max_depth: 16, max_length: data.len }
+    if flag(flags, 0x40) {
+        if data.len < at + 18 {
+            fail MalformedAuthenticatorData
+        }
+        out.aaguid = data[at..at + 16]
+        let length = i64(data[at + 16]) << 8 | i64(data[at + 17])
+        at += 18
+        if data.len < at + length {
+            fail MalformedAuthenticatorData
+        }
+        out.credential_id = data[at..at + length]
+        at += length
+        let key = cbor.decode_first(data[at..], limits) catch {
+            _ => fail MalformedAuthenticatorData
+        }
+        out.public_key = data[at..at + key.length]
+        at += key.length
+    }
+    if flag(flags, 0x80) {
+        let extensions = cbor.decode_first(data[at..], limits) catch {
+            _ => fail MalformedAuthenticatorData
+        }
+        at += extensions.length
+    }
+    if at != data.len {
+        fail MalformedAuthenticatorData
+    }
+    out
+}
+
+fn check_authenticator_data(a: AuthenticatorData, expected: Expected) ! Error {
+    let sha256 = hash.sha256()
+    let rp_id_hash = hash.sum(sha256, bytes(expected.rp_id))
+    if !hash.equal(a.rp_id_hash, rp_id_hash) {
+        fail RpIdHashMismatch
+    }
+    if !flag(a.flags, 0x01) {
+        fail UserNotPresent
+    }
+    if expected.require_user_verification && !flag(a.flags, 0x04) {
+        fail UserNotVerified
+    }
+}
+
+fn check_backup_flags(flags: u8) ! Error {
+    if flag(flags, 0x10) && !flag(flags, 0x08) {
+        fail InconsistentBackupFlags
+    }
+}
+
+fn attestation_text(v: cbor.Value, name: str) -> str ! Error {
+    match cbor.get(v, cbor.Value.Text(name)) ?? cbor.Value.Null {
+        Text(s) => s
+        _ => fail MalformedAttestationObject
+    }
+}
+
+fn attestation_auth_data(v: cbor.Value) -> []u8 ! Error {
+    match cbor.get(v, cbor.Value.Text("authData")) ?? cbor.Value.Null {
+        Bytes(data) => data
+        _ => fail MalformedAttestationObject
+    }
+}
+
+fn check_statement(v: cbor.Value) ! Error {
+    match cbor.get(v, cbor.Value.Text("attStmt")) ?? cbor.Value.Map([]) {
+        Map(entries) => if entries.len > 0 { fail UnexpectedAttestationStatement }
+        _ => fail UnexpectedAttestationStatement
+    }
+}
+
+pub fn verify_registration(credential_json: json.Value, expected: Expected) -> Registration ! Error {
+    let c = credential(credential_json)?
+    let attestation = binary_field(c.response, "attestationObject")?
+    check_client_data(c.client_data, "webauthn.create", expected)?
+    let limits = cbor.Options { max_depth: 16, max_length: attestation.len }
+    let object = cbor.decode_with(attestation, limits) catch {
+        _ => fail MalformedAttestationObject
+    }
+    match object {
+        Map(_) => {}
+        _ => fail MalformedAttestationObject
+    }
+    let format = attestation_text(object, "fmt")?
+    let authenticator_data = attestation_auth_data(object)?
+    let a = parse_authenticator_data(authenticator_data)?
+    check_authenticator_data(a, expected)?
+    if !flag(a.flags, 0x40) || a.credential_id.len == 0 {
+        fail MissingCredentialData
+    }
+    parse_public_key(a.public_key)?
+    if format != "none" {
+        fail UnsupportedAttestation(format)
+    }
+    check_statement(object)?
+    check_backup_flags(a.flags)?
+    Registration {
+        credential_id: a.credential_id
+        public_key: a.public_key
+        sign_count: a.sign_count
+        aaguid: a.aaguid
+        user_verified: flag(a.flags, 0x04)
+        multi_device: flag(a.flags, 0x08)
+        backed_up: flag(a.flags, 0x10)
+    }
+}
+
+pub fn verify_authentication(credential_json: json.Value, expected: Expected, public_key: []u8, sign_count: i64) -> Authentication ! Error {
+    let c = credential(credential_json)?
+    let authenticator_data = binary_field(c.response, "authenticatorData")?
+    let signature = binary_field(c.response, "signature")?
+    check_client_data(c.client_data, "webauthn.get", expected)?
+    let a = parse_authenticator_data(authenticator_data)?
+    check_authenticator_data(a, expected)?
+    if (a.sign_count > 0 || sign_count > 0) && a.sign_count <= sign_count {
+        fail SignCountRegression(a.sign_count, sign_count)
+    }
+    let key = parse_public_key(public_key)?
+    let sha256 = hash.sha256()
+    let client_hash = hash.sum(sha256, c.client_data)
+    let signed: []u8 = __make(authenticator_data.len + client_hash.len)
+    __memmove(signed, authenticator_data)
+    __memmove(signed[authenticator_data.len..], client_hash)
+    if !verify_signature(key, signed, signature) {
+        fail BadSignature
+    }
+    check_backup_flags(a.flags)?
+    Authentication {
+        credential_id: c.raw_id
+        new_sign_count: a.sign_count
+        user_verified: flag(a.flags, 0x04)
+        multi_device: flag(a.flags, 0x08)
+        backed_up: flag(a.flags, 0x10)
+    }
+}
