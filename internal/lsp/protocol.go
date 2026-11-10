@@ -160,14 +160,35 @@ type WorkspaceEdit struct {
 	Changes map[string][]TextEdit `json:"changes"`
 }
 
+type SignatureHelpOptions struct {
+	TriggerCharacters   []string `json:"triggerCharacters"`
+	RetriggerCharacters []string `json:"retriggerCharacters"`
+}
+
+type ParameterInformation struct {
+	Label [2]int `json:"label"`
+}
+
+type SignatureInformation struct {
+	Label      string                 `json:"label"`
+	Parameters []ParameterInformation `json:"parameters"`
+}
+
+type SignatureHelp struct {
+	Signatures      []SignatureInformation `json:"signatures"`
+	ActiveSignature int                    `json:"activeSignature"`
+	ActiveParameter int                    `json:"activeParameter"`
+}
+
 type Capabilities struct {
-	TextDocumentSync       SyncOptions       `json:"textDocumentSync"`
-	HoverProvider          bool              `json:"hoverProvider"`
-	DefinitionProvider     bool              `json:"definitionProvider"`
-	ReferencesProvider     bool              `json:"referencesProvider"`
-	RenameProvider         bool              `json:"renameProvider"`
-	DocumentSymbolProvider bool              `json:"documentSymbolProvider"`
-	CompletionProvider     CompletionOptions `json:"completionProvider"`
+	TextDocumentSync       SyncOptions          `json:"textDocumentSync"`
+	HoverProvider          bool                 `json:"hoverProvider"`
+	DefinitionProvider     bool                 `json:"definitionProvider"`
+	ReferencesProvider     bool                 `json:"referencesProvider"`
+	RenameProvider         bool                 `json:"renameProvider"`
+	DocumentSymbolProvider bool                 `json:"documentSymbolProvider"`
+	CompletionProvider     CompletionOptions    `json:"completionProvider"`
+	SignatureHelpProvider  SignatureHelpOptions `json:"signatureHelpProvider"`
 }
 
 type ServerInfo struct {

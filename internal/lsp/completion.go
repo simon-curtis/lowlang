@@ -36,7 +36,7 @@ var builtinConstants = []string{"true", "false", "none", "null"}
 
 var funcHeader = regexp.MustCompile(`^(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
 
-type completer struct {
+type cursor struct {
 	unit  *compiler.Unit
 	file  *ast.File
 	text  text
@@ -46,7 +46,7 @@ type completer struct {
 	seen  map[string]bool
 }
 
-func (c *completer) add(label string, kind int, detail string) {
+func (c *cursor) add(label string, kind int, detail string) {
 	if c.seen[label] {
 		return
 	}
@@ -54,7 +54,7 @@ func (c *completer) add(label string, kind int, detail string) {
 	c.items = append(c.items, CompletionItem{Label: label, Kind: kind, Detail: detail})
 }
 
-func (c *completer) complete() []CompletionItem {
+func (c *cursor) complete() []CompletionItem {
 	chain, member := c.receiver()
 	if member {
 		c.members(chain)
@@ -67,29 +67,37 @@ func (c *completer) complete() []CompletionItem {
 	return c.items
 }
 
-func (c *completer) receiver() ([]string, bool) {
+func (c *cursor) receiver() ([]string, bool) {
 	src := c.text.line(c.line)
 	at := min(c.col, len(src))
 	for at > 0 && isWord(src[at-1]) {
 		at--
 	}
+	if at == 0 || src[at-1] != '.' {
+		return nil, false
+	}
+	return chainBefore(src, at-1), true
+}
+
+func chainBefore(src string, end int) []string {
 	var chain []string
-	for at > 0 && src[at-1] == '.' {
-		end := at - 1
+	for {
 		start := end
 		for start > 0 && isWord(src[start-1]) {
 			start--
 		}
 		if start == end {
-			return nil, true
+			return chain
 		}
 		chain = append([]string{src[start:end]}, chain...)
-		at = start
+		if start == 0 || src[start-1] != '.' {
+			return chain
+		}
+		end = start - 1
 	}
-	return chain, len(chain) > 0
 }
 
-func (c *completer) files(module string) []*ast.File {
+func (c *cursor) files(module string) []*ast.File {
 	var files []*ast.File
 	if c.unit == nil {
 		return files
@@ -102,7 +110,7 @@ func (c *completer) files(module string) []*ast.File {
 	return files
 }
 
-func (c *completer) members(chain []string) {
+func (c *cursor) members(chain []string) {
 	if c.file == nil || len(chain) == 0 {
 		return
 	}
@@ -120,7 +128,7 @@ func (c *completer) members(chain []string) {
 	}
 }
 
-func (c *completer) moduleMembers(path string, rest []string) {
+func (c *cursor) moduleMembers(path string, rest []string) {
 	if len(rest) == 1 {
 		c.variants(path, rest[0])
 		return
@@ -133,7 +141,7 @@ func (c *completer) moduleMembers(path string, rest []string) {
 	}
 }
 
-func (c *completer) variants(module, name string) {
+func (c *cursor) variants(module, name string) {
 	for _, f := range c.files(module) {
 		for _, d := range f.Enums {
 			if d.Name != name {
@@ -146,7 +154,7 @@ func (c *completer) variants(module, name string) {
 	}
 }
 
-func (c *completer) fields(t *types.Type, path []string) {
+func (c *cursor) fields(t *types.Type, path []string) {
 	for _, name := range path {
 		if t == nil {
 			return
@@ -174,26 +182,29 @@ func (c *completer) fields(t *types.Type, path []string) {
 	}
 }
 
-func (c *completer) enclosing() *ast.Func {
-	if c.file == nil {
+func (c *cursor) headerLine() (int, string) {
+	for line := c.line; line >= 0; line-- {
+		if m := funcHeader.FindStringSubmatch(c.text.line(line)); m != nil {
+			return line, m[1]
+		}
+	}
+	return 0, ""
+}
+
+func (c *cursor) enclosing() *ast.Func {
+	_, name := c.headerLine()
+	if c.file == nil || name == "" {
 		return nil
 	}
-	for line := c.line; line >= 0; line-- {
-		m := funcHeader.FindStringSubmatch(c.text.line(line))
-		if m == nil {
-			continue
+	for _, f := range c.file.Funcs {
+		if f.Name == name && f.Template == nil && f.Closure == nil {
+			return f
 		}
-		for _, f := range c.file.Funcs {
-			if f.Name == m[1] && f.Template == nil && f.Closure == nil {
-				return f
-			}
-		}
-		return nil
 	}
 	return nil
 }
 
-func (c *completer) span(f *ast.Func) (int, int) {
+func (c *cursor) span(f *ast.Func) (int, int) {
 	end := math.MaxInt
 	var starts []lexer.Pos
 	for _, g := range c.file.Funcs {
@@ -218,7 +229,7 @@ func (c *completer) span(f *ast.Func) (int, int) {
 	return f.Pos.Line, end
 }
 
-func (c *completer) scope() []*ast.Local {
+func (c *cursor) scope() []*ast.Local {
 	f := c.enclosing()
 	if f == nil {
 		return nil
@@ -234,7 +245,7 @@ func (c *completer) scope() []*ast.Local {
 	return locals
 }
 
-func (c *completer) local(name string) *ast.Local {
+func (c *cursor) local(name string) *ast.Local {
 	var found *ast.Local
 	for _, l := range c.scope() {
 		if l.Name == name {
@@ -244,7 +255,7 @@ func (c *completer) local(name string) *ast.Local {
 	return found
 }
 
-func (c *completer) locals() {
+func (c *cursor) locals() {
 	locals := c.scope()
 	for i := len(locals) - 1; i >= 0; i-- {
 		l := locals[i]
@@ -256,7 +267,7 @@ func (c *completer) locals() {
 	}
 }
 
-func (c *completer) module() {
+func (c *cursor) module() {
 	if c.file == nil {
 		return
 	}
@@ -265,7 +276,7 @@ func (c *completer) module() {
 	}
 }
 
-func (c *completer) declarations(f *ast.File, public bool) {
+func (c *cursor) declarations(f *ast.File, public bool) {
 	for _, fn := range f.Funcs {
 		if fn.Template == nil && fn.Closure == nil && (fn.Pub || !public) {
 			c.add(fn.Name, completionFunction, signature(fn))
@@ -298,7 +309,7 @@ func (c *completer) declarations(f *ast.File, public bool) {
 	}
 }
 
-func (c *completer) imports() {
+func (c *cursor) imports() {
 	if c.file == nil {
 		return
 	}
@@ -307,7 +318,7 @@ func (c *completer) imports() {
 	}
 }
 
-func (c *completer) builtins() {
+func (c *cursor) builtins() {
 	for _, name := range builtinFuncs {
 		c.add(name, completionFunction, "builtin")
 	}

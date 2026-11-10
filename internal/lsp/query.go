@@ -390,6 +390,11 @@ func typeParamsText(params []*ast.TypeParam) string {
 }
 
 func signature(f *ast.Func) string {
+	head, params, tail := signatureParts(f)
+	return fmt.Sprintf("%s%s%s", head, strings.Join(params, ", "), tail)
+}
+
+func signatureParts(f *ast.Func) (string, []string, string) {
 	if f.Template != nil {
 		f = f.Template
 	}
@@ -416,10 +421,8 @@ func signature(f *ast.Func) string {
 	b.WriteString(f.Name)
 	b.WriteString(typeParamsText(f.TypeParams))
 	b.WriteString("(")
-	b.WriteString(strings.Join(params, ", "))
-	b.WriteString(")")
-	b.WriteString(resultText(f))
-	return b.String()
+	tail := fmt.Sprintf(")%s", resultText(f))
+	return b.String(), params, tail
 }
 
 func resultText(f *ast.Func) string {

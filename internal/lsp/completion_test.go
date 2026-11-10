@@ -17,8 +17,11 @@ func (f fixture) typeAfter(t *testing.T, needle, typed string) typing {
 	lines := strings.Split(f.src, "\n")
 	for i, line := range lines {
 		if strings.Contains(line, needle) {
-			inserted := slices.Insert(lines, i+1, typed)
-			return typing{text: strings.Join(inserted, "\n"), at: Position{Line: i + 1, Character: len(typed)}}
+			typedLines := strings.Split(typed, "\n")
+			inserted := slices.Insert(lines, i+1, typedLines...)
+			last := len(typedLines) - 1
+			at := Position{Line: i + 1 + last, Character: len(typedLines[last])}
+			return typing{text: strings.Join(inserted, "\n"), at: at}
 		}
 	}
 	t.Fatalf("%q not found in %s", needle, f.path)

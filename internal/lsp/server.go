@@ -131,6 +131,8 @@ func (s *Server) handle(req request) (bool, error) {
 		return false, s.position(req, s.definition)
 	case "textDocument/completion":
 		return false, s.position(req, s.completion)
+	case "textDocument/signatureHelp":
+		return false, s.position(req, s.signatureHelp)
 	case "textDocument/references":
 		var p ReferenceParams
 		if err := json.Unmarshal(req.Params, &p); err != nil {
@@ -174,6 +176,7 @@ func (s *Server) initialize() InitializeResult {
 			RenameProvider:         true,
 			DocumentSymbolProvider: true,
 			CompletionProvider:     CompletionOptions{TriggerCharacters: []string{"."}},
+			SignatureHelpProvider:  SignatureHelpOptions{TriggerCharacters: []string{"(", ","}, RetriggerCharacters: []string{","}},
 		},
 		ServerInfo: ServerInfo{Name: "low"},
 	}
@@ -354,10 +357,10 @@ func (s *Server) definition(p TextDocumentPositionParams) any {
 	return s.locate(tg)
 }
 
-func (s *Server) completion(p TextDocumentPositionParams) any {
+func (s *Server) cursorAt(p TextDocumentPositionParams) *cursor {
 	path := pathOf(p.TextDocument.URI)
 	t := s.text(path)
-	c := &completer{
+	return &cursor{
 		unit: s.units[s.entry(path)],
 		file: s.checked(path),
 		text: t,
@@ -365,8 +368,15 @@ func (s *Server) completion(p TextDocumentPositionParams) any {
 		col:  t.byteCol(p.Position.Line, p.Position.Character),
 		seen: map[string]bool{},
 	}
-	items := c.complete()
+}
+
+func (s *Server) completion(p TextDocumentPositionParams) any {
+	items := s.cursorAt(p).complete()
 	return CompletionList{Items: items}
+}
+
+func (s *Server) signatureHelp(p TextDocumentPositionParams) any {
+	return s.cursorAt(p).signatureHelp()
 }
 
 func (s *Server) locate(tg target) Location {
