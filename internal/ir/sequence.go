@@ -221,7 +221,7 @@ func (b *builder) make(elem *types.Type, n *Value) []*Value {
 func (b *builder) copySlice(e *ast.Call) *Value {
 	t := e.Args[0].TypeOf()
 	dst := b.value(e.Args[0], t)
-	src := b.value(e.Args[1], t)
+	src := b.value(e.Args[1], e.Args[1].TypeOf())
 	n := b.callNamed("__min", dst[1], src[1])[0]
 	stride := b.constant(int64(t.Elem.Stride()))
 	b.runtimeVoid("memmove", dst[0], src[0], b.emit(OpMul, n, stride))

@@ -44,7 +44,7 @@ func Check(path string, read func(name string) ([]byte, error)) (*Unit, error) {
 		return nil, err
 	}
 	files := append([]*ast.File{prelude}, modules.files...)
-	embeds, err := check.Check(files)
+	embeds, err := check.Check(files, stdFS)
 	if err != nil {
 		return nil, err
 	}
