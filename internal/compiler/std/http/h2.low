@@ -36,6 +36,8 @@ struct Peer {
     last: i64
     pending: i64
     settled: bool
+    outstanding: i64
+    failure: i64
     code: i64
     complete: fn(*Peer, *Exchange) ! io.Error
 }
@@ -63,6 +65,8 @@ fn new_peer(s: io.Stream, r: *io.Reader, server: bool, complete: fn(*Peer, *Exch
         last: 0
         pending: 0
         settled: false
+        outstanding: 0
+        failure: 0
         code: 0
         complete
     })
@@ -114,7 +118,7 @@ fn read_frame(p: *Peer) -> Frame ! io.Error {
     let head = io.read_exact(p.reader, 9)?
     let size = io.be24(head, 0)
     if size > 16384 {
-        fail protocol(p, 6)
+        fail TooLarge
     }
     let payload = io.read_exact(p.reader, size)?
     Frame { kind: i64(head[3]), flags: i64(head[4]), stream: io.be32(head, 5) & window_limit(), payload }
@@ -553,8 +557,77 @@ fn drive(p: *Peer, done: fn() -> bool) ! io.Error {
         if done() {
             return
         }
-        let f = read_frame(p)?
+        let f = read_frame(p) catch {
+            TooLarge => fail protocol(p, 6)
+            Eof => fail Eof
+            _ => fail Reset
+        }
         on_frame(p, f)?
+    }
+}
+
+struct Reply {
+    id: i64
+    method: str
+    response: Response
+}
+
+fn pump(p: *Peer, frames: chan[Frame]) {
+    for {
+        let f = read_frame(p) catch {
+            TooLarge => {
+                p.failure = 6
+                close(frames)
+                return
+            }
+            _ => {
+                close(frames)
+                return
+            }
+        }
+        frames <- f
+    }
+}
+
+fn respond(handler: fn(Request) -> Response, req: Request, id: i64, replies: chan[Reply]) {
+    replies <- Reply { id, method: req.method, response: handler(req) }
+}
+
+fn deliver(p: *Peer, reply: Reply) ! io.Error {
+    p.outstanding -= 1
+    let e = match p.exchanges[reply.id] {
+        some(e) => e
+        none => return
+    }
+    let resp = reply.response
+    var fields: []Header = [Header { name: ":status", value: "{resp.status}" }]
+    for h in resp.headers {
+        if !connection_specific(text.lower(h.name)) {
+            push(mut fields, h)
+        }
+    }
+    var body = resp.body
+    if bodiless(reply.method, resp.status) {
+        body = []
+    }
+    if !has_header(resp.headers, "content-length") {
+        push(mut fields, Header { name: "content-length", value: "{body.len}" })
+    }
+    queue(p, e, fields, body)?
+}
+
+fn on_input(p: *Peer, f: Frame?) -> bool ! io.Error {
+    match f {
+        some(frame) => {
+            on_frame(p, frame)?
+            true
+        }
+        none => {
+            if p.failure != 0 {
+                fail protocol(p, p.failure)
+            }
+            false
+        }
     }
 }
 
@@ -594,6 +667,7 @@ fn connection_specific(name: str) -> bool {
 }
 
 fn serve_h2(s: io.Stream, r: *io.Reader, handler: fn(Request) -> Response) ! io.Error {
+    let replies = chan[Reply](128)
     let complete = fn(p: *Peer, e: *Exchange) ! io.Error {
         let req = request_from(e) catch {
             _ => {
@@ -601,27 +675,36 @@ fn serve_h2(s: io.Stream, r: *io.Reader, handler: fn(Request) -> Response) ! io.
                 return
             }
         }
-        let resp = handler(req)
-        var fields: []Header = [Header { name: ":status", value: "{resp.status}" }]
-        for h in resp.headers {
-            if !connection_specific(text.lower(h.name)) {
-                push(mut fields, h)
-            }
-        }
-        var body = resp.body
-        if bodiless(req.method, resp.status) {
-            body = []
-        }
-        if !has_header(resp.headers, "content-length") {
-            push(mut fields, Header { name: "content-length", value: "{body.len}" })
-        }
-        queue(p, e, fields, body)?
+        p.outstanding += 1
+        spawn respond(handler, req, e.id, replies)
     }
     let p = new_peer(s, r, true, complete)
     var out: []u8 = []
     settings_frame(mut out, true)
     io.write_all(s, out)?
-    drive(p, fn() -> bool { false })?
+    let frames = chan[Frame](16)
+    spawn pump(p, frames)
+    var reading = true
+    for reading || p.outstanding > 0 {
+        flush(p)?
+        if !reading {
+            match <-replies {
+                some(reply) => deliver(p, reply)?
+                none => return
+            }
+            continue
+        }
+        select {
+            f = <-frames => {
+                reading = on_input(p, f)?
+            }
+            reply = <-replies => match reply {
+                some(x) => deliver(p, x)?
+                none => {}
+            }
+        }
+    }
+    flush(p)?
 }
 
 fn send_h2(s: io.Stream, req: Request) -> Response ! io.Error {
