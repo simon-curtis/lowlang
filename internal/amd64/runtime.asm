@@ -125,6 +125,12 @@ rt_pins:
 	.zero 524288
 rt_free_small:
 	.zero 512
+rt_arg_count:
+	.zero 8
+rt_arg_values:
+	.zero 8
+rt_env_values:
+	.zero 8
 
 	.text
 
@@ -431,6 +437,26 @@ rt_free_chunk:
 	mov [rdi+8], rax
 	mov [rcx], rdi
 	jmp rt_set_start
+
+	.globl rt_argc
+rt_argc:
+	mov rax, [rip+rt_arg_count]
+	ret
+
+	.globl rt_argv
+rt_argv:
+	mov rax, [rip+rt_arg_values]
+	mov rax, [rax+8*rdi]
+	ret
+
+	.globl rt_envv
+rt_envv:
+	mov rax, [rip+rt_env_values]
+	test rax, rax
+	jz 1f
+	mov rax, [rax+8*rdi]
+1:
+	ret
 
 	.globl rt_alloc
 rt_alloc:
