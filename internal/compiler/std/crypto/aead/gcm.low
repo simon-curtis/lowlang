@@ -1,0 +1,186 @@
+import std/io
+import std/crypto/hash
+
+struct Gcm {
+    cipher: *Aes
+    lo: []u64
+    hi: []u64
+    reduction: []u64
+}
+
+struct Ghash {
+    lo: u64
+    hi: u64
+}
+
+fn reverse4(i: i64) -> i64 {
+    (i & 1) << 3 | (i & 2) << 1 | (i & 4) >> 1 | (i & 8) >> 3
+}
+
+fn be64(b: []u8, at: i64) -> u64 {
+    u64(be32(b, at)) << 32 | u64(be32(b, at + 4))
+}
+
+fn put_be64(b: []u8, at: i64, v: u64) {
+    put_be32(b, at, u32(v >> 32))
+    put_be32(b, at + 4, u32(v))
+}
+
+fn gcm(cipher: *Aes) -> *Gcm {
+    let h: []u8 = __make(16)
+    encrypt_words(cipher, 0, 0, 0, 0, h, 0)
+    let lo: []u64 = __make(16)
+    let hi: []u64 = __make(16)
+    lo[reverse4(1)] = be64(h, 0)
+    hi[reverse4(1)] = be64(h, 8)
+    var i = 2
+    for i < 16 {
+        let half = reverse4(i / 2)
+        let carry = 0 - (hi[half] & 1)
+        let d = reverse4(i)
+        hi[d] = hi[half] >> 1 | lo[half] << 63
+        lo[d] = lo[half] >> 1 ^ 0xe100000000000000 & carry
+        let e = reverse4(i + 1)
+        lo[e] = lo[d] ^ lo[reverse4(1)]
+        hi[e] = hi[d] ^ hi[reverse4(1)]
+        i += 2
+    }
+    let reduction: []u64 = [
+        0x0000, 0x1c20, 0x3840, 0x2460, 0x7080, 0x6ca0, 0x48c0, 0x54e0,
+        0xe100, 0xfd20, 0xd940, 0xc560, 0x9180, 0x8da0, 0xa9c0, 0xb5e0,
+    ]
+    new(Gcm { cipher, lo, hi, reduction })
+}
+
+fn ghash_mul(g: *Gcm, y: *Ghash) {
+    let lo = g.lo
+    let hi = g.hi
+    let reduction = g.reduction
+    var z_lo: u64 = 0
+    var z_hi: u64 = 0
+    var word = y.hi
+    for half in 0..2 {
+        for _ in 0..16 {
+            let msw = z_hi & 0xf
+            z_hi = z_hi >> 4 | z_lo << 60
+            z_lo = z_lo >> 4 ^ reduction[msw] << 48
+            let n = word & 0xf
+            z_lo ^= lo[n]
+            z_hi ^= hi[n]
+            word >>= 4
+        }
+        word = y.lo
+    }
+    y.lo = z_lo
+    y.hi = z_hi
+}
+
+fn ghash(g: *Gcm, y: *Ghash, data: []u8) {
+    var at = 0
+    for at + 16 <= data.len {
+        y.lo ^= be64(data, at)
+        y.hi ^= be64(data, at + 8)
+        ghash_mul(g, y)
+        at += 16
+    }
+    if at < data.len {
+        let last: []u8 = __make(16)
+        __memmove(last, data[at..])
+        y.lo ^= be64(last, 0)
+        y.hi ^= be64(last, 8)
+        ghash_mul(g, y)
+    }
+}
+
+fn ghash_lengths(g: *Gcm, y: *Ghash, a: i64, c: i64) {
+    y.lo ^= u64(a) * 8
+    y.hi ^= u64(c) * 8
+    ghash_mul(g, y)
+}
+
+fn counter_block(g: *Gcm, nonce: []u8) -> []u8 {
+    let j0: []u8 = __make(16)
+    if nonce.len == 12 {
+        __memmove(j0, nonce)
+        j0[15] = 1
+        return j0
+    }
+    let y = new(Ghash { lo: 0, hi: 0 })
+    ghash(g, y, nonce)
+    ghash_lengths(g, y, 0, nonce.len)
+    put_be64(j0, 0, y.lo)
+    put_be64(j0, 8, y.hi)
+    j0
+}
+
+fn ctr(g: *Gcm, j0: []u8, src: []u8, dst: []u8) {
+    let c = g.cipher
+    let x0 = be32(j0, 0)
+    let x1 = be32(j0, 4)
+    let x2 = be32(j0, 8)
+    var counter = be32(j0, 12)
+    let stream: []u8 = __make(16)
+    var at = 0
+    for at < src.len {
+        counter += 1
+        encrypt_words(c, x0, x1, x2, counter, stream, 0)
+        let n = if src.len - at < 16 { src.len - at } else { 16 }
+        for i in 0..n {
+            dst[at + i] = src[at + i] ^ stream[i]
+        }
+        at += 16
+    }
+}
+
+fn gcm_tag(g: *Gcm, j0: []u8, ciphertext: []u8, aad: []u8) -> []u8 {
+    let y = new(Ghash { lo: 0, hi: 0 })
+    ghash(g, y, aad)
+    ghash(g, y, ciphertext)
+    ghash_lengths(g, y, aad.len, ciphertext.len)
+    let tag: []u8 = __make(16)
+    encrypt_words(g.cipher, be32(j0, 0), be32(j0, 4), be32(j0, 8), be32(j0, 12), tag, 0)
+    let s: []u8 = __make(16)
+    put_be64(s, 0, y.lo)
+    put_be64(s, 8, y.hi)
+    for i in 0..16 {
+        tag[i] ^= s[i]
+    }
+    tag
+}
+
+fn gcm_seal(g: *Gcm, nonce: []u8, plaintext: []u8, aad: []u8) -> []u8 {
+    let j0 = counter_block(g, nonce)
+    let out: []u8 = __make(plaintext.len + 16)
+    let body = out[..plaintext.len]
+    ctr(g, j0, plaintext, body)
+    let tag = gcm_tag(g, j0, body, aad)
+    __memmove(out[plaintext.len..], tag)
+    out
+}
+
+fn gcm_open(g: *Gcm, nonce: []u8, sealed: []u8, aad: []u8) -> []u8 ! io.Error {
+    if sealed.len < 16 {
+        fail io.Error.Invalid
+    }
+    let n = sealed.len - 16
+    let j0 = counter_block(g, nonce)
+    let body = sealed[..n]
+    let expected = gcm_tag(g, j0, body, aad)
+    if !hash.equal(expected, sealed[n..]) {
+        fail io.Error.Invalid
+    }
+    let out: []u8 = __make(n)
+    ctr(g, j0, body, out)
+    out
+}
+
+pub fn aes_gcm(key: []u8) -> Aead ! io.Error {
+    let g = gcm(aes(key)?)
+    Aead {
+        key_size: key.len
+        nonce_size: 12
+        tag_size: 16
+        seal: fn(nonce, plaintext, aad) { gcm_seal(g, nonce, plaintext, aad) }
+        open: fn(nonce, sealed, aad) { gcm_open(g, nonce, sealed, aad) }
+    }
+}
