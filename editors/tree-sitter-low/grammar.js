@@ -317,6 +317,7 @@ module.exports = grammar({
     integer: _ => token(choice(
       /0x[0-9A-Fa-f_]+/,
       /0b[01_]+/,
+      /0o[0-7_]+/,
       /[0-9][0-9_]*/,
     )),
 

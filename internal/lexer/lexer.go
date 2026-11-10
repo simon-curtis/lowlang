@@ -171,7 +171,7 @@ func (l *Lexer) ident(start Pos) error {
 func (l *Lexer) number(start Pos) {
 	from := l.off
 	kind := Int
-	if l.peek(0) == '0' && (l.peek(1) == 'x' || l.peek(1) == 'b') {
+	if l.peek(0) == '0' && (l.peek(1) == 'x' || l.peek(1) == 'b' || l.peek(1) == 'o') {
 		l.advance()
 		l.advance()
 		l.digits(isHexDigit)
