@@ -174,7 +174,7 @@ func (b *builder) cStruct(e *ast.StructLit) []*Value {
 		b.store(place{addr: slot, offset: 8 * k}, []*Value{zero})
 	}
 	for _, init := range e.Fields {
-		at := place{addr: slot, offset: init.Field.Bytes, scalar: init.Field.Type.Width()}
+		at := place{addr: slot, offset: init.Field.Bytes, scalar: init.Field.Type.Width(), tail: init.Field.Type.Tail()}
 		b.store(at, b.value(init.Value, init.Field.Type))
 	}
 	return b.load(place{addr: slot}, e.Type)
@@ -184,7 +184,7 @@ func (b *builder) cField(e *ast.Selector) []*Value {
 	words := b.value(e.X, e.X.TypeOf())
 	slot := b.slot(len(words))
 	b.store(place{addr: slot}, words)
-	return b.load(place{addr: slot, offset: e.Field.Bytes, scalar: e.Field.Type.Width()}, e.Type)
+	return b.load(place{addr: slot, offset: e.Field.Bytes, scalar: e.Field.Type.Width(), tail: e.Field.Type.Tail()}, e.Type)
 }
 
 func (b *builder) slot(words int) *Value {
@@ -202,11 +202,11 @@ func (b *builder) pointerBuiltin(e *ast.Call) ([]*Value, bool) {
 		return []*Value{b.word(arg), n, n}, true
 	case "load":
 		elem := e.Type
-		return b.load(place{addr: b.word(arg), scalar: elem.Width()}, elem), true
+		return b.load(place{addr: b.word(arg), scalar: elem.Width(), tail: elem.Tail()}, elem), true
 	case "store":
 		elem := e.Args[1].TypeOf()
 		ptr := b.word(arg)
-		b.store(place{addr: ptr, scalar: elem.Width()}, b.value(e.Args[1], elem))
+		b.store(place{addr: ptr, scalar: elem.Width(), tail: elem.Tail()}, b.value(e.Args[1], elem))
 		return nil, true
 	case "cstr":
 		return b.callNamed("__cstr", b.value(arg, types.Str)...), true

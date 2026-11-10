@@ -28,6 +28,7 @@ type Parser struct {
 	tokens   []lexer.Token
 	i        int
 	noStruct bool
+	testing  bool
 	prelude  bool
 }
 
@@ -300,6 +301,14 @@ func (p *Parser) structDecl() *ast.StructDecl {
 	d := &ast.StructDecl{Name: p.expect(lexer.Ident).Text, Pos: pos}
 	d.TypeParams = p.typeParams()
 	p.lines(func() {
+		if t := p.tok(); t.Kind == lexer.Drop {
+			p.next()
+			if d.Drop != nil {
+				p.fail(t.Pos, "struct %s already has a drop", d.Name)
+			}
+			d.Drop = p.stmt()
+			return
+		}
 		pub := p.at(lexer.Pub)
 		if pub {
 			p.next()
@@ -600,6 +609,15 @@ func (p *Parser) stmt() ast.Stmt {
 	switch t.Kind {
 	case lexer.Let, lexer.Var:
 		return p.let()
+	case lexer.Using:
+		p.next()
+		mutable := p.at(lexer.Var)
+		if mutable {
+			p.next()
+		}
+		s := p.binding(t.Pos, mutable)
+		s.Using = true
+		return s
 	case lexer.For:
 		p.next()
 		if p.at(lexer.Ident) && (p.peek() == lexer.In || p.peek() == lexer.Comma) {
@@ -668,6 +686,10 @@ func (p *Parser) forIn(pos lexer.Pos) *ast.ForIn {
 
 func (p *Parser) let() *ast.Let {
 	t := p.next()
+	return p.binding(t.Pos, t.Kind == lexer.Var)
+}
+
+func (p *Parser) binding(pos lexer.Pos, mutable bool) *ast.Let {
 	name := p.expect(lexer.Ident).Text
 	var typeName *ast.TypeName
 	if p.at(lexer.Colon) {
@@ -675,7 +697,7 @@ func (p *Parser) let() *ast.Let {
 		typeName = p.typeName()
 	}
 	p.expect(lexer.Assign)
-	return &ast.Let{Name: name, Mutable: t.Kind == lexer.Var, TypeName: typeName, Value: p.expr(), Pos: t.Pos}
+	return &ast.Let{Name: name, Mutable: mutable, TypeName: typeName, Value: p.expr(), Pos: pos}
 }
 
 var precedence = map[lexer.Kind]int{
@@ -692,7 +714,10 @@ func (p *Parser) expr() ast.Expr {
 }
 
 func (p *Parser) binary(minPrec int) ast.Expr {
-	x := p.unary()
+	return p.binaryFrom(p.unary(), minPrec)
+}
+
+func (p *Parser) binaryFrom(x ast.Expr, minPrec int) ast.Expr {
 	for {
 		op := p.tok()
 		prec, ok := precedence[op.Kind]
@@ -711,6 +736,9 @@ func (p *Parser) binary(minPrec int) ast.Expr {
 
 func (p *Parser) unary() ast.Expr {
 	t := p.tok()
+	if p.testing && precedence[t.Kind] > 0 && t.Kind != lexer.Minus && t.Kind != lexer.Star {
+		return p.binaryFrom(&ast.Subject{Pos: t.Pos}, precedence[lexer.Eq])
+	}
 	switch t.Kind {
 	case lexer.Minus:
 		p.next()
@@ -1027,11 +1055,22 @@ func (p *Parser) catch(x ast.Expr, pos lexer.Pos) *ast.Catch {
 
 func (p *Parser) arms() []*ast.Arm {
 	var arms []*ast.Arm
-	p.lines(func() {
-		pattern := p.pattern()
-		p.expect(lexer.FatArrow)
-		arms = append(arms, &ast.Arm{Pattern: pattern, Body: p.armBody()})
+	p.expect(lexer.LBrace)
+	p.nested(func() {
+		p.skipNewlines()
+		for !p.at(lexer.RBrace) {
+			pattern := p.pattern()
+			p.expect(lexer.FatArrow)
+			arms = append(arms, &ast.Arm{Pattern: pattern, Body: p.armBody()})
+			if p.at(lexer.Comma) {
+				p.next()
+			} else if !p.at(lexer.RBrace) {
+				p.expect(lexer.Newline)
+			}
+			p.skipNewlines()
+		}
 	})
+	p.expect(lexer.RBrace)
 	return arms
 }
 
@@ -1044,6 +1083,12 @@ func (p *Parser) armBody() ast.Expr {
 }
 
 func (p *Parser) pattern() *ast.Pattern {
+	if t := p.tok(); precedence[t.Kind] > 0 {
+		p.testing = true
+		test := p.binaryFrom(&ast.Subject{Pos: t.Pos}, 0)
+		p.testing = false
+		return &ast.Pattern{Test: test, Pos: t.Pos}
+	}
 	name := p.expect(lexer.Ident)
 	pat := &ast.Pattern{Name: name.Text, Pos: name.Pos}
 	if !p.at(lexer.LParen) {

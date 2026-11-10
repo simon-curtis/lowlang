@@ -23,6 +23,7 @@ type place struct {
 	addr   *Value
 	offset int
 	scalar *types.Type
+	tail   int
 }
 
 type builder struct {
@@ -37,6 +38,7 @@ type builder struct {
 	loops    []loopTarget
 	temps    int
 	defers   [][]ast.Stmt
+	subjects [][]*Value
 }
 
 func Build(files []*ast.File) *Program {
@@ -351,19 +353,20 @@ func (b *builder) bind(local *ast.Local, words []*Value) {
 func (b *builder) place(p *ast.Place) place {
 	switch {
 	case p.Ptr != nil:
-		return place{addr: b.word(p.Ptr), offset: p.Offset, scalar: p.Width}
+		return place{addr: b.word(p.Ptr), offset: p.Offset, scalar: p.Width, tail: p.Tail}
 	case p.Index != nil:
 		element := b.element(p.Index)
 		element.offset += p.Offset
+		element.tail = p.Tail
 		if p.Width != nil {
 			element.scalar = p.Width
 		}
 		return element
 	case p.Local.Ref:
-		return place{addr: b.refs[p.Local], offset: p.Offset, scalar: p.Width}
+		return place{addr: b.refs[p.Local], offset: p.Offset, scalar: p.Width, tail: p.Tail}
 	}
 	if slot, ok := b.slots[p.Local]; ok {
-		return place{addr: slot, offset: p.Offset, scalar: p.Width}
+		return place{addr: slot, offset: p.Offset, scalar: p.Width, tail: p.Tail}
 	}
 	return place{local: p.Local, word: p.Offset / 8}
 }
@@ -375,6 +378,10 @@ func (b *builder) load(p place, t *types.Type) []*Value {
 			words[k] = b.read(varKey{local: p.local, word: p.word + k}, b.cur)
 			continue
 		}
+		if p.tail != 0 && k == len(words)-1 {
+			words[k] = b.loadTail(p.addr, p.offset+8*k, p.tail)
+			continue
+		}
 		v := b.typed(OpLoad, p.scalar, p.addr)
 		v.Aux = int64(p.offset + 8*k)
 		v.Scalar = !t.PointerWords()[k]
@@ -383,10 +390,57 @@ func (b *builder) load(p place, t *types.Type) []*Value {
 	return words
 }
 
+var tailWidths = []struct {
+	bytes int
+	width *types.Type
+}{{4, types.U32}, {2, types.U16}, {1, types.U8}}
+
+func (b *builder) loadTail(addr *Value, offset, tail int) *Value {
+	var acc *Value
+	at := 0
+	for _, part := range tailWidths {
+		if tail-at < part.bytes {
+			continue
+		}
+		v := b.typed(OpLoad, part.width, addr)
+		v.Aux = int64(offset + at)
+		if at > 0 {
+			v = b.typed(OpShl, types.I64, v, b.constant(int64(8*at)))
+		}
+		if acc == nil {
+			acc = v
+		} else {
+			acc = b.typed(OpOr, types.I64, acc, v)
+		}
+		at += part.bytes
+	}
+	return acc
+}
+
+func (b *builder) storeTail(addr *Value, offset, tail int, word *Value) {
+	at := 0
+	for _, part := range tailWidths {
+		if tail-at < part.bytes {
+			continue
+		}
+		v := word
+		if at > 0 {
+			v = b.typed(OpShr, types.I64, word, b.constant(int64(8*at)))
+		}
+		store := b.typed(OpStore, part.width, addr, v)
+		store.Aux = int64(offset + at)
+		at += part.bytes
+	}
+}
+
 func (b *builder) store(p place, words []*Value) {
 	for k, w := range words {
 		if p.addr == nil {
 			b.write(varKey{local: p.local, word: p.word + k}, b.cur, w)
+			continue
+		}
+		if p.tail != 0 && k == len(words)-1 {
+			b.storeTail(p.addr, p.offset+8*k, p.tail, w)
 			continue
 		}
 		v := b.typed(OpStore, p.scalar, p.addr, w)
@@ -455,6 +509,13 @@ func (b *builder) stmt(s ast.Stmt) {
 	switch s := s.(type) {
 	case *ast.Let:
 		b.bind(s.Local, b.value(s.Value, s.Local.Type))
+		if s.Flag != nil {
+			b.bind(s.Flag, []*Value{b.constant(1)})
+		}
+		if s.Release != nil {
+			top := len(b.defers) - 1
+			b.defers[top] = append(b.defers[top], s.Release)
+		}
 	case *ast.Assign:
 		b.assign(s)
 	case *ast.ExprStmt:
@@ -525,12 +586,22 @@ func (b *builder) assign(s *ast.Assign) {
 		source = s.Value.TypeOf()
 	}
 	words := b.value(s.Value, source)
+	if s.Release != nil {
+		b.stmt(s.Release)
+	}
 	p := b.place(s.Place)
 	if op, ok := arith[s.Op]; ok {
 		old := b.load(p, t)[0]
 		words = []*Value{b.typed(op, t, old, b.pad(words, 1)[0])}
 	}
 	b.store(p, b.fit(t, words))
+	if s.Flag != nil {
+		b.setFlag(s.Flag, 1)
+	}
+}
+
+func (b *builder) setFlag(flag *ast.Local, live int64) {
+	b.store(b.place(&ast.Place{Local: flag}), []*Value{b.constant(live)})
 }
 
 func (b *builder) forStmt(s *ast.For) {
@@ -586,9 +657,11 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		}
 		p, _ := ast.PlaceOf(e)
 		if p == nil {
-			p = &ast.Place{Index: e}
+			p = &ast.Place{Index: e, Tail: e.Type.Tail()}
 		}
 		return b.load(b.place(p), e.Type)
+	case *ast.Receiver:
+		return b.expr(e.X)
 	case *ast.Slicing:
 		return b.slicing(e)
 	case *ast.SliceLit:
@@ -607,7 +680,11 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		if e.Func != nil {
 			return b.funcValue(e.Func, e.Type)
 		}
-		return b.load(b.place(&ast.Place{Local: e.Local}), e.Type)
+		words := b.load(b.place(&ast.Place{Local: e.Local}), e.Type)
+		if e.Moved {
+			b.setFlag(e.Local.Flag, 0)
+		}
+		return words
 	case *ast.Selector:
 		if e.Func != nil {
 			return b.funcValue(e.Func, e.Type)
@@ -638,6 +715,8 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		return b.dispatch(e.Arms, b.value(e.X, e.X.TypeOf()), e.Type)
 	case *ast.Select:
 		return b.selectExpr(e)
+	case *ast.Subject:
+		return b.subjects[len(b.subjects)-1]
 	case *ast.Try:
 		return b.try(e)
 	case *ast.Catch:
@@ -913,12 +992,12 @@ func (b *builder) dispatch(arms []*ast.Arm, subject []*Value, result *types.Type
 	for i, arm := range arms {
 		targets[i] = b.newBlock()
 		last := i == len(arms)-1
-		if arm.Pattern.Variant == nil || last {
+		if (arm.Pattern.Variant == nil && arm.Pattern.Test == nil) || last {
 			b.jump(targets[i])
 			break
 		}
 		next := b.newBlock()
-		match := b.emit(OpEq, subject[0], b.constant(int64(arm.Pattern.Variant.Tag)))
+		match := b.armMatches(arm.Pattern, subject)
 		b.branch(match, targets[i], next)
 		b.enter(next)
 	}
@@ -933,6 +1012,16 @@ func (b *builder) dispatch(arms []*ast.Arm, subject []*Value, result *types.Type
 	}
 	b.enter(done)
 	return b.readTemp(temp, result.Size())
+}
+
+func (b *builder) armMatches(p *ast.Pattern, subject []*Value) *Value {
+	if p.Test == nil {
+		return b.emit(OpEq, subject[0], b.constant(int64(p.Variant.Tag)))
+	}
+	b.subjects = append(b.subjects, subject)
+	match := b.word(p.Test)
+	b.subjects = b.subjects[:len(b.subjects)-1]
+	return match
 }
 
 func (b *builder) bindPattern(p *ast.Pattern, subject []*Value) {

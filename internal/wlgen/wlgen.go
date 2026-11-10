@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"lowlang/internal/lexer"
 )
 
 type Protocol struct {
@@ -45,10 +47,7 @@ type Entry struct {
 }
 
 var reserved = map[string]bool{
-	"fn": true, "let": true, "var": true, "if": true, "else": true, "for": true, "break": true, "continue": true,
-	"return": true, "true": true, "false": true, "enum": true, "match": true, "fail": true, "catch": true,
-	"struct": true, "mut": true, "in": true, "import": true, "pub": true, "extern": true, "defer": true,
-	"spawn": true, "select": true, "str": true, "ptr": true, "print": true, "new": true, "null": true,
+	"str": true, "ptr": true, "print": true, "new": true, "null": true,
 	"none": true, "some": true, "chan": true, "close": true, "sleep": true,
 }
 
@@ -124,7 +123,7 @@ func (g *generator) line(format string, args ...any) {
 }
 
 func ident(name string) string {
-	if reserved[name] {
+	if reserved[name] || lexer.IsKeyword(name) {
 		return fmt.Sprintf("%s_", name)
 	}
 	return name

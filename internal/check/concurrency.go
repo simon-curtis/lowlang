@@ -58,7 +58,7 @@ func (c *Checker) makeChan(e *ast.Call, inst *ast.Instance) {
 		c.integer(e.Args[0])
 	}
 	e.Builtin = "chan"
-	e.Type = c.chanOf(c.resolve(inst.Types[0]))
+	e.Type = c.chanOf(c.contained(inst.Types[0], "a channel"))
 }
 
 func (c *Checker) send(s *ast.Send) {

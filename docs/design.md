@@ -43,12 +43,20 @@ let twice = fn(x: i64) -> i64 { x * 2 }
 let ops: [str: fn(i64) -> i64] = ["twice": twice, "negate": negate]
 let parse: fn(str) -> i64 ! ParseError = parse_int
 let square: fn(i64) -> i64 = fn(x) { x * x }
+
+fn first(s: str) -> u8 {
+    s[0]
+}
+
+"simon".first()
+items.push(4)
 ```
 
 - A function type is written `fn(i64, mut str) -> bool`, with `! E` for a result that can fail. Two function types are the same when their parameters, `mut` markers and results are.
 - A named function is a value of its function type. `fn(params) -> R { body }` is a closure; parameter and result types may be left out when the expected function type supplies them, and a closure with no written result and no expected type returns nothing.
 - A closure captures the variables it names by reference, as Go does: it reads and assigns the variable itself, and the variable lives as long as any closure holding it. Each loop iteration binds fresh variables, so closures made in different iterations see different ones. A `mut` parameter cannot be captured.
 - A function value is called like a function. Values of function type can be stored in variables, fields, slices and maps, passed and returned; they cannot be compared or printed.
+- `x.f(args)` calls `f(x, args)`, so calls chain left to right: `"ab".repeat(3).first()`. `f` is any function callable by its plain name: a function in the current module, a function value in scope, a generic function or a builtin. A struct field of function type named `f` takes precedence, so `op.apply(v)` calls the stored function. When the first parameter is `mut`, `x` is passed as `mut` and must be a mutable place.
 
 ### Control flow
 
@@ -258,6 +266,18 @@ fn area(s: Shape) -> f64 {
 ```
 
 - `match` must cover every variant, or end with `_`. Arms after `_` and duplicate arms are errors.
+- An arm that starts with a binary operator tests the subject: `% 3 == 0 => ...` means `subject % 3 == 0`, with the subject on the left and ordinary precedence after it. The subject is evaluated once and arms are tried in order. Such tests work on a subject of any type, including enums (`== Empty`) and the error of a `catch`; a `match` that uses one, or whose subject is not an enum, must end with `_`. Arms are separated by newlines or commas.
+
+```low
+fn classify(n: i64) -> str {
+    match n {
+        % 15 == 0 => "FizzBuzz",
+        % 3 == 0 => "Fizz",
+        % 5 == 0 => "Buzz",
+        _ => "number"
+    }
+}
+```
 - Patterns bind fields by position; `_` ignores a field, and a bare variant name ignores all of them.
 - An arm body is an expression, or `break`, `continue`, `return` or `fail`.
 - Variants are constructed as `Shape.Circle(2)`. Where the expected type is known (an annotated `let`, an argument, an assignment, a return, `fail`), the bare name works: `let s: Shape = Empty`.
@@ -365,8 +385,8 @@ extern struct DivT {
     rem: i32
 }
 
-let buf: ptr[u8] = malloc(64)
-defer free(buf)
+using block = Block[u8] { data: malloc(64) }
+let buf = block.data
 snprintf(buf, 64, cstr("%d-%.2f"), 42, 3.14159)
 print(str(buf))
 var end: ptr = null
@@ -411,6 +431,48 @@ defer {
 
 - `defer` runs a statement when its enclosing block exits: at the end of the block, on `return`, `fail` or a propagated `?`, and when `break` or `continue` leaves it. Deferred statements of a block run last first.
 - The statement runs at exit and sees variables as they are then. It cannot `return`, `fail`, use `?`, `break`, `continue` or contain another `defer`.
+
+### Using
+
+```low
+struct File {
+    fd: i32
+    drop close(fd)
+}
+
+struct Conn {
+    sock: i32
+    buf: Block[u8]
+    drop {
+        flush(sock)
+        close(sock)
+    }
+}
+
+struct Block[T] {
+    data: ptr[T]
+    drop free(data)
+}
+
+using f = open_file("config.low")
+using c = connect(addr)?
+using var current = open_file("a")
+current = open_file("b")
+```
+
+- `drop <stmt>` inside a struct body declares its cleanup, with the struct's fields in scope as borrowed values. Like `defer`, it takes one statement or a `{ }` block. A struct has at most one `drop`, and `using` cannot appear in it.
+- A struct with a `drop` is droppable, and so is a struct with a droppable field, even without its own `drop`. Releasing a value runs its own `drop` first, then releases its droppable fields in declaration order. Generic instances are droppable per instance: `Pair[File, i64]` is, `Pair[i64, i64]` is not.
+- `using x = expr` binds `x` and releases it when the enclosing block exits by any path: the end of the block, `return`, `fail`, `?`, `break` or `continue`, last first together with `defer`. `using var x = expr` can be reassigned; assignment releases the old value, and exit releases the value it holds then. `using` cannot appear inside `defer`, and binding a non-droppable value with it is an error.
+- A droppable value cannot be bound with `let` or `var`: "File has drop; bind it with using". Results of droppable types are unwrapped with `?` or `catch` straight into a `using` binding.
+- Droppable values are move-only:
+  - `return x`, or a function body ending in `x`, moves a `using` binding out; the caller owns the value and must bind it with `using`.
+  - A struct literal field or an assignment to a field of a droppable value moves the value into it, and the outer value releases it. A field is assigned through a `using var` binding or a `mut` parameter; the old value of the field is released first.
+  - `using y = x` moves `x` into `y`.
+  - Passing a value as an argument borrows it: the callee cannot release it, store it or return it. A value that has just been produced, such as a call result or a struct literal, must be bound with `using` before it is passed.
+  - Any other copy is an error: binding it with `let`, storing it in a slice, map, channel, optional, pointer or enum variant, moving a field out of its struct, discarding a call result, or capturing it in a closure.
+  - Using a binding after it was moved is an error, and so is using one that may have been moved on one branch or by an earlier loop iteration.
+- Generic code is checked under these rules for each instance whose type arguments are droppable, so `fn same[T](x: T) -> T { x }` cannot be instantiated with `File`.
+- Each `using` binding has a hidden flag that a move clears; the release at exit runs only while the flag is set, so a value moved on one branch is released exactly once.
 
 ### Modules
 
@@ -590,8 +652,9 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Integer division carries its zero and overflow checks inside the instruction.
 - A call to a C function becomes a `ccall` carrying its System V AMD64 plan. Each argument word is classified: integers, `bool` and pointers take `rdi`, `rsi`, `rdx`, `rcx`, `r8` and `r9`; floats take `xmm0` to `xmm7`; an `extern struct` of at most 16 bytes is split into eightbytes that go to vector registers when every field in them is a float and to integer registers otherwise; a larger struct, or one that does not fit in the registers still free, goes on the stack. Variadic `f32` arguments are widened to `f64`, and `al` holds the number of vector registers used. A struct result of at most 16 bytes comes back in `rax`, `rdx`, `xmm0` and `xmm1` by class; a larger one is written to a buffer whose address goes in `rdi`. Narrow integer, `bool` and `f32` results are re-extended, and so are narrow places passed as `mut` once the call returns.
 - Every frame keeps `rsp` 16-byte aligned at its calls, as C requires: frames are rounded to 16 bytes, and `_start` rounds the space it reserves for `main`'s result.
-- An `extern struct` value is its C bytes, one word per eightbyte. Its locals and parameters live in frame slots; a field is loaded or stored at its own width, and a struct literal or a field of a computed value goes through a temporary slot.
+- An `extern struct` value is its C bytes, one word per eightbyte. Its locals and parameters live in frame slots; a field is loaded or stored at its own width, and a struct literal or a field of a computed value goes through a temporary slot. A struct whose size is not a multiple of 8 is stored and loaded up to its last byte, with 4-, 2- and 1-byte accesses for the final partial word, so writing a nested field or an element of a `view` never touches the bytes after it.
 - `defer` keeps a stack of deferred statements per block and lowers them again at every exit from that block.
+- A struct's `drop` becomes a function `T..drop` whose parameters are the struct's fields, and every droppable type gets a generated `T..release` that calls it and then the releases of its droppable fields. A `using` binding adds a deferred `if flag { T..release(x) }` to its block; a move reads the value and clears the flag. Moves are found by a flow-sensitive pass over each checked function body, which joins moved states across branches and runs a loop body a second time when an iteration moves a binding.
 - `==` on a struct is the conjunction of its fields' comparisons. On an enum it compares tags, then branches on the tag to compare only that variant's fields, since the other payload words are undefined. An `extern struct` is stored in two frame slots and compared field by field at each field's offset and width, so padding is ignored.
 - A LowLang function value is two words: a code address and an environment pointer. Code reached through a function value takes the environment as parameter word 0. A closure is checked in place and becomes a function named after its parent, such as `counter..c1`; its environment is a heap array holding a box pointer per captured variable, or 0 when it captures none. A captured variable lives in a heap box allocated when it is bound, and every access, in its own function and in closures, loads and stores through the box. A named function used as a value goes through an adapter, `name..value`, which drops the environment and calls it.
 - A call through a function value moves the code address to `r10` and calls it, passing the environment and the arguments like any call. A call through an `extern fn` value is a `ccall` with the same System V plan as a named C function.
@@ -664,7 +727,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 
 - Types: `i64`, `i32`, `u32`, `u16`, `u8`, `f64`, `f32`, `bool`, `str`, slices `[]T`, maps `[K: V]`, structs, enums with payloads, results `T ! E`, pointers `*T`.
 - `let`, `var`, assignment, `if`/`else`, `for cond`, `for` with `break`/`continue`, `return`.
-- Functions with parameters and return values, recursion.
+- Functions with parameters and return values, recursion, and `x.f(args)` calls passing `x` as the first argument.
 - Arithmetic, comparison, logical, bitwise and shift operators; numeric conversions; `sqrt`, `floor` and `exp`.
 - `match`, `fail`, `?`, `catch`.
 - Optionals `T?` with `none`, `some`, `??` and implicit wrapping.
@@ -677,7 +740,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - `embed` for compile-time file contents.
 - `extern` blocks naming C libraries and declaring their functions, and dynamic linking against libc when any is named.
 - C interop: System V calls, `extern struct`, `ptr` and `ptr[T]`, `view`, `load`, `store`, `cstr`, `str(p)`, `pin` and `unpin`.
-- `defer`.
+- `defer`, and droppable structs with `drop` and move-only `using` bindings.
 - Generic functions, structs and enums with built-in constraints, compiled per type; maps built on generic prelude code.
 - Structural `==` and `!=` on structs and enums.
 - Field defaults and trailing children blocks for struct literals and calls.

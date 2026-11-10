@@ -111,10 +111,13 @@ type Place struct {
 	Index  *Index
 	Offset int
 	Width  *types.Type
+	Tail   int
 }
 
 func PlaceOf(e Expr) (*Place, bool) {
 	switch e := e.(type) {
+	case *Receiver:
+		return PlaceOf(e.X)
 	case *Ident:
 		if e.Local != nil {
 			return &Place{Local: e.Local}, true
@@ -125,20 +128,20 @@ func PlaceOf(e Expr) (*Place, bool) {
 		}
 		width := fieldWidth(e)
 		if e.X.TypeOf().Kind == types.PointerKind {
-			return &Place{Ptr: e.X, Offset: e.Field.Bytes, Width: width}, true
+			return &Place{Ptr: e.X, Offset: e.Field.Bytes, Width: width, Tail: e.Field.Type.Tail()}, true
 		}
 		p, ok := PlaceOf(e.X)
 		if !ok {
 			return nil, false
 		}
-		return &Place{Local: p.Local, Ptr: p.Ptr, Index: p.Index, Offset: p.Offset + e.Field.Bytes, Width: width}, true
+		return &Place{Local: p.Local, Ptr: p.Ptr, Index: p.Index, Offset: p.Offset + e.Field.Bytes, Width: width, Tail: e.Field.Type.Tail()}, true
 	case *Index:
 		if e.X.TypeOf().Kind == types.SliceKind {
-			return &Place{Index: e}, true
+			return &Place{Index: e, Tail: e.Type.Tail()}, true
 		}
 	case *Unary:
 		if e.Op == lexer.Star {
-			return &Place{Ptr: e.X}, true
+			return &Place{Ptr: e.X, Tail: e.Type.Tail()}, true
 		}
 	}
 	return nil, false
@@ -168,6 +171,7 @@ type VariantDecl struct {
 
 type StructDecl struct {
 	Name       string
+	Drop       Stmt
 	TypeParams []*TypeParam
 	C          bool
 	Pub        bool
@@ -230,6 +234,7 @@ type Local struct {
 	Addressed bool
 	Captured  bool
 	Owner     *Func
+	Flag      *Local
 }
 
 type Node interface {
@@ -265,19 +270,24 @@ type Block struct {
 type Let struct {
 	Name     string
 	Mutable  bool
+	Using    bool
 	TypeName *TypeName
 	Value    Expr
 	Pos      lexer.Pos
 	Local    *Local
+	Flag     *Local
+	Release  Stmt
 }
 
 type Assign struct {
-	Target Expr
-	Op     lexer.Kind
-	Value  Expr
-	Pos    lexer.Pos
-	Place  *Place
-	Entry  *Index
+	Target  Expr
+	Op      lexer.Kind
+	Value   Expr
+	Pos     lexer.Pos
+	Place   *Place
+	Entry   *Index
+	Release Stmt
+	Flag    *Local
 }
 
 type ExprStmt struct {
@@ -341,6 +351,7 @@ type Ident struct {
 	Variant *types.Variant
 	Null    bool
 	Func    *Func
+	Moved   bool
 }
 
 type Selector struct {
@@ -425,6 +436,11 @@ type Ref struct {
 	Place *Place
 }
 
+type Receiver struct {
+	Typed
+	X Expr
+}
+
 type StructLit struct {
 	Typed
 	Module   string
@@ -480,8 +496,14 @@ type If struct {
 type Pattern struct {
 	Name     string
 	Bindings []*Binding
+	Test     Expr
 	Pos      lexer.Pos
 	Variant  *types.Variant
+}
+
+type Subject struct {
+	Typed
+	Pos lexer.Pos
 }
 
 type Binding struct {
@@ -529,6 +551,8 @@ func (n *Defer) Position() lexer.Pos     { return n.Pos }
 func (n *Spawn) Position() lexer.Pos     { return n.Pos }
 func (n *Send) Position() lexer.Pos      { return n.Pos }
 func (n *Select) Position() lexer.Pos    { return n.Pos }
+func (n *Subject) Position() lexer.Pos   { return n.Pos }
+func (n *Receiver) Position() lexer.Pos  { return n.X.Position() }
 func (n *IntLit) Position() lexer.Pos    { return n.Pos }
 func (n *FloatLit) Position() lexer.Pos  { return n.Pos }
 func (n *StrLit) Position() lexer.Pos    { return n.Pos }
@@ -588,5 +612,7 @@ func (*Call) expr()      {}
 func (*If) expr()        {}
 func (*Match) expr()     {}
 func (*Select) expr()    {}
+func (*Subject) expr()   {}
+func (*Receiver) expr()  {}
 func (*Try) expr()       {}
 func (*Catch) expr()     {}

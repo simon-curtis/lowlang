@@ -242,6 +242,13 @@ func (t *Type) CCompatible() bool {
 	return false
 }
 
+func (t *Type) Tail() int {
+	if t.Kind == StructKind && t.C {
+		return t.Bytes % 8
+	}
+	return 0
+}
+
 func (t *Type) CSize() int {
 	switch {
 	case t.Kind == BoolKind:

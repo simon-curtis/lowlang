@@ -66,6 +66,15 @@ type Checker struct {
 	chans           map[*types.Type]*types.Type
 	waitingChans    []*types.Type
 	spawns          int
+	drops           map[*types.Type]*dropSource
+	droppables      map[*types.Type]bool
+	dropFuncs       map[*types.Type]*ast.Func
+	releaseFuncs    map[*types.Type]*ast.Func
+	structFiles     map[*types.Type]*ast.File
+	containments    []containment
+	dropping        bool
+	flags           int
+	subjects        []*types.Type
 	fieldSources    map[*types.Field]*fieldSource
 	defaults        map[*types.Field]ast.Expr
 	checkingDefault map[*types.Field]bool
@@ -88,6 +97,11 @@ func Check(files []*ast.File) (embeds []string, err error) {
 		pristine:        map[*ast.Func]*ast.Func{},
 		instances:       map[*ast.Func]map[string]*ast.Func{},
 		chans:           map[*types.Type]*types.Type{},
+		drops:           map[*types.Type]*dropSource{},
+		droppables:      map[*types.Type]bool{},
+		dropFuncs:       map[*types.Type]*ast.Func{},
+		releaseFuncs:    map[*types.Type]*ast.Func{},
+		structFiles:     map[*types.Type]*ast.File{},
 		fieldSources:    map[*types.Field]*fieldSource{},
 		defaults:        map[*types.Field]ast.Expr{},
 		checkingDefault: map[*types.Field]bool{},
@@ -172,22 +186,22 @@ func (c *Checker) fail(pos lexer.Pos, format string, args ...any) {
 func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 	switch {
 	case t.Pointer:
-		return c.pointer(c.resolve(t.Elem))
+		return c.pointer(c.contained(t.Elem, "a pointer"))
 	case t.Slice:
-		return c.slice(c.resolve(t.Elem))
+		return c.slice(c.contained(t.Elem, "a slice"))
 	case t.Map:
 		key := c.resolve(t.Key)
 		if !key.Hashable() {
 			c.fail(t.Key.Pos, "map keys must be integers, bool, str or pointers, found %s", key)
 		}
-		return c.mapOf(key, c.resolve(t.Elem))
+		return c.mapOf(key, c.contained(t.Elem, "a map"))
 	case t.Optional:
-		return c.optional(c.resolve(t.Elem))
+		return c.optional(c.contained(t.Elem, "an optional"))
 	case t.Raw:
 		if t.Elem == nil {
 			return c.raw(nil)
 		}
-		return c.raw(c.resolve(t.Elem))
+		return c.raw(c.contained(t.Elem, "a ptr"))
 	case t.Func:
 		return c.funcTypeName(t)
 	}
@@ -201,7 +215,7 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 		if len(t.Args) != 1 {
 			c.fail(t.Pos, "chan takes 1 type argument")
 		}
-		return c.chanOf(c.resolve(t.Args[0]))
+		return c.chanOf(c.contained(t.Args[0], "a channel"))
 	}
 	if g := c.lookupGeneric(t.Module, t.Name, t.Pos); g != nil {
 		if t.Args == nil {
@@ -331,8 +345,6 @@ func (c *Checker) result(ok, err *types.Type) *types.Type {
 func (c *Checker) check(files []*ast.File) {
 	c.declareTypes(files)
 	c.declareFuncs(files)
-	c.checkDefaults(files)
-	c.checkMain()
 	var funcs []*ast.Func
 	for _, f := range files {
 		for _, fn := range f.Funcs {
@@ -341,6 +353,9 @@ func (c *Checker) check(files []*ast.File) {
 			}
 		}
 	}
+	c.checkDrops(files)
+	c.checkDefaults(files)
+	c.checkMain()
 	for _, fn := range funcs {
 		c.function(fn)
 	}
@@ -422,6 +437,7 @@ func (c *Checker) declareTypes(files []*ast.File) {
 	}
 	c.unlaid = nil
 	c.laid = true
+	c.checkContainments()
 }
 
 func (c *Checker) layout(t *types.Type, pos lexer.Pos) {
@@ -437,13 +453,14 @@ func (c *Checker) declareVariants(d *ast.EnumDecl, t *types.Type) {
 		}
 		v := &types.Variant{Name: vd.Name, Tag: i}
 		for _, f := range vd.Fields {
-			v.Fields = append(v.Fields, c.resolve(f))
+			v.Fields = append(v.Fields, c.contained(f, "an enum variant"))
 		}
 		t.Variants = append(t.Variants, v)
 	}
 }
 
 func (c *Checker) declareFields(d *ast.StructDecl, st *types.Type) {
+	c.recordStruct(d, st)
 	for _, fd := range d.Fields {
 		if st.Field(fd.Name) != nil {
 			c.fail(fd.Pos, "field %s already declared in %s", fd.Name, d.Name)
@@ -573,6 +590,9 @@ func (c *Checker) body(fn *ast.Func) {
 	}
 	if !c.returnable(body) {
 		c.fail(fn.Body.Pos, "%s must return %s, body produces %s", c.subject(), c.okType(), body)
+	}
+	if !c.abstract {
+		c.checkMoves(fn)
 	}
 }
 
@@ -708,6 +728,9 @@ func (c *Checker) capture(l *ast.Local, pos lexer.Pos) {
 		if l.Ref {
 			c.fail(pos, "a closure cannot capture mut parameter %s", l.Name)
 		}
+		if c.droppable(l.Type) {
+			c.fail(pos, "a closure cannot capture %s; %s has drop", l.Name, l.Type)
+		}
 		l.Captured = true
 		if closure := c.closures[i]; !slices.Contains(closure.Captures, l) {
 			closure.Captures = append(closure.Captures, l)
@@ -820,6 +843,13 @@ func (c *Checker) let(s *ast.Let) {
 		t = want
 	}
 	s.Local = c.declare(s.Name, t, s.Mutable)
+	if s.Using {
+		c.usingBinding(s, t)
+		return
+	}
+	if c.droppable(t) {
+		c.fail(s.Pos, "%s has drop; bind it with using", t)
+	}
 }
 
 func (c *Checker) assign(s *ast.Assign) {
@@ -839,6 +869,7 @@ func (c *Checker) assign(s *ast.Assign) {
 	if !t.Accepts(value) {
 		c.fail(s.Value.Position(), "cannot assign %s to a place of type %s", value, t)
 	}
+	c.droppableAssign(s, t)
 }
 
 func (c *Checker) assignTarget(s *ast.Assign) *types.Type {
@@ -1082,6 +1113,7 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 		c.fail(e.Pos, "type arguments must be followed by a call")
 	case *ast.Ref:
 		c.fail(e.Pos, "mut is only allowed as an argument to a mut parameter")
+	case *ast.Receiver:
 	case *ast.Index:
 		c.index(e)
 	case *ast.Slicing:
@@ -1106,6 +1138,11 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 		c.match(e, want)
 	case *ast.Select:
 		c.selectExpr(e, want)
+	case *ast.Subject:
+		if len(c.subjects) == 0 {
+			c.fail(e.Pos, "the match subject is only available in a match arm")
+		}
+		e.Type = c.subjects[len(c.subjects)-1]
 	case *ast.Try:
 		c.try(e)
 	case *ast.Catch:
@@ -1279,6 +1316,7 @@ func (c *Checker) sliceLit(e *ast.SliceLit, want *types.Type) {
 	for _, el := range e.Elems[1:] {
 		c.expectType(el, elem)
 	}
+	c.contain(elem, "a slice", e.Pos)
 	e.Type = c.slice(elem)
 }
 
@@ -1554,8 +1592,37 @@ func (c *Checker) selectorCall(e *ast.Call, sel *ast.Selector, want *types.Type)
 	case isIdent && c.find(id.Name) == nil:
 		c.fail(id.Pos, "undefined: %s", id.Name)
 	default:
-		c.indirect(e)
+		c.method(e, sel, want)
 	}
+}
+
+func (c *Checker) method(e *ast.Call, sel *ast.Selector, want *types.Type) {
+	t := c.plain(sel.X, nil)
+	receiver := &ast.Receiver{Typed: ast.Typed{Type: t}, X: sel.X}
+	if f := deref(t).Field(sel.Name); f != nil && f.Type.Kind == types.FuncKind {
+		sel.X = receiver
+		c.indirect(e)
+		return
+	}
+	var first ast.Expr = receiver
+	if c.receivesMut(sel.Name) {
+		first = &ast.Ref{X: receiver, Pos: sel.X.Position()}
+	}
+	e.Fn = &ast.Ident{Name: sel.Name, Pos: sel.Pos}
+	e.Args = append([]ast.Expr{first}, e.Args...)
+	c.call(e, want)
+}
+
+func (c *Checker) receivesMut(name string) bool {
+	if local := c.find(name); local != nil {
+		t := local.Type
+		return t.Kind == types.FuncKind && len(t.Muts) > 0 && t.Muts[0]
+	}
+	if name == "push" || name == "delete" {
+		return true
+	}
+	fn, ok := c.local().funcs[name]
+	return ok && len(fn.Params) > 0 && fn.Params[0].Mut
 }
 
 func (c *Checker) indirect(e *ast.Call) {
@@ -1829,6 +1896,7 @@ func (c *Checker) allocate(e *ast.Call, want *types.Type) {
 		c.fail(e.Args[0].Position(), "cannot allocate a value of type %s", t)
 	}
 	e.Builtin = "new"
+	c.contain(t, "a pointer", e.Pos)
 	e.Type = c.pointer(t)
 }
 
@@ -1918,7 +1986,7 @@ func (c *Checker) ifExpr(e *ast.If, want *types.Type) {
 
 func (c *Checker) match(e *ast.Match, want *types.Type) {
 	t := c.plain(e.X, nil)
-	if t.Kind != types.EnumKind {
+	if t == types.Void || t == types.Never {
 		c.fail(e.X.Position(), "cannot match on a value of type %s", t)
 	}
 	e.Type = c.arms(e.Arms, t, want, e.Pos)
@@ -1927,7 +1995,7 @@ func (c *Checker) match(e *ast.Match, want *types.Type) {
 func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos lexer.Pos) *types.Type {
 	result := types.Never
 	covered := map[*types.Variant]bool{}
-	wildcard := false
+	wildcard, tested := false, false
 	for _, arm := range arms {
 		if wildcard {
 			c.fail(arm.Pattern.Pos, "unreachable arm after _")
@@ -1936,6 +2004,10 @@ func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos lexer.Pos) *
 		c.pattern(arm.Pattern, enum)
 		result = unify(result, c.expr(arm.Body, want))
 		c.popScope()
+		if arm.Pattern.Test != nil {
+			tested = true
+			continue
+		}
 		if arm.Pattern.Variant == nil {
 			wildcard = true
 			continue
@@ -1945,7 +2017,11 @@ func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos lexer.Pos) *
 		}
 		covered[arm.Pattern.Variant] = true
 	}
-	if !wildcard {
+	switch {
+	case wildcard:
+	case tested || enum.Kind != types.EnumKind:
+		c.fail(pos, "match on %s needs a final _ arm", enum)
+	default:
 		c.exhaustive(enum, covered, pos)
 	}
 	return result
@@ -1964,6 +2040,15 @@ func (c *Checker) exhaustive(enum *types.Type, covered map[*types.Variant]bool, 
 }
 
 func (c *Checker) pattern(p *ast.Pattern, enum *types.Type) {
+	if p.Test != nil {
+		c.subjects = append(c.subjects, enum)
+		c.expectType(p.Test, types.Bool)
+		c.subjects = c.subjects[:len(c.subjects)-1]
+		return
+	}
+	if p.Name != "_" && enum.Kind != types.EnumKind {
+		c.fail(p.Pos, "an arm matching %s starts with an operator, such as == or <", enum)
+	}
 	if p.Name == "_" {
 		if len(p.Bindings) > 0 {
 			c.fail(p.Pos, "_ cannot bind fields")

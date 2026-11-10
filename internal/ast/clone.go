@@ -21,6 +21,10 @@ func CloneFunc(f *Func) *Func {
 	return &c
 }
 
+func CloneStmt(s Stmt) Stmt {
+	return clone(s)
+}
+
 func CloneExpr(e Expr) Expr {
 	return clone(e)
 }

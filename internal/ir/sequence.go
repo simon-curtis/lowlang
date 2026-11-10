@@ -37,7 +37,7 @@ func (b *builder) element(e *ast.Index) place {
 	index := b.word(e.Index)
 	b.check(index, seq[1])
 	elem := elementType(e.X.TypeOf())
-	return place{addr: b.scaled(seq[0], index, elem.Stride()), scalar: scalarOf(elem)}
+	return place{addr: b.scaled(seq[0], index, elem.Stride()), scalar: scalarOf(elem), tail: elem.Tail()}
 }
 
 func (b *builder) slicing(e *ast.Slicing) []*Value {
@@ -69,7 +69,7 @@ func (b *builder) sliceLit(e *ast.SliceLit) []*Value {
 	words := (len(e.Elems)*elem.Stride() + 7) / 8
 	ptr := b.runtime("alloc", b.constant(int64(words)), b.scan(elem))
 	for i, el := range e.Elems {
-		b.store(place{addr: ptr, offset: i * elem.Stride(), scalar: scalarOf(elem)}, b.value(el, elem))
+		b.store(place{addr: ptr, offset: i * elem.Stride(), scalar: scalarOf(elem), tail: elem.Tail()}, b.value(el, elem))
 	}
 	return []*Value{ptr, n, n}
 }
@@ -220,7 +220,7 @@ func (b *builder) push(e *ast.Call) {
 	b.jump(done)
 	b.enter(done)
 	base := b.readTemp(temp, 1)[0]
-	b.store(place{addr: b.scaled(base, length, int(stride)), scalar: scalarOf(elem)}, value)
+	b.store(place{addr: b.scaled(base, length, int(stride)), scalar: scalarOf(elem), tail: elem.Tail()}, value)
 	b.store(place{addr: header, offset: 8}, []*Value{b.emit(OpAdd, length, b.constant(1))})
 }
 
@@ -259,7 +259,7 @@ func (b *builder) forIn(s *ast.ForIn) {
 		b.writeTemp(step, r[1:2])
 	} else {
 		elem := s.Iter.TypeOf().Elem
-		at := place{addr: b.scaled(seq[0], i, elem.Stride()), scalar: scalarOf(elem)}
+		at := place{addr: b.scaled(seq[0], i, elem.Stride()), scalar: scalarOf(elem), tail: elem.Tail()}
 		b.bind(s.ValueLocal, b.load(at, elem))
 		b.writeTemp(step, []*Value{b.constant(1)})
 	}
