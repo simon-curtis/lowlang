@@ -101,11 +101,12 @@ let whole = i64(floor(length))
 let byte = u8(300)
 ```
 
-- Integer types are `i64`, `i32`, `u32`, `u16` and `u8`; float types are `f64` and `f32`.
+- Integer types are `i64`, `i32`, `u64`, `u32`, `u16` and `u8`; float types are `f64` and `f32`.
 - Integer arithmetic wraps at the type's width. Division by zero panics.
-- An integer literal takes the type the context expects, including the other operand of a binary operator, and must fit it; otherwise it is `i64`. A float literal is `f64` unless an `f32` is expected. Literals are decimal, `0x` hexadecimal or `0b` binary, with `_` separators, and floats may have an exponent.
+- An integer literal takes the type the context expects, including the other operand of a binary operator, and must fit it; otherwise it is `i64`. A literal above the `i64` range is only accepted as a `u64`. A float literal is `f64` unless an `f32` is expected. In an `if` expression with no expected type, an integer literal branch takes the type of the other branch. Literals are decimal, `0x` hexadecimal or `0b` binary, with `_` separators, and floats may have an exponent.
 - Operands of a binary operator have the same type; conversions are explicit calls such as `u8(x)`, `f64(n)` and `i64(f)`. Integer conversions truncate or extend, float to integer truncates toward zero.
 - `&`, `|`, `^`, `~`, `<<` and `>>` work on integers. `>>` is arithmetic on signed types and logical on unsigned ones. The shift count may be any integer type; a count of 64 or more, or a negative one, gives 0, or the sign fill for `>>` on a negative signed value.
+- Binary operators bind as in Go: `*`, `/`, `%`, `<<`, `>>` and `&` tightest; then `+`, `-`, `|` and `^`; then `??`; then comparisons; then `&&`; then `||`. So `a - b >> 1` is `a - (b >> 1)` and `x | y - z` is `(x | y) - z`.
 - `%` is integer only. Floats follow IEEE 754: division by zero gives an infinity, and comparisons with NaN are false except `!=`.
 - `sqrt`, `floor` and `exp` take and return `f32` or `f64`.
 - `print` accepts any integer type.
@@ -635,22 +636,82 @@ fn main() ! io.Error {
 
 | Module | Contents |
 |---|---|
-| `std/io` | `Error`, the error type shared by `file`, `net` and `http`; `Stream`, a struct of `read`, `write` and `close` closures; a buffered `Reader` with `read_line`, `read_exact`, `read_some` and `read_byte`; `write_all`, `read_all`, `buffer(n)` and big- and little-endian byte helpers. |
+| `std/io` | `Error`, the error type shared by the I/O, codec and protocol modules; `Stream`, a struct of `read`, `write` and `close` closures; a buffered `Reader` over a stream or, with `bytes_reader`, over a buffer, with `read_line`, `read_exact`, `read_some` and `read_byte`; `write_all`, `read_all`, `buffer(n)`, `copy` and big- and little-endian byte helpers. |
 | `std/file` | `open`, `create`, `append`, `update`, `read`, `write`, `write_all`, `seek`, `sync`, `truncate`, `close`, `info`, `stat`, `exists`, `read_file`, `read_text`, `write_file`, `write_text`, `remove`, `remove_dir`, `rename`, `mkdir`, `mkdir_all`, `list` and `stream`. |
-| `std/net` | IPv4 and IPv6 `Addr`, `parse_ip`, `format_ip`, `parse_addr`, `format`; TCP `listen`, `accept`, `connect`, `dial`, `read`, `write`, `write_all`, `shutdown_write`, `set_nodelay`, read and write timeouts and `stream`; UDP `bind_udp`, `send_to` and `receive_from`; `lookup`, which tries an IP literal, `/etc/hosts`, then A and AAAA queries to each `/etc/resolv.conf` nameserver. |
-| `std/http` | `Request`, `Response`, `Header`, header helpers, `parse_url`; `serve`, `serve_conn` and `serve_stream`; `fetch`, `get` and `post`. |
-| `std/http/websocket` | `accept`, `dial`, `receive`, `send_text`, `send_binary`, `ping` and `close`. |
-| `std/text` | integer parsing and hex formatting, `trim`, `split`, `join`, `index`, case folding and comma-separated token lists. |
-| `std/base64` | `encode` and `decode`. |
+| `std/net` | IPv4 and IPv6 `Addr`, `parse_ip`, `format_ip`, `parse_addr`, `format`; TCP `listen`, `accept`, `connect`, `dial` and their `_within` forms with a connect timeout, `read`, `write`, `write_all`, `shutdown_write`, `set_nodelay`, read and write timeouts and `stream`; UDP `bind_udp`, `send_to` and `receive_from`; `lookup`, which tries an IP literal, `/etc/hosts`, then A and AAAA queries to each `/etc/resolv.conf` nameserver. |
+| `std/pipe` | Pipelines: a `Pipe` with a `Reader` and `Writer`, segmented buffers, backpressure, `Sequence` and `SequenceReader`, and adapters between pipes and streams. |
+| `std/http` | `Request`, `Response`, `Header`, header helpers, `parse_url`; `serve`, `serve_tls`, `serve_conn` and `serve_stream`; `fetch`, `get` and `post` over `http` and `https`; `connect`. |
+| `std/http/websocket` | `accept`, `dial` over `ws` and `wss`, `receive`, `send_text`, `send_binary`, `ping` and `close`. |
+| `std/web` | A router with groups, middleware and typed JSON endpoints, problem details (RFC 9457), an OpenAPI 3.1 document built from the types, cookie sessions, CSRF protection, API key, Basic and bearer authentication, CORS and gzip compression. |
+| `std/tls` | TLS 1.3 clients and servers. |
+| `std/serde` | The `Writer` and `Reader` protocols, `write[T]`, `read[T]` and `schema[T]`, which the compiler derives for every type, and `Field[T, F]`. |
+| `std/json` | A reader and writer over UTF-8 bytes, the `Value` document model, and `serialize[T]` and `deserialize[T]` with naming policies. |
+| `std/sql` | The driver contract: `Connection`, `Value`, `Rows`, `Error`, `Options` and dialect helpers. |
+| `std/orm` | Typed queries over field references, row mapping, inserts, updates and deletes, tables created from types, and raw queries mapped onto structs. |
+| `std/compress/deflate` | DEFLATE, zlib and gzip. |
+| `std/compress/xz` | xz with LZMA2, and `.lzma`. |
+| `std/hash` | CRC-32, CRC-32C, Adler-32, CRC-64 and xxHash32/64, in one-shot and incremental forms. |
 | `std/crypto` | `sha1` and `random`, which reads `getrandom`. |
+| `std/crypto/hash` | `Algorithm` and cloneable `Digest`, SHA-256, SHA-384 and SHA-512, HMAC, HKDF and constant-time `equal`. |
+| `std/crypto/sha3` | SHA3-256, SHA3-384, SHA3-512, SHAKE128 and SHAKE256. |
+| `std/crypto/aead` | AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 as `Aead` values, and the AES and ChaCha20 block functions. |
+| `std/crypto/x25519`, `std/crypto/ed25519` | X25519 key agreement (RFC 7748) and Ed25519 signatures (RFC 8032), over `std/crypto/curve25519`. |
+| `std/crypto/ecdsa` | ECDH and ECDSA on P-256 and P-384, with RFC 6979 nonces and SEC1 private keys. |
+| `std/crypto/rsa` | RSA PKCS#1 v1.5 and PSS signing and verification, and PKCS#1 keys. |
+| `std/crypto/mlkem` | ML-KEM-512, -768 and -1024 (FIPS 203). |
+| `std/crypto/x509` | DER, PEM, certificates, PKCS#8 private keys, the system roots, chain validation and TLS signature schemes. |
+| `std/time` | `now`, in Unix seconds. |
+| `std/text` | integer and correctly rounded float parsing, hex encoding, `trim`, `split`, `join`, `index`, case folding and comma-separated token lists. |
+| `std/base64` | `encode` and `decode`. |
 
-- A server speaks HTTP/1.1 and HTTP/2 on the same port. A connection that opens with the HTTP/2 preface is served as HTTP/2 with prior knowledge (h2c); any other is HTTP/1.1 with keep-alive, pipelining, chunked bodies and `Expect: 100-continue`. The `h2c` upgrade from HTTP/1.1, deprecated by RFC 9113, is not offered.
-- HTTP/2 covers framing, HPACK with its dynamic table and Huffman decoding, stream multiplexing, flow control in both directions, SETTINGS, PING, RST_STREAM, GOAWAY and CONTINUATION, and the request validation of RFC 9113 section 8. The encoder uses the static table and literals without Huffman coding. It passes h2spec except the test sending a garbage preface, which the shared port reads as an HTTP/1.1 request.
-- `serve` handles connections one at a time, and HTTP/2 streams on a connection in the order their requests complete.
+### Networking
+
+- Sockets are non-blocking. An operation that would block waits with `wait_readable` or `wait_writable`, so a green thread waiting on the network never holds an OS thread the collector must wait for. Every connection holds a duplicate descriptor for its write side, so one green thread can read while another writes. A timeout spawns a green thread that sleeps and shuts the socket down if the operation is still waiting; the waiting operation then fails with `TimedOut`. Closing a connection shuts it down first, which wakes any green thread still waiting on it.
+- `serve` runs each connection on its own green thread.
+- A server speaks HTTP/1.1 and HTTP/2 on the same port. A connection that opens with the HTTP/2 preface is served as HTTP/2; any other is HTTP/1.1 with keep-alive, pipelining, chunked bodies and `Expect: 100-continue`. Over TLS, ALPN offers `h2` and `http/1.1` and the same detection applies. The `h2c` upgrade from HTTP/1.1, deprecated by RFC 9113, is not offered.
+- HTTP/2 covers framing, HPACK with its dynamic table and Huffman decoding, stream multiplexing, flow control in both directions, SETTINGS, PING, RST_STREAM, GOAWAY and CONTINUATION, and the request validation of RFC 9113 section 8. A reader green thread feeds frames to the connection, each request's handler runs on its own green thread, and the connection selects over frames and finished responses, so every write happens on one green thread. The encoder uses the static table and literals without Huffman coding. It passes h2spec except the test sending a garbage preface, which the shared port reads as an HTTP/1.1 request.
 - A handler that returns status 101 owns the connection: the server writes nothing more and closes it once the handler returns. `http.upgraded()` is that response, returned after a WebSocket session.
 - `Request.connection` is the buffered reader of an HTTP/1.1 connection, which `websocket.accept` writes the handshake to and reads frames from. A WebSocket server requires masked client frames, answers pings, reassembles fragments, checks UTF-8 in text messages, limits messages to 16 MB and echoes a close frame.
-- The client speaks HTTP/1.1 or HTTP/2 with prior knowledge, one request per connection, over `http` URLs. `https` and `wss` URLs fail with `Unsupported`.
+- The client speaks HTTP/1.1 or HTTP/2, one request per connection, over `http` and `https` URLs. It asks for gzip and deflate and decodes them.
 - Request and response bodies are limited to 64 MB.
+
+### TLS
+
+- TLS 1.3 only (RFC 8446), client and server, with the cipher suites TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256 and TLS_AES_256_GCM_SHA384.
+- Key exchange offers the hybrid post-quantum group X25519MLKEM768 first, then X25519, P-256 and P-384. A client sends key shares for X25519MLKEM768 and X25519; a server picks the first group of its own order that the client supports, answering with a HelloRetryRequest when the client sent no share for it, so a client that supports X25519MLKEM768 always gets it.
+- Servers sign with ECDSA P-256 or P-384, RSA-PSS or Ed25519 keys loaded from PEM (`load_certificates`, `load_key`). Clients verify the chain against `Config.roots`, or the system roots when that is empty, check the host name against the certificate's subject alternative names, and verify CertificateVerify with any of the schemes the certificate allows.
+- ALPN, SNI, KeyUpdate in both directions and `close_notify` are supported. Session tickets are ignored, so there is no resumption or 0-RTT, and servers do not request client certificates.
+- A session's read and write sides are independent, with a write lock, so it can be read and written by different green threads.
+
+### Derived serialization
+
+`std/serde` defines a `Writer` and a `Reader`, structs of closures through which values are written and read. The compiler derives, for every concrete type, a function that writes a value to a `Writer`, one that reads it from a `Reader`, and a `Schema` describing it:
+
+- Booleans, integers, floats and strings map to their primitives; `[]u8` to binary; slices to sequences; maps to maps with keys written as text; optionals to null or the value; pointers to their target.
+- A struct is a map from field names to values, and every field takes part, private ones included. Reading skips unknown keys, uses a field's default when its key is missing, treats a missing optional field as `none`, and fails with `Missing` otherwise.
+- An enum variant without fields is its name. One with labelled fields is a single-key map from its name to a map of its fields, and one with positional fields maps its name to a sequence.
+- A schema records each type's kind, name, fields with whether they are required, and variants. A struct or enum reached again through a pointer while it is being described becomes a `Ref` to its name.
+
+`std/json`, `std/orm` and `std/web` are built on these. `T.field`, where `T` is a struct type, is a `serde.Field[T, F]` holding the field's name and index, so a function can take a field of a given struct with a given type.
+
+### Data
+
+- `json.Reader` tokenizes UTF-8 bytes like .NET's `Utf8JsonReader`, strictly per RFC 8259, with a depth limit of 64, returning strings without copying unless they contain escapes. Numbers are parsed as integers or correctly rounded floats.
+- `json.serialize_with` and `json.deserialize_with` take `Options` for indentation, field naming (`Unchanged`, `CamelCase`, `SnakeCase`) and maximum depth. Binary data is base64; non-finite floats are written as `null`.
+- `std/orm` builds queries from conditions over field references, such as `orm.filter(orm.from(users), orm.ge(User.age, 18))`, which are type-checked against the field. It renders them for Postgres or SQL Server, maps rows onto structs, stores nested values as JSON columns, creates tables from types with an identity key named `id`, and returns generated keys from inserts.
+- Pipes block through channels. A writer flushing more than the pause threshold waits until the reader brings the unconsumed bytes below the resume threshold, or until the reader itself waits for more data, so a message larger than the thresholds cannot deadlock the pipe.
+
+### Compression
+
+- DEFLATE, zlib and gzip decode stored, fixed and dynamic blocks with two-level lookup tables, check Adler-32, CRC-32, ISIZE and the gzip header CRC, and read concatenated gzip members. The encoder uses greedy matching at levels 1 to 3 and lazy matching at 4 to 9 over a hash chain on a 32 KB window, choosing dynamic, fixed or stored encoding per block; `flush` emits a sync flush so streamed output is decodable as it arrives.
+- xz decodes multiple blocks and streams, the none, CRC32, CRC64 and SHA-256 checks, LZMA2 chunks with their resets, and the delta filter; other filters fail with `Unsupported`. The encoder writes LZMA2 with a hash-chain match finder and lazy parsing, a dictionary from 256 KiB to 64 MiB by level, and raw chunks where compression does not pay.
+- Every codec has buffer functions, a streaming decoder that pulls from an `io.Reader`, pushes output to a sink and fails with `TooLarge` past a caller's limit, and a streaming encoder.
+
+### Web
+
+- `web.app()` holds routes and middleware. `get`, `post`, `put`, `patch`, `del` and `route` add handlers for paths with `:name` parameters and a trailing `*`; `group` makes a sub-application with a prefix and more middleware, and `mount` adds its routes back. An unknown path is a 404 and a known path with another method a 405 with `Allow`.
+- `endpoint[Req, Res]` and `query_endpoint[Res]` read a JSON body into `Req`, call a handler returning `Res ! web.Problem`, and write the result as JSON or the problem as `application/problem+json`. Their schemas describe the operation in the OpenAPI document that `openapi` serves, along with path parameters and each route's security schemes.
+- Middleware is a struct of a `run` closure and an optional security scheme. `api_key`, `basic` and `bearer` authenticate requests and set `Context.user`; `sessions` keeps a map in a cookie sealed with AES-256-GCM, with the cookie name as associated data and an expiry inside; `csrf` requires the session's token in `X-CSRF-Token` on unsafe methods; `require_session`, `cors`, `logger` and `compress` round them out.
 
 ## Compiler
 
@@ -693,7 +754,7 @@ The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emi
 
 `internal/compiler/prelude.low` is LowLang source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, the generic map table, integer formatting, and float formatting with Burger and Dybvig's free-format algorithm over big integers of 32-bit limbs. Its names start with `__`, which user code cannot use, and four intrinsics are available only there: `__bits` gives a float's bit pattern, `__str_view` turns a `[]u8` into a `str` without copying, `__hash` hashes any `Hash` value, and `__zero` is the all-zero value of its expected type. Functions unreachable from `main` are dropped, so a program that formats no floats carries none of this code.
 
-The standard library lives in `internal/compiler/std` and is embedded in `low` with `go:embed`. An import whose path is `std` or starts with `std/` is read from there, never from the project root. Its files are lexed like the prelude, so they may use `__` names and intrinsics, and they are left out of the sources `low dev` watches. Two intrinsics serve it: `__syscall(n, args...)` makes Linux syscall `n` with up to six integer, `bool` or `ptr` arguments and returns `rax` as `i64`, a negative errno on failure; `__slice_ptr(x)` gives the data address of a slice or `str` as a `ptr[T]`. `__syscall` lowers to a runtime-call instruction that the code generator emits inline: it moves the arguments into `rax`, `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9` with the parallel move and executes `syscall`. Being a call, it keeps no value in a caller-saved register across it, which covers the `rcx` and `r11` the kernel clobbers.
+The standard library lives in `internal/compiler/std` and is embedded in `low` with `go:embed`. An import whose path is `std` or starts with `std/` is read from there, never from the project root. Its files are lexed like the prelude, so they may use `__` names and intrinsics, and they are left out of the sources `low dev` watches. These intrinsics serve it: `__syscall(n, args...)` makes Linux syscall `n` with up to six integer, `bool` or `ptr` arguments and returns `rax` as `i64`, a negative errno on failure; `__slice_ptr(x)` gives the data address of a slice or `str` as a `ptr[T]`; `__mulhi(a, b)` is the high 64 bits of the 128-bit product of two `u64`, an IR instruction that becomes one `mul`; `__make(n)` is a zeroed slice of `n` elements of the expected slice type, allocated through `rt_grow`; `__memmove(dst, src)` copies `min(dst.len, src.len)` elements with the runtime's overlap-safe `rt_memmove` and returns the count; `__serialize`, `__deserialize` and `__schema` are the derivations below, allowed only in `std/serde`. `__syscall` lowers to a runtime-call instruction that the code generator emits inline: it moves the arguments into `rax`, `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9` with the parallel move and executes `syscall`. Being a call, it keeps no value in a caller-saved register across it, which covers the `rcx` and `r11` the kernel clobbers.
 
 The garbage collector is a non-moving mark-sweep collector in the runtime:
 
@@ -710,6 +771,8 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Every candidate word, mapped or not, is checked against the heap before it is followed, so a map that names a word holding an integer is harmless.
 - A `ptr` counts as a possible heap pointer, so a `cstr` copy or a pinned object stays alive while LowLang holds its address. `pin` records the address in a table of 65536 roots that every collection scans; `unpin` removes it.
 - Sweeping coalesces adjacent dead objects into free chunks and returns a trailing free run to the end of the heap.
+
+The derivations are generated as source. When the checker meets `__serialize(v, w)`, `__deserialize[T](r)` or `__schema[T]()` with a concrete type, it writes a function for that type in LowLang text, binding the type and each type it mentions to names like `__X0`, parses it with the prelude's privileges, marks it trusted so it may read and build private fields, and checks it like a generic instance. Calls inside it to the same intrinsics derive the types they reach, and each derived function is cached by type. Bound names resolve in type positions, struct literals and variant selectors. A field reference `T.field` is checked as `serde.Field[T, F]` and lowered to the field's name and index as constants.
 
 ### IR
 
@@ -818,17 +881,16 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - Field defaults and trailing children blocks for struct literals and calls.
 - Function values and closures capturing by reference; `extern fn` C function pointers and C callbacks.
 - Green threads on an M:N scheduler with `spawn`, channels, `select`, `sleep`, descriptor waits through epoll, deadlock detection and stack overflow checks.
-- Standard library: `std/io`, `std/file`, `std/net` with a DNS resolver, `std/http` with HTTP/1.1 and HTTP/2 servers and clients, `std/http/websocket`, `std/text`, `std/base64` and `std/crypto`.
+- Derived serialization, deserialization and schemas for every type, and `T.field` references.
+- Standard library: files, networking with DNS, pipelines, HTTP/1.1 and HTTP/2 clients and servers, WebSocket, post-quantum TLS 1.3, JSON, the web framework with OpenAPI and authentication, the SQL driver contract and ORM, DEFLATE/zlib/gzip and xz compression, checksums, and the cryptography TLS needs.
 - Hot reload with `low dev`.
 - Target: linux/amd64.
 
 ## Roadmap
 
 1. Standard library, written in LowLang:
-    1. Serve each connection and each HTTP/2 stream on its own green thread, and wait for socket readiness through the netpoller.
-    2. TLS 1.3 (RFC 8446): X25519 and P-256 key exchange, AES-GCM and ChaCha20-Poly1305, SHA-256 and SHA-384, HKDF, X.509 chain validation with ECDSA and RSA-PSS against the system roots, and ALPN, giving `https`, `wss` and HTTP/2 over TLS.
-    3. QUIC (RFC 9000, 9001 and 9002) over UDP with the TLS 1.3 handshake, loss recovery and congestion control; HTTP/3 (RFC 9114) with QPACK (RFC 9204).
-    4. WebRTC data channels: ICE with STUN, DTLS, SCTP over DTLS and the data channel establishment protocol; media over SRTP.
+    1. QUIC (RFC 9000, 9001 and 9002) over UDP with the TLS 1.3 handshake, loss recovery and congestion control; HTTP/3 (RFC 9114) with QPACK (RFC 9204).
+    2. WebRTC data channels: ICE with STUN, DTLS, SCTP over DTLS and the data channel establishment protocol; media over SRTP.
 2. GPU UI library with GPUI's renderer and platform layer and a signal-based state model, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
