@@ -1,0 +1,242 @@
+import std/io
+import std/text
+import std/time
+
+struct Directory {
+    count: i64
+    size: i64
+    offset: i64
+}
+
+struct Sizes {
+    size: i64
+    compressed: i64
+    offset: i64
+    stamp: i64?
+}
+
+fn central_signature() -> i64 {
+    0x02014b50
+}
+
+fn saturated16() -> i64 {
+    0xFFFF
+}
+
+fn saturated32() -> i64 {
+    0xFFFFFFFF
+}
+
+fn find_eocd(data: []u8) -> i64 ! io.Error {
+    if data.len < 22 {
+        fail Malformed
+    }
+    let stop = if data.len - 22 - 65535 > 0 { data.len - 22 - 65535 } else { 0 }
+    var at = data.len - 22
+    for at >= stop {
+        if io.le32(data, at) == 0x06054b50 && at + 22 + io.le16(data, at + 20) <= data.len {
+            return at
+        }
+        at -= 1
+    }
+    fail Malformed
+}
+
+fn locate(data: []u8, eocd: i64, limits: Limits) -> Directory ! io.Error {
+    if io.le16(data, eocd + 4) != 0 || io.le16(data, eocd + 6) != 0 {
+        fail Unsupported
+    }
+    var dir = Directory { count: io.le16(data, eocd + 10), size: io.le32(data, eocd + 12), offset: io.le32(data, eocd + 16) }
+    if dir.count == saturated16() || dir.size == saturated32() || dir.offset == saturated32() {
+        dir = locate64(data, eocd, dir)?
+    }
+    if dir.count < 0 || dir.size < 0 || dir.offset < 0 || dir.offset > data.len - dir.size {
+        fail Malformed
+    }
+    if dir.count > limits.entries {
+        fail TooLarge
+    }
+    if dir.count * 46 > dir.size {
+        fail Malformed
+    }
+    dir
+}
+
+fn locate64(data: []u8, eocd: i64, fallback: Directory) -> Directory ! io.Error {
+    let locator = eocd - 20
+    if locator < 0 || io.le32(data, locator) != 0x07064b50 {
+        return fallback
+    }
+    let at = io.le64(data, locator + 8)
+    if at < 0 || at > data.len - 56 || io.le32(data, at) != 0x06064b50 {
+        fail Malformed
+    }
+    Directory { count: io.le64(data, at + 32), size: io.le64(data, at + 40), offset: io.le64(data, at + 48) }
+}
+
+fn dos_to_unix(date: i64, clock: i64) -> i64 {
+    if date == 0 {
+        return 0
+    }
+    let month = (date >> 5) & 15
+    let day = date & 31
+    let when = time.DateTime {
+        date: time.Date { year: 1980 + (date >> 9), month: if month < 1 || month > 12 { 1 } else { month }, day: if day < 1 { 1 } else { day } }
+        hour: clock >> 11
+        minute: (clock >> 5) & 63
+        second: (clock & 31) * 2
+    }
+    time.to_unix(when)
+}
+
+fn block_data(extra: []u8, id: i64) -> []u8? {
+    var at = 0
+    for at + 4 <= extra.len {
+        let size = io.le16(extra, at + 2)
+        if at + 4 + size > extra.len {
+            return none
+        }
+        if io.le16(extra, at) == id {
+            return extra[at + 4..at + 4 + size]
+        }
+        at += 4 + size
+    }
+    none
+}
+
+fn apply_extra(extra: []u8, sizes: Sizes) -> Sizes ! io.Error {
+    var out = sizes
+    let body = block_data(extra, 0x0001) ?? []
+    var at = 0
+    if sizes.size == saturated32() {
+        out.size = field64(body, at)?
+        at += 8
+    }
+    if sizes.compressed == saturated32() {
+        out.compressed = field64(body, at)?
+        at += 8
+    }
+    if sizes.offset == saturated32() {
+        out.offset = field64(body, at)?
+    }
+    let stamp = block_data(extra, 0x5455) ?? []
+    if stamp.len >= 5 && stamp[0] & 1 != 0 {
+        out.stamp = io.le32(stamp, 1)
+    }
+    out
+}
+
+fn field64(body: []u8, at: i64) -> i64 ! io.Error {
+    if at + 8 > body.len {
+        fail Malformed
+    }
+    io.le64(body, at)
+}
+
+fn unix_mode(made_by: i64, external: i64) -> i64 {
+    if made_by >> 8 == 3 {
+        return external >> 16 & 0xFFFF
+    }
+    0
+}
+
+fn kind_of(name: str, mode: i64, external: i64) -> Kind {
+    let format = mode & 0xF000
+    if format == 0xA000 {
+        return Symlink
+    }
+    if format == 0x4000 || external & 0x10 != 0 || text.ends_with(name, "/") {
+        return Dir
+    }
+    File
+}
+
+fn parse_entry(data: []u8, at: i64, end: i64) -> Entry ! io.Error {
+    if at + 46 > end || io.le32(data, at) != central_signature() {
+        fail Malformed
+    }
+    let name_len = io.le16(data, at + 28)
+    let extra_len = io.le16(data, at + 30)
+    let comment_len = io.le16(data, at + 32)
+    if at + 46 + name_len + extra_len + comment_len > end {
+        fail Malformed
+    }
+    let name = str(data[at + 46..at + 46 + name_len])
+    let extra = data[at + 46 + name_len..at + 46 + name_len + extra_len]
+    let base = Sizes { size: io.le32(data, at + 24), compressed: io.le32(data, at + 20), offset: io.le32(data, at + 42), stamp: none }
+    let sizes = apply_extra(extra, base)?
+    let external = io.le32(data, at + 38)
+    let mode = unix_mode(io.le16(data, at + 4), external)
+    let code = io.le16(data, at + 10)
+    let kind = kind_of(name, mode, external)
+    Entry {
+        name
+        size: sizes.size
+        compressed: sizes.compressed
+        method: method_of(code)
+        crc: io.le32(data, at + 16)
+        mtime: sizes.stamp ?? dos_to_unix(io.le16(data, at + 14), io.le16(data, at + 12))
+        mode: permissions(mode, kind)
+        kind
+        offset: sizes.offset
+        flags: io.le16(data, at + 8)
+    }
+}
+
+fn permissions(mode: i64, kind: Kind) -> i64 {
+    if mode & 0o777 != 0 {
+        return mode & 0o7777
+    }
+    match kind {
+        Dir => 0o755
+        _ => 0o644
+    }
+}
+
+fn method_of(code: i64) -> Method {
+    if code == 0 {
+        return Stored
+    }
+    if code == 8 {
+        return Deflate
+    }
+    Other(code)
+}
+
+fn entry_length(data: []u8, at: i64) -> i64 {
+    46 + io.le16(data, at + 28) + io.le16(data, at + 30) + io.le16(data, at + 32)
+}
+
+fn parse_directory(data: []u8, dir: Directory) -> []Entry ! io.Error {
+    var entries: []Entry = []
+    var at = dir.offset
+    let end = dir.offset + dir.size
+    for i in 0..dir.count {
+        let e = parse_entry(data, at, end)?
+        push(mut entries, e)
+        at += entry_length(data, at)
+    }
+    entries
+}
+
+fn check_totals(entries: []Entry, archive_size: i64, limits: Limits) ! io.Error {
+    var total = 0
+    for e in entries {
+        if e.size < 0 || e.compressed < 0 || e.offset < 0 || e.compressed > archive_size {
+            fail Malformed
+        }
+        if e.size > limits.entry {
+            fail TooLarge
+        }
+        if e.size > limits.ratio * e.compressed {
+            fail TooLarge
+        }
+        total += e.size
+        if total > limits.total {
+            fail TooLarge
+        }
+    }
+    if total > limits.ratio * archive_size {
+        fail TooLarge
+    }
+}

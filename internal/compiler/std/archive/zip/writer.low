@@ -1,0 +1,275 @@
+import std/compress/deflate
+import std/hash
+import std/io
+import std/text
+import std/time
+
+pub struct Writer {
+    sink: io.Stream?
+    data: []u8
+    central: []u8
+    count: i64
+    written: i64
+    force64: bool
+    closed: bool
+}
+
+struct Prepared {
+    name: str
+    body: []u8
+    method: i64
+    crc: i64
+    size: i64
+    flags: i64
+    mode: i64
+    external: i64
+}
+
+pub fn writer() -> *Writer {
+    new(Writer { sink: none, data: [], central: [], count: 0, written: 0, force64: false, closed: false })
+}
+
+pub fn stream_writer(sink: io.Stream) -> *Writer {
+    new(Writer { sink, data: [], central: [], count: 0, written: 0, force64: false, closed: false })
+}
+
+pub fn force_zip64(w: *Writer) {
+    w.force64 = true
+}
+
+pub fn output(w: *Writer) -> []u8 {
+    w.data
+}
+
+fn emit(w: *Writer, chunk: []u8) ! io.Error {
+    match w.sink {
+        some(s) => io.write_all(s, chunk)?
+        none => io.append(mut w.data, chunk)
+    }
+    w.written += chunk.len
+}
+
+fn put16(mut out: []u8, v: i64) {
+    push(mut out, u8(v))
+    push(mut out, u8(v >> 8))
+}
+
+fn put32(mut out: []u8, v: i64) {
+    put16(mut out, v)
+    put16(mut out, v >> 16)
+}
+
+fn put64(mut out: []u8, v: i64) {
+    put32(mut out, v)
+    put32(mut out, v >> 32)
+}
+
+fn ascii(s: str) -> bool {
+    for i in 0..s.len {
+        if s[i] >= 128 {
+            return false
+        }
+    }
+    true
+}
+
+fn dos_date(seconds: i64) -> i64 {
+    let when = time.from_unix(seconds)
+    if when.date.year < 1980 {
+        return 0x21
+    }
+    (when.date.year - 1980) << 9 | when.date.month << 5 | when.date.day
+}
+
+fn dos_clock(seconds: i64) -> i64 {
+    let when = time.from_unix(seconds)
+    if when.date.year < 1980 {
+        return 0
+    }
+    when.hour << 11 | when.minute << 5 | when.second / 2
+}
+
+fn timestamp_extra(mtime: i64) -> []u8 {
+    var out: []u8 = []
+    if mtime < 0 || mtime > 0xFFFFFFFF {
+        return out
+    }
+    put16(mut out, 0x5455)
+    put16(mut out, 5)
+    push(mut out, 1)
+    put32(mut out, mtime)
+    out
+}
+
+fn validate(w: *Writer, e: Entry) ! io.Error {
+    if w.closed || e.name.len == 0 || e.name.len > 0xFFFF {
+        fail Invalid
+    }
+    for i in 0..e.name.len {
+        if e.name[i] == 0 {
+            fail Invalid
+        }
+    }
+}
+
+fn compress(data: []u8, method: Method) -> Packed {
+    match method {
+        Deflate => {
+            let packed = deflate.compress(data, 6)
+            if packed.len < data.len {
+                return Packed { body: packed, method: 8 }
+            }
+            Packed { body: data, method: 0 }
+        }
+        _ => Packed { body: data, method: 0 }
+    }
+}
+
+struct Packed {
+    body: []u8
+    method: i64
+}
+
+fn prepare(e: Entry, data: []u8) -> Prepared {
+    let perm = e.mode & 0o7777
+    match e.kind {
+        Dir => {
+            let name = if text.ends_with(e.name, "/") { e.name } else { "{e.name}/" }
+            Prepared { name, body: [], method: 0, crc: 0, size: 0, flags: flags_of(name), mode: 0o40000 | perm, external: 0x10 }
+        }
+        Symlink => Prepared { name: e.name, body: data, method: 0, crc: i64(hash.crc32(data)), size: data.len, flags: flags_of(e.name), mode: 0o120000 | perm, external: 0 }
+        File => {
+            let packed = compress(data, e.method)
+            Prepared { name: e.name, body: packed.body, method: packed.method, crc: i64(hash.crc32(data)), size: data.len, flags: flags_of(e.name), mode: 0o100000 | perm, external: 0 }
+        }
+    }
+}
+
+fn flags_of(name: str) -> i64 {
+    if ascii(name) { 0 } else { 0x800 }
+}
+
+fn local_header(w: *Writer, p: Prepared, mtime: i64) -> []u8 {
+    let wide = w.force64 || p.size >= 0xFFFFFFFF || p.body.len >= 0xFFFFFFFF
+    var extra: []u8 = []
+    if wide {
+        put16(mut extra, 1)
+        put16(mut extra, 16)
+        put64(mut extra, p.size)
+        put64(mut extra, p.body.len)
+    }
+    io.append(mut extra, timestamp_extra(mtime))
+    var out: []u8 = []
+    put32(mut out, 0x04034b50)
+    put16(mut out, if wide { 45 } else { 20 })
+    put16(mut out, p.flags)
+    put16(mut out, p.method)
+    put16(mut out, dos_clock(mtime))
+    put16(mut out, dos_date(mtime))
+    put32(mut out, p.crc)
+    put32(mut out, if wide { 0xFFFFFFFF } else { p.body.len })
+    put32(mut out, if wide { 0xFFFFFFFF } else { p.size })
+    put16(mut out, p.name.len)
+    put16(mut out, extra.len)
+    text.append(mut out, p.name)
+    io.append(mut out, extra)
+    out
+}
+
+fn add_central(w: *Writer, p: Prepared, mtime: i64, offset: i64) {
+    let sizes_wide = w.force64 || p.size >= 0xFFFFFFFF || p.body.len >= 0xFFFFFFFF
+    let offset_wide = w.force64 || offset >= 0xFFFFFFFF
+    var extra: []u8 = []
+    if sizes_wide || offset_wide {
+        put16(mut extra, 1)
+        put16(mut extra, (if sizes_wide { 16 } else { 0 }) + (if offset_wide { 8 } else { 0 }))
+        if sizes_wide {
+            put64(mut extra, p.size)
+            put64(mut extra, p.body.len)
+        }
+        if offset_wide {
+            put64(mut extra, offset)
+        }
+    }
+    io.append(mut extra, timestamp_extra(mtime))
+    var record: []u8 = []
+    put32(mut record, 0x02014b50)
+    put16(mut record, 3 << 8 | if sizes_wide || offset_wide { 45 } else { 20 })
+    put16(mut record, if sizes_wide || offset_wide { 45 } else { 20 })
+    put16(mut record, p.flags)
+    put16(mut record, p.method)
+    put16(mut record, dos_clock(mtime))
+    put16(mut record, dos_date(mtime))
+    put32(mut record, p.crc)
+    put32(mut record, if sizes_wide { 0xFFFFFFFF } else { p.body.len })
+    put32(mut record, if sizes_wide { 0xFFFFFFFF } else { p.size })
+    put16(mut record, p.name.len)
+    put16(mut record, extra.len)
+    put16(mut record, 0)
+    put16(mut record, 0)
+    put16(mut record, 0)
+    put32(mut record, p.mode << 16 | p.external)
+    put32(mut record, if offset_wide { 0xFFFFFFFF } else { offset })
+    text.append(mut record, p.name)
+    io.append(mut record, extra)
+    io.append(mut w.central, record)
+    w.count += 1
+}
+
+pub fn add(w: *Writer, e: Entry, data: []u8) ! io.Error {
+    validate(w, e)?
+    let p = prepare(e, data)
+    let offset = w.written
+    emit(w, local_header(w, p, e.mtime))?
+    emit(w, p.body)?
+    add_central(w, p, e.mtime, offset)
+}
+
+pub fn add_file(w: *Writer, name: str, data: []u8, method: Method) ! io.Error {
+    add(w, Entry { name, method }, data)?
+}
+
+pub fn add_dir(w: *Writer, name: str) ! io.Error {
+    add(w, Entry { name, kind: Dir, method: Stored, mode: 0o755 }, [])?
+}
+
+pub fn add_symlink(w: *Writer, name: str, target: str) ! io.Error {
+    add(w, Entry { name, kind: Symlink, method: Stored, mode: 0o777 }, bytes(target))?
+}
+
+pub fn finish(w: *Writer) ! io.Error {
+    if w.closed {
+        return
+    }
+    w.closed = true
+    let offset = w.written
+    let size = w.central.len
+    emit(w, w.central)?
+    let wide = w.force64 || w.count >= 0xFFFF || size >= 0xFFFFFFFF || offset >= 0xFFFFFFFF
+    var out: []u8 = []
+    if wide {
+        put32(mut out, 0x06064b50)
+        put64(mut out, 44)
+        put16(mut out, 45)
+        put16(mut out, 45)
+        put32(mut out, 0)
+        put32(mut out, 0)
+        put64(mut out, w.count)
+        put64(mut out, w.count)
+        put64(mut out, size)
+        put64(mut out, offset)
+        put32(mut out, 0x07064b50)
+        put32(mut out, 0)
+        put64(mut out, offset + size)
+        put32(mut out, 1)
+    }
+    put32(mut out, 0x06054b50)
+    put16(mut out, 0)
+    put16(mut out, 0)
+    put16(mut out, if wide { 0xFFFF } else { w.count })
+    put16(mut out, if wide { 0xFFFF } else { w.count })
+    put32(mut out, if wide { 0xFFFFFFFF } else { size })
+    put32(mut out, if wide { 0xFFFFFFFF } else { offset })
+    put16(mut out, 0)
+    emit(w, out)?
+}

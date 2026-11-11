@@ -1,3 +1,154 @@
+import std/file
+import std/io
+import std/text
+
+pub struct User {
+    pub name: str
+    pub uid: i64
+    pub gid: i64
+    pub home: str
+    pub shell: str
+}
+
+struct Anchor {
+    words: []i64
+    data: []u8
+}
+
+fn anchor_address() -> i64 {
+    0x3e5700000000
+}
+
+fn anchor_size() -> i64 {
+    1048576
+}
+
+fn anchor_data() -> i64 {
+    64
+}
+
+fn anchor_magic() -> i64 {
+    0x4c4f574f56455231
+}
+
+fn view_anchor() -> Anchor {
+    let raw = __slice_ptr(__str_raw(anchor_address(), anchor_size()))
+    let any: ptr = raw
+    let words: ptr[i64] = any
+    Anchor { words: view(words, anchor_size() / 8), data: view(raw, anchor_size()) }
+}
+
+fn anchor_mapped() -> bool {
+    __syscall(28, anchor_address(), 4096, 0) == 0
+}
+
+fn anchor_ready(a: Anchor) -> bool {
+    __cas(mut a.words[1], anchor_magic(), anchor_magic())
+}
+
+fn attach() -> Anchor? {
+    if !anchor_mapped() {
+        return none
+    }
+    let a = view_anchor()
+    if anchor_ready(a) {
+        return a
+    }
+    none
+}
+
+fn create() -> Anchor ! io.Error {
+    if !anchor_mapped() {
+        let r = __syscall(9, anchor_address(), anchor_size(), 3, 0x104022, -1, 0)
+        if r == anchor_address() {
+            let fresh = view_anchor()
+            __cas(mut fresh.words[1], 0, anchor_magic())
+            return fresh
+        }
+        if r >= 0 {
+            __syscall(11, r, anchor_size())
+            fail Unsupported
+        }
+        if r != -17 {
+            fail io.errno(-r)
+        }
+    }
+    let a = view_anchor()
+    for _ in 0..1000 {
+        if anchor_ready(a) {
+            return a
+        }
+        __syscall(24)
+    }
+    fail Unsupported
+}
+
+fn records(blob: str) -> []str {
+    var out: []str = []
+    var start = 0
+    for i in 0..blob.len {
+        if blob[i] == 0 {
+            push(mut out, blob[start..i])
+            start = i + 1
+        }
+    }
+    out
+}
+
+fn record_name(record: str) -> str {
+    let at = text.index_byte(record, '=')
+    if at < 0 {
+        return record
+    }
+    record[..at]
+}
+
+fn snapshot() -> str {
+    let a = attach() ?? return ""
+    __lock(mut a.words[0])
+    let blob = str(a.data[anchor_data()..anchor_data() + a.words[2]])
+    __unlock(mut a.words[0])
+    blob
+}
+
+fn put_record(name: str, record: str) ! io.Error {
+    let a = create()?
+    __lock(mut a.words[0])
+    defer __unlock(mut a.words[0])
+    var out: []u8 = []
+    for existing in records(str(a.data[anchor_data()..anchor_data() + a.words[2]])) {
+        if record_name(existing) != name {
+            text.append(mut out, existing)
+            push(mut out, 0)
+        }
+    }
+    text.append(mut out, record)
+    push(mut out, 0)
+    if anchor_data() + out.len > a.data.len {
+        fail NoSpace
+    }
+    __memmove(a.data[anchor_data()..], out)
+    a.words[2] = out.len
+}
+
+fn valid_name(name: str) -> bool {
+    name.len > 0 && text.index_byte(name, '=') < 0 && text.index_byte(name, 0) < 0
+}
+
+pub fn set_env(name: str, value: str) ! io.Error {
+    if !valid_name(name) || text.index_byte(value, 0) >= 0 {
+        fail Invalid
+    }
+    put_record(name, "{name}={value}")?
+}
+
+pub fn unset_env(name: str) ! io.Error {
+    if !valid_name(name) {
+        fail Invalid
+    }
+    put_record(name, name)?
+}
+
 pub fn args() -> []str {
     var out: []str = []
     for i in 0..__argc() {
@@ -29,16 +180,36 @@ pub fn environment() -> [str: str] {
             }
         }
     }
+    for record in records(snapshot()) {
+        let name = record_name(record)
+        if record.len == name.len {
+            delete(mut vars, name)
+        } else {
+            vars[name] = record[name.len + 1..]
+        }
+    }
     vars
 }
 
-pub fn env(name: str) -> str? {
+fn inherited(name: str) -> str? {
     for entry in environ() {
         if entry.len > name.len && entry[name.len] == '=' && entry[..name.len] == name {
             return entry[name.len + 1..]
         }
     }
     none
+}
+
+pub fn env(name: str) -> str? {
+    for record in records(snapshot()) {
+        if record_name(record) == name {
+            if record.len == name.len {
+                return none
+            }
+            return record[name.len + 1..]
+        }
+    }
+    inherited(name)
 }
 
 pub fn umask(mask: i64) -> i64 {
@@ -49,6 +220,169 @@ pub fn pid() -> i64 {
     __syscall(39)
 }
 
+pub fn ppid() -> i64 {
+    __syscall(110)
+}
+
+pub fn uid() -> i64 {
+    __syscall(102)
+}
+
+pub fn gid() -> i64 {
+    __syscall(104)
+}
+
+pub fn euid() -> i64 {
+    __syscall(107)
+}
+
+pub fn egid() -> i64 {
+    __syscall(108)
+}
+
 pub fn exit(code: i64) {
     __syscall(231, code)
+}
+
+fn c_string(buf: []u8, from: i64) -> str {
+    var end = from
+    for end < buf.len && buf[end] != 0 {
+        end += 1
+    }
+    str(buf[from..end])
+}
+
+pub fn getcwd() -> str ! io.Error {
+    var size = 256
+    for size <= 1048576 {
+        let buf = io.buffer(size)
+        let r = __syscall(79, __slice_ptr(buf), size)
+        if r == -34 {
+            size *= 4
+            continue
+        }
+        let n = io.syscall_result(r)?
+        return str(buf[..n - 1])
+    }
+    fail TooLarge
+}
+
+pub fn chdir(path: str) ! io.Error {
+    io.syscall_result(__syscall(80, cstr(path)))?
+}
+
+pub fn hostname() -> str ! io.Error {
+    let buf = io.buffer(390)
+    io.syscall_result(__syscall(63, __slice_ptr(buf)))?
+    c_string(buf, 65)
+}
+
+pub fn executable() -> str ! io.Error {
+    file.readlink("/proc/self/exe")?
+}
+
+pub fn uptime() -> i64 ! io.Error {
+    let buf = io.buffer(112)
+    io.syscall_result(__syscall(99, __slice_ptr(buf)))?
+    io.le64(buf, 0)
+}
+
+fn bit_count(b: u8) -> i64 {
+    var n = 0
+    var rest = b
+    for rest != 0 {
+        n += i64(rest & 1)
+        rest >>= 1
+    }
+    n
+}
+
+pub fn cpu_count() -> i64 {
+    let buf = io.buffer(1024)
+    let r = __syscall(204, 0, buf.len, __slice_ptr(buf))
+    if r <= 0 {
+        return 1
+    }
+    var n = 0
+    for i in 0..r {
+        n += bit_count(buf[i])
+    }
+    n
+}
+
+fn parse_user(line: str) -> User? {
+    let parts = text.split(line, ':')
+    if parts.len < 7 {
+        return none
+    }
+    let uid = text.parse_int(parts[2]) catch { _ => return none }
+    let gid = text.parse_int(parts[3]) catch { _ => return none }
+    User { name: parts[0], uid, gid, home: parts[5], shell: parts[6] }
+}
+
+pub fn lookup_user(id: i64) -> User? {
+    let content = file.read_text("/etc/passwd") catch { _ => return none }
+    for line in text.lines(content) {
+        let user = parse_user(line)
+        match user {
+            some(u) => {
+                if u.uid == id {
+                    return u
+                }
+            }
+            none => {}
+        }
+    }
+    none
+}
+
+pub fn user_name() -> str? {
+    let user = lookup_user(euid()) ?? return none
+    user.name
+}
+
+fn account_home() -> str? {
+    let user = lookup_user(euid()) ?? return none
+    user.home
+}
+
+fn present(name: str) -> str? {
+    let value = env(name) ?? return none
+    if value.len == 0 {
+        return none
+    }
+    value
+}
+
+pub fn home_dir() -> str? {
+    present("HOME") ?? account_home()
+}
+
+fn xdg_dir(variable: str, fallback: str) -> str? {
+    let configured = present(variable) ?? ""
+    if configured.len > 0 && configured[0] == '/' {
+        return configured
+    }
+    let home = home_dir() ?? return none
+    "{home}/{fallback}"
+}
+
+pub fn cache_dir() -> str? {
+    xdg_dir("XDG_CACHE_HOME", ".cache")
+}
+
+pub fn config_dir() -> str? {
+    xdg_dir("XDG_CONFIG_HOME", ".config")
+}
+
+pub fn data_dir() -> str? {
+    xdg_dir("XDG_DATA_HOME", ".local/share")
+}
+
+pub fn state_dir() -> str? {
+    xdg_dir("XDG_STATE_HOME", ".local/state")
+}
+
+pub fn temp_dir_path() -> str {
+    present("TMPDIR") ?? "/tmp"
 }

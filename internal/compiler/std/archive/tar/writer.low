@@ -1,0 +1,242 @@
+import std/compress/deflate
+import std/io
+import std/text
+
+pub struct Writer {
+    sink: io.Stream?
+    data: []u8
+    closed: bool
+}
+
+struct Names {
+    name: str
+    prefix: str
+    fits: bool
+}
+
+pub fn writer() -> *Writer {
+    new(Writer { sink: none, data: [], closed: false })
+}
+
+pub fn stream_writer(sink: io.Stream) -> *Writer {
+    new(Writer { sink, data: [], closed: false })
+}
+
+pub fn output(w: *Writer) -> []u8 {
+    w.data
+}
+
+fn emit(w: *Writer, chunk: []u8) ! io.Error {
+    match w.sink {
+        some(s) => io.write_all(s, chunk)?
+        none => io.append(mut w.data, chunk)
+    }
+}
+
+fn ascii(s: str) -> bool {
+    for i in 0..s.len {
+        if s[i] >= 128 || s[i] == 0 {
+            return false
+        }
+    }
+    true
+}
+
+fn fits(v: i64, width: i64) -> bool {
+    v >= 0 && v < 1 << (3 * (width - 1))
+}
+
+fn put_octal(block: []u8, at: i64, width: i64, v: i64) {
+    if !fits(v, width) {
+        return
+    }
+    var x = v
+    var i = at + width - 2
+    for i >= at {
+        block[i] = u8(48 + (x & 7))
+        x = x >> 3
+        i -= 1
+    }
+}
+
+fn put_text(block: []u8, at: i64, limit: i64, s: str) {
+    let n = if s.len < limit { s.len } else { limit }
+    for i in 0..n {
+        block[at + i] = s[i]
+    }
+}
+
+fn type_flag(kind: Kind) -> u8 ! io.Error {
+    match kind {
+        File => '0'
+        Dir => '5'
+        Symlink => '2'
+        Hardlink => '1'
+        Other => fail Unsupported
+    }
+}
+
+fn header_block(names: Names, link: str, mode: i64, uid: i64, gid: i64, size: i64, mtime: i64, flag: u8) -> []u8 {
+    let block = io.buffer(512)
+    put_text(block, 0, 100, names.name)
+    put_octal(block, 100, 8, mode & 0o7777)
+    put_octal(block, 108, 8, uid)
+    put_octal(block, 116, 8, gid)
+    put_octal(block, 124, 12, size)
+    put_octal(block, 136, 12, mtime)
+    block[156] = flag
+    put_text(block, 157, 100, link)
+    put_text(block, 257, 6, "ustar")
+    put_text(block, 263, 2, "00")
+    put_text(block, 345, 155, names.prefix)
+    for i in 148..156 {
+        block[i] = ' '
+    }
+    var sum = 0
+    for b in block {
+        sum += i64(b)
+    }
+    put_octal(block, 148, 7, sum)
+    block[154] = 0
+    block[155] = ' '
+    block
+}
+
+fn split_name(name: str) -> Names {
+    if name.len <= 100 {
+        return Names { name, prefix: "", fits: ascii(name) }
+    }
+    var i = if name.len - 1 < 155 { name.len - 1 } else { 155 }
+    for i > 0 {
+        if name[i] == '/' && name.len - i - 1 <= 100 && name.len - i - 1 > 0 {
+            return Names { name: name[i + 1..], prefix: name[..i], fits: ascii(name) }
+        }
+        i -= 1
+    }
+    Names { name: name[..100], prefix: "", fits: false }
+}
+
+fn digits(n: i64) -> i64 {
+    var count = 1
+    var x = n
+    for x >= 10 {
+        x = x / 10
+        count += 1
+    }
+    count
+}
+
+fn pax_record(mut out: []u8, key: str, value: str) {
+    let body = key.len + value.len + 3
+    var total = body + digits(body)
+    total = body + digits(total)
+    text.append(mut out, "{total} {key}={value}\n")
+}
+
+fn pax_records(e: Entry, name: str, names: Names, size: i64) -> []u8 {
+    var out: []u8 = []
+    if !names.fits {
+        pax_record(mut out, "path", name)
+    }
+    if e.link.len > 100 || !ascii(e.link) {
+        pax_record(mut out, "linkpath", e.link)
+    }
+    if !fits(size, 12) {
+        pax_record(mut out, "size", "{size}")
+    }
+    if !fits(e.uid, 8) {
+        pax_record(mut out, "uid", "{e.uid}")
+    }
+    if !fits(e.gid, 8) {
+        pax_record(mut out, "gid", "{e.gid}")
+    }
+    if !fits(e.mtime, 12) {
+        pax_record(mut out, "mtime", "{e.mtime}")
+    }
+    out
+}
+
+fn base_name(name: str) -> str {
+    let trimmed = text.trim_suffix(name, "/")
+    let slash = text.last_index_byte(trimmed, '/')
+    trimmed[slash + 1..]
+}
+
+fn emit_padded(w: *Writer, data: []u8) ! io.Error {
+    emit(w, data)?
+    let pad = padding(data.len)
+    if pad > 0 {
+        emit(w, io.buffer(pad))?
+    }
+}
+
+fn emit_pax(w: *Writer, records: []u8, name: str, e: Entry) ! io.Error {
+    let label = "PaxHeaders.0/{base_name(name)}"
+    let names = Names { name: label, prefix: "", fits: true }
+    let stamp = if fits(e.mtime, 12) { e.mtime } else { 0 }
+    let block = header_block(names, "", 0o644, 0, 0, records.len, stamp, 'x')
+    emit(w, block)?
+    emit_padded(w, records)?
+}
+
+fn validate(w: *Writer, e: Entry) ! io.Error {
+    if w.closed || e.name.len == 0 {
+        fail Invalid
+    }
+    for i in 0..e.name.len {
+        if e.name[i] == 0 {
+            fail Invalid
+        }
+    }
+}
+
+pub fn add(w: *Writer, e: Entry, data: []u8) ! io.Error {
+    validate(w, e)?
+    let flag = type_flag(e.kind)?
+    let name = if e.kind == Dir && !text.ends_with(e.name, "/") { "{e.name}/" } else { e.name }
+    let size = if e.kind == File { data.len } else { 0 }
+    let names = split_name(name)
+    let records = pax_records(e, name, names, size)
+    if records.len > 0 {
+        emit_pax(w, records, name, e)?
+    }
+    let stamp = if fits(e.mtime, 12) { e.mtime } else { 0 }
+    let block = header_block(names, e.link, e.mode, e.uid, e.gid, size, stamp, flag)
+    emit(w, block)?
+    if size > 0 {
+        emit_padded(w, data)?
+    }
+}
+
+pub fn add_file(w: *Writer, name: str, data: []u8, mode: i64) ! io.Error {
+    add(w, Entry { name, mode }, data)?
+}
+
+pub fn add_dir(w: *Writer, name: str, mode: i64) ! io.Error {
+    add(w, Entry { name, mode, kind: Dir }, [])?
+}
+
+pub fn add_symlink(w: *Writer, name: str, target: str) ! io.Error {
+    add(w, Entry { name, mode: 0o777, kind: Symlink, link: target }, [])?
+}
+
+pub fn add_hardlink(w: *Writer, name: str, target: str) ! io.Error {
+    add(w, Entry { name, kind: Hardlink, link: target }, [])?
+}
+
+pub fn finish(w: *Writer) ! io.Error {
+    if w.closed {
+        return
+    }
+    w.closed = true
+    emit(w, io.buffer(1024))?
+}
+
+pub fn write_gzip(w: *Writer, level: i64) -> []u8 ! io.Error {
+    match w.sink {
+        some(_) => fail Unsupported
+        none => {}
+    }
+    finish(w)?
+    deflate.gzip_compress(w.data, level)
+}

@@ -1,0 +1,320 @@
+import std/atomic
+import std/sync
+
+struct Shared {
+    a: i64
+    b: i64
+    broken: i64
+    running: i64
+    peak: i64
+    total: i64
+    queue: []i64
+    open: bool
+}
+
+enum Failure {
+    Odd(n: i64)
+    Negative(n: i64)
+}
+
+fn write_pair(l: sync.RwLock, s: *Shared, group: sync.WaitGroup) {
+    for i in 0..50 {
+        l.write_lock()
+        s.a += 1
+        sleep(0)
+        s.b += 1
+        l.write_unlock()
+    }
+    group.done()
+}
+
+fn read_pair(l: sync.RwLock, s: *Shared, group: sync.WaitGroup) {
+    for i in 0..50 {
+        l.read_lock()
+        if s.a != s.b {
+            s.broken += 1
+        }
+        sleep(0)
+        l.read_unlock()
+    }
+    group.done()
+}
+
+fn rwlock() {
+    let l = sync.rw_lock()
+    print("try read {l.try_read_lock()}")
+    print("try read {l.try_read_lock()}")
+    print("try write {l.try_write_lock()}")
+    l.read_unlock()
+    l.read_unlock()
+    print("try write {l.try_write_lock()}")
+    print("try read {l.try_read_lock()}")
+    print("try write {l.try_write_lock()}")
+    l.write_unlock()
+
+    let s = new(Shared { a: 0, b: 0, broken: 0, running: 0, peak: 0, total: 0, queue: [], open: false })
+    let group = sync.wait_group()
+    for t in 0..4 {
+        group.add(2)
+        spawn write_pair(l, s, group)
+        spawn read_pair(l, s, group)
+    }
+    group.wait()
+    print("pairs {s.a} {s.b} torn {s.broken}")
+
+    let n = l.reading(fn() -> i64 { s.a })
+    let m = l.writing(fn() -> i64 {
+        s.a += 1
+        s.a
+    })
+    print("helpers {n} {m}")
+}
+
+fn blocked_writer(l: sync.RwLock, order: chan[str]) {
+    l.write_lock()
+    order <- "writer"
+    l.write_unlock()
+}
+
+fn blocked_reader(l: sync.RwLock, order: chan[str]) {
+    l.read_lock()
+    order <- "reader"
+    l.read_unlock()
+}
+
+fn rwlock_parks() {
+    let l = sync.rw_lock()
+    let order = chan[str](4)
+    l.read_lock()
+    spawn blocked_writer(l, order)
+    sleep(20)
+    print("reader behind a waiting writer {l.try_read_lock()}")
+    spawn blocked_reader(l, order)
+    sleep(20)
+    let early = select {
+        <-order => true
+        else => false
+    }
+    print("early {early}")
+    l.read_unlock()
+    let first = (<-order) ?? "closed"
+    let second = (<-order) ?? "closed"
+    print("order {first} {second}")
+}
+
+fn limited(sem: sync.Semaphore, s: *Shared, guard: sync.Mutex, group: sync.WaitGroup) {
+    sem.acquire()
+    guard.lock()
+    s.running += 1
+    if s.running > s.peak {
+        s.peak = s.running
+    }
+    guard.unlock()
+    sleep(2)
+    guard.lock()
+    s.running -= 1
+    s.total += 1
+    guard.unlock()
+    sem.release()
+    group.done()
+}
+
+fn semaphores() {
+    let sem = sync.semaphore(3)
+    let guard = sync.mutex()
+    let s = new(Shared { a: 0, b: 0, broken: 0, running: 0, peak: 0, total: 0, queue: [], open: false })
+    let group = sync.wait_group()
+    for t in 0..24 {
+        group.add(1)
+        spawn limited(sem, s, guard, group)
+    }
+    group.wait()
+    print("done {s.total} peak within limit {s.peak >= 1 && s.peak <= 3} left {sem.available()}")
+
+    let one = sync.semaphore(1)
+    print("try {one.try_acquire()} {one.try_acquire()}")
+    one.release()
+    print("try {one.try_acquire()}")
+}
+
+fn consume(c: sync.Cond, m: sync.Mutex, s: *Shared, group: sync.WaitGroup) {
+    for {
+        m.lock()
+        for s.queue.len == 0 && s.open {
+            c.wait_cond()
+        }
+        if s.queue.len == 0 {
+            m.unlock()
+            break
+        }
+        s.total += s.queue[0]
+        s.queue = s.queue[1..]
+        m.unlock()
+    }
+    group.done()
+}
+
+fn wait_open(c: sync.Cond, m: sync.Mutex, s: *Shared, woken: atomic.Int, group: sync.WaitGroup) {
+    m.lock()
+    for !s.open {
+        c.wait_cond()
+    }
+    m.unlock()
+    woken.add_int(1)
+    group.done()
+}
+
+fn conditions() {
+    let m = sync.mutex()
+    let c = sync.cond(m)
+    let s = new(Shared { a: 0, b: 0, broken: 0, running: 0, peak: 0, total: 0, queue: [], open: true })
+    let group = sync.wait_group()
+    for t in 0..4 {
+        group.add(1)
+        spawn consume(c, m, s, group)
+    }
+    var expected = 0
+    for i in 1..201 {
+        m.lock()
+        push(mut s.queue, i)
+        m.unlock()
+        c.signal()
+        expected += i
+    }
+    m.lock()
+    s.open = false
+    m.unlock()
+    c.broadcast()
+    group.wait()
+    print("consumed {s.total == expected} {s.total}")
+
+    let gate = new(Shared { a: 0, b: 0, broken: 0, running: 0, peak: 0, total: 0, queue: [], open: false })
+    let woken = atomic.int(0)
+    let waiting = sync.wait_group()
+    for t in 0..6 {
+        waiting.add(1)
+        spawn wait_open(c, m, gate, woken, waiting)
+    }
+    sleep(10)
+    print("before {woken.load_int()}")
+    m.lock()
+    gate.open = true
+    m.unlock()
+    c.broadcast()
+    waiting.wait()
+    print("after {woken.load_int()}")
+}
+
+fn phase(b: sync.Barrier, s: *Shared, guard: sync.Mutex, leaders: atomic.Int, group: sync.WaitGroup) {
+    for round in 1..6 {
+        guard.lock()
+        s.a += 1
+        guard.unlock()
+        if b.wait_barrier() {
+            leaders.add_int(1)
+        }
+        guard.lock()
+        if s.a != round * 5 {
+            s.broken += 1
+        }
+        guard.unlock()
+        b.wait_barrier()
+    }
+    group.done()
+}
+
+fn barriers() {
+    let b = sync.barrier(5)
+    let guard = sync.mutex()
+    let leaders = atomic.int(0)
+    let s = new(Shared { a: 0, b: 0, broken: 0, running: 0, peak: 0, total: 0, queue: [], open: false })
+    let group = sync.wait_group()
+    for t in 0..5 {
+        group.add(1)
+        spawn phase(b, s, guard, leaders, group)
+    }
+    group.wait()
+    print("rounds {s.a} out of step {s.broken} leaders {leaders.load_int()}")
+
+    let alone = sync.barrier(1)
+    print("alone {alone.wait_barrier()} {alone.wait_barrier()}")
+}
+
+fn once_values() {
+    let runs = atomic.int(0)
+    let v = sync.once_value(fn() -> i64 {
+        runs.add_int(1)
+        sleep(5)
+        42
+    })
+    let results = chan[i64](8)
+    for t in 0..8 {
+        spawn fetch(v, results)
+    }
+    var sum = 0
+    for t in 0..8 {
+        sum += (<-results) ?? 0
+    }
+    print("once {sum} computed {runs.load_int()} again {v.get_once()} {runs.load_int()}")
+}
+
+fn fetch(v: sync.OnceValue[i64], out: chan[i64]) {
+    out <- v.get_once()
+}
+
+fn task(n: i64, s: *Shared, guard: sync.Mutex) -> Failure? {
+    guard.lock()
+    s.running += 1
+    if s.running > s.peak {
+        s.peak = s.running
+    }
+    guard.unlock()
+    sleep(2)
+    guard.lock()
+    s.running -= 1
+    s.total += n
+    guard.unlock()
+    if n < 0 {
+        return Negative(n)
+    }
+    none
+}
+
+fn error_groups() {
+    let guard = sync.mutex()
+    let s = new(Shared { a: 0, b: 0, broken: 0, running: 0, peak: 0, total: 0, queue: [], open: false })
+    let g = sync.group[Failure](2)
+    for i in 1..11 {
+        g.go(fn() -> Failure? { task(i, s, guard) })
+    }
+    let clean = g.join()
+    print("clean {clean == none} total {s.total} peak within limit {s.peak >= 1 && s.peak <= 2}")
+
+    let h = sync.group[Failure](3)
+    for i in 0..6 {
+        h.go(fn() -> Failure? {
+            if i == 4 {
+                return Negative(-4)
+            }
+            none
+        })
+    }
+    let failed = h.join()
+    match failed {
+        some(f) => match f {
+            Negative(n) => print("failed negative {n}")
+            Odd(n) => print("failed odd {n}")
+        }
+        none => print("no failure")
+    }
+}
+
+fn main() {
+    rwlock()
+    rwlock_parks()
+    semaphores()
+    conditions()
+    barriers()
+    once_values()
+    error_groups()
+}
