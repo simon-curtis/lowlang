@@ -15,7 +15,7 @@ type symbol struct {
 	state   symState
 	section *secBuilder
 	value   int64
-	item    int
+	frag    int32
 	global  bool
 }
 
@@ -36,7 +36,7 @@ func (a *assembler) defineLabel(name string) {
 	}
 	sym.state = symLabel
 	sym.section = a.cur
-	sym.value, sym.item = a.cur.mark()
+	sym.value, sym.frag = a.cur.mark()
 }
 
 func (a *assembler) defineNumericLabel(n int) {

@@ -9,21 +9,18 @@ type Options struct {
 }
 
 type Object struct {
-	Sections    []*Section
-	Symbols     []Symbol
-	TextEncoded bool
+	Sections []*Section
+	Symbols  []Symbol
 }
 
 type Section struct {
-	Name       string
-	Flags      string
-	Align      int64
-	Data       []byte
-	NoBits     bool
-	Size       int64
-	Fixups     []Fixup
-	Items      []Item
-	Unresolved []Span
+	Name   string
+	Flags  string
+	Align  int64
+	Data   []byte
+	NoBits bool
+	Size   int64
+	Fixups []Fixup
 }
 
 const (
@@ -36,7 +33,6 @@ type Symbol struct {
 	Section int
 	Value   int64
 	Global  bool
-	Item    int
 }
 
 type FixupKind int
@@ -46,24 +42,28 @@ const (
 	Abs32
 	Abs32S
 	PC32
+	PLT32
 	GOTPCREL
+	GOTPCRELX
+	REXGOTPCRELX
 	ImgRel32
 )
 
+var fixupKindNames = [...]string{
+	Abs64:        "Abs64",
+	Abs32:        "Abs32",
+	Abs32S:       "Abs32S",
+	PC32:         "PC32",
+	PLT32:        "PLT32",
+	GOTPCREL:     "GOTPCREL",
+	GOTPCRELX:    "GOTPCRELX",
+	REXGOTPCRELX: "REX_GOTPCRELX",
+	ImgRel32:     "ImgRel32",
+}
+
 func (k FixupKind) String() string {
-	switch k {
-	case Abs64:
-		return "Abs64"
-	case Abs32:
-		return "Abs32"
-	case Abs32S:
-		return "Abs32S"
-	case PC32:
-		return "PC32"
-	case GOTPCREL:
-		return "GOTPCREL"
-	case ImgRel32:
-		return "ImgRel32"
+	if k > 0 && int(k) < len(fixupKindNames) {
+		return fixupKindNames[k]
 	}
 	return fmt.Sprintf("FixupKind(%d)", int(k))
 }
@@ -73,35 +73,6 @@ type Fixup struct {
 	Kind   FixupKind
 	Symbol string
 	Addend int64
-	Line   int
-}
-
-type Span struct {
-	Offset int64
-	Size   int64
-}
-
-type ItemKind uint8
-
-const (
-	ItemInst ItemKind = iota + 1
-	ItemData
-	ItemAlign
-)
-
-type Item struct {
-	Kind  ItemKind
-	Line  int
-	Inst  *Inst
-	Data  []byte
-	Exprs []DataExpr
-	Align int64
-}
-
-type DataExpr struct {
-	Offset int64
-	Size   int
-	Value  Value
 	Line   int
 }
 

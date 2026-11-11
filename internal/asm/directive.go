@@ -20,9 +20,7 @@ func (a *assembler) directive(name string) {
 	case ".zero", ".space":
 		a.zeroFill()
 	case ".p2align":
-		power := a.constExpr()
-		a.emitAlign(power)
-		a.expectEnd()
+		a.alignDirective()
 	case ".set":
 		a.setSymbol()
 	case ".globl", ".global":
@@ -64,8 +62,31 @@ func (a *assembler) intelSyntax() {
 	}
 }
 
+func (a *assembler) alignDirective() {
+	s := &a.sc
+	power := a.constExpr()
+	var max int64
+	if s.accept(',') {
+		s.skipSpace()
+		if s.peek() != ',' {
+			a.fail(".p2align with a fill value is not supported")
+		}
+		s.pos++
+		max = a.constExpr()
+	}
+	a.emitAlign(power, max)
+	a.expectEnd()
+}
+
+func (a *assembler) markConstantData() {
+	if a.cur.exec {
+		a.cur.last = lastDirective
+	}
+}
+
 func (a *assembler) dataList(size int) {
 	s := &a.sc
+	a.markConstantData()
 	for {
 		s.skipSpace()
 		if n, ok := s.plainInt(); ok {
@@ -82,6 +103,7 @@ func (a *assembler) dataList(size int) {
 }
 
 func (a *assembler) zeroFill() {
+	a.markConstantData()
 	n := a.constExpr()
 	fill := int64(0)
 	if a.sc.accept(',') {
@@ -160,6 +182,7 @@ func (a *assembler) sectionType(name string) bool {
 
 func (a *assembler) doubleList() {
 	s := &a.sc
+	a.markConstantData()
 	for {
 		s.skipSpace()
 		start := s.pos
@@ -198,6 +221,7 @@ func (a *assembler) scanFloat() {
 
 func (a *assembler) stringList(terminate bool) {
 	s := &a.sc
+	a.markConstantData()
 	for {
 		text := a.stringLiteral()
 		a.emitString(text)
@@ -297,6 +321,7 @@ func (a *assembler) numericEscape(base uint64, maxDigits int) byte {
 }
 
 func (a *assembler) incbin() {
+	a.markConstantData()
 	path := a.stringLiteral()
 	data, err := os.ReadFile(path)
 	if err != nil {

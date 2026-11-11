@@ -79,28 +79,23 @@ func TestSymbolDifferences(t *testing.T) {
 `)
 }
 
-func TestUnresolvedTextDifference(t *testing.T) {
-	object, err := asm.Assemble(`
+func TestTextSymbolDifference(t *testing.T) {
+	assertMatchesAs(t, `
 	.intel_syntax noprefix
 	.text
+	.globl entry
+entry:
 .Lt1:
 	nop
+	jmp .Lt3
+	mov rax, 5
 .Lt2:
+	.p2align 4
+.Lt3:
+	ret
 	.section .rodata
-	.long 7, .Lt2 - .Lt1
-`, asm.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var rodata *asm.Section
-	for _, s := range object.Sections {
-		if s.Name == ".rodata" {
-			rodata = s
-		}
-	}
-	if rodata == nil || len(rodata.Unresolved) != 1 || rodata.Unresolved[0] != (asm.Span{Offset: 4, Size: 4}) {
-		t.Fatalf("unresolved spans: %+v", rodata)
-	}
+	.long 7, .Lt2 - .Lt1, .Lt3 - .Lt1
+`)
 }
 
 func TestMacrosConditionalsAndLocalLabels(t *testing.T) {
@@ -222,64 +217,5 @@ func TestErrors(t *testing.T) {
 		if err == nil || !strings.Contains(fmt.Sprint(err), want) {
 			t.Errorf("%q: error %v, want mention of %q", source, err, want)
 		}
-	}
-}
-
-func TestInstructionForms(t *testing.T) {
-	object, err := asm.Assemble(`
-	.intel_syntax noprefix
-	.set M, 16
-	.text
-	lock cmpxchg qword ptr [rbx+M+8], rcx
-	lea rax, [rip+sym+8]
-	mov rax, qword ptr fs:[-24]
-	mov eax, [rax+rcx*8-16]
-	mov eax, [8*rcx+rdx]
-	call qword ptr [rip+free@GOTPCREL]
-	vmovdqu ymm0, ymmword ptr [rsi]
-	rep stosq
-	imul rax, rcx, 5*M
-	jz 1f
-1:
-	call target_fn
-	movzx eax, byte ptr [rdi+rsi]
-	mov ah, [rsp]
-`, asm.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{
-		"lock cmpxchg m64[r64+const], r64",
-		"lea r64, m0[rip+sym+const]",
-		"mov r64, fs:m64[const]",
-		"mov r32, m0[r64+r64*8+const]",
-		"mov r32, m0[r64+r64*8]",
-		"call m64[rip+sym@GOTPCREL]",
-		"vmovdqu ymm, m256[r64]",
-		"rep stosq",
-		"imul r64, r64, const",
-		"jz sym",
-		"call sym",
-		"movzx r32, m8[r64+r64*1]",
-		"mov r8h, m0[r64]",
-	}
-	var got []string
-	for _, item := range object.Sections[0].Items {
-		if item.Kind == asm.ItemInst {
-			shape := instShape(item.Inst)
-			got = append(got, shape)
-		}
-	}
-	if len(got) != len(want) {
-		t.Fatalf("got %d instructions, want %d: %v", len(got), len(want), got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("instruction %d: %q, want %q", i, got[i], want[i])
-		}
-	}
-	first := object.Sections[0].Items[0].Inst.Operands[0]
-	if first.Base.String() != "rbx" || first.Value.Add != 24 || first.Size != 8 {
-		t.Errorf("memory operand decoded as %+v", first)
 	}
 }

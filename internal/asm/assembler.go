@@ -20,8 +20,6 @@ type assembler struct {
 	frame         *frame
 	sc            scanner
 	line          int
-	insts         []Inst
-	operands      []Operand
 }
 
 type cond struct {

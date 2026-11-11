@@ -26,13 +26,10 @@ type fileResult struct {
 	asError    error
 	mismatches []string
 	sections   int
-	text       int
 	size       int
-	elapsed    time.Duration
 }
 
 type oracleRunner struct {
-	census  *census
 	mu      sync.Mutex
 	largest string
 	results []fileResult
@@ -48,28 +45,23 @@ func (r *oracleRunner) work(dir string, entry corpusEntry) {
 		return
 	}
 	result.size = len(source)
-	opts := asm.Options{AlignBranches: entry.platform == target.Linux}
-	start := time.Now()
-	object, err := asm.Assemble(source, opts)
-	result.elapsed = time.Since(start)
-	if err != nil {
-		result.parseError = err
-		r.record(result, source)
-		return
-	}
-	counts := collectCensus(source, object)
-	r.census.merge(counts)
-	r.compareAll(dir, source, object, &result)
+	r.compareAll(dir, source, &result)
 	r.record(result, source)
 }
 
-func (r *oracleRunner) compareAll(dir, source string, object *asm.Object, result *fileResult) {
+func (r *oracleRunner) compareAll(dir, source string, result *fileResult) {
 	variants := [][]string{nil}
 	if result.entry.platform == target.Linux {
 		variants = [][]string{{branchFlag}, nil}
 	}
 	fed := asSource(source, result.entry.platform)
 	for _, flags := range variants {
+		opts := asm.Options{AlignBranches: len(flags) > 0}
+		object, err := asm.Assemble(source, opts)
+		if err != nil {
+			result.parseError = err
+			return
+		}
 		oracle, err := runAs(dir, fed, flags)
 		if err != nil {
 			result.asError = err
@@ -80,7 +72,7 @@ func (r *oracleRunner) compareAll(dir, source string, object *asm.Object, result
 		for _, m := range c.mismatches {
 			result.mismatches = append(result.mismatches, fmt.Sprintf("as %v: %s", flags, m))
 		}
-		result.sections, result.text = c.checked, c.text
+		result.sections += c.checked
 	}
 }
 
@@ -104,7 +96,7 @@ func TestOracle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := &oracleRunner{census: newCensus()}
+	runner := &oracleRunner{}
 	started := time.Now()
 	runner.runAll(t, entries)
 	wall := time.Since(started)
@@ -138,7 +130,7 @@ func (r *oracleRunner) runAll(t *testing.T, entries []corpusEntry) {
 
 func (r *oracleRunner) summarise(t *testing.T, wall time.Duration) {
 	sort.Slice(r.results, func(i, j int) bool { return r.results[i].entry.label() < r.results[j].entry.label() })
-	var skipped, parseErrors, asErrors, matched, mismatched, sections, text, totalBytes int
+	var skipped, parseErrors, asErrors, matched, mismatched, sections, totalBytes int
 	skipReasons := map[string]int{}
 	var details []string
 	for _, res := range r.results {
@@ -161,21 +153,18 @@ func (r *oracleRunner) summarise(t *testing.T, wall time.Duration) {
 			matched++
 		}
 		sections += res.sections
-		text += res.text
 	}
 	compiled := len(r.results) - skipped
 	t.Logf("corpus: %d entries, %d compiled, %d skipped (compile failures); %.0f MB of assembly; wall %v", len(r.results), compiled, skipped, float64(totalBytes)/1e6, wall.Round(time.Millisecond))
 	for _, reason := range sortedKeys(skipReasons) {
 		t.Logf("  skipped x%d  %s", skipReasons[reason], reason)
 	}
-	t.Logf("parse errors %d, oracle errors %d, files with all non-text sections exact %d, files with mismatches %d", parseErrors, asErrors, matched, mismatched)
-	t.Logf("sections compared %d; .text sections not yet encoded %d", sections, text)
+	t.Logf("parse errors %d, oracle errors %d, files matching as exactly %d, files with mismatches %d", parseErrors, asErrors, matched, mismatched)
+	t.Logf("sections compared %d", sections)
 	for _, line := range details {
 		t.Error(line)
 	}
 	r.timeLargest(t)
-	t.Log(r.census.summary())
-	r.writeCensus(t)
 }
 
 func sortedKeys(counts map[string]int) []string {
@@ -200,13 +189,21 @@ func formatMismatches(res fileResult) string {
 }
 
 func (r *oracleRunner) timeLargest(t *testing.T) {
+	for _, align := range []bool{false, true} {
+		best, mean := timeAssemble(t, r.largest, asm.Options{AlignBranches: align})
+		t.Logf("largest file: %.1f MB, AlignBranches %v, Assemble best %v, mean %v", float64(len(r.largest))/1e6, align, best.Round(time.Millisecond), mean.Round(time.Millisecond))
+	}
+}
+
+func timeAssemble(t *testing.T, source string, opts asm.Options) (best, mean time.Duration) {
 	const runs = 5
-	var best, total time.Duration
+	var total time.Duration
 	for range runs {
+		runtime.GC()
 		start := time.Now()
-		if _, err := asm.Assemble(r.largest, asm.Options{}); err != nil {
+		if _, err := asm.Assemble(source, opts); err != nil {
 			t.Errorf("largest file: %v", err)
-			return
+			return 0, 0
 		}
 		elapsed := time.Since(start)
 		total += elapsed
@@ -214,16 +211,5 @@ func (r *oracleRunner) timeLargest(t *testing.T) {
 			best = elapsed
 		}
 	}
-	t.Logf("largest file: %.1f MB, Assemble best %v, mean %v over %d serial runs", float64(len(r.largest))/1e6, best.Round(time.Millisecond), (total / runs).Round(time.Millisecond), runs)
-}
-
-func (r *oracleRunner) writeCensus(t *testing.T) {
-	path := os.Getenv("LOW_ASM_CENSUS")
-	if path == "" {
-		return
-	}
-	report := []byte(r.census.summary())
-	if err := os.WriteFile(path, report, 0o644); err != nil {
-		t.Errorf("write census: %v", err)
-	}
+	return best, total / runs
 }

@@ -24,11 +24,14 @@ const RegNone Reg = 0
 type regInfo struct {
 	name  string
 	class RegClass
+	num   uint8
 }
 
 var regInfos = buildRegInfos()
 
 var regByName = buildRegByName()
+
+var regRIP = lookupReg("rip")
 
 var gpNames = [16][4]string{
 	{"al", "ax", "eax", "rax"},
@@ -54,29 +57,29 @@ func buildRegInfos() []regInfo {
 			infos = append(infos, info)
 		}
 	}
-	for _, name := range highByteNames {
-		infos = append(infos, regInfo{name: name, class: ClassGP8High})
+	for i, name := range highByteNames {
+		infos = append(infos, regInfo{name: name, class: ClassGP8High, num: uint8(4 + i)})
 	}
 	for n := range 16 {
 		xmm := fmt.Sprintf("xmm%d", n)
-		infos = append(infos, regInfo{name: xmm, class: ClassXMM})
+		infos = append(infos, regInfo{name: xmm, class: ClassXMM, num: uint8(n)})
 	}
 	for n := range 16 {
 		ymm := fmt.Sprintf("ymm%d", n)
-		infos = append(infos, regInfo{name: ymm, class: ClassYMM})
+		infos = append(infos, regInfo{name: ymm, class: ClassYMM, num: uint8(n)})
 	}
-	for _, name := range segmentNames {
-		infos = append(infos, regInfo{name: name, class: ClassSegment})
+	for i, name := range segmentNames {
+		infos = append(infos, regInfo{name: name, class: ClassSegment, num: uint8(i)})
 	}
 	return append(infos, regInfo{name: "rip", class: ClassIP})
 }
 
 func newGPInfo(n, width int, class RegClass) regInfo {
 	if n < 8 {
-		return regInfo{name: gpNames[n][width], class: class}
+		return regInfo{name: gpNames[n][width], class: class, num: uint8(n)}
 	}
 	suffix := [4]string{"b", "w", "d", ""}[width]
-	return regInfo{name: fmt.Sprintf("r%d%s", n, suffix), class: class}
+	return regInfo{name: fmt.Sprintf("r%d%s", n, suffix), class: class, num: uint8(n)}
 }
 
 func buildRegByName() map[string]Reg {
@@ -89,6 +92,10 @@ func buildRegByName() map[string]Reg {
 
 func (r Reg) Class() RegClass {
 	return regInfos[r].class
+}
+
+func (r Reg) Num() uint8 {
+	return regInfos[r].num
 }
 
 func (r Reg) String() string {

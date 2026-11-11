@@ -59,8 +59,8 @@ var relocKinds = map[elf.R_X86_64]string{
 	elf.R_X86_64_PC32:          "PC32",
 	elf.R_X86_64_PLT32:         "PLT32",
 	elf.R_X86_64_GOTPCREL:      "GOTPCREL",
-	elf.R_X86_64_GOTPCRELX:     "GOTPCREL",
-	elf.R_X86_64_REX_GOTPCRELX: "GOTPCREL",
+	elf.R_X86_64_GOTPCRELX:     "GOTPCRELX",
+	elf.R_X86_64_REX_GOTPCRELX: "REX_GOTPCRELX",
 }
 
 func canonicalFlags(flags string) string {

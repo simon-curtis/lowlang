@@ -7,9 +7,12 @@ import (
 
 type secBuilder struct {
 	Section
-	index    int
-	exec     bool
-	dataOpen bool
+	index  int
+	exec   bool
+	frags  []frag
+	fixups []textFixup
+	pads   []padState
+	last   lastKind
 }
 
 type pendingDifference struct {
@@ -34,24 +37,14 @@ var sectionDefaults = map[string]sectionDefault{
 	".tdata":  {flags: "awT"},
 }
 
-func (b *secBuilder) mark() (int64, int) {
+func (b *secBuilder) mark() (int64, int32) {
 	if b.exec {
-		b.dataOpen = false
-		return 0, len(b.Items)
+		return int64(len(b.Data)), b.currentFrag()
 	}
 	if b.NoBits {
 		return b.Size, 0
 	}
 	return int64(len(b.Data)), 0
-}
-
-func (b *secBuilder) dataItem(line int) *Item {
-	if b.dataOpen {
-		return &b.Items[len(b.Items)-1]
-	}
-	b.Items = append(b.Items, Item{Kind: ItemData, Line: line})
-	b.dataOpen = true
-	return &b.Items[len(b.Items)-1]
 }
 
 func (b *secBuilder) raiseAlign(n int64) {
@@ -74,6 +67,9 @@ func (a *assembler) section(name, flags string, hasFlags, noBits bool) {
 	b.Name, b.Flags, b.NoBits = name, flags, noBits
 	b.Align = 1
 	b.exec = strings.Contains(flags, "x")
+	if b.exec {
+		b.frags = []frag{{}}
+	}
 	a.sections[name] = b
 	a.secOrder = append(a.secOrder, b)
 	a.cur = b
@@ -81,9 +77,6 @@ func (a *assembler) section(name, flags string, hasFlags, noBits bool) {
 
 func (a *assembler) target() *[]byte {
 	b := a.cur
-	if b.exec {
-		return &b.dataItem(a.line).Data
-	}
 	if b.NoBits {
 		a.fail("cannot emit data into nobits section %s", b.Name)
 	}
@@ -123,17 +116,21 @@ func appendFill(data []byte, n int64, fill byte) []byte {
 	return data
 }
 
-func (a *assembler) emitAlign(power int64) {
+func (a *assembler) emitAlign(power, max int64) {
 	if power < 0 || power > 16 {
 		a.fail("bad alignment %d", power)
+	}
+	if power == 0 {
+		return
 	}
 	n := int64(1) << power
 	b := a.cur
 	b.raiseAlign(n)
 	switch {
 	case b.exec:
-		b.Items = append(b.Items, Item{Kind: ItemAlign, Line: a.line, Align: n})
-		b.dataOpen = false
+		b.addAlign(uint8(power), int32(max), a.line)
+	case max != 0:
+		a.fail("an alignment limit is only supported in executable sections")
 	case b.NoBits:
 		b.Size = (b.Size + n - 1) &^ (n - 1)
 	default:
@@ -165,25 +162,36 @@ func (a *assembler) emitValue(size int, v Value) {
 		return
 	}
 	b := a.cur
-	if b.exec {
-		item := b.dataItem(a.line)
-		offset := int64(len(item.Data))
-		expr := DataExpr{Offset: offset, Size: size, Value: v, Line: a.line}
-		item.Exprs = append(item.Exprs, expr)
-		item.Data = appendFill(item.Data, int64(size), 0)
-		return
-	}
 	if b.NoBits {
 		a.fail("cannot emit data into nobits section %s", b.Name)
 	}
 	offset := int64(len(b.Data))
-	if v.Neg != "" {
+	switch {
+	case b.exec:
+		a.emitTextValue(size, v)
+		return
+	case v.Neg != "":
 		diff := pendingDifference{section: b, offset: offset, size: size, value: v, line: a.line}
 		a.pending = append(a.pending, diff)
-	} else {
+	default:
 		kind := a.dataFixupKind(size, v.Reloc)
 		b.Fixups = append(b.Fixups, Fixup{Offset: offset, Kind: kind, Symbol: v.Sym, Addend: v.Add, Line: a.line})
 	}
+	b.Data = appendFill(b.Data, int64(size), 0)
+}
+
+func (a *assembler) emitTextValue(size int, v Value) {
+	b := a.cur
+	fixup := textFixup{at: int32(len(b.Data)), size: uint8(size), addend: v.Add, line: int32(a.line)}
+	if v.Neg != "" {
+		fixup.neg = a.lookup(v.Neg)
+	} else {
+		fixup.kind = a.dataFixupKind(size, v.Reloc)
+	}
+	if v.Sym != "" {
+		fixup.sym = a.lookup(v.Sym)
+	}
+	b.addFixup(fixup)
 	b.Data = appendFill(b.Data, int64(size), 0)
 }
 
@@ -200,31 +208,48 @@ func (a *assembler) dataFixupKind(size int, reloc Reloc) FixupKind {
 	return 0
 }
 
+func (a *assembler) differenceValue(plus, minus *symbol, add int64) int64 {
+	if plus == nil || plus.state != symLabel || minus.state != symLabel {
+		a.fail("symbol difference uses an undefined symbol")
+	}
+	if plus.section != minus.section {
+		a.fail("symbol difference %s - %s spans sections", plus.name, minus.name)
+	}
+	return a.address(plus) - a.address(minus) + add
+}
+
 func (a *assembler) resolveDifference(p pendingDifference) {
 	a.line = p.line
 	v := p.value
 	if v.Sym == "" || v.Reloc != RelocNone {
 		a.fail("unsupported symbol difference")
 	}
-	plus, minus := a.syms[v.Sym], a.syms[v.Neg]
-	if plus.state != symLabel || minus.state != symLabel {
-		a.fail("symbol difference %s - %s uses an undefined symbol", v.Sym, v.Neg)
-	}
-	if plus.section != minus.section {
-		a.fail("symbol difference %s - %s spans sections", v.Sym, v.Neg)
-	}
-	if plus.section.exec {
-		p.section.Unresolved = append(p.section.Unresolved, Span{Offset: p.offset, Size: int64(p.size)})
-		return
-	}
-	value := plus.value - minus.value + v.Add
+	value := a.differenceValue(a.syms[v.Sym], a.syms[v.Neg], v.Add)
 	patch := appendInt(nil, p.size, value)
 	copy(p.section.Data[p.offset:], patch)
+}
+
+func (a *assembler) address(sym *symbol) int64 {
+	if !sym.section.exec {
+		return sym.value
+	}
+	f := &sym.section.frags[sym.frag]
+	return f.addr + sym.value - int64(f.start)
 }
 
 func (a *assembler) finish() {
 	if len(a.conds) != 0 {
 		a.fail("missing .endif")
+	}
+	for _, b := range a.secOrder {
+		if b.exec {
+			a.layout(b)
+		}
+	}
+	for _, b := range a.secOrder {
+		if b.exec {
+			a.emitText(b)
+		}
 	}
 	for _, p := range a.pending {
 		a.resolveDifference(p)
@@ -250,7 +275,7 @@ func (a *assembler) object() *Object {
 }
 
 func (a *assembler) exportSymbol(sym *symbol) Symbol {
-	out := Symbol{Name: sym.name, Global: sym.global, Value: sym.value, Item: sym.item}
+	out := Symbol{Name: sym.name, Global: sym.global, Value: sym.value}
 	switch sym.state {
 	case symUndefined:
 		out.Section = SectionUndefined
@@ -259,6 +284,7 @@ func (a *assembler) exportSymbol(sym *symbol) Symbol {
 		out.Section = SectionAbsolute
 	default:
 		out.Section = sym.section.index
+		out.Value = a.address(sym)
 	}
 	return out
 }

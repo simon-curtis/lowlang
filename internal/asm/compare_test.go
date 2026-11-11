@@ -18,7 +18,6 @@ type comparison struct {
 	symbols    map[string]asm.Symbol
 	mismatches []string
 	checked    int
-	text       int
 }
 
 func newComparison(object *asm.Object, oracle *oracleObject, platform target.OS) *comparison {
@@ -62,7 +61,7 @@ func (c *comparison) run() {
 }
 
 func (c *comparison) mineEmpty(s *asm.Section) bool {
-	return s == nil || (len(s.Data) == 0 && s.Size == 0 && len(s.Items) == 0 && len(s.Fixups) == 0)
+	return s == nil || (len(s.Data) == 0 && s.Size == 0 && len(s.Fixups) == 0)
 }
 
 func (c *comparison) oracleEmpty(s *oracleSection) bool {
@@ -92,10 +91,6 @@ func (c *comparison) compareSection(name string, mine *asm.Section, theirs *orac
 	if mine.NoBits != theirs.noBits {
 		c.report("%s: nobits %v, as has %v", name, mine.NoBits, theirs.noBits)
 	}
-	if strings.Contains(theirs.flags, "x") && !c.object.TextEncoded {
-		c.text++
-		return
-	}
 	if uint64(mine.Align) != theirs.align {
 		c.report("%s: align %d, as has %d", name, mine.Align, theirs.align)
 	}
@@ -110,13 +105,6 @@ func (c *comparison) compareSection(name string, mine *asm.Section, theirs *orac
 
 func (c *comparison) compareBytes(name string, mine *asm.Section, theirs *oracleSection) {
 	got, want := mine.Data, theirs.data
-	if len(mine.Unresolved) > 0 {
-		got, want = bytes.Clone(got), bytes.Clone(want)
-		for _, span := range mine.Unresolved {
-			clear(got[span.Offset : span.Offset+span.Size])
-			clear(want[span.Offset : span.Offset+span.Size])
-		}
-	}
 	if len(got) != len(want) {
 		c.report("%s: %d bytes, as has %d", name, len(got), len(want))
 		return
@@ -150,11 +138,6 @@ func (c *comparison) context(section *asm.Section, offset int64) string {
 		return "start"
 	}
 	return fmt.Sprintf("%s+%d", best, offset-bestValue)
-}
-
-func (c *comparison) isExec(name string) bool {
-	s := c.oracle.sections[name]
-	return s != nil && strings.Contains(s.flags, "x")
 }
 
 func (c *comparison) mineRelocs(section *asm.Section) ([]normReloc, []int) {
@@ -191,16 +174,6 @@ func (c *comparison) normalise(f asm.Fixup) normReloc {
 	return norm
 }
 
-func (c *comparison) maskText(r normReloc) normReloc {
-	if c.object.TextEncoded {
-		return r
-	}
-	if name, ok := strings.CutPrefix(r.target, "sec:"); ok && c.isExec(name) {
-		r.addend = 0
-	}
-	return r
-}
-
 func (c *comparison) compareRelocs(name string, mine *asm.Section, theirs *oracleSection) {
 	got, lines := c.mineRelocs(mine)
 	want := theirs.relocs
@@ -208,9 +181,8 @@ func (c *comparison) compareRelocs(name string, mine *asm.Section, theirs *oracl
 		want = c.windowsRelocs(want)
 	}
 	for i := 0; i < len(got) && i < len(want); i++ {
-		g, w := c.maskText(got[i]), c.maskText(want[i])
-		if g != w {
-			c.report("%s reloc %d (line %d): %s, as has %s", name, i, lines[i], g, w)
+		if got[i] != want[i] {
+			c.report("%s reloc %d (line %d): %s, as has %s", name, i, lines[i], got[i], want[i])
 			return
 		}
 	}
@@ -270,9 +242,6 @@ func (c *comparison) compareSymbol(got asm.Symbol, want oracleSymbol) {
 	}
 	if got.Global != want.global {
 		c.report("symbol %s: global %v, as has %v", got.Name, got.Global, want.global)
-	}
-	if c.isExec(section) && !c.object.TextEncoded {
-		return
 	}
 	if section != sectionUndefined && uint64(got.Value) != want.value {
 		c.report("symbol %s: value %#x, as has %#x", got.Name, uint64(got.Value), want.value)

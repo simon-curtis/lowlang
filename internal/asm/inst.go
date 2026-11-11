@@ -29,12 +29,6 @@ type Operand struct {
 	Value Value
 }
 
-type Inst struct {
-	Mnemonic string
-	Prefix   Prefix
-	Operands []Operand
-}
-
 var prefixes = map[string]Prefix{
 	"lock":  PrefixLock,
 	"rep":   PrefixRep,
@@ -87,30 +81,46 @@ func (a *assembler) instruction(mnemonic string) {
 	if !a.cur.exec {
 		a.fail("instruction %s in non-executable section %s", mnemonic, a.cur.Name)
 	}
-	inst := a.newInst()
-	inst.Mnemonic = mnemonic
-	inst.Prefix = prefix
-	inst.Operands = a.keepOperands(ops[:count])
+	a.assemble(mnemonic, prefix, ops[:count])
+	a.cur.last = lastOther
+	if a.opts.AlignBranches {
+		a.cur.endInstruction()
+	}
+}
+
+func (a *assembler) assemble(mnemonic string, prefix Prefix, ops []Operand) {
+	if a.assembleBranch(mnemonic, ops) {
+		return
+	}
+	forms, ok := isa[mnemonic]
+	if !ok {
+		a.fail("unsupported instruction %s", mnemonic)
+	}
+	for i := range forms {
+		f := &forms[i]
+		size, matched := f.match(ops)
+		if !matched {
+			continue
+		}
+		enc := a.encode(f, size, ops, prefix)
+		padding := a.addInstructionPadding(f, ops)
+		a.emitEncoding(&enc)
+		if padding != noLink {
+			a.cur.reservePrefixRoom(padding, &enc)
+		}
+		return
+	}
+	a.fail("no form of %s accepts these operands", mnemonic)
+}
+
+func (a *assembler) emitEncoding(e *encoding) {
 	b := a.cur
-	b.Items = append(b.Items, Item{Kind: ItemInst, Line: a.line, Inst: inst})
-	b.dataOpen = false
-}
-
-func (a *assembler) newInst() *Inst {
-	if len(a.insts) == cap(a.insts) {
-		a.insts = make([]Inst, 0, 1024)
+	if e.hasFixup {
+		sym := a.lookup(e.fixupSymbol)
+		at := int32(len(b.Data) + e.fixupAt)
+		b.addFixup(textFixup{at: at, size: 4, kind: e.fixupKind, sym: sym, addend: e.fixupAddend, line: int32(a.line)})
 	}
-	a.insts = a.insts[:len(a.insts)+1]
-	return &a.insts[len(a.insts)-1]
-}
-
-func (a *assembler) keepOperands(ops []Operand) []Operand {
-	if cap(a.operands)-len(a.operands) < len(ops) {
-		a.operands = make([]Operand, 0, 4096)
-	}
-	start := len(a.operands)
-	a.operands = append(a.operands, ops...)
-	return a.operands[start:len(a.operands):len(a.operands)]
+	b.Data = append(b.Data, e.bytes[:e.length]...)
 }
 
 func (a *assembler) operand() Operand {
