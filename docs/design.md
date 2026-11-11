@@ -1279,7 +1279,10 @@ The compiler is written in Go. Pipeline:
 | Check | `internal/check` | types attached to the tree |
 | Build IR | `internal/ir` | SSA form, one value per machine word |
 | Codegen | `internal/amd64` | x86-64 GNU assembly |
-| Assemble and link | `as`, `ld` | static or dynamic ELF binary |
+| Assemble | `internal/asm` | object: sections, symbols and fixups |
+| Link | `internal/link` | static ELF executable |
+
+`as` and `ld` assemble and link dynamic programs and the patches of `low dev`.
 
 - The `low` command lives in `cmd/low`. The pipeline it shares with hot reload lives in `internal/compiler`.
 - `low ir` prints the SSA form and `low asm` the generated assembly.
@@ -1340,7 +1343,10 @@ The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emi
 
 ### Linking
 
-- A static program is linked with `ld -static` and starts at the generated `_start`. `_start` initialises the heap and the scheduler, starts `main` on the first green thread and enters the scheduler on the process stack.
+- A static program is assembled by `internal/asm` and linked in process by `internal/link`, which writes the executable without running `as` or `ld`. It starts at the generated `_start`.
+  - The image is based at `0x400000`, below the hot-reload region, and has the layout of `ld -static` with separate code: a read-only header segment, then read-execute `.text`, read-only `.rodata`, and read-write `.data` and `.bss`, each page-aligned in memory and congruent with its file offset. `.tbss` has a `PT_TLS` segment and the stack is non-executable.
+  - Symbols resolve across the sections of the one object. `PC32` and `PLT32` resolve alike, and `Abs32` and `Abs32S` fail when the value does not fit. An undefined symbol fails the link and names the symbol.
+  - The file carries section headers and a symbol table of the object's non-`.L` symbols plus `__bss_start`, `_edata` and `_end`, so `debug/elf`, `readelf` and `gdb` read it, and `low dev` reads it to link patches against it. `_start` initialises the heap and the scheduler, starts `main` on the first green thread and enters the scheduler on the process stack.
 - A dynamic program is linked with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2` against glibc's `crt1.o`, `crti.o` and `crtn.o`, then `-l<name>` for each library and `-lc`.
   - The start files are looked for in `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/lib/x86_64-linux-gnu`.
   - glibc's start-up code calls the generated C `main`, which does the same work as `_start`.

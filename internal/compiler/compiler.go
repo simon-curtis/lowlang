@@ -3,16 +3,21 @@ package compiler
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
+	"lowlang/internal/asm"
 	"lowlang/internal/ast"
 	"lowlang/internal/check"
 	"lowlang/internal/ir"
 	"lowlang/internal/lexer"
+	"lowlang/internal/link"
 	"lowlang/internal/lint"
 	"lowlang/internal/parser"
 	"lowlang/internal/target"
@@ -81,27 +86,54 @@ func Assemble(ctx context.Context, asm, object string, flags ...string) error {
 	return tool(ctx, "as", args...)
 }
 
-func Link(ctx context.Context, asm, output string, prog *ir.Program) error {
+func Link(ctx context.Context, source, output string, prog *ir.Program) error {
+	if prog.OS != target.Windows && len(prog.Libraries) == 0 {
+		return linkStatic(ctx, source, output)
+	}
 	dir, err := os.MkdirTemp("", "low-build-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
 	if prog.OS == target.Windows {
-		return linkWindows(ctx, dir, asm, output)
+		return linkWindows(ctx, dir, source, output)
 	}
 	object := filepath.Join(dir, "main.o")
-	if err := Assemble(ctx, asm, object, "-mbranches-within-32B-boundaries"); err != nil {
+	if err := Assemble(ctx, source, object, "-mbranches-within-32B-boundaries"); err != nil {
 		return err
-	}
-	if len(prog.Libraries) == 0 {
-		return tool(ctx, "ld", "-static", "-o", output, object)
 	}
 	args, err := dynamicArgs(output, object, prog.Libraries)
 	if err != nil {
 		return err
 	}
 	return tool(ctx, "ld", args...)
+}
+
+func linkStatic(ctx context.Context, source, output string) error {
+	object, err := asm.Assemble(source, asm.Options{AlignBranches: true})
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	image, err := link.Static(object)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(output); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("replace %s: %w", output, err)
+	}
+	if err := writeWhileForksWait(output, image); err != nil {
+		return fmt.Errorf("write %s: %w", output, err)
+	}
+	return nil
+}
+
+func writeWhileForksWait(path string, data []byte) error {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	return os.WriteFile(path, data, 0o755)
 }
 
 const windowsStack = 8 << 20
