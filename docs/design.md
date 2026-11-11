@@ -745,6 +745,7 @@ fn main() {
 - `import ui/text` loads `<root>/ui/text/`. A path starting with `std/` names a module of the standard library, which is compiled into `low`, so a project directory named `std` cannot be imported.
 - `low build dir` builds the directory as the entry module. `low build file.low` builds that one file as the entry module, without the other files beside it.
 - `low lint file.low` type-checks the program, prints warnings for the program's own modules (not the standard library), and exits with status 1 if there were any. `low build`, `low run`, `low asm` and `low ir` print the same warnings to stderr and continue. The language server reports them as warnings.
+- `low doc dir` prints, as JSON, every module under the directory with its imports, each with the name it is used through, and its public structs, enums and functions, each with its declaration as text, its file and its line. A struct shows its public fields, and `...` stands for its private ones. A function whose first parameter is a public type of its module, or a pointer to one, names that type as its receiver. `low doc std` documents the standard library, and the website builds its package pages from it.
 - `prefer-match` flags an `if` / `else if` / `else` chain with at least two conditions in which every condition is `==` between one side-effect-free subject (a variable, field, index or dereference) and a non-negative integer, character or string literal or an enum variant. It suggests `match subject { 4 => ..., _ => ... }`.
 - Imports come before declarations and apply to their file.
 - A module is used through its last path segment, `text.shout(...)`, or through a name given with `import t = ui/text`.
@@ -1806,4 +1807,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
     1. OS-specific std code selected by target, so each OS-facing module (`std/os`, `std/os/signal`, `std/file`, `std/net`, `std/process`) carries one implementation per OS behind one API.
     2. `__syscall` rejected at compile time on the Windows target, so a module without a Windows implementation fails the build.
     3. `std/process` over kernel32: `CreateProcessW` with Windows command-line quoting, `CreatePipe` with overlapped reads and writes for piped streams, `WaitForSingleObject` and `GetExitCodeProcess`, `TerminateProcess`, job objects for process groups, and `find` over `PATH` and `PATHEXT`.
-6. Further targets: linux/arm64, darwin; macOS (Metal) and Windows backends for the UI library.
+7. A package registry:
+    1. Dependencies declared in `low.mod` with a version each, a `low.sum` lockfile holding exact versions and content hashes, and a module cache that imports resolve to.
+    2. Packages published from tagged git repositories, each version immutable once indexed, and yanking in place of deletion.
+    3. A package page on the website for every indexed version, generated with `low doc` as the standard library pages are.

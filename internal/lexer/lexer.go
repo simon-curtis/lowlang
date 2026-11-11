@@ -24,6 +24,8 @@ type Lexer struct {
 	col     int
 	last    Kind
 	tokens  []Token
+	doc     []string
+	docAt   Pos
 	prelude bool
 }
 
@@ -81,6 +83,10 @@ func (l *Lexer) advance() byte {
 }
 
 func (l *Lexer) emit(t Token) {
+	if t.Kind != Newline && len(l.doc) > 0 {
+		t.Doc, t.DocAt = strings.Join(l.doc, "\n"), l.docAt
+		l.doc = nil
+	}
 	l.tokens = append(l.tokens, t)
 	l.last = t.Kind
 }
@@ -119,13 +125,39 @@ func (l *Lexer) skipSpace() {
 		case c == ' ' || c == '\t' || c == '\r':
 			l.advance()
 		case c == '/' && l.peek(1) == '/':
-			for l.off < len(l.src) && l.peek(0) != '\n' {
-				l.advance()
-			}
+			l.comment()
 		default:
 			return
 		}
 	}
+}
+
+func (l *Lexer) comment() {
+	start, at := l.off, l.pos()
+	for l.off < len(l.src) && l.peek(0) != '\n' {
+		l.advance()
+	}
+	text := string(l.src[start:l.off])
+	if body, ok := strings.CutPrefix(text, "///"); ok && !strings.HasPrefix(body, "/") && l.lineStart(start) {
+		if len(l.doc) == 0 {
+			l.docAt = at
+		}
+		l.doc = append(l.doc, strings.TrimSuffix(strings.TrimPrefix(body, " "), "\r"))
+	}
+}
+
+func (l *Lexer) lineStart(at int) bool {
+	for at > 0 {
+		at--
+		switch l.src[at] {
+		case '\n':
+			return true
+		case ' ', '\t':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (l *Lexer) next() error {

@@ -50,7 +50,7 @@ func structSymbol(d *ast.StructDecl, t text) DocumentSymbol {
 	pos := t.nameAfter(d.Pos, d.Name)
 	s := symbol(t, pos, d.Name, "struct", symbolStruct)
 	for _, f := range d.Fields {
-		detail := typeNameString(f.TypeName)
+		detail := f.TypeName.String()
 		s.Children = append(s.Children, symbol(t, f.Pos, f.Name, detail, symbolField))
 	}
 	return s
@@ -60,7 +60,7 @@ func enumSymbol(d *ast.EnumDecl, t text) DocumentSymbol {
 	pos := t.nameAfter(d.Pos, d.Name)
 	s := symbol(t, pos, d.Name, "enum", symbolEnum)
 	for _, v := range d.Variants {
-		detail := variantDeclText(v)
+		detail := v.String()
 		s.Children = append(s.Children, symbol(t, v.Pos, v.Name, detail, symbolEnumMember))
 	}
 	return s

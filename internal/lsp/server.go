@@ -390,6 +390,9 @@ func (s *Server) hover(p TextDocumentPositionParams) any {
 		return nil
 	}
 	value := fmt.Sprintf("```low\n%s\n```", content)
+	if doc := q.doc(); doc != "" {
+		value = fmt.Sprintf("%s\n\n%s", value, doc)
+	}
 	span := q.index.text.span(q.occ.pos, len(q.occ.name))
 	return Hover{Contents: MarkupContent{Kind: "markdown", Value: value}, Range: span}
 }

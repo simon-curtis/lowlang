@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -23,6 +24,7 @@ const usage = `usage:
   low asm <file.low> [-target linux/amd64|windows/amd64]
   low ir <file.low> [-target linux/amd64|windows/amd64]
   low lint <file.low>
+  low doc <dir|std>
   low dev <file.low>
   low lsp`
 
@@ -76,6 +78,11 @@ func run(ctx context.Context, args []string) error {
 			return usageError{}
 		}
 		return lintCommand(path)
+	case "doc":
+		if len(args) != 2 {
+			return usageError{}
+		}
+		return docCommand(path)
 	case "run":
 		if len(args) != 2 {
 			return usageError{}
@@ -133,6 +140,16 @@ func lintCommand(path string) error {
 		return exitError{code: 1}
 	}
 	return nil
+}
+
+func docCommand(target string) error {
+	modules, err := compiler.Document(target)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(modules)
 }
 
 func report(unit *compiler.Unit) {

@@ -165,7 +165,7 @@ func fits(tn *ast.TypeName, t *types.Type, params map[string]bool) bool {
 		base, _, _ := strings.Cut(t.String(), "[")
 		return base == tn.Name || strings.HasSuffix(base, fmt.Sprintf(".%s", tn.Name))
 	}
-	return t.String() == typeNameString(tn)
+	return t.String() == tn.String()
 }
 
 func takes(fn *ast.Func, t *types.Type) bool {

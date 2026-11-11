@@ -282,7 +282,7 @@ func (q *query) hover() string {
 		if decl := q.typeDecl(n.Module, n.Name); decl != nil {
 			return declText(decl)
 		}
-		return typeNameString(n)
+		return n.String()
 	case moduleRef:
 		if path, ok := q.file().Imported(n.alias); ok {
 			return fmt.Sprintf("import %s", path)
@@ -301,14 +301,100 @@ func (q *query) hover() string {
 	case *ast.StructDecl, *ast.EnumDecl:
 		return declText(n)
 	case *ast.FieldDecl:
-		return fmt.Sprintf("%s: %s", n.Name, typeNameString(n.TypeName))
+		return fmt.Sprintf("%s: %s", n.Name, n.TypeName)
 	case *ast.VariantDecl:
-		return variantDeclText(n)
+		return n.String()
 	case *ast.TypeParam:
-		return typeParamText(n)
+		return n.String()
 	}
 	if q.occ.local != nil {
 		return q.localText(q.occ.local)
+	}
+	return ""
+}
+
+func (q *query) doc() string {
+	switch n := q.occ.node.(type) {
+	case *ast.Call:
+		if n.Target != nil {
+			return funcDoc(n.Target)
+		}
+		if n.Variant != nil {
+			return q.variantDoc(n.TypeOf(), n.Variant)
+		}
+		return q.callee(n).doc()
+	case *ast.Ident:
+		if n.Func != nil {
+			return funcDoc(n.Func)
+		}
+		if n.Variant != nil {
+			return q.variantDoc(n.TypeOf(), n.Variant)
+		}
+		if n.Local == nil && n.Variant == nil {
+			return declDoc(q.typeDecl("", n.Name))
+		}
+	case *ast.Selector:
+		if n.Func != nil {
+			return funcDoc(n.Func)
+		}
+		if n.Variant != nil {
+			return q.variantDoc(n.TypeOf(), n.Variant)
+		}
+	case *ast.Pattern:
+		if n.Local == nil && n.Variant != nil {
+			return q.variantDoc(q.occ.parent, n.Variant)
+		}
+	case *ast.StructLit:
+		return declDoc(q.typeDecl(n.Module, n.Name))
+	case *ast.TypeName:
+		return declDoc(q.typeDecl(n.Module, n.Name))
+	case *ast.Func:
+		return funcDoc(n)
+	case *ast.StructDecl, *ast.EnumDecl:
+		return declDoc(n)
+	case *ast.FieldDecl:
+		return n.Doc
+	case *ast.VariantDecl:
+		return n.Doc
+	}
+	return ""
+}
+
+func (q *query) variantDoc(enum *types.Type, v *types.Variant) string {
+	if enum == nil || v == nil {
+		return ""
+	}
+	if enum.Origin != nil {
+		enum = enum.Origin
+	}
+	for _, f := range q.files() {
+		for _, d := range f.Enums {
+			if d.Type != enum {
+				continue
+			}
+			for _, decl := range d.Variants {
+				if decl.Name == v.Name {
+					return decl.Doc
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func funcDoc(f *ast.Func) string {
+	if f.Template != nil {
+		return f.Template.Doc
+	}
+	return f.Doc
+}
+
+func declDoc(decl any) string {
+	switch d := decl.(type) {
+	case *ast.StructDecl:
+		return d.Doc
+	case *ast.EnumDecl:
+		return d.Doc
 	}
 	return ""
 }
@@ -382,35 +468,6 @@ func variantText(enum *types.Type, v *types.Variant) string {
 	return fmt.Sprintf("%s(%s)", name, strings.Join(fields, ", "))
 }
 
-func variantDeclText(v *ast.VariantDecl) string {
-	if len(v.Fields) == 0 {
-		return v.Name
-	}
-	fields := make([]string, len(v.Fields))
-	for i, f := range v.Fields {
-		fields[i] = typeNameString(f)
-	}
-	return fmt.Sprintf("%s(%s)", v.Name, strings.Join(fields, ", "))
-}
-
-func typeParamText(p *ast.TypeParam) string {
-	if len(p.Constraints) == 0 {
-		return p.Name
-	}
-	return fmt.Sprintf("%s: %s", p.Name, strings.Join(p.Constraints, " + "))
-}
-
-func typeParamsText(params []*ast.TypeParam) string {
-	if len(params) == 0 {
-		return ""
-	}
-	texts := make([]string, len(params))
-	for i, p := range params {
-		texts[i] = typeParamText(p)
-	}
-	return fmt.Sprintf("[%s]", strings.Join(texts, ", "))
-}
-
 func signature(f *ast.Func) string {
 	head, params, tail := signatureParts(f)
 	return fmt.Sprintf("%s%s%s", head, strings.Join(params, ", "), tail)
@@ -422,7 +479,7 @@ func signatureParts(f *ast.Func) (string, []string, string) {
 	}
 	params := make([]string, 0, len(f.Params)+1)
 	for i, p := range f.Params {
-		t := typeNameString(p.TypeName)
+		t := p.TypeName.String()
 		if i < len(f.ParamTypes) {
 			t = f.ParamTypes[i].String()
 		}
@@ -441,7 +498,7 @@ func signatureParts(f *ast.Func) (string, []string, string) {
 	}
 	b.WriteString("fn ")
 	b.WriteString(f.Name)
-	b.WriteString(typeParamsText(f.TypeParams))
+	b.WriteString(ast.TypeParams(f.TypeParams))
 	b.WriteString("(")
 	tail := fmt.Sprintf(")%s", resultText(f))
 	return b.String(), params, tail
@@ -450,7 +507,7 @@ func signatureParts(f *ast.Func) (string, []string, string) {
 func resultText(f *ast.Func) string {
 	t := f.RetType
 	if t == nil {
-		return resultNames(f.Result, f.Error)
+		return ast.Results(f.Result, f.Error)
 	}
 	switch {
 	case t == types.Void:
@@ -463,19 +520,6 @@ func resultText(f *ast.Func) string {
 	return fmt.Sprintf(" -> %s", t)
 }
 
-func resultNames(result, errName *ast.TypeName) string {
-	var b strings.Builder
-	if result != nil {
-		b.WriteString(" -> ")
-		b.WriteString(typeNameString(result))
-	}
-	if errName != nil {
-		b.WriteString(" ! ")
-		b.WriteString(typeNameString(errName))
-	}
-	return b.String()
-}
-
 func declText(decl any) string {
 	var b strings.Builder
 	switch d := decl.(type) {
@@ -483,70 +527,17 @@ func declText(decl any) string {
 		if d.C {
 			b.WriteString("extern ")
 		}
-		b.WriteString(fmt.Sprintf("struct %s%s {\n", d.Name, typeParamsText(d.TypeParams)))
+		b.WriteString(fmt.Sprintf("struct %s%s {\n", d.Name, ast.TypeParams(d.TypeParams)))
 		for _, f := range d.Fields {
-			b.WriteString(fmt.Sprintf("    %s: %s\n", f.Name, typeNameString(f.TypeName)))
+			b.WriteString(fmt.Sprintf("    %s: %s\n", f.Name, f.TypeName))
 		}
 		b.WriteString("}")
 	case *ast.EnumDecl:
-		b.WriteString(fmt.Sprintf("enum %s%s {\n", d.Name, typeParamsText(d.TypeParams)))
+		b.WriteString(fmt.Sprintf("enum %s%s {\n", d.Name, ast.TypeParams(d.TypeParams)))
 		for _, v := range d.Variants {
-			b.WriteString(fmt.Sprintf("    %s\n", variantDeclText(v)))
+			b.WriteString(fmt.Sprintf("    %s\n", v))
 		}
 		b.WriteString("}")
 	}
 	return b.String()
-}
-
-func typeNamesString(list []*ast.TypeName) string {
-	texts := make([]string, len(list))
-	for i, t := range list {
-		texts[i] = typeNameString(t)
-	}
-	return strings.Join(texts, ", ")
-}
-
-func typeNameString(t *ast.TypeName) string {
-	switch {
-	case t == nil:
-		return ""
-	case t.Optional:
-		return fmt.Sprintf("%s?", typeNameString(t.Elem))
-	case t.Pointer:
-		return fmt.Sprintf("*%s", typeNameString(t.Elem))
-	case t.Slice:
-		return fmt.Sprintf("[]%s", typeNameString(t.Elem))
-	case t.Map:
-		return fmt.Sprintf("[%s: %s]", typeNameString(t.Key), typeNameString(t.Elem))
-	case t.Raw && t.Elem == nil:
-		return "ptr"
-	case t.Raw:
-		return fmt.Sprintf("ptr[%s]", typeNameString(t.Elem))
-	case t.Func:
-		return funcTypeString(t)
-	}
-	name := t.Name
-	if t.Module != "" {
-		name = fmt.Sprintf("%s.%s", t.Module, t.Name)
-	}
-	if len(t.Args) > 0 {
-		name = fmt.Sprintf("%s[%s]", name, typeNamesString(t.Args))
-	}
-	return name
-}
-
-func funcTypeString(t *ast.TypeName) string {
-	params := make([]string, len(t.Params))
-	for i, p := range t.Params {
-		params[i] = typeNameString(p)
-		if i < len(t.Muts) && t.Muts[i] {
-			params[i] = fmt.Sprintf("mut %s", params[i])
-		}
-	}
-	prefix := "fn"
-	if t.CFunc {
-		prefix = "extern fn"
-	}
-	results := resultNames(t.Result, t.Error)
-	return fmt.Sprintf("%s(%s)%s", prefix, strings.Join(params, ", "), results)
 }

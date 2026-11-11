@@ -27,6 +27,7 @@ go build -o low ./cmd/low
 ./low build testdata/run/fib.low -target windows/amd64
 ./low asm testdata/run/fib.low
 ./low lint app.low
+./low doc std
 ./low dev app.low
 ./low run app/
 ```
@@ -76,6 +77,7 @@ python3 ../assets/brand/build.py
 
 - builds the compiler and starts `low lsp`;
 - renders `docs/design.md` and `editors/README.md` into `site/docs/`;
+- renders the standard library from `low doc std` into `site/packages/`, one page per module, with each module's description from the table in `docs/design.md`;
 - highlights every Low snippet with hover text and references from the LSP;
 - writes `style.css` from `tailwind.css` and copies Lenis to `lenis.js`.
 

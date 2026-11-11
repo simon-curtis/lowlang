@@ -324,6 +324,26 @@ func TestHover(t *testing.T) {
 	}
 }
 
+func TestHoverShowsDocComments(t *testing.T) {
+	c := start(t)
+	f := load(t, "doc_comments.low")
+	c.open(f, f.src)
+	cases := []struct {
+		at   Position
+		want string
+	}{
+		{f.at(t, "match side(", 6), "fn side(p: Point) -> Side\n```\n\nClassifies a point.\n\n```low\nside(Point { x: -1, y: 0 })\n```"},
+		{f.at(t, "side(Point { x: -3", 5), "A point on the plane."},
+		{f.at(t, "Left =>", 0), "Left of the y axis."},
+		{f.at(t, "pub x: i64", 4), "Distance from the y axis."},
+	}
+	for _, tc := range cases {
+		if got := c.hover(f, tc.at); !strings.Contains(got, tc.want) {
+			t.Errorf("hover at %+v = %q, want %q", tc.at, got, tc.want)
+		}
+	}
+}
+
 func TestHoverOnBuiltins(t *testing.T) {
 	c := start(t)
 	f := load(t, "maps.low")

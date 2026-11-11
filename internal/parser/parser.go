@@ -30,14 +30,15 @@ type Parser struct {
 	noStruct bool
 	testing  bool
 	prelude  bool
+	taken    map[int]bool
 }
 
 func Parse(tokens []lexer.Token) (*ast.File, error) {
-	return parse(&Parser{tokens: tokens})
+	return parse(&Parser{tokens: tokens, taken: map[int]bool{}})
 }
 
 func ParsePrelude(tokens []lexer.Token) (*ast.File, error) {
-	return parse(&Parser{tokens: tokens, prelude: true})
+	return parse(&Parser{tokens: tokens, prelude: true, taken: map[int]bool{}})
 }
 
 func parse(p *Parser) (file *ast.File, err error) {
@@ -57,6 +58,22 @@ func parse(p *Parser) (file *ast.File, err error) {
 
 func (p *Parser) tok() lexer.Token {
 	return p.tokens[p.i]
+}
+
+func (p *Parser) doc() string {
+	t := p.tok()
+	if t.Doc != "" {
+		p.taken[p.i] = true
+	}
+	return t.Doc
+}
+
+func (p *Parser) strayDocs() {
+	for i, t := range p.tokens {
+		if t.Doc != "" && !p.taken[i] {
+			p.fail(t.DocAt, "a /// comment must come before a declaration, struct field or enum variant")
+		}
+	}
 }
 
 func (p *Parser) peek() lexer.Kind {
@@ -158,10 +175,12 @@ func (p *Parser) file() *ast.File {
 		p.declaration(f)
 		p.skipNewlines()
 	}
+	p.strayDocs()
 	return f
 }
 
 func (p *Parser) declaration(f *ast.File) {
+	doc := p.doc()
 	pub := p.at(lexer.Pub)
 	if pub {
 		p.next()
@@ -169,21 +188,21 @@ func (p *Parser) declaration(f *ast.File) {
 	switch t := p.tok(); t.Kind {
 	case lexer.Fn:
 		d := p.fn()
-		d.Pub, d.File = pub, f
+		d.Pub, d.File, d.Doc = pub, f, doc
 		f.Funcs = append(f.Funcs, d)
 	case lexer.Enum:
 		d := p.enum()
-		d.Pub, d.File = pub, f
+		d.Pub, d.File, d.Doc = pub, f, doc
 		f.Enums = append(f.Enums, d)
 	case lexer.Struct:
 		d := p.structDecl()
-		d.Pub, d.File = pub, f
+		d.Pub, d.File, d.Doc = pub, f, doc
 		f.Structs = append(f.Structs, d)
 	case lexer.Extern:
 		if p.peek() == lexer.Struct {
 			p.next()
 			d := p.structDecl()
-			d.Pub, d.File, d.C = pub, f, true
+			d.Pub, d.File, d.C, d.Doc = pub, f, true, doc
 			f.Structs = append(f.Structs, d)
 			return
 		}
@@ -214,12 +233,13 @@ func (p *Parser) extern() *ast.Extern {
 }
 
 func (p *Parser) externFn(e *ast.Extern) *ast.Func {
+	doc := p.doc()
 	pub := p.at(lexer.Pub)
 	if pub {
 		p.next()
 	}
 	pos := p.expect(lexer.Fn).Pos
-	f := &ast.Func{Name: p.expect(lexer.Ident).Text, Pub: pub, Extern: e, Pos: pos}
+	f := &ast.Func{Name: p.expect(lexer.Ident).Text, Doc: doc, Pub: pub, Extern: e, Pos: pos}
 	p.list(func() {
 		if f.Variadic {
 			p.fail(p.tok().Pos, "... must be the last parameter")
@@ -302,8 +322,9 @@ func (p *Parser) enum() *ast.EnumDecl {
 }
 
 func (p *Parser) variant() *ast.VariantDecl {
+	doc := p.doc()
 	name := p.expect(lexer.Ident)
-	v := &ast.VariantDecl{Name: name.Text, Pos: name.Pos}
+	v := &ast.VariantDecl{Name: name.Text, Doc: doc, Pos: name.Pos}
 	if !p.at(lexer.LParen) {
 		return v
 	}
@@ -332,13 +353,14 @@ func (p *Parser) structDecl() *ast.StructDecl {
 			d.Drop = p.stmt()
 			return
 		}
+		doc := p.doc()
 		pub := p.at(lexer.Pub)
 		if pub {
 			p.next()
 		}
 		name := p.expect(lexer.Ident)
 		p.expect(lexer.Colon)
-		field := &ast.FieldDecl{Name: name.Text, Pub: pub, TypeName: p.typeName(), Pos: name.Pos}
+		field := &ast.FieldDecl{Name: name.Text, Doc: doc, Pub: pub, TypeName: p.typeName(), Pos: name.Pos}
 		if p.at(lexer.Assign) {
 			p.next()
 			field.Default = p.expr()

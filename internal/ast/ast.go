@@ -155,6 +155,7 @@ type TypeParam struct {
 
 type EnumDecl struct {
 	Name       string
+	Doc        string
 	TypeParams []*TypeParam
 	Pub        bool
 	File       *File
@@ -165,6 +166,7 @@ type EnumDecl struct {
 
 type VariantDecl struct {
 	Name   string
+	Doc    string
 	Fields []*TypeName
 	Labels []string
 	Pos    lexer.Pos
@@ -172,6 +174,7 @@ type VariantDecl struct {
 
 type StructDecl struct {
 	Name       string
+	Doc        string
 	Drop       Stmt
 	TypeParams []*TypeParam
 	C          bool
@@ -184,6 +187,7 @@ type StructDecl struct {
 
 type FieldDecl struct {
 	Name     string
+	Doc      string
 	Pub      bool
 	TypeName *TypeName
 	Default  Expr
@@ -199,6 +203,7 @@ type Param struct {
 
 type Func struct {
 	Name        string
+	Doc         string
 	TypeParams  []*TypeParam
 	Template    *Func
 	TypeArgs    []*types.Type

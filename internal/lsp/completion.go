@@ -182,7 +182,7 @@ func (c *cursor) variants(module, name string) {
 				continue
 			}
 			for _, v := range d.Variants {
-				c.add(v.Name, completionEnumMember, variantDeclText(v))
+				c.add(v.Name, completionEnumMember, v.String())
 			}
 		}
 	}
@@ -339,7 +339,7 @@ func (c *cursor) declarations(f *ast.File, public bool) {
 			continue
 		}
 		for _, v := range d.Variants {
-			detail := fmt.Sprintf("%s.%s", d.Name, variantDeclText(v))
+			detail := fmt.Sprintf("%s.%s", d.Name, v.String())
 			c.add(v.Name, completionEnumMember, detail)
 		}
 	}

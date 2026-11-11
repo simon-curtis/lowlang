@@ -118,7 +118,7 @@ func (c *cursor) variantShape(module, enum, name string) (callShape, bool) {
 				}
 				params := make([]string, len(v.Fields))
 				for i, field := range v.Fields {
-					params[i] = typeNameString(field)
+					params[i] = field.String()
 				}
 				head := fmt.Sprintf("%s.%s(", d.Name, v.Name)
 				return callShape{head: head, params: params, tail: ")"}, true

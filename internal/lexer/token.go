@@ -146,4 +146,6 @@ type Token struct {
 	Text  string
 	Parts []Part
 	Pos   Pos
+	Doc   string
+	DocAt Pos
 }
