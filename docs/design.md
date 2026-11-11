@@ -1366,4 +1366,8 @@ The UI library is staged under `ui/` until it moves into the standard library as
     3. A browser host: `print` and the clock as JavaScript imports; modules that need the OS (files, sockets, processes, the UI library) are rejected at compile time for this target.
     4. The compiler built for `js/wasm`, so the page compiles and runs a snippet without a server.
     5. A Run button on every documentation snippet, and an editable playground page on the site.
-5. Further targets: linux/arm64, darwin; macOS (Metal) and Windows backends for the UI library.
+5. Standard library on windows/amd64:
+    1. OS-specific std code selected by target, so each OS-facing module (`std/os`, `std/os/signal`, `std/file`, `std/net`, `std/process`) carries one implementation per OS behind one API.
+    2. `__syscall` rejected at compile time on the Windows target, so a module without a Windows implementation fails the build.
+    3. `std/process` over kernel32: `CreateProcessW` with Windows command-line quoting, `CreatePipe` with overlapped reads and writes for piped streams, `WaitForSingleObject` and `GetExitCodeProcess`, `TerminateProcess`, job objects for process groups, and `find` over `PATH` and `PATHEXT`.
+6. Further targets: linux/arm64, darwin; macOS (Metal) and Windows backends for the UI library.
