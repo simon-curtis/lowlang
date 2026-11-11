@@ -26,6 +26,7 @@ pub struct Conn {
 pub struct ListenerHandle {
     pub fd: i64
     pub addr: Addr
+    closing: *Watch
     guard: *io.Guard
 }
 
@@ -161,17 +162,24 @@ fn socket_error(fd: i64) -> i64 {
 }
 
 fn local(fd: i64) -> Addr ! io.Error {
-    let buf = io.buffer(28)
+    let buf = io.buffer(128)
     let size = io.buffer(4)
-    io.set_le32(size, 0, 28)
+    io.set_le32(size, 0, 128)
     io.syscall_result(__syscall(51, fd, __slice_ptr(buf), __slice_ptr(size)))?
-    from_sockaddr(buf)
+    from_sockaddr(buf, io.le32(size, 0))
 }
 
-fn bound(a: Addr, kind: i64) -> Pending ! io.Error {
+fn bound(a: Addr, kind: i64, o: ListenOptions) -> Pending ! io.Error {
     using p = Pending { fd: socket(family(a), kind)?, kept: false }
-    set_int(p.fd, 1, 2, 1) catch {
-        _ => fail Invalid
+    if o.reuse_addr {
+        set_int(p.fd, 1, 2, 1) catch {
+            _ => fail Invalid
+        }
+    }
+    if o.reuse_port {
+        set_int(p.fd, 1, 15, 1) catch {
+            _ => fail Invalid
+        }
     }
     let sa = sockaddr(a)
     let r = __syscall(49, p.fd, __slice_ptr(sa), sa.len)
@@ -192,15 +200,42 @@ fn socket_guard(fd: i64) -> *io.Guard {
     io.guard(fn() { __syscall(48, fd, 2) }, fn() { __syscall(3, fd) })
 }
 
+pub struct ListenOptions {
+    pub reuse_addr: bool = true
+    pub reuse_port: bool = false
+    pub backlog: i64 = 4096
+}
+
 pub fn listen(host: str, port: i64) -> Listener ! io.Error {
-    using var p = bound(Addr { ip: resolve_local(host)?, port }, 1)?
-    let r = __syscall(50, p.fd, 4096)
+    listen_with(host, port, ListenOptions {})
+}
+
+pub fn listen_with(host: str, port: i64, o: ListenOptions) -> Listener ! io.Error {
+    using var p = bound(Addr { ip: resolve_local(host)?, port }, 1, o)?
+    open_listener(mut p, o.backlog, "")?
+}
+
+fn listener_guard(fd: i64, closing: *Watch, path: str) -> *io.Guard {
+    io.guard(fn() {
+        closing.done = true
+        __syscall(48, fd, 2)
+    }, fn() {
+        __syscall(3, fd)
+        if path.len > 0 && !abstract_path(path) {
+            __syscall(87, cstr(path))
+        }
+    })
+}
+
+fn open_listener(mut p: Pending, backlog: i64, path: str) -> Listener ! io.Error {
+    let r = __syscall(50, p.fd, backlog)
     if r < 0 {
         fail io.errno(-r)
     }
     let addr = local(p.fd)?
     let fd = keep(mut p)
-    Listener { handle: ListenerHandle { fd, addr, guard: socket_guard(fd) } }
+    let closing = new(Watch { done: false, fired: false })
+    Listener { handle: ListenerHandle { fd, addr, closing, guard: listener_guard(fd, closing, path) } }
 }
 
 pub fn accept(l: Listener) -> Conn ! io.Error {
@@ -210,15 +245,18 @@ pub fn accept(l: Listener) -> Conn ! io.Error {
 
 pub fn accept_handle(h: ListenerHandle) -> ConnHandle ! io.Error {
     using lease = io.enter(h.guard)?
-    let buf = io.buffer(28)
+    let buf = io.buffer(128)
     let size = io.buffer(4)
     for {
-        io.set_le32(size, 0, 28)
+        io.set_le32(size, 0, 128)
         let r = __syscall(288, h.fd, __slice_ptr(buf), __slice_ptr(size), 0x80800)
         if r == -11 {
             wait_readable(h.fd)
+            if h.closing.done {
+                fail NotConnected
+            }
         } else if r >= 0 {
-            return conn(r, from_sockaddr(buf))
+            return conn(r, from_sockaddr(buf, io.le32(size, 0)))
         } else if r != -4 && r != -103 {
             fail io.errno(-r)
         }
@@ -255,7 +293,16 @@ fn open_stream(a: Addr, device: str, millis: i64) -> Conn ! io.Error {
     }
     let sa = sockaddr(a)
     var r = __syscall(42, fd, __slice_ptr(sa), sa.len)
-    for r == -4 {
+    var queued = 0
+    let queue_limit = if millis > 0 { millis } else { 30000 }
+    for r == -4 || r == -11 && is_unix(a) {
+        if r == -11 {
+            if queued >= queue_limit {
+                fail TimedOut
+            }
+            sleep(1)
+            queued += 1
+        }
         r = __syscall(42, fd, __slice_ptr(sa), sa.len)
     }
     if r == -115 {
@@ -397,7 +444,11 @@ pub fn stream_on(h: ConnHandle) -> io.Stream {
 }
 
 pub fn bind_udp(host: str, port: i64) -> Socket ! io.Error {
-    using var p = bound(Addr { ip: resolve_local(host)?, port }, 2)?
+    bind_udp_with(host, port, ListenOptions {})
+}
+
+pub fn bind_udp_with(host: str, port: i64, o: ListenOptions) -> Socket ! io.Error {
+    using var p = bound(Addr { ip: resolve_local(host)?, port }, 2, o)?
     let addr = local(p.fd)?
     let fd = keep(mut p)
     Socket { handle: SocketHandle { fd, addr, timeouts: no_timeouts(), guard: socket_guard(fd) } }
@@ -421,7 +472,7 @@ pub fn receive_from(s: Socket, buf: []u8) -> Packet ! io.Error {
         io.set_le32(size, 0, 28)
         __syscall(45, h.fd, __slice_ptr(buf), buf.len, 0, __slice_ptr(sa), __slice_ptr(size))
     })?
-    Packet { size: n, from: from_sockaddr(sa) }
+    Packet { size: n, from: from_sockaddr(sa, io.le32(size, 0)) }
 }
 
 pub fn set_receive_timeout(s: Socket, millis: i64) {

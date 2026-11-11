@@ -1,0 +1,441 @@
+import std/crypto/x509
+import std/http
+import std/io
+import std/net
+import std/socks
+import std/sync
+import std/text
+import std/tls
+
+struct Proxy {
+    lock: sync.Mutex
+    password: str
+    connections: i64
+    targets: []str
+    backend: net.Addr
+}
+
+struct Pump {
+    from: net.ConnHandle
+    to: net.ConnHandle
+    done: chan[bool]
+}
+
+fn record(p: *Proxy, line: str) {
+    sync.lock(p.lock)
+    push(mut p.targets, line)
+    sync.unlock(p.lock)
+}
+
+fn read_exact(c: net.Conn, n: i64) -> []u8 ! io.Error {
+    let out = io.buffer(n)
+    var got = 0
+    for got < n {
+        let r = net.read(c, out[got..])?
+        if r == 0 {
+            fail Eof
+        }
+        got += r
+    }
+    out
+}
+
+fn reply5(c: net.Conn, code: i64) ! io.Error {
+    net.write_all(c, [5, u8(code), 0, 1, 0, 0, 0, 0, 0, 0])?
+}
+
+fn pump(w: Pump) {
+    let buf = io.buffer(4096)
+    for {
+        let n = net.read_on(w.from, buf) catch 0
+        if n == 0 {
+            break
+        }
+        net.write_all_on(w.to, buf[..n]) catch {
+            _ => break
+        }
+    }
+    net.shutdown_write_on(w.to) catch {
+        _ => {}
+    }
+    w.done <- true
+}
+
+fn splice(c: net.Conn, upstream: net.Conn) {
+    let done = chan[bool](2)
+    spawn pump(Pump { from: c.handle, to: upstream.handle, done })
+    spawn pump(Pump { from: upstream.handle, to: c.handle, done })
+    let a = <-done
+    let b = <-done
+}
+
+fn authorised(p: *Proxy, c: net.Conn) -> bool ! io.Error {
+    let head = read_exact(c, 2)?
+    let user = read_exact(c, i64(head[1]))?
+    let length = read_exact(c, 1)?
+    let password = read_exact(c, i64(length[0]))?
+    let good = p.password.len > 0 && str(password) == p.password
+    net.write_all(c, [1, if good { 0 } else { 1 }])?
+    if good {
+        record(p, "auth {str(user)}")
+    }
+    good
+}
+
+fn outcome(host: str) -> i64 {
+    if host == "refused.test" {
+        return 5
+    }
+    if host == "unreachable.test" {
+        return 4
+    }
+    if host == "blocked.test" {
+        return 2
+    }
+    0
+}
+
+fn socks5(p: *Proxy, c: net.Conn) ! io.Error {
+    let count = read_exact(c, 1)?
+    let methods = read_exact(c, i64(count[0]))?
+    var offers_password = false
+    for m in methods {
+        if m == 2 {
+            offers_password = true
+        }
+    }
+    if p.password.len > 0 {
+        if !offers_password {
+            net.write_all(c, [5, 0xFF])?
+            return
+        }
+        net.write_all(c, [5, 2])?
+        if !authorised(p, c)? {
+            return
+        }
+    } else {
+        net.write_all(c, [5, 0])?
+    }
+    let head = read_exact(c, 4)?
+    var label = ""
+    if head[3] == 1 {
+        label = "ipv4 {net.format_ip(read_exact(c, 4)?)}"
+    } else if head[3] == 4 {
+        label = "ipv6 {net.format_ip(read_exact(c, 16)?)}"
+    } else {
+        let size = read_exact(c, 1)?
+        label = "domain {str(read_exact(c, i64(size[0]))?)}"
+    }
+    let port = io.be16(read_exact(c, 2)?, 0)
+    record(p, "{label} port-ok {port == p.backend.port || port == 9}")
+    let code = outcome(label[7..])
+    if code != 0 {
+        reply5(c, code)?
+        return
+    }
+    using upstream = net.connect(p.backend)?
+    reply5(c, 0)?
+    splice(c, upstream)
+}
+
+fn socks4(p: *Proxy, c: net.Conn) ! io.Error {
+    let head = read_exact(c, 7)?
+    let port = io.be16(head, 1)
+    let ip = head[3..7]
+    var user: []u8 = []
+    for {
+        let b = read_exact(c, 1)?
+        if b[0] == 0 {
+            break
+        }
+        push(mut user, b[0])
+    }
+    var label = "ipv4 {net.format_ip(ip)}"
+    if ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] != 0 {
+        var host: []u8 = []
+        for {
+            let b = read_exact(c, 1)?
+            if b[0] == 0 {
+                break
+            }
+            push(mut host, b[0])
+        }
+        label = "domain {str(host)}"
+    }
+    record(p, "4a {label} user {str(user)} port-ok {port == p.backend.port || port == 9}")
+    if label == "domain denied.test" {
+        net.write_all(c, [0, 0x5B, 0, 0, 0, 0, 0, 0])?
+        return
+    }
+    using upstream = net.connect(p.backend)?
+    net.write_all(c, [0, 0x5A, 0, 0, 0, 0, 0, 0])?
+    splice(c, upstream)
+}
+
+fn serve_proxy_conn(p: *Proxy, h: net.ConnHandle) {
+    using c = net.adopt(h)
+    let version = read_exact(c, 1) catch {
+        _ => return
+    }
+    if version[0] == 5 {
+        socks5(p, c) catch {
+            _ => {}
+        }
+    } else if version[0] == 4 {
+        socks4(p, c) catch {
+            _ => {}
+        }
+    }
+}
+
+fn run_proxy(p: *Proxy, l: net.ListenerHandle) {
+    for {
+        let h = net.accept_handle(l) catch {
+            _ => return
+        }
+        sync.lock(p.lock)
+        p.connections += 1
+        sync.unlock(p.lock)
+        spawn serve_proxy_conn(p, h)
+    }
+}
+
+fn run_backend(l: net.ListenerHandle) {
+    for {
+        let h = net.accept_handle(l) catch {
+            _ => return
+        }
+        spawn echo(h)
+    }
+}
+
+fn echo(h: net.ConnHandle) {
+    using c = net.adopt(h)
+    let buf = io.buffer(64)
+    for {
+        let n = net.read(c, buf) catch 0
+        if n == 0 {
+            return
+        }
+        net.write_all(c, bytes("echo:{str(buf[..n])}")) catch {
+            _ => return
+        }
+    }
+}
+
+fn start_proxy(backend: net.Addr, password: str) -> *Proxy {
+    let p = new(Proxy { lock: sync.mutex(), password, connections: 0, targets: [], backend })
+    p
+}
+
+fn exchange(c: net.Conn, message: str) -> str ! io.Error {
+    net.write_all(c, bytes(message))?
+    let buf = io.buffer(64)
+    let n = net.read(c, buf)?
+    str(buf[..n])
+}
+
+fn through(proxy: net.Addr, host: str, port: i64, auth: socks.Auth?) -> str {
+    using c = socks.dial(proxy, host, port, auth) catch {
+        Denied => return "denied"
+        Refused => return "refused"
+        Unreachable => return "unreachable"
+        Unsupported => return "unsupported"
+        Invalid => return "invalid"
+        _ => return "failed"
+    }
+    exchange(c, "ping") catch {
+        _ => return "no reply"
+    }
+}
+
+fn through4a(proxy: net.Addr, host: str, port: i64, user: str) -> str {
+    using c = socks.dial4a(proxy, host, port, user) catch {
+        Denied => return "denied"
+        Refused => return "refused"
+        Unsupported => return "unsupported"
+        _ => return "failed"
+    }
+    exchange(c, "ping") catch {
+        _ => return "no reply"
+    }
+}
+
+fn page(req: http.Request) -> http.Response {
+    http.response(200, "host={http.header(req.headers, "host") ?? req.authority} path={req.target}")
+}
+
+fn run_web(l: net.ListenerHandle) {
+    let handler = fn(req: http.Request) -> http.Response { page(req) }
+    http.serve_on(l, handler) catch {
+        _ => {}
+    }
+}
+
+fn secure_conn(h: net.ConnHandle, config: tls.Config) {
+    using c = net.adopt(h)
+    using t = tls.server(net.stream(c), config) catch {
+        _ => return
+    }
+    let handler = fn(req: http.Request) -> http.Response { page(req) }
+    http.serve_stream(tls.stream(t), handler) catch {
+        _ => {}
+    }
+}
+
+fn run_secure(l: net.ListenerHandle, config: tls.Config) {
+    for {
+        let h = net.accept_handle(l) catch {
+            _ => return
+        }
+        spawn secure_conn(h, config)
+    }
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_blocks(embed("std_tls_ca.pem"), "CERTIFICATE") {
+        push(mut out, x509.parse(der) catch {
+            _ => return out
+        })
+    }
+    out
+}
+
+fn fetched(c: *http.Client, url: str, port: i64) -> str {
+    let r = c.get(url) catch {
+        Connect(_) => return "connect error"
+        Tls(_) => return "tls error"
+        _ => return "other error"
+    }
+    "{r.status} {text.replace(http.text(r), "{port}", "PORT")}"
+}
+
+fn show(p: *Proxy) {
+    sync.lock(p.lock)
+    for t in p.targets {
+        print("  proxy saw {t}")
+    }
+    p.targets = []
+    sync.unlock(p.lock)
+}
+
+fn main() ! io.Error {
+    using backend = net.listen("127.0.0.1", 0)?
+    spawn run_backend(backend.handle)
+    let target = backend.handle.addr.port
+
+    using open = net.listen("127.0.0.1", 0)?
+    let plain = start_proxy(backend.handle.addr, "")
+    spawn run_proxy(plain, open.handle)
+    let open_addr = open.handle.addr
+
+    print("domain: {through(open_addr, "backend.test", target, none)}")
+    show(plain)
+    print("ipv4: {through(open_addr, "127.0.0.1", target, none)}")
+    show(plain)
+    print("ipv6: {through(open_addr, "::1", target, none)}")
+    show(plain)
+    print("bracketed ipv6: {through(open_addr, "[::1]", target, none)}")
+    show(plain)
+    print("refused: {through(open_addr, "refused.test", 9, none)}")
+    show(plain)
+    print("unreachable: {through(open_addr, "unreachable.test", 9, none)}")
+    show(plain)
+    print("blocked: {through(open_addr, "blocked.test", 9, none)}")
+    show(plain)
+    print("credentials sent to an open proxy: {through(open_addr, "backend.test", target, some(socks.Auth { user: "alice", password: "secret" }))}")
+    show(plain)
+    print("bad port: {through(open_addr, "backend.test", 0, none)}")
+    print("empty host: {through(open_addr, "", target, none)}")
+
+    using locked = net.listen("127.0.0.1", 0)?
+    let guarded = start_proxy(backend.handle.addr, "secret")
+    spawn run_proxy(guarded, locked.handle)
+    let locked_addr = locked.handle.addr
+    let alice = socks.Auth { user: "alice", password: "secret" }
+    print("auth ok: {through(locked_addr, "backend.test", target, some(alice))}")
+    show(guarded)
+    print("auth wrong password: {through(locked_addr, "backend.test", target, some(socks.Auth { user: "alice", password: "nope" }))}")
+    show(guarded)
+    print("auth missing: {through(locked_addr, "backend.test", target, none)}")
+
+    print("v4a domain: {through4a(open_addr, "backend.test", target, "bob")}")
+    show(plain)
+    print("v4a literal: {through4a(open_addr, "127.0.0.1", target, "")}")
+    show(plain)
+    print("v4a denied: {through4a(open_addr, "denied.test", 9, "bob")}")
+    show(plain)
+    print("v4a ipv6: {through4a(open_addr, "::1", target, "bob")}")
+
+    let dialer = socks.dialer(open_addr, none)
+    using viaDialer = net.adopt(dialer.dial("backend.test", target)?)
+    print("dialer: {exchange(viaDialer, "ping")?}")
+    show(plain)
+
+    using direct = net.adopt(net.direct_dialer().dial("127.0.0.1", target)?)
+    print("direct dialer: {exchange(direct, "ping")?}")
+
+    sleep(100)
+    print("plain proxy connections {plain.connections}")
+    print("guarded proxy connections {guarded.connections}")
+
+    using web = net.listen("127.0.0.1", 0)?
+    spawn run_web(web.handle)
+    let web_port = web.handle.addr.port
+    let pem = embed("std_tls_ec.pem")
+    let key = tls.load_key(pem) catch {
+        _ => return
+    }
+    let config = tls.Config { certificates: tls.load_certificates(pem), key, alpn: ["h2", "http/1.1"] }
+    using web_tls = net.listen("127.0.0.1", 0)?
+    spawn run_secure(web_tls.handle, config)
+    let web_tls_port = web_tls.handle.addr.port
+
+    using via_listener = net.listen("127.0.0.1", 0)?
+    let routed = start_proxy(web.handle.addr, "")
+    spawn run_proxy(routed, via_listener.handle)
+    let routed_port = via_listener.handle.addr.port
+    let by_url = http.client().with_proxy("socks5://127.0.0.1:{routed_port}").build()
+    print("http through socks5: {fetched(by_url, "http://backend.test:{web_port}/page?x=1", web_port)}")
+    show(routed)
+
+    using tls_listener = net.listen("127.0.0.1", 0)?
+    let routed_tls = start_proxy(web_tls.handle.addr, "")
+    spawn run_proxy(routed_tls, tls_listener.handle)
+    let tls_proxy_port = tls_listener.handle.addr.port
+    let secure_url = http.client().with_proxy("socks5://127.0.0.1:{tls_proxy_port}").with_roots(roots()).build()
+    print("https through socks5: {fetched(secure_url, "https://localhost:{web_tls_port}/secure", web_tls_port)}")
+    show(routed_tls)
+
+    let untrusted = http.client().with_proxy("socks5://127.0.0.1:{tls_proxy_port}").build()
+    print("untrusted certificate: {fetched(untrusted, "https://localhost:{web_tls_port}/secure", web_tls_port)}")
+
+    let literal = http.client().with_proxy("socks5h://127.0.0.1:{routed_port}").build()
+    print("socks5h and a literal address: {fetched(literal, "http://127.0.0.1:{web_port}/literal", web_port)}")
+    show(routed)
+
+    let v4a = http.client().with_proxy("socks4a://carol@127.0.0.1:{routed_port}").build()
+    print("socks4a: {fetched(v4a, "http://backend.test:{web_port}/v4", web_port)}")
+    show(routed)
+
+    let skipped = http.client().with_proxy("socks5://127.0.0.1:{routed_port}").with_no_proxy("backend.test").with_resolver(fn(host: str) -> [][]u8 ! io.Error { [net.parse_ip("127.0.0.1")?] }).build()
+    print("no_proxy bypass: {fetched(skipped, "http://backend.test:{web_port}/direct", web_port)}")
+
+    using locked_web = net.listen("127.0.0.1", 0)?
+    let credentials = start_proxy(web.handle.addr, "secret")
+    spawn run_proxy(credentials, locked_web.handle)
+    let locked_port = locked_web.handle.addr.port
+    let signed_in = http.client().with_proxy("socks5://alice:secret@127.0.0.1:{locked_port}").build()
+    print("socks5 credentials: {fetched(signed_in, "http://backend.test:{web_port}/auth", web_port)}")
+    show(credentials)
+    let anonymous = http.client().with_proxy("socks5://127.0.0.1:{locked_port}").build()
+    print("socks5 without credentials: {fetched(anonymous, "http://backend.test:{web_port}/auth", web_port)}")
+    let wrong = http.client().with_proxy("socks5://alice:nope@127.0.0.1:{locked_port}").build()
+    print("socks5 wrong password: {fetched(wrong, "http://backend.test:{web_port}/auth", web_port)}")
+
+    let dialled = http.client().with_dialer(socks.dialer(via_listener.handle.addr, none)).build()
+    print("dialer value: {fetched(dialled, "http://backend.test:{web_port}/dialer", web_port)}")
+    sleep(100)
+    print("routed proxy connections {routed.connections}")
+}

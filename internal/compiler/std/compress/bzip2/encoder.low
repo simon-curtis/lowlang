@@ -1,0 +1,378 @@
+import std/io
+
+pub struct Encoder {
+    sink: fn([]u8) ! io.Error
+    level: i64
+    block: []u8
+    len: i64
+    limit: i64
+    run_byte: u8
+    run_len: i64
+    crc: Crc
+    combined: u32
+    started: bool
+    bits: *BitOut
+    work: *Work
+}
+
+fn block_unit() -> i64 {
+    100000
+}
+
+fn table_iterations() -> i64 {
+    4
+}
+
+pub fn encoder(level: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
+    let l = if level < 1 { 1 } else if level > 9 { 9 } else { level }
+    let size = l * block_unit()
+    new(Encoder {
+        sink
+        level: l
+        block: io.buffer(size)
+        len: 0
+        limit: size - 19
+        run_byte: 0
+        run_len: 0
+        crc: crc_new()
+        combined: 0
+        started: false
+        bits: bit_out()
+        work: work()
+    })
+}
+
+pub fn encode(e: *Encoder, data: []u8) ! io.Error {
+    for b in data {
+        if e.run_len > 0 && b == e.run_byte && e.run_len < 255 {
+            e.run_len += 1
+            continue
+        }
+        end_run(e)?
+        e.run_byte = b
+        e.run_len = 1
+    }
+}
+
+fn end_run(e: *Encoder) ! io.Error {
+    let n = e.run_len
+    if n == 0 {
+        return
+    }
+    e.run_len = 0
+    crc_byte(mut e.crc, e.run_byte, n)
+    if n < 4 {
+        for _ in 0..n {
+            e.block[e.len] = e.run_byte
+            e.len += 1
+        }
+    } else {
+        for _ in 0..4 {
+            e.block[e.len] = e.run_byte
+            e.len += 1
+        }
+        e.block[e.len] = u8(n - 4)
+        e.len += 1
+    }
+    if e.len >= e.limit {
+        write_block(e)?
+    }
+}
+
+pub fn finish(e: *Encoder) ! io.Error {
+    end_run(e)?
+    if e.len > 0 {
+        write_block(e)?
+    }
+    start_stream(e)
+    let b = e.bits
+    put(b, 0x177245, 24)
+    put(b, 0x385090, 24)
+    put(b, i64(e.combined), 32)
+    align_out(b)
+    drain(b, e.sink)?
+}
+
+fn start_stream(e: *Encoder) {
+    if e.started {
+        return
+    }
+    e.started = true
+    put(e.bits, 0x425A68, 24)
+    put(e.bits, 0x30 + e.level, 8)
+}
+
+fn write_block(e: *Encoder) ! io.Error {
+    start_stream(e)
+    let n = e.len
+    let sum = crc_sum(e.crc)
+    e.combined = rotate_crc(e.combined, sum)
+    crc_reset(mut e.crc)
+    e.len = 0
+    let w = e.work
+    let data = e.block
+    reserve_work(w, n)
+    let orig = transform(w, data, n)
+    let present = io.buffer(256)
+    let map = io.buffer(256)
+    let used = symbol_map(data, n, present, map)
+    let count = move_to_front(w, n, map, used)
+    let b = e.bits
+    put(b, 0x314159, 24)
+    put(b, 0x265359, 24)
+    put(b, i64(sum), 32)
+    put(b, 0, 1)
+    put(b, orig, 24)
+    put_map(b, present)
+    let alpha = used + 2
+    let groups = table_count(count)
+    let selectors = fit_tables(w, count, alpha, groups)
+    put(b, groups, 3)
+    put(b, selectors, 15)
+    put_selectors(b, w, selectors)
+    put_tables(b, w, groups, alpha)
+    put_symbols(b, w, count)
+    drain(b, e.sink)?
+}
+
+fn symbol_map(data: []u8, n: i64, present: []u8, map: []u8) -> i64 {
+    for i in 0..n {
+        present[data[i]] = 1
+    }
+    var used = 0
+    for v in 0..256 {
+        if present[v] != 0 {
+            map[v] = u8(used)
+            used += 1
+        }
+    }
+    used
+}
+
+fn put_map(b: *BitOut, present: []u8) {
+    var ranges = 0
+    for i in 0..16 {
+        for j in 0..16 {
+            if present[i * 16 + j] != 0 {
+                ranges |= 1 << (15 - i)
+            }
+        }
+    }
+    put(b, ranges, 16)
+    for i in 0..16 {
+        if ranges >> (15 - i) & 1 == 0 {
+            continue
+        }
+        var members = 0
+        for j in 0..16 {
+            members = members << 1 | i64(present[i * 16 + j])
+        }
+        put(b, members, 16)
+    }
+}
+
+fn put_zero_run(w: *Work, at: i64, run: i64) -> i64 {
+    var pending = run - 1
+    var out = at
+    for {
+        let sym = pending & 1
+        w.symbols[out] = u16(sym)
+        w.freq[sym] += 1
+        out += 1
+        if pending < 2 {
+            break
+        }
+        pending = (pending - 2) / 2
+    }
+    out
+}
+
+fn move_to_front(w: *Work, n: i64, map: []u8, used: i64) -> i64 {
+    let list = io.buffer(256)
+    for i in 0..used {
+        list[i] = u8(i)
+    }
+    for i in 0..max_symbols() {
+        w.freq[i] = 0
+    }
+    var out = 0
+    var zeros = 0
+    for i in 0..n {
+        let v = map[w.last[i]]
+        if list[0] == v {
+            zeros += 1
+            continue
+        }
+        if zeros > 0 {
+            out = put_zero_run(w, out, zeros)
+            zeros = 0
+        }
+        var carry = list[0]
+        var j = 1
+        for list[j] != v {
+            let t = list[j]
+            list[j] = carry
+            carry = t
+            j += 1
+        }
+        list[j] = carry
+        list[0] = v
+        w.symbols[out] = u16(j + 1)
+        w.freq[j + 1] += 1
+        out += 1
+    }
+    if zeros > 0 {
+        out = put_zero_run(w, out, zeros)
+    }
+    w.symbols[out] = u16(used + 1)
+    w.freq[used + 1] += 1
+    out + 1
+}
+
+fn table_count(count: i64) -> i64 {
+    if count < 200 {
+        2
+    } else if count < 600 {
+        3
+    } else if count < 1200 {
+        4
+    } else if count < 2400 {
+        5
+    } else {
+        6
+    }
+}
+
+fn initial_tables(w: *Work, count: i64, alpha: i64, groups: i64) {
+    var parts = groups
+    var remaining = count
+    var start = 0
+    for parts > 0 {
+        let target = remaining / parts
+        var end = start - 1
+        var covered = 0
+        for covered < target && end < alpha - 1 {
+            end += 1
+            covered += w.freq[end]
+        }
+        if end > start && parts != groups && parts != 1 && (groups - parts) % 2 == 1 {
+            covered -= w.freq[end]
+            end -= 1
+        }
+        for v in 0..alpha {
+            w.lens[(parts - 1) * max_symbols() + v] = if v >= start && v <= end { 0 } else { 15 }
+        }
+        parts -= 1
+        start = end + 1
+        remaining -= covered
+    }
+}
+
+fn fit_tables(w: *Work, count: i64, alpha: i64, groups: i64) -> i64 {
+    initial_tables(w, count, alpha, groups)
+    let cost: []i64 = __make(6)
+    var selectors = 0
+    for _ in 0..table_iterations() {
+        for i in 0..groups * max_symbols() {
+            w.rfreq[i] = 0
+        }
+        selectors = 0
+        var start = 0
+        for start < count {
+            let end = if start + group_size() < count { start + group_size() } else { count }
+            var best = 0
+            for t in 0..groups {
+                var c = 0
+                let row = t * max_symbols()
+                for i in start..end {
+                    c += i64(w.lens[row + i64(w.symbols[i])])
+                }
+                cost[t] = c
+                if c < cost[best] {
+                    best = t
+                }
+            }
+            let row = best * max_symbols()
+            for i in start..end {
+                w.rfreq[row + i64(w.symbols[i])] += 1
+            }
+            w.selectors[selectors] = u8(best)
+            selectors += 1
+            start = end
+        }
+        for t in 0..groups {
+            let row = t * max_symbols()
+            make_lengths(w.rfreq[row..], w.lens[row..], alpha)
+        }
+    }
+    selectors
+}
+
+fn put_selectors(b: *BitOut, w: *Work, selectors: i64) {
+    let order = io.buffer(6)
+    for i in 0..6 {
+        order[i] = u8(i)
+    }
+    for i in 0..selectors {
+        let v = w.selectors[i]
+        var j = 0
+        for order[j] != v {
+            j += 1
+        }
+        for k in 0..j {
+            order[j - k] = order[j - k - 1]
+        }
+        order[0] = v
+        put(b, ((1 << j) - 1) << 1, j + 1)
+    }
+}
+
+fn put_tables(b: *BitOut, w: *Work, groups: i64, alpha: i64) {
+    for t in 0..groups {
+        let row = t * max_symbols()
+        var curr = i64(w.lens[row])
+        put(b, curr, 5)
+        for i in 0..alpha {
+            let target = i64(w.lens[row + i])
+            for curr < target {
+                put(b, 2, 2)
+                curr += 1
+            }
+            for curr > target {
+                put(b, 3, 2)
+                curr -= 1
+            }
+            put(b, 0, 1)
+        }
+        assign_codes(w.lens[row..], w.codes[row..], alpha)
+    }
+}
+
+fn put_symbols(b: *BitOut, w: *Work, count: i64) {
+    var start = 0
+    var g = 0
+    for start < count {
+        let end = if start + group_size() < count { start + group_size() } else { count }
+        let row = i64(w.selectors[g]) * max_symbols()
+        for i in start..end {
+            let sym = i64(w.symbols[i])
+            put(b, w.codes[row + sym], i64(w.lens[row + sym]))
+        }
+        start = end
+        g += 1
+    }
+}
+
+pub fn compress(data: []u8, level: i64) -> []u8 {
+    let c = new(Collector { data: __make(data.len / 2 + 64), len: 0 })
+    let sink: fn([]u8) ! io.Error = fn(chunk) { collect(c, chunk) }
+    let e = encoder(level, sink)
+    encode(e, data) catch {
+        _ => {}
+    }
+    finish(e) catch {
+        _ => {}
+    }
+    c.data[..c.len]
+}
+

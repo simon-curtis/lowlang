@@ -1,0 +1,1525 @@
+import std/base64
+import std/crypto/x509
+import std/io
+import std/mail
+import std/net
+import std/slices
+import std/smtp
+import std/sync
+import std/text
+import std/time
+import std/tls
+
+struct Settings {
+    starttls: bool = false
+    auth: str = ""
+    size: i64 = 0
+    eight_bit: bool = false
+    utf8: bool = false
+    pipelining: bool = false
+    ehlo_unknown: bool = false
+    require_auth: bool = false
+}
+
+struct Received {
+    from: str
+    to: []str
+    params: str
+    data: str
+}
+
+struct Store {
+    gate: sync.Mutex
+    settings: Settings
+    config: tls.Config
+    messages: []Received
+    log: []str
+    batches: i64
+    sessions: i64
+    ended: chan[str]
+}
+
+struct Session {
+    st: *Store
+    stream: io.Stream
+    reader: *io.Reader
+    encrypted: bool
+    greeted: bool
+    authed: bool
+    has_from: bool
+    from: str
+    params: str
+    accepted: []str
+    upgrade: bool
+    done: bool
+}
+
+fn new_store(settings: Settings, config: tls.Config) -> *Store {
+    new(Store {
+        gate: sync.mutex()
+        settings
+        config
+        messages: []
+        log: []
+        batches: 0
+        sessions: 0
+        ended: chan[str](64)
+    })
+}
+
+fn open_session(st: *Store, stream: io.Stream, encrypted: bool) -> *Session {
+    new(Session {
+        st
+        stream
+        reader: io.reader(stream)
+        encrypted
+        greeted: false
+        authed: false
+        has_from: false
+        from: ""
+        params: ""
+        accepted: []
+        upgrade: false
+        done: false
+    })
+}
+
+fn record(st: *Store, line: str) {
+    sync.lock(st.gate)
+    push(mut st.log, line)
+    sync.unlock(st.gate)
+}
+
+fn say(s: *Session, reply: str) {
+    io.write_str(s.stream, reply) catch {
+        _ => {
+            s.done = true
+        }
+    }
+}
+
+fn offers(list: str, mechanism: str) -> bool {
+    for m in text.fields(list) {
+        if m == mechanism {
+            return true
+        }
+    }
+    false
+}
+
+fn extension_lines(s: *Session) -> []str {
+    let set = s.st.settings
+    var lines = ["fake.example Hello"]
+    if set.size > 0 {
+        push(mut lines, "SIZE {set.size}")
+    }
+    if set.pipelining {
+        push(mut lines, "PIPELINING")
+    }
+    if set.eight_bit {
+        push(mut lines, "8BITMIME")
+    }
+    if set.utf8 {
+        push(mut lines, "SMTPUTF8")
+    }
+    if set.starttls && !s.encrypted {
+        push(mut lines, "STARTTLS")
+    }
+    if set.auth.len > 0 && (s.encrypted || !set.starttls) {
+        push(mut lines, "AUTH {set.auth}")
+    }
+    lines
+}
+
+fn ehlo_reply(s: *Session) -> str {
+    let lines = extension_lines(s)
+    var out = ""
+    for i, line in lines {
+        let joint = if i == lines.len - 1 { " " } else { "-" }
+        out = "{out}250{joint}{line}\r\n"
+    }
+    out
+}
+
+fn reset_transaction(s: *Session) {
+    s.has_from = false
+    s.from = ""
+    s.params = ""
+    s.accepted = []
+}
+
+fn path_of(arg: str) -> str {
+    let start = text.index_byte(arg, '<')
+    let stop = text.index_byte(arg, '>')
+    if start < 0 || stop < start {
+        return ""
+    }
+    arg[start + 1..stop]
+}
+
+fn params_of(arg: str) -> str {
+    let stop = text.index_byte(arg, '>')
+    if stop < 0 {
+        return ""
+    }
+    text.trim(arg[stop + 1..])
+}
+
+fn declared_size(params: str) -> i64 {
+    let cut = text.cut(params, "SIZE=")
+    if !cut.found {
+        return 0
+    }
+    let digits = text.cut(cut.after, " ").before
+    text.parse_int(digits) catch {
+        _ => 0
+    }
+}
+
+fn cmd_ehlo(s: *Session) {
+    if s.st.settings.ehlo_unknown {
+        say(s, "502 5.5.1 Command not implemented\r\n")
+        return
+    }
+    s.greeted = true
+    reset_transaction(s)
+    say(s, ehlo_reply(s))
+}
+
+fn cmd_helo(s: *Session) {
+    s.greeted = true
+    reset_transaction(s)
+    say(s, "250 fake.example\r\n")
+}
+
+fn cmd_mail(s: *Session, arg: str) {
+    let set = s.st.settings
+    if !s.greeted {
+        say(s, "503 5.5.1 Say EHLO first\r\n")
+        return
+    }
+    if set.require_auth && !s.authed {
+        say(s, "530 5.7.0 Authentication required\r\n")
+        return
+    }
+    if !text.starts_with(text.upper(arg), "FROM:") {
+        say(s, "501 5.5.4 Syntax error\r\n")
+        return
+    }
+    let sender = path_of(arg)
+    let params = params_of(arg)
+    if sender == "blocked@example.org" {
+        say(s, "550 5.7.1 Sender blocked\r\n")
+        return
+    }
+    let size = declared_size(params)
+    if set.size > 0 && size > set.size {
+        say(s, "552 5.3.4 Message size exceeds fixed limit\r\n")
+        return
+    }
+    if text.contains(params, "SMTPUTF8") && !set.utf8 {
+        say(s, "555 5.6.7 SMTPUTF8 not supported\r\n")
+        return
+    }
+    if text.contains(params, "BODY=8BITMIME") && !set.eight_bit {
+        say(s, "555 5.5.4 BODY not supported\r\n")
+        return
+    }
+    s.has_from = true
+    s.from = sender
+    s.params = params
+    s.accepted = []
+    say(s, "250 2.1.0 Ok\r\n")
+}
+
+fn cmd_rcpt(s: *Session, arg: str) {
+    if !s.has_from {
+        say(s, "503 5.5.1 Need MAIL first\r\n")
+        return
+    }
+    let to = path_of(arg)
+    if text.starts_with(to, "nouser") {
+        say(s, "550 5.1.1 <{to}>: Recipient address rejected: User unknown\r\n")
+        return
+    }
+    if text.starts_with(to, "later") {
+        say(s, "450 4.2.0 <{to}>: Mailbox busy\r\n")
+        return
+    }
+    if text.starts_with(to, "hang") {
+        sleep(600)
+    }
+    push(mut s.accepted, to)
+    say(s, "250 2.1.5 Ok\r\n")
+}
+
+fn read_data(s: *Session) -> str {
+    var lines: []str = []
+    for {
+        let line = io.read_line(s.reader) catch {
+            _ => {
+                s.done = true
+                return ""
+            }
+        }
+        if line == "." {
+            break
+        }
+        if text.starts_with(line, "..") {
+            push(mut lines, line[1..])
+        } else {
+            push(mut lines, line)
+        }
+    }
+    if lines.len == 0 {
+        return ""
+    }
+    "{text.join(lines, "\r\n")}\r\n"
+}
+
+fn store_message(s: *Session, data: str) -> i64 {
+    let st = s.st
+    sync.lock(st.gate)
+    push(mut st.messages, Received { from: s.from, to: s.accepted, params: s.params, data })
+    let count = st.messages.len
+    sync.unlock(st.gate)
+    count
+}
+
+fn cmd_data(s: *Session) {
+    if s.accepted.len == 0 {
+        say(s, "503 5.5.1 Need RCPT first\r\n")
+        return
+    }
+    say(s, "354 End data with <CR><LF>.<CR><LF>\r\n")
+    let data = read_data(s)
+    if s.done {
+        return
+    }
+    if text.contains(data, "Subject: REJECT") {
+        reset_transaction(s)
+        say(s, "554 5.6.0 Message rejected\r\n")
+        return
+    }
+    if text.contains(data, "Subject: DEFER") {
+        reset_transaction(s)
+        say(s, "451 4.3.0 Try again later\r\n")
+        return
+    }
+    let count = store_message(s, data)
+    reset_transaction(s)
+    say(s, "250 2.0.0 Ok: queued as Q{count}\r\n")
+}
+
+fn cmd_starttls(s: *Session) {
+    if !s.st.settings.starttls || s.encrypted {
+        say(s, "502 5.5.1 STARTTLS not available\r\n")
+        return
+    }
+    say(s, "220 2.0.0 Ready to start TLS\r\n")
+    s.upgrade = true
+}
+
+fn answer(s: *Session) -> str {
+    let line = io.read_line(s.reader) catch {
+        _ => {
+            s.done = true
+            return ""
+        }
+    }
+    record(s.st, "C: {line}")
+    line
+}
+
+fn decoded(value: str) -> str {
+    let raw = base64.decode(value) catch {
+        _ => return ""
+    }
+    str(raw)
+}
+
+fn accept_auth(s: *Session) {
+    s.authed = true
+    say(s, "235 2.7.0 Authentication successful\r\n")
+}
+
+fn reject_auth(s: *Session) {
+    say(s, "535 5.7.8 Authentication credentials invalid\r\n")
+}
+
+fn auth_plain(s: *Session, initial: str) {
+    if decoded(initial) == "\0tim\0tanstaaftanstaaf" {
+        accept_auth(s)
+        return
+    }
+    reject_auth(s)
+}
+
+fn auth_login(s: *Session) {
+    say(s, "334 VXNlcm5hbWU6\r\n")
+    let user = decoded(answer(s))
+    say(s, "334 UGFzc3dvcmQ6\r\n")
+    let password = decoded(answer(s))
+    if user == "tim" && password == "tanstaaftanstaaf" {
+        accept_auth(s)
+        return
+    }
+    reject_auth(s)
+}
+
+fn auth_cram_md5(s: *Session) {
+    say(s, "334 PDE4OTYuNjk3MTcwOTUyQHBvc3RvZmZpY2UucmVzdG9uLm1jaS5uZXQ+\r\n")
+    let response = answer(s)
+    if response == "dGltIGI5MTNhNjAyYzdlZGE3YTQ5NWI0ZTZlNzMzNGQzODkw" {
+        accept_auth(s)
+        return
+    }
+    reject_auth(s)
+}
+
+fn auth_xoauth2(s: *Session, initial: str) {
+    if initial == "dXNlcj10aW0BYXV0aD1CZWFyZXIgdG9rAQE=" {
+        accept_auth(s)
+        return
+    }
+    let problem = base64.encode(bytes("{{\"status\":\"401\",\"scope\":\"mail\"}}"))
+    say(s, "334 {problem}\r\n")
+    let ignored = answer(s)
+    say(s, "535 5.7.8 Token not accepted\r\n")
+}
+
+fn cmd_auth(s: *Session, arg: str) {
+    let set = s.st.settings
+    if !s.greeted || s.authed {
+        say(s, "503 5.5.1 Bad sequence of commands\r\n")
+        return
+    }
+    let cut = text.cut(arg, " ")
+    let mechanism = text.upper(cut.before)
+    if !offers(set.auth, mechanism) || (set.starttls && !s.encrypted) {
+        say(s, "504 5.5.4 Unrecognized authentication type\r\n")
+        return
+    }
+    if mechanism == "PLAIN" {
+        auth_plain(s, cut.after)
+    } else if mechanism == "LOGIN" {
+        auth_login(s)
+    } else if mechanism == "CRAM-MD5" {
+        auth_cram_md5(s)
+    } else {
+        auth_xoauth2(s, cut.after)
+    }
+}
+
+fn handle(s: *Session, line: str) {
+    let cut = text.cut(line, " ")
+    let verb = text.upper(cut.before)
+    if verb == "EHLO" {
+        cmd_ehlo(s)
+    } else if verb == "HELO" {
+        cmd_helo(s)
+    } else if verb == "MAIL" {
+        cmd_mail(s, cut.after)
+    } else if verb == "RCPT" {
+        cmd_rcpt(s, cut.after)
+    } else if verb == "DATA" {
+        cmd_data(s)
+    } else if verb == "AUTH" {
+        cmd_auth(s, cut.after)
+    } else if verb == "STARTTLS" {
+        cmd_starttls(s)
+    } else if verb == "RSET" {
+        reset_transaction(s)
+        say(s, "250 2.0.0 Ok\r\n")
+    } else if verb == "NOOP" {
+        say(s, "250 2.0.0 Ok\r\n")
+    } else if verb == "QUIT" {
+        say(s, "221 2.0.0 Bye\r\n")
+        s.done = true
+    } else {
+        say(s, "500 5.5.2 Command not recognized\r\n")
+    }
+}
+
+fn note_batch(s: *Session) {
+    if io.buffered(s.reader) == 0 {
+        return
+    }
+    sync.lock(s.st.gate)
+    s.st.batches += 1
+    sync.unlock(s.st.gate)
+}
+
+fn converse(s: *Session) -> bool {
+    for !s.done {
+        let line = io.read_line(s.reader) catch {
+            _ => return false
+        }
+        note_batch(s)
+        record(s.st, "C: {line}")
+        handle(s, line)
+        if s.upgrade {
+            return true
+        }
+    }
+    false
+}
+
+fn next_session(st: *Store) -> i64 {
+    sync.lock(st.gate)
+    st.sessions += 1
+    let id = st.sessions
+    sync.unlock(st.gate)
+    id
+}
+
+fn secure(st: *Store, wire: io.Stream) {
+    using t = tls.server(wire, st.config) catch {
+        _ => return
+    }
+    let s = open_session(st, tls.stream(t), true)
+    converse(s)
+}
+
+fn plain(h: net.ConnHandle, st: *Store) {
+    using c = net.adopt(h)
+    let id = next_session(st)
+    let wire = net.stream(c)
+    let s = open_session(st, wire, false)
+    say(s, "220 fake.example ESMTP ready\r\n")
+    if converse(s) {
+        secure(st, wire)
+    }
+    st.ended <- "session {id} ended"
+}
+
+fn encrypted_session(h: net.ConnHandle, st: *Store) {
+    using c = net.adopt(h)
+    let id = next_session(st)
+    using t = tls.server(net.stream(c), st.config) catch {
+        _ => {
+            st.ended <- "session {id} ended"
+            return
+        }
+    }
+    let s = open_session(st, tls.stream(t), true)
+    say(s, "220 fake.example ESMTP ready\r\n")
+    converse(s)
+    st.ended <- "session {id} ended"
+}
+
+fn serve(l: net.ListenerHandle, st: *Store) {
+    for {
+        let h = net.accept_handle(l) catch {
+            _ => return
+        }
+        spawn plain(h, st)
+    }
+}
+
+fn serve_tls(l: net.ListenerHandle, st: *Store) {
+    for {
+        let h = net.accept_handle(l) catch {
+            _ => return
+        }
+        spawn encrypted_session(h, st)
+    }
+}
+
+fn mail_error(e: mail.Error) -> str {
+    match e {
+        InvalidAddress(a) => "InvalidAddress({text.quote(a)})"
+        HeaderInjection(h) => "HeaderInjection({text.quote(h)})"
+        InvalidHeader(h) => "InvalidHeader({text.quote(h)})"
+        NoRecipients => "NoRecipients"
+    }
+}
+
+fn describe(e: smtp.Error) -> str {
+    match e {
+        Connect => "Connect"
+        Closed => "Closed"
+        Timeout => "Timeout"
+        Protocol => "Protocol"
+        TooLarge => "TooLarge"
+        Insecure => "Insecure"
+        MessageTooLarge => "MessageTooLarge"
+        Unsupported(f) => "Unsupported({f})"
+        Transient(code, message) => "Transient({code}, {text.quote(message)})"
+        Permanent(code, message) => "Permanent({code}, {text.quote(message)})"
+        Auth(message) => "Auth({text.quote(message)})"
+        Invalid(error) => "Invalid({mail_error(error)})"
+    }
+}
+
+fn parse(label: str, data: str) {
+    let r = smtp.parse_reply(bytes(data)) catch {
+        e => {
+            print("{label}: error {describe(e)}")
+            return
+        }
+    }
+    print("{label}: {r.code} {text.quote(text.join(r.lines, "|"))} lines={r.lines.len}")
+}
+
+fn parse_limited(label: str, data: str, lines: i64) {
+    let r = smtp.parse_reply_with(bytes(data), smtp.Limits { lines }) catch {
+        e => {
+            print("{label}: error {describe(e)}")
+            return
+        }
+    }
+    print("{label}: {r.code} lines={r.lines.len}")
+}
+
+struct Drip {
+    data: []u8
+    at: i64
+}
+
+fn dripping(data: str, size: i64) -> io.Stream {
+    let state = new(Drip { data: bytes(data), at: 0 })
+    io.Stream {
+        read: fn(buf) {
+            let left = state.data.len - state.at
+            if left == 0 {
+                return 0
+            }
+            var n = if left < size { left } else { size }
+            if n > buf.len {
+                n = buf.len
+            }
+            let k = io.copy(buf[..n], state.data[state.at..state.at + n])
+            state.at += k
+            k
+        }
+        write: fn(data) { data.len }
+        close: fn() {}
+    }
+}
+
+fn parse_stream(label: str, data: str, size: i64) {
+    let r = smtp.read_reply(io.reader(dripping(data, size)), smtp.Limits {}) catch {
+        e => {
+            print("{label}: error {describe(e)}")
+            return
+        }
+    }
+    print("{label}: {r.code} lines={r.lines.len} bytes={text.join(r.lines, "").len}")
+}
+
+fn flag(v: bool) -> str {
+    if v { "yes" } else { "no" }
+}
+
+fn extensions_of(label: str, data: str) {
+    let r = smtp.parse_reply(bytes(data)) catch {
+        e => {
+            print("{label}: error {describe(e)}")
+            return
+        }
+    }
+    let e = smtp.parse_extensions(r)
+    print("{label}: greeting={text.quote(e.greeting)} names={text.join(e.names, ",")} auth={text.join(e.mechanisms, ",")} size={e.size}")
+    print("{label}: starttls={flag(e.starttls)} 8bit={flag(e.eight_bit_mime)} utf8={flag(e.smtputf8)} pipelining={flag(e.pipelining)} enhanced={flag(e.enhanced_codes)} plain={flag(smtp.supports(e, "plain"))}")
+}
+
+fn parser_tests() {
+    parse("simple", "250 OK\r\n")
+    parse("no text", "250\r\n")
+    parse("empty text", "250 \r\n")
+    parse("multiline", "250-first\r\n250-second\r\n250 third\r\n")
+    parse("bare lf", "250 fine\n")
+    parse("greeting", "220 mail.example.com ESMTP Postfix\r\n")
+    parse("enhanced", "550 5.1.1 <a@b>: Recipient address rejected\r\n")
+    parse("trailing data", "250 ok\r\n250 next\r\n")
+    parse("empty", "")
+    parse("short", "25\r\n")
+    parse("letters", "abc def\r\n")
+    parse("glued", "250x ok\r\n")
+    parse("code range", "999 x\r\n")
+    parse("code low", "099 x\r\n")
+    parse("code mismatch", "250-a\r\n251 b\r\n")
+    parse("truncated", "250-a\r\n")
+    parse("no newline", "250 ok")
+    parse("blank line", "\r\n")
+    parse("continuation after final", "250 a\r\n250-b\r\n250 c\r\n")
+    parse_limited("lines at limit", "250-a\r\n250-b\r\n250 c\r\n", 3)
+    parse_limited("lines over limit", "250-a\r\n250-b\r\n250-c\r\n250 d\r\n", 3)
+    parse_limited("lines one", "250 a\r\n", 1)
+    parse_limited("lines zero", "250 a\r\n", 0)
+    parse_stream("dripped", "250-one\r\n250-two\r\n250 three\r\n", 3)
+    parse_stream("dripped one byte", "354 go ahead\r\n", 1)
+    parse_stream("oversize line", "250 {text.repeat("a", 20000)}\r\n", 1000)
+    parse_stream("long line", "250 {text.repeat("a", 4000)}\r\n", 1000)
+    parse_stream("endless line", text.repeat("2", 40000), 1000)
+}
+
+fn extension_tests() {
+    extensions_of("postfix", "250-mail.example.com\r\n250-PIPELINING\r\n250-SIZE 10240000\r\n250-VRFY\r\n250-ETRN\r\n250-STARTTLS\r\n250-AUTH PLAIN LOGIN\r\n250-AUTH=PLAIN LOGIN\r\n250-ENHANCEDSTATUSCODES\r\n250-8BITMIME\r\n250-DSN\r\n250 SMTPUTF8\r\n")
+    extensions_of("lowercase", "250-host Hello there\r\n250-auth plain cram-md5\r\n250 starttls\r\n")
+    extensions_of("greeting only", "250 host\r\n")
+    extensions_of("size bare", "250-host\r\n250 SIZE\r\n")
+    extensions_of("size bogus", "250-host\r\n250 SIZE lots\r\n")
+    extensions_of("size negative", "250-host\r\n250 SIZE -5\r\n")
+    extensions_of("empty lines", "250-host\r\n250- \r\n250 8BITMIME\r\n")
+    extensions_of("auth alone", "250-host\r\n250 AUTH\r\n")
+    extensions_of("xoauth", "250-host\r\n250 AUTH XOAUTH2 PLAIN\r\n")
+}
+
+fn dot(s: str) {
+    print("dot {text.quote(s)}: {text.quote(str(smtp.dot_stuff(bytes(s))))}")
+}
+
+fn dot_tests() {
+    dot("")
+    dot("a")
+    dot("a\r\n")
+    dot(".")
+    dot(".\r\n")
+    dot("..\r\n")
+    dot(".x")
+    dot("line\r\n.hidden\r\nend\r\n")
+    dot("a\n.\nb\n")
+    dot("a\r.\rb")
+    dot("a\r\r\nb")
+    dot("\r\n\r\n")
+    dot("x\r\n.\r\nMAIL FROM:<evil@example.com>\r\n")
+}
+
+fn choice(advertised: []str, encrypted: bool) -> str {
+    let picked = smtp.choose(advertised, encrypted)
+    match picked {
+        some(m) => smtp.mechanism_name(m)
+        none => "(none)"
+    }
+}
+
+fn auth_tests() {
+    print("plain: {smtp.plain_response("user", "pass")}")
+    print("plain tim: {smtp.plain_response("tim", "tanstaaftanstaaf")}")
+    print("login: {smtp.login_response("tim")} {smtp.login_response("tanstaaftanstaaf")}")
+    print("xoauth2: {smtp.xoauth2_response("someuser@example.com", "ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg")}")
+    let challenge = "<1896.697170952@postoffice.reston.mci.net>"
+    print("cram digest: {smtp.cram_md5_digest("tanstaaftanstaaf", challenge)}")
+    print("cram response: {smtp.cram_md5_response("tim", "tanstaaftanstaaf", challenge)}")
+    let decoded = smtp.decode_challenge("PDE4OTYuNjk3MTcwOTUyQHBvc3RvZmZpY2UucmVzdG9uLm1jaS5uZXQ+") catch {
+        _ => "(error)"
+    }
+    print("challenge: {decoded}")
+    print("encrypted pick: {choice(["PLAIN", "LOGIN", "CRAM-MD5"], true)}")
+    print("plain pick: {choice(["PLAIN", "LOGIN", "CRAM-MD5"], false)}")
+    print("login only: {choice(["LOGIN"], true)}")
+    print("xoauth only: {choice(["XOAUTH2"], true)}")
+    print("none: {choice([], true)}")
+    print("names: {smtp.mechanism_name(smtp.Mechanism.Auto)} {smtp.mechanism_name(smtp.Mechanism.Plain)} {smtp.mechanism_name(smtp.Mechanism.Login)} {smtp.mechanism_name(smtp.Mechanism.XOAuth2)} {smtp.mechanism_name(smtp.Mechanism.CramMd5)}")
+}
+
+fn when() -> time.Instant {
+    time.at_offset(1762851000, 3600)
+}
+
+fn letter(subject: str, body: str) -> mail.Message {
+    mail.Message {
+        from: mail.address("ada@example.com")
+        to: [mail.address("bob@example.org")]
+        subject
+        date: when()
+        message_id: "smtp-1@example.com"
+        text: body
+        boundary: "BOUNDARY"
+    }
+}
+
+fn dialogue(st: *Store) {
+    sync.lock(st.gate)
+    let lines = st.log
+    st.log = []
+    sync.unlock(st.gate)
+    for line in lines {
+        print("  {line}")
+    }
+}
+
+fn settle(st: *Store) {
+    let note = <-st.ended
+    print("  {note ?? "?"}")
+}
+
+fn options(l: net.Listener) -> smtp.Options {
+    smtp.Options { port: l.handle.addr.port, timeout: 5000, hello: "client.example" }
+}
+
+fn signed_in(l: net.Listener, mechanism: smtp.Mechanism) -> smtp.Options {
+    var o = options(l)
+    o.username = "tim"
+    o.password = "tanstaaftanstaaf"
+    o.mechanism = mechanism
+    o.insecure_auth = true
+    o
+}
+
+fn describe_receipt(r: smtp.Receipt) -> str {
+    var refused: []str = []
+    for f in r.refused {
+        push(mut refused, "{f.address}={f.code} {text.quote(f.message)}")
+    }
+    "accepted={text.join(r.accepted, ",")} refused=[{text.join(refused, "; ")}] reply={r.code} {text.quote(r.message)}"
+}
+
+fn describe_extensions(e: smtp.Extensions) -> str {
+    "greeting={text.quote(e.greeting)} names={text.join(e.names, ",")} auth={text.join(e.mechanisms, ",")} size={e.size}"
+}
+
+fn stored(st: *Store) -> []Received {
+    sync.lock(st.gate)
+    let all = st.messages
+    sync.unlock(st.gate)
+    all
+}
+
+fn matches(st: *Store, index: i64, m: mail.Message) -> bool {
+    let all = stored(st)
+    let rendered = mail.render(m) catch {
+        _ => return false
+    }
+    all[index].data == rendered
+}
+
+fn basics(o: smtp.Options, st: *Store) ! smtp.Error {
+    using c = smtp.connect(o)?
+    let h = c.handle
+    print("extensions: {describe_extensions(c.handle.extensions)}")
+    print("encrypted: {flag(c.handle.encrypted)}")
+    let m = letter("Hello", "Hi Bob,\nthe build is green.\n")
+    let receipt = smtp.send(c, m)?
+    print("receipt: {describe_receipt(receipt)}")
+    print("stored matches rendered: {flag(matches(st, 0, m))}")
+    smtp.noop(c)?
+    smtp.reset(c)?
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+    print("after quit: {outcome(fn() ! smtp.Error { smtp.noop_on(h)? })}")
+}
+
+fn outcome(body: fn() ! smtp.Error) -> str {
+    body() catch {
+        e => return describe(e)
+    }
+    "ok"
+}
+
+fn authenticating(l: net.Listener, st: *Store) ! smtp.Error {
+    let all = [smtp.Mechanism.Plain, smtp.Mechanism.Login, smtp.Mechanism.CramMd5, smtp.Mechanism.XOAuth2, smtp.Mechanism.Auto]
+    for m in all {
+        var o = signed_in(l, m)
+        if smtp.mechanism_name(m) == "XOAUTH2" {
+            o.password = "tok"
+        }
+        using c = smtp.connect(o)?
+        print("authenticated with {smtp.mechanism_name(m)}")
+        smtp.quit(c)
+        dialogue(st)
+        settle(st)
+    }
+}
+
+fn rejected_credentials(l: net.Listener, st: *Store) {
+    var wrong = signed_in(l, smtp.Mechanism.Plain)
+    wrong.password = "nope"
+    let tried = outcome(fn() ! smtp.Error {
+        using c = smtp.connect(wrong)?
+    })
+    print("wrong plain password: {tried}")
+    settle(st)
+    dialogue(st)
+
+    var login = signed_in(l, smtp.Mechanism.Login)
+    login.username = "mallory"
+    let again = outcome(fn() ! smtp.Error {
+        using c = smtp.connect(login)?
+    })
+    print("wrong login user: {again}")
+    settle(st)
+    dialogue(st)
+
+    var bad_token = signed_in(l, smtp.Mechanism.XOAuth2)
+    bad_token.password = "expired"
+    let third = outcome(fn() ! smtp.Error {
+        using c = smtp.connect(bad_token)?
+    })
+    print("bad token: {third}")
+    settle(st)
+    dialogue(st)
+
+    var cram = signed_in(l, smtp.Mechanism.CramMd5)
+    cram.password = "wrong"
+    let fourth = outcome(fn() ! smtp.Error {
+        using c = smtp.connect(cram)?
+    })
+    print("wrong cram password: {fourth}")
+    settle(st)
+    dialogue(st)
+}
+
+fn automatic(l: net.Listener, st: *Store) ! smtp.Error {
+    var o = options(l)
+    o.username = "tim"
+    o.password = "tanstaaftanstaaf"
+    using c = smtp.connect(o)?
+    print("auto without insecure_auth chose the digest mechanism")
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+}
+
+fn plaintext_refused(l: net.Listener, st: *Store) {
+    var o = options(l)
+    o.username = "tim"
+    o.password = "tanstaaftanstaaf"
+    let tried = outcome(fn() ! smtp.Error {
+        using c = smtp.connect(o)?
+    })
+    print("password over plaintext: {tried}")
+    settle(st)
+    dialogue(st)
+    var login = o
+    login.mechanism = smtp.Mechanism.Login
+    let second = outcome(fn() ! smtp.Error {
+        using c = smtp.connect(login)?
+    })
+    print("login over plaintext: {second}")
+    settle(st)
+    dialogue(st)
+    var allowed = o
+    allowed.insecure_auth = true
+    using c = smtp.connect(allowed) catch {
+        e => {
+            print("allowed: {describe(e)}")
+            return
+        }
+    }
+    print("allowed with insecure_auth")
+    smtp.quit(c)
+    settle(st)
+    dialogue(st)
+}
+
+fn unsupported(l: net.Listener, st: *Store) {
+    var o = options(l)
+    o.username = "tim"
+    o.password = "tanstaaftanstaaf"
+    o.insecure_auth = true
+    let first = outcome(fn() ! smtp.Error {
+        using c = smtp.connect(o)?
+    })
+    print("credentials: {first}")
+    settle(st)
+    var oauth = o
+    oauth.mechanism = smtp.Mechanism.XOAuth2
+    let second = outcome(fn() ! smtp.Error {
+        using c = smtp.connect(oauth)?
+    })
+    print("xoauth2 requested: {second}")
+    settle(st)
+    dialogue(st)
+}
+
+fn starttls_missing(l: net.Listener, st: *Store, config: tls.Config) {
+    let base = options(l)
+    let tried = outcome(fn() ! smtp.Error {
+        using c = smtp.connect_starttls(base, config)?
+    })
+    print("starttls not offered: {tried}")
+    settle(st)
+    dialogue(st)
+}
+
+fn authentication_required(l: net.Listener, st: *Store) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    let h = c.handle
+    let before = outcome(fn() ! smtp.Error { smtp.send_on(h, letter("Early", "x\n"))? })
+    print("send before auth: {before}")
+    smtp.authenticate(c, "tim", "tanstaaftanstaaf", smtp.Mechanism.CramMd5)?
+    let receipt = smtp.send(c, letter("Late", "x\n"))?
+    print("send after auth: {receipt.code}")
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+}
+
+fn many_recipients(c: smtp.Client, st: *Store) ! smtp.Error {
+    var m = letter("Crowd", "to everyone\n")
+    m.to = [mail.address("bob@example.org"), mail.address("nouser1@example.org")]
+    m.cc = [mail.address("carol@example.org")]
+    m.bcc = [mail.address("dave@example.org")]
+    let receipt = smtp.send(c, m)?
+    print("partial: {describe_receipt(receipt)}")
+    let all = stored(st)
+    print("stored to: {text.join(all[all.len - 1].to, ",")}")
+}
+
+fn refusals(h: *smtp.ClientHandle) {
+    var none_left = letter("Nobody", "x\n")
+    none_left.to = [mail.address("nouser1@example.org"), mail.address("nouser2@example.org")]
+    print("all permanent: {outcome(fn() ! smtp.Error { smtp.send_on(h, none_left)? })}")
+
+    var busy = letter("Busy", "x\n")
+    busy.to = [mail.address("later@example.org")]
+    print("all transient: {outcome(fn() ! smtp.Error { smtp.send_on(h, busy)? })}")
+
+    var blocked = letter("Blocked", "x\n")
+    blocked.from = mail.address("blocked@example.org")
+    print("sender refused: {outcome(fn() ! smtp.Error { smtp.send_on(h, blocked)? })}")
+
+    let rejected = letter("REJECT this", "x\n")
+    print("data rejected: {outcome(fn() ! smtp.Error { smtp.send_on(h, rejected)? })}")
+    let deferred = letter("DEFER this", "x\n")
+    print("data deferred: {outcome(fn() ! smtp.Error { smtp.send_on(h, deferred)? })}")
+}
+
+fn deliveries(l: net.Listener, st: *Store) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    many_recipients(c, st)?
+    refusals(c.handle)
+    let after = smtp.send(c, letter("After failures", "still works\n"))?
+    print("after failures: {describe_receipt(after)}")
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+    var subjects: []str = []
+    for r in stored(st) {
+        let cut = text.cut(r.data, "Subject: ")
+        push(mut subjects, text.cut(cut.after, "\r\n").before)
+    }
+    print("stored subjects: {text.join(subjects, ", ")}")
+}
+
+fn pipelined(l: net.Listener, st: *Store, label: str) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    let h = c.handle
+    var m = letter("Pipe", "x\n")
+    m.to = [mail.address("bob@example.org"), mail.address("nouser1@example.org"), mail.address("carol@example.org")]
+    let receipt = smtp.send(c, m)?
+    print("{label}: {describe_receipt(receipt)}")
+    let mail_refused = letter("Pipe two", "x\n")
+    var blocked = mail_refused
+    blocked.from = mail.address("blocked@example.org")
+    print("{label} sender refused: {outcome(fn() ! smtp.Error { smtp.send_on(h, blocked)? })}")
+    var later = letter("Pipe three", "x\n")
+    later.to = [mail.address("later@example.org")]
+    print("{label} recipient refused: {outcome(fn() ! smtp.Error { smtp.send_on(h, later)? })}")
+    let last = smtp.send(c, letter("Pipe four", "x\n"))?
+    print("{label} afterwards: {last.code}")
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+    sync.lock(st.gate)
+    let batches = st.batches
+    sync.unlock(st.gate)
+    print("{label} batched commands: {flag(batches > 0)}")
+}
+
+fn extension_use(l: net.Listener, st: *Store) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    let h = c.handle
+    let plain_one = letter("Plain", "ascii only\n")
+    let sent = smtp.send(c, plain_one)?
+    let all = stored(st)
+    let rendered = mail.render(plain_one) catch {
+        _ => ""
+    }
+    print("size parameter: {all[0].params} rendered={rendered.len} reply={sent.code}")
+
+    var wide = letter("8bit", "Grüße\n")
+    wide.eight_bit = true
+    let second = smtp.send(c, wide)?
+    print("8bit: params={stored(st)[1].params} reply={second.code} matches={flag(matches(st, 1, wide))}")
+
+    var utf8 = letter("International", "hi\n")
+    utf8.to = [mail.address("jörg@exämple.org")]
+    let third = smtp.send(c, utf8)?
+    print("smtputf8: params={stored(st)[2].params} to={stored(st)[2].to[0]} reply={third.code}")
+
+    var huge = letter("Huge", text.repeat("0123456789abcdef\n", 200))
+    print("over size: {outcome(fn() ! smtp.Error { smtp.send_on(h, huge)? })}")
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+}
+
+fn bare_server(l: net.Listener, st: *Store) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    let h = c.handle
+    print("bare extensions: {describe_extensions(c.handle.extensions)}")
+    let sent = smtp.send(c, letter("Bare", "plain\n"))?
+    print("bare send: {sent.code}")
+    var wide = letter("8bit", "Grüße\n")
+    wide.eight_bit = true
+    print("8bit refused: {outcome(fn() ! smtp.Error { smtp.send_on(h, wide)? })}")
+    var utf8 = letter("International", "hi\n")
+    utf8.to = [mail.address("jörg@exämple.org")]
+    print("smtputf8 refused: {outcome(fn() ! smtp.Error { smtp.send_on(h, utf8)? })}")
+    smtp.noop(c)?
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+}
+
+fn stuffing(l: net.Listener, st: *Store) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    let body = "before\n.\n..\n.hidden\nafter\n"
+    let m = letter("Dots", body)
+    let sent = smtp.send(c, m)?
+    print("dots: {sent.code} matches={flag(matches(st, 0, m))} stored={stored(st).len}")
+
+    let smuggle = smtp.Envelope { from: "ada@example.com", to: ["bob@example.org"] }
+    let raw = "hello\r\n.\r\nMAIL FROM:<evil@example.com>\r\nRCPT TO:<victim@example.org>\r\nDATA\r\nsmuggled\r\n"
+    let second = smtp.send_raw(c, smuggle, bytes(raw))?
+    let all = stored(st)
+    print("smuggle: {second.code} stored={all.len} data={text.quote(all[1].data)}")
+
+    let bare = smtp.send_raw(c, smuggle, bytes("a\n.\nb\n"))?
+    let more = stored(st)
+    print("bare lf: {bare.code} data={text.quote(more[2].data)}")
+
+    let empty = smtp.send_raw(c, smtp.Envelope { from: "", to: ["bob@example.org"] }, [])?
+    let last = stored(st)
+    print("null sender: {empty.code} from={text.quote(last[3].from)} data={text.quote(last[3].data)}")
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+}
+
+fn invalid_input(l: net.Listener, st: *Store) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    let h = c.handle
+    var injected = letter("Hello\r\nBcc: evil@example.com", "x\n")
+    print("subject injection: {outcome(fn() ! smtp.Error { smtp.send_on(h, injected)? })}")
+    var nobody = letter("Nobody", "x\n")
+    nobody.to = []
+    print("no recipients: {outcome(fn() ! smtp.Error { smtp.send_on(h, nobody)? })}")
+    var odd = letter("Odd", "x\n")
+    odd.to = [mail.address("bob@example.org\r\nRCPT TO:<evil@example.com>")]
+    print("recipient injection: {outcome(fn() ! smtp.Error { smtp.send_on(h, odd)? })}")
+    let raw_from = smtp.Envelope { from: "a b", to: ["bob@example.org"] }
+    print("raw bad sender: {outcome(fn() ! smtp.Error { smtp.send_raw_on(h, raw_from, bytes("x"))? })}")
+    let raw_to = smtp.Envelope { from: "ada@example.com", to: ["x@y\r\nDATA"] }
+    print("raw bad recipient: {outcome(fn() ! smtp.Error { smtp.send_raw_on(h, raw_to, bytes("x"))? })}")
+    let raw_none = smtp.Envelope { from: "ada@example.com", to: [] }
+    print("raw no recipients: {outcome(fn() ! smtp.Error { smtp.send_raw_on(h, raw_none, bytes("x"))? })}")
+    smtp.noop(c)?
+    print("still usable")
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+    print("nothing stored: {flag(stored(st).len == 0)}")
+}
+
+fn bad_hello(l: net.Listener, st: *Store) {
+    var o = options(l)
+    o.hello = "evil\r\nMAIL FROM:<x@y>"
+    let tried = outcome(fn() ! smtp.Error {
+        using c = smtp.connect(o)?
+    })
+    print("hello injection: {tried}")
+    settle(st)
+    dialogue(st)
+}
+
+fn timing(l: net.Listener, st: *Store) ! smtp.Error {
+    var quick = options(l)
+    quick.timeout = 150
+    using c = smtp.connect(quick)?
+    let h = c.handle
+    var m = letter("Slow", "x\n")
+    m.to = [mail.address("hang@example.org")]
+    print("slow recipient: {outcome(fn() ! smtp.Error { smtp.send_on(h, m)? })}")
+    print("after timeout: {outcome(fn() ! smtp.Error { smtp.noop_on(h)? })}")
+    settle(st)
+}
+
+fn ownership(l: net.Listener, st: *Store) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    let view = c.handle
+    smtp.noop(c)?
+    smtp.close_client(c)
+    smtp.close_client(c)
+    smtp.noop(c) catch {
+        e => print("owner after close: {describe(e)}")
+    }
+    print("view after close: {outcome(fn() ! smtp.Error { smtp.noop_on(view)? })}")
+    settle(st)
+
+    using var moved = smtp.connect(options(l))?
+    let kept = smtp.detach(mut moved)
+    using again = smtp.adopt(kept)
+    smtp.noop(again)?
+    print("adopted noop ok")
+    smtp.quit(again)
+    settle(st)
+}
+
+fn leave(l: net.Listener, st: *Store) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    smtp.noop(c)?
+}
+
+fn deliver_one(h: *smtp.ClientHandle, subject: str, done: chan[str]) {
+    let result = smtp.send_on(h, letter(subject, "from a worker\n")) catch {
+        e => {
+            done <- "{subject}: {describe(e)}"
+            return
+        }
+    }
+    done <- "{subject}: {result.code}"
+}
+
+fn shared(l: net.Listener, st: *Store) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    let h = c.handle
+    let done = chan[str](8)
+    for i in 0..6 {
+        spawn deliver_one(h, "worker {i}", done)
+    }
+    var results: []str = []
+    for _ in 0..6 {
+        let one = <-done
+        push(mut results, one ?? "?")
+    }
+    slices.sort(mut results)
+    for r in results {
+        print("  {r}")
+    }
+    var subjects: []str = []
+    for r in stored(st) {
+        let cut = text.cut(r.data, "Subject: ")
+        push(mut subjects, text.cut(cut.after, "\r\n").before)
+    }
+    slices.sort(mut subjects)
+    print("stored: {text.join(subjects, ", ")}")
+    var clean = true
+    for r in stored(st) {
+        if !text.contains(r.data, "from a worker") {
+            clean = false
+        }
+    }
+    print("messages intact: {flag(clean)}")
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_blocks(embed("std_tls_ca.pem"), "CERTIFICATE") {
+        push(mut out, x509.parse(der) catch {
+            _ => return out
+        })
+    }
+    out
+}
+
+fn server_config() -> tls.Config {
+    let pem = embed("std_tls_ec.pem")
+    let key = tls.load_key(pem) catch {
+        _ => return tls.Config {}
+    }
+    tls.Config { certificates: tls.load_certificates(pem), key }
+}
+
+fn client_config(name: str) -> tls.Config {
+    tls.Config { server_name: name, roots: roots() }
+}
+
+fn upgraded(l: net.Listener, st: *Store) ! smtp.Error {
+    var o = options(l)
+    o.username = "tim"
+    o.password = "tanstaaftanstaaf"
+    using c = smtp.connect_starttls(o, client_config("localhost"))?
+    print("starttls encrypted: {flag(c.handle.encrypted)}")
+    print("starttls extensions: {describe_extensions(c.handle.extensions)}")
+    let receipt = smtp.send(c, letter("Secure", "over starttls\n"))?
+    print("starttls send: {receipt.code}")
+    smtp.start_tls(c, client_config("localhost"))?
+    print("second upgrade ignored: {flag(c.handle.encrypted)}")
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+}
+
+fn upgraded_by_hand(l: net.Listener, st: *Store) ! smtp.Error {
+    using c = smtp.connect(options(l))?
+    let h = c.handle
+    print("before: encrypted={flag(c.handle.encrypted)} {describe_extensions(c.handle.extensions)}")
+    print("auth before: {outcome(fn() ! smtp.Error { smtp.authenticate_on(h, "tim", "tanstaaftanstaaf", smtp.Mechanism.Auto)? })}")
+    smtp.start_tls(c, client_config("localhost"))?
+    print("after: encrypted={flag(c.handle.encrypted)} {describe_extensions(c.handle.extensions)}")
+    smtp.authenticate(c, "tim", "tanstaaftanstaaf", smtp.Mechanism.Auto)?
+    let receipt = smtp.send(c, letter("Manual", "upgraded by hand\n"))?
+    print("send: {receipt.code} stored={stored(st).len}")
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+}
+
+fn plaintext_with_credentials(l: net.Listener, st: *Store) {
+    var o = options(l)
+    o.username = "tim"
+    o.password = "tanstaaftanstaaf"
+    let tried = outcome(fn() ! smtp.Error {
+        using c = smtp.connect(o)?
+    })
+    print("credentials before starttls: {tried}")
+    settle(st)
+    dialogue(st)
+}
+
+fn wrong_certificate_name(l: net.Listener, st: *Store) {
+    let base = options(l)
+    let tried = outcome(fn() ! smtp.Error {
+        using c = smtp.connect_starttls(base, client_config("other.example"))?
+    })
+    print("starttls wrong name: {tried}")
+    settle(st)
+}
+
+fn implicit(l: net.Listener, st: *Store) ! smtp.Error {
+    var o = options(l)
+    o.username = "tim"
+    o.password = "tanstaaftanstaaf"
+    using c = smtp.connect_tls(o, client_config("localhost"))?
+    print("implicit encrypted: {flag(c.handle.encrypted)}")
+    print("implicit extensions: {describe_extensions(c.handle.extensions)}")
+    let receipt = smtp.send(c, letter("Implicit", "over tls\n"))?
+    print("implicit send: {receipt.code}")
+    smtp.quit(c)
+    dialogue(st)
+    settle(st)
+    let base = options(l)
+    let wrong = outcome(fn() ! smtp.Error {
+        using w = smtp.connect_tls(base, client_config("other.example"))?
+    })
+    print("implicit wrong name: {wrong}")
+    settle(st)
+    var quick = base
+    quick.timeout = 300
+    let plain_client = outcome(fn() ! smtp.Error {
+        using w = smtp.connect(quick)?
+    })
+    print("plaintext against tls port: {plain_client}")
+    settle(st)
+}
+
+struct Script {
+    replies: []str
+    next: i64
+    out: []u8
+    at: i64
+}
+
+fn script(replies: []str) -> io.Stream {
+    let state = new(Script { replies, next: 1, out: bytes(replies[0]), at: 0 })
+    io.Stream {
+        read: fn(buf) {
+            let left = state.out.len - state.at
+            if left == 0 {
+                return 0
+            }
+            let n = if left < buf.len { left } else { buf.len }
+            let k = io.copy(buf[..n], state.out[state.at..state.at + n])
+            state.at += k
+            k
+        }
+        write: fn(data) {
+            if state.next < state.replies.len {
+                text.append(mut state.out, state.replies[state.next])
+                state.next += 1
+            }
+            data.len
+        }
+        close: fn() {}
+    }
+}
+
+fn scripted(label: str, replies: []str, o: smtp.Options) {
+    using c = smtp.connect_stream(script(replies), o) catch {
+        e => {
+            print("{label}: {describe(e)}")
+            return
+        }
+    }
+    print("{label}: connected greeting={text.quote(c.handle.extensions.greeting)} names={text.join(c.handle.extensions.names, ",")}")
+}
+
+fn faulty_servers() {
+    let o = smtp.Options {}
+    var tight = smtp.Options {}
+    tight.limits = smtp.Limits { lines: 3 }
+    let hello = "250-x\r\n250 AUTH CRAM-MD5\r\n"
+    scripted("greeting 554", ["554 5.3.2 No service\r\n"], o)
+    scripted("greeting 421", ["421 4.3.2 Too busy\r\n"], o)
+    scripted("greeting 250", ["250 not a greeting\r\n", hello], o)
+    scripted("greeting garbage", ["hello there\r\n"], o)
+    scripted("greeting mismatch", ["220-a\r\n221 b\r\n"], o)
+    scripted("greeting truncated", ["220-a\r\n"], o)
+    scripted("greeting silent", [""], o)
+    scripted("too many lines", ["220-a\r\n220-b\r\n220-c\r\n220-d\r\n220 e\r\n"], tight)
+    scripted("oversize line", ["220 {text.repeat("a", 20000)}\r\n"], o)
+    scripted("ehlo unavailable", ["220 hi\r\n", "421 4.3.2 Shutting down\r\n"], o)
+    scripted("ehlo then helo", ["220 hi\r\n", "502 5.5.1 no\r\n", "250 fake.example\r\n"], o)
+    scripted("helo fails too", ["220 hi\r\n", "500 5.5.1 no\r\n", "500 5.5.1 still no\r\n"], o)
+    scripted("ehlo multi", ["220 hi\r\n", "250-fake.example Hello\r\n250-PIPELINING\r\n250 8BITMIME\r\n"], o)
+    scripted("helo reply garbage", ["220 hi\r\n", "502 5.5.1 no\r\n", "what\r\n"], o)
+
+    var creds = smtp.Options {}
+    creds.username = "tim"
+    creds.password = "tanstaaftanstaaf"
+    creds.mechanism = smtp.Mechanism.CramMd5
+    scripted("cram not base64", ["220 hi\r\n", hello, "334 !!nope!!\r\n"], creds)
+    scripted("cram ok", ["220 hi\r\n", hello, "334 PDE4OTYuNjk3MTcwOTUyQHBvc3RvZmZpY2UucmVzdG9uLm1jaS5uZXQ+\r\n", "235 2.7.0 ok\r\n"], creds)
+    scripted("cram refused", ["220 hi\r\n", hello, "334 PDE4OTYuNjk3MTcwOTUyQHBvc3RvZmZpY2UucmVzdG9uLm1jaS5uZXQ+\r\n", "535 5.7.8 no\r\n"], creds)
+    scripted("cram temporary", ["220 hi\r\n", hello, "334 PDE4OTYuNjk3MTcwOTUyQHBvc3RvZmZpY2UucmVzdG9uLm1jaS5uZXQ+\r\n", "454 4.7.0 try later\r\n"], creds)
+    scripted("cram no challenge", ["220 hi\r\n", hello, "235 2.7.0 ok\r\n"], creds)
+    scripted("cram rejected up front", ["220 hi\r\n", hello, "504 5.5.4 no such mechanism\r\n"], creds)
+
+    var login = creds
+    login.mechanism = smtp.Mechanism.Login
+    login.insecure_auth = true
+    scripted("login unsupported", ["220 hi\r\n", hello], login)
+}
+
+fn injection_attempt() {
+    var o = smtp.Options {}
+    using c = smtp.connect_stream(script(["220 hi\r\n", "250-x\r\n250 STARTTLS\r\n", "220 go\r\n220 injected\r\n"]), o) catch {
+        e => {
+            print("injection connect: {describe(e)}")
+            return
+        }
+    }
+    let h = c.handle
+    print("injection: {outcome(fn() ! smtp.Error { smtp.start_tls_on(h, client_config("localhost"))? })}")
+    print("after injection: {outcome(fn() ! smtp.Error { smtp.noop_on(h)? })}")
+}
+
+fn refused_connection() {
+    using l = net.listen("127.0.0.1", 0) catch {
+        _ => {
+            print("refused: listen failed")
+            return
+        }
+    }
+    let port = l.handle.addr.port
+    net.close_listener(l)
+    var o = smtp.Options {}
+    o.port = port
+    o.connect_timeout = 1000
+    using c = smtp.connect(o) catch {
+        e => {
+            print("refused: {describe(e)}")
+            return
+        }
+    }
+    print("refused: connected")
+}
+
+fn script_session(label: str, replies: []str, body: fn(*smtp.ClientHandle) ! smtp.Error) {
+    using c = smtp.connect_stream(script(replies), smtp.Options {}) catch {
+        e => {
+            print("{label}: connect {describe(e)}")
+            return
+        }
+    }
+    let h = c.handle
+    body(h) catch {
+        e => {
+            print("{label}: {describe(e)}")
+            return
+        }
+    }
+    print("{label}: ok")
+}
+
+fn faulty_transactions() {
+    let hello = "250 fake.example\r\n"
+    var m = letter("Scripted", "x\n")
+    script_session("data accepted as 250", ["220 hi\r\n", hello, "250 ok\r\n", "250 ok\r\n", "250 surprise\r\n"], fn(h) ! smtp.Error { smtp.send_on(h, m)? })
+    script_session("sender 4xx", ["220 hi\r\n", hello, "451 4.3.0 local error\r\n"], fn(h) ! smtp.Error { smtp.send_on(h, m)? })
+    script_session("final reply 5xx", ["220 hi\r\n", hello, "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "554 5.6.0 no\r\n"], fn(h) ! smtp.Error { smtp.send_on(h, m)? })
+    script_session("final reply garbage", ["220 hi\r\n", hello, "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "zzz\r\n"], fn(h) ! smtp.Error { smtp.send_on(h, m)? })
+    script_session("final reply missing", ["220 hi\r\n", hello, "250 ok\r\n", "250 ok\r\n", "354 go\r\n"], fn(h) ! smtp.Error { smtp.send_on(h, m)? })
+    script_session("noop 5xx", ["220 hi\r\n", hello, "500 5.5.2 what\r\n"], fn(h) ! smtp.Error { smtp.noop_on(h)? })
+    script_session("noop ok", ["220 hi\r\n", hello, "250 fine\r\n"], fn(h) ! smtp.Error { smtp.noop_on(h)? })
+}
+
+fn with_server(label: str, settings: Settings, body: fn(net.Listener, *Store) ! smtp.Error) {
+    using l = net.listen("127.0.0.1", 0) catch {
+        _ => {
+            print("{label}: listen failed")
+            return
+        }
+    }
+    let st = new_store(settings, server_config())
+    spawn serve(l.handle, st)
+    print("--- {label}")
+    body(l, st) catch {
+        e => print("{label} failed: {describe(e)}")
+    }
+}
+
+fn with_tls_server(label: str, settings: Settings, body: fn(net.Listener, *Store) ! smtp.Error) {
+    using l = net.listen("127.0.0.1", 0) catch {
+        _ => {
+            print("{label}: listen failed")
+            return
+        }
+    }
+    let st = new_store(settings, server_config())
+    spawn serve_tls(l.handle, st)
+    print("--- {label}")
+    body(l, st) catch {
+        e => print("{label} failed: {describe(e)}")
+    }
+}
+
+fn main() {
+    parser_tests()
+    extension_tests()
+    dot_tests()
+    auth_tests()
+    faulty_servers()
+    injection_attempt()
+    faulty_transactions()
+    refused_connection()
+
+    let full = Settings { auth: "PLAIN LOGIN CRAM-MD5 XOAUTH2", size: 1500, eight_bit: true, utf8: true }
+    with_server("basics", Settings { size: 10240000, eight_bit: true, pipelining: true, auth: "PLAIN LOGIN" }, fn(l, st) ! smtp.Error { basics(options(l), st)? })
+    with_server("authenticating", full, fn(l, st) ! smtp.Error { authenticating(l, st)? })
+    with_server("rejected credentials", full, fn(l, st) ! smtp.Error { rejected_credentials(l, st) })
+    with_server("automatic", full, fn(l, st) ! smtp.Error { automatic(l, st)? })
+    with_server("plaintext refused", Settings { auth: "PLAIN LOGIN" }, fn(l, st) ! smtp.Error { plaintext_refused(l, st) })
+    with_server("unsupported", Settings { auth: "PLAIN" }, fn(l, st) ! smtp.Error { unsupported(l, st) })
+    with_server("no auth", Settings {}, fn(l, st) ! smtp.Error { unsupported(l, st) })
+    with_server("starttls missing", Settings {}, fn(l, st) ! smtp.Error { starttls_missing(l, st, client_config("localhost")) })
+    with_server("authentication required", Settings { auth: "CRAM-MD5", require_auth: true }, fn(l, st) ! smtp.Error { authentication_required(l, st)? })
+    with_server("deliveries", Settings { size: 10240000 }, fn(l, st) ! smtp.Error { deliveries(l, st)? })
+    with_server("pipelined", Settings { pipelining: true }, fn(l, st) ! smtp.Error { pipelined(l, st, "pipelined")? })
+    with_server("sequential", Settings {}, fn(l, st) ! smtp.Error { pipelined(l, st, "sequential")? })
+    with_server("extensions", Settings { size: 1500, eight_bit: true, utf8: true }, fn(l, st) ! smtp.Error { extension_use(l, st)? })
+    with_server("bare", Settings {}, fn(l, st) ! smtp.Error { bare_server(l, st)? })
+    with_server("stuffing", Settings {}, fn(l, st) ! smtp.Error { stuffing(l, st)? })
+    with_server("invalid input", Settings {}, fn(l, st) ! smtp.Error { invalid_input(l, st)? })
+    with_server("bad hello", Settings {}, fn(l, st) ! smtp.Error { bad_hello(l, st) })
+    with_server("helo fallback", Settings { ehlo_unknown: true }, fn(l, st) ! smtp.Error { basics(options(l), st)? })
+    with_server("timeout", Settings {}, fn(l, st) ! smtp.Error { timing(l, st)? })
+    with_server("ownership", Settings {}, fn(l, st) ! smtp.Error { ownership(l, st)? })
+    with_server("scoped", Settings {}, fn(l, st) ! smtp.Error {
+        leave(l, st)?
+        settle(st)
+    })
+    with_server("shared", Settings {}, fn(l, st) ! smtp.Error { shared(l, st)? })
+    let secured = Settings { starttls: true, auth: "PLAIN LOGIN", size: 10240000 }
+    with_server("starttls", secured, fn(l, st) ! smtp.Error { upgraded(l, st)? })
+    with_server("starttls by hand", secured, fn(l, st) ! smtp.Error { upgraded_by_hand(l, st)? })
+    with_server("credentials before starttls", secured, fn(l, st) ! smtp.Error { plaintext_with_credentials(l, st) })
+    with_server("starttls wrong name", secured, fn(l, st) ! smtp.Error { wrong_certificate_name(l, st) })
+    with_tls_server("implicit tls", Settings { auth: "PLAIN LOGIN", size: 10240000 }, fn(l, st) ! smtp.Error { implicit(l, st)? })
+}

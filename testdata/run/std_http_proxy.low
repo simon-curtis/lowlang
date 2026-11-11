@@ -1,0 +1,494 @@
+import std/crypto/x509
+import std/file
+import std/http
+import std/io
+import std/net
+import std/os
+import std/sync
+import std/text
+import std/tls
+
+struct Proxy {
+    lock: sync.Mutex
+    connections: i64
+    log: []str
+    expect_auth: str
+}
+
+struct Origin {
+    lock: sync.Mutex
+    connections: i64
+}
+
+struct Seen {
+    lock: sync.Mutex
+    hosts: []str
+}
+
+struct Relay {
+    read: fn([]u8) -> i64 ! io.Error
+    write: net.ConnHandle
+    done: chan[bool]
+}
+
+fn note(p: *Proxy, line: str) {
+    sync.lock(p.lock)
+    push(mut p.log, line)
+    sync.unlock(p.lock)
+}
+
+fn relay(r: Relay) {
+    let buf = io.buffer(4096)
+    for {
+        let n = r.read(buf) catch 0
+        if n == 0 {
+            break
+        }
+        net.write_all_on(r.write, buf[..n]) catch {
+            _ => break
+        }
+    }
+    net.shutdown_write_on(r.write) catch {
+        _ => {}
+    }
+    r.done <- true
+}
+
+fn tunnel(c: net.Conn, r: *io.Reader, upstream: net.Conn) {
+    let done = chan[bool](2)
+    let upstream_view = upstream.handle
+    let from_client = fn(buf: []u8) -> i64 ! io.Error { io.read_some(r, buf)? }
+    let from_upstream = fn(buf: []u8) -> i64 ! io.Error { net.read_on(upstream_view, buf)? }
+    spawn relay(Relay { read: from_client, write: upstream.handle, done })
+    spawn relay(Relay { read: from_upstream, write: c.handle, done })
+    let a = <-done
+    let b = <-done
+}
+
+fn loopback(port: i64) -> net.Addr {
+    net.Addr { ip: [127, 0, 0, 1], port }
+}
+
+fn reply(s: io.Stream, method: str, status: i64, extra: []http.Header) ! io.Error {
+    let resp = http.Response { status, headers: extra, body: bytes(http.status_text(status)) }
+    http.write_response(s, method, resp, false)?
+}
+
+fn denied_host(host: str) -> bool {
+    host == "blocked.example"
+}
+
+fn connect_tunnel(c: net.Conn, r: *io.Reader, req: http.Request) ! io.Error {
+    let s = net.stream(c)
+    let colon = text.last_index_byte(req.target, ':')
+    if denied_host(req.target[..colon]) {
+        reply(s, req.method, 403, [])?
+        return
+    }
+    let port = text.parse_uint(req.target[colon + 1..], 10) catch 0
+    using upstream = net.connect(loopback(port)) catch {
+        _ => {
+            reply(s, req.method, 502, [])?
+            return
+        }
+    }
+    io.write_str(s, "HTTP/1.1 200 Connection established\r\n\r\n")?
+    tunnel(c, r, upstream)
+}
+
+fn forward(c: net.Conn, req: http.Request) ! io.Error {
+    let s = net.stream(c)
+    let u = http.parse_url(req.target) catch {
+        _ => {
+            reply(s, req.method, 400, [])?
+            return
+        }
+    }
+    if denied_host(u.host) {
+        reply(s, req.method, 403, [])?
+        return
+    }
+    var b = http.client().with_version(Http1).build().request(req.method, "http://{net.format(loopback(u.port))}{u.target}")
+    for h in req.headers {
+        if !text.equal_fold(h.name, "proxy-authorization") && !text.equal_fold(h.name, "content-length") {
+            b = b.with_header(h.name, h.value)
+        }
+    }
+    if req.body.len > 0 {
+        b = b.with_body(req.body, http.header(req.headers, "content-type") ?? "application/octet-stream")
+    }
+    let answer = b.send() catch {
+        _ => {
+            reply(s, req.method, 502, [])?
+            return
+        }
+    }
+    let out = http.Response { status: answer.status, headers: [http.Header { name: "x-via", value: "testproxy" }], body: answer.body }
+    http.write_response(s, req.method, out, false)?
+}
+
+fn proxy_conn(p: *Proxy, h: net.ConnHandle) {
+    using c = net.adopt(h)
+    let r = io.reader(net.stream(c))
+    for {
+        let req = http.read_request(r) catch {
+            _ => return
+        }
+        let credentials = http.header(req.headers, "proxy-authorization") ?? "-"
+        note(p, "{req.method} {req.target} auth={credentials}")
+        if p.expect_auth.len > 0 && credentials != p.expect_auth {
+            let challenge = [http.Header { name: "proxy-authenticate", value: "Basic realm=\"test\"" }]
+            reply(net.stream(c), req.method, 407, challenge) catch {
+                _ => return
+            }
+            continue
+        }
+        if req.method == "CONNECT" {
+            connect_tunnel(c, r, req) catch {
+                _ => {}
+            }
+            return
+        }
+        forward(c, req) catch {
+            _ => return
+        }
+    }
+}
+
+fn run_proxy(p: *Proxy, l: net.ListenerHandle) {
+    for {
+        let h = net.accept_handle(l) catch {
+            _ => return
+        }
+        sync.lock(p.lock)
+        p.connections += 1
+        sync.unlock(p.lock)
+        spawn proxy_conn(p, h)
+    }
+}
+
+fn origin_answer(req: http.Request) -> http.Response {
+    let host = http.header(req.headers, "host") ?? req.authority
+    let auth = http.header(req.headers, "authorization") ?? "-"
+    let proxy_auth = http.header(req.headers, "proxy-authorization") ?? "-"
+    http.response(200, "{req.method} host={host} path={req.target} body={str(req.body)} auth={auth} proxy-auth={proxy_auth}")
+}
+
+fn run_origin(o: *Origin, l: net.ListenerHandle) {
+    let handler = fn(req: http.Request) -> http.Response { origin_answer(req) }
+    for {
+        let h = net.accept_handle(l) catch {
+            _ => return
+        }
+        sync.lock(o.lock)
+        o.connections += 1
+        sync.unlock(o.lock)
+        spawn http.serve_conn_on(h, handler)
+    }
+}
+
+fn secure_conn(h: net.ConnHandle, config: tls.Config) {
+    using c = net.adopt(h)
+    using t = tls.server(net.stream(c), config) catch {
+        _ => return
+    }
+    let handler = fn(req: http.Request) -> http.Response { origin_answer(req) }
+    http.serve_stream(tls.stream(t), handler) catch {
+        _ => {}
+    }
+}
+
+fn run_secure(l: net.ListenerHandle, config: tls.Config) {
+    for {
+        let h = net.accept_handle(l) catch {
+            _ => return
+        }
+        spawn secure_conn(h, config)
+    }
+}
+
+fn contains(data: []u8, needle: str) -> bool {
+    let n = bytes(needle)
+    if data.len < n.len {
+        return false
+    }
+    for i in 0..data.len - n.len + 1 {
+        var same = true
+        for k in 0..n.len {
+            if data[i + k] != n[k] {
+                same = false
+                break
+            }
+        }
+        if same {
+            return true
+        }
+    }
+    false
+}
+
+fn sniff(l: net.ListenerHandle, seen: chan[bool]) {
+    let h = net.accept_handle(l) catch {
+        _ => return
+    }
+    using c = net.adopt(h)
+    let buf = io.buffer(2048)
+    let n = net.read(c, buf) catch 0
+    seen <- contains(buf[..n], "secure.example")
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_blocks(embed("std_tls_ca.pem"), "CERTIFICATE") {
+        push(mut out, x509.parse(der) catch {
+            _ => return out
+        })
+    }
+    out
+}
+
+fn recording(seen: *Seen) -> fn(str) -> [][]u8 ! io.Error {
+    fn(host: str) -> [][]u8 ! io.Error {
+        sync.lock(seen.lock)
+        push(mut seen.hosts, host)
+        sync.unlock(seen.lock)
+        [net.parse_ip("127.0.0.1")?]
+    }
+}
+
+fn show_log(p: *Proxy, port: i64) {
+    sync.lock(p.lock)
+    for line in p.log {
+        print("  proxy saw: {text.replace(line, "{port}", "PORT")}")
+    }
+    p.log = []
+    sync.unlock(p.lock)
+}
+
+fn show_hosts(s: *Seen) {
+    sync.lock(s.lock)
+    var unique: []str = []
+    for h in s.hosts {
+        var known = false
+        for u in unique {
+            known = known || u == h
+        }
+        if !known {
+            push(mut unique, h)
+        }
+    }
+    print("  client resolved: {text.join(unique, ", ")}")
+    s.hosts = []
+    sync.unlock(s.lock)
+}
+
+fn mask(s: str, port: i64) -> str {
+    text.replace(s, "{port}", "PORT")
+}
+
+fn io_name(e: io.Error) -> str {
+    match e {
+        Denied => "denied"
+        Refused => "refused"
+        Unreachable => "unreachable"
+        TimedOut => "timed out"
+        _ => "other"
+    }
+}
+
+fn outcome(c: *http.Client, url: str, port: i64) -> str {
+    let r = c.get(url) catch {
+        InvalidUrl(_) => return "invalid url"
+        Connect(e) => return "connect error {io_name(e)}"
+        Tls(_) => return "tls error"
+        _ => return "other error"
+    }
+    "{r.status} {mask(http.text(r), port)}"
+}
+
+fn route_table(b: http.Builder[http.Client], urls: []str) {
+    for url in urls {
+        let chosen = http.proxy_for(b, url)
+        print("  {url} -> {if chosen.len == 0 { "direct" } else { chosen }}")
+    }
+}
+
+fn unix_handle(path: str) -> net.ConnHandle ! io.Error {
+    using var c = net.connect_unix(path)?
+    net.detach(mut c)
+}
+
+fn clear_environment() {
+    for name in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"] {
+        os.unset_env(name) catch {
+            _ => {}
+        }
+    }
+}
+
+fn environment_routes() ! io.Error {
+    let base = http.client()
+    let urls = ["http://a.test/", "https://a.test/", "http://skip.test/", "http://deep.skip.test/"]
+    clear_environment()
+    print("empty environment")
+    route_table(http.with_proxy_from_environment(base), urls)
+
+    os.set_env("HTTP_PROXY", "http://upper.test:3128")?
+    os.set_env("NO_PROXY", "skip.test")?
+    print("HTTP_PROXY and NO_PROXY")
+    route_table(http.with_proxy_from_environment(base), urls)
+
+    os.set_env("http_proxy", "http://lower.test:3128")?
+    os.set_env("ALL_PROXY", "socks5://all.test:1080")?
+    print("lowercase wins, ALL_PROXY fills https")
+    route_table(http.with_proxy_from_environment(base), urls)
+
+    os.set_env("HTTPS_PROXY", "secure.test:8443")?
+    print("HTTPS_PROXY without scheme")
+    route_table(http.with_proxy_from_environment(base), urls)
+
+    os.set_env("NO_PROXY", "*")?
+    print("NO_PROXY star")
+    route_table(http.with_proxy_from_environment(base), urls)
+    clear_environment()
+}
+
+fn matching_rules() {
+    let base = http.client().with_proxy("http://proxy.test:3128")
+    let rules = "localhost, .internal.test, 10.0.0.0/8, direct.test:8080, *.wild.test, 192.168.1.5, [::1], 2001:db8::/32"
+    print("rules: {rules}")
+    route_table(http.with_no_proxy(base, rules), [
+        "http://localhost/", "http://a.localhost/", "http://localhost.other/"
+        "http://api.internal.test/", "http://internal.test/"
+        "http://10.2.3.4/", "http://11.0.0.1/"
+        "http://direct.test:8080/", "http://direct.test:9090/", "http://direct.test/"
+        "http://x.wild.test/", "http://wild.test/"
+        "http://192.168.1.5/", "http://192.168.1.6/"
+        "http://[::1]/", "http://[::2]/", "http://[2001:db8::7]/", "http://[2001:db9::7]/"
+        "https://secure.example/", "https://UPPER.internal.test/"
+    ])
+    print("star")
+    route_table(http.with_no_proxy(base, "*"), ["http://a.test/", "https://a.test/"])
+    print("separate http and https proxies")
+    let split = http.client().with_http_proxy("http://plain.test:8080").with_https_proxy("socks5://secure.test:1080")
+    route_table(split, ["http://a.test/", "https://a.test/", "https://user:pw@a.test/"])
+}
+
+fn main() ! io.Error {
+    environment_routes()?
+    matching_rules()
+
+    using origin = net.listen("127.0.0.1", 0)?
+    let origins = new(Origin { lock: sync.mutex(), connections: 0 })
+    spawn run_origin(origins, origin.handle)
+    let origin_port = origin.handle.addr.port
+
+    using front = net.listen("127.0.0.1", 0)?
+    let proxy = new(Proxy { lock: sync.mutex(), connections: 0, log: [], expect_auth: "" })
+    spawn run_proxy(proxy, front.handle)
+    let proxy_port = front.handle.addr.port
+
+    let seen = new(Seen { lock: sync.mutex(), hosts: [] })
+    let c = http.client().with_proxy("http://proxy.test:{proxy_port}").with_resolver(recording(seen)).build()
+
+    print("forwarding")
+    print(outcome(c, "http://origin.test:{origin_port}/hello?x=1", origin_port))
+    show_log(proxy, origin_port)
+    show_hosts(seen)
+    let posted = c.post("http://origin.test:{origin_port}/submit", "text/plain", bytes("payload")) catch {
+        _ => return
+    }
+    print("{posted.status} {mask(http.text(posted), origin_port)} via={http.header_value(posted, "x-via") ?? "-"}")
+    show_log(proxy, origin_port)
+    print("proxy connections {proxy.connections}, origin connections {origins.connections}")
+
+    print("direct for no_proxy hosts")
+    let bypass_seen = new(Seen { lock: sync.mutex(), hosts: [] })
+    let bypass = http.client().with_proxy("http://proxy.test:{proxy_port}").with_no_proxy("direct.test").with_resolver(recording(bypass_seen)).build()
+    print(outcome(bypass, "http://direct.test:{origin_port}/direct", origin_port))
+    show_hosts(bypass_seen)
+    show_log(proxy, origin_port)
+    print("proxy connections {proxy.connections}")
+
+    print("authentication")
+    using guarded = net.listen("127.0.0.1", 0)?
+    let strict = new(Proxy { lock: sync.mutex(), connections: 0, log: [], expect_auth: "Basic dXNlcjpwYXNz" })
+    spawn run_proxy(strict, guarded.handle)
+    let guarded_port = guarded.handle.addr.port
+    let anonymous = http.client().with_proxy("http://127.0.0.1:{guarded_port}").build()
+    print(outcome(anonymous, "http://origin.test:{origin_port}/need-auth", origin_port))
+    let named = http.client().with_proxy("http://user:pass@127.0.0.1:{guarded_port}").build()
+    print(outcome(named, "http://origin.test:{origin_port}/need-auth", origin_port))
+    show_log(strict, origin_port)
+
+    print("blocked and failing targets")
+    print(outcome(c, "http://blocked.example/", origin_port))
+    print(outcome(c, "https://blocked.example/", origin_port))
+    print(outcome(c, "https://dead.example:1/", origin_port))
+    show_log(proxy, origin_port)
+
+    print("connect tunnel")
+    let pem = embed("std_tls_ec.pem")
+    let key = tls.load_key(pem) catch {
+        _ => return
+    }
+    let config = tls.Config { certificates: tls.load_certificates(pem), key, alpn: ["h2", "http/1.1"] }
+    using secure = net.listen("127.0.0.1", 0)?
+    spawn run_secure(secure.handle, config)
+    let secure_port = secure.handle.addr.port
+    let tunnelled_seen = new(Seen { lock: sync.mutex(), hosts: [] })
+    let tunnelled = http.client().with_proxy("http://user:pass@proxy.test:{guarded_port}").with_roots(roots()).with_resolver(recording(tunnelled_seen)).build()
+    let secured = tunnelled.get("https://localhost:{secure_port}/secure") catch {
+        _ => return
+    }
+    print("{secured.status} {mask(http.text(secured), secure_port)} h2={secured.version == Http2}")
+    let again = tunnelled.get("https://localhost:{secure_port}/again") catch {
+        _ => return
+    }
+    print("{again.status} {mask(http.text(again), secure_port)}")
+    show_log(strict, secure_port)
+    show_hosts(tunnelled_seen)
+    print("strict proxy connections {strict.connections}")
+
+    print("server name")
+    using sniffer = net.listen("127.0.0.1", 0)?
+    let hello = chan[bool](1)
+    spawn sniff(sniffer.handle, hello)
+    let sniffing = http.client().with_proxy("http://proxy.test:{proxy_port}").with_resolver(recording(seen)).with_timeout(2000).build()
+    print(outcome(sniffing, "https://secure.example:{sniffer.handle.addr.port}/", origin_port))
+    print("client hello named secure.example: {(<-hello) ?? false}")
+    show_log(proxy, sniffer.handle.addr.port)
+    show_hosts(seen)
+
+    print("invalid proxies")
+    let wrong = http.client().with_proxy("ftp://proxy.test:21").build()
+    print(outcome(wrong, "http://origin.test/", origin_port))
+    let closed = http.client().with_proxy("http://127.0.0.1:1").build()
+    print(outcome(closed, "http://origin.test/", origin_port))
+
+    print("dialer")
+    let dir = file.temp_dir("lowproxy")?
+    let socket_path = "{dir}/origin.sock"
+    using unix = net.listen_unix(socket_path)?
+    let handler = fn(req: http.Request) -> http.Response { origin_answer(req) }
+    let unix_view = unix.handle
+    spawn fn() {
+        http.serve_on(unix_view, handler) catch {
+            _ => {}
+        }
+    }()
+    let dialled = new(Seen { lock: sync.mutex(), hosts: [] })
+    let dial_unix = net.Dialer {
+        dial: fn(host: str, port: i64) -> net.ConnHandle ! io.Error {
+            sync.lock(dialled.lock)
+            push(mut dialled.hosts, "{host}:{port}")
+            sync.unlock(dialled.lock)
+            unix_handle(socket_path)?
+        }
+    }
+    let local = http.client().with_dialer(dial_unix).build()
+    print(outcome(local, "http://unix.test/over-unix", 0))
+    print("dialer asked for {dialled.hosts[0]}")
+    net.close_listener(unix)
+    file.remove_all(dir)?
+}

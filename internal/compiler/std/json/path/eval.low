@@ -1,0 +1,360 @@
+import std/json
+import std/regex
+import std/text
+
+struct Walk {
+    root: json.Value
+    track: bool
+}
+
+fn quote_name(name: str) -> str {
+    var out: []u8 = []
+    push(mut out, '\'')
+    for c in name {
+        if c == '\'' {
+            text.append(mut out, "\\'")
+        } else if c == '\\' {
+            text.append(mut out, "\\\\")
+        } else if c == 8 {
+            text.append(mut out, "\\b")
+        } else if c == 12 {
+            text.append(mut out, "\\f")
+        } else if c == 10 {
+            text.append(mut out, "\\n")
+        } else if c == 13 {
+            text.append(mut out, "\\r")
+        } else if c == 9 {
+            text.append(mut out, "\\t")
+        } else if c < 0x20 {
+            text.append(mut out, "\\u00{text.pad_left(text.hex(i64(c)), 2, '0')}")
+        } else {
+            text.append_char(mut out, c)
+        }
+    }
+    push(mut out, '\'')
+    str(out)
+}
+
+fn member_node(w: Walk, parent: Node, m: json.Member) -> Node {
+    if !w.track {
+        return Node { value: m.value, path: "" }
+    }
+    Node { value: m.value, path: "{parent.path}[{quote_name(m.name)}]" }
+}
+
+fn item_node(w: Walk, parent: Node, items: []json.Value, i: i64) -> Node {
+    if !w.track {
+        return Node { value: items[i], path: "" }
+    }
+    Node { value: items[i], path: "{parent.path}[{i}]" }
+}
+
+fn children(w: Walk, node: Node) -> []Node {
+    var out: []Node = []
+    match node.value {
+        Object(members) => {
+            for m in members {
+                push(mut out, member_node(w, node, m))
+            }
+        }
+        Array(items) => {
+            for i in 0..items.len {
+                push(mut out, item_node(w, node, items, i))
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn run_query(w: Walk, q: Query, current: json.Value) -> []Node {
+    var nodes: []Node = []
+    if q.root {
+        push(mut nodes, Node { value: w.root, path: "$" })
+    } else {
+        push(mut nodes, Node { value: current, path: "@" })
+    }
+    for segment in q.segments {
+        var next: []Node = []
+        for node in nodes {
+            if segment.descendant {
+                descend(w, node, segment.selectors, mut next)
+            } else {
+                apply_selectors(w, node, segment.selectors, mut next)
+            }
+        }
+        nodes = next
+    }
+    nodes
+}
+
+fn descend(w: Walk, node: Node, selectors: []Selector, mut out: []Node) {
+    apply_selectors(w, node, selectors, mut out)
+    for child in children(w, node) {
+        descend(w, child, selectors, mut out)
+    }
+}
+
+fn apply_selectors(w: Walk, node: Node, selectors: []Selector, mut out: []Node) {
+    for selector in selectors {
+        match selector {
+            Name(name) => pick_name(w, node, name, mut out)
+            Wildcard => {
+                for child in children(w, node) {
+                    push(mut out, child)
+                }
+            }
+            Index(index) => pick_index(w, node, index, mut out)
+            Slice(start, end, step) => pick_slice(w, node, start, end, step, mut out)
+            Filter(expr) => pick_filter(w, node, expr, mut out)
+        }
+    }
+}
+
+fn pick_name(w: Walk, node: Node, name: str, mut out: []Node) {
+    match node.value {
+        Object(members) => {
+            for m in members {
+                if m.name == name {
+                    push(mut out, member_node(w, node, m))
+                    return
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn pick_index(w: Walk, node: Node, index: i64, mut out: []Node) {
+    match node.value {
+        Array(items) => {
+            let i = if index < 0 { items.len + index } else { index }
+            if i >= 0 && i < items.len {
+                push(mut out, item_node(w, node, items, i))
+            }
+        }
+        _ => {}
+    }
+}
+
+fn clamp(x: i64, low: i64, high: i64) -> i64 {
+    if x < low {
+        return low
+    }
+    if x > high {
+        return high
+    }
+    x
+}
+
+fn normalize(i: i64, len: i64) -> i64 {
+    if i >= 0 { i } else { len + i }
+}
+
+fn slice_indices(len: i64, start: i64?, end: i64?, step: i64) -> []i64 {
+    var out: []i64 = []
+    if step > 0 {
+        let lower = clamp(normalize(start ?? 0, len), 0, len)
+        let upper = clamp(normalize(end ?? len, len), 0, len)
+        var i = lower
+        for i < upper {
+            push(mut out, i)
+            i += step
+        }
+    } else if step < 0 {
+        let upper = clamp(normalize(start ?? len - 1, len), -1, len - 1)
+        let lower = clamp(normalize(end ?? -len - 1, len), -1, len - 1)
+        var i = upper
+        for lower < i {
+            push(mut out, i)
+            i += step
+        }
+    }
+    out
+}
+
+fn pick_slice(w: Walk, node: Node, start: i64?, end: i64?, step: i64, mut out: []Node) {
+    match node.value {
+        Array(items) => {
+            for i in slice_indices(items.len, start, end, step) {
+                push(mut out, item_node(w, node, items, i))
+            }
+        }
+        _ => {}
+    }
+}
+
+fn pick_filter(w: Walk, node: Node, expr: *Expr, mut out: []Node) {
+    let inner = Walk { root: w.root, track: false }
+    for child in children(w, node) {
+        if truthy(inner, *expr, child.value) {
+            push(mut out, child)
+        }
+    }
+}
+
+fn truthy(w: Walk, e: Expr, current: json.Value) -> bool {
+    match e {
+        Or(left, right) => truthy(w, *left, current) || truthy(w, *right, current)
+        And(left, right) => truthy(w, *left, current) && truthy(w, *right, current)
+        Not(inner) => !truthy(w, *inner, current)
+        Compare(left, op, right) => {
+            let a = operand_value(w, left, current)
+            let b = operand_value(w, right, current)
+            compare(op, a, b)
+        }
+        Exists(q) => run_query(w, q, current).len > 0
+        Test(call) => test_call(w, call, current)
+    }
+}
+
+fn operand_value(w: Walk, o: Operand, current: json.Value) -> json.Value? {
+    match o {
+        Literal(v) => v
+        Query(q) => {
+            let nodes = run_query(w, q, current)
+            if nodes.len == 1 {
+                return nodes[0].value
+            }
+            none
+        }
+        Call(c) => call_value(w, c, current)
+    }
+}
+
+fn same(a: json.Value?, b: json.Value?) -> bool {
+    match a {
+        some(x) => match b {
+            some(y) => json.equal(x, y)
+            none => false
+        }
+        none => match b {
+            some(_) => false
+            none => true
+        }
+    }
+}
+
+fn number(v: json.Value) -> f64? {
+    match v {
+        Int(n) => f64(n)
+        Float(x) => x
+        _ => none
+    }
+}
+
+fn below(a: json.Value?, b: json.Value?) -> bool {
+    let x = a ?? return false
+    let y = b ?? return false
+    match x {
+        Int(m) => match y {
+            Int(n) => m < n
+            Float(f) => f64(m) < f
+            _ => false
+        }
+        Float(f) => match y {
+            Int(n) => f < f64(n)
+            Float(g) => f < g
+            _ => false
+        }
+        Str(s) => match y {
+            Str(t) => s < t
+            _ => false
+        }
+        _ => false
+    }
+}
+
+fn compare(op: Cmp, a: json.Value?, b: json.Value?) -> bool {
+    match op {
+        Eq => same(a, b)
+        Ne => !same(a, b)
+        Lt => below(a, b)
+        Gt => below(b, a)
+        Le => below(a, b) || same(a, b)
+        Ge => below(b, a) || same(a, b)
+    }
+}
+
+fn first_argument(call: Call) -> Operand {
+    call.args[0]
+}
+
+fn call_value(w: Walk, call: Call, current: json.Value) -> json.Value? {
+    let first = first_argument(call)
+    if call.function == Count {
+        return json.Value.Int(argument_nodes(w, first, current).len)
+    }
+    if call.function == Value {
+        let nodes = argument_nodes(w, first, current)
+        if nodes.len == 1 {
+            return nodes[0].value
+        }
+        return none
+    }
+    let v = operand_value(w, first, current) ?? return none
+    match v {
+        Str(s) => json.Value.Int(text.char_count(s))
+        Array(items) => json.Value.Int(items.len)
+        Object(members) => json.Value.Int(members.len)
+        _ => none
+    }
+}
+
+fn argument_nodes(w: Walk, o: Operand, current: json.Value) -> []Node {
+    match o {
+        Query(q) => run_query(w, q, current)
+        _ => []
+    }
+}
+
+fn test_call(w: Walk, call: Call, current: json.Value) -> bool {
+    let subject = operand_value(w, call.args[0], current) ?? return false
+    let pattern = operand_value(w, call.args[1], current) ?? return false
+    let s = match subject {
+        Str(t) => t
+        _ => return false
+    }
+    let source = match pattern {
+        Str(t) => t
+        _ => return false
+    }
+    let re = regex.compile(interoperable(source)) catch {
+        _ => return false
+    }
+    let found = if call.function == Match { regex.full_match(re, s) } else { regex.find(re, s) }
+    match found {
+        some(_) => true
+        none => false
+    }
+}
+
+fn interoperable(pattern: str) -> str {
+    var out: []u8 = []
+    var in_class = false
+    var i = 0
+    for i < pattern.len {
+        let c = pattern[i]
+        if c == '\\' && i + 1 < pattern.len {
+            push(mut out, c)
+            push(mut out, pattern[i + 1])
+            i += 2
+            continue
+        }
+        if in_class {
+            if c == ']' {
+                in_class = false
+            }
+            push(mut out, c)
+        } else if c == '[' {
+            in_class = true
+            push(mut out, c)
+        } else if c == '.' {
+            text.append(mut out, "[^\\n\\r]")
+        } else {
+            push(mut out, c)
+        }
+        i += 1
+    }
+    str(out)
+}

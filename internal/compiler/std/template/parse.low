@@ -1,0 +1,349 @@
+import std/text
+
+struct Parser {
+    name: str
+    src: str
+    pos: i64
+    at: i64
+    limit: i64
+    cursor: i64
+    line: i64
+    line_start: i64
+    trim_next: bool
+    blocks: [str: []Node]
+    parent: str
+    parent_pos: Pos
+    extends: bool
+    depth: i64
+    nodes: i64
+}
+
+struct Tag {
+    start: i64
+    inner: i64
+    stop: i64
+    after: i64
+    trim_before: bool
+    trim_after: bool
+    comment: bool
+}
+
+struct Body {
+    nodes: []Node
+    stop: str
+    at: i64
+}
+
+fn locate(p: *Parser, offset: i64) -> Pos {
+    if offset < p.cursor {
+        p.cursor = 0
+        p.line = 1
+        p.line_start = 0
+    }
+    for p.cursor < offset {
+        if p.src[p.cursor] == '\n' {
+            p.line += 1
+            p.line_start = p.cursor + 1
+        }
+        p.cursor += 1
+    }
+    Pos { line: p.line, column: offset - p.line_start + 1 }
+}
+
+fn error_at(p: *Parser, offset: i64, message: str) -> Error {
+    let pos = locate(p, offset)
+    Error.Parse(p.name, pos.line, pos.column, message)
+}
+
+pub fn compile(name: str, source: str) -> Template ! Error {
+    let blocks: [str: []Node] = [:]
+    let p = new(Parser {
+        name, src: source, pos: 0, at: 0, limit: 0, cursor: 0, line: 1, line_start: 0,
+        trim_next: false, blocks, parent: "", parent_pos: Pos { line: 0, column: 0 }, extends: false, depth: 0, nodes: 0,
+    })
+    let body = parse_body(p)?
+    if body.stop != "" {
+        fail error_at(p, body.at, "unexpected {body.stop}")
+    }
+    Template { name, nodes: body.nodes, parent: p.parent, parent_pos: p.parent_pos, extends: p.extends, blocks: p.blocks }
+}
+
+fn skip_quoted(p: *Parser, from: i64) -> i64 {
+    let quote = p.src[from]
+    var i = from + 1
+    for i < p.src.len {
+        let c = p.src[i]
+        if c == '\\' {
+            i += 2
+            continue
+        }
+        if c == quote {
+            return i + 1
+        }
+        i += 1
+    }
+    p.src.len
+}
+
+fn find_close(p: *Parser, start: i64, from: i64) -> i64 ! Error {
+    var i = from
+    for i < p.src.len {
+        let c = p.src[i]
+        if c == '"' || c == '\'' {
+            i = skip_quoted(p, i)
+            continue
+        }
+        if c == '}' && i + 1 < p.src.len && p.src[i + 1] == '}' {
+            return i
+        }
+        i += 1
+    }
+    fail error_at(p, start, "unclosed tag")
+}
+
+fn read_tag(p: *Parser, start: i64) -> Tag ! Error {
+    var inner = start + 2
+    var trim_before = false
+    if inner + 1 < p.src.len && p.src[inner] == '-' && (text.space(p.src[inner + 1]) || p.src[inner + 1] == '#') {
+        trim_before = true
+        inner += 1
+    }
+    var comment = false
+    if inner < p.src.len && p.src[inner] == '#' {
+        comment = true
+        inner += 1
+    }
+    var stop = 0
+    if comment {
+        let rest = text.index(p.src[inner..], "}}")
+        if rest < 0 {
+            fail error_at(p, start, "unclosed comment")
+        }
+        stop = inner + rest
+    } else {
+        stop = find_close(p, start, inner)?
+    }
+    var trim_after = false
+    var content_end = stop
+    if stop - 2 >= inner && p.src[stop - 1] == '-' && (text.space(p.src[stop - 2]) || comment) {
+        trim_after = true
+        content_end = stop - 1
+    }
+    Tag { start, inner, stop: content_end, after: stop + 2, trim_before, trim_after, comment }
+}
+
+fn emit_text(p: *Parser, mut nodes: []Node, to: i64, trim_before: bool) {
+    var s = p.src[p.pos..to]
+    if p.trim_next {
+        s = text.trim_start(s)
+    }
+    if trim_before {
+        s = text.trim_end(s)
+    }
+    if s.len > 0 {
+        push(mut nodes, Node.Text(s))
+    }
+}
+
+fn parse_body(p: *Parser) -> Body ! Error {
+    var nodes: []Node = []
+    for {
+        let open = text.index(p.src[p.pos..], "{{")
+        if open < 0 {
+            emit_text(p, mut nodes, p.src.len, false)
+            p.pos = p.src.len
+            return Body { nodes, stop: "", at: p.src.len }
+        }
+        let tag = read_tag(p, p.pos + open)?
+        emit_text(p, mut nodes, tag.start, tag.trim_before)
+        p.pos = tag.after
+        p.trim_next = tag.trim_after
+        if tag.comment {
+            continue
+        }
+        p.at = tag.inner
+        p.limit = tag.stop
+        p.nodes = 0
+        skip_space(p)
+        let start = p.at
+        let word = take_word(p)
+        if word == "end" || word == "else" {
+            return Body { nodes, stop: word, at: tag.start }
+        }
+        let node = parse_statement(p, word, tag.start, start)?
+        match node {
+            some(n) => push(mut nodes, n)
+            none => {}
+        }
+    }
+}
+
+fn parse_statement(p: *Parser, word: str, tag_start: i64, start: i64) -> Node? ! Error {
+    if word == "if" {
+        let cond = parse_expr(p)?
+        expect_close(p)?
+        return parse_if(p, cond, tag_start)?
+    }
+    if word == "for" {
+        return parse_each(p, tag_start)?
+    }
+    if word == "include" {
+        let pos = locate(p, start)
+        let target = parse_expr(p)?
+        expect_close(p)?
+        return Node.Include(target, pos)
+    }
+    if word == "block" {
+        return parse_block(p, tag_start)?
+    }
+    if word == "extends" {
+        return parse_extends(p, tag_start)?
+    }
+    if word == "let" {
+        return parse_let(p)?
+    }
+    p.at = start
+    let pos = locate(p, start)
+    let value = parse_expr(p)?
+    expect_close(p)?
+    Node.Output(value, pos)
+}
+
+fn descend(p: *Parser, tag_start: i64) ! Error {
+    p.depth += 1
+    if p.depth > 100 {
+        fail error_at(p, tag_start, "nesting too deep")
+    }
+}
+
+fn parse_if(p: *Parser, first: Expr, tag_start: i64) -> Node ! Error {
+    var branches: []Branch = []
+    var otherwise: []Node = []
+    var cond = first
+    descend(p, tag_start)?
+    for {
+        let body = parse_body(p)?
+        push(mut branches, Branch { cond, body: body.nodes })
+        if body.stop == "" {
+            fail error_at(p, tag_start, "if is never closed")
+        }
+        if body.stop == "end" {
+            expect_close(p)?
+            break
+        }
+        skip_space(p)
+        if take_keyword(p, "if") {
+            cond = parse_expr(p)?
+            expect_close(p)?
+            continue
+        }
+        expect_close(p)?
+        let tail = parse_body(p)?
+        if tail.stop == "else" {
+            fail error_at(p, tail.at, "unexpected else")
+        }
+        if tail.stop != "end" {
+            fail error_at(p, tag_start, "if is never closed")
+        }
+        expect_close(p)?
+        otherwise = tail.nodes
+        break
+    }
+    p.depth -= 1
+    Node.If(branches, otherwise)
+}
+
+fn parse_each(p: *Parser, tag_start: i64) -> Node ! Error {
+    let pos = locate(p, tag_start)
+    let first = expect_name(p)?
+    var second = ""
+    skip_space(p)
+    if peek(p) == ',' {
+        p.at += 1
+        second = expect_name(p)?
+    }
+    skip_space(p)
+    if !take_keyword(p, "in") {
+        fail error_at(p, p.at, "expected in")
+    }
+    let iterable = parse_expr(p)?
+    expect_close(p)?
+    descend(p, tag_start)?
+    let body = parse_body(p)?
+    var empty: []Node = []
+    var stop = body.stop
+    if stop == "else" {
+        expect_close(p)?
+        let tail = parse_body(p)?
+        empty = tail.nodes
+        stop = tail.stop
+    }
+    if stop != "end" {
+        fail error_at(p, tag_start, "for is never closed")
+    }
+    expect_close(p)?
+    p.depth -= 1
+    Node.Loop(Each { key: first, value: second, iterable, body: body.nodes, empty, pos })
+}
+
+fn parse_block(p: *Parser, tag_start: i64) -> Node ! Error {
+    let name = expect_literal(p)?
+    expect_close(p)?
+    descend(p, tag_start)?
+    let body = parse_body(p)?
+    if body.stop != "end" {
+        fail error_at(p, tag_start, "block is never closed")
+    }
+    expect_close(p)?
+    p.depth -= 1
+    match p.blocks[name] {
+        some(_) => fail error_at(p, tag_start, "block {name} is defined twice")
+        none => {}
+    }
+    p.blocks[name] = body.nodes
+    Node.Block(name, body.nodes)
+}
+
+fn parse_extends(p: *Parser, tag_start: i64) -> Node? ! Error {
+    let name = expect_literal(p)?
+    expect_close(p)?
+    if p.extends {
+        fail error_at(p, tag_start, "extends appears twice")
+    }
+    if p.depth > 0 {
+        fail error_at(p, tag_start, "extends must not be nested")
+    }
+    p.extends = true
+    p.parent = name
+    p.parent_pos = locate(p, tag_start)
+    none
+}
+
+fn parse_let(p: *Parser) -> Node ! Error {
+    let name = expect_name(p)?
+    skip_space(p)
+    if peek(p) != '=' || peek_at(p, 1) == '=' {
+        fail error_at(p, p.at, "expected =")
+    }
+    p.at += 1
+    let value = parse_expr(p)?
+    expect_close(p)?
+    Node.Let(name, value)
+}
+
+fn expect_literal(p: *Parser) -> str ! Error {
+    skip_space(p)
+    let c = peek(p)
+    if c != '"' && c != '\'' {
+        fail error_at(p, p.at, "expected a quoted name")
+    }
+    let value = parse_string(p)?
+    value
+}
+
+fn expect_close(p: *Parser) ! Error {
+    skip_space(p)
+    if p.at < p.limit {
+        fail error_at(p, p.at, "unexpected {text.from_char(u32(p.src[p.at]))}")
+    }
+}

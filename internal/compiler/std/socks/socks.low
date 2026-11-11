@@ -1,0 +1,199 @@
+import std/io
+import std/net
+
+pub struct Auth {
+    pub user: str
+    pub password: str
+}
+
+fn read_exact(h: net.ConnHandle, n: i64) -> []u8 ! io.Error {
+    let out = io.buffer(n)
+    var got = 0
+    for got < n {
+        let r = net.read_on(h, out[got..])?
+        if r == 0 {
+            fail Eof
+        }
+        got += r
+    }
+    out
+}
+
+fn reply_error(code: i64) -> io.Error {
+    let known: [i64: io.Error] = [2: Denied, 3: Unreachable, 4: Unreachable, 5: Refused, 6: TimedOut, 7: Unsupported, 8: Unsupported]
+    known[code] ?? Os(code)
+}
+
+fn bare_host(host: str) -> str {
+    if host.len >= 2 && host[0] == '[' && host[host.len - 1] == ']' {
+        return host[1..host.len - 1]
+    }
+    host
+}
+
+fn address_bytes(host: str) -> []u8 ! io.Error {
+    let name = bare_host(host)
+    let literal: []u8 = net.parse_ip(name) catch []
+    var out: []u8 = []
+    if literal.len == 4 {
+        push(mut out, 1)
+        io.append(mut out, literal)
+    } else if literal.len == 16 {
+        push(mut out, 4)
+        io.append(mut out, literal)
+    } else {
+        if name.len == 0 || name.len > 255 {
+            fail Invalid
+        }
+        push(mut out, 3)
+        push(mut out, u8(name.len))
+        io.append_str(mut out, name)
+    }
+    out
+}
+
+fn authenticate(h: net.ConnHandle, auth: Auth?) ! io.Error {
+    let credentials = match auth {
+        some(a) => a
+        none => fail Denied
+    }
+    if credentials.user.len == 0 || credentials.user.len > 255 || credentials.password.len > 255 {
+        fail Invalid
+    }
+    var request: []u8 = [1]
+    push(mut request, u8(credentials.user.len))
+    io.append_str(mut request, credentials.user)
+    push(mut request, u8(credentials.password.len))
+    io.append_str(mut request, credentials.password)
+    net.write_all_on(h, request)?
+    let answer = read_exact(h, 2)?
+    if answer[0] != 1 {
+        fail Malformed
+    }
+    if answer[1] != 0 {
+        fail Denied
+    }
+}
+
+fn negotiate(h: net.ConnHandle, auth: Auth?) ! io.Error {
+    let greeting: []u8 = if auth != none { [5, 2, 0, 2] } else { [5, 1, 0] }
+    net.write_all_on(h, greeting)?
+    let choice = read_exact(h, 2)?
+    if choice[0] != 5 {
+        fail Malformed
+    }
+    if choice[1] == 2 {
+        authenticate(h, auth)?
+    } else if choice[1] == 0xFF {
+        fail Denied
+    } else if choice[1] != 0 {
+        fail Unsupported
+    }
+}
+
+fn skip_bound_address(h: net.ConnHandle, kind: i64) ! io.Error {
+    var size = 0
+    if kind == 1 {
+        size = 4
+    } else if kind == 4 {
+        size = 16
+    } else if kind == 3 {
+        size = i64(read_exact(h, 1)?[0])
+    } else {
+        fail Malformed
+    }
+    read_exact(h, size + 2)?
+}
+
+pub fn tunnel(c: net.Conn, host: str, port: i64, auth: Auth?) ! io.Error {
+    tunnel_on(c.handle, host, port, auth)?
+}
+
+pub fn tunnel_on(h: net.ConnHandle, host: str, port: i64, auth: Auth?) ! io.Error {
+    if port <= 0 || port > 65535 {
+        fail Invalid
+    }
+    negotiate(h, auth)?
+    var request: []u8 = [5, 1, 0]
+    io.append(mut request, address_bytes(host)?)
+    io.put_be16(mut request, port)
+    net.write_all_on(h, request)?
+    let head = read_exact(h, 4)?
+    if head[0] != 5 {
+        fail Malformed
+    }
+    if head[1] != 0 {
+        fail reply_error(i64(head[1]))
+    }
+    skip_bound_address(h, i64(head[3]))?
+}
+
+pub fn tunnel4a(c: net.Conn, host: str, port: i64, user: str) ! io.Error {
+    tunnel4a_on(c.handle, host, port, user)?
+}
+
+pub fn tunnel4a_on(h: net.ConnHandle, host: str, port: i64, user: str) ! io.Error {
+    if port <= 0 || port > 65535 {
+        fail Invalid
+    }
+    let name = bare_host(host)
+    let literal: []u8 = net.parse_ip(name) catch []
+    if literal.len == 16 || name.len == 0 || name.len > 255 {
+        fail Unsupported
+    }
+    var request: []u8 = [4, 1]
+    io.put_be16(mut request, port)
+    if literal.len == 4 {
+        io.append(mut request, literal)
+    } else {
+        io.append(mut request, [0, 0, 0, 1])
+    }
+    io.append_str(mut request, user)
+    push(mut request, 0)
+    if literal.len == 0 {
+        io.append_str(mut request, name)
+        push(mut request, 0)
+    }
+    net.write_all_on(h, request)?
+    let answer = read_exact(h, 8)?
+    if answer[0] != 0 {
+        fail Malformed
+    }
+    if answer[1] == 0x5A {
+        return
+    }
+    if answer[1] == 0x5B {
+        fail Refused
+    }
+    fail Denied
+}
+
+pub fn dial(proxy: net.Addr, host: str, port: i64, auth: Auth?) -> net.Conn ! io.Error {
+    using c = net.connect(proxy)?
+    tunnel(c, host, port, auth)?
+    c
+}
+
+pub fn dial4a(proxy: net.Addr, host: str, port: i64, user: str) -> net.Conn ! io.Error {
+    using c = net.connect(proxy)?
+    tunnel4a(c, host, port, user)?
+    c
+}
+
+pub fn dial_handle(proxy: net.Addr, host: str, port: i64, auth: Auth?) -> net.ConnHandle ! io.Error {
+    using var c = dial(proxy, host, port, auth)?
+    net.detach(mut c)
+}
+
+pub fn dial4a_handle(proxy: net.Addr, host: str, port: i64, user: str) -> net.ConnHandle ! io.Error {
+    using var c = dial4a(proxy, host, port, user)?
+    net.detach(mut c)
+}
+
+pub fn dialer(proxy: net.Addr, auth: Auth?) -> net.Dialer {
+    net.Dialer { dial: fn(host: str, port: i64) -> net.ConnHandle ! io.Error { dial_handle(proxy, host, port, auth)? } }
+}
+
+pub fn dialer4a(proxy: net.Addr, user: str) -> net.Dialer {
+    net.Dialer { dial: fn(host: str, port: i64) -> net.ConnHandle ! io.Error { dial4a_handle(proxy, host, port, user)? } }
+}

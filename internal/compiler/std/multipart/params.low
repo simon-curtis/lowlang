@@ -1,0 +1,255 @@
+import std/http
+import std/text
+
+pub struct Value {
+    pub main: str
+    pub params: []http.Header
+}
+
+pub fn parse_value(s: str) -> Value {
+    let semi = text.index_byte(s, ';')
+    if semi < 0 {
+        return Value { main: text.trim(s), params: [] }
+    }
+    Value { main: text.trim(s[..semi]), params: resolve(raw_params(s, semi + 1)) }
+}
+
+pub fn param(v: Value, name: str) -> str? {
+    http.header(v.params, name)
+}
+
+fn skip_blanks(s: str, from: i64) -> i64 {
+    var i = from
+    for i < s.len && (text.space(s[i]) || s[i] == ';') {
+        i += 1
+    }
+    i
+}
+
+fn raw_params(s: str, from: i64) -> []http.Header {
+    var out: []http.Header = []
+    var i = skip_blanks(s, from)
+    for i < s.len {
+        let name_start = i
+        for i < s.len && s[i] != '=' && s[i] != ';' {
+            i += 1
+        }
+        let name = text.lower(text.trim(s[name_start..i]))
+        if i >= s.len || s[i] == ';' {
+            if name.len > 0 {
+                push(mut out, http.Header { name, value: "" })
+            }
+            i = skip_blanks(s, i)
+            continue
+        }
+        i += 1
+        for i < s.len && text.space(s[i]) {
+            i += 1
+        }
+        var value = ""
+        if i < s.len && s[i] == '"' {
+            var bytes_out: []u8 = []
+            i += 1
+            for i < s.len && s[i] != '"' {
+                if s[i] == '\\' && i + 1 < s.len && (s[i + 1] == '"' || s[i + 1] == '\\') {
+                    i += 1
+                }
+                push(mut bytes_out, s[i])
+                i += 1
+            }
+            if i < s.len {
+                i += 1
+            }
+            for i < s.len && s[i] != ';' {
+                i += 1
+            }
+            value = __str_view(bytes_out)
+        } else {
+            let value_start = i
+            for i < s.len && s[i] != ';' {
+                i += 1
+            }
+            value = text.trim(s[value_start..i])
+        }
+        if name.len > 0 {
+            push(mut out, http.Header { name, value })
+        }
+        i = skip_blanks(s, i)
+    }
+    out
+}
+
+struct Piece {
+    base: str
+    order: i64
+    extended: bool
+    value: str
+}
+
+fn hex_value(c: u8) -> i64 {
+    if c >= '0' && c <= '9' {
+        return i64(c - '0')
+    }
+    if c >= 'a' && c <= 'f' {
+        return i64(c - 'a') + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return i64(c - 'A') + 10
+    }
+    -1
+}
+
+fn percent_decode(s: str) -> []u8 {
+    var out: []u8 = []
+    var i = 0
+    for i < s.len {
+        if s[i] == '%' && i + 2 < s.len && hex_value(s[i + 1]) >= 0 && hex_value(s[i + 2]) >= 0 {
+            push(mut out, u8(hex_value(s[i + 1]) * 16 + hex_value(s[i + 2])))
+            i += 3
+        } else {
+            push(mut out, s[i])
+            i += 1
+        }
+    }
+    out
+}
+
+fn latin1_to_utf8(data: []u8) -> str {
+    var out: []u8 = []
+    for b in data {
+        text.append_char(mut out, u32(b))
+    }
+    __str_view(out)
+}
+
+fn charset_text(charset: str, data: []u8) -> str {
+    let name = text.lower(charset)
+    if name == "iso-8859-1" || name == "latin1" || name == "us-ascii" {
+        return latin1_to_utf8(data)
+    }
+    __str_view(data)
+}
+
+fn split_extended(value: str) -> Value {
+    let first = text.index_byte(value, '\'')
+    if first < 0 {
+        return Value { main: "", params: [] }
+    }
+    let rest = value[first + 1..]
+    let second = text.index_byte(rest, '\'')
+    if second < 0 {
+        return Value { main: "", params: [] }
+    }
+    Value { main: value[..first], params: [http.Header { name: "data", value: rest[second + 1..] }] }
+}
+
+fn decode_extended(value: str) -> str {
+    let parts = split_extended(value)
+    match param(parts, "data") {
+        some(data) => charset_text(parts.main, percent_decode(data))
+        none => value
+    }
+}
+
+fn piece_of(h: http.Header) -> Piece {
+    let star = text.index_byte(h.name, '*')
+    if star < 0 {
+        return Piece { base: h.name, order: -2, extended: false, value: h.value }
+    }
+    let rest = h.name[star + 1..]
+    if rest.len == 0 {
+        return Piece { base: h.name[..star], order: -1, extended: true, value: h.value }
+    }
+    var digits = rest
+    var extended = false
+    if rest[rest.len - 1] == '*' {
+        digits = rest[..rest.len - 1]
+        extended = true
+    }
+    let order = text.parse_int(digits) catch -3
+    Piece { base: h.name[..star], order, extended, value: h.value }
+}
+
+fn joined(pieces: []Piece) -> str {
+    var numbered: []Piece = []
+    for p in pieces {
+        if p.order >= 0 {
+            push(mut numbered, p)
+        }
+    }
+    var i = 1
+    for i < numbered.len {
+        var j = i
+        for j > 0 && numbered[j - 1].order > numbered[j].order {
+            let swap = numbered[j]
+            numbered[j] = numbered[j - 1]
+            numbered[j - 1] = swap
+            j -= 1
+        }
+        i += 1
+    }
+    var charset = ""
+    var data: []u8 = []
+    var expect = 0
+    for p in numbered {
+        if p.order != expect {
+            break
+        }
+        expect += 1
+        var piece = p.value
+        if p.order == 0 && p.extended {
+            let parts = split_extended(p.value)
+            charset = parts.main
+            piece = http.header(parts.params, "data") ?? ""
+        }
+        if p.extended {
+            for b in percent_decode(piece) {
+                push(mut data, b)
+            }
+        } else {
+            text.append(mut data, piece)
+        }
+    }
+    charset_text(charset, data)
+}
+
+fn resolve(raw: []http.Header) -> []http.Header {
+    var out: []http.Header = []
+    var seen: [str: bool] = [:]
+    for h in raw {
+        let base = piece_of(h).base
+        match seen[base] {
+            some(_) => continue
+            none => {}
+        }
+        seen[base] = true
+        var pieces: []Piece = []
+        for other in raw {
+            let p = piece_of(other)
+            if p.base == base {
+                push(mut pieces, p)
+            }
+        }
+        push(mut out, http.Header { name: base, value: resolved_value(pieces) })
+    }
+    out
+}
+
+fn resolved_value(pieces: []Piece) -> str {
+    for p in pieces {
+        if p.order == -1 {
+            return decode_extended(p.value)
+        }
+    }
+    for p in pieces {
+        if p.order >= 0 {
+            return joined(pieces)
+        }
+    }
+    for p in pieces {
+        if p.order == -2 {
+            return p.value
+        }
+    }
+    ""
+}

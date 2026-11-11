@@ -1,0 +1,663 @@
+import std/json
+import std/json/pointer
+import std/regex
+import std/slices
+import std/text
+
+struct Context {
+    index: [str: Entry]
+    patterns: [str: regex.Regex]
+    assert_formats: bool
+}
+
+struct Frame {
+    base: str
+    ipath: str
+    kpath: str
+    stack: []str
+    scope: []str
+}
+
+struct Outcome {
+    errors: []Violation
+    props: []str
+    items: []bool
+}
+
+fn empty() -> Outcome {
+    Outcome { errors: [], props: [], items: [] }
+}
+
+fn mark_item(mut out: Outcome, i: i64) {
+    for out.items.len <= i {
+        push(mut out.items, false)
+    }
+    out.items[i] = true
+}
+
+fn is_marked(items: []bool, i: i64) -> bool {
+    i < items.len && items[i]
+}
+
+fn merge_errors(mut out: Outcome, branch: Outcome) {
+    for e in branch.errors {
+        push(mut out.errors, e)
+    }
+}
+
+fn merge_marks(mut out: Outcome, branch: Outcome) {
+    for name in branch.props {
+        push(mut out.props, name)
+    }
+    for i, marked in branch.items {
+        if marked {
+            mark_item(mut out, i)
+        }
+    }
+}
+
+fn merge(mut out: Outcome, branch: Outcome) {
+    merge_errors(mut out, branch)
+    merge_marks(mut out, branch)
+}
+
+fn report(mut out: Outcome, f: Frame, keyword: str, message: str) {
+    push(mut out.errors, Violation { instance: f.ipath, keyword: "{f.kpath}/{keyword}", message })
+}
+
+fn relocate(f: Frame, ipath: str, kpath: str) -> Frame {
+    Frame { base: f.base, ipath, kpath, stack: f.stack, scope: f.scope }
+}
+
+fn under_keyword(f: Frame, keyword: str) -> Frame {
+    relocate(f, f.ipath, "{f.kpath}/{keyword}")
+}
+
+fn under_slot(f: Frame, keyword: str, slot: str) -> Frame {
+    relocate(f, f.ipath, "{f.kpath}/{keyword}/{pointer.escape(slot)}")
+}
+
+fn show(v: json.Value) -> str {
+    json.stringify(v, 0)
+}
+
+fn run(c: Context, schema: json.Value, inst: json.Value, f: Frame) -> Outcome {
+    var out = empty()
+    check(c, schema, inst, f, mut out)
+    out
+}
+
+fn child_errors(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let branch = run(c, schema, inst, f)
+    merge_errors(mut out, branch)
+}
+
+fn enter(schema: json.Value, f: Frame) -> Frame {
+    let base = apply_id(schema, f.base)
+    if base == f.base {
+        return f
+    }
+    var scope = slices.clone(f.scope)
+    push(mut scope, base)
+    Frame { base, ipath: f.ipath, kpath: f.kpath, stack: f.stack, scope }
+}
+
+fn check(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    match schema {
+        Bool(allowed) => {
+            if !allowed {
+                push(mut out.errors, Violation { instance: f.ipath, keyword: f.kpath, message: "the schema is false" })
+            }
+        }
+        Object(_) => {
+            let inner = enter(schema, f)
+            check_schema(c, schema, inst, inner, mut out)
+        }
+        _ => {}
+    }
+}
+
+fn has(v: json.Value, name: str) -> bool {
+    match json.get(v, name) {
+        some(_) => true
+        none => false
+    }
+}
+
+fn check_schema(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    follow_reference(c, schema, inst, f, mut out)
+    follow_dynamic(c, schema, inst, f, mut out)
+    check_types(schema, inst, f, mut out)
+    check_enum(schema, inst, f, mut out)
+    check_const(schema, inst, f, mut out)
+    match inst {
+        Int(_) => check_number(schema, inst, f, mut out)
+        Float(_) => check_number(schema, inst, f, mut out)
+        Str(s) => check_string(c, schema, s, f, mut out)
+        Array(items) => check_array(c, schema, items, f, mut out)
+        Object(members) => check_object(c, schema, inst, members, f, mut out)
+        _ => {}
+    }
+    check_combinators(c, schema, inst, f, mut out)
+    check_unevaluated(c, schema, inst, f, mut out)
+}
+
+fn follow(c: Context, target: Entry, uri: str, keyword: str, inst: json.Value, f: Frame, mut out: Outcome) {
+    let key = "{uri}@{f.ipath}"
+    if slices.contains(f.stack, key) {
+        report(mut out, f, keyword, "reference cycle through {uri}")
+        return
+    }
+    var stack = slices.clone(f.stack)
+    push(mut stack, key)
+    var scope = f.scope
+    let resource = apply_id(target.schema, target.base)
+    if scope.len == 0 || scope[scope.len - 1] != resource {
+        scope = slices.clone(scope)
+        push(mut scope, resource)
+    }
+    let into = Frame { base: target.base, ipath: f.ipath, kpath: "{f.kpath}/{keyword}", stack, scope }
+    check(c, target.schema, inst, into, mut out)
+}
+
+fn follow_reference(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let v = json.get(schema, "$ref") ?? return
+    let reference = text_of(v) ?? return
+    let uri = resolve(f.base, reference)
+    let target = lookup(c.index, uri) ?? return
+    follow(c, target, uri, "$ref", inst, f, mut out)
+}
+
+fn dynamic_name(entry: Entry) -> str? {
+    let v = json.get(entry.schema, "$dynamicAnchor") ?? return none
+    text_of(v)
+}
+
+fn follow_dynamic(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let v = json.get(schema, "$dynamicRef") ?? return
+    let reference = text_of(v) ?? return
+    var uri = resolve(f.base, reference)
+    var target = lookup(c.index, uri) ?? return
+    let name = dynamic_name(target) ?? ""
+    let wanted = text.cut(uri, "#").after
+    if name.len > 0 && name == wanted {
+        for resource in f.scope {
+            let candidate = "{resource}#{name}"
+            let found = c.index[candidate] ?? continue
+            if dynamic_name(found) == name {
+                uri = candidate
+                target = found
+                break
+            }
+        }
+    }
+    follow(c, target, uri, "$dynamicRef", inst, f, mut out)
+}
+
+fn kind_name(v: json.Value) -> str {
+    match v {
+        Null => "null"
+        Bool(_) => "boolean"
+        Int(_) => "integer"
+        Float(_) => "number"
+        Str(_) => "string"
+        Array(_) => "array"
+        Object(_) => "object"
+    }
+}
+
+fn integral(v: json.Value) -> bool {
+    match v {
+        Int(_) => true
+        Float(x) => x == floor(x) && x - x == 0.0
+        _ => false
+    }
+}
+
+fn type_matches(name: str, v: json.Value) -> bool {
+    match v {
+        Null => name == "null"
+        Bool(_) => name == "boolean"
+        Str(_) => name == "string"
+        Array(_) => name == "array"
+        Object(_) => name == "object"
+        Int(_) => name == "number" || name == "integer"
+        Float(_) => name == "number" || (name == "integer" && integral(v))
+    }
+}
+
+fn check_types(schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let declared = json.get(schema, "type") ?? return
+    var names: []str = []
+    match declared {
+        Str(name) => push(mut names, name)
+        Array(items) => {
+            for item in items {
+                push(mut names, text_of(item) ?? "")
+            }
+        }
+        _ => {}
+    }
+    for name in names {
+        if type_matches(name, inst) {
+            return
+        }
+    }
+    let expected = text.join(names, " or ")
+    report(mut out, f, "type", "expected {expected}, got {kind_name(inst)}")
+}
+
+fn check_enum(schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let declared = json.get(schema, "enum") ?? return
+    for option in items_of(declared) {
+        if json.equal(option, inst) {
+            return
+        }
+    }
+    report(mut out, f, "enum", "{show(inst)} is not one of the allowed values")
+}
+
+fn check_const(schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let expected = json.get(schema, "const") ?? return
+    if !json.equal(expected, inst) {
+        report(mut out, f, "const", "{show(inst)} does not equal {show(expected)}")
+    }
+}
+
+fn as_float(v: json.Value) -> f64 {
+    match v {
+        Int(n) => f64(n)
+        Float(x) => x
+        _ => 0.0
+    }
+}
+
+fn order(a: json.Value, b: json.Value) -> i64 {
+    match a {
+        Int(x) => match b {
+            Int(y) => return if x < y { -1 } else if x > y { 1 } else { 0 }
+            _ => {}
+        }
+        _ => {}
+    }
+    let x = as_float(a)
+    let y = as_float(b)
+    if x < y { -1 } else if x > y { 1 } else { 0 }
+}
+
+fn is_less(c: i64) -> bool {
+    c < 0
+}
+
+fn is_greater(c: i64) -> bool {
+    c > 0
+}
+
+fn is_not_less(c: i64) -> bool {
+    c >= 0
+}
+
+fn is_not_greater(c: i64) -> bool {
+    c <= 0
+}
+
+fn check_bound(schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome, keyword: str, violated: fn(i64) -> bool, phrase: str) {
+    let bound = json.get(schema, keyword) ?? return
+    if violated(order(inst, bound)) {
+        report(mut out, f, keyword, "{show(inst)} is {phrase} {show(bound)}")
+    }
+}
+
+fn multiple_of(inst: json.Value, divisor: json.Value) -> bool {
+    match inst {
+        Int(a) => match divisor {
+            Int(d) => return a % d == 0
+            _ => {}
+        }
+        _ => {}
+    }
+    let q = as_float(inst) / as_float(divisor)
+    if q - q != 0.0 {
+        return false
+    }
+    let nearest = floor(q + 0.5)
+    var gap = q - nearest
+    if gap < 0.0 {
+        gap = -gap
+    }
+    var scale = q
+    if scale < 0.0 {
+        scale = -scale
+    }
+    gap <= 1e-9 * (1.0 + scale)
+}
+
+fn check_number(schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    check_bound(schema, inst, f, mut out, "minimum", is_less, "less than the minimum")
+    check_bound(schema, inst, f, mut out, "maximum", is_greater, "greater than the maximum")
+    check_bound(schema, inst, f, mut out, "exclusiveMinimum", is_not_greater, "not greater than the exclusive minimum")
+    check_bound(schema, inst, f, mut out, "exclusiveMaximum", is_not_less, "not less than the exclusive maximum")
+    let divisor = json.get(schema, "multipleOf") ?? return
+    if !multiple_of(inst, divisor) {
+        report(mut out, f, "multipleOf", "{show(inst)} is not a multiple of {show(divisor)}")
+    }
+}
+
+fn count_of(v: json.Value) -> i64 {
+    match v {
+        Int(n) => n
+        Float(x) => i64(x)
+        _ => 0
+    }
+}
+
+fn check_size(schema: json.Value, f: Frame, mut out: Outcome, keyword: str, noun: str, actual: i64, minimum: bool) {
+    let limit = json.get(schema, keyword) ?? return
+    let bound = count_of(limit)
+    if minimum && actual < bound {
+        report(mut out, f, keyword, "{noun} {actual} is less than {keyword} {bound}")
+    } else if !minimum && actual > bound {
+        report(mut out, f, keyword, "{noun} {actual} is greater than {keyword} {bound}")
+    }
+}
+
+fn matches_pattern(c: Context, pattern: str, s: str) -> bool {
+    let re = c.patterns[pattern] ?? return false
+    regex.is_match(re, s)
+}
+
+fn check_string(c: Context, schema: json.Value, s: str, f: Frame, mut out: Outcome) {
+    if has(schema, "minLength") || has(schema, "maxLength") {
+        let length = text.char_count(s)
+        check_size(schema, f, mut out, "minLength", "length", length, true)
+        check_size(schema, f, mut out, "maxLength", "length", length, false)
+    }
+    match json.get(schema, "pattern") {
+        some(p) => {
+            let source = text_of(p) ?? return
+            if !matches_pattern(c, source, s) {
+                report(mut out, f, "pattern", "{show(json.Value.Str(s))} does not match the pattern {source}")
+            }
+        }
+        none => {}
+    }
+    if !c.assert_formats {
+        return
+    }
+    let declared = json.get(schema, "format") ?? return
+    let name = text_of(declared) ?? return
+    if !valid_format(name, s) {
+        report(mut out, f, "format", "{show(json.Value.Str(s))} is not a valid {name}")
+    }
+}
+
+fn check_array(c: Context, schema: json.Value, items: []json.Value, f: Frame, mut out: Outcome) {
+    let prefix = items_of(json.get(schema, "prefixItems") ?? json.Value.Null)
+    for i in 0..prefix.len {
+        if i >= items.len {
+            break
+        }
+        let into = relocate(f, "{f.ipath}/{i}", "{f.kpath}/prefixItems/{i}")
+        child_errors(c, prefix[i], items[i], into, mut out)
+        mark_item(mut out, i)
+    }
+    match json.get(schema, "items") {
+        some(rest) => {
+            for i in prefix.len..items.len {
+                let into = relocate(f, "{f.ipath}/{i}", "{f.kpath}/items")
+                child_errors(c, rest, items[i], into, mut out)
+                mark_item(mut out, i)
+            }
+        }
+        none => {}
+    }
+    check_contains(c, schema, items, f, mut out)
+    check_size(schema, f, mut out, "minItems", "item count", items.len, true)
+    check_size(schema, f, mut out, "maxItems", "item count", items.len, false)
+    check_unique(schema, items, f, mut out)
+}
+
+fn check_contains(c: Context, schema: json.Value, items: []json.Value, f: Frame, mut out: Outcome) {
+    let sub = json.get(schema, "contains") ?? return
+    var matched = 0
+    for i, item in items {
+        let into = relocate(f, "{f.ipath}/{i}", "{f.kpath}/contains")
+        let branch = run(c, sub, item, into)
+        if branch.errors.len == 0 {
+            matched += 1
+            mark_item(mut out, i)
+        }
+    }
+    var least = 1
+    match json.get(schema, "minContains") {
+        some(v) => {
+            least = count_of(v)
+        }
+        none => {}
+    }
+    if matched < least {
+        if matched == 0 && least == 1 {
+            report(mut out, f, "contains", "no item matches the contains schema")
+        } else {
+            report(mut out, f, "minContains", "{matched} items match the contains schema, at least {least} required")
+        }
+    }
+    let most = json.get(schema, "maxContains") ?? return
+    if matched > count_of(most) {
+        report(mut out, f, "maxContains", "{matched} items match the contains schema, at most {count_of(most)} allowed")
+    }
+}
+
+fn check_unique(schema: json.Value, items: []json.Value, f: Frame, mut out: Outcome) {
+    let flag = json.get(schema, "uniqueItems") ?? return
+    match flag {
+        Bool(enabled) => {
+            if !enabled {
+                return
+            }
+        }
+        _ => return
+    }
+    for i in 1..items.len {
+        for j in 0..i {
+            if json.equal(items[i], items[j]) {
+                report(mut out, f, "uniqueItems", "items {j} and {i} are equal")
+                return
+            }
+        }
+    }
+}
+
+fn check_object(c: Context, schema: json.Value, inst: json.Value, members: []json.Member, f: Frame, mut out: Outcome) {
+    let declared = members_of(json.get(schema, "properties") ?? json.Value.Null)
+    let patterned = members_of(json.get(schema, "patternProperties") ?? json.Value.Null)
+    for p in declared {
+        let value = json.get(inst, p.name) ?? continue
+        let into = relocate(f, "{f.ipath}/{pointer.escape(p.name)}", "{f.kpath}/properties/{pointer.escape(p.name)}")
+        child_errors(c, p.value, value, into, mut out)
+        push(mut out.props, p.name)
+    }
+    for p in patterned {
+        for m in members {
+            if matches_pattern(c, p.name, m.name) {
+                let into = relocate(f, "{f.ipath}/{pointer.escape(m.name)}", "{f.kpath}/patternProperties/{pointer.escape(p.name)}")
+                child_errors(c, p.value, m.value, into, mut out)
+                push(mut out.props, m.name)
+            }
+        }
+    }
+    check_additional(c, schema, members, declared, patterned, f, mut out)
+    check_required(schema, inst, f, mut out)
+    check_property_names(c, schema, members, f, mut out)
+    check_size(schema, f, mut out, "minProperties", "property count", members.len, true)
+    check_size(schema, f, mut out, "maxProperties", "property count", members.len, false)
+    check_dependent(c, schema, inst, f, mut out)
+}
+
+fn declared_name(declared: []json.Member, name: str) -> bool {
+    for p in declared {
+        if p.name == name {
+            return true
+        }
+    }
+    false
+}
+
+fn pattern_covers(c: Context, patterned: []json.Member, name: str) -> bool {
+    for p in patterned {
+        if matches_pattern(c, p.name, name) {
+            return true
+        }
+    }
+    false
+}
+
+fn check_additional(c: Context, schema: json.Value, members: []json.Member, declared: []json.Member, patterned: []json.Member, f: Frame, mut out: Outcome) {
+    let rest = json.get(schema, "additionalProperties") ?? return
+    for m in members {
+        if declared_name(declared, m.name) || pattern_covers(c, patterned, m.name) {
+            continue
+        }
+        let into = relocate(f, "{f.ipath}/{pointer.escape(m.name)}", "{f.kpath}/additionalProperties")
+        child_errors(c, rest, m.value, into, mut out)
+        push(mut out.props, m.name)
+    }
+}
+
+fn check_required(schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let declared = json.get(schema, "required") ?? return
+    for item in items_of(declared) {
+        let name = text_of(item) ?? continue
+        if !has(inst, name) {
+            report(mut out, f, "required", "missing required property {name}")
+        }
+    }
+}
+
+fn check_property_names(c: Context, schema: json.Value, members: []json.Member, f: Frame, mut out: Outcome) {
+    let sub = json.get(schema, "propertyNames") ?? return
+    for m in members {
+        let into = relocate(f, "{f.ipath}/{pointer.escape(m.name)}", "{f.kpath}/propertyNames")
+        child_errors(c, sub, json.Value.Str(m.name), into, mut out)
+    }
+}
+
+fn check_dependent(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    for m in members_of(json.get(schema, "dependentRequired") ?? json.Value.Null) {
+        if !has(inst, m.name) {
+            continue
+        }
+        for item in items_of(m.value) {
+            let name = text_of(item) ?? continue
+            if !has(inst, name) {
+                report(mut out, f, "dependentRequired", "property {m.name} requires property {name}")
+            }
+        }
+    }
+    for m in members_of(json.get(schema, "dependentSchemas") ?? json.Value.Null) {
+        if !has(inst, m.name) {
+            continue
+        }
+        let branch = run(c, m.value, inst, under_slot(f, "dependentSchemas", m.name))
+        merge(mut out, branch)
+    }
+}
+
+fn check_combinators(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    for i, sub in items_of(json.get(schema, "allOf") ?? json.Value.Null) {
+        let branch = run(c, sub, inst, under_slot(f, "allOf", "{i}"))
+        merge(mut out, branch)
+    }
+    check_any(c, schema, inst, f, mut out)
+    check_one(c, schema, inst, f, mut out)
+    check_not(c, schema, inst, f, mut out)
+    check_conditional(c, schema, inst, f, mut out)
+}
+
+fn check_any(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let subs = items_of(json.get(schema, "anyOf") ?? json.Value.Null)
+    if subs.len == 0 {
+        return
+    }
+    var matched = 0
+    for i, sub in subs {
+        let branch = run(c, sub, inst, under_slot(f, "anyOf", "{i}"))
+        if branch.errors.len == 0 {
+            matched += 1
+            merge_marks(mut out, branch)
+        }
+    }
+    if matched == 0 {
+        report(mut out, f, "anyOf", "the value matches none of the {subs.len} schemas")
+    }
+}
+
+fn check_one(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let subs = items_of(json.get(schema, "oneOf") ?? json.Value.Null)
+    if subs.len == 0 {
+        return
+    }
+    var matched = 0
+    for i, sub in subs {
+        let branch = run(c, sub, inst, under_slot(f, "oneOf", "{i}"))
+        if branch.errors.len == 0 {
+            matched += 1
+            merge_marks(mut out, branch)
+        }
+    }
+    if matched != 1 {
+        report(mut out, f, "oneOf", "the value matches {matched} of the {subs.len} schemas, exactly one required")
+    }
+}
+
+fn check_not(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let sub = json.get(schema, "not") ?? return
+    let branch = run(c, sub, inst, under_keyword(f, "not"))
+    if branch.errors.len == 0 {
+        report(mut out, f, "not", "the value matches a schema it must not match")
+    }
+}
+
+fn check_conditional(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    let condition = json.get(schema, "if") ?? return
+    let tested = run(c, condition, inst, under_keyword(f, "if"))
+    if tested.errors.len == 0 {
+        merge_marks(mut out, tested)
+        let then_branch = json.get(schema, "then") ?? return
+        let branch = run(c, then_branch, inst, under_keyword(f, "then"))
+        merge(mut out, branch)
+        return
+    }
+    let else_branch = json.get(schema, "else") ?? return
+    let branch = run(c, else_branch, inst, under_keyword(f, "else"))
+    merge(mut out, branch)
+}
+
+fn check_unevaluated(c: Context, schema: json.Value, inst: json.Value, f: Frame, mut out: Outcome) {
+    match inst {
+        Array(items) => {
+            let sub = json.get(schema, "unevaluatedItems") ?? return
+            for i in 0..items.len {
+                if is_marked(out.items, i) {
+                    continue
+                }
+                let into = relocate(f, "{f.ipath}/{i}", "{f.kpath}/unevaluatedItems")
+                child_errors(c, sub, items[i], into, mut out)
+                mark_item(mut out, i)
+            }
+        }
+        Object(members) => {
+            let sub = json.get(schema, "unevaluatedProperties") ?? return
+            let seen = slices.clone(out.props)
+            for m in members {
+                if slices.contains(seen, m.name) {
+                    continue
+                }
+                let into = relocate(f, "{f.ipath}/{pointer.escape(m.name)}", "{f.kpath}/unevaluatedProperties")
+                child_errors(c, sub, m.value, into, mut out)
+                push(mut out.props, m.name)
+            }
+        }
+        _ => {}
+    }
+}

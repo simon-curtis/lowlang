@@ -1,0 +1,631 @@
+import std/archive
+import std/archive/cpio
+import std/file
+import std/hash
+import std/io
+import std/slices
+import std/text
+
+fn error_name(e: io.Error) -> str {
+    match e {
+        Malformed => "Malformed"
+        TooLarge => "TooLarge"
+        Eof => "Eof"
+        Denied => "Denied"
+        Unsupported => "Unsupported"
+        Invalid => "Invalid"
+        NotFound => "NotFound"
+        NotDir => "NotDir"
+        IsDir => "IsDir"
+        Exists => "Exists"
+        _ => "other"
+    }
+}
+
+fn kind_name(k: cpio.Kind) -> str {
+    match k {
+        File => "file"
+        Dir => "dir"
+        Symlink => "symlink"
+        Char => "char"
+        Block => "block"
+        Fifo => "fifo"
+        Socket => "socket"
+    }
+}
+
+fn format_name(f: cpio.Format) -> str {
+    match f {
+        Newc => "newc"
+        Crc => "crc"
+        Odc => "odc"
+    }
+}
+
+fn noise(n: i64, start: u64) -> []u8 {
+    let out = io.buffer(n)
+    var seed = start
+    for i in 0..n {
+        seed = seed * 6364136223846793005 + 1442695040888963407
+        out[i] = u8(seed >> 56)
+    }
+    out
+}
+
+fn joined(parts: [][]u8) -> []u8 {
+    var out: []u8 = []
+    for p in parts {
+        io.append(mut out, p)
+    }
+    out
+}
+
+fn same(a: []u8, b: []u8) -> bool {
+    a.len == b.len && hash.crc32(a) == hash.crc32(b)
+}
+
+fn body_text(body: []u8) -> str {
+    if body.len <= 24 {
+        return "{body.len}:{text.trim(str(body))}"
+    }
+    "{body.len}:{hash.crc32(body)}"
+}
+
+fn walk(label: str, r: *cpio.Reader) {
+    for {
+        let next = cpio.next(r) catch {
+            e => {
+                print("{label}: next {error_name(e)}")
+                return
+            }
+        }
+        let e = next ?? {
+            print("{label}: end")
+            return
+        }
+        let body = cpio.read_entry(r) catch {
+            err => {
+                print("{label}: {e.name} body {error_name(err)}")
+                return
+            }
+        }
+        print("{label}: {e.name} {kind_name(e.kind)} size={e.size} mode={text.radix(e.mode, 8)} uid={e.uid} gid={e.gid} mtime={e.mtime} nlink={e.nlink} ino={e.ino} dev={e.dev_major}:{e.dev_minor} rdev={e.rdev_major}:{e.rdev_minor} link={e.link} body={body_text(body)}")
+    }
+}
+
+fn walk_data(label: str, data: []u8) {
+    walk(label, cpio.bytes_reader(data))
+}
+
+fn rewrite(data: []u8, format: cpio.Format) -> []u8 ! io.Error {
+    let r = cpio.bytes_reader(data)
+    let w = cpio.writer(format)
+    for {
+        let e = cpio.next(r)? ?? break
+        let body = cpio.read_entry(r)?
+        cpio.add(w, e, body)?
+    }
+    cpio.finish(w)?
+    cpio.output(w)
+}
+
+fn reference(label: str, format: cpio.Format, data: []u8) ! io.Error {
+    walk_data(label, data)
+    let again = rewrite(data, format)?
+    print("{label} rewrite {same(again, data)} {data.len} {data.len % 512}")
+}
+
+fn references() ! io.Error {
+    reference("newc", cpio.Format.Newc, bytes(embed("ref.newc")))?
+    reference("crc", cpio.Format.Crc, bytes(embed("ref.crc")))?
+    reference("odc", cpio.Format.Odc, bytes(embed("ref.odc")))?
+}
+
+fn hex(v: i64) -> str {
+    text.pad_left(text.radix(v, 16), 8, '0')
+}
+
+fn oct(v: i64, width: i64) -> str {
+    text.pad_left(text.radix(v, 8), width, '0')
+}
+
+fn align(mut out: []u8) {
+    for out.len % 4 != 0 {
+        push(mut out, 0)
+    }
+}
+
+fn newc_raw(magic: str, ino: i64, mode: i64, nlink: i64, name: str, body: []u8, size: i64, check: i64) -> []u8 {
+    var out: []u8 = []
+    io.append_str(mut out, magic)
+    for v in [ino, mode, 0, 0, nlink, 0, size, 0, 0, 0, 0, name.len + 1, check] {
+        io.append_str(mut out, hex(v))
+    }
+    io.append_str(mut out, name)
+    push(mut out, 0)
+    align(mut out)
+    io.append(mut out, body)
+    align(mut out)
+    out
+}
+
+fn forge(name: str, mode: i64, body: str) -> []u8 {
+    newc_raw("070701", 7, mode, 1, name, bytes(body), body.len, 0)
+}
+
+fn file_entry(name: str, body: str) -> []u8 {
+    forge(name, 0o100644, body)
+}
+
+fn link_entry(name: str, target: str) -> []u8 {
+    forge(name, 0o120777, target)
+}
+
+fn dir_entry(name: str) -> []u8 {
+    forge(name, 0o040755, "")
+}
+
+fn linked(ino: i64, nlink: i64, name: str, body: str) -> []u8 {
+    newc_raw("070701", ino, 0o100644, nlink, name, bytes(body), body.len, 0)
+}
+
+fn odc_entry(ino: i64, mode: i64, nlink: i64, name: str, body: str) -> []u8 {
+    var out: []u8 = []
+    io.append_str(mut out, "070707")
+    io.append_str(mut out, oct(0, 6))
+    io.append_str(mut out, oct(ino, 6))
+    io.append_str(mut out, oct(mode, 6))
+    io.append_str(mut out, oct(0, 6))
+    io.append_str(mut out, oct(0, 6))
+    io.append_str(mut out, oct(nlink, 6))
+    io.append_str(mut out, oct(0, 6))
+    io.append_str(mut out, oct(0, 11))
+    io.append_str(mut out, oct(name.len + 1, 6))
+    io.append_str(mut out, oct(body.len, 11))
+    io.append_str(mut out, name)
+    push(mut out, 0)
+    io.append_str(mut out, body)
+    out
+}
+
+fn ending() -> []u8 {
+    newc_raw("070701", 0, 0, 1, "TRAILER!!!", [], 0, 0)
+}
+
+fn archive_of(parts: [][]u8) -> []u8 {
+    joined([joined(parts), ending()])
+}
+
+fn forged() {
+    walk_data("forged", archive_of([file_entry("a", "alpha"), dir_entry("d"), file_entry("d/b", "bravo!"), link_entry("l", "d/b")]))
+    walk_data("empty input", [])
+    walk_data("trailer only", ending())
+    walk_data("bad magic", bytes("07070X00000000"))
+    walk_data("binary magic", [0xC7, 0x71, 0, 0, 0, 0, 0, 0])
+    walk_data("short magic", bytes("0707"))
+    walk_data("short header", joined([bytes("070701"), bytes("00000001")]))
+    let good = file_entry("a", "alpha")
+    var bad_digit = joined([good])
+    bad_digit[10] = 'G'
+    walk_data("bad digit", joined([bad_digit, ending()]))
+    var lower = joined([good])
+    lower[8] = 'a'
+    walk_data("accepts lower case hex", joined([lower, ending()]))
+    walk_data("missing trailer", good)
+    walk_data("truncated body", newc_raw("070701", 1, 0o100644, 1, "t", bytes("ab"), 50, 0))
+    walk_data("truncated name", good[..111])
+    walk_data("zero name size", archive_of([forge("", 0o100644, "x")]))
+    var unterminated = joined([good])
+    unterminated[111] = 'z'
+    walk_data("unterminated name", joined([unterminated, ending()]))
+    walk_data("unknown type", archive_of([forge("w", 0o030644, "")]))
+    walk_data("socket and block", archive_of([forge("s", 0o140755, ""), forge("b", 0o060600, "")]))
+    walk_data("crc ok", archive_of([newc_raw("070702", 1, 0o100644, 1, "c", bytes("abc"), 3, 294)]))
+    walk_data("crc wrong", archive_of([newc_raw("070702", 1, 0o100644, 1, "c", bytes("abc"), 3, 295)]))
+    walk_data("crc on newc ignored", archive_of([newc_raw("070701", 1, 0o100644, 1, "c", bytes("abc"), 3, 295)]))
+    walk_data("crc empty file", archive_of([newc_raw("070702", 1, 0o100644, 1, "c", [], 0, 0)]))
+    walk_data("odc", joined([odc_entry(5, 0o100600, 1, "o", "octal"), odc_entry(6, 0o040700, 2, "od", ""), odc_entry(0, 0, 1, "TRAILER!!!", "")]))
+    var odc_bad = odc_entry(5, 0o100600, 1, "o", "octal")
+    odc_bad[7] = '8'
+    walk_data("odc bad digit", joined([odc_bad, odc_entry(0, 0, 1, "TRAILER!!!", "")]))
+    walk_data("mixed formats", joined([file_entry("n", "newc"), odc_entry(5, 0o100600, 1, "o", "odc"), newc_raw("070702", 1, 0o100644, 1, "c", bytes("abc"), 3, 294), ending()]))
+    walk_data("after trailer", joined([ending(), file_entry("hidden", "no")]))
+}
+
+fn limits() {
+    let big = archive_of([file_entry("big", text.repeat("y", 5000))])
+    walk("entry limit", cpio.reader_with(io.bytes_reader(big), cpio.Limits { entry: 4096 }))
+    walk("entry at limit", cpio.reader_with(io.bytes_reader(big), cpio.Limits { entry: 5000 }))
+    let two = archive_of([file_entry("a", text.repeat("a", 3000)), file_entry("b", text.repeat("b", 3000))])
+    walk("total limit", cpio.reader_with(io.bytes_reader(two), cpio.Limits { total: 5000 }))
+    let longer = archive_of([file_entry(text.repeat("n", 100), "x")])
+    walk("name limit", cpio.reader_with(io.bytes_reader(longer), cpio.Limits { name: 50 }))
+    walk("name at limit", cpio.reader_with(io.bytes_reader(longer), cpio.Limits { name: 101 }))
+    let bomb = newc_raw("070701", 1, 0o100644, 1, "bomb", [], 0x7FFFFFFF, 0)
+    walk_data("huge size", bomb)
+    walk("huge size limited", cpio.reader_with(io.bytes_reader(bomb), cpio.Limits { entry: 1 << 20 }))
+    let target = archive_of([link_entry("l", text.repeat("t", 200))])
+    walk("symlink target limit", cpio.reader_with(io.bytes_reader(target), cpio.Limits { name: 100 }))
+}
+
+fn describe(w: *cpio.Writer) {
+    let data = cpio.output(w)
+    print("size {data.len} rem {data.len % 512} crc {hash.crc32(data)}")
+    walk_data("written", data)
+}
+
+fn writer_layout() ! io.Error {
+    let a = cpio.writer(cpio.Format.Newc)
+    cpio.add_file(a, "a.txt", bytes("hi"), 0o644)?
+    cpio.finish(a)?
+    let data = cpio.output(a)
+    print(str(data[..110]))
+    print("name {str(data[110..115])} nul {data[115]} body {str(data[116..118])} pad {data[118]} {data[119]} trailer {str(data[120..126])}")
+    describe(a)
+    cpio.finish(a)?
+    print("finish twice {cpio.output(a).len}")
+
+    let c = cpio.writer(cpio.Format.Crc)
+    cpio.add_file(c, "sum", bytes("abc"), 0o600)?
+    cpio.add_dir(c, "dir", 0o755)?
+    cpio.add_symlink(c, "dir/ln", "../sum")?
+    cpio.finish(c)?
+    let cdata = cpio.output(c)
+    print(str(cdata[..110]))
+    describe(c)
+
+    let o = cpio.writer(cpio.Format.Odc)
+    cpio.add_file(o, "o.txt", bytes("odd"), 0o640)?
+    cpio.finish(o)?
+    print(str(cpio.output(o)[..76]))
+    describe(o)
+}
+
+fn writer_fields() ! io.Error {
+    let w = cpio.writer(cpio.Format.Newc)
+    cpio.add(w, cpio.Entry { name: "f", mode: 0o4755, uid: 1000, gid: 100, mtime: 1700000000, ino: 77, dev_major: 8, dev_minor: 1 }, bytes("data"))?
+    cpio.add(w, cpio.Entry { name: "tty", kind: Char, mode: 0o620, rdev_major: 4, rdev_minor: 64 }, [])?
+    cpio.add(w, cpio.Entry { name: "disk", kind: Block, mode: 0o660, rdev_major: 8, rdev_minor: 0 }, [])?
+    cpio.add(w, cpio.Entry { name: "pipe", kind: Fifo, mode: 0o600 }, [])?
+    cpio.add(w, cpio.Entry { name: "sock", kind: Socket, mode: 0o600 }, [])?
+    cpio.add(w, cpio.Entry { name: "d", kind: Dir, mode: 0o750, nlink: 2 }, [])?
+    cpio.add(w, cpio.Entry { name: "huge", mtime: 4000000000, uid: 4000000000 }, bytes("x"))?
+    cpio.finish(w)?
+    describe(w)
+
+    let o = cpio.writer(cpio.Format.Odc)
+    cpio.add(o, cpio.Entry { name: "f", mode: 0o755, uid: 1000, gid: 100, mtime: 1700000000, ino: 77, dev_major: 8, dev_minor: 1 }, bytes("data"))?
+    cpio.add(o, cpio.Entry { name: "tty", kind: Char, mode: 0o620, rdev_major: 4, rdev_minor: 64 }, [])?
+    cpio.finish(o)?
+    describe(o)
+}
+
+fn rejected(label: str, f: fn() ! io.Error) {
+    f() catch {
+        e => {
+            print("{label}: {error_name(e)}")
+            return
+        }
+    }
+    print("{label}: accepted")
+}
+
+fn writer_errors() {
+    rejected("empty name", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Newc)
+        cpio.add_file(w, "", [], 0o644)?
+    })
+    rejected("trailer name", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Newc)
+        cpio.add_file(w, "TRAILER!!!", [], 0o644)?
+    })
+    rejected("nul in name", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Newc)
+        cpio.add_file(w, "a\0b", [], 0o644)?
+    })
+    rejected("add after finish", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Newc)
+        cpio.finish(w)?
+        cpio.add_file(w, "late", [], 0o644)?
+    })
+    rejected("odc uid too large", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Odc)
+        cpio.add(w, cpio.Entry { name: "u", uid: 262144 }, [])?
+    })
+    rejected("odc uid fits", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Odc)
+        cpio.add(w, cpio.Entry { name: "u", uid: 262143 }, [])?
+    })
+    rejected("odc mtime too large", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Odc)
+        cpio.add(w, cpio.Entry { name: "u", mtime: 8589934592 }, [])?
+    })
+    rejected("newc uid too large", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Newc)
+        cpio.add(w, cpio.Entry { name: "u", uid: 4294967296 }, [])?
+    })
+    rejected("negative mtime", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Newc)
+        cpio.add(w, cpio.Entry { name: "u", mtime: -1 }, [])?
+    })
+    rejected("links of a directory", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Newc)
+        cpio.add_links(w, cpio.Entry { name: "d", kind: Dir }, ["a", "b"], [])?
+    })
+    rejected("no link names", fn() ! io.Error {
+        let w = cpio.writer(cpio.Format.Newc)
+        cpio.add_links(w, cpio.Entry { name: "d" }, [], [])?
+    })
+}
+
+fn hard_links() ! io.Error {
+    let n = cpio.writer(cpio.Format.Newc)
+    cpio.add_links(n, cpio.Entry { name: "x", mode: 0o644 }, ["one", "two", "three"], bytes("shared"))?
+    cpio.add_file(n, "solo", bytes("alone"), 0o644)?
+    cpio.finish(n)?
+    walk_data("links newc", cpio.output(n))
+
+    let o = cpio.writer(cpio.Format.Odc)
+    cpio.add_links(o, cpio.Entry { name: "x", mode: 0o644 }, ["one", "two", "three"], bytes("shared"))?
+    cpio.finish(o)?
+    walk_data("links odc", cpio.output(o))
+
+    let c = cpio.writer(cpio.Format.Crc)
+    cpio.add_links(c, cpio.Entry { name: "x", mode: 0o644 }, ["p", "q"], bytes("abc"))?
+    cpio.finish(c)?
+    walk_data("links crc", cpio.output(c))
+}
+
+fn tree(root: str) -> str {
+    let names = file.list(root) catch {
+        _ => []
+    }
+    var sorted = names
+    sorted |> slices.sort()
+    text.join(sorted, ",")
+}
+
+fn inode(path: str) -> i64 {
+    let info = file.lstat(path) catch {
+        _ => return -1
+    }
+    info.inode
+}
+
+fn extract_reference(root: str) ! io.Error {
+    let formats: [str: []u8] = ["newc": bytes(embed("ref.newc")), "crc": bytes(embed("ref.crc")), "odc": bytes(embed("ref.odc"))]
+    for label, data in formats {
+        let dir = "{root}/ref-{label}"
+        cpio.extract(data, dir)?
+        print("{label} tree {tree("{dir}/d")} / {tree("{dir}/d/sub")}")
+        print("{label} contents {text.trim(file.read_text("{dir}/d/hello.txt")?)} {text.trim(file.read_text("{dir}/d/alink")?)} {text.trim(file.read_text("{dir}/d/clink")?)} {text.trim(file.read_text("{dir}/d/sub/deep.txt")?)}")
+        let data_bin = file.read_file("{dir}/d/data.bin")?
+        print("{label} data.bin {data_bin.len} {hash.crc32(data_bin)}")
+        print("{label} link {archive.read_link("{dir}/d/ln")?} {text.trim(file.read_text("{dir}/d/ln")?)}")
+        let a = inode("{dir}/d/alink")
+        print("{label} hard links {a == inode("{dir}/d/blink")} {a == inode("{dir}/d/clink")} {a == inode("{dir}/d/hello.txt")}")
+        let st = archive.lstat("{dir}/d/hello.txt")?
+        print("{label} stat {text.radix(st.mode & 0o777, 8)} {st.mtime} {st.size}")
+        let dst = archive.lstat("{dir}/d")?
+        print("{label} dir {text.radix(dst.mode & 0o777, 8)} {dst.mtime}")
+        let empty = archive.lstat("{dir}/d/empty")?
+        print("{label} empty {empty.size}")
+    }
+}
+
+fn attempt(root: str, label: str, data: []u8) {
+    let dir = "{root}/{label}"
+    cpio.extract(data, dir) catch {
+        e => {
+            print("{label}: {error_name(e)}")
+            return
+        }
+    }
+    print("{label}: extracted {tree(dir)}")
+}
+
+fn hostile(root: str) ! io.Error {
+    let outside = "{root}/outside"
+    file.mkdir(outside)?
+    attempt(root, "absolute", archive_of([file_entry("{root}/abs.txt", "x")]))
+    attempt(root, "dotdot", archive_of([file_entry("../escape.txt", "x")]))
+    attempt(root, "nested dotdot", archive_of([file_entry("a/../../escape2.txt", "x")]))
+    attempt(root, "bare dotdot", archive_of([dir_entry("..")]))
+    attempt(root, "symlink escape", archive_of([link_entry("jump", outside), file_entry("jump/planted.txt", "x")]))
+    attempt(root, "relative escape", archive_of([link_entry("up", ".."), file_entry("up/planted2.txt", "x")]))
+    attempt(root, "dir escape", archive_of([link_entry("dl", outside), dir_entry("dl/sub")]))
+    attempt(root, "link name escape", archive_of([linked(5, 2, "../h", ""), linked(5, 2, "ok", "data")]))
+    attempt(root, "link through symlink", archive_of([link_entry("l", outside), linked(5, 2, "l/h", ""), linked(5, 2, "ok", "data")]))
+    attempt(root, "dot name", archive_of([file_entry(".", "x")]))
+    print("outside {tree(outside)}")
+    print("root {file.exists("{root}/escape.txt")} {file.exists("{root}/escape2.txt")} {file.exists("{root}/abs.txt")}")
+
+    let replace = "{root}/replace link"
+    attempt(root, "replace link", archive_of([file_entry("swap", "first"), link_entry("swap", "{root}/outside/swap"), file_entry("keep", "kept")]))
+    print("replace link {file.exists("{outside}/swap")} {tree(replace)}")
+
+    let existing = "{root}/existing"
+    file.mkdir(existing)?
+    file.symlink(outside, "{existing}/jump")?
+    cpio.extract(archive_of([file_entry("jump/planted.txt", "x")]), existing) catch {
+        e => print("existing link: {error_name(e)}")
+    }
+    print("existing {tree(outside)}")
+
+    attempt(root, "file then dir", archive_of([file_entry("file", "x"), file_entry("file/under", "y")]))
+    attempt(root, "dir then file", archive_of([dir_entry("dir"), file_entry("dir", "y")]))
+
+    let truncated = joined([file_entry("a", "a"), newc_raw("070701", 1, 0o100644, 1, "b", bytes("short"), 600, 0)])
+    attempt(root, "truncated", truncated)
+    print("truncated {tree("{root}/truncated")}")
+
+    let limited = cpio.reader_with(io.bytes_reader(archive_of([file_entry("l", text.repeat("z", 5000))])), cpio.Limits { entry: 100 })
+    cpio.extract_from(limited, "{root}/limited") catch {
+        e => print("limited: {error_name(e)}")
+    }
+    print("limited {tree("{root}/limited")}")
+
+    attempt(root, "devices skipped", archive_of([forge("tty", 0o020620, ""), forge("pipe", 0o010600, ""), file_entry("after", "ok")]))
+    attempt(root, "nested", archive_of([file_entry("a/b/c/deep.txt", "deep"), dir_entry("a/b")]))
+    print("nested {file.read_text("{root}/nested/a/b/c/deep.txt")?}")
+    attempt(root, "linked group", archive_of([linked(9, 3, "g1", ""), linked(9, 3, "g2", ""), linked(9, 3, "g3", "group")]))
+    print("linked group {file.read_text("{root}/linked group/g1")?} {inode("{root}/linked group/g1") == inode("{root}/linked group/g3")} {inode("{root}/linked group/g2") == inode("{root}/linked group/g3")}")
+    attempt(root, "incomplete group", archive_of([linked(9, 3, "g1", ""), linked(9, 3, "g2", ""), file_entry("z", "z")]))
+    print("incomplete group {file.read_text("{root}/incomplete group/z")?} {inode("{root}/incomplete group/g1") == inode("{root}/incomplete group/g2")} {archive.lstat("{root}/incomplete group/g1")?.size}")
+    attempt(root, "empty group", archive_of([linked(9, 2, "e1", ""), linked(9, 2, "e2", "")]))
+    print("empty group {inode("{root}/empty group/e1") == inode("{root}/empty group/e2")}")
+    attempt(root, "odc group", joined([odc_entry(3, 0o100644, 2, "o1", "same"), odc_entry(3, 0o100644, 2, "o2", "same"), odc_entry(0, 0, 1, "TRAILER!!!", "")]))
+    print("odc group {file.read_text("{root}/odc group/o2")?} {inode("{root}/odc group/o1") == inode("{root}/odc group/o2")}")
+}
+
+fn trickle(data: []u8) -> *io.Reader {
+    var at = 0
+    let stream = io.Stream {
+        read: fn(buf) {
+            if at >= data.len {
+                0
+            } else {
+                let want = if buf.len < 7 { buf.len } else { 7 }
+                let n = if want < data.len - at { want } else { data.len - at }
+                for i in 0..n {
+                    buf[i] = data[at + i]
+                }
+                at += n
+                n
+            }
+        }
+        write: fn(buf) -> i64 ! io.Error { fail Unsupported }
+        close: fn() {}
+    }
+    io.reader(stream)
+}
+
+fn streaming() ! io.Error {
+    let data = bytes(embed("ref.newc"))
+    walk("trickle", cpio.reader(trickle(data)))
+    let direct = rewrite(data, cpio.Format.Newc)?
+    let r = cpio.reader(trickle(data))
+    let w = cpio.writer(cpio.Format.Newc)
+    for {
+        let e = cpio.next(r)? ?? break
+        cpio.add(w, e, cpio.read_entry(r)?)?
+    }
+    cpio.finish(w)?
+    print("trickle rewrite {same(cpio.output(w), direct)}")
+
+    var chunks = 0
+    var collected: []u8 = []
+    let sink = io.Stream {
+        read: fn(buf) { 0 }
+        write: fn(bytes) -> i64 ! io.Error {
+            chunks += 1
+            io.append(mut collected, bytes)
+            bytes.len
+        }
+        close: fn() {}
+    }
+    let sw = cpio.stream_writer(sink, cpio.Format.Crc)
+    cpio.add_file(sw, "one", bytes("1"), 0o644)?
+    cpio.add_dir(sw, "two", 0o755)?
+    cpio.finish(sw)?
+    print("streamed {collected.len} {chunks > 3} {collected.len % 512}")
+    print("buffer empty {cpio.output(sw).len}")
+    walk_data("streamed", collected)
+
+    let tiny = cpio.reader(trickle(archive_of([file_entry("a", "alpha"), file_entry("b", "bravo")])))
+    let first = cpio.next(tiny)? ?? return
+    var piece = io.buffer(2)
+    var total = 0
+    var parts: []str = []
+    for {
+        let n = cpio.read_body(tiny, piece)?
+        if n == 0 {
+            break
+        }
+        total += n
+        push(mut parts, str(piece[..n]))
+    }
+    print("partial reads {first.name} {total} {text.join(parts, "|")}")
+    let second = cpio.next(tiny)? ?? return
+    print("skip unread {second.name} {text.trim(str(cpio.read_entry(tiny)?))}")
+
+    let skipped = cpio.bytes_reader(archive_of([file_entry("a", text.repeat("q", 700)), file_entry("b", "bravo")]))
+    let one = cpio.next(skipped)? ?? return
+    let two = cpio.next(skipped)? ?? return
+    let body = text.trim(str(cpio.read_entry(skipped)?))
+    let end = cpio.next(skipped)?
+    print("skip unread large {one.name} {two.name} {body} {end == none}")
+}
+
+fn big_roundtrip() ! io.Error {
+    let payload = noise(300000, 11)
+    let empty: []u8 = []
+    for f in [cpio.Format.Newc, cpio.Format.Crc, cpio.Format.Odc] {
+        let w = cpio.writer(f)
+        cpio.add_file(w, "big.bin", payload, 0o644)?
+        cpio.add_file(w, "odd.bin", payload[..4099], 0o644)?
+        cpio.add_file(w, "zero.bin", empty, 0o644)?
+        cpio.finish(w)?
+        let data = cpio.output(w)
+        let r = cpio.reader(trickle(data))
+        var sums: []str = []
+        for {
+            let e = cpio.next(r)? ?? break
+            let body = cpio.read_entry(r)?
+            push(mut sums, "{e.name}:{body.len}:{hash.crc32(body)}")
+        }
+        print("big {format_name(f)} {data.len % 512} {text.join(sums, " ")}")
+    }
+    print("payload {hash.crc32(payload)} {hash.crc32(payload[..4099])}")
+}
+
+fn create_extract(root: str) ! io.Error {
+    let src = "{root}/src"
+    file.mkdir(src)?
+    file.mkdir("{src}/sub")?
+    file.mkdir("{src}/sub/inner")?
+    file.write_text("{src}/top.txt", "top level\n")?
+    file.write_text("{src}/sub/inner/leaf.txt", "leaf\n")?
+    file.write_file("{src}/blob.bin", noise(5000, 3))?
+    file.write_text("{src}/empty", "")?
+    file.write_text("{src}/h1", "hard\n")?
+    file.link("{src}/h1", "{src}/sub/h2")?
+    file.link("{src}/h1", "{src}/sub/inner/h3")?
+    file.symlink("top.txt", "{src}/ln")?
+    for f in [cpio.Format.Newc, cpio.Format.Crc, cpio.Format.Odc] {
+        let packed = cpio.create(src, f)?
+        let listing = cpio.list(packed)?
+        var names: []str = []
+        for e in listing {
+            push(mut names, "{e.name}:{kind_name(e.kind)}:{e.size}:{e.nlink}")
+        }
+        print("create {format_name(f)} {packed.len % 512} {text.join(names, " ")}")
+        let dir = "{root}/out-{format_name(f)}"
+        cpio.extract(packed, dir)?
+        print("created tree {tree(dir)} / {tree("{dir}/sub")} / {tree("{dir}/sub/inner")}")
+        print(text.trim(file.read_text("{dir}/sub/inner/leaf.txt")?))
+        print("blob {hash.crc32(file.read_file("{dir}/blob.bin")?)} {hash.crc32(file.read_file("{src}/blob.bin")?)}")
+        print("links {archive.read_link("{dir}/ln")?} {inode("{dir}/h1") == inode("{dir}/sub/h2")} {inode("{dir}/h1") == inode("{dir}/sub/inner/h3")} {inode("{dir}/h1") == inode("{dir}/top.txt")}")
+        print("mtime {archive.lstat("{dir}/top.txt")?.mtime == archive.lstat("{src}/top.txt")?.mtime}")
+        let again = cpio.create(dir, f)?
+        print("recreate {again.len == packed.len}")
+    }
+}
+
+fn main() ! io.Error {
+    references()?
+    forged()
+    limits()
+    writer_layout()?
+    writer_fields()?
+    writer_errors()
+    hard_links()?
+    streaming()?
+    big_roundtrip()?
+    let root = file.temp_dir("low-std-cpio-")?
+    extract_reference(root)?
+    hostile(root)?
+    create_extract(root)?
+    file.remove_all(root)?
+    print(file.exists(root))
+}

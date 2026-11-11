@@ -1,0 +1,333 @@
+import std/io
+import std/text
+
+pub enum Reply {
+    Nil
+    Status(text: str)
+    Failure(text: str)
+    Integer(value: i64)
+    Bulk(data: []u8)
+    Array(items: []Reply)
+    Map(entries: []Pair)
+    Set(items: []Reply)
+    Boolean(value: bool)
+    Double(value: f64)
+    BigNumber(digits: str)
+    Verbatim(format: str, text: str)
+    Push(items: []Reply)
+}
+
+pub struct Pair {
+    pub key: Reply
+    pub value: Reply
+}
+
+pub enum Error {
+    Connect
+    Closed
+    Timeout
+    Protocol
+    TooLarge
+    Unsupported
+    Subscribed
+    Aborted
+    Type
+    Auth(message: str)
+    Server(message: str)
+}
+
+pub struct Limits {
+    pub bulk: i64 = 67108864
+    pub depth: i64 = 32
+    pub elements: i64 = 1048576
+}
+
+pub fn encode(args: []str) -> []u8 {
+    var out: []u8 = []
+    encode_into(mut out, args)
+    out
+}
+
+pub fn encode_into(mut out: []u8, args: []str) {
+    text.append(mut out, "*{args.len}\r\n")
+    for arg in args {
+        text.append(mut out, "${arg.len}\r\n")
+        text.append(mut out, arg)
+        text.append(mut out, "\r\n")
+    }
+}
+
+pub fn decode(data: []u8) -> Reply ! Error {
+    decode_with(data, Limits {})
+}
+
+pub fn decode_with(data: []u8, limits: Limits) -> Reply ! Error {
+    let r = io.bytes_reader(data)
+    read_reply(r, limits) catch {
+        Closed => fail Protocol
+        e => fail e
+    }
+}
+
+pub fn read_reply(r: *io.Reader, limits: Limits) -> Reply ! Error {
+    read_value(r, limits, 0)
+}
+
+fn transport(e: io.Error) -> Error {
+    match e {
+        TimedOut => Timeout
+        TooLarge => TooLarge
+        Malformed => Protocol
+        _ => Closed
+    }
+}
+
+fn read_text(r: *io.Reader) -> str ! Error {
+    io.read_line(r) catch {
+        e => fail transport(e)
+    }
+}
+
+fn read_bytes(r: *io.Reader, n: i64) -> []u8 ! Error {
+    io.read_exact(r, n) catch {
+        e => fail transport(e)
+    }
+}
+
+fn number(s: str) -> i64 ! Error {
+    text.parse_int(s) catch {
+        _ => fail Protocol
+    }
+}
+
+fn count(s: str, limits: Limits) -> i64 ! Error {
+    let n = number(s)?
+    if n < -1 {
+        fail Protocol
+    }
+    if n > limits.elements {
+        fail TooLarge
+    }
+    n
+}
+
+fn read_value(r: *io.Reader, limits: Limits, depth: i64) -> Reply ! Error {
+    for {
+        let line = read_text(r)?
+        if line.len == 0 {
+            fail Protocol
+        }
+        let body = line[1..]
+        if line[0] == '|' {
+            let skipped = count(body, limits)?
+            if skipped < 0 {
+                fail Protocol
+            }
+            read_pairs(r, limits, depth + 1, skipped)?
+            continue
+        }
+        return read_body(r, limits, depth, line[0], body)
+    }
+}
+
+fn read_body(r: *io.Reader, limits: Limits, depth: i64, kind: u8, body: str) -> Reply ! Error {
+    match kind {
+        == '+' => Status(body)
+        == '-' => Failure(body)
+        == ':' => Integer(number(body)?)
+        == '$' => read_bulk(r, limits, body)?
+        == '*' => read_array(r, limits, depth, body)?
+        == '%' => read_map(r, limits, depth, body)?
+        == '~' => read_set(r, limits, depth, body)?
+        == '>' => read_push(r, limits, depth, body)?
+        == '=' => read_verbatim(r, limits, body)?
+        == '!' => read_blob_error(r, limits, body)?
+        == '_' => read_null(body)?
+        == '#' => read_boolean(body)?
+        == ',' => read_double(body)?
+        == '(' => read_big(body)?
+        _ => fail Protocol
+    }
+}
+
+fn read_null(body: str) -> Reply ! Error {
+    if body.len != 0 {
+        fail Protocol
+    }
+    Nil
+}
+
+fn read_boolean(body: str) -> Reply ! Error {
+    if body == "t" {
+        return Boolean(true)
+    }
+    if body == "f" {
+        return Boolean(false)
+    }
+    fail Protocol
+}
+
+fn read_double(body: str) -> Reply ! Error {
+    if body.len == 0 {
+        fail Protocol
+    }
+    let v = text.parse_float(body) catch {
+        _ => fail Protocol
+    }
+    Double(v)
+}
+
+fn read_big(body: str) -> Reply ! Error {
+    var start = 0
+    if body.len > 0 && (body[0] == '-' || body[0] == '+') {
+        start = 1
+    }
+    if body.len == start {
+        fail Protocol
+    }
+    for i in start..body.len {
+        if body[i] < '0' || body[i] > '9' {
+            fail Protocol
+        }
+    }
+    BigNumber(body)
+}
+
+fn read_payload(r: *io.Reader, limits: Limits, body: str) -> []u8 ! Error {
+    let n = number(body)?
+    if n < 0 {
+        fail Protocol
+    }
+    if n > limits.bulk {
+        fail TooLarge
+    }
+    read_terminated(r, n)
+}
+
+fn read_terminated(r: *io.Reader, n: i64) -> []u8 ! Error {
+    var data: []u8 = []
+    if n <= 65536 {
+        data = read_bytes(r, n)?
+    } else {
+        var rest = n
+        for rest > 0 {
+            let part = if rest > 65536 { 65536 } else { rest }
+            io.append(mut data, read_bytes(r, part)?)
+            rest -= part
+        }
+    }
+    let end = read_bytes(r, 2)?
+    if end[0] != '\r' || end[1] != '\n' {
+        fail Protocol
+    }
+    data
+}
+
+fn read_bulk(r: *io.Reader, limits: Limits, body: str) -> Reply ! Error {
+    if body == "-1" {
+        return Nil
+    }
+    Bulk(read_payload(r, limits, body)?)
+}
+
+fn read_verbatim(r: *io.Reader, limits: Limits, body: str) -> Reply ! Error {
+    let data = read_payload(r, limits, body)?
+    if data.len < 4 || data[3] != ':' {
+        fail Protocol
+    }
+    Verbatim(str(data[..3]), str(data[4..]))
+}
+
+fn read_blob_error(r: *io.Reader, limits: Limits, body: str) -> Reply ! Error {
+    Failure(str(read_payload(r, limits, body)?))
+}
+
+fn read_items(r: *io.Reader, limits: Limits, depth: i64, n: i64) -> []Reply ! Error {
+    var items: []Reply = []
+    for _ in 0..n {
+        push(mut items, read_value(r, limits, depth)?)
+    }
+    items
+}
+
+fn read_pairs(r: *io.Reader, limits: Limits, depth: i64, n: i64) -> []Pair ! Error {
+    if depth > limits.depth {
+        fail TooLarge
+    }
+    var entries: []Pair = []
+    for _ in 0..n {
+        let key = read_value(r, limits, depth)?
+        let value = read_value(r, limits, depth)?
+        push(mut entries, Pair { key, value })
+    }
+    entries
+}
+
+fn read_array(r: *io.Reader, limits: Limits, depth: i64, body: str) -> Reply ! Error {
+    let n = count(body, limits)?
+    if n < 0 {
+        return Nil
+    }
+    if depth >= limits.depth {
+        fail TooLarge
+    }
+    Array(read_items(r, limits, depth + 1, n)?)
+}
+
+fn read_set(r: *io.Reader, limits: Limits, depth: i64, body: str) -> Reply ! Error {
+    let n = count(body, limits)?
+    if n < 0 || depth >= limits.depth {
+        fail Protocol
+    }
+    Set(read_items(r, limits, depth + 1, n)?)
+}
+
+fn read_push(r: *io.Reader, limits: Limits, depth: i64, body: str) -> Reply ! Error {
+    let n = count(body, limits)?
+    if n < 0 || depth >= limits.depth {
+        fail Protocol
+    }
+    Push(read_items(r, limits, depth + 1, n)?)
+}
+
+fn read_map(r: *io.Reader, limits: Limits, depth: i64, body: str) -> Reply ! Error {
+    let n = count(body, limits)?
+    if n < 0 {
+        fail Protocol
+    }
+    Map(read_pairs(r, limits, depth + 1, n)?)
+}
+
+pub fn format(reply: Reply) -> str {
+    match reply {
+        Nil => "(nil)"
+        Status(t) => "+{t}"
+        Failure(t) => "-{t}"
+        Integer(v) => ":{v}"
+        Bulk(d) => text.quote(str(d))
+        Array(items) => "[{join(items)}]"
+        Map(entries) => "{{{join_pairs(entries)}}}"
+        Set(items) => "~[{join(items)}]"
+        Boolean(v) => if v { "#t" } else { "#f" }
+        Double(v) => ",{v}"
+        BigNumber(d) => "({d}"
+        Verbatim(f, t) => "={f}:{text.quote(t)}"
+        Push(items) => ">[{join(items)}]"
+    }
+}
+
+fn join(items: []Reply) -> str {
+    var parts: []str = []
+    for item in items {
+        push(mut parts, format(item))
+    }
+    text.join(parts, ", ")
+}
+
+fn join_pairs(entries: []Pair) -> str {
+    var parts: []str = []
+    for e in entries {
+        push(mut parts, "{format(e.key)}: {format(e.value)}")
+    }
+    text.join(parts, ", ")
+}

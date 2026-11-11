@@ -8,6 +8,8 @@ import (
 func main() {
 	if len(os.Args) != 4 {
 		fmt.Fprintln(os.Stderr, "usage: tablegen unicode <ucd directory> <output directory>")
+		fmt.Fprintln(os.Stderr, "       tablegen properties <ucd directory> <output directory>")
+		fmt.Fprintln(os.Stderr, "       tablegen charset <index directory> <output directory>")
 		fmt.Fprintln(os.Stderr, "       tablegen entities <entities.json> <output directory>")
 		os.Exit(2)
 	}
@@ -21,6 +23,10 @@ func run(command, source, output string) error {
 	switch command {
 	case "unicode":
 		return generateUnicode(source, output)
+	case "properties":
+		return generateProperties(source, output)
+	case "charset":
+		return generateCharset(source, output)
 	case "entities":
 		return generateEntities(source, output)
 	}

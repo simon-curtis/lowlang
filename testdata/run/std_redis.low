@@ -1,0 +1,1504 @@
+import std/crypto/x509
+import std/io
+import std/net
+import std/redis
+import std/slices
+import std/sync
+import std/text
+import std/tls
+
+struct Delivery {
+    kind: str
+    pattern: str
+    channel: str
+    payload: str
+}
+
+struct Session {
+    id: i64
+    proto: i64
+    authed: bool
+    user: str
+    db: i64
+    queueing: bool
+    poisoned: bool
+    queued: [][]str
+    watched: [str: i64]
+    channels: []str
+    patterns: []str
+    inbox: chan[Delivery]
+}
+
+struct Settings {
+    user: str
+    password: str
+    hello: bool
+}
+
+struct Store {
+    gate: sync.Mutex
+    strings: [str: str]
+    ttls: [str: i64]
+    hashes: [str: []redis.Field]
+    lists: [str: []str]
+    sets: [str: []str]
+    zsets: [str: []redis.Scored]
+    versions: [str: i64]
+    sessions: [i64: *Session]
+    next_id: i64
+    batched: i64
+    ended: chan[str]
+    settings: Settings
+}
+
+struct Range {
+    lo: i64
+    hi: i64
+}
+
+fn new_store(settings: Settings) -> *Store {
+    new(Store {
+        gate: sync.mutex()
+        strings: [:]
+        ttls: [:]
+        hashes: [:]
+        lists: [:]
+        sets: [:]
+        zsets: [:]
+        versions: [:]
+        sessions: [:]
+        next_id: 0
+        batched: 0
+        ended: chan[str](16)
+        settings
+    })
+}
+
+fn open_settings() -> Settings {
+    Settings { user: "", password: "", hello: true }
+}
+
+fn simple(s: str) -> str {
+    "+{s}\r\n"
+}
+
+fn error(s: str) -> str {
+    "-{s}\r\n"
+}
+
+fn integer(n: i64) -> str {
+    ":{n}\r\n"
+}
+
+fn bulk(s: str) -> str {
+    "${s.len}\r\n{s}\r\n"
+}
+
+fn nil(s: *Session) -> str {
+    if s.proto == 3 { "_\r\n" } else { "$-1\r\n" }
+}
+
+fn nil_array(s: *Session) -> str {
+    if s.proto == 3 { "_\r\n" } else { "*-1\r\n" }
+}
+
+fn optional(s: *Session, v: str?) -> str {
+    match v {
+        some(text) => bulk(text)
+        none => nil(s)
+    }
+}
+
+fn array(parts: []str) -> str {
+    "*{parts.len}\r\n{text.join(parts, "")}"
+}
+
+fn bulks(items: []str) -> str {
+    array(slices.map(items, bulk))
+}
+
+fn bulk_set(s: *Session, items: []str) -> str {
+    if s.proto == 3 {
+        return "~{items.len}\r\n{text.join(slices.map(items, bulk), "")}"
+    }
+    bulks(items)
+}
+
+fn bulk_map(s: *Session, fields: []redis.Field) -> str {
+    var parts: []str = []
+    for f in fields {
+        push(mut parts, bulk(f.name))
+        push(mut parts, bulk(f.value))
+    }
+    if s.proto == 3 {
+        return "%{fields.len}\r\n{text.join(parts, "")}"
+    }
+    array(parts)
+}
+
+fn push_frame(s: *Session, parts: []str) -> str {
+    let marker = if s.proto == 3 { ">" } else { "*" }
+    "{marker}{parts.len}\r\n{text.join(parts, "")}"
+}
+
+fn has[V](m: [str: V], key: str) -> bool {
+    match m[key] {
+        some(v) => true
+        none => false
+    }
+}
+
+fn touch(st: *Store, key: str) {
+    st.versions[key] += 1
+}
+
+fn known() -> []str {
+    [
+        "PING", "ECHO", "AUTH", "HELLO", "SELECT", "GET", "SET", "DEL", "EXISTS", "EXPIRE", "TTL", "INCR", "INCRBY",
+        "HGET", "HSET", "HGETALL", "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "SADD", "SMEMBERS", "ZADD", "ZRANGE",
+        "PUBLISH", "SUBSCRIBE", "PSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE", "MULTI", "EXEC", "DISCARD", "WATCH",
+        "UNWATCH", "XDB", "XWHO", "XTYPES", "XHANG",
+    ]
+}
+
+fn range_of(n: i64, start: i64, stop: i64) -> Range {
+    var lo = if start < 0 { start + n } else { start }
+    var hi = if stop < 0 { stop + n } else { stop }
+    if lo < 0 {
+        lo = 0
+    }
+    if hi >= n {
+        hi = n - 1
+    }
+    if lo > hi {
+        return Range { lo: 0, hi: 0 }
+    }
+    Range { lo, hi: hi + 1 }
+}
+
+fn number(s: str) -> i64? {
+    let n = text.parse_int(s) catch {
+        _ => return none
+    }
+    n
+}
+
+fn authenticate(st: *Store, s: *Session, user: str, password: str) -> bool {
+    let expected = if st.settings.user.len > 0 { st.settings.user } else { "default" }
+    if user == expected && password == st.settings.password {
+        s.authed = true
+        s.user = user
+        return true
+    }
+    false
+}
+
+fn cmd_auth(st: *Store, s: *Session, a: []str) -> str {
+    var user = "default"
+    var password = a[1]
+    if a.len == 3 {
+        user = a[1]
+        password = a[2]
+    }
+    if authenticate(st, s, user, password) {
+        return simple("OK")
+    }
+    error("WRONGPASS invalid username-password pair or user is disabled.")
+}
+
+fn hello_map(s: *Session) -> str {
+    let parts = ["server", "redis", "proto", "{s.proto}"]
+    if s.proto == 3 {
+        return "%2\r\n{bulk("server")}{bulk("redis")}{bulk("proto")}{integer(3)}"
+    }
+    array(slices.map(parts, bulk))
+}
+
+fn cmd_hello(st: *Store, s: *Session, a: []str) -> str {
+    if !st.settings.hello {
+        return error("ERR unknown command 'HELLO'")
+    }
+    if a.len >= 2 && a[1] != "2" && a[1] != "3" {
+        return error("NOPROTO sorry this protocol version is not supported")
+    }
+    if a.len == 5 && !authenticate(st, s, a[3], a[4]) {
+        return error("WRONGPASS invalid username-password pair or user is disabled.")
+    }
+    if a.len >= 2 && a[1] == "3" {
+        s.proto = 3
+    }
+    hello_map(s)
+}
+
+fn cmd_select(s: *Session, a: []str) -> str {
+    let n = number(a[1]) ?? -1
+    if n < 0 || n > 15 {
+        return error("ERR DB index is out of range")
+    }
+    s.db = n
+    simple("OK")
+}
+
+fn cmd_get(st: *Store, s: *Session, a: []str) -> str {
+    if (st.lists[a[1]] ?? []).len > 0 {
+        return error("WRONGTYPE Operation against a key holding the wrong kind of value")
+    }
+    optional(s, st.strings[a[1]])
+}
+
+fn cmd_set(st: *Store, s: *Session, a: []str) -> str {
+    let key = a[1]
+    let present = has(st.strings, key)
+    var ttl = -1
+    var keep = false
+    var i = 3
+    for i < a.len {
+        let option = text.upper(a[i])
+        if option == "NX" && present || option == "XX" && !present {
+            return nil(s)
+        }
+        if option == "EX" {
+            ttl = number(a[i + 1]) ?? -1
+            i += 1
+        } else if option == "PX" {
+            ttl = ((number(a[i + 1]) ?? 0) + 999) / 1000
+            i += 1
+        } else if option == "KEEPTTL" {
+            keep = true
+        }
+        i += 1
+    }
+    st.strings[key] = a[2]
+    if ttl >= 0 {
+        st.ttls[key] = ttl
+    } else if !keep {
+        delete(mut st.ttls, key)
+    }
+    touch(st, key)
+    simple("OK")
+}
+
+fn cmd_del(st: *Store, a: []str) -> str {
+    var removed = 0
+    for key in a[1..] {
+        var gone = false
+        if has(st.strings, key) {
+            delete(mut st.strings, key)
+            gone = true
+        }
+        if has(st.hashes, key) {
+            delete(mut st.hashes, key)
+            gone = true
+        }
+        if has(st.lists, key) {
+            delete(mut st.lists, key)
+            gone = true
+        }
+        delete(mut st.ttls, key)
+        if gone {
+            removed += 1
+            touch(st, key)
+        }
+    }
+    integer(removed)
+}
+
+fn has_key(st: *Store, key: str) -> bool {
+    has(st.strings, key) || has(st.hashes, key) || has(st.lists, key) || has(st.sets, key) || has(st.zsets, key)
+}
+
+fn cmd_exists(st: *Store, a: []str) -> str {
+    var found = 0
+    for key in a[1..] {
+        if has_key(st, key) {
+            found += 1
+        }
+    }
+    integer(found)
+}
+
+fn cmd_expire(st: *Store, a: []str) -> str {
+    if !has_key(st, a[1]) {
+        return integer(0)
+    }
+    st.ttls[a[1]] = number(a[2]) ?? 0
+    integer(1)
+}
+
+fn cmd_ttl(st: *Store, a: []str) -> str {
+    if !has_key(st, a[1]) {
+        return integer(-2)
+    }
+    integer(st.ttls[a[1]] ?? -1)
+}
+
+fn cmd_incr(st: *Store, a: []str, by: i64) -> str {
+    let current = number(st.strings[a[1]] ?? "0") ?? -1
+    if current < 0 && (st.strings[a[1]] ?? "0") != "-1" {
+        return error("ERR value is not an integer or out of range")
+    }
+    let next = current + by
+    st.strings[a[1]] = "{next}"
+    touch(st, a[1])
+    integer(next)
+}
+
+fn cmd_hset(st: *Store, a: []str) -> str {
+    var fields = st.hashes[a[1]] ?? []
+    var added = 0
+    var i = 2
+    for i + 1 < a.len {
+        var found = false
+        for j, f in fields {
+            if f.name == a[i] {
+                fields[j] = redis.Field { name: a[i], value: a[i + 1] }
+                found = true
+            }
+        }
+        if !found {
+            push(mut fields, redis.Field { name: a[i], value: a[i + 1] })
+            added += 1
+        }
+        i += 2
+    }
+    st.hashes[a[1]] = fields
+    touch(st, a[1])
+    integer(added)
+}
+
+fn cmd_hget(st: *Store, s: *Session, a: []str) -> str {
+    for f in st.hashes[a[1]] ?? [] {
+        if f.name == a[2] {
+            return bulk(f.value)
+        }
+    }
+    nil(s)
+}
+
+fn cmd_push(st: *Store, a: []str, front: bool) -> str {
+    var items = st.lists[a[1]] ?? []
+    for v in a[2..] {
+        if front {
+            items = slices.concat([v], items)
+        } else {
+            push(mut items, v)
+        }
+    }
+    st.lists[a[1]] = items
+    touch(st, a[1])
+    integer(items.len)
+}
+
+fn cmd_pop(st: *Store, s: *Session, a: []str, front: bool) -> str {
+    let items = st.lists[a[1]] ?? []
+    if items.len == 0 {
+        return nil(s)
+    }
+    let at = if front { 0 } else { items.len - 1 }
+    let value = items[at]
+    if front {
+        st.lists[a[1]] = items[1..]
+    } else {
+        st.lists[a[1]] = items[..items.len - 1]
+    }
+    touch(st, a[1])
+    bulk(value)
+}
+
+fn cmd_lrange(st: *Store, a: []str) -> str {
+    let items = st.lists[a[1]] ?? []
+    let r = range_of(items.len, number(a[2]) ?? 0, number(a[3]) ?? -1)
+    bulks(items[r.lo..r.hi])
+}
+
+fn cmd_sadd(st: *Store, a: []str) -> str {
+    var members = st.sets[a[1]] ?? []
+    var added = 0
+    for m in a[2..] {
+        if !slices.contains(members, m) {
+            push(mut members, m)
+            added += 1
+        }
+    }
+    st.sets[a[1]] = members
+    touch(st, a[1])
+    integer(added)
+}
+
+fn ordered(z: []redis.Scored) -> []redis.Scored {
+    var copy = slices.clone(z)
+    slices.sort_by(mut copy, fn(x: redis.Scored, y: redis.Scored) -> bool { x.score < y.score || x.score == y.score && x.member < y.member })
+    copy
+}
+
+fn cmd_zadd(st: *Store, a: []str) -> str {
+    var members = st.zsets[a[1]] ?? []
+    var added = 0
+    var i = 2
+    for i + 1 < a.len {
+        let score = text.parse_float(a[i]) catch { _ => 0.0 }
+        var found = false
+        for j, m in members {
+            if m.member == a[i + 1] {
+                members[j] = redis.Scored { member: m.member, score }
+                found = true
+            }
+        }
+        if !found {
+            push(mut members, redis.Scored { member: a[i + 1], score })
+            added += 1
+        }
+        i += 2
+    }
+    st.zsets[a[1]] = members
+    touch(st, a[1])
+    integer(added)
+}
+
+fn scored_reply(s: *Session, m: redis.Scored) -> []str {
+    if s.proto == 3 {
+        return [array([bulk(m.member), ",{m.score}\r\n"])]
+    }
+    [bulk(m.member), bulk("{m.score}")]
+}
+
+fn cmd_zrange(st: *Store, s: *Session, a: []str) -> str {
+    let sorted = ordered(st.zsets[a[1]] ?? [])
+    let r = range_of(sorted.len, number(a[2]) ?? 0, number(a[3]) ?? -1)
+    var parts: []str = []
+    for m in sorted[r.lo..r.hi] {
+        if a.len > 4 {
+            parts = slices.concat(parts, scored_reply(s, m))
+        } else {
+            push(mut parts, bulk(m.member))
+        }
+    }
+    array(parts)
+}
+
+fn matches(pattern: str, channel: str) -> bool {
+    if text.ends_with(pattern, "*") {
+        return text.starts_with(channel, pattern[..pattern.len - 1])
+    }
+    pattern == channel
+}
+
+fn cmd_publish(st: *Store, a: []str) -> str {
+    var receivers = 0
+    for id, session in st.sessions {
+        if slices.contains(session.channels, a[1]) {
+            session.inbox <- Delivery { kind: "message", pattern: "", channel: a[1], payload: a[2] }
+            receivers += 1
+        }
+        for p in session.patterns {
+            if matches(p, a[1]) {
+                session.inbox <- Delivery { kind: "pmessage", pattern: p, channel: a[1], payload: a[2] }
+                receivers += 1
+            }
+        }
+    }
+    integer(receivers)
+}
+
+fn subscription_count(s: *Session) -> i64 {
+    s.channels.len + s.patterns.len
+}
+
+fn cmd_subscribe(st: *Store, s: *Session, a: []str, pattern: bool) -> str {
+    st.sessions[s.id] = s
+    var frames: []str = []
+    for name in a[1..] {
+        if pattern {
+            push(mut s.patterns, name)
+        } else {
+            push(mut s.channels, name)
+        }
+        let kind = if pattern { "psubscribe" } else { "subscribe" }
+        push(mut frames, push_frame(s, [bulk(kind), bulk(name), integer(subscription_count(s))]))
+    }
+    text.join(frames, "")
+}
+
+fn cmd_unsubscribe(s: *Session, a: []str, pattern: bool) -> str {
+    let kind = if pattern { "punsubscribe" } else { "unsubscribe" }
+    var names = if pattern { s.patterns } else { s.channels }
+    if a.len > 1 {
+        names = a[1..]
+    }
+    if names.len == 0 {
+        return push_frame(s, [bulk(kind), nil(s), integer(subscription_count(s))])
+    }
+    var frames: []str = []
+    for name in slices.clone(names) {
+        if pattern {
+            s.patterns = slices.filter(s.patterns, fn(p: str) -> bool { p != name })
+        } else {
+            s.channels = slices.filter(s.channels, fn(c: str) -> bool { c != name })
+        }
+        push(mut frames, push_frame(s, [bulk(kind), bulk(name), integer(subscription_count(s))]))
+    }
+    text.join(frames, "")
+}
+
+fn cmd_watch(st: *Store, s: *Session, a: []str) -> str {
+    for key in a[1..] {
+        s.watched[key] = st.versions[key] ?? 0
+    }
+    simple("OK")
+}
+
+fn dirty(st: *Store, s: *Session) -> bool {
+    for key, seen in s.watched {
+        if (st.versions[key] ?? 0) != seen {
+            return true
+        }
+    }
+    false
+}
+
+fn cmd_exec(st: *Store, s: *Session) -> str {
+    let queued = s.queued
+    let poisoned = s.poisoned
+    let changed = dirty(st, s)
+    s.queueing = false
+    s.poisoned = false
+    s.queued = []
+    s.watched = [:]
+    if poisoned {
+        return error("EXECABORT Transaction discarded because of previous errors.")
+    }
+    if changed {
+        return nil_array(s)
+    }
+    var replies: []str = []
+    for args in queued {
+        push(mut replies, execute(st, s, args))
+    }
+    array(replies)
+}
+
+fn types_reply() -> str {
+    let parts = [
+        "#t\r\n", ",2.5\r\n", "(12345678901234567890123\r\n", "=7\r\ntxt:abc\r\n", "~2\r\n:1\r\n:2\r\n",
+        "%1\r\n+k\r\n:9\r\n", "_\r\n", "|1\r\n+meta\r\n+x\r\n:7\r\n", "!3\r\nBAD\r\n",
+    ]
+    ">2\r\n+invalidate\r\n*1\r\n$1\r\nk\r\n*{parts.len}\r\n{text.join(parts, "")}"
+}
+
+fn execute(st: *Store, s: *Session, a: []str) -> str {
+    let cmd = text.upper(a[0])
+    if st.settings.password.len > 0 && !s.authed && cmd != "AUTH" && cmd != "HELLO" {
+        return error("NOAUTH Authentication required.")
+    }
+    if s.queueing && cmd != "EXEC" && cmd != "DISCARD" && cmd != "MULTI" && cmd != "WATCH" {
+        if !slices.contains(known(), cmd) {
+            s.poisoned = true
+            return error("ERR unknown command '{a[0]}'")
+        }
+        push(mut s.queued, a)
+        return simple("QUEUED")
+    }
+    match cmd {
+        == "PING" => if a.len > 1 { bulk(a[1]) } else { simple("PONG") }
+        == "ECHO" => bulk(a[1])
+        == "AUTH" => cmd_auth(st, s, a)
+        == "HELLO" => cmd_hello(st, s, a)
+        == "SELECT" => cmd_select(s, a)
+        == "GET" => cmd_get(st, s, a)
+        == "SET" => cmd_set(st, s, a)
+        == "DEL" => cmd_del(st, a)
+        == "EXISTS" => cmd_exists(st, a)
+        == "EXPIRE" => cmd_expire(st, a)
+        == "TTL" => cmd_ttl(st, a)
+        == "INCR" => cmd_incr(st, a, 1)
+        == "INCRBY" => cmd_incr(st, a, number(a[2]) ?? 0)
+        == "HGET" => cmd_hget(st, s, a)
+        == "HSET" => cmd_hset(st, a)
+        == "HGETALL" => bulk_map(s, st.hashes[a[1]] ?? [])
+        == "LPUSH" => cmd_push(st, a, true)
+        == "RPUSH" => cmd_push(st, a, false)
+        == "LPOP" => cmd_pop(st, s, a, true)
+        == "RPOP" => cmd_pop(st, s, a, false)
+        == "LRANGE" => cmd_lrange(st, a)
+        == "SADD" => cmd_sadd(st, a)
+        == "SMEMBERS" => bulk_set(s, st.sets[a[1]] ?? [])
+        == "ZADD" => cmd_zadd(st, a)
+        == "ZRANGE" => cmd_zrange(st, s, a)
+        == "PUBLISH" => cmd_publish(st, a)
+        == "SUBSCRIBE" => cmd_subscribe(st, s, a, false)
+        == "PSUBSCRIBE" => cmd_subscribe(st, s, a, true)
+        == "UNSUBSCRIBE" => cmd_unsubscribe(s, a, false)
+        == "PUNSUBSCRIBE" => cmd_unsubscribe(s, a, true)
+        == "MULTI" => {
+            s.queueing = true
+            simple("OK")
+        }
+        == "EXEC" => if s.queueing { cmd_exec(st, s) } else { error("ERR EXEC without MULTI") }
+        == "DISCARD" => {
+            s.queueing = false
+            s.queued = []
+            s.watched = [:]
+            simple("OK")
+        }
+        == "WATCH" => cmd_watch(st, s, a)
+        == "UNWATCH" => {
+            s.watched = [:]
+            simple("OK")
+        }
+        == "XDB" => integer(s.db)
+        == "XWHO" => bulk(s.user)
+        == "XTYPES" => if s.proto == 3 { types_reply() } else { error("ERR needs RESP3") }
+        _ => error("ERR unknown command '{a[0]}'")
+    }
+}
+
+fn locked(st: *Store, s: *Session, a: []str) -> str {
+    sync.lock(st.gate)
+    let reply = execute(st, s, a)
+    sync.unlock(st.gate)
+    reply
+}
+
+fn new_session(st: *Store) -> *Session {
+    sync.lock(st.gate)
+    st.next_id += 1
+    let id = st.next_id
+    sync.unlock(st.gate)
+    let authed = st.settings.password.len == 0
+    new(Session {
+        id
+        proto: 2
+        authed
+        user: "default"
+        db: 0
+        queueing: false
+        poisoned: false
+        queued: []
+        watched: [:]
+        channels: []
+        patterns: []
+        inbox: chan[Delivery](16)
+    })
+}
+
+fn request_args(reply: redis.Reply) -> []str {
+    match reply {
+        Array(items) => {
+            var args: []str = []
+            for item in items {
+                match item {
+                    Bulk(data) => push(mut args, str(data))
+                    _ => {}
+                }
+            }
+            args
+        }
+        _ => []
+    }
+}
+
+fn read_requests(r: *io.Reader, st: *Store, out: chan[[]str]) {
+    for {
+        let reply = redis.read_reply(r, redis.Limits {}) catch {
+            _ => break
+        }
+        if io.buffered(r) > 0 {
+            sync.lock(st.gate)
+            st.batched += 1
+            sync.unlock(st.gate)
+        }
+        out <- request_args(reply)
+    }
+    close(out)
+}
+
+fn deliver(s: *Session, d: Delivery) -> str {
+    if d.kind == "message" {
+        return push_frame(s, [bulk("message"), bulk(d.channel), bulk(d.payload)])
+    }
+    push_frame(s, [bulk("pmessage"), bulk(d.pattern), bulk(d.channel), bulk(d.payload)])
+}
+
+fn forget(st: *Store, s: *Session) {
+    sync.lock(st.gate)
+    delete(mut st.sessions, s.id)
+    sync.unlock(st.gate)
+}
+
+fn run_session(st: *Store, stream: io.Stream) {
+    let s = new_session(st)
+    let requests = chan[[]str](1)
+    spawn read_requests(io.reader(stream), st, requests)
+    for {
+        var reply = ""
+        select {
+            req = <-requests => {
+                let args = req ?? break
+                if args.len == 0 {
+                    continue
+                }
+                if text.upper(args[0]) == "XHANG" {
+                    sleep(400)
+                    continue
+                }
+                reply = locked(st, s, args)
+            }
+            d = <-s.inbox => {
+                reply = deliver(s, d ?? break)
+            }
+        }
+        io.write_str(stream, reply) catch {
+            _ => break
+        }
+    }
+    forget(st, s)
+    st.ended <- "session {s.id} ended"
+}
+
+fn serve(l: net.ListenerHandle, st: *Store) {
+    for {
+        let h = net.accept_handle(l) catch {
+            _ => return
+        }
+        spawn plain(h, st)
+    }
+}
+
+fn plain(h: net.ConnHandle, st: *Store) {
+    using c = net.adopt(h)
+    run_session(st, net.stream(c))
+}
+
+fn serve_tls(l: net.ListenerHandle, st: *Store, config: tls.Config) {
+    for {
+        let h = net.accept_handle(l) catch {
+            _ => return
+        }
+        spawn encrypted_session(h, st, config)
+    }
+}
+
+fn encrypted_session(h: net.ConnHandle, st: *Store, config: tls.Config) {
+    using c = net.adopt(h)
+    using t = tls.server(net.stream(c), config) catch {
+        _ => return
+    }
+    run_session(st, tls.stream(t))
+}
+
+fn describe(e: redis.Error) -> str {
+    match e {
+        Connect => "Connect"
+        Closed => "Closed"
+        Timeout => "Timeout"
+        Protocol => "Protocol"
+        TooLarge => "TooLarge"
+        Unsupported => "Unsupported"
+        Subscribed => "Subscribed"
+        Aborted => "Aborted"
+        Type => "Type"
+        Auth(m) => "Auth({m})"
+        Server(m) => "Server({m})"
+    }
+}
+
+fn decoded(label: str, data: str, limits: redis.Limits) {
+    let r = redis.decode_with(bytes(data), limits) catch {
+        e => {
+            print("{label}: error {describe(e)}")
+            return
+        }
+    }
+    print("{label}: {redis.format(r)}")
+}
+
+fn parse(label: str, data: str) {
+    decoded(label, data, redis.Limits {})
+}
+
+struct Drip {
+    data: []u8
+    at: i64
+}
+
+fn dripping(data: str, size: i64) -> io.Stream {
+    let state = new(Drip { data: bytes(data), at: 0 })
+    io.Stream {
+        read: fn(buf) {
+            let left = state.data.len - state.at
+            if left == 0 {
+                return 0
+            }
+            let n = if left < size { left } else { size }
+            let k = io.copy(buf[..n], state.data[state.at..state.at + n])
+            state.at += k
+            k
+        }
+        write: fn(data) { data.len }
+        close: fn() {}
+    }
+}
+
+fn parse_stream(label: str, data: str, size: i64) {
+    let r = redis.read_reply(io.reader(dripping(data, size)), redis.Limits {}) catch {
+        e => {
+            print("{label}: error {describe(e)}")
+            return
+        }
+    }
+    print("{label}: {redis.format(r)}")
+}
+
+fn large_bulk() {
+    let body = "${70000}\r\n{text.repeat("y", 70000)}\r\n"
+    let r = redis.read_reply(io.reader(dripping(body, 1000)), redis.Limits {}) catch {
+        e => {
+            print("large bulk: error {describe(e)}")
+            return
+        }
+    }
+    match r {
+        Bulk(data) => print("large bulk: {data.len} bytes, last {data[data.len - 1]}")
+        _ => print("large bulk: unexpected")
+    }
+}
+
+fn parser_tests() {
+    parse("simple", "+OK\r\n")
+    parse("error", "-ERR unknown command\r\n")
+    parse("integer", ":-12\r\n")
+    parse("bulk", "$5\r\nhello\r\n")
+    parse("empty bulk", "$0\r\n\r\n")
+    parse("null bulk", "$-1\r\n")
+    parse("bulk with crlf", "$4\r\na\r\nb\r\n")
+    parse("array", "*2\r\n$1\r\na\r\n*1\r\n:1\r\n")
+    parse("empty array", "*0\r\n")
+    parse("null array", "*-1\r\n")
+    parse("map", "%2\r\n+a\r\n:1\r\n+b\r\n#t\r\n")
+    parse("set", "~2\r\n:1\r\n:2\r\n")
+    parse("null", "_\r\n")
+    parse("true", "#t\r\n")
+    parse("false", "#f\r\n")
+    parse("double", ",3.14\r\n")
+    parse("exponent", ",1.5e3\r\n")
+    parse("inf", ",inf\r\n")
+    parse("negative inf", ",-inf\r\n")
+    parse("nan", ",nan\r\n")
+    parse("big number", "(3492890328409238509324850943850943825024385\r\n")
+    parse("negative big number", "(-17\r\n")
+    parse("verbatim", "=15\r\ntxt:Some string\r\n")
+    parse("push", ">3\r\n+pubsub\r\n+news\r\n+hi\r\n")
+    parse("blob error", "!21\r\nSYNTAX invalid syntax\r\n")
+    parse("attribute", "|1\r\n+ttl\r\n:3600\r\n$3\r\nfoo\r\n")
+    parse("two attributes", "|1\r\n+a\r\n:1\r\n|1\r\n+b\r\n:2\r\n:5\r\n")
+    parse("nested", "*2\r\n%1\r\n+k\r\n*1\r\n~1\r\n:7\r\n+x\r\n")
+    parse("empty", "")
+    parse("no terminator", "+OK")
+    parse("unknown type", "?x\r\n")
+    parse("bad integer", ":abc\r\n")
+    parse("empty integer", ":\r\n")
+    parse("integer overflow", ":99999999999999999999\r\n")
+    parse("bad bulk length", "$x\r\n")
+    parse("negative bulk length", "$-2\r\n")
+    parse("short bulk", "$3\r\nab\r\n")
+    parse("unterminated bulk", "$3\r\nabcde\r\n")
+    parse("short array", "*2\r\n:1\r\n")
+    parse("negative map length", "%-1\r\n")
+    parse("negative set length", "~-1\r\n")
+    parse("bad boolean", "#x\r\n")
+    parse("bad null", "_x\r\n")
+    parse("bad double", ",abc\r\n")
+    parse("empty double", ",\r\n")
+    parse("bad big number", "(12a\r\n")
+    parse("empty big number", "(\r\n")
+    parse("short verbatim", "=3\r\nabc\r\n")
+    parse("verbatim without colon", "=5\r\nabcde\r\n")
+    parse("empty line", "\r\n")
+    parse("lone attribute", "|1\r\n+a\r\n:1\r\n")
+    decoded("bulk at limit", "$8\r\n12345678\r\n", redis.Limits { bulk: 8 })
+    decoded("bulk over limit", "$9\r\n123456789\r\n", redis.Limits { bulk: 8 })
+    decoded("verbatim over limit", "=12\r\ntxt:12345678\r\n", redis.Limits { bulk: 8 })
+    parse("huge bulk", "$1000000000000\r\n")
+    decoded("array at limit", "*3\r\n:1\r\n:2\r\n:3\r\n", redis.Limits { elements: 3 })
+    decoded("array over limit", "*4\r\n:1\r\n:2\r\n:3\r\n:4\r\n", redis.Limits { elements: 3 })
+    parse("huge array", "*99999999999\r\n")
+    decoded("map over limit", "%4\r\n", redis.Limits { elements: 3 })
+    decoded("depth at limit", "{text.repeat("*1\r\n", 3)}:1\r\n", redis.Limits { depth: 3 })
+    decoded("depth over limit", "{text.repeat("*1\r\n", 4)}:1\r\n", redis.Limits { depth: 3 })
+    parse("default depth", "{text.repeat("*1\r\n", 32)}:1\r\n")
+    parse("too deep", "{text.repeat("*1\r\n", 33)}:1\r\n")
+    parse("deep maps", "{text.repeat("%1\r\n+k\r\n", 40)}:1\r\n")
+    parse("deep attribute", "{text.repeat("|1\r\n+k\r\n", 40)}:1\r\n")
+    let long = text.repeat("x", 20000)
+    parse_stream("long line", "+{long}\r\n", 4096)
+    parse_stream("dripped array", "*2\r\n$3\r\nfoo\r\n:42\r\n", 1)
+    parse_stream("dripped bulk", "$12\r\nhello\r\nworld\r\n", 3)
+    parse_stream("dripped map", "%1\r\n+k\r\n,1.25\r\n", 2)
+    large_bulk()
+}
+
+fn options(l: net.Listener) -> redis.Options {
+    redis.Options { port: l.handle.addr.port, timeout: 2000 }
+}
+
+fn show(r: redis.Reply) {
+    print(redis.format(r))
+}
+
+fn text_or_none(v: str?) -> str {
+    v ?? "(none)"
+}
+
+fn denied(label: str, body: fn() ! redis.Error) {
+    body() catch {
+        e => {
+            print("{label}: {describe(e)}")
+            return
+        }
+    }
+    print("{label}: unexpectedly succeeded")
+}
+
+fn outcome(body: fn() -> str? ! redis.Error) -> str {
+    let v = body() catch {
+        e => {
+            return describe(e)
+        }
+    }
+    "ok {text_or_none(v)}"
+}
+
+fn join(items: []str) -> str {
+    "[{text.join(items, ",")}]"
+}
+
+fn fields_text(fields: []redis.Field) -> str {
+    join(slices.map(fields, fn(f: redis.Field) -> str { "{f.name}={f.value}" }))
+}
+
+fn scored_text(items: []redis.Scored) -> str {
+    join(slices.map(items, fn(m: redis.Scored) -> str { "{m.member}={m.score}" }))
+}
+
+fn strings(o: redis.Options) ! redis.Error {
+    using c = redis.connect(o)?
+    let h = c.handle
+    redis.set_timeout(c, 1000)
+    redis.ping(c)?
+    print("protocol {c.handle.protocol}")
+    print("missing: {text_or_none(c.get("greeting")?)}")
+    c.set("greeting", "hello")?
+    print("get: {text_or_none(c.get("greeting")?)}")
+    print("nx existing: {redis.set_with(c, "greeting", "other", redis.SetOptions { nx: true })?}")
+    print("nx new: {redis.set_with(c, "fresh", "1", redis.SetOptions { nx: true })?}")
+    print("xx missing: {redis.set_with(c, "ghost", "1", redis.SetOptions { xx: true })?}")
+    print("xx existing: {redis.set_with(c, "fresh", "2", redis.SetOptions { xx: true })?}")
+    print("fresh: {text_or_none(c.get("fresh")?)}")
+    print("ttl none: {c.ttl("fresh")?}")
+    print("ex: {redis.set_with(c, "session", "s", redis.SetOptions { ex: 60 })?} ttl {c.ttl("session")?}")
+    print("px: {redis.set_with(c, "short", "s", redis.SetOptions { px: 1500 })?} ttl {c.ttl("short")?}")
+    print("keep ttl: {redis.set_with(c, "session", "t", redis.SetOptions { keep_ttl: true })?} ttl {c.ttl("session")?}")
+    print("plain set clears ttl: {redis.set_with(c, "session", "u", redis.SetOptions {})?} ttl {c.ttl("session")?}")
+    print("ttl missing: {c.ttl("nothing")?}")
+    print("expire: {c.expire("greeting", 30)?} ttl {c.ttl("greeting")?}")
+    print("expire missing: {c.expire("nothing", 30)?}")
+    print("incr: {c.incr("counter")?} {c.incr("counter")?}")
+    print("incrby: {c.incrby("counter", 10)?} {c.incrby("counter", -4)?}")
+    denied("incr text", fn() ! redis.Error { redis.incr_on(h, "greeting")? })
+    print("exists: {c.exists(["greeting", "counter", "nothing"])?}")
+    print("del: {c.del(["greeting", "nothing"])?}")
+    print("exists after del: {c.exists(["greeting", "counter", "nothing"])?}")
+    show(c.command(["ECHO", "raw bytes"])?)
+    show(c.command(["BOGUS", "1"])?)
+    print("publish without subscribers: {c.publish("news", "hi")?}")
+}
+
+fn collections(o: redis.Options) ! redis.Error {
+    using c = redis.connect(o)?
+    let h = c.handle
+    let user = [redis.Field { name: "name", value: "Ada" }, redis.Field { name: "lang", value: "low" }]
+    print("hset: {c.hset("user:1", user)?}")
+    print("hset again: {c.hset("user:1", [redis.Field { name: "name", value: "Ada L" }, redis.Field { name: "age", value: "36" }])?}")
+    print("hget: {text_or_none(c.hget("user:1", "name")?)}")
+    print("hget missing: {text_or_none(c.hget("user:1", "nothing")?)}")
+    print("hgetall: {fields_text(c.hgetall("user:1")?)}")
+    print("hgetall missing: {fields_text(c.hgetall("user:2")?)}")
+    print("rpush: {c.rpush("q", ["a", "b", "c"])?}")
+    print("lpush: {c.lpush("q", ["z", "y"])?}")
+    print("lrange: {join(c.lrange("q", 0, -1)?)}")
+    print("lpop: {text_or_none(c.lpop("q")?)}")
+    print("rpop: {text_or_none(c.rpop("q")?)}")
+    print("lrange head: {join(c.lrange("q", 0, 1)?)}")
+    print("lpop missing: {text_or_none(c.lpop("nothing")?)}")
+    denied("get list", fn() ! redis.Error { redis.get_on(h, "q")? })
+    print("sadd: {c.sadd("tags", ["a", "b", "a"])?}")
+    print("sadd more: {c.sadd("tags", ["b", "c"])?}")
+    print("smembers: {join(c.smembers("tags")?)}")
+    let scores = [redis.Scored { member: "b", score: 2.0 }, redis.Scored { member: "a", score: 1.0 }, redis.Scored { member: "c", score: 3.5 }]
+    print("zadd: {c.zadd("board", scores)?}")
+    print("zadd update: {c.zadd("board", [redis.Scored { member: "a", score: 5.0 }])?}")
+    print("zrange: {join(c.zrange("board", 0, -1)?)}")
+    print("zrange scores: {scored_text(c.zrange_scores("board", 0, 1)?)}")
+}
+
+fn resp3(o: redis.Options) ! redis.Error {
+    var wanted = o
+    wanted.protocol = 3
+    using c = redis.connect(wanted)?
+    print("protocol {c.handle.protocol}")
+    c.hset("h", [redis.Field { name: "k", value: "v" }, redis.Field { name: "n", value: "1" }])?
+    print("hgetall: {fields_text(c.hgetall("h")?)}")
+    c.sadd("s", ["x", "y"])?
+    print("smembers: {join(c.smembers("s")?)}")
+    c.zadd("z", [redis.Scored { member: "m", score: 1.5 }, redis.Scored { member: "n", score: 4.0 }])?
+    print("zrange scores: {scored_text(c.zrange_scores("z", 0, -1)?)}")
+    print("missing: {text_or_none(c.get("nothing")?)}")
+    print("lpop missing: {text_or_none(c.lpop("nothing")?)}")
+    show(c.command(["XTYPES"])?)
+    print("after push: {c.incr("n")?}")
+}
+
+fn pipelines(o: redis.Options, st: *Store) ! redis.Error {
+    using c = redis.connect(o)?
+    let h = c.handle
+    c.set("text", "x")?
+    var p = redis.pipeline()
+    redis.queue(mut p, ["SET", "a", "1"])
+    redis.queue(mut p, ["INCR", "a"])
+    redis.queue(mut p, ["GET", "a"])
+    redis.queue(mut p, ["INCR", "text"])
+    redis.queue(mut p, ["DEL", "a"])
+    for r in redis.flush(c, p)? {
+        show(r)
+    }
+    print("one write: {st.batched >= 4}")
+    print("empty pipeline: {redis.run_pipeline(c, [])?.len}")
+    for r in redis.transaction(c, [["SET", "t1", "a"], ["INCR", "cnt"], ["GET", "t1"]])? {
+        show(r)
+    }
+    denied("transaction with unknown command", fn() ! redis.Error { redis.transaction_on(h, [["SET", "t2", "b"], ["BOGUS"]])? })
+    print("after failed transaction: {text_or_none(c.get("t2")?)}")
+    redis.multi(c)?
+    show(c.command(["INCR", "n"])?)
+    show(c.command(["INCR", "n"])?)
+    for r in redis.exec(c)? {
+        show(r)
+    }
+    denied("exec without multi", fn() ! redis.Error { redis.exec_on(h)? })
+    redis.multi(c)?
+    redis.discard(c)?
+    print("after discard: {text_or_none(c.get("n")?)}")
+    using other = redis.connect(o)?
+    redis.watch(c, ["w"])?
+    other.set("w", "changed")?
+    redis.multi(c)?
+    show(c.command(["SET", "w", "mine"])?)
+    denied("watched key changed", fn() ! redis.Error { redis.exec_on(h)? })
+    redis.watch(c, ["w"])?
+    redis.multi(c)?
+    show(c.command(["SET", "w", "mine"])?)
+    for r in redis.exec(c)? {
+        show(r)
+    }
+    redis.watch(c, ["w"])?
+    redis.unwatch(c)?
+    print("w: {text_or_none(c.get("w")?)}")
+}
+
+fn next(s: redis.Subscription) -> str {
+    select {
+        v = <-s.messages => match v {
+            some(m) => if m.pattern.len > 0 { "{m.channel} via {m.pattern}: {m.payload}" } else { "{m.channel}: {m.payload}" }
+            none => "closed"
+        }
+        after(2000) => "timeout"
+    }
+}
+
+fn pubsub(o: redis.Options) ! redis.Error {
+    using sub = redis.connect(o)?
+    using publisher = redis.connect(o)?
+    let subh = sub.handle
+    let s = sub.subscribe(["news", "sport"])?
+    print("publish news: {publisher.publish("news", "hello")?}")
+    print("publish other: {publisher.publish("other", "ignored")?}")
+    print("publish sport: {publisher.publish("sport", "goal")?}")
+    print(next(s))
+    print(next(s))
+    denied("command while subscribed", fn() ! redis.Error { redis.get_on(subh, "key")? })
+    denied("subscribe twice", fn() ! redis.Error { redis.subscribe_on(subh, ["more"])? })
+    redis.unsubscribe(s)?
+    print(next(s))
+    redis.ping(sub)?
+    print("usable again")
+
+    let patterned = sub.psubscribe(["news.*"])?
+    print("publish pattern: {publisher.publish("news.eu", "bonjour")?}")
+    print("publish exact: {publisher.publish("news", "plain")?}")
+    print(next(patterned))
+    redis.unsubscribe(patterned)?
+    print(next(patterned))
+
+    let slow = redis.Options { port: o.port, timeout: 2000, buffer: 2 }
+    using reader = redis.connect(slow)?
+    let flood = reader.subscribe(["flood"])?
+    for i in 0..50 {
+        publisher.publish("flood", "m{i}")?
+    }
+    var received = 0
+    var last = ""
+    for received < 50 {
+        let m = (<-flood.messages) ?? break
+        received += 1
+        last = m.payload
+    }
+    print("flood: {received} last {last}")
+    sleep(20)
+}
+
+fn pubsub3(o: redis.Options) ! redis.Error {
+    var wanted = o
+    wanted.protocol = 3
+    using sub = redis.connect(wanted)?
+    using publisher = redis.connect(o)?
+    let s = sub.subscribe(["alerts"])?
+    print("publish: {publisher.publish("alerts", "fire")?}")
+    print(next(s))
+    redis.unsubscribe(s)?
+    print(next(s))
+}
+
+fn abandoned(o: redis.Options) ! redis.Error {
+    var narrow = o
+    narrow.buffer = 1
+    using sub = redis.connect(narrow)?
+    let s = sub.subscribe(["quiet"])?
+    using publisher = redis.connect(o)?
+    for i in 0..10 {
+        publisher.publish("quiet", "n{i}")?
+    }
+    print("first: {next(s)}")
+}
+
+fn timeout(o: redis.Options) ! redis.Error {
+    var quick = o
+    quick.timeout = 100
+    using c = redis.connect(quick)?
+    let h = c.handle
+    redis.ping(c)?
+    denied("hang", fn() ! redis.Error { redis.command_on(h, ["XHANG"])? })
+    denied("after timeout", fn() ! redis.Error { redis.get_on(h, "k")? })
+}
+
+fn ownership(o: redis.Options, st: *Store) ! redis.Error {
+    using c = redis.connect(o)?
+    let view = c.handle
+    c.set("k", "v")?
+    redis.close_client(c)
+    redis.close_client(c)
+    let seen = redis.get(c, "k") catch {
+        e => {
+            print("owner after close: {describe(e)}")
+            some("(error)")
+        }
+    }
+    print("view after close: {outcome(fn() -> str? ! redis.Error { redis.get_on(view, "k") })}")
+    print("ended: {(<-st.ended) ?? "?"}")
+
+    using d = redis.connect(o)?
+    let shared = d.handle
+    let done = chan[i64](8)
+    for _ in 0..8 {
+        spawn count(shared, done)
+    }
+    var total = 0
+    for _ in 0..8 {
+        total += (<-done) ?? 0
+    }
+    print("workers {total}, counter {text_or_none(d.get("shared")?)}")
+
+    using var moved = redis.connect(o)?
+    let kept = redis.detach(mut moved)
+    using again = redis.adopt(kept)
+    print("adopted: {again.incr("adopted")?}")
+}
+
+fn count(h: *redis.ClientHandle, done: chan[i64]) {
+    var made = 0
+    for _ in 0..25 {
+        redis.incr_on(h, "shared") catch {
+            _ => break
+        }
+        made += 1
+    }
+    done <- made
+}
+
+fn leave(o: redis.Options, st: *Store) ! redis.Error {
+    using c = redis.connect(o)?
+    c.set("scoped", "1")?
+}
+
+fn secured(l: net.Listener) {
+    using anonymous = redis.connect(options(l)) catch {
+        e => {
+            print("anonymous: {describe(e)}")
+            return
+        }
+    }
+    let ah = anonymous.handle
+    denied("anonymous command", fn() ! redis.Error { redis.get_on(ah, "k")? })
+    var named = options(l)
+    named.username = "alice"
+    named.password = "secret"
+    using alice = redis.connect(named) catch {
+        e => {
+            print("alice: {describe(e)}")
+            return
+        }
+    }
+    show(alice.command(["XWHO"]) catch { e => redis.Reply.Status(describe(e)) })
+    named.protocol = 3
+    using upgraded = redis.connect(named) catch {
+        e => {
+            print("hello auth: {describe(e)}")
+            return
+        }
+    }
+    print("hello auth protocol {upgraded.handle.protocol}")
+    show(upgraded.command(["XWHO"]) catch { e => redis.Reply.Status(describe(e)) })
+    var wrong = named
+    wrong.protocol = 2
+    wrong.password = "nope"
+    using first = redis.connect(wrong) catch {
+        e => {
+            print("wrong password: {describe(e)}")
+            return
+        }
+    }
+    print("wrong password accepted")
+}
+
+fn secured_more(l: net.Listener) {
+    var wrong = options(l)
+    wrong.username = "alice"
+    wrong.password = "nope"
+    wrong.protocol = 3
+    using hello = redis.connect(wrong) catch {
+        e => {
+            print("wrong password hello: {describe(e)}")
+            return
+        }
+    }
+    print("wrong password hello accepted")
+}
+
+fn secured_default(l: net.Listener) {
+    var defaulted = options(l)
+    defaulted.password = "secret"
+    using c = redis.connect(defaulted) catch {
+        e => {
+            print("default user: {describe(e)}")
+            return
+        }
+    }
+    print("default user accepted")
+}
+
+fn databases(l: net.Listener) {
+    var o = options(l)
+    o.database = 5
+    using c = redis.connect(o) catch {
+        e => {
+            print("select: {describe(e)}")
+            return
+        }
+    }
+    show(c.command(["XDB"]) catch { e => redis.Reply.Status(describe(e)) })
+    o.database = 99
+    using far = redis.connect(o) catch {
+        e => {
+            print("select out of range: {describe(e)}")
+            return
+        }
+    }
+    print("select out of range accepted")
+}
+
+fn old_server(l: net.Listener) {
+    var o = options(l)
+    o.protocol = 3
+    using c = redis.connect(o) catch {
+        e => {
+            print("hello on old server: {describe(e)}")
+            return
+        }
+    }
+    print("hello on old server accepted")
+}
+
+fn old_server_password(l: net.Listener) {
+    var o = options(l)
+    o.protocol = 3
+    o.password = "x"
+    using c = redis.connect(o) catch {
+        e => {
+            print("hello with password on old server: {describe(e)}")
+            return
+        }
+    }
+    print("hello with password on old server accepted")
+}
+
+fn free_port() -> i64 {
+    using l = net.listen("127.0.0.1", 0) catch {
+        _ => return 0
+    }
+    l.handle.addr.port
+}
+
+fn refused() {
+    let port = free_port()
+    using c = redis.connect(redis.Options { port, connect_timeout: 1000 }) catch {
+        e => {
+            print("refused: {describe(e)}")
+            return
+        }
+    }
+    print("refused: connected")
+}
+
+fn scripted(reply: str) -> io.Stream {
+    let state = new(Drip { data: bytes(reply), at: 0 })
+    io.Stream {
+        read: fn(buf) {
+            let left = state.data.len - state.at
+            if left == 0 {
+                return 0
+            }
+            let n = if left < buf.len { left } else { buf.len }
+            let k = io.copy(buf[..n], state.data[state.at..state.at + n])
+            state.at += k
+            k
+        }
+        write: fn(data) { data.len }
+        close: fn() {}
+    }
+}
+
+fn faulty(label: str, reply: str, limits: redis.Limits) {
+    using c = redis.connect_stream(scripted(reply), redis.Options { limits }) catch {
+        e => {
+            print("{label}: connect {describe(e)}")
+            return
+        }
+    }
+    let h = c.handle
+    print("{label}: first {outcome(fn() -> str? ! redis.Error { redis.get_on(h, "k") })}")
+    print("{label}: then {outcome(fn() -> str? ! redis.Error { redis.get_on(h, "k") })}")
+}
+
+fn malformed_servers() {
+    let normal = redis.Limits {}
+    faulty("garbage", "?garbage\r\n", normal)
+    faulty("oversize bulk", "$100\r\n", redis.Limits { bulk: 10 })
+    faulty("truncated", "$5\r\nab", normal)
+    faulty("server error", "-ERR boom\r\n", normal)
+    faulty("wrong type", "*1\r\n:1\r\n", normal)
+    faulty("bulk", "$2\r\nok\r\n", normal)
+    faulty("too deep", "{text.repeat("*1\r\n", 5)}:1\r\n", redis.Limits { depth: 4 })
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_blocks(embed("std_tls_ca.pem"), "CERTIFICATE") {
+        push(mut out, x509.parse(der) catch {
+            _ => return out
+        })
+    }
+    out
+}
+
+fn encrypted() ! redis.Error {
+    let pem = embed("std_tls_ec.pem")
+    let key = tls.load_key(pem) catch {
+        _ => fail Protocol
+    }
+    let config = tls.Config { certificates: tls.load_certificates(pem), key }
+    using l = net.listen("127.0.0.1", 0) catch {
+        _ => fail Connect
+    }
+    let st = new_store(open_settings())
+    spawn serve_tls(l.handle, st, config)
+    let o = redis.Options { port: l.handle.addr.port, timeout: 5000 }
+    using c = redis.connect_tls(o, tls.Config { server_name: "localhost", roots: roots() })?
+    c.set("secret", "over tls")?
+    print("tls get: {text_or_none(c.get("secret")?)}")
+    print("tls incr: {c.incr("n")?}")
+    redis.close_client(c)
+    print("tls ended: {(<-st.ended) ?? "?"}")
+    using wrong = redis.connect_tls(o, tls.Config { server_name: "other.example", roots: roots() }) catch {
+        e => {
+            print("tls wrong name: {describe(e)}")
+            return
+        }
+    }
+    print("tls wrong name accepted")
+}
+
+fn run(label: str, body: fn() ! redis.Error) {
+    body() catch {
+        e => print("{label} failed: {describe(e)}")
+    }
+}
+
+fn with_server(label: str, settings: Settings, body: fn(net.Listener, *Store) ! redis.Error) {
+    using l = net.listen("127.0.0.1", 0) catch {
+        _ => {
+            print("{label}: listen failed")
+            return
+        }
+    }
+    let st = new_store(settings)
+    spawn serve(l.handle, st)
+    body(l, st) catch {
+        e => print("{label} failed: {describe(e)}")
+    }
+}
+
+fn main() {
+    parser_tests()
+    print(text.quote(str(redis.encode(["SET", "k", "va lue"]))))
+    print(text.quote(str(redis.encode([]))))
+    print(text.quote(str(redis.encode(["ECHO", ""]))))
+
+    with_server("strings", open_settings(), fn(l, st) ! redis.Error { strings(options(l))? })
+    with_server("collections", open_settings(), fn(l, st) ! redis.Error { collections(options(l))? })
+    with_server("resp3", open_settings(), fn(l, st) ! redis.Error { resp3(options(l))? })
+    with_server("pipelines", open_settings(), fn(l, st) ! redis.Error { pipelines(options(l), st)? })
+    with_server("pubsub", open_settings(), fn(l, st) ! redis.Error { pubsub(options(l))? })
+    with_server("pubsub3", open_settings(), fn(l, st) ! redis.Error { pubsub3(options(l))? })
+    with_server("abandoned", open_settings(), fn(l, st) ! redis.Error {
+        abandoned(options(l))?
+        var ended = [(<-st.ended) ?? "?", (<-st.ended) ?? "?"]
+        slices.sort(mut ended)
+        print("ended: {join(ended)}")
+    })
+    with_server("timeout", open_settings(), fn(l, st) ! redis.Error { timeout(options(l))? })
+    with_server("ownership", open_settings(), fn(l, st) ! redis.Error { ownership(options(l), st)? })
+    with_server("scoped", open_settings(), fn(l, st) ! redis.Error {
+        leave(options(l), st)?
+        print("scoped: {(<-st.ended) ?? "?"}")
+    })
+    let guarded = Settings { user: "alice", password: "secret", hello: true }
+    with_server("secured", guarded, fn(l, st) ! redis.Error { secured(l) })
+    with_server("secured hello", guarded, fn(l, st) ! redis.Error { secured_more(l) })
+    with_server("secured default", guarded, fn(l, st) ! redis.Error { secured_default(l) })
+    with_server("databases", open_settings(), fn(l, st) ! redis.Error { databases(l) })
+    let legacy = Settings { user: "", password: "", hello: false }
+    with_server("old server", legacy, fn(l, st) ! redis.Error { old_server(l) })
+    with_server("old server password", legacy, fn(l, st) ! redis.Error { old_server_password(l) })
+    refused()
+    malformed_servers()
+    run("tls", encrypted)
+}

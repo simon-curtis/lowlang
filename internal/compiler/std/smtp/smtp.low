@@ -1,0 +1,639 @@
+import std/io
+import std/mail
+import std/net
+import std/sync
+import std/text
+import std/tls
+
+pub struct Options {
+    pub host: str = "127.0.0.1"
+    pub port: i64 = 25
+    pub hello: str = "localhost"
+    pub username: str = ""
+    pub password: str = ""
+    pub mechanism: Mechanism = Auto
+    pub insecure_auth: bool = false
+    pub timeout: i64 = 0
+    pub connect_timeout: i64 = 0
+    pub limits: Limits = Limits {}
+}
+
+pub struct ClientHandle {
+    stream: io.Stream
+    reader: *io.Reader
+    gate: sync.Mutex
+    timeouts: *net.Timeouts
+    limits: Limits
+    host: str
+    hello: str
+    insecure_auth: bool
+    lock: i64
+    closed: bool
+    pub timeout: i64
+    pub encrypted: bool
+    pub extensions: Extensions
+}
+
+pub struct Client {
+    pub handle: *ClientHandle
+    detached: bool = false
+    drop {
+        if !detached {
+            close_client_on(handle)
+        }
+    }
+}
+
+pub struct Envelope {
+    pub from: str
+    pub to: []str
+    pub eight_bit: bool = false
+    pub utf8: bool = false
+}
+
+pub struct Refusal {
+    pub address: str
+    pub code: i64
+    pub message: str
+}
+
+pub struct Receipt {
+    pub accepted: []str
+    pub refused: []Refusal
+    pub code: i64
+    pub message: str
+}
+
+struct Opened {
+    sender: Reply
+    recipients: []Reply
+}
+
+pub fn adopt(h: *ClientHandle) -> Client {
+    Client { handle: h }
+}
+
+pub fn detach(mut c: Client) -> *ClientHandle {
+    c.detached = true
+    c.handle
+}
+
+fn open(s: io.Stream, timeouts: *net.Timeouts, o: Options, encrypted: bool) -> *ClientHandle {
+    new(ClientHandle {
+        stream: s
+        reader: io.reader(s)
+        gate: sync.mutex()
+        timeouts
+        limits: o.limits
+        host: o.host
+        hello: o.hello
+        insecure_auth: o.insecure_auth
+        lock: 0
+        closed: false
+        timeout: o.timeout
+        encrypted
+        extensions: Extensions {}
+    })
+}
+
+fn apply_timeout(t: *net.Timeouts, millis: i64) {
+    t.read = millis
+    t.write = millis
+}
+
+fn dial(o: Options) -> net.Conn ! Error {
+    using conn = net.dial_within(o.host, o.port, o.connect_timeout) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    conn
+}
+
+fn named(config: tls.Config, host: str) -> tls.Config {
+    var out = config
+    if out.server_name.len == 0 {
+        out.server_name = host
+    }
+    out
+}
+
+pub fn connect(o: Options) -> Client ! Error {
+    using var conn = dial(o)?
+    let wire = net.detach(mut conn)
+    apply_timeout(wire.timeouts, o.timeout)
+    let h = open(net.stream_on(wire), wire.timeouts, o, false)
+    session(h, o) catch {
+        e => fail abandon(h, e)
+    }
+    Client { handle: h }
+}
+
+pub fn connect_starttls(o: Options, config: tls.Config) -> Client ! Error {
+    using var conn = dial(o)?
+    let wire = net.detach(mut conn)
+    apply_timeout(wire.timeouts, o.timeout)
+    let h = open(net.stream_on(wire), wire.timeouts, o, false)
+    secured_session(h, o, config) catch {
+        e => fail abandon(h, e)
+    }
+    Client { handle: h }
+}
+
+pub fn connect_tls(o: Options, config: tls.Config) -> Client ! Error {
+    using var conn = dial(o)?
+    apply_timeout(conn.handle.timeouts, o.timeout)
+    let session_config = named(config, o.host)
+    let secure = tls.client_handle(net.stream(conn), session_config) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    let wire = net.detach(mut conn)
+    let h = open(tls.stream_on(secure), wire.timeouts, o, true)
+    session(h, o) catch {
+        e => fail abandon(h, e)
+    }
+    Client { handle: h }
+}
+
+pub fn connect_stream(s: io.Stream, o: Options) -> Client ! Error {
+    let h = open(s, new(net.Timeouts { read: 0, write: 0 }), o, false)
+    session(h, o) catch {
+        e => fail abandon(h, e)
+    }
+    Client { handle: h }
+}
+
+fn session(h: *ClientHandle, o: Options) ! Error {
+    greet(h)?
+    introduce(h)?
+    credentials(h, o)?
+}
+
+fn secured_session(h: *ClientHandle, o: Options, config: tls.Config) ! Error {
+    greet(h)?
+    introduce(h)?
+    upgrade(h, config)?
+    credentials(h, o)?
+}
+
+fn credentials(h: *ClientHandle, o: Options) ! Error {
+    if o.username.len == 0 {
+        return
+    }
+    login(h, o.username, o.password, o.mechanism)?
+}
+
+pub fn close_client(c: Client) {
+    close_client_on(c.handle)
+}
+
+pub fn close_client_on(h: *ClientHandle) {
+    __lock(mut h.lock)
+    if h.closed {
+        __unlock(mut h.lock)
+        return
+    }
+    h.closed = true
+    __unlock(mut h.lock)
+    h.stream.close()
+}
+
+pub fn set_timeout(c: Client, millis: i64) {
+    set_timeout_on(c.handle, millis)
+}
+
+pub fn set_timeout_on(h: *ClientHandle, millis: i64) {
+    h.timeout = millis
+    apply_timeout(h.timeouts, millis)
+}
+
+fn abandon(h: *ClientHandle, e: Error) -> Error {
+    close_client_on(h)
+    e
+}
+
+fn usable(h: *ClientHandle) ! Error {
+    if h.closed {
+        fail Closed
+    }
+}
+
+fn family_error(r: Reply) -> Error {
+    let message = text_of(r)
+    let kind = family(r)
+    if kind == 4 {
+        return Transient(r.code, message)
+    }
+    if kind == 5 {
+        return Permanent(r.code, message)
+    }
+    Protocol
+}
+
+fn transmit(h: *ClientHandle, payload: []u8) ! Error {
+    io.write_all(h.stream, payload) catch {
+        e => fail abandon(h, transport(e))
+    }
+}
+
+fn receive(h: *ClientHandle) -> Reply ! Error {
+    read_reply(h.reader, h.limits) catch {
+        e => fail abandon(h, e)
+    }
+}
+
+fn exchange(h: *ClientHandle, line: str) -> Reply ! Error {
+    transmit(h, bytes("{line}\r\n"))?
+    receive(h)
+}
+
+fn expect_positive(r: Reply) ! Error {
+    if !positive(r) {
+        fail family_error(r)
+    }
+}
+
+fn clean(label: str, s: str) ! Error {
+    for c in bytes(s) {
+        if c == '\r' || c == '\n' || c == 0 {
+            fail Invalid(mail.Error.HeaderInjection(label))
+        }
+    }
+}
+
+fn greet(h: *ClientHandle) ! Error {
+    let r = receive(h)?
+    expect_positive(r)?
+}
+
+fn first_line(r: Reply) -> str {
+    if r.lines.len == 0 {
+        return ""
+    }
+    r.lines[0]
+}
+
+fn introduce(h: *ClientHandle) ! Error {
+    clean("EHLO", h.hello)?
+    let r = exchange(h, "EHLO {h.hello}")?
+    if positive(r) {
+        h.extensions = parse_extensions(r)
+        return
+    }
+    if family(r) != 5 {
+        fail family_error(r)
+    }
+    let fallback = exchange(h, "HELO {h.hello}")?
+    expect_positive(fallback)?
+    h.extensions = Extensions { greeting: first_line(fallback) }
+}
+
+pub fn start_tls(c: Client, config: tls.Config) ! Error {
+    start_tls_on(c.handle, config)
+}
+
+pub fn start_tls_on(h: *ClientHandle, config: tls.Config) ! Error {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    usable(h)?
+    upgrade(h, config)?
+}
+
+fn upgrade(h: *ClientHandle, config: tls.Config) ! Error {
+    if h.encrypted {
+        return
+    }
+    if !h.extensions.starttls {
+        fail Unsupported("STARTTLS")
+    }
+    let r = exchange(h, "STARTTLS")?
+    expect_positive(r)?
+    if io.buffered(h.reader) > 0 {
+        fail abandon(h, Protocol)
+    }
+    let session_config = named(config, h.host)
+    let secure = tls.client_handle(h.stream, session_config) catch {
+        TimedOut => fail abandon(h, Timeout)
+        _ => fail abandon(h, Connect)
+    }
+    h.stream = tls.stream_on(secure)
+    h.reader = io.reader(h.stream)
+    h.encrypted = true
+    introduce(h)?
+}
+
+pub fn authenticate(c: Client, username: str, password: str, mechanism: Mechanism) ! Error {
+    authenticate_on(c.handle, username, password, mechanism)
+}
+
+pub fn authenticate_on(h: *ClientHandle, username: str, password: str, mechanism: Mechanism) ! Error {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    usable(h)?
+    login(h, username, password, mechanism)?
+}
+
+fn sends_password(m: Mechanism) -> bool {
+    match m {
+        CramMd5 => false
+        _ => true
+    }
+}
+
+fn select_mechanism(h: *ClientHandle, requested: Mechanism) -> Mechanism ! Error {
+    let advertised = h.extensions.mechanisms
+    match requested {
+        Auto => {
+            let found = choose(advertised, h.encrypted)
+            match found {
+                some(m) => return m
+                none => fail Unsupported("AUTH")
+            }
+        }
+        _ => {}
+    }
+    if !supported(advertised, requested) {
+        fail Unsupported(mechanism_name(requested))
+    }
+    requested
+}
+
+fn login(h: *ClientHandle, username: str, password: str, requested: Mechanism) ! Error {
+    let chosen = select_mechanism(h, requested)?
+    if !h.encrypted && !h.insecure_auth && sends_password(chosen) {
+        fail Insecure
+    }
+    match chosen {
+        Plain => auth_plain(h, username, password)?
+        Login => auth_login(h, username, password)?
+        CramMd5 => auth_cram_md5(h, username, password)?
+        XOAuth2 => auth_xoauth2(h, username, password)?
+        Auto => fail Unsupported("AUTH")
+    }
+}
+
+fn authenticated(r: Reply) ! Error {
+    if positive(r) {
+        return
+    }
+    if family(r) == 4 {
+        fail family_error(r)
+    }
+    fail Auth(text_of(r))
+}
+
+fn challenged(r: Reply) ! Error {
+    if r.code == 334 {
+        return
+    }
+    authenticated(r)?
+    fail Protocol
+}
+
+fn auth_plain(h: *ClientHandle, username: str, password: str) ! Error {
+    let r = exchange(h, "AUTH PLAIN {plain_response(username, password)}")?
+    authenticated(r)?
+}
+
+fn auth_login(h: *ClientHandle, username: str, password: str) ! Error {
+    let start = exchange(h, "AUTH LOGIN")?
+    challenged(start)?
+    let user_step = exchange(h, login_response(username))?
+    challenged(user_step)?
+    let done = exchange(h, login_response(password))?
+    authenticated(done)?
+}
+
+fn auth_cram_md5(h: *ClientHandle, username: str, password: str) ! Error {
+    let start = exchange(h, "AUTH CRAM-MD5")?
+    challenged(start)?
+    let challenge = decode_challenge(first_line(start)) catch {
+        _ => fail abandon(h, Protocol)
+    }
+    let response = cram_md5_response(username, password, challenge)
+    let done = exchange(h, response)?
+    authenticated(done)?
+}
+
+fn oauth_failure(first: Reply, last: Reply) -> Error {
+    let detail = decode_challenge(first_line(first)) catch {
+        _ => text_of(last)
+    }
+    Auth(detail)
+}
+
+fn auth_xoauth2(h: *ClientHandle, username: str, token: str) ! Error {
+    let r = exchange(h, "AUTH XOAUTH2 {xoauth2_response(username, token)}")?
+    if r.code != 334 {
+        authenticated(r)?
+        return
+    }
+    let last = exchange(h, "")?
+    fail oauth_failure(r, last)
+}
+
+fn simple(h: *ClientHandle, line: str) ! Error {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    usable(h)?
+    let r = exchange(h, line)?
+    expect_positive(r)?
+}
+
+pub fn noop(c: Client) ! Error {
+    simple(c.handle, "NOOP")?
+}
+
+pub fn noop_on(h: *ClientHandle) ! Error {
+    simple(h, "NOOP")?
+}
+
+pub fn reset(c: Client) ! Error {
+    simple(c.handle, "RSET")?
+}
+
+pub fn reset_on(h: *ClientHandle) ! Error {
+    simple(h, "RSET")?
+}
+
+pub fn quit(c: Client) {
+    quit_on(c.handle)
+}
+
+pub fn quit_on(h: *ClientHandle) {
+    sync.lock(h.gate)
+    if !h.closed {
+        attempt(h, "QUIT")
+    }
+    sync.unlock(h.gate)
+    close_client_on(h)
+}
+
+pub fn send(c: Client, m: mail.Message) -> Receipt ! Error {
+    send_on(c.handle, m)
+}
+
+pub fn send_on(h: *ClientHandle, m: mail.Message) -> Receipt ! Error {
+    let rendered = mail.render(m) catch {
+        e => fail Invalid(e)
+    }
+    let to = mail.recipients(m) catch {
+        e => fail Invalid(e)
+    }
+    let envelope = Envelope {
+        from: m.from.email
+        to
+        eight_bit: mail.needs_8bit(m)
+        utf8: mail.needs_utf8(m)
+    }
+    send_raw_on(h, envelope, bytes(rendered))
+}
+
+pub fn send_raw(c: Client, e: Envelope, data: []u8) -> Receipt ! Error {
+    send_raw_on(c.handle, e, data)
+}
+
+pub fn send_raw_on(h: *ClientHandle, e: Envelope, data: []u8) -> Receipt ! Error {
+    check_envelope(e)?
+    let block = dot_stuff(data)
+    let size = block.len - 3
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    usable(h)?
+    check_capabilities(h, e, size)?
+    let opened = open_envelope(h, e, size)?
+    deliver(h, e, opened, block)?
+}
+
+fn check_path(address: str) ! Error {
+    if !mail.valid_email(address) {
+        fail Invalid(mail.Error.InvalidAddress(address))
+    }
+}
+
+fn check_envelope(e: Envelope) ! Error {
+    if e.from.len > 0 {
+        check_path(e.from)?
+    }
+    if e.to.len == 0 {
+        fail Invalid(mail.Error.NoRecipients)
+    }
+    for address in e.to {
+        check_path(address)?
+    }
+}
+
+fn check_capabilities(h: *ClientHandle, e: Envelope, size: i64) ! Error {
+    if e.utf8 && !h.extensions.smtputf8 {
+        fail Unsupported("SMTPUTF8")
+    }
+    if e.eight_bit && !h.extensions.eight_bit_mime {
+        fail Unsupported("8BITMIME")
+    }
+    if h.extensions.size > 0 && size > h.extensions.size {
+        fail MessageTooLarge
+    }
+}
+
+fn sender_command(h: *ClientHandle, e: Envelope, size: i64) -> str {
+    var out = "MAIL FROM:<{e.from}>"
+    if h.extensions.size > 0 {
+        out = "{out} SIZE={size}"
+    }
+    if e.eight_bit {
+        out = "{out} BODY=8BITMIME"
+    }
+    if e.utf8 {
+        out = "{out} SMTPUTF8"
+    }
+    out
+}
+
+fn envelope_lines(h: *ClientHandle, e: Envelope, size: i64) -> []str {
+    var lines = [sender_command(h, e, size)]
+    for address in e.to {
+        push(mut lines, "RCPT TO:<{address}>")
+    }
+    lines
+}
+
+fn open_envelope(h: *ClientHandle, e: Envelope, size: i64) -> Opened ! Error {
+    let lines = envelope_lines(h, e, size)
+    if h.extensions.pipelining {
+        return pipelined(h, lines)
+    }
+    stepwise(h, lines)
+}
+
+fn pipelined(h: *ClientHandle, lines: []str) -> Opened ! Error {
+    var payload: []u8 = []
+    for line in lines {
+        text.append(mut payload, "{line}\r\n")
+    }
+    transmit(h, payload)?
+    var replies: []Reply = []
+    for _ in 0..lines.len {
+        let r = receive(h)?
+        push(mut replies, r)
+    }
+    opened_from(replies)
+}
+
+fn stepwise(h: *ClientHandle, lines: []str) -> Opened ! Error {
+    var replies: []Reply = []
+    for line in lines {
+        let r = exchange(h, line)?
+        push(mut replies, r)
+        if replies.len == 1 && !positive(r) {
+            break
+        }
+    }
+    opened_from(replies)
+}
+
+fn opened_from(replies: []Reply) -> Opened {
+    var rest: []Reply = []
+    for i in 1..replies.len {
+        push(mut rest, replies[i])
+    }
+    Opened { sender: replies[0], recipients: rest }
+}
+
+fn attempt(h: *ClientHandle, line: str) {
+    let r = exchange(h, line) catch {
+        _ => return
+    }
+}
+
+fn abort_transaction(h: *ClientHandle) {
+    attempt(h, "RSET")
+}
+
+fn deliver(h: *ClientHandle, e: Envelope, opened: Opened, block: []u8) -> Receipt ! Error {
+    if !positive(opened.sender) {
+        fail family_error(opened.sender)
+    }
+    var accepted: []str = []
+    var refused: []Refusal = []
+    for i, address in e.to {
+        let r = opened.recipients[i]
+        if positive(r) {
+            push(mut accepted, address)
+        } else {
+            push(mut refused, Refusal { address, code: r.code, message: text_of(r) })
+        }
+    }
+    if accepted.len == 0 {
+        abort_transaction(h)
+        fail family_error(opened.recipients[0])
+    }
+    let go_ahead = exchange(h, "DATA")?
+    if go_ahead.code != 354 {
+        abort_transaction(h)
+        fail family_error(go_ahead)
+    }
+    transmit(h, block)?
+    let done = receive(h)?
+    expect_positive(done)?
+    Receipt { accepted, refused, code: done.code, message: text_of(done) }
+}

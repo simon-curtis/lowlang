@@ -1,0 +1,965 @@
+import std/io
+import std/net
+import std/sync
+import std/text
+import std/tls
+
+pub struct Options {
+    pub host: str = "127.0.0.1"
+    pub port: i64 = 6379
+    pub username: str = ""
+    pub password: str = ""
+    pub database: i64 = 0
+    pub protocol: i64 = 2
+    pub timeout: i64 = 0
+    pub connect_timeout: i64 = 0
+    pub buffer: i64 = 256
+    pub limits: Limits = Limits {}
+}
+
+pub struct ClientHandle {
+    stream: io.Stream
+    reader: *io.Reader
+    gate: sync.Mutex
+    timeouts: *net.Timeouts
+    timeout: i64
+    limits: Limits
+    stop: chan[bool]
+    buffer: i64
+    lock: i64
+    closed: bool
+    subscribed: bool
+    pub protocol: i64
+}
+
+pub struct Client {
+    pub handle: *ClientHandle
+    detached: bool = false
+    drop {
+        if !detached {
+            close_client_on(handle)
+        }
+    }
+}
+
+pub struct Pipeline {
+    pub commands: [][]str
+}
+
+pub struct SetOptions {
+    pub ex: i64 = 0
+    pub px: i64 = 0
+    pub nx: bool = false
+    pub xx: bool = false
+    pub keep_ttl: bool = false
+}
+
+pub struct Field {
+    pub name: str
+    pub value: str
+}
+
+pub struct Scored {
+    pub member: str
+    pub score: f64
+}
+
+pub struct Message {
+    pub pattern: str
+    pub channel: str
+    pub payload: str
+}
+
+pub struct Subscription {
+    pub messages: chan[Message]
+    handle: *ClientHandle
+    patterns: bool
+}
+
+pub fn adopt(h: *ClientHandle) -> Client {
+    Client { handle: h }
+}
+
+pub fn detach(mut c: Client) -> *ClientHandle {
+    c.detached = true
+    c.handle
+}
+
+fn open(s: io.Stream, timeouts: *net.Timeouts, o: Options) -> *ClientHandle {
+    new(ClientHandle {
+        stream: s
+        reader: io.reader(s)
+        gate: sync.mutex()
+        timeouts
+        timeout: o.timeout
+        limits: o.limits
+        stop: chan[bool]()
+        buffer: o.buffer
+        lock: 0
+        closed: false
+        subscribed: false
+        protocol: 2
+    })
+}
+
+fn apply_timeout(t: *net.Timeouts, millis: i64) {
+    t.read = millis
+    t.write = millis
+}
+
+fn established(h: *ClientHandle, o: Options) -> Client ! Error {
+    handshake(h, o) catch {
+        e => {
+            close_client_on(h)
+            fail e
+        }
+    }
+    Client { handle: h }
+}
+
+fn dial(o: Options) -> net.Conn ! Error {
+    using conn = net.dial_within(o.host, o.port, o.connect_timeout) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    conn
+}
+
+pub fn connect(o: Options) -> Client ! Error {
+    using var conn = dial(o)?
+    let wire = net.detach(mut conn)
+    apply_timeout(wire.timeouts, o.timeout)
+    let h = open(net.stream_on(wire), wire.timeouts, o)
+    established(h, o)
+}
+
+pub fn connect_tls(o: Options, config: tls.Config) -> Client ! Error {
+    using var conn = dial(o)?
+    apply_timeout(conn.handle.timeouts, o.timeout)
+    var named = config
+    if named.server_name.len == 0 {
+        named.server_name = o.host
+    }
+    let session = tls.client_handle(net.stream(conn), named) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    let wire = net.detach(mut conn)
+    let h = open(tls.stream_on(session), wire.timeouts, o)
+    established(h, o)
+}
+
+pub fn connect_stream(s: io.Stream, o: Options) -> Client ! Error {
+    let h = open(s, new(net.Timeouts { read: 0, write: 0 }), o)
+    established(h, o)
+}
+
+fn handshake(h: *ClientHandle, o: Options) ! Error {
+    if o.protocol == 3 {
+        hello(h, o)?
+    } else if o.password.len > 0 {
+        authenticate(h, o)?
+    }
+    if o.database != 0 {
+        let reply = command_on(h, ["SELECT", "{o.database}"])?
+        match failure_text(reply) {
+            some(t) => fail Server(t)
+            none => {}
+        }
+    }
+}
+
+fn hello(h: *ClientHandle, o: Options) ! Error {
+    var args = ["HELLO", "3"]
+    if o.password.len > 0 {
+        let user = if o.username.len > 0 { o.username } else { "default" }
+        args = ["HELLO", "3", "AUTH", user, o.password]
+    }
+    let reply = command_on(h, args)?
+    match failure_text(reply) {
+        some(t) => {
+            if o.password.len > 0 {
+                fail Auth(t)
+            }
+            fail Unsupported
+        }
+        none => {}
+    }
+    h.protocol = 3
+}
+
+fn authenticate(h: *ClientHandle, o: Options) ! Error {
+    var args = ["AUTH", o.password]
+    if o.username.len > 0 {
+        args = ["AUTH", o.username, o.password]
+    }
+    let reply = command_on(h, args)?
+    match failure_text(reply) {
+        some(t) => fail Auth(t)
+        none => {}
+    }
+}
+
+fn failure_text(r: Reply) -> str? {
+    match r {
+        Failure(t) => some(t)
+        _ => none
+    }
+}
+
+pub fn close_client(c: Client) {
+    close_client_on(c.handle)
+}
+
+pub fn close_client_on(h: *ClientHandle) {
+    __lock(mut h.lock)
+    if h.closed {
+        __unlock(mut h.lock)
+        return
+    }
+    h.closed = true
+    __unlock(mut h.lock)
+    close(h.stop)
+    h.stream.close()
+}
+
+pub fn set_timeout(c: Client, millis: i64) {
+    set_timeout_on(c.handle, millis)
+}
+
+pub fn set_timeout_on(h: *ClientHandle, millis: i64) {
+    h.timeout = millis
+    apply_timeout(h.timeouts, millis)
+}
+
+fn abandon(h: *ClientHandle, e: Error) -> Error {
+    close_client_on(h)
+    e
+}
+
+fn usable(h: *ClientHandle) ! Error {
+    if h.closed {
+        fail Closed
+    }
+    if h.subscribed {
+        fail Subscribed
+    }
+}
+
+fn send(h: *ClientHandle, payload: []u8) ! Error {
+    io.write_all(h.stream, payload) catch {
+        e => fail abandon(h, transport(e))
+    }
+}
+
+fn receive(h: *ClientHandle) -> Reply ! Error {
+    for {
+        let reply = read_reply(h.reader, h.limits) catch {
+            e => fail abandon(h, e)
+        }
+        match reply {
+            Push(items) => continue
+            _ => return reply
+        }
+    }
+}
+
+fn exchange(h: *ClientHandle, payload: []u8, expected: i64) -> []Reply ! Error {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    usable(h)?
+    send(h, payload)?
+    var replies: []Reply = []
+    for _ in 0..expected {
+        let reply = receive(h)?
+        push(mut replies, reply)
+    }
+    replies
+}
+
+pub fn command(c: Client, args: []str) -> Reply ! Error {
+    command_on(c.handle, args)
+}
+
+pub fn command_on(h: *ClientHandle, args: []str) -> Reply ! Error {
+    let replies = exchange(h, encode(args), 1)?
+    replies[0]
+}
+
+pub fn pipeline() -> Pipeline {
+    Pipeline { commands: [] }
+}
+
+pub fn queue(mut p: Pipeline, args: []str) {
+    push(mut p.commands, args)
+}
+
+pub fn flush(c: Client, p: Pipeline) -> []Reply ! Error {
+    flush_on(c.handle, p)
+}
+
+pub fn flush_on(h: *ClientHandle, p: Pipeline) -> []Reply ! Error {
+    run_pipeline_on(h, p.commands)
+}
+
+pub fn run_pipeline(c: Client, commands: [][]str) -> []Reply ! Error {
+    run_pipeline_on(c.handle, commands)
+}
+
+pub fn run_pipeline_on(h: *ClientHandle, commands: [][]str) -> []Reply ! Error {
+    if commands.len == 0 {
+        return []
+    }
+    exchange(h, encode_all(commands), commands.len)
+}
+
+fn encode_all(commands: [][]str) -> []u8 {
+    var out: []u8 = []
+    for args in commands {
+        encode_into(mut out, args)
+    }
+    out
+}
+
+pub fn transaction(c: Client, commands: [][]str) -> []Reply ! Error {
+    transaction_on(c.handle, commands)
+}
+
+pub fn transaction_on(h: *ClientHandle, commands: [][]str) -> []Reply ! Error {
+    var all: [][]str = [["MULTI"]]
+    for args in commands {
+        push(mut all, args)
+    }
+    push(mut all, ["EXEC"])
+    let replies = exchange(h, encode_all(all), all.len)?
+    for r in replies[..replies.len - 1] {
+        match failure_text(r) {
+            some(t) => fail Server(t)
+            none => {}
+        }
+    }
+    exec_items(replies[replies.len - 1])
+}
+
+fn exec_items(r: Reply) -> []Reply ! Error {
+    match r {
+        Array(items) => items
+        Nil => fail Aborted
+        Failure(t) => fail Server(t)
+        _ => fail Type
+    }
+}
+
+pub fn multi(c: Client) ! Error {
+    multi_on(c.handle)?
+}
+
+pub fn multi_on(h: *ClientHandle) ! Error {
+    let reply = call(h, ["MULTI"])?
+    expect_ok(reply)?
+}
+
+pub fn exec(c: Client) -> []Reply ! Error {
+    exec_on(c.handle)
+}
+
+pub fn exec_on(h: *ClientHandle) -> []Reply ! Error {
+    let reply = command_on(h, ["EXEC"])?
+    exec_items(reply)
+}
+
+pub fn discard(c: Client) ! Error {
+    discard_on(c.handle)?
+}
+
+pub fn discard_on(h: *ClientHandle) ! Error {
+    let reply = call(h, ["DISCARD"])?
+    expect_ok(reply)?
+}
+
+pub fn watch(c: Client, keys: []str) ! Error {
+    watch_on(c.handle, keys)?
+}
+
+pub fn watch_on(h: *ClientHandle, keys: []str) ! Error {
+    let args = with(["WATCH"], keys)
+    let reply = call(h, args)?
+    expect_ok(reply)?
+}
+
+pub fn unwatch(c: Client) ! Error {
+    unwatch_on(c.handle)?
+}
+
+pub fn unwatch_on(h: *ClientHandle) ! Error {
+    let reply = call(h, ["UNWATCH"])?
+    expect_ok(reply)?
+}
+
+fn call(h: *ClientHandle, args: []str) -> Reply ! Error {
+    let reply = command_on(h, args)?
+    match failure_text(reply) {
+        some(t) => fail Server(t)
+        none => reply
+    }
+}
+
+fn with(prefix: []str, rest: []str) -> []str {
+    var out = prefix
+    for item in rest {
+        push(mut out, item)
+    }
+    out
+}
+
+fn expect_ok(r: Reply) ! Error {
+    match r {
+        Status(t) => {
+            if t != "OK" && t != "QUEUED" {
+                fail Type
+            }
+        }
+        _ => fail Type
+    }
+}
+
+fn integer(r: Reply) -> i64 ! Error {
+    match r {
+        Integer(v) => v
+        _ => fail Type
+    }
+}
+
+fn boolean(r: Reply) -> bool ! Error {
+    match r {
+        Integer(v) => v != 0
+        Boolean(v) => v
+        _ => fail Type
+    }
+}
+
+fn text_of(r: Reply) -> str ! Error {
+    match r {
+        Bulk(d) => str(d)
+        Status(t) => t
+        Verbatim(f, t) => t
+        Integer(v) => "{v}"
+        BigNumber(d) => d
+        _ => fail Type
+    }
+}
+
+fn optional_text(r: Reply) -> str? ! Error {
+    match r {
+        Nil => none
+        _ => {
+            let value = text_of(r)?
+            some(value)
+        }
+    }
+}
+
+fn items_of(r: Reply) -> []Reply ! Error {
+    match r {
+        Array(items) => items
+        Set(items) => items
+        Push(items) => items
+        Nil => []
+        _ => fail Type
+    }
+}
+
+fn texts(r: Reply) -> []str ! Error {
+    var out: []str = []
+    let items = items_of(r)?
+    for item in items {
+        let value = text_of(item)?
+        push(mut out, value)
+    }
+    out
+}
+
+fn score_of(r: Reply) -> f64 ! Error {
+    match r {
+        Double(v) => v
+        Integer(v) => f64(v)
+        Bulk(d) => parse_score(str(d))?
+        _ => fail Type
+    }
+}
+
+fn parse_score(s: str) -> f64 ! Error {
+    text.parse_float(s) catch {
+        _ => fail Protocol
+    }
+}
+
+fn fields_of(r: Reply) -> []Field ! Error {
+    var out: []Field = []
+    match r {
+        Map(entries) => {
+            for e in entries {
+                let name = text_of(e.key)?
+                let value = text_of(e.value)?
+                push(mut out, Field { name, value })
+            }
+        }
+        _ => {
+            let items = items_of(r)?
+            if items.len % 2 != 0 {
+                fail Protocol
+            }
+            var i = 0
+            for i < items.len {
+                let name = text_of(items[i])?
+                let value = text_of(items[i + 1])?
+                push(mut out, Field { name, value })
+                i += 2
+            }
+        }
+    }
+    out
+}
+
+fn scored_of(r: Reply) -> []Scored ! Error {
+    let items = items_of(r)?
+    var out: []Scored = []
+    if items.len > 0 && is_array(items[0]) {
+        for pair in items {
+            let two = items_of(pair)?
+            if two.len != 2 {
+                fail Protocol
+            }
+            let member = text_of(two[0])?
+            let score = score_of(two[1])?
+            push(mut out, Scored { member, score })
+        }
+        return out
+    }
+    if items.len % 2 != 0 {
+        fail Protocol
+    }
+    var i = 0
+    for i < items.len {
+        let member = text_of(items[i])?
+        let score = score_of(items[i + 1])?
+        push(mut out, Scored { member, score })
+        i += 2
+    }
+    out
+}
+
+fn is_array(r: Reply) -> bool {
+    match r {
+        Array(items) => true
+        _ => false
+    }
+}
+
+pub fn ping(c: Client) ! Error {
+    ping_on(c.handle)?
+}
+
+pub fn ping_on(h: *ClientHandle) ! Error {
+    let reply = call(h, ["PING"])?
+    match reply {
+        Status(t) => {
+            if t != "PONG" {
+                fail Type
+            }
+        }
+        Bulk(d) => {}
+        _ => fail Type
+    }
+}
+
+pub fn get(c: Client, key: str) -> str? ! Error {
+    get_on(c.handle, key)
+}
+
+pub fn get_on(h: *ClientHandle, key: str) -> str? ! Error {
+    let reply = call(h, ["GET", key])?
+    optional_text(reply)
+}
+
+pub fn set(c: Client, key: str, value: str) ! Error {
+    set_on(c.handle, key, value)?
+}
+
+pub fn set_on(h: *ClientHandle, key: str, value: str) ! Error {
+    let reply = call(h, ["SET", key, value])?
+    expect_ok(reply)?
+}
+
+pub fn set_with(c: Client, key: str, value: str, o: SetOptions) -> bool ! Error {
+    set_with_on(c.handle, key, value, o)
+}
+
+pub fn set_with_on(h: *ClientHandle, key: str, value: str, o: SetOptions) -> bool ! Error {
+    var args = ["SET", key, value]
+    if o.ex > 0 {
+        args = with(args, ["EX", "{o.ex}"])
+    }
+    if o.px > 0 {
+        args = with(args, ["PX", "{o.px}"])
+    }
+    if o.nx {
+        push(mut args, "NX")
+    }
+    if o.xx {
+        push(mut args, "XX")
+    }
+    if o.keep_ttl {
+        push(mut args, "KEEPTTL")
+    }
+    let reply = call(h, args)?
+    match reply {
+        Nil => false
+        _ => {
+            expect_ok(reply)?
+            true
+        }
+    }
+}
+
+pub fn del(c: Client, keys: []str) -> i64 ! Error {
+    del_on(c.handle, keys)
+}
+
+pub fn del_on(h: *ClientHandle, keys: []str) -> i64 ! Error {
+    let args = with(["DEL"], keys)
+    let reply = call(h, args)?
+    integer(reply)
+}
+
+pub fn exists(c: Client, keys: []str) -> i64 ! Error {
+    exists_on(c.handle, keys)
+}
+
+pub fn exists_on(h: *ClientHandle, keys: []str) -> i64 ! Error {
+    let args = with(["EXISTS"], keys)
+    let reply = call(h, args)?
+    integer(reply)
+}
+
+pub fn expire(c: Client, key: str, seconds: i64) -> bool ! Error {
+    expire_on(c.handle, key, seconds)
+}
+
+pub fn expire_on(h: *ClientHandle, key: str, seconds: i64) -> bool ! Error {
+    let reply = call(h, ["EXPIRE", key, "{seconds}"])?
+    boolean(reply)
+}
+
+pub fn ttl(c: Client, key: str) -> i64 ! Error {
+    ttl_on(c.handle, key)
+}
+
+pub fn ttl_on(h: *ClientHandle, key: str) -> i64 ! Error {
+    let reply = call(h, ["TTL", key])?
+    integer(reply)
+}
+
+pub fn incr(c: Client, key: str) -> i64 ! Error {
+    incr_on(c.handle, key)
+}
+
+pub fn incr_on(h: *ClientHandle, key: str) -> i64 ! Error {
+    let reply = call(h, ["INCR", key])?
+    integer(reply)
+}
+
+pub fn incrby(c: Client, key: str, n: i64) -> i64 ! Error {
+    incrby_on(c.handle, key, n)
+}
+
+pub fn incrby_on(h: *ClientHandle, key: str, n: i64) -> i64 ! Error {
+    let reply = call(h, ["INCRBY", key, "{n}"])?
+    integer(reply)
+}
+
+pub fn hget(c: Client, key: str, field: str) -> str? ! Error {
+    hget_on(c.handle, key, field)
+}
+
+pub fn hget_on(h: *ClientHandle, key: str, field: str) -> str? ! Error {
+    let reply = call(h, ["HGET", key, field])?
+    optional_text(reply)
+}
+
+pub fn hset(c: Client, key: str, fields: []Field) -> i64 ! Error {
+    hset_on(c.handle, key, fields)
+}
+
+pub fn hset_on(h: *ClientHandle, key: str, fields: []Field) -> i64 ! Error {
+    var args = ["HSET", key]
+    for f in fields {
+        push(mut args, f.name)
+        push(mut args, f.value)
+    }
+    let reply = call(h, args)?
+    integer(reply)
+}
+
+pub fn hgetall(c: Client, key: str) -> []Field ! Error {
+    hgetall_on(c.handle, key)
+}
+
+pub fn hgetall_on(h: *ClientHandle, key: str) -> []Field ! Error {
+    let reply = call(h, ["HGETALL", key])?
+    fields_of(reply)
+}
+
+pub fn lpush(c: Client, key: str, values: []str) -> i64 ! Error {
+    lpush_on(c.handle, key, values)
+}
+
+pub fn lpush_on(h: *ClientHandle, key: str, values: []str) -> i64 ! Error {
+    let args = with(["LPUSH", key], values)
+    let reply = call(h, args)?
+    integer(reply)
+}
+
+pub fn rpush(c: Client, key: str, values: []str) -> i64 ! Error {
+    rpush_on(c.handle, key, values)
+}
+
+pub fn rpush_on(h: *ClientHandle, key: str, values: []str) -> i64 ! Error {
+    let args = with(["RPUSH", key], values)
+    let reply = call(h, args)?
+    integer(reply)
+}
+
+pub fn lpop(c: Client, key: str) -> str? ! Error {
+    lpop_on(c.handle, key)
+}
+
+pub fn lpop_on(h: *ClientHandle, key: str) -> str? ! Error {
+    let reply = call(h, ["LPOP", key])?
+    optional_text(reply)
+}
+
+pub fn rpop(c: Client, key: str) -> str? ! Error {
+    rpop_on(c.handle, key)
+}
+
+pub fn rpop_on(h: *ClientHandle, key: str) -> str? ! Error {
+    let reply = call(h, ["RPOP", key])?
+    optional_text(reply)
+}
+
+pub fn lrange(c: Client, key: str, start: i64, stop: i64) -> []str ! Error {
+    lrange_on(c.handle, key, start, stop)
+}
+
+pub fn lrange_on(h: *ClientHandle, key: str, start: i64, stop: i64) -> []str ! Error {
+    let reply = call(h, ["LRANGE", key, "{start}", "{stop}"])?
+    texts(reply)
+}
+
+pub fn sadd(c: Client, key: str, members: []str) -> i64 ! Error {
+    sadd_on(c.handle, key, members)
+}
+
+pub fn sadd_on(h: *ClientHandle, key: str, members: []str) -> i64 ! Error {
+    let args = with(["SADD", key], members)
+    let reply = call(h, args)?
+    integer(reply)
+}
+
+pub fn smembers(c: Client, key: str) -> []str ! Error {
+    smembers_on(c.handle, key)
+}
+
+pub fn smembers_on(h: *ClientHandle, key: str) -> []str ! Error {
+    let reply = call(h, ["SMEMBERS", key])?
+    texts(reply)
+}
+
+pub fn zadd(c: Client, key: str, members: []Scored) -> i64 ! Error {
+    zadd_on(c.handle, key, members)
+}
+
+pub fn zadd_on(h: *ClientHandle, key: str, members: []Scored) -> i64 ! Error {
+    var args = ["ZADD", key]
+    for m in members {
+        push(mut args, "{m.score}")
+        push(mut args, m.member)
+    }
+    let reply = call(h, args)?
+    integer(reply)
+}
+
+pub fn zrange(c: Client, key: str, start: i64, stop: i64) -> []str ! Error {
+    zrange_on(c.handle, key, start, stop)
+}
+
+pub fn zrange_on(h: *ClientHandle, key: str, start: i64, stop: i64) -> []str ! Error {
+    let reply = call(h, ["ZRANGE", key, "{start}", "{stop}"])?
+    texts(reply)
+}
+
+pub fn zrange_scores(c: Client, key: str, start: i64, stop: i64) -> []Scored ! Error {
+    zrange_scores_on(c.handle, key, start, stop)
+}
+
+pub fn zrange_scores_on(h: *ClientHandle, key: str, start: i64, stop: i64) -> []Scored ! Error {
+    let reply = call(h, ["ZRANGE", key, "{start}", "{stop}", "WITHSCORES"])?
+    scored_of(reply)
+}
+
+pub fn publish(c: Client, channel: str, message: str) -> i64 ! Error {
+    publish_on(c.handle, channel, message)
+}
+
+pub fn publish_on(h: *ClientHandle, channel: str, message: str) -> i64 ! Error {
+    let reply = call(h, ["PUBLISH", channel, message])?
+    integer(reply)
+}
+
+pub fn subscribe(c: Client, channels: []str) -> Subscription ! Error {
+    subscribe_on(c.handle, channels)
+}
+
+pub fn subscribe_on(h: *ClientHandle, channels: []str) -> Subscription ! Error {
+    start_subscription(h, with(["SUBSCRIBE"], channels), channels.len, false)
+}
+
+pub fn psubscribe(c: Client, patterns: []str) -> Subscription ! Error {
+    psubscribe_on(c.handle, patterns)
+}
+
+pub fn psubscribe_on(h: *ClientHandle, patterns: []str) -> Subscription ! Error {
+    start_subscription(h, with(["PSUBSCRIBE"], patterns), patterns.len, true)
+}
+
+fn start_subscription(h: *ClientHandle, args: []str, expected: i64, patterns: bool) -> Subscription ! Error {
+    if expected == 0 {
+        fail Protocol
+    }
+    let messages = chan[Message](h.buffer)
+    let ready = chan[str](1)
+    begin_subscription(h, args)?
+    spawn pump(h, messages, ready, expected)
+    match <-ready {
+        some(t) => {
+            if t.len > 0 {
+                fail Server(t)
+            }
+        }
+        none => fail Closed
+    }
+    Subscription { messages, handle: h, patterns }
+}
+
+fn begin_subscription(h: *ClientHandle, args: []str) ! Error {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    usable(h)?
+    send(h, encode(args))?
+    h.subscribed = true
+    h.timeouts.read = 0
+}
+
+pub fn unsubscribe(s: Subscription) ! Error {
+    let name = if s.patterns { "PUNSUBSCRIBE" } else { "UNSUBSCRIBE" }
+    sync.lock(s.handle.gate)
+    defer sync.unlock(s.handle.gate)
+    if s.handle.closed {
+        fail Closed
+    }
+    send(s.handle, encode([name]))?
+}
+
+fn pump(h: *ClientHandle, out: chan[Message], ready: chan[str], expected: i64) {
+    var confirmed = 0
+    var signalled = false
+    var clean = false
+    for {
+        let reply = read_reply(h.reader, h.limits) catch {
+            _ => break
+        }
+        match failure_text(reply) {
+            some(t) => {
+                if !signalled {
+                    ready <- t
+                    signalled = true
+                }
+                clean = true
+                break
+            }
+            none => {}
+        }
+        let items = frame(reply)
+        if items.len == 0 {
+            continue
+        }
+        let kind = text_of(items[0]) catch ""
+        if kind == "message" || kind == "pmessage" {
+            let m = message_of(kind, items) catch {
+                _ => break
+            }
+            select {
+                out <- m => {}
+                <-h.stop => break
+            }
+        } else if kind == "subscribe" || kind == "psubscribe" {
+            confirmed += 1
+            if confirmed == expected && !signalled {
+                ready <- ""
+                signalled = true
+            }
+        } else if kind == "unsubscribe" || kind == "punsubscribe" {
+            let remaining = integer_at(items, 2) catch { _ => -1 }
+            if remaining == 0 {
+                clean = true
+                break
+            }
+            if remaining < 0 {
+                break
+            }
+        }
+    }
+    h.subscribed = false
+    h.timeouts.read = h.timeout
+    if !clean {
+        close_client_on(h)
+    }
+    if !signalled {
+        close(ready)
+    }
+    close(out)
+}
+
+fn frame(r: Reply) -> []Reply {
+    match r {
+        Array(items) => items
+        Push(items) => items
+        _ => []
+    }
+}
+
+fn integer_at(items: []Reply, at: i64) -> i64 ! Error {
+    if items.len <= at {
+        fail Protocol
+    }
+    integer(items[at])?
+}
+
+fn message_of(kind: str, items: []Reply) -> Message ! Error {
+    if kind == "message" {
+        if items.len != 3 {
+            fail Protocol
+        }
+        let channel = text_of(items[1])?
+        let payload = text_of(items[2])?
+        return Message { pattern: "", channel, payload }
+    }
+    if items.len != 4 {
+        fail Protocol
+    }
+    let pattern = text_of(items[1])?
+    let channel = text_of(items[2])?
+    let payload = text_of(items[3])?
+    Message { pattern, channel, payload }
+}

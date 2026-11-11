@@ -1,30 +1,61 @@
 import std/net
+import std/sync
 import std/text
 import std/time
 
-struct Cookie {
-    name: str
-    value: str
-    domain: str
-    host_only: bool
-    path: str
-    expires: i64
-    secure: bool
-    created: i64
+pub enum SameSite {
+    Unset
+    NoRestriction
+    Lax
+    Strict
 }
 
-struct Jar {
-    lock: chan[bool]
+pub struct Cookie {
+    pub name: str
+    pub value: str
+    pub domain: str
+    pub host_only: bool
+    pub path: str
+    pub expires: i64
+    pub secure: bool
+    pub http_only: bool
+    pub same_site: SameSite
+    pub created: i64
+    pub accessed: i64
+}
+
+struct JarState {
+    lock: sync.Mutex
     cookies: []Cookie
-    created: i64
+    tick: i64
 }
 
-fn new_jar() -> *Jar {
-    new(Jar { lock: chan[bool](1), cookies: [], created: 0 })
+pub struct CookieJar {
+    state: *JarState
+}
+
+pub fn cookie_jar() -> CookieJar {
+    CookieJar { state: new(JarState { lock: sync.mutex(), cookies: [], tick: 0 }) }
 }
 
 fn session_expiry() -> i64 {
     0x7FFFFFFFFFFFFFFF
+}
+
+fn max_cookie_bytes() -> i64 {
+    4096
+}
+
+fn max_attribute_bytes() -> i64 {
+    1024
+}
+
+fn max_cookies_per_domain() -> i64 {
+    50
+}
+
+fn max_cookies() -> i64 {
+    3000
 }
 
 fn cookie_delimiter(c: u8) -> bool {
@@ -179,6 +210,47 @@ fn path_match(path: str, cookie_path: str) -> bool {
     cookie_path[cookie_path.len - 1] == '/' || path[cookie_path.len] == '/'
 }
 
+fn secure_origin(u: Url) -> bool {
+    u.scheme == "https" || u.scheme == "wss"
+}
+
+fn same_site_of(value: str) -> SameSite {
+    if value == "strict" {
+        return Strict
+    }
+    if value == "lax" {
+        return Lax
+    }
+    if value == "none" {
+        return NoRestriction
+    }
+    Unset
+}
+
+fn max_age_expiry(value: str, now: i64) -> i64? {
+    let negative = value.len > 0 && value[0] == '-'
+    let digits = if negative { value[1..] } else { value }
+    if digits.len == 0 || digits.len > 12 {
+        return none
+    }
+    let n = text.parse_uint(digits, 10) catch -1
+    if n < 0 {
+        return none
+    }
+    if negative || n == 0 { 0 } else { now + n * 1000 }
+}
+
+fn prefix_allows(c: Cookie, u: Url) -> bool {
+    let name = text.lower(c.name)
+    if text.starts_with(name, "__secure-") {
+        return c.secure
+    }
+    if text.starts_with(name, "__host-") {
+        return c.secure && c.host_only && c.path == "/"
+    }
+    true
+}
+
 fn parse_set_cookie(u: Url, line: str, now: i64) -> Cookie? {
     let parts = text.split(line, ';')
     let pair = parts[0]
@@ -187,106 +259,183 @@ fn parse_set_cookie(u: Url, line: str, now: i64) -> Cookie? {
         return none
     }
     let name = text.trim(pair[..eq])
-    if name.len == 0 {
+    let value = text.trim(pair[eq + 1..])
+    if name.len == 0 || name.len + value.len > max_cookie_bytes() {
         return none
     }
     var c = Cookie {
         name
-        value: text.trim(pair[eq + 1..])
+        value
         domain: u.host
         host_only: true
         path: default_path(u.target)
         expires: session_expiry()
         secure: false
+        http_only: false
+        same_site: Unset
         created: 0
+        accessed: 0
     }
     var max_age_seen = false
     for attr in parts[1..] {
         let at = text.index_byte(attr, '=')
         let key = text.lower(text.trim(if at >= 0 { attr[..at] } else { attr }))
-        let value = text.trim(if at >= 0 { attr[at + 1..] } else { "" })
+        let attribute = text.trim(if at >= 0 { attr[at + 1..] } else { "" })
+        if attribute.len > max_attribute_bytes() {
+            continue
+        }
         if key == "max-age" {
-            let negative = value.len > 0 && value[0] == '-'
-            let n = text.parse_uint(if negative { value[1..] } else { value }, 10) catch -1
-            if n >= 0 {
-                max_age_seen = true
-                c.expires = if negative || n == 0 { 0 } else { now + n }
-            }
-        } else if key == "expires" && !max_age_seen {
-            match parse_cookie_date(value) {
+            match max_age_expiry(attribute, now) {
                 some(t) => {
+                    max_age_seen = true
                     c.expires = t
                 }
                 none => {}
             }
-        } else if key == "domain" && value.len > 0 {
-            let d = text.lower(if value[0] == '.' { value[1..] } else { value })
+        } else if key == "expires" && !max_age_seen {
+            match parse_cookie_date(attribute) {
+                some(t) => {
+                    c.expires = t * 1000
+                }
+                none => {}
+            }
+        } else if key == "domain" {
+            let d = text.lower(if attribute.len > 0 && attribute[0] == '.' { attribute[1..] } else { attribute })
+            if d.len == 0 {
+                continue
+            }
             if !domain_match(u.host, d) {
                 return none
             }
             c.domain = d
             c.host_only = false
         } else if key == "path" {
-            c.path = if value.len > 0 && value[0] == '/' { value } else { default_path(u.target) }
+            c.path = if attribute.len > 0 && attribute[0] == '/' { attribute } else { default_path(u.target) }
         } else if key == "secure" {
             c.secure = true
+        } else if key == "httponly" {
+            c.http_only = true
+        } else if key == "samesite" {
+            c.same_site = same_site_of(text.lower(attribute))
         }
+    }
+    if c.secure && !secure_origin(u) || !prefix_allows(c, u) {
+        return none
     }
     c
 }
 
-fn store_cookies(j: *Jar, u: Url, headers: []Header) {
-    let now = time.now()
-    j.lock <- true
-    defer <-j.lock
-    for h in headers {
-        if !text.equal_fold(h.name, "set-cookie") {
-            continue
+fn live_cookies(cookies: []Cookie, now: i64) -> []Cookie {
+    var live: []Cookie = []
+    for c in cookies {
+        if c.expires > now {
+            push(mut live, c)
         }
-        match parse_set_cookie(u, h.value, now) {
-            some(c) => keep_cookie(j, c, now)
-            none => {}
+    }
+    live
+}
+
+fn oldest_index(cookies: []Cookie, domain: str) -> i64 {
+    var found = -1
+    for i, c in cookies {
+        if (domain.len == 0 || c.domain == domain) && (found < 0 || c.accessed < cookies[found].accessed) {
+            found = i
         }
+    }
+    found
+}
+
+fn without_index(cookies: []Cookie, skip: i64) -> []Cookie {
+    var kept: []Cookie = []
+    for i, c in cookies {
+        if i != skip {
+            push(mut kept, c)
+        }
+    }
+    kept
+}
+
+fn count_domain(cookies: []Cookie, domain: str) -> i64 {
+    var n = 0
+    for c in cookies {
+        if c.domain == domain {
+            n += 1
+        }
+    }
+    n
+}
+
+fn trim_jar(s: *JarState, domain: str) {
+    if count_domain(s.cookies, domain) > max_cookies_per_domain() {
+        s.cookies = without_index(s.cookies, oldest_index(s.cookies, domain))
+    }
+    if s.cookies.len > max_cookies() {
+        s.cookies = without_index(s.cookies, oldest_index(s.cookies, ""))
     }
 }
 
-fn keep_cookie(j: *Jar, c: Cookie, now: i64) {
+fn keep_cookie(s: *JarState, u: Url, c: Cookie, now: i64) -> bool {
+    let current = live_cookies(s.cookies, now)
     var fresh = c
-    j.created += 1
-    fresh.created = j.created
+    s.tick += 1
+    fresh.created = s.tick
+    fresh.accessed = s.tick
     var kept: []Cookie = []
-    for old in j.cookies {
+    for old in current {
         if old.name == c.name && old.domain == c.domain && old.path == c.path {
+            if old.secure && !secure_origin(u) {
+                s.cookies = current
+                return false
+            }
             fresh.created = old.created
         } else {
             push(mut kept, old)
         }
     }
-    if c.expires > now {
+    let stored = c.expires > now
+    if stored {
         push(mut kept, fresh)
     }
-    j.cookies = kept
+    s.cookies = kept
+    trim_jar(s, c.domain)
+    stored
 }
 
-fn cookie_header(j: *Jar, u: Url) -> str {
-    let now = time.now()
-    let secure = u.scheme == "https" || u.scheme == "wss"
-    let path = path_of(u.target)
-    j.lock <- true
-    var live: []Cookie = []
-    var chosen: []Cookie = []
-    for c in j.cookies {
-        if c.expires <= now {
+fn store_cookies(j: CookieJar, u: Url, headers: []Header) {
+    let now = time.now_millis()
+    let s = j.state
+    sync.lock(s.lock)
+    defer sync.unlock(s.lock)
+    for h in headers {
+        if !text.equal_fold(h.name, "set-cookie") {
             continue
         }
-        push(mut live, c)
+        match parse_set_cookie(u, h.value, now) {
+            some(c) => {
+                keep_cookie(s, u, c, now)
+            }
+            none => {}
+        }
+    }
+}
+
+fn cookie_header(j: CookieJar, u: Url) -> str {
+    let now = time.now_millis()
+    let secure = secure_origin(u)
+    let path = path_of(u.target)
+    let s = j.state
+    var chosen: []Cookie = []
+    sync.lock(s.lock)
+    s.cookies = live_cookies(s.cookies, now)
+    s.tick += 1
+    for i, c in s.cookies {
         let host_ok = if c.host_only { u.host == c.domain } else { domain_match(u.host, c.domain) }
         if host_ok && path_match(path, c.path) && (!c.secure || secure) {
+            s.cookies[i].accessed = s.tick
             push(mut chosen, c)
         }
     }
-    j.cookies = live
-    <-j.lock
+    sync.unlock(s.lock)
     for i in 1..chosen.len {
         var k = i
         for k > 0 && cookie_before(chosen[k], chosen[k - 1]) {
@@ -308,4 +457,45 @@ fn cookie_before(a: Cookie, b: Cookie) -> bool {
         return a.path.len > b.path.len
     }
     a.created < b.created
+}
+
+pub fn jar_set(j: CookieJar, url: str, set_cookie: str) -> bool {
+    let u = parse_url(url) catch {
+        _ => return false
+    }
+    let now = time.now_millis()
+    let c = match parse_set_cookie(u, set_cookie, now) {
+        some(c) => c
+        none => return false
+    }
+    let s = j.state
+    sync.lock(s.lock)
+    defer sync.unlock(s.lock)
+    keep_cookie(s, u, c, now)
+}
+
+pub fn jar_header(j: CookieJar, url: str) -> str {
+    let u = parse_url(url) catch {
+        _ => return ""
+    }
+    cookie_header(j, u)
+}
+
+pub fn jar_cookies(j: CookieJar) -> []Cookie {
+    let s = j.state
+    sync.lock(s.lock)
+    s.cookies = live_cookies(s.cookies, time.now_millis())
+    var copy: []Cookie = []
+    for c in s.cookies {
+        push(mut copy, c)
+    }
+    sync.unlock(s.lock)
+    copy
+}
+
+pub fn jar_clear(j: CookieJar) {
+    let s = j.state
+    sync.lock(s.lock)
+    s.cookies = []
+    sync.unlock(s.lock)
 }

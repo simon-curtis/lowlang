@@ -1,0 +1,339 @@
+import std/json
+import std/json/pointer
+import std/regex
+import std/text
+
+struct Reference {
+    base: str
+    target: str
+}
+
+struct Builder {
+    index: [str: Entry]
+    patterns: [str: regex.Regex]
+    references: []Reference
+}
+
+enum Kind {
+    Number
+    Positive
+    Count
+    Flag
+    Text
+    List
+    Table
+}
+
+fn kind_phrase(k: Kind) -> str {
+    match k {
+        Number => "a number"
+        Positive => "a number greater than zero"
+        Count => "a non-negative integer"
+        Flag => "a boolean"
+        Text => "a string"
+        List => "an array"
+        Table => "an object"
+    }
+}
+
+fn is_count(v: json.Value) -> bool {
+    match v {
+        Int(n) => n >= 0
+        Float(x) => x >= 0.0 && x == floor(x)
+        _ => false
+    }
+}
+
+fn conforms(v: json.Value, k: Kind) -> bool {
+    match v {
+        Int(n) => k == Number || (k == Positive && n > 0) || k == Count && n >= 0
+        Float(x) => k == Number || (k == Positive && x > 0.0) || (k == Count && is_count(v))
+        Bool(_) => k == Flag
+        Str(_) => k == Text
+        Array(_) => k == List
+        Object(_) => k == Table
+        Null => false
+    }
+}
+
+fn expect(schema: json.Value, name: str, at: str, k: Kind) ! Error {
+    let v = json.get(schema, name) ?? return
+    if !conforms(v, k) {
+        fail Malformed("{at}/{pointer.escape(name)}", "must be {kind_phrase(k)}")
+    }
+}
+
+fn items_of(v: json.Value) -> []json.Value {
+    match v {
+        Array(items) => items
+        _ => []
+    }
+}
+
+fn members_of(v: json.Value) -> []json.Member {
+    match v {
+        Object(members) => members
+        _ => []
+    }
+}
+
+fn text_of(v: json.Value) -> str? {
+    match v {
+        Str(s) => s
+        _ => none
+    }
+}
+
+fn type_names() -> []str {
+    ["null", "boolean", "object", "array", "number", "integer", "string"]
+}
+
+fn known_type(name: str) -> bool {
+    for t in type_names() {
+        if t == name {
+            return true
+        }
+    }
+    false
+}
+
+fn check_type_keyword(schema: json.Value, at: str) ! Error {
+    let v = json.get(schema, "type") ?? return
+    let here = "{at}/type"
+    match v {
+        Str(name) => {
+            if !known_type(name) {
+                fail Malformed(here, "unknown type {name}")
+            }
+        }
+        Array(items) => {
+            if items.len == 0 {
+                fail Malformed(here, "must not be empty")
+            }
+            for i, item in items {
+                let name = text_of(item) ?? fail Malformed(here, "must contain strings")
+                if !known_type(name) {
+                    fail Malformed(here, "unknown type {name}")
+                }
+                for j in 0..i {
+                    if text_of(items[j]) == name {
+                        fail Malformed(here, "must not repeat {name}")
+                    }
+                }
+            }
+        }
+        _ => fail Malformed(here, "must be a string or an array of strings")
+    }
+}
+
+fn strings_only(v: json.Value) -> bool {
+    match v {
+        Array(items) => {
+            for item in items {
+                if text_of(item) == none {
+                    return false
+                }
+            }
+            true
+        }
+        _ => false
+    }
+}
+
+fn check_strings(schema: json.Value, name: str, at: str) ! Error {
+    let v = json.get(schema, name) ?? return
+    if !strings_only(v) {
+        fail Malformed("{at}/{name}", "must be an array of strings")
+    }
+}
+
+fn check_dependent_required(schema: json.Value, at: str) ! Error {
+    let v = json.get(schema, "dependentRequired") ?? return
+    let here = "{at}/dependentRequired"
+    match v {
+        Object(members) => {
+            for m in members {
+                if !strings_only(m.value) {
+                    fail Malformed("{here}/{pointer.escape(m.name)}", "must be an array of strings")
+                }
+            }
+        }
+        _ => fail Malformed(here, "must be an object")
+    }
+}
+
+fn add_pattern(mut b: Builder, pattern: str, at: str) ! Error {
+    match b.patterns[pattern] {
+        some(_) => return
+        none => {}
+    }
+    let re = regex.compile(pattern) catch {
+        Invalid(offset, message) => fail Malformed(at, "invalid pattern at {offset}: {message}")
+    }
+    b.patterns[pattern] = re
+}
+
+fn valid_anchor(s: str) -> bool {
+    if s.len == 0 || !(alpha(s[0]) || s[0] == '_') {
+        return false
+    }
+    for i in 1..s.len {
+        let c = s[i]
+        if !(alpha(c) || numeric(c) || c == '-' || c == '_' || c == '.') {
+            return false
+        }
+    }
+    true
+}
+
+fn apply_id(schema: json.Value, base: str) -> str {
+    let v = json.get(schema, "$id") ?? return base
+    let id = text_of(v) ?? return base
+    strip_fragment(resolve(base, id))
+}
+
+fn declared_id(schema: json.Value) -> str? {
+    let v = json.get(schema, "$id") ?? return none
+    text_of(v)
+}
+
+fn register(mut b: Builder, schema: json.Value, base: str, at: str) -> str ! Error {
+    expect(schema, "$id", at, Text)?
+    expect(schema, "$anchor", at, Text)?
+    expect(schema, "$dynamicAnchor", at, Text)?
+    expect(schema, "$ref", at, Text)?
+    expect(schema, "$dynamicRef", at, Text)?
+    let inner = apply_id(schema, base)
+    let id = declared_id(schema) ?? ""
+    if text.contains(id, "#") && !text.ends_with(id, "#") {
+        fail Malformed("{at}/$id", "must not carry a fragment")
+    }
+    if id.len > 0 {
+        b.index[inner] = Entry { schema, base }
+    }
+    for name in ["$anchor", "$dynamicAnchor"] {
+        let anchor = json.get(schema, name) ?? continue
+        let label = text_of(anchor) ?? continue
+        if !valid_anchor(label) {
+            fail Malformed("{at}/{name}", "must be a plain name")
+        }
+        b.index["{inner}#{label}"] = Entry { schema, base }
+    }
+    for name in ["$ref", "$dynamicRef"] {
+        let target = json.get(schema, name) ?? continue
+        let uri = text_of(target) ?? continue
+        push(mut b.references, Reference { base: inner, target: uri })
+    }
+    inner
+}
+
+fn check_keywords(mut b: Builder, schema: json.Value, at: str) ! Error {
+    for name in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
+        expect(schema, name, at, Number)?
+    }
+    expect(schema, "multipleOf", at, Positive)?
+    for name in ["minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "minContains", "maxContains"] {
+        expect(schema, name, at, Count)?
+    }
+    expect(schema, "uniqueItems", at, Flag)?
+    expect(schema, "format", at, Text)?
+    expect(schema, "pattern", at, Text)?
+    expect(schema, "enum", at, List)?
+    expect(schema, "properties", at, Table)?
+    expect(schema, "patternProperties", at, Table)?
+    expect(schema, "dependentSchemas", at, Table)?
+    expect(schema, "$defs", at, Table)?
+    expect(schema, "definitions", at, Table)?
+    check_type_keyword(schema, at)?
+    check_strings(schema, "required", at)?
+    check_dependent_required(schema, at)?
+    match json.get(schema, "pattern") {
+        some(p) => {
+            let source = text_of(p) ?? return
+            add_pattern(mut b, source, "{at}/pattern")?
+        }
+        none => {}
+    }
+    for m in members_of(json.get(schema, "patternProperties") ?? json.Value.Null) {
+        add_pattern(mut b, m.name, "{at}/patternProperties/{pointer.escape(m.name)}")?
+    }
+}
+
+fn visit_children(mut b: Builder, schema: json.Value, base: str, at: str) ! Error {
+    for name in ["items", "contains", "additionalProperties", "propertyNames", "unevaluatedItems", "unevaluatedProperties", "not", "if", "then", "else"] {
+        let child = json.get(schema, name) ?? continue
+        visit(mut b, child, base, "{at}/{name}")?
+    }
+    for name in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        let list = json.get(schema, name) ?? continue
+        let items = match list {
+            Array(found) => found
+            _ => fail Malformed("{at}/{name}", "must be an array of schemas")
+        }
+        if items.len == 0 && name != "prefixItems" {
+            fail Malformed("{at}/{name}", "must not be empty")
+        }
+        for i, item in items {
+            visit(mut b, item, base, "{at}/{name}/{i}")?
+        }
+    }
+    for name in ["$defs", "definitions", "properties", "patternProperties", "dependentSchemas"] {
+        let table = json.get(schema, name) ?? continue
+        for m in members_of(table) {
+            visit(mut b, m.value, base, "{at}/{name}/{pointer.escape(m.name)}")?
+        }
+    }
+}
+
+fn visit(mut b: Builder, schema: json.Value, base: str, at: str) ! Error {
+    match schema {
+        Bool(_) => return
+        Object(_) => {}
+        _ => fail Malformed(at, "a schema is an object or a boolean")
+    }
+    let inner = register(mut b, schema, base, at)?
+    check_keywords(mut b, schema, at)?
+    visit_children(mut b, schema, inner, at)?
+}
+
+fn lookup(index: [str: Entry], uri: str) -> Entry? {
+    let parts = text.cut(uri, "#")
+    if !parts.found || parts.after.len == 0 {
+        return index[parts.before]
+    }
+    let fragment = percent_decode(parts.after)
+    if fragment[0] != '/' {
+        return index["{parts.before}#{fragment}"]
+    }
+    let start = index[parts.before] ?? return none
+    walk(start, fragment)
+}
+
+fn walk(start: Entry, fragment: str) -> Entry? {
+    let tokens = pointer.parse(fragment) catch {
+        _ => return none
+    }
+    var enclosing = start.base
+    var current = start.schema
+    var inside = apply_id(current, enclosing)
+    for token in tokens {
+        let at = pointer.format([token])
+        let next = pointer.get(current, at) catch {
+            _ => return none
+        }
+        enclosing = inside
+        inside = apply_id(next, enclosing)
+        current = next
+    }
+    Entry { schema: current, base: enclosing }
+}
+
+fn resolve_references(b: Builder) ! Error {
+    for r in b.references {
+        let uri = resolve(r.base, r.target)
+        match lookup(b.index, uri) {
+            some(_) => {}
+            none => fail Unresolved(uri)
+        }
+    }
+}

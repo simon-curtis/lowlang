@@ -1,0 +1,250 @@
+import std/json
+import std/json/pointer
+import std/slices
+import std/text
+
+pub enum Error {
+    Malformed(index: i64, message: str)
+    Pointer(index: i64, cause: pointer.Error)
+    TestFailed(index: i64, path: str)
+}
+
+pub fn apply(doc: json.Value, patch: json.Value) -> json.Value ! Error {
+    let ops = match patch {
+        Array(items) => items
+        _ => fail Malformed(-1, "a patch is an array of operations")
+    }
+    var current = doc
+    for i, op in ops {
+        current = apply_operation(current, op, i)?
+    }
+    current
+}
+
+fn required(op: json.Value, name: str, index: i64) -> json.Value ! Error {
+    match op {
+        Object(_) => json.get(op, name) ?? fail Malformed(index, "missing member {name}")
+        _ => fail Malformed(index, "an operation is an object")
+    }
+}
+
+fn required_text(op: json.Value, name: str, index: i64) -> str ! Error {
+    let v = required(op, name, index)?
+    match v {
+        Str(s) => s
+        _ => fail Malformed(index, "member {name} is a string")
+    }
+}
+
+fn apply_operation(doc: json.Value, op: json.Value, index: i64) -> json.Value ! Error {
+    let name = required_text(op, "op", index)?
+    let path = required_text(op, "path", index)?
+    if name == "add" {
+        let value = required(op, "value", index)?
+        return pointer.add(doc, path, value) catch {
+            e => fail Pointer(index, e)
+        }
+    }
+    if name == "replace" {
+        let value = required(op, "value", index)?
+        return pointer.replace(doc, path, value) catch {
+            e => fail Pointer(index, e)
+        }
+    }
+    if name == "remove" {
+        return pointer.remove(doc, path) catch {
+            e => fail Pointer(index, e)
+        }
+    }
+    if name == "test" {
+        let value = required(op, "value", index)?
+        return check(doc, path, value, index)?
+    }
+    if name == "move" || name == "copy" {
+        let from = required_text(op, "from", index)?
+        return transfer(doc, name == "move", from, path, index)?
+    }
+    fail Malformed(index, "unknown operation {name}")
+}
+
+fn check(doc: json.Value, path: str, value: json.Value, index: i64) -> json.Value ! Error {
+    let found = pointer.get(doc, path) catch {
+        e => fail Pointer(index, e)
+    }
+    if !json.equal(found, value) {
+        fail TestFailed(index, path)
+    }
+    doc
+}
+
+fn transfer(doc: json.Value, remove_source: bool, from: str, path: str, index: i64) -> json.Value ! Error {
+    let value = pointer.get(doc, from) catch {
+        e => fail Pointer(index, e)
+    }
+    if !remove_source {
+        return pointer.add(doc, path, value) catch {
+            e => fail Pointer(index, e)
+        }
+    }
+    if from == path {
+        return doc
+    }
+    if text.starts_with(path, "{from}/") {
+        fail Malformed(index, "cannot move a value into itself")
+    }
+    let removed = pointer.remove(doc, from) catch {
+        e => fail Pointer(index, e)
+    }
+    pointer.add(removed, path, value) catch {
+        e => fail Pointer(index, e)
+    }
+}
+
+pub fn diff(a: json.Value, b: json.Value) -> json.Value {
+    var ops: []json.Value = []
+    diff_at(a, b, "", mut ops)
+    json.Value.Array(ops)
+}
+
+fn operation(name: str, path: str) -> []json.Member {
+    [
+        json.Member { name: "op", value: json.Value.Str(name) }
+        json.Member { name: "path", value: json.Value.Str(path) }
+    ]
+}
+
+fn with_value(name: str, path: str, value: json.Value) -> json.Value {
+    var members = operation(name, path)
+    push(mut members, json.Member { name: "value", value })
+    json.Value.Object(members)
+}
+
+fn without_value(name: str, path: str) -> json.Value {
+    json.Value.Object(operation(name, path))
+}
+
+fn diff_at(a: json.Value, b: json.Value, path: str, mut ops: []json.Value) {
+    if json.equal(a, b) {
+        return
+    }
+    match a {
+        Object(am) => match b {
+            Object(bm) => return diff_objects(am, bm, path, mut ops)
+            _ => {}
+        }
+        Array(ai) => match b {
+            Array(bi) => return diff_arrays(ai, bi, path, mut ops)
+            _ => {}
+        }
+        _ => {}
+    }
+    push(mut ops, with_value("replace", path, b))
+}
+
+fn member_index(members: []json.Member, name: str) -> i64 {
+    for i, m in members {
+        if m.name == name {
+            return i
+        }
+    }
+    -1
+}
+
+fn diff_objects(am: []json.Member, bm: []json.Member, path: str, mut ops: []json.Value) {
+    for m in am {
+        let child = "{path}/{pointer.escape(m.name)}"
+        let i = member_index(bm, m.name)
+        if i < 0 {
+            push(mut ops, without_value("remove", child))
+        } else {
+            diff_at(m.value, bm[i].value, child, mut ops)
+        }
+    }
+    for m in bm {
+        if member_index(am, m.name) < 0 {
+            push(mut ops, with_value("add", "{path}/{pointer.escape(m.name)}", m.value))
+        }
+    }
+}
+
+fn diff_arrays(ai: []json.Value, bi: []json.Value, path: str, mut ops: []json.Value) {
+    let shared = if ai.len < bi.len { ai.len } else { bi.len }
+    for i in 0..shared {
+        diff_at(ai[i], bi[i], "{path}/{i}", mut ops)
+    }
+    var last = ai.len - 1
+    for last >= bi.len {
+        push(mut ops, without_value("remove", "{path}/{last}"))
+        last -= 1
+    }
+    for i in ai.len..bi.len {
+        push(mut ops, with_value("add", "{path}/{i}", bi[i]))
+    }
+}
+
+pub fn merge_patch(target: json.Value, patch: json.Value) -> json.Value {
+    match patch {
+        Object(changes) => merge_members(target, changes)
+        _ => patch
+    }
+}
+
+fn is_null(v: json.Value) -> bool {
+    match v {
+        Null => true
+        _ => false
+    }
+}
+
+fn merge_members(target: json.Value, changes: []json.Member) -> json.Value {
+    var members: []json.Member = match target {
+        Object(existing) => slices.clone(existing)
+        _ => []
+    }
+    for change in changes {
+        let i = member_index(members, change.name)
+        if is_null(change.value) {
+            if i >= 0 {
+                slices.remove(mut members, i)
+            }
+            continue
+        }
+        let base = if i >= 0 { members[i].value } else { json.Value.Null }
+        let merged = json.Member { name: change.name, value: merge_patch(base, change.value) }
+        if i >= 0 {
+            members[i] = merged
+        } else {
+            push(mut members, merged)
+        }
+    }
+    json.Value.Object(members)
+}
+
+pub fn merge_diff(a: json.Value, b: json.Value) -> json.Value {
+    match a {
+        Object(am) => match b {
+            Object(bm) => return json.Value.Object(diff_members(am, bm))
+            _ => {}
+        }
+        _ => {}
+    }
+    b
+}
+
+fn diff_members(am: []json.Member, bm: []json.Member) -> []json.Member {
+    var out: []json.Member = []
+    for m in am {
+        if member_index(bm, m.name) < 0 {
+            push(mut out, json.Member { name: m.name, value: json.Value.Null })
+        }
+    }
+    for m in bm {
+        let i = member_index(am, m.name)
+        if i < 0 {
+            push(mut out, m)
+        } else if !json.equal(am[i].value, m.value) {
+            push(mut out, json.Member { name: m.name, value: merge_diff(am[i].value, m.value) })
+        }
+    }
+    out
+}

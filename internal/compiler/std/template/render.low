@@ -1,0 +1,285 @@
+import std/io
+import std/text
+
+struct Ctx {
+    set: Set
+    root: Data
+    names: []str
+    values: []Data
+    used: i64
+    chain: []*Template
+    out: []u8
+    total: i64
+    sink: io.Stream?
+    depth: i64
+    lenient: i64
+    current: str
+}
+
+fn start(s: Set, data: Data, sink: io.Stream?) -> *Ctx {
+    new(Ctx {
+        set: s, root: data, names: [], values: [], used: 0, chain: [], out: [], total: 0, sink,
+        depth: 0, lenient: 0, current: "",
+    })
+}
+
+fn render_error(c: *Ctx, pos: Pos, message: str) -> Error {
+    Error.Render(c.current, pos.line, pos.column, message)
+}
+
+fn emit(c: *Ctx, s: str) ! Error {
+    c.total += s.len
+    if c.total > c.set.options.max_output {
+        fail Error.TooLarge
+    }
+    text.append(mut c.out, s)
+    if c.out.len >= 16384 {
+        flush(c)?
+    }
+}
+
+fn flush(c: *Ctx) ! Error {
+    match c.sink {
+        some(stream) => {
+            io.write_all(stream, c.out) catch {
+                e => fail Error.Write(e)
+            }
+            c.out = []
+        }
+        none => {}
+    }
+}
+
+fn bind(c: *Ctx, name: str, v: Data) {
+    if c.used < c.names.len {
+        c.names[c.used] = name
+        c.values[c.used] = v
+    } else {
+        push(mut c.names, name)
+        push(mut c.values, v)
+    }
+    c.used += 1
+}
+
+fn lookup(c: *Ctx, name: str) -> Data? {
+    var i = c.used - 1
+    for i >= 0 {
+        if c.names[i] == name {
+            return c.values[i]
+        }
+        i -= 1
+    }
+    none
+}
+
+fn render_named(c: *Ctx, name: str) ! Error {
+    let t = c.set.templates[name] ?? fail Error.NotFound(name, 0, 0, name)
+    render_template(c, t, Pos { line: 0, column: 0 })?
+}
+
+fn enter(c: *Ctx, pos: Pos) ! Error {
+    c.depth += 1
+    if c.depth > c.set.options.max_depth {
+        fail Error.TooDeep(c.current, pos.line, pos.column)
+    }
+}
+
+fn render_template(c: *Ctx, t: *Template, pos: Pos) ! Error {
+    enter(c, pos)?
+    let outer = c.current
+    c.current = t.name
+    if t.extends {
+        let parent = c.set.templates[t.parent] ?? fail Error.NotFound(t.name, t.parent_pos.line, t.parent_pos.column, t.parent)
+        push(mut c.chain, t)
+        render_template(c, parent, t.parent_pos)?
+        c.chain = c.chain[..c.chain.len - 1]
+    } else {
+        render_nodes(c, t.nodes)?
+    }
+    c.current = outer
+    c.depth -= 1
+}
+
+fn render_nodes(c: *Ctx, nodes: []Node) ! Error {
+    for n in nodes {
+        render_node(c, n)?
+    }
+}
+
+fn render_scoped(c: *Ctx, nodes: []Node) ! Error {
+    let mark = c.used
+    render_nodes(c, nodes)?
+    c.used = mark
+}
+
+fn render_node(c: *Ctx, n: Node) ! Error {
+    match n {
+        Text(s) => emit(c, s)?
+        Output(e, pos) => {
+            let v = eval(c, e)?
+            let s = output_text(c, v, pos)?
+            emit(c, s)?
+        }
+        If(branches, otherwise) => render_if(c, branches, otherwise)?
+        Loop(each) => render_each(c, each)?
+        Include(target, pos) => render_include(c, target, pos)?
+        Block(name, body) => render_block(c, name, body)?
+        Let(name, e) => {
+            let v = eval(c, e)?
+            bind(c, name, v)
+        }
+    }
+}
+
+fn render_if(c: *Ctx, branches: []Branch, otherwise: []Node) ! Error {
+    for b in branches {
+        let v = eval(c, b.cond)?
+        if truthy(v) {
+            render_scoped(c, b.body)?
+            return
+        }
+    }
+    render_scoped(c, otherwise)?
+}
+
+fn render_block(c: *Ctx, name: str, body: []Node) ! Error {
+    var chosen = body
+    for t in c.chain {
+        match t.blocks[name] {
+            some(override) => {
+                chosen = override
+                break
+            }
+            none => {}
+        }
+    }
+    render_scoped(c, chosen)?
+}
+
+fn render_include(c: *Ctx, target: Expr, pos: Pos) ! Error {
+    let v = eval(c, target)?
+    let name = as_text(v) ?? fail render_error(c, pos, "include needs a template name")
+    let t = c.set.templates[name] ?? fail Error.NotFound(c.current, pos.line, pos.column, name)
+    let mark = c.used
+    render_template(c, t, pos)?
+    c.used = mark
+}
+
+fn output_text(c: *Ctx, v: Data, pos: Pos) -> str ! Error {
+    match v {
+        Safe(s) => s
+        Str(s) => escaped(c, s)
+        _ => escaped(c, plain(c, v, pos)?)
+    }
+}
+
+fn escaped(c: *Ctx, s: str) -> str {
+    match c.set.options.escape {
+        Html => escape_html(s)
+        None => s
+    }
+}
+
+fn plain(c: *Ctx, v: Data, pos: Pos) -> str ! Error {
+    match v {
+        Null => ""
+        Bool(b) => if b { "true" } else { "false" }
+        Int(n) => "{n}"
+        Float(x) => "{x}"
+        Str(s) => s
+        Safe(s) => s
+        _ => fail render_error(c, pos, "cannot output {kind_name(v)}")
+    }
+}
+
+fn escape_html(s: str) -> str {
+    var clean = true
+    for i in 0..s.len {
+        let ch = s[i]
+        if ch == '&' || ch == '<' || ch == '>' || ch == '"' || ch == '\'' {
+            clean = false
+            break
+        }
+    }
+    if clean {
+        return s
+    }
+    var out: []u8 = []
+    for i in 0..s.len {
+        let ch = s[i]
+        if ch == '&' {
+            text.append(mut out, "&amp;")
+        } else if ch == '<' {
+            text.append(mut out, "&lt;")
+        } else if ch == '>' {
+            text.append(mut out, "&gt;")
+        } else if ch == '"' {
+            text.append(mut out, "&quot;")
+        } else if ch == '\'' {
+            text.append(mut out, "&#39;")
+        } else {
+            push(mut out, ch)
+        }
+    }
+    __str_view(out)
+}
+
+fn bind_loop(c: *Ctx, each: Each, first: Data, second: Data, single: Data) {
+    if each.value != "" {
+        bind(c, each.key, first)
+        bind(c, each.value, second)
+    } else {
+        bind(c, each.key, single)
+    }
+}
+
+fn render_each(c: *Ctx, each: Each) ! Error {
+    let iterable = eval(c, each.iterable)?
+    let mark = c.used
+    match iterable {
+        List(items) => {
+            if items.len == 0 {
+                render_scoped(c, each.empty)?
+                return
+            }
+            bind(c, "@index", Data.Int(0))
+            bind(c, "@first", Data.Bool(true))
+            bind(c, "@last", Data.Bool(false))
+            bind(c, "@length", Data.Int(items.len))
+            let base = c.used
+            for i, item in items {
+                c.used = base
+                c.values[mark] = Data.Int(i)
+                c.values[mark + 1] = Data.Bool(i == 0)
+                c.values[mark + 2] = Data.Bool(i == items.len - 1)
+                bind_loop(c, each, Data.Int(i), item, item)
+                render_nodes(c, each.body)?
+            }
+        }
+        Map(entries) => {
+            if entries.len == 0 {
+                render_scoped(c, each.empty)?
+                return
+            }
+            bind(c, "@index", Data.Int(0))
+            bind(c, "@first", Data.Bool(true))
+            bind(c, "@last", Data.Bool(false))
+            bind(c, "@length", Data.Int(entries.len))
+            let base = c.used
+            var i = 0
+            for k, v in entries {
+                c.used = base
+                c.values[mark] = Data.Int(i)
+                c.values[mark + 1] = Data.Bool(i == 0)
+                c.values[mark + 2] = Data.Bool(i == entries.len - 1)
+                let key = Data.Str(k)
+                bind_loop(c, each, key, v, key)
+                render_nodes(c, each.body)?
+                i += 1
+            }
+        }
+        Null => render_scoped(c, each.empty)?
+        _ => fail render_error(c, each.pos, "cannot loop over {kind_name(iterable)}")
+    }
+    c.used = mark
+}

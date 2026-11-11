@@ -1,0 +1,427 @@
+import std/io
+
+struct Decoder {
+    bits: *BitIn
+    sink: fn([]u8) ! io.Error
+    limit: i64
+    total: i64
+    crc: Crc
+    tt: []u32
+    out: []u8
+    filled: i64
+    lens: []u8
+    selectors: []u8
+    limits: []i64
+    bases: []i64
+    perms: []i64
+    mins: []i64
+    maxs: []i64
+    counts: []i64
+    list: []u8
+}
+
+fn group_size() -> i64 {
+    50
+}
+
+fn max_selectors() -> i64 {
+    18002
+}
+
+fn max_symbols() -> i64 {
+    258
+}
+
+fn code_stride() -> i64 {
+    24
+}
+
+fn max_code_length() -> i64 {
+    20
+}
+
+pub fn decode(r: *io.Reader, sink: fn([]u8) ! io.Error, limit: i64) ! io.Error {
+    let d = new(Decoder {
+        bits: bit_in(r)
+        sink
+        limit
+        total: 0
+        crc: crc_new()
+        tt: []
+        out: io.buffer(65536)
+        filled: 0
+        lens: io.buffer(max_symbols())
+        selectors: io.buffer(max_selectors())
+        limits: __make(6 * code_stride())
+        bases: __make(6 * code_stride())
+        perms: __make(6 * max_symbols())
+        mins: __make(6)
+        maxs: __make(6)
+        counts: __make(256)
+        list: io.buffer(256)
+    })
+    var streams = 0
+    for !exhausted(d.bits)? {
+        stream(d)?
+        streams += 1
+    }
+    if streams == 0 {
+        fail Malformed
+    }
+}
+
+fn stream(d: *Decoder) ! io.Error {
+    let b = d.bits
+    if take(b, 24)? != 0x425A68 {
+        fail Malformed
+    }
+    let level = take(b, 8)? - 0x30
+    if level < 1 || level > 9 {
+        fail Malformed
+    }
+    let max = level * 100000
+    if d.tt.len < max {
+        d.tt = __make(max)
+    }
+    var combined: u32 = 0
+    for {
+        let hi = take(b, 24)?
+        let lo = take(b, 24)?
+        if hi == 0x314159 && lo == 0x265359 {
+            combined = rotate_crc(combined, block(d, max)?)
+        } else if hi == 0x177245 && lo == 0x385090 {
+            if take(b, 32)? != i64(combined) {
+                fail Malformed
+            }
+            align_in(b)
+            return
+        } else {
+            fail Malformed
+        }
+    }
+}
+
+fn block(d: *Decoder, max: i64) -> u32 ! io.Error {
+    let b = d.bits
+    let stored = take(b, 32)?
+    if take_bit(b)? {
+        fail Unsupported
+    }
+    let orig = take(b, 24)?
+    let used = read_map(d)?
+    let groups = take(b, 3)?
+    if groups < 2 || groups > 6 {
+        fail Malformed
+    }
+    let declared = take(b, 15)?
+    if declared < 1 {
+        fail Malformed
+    }
+    let selectors = read_selectors(d, groups, declared)?
+    read_tables(d, groups, used + 2)?
+    let n = read_symbols(d, selectors, used, max)?
+    if orig >= n {
+        fail Malformed
+    }
+    let sum = unpack(d, n, orig)?
+    if i64(sum) != stored {
+        fail Malformed
+    }
+    sum
+}
+
+fn read_map(d: *Decoder) -> i64 ! io.Error {
+    let b = d.bits
+    let ranges = take(b, 16)?
+    var used = 0
+    for i in 0..16 {
+        if ranges >> (15 - i) & 1 == 0 {
+            continue
+        }
+        let members = take(b, 16)?
+        for j in 0..16 {
+            if members >> (15 - j) & 1 == 1 {
+                d.list[used] = u8(i * 16 + j)
+                used += 1
+            }
+        }
+    }
+    if used == 0 {
+        fail Malformed
+    }
+    used
+}
+
+fn read_selectors(d: *Decoder, groups: i64, declared: i64) -> i64 ! io.Error {
+    let b = d.bits
+    let order = io.buffer(6)
+    for i in 0..6 {
+        order[i] = u8(i)
+    }
+    let kept = if declared < max_selectors() { declared } else { max_selectors() }
+    for i in 0..declared {
+        var j = 0
+        for take_bit(b)? {
+            j += 1
+            if j >= groups {
+                fail Malformed
+            }
+        }
+        let v = order[j]
+        for k in 0..j {
+            order[j - k] = order[j - k - 1]
+        }
+        order[0] = v
+        if i < kept {
+            d.selectors[i] = v
+        }
+    }
+    kept
+}
+
+fn read_tables(d: *Decoder, groups: i64, alpha: i64) ! io.Error {
+    let b = d.bits
+    for t in 0..groups {
+        var curr = take(b, 5)?
+        for i in 0..alpha {
+            for {
+                if curr < 1 || curr > max_code_length() {
+                    fail Malformed
+                }
+                if !take_bit(b)? {
+                    break
+                }
+                if take_bit(b)? {
+                    curr -= 1
+                } else {
+                    curr += 1
+                }
+            }
+            d.lens[i] = u8(curr)
+        }
+        build_table(d, t, alpha)
+    }
+}
+
+fn build_table(d: *Decoder, t: i64, alpha: i64) {
+    let count: []i64 = __make(max_code_length() + 2)
+    var min = max_code_length()
+    var max = 1
+    for i in 0..alpha {
+        let l = i64(d.lens[i])
+        count[l] += 1
+        if l < min {
+            min = l
+        }
+        if l > max {
+            max = l
+        }
+    }
+    let row = t * code_stride()
+    var at = t * max_symbols()
+    for len in min..max + 1 {
+        for sym in 0..alpha {
+            if i64(d.lens[sym]) == len {
+                d.perms[at] = sym
+                at += 1
+            }
+        }
+    }
+    var code = 0
+    var index = 0
+    for len in min..max + 1 {
+        d.limits[row + len] = code + count[len] - 1
+        d.bases[row + len] = code - index
+        index += count[len]
+        code = (code + count[len]) << 1
+    }
+    d.mins[t] = min
+    d.maxs[t] = max
+}
+
+fn symbol(d: *Decoder, table: i64, alpha: i64) -> i64 ! io.Error {
+    let b = d.bits
+    if b.held < 20 {
+        refill(b)?
+    }
+    var window = if b.held >= 20 { b.acc >> (b.held - 20) } else { b.acc << (20 - b.held) }
+    window &= 0xFFFFF
+    let w = i64(window)
+    let row = table * code_stride()
+    let max = d.maxs[table]
+    var len = d.mins[table]
+    for len <= max {
+        let code = w >> (20 - len)
+        if code <= d.limits[row + len] {
+            let index = code - d.bases[row + len]
+            if index < 0 || index >= alpha || len > b.held {
+                fail Malformed
+            }
+            b.held -= len
+            return d.perms[table * max_symbols() + index]
+        }
+        len += 1
+    }
+    fail Malformed
+}
+
+fn read_symbols(d: *Decoder, selectors: i64, used: i64, max: i64) -> i64 ! io.Error {
+    let alpha = used + 2
+    let eob = used + 1
+    let tt = d.tt
+    let list = d.list
+    let counts = d.counts
+    for i in 0..256 {
+        counts[i] = 0
+    }
+    var n = 0
+    var run = 0
+    var weight = 1
+    var sel = 0
+    var left = 0
+    var table = 0
+    for {
+        if left == 0 {
+            if sel >= selectors {
+                fail Malformed
+            }
+            table = i64(d.selectors[sel])
+            sel += 1
+            left = group_size()
+        }
+        left -= 1
+        let sym = symbol(d, table, alpha)?
+        if sym <= 1 {
+            if weight > 1 << 21 {
+                fail Malformed
+            }
+            run += weight << sym
+            weight <<= 1
+            continue
+        }
+        if run > 0 {
+            if n + run > max {
+                fail Malformed
+            }
+            let v = list[0]
+            for k in n..n + run {
+                tt[k] = u32(v)
+            }
+            counts[v] += run
+            n += run
+            run = 0
+            weight = 1
+        }
+        if sym == eob {
+            break
+        }
+        if n >= max {
+            fail Malformed
+        }
+        let pos = sym - 1
+        let v = list[pos]
+        var k = pos
+        for k > 0 {
+            list[k] = list[k - 1]
+            k -= 1
+        }
+        list[0] = v
+        tt[n] = u32(v)
+        counts[v] += 1
+        n += 1
+    }
+    n
+}
+
+fn flush(d: *Decoder) ! io.Error {
+    if d.filled == 0 {
+        return
+    }
+    if d.filled > d.limit - d.total {
+        fail TooLarge
+    }
+    let chunk = d.out[..d.filled]
+    d.filled = 0
+    d.total += chunk.len
+    crc_update(mut d.crc, chunk)
+    d.sink(chunk)?
+}
+
+fn put_run(d: *Decoder, v: u8, count: i64) ! io.Error {
+    if d.filled + count > d.out.len {
+        flush(d)?
+    }
+    let out = d.out
+    var at = d.filled
+    for _ in 0..count {
+        out[at] = v
+        at += 1
+    }
+    d.filled = at
+}
+
+fn unpack(d: *Decoder, n: i64, orig: i64) -> u32 ! io.Error {
+    let tt = d.tt
+    let counts = d.counts
+    var start = 0
+    for i in 0..256 {
+        let c = counts[i]
+        counts[i] = start
+        start += c
+    }
+    for i in 0..n {
+        let v = i64(tt[i] & 0xFF)
+        let at = counts[v]
+        counts[v] = at + 1
+        tt[at] |= u32(i) << 8
+    }
+    crc_reset(mut d.crc)
+    var pos = i64(tt[orig] >> 8)
+    var prev = -1
+    var run = 0
+    for _ in 0..n {
+        let entry = tt[pos]
+        pos = i64(entry >> 8)
+        let ch = i64(entry & 0xFF)
+        if run == 4 {
+            put_run(d, u8(prev), ch)?
+            run = 0
+            prev = -1
+            continue
+        }
+        if ch == prev {
+            run += 1
+        } else {
+            prev = ch
+            run = 1
+        }
+        put_run(d, u8(ch), 1)?
+    }
+    flush(d)?
+    crc_sum(d.crc)
+}
+
+struct Collector {
+    data: []u8
+    len: i64
+}
+
+fn collect(c: *Collector, chunk: []u8) {
+    let need = c.len + chunk.len
+    if need > c.data.len {
+        let size = if c.data.len * 2 > need { c.data.len * 2 } else { need }
+        let grown: []u8 = __make(size)
+        io.copy(grown, c.data[..c.len])
+        c.data = grown
+    }
+    io.copy(c.data[c.len..], chunk)
+    c.len = need
+}
+
+pub fn decompress(data: []u8, limit: i64) -> []u8 ! io.Error {
+    let hint = data.len * 4 + 64
+    let c = new(Collector { data: __make(if hint < limit { hint } else if limit > 0 { limit } else { 0 }), len: 0 })
+    let sink: fn([]u8) ! io.Error = fn(chunk) { collect(c, chunk) }
+    decode(io.bytes_reader(data), sink, limit)?
+    c.data[..c.len]
+}

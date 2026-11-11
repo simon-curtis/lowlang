@@ -1,0 +1,452 @@
+import std/http
+import std/io
+import std/text
+
+pub enum Error {
+    BadContentType
+    BadBoundary
+    Malformed(at: i64, message: str)
+    Truncated
+    TooManyParts
+    HeaderTooLarge
+    TooLarge
+    BoundaryInData
+    InvalidHeader
+    Finished
+    Io(cause: io.Error)
+}
+
+pub struct Limits {
+    pub max_parts: i64 = 1000
+    pub max_header_bytes: i64 = 16384
+    pub max_total_bytes: i64 = 67108864
+    pub max_memory: i64 = 1048576
+}
+
+pub struct Part {
+    pub index: i64
+    pub headers: []http.Header
+    pub disposition: str
+    pub name: str
+    pub filename: str?
+    pub content_type: str
+    pub params: []http.Header
+}
+
+pub struct Body {
+    pub data: []u8
+    pub size: i64
+    pub spilled: bool
+}
+
+enum Mode {
+    Preamble
+    Delimited
+    Inside
+    Done
+}
+
+struct Scan {
+    at: i64
+    found: bool
+    safe: i64
+}
+
+pub struct Reader {
+    source: *io.Reader
+    delimiter: str
+    limits: Limits
+    buf: []u8
+    start: i64
+    end: i64
+    total: i64
+    parts: i64
+    mode: Mode
+    eof: bool
+    scan: Scan
+    scanned: bool
+}
+
+fn boundary_byte(c: u8) -> bool {
+    if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+        return true
+    }
+    text.index_byte("'()+_,-./:=? ", c) >= 0
+}
+
+pub fn check_boundary(boundary: str) ! Error {
+    if boundary.len == 0 || boundary.len > 70 || boundary[boundary.len - 1] == ' ' {
+        fail Error.BadBoundary
+    }
+    for i in 0..boundary.len {
+        if !boundary_byte(boundary[i]) {
+            fail Error.BadBoundary
+        }
+    }
+}
+
+pub fn boundary_from_content_type(content_type: str) -> str ! Error {
+    let v = parse_value(content_type)
+    if !text.starts_with(text.lower(v.main), "multipart/") {
+        fail Error.BadContentType
+    }
+    let boundary = param(v, "boundary") ?? fail Error.BadBoundary
+    check_boundary(boundary)?
+    boundary
+}
+
+pub fn reader(source: *io.Reader, boundary: str, limits: Limits) -> *Reader ! Error {
+    check_boundary(boundary)?
+    let buf = io.buffer(65536)
+    buf[0] = '\r'
+    buf[1] = '\n'
+    new(Reader {
+        source, delimiter: "\r\n--{boundary}", limits, buf, start: 0, end: 2, total: 0, parts: 0,
+        mode: Preamble, eof: false, scan: Scan { at: -1, found: false, safe: 0 }, scanned: false,
+    })
+}
+
+pub fn bytes_reader(data: []u8, boundary: str, limits: Limits) -> *Reader ! Error {
+    reader(io.bytes_reader(data), boundary, limits)?
+}
+
+fn malformed(r: *Reader, message: str) -> Error {
+    Error.Malformed(r.total - (r.end - r.start), message)
+}
+
+fn fill(r: *Reader) ! Error {
+    if r.eof {
+        return
+    }
+    r.scanned = false
+    if r.start == r.end {
+        r.start = 0
+        r.end = 0
+    }
+    if r.end == r.buf.len {
+        if r.start > 0 {
+            io.copy(r.buf, r.buf[r.start..r.end])
+            r.end -= r.start
+            r.start = 0
+        } else {
+            let bigger = io.buffer(r.buf.len * 2)
+            io.copy(bigger, r.buf[..r.end])
+            r.buf = bigger
+        }
+    }
+    let n = io.read_some(r.source, r.buf[r.end..]) catch {
+        e => fail Error.Io(e)
+    }
+    if n == 0 {
+        r.eof = true
+        return
+    }
+    r.total += n
+    if r.total > r.limits.max_total_bytes {
+        fail Error.TooLarge
+    }
+    r.end += n
+}
+
+fn ensure(r: *Reader, n: i64) ! Error {
+    for r.end - r.start < n {
+        if r.eof {
+            fail Error.Truncated
+        }
+        fill(r)?
+    }
+}
+
+fn confirms(first: u8, second: u8) -> bool {
+    if first == '-' {
+        return second == '-'
+    }
+    if first == '\r' {
+        return second == '\n'
+    }
+    first == ' ' || first == '\t'
+}
+
+fn find_delimiter(r: *Reader) -> Scan {
+    let view = __str_view(r.buf[r.start..r.end])
+    var from = 0
+    for {
+        let i = text.index(view[from..], r.delimiter)
+        if i < 0 {
+            var held = r.delimiter.len - 1
+            if r.eof {
+                held = 0
+            }
+            var safe = view.len - held
+            if safe < 0 {
+                safe = 0
+            }
+            return Scan { at: -1, found: false, safe }
+        }
+        let found = from + i
+        let after = found + r.delimiter.len
+        if view.len - after < 2 {
+            if r.eof {
+                return Scan { at: r.start + found, found: true, safe: found }
+            }
+            return Scan { at: -1, found: false, safe: found }
+        }
+        if confirms(view[after], view[after + 1]) {
+            return Scan { at: r.start + found, found: true, safe: found }
+        }
+        from = found + 1
+    }
+}
+
+fn current_scan(r: *Reader) -> Scan {
+    if !r.scanned {
+        r.scan = find_delimiter(r)
+        r.scanned = true
+    }
+    r.scan
+}
+
+fn consume(r: *Reader, n: i64) {
+    r.start += n
+    r.scan.safe -= n
+    if r.scan.safe < 0 {
+        r.scan.safe = 0
+    }
+}
+
+fn consume_delimiter(r: *Reader, s: Scan) {
+    r.start = s.at + r.delimiter.len
+    r.scanned = false
+    r.mode = Delimited
+}
+
+pub fn read(r: *Reader, dst: []u8) -> i64 ! Error {
+    if r.mode != Inside || dst.len == 0 {
+        return 0
+    }
+    for {
+        let s = current_scan(r)
+        if s.safe > 0 {
+            var n = s.safe
+            if n > dst.len {
+                n = dst.len
+            }
+            io.copy(dst, r.buf[r.start..r.start + n])
+            consume(r, n)
+            return n
+        }
+        if s.found {
+            consume_delimiter(r, s)
+            return 0
+        }
+        if r.eof {
+            fail Error.Truncated
+        }
+        fill(r)?
+    }
+}
+
+fn skip_preamble(r: *Reader) ! Error {
+    for {
+        let s = current_scan(r)
+        if s.found {
+            consume_delimiter(r, s)
+            return
+        }
+        r.start += s.safe
+        r.scanned = false
+        if r.eof {
+            fail Error.Truncated
+        }
+        fill(r)?
+    }
+}
+
+fn drain(r: *Reader) ! Error {
+    let sink = io.buffer(4096)
+    for r.mode == Inside {
+        read(r, sink)?
+    }
+}
+
+fn header_line(r: *Reader, budget: i64) -> str ! Error {
+    for {
+        let view = __str_view(r.buf[r.start..r.end])
+        let i = text.index(view, "\r\n")
+        if i >= 0 {
+            if i + 2 > budget {
+                fail Error.HeaderTooLarge
+            }
+            let line = str(r.buf[r.start..r.start + i])
+            for k in 0..line.len {
+                if line[k] == '\n' || line[k] == '\r' {
+                    fail malformed(r, "bare line break in a header")
+                }
+            }
+            r.start += i + 2
+            r.scanned = false
+            return line
+        }
+        if view.len + 2 > budget {
+            fail Error.HeaderTooLarge
+        }
+        if r.eof {
+            fail Error.Truncated
+        }
+        fill(r)?
+    }
+}
+
+fn token_byte(c: u8) -> bool {
+    if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+        return true
+    }
+    text.index_byte("!#$%&'*+-.^_`|~", c) >= 0
+}
+
+fn valid_name(name: str) -> bool {
+    if name.len == 0 {
+        return false
+    }
+    for i in 0..name.len {
+        if !token_byte(name[i]) {
+            return false
+        }
+    }
+    true
+}
+
+fn read_headers(r: *Reader) -> []http.Header ! Error {
+    var headers: []http.Header = []
+    var used = 0
+    for {
+        let line = header_line(r, r.limits.max_header_bytes - used)?
+        used += line.len + 2
+        if line.len == 0 {
+            return headers
+        }
+        if line[0] == ' ' || line[0] == '\t' {
+            if headers.len == 0 {
+                fail malformed(r, "header continuation without a header")
+            }
+            let last = headers.len - 1
+            let previous = headers[last]
+            headers[last] = http.Header { name: previous.name, value: "{previous.value} {text.trim(line)}" }
+            continue
+        }
+        let colon = text.index_byte(line, ':')
+        if colon < 0 || !valid_name(line[..colon]) {
+            fail malformed(r, "bad header line")
+        }
+        push(mut headers, http.Header { name: line[..colon], value: text.trim(line[colon + 1..]) })
+    }
+}
+
+fn describe(index: i64, headers: []http.Header) -> Part {
+    let disposition = http.header(headers, "content-disposition") ?? ""
+    let parsed = parse_value(disposition)
+    Part {
+        index
+        headers
+        disposition: text.lower(parsed.main)
+        name: param(parsed, "name") ?? ""
+        filename: param(parsed, "filename")
+        content_type: http.header(headers, "content-type") ?? ""
+        params: parsed.params
+    }
+}
+
+fn open_part(r: *Reader) -> Part? ! Error {
+    ensure(r, 2)?
+    if r.buf[r.start] == '-' && r.buf[r.start + 1] == '-' {
+        r.start += 2
+        r.mode = Done
+        return none
+    }
+    for r.start < r.end && (r.buf[r.start] == ' ' || r.buf[r.start] == '\t') {
+        r.start += 1
+        ensure(r, 2)?
+    }
+    if r.buf[r.start] != '\r' || r.buf[r.start + 1] != '\n' {
+        fail malformed(r, "boundary is not followed by a line break")
+    }
+    r.start += 2
+    r.parts += 1
+    if r.parts > r.limits.max_parts {
+        fail Error.TooManyParts
+    }
+    let headers = read_headers(r)?
+    r.mode = Inside
+    r.scanned = false
+    describe(r.parts - 1, headers)
+}
+
+pub fn next_part(r: *Reader) -> Part? ! Error {
+    match r.mode {
+        Done => return none
+        Preamble => skip_preamble(r)?
+        Inside => drain(r)?
+        Delimited => {}
+    }
+    open_part(r)?
+}
+
+pub fn read_bytes(r: *Reader) -> []u8 ! Error {
+    var out: []u8 = []
+    let chunk = io.buffer(8192)
+    for {
+        let n = read(r, chunk)?
+        if n == 0 {
+            return out
+        }
+        if out.len + n > r.limits.max_memory {
+            fail Error.TooLarge
+        }
+        io.append(mut out, chunk[..n])
+    }
+}
+
+pub fn read_text(r: *Reader) -> str ! Error {
+    let data = read_bytes(r)?
+    __str_view(data)
+}
+
+pub fn read_spill(r: *Reader, sink: fn([]u8) ! io.Error) -> Body ! Error {
+    var held: []u8 = []
+    var size = 0
+    var spilled = false
+    let chunk = io.buffer(16384)
+    for {
+        let n = read(r, chunk)?
+        if n == 0 {
+            break
+        }
+        size += n
+        if spilled {
+            sink(chunk[..n]) catch {
+                e => fail Error.Io(e)
+            }
+            continue
+        }
+        io.append(mut held, chunk[..n])
+        if held.len > r.limits.max_memory {
+            sink(held) catch {
+                e => fail Error.Io(e)
+            }
+            held = []
+            spilled = true
+        }
+    }
+    Body { data: held, size, spilled }
+}
+
+pub fn media_type(p: Part) -> str {
+    if p.content_type == "" {
+        return "text/plain"
+    }
+    text.lower(parse_value(p.content_type).main)
+}
+
+pub fn header(p: Part, name: str) -> str? {
+    http.header(p.headers, name)
+}

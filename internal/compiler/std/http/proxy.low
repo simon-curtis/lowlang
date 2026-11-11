@@ -1,0 +1,285 @@
+import std/io
+import std/net
+import std/os
+import std/socks
+import std/text
+
+enum Via {
+    Direct
+    Forward(proxy: Url)
+    Tunnel(proxy: Url)
+    Socks(proxy: Url)
+}
+
+struct Pattern {
+    host: str
+    port: i64
+}
+
+pub fn with_proxy(b: Builder[Client], url: str) -> Builder[Client] {
+    var out = b
+    out.http_proxy = url
+    out.https_proxy = url
+    out
+}
+
+pub fn with_http_proxy(b: Builder[Client], url: str) -> Builder[Client] {
+    var out = b
+    out.http_proxy = url
+    out
+}
+
+pub fn with_https_proxy(b: Builder[Client], url: str) -> Builder[Client] {
+    var out = b
+    out.https_proxy = url
+    out
+}
+
+pub fn with_no_proxy(b: Builder[Client], list: str) -> Builder[Client] {
+    var out = b
+    out.no_proxy = text.split(list, ',')
+    out
+}
+
+pub fn with_dialer(b: Builder[Client], d: net.Dialer) -> Builder[Client] {
+    var out = b
+    out.dialer = some(d)
+    out
+}
+
+pub fn with_proxy_from_environment(b: Builder[Client]) -> Builder[Client] {
+    var out = b
+    let everything = environment_value(["all_proxy", "ALL_PROXY"])
+    out.http_proxy = environment_value(["http_proxy", "HTTP_PROXY"]) ?? everything ?? ""
+    out.https_proxy = environment_value(["https_proxy", "HTTPS_PROXY"]) ?? everything ?? ""
+    out.no_proxy = text.split(environment_value(["no_proxy", "NO_PROXY"]) ?? "", ',')
+    out
+}
+
+pub fn proxy_for(b: Builder[Client], url: str) -> str {
+    let u = parse_url(url) catch {
+        _ => return ""
+    }
+    let route = via(b, u) catch {
+        _ => return ""
+    }
+    match route {
+        Direct => ""
+        Forward(p) => origin(p)
+        Tunnel(p) => origin(p)
+        Socks(p) => origin(p)
+    }
+}
+
+fn environment_value(names: []str) -> str? {
+    for name in names {
+        let value = os.env(name) ?? ""
+        if value.len > 0 {
+            return value
+        }
+    }
+    none
+}
+
+fn proxy_setting(o: Builder[Client], u: Url) -> str {
+    if secure_scheme(u.scheme) { o.https_proxy } else { o.http_proxy }
+}
+
+fn parse_proxy(raw: str) -> Url ! io.Error {
+    let spelled = if text.index(raw, "://") < 0 { "http://{raw}" } else { raw }
+    let p = parse_url(spelled)?
+    if p.scheme != "http" && p.scheme != "socks5" && p.scheme != "socks5h" && p.scheme != "socks4" && p.scheme != "socks4a" {
+        fail Unsupported
+    }
+    p
+}
+
+fn via(o: Builder[Client], u: Url) -> Via ! io.Error {
+    let raw = proxy_setting(o, u)
+    if raw.len == 0 || bypassed(o.no_proxy, u) {
+        return Direct
+    }
+    let p = parse_proxy(raw)?
+    if p.scheme == "http" {
+        if secure_scheme(u.scheme) {
+            return Tunnel(p)
+        }
+        return Forward(p)
+    }
+    Socks(p)
+}
+
+fn forwards(route: Via) -> bool {
+    match route {
+        Forward(_) => true
+        _ => false
+    }
+}
+
+fn split_pattern(entry: str) -> Pattern {
+    if entry[0] == '[' {
+        let close = text.index_byte(entry, ']')
+        if close > 0 {
+            let rest = entry[close + 1..]
+            let port = if rest.len > 1 && rest[0] == ':' { text.parse_uint(rest[1..], 10) catch 0 } else { 0 }
+            return Pattern { host: entry[1..close], port }
+        }
+    }
+    let colon = text.index_byte(entry, ':')
+    if colon > 0 && colon == text.last_index_byte(entry, ':') {
+        return Pattern { host: entry[..colon], port: text.parse_uint(entry[colon + 1..], 10) catch 0 }
+    }
+    Pattern { host: entry, port: 0 }
+}
+
+fn same_bytes(a: []u8, b: []u8) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn matches_entry(entry: str, host: str, ip: []u8, port: i64) -> bool {
+    if text.index_byte(entry, '/') >= 0 {
+        return ip.len > 0 && net.in_network(ip, entry)
+    }
+    let p = split_pattern(entry)
+    if p.port != 0 && p.port != port {
+        return false
+    }
+    let literal: []u8 = net.parse_ip(p.host) catch []
+    if literal.len > 0 {
+        return same_bytes(literal, ip)
+    }
+    var suffix = if text.starts_with(p.host, "*.") { p.host[1..] } else { p.host }
+    var whole_name = false
+    if suffix[0] != '.' {
+        whole_name = true
+        suffix = ".{suffix}"
+    }
+    text.ends_with(host, suffix) || whole_name && host == suffix[1..]
+}
+
+fn bypassed(entries: []str, u: Url) -> bool {
+    let ip: []u8 = net.parse_ip(u.host) catch []
+    for raw in entries {
+        let entry = text.lower(text.trim(raw))
+        if entry.len == 0 {
+            continue
+        }
+        if entry == "*" || matches_entry(entry, u.host, ip, u.port) {
+            return true
+        }
+    }
+    false
+}
+
+fn proxy_credentials(p: Url) -> str {
+    if p.user.len == 0 {
+        return ""
+    }
+    basic_credentials(p.user, p.password)
+}
+
+fn socks_auth(p: Url) -> socks.Auth? {
+    if p.user.len == 0 || p.scheme == "socks4" || p.scheme == "socks4a" {
+        return none
+    }
+    some(socks.Auth { user: p.user, password: p.password })
+}
+
+fn open_host(job: Job, host: str, port: i64, limit: i64) -> net.Conn ! io.Error {
+    let options = job.client.options
+    match options.dialer {
+        some(d) => {
+            let h = d.dial(host, port)?
+            return net.adopt(h)
+        }
+        none => {}
+    }
+    let ips = options.resolver(host)?
+    net.connect_first(ips, port, options.device, limit)?
+}
+
+fn open_carrier(job: Job, route: Via, u: Url, limit: i64) -> net.Conn ! io.Error {
+    match route {
+        Forward(p) => return open_host(job, p.host, p.port, limit)
+        Tunnel(p) => return open_tunnel(job, p, u, limit)
+        Socks(p) => return open_socks(job, p, u, limit)
+        Direct => return open_host(job, u.host, u.port, limit)
+    }
+}
+
+fn open_tunnel(job: Job, p: Url, u: Url, limit: i64) -> net.Conn ! io.Error {
+    using c = open_host(job, p.host, p.port, limit)?
+    let view = c.handle
+    negotiate(job, view, fn() ! io.Error { connect_request(view, u, proxy_credentials(p))? })?
+    c
+}
+
+fn open_socks(job: Job, p: Url, u: Url, limit: i64) -> net.Conn ! io.Error {
+    using c = open_host(job, p.host, p.port, limit)?
+    let view = c.handle
+    let auth = socks_auth(p)
+    if p.scheme == "socks4" || p.scheme == "socks4a" {
+        negotiate(job, view, fn() ! io.Error { socks.tunnel4a_on(view, u.host, u.port, p.user)? })?
+    } else {
+        negotiate(job, view, fn() ! io.Error { socks.tunnel_on(view, u.host, u.port, auth)? })?
+    }
+    c
+}
+
+fn negotiate(job: Job, view: net.ConnHandle, step: fn() ! io.Error) ! io.Error {
+    let reaper = job.client.reaper
+    track(reaper, job.deadline, view)
+    let result = outcome(fn() -> bool ! io.Error {
+        step()?
+        true
+    })
+    untrack(reaper, job.deadline)
+    match result {
+        Done(_) => {}
+        Failed(e) => fail e
+    }
+}
+
+fn connect_request(h: net.ConnHandle, u: Url, credentials: str) ! io.Error {
+    let name = if text.index_byte(u.host, ':') >= 0 { "[{u.host}]:{u.port}" } else { "{u.host}:{u.port}" }
+    var out: []u8 = []
+    text.append(mut out, "CONNECT {name} HTTP/1.1\r\nhost: {name}\r\n")
+    if credentials.len > 0 {
+        text.append(mut out, "proxy-authorization: {credentials}\r\n")
+    }
+    text.append(mut out, "\r\n")
+    net.write_all_on(h, out)?
+    let head = read_head(h)?
+    let line = head[..text.index(head, "\r\n")]
+    let status = parse_status_line(line)?
+    if status >= 200 && status < 300 {
+        return
+    }
+    if status == 407 || status == 403 {
+        fail Denied
+    }
+    fail Refused
+}
+
+fn read_head(h: net.ConnHandle) -> str ! io.Error {
+    var head: []u8 = []
+    let one = io.buffer(1)
+    for head.len < 16384 {
+        if net.read_on(h, one)? == 0 {
+            fail Eof
+        }
+        push(mut head, one[0])
+        if head.len >= 4 && head[head.len - 4] == '\r' && head[head.len - 3] == '\n' && head[head.len - 2] == '\r' && head[head.len - 1] == '\n' {
+            return __str_view(head)
+        }
+    }
+    fail TooLarge
+}

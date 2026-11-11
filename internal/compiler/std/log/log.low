@@ -1,3 +1,9 @@
+import std/io
+import std/json
+import std/os
+import std/text
+import std/time
+
 pub enum Level {
     Debug
     Info
@@ -5,10 +11,46 @@ pub enum Level {
     Error
 }
 
+pub enum Format {
+    Text
+    Json
+}
+
+pub enum ParseError {
+    Unknown
+}
+
+pub enum Attr {
+    Str(key: str, value: str)
+    Int(key: str, value: i64)
+    Float(key: str, value: f64)
+    Bool(key: str, value: bool)
+}
+
+pub struct Record {
+    pub level: Level
+    pub message: str
+    pub prefix: str
+    pub attrs: []Attr
+    pub time: i64?
+}
+
+pub enum Sink {
+    Fd
+    Stream(io.Stream)
+    Lines(fn(str))
+    Handler(fn(Record))
+}
+
 pub struct Logger {
     pub level: Level = Info
     pub fd: i64 = 2
     pub prefix: str = ""
+    pub format: Format = Text
+    pub sink: Sink = Fd
+    pub attrs: []Attr = []
+    pub timestamps: bool = false
+    pub clock: fn() -> i64 = fn() -> i64 { time.now_nanos() }
 }
 
 fn rank(l: Level) -> i64 {
@@ -29,23 +71,217 @@ fn label(l: Level) -> str {
     }
 }
 
+pub fn parse_level(s: str) -> Level ! ParseError {
+    let name = text.lower(text.trim(s))
+    match name {
+        == "debug" => Debug
+        == "info" => Info
+        == "warn" => Warn
+        == "warning" => Warn
+        == "error" => Error
+        _ => fail Unknown
+    }
+}
+
+pub fn level_from_env(fallback: Level) -> Level {
+    let value = os.env("LOG_LEVEL") ?? return fallback
+    parse_level(value) catch fallback
+}
+
+pub fn str_attr(key: str, value: str) -> Attr {
+    Str(key, value)
+}
+
+pub fn int_attr(key: str, value: i64) -> Attr {
+    Int(key, value)
+}
+
+pub fn float_attr(key: str, value: f64) -> Attr {
+    Float(key, value)
+}
+
+pub fn bool_attr(key: str, value: bool) -> Attr {
+    Bool(key, value)
+}
+
 pub fn enabled(l: Logger, level: Level) -> bool {
     rank(level) >= rank(l.level)
 }
 
-pub fn emit(l: Logger, level: Level, message: str) {
-    if !enabled(l, level) {
-        return
+fn bare_value(value: str) -> bool {
+    if value.len == 0 {
+        return false
     }
-    let line = if l.prefix.len > 0 { "{label(level)} {l.prefix}: {message}\n" } else { "{label(level)} {message}\n" }
+    for i in 0..value.len {
+        let c = value[i]
+        if c <= ' ' || c == '"' || c == '=' || c == 0x7F {
+            return false
+        }
+    }
+    true
+}
+
+fn text_value(value: str) -> str {
+    if bare_value(value) { value } else { text.quote(value) }
+}
+
+fn append_text_attr(mut out: []u8, a: Attr) {
+    match a {
+        Str(key, value) => text.append(mut out, " {key}={text_value(value)}")
+        Int(key, value) => text.append(mut out, " {key}={value}")
+        Float(key, value) => text.append(mut out, " {key}={value}")
+        Bool(key, value) => text.append(mut out, " {key}={value}")
+    }
+}
+
+fn stamp(nanos: i64) -> str {
+    let dt = time.from_unix(nanos / 1000000000)
+    let millis = nanos % 1000000000 / 1000000
+    let local = time.DateTime {
+        date: dt.date
+        hour: dt.hour
+        minute: dt.minute
+        second: dt.second
+        nanosecond: millis * 1000000
+    }
+    time.format_instant(time.Instant { local, offset: 0 })
+}
+
+fn render_text(r: Record) -> str {
+    var out: []u8 = []
+    match r.time {
+        some(t) => text.append(mut out, "{stamp(t)} ")
+        none => {}
+    }
+    text.append(mut out, label(r.level))
+    if r.prefix.len > 0 {
+        text.append(mut out, " {r.prefix}: {r.message}")
+    } else {
+        text.append(mut out, " {r.message}")
+    }
+    for a in r.attrs {
+        append_text_attr(mut out, a)
+    }
+    __str_view(out)
+}
+
+fn write_json_attr(w: *json.Writer, a: Attr) {
+    match a {
+        Str(key, value) => {
+            json.property(w, key)
+            json.string_value(w, value)
+        }
+        Int(key, value) => {
+            json.property(w, key)
+            json.integer(w, value)
+        }
+        Float(key, value) => {
+            json.property(w, key)
+            json.float(w, value)
+        }
+        Bool(key, value) => {
+            json.property(w, key)
+            json.boolean(w, value)
+        }
+    }
+}
+
+fn render_json(r: Record) -> str {
+    let w = json.writer(0)
+    json.start_object(w)
+    match r.time {
+        some(t) => {
+            json.property(w, "time")
+            json.string_value(w, stamp(t))
+        }
+        none => {}
+    }
+    json.property(w, "level")
+    json.string_value(w, label(r.level))
+    json.property(w, "msg")
+    json.string_value(w, r.message)
+    if r.prefix.len > 0 {
+        json.property(w, "prefix")
+        json.string_value(w, r.prefix)
+    }
+    for a in r.attrs {
+        write_json_attr(w, a)
+    }
+    json.end_object(w)
+    json.written_text(w)
+}
+
+fn render(format: Format, r: Record) -> str {
+    match format {
+        Text => render_text(r)
+        Json => render_json(r)
+    }
+}
+
+fn write_fd(fd: i64, line: str) {
     var done = 0
     for done < line.len {
-        let n = __syscall(1, l.fd, __slice_ptr(line[done..]), line.len - done)
+        let n = __syscall(1, fd, __slice_ptr(line[done..]), line.len - done)
+        if n == -4 {
+            continue
+        }
+        if n == -11 {
+            wait_writable(fd)
+            continue
+        }
         if n <= 0 {
             return
         }
         done += n
     }
+}
+
+fn write_stream(s: io.Stream, line: str) {
+    io.write_all(s, bytes(line)) catch {
+        _ => {}
+    }
+}
+
+fn deliver(l: Logger, r: Record) {
+    match l.sink {
+        Fd => write_fd(l.fd, "{render(l.format, r)}\n")
+        Stream(s) => write_stream(s, "{render(l.format, r)}\n")
+        Lines(f) => f(render(l.format, r))
+        Handler(h) => h(r)
+    }
+}
+
+fn joined(bound: []Attr, extra: []Attr) -> []Attr {
+    if extra.len == 0 {
+        return bound
+    }
+    if bound.len == 0 {
+        return extra
+    }
+    var out: []Attr = []
+    for a in bound {
+        push(mut out, a)
+    }
+    for a in extra {
+        push(mut out, a)
+    }
+    out
+}
+
+fn record(l: Logger, level: Level, message: str, attrs: []Attr) -> Record {
+    let at: i64? = if l.timestamps { l.clock() } else { none }
+    Record { level, message, prefix: l.prefix, attrs: joined(l.attrs, attrs), time: at }
+}
+
+pub fn log(l: Logger, level: Level, message: str, attrs: []Attr) {
+    if !enabled(l, level) {
+        return
+    }
+    deliver(l, record(l, level, message, attrs))
+}
+
+pub fn emit(l: Logger, level: Level, message: str) {
+    log(l, level, message, [])
 }
 
 pub fn debug(l: Logger, message: str) {
@@ -64,7 +300,83 @@ pub fn error(l: Logger, message: str) {
     emit(l, Error, message)
 }
 
+pub fn debug_with(l: Logger, message: str, attrs: []Attr) {
+    log(l, Debug, message, attrs)
+}
+
+pub fn info_with(l: Logger, message: str, attrs: []Attr) {
+    log(l, Info, message, attrs)
+}
+
+pub fn warn_with(l: Logger, message: str, attrs: []Attr) {
+    log(l, Warn, message, attrs)
+}
+
+pub fn error_with(l: Logger, message: str, attrs: []Attr) {
+    log(l, Error, message, attrs)
+}
+
 pub fn with_prefix(l: Logger, prefix: str) -> Logger {
-    let joined = if l.prefix.len > 0 { "{l.prefix}.{prefix}" } else { prefix }
-    Logger { level: l.level, fd: l.fd, prefix: joined }
+    var out = l
+    out.prefix = if l.prefix.len > 0 { "{l.prefix}.{prefix}" } else { prefix }
+    out
+}
+
+pub fn with_attrs(l: Logger, attrs: []Attr) -> Logger {
+    var out = l
+    out.attrs = joined(l.attrs, attrs)
+    out
+}
+
+pub fn with_level(l: Logger, level: Level) -> Logger {
+    var out = l
+    out.level = level
+    out
+}
+
+pub fn with_env_level(l: Logger) -> Logger {
+    with_level(l, level_from_env(l.level))
+}
+
+pub fn with_format(l: Logger, format: Format) -> Logger {
+    var out = l
+    out.format = format
+    out
+}
+
+pub fn with_timestamps(l: Logger, on: bool) -> Logger {
+    var out = l
+    out.timestamps = on
+    out
+}
+
+pub fn with_clock(l: Logger, clock: fn() -> i64) -> Logger {
+    var out = l
+    out.clock = clock
+    out
+}
+
+pub fn with_fd(l: Logger, fd: i64) -> Logger {
+    var out = l
+    out.fd = fd
+    out.sink = Fd
+    out
+}
+
+pub fn with_stream(l: Logger, s: io.Stream) -> Logger {
+    var out = l
+    out.sink = Stream(s)
+    out
+}
+
+pub fn with_lines(l: Logger, f: fn(str)) -> Logger {
+    var out = l
+    out.sink = Lines(f)
+    out
+}
+
+pub fn with_handler(l: Logger, f: fn(Record)) -> Logger {
+    var out = l
+    out.sink = Handler(f)
+    out
 }
