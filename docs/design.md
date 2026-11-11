@@ -754,6 +754,26 @@ fn main() {
 - A struct with private fields without defaults cannot be built with a literal outside its module.
 - An import cycle is an error, as is importing two modules under one name.
 
+### Doc comments
+
+```low
+/// A point on the plane.
+pub struct Point {
+    /// Distance from the y axis.
+    pub x: i64
+    pub y: i64
+}
+
+/// Returns the point mirrored in the y axis.
+pub fn mirror(p: Point) -> Point {
+    return Point { x: -p.x, y: p.y }
+}
+```
+
+- A line starting with `///` documents the declaration, struct field or enum variant directly below it. Consecutive `///` lines form one doc, written in Markdown; one space after `///` is dropped.
+- A `///` line anywhere else is an error. `////` starts an ordinary comment.
+- The language server shows a doc under the signature on hover, `low doc` prints it, and the website renders it on the package pages.
+
 ### Generics
 
 <!-- prelude
@@ -893,6 +913,13 @@ fn main() ! io.Error {
 `import std/<name>` loads a standard library module. The library is compiled into `low`, and the project root is not searched for it.
 
 Every module except `std/math` and `std/sql/sqlite` talks to the kernel through raw syscalls. `std/math` calls libm and `std/sql/sqlite` calls libsqlite3 through `extern` blocks. A library is linked only when reachable code calls it, so a program stays static unless it calls one of their C functions.
+
+Every public struct, enum, function, struct field and enum variant carries a doc comment, and `TestStdDocumented` in `internal/compiler` fails on any that does not. A doc is written for a caller reading it on hover:
+
+- The first sentence is the summary: a verb phrase for a function (`Returns the ...`, `Parses ...`), a noun phrase for a type, field or variant.
+- Later paragraphs carry the contract the signature cannot: which error variant is returned and when, whether the call blocks, what dropping or closing releases, limits, defaults and edge cases such as empty input or end of input.
+- Identifiers and literals are in backticks. A `low` example block appears only where usage is not obvious from the signature, and it type-checks.
+- A doc states the current behaviour as read from the code.
 
 | Module | Contents |
 |---|---|

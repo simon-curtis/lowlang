@@ -1,9 +1,15 @@
 package compiler
 
 import (
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"lowlang/internal/ast"
+	"lowlang/internal/lexer"
 )
 
 func TestDocumentProject(t *testing.T) {
@@ -77,4 +83,70 @@ func TestDocumentStd(t *testing.T) {
 		}
 	}
 	t.Fatal("std/io has no documented items")
+}
+
+type undocumented struct {
+	missing []string
+}
+
+func (u *undocumented) check(doc string, pos lexer.Pos, name string) {
+	if doc == "" {
+		u.missing = append(u.missing, fmt.Sprintf("%s: %s", pos, name))
+	}
+}
+
+func (u *undocumented) file(f *ast.File) {
+	for _, s := range f.Structs {
+		if !s.Pub {
+			continue
+		}
+		u.check(s.Doc, s.Pos, s.Name)
+		for _, field := range s.Fields {
+			if field.Pub {
+				u.check(field.Doc, field.Pos, fmt.Sprintf("%s.%s", s.Name, field.Name))
+			}
+		}
+	}
+	for _, e := range f.Enums {
+		if !e.Pub {
+			continue
+		}
+		u.check(e.Doc, e.Pos, e.Name)
+		for _, v := range e.Variants {
+			u.check(v.Doc, v.Pos, fmt.Sprintf("%s.%s", e.Name, v.Name))
+		}
+	}
+	for _, fn := range f.Funcs {
+		if fn.Pub {
+			u.check(fn.Doc, fn.Pos, fn.Name)
+		}
+	}
+	for _, e := range f.Externs {
+		for _, fn := range e.Funcs {
+			if fn.Pub {
+				u.check(fn.Doc, fn.Pos, fn.Name)
+			}
+		}
+	}
+}
+
+func TestStdDocumented(t *testing.T) {
+	u := &undocumented{}
+	err := fs.WalkDir(stdFS, "std", func(name string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || !strings.HasSuffix(name, ".low") {
+			return err
+		}
+		f, err := parseStd(name)
+		if err != nil {
+			return err
+		}
+		u.file(f)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(u.missing) > 0 {
+		t.Errorf("%d public std items have no /// doc:\n%s", len(u.missing), strings.Join(u.missing, "\n"))
+	}
 }
