@@ -1,0 +1,181 @@
+import std/sql
+
+pub struct LeaseHandle {
+    pool: *State
+    slot: Slot
+    broken: bool
+    released: bool
+    in_transaction: bool
+    view: sql.ConnectionHandle
+}
+
+pub struct Lease {
+    pub handle: *LeaseHandle
+    drop release_on(handle)
+}
+
+fn lease_of(s: *State, slot: Slot) -> Lease {
+    let h = new(LeaseHandle {
+        pool: s
+        slot
+        broken: false
+        released: false
+        in_transaction: false
+        view: slot.handle
+    })
+    h.view = guarded(h)
+    Lease { handle: h }
+}
+
+fn fatal(e: sql.Error) -> bool {
+    match e {
+        Connect => true
+        Authentication => true
+        Closed => true
+        Timeout => true
+        Protocol => true
+        _ => false
+    }
+}
+
+fn observe(h: *LeaseHandle, e: sql.Error) {
+    if fatal(e) {
+        h.broken = true
+    }
+}
+
+fn usable(h: *LeaseHandle) ! sql.Error {
+    if h.released || h.broken {
+        fail Closed
+    }
+}
+
+fn run_query(h: *LeaseHandle, text: str, values: []sql.Value) -> sql.Rows ! sql.Error {
+    usable(h)?
+    h.slot.handle.query(text, values) catch {
+        e => {
+            observe(h, e)
+            fail e
+        }
+    }
+}
+
+fn run_each(h: *LeaseHandle, text: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
+    usable(h)?
+    h.slot.handle.each(text, values, visit) catch {
+        e => {
+            observe(h, e)
+            fail e
+        }
+    }
+}
+
+fn run_execute(h: *LeaseHandle, text: str, values: []sql.Value) -> i64 ! sql.Error {
+    usable(h)?
+    h.slot.handle.execute(text, values) catch {
+        e => {
+            observe(h, e)
+            fail e
+        }
+    }
+}
+
+fn run_begin(h: *LeaseHandle) ! sql.Error {
+    usable(h)?
+    h.slot.handle.begin() catch {
+        e => {
+            observe(h, e)
+            fail e
+        }
+    }
+    h.in_transaction = true
+}
+
+fn run_commit(h: *LeaseHandle) ! sql.Error {
+    usable(h)?
+    h.slot.handle.commit() catch {
+        e => {
+            observe(h, e)
+            fail e
+        }
+    }
+    h.in_transaction = false
+}
+
+fn run_rollback(h: *LeaseHandle) ! sql.Error {
+    usable(h)?
+    h.slot.handle.rollback() catch {
+        e => {
+            observe(h, e)
+            fail e
+        }
+    }
+    h.in_transaction = false
+}
+
+fn guarded(h: *LeaseHandle) -> sql.ConnectionHandle {
+    sql.ConnectionHandle {
+        dialect: h.slot.handle.dialect
+        query: fn(text, values) -> sql.Rows ! sql.Error { run_query(h, text, values) }
+        each: fn(text, values, visit) ! sql.Error { run_each(h, text, values, visit)? }
+        execute: fn(text, values) -> i64 ! sql.Error { run_execute(h, text, values) }
+        begin: fn() ! sql.Error { run_begin(h)? }
+        commit: fn() ! sql.Error { run_commit(h)? }
+        rollback: fn() ! sql.Error { run_rollback(h)? }
+        close: fn() { discard_on(h) }
+    }
+}
+
+pub fn conn(l: Lease) -> sql.ConnectionHandle {
+    conn_on(l.handle)
+}
+
+pub fn conn_on(h: *LeaseHandle) -> sql.ConnectionHandle {
+    h.view
+}
+
+pub fn connection(l: Lease) -> sql.Connection {
+    connection_on(l.handle)
+}
+
+pub fn connection_on(h: *LeaseHandle) -> sql.Connection {
+    let v = h.view
+    sql.adopt(sql.ConnectionHandle {
+        dialect: v.dialect
+        query: v.query
+        each: v.each
+        execute: v.execute
+        begin: v.begin
+        commit: v.commit
+        rollback: v.rollback
+        close: fn() {}
+    })
+}
+
+pub fn discard(l: Lease) {
+    discard_on(l.handle)
+}
+
+pub fn discard_on(h: *LeaseHandle) {
+    h.broken = true
+}
+
+pub fn release(l: Lease) {
+    release_on(l.handle)
+}
+
+pub fn release_on(h: *LeaseHandle) {
+    if h.released {
+        return
+    }
+    h.released = true
+    var broken = h.broken
+    if !broken && h.in_transaction {
+        h.slot.handle.rollback() catch {
+            _ => {
+                broken = true
+            }
+        }
+    }
+    give_back(h.pool, h.slot, broken)
+}

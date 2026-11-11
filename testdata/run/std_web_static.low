@@ -1,0 +1,417 @@
+import std/crypto/hash
+import std/file
+import std/http
+import std/http/files
+import std/io
+import std/net
+import std/text
+import std/web
+
+struct Hit {
+    status: i64
+    headers: []http.Header
+    body: []u8
+}
+
+fn visible(s: str) -> str {
+    var out: []u8 = []
+    for i in 0..s.len {
+        match s[i] {
+            '\n' => text.append(mut out, "\\n")
+            '\r' => text.append(mut out, "\\r")
+            _ => push(mut out, s[i])
+        }
+    }
+    str(out)
+}
+
+fn pattern(n: i64) -> []u8 {
+    var out: []u8 = []
+    for i in 0..n {
+        push(mut out, u8((i * 7 + i / 251) % 256))
+    }
+    out
+}
+
+fn fetch(l: net.ListenerHandle, request: str) -> Hit ! io.Error {
+    using c = net.connect(l.addr)?
+    net.write_all(c, bytes(request))?
+    let r = io.reader(net.stream(c))
+    let resp = http.read_response(r, if text.starts_with(request, "HEAD") { "HEAD" } else { "GET" })?
+    net.close(c)
+    Hit { status: resp.status, headers: resp.headers, body: resp.body }
+}
+
+fn visit(l: net.ListenerHandle, target: str, extra: str) -> Hit ! io.Error {
+    fetch(l, "GET {target} HTTP/1.1\r\nhost: x\r\n{extra}connection: close\r\n\r\n")?
+}
+
+fn head_of(h: Hit, name: str) -> str {
+    http.header(h.headers, name) ?? "-"
+}
+
+fn summary(label: str, h: Hit) {
+    print("{label}: {h.status} type={head_of(h, "content-type")} length={head_of(h, "content-length")} range={head_of(h, "content-range")} encoding={head_of(h, "content-encoding")} body={h.body.len}")
+}
+
+fn digest(h: Hit) -> str {
+    text.encode_hex(hash.sum(hash.sha256(), h.body))[..16]
+}
+
+fn serve(l: net.ListenerHandle, app: *web.App) {
+    http.serve_on(l, web.handler(app)) catch {
+        _ => {}
+    }
+}
+
+fn build_tree(dir: str, outside: str) ! io.Error {
+    file.write_text("{dir}/a.txt", "hello world")?
+    file.write_text("{dir}/data.unknown", "plain words in a file with no known extension")?
+    file.write_file("{dir}/blob.noext", pattern(300))?
+    file.write_file("{dir}/pic.noext", [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])?
+    file.write_file("{dir}/big.bin", pattern(300000))?
+    file.write_text("{dir}/zero.txt", "")?
+    file.write_text("{dir}/style.css", "body {{ margin: 0 }}\n")?
+    file.write_text("{dir}/.hidden", "hidden")?
+    file.mkdir_all("{dir}/sub/deep")?
+    file.write_text("{dir}/sub/index.html", "<h1>sub index</h1>\n")?
+    file.write_text("{dir}/sub/deep/note.txt", "deep note")?
+    file.mkdir("{dir}/empty")?
+    file.mkdir("{dir}/.well-known")?
+    file.write_text("{dir}/.well-known/security.txt", "contact")?
+    file.mkdir("{dir}/we ird&dir")?
+    file.write_text("{dir}/we ird&dir/<b>.txt", "x")?
+    file.write_text("{dir}/app.js", "console.log(1)\n")?
+    file.write_text("{dir}/app.js.gz", "gzip-bytes")?
+    file.write_text("{dir}/app.js.br", "br-bytes")?
+    file.write_text("{dir}/lib.js", "console.log(2)\n")?
+    file.write_text("{dir}/lib.js.gz", "gz-only")?
+    file.write_text("{outside}/secret.txt", "top secret")?
+    file.symlink("{outside}/secret.txt", "{dir}/leak.txt")?
+    file.symlink(outside, "{dir}/leakdir")?
+    file.symlink("{dir}/a.txt", "{dir}/inside-link.txt")?
+}
+
+fn traversal(l: net.ListenerHandle) ! io.Error {
+    let targets = [
+        "/s/../outside/secret.txt"
+        "/s/%2e%2e/secret.txt"
+        "/s/%2E%2E/secret.txt"
+        "/s/sub/%2e%2e/%2e%2e/secret.txt"
+        "/s/%2e%2e%2fsecret.txt"
+        "/s/sub%2f..%2fa.txt"
+        "/s/a.txt%00.png"
+        "/s/%5c..%5csecret.txt"
+        "/s/..%5csecret.txt"
+        "/s/a%2ftxt"
+        "/s/%zz"
+        "/s/%e"
+        "/s/leak.txt"
+        "/s/leakdir/secret.txt"
+        "/s/leakdir"
+        "/s/leakdir/"
+        "/s/.hidden"
+        "/s/%2ehidden"
+        "/s/.well-known/security.txt"
+        "/s/sub/.."
+        "/s/./a.txt"
+    ]
+    for t in targets {
+        let h = visit(l, t, "")?
+        print("traversal {t} -> {h.status}")
+    }
+}
+
+fn basics(l: net.ListenerHandle) ! io.Error {
+    let a = visit(l, "/s/a.txt", "")?
+    summary("file", a)
+    print("  body={str(a.body)} etag-weak={text.starts_with(head_of(a, "etag"), "W/\"")} accept-ranges={head_of(a, "accept-ranges")} modified-gmt={text.ends_with(head_of(a, "last-modified"), " GMT")}")
+    summary("symlink inside", visit(l, "/s/inside-link.txt", "")?)
+    summary("css", visit(l, "/s/style.css", "")?)
+    summary("js", visit(l, "/s/app.js", "")?)
+    summary("sniffed text", visit(l, "/s/data.unknown", "")?)
+    summary("sniffed binary", visit(l, "/s/blob.noext", "")?)
+    summary("sniffed png", visit(l, "/s/pic.noext", "")?)
+    summary("empty file", visit(l, "/s/zero.txt", "")?)
+    let big = visit(l, "/s/big.bin", "")?
+    summary("big", big)
+    print("  digest={digest(big)} expected={text.encode_hex(hash.sum(hash.sha256(), pattern(300000)))[..16]}")
+    summary("missing", visit(l, "/s/missing.txt", "")?)
+    summary("trailing slash on file", visit(l, "/s/a.txt/", "")?)
+    summary("encoded name", visit(l, "/s/we%20ird%26dir/%3Cb%3E.txt", "")?)
+    summary("encoded plus", visit(l, "/s/sub/deep/note.txt", "")?)
+    summary("double slash", visit(l, "//s//a.txt", "")?)
+    summary("method not allowed", fetch(l, "POST /s/a.txt HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")?)
+    let head = fetch(l, "HEAD /s/big.bin HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")?
+    summary("head", head)
+    print("  head etag matches get={head_of(head, "etag") == head_of(big, "etag")}")
+    let ranged_head = fetch(l, "HEAD /s/big.bin HTTP/1.1\r\nhost: x\r\nrange: bytes=10-19\r\nconnection: close\r\n\r\n")?
+    summary("head range", ranged_head)
+}
+
+fn directories(l: net.ListenerHandle) ! io.Error {
+    let redirect = visit(l, "/s/sub", "")?
+    print("dir redirect: {redirect.status} location={head_of(redirect, "location")}")
+    let query = visit(l, "/s/sub?x=1&y=2", "")?
+    print("dir redirect with query: {query.status} location={head_of(query, "location")}")
+    let root = visit(l, "/s", "")?
+    print("root redirect: {root.status} location={head_of(root, "location")}")
+    let index = visit(l, "/s/sub/", "")?
+    summary("index", index)
+    print("  body={visible(str(index.body))}")
+    summary("dir without index", visit(l, "/s/sub/deep/", "")?)
+    summary("empty dir", visit(l, "/s/empty/", "")?)
+    summary("root without index", visit(l, "/s/", "")?)
+    let list = visit(l, "/l/", "")?
+    summary("listing", list)
+    print("  cache-control={head_of(list, "cache-control")}")
+    for line in text.split(str(list.body), '\n') {
+        print("  | {line}")
+    }
+    let nested = visit(l, "/l/we%20ird%26dir/", "")?
+    for line in text.split(str(nested.body), '\n') {
+        if text.contains(line, "<li>") || text.contains(line, "<h1>") {
+            print("  nested | {line}")
+        }
+    }
+    summary("listing of file", visit(l, "/l/a.txt", "")?)
+    summary("listing sub uses index", visit(l, "/l/sub/", "")?)
+    summary("listing traversal", visit(l, "/l/../outside/", "")?)
+}
+
+fn conditional(l: net.ListenerHandle) ! io.Error {
+    let first = visit(l, "/s/a.txt", "")?
+    let etag = head_of(first, "etag")
+    let modified = head_of(first, "last-modified")
+    let by_etag = visit(l, "/s/a.txt", "if-none-match: {etag}\r\n")?
+    summary("if-none-match", by_etag)
+    print("  etag={head_of(by_etag, "etag") == etag} last-modified={head_of(by_etag, "last-modified") == modified}")
+    summary("if-none-match list", visit(l, "/s/a.txt", "if-none-match: \"zzz\", {etag}\r\n")?)
+    summary("if-none-match strong form", visit(l, "/s/a.txt", "if-none-match: {text.trim_prefix(etag, "W/")}\r\n")?)
+    summary("if-none-match star", visit(l, "/s/a.txt", "if-none-match: *\r\n")?)
+    summary("if-none-match other", visit(l, "/s/a.txt", "if-none-match: W/\"nope\"\r\n")?)
+    summary("if-modified-since same", visit(l, "/s/a.txt", "if-modified-since: {modified}\r\n")?)
+    summary("if-modified-since old", visit(l, "/s/a.txt", "if-modified-since: Mon, 01 Jan 2001 00:00:00 GMT\r\n")?)
+    summary("if-modified-since junk", visit(l, "/s/a.txt", "if-modified-since: yesterday\r\n")?)
+    summary("etag beats date", visit(l, "/s/a.txt", "if-none-match: W/\"nope\"\r\nif-modified-since: {modified}\r\n")?)
+    let head304 = fetch(l, "HEAD /s/a.txt HTTP/1.1\r\nhost: x\r\nif-none-match: {etag}\r\nconnection: close\r\n\r\n")?
+    summary("head 304", head304)
+}
+
+fn ranges(l: net.ListenerHandle) ! io.Error {
+    let whole = pattern(300000)
+    let cases = [
+        "bytes=0-4"
+        "bytes=299995-"
+        "bytes=-5"
+        "bytes=100000-100000"
+        "bytes=65530-65545"
+        "bytes=0-"
+        "bytes=-999999999"
+        "bytes=299999-999999999"
+        "bytes=300000-"
+        "bytes=-0"
+        "bytes=400000-500000"
+        "bytes=5-2"
+        "bytes=0-1,5-6"
+        "bytes=abc"
+        "items=0-4"
+        "bytes=a-b"
+        "bytes= 3 - 6 "
+    ]
+    for r in cases {
+        let h = visit(l, "/s/big.bin", "range: {r}\r\n")?
+        summary("range {r}", h)
+        if h.status == 206 {
+            let start = text.parse_uint(text.split(text.split(head_of(h, "content-range"), ' ')[1], '-')[0], 10) catch 0
+            let ok = str(h.body) == str(whole[start..start + h.body.len])
+            print("  content matches file={ok}")
+        }
+    }
+    let small = visit(l, "/s/a.txt", "range: bytes=6-\r\n")?
+    print("small: {small.status} {str(small.body)} {head_of(small, "content-range")}")
+    let empty = visit(l, "/s/zero.txt", "range: bytes=0-\r\n")?
+    summary("empty file range", empty)
+    let first = visit(l, "/s/a.txt", "")?
+    let etag = head_of(first, "etag")
+    let modified = head_of(first, "last-modified")
+    summary("if-range date match", visit(l, "/s/a.txt", "range: bytes=0-4\r\nif-range: {modified}\r\n")?)
+    summary("if-range date mismatch", visit(l, "/s/a.txt", "range: bytes=0-4\r\nif-range: Mon, 01 Jan 2001 00:00:00 GMT\r\n")?)
+    summary("if-range weak etag", visit(l, "/s/a.txt", "range: bytes=0-4\r\nif-range: {etag}\r\n")?)
+    summary("range with 304", visit(l, "/s/a.txt", "range: bytes=0-4\r\nif-none-match: {etag}\r\n")?)
+}
+
+fn precompressed(l: net.ListenerHandle) ! io.Error {
+    let plain = visit(l, "/p/app.js", "")?
+    summary("no accept-encoding", plain)
+    print("  vary={head_of(plain, "vary")} body={visible(str(plain.body))}")
+    let gz = visit(l, "/p/app.js", "accept-encoding: gzip\r\n")?
+    summary("gzip", gz)
+    print("  vary={head_of(gz, "vary")} body={str(gz.body)} etag-differs={head_of(gz, "etag") != head_of(plain, "etag")}")
+    let br = visit(l, "/p/app.js", "accept-encoding: gzip, br\r\n")?
+    summary("br preferred", br)
+    print("  body={str(br.body)}")
+    summary("br refused", visit(l, "/p/app.js", "accept-encoding: br;q=0, gzip\r\n")?)
+    summary("identity", visit(l, "/p/app.js", "accept-encoding: identity\r\n")?)
+    summary("gzip only sibling", visit(l, "/p/lib.js", "accept-encoding: br, gzip\r\n")?)
+    summary("no sibling", visit(l, "/p/a.txt", "accept-encoding: gzip\r\n")?)
+    let ranged = visit(l, "/p/app.js", "accept-encoding: gzip\r\nrange: bytes=0-3\r\n")?
+    summary("range on encoded", ranged)
+    print("  body={str(ranged.body)}")
+    summary("plain tree ignores siblings", visit(l, "/s/app.js", "accept-encoding: gzip\r\n")?)
+    summary("direct gz", visit(l, "/s/app.js.gz", "")?)
+}
+
+fn helper(l: net.ListenerHandle) ! io.Error {
+    summary("file_response", visit(l, "/direct", "")?)
+    summary("file_response range", visit(l, "/direct", "range: bytes=2-5\r\n")?)
+    summary("file_response head", fetch(l, "HEAD /direct HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")?)
+    summary("file_response missing", visit(l, "/gone", "")?)
+    summary("file_response directory", visit(l, "/folder", "")?)
+    let custom = visit(l, "/custom", "")?
+    summary("file_response options", custom)
+    print("  cache-control={head_of(custom, "cache-control")}")
+}
+
+fn pipelined(l: net.ListenerHandle) ! io.Error {
+    using c = net.connect(l.addr)?
+    net.write_all(c, bytes("GET /s/a.txt HTTP/1.1\r\nhost: x\r\n\r\nGET /s/big.bin HTTP/1.1\r\nhost: x\r\nrange: bytes=0-9\r\n\r\nGET /s/missing HTTP/1.1\r\nhost: x\r\n\r\nGET /s/sub/deep/note.txt HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"))?
+    let r = io.reader(net.stream(c))
+    for _ in 0..4 {
+        let resp = http.read_response(r, "GET")?
+        print("pipelined: {resp.status} {resp.body.len}")
+    }
+    net.close(c)
+}
+
+fn open_descriptors() -> i64 {
+    let names = file.list("/proc/self/fd") catch []
+    names.len
+}
+
+fn abandoned(l: net.ListenerHandle) ! io.Error {
+    let before = open_descriptors()
+    for _ in 0..8 {
+        using c = net.connect(l.addr)?
+        net.write_all(c, bytes("GET /s/big.bin HTTP/1.1\r\nhost: x\r\n\r\n"))?
+        let r = io.reader(net.stream(c))
+        io.read_line(r)?
+        net.close(c)
+    }
+    sleep(300)
+    let after = open_descriptors()
+    print("abandoned downloads release files: {after <= before}")
+}
+
+fn through_client(base: str) {
+    let c = http.client().build()
+    let r = c.get("{base}/s/big.bin") catch {
+        _ => http.response(-1, "")
+    }
+    print("client: {r.status} {r.body.len} version={if r.version == Http2 { "h2" } else { "h1" }}")
+    let h2 = http.client().with_prior_knowledge(true).build()
+    let whole = h2.get("{base}/s/big.bin") catch {
+        _ => http.response(-1, "")
+    }
+    print("h2 client: {whole.status} {whole.body.len} version={if whole.version == Http2 { "h2" } else { "h1" }} digest={text.encode_hex(hash.sum(hash.sha256(), whole.body))[..16]}")
+    let part = h2.request("GET", "{base}/s/big.bin").with_header("range", "bytes=1000-1999").send() catch {
+        _ => http.response(-1, "")
+    }
+    print("h2 range: {part.status} {part.body.len} {http.header_value(part, "content-range") ?? "-"}")
+    let missing = h2.get("{base}/s/nope") catch {
+        _ => http.response(-1, "")
+    }
+    print("h2 missing: {missing.status}")
+    let head = h2.head("{base}/s/big.bin") catch {
+        _ => http.response(-1, "")
+    }
+    print("h2 head: {head.status} {http.header_value(head, "content-length") ?? "-"} body={head.body.len}")
+    let sink = h2.request("GET", "{base}/s/big.bin")
+    var received = 0
+    let streamed = sink.stream_to(fn(chunk: []u8) ! io.Error {
+        received += chunk.len
+    }) catch {
+        _ => http.response(-1, "")
+    }
+    print("h2 stream_to: {streamed.status} {received}")
+}
+
+fn main() ! io.Error {
+    let root = file.temp_dir("lowstatic")?
+    exercise(root) catch {
+        e => {
+            file.remove_all(root) catch {
+                _ => {}
+            }
+            fail e
+        }
+    }
+    file.remove_all(root)?
+}
+
+fn exercise(root: str) ! io.Error {
+    let dir = "{root}/www"
+    let outside = "{root}/outside"
+    file.mkdir(dir)?
+    file.mkdir(outside)?
+    build_tree(dir, outside)?
+
+    let app = web.app()
+    web.use(app, web.compress(1, 3))
+    web.static(app, "/s", dir)
+    var listing = web.static_options()
+    listing.listing = true
+    listing.cache_control = "public, max-age=60"
+    web.static_with(app, "/l", dir, listing)
+    var packed = web.static_options()
+    packed.precompressed = true
+    web.static_with(app, "/p", dir, packed)
+    web.get(app, "/direct", fn(c: *web.Context) -> http.Response { files.serve_file(c.request, "{dir}/a.txt") })
+    web.get(app, "/gone", fn(c: *web.Context) -> http.Response { files.serve_file(c.request, "{dir}/nothing") })
+    web.get(app, "/folder", fn(c: *web.Context) -> http.Response { files.serve_file(c.request, "{dir}/sub") })
+    web.get(app, "/custom", fn(c: *web.Context) -> http.Response {
+        let options = files.FileOptions { content_type: "application/x-custom", cache_control: "no-store" }
+        files.serve_file_with(c.request, "{dir}/data.unknown", options)
+    })
+
+    using l = net.listen("127.0.0.1", 0)?
+    spawn serve(l.handle, app)
+    basics(l.handle)?
+    traversal(l.handle)?
+    directories(l.handle)?
+    conditional(l.handle)?
+    ranges(l.handle)?
+    precompressed(l.handle)?
+    helper(l.handle)?
+    pipelined(l.handle)?
+    abandoned(l.handle)?
+    through_client("http://127.0.0.1:{l.handle.addr.port}")
+
+    var dotted = web.static_options()
+    dotted.dotfiles = true
+    dotted.index = ""
+    let open = web.app()
+    web.static_with(open, "/d", dir, dotted)
+    using o = net.listen("127.0.0.1", 0)?
+    spawn serve(o.handle, open)
+    summary("dotfiles on", visit(o.handle, "/d/.hidden", "")?)
+    summary("dotfiles on well-known", visit(o.handle, "/d/.well-known/security.txt", "")?)
+    summary("no index configured", visit(o.handle, "/d/sub/", "")?)
+    summary("traversal with dotfiles on", visit(o.handle, "/d/../outside/secret.txt", "")?)
+
+    let missing = web.app()
+    web.static(missing, "/m", "{root}/not-there")
+    using m = net.listen("127.0.0.1", 0)?
+    spawn serve(m.handle, missing)
+    summary("missing root", visit(m.handle, "/m/a.txt", "")?)
+
+    let group = web.app()
+    let api = web.group(group, "/assets", [])
+    web.static(api, "/v1", dir)
+    web.mount(group, api)
+    using g = net.listen("127.0.0.1", 0)?
+    spawn serve(g.handle, group)
+    summary("grouped prefix", visit(g.handle, "/assets/v1/a.txt", "")?)
+    summary("grouped traversal", visit(g.handle, "/assets/v1/../outside/secret.txt", "")?)
+    summary("grouped prefix only", visit(g.handle, "/assets/v1/sub", "")?)
+}

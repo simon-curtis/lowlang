@@ -1,0 +1,467 @@
+import std/atomic
+import std/file
+import std/os
+import std/sql
+import std/sql/migrate
+import std/sql/sqlite
+import std/sync
+import std/text
+import std/time/clock
+import std/time/duration
+import std/time/timestamp
+
+fn cause(e: sql.Error) -> str {
+    match e {
+        Server(code, message) => "server {code}"
+        Busy => "busy"
+        Closed => "closed"
+        _ => "other"
+    }
+}
+
+fn describe(e: migrate.Error) -> str {
+    match e {
+        Sql(c) => "sql {cause(c)}"
+        Failed(version, c) => "failed {version} {cause(c)}"
+        Duplicate(version) => "duplicate {version}"
+        OutOfOrder(version) => "out of order {version}"
+        Invalid(version) => "invalid {version}"
+        Drift(version) => "drift {version}"
+        Unknown(version) => "unknown {version}"
+        NoDown(version) => "no down {version}"
+        Locked => "locked"
+        Syntax(line) => "syntax at {line}"
+        BadName(name) => "bad name {name}"
+        Io(c) => "io"
+    }
+}
+
+fn state_name(s: migrate.State) -> str {
+    match s {
+        Applied => "applied"
+        Pending => "pending"
+        Drifted => "drifted"
+        Unknown => "unknown"
+    }
+}
+
+fn versions(applied: []i64) -> str {
+    var parts: []str = []
+    for v in applied {
+        push(mut parts, "{v}")
+    }
+    "[{text.join(parts, ",")}]"
+}
+
+fn memory() -> sql.Connection ! sql.Error {
+    sqlite.connect(sql.Options { database: ":memory:" })
+}
+
+fn count(c: sql.Connection, statement: str) -> i64 {
+    let rows = c.query(statement, []) catch {
+        _ => sql.Rows { columns: [], rows: [[sql.Value.Int(-1)]] }
+    }
+    match rows.rows[0][0] {
+        Int(n) => n
+        _ => -2
+    }
+}
+
+fn int_of(v: sql.Value) -> i64 {
+    match v {
+        Int(n) => n
+        _ => -2
+    }
+}
+
+fn tables(c: sql.Connection) -> str {
+    let rows = c.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name", []) catch {
+        _ => sql.Rows { columns: [], rows: [] }
+    }
+    var names: []str = []
+    for r in rows.rows {
+        match r[0] {
+            Text(s) => push(mut names, s)
+            _ => {}
+        }
+    }
+    text.join(names, ",")
+}
+
+fn sample() -> []migrate.Migration {
+    [
+        migrate.Migration {
+            version: 1
+            name: "create users"
+            up: ["CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL)"]
+            down: ["DROP TABLE users"]
+        }
+        migrate.Migration {
+            version: 2
+            name: "index email"
+            up: ["CREATE UNIQUE INDEX users_email ON users (email)", "INSERT INTO users (email) VALUES ('root@example.com')"]
+            down: ["DROP INDEX users_email"]
+        }
+        migrate.Migration {
+            version: 3
+            name: "add age"
+            up: ["ALTER TABLE users ADD COLUMN age INTEGER"]
+            down: ["ALTER TABLE users DROP COLUMN age"]
+        }
+    ]
+}
+
+fn print_status(entries: []migrate.Entry) {
+    for e in entries {
+        print("{e.version} {e.name} {state_name(e.state)} {e.applied_at != none}")
+    }
+}
+
+fn lifecycle() {
+    using c = memory() catch {
+        _ => return
+    }
+    let p = migrate.plan(sample())
+    print_status(migrate.status(c, p) catch { _ => [] })
+    print(versions(migrate.up(c, p) catch { _ => [] }))
+    print(versions(migrate.up(c, p) catch { _ => [-1] }))
+    print_status(migrate.status(c, p) catch { _ => [] })
+    print(tables(c))
+    print(count(c, "SELECT count(*) FROM schema_migrations"))
+    print(count(c, "SELECT count(*) FROM users"))
+    print(versions(migrate.down(c, p, 1) catch { _ => [-1] }))
+    print(count(c, "SELECT count(*) FROM pragma_table_info('users')"))
+    print(versions(migrate.down(c, p, 5) catch { _ => [-1] }))
+    print(tables(c))
+    print(versions(migrate.down(c, p, 1) catch { _ => [-1] }))
+    print(versions(migrate.up_to(c, p, 2) catch { _ => [-1] }))
+    print(tables(c))
+    print_status(migrate.status(c, p) catch { _ => [] })
+    print(versions(migrate.up_to(c, p, 2) catch { _ => [-1] }))
+    print(versions(migrate.up(c, p) catch { _ => [-1] }))
+}
+
+fn checksums() {
+    let m = migrate.Migration { version: 1, name: "n", up: ["CREATE TABLE a (x INTEGER)", "CREATE TABLE b (y INTEGER)"], down: [] }
+    print(migrate.checksum(m))
+    let same = migrate.Migration { version: 9, name: "other", up: m.up, down: ["DROP TABLE a"] }
+    print(migrate.checksum(same) == migrate.checksum(m))
+    let moved = migrate.Migration { version: 1, name: "n", up: ["CREATE TABLE a (x INTEGER)CREATE TABLE b (y INTEGER)"], down: [] }
+    print(migrate.checksum(moved) == migrate.checksum(m))
+    let empty = migrate.Migration { version: 1, name: "n", up: [], down: [] }
+    print(migrate.checksum(empty))
+}
+
+fn drift() {
+    using c = memory() catch {
+        _ => return
+    }
+    let p = migrate.plan(sample())
+    migrate.up(c, p) catch { _ => [] }
+    var edited = sample()
+    edited[0] = migrate.Migration {
+        version: 1
+        name: "create users"
+        up: ["CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)"]
+        down: ["DROP TABLE users"]
+    }
+    let q = migrate.plan(edited)
+    let entries = migrate.status(c, q) catch { _ => [] }
+    print_status(entries)
+    print(entries[0].expected == entries[0].recorded)
+    migrate.up(c, q) catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+    migrate.down(c, q, 1) catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+    print(versions(migrate.down(c, q, 1) catch { _ => [-1] }))
+}
+
+fn unknown_versions() {
+    using c = memory() catch {
+        _ => return
+    }
+    let p = migrate.plan(sample())
+    migrate.up(c, p) catch { _ => [] }
+    c.execute("INSERT INTO schema_migrations (version, name, applied_at, checksum) VALUES (9, 'from the future', 0, 'abc')", []) catch { _ => -1 }
+    print_status(migrate.status(c, p) catch { _ => [] })
+    print(versions(migrate.up(c, p) catch { _ => [-1] }))
+    migrate.down(c, p, 1) catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+    let shorter = migrate.plan([sample()[0]])
+    print_status(migrate.status(c, shorter) catch { _ => [] })
+}
+
+fn out_of_order() {
+    using c = memory() catch {
+        _ => return
+    }
+    let all = sample()
+    let first_and_third = migrate.plan([all[0], all[2]])
+    print(versions(migrate.up(c, first_and_third) catch { _ => [-1] }))
+    migrate.up(c, migrate.plan(all)) catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+    print(count(c, "SELECT count(*) FROM schema_migrations"))
+}
+
+fn invalid_plans() {
+    using c = memory() catch {
+        _ => return
+    }
+    let all = sample()
+    let plans = [
+        migrate.plan([all[0], all[1], all[0]])
+        migrate.plan([all[1], all[0]])
+        migrate.plan([migrate.Migration { version: 0, name: "zero", up: [], down: [] }])
+        migrate.plan([migrate.Migration { version: -4, name: "negative", up: [], down: [] }])
+    ]
+    for p in plans {
+        migrate.up(c, p) catch {
+            e => {
+                print(describe(e))
+                []
+            }
+        }
+        migrate.status(c, p) catch {
+            e => {
+                print(describe(e))
+                []
+            }
+        }
+    }
+    print(tables(c))
+}
+
+fn atomic_failure() {
+    using c = memory() catch {
+        _ => return
+    }
+    let broken = [
+        migrate.Migration { version: 1, name: "ok", up: ["CREATE TABLE a (x INTEGER)"], down: ["DROP TABLE a"] }
+        migrate.Migration { version: 2, name: "half", up: ["CREATE TABLE b (x INTEGER)", "INSERT INTO nowhere VALUES (1)"], down: [] }
+        migrate.Migration { version: 3, name: "never", up: ["CREATE TABLE c (x INTEGER)"], down: [] }
+    ]
+    let p = migrate.plan(broken)
+    migrate.up(c, p) catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+    print(tables(c))
+    print(count(c, "SELECT count(*) FROM schema_migrations"))
+    print_status(migrate.status(c, p) catch { _ => [] })
+
+    migrate.down(c, p, 1) catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+    print(tables(c))
+}
+
+fn missing_down() {
+    using c = memory() catch {
+        _ => return
+    }
+    let m = [
+        migrate.Migration { version: 1, name: "a", up: ["CREATE TABLE a (x INTEGER)"], down: ["DROP TABLE a"] }
+        migrate.Migration { version: 2, name: "b", up: ["CREATE TABLE b (x INTEGER)"], down: [] }
+    ]
+    let p = migrate.plan(m)
+    migrate.up(c, p) catch { _ => [] }
+    migrate.down(c, p, 2) catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+    print(tables(c))
+    print(count(c, "SELECT count(*) FROM schema_migrations"))
+}
+
+fn custom_table() {
+    using c = memory() catch {
+        _ => return
+    }
+    let start = timestamp.from_unix(1700000000) catch { _ => timestamp.epoch() }
+    let fixed = clock.fixed(start)
+    let p = migrate.plan(sample()) |> migrate.with_table("app history") |> migrate.with_clock(fixed)
+    print(versions(migrate.up_to(c, p, 1) catch { _ => [-1] }))
+    print(tables(c))
+    let rows = c.query("SELECT version, name, applied_at FROM \"app history\"", []) catch {
+        _ => sql.Rows { columns: [], rows: [] }
+    }
+    for r in rows.rows {
+        print("{int_of(r[0])} {int_of(r[2])}")
+    }
+    let entries = migrate.status(c, p) catch { _ => [] }
+    print(timestamp.to_string(entries[0].applied_at ?? timestamp.epoch()))
+}
+
+fn parsed(source: str) {
+    let m = migrate.from_text(7, "sample", source) catch {
+        e => {
+            print(describe(e))
+            return
+        }
+    }
+    print("{m.version} {m.name} up {m.up.len} down {m.down.len}")
+    for s in m.up {
+        print("up: {text.replace(s, "\n", "|")}")
+    }
+    for s in m.down {
+        print("down: {text.replace(s, "\n", "|")}")
+    }
+}
+
+fn text_format() {
+    parsed("-- +up\nCREATE TABLE t (\n    id INTEGER PRIMARY KEY,\n    name TEXT\n);\n\n-- a comment between statements\nCREATE INDEX t_name ON t (name);\n-- +down\nDROP INDEX t_name;\nDROP TABLE t;\n")
+    parsed("-- header\n\n-- +up\nSELECT 1;\n-- +begin\nCREATE TRIGGER t_ai AFTER INSERT ON t BEGIN\n    UPDATE t SET name = 'x';\nEND;\n-- +end\nSELECT 2\n-- +down\n")
+    parsed("-- +up\r\nSELECT 1;\r\n-- +down\r\nSELECT 2;\r\n")
+    parsed("-- +down\nSELECT 1;\n")
+    parsed("")
+    parsed("SELECT 1;\n-- +up\nSELECT 2;\n")
+    parsed("-- +up\n-- +begin\nSELECT 1;\n")
+    parsed("-- +up\n-- +end\n")
+    parsed("-- +begin\nSELECT 1;\n-- +end\n")
+    parsed("-- +up\n-- +begin\n-- +down\n-- +end\n")
+}
+
+fn write(dir: str, name: str, body: str) {
+    file.write_text("{dir}/{name}", body) catch {
+        _ => print("cannot write {name}")
+    }
+}
+
+fn directory(dir: str) {
+    write(dir, "010_add_orders.sql", "-- +up\nCREATE TABLE orders (id INTEGER);\n-- +down\nDROP TABLE orders;\n")
+    write(dir, "002_add_index.sql", "-- +up\nCREATE INDEX users_email ON users (email);\n-- +down\nDROP INDEX users_email;\n")
+    write(dir, "001_create_users.sql", "-- +up\nCREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);\n-- +down\nDROP TABLE users;\n")
+    write(dir, "README.txt", "not a migration")
+    let loaded = migrate.load_dir(dir) catch {
+        e => {
+            print(describe(e))
+            return
+        }
+    }
+    for m in loaded {
+        print("{m.version} {m.name} {m.up.len} {m.down.len}")
+    }
+    using c = memory() catch {
+        _ => return
+    }
+    print(versions(migrate.up(c, migrate.plan(loaded)) catch { _ => [-1] }))
+    print(tables(c))
+    print(versions(migrate.down(c, migrate.plan(loaded), 2) catch { _ => [-1] }))
+    print(tables(c))
+
+    write(dir, "notes.sql", "-- +up\nSELECT 1;\n")
+    migrate.load_dir(dir) catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+    file.remove("{dir}/notes.sql") catch { _ => {} }
+
+    write(dir, "001_other.sql", "-- +up\nSELECT 1;\n")
+    migrate.load_dir(dir) catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+    file.remove("{dir}/001_other.sql") catch { _ => {} }
+
+    write(dir, "003_broken.sql", "SELECT 1;\n")
+    migrate.load_dir(dir) catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+    file.remove("{dir}/003_broken.sql") catch { _ => {} }
+
+    migrate.load_dir("{dir}/missing") catch {
+        e => {
+            print(describe(e))
+            []
+        }
+    }
+}
+
+fn runner(path: str, p: migrate.Plan, done: sync.WaitGroup, applied: atomic.Int, failures: atomic.Int) {
+    using c = sqlite.connect(sql.Options { database: path }) catch {
+        _ => {
+            atomic.add_int(failures, 1)
+            sync.done(done)
+            return
+        }
+    }
+    let ran = migrate.up(c, p) catch {
+        _ => {
+            atomic.add_int(failures, 1)
+            []
+        }
+    }
+    atomic.add_int(applied, ran.len)
+    sync.done(done)
+}
+
+fn contention(dir: str) {
+    let path = "{dir}/shared.db"
+    let p = migrate.plan(sample())
+    let done = sync.wait_group()
+    let applied = atomic.int(0)
+    let failures = atomic.int(0)
+    sync.add(done, 4)
+    for i in 0..4 {
+        spawn runner(path, p, done, applied, failures)
+    }
+    sync.wait(done)
+    print("applied {atomic.load_int(applied)} failures {atomic.load_int(failures)}")
+    using c = sqlite.connect(sql.Options { database: path }) catch {
+        _ => return
+    }
+    print(count(c, "SELECT count(*) FROM schema_migrations"))
+    print(tables(c))
+}
+
+fn main() {
+    let dir = "/tmp/low-std-sql-migrate-{os.pid()}"
+    file.mkdir(dir) catch {
+        _ => print("cannot make {dir}")
+    }
+    lifecycle()
+    checksums()
+    drift()
+    unknown_versions()
+    out_of_order()
+    invalid_plans()
+    atomic_failure()
+    missing_down()
+    custom_table()
+    text_format()
+    directory(dir)
+    contention(dir)
+    file.remove_all(dir) catch {
+        _ => print("cannot remove {dir}")
+    }
+}

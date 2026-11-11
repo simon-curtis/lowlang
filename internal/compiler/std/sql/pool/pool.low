@@ -1,0 +1,463 @@
+import std/cancel
+import std/sql
+import std/sync
+import std/time/clock
+import std/time/duration
+
+pub enum Error {
+    Closed
+    Timeout
+    Cancelled
+    Sql(cause: sql.Error)
+}
+
+pub struct Config {
+    pub max: i64 = 4
+    pub max_idle: i64 = -1
+    pub idle_timeout: duration.Duration = duration.zero()
+    pub max_lifetime: duration.Duration = duration.zero()
+    pub wait_timeout: duration.Duration = duration.zero()
+    pub ping_after: duration.Duration = duration.zero()
+    pub ping: fn(sql.ConnectionHandle) ! sql.Error = default_ping
+    pub clock: clock.Clock = clock.system()
+}
+
+pub struct Stats {
+    pub open: i64
+    pub idle: i64
+    pub in_use: i64
+    pub waiting: i64
+    pub acquires: i64
+    pub waits: i64
+    pub timeouts: i64
+    pub cancelled: i64
+    pub discarded: i64
+    pub opened: i64
+}
+
+struct Slot {
+    handle: sql.ConnectionHandle
+    born: duration.Duration
+    used: duration.Duration
+}
+
+enum Grant {
+    Conn(slot: Slot)
+    Open
+    Closed
+}
+
+enum Wake {
+    Granted(grant: Grant)
+    Aborted
+    Expired
+}
+
+struct Waiter {
+    id: i64
+    wake: chan[Grant]
+}
+
+struct State {
+    guard: sync.Mutex
+    opener: fn() -> sql.Connection ! sql.Error
+    config: Config
+    idle: []Slot
+    open: i64
+    in_use: i64
+    waiters: []Waiter
+    next_waiter: i64
+    closed: bool
+    drained: []chan[bool]
+    acquires: i64
+    waits: i64
+    timeouts: i64
+    cancelled: i64
+    discarded: i64
+    opened: i64
+}
+
+pub struct Pool {
+    state: *State
+}
+
+fn default_ping(h: sql.ConnectionHandle) ! sql.Error {
+    let rows = h.query("SELECT 1", [])?
+}
+
+pub fn detach(mut c: sql.Connection) -> sql.ConnectionHandle {
+    let h = sql.handle(c)
+    c.close = fn() {}
+    h
+}
+
+pub fn open(opener: fn() -> sql.Connection ! sql.Error, config: Config) -> Pool {
+    var chosen = config
+    if chosen.max < 1 {
+        chosen.max = 1
+    }
+    if chosen.max_idle < 0 || chosen.max_idle > chosen.max {
+        chosen.max_idle = chosen.max
+    }
+    let state = State {
+        guard: sync.mutex()
+        opener
+        config: chosen
+        idle: []
+        open: 0
+        in_use: 0
+        waiters: []
+        next_waiter: 0
+        closed: false
+        drained: []
+        acquires: 0
+        waits: 0
+        timeouts: 0
+        cancelled: 0
+        discarded: 0
+        opened: 0
+    }
+    Pool { state: new(state) }
+}
+
+pub fn stats(p: Pool) -> Stats {
+    let s = p.state
+    sync.lock(s.guard)
+    let out = Stats {
+        open: s.open
+        idle: s.idle.len
+        in_use: s.in_use
+        waiting: s.waiters.len
+        acquires: s.acquires
+        waits: s.waits
+        timeouts: s.timeouts
+        cancelled: s.cancelled
+        discarded: s.discarded
+        opened: s.opened
+    }
+    sync.unlock(s.guard)
+    out
+}
+
+pub fn acquire(p: Pool) -> Lease ! Error {
+    acquire_until(p, cancel.token(), p.state.config.wait_timeout)?
+}
+
+pub fn acquire_until(p: Pool, t: *cancel.Token, wait: duration.Duration) -> Lease ! Error {
+    let s = p.state
+    let slot = checkout(s, t, wait)?
+    sync.lock(s.guard)
+    s.acquires += 1
+    sync.unlock(s.guard)
+    lease_of(s, slot)
+}
+
+pub fn with(p: Pool, work: fn(sql.ConnectionHandle) ! sql.Error) ! Error {
+    using lease = acquire(p)?
+    work(conn(lease)) catch {
+        e => fail Sql(e)
+    }
+}
+
+pub fn prune(p: Pool) -> i64 {
+    let s = p.state
+    var dead: []sql.ConnectionHandle = []
+    sync.lock(s.guard)
+    sweep(s, now_of(s), mut dead)
+    sync.unlock(s.guard)
+    close_all(dead)
+    dead.len
+}
+
+pub fn shutdown(p: Pool) {
+    let s = p.state
+    var dead: []sql.ConnectionHandle = []
+    sync.lock(s.guard)
+    s.closed = true
+    for slot in s.idle {
+        push(mut dead, slot.handle)
+    }
+    s.open -= s.idle.len
+    s.idle = []
+    let queued = s.waiters
+    s.waiters = []
+    for w in queued {
+        w.wake <- Closed
+    }
+    if s.in_use == 0 {
+        sync.unlock(s.guard)
+        close_all(dead)
+        return
+    }
+    let finished = chan[bool]()
+    push(mut s.drained, finished)
+    sync.unlock(s.guard)
+    close_all(dead)
+    let waited = <-finished
+}
+
+fn now_of(s: *State) -> duration.Duration {
+    s.config.clock.monotonic()
+}
+
+fn close_all(handles: []sql.ConnectionHandle) {
+    for h in handles {
+        h.close()
+    }
+}
+
+fn elapsed_over(now: duration.Duration, since: duration.Duration, limit: duration.Duration) -> bool {
+    !duration.is_zero(limit) && duration.after(duration.minus(now, since), limit)
+}
+
+fn expired(s: *State, slot: Slot, now: duration.Duration) -> bool {
+    elapsed_over(now, slot.born, s.config.max_lifetime) || elapsed_over(now, slot.used, s.config.idle_timeout)
+}
+
+fn sweep(s: *State, now: duration.Duration, mut dead: []sql.ConnectionHandle) {
+    var live: []Slot = []
+    for slot in s.idle {
+        if expired(s, slot, now) {
+            push(mut dead, slot.handle)
+            s.open -= 1
+            s.discarded += 1
+        } else {
+            push(mut live, slot)
+        }
+    }
+    s.idle = live
+}
+
+fn pop_idle(s: *State, now: duration.Duration, mut dead: []sql.ConnectionHandle) -> Slot? {
+    sweep(s, now, mut dead)
+    if s.idle.len == 0 {
+        return none
+    }
+    let slot = s.idle[s.idle.len - 1]
+    s.idle = s.idle[..s.idle.len - 1]
+    slot
+}
+
+fn settle(s: *State) {
+    if !s.closed || s.in_use != 0 {
+        return
+    }
+    for finished in s.drained {
+        close(finished)
+    }
+    s.drained = []
+}
+
+fn next_waiter(s: *State) -> Waiter? {
+    if s.waiters.len == 0 {
+        return none
+    }
+    let w = s.waiters[0]
+    s.waiters = s.waiters[1..]
+    w
+}
+
+fn pass_on(s: *State, grant: Grant) -> bool {
+    match next_waiter(s) {
+        some(w) => {
+            w.wake <- grant
+            true
+        }
+        none => false
+    }
+}
+
+fn retire(s: *State) {
+    s.open -= 1
+    s.in_use -= 1
+    settle(s)
+}
+
+fn give_back(s: *State, slot: Slot, broken: bool) {
+    let now = now_of(s)
+    var dead: []sql.ConnectionHandle = []
+    sync.lock(s.guard)
+    if s.closed {
+        push(mut dead, slot.handle)
+        retire(s)
+    } else if broken || expired(s, slot, now) {
+        push(mut dead, slot.handle)
+        s.discarded += 1
+        if !pass_on(s, Open) {
+            retire(s)
+        }
+    } else {
+        let renewed = Slot { handle: slot.handle, born: slot.born, used: now }
+        if !pass_on(s, Conn(renewed)) {
+            if s.idle.len >= s.config.max_idle {
+                push(mut dead, slot.handle)
+                retire(s)
+            } else {
+                push(mut s.idle, renewed)
+                s.in_use -= 1
+            }
+        }
+    }
+    sync.unlock(s.guard)
+    close_all(dead)
+}
+
+fn forfeit(s: *State) {
+    sync.lock(s.guard)
+    if !pass_on(s, Open) {
+        retire(s)
+    }
+    sync.unlock(s.guard)
+}
+
+fn open_slot(s: *State) -> Slot ! sql.Error {
+    using var c = s.opener()?
+    let h = detach(mut c)
+    let now = now_of(s)
+    sync.lock(s.guard)
+    s.opened += 1
+    sync.unlock(s.guard)
+    Slot { handle: h, born: now, used: now }
+}
+
+fn open_reserved(s: *State) -> Slot ! Error {
+    let slot = open_slot(s) catch {
+        e => {
+            forfeit(s)
+            fail Sql(e)
+        }
+    }
+    slot
+}
+
+fn healthy(s: *State, slot: Slot, now: duration.Duration) -> bool {
+    if !elapsed_over(now, slot.used, s.config.ping_after) {
+        return true
+    }
+    var ok = true
+    let ping = s.config.ping
+    ping(slot.handle) catch {
+        _ => {
+            ok = false
+        }
+    }
+    ok
+}
+
+fn checkout(s: *State, t: *cancel.Token, wait: duration.Duration) -> Slot ! Error {
+    for {
+        sync.lock(s.guard)
+        if s.closed {
+            sync.unlock(s.guard)
+            fail Closed
+        }
+        if cancel.cancelled(t) {
+            s.cancelled += 1
+            sync.unlock(s.guard)
+            fail Cancelled
+        }
+        let now = now_of(s)
+        var dead: []sql.ConnectionHandle = []
+        let found = pop_idle(s, now, mut dead)
+        match found {
+            some(slot) => {
+                s.in_use += 1
+                sync.unlock(s.guard)
+                close_all(dead)
+                if healthy(s, slot, now) {
+                    return slot
+                }
+                give_back(s, slot, true)
+                continue
+            }
+            none => {}
+        }
+        if s.open < s.config.max {
+            s.open += 1
+            s.in_use += 1
+            sync.unlock(s.guard)
+            close_all(dead)
+            return open_reserved(s)?
+        }
+        let w = Waiter { id: s.next_waiter, wake: chan[Grant](1) }
+        s.next_waiter += 1
+        s.waits += 1
+        push(mut s.waiters, w)
+        sync.unlock(s.guard)
+        close_all(dead)
+        let grant = await_grant(s, w, t, wait)?
+        match grant {
+            Conn(slot) => return slot
+            Open => return open_reserved(s)?
+            Closed => fail Closed
+        }
+    }
+}
+
+fn wait_for(w: Waiter, t: *cancel.Token, wait: duration.Duration) -> Wake {
+    if duration.is_zero(wait) {
+        return select {
+            g = <-w.wake => Granted(g ?? Closed)
+            <-cancel.done(t) => Aborted
+        }
+    }
+    var ms = duration.whole_millis(wait)
+    if ms < 1 {
+        ms = 1
+    }
+    select {
+        g = <-w.wake => Granted(g ?? Closed)
+        <-cancel.done(t) => Aborted
+        after(ms) => Expired
+    }
+}
+
+fn withdraw(s: *State, id: i64) -> bool {
+    var kept: []Waiter = []
+    var found = false
+    for w in s.waiters {
+        if w.id == id {
+            found = true
+        } else {
+            push(mut kept, w)
+        }
+    }
+    s.waiters = kept
+    found
+}
+
+fn surrender(s: *State, grant: Grant) {
+    match grant {
+        Conn(slot) => give_back(s, slot, false)
+        Open => forfeit(s)
+        Closed => {}
+    }
+}
+
+fn await_grant(s: *State, w: Waiter, t: *cancel.Token, wait: duration.Duration) -> Grant ! Error {
+    let woke = wait_for(w, t, wait)
+    var timed_out = false
+    match woke {
+        Granted(grant) => return grant
+        Expired => {
+            timed_out = true
+        }
+        Aborted => {}
+    }
+    sync.lock(s.guard)
+    let removed = withdraw(s, w.id)
+    if timed_out {
+        s.timeouts += 1
+    } else {
+        s.cancelled += 1
+    }
+    sync.unlock(s.guard)
+    if !removed {
+        let late = (<-w.wake) ?? Closed
+        surrender(s, late)
+    }
+    if timed_out {
+        fail Timeout
+    }
+    fail Cancelled
+}

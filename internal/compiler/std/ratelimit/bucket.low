@@ -1,0 +1,256 @@
+import std/cancel
+import std/sync
+import std/time/clock
+import std/time/duration
+
+pub enum Error {
+    Cancelled
+    TooLarge
+}
+
+struct State {
+    guard: sync.Mutex
+    clock: clock.Clock
+    sleeper: fn(duration.Duration)?
+    tokens: i64
+    per: i64
+    burst: i64
+    balance: i64
+    last: i64
+}
+
+pub struct Bucket {
+    state: *State
+}
+
+fn max_i64() -> i64 {
+    9223372036854775807
+}
+
+fn limit() -> i64 {
+    2305843009213693952
+}
+
+fn nanos_of(d: duration.Duration) -> i64 {
+    duration.as_nanos(d) ?? if duration.is_negative(d) { -max_i64() } else { max_i64() }
+}
+
+fn millis_up(nanos: i64) -> i64 {
+    if nanos <= 0 {
+        return 0
+    }
+    let whole = nanos / 1000000
+    if nanos % 1000000 != 0 { whole + 1 } else { whole }
+}
+
+fn shape_ok(tokens: i64, per: i64, burst: i64) -> bool {
+    tokens >= 1 && per >= 1 && burst >= 1 && burst <= limit() / per && tokens <= limit()
+}
+
+fn check_shape(tokens: i64, per: i64, burst: i64) {
+    if !shape_ok(tokens, per, burst) {
+        __panic("ratelimit: rate, interval and burst must be positive and fit")
+    }
+}
+
+pub fn bucket_per(tokens: i64, per: duration.Duration, burst: i64, c: clock.Clock) -> Bucket {
+    let interval = nanos_of(per)
+    check_shape(tokens, interval, burst)
+    let now = nanos_of(c.monotonic())
+    let s = State {
+        guard: sync.mutex(),
+        clock: c,
+        sleeper: none,
+        tokens,
+        per: interval,
+        burst,
+        balance: burst * interval,
+        last: now
+    }
+    Bucket { state: new(s) }
+}
+
+pub fn bucket(rate_per_second: i64, burst: i64, c: clock.Clock) -> Bucket {
+    bucket_per(rate_per_second, duration.seconds(1), burst, c)
+}
+
+pub fn set_sleeper(b: Bucket, f: fn(duration.Duration)) {
+    let s = b.state
+    sync.lock(s.guard)
+    s.sleeper = some(f)
+    sync.unlock(s.guard)
+}
+
+fn capacity(s: *State) -> i64 {
+    s.burst * s.per
+}
+
+fn refill(s: *State) {
+    let now = nanos_of(s.clock.monotonic())
+    let elapsed = now - s.last
+    s.last = now
+    if elapsed <= 0 {
+        return
+    }
+    let room = capacity(s) - s.balance
+    if elapsed > room / s.tokens {
+        s.balance = capacity(s)
+        return
+    }
+    s.balance += elapsed * s.tokens
+}
+
+fn wait_nanos(s: *State, n: i64) -> i64 {
+    let deficit = n * s.per - s.balance
+    if deficit <= 0 {
+        return 0
+    }
+    let whole = deficit / s.tokens
+    if deficit % s.tokens != 0 { whole + 1 } else { whole }
+}
+
+fn fits(s: *State, n: i64) -> bool {
+    n >= 0 && n <= s.burst
+}
+
+fn floor_balance() -> i64 {
+    -limit()
+}
+
+pub fn allow_n(b: Bucket, n: i64) -> bool {
+    let s = b.state
+    sync.lock(s.guard)
+    refill(s)
+    let granted = fits(s, n) && s.balance >= n * s.per
+    if granted {
+        s.balance -= n * s.per
+    }
+    sync.unlock(s.guard)
+    granted
+}
+
+pub fn allow(b: Bucket) -> bool {
+    allow_n(b, 1)
+}
+
+pub fn reserve(b: Bucket, n: i64) -> duration.Duration? {
+    let s = b.state
+    sync.lock(s.guard)
+    refill(s)
+    if !fits(s, n) || s.balance - n * s.per < floor_balance() {
+        sync.unlock(s.guard)
+        return none
+    }
+    let wait = wait_nanos(s, n)
+    s.balance -= n * s.per
+    sync.unlock(s.guard)
+    duration.nanoseconds(wait)
+}
+
+pub fn delay(b: Bucket, n: i64) -> duration.Duration? {
+    let s = b.state
+    sync.lock(s.guard)
+    refill(s)
+    if !fits(s, n) {
+        sync.unlock(s.guard)
+        return none
+    }
+    let wait = wait_nanos(s, n)
+    sync.unlock(s.guard)
+    duration.nanoseconds(wait)
+}
+
+pub fn refund(b: Bucket, n: i64) {
+    let s = b.state
+    if n <= 0 {
+        return
+    }
+    sync.lock(s.guard)
+    let count = if n > s.burst { s.burst } else { n }
+    let restored = s.balance + count * s.per
+    s.balance = if restored > capacity(s) { capacity(s) } else { restored }
+    sync.unlock(s.guard)
+}
+
+pub fn available(b: Bucket) -> i64 {
+    let s = b.state
+    sync.lock(s.guard)
+    refill(s)
+    let whole = if s.balance <= 0 { 0 } else { s.balance / s.per }
+    sync.unlock(s.guard)
+    whole
+}
+
+pub fn burst(b: Bucket) -> i64 {
+    let s = b.state
+    sync.lock(s.guard)
+    let n = s.burst
+    sync.unlock(s.guard)
+    n
+}
+
+pub fn set_rate_per(b: Bucket, tokens: i64, per: duration.Duration) {
+    let s = b.state
+    let interval = nanos_of(per)
+    sync.lock(s.guard)
+    if !shape_ok(tokens, interval, s.burst) {
+        sync.unlock(s.guard)
+        __panic("ratelimit: rate, interval and burst must be positive and fit")
+    }
+    refill(s)
+    if interval != s.per {
+        let whole = if s.balance < 0 { 0 } else { s.balance / s.per }
+        s.balance = whole * interval
+        s.per = interval
+    }
+    s.tokens = tokens
+    sync.unlock(s.guard)
+}
+
+pub fn set_rate(b: Bucket, rate_per_second: i64) {
+    set_rate_per(b, rate_per_second, duration.seconds(1))
+}
+
+pub fn set_burst(b: Bucket, burst: i64) {
+    let s = b.state
+    sync.lock(s.guard)
+    if !shape_ok(s.tokens, s.per, burst) {
+        sync.unlock(s.guard)
+        __panic("ratelimit: rate, interval and burst must be positive and fit")
+    }
+    refill(s)
+    s.burst = burst
+    if s.balance > capacity(s) {
+        s.balance = capacity(s)
+    }
+    sync.unlock(s.guard)
+}
+
+fn pause(s: *State, t: *cancel.Token, wait: duration.Duration) {
+    match s.sleeper {
+        some(f) => f(wait)
+        none => {
+            let finished = cancel.pause(t, millis_up(nanos_of(wait)))
+        }
+    }
+}
+
+pub fn wait_n(b: Bucket, n: i64, t: *cancel.Token) ! Error {
+    let s = b.state
+    if cancel.cancelled(t) {
+        fail Cancelled
+    }
+    let wait = reserve(b, n) ?? fail TooLarge
+    if duration.is_zero(wait) {
+        return
+    }
+    pause(s, t, wait)
+    if cancel.cancelled(t) {
+        refund(b, n)
+        fail Cancelled
+    }
+}
+
+pub fn wait(b: Bucket, t: *cancel.Token) ! Error {
+    wait_n(b, 1, t)?
+}

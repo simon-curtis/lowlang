@@ -1,0 +1,306 @@
+import std/atomic
+import std/singleflight
+import std/sync
+import std/time/clock
+import std/time/duration
+import std/time/timestamp
+
+enum Failure {
+    Down
+    Slow
+}
+
+fn hold_until(g: singleflight.Group[str, i64], key: str, followers: i64) {
+    for singleflight.followers(g, key) < followers {
+        sleep(1)
+    }
+}
+
+fn caller(g: singleflight.Group[str, i64], key: str, runs: atomic.Int, hold: i64, out: chan[i64]) {
+    let v = singleflight.do(g, key, fn() -> i64 {
+        let n = runs.add_int(1)
+        hold_until(g, key, hold)
+        n * 100 + key.len
+    })
+    out <- v
+}
+
+fn collect(out: chan[i64], n: i64) -> []i64 {
+    var values: []i64 = []
+    for i in 0..n {
+        push(mut values, (<-out) ?? -1)
+    }
+    values
+}
+
+fn all_equal(xs: []i64, want: i64) -> bool {
+    for x in xs {
+        if x != want {
+            return false
+        }
+    }
+    true
+}
+
+fn sequential() {
+    let g = singleflight.group[str, i64]()
+    var runs = 0
+    let a = singleflight.do(g, "k", fn() -> i64 {
+        runs += 1
+        runs
+    })
+    let b = singleflight.do(g, "k", fn() -> i64 {
+        runs += 1
+        runs
+    })
+    let r = singleflight.do_shared(g, "k", fn() -> i64 { 7 })
+    print("sequential {a} {b} {r.value} shared {r.shared} pending {singleflight.pending(g)}")
+}
+
+fn batches() {
+    let g = singleflight.group[str, i64]()
+    let runs = atomic.int(0)
+    let out = chan[i64](32)
+    for round in 1..4 {
+        for i in 0..20 {
+            spawn caller(g, "alpha", runs, 19, out)
+        }
+        let values = collect(out, 20)
+        print("round {round} executions {runs.load_int()} all {all_equal(values, round * 100 + 5)} pending {singleflight.pending(g)}")
+    }
+}
+
+fn distinct_keys() {
+    let g = singleflight.group[str, i64]()
+    let runs = atomic.int(0)
+    let out = chan[i64](64)
+    let keys = ["a", "bb", "ccc", "dddd"]
+    for key in keys {
+        for i in 0..5 {
+            spawn caller(g, key, runs, 4, out)
+        }
+    }
+    let values = collect(out, 20)
+    var lengths = [0, 0, 0, 0, 0]
+    for v in values {
+        lengths[v % 100] += 1
+    }
+    print("keys executions {runs.load_int()} by length {lengths[1]} {lengths[2]} {lengths[3]} {lengths[4]} pending {singleflight.pending(g)}")
+}
+
+fn shared_flags() {
+    let g = singleflight.group[str, i64]()
+    let out = chan[bool](8)
+    let leader_started = chan[bool](1)
+    let release = chan[bool](1)
+    spawn fn() {
+        let r = singleflight.do_shared(g, "k", fn() -> i64 {
+            leader_started <- true
+            let go = <-release
+            5
+        })
+        out <- r.shared
+    }()
+    let up = <-leader_started
+    print("in flight {singleflight.in_flight(g, "k")} {singleflight.in_flight(g, "other")} followers {singleflight.followers(g, "k")}")
+    for i in 0..3 {
+        spawn fn() {
+            let r = singleflight.do_shared(g, "k", fn() -> i64 { 99 })
+            out <- r.shared && r.value == 5
+        }()
+    }
+    hold_until(g, "k", 3)
+    print("followers {singleflight.followers(g, "k")}")
+    release <- true
+    var trues = 0
+    for i in 0..4 {
+        if (<-out) ?? false {
+            trues += 1
+        }
+    }
+    print("shared flags {trues} in flight {singleflight.in_flight(g, "k")} followers {singleflight.followers(g, "k")}")
+    let alone = singleflight.do_shared(g, "k", fn() -> i64 { 1 })
+    print("alone {alone.value} {alone.shared}")
+}
+
+fn forgetting() {
+    let g = singleflight.group[str, i64]()
+    let out = chan[i64](8)
+    let first_up = chan[bool](1)
+    let second_up = chan[bool](1)
+    let first_go = chan[bool](1)
+    let second_go = chan[bool](1)
+    spawn fn() {
+        out <- singleflight.do(g, "k", fn() -> i64 {
+            first_up <- true
+            let go = <-first_go
+            1
+        })
+    }()
+    let a = <-first_up
+    spawn fn() {
+        out <- singleflight.do(g, "k", fn() -> i64 { 100 })
+    }()
+    hold_until(g, "k", 1)
+    singleflight.forget(g, "k")
+    print("forgotten in flight {singleflight.in_flight(g, "k")} pending {singleflight.pending(g)}")
+    spawn fn() {
+        out <- singleflight.do(g, "k", fn() -> i64 {
+            second_up <- true
+            let go = <-second_go
+            2
+        })
+    }()
+    let b = <-second_up
+    first_go <- true
+    let one = (<-out) ?? -1
+    let two = (<-out) ?? -1
+    print("first batch {one} {two}")
+    print("second still in flight {singleflight.in_flight(g, "k")} pending {singleflight.pending(g)}")
+    second_go <- true
+    let third = (<-out) ?? -1
+    print("second batch {third} in flight {singleflight.in_flight(g, "k")} pending {singleflight.pending(g)}")
+}
+
+fn results() {
+    let g = singleflight.group[str, singleflight.Result[i64, Failure]]()
+    let out = chan[i64](8)
+    let up = chan[bool](1)
+    let release = chan[bool](1)
+    for i in 0..4 {
+        spawn fn() {
+            let r = singleflight.do(g, "db", fn() -> singleflight.Result[i64, Failure] {
+                if i == 0 {
+                    up <- true
+                    let go = <-release
+                }
+                Err(Down)
+            })
+            out <- match r {
+                Ok(v) => v
+                Err(e) => if e == Failure.Down { -1 } else { -2 }
+            }
+            let ok = singleflight.do(g, "fine", fn() -> singleflight.Result[i64, Failure] { Ok(8) })
+            out <- match ok {
+                Ok(v) => v
+                Err(e) => -3
+            }
+        }()
+        if i == 0 {
+            let started = <-up
+        }
+    }
+    hold_until_result(g, "db", 3)
+    release <- true
+    var sum = 0
+    for i in 0..8 {
+        sum += (<-out) ?? 0
+    }
+    print("results sum {sum} pending {singleflight.pending(g)}")
+}
+
+fn hold_until_result(g: singleflight.Group[str, singleflight.Result[i64, Failure]], key: str, followers: i64) {
+    for singleflight.followers(g, key) < followers {
+        sleep(1)
+    }
+}
+
+fn stress() {
+    let g = singleflight.group[i64, i64]()
+    let runs = atomic.int(0)
+    let wrong = atomic.int(0)
+    let finished = sync.wait_group()
+    finished.add(64)
+    for t in 0..64 {
+        spawn fn() {
+            for i in 0..200 {
+                let key = (t + i) % 8
+                let v = singleflight.do(g, key, fn() -> i64 {
+                    runs.add_int(1)
+                    key * 1000
+                })
+                if v != key * 1000 {
+                    wrong.add_int(1)
+                }
+            }
+            finished.done()
+        }()
+    }
+    finished.wait()
+    let total = runs.load_int()
+    print("stress wrong {wrong.load_int()} runs within bounds {total >= 8 && total <= 12800} pending {singleflight.pending(g)}")
+}
+
+fn expiry() {
+    let m = clock.manual(timestamp.epoch())
+    let runs = atomic.int(0)
+    let e = singleflight.expiring(duration.seconds(10), m.clock(), fn() -> i64 { runs.add_int(1) })
+    print("expiring first {singleflight.fetch(e)} second {singleflight.fetch(e)} cached {singleflight.cached(e) ?? -1}")
+    m.advance(duration.milliseconds(9999))
+    print("before ttl {singleflight.fetch(e)} cached {singleflight.cached(e) ?? -1}")
+    m.advance(duration.milliseconds(1))
+    print("cached at ttl {singleflight.cached(e) ?? -1} fetch {singleflight.fetch(e)} refreshes {singleflight.refresh_count(e)}")
+    singleflight.invalidate(e)
+    print("invalidated cached {singleflight.cached(e) ?? -1} fetch {singleflight.fetch(e)} refreshes {singleflight.refresh_count(e)}")
+    let never = singleflight.expiring(duration.zero(), m.clock(), fn() -> i64 { runs.add_int(1) })
+    print("zero ttl {singleflight.fetch(never)} {singleflight.fetch(never)}")
+}
+
+fn collapsing() {
+    let m = clock.manual(timestamp.epoch())
+    let runs = atomic.int(0)
+    let started = chan[bool](1)
+    let release = chan[bool](1)
+    let e = singleflight.expiring(duration.seconds(5), m.clock(), fn() -> i64 {
+        let n = runs.add_int(1)
+        if n == 1 {
+            started <- true
+            let go = <-release
+        }
+        n * 11
+    })
+    let out = chan[i64](32)
+    for i in 0..16 {
+        spawn fn() {
+            out <- singleflight.fetch(e)
+        }()
+    }
+    let up = <-started
+    sleep(30)
+    release <- true
+    var values: []i64 = []
+    for i in 0..16 {
+        push(mut values, (<-out) ?? -1)
+    }
+    print("collapsed refreshes {singleflight.refresh_count(e)} all {all_equal(values, 11)}")
+
+    let racing = singleflight.expiring(duration.seconds(5), m.clock(), fn() -> i64 {
+        let n = runs.add_int(1)
+        if n == 2 {
+            started <- true
+            let go = <-release
+        }
+        n
+    })
+    spawn fn() {
+        out <- singleflight.fetch(racing)
+    }()
+    let began = <-started
+    singleflight.invalidate(racing)
+    release <- true
+    let landed = (<-out) ?? -1
+    print("invalidated in flight {landed} cached {singleflight.cached(racing) ?? -1} refreshes {singleflight.refresh_count(racing)}")
+    print("after race {singleflight.fetch(racing)} refreshes {singleflight.refresh_count(racing)}")
+}
+
+fn main() {
+    sequential()
+    batches()
+    distinct_keys()
+    shared_flags()
+    forgetting()
+    results()
+    stress()
+    expiry()
+    collapsing()
+}

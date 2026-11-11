@@ -1,0 +1,285 @@
+import std/cancel
+import std/file
+import std/http
+import std/io
+import std/mime
+import paths = std/path
+import std/text
+import std/time/timestamp
+
+pub struct FileOptions {
+    pub name: str = ""
+    pub content_type: str = ""
+    pub encoding: str = ""
+    pub cache_control: str = ""
+}
+
+enum Selection {
+    Whole
+    Partial(start: i64, end: i64)
+    Unsatisfiable
+}
+
+fn chunk_size() -> i64 {
+    65536
+}
+
+fn plain(status: i64) -> http.Response {
+    var resp = http.response(status, http.status_text(status))
+    http.set_header(mut resp.headers, "content-type", "text/plain; charset=utf-8")
+    resp
+}
+
+fn digits_only(s: str) -> bool {
+    if s.len == 0 {
+        return false
+    }
+    for i in 0..s.len {
+        if s[i] < '0' || s[i] > '9' {
+            return false
+        }
+    }
+    true
+}
+
+fn weak_etag(info: file.Info) -> str {
+    "W/\"{text.hex(info.size)}-{text.hex(info.modified)}\""
+}
+
+fn opaque(tag: str) -> str {
+    text.trim_prefix(text.trim(tag), "W/")
+}
+
+fn etag_listed(listed: str, etag: str) -> bool {
+    for part in text.split(listed, ',') {
+        let candidate = text.trim(part)
+        if candidate == "*" || opaque(candidate) == opaque(etag) {
+            return true
+        }
+    }
+    false
+}
+
+fn http_date(secs: i64) -> str {
+    let stamp = timestamp.from_unix(secs) catch {
+        _ => timestamp.epoch()
+    }
+    timestamp.to_http_date(stamp)
+}
+
+fn date_seconds(value: str) -> i64? {
+    let stamp = timestamp.parse_http_date(text.trim(value)) catch {
+        _ => return none
+    }
+    timestamp.unix_seconds(stamp)
+}
+
+fn unmodified(req: http.Request, etag: str, modified: i64) -> bool {
+    match http.header(req.headers, "if-none-match") {
+        some(listed) => return etag_listed(listed, etag)
+        none => {}
+    }
+    let since: i64? = match http.header(req.headers, "if-modified-since") {
+        some(value) => date_seconds(value)
+        none => none
+    }
+    match since {
+        some(secs) => modified <= secs
+        none => false
+    }
+}
+
+fn range_applies(req: http.Request, modified: i64) -> bool {
+    match http.header(req.headers, "if-range") {
+        some(value) => {
+            let stamp = date_seconds(value)
+            match stamp {
+                some(secs) => secs == modified
+                none => false
+            }
+        }
+        none => true
+    }
+}
+
+fn parse_number(s: str) -> i64? {
+    if !digits_only(s) {
+        return none
+    }
+    let n = text.parse_uint(s, 10) catch {
+        _ => return none
+    }
+    n
+}
+
+fn select_range(value: str, size: i64) -> Selection {
+    let spec = text.trim(value)
+    if !text.starts_with(spec, "bytes=") {
+        return Whole
+    }
+    let ranges = text.trim(spec[6..])
+    if text.index_byte(ranges, ',') >= 0 {
+        return Whole
+    }
+    let dash = text.index_byte(ranges, '-')
+    if dash < 0 {
+        return Whole
+    }
+    let first = text.trim(ranges[..dash])
+    let last = text.trim(ranges[dash + 1..])
+    if first.len == 0 {
+        let count = match parse_number(last) {
+            some(n) => n
+            none => return Whole
+        }
+        if count == 0 || size == 0 {
+            return Unsatisfiable
+        }
+        return Partial(if count >= size { 0 } else { size - count }, size - 1)
+    }
+    let start = match parse_number(first) {
+        some(n) => n
+        none => return Whole
+    }
+    var end = size - 1
+    if last.len > 0 {
+        let stop = match parse_number(last) {
+            some(n) => n
+            none => return Whole
+        }
+        if stop < start {
+            return Whole
+        }
+        end = if stop < end { stop } else { end }
+    }
+    if start >= size {
+        return Unsatisfiable
+    }
+    Partial(start, end)
+}
+
+fn sniffed(target: str) -> str {
+    using f = file.open(target) catch {
+        _ => return "application/octet-stream"
+    }
+    let buf = io.buffer(512)
+    let n = file.read(f, buf) catch 0
+    mime.sniff(buf[..n])
+}
+
+fn content_type_of(target: str, o: FileOptions) -> str {
+    if o.content_type.len > 0 {
+        return o.content_type
+    }
+    let name = if o.name.len > 0 { o.name } else { target }
+    match mime.by_extension(paths.ext(name)) {
+        some(t) => return t
+        none => {}
+    }
+    if o.encoding.len > 0 {
+        return "application/octet-stream"
+    }
+    sniffed(target)
+}
+
+fn validators(mut headers: []http.Header, info: file.Info, o: FileOptions) {
+    http.set_header(mut headers, "last-modified", http_date(info.modified))
+    http.set_header(mut headers, "etag", weak_etag(info))
+    if o.cache_control.len > 0 {
+        http.set_header(mut headers, "cache-control", o.cache_control)
+    }
+    if o.encoding.len > 0 {
+        http.set_header(mut headers, "content-encoding", o.encoding)
+        http.set_header(mut headers, "vary", "Accept-Encoding")
+    }
+}
+
+fn pump(target: str, start: i64, length: i64, ready: chan[bool], out: chan[[]u8], token: *cancel.Token) {
+    defer close(out)
+    using f = file.open(target) catch {
+        _ => {
+            ready <- false
+            return
+        }
+    }
+    if start > 0 {
+        file.seek(f, start, Start) catch {
+            _ => {
+                ready <- false
+                return
+            }
+        }
+    }
+    ready <- true
+    let gone = cancel.done(token)
+    var left = length
+    for left > 0 {
+        let buf = io.buffer(if left < chunk_size() { left } else { chunk_size() })
+        let n = file.read(f, buf) catch 0
+        if n == 0 {
+            return
+        }
+        let part = buf[..n]
+        select {
+            out <- part => {}
+            <-gone => return
+        }
+        left -= n
+    }
+}
+
+fn body_of(req: http.Request, target: str, start: i64, length: i64, headers: []http.Header, status: i64) -> http.Response {
+    var resp = http.Response { status, headers, body: [] }
+    http.set_header(mut resp.headers, "content-length", "{length}")
+    if req.method == "HEAD" || length == 0 {
+        return resp
+    }
+    let ready = chan[bool](1)
+    let out = chan[[]u8](4)
+    spawn pump(target, start, length, ready, out, req.token)
+    if !((<-ready) ?? false) {
+        return plain(500)
+    }
+    resp.stream = some(out)
+    resp
+}
+
+pub fn serve_file_with(req: http.Request, target: str, o: FileOptions) -> http.Response {
+    let info = file.stat(target) catch {
+        NotFound => return plain(404)
+        Denied => return plain(403)
+        _ => return plain(500)
+    }
+    if !info.regular {
+        return plain(404)
+    }
+    var headers: []http.Header = []
+    validators(mut headers, info, o)
+    http.set_header(mut headers, "accept-ranges", "bytes")
+    if unmodified(req, weak_etag(info), info.modified) {
+        return http.Response { status: 304, headers, body: [] }
+    }
+    http.set_header(mut headers, "content-type", content_type_of(target, o))
+    let requested = http.header(req.headers, "range") ?? ""
+    if requested.len > 0 && range_applies(req, info.modified) {
+        match select_range(requested, info.size) {
+            Partial(start, end) => {
+                let length = end - start + 1
+                http.set_header(mut headers, "content-range", "bytes {start}-{end}/{info.size}")
+                return body_of(req, target, start, length, headers, 206)
+            }
+            Unsatisfiable => {
+                var rejected = http.Response { status: 416, headers: [], body: [] }
+                http.set_header(mut rejected.headers, "content-range", "bytes */{info.size}")
+                http.set_header(mut rejected.headers, "accept-ranges", "bytes")
+                return rejected
+            }
+            Whole => {}
+        }
+    }
+    body_of(req, target, 0, info.size, headers, 200)
+}
+
+pub fn serve_file(req: http.Request, target: str) -> http.Response {
+    serve_file_with(req, target, FileOptions {})
+}

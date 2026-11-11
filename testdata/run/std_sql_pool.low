@@ -1,0 +1,466 @@
+import std/atomic
+import std/cancel
+import std/file
+import std/os
+import std/sql
+import std/sql/pool
+import std/sql/sqlite
+import std/sync
+import std/time/clock
+import std/time/duration
+import std/time/timestamp
+
+fn describe(e: pool.Error) -> str {
+    match e {
+        Closed => "closed"
+        Timeout => "timeout"
+        Cancelled => "cancelled"
+        Sql(cause) => "sql"
+    }
+}
+
+fn show(s: pool.Stats) -> str {
+    "open={s.open} idle={s.idle} in_use={s.in_use} waiting={s.waiting} acquires={s.acquires} waits={s.waits} discarded={s.discarded} opened={s.opened}"
+}
+
+fn count_of(rows: sql.Rows) -> i64 {
+    match rows.rows[0][0] {
+        Int(n) => n
+        _ => -1
+    }
+}
+
+fn opener(path: str, made: atomic.Int) -> fn() -> sql.Connection ! sql.Error {
+    fn() -> sql.Connection ! sql.Error {
+        atomic.add_int(made, 1)
+        sqlite.connect(sql.Options { database: path })
+    }
+}
+
+fn increment(p: pool.Pool, done: sync.WaitGroup, failures: atomic.Int) {
+    pool.with(p, fn(c: sql.ConnectionHandle) ! sql.Error {
+        c.execute("INSERT INTO hits (n) VALUES (1)", [])?
+    }) catch {
+        _ => {
+            atomic.add_int(failures, 1)
+        }
+    }
+    sync.done(done)
+}
+
+fn await_waiting(p: pool.Pool, n: i64) {
+    for i in 0..5000 {
+        if pool.stats(p).waiting == n {
+            return
+        }
+        sleep(1)
+    }
+}
+
+fn basics(p: pool.Pool) {
+    using a = pool.acquire(p) catch {
+        e => {
+            print(describe(e))
+            return
+        }
+    }
+    using b = pool.acquire(p) catch {
+        e => {
+            print(describe(e))
+            return
+        }
+    }
+    print(show(pool.stats(p)))
+    let c = pool.conn(a)
+    print(c.execute("CREATE TABLE hits (n INTEGER)", []) catch { _ => -1 })
+    pool.release(a)
+    print(show(pool.stats(p)))
+    let late = pool.conn(a).query("SELECT 1", []) catch {
+        _ => sql.Rows { columns: [], rows: [] }
+    }
+    print(late.rows.len)
+}
+
+fn waiting(p: pool.Pool) {
+    using a = pool.acquire(p) catch {
+        _ => return
+    }
+    using b = pool.acquire(p) catch {
+        _ => return
+    }
+    let gate = chan[bool](1)
+    spawn wait_then_report(p, gate)
+    await_waiting(p, 1)
+    print(show(pool.stats(p)))
+    pool.release(a)
+    let got = <-gate
+    print("waiter got {got ?? false}")
+    print(show(pool.stats(p)))
+}
+
+fn wait_then_report(p: pool.Pool, gate: chan[bool]) {
+    using l = pool.acquire(p) catch {
+        _ => {
+            gate <- false
+            return
+        }
+    }
+    gate <- true
+}
+
+fn views(p: pool.Pool) {
+    {
+        using a = pool.acquire(p) catch {
+            _ => return
+        }
+        {
+            using owner = pool.connection(a)
+            print(owner.execute("INSERT INTO hits (n) VALUES (5)", []) catch { _ => -1 })
+        }
+        let rows = pool.conn(a).query("SELECT count(*) FROM hits WHERE n = 5", []) catch {
+            _ => sql.Rows { columns: [], rows: [[sql.Value.Int(-1)]] }
+        }
+        print("view kept the lease {count_of(rows)}")
+    }
+    pool.with(p, fn(c: sql.ConnectionHandle) ! sql.Error {
+        c.execute("DELETE FROM hits WHERE n = 5", [])?
+        c.execute("DELETE FROM missing", [])?
+    }) catch {
+        e => print(describe(e))
+    }
+    print(show(pool.stats(p)))
+}
+
+fn timing(p: pool.Pool) {
+    using a = pool.acquire(p) catch {
+        _ => return
+    }
+    using b = pool.acquire(p) catch {
+        _ => return
+    }
+    let t = cancel.token()
+    using first = pool.acquire_until(p, t, duration.milliseconds(20)) catch {
+        e => {
+            print(describe(e))
+            return
+        }
+    }
+    print("unexpected")
+}
+
+fn cancelling(p: pool.Pool) {
+    using a = pool.acquire(p) catch {
+        _ => return
+    }
+    using b = pool.acquire(p) catch {
+        _ => return
+    }
+    let t = cancel.token()
+    spawn cancel_soon(t)
+    using first = pool.acquire_until(p, t, duration.zero()) catch {
+        e => {
+            print(describe(e))
+            return
+        }
+    }
+    print("unexpected")
+}
+
+fn cancel_soon(t: *cancel.Token) {
+    sleep(20)
+    cancel.cancel(t)
+}
+
+fn cancelled_up_front(p: pool.Pool) {
+    let t = cancel.token()
+    cancel.cancel(t)
+    using first = pool.acquire_until(p, t, duration.zero()) catch {
+        e => {
+            print(describe(e))
+            return
+        }
+    }
+    print("unexpected")
+}
+
+fn discarding(p: pool.Pool) {
+    using a = pool.acquire(p) catch {
+        _ => return
+    }
+    pool.conn(a).close()
+    let after = pool.conn(a).query("SELECT 1", []) catch {
+        _ => sql.Rows { columns: [], rows: [] }
+    }
+    print(after.rows.len)
+    pool.release(a)
+    print(show(pool.stats(p)))
+}
+
+fn broken_connection(path: str) {
+    var raws: []sql.ConnectionHandle = []
+    let p = pool.open(fn() -> sql.Connection ! sql.Error {
+        using c = sqlite.connect(sql.Options { database: path })?
+        push(mut raws, sql.handle(c))
+        c
+    }, pool.Config { max: 1 })
+    {
+        using a = pool.acquire(p) catch {
+            _ => return
+        }
+        raws[0].close()
+        let r = pool.conn(a).query("SELECT 1", []) catch {
+            e => {
+                match e {
+                    Closed => print("saw closed")
+                    _ => print("saw other")
+                }
+                sql.Rows { columns: [], rows: [] }
+            }
+        }
+        print(r.rows.len)
+    }
+    print(show(pool.stats(p)))
+    using b = pool.acquire(p) catch {
+        _ => return
+    }
+    let rows = pool.conn(b).query("SELECT 7", []) catch {
+        _ => sql.Rows { columns: [], rows: [[sql.Value.Int(-1)]] }
+    }
+    print("replacement {count_of(rows)} raws {raws.len}")
+}
+
+fn server_error(path: str) {
+    let p = pool.open(opener(path, atomic.int(0)), pool.Config { max: 1 })
+    {
+        using a = pool.acquire(p) catch {
+            _ => return
+        }
+        let r = pool.conn(a).execute("INSERT INTO missing VALUES (1)", []) catch {
+            e => {
+                match e {
+                    Server(code, message) => print("server error kept the connection")
+                    _ => print("other")
+                }
+                0
+            }
+        }
+    }
+    print(show(pool.stats(p)))
+    pool.shutdown(p)
+}
+
+fn rolled_back(p: pool.Pool) {
+    using a = pool.acquire(p) catch {
+        _ => return
+    }
+    pool.conn(a).begin() catch { _ => {} }
+    pool.conn(a).execute("INSERT INTO hits (n) VALUES (100)", []) catch { _ => -1 }
+    pool.release(a)
+    using b = pool.acquire(p) catch {
+        _ => return
+    }
+    let rows = pool.conn(b).query("SELECT count(*) FROM hits WHERE n = 100", []) catch {
+        _ => sql.Rows { columns: [], rows: [[sql.Value.Int(-1)]] }
+    }
+    print("rolled back rows {count_of(rows)}")
+}
+
+fn concurrent(path: str) {
+    let made = atomic.int(0)
+    let failures = atomic.int(0)
+    let p = pool.open(opener(path, made), pool.Config { max: 3 })
+    let done = sync.wait_group()
+    sync.add(done, 40)
+    for i in 0..40 {
+        spawn increment(p, done, failures)
+    }
+    sync.wait(done)
+    print("failures {atomic.load_int(failures)}")
+    {
+        using a = pool.acquire(p) catch {
+            _ => return
+        }
+        let rows = pool.conn(a).query("SELECT count(*) FROM hits WHERE n = 1", []) catch {
+            _ => sql.Rows { columns: [], rows: [[sql.Value.Int(-1)]] }
+        }
+        print("hits {count_of(rows)}")
+    }
+    let s = pool.stats(p)
+    print("in_use {s.in_use} waiting {s.waiting} open<=3 {s.open <= 3} opened<=3 {s.opened <= 3} acquires {s.acquires}")
+    pool.shutdown(p)
+}
+
+fn aging(path: str) {
+    let start = timestamp.from_unix(1000) catch { _ => timestamp.epoch() }
+    let m = clock.manual(start)
+    let made = atomic.int(0)
+    let pings = atomic.int(0)
+    let healthy = atomic.boolean(true)
+    let config = pool.Config {
+        max: 2
+        max_idle: 1
+        idle_timeout: duration.seconds(60)
+        max_lifetime: duration.seconds(300)
+        ping_after: duration.seconds(10)
+        ping: fn(h: sql.ConnectionHandle) ! sql.Error {
+            atomic.add_int(pings, 1)
+            if !atomic.load_bool(healthy) {
+                fail Closed
+            }
+        }
+        clock: clock.clock(m)
+    }
+    let p = pool.open(opener(path, made), config)
+    {
+        using a = pool.acquire(p) catch { _ => return }
+        using b = pool.acquire(p) catch { _ => return }
+        print(show(pool.stats(p)))
+    }
+    print("after release {show(pool.stats(p))}")
+
+    clock.advance(m, duration.seconds(5))
+    {
+        using a = pool.acquire(p) catch { _ => return }
+    }
+    print("fresh idle: pings {atomic.load_int(pings)} opened {atomic.load_int(made)}")
+
+    clock.advance(m, duration.seconds(20))
+    {
+        using a = pool.acquire(p) catch { _ => return }
+    }
+    print("stale idle: pings {atomic.load_int(pings)} opened {atomic.load_int(made)}")
+
+    atomic.store_bool(healthy, false)
+    clock.advance(m, duration.seconds(20))
+    {
+        using a = pool.acquire(p) catch { _ => return }
+        print("ping failed: pings {atomic.load_int(pings)} opened {atomic.load_int(made)} {show(pool.stats(p))}")
+    }
+    atomic.store_bool(healthy, true)
+
+    clock.advance(m, duration.seconds(61))
+    print("pruned {pool.prune(p)}")
+    print(show(pool.stats(p)))
+
+    {
+        using a = pool.acquire(p) catch { _ => return }
+    }
+    clock.advance(m, duration.seconds(301))
+    {
+        using a = pool.acquire(p) catch { _ => return }
+        print("lifetime: opened {atomic.load_int(made)} {show(pool.stats(p))}")
+    }
+    pool.shutdown(p)
+}
+
+fn closing(path: str) {
+    let made = atomic.int(0)
+    let p = pool.open(opener(path, made), pool.Config { max: 2 })
+    let held = chan[bool]()
+    let released = chan[bool](1)
+    spawn hold_then_release(p, held)
+    let ready = <-held
+    let waiter = chan[bool](1)
+    spawn acquire_after_close(p, waiter)
+    await_waiting(p, 1)
+    print(show(pool.stats(p)))
+    spawn announce_shutdown(p, released)
+    await_waiting(p, 0)
+    print("closing {show(pool.stats(p))}")
+    held <- true
+    let finished = <-released
+    print("after shutdown {show(pool.stats(p))}")
+    print("waiter closed {(<-waiter) ?? false}")
+    using late = pool.acquire(p) catch {
+        e => {
+            print(describe(e))
+            return
+        }
+    }
+    print("unexpected")
+}
+
+fn hold_then_release(p: pool.Pool, held: chan[bool]) {
+    using a = pool.acquire(p) catch {
+        _ => return
+    }
+    using b = pool.acquire(p) catch {
+        _ => return
+    }
+    held <- true
+    let go = <-held
+}
+
+fn acquire_after_close(p: pool.Pool, out: chan[bool]) {
+    using r = pool.acquire(p) catch {
+        e => {
+            match e {
+                Closed => {
+                    out <- true
+                    return
+                }
+                _ => {}
+            }
+            out <- false
+            return
+        }
+    }
+    out <- false
+}
+
+fn announce_shutdown(p: pool.Pool, done: chan[bool]) {
+    pool.shutdown(p)
+    done <- true
+}
+
+fn opener_failure() {
+    let attempts = atomic.int(0)
+    let p = pool.open(fn() -> sql.Connection ! sql.Error {
+        atomic.add_int(attempts, 1)
+        fail sql.Error.Connect
+    }, pool.Config { max: 1 })
+    for i in 0..2 {
+        using extra = pool.acquire(p) catch {
+            e => {
+                print(describe(e))
+                continue
+            }
+        }
+    }
+    print("attempts {atomic.load_int(attempts)} {show(pool.stats(p))}")
+}
+
+fn main() {
+    let dir = "/tmp/low-std-sql-pool-{os.pid()}"
+    file.mkdir(dir) catch {
+        _ => print("cannot make {dir}")
+    }
+    let path = "{dir}/pool.db"
+    let made = atomic.int(0)
+
+    let p = pool.open(opener(path, made), pool.Config { max: 2 })
+    basics(p)
+    waiting(p)
+    views(p)
+    timing(p)
+    cancelling(p)
+    cancelled_up_front(p)
+    print(show(pool.stats(p)))
+    discarding(p)
+    rolled_back(p)
+    let before = pool.stats(p)
+    print("timeouts {before.timeouts} cancelled {before.cancelled}")
+    pool.shutdown(p)
+    print("shutdown {show(pool.stats(p))}")
+    print("made {atomic.load_int(made)}")
+
+    concurrent(path)
+    broken_connection(path)
+    server_error(path)
+    aging(path)
+    closing(path)
+    opener_failure()
+    file.remove_all(dir) catch {
+        _ => print("cannot remove {dir}")
+    }
+}

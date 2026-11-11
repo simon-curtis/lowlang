@@ -1,0 +1,328 @@
+import std/cancel
+import std/http
+import std/http/sse
+import std/io
+import std/net
+import std/text
+import std/web
+
+fn visible(s: str) -> str {
+    var out: []u8 = []
+    for i in 0..s.len {
+        let c = s[i]
+        match c {
+            '\n' => text.append(mut out, "\\n")
+            '\r' => text.append(mut out, "\\r")
+            0 => text.append(mut out, "\\0")
+            _ => push(mut out, c)
+        }
+    }
+    str(out)
+}
+
+fn show_format(label: str, e: sse.Event) {
+    print("{label}: {visible(sse.format(e))}")
+}
+
+fn formatting() {
+    show_format("plain", sse.Event { data: "hello" })
+    show_format("all", sse.Event { id: some("7"), event: some("tick"), data: "a", retry: some(3000) })
+    show_format("multi", sse.Event { data: "a\nb\r\nc\rd" })
+    show_format("trailing", sse.Event { data: "a\n" })
+    show_format("blank line", sse.Event { data: "a\n\nb" })
+    show_format("leading space", sse.Event { data: " indented" })
+    show_format("id breaks", sse.Event { id: some("a\nb\0c"), data: "x" })
+    show_format("event breaks", sse.Event { event: some("up\r\ndate"), data: "x" })
+    show_format("named empty", sse.Event { event: some("ping") })
+    show_format("empty id", sse.Event { id: some(""), data: "x" })
+    show_format("retry only", sse.Event { retry: some(1500) })
+    show_format("nothing", sse.Event {})
+    print("comment: {visible(sse.comment("note"))}")
+    print("comment lines: {visible(sse.comment("a\nb"))}")
+    print("keepalive: {visible(sse.keepalive())}")
+}
+
+fn describe(e: sse.Event) -> str {
+    "id={e.id ?? "-"} event={e.event ?? "-"} retry={e.retry ?? -1} data=[{visible(e.data)}]"
+}
+
+fn parsed(label: str, input: []u8) {
+    let events = sse.parse(input)
+    print("{label}: {events.len} events")
+    for e in events {
+        print("  {describe(e)}")
+    }
+}
+
+fn from(s: str) -> []u8 {
+    bytes(s)
+}
+
+fn split_feed(label: str, input: []u8, size: i64) {
+    let p = sse.parser()
+    var events: []sse.Event = []
+    var at = 0
+    for at < input.len {
+        let stop = if at + size < input.len { at + size } else { input.len }
+        for e in sse.feed(p, input[at..stop]) {
+            push(mut events, e)
+        }
+        at = stop
+    }
+    print("{label}: {events.len} events, reconnect {p.reconnect}")
+    for e in events {
+        print("  {describe(e)}")
+    }
+}
+
+fn parsing() {
+    parsed("lf", from("data: one\n\ndata: two\n\n"))
+    parsed("crlf", from("data: one\r\n\r\ndata: two\r\n\r\n"))
+    parsed("cr", from("data: one\r\rdata: two\r\r"))
+    parsed("mixed", from("data: a\ndata: b\r\ndata: c\r\r"))
+    parsed("multi data", from("data: first\ndata: second\n\n"))
+    parsed("fields", from("id: 9\nevent: update\nretry: 2500\ndata: payload\n\n"))
+    parsed("comments", from(": hello\ndata: x\n: between\n\n: only a comment\n\n"))
+    parsed("no colon", from("data\n\ndata:\n\n"))
+    parsed("no colon field", from("event\ndata: x\n\n"))
+    parsed("one space", from("data:  two spaces\ndata:no space\n\n"))
+    parsed("no data", from("event: ping\nid: 4\n\n"))
+    parsed("sticky id", from("id: 1\ndata: a\n\ndata: b\n\nid: 2\ndata: c\n\n"))
+    parsed("id reset", from("id: 1\ndata: a\n\nid\ndata: b\n\n"))
+    parsed("id with nul", from("id: 1\ndata: a\n\nid: 2\03\ndata: b\n\n"))
+    parsed("event reset", from("event: x\ndata: a\n\ndata: b\n\n"))
+    parsed("unknown field", from("foo: bar\ndata: x\n\n"))
+    parsed("retry junk", from("retry: abc\nretry: 12x\nretry: -5\ndata: a\n\n"))
+    parsed("incomplete", from("data: kept\n\ndata: lost"))
+    parsed("trailing newline in data", from("data: a\ndata:\n\n"))
+    parsed("empty lines", from("\n\n\ndata: x\n\n\n"))
+    var bom: []u8 = [0xEF, 0xBB, 0xBF]
+    io.append_str(mut bom, "data: after bom\n\n")
+    parsed("bom", bom)
+    var late: []u8 = from("data: a\n\n")
+    io.append(mut late, [0xEF, 0xBB, 0xBF])
+    io.append_str(mut late, "data: b\n\n")
+    parsed("bom not first", late)
+    var utf: []u8 = from("data: caf")
+    io.append(mut utf, [0xC3, 0xA9])
+    io.append_str(mut utf, "\n\n")
+    parsed("utf8", utf)
+    let whole = from("id: 5\r\nevent: t\r\ndata: a\r\ndata: b\r\n\r\n: c\r\ndata: z\r\rretry: 99\rdata: q\n\n")
+    split_feed("chunks of 1", whole, 1)
+    split_feed("chunks of 2", whole, 2)
+    split_feed("chunks of 3", whole, 3)
+    split_feed("whole", whole, whole.len)
+}
+
+fn ticks(em: *sse.Emitter) {
+    for i in 1..4 {
+        if !sse.send(em, sse.Event { id: some("{i}"), event: some("count"), data: "n={i}" }) {
+            return
+        }
+    }
+}
+
+fn forever(em: *sse.Emitter, stopped: chan[str]) {
+    var n = 0
+    for sse.send(em, sse.Event { data: "tick {n}" }) {
+        n += 1
+        cancel.pause(em.token, 5)
+    }
+    stopped <- "producer stopped"
+}
+
+fn slow(em: *sse.Emitter) {
+    cancel.pause(em.token, 300)
+    sse.send(em, sse.Event { data: "late" })
+}
+
+fn echo_last(req: http.Request) -> http.Response {
+    let ch = chan[sse.Event](2)
+    ch <- sse.Event { data: "resume from {sse.last_event_id(req) ?? "none"}" }
+    close(ch)
+    sse.serve_events(req, ch)
+}
+
+fn handle(req: http.Request, stopped: chan[str]) -> http.Response {
+    if req.path == "/count" {
+        return sse.stream(req, ticks)
+    }
+    if req.path == "/forever" {
+        return sse.stream(req, fn(em: *sse.Emitter) { forever(em, stopped) })
+    }
+    if req.path == "/slow" {
+        var o = sse.options()
+        o.keepalive = 20
+        o.retry = 4000
+        return sse.stream_with(req, o, slow)
+    }
+    if req.path == "/last" {
+        return echo_last(req)
+    }
+    if req.path == "/chan" {
+        let ch = chan[sse.Event](4)
+        ch <- sse.Event { data: "one" }
+        ch <- sse.Event { id: some("b"), data: "two\nlines" }
+        close(ch)
+        return sse.serve_events(req, ch)
+    }
+    http.response(404, "")
+}
+
+fn serve(l: net.ListenerHandle, stopped: chan[str]) {
+    let handler = fn(r: http.Request) -> http.Response { handle(r, stopped) }
+    http.serve_on(l, handler) catch {
+        _ => {}
+    }
+}
+
+fn collect(c: *http.Client, url: str, label: str) {
+    let r = sse.listen(c.request("GET", url), fn(e: sse.Event) ! io.Error {
+        print("  {label} {describe(e)}")
+    }) catch {
+        _ => http.response(-1, "")
+    }
+    let version = if r.version == Http2 { "h2" } else { "h1" }
+    print("{label} {version} status {r.status} type {http.header_value(r, "content-type") ?? "-"} cache {http.header_value(r, "cache-control") ?? "-"} buffering {http.header_value(r, "x-accel-buffering") ?? "-"} length {http.header_value(r, "content-length") ?? "-"}")
+}
+
+fn cancelled_stream(c: *http.Client, url: str, stopped: chan[str], label: str) {
+    let t = cancel.token()
+    var seen = 0
+    let r = sse.listen(c.request("GET", url).with_cancel(t), fn(e: sse.Event) ! io.Error {
+        seen += 1
+        if seen == 3 {
+            cancel.cancel(t)
+        }
+    }) catch {
+        Cancelled => http.response(-2, "")
+        _ => http.response(-1, "")
+    }
+    print("{label} cancelled client {r.status} after {seen} events")
+    print("{label} {<-stopped ?? ""}")
+}
+
+fn raw_exchange(l: net.ListenerHandle, request: str) -> str ! io.Error {
+    using c = net.connect(l.addr)?
+    net.write_all(c, bytes(request))?
+    let all = io.read_all(net.stream(c)) catch []
+    net.close(c)
+    str(all)
+}
+
+fn raw_until(l: net.ListenerHandle, request: str, marker: str) -> str ! io.Error {
+    using c = net.connect(l.addr)?
+    net.write_all(c, bytes(request))?
+    let r = io.reader(net.stream(c))
+    var seen: []str = []
+    for {
+        let line = io.read_line(r) catch {
+            _ => break
+        }
+        push(mut seen, line)
+        if line == marker {
+            break
+        }
+    }
+    net.close(c)
+    text.join(seen, "|")
+}
+
+fn raw_disconnect(l: net.ListenerHandle, stopped: chan[str]) ! io.Error {
+    using c = net.connect(l.addr)?
+    net.write_all(c, bytes("GET /forever HTTP/1.1\r\nhost: x\r\n\r\n"))?
+    let r = io.reader(net.stream(c))
+    for {
+        let line = io.read_line(r)?
+        if text.starts_with(line, "data: tick 1") {
+            break
+        }
+    }
+    net.close(c)
+    let outcome = select {
+        s = <-stopped => s ?? ""
+        after(3000) => "producer still running"
+    }
+    print("raw disconnect: {outcome}")
+}
+
+fn web_events(app_events: chan[sse.Event]) -> *web.App {
+    let app = web.app()
+    web.use(app, web.compress(0, 3))
+    web.get(app, "/w", fn(c: *web.Context) -> http.Response { web.events(c, app_events) })
+    web.get(app, "/ws", fn(c: *web.Context) -> http.Response { web.event_stream(c, ticks) })
+    app
+}
+
+fn main() ! io.Error {
+    formatting()
+    parsing()
+
+    let stopped = chan[str](1)
+    using l = net.listen("127.0.0.1", 0)?
+    spawn serve(l.handle, stopped)
+    let base = "http://127.0.0.1:{l.handle.addr.port}"
+
+    let h1 = http.client().with_version(Http1).build()
+    collect(h1, "{base}/count", "h1 count")
+    collect(h1, "{base}/chan", "h1 chan")
+    collect(h1, "{base}/last", "h1 last")
+    let h2 = http.client().with_prior_knowledge(true).build()
+    collect(h2, "{base}/count", "h2 count")
+    collect(h2, "{base}/chan", "h2 chan")
+    let resumed = sse.listen(h1.request("GET", "{base}/last").with_header("last-event-id", "42"), fn(e: sse.Event) ! io.Error {
+        print("  resumed {describe(e)}")
+    }) catch {
+        _ => http.response(-1, "")
+    }
+    print("resumed status {resumed.status}")
+
+    cancelled_stream(h1, "{base}/forever", stopped, "h1 forever")
+    cancelled_stream(h2, "{base}/forever", stopped, "h2 forever")
+    raw_disconnect(l.handle, stopped)?
+
+    let wire = raw_exchange(l.handle, "GET /count HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")?
+    print("wire: {visible(wire)}")
+    let legacy = raw_exchange(l.handle, "GET /chan HTTP/1.0\r\nhost: x\r\n\r\n")?
+    print("http/1.0: {visible(legacy)}")
+    let head = raw_exchange(l.handle, "HEAD /count HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")?
+    print("head: {visible(head)}")
+    let both = raw_exchange(l.handle, "GET /chan HTTP/1.1\r\nhost: x\r\n\r\nGET /last HTTP/1.1\r\nhost: x\r\nlast-event-id: z\r\nconnection: close\r\n\r\n")?
+    print("pipelined: {visible(both)}")
+    let waiting = raw_until(l.handle, "GET /slow HTTP/1.1\r\nhost: x\r\n\r\n", "data: late")?
+    var keepalives = 0
+    for line in text.split(waiting, '|') {
+        if line == ": keepalive" {
+            keepalives += 1
+        }
+    }
+    print("slow: retry first {text.contains(waiting, "retry: 4000")} keepalive seen {keepalives > 0} ends with {waiting[waiting.len - 10..]}")
+
+    let queued = chan[sse.Event](4)
+    queued <- sse.Event { event: some("hello"), data: "via web" }
+    queued <- sse.Event { data: "second" }
+    close(queued)
+    let app = web_events(queued)
+    using w = net.listen("127.0.0.1", 0)?
+    spawn serve_app(w.handle, app)
+    let wb = "http://127.0.0.1:{w.handle.addr.port}"
+    let gz = http.client().with_decompression(false).build()
+    let compressed = sse.listen(gz.request("GET", "{wb}/w").with_header("accept-encoding", "gzip, br, zstd"), fn(e: sse.Event) ! io.Error {
+        print("  web {describe(e)}")
+    }) catch {
+        _ => http.response(-1, "")
+    }
+    print("web status {compressed.status} encoding {http.header_value(compressed, "content-encoding") ?? "none"} type {http.header_value(compressed, "content-type") ?? "-"}")
+    let producer = sse.listen(gz.request("GET", "{wb}/ws").with_header("accept-encoding", "gzip"), fn(e: sse.Event) ! io.Error {
+        print("  web stream {describe(e)}")
+    }) catch {
+        _ => http.response(-1, "")
+    }
+    print("web stream status {producer.status} encoding {http.header_value(producer, "content-encoding") ?? "none"}")
+}
+
+fn serve_app(l: net.ListenerHandle, app: *web.App) {
+    http.serve_on(l, web.handler(app)) catch {
+        _ => {}
+    }
+}

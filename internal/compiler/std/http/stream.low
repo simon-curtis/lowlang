@@ -1,0 +1,102 @@
+import std/cancel
+import std/io
+import std/text
+
+fn declared_length(headers: []Header) -> i64 {
+    let value = header(headers, "content-length") ?? ""
+    text.parse_uint(value, 10) catch {
+        _ => -1
+    }
+}
+
+fn chunk_frame(data: []u8) -> []u8 {
+    var out: []u8 = []
+    text.append(mut out, "{text.hex(data.len)}\r\n")
+    io.append(mut out, data)
+    text.append(mut out, "\r\n")
+    out
+}
+
+fn write_live_head(s: io.Stream, resp: Response, chunked: bool, closing: bool) ! io.Error {
+    var out: []u8 = []
+    text.append(mut out, "HTTP/1.1 {resp.status} {status_text(resp.status)}\r\n")
+    write_head(mut out, resp.headers)?
+    if chunked {
+        text.append(mut out, "transfer-encoding: chunked\r\n")
+    }
+    if closing {
+        text.append(mut out, "connection: close\r\n")
+    }
+    text.append(mut out, "\r\n")
+    io.write_all(s, out)?
+}
+
+fn write_live_part(s: io.Stream, data: []u8, chunked: bool, declared: i64, sent: i64) -> i64 ! io.Error {
+    if data.len == 0 {
+        return sent
+    }
+    if declared >= 0 && sent + data.len > declared {
+        fail Malformed
+    }
+    io.write_all(s, if chunked { chunk_frame(data) } else { data })?
+    sent + data.len
+}
+
+fn pump_live(s: io.Stream, chunks: chan[[]u8], token: *cancel.Token, arrived: chan[i64], chunked: bool, declared: i64) ! io.Error {
+    let silent = chan[i64](1)
+    var watching = true
+    var sent = 0
+    for {
+        let gate = if watching { arrived } else { silent }
+        select {
+            part = <-chunks => match part {
+                some(data) => {
+                    sent = write_live_part(s, data, chunked, declared, sent)?
+                }
+                none => {
+                    if declared >= 0 && sent != declared {
+                        fail Malformed
+                    }
+                    if chunked {
+                        io.write_str(s, "0\r\n\r\n")?
+                    }
+                    return
+                }
+            }
+            n = <-gate => {
+                let more = n ?? -1
+                arrived <- more
+                if more <= 0 {
+                    return
+                }
+                watching = false
+            }
+        }
+    }
+}
+
+fn write_live(s: io.Stream, line: str, token: *cancel.Token, resp: Response, arrived: chan[i64], closing: bool) -> bool ! io.Error {
+    let chunks = match resp.stream {
+        some(c) => c
+        none => return closing
+    }
+    let declared = if has_header(resp.headers, "content-length") { declared_length(resp.headers) } else { -1 }
+    let framed = declared < 0
+    let http10 = text.ends_with(line, "HTTP/1.0")
+    let chunked = framed && !http10
+    let close = closing || framed && http10
+    write_live_head(s, resp, chunked, close) catch {
+        e => {
+            cancel.cancel(token)
+            fail e
+        }
+    }
+    pump_live(s, chunks, token, arrived, chunked, declared) catch {
+        e => {
+            cancel.cancel(token)
+            fail e
+        }
+    }
+    cancel.cancel(token)
+    close
+}

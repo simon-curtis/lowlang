@@ -1,0 +1,195 @@
+import std/cancel
+import std/sync
+import std/time/clock
+import std/time/duration
+
+struct Node[K: Hash] {
+    key: K
+    bucket: Bucket
+    seen: i64
+    prev: i64
+    next: i64
+}
+
+struct KeyedState[K: Hash] {
+    guard: sync.Mutex
+    clock: clock.Clock
+    sleeper: fn(duration.Duration)?
+    rate: i64
+    burst: i64
+    capacity: i64
+    idle: i64
+    slots: [K: i64]
+    nodes: []Node[K]
+    spare: []i64
+    head: i64
+    tail: i64
+}
+
+pub struct Keyed[K: Hash] {
+    state: *KeyedState[K]
+}
+
+pub fn keyed[K: Hash](rate_per_second: i64, burst: i64, capacity: i64, idle: duration.Duration, c: clock.Clock) -> Keyed[K] {
+    if capacity < 1 {
+        __panic("ratelimit: keyed capacity must be at least 1")
+    }
+    check_shape(rate_per_second, 1000000000, burst)
+    let s = KeyedState[K] {
+        guard: sync.mutex(),
+        clock: c,
+        sleeper: none,
+        rate: rate_per_second,
+        burst,
+        capacity,
+        idle: nanos_of(idle),
+        slots: [:],
+        nodes: [],
+        spare: [],
+        head: -1,
+        tail: -1
+    }
+    Keyed[K] { state: new(s) }
+}
+
+pub fn set_keyed_sleeper[K: Hash](k: Keyed[K], f: fn(duration.Duration)) {
+    let s = k.state
+    sync.lock(s.guard)
+    s.sleeper = some(f)
+    sync.unlock(s.guard)
+}
+
+fn detach[K: Hash](s: *KeyedState[K], at: i64) {
+    let n = s.nodes[at]
+    if n.prev >= 0 {
+        s.nodes[n.prev].next = n.next
+    } else {
+        s.head = n.next
+    }
+    if n.next >= 0 {
+        s.nodes[n.next].prev = n.prev
+    } else {
+        s.tail = n.prev
+    }
+}
+
+fn attach_front[K: Hash](s: *KeyedState[K], at: i64) {
+    s.nodes[at].prev = -1
+    s.nodes[at].next = s.head
+    if s.head >= 0 {
+        s.nodes[s.head].prev = at
+    }
+    s.head = at
+    if s.tail < 0 {
+        s.tail = at
+    }
+}
+
+fn drop_node[K: Hash](s: *KeyedState[K], at: i64) {
+    detach(s, at)
+    delete(mut s.slots, s.nodes[at].key)
+    push(mut s.spare, at)
+}
+
+fn evict_idle[K: Hash](s: *KeyedState[K], now: i64) {
+    if s.idle <= 0 {
+        return
+    }
+    for s.tail >= 0 && now - s.nodes[s.tail].seen >= s.idle {
+        drop_node(s, s.tail)
+    }
+}
+
+fn claim[K: Hash](s: *KeyedState[K], key: K, fresh: Bucket, now: i64) -> i64 {
+    let node = Node[K] { key: key, bucket: fresh, seen: now, prev: -1, next: -1 }
+    if s.spare.len > 0 {
+        let at = s.spare[s.spare.len - 1]
+        s.spare = s.spare[..s.spare.len - 1]
+        s.nodes[at] = node
+        return at
+    }
+    push(mut s.nodes, node)
+    s.nodes.len - 1
+}
+
+fn fresh_bucket[K: Hash](s: *KeyedState[K]) -> Bucket {
+    let b = bucket(s.rate, s.burst, s.clock)
+    match s.sleeper {
+        some(f) => set_sleeper(b, f)
+        none => {}
+    }
+    b
+}
+
+fn lookup[K: Hash](s: *KeyedState[K], key: K) -> Bucket {
+    let now = nanos_of(s.clock.monotonic())
+    evict_idle(s, now)
+    match s.slots[key] {
+        some(at) => {
+            s.nodes[at].seen = now
+            if at != s.head {
+                detach(s, at)
+                attach_front(s, at)
+            }
+            return s.nodes[at].bucket
+        }
+        none => {}
+    }
+    if s.slots.len >= s.capacity {
+        drop_node(s, s.tail)
+    }
+    let fresh = fresh_bucket(s)
+    let at = claim(s, key, fresh, now)
+    s.slots[key] = at
+    attach_front(s, at)
+    fresh
+}
+
+pub fn bucket_for[K: Hash](k: Keyed[K], key: K) -> Bucket {
+    let s = k.state
+    sync.lock(s.guard)
+    let b = lookup(s, key)
+    sync.unlock(s.guard)
+    b
+}
+
+pub fn allow_key[K: Hash](k: Keyed[K], key: K) -> bool {
+    allow(bucket_for(k, key))
+}
+
+pub fn allow_key_n[K: Hash](k: Keyed[K], key: K, n: i64) -> bool {
+    allow_n(bucket_for(k, key), n)
+}
+
+pub fn reserve_key[K: Hash](k: Keyed[K], key: K, n: i64) -> duration.Duration? {
+    reserve(bucket_for(k, key), n)
+}
+
+pub fn wait_key[K: Hash](k: Keyed[K], key: K, t: *cancel.Token) ! Error {
+    wait(bucket_for(k, key), t)?
+}
+
+pub fn forget_key[K: Hash](k: Keyed[K], key: K) {
+    let s = k.state
+    sync.lock(s.guard)
+    match s.slots[key] {
+        some(at) => drop_node(s, at)
+        none => {}
+    }
+    sync.unlock(s.guard)
+}
+
+pub fn tracked[K: Hash](k: Keyed[K]) -> i64 {
+    let s = k.state
+    sync.lock(s.guard)
+    let n = s.slots.len
+    sync.unlock(s.guard)
+    n
+}
+
+pub fn sweep[K: Hash](k: Keyed[K]) {
+    let s = k.state
+    sync.lock(s.guard)
+    evict_idle(s, nanos_of(s.clock.monotonic()))
+    sync.unlock(s.guard)
+}

@@ -1,0 +1,496 @@
+import std/crypto/hash
+import std/io
+import std/sql
+import std/text
+import std/time/clock
+import std/time/timestamp
+
+pub struct Migration {
+    pub version: i64
+    pub name: str
+    pub up: []str
+    pub down: []str
+}
+
+pub struct Plan {
+    pub migrations: []Migration
+    pub table: str = "schema_migrations"
+    pub clock: clock.Clock = clock.system()
+}
+
+pub enum State {
+    Applied
+    Pending
+    Drifted
+    Unknown
+}
+
+pub struct Entry {
+    pub version: i64
+    pub name: str
+    pub state: State
+    pub expected: str
+    pub recorded: str
+    pub applied_at: timestamp.Timestamp?
+}
+
+pub enum Error {
+    Sql(cause: sql.Error)
+    Failed(version: i64, cause: sql.Error)
+    Duplicate(version: i64)
+    OutOfOrder(version: i64)
+    Invalid(version: i64)
+    Drift(version: i64)
+    Unknown(version: i64)
+    NoDown(version: i64)
+    Locked
+    Syntax(line: i64)
+    BadName(file: str)
+    Io(cause: io.Error)
+}
+
+struct Record {
+    version: i64
+    name: str
+    applied_at: i64
+    checksum: str
+}
+
+fn max_version() -> i64 {
+    9223372036854775807
+}
+
+pub fn plan(migrations: []Migration) -> Plan {
+    Plan { migrations }
+}
+
+pub fn with_table(p: Plan, table: str) -> Plan {
+    Plan { migrations: p.migrations, table, clock: p.clock }
+}
+
+pub fn with_clock(p: Plan, c: clock.Clock) -> Plan {
+    Plan { migrations: p.migrations, table: p.table, clock: c }
+}
+
+pub fn checksum(m: Migration) -> str {
+    var buf: []u8 = []
+    for statement in m.up {
+        text.append(mut buf, "{statement.len}:")
+        text.append(mut buf, statement)
+        text.append(mut buf, "\n")
+    }
+    text.encode_hex(hash.sum(hash.sha256(), buf))
+}
+
+pub fn validate(p: Plan) ! Error {
+    var seen: [i64: bool] = [:]
+    for m in p.migrations {
+        if m.version < 1 {
+            fail Invalid(m.version)
+        }
+        if seen[m.version] != none {
+            fail Duplicate(m.version)
+        }
+        seen[m.version] = true
+    }
+    var previous = 0
+    for m in p.migrations {
+        if m.version < previous {
+            fail OutOfOrder(m.version)
+        }
+        previous = m.version
+    }
+}
+
+fn table_of(d: sql.Dialect, p: Plan) -> str {
+    sql.quote_identifier(d, p.table)
+}
+
+fn create_text(d: sql.Dialect, p: Plan) -> str {
+    let t = table_of(d, p)
+    match d {
+        SqlServer => "IF OBJECT_ID(N'{p.table}', N'U') IS NULL CREATE TABLE {t} (version BIGINT NOT NULL PRIMARY KEY, name NVARCHAR(255) NOT NULL, applied_at BIGINT NOT NULL, checksum VARCHAR(64) NOT NULL)"
+        _ => "CREATE TABLE IF NOT EXISTS {t} (version BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL, checksum TEXT NOT NULL)"
+    }
+}
+
+fn lock_key(p: Plan) -> i64 {
+    let digest = hash.sum(hash.sha256(), bytes("low.migrate:{p.table}"))
+    var key: i64 = 0
+    for i in 0..7 {
+        key = key * 256 + i64(digest[i])
+    }
+    key
+}
+
+fn lock_text(d: sql.Dialect) -> str {
+    match d {
+        Postgres => "SELECT pg_advisory_lock({sql.placeholder(d, 0)})"
+        SqlServer => "DECLARE @status INT; EXEC @status = sp_getapplock @Resource = {sql.placeholder(d, 0)}, @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = -1; SELECT @status"
+        Sqlite => ""
+    }
+}
+
+fn unlock_text(d: sql.Dialect) -> str {
+    match d {
+        Postgres => "SELECT pg_advisory_unlock({sql.placeholder(d, 0)})"
+        SqlServer => "EXEC sp_releaseapplock @Resource = {sql.placeholder(d, 0)}, @LockOwner = 'Session'"
+        Sqlite => ""
+    }
+}
+
+fn lock_value(d: sql.Dialect, p: Plan) -> sql.Value {
+    match d {
+        SqlServer => Text("low.migrate:{p.table}")
+        _ => Int(lock_key(p))
+    }
+}
+
+fn acquire_lock(h: sql.ConnectionHandle, p: Plan) ! Error {
+    let statement = lock_text(h.dialect)
+    if statement.len == 0 {
+        return
+    }
+    let values = [lock_value(h.dialect, p)]
+    let rows = h.query(statement, values) catch {
+        e => fail Sql(e)
+    }
+    if h.dialect == SqlServer && rows.rows.len > 0 && int_at(rows.rows[0][0]) < 0 {
+        fail Locked
+    }
+}
+
+fn release_lock(h: sql.ConnectionHandle, p: Plan) {
+    let statement = unlock_text(h.dialect)
+    if statement.len == 0 {
+        return
+    }
+    let values = [lock_value(h.dialect, p)]
+    h.execute(statement, values) catch {
+        _ => 0
+    }
+}
+
+fn ensure_table(h: sql.ConnectionHandle, p: Plan) ! Error {
+    h.execute(create_text(h.dialect, p), []) catch {
+        e => fail Sql(e)
+    }
+}
+
+fn int_at(v: sql.Value) -> i64 {
+    match v {
+        Int(n) => n
+        Bool(b) => if b { 1 } else { 0 }
+        Decimal(digits) => text.parse_int(digits) catch 0
+        _ => 0
+    }
+}
+
+fn text_at(v: sql.Value) -> str {
+    match v {
+        Text(s) => s
+        _ => ""
+    }
+}
+
+fn read_records(h: sql.ConnectionHandle, p: Plan) -> []Record ! Error {
+    let statement = "SELECT version, name, applied_at, checksum FROM {table_of(h.dialect, p)} ORDER BY version"
+    let rows = h.query(statement, []) catch {
+        e => fail Sql(e)
+    }
+    var out: []Record = []
+    for r in rows.rows {
+        push(mut out, Record {
+            version: int_at(r[0])
+            name: text_at(r[1])
+            applied_at: int_at(r[2])
+            checksum: text_at(r[3])
+        })
+    }
+    out
+}
+
+fn rollback_quietly(h: sql.ConnectionHandle) {
+    h.rollback() catch {
+        _ => {}
+    }
+}
+
+fn begin_transaction(h: sql.ConnectionHandle) ! sql.Error {
+    if h.dialect == Sqlite {
+        h.execute("BEGIN IMMEDIATE", [])?
+        return
+    }
+    h.begin()?
+}
+
+fn transact(h: sql.ConnectionHandle, version: i64, work: fn() ! sql.Error) ! Error {
+    begin_transaction(h) catch {
+        e => fail Failed(version, e)
+    }
+    work() catch {
+        e => {
+            rollback_quietly(h)
+            fail Failed(version, e)
+        }
+    }
+    h.commit() catch {
+        e => {
+            rollback_quietly(h)
+            fail Failed(version, e)
+        }
+    }
+}
+
+fn recorded(h: sql.ConnectionHandle, p: Plan, version: i64) -> bool ! sql.Error {
+    let statement = "SELECT count(*) FROM {table_of(h.dialect, p)} WHERE version = {sql.placeholder(h.dialect, 0)}"
+    let rows = h.query(statement, [Int(version)])?
+    rows.rows.len > 0 && int_at(rows.rows[0][0]) > 0
+}
+
+fn run_all(h: sql.ConnectionHandle, statements: []str) ! sql.Error {
+    for statement in statements {
+        h.execute(statement, [])?
+    }
+}
+
+fn insert_record(h: sql.ConnectionHandle, p: Plan, m: Migration) ! sql.Error {
+    let d = h.dialect
+    let t = table_of(d, p)
+    let marks = [sql.placeholder(d, 0), sql.placeholder(d, 1), sql.placeholder(d, 2), sql.placeholder(d, 3)]
+    let statement = "INSERT INTO {t} (version, name, applied_at, checksum) VALUES ({text.join(marks, ", ")})"
+    let at = timestamp.unix_millis(p.clock.read())
+    h.execute(statement, [Int(m.version), Text(m.name), Int(at), Text(checksum(m))])?
+}
+
+fn delete_record(h: sql.ConnectionHandle, p: Plan, version: i64) ! sql.Error {
+    let statement = "DELETE FROM {table_of(h.dialect, p)} WHERE version = {sql.placeholder(h.dialect, 0)}"
+    h.execute(statement, [Int(version)])?
+}
+
+fn apply_one(h: sql.ConnectionHandle, p: Plan, m: Migration) -> bool ! Error {
+    var applied = false
+    let work = fn() ! sql.Error {
+        if recorded(h, p, m.version)? {
+            return
+        }
+        run_all(h, m.up)?
+        insert_record(h, p, m)?
+        applied = true
+    }
+    transact(h, m.version, work)?
+    applied
+}
+
+fn revert_one(h: sql.ConnectionHandle, p: Plan, m: Migration) -> bool ! Error {
+    var reverted = false
+    let work = fn() ! sql.Error {
+        if !recorded(h, p, m.version)? {
+            return
+        }
+        run_all(h, m.down)?
+        delete_record(h, p, m.version)?
+        reverted = true
+    }
+    transact(h, m.version, work)?
+    reverted
+}
+
+fn find_record(records: []Record, version: i64) -> Record? {
+    for r in records {
+        if r.version == version {
+            return r
+        }
+    }
+    none
+}
+
+fn find_migration(p: Plan, version: i64) -> Migration? {
+    for m in p.migrations {
+        if m.version == version {
+            return m
+        }
+    }
+    none
+}
+
+fn highest(records: []Record) -> i64 {
+    var top = 0
+    for r in records {
+        if r.version > top {
+            top = r.version
+        }
+    }
+    top
+}
+
+fn check_drift(p: Plan, records: []Record) ! Error {
+    for r in records {
+        match find_migration(p, r.version) {
+            some(m) => {
+                if checksum(m) != r.checksum {
+                    fail Drift(r.version)
+                }
+            }
+            none => {}
+        }
+    }
+}
+
+fn apply_pending(h: sql.ConnectionHandle, p: Plan, limit: i64, mut applied: []i64) ! Error {
+    let records = read_records(h, p)?
+    check_drift(p, records)?
+    let top = highest(records)
+    for m in p.migrations {
+        if find_record(records, m.version) != none {
+            continue
+        }
+        if m.version < top {
+            fail OutOfOrder(m.version)
+        }
+        if m.version > limit {
+            break
+        }
+        if apply_one(h, p, m)? {
+            push(mut applied, m.version)
+        }
+    }
+}
+
+fn revert_latest(h: sql.ConnectionHandle, p: Plan, steps: i64, mut reverted: []i64) ! Error {
+    let records = read_records(h, p)?
+    var targets: []Migration = []
+    var index = records.len - 1
+    for index >= 0 && targets.len < steps {
+        let r = records[index]
+        match find_migration(p, r.version) {
+            some(m) => {
+                if m.down.len == 0 {
+                    fail NoDown(m.version)
+                }
+                push(mut targets, m)
+            }
+            none => fail Unknown(r.version)
+        }
+        index -= 1
+    }
+    for m in targets {
+        if revert_one(h, p, m)? {
+            push(mut reverted, m.version)
+        }
+    }
+}
+
+fn prepare(h: sql.ConnectionHandle, p: Plan) ! Error {
+    validate(p)?
+    acquire_lock(h, p)?
+    ensure_table(h, p) catch {
+        e => {
+            release_lock(h, p)
+            fail e
+        }
+    }
+}
+
+pub fn up_on(h: sql.ConnectionHandle, p: Plan) -> []i64 ! Error {
+    up_to_on(h, p, max_version())?
+}
+
+pub fn up_to_on(h: sql.ConnectionHandle, p: Plan, version: i64) -> []i64 ! Error {
+    prepare(h, p)?
+    var applied: []i64 = []
+    var failure: Error? = none
+    apply_pending(h, p, version, mut applied) catch {
+        e => {
+            failure = e
+        }
+    }
+    release_lock(h, p)
+    match failure {
+        some(e) => fail e
+        none => {}
+    }
+    applied
+}
+
+pub fn down_on(h: sql.ConnectionHandle, p: Plan, steps: i64) -> []i64 ! Error {
+    prepare(h, p)?
+    var reverted: []i64 = []
+    var failure: Error? = none
+    revert_latest(h, p, steps, mut reverted) catch {
+        e => {
+            failure = e
+        }
+    }
+    release_lock(h, p)
+    match failure {
+        some(e) => fail e
+        none => {}
+    }
+    reverted
+}
+
+fn entry_of(m: Migration, r: Record?) -> Entry {
+    let expected = checksum(m)
+    match r {
+        some(found) => Entry {
+            version: m.version
+            name: m.name
+            state: if found.checksum == expected { Applied } else { Drifted }
+            expected
+            recorded: found.checksum
+            applied_at: stamp(found.applied_at)
+        }
+        none => Entry { version: m.version, name: m.name, state: Pending, expected, recorded: "", applied_at: none }
+    }
+}
+
+fn stamp(millis: i64) -> timestamp.Timestamp? {
+    let ts = timestamp.from_unix_millis(millis) catch {
+        _ => return none
+    }
+    ts
+}
+
+fn unknown_entry(r: Record) -> Entry {
+    Entry { version: r.version, name: r.name, state: Unknown, expected: "", recorded: r.checksum, applied_at: stamp(r.applied_at) }
+}
+
+pub fn status_on(h: sql.ConnectionHandle, p: Plan) -> []Entry ! Error {
+    validate(p)?
+    ensure_table(h, p)?
+    let records = read_records(h, p)?
+    var out: []Entry = []
+    var next = 0
+    for m in p.migrations {
+        for next < records.len && records[next].version < m.version {
+            push(mut out, unknown_entry(records[next]))
+            next += 1
+        }
+        push(mut out, entry_of(m, find_record(records, m.version)))
+        if next < records.len && records[next].version == m.version {
+            next += 1
+        }
+    }
+    for next < records.len {
+        push(mut out, unknown_entry(records[next]))
+        next += 1
+    }
+    out
+}
+
+pub fn status(c: sql.Connection, p: Plan) -> []Entry ! Error {
+    status_on(sql.handle(c), p)?
+}
+
+pub fn up(c: sql.Connection, p: Plan) -> []i64 ! Error {
+    up_on(sql.handle(c), p)?
+}
+
+pub fn up_to(c: sql.Connection, p: Plan, version: i64) -> []i64 ! Error {
+    up_to_on(sql.handle(c), p, version)?
+}
+
+pub fn down(c: sql.Connection, p: Plan, steps: i64) -> []i64 ! Error {
+    down_on(sql.handle(c), p, steps)?
+}

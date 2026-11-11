@@ -1,0 +1,228 @@
+import std/file
+import std/http
+import std/http/files
+import std/slices
+import std/text
+
+pub struct StaticOptions {
+    pub index: str = "index.html"
+    pub listing: bool = false
+    pub dotfiles: bool = false
+    pub cache_control: str = ""
+    pub precompressed: bool = false
+}
+
+enum Located {
+    Parts(parts: []str)
+    Invalid
+    Hidden
+}
+
+fn unsafe_segment(s: str) -> bool {
+    s == ".." || text.index_byte(s, '/') >= 0 || text.index_byte(s, '\\') >= 0 || text.index_byte(s, 0) >= 0
+}
+
+fn locate(segments: []str, o: StaticOptions) -> Located {
+    var parts: []str = []
+    for raw in segments {
+        let s = http.unescape(raw) catch {
+            _ => return Invalid
+        }
+        if unsafe_segment(s) {
+            return Invalid
+        }
+        if s == "." {
+            continue
+        }
+        if s.len > 0 && s[0] == '.' && !o.dotfiles {
+            return Hidden
+        }
+        push(mut parts, s)
+    }
+    Parts(parts)
+}
+
+fn root_prefix(root: str) -> str {
+    if text.ends_with(root, "/") { root } else { "{root}/" }
+}
+
+fn inside(root: str, resolved: str) -> bool {
+    resolved == root || text.starts_with(resolved, root_prefix(root))
+}
+
+fn resolve_inside(root: str, candidate: str) -> str? {
+    let resolved = file.realpath(candidate) catch {
+        _ => return none
+    }
+    if !inside(root, resolved) {
+        return none
+    }
+    resolved
+}
+
+fn regular_file(path: str) -> bool {
+    let info = file.stat(path) catch {
+        _ => return false
+    }
+    info.regular
+}
+
+fn links_inside(root: str, path: str) -> bool {
+    match resolve_inside(root, path) {
+        some(_) => true
+        none => false
+    }
+}
+
+fn is_directory(path: str) -> bool {
+    let info = file.stat(path) catch {
+        _ => return false
+    }
+    info.dir
+}
+
+fn html_escape(s: str) -> str {
+    var out: []u8 = []
+    for i in 0..s.len {
+        let c = s[i]
+        match c {
+            '&' => text.append(mut out, "&amp;")
+            '<' => text.append(mut out, "&lt;")
+            '>' => text.append(mut out, "&gt;")
+            '"' => text.append(mut out, "&quot;")
+            '\'' => text.append(mut out, "&#39;")
+            _ => push(mut out, c)
+        }
+    }
+    str(out)
+}
+
+fn listing_page(shown: str, directory: str, root: str, o: StaticOptions) -> http.Response {
+    let entries = file.read_dir_info(directory) catch {
+        _ => return problem_response(Internal("cannot read directory"))
+    }
+    var names: []str = []
+    for e in entries {
+        if e.name.len > 0 && e.name[0] == '.' && !o.dotfiles {
+            continue
+        }
+        if e.link && !links_inside(root, "{directory}/{e.name}") {
+            continue
+        }
+        push(mut names, if e.dir || e.link && is_directory("{directory}/{e.name}") { "{e.name}/" } else { e.name })
+    }
+    slices.sort(mut names)
+    var page: []u8 = []
+    text.append(mut page, "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Index of {html_escape(shown)}</title></head>\n")
+    text.append(mut page, "<body><h1>Index of {html_escape(shown)}</h1>\n<ul>\n")
+    for name in names {
+        let bare = text.trim_suffix(name, "/")
+        let target = if bare.len < name.len { "{http.escape(bare)}/" } else { http.escape(bare) }
+        text.append(mut page, "<li><a href=\"{target}\">{html_escape(name)}</a></li>\n")
+    }
+    text.append(mut page, "</ul></body></html>\n")
+    var resp = http.response(200, str(page))
+    http.set_header(mut resp.headers, "content-type", "text/html; charset=utf-8")
+    if o.cache_control.len > 0 {
+        http.set_header(mut resp.headers, "cache-control", o.cache_control)
+    }
+    resp
+}
+
+fn precompressed_variant(c: *Context, resolved: str, root: str, o: StaticOptions) -> http.Response? {
+    let accepted = header(c, "accept-encoding") ?? ""
+    for coding in ["br", "gzip"] {
+        if !accepts(accepted, coding) {
+            continue
+        }
+        let suffix = if coding == "br" { ".br" } else { ".gz" }
+        let sibling = match resolve_inside(root, "{resolved}{suffix}") {
+            some(p) => p
+            none => continue
+        }
+        if !regular_file(sibling) {
+            continue
+        }
+        let options = files.FileOptions { name: resolved, encoding: coding, cache_control: o.cache_control }
+        return files.serve_file_with(c.request, sibling, options)
+    }
+    none
+}
+
+fn serve_regular(c: *Context, resolved: str, root: str, o: StaticOptions) -> http.Response {
+    if o.precompressed {
+        match precompressed_variant(c, resolved, root, o) {
+            some(resp) => return resp
+            none => {}
+        }
+    }
+    var resp = files.serve_file_with(c.request, resolved, files.FileOptions { cache_control: o.cache_control })
+    if o.precompressed {
+        http.set_header(mut resp.headers, "vary", "Accept-Encoding")
+    }
+    resp
+}
+
+fn serve_directory(c: *Context, resolved: str, root: str, segments: []str, parts: []str, o: StaticOptions) -> http.Response {
+    if !text.ends_with(c.request.path, "/") {
+        let base = "/{text.join(segments, "/")}/"
+        let target = if c.request.query.len > 0 { "{base}?{c.request.query}" } else { base }
+        return redirect(target, 301)
+    }
+    if o.index.len > 0 {
+        match resolve_inside(root, "{resolved}/{o.index}") {
+            some(index) => {
+                if regular_file(index) {
+                    return serve_regular(c, index, root, o)
+                }
+            }
+            none => {}
+        }
+    }
+    if o.listing {
+        let shown = if parts.len == 0 { "/" } else { "/{text.join(parts, "/")}/" }
+        return listing_page(shown, resolved, root, o)
+    }
+    problem_response(NotFound)
+}
+
+fn serve_static(c: *Context, depth: i64, dir: str, o: StaticOptions) -> http.Response {
+    let segments = split_path(c.request.path)
+    let parts = match locate(segments[depth..], o) {
+        Parts(p) => p
+        Invalid => return problem_response(BadRequest("invalid path"))
+        Hidden => return problem_response(NotFound)
+    }
+    let root = file.realpath(dir) catch {
+        _ => return problem_response(NotFound)
+    }
+    let candidate = if parts.len == 0 { root } else { "{root_prefix(root)}{text.join(parts, "/")}" }
+    let resolved = match resolve_inside(root, candidate) {
+        some(p) => p
+        none => return problem_response(NotFound)
+    }
+    let info = file.stat(resolved) catch {
+        _ => return problem_response(NotFound)
+    }
+    if info.dir {
+        return serve_directory(c, resolved, root, segments, parts, o)
+    }
+    if !info.regular || text.ends_with(c.request.path, "/") {
+        return problem_response(NotFound)
+    }
+    serve_regular(c, resolved, root, o)
+}
+
+pub fn static_options() -> StaticOptions {
+    StaticOptions {}
+}
+
+pub fn static_with(a: *App, prefix: str, dir: str, o: StaticOptions) {
+    let depth = split_path("{a.prefix}{prefix}").len
+    let handler = fn(c: *Context) -> http.Response { serve_static(c, depth, dir, o) }
+    route(a, "GET", "{prefix}/*", handler)
+}
+
+pub fn static(a: *App, prefix: str, dir: str) {
+    static_with(a, prefix, dir, static_options())
+}

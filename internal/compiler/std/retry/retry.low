@@ -1,0 +1,306 @@
+import std/cancel
+import std/rand
+import std/time/clock
+import std/time/duration
+
+pub enum Jitter {
+    None
+    Full
+    Equal
+    Decorrelated
+}
+
+pub enum Stop {
+    Running
+    Exhausted
+    Deadline
+    Cancelled
+}
+
+pub struct Policy {
+    pub attempts: i64 = 5
+    pub base: duration.Duration = duration.milliseconds(100)
+    pub multiplier: f64 = 2.0
+    pub max_delay: duration.Duration = duration.seconds(30)
+    pub jitter: Jitter = Full
+    pub deadline: duration.Duration? = none
+    pub rng: rand.Rng? = none
+    pub token: *cancel.Token? = none
+    pub clock: clock.Clock = clock.system()
+    pub sleeper: fn(duration.Duration)? = none
+    pub observer: fn(i64, duration.Duration)? = none
+}
+
+pub fn policy() -> Policy {
+    Policy {}
+}
+
+pub fn with_attempts(p: Policy, attempts: i64) -> Policy {
+    var q = p
+    q.attempts = if attempts < 1 { 1 } else { attempts }
+    q
+}
+
+pub fn with_base(p: Policy, base: duration.Duration) -> Policy {
+    var q = p
+    q.base = duration.max(base, duration.zero())
+    q
+}
+
+pub fn with_multiplier(p: Policy, multiplier: f64) -> Policy {
+    var q = p
+    q.multiplier = if multiplier < 1.0 { 1.0 } else { multiplier }
+    q
+}
+
+pub fn with_max_delay(p: Policy, max_delay: duration.Duration) -> Policy {
+    var q = p
+    q.max_delay = duration.max(max_delay, duration.zero())
+    q
+}
+
+pub fn with_jitter(p: Policy, jitter: Jitter) -> Policy {
+    var q = p
+    q.jitter = jitter
+    q
+}
+
+pub fn with_deadline(p: Policy, total: duration.Duration) -> Policy {
+    var q = p
+    q.deadline = some(total)
+    q
+}
+
+pub fn with_rng(p: Policy, r: rand.Rng) -> Policy {
+    var q = p
+    q.rng = some(r)
+    q
+}
+
+pub fn with_cancel(p: Policy, t: *cancel.Token) -> Policy {
+    var q = p
+    q.token = some(t)
+    q
+}
+
+pub fn with_clock(p: Policy, c: clock.Clock) -> Policy {
+    var q = p
+    q.clock = c
+    q
+}
+
+pub fn with_sleeper(p: Policy, f: fn(duration.Duration)) -> Policy {
+    var q = p
+    q.sleeper = some(f)
+    q
+}
+
+pub fn on_retry(p: Policy, f: fn(i64, duration.Duration)) -> Policy {
+    var q = p
+    q.observer = some(f)
+    q
+}
+
+fn max_i64() -> i64 {
+    9223372036854775807
+}
+
+fn nanos_of(d: duration.Duration) -> i64 {
+    duration.as_nanos(d) ?? if duration.is_negative(d) { 0 } else { max_i64() }
+}
+
+fn millis_up(nanos: i64) -> i64 {
+    if nanos <= 0 {
+        return 0
+    }
+    let whole = nanos / 1000000
+    if nanos % 1000000 != 0 { whole + 1 } else { whole }
+}
+
+fn grown(current: i64, multiplier: f64, cap: i64) -> i64 {
+    let next = f64(current) * multiplier
+    if next >= f64(cap) {
+        return cap
+    }
+    i64(next)
+}
+
+pub fn delay(p: Policy, attempt: i64) -> duration.Duration {
+    let cap = nanos_of(p.max_delay)
+    var nanos = nanos_of(p.base)
+    if nanos > cap {
+        nanos = cap
+    }
+    var step = 1
+    for step < attempt && nanos < cap {
+        nanos = grown(nanos, p.multiplier, cap)
+        step += 1
+    }
+    duration.nanoseconds(nanos)
+}
+
+fn decorrelated(p: Policy, previous: i64, mut r: rand.Rng) -> i64 {
+    let cap = nanos_of(p.max_delay)
+    let floor = nanos_of(p.base)
+    let top = if previous > cap / 3 { cap } else { previous * 3 }
+    if top <= floor {
+        return if floor < cap { floor } else { cap }
+    }
+    rand.between(mut r, floor, top)
+}
+
+pub fn jittered(p: Policy, attempt: i64, previous: duration.Duration, mut r: rand.Rng) -> duration.Duration {
+    let ceiling = nanos_of(delay(p, attempt))
+    match p.jitter {
+        None => duration.nanoseconds(ceiling)
+        Full => duration.nanoseconds(rand.between(mut r, 0, ceiling))
+        Equal => {
+            let half = ceiling / 2
+            duration.nanoseconds(half + rand.between(mut r, 0, ceiling - half))
+        }
+        Decorrelated => duration.nanoseconds(decorrelated(p, nanos_of(previous), mut r))
+    }
+}
+
+pub struct Retrier {
+    pub attempt: i64
+    pub stop: Stop
+    pub last_delay: duration.Duration
+    policy: Policy
+    started: duration.Duration
+    rng: rand.Rng
+    minimum: duration.Duration
+}
+
+pub fn start(p: Policy) -> *Retrier {
+    let source = p.rng ?? rand.rng()
+    new(Retrier {
+        attempt: 0,
+        stop: Running,
+        last_delay: p.base,
+        policy: p,
+        started: p.clock.monotonic(),
+        rng: source,
+        minimum: duration.zero()
+    })
+}
+
+pub fn at_least(r: *Retrier, d: duration.Duration) {
+    r.minimum = duration.max(r.minimum, d)
+}
+
+pub fn elapsed(r: *Retrier) -> duration.Duration {
+    clock.elapsed_since(r.policy.clock, r.started)
+}
+
+fn is_cancelled(r: *Retrier) -> bool {
+    match r.policy.token {
+        some(t) => cancel.cancelled(t)
+        none => false
+    }
+}
+
+fn announce(r: *Retrier, wait: duration.Duration) {
+    match r.policy.observer {
+        some(f) => f(r.attempt, wait)
+        none => {}
+    }
+}
+
+fn over_budget(r: *Retrier, wait: duration.Duration) -> bool {
+    match r.policy.deadline {
+        some(total) => duration.after(duration.plus(elapsed(r), wait), total)
+        none => false
+    }
+}
+
+fn pause(r: *Retrier, wait: duration.Duration) {
+    if duration.is_zero(wait) {
+        return
+    }
+    match r.policy.sleeper {
+        some(f) => f(wait)
+        none => {
+            let millis = millis_up(nanos_of(wait))
+            match r.policy.token {
+                some(t) => {
+                    let finished = cancel.pause(t, millis)
+                }
+                none => sleep(millis)
+            }
+        }
+    }
+}
+
+fn next_delay(r: *Retrier) -> duration.Duration {
+    let drawn = jittered(r.policy, r.attempt, r.last_delay, mut r.rng)
+    duration.max(drawn, r.minimum)
+}
+
+pub fn next(r: *Retrier) -> bool {
+    if r.stop != Running {
+        return false
+    }
+    if is_cancelled(r) {
+        r.stop = Cancelled
+        return false
+    }
+    if r.attempt == 0 {
+        r.attempt = 1
+        return true
+    }
+    if r.attempt >= r.policy.attempts {
+        r.stop = Exhausted
+        return false
+    }
+    let wait = next_delay(r)
+    if over_budget(r, wait) {
+        r.stop = Deadline
+        return false
+    }
+    announce(r, wait)
+    pause(r, wait)
+    r.last_delay = wait
+    r.minimum = duration.zero()
+    if is_cancelled(r) {
+        r.stop = Cancelled
+        return false
+    }
+    r.attempt += 1
+    true
+}
+
+pub enum Step[T, E] {
+    Done(T)
+    Retry(E)
+    RetryAfter(error: E, wait: duration.Duration)
+    Fatal(E)
+}
+
+pub enum Outcome[T, E] {
+    Value(T)
+    Failed(E)
+    GaveUp(error: E, reason: Stop)
+    Stopped(Stop)
+}
+
+pub fn run[T, E](p: Policy, op: fn(i64) -> Step[T, E]) -> Outcome[T, E] {
+    let r = start(p)
+    var last: E? = none
+    for next(r) {
+        let step = op(r.attempt)
+        match step {
+            Done(v) => return Value(v)
+            Fatal(e) => return Failed(e)
+            Retry(e) => { last = some(e) }
+            RetryAfter(e, wait) => {
+                last = some(e)
+                at_least(r, wait)
+            }
+        }
+    }
+    match last {
+        some(e) => GaveUp(e, r.stop)
+        none => Stopped(r.stop)
+    }
+}

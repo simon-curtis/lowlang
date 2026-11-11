@@ -1,0 +1,518 @@
+import std/file
+import std/io
+import std/text
+
+pub enum Kind {
+    Created
+    Modified
+    Deleted
+    MovedFrom
+    MovedTo
+    Attrib
+    Closed
+    ClosedUnmodified
+    Opened
+    Accessed
+    SelfDeleted
+    SelfMoved
+    Overflow
+}
+
+pub struct Event {
+    pub watched: str
+    pub name: str
+    pub path: str
+    pub kind: Kind
+    pub dir: bool
+    pub cookie: i64
+}
+
+pub struct Options {
+    pub recursive: bool = false
+    pub access: bool = false
+}
+
+struct Target {
+    path: str
+    root: bool
+}
+
+struct State {
+    lock: i64
+    targets: [i64: Target]
+    queue: []Event
+    head: i64
+    closed: bool
+    done: chan[bool]
+    recursive: bool
+    mask: i64
+}
+
+pub struct WatcherHandle {
+    pub fd: i64
+    state: *State
+    guard: *io.Guard
+}
+
+pub struct Watcher {
+    pub handle: WatcherHandle
+    detached: bool = false
+    drop {
+        if !detached {
+            stop_on(handle)
+        }
+    }
+}
+
+fn in_access() -> i64 {
+    0x1
+}
+
+fn in_modify() -> i64 {
+    0x2
+}
+
+fn in_attrib() -> i64 {
+    0x4
+}
+
+fn in_close_write() -> i64 {
+    0x8
+}
+
+fn in_close_nowrite() -> i64 {
+    0x10
+}
+
+fn in_open() -> i64 {
+    0x20
+}
+
+fn in_moved_from() -> i64 {
+    0x40
+}
+
+fn in_moved_to() -> i64 {
+    0x80
+}
+
+fn in_create() -> i64 {
+    0x100
+}
+
+fn in_delete() -> i64 {
+    0x200
+}
+
+fn in_delete_self() -> i64 {
+    0x400
+}
+
+fn in_move_self() -> i64 {
+    0x800
+}
+
+fn in_overflow() -> i64 {
+    0x4000
+}
+
+fn in_ignored() -> i64 {
+    0x8000
+}
+
+fn in_isdir() -> i64 {
+    0x40000000
+}
+
+fn change_mask() -> i64 {
+    in_modify() | in_attrib() | in_close_write() | in_moved_from() | in_moved_to() | in_create() | in_delete() | in_delete_self() | in_move_self()
+}
+
+fn access_mask() -> i64 {
+    in_access() | in_close_nowrite() | in_open()
+}
+
+fn watch_mask(options: Options) -> i64 {
+    if options.access {
+        return change_mask() | access_mask()
+    }
+    change_mask()
+}
+
+fn read_size() -> i64 {
+    4096
+}
+
+fn header_size() -> i64 {
+    16
+}
+
+fn has(mask: i64, bit: i64) -> bool {
+    mask & bit != 0
+}
+
+fn child_path(dir: str, name: str) -> str {
+    if name.len == 0 {
+        return dir
+    }
+    if dir[dir.len - 1] == '/' {
+        return "{dir}{name}"
+    }
+    "{dir}/{name}"
+}
+
+fn lock(s: *State) {
+    __lock(mut s.lock)
+}
+
+fn unlock(s: *State) {
+    __unlock(mut s.lock)
+}
+
+fn poke(fd: i64) {
+    let r = __syscall(254, fd, cstr("/"), in_attrib())
+    if r >= 0 {
+        __syscall(255, fd, r)
+    }
+}
+
+fn watcher_guard(fd: i64, s: *State) -> *io.Guard {
+    io.guard(fn() {
+        lock(s)
+        s.closed = true
+        unlock(s)
+        close(s.done)
+        poke(fd)
+    }, fn() { __syscall(3, fd) })
+}
+
+pub fn create(options: Options) -> Watcher ! io.Error {
+    let fd = io.syscall_result(__syscall(294, 0x80800))?
+    let s = new(State {
+        lock: 0
+        targets: [:]
+        queue: []
+        head: 0
+        closed: false
+        done: chan[bool](1)
+        recursive: options.recursive
+        mask: watch_mask(options)
+    })
+    let view = WatcherHandle { fd, state: s, guard: watcher_guard(fd, s) }
+    Watcher { handle: view }
+}
+
+pub fn watch(paths: []str) -> Watcher ! io.Error {
+    watch_with(paths, Options {})?
+}
+
+pub fn watch_with(paths: []str, options: Options) -> Watcher ! io.Error {
+    using var w = create(options)?
+    for path in paths {
+        add(w, path)?
+    }
+    adopt(detach(mut w))
+}
+
+pub fn adopt(h: WatcherHandle) -> Watcher {
+    Watcher { handle: h }
+}
+
+pub fn detach(mut w: Watcher) -> WatcherHandle {
+    w.detached = true
+    w.handle
+}
+
+pub fn stop(w: Watcher) {
+    stop_on(w.handle)
+}
+
+pub fn stop_on(h: WatcherHandle) {
+    io.retire(h.guard)
+}
+
+pub fn add(w: Watcher, path: str) ! io.Error {
+    add_on(w.handle, path)?
+}
+
+pub fn add_on(h: WatcherHandle, path: str) ! io.Error {
+    using lease = io.enter(h.guard)?
+    track(h, path, true)?
+}
+
+pub fn remove(w: Watcher, path: str) ! io.Error {
+    remove_on(w.handle, path)?
+}
+
+pub fn remove_on(h: WatcherHandle, path: str) ! io.Error {
+    using lease = io.enter(h.guard)?
+    let wds = matching(h.state, path, true)
+    if wds.len == 0 {
+        fail NotFound
+    }
+    forget(h, wds)
+}
+
+fn matching(s: *State, path: str, exact: bool) -> []i64 {
+    let prefix = "{path}/"
+    var wds: []i64 = []
+    lock(s)
+    for wd, t in s.targets {
+        if (exact && t.path == path) || text.starts_with(t.path, prefix) {
+            push(mut wds, wd)
+        }
+    }
+    unlock(s)
+    wds
+}
+
+fn forget(h: WatcherHandle, wds: []i64) {
+    lock(h.state)
+    for wd in wds {
+        delete(mut h.state.targets, wd)
+    }
+    unlock(h.state)
+    for wd in wds {
+        __syscall(255, h.fd, wd)
+    }
+}
+
+fn track(h: WatcherHandle, path: str, root: bool) ! io.Error {
+    let r = __syscall(254, h.fd, cstr(path), h.state.mask)
+    let wd = io.syscall_result(r)?
+    lock(h.state)
+    h.state.targets[wd] = Target { path, root }
+    unlock(h.state)
+    if h.state.recursive && file.is_dir(path) {
+        track_children(h, path)?
+    }
+}
+
+fn track_children(h: WatcherHandle, path: str) ! io.Error {
+    for entry in file.read_dir_info(path)? {
+        if entry.dir && !entry.link {
+            track(h, child_path(path, entry.name), false) catch {
+                e => match e {
+                    NotFound => {}
+                    _ => fail e
+                }
+            }
+        }
+    }
+}
+
+fn kind_of(mask: i64) -> Kind? {
+    if has(mask, in_create()) {
+        return Created
+    }
+    if has(mask, in_modify()) {
+        return Modified
+    }
+    if has(mask, in_delete()) {
+        return Deleted
+    }
+    if has(mask, in_moved_from()) {
+        return MovedFrom
+    }
+    if has(mask, in_moved_to()) {
+        return MovedTo
+    }
+    if has(mask, in_attrib()) {
+        return Attrib
+    }
+    if has(mask, in_close_write()) {
+        return Closed
+    }
+    if has(mask, in_close_nowrite()) {
+        return ClosedUnmodified
+    }
+    if has(mask, in_open()) {
+        return Opened
+    }
+    if has(mask, in_access()) {
+        return Accessed
+    }
+    if has(mask, in_delete_self()) {
+        return SelfDeleted
+    }
+    if has(mask, in_move_self()) {
+        return SelfMoved
+    }
+    none
+}
+
+fn is_self(kind: Kind) -> bool {
+    kind == SelfDeleted || kind == SelfMoved
+}
+
+fn overflow_event() -> Event {
+    Event { watched: "", name: "", path: "", kind: Overflow, dir: false, cookie: 0 }
+}
+
+fn event_of(t: Target, mask: i64, cookie: i64, name: str) -> Event? {
+    let kind = kind_of(mask) ?? return none
+    if is_self(kind) && !t.root {
+        return none
+    }
+    some(Event {
+        watched: t.path
+        name
+        path: child_path(t.path, name)
+        kind
+        dir: has(mask, in_isdir())
+        cookie
+    })
+}
+
+fn name_at(buf: []u8, from: i64, length: i64) -> str {
+    var end = from
+    for end < from + length && buf[end] != 0 {
+        end += 1
+    }
+    str(buf[from..end])
+}
+
+fn target_of(s: *State, wd: i64) -> Target? {
+    lock(s)
+    let t = s.targets[wd]
+    unlock(s)
+    t
+}
+
+fn ignore(s: *State, wd: i64) {
+    lock(s)
+    delete(mut s.targets, wd)
+    unlock(s)
+}
+
+fn decode(h: WatcherHandle, buf: []u8, n: i64) -> []Event {
+    var events: []Event = []
+    var at = 0
+    for at + header_size() <= n {
+        let wd = io.le32(buf, at)
+        let mask = io.le32(buf, at + 4)
+        let cookie = io.le32(buf, at + 8)
+        let length = io.le32(buf, at + 12)
+        let name = name_at(buf, at + header_size(), length)
+        at += header_size() + length
+        if has(mask, in_overflow()) {
+            push(mut events, overflow_event())
+        } else if has(mask, in_ignored()) {
+            ignore(h.state, wd)
+        } else {
+            let t = target_of(h.state, wd) ?? continue
+            let e = event_of(t, mask, cookie, name) ?? continue
+            push(mut events, e)
+        }
+    }
+    events
+}
+
+fn enqueue(s: *State, events: []Event) {
+    lock(s)
+    for e in events {
+        push(mut s.queue, e)
+    }
+    unlock(s)
+}
+
+fn dequeue(s: *State) -> Event? {
+    lock(s)
+    var out: Event? = none
+    if s.head < s.queue.len {
+        out = some(s.queue[s.head])
+        s.head += 1
+        if s.head == s.queue.len {
+            s.queue = []
+            s.head = 0
+        }
+    }
+    unlock(s)
+    out
+}
+
+fn is_closed(s: *State) -> bool {
+    lock(s)
+    let closed = s.closed
+    unlock(s)
+    closed
+}
+
+fn follow(h: WatcherHandle, events: []Event) ! io.Error {
+    if !h.state.recursive {
+        return
+    }
+    for e in events {
+        if !e.dir {
+            continue
+        }
+        if e.kind == Created || e.kind == MovedTo {
+            track(h, e.path, false) catch {
+                err => match err {
+                    NotFound => {}
+                    _ => fail err
+                }
+            }
+        } else if e.kind == MovedFrom {
+            forget(h, matching(h.state, e.path, true))
+        }
+    }
+}
+
+fn refill(h: WatcherHandle) ! io.Error {
+    let buf = io.buffer(read_size())
+    for {
+        let r = __syscall(0, h.fd, __slice_ptr(buf), buf.len)
+        if r == -11 {
+            wait_readable(h.fd)
+            if is_closed(h.state) {
+                fail NotConnected
+            }
+        } else if r != -4 {
+            let n = io.syscall_result(r)?
+            let events = decode(h, buf, n)
+            enqueue(h.state, events)
+            follow(h, events)?
+            return
+        }
+    }
+}
+
+pub fn next(w: Watcher) -> Event ! io.Error {
+    next_on(w.handle)?
+}
+
+pub fn next_on(h: WatcherHandle) -> Event ! io.Error {
+    using lease = io.enter(h.guard)?
+    for {
+        let ready = dequeue(h.state)
+        match ready {
+            some(e) => return e
+            none => refill(h)?
+        }
+    }
+}
+
+pub fn events(w: Watcher) -> chan[Event] {
+    events_on(w.handle)
+}
+
+pub fn events_on(h: WatcherHandle) -> chan[Event] {
+    let out = chan[Event](64)
+    spawn pump(h, out)
+    out
+}
+
+fn pump(h: WatcherHandle, out: chan[Event]) {
+    for {
+        let e = next_on(h) catch { _ => break }
+        let sent = select {
+            out <- e => true
+            <-h.state.done => false
+        }
+        if !sent {
+            break
+        }
+    }
+    close(out)
+}

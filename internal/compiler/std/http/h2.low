@@ -21,6 +21,7 @@ struct Exchange {
     out: []u8
     tail: []Header
     queued: bool
+    open: bool
     status: i64
     token: *cancel.Token?
 }
@@ -88,6 +89,7 @@ fn new_exchange(p: *Peer, id: i64) -> *Exchange {
         out: []
         tail: []
         queued: false
+        open: false
         status: 0
         token: none
     })
@@ -526,7 +528,7 @@ fn header_frames(p: *Peer, mut out: []u8, id: i64, fields: []Header, ends: bool)
 
 fn queue(p: *Peer, e: *Exchange, fields: []Header, body: []u8, trailers: []Header) ! io.Error {
     var out: []u8 = []
-    header_frames(p, mut out, e.id, fields, body.len == 0 && trailers.len == 0)
+    header_frames(p, mut out, e.id, fields, body.len == 0 && trailers.len == 0 && !e.open)
     if body.len == 0 && trailers.len > 0 {
         header_frames(p, mut out, e.id, trailers, true)
     }
@@ -534,7 +536,7 @@ fn queue(p: *Peer, e: *Exchange, fields: []Header, body: []u8, trailers: []Heade
     e.out = body
     e.tail = trailers
     e.queued = true
-    if body.len == 0 {
+    if body.len == 0 && !e.open {
         sent(p, e)
     }
 }
@@ -551,7 +553,7 @@ fn flush(p: *Peer) ! io.Error {
     for _, e in p.exchanges {
         for e.queued && e.out.len > 0 && p.window > 0 && e.window > 0 {
             let n = least(least(e.out.len, p.frame_size), least(p.window, e.window))
-            let last = n == e.out.len
+            let last = n == e.out.len && !e.open
             put_frame(mut out, 0, if last && e.tail.len == 0 { 1 } else { 0 }, e.id, e.out[..n])
             e.out = e.out[n..]
             p.window -= n
@@ -580,10 +582,18 @@ fn go_away(p: *Peer) {
     }
 }
 
+enum ReplyPart {
+    Whole
+    Chunk
+    End
+}
+
 struct Reply {
     id: i64
     method: str
     response: Response
+    phase: ReplyPart = Whole
+    chunk: []u8 = []
 }
 
 fn pump(p: *Peer, frames: chan[Frame]) {
@@ -604,18 +614,83 @@ fn pump(p: *Peer, frames: chan[Frame]) {
 }
 
 fn respond(handler: fn(Request) -> Response, req: Request, id: i64, replies: chan[Reply]) {
-    let response = traced(handler, req)
-    cancel.cancel(req.token)
-    replies <- Reply { id, method: req.method, response }
+    let produced = traced(handler, req)
+    let response = unstreamed(req.method, produced, req.token)
+    match response.stream {
+        some(chunks) => relay(response, chunks, req, id, replies)
+        none => {
+            cancel.cancel(req.token)
+            replies <- Reply { id, method: req.method, response }
+        }
+    }
 }
 
-fn deliver(p: *Peer, reply: Reply) ! io.Error {
+fn relay(response: Response, chunks: chan[[]u8], req: Request, id: i64, replies: chan[Reply]) {
+    replies <- Reply { id, method: req.method, response }
+    let gone = cancel.done(req.token)
+    for {
+        select {
+            part = <-chunks => match part {
+                some(data) => {
+                    select {
+                        replies <- Reply { id, method: req.method, response, phase: Chunk, chunk: data } => {}
+                        <-gone => break
+                    }
+                }
+                none => break
+            }
+            <-gone => break
+        }
+    }
+    cancel.cancel(req.token)
+    replies <- Reply { id, method: req.method, response, phase: End }
+}
+
+fn take_chunk(p: *Peer, reply: Reply) {
+    match p.exchanges[reply.id] {
+        some(e) => io.append(mut e.out, reply.chunk)
+        none => {}
+    }
+}
+
+fn end_stream(p: *Peer, reply: Reply) ! io.Error {
     p.outstanding -= 1
     let e = match p.exchanges[reply.id] {
         some(e) => e
         none => return
     }
+    e.open = false
+    if e.out.len > 0 {
+        return
+    }
+    var out: []u8 = []
+    put_frame(mut out, 0, 1, e.id, [])
+    io.write_all(p.stream, out)?
+    e.queued = false
+    sent(p, e)
+}
+
+fn deliver(p: *Peer, reply: Reply) ! io.Error {
+    match reply.phase {
+        Chunk => {
+            take_chunk(p, reply)
+            return
+        }
+        End => {
+            end_stream(p, reply)?
+            return
+        }
+        Whole => {}
+    }
     let resp = reply.response
+    if !streaming(resp) {
+        p.outstanding -= 1
+    }
+    let e = match p.exchanges[reply.id] {
+        some(e) => e
+        none => return
+    }
+    e.open = streaming(resp)
     var fields: []Header = [Header { name: ":status", value: "{resp.status}" }]
     for h in resp.headers {
         if !connection_specific(text.lower(h.name)) {
@@ -626,7 +701,7 @@ fn deliver(p: *Peer, reply: Reply) ! io.Error {
     if bodiless(reply.method, resp.status) {
         body = []
     }
-    if !has_header(resp.headers, "content-length") {
+    if !has_header(resp.headers, "content-length") && !e.open {
         push(mut fields, Header { name: "content-length", value: "{body.len}" })
     }
     var trailers: []Header = []

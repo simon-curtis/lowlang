@@ -1,0 +1,334 @@
+import std/cancel
+import std/rand
+import std/retry
+import std/time/clock
+import std/time/duration
+import std/time/timestamp
+
+enum Failure {
+    Busy
+    Broken
+}
+
+fn ns(d: duration.Duration) -> i64 {
+    duration.as_nanos(d) ?? -1
+}
+
+fn jitter_name(j: retry.Jitter) -> str {
+    match j {
+        None => "none"
+        Full => "full"
+        Equal => "equal"
+        Decorrelated => "decorrelated"
+    }
+}
+
+fn stop_name(s: retry.Stop) -> str {
+    match s {
+        Running => "running"
+        Exhausted => "exhausted"
+        Deadline => "deadline"
+        Cancelled => "cancelled"
+    }
+}
+
+fn base_table() {
+    let p = retry.policy().with_jitter(None).with_attempts(10)
+    var row = ""
+    for a in 0..9 {
+        row = "{row} {ns(retry.delay(p, a))}"
+    }
+    print("default:{row}")
+    let slow = p.with_multiplier(1.5).with_base(duration.milliseconds(10)).with_max_delay(duration.milliseconds(100))
+    row = ""
+    for a in 1..9 {
+        row = "{row} {ns(retry.delay(slow, a))}"
+    }
+    print("1.5x cap 100ms:{row}")
+    let flat = p.with_multiplier(1.0)
+    print("flat {ns(retry.delay(flat, 1))} {ns(retry.delay(flat, 50))}")
+    let huge = p.with_base(duration.seconds(1)).with_multiplier(10.0).with_max_delay(duration.hours(1000000))
+    print("huge {ns(retry.delay(huge, 1))} {ns(retry.delay(huge, 5))} {ns(retry.delay(huge, 12))} {ns(retry.delay(huge, 40))}")
+    let clamped = p.with_base(duration.seconds(5)).with_max_delay(duration.seconds(2))
+    print("base over cap {ns(retry.delay(clamped, 1))} {ns(retry.delay(clamped, 3))}")
+    let zero = p.with_base(duration.zero())
+    print("zero base {ns(retry.delay(zero, 1))} {ns(retry.delay(zero, 7))}")
+    print("builders {p.with_attempts(0).attempts} {p.with_multiplier(0.2).multiplier} {ns(p.with_base(duration.milliseconds(-5)).base)}")
+}
+
+fn seeded_table(mode: retry.Jitter) {
+    let p = retry.policy().with_base(duration.milliseconds(100)).with_max_delay(duration.seconds(3)).with_jitter(mode)
+    var r = rand.seeded(7)
+    var previous = p.base
+    var row = ""
+    for a in 1..9 {
+        let d = retry.jittered(p, a, previous, mut r)
+        previous = d
+        row = "{row} {ns(d)}"
+    }
+    print("{jitter_name(mode)}:{row}")
+}
+
+fn bounds() {
+    var r = rand.seeded(99)
+    var broken = 0
+    for mode in [retry.Jitter.Full, retry.Jitter.Equal, retry.Jitter.Decorrelated] {
+        let p = retry.policy().with_base(duration.milliseconds(50)).with_max_delay(duration.seconds(2)).with_jitter(mode)
+        var previous = p.base
+        for round in 0..200 {
+            let a = round % 9 + 1
+            let d = retry.jittered(p, a, previous, mut r)
+            previous = d
+            let top = ns(retry.delay(p, a))
+            let low = match mode {
+                Equal => top / 2
+                Decorrelated => ns(p.base)
+                _ => 0
+            }
+            let high = match mode {
+                Decorrelated => ns(p.max_delay)
+                _ => top
+            }
+            if ns(d) < low || ns(d) > high {
+                broken += 1
+            }
+        }
+    }
+    print("bounds broken {broken}")
+}
+
+fn recording_policy(m: clock.Manual, waits: *Waits, mode: retry.Jitter) -> retry.Policy {
+    retry.policy()
+        .with_jitter(mode)
+        .with_clock(m.clock())
+        .with_sleeper(fn(d: duration.Duration) {
+            push(mut waits.items, ns(d))
+            m.advance(d)
+        })
+}
+
+struct Waits {
+    items: []i64
+}
+
+fn show(items: []i64) -> str {
+    var row = ""
+    for v in items {
+        row = "{row} {v}"
+    }
+    row
+}
+
+fn drive_success() {
+    let m = clock.manual(timestamp.epoch())
+    let waits = new(Waits { items: [] })
+    let calls = new(Waits { items: [] })
+    let p = retry.policy()
+        .with_jitter(None)
+        .with_clock(m.clock())
+        .with_sleeper(fn(d: duration.Duration) {
+            push(mut waits.items, ns(d))
+            m.advance(d)
+        })
+        .on_retry(fn(attempt: i64, wait: duration.Duration) { push(mut calls.items, attempt * 1000000000 + ns(wait) / 1000000) })
+    let r = retry.start(p)
+    var result = -1
+    for retry.next(r) {
+        if r.attempt < 4 {
+            continue
+        }
+        result = r.attempt * 10
+        break
+    }
+    print("success result {result} attempt {r.attempt} stop {stop_name(r.stop)}")
+    print("success waits{show(waits.items)}")
+    print("success observed{show(calls.items)}")
+    print("success elapsed {ns(retry.elapsed(r))}")
+}
+
+fn drive_exhausted() {
+    let m = clock.manual(timestamp.epoch())
+    let waits = new(Waits { items: [] })
+    let p = recording_policy(m, waits, None).with_attempts(4)
+    let r = retry.start(p)
+    var calls = 0
+    for retry.next(r) {
+        calls += 1
+    }
+    print("exhausted calls {calls} stop {stop_name(r.stop)} waits{show(waits.items)}")
+    print("exhausted next {retry.next(r)} {stop_name(r.stop)}")
+}
+
+fn drive_deadline() {
+    let m = clock.manual(timestamp.epoch())
+    let waits = new(Waits { items: [] })
+    let p = recording_policy(m, waits, None).with_attempts(20).with_deadline(duration.milliseconds(1000))
+    let r = retry.start(p)
+    var calls = 0
+    for retry.next(r) {
+        calls += 1
+    }
+    print("deadline calls {calls} stop {stop_name(r.stop)} waits{show(waits.items)} elapsed {ns(retry.elapsed(r))}")
+    for limit in [1499, 1500] {
+        let bounded = recording_policy(m, waits, None).with_attempts(20).with_deadline(duration.milliseconds(limit))
+        let again = retry.start(bounded)
+        var more = 0
+        for retry.next(again) {
+            more += 1
+        }
+        print("deadline {limit}ms calls {more} stop {stop_name(again.stop)}")
+    }
+}
+
+fn drive_minimum() {
+    let m = clock.manual(timestamp.epoch())
+    let waits = new(Waits { items: [] })
+    let p = recording_policy(m, waits, None).with_attempts(5)
+    let r = retry.start(p)
+    var calls = 0
+    for retry.next(r) {
+        calls += 1
+        if calls == 2 {
+            retry.at_least(r, duration.seconds(7))
+        }
+        if calls == 3 {
+            retry.at_least(r, duration.milliseconds(1))
+            retry.at_least(r, duration.milliseconds(2))
+        }
+    }
+    print("minimum waits{show(waits.items)}")
+    let capped = recording_policy(m, waits, None).with_attempts(3).with_deadline(duration.seconds(5))
+    let c = retry.start(capped)
+    for retry.next(c) {
+        retry.at_least(c, duration.seconds(60))
+    }
+    print("minimum deadline {stop_name(c.stop)} {c.attempt}")
+}
+
+fn drive_cancel() {
+    let m = clock.manual(timestamp.epoch())
+    let t = cancel.token()
+    let waits = new(Waits { items: [] })
+    let p = retry.policy()
+        .with_jitter(None)
+        .with_clock(m.clock())
+        .with_cancel(t)
+        .with_sleeper(fn(d: duration.Duration) {
+            push(mut waits.items, ns(d))
+            if waits.items.len == 2 {
+                cancel.cancel(t)
+            }
+        })
+    let r = retry.start(p)
+    var calls = 0
+    for retry.next(r) {
+        calls += 1
+    }
+    print("cancel calls {calls} stop {stop_name(r.stop)} waits{show(waits.items)}")
+
+    let before = cancel.token()
+    cancel.cancel(before)
+    let early = retry.start(retry.policy().with_cancel(before))
+    print("cancel early {retry.next(early)} {stop_name(early.stop)} {early.attempt}")
+}
+
+fn classify(attempt: i64, failures: i64) -> retry.Step[i64, Failure] {
+    if attempt <= failures {
+        return Retry(Busy)
+    }
+    Done(attempt * 100)
+}
+
+fn show_outcome(label: str, out: retry.Outcome[i64, Failure]) {
+    match out {
+        Value(v) => print("{label} value {v}")
+        Failed(e) => print("{label} failed {e == Failure.Broken}")
+        GaveUp(e, reason) => print("{label} gave up {e == Failure.Busy} {stop_name(reason)}")
+        Stopped(reason) => print("{label} stopped {stop_name(reason)}")
+    }
+}
+
+fn run_helper() {
+    let m = clock.manual(timestamp.epoch())
+    let waits = new(Waits { items: [] })
+    let p = recording_policy(m, waits, None).with_attempts(4)
+    show_outcome("run ok", retry.run(p, fn(a: i64) -> retry.Step[i64, Failure] { classify(a, 2) }))
+    print("run ok waits{show(waits.items)}")
+    waits.items = []
+    show_outcome("run exhausted", retry.run(p, fn(a: i64) -> retry.Step[i64, Failure] { classify(a, 9) }))
+    print("run exhausted waits{show(waits.items)}")
+    show_outcome("run fatal", retry.run(p, fn(a: i64) -> retry.Step[i64, Failure] {
+        if a == 2 { return Fatal(Broken) }
+        Retry(Busy)
+    }))
+    waits.items = []
+    show_outcome("run retry after", retry.run(p, fn(a: i64) -> retry.Step[i64, Failure] {
+        if a == 1 { return RetryAfter(Busy, duration.seconds(3)) }
+        Done(a)
+    }))
+    print("run retry after waits{show(waits.items)}")
+    let t = cancel.token()
+    cancel.cancel(t)
+    show_outcome("run cancelled", retry.run(p.with_cancel(t), fn(a: i64) -> retry.Step[i64, Failure] { Done(a) }))
+}
+
+fn seeded_policy() {
+    var firsts = ""
+    for round in 0..3 {
+        let waits = new(Waits { items: [] })
+        let m = clock.manual(timestamp.epoch())
+        let p = recording_policy(m, waits, Full).with_attempts(5).with_rng(rand.seeded(2024))
+        let r = retry.start(p)
+        for retry.next(r) {}
+        firsts = "{firsts}{show(waits.items)} |"
+    }
+    print("seeded policy {firsts}")
+}
+
+fn real_sleep() {
+    let t = cancel.token()
+    let p = retry.policy()
+        .with_jitter(None)
+        .with_base(duration.milliseconds(1))
+        .with_max_delay(duration.milliseconds(2))
+        .with_attempts(4)
+    let r = retry.start(p)
+    var calls = 0
+    for retry.next(r) {
+        calls += 1
+    }
+    print("real sleep calls {calls} {stop_name(r.stop)}")
+
+    let slow = retry.policy()
+        .with_jitter(None)
+        .with_base(duration.seconds(30))
+        .with_attempts(3)
+        .with_cancel(t)
+    let blocked = retry.start(slow)
+    spawn fn() {
+        sleep(20)
+        cancel.cancel(t)
+    }()
+    var tries = 0
+    for retry.next(blocked) {
+        tries += 1
+    }
+    print("real cancel tries {tries} {stop_name(blocked.stop)}")
+}
+
+fn main() {
+    base_table()
+    seeded_table(Full)
+    seeded_table(Equal)
+    seeded_table(Decorrelated)
+    seeded_table(None)
+    bounds()
+    drive_success()
+    drive_exhausted()
+    drive_deadline()
+    drive_minimum()
+    drive_cancel()
+    run_helper()
+    seeded_policy()
+    real_sleep()
+}
