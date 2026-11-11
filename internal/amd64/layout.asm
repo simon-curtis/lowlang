@@ -29,6 +29,8 @@
 	.set M_RNSEQ, 192
 	.set M_LASTWAKE, 200
 	.set M_WAKETICK, 208
+	.set M_SLOWS, 216
+	.set M_REFILLS, 224
 	.set ALLOC_SMALL, 255
 	.set ALLOC_BUFFER, 4096
 	.set RELEASE_MIN, 131072
@@ -51,6 +53,15 @@
 	.set STEAL_DELAY, 2000
 	.set GQ_BATCH, 128
 	.set SPAWN_LOCAL, 16
+
+	.set GC_OFF, 1
+	.set GC_STRESS, 2
+	.set TICK_ENTER, 0
+	.set TICK_STOPPED, 1
+	.set TICK_MARKED, 2
+	.set TICK_SWEPT, 3
+	.set TICK_RESUMED, 4
+	.set STRESS_WORDS, 8192
 
 	.set RUNNING, 1
 	.set IDLE, 2

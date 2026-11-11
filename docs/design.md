@@ -1,6 +1,6 @@
-# LowLang Design
+# Low Design
 
-LowLang compiles to static native binaries with no libc dependency, has a tracing garbage collector and green threads with channels, and adds sum-type enums and typed error returns on top of a Go-sized core.
+Low compiles to static native binaries with no libc dependency, has a tracing garbage collector and green threads with channels, and adds sum-type enums and typed error returns on top of a Go-sized core.
 
 ## Goals
 
@@ -26,6 +26,21 @@ count += 1
 
 ### Functions
 
+<!-- prelude
+import std/text
+enum ParseError {
+    Bad
+}
+fn negate(x: i64) -> i64 {
+    -x
+}
+fn parse_int(s: str) -> i64 ! ParseError {
+    0
+}
+var items = [1, 2, 3]
+let input = "42"
+fn main() ! ParseError {
+-->
 ```low
 fn add(a: i64, b: i64) -> i64 {
     a + b
@@ -67,6 +82,12 @@ let n = input |> parse()?
 
 ### Control flow
 
+<!-- prelude
+var n = 3
+let xs = [1, 2, 3]
+let grid = [[1, 2], [3, 4]]
+let want = 4
+-->
 ```low
 if n > 0 { print(n) } else { print(0) }
 
@@ -186,6 +207,10 @@ for name in ages { print(name) }
 
 ### Strings
 
+<!-- prelude
+let age = 36
+let score = 9.0
+-->
 ```low
 let name = "Ada"
 let line = "{name} is {age}, ratio {score / 2.0}"
@@ -206,6 +231,23 @@ let copy = str(bytes(name))
 
 ### Structs
 
+<!-- prelude
+enum Align {
+    Start
+    Center
+}
+struct Text {
+    value: str
+}
+enum Element {
+    Label(Text)
+    Box(Div)
+    Button(str)
+}
+fn button(label: str) -> Element {
+    Button(label)
+}
+-->
 ```low
 struct Point {
     x: f64
@@ -268,13 +310,22 @@ swap(mut x, mut y)
 ```
 
 - A `mut` parameter refers to the caller's variable; reads and writes go through to it. The call site writes `mut` before the argument.
-- A `mut` argument must be a `var` binding, a `mut` parameter, or a field of either.
+- A `mut` argument must be a `var` binding, a `mut` parameter, a field or element of either, or a place through a dereferenced pointer.
 - One call cannot pass overlapping places as `mut`: `swap(mut p.x, mut p.x)` is rejected, while `swap(mut p.x, mut p.y)` is allowed. Two `mut` parameters therefore never alias.
 - References exist only as parameters. They cannot be stored, returned or bound with `let`, so they never outlive the variable they refer to.
 - A `mut` parameter occupies one word holding the address of the place.
+- A place narrower than a word, an element of a packed slice such as `[]u8` or a narrow `extern struct` field, is copied into a word-sized frame slot before the call and copied back at its own width after it, so the callee's word-sized reads and writes never touch the neighbouring bytes. Code in the callee that reads the same element through another route, such as a pointer to the slice, sees the value from before the call until the callee returns.
 
 ### Pointers
 
+<!-- prelude
+struct Counter {
+    hits: i64
+}
+fn bump(mut c: Counter) {
+    c.hits += 1
+}
+-->
 ```low
 enum List {
     Cons(i64, *List)
@@ -338,6 +389,9 @@ fn classify(n: i64) -> str {
 
 ### Optionals
 
+<!-- prelude
+let xs = [1, 7, 4]
+-->
 ```low
 fn find(xs: []i64, target: i64) -> i64? {
     for i, x in xs {
@@ -410,6 +464,10 @@ fn main() ! ParseError {
 
 ### Embedded data
 
+<!-- prelude shaders/quad.spv
+-->
+<!-- prelude fonts/fallback.ttf
+-->
 ```low
 let shader = embed("shaders/quad.spv")
 let font = embed("fonts/fallback.ttf")
@@ -422,6 +480,12 @@ print(shader.len)
 
 ### C interop
 
+<!-- prelude
+struct Block[T] {
+    data: ptr[T]
+    drop free(data)
+}
+-->
 ```low
 extern "c" {
     fn malloc(n: i64) -> ptr
@@ -445,18 +509,25 @@ let n = strtol(cstr("123abc"), mut end, 10)
 let pixels = view(buf, 64)
 ```
 
-- `extern "name" { ... }` at the top level of a file names a C library and declares its functions, with no bodies. `"c"` is the C library itself. A trailing `...` makes a function variadic. `fn errno_location() -> ptr[i32] = "__errno_location"` gives a function a LowLang name different from its C symbol, for symbols that start with `__` or are LowLang keywords. Declarations are private to their module unless marked `pub`.
+- `extern "name" { ... }` at the top level of a file names a C library and declares its functions, with no bodies. `"c"` is the C library itself. A trailing `...` makes a function variadic. `fn errno_location() -> ptr[i32] = "__errno_location"` gives a function a Low name different from its C symbol, for symbols that start with `__` or are Low keywords. Declarations are private to their module unless marked `pub`.
 - A library is linked when code reachable from `main` calls or takes the address of one of the functions its `extern` block declares, so importing a module that declares C functions costs nothing until one is used. A program that uses no library is a static executable with no libc. A program that uses any is a dynamic executable linked against libc and each used library.
-- C signatures use C types: integers, floats, `bool`, `ptr` and `ptr[T]`, and `extern struct`s by value. A `mut` parameter passes the address of a LowLang place for the duration of the call, as C# passes `ref`; C may read and write through it.
+- C signatures use C types: integers, floats, `bool`, `ptr` and `ptr[T]`, and `extern struct`s by value. A `mut` parameter passes the address of a Low place for the duration of the call, as C# passes `ref`; C may read and write through it.
 - `ptr[T]` is a nullable pointer to C memory and `ptr` is `void*`; `null` takes its type from context, and `ptr` converts to and from any `ptr[T]`. `==` and `!=` compare addresses.
 - `view(p, n)` is a `[]T` over `n` elements at `p`, bounds-checked like any slice; `load(p)` and `store(p, v)` read and write one `T`.
 - `cstr(s)` is a NUL-terminated copy of a string; `str(p)` copies a NUL-terminated `ptr[u8]` back.
 - `extern struct` has C layout: fields in order at their natural alignment, size rounded to the largest alignment. Its fields must have C types. It is used like any struct and its fields are read and written at their own width.
 - Memory may be passed to C for the duration of a call. Memory C keeps after the call must be pinned: `pin(x)` returns the address of a pointer, slice, map or string's data and keeps it alive until `unpin(p)`. Memory C allocates is never touched by the collector.
 - `extern fn(ptr[i64], ptr[i64]) -> i32` is a C function pointer, one word, like C#'s `delegate* unmanaged`. Its parameters and result must have C types. It is a C type, so it can be a parameter, result or `extern struct` field.
-- A top-level LowLang function becomes a C callback where an `extern fn` is expected, if it takes and returns only numbers, `bool`, `ptr` or `extern fn`, with no `mut` parameters. An `extern` function used as a value is its C address. Calling an `extern fn` value makes a C call.
+- A top-level Low function becomes a C callback where an `extern fn` is expected, if it takes and returns only numbers, `bool`, `ptr` or `extern fn`, with no `mut` parameters. An `extern` function used as a value is its C address. Calling an `extern fn` value makes a C call.
 - A closure reaches C through a `ptr` user-data argument: pin a pointer to the state it needs and pass a top-level callback that loads it.
 
+<!-- prelude
+extern "c" {
+    fn malloc(n: i64) -> ptr
+}
+let n = 3
+let data = malloc(n * 8)
+-->
 ```low
 extern "c" {
     fn qsort(base: ptr, n: i64, size: i64, compare: extern fn(ptr[i64], ptr[i64]) -> i32)
@@ -471,6 +542,20 @@ qsort(data, n, 8, ascending)
 
 ### Defer
 
+<!-- prelude
+enum IoError {
+    Closed
+}
+fn open(path: str) -> i32 ! IoError {
+    3
+}
+fn close(fd: i32) {
+}
+fn log(line: str) {
+}
+let path = "config.low"
+fn main() ! IoError {
+-->
 ```low
 let fd = open(path)?
 defer close(fd)
@@ -485,6 +570,26 @@ defer {
 
 ### Using
 
+<!-- prelude
+enum IoError {
+    Closed
+}
+extern "c" {
+    fn free(p: ptr)
+}
+fn close(fd: i32) {
+}
+fn flush(sock: i32) {
+}
+fn open_file(path: str) -> File {
+    File { fd: 3 }
+}
+fn connect(addr: str) -> Conn ! IoError {
+    Conn { sock: 4, buf: Block[u8] { data: null } }
+}
+let addr = "localhost:8080"
+fn main() ! IoError {
+-->
 ```low
 struct File {
     fd: i32
@@ -528,6 +633,25 @@ current = open_file("b")
 
 ### Modules
 
+<!-- prelude geometry/geometry.low
+pub struct Circle {
+    pub radius: f64
+}
+pub enum Shape {
+    Square(i64)
+}
+pub fn circle(radius: f64) -> Circle {
+    Circle { radius }
+}
+pub fn area(c: Circle) -> f64 {
+    3.14159 * c.radius * c.radius
+}
+-->
+<!-- prelude ui/text/text.low
+pub fn shout(s: str) -> str {
+    s
+}
+-->
 ```low
 import geometry
 import t = ui/text
@@ -559,6 +683,12 @@ fn main() {
 
 ### Generics
 
+<!-- prelude
+struct Pair[A, B] {
+    first: A
+    second: B
+}
+-->
 ```low
 struct Stack[T] {
     items: []T
@@ -608,6 +738,9 @@ let pick: fn(i64, i64) -> i64 = max
 
 ### Concurrency
 
+<!-- prelude
+let fd: i32 = 0
+-->
 ```low
 fn worker(jobs: chan[i64], results: chan[i64]) {
     for j in jobs {
@@ -940,7 +1073,7 @@ Every standard library resource that must be disposed of is a droppable owner bo
 - Matching is leftmost-first, as in Python and RE2, and results agree with Python's `re` under `re.ASCII`. `find_all`, `replace_all` and `split` follow Python 3.7: an empty match is allowed right after a non-empty one, and after an empty match the next one may start at the same offset only if it is not empty. `split` does not include group text. `split_n` splits at most `max` times; a negative `max` splits everywhere.
 - Repeat counts are limited to 10000 and programs to 100,000 instructions. Invalid patterns fail with `Invalid(at, message)`, at the byte offset Python reports. Backreferences, lookaround, named groups and possessive quantifiers are rejected.
 - `regex.generated("pattern")` is a `Regex` built at compile time, like .NET's `[GeneratedRegex]`. The pattern must be a string literal; flags are written inline. An invalid pattern is a compile error at the literal, `invalid regex at byte N: message`, with the offset and message `compile` would fail with. The result is used through the same functions as a compiled `Regex` and matches identically.
-- `internal/regex` holds a Go copy of the parser and assembler, held to the LowLang one by running the `std_regex_errors` fixture's patterns through it. The checker turns each distinct literal into LowLang functions named `__regex_` and the FNV-1a hash of the pattern, parsed with the prelude's privileges and added to `std/regex`, so they reach its private types. A `Regex` carries an `Engine` of thread-start, step and skip functions with the queue size; `compile` fills it with the Pike VM, and the generated engine keeps the VM's queues, priorities and capture slots but replaces interpretation with code per instruction: one function per instruction that starts a thread, follows a consumed character or joins two epsilon paths, each guarded by the queue's sparse set, with the remaining jumps, splits, saves and assertions inlined into it; characters and classes of up to four ranges compare inline in the step, which dispatches on the program counter by binary search, and larger classes get a binary-search function. When no empty match is possible from the start, a skip function moves past ASCII bytes that cannot begin a match before a thread starts. Programs over 2000 instructions are compiled at run time by `compile` instead, so call depth stays bounded.
+- `internal/regex` holds a Go copy of the parser and assembler, held to the Low one by running the `std_regex_errors` fixture's patterns through it. The checker turns each distinct literal into Low functions named `__regex_` and the FNV-1a hash of the pattern, parsed with the prelude's privileges and added to `std/regex`, so they reach its private types. A `Regex` carries an `Engine` of thread-start, step and skip functions with the queue size; `compile` fills it with the Pike VM, and the generated engine keeps the VM's queues, priorities and capture slots but replaces interpretation with code per instruction: one function per instruction that starts a thread, follows a consumed character or joins two epsilon paths, each guarded by the queue's sparse set, with the remaining jumps, splits, saves and assertions inlined into it; characters and classes of up to four ranges compare inline in the step, which dispatches on the program counter by binary search, and larger classes get a binary-search function. When no empty match is possible from the start, a skip function moves past ASCII bytes that cannot begin a match before a thread starts. Programs over 2000 instructions are compiled at run time by `compile` instead, so call depth stays bounded.
 
 ### Compression
 
@@ -1003,33 +1136,34 @@ The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emi
 ### Linking
 
 - A static program is linked with `ld -static` and starts at the generated `_start`, which initialises the heap and the scheduler, starts `main` on the first green thread and enters the scheduler on the process stack.
-- A dynamic program is linked with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2` against glibc's `crt1.o`, `crti.o` and `crtn.o`, then `-l<name>` for each library and `-lc`. The start files are looked for in `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/lib/x86_64-linux-gnu`. glibc's start-up code calls the generated C `main`, which does the same; when LowLang's `main` returns the program calls `exit(0)`, letting libc run its exit handlers. An error from `main` still prints and exits with status 1.
+- A dynamic program is linked with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2` against glibc's `crt1.o`, `crti.o` and `crtn.o`, then `-l<name>` for each library and `-lc`. The start files are looked for in `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/lib/x86_64-linux-gnu`. glibc's start-up code calls the generated C `main`, which does the same; when Low's `main` returns the program calls `exit(0)`, letting libc run its exit handlers. An error from `main` still prints and exits with status 1.
 
-`internal/compiler/prelude.low` is LowLang source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, the generic map table, integer formatting, and float formatting by unrounded scaling against a table of 128-bit powers of ten from 1e-348 to 1e347, which finds the shortest digits that read back to the same value without allocating. `cmd/tablegen pow10` generates the table twice: as the `__pow10_hi` and `__pow10_lo` functions the prelude holds, and as `std/text/pow10.bin`, which `std/text` embeds for float parsing, because standard library files cannot call prelude functions. Its names start with `__`, which user code cannot use, and four intrinsics are available only there: `__bits` gives a float's bit pattern, `__str_view` turns a `[]u8` into a `str` without copying, `__hash` hashes any `Hash` value, and `__zero` is the all-zero value of its expected type. A function's IR is built only when `main` reaches it through a call or a function address, so a program that formats no floats neither builds nor carries any of this code. Reachable functions are built in call order and emitted in declaration order.
+`internal/compiler/prelude.low` is Low source compiled ahead of every program: UTF-8 decoding, the string builder behind interpolation and concatenation, the generic map table, integer formatting, and float formatting by unrounded scaling against a table of 128-bit powers of ten from 1e-348 to 1e347, which finds the shortest digits that read back to the same value without allocating. `cmd/tablegen pow10` generates the table twice: as the `__pow10_hi` and `__pow10_lo` functions the prelude holds, and as `std/text/pow10.bin`, which `std/text` embeds for float parsing, because standard library files cannot call prelude functions. Its names start with `__`, which user code cannot use, and four intrinsics are available only there: `__bits` gives a float's bit pattern, `__str_view` turns a `[]u8` into a `str` without copying, `__hash` hashes any `Hash` value, and `__zero` is the all-zero value of its expected type. A function's IR is built only when `main` reaches it through a call or a function address, so a program that formats no floats neither builds nor carries any of this code. Reachable functions are built in call order and emitted in declaration order.
 
 The standard library lives in `internal/compiler/std` and is embedded in `low` with `go:embed`. An import whose path is `std` or starts with `std/` is read from there, never from the project root. Its files are lexed like the prelude, so they may use `__` names and intrinsics, and they are left out of the sources `low dev` watches. `embed` in a standard library file reads from the embedded tree and writes the bytes once to `lowlang/embed/` under the user cache directory, named by their SHA-256, for the assembler's `.incbin`. These intrinsics serve it: `__argc()`, `__argv(i)` and `__envv(i)` read the argument count, argument `i` and environment entry `i` (`null` past the end) as NUL-terminated `ptr[u8]`s, which the start code saves from the initial stack in a static program and from `main`'s arguments in a dynamic one; `__syscall(n, args...)` makes Linux syscall `n` with up to six integer, `bool` or `ptr` arguments and returns `rax` as `i64`, a negative errno on failure; `__slice_ptr(x)` gives the data address of a slice or `str` as a `ptr[T]`; `__mulhi(a, b)` is the high 64 bits of the 128-bit product of two `u64`, an IR instruction that becomes one `mul`; `__hash_seed(i)` is word `i`, a literal 0 or 1, of the process's 128-bit hash seed, an IR instruction that becomes one load from `rt_hash_seed`; `__extend_by(mut b, n)` grows a `[]u8` by `n` bytes with at most one allocation and returns the index of the first new byte, whose contents the caller overwrites; `__make(n)` is a zeroed slice of `n` elements of the expected slice type, allocated through the runtime's grow routine; `__memmove(dst, src)` copies `min(dst.len, src.len)` elements with the runtime's overlap-safe `rt_memmove`, which loads up to 64 bytes into registers before storing them and uses `rep movsb` beyond that, and returns the count, taking a `str` source for a `[]u8` destination; `__clock_nanos(id)` returns `clock_gettime(id)` in nanoseconds, or 0 on failure, through `rt_clock_nanos`, which calls `__vdso_clock_gettime` when start-up found it from `AT_SYSINFO_EHDR` and the vDSO's dynamic symbol table (DT_HASH or DT_GNU_HASH) and makes the syscall otherwise; `__context()` reads the current green thread's context slot as the expected pointer type, `__set_context(p)` replaces it and `__has_context()` tells whether it is set; `spawn` copies the parent's slot into the child, and the collector marks every live green thread's slot; `__serialize`, `__deserialize` and `__schema` are the derivations below, allowed only in `std/serde`. `__syscall` lowers to a runtime-call instruction, `syscall` for a constant number on the non-blocking list and `sysblock` otherwise (see the Scheduler section), that the code generator emits inline for `syscall`: it moves the arguments into `rax`, `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9` with the parallel move and executes `syscall`. Being a call, it keeps no value in a caller-saved register across it, which covers the `rcx` and `r11` the kernel clobbers.
 
 The garbage collector is a non-moving mark-sweep collector in the runtime:
 
 - The heap is a 16 GB reservation made with `mmap` and `MAP_NORESERVE`; pages are committed as they are touched.
-- Each object has a one-word header. Bits 3 and up hold the object's size in words, header included, so the word is the size in bytes with its low three bits used as flags: bit 0 is always zero, bit 1 marks a free chunk and bit 2 marks an object with no pointers to scan. A bitmap records the first word of every object and free chunk, which resolves pointers into the middle of an object, such as a `mut` parameter aimed at a heap field. Two summary bitmaps above it hold one bit per non-empty bitmap word and one per non-empty summary word, so finding the start behind an interior pointer skips empty spans 32 KB and 2 MB at a time instead of reading every bitmap word between the pointer and its object's header. A second bitmap of the same shape holds the mark bit of each object; it is zero outside a collection. The mark bitmap and the first summary bitmap are sparsely touched, so they are excluded from transparent huge pages on Linux.
-- Each OS thread allocates objects of up to 255 words from its own buffer of up to 4096 words without taking the heap lock: it bumps a pointer, writes the header and sets the object's start bit. Only the start-bitmap words at the buffer's unaligned edges are set atomically, with `lock or`; the other words are updated with a plain `or`. The summary bits are tested first and set atomically only when clear, and each thread remembers the last bitmap word whose summary bits it set, so allocation skips the summary update while it stays in that word. The memory is reset whenever the thread takes a new buffer. A thread whose buffer is full takes the heap lock and refills it from the smallest free chunk large enough in the size-class bins below, then the exact-size free lists from the largest down, then the end of the heap, zeroing the buffer's dirty pages in one pass. A collection turns every thread's unused buffer tail into a free chunk before marking, and an allocation that would leave a single word in a buffer takes that word too, so the sweep finds a header at every object boundary.
-- Free chunks of 64 words or more sit in 256 size-class bins, four per power of two, and a 256-bit bitmap marks the non-empty ones. Bins 0 to 127 hold chunks whose pages may be non-zero (dirty) and bins 128 to 255 hold chunks known to be zero (clean). An allocation scans up to eight chunks of its own bin for the smallest that fits, then takes the first chunk of the lowest non-empty bin above it, preferring a dirty bin to a clean one of the same class, and splits off the remainder. Chunks under 64 words sit in exact-size free lists that only buffer refills read. Objects over 255 words take the heap lock and allocate from the bins, then from the end of the heap.
+- Each object has a one-word header. Bits 3 and up hold the object's size in words, header included, so the word is the size in bytes with its low three bits used as flags: bit 0 is always zero, bit 1 marks a free chunk and bit 2 marks an object with no pointers to scan. A bitmap records the first word of every object and free chunk, which resolves pointers into the middle of an object, such as a `mut` parameter aimed at a heap field. Two summary bitmaps above it hold one bit per non-empty bitmap word and one per non-empty summary word, so finding the start behind an interior pointer skips empty spans 32 KB and 2 MB at a time instead of reading every bitmap word between the pointer and its object's header. A second bitmap of the same shape holds the mark bit of each object; it is zero outside a collection. The start bitmap, the mark bitmap, the first summary bitmap and the mark stack are touched sparsely or in small steps, so they are excluded from transparent huge pages on Linux; one touched byte would otherwise make a 2 MB page resident.
+- Each OS thread allocates objects of up to 255 words from its own buffer of up to 4096 words without taking the heap lock: it bumps a pointer, writes the header and sets the object's start bit. Only the start-bitmap words at the buffer's unaligned edges are set atomically, with `lock or`; the other words are updated with a plain `or`. The summary bits are tested first and set atomically only when clear, and each thread remembers the last bitmap word whose summary bits it set, so allocation skips the summary update while it stays in that word. The memory is reset whenever the thread takes a new buffer. A thread whose buffer is full takes the heap lock and refills it from the smallest free chunk large enough in the size-class bins below, then the exact-size free lists from the largest down, then the end of the heap, and zeroes the buffer's dirty pages in one pass after releasing the lock. A collection turns every thread's unused buffer tail into a free chunk before marking, and an allocation that would leave a single word in a buffer takes that word too, so the sweep finds a header at every object boundary.
+- Free chunks of 64 words or more sit in 256 size-class bins, four per power of two, and a 256-bit bitmap marks the non-empty ones. Bins 0 to 127 hold chunks whose pages may be non-zero (dirty) and bins 128 to 255 hold chunks known to be zero (clean). An allocation scans up to eight chunks of its own bin for the smallest that fits, then takes the first chunk of the lowest non-empty bin above it, preferring a dirty bin to a clean one of the same class, and splits off the remainder. Chunks under 64 words sit in exact-size free lists that only buffer refills read. Objects over 255 words take the heap lock and allocate from the bins, then from the end of the heap, and are zeroed after the lock is released.
 - A bitmap with one bit per 4096-byte heap page records which pages may hold non-zero words. Pages never handed out are zero from the operating system and are clean. An allocation zeroes only the dirty pages of its range and then marks the whole range dirty, so a large zeroed object that is never written costs no resident memory. Every free chunk of 1 MB or more whose interior pages are all clean is filed in a clean bin.
 - Before the heap end moves for an allocation, every dirty free chunk of at least 1 MB returns its whole interior pages to the operating system on Linux with `madvise(MADV_DONTNEED)`, clears their dirty bits and moves to a clean bin. The walk starts at the first bin that can hold such a chunk and visits dirty bins only, so a chunk is advised once and not again until it is reused and freed. Resident memory holds the live objects and the new one rather than also the chunks that were too small. On Windows the pages stay committed and chunks stay dirty.
 - Collection runs when the words allocated since the last one exceed the words that survived it, with a 4 MB floor. A thread's allocation buffer counts by the size of the chunk it actually receives, so refilling from small free chunks after a sweep counts no more than the memory handed out.
+- `LOW_GCTRACE=1` prints one line per collection to stderr: `gc N pause_us= mark_us= sweep_us= live_kb= heap_kb= slow_allocs= refills=`, from timestamps around the stop, mark, sweep and restart and from per-thread counters of buffer refills. `LOW_GC=off` never collects and `LOW_GC=stress` collects after every 8192 words allocated.
 - An allocation whose type holds no pointers is noscan: `new` of a pointer-free value, and the backing arrays of slices whose elements hold none, such as `[]u8`, `[]i64` and `[]f32`. A noscan object is marked but its contents are never read. Other objects are scanned word by word.
 - Allocation and pinning take a heap lock. A collection stops the world: it sets a stop flag and every thread's preemption flag, then waits until each other thread is stopped at a safepoint, idle in the scheduler or in a C call, and holds those threads there until it finishes. Threads waiting for a lock stop for the collector while they wait.
 - Roots come from stack maps. At every call the code generator records the frame words that may hold a heap pointer at that point: the saved callee-saved registers, spill slots of values that may be pointers and are live across the call, and every frame slot. The maps form a table sorted by return address. The words of `rt_cells`, one per hoisted literal, are scanned as roots in every collection.
-- Every green thread records where it stopped: the return address, stack pointer and frame pointer of the LowLang code that entered the runtime, and the lowest stack word holding registers it saved. The collector scans each live green thread's saved registers conservatively, then follows its `rbp` chain, looking up each frame's return address and scanning only its mapped words, and scans the green thread's first frame conservatively. Frames without a map, such as code patched in by hot reload or a loop interrupted by a preemption check, are scanned whole. A green thread that has not started is scanned whole.
+- Every green thread records where it stopped: the return address, stack pointer and frame pointer of the Low code that entered the runtime, and the lowest stack word holding registers it saved. The collector scans each live green thread's saved registers conservatively, then follows its `rbp` chain, looking up each frame's return address and scanning only its mapped words, and scans the green thread's first frame conservatively. Frames without a map, such as code patched in by hot reload or a loop interrupted by a preemption check, are scanned whole. A green thread that has not started is scanned whole.
 - Values in callee-saved registers are found in the save slots of whichever later frame saved them, or among the registers saved when the green thread stopped.
-- A callback thunk crosses C frames by segment. Its frame record holds the LowLang caller's frame pointer and return address, so the `rbp` chain leads from the thunk straight back to the caller, and its frame keeps the bounds of the C frames on the system stack and of the registers the C call saved. The thunk's call site has a map of count -1, which tells the collector to scan both regions conservatively before following the chain.
+- A callback thunk crosses C frames by segment. Its frame record holds the Low caller's frame pointer and return address, so the `rbp` chain leads from the thunk straight back to the caller, and its frame keeps the bounds of the C frames on the system stack and of the registers the C call saved. The thunk's call site has a map of count -1, which tells the collector to scan both regions conservatively before following the chain.
 - Every candidate word, mapped or not, is checked against the heap before it is followed, so a map that names a word holding an integer is harmless.
-- A `ptr` counts as a possible heap pointer, so a `cstr` copy or a pinned object stays alive while LowLang holds its address. `pin` records the address in a table of 65536 roots that every collection scans; `unpin` removes it.
+- A `ptr` counts as a possible heap pointer, so a `cstr` copy or a pinned object stays alive while Low holds its address. `pin` records the address in a table of 65536 roots that every collection scans; `unpin` removes it.
 - Marking resolves a candidate word first by testing the start bit of the word before it, which is the header when the candidate is an object's first field address, and falls back to the summary walk otherwise. Candidates are prefetched through a ring of pending headers before they are marked, so cache misses overlap. Marking sets the object's bit in the mark bitmap and adds its size to the live word count; newly marked noscan objects are not pushed on the mark stack.
 - Sweeping walks the start bitmap, jumping over empty words with the summary bitmaps, so its cost follows the number of objects and not the address span of the heap. It rebuilds the free lists and bins from empty. Within a word, the start bits without a mark bit are dead and the rest are live, and it jumps between the two kinds of run to coalesce adjacent dead objects into free chunks. A chunk keeps only its first start bit, and the word's mark bits are cleared once it is done. A trailing free run returns to the end of the heap.
 
-The derivations are generated as source. When the checker meets `__serialize(v, w)`, `__deserialize[T](r)` or `__schema[T]()` with a concrete type, it writes a function for that type in LowLang text, binding the type and each type it mentions to names like `__X0`, parses it with the prelude's privileges, marks it trusted so it may read and build private fields, and checks it like a generic instance. Calls inside it to the same intrinsics derive the types they reach, and each derived function is cached by type. Bound names resolve in type positions, struct literals and variant selectors. A field reference `T.field` is checked as `serde.Field[T, F]` and lowered to the field's name and index as constants.
+The derivations are generated as source. When the checker meets `__serialize(v, w)`, `__deserialize[T](r)` or `__schema[T]()` with a concrete type, it writes a function for that type in Low text, binding the type and each type it mentions to names like `__X0`, parses it with the prelude's privileges, marks it trusted so it may read and build private fields, and checks it like a generic instance. Calls inside it to the same intrinsics derive the types they reach, and each derived function is cached by type. Bound names resolve in type positions, struct literals and variant selectors. A field reference `T.field` is checked as `serde.Field[T, F]` and lowered to the field's name and index as constants.
 
 ### IR
 
@@ -1045,9 +1179,9 @@ The derivations are generated as source. When the checker meets `__serialize(v, 
 - `defer` keeps a stack of deferred statements per block and lowers them again at every exit from that block.
 - A struct's `drop` becomes a function `T..drop` whose parameters are the struct's fields, and every droppable type gets a generated `T..release` that calls it and then the releases of its droppable fields. A `using` binding adds a deferred `if flag { T..release(x) }` to its block; a move reads the value and clears the flag. Moves are found by a flow-sensitive pass over each checked function body, which joins moved states across branches and runs a loop body a second time when an iteration moves a binding.
 - `==` on a struct is the conjunction of its fields' comparisons. On an enum it compares tags, then branches on the tag to compare only that variant's fields, since the other payload words are undefined. An `extern struct` is stored in two frame slots and compared field by field at each field's offset and width, so padding is ignored.
-- A LowLang function value is two words: a code address and an environment pointer. Code reached through a function value takes the environment as parameter word 0. A closure is checked in place and becomes a function named after its parent, such as `counter..c1`; its environment is a heap array, or 0 when it captures none. A captured variable that is assigned after its binding, passed as `mut`, a C struct or a vector lives in a heap box allocated when it is bound, every access, in its own function and in closures, loads and stores through the box, and the environment holds the box pointer in one word. Any other captured variable stays an SSA variable of its function and the environment holds its words inline; the closure reads them into SSA variables on entry. Environment words follow the order of the closure's captures. `spawn` binds its callee and arguments to such variables, so a spawn allocates the environment and nothing else. A named function used as a value goes through an adapter, `name..value`, which drops the environment and calls it.
+- A Low function value is two words: a code address and an environment pointer. Code reached through a function value takes the environment as parameter word 0. A closure is checked in place and becomes a function named after its parent, such as `counter..c1`; its environment is a heap array, or 0 when it captures none. A captured variable that is assigned after its binding, passed as `mut`, a C struct or a vector lives in a heap box allocated when it is bound, every access, in its own function and in closures, loads and stores through the box, and the environment holds the box pointer in one word. Any other captured variable stays an SSA variable of its function and the environment holds its words inline; the closure reads them into SSA variables on entry. Environment words follow the order of the closure's captures. `spawn` binds its callee and arguments to such variables, so a spawn allocates the environment and nothing else. A named function used as a value goes through an adapter, `name..value`, which drops the environment and calls it.
 - A call through a function value moves the code address to `r10` and calls it, passing the environment and the arguments like any call. A call through an `extern fn` value is a `ccall` with the same System V plan as a named C function.
-- A C callback is a thunk, `cb_name`, emitted once per program for every function used as one. It saves the C argument registers, re-extends narrow integers and `bool` from them and from the C stack, calls the function with LowLang's convention on the green thread's stack and moves a float result to `xmm0`. On Windows it also saves and restores `xmm6` to `xmm15`, which C treats as callee-saved.
+- A C callback is a thunk, `cb_name`, emitted once per program for every function used as one. It saves the C argument registers, re-extends narrow integers and `bool` from them and from the C stack, calls the function with Low's convention on the green thread's stack and moves a float result to `xmm0`. On Windows it also saves and restores `xmm6` to `xmm15`, which C treats as callee-saved.
 - Every loop's back-edge block is marked; the code generator ends it with `cmp byte ptr fs:[-8], 0` and a branch to an out-of-line `call rt_poll`.
 - `spawn f(a, b)` becomes a block that binds the callee and the arguments to fresh locals and passes a closure calling `f` with them to `rt_spawn`. Sends, receives, `close` and channel loops call the prelude's instances for the element type; `select` calls the prelude's per-arm helpers and the runtime's `rt_lock_all`, `rt_timer_add` and `rt_park`.
 - `funcaddr` gives a function's code address, its thunk, or an `extern` function's address through the GOT. Functions reached only through `funcaddr` are kept.
@@ -1057,8 +1191,9 @@ The derivations are generated as source. When the checker meets `__serialize(v, 
 - A `str` is two words and a slice three. An element access computes `pointer + index * stride` after a `check` instruction, which compares unsigned and jumps to the index panic; packed elements load with `movzx`, `movsxd` or a 32-bit `mov` and store at their width.
 - A map `[K: V]` is a pointer to the prelude's generic `__Map[K, V]`, whose `entries` slice holds `__Entry[K, V]` records of a live flag, the key and the value. An open-addressing index of entry numbers with linear probing finds them; deleted entries leave tombstones until the next rebuild, which compacts the entries in order and resizes the index to keep it at most three quarters full. Integer, `bool` and pointer keys hash their word and `str` keys their bytes, both with the seeded multiply of the Maps section. Every concrete map type instantiates `__map_new`, `__map_get`, `__map_set`, `__map_delete`, `__map_len`, `__map_next`, `__map_key` and `__map_value` for its key and value types, and map literals, lookups, assignments, `delete`, `.len` and loops become calls to them. A compound assignment such as `m[k] += v` is a get, the operation on the value or zero, and a set.
 - `push` and the formatting helpers call the runtime's grow routine and the prelude; the buffer behind an interpolation lives in a frame slot passed as a `mut` argument. A `push` that finds the slice full grows it to twice the capacity plus 4.
-- A counted loop `for i in a..b` whose whole body is `push(mut xs, v)`, where `xs` is an SSA variable and `v` is made only of literals, other variables, field reads, conversions, unary operators and non-trapping arithmetic or comparison on numbers, becomes one reservation instead of a push per iteration. The trip count is `b - a` as an unsigned word when `a < b` and the loop is skipped otherwise. A trip count above 2^40 bytes of elements calls the grow routine with an impossible size so the program stops with the out-of-memory panic. The slice then grows once to exactly its length plus the trip count, or not at all when the capacity already suffices, and its length becomes that sum. When `xs` is known to be empty the growth is unconditional. A value that is zero in every word (a zero constant or a conversion of one) needs no stores in a freshly grown buffer, since the runtime returns zeroed memory; the elements are written with a counted loop when the value is not zero, and in the no-growth case for a zero value. A value that calls a function, can trap or reads the slice itself keeps the push loop. The prelude appends a whole string to a `[]u8` with `__extend`, which grows the buffer at most once and copies the bytes with the runtime's `rt_memmove`, so concatenation, interpolation, `bytes` and `str(b)` copy in bulk. An integer is formatted by counting its digits against powers of ten, growing the buffer once with `__extend_by` and writing the digits from the end. A concatenation chain and an interpolation, including interpolations and chains nested inside either, are flattened into one list of pieces. Adjacent literal pieces merge. Every piece is evaluated first, in order, and the result buffer is allocated once with the grow routine at the sum of the literal bytes, the lengths of the `str` pieces and the widest rendering of each number (20 for an integer, 24 for a float, 5 for a `bool`), which no rendering exceeds. A chain with no number pieces copies each piece with `rt_memmove` at a running offset; with number pieces the buffer lives in a frame slot, `str` pieces are copied at its length and numbers go through the prelude's `__append_*`. String ordering calls the prelude's `__str_cmp`.
+- A counted loop `for i in a..b` whose whole body is `push(mut xs, v)`, where `xs` is an SSA variable and `v` is made only of literals, other variables, field reads, conversions, unary operators and non-trapping arithmetic or comparison on numbers, becomes one reservation instead of a push per iteration. The trip count is `b - a` as an unsigned word when `a < b` and the loop is skipped otherwise. A trip count above 2^40 bytes of elements calls the grow routine with an impossible size so the program stops with the out-of-memory panic. The slice then grows once to exactly its length plus the trip count, or not at all when the capacity already suffices, and its length becomes that sum. When `xs` is known to be empty the growth is unconditional. A value that is zero in every word (a zero constant or a conversion of one) needs no stores in a freshly grown buffer, since the runtime returns zeroed memory; the elements are written with a counted loop when the value is not zero, and in the no-growth case for a zero value. A value that calls a function, can trap or reads the slice itself keeps the push loop. The prelude appends a whole string to a `[]u8` with `__extend`, which grows the buffer at most once and copies the bytes with the runtime's `rt_memmove`, so concatenation, interpolation, `bytes` and `str(b)` copy in bulk. An integer is formatted by counting its digits against powers of ten, growing the buffer once with `__extend_by` and writing the digits from the end. A concatenation chain and an interpolation, including interpolations and chains nested inside either, are flattened into one list of pieces. Adjacent literal pieces merge. Every piece is evaluated first, in order, and the result buffer is allocated once with the grow routine at the sum of the literal bytes, the lengths of the `str` pieces and the widest rendering of each number (20 for an integer, 25 for a float, 5 for a `bool`), which no rendering exceeds: the longest float is a negative value with exponent -6 and 17 significant digits, `-0.0000012345678901234567`. A chain with no number pieces copies each piece with `rt_memmove` at a running offset; with number pieces the buffer lives in a frame slot, `str` pieces are copied at its length and numbers go through the prelude's `__append_*`. String ordering calls the prelude's `__str_cmp`.
 - Unreachable blocks are pruned after construction.
+- A frame slot whose address is used only by word-sized loads and stores at word offsets inside it, never passed to a call, stored, compared with another address or reached through arithmetic with a variable, is promoted to SSA values by the optimiser: its stores disappear, each load becomes the value stored on every path that reaches it, and phis join the paths. A slot read before any store reads an undefined value. A slot of a C or vector type, a `select` box, a lock array and a slot with more than one address value stay in memory. After inlining, a `mut` argument whose callee is inlined therefore lives in registers. Loads and stores carry the flags raw (a narrow or tail access of a C struct, or `load` and `store`) and trap (`load`, which is never discarded).
 - An optimiser runs over each function's SSA before phis are classified. It keeps each value's type, float width and may-hold-a-pointer flag; a value that replaces another holds a pointer if either did. A pass leaves the control-flow graph alone, so phi inputs and predecessor lists stay valid while it runs. Between passes a branch on a constant becomes a jump to the taken successor, blocks left unreachable are pruned together with their predecessor entries and phi inputs, trivial phis are removed, and the pass runs again until no branch folds.
 - The optimiser builds a dominator tree with the Cooper-Harvey-Kennedy algorithm and walks it from the entry, so each value sees only facts established by its dominators. The tree is generic over its node type and the code generator builds it over machine blocks; predecessors that the entry cannot reach are ignored.
 - Copies are propagated, and integer operations, comparisons and `not` on constants are folded at their own type: `i32` results are sign-extended and `u8`, `u16` and `u32` results zero-extended exactly as the generated code would leave them. Division and remainder of constants by zero or by -1 are never folded, so the runtime panic and the overflow case stay in the instruction. Adding, subtracting, or-ing, xor-ing or shifting by zero, multiplying by one, and multiplying or and-ing by zero reduce to an operand or a constant, and multiplication by a power of two becomes a shift.
@@ -1067,14 +1202,15 @@ The derivations are generated as source. When the checker meets `__serialize(v, 
 - A `check [i, n]` is removed when an identical check dominates it, or when `i < n` is known on the path and `i` is known to be non-negative. A branch on a single-predecessor block's comparison of integers establishes `i < n` on the true edge of `i < n`, on the true edge of `n > i`, on the false edge of `i >= n` and on the false edge of `n <= i`. `i` is non-negative when it is a non-negative constant, an unsigned value, a value a dominating signed comparison bounds below by a constant of at least 0 (or by -1 strictly), a product of non-negative values that cannot overflow, or an induction variable that starts non-negative and only grows by a non-negative step without overflowing. A variable stepping by one cannot overflow below a bound it is compared against; any other step cannot overflow when the upper bounds of the variable and the step, added, stay within the type's range.
 - An upper bound is derived for a value from a constant, from the width of a narrow unsigned type, from a dominating signed comparison against a value that has an upper bound (strict comparisons subtract one), and for a sum or product of two non-negative values from their upper bounds when the result stays within the type's range. A check `[i, n]` with a constant `n` is removed when `i` is non-negative and its upper bound is below `n`. Only comparisons whose block dominates the use contribute.
 - Branch facts also record `i <= n` on the false edge of `i < n` and the true edge of `i >= n`; these never remove a check and never prove a step cannot overflow. A length that is a phi satisfies `n >= L` when every input satisfies it on its incoming edge, by being `L`, a constant at least `L`, a phi that does, or a value that a fact on the input's dominators bounds below by `L`. When `i < L` is known and `n >= L` holds, `i` non-negative removes the check, and otherwise the check compares against `L` instead of `n`, which keeps the same panics. A slice filled by a counted `push` loop from 0 to `L` has length `L` when `L > 0` and 0 otherwise, so indexing it by a counter below `L` needs no check.
-- Values nothing reads are removed, together with groups of values that only read each other, such as a phi and the add feeding it. Only these operations are removed: constants, strings, embeds, undefined values, phis, add, subtract, multiply, and, or, xor, shifts, negation, `not`, complement, conversions, `sqrt`, `floor`, comparisons, function addresses, high multiplies, trailing-zero counts, loads, float division, and integer division or remainder by a constant other than 0 and -1. Every other instruction stays, including calls, stores, checks, vector instructions, frame slots and divisions that can panic. A load is not a trapping instruction, since pointers are never null and an index is checked before its element is loaded, so an unread load is removed.
+- Values nothing reads are removed, together with groups of values that only read each other, such as a phi and the add feeding it. Only these operations are removed: constants, strings, embeds, undefined values, phis, add, subtract, multiply, and, or, xor, shifts, negation, `not`, complement, conversions, `sqrt`, `floor`, comparisons, function addresses, high multiplies, trailing-zero counts, loads, float division, and integer division or remainder by a constant other than 0 and -1. Every other instruction stays, including calls, stores, checks, vector instructions, frame slots and divisions that can panic. An unread load through a reference, a slice element or a frame slot is removed, since `*T` values are never null and an index is checked before its element is loaded. A `load` through a `ptr[T]` stays, so a null raw pointer traps even when the value is unused.
 - Float arithmetic, negation, `sqrt`, `floor` and conversions between integers, `f32` and `f64` are folded on constants with the result the SSE instruction produces: `f32` operations round to single precision, a float to integer conversion of a NaN or an out-of-range value gives the minimum 64-bit value, and unsigned 64-bit conversions are left to the instruction. A result that is NaN is never folded, so the sign and payload of a NaN come from the hardware.
 - Loop-invariant code motion works on natural loops found from back edges whose header dominates the latch, innermost first, in loops with a single outside predecessor that ends in a plain jump; that predecessor is the preheader. Only values whose operands are defined outside the loop or already hoisted move: multiply, and, or, xor, shifts, negation, `not`, complement, conversions, `sqrt`, `floor`, function addresses, high multiplies, trailing-zero counts, float division, and add, subtract or shift that is not the constant-offset address arithmetic an addressing mode absorbs. Loads, checks, calls, stores and integer division stay where they are, so a loop that runs zero times executes nothing it would not have executed. A constant a hoisted value reads is copied into the preheader, because the code generator defines a constant that is not an immediate at its first use.
 - Strength reduction replaces `i * c` by an add induction variable when `i` is a basic induction variable of a loop with a constant step, and replaces `i * c + d` derived from it the same way. The new variable starts at the start value multiplied by `c` in the preheader and steps by `step * c` on the back edge, with 64-bit wrapping arithmetic, so the result equals the product for every start, step and trip count, including overflow and negative steps.
 - A call through a function value whose code address is a function address becomes a direct call that keeps the environment argument.
 - Before inlining, a function that is never called through a function value, is not `main` or a callback and receives the same function address and the same constant environment from every direct call site, loses those two parameter words: the parameters become the constants, the arguments leave every call site, and the function and its callers are simplified again. Calls from the function to itself that pass its own parameters unchanged count as agreeing. This runs for up to four rounds, so a function value handed down through several calls reaches the call that uses it.
+- A function of at most 150 values that calls a function-value parameter, or hands it to another call, is cloned per function address when its direct call sites pass two or more different function addresses for that parameter, or one function address with different environments. Each clone takes the call sites of one function address, named `name..withN.target` where `N` is the first parameter word, has that word as the constant, drops the environment word too when every one of those call sites passes the same constant, and is simplified, so its call through the function value becomes direct. Calls from the clone to the original that pass the parameters unchanged call the clone. The original stays for the remaining call sites. A function gets at most 4 clones, and clones add at most 4000 values to the program.
 - The same conditions let an integer parameter that receives one and the same constant from every direct call site become that constant, but only when it pays: the function is simplified as a copy with the constants substituted and as a copy without, and the substitution is kept when the copy with it has fewer checks, blocks or values besides constants and parameters.
-- Release builds inline direct calls bottom-up over the strongly connected components of the call graph. A callee is eligible when it is not part of a cycle, is not a callback, has at most 48 values besides constants, parameters and results, has at most one loop and an entry block no jump returns to, and uses no frame slot, `ccall`, runtime call or vector instruction. A caller grows by at most 240 values and the program by at most 6000. The call's block is split, the callee's blocks are cloned with parameters bound to the arguments, a single return forwards its values and several returns join in phis, and the caller is simplified again. Loop back edges keep their marks, and checks and divisions keep their panics. Dev builds do not inline, specialise or hoist literals, so hot reload patches see every function and every literal's data.
+- Release builds inline direct calls bottom-up over the strongly connected components of the call graph. A callee is eligible when it is not part of a cycle, is not a callback, has at most 48 values besides constants, parameters and results, has at most one loop and an entry block no jump returns to, and uses no vector instruction; frame slots, `ccall`s and runtime calls are cloned with the body, and the callee's slots are appended to the caller's. A callee of at most 6 values is free. Any other site is charged to the caller, which grows by at most 240 values, and to the program, whose budget is a fifth of its value count before inlining, at least 6000 and at most 40000. The last quarter of the program budget is kept for call sites inside loops. A caller inlines up to four rounds: each round takes its sites inside the deepest loops first, then the smaller callees, then the earlier values, splits the call's block, clones the callee's blocks with parameters bound to the arguments, forwards a single return's values or joins several returns in phis, and simplifies the caller, so calls that an inlined body or a devirtualised call exposes are inlined in the next round. Loop back edges keep their marks, and checks and divisions keep their panics. Dev builds do not inline, specialise or hoist literals, so hot reload patches see every function and every literal's data.
 - A release build hoists a non-empty slice or map literal whose elements are all constants: integer, float, `bool` and `str` literals, negated numbers, `none`, enum variants without payload and non-C struct literals of constants. The checker marks a literal read-only when it is the operand of an index, a `for` or `.len`, or is bound by a `let` whose every use is such an operand; an assignment, a `mut` argument or any other use anywhere in the target path of an element or field makes the binding non-read-only. Each hoisted literal owns a word of `rt_cells`. The code loads the word, and when it is 0 builds the literal as usual and stores the pointer, so the first evaluation builds it and a racing thread at most builds a second equal copy. A read-only literal uses the cell's pointer, as a slice of its length for a slice. Any other use copies it: a slice with one grow call that moves the template's bytes, a map with the prelude's `__map_clone`, which copies the entry array and the index. A literal below the copy thresholds of the Slices and Maps sections is built each time in that case.
 - A block that ends in a jump to a block with no other predecessor and no phis is merged into it. A block that holds a phi and at most one more value and branches on that phi, or on its negation, is skipped by a predecessor that passes a constant: the predecessor jumps to the successor the constant selects.
 
@@ -1141,12 +1277,12 @@ Mechanism:
 The UI library is staged under `ui/` until it moves into the standard library as `std/ui`.
 
 - `ui/protocols` holds the Wayland protocol XML the library is built from: `wayland.xml` and `xdg-shell.xml`.
-- `go run ./cmd/wlgen -o wayland.low ui/protocols/wayland.xml ui/protocols/xdg-shell.xml` generates LowLang bindings for libwayland-client. Every interface given in one run shares an `Interfaces` record of `wl_interface` tables that `interfaces()` builds in C memory; a reference to an interface that no given protocol declares is an error.
+- `go run ./cmd/wlgen -o wayland.low ui/protocols/wayland.xml ui/protocols/xdg-shell.xml` generates Low bindings for libwayland-client. Every interface given in one run shares an `Interfaces` record of `wl_interface` tables that `interfaces()` builds in C memory; a reference to an interface that no given protocol declares is an error.
 - A request becomes `interface_request(...)` over `wl_proxy_marshal_flags`, taking the `Interfaces` record when it creates an object of a known interface; `wl_registry_bind` takes the interface table and version. Destructor requests pass `WL_MARSHAL_FLAG_DESTROY`, and an interface without a `destroy` request gets one that calls `wl_proxy_destroy`. Objects are `ptr`, strings `ptr[u8]`, `fixed` an `i32`.
-- Events become an `extern struct` listener of `extern fn` fields, each defaulting to a generated function that ignores the event, so a listener names only the events it handles; `interface_add_listener` copies it into C memory. Callbacks receive the listener's `data` pointer, usually a pinned LowLang object.
-- Enum entries are functions such as `wl_shm_format_argb8888() -> u32`. Names that clash with LowLang keywords or builtins gain a trailing `_`.
+- Events become an `extern struct` listener of `extern fn` fields, each defaulting to a generated function that ignores the event, so a listener names only the events it handles; `interface_add_listener` copies it into C memory. Callbacks receive the listener's `data` pointer, usually a pinned Low object.
+- Enum entries are functions such as `wl_shm_format_argb8888() -> u32`. Names that clash with Low keywords or builtins gain a trailing `_`.
 - `ui/shaders` holds GLSL for instanced quads with per-corner radii, borders and clipping, blurred shadows, and monochrome glyph sprites sampled from an `R8` atlas. Instances are read from a storage buffer at set 0 binding 0 and the viewport size is a push constant. `go run ./cmd/shadergen ui/shaders` compiles each stage with `glslc` to a checked-in `.spv` and records the sources' SHA-256 sums in `sources.sum`.
-- `ui/registry` holds the Vulkan registry, `vk.xml.gz` from Vulkan-Docs v1.4.363, and `vulkan.list`, which selects extensions, commands and extra types such as `pNext` structures. `go run ./cmd/vkgen -registry ui/registry/vk.xml.gz -select ui/registry/vulkan.list -o vulkan.low` generates LowLang bindings for the selected commands and every type they reach, skipping Vulkan SC variants. Enum values come from the core enums, every Vulkan feature level and the selected extensions.
+- `ui/registry` holds the Vulkan registry, `vk.xml.gz` from Vulkan-Docs v1.4.363, and `vulkan.list`, which selects extensions, commands and extra types such as `pNext` structures. `go run ./cmd/vkgen -registry ui/registry/vk.xml.gz -select ui/registry/vulkan.list -o vulkan.low` generates Low bindings for the selected commands and every type they reach, skipping Vulkan SC variants. Enum values come from the core enums, every Vulkan feature level and the selected extensions.
 - In the Vulkan bindings a handle is a one-field `extern struct`, `ptr` for dispatchable handles and `i64` for the others, so `VkBuffer {}` is the null handle and handles of different kinds do not mix. Structures and unions become `extern struct`s whose fields all have defaults: zero, `null`, the empty handle, or for `sType` the structure's own value, so a literal names only what it sets. A union takes the layout of its widest member. A fixed C array becomes numbered fields, `name_0` to `name_N`, with an accessor `Struct_name(s)` that returns them as a slice, or as a `str` for a character array.
 - Vulkan types map to `u32` (`uint32_t`, `VkBool32`, `VkFlags`, 32-bit flag bits), `i32` (`int32_t`, enums), `i64` (`uint64_t`, `VkDeviceSize`, `VkFlags64`, `size_t`), `u16`, `u8`, `f32` and `f64`. Pointers to known types become `ptr[T]`; `void*`, function pointers and pointers to pointers become `ptr`. A command's single input or output through a pointer is a `mut` parameter; an array or optional pointer is a `ptr[T]`. Enum entries and API constants are functions such as `VK_FORMAT_R8G8B8A8_UNORM() -> i32`, and `vk_make_api_version` builds version numbers.
 
@@ -1196,7 +1332,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 
 ## Roadmap
 
-1. Standard library, written in LowLang:
+1. Standard library, written in Low:
     1. Vector values in registers across blocks and calls, and an AVX-512 version.
     2. QUIC (RFC 9000, 9001 and 9002) over UDP with the TLS 1.3 handshake, loss recovery and congestion control; HTTP/3 (RFC 9114) with QPACK (RFC 9204).
     3. WebRTC data channels: ICE with STUN, DTLS, SCTP over DTLS and the data channel establishment protocol; media over SRTP.

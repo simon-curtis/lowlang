@@ -61,10 +61,7 @@ func isVector(t *types.Type) bool {
 }
 
 func (b *builder) vectorSlot(t *types.Type) *Value {
-	slot := b.emit(OpSlot)
-	slot.Aux = int64(len(b.fn.Slots))
-	b.fn.Slots = append(b.fn.Slots, t.Size())
-	return slot
+	return b.slot(t.Size())
 }
 
 func (b *builder) vectorOp(op VectorOp, t *types.Type, args ...*Value) {

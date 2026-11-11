@@ -2,26 +2,40 @@ package ir
 
 import "slices"
 
-const maxSpecialisationRounds = 4
+const (
+	maxSpecialisationRounds = 4
+	maxClonesPerFunction    = 4
+	maxCloneSourceCost      = 150
+	maxClonedProgramCost    = 4000
+)
 
 type callSite struct {
 	call   *Value
 	caller *Func
 }
 
+type specialiser struct {
+	program  *Program
+	cloned   int
+	clonesOf map[*Func]int
+}
+
 func (p *Program) specialiseConstantArguments() {
+	s := &specialiser{program: p, clonesOf: map[*Func]int{}}
 	for round := 0; round < maxSpecialisationRounds; round++ {
-		if !p.specialiseOnce() {
+		constants := s.specialiseConstants()
+		clones := s.cloneForFunctions()
+		if !constants && !clones {
 			return
 		}
 	}
 }
 
-func (p *Program) specialiseOnce() bool {
-	sites, escaping := p.directCalls()
+func (s *specialiser) specialiseConstants() bool {
+	sites, escaping := s.program.directCalls()
 	changed := map[*Func]bool{}
-	for _, g := range p.Funcs {
-		if len(sites[g]) == 0 || escaping[g] || g == p.Main || g.Callback {
+	for _, g := range s.program.Funcs {
+		if len(sites[g]) == 0 || escaping[g] || g == s.program.Main || g.Callback {
 			continue
 		}
 		dropped := specialiseParams(g, sites[g])
@@ -35,12 +49,16 @@ func (p *Program) specialiseOnce() bool {
 			changed[site.caller] = true
 		}
 	}
+	simplifyAll(s.program, changed)
+	return len(changed) > 0
+}
+
+func simplifyAll(p *Program, changed map[*Func]bool) {
 	for _, f := range p.Funcs {
 		if changed[f] {
 			simplify(f)
 		}
 	}
-	return len(changed) > 0
 }
 
 func (p *Program) directCalls() (map[*Func][]callSite, map[*Func]bool) {

@@ -3,7 +3,7 @@ package ir
 import "slices"
 
 func (s *ssa) threadBranches() bool {
-	var uses map[*Value]int
+	var uses []int32
 	threaded := false
 	for _, b := range s.fn.Blocks {
 		if !branchesOnPhiOfConstants(b) {
@@ -27,37 +27,38 @@ func branchesOnPhiOfConstants(b *Block) bool {
 	return slices.ContainsFunc(b.Values[0].Args, func(a *Value) bool { return a.Op == OpConst })
 }
 
-func (s *ssa) useCounts() map[*Value]int {
-	uses := map[*Value]int{}
+func (s *ssa) useCounts() []int32 {
+	s.ws.uses = reset(s.ws.uses, s.fn.values+1)
+	uses := s.ws.uses
 	for _, b := range s.fn.Blocks {
 		for _, v := range b.Values {
 			for _, a := range v.Args {
-				uses[a]++
+				uses[a.ID]++
 			}
 		}
 		if b.Control != nil {
-			uses[b.Control]++
+			uses[b.Control.ID]++
 		}
 		for _, r := range b.Results {
-			uses[r]++
+			uses[r.ID]++
 		}
 	}
 	return uses
 }
 
-func branchOnPhi(b *Block, uses map[*Value]int) (*Value, bool, bool) {
+func branchOnPhi(b *Block, uses []int32) (*Value, bool, bool) {
 	if b.Kind != If || b.Succs[0] == b.Succs[1] || len(b.Values) == 0 || len(b.Values) > 2 {
 		return nil, false, false
 	}
 	phi := b.Values[0]
-	if phi.Op != OpPhi || uses[phi] != 1 {
+	if phi.Op != OpPhi || uses[phi.ID] != 1 {
 		return nil, false, false
 	}
 	if len(b.Values) == 1 {
 		return phi, false, b.Control == phi
 	}
 	not := b.Values[1]
-	ok := not.Op == OpNot && not.Args[0] == phi && b.Control == not && uses[not] == 1
+	ok := not.Op == OpNot && not.Args[0] == phi && b.Control == not && uses[not.ID] == 1
 	return phi, true, ok
 }
 

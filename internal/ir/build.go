@@ -25,6 +25,7 @@ type place struct {
 	offset int
 	scalar *types.Type
 	tail   int
+	mem    uint8
 }
 
 func (p place) at(word int) place {
@@ -88,9 +89,10 @@ func Build(files []*ast.File, os target.OS, opts Options) *Program {
 		}
 	}
 	cells := 0
+	ws := &workspace{}
 	builderFor := func(f *Func, d *ast.Func) *builder {
 		return &builder{
-			ssa:      newSSA(f),
+			ssa:      ws.ssaFor(f),
 			os:       os,
 			decl:     d,
 			funcs:    funcs,
@@ -120,11 +122,7 @@ func Build(files []*ast.File, os target.OS, opts Options) *Program {
 	buildReachable(p.Main, pending)
 	p.Cells = cells
 	p.Funcs = reachable(p.Main, p.Funcs)
-	if opts.Inline {
-		p.specialiseConstantArguments()
-		p.inline()
-		p.Funcs = reachable(p.Main, p.Funcs)
-	}
+	p.optimise(opts)
 	p.CSymbols = cSymbols(p.Funcs)
 	p.Libraries = libraries(files, p.CSymbols)
 	p.Imports = imports(files, p.CSymbols)
@@ -268,7 +266,8 @@ func (b *builder) function() {
 	}
 	for i, local := range b.decl.ParamLocals {
 		if b.decl.Params[i].Mut {
-			b.refs[local] = b.param(word)
+			ref := b.param(word)
+			b.refs[local] = ref
 			word++
 			continue
 		}
@@ -449,9 +448,7 @@ func (b *builder) bind(local *ast.Local, words []*Value) {
 		return
 	}
 	if local.Addressed || isC(local.Type) || isVector(local.Type) {
-		slot := b.emit(OpSlot)
-		slot.Aux = int64(len(b.fn.Slots))
-		b.fn.Slots = append(b.fn.Slots, len(words))
+		slot := b.slot(len(words))
 		b.slots[local] = slot
 		b.store(place{addr: slot}, words)
 		return
@@ -462,22 +459,30 @@ func (b *builder) bind(local *ast.Local, words []*Value) {
 func (b *builder) place(p *ast.Place) place {
 	switch {
 	case p.Ptr != nil:
-		return place{addr: b.word(p.Ptr), offset: p.Offset, scalar: p.Width, tail: p.Tail}
+		return place{addr: b.word(p.Ptr), offset: p.Offset, scalar: p.Width, tail: p.Tail, mem: memOf(p)}
 	case p.Index != nil:
 		element := b.element(p.Index)
 		element.offset += p.Offset
 		element.tail = p.Tail
+		element.mem = memOf(p)
 		if p.Width != nil {
 			element.scalar = p.Width
 		}
 		return element
 	case p.Local.Ref:
-		return place{addr: b.refs[p.Local], offset: p.Offset, scalar: p.Width, tail: p.Tail}
+		return place{addr: b.refs[p.Local], offset: p.Offset, scalar: p.Width, tail: p.Tail, mem: memOf(p)}
 	}
 	if slot, ok := b.slots[p.Local]; ok {
-		return place{addr: slot, offset: p.Offset, scalar: p.Width, tail: p.Tail}
+		return place{addr: slot, offset: p.Offset, scalar: p.Width, tail: p.Tail, mem: memOf(p)}
 	}
 	return place{local: p.Local, word: p.Offset / 8}
+}
+
+func memOf(p *ast.Place) uint8 {
+	if p.Width != nil || p.Tail != 0 {
+		return MemRaw
+	}
+	return 0
 }
 
 func (b *builder) load(p place, t *types.Type) []*Value {
@@ -489,11 +494,12 @@ func (b *builder) load(p place, t *types.Type) []*Value {
 			continue
 		}
 		if p.tail != 0 && k == len(words)-1 {
-			words[k] = b.loadTail(p.addr, p.offset+8*k, p.tail)
+			words[k] = b.loadTail(p.addr, p.offset+8*k, p.tail, p.mem)
 			continue
 		}
 		v := b.typed(OpLoad, p.scalar, p.addr)
 		v.Aux = int64(p.offset + 8*k)
+		v.Mem = p.mem
 		v.Scalar = !pointers[k]
 		if floats[k] != 0 {
 			v.FloatBits = floats[k]
@@ -508,7 +514,7 @@ var tailWidths = []struct {
 	width *types.Type
 }{{4, types.U32}, {2, types.U16}, {1, types.U8}}
 
-func (b *builder) loadTail(addr *Value, offset, tail int) *Value {
+func (b *builder) loadTail(addr *Value, offset, tail int, mem uint8) *Value {
 	var acc *Value
 	at := 0
 	for _, part := range tailWidths {
@@ -517,6 +523,7 @@ func (b *builder) loadTail(addr *Value, offset, tail int) *Value {
 		}
 		v := b.typed(OpLoad, part.width, addr)
 		v.Aux = int64(offset + at)
+		v.Mem = mem | MemRaw
 		if at > 0 {
 			v = b.typed(OpShl, types.I64, v, b.constant(int64(8*at)))
 		}
@@ -530,7 +537,7 @@ func (b *builder) loadTail(addr *Value, offset, tail int) *Value {
 	return acc
 }
 
-func (b *builder) storeTail(addr *Value, offset, tail int, word *Value) {
+func (b *builder) storeTail(addr *Value, offset, tail int, word *Value, mem uint8) {
 	at := 0
 	for _, part := range tailWidths {
 		if tail-at < part.bytes {
@@ -542,6 +549,7 @@ func (b *builder) storeTail(addr *Value, offset, tail int, word *Value) {
 		}
 		store := b.typed(OpStore, part.width, addr, v)
 		store.Aux = int64(offset + at)
+		store.Mem = mem | MemRaw
 		at += part.bytes
 	}
 }
@@ -553,11 +561,12 @@ func (b *builder) store(p place, words []*Value) {
 			continue
 		}
 		if p.tail != 0 && k == len(words)-1 {
-			b.storeTail(p.addr, p.offset+8*k, p.tail, w)
+			b.storeTail(p.addr, p.offset+8*k, p.tail, w, p.mem)
 			continue
 		}
 		v := b.typed(OpStore, p.scalar, p.addr, w)
 		v.Aux = int64(p.offset + 8*k)
+		v.Mem = p.mem
 	}
 }
 
@@ -1021,16 +1030,38 @@ func (b *builder) captured(local *ast.Local) []*Value {
 	return b.load(b.place(&ast.Place{Local: local}), local.Type)
 }
 
-func (b *builder) arguments(args []ast.Expr, params []*types.Type) []*Value {
+type writeBack struct {
+	to   place
+	from *Value
+	typ  *types.Type
+}
+
+func (b *builder) arguments(args []ast.Expr, params []*types.Type) ([]*Value, []writeBack) {
 	var words []*Value
+	var backs []writeBack
 	for i, arg := range args {
-		if r, ok := arg.(*ast.Ref); ok {
-			words = append(words, b.address(b.place(r.Place)))
+		r, ok := arg.(*ast.Ref)
+		if !ok {
+			words = append(words, b.value(arg, params[i])...)
 			continue
 		}
-		words = append(words, b.value(arg, params[i])...)
+		p := b.place(r.Place)
+		if p.scalar == nil && p.tail == 0 {
+			words = append(words, b.address(p))
+			continue
+		}
+		held := b.slot(r.Type.Size())
+		b.store(place{addr: held}, b.load(p, r.Type))
+		words = append(words, held)
+		backs = append(backs, writeBack{to: p, from: held, typ: r.Type})
 	}
-	return words
+	return words, backs
+}
+
+func (b *builder) writeBack(backs []writeBack) {
+	for _, w := range backs {
+		b.store(w.to, b.load(place{addr: w.from}, w.typ))
+	}
 }
 
 func (b *builder) callValue(e *ast.Call) []*Value {
@@ -1039,13 +1070,15 @@ func (b *builder) callValue(e *ast.Call) []*Value {
 	if t.C {
 		return b.cInvoke("", t.Params, t.Ret, callee, e.Args)
 	}
-	args := b.arguments(e.Args, t.Params)
+	args, backs := b.arguments(e.Args, t.Params)
 	signature := &Func{Name: t.Name, ParamWords: 1 + len(args), ResultWords: t.Ret.Size(), Ret: t.Ret}
 	operands := append(callee, args...)
 	call := b.emit(OpCall, operands...)
 	call.Indirect = true
 	call.Target = signature
-	return b.results(call, signature)
+	results := b.results(call, signature)
+	b.writeBack(backs)
+	return results
 }
 
 func (b *builder) convert(x *Value, from, to *types.Type) *Value {
@@ -1107,8 +1140,10 @@ func (b *builder) callFunc(e *ast.Call) []*Value {
 	if e.Target.Extern != nil {
 		return b.cCall(e)
 	}
-	args := b.arguments(e.Args, e.Target.ParamTypes)
-	return b.invoke(b.funcs[e.Target], args)
+	args, backs := b.arguments(e.Args, e.Target.ParamTypes)
+	results := b.invoke(b.funcs[e.Target], args)
+	b.writeBack(backs)
+	return results
 }
 
 func (b *builder) invoke(target *Func, args []*Value) []*Value {

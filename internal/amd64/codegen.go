@@ -28,6 +28,9 @@ var runtime string
 //go:embed sched.asm
 var scheduler string
 
+//go:embed gc.asm
+var collector string
+
 //go:embed hot.asm
 var hotRuntime string
 
@@ -127,6 +130,7 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 	out.WriteString(g.osRuntime())
 	out.WriteString(scheduler)
 	out.WriteString(runtime)
+	out.WriteString(collector)
 	g.writeMaps(&out)
 	writeCells(&out, prog.Cells)
 	if table != nil {

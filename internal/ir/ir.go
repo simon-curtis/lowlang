@@ -84,6 +84,11 @@ func (o Op) HasResult() bool {
 	return o != OpStore && o != OpCall && o != OpCCall && o != OpRuntime && o != OpCheck && o != OpVector
 }
 
+const (
+	MemRaw uint8 = 1 << iota
+	MemTrap
+)
+
 type Value struct {
 	ID        int
 	Op        Op
@@ -98,6 +103,7 @@ type Value struct {
 	Scalar    bool
 	FloatBits int
 	Indirect  bool
+	Mem       uint8
 	Uses      int
 	forward   *Value
 }

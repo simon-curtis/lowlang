@@ -13,24 +13,13 @@ type varKey struct {
 }
 
 type ssa struct {
-	fn         *Func
-	defs       map[varKey]map[*Block]*Value
-	sealed     map[*Block]bool
-	incomplete map[*Block][]pendingPhi
+	fn *Func
+	ws *workspace
 }
 
 type pendingPhi struct {
 	key varKey
 	phi *Value
-}
-
-func newSSA(fn *Func) ssa {
-	return ssa{
-		fn:         fn,
-		defs:       map[varKey]map[*Block]*Value{},
-		sealed:     map[*Block]bool{},
-		incomplete: map[*Block][]pendingPhi{},
-	}
 }
 
 func resolve(v *Value) *Value {
@@ -41,16 +30,11 @@ func resolve(v *Value) *Value {
 }
 
 func (s *ssa) write(k varKey, b *Block, v *Value) {
-	defs := s.defs[k]
-	if defs == nil {
-		defs = map[*Block]*Value{}
-		s.defs[k] = defs
-	}
-	defs[b] = v
+	s.ws.variables[defKey{variable: k, block: b.ID}] = v
 }
 
 func (s *ssa) read(k varKey, b *Block) *Value {
-	if v, ok := s.defs[k][b]; ok {
+	if v, ok := s.ws.variables[defKey{variable: k, block: b.ID}]; ok {
 		return resolve(v)
 	}
 	return s.readRecursive(k, b)
@@ -59,9 +43,9 @@ func (s *ssa) read(k varKey, b *Block) *Value {
 func (s *ssa) readRecursive(k varKey, b *Block) *Value {
 	var v *Value
 	switch {
-	case !s.sealed[b]:
+	case !s.ws.isSealed(b):
 		v = s.phi(b)
-		s.incomplete[b] = append(s.incomplete[b], pendingPhi{key: k, phi: v})
+		s.ws.addIncomplete(b, pendingPhi{key: k, phi: v})
 	case len(b.Preds) == 0:
 		v = s.prepend(b, OpUndef)
 	case len(b.Preds) == 1:
@@ -112,18 +96,22 @@ func (s *ssa) trivial(phi *Value) *Value {
 }
 
 func (s *ssa) seal(b *Block) {
-	for i := 0; i < len(s.incomplete[b]); i++ {
-		pending := s.incomplete[b][i]
+	for i := 0; ; i++ {
+		pending, ok := s.ws.takeIncomplete(b, i)
+		if !ok {
+			break
+		}
 		s.addOperands(pending.key, pending.phi)
 	}
-	delete(s.incomplete, b)
-	s.sealed[b] = true
+	s.ws.dropIncomplete(b)
+	s.ws.markSealed(b)
 }
 
 func (s *ssa) finalize() {
 	s.optimizeUntilStable()
 	s.optimizeLoops()
 	s.removeDeadValues()
+	s.compactSlots()
 	s.countUses()
 	s.classifyPhis()
 	s.classifyFloatPhis()
@@ -134,13 +122,14 @@ func (s *ssa) optimizeUntilStable() {
 		s.prune()
 		for s.removeTrivialPhis() {
 		}
+		promoted := s.promoteSlots()
 		s.optimize()
 		for s.removeTrivialPhis() {
 		}
 		folded := s.foldConstantBranches()
 		threaded := s.threadBranches()
 		merged := s.mergeBlocks()
-		if !folded && !threaded && !merged {
+		if !folded && !threaded && !merged && !promoted {
 			return
 		}
 	}
@@ -171,13 +160,14 @@ func (s *ssa) classifyPhis() {
 }
 
 func (s *ssa) prune() {
-	reachable := map[*Block]bool{}
+	reachable := reset(s.ws.reach, s.fn.blockIDs)
+	s.ws.reach = reachable
 	var visit func(b *Block)
 	visit = func(b *Block) {
-		if reachable[b] {
+		if reachable[b.ID] {
 			return
 		}
-		reachable[b] = true
+		reachable[b.ID] = true
 		for _, succ := range b.Succs {
 			visit(succ)
 		}
@@ -185,7 +175,7 @@ func (s *ssa) prune() {
 	visit(s.fn.Blocks[0])
 	var kept []*Block
 	for _, b := range s.fn.Blocks {
-		if reachable[b] {
+		if reachable[b.ID] {
 			dropDeadPreds(b, reachable)
 			kept = append(kept, b)
 		}
@@ -193,10 +183,10 @@ func (s *ssa) prune() {
 	s.fn.Blocks = kept
 }
 
-func dropDeadPreds(b *Block, reachable map[*Block]bool) {
+func dropDeadPreds(b *Block, reachable []bool) {
 	var live []int
 	for i, p := range b.Preds {
-		if reachable[p] {
+		if reachable[p.ID] {
 			live = append(live, i)
 		}
 	}
@@ -276,7 +266,7 @@ func (s *ssa) countUses() {
 	}
 }
 
-type floatLattice map[*Value]int
+type floatLattice []uint8
 
 func (s *ssa) classifyFloatPhis() {
 	var phis []*Value
@@ -287,7 +277,8 @@ func (s *ssa) classifyFloatPhis() {
 			}
 		}
 	}
-	lattice := floatLattice{}
+	s.ws.lattice = reset(s.ws.lattice, s.fn.values+1)
+	lattice := floatLattice(s.ws.lattice)
 	for changed := true; changed; {
 		changed = false
 		for _, phi := range phis {
@@ -297,17 +288,29 @@ func (s *ssa) classifyFloatPhis() {
 		}
 	}
 	for _, phi := range phis {
-		phi.FloatBits = lattice[phi]
+		phi.FloatBits = lattice.bits(phi)
 	}
+}
+
+func (l floatLattice) get(v *Value) (int, bool) {
+	known := l[v.ID]
+	return int(known) - 1, known != 0
+}
+
+func (l floatLattice) bits(v *Value) int {
+	if bits, known := l.get(v); known {
+		return bits
+	}
+	return 0
 }
 
 func (l floatLattice) refine(phi *Value) bool {
 	bits, determined := l.join(phi)
-	old, known := l[phi]
+	old, known := l.get(phi)
 	if !determined || (known && old == bits) {
 		return false
 	}
-	l[phi] = bits
+	l[phi.ID] = uint8(bits + 1)
 	return true
 }
 
@@ -333,6 +336,5 @@ func (l floatLattice) bitsOf(v *Value) (int, bool) {
 	if v.Op != OpPhi {
 		return v.FloatBits, true
 	}
-	bits, known := l[v]
-	return bits, known
+	return l.get(v)
 }

@@ -5,8 +5,13 @@ import "slices"
 const (
 	maxInlineCost    = 48
 	maxInlineLoops   = 1
+	freeInlineCost   = 6
 	maxCallerGrowth  = 240
-	maxProgramGrowth = 6000
+	minProgramGrowth = 6000
+	maxProgramGrowth = 40000
+	programShare     = 5
+	loopReserveShare = 4
+	maxInlineRounds  = 4
 )
 
 type calleeSummary struct {
@@ -18,15 +23,38 @@ type inliner struct {
 	program   *Program
 	recursive map[*Func]bool
 	summaries map[*Func]calleeSummary
-	grown     int
+	budget    int
+	reserve   int
+	scratch   inlineScratch
 }
 
 func (p *Program) inline() {
-	in := &inliner{program: p, summaries: map[*Func]calleeSummary{}}
+	budget := programBudget(p)
+	in := &inliner{program: p, summaries: map[*Func]calleeSummary{}, budget: budget, reserve: budget / loopReserveShare}
 	order := in.callOrder()
 	for _, f := range order {
 		in.inlineInto(f)
 	}
+}
+
+func programBudget(p *Program) int {
+	total := 0
+	for _, f := range p.Funcs {
+		total += costOf(f)
+	}
+	return min(maxProgramGrowth, max(minProgramGrowth, total/programShare))
+}
+
+func costOf(f *Func) int {
+	cost := 0
+	for _, b := range f.Blocks {
+		for _, v := range b.Values {
+			if countsTowardCost(v.Op) {
+				cost++
+			}
+		}
+	}
+	return cost
 }
 
 func directCallees(f *Func) []*Func {
@@ -126,7 +154,7 @@ func (in *inliner) summarise(g *Func) calleeSummary {
 }
 
 func (in *inliner) measure(g *Func) calleeSummary {
-	if in.recursive[g] || g.Callback || len(g.Slots) > 0 || len(g.Blocks[0].Preds) > 0 {
+	if in.recursive[g] || g.Callback || len(g.Blocks[0].Preds) > 0 {
 		return calleeSummary{}
 	}
 	cost, loops := 0, 0
@@ -148,7 +176,7 @@ func (in *inliner) measure(g *Func) calleeSummary {
 
 func inlinableOp(op Op) bool {
 	switch op {
-	case OpSlot, OpCCall, OpRuntime, OpVector, OpVectorScalar:
+	case OpVector, OpVectorScalar:
 		return false
 	}
 	return true
@@ -162,37 +190,109 @@ func countsTowardCost(op Op) bool {
 	return true
 }
 
+type inlineCandidate struct {
+	call  *Value
+	depth int
+	cost  int
+}
+
 func (in *inliner) inlineInto(f *Func) {
-	sites := in.callSites(f)
-	if len(sites) == 0 {
-		return
-	}
 	grown := 0
-	changed := false
-	for _, call := range sites {
-		callee := call.Target
-		summary := in.summarise(callee)
-		if !summary.eligible || len(call.Args) != callee.ParamWords || grown+summary.cost > maxCallerGrowth || in.grown+summary.cost > maxProgramGrowth {
-			continue
+	for round := 0; round < maxInlineRounds; round++ {
+		if !in.expandRound(f, &grown) {
+			return
 		}
-		newInlineSite(f, call, callee).expand()
-		grown += summary.cost
-		in.grown += summary.cost
-		changed = true
-	}
-	if changed {
 		simplify(f)
 	}
 }
 
-func (in *inliner) callSites(f *Func) []*Value {
-	var sites []*Value
+func (in *inliner) expandRound(f *Func, grown *int) bool {
+	candidates := in.candidates(f)
+	if len(candidates) == 0 {
+		return false
+	}
+	results := resultsOf(f, candidates)
+	expanded := false
+	for _, c := range candidates {
+		free := c.cost <= freeInlineCost
+		if !free && !in.admits(c, *grown) {
+			continue
+		}
+		newInlineSite(f, c.call, c.call.Target, &in.scratch).expand(results[c.call])
+		expanded = true
+		if !free {
+			*grown += c.cost
+			in.budget -= c.cost
+		}
+	}
+	return expanded
+}
+
+func (in *inliner) admits(c inlineCandidate, grown int) bool {
+	available := in.budget
+	if c.depth == 0 {
+		available -= in.reserve
+	}
+	return grown+c.cost <= maxCallerGrowth && c.cost <= available
+}
+
+func (in *inliner) candidates(f *Func) []inlineCandidate {
+	var candidates []inlineCandidate
+	var depths []int
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			if v.Op == OpCall && !v.Indirect && v.Target != nil && v.Target != f && in.summarise(v.Target).eligible {
-				sites = append(sites, v)
+			if v.Op != OpCall || v.Indirect || v.Target == nil || v.Target == f {
+				continue
+			}
+			summary := in.summarise(v.Target)
+			if !summary.eligible || len(v.Args) != v.Target.ParamWords {
+				continue
+			}
+			if depths == nil {
+				depths = loopDepths(f)
+			}
+			candidates = append(candidates, inlineCandidate{call: v, depth: depths[b.ID], cost: summary.cost})
+		}
+	}
+	slices.SortFunc(candidates, func(a, b inlineCandidate) int {
+		switch {
+		case a.depth != b.depth:
+			return b.depth - a.depth
+		case a.cost != b.cost:
+			return a.cost - b.cost
+		}
+		return a.call.ID - b.call.ID
+	})
+	return candidates
+}
+
+func loopDepths(f *Func) []int {
+	depths := make([]int, f.blockIDs)
+	if !slices.ContainsFunc(f.Blocks, func(b *Block) bool { return b.Poll }) {
+		return depths
+	}
+	for _, l := range findLoops(newDominators(f)) {
+		for _, b := range l.order {
+			depths[b.ID]++
+		}
+	}
+	return depths
+}
+
+func resultsOf(f *Func, candidates []inlineCandidate) map[*Value][]*Value {
+	results := make(map[*Value][]*Value, len(candidates))
+	for _, c := range candidates {
+		results[c.call] = make([]*Value, c.call.Target.ResultWords)
+	}
+	for _, b := range f.Blocks {
+		for _, v := range b.Values {
+			if v.Op != OpResult {
+				continue
+			}
+			if words, ok := results[v.Args[0]]; ok {
+				words[v.Aux] = v
 			}
 		}
 	}
-	return sites
+	return results
 }

@@ -49,7 +49,7 @@ func (o *optimizer) operandUpper(larger operand, at *Block, depth int) (int64, b
 	if larger.konst {
 		return larger.n, true
 	}
-	def, defined := o.defs[larger.id]
+	def, defined := o.definition(larger.id)
 	if !defined || depth == 0 {
 		return 0, false
 	}

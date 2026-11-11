@@ -42,7 +42,7 @@ var winArgRegs = []string{"rcx", "rdx", "r8", "r9"}
 var runtimeImports = map[string][]string{
 	kernelDLL: {
 		"AddVectoredExceptionHandler", "CloseHandle", "CreateEventW", "CreateThread", "ExitProcess",
-		"GetStdHandle", "GetSystemInfo", "GetSystemTimePreciseAsFileTime", "QueryPerformanceCounter", "QueryPerformanceFrequency",
+		"GetEnvironmentVariableA", "GetStdHandle", "GetSystemInfo", "GetSystemTimePreciseAsFileTime", "QueryPerformanceCounter", "QueryPerformanceFrequency",
 		"RegisterWaitForSingleObject", "SetEvent", "Sleep", "SwitchToThread", "TlsAlloc",
 		"UnregisterWait", "VirtualAlloc", "WaitForSingleObject", "WriteFile",
 	},

@@ -219,6 +219,23 @@ rt_exit:
 	WIN ExitProcess
 	ud2
 
+rt_env_byte:
+	OS_ENTER
+	mov rcx, rdi
+	lea rdx, [rsp+48]
+	mov r8d, 32
+	WIN GetEnvironmentVariableA
+	xor ecx, ecx
+	test eax, eax
+	jz 1f
+	cmp eax, 32
+	jae 1f
+	movzx ecx, byte ptr [rsp+48]
+1:
+	mov eax, ecx
+	OS_LEAVE
+	ret
+
 rt_mmap:
 	OS_ENTER
 	xor ecx, ecx

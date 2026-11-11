@@ -388,6 +388,7 @@ rt_memmove:
 	call rt_heap_acquire
 	call rt_alloc_body
 	mov qword ptr [rip+rt_heap_lock], 0
+	call rt_zero_payload
 2:
 	mov rdi, rax
 	mov r11, rax
@@ -533,6 +534,7 @@ rt_panic_oom:
 	jmp rt_panic
 
 rt_gc_init:
+	call rt_gc_env
 	mov rsi, 17179869184
 	call rt_mmap
 	mov [rip+rt_heap_start], rax
@@ -541,7 +543,7 @@ rt_gc_init:
 	add rcx, rax
 	mov [rip+rt_heap_end], rcx
 	mov rsi, 268435456
-	call rt_mmap
+	call rt_mmap_sparse
 	mov [rip+rt_bitmap], rax
 	mov rsi, 268435456
 	call rt_mmap_sparse
@@ -553,12 +555,13 @@ rt_gc_init:
 	call rt_mmap
 	mov [rip+rt_summary2], rax
 	mov rsi, 8589934592
-	call rt_mmap
+	call rt_mmap_sparse
 	mov [rip+rt_mark_base], rax
 	mov rsi, 524288
 	call rt_mmap
 	mov [rip+rt_dirty], rax
-	mov qword ptr [rip+rt_gc_threshold], 524288
+	xor eax, eax
+	call rt_gc_set_threshold
 	ret
 
 rt_set_start:
@@ -652,11 +655,11 @@ rt_link_chunk:
 	mov rax, rdi
 	sub rax, r8
 	shr rax, PAGE_SHIFT
-	bts qword ptr [r9], rax
+	lock bts qword ptr [r9], rax
 	lea rax, [rdi+15]
 	sub rax, r8
 	shr rax, PAGE_SHIFT
-	bts qword ptr [r9], rax
+	lock bts qword ptr [r9], rax
 	cmp rsi, BIN_MIN
 	jb 4f
 	xor r10d, r10d
@@ -886,13 +889,14 @@ rt_page_write:
 	shr r9, cl
 	and rax, r9
 2:
-	mov rcx, [r8+8*rdx]
-	mov r9, rax
-	not r9
-	and rcx, r9
-	and rax, r10
-	or rcx, rax
-	mov [r8+8*rdx], rcx
+	test r10, r10
+	jz 3f
+	lock or [r8+8*rdx], rax
+	jmp 4f
+3:
+	not rax
+	lock and [r8+8*rdx], rax
+4:
 	lea rdi, [rdx+1]
 	shl rdi, 6
 	cmp rdi, rsi
@@ -1051,7 +1055,7 @@ rt_alloc:
 	pop rsi
 	call rt_alloc_body
 	mov qword ptr [rip+rt_heap_lock], 0
-	ret
+	jmp rt_zero_payload
 
 rt_alloc_small:
 	lea rdx, [rdi+1]
@@ -1132,6 +1136,8 @@ rt_alloc_refill:
 	mov r12, rdi
 	call rt_heap_acquire
 	TLS_GET rbx, TLS_M
+	inc qword ptr [rbx+M_SLOWS]
+	inc qword ptr [rbx+M_REFILLS]
 	mov rdi, [rbx+M_ALLOC_CUR]
 	mov rsi, [rbx+M_ALLOC_END]
 	mov qword ptr [rbx+M_ALLOC_CUR], 0
@@ -1184,11 +1190,7 @@ rt_alloc_refill:
 	mov [rip+rt_heap_bump], rdx
 8:
 	add [rip+rt_alloc_since], r13
-	mov rdi, rax
-	mov rsi, r13
-	push rax
-	call rt_zero_range
-	pop rdx
+	mov rdx, rax
 	mov [rbx+M_ALLOC_CUR], rdx
 	mov qword ptr [rbx+M_ALLOC_SUMMARY], -1
 	lea rax, [rdx+8*r13]
@@ -1199,6 +1201,9 @@ rt_alloc_refill:
 	and rdx, -512
 	mov [rbx+M_ALLOC_LO], rdx
 	mov qword ptr [rip+rt_heap_lock], 0
+	mov rdi, [rbx+M_ALLOC_CUR]
+	mov rsi, r13
+	call rt_zero_range
 	pop r13
 	pop r12
 	pop rbx
@@ -1227,6 +1232,7 @@ rt_alloc_retire_all:
 
 rt_alloc_body:
 	push rsi
+	inc qword ptr [rip+rt_stat_slow]
 	cmp rdi, 1
 	adc rdi, 0
 	lea rsi, [rdi+1]
@@ -1286,14 +1292,18 @@ rt_alloc_body:
 	jnz 8f
 	or rdx, 4
 8:
-	push rdx
+	mov [rax], rdx
+	shr rdx, 3
+	lea rcx, [rdx-1]
+	add rax, 8
+	ret
+
+rt_zero_payload:
 	push rax
 	mov rdi, rax
+	mov rsi, rcx
 	call rt_zero_range
 	pop rax
-	pop rdx
-	mov [rax], rdx
-	add rax, 8
 	ret
 
 rt_find:
@@ -1391,9 +1401,13 @@ rt_gc:
 	push r13
 	push r14
 	push r15
+	mov edi, TICK_ENTER
+	call rt_gc_stamp
 	TLS_GET rax, TLS_G
 	mov [rax+G_SCANLO], rsp
 	call rt_world_stop
+	mov edi, TICK_STOPPED
+	call rt_gc_stamp
 	call rt_alloc_retire_all
 	mov qword ptr [rip+rt_live_words], 0
 	mov r15, [rip+rt_mark_base]
@@ -1462,8 +1476,20 @@ rt_gc:
 	jb 10b
 	cmp r15, [rip+rt_mark_base]
 	ja 6b
+	mov edi, TICK_MARKED
+	call rt_gc_stamp
 	call rt_sweep
+	mov edi, TICK_SWEPT
+	call rt_gc_stamp
 	call rt_world_start
+	mov edi, TICK_RESUMED
+	call rt_gc_stamp
+	inc qword ptr [rip+rt_gc_count]
+	cmp byte ptr [rip+rt_gc_trace], 0
+	je 12f
+	call rt_gc_stats_collect
+	call rt_gc_trace_print
+12:
 	pop r15
 	pop r14
 	pop r13
@@ -1745,10 +1771,7 @@ rt_sweep:
 3:
 	pop rbp
 	mov rax, [rip+rt_live_words]
-	mov rcx, 524288
-	cmp rax, rcx
-	cmovb rax, rcx
-	mov [rip+rt_gc_threshold], rax
+	call rt_gc_set_threshold
 	mov qword ptr [rip+rt_alloc_since], 0
 	ret
 

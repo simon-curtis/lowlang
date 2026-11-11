@@ -117,6 +117,35 @@ rt_exit:
 	mov eax, 231
 	syscall
 
+rt_env_byte:
+	mov rsi, [rip+rt_env_values]
+	test rsi, rsi
+	jz 7f
+1:
+	mov r8, [rsi]
+	test r8, r8
+	jz 7f
+	xor ecx, ecx
+2:
+	movzx eax, byte ptr [rdi+rcx]
+	test al, al
+	jz 3f
+	cmp al, [r8+rcx]
+	jne 6f
+	inc rcx
+	jmp 2b
+3:
+	cmp byte ptr [r8+rcx], 61
+	jne 6f
+	movzx eax, byte ptr [r8+rcx+1]
+	ret
+6:
+	add rsi, 8
+	jmp 1b
+7:
+	xor eax, eax
+	ret
+
 rt_mmap:
 	xor edi, edi
 	mov edx, 3

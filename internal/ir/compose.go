@@ -23,7 +23,7 @@ func renderedSize(t *types.Type) int64 {
 	case t == types.Bool:
 		return 5
 	case t.Float():
-		return 24
+		return 25
 	}
 	return 20
 }
@@ -123,9 +123,7 @@ func (b *builder) source(p piece) (*Value, *Value) {
 }
 
 func (b *builder) composeFormatted(pieces []piece, data, total *Value) []*Value {
-	slot := b.emit(OpSlot)
-	slot.Aux = int64(len(b.fn.Slots))
-	b.fn.Slots = append(b.fn.Slots, 3)
+	slot := b.slot(3)
 	b.store(place{addr: slot}, []*Value{data, b.constant(0), total})
 	for _, p := range pieces {
 		if p.formatted() {

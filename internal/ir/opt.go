@@ -34,15 +34,13 @@ type fact struct {
 }
 
 type optimizer struct {
-	fn       *Func
-	doms     *Dominators[*Block]
-	reps     map[exprKey]*Value
-	added    []exprKey
-	facts    []fact
-	nonneg   map[*Value]bool
-	defs     map[int]*Value
-	visiting map[*Value]bool
-	out      []*Value
+	fn    *Func
+	ws    *workspace
+	doms  *Dominators[*Block]
+	reps  map[exprKey]*Value
+	added []exprKey
+	facts []fact
+	out   []*Value
 }
 
 func blockSuccs(b *Block) []*Block {
@@ -53,19 +51,21 @@ func blockPreds(b *Block) []*Block {
 	return b.Preds
 }
 
-func newOptimizer(fn *Func, doms *Dominators[*Block]) *optimizer {
+func newOptimizer(fn *Func, ws *workspace, doms *Dominators[*Block]) *optimizer {
+	size := fn.values + 1
+	ws.nonneg = reset(ws.nonneg, size)
+	ws.defs = reset(ws.defs, size)
+	ws.visiting = reset(ws.visiting, size)
 	return &optimizer{
-		fn:       fn,
-		doms:     doms,
-		reps:     map[exprKey]*Value{},
-		nonneg:   map[*Value]bool{},
-		defs:     map[int]*Value{},
-		visiting: map[*Value]bool{},
+		fn:   fn,
+		ws:   ws,
+		doms: doms,
+		reps: map[exprKey]*Value{},
 	}
 }
 
 func (s *ssa) optimize() {
-	o := newOptimizer(s.fn, newDominators(s.fn))
+	o := newOptimizer(s.fn, s.ws, newDominators(s.fn))
 	o.visit(0)
 	for _, b := range s.fn.Blocks {
 		s.resolveBlock(b)
@@ -96,7 +96,7 @@ func (o *optimizer) visit(i int) {
 
 func (o *optimizer) block(b *Block) {
 	for _, v := range b.Values {
-		o.defs[v.ID] = v
+		o.define(v)
 		for i, a := range v.Args {
 			v.Args[i] = resolve(a)
 		}
@@ -150,7 +150,7 @@ func (o *optimizer) tighten(check *Value) bool {
 	if !found {
 		return false
 	}
-	limit, defined := o.defs[bound.id]
+	limit, defined := o.definition(bound.id)
 	if bound.konst || !defined || limit == check.Args[1] {
 		return false
 	}
@@ -293,12 +293,39 @@ func (o *optimizer) atLeastFrom(v *Value, bound operand, pred *Block, depth int)
 }
 
 func (o *optimizer) nonNegative(v *Value) bool {
-	if known, ok := o.nonneg[v]; ok {
+	if known, ok := o.memoisedNonNegative(v); ok {
 		return known
 	}
 	result := o.provesNonNegative(v)
-	o.nonneg[v] = result
+	o.ws.nonneg = fit(o.ws.nonneg, v.ID+1)
+	o.ws.nonneg[v.ID] = nonNegativeVerdict(result)
 	return result
+}
+
+func nonNegativeVerdict(known bool) int8 {
+	if known {
+		return 1
+	}
+	return -1
+}
+
+func (o *optimizer) memoisedNonNegative(v *Value) (bool, bool) {
+	if v.ID >= len(o.ws.nonneg) || o.ws.nonneg[v.ID] == 0 {
+		return false, false
+	}
+	return o.ws.nonneg[v.ID] > 0, true
+}
+
+func (o *optimizer) define(v *Value) {
+	o.ws.defs = fit(o.ws.defs, v.ID+1)
+	o.ws.defs[v.ID] = v
+}
+
+func (o *optimizer) definition(id int) (*Value, bool) {
+	if id >= len(o.ws.defs) || o.ws.defs[id] == nil {
+		return nil, false
+	}
+	return o.ws.defs[id], true
 }
 
 func (o *optimizer) provesNonNegative(v *Value) bool {
@@ -322,11 +349,12 @@ func unsignedNarrow(t *types.Type) bool {
 }
 
 func (o *optimizer) inductionNonNegative(phi *Value) bool {
-	if o.visiting[phi] {
+	o.ws.visiting = fit(o.ws.visiting, phi.ID+1)
+	if o.ws.visiting[phi.ID] {
 		return true
 	}
-	o.visiting[phi] = true
-	defer delete(o.visiting, phi)
+	o.ws.visiting[phi.ID] = true
+	defer func() { o.ws.visiting[phi.ID] = false }()
 	for _, a := range phi.Args {
 		a = resolve(a)
 		if a == phi || o.nonNegativeUnmemoised(a) {
@@ -338,7 +366,7 @@ func (o *optimizer) inductionNonNegative(phi *Value) bool {
 }
 
 func (o *optimizer) nonNegativeUnmemoised(v *Value) bool {
-	if known, ok := o.nonneg[v]; ok {
+	if known, ok := o.memoisedNonNegative(v); ok {
 		return known
 	}
 	return o.provesNonNegative(v)
@@ -653,8 +681,10 @@ func discardable(v *Value) bool {
 	switch v.Op {
 	case OpConst, OpString, OpEmbed, OpUndef, OpPhi, OpAdd, OpSub, OpMul, OpAnd, OpOr, OpXor, OpShl, OpShr,
 		OpNeg, OpNot, OpCompl, OpConvert, OpSqrt, OpFloor, OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpFuncAddr,
-		OpMulHigh, OpTrailingZeros, OpHashSeed, OpLoad:
+		OpMulHigh, OpTrailingZeros, OpHashSeed, OpSlot:
 		return true
+	case OpLoad:
+		return v.Mem&MemTrap == 0
 	case OpDiv, OpRem:
 		return floatValue(v) || divisorCannotFault(v)
 	}
