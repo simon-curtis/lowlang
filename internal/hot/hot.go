@@ -15,7 +15,6 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"lowlang/internal/amd64"
@@ -51,6 +50,9 @@ type Session struct {
 }
 
 func New(path string, stdout, stderr io.Writer) (*Session, error) {
+	if err := checkHost(); err != nil {
+		return nil, err
+	}
 	dir, err := os.MkdirTemp("", "low-dev-")
 	if err != nil {
 		return nil, err
@@ -363,7 +365,7 @@ func (s *Session) apply(ctx context.Context, code []byte, address uint64, entrie
 	if _, err := mem.WriteAt(binary.LittleEndian.AppendUint64(nil, uint64(count)), counter); err != nil {
 		return fmt.Errorf("writing patch count: %w", err)
 	}
-	if err := s.child.cmd.Process.Signal(syscall.SIGUSR1); err != nil {
+	if err := notify(s.child.cmd.Process); err != nil {
 		return err
 	}
 	if err := waitForZero(ctx, mem, counter); err != nil && s.awaitExit(ctx) != nil {
