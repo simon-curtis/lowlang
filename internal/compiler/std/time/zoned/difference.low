@@ -1,0 +1,258 @@
+import std/time/date
+import std/time/datetime
+import std/time/duration
+import std/time/fault
+import std/time/rounding
+import std/time/span
+import std/time/timeofday
+import std/time/timestamp
+
+struct Parts {
+    years: i64
+    months: i64
+    weeks: i64
+    days: i64
+    time: duration.Duration
+}
+
+struct Nudge {
+    parts: Parts
+    at: timestamp.Timestamp
+    expanded: bool
+}
+
+fn duration_sign(d: duration.Duration) -> i64 {
+    if duration.is_negative(d) {
+        return -1
+    }
+    if duration.is_zero(d) { 0 } else { 1 }
+}
+
+fn magnitude(n: i64) -> i64 {
+    if n < 0 { -n } else { n }
+}
+
+fn time_step(smallest: span.Unit, increment: i64) -> duration.Duration ! fault.Fault {
+    let per = span.nanos_per(smallest)?
+    duration.try_times(duration.nanoseconds(per), increment) ?? fail OutOfRange("rounding increment")
+}
+
+fn exact_until(a: Zoned, b: Zoned, diff: span.Diff) -> span.Span ! fault.Fault {
+    let step = time_step(diff.smallest, diff.increment)?
+    let rounded = duration.round(timestamp.until(a.ts, b.ts), step, diff.mode)?
+    span.from_duration(rounded, diff.largest)?
+}
+
+fn date_span(p: Parts) -> span.Span ! fault.Fault {
+    span.from_counts([p.years, p.months, p.weeks, p.days, 0, 0, 0, 0, 0, 0])?
+}
+
+fn anchor(a: Zoned, p: Parts) -> timestamp.Timestamp ! fault.Fault {
+    let moved = date.plus(date(a), date_span(p)?)?
+    let dt = datetime.from_parts(moved, time(a))
+    instant_for(a.tz, dt, Disambiguation.Compatible)?
+}
+
+fn calendar_parts(from: date.Date, to: date.Date, largest: span.Unit, time_part: duration.Duration) -> Parts ! fault.Fault {
+    let diff = span.Diff { largest, smallest: span.Unit.Days }
+    let c = span.counts(date.until(from, to, diff)?)
+    Parts { years: c[0], months: c[1], weeks: c[2], days: c[3], time: time_part }
+}
+
+fn raw_difference(a: Zoned, b: Zoned, largest: span.Unit, sign: i64) -> Parts ! fault.Fault {
+    let start_day = date(a)
+    let end_day = date(b)
+    if date.equal(start_day, end_day) {
+        return Parts { years: 0, months: 0, weeks: 0, days: 0, time: timestamp.until(a.ts, b.ts) }
+    }
+    let limit = if sign == 1 { 2 } else { 1 }
+    var correction = 0
+    if duration_sign(timeofday.until(time(a), time(b))) == -sign {
+        correction = 1
+    }
+    for correction <= limit {
+        let day = date.plus_days(end_day, -correction * sign)?
+        let dt = datetime.from_parts(day, time(a))
+        let anchor_at = instant_for(a.tz, dt, Disambiguation.Compatible)?
+        let rest = timestamp.until(anchor_at, b.ts)
+        if sign != -duration_sign(rest) {
+            return calendar_parts(start_day, day, largest, rest)?
+        }
+        correction += 1
+    }
+    fail Invalid("zoned difference")
+}
+
+fn with_unit(p: Parts, rank: i64, count: i64) -> Parts {
+    if rank == 0 {
+        return Parts { years: count, months: 0, weeks: 0, days: 0, time: duration.zero() }
+    }
+    if rank == 1 {
+        return Parts { years: p.years, months: count, weeks: 0, days: 0, time: duration.zero() }
+    }
+    if rank == 2 {
+        return Parts { years: p.years, months: p.months, weeks: count, days: 0, time: duration.zero() }
+    }
+    Parts { years: p.years, months: p.months, weeks: p.weeks, days: count, time: duration.zero() }
+}
+
+fn count_of(p: Parts, rank: i64) -> i64 {
+    if rank == 0 {
+        return p.years
+    }
+    if rank == 1 {
+        return p.months
+    }
+    if rank == 2 { p.weeks } else { p.days }
+}
+
+fn whole_weeks(a: Zoned, p: Parts) -> i64 ! fault.Fault {
+    let start = date.plus(date(a), date_span(with_unit(p, 1, p.months))?)?
+    let end = date.plus_days(start, p.days)?
+    let diff = span.Diff { largest: span.Unit.Weeks, smallest: span.Unit.Days }
+    p.weeks + span.week_count(date.until(start, end, diff)?)
+}
+
+fn nudge_calendar(a: Zoned, b: Zoned, raw: Parts, sign: i64, diff: span.Diff) -> Nudge ! fault.Fault {
+    let rank = span.rank(diff.smallest)
+    let inc = diff.increment
+    let count = if rank == 2 { whole_weeks(a, raw)? } else { count_of(raw, rank) }
+    let low = count / inc * inc
+    let high = low + inc * sign
+    let start = with_unit(raw, rank, low)
+    let end = with_unit(raw, rank, high)
+    let start_at = anchor(a, start)?
+    let end_at = anchor(a, end)?
+    let num = duration.abs(timestamp.until(start_at, b.ts))
+    let den = duration.abs(timestamp.until(start_at, end_at))
+    let class = span.half_class(num, den)
+    let rounded = span.round_count(magnitude(low) / inc, class, sign < 0, diff.mode)
+    if rounded > magnitude(low) / inc {
+        return Nudge { parts: end, at: end_at, expanded: true }
+    }
+    Nudge { parts: start, at: start_at, expanded: false }
+}
+
+fn nudge_time(a: Zoned, raw: Parts, sign: i64, diff: span.Diff) -> Nudge ! fault.Fault {
+    let start_day = date.plus(date(a), date_span(raw)?)?
+    let end_day = date.plus_days(start_day, sign)?
+    let start_at = instant_for(a.tz, datetime.from_parts(start_day, time(a)), Disambiguation.Compatible)?
+    let end_at = instant_for(a.tz, datetime.from_parts(end_day, time(a)), Disambiguation.Compatible)?
+    let day_span = timestamp.until(start_at, end_at)
+    let unit = time_step(diff.smallest, diff.increment)?
+    let rounded = duration.round(raw.time, unit, diff.mode)?
+    let beyond = duration.minus(rounded, day_span)
+    if duration_sign(beyond) != -sign {
+        let again = duration.round(beyond, unit, diff.mode)?
+        let moved = Parts { years: raw.years, months: raw.months, weeks: raw.weeks, days: raw.days + sign, time: again }
+        let at = timestamp.plus(end_at, again)?
+        return Nudge { parts: moved, at, expanded: true }
+    }
+    let kept = Parts { years: raw.years, months: raw.months, weeks: raw.weeks, days: raw.days, time: rounded }
+    let at = timestamp.plus(start_at, rounded)?
+    Nudge { parts: kept, at, expanded: false }
+}
+
+fn bubble(a: Zoned, nudge: Nudge, sign: i64, largest: span.Unit, start_rank: i64) -> Parts ! fault.Fault {
+    var parts = nudge.parts
+    let top = span.rank(largest)
+    var rank = start_rank - 1
+    for rank >= top {
+        if rank != 2 || top == 2 {
+            let end = with_unit(parts, rank, count_of(parts, rank) + sign)
+            let end_at = anchor(a, end)?
+            let overshoot = timestamp.until(end_at, nudge.at)
+            if duration_sign(overshoot) == -sign {
+                break
+            }
+            parts = end
+        }
+        rank -= 1
+    }
+    parts
+}
+
+fn round_parts(a: Zoned, b: Zoned, raw: Parts, sign: i64, diff: span.Diff) -> Parts ! fault.Fault {
+    let rank = span.rank(diff.smallest)
+    let nudge = if rank <= 3 { nudge_calendar(a, b, raw, sign, diff)? } else { nudge_time(a, raw, sign, diff)? }
+    if nudge.expanded && rank != 2 {
+        let start_rank = if rank < 3 { rank } else { 3 }
+        return bubble(a, nudge, sign, diff.largest, start_rank)?
+    }
+    nudge.parts
+}
+
+fn assemble(p: Parts) -> span.Span ! fault.Fault {
+    let clocked = span.from_duration(p.time, span.Unit.Hours)?
+    var c = span.counts(clocked)
+    c[0] = p.years
+    c[1] = p.months
+    c[2] = p.weeks
+    c[3] = p.days
+    span.from_counts(c)?
+}
+
+fn calendar_until(a: Zoned, other: Zoned, diff: span.Diff) -> span.Span ! fault.Fault {
+    let b = in_zone(other, a.tz)?
+    let sign = if timestamp.before(b.ts, a.ts) { -1 } else { 1 }
+    let raw = raw_difference(a, b, diff.largest, sign)?
+    if span.rank(diff.smallest) == 9 && diff.increment == 1 {
+        return assemble(raw)?
+    }
+    let rounded = round_parts(a, b, raw, sign, diff)?
+    assemble(rounded)?
+}
+
+pub fn until(a: Zoned, b: Zoned, diff: span.Diff) -> span.Span ! fault.Fault {
+    span.check_diff(diff)?
+    span.check_time_increment(diff.smallest, diff.increment, diff.largest)?
+    if timestamp.equal(a.ts, b.ts) {
+        return span.zero()
+    }
+    if !span.is_calendar(diff.largest) {
+        return exact_until(a, b, diff)?
+    }
+    calendar_until(a, b, diff)?
+}
+
+pub fn since(a: Zoned, b: Zoned, diff: span.Diff) -> span.Span ! fault.Fault {
+    until(b, a, diff)?
+}
+
+fn preferred_civil(z: Zoned, dt: datetime.DateTime) -> Zoned ! fault.Fault {
+    let ts = instant_preferring(z.tz, dt, z.shift)?
+    of(ts, z.tz)?
+}
+
+fn round_day(z: Zoned, increment: i64, mode: rounding.Rounding) -> Zoned ! fault.Fault {
+    if increment != 1 {
+        fail Invalid("rounding increment")
+    }
+    let first = day_start(z.tz, date(z))?
+    let last = day_end(z.tz, date(z))?
+    let elapsed = duration.abs(timestamp.until(first, z.ts))
+    let length = duration.plus(timestamp.until(first, last), duration.nanoseconds(1))
+    let class = span.half_class(elapsed, length)
+    let up = span.round_count(0, class, false, mode) > 0
+    if up {
+        let next = timestamp.plus(last, duration.nanoseconds(1))?
+        return of(next, z.tz)?
+    }
+    of(first, z.tz)?
+}
+
+pub fn round(z: Zoned, unit: span.Unit, increment: i64, mode: rounding.Rounding) -> Zoned ! fault.Fault {
+    let rank = span.rank(unit)
+    if rank < 3 {
+        fail Invalid("rounding unit {span.unit_name(unit)}")
+    }
+    if rank == 3 {
+        return round_day(z, increment, mode)?
+    }
+    let rounded = datetime.round(z.civil, unit, increment, mode)?
+    preferred_civil(z, rounded)?
+}
+
+pub fn truncate(z: Zoned, unit: span.Unit) -> Zoned ! fault.Fault {
+    round(z, unit, 1, rounding.Rounding.Trunc)?
+}

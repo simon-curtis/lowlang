@@ -11,6 +11,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "       tablegen properties <ucd directory> <output directory>")
 		fmt.Fprintln(os.Stderr, "       tablegen charset <index directory> <output directory>")
 		fmt.Fprintln(os.Stderr, "       tablegen entities <entities.json> <output directory>")
+		fmt.Fprintln(os.Stderr, "       tablegen tzdata <zoneinfo directory with tzdata.zi> <output directory>")
 		os.Exit(2)
 	}
 	if err := run(os.Args[1], os.Args[2], os.Args[3]); err != nil {
@@ -29,6 +30,8 @@ func run(command, source, output string) error {
 		return generateCharset(source, output)
 	case "entities":
 		return generateEntities(source, output)
+	case "tzdata":
+		return generateTzdata(source, output)
 	}
 	return fmt.Errorf("unknown command %q", command)
 }

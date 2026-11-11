@@ -1,0 +1,395 @@
+import std/file
+import std/os
+import std/text
+import std/time/fault
+import std/time/offset
+import std/time/timestamp
+
+pub struct Zone {
+    name: str
+    rules: *Rules
+}
+
+pub struct Info {
+    pub offset: offset.Offset
+    pub abbreviation: str
+    pub dst: bool
+}
+
+pub struct Transition {
+    pub at: timestamp.Timestamp
+    pub before: Info
+    pub after: Info
+}
+
+pub enum Candidates {
+    One(only: offset.Offset)
+    Overlap(earlier: offset.Offset, later: offset.Offset)
+    Gap(before: offset.Offset, after: offset.Offset)
+}
+
+fn transition_limit() -> i64 {
+    10000
+}
+
+fn zoneinfo_root() -> str {
+    "/usr/share/zoneinfo"
+}
+
+fn fixed_kind(o: offset.Offset) -> Kind {
+    let label = if offset.is_utc(o) { "UTC" } else { offset.to_string(o) }
+    Kind { offset: o, dst: false, abbreviation: label }
+}
+
+pub fn fixed(o: offset.Offset) -> Zone {
+    let kind = fixed_kind(o)
+    Zone { name: kind.abbreviation, rules: new(Rules { times: [], segments: [], before: kind, last: kind, footer: none }) }
+}
+
+pub fn utc() -> Zone {
+    fixed(offset.utc())
+}
+
+pub fn from_posix(rule: str, name: str) -> Zone ! fault.Fault {
+    let footer = parse_rule(rule)?
+    let kind = footer.standard
+    Zone { name, rules: new(Rules { times: [], segments: [], before: kind, last: kind, footer }) }
+}
+
+pub fn name(z: Zone) -> str {
+    z.name
+}
+
+pub fn is_fixed(z: Zone) -> bool {
+    let r = z.rules
+    if r.times.len > 0 {
+        return false
+    }
+    match r.footer {
+        some(f) => f.daylight == none
+        none => true
+    }
+}
+
+fn check_name(name: str) ! fault.Fault {
+    if name.len == 0 || name[0] == '/' || text.contains(name, "..") || text.index_byte(name, '\0') >= 0 || text.index_byte(name, '\\') >= 0 {
+        fail Invalid("zone name")
+    }
+}
+
+fn try_read(path: str) -> []u8? ! fault.Fault {
+    let data = file.read_file(path) catch {
+        NotFound => return none
+        NotDir => return none
+        IsDir => return none
+        e => fail Malformed("zone file {path}: unreadable")
+    }
+    data
+}
+
+fn find_file(name: str) -> []u8? ! fault.Fault {
+    let dir = os.env("ZONEINFO") ?? ""
+    if dir.len > 0 {
+        match try_read("{dir}/{name}")? {
+            some(data) => return data
+            none => {}
+        }
+    }
+    try_read("{zoneinfo_root()}/{name}")
+}
+
+pub fn named(name: str) -> Zone ! fault.Fault {
+    check_name(name)?
+    let data = find_file(name)? ?? return missing(name)
+    decode(name, data)
+}
+
+fn missing(name: str) -> Zone ! fault.Fault {
+    if name == "UTC" {
+        return utc()
+    }
+    fail UnknownZone(name)
+}
+
+pub fn load_from(name: str, source: fn(str) -> []u8?) -> Zone ! fault.Fault {
+    check_name(name)?
+    let data = source(name) ?? fail UnknownZone(name)
+    decode(name, data)
+}
+
+fn load_or_none(name: str) -> Zone? {
+    let z = named(name) catch {
+        e => return none
+    }
+    z
+}
+
+fn name_from_path(path: str) -> str {
+    let marker = "zoneinfo/"
+    let at = text.last_index(path, marker)
+    if at < 0 { path } else { path[at + marker.len..] }
+}
+
+fn from_path(path: str) -> Zone ! fault.Fault {
+    let data = try_read(path)? ?? fail UnknownZone(path)
+    decode(name_from_path(path), data)
+}
+
+fn from_variable(value: str) -> Zone ! fault.Fault {
+    let rule = if value.len > 0 && value[0] == ':' { value[1..] } else { value }
+    if rule.len == 0 {
+        return utc()
+    }
+    if rule[0] == '/' {
+        return from_path(rule)
+    }
+    let named = load_or_none(rule) ?? return posix_or_unknown(rule)
+    named
+}
+
+fn posix_or_unknown(rule: str) -> Zone ! fault.Fault {
+    from_posix(rule, rule) catch {
+        e => fail UnknownZone(rule)
+    }
+}
+
+fn from_localtime() -> Zone? {
+    let data = file.read_file("/etc/localtime") catch {
+        e => return none
+    }
+    let target = file.readlink("/etc/localtime") catch {
+        e => ""
+    }
+    let name = if target.len == 0 { "Local" } else { name_from_path(target) }
+    let z = decode(name, data) catch {
+        e => return none
+    }
+    z
+}
+
+fn from_timezone_file() -> Zone? {
+    let content = file.read_text("/etc/timezone") catch {
+        e => return none
+    }
+    load_or_none(text.trim(content))
+}
+
+pub fn local() -> Zone ! fault.Fault {
+    match os.env("TZ") {
+        some(value) => return from_variable(value)
+        none => {}
+    }
+    from_localtime() ?? from_timezone_file() ?? utc()
+}
+
+fn info_of(k: Kind) -> Info {
+    Info { offset: k.offset, abbreviation: k.abbreviation, dst: k.dst }
+}
+
+fn count_through(times: []i64, key: i64) -> i64 {
+    var low = 0
+    var high = times.len
+    for low < high {
+        let mid = (low + high) / 2
+        if times[mid] <= key {
+            low = mid + 1
+        } else {
+            high = mid
+        }
+    }
+    low
+}
+
+fn after_table(r: *Rules, at: i64) -> Kind {
+    match r.footer {
+        some(f) => footer_kind(f, at)
+        none => r.last
+    }
+}
+
+fn kind_at(r: *Rules, at: i64) -> Kind {
+    let n = r.times.len
+    if n == 0 {
+        return after_table(r, at)
+    }
+    if at < r.times[0] {
+        return r.before
+    }
+    let i = count_through(r.times, at) - 1
+    if i == n - 1 {
+        return after_table(r, at)
+    }
+    r.segments[i]
+}
+
+fn kind_in(r: *Rules, i: i64) -> Kind {
+    if i < 0 {
+        return r.before
+    }
+    if i == r.times.len - 1 {
+        return after_table(r, r.times[i])
+    }
+    r.segments[i]
+}
+
+fn next_flip(r: *Rules, after: i64) -> Flip? {
+    let n = r.times.len
+    var i = count_through(r.times, after)
+    for i < n {
+        let flip = Flip { at: r.times[i], before: kind_in(r, i - 1), after: kind_in(r, i) }
+        if changed(flip.before, flip.after) {
+            return flip
+        }
+        i += 1
+    }
+    let f = r.footer ?? return none
+    let floor = if n > 0 && r.times[n - 1] > after { r.times[n - 1] } else { after }
+    footer_next(f, floor)
+}
+
+fn footer_previous_flip(r: *Rules, bound: i64) -> Flip? {
+    let f = r.footer ?? return none
+    let flip = footer_previous(f, bound) ?? return none
+    if r.times.len == 0 || flip.at > r.times[r.times.len - 1] {
+        return flip
+    }
+    none
+}
+
+fn previous_flip(r: *Rules, bound: i64) -> Flip? {
+    match footer_previous_flip(r, bound) {
+        some(flip) => return flip
+        none => {}
+    }
+    var i = count_through(r.times, bound - 1) - 1
+    for i >= 0 {
+        let flip = Flip { at: r.times[i], before: kind_in(r, i - 1), after: kind_in(r, i) }
+        if changed(flip.before, flip.after) {
+            return flip
+        }
+        i -= 1
+    }
+    none
+}
+
+pub fn info_at(z: Zone, ts: timestamp.Timestamp) -> Info {
+    info_of(kind_at(z.rules, timestamp.unix_seconds(ts)))
+}
+
+pub fn offset_at(z: Zone, ts: timestamp.Timestamp) -> offset.Offset {
+    kind_at(z.rules, timestamp.unix_seconds(ts)).offset
+}
+
+pub fn is_dst_at(z: Zone, ts: timestamp.Timestamp) -> bool {
+    kind_at(z.rules, timestamp.unix_seconds(ts)).dst
+}
+
+fn transition_of(flip: Flip) -> Transition? {
+    let at = timestamp.from_unix(flip.at) catch {
+        e => return none
+    }
+    Transition { at, before: info_of(flip.before), after: info_of(flip.after) }
+}
+
+fn ceil_seconds(ts: timestamp.Timestamp) -> i64 {
+    timestamp.unix_seconds(ts) + if timestamp.subsec_nanos(ts) > 0 { 1 } else { 0 }
+}
+
+pub fn next_transition(z: Zone, ts: timestamp.Timestamp) -> Transition? {
+    let flip = next_flip(z.rules, timestamp.unix_seconds(ts)) ?? return none
+    transition_of(flip)
+}
+
+pub fn previous_transition(z: Zone, ts: timestamp.Timestamp) -> Transition? {
+    let flip = previous_flip(z.rules, ceil_seconds(ts)) ?? return none
+    transition_of(flip)
+}
+
+pub fn transitions(z: Zone, from: timestamp.Timestamp, to: timestamp.Timestamp) -> []Transition {
+    var found: []Transition = []
+    let end = ceil_seconds(to)
+    var cursor = ceil_seconds(from) - 1
+    for found.len < transition_limit() {
+        let flip = next_flip(z.rules, cursor) ?? break
+        if flip.at >= end {
+            break
+        }
+        let t = transition_of(flip) ?? break
+        push(mut found, t)
+        cursor = flip.at
+    }
+    found
+}
+
+fn window_flips(r: *Rules, low: i64, high: i64) -> []Flip {
+    var flips: []Flip = []
+    var cursor = low
+    for flips.len < 16 {
+        let flip = next_flip(r, cursor) ?? break
+        if flip.at > high {
+            break
+        }
+        push(mut flips, flip)
+        cursor = flip.at
+    }
+    flips
+}
+
+fn has_offset(found: []offset.Offset, o: offset.Offset) -> bool {
+    for candidate in found {
+        if candidate == o {
+            return true
+        }
+    }
+    false
+}
+
+fn valid_offsets(r: *Rules, local_seconds: i64, flips: []Flip) -> []offset.Offset {
+    var tried: []offset.Offset = [kind_at(r, local_seconds - 100000).offset]
+    for flip in flips {
+        if !has_offset(tried, flip.after.offset) {
+            push(mut tried, flip.after.offset)
+        }
+    }
+    var valid: []offset.Offset = []
+    for o in tried {
+        if kind_at(r, local_seconds - offset.seconds_of(o)).offset == o {
+            push(mut valid, o)
+        }
+    }
+    valid
+}
+
+fn gap_at(flips: []Flip, local_seconds: i64) -> Candidates? {
+    for flip in flips {
+        let before = secs(flip.before)
+        let after = secs(flip.after)
+        if before < after && flip.at + before <= local_seconds && local_seconds < flip.at + after {
+            return Gap(flip.before.offset, flip.after.offset)
+        }
+    }
+    none
+}
+
+fn overlap_of(valid: []offset.Offset) -> Candidates {
+    var earlier = valid[0]
+    var later = valid[0]
+    for o in valid {
+        earlier = offset.max(earlier, o)
+        later = offset.min(later, o)
+    }
+    Overlap(earlier, later)
+}
+
+pub fn candidates(z: Zone, local_seconds: i64) -> Candidates {
+    let r = z.rules
+    let flips = window_flips(r, local_seconds - 100000, local_seconds + 100000)
+    let valid = valid_offsets(r, local_seconds, flips)
+    if valid.len == 1 {
+        return One(valid[0])
+    }
+    if valid.len > 1 {
+        return overlap_of(valid)
+    }
+    gap_at(flips, local_seconds) ?? One(kind_at(r, local_seconds).offset)
+}
