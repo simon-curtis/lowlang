@@ -2,10 +2,10 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { Marked } from "marked";
 import { escape, low, words } from "./highlight.mjs";
 import { Program } from "./program.mjs";
+import { layout } from "./layout.mjs";
 
 const repository = new URL("../", import.meta.url);
 const output = new URL("docs/", import.meta.url);
-const origin = "https://low.simoncurtis.dev";
 const hidden = /^<!-- prelude ?(\S*)\n([\s\S]*?)\n?-->/;
 
 function slug(text) {
@@ -69,61 +69,9 @@ function document(page, pages) {
         const current = entry === page ? ' class="font-bold underline underline-offset-4" aria-current="page"' : ' class="hover:underline hover:underline-offset-4"';
         return `<li><a${current} href="${entry.file}">${escape(entry.title)}</a></li>`;
     });
+    const sidebar = `<ul class="flex flex-wrap gap-x-5 gap-y-2 lg:block lg:space-y-2">\n${items.join("\n")}\n</ul>`;
     const title = page.file === "index.html" ? "Low documentation" : `${page.title}: Low documentation`;
-    const description = escape(page.description);
-    return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escape(title)}</title>
-<meta name="description" content="${description}">
-<meta property="og:type" content="article">
-<meta property="og:title" content="${escape(title)}">
-<meta property="og:description" content="${description}">
-<meta property="og:url" content="${origin}/docs/${page.file}">
-<meta property="og:image" content="${origin}/og-image.png">
-<meta name="twitter:card" content="summary_large_image">
-<link rel="canonical" href="${origin}/docs/${page.file}">
-<meta name="theme-color" content="#f5f5f3">
-<link rel="icon" href="../favicon.ico" sizes="48x48">
-<link rel="icon" href="../icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="../apple-touch-icon.png">
-<link rel="manifest" href="../site.webmanifest">
-<link rel="preload" href="../fonts/inter.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="preload" href="../fonts/jetbrains-mono.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="../style.css">
-</head>
-<body>
-<a class="skip" href="#main">Skip to content</a>
-<header class="absolute inset-x-0 top-0 z-10">
-<div class="wrap flex h-16 items-center justify-between">
-<a class="flex items-center gap-2.5 text-lg font-bold" href="../index.html"><span class="mark size-5" aria-hidden="true"></span>Low</a>
-<nav class="flex gap-3 text-sm font-semibold sm:gap-8">
-<a class="hover:underline hover:underline-offset-8" href="../index.html">Overview</a>
-<a class="hover:underline hover:underline-offset-8" href="../reference.html">Reference</a>
-<a class="underline underline-offset-8" href="index.html">Docs</a>
-<a class="hover:underline hover:underline-offset-8" href="https://github.com/simon-curtis/lowlang">GitHub</a>
-</nav>
-</div>
-</header>
-
-<div class="wrap grid grid-cols-[minmax(0,1fr)] gap-x-16 gap-y-10 pt-28 pb-24 lg:grid-cols-[13rem_minmax(0,1fr)]">
-<nav class="lg:sticky lg:top-8 lg:self-start" aria-label="Documentation">
-<ul class="flex flex-wrap gap-x-5 gap-y-2 lg:block lg:space-y-2">
-${items.join("\n")}
-</ul>
-</nav>
-<main class="prose" id="main">
-<h1>${escape(page.title)}</h1>
-${page.body}</main>
-</div>
-<script src="../lenis.js" defer></script>
-<script src="../scroll.js" defer></script>
-<script src="../hover.js" defer></script>
-</body>
-</html>
-`;
+    return layout({ path: `docs/${page.file}`, heading: page.title, title, description: page.description, current: "Docs", sidebar, body: page.body });
 }
 
 async function read(path) {

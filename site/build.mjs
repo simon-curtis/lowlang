@@ -1,4 +1,5 @@
 import { docs } from "./docs.mjs";
+import { packages } from "./packages.mjs";
 import { Session } from "./lsp.mjs";
 import { snippets } from "./snippets.mjs";
 
@@ -10,6 +11,8 @@ try {
     for (const snippet of unchecked) {
         console.warn(`unchecked: ${snippet}`);
     }
+    const modules = await packages(session.binary);
+    console.log(`packages: ${modules} modules`);
     const blocks = await snippets(session);
     console.log(`snippets: ${blocks}`);
 } catch (error) {

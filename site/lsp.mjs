@@ -14,8 +14,9 @@ function frame(message) {
     return `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
 }
 
-function unfence(value) {
-    return value.replace(/^```\w*\n/, "").replace(/\n```$/, "");
+function split(value) {
+    const [, code = value, doc = ""] = /^```\w*\n([\s\S]*?)\n```(?:\n\n([\s\S]*))?$/.exec(value) ?? [];
+    return { code, doc };
 }
 
 export class Session {
@@ -28,11 +29,14 @@ export class Session {
     #next = 1;
     #files = 0;
 
+    get binary() {
+        return join(this.#directory, "low");
+    }
+
     async start() {
         this.#directory = await mkdtemp(join(tmpdir(), "low-site-"));
-        const binary = join(this.#directory, "low");
-        await run("go", ["build", "-o", binary, "./cmd/low"], { cwd: repository });
-        this.#process = spawn(binary, ["lsp"], { cwd: this.#directory, stdio: ["pipe", "pipe", "ignore"] });
+        await run("go", ["build", "-o", this.binary, "./cmd/low"], { cwd: repository });
+        this.#process = spawn(this.binary, ["lsp"], { cwd: this.#directory, stdio: ["pipe", "pipe", "ignore"] });
         this.#process.stdout.on("data", (chunk) => this.#receive(chunk));
         await this.#request("initialize", { processId: process.pid, rootUri: pathToFileURL(this.#directory).href, capabilities: {} });
         this.#notify("initialized", {});
@@ -68,7 +72,7 @@ export class Session {
             const position = program.position(offset);
             const hover = await this.#request("textDocument/hover", { textDocument: { uri }, position });
             if (hover?.contents?.value) {
-                hovers.set(offset, unfence(hover.contents.value));
+                hovers.set(offset, split(hover.contents.value));
             }
             const locations = await this.#request("textDocument/references", { textDocument: { uri }, position, context: { includeDeclaration: true } });
             const group = (locations ?? []).filter((location) => location.uri === uri).map((location) => program.offset(location.range.start)).filter((found) => found !== undefined);

@@ -100,9 +100,10 @@ function classify(tokens, index, imported) {
     return "";
 }
 
-function wrap(text, style, hover = "", group) {
+function wrap(text, style, hover, group) {
     const name = style ? ` class="${style}"` : "";
-    const detail = hover ? ` data-hover="${escape(low(hover))}"` : "";
+    const tip = hover ? `${low(hover.code)}${hover.doc ? `<span class="doc">${escape(hover.doc)}</span>` : ""}` : "";
+    const detail = tip ? ` data-hover="${escape(tip)}"` : "";
     const reference = group === undefined ? "" : ` data-ref="${group}"`;
     return name || detail || reference ? `<span${name}${detail}${reference}>${text}</span>` : text;
 }
@@ -130,7 +131,7 @@ function paint(token, index, tokens, imported, facts) {
         return wrap(text, "k");
     }
     const hover = facts.hovers.get(token.offset);
-    const useful = hover && hover !== token.text ? hover : "";
+    const useful = hover && hover.code !== token.text ? hover : undefined;
     return wrap(text, style, useful, facts.references.get(token.offset));
 }
 
