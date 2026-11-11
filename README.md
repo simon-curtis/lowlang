@@ -58,7 +58,7 @@ Each `bench/<name>/` directory holds one program as `main.low`, `main.go` and `m
 
 ## Website
 
-`site/` is a static site styled with Tailwind. `npm run build` builds the compiler, renders `docs/design.md` and `editors/README.md` into `site/docs/`, highlights every Low snippet with hover text from `low lsp`, writes `style.css` from `tailwind.css` and copies the Lenis scroll library to `lenis.js`. The output is committed, so the directory serves as it is.
+`site/` is a static site styled with Tailwind. `npm run build` builds the compiler, renders `docs/design.md` and `editors/README.md` into `site/docs/`, highlights every Low snippet with hover text from `low lsp`, writes `style.css` from `tailwind.css` and copies the Lenis scroll library to `lenis.js`. The output is committed, so the directory serves as it is. The `site` workflow rebuilds it on every push to `main` that touches the site, the docs or the compiler, and deploys it to Cloudflare Pages at https://low.simoncurtis.dev.
 
 The LSP checks each snippet as a program: declarations stay at the top level and loose statements go inside `fn main()`. HTML comments directly above a block in a docs file add context that readers do not see. `<!-- prelude` holds Low code placed before the snippet. If the comment's last line opens a function, such as `fn main() ! ParseError {`, that line wraps the statements instead of `fn main()`. `<!-- prelude path/file.low` writes a file beside the snippet, for imported modules or embedded assets. The build lists each snippet that still fails to check.
 
