@@ -4,34 +4,59 @@ import std/sync
 import std/time/clock
 import std/time/duration
 
+/// The error `acquire`, `acquire_until` and `with` return.
 pub enum Error {
+    /// The pool has been shut down, including while the call was waiting for a connection.
     Closed
+    /// No connection became available within the wait time.
     Timeout
+    /// The cancel token was cancelled before or while the call waited for a connection.
     Cancelled
+    /// The opener failed to make a connection, or the callback of `with` returned an error. `cause` is the underlying `sql.Error`.
     Sql(cause: sql.Error)
 }
 
+/// How a pool sizes itself and how it keeps its connections healthy. A duration of zero turns the matching limit off.
 pub struct Config {
+    /// The most connections the pool keeps open at once, idle and leased together. Defaults to `4`; a value below `1` becomes `1`.
     pub max: i64 = 4
+    /// The most connections kept idle for reuse. Defaults to `-1`, and a negative value or one above `max` means `max`. A connection returned while this many are idle is closed.
     pub max_idle: i64 = -1
+    /// How long a connection may sit idle before the pool closes it instead of handing it out. Defaults to zero, which keeps idle connections indefinitely.
     pub idle_timeout: duration.Duration = duration.zero()
+    /// How long after it was opened a connection may be reused. An older connection is closed when it is returned or found idle. Defaults to zero, which has no limit.
     pub max_lifetime: duration.Duration = duration.zero()
+    /// How long `acquire` waits for a connection when all of them are in use before it fails with `Error.Timeout`. Defaults to zero, which waits until a connection or the cancel token ends the wait.
     pub wait_timeout: duration.Duration = duration.zero()
+    /// How long a connection must have been idle before `ping` checks it as it leaves the pool. Defaults to zero, which never pings.
     pub ping_after: duration.Duration = duration.zero()
+    /// Checks an idle connection that has passed `ping_after`; a connection for which it fails is closed and replaced by another. Defaults to running `SELECT 1`.
     pub ping: fn(sql.ConnectionHandle) ! sql.Error = default_ping
+    /// The source of the monotonic time behind the lifetime, idle and ping limits. Defaults to the system clock.
     pub clock: clock.Clock = clock.system()
 }
 
+/// A snapshot of the counters and sizes of a pool.
 pub struct Stats {
+    /// The connections open, idle and leased together, counting those being opened.
     pub open: i64
+    /// The idle connections kept in the pool.
     pub idle: i64
+    /// The connections currently leased.
     pub in_use: i64
+    /// The calls waiting for a connection.
     pub waiting: i64
+    /// The leases handed out in total.
     pub acquires: i64
+    /// The calls that had to queue because every connection was in use.
     pub waits: i64
+    /// The waits that ended in `Error.Timeout`.
     pub timeouts: i64
+    /// The calls that ended in `Error.Cancelled`.
     pub cancelled: i64
+    /// The connections the pool closed because they were broken, past their lifetime or idle for too long.
     pub discarded: i64
+    /// The connections the opener has made successfully in total.
     pub opened: i64
 }
 
@@ -77,6 +102,9 @@ struct State {
     opened: i64
 }
 
+/// A pool of connections made on demand by an opener.
+///
+/// A `Pool` is a copyable handle; copies share one pool. It opens a connection when none is idle and `max` is not reached, and otherwise queues the caller in first-in first-out order. It is safe to use from several green threads.
 pub struct Pool {
     state: *State
 }
@@ -85,12 +113,16 @@ fn default_ping(h: sql.ConnectionHandle) ! sql.Error {
     let rows = h.query("SELECT 1", [])?
 }
 
+/// Returns the copyable view of an owned connection and turns the connection's own `close` into a no-op, so that dropping `c` no longer closes it. An opener uses it to give a connection to the pool.
 pub fn detach(mut c: sql.Connection) -> sql.ConnectionHandle {
     let h = sql.handle(c)
     c.close = fn() {}
     h
 }
 
+/// Returns a pool that calls `opener` to make connections as callers need them. No connection is opened until the first `acquire`.
+///
+/// The `config` is normalized: `max` below `1` becomes `1` and `max_idle` below `0` or above `max` becomes `max`.
 pub fn open(opener: fn() -> sql.Connection ! sql.Error, config: Config) -> Pool {
     var chosen = config
     if chosen.max < 1 {
@@ -120,6 +152,7 @@ pub fn open(opener: fn() -> sql.Connection ! sql.Error, config: Config) -> Pool 
     Pool { state: new(state) }
 }
 
+/// Returns a snapshot of the pool's sizes and counters.
 pub fn stats(p: Pool) -> Stats {
     let s = p.state
     sync.lock(s.guard)
@@ -139,10 +172,16 @@ pub fn stats(p: Pool) -> Stats {
     out
 }
 
+/// Leases a connection, waiting up to `Config.wait_timeout` when every connection is in use. It is `acquire_until` with a token that is never cancelled.
 pub fn acquire(p: Pool) -> Lease ! Error {
     acquire_until(p, cancel.token(), p.state.config.wait_timeout)?
 }
 
+/// Leases a connection, waiting at most `wait` for one; a zero `wait` waits without a time limit.
+///
+/// An idle connection is reused first, failing that a new one is opened while fewer than `max` are open, and failing that the call queues in first-in first-out order. Idle connections past their limits are closed first, and one idle longer than `ping_after` is pinged and replaced when the ping fails.
+///
+/// Returns `Error.Closed` when the pool is shut down, `Error.Cancelled` when `t` is cancelled, `Error.Timeout` when `wait` runs out and `Error.Sql` when the opener fails. Dropping the returned `Lease` returns the connection.
 pub fn acquire_until(p: Pool, t: *cancel.Token, wait: duration.Duration) -> Lease ! Error {
     let s = p.state
     let slot = checkout(s, t, wait)?
@@ -152,6 +191,9 @@ pub fn acquire_until(p: Pool, t: *cancel.Token, wait: duration.Duration) -> Leas
     lease_of(s, slot)
 }
 
+/// Leases a connection, passes it to `work` and returns it to the pool when `work` finishes.
+///
+/// Fails like `acquire`; an error from `work` is returned as `Error.Sql`.
 pub fn with(p: Pool, work: fn(sql.ConnectionHandle) ! sql.Error) ! Error {
     using lease = acquire(p)?
     work(conn(lease)) catch {
@@ -159,6 +201,7 @@ pub fn with(p: Pool, work: fn(sql.ConnectionHandle) ! sql.Error) ! Error {
     }
 }
 
+/// Closes the idle connections that are past `max_lifetime` or `idle_timeout` and returns how many it closed. Leased connections are not touched.
 pub fn prune(p: Pool) -> i64 {
     let s = p.state
     var dead: []sql.ConnectionHandle = []
@@ -169,6 +212,9 @@ pub fn prune(p: Pool) -> i64 {
     dead.len
 }
 
+/// Shuts the pool down: closes every idle connection, fails the queued callers with `Error.Closed` and refuses later calls to `acquire`.
+///
+/// Blocks the calling green thread until every outstanding lease is returned; each connection returned after the shutdown is closed.
 pub fn shutdown(p: Pool) {
     let s = p.state
     var dead: []sql.ConnectionHandle = []
