@@ -231,6 +231,12 @@ rt_mmap:
 	jz rt_panic_oom
 	ret
 
+rt_mmap_sparse:
+	jmp rt_mmap
+
+rt_heap_release:
+	ret
+
 rt_mmap_stack:
 	OS_ENTER
 	xor ecx, ecx
@@ -280,6 +286,15 @@ rt_heap_commit:
 	call rt_commit
 	mov rcx, r12
 	sub rcx, rbx
+	shr rcx, 6
+	add rcx, [rip+rt_mark_bits]
+	mov rdx, r13
+	sub rdx, r12
+	shr rdx, 6
+	add rdx, 8
+	call rt_commit
+	mov rcx, r12
+	sub rcx, rbx
 	shr rcx, 12
 	add rcx, [rip+rt_summary1]
 	mov rdx, r13
@@ -294,6 +309,15 @@ rt_heap_commit:
 	mov rdx, r13
 	sub rdx, r12
 	shr rdx, 18
+	add rdx, 8
+	call rt_commit
+	mov rcx, r12
+	sub rcx, rbx
+	shr rcx, 15
+	add rcx, [rip+rt_dirty]
+	mov rdx, r13
+	sub rdx, r12
+	shr rdx, 15
 	add rdx, 8
 	call rt_commit
 	mov rcx, r12
@@ -659,6 +683,29 @@ rt_msg_syscall:
 rt_panic_syscall:
 	lea rdi, [rip+rt_msg_syscall]
 	jmp rt_panic
+
+	.globl rt_sysblock
+rt_sysblock:
+	jmp rt_panic_syscall
+
+rt_seed_init:
+	push rbp
+	mov rbp, rsp
+	and rsp, -16
+	sub rsp, 48
+	lea rcx, [rip+rt_hash_seed]
+	mov edx, 16
+	WIN ProcessPrng
+	test eax, eax
+	jnz 9f
+	call rt_seed_fallback
+	mov [rip+rt_hash_seed], rax
+	mov [rip+rt_hash_seed+8], rdx
+9:
+	or qword ptr [rip+rt_hash_seed+8], 1
+	mov rsp, rbp
+	pop rbp
+	ret
 
 rt_vdso_init:
 	ret

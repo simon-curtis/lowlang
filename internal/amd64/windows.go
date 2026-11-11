@@ -25,6 +25,7 @@ const (
 	cRuntimeDLL  = "msvcrt.dll"
 	kernelDLL    = "kernel32.dll"
 	synchDLL     = "api-ms-win-core-synch-l1-2-0.dll"
+	randomDLL    = "bcryptprimitives.dll"
 	importPrefix = "__imp_"
 )
 
@@ -45,7 +46,8 @@ var runtimeImports = map[string][]string{
 		"RegisterWaitForSingleObject", "SetEvent", "Sleep", "SwitchToThread", "TlsAlloc",
 		"UnregisterWait", "VirtualAlloc", "WaitForSingleObject", "WriteFile",
 	},
-	synchDLL: {"WaitOnAddress", "WakeByAddressAll", "WakeByAddressSingle"},
+	synchDLL:  {"WaitOnAddress", "WakeByAddressAll", "WakeByAddressSingle"},
+	randomDLL: {"ProcessPrng"},
 }
 
 func importSymbol(symbol string) string {
@@ -82,6 +84,17 @@ func (g *Generator) cRegisterSlots() int {
 		return len(winArgRegs)
 	}
 	return 0
+}
+
+var winPreservedVectors = []string{
+	"xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
+}
+
+func (g *Generator) cPreservedVectors() []string {
+	if g.os != target.Windows {
+		return nil
+	}
+	return winPreservedVectors
 }
 
 func (g *Generator) thunkSaved() []string {
@@ -161,7 +174,7 @@ func (g *Generator) win64Args(fr *frame, plan *ir.CPlan, args []*vreg, moves []p
 			continue
 		}
 		if plan.Args[i] == ir.Vector {
-			g.toXmm(fmt.Sprintf("xmm%d", slot), src)
+			moves = append(moves, fr.vectorMove(fmt.Sprintf("xmm%d", slot), a))
 		}
 		moves = append(moves, pmove{dst: winArgRegs[slot], src: src})
 	}

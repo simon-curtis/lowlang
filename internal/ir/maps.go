@@ -17,6 +17,13 @@ func (b *builder) withKey(table *Value, key ast.Expr, m *types.Type, rest ...*Va
 }
 
 func (b *builder) mapLit(e *ast.MapLit) []*Value {
+	if words, ok := b.hoistedMap(e); ok {
+		return words
+	}
+	return b.filledMap(e)
+}
+
+func (b *builder) filledMap(e *ast.MapLit) []*Value {
 	m := e.Type
 	table := b.mapCall("__map_new", m)[0]
 	for i, k := range e.Keys {

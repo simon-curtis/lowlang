@@ -22,6 +22,7 @@ const usage = `usage:
   low run <file.low>
   low asm <file.low> [-target linux/amd64|windows/amd64]
   low ir <file.low> [-target linux/amd64|windows/amd64]
+  low lint <file.low>
   low dev <file.low>
   low lsp`
 
@@ -70,6 +71,11 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		return compileCommand(ctx, cmd, path, opts)
+	case "lint":
+		if len(args) != 2 {
+			return usageError{}
+		}
+		return lintCommand(path)
 	case "run":
 		if len(args) != 2 {
 			return usageError{}
@@ -117,11 +123,30 @@ func parseOptions(args []string, output bool) (options, error) {
 	return opts, nil
 }
 
+func lintCommand(path string) error {
+	unit, err := compiler.Check(path, os.ReadFile)
+	if err != nil {
+		return err
+	}
+	report(unit)
+	if len(unit.Warnings) > 0 {
+		return exitError{code: 1}
+	}
+	return nil
+}
+
+func report(unit *compiler.Unit) {
+	for _, w := range unit.Warnings {
+		fmt.Fprintln(os.Stderr, w)
+	}
+}
+
 func compileCommand(ctx context.Context, cmd, path string, opts options) error {
 	unit, err := compiler.Analyse(path, opts.platform)
 	if err != nil {
 		return err
 	}
+	report(unit)
 	switch cmd {
 	case "ir":
 		for _, f := range unit.Program.Funcs {
@@ -157,6 +182,7 @@ func build(ctx context.Context, path, output string, platform target.OS) error {
 	if err != nil {
 		return err
 	}
+	report(unit)
 	return link(ctx, unit, output)
 }
 

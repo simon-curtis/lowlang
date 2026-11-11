@@ -69,7 +69,7 @@ func (g *Generator) sysvArgs(fr *frame, plan *ir.CPlan, args []*vreg, moves []pm
 		src := fr.loc(a)
 		switch plan.Args[i] {
 		case ir.Vector:
-			g.toXmm(fmt.Sprintf("xmm%d", vectors), src)
+			moves = append(moves, fr.vectorMove(fmt.Sprintf("xmm%d", vectors), a))
 			vectors++
 		case ir.Stack:
 			g.stackArg(stack, src)
@@ -83,11 +83,7 @@ func (g *Generator) sysvArgs(fr *frame, plan *ir.CPlan, args []*vreg, moves []pm
 }
 
 func (g *Generator) stackArg(slot int, src string) {
-	if isMem(src) {
-		g.move("r10", src)
-		src = "r10"
-	}
-	g.emit("mov qword ptr [rsp+%d], %s", 8*slot, src)
+	g.move(fmt.Sprintf("qword ptr [rsp+%d]", 8*slot), src)
 }
 
 func (g *Generator) leaveC() {
@@ -148,6 +144,7 @@ func (g *Generator) trampolines(symbols []string) {
 func (g *Generator) thunk(f *ir.Func) {
 	g.fn = fmt.Sprintf("cb_%s", mangle(f.Name))
 	g.labels = 0
+	g.align(functionAlignment)
 	fmt.Fprintf(&g.text, "\t.globl %s\n%s:\n", g.fn, g.fn)
 	saved := g.thunkSaved()
 	g.emit("push rbp")
@@ -155,8 +152,9 @@ func (g *Generator) thunk(f *ir.Func) {
 		g.emit("push %s", r)
 	}
 	ints, vectors := g.cIntRegs(), g.cVectorRegs()
+	registerBytes := (8*(len(ints)+vectors) + 15) &^ 15
 	g.emit("mov r13, rsp")
-	g.emit("sub rsp, %d", 8*(len(ints)+vectors))
+	g.emit("sub rsp, %d", registerBytes+16*len(g.cPreservedVectors()))
 	g.emit("and rsp, -16")
 	g.emit("mov r12, rsp")
 	for i, r := range ints {
@@ -164,6 +162,9 @@ func (g *Generator) thunk(f *ir.Func) {
 	}
 	for i := range vectors {
 		g.emit("movq qword ptr [r12+%d], xmm%d", 8*(len(ints)+i), i)
+	}
+	for i, r := range g.cPreservedVectors() {
+		g.emit("movaps xmmword ptr [r12+%d], %s", registerBytes+16*i, r)
 	}
 	g.tls("rbx", tlsM)
 	g.emit("mov edi, %d", inC)
@@ -205,6 +206,9 @@ func (g *Generator) thunk(f *ir.Func) {
 		g.tebToOS("r15", "rbx")
 	}
 	g.emit("mov rsp, r12")
+	for i, r := range g.cPreservedVectors() {
+		g.emit("movaps %s, xmmword ptr [r12+%d]", r, registerBytes+16*i)
+	}
 	g.emit("mov [rbx+%d], r14", mG0SP)
 	g.emit("mov ecx, %d", inC)
 	g.emit("xchg [rbx], rcx")
@@ -280,10 +284,23 @@ func (g *Generator) cResult(fr *frame, in *instr, plan *ir.CPlan, k int) {
 		g.move(dst, []string{"rax", "rdx"}[ints])
 		return
 	}
-	reg := dst
-	if !isReg(dst) {
-		reg = "r10"
+	source := fmt.Sprintf("xmm%d", vectors)
+	if plan.Ret == types.F32 {
+		g.moveSingle(dst, source)
+		return
 	}
-	g.emit("movq %s, xmm%d", reg, vectors)
-	g.move(dst, reg)
+	g.move(dst, source)
+}
+
+func (g *Generator) moveSingle(dst, source string) {
+	switch {
+	case isXmm(dst):
+		g.emit("xorps %s, %s", dst, dst)
+		g.emit("movss %s, %s", dst, source)
+	case isReg(dst):
+		g.emit("movd %s, %s", narrow[dst][0], source)
+	default:
+		g.emit("movd r10d, %s", source)
+		g.move(dst, "r10")
+	}
 }

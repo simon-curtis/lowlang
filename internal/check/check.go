@@ -596,6 +596,9 @@ func (c *Checker) function(fn *ast.Func) {
 	c.abstract = fn.TypeParams != nil
 	c.scopes = nil
 	c.body(fn)
+	if !c.abstract {
+		c.markReadOnly(fn)
+	}
 }
 
 func (c *Checker) body(fn *ast.Func) {
@@ -954,6 +957,7 @@ func (c *Checker) place(e ast.Expr, pos lexer.Pos, action, invalid string) (*ast
 	}
 	if place.Local != nil {
 		c.mutable(place.Local, pos, action)
+		place.Local.Assigned = true
 	}
 	return place, t
 }
@@ -965,10 +969,15 @@ func (c *Checker) ref(r *ast.Ref, want *types.Type) {
 }
 
 func (c *Checker) borrow(r *ast.Ref) *types.Type {
-	place, t := c.place(r.X, r.Pos, "pass %s as mut", "mut argument must be a variable, a field, an element or a dereferenced pointer")
-	if place.Local != nil && !place.Local.Ref {
-		place.Local.Addressed = true
+	t := c.borrowInPlace(r)
+	if local := r.Place.Local; local != nil && !local.Ref {
+		local.Addressed = true
 	}
+	return t
+}
+
+func (c *Checker) borrowInPlace(r *ast.Ref) *types.Type {
+	place, t := c.place(r.X, r.Pos, "pass %s as mut", "mut argument must be a variable, a field, an element or a dereferenced pointer")
 	r.Place = place
 	r.Type = t
 	return t
@@ -1668,7 +1677,7 @@ var builtins = map[string]bool{
 	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
 	"delete": true, "embed": true, "__str_raw": true,
 	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
-	"__bits": true, "__str_view": true, "__extend": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true, "__ctz": true, "__clock_nanos": true, "__argc": true, "__argv": true, "__envv": true,
+	"__bits": true, "__str_view": true, "__extend": true, "__extend_by": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true, "__ctz": true, "__clock_nanos": true, "__hash_seed": true, "__argc": true, "__argv": true, "__envv": true,
 	"__spawn": true, "__current": true, "__park": true, "__ready": true, "__lock": true, "__unlock": true, "__cas": true, "__panic": true,
 	"__context": true, "__set_context": true, "__has_context": true,
 }
@@ -1819,7 +1828,7 @@ func (c *Checker) firstMut(fn ast.Expr) bool {
 		if c.find(fn.Name) != nil {
 			return false
 		}
-		if fn.Name == "push" || fn.Name == "delete" {
+		if fn.Name == "push" || fn.Name == "delete" || c.sliceShrink(fn.Name) {
 			return true
 		}
 		target, ok := c.local().funcs[fn.Name]
@@ -1887,6 +1896,10 @@ func (c *Checker) print(e *ast.Call) {
 
 func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 	if c.concurrencyBuiltin(e, name) {
+		return true
+	}
+	if c.sliceShrink(name) {
+		c.shrink(e, name)
 		return true
 	}
 	switch name {
@@ -1983,6 +1996,13 @@ func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 		c.single(e, name)
 		c.expectType(e.Args[0], types.I64)
 		e.Builtin, e.Type = name, types.I64
+	case "__hash_seed":
+		c.single(e, name)
+		if lit, ok := e.Args[0].(*ast.IntLit); !ok || lit.Value < 0 || lit.Value > 1 {
+			c.fail(e.Pos, "__hash_seed takes the literal 0 or 1")
+		}
+		c.expectType(e.Args[0], types.I64)
+		e.Builtin, e.Type = name, types.U64
 	case "__argc":
 		if len(e.Args) != 0 {
 			c.fail(e.Pos, "__argc takes no arguments")
@@ -2024,11 +2044,21 @@ func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 			c.fail(e.Pos, "__extend takes 2 arguments")
 		}
 		r, ok := e.Args[0].(*ast.Ref)
-		if !ok || c.borrow(r) != c.slice(types.U8) {
+		if !ok || c.borrowInPlace(r) != c.slice(types.U8) {
 			c.fail(e.Pos, "__extend needs a mut []u8")
 		}
 		c.expectType(e.Args[1], types.Str)
 		e.Builtin, e.Type = name, types.Void
+	case "__extend_by":
+		if len(e.Args) != 2 {
+			c.fail(e.Pos, "__extend_by takes 2 arguments")
+		}
+		r, ok := e.Args[0].(*ast.Ref)
+		if !ok || c.borrowInPlace(r) != c.slice(types.U8) {
+			c.fail(e.Pos, "__extend_by needs a mut []u8")
+		}
+		c.expectType(e.Args[1], types.I64)
+		e.Builtin, e.Type = name, types.I64
 	case "__str_view":
 		c.single(e, name)
 		c.expectType(e.Args[0], c.slice(types.U8))
@@ -2148,7 +2178,7 @@ func (c *Checker) deleteEntry(e *ast.Call) {
 	if !ok {
 		c.fail(e.Args[0].Position(), "delete needs a mut map; write delete(mut m, key)")
 	}
-	t := c.borrow(r)
+	t := c.borrowInPlace(r)
 	if t.Kind != types.MapKind {
 		c.fail(r.Pos, "delete needs a map, found %s", t)
 	}
@@ -2179,13 +2209,46 @@ func (c *Checker) push(e *ast.Call) {
 	if !ok {
 		c.fail(e.Args[0].Position(), "push needs a mut slice; write push(mut s, value)")
 	}
-	t := c.borrow(r)
+	t := c.borrowInPlace(r)
 	if t.Kind != types.SliceKind {
 		c.fail(r.Pos, "push needs a slice, found %s", t)
 	}
 	c.expectType(e.Args[1], t.Elem)
 	e.Builtin = "push"
 	e.Type = types.Void
+}
+
+func (c *Checker) sliceShrink(name string) bool {
+	if name != "pop" && name != "truncate" {
+		return false
+	}
+	scope := c.local()
+	return scope.funcs[name] == nil && scope.generics[name] == nil && c.find(name) == nil
+}
+
+func (c *Checker) shrink(e *ast.Call, name string) {
+	want := 1
+	if name == "truncate" {
+		want = 2
+	}
+	if len(e.Args) != want {
+		c.fail(e.Pos, "%s takes %d arguments, found %d", name, want, len(e.Args))
+	}
+	r, ok := e.Args[0].(*ast.Ref)
+	if !ok {
+		c.fail(e.Args[0].Position(), "%s needs a mut slice; write %s(mut s)", name, name)
+	}
+	t := c.borrowInPlace(r)
+	if t.Kind != types.SliceKind {
+		c.fail(r.Pos, "%s needs a slice, found %s", name, t)
+	}
+	e.Builtin = name
+	e.Type = types.Void
+	if name == "pop" {
+		e.Type = c.optional(t.Elem)
+		return
+	}
+	c.integer(e.Args[1])
 }
 
 func (c *Checker) syscall(e *ast.Call) {
@@ -2208,9 +2271,12 @@ func (c *Checker) single(e *ast.Call, name string) {
 
 func (c *Checker) math(e *ast.Call, name string, want *types.Type) {
 	c.single(e, name)
-	arg := types.F64
-	if want != nil && want.Float() {
+	var arg *types.Type
+	switch {
+	case want != nil && want.Float():
 		arg = want
+	case numericLiterals(e.Args[0]):
+		arg = types.F64
 	}
 	t := c.plain(e.Args[0], arg)
 	if !t.Float() {
@@ -2368,6 +2434,22 @@ func bareNumber(e ast.Expr) bool {
 	return false
 }
 
+func numericLiterals(e ast.Expr) bool {
+	switch e := e.(type) {
+	case *ast.IntLit, *ast.FloatLit:
+		return true
+	case *ast.Unary:
+		return numericLiterals(e.X)
+	case *ast.Binary:
+		return numericLiterals(e.X) && numericLiterals(e.Y)
+	case *ast.Block:
+		return len(e.Stmts) == 0 && e.Tail != nil && numericLiterals(e.Tail)
+	case *ast.If:
+		return e.Else != nil && numericLiterals(e.Then) && numericLiterals(e.Else)
+	}
+	return false
+}
+
 func produced(e ast.Expr) ast.Expr {
 	if block, ok := e.(*ast.Block); ok && block.Tail != nil {
 		return produced(block.Tail)
@@ -2445,7 +2527,7 @@ func (c *Checker) pattern(p *ast.Pattern, enum *types.Type) {
 		return
 	}
 	if p.Name != "_" && enum.Kind != types.EnumKind {
-		c.fail(p.Pos, "an arm matching %s starts with an operator, such as == or <", enum)
+		c.fail(p.Pos, "an arm matching %s starts with a literal or an operator, such as 4, == or <", enum)
 	}
 	if p.Name == "_" {
 		if len(p.Bindings) > 0 {

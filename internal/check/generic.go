@@ -31,7 +31,7 @@ type inference struct {
 	bound  map[*types.Type]*types.Type
 }
 
-var mapFuncs = []string{"__map_new", "__map_len", "__map_get", "__map_set", "__map_delete", "__map_next", "__map_key", "__map_value"}
+var mapFuncs = []string{"__map_new", "__map_clone", "__map_len", "__map_get", "__map_set", "__map_delete", "__map_next", "__map_key", "__map_value"}
 
 func plural(n int, noun string) string {
 	if n == 1 {

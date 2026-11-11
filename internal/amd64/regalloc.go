@@ -1,7 +1,9 @@
 package amd64
 
 import (
+	"math"
 	"slices"
+	"sort"
 
 	"lowlang/internal/ir"
 )
@@ -9,7 +11,69 @@ import (
 var (
 	callerSaved = []string{"rcx", "rsi", "rdi", "r8", "r9"}
 	calleeSaved = []string{"rbx", "r12", "r13", "r14", "r15"}
+	floatRegs   = []string{
+		"xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8",
+		"xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
+	}
+	integerRegs = slices.Concat(callerSaved, calleeSaved)
 )
+
+type segment struct {
+	start int
+	end   int
+}
+
+type step struct {
+	pos  int
+	uses []*vreg
+	defs []*vreg
+}
+
+func (r *vreg) fixed() bool {
+	return r.konst != nil || r.pool != nil || r.frame != nil || r.mem != nil || r.pinned != ""
+}
+
+func (r *vreg) first() int {
+	return r.ranges[0].start
+}
+
+func (r *vreg) last() int {
+	return r.ranges[len(r.ranges)-1].end
+}
+
+func (r *vreg) addRange(start, end int) {
+	if n := len(r.ranges); n > 0 && r.ranges[n-1].start <= end {
+		tail := &r.ranges[n-1]
+		tail.start = min(tail.start, start)
+		tail.end = max(tail.end, end)
+		return
+	}
+	r.ranges = append(r.ranges, segment{start: start, end: end})
+}
+
+func (r *vreg) liveAcross(pos int) bool {
+	for _, s := range r.ranges {
+		if s.start < pos && pos < s.end {
+			return true
+		}
+	}
+	return false
+}
+
+func overlaps(a, b []segment) bool {
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if a[i].start < b[j].end && b[j].start < a[i].end {
+			return true
+		}
+		if a[i].end < b[j].end {
+			i++
+		} else {
+			j++
+		}
+	}
+	return false
+}
 
 func (mb *mblock) terminatorUses() []*vreg {
 	uses := append([]*vreg{}, mb.compare...)
@@ -19,24 +83,87 @@ func (mb *mblock) terminatorUses() []*vreg {
 	return append(uses, mb.results...)
 }
 
+func registers(regs []*vreg) []*vreg {
+	var out []*vreg
+	for _, r := range regs {
+		switch {
+		case r.mem != nil:
+			out = append(out, registers(r.mem.pieces())...)
+		case !r.fixed():
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func copyStep(pos int, copies []*phiCopy) step {
+	st := step{pos: pos}
+	for _, c := range copies {
+		st.uses = append(st.uses, registers([]*vreg{c.src})...)
+		st.defs = append(st.defs, c.dst)
+	}
+	return st
+}
+
+func (f *mfunc) number() {
+	pos := 0
+	for _, mb := range f.blocks {
+		mb.start = pos
+		pos += 2
+		for _, in := range mb.instrs {
+			in.pos = pos
+			pos += 2
+		}
+		mb.copyPos = pos
+		pos += 2
+		mb.end = pos
+		mb.buildSteps()
+	}
+}
+
+func (mb *mblock) buildSteps() {
+	mb.steps = nil
+	var params []*vreg
+	for _, in := range mb.instrs {
+		if in.isParam() {
+			params = append(params, in.dst)
+		}
+	}
+	if len(params) > 0 {
+		mb.steps = append(mb.steps, step{pos: mb.start, defs: params})
+	}
+	if len(mb.heads) > 0 {
+		mb.steps = append(mb.steps, copyStep(mb.start+1, mb.heads))
+	}
+	for _, in := range mb.instrs {
+		if in.isParam() {
+			continue
+		}
+		st := step{pos: in.pos, uses: registers(in.args)}
+		if in.dst != nil {
+			st.defs = []*vreg{in.dst}
+		}
+		mb.steps = append(mb.steps, st)
+	}
+	if len(mb.copies) > 0 {
+		mb.steps = append(mb.steps, copyStep(mb.copyPos, mb.copies))
+	}
+	mb.steps = append(mb.steps, step{pos: mb.end, uses: registers(mb.terminatorUses())})
+}
+
 func (f *mfunc) liveness() {
 	use := map[*mblock]map[*vreg]bool{}
 	def := map[*mblock]map[*vreg]bool{}
 	for _, mb := range f.blocks {
 		u, d := map[*vreg]bool{}, map[*vreg]bool{}
-		for _, in := range mb.instrs {
-			for _, a := range in.args {
-				if !d[a] && a.konst == nil {
-					u[a] = true
+		for _, st := range mb.steps {
+			for _, r := range st.uses {
+				if !d[r] {
+					u[r] = true
 				}
 			}
-			if in.dst != nil {
-				d[in.dst] = true
-			}
-		}
-		for _, a := range mb.terminatorUses() {
-			if !d[a] && a.konst == nil {
-				u[a] = true
+			for _, r := range st.defs {
+				d[r] = true
 			}
 		}
 		use[mb], def[mb] = u, d
@@ -77,187 +204,270 @@ func (mb *mblock) propagate(use, def map[*mblock]map[*vreg]bool) bool {
 	return changed
 }
 
-func (r *vreg) extend(pos int) {
-	if r.konst != nil {
-		return
+func (f *mfunc) buildRanges() {
+	for _, r := range f.vregs {
+		r.ranges = nil
 	}
-	if r.start < 0 || pos < r.start {
-		r.start = pos
+	for i := len(f.blocks) - 1; i >= 0; i-- {
+		f.blocks[i].buildRanges()
 	}
-	if pos > r.end {
-		r.end = pos
+	for _, r := range f.vregs {
+		slices.Reverse(r.ranges)
 	}
 }
 
-func (f *mfunc) intervals() {
-	pos := 0
-	for _, mb := range f.blocks {
-		mb.start = pos
-		pos += 2
-		for _, in := range mb.instrs {
-			in.pos = pos
-			pos += 2
-		}
-		mb.end = pos
-		pos += 2
+func (mb *mblock) buildRanges() {
+	open := map[*vreg]int{}
+	for r := range mb.liveOut {
+		open[r] = mb.end
 	}
-	for _, mb := range f.blocks {
-		mb.extendIntervals()
-		mb.markCallCrossings()
+	for i := len(mb.steps) - 1; i >= 0; i-- {
+		st := mb.steps[i]
+		for _, d := range st.defs {
+			if end, live := open[d]; live {
+				d.addRange(st.pos, end)
+				delete(open, d)
+				continue
+			}
+			d.addRange(st.pos, st.pos+1)
+		}
+		for _, u := range st.uses {
+			if _, live := open[u]; !live {
+				open[u] = st.pos
+			}
+		}
+	}
+	for r, end := range open {
+		r.addRange(mb.start, end)
 	}
 }
 
 func (in *instr) isCall() bool {
-	return !in.move && (in.op == ir.OpCall || in.op == ir.OpCCall || in.op == ir.OpRuntime)
+	return in.op == ir.OpCall || in.op == ir.OpCCall || (in.op == ir.OpRuntime && in.literal == nil)
 }
 
-type segment struct {
-	start int
-	end   int
+func (in *instr) preservesRegisters() bool {
+	return in.op == ir.OpRuntime && in.value.Str == "grow"
 }
 
-func (mb *mblock) markCallCrossings() {
-	var calls []int
-	for _, in := range mb.instrs {
-		if in.isCall() {
-			calls = append(calls, in.pos)
-		}
-	}
-	if len(calls) == 0 {
-		return
-	}
-	for r, s := range mb.segments() {
-		for _, c := range calls {
-			if s.start < c && c < s.end {
-				r.crossesCall = true
-				break
+func (f *mfunc) markCallCrossings() {
+	var clobbering, preserving []int
+	for _, mb := range f.blocks {
+		for _, in := range mb.instrs {
+			switch {
+			case in.preservesRegisters():
+				preserving = append(preserving, in.pos)
+			case in.isCall():
+				clobbering = append(clobbering, in.pos)
 			}
 		}
 	}
+	for _, r := range f.vregs {
+		r.crossesPreserving = r.crossesAny(preserving)
+		r.crossesCall = r.crossesAny(clobbering) || (r.crossesPreserving && !r.scalar)
+	}
 }
 
-func (mb *mblock) segments() map[*vreg]*segment {
-	segs := map[*vreg]*segment{}
-	touch := func(r *vreg, pos int) {
-		if r.konst != nil {
-			return
-		}
-		if s, ok := segs[r]; ok {
-			s.end = pos
-			return
-		}
-		segs[r] = &segment{start: pos, end: pos}
+func (r *vreg) crossesAny(calls []int) bool {
+	if len(calls) == 0 {
+		return false
 	}
-	for r := range mb.liveIn {
-		touch(r, mb.start)
-	}
-	for _, in := range mb.instrs {
-		if in.isParam() {
-			touch(in.dst, mb.start)
+	for _, s := range r.ranges {
+		i := sort.SearchInts(calls, s.start+1)
+		if i < len(calls) && calls[i] < s.end {
+			return true
 		}
 	}
-	for _, in := range mb.instrs {
-		for _, a := range in.args {
-			touch(a, in.pos)
-		}
-		if in.dst != nil {
-			touch(in.dst, in.pos)
-		}
-	}
-	for _, a := range mb.terminatorUses() {
-		touch(a, mb.end)
-	}
-	for r := range mb.liveOut {
-		touch(r, mb.end)
-	}
-	return segs
-}
-
-func (mb *mblock) extendIntervals() {
-	for r := range mb.liveIn {
-		r.extend(mb.start)
-	}
-	for r := range mb.liveOut {
-		r.extend(mb.end)
-	}
-	for _, in := range mb.instrs {
-		for _, a := range in.args {
-			a.extend(in.pos)
-		}
-		if in.dst != nil {
-			in.dst.extend(in.pos)
-		}
-		if in.isParam() {
-			in.dst.extend(mb.start)
-		}
-	}
-	for _, a := range mb.terminatorUses() {
-		a.extend(mb.end)
-	}
+	return false
 }
 
 func (in *instr) isParam() bool {
-	return !in.move && in.op == ir.OpParam
+	return in.op == ir.OpParam
 }
 
 type allocator struct {
-	active []*vreg
-	free   map[string]bool
-	spills int
-	used   map[string]bool
+	assigned map[string][]*vreg
+	slots    [][]*vreg
+	used     map[string]bool
+	cost     func(*vreg) float64
+}
+
+type placement struct {
+	reg   string
+	spill int
+}
+
+type outcome struct {
+	alloc  *allocator
+	placed []placement
+	cost   float64
+}
+
+var spillCosts = []func(*vreg) float64{
+	func(r *vreg) float64 { return float64(r.weight) },
+	func(r *vreg) float64 { return float64(r.weight) / float64(r.length) },
+	func(r *vreg) float64 { return float64(r.weight) / math.Sqrt(float64(r.length)) },
+}
+
+func (r *vreg) measure() {
+	r.length = 0
+	for _, s := range r.ranges {
+		r.length += s.end - s.start
+	}
+}
+
+func (f *mfunc) allocationOrder() []*vreg {
+	var order []*vreg
+	for _, r := range f.vregs {
+		if len(r.ranges) > 0 {
+			r.measure()
+			order = append(order, r)
+		}
+	}
+	slices.SortStableFunc(order, func(x, y *vreg) int { return x.first() - y.first() })
+	return order
+}
+
+func (f *mfunc) place(order []*vreg, cost func(*vreg) float64) outcome {
+	for _, r := range order {
+		r.reg, r.spill = "", -1
+	}
+	a := &allocator{assigned: map[string][]*vreg{}, used: map[string]bool{}, cost: cost}
+	for _, r := range order {
+		a.assign(r)
+	}
+	o := outcome{alloc: a, placed: make([]placement, len(order))}
+	for i, r := range order {
+		o.placed[i] = placement{reg: r.reg, spill: r.spill}
+		if r.reg == "" {
+			o.cost += float64(r.weight)
+		}
+	}
+	for _, reg := range calleeSaved {
+		if a.used[reg] {
+			o.cost += saveCost
+		}
+	}
+	return o
 }
 
 func (f *mfunc) allocate() (spills int, saved []string) {
+	f.number()
 	f.liveness()
-	f.intervals()
-	a := &allocator{free: map[string]bool{}, used: map[string]bool{}}
-	for _, r := range append(append([]string{}, callerSaved...), calleeSaved...) {
-		a.free[r] = true
-	}
-	order := slices.Clone(f.vregs)
-	slices.SortStableFunc(order, func(x, y *vreg) int { return x.start - y.start })
-	for _, r := range order {
-		if r.start >= 0 {
-			a.assign(r)
+	f.buildRanges()
+	f.markCallCrossings()
+	f.markLight()
+	f.weigh()
+	order := f.allocationOrder()
+	var best outcome
+	for i, cost := range spillCosts {
+		if o := f.place(order, cost); i == 0 || o.cost < best.cost {
+			best = o
 		}
 	}
+	for i, r := range order {
+		r.reg, r.spill = best.placed[i].reg, best.placed[i].spill
+	}
 	for _, r := range calleeSaved {
-		if a.used[r] {
+		if best.alloc.used[r] {
 			saved = append(saved, r)
 		}
 	}
-	return a.spills, saved
+	return len(best.alloc.slots), saved
+}
+
+func (a *allocator) candidates(cur *vreg) []string {
+	switch {
+	case cur.float:
+		return floatRegs
+	case cur.crossesCall && cur.light:
+		return nil
+	case cur.crossesCall:
+		return calleeSaved
+	case cur.light:
+		return callerSaved
+	}
+	return integerRegs
 }
 
 func (a *allocator) assign(cur *vreg) {
-	a.expire(cur.start)
-	pools := [][]string{callerSaved, calleeSaved}
-	if cur.crossesCall {
-		pools = [][]string{calleeSaved}
+	a.expire(cur.first())
+	if cur.float && (cur.crossesCall || cur.crossesPreserving) {
+		a.spill(cur)
+		return
 	}
+	regs := a.candidates(cur)
 	for _, reg := range cur.preferred() {
-		if a.free[reg] && slices.ContainsFunc(pools, func(p []string) bool { return slices.Contains(p, reg) }) {
+		if slices.Contains(regs, reg) && a.fits(cur, reg) {
 			a.take(cur, reg)
 			return
 		}
 	}
-	for _, pool := range pools {
-		for _, reg := range pool {
-			if a.free[reg] {
-				a.take(cur, reg)
-				return
-			}
+	if reg := a.firstFit(cur, regs); reg != "" {
+		a.take(cur, reg)
+		return
+	}
+	a.displace(cur, regs)
+}
+
+func (a *allocator) fits(cur *vreg, reg string) bool {
+	return len(a.conflicts(cur, reg)) == 0
+}
+
+func (a *allocator) conflicts(cur *vreg, reg string) []*vreg {
+	var found []*vreg
+	for _, r := range a.assigned[reg] {
+		if overlaps(cur.ranges, r.ranges) {
+			found = append(found, r)
 		}
 	}
-	victim := a.victim(cur.crossesCall)
-	if victim == nil || victim.end <= cur.end {
+	return found
+}
+
+func (a *allocator) firstFit(cur *vreg, regs []string) string {
+	fallback := ""
+	for _, reg := range regs {
+		switch {
+		case !a.fits(cur, reg):
+		case cur.avoids(reg):
+			fallback = reg
+		default:
+			return reg
+		}
+	}
+	return fallback
+}
+
+func (r *vreg) avoids(reg string) bool {
+	return r.avoid != nil && r.avoid.reg == reg
+}
+
+func (a *allocator) cheaperToSpill(r, other *vreg) bool {
+	if x, y := a.cost(r), a.cost(other); x != y {
+		return x < y
+	}
+	return r.last() > other.last()
+}
+
+func (a *allocator) displace(cur *vreg, regs []string) {
+	var victim *vreg
+	for _, reg := range regs {
+		found := a.conflicts(cur, reg)
+		if len(found) != 1 {
+			continue
+		}
+		if victim == nil || a.cheaperToSpill(found[0], victim) {
+			victim = found[0]
+		}
+	}
+	if victim == nil || !a.cheaperToSpill(victim, cur) {
 		a.spill(cur)
 		return
 	}
 	reg := victim.reg
+	a.assigned[reg] = slices.DeleteFunc(a.assigned[reg], func(r *vreg) bool { return r == victim })
 	victim.reg = ""
 	a.spill(victim)
-	a.active = slices.DeleteFunc(a.active, func(r *vreg) bool { return r == victim })
 	a.take(cur, reg)
 }
 
@@ -266,43 +476,52 @@ func (r *vreg) preferred() []string {
 	if r.hint != "" {
 		regs = append(regs, r.hint)
 	}
-	if r.copyOf != nil && r.copyOf.reg != "" {
-		regs = append(regs, r.copyOf.reg)
+	for _, s := range r.sources {
+		if s.reg != "" {
+			regs = append(regs, s.reg)
+		}
+	}
+	for _, s := range r.sinks {
+		if s.reg != "" {
+			regs = append(regs, s.reg)
+		}
 	}
 	return regs
 }
 
 func (a *allocator) expire(pos int) {
-	a.active = slices.DeleteFunc(a.active, func(r *vreg) bool {
-		if r.end <= pos {
-			a.free[r.reg] = true
-			return true
-		}
-		return false
-	})
-}
-
-func (a *allocator) victim(calleeOnly bool) *vreg {
-	var best *vreg
-	for _, r := range a.active {
-		if calleeOnly && !slices.Contains(calleeSaved, r.reg) {
-			continue
-		}
-		if best == nil || r.end > best.end {
-			best = r
-		}
+	for reg, list := range a.assigned {
+		a.assigned[reg] = slices.DeleteFunc(list, func(r *vreg) bool { return r.last() <= pos })
 	}
-	return best
 }
 
 func (a *allocator) take(r *vreg, reg string) {
 	r.reg = reg
-	a.free[reg] = false
 	a.used[reg] = true
-	a.active = append(a.active, r)
+	a.assigned[reg] = append(a.assigned[reg], r)
 }
 
 func (a *allocator) spill(r *vreg) {
-	r.spill = a.spills
-	a.spills++
+	slot := a.sharedSlot(r)
+	if slot < 0 {
+		slot = len(a.slots)
+		a.slots = append(a.slots, nil)
+	}
+	r.spill = slot
+	a.slots[slot] = append(a.slots[slot], r)
+}
+
+func (a *allocator) sharedSlot(r *vreg) int {
+	for _, related := range r.copyPeers {
+		if related.spill < 0 || related.reg != "" {
+			continue
+		}
+		free := !slices.ContainsFunc(a.slots[related.spill], func(occupant *vreg) bool {
+			return overlaps(occupant.ranges, r.ranges)
+		})
+		if free {
+			return related.spill
+		}
+	}
+	return -1
 }

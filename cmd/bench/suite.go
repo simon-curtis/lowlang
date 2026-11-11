@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"lowlang/internal/peakrss"
 )
 
 type suite struct {
@@ -200,20 +202,22 @@ func (s *suite) execute(ctx context.Context, binary string, stdout io.Writer) (s
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, binary)
-	cmd.Dir = s.work
-	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
 	start := time.Now()
-	err := cmd.Run()
+	result, err := peakrss.Run(func() *exec.Cmd {
+		cmd := exec.CommandContext(ctx, binary)
+		cmd.Dir = s.work
+		cmd.Stdout = stdout
+		cmd.Stderr = &stderr
+		return cmd
+	})
 	wall := time.Since(start)
 	if err != nil {
 		return sample{}, fmt.Errorf("%s: %w\n%s", filepath.Base(binary), err, bytes.TrimSpace(stderr.Bytes()))
 	}
-	usage, ok := cmd.ProcessState.SysUsage().(*syscall.Rusage)
+	usage, ok := result.Cmd.ProcessState.SysUsage().(*syscall.Rusage)
 	if !ok {
 		return sample{wall: wall}, nil
 	}
 	cpu := time.Duration(usage.Utime.Nano() + usage.Stime.Nano())
-	return sample{wall: wall, cpu: cpu, rss: usage.Maxrss * 1024}, nil
+	return sample{wall: wall, cpu: cpu, rss: result.PeakKB * 1024}, nil
 }

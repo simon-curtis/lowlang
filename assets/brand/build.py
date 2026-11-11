@@ -1,13 +1,16 @@
 import json
+import math
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-TILE = "#3f7d5c"
-DOG = "#15181d"
-INK = "#f5f1e8"
+PAPER = "#f2ead9"
+GRAIN = "#e2d6bd"
+SPOT = "#ff5a1f"
+INK = "#16130f"
+TYPEFACE = "Noto Sans"
 NAME = "LowLang"
 TAGLINE = [
     "A compiled language with Go's speed",
@@ -15,158 +18,94 @@ TAGLINE = [
     "and expression-oriented syntax.",
 ]
 
-SKULL = [(290, 85), (330, 74), (372, 68), (425, 70), (482, 76), (545, 88), (582, 82), (604, 114), (640, 155), (665, 195), (676, 232), (680, 266), (702, 290), (750, 316), (798, 336), (820, 360), (822, 382), (815, 400)]
-EAR = [(290, 85), (245, 115), (205, 150), (160, 190), (148, 228), (175, 262), (208, 296), (240, 322), (292, 346), (318, 372), (338, 396), (362, 382), (380, 340), (388, 280), (382, 215), (373, 160), (382, 112), (415, 82)]
-JAW = [(420, 403), (458, 432), (488, 470), (505, 508), (525, 535), (553, 544), (582, 532), (604, 524), (640, 534), (672, 530), (712, 513), (742, 506), (778, 497), (794, 470), (800, 432), (815, 400)]
-NECK_BACK = [(208, 296), (199, 318), (186, 350), (178, 405), (168, 462), (154, 512), (122, 563), (96, 604), (66, 632), (46, 658), (40, 700), (26, 736), (12, 768), (2, 800), (-30, 1000), (-80, 1300)]
-NECK_FRONT = [(598, 538), (591, 592), (583, 650), (579, 712), (602, 728), (620, 750), (624, 800), (632, 1000), (650, 1300)]
-THROAT = [(508, 548), (482, 575), (466, 610), (460, 648), (443, 668)]
-EYE = [(550, 222), (522, 226), (501, 239), (522, 246), (549, 248)]
-NOSE = [(802, 349), (764, 349), (740, 364), (738, 390), (762, 404), (790, 400)]
-NOSTRILS = [(776, 390, 9), (816, 393, 10)]
-EYE_DOT = (527, 236, 26)
-EAR_HEM = EAR[6:11]
-SILHOUETTE = SKULL + JAW[-2:6:-1] + NECK_FRONT + NECK_BACK[::-1][:-1] + EAR[6:0:-1]
-
-ICON_VIEW = (-20, -60, 860)
-ICON_RADIUS = 190
-SMALL_VIEW = (110, 10, 760)
-PIXELS_16 = (
-    "................",
-    "....######......",
-    "...#########....",
-    "..##########....",
-    ".#######.###....",
-    ".############...",
-    "...###########..",
-    "..#.###########.",
-    ".###.##########.",
-    ".#############..",
-    ".############...",
-    "##########......",
-    "##########......",
-    "##########......",
-    "##########......",
-    "###########.....",
-)
-MASKABLE_VIEW = (-15, -200, 1000)
+VIEW = 512
+LETTER_LEFT = 136
+LETTER_TOP = 96
+LETTER_RIGHT = 376
+LETTER_BOTTOM = 416
+STROKE = 96
 
 
-class Canvas:
-    def __init__(self, x, y, width, height, crisp=False):
-        self.x = x
-        self.y = y
-        self.width = width
-        self.height = height
-        self.crisp = crisp
-        self.defs = []
-        self.body = []
-
-    def render(self):
-        rendering = ' shape-rendering="crispEdges"' if self.crisp else ""
-        lines = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{self.x} {self.y} {self.width} {self.height}"{rendering}>']
-        if self.defs:
-            lines.append("  <defs>")
-            lines.extend(f"    {d}" for d in self.defs)
-            lines.append("  </defs>")
-        lines.extend(f"  {b}" for b in self.body)
-        lines.append("</svg>")
-        return "\n".join(lines) + "\n"
-
-    def frame(self, radius=0):
-        self.defs.append(f'<clipPath id="tile"><rect x="{self.x}" y="{self.y}" width="{self.width}" height="{self.height}" rx="{radius}"/></clipPath>')
-
-    def background(self, radius=0):
-        self.frame(radius)
-        self.body.append(f'<rect x="{self.x}" y="{self.y}" width="{self.width}" height="{self.height}" rx="{radius}" fill="{TILE}"/>')
-
-    def dog(self, transform="", detail=True, colour=DOG):
-        cut = 'fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round"'
-        mask = [f'<mask id="lines" maskUnits="userSpaceOnUse" x="-200" y="-200" width="1400" height="1600">', '  <rect x="-200" y="-200" width="1400" height="1600" fill="#fff"/>']
-        if detail:
-            mask.extend(f'  <path d="{smooth(points)}" {cut} stroke-width="20"/>' for points in (EAR, JAW, THROAT))
-            mask.append(f'  <path d="{smooth(NOSE)}" {cut} stroke-width="14"/>')
-            mask.extend(f'  <circle cx="{cx}" cy="{cy}" r="{r}" fill="#000"/>' for cx, cy, r in NOSTRILS)
-            mask.append(f'  <path d="{smooth(EYE)}" {cut} stroke-width="16"/>')
-        else:
-            cx, cy, r = EYE_DOT
-            mask.append(f'  <path d="{smooth(EAR_HEM)}" {cut} stroke-width="44"/>')
-            mask.append(f'  <circle cx="{cx}" cy="{cy}" r="{r}" fill="#000"/>')
-        mask.append("</mask>")
-        self.defs.extend(mask)
-        group = f' transform="{transform}"' if transform else ""
-        self.body.append(f'<g clip-path="url(#tile)"><g{group}><path d="{smooth(SILHOUETTE, closed=True)}" fill="{colour}" mask="url(#lines)"/></g></g>')
-
-    def pixels(self, rows, colour):
-        cells = "".join(f'<rect x="{x}" y="{y}" width="1" height="1"/>' for y, row in enumerate(rows) for x, cell in enumerate(row) if cell == "#")
-        self.body.append(f'<g fill="{colour}">{cells}</g>')
-
-    def text(self, x, y, content, size, weight, opacity=1):
-        escaped = content.replace("&", "&amp;").replace("'", "&#39;")
-        self.body.append(f'<text x="{x}" y="{y}" font-family="Open Sans" font-size="{size}" font-weight="{weight}" fill="{INK}" fill-opacity="{opacity}">{escaped}</text>')
+def letter_path():
+    inner_x = LETTER_LEFT + STROKE
+    inner_y = LETTER_BOTTOM - STROKE
+    return (
+        f"M{LETTER_LEFT} {LETTER_TOP}H{inner_x}V{inner_y}H{LETTER_RIGHT}V{LETTER_BOTTOM}H{LETTER_LEFT}Z"
+    )
 
 
-def smooth(points, closed=False):
-    count = len(points)
-
-    def at(k):
-        if closed:
-            return points[k % count]
-        return points[max(0, min(count - 1, k))]
-
-    segments = count if closed else count - 1
-    path = [f"M{points[0][0]} {points[0][1]}"]
-    for i in range(segments):
-        p0, p1, p2, p3 = at(i - 1), at(i), at(i + 1), at(i + 2)
-        c1 = (p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6)
-        c2 = (p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6)
-        path.append(f"C{c1[0]:.1f} {c1[1]:.1f} {c2[0]:.1f} {c2[1]:.1f} {p2[0]} {p2[1]}")
-    if closed:
-        path.append("Z")
-    return "".join(path)
+def letter_tone(x, y):
+    along = (x - LETTER_LEFT) / (LETTER_RIGHT - LETTER_LEFT)
+    up = (LETTER_BOTTOM - y) / (LETTER_BOTTOM - LETTER_TOP)
+    return 1.1 - 1.05 * max(along, up)
 
 
-def icon(rounded):
-    x, y, size = ICON_VIEW
-    canvas = Canvas(x, y, size, size)
-    canvas.background(ICON_RADIUS if rounded else 0)
-    canvas.dog()
-    return canvas.render()
+def screen(left, top, right, bottom, step, tone):
+    circles = []
+    rows = int((bottom - top) / step) + 1
+    columns = int((right - left) / (2 * step)) + 1
+    for row in range(rows):
+        y = top + row * step
+        for column in range(columns):
+            x = left + (2 * column + row % 2) * step
+            level = min(tone(x, y), 1.1)
+            if level > 0:
+                circles.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{step * math.sqrt(level):.2f}"/>')
+    return "".join(circles)
 
 
-def glyph(view, detail, crisp=False):
-    x, y, size = view
-    canvas = Canvas(x, y, size, size, crisp)
-    canvas.frame()
-    canvas.dog(detail=detail, colour=TILE)
-    return canvas.render()
+def tile(step, radius, scale):
+    overprint = screen(LETTER_LEFT, LETTER_TOP, LETTER_RIGHT, LETTER_BOTTOM, step, letter_tone)
+    shift = VIEW / 2 * (1 - scale)
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {VIEW} {VIEW}">'
+        f'<defs><clipPath id="letter"><path d="{letter_path()}"/></clipPath></defs>'
+        f'<rect width="{VIEW}" height="{VIEW}" rx="{radius}" fill="{PAPER}"/>'
+        f'<g transform="translate({shift} {shift}) scale({scale})">'
+        f'<path d="{letter_path()}" fill="{SPOT}"/>'
+        f'<g clip-path="url(#letter)" fill="{INK}">{overprint}</g></g></svg>\n'
+    )
 
 
-def pixel_glyph(rows):
-    canvas = Canvas(0, 0, len(rows[0]), len(rows), crisp=True)
-    canvas.pixels(rows, TILE)
-    return canvas.render()
-
-
-def maskable():
-    x, y, size = MASKABLE_VIEW
-    canvas = Canvas(x, y, size, size)
-    canvas.background()
-    canvas.dog()
-    return canvas.render()
+def pixel_tile():
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" shape-rendering="crispEdges">'
+        f'<rect width="16" height="16" fill="{PAPER}"/>'
+        f'<path d="M4 2H8V10H13V14H4Z" fill="{SPOT}"/>'
+        f'<path d="M4 8H8V10H10V14H4Z" fill="{INK}"/></svg>\n'
+    )
 
 
 def banner(width, height):
-    canvas = Canvas(0, 0, width, height)
-    canvas.background()
-    scale = height * 0.82 / 860
-    margin = height * 0.07
-    canvas.dog(f"translate({margin:.1f} {height * 0.12:.1f}) scale({scale:.4f})")
-    left = round(margin + 840 * scale + width * 0.05)
-    canvas.text(left, round(height * 0.45), NAME, round(height * 0.15), 800)
-    for index, line in enumerate(TAGLINE):
-        canvas.text(left, round(height * (0.58 + index * 0.068)), line, round(height * 0.04), 400, 0.85)
-    return canvas.render()
+    unit = width / 1200
+    left = 72 * unit
+    size = 212 * unit
+    baseline = height / 2 - 30 * unit
+    word_width = 840 * unit
+    step = 7 * unit
+
+    def word_tone(x, y):
+        return 1.12 - 1.1 * max((x - left) / word_width, 0) ** 1.6
+
+    def grain_tone(x, y):
+        return 0.55 * (x / width) ** 2 * (y / height) ** 2
+
+    word = f'<text x="{left:.2f}" y="{baseline:.2f}" font-family="{TYPEFACE}" font-weight="900" font-size="{size:.2f}">{NAME}</text>'
+    overprint = screen(left, baseline - size, left + word_width + size, baseline + size / 3, step, word_tone)
+    grain = screen(0, 0, width, height, 10 * unit, grain_tone)
+    lines = "".join(
+        f'<text x="{left + 6 * unit:.2f}" y="{baseline + (96 + index * 50) * unit:.2f}">{line}</text>'
+        for index, line in enumerate(TAGLINE)
+    )
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">'
+        f'<defs><clipPath id="word">{word}</clipPath></defs>'
+        f'<rect width="{width}" height="{height}" fill="{PAPER}"/>'
+        f'<g fill="{GRAIN}">{grain}</g>'
+        f'<g fill="{SPOT}">{word}</g>'
+        f'<g clip-path="url(#word)" fill="{INK}">{overprint}</g>'
+        f'<g fill="{INK}" font-family="{TYPEFACE}" font-weight="500" font-size="{36 * unit:.2f}">{lines}</g></svg>\n'
+    )
 
 
 def rasterise(svg, output, width, height):
@@ -181,6 +120,13 @@ def pack_ico(sources, output):
         raise RuntimeError(f"magick failed for {output.name}: {result.stderr.decode().strip()}")
 
 
+def require_typeface():
+    result = subprocess.run(["fc-match", "-f", "%{family}", TYPEFACE], capture_output=True)
+    families = result.stdout.decode().split(",")
+    if result.returncode != 0 or TYPEFACE not in families:
+        raise RuntimeError(f"typeface {TYPEFACE} is not installed")
+
+
 def manifest():
     return json.dumps({
         "name": NAME,
@@ -190,20 +136,20 @@ def manifest():
             {"src": "icon-512.png", "sizes": "512x512", "type": "image/png"},
             {"src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
-        "theme_color": TILE,
-        "background_color": TILE,
+        "theme_color": PAPER,
+        "background_color": PAPER,
         "display": "standalone",
     }, indent=2) + "\n"
 
 
 def build(brand):
-    rounded = icon(rounded=True)
-    square = icon(rounded=False)
+    require_typeface()
+    rounded = tile(16, 112, 1)
     (brand.parent / "icon.svg").write_text(rounded)
     favicons = {
-        16: pixel_glyph(PIXELS_16),
-        32: glyph(SMALL_VIEW, detail=False, crisp=True),
-        48: glyph(ICON_VIEW, detail=True),
+        16: pixel_tile(),
+        32: tile(40, 80, 1.15),
+        48: tile(32, 96, 1.1),
     }
     with tempfile.TemporaryDirectory() as scratch:
         frames = []
@@ -212,17 +158,17 @@ def build(brand):
             rasterise(source, frame, size, size)
             frames.append(frame)
         pack_ico(frames, brand / "favicon.ico")
-    rasterise(square, brand / "apple-touch-icon.png", 180, 180)
+    rasterise(tile(16, 0, 1), brand / "apple-touch-icon.png", 180, 180)
     rasterise(rounded, brand / "icon-192.png", 192, 192)
     rasterise(rounded, brand / "icon-512.png", 512, 512)
-    rasterise(maskable(), brand / "icon-maskable-512.png", 512, 512)
+    rasterise(tile(16, 0, 0.78), brand / "icon-maskable-512.png", 512, 512)
     rasterise(banner(1200, 630), brand / "og-image.png", 1200, 630)
     rasterise(banner(1280, 640), brand / "github-social-preview.png", 1280, 640)
     (brand / "site.webmanifest").write_text(manifest())
 
 
 def main():
-    missing = [tool for tool in ("rsvg-convert", "magick") if shutil.which(tool) is None]
+    missing = [tool for tool in ("rsvg-convert", "magick", "fc-match") if shutil.which(tool) is None]
     if missing:
         sys.exit(f"missing tools: {', '.join(missing)}")
     try:

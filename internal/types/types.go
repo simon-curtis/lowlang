@@ -124,6 +124,22 @@ func (t *Type) PointerWords() []bool {
 	return words
 }
 
+func (t *Type) FloatWords() []int {
+	words := make([]int, t.size)
+	switch t.Kind {
+	case FloatKind:
+		words[0] = t.Bits
+	case StructKind:
+		if t.C {
+			return words
+		}
+		for _, f := range t.Fields {
+			copy(words[f.Offset:], f.Type.FloatWords())
+		}
+	}
+	return words
+}
+
 func merge(into, from []bool) {
 	for i, p := range from {
 		into[i] = into[i] || p

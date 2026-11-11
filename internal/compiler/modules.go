@@ -94,6 +94,10 @@ func sources(dir string) ([]string, error) {
 	return files, nil
 }
 
+func (l *loader) userFiles() []*ast.File {
+	return slices.DeleteFunc(slices.Clone(l.files), func(f *ast.File) bool { return isStd(f.Module) })
+}
+
 func (l *loader) imported(e edge) error {
 	if _, done := l.edges[e.to]; done {
 		return nil

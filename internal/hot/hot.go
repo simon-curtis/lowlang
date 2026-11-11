@@ -148,7 +148,7 @@ func (s *Session) watched() []string {
 }
 
 func (s *Session) Reload(ctx context.Context) error {
-	unit, err := compiler.Analyse(s.path, target.Linux)
+	unit, err := compiler.AnalyseDev(s.path, target.Linux)
 	if err != nil {
 		s.logf("%v", err)
 		return nil
@@ -300,11 +300,12 @@ func (s *Session) patch(ctx context.Context, prog *ir.Program, table map[string]
 	if err := compiler.LinkAt(ctx, asm, output, s.binary, address); err != nil {
 		return err
 	}
-	code, symbols, err := readPatch(output)
+	section, symbols, err := readPatch(output)
 	if err != nil {
 		return err
 	}
-	if s.next+uint64(len(code)) > amd64.HotSize {
+	end := section.address + uint64(len(section.code)) - amd64.HotBase
+	if end > amd64.HotSize {
 		return errors.New("hot code space exhausted")
 	}
 	entries := make([]byte, 0, 16*len(changed))
@@ -312,29 +313,34 @@ func (s *Session) patch(ctx context.Context, prog *ir.Program, table map[string]
 		entries = binary.LittleEndian.AppendUint64(entries, uint64(table[name]))
 		entries = binary.LittleEndian.AppendUint64(entries, symbols[amd64.Symbol(name, suffix)])
 	}
-	if err := s.apply(ctx, code, address, entries, len(changed)); err != nil {
+	if err := s.apply(ctx, section.code, section.address, entries, len(changed)); err != nil {
 		return err
 	}
-	s.next += (uint64(len(code)) + 15) &^ 15
+	s.next = (end + 15) &^ 15
 	return nil
 }
 
-func readPatch(path string) ([]byte, map[string]uint64, error) {
+type patchSection struct {
+	address uint64
+	code    []byte
+}
+
+func readPatch(path string) (patchSection, map[string]uint64, error) {
 	f, err := elf.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return patchSection{}, nil, err
 	}
 	defer f.Close()
 	section := f.Section(".hot")
 	if section == nil {
-		return nil, nil, errors.New("patch has no .hot section")
+		return patchSection{}, nil, errors.New("patch has no .hot section")
 	}
 	code, err := section.Data()
 	if err != nil {
-		return nil, nil, err
+		return patchSection{}, nil, err
 	}
 	symbols, err := readSymbols(path)
-	return code, symbols, err
+	return patchSection{address: section.Addr, code: code}, symbols, err
 }
 
 func (s *Session) apply(ctx context.Context, code []byte, address uint64, entries []byte, count int) error {
@@ -441,7 +447,7 @@ func signatures(files []*ast.File) map[string]string {
 			fmt.Fprintf(&b, "-> %s", fn.RetType)
 			if fn.Closure != nil {
 				for _, l := range fn.Closure.Captures {
-					fmt.Fprintf(&b, " %s %s", l.Name, l.Type)
+					fmt.Fprintf(&b, " %s %s %t", l.Name, l.Type, l.Boxed())
 				}
 			}
 			out[fmt.Sprintf("%s.%s", file.Module, fn.Name)] = b.String()

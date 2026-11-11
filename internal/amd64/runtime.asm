@@ -111,20 +111,33 @@ rt_summary1:
 	.zero 8
 rt_summary2:
 	.zero 8
+rt_mark_bits:
+	.zero 8
 rt_mark_base:
+	.zero 8
+rt_mark_ring:
+	.zero 256
+rt_live_words:
 	.zero 8
 rt_alloc_since:
 	.zero 8
 rt_gc_threshold:
 	.zero 8
-rt_free_large:
+rt_dirty:
 	.zero 8
+rt_bin_bits:
+	.zero 32
+rt_bins:
+	.zero 2048
 rt_pin_count:
 	.zero 8
 rt_pins:
 	.zero 524288
 rt_free_small:
 	.zero 512
+	.globl rt_hash_seed
+rt_hash_seed:
+	.zero 16
 rt_arg_count:
 	.zero 8
 rt_arg_values:
@@ -133,6 +146,54 @@ rt_env_values:
 	.zero 8
 
 	.text
+
+	.macro MARK_CANDIDATE
+	mov r8, [rip+rt_heap_start]
+	lea rax, [r8+8]
+	cmp rdi, rax
+	jb .Lmark_search_\@
+	cmp rdi, [rip+rt_heap_bump]
+	jae .Lmark_done_\@
+	lea rax, [rdi-8]
+	sub rax, r8
+	shr rax, 3
+	mov rcx, rax
+	shr rcx, 6
+	mov rdx, [rip+rt_bitmap]
+	mov rdx, [rdx+8*rcx]
+	bt rdx, rax
+	jnc .Lmark_search_\@
+	jmp .Lmark_resolved_\@
+.Lmark_search_\@:
+	call rt_find
+	test rax, rax
+	jz .Lmark_done_\@
+	sub rax, [rip+rt_heap_start]
+	shr rax, 3
+.Lmark_resolved_\@:
+	mov rcx, rax
+	shr rcx, 6
+	mov r9, [rip+rt_mark_bits]
+	lea r9, [r9+8*rcx]
+	mov rdx, [r9]
+	bt rdx, rax
+	jc .Lmark_done_\@
+	mov r8, [rip+rt_heap_start]
+	lea rcx, [r8+8*rax]
+	mov rsi, [rcx]
+	test sil, 2
+	jnz .Lmark_done_\@
+	bts rdx, rax
+	mov [r9], rdx
+	mov r10, rsi
+	shr r10, 3
+	add [rip+rt_live_words], r10
+	test sil, 4
+	jnz .Lmark_done_\@
+	mov [r15], rcx
+	add r15, 8
+.Lmark_done_\@:
+	.endm
 
 	.globl rt_print_bool
 rt_print_bool:
@@ -182,42 +243,141 @@ rt_print_i64:
 rt_str_eq:
 	xor eax, eax
 	cmp rsi, rcx
-	jne 1f
-	mov rsi, rdx
-	test rcx, rcx
-	repe cmpsb
-	sete al
+	jne 9f
+	cmp rdi, rdx
+	je 8f
+	cmp rsi, 8
+	jb 3f
 1:
+	cmp rsi, 8
+	jbe 2f
+	mov r10, [rdi]
+	cmp r10, [rdx]
+	jne 9f
+	add rdi, 8
+	add rdx, 8
+	sub rsi, 8
+	jmp 1b
+2:
+	mov r10, [rdi+rsi-8]
+	cmp r10, [rdx+rsi-8]
+	sete al
+	ret
+3:
+	cmp rsi, 4
+	jb 4f
+	mov r10d, [rdi]
+	cmp r10d, [rdx]
+	jne 9f
+	mov r10d, [rdi+rsi-4]
+	cmp r10d, [rdx+rsi-4]
+	sete al
+	ret
+4:
+	test rsi, rsi
+	jz 8f
+	movzx r10d, byte ptr [rdi]
+	cmp r10b, [rdx]
+	jne 9f
+	movzx r10d, byte ptr [rdi+rsi-1]
+	cmp r10b, [rdx+rsi-1]
+	jne 9f
+	shr rsi, 1
+	movzx r10d, byte ptr [rdi+rsi]
+	cmp r10b, [rdx+rsi]
+	sete al
+	ret
+8:
+	mov eax, 1
+9:
 	ret
 
 	.globl rt_memmove
 rt_memmove:
+	cmp rdx, 16
+	ja 5f
+	cmp rdx, 8
+	jae 1f
+	cmp rdx, 4
+	jae 2f
+	test rdx, rdx
+	jz 9f
+	movzx eax, byte ptr [rsi]
+	movzx ecx, byte ptr [rsi+rdx-1]
+	mov r8, rdx
+	shr r8, 1
+	movzx r9d, byte ptr [rsi+r8]
+	mov [rdi], al
+	mov [rdi+rdx-1], cl
+	mov [rdi+r8], r9b
+9:
+	ret
+2:
+	mov eax, [rsi]
+	mov ecx, [rsi+rdx-4]
+	mov [rdi], eax
+	mov [rdi+rdx-4], ecx
+	ret
+1:
+	mov rax, [rsi]
+	mov rcx, [rsi+rdx-8]
+	mov [rdi], rax
+	mov [rdi+rdx-8], rcx
+	ret
+5:
+	cmp rdx, 32
+	ja 6f
+	movups xmm0, [rsi]
+	movups xmm1, [rsi+rdx-16]
+	movups [rdi], xmm0
+	movups [rdi+rdx-16], xmm1
+	ret
+6:
+	cmp rdx, 64
+	ja 7f
+	movups xmm0, [rsi]
+	movups xmm1, [rsi+16]
+	movups xmm2, [rsi+rdx-32]
+	movups xmm3, [rsi+rdx-16]
+	movups [rdi], xmm0
+	movups [rdi+16], xmm1
+	movups [rdi+rdx-32], xmm2
+	movups [rdi+rdx-16], xmm3
+	ret
+7:
 	mov rcx, rdx
 	cmp rdi, rsi
-	jbe 1f
+	jbe 8f
 	lea rax, [rsi+rdx]
 	cmp rdi, rax
-	jae 1f
+	jae 8f
 	lea rsi, [rsi+rdx-1]
 	lea rdi, [rdi+rdx-1]
 	std
 	rep movsb
 	cld
 	ret
-1:
+8:
 	rep movsb
 	ret
 
-	.globl rt_grow
-rt_grow:
-	ENTER_RT
-	push rdi
-	push rsi
-	push rdx
+	.macro GROW scan
 	push rcx
-	lea rdi, [rdx+7]
+	push rsi
+	push rdi
+	push r8
+	push r9
+	TLS_GET rcx, TLS_G
+	mov r11, [rsp+40]
+	mov [rcx+G_PC], r11
+	mov [rcx+G_USERSP], rsp
+	mov [rcx+G_FP], rbp
+	push rax
+	push rdx
+	push r10
+	lea rdi, [r10+7]
 	shr rdi, 3
-	mov rsi, rcx
+	mov esi, \scan
 	cmp rdi, 1
 	adc rdi, 0
 	cmp rdi, ALLOC_SMALL
@@ -229,13 +389,28 @@ rt_grow:
 	call rt_alloc_body
 	mov qword ptr [rip+rt_heap_lock], 0
 2:
-	pop rcx
-	pop rdx
-	pop rcx
-	pop rsi
 	mov rdi, rax
-	rep movsb
+	mov r11, rax
+	mov rsi, [rsp+16]
+	mov rdx, [rsp+8]
+	call rt_memmove
+	mov rax, r11
+	add rsp, 24
+	pop r9
+	pop r8
+	pop rdi
+	pop rsi
+	pop rcx
 	ret
+	.endm
+
+	.globl rt_grow_scan
+rt_grow_scan:
+	GROW 1
+
+	.globl rt_grow_noscan
+rt_grow_noscan:
+	GROW 0
 
 	.globl rt_pin
 rt_pin:
@@ -368,8 +543,11 @@ rt_gc_init:
 	mov rsi, 268435456
 	call rt_mmap
 	mov [rip+rt_bitmap], rax
+	mov rsi, 268435456
+	call rt_mmap_sparse
+	mov [rip+rt_mark_bits], rax
 	mov rsi, 4194304
-	call rt_mmap
+	call rt_mmap_sparse
 	mov [rip+rt_summary1], rax
 	mov rsi, 65536
 	call rt_mmap
@@ -377,6 +555,9 @@ rt_gc_init:
 	mov rsi, 8589934592
 	call rt_mmap
 	mov [rip+rt_mark_base], rax
+	mov rsi, 524288
+	call rt_mmap
+	mov [rip+rt_dirty], rax
 	mov qword ptr [rip+rt_gc_threshold], 524288
 	ret
 
@@ -384,22 +565,39 @@ rt_set_start:
 	mov rax, rdi
 	sub rax, [rip+rt_heap_start]
 	shr rax, 3
-	mov rcx, [rip+rt_bitmap]
-	lock bts qword ptr [rcx], rax
+	mov rcx, rax
+	shr rcx, 6
+	mov rdx, [rip+rt_bitmap]
+	lea rcx, [rdx+8*rcx]
+	xor edx, edx
+	bts rdx, rax
+	lock or [rcx], rdx
+	shr rax, 6
 	jmp rt_set_summaries
 
 rt_set_summaries:
-	shr rax, 6
-	mov rcx, [rip+rt_summary1]
-	bt qword ptr [rcx], rax
+	mov rcx, rax
+	shr rcx, 6
+	mov rdx, [rip+rt_summary1]
+	lea rcx, [rdx+8*rcx]
+	mov rdx, [rcx]
+	bt rdx, rax
 	jc 1f
-	lock bts qword ptr [rcx], rax
+	xor edx, edx
+	bts rdx, rax
+	lock or [rcx], rdx
 1:
 	shr rax, 6
-	mov rcx, [rip+rt_summary2]
-	bt qword ptr [rcx], rax
+	mov rcx, rax
+	shr rcx, 6
+	mov rdx, [rip+rt_summary2]
+	lea rcx, [rdx+8*rcx]
+	mov rdx, [rcx]
+	bt rdx, rax
 	jc 2f
-	lock bts qword ptr [rcx], rax
+	xor edx, edx
+	bts rdx, rax
+	lock or [rcx], rdx
 2:
 	ret
 
@@ -407,36 +605,419 @@ rt_clear_start:
 	mov rax, rdi
 	sub rax, [rip+rt_heap_start]
 	shr rax, 3
+	mov rdx, rax
+	shr rdx, 6
 	mov rcx, [rip+rt_bitmap]
-	btr qword ptr [rcx], rax
-	shr rax, 6
-	cmp qword ptr [rcx+8*rax], 0
-	jne 1f
+	lea rcx, [rcx+8*rdx]
+	mov r8, [rcx]
+	btr r8, rax
+	mov [rcx], r8
+	test r8, r8
+	jnz 1f
+	jmp rt_clear_summaries
+1:
+	ret
+
+rt_clear_summaries:
+	mov rax, rdx
+	shr rdx, 6
 	mov rcx, [rip+rt_summary1]
-	btr qword ptr [rcx], rax
-	shr rax, 6
-	cmp qword ptr [rcx+8*rax], 0
-	jne 1f
+	lea rcx, [rcx+8*rdx]
+	mov r8, [rcx]
+	btr r8, rax
+	mov [rcx], r8
+	test r8, r8
+	jnz 1f
+	mov rax, rdx
+	shr rdx, 6
 	mov rcx, [rip+rt_summary2]
-	btr qword ptr [rcx], rax
+	lea rcx, [rcx+8*rdx]
+	mov r8, [rcx]
+	btr r8, rax
+	mov [rcx], r8
 1:
 	ret
 
 rt_free_chunk:
+	call rt_link_chunk
+	jmp rt_set_start
+
+rt_link_chunk:
 	mov rax, rsi
 	shl rax, 3
 	or rax, 2
 	mov [rdi], rax
-	lea rcx, [rip+rt_free_large]
-	cmp rsi, 64
-	jae 1f
+	mov r8, [rip+rt_heap_start]
+	mov r9, [rip+rt_dirty]
+	mov rax, rdi
+	sub rax, r8
+	shr rax, PAGE_SHIFT
+	bts qword ptr [r9], rax
+	lea rax, [rdi+15]
+	sub rax, r8
+	shr rax, PAGE_SHIFT
+	bts qword ptr [r9], rax
+	cmp rsi, BIN_MIN
+	jb 4f
+	xor r10d, r10d
+	cmp rsi, RELEASE_MIN
+	jb 2f
+	lea rax, [rdi+16+4095]
+	sub rax, r8
+	shr rax, PAGE_SHIFT
+	lea rcx, [rdi+8*rsi]
+	sub rcx, r8
+	shr rcx, PAGE_SHIFT
+	dec rcx
+	push rdi
+	push rsi
+	mov rdi, rax
+	mov rsi, rcx
+	xor edx, edx
+	call rt_page_scan
+	cmp rax, rsi
+	pop rsi
+	pop rdi
+	jbe 2f
+	mov r10d, BIN_CLEAN
+2:
+	call rt_bin_of
+	add rax, r10
+	lea rcx, [rip+rt_bins]
+	mov rdx, [rcx+8*rax]
+	mov [rdi+8], rdx
+	mov [rcx+8*rax], rdi
+	lea rcx, [rip+rt_bin_bits]
+	bts qword ptr [rcx], rax
+	ret
+4:
 	lea rcx, [rip+rt_free_small]
 	lea rcx, [rcx+8*rsi]
-1:
 	mov rax, [rcx]
 	mov [rdi+8], rax
 	mov [rcx], rdi
-	jmp rt_set_start
+	ret
+
+rt_bin_of:
+	bsr rdx, rsi
+	lea ecx, [rdx-2]
+	mov rax, rsi
+	shr rax, cl
+	and eax, 3
+	sub edx, 6
+	lea rax, [rax+4*rdx]
+	ret
+
+rt_bits_next:
+	cmp rdi, 64
+	jae 2f
+	mov ecx, edi
+	mov rax, -1
+	shl rax, cl
+	and rax, [rsi]
+	jz 1f
+	bsf rax, rax
+	ret
+1:
+	mov rax, [rsi+8]
+	test rax, rax
+	jz 3f
+	bsf rax, rax
+	add rax, 64
+	ret
+2:
+	cmp rdi, 128
+	jae 3f
+	lea ecx, [rdi-64]
+	mov rax, -1
+	shl rax, cl
+	and rax, [rsi+8]
+	jz 3f
+	bsf rax, rax
+	add rax, 64
+	ret
+3:
+	mov rax, -1
+	ret
+
+rt_bin_scan:
+	lea r8, [rip+rt_bins]
+	lea r8, [r8+8*rdi]
+	mov r10, r8
+	mov r9d, BIN_SCAN
+1:
+	mov rax, [r8]
+	test rax, rax
+	jz 9f
+	mov rdx, [rax]
+	shr rdx, 3
+	cmp rdx, rsi
+	jae 2f
+	lea r8, [rax+8]
+	dec r9d
+	jnz 1b
+9:
+	xor eax, eax
+	ret
+2:
+	mov rdx, [rax+8]
+	mov [r8], rdx
+	cmp qword ptr [r10], 0
+	jne 3f
+	lea rcx, [rip+rt_bin_bits]
+	btr qword ptr [rcx], rdi
+3:
+	ret
+
+rt_bin_take:
+	cmp rdi, BIN_MIN
+	jae 1f
+	mov edi, BIN_MIN
+1:
+	push rbx
+	push r12
+	mov r12, rdi
+	mov rsi, rdi
+	call rt_bin_of
+	mov rbx, rax
+	mov rax, 1
+	shl rax, cl
+	dec rax
+	test r12, rax
+	jz 3f
+	mov rdi, rbx
+	mov rsi, r12
+	call rt_bin_scan
+	test rax, rax
+	jnz 8f
+	lea rdi, [rbx+BIN_CLEAN]
+	mov rsi, r12
+	call rt_bin_scan
+	test rax, rax
+	jnz 8f
+	inc rbx
+3:
+	mov rdi, rbx
+	lea rsi, [rip+rt_bin_bits]
+	call rt_bits_next
+	mov r12, rax
+	mov rdi, rbx
+	lea rsi, [rip+rt_bin_bits+16]
+	call rt_bits_next
+	cmp r12, -1
+	je 4f
+	cmp rax, -1
+	je 6f
+	cmp rax, r12
+	jae 6f
+	lea r12, [rax+BIN_CLEAN]
+	jmp 6f
+4:
+	cmp rax, -1
+	je 7f
+	lea r12, [rax+BIN_CLEAN]
+6:
+	lea rcx, [rip+rt_bins]
+	mov rax, [rcx+8*r12]
+	mov rdx, [rax+8]
+	mov [rcx+8*r12], rdx
+	test rdx, rdx
+	jnz 8f
+	lea rcx, [rip+rt_bin_bits]
+	btr qword ptr [rcx], r12
+	jmp 8f
+7:
+	xor eax, eax
+8:
+	pop r12
+	pop rbx
+	ret
+
+rt_page_scan:
+	mov r9, [rip+rt_dirty]
+	mov r8, rdi
+1:
+	cmp r8, rsi
+	ja 3f
+	mov rcx, r8
+	shr rcx, 6
+	mov rax, [r9+8*rcx]
+	xor rax, rdx
+	mov ecx, r8d
+	shr rax, cl
+	test rax, rax
+	jnz 2f
+	or r8, 63
+	inc r8
+	jmp 1b
+2:
+	bsf rax, rax
+	add rax, r8
+	cmp rax, rsi
+	ja 3f
+	ret
+3:
+	lea rax, [rsi+1]
+	ret
+
+rt_page_set:
+	mov r10, -1
+	jmp rt_page_write
+
+rt_page_clear:
+	xor r10d, r10d
+
+rt_page_write:
+	mov r8, [rip+rt_dirty]
+1:
+	mov rdx, rdi
+	shr rdx, 6
+	mov rax, -1
+	mov ecx, edi
+	shl rax, cl
+	mov rcx, rsi
+	shr rcx, 6
+	cmp rcx, rdx
+	jne 2f
+	mov ecx, esi
+	not ecx
+	and ecx, 63
+	mov r9, -1
+	shr r9, cl
+	and rax, r9
+2:
+	mov rcx, [r8+8*rdx]
+	mov r9, rax
+	not r9
+	and rcx, r9
+	and rax, r10
+	or rcx, rax
+	mov [r8+8*rdx], rcx
+	lea rdi, [rdx+1]
+	shl rdi, 6
+	cmp rdi, rsi
+	jbe 1b
+	ret
+
+rt_zero_range:
+	push rbx
+	push r12
+	push r13
+	push r14
+	push r15
+	mov rbx, rdi
+	lea r12, [rdi+8*rsi]
+	mov r13, [rip+rt_heap_start]
+	mov r14, rdi
+	sub r14, r13
+	shr r14, PAGE_SHIFT
+	lea r15, [r12-1]
+	sub r15, r13
+	shr r15, PAGE_SHIFT
+1:
+	cmp r14, r15
+	ja 9f
+	mov rdi, r14
+	mov rsi, r15
+	xor edx, edx
+	call rt_page_scan
+	cmp rax, r15
+	ja 9f
+	mov r14, rax
+	mov rdi, rax
+	mov rsi, r15
+	mov rdx, -1
+	call rt_page_scan
+	mov rcx, r14
+	shl rcx, PAGE_SHIFT
+	add rcx, r13
+	cmp rcx, rbx
+	cmovb rcx, rbx
+	mov rdx, rax
+	shl rdx, PAGE_SHIFT
+	add rdx, r13
+	cmp rdx, r12
+	cmova rdx, r12
+	mov r14, rax
+	mov rdi, rcx
+	mov rcx, rdx
+	sub rcx, rdi
+	shr rcx, 3
+	xor eax, eax
+	rep stosq
+	jmp 1b
+9:
+	mov rdi, rbx
+	sub rdi, r13
+	shr rdi, PAGE_SHIFT
+	mov rsi, r15
+	call rt_page_set
+	pop r15
+	pop r14
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+rt_next_word:
+	mov r11, [rip+rt_heap_bump]
+	sub r11, [rip+rt_heap_start]
+	add r11, 511
+	shr r11, 9
+	cmp rdi, r11
+	jae 7f
+	add r11, 4095
+	shr r11, 12
+	mov rdx, rdi
+	mov rsi, rdx
+	shr rsi, 6
+	mov r9, [rip+rt_summary1]
+	mov rax, [r9+8*rsi]
+	mov ecx, edx
+	shr rax, cl
+	test rax, rax
+	jz 1f
+	bsf rax, rax
+	add rax, rdx
+	ret
+1:
+	inc rsi
+	mov r10, [rip+rt_summary2]
+	mov rdx, rsi
+	shr rdx, 6
+	cmp rdx, r11
+	jae 7f
+	mov rax, [r10+8*rdx]
+	mov ecx, esi
+	shr rax, cl
+	test rax, rax
+	jz 3f
+	bsf rax, rax
+	add rax, rsi
+	jmp 5f
+3:
+	inc rdx
+4:
+	cmp rdx, r11
+	jae 7f
+	mov rax, [r10+8*rdx]
+	test rax, rax
+	jnz 6f
+	inc rdx
+	jmp 4b
+6:
+	bsf rax, rax
+	shl rdx, 6
+	add rax, rdx
+5:
+	mov rdx, [r9+8*rax]
+	bsf rdx, rdx
+	shl rax, 6
+	add rax, rdx
+	ret
+7:
+	mov rax, -1
+	ret
 
 	.globl rt_argc
 rt_argc:
@@ -500,18 +1081,28 @@ rt_alloc_small:
 	mov rcx, rax
 	sub rcx, [rip+rt_heap_start]
 	shr rcx, 3
-	mov rdx, [rip+rt_bitmap]
+	mov rdx, rcx
+	shr rdx, 6
+	mov r10, [rip+rt_bitmap]
+	lea rdx, [r10+8*rdx]
+	xor r10d, r10d
+	bts r10, rcx
 	cmp rax, [r8+M_ALLOC_LO]
 	jb 4f
 	cmp rax, [r8+M_ALLOC_HI]
 	jae 4f
-	bts qword ptr [rdx], rcx
+	or [rdx], r10
 	jmp 6f
 4:
-	lock bts qword ptr [rdx], rcx
+	lock or [rdx], r10
 6:
+	shr rcx, 6
+	cmp rcx, [r8+M_ALLOC_SUMMARY]
+	je 7f
+	mov [r8+M_ALLOC_SUMMARY], rcx
 	mov rax, rcx
 	call rt_set_summaries
+7:
 	lea rax, [r9+8]
 	ret
 5:
@@ -547,27 +1138,17 @@ rt_alloc_refill:
 	mov qword ptr [rbx+M_ALLOC_END], 0
 	call rt_alloc_retire
 	mov rax, [rip+rt_alloc_since]
-	add rax, ALLOC_BUFFER
-	mov [rip+rt_alloc_since], rax
 	cmp rax, [rip+rt_gc_threshold]
 	jb 1f
 	call rt_gc
 1:
-	lea rcx, [rip+rt_free_large]
-2:
-	mov rax, [rcx]
+	mov rdi, r12
+	call rt_bin_take
 	test rax, rax
 	jz 5f
-	mov rdx, [rax]
-	shr rdx, 3
-	cmp rdx, r12
-	jae 3f
-	lea rcx, [rax+8]
-	jmp 2b
 3:
-	mov r8, [rax+8]
-	mov [rcx], r8
-	mov r13, rdx
+	mov r13, [rax]
+	shr r13, 3
 	cmp r13, ALLOC_BUFFER+2
 	jb 8f
 	push rax
@@ -602,12 +1183,14 @@ rt_alloc_refill:
 	HEAP_COMMIT rdx
 	mov [rip+rt_heap_bump], rdx
 8:
+	add [rip+rt_alloc_since], r13
 	mov rdi, rax
-	mov rcx, r13
-	mov rdx, rax
-	xor eax, eax
-	rep stosq
+	mov rsi, r13
+	push rax
+	call rt_zero_range
+	pop rdx
 	mov [rbx+M_ALLOC_CUR], rdx
+	mov qword ptr [rbx+M_ALLOC_SUMMARY], -1
 	lea rax, [rdx+8*r13]
 	mov [rbx+M_ALLOC_END], rax
 	and rax, -512
@@ -656,30 +1239,14 @@ rt_alloc_body:
 	call rt_gc
 	pop rsi
 1:
-	cmp rsi, 64
-	jae 2f
-	lea rcx, [rip+rt_free_small]
-	mov rax, [rcx+8*rsi]
-	test rax, rax
-	jz 2f
-	mov rdx, [rax+8]
-	mov [rcx+8*rsi], rdx
-	jmp 6f
-2:
-	lea rcx, [rip+rt_free_large]
-3:
-	mov rax, [rcx]
+	push rsi
+	mov rdi, rsi
+	call rt_bin_take
+	pop rsi
 	test rax, rax
 	jz 5f
 	mov rdx, [rax]
 	shr rdx, 3
-	cmp rdx, rsi
-	jae 4f
-	lea rcx, [rax+8]
-	jmp 3b
-4:
-	mov r8, [rax+8]
-	mov [rcx], r8
 	mov r9, rdx
 	sub r9, rsi
 	cmp r9, 2
@@ -696,6 +1263,9 @@ rt_alloc_body:
 	mov rsi, rdx
 	jmp 6f
 5:
+	push rsi
+	call rt_heap_release
+	pop rsi
 	mov rax, [rip+rt_heap_bump]
 	lea rdx, [rax+8*rsi]
 	cmp rdx, [rip+rt_heap_end]
@@ -716,13 +1286,14 @@ rt_alloc_body:
 	jnz 8f
 	or rdx, 4
 8:
+	push rdx
+	push rax
+	mov rdi, rax
+	call rt_zero_range
+	pop rax
+	pop rdx
 	mov [rax], rdx
-	lea rdi, [rax+8]
-	lea rcx, [rsi-1]
-	mov rdx, rax
-	xor eax, eax
-	rep stosq
-	lea rax, [rdx+8]
+	add rax, 8
 	ret
 
 rt_find:
@@ -811,17 +1382,7 @@ rt_find:
 	ret
 
 rt_mark:
-	call rt_find
-	test rax, rax
-	jz 1f
-	mov rdx, [rax]
-	test edx, 3
-	jnz 1f
-	or rdx, 1
-	mov [rax], rdx
-	mov [r15], rax
-	add r15, 8
-1:
+	MARK_CANDIDATE
 	ret
 
 rt_gc:
@@ -834,15 +1395,19 @@ rt_gc:
 	mov [rax+G_SCANLO], rsp
 	call rt_world_stop
 	call rt_alloc_retire_all
+	mov qword ptr [rip+rt_live_words], 0
 	mov r15, [rip+rt_mark_base]
 	lea rdi, [rip+rt_pins]
 	mov rsi, [rip+rt_pin_count]
 	lea rsi, [rdi+8*rsi]
 	call rt_scan_range
+	lea rdi, [rip+rt_cells]
+	lea rsi, [rip+rt_cells_end]
+	call rt_scan_range
 	xor r12d, r12d
 1:
 	cmp r12, [rip+rt_ngs]
-	jae 6f
+	jae 5f
 	mov rax, [rip+rt_allgs]
 	mov rdi, [rax+8*r12]
 	inc r12
@@ -853,13 +1418,13 @@ rt_gc:
 	ja 1b
 	call rt_scan_g
 	jmp 1b
+5:
+	xor ebx, ebx
 6:
 	cmp r15, [rip+rt_mark_base]
-	jbe 8f
+	jbe 9f
 	sub r15, 8
 	mov r12, [r15]
-	test byte ptr [r12], 4
-	jnz 6b
 	mov r13, [r12]
 	shr r13, 3
 	mov r14d, 1
@@ -867,10 +1432,36 @@ rt_gc:
 	cmp r14, r13
 	jae 6b
 	mov rdi, [r12+8*r14]
-	call rt_mark
 	inc r14
+	cmp rdi, [rip+rt_heap_start]
+	jb 7b
+	prefetcht0 [rdi-8]
+	mov rax, rbx
+	and eax, 31
+	lea rcx, [rip+rt_mark_ring]
+	mov rdx, [rcx+8*rax]
+	mov [rcx+8*rax], rdi
+	mov rdi, rdx
+	inc rbx
+	test rdi, rdi
+	jz 7b
+	MARK_CANDIDATE
 	jmp 7b
-8:
+9:
+	xor r13d, r13d
+10:
+	lea rcx, [rip+rt_mark_ring]
+	mov rdi, [rcx+8*r13]
+	mov qword ptr [rcx+8*r13], 0
+	inc r13
+	test rdi, rdi
+	jz 11f
+	MARK_CANDIDATE
+11:
+	cmp r13, 32
+	jb 10b
+	cmp r15, [rip+rt_mark_base]
+	ja 6b
 	call rt_sweep
 	call rt_world_start
 	pop r15
@@ -1073,54 +1664,87 @@ rt_sweep:
 	mov ecx, 64
 	xor eax, eax
 	rep stosq
-	mov qword ptr [rip+rt_free_large], 0
-	mov r12, [rip+rt_heap_start]
+	lea rdi, [rip+rt_bin_bits]
+	mov ecx, 260
+	rep stosq
+	push rbp
 	xor r13d, r13d
 	xor r14d, r14d
-	xor ebx, ebx
 1:
-	cmp r12, [rip+rt_heap_bump]
-	jae 5f
-	mov rax, [r12]
-	mov rcx, rax
-	shr rcx, 3
-	test eax, 1
-	jz 2f
-	and rax, -2
-	mov [r12], rax
-	add rbx, rcx
-	test r13, r13
-	jz 4f
-	push rcx
-	mov rdi, r13
-	mov rsi, r14
-	call rt_free_chunk
-	pop rcx
-	xor r13d, r13d
-	jmp 4f
+	mov rdi, r14
+	call rt_next_word
+	cmp rax, -1
+	je 5f
+	mov r14, rax
+	mov rax, [rip+rt_bitmap]
+	mov rdx, [rax+8*r14]
+	mov rax, [rip+rt_mark_bits]
+	mov rbx, [rax+8*r14]
+	and rbx, rdx
+	mov r12, rbx
+	not r12
+	and r12, rdx
+	mov rbp, -1
 2:
 	test r13, r13
-	jnz 3f
-	mov r13, r12
-	mov r14, rcx
-	jmp 4f
-3:
-	add r14, rcx
-	push rcx
-	mov rdi, r12
-	call rt_clear_start
-	pop rcx
+	jnz 4f
+	mov rax, r12
+	and rax, rbp
+	jz 7f
+	bsf rcx, rax
+	mov rdx, r14
+	shl rdx, 6
+	add rdx, rcx
+	mov r13, [rip+rt_heap_start]
+	lea r13, [r13+8*rdx]
+	bts rbx, rcx
+	mov rax, -2
+	shl rax, cl
+	and rbp, rax
+	jmp 2b
 4:
-	lea r12, [r12+8*rcx]
+	mov rax, rbx
+	and rax, rbp
+	jz 7f
+	bsf rcx, rax
+	mov rdx, -2
+	shl rdx, cl
+	and rbp, rdx
+	mov rdx, r14
+	shl rdx, 6
+	add rdx, rcx
+	mov rsi, [rip+rt_heap_start]
+	lea rsi, [rsi+8*rdx]
+	mov rdi, r13
+	sub rsi, r13
+	shr rsi, 3
+	call rt_link_chunk
+	xor r13d, r13d
+	jmp 2b
+7:
+	mov rax, [rip+rt_mark_bits]
+	cmp qword ptr [rax+8*r14], 0
+	je 6f
+	mov qword ptr [rax+8*r14], 0
+6:
+	mov rax, [rip+rt_bitmap]
+	mov [rax+8*r14], rbx
+	test rbx, rbx
+	jnz 8f
+	mov rdx, r14
+	call rt_clear_summaries
+8:
+	inc r14
 	jmp 1b
 5:
 	test r13, r13
-	jz 6f
+	jz 3f
 	mov [rip+rt_heap_bump], r13
 	mov rdi, r13
 	call rt_clear_start
-6:
-	mov rax, rbx
+3:
+	pop rbp
+	mov rax, [rip+rt_live_words]
 	mov rcx, 524288
 	cmp rax, rcx
 	cmovb rax, rcx
@@ -1208,6 +1832,73 @@ rt_exp:
 	xor eax, eax
 	ret
 
+rt_seed_mix:
+	mov rdx, 0x9E3779B97F4A7C15
+	add rax, rdx
+	mov rdx, rax
+	shr rdx, 30
+	xor rax, rdx
+	mov rdx, 0xBF58476D1CE4E5B9
+	imul rax, rdx
+	mov rdx, rax
+	shr rdx, 27
+	xor rax, rdx
+	mov rdx, 0x94D049BB133111EB
+	imul rax, rdx
+	mov rdx, rax
+	shr rdx, 31
+	xor rax, rdx
+	ret
+
+rt_seed_fallback:
+	push rbx
+	rdtsc
+	shl rdx, 32
+	or rax, rdx
+	mov r8, rax
+	mov eax, 1
+	xor ecx, ecx
+	cpuid
+	mov r9d, ecx
+	rdtsc
+	shl rdx, 32
+	or rax, rdx
+	mov r10, rax
+	mov r11, rsp
+	bt r9d, 30
+	jnc 4f
+	mov ecx, 10
+1:
+	rdrand rax
+	jc 2f
+	dec ecx
+	jnz 1b
+	jmp 4f
+2:
+	xor r8, rax
+	mov ecx, 10
+3:
+	rdrand rax
+	jc 5f
+	dec ecx
+	jnz 3b
+	jmp 4f
+5:
+	xor r10, rax
+4:
+	mov rax, r8
+	xor rax, r11
+	call rt_seed_mix
+	mov r8, rax
+	mov rax, r10
+	ror r11, 29
+	xor rax, r11
+	call rt_seed_mix
+	mov rdx, rax
+	mov rax, r8
+	pop rbx
+	ret
+
 	.data
 	.globl rt_avx2
 rt_avx2:
@@ -1219,6 +1910,8 @@ rt_cpu_init:
 	push rbx
 	push r12
 	mov r12, rdi
+	call rt_seed_init
+	mov rdi, r12
 	call rt_vdso_init
 	mov eax, 1
 	xor ecx, ecx

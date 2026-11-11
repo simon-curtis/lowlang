@@ -15,6 +15,7 @@ import (
 	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
 	"lowlang/internal/lexer"
+	"lowlang/internal/lint"
 	"lowlang/internal/parser"
 )
 
@@ -303,7 +304,23 @@ func (s *Server) finish(r compiled) error {
 		uri, d := s.diagnose(r.err, r.job.path)
 		diagnostics[uri] = append(diagnostics[uri], d)
 	}
+	if r.err == nil {
+		for _, w := range r.unit.Warnings {
+			uri, d := s.warn(w, r.job.path)
+			diagnostics[uri] = append(diagnostics[uri], d)
+		}
+	}
 	return s.publish(entry, diagnostics)
+}
+
+func (s *Server) warn(w lint.Warning, document string) (string, Diagnostic) {
+	file := w.Pos.File
+	if file == "" || !filepath.IsAbs(file) {
+		file = document
+	}
+	pos := lexer.Pos{File: file, Line: w.Pos.Line, Col: w.Pos.Col}
+	d := Diagnostic{Severity: severityWarning, Source: "low", Message: w.Msg, Range: s.text(file).word(pos)}
+	return uriOf(file), d
 }
 
 func (s *Server) publish(entry string, diagnostics map[string][]Diagnostic) error {

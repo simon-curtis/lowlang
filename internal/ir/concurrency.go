@@ -113,7 +113,6 @@ func (b *builder) chanLoop(s *ast.ForIn) {
 }
 
 func (b *builder) selectExpr(e *ast.Select) []*Value {
-	w := b.callNamed("__waiter")[0]
 	arms := make([]*selectArm, len(e.Cases))
 	var chans []*Value
 	elseIndex := -1
@@ -124,7 +123,7 @@ func (b *builder) selectExpr(e *ast.Select) []*Value {
 		case ast.RecvCase:
 			a.chant = sc.Chan.TypeOf()
 			a.ch = b.word(sc.Chan)
-			a.box = b.chanCall("__box", a.chant)[0]
+			a.box = b.slot(max(1, a.chant.Elem.Size()))
 			chans = append(chans, a.ch)
 		case ast.SendCase:
 			a.chant = sc.Chan.TypeOf()
@@ -138,32 +137,33 @@ func (b *builder) selectExpr(e *ast.Select) []*Value {
 		}
 	}
 	locks := b.lockChannels(chans)
-	done := b.newTemp()
-	b.writeTemp(done, []*Value{b.constant(0)})
+	outcome := b.newTemp()
+	b.writeTemp(outcome, []*Value{b.constant(-1), b.constant(0), b.constant(0)})
 	for i, a := range arms {
 		if a.ch != nil {
-			b.trySelect(i, a, w, done)
+			b.trySelect(i, a, outcome)
 		}
 	}
 	fired := b.newBlock()
 	waiting := b.newBlock()
 	finish := b.newBlock()
-	b.branch(b.readTemp(done, 1)[0], fired, waiting)
+	pending := b.emit(OpLt, b.readTemp(outcome, 1)[0], b.constant(0))
+	b.branch(pending, waiting, fired)
 	b.enter(fired)
 	b.unlockChannels(locks, len(chans))
-	b.callNamed("__sel_wake", w)
+	b.callNamed("__wake", b.readTemp(outcome, 3)[2])
 	b.jump(finish)
 	b.enter(waiting)
 	if elseIndex >= 0 {
 		b.unlockChannels(locks, len(chans))
-		b.store(place{addr: w, offset: 8}, []*Value{b.constant(int64(elseIndex))})
+		b.writeTemp(outcome, []*Value{b.constant(int64(elseIndex))})
 	} else {
-		b.waitSelect(arms, w, locks, len(chans))
+		b.waitSelect(arms, locks, len(chans), outcome)
 	}
 	b.jump(finish)
 	b.enter(finish)
-	index := b.load(place{addr: w, offset: 8}, types.I64)[0]
-	return b.selectArms(e, arms, w, index)
+	result := b.readTemp(outcome, 2)
+	return b.selectArms(e, arms, result[0], result[1])
 }
 
 func (b *builder) lockChannels(chans []*Value) *Value {
@@ -184,33 +184,38 @@ func (b *builder) unlockChannels(locks *Value, n int) {
 	}
 }
 
-func (b *builder) trySelect(i int, a *selectArm, w *Value, done int) {
+func (b *builder) trySelect(i int, a *selectArm, outcome int) {
 	try := b.newBlock()
+	hit := b.newBlock()
 	skip := b.newBlock()
-	b.branch(b.readTemp(done, 1)[0], skip, try)
+	b.branch(b.emit(OpLt, b.readTemp(outcome, 1)[0], b.constant(0)), try, skip)
 	b.enter(try)
-	index := b.constant(int64(i))
-	var result []*Value
+	var probe []*Value
 	if a.sc.Kind == ast.RecvCase {
-		result = b.chanCall("__sel_recv", a.chant, a.ch, w, index, a.box)
+		probe = b.chanCall("__sel_recv", a.chant, a.ch, a.box)
 	} else {
-		args := append([]*Value{a.ch, w, index}, a.val...)
-		result = b.chanCall("__sel_send", a.chant, args...)
+		args := append([]*Value{a.ch}, a.val...)
+		probe = b.chanCall("__sel_send", a.chant, args...)
 	}
-	b.writeTemp(done, result)
+	b.branch(b.emit(OpLt, probe[0], b.constant(0)), skip, hit)
+	b.enter(hit)
+	ok := b.emit(OpEq, probe[0], b.constant(1))
+	b.writeTemp(outcome, []*Value{b.constant(int64(i)), ok, probe[1]})
 	b.jump(skip)
 	b.enter(skip)
 }
 
-func (b *builder) waitSelect(arms []*selectArm, w, locks *Value, n int) {
+func (b *builder) waitSelect(arms []*selectArm, locks *Value, n int, outcome int) {
+	w := b.callNamed("__waiter")[0]
 	for i, a := range arms {
 		index := b.constant(int64(i))
 		switch a.sc.Kind {
 		case ast.RecvCase:
 			b.chanCall("__sel_wait_recv", a.chant, a.ch, w, index, a.box)
 		case ast.SendCase:
-			args := append([]*Value{a.ch, w, index}, a.val...)
-			b.chanCall("__sel_wait_send", a.chant, args...)
+			a.box = b.slot(max(1, len(a.val)))
+			b.store(place{addr: a.box}, a.val)
+			b.chanCall("__sel_wait_send", a.chant, a.ch, w, index, a.box)
 		}
 	}
 	b.unlockChannels(locks, n)
@@ -222,18 +227,19 @@ func (b *builder) waitSelect(arms []*selectArm, w, locks *Value, n int) {
 	}
 	b.runtimeVoid("park")
 	for _, a := range arms {
-		switch {
-		case a.sc.Kind == ast.RecvCase:
-			b.chanCall("__sel_cancel_recv", a.chant, a.ch, w)
-		case a.sc.Kind == ast.SendCase:
-			b.chanCall("__sel_cancel_send", a.chant, a.ch, w)
-		case a.timer != nil:
+		if a.timer != nil {
 			b.runtimeVoid("timer_del", a.timer)
 		}
+		if a.sc.Kind == ast.SendCase {
+			b.clearSlot(a.box, len(a.val))
+		}
 	}
+	index := b.load(place{addr: w, offset: 8}, types.I64)[0]
+	ok := b.load(place{addr: w, offset: 16}, types.Bool)[0]
+	b.writeTemp(outcome, []*Value{index, ok})
 }
 
-func (b *builder) selectArms(e *ast.Select, arms []*selectArm, w, index *Value) []*Value {
+func (b *builder) selectArms(e *ast.Select, arms []*selectArm, index, ok *Value) []*Value {
 	temp := b.newTemp()
 	done := b.newBlock()
 	for i, a := range arms {
@@ -243,7 +249,10 @@ func (b *builder) selectArms(e *ast.Select, arms []*selectArm, w, index *Value) 
 		b.branch(match, body, next)
 		b.enter(body)
 		if a.sc.Local != nil {
-			b.bind(a.sc.Local, b.chanCall("__sel_value", a.chant, w, a.box))
+			b.bind(a.sc.Local, b.chanCall("__sel_value", a.chant, ok, a.box))
+		}
+		if a.sc.Kind == ast.RecvCase {
+			b.clearSlot(a.box, a.chant.Elem.Size())
 		}
 		b.writeTemp(temp, b.value(a.sc.Body, e.Type))
 		b.jump(done)
@@ -252,4 +261,12 @@ func (b *builder) selectArms(e *ast.Select, arms []*selectArm, w, index *Value) 
 	b.cur.Kind = Unreachable
 	b.enter(done)
 	return b.readTemp(temp, e.Type.Size())
+}
+
+func (b *builder) clearSlot(slot *Value, words int) {
+	zeros := make([]*Value, max(1, words))
+	for i := range zeros {
+		zeros[i] = b.constant(0)
+	}
+	b.store(place{addr: slot}, zeros)
 }

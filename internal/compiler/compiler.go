@@ -13,25 +13,35 @@ import (
 	"lowlang/internal/check"
 	"lowlang/internal/ir"
 	"lowlang/internal/lexer"
+	"lowlang/internal/lint"
 	"lowlang/internal/parser"
 	"lowlang/internal/target"
 )
 
 type Unit struct {
-	Files   []*ast.File
-	Program *ir.Program
-	Sources []string
+	Files    []*ast.File
+	Program  *ir.Program
+	Sources  []string
+	Warnings []lint.Warning
 }
 
 //go:embed prelude.low
 var preludeSource []byte
 
 func Analyse(path string, platform target.OS) (*Unit, error) {
+	return analyse(path, platform, ir.Options{Inline: true, Hoist: true})
+}
+
+func AnalyseDev(path string, platform target.OS) (*Unit, error) {
+	return analyse(path, platform, ir.Options{})
+}
+
+func analyse(path string, platform target.OS, opts ir.Options) (*Unit, error) {
 	unit, err := Check(path, os.ReadFile)
 	if err != nil {
 		return nil, err
 	}
-	unit.Program = ir.Build(unit.Files, platform)
+	unit.Program = ir.Build(unit.Files, platform, opts)
 	return unit, nil
 }
 
@@ -49,7 +59,9 @@ func Check(path string, read func(name string) ([]byte, error)) (*Unit, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Unit{Files: files, Sources: append(modules.sources, embeds...)}, nil
+	unit := &Unit{Files: files, Sources: append(modules.sources, embeds...)}
+	unit.Warnings = lint.Run(modules.userFiles())
+	return unit, nil
 }
 
 func parsePrelude() (*ast.File, error) {
@@ -60,12 +72,13 @@ func parsePrelude() (*ast.File, error) {
 	return parser.ParsePrelude(tokens)
 }
 
-func Assemble(ctx context.Context, asm, object string) error {
+func Assemble(ctx context.Context, asm, object string, flags ...string) error {
 	source := fmt.Sprintf("%s.s", object)
 	if err := os.WriteFile(source, []byte(asm), 0o644); err != nil {
 		return err
 	}
-	return tool(ctx, "as", "-o", object, source)
+	args := append(flags, "-o", object, source)
+	return tool(ctx, "as", args...)
 }
 
 func Link(ctx context.Context, asm, output string, prog *ir.Program) error {
@@ -78,7 +91,7 @@ func Link(ctx context.Context, asm, output string, prog *ir.Program) error {
 		return linkWindows(ctx, dir, asm, output)
 	}
 	object := filepath.Join(dir, "main.o")
-	if err := Assemble(ctx, asm, object); err != nil {
+	if err := Assemble(ctx, asm, object, "-mbranches-within-32B-boundaries"); err != nil {
 		return err
 	}
 	if len(prog.Libraries) == 0 {
@@ -103,7 +116,7 @@ func linkWindows(ctx context.Context, dir, asm, output string) error {
 		return err
 	}
 	return tool(ctx, "lld-link",
-		"/nologo", "/nodefaultlib", "/entry:start", "/subsystem:console",
+		"/nologo", "/brepro", "/nodefaultlib", "/entry:start", "/subsystem:console",
 		fmt.Sprintf("/stack:%d", windowsStack), fmt.Sprintf("/out:%s", output), object)
 }
 

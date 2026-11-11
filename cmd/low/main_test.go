@@ -5,17 +5,18 @@ import (
 	"context"
 	"debug/elf"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"lowlang/internal/compiler"
+	"lowlang/internal/peakrss"
 	"lowlang/internal/target"
 )
 
@@ -92,10 +93,29 @@ func runWithEnv(t *testing.T, path, binary string, env []string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binary)
-	cmd.Env = append(os.Environ(), env...)
-	compareRun(t, path, cmd, env)
-	checkMemory(t, path, cmd.ProcessState)
+	newCmd := func(stdout, stderr io.Writer) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, binary)
+		cmd.Env = append(os.Environ(), env...)
+		cmd.Stdout, cmd.Stderr = stdout, stderr
+		return cmd
+	}
+	limit, measured := memoryLimit(t, path)
+	if !measured {
+		compareRun(t, path, func(stdout, stderr io.Writer) error {
+			return newCmd(stdout, stderr).Run()
+		}, env)
+		return
+	}
+	var peak int64
+	compareRun(t, path, func(stdout, stderr io.Writer) error {
+		result, err := peakrss.Run(func() *exec.Cmd { return newCmd(stdout, stderr) })
+		peak = result.PeakKB
+		return err
+	}, env)
+	t.Logf("peak memory %d KB, limit %d KB", peak, limit)
+	if peak > limit {
+		t.Errorf("peak memory %d KB exceeds %d KB", peak, limit)
+	}
 }
 
 func TestRunWindows(t *testing.T) {
@@ -124,14 +144,16 @@ func runWindowsFixture(t *testing.T, wine, path string) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, wine, binary)
 	cmd.Env = append(os.Environ(), "WINEDEBUG=-all", "DISPLAY=", "WAYLAND_DISPLAY=")
-	compareRun(t, path, cmd, nil)
+	compareRun(t, path, func(stdout, stderr io.Writer) error {
+		cmd.Stdout, cmd.Stderr = stdout, stderr
+		return cmd.Run()
+	}, nil)
 }
 
-func compareRun(t *testing.T, path string, cmd *exec.Cmd, env []string) {
+func compareRun(t *testing.T, path string, run func(stdout, stderr io.Writer) error, env []string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	runErr := cmd.Run()
+	runErr := run(&stdout, &stderr)
 
 	wantOut, _ := expected(t, path, ".out")
 	if got := stdout.String(); got != wantOut {
@@ -169,22 +191,17 @@ func checkLinking(t *testing.T, path, binary string) {
 	}
 }
 
-func checkMemory(t *testing.T, path string, state *os.ProcessState) {
-	limit, ok := expected(t, path, ".maxrss")
+func memoryLimit(t *testing.T, path string) (int64, bool) {
+	t.Helper()
+	text, ok := expected(t, path, ".maxrss")
 	if !ok {
-		return
+		return 0, false
 	}
-	kb, err := strconv.ParseInt(strings.TrimSpace(limit), 10, 64)
+	kb, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
 	if err != nil {
 		t.Fatalf("invalid .maxrss: %v", err)
 	}
-	usage, ok := state.SysUsage().(*syscall.Rusage)
-	if !ok {
-		t.Fatal("resource usage unavailable")
-	}
-	if usage.Maxrss > kb {
-		t.Errorf("peak memory %d KB exceeds %d KB", usage.Maxrss, kb)
-	}
+	return kb, true
 }
 
 func TestFail(t *testing.T) {

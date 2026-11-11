@@ -1148,7 +1148,25 @@ func (p *Parser) atEnd() bool {
 	return false
 }
 
+func (p *Parser) valueArm() bool {
+	switch p.tok().Kind {
+	case lexer.Int, lexer.Float, lexer.Char, lexer.String, lexer.True, lexer.False, lexer.LParen, lexer.Not, lexer.Tilde:
+		return true
+	case lexer.Minus:
+		next := p.peek()
+		return next == lexer.Int || next == lexer.Float
+	case lexer.Ident:
+		return p.peek() == lexer.Dot
+	}
+	return false
+}
+
 func (p *Parser) pattern() *ast.Pattern {
+	if t := p.tok(); p.valueArm() {
+		subject := &ast.Subject{Pos: t.Pos}
+		test := &ast.Binary{Op: lexer.Eq, X: subject, Y: p.expr(), Pos: t.Pos}
+		return &ast.Pattern{Test: test, Pos: t.Pos}
+	}
 	if t := p.tok(); precedence[t.Kind] > 0 {
 		p.testing = true
 		test := p.binaryFrom(&ast.Subject{Pos: t.Pos}, 0)

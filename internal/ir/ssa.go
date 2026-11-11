@@ -16,7 +16,12 @@ type ssa struct {
 	fn         *Func
 	defs       map[varKey]map[*Block]*Value
 	sealed     map[*Block]bool
-	incomplete map[*Block]map[varKey]*Value
+	incomplete map[*Block][]pendingPhi
+}
+
+type pendingPhi struct {
+	key varKey
+	phi *Value
 }
 
 func newSSA(fn *Func) ssa {
@@ -24,7 +29,7 @@ func newSSA(fn *Func) ssa {
 		fn:         fn,
 		defs:       map[varKey]map[*Block]*Value{},
 		sealed:     map[*Block]bool{},
-		incomplete: map[*Block]map[varKey]*Value{},
+		incomplete: map[*Block][]pendingPhi{},
 	}
 }
 
@@ -56,10 +61,7 @@ func (s *ssa) readRecursive(k varKey, b *Block) *Value {
 	switch {
 	case !s.sealed[b]:
 		v = s.phi(b)
-		if s.incomplete[b] == nil {
-			s.incomplete[b] = map[varKey]*Value{}
-		}
-		s.incomplete[b][k] = v
+		s.incomplete[b] = append(s.incomplete[b], pendingPhi{key: k, phi: v})
 	case len(b.Preds) == 0:
 		v = s.prepend(b, OpUndef)
 	case len(b.Preds) == 1:
@@ -110,19 +112,38 @@ func (s *ssa) trivial(phi *Value) *Value {
 }
 
 func (s *ssa) seal(b *Block) {
-	for k, phi := range s.incomplete[b] {
-		s.addOperands(k, phi)
+	for i := 0; i < len(s.incomplete[b]); i++ {
+		pending := s.incomplete[b][i]
+		s.addOperands(pending.key, pending.phi)
 	}
 	delete(s.incomplete, b)
 	s.sealed[b] = true
 }
 
 func (s *ssa) finalize() {
-	s.prune()
-	for s.removeTrivialPhis() {
-	}
+	s.optimizeUntilStable()
+	s.optimizeLoops()
+	s.removeDeadValues()
 	s.countUses()
 	s.classifyPhis()
+	s.classifyFloatPhis()
+}
+
+func (s *ssa) optimizeUntilStable() {
+	for {
+		s.prune()
+		for s.removeTrivialPhis() {
+		}
+		s.optimize()
+		for s.removeTrivialPhis() {
+		}
+		folded := s.foldConstantBranches()
+		threaded := s.threadBranches()
+		merged := s.mergeBlocks()
+		if !folded && !threaded && !merged {
+			return
+		}
+	}
 }
 
 func (s *ssa) classifyPhis() {
@@ -237,6 +258,11 @@ func (s *ssa) resolveBlock(b *Block) {
 func (s *ssa) countUses() {
 	for _, b := range s.fn.Blocks {
 		for _, v := range b.Values {
+			v.Uses = 0
+		}
+	}
+	for _, b := range s.fn.Blocks {
+		for _, v := range b.Values {
 			for _, arg := range v.Args {
 				arg.Uses++
 			}
@@ -248,4 +274,65 @@ func (s *ssa) countUses() {
 			r.Uses++
 		}
 	}
+}
+
+type floatLattice map[*Value]int
+
+func (s *ssa) classifyFloatPhis() {
+	var phis []*Value
+	for _, b := range s.fn.Blocks {
+		for _, v := range b.Values {
+			if v.Op == OpPhi {
+				phis = append(phis, v)
+			}
+		}
+	}
+	lattice := floatLattice{}
+	for changed := true; changed; {
+		changed = false
+		for _, phi := range phis {
+			if lattice.refine(phi) {
+				changed = true
+			}
+		}
+	}
+	for _, phi := range phis {
+		phi.FloatBits = lattice[phi]
+	}
+}
+
+func (l floatLattice) refine(phi *Value) bool {
+	bits, determined := l.join(phi)
+	old, known := l[phi]
+	if !determined || (known && old == bits) {
+		return false
+	}
+	l[phi] = bits
+	return true
+}
+
+func (l floatLattice) join(phi *Value) (int, bool) {
+	bits, determined := 0, false
+	for _, a := range phi.Args {
+		if a == phi || a.Op == OpUndef {
+			continue
+		}
+		argBits, known := l.bitsOf(a)
+		switch {
+		case !known:
+		case !determined:
+			bits, determined = argBits, true
+		case bits != argBits:
+			return 0, true
+		}
+	}
+	return bits, determined
+}
+
+func (l floatLattice) bitsOf(v *Value) (int, bool) {
+	if v.Op != OpPhi {
+		return v.FloatBits, true
+	}
+	bits, known := l[v]
+	return bits, known
 }

@@ -61,6 +61,13 @@ func (b *builder) slicing(e *ast.Slicing) []*Value {
 }
 
 func (b *builder) sliceLit(e *ast.SliceLit) []*Value {
+	if words, ok := b.hoistedSlice(e); ok {
+		return words
+	}
+	return b.filledSlice(e)
+}
+
+func (b *builder) filledSlice(e *ast.SliceLit) []*Value {
 	n := b.constant(int64(len(e.Elems)))
 	if len(e.Elems) == 0 {
 		return []*Value{b.constant(0), n, n}
@@ -78,51 +85,12 @@ func (b *builder) callNamed(name string, args ...*Value) []*Value {
 	return b.invoke(b.named[name], args)
 }
 
-func (b *builder) buffer() *Value {
-	slot := b.emit(OpSlot)
-	slot.Aux = int64(len(b.fn.Slots))
-	b.fn.Slots = append(b.fn.Slots, 3)
-	zero := b.constant(0)
-	b.store(place{addr: slot}, []*Value{zero, zero, zero})
-	return slot
-}
-
-func (b *builder) appendValue(buf *Value, part ast.Expr) {
-	t := part.TypeOf()
-	words := b.value(part, t)
-	switch {
-	case t == types.Str:
-		b.callNamed("__append_str", buf, words[0], words[1])
-	case t == types.Bool:
-		b.callNamed("__append_bool", buf, words[0])
-	case t == types.F64:
-		b.callNamed("__append_f64", buf, words[0])
-	case t == types.F32:
-		b.callNamed("__append_f32", buf, words[0])
-	case t == types.U64:
-		b.callNamed("__append_u64", buf, words[0])
-	default:
-		b.callNamed("__append_i64", buf, words[0])
-	}
-}
-
-func (b *builder) interpolate(e *ast.Interp) []*Value {
-	buf := b.buffer()
-	for _, part := range e.Parts {
-		if lit, ok := part.(*ast.StrLit); ok && lit.Value == "" {
-			continue
-		}
-		b.appendValue(buf, part)
-	}
-	return b.load(place{addr: buf}, types.Str)
-}
-
 func (b *builder) strings(e *ast.Binary) []*Value {
+	if e.Op == lexer.Plus {
+		return b.concatenate(e)
+	}
 	x := b.value(e.X, types.Str)
 	y := b.value(e.Y, types.Str)
-	if e.Op == lexer.Plus {
-		return b.callNamed("__concat", x[0], x[1], y[0], y[1])
-	}
 	if e.Op != lexer.Eq && e.Op != lexer.NotEq {
 		order := b.callNamed("__str_cmp", x[0], x[1], y[0], y[1])[0]
 		return []*Value{b.typed(arith[e.Op], types.I64, order, b.constant(0))}
@@ -168,9 +136,16 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 	case "push":
 		b.push(e)
 		return nil
+	case "pop":
+		return b.pop(e)
+	case "truncate":
+		b.truncate(e)
+		return nil
 	case "__extend":
 		b.extend(e)
 		return nil
+	case "__extend_by":
+		return []*Value{b.extendBy(e)}
 	case "delete":
 		b.deleteEntry(e)
 		return nil
@@ -208,6 +183,10 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 		nanos := b.runtime("clock_nanos", b.word(arg))
 		nanos.Scalar = true
 		return []*Value{nanos}
+	case "__hash_seed":
+		seed := b.typed(OpHashSeed, types.U64)
+		seed.Aux = e.Args[0].(*ast.IntLit).Value
+		return []*Value{seed}
 	case "__mulhi":
 		return []*Value{b.typed(OpMulHigh, types.U64, b.word(arg), b.word(e.Args[1]))}
 	case "__make":
@@ -253,67 +232,9 @@ func (b *builder) syscall(args []ast.Expr) *Value {
 	for i, arg := range args {
 		words[i] = b.word(arg)
 	}
-	result := b.runtime("syscall", words...)
+	result := b.runtime(syscallRuntime(words[0]), words...)
 	result.Scalar = true
 	return result
-}
-
-func (b *builder) extend(e *ast.Call) {
-	ref := e.Args[0].(*ast.Ref)
-	header := b.address(b.place(ref.Place))
-	src := b.value(e.Args[1], types.Str)
-	slice := b.load(place{addr: header}, ref.Type)
-	ptr, length, capacity := slice[0], slice[1], slice[2]
-	needed := b.emit(OpAdd, length, src[1])
-	temp := b.newTemp()
-	grow := b.newBlock()
-	keep := b.newBlock()
-	done := b.newBlock()
-	b.branch(b.emit(OpGt, needed, capacity), grow, keep)
-	b.enter(grow)
-	grown := b.emit(OpAdd, b.emit(OpMul, capacity, b.constant(2)), b.emit(OpAdd, src[1], b.constant(4)))
-	moved := b.runtime("grow", ptr, length, grown, b.constant(0))
-	b.store(place{addr: header}, []*Value{moved})
-	b.store(place{addr: header, offset: 16}, []*Value{grown})
-	b.writeTemp(temp, []*Value{moved})
-	b.jump(done)
-	b.enter(keep)
-	b.writeTemp(temp, []*Value{ptr})
-	b.jump(done)
-	b.enter(done)
-	base := b.readTemp(temp, 1)[0]
-	b.runtimeVoid("memmove", b.emit(OpAdd, base, length), src[0], src[1])
-	b.store(place{addr: header, offset: 8}, []*Value{needed})
-}
-
-func (b *builder) push(e *ast.Call) {
-	ref := e.Args[0].(*ast.Ref)
-	elem := ref.Type.Elem
-	stride := int64(elem.Stride())
-	header := b.address(b.place(ref.Place))
-	value := b.value(e.Args[1], elem)
-	slice := b.load(place{addr: header}, ref.Type)
-	ptr, length, capacity := slice[0], slice[1], slice[2]
-	temp := b.newTemp()
-	grow := b.newBlock()
-	keep := b.newBlock()
-	done := b.newBlock()
-	b.branch(b.emit(OpEq, length, capacity), grow, keep)
-	b.enter(grow)
-	grown := b.emit(OpAdd, b.emit(OpMul, capacity, b.constant(2)), b.constant(4))
-	used := b.emit(OpMul, length, b.constant(stride))
-	moved := b.runtime("grow", ptr, used, b.emit(OpMul, grown, b.constant(stride)), b.scan(elem))
-	b.store(place{addr: header}, []*Value{moved})
-	b.store(place{addr: header, offset: 16}, []*Value{grown})
-	b.writeTemp(temp, []*Value{moved})
-	b.jump(done)
-	b.enter(keep)
-	b.writeTemp(temp, []*Value{ptr})
-	b.jump(done)
-	b.enter(done)
-	base := b.readTemp(temp, 1)[0]
-	b.store(place{addr: b.scaled(base, length, int(stride)), scalar: scalarOf(elem), tail: elem.Tail()}, value)
-	b.store(place{addr: header, offset: 8}, []*Value{b.emit(OpAdd, length, b.constant(1))})
 }
 
 func (b *builder) forIn(s *ast.ForIn) {
@@ -365,6 +286,9 @@ func (b *builder) forIn(s *ast.ForIn) {
 }
 
 func (b *builder) rangeLoop(s *ast.ForIn) {
+	if b.fillLoop(s) {
+		return
+	}
 	t := s.ValueLocal.Type
 	lo := b.word(s.Iter)
 	hi := b.word(s.End)

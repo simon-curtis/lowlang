@@ -3,6 +3,7 @@ package hot
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -370,4 +371,51 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(src)
+}
+
+const strung = `FUNCS
+fn value() -> i64 {
+    VALUE
+}
+
+fn main() {
+    print(0)
+    var n = value()
+    for n == 1 {
+        n = value()
+    }
+    print(n)
+}
+`
+
+func stringProgram(k int, lengths []int, final bool) string {
+	var funcs strings.Builder
+	for i := 1; i <= k; i++ {
+		fmt.Fprintf(&funcs, "fn f%d() -> i64 {\n    i64(\"%s\"[1])\n}\n\n", i, strings.Repeat("x", lengths[i-1]))
+	}
+	want := 1
+	if final {
+		want = 2
+	}
+	value := fmt.Sprintf("f%d() - 120 + %d", k, want)
+	return strings.NewReplacer("FUNCS", funcs.String(), "VALUE", value).Replace(strung)
+}
+
+func TestReloadsAtUnalignedOffsets(t *testing.T) {
+	lengths := []int{3, 40, 7, 90, 2, 17, 130, 5}
+	f := newFixture(t, strings.NewReplacer("FUNCS", "", "VALUE", "1").Replace(strung))
+	f.waitFor(f.stdout, "0\n")
+	unaligned := 0
+	for k := 1; k <= len(lengths); k++ {
+		if f.session.next%32 == 16 {
+			unaligned++
+		}
+		f.write(stringProgram(k, lengths, k == len(lengths)))
+		f.reload()
+	}
+	f.waitFor(f.stdout, "0\n2\n")
+	f.noRestart()
+	if unaligned == 0 {
+		t.Fatal("no reload started at an offset of 16 modulo 32")
+	}
 }

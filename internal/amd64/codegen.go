@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"slices"
+	"strconv"
 	"strings"
 
 	"lowlang/internal/ir"
@@ -42,27 +43,38 @@ type Output struct {
 }
 
 type Generator struct {
-	os      target.OS
-	text    strings.Builder
-	data    strings.Builder
-	fn      string
-	labels  int
-	strings map[string]bool
-	table   map[string]int
-	suffix  string
-	maps    []stackMap
-	stubs   []pollStub
-	tier    tier
-	cache   *vectorCache
+	os         target.OS
+	text       strings.Builder
+	data       strings.Builder
+	fn         string
+	labels     int
+	dataLabels map[string]bool
+	previous   moved
+	table      map[string]int
+	suffix     string
+	maps       []stackMap
+	stubs      []pollStub
+	jumps      []jumpTable
+	tier       tier
+	cache      *vectorCache
+}
+
+type moved struct {
+	dst string
+	src string
 }
 
 type frame struct {
+	gen           *Generator
 	fn            *mfunc
 	saved         []string
 	slots         []int
 	firstSlot     int
 	vectorScratch int
 	results       int
+	size          int
+	direct        *vreg
+	mode          frameMode
 }
 
 type stackMap struct {
@@ -78,7 +90,7 @@ func stackWords(params int) int {
 }
 
 func newGenerator(os target.OS, table map[string]int, suffix string) *Generator {
-	return &Generator{os: os, strings: map[string]bool{}, table: table, suffix: suffix}
+	return &Generator{os: os, dataLabels: map[string]bool{}, table: table, suffix: suffix}
 }
 
 func (g *Generator) osRuntime() string {
@@ -116,6 +128,7 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 	out.WriteString(scheduler)
 	out.WriteString(runtime)
 	g.writeMaps(&out)
+	writeCells(&out, prog.Cells)
 	if table != nil {
 		out.WriteString(hotRuntimeSource())
 		g.writeTable(&out)
@@ -185,12 +198,24 @@ func (g *Generator) writeTable(out *strings.Builder) {
 }
 
 func (g *Generator) emit(format string, args ...any) {
+	g.previous = moved{}
 	g.text.WriteString("\t")
 	fmt.Fprintf(&g.text, format, args...)
 	g.text.WriteString("\n")
 }
 
+const (
+	functionAlignment = 5
+	loopAlignment     = 5
+	maxAlignedInstrs  = 4
+)
+
+func (g *Generator) align(power int) {
+	fmt.Fprintf(&g.text, "\t.p2align %d\n", power)
+}
+
 func (g *Generator) label(name string) {
+	g.previous = moved{}
 	fmt.Fprintf(&g.text, "%s:\n", name)
 }
 
@@ -295,10 +320,10 @@ func (g *Generator) stringLabel(s string) string {
 	h := fnv.New64a()
 	h.Write([]byte(s))
 	l := fmt.Sprintf(".Lstr_%x", h.Sum64())
-	if g.strings[l] {
+	if g.dataLabels[l] {
 		return l
 	}
-	g.strings[l] = true
+	g.dataLabels[l] = true
 	fmt.Fprintf(&g.data, "%s:\n", l)
 	if len(s) == 0 {
 		return l
@@ -313,10 +338,10 @@ func (g *Generator) stringLabel(s string) string {
 
 func (g *Generator) embedLabel(path string, digest uint64) string {
 	l := fmt.Sprintf(".Lembed_%x", digest)
-	if g.strings[l] {
+	if g.dataLabels[l] {
 		return l
 	}
-	g.strings[l] = true
+	g.dataLabels[l] = true
 	fmt.Fprintf(&g.data, "\t.p2align 4\n%s:\n\t.incbin %q\n", l, path)
 	return l
 }
@@ -334,6 +359,7 @@ func (g *Generator) function(f *ir.Func) {
 		g.body(f, symbol, mangle(f.Name), false)
 		return
 	}
+	g.align(functionAlignment)
 	g.label(symbol)
 	g.emit("cmp byte ptr [rip+rt_avx2], 0")
 	g.emit("jne %s.avx2", symbol)
@@ -351,9 +377,15 @@ func (g *Generator) body(f *ir.Func, symbol, prefix string, vectors bool) {
 	if vectors && g.tier == avx2 {
 		g.cache = vectorTemps(f)
 	}
-	mf := lower(f, prefix)
+	mf := lower(f, prefix, !vectors, !vectors)
 	spills, saved := mf.allocate()
-	fr := &frame{fn: mf, saved: saved, results: 16 + 8*stackWords(f.ParamWords)}
+	mode := mf.frameMode(f, saved, vectors)
+	if mf.guard != nil && len(saved) == 0 && mode != deferredFrame {
+		mf = lower(f, prefix, !vectors, false)
+		spills, saved = mf.allocate()
+		mode = mf.frameMode(f, saved, vectors)
+	}
+	fr := &frame{gen: g, fn: mf, mode: mode, saved: saved, results: 16 + 8*stackWords(f.ParamWords)}
 	words := len(saved) + spills
 	fr.firstSlot = words + 1
 	for _, n := range f.Slots {
@@ -365,18 +397,21 @@ func (g *Generator) body(f *ir.Func, symbol, prefix string, vectors bool) {
 		fr.vectorScratch = -8 * words
 	}
 	size := (8*(words+outgoing(f)) + 15) &^ 15
+	fr.size = size
+	g.align(functionAlignment)
 	g.label(symbol)
-	g.emit("push rbp")
-	g.emit("mov rbp, rsp")
-	g.reserve(size)
-	for i, r := range saved {
-		g.emit("mov qword ptr [rbp-%d], %s", 8*(i+1), r)
+	if mode == fullFrame {
+		g.enterFrame(fr)
+		if mf.guard == nil {
+			g.saveRegisters(fr)
+		}
 	}
 	g.params(fr, mf.blocks[0])
-	for i, mb := range mf.blocks {
+	emitted := fr.emitted()
+	for i, mb := range emitted {
 		var next *mblock
-		if i+1 < len(mf.blocks) {
-			next = mf.blocks[i+1]
+		if i+1 < len(emitted) {
+			next = emitted[i+1]
 		}
 		g.block(fr, mb, next)
 	}
@@ -387,6 +422,7 @@ func (g *Generator) body(f *ir.Func, symbol, prefix string, vectors bool) {
 		g.emit("jmp %s", stub.resume)
 	}
 	g.stubs = nil
+	g.flushJumpTables()
 }
 
 type pollStub struct {
@@ -394,10 +430,11 @@ type pollStub struct {
 	resume string
 }
 
-func (g *Generator) poll(resume string) {
-	stub := pollStub{label: g.newLabel(), resume: resume}
+func (g *Generator) poll() {
+	stub := pollStub{label: g.newLabel(), resume: g.newLabel()}
 	g.emit("cmp byte ptr %s, 0", g.tlsOperand("r11", tlsFlag))
 	g.emit("jne %s", stub.label)
+	g.label(stub.resume)
 	g.stubs = append(g.stubs, stub)
 }
 
@@ -426,8 +463,16 @@ func outgoing(f *ir.Func) int {
 
 func (fr *frame) loc(r *vreg) string {
 	switch {
+	case r == fr.direct:
+		return "rax"
+	case r.pinned != "":
+		return r.pinned
 	case r.konst != nil:
 		return fmt.Sprintf("%d", *r.konst)
+	case r.mem != nil:
+		return fmt.Sprintf("qword ptr %s", fr.address(r))
+	case r.pool != nil:
+		return fmt.Sprintf("qword ptr [rip+%s]", fr.gen.floatLabel(*r.pool))
 	case r.reg != "":
 		return r.reg
 	}
@@ -439,46 +484,168 @@ func (fr *frame) slot(index int) int {
 }
 
 func isMem(loc string) bool {
-	return strings.HasPrefix(loc, "qword")
+	return strings.HasPrefix(loc, "qword") || strings.HasPrefix(loc, "dword")
 }
 
 func isReg(loc string) bool {
-	return !isMem(loc) && !isImm(loc)
+	return !isMem(loc) && !isImm(loc) && !isXmm(loc)
 }
 
 func isImm(loc string) bool {
 	return loc[0] == '-' || (loc[0] >= '0' && loc[0] <= '9')
 }
 
+func isXmm(loc string) bool {
+	return strings.HasPrefix(loc, "xmm")
+}
+
 func (g *Generator) move(dst, src string) {
 	switch {
-	case dst == src:
+	case dst == src, g.previous == moved{dst: src, src: dst}:
+	case isXmm(dst):
+		g.moveToXmm(dst, src)
+	case isXmm(src):
+		g.emit("movq %s, %s", dst, src)
 	case isMem(dst) && isMem(src):
 		g.emit("mov r10, %s", src)
 		g.emit("mov %s, r10", dst)
 	default:
 		g.emit("mov %s, %s", dst, src)
+		g.previous = moved{dst: dst, src: src}
 	}
 }
 
+func (g *Generator) moveToXmm(dst, src string) {
+	switch {
+	case isXmm(src):
+		g.emit("movaps %s, %s", dst, src)
+	default:
+		g.emit("movq %s, %s", dst, src)
+	}
+}
+
+func (g *Generator) floatLabel(bits int64) string {
+	label := fmt.Sprintf(".Lfc_%x", uint64(bits))
+	if !g.dataLabels[label] {
+		g.dataLabels[label] = true
+		fmt.Fprintf(&g.data, "\t.p2align 3\n%s:\n\t.quad %d\n", label, bits)
+	}
+	return label
+}
+
+func (g *Generator) signMask(bits int) string {
+	label := fmt.Sprintf(".Lsign_%d", bits)
+	if !g.dataLabels[label] {
+		g.dataLabels[label] = true
+		fmt.Fprintf(&g.data, "\t.p2align 4\n%s:\n\t.quad 0x%x, 0\n", label, uint64(1)<<(bits-1))
+	}
+	return label
+}
+
+func (g *Generator) loadFloatBits(dst string, bits int64) {
+	if bits == 0 {
+		g.emit("xorps %s, %s", dst, dst)
+		return
+	}
+	g.emit("movq %s, qword ptr [rip+%s]", dst, g.floatLabel(bits))
+}
+
+func (g *Generator) saveRegisters(fr *frame) {
+	for i, r := range fr.saved {
+		g.emit("mov qword ptr [rbp-%d], %s", 8*(i+1), r)
+	}
+}
+
+func (fr *frame) empty(mb *mblock) bool {
+	if mb.kind != ir.Plain || mb.poll || len(mb.instrs) != 0 || len(mb.heads) != 0 || mb == fr.fn.guard {
+		return false
+	}
+	return !slices.ContainsFunc(mb.copies, func(c *phiCopy) bool { return fr.loc(c.dst) != fr.loc(c.src) })
+}
+
+func (fr *frame) alignsLoop(mb *mblock) bool {
+	if !mb.poll || mb.kind != ir.If || len(mb.instrs)+len(mb.copies) > maxAlignedInstrs {
+		return false
+	}
+	return slices.ContainsFunc(mb.succs, func(s *mblock) bool { return fr.final(s) == mb })
+}
+
+func (fr *frame) final(mb *mblock) *mblock {
+	for hops := 0; hops < len(fr.fn.blocks) && fr.empty(mb); hops++ {
+		mb = mb.succs[0]
+	}
+	return mb
+}
+
+func (fr *frame) emitted() []*mblock {
+	reached := map[*mblock]bool{}
+	var visit func(mb *mblock)
+	visit = func(mb *mblock) {
+		if reached[mb] {
+			return
+		}
+		reached[mb] = true
+		for _, s := range mb.succs {
+			visit(fr.final(s))
+		}
+	}
+	visit(fr.fn.blocks[0])
+	return slices.DeleteFunc(slices.Clone(fr.fn.blocks), func(mb *mblock) bool { return !reached[mb] })
+}
+
+func (mb *mblock) returnedLast() *vreg {
+	if mb.kind != ir.Ret || len(mb.results) == 0 || len(mb.instrs) == 0 {
+		return nil
+	}
+	last := mb.instrs[len(mb.instrs)-1]
+	if last.dst == nil || last.dst != mb.results[0] || last.dst.pinned != "" || last.value.Uses != 1 || last.isCall() || last.isParam() {
+		return nil
+	}
+	return last.dst
+}
+
+func (g *Generator) copies(fr *frame, copies []*phiCopy) {
+	moves := make([]pmove, len(copies))
+	for i, c := range copies {
+		moves[i] = fr.vectorMove(fr.loc(c.dst), c.src)
+	}
+	g.parallel(moves)
+}
+
 func (g *Generator) block(fr *frame, mb *mblock, next *mblock) {
+	if fr.alignsLoop(mb) {
+		g.align(loopAlignment)
+	}
 	g.label(mb.label)
 	if g.cache != nil {
 		g.cache.reset()
 	}
+	if mb == fr.fn.guard {
+		if fr.mode == deferredFrame {
+			g.enterFrame(fr)
+		}
+		g.saveRegisters(fr)
+	}
+	fr.direct = nil
+	g.copies(fr, mb.heads)
+	fr.direct = mb.returnedLast()
 	for _, in := range mb.instrs {
 		g.instr(fr, in)
 	}
+	g.copies(fr, mb.copies)
+	if mb.poll {
+		g.poll()
+	}
 	switch mb.kind {
 	case ir.Plain:
-		if mb.poll {
-			g.poll(mb.succs[0].label)
-		}
-		if mb.succs[0] != next {
-			g.emit("jmp %s", mb.succs[0].label)
+		target := fr.final(mb.succs[0])
+		if target != next {
+			g.emit("jmp %s", target.label)
 		}
 	case ir.If:
 		g.branch(fr, mb, next)
+	case ir.Switch:
+		g.jumpTable(fr, mb)
 	case ir.Ret:
 		g.ret(fr, mb)
 	case ir.Unreachable:
@@ -487,14 +654,31 @@ func (g *Generator) block(fr *frame, mb *mblock, next *mblock) {
 }
 
 func (g *Generator) branch(fr *frame, mb *mblock, next *mblock) {
+	then, otherwise := fr.final(mb.succs[0]), fr.final(mb.succs[1])
+	if then == otherwise {
+		if then != next {
+			g.emit("jmp %s", then.label)
+		}
+		return
+	}
 	cond := "nz"
-	if mb.fused != nil {
+	for _, r := range mb.compare {
+		g.reloadPieces(fr, r)
+	}
+	switch {
+	case mb.fused != nil && isFloat(mb.fused.Type):
+		g.floatBranch(fr, mb, then, otherwise, next)
+		return
+	case mb.fused != nil:
 		g.compare(fr, mb.compare[0], mb.compare[1])
 		cond = condition(mb.fused)
-	} else {
+	default:
 		g.test(fr.loc(mb.control))
 	}
-	then, otherwise := mb.succs[0], mb.succs[1]
+	g.jump(cond, then, otherwise, next)
+}
+
+func (g *Generator) jump(cond string, then, otherwise, next *mblock) {
 	if then == next {
 		g.emit("j%s %s", inverse[cond], otherwise.label)
 		return
@@ -518,31 +702,69 @@ func (g *Generator) test(loc string) {
 }
 
 func (g *Generator) compare(fr *frame, a, b *vreg) {
-	x := fr.loc(a)
-	if !isReg(x) {
-		g.move("r10", x)
-		x = "r10"
+	x, y := fr.loc(a), fr.loc(b)
+	switch {
+	case a.narrowMemory():
+		g.emit("cmp %s ptr %s, %s", widths[a.mem.loaded.Bits], fr.address(a), y)
+	case isReg(x) && y == "0":
+		g.emit("test %s, %s", x, x)
+	case isMem(x) && !isMem(y):
+		g.emit("cmp %s, %s", x, y)
+	default:
+		if !isReg(x) {
+			scratch := "r10"
+			if a.mem != nil || b.mem != nil {
+				scratch = "rax"
+			}
+			g.move(scratch, x)
+			x = scratch
+		}
+		g.emit("cmp %s, %s", x, y)
 	}
-	g.emit("cmp %s, %s", x, fr.loc(b))
 }
 
 func (g *Generator) ret(fr *frame, mb *mblock) {
 	if len(mb.results) <= 2 {
+		moves := make([]pmove, len(mb.results))
 		for i, r := range mb.results {
-			g.move([]string{"rax", "rdx"}[i], fr.loc(r))
+			moves[i] = fr.vectorMove([]string{"rax", "rdx"}[i], r)
 		}
+		g.parallel(moves)
 	} else {
 		for k, r := range mb.results {
 			g.move(fmt.Sprintf("qword ptr [rbp+%d]", fr.results+8*k), fr.loc(r))
 		}
 	}
-	for i, r := range fr.saved {
-		g.emit("mov %s, qword ptr [rbp-%d]", r, 8*(i+1))
+	if fr.exitsWithoutFrame(mb) {
+		g.emit("ret")
+		return
 	}
-	g.emit("mov rsp, rbp")
-	g.emit("pop rbp")
+	if mb.restores() {
+		for i, r := range fr.saved {
+			g.emit("mov %s, qword ptr [rbp-%d]", r, 8*(i+1))
+		}
+	}
+	g.epilogue(fr)
 	g.leaveVectors()
 	g.emit("ret")
+}
+
+func (g *Generator) enterFrame(fr *frame) {
+	g.emit("push rbp")
+	g.emit("mov rbp, rsp")
+	g.reserve(fr.size)
+}
+
+func (fr *frame) exitsWithoutFrame(mb *mblock) bool {
+	return fr.mode == framelessFrame || (fr.mode == deferredFrame && mb.light)
+}
+
+func (g *Generator) epilogue(fr *frame) {
+	if fr.size == 0 {
+		g.emit("pop rbp")
+		return
+	}
+	g.emit("leave")
 }
 
 var binops = map[ir.Op]string{
@@ -550,14 +772,13 @@ var binops = map[ir.Op]string{
 }
 
 func (g *Generator) instr(fr *frame, in *instr) {
-	if in.move {
-		g.move(fr.loc(in.dst), fr.loc(in.args[0]))
-		return
-	}
 	if in.isParam() {
 		return
 	}
 	v := in.value
+	for _, a := range in.args {
+		g.reloadPieces(fr, a)
+	}
 	switch in.op {
 	case ir.OpConst:
 		g.constant(fr.loc(in.dst), v.Aux)
@@ -565,13 +786,21 @@ func (g *Generator) instr(fr *frame, in *instr) {
 		g.address(fr.loc(in.dst), fmt.Sprintf("[rip+%s]", g.embedLabel(v.Str, uint64(v.Aux))))
 	case ir.OpString:
 		g.address(fr.loc(in.dst), fmt.Sprintf("[rip+%s]", g.stringLabel(v.Str)))
+	case ir.OpCell:
+		g.address(fr.loc(in.dst), g.cellAddress(v.Aux))
 	case ir.OpUndef:
 	case ir.OpAdd, ir.OpSub, ir.OpMul:
 		g.arithmetic(fr, in, map[ir.Op]string{ir.OpAdd: "add", ir.OpSub: "sub", ir.OpMul: "mul"}[in.op])
 	case ir.OpAnd, ir.OpOr, ir.OpXor:
+		if in.rotate != 0 {
+			g.rotate(fr, in)
+			break
+		}
 		g.binary(fr, in, binops[in.op])
 	case ir.OpMulHigh:
 		g.mulHigh(fr, in)
+	case ir.OpHashSeed:
+		g.hashSeed(fr.loc(in.dst), v.Aux)
 	case ir.OpVector, ir.OpVectorScalar:
 		g.vector(fr, in)
 	case ir.OpTrailingZeros:
@@ -587,7 +816,7 @@ func (g *Generator) instr(fr *frame, in *instr) {
 	case ir.OpNeg, ir.OpCompl:
 		g.negate(fr, in)
 	case ir.OpNot:
-		g.unary(fr, in, "xor r10, 1")
+		g.logicalNot(fr, in)
 	case ir.OpConvert:
 		g.convert(fr, in)
 	case ir.OpSqrt, ir.OpFloor:
@@ -616,14 +845,6 @@ func (g *Generator) instr(fr *frame, in *instr) {
 	}
 }
 
-func (g *Generator) base(loc string) string {
-	if isReg(loc) {
-		return loc
-	}
-	g.move("r10", loc)
-	return "r10"
-}
-
 func (g *Generator) address(dst, operand string) {
 	if isReg(dst) {
 		g.emit("lea %s, %s", dst, operand)
@@ -633,7 +854,21 @@ func (g *Generator) address(dst, operand string) {
 	g.move(dst, "r10")
 }
 
+func (g *Generator) hashSeed(dst string, index int64) {
+	operand := fmt.Sprintf("qword ptr [rip+rt_hash_seed+%d]", 8*index)
+	if isReg(dst) {
+		g.emit("mov %s, %s", dst, operand)
+		return
+	}
+	g.emit("mov r10, %s", operand)
+	g.move(dst, "r10")
+}
+
 func (g *Generator) constant(dst string, n int64) {
+	if n == 0 && isReg(dst) {
+		g.zero(dst)
+		return
+	}
 	if isReg(dst) || (n >= -1<<31 && n < 1<<31) {
 		g.emit("mov %s, %d", dst, n)
 		return
@@ -645,23 +880,63 @@ func (g *Generator) constant(dst string, n int64) {
 func (g *Generator) binary(fr *frame, in *instr, op string) {
 	dst, a, b := fr.loc(in.dst), fr.loc(in.args[0]), fr.loc(in.args[1])
 	commutative := in.op != ir.OpSub
+	if commutative && isImm(a) && !isImm(b) {
+		a, b = b, a
+	}
+	work := "r10"
+	if in.memoryOperand() != nil {
+		work = "rax"
+	}
+	direct := isReg(dst) && !fr.overwritesAddress(in, dst)
+	fit := in.sized()
 	switch {
-	case isReg(dst) && dst != b:
-		g.move(dst, a)
-		g.emit("%s %s, %s", op, dst, b)
-	case isReg(dst) && commutative:
-		g.emit("%s %s, %s", op, dst, a)
+	case isReg(dst) && g.threeOperand(in.op, dst, a, b, fit):
+	case direct && dst != b:
+		g.move(fit(dst), fit(a))
+		g.emit("%s %s, %s", op, fit(dst), fit(b))
+	case direct && commutative:
+		g.emit("%s %s, %s", op, fit(dst), fit(a))
 	default:
-		g.move("r10", a)
-		g.emit("%s r10, %s", op, b)
-		g.move(dst, "r10")
+		g.move(fit(work), fit(a))
+		g.emit("%s %s, %s", op, fit(work), fit(b))
+		g.move(dst, work)
 	}
 }
 
-func (g *Generator) unary(fr *frame, in *instr, op string) {
-	g.move("r10", fr.loc(in.args[0]))
-	g.emit("%s", op)
-	g.move(fr.loc(in.dst), "r10")
+func (g *Generator) threeOperand(op ir.Op, dst, a, b string, fit func(string) string) bool {
+	switch {
+	case op == ir.OpMul && isImm(b) && !isImm(a):
+		g.emit("imul %s, %s, %s", fit(dst), fit(a), b)
+	case op == ir.OpAdd && isReg(a) && isImm(b) && dst != a:
+		g.emit("lea %s, [%s%+d]", fit(dst), a, immediate(b))
+	case op == ir.OpSub && isReg(a) && isImm(b) && dst != a && immediate(b) != -1<<31:
+		g.emit("lea %s, [%s%+d]", fit(dst), a, -immediate(b))
+	case op == ir.OpAdd && isReg(a) && isReg(b) && dst != a && dst != b:
+		g.emit("lea %s, [%s+%s]", fit(dst), a, b)
+	default:
+		return false
+	}
+	return true
+}
+
+func immediate(loc string) int64 {
+	n, _ := strconv.ParseInt(loc, 10, 64)
+	return n
+}
+
+func (g *Generator) workRegister(dst string) string {
+	if isReg(dst) {
+		return dst
+	}
+	return "r10"
+}
+
+func (g *Generator) logicalNot(fr *frame, in *instr) {
+	dst := fr.loc(in.dst)
+	work := g.workRegister(dst)
+	g.move(work, fr.loc(in.args[0]))
+	g.emit("xor %s, 1", work)
+	g.move(dst, work)
 }
 
 func (g *Generator) params(fr *frame, entry *mblock) {
@@ -721,11 +996,7 @@ func (g *Generator) call(fr *frame, in *instr) {
 			moves = append(moves, pmove{dst: argRegs[i], src: src})
 			continue
 		}
-		if isMem(src) {
-			g.move("r10", src)
-			src = "r10"
-		}
-		g.emit("mov qword ptr [rsp+%d], %s", 8*(i-len(argRegs)), src)
+		g.move(fmt.Sprintf("qword ptr [rsp+%d]", 8*(i-len(argRegs))), src)
 	}
 	g.parallel(moves)
 	g.leaveVectors()
@@ -734,8 +1005,30 @@ func (g *Generator) call(fr *frame, in *instr) {
 }
 
 type pmove struct {
-	dst string
-	src string
+	dst  string
+	src  string
+	bits *int64
+}
+
+func (fr *frame) vectorMove(dst string, r *vreg) pmove {
+	return pmove{dst: dst, src: fr.loc(r), bits: r.konst}
+}
+
+func (g *Generator) zero(reg string) {
+	low := narrow[reg][0]
+	g.emit("xor %s, %s", low, low)
+}
+
+func (g *Generator) performMove(m pmove) {
+	if m.bits != nil && isXmm(m.dst) {
+		g.loadFloatBits(m.dst, *m.bits)
+		return
+	}
+	if m.src == "0" && isReg(m.dst) {
+		g.zero(m.dst)
+		return
+	}
+	g.move(m.dst, m.src)
 }
 
 func (g *Generator) parallel(moves []pmove) {
@@ -754,7 +1047,7 @@ func (g *Generator) parallel(moves []pmove) {
 			}
 			continue
 		}
-		g.move(moves[i].dst, moves[i].src)
+		g.performMove(moves[i])
 		moves = slices.Delete(moves, i, i+1)
 	}
 }
@@ -770,7 +1063,7 @@ func (g *Generator) safepointAt(fr *frame, in *instr, label string) {
 		offsets = append(offsets, -8*(i+1))
 	}
 	for _, r := range fr.fn.vregs {
-		if r.spill >= 0 && !r.scalar && r.start < in.pos && in.pos < r.end {
+		if r.spill >= 0 && !r.scalar && r.liveAcross(in.pos) {
 			offsets = append(offsets, -8*(len(fr.saved)+r.spill+1))
 		}
 	}
@@ -802,9 +1095,42 @@ func (g *Generator) writeMaps(out *strings.Builder) {
 
 var syscallRegs = []string{"rax", "rdi", "rsi", "rdx", "r10", "r8", "r9"}
 
+func isSyscall(name string) bool {
+	return name == "syscall" || name == "sysblock"
+}
+
+var growRegs = []string{"rax", "rdx", "r10"}
+
+func (g *Generator) growCall(fr *frame, in *instr) {
+	moves := make([]pmove, len(growRegs))
+	for i, reg := range growRegs {
+		moves[i] = pmove{dst: reg, src: fr.loc(in.args[i])}
+	}
+	g.parallel(moves)
+	g.leaveVectors()
+	symbol := "rt_grow_scan"
+	if scan := in.args[3].konst; scan != nil && *scan == 0 {
+		symbol = "rt_grow_noscan"
+	}
+	g.emit("call %s", symbol)
+	g.safepoint(fr, in)
+}
+
 func (g *Generator) runtimeCall(fr *frame, in *instr) {
+	if in.preservesRegisters() {
+		g.growCall(fr, in)
+		return
+	}
+	if in.literal != nil {
+		g.literalEquality(fr, in)
+		return
+	}
+	if in.isStringEquality() {
+		g.stringEquality(fr, in)
+		return
+	}
 	regs := argRegs
-	if in.value.Str == "syscall" {
+	if isSyscall(in.value.Str) {
 		regs = syscallRegs
 	}
 	moves := make([]pmove, len(in.args))
@@ -822,6 +1148,9 @@ func (g *Generator) runtimeCall(fr *frame, in *instr) {
 }
 
 func (g *Generator) result(fr *frame, in *instr) {
+	if in.dst.pinned != "" {
+		return
+	}
 	k := int(in.value.Aux)
 	call := in.call
 	if call.Op == ir.OpCCall {
@@ -832,6 +1161,5 @@ func (g *Generator) result(fr *frame, in *instr) {
 		g.move(fr.loc(in.dst), []string{"rax", "rdx"}[k])
 		return
 	}
-	g.emit("mov r10, qword ptr [rsp+%d]", 8*(stackWords(call.Target.ParamWords)+k))
-	g.move(fr.loc(in.dst), "r10")
+	g.move(fr.loc(in.dst), fmt.Sprintf("qword ptr [rsp+%d]", 8*(stackWords(call.Target.ParamWords)+k)))
 }

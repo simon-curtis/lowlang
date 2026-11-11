@@ -10,7 +10,7 @@ import (
 
 var chanFuncs = []string{
 	"__chan_new", "__chan_send", "__chan_recv", "__chan_close", "__box",
-	"__sel_recv", "__sel_send", "__sel_wait_recv", "__sel_wait_send", "__sel_cancel_recv", "__sel_cancel_send", "__sel_value",
+	"__sel_recv", "__sel_send", "__sel_wait_recv", "__sel_wait_send", "__sel_value",
 }
 
 var softBuiltins = map[string]bool{"close": true, "sleep": true, "wait_readable": true, "wait_writable": true}

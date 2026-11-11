@@ -52,6 +52,8 @@ const (
 	OpVector
 	OpVectorScalar
 	OpTrailingZeros
+	OpHashSeed
+	OpCell
 )
 
 const (
@@ -67,7 +69,7 @@ var opNames = [...]string{
 	OpConvert: "convert", OpSqrt: "sqrt", OpFloor: "floor",
 	OpEq: "eq", OpNe: "ne", OpLt: "lt", OpLe: "le", OpGt: "gt", OpGe: "ge",
 	OpLoad: "load", OpStore: "store", OpCheck: "check", OpSlot: "slot", OpCall: "call", OpCCall: "ccall", OpRuntime: "runtime", OpResult: "result",
-	OpFuncAddr: "funcaddr", OpMulHigh: "mulhigh", OpVector: "vector", OpVectorScalar: "vectorscalar", OpTrailingZeros: "ctz",
+	OpFuncAddr: "funcaddr", OpMulHigh: "mulhigh", OpVector: "vector", OpVectorScalar: "vectorscalar", OpTrailingZeros: "ctz", OpHashSeed: "hashseed", OpCell: "cell",
 }
 
 func (o Op) String() string {
@@ -83,20 +85,21 @@ func (o Op) HasResult() bool {
 }
 
 type Value struct {
-	ID       int
-	Op       Op
-	Args     []*Value
-	Block    *Block
-	Aux      int64
-	Str      string
-	Target   *Func
-	Plan     *CPlan
-	Type     *types.Type
-	From     *types.Type
-	Scalar   bool
-	Indirect bool
-	Uses     int
-	forward  *Value
+	ID        int
+	Op        Op
+	Args      []*Value
+	Block     *Block
+	Aux       int64
+	Str       string
+	Target    *Func
+	Plan      *CPlan
+	Type      *types.Type
+	From      *types.Type
+	Scalar    bool
+	FloatBits int
+	Indirect  bool
+	Uses      int
+	forward   *Value
 }
 
 func (v *Value) String() string {
@@ -110,17 +113,33 @@ const (
 	If
 	Ret
 	Unreachable
+	Switch
 )
+
+type JumpTable struct {
+	Low   int64
+	Cases []int
+}
+
+func (t *JumpTable) Index(control int64) int {
+	offset := uint64(control) - uint64(t.Low)
+	if offset >= uint64(len(t.Cases)) {
+		return 0
+	}
+	return t.Cases[offset]
+}
 
 type Block struct {
 	ID      int
 	Kind    Kind
 	Values  []*Value
 	Control *Value
+	Table   *JumpTable
 	Results []*Value
 	Succs   []*Block
 	Preds   []*Block
 	Poll    bool
+	merged  bool
 }
 
 func (b *Block) String() string {
@@ -137,6 +156,12 @@ type Func struct {
 	Blocks      []*Block
 	Slots       []int
 	values      int
+	blockIDs    int
+}
+
+type Options struct {
+	Inline bool
+	Hoist  bool
 }
 
 type Program struct {
@@ -147,10 +172,12 @@ type Program struct {
 	Funcs     []*Func
 	Main      *Func
 	MainErr   *types.Type
+	Cells     int
 }
 
 func (f *Func) newBlock() *Block {
-	b := &Block{ID: len(f.Blocks)}
+	b := &Block{ID: f.blockIDs}
+	f.blockIDs++
 	f.Blocks = append(f.Blocks, b)
 	return b
 }
@@ -179,6 +206,8 @@ func (f *Func) writeBlock(s *strings.Builder, b *Block) {
 		fmt.Fprintf(s, "  jump %s\n", b.Succs[0])
 	case If:
 		fmt.Fprintf(s, "  if %s then %s else %s\n", b.Control, b.Succs[0], b.Succs[1])
+	case Switch:
+		fmt.Fprintf(s, "  switch %s low %d table %v default %s targets %v\n", b.Control, b.Table.Low, b.Table.Cases, b.Succs[0], b.Succs[1:])
 	case Ret:
 		fmt.Fprintf(s, "  ret %v\n", b.Results)
 	case Unreachable:
@@ -189,7 +218,7 @@ func (f *Func) writeBlock(s *strings.Builder, b *Block) {
 func describe(v *Value) string {
 	var detail string
 	switch v.Op {
-	case OpConst, OpParam, OpSlot, OpResult, OpLoad, OpStore:
+	case OpConst, OpParam, OpSlot, OpResult, OpLoad, OpStore, OpHashSeed, OpCell:
 		detail = fmt.Sprintf(" #%d", v.Aux)
 	case OpString, OpEmbed:
 		detail = fmt.Sprintf(" %q", v.Str)

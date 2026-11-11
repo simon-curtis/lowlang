@@ -254,6 +254,7 @@ const (
 	symbolEnumMember = 22
 	symbolStruct     = 23
 	severityError    = 1
+	severityWarning  = 2
 	syncFull         = 1
 	methodNotFound   = -32601
 	invalidParams    = -32602

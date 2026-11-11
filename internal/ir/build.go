@@ -27,6 +27,15 @@ type place struct {
 	tail   int
 }
 
+func (p place) at(word int) place {
+	if p.addr == nil {
+		p.word += word
+	} else {
+		p.offset += 8 * word
+	}
+	return p
+}
+
 type builder struct {
 	ssa
 	os       target.OS
@@ -41,9 +50,11 @@ type builder struct {
 	temps    int
 	defers   [][]ast.Stmt
 	subjects [][]*Value
+	hoist    bool
+	cells    *int
 }
 
-func Build(files []*ast.File, os target.OS) *Program {
+func Build(files []*ast.File, os target.OS, opts Options) *Program {
 	var decls []*ast.Func
 	for _, file := range files {
 		for _, d := range file.Funcs {
@@ -76,6 +87,7 @@ func Build(files []*ast.File, os target.OS) *Program {
 			}
 		}
 	}
+	cells := 0
 	builderFor := func(f *Func, d *ast.Func) *builder {
 		return &builder{
 			ssa:      newSSA(f),
@@ -86,23 +98,64 @@ func Build(files []*ast.File, os target.OS) *Program {
 			named:    named,
 			slots:    map[*ast.Local]*Value{},
 			refs:     map[*ast.Local]*Value{},
+			hoist:    opts.Hoist,
+			cells:    &cells,
 		}
 	}
+	pending := map[*Func]func(){}
 	for _, d := range decls {
-		b := builderFor(funcs[d], d)
-		b.function()
-		b.finalize()
+		pending[funcs[d]] = func() {
+			b := builderFor(funcs[d], d)
+			b.function()
+			b.finalize()
+		}
+		if adapter, ok := adapters[d]; ok {
+			pending[adapter] = func() {
+				b := builderFor(adapter, d)
+				b.adapter(funcs[d])
+				b.finalize()
+			}
+		}
 	}
-	for d, f := range adapters {
-		b := builderFor(f, d)
-		b.adapter(funcs[d])
-		b.finalize()
-	}
+	buildReachable(p.Main, pending)
+	p.Cells = cells
 	p.Funcs = reachable(p.Main, p.Funcs)
+	if opts.Inline {
+		p.specialiseConstantArguments()
+		p.inline()
+		p.Funcs = reachable(p.Main, p.Funcs)
+	}
 	p.CSymbols = cSymbols(p.Funcs)
 	p.Libraries = libraries(files, p.CSymbols)
 	p.Imports = imports(files, p.CSymbols)
 	return p
+}
+
+func buildReachable(main *Func, pending map[*Func]func()) {
+	queue := []*Func{main}
+	for len(queue) > 0 {
+		f := queue[0]
+		queue = queue[1:]
+		build, ok := pending[f]
+		if !ok {
+			continue
+		}
+		delete(pending, f)
+		build()
+		queue = append(queue, callees(f)...)
+	}
+}
+
+func callees(f *Func) []*Func {
+	var targets []*Func
+	for _, b := range f.Blocks {
+		for _, v := range b.Values {
+			if (v.Op == OpCall && !v.Indirect) || (v.Op == OpFuncAddr && v.Target != nil) {
+				targets = append(targets, v.Target)
+			}
+		}
+	}
+	return targets
 }
 
 func cSymbols(funcs []*Func) []string {
@@ -231,12 +284,25 @@ func (b *builder) function() {
 	b.ret(b.decl.Body.Type, body)
 }
 
+func captureWords(local *ast.Local) int {
+	if local.Boxed() {
+		return 1
+	}
+	return local.Type.Size()
+}
+
 func (b *builder) environment(captures []*ast.Local) {
 	env := b.param(0)
-	for i, local := range captures {
-		box := b.emit(OpLoad, env)
-		box.Aux = int64(8 * i)
-		b.slots[local] = box
+	offset := 0
+	for _, local := range captures {
+		if local.Boxed() {
+			box := b.emit(OpLoad, env)
+			box.Aux = int64(offset)
+			b.slots[local] = box
+		} else {
+			b.store(place{local: local}, b.load(place{addr: env, offset: offset}, local.Type))
+		}
+		offset += 8 * captureWords(local)
 	}
 }
 
@@ -283,6 +349,15 @@ func classify(words []*Value, t *types.Type) {
 	for k, pointer := range t.PointerWords() {
 		words[k].Scalar = !pointer
 	}
+	for k, bits := range t.FloatWords() {
+		words[k].FloatBits = bits
+	}
+}
+
+func (b *builder) floatConstant(t *types.Type, f float64) *Value {
+	v := b.constant(floatBits(t, f))
+	v.FloatBits = t.Bits
+	return v
 }
 
 func (b *builder) result(call *Value, k int) *Value {
@@ -367,7 +442,7 @@ func (b *builder) word(e ast.Expr) *Value {
 }
 
 func (b *builder) bind(local *ast.Local, words []*Value) {
-	if local.Captured {
+	if local.Boxed() {
 		box := b.runtime("alloc", b.constant(int64(len(words))), b.scan(local.Type))
 		b.slots[local] = box
 		b.store(place{addr: box}, words)
@@ -407,6 +482,7 @@ func (b *builder) place(p *ast.Place) place {
 
 func (b *builder) load(p place, t *types.Type) []*Value {
 	words := make([]*Value, t.Size())
+	pointers, floats := t.PointerWords(), t.FloatWords()
 	for k := range words {
 		if p.addr == nil {
 			words[k] = b.read(varKey{local: p.local, word: p.word + k}, b.cur)
@@ -418,7 +494,10 @@ func (b *builder) load(p place, t *types.Type) []*Value {
 		}
 		v := b.typed(OpLoad, p.scalar, p.addr)
 		v.Aux = int64(p.offset + 8*k)
-		v.Scalar = !t.PointerWords()[k]
+		v.Scalar = !pointers[k]
+		if floats[k] != 0 {
+			v.FloatBits = floats[k]
+		}
 		words[k] = v
 	}
 	return words
@@ -610,6 +689,9 @@ func (b *builder) typed(op Op, t *types.Type, args ...*Value) *Value {
 	v := b.emit(op, args...)
 	v.Type = t
 	v.Scalar = t != nil && !t.HasPointers()
+	if t != nil && t.Float() && !op.Compare() {
+		v.FloatBits = t.Bits
+	}
 	return v
 }
 
@@ -683,11 +765,11 @@ func (b *builder) expr(e ast.Expr) []*Value {
 	switch e := e.(type) {
 	case *ast.IntLit:
 		if e.Type.Float() {
-			return []*Value{b.constant(floatBits(e.Type, float64(e.Value)))}
+			return []*Value{b.floatConstant(e.Type, float64(e.Value))}
 		}
 		return []*Value{b.constant(e.Value)}
 	case *ast.FloatLit:
-		return []*Value{b.constant(floatBits(e.Type, e.Value))}
+		return []*Value{b.floatConstant(e.Type, e.Value)}
 	case *ast.BoolLit:
 		if e.Value {
 			return []*Value{b.constant(1)}
@@ -919,11 +1001,24 @@ func (b *builder) closure(e *ast.Closure) []*Value {
 	if len(e.Captures) == 0 {
 		return []*Value{code, b.constant(0)}
 	}
-	env := b.runtime("alloc", b.constant(int64(len(e.Captures))), b.constant(1))
-	for i, local := range e.Captures {
-		b.store(place{addr: env, offset: 8 * i}, []*Value{b.slots[local]})
+	words := 0
+	for _, local := range e.Captures {
+		words += captureWords(local)
+	}
+	env := b.runtime("alloc", b.constant(int64(words)), b.constant(1))
+	offset := 0
+	for _, local := range e.Captures {
+		b.store(place{addr: env, offset: offset}, b.captured(local))
+		offset += 8 * captureWords(local)
 	}
 	return []*Value{code, env}
+}
+
+func (b *builder) captured(local *ast.Local) []*Value {
+	if local.Boxed() {
+		return []*Value{b.slots[local]}
+	}
+	return b.load(b.place(&ast.Place{Local: local}), local.Type)
 }
 
 func (b *builder) arguments(args []ast.Expr, params []*types.Type) []*Value {
@@ -1053,22 +1148,11 @@ func (b *builder) dispatch(arms []*ast.Arm, subject []*Value, result *types.Type
 	temp := b.newTemp()
 	done := b.newBlock()
 	targets := make([]*Block, len(arms))
-	for i, arm := range arms {
+	for i := range arms {
 		targets[i] = b.newBlock()
-		last := i == len(arms)-1
-		if (arm.Pattern.Variant == nil && arm.Pattern.Test == nil) || last {
-			b.jump(targets[i])
-			break
-		}
-		next := b.newBlock()
-		match := b.armMatches(arm.Pattern, subject)
-		b.branch(match, targets[i], next)
-		b.enter(next)
 	}
+	b.selectArm(arms, targets, subject)
 	for i, arm := range arms {
-		if targets[i] == nil {
-			break
-		}
 		b.enter(targets[i])
 		b.bindPattern(arm.Pattern, subject)
 		b.writeTemp(temp, b.value(arm.Body, result))
@@ -1076,6 +1160,24 @@ func (b *builder) dispatch(arms []*ast.Arm, subject []*Value, result *types.Type
 	}
 	b.enter(done)
 	return b.readTemp(temp, result.Size())
+}
+
+func (b *builder) selectArm(arms []*ast.Arm, targets []*Block, subject []*Value) {
+	last := len(arms) - 1
+	if plan, ok := switchOf(arms, targets); ok {
+		b.lowerSwitch(plan, subject[0], targets[last])
+		return
+	}
+	for i, arm := range arms {
+		if (arm.Pattern.Variant == nil && arm.Pattern.Test == nil) || i == last {
+			b.jump(targets[i])
+			return
+		}
+		next := b.newBlock()
+		match := b.armMatches(arm.Pattern, subject)
+		b.branch(match, targets[i], next)
+		b.enter(next)
+	}
 }
 
 func (b *builder) armMatches(p *ast.Pattern, subject []*Value) *Value {

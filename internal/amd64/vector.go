@@ -73,10 +73,6 @@ func (l lanes) reg(base, half int) string {
 	return fmt.Sprintf("xmm%d", base+half)
 }
 
-func (l lanes) xmm(base, half int) string {
-	return fmt.Sprintf("xmm%d", base+half)
-}
-
 func (g *Generator) loadVector(l lanes, base int, m maddr) {
 	for h := range l.halves {
 		g.emit("%s %s, %s ptr %s", g.vmov(), l.reg(base, h), g.memWidth(l), m.at(16*h))

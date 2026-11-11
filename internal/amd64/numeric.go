@@ -2,7 +2,7 @@ package amd64
 
 import (
 	"fmt"
-	"strconv"
+	"strings"
 
 	"lowlang/internal/ir"
 	"lowlang/internal/types"
@@ -70,50 +70,74 @@ func (g *Generator) normalize(loc string, t *types.Type) {
 	g.move(loc, reg)
 }
 
-func (g *Generator) toXmm(xmm, loc string) {
-	if isImm(loc) {
-		g.move("r10", loc)
-		loc = "r10"
-	}
-	g.emit("movq %s, %s", xmm, loc)
-}
-
-func (g *Generator) fromXmm(dst string, t *types.Type) {
-	if isReg(dst) {
-		g.emit("movq %s, xmm0", dst)
-	} else {
-		g.emit("movq r10, xmm0")
-		g.move(dst, "r10")
-	}
-	g.normalize(dst, t)
-}
-
 func (g *Generator) arithmetic(fr *frame, in *instr, op string) {
 	t := in.value.Type
 	if isFloat(t) {
-		g.toXmm("xmm0", fr.loc(in.args[0]))
-		g.toXmm("xmm1", fr.loc(in.args[1]))
-		g.emit("%ss%s xmm0, xmm1", op, precision(t))
-		g.fromXmm(fr.loc(in.dst), t)
+		g.floatArithmetic(fr, in, op)
 		return
 	}
 	g.binary(fr, in, binops[in.op])
-	g.normalize(fr.loc(in.dst), t)
+	if !in.word32() {
+		g.normalize(fr.loc(in.dst), t)
+	}
+}
+
+func (in *instr) word32() bool {
+	t := in.value.Type
+	return t != nil && t.Integer() && !t.Signed && t.Bits == 32
+}
+
+func dword(loc string) string {
+	switch {
+	case isReg(loc):
+		return narrow[loc][0]
+	case isMem(loc):
+		return strings.Replace(loc, "qword", "dword", 1)
+	}
+	return loc
+}
+
+func (in *instr) sized() func(string) string {
+	if in.word32() {
+		return dword
+	}
+	return func(loc string) string { return loc }
+}
+
+func widens(from, to *types.Type) bool {
+	if !from.Integer() || !to.Integer() || to.Bits == 0 || from.Bits == 0 {
+		return false
+	}
+	switch {
+	case !from.Signed && !to.Signed:
+		return to.Bits >= from.Bits
+	case !from.Signed:
+		return to.Bits > from.Bits
+	}
+	return to.Signed && to.Bits >= from.Bits
 }
 
 func (g *Generator) negate(fr *frame, in *instr) {
 	t := in.value.Type
-	g.move("r10", fr.loc(in.args[0]))
-	switch {
-	case isFloat(t):
-		g.emit("btc r10, %d", t.Bits-1)
-	case in.op == ir.OpCompl:
-		g.emit("not r10")
-	default:
-		g.emit("neg r10")
+	if isFloat(t) {
+		g.floatNegate(fr, in)
+		return
 	}
-	g.normalize("r10", t)
-	g.move(fr.loc(in.dst), "r10")
+	dst := fr.loc(in.dst)
+	work := g.workRegister(dst)
+	g.move(work, fr.loc(in.args[0]))
+	operation, operand := "neg", work
+	if in.op == ir.OpCompl {
+		operation = "not"
+	}
+	if in.word32() {
+		operand = dword(work)
+	}
+	g.emit("%s %s", operation, operand)
+	if !in.word32() {
+		g.normalize(work, t)
+	}
+	g.move(dst, work)
 }
 
 func (g *Generator) divide(fr *frame, in *instr) {
@@ -122,16 +146,21 @@ func (g *Generator) divide(fr *frame, in *instr) {
 		g.arithmetic(fr, in, "div")
 		return
 	}
+	divisor := in.args[1].konst
+	zeroPossible := divisor == nil || *divisor == 0
+	minusOnePossible := divisor == nil || *divisor == -1
 	done := g.newLabel()
 	g.move("rax", fr.loc(in.args[0]))
 	g.move("r10", fr.loc(in.args[1]))
-	g.emit("test r10, r10")
-	g.emit("jz rt_panic_divzero")
+	if zeroPossible {
+		g.emit("test r10, r10")
+		g.emit("jz rt_panic_divzero")
+	}
 	if t != nil && !t.Signed {
 		g.emit("xor edx, edx")
 		g.emit("div r10")
 	} else {
-		g.signedDivide(in.op, done)
+		g.signedDivide(in.op, done, minusOnePossible)
 	}
 	if in.op == ir.OpRem {
 		g.emit("mov rax, rdx")
@@ -141,7 +170,12 @@ func (g *Generator) divide(fr *frame, in *instr) {
 	g.move(fr.loc(in.dst), "rax")
 }
 
-func (g *Generator) signedDivide(op ir.Op, done string) {
+func (g *Generator) signedDivide(op ir.Op, done string, minusOnePossible bool) {
+	if !minusOnePossible {
+		g.emit("cqo")
+		g.emit("idiv r10")
+		return
+	}
 	normal := g.newLabel()
 	g.emit("cmp r10, -1")
 	g.emit("jne %s", normal)
@@ -165,19 +199,38 @@ func (g *Generator) shift(fr *frame, in *instr) {
 			op = "sar"
 		}
 	}
-	g.move("r10", fr.loc(in.args[0]))
-	count := fr.loc(in.args[1])
-	if n, err := strconv.ParseInt(count, 10, 64); err == nil {
-		if n >= 0 && n < 64 {
-			g.emit("%s r10, %d", op, n)
-		} else {
-			g.overshift(op)
+	dst := fr.loc(in.dst)
+	count := in.args[1]
+	if count.konst == nil {
+		g.move("r10", fr.loc(in.args[0]))
+		g.variableShift(op, fr.loc(count))
+		if op == "shl" {
+			g.normalize("r10", t)
 		}
-	} else {
-		g.variableShift(op, count)
+		g.move(dst, "r10")
+		return
 	}
-	g.normalize("r10", t)
-	g.move(fr.loc(in.dst), "r10")
+	work := g.workRegister(dst)
+	g.move(work, fr.loc(in.args[0]))
+	n := *count.konst
+	switch {
+	case op == "shl" && in.word32() && n >= 0 && n < 32:
+		g.emit("shl %s, %d", dword(work), n)
+	default:
+		g.constantShift(op, work, n)
+		if op == "shl" {
+			g.normalize(work, t)
+		}
+	}
+	g.move(dst, work)
+}
+
+func (g *Generator) constantShift(op, reg string, n int64) {
+	if n >= 0 && n < 64 {
+		g.emit("%s %s, %d", op, reg, n)
+		return
+	}
+	g.overshift(op, reg)
 }
 
 func (g *Generator) variableShift(op, count string) {
@@ -192,24 +245,28 @@ func (g *Generator) variableShift(op, count string) {
 	g.emit("%s r10, cl", op)
 	g.emit("jmp %s", done)
 	g.label(big)
-	g.overshift(op)
+	g.overshift(op, "r10")
 	g.label(done)
 	g.move("rcx", "r11")
 }
 
-func (g *Generator) overshift(op string) {
+func (g *Generator) overshift(op, reg string) {
 	if op == "sar" {
-		g.emit("sar r10, 63")
+		g.emit("sar %s, 63", reg)
 		return
 	}
-	g.emit("xor r10d, r10d")
+	g.emit("xor %s, %s", narrow[reg][0], narrow[reg][0])
 }
 
 func (g *Generator) compareValues(fr *frame, in *instr) {
 	t := in.value.Type
 	if !isFloat(t) {
 		g.compare(fr, in.args[0], in.args[1])
-		g.emit("set%s al", condition(in.value))
+		cond := condition(in.value)
+		if in.negated {
+			cond = inverse[cond]
+		}
+		g.emit("set%s al", cond)
 	} else {
 		g.floatCompare(fr, in)
 	}
@@ -217,131 +274,54 @@ func (g *Generator) compareValues(fr *frame, in *instr) {
 	g.move(fr.loc(in.dst), "rax")
 }
 
-func (g *Generator) floatCompare(fr *frame, in *instr) {
-	t := in.value.Type
-	g.toXmm("xmm0", fr.loc(in.args[0]))
-	g.toXmm("xmm1", fr.loc(in.args[1]))
-	ucomis := "ucomis" + precision(t)
-	switch in.op {
-	case ir.OpEq, ir.OpNe:
-		g.emit("%s xmm0, xmm1", ucomis)
-		if in.op == ir.OpEq {
-			g.emit("sete al")
-			g.emit("setnp r11b")
-			g.emit("and al, r11b")
-		} else {
-			g.emit("setne al")
-			g.emit("setp r11b")
-			g.emit("or al, r11b")
-		}
-	case ir.OpLt:
-		g.emit("%s xmm1, xmm0", ucomis)
-		g.emit("seta al")
-	case ir.OpLe:
-		g.emit("%s xmm1, xmm0", ucomis)
-		g.emit("setae al")
-	case ir.OpGt:
-		g.emit("%s xmm0, xmm1", ucomis)
-		g.emit("seta al")
-	case ir.OpGe:
-		g.emit("%s xmm0, xmm1", ucomis)
-		g.emit("setae al")
-	}
-}
-
 func (g *Generator) convert(fr *frame, in *instr) {
 	from, to := in.value.From, in.value.Type
 	src, dst := fr.loc(in.args[0]), fr.loc(in.dst)
 	switch {
+	case from.Integer() && to.Integer() && widens(from, to):
+		g.move(dst, src)
 	case from.Integer() && to.Integer():
 		g.move("r10", src)
 		g.normalize("r10", to)
 		g.move(dst, "r10")
 	case from == types.U64:
-		g.move("r10", src)
-		g.unsignedToFloat(precision(to))
-		g.fromXmm(dst, to)
+		g.unsignedToFloat(src, dst, to)
 	case from.Integer():
-		g.move("r10", src)
-		g.emit("cvtsi2s%s xmm0, r10", precision(to))
-		g.fromXmm(dst, to)
+		g.integerToFloat(src, dst, to)
 	case to == types.U64:
-		g.toXmm("xmm0", src)
-		g.floatToUnsigned(precision(from))
-		g.move(dst, "r10")
+		g.floatToUnsigned(fr, in.args[0], dst, from)
 	case to.Integer():
-		g.toXmm("xmm0", src)
-		g.emit("cvtts%s2si r10, xmm0", precision(from))
-		g.normalize("r10", to)
-		g.move(dst, "r10")
+		g.floatToInteger(fr, in.args[0], dst, from, to)
 	default:
-		g.toXmm("xmm0", src)
-		g.emit("cvts%s2s%s xmm0, xmm0", precision(from), precision(to))
-		g.fromXmm(dst, to)
+		g.floatToFloat(fr, in.args[0], dst, from, to)
 	}
-}
-
-func (g *Generator) unsignedToFloat(p string) {
-	big := g.newLabel()
-	done := g.newLabel()
-	g.emit("test r10, r10")
-	g.emit("js %s", big)
-	g.emit("cvtsi2s%s xmm0, r10", p)
-	g.emit("jmp %s", done)
-	g.label(big)
-	g.emit("mov r11, r10")
-	g.emit("shr r10, 1")
-	g.emit("and r11d, 1")
-	g.emit("or r10, r11")
-	g.emit("cvtsi2s%s xmm0, r10", p)
-	g.emit("adds%s xmm0, xmm0", p)
-	g.label(done)
-}
-
-func (g *Generator) floatToUnsigned(p string) {
-	big := g.newLabel()
-	done := g.newLabel()
-	limit := int64(0x43E0000000000000)
-	if p == "s" {
-		limit = 0x5F000000
-	}
-	g.emit("mov r10, %d", limit)
-	g.emit("movq xmm1, r10")
-	g.emit("ucomis%s xmm0, xmm1", p)
-	g.emit("jae %s", big)
-	g.emit("cvtts%s2si r10, xmm0", p)
-	g.emit("jmp %s", done)
-	g.label(big)
-	g.emit("subs%s xmm0, xmm1", p)
-	g.emit("cvtts%s2si r10, xmm0", p)
-	g.emit("btc r10, 63")
-	g.label(done)
 }
 
 func (g *Generator) mulHigh(fr *frame, in *instr) {
 	g.move("rax", fr.loc(in.args[0]))
-	g.move("r10", fr.loc(in.args[1]))
-	g.emit("mul r10")
-	g.move(fr.loc(in.dst), "rdx")
-}
-
-func (g *Generator) floatUnary(fr *frame, in *instr) {
-	t := in.value.Type
-	g.toXmm("xmm0", fr.loc(in.args[0]))
-	if in.op == ir.OpSqrt {
-		g.emit("sqrts%s xmm0, xmm0", precision(t))
-	} else {
-		g.emit("rounds%s xmm0, xmm0, 1", precision(t))
+	factor := fr.loc(in.args[1])
+	if !isReg(factor) {
+		g.move("r10", factor)
+		factor = "r10"
 	}
-	g.fromXmm(fr.loc(in.dst), t)
+	if t := in.value.Type; t != nil && t.Signed {
+		g.emit("imul %s", factor)
+	} else {
+		g.emit("mul %s", factor)
+	}
+	g.move(fr.loc(in.dst), "rdx")
 }
 
 var widths = map[int]string{8: "byte", 16: "word", 32: "dword"}
 
 func (g *Generator) load(fr *frame, in *instr) {
 	t := in.value.Type
-	memory := fmt.Sprintf("[%s+%d]", g.base(fr.loc(in.args[0])), in.value.Aux)
+	memory := fr.address(in.args[0])
 	dst := fr.loc(in.dst)
+	if isXmm(dst) {
+		g.floatLoad(dst, t, memory)
+		return
+	}
 	if t == nil {
 		g.move(dst, fmt.Sprintf("qword ptr %s", memory))
 		return
@@ -364,11 +344,18 @@ func (g *Generator) load(fr *frame, in *instr) {
 
 func (g *Generator) store(fr *frame, in *instr) {
 	t := in.value.Type
-	base := g.base(fr.loc(in.args[0]))
+	memory := fr.address(in.args[0])
 	value := fr.loc(in.args[1])
+	if isXmm(value) {
+		if g.floatStore(memory, in, value) {
+			return
+		}
+		g.move("rax", value)
+		value = "rax"
+	}
 	if isMem(value) {
-		g.move("r11", value)
-		value = "r11"
+		g.move("rax", value)
+		value = "rax"
 	}
 	width := "qword"
 	if t != nil {
@@ -377,5 +364,5 @@ func (g *Generator) store(fr *frame, in *instr) {
 			value = narrow[value][map[int]int{8: 2, 16: 1, 32: 0}[t.Bits]]
 		}
 	}
-	g.emit("mov %s ptr [%s+%d], %s", width, base, in.value.Aux, value)
+	g.emit("mov %s ptr %s, %s", width, memory, value)
 }

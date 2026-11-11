@@ -237,8 +237,16 @@ type Local struct {
 	Ref       bool
 	Addressed bool
 	Captured  bool
+	Assigned  bool
 	Owner     *Func
 	Flag      *Local
+}
+
+func (l *Local) Boxed() bool {
+	if !l.Captured {
+		return false
+	}
+	return l.Assigned || l.Addressed || l.Type.Kind == types.VectorKind || (l.Type.Kind == types.StructKind && l.Type.C)
 }
 
 type Node interface {
@@ -414,15 +422,17 @@ type Slicing struct {
 
 type SliceLit struct {
 	Typed
-	Elems []Expr
-	Pos   lexer.Pos
+	Elems    []Expr
+	ReadOnly bool
+	Pos      lexer.Pos
 }
 
 type MapLit struct {
 	Typed
-	Keys   []Expr
-	Values []Expr
-	Pos    lexer.Pos
+	Keys     []Expr
+	Values   []Expr
+	ReadOnly bool
+	Pos      lexer.Pos
 }
 
 type Interp struct {

@@ -37,11 +37,11 @@
 (call_expression
   function: (identifier) @function.call
   (#match? @function.call "^[a-z_]")
-  (#not-any-of? @function.call "print" "new" "push" "delete" "bytes" "cstr" "str" "view" "load" "store" "pin" "unpin" "embed" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
+  (#not-any-of? @function.call "print" "new" "push" "pop" "truncate" "delete" "bytes" "cstr" "str" "view" "load" "store" "pin" "unpin" "embed" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
 
 (call_expression
   function: (identifier) @function.builtin
-  (#any-of? @function.builtin "print" "new" "push" "delete" "bytes" "cstr" "str" "view" "load" "store" "pin" "unpin" "embed" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
+  (#any-of? @function.builtin "print" "new" "push" "pop" "truncate" "delete" "bytes" "cstr" "str" "view" "load" "store" "pin" "unpin" "embed" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
 
 (call_expression
   function: (field_expression

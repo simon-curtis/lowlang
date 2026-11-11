@@ -228,6 +228,8 @@ func (c *cursor) methods(t *types.Type) {
 	switch t.Kind {
 	case types.SliceKind:
 		c.add("push", completionMethod, "builtin")
+		c.add("pop", completionMethod, "builtin")
+		c.add("truncate", completionMethod, "builtin")
 	case types.MapKind:
 		c.add("delete", completionMethod, "builtin")
 	case types.ChanKind:

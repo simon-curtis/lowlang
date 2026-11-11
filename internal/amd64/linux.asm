@@ -129,9 +129,123 @@ rt_mmap:
 	ja rt_panic_oom
 	ret
 
+rt_mmap_sparse:
+	push rsi
+	call rt_mmap
+	pop rsi
+	push rax
+	mov rdi, rax
+	mov edx, 15
+	mov eax, 28
+	syscall
+	pop rax
+	ret
+
+rt_heap_release:
+	push rbx
+	push r12
+	push r13
+	mov ebx, BIN_RELEASE
+1:
+	mov rdi, rbx
+	lea rsi, [rip+rt_bin_bits]
+	call rt_bits_next
+	cmp rax, -1
+	je 9f
+	mov rbx, rax
+2:
+	lea rcx, [rip+rt_bins]
+	mov r12, [rcx+8*rbx]
+	mov rax, [r12+8]
+	mov [rcx+8*rbx], rax
+	test rax, rax
+	jnz 3f
+	lea rcx, [rip+rt_bin_bits]
+	btr qword ptr [rcx], rbx
+3:
+	mov rax, [r12]
+	shr rax, 3
+	lea r13, [r12+8*rax]
+	and r13, -4096
+	lea rdi, [r12+16+4095]
+	and rdi, -4096
+	mov rsi, r13
+	sub rsi, rdi
+	mov edx, 4
+	mov eax, 28
+	syscall
+	mov rcx, [rip+rt_heap_start]
+	sub rdi, rcx
+	shr rdi, PAGE_SHIFT
+	sub r13, rcx
+	shr r13, PAGE_SHIFT
+	dec r13
+	mov rsi, r13
+	test rax, rax
+	jnz 4f
+	call rt_page_clear
+4:
+	lea rdx, [rbx+BIN_CLEAN]
+	lea rcx, [rip+rt_bins]
+	mov rax, [rcx+8*rdx]
+	mov [r12+8], rax
+	mov [rcx+8*rdx], r12
+	lea rcx, [rip+rt_bin_bits]
+	bts qword ptr [rcx], rdx
+	lea rcx, [rip+rt_bins]
+	cmp qword ptr [rcx+8*rbx], 0
+	jne 2b
+	jmp 1b
+9:
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
 rt_yield:
 	mov eax, 24
 	syscall
+	ret
+
+	.globl rt_sysblock
+rt_sysblock:
+	push rbx
+	push r12
+	push r13
+	push r14
+	push r15
+	push r9
+	push r8
+	push r10
+	push rdx
+	push rsi
+	push rdi
+	push rax
+	TLS_GET rcx, TLS_G
+	mov r11, [rsp+96]
+	mov [rcx+G_PC], r11
+	lea r11, [rsp+104]
+	mov [rcx+G_USERSP], r11
+	mov [rcx+G_FP], rbp
+	mov [rcx+G_SCANLO], rsp
+	TLS_GET r11, TLS_M
+	mov ecx, INC
+	xchg [r11+M_STATE], rcx
+	mov rax, [rsp]
+	mov rdi, [rsp+8]
+	mov rsi, [rsp+16]
+	mov rdx, [rsp+24]
+	mov r10, [rsp+32]
+	mov r8, [rsp+40]
+	mov r9, [rsp+48]
+	syscall
+	call rt_exitc
+	add rsp, 56
+	pop r15
+	pop r14
+	pop r13
+	pop r12
+	pop rbx
 	ret
 
 rt_futex_wait:
@@ -176,7 +290,12 @@ rt_os_stack:
 rt_os_m_prepare:
 	mov rsi, G0_STACK
 	call rt_mmap_stack
-	add rax, G0_STACK
+	mov rdi, rax
+	mov esi, G0_STACK
+	mov edx, 15
+	mov eax, 28
+	syscall
+	lea rax, [rdi+G0_STACK]
 	mov [rbx+M_G0TOP], rax
 	mov [rbx+M_G0SP], rax
 	lea rax, [rbx+M_TCB]
@@ -537,6 +656,45 @@ rt_vdso_clock_name:
 	.asciz "__vdso_clock_gettime"
 
 	.text
+rt_seed_init:
+	test rdi, rdi
+	jz 5f
+1:
+	mov rax, [rdi]
+	add rdi, 8
+	test rax, rax
+	jnz 1b
+2:
+	mov rax, [rdi]
+	test rax, rax
+	jz 5f
+	cmp rax, 25
+	je 3f
+	add rdi, 16
+	jmp 2b
+3:
+	mov rsi, [rdi+8]
+	test rsi, rsi
+	jz 5f
+	mov rax, [rsi]
+	mov rdx, [rsi+8]
+	jmp 8f
+5:
+	lea rdi, [rip+rt_hash_seed]
+	mov esi, 16
+	xor edx, edx
+	mov eax, 318
+	syscall
+	cmp rax, 16
+	je 9f
+	call rt_seed_fallback
+8:
+	mov [rip+rt_hash_seed], rax
+	mov [rip+rt_hash_seed+8], rdx
+9:
+	or qword ptr [rip+rt_hash_seed+8], 1
+	ret
+
 rt_vdso_init:
 	push rbx
 	push r12

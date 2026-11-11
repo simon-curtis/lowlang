@@ -28,7 +28,7 @@ const (
 )
 
 var builtinFuncs = []string{
-	"print", "new", "push", "delete", "bytes", "cstr", "str", "view", "load", "store", "pin", "unpin",
+	"print", "new", "push", "pop", "truncate", "delete", "bytes", "cstr", "str", "view", "load", "store", "pin", "unpin",
 	"embed", "sqrt", "floor", "exp", "close", "sleep", "wait_readable", "wait_writable",
 }
 

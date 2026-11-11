@@ -190,10 +190,7 @@ func (b *builder) cInvoke(symbol string, params []*types.Type, ret *types.Type, 
 	for k := range results {
 		results[k] = b.result(call, k)
 	}
-	if width := ret.Width(); width != nil && len(results) == 1 {
-		if width.Float() {
-			width = types.U32
-		}
+	if width := ret.Width(); width != nil && !width.Float() && len(results) == 1 {
 		results[0] = b.convert(results[0], types.I64, width)
 	}
 	classify(results, ret)

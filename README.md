@@ -24,6 +24,7 @@ go build -o low ./cmd/low
 ./low build testdata/run/fib.low -o fib
 ./low asm testdata/run/fib.low
 ./low build testdata/run/fib.low -target windows/amd64
+./low lint app.low
 ./low dev app.low
 ./low run app/
 ```
