@@ -25,11 +25,33 @@ function show(target) {
     tip.style.left = `${left}px`;
 }
 
+let traced;
+
+function untrace() {
+    traced?.classList.remove("tracing");
+    for (const node of traced?.querySelectorAll(".traced") ?? []) {
+        node.classList.remove("traced");
+    }
+    traced = undefined;
+}
+
+function trace(target) {
+    untrace();
+    if (target) {
+        traced = target.closest("pre");
+        traced.classList.add("tracing");
+        for (const node of traced.querySelectorAll(`[data-ref="${target.dataset.ref}"]`)) {
+            node.classList.add("traced");
+        }
+    }
+}
+
 function hide() {
     tip.hidden = true;
 }
 
 document.addEventListener("pointerover", (event) => {
+    trace(event.target.closest("pre [data-ref]"));
     const target = event.target.closest("[data-hover]");
     if (target) {
         show(target);
