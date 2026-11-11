@@ -1,12 +1,14 @@
 # Editor support
 
-`tree-sitter-low` is the grammar for `.low` files. Zed and Neovim use it directly; VS Code uses the TextMate grammar in `vscode/syntaxes`. All three start `low lsp`, which serves diagnostics, hover, go-to-definition, references, rename, document and workspace symbols, completion, signature help and inlay hints for inferred types. Rename and inlay hints only answer when the program compiles. `low` must be on `PATH`:
+- Zed and Neovim highlight with the `tree-sitter-low` grammar; VS Code uses the TextMate grammar in `vscode/syntaxes`.
+- All three start `low lsp`: diagnostics, hover, go-to-definition, references, rename, document and workspace symbols, completion, signature help, and inlay hints for inferred types. Rename and inlay hints answer only when the program compiles.
+- `go test ./editors/` fails when the lexer has a keyword that a grammar or highlight query does not cover.
+
+`low` must be on `PATH`:
 
 ```sh
 go install ./cmd/low
 ```
-
-`go test ./editors/` fails when the lexer has a keyword that a grammar or highlight query does not cover.
 
 ## Grammar
 
@@ -17,7 +19,7 @@ npx tree-sitter generate
 npx tree-sitter test
 ```
 
-`src/` is generated and committed, because Zed and Neovim compile `src/parser.c` directly. Regenerate after every change to `grammar.js`. `queries/highlights.scm` is shared: Zed and Neovim link to it.
+`src/` is generated and committed because Zed and Neovim compile `src/parser.c` directly; regenerate it after every change to `grammar.js`. Zed and Neovim link to the shared `queries/highlights.scm`.
 
 ## VS Code
 
@@ -44,4 +46,4 @@ Requires Neovim 0.11 or later. With lazy.nvim:
 
 Without a plugin manager, add `editors/nvim` to `runtimepath` and run `nvim -l editors/nvim/build.lua` once. The build compiles the parser to `editors/nvim/parser/low.so` with `cc`.
 
-The plugin enables the `low` language server; set `vim.g.low_lsp = false` to stop that. Indentation uses nvim-treesitter's `indentexpr` when nvim-treesitter is installed, and `cindent` otherwise.
+The plugin enables the `low` language server unless `vim.g.low_lsp = false`. Indentation uses nvim-treesitter's `indentexpr` when nvim-treesitter is installed, and `cindent` otherwise.
