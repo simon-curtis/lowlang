@@ -11,6 +11,9 @@ try {
     for (const snippet of unchecked) {
         console.warn(`unchecked: ${snippet}`);
     }
+    if (unchecked.length > 0) {
+        throw new Error(`${unchecked.length} docs snippets fail to check`);
+    }
     const modules = await packages(session.binary);
     console.log(`packages: ${modules} modules`);
     const blocks = await snippets(session);

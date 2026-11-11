@@ -64,7 +64,7 @@ Each `bench/<name>/` holds one program as `main.low`, `main.go` and, for most, `
 
 ## Website
 
-`site/` is a static site styled with Tailwind. Its output is committed, so the directory serves as it is. The `site` workflow rebuilds it on every push to `main` that touches the site, the docs or the compiler, and deploys it to Cloudflare Pages.
+`site/` is a static site styled with Tailwind. Its output is committed, so the directory serves as it is. The `test` workflow runs `go vet` and `go test` on every push and pull request to `main`. When it passes on a push to `main`, the `site` workflow rebuilds the site and deploys it to Cloudflare Pages.
 
 ```sh
 cd site
@@ -85,7 +85,7 @@ python3 ../assets/brand/build.py
 
 ### Checked snippets
 
-The LSP checks each Low snippet in the docs as a program: declarations stay at the top level and loose statements go inside `fn main()`. A `...` standing for elided code checks as a diverging loop. The build lists every snippet that fails to check.
+The LSP checks each Low snippet in the docs as a program: declarations stay at the top level and loose statements go inside `fn main()`, and `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. The build lists every snippet that fails to check and then fails.
 
 HTML comments directly above a block supply context readers do not see:
 
