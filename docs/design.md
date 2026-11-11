@@ -1360,4 +1360,10 @@ The UI library is staged under `ui/` until it moves into the standard library as
     12. Text input element whose state is held in signals, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     13. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
 3. Own assembler and linker replacing `as` and `ld`, with static and dynamic ELF output.
-4. Further targets: linux/arm64, darwin; macOS (Metal) and Windows backends for the UI library.
+4. A wasm32 target and a browser playground that runs snippets:
+    1. Targets named by OS and architecture, with `wasm32` beside `amd64`.
+    2. A WebAssembly back end lowered from the IR: structured control flow rebuilt from the IR's blocks, locals in place of registers, a linear-memory heap with the size-class bins, and a module written directly without an external assembler or linker.
+    3. A browser host: `print` and the clock as JavaScript imports; modules that need the OS (files, sockets, processes, the UI library) are rejected at compile time for this target.
+    4. The compiler built for `js/wasm`, so the page compiles and runs a snippet without a server.
+    5. A Run button on every documentation snippet, and an editable playground page on the site.
+5. Further targets: linux/arm64, darwin; macOS (Metal) and Windows backends for the UI library.
