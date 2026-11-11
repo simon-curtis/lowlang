@@ -1,10 +1,10 @@
 use zed_extension_api::{self as zed, LanguageServerId, Result};
 
-struct LowLang;
+struct Low;
 
-impl zed::Extension for LowLang {
+impl zed::Extension for Low {
     fn new() -> Self {
-        LowLang
+        Low
     }
 
     fn language_server_command(
@@ -23,4 +23,4 @@ impl zed::Extension for LowLang {
     }
 }
 
-zed::register_extension!(LowLang);
+zed::register_extension!(Low);

@@ -13,7 +13,7 @@ local result = vim.system({
 }):wait()
 
 if result.code ~= 0 then
-  error(string.format("building the LowLang parser failed:\n%s", result.stderr))
+  error(string.format("building the Low parser failed:\n%s", result.stderr))
 end
 
 print(string.format("built %s", output))

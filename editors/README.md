@@ -28,7 +28,7 @@ npm run package
 code --install-extension lowlang-0.1.0.vsix
 ```
 
-The `lowlang.server.path` setting overrides the `low` binary. The `LowLang: Restart Language Server` command restarts it.
+The `lowlang.server.path` setting overrides the `low` binary. The `Low: Restart Language Server` command restarts it.
 
 ## Zed
 

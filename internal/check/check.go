@@ -2103,6 +2103,7 @@ func (c *Checker) embed(e *ast.Call) {
 	if !ok {
 		c.fail(e.Args[0].Position(), "embed needs a string literal path")
 	}
+	lit.Type = types.Str
 	if strings.HasPrefix(c.file.Module, "std/") {
 		c.stdEmbed(e, lit)
 		return

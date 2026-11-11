@@ -1,110 +1,67 @@
 import json
-import math
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-PAPER = "#f2ead9"
-GRAIN = "#e2d6bd"
-SPOT = "#ff5a1f"
-INK = "#16130f"
+INK = "#111111"
+PAPER = "#f5f5f3"
 TYPEFACE = "Noto Sans"
-NAME = "LowLang"
+NAME = "Low"
 TAGLINE = [
-    "A compiled language with Go's speed",
-    "and footprint, plus enums, typed errors",
-    "and expression-oriented syntax.",
+    "A compiled, garbage-collected language",
+    "with green threads, enums and typed errors.",
+    "Small static binaries for Linux and Windows.",
 ]
 
 VIEW = 512
-LETTER_LEFT = 136
-LETTER_TOP = 96
-LETTER_RIGHT = 376
-LETTER_BOTTOM = 416
-STROKE = 96
+STROKE_RATIO = 0.3
+GAP_RATIO = 0.0625
 
 
-def letter_path():
-    inner_x = LETTER_LEFT + STROKE
-    inner_y = LETTER_BOTTOM - STROKE
-    return (
-        f"M{LETTER_LEFT} {LETTER_TOP}H{inner_x}V{inner_y}H{LETTER_RIGHT}V{LETTER_BOTTOM}H{LETTER_LEFT}Z"
-    )
+def mark(left, top, size, stroke, gap):
+    right = left + size
+    bottom = top + size
+    upright = f"M{left} {top}H{left + stroke}V{bottom - stroke - gap}L{left} {bottom - gap}Z"
+    foot = f"M{left + gap} {bottom}L{left + stroke + gap} {bottom - stroke}H{right}V{bottom}Z"
+    return f"{upright}{foot}"
 
 
-def letter_tone(x, y):
-    along = (x - LETTER_LEFT) / (LETTER_RIGHT - LETTER_LEFT)
-    up = (LETTER_BOTTOM - y) / (LETTER_BOTTOM - LETTER_TOP)
-    return 1.1 - 1.05 * max(along, up)
+def proportioned(left, top, size):
+    return mark(left, top, size, round(size * STROKE_RATIO), round(size * GAP_RATIO))
 
 
-def screen(left, top, right, bottom, step, tone):
-    circles = []
-    rows = int((bottom - top) / step) + 1
-    columns = int((right - left) / (2 * step)) + 1
-    for row in range(rows):
-        y = top + row * step
-        for column in range(columns):
-            x = left + (2 * column + row % 2) * step
-            level = min(tone(x, y), 1.1)
-            if level > 0:
-                circles.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{step * math.sqrt(level):.2f}"/>')
-    return "".join(circles)
+def bare_mark():
+    return f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {VIEW} {VIEW}"><path d="{proportioned(0, 0, VIEW)}"/></svg>\n'
 
 
-def tile(step, radius, scale):
-    overprint = screen(LETTER_LEFT, LETTER_TOP, LETTER_RIGHT, LETTER_BOTTOM, step, letter_tone)
-    shift = VIEW / 2 * (1 - scale)
+def tile(radius, inset, stroke, gap):
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {VIEW} {VIEW}">'
-        f'<defs><clipPath id="letter"><path d="{letter_path()}"/></clipPath></defs>'
-        f'<rect width="{VIEW}" height="{VIEW}" rx="{radius}" fill="{PAPER}"/>'
-        f'<g transform="translate({shift} {shift}) scale({scale})">'
-        f'<path d="{letter_path()}" fill="{SPOT}"/>'
-        f'<g clip-path="url(#letter)" fill="{INK}">{overprint}</g></g></svg>\n'
+        f'<rect width="{VIEW}" height="{VIEW}" rx="{radius}" fill="{INK}"/>'
+        f'<path d="{mark(inset, inset, VIEW - 2 * inset, stroke, gap)}" fill="{PAPER}"/></svg>\n'
     )
 
 
-def pixel_tile():
-    return (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" shape-rendering="crispEdges">'
-        f'<rect width="16" height="16" fill="{PAPER}"/>'
-        f'<path d="M4 2H8V10H13V14H4Z" fill="{SPOT}"/>'
-        f'<path d="M4 8H8V10H10V14H4Z" fill="{INK}"/></svg>\n'
-    )
+def standard_tile(radius, inset):
+    size = VIEW - 2 * inset
+    return tile(radius, inset, round(size * STROKE_RATIO), round(size * GAP_RATIO))
 
 
 def banner(width, height):
     unit = width / 1200
-    left = 72 * unit
-    size = 212 * unit
-    baseline = height / 2 - 30 * unit
-    word_width = 840 * unit
-    step = 7 * unit
-
-    def word_tone(x, y):
-        return 1.12 - 1.1 * max((x - left) / word_width, 0) ** 1.6
-
-    def grain_tone(x, y):
-        return 0.55 * (x / width) ** 2 * (y / height) ** 2
-
-    word = f'<text x="{left:.2f}" y="{baseline:.2f}" font-family="{TYPEFACE}" font-weight="900" font-size="{size:.2f}">{NAME}</text>'
-    overprint = screen(left, baseline - size, left + word_width + size, baseline + size / 3, step, word_tone)
-    grain = screen(0, 0, width, height, 10 * unit, grain_tone)
+    left = round(96 * unit)
     lines = "".join(
-        f'<text x="{left + 6 * unit:.2f}" y="{baseline + (96 + index * 50) * unit:.2f}">{line}</text>'
+        f'<text x="{left}" y="{(430 + index * 50) * unit:.2f}">{line}</text>'
         for index, line in enumerate(TAGLINE)
     )
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">'
-        f'<defs><clipPath id="word">{word}</clipPath></defs>'
         f'<rect width="{width}" height="{height}" fill="{PAPER}"/>'
-        f'<g fill="{GRAIN}">{grain}</g>'
-        f'<g fill="{SPOT}">{word}</g>'
-        f'<g clip-path="url(#word)" fill="{INK}">{overprint}</g>'
-        f'<g fill="{INK}" font-family="{TYPEFACE}" font-weight="500" font-size="{36 * unit:.2f}">{lines}</g></svg>\n'
+        f'<path d="{proportioned(left, round(96 * unit), round(128 * unit))}" fill="{INK}"/>'
+        f'<text x="{left - 6 * unit:.2f}" y="{350 * unit:.2f}" fill="{INK}" font-family="{TYPEFACE}" font-weight="700" font-size="{104 * unit:.2f}">{NAME}</text>'
+        f'<g fill="{INK}" font-family="{TYPEFACE}" font-weight="400" font-size="{34 * unit:.2f}">{lines}</g></svg>\n'
     )
 
 
@@ -144,12 +101,16 @@ def manifest():
 
 def build(brand):
     require_typeface()
-    rounded = tile(16, 112, 1)
-    (brand.parent / "icon.svg").write_text(rounded)
+    assets = brand.parent
+    site = assets.parent / "site"
+    rounded = standard_tile(112, 144)
+    (assets / "icon.svg").write_text(rounded)
+    (site / "icon.svg").write_text(rounded)
+    (site / "mark.svg").write_text(bare_mark())
     favicons = {
-        16: pixel_tile(),
-        32: tile(40, 80, 1.15),
-        48: tile(32, 96, 1.1),
+        16: tile(64, 96, 104, 40),
+        32: tile(96, 104, 96, 28),
+        48: tile(104, 120, 84, 20),
     }
     with tempfile.TemporaryDirectory() as scratch:
         frames = []
@@ -157,14 +118,14 @@ def build(brand):
             frame = Path(scratch) / f"favicon-{size}.png"
             rasterise(source, frame, size, size)
             frames.append(frame)
-        pack_ico(frames, brand / "favicon.ico")
-    rasterise(tile(16, 0, 1), brand / "apple-touch-icon.png", 180, 180)
-    rasterise(rounded, brand / "icon-192.png", 192, 192)
-    rasterise(rounded, brand / "icon-512.png", 512, 512)
-    rasterise(tile(16, 0, 0.78), brand / "icon-maskable-512.png", 512, 512)
-    rasterise(banner(1200, 630), brand / "og-image.png", 1200, 630)
+        pack_ico(frames, site / "favicon.ico")
+    rasterise(standard_tile(0, 144), site / "apple-touch-icon.png", 180, 180)
+    rasterise(rounded, site / "icon-192.png", 192, 192)
+    rasterise(rounded, site / "icon-512.png", 512, 512)
+    rasterise(standard_tile(0, 168), site / "icon-maskable-512.png", 512, 512)
+    rasterise(banner(1200, 630), site / "og-image.png", 1200, 630)
     rasterise(banner(1280, 640), brand / "github-social-preview.png", 1280, 640)
-    (brand / "site.webmanifest").write_text(manifest())
+    (site / "site.webmanifest").write_text(manifest())
 
 
 def main():

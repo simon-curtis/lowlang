@@ -256,6 +256,9 @@ func (q *query) hover() string {
 		case n.Variant != nil:
 			return variantText(n.TypeOf(), n.Variant)
 		}
+		if text := builtinSignature(n); text != "" {
+			return text
+		}
 		return q.callee(n).hover()
 	case *ast.Ident:
 		return q.identHover(n)

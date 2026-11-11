@@ -9,7 +9,7 @@ function createClient(): LanguageClient {
   const options: LanguageClientOptions = {
     documentSelector: [{ scheme: 'file', language: 'low' }],
   };
-  return new LanguageClient('lowlang', 'LowLang', server, options);
+  return new LanguageClient('lowlang', 'Low', server, options);
 }
 
 async function start(): Promise<void> {
@@ -20,7 +20,7 @@ async function start(): Promise<void> {
   } catch (error) {
     client = undefined;
     const reason = error instanceof Error ? error.message : String(error);
-    window.showErrorMessage(`LowLang language server failed to start: ${reason}`);
+    window.showErrorMessage(`Low language server failed to start: ${reason}`);
   }
 }
 

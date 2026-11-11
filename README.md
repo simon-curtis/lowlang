@@ -1,6 +1,6 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<img src="assets/icon.svg" width="64" height="64" alt="Low">
 
-# LowLang
+# Low
 
 A compiled language with Go's speed and footprint, plus enums, typed errors and expression-oriented syntax.
 
@@ -55,5 +55,20 @@ Each `bench/<name>/` directory holds one program as `main.low`, `main.go` and `m
 | strings | interpolation, `str` map keys, code point iteration |
 | sort | generic quicksort with a closure comparator |
 | channels | unbuffered ping-pong and a buffered worker pool |
+
+## Website
+
+`site/` is a static site styled with Tailwind. `npm run build` builds the compiler, renders `docs/design.md` and `editors/README.md` into `site/docs/`, highlights every Low snippet with hover text from `low lsp`, writes `style.css` from `tailwind.css` and copies the Lenis scroll library to `lenis.js`. The output is committed, so the directory serves as it is.
+
+The LSP checks each snippet as a program: declarations stay at the top level and loose statements go inside `fn main()`. HTML comments directly above a block in a docs file add context that readers do not see. `<!-- prelude` holds Low code placed before the snippet. If the comment's last line opens a function, such as `fn main() ! ParseError {`, that line wraps the statements instead of `fn main()`. `<!-- prelude path/file.low` writes a file beside the snippet, for imported modules or embedded assets. The build lists each snippet that still fails to check.
+
+```sh
+cd site
+npm install
+npm run build
+python3 ../assets/brand/build.py
+```
+
+`build.py` regenerates the icons, the social images and the web manifest from the mark; it needs `rsvg-convert`, `magick` and Noto Sans.
 
 See [docs/design.md](docs/design.md) for the language design, the standard library, what is implemented and the roadmap.
