@@ -9,6 +9,7 @@ import (
 type Options struct {
 	AlignBranches bool
 	ClangLayout   bool
+	Embeds        map[string][]byte
 }
 
 type Object struct {

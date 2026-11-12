@@ -68,21 +68,11 @@ func (l *peLinker) sizes() (code, initialized, uninitialized uint32, baseOfCode 
 func (l *peLinker) dataDirectories() [peDataDirectories]pe.DataDirectory {
 	var dirs [peDataDirectories]pe.DataDirectory
 	dirs[peDirDebug] = pe.DataDirectory{VirtualAddress: uint32(l.debug.rva()), Size: uint32(l.debug.size)}
-	imports := l.chunksWithPrefix(importPrefix)
-	if len(imports) > 0 {
-		var size uint64
-		for _, c := range imports {
-			size += c.size
-		}
-		dirs[peDirImport] = pe.DataDirectory{VirtualAddress: uint32(imports[0].rva()), Size: uint32(size)}
+	if span, ok := l.prefixSpan(importPrefix); ok {
+		dirs[peDirImport] = span
 	}
-	tables := l.chunksWithPrefix(iatPrefix)
-	if len(tables) > 0 {
-		var size uint64
-		for _, c := range tables {
-			size += c.size
-		}
-		dirs[peDirIAT] = pe.DataDirectory{VirtualAddress: uint32(tables[0].rva()), Size: uint32(size)}
+	if span, ok := l.prefixSpan(iatPrefix); ok {
+		dirs[peDirIAT] = span
 	}
 	if len(l.sites) > 0 {
 		last := l.sections[len(l.sections)-1]

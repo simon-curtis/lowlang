@@ -2,10 +2,7 @@ package ir
 
 import "slices"
 
-func (p *Program) optimise(opts Options) {
-	if !opts.Inline {
-		return
-	}
+func (p *Program) optimise() {
 	p.specialiseConstantArguments()
 	p.inline()
 	reachable := p.reachableFromMain()

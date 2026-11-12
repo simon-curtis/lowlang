@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"lowlang/internal/amd64"
 	"lowlang/internal/asm"
 	"lowlang/internal/link"
 )
@@ -87,20 +88,13 @@ func TestPatchRejectsWritableSections(t *testing.T) {
 	}
 }
 
-func TestImageSymbolsReadsTheLinkedImage(t *testing.T) {
+func TestLinkReturnsTheResolvedSymbols(t *testing.T) {
 	obj := fixtureObject(fixtureOptions{})
 	image, err := link.Static(obj)
 	if err != nil {
 		t.Fatal(err)
 	}
-	symbols, err := link.ImageSymbols(image)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if symbols[link.EntrySymbol] == 0 || symbols["data_label"] == 0 {
+	if symbols := image.Symbols; symbols[amd64.ELFEntrySymbol] == 0 || symbols["data_label"] == 0 {
 		t.Errorf("entry and data labels missing from %v", symbols)
-	}
-	if _, err := link.ImageSymbols([]byte("not an image")); err == nil {
-		t.Error("read symbols from bytes that are not an ELF file")
 	}
 }

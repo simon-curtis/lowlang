@@ -28,23 +28,24 @@ type fileResult struct {
 }
 
 type oracleRunner struct {
-	mu      sync.Mutex
-	largest string
-	results []fileResult
+	mu          sync.Mutex
+	largest     corpusEntry
+	largestSize int
+	results     []fileResult
 }
 
 func (r *oracleRunner) work(dir string, entry corpusEntry) {
 	result := fileResult{entry: entry}
-	source, err := entry.generate()
+	source, err := entry.generate(dir)
 	if err != nil {
 		firstLine, _, _ := strings.Cut(err.Error(), "\n")
 		result.skipped = truncate(firstLine, 100)
-		r.record(result, "")
+		r.record(result)
 		return
 	}
 	result.size = len(source)
 	r.compareAll(dir, source, &result)
-	r.record(result, source)
+	r.record(result)
 }
 
 func (r *oracleRunner) compareAll(dir, source string, result *fileResult) {
@@ -74,12 +75,12 @@ func (r *oracleRunner) compareAll(dir, source string, result *fileResult) {
 	}
 }
 
-func (r *oracleRunner) record(result fileResult, source string) {
+func (r *oracleRunner) record(result fileResult) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.results = append(r.results, result)
-	if len(source) > len(r.largest) {
-		r.largest = source
+	if result.size > r.largestSize {
+		r.largest, r.largestSize = result.entry, result.size
 	}
 }
 
@@ -88,10 +89,7 @@ func TestOracle(t *testing.T) {
 		t.Skip("oracle corpus is slow")
 	}
 	oracletool.Require(t, "as", oracletool.GNU)
-	entries, err := corpusEntries()
-	if err != nil {
-		t.Fatal(err)
-	}
+	entries := corpusEntries(t)
 	runner := &oracleRunner{}
 	started := time.Now()
 	runner.runAll(t, entries)
@@ -185,9 +183,14 @@ func formatMismatches(res fileResult) string {
 }
 
 func (r *oracleRunner) timeLargest(t *testing.T) {
+	source, err := r.largest.generate(t.TempDir())
+	if err != nil {
+		t.Errorf("largest file: %v", err)
+		return
+	}
 	for _, align := range []bool{false, true} {
-		best, mean := timeAssemble(t, r.largest, asm.Options{AlignBranches: align})
-		t.Logf("largest file: %.1f MB, AlignBranches %v, Assemble best %v, mean %v", float64(len(r.largest))/1e6, align, best.Round(time.Millisecond), mean.Round(time.Millisecond))
+		best, mean := timeAssemble(t, source, asm.Options{AlignBranches: align})
+		t.Logf("largest file: %.1f MB, AlignBranches %v, Assemble best %v, mean %v", float64(len(source))/1e6, align, best.Round(time.Millisecond), mean.Round(time.Millisecond))
 	}
 }
 

@@ -18,10 +18,6 @@ func (l *linker) applySections(image []byte) error {
 	return relocate(l, image, spaces)
 }
 
-func (l *linker) imageBase() uint64 {
-	return 0
-}
-
 func (l *linker) supports(kind asm.FixupKind) bool {
 	return !kind.ImageRelative()
 }

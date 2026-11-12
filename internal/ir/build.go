@@ -55,7 +55,7 @@ type builder struct {
 	cells    *int
 }
 
-func Build(files []*ast.File, opts Options) *Program {
+func Build(files []*ast.File, optimise bool) *Program {
 	var decls []*ast.Func
 	for _, file := range files {
 		for _, d := range file.Funcs {
@@ -99,7 +99,7 @@ func Build(files []*ast.File, opts Options) *Program {
 			named:    named,
 			slots:    map[*ast.Local]*Value{},
 			refs:     map[*ast.Local]*Value{},
-			hoist:    opts.Hoist,
+			hoist:    optimise,
 			cells:    &cells,
 		}
 	}
@@ -121,7 +121,9 @@ func Build(files []*ast.File, opts Options) *Program {
 	built := buildReachable(p.Main, pending)
 	p.keepReachable(built)
 	p.Cells = cells
-	p.optimise(opts)
+	if optimise {
+		p.optimise()
+	}
 	p.splitCriticalEdges()
 	p.CSymbols = cSymbols(p.Funcs)
 	p.Imports = imports(files, p.CSymbols)

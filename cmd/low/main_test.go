@@ -59,14 +59,14 @@ func runFixture(t *testing.T, program fixturetest.Program, sidecars fixture.Side
 
 func buildLinux(t *testing.T, program fixturetest.Program, sidecars fixture.Sidecars, binary string) {
 	t.Helper()
-	unit, err := compiler.Analyse(program.Path, target.Linux)
+	unit, err := compiler.Analyse(program.Path, compiler.Release(target.Linux))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := hasVectorCode(unit.Program); got != sidecars.SIMD {
 		t.Errorf("program has vector code %v, but its .tags file says simd %v", got, sidecars.SIMD)
 	}
-	if err := buildUnit(context.Background(), unit, binary); err != nil {
+	if _, err := compiler.Build(context.Background(), unit, binary); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -222,7 +222,7 @@ func failFixture(t *testing.T, program fixturetest.Program) {
 	if !ok {
 		t.Fatal("missing .err fixture")
 	}
-	_, err := compiler.Analyse(program.Path, target.Linux)
+	_, err := compiler.Analyse(program.Path, compiler.Release(target.Linux))
 	if err == nil {
 		t.Fatal("compiled without error")
 	}

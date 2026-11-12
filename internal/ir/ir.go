@@ -192,11 +192,6 @@ func (f *Func) ResultWords() int {
 	return f.Ret.Size()
 }
 
-type Options struct {
-	Inline bool
-	Hoist  bool
-}
-
 type Program struct {
 	CSymbols []string
 	Imports  map[string][]string

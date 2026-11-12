@@ -43,6 +43,13 @@ func (m Mode) String() string {
 	return "release"
 }
 
+func (m Mode) profile() compiler.Profile {
+	if m == Dev {
+		return compiler.Dev
+	}
+	return compiler.Release(target.Linux)
+}
+
 type Finding struct {
 	Class  string
 	Detail string
@@ -157,15 +164,11 @@ func (r *Runner) build(ctx context.Context, dir, binary, source string, mode Mod
 			err = stageError{class: ClassICE, detail: fmt.Sprintf("%v at %s", rec, topFrame(string(debug.Stack())))}
 		}
 	}()
-	analyse := compiler.Analyse
-	if mode == Dev {
-		analyse = compiler.AnalyseDev
-	}
-	unit, err := analyse(path, target.Linux)
+	unit, err := compiler.Analyse(path, mode.profile())
 	if err != nil {
 		return stageError{class: ClassReject, detail: strings.ReplaceAll(err.Error(), dir+"/", "")}
 	}
-	if _, err := compiler.Build(ctx, unit, compiler.Release, binary); err != nil {
+	if _, err := compiler.Build(ctx, unit, binary); err != nil {
 		return stageError{class: ClassLink, detail: err.Error()}
 	}
 	return nil

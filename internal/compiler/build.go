@@ -14,25 +14,15 @@ import (
 	"lowlang/internal/target"
 )
 
-type Mode struct {
-	hot   bool
-	table amd64.FuncTable
-}
-
-var Release = Mode{}
-
-func Hot(table amd64.FuncTable) Mode {
-	return Mode{hot: true, table: table}
-}
-
 type Built struct {
 	Funcs   map[string]string
 	Symbols map[string]uint64
+	Table   amd64.FuncTable
 }
 
 type toolchain struct {
 	assembler asm.Options
-	link      func(object *asm.Object, libraries []string) ([]byte, error)
+	link      func(object *asm.Object, libraries []string) (link.Image, error)
 }
 
 var toolchains = map[target.OS]toolchain{
@@ -42,59 +32,66 @@ var toolchains = map[target.OS]toolchain{
 
 var libraryResolver = link.Resolver{Dirs: link.SystemDirs}
 
-func Generate(unit *Unit, mode Mode) (amd64.Output, error) {
-	return amd64.Generate(unit.Program, unit.Platform, mode.table)
+func Assembler(platform target.OS) asm.Options {
+	return toolchains[platform].assembler
 }
 
-func Build(ctx context.Context, unit *Unit, mode Mode, output string) (*Built, error) {
-	out, err := Generate(unit, mode)
+func (u *Unit) assembler() asm.Options {
+	options := Assembler(u.Platform.OS())
+	options.Embeds = u.Embeds
+	return options
+}
+
+func Generate(unit *Unit, table amd64.FuncTable) (amd64.Output, error) {
+	return amd64.Generate(unit.Program, unit.Platform, table)
+}
+
+func Build(ctx context.Context, unit *Unit, output string) (*Built, error) {
+	table := unit.NewTable()
+	out, err := Generate(unit, table)
 	if err != nil {
 		return nil, err
 	}
-	chain := toolchains[unit.Platform.OS()]
-	object, err := asm.Assemble(out.Asm, chain.assembler)
+	object, err := asm.Assemble(out.Asm, unit.assembler())
 	if err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	image, err := chain.link(object, unit.Program.Libraries())
+	image, err := toolchains[unit.Platform.OS()].link(object, unit.Program.Libraries())
 	if err != nil {
 		return nil, err
 	}
-	if err := writeExecutable(output, image); err != nil {
+	if err := writeExecutable(output, image.Bytes); err != nil {
 		return nil, err
 	}
-	built := &Built{Funcs: out.Funcs}
-	if mode.hot {
-		built.Symbols, err = link.ImageSymbols(image)
-	}
-	return built, err
+	return &Built{Funcs: out.Funcs, Symbols: image.Symbols, Table: table}, nil
 }
 
 func (b *Built) Patch(unit *Unit, table amd64.FuncTable, changed []string, suffix string, base uint64) (*link.PatchImage, error) {
 	source := amd64.GeneratePatch(unit.Program, unit.Platform, changed, table, suffix)
-	object, err := asm.Assemble(source, toolchains[target.Linux].assembler)
+	object, err := asm.Assemble(source, unit.assembler())
 	if err != nil {
 		return nil, err
 	}
 	return link.Patch(object, base, b.Symbols)
 }
 
-func linkELF(object *asm.Object, libraries []string) ([]byte, error) {
+func linkELF(object *asm.Object, libraries []string) (link.Image, error) {
 	if len(libraries) == 0 {
 		return link.Static(object)
 	}
 	resolved, err := libraryResolver.Resolve(libraries)
 	if err != nil {
-		return nil, err
+		return link.Image{}, err
 	}
 	return link.Dynamic(object, resolved)
 }
 
-func linkPE(object *asm.Object, _ []string) ([]byte, error) {
-	return link.PE(object)
+func linkPE(object *asm.Object, _ []string) (link.Image, error) {
+	bytes, err := link.PE(object)
+	return link.Image{Bytes: bytes}, err
 }
 
 func writeExecutable(output string, image []byte) error {

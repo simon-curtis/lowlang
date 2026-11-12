@@ -12,11 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"lowlang/internal/amd64"
 	"lowlang/internal/ast"
 	"lowlang/internal/check"
 	"lowlang/internal/diag"
-	"lowlang/internal/ir"
 	"lowlang/internal/parser"
 	"lowlang/internal/target"
 )
@@ -139,9 +137,10 @@ func buildProbe(t *testing.T, source string) string {
 		t.Fatal(err)
 	}
 	host := target.Host()
-	unit := &Unit{Platform: amd64.NewPlatform(host), Program: ir.Build(files, ir.Options{Inline: true})}
+	unit := &Unit{Files: files}
+	unit.lower(Release(host))
 	binary := filepath.Join(t.TempDir(), host.Executable("probe"))
-	if _, err := Build(context.Background(), unit, Release, binary); err != nil {
+	if _, err := Build(context.Background(), unit, binary); err != nil {
 		t.Fatal(err)
 	}
 	return binary

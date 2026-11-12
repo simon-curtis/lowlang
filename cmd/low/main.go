@@ -91,14 +91,12 @@ func run(ctx context.Context, args []string) error {
 			return lintCommand(path, opts.platform)
 		}
 		return docCommand(path, opts.platform)
-	case "run":
+	case "run", "dev":
 		if len(args) != 2 {
 			return usageError{}
 		}
-		return buildAndRun(ctx, path)
-	case "dev":
-		if len(args) != 2 {
-			return usageError{}
+		if cmd == "run" {
+			return buildAndRun(ctx, path)
 		}
 		session, err := hot.New(path, os.Stdout, os.Stderr)
 		if err != nil {
@@ -190,7 +188,7 @@ func report(unit *compiler.Unit) {
 }
 
 func analyse(path string, platform target.OS) (*compiler.Unit, error) {
-	unit, err := compiler.Analyse(path, platform)
+	unit, err := compiler.Analyse(path, compiler.Release(platform))
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +208,7 @@ func compileCommand(ctx context.Context, cmd, path string, opts options) error {
 		}
 		return nil
 	case "asm":
-		out, err := compiler.Generate(unit, compiler.Release)
+		out, err := compiler.Generate(unit, unit.NewTable())
 		if err != nil {
 			return err
 		}
@@ -221,7 +219,8 @@ func compileCommand(ctx context.Context, cmd, path string, opts options) error {
 	if output == "" {
 		output = defaultOutput(path, opts.platform)
 	}
-	return buildUnit(ctx, unit, output)
+	_, err = compiler.Build(ctx, unit, output)
+	return err
 }
 
 func defaultOutput(path string, platform target.OS) string {
@@ -229,17 +228,13 @@ func defaultOutput(path string, platform target.OS) string {
 	return platform.Executable(name)
 }
 
-func buildUnit(ctx context.Context, unit *compiler.Unit, output string) error {
-	_, err := compiler.Build(ctx, unit, compiler.Release, output)
-	return err
-}
-
 func build(ctx context.Context, path, output string, platform target.OS) error {
 	unit, err := analyse(path, platform)
 	if err != nil {
 		return err
 	}
-	return buildUnit(ctx, unit, output)
+	_, err = compiler.Build(ctx, unit, output)
+	return err
 }
 
 func buildAndRun(ctx context.Context, path string) error {

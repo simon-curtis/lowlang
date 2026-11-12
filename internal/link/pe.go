@@ -14,7 +14,6 @@ const (
 	peImageBase      uint64 = 0x140000000
 	peSectionAlign   uint64 = pageSize
 	peFileAlign      uint64 = 0x200
-	peEntrySymbol           = amd64.PEEntrySymbol
 	peStackReserve   uint64 = 8 << 20
 	peStackCommit    uint64 = pageSize
 	peHeapReserve    uint64 = 1 << 20
@@ -272,6 +271,18 @@ func (l *peLinker) chunksWithPrefix(prefix string) []*peChunk {
 	return found
 }
 
+func (l *peLinker) prefixSpan(prefix string) (pe.DataDirectory, bool) {
+	chunks := l.chunksWithPrefix(prefix)
+	if len(chunks) == 0 {
+		return pe.DataDirectory{}, false
+	}
+	var size uint64
+	for _, c := range chunks {
+		size += c.size
+	}
+	return pe.DataDirectory{VirtualAddress: uint32(chunks[0].rva()), Size: uint32(size)}, true
+}
+
 func outputName(name string) string {
 	base, _, _ := strings.Cut(name, groupSplitter)
 	if merged, ok := peMergedNames[base]; ok {
@@ -338,7 +349,7 @@ func (l *peLinker) layout() {
 }
 
 func (l *peLinker) entry() (uint64, error) {
-	return entryAddress(peEntrySymbol, l.entryRVA)
+	return entryAddress(amd64.PEEntrySymbol, l.entryRVA)
 }
 
 func (l *peLinker) writeSections(image []byte) {

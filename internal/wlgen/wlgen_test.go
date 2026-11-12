@@ -78,13 +78,13 @@ func TestRegistry(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	unit, err := compiler.Analyse(dir, target.Linux)
+	unit, err := compiler.Analyse(dir, compiler.Release(target.Linux))
 	if err != nil {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(dir, "registry")
 	ctx := context.Background()
-	if _, err := compiler.Build(ctx, unit, compiler.Release, binary); err != nil {
+	if _, err := compiler.Build(ctx, unit, binary); err != nil {
 		t.Fatal(err)
 	}
 	if os.Getenv("WAYLAND_DISPLAY") == "" {

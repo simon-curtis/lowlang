@@ -25,10 +25,6 @@ func (l *peLinker) rvaOf(sym asm.Symbol) (uint64, bool) {
 	return uint64(int64(c.rva()) + sym.Value), true
 }
 
-func (l *peLinker) imageBase() uint64 {
-	return peImageBase
-}
-
 func (l *peLinker) supports(kind asm.FixupKind) bool {
 	switch kind {
 	case asm.Abs64, asm.ImgRel32, asm.PC32, asm.PLT32:
@@ -46,6 +42,9 @@ func (l *peLinker) target(_ *fixupSpace, f asm.Fixup) (uint64, bool, error) {
 		return uint64(sym.Value), true, nil
 	}
 	rva, ok := l.rvaOf(sym)
+	if f.Kind.ImageRelative() {
+		return rva, ok, nil
+	}
 	return peImageBase + rva, ok, nil
 }
 

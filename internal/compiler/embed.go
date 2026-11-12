@@ -1,11 +1,7 @@
 package compiler
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"fmt"
 	"io/fs"
-	"os"
 	"path"
 	"path/filepath"
 	"slices"
@@ -18,6 +14,7 @@ type embedder struct {
 	disk  fs.FS
 	std   fs.FS
 	paths []string
+	data  map[string][]byte
 }
 
 func (e *embedder) resolve(file *ast.File, name string) (check.Embedded, error) {
@@ -42,44 +39,19 @@ func (e *embedder) diskFile(file *ast.File, name string) (check.Embedded, error)
 	if !slices.Contains(e.paths, abs) {
 		e.paths = append(e.paths, abs)
 	}
-	return check.Embedded{Path: abs, Data: data}, nil
+	return e.hold(abs, data), nil
 }
 
 func (e *embedder) stdFile(file *ast.File, name string) (check.Embedded, error) {
-	data, err := fs.ReadFile(e.std, path.Join(path.Dir(file.Path), name))
+	key := path.Join(path.Dir(file.Path), name)
+	data, err := fs.ReadFile(e.std, key)
 	if err != nil {
 		return check.Embedded{}, err
 	}
-	cache, err := os.UserCacheDir()
-	if err != nil {
-		return check.Embedded{}, err
-	}
-	sum := sha256.Sum256(data)
-	out := filepath.Join(cache, "lowlang", "embed", fmt.Sprintf("%x-%s", sum[:12], path.Base(name)))
-	if err := materialize(out, data); err != nil {
-		return check.Embedded{}, err
-	}
-	return check.Embedded{Path: out, Data: data}, nil
+	return e.hold(key, data), nil
 }
 
-func materialize(out string, data []byte) error {
-	if existing, err := os.ReadFile(out); err == nil && bytes.Equal(existing, data) {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		return err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(out), "embed-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(temp.Name())
-	if _, err := temp.Write(data); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(temp.Name(), out)
+func (e *embedder) hold(key string, data []byte) check.Embedded {
+	e.data[key] = data
+	return check.Embedded{Path: key, Data: data}
 }

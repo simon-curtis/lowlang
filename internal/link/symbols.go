@@ -128,8 +128,9 @@ func (l *linker) emittedSymbols() (locals, globals []linkerSymbol) {
 			locals = append(locals, entry)
 		}
 	}
+	own := l.objectDefined()
 	for _, defined := range l.boundarySymbols() {
-		if l.definedByObject(defined.name) {
+		if own[defined.name] {
 			continue
 		}
 		globals = append(globals, defined)
@@ -152,11 +153,35 @@ func (l *linker) appendImported(globals []linkerSymbol, name string) []linkerSym
 	return append(globals, entry)
 }
 
-func (l *linker) definedByObject(name string) bool {
+func (l *linker) objectDefined() map[string]bool {
+	defined := map[string]bool{}
 	for _, sym := range l.obj.Symbols {
-		if sym.Name == name && sym.Section != asm.SectionUndefined {
-			return true
+		if sym.Section != asm.SectionUndefined {
+			defined[sym.Name] = true
 		}
 	}
-	return false
+	return defined
+}
+
+func (l *linker) definedNames() map[string]bool {
+	defined := l.objectDefined()
+	for _, boundary := range l.boundarySymbols() {
+		defined[boundary.name] = true
+	}
+	return defined
+}
+
+func (l *linker) addresses() map[string]uint64 {
+	out := make(map[string]uint64, len(l.symbols))
+	for name, value := range l.symbols {
+		if !strings.HasPrefix(name, ".L") {
+			out[name] = l.emittedValue(value)
+		}
+	}
+	if l.dyn != nil {
+		for _, table := range l.dyn.tableSymbols() {
+			out[table.name] = l.emittedValue(table.value)
+		}
+	}
+	return out
 }

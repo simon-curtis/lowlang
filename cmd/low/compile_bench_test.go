@@ -14,7 +14,7 @@ func BenchmarkCompile(b *testing.B) {
 		b.Run(program.Name, func(b *testing.B) {
 			b.ReportAllocs()
 			for range b.N {
-				unit, err := compiler.Analyse(program.Path, target.Linux)
+				unit, err := compiler.Analyse(program.Path, compiler.Release(target.Linux))
 				if err != nil {
 					b.Fatal(err)
 				}

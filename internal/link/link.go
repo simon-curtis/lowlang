@@ -7,26 +7,30 @@ import (
 
 const (
 	BaseAddress uint64 = 0x400000
-	EntrySymbol        = amd64.ELFEntrySymbol
 	FileSymbol         = "main.o"
 )
 
-func Static(obj *asm.Object) ([]byte, error) {
+type Image struct {
+	Bytes   []byte
+	Symbols map[string]uint64
+}
+
+func Static(obj *asm.Object) (Image, error) {
 	l := newLinker(obj)
 	return l.link()
 }
 
-func Dynamic(obj *asm.Object, libraries []*Library) ([]byte, error) {
+func Dynamic(obj *asm.Object, libraries []*Library) (Image, error) {
 	l := newLinker(obj)
 	l.dyn = newDynamicLink(libraries)
 	return l.link()
 }
 
-func (l *linker) link() ([]byte, error) {
+func (l *linker) link() (Image, error) {
 	l.collectSections()
 	if l.dyn != nil {
 		if err := l.addDynamicSections(); err != nil {
-			return nil, err
+			return Image{}, err
 		}
 	}
 	l.orderSections()
@@ -34,30 +38,30 @@ func (l *linker) link() ([]byte, error) {
 	l.resolveSymbols()
 	entry, err := l.entry()
 	if err != nil {
-		return nil, err
+		return Image{}, err
 	}
 	if l.dyn != nil {
 		l.fillDynamic()
 	}
 	tables, err := l.buildTables()
 	if err != nil {
-		return nil, err
+		return Image{}, err
 	}
 	image := make([]byte, tables.size)
 	if err := l.applySections(image); err != nil {
-		return nil, err
+		return Image{}, err
 	}
 	if err := l.writeHeaders(image, entry, tables); err != nil {
-		return nil, err
+		return Image{}, err
 	}
 	if err := l.writeTables(image, tables); err != nil {
-		return nil, err
+		return Image{}, err
 	}
-	return image, nil
+	return Image{Bytes: image, Symbols: l.addresses()}, nil
 }
 
 func (l *linker) entry() (uint64, error) {
-	return entryAddress(EntrySymbol, l.addressOf)
+	return entryAddress(amd64.ELFEntrySymbol, l.addressOf)
 }
 
 func (l *linker) addressOf(name string) (uint64, bool) {
@@ -88,4 +92,12 @@ func alignUp(value, align uint64) uint64 {
 		return value
 	}
 	return (value + align - 1) / align * align
+}
+
+func maxAlign(members []*section) uint64 {
+	largest := uint64(1)
+	for _, s := range members {
+		largest = max(largest, s.align)
+	}
+	return largest
 }

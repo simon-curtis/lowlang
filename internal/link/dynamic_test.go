@@ -45,7 +45,7 @@ func mustLinkDynamic(t *testing.T, obj *asm.Object) *elf.File {
 	if err != nil {
 		t.Fatalf("link: %v", err)
 	}
-	file, err := elf.NewFile(bytes.NewReader(image))
+	file, err := elf.NewFile(bytes.NewReader(image.Bytes))
 	if err != nil {
 		t.Fatalf("parse linked image: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestDynamicRecordsLibrariesInLinkOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	file, err := elf.NewFile(bytes.NewReader(image))
+	file, err := elf.NewFile(bytes.NewReader(image.Bytes))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,10 +3,11 @@ package asm_test
 import (
 	"fmt"
 	"path/filepath"
-	"sort"
+	"slices"
+	"testing"
 
-	"lowlang/internal/amd64"
-	"lowlang/internal/compiler"
+	"lowlang/internal/fixture/fixturetest"
+	"lowlang/internal/oracletool"
 	"lowlang/internal/target"
 )
 
@@ -20,44 +21,23 @@ func (e corpusEntry) label() string {
 	return fmt.Sprintf("%s [%s]", e.name, e.platform)
 }
 
-func corpusEntries() ([]corpusEntry, error) {
-	root := filepath.Join("..", "..")
-	var paths []string
-	for _, pattern := range []string{"testdata/run/*.low", "testdata/windows/*.low", "bench/*/main.low"} {
-		full := filepath.Join(root, pattern)
-		matches, err := filepath.Glob(full)
-		if err != nil {
-			return nil, fmt.Errorf("glob %s: %w", pattern, err)
-		}
-		paths = append(paths, matches...)
-	}
-	sort.Strings(paths)
+func corpusEntries(t testing.TB) []corpusEntry {
+	t.Helper()
+	programs := slices.Concat(fixturetest.Programs(t, "run"), fixturetest.Programs(t, "windows"), fixturetest.Benchmarks(t))
 	var entries []corpusEntry
-	for _, path := range paths {
-		rel, err := filepath.Rel(root, path)
+	for _, program := range programs {
+		rel, err := filepath.Rel(fixturetest.Root(), program.Path)
 		if err != nil {
-			return nil, fmt.Errorf("relative path of %s: %w", path, err)
+			t.Fatalf("relative path of %s: %v", program.Path, err)
 		}
 		for _, platform := range []target.OS{target.Linux, target.Windows} {
-			entries = append(entries, corpusEntry{name: rel, path: path, platform: platform})
+			entries = append(entries, corpusEntry{name: rel, path: program.Path, platform: platform})
 		}
 	}
-	return entries, nil
+	return entries
 }
 
-func (e corpusEntry) generate() (source string, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("compiler panic: %v", r)
-		}
-	}()
-	unit, err := compiler.Analyse(e.path, e.platform)
-	if err != nil {
-		return "", err
-	}
-	out, err := amd64.Generate(unit.Program, unit.Platform, nil)
-	if err != nil {
-		return "", err
-	}
-	return out.Asm, nil
+func (e corpusEntry) generate(dir string) (string, error) {
+	generated, err := oracletool.Generate(dir, e.path, e.platform)
+	return generated.Asm, err
 }

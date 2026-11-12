@@ -7,11 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 
 	"lowlang/internal/asm"
+	"lowlang/internal/compiler"
+	"lowlang/internal/fixture/fixturetest"
 	"lowlang/internal/link"
 	"lowlang/internal/oracletool"
 	"lowlang/internal/target"
@@ -25,22 +26,8 @@ const (
 
 var lldArguments = []string{"/nologo", "/brepro", "/nodefaultlib", "/entry:start", "/subsystem:console", "/stack:8388608"}
 
-func windowsCorpusPaths(t *testing.T) []string {
-	matches, err := filepath.Glob(filepath.Join(repoRoot(), "testdata", "windows", "*.low"))
-	if err != nil {
-		t.Fatalf("glob windows corpus: %v", err)
-	}
-	var paths []string
-	for _, match := range matches {
-		rel, err := filepath.Rel(repoRoot(), match)
-		if err != nil {
-			t.Fatalf("relative path of %s: %v", match, err)
-		}
-		paths = append(paths, rel)
-	}
-	paths = append(paths, corpusPaths(t)...)
-	sort.Strings(paths)
-	return paths
+func windowsCorpus(t *testing.T) []fixturetest.Program {
+	return append(fixturetest.Programs(t, "windows"), corpus(t)...)
 }
 
 func requireWindowsTools(t *testing.T) {
@@ -67,7 +54,7 @@ func linkWithLLD(dir, source string) ([]byte, error) {
 }
 
 func linkWithPE(source string) ([]byte, error) {
-	object, err := asm.Assemble(source, asm.Options{ClangLayout: true})
+	object, err := asm.Assemble(source, compiler.Assembler(target.Windows))
 	if err != nil {
 		return nil, fmt.Errorf("assemble: %w", err)
 	}
@@ -128,15 +115,15 @@ func firstDifferingLine(got, want string) string {
 
 func TestPEMatchesLLD(t *testing.T) {
 	requireWindowsTools(t)
-	for _, path := range windowsCorpusPaths(t) {
-		t.Run(path, func(t *testing.T) {
-			source, _, err := generate(path, target.Windows)
+	for _, program := range windowsCorpus(t) {
+		t.Run(program.Name, func(t *testing.T) {
+			dir := t.TempDir()
+			generated, err := oracletool.Generate(dir, program.Path, target.Windows)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			dir := t.TempDir()
-			want, lldErr := linkWithLLD(dir, source)
-			got, peErr := linkWithPE(source)
+			want, lldErr := linkWithLLD(dir, generated.Asm)
+			got, peErr := linkWithPE(generated.Asm)
 			if lldErr != nil {
 				if peErr == nil {
 					t.Fatalf("lld-link rejects the program but the PE writer accepts it: %v", lldErr)

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"lowlang/internal/amd64"
 	"lowlang/internal/asm"
 	"lowlang/internal/link"
 )
@@ -38,7 +39,7 @@ func fixtureObject(options fixtureOptions) *asm.Object {
 	bss := &asm.Section{Name: ".bss", Flags: asm.FlagAlloc | asm.FlagWrite, Align: 8, NoBits: true, Size: bssSize}
 	tbss := &asm.Section{Name: ".tbss", Flags: asm.FlagAlloc | asm.FlagWrite | asm.FlagTLS, Align: 8, NoBits: true, Size: 24}
 	symbols := []asm.Symbol{
-		{Name: link.EntrySymbol, Section: textIndex, Global: true},
+		{Name: amd64.ELFEntrySymbol, Section: textIndex, Global: true},
 		{Name: "text_label", Section: textIndex, Value: 8},
 		{Name: "rodata_label", Section: rodataIndex, Value: 4},
 		{Name: "data_label", Section: dataIndex, Value: 16, Global: true},
@@ -56,7 +57,7 @@ func mustLink(t *testing.T, obj *asm.Object) *elf.File {
 	if err != nil {
 		t.Fatalf("link: %v", err)
 	}
-	file, err := elf.NewFile(bytes.NewReader(image))
+	file, err := elf.NewFile(bytes.NewReader(image.Bytes))
 	if err != nil {
 		t.Fatalf("parse linked image: %v", err)
 	}
@@ -169,7 +170,7 @@ func TestAbs32S(t *testing.T) {
 			if c.fails {
 				return
 			}
-			file, err := elf.NewFile(bytes.NewReader(image))
+			file, err := elf.NewFile(bytes.NewReader(image.Bytes))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -264,8 +265,8 @@ func TestMissingEntry(t *testing.T) {
 	obj := fixtureObject(fixtureOptions{})
 	obj.Symbols[0].Name = "begin"
 	_, err := link.Static(obj)
-	if err == nil || !strings.Contains(err.Error(), link.EntrySymbol) {
-		t.Fatalf("error %v, want one naming %s", err, link.EntrySymbol)
+	if err == nil || !strings.Contains(err.Error(), amd64.ELFEntrySymbol) {
+		t.Fatalf("error %v, want one naming %s", err, amd64.ELFEntrySymbol)
 	}
 }
 
@@ -360,7 +361,7 @@ func TestDeterministic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return image
+		return image.Bytes
 	}
 	if !bytes.Equal(build(), build()) {
 		t.Error("two links of the same object differ")

@@ -14,34 +14,52 @@ import (
 	"lowlang/internal/types"
 )
 
+type Profile struct {
+	platform target.OS
+	optimise bool
+	hot      bool
+}
+
+func Release(platform target.OS) Profile {
+	return Profile{platform: platform, optimise: true}
+}
+
+var Dev = Profile{platform: target.Linux, hot: true}
+
 type Unit struct {
 	Files    []*ast.File
 	Types    *types.Universe
+	Profile  Profile
 	Platform amd64.Platform
 	Program  *ir.Program
 	Sources  []string
+	Embeds   map[string][]byte
 	Warnings []lint.Warning
 }
 
 //go:embed prelude.low
 var preludeSource []byte
 
-func Analyse(path string, platform target.OS) (*Unit, error) {
-	return analyse(path, platform, ir.Options{Inline: true, Hoist: true})
-}
-
-func AnalyseDev(path string, platform target.OS) (*Unit, error) {
-	return analyse(path, platform, ir.Options{})
-}
-
-func analyse(path string, platform target.OS, opts ir.Options) (*Unit, error) {
-	unit, err := Check(path, platform, Overlay(nil))
+func Analyse(path string, profile Profile) (*Unit, error) {
+	unit, err := Check(path, profile.platform, Overlay(nil))
 	if err != nil {
 		return nil, err
 	}
-	unit.Platform = amd64.NewPlatform(platform)
-	unit.Program = ir.Build(unit.Files, opts)
+	unit.lower(profile)
 	return unit, nil
+}
+
+func (u *Unit) lower(profile Profile) {
+	u.Profile = profile
+	u.Platform = amd64.NewPlatform(profile.platform)
+	u.Program = ir.Build(u.Files, profile.optimise)
+}
+
+func (u *Unit) NewTable() amd64.FuncTable {
+	if !u.Profile.hot {
+		return nil
+	}
+	return amd64.NewFuncTable(u.Program)
 }
 
 func Check(path string, platform target.OS, disk fs.FS) (*Unit, error) {
@@ -54,12 +72,12 @@ func Check(path string, platform target.OS, disk fs.FS) (*Unit, error) {
 		return nil, err
 	}
 	files := append([]*ast.File{file}, modules.files...)
-	embeds := &embedder{disk: disk, std: stdFS}
+	embeds := &embedder{disk: disk, std: stdFS, data: map[string][]byte{}}
 	universe, err := check.Check(files, embeds.resolve)
 	if err != nil {
 		return nil, err
 	}
-	unit := &Unit{Files: files, Types: universe, Sources: append(modules.sources, embeds.paths...)}
+	unit := &Unit{Files: files, Types: universe, Sources: append(modules.sources, embeds.paths...), Embeds: embeds.data}
 	unit.Warnings = lint.Run(modules.userFiles())
 	return unit, nil
 }

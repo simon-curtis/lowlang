@@ -1,8 +1,6 @@
 package link
 
 import (
-	"bytes"
-	"debug/elf"
 	"fmt"
 
 	"lowlang/internal/asm"
@@ -12,25 +10,6 @@ type PatchImage struct {
 	Address uint64
 	Code    []byte
 	Symbols map[string]uint64
-}
-
-func ImageSymbols(image []byte) (map[string]uint64, error) {
-	file, err := elf.NewFile(bytes.NewReader(image))
-	if err != nil {
-		return nil, fmt.Errorf("link: read image symbols: %w", err)
-	}
-	defer file.Close()
-	symbols, err := file.Symbols()
-	if err != nil {
-		return nil, fmt.Errorf("link: read image symbols: %w", err)
-	}
-	out := make(map[string]uint64, len(symbols))
-	for _, sym := range symbols {
-		if sym.Section != elf.SHN_UNDEF && sym.Name != "" {
-			out[sym.Name] = sym.Value
-		}
-	}
-	return out, nil
 }
 
 func Patch(obj *asm.Object, base uint64, running map[string]uint64) (*PatchImage, error) {
@@ -70,7 +49,7 @@ func placePatch(obj *asm.Object, base uint64) (*placedPatch, error) {
 		}
 	}
 	l.orderSections()
-	address := alignUp(base, patchAlign(l.sections))
+	address := alignUp(base, maxAlign(l.sections))
 	c := &cursor{addr: address}
 	for _, s := range l.sections {
 		c.place(s)
@@ -84,21 +63,9 @@ func placePatch(obj *asm.Object, base uint64) (*placedPatch, error) {
 	return &placedPatch{sections: l.sections, symbols: symbols}, nil
 }
 
-func patchAlign(sections []*section) uint64 {
-	align := uint64(1)
-	for _, s := range sections {
-		align = max(align, s.align)
-	}
-	return align
-}
-
 type patchFormat struct {
 	defined map[string]uint64
 	running map[string]uint64
-}
-
-func (p *patchFormat) imageBase() uint64 {
-	return 0
 }
 
 func (p *patchFormat) supports(kind asm.FixupKind) bool {

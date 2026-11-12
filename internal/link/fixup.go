@@ -18,7 +18,6 @@ type fixupSpace struct {
 }
 
 type fixupFormat interface {
-	imageBase() uint64
 	supports(kind asm.FixupKind) bool
 	target(space *fixupSpace, f asm.Fixup) (address uint64, defined bool, err error)
 }
@@ -68,9 +67,6 @@ func applyFixup(format fixupFormat, image []byte, space *fixupSpace, f asm.Fixup
 	value := int64(address) + f.Addend
 	if f.Kind.PCRelative() {
 		value -= int64(place)
-	}
-	if f.Kind.ImageRelative() {
-		value -= int64(format.imageBase())
 	}
 	if !f.Kind.Fits(value) {
 		return fmt.Errorf("link: %s relocation against %s at %s+%#x: %w", f.Kind, f.Symbol, space.name, f.Offset, rangeError(f.Kind, value))

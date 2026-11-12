@@ -343,10 +343,17 @@ func (a *assembler) numericEscape(base uint64, maxDigits int) byte {
 func (a *assembler) incbin() {
 	a.markConstantData()
 	path := a.stringLiteral()
+	a.emitBytes(a.included(path))
+	a.expectEnd()
+}
+
+func (a *assembler) included(path string) []byte {
+	if data, ok := a.opts.Embeds[path]; ok {
+		return data
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		a.failWrap(err, "cannot read .incbin %q", path)
 	}
-	a.emitBytes(data)
-	a.expectEnd()
+	return data
 }

@@ -122,11 +122,3 @@ func (l *linker) relroStart(c cursor, relro []*section) cursor {
 	}
 	return c
 }
-
-func maxAlign(members []*section) uint64 {
-	largest := uint64(1)
-	for _, s := range members {
-		largest = max(largest, s.align)
-	}
-	return largest
-}

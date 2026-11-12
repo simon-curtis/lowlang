@@ -1493,7 +1493,7 @@ Building a program and running `low dev` need no external tool.
   - A refused connection to a loopback address fails at once rather than after the SYN retransmissions Windows would otherwise make.
   - Signals, inotify watches, pseudo-terminals, setting a terminal's size, `chown`, peer credentials, binding to a device and `SO_REUSEPORT` fail with `Unsupported`. User and group IDs are -1 and the umask is 0.
   - Returning from a C call can wait out a collection; the wait keeps the thread's last-error value, so `GetLastError` after an extern call reads that call's error.
-- The `low` command lives in `cmd/low`. `compiler.Build` is the one build entry: it generates the assembly for the unit's target, assembles it, links it with the linker that target uses and writes the executable. `low build`, `low run`, hot reload, the fuzz oracle and the Vulkan and Wayland generator tests all call it. Hot reload is the only caller that passes the hot mode value.
+- The `low` command lives in `cmd/low`. `compiler.Analyse` takes a profile and `compiler.Build` is the one build entry: it generates the assembly for the unit, assembles it with the unit's embedded files, links it with the linker its target uses and writes the executable. `low build`, `low run`, hot reload, the fuzz oracle and the Vulkan and Wayland generator tests all call it. Only the `Dev` profile produces a hot-reloadable build.
 - `low ir` prints the SSA form and `low asm` the generated assembly.
 - Compilation is deterministic: the same source and target always produce the same SSA form, assembly and binary. No pass depends on map iteration order; where order matters the compiler walks slices or stacks.
 - `parser.ParseSource` is the one entry from source text to tree, for user files, the prelude, the standard library and generated code. The lexer lexes each interpolated `{}` expression into tokens when it lexes the string, and keeps the `,width:format` suffix as text that `ast.ParseSpec` parses.
@@ -1610,7 +1610,7 @@ Standard library:
 - It lives in `internal/compiler/std` and is embedded in `low` with `go:embed`.
 - An import whose path is `std` or starts with `std/` is read from there, never from the project root.
 - Its files are lexed like the prelude, so they may use `__` names and intrinsics, and they are left out of the sources `low dev` watches.
-- `embed` in a standard library file reads from the embedded tree and writes the bytes once to `lowlang/embed/` under the user cache directory, named by their SHA-256, for the assembler's `.incbin`.
+- `embed` in a standard library file reads from the embedded tree. Every embedded file, standard or not, is held by its path in the unit, and the assembler resolves `.incbin` from that map before it reads the disk.
 
 Standard library intrinsics:
 
@@ -1847,6 +1847,7 @@ Optimiser:
   - A caller inlines up to four rounds. Each round takes its sites inside the deepest loops first, then the smaller callees, then the earlier values; splits the call's block; clones the callee's blocks with parameters bound to the arguments; forwards a single return's values or joins several returns in phis; and simplifies the caller. Calls that an inlined body or a devirtualised call exposes are inlined in the next round.
   - Loop back edges keep their marks, and checks and divisions keep their panics.
   - Dev builds do not inline, specialise or hoist literals, so hot reload patches see every function and every literal's data.
+  - A `compiler.Profile` chooses the target, whether the IR is optimised and whether code generation is hot-reloadable. `Release(target)` optimises and generates plain code. `Dev` skips the optimiser, generates `fn_table` code and is Linux-only.
 - Literal hoisting:
   - A release build hoists a non-empty slice or map literal whose elements are all constants: integer, float, `bool` and `str` literals, negated numbers, `none`, enum variants without payload and non-C struct literals of constants.
   - The checker marks a literal read-only when it is the operand of an index, a `for` or `.len`, or is bound by a `let` whose every use is such an operand. An assignment, a `mut` argument or any other use anywhere in the target path of an element or field makes the binding non-read-only.
@@ -1970,6 +1971,7 @@ Calling convention:
 - A file that fails to compile is reported and the running program is left alone.
 - The program restarts when any of these changes:
   - the set of linked libraries;
+  - the set of called C functions;
   - a struct or enum layout;
   - an existing function's signature;
   - a closure's captured variables;
@@ -1984,7 +1986,7 @@ Mechanism:
 - In dev builds a function value's code word is the address of its `fn_table` entry and calls through it use `call [r10]`, so a stored function value or closure runs the newest code. Callback thunks call through the table too.
 - `internal/amd64` owns this protocol: `Generate` with a `FuncTable` and `GeneratePatch`, the `fn_table` size, the patch signal and entry size, the mailbox symbol names and the region's base and size.
 - At start the dev runtime installs a `SIGUSR1` handler and maps a 64 MB read-execute region at `0x40000000`, close enough to the binary for 32-bit relative references.
-- A patch is assembled and linked in process, by `Built.Patch`, at the next free address in that region, resolving its references against the symbols of the running binary that `compiler.Build` returned. It holds only the changed functions and their strings. Patched functions get a fresh symbol suffix so they never collide with the originals.
+- A patch is assembled and linked in process, by `Built.Patch`, at the next free address in that region, resolving its references against the symbols of the running binary that the linker returned with its image. It holds only the changed functions and their strings. Patched functions get a fresh symbol suffix so they never collide with the originals.
 - `low dev` writes the machine code into the region through `/proc/<pid>/mem`, writes `(index, address)` pairs and a count into a mailbox in the program, and sends `SIGUSR1`. The handler stores each address into `fn_table` with an aligned 8-byte write and clears the count, which `low dev` waits for.
 - Frames already running keep executing their old code; the next call through the table enters the new code. Old code is never unmapped.
 
@@ -2050,7 +2052,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - stored function values, closures and callbacks running patched code;
   - instances of an edited generic function patched;
   - restarts on layout, signature and capture changes.
-- `cmd/lowfuzz` generates well-typed, terminating programs from a choice stream (`internal/fuzz/gen`), predicts their output with a reference interpreter (`internal/fuzz/model`), compiles each for release and dev, runs both, and reports any of these (`internal/fuzz/oracle`):
+- `cmd/lowfuzz` generates well-typed, terminating programs from a choice stream (`internal/fuzz/gen`), predicts their output with a reference interpreter (`internal/fuzz/model`), builds each with the release profile and the dev profile, the same optimisation and hot-reload code generation as `low build` and `low dev`, runs both, and reports any of these (`internal/fuzz/oracle`):
   - compiler panic;
   - rejected program;
   - link failure;

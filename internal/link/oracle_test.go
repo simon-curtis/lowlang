@@ -10,9 +10,9 @@ import (
 	"sort"
 	"testing"
 
-	"lowlang/internal/amd64"
 	"lowlang/internal/asm"
 	"lowlang/internal/compiler"
+	"lowlang/internal/fixture/fixturetest"
 	"lowlang/internal/link"
 	"lowlang/internal/oracletool"
 	"lowlang/internal/target"
@@ -24,63 +24,27 @@ const (
 	stackNote      = "\n.section .note.GNU-stack,\"\",@progbits\n"
 )
 
-var sampleCorpus = []string{
-	"testdata/run/chaining.low",
-	"testdata/run/callbacks.low",
-	"testdata/run/cf_loops.low",
-	"testdata/run/cf_spawn_loop.low",
-	"testdata/run/chan_fairness.low",
-	"testdata/run/std_jose.low",
-	"testdata/run/std_tzdata.low",
-	"testdata/run/std_unicode_graphemes.low",
-	"testdata/run/std_http_proxy.low",
-	"bench/binarytrees/main.low",
-	"bench/nbody/main.low",
-	"bench/jsonpar/main.low",
-	"bench/maps/main.low",
+var sampleCorpus = []fixturetest.Program{
+	fixturetest.RunProgram("chaining"),
+	fixturetest.RunProgram("callbacks"),
+	fixturetest.RunProgram("cf_loops"),
+	fixturetest.RunProgram("cf_spawn_loop"),
+	fixturetest.RunProgram("chan_fairness"),
+	fixturetest.RunProgram("std_jose"),
+	fixturetest.RunProgram("std_tzdata"),
+	fixturetest.RunProgram("std_unicode_graphemes"),
+	fixturetest.RunProgram("std_http_proxy"),
+	fixturetest.BenchmarkProgram("binarytrees"),
+	fixturetest.BenchmarkProgram("nbody"),
+	fixturetest.BenchmarkProgram("jsonpar"),
+	fixturetest.BenchmarkProgram("maps"),
 }
 
-func repoRoot() string {
-	return filepath.Join("..", "..")
-}
-
-func corpusPaths(t *testing.T) []string {
+func corpus(t *testing.T) []fixturetest.Program {
 	if os.Getenv("LOW_LINK_FULL") == "" {
 		return sampleCorpus
 	}
-	var paths []string
-	for _, pattern := range []string{"testdata/run/*.low", "bench/*/main.low"} {
-		matches, err := filepath.Glob(filepath.Join(repoRoot(), pattern))
-		if err != nil {
-			t.Fatalf("glob %s: %v", pattern, err)
-		}
-		for _, match := range matches {
-			rel, err := filepath.Rel(repoRoot(), match)
-			if err != nil {
-				t.Fatalf("relative path of %s: %v", match, err)
-			}
-			paths = append(paths, rel)
-		}
-	}
-	sort.Strings(paths)
-	return paths
-}
-
-func generate(path string, platform target.OS) (source string, libraries []string, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("compiler panic: %v", r)
-		}
-	}()
-	unit, err := compiler.Analyse(filepath.Join(repoRoot(), path), platform)
-	if err != nil {
-		return "", nil, err
-	}
-	out, err := amd64.Generate(unit.Program, unit.Platform, nil)
-	if err != nil {
-		return "", nil, err
-	}
-	return out.Asm, unit.Program.Libraries(), nil
+	return append(fixturetest.Programs(t, "run"), fixturetest.Benchmarks(t)...)
 }
 
 func linkWithLd(dir, source string) (string, error) {
@@ -101,7 +65,7 @@ func linkWithLd(dir, source string) (string, error) {
 }
 
 func linkInProcess(dir, source string) (string, error) {
-	object, err := asm.Assemble(source, asm.Options{AlignBranches: true})
+	object, err := asm.Assemble(source, compiler.Assembler(target.Linux))
 	if err != nil {
 		return "", fmt.Errorf("assemble: %w", err)
 	}
@@ -110,7 +74,7 @@ func linkInProcess(dir, source string) (string, error) {
 		return "", err
 	}
 	output := filepath.Join(dir, "main.low")
-	if err := os.WriteFile(output, image, 0o755); err != nil {
+	if err := os.WriteFile(output, image.Bytes, 0o755); err != nil {
 		return "", err
 	}
 	return output, nil
@@ -124,21 +88,21 @@ func requireTools(t *testing.T) {
 
 func TestMatchesGNULd(t *testing.T) {
 	requireTools(t)
-	for _, path := range corpusPaths(t) {
-		t.Run(path, func(t *testing.T) {
-			source, libraries, err := generate(path, target.Linux)
+	for _, program := range corpus(t) {
+		t.Run(program.Name, func(t *testing.T) {
+			dir := t.TempDir()
+			generated, err := oracletool.Generate(dir, program.Path, target.Linux)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			if len(libraries) > 0 {
+			if len(generated.Libraries) > 0 {
 				t.Skip("program links C libraries")
 			}
-			dir := t.TempDir()
-			want, err := linkWithLd(dir, source)
+			want, err := linkWithLd(dir, generated.Asm)
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := linkInProcess(dir, source)
+			got, err := linkInProcess(dir, generated.Asm)
 			if err != nil {
 				t.Fatal(err)
 			}

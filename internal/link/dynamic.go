@@ -96,16 +96,6 @@ func newDynamicLink(libraries []*Library) *dynamicLink {
 	}
 }
 
-func (l *linker) definedNames() map[string]bool {
-	defined := map[string]bool{boundBssStart: true, boundEdata: true, boundEnd: true}
-	for _, sym := range l.obj.Symbols {
-		if sym.Section != asm.SectionUndefined {
-			defined[sym.Name] = true
-		}
-	}
-	return defined
-}
-
 func (l *linker) addDynamicSections() error {
 	d := l.dyn
 	d.collectReferences(l)

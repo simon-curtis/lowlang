@@ -13,11 +13,12 @@ func TestOracleReadsObjects(t *testing.T) {
 	path := filepath.Join("..", "..", "bench", "fib", "main.low")
 	for _, platform := range []target.OS{target.Linux, target.Windows} {
 		entry := corpusEntry{name: "bench/fib/main.low", path: path, platform: platform}
-		source, err := entry.generate()
+		dir := t.TempDir()
+		source, err := entry.generate(dir)
 		if err != nil {
 			t.Fatalf("%s: %v", entry.label(), err)
 		}
-		oracle, err := runAs(t.TempDir(), asSource(source, platform), nil)
+		oracle, err := runAs(dir, asSource(source, platform), nil)
 		if err != nil {
 			t.Fatalf("%s: %v", entry.label(), err)
 		}

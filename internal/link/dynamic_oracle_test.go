@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"lowlang/internal/asm"
+	"lowlang/internal/compiler"
+	"lowlang/internal/fixture/fixturetest"
 	"lowlang/internal/link"
 	"lowlang/internal/oracletool"
 	"lowlang/internal/target"
@@ -24,21 +26,14 @@ const noUnwindSection = ".eh_frame"
 
 var loaderPath = link.Interpreter
 
-func dynamicPrograms(t *testing.T) []string {
-	matches, err := filepath.Glob(filepath.Join(repoRoot(), "testdata/run/*.needed"))
-	if err != nil {
-		t.Fatalf("glob programs: %v", err)
-	}
-	paths := make([]string, 0, len(matches))
-	for _, match := range matches {
-		rel, err := filepath.Rel(repoRoot(), strings.TrimSuffix(match, ".needed")+".low")
-		if err != nil {
-			t.Fatalf("relative path of %s: %v", match, err)
+func dynamicPrograms(t *testing.T) []fixturetest.Program {
+	var programs []fixturetest.Program
+	for _, program := range fixturetest.Programs(t, "run") {
+		if len(program.Sidecars(t).Libraries) > 0 {
+			programs = append(programs, program)
 		}
-		paths = append(paths, rel)
 	}
-	slices.Sort(paths)
-	return paths
+	return programs
 }
 
 func linkDynamicWithLd(dir, source string, libraries []string) (string, error) {
@@ -102,7 +97,7 @@ func orderImports(obj *asm.Object, names []string) {
 }
 
 func linkDynamicInProcess(dir, source string, libraries []string, order []string) (string, error) {
-	object, err := asm.Assemble(source, asm.Options{AlignBranches: true})
+	object, err := asm.Assemble(source, compiler.Assembler(target.Linux))
 	if err != nil {
 		return "", fmt.Errorf("assemble: %w", err)
 	}
@@ -119,7 +114,7 @@ func linkDynamicInProcess(dir, source string, libraries []string, order []string
 		return "", err
 	}
 	output := filepath.Join(dir, "main.low")
-	if err := os.WriteFile(output, image, 0o755); err != nil {
+	if err := os.WriteFile(output, image.Bytes, 0o755); err != nil {
 		return "", err
 	}
 	return output, nil
@@ -127,14 +122,14 @@ func linkDynamicInProcess(dir, source string, libraries []string, order []string
 
 func TestDynamicMatchesGNULd(t *testing.T) {
 	requireTools(t)
-	for _, path := range dynamicPrograms(t) {
-		t.Run(path, func(t *testing.T) {
-			source, libraries, err := generate(path, target.Linux)
+	for _, program := range dynamicPrograms(t) {
+		t.Run(program.Name, func(t *testing.T) {
+			dir := t.TempDir()
+			generated, err := oracletool.Generate(dir, program.Path, target.Linux)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			dir := t.TempDir()
-			want, err := linkDynamicWithLd(dir, source, libraries)
+			want, err := linkDynamicWithLd(dir, generated.Asm, generated.Libraries)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -142,7 +137,7 @@ func TestDynamicMatchesGNULd(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := linkDynamicInProcess(dir, source, libraries, order)
+			got, err := linkDynamicInProcess(dir, generated.Asm, generated.Libraries, order)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -417,22 +412,20 @@ func (c *dynamicComparison) compareSymbols() {
 }
 
 func TestDynamicProgramsLoad(t *testing.T) {
-	for _, tool := range []string{"ldd"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			t.Skipf("%s is not on PATH", tool)
-		}
+	if _, err := exec.LookPath("ldd"); err != nil {
+		t.Skip("ldd is not on PATH")
 	}
 	if _, err := os.Stat(loaderPath); err != nil {
 		t.Skipf("no dynamic loader at %s", loaderPath)
 	}
-	for _, path := range dynamicPrograms(t) {
-		t.Run(path, func(t *testing.T) {
-			source, libraries, err := generate(path, target.Linux)
+	for _, program := range dynamicPrograms(t) {
+		t.Run(program.Name, func(t *testing.T) {
+			dir := t.TempDir()
+			generated, err := oracletool.Generate(dir, program.Path, target.Linux)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			dir := t.TempDir()
-			binary, err := linkDynamicInProcess(dir, source, libraries, nil)
+			binary, err := linkDynamicInProcess(dir, generated.Asm, generated.Libraries, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -17,25 +17,25 @@ import (
 
 func devProgram(t *testing.T, source string) *ir.Program {
 	t.Helper()
-	return programWith(t, source, AnalyseDev)
+	return unitWith(t, source, Dev).Program
 }
 
 func releaseProgram(t *testing.T, source string) *ir.Program {
 	t.Helper()
-	return programWith(t, source, Analyse)
+	return unitWith(t, source, Release(target.Linux)).Program
 }
 
-func programWith(t *testing.T, source string, analyser func(string, target.OS) (*Unit, error)) *ir.Program {
+func unitWith(t *testing.T, source string, profile Profile) *Unit {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "main.low")
 	if err := os.WriteFile(path, []byte(source), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	unit, err := analyser(path, target.Linux)
+	unit, err := Analyse(path, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return unit.Program
+	return unit
 }
 
 func function(t *testing.T, prog *ir.Program, name string) *ir.Func {

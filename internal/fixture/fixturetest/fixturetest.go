@@ -1,7 +1,6 @@
 package fixturetest
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -77,7 +76,7 @@ func (p Program) Text(t testing.TB, ext string) (string, bool) {
 }
 
 func RunProgram(name string) Program {
-	return Program{Name: name, Path: filepath.Join(Root(), "testdata", "run", fmt.Sprintf("%s.low", name))}
+	return Program{Name: name, Path: filepath.Join(Root(), "testdata", "run", name+fixture.SourceExt)}
 }
 
 func BenchmarkProgram(name string) Program {

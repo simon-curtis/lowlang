@@ -18,7 +18,6 @@ import (
 
 	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
-	"lowlang/internal/target"
 )
 
 type child struct {
@@ -146,7 +145,7 @@ func (s *Session) watched() []string {
 }
 
 func (s *Session) Reload(ctx context.Context) error {
-	unit, err := compiler.AnalyseDev(s.path, target.Linux)
+	unit, err := compiler.Analyse(s.path, compiler.Dev)
 	if err != nil {
 		s.logf("%v", err)
 		return nil
@@ -162,7 +161,7 @@ func (s *Session) Reload(ctx context.Context) error {
 	if table.Full() {
 		return s.restart(ctx, unit, "function table full")
 	}
-	out, err := compiler.Generate(unit, compiler.Hot(table))
+	out, err := compiler.Generate(unit, table)
 	if err != nil {
 		return err
 	}
@@ -215,9 +214,8 @@ func changedFuncs(old, current map[string]string) []string {
 
 func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string) error {
 	s.builds++
-	table := amd64.NewFuncTable(unit.Program)
 	binary := filepath.Join(s.dir, fmt.Sprintf("app%d", s.builds))
-	built, err := compiler.Build(ctx, unit, compiler.Hot(table), binary)
+	built, err := compiler.Build(ctx, unit, binary)
 	if err != nil {
 		return err
 	}
@@ -230,7 +228,7 @@ func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string)
 	go c.wait()
 	s.child = c
 	s.built = built
-	s.table, s.funcs = table, built.Funcs
+	s.table, s.funcs = built.Table, built.Funcs
 	s.signatures, s.layout = signatures(unit.Program), layout(unit.Files)
 	s.libraries = unit.Program.Libraries()
 	s.cSymbols = unit.Program.CSymbols

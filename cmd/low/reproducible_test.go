@@ -5,17 +5,15 @@ import (
 	"strings"
 	"testing"
 
-	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
 	"lowlang/internal/fixture/fixturetest"
 	"lowlang/internal/target"
 )
 
 type determinismCase struct {
-	name     string
-	path     string
-	platform target.OS
-	dev      bool
+	name    string
+	path    string
+	profile compiler.Profile
 }
 
 type compiled struct {
@@ -27,12 +25,12 @@ func determinismCases(t *testing.T) []determinismCase {
 	t.Helper()
 	var cases []determinismCase
 	add := func(group string, program fixturetest.Program, platform target.OS, dev bool) {
-		mode := "release"
+		mode, profile := "release", compiler.Release(platform)
 		if dev {
-			mode = "dev"
+			mode, profile = "dev", compiler.Dev
 		}
 		name := fmt.Sprintf("%s/%s/%s/%s", group, program.Name, platform, mode)
-		cases = append(cases, determinismCase{name: name, path: program.Path, platform: platform, dev: dev})
+		cases = append(cases, determinismCase{name: name, path: program.Path, profile: profile})
 	}
 	for _, program := range fixturetest.Programs(t, "run") {
 		add("run", program, target.Linux, false)
@@ -49,19 +47,11 @@ func determinismCases(t *testing.T) []determinismCase {
 }
 
 func compileOnce(c determinismCase) (compiled, error) {
-	analyse := compiler.Analyse
-	if c.dev {
-		analyse = compiler.AnalyseDev
-	}
-	unit, err := analyse(c.path, c.platform)
+	unit, err := compiler.Analyse(c.path, c.profile)
 	if err != nil {
 		return compiled{}, err
 	}
-	mode := compiler.Release
-	if c.dev {
-		mode = compiler.Hot(amd64.NewFuncTable(unit.Program))
-	}
-	out, err := compiler.Generate(unit, mode)
+	out, err := compiler.Generate(unit, unit.NewTable())
 	if err != nil {
 		return compiled{}, err
 	}
