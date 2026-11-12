@@ -29,7 +29,7 @@ var Dev = Profile{platform: target.Linux, hot: true}
 type Unit struct {
 	Files    []*ast.File
 	Types    *types.Universe
-	Profile  Profile
+	profile  Profile
 	Platform amd64.Platform
 	Program  *ir.Program
 	Sources  []string
@@ -50,13 +50,13 @@ func Analyse(path string, profile Profile) (*Unit, error) {
 }
 
 func (u *Unit) lower(profile Profile) {
-	u.Profile = profile
+	u.profile = profile
 	u.Platform = amd64.NewPlatform(profile.platform)
 	u.Program = ir.Build(u.Files, profile.optimise)
 }
 
-func (u *Unit) NewTable() amd64.FuncTable {
-	if !u.Profile.hot {
+func (u *Unit) newTable() amd64.FuncTable {
+	if !u.profile.hot {
 		return nil
 	}
 	return amd64.NewFuncTable(u.Program)

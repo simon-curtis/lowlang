@@ -161,7 +161,7 @@ func (s *Session) Reload(ctx context.Context) error {
 	if table.Full() {
 		return s.restart(ctx, unit, "function table full")
 	}
-	out, err := compiler.Generate(unit, table)
+	out, err := compiler.GenerateWith(unit, table)
 	if err != nil {
 		return err
 	}

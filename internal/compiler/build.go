@@ -42,13 +42,17 @@ func (u *Unit) assembler() asm.Options {
 	return options
 }
 
-func Generate(unit *Unit, table amd64.FuncTable) (amd64.Output, error) {
+func Generate(unit *Unit) (amd64.Output, error) {
+	return GenerateWith(unit, unit.newTable())
+}
+
+func GenerateWith(unit *Unit, table amd64.FuncTable) (amd64.Output, error) {
 	return amd64.Generate(unit.Program, unit.Platform, table)
 }
 
 func Build(ctx context.Context, unit *Unit, output string) (*Built, error) {
-	table := unit.NewTable()
-	out, err := Generate(unit, table)
+	table := unit.newTable()
+	out, err := GenerateWith(unit, table)
 	if err != nil {
 		return nil, err
 	}

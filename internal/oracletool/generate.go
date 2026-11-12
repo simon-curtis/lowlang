@@ -28,7 +28,7 @@ func Generate(dir, path string, platform target.OS) (generated Generated, err er
 	if err != nil {
 		return Generated{}, err
 	}
-	out, err := amd64.Generate(unit.Program, unit.Platform, nil)
+	out, err := compiler.Generate(unit)
 	if err != nil {
 		return Generated{}, err
 	}

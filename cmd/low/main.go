@@ -208,7 +208,7 @@ func compileCommand(ctx context.Context, cmd, path string, opts options) error {
 		}
 		return nil
 	case "asm":
-		out, err := compiler.Generate(unit, unit.NewTable())
+		out, err := compiler.Generate(unit)
 		if err != nil {
 			return err
 		}

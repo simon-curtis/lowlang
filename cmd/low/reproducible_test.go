@@ -51,7 +51,7 @@ func compileOnce(c determinismCase) (compiled, error) {
 	if err != nil {
 		return compiled{}, err
 	}
-	out, err := compiler.Generate(unit, unit.NewTable())
+	out, err := compiler.Generate(unit)
 	if err != nil {
 		return compiled{}, err
 	}

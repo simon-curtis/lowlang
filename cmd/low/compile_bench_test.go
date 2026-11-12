@@ -3,7 +3,6 @@ package main
 import (
 	"testing"
 
-	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
 	"lowlang/internal/fixture/fixturetest"
 	"lowlang/internal/target"
@@ -18,7 +17,7 @@ func BenchmarkCompile(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				if _, err := amd64.Generate(unit.Program, unit.Platform, nil); err != nil {
+				if _, err := compiler.Generate(unit); err != nil {
 					b.Fatal(err)
 				}
 			}
