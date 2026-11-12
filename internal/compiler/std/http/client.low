@@ -130,15 +130,6 @@ struct Incoming {
     finish: fn(bool)
 }
 
-struct Framing {
-    reader: *io.Reader
-    attempt: *Attempt
-    mode: Mode
-    left: i64
-    first: bool
-    done: bool
-}
-
 struct Inflow {
     pending: []u8
     done: bool
@@ -218,12 +209,7 @@ pub fn build(b: Builder[Client]) -> *Client {
 /// The name is sent as written. On a client builder the header is a default for all its requests; on a request builder it replaces the client's header of that name for that request. A name or value that is not valid fails the request with `Io(Invalid)`. Headers the client adds itself, `user-agent`, `accept`, `accept-encoding` and `authorization` from the URL's user information, are skipped when one of that name is set.
 pub fn with_header[K](b: Builder[K], name: str, value: str) -> Builder[K] {
     var out = b
-    var headers: []header.Header = []
-    for h in b.headers {
-        if !text.equal_fold(h.name, name) {
-            push(mut headers, h)
-        }
-    }
+    var headers = header.remove(b.headers, name)
     push(mut headers, header.Header { name, value })
     out.headers = headers
     out
@@ -246,11 +232,6 @@ pub fn with_bearer_token[K](b: Builder[K], token: str) -> Builder[K] {
 /// The header is dropped when a redirect leads to another origin. A URL with user information gets the same header when none is set.
 pub fn with_basic_auth[K](b: Builder[K], user: str, password: str) -> Builder[K] {
     with_header(b, "authorization", basic_credentials(user, password))
-}
-
-/// Sets the header `name` to the key `value`, as `with_header` does.
-pub fn with_api_key[K](b: Builder[K], name: str, value: str) -> Builder[K] {
-    with_header(b, name, value)
 }
 
 /// Sets the time limit for a request, in milliseconds.
@@ -510,10 +491,10 @@ pub fn stream_to(b: Builder[Response], sink: fn([]u8) ! io.Error) -> Response ! 
 
 /// Sends the request and writes the body to the file at `path`, creating it or truncating it.
 ///
-/// The returned response has an empty `body`. The file is written whatever the status, so call `ensure_success` on the result and remove the file for a status that is not wanted. When the request fails part way, the file is removed. A file that cannot be created fails with `Io(Denied)`, whatever the cause.
+/// The returned response has an empty `body`. The file is written whatever the status, so call `ensure_success` on the result and remove the file for a status that is not wanted. When the request fails part way, the file is removed. A file that cannot be created fails with `Io` holding the cause, such as `NotFound` or `Denied`.
 pub fn download(b: Builder[Response], path: str) -> Response ! Error {
     using f = file.create(path) catch {
-        _ => fail Io(Denied)
+        e => fail Io(e)
     }
     let target = f.handle
     let resp = perform(b, false, fn(chunk: []u8) ! io.Error { file.write_all_on(target, chunk)? }) catch {
@@ -590,17 +571,6 @@ pub fn header_value(resp: Response, name: str) -> str? {
     header.get(resp.headers, name)
 }
 
-/// Returns the values of every header of `resp` named `name`, ignoring case, in the order received. The slice is empty when there are none.
-pub fn header_values(resp: Response, name: str) -> []str {
-    var out: []str = []
-    for h in resp.headers {
-        if text.equal_fold(h.name, name) {
-            push(mut out, h.value)
-        }
-    }
-    out
-}
-
 /// Returns the `cookie` header value that the jar of `c` would send to `url`.
 ///
 /// Returns an empty string when `c` has no jar, `url` does not parse, or no cookie matches.
@@ -672,17 +642,9 @@ fn request_headers(b: Builder[Response], u: Url) -> []header.Header {
 }
 
 fn without_headers(headers: []header.Header, names: []str) -> []header.Header {
-    var out: []header.Header = []
-    for h in headers {
-        var dropped = false
-        for name in names {
-            if text.equal_fold(h.name, name) {
-                dropped = true
-            }
-        }
-        if !dropped {
-            push(mut out, h)
-        }
+    var out = headers
+    for name in names {
+        out = header.remove(out, name)
     }
     out
 }
@@ -733,25 +695,27 @@ fn follow(b: Builder[Response], collect: bool, sink: fn([]u8) ! io.Error) -> Res
             return finish_response(job, inc, req.url, b.decompression, collect, sink, trace)
         }
         let version = version_text(inc.version)
+        let invalid = Error.InvalidUrl(location)
         let next = resolve(req.url, location) catch {
             _ => {
                 inc.finish(false)
-                settle(trace, inc.status, version, "InvalidUrl")
-                fail InvalidUrl(location)
+                settle(trace, inc.status, version, invalid)
+                fail invalid
             }
         }
         if next.scheme != "http" && next.scheme != "https" {
             inc.finish(false)
-            settle(trace, inc.status, version, "InvalidUrl")
-            fail InvalidUrl(location)
+            settle(trace, inc.status, version, invalid)
+            fail invalid
         }
         if hops == b.redirects {
+            let exhausted = Error.TooManyRedirects(hops)
             inc.finish(false)
-            settle(trace, inc.status, version, "TooManyRedirects")
-            fail TooManyRedirects(hops)
+            settle(trace, inc.status, version, exhausted)
+            fail exhausted
         }
         discard(inc)
-        settle(trace, inc.status, version, "")
+        settle(trace, inc.status, version, none)
         hops += 1
         if !keeps_body && req.method != "HEAD" {
             req.method = "GET"
@@ -865,7 +829,7 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing, trace: *Trace?) -> In
                     retry_wait(retries, inc.headers)
                     if retry.reserve(retries) {
                         discard(inc)
-                        settle(trace, inc.status, version_text(inc.version), "")
+                        settle(trace, inc.status, version_text(inc.version), none)
                         retry.commit(retries)
                         continue
                     }
@@ -874,11 +838,11 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing, trace: *Trace?) -> In
             }
             Failed(e) => {
                 if expired(job.deadline) {
-                    settle(trace, 0, "", "Timeout")
+                    settle(trace, 0, "", Error.Timeout)
                     fail Timeout
                 }
                 let failure = classify(e, a)
-                settle(trace, 0, "", error_name(failure))
+                settle(trace, 0, "", failure)
                 if a.stale && replayable && !stale_retried {
                     stale_retried = true
                     fresh = true
@@ -960,16 +924,16 @@ fn finish_response(job: Job, inc: Incoming, u: Url, decode: bool, collect: bool,
             inc.finish(false)
             let version = version_text(inc.version)
             if expired(job.deadline) {
-                settle(trace, inc.status, version, "Timeout")
+                settle(trace, inc.status, version, Error.Timeout)
                 fail Timeout
             }
             let failure = classify(e, a)
-            settle(trace, inc.status, version, error_name(failure))
+            settle(trace, inc.status, version, failure)
             fail failure
         }
     }
     inc.finish(true)
-    settle(trace, inc.status, version_text(inc.version), "")
+    settle(trace, inc.status, version_text(inc.version), none)
     var headers = inc.headers
     if decoded {
         headers = without_headers(headers, ["content-encoding", "content-length"])
@@ -1103,7 +1067,7 @@ fn exchange1(job: Job, conn: *Conn1, req: Outgoing, a: *Attempt) -> Incoming ! i
             fail e
         }
     }
-    let framing = new(Framing { reader: conn.reader, attempt: a, mode: shape.mode, left: if shape.mode == Length { shape.length } else { 0 }, first: true, done: false })
+    let framing = framing_of(conn.reader, shape)
     let length = shape.length
     let reusable = head.keep && head.status != 101 && framing.mode != UntilClose
     let body = io.Stream {
@@ -1111,6 +1075,9 @@ fn exchange1(job: Job, conn: *Conn1, req: Outgoing, a: *Attempt) -> Incoming ! i
             a.broken = true
             let n = framed_read(framing, buf)?
             a.broken = false
+            if framing.done {
+                a.trailers = framing.trailers
+            }
             n
         }
         write: fn(data) -> i64 ! io.Error { fail Unsupported }
@@ -1173,51 +1140,6 @@ fn write_request1(s: io.Stream, req: Outgoing) ! io.Error {
             }
         }
     }
-}
-
-fn framed_read(f: *Framing, buf: []u8) -> i64 ! io.Error {
-    if f.done {
-        return 0
-    }
-    match f.mode {
-        Empty => {
-            f.done = true
-            return 0
-        }
-        UntilClose => {
-            let n = io.read_some(f.reader, buf)?
-            if n == 0 {
-                f.done = true
-            }
-            return n
-        }
-        Chunked => {
-            if f.left == 0 {
-                if !f.first && io.read_line(f.reader)?.len != 0 {
-                    fail Malformed
-                }
-                f.first = false
-                let size = read_chunk_size(f.reader)?
-                if size == 0 {
-                    f.attempt.trailers = read_headers(f.reader)?
-                    f.done = true
-                    return 0
-                }
-                f.left = size
-            }
-        }
-        Length => {}
-    }
-    let want = if buf.len < f.left { buf.len } else { f.left }
-    let n = io.read_some(f.reader, buf[..want])?
-    if n == 0 {
-        fail Eof
-    }
-    f.left -= n
-    if f.mode == Length && f.left == 0 {
-        f.done = true
-    }
-    n
 }
 
 fn exchange2(job: Job, m: *Mux, req: Outgoing, a: *Attempt) -> Incoming ! io.Error {
@@ -1304,8 +1226,7 @@ fn start2(m: *Mux, lane: *Lane, req: Outgoing, d: *Deadline, a: *Attempt) -> Eve
     }
     let streamed = req.source != none
     let has_body = streamed || req.body.len > 0
-    let sends_length = req.body.len > 0 || req.method == "POST" || req.method == "PUT" || req.method == "PATCH"
-    if !streamed && sends_length && !header.has(req.headers, "content-length") {
+    if !streamed && sends_length(req.method, req.body.len) && !header.has(req.headers, "content-length") {
         push(mut fields, header.Header { name: "content-length", value: "{req.body.len}" })
     }
     open_lane(m, lane, fields, !has_body)?

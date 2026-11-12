@@ -96,29 +96,77 @@ fn last_chunk() -> str {
     "0\r\n\r\n"
 }
 
-fn read_chunked(r: *io.Reader) -> []u8 ! io.Error {
-    var body: []u8 = []
-    for {
-        let size = read_chunk_size(r)?
-        if size == 0 {
-            read_headers(r)?
-            return body
-        }
-        if body.len + size > max_body() {
-            fail TooLarge
-        }
-        io.append(mut body, io.read_exact(r, size)?)
-        if io.read_line(r)?.len != 0 {
-            fail Malformed
-        }
-    }
+struct Framing {
+    reader: *io.Reader
+    mode: Mode
+    left: i64
+    first: bool
+    done: bool
+    trailers: []header.Header
 }
 
-fn read_until_close(r: *io.Reader) -> []u8 ! io.Error {
+fn framing_of(r: *io.Reader, shape: BodyFraming) -> *Framing {
+    new(Framing { reader: r, mode: shape.mode, left: if shape.mode == Length { shape.length } else { 0 }, first: true, done: false, trailers: [] })
+}
+
+fn framed_read(f: *Framing, buf: []u8) -> i64 ! io.Error {
+    if f.done {
+        return 0
+    }
+    match f.mode {
+        Empty => {
+            f.done = true
+            return 0
+        }
+        UntilClose => {
+            let n = io.read_some(f.reader, buf)?
+            if n == 0 {
+                f.done = true
+            }
+            return n
+        }
+        Chunked => {
+            if f.left == 0 {
+                if !f.first && io.read_line(f.reader)?.len != 0 {
+                    fail Malformed
+                }
+                f.first = false
+                let size = read_chunk_size(f.reader)?
+                if size == 0 {
+                    f.trailers = read_headers(f.reader)?
+                    f.done = true
+                    return 0
+                }
+                f.left = size
+            }
+        }
+        Length => {}
+    }
+    let want = if buf.len < f.left { buf.len } else { f.left }
+    let n = io.read_some(f.reader, buf[..want])?
+    if n == 0 {
+        fail Eof
+    }
+    f.left -= n
+    if f.mode == Length && f.left == 0 {
+        f.done = true
+    }
+    n
+}
+
+fn read_body(f: *Framing) -> []u8 ! io.Error {
+    if f.mode == Length {
+        let out: []u8 = __make(f.left)
+        var got = 0
+        for got < out.len {
+            got += framed_read(f, out[got..])?
+        }
+        return out
+    }
     var body: []u8 = []
     let chunk = io.buffer(16384)
     for {
-        let n = io.read_some(r, chunk)?
+        let n = framed_read(f, chunk)?
         if n == 0 {
             return body
         }
@@ -129,6 +177,17 @@ fn read_until_close(r: *io.Reader) -> []u8 ! io.Error {
     }
 }
 
+fn request_framing(headers: []header.Header) -> BodyFraming ! io.Error {
+    if chunked(headers) {
+        return BodyFraming { mode: Chunked, length: -1 }
+    }
+    let n = content_length(headers)?
+    if n > 0 {
+        return BodyFraming { mode: Length, length: n }
+    }
+    BodyFraming { mode: Empty, length: 0 }
+}
+
 fn parse_request_line(line: str) -> Request ! io.Error {
     let parts = text.split(line, ' ')
     if parts.len != 3 || parts[0].len == 0 || parts[1].len == 0 || !header.token(parts[0]) {
@@ -137,7 +196,9 @@ fn parse_request_line(line: str) -> Request ! io.Error {
     if parts[2] != "HTTP/1.1" && parts[2] != "HTTP/1.0" {
         fail Unsupported
     }
-    new_request(parts[0], parts[1])
+    var req = new_request(parts[0], parts[1])
+    req.http10 = parts[2] == "HTTP/1.0"
+    req
 }
 
 fn read_request_rest(r: *io.Reader, line: str) -> Request ! io.Error {
@@ -148,20 +209,15 @@ fn read_request_rest(r: *io.Reader, line: str) -> Request ! io.Error {
     if text.has_token(header.get(req.headers, "expect") ?? "", "100-continue") {
         io.write_str(io.reader_stream(r), "HTTP/1.1 100 Continue\r\n\r\n")?
     }
-    if chunked(req.headers) {
-        req.body = read_chunked(r)?
-        return req
-    }
-    let n = content_length(req.headers)?
-    if n > 0 {
-        req.body = io.read_exact(r, n)?
-    }
+    let shape = request_framing(req.headers)?
+    let framing = framing_of(r, shape)
+    req.body = read_body(framing)?
     req
 }
 
 /// Reads one HTTP/1 request from `r`, including its whole body.
 ///
-/// Blocks until the request is complete. Blank lines before the request line are skipped. The returned request has `version` `Http1`, whatever the version in the request line, its `authority` taken from the `host` header, and `connection` set to `r`. The body is read from `chunked` transfer coding, or from `content-length` bytes; a request with neither has an empty body. When the request carries `expect: 100-continue`, `HTTP/1.1 100 Continue` is written to the stream beneath `r` before the body is read.
+/// Blocks until the request is complete. Blank lines before the request line are skipped. The returned request has `version` `Http1`, `http10` set when the request line says `HTTP/1.0`, its `authority` taken from the `host` header, and `connection` set to `r`. The body is read from `chunked` transfer coding, or from `content-length` bytes; a request with neither has an empty body. When the request carries `expect: 100-continue`, `HTTP/1.1 100 Continue` is written to the stream beneath `r` before the body is read.
 ///
 /// Fails with `Eof` when the input ends before a complete request, `Malformed` for a request line that is not `METHOD target HTTP/1.x`, a header line without a valid name and `:`, a bad chunk size or a `content-length` that is not a number, `Unsupported` when the version is not `HTTP/1.0` or `HTTP/1.1`, and `TooLarge` for more than 100 headers, a line longer than the reader's buffer, or a body over 64 MiB. Header names are lowercased.
 pub fn read_request(r: *io.Reader) -> Request ! io.Error {
@@ -172,9 +228,9 @@ pub fn read_request(r: *io.Reader) -> Request ! io.Error {
     read_request_rest(r, line)
 }
 
-fn keep_alive(line: str, headers: []header.Header) -> bool {
+fn keep_alive(http10: bool, headers: []header.Header) -> bool {
     let connection = header.get(headers, "connection") ?? ""
-    if text.ends_with(line, "HTTP/1.0") {
+    if http10 {
         return text.has_token(connection, "keep-alive")
     }
     !text.has_token(connection, "close")
@@ -188,7 +244,7 @@ fn read_response_head(r: *io.Reader) -> ResponseHead ! io.Error {
         if status >= 100 && status < 200 && status != 101 {
             continue
         }
-        return ResponseHead { status, headers, keep: keep_alive(line, headers) }
+        return ResponseHead { status, headers, keep: keep_alive(text.starts_with(line, "HTTP/1.0"), headers) }
     }
 }
 
@@ -214,7 +270,7 @@ pub fn write_response(s: io.Stream, method: str, resp: Response, closing: bool) 
     text.append(mut out, "HTTP/1.1 {resp.status} {status_text(resp.status)}\r\n")
     write_head(mut out, resp.headers)?
     let empty = bodiless(method, resp.status)
-    if !header.has(resp.headers, "content-length") && !(resp.status < 200 || resp.status == 204 || resp.status == 304) {
+    if !header.has(resp.headers, "content-length") && !status_bodiless(resp.status) {
         text.append(mut out, "content-length: {resp.body.len}\r\n")
     }
     if closing && resp.status != 101 {
@@ -247,10 +303,14 @@ fn put_request_head(mut out: []u8, method: str, target: str, host: str, headers:
     write_head(mut out, headers)?
     if body_len < 0 {
         text.append(mut out, "transfer-encoding: chunked\r\n")
-    } else if (body_len > 0 || method == "POST" || method == "PUT" || method == "PATCH") && !header.has(headers, "content-length") {
+    } else if sends_length(method, body_len) && !header.has(headers, "content-length") {
         text.append(mut out, "content-length: {body_len}\r\n")
     }
     text.append(mut out, "\r\n")
+}
+
+fn sends_length(method: str, body_len: i64) -> bool {
+    body_len > 0 || method == "POST" || method == "PUT" || method == "PATCH"
 }
 
 fn parse_status_line(line: str) -> i64 ! io.Error {
@@ -264,27 +324,16 @@ fn parse_status_line(line: str) -> i64 ! io.Error {
 
 /// Reads one HTTP/1 response from `r`, including its whole body.
 ///
-/// `method` is the method of the request being answered. Blocks until the response is complete. Interim `1xx` responses other than `101` are skipped. The body is empty for a response to `HEAD` and for `1xx`, `204` and `304`; otherwise it is read from `chunked` transfer coding, from `content-length` bytes, or, when neither is present, until the peer closes the connection. Chunked trailers are read and discarded. The returned response has `version` `Http1` and an empty `url`.
+/// `method` is the method of the request being answered. Blocks until the response is complete. Interim `1xx` responses other than `101` are skipped. The body is empty for a response to `HEAD` and for `1xx`, `204` and `304`; otherwise it is read from `chunked` transfer coding, from `content-length` bytes, or, when neither is present, until the peer closes the connection. Chunked trailers are returned in `trailers`. The returned response has `version` `Http1` and an empty `url`.
 ///
 /// Fails with `Eof` when the input ends early, `Malformed` for a status line that is not `HTTP/1.x` and a three-digit status, a bad header, a bad chunk size or a `content-length` that is not a number, and `TooLarge` for more than 100 headers or a body over 64 MiB.
 pub fn read_response(r: *io.Reader, method: str) -> Response ! io.Error {
     let head = read_response_head(r)?
-    let framing = body_framing(method, head.status, head.headers)?
-    var resp = Response { status: head.status, headers: head.headers, body: [] }
-    match framing.mode {
-        Empty => {}
-        Chunked => {
-            resp.body = read_chunked(r)?
-        }
-        Length => {
-            if framing.length > max_body() {
-                fail TooLarge
-            }
-            resp.body = io.read_exact(r, framing.length)?
-        }
-        UntilClose => {
-            resp.body = read_until_close(r)?
-        }
+    let shape = body_framing(method, head.status, head.headers)?
+    if shape.length > max_body() {
+        fail TooLarge
     }
-    resp
+    let framing = framing_of(r, shape)
+    let body = read_body(framing)?
+    Response { status: head.status, headers: head.headers, body, trailers: framing.trailers }
 }
