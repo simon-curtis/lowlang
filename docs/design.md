@@ -1155,8 +1155,8 @@ Every public struct, enum, function, struct field and enum variant carries a doc
 | `std/bits` | Dense bitsets. |
 | `std/bits/roaring` | Roaring bitmaps with the portable serialization format. |
 | `std/image` | Bitmaps, pixel operations and resizing, with PNG, JPEG, GIF, BMP, QOI and lossless WebP codecs. |
-| `std/crypto` | `sha1`, and `random`, which reads `getrandom` and panics when the generator fails. |
-| `std/crypto/hash` | `Algorithm` and cloneable `Digest`, SHA-256, SHA-384 and SHA-512, HMAC, HKDF and constant-time `equal`. |
+| `std/crypto` | `random`, which reads `getrandom` and panics when the generator fails. |
+| `std/crypto/hash` | `Algorithm` and cloneable `Digest`, SHA-1, SHA-256, SHA-384 and SHA-512, HMAC, HKDF and constant-time `equal`. |
 | `std/crypto/sha3` | SHA3-256, SHA3-384, SHA3-512, SHAKE128 and SHAKE256. |
 | `std/crypto/aead` | `Aead` values for AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 and XChaCha20-Poly1305 (`xchacha20_poly1305`, 24-byte nonce). The AES block functions for 128-, 192- and 256-bit keys (`aes_key`, `encrypt_block_into`, `decrypt_block`, `decrypt_block_into`). The ChaCha20 functions `chacha20_xor` (takes the RFC 8439 block counter) and `hchacha20`. |
 | `std/crypto/md5` | MD5 as a `hash.Algorithm`, so HMAC, HKDF and PBKDF2 work over it, and `sum`. For interop and checksums, not security. |
