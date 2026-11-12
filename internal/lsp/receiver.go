@@ -48,7 +48,14 @@ func (c *cursor) method(t *types.Type, name string) *ast.Func {
 		return fn
 	}
 	if module, foreign := check.ReceiverModule(t, c.file.Module); foreign {
-		return c.function(module, name, true)
+		if fn := c.function(module, name, true); fn != nil {
+			return fn
+		}
+	}
+	for _, imp := range c.file.Imports {
+		if fn := c.function(imp.Path, name, true); fn != nil && check.TakesFirst(fn, t) {
+			return fn
+		}
 	}
 	return nil
 }
@@ -67,6 +74,9 @@ func (c *cursor) methods(t *types.Type) {
 	c.moduleMethods(c.file.Module, t, false)
 	if module, foreign := check.ReceiverModule(t, c.file.Module); foreign {
 		c.moduleMethods(module, t, true)
+	}
+	for _, imp := range c.file.Imports {
+		c.moduleMethods(imp.Path, t, true)
 	}
 	for _, l := range c.scope() {
 		if l.Type != nil && l.Type.Kind == types.FuncKind && len(l.Type.Params) > 0 && l.Type.Params[0].Accepts(t) {

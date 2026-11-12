@@ -1661,7 +1661,11 @@ func (c *Checker) method(e *ast.Call, sel *ast.Selector, want *types.Type) {
 	e.Fn = &ast.Ident{Name: sel.Name, Pos: sel.Pos}
 	e.Args = append([]ast.Expr{receiver}, e.Args...)
 	e.Prepended = true
-	if target := c.receiverFunc(t, sel.Name); target != nil {
+	target := c.receiverFunc(t, sel.Name)
+	if target == nil && !c.callable(sel.Name) {
+		target = c.importedReceiverFunc(t, sel.Name, sel.Pos)
+	}
+	if target != nil {
 		if len(target.Params) > 0 && target.Params[0].Mut {
 			prependMut(e)
 		}
@@ -1702,6 +1706,25 @@ func (c *Checker) receiverFunc(t *types.Type, name string) *ast.Func {
 		return nil
 	}
 	return fn
+}
+
+func (c *Checker) importedReceiverFunc(t *types.Type, name string, pos diag.Pos) *ast.Func {
+	var found []*ast.Func
+	var modules []string
+	for _, imp := range c.file.Imports {
+		fn := c.scope(imp.Path).funcs[name]
+		if fn != nil && fn.Pub && TakesFirst(fn, t) {
+			found = append(found, fn)
+			modules = append(modules, fmt.Sprintf("%s.%s", imp.Alias, name))
+		}
+	}
+	if len(found) > 1 {
+		c.fail(pos, "%s is ambiguous for %s: %s; call one of them by its module", name, t, strings.Join(modules, ", "))
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return found[0]
 }
 
 func prependMut(e *ast.Call) {

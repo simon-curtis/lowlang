@@ -170,3 +170,29 @@ func TestMethodCompletionOffersLocalsAcceptingTheReceiver(t *testing.T) {
 	items := c.completeTyping(f, "print(p.show", "    p.")
 	expect(t, items, []string{"show"}, []string{"other"})
 }
+
+const sliceMethodsSource = `import std/slices
+import std/text
+
+fn main() {
+    let words = text.fields("a bb")
+    let name = "x"
+    print(words.map(fn(w) w.len).sum() + name.len)
+}
+`
+
+func TestMethodsFromImportedModules(t *testing.T) {
+	c := start(t)
+	f := scratch(t, "slices.low", sliceMethodsSource)
+	if got := c.open(f, f.src); len(got) != 0 {
+		t.Fatalf("diagnostics = %+v", got)
+	}
+	items := c.completeTyping(f, `let words = text.fields("a bb")`, "    words.")
+	expect(t, items, []string{"map", "scan", "count", "len"}, []string{"trim", "fields"})
+	items = c.completeTyping(f, `let name = "x"`, "    name.")
+	expect(t, items, []string{"trim", "fields", "count"}, []string{"scan", "flat_map"})
+	help := c.signature(f, `let words = text.fields("a bb")`, "    words.scan(")
+	if help == nil || activeParam(help) != "initial: A" {
+		t.Errorf("words.scan( help = %+v", help)
+	}
+}
