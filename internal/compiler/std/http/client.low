@@ -7,8 +7,10 @@ import std/header
 import std/io
 import std/json
 import std/net
+import std/retry
 import std/serde
 import std/text
+import std/time/duration
 import std/tls
 import std/uri
 
@@ -767,8 +769,42 @@ fn idempotent(method: str) -> bool {
     method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS" || method == "TRACE"
 }
 
-fn retry_status(status: i64) -> bool {
+/// Returns `true` for the statuses a retry may recover from: `429`, `502`, `503` and `504`.
+pub fn retry_status(status: i64) -> bool {
     status == 429 || status == 502 || status == 503 || status == 504
+}
+
+/// Returns the wait in milliseconds that a `retry-after` header of whole seconds asks for, or `-1` when there is none or it is not a number of seconds.
+pub fn retry_after_ms(headers: []header.Header) -> i64 {
+    let seconds = text.parse_uint(text.trim(header.get(headers, "retry-after") ?? ""), 10) catch -1
+    if seconds < 0 { -1 } else { seconds * 1000 }
+}
+
+fn max_retry_wait() -> i64 {
+    30000
+}
+
+fn retry_policy(b: Builder[Response], d: *Deadline) -> retry.Policy {
+    var p = retry.policy()
+    p = retry.with_attempts(p, b.retries + 1)
+    p = retry.with_base(p, duration.milliseconds(100))
+    p = retry.with_max_delay(p, duration.milliseconds(6400))
+    p = retry.with_jitter(p, retry.Jitter.None)
+    let left = remaining(d)
+    if left > 0 {
+        p = retry.with_deadline(p, duration.milliseconds(left))
+    }
+    match b.token {
+        some(t) => retry.with_cancel(p, t)
+        none => p
+    }
+}
+
+fn retry_wait(r: *retry.Retrier, headers: []header.Header) {
+    let ms = retry_after_ms(headers)
+    if ms > 0 {
+        retry.at_least(r, duration.milliseconds(if ms > max_retry_wait() { max_retry_wait() } else { ms }))
+    }
 }
 
 fn transport_failure(e: io.Error) -> bool {
@@ -783,21 +819,6 @@ fn transport_failure(e: io.Error) -> bool {
         TimedOut => true
         _ => false
     }
-}
-
-fn backoff(tries: i64, headers: []header.Header) -> i64 {
-    let shift = if tries > 6 { 6 } else { tries }
-    var wait = 100 << shift
-    let after = text.parse_uint(text.trim(header.get(headers, "retry-after") ?? ""), 10) catch -1
-    if after >= 0 && after * 1000 > wait {
-        wait = after * 1000
-    }
-    if wait > 30000 { 30000 } else { wait }
-}
-
-fn fits(d: *Deadline, wait: i64) -> bool {
-    let left = remaining(d)
-    left == 0 || left > wait
 }
 
 fn attempt(job: Job, b: Builder[Response], base: Outgoing, trace: *Trace?) -> Incoming ! Error {
@@ -826,7 +847,8 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing, trace: *Trace?) -> In
     }
     let replayable = req.source == none
     let safe = idempotent(req.method)
-    var tries = 0
+    let retries = retry.start(retry_policy(b, job.deadline))
+    retry.next(retries)
     var fresh = false
     var avoid: *Mux? = none
     var stale_retried = false
@@ -838,13 +860,12 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing, trace: *Trace?) -> In
         let result = outcome(fn() -> Incoming ! io.Error { open(job, h, announced, a) })
         match result {
             Done(inc) => {
-                if safe && replayable && tries < b.retries && retry_status(inc.status) {
-                    let wait = backoff(tries, inc.headers)
-                    if fits(job.deadline, wait) {
+                if safe && replayable && retry_status(inc.status) {
+                    retry_wait(retries, inc.headers)
+                    if retry.reserve(retries) {
                         discard(inc)
                         settle(trace, inc.status, version_text(inc.version), "")
-                        sleep(wait)
-                        tries += 1
+                        retry.commit(retries)
                         continue
                     }
                 }
@@ -864,15 +885,11 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing, trace: *Trace?) -> In
                     continue
                 }
                 let retryable = a.phase == Connecting || safe && a.phase != Handshaking && transport_failure(e)
-                if retryable && replayable && tries < b.retries {
-                    let wait = backoff(tries, [])
-                    if fits(job.deadline, wait) {
-                        sleep(wait)
-                        tries += 1
-                        fresh = true
-                        avoid = a.used
-                        continue
-                    }
+                if retryable && replayable && retry.reserve(retries) {
+                    retry.commit(retries)
+                    fresh = true
+                    avoid = a.used
+                    continue
                 }
                 fail failure
             }
