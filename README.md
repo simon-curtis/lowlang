@@ -65,6 +65,10 @@ Each `bench/<name>/` holds one program as `main.low`, `main.go` and, for most, `
 | jsonpar | JSON parsing and tree walking |
 | channels | unbuffered ping-pong and a buffered worker pool |
 
+## Releases
+
+Pushing a `v*` tag runs the `test` workflow, then the `release` workflow builds `low` for `linux/amd64` and `windows/amd64` and publishes them as a GitHub release, `low-linux-amd64` and `low-windows-amd64.exe`. `site/install.sh` and `site/install.ps1`, served by the website, download the latest release.
+
 ## Website
 
 `site/` is a static site styled with Tailwind. Its output is committed, so the directory serves as it is. The `test` workflow runs `go vet` and `go test` on every push and pull request to `main`. When it passes on a push to `main`, the `site` workflow rebuilds the site and deploys it to Cloudflare Pages.
