@@ -23,6 +23,7 @@ const (
 	tebDealloc   = 0x1478
 	pageSize     = 4096
 	cRuntimeDLL  = "msvcrt.dll"
+	mathDLL      = "api-ms-win-crt-math-l1-1-0.dll"
 	kernelDLL    = "kernel32.dll"
 	synchDLL     = "api-ms-win-core-synch-l1-2-0.dll"
 	randomDLL    = "bcryptprimitives.dll"
@@ -56,8 +57,10 @@ func importSymbol(symbol string) string {
 
 func dllName(library string) string {
 	switch library {
-	case "c", "m":
+	case "c":
 		return cRuntimeDLL
+	case "m":
+		return mathDLL
 	}
 	if strings.HasSuffix(strings.ToLower(library), ".dll") {
 		return strings.ToLower(library)

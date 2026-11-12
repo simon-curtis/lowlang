@@ -183,10 +183,7 @@ func compileCommand(ctx context.Context, cmd, path string, opts options) error {
 
 func defaultOutput(path string, platform target.OS) string {
 	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	if platform == target.Windows {
-		return fmt.Sprintf("%s.exe", name)
-	}
-	return name
+	return platform.Executable(name)
 }
 
 func link(ctx context.Context, unit *compiler.Unit, output string) error {
@@ -209,7 +206,7 @@ func buildAndRun(ctx context.Context, path string) error {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	binary := filepath.Join(dir, defaultOutput("main", target.Host()))
+	binary := filepath.Join(dir, target.Host().Executable("main"))
 	if err := build(ctx, path, binary, target.Host()); err != nil {
 		return err
 	}

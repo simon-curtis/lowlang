@@ -1362,6 +1362,7 @@ The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emi
   - Sections merge by the name before `$`, `.bss` joins `.data` after its initialised bytes, and `.idata` joins `.rdata`. The order is `.text`, `.rdata`, `.data`, the rest by name, then `.reloc`. Code padding is `int3`. `.rodata` is writable.
   - `.rdata` starts with a debug directory holding one `REPRO` entry. The header timestamp and that entry carry the low 32 bits of the XXH3-64 hash of the image taken with both zero, so a program always links to the same bytes.
   - The code generator writes the import tables as `.idata$2` to `.idata$7` with `__imp_` labels. The import directory covers the `.idata$2` descriptors and a null descriptor placed after `.idata$3`, and the import address table directory covers `.idata$5`.
+  - `extern "c"` imports from `msvcrt.dll`, `extern "m"` from the UCRT maths set `api-ms-win-crt-math-l1-1-0.dll`, which has the C99 functions such as `round` and `cbrt` that `msvcrt.dll` lacks, and any other `extern "name"` from `name.dll`.
   - Every `Abs64` fixup gets a `DIR64` entry in `.reloc`, one block for each 4 KiB page, so the loader can rebase the image. `ImgRel32` resolves to an RVA, and `PC32` and `PLT32` to rip-relative values. 32-bit absolute, GOT and thread-local references fail the link, and so does an undefined symbol, which the error names.
   - `.incbin` paths are written with octal escapes for every byte outside printable ASCII, and `\` and `"` escaped, so drive letters, backslashes and non-ASCII names assemble unchanged.
 

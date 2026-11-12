@@ -41,14 +41,23 @@ func newFixture(t *testing.T, src string) *fixture {
 	t.Helper()
 	f := &fixture{t: t, path: filepath.Join(t.TempDir(), "app.low"), stdout: &syncBuffer{}, stderr: &syncBuffer{}}
 	f.write(src)
-	session, err := New(f.path, f.stdout, f.stderr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	session := f.open(f.path)
 	t.Cleanup(func() { session.Close() })
 	f.session = session
 	f.reload()
 	return f
+}
+
+func (f *fixture) open(path string) *Session {
+	f.t.Helper()
+	if err := checkHost(); err != nil {
+		f.t.Skip(err)
+	}
+	session, err := New(path, f.stdout, f.stderr)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return session
 }
 
 func writeFile(t *testing.T, path, src string) {
@@ -98,10 +107,7 @@ func TestRunWatchesModules(t *testing.T) {
 	library := filepath.Join(dir, "lib", "lib.low")
 	writeFile(t, library, "pub fn value() -> i64 {\n    1\n}\n")
 	f := &fixture{t: t, stdout: &syncBuffer{}, stderr: &syncBuffer{}}
-	session, err := New(dir, f.stdout, f.stderr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	session := f.open(dir)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- session.Run(ctx) }()

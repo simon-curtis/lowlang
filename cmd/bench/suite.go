@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"lowlang/internal/peakrss"
@@ -214,10 +213,7 @@ func (s *suite) execute(ctx context.Context, binary string, stdout io.Writer) (s
 	if err != nil {
 		return sample{}, fmt.Errorf("%s: %w\n%s", filepath.Base(binary), err, bytes.TrimSpace(stderr.Bytes()))
 	}
-	usage, ok := result.Cmd.ProcessState.SysUsage().(*syscall.Rusage)
-	if !ok {
-		return sample{wall: wall}, nil
-	}
-	cpu := time.Duration(usage.Utime.Nano() + usage.Stime.Nano())
+	state := result.Cmd.ProcessState
+	cpu := state.UserTime() + state.SystemTime()
 	return sample{wall: wall, cpu: cpu, rss: result.PeakKB * 1024}, nil
 }

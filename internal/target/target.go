@@ -21,6 +21,13 @@ func (o OS) String() string {
 	return names[o]
 }
 
+func (o OS) Executable(name string) string {
+	if o == Windows {
+		return fmt.Sprintf("%s.exe", name)
+	}
+	return name
+}
+
 func Parse(name string) (OS, error) {
 	for o, n := range names {
 		if n == name {

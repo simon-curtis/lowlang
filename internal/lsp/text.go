@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -104,10 +105,27 @@ func pathOf(uri string) string {
 	if err != nil || u.Scheme != "file" {
 		return uri
 	}
-	return filepath.Clean(u.Path)
+	p := u.Path
+	if u.Host != "" && u.Host != "localhost" {
+		p = fmt.Sprintf("//%s%s", u.Host, p)
+	}
+	rooted := strings.TrimPrefix(p, "/")
+	if drive := filepath.VolumeName(rooted); len(drive) == 2 {
+		p = fmt.Sprintf("%s%s", strings.ToUpper(drive), rooted[2:])
+	}
+	return filepath.Clean(filepath.FromSlash(p))
 }
 
 func uriOf(path string) string {
-	u := url.URL{Scheme: "file", Path: path}
+	volume := filepath.VolumeName(path)
+	p := filepath.ToSlash(path)
+	u := url.URL{Scheme: "file", Path: p}
+	switch {
+	case strings.HasPrefix(volume, `\\`):
+		host, rest, _ := strings.Cut(strings.TrimPrefix(p, "//"), "/")
+		u.Host, u.Path = host, fmt.Sprintf("/%s", rest)
+	case volume != "":
+		u.Path = fmt.Sprintf("/%s", p)
+	}
 	return u.String()
 }

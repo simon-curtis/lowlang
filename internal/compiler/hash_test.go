@@ -137,9 +137,11 @@ func buildProbe(t *testing.T, source string) string {
 	if _, err := check.Check(files, stdFS); err != nil {
 		t.Fatal(err)
 	}
-	program := ir.Build(files, target.Linux, ir.Options{Inline: true})
-	binary := filepath.Join(t.TempDir(), "probe")
-	if err := Link(context.Background(), amd64.Generate(program, nil).Asm, binary, program); err != nil {
+	host := target.Host()
+	program := ir.Build(files, host, ir.Options{Inline: true})
+	binary := filepath.Join(t.TempDir(), host.Executable("probe"))
+	asm := amd64.Generate(program, nil).Asm
+	if err := Link(context.Background(), asm, binary, program); err != nil {
 		t.Fatal(err)
 	}
 	return binary
