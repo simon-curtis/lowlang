@@ -13,6 +13,7 @@ import (
 
 	"lowlang/internal/asm"
 	"lowlang/internal/link"
+	"lowlang/internal/oracletool"
 	"lowlang/internal/target"
 )
 
@@ -44,9 +45,7 @@ func windowsCorpusPaths(t *testing.T) []string {
 
 func requireWindowsTools(t *testing.T) {
 	for _, tool := range []string{"clang", "lld-link"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			t.Skipf("%s is not on PATH", tool)
-		}
+		oracletool.Require(t, tool, oracletool.LLVM)
 	}
 }
 

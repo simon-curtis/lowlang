@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"lowlang/internal/asm"
+	"lowlang/internal/oracletool"
 )
 
 const clangTarget = "--target=x86_64-pc-windows-msvc"
@@ -47,9 +48,7 @@ func clangLayoutText(t *testing.T, source string) []byte {
 }
 
 func requireClang(t *testing.T) {
-	if _, err := exec.LookPath("clang"); err != nil {
-		t.Skip("clang is not on PATH")
-	}
+	oracletool.Require(t, "clang", oracletool.LLVM)
 }
 
 func TestClangLayoutAlignmentPadding(t *testing.T) {

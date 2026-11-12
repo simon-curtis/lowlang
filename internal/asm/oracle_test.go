@@ -3,7 +3,6 @@ package asm_test
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"runtime"
 	"sort"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"lowlang/internal/asm"
+	"lowlang/internal/oracletool"
 	"lowlang/internal/target"
 )
 
@@ -89,9 +89,7 @@ func TestOracle(t *testing.T) {
 	if testing.Short() {
 		t.Skip("oracle corpus is slow")
 	}
-	if _, err := exec.LookPath("as"); err != nil {
-		t.Skip("GNU as is not on PATH")
-	}
+	oracletool.Require(t, "as", oracletool.GNU)
 	entries, err := corpusEntries()
 	if err != nil {
 		t.Fatal(err)

@@ -14,6 +14,7 @@ import (
 	"lowlang/internal/asm"
 	"lowlang/internal/compiler"
 	"lowlang/internal/link"
+	"lowlang/internal/oracletool"
 	"lowlang/internal/target"
 )
 
@@ -114,9 +115,7 @@ func linkInProcess(dir, source string) (string, error) {
 
 func requireTools(t *testing.T) {
 	for _, tool := range []string{"as", "ld"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			t.Skipf("%s is not on PATH", tool)
-		}
+		oracletool.Require(t, tool, oracletool.GNU)
 	}
 }
 

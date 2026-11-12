@@ -1,17 +1,15 @@
 package asm_test
 
 import (
-	"os/exec"
 	"path/filepath"
 	"testing"
 
+	"lowlang/internal/oracletool"
 	"lowlang/internal/target"
 )
 
 func TestOracleReadsObjects(t *testing.T) {
-	if _, err := exec.LookPath("as"); err != nil {
-		t.Skip("GNU as is not on PATH")
-	}
+	oracletool.Require(t, "as", oracletool.GNU)
 	path := filepath.Join("..", "..", "bench", "fib", "main.low")
 	for _, platform := range []target.OS{target.Linux, target.Windows} {
 		entry := corpusEntry{name: "bench/fib/main.low", path: path, platform: platform}

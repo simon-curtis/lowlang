@@ -6,21 +6,19 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"lowlang/internal/amd64"
 	"lowlang/internal/asm"
+	"lowlang/internal/oracletool"
 	"lowlang/internal/target"
 )
 
 func assertMatchesAs(t *testing.T, source string) {
 	t.Helper()
-	if _, err := exec.LookPath("as"); err != nil {
-		t.Skip("GNU as is not on PATH")
-	}
+	oracletool.Require(t, "as", oracletool.GNU)
 	object, err := asm.Assemble(source, asm.Options{})
 	if err != nil {
 		t.Fatalf("assemble: %v", err)
