@@ -173,6 +173,7 @@ let byte = u8(300)
 ### Vectors
 
 ```low
+import std/bits
 import std/simd
 
 fn find(data: []u8, c: u8) -> i64 {
@@ -182,7 +183,7 @@ fn find(data: []u8, c: u8) -> i64 {
         let chunk: u8x32 = simd.read(data, i)
         let hits = simd.mask(chunk == needle)
         if hits != 0 {
-            return i + simd.trailing_zeros(hits)
+            return i + bits.trailing_zeros(hits)
         }
         i += 32
     }
