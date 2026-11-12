@@ -123,12 +123,12 @@ func (m *ModuleDoc) add(file *ast.File, types map[string]bool) {
 	}
 	for _, s := range file.Structs {
 		if s.Pub {
-			m.Items = append(m.Items, ItemDoc{Kind: "struct", Name: s.Name, Text: structText(s), Doc: s.Doc, File: name, Line: s.Pos.Line})
+			m.Items = append(m.Items, ItemDoc{Kind: "struct", Name: s.Name, Text: s.Interface(), Doc: s.Doc, File: name, Line: s.Pos.Line})
 		}
 	}
 	for _, e := range file.Enums {
 		if e.Pub {
-			m.Items = append(m.Items, ItemDoc{Kind: "enum", Name: e.Name, Text: enumText(e), Doc: e.Doc, File: name, Line: e.Pos.Line})
+			m.Items = append(m.Items, ItemDoc{Kind: "enum", Name: e.Name, Text: e.Interface(), Doc: e.Doc, File: name, Line: e.Pos.Line})
 		}
 	}
 	for _, f := range file.Funcs {
@@ -157,47 +157,4 @@ func receiver(f *ast.Func, types map[string]bool) string {
 		return ""
 	}
 	return t.Name
-}
-
-func structText(s *ast.StructDecl) string {
-	var b strings.Builder
-	if s.C {
-		b.WriteString("extern ")
-	}
-	b.WriteString(fmt.Sprintf("pub struct %s%s {\n", s.Name, ast.TypeParams(s.TypeParams)))
-	hidden := false
-	for _, f := range s.Fields {
-		if !f.Pub {
-			hidden = true
-			continue
-		}
-		member(&b, f.Doc)
-		b.WriteString(fmt.Sprintf("    pub %s: %s\n", f.Name, f.TypeName))
-	}
-	if hidden {
-		b.WriteString("    ...\n")
-	}
-	b.WriteString("}")
-	return b.String()
-}
-
-func enumText(e *ast.EnumDecl) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("pub enum %s%s {\n", e.Name, ast.TypeParams(e.TypeParams)))
-	for _, v := range e.Variants {
-		member(&b, v.Doc)
-		b.WriteString(fmt.Sprintf("    %s\n", v))
-	}
-	b.WriteString("}")
-	return b.String()
-}
-
-func member(b *strings.Builder, doc string) {
-	if doc == "" {
-		return
-	}
-	for line := range strings.Lines(doc) {
-		b.WriteString(strings.TrimRight(fmt.Sprintf("    /// %s", line), " \n"))
-		b.WriteString("\n")
-	}
 }

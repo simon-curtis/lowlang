@@ -1179,21 +1179,29 @@ func (c *Checker) fieldReference(e *ast.Selector, t *types.Type) {
 	e.Type = c.serdeFieldType(t, f, e.Pos)
 }
 
-func (c *Checker) index(e *ast.Index) {
-	t := c.plain(e.X, nil)
+func IndexType(u *types.Universe, t *types.Type) *types.Type {
 	switch {
 	case t.Kind == types.MapKind:
-		c.key(e.Index, t)
-		e.Type = c.universe.Optional(t.Elem)
-		return
+		return u.Optional(t.Elem)
 	case t.Kind == types.SliceKind:
-		e.Type = t.Elem
+		return t.Elem
 	case t == types.Str:
-		e.Type = types.U8
-	default:
-		c.fail(e.Pos, "cannot index a value of type %s", t)
+		return types.U8
 	}
-	c.integer(e.Index)
+	return nil
+}
+
+func (c *Checker) index(e *ast.Index) {
+	t := c.plain(e.X, nil)
+	e.Type = IndexType(c.universe, t)
+	switch {
+	case e.Type == nil:
+		c.fail(e.Pos, "cannot index a value of type %s", t)
+	case t.Kind == types.MapKind:
+		c.key(e.Index, t)
+	default:
+		c.integer(e.Index)
+	}
 }
 
 func (c *Checker) integer(e ast.Expr) {
@@ -1607,15 +1615,20 @@ func (c *Checker) shadowedModule(x ast.Expr, name string) {
 	}
 }
 
-func (c *Checker) receiverFunc(t *types.Type, name string) *ast.Func {
+func ReceiverModule(t *types.Type, current string) (string, bool) {
 	named := types.StructOf(t)
 	if named.Origin != nil {
 		named = named.Origin
 	}
-	if named.Module == c.file.Module || c.callable(name) {
+	return named.Module, named.Module != current
+}
+
+func (c *Checker) receiverFunc(t *types.Type, name string) *ast.Func {
+	module, foreign := ReceiverModule(t, c.file.Module)
+	if !foreign || c.callable(name) {
 		return nil
 	}
-	fn := c.scope(named.Module).funcs[name]
+	fn := c.scope(module).funcs[name]
 	if fn == nil || !fn.Pub {
 		return nil
 	}

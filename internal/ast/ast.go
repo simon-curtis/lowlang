@@ -1,6 +1,8 @@
 package ast
 
 import (
+	"iter"
+
 	"lowlang/internal/builtin"
 	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
@@ -178,6 +180,34 @@ type Func struct {
 	Bound       map[string]*types.Type
 	Trusted     bool
 	Derived     bool
+}
+
+func (f *Func) Declared() bool {
+	return f.Template == nil && f.Closure == nil
+}
+
+func (f *Func) Source() *Func {
+	if f.Template != nil {
+		return f.Template
+	}
+	return f
+}
+
+func (f *File) Declared() iter.Seq[*Func] {
+	return func(yield func(*Func) bool) {
+		for _, e := range f.Externs {
+			for _, fn := range e.Funcs {
+				if !yield(fn) {
+					return
+				}
+			}
+		}
+		for _, fn := range f.Funcs {
+			if fn.Declared() && !yield(fn) {
+				return
+			}
+		}
+	}
 }
 
 type Local struct {
@@ -511,44 +541,59 @@ type Catch struct {
 	Pos      diag.Pos
 }
 
-func (n *Block) Position() diag.Pos     { return n.Pos }
-func (n *Let) Position() diag.Pos       { return n.Pos }
-func (n *Assign) Position() diag.Pos    { return n.Pos }
-func (n *ExprStmt) Position() diag.Pos  { return n.X.Position() }
-func (n *For) Position() diag.Pos       { return n.Pos }
-func (n *Break) Position() diag.Pos     { return n.Pos }
-func (n *Continue) Position() diag.Pos  { return n.Pos }
-func (n *Return) Position() diag.Pos    { return n.Pos }
-func (n *Fail) Position() diag.Pos      { return n.Pos }
-func (n *Defer) Position() diag.Pos     { return n.Pos }
-func (n *Spawn) Position() diag.Pos     { return n.Pos }
-func (n *Send) Position() diag.Pos      { return n.Pos }
-func (n *Select) Position() diag.Pos    { return n.Pos }
-func (n *Subject) Position() diag.Pos   { return n.Pos }
-func (n *Receiver) Position() diag.Pos  { return n.X.Position() }
-func (n *IntLit) Position() diag.Pos    { return n.Pos }
-func (n *FloatLit) Position() diag.Pos  { return n.Pos }
-func (n *StrLit) Position() diag.Pos    { return n.Pos }
-func (n *BoolLit) Position() diag.Pos   { return n.Pos }
-func (n *Ident) Position() diag.Pos     { return n.Pos }
-func (n *Selector) Position() diag.Pos  { return n.Pos }
-func (n *StructLit) Position() diag.Pos { return n.Pos }
-func (n *Ref) Position() diag.Pos       { return n.Pos }
-func (n *Index) Position() diag.Pos     { return n.Pos }
-func (n *Instance) Position() diag.Pos  { return n.Pos }
-func (n *Closure) Position() diag.Pos   { return n.Pos }
-func (n *Slicing) Position() diag.Pos   { return n.Pos }
-func (n *SliceLit) Position() diag.Pos  { return n.Pos }
-func (n *Interp) Position() diag.Pos    { return n.Pos }
-func (n *MapLit) Position() diag.Pos    { return n.Pos }
-func (n *ForIn) Position() diag.Pos     { return n.Pos }
-func (n *Unary) Position() diag.Pos     { return n.Pos }
-func (n *Binary) Position() diag.Pos    { return n.Pos }
-func (n *Call) Position() diag.Pos      { return n.Pos }
-func (n *If) Position() diag.Pos        { return n.Pos }
-func (n *Match) Position() diag.Pos     { return n.Pos }
-func (n *Try) Position() diag.Pos       { return n.Pos }
-func (n *Catch) Position() diag.Pos     { return n.Pos }
+func (n *File) Position() diag.Pos        { return diag.Start(n.Path) }
+func (n *Import) Position() diag.Pos      { return n.Pos }
+func (n *Extern) Position() diag.Pos      { return n.Pos }
+func (n *Func) Position() diag.Pos        { return n.Pos }
+func (n *Param) Position() diag.Pos       { return n.Pos }
+func (n *TypeParam) Position() diag.Pos   { return n.Pos }
+func (n *TypeName) Position() diag.Pos    { return n.Pos }
+func (n *StructDecl) Position() diag.Pos  { return n.Pos }
+func (n *EnumDecl) Position() diag.Pos    { return n.Pos }
+func (n *FieldDecl) Position() diag.Pos   { return n.Pos }
+func (n *VariantDecl) Position() diag.Pos { return n.Pos }
+func (n *FieldInit) Position() diag.Pos   { return n.Pos }
+func (n *SelectCase) Position() diag.Pos  { return n.Pos }
+func (n *Pattern) Position() diag.Pos     { return n.Pos }
+func (n *Binding) Position() diag.Pos     { return n.Pos }
+func (n *Block) Position() diag.Pos       { return n.Pos }
+func (n *Let) Position() diag.Pos         { return n.Pos }
+func (n *Assign) Position() diag.Pos      { return n.Pos }
+func (n *ExprStmt) Position() diag.Pos    { return n.X.Position() }
+func (n *For) Position() diag.Pos         { return n.Pos }
+func (n *Break) Position() diag.Pos       { return n.Pos }
+func (n *Continue) Position() diag.Pos    { return n.Pos }
+func (n *Return) Position() diag.Pos      { return n.Pos }
+func (n *Fail) Position() diag.Pos        { return n.Pos }
+func (n *Defer) Position() diag.Pos       { return n.Pos }
+func (n *Spawn) Position() diag.Pos       { return n.Pos }
+func (n *Send) Position() diag.Pos        { return n.Pos }
+func (n *Select) Position() diag.Pos      { return n.Pos }
+func (n *Subject) Position() diag.Pos     { return n.Pos }
+func (n *Receiver) Position() diag.Pos    { return n.X.Position() }
+func (n *IntLit) Position() diag.Pos      { return n.Pos }
+func (n *FloatLit) Position() diag.Pos    { return n.Pos }
+func (n *StrLit) Position() diag.Pos      { return n.Pos }
+func (n *BoolLit) Position() diag.Pos     { return n.Pos }
+func (n *Ident) Position() diag.Pos       { return n.Pos }
+func (n *Selector) Position() diag.Pos    { return n.Pos }
+func (n *StructLit) Position() diag.Pos   { return n.Pos }
+func (n *Ref) Position() diag.Pos         { return n.Pos }
+func (n *Index) Position() diag.Pos       { return n.Pos }
+func (n *Instance) Position() diag.Pos    { return n.Pos }
+func (n *Closure) Position() diag.Pos     { return n.Pos }
+func (n *Slicing) Position() diag.Pos     { return n.Pos }
+func (n *SliceLit) Position() diag.Pos    { return n.Pos }
+func (n *Interp) Position() diag.Pos      { return n.Pos }
+func (n *MapLit) Position() diag.Pos      { return n.Pos }
+func (n *ForIn) Position() diag.Pos       { return n.Pos }
+func (n *Unary) Position() diag.Pos       { return n.Pos }
+func (n *Binary) Position() diag.Pos      { return n.Pos }
+func (n *Call) Position() diag.Pos        { return n.Pos }
+func (n *If) Position() diag.Pos          { return n.Pos }
+func (n *Match) Position() diag.Pos       { return n.Pos }
+func (n *Try) Position() diag.Pos         { return n.Pos }
+func (n *Catch) Position() diag.Pos       { return n.Pos }
 
 func (*Let) stmt()      {}
 func (*Assign) stmt()   {}

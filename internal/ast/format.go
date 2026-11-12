@@ -3,6 +3,8 @@ package ast
 import (
 	"fmt"
 	"strings"
+
+	"lowlang/internal/types"
 )
 
 func (t *TypeName) String() string {
@@ -46,11 +48,15 @@ func (t *TypeName) funcString() string {
 }
 
 func TypeNames(list []*TypeName) string {
+	return strings.Join(typeTexts(list), ", ")
+}
+
+func typeTexts(list []*TypeName) []string {
 	texts := make([]string, len(list))
 	for i, t := range list {
 		texts[i] = t.String()
 	}
-	return strings.Join(texts, ", ")
+	return texts
 }
 
 func Results(result, errName *TypeName) string {
@@ -99,9 +105,28 @@ func (p *Param) String() string {
 }
 
 func (f *Func) String() string {
+	head, params, tail := f.parts(false)
+	return fmt.Sprintf("%s%s%s", head, strings.Join(params, ", "), tail)
+}
+
+func (f *Func) Signature() string {
+	head, params, tail := f.SignatureParts()
+	return fmt.Sprintf("%s%s%s", head, strings.Join(params, ", "), tail)
+}
+
+func (f *Func) SignatureParts() (string, []string, string) {
+	return f.Source().parts(true)
+}
+
+func (f *Func) parts(resolved bool) (string, []string, string) {
 	params := make([]string, 0, len(f.Params)+1)
-	for _, p := range f.Params {
-		params = append(params, p.String())
+	for i, p := range f.Params {
+		text := p.String()
+		if resolved && i < len(f.ParamTypes) {
+			text = types.ParamText(f.ParamTypes[i], p.Mut)
+			text = fmt.Sprintf("%s: %s", p.Name, text)
+		}
+		params = append(params, text)
 	}
 	if f.Variadic {
 		params = append(params, "...")
@@ -110,12 +135,80 @@ func (f *Func) String() string {
 	if f.Extern != nil {
 		b.WriteString("extern ")
 	}
-	b.WriteString("fn ")
-	b.WriteString(f.Name)
-	b.WriteString(TypeParams(f.TypeParams))
-	b.WriteString("(")
-	b.WriteString(strings.Join(params, ", "))
-	b.WriteString(")")
-	b.WriteString(Results(f.Result, f.Error))
+	fmt.Fprintf(&b, "fn %s%s(", f.Name, TypeParams(f.TypeParams))
+	tail := Results(f.Result, f.Error)
+	if resolved && f.RetType != nil {
+		tail = types.ReturnText(f.RetType)
+	}
+	return b.String(), params, fmt.Sprintf(")%s", tail)
+}
+
+func (d *StructDecl) String() string {
+	return d.render(false)
+}
+
+func (d *StructDecl) Interface() string {
+	return d.render(true)
+}
+
+func (d *StructDecl) render(public bool) string {
+	var b strings.Builder
+	if d.C {
+		b.WriteString("extern ")
+	}
+	if public {
+		b.WriteString("pub ")
+	}
+	fmt.Fprintf(&b, "struct %s%s {\n", d.Name, TypeParams(d.TypeParams))
+	hidden := false
+	for _, f := range d.Fields {
+		switch {
+		case public && !f.Pub:
+			hidden = true
+		case public:
+			writeDoc(&b, f.Doc)
+			fmt.Fprintf(&b, "    pub %s: %s\n", f.Name, f.TypeName)
+		default:
+			fmt.Fprintf(&b, "    %s: %s\n", f.Name, f.TypeName)
+		}
+	}
+	if hidden {
+		b.WriteString("    ...\n")
+	}
+	b.WriteString("}")
 	return b.String()
+}
+
+func (d *EnumDecl) String() string {
+	return d.render(false)
+}
+
+func (d *EnumDecl) Interface() string {
+	return d.render(true)
+}
+
+func (d *EnumDecl) render(public bool) string {
+	var b strings.Builder
+	if public {
+		b.WriteString("pub ")
+	}
+	fmt.Fprintf(&b, "enum %s%s {\n", d.Name, TypeParams(d.TypeParams))
+	for _, v := range d.Variants {
+		if public {
+			writeDoc(&b, v.Doc)
+		}
+		fmt.Fprintf(&b, "    %s\n", v)
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
+func writeDoc(b *strings.Builder, doc string) {
+	for line := range strings.Lines(doc) {
+		fmt.Fprintf(b, "%s\n", strings.TrimRight(fmt.Sprintf("    /// %s", line), " \n"))
+	}
+}
+
+func (v *VariantDecl) Params() []string {
+	return typeTexts(v.Fields)
 }

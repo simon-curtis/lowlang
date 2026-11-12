@@ -223,33 +223,38 @@ func StructOf(t *Type) *Type {
 	return t
 }
 
-func newFunc(params []*Type, muts []bool, ret *Type, c bool) *Type {
-	var b strings.Builder
-	if c {
-		b.WriteString("extern ")
+func ParamText(p *Type, mut bool) string {
+	if mut {
+		return fmt.Sprintf("mut %s", p)
 	}
-	b.WriteString("fn(")
-	for i, p := range params {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		if muts[i] {
-			b.WriteString("mut ")
-		}
-		b.WriteString(p.String())
-	}
-	b.WriteString(")")
+	return p.String()
+}
+
+func ReturnText(ret *Type) string {
 	switch {
 	case ret.Kind == ResultKind && ret.Ok == Void:
-		fmt.Fprintf(&b, " %s", ret)
+		return fmt.Sprintf(" %s", ret)
 	case ret != Void:
-		fmt.Fprintf(&b, " -> %s", ret)
+		return fmt.Sprintf(" -> %s", ret)
 	}
+	return ""
+}
+
+func newFunc(params []*Type, muts []bool, ret *Type, c bool) *Type {
+	texts := make([]string, len(params))
+	for i, p := range params {
+		texts[i] = ParamText(p, muts[i])
+	}
+	prefix := "fn"
+	if c {
+		prefix = "extern fn"
+	}
+	name := fmt.Sprintf("%s(%s)%s", prefix, strings.Join(texts, ", "), ReturnText(ret))
 	size := 2
 	if c {
 		size = 1
 	}
-	return &Type{Kind: FuncKind, Name: b.String(), Params: params, Muts: muts, Ret: ret, C: c, size: size}
+	return &Type{Kind: FuncKind, Name: name, Params: params, Muts: muts, Ret: ret, C: c, size: size}
 }
 
 func newRaw(elem *Type) *Type {
