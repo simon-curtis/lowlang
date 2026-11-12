@@ -309,12 +309,12 @@ func (b *builder) sleepCall(e *ast.Call) []*Value {
 }
 
 func (b *builder) waitReadableCall(e *ast.Call) []*Value {
-	b.runtime(rtWaitFd, b.word(e.Args[0]), b.constant(1))
+	b.runtime(rtWaitRead, b.word(e.Args[0]))
 	return nil
 }
 
 func (b *builder) waitWritableCall(e *ast.Call) []*Value {
-	b.runtime(rtWaitFd, b.word(e.Args[0]), b.constant(4))
+	b.runtime(rtWaitWrite, b.word(e.Args[0]))
 	return nil
 }
 

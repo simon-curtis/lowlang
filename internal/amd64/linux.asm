@@ -124,6 +124,7 @@ rt_env_byte:
 	xor eax, eax
 	ret
 
+rt_mmap_stack:
 rt_mmap:
 	xor edi, edi
 	mov edx, 3
@@ -268,18 +269,6 @@ rt_futex_wake:
 	mov rdx, rsi
 	mov esi, 129
 	syscall
-	ret
-
-rt_mmap_stack:
-	mov edx, 3
-	mov r10d, 0x4022
-	mov r8, -1
-	xor r9d, r9d
-	xor edi, edi
-	mov eax, 9
-	syscall
-	cmp rax, -4096
-	ja rt_panic_oom
 	ret
 
 rt_os_stack:
@@ -598,8 +587,18 @@ rt_netpoll:
 	pop rbx
 	ret
 
-	.globl rt_wait_fd
-rt_wait_fd:
+	.set EPOLLIN, 1
+	.set EPOLLOUT, 4
+
+	.globl rt_wait_readable
+rt_wait_readable:
+	mov esi, EPOLLIN
+	jmp rt_wait_epoll
+
+	.globl rt_wait_writable
+rt_wait_writable:
+	mov esi, EPOLLOUT
+rt_wait_epoll:
 	ENTER_RT
 	push rdi
 	push rsi

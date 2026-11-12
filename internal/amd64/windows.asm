@@ -290,7 +290,7 @@ rt_os_stack:
 	test rax, rax
 	jz 1f
 	lea rax, [rbx+G_MAP-STACK_COMMIT]
-	mov [rbx+GUARD+STACK+G_LIMIT], rax
+	mov [rbx+G_RECORD+G_LIMIT], rax
 	mov rax, rbx
 	OS_LEAVE
 	ret
@@ -530,8 +530,10 @@ rt_wait_done:
 	add rsp, 40
 	ret
 
-	.globl rt_wait_fd
-rt_wait_fd:
+	.globl rt_wait_readable
+	.globl rt_wait_writable
+rt_wait_readable:
+rt_wait_writable:
 	ENTER_RT
 	push rbx
 	push rdi

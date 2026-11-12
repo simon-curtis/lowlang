@@ -403,7 +403,7 @@ rt_galloc:
 	call rt_spin_unlock
 	call rt_os_stack
 	mov rbx, rax
-	lea rax, [rbx+GUARD+STACK]
+	lea rax, [rbx+G_RECORD]
 	mov [rax+G_HI], rax
 	mov [rax+G_LO], rbx
 	mov rbx, rax
