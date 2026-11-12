@@ -1,5 +1,8 @@
+import std/bits
+import std/compress/codec
 import std/hash
 import std/io
+import std/math
 
 struct Params {
     wlog: i64
@@ -16,22 +19,25 @@ struct Params {
 ///
 /// `encode` takes input in any chunking, `flush` writes the buffered input as blocks, and `finish` writes the last block and the content checksum. The frame carries no content size. A chunk is valid only during the call to `sink`.
 pub struct Encoder {
+    core: *Framer
     sink: fn([]u8) ! io.Error
+}
+
+struct Framer {
     p: Params
     window: i64
     hist: []u8
     fill: i64
     pos: i64
     next_insert: i64
-    short: *Chain
-    long: *Chain
+    short: *codec.Chain
+    long: *codec.Chain
     content_size: i64
     started: bool
     sum: *hash.Xxh64
     reps: []i64
     saved: []i64
-    m_len: i64
-    m_off: i64
+    m: *codec.Match
     lits: []u8
     nlit: i64
     seq_ll: []i32
@@ -41,9 +47,9 @@ pub struct Encoder {
     ll_codes: []u8
     ml_codes: []u8
     of_codes: []u8
-    out: BitOut
-    body: BitOut
-    tmp: BitOut
+    out: *codec.Buffer
+    body: *codec.Buffer
+    tmp: *codec.Buffer
     huff: *HuffEnc
     codes: *Codes
     counts: []i64
@@ -56,24 +62,16 @@ pub struct Encoder {
     of_pre: *FseEnc
 }
 
-fn min(a: i64, b: i64) -> i64 {
-    if a < b { a } else { b }
-}
-
-fn max(a: i64, b: i64) -> i64 {
-    if a > b { a } else { b }
-}
-
 fn params(level: i64, content_size: i64) -> Params {
-    let l = max(1, min(level, 22))
+    let l = math.max(1, math.min(level, 22))
     let depths = [1, 2, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640, 768, 896, 1024, 1024, 1024]
-    var wlog = min(18 + l, 23)
-    var hlog = min(15 + (l + 1) / 2, 21)
-    var clog = min(15 + l / 2 + 1, 22)
+    var wlog = math.min(18 + l, 23)
+    var hlog = math.min(15 + (l + 1) / 2, 21)
+    var clog = math.min(15 + l / 2 + 1, 22)
     if content_size >= 0 {
-        wlog = max(10, min(wlog, highbit(u64(max(content_size, 2) - 1)) + 1))
-        hlog = min(hlog, wlog + 1)
-        clog = min(clog, wlog)
+        wlog = math.max(10, math.min(wlog, bits.bit_length(u64(math.max(content_size, 2) - 1))))
+        hlog = math.min(hlog, wlog + 1)
+        clog = math.min(clog, wlog)
     }
     Params {
         wlog
@@ -82,7 +80,7 @@ fn params(level: i64, content_size: i64) -> Params {
         depth: depths[l - 1]
         lazy: if l < 3 { 0 } else if l < 6 { 1 } else { 2 }
         minm: if l < 3 { 5 } else { 4 }
-        nice: min(16 * l + 16, 1024)
+        nice: math.min(16 * l + 16, 1024)
         skip: if l < 3 { 6 } else { 8 }
     }
 }
@@ -91,33 +89,31 @@ fn params(level: i64, content_size: i64) -> Params {
 ///
 /// `level` is clamped to `1..22`; the window is at most 8 MiB and higher levels search more candidates.
 pub fn encoder(level: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
-    make_encoder(level, sink, -1)
+    new(Encoder { core: framer(level, -1, 1024), sink })
 }
 
-fn make_encoder(level: i64, sink: fn([]u8) ! io.Error, content_size: i64) -> *Encoder {
+fn framer(level: i64, content_size: i64, capacity: i64) -> *Framer {
     let p = params(level, content_size)
     let window = 1 << p.wlog
-    let span = if content_size >= 0 && content_size < 1 << 30 { max(content_size, 1) } else { 2 * window + 2 * block_size() }
+    let span = if content_size >= 0 && content_size < 1 << 30 { math.max(content_size, 1) } else { 2 * window + 2 * block_size() }
     let ll_norm = ll_default()
     let ml_norm = ml_default()
     let of_norm = of_default()
-    new(Encoder {
-        sink
+    new(Framer {
         p
         window
         hist: __make(span)
         fill: 0
         pos: 0
         next_insert: 0
-        short: chain(p.minm, p.hlog, p.clog)
-        long: chain(8, p.hlog, p.clog)
+        short: codec.chain(p.minm, p.hlog, p.clog)
+        long: codec.chain(8, p.hlog, p.clog)
         content_size
         started: false
         sum: hash.xxh64_new(0)
         reps: [1, 4, 8]
         saved: [1, 4, 8]
-        m_len: 0
-        m_off: 0
+        m: new(codec.Match { len: 0, off: 0 })
         lits: __make(block_size())
         nlit: 0
         seq_ll: __make(block_size() / 3 + 1)
@@ -127,9 +123,9 @@ fn make_encoder(level: i64, sink: fn([]u8) ! io.Error, content_size: i64) -> *En
         ll_codes: __make(block_size() / 3 + 1)
         ml_codes: __make(block_size() / 3 + 1)
         of_codes: __make(block_size() / 3 + 1)
-        out: bit_out(1024)
-        body: bit_out(block_size() + 1024)
-        tmp: bit_out(256)
+        out: codec.buffer(capacity)
+        body: codec.buffer(block_size() + 1024)
+        tmp: codec.buffer(256)
         huff: huff_encoder()
         codes: codes()
         counts: __make(64)
@@ -143,98 +139,44 @@ fn make_encoder(level: i64, sink: fn([]u8) ! io.Error, content_size: i64) -> *En
     })
 }
 
-struct Chain {
-    head: []i32
-    links: []i32
-    shift_in: i64
-    shift_out: i64
-}
-
-fn chain(width: i64, hlog: i64, clog: i64) -> *Chain {
-    new(Chain { head: __make(1 << hlog), links: __make(1 << clog), shift_in: 64 - 8 * width, shift_out: 64 - hlog })
-}
-
-fn hash_at(c: *Chain, hist: []u8, i: i64) -> i64 {
-    let v = load64(hist, i) << c.shift_in
-    i64(v * 0x9E3779B185EBCA87 >> c.shift_out)
-}
-
-fn link(c: *Chain, hist: []u8, i: i64) {
-    let h = hash_at(c, hist, i)
-    c.links[i & (c.links.len - 1)] = c.head[h]
-    c.head[h] = i32(i + 1)
-}
-
-fn insert_to(e: *Encoder, target: i64) {
+fn insert_to(e: *Framer, target: i64) {
     let hist = e.hist
     for i in e.next_insert..target {
-        link(e.short, hist, i)
-        link(e.long, hist, i)
+        codec.link(e.short, hist, i)
+        codec.link(e.long, hist, i)
     }
     if target > e.next_insert {
         e.next_insert = target
     }
 }
 
-fn match_len(hist: []u8, a: i64, b: i64, end: i64) -> i64 {
-    var n = 0
-    let most = end - a
-    for n < most && hist[a + n] == hist[b + n] {
-        n += 1
-    }
-    n
-}
-
-fn walk(e: *Encoder, c: *Chain, p: i64, end: i64, tries: i64) {
-    let hist = e.hist
-    let links = c.links
-    let mask = links.len - 1
-    let floor = max(-1, max(p - e.window, p - links.len))
-    let most = end - p
-    var best = e.m_len
-    var cand = i64(c.head[hash_at(c, hist, p)]) - 1
-    var left = tries
-    for left > 0 && cand > floor && best < most && best < e.p.nice {
-        if hist[cand + best] == hist[p + best] {
-            let n = match_len(hist, p, cand, end)
-            if n > best {
-                best = n
-                e.m_len = n
-                e.m_off = p - cand
-            }
-        }
-        cand = i64(links[cand & mask]) - 1
-        left -= 1
-    }
-}
-
-fn find(e: *Encoder, p: i64, end: i64) {
+fn find(e: *Framer, p: i64, end: i64) {
     insert_to(e, p)
     let hist = e.hist
-    e.m_len = e.p.minm - 1
-    e.m_off = 0
+    e.m.len = e.p.minm - 1
+    e.m.off = 0
     for k in 0..2 {
         let r = e.reps[k]
         if r <= p && r < e.window && hist[p] == hist[p - r] {
-            let n = match_len(hist, p, p - r, end)
-            if n > e.m_len {
-                e.m_len = n
-                e.m_off = r
+            let n = codec.match_length(hist, p, p - r, end - p)
+            if n > e.m.len {
+                e.m.len = n
+                e.m.off = r
             }
         }
     }
-    walk(e, e.long, p, end, e.p.depth)
-    walk(e, e.short, p, end, max(2, e.p.depth / 4))
-    if e.m_len < e.p.minm {
-        e.m_len = 0
+    codec.walk(e.long, hist, p, end, e.window, e.p.nice, e.p.depth, e.m)
+    codec.walk(e.short, hist, p, end, e.window, e.p.nice, math.max(2, e.p.depth / 4), e.m)
+    if e.m.len < e.p.minm {
+        e.m.len = 0
     }
 }
 
 fn gain(len: i64, off: i64) -> i64 {
-    4 * len - highbit(u64(off + 1))
+    4 * len + 1 - bits.bit_length(u64(off + 1))
 }
 
-fn encode_offset(e: *Encoder, ll: i64, off: i64) -> i64 {
+fn encode_offset(e: *Framer, ll: i64, off: i64) -> i64 {
     let reps = e.reps
     if ll > 0 {
         if off == reps[0] {
@@ -276,12 +218,12 @@ fn encode_offset(e: *Encoder, ll: i64, off: i64) -> i64 {
     off + 3
 }
 
-fn add_literals(e: *Encoder, from: i64, to: i64) {
+fn add_literals(e: *Framer, from: i64, to: i64) {
     io.copy(e.lits[e.nlit..], e.hist[from..to])
     e.nlit += to - from
 }
 
-fn add_sequence(e: *Encoder, anchor: i64, p: i64, off: i64, len: i64) {
+fn add_sequence(e: *Framer, anchor: i64, p: i64, off: i64, len: i64) {
     add_literals(e, anchor, p)
     let ll = p - anchor
     let k = e.nseq
@@ -291,7 +233,7 @@ fn add_sequence(e: *Encoder, anchor: i64, p: i64, off: i64, len: i64) {
     e.nseq = k + 1
 }
 
-fn parse(e: *Encoder, start: i64, end: i64) {
+fn parse(e: *Framer, start: i64, end: i64) {
     e.nlit = 0
     e.nseq = 0
     let hist = e.hist
@@ -300,8 +242,8 @@ fn parse(e: *Encoder, start: i64, end: i64) {
     var p = start
     for p < limit {
         find(e, p, end)
-        var len = e.m_len
-        var off = e.m_off
+        var len = e.m.len
+        var off = e.m.off
         if len == 0 {
             p += 1 + ((p - anchor) >> e.p.skip)
             continue
@@ -309,12 +251,12 @@ fn parse(e: *Encoder, start: i64, end: i64) {
         var step = 0
         for step < e.p.lazy && len < e.p.nice && p + 1 < limit {
             find(e, p + 1, end)
-            if e.m_len == 0 || gain(e.m_len, e.m_off) <= gain(len, off) + 4 {
+            if e.m.len == 0 || gain(e.m.len, e.m.off) <= gain(len, off) + 4 {
                 break
             }
             p += 1
-            len = e.m_len
-            off = e.m_off
+            len = e.m.len
+            off = e.m.off
             step += 1
         }
         for p > anchor && p - off > 0 && hist[p - 1] == hist[p - 1 - off] {
@@ -328,22 +270,22 @@ fn parse(e: *Encoder, start: i64, end: i64) {
     add_literals(e, anchor, end)
 }
 
-fn lit_header(mut w: BitOut, kind: i64, n: i64) {
+fn lit_header(w: *codec.Buffer, kind: i64, n: i64) {
     if n < 32 {
-        put_byte(mut w, u8(kind | n << 3))
+        codec.put_byte(w, u8(kind | n << 3))
     } else if n < 4096 {
-        put_le(mut w, kind | 1 << 2 | n << 4, 2)
+        codec.put_le(w, kind | 1 << 2 | n << 4, 2)
     } else {
-        put_le(mut w, kind | 3 << 2 | n << 4, 3)
+        codec.put_le(w, kind | 3 << 2 | n << 4, 3)
     }
 }
 
-fn raw_literals(e: *Encoder) {
-    lit_header(mut e.body, 0, e.nlit)
-    put_bytes(mut e.body, e.lits[..e.nlit])
+fn raw_literals(e: *Framer) {
+    lit_header(e.body, 0, e.nlit)
+    codec.put_bytes(e.body, e.lits[..e.nlit])
 }
 
-fn write_literals(e: *Encoder) {
+fn write_literals(e: *Framer) {
     let n = e.nlit
     let lits = e.lits[..n]
     if n == 0 {
@@ -353,8 +295,8 @@ fn write_literals(e: *Encoder) {
     let h = e.huff
     let distinct = huff_count(h, lits)
     if distinct == 1 {
-        lit_header(mut e.body, 1, n)
-        put_byte(mut e.body, lits[0])
+        lit_header(e.body, 1, n)
+        codec.put_byte(e.body, lits[0])
         return
     }
     if n < 64 {
@@ -369,23 +311,23 @@ fn write_literals(e: *Encoder) {
     let four = n >= 256
     let head = if n <= 1023 { 3 } else if n <= 16383 { 4 } else { 5 }
     let start = e.body.len
-    put_le(mut e.body, 0, head)
-    put_bytes(mut e.body, h.table.buf[..h.table.len])
+    codec.put_le(e.body, 0, head)
+    codec.put_bytes(e.body, codec.contents(h.table))
     if four {
         let jump = e.body.len
-        put_le(mut e.body, 0, 6)
+        codec.put_le(e.body, 0, 6)
         let seg = (n + 3) / 4
         for k in 0..4 {
             let from = k * seg
             let to = if k == 3 { n } else { from + seg }
             let s0 = e.body.len
-            huff_encode(h, mut e.body, lits[from..to])
+            huff_encode(h, e.body, lits[from..to])
             if k < 3 {
-                io.set_le16(e.body.buf, jump + 2 * k, e.body.len - s0)
+                io.set_le16(e.body.data, jump + 2 * k, e.body.len - s0)
             }
         }
     } else {
-        huff_encode(h, mut e.body, lits)
+        huff_encode(h, e.body, lits)
     }
     let comp = e.body.len - start - head
     if comp >= n {
@@ -397,11 +339,11 @@ fn write_literals(e: *Encoder) {
     let width = if head == 3 { 10 } else if head == 4 { 14 } else { 18 }
     let header = 2 | format << 2 | n << 4 | comp << (4 + width)
     for i in 0..head {
-        e.body.buf[start + i] = u8(header >> (8 * i))
+        e.body.data[start + i] = u8(header >> (8 * i))
     }
 }
 
-fn choose(e: *Encoder, symbols: []u8, n: i64, max_log: i64, norm_default: []i32, log_default: i64, pre: *FseEnc, mut mode: i64) -> *FseEnc {
+fn choose(e: *Framer, symbols: []u8, n: i64, max_log: i64, norm_default: []i32, log_default: i64, pre: *FseEnc, mut mode: i64) -> *FseEnc {
     let counts = e.counts
     for s in 0..64 {
         counts[s] = 0
@@ -416,34 +358,34 @@ fn choose(e: *Encoder, symbols: []u8, n: i64, max_log: i64, norm_default: []i32,
     }
     if counts[top] == n {
         mode = 1
-        put_byte(mut e.body, u8(top))
+        codec.put_byte(e.body, u8(top))
         return fse_rle_encoder()
     }
     let pre_cost = fse_cost(counts, top + 1, norm_default, norm_default.len, log_default)
     let log = optimal_log(max_log, n, top)
     normalize(counts, top + 1, n, log, e.norm)
-    reset_bits(mut e.tmp)
-    write_ncount(mut e.tmp, e.norm, top + 1, log)
+    codec.reset(e.tmp)
+    write_ncount(e.tmp, e.norm, top + 1, log)
     let own_cost = fse_cost(counts, top + 1, e.norm, top + 1, log) + 8 * e.tmp.len
     if pre_cost <= own_cost {
         mode = 0
         return pre
     }
     mode = 2
-    put_bytes(mut e.body, e.tmp.buf[..e.tmp.len])
+    codec.put_bytes(e.body, codec.contents(e.tmp))
     fse_encoder(e.norm, top + 1, log)
 }
 
-fn write_sequences(e: *Encoder) {
+fn write_sequences(e: *Framer) {
     let n = e.nseq
     if n < 128 {
-        put_byte(mut e.body, u8(n))
+        codec.put_byte(e.body, u8(n))
     } else if n < 0x7F00 {
-        put_byte(mut e.body, u8((n >> 8) + 128))
-        put_byte(mut e.body, u8(n))
+        codec.put_byte(e.body, u8((n >> 8) + 128))
+        codec.put_byte(e.body, u8(n))
     } else {
-        put_byte(mut e.body, 255)
-        put_le(mut e.body, n - 0x7F00, 2)
+        codec.put_byte(e.body, 255)
+        codec.put_le(e.body, n - 0x7F00, 2)
     }
     if n == 0 {
         return
@@ -452,17 +394,17 @@ fn write_sequences(e: *Encoder) {
     for i in 0..n {
         e.ll_codes[i] = u8(ll_code(codes, i64(e.seq_ll[i])))
         e.ml_codes[i] = u8(ml_code(codes, i64(e.seq_ml[i])))
-        e.of_codes[i] = u8(highbit(u64(e.seq_off[i])))
+        e.of_codes[i] = u8(bits.bit_length(u64(e.seq_off[i])) - 1)
     }
     let modes_at = e.body.len
-    put_byte(mut e.body, 0)
+    codec.put_byte(e.body, 0)
     var ll_mode = 0
     var of_mode = 0
     var ml_mode = 0
     let lle = choose(e, e.ll_codes, n, 9, e.ll_norm, 6, e.ll_pre, mut ll_mode)
     let ofe = choose(e, e.of_codes, n, 8, e.of_norm, 5, e.of_pre, mut of_mode)
     let mle = choose(e, e.ml_codes, n, 9, e.ml_norm, 6, e.ml_pre, mut ml_mode)
-    e.body.buf[modes_at] = u8(ll_mode << 6 | of_mode << 4 | ml_mode << 2)
+    e.body.data[modes_at] = u8(ll_mode << 6 | of_mode << 4 | ml_mode << 2)
     let ll_base = codes.ll_base
     let ll_bits = codes.ll_bits
     let ml_base = codes.ml_base
@@ -477,43 +419,43 @@ fn write_sequences(e: *Encoder) {
         let mlc = e.ml_codes[i]
         let ofc = i64(e.of_codes[i])
         if i < last {
-            sof = fse_encode(mut e.body, ofe, sof, ofc)
-            sml = fse_encode(mut e.body, mle, sml, i64(mlc))
-            sll = fse_encode(mut e.body, lle, sll, i64(llc))
+            sof = fse_encode(e.body, ofe, sof, ofc)
+            sml = fse_encode(e.body, mle, sml, i64(mlc))
+            sll = fse_encode(e.body, lle, sll, i64(llc))
         }
-        add_bits(mut e.body, u64(i64(e.seq_ll[i]) - i64(ll_base[llc])), i64(ll_bits[llc]))
-        add_bits(mut e.body, u64(i64(e.seq_ml[i]) + 3 - i64(ml_base[mlc])), i64(ml_bits[mlc]))
-        add_bits(mut e.body, u64(i64(e.seq_off[i]) - (1 << ofc)), ofc)
+        codec.put_bits(e.body, i64(e.seq_ll[i]) - i64(ll_base[llc]), i64(ll_bits[llc]))
+        codec.put_bits(e.body, i64(e.seq_ml[i]) + 3 - i64(ml_base[mlc]), i64(ml_bits[mlc]))
+        codec.put_bits(e.body, i64(e.seq_off[i]) - (1 << ofc), ofc)
         i -= 1
     }
-    fse_flush(mut e.body, mle, sml)
-    fse_flush(mut e.body, ofe, sof)
-    fse_flush(mut e.body, lle, sll)
-    close_bits(mut e.body)
+    fse_flush(e.body, mle, sml)
+    fse_flush(e.body, ofe, sof)
+    fse_flush(e.body, lle, sll)
+    close_bits(e.body)
 }
 
-fn start_frame(e: *Encoder) {
+fn start_frame(e: *Framer) {
     if e.started {
         return
     }
     e.started = true
-    put_le(mut e.out, 0xFD2FB528, 4)
+    codec.put_le(e.out, 0xFD2FB528, 4)
     let size = e.content_size
     if size < 0 {
-        put_byte(mut e.out, 0x04)
-        put_byte(mut e.out, u8((e.p.wlog - 10) << 3))
+        codec.put_byte(e.out, 0x04)
+        codec.put_byte(e.out, u8((e.p.wlog - 10) << 3))
     } else if size < 256 {
-        put_byte(mut e.out, 0x24)
-        put_byte(mut e.out, u8(size))
+        codec.put_byte(e.out, 0x24)
+        codec.put_byte(e.out, u8(size))
     } else if size < 65536 + 256 {
-        put_byte(mut e.out, 0x64)
-        put_le(mut e.out, size - 256, 2)
+        codec.put_byte(e.out, 0x64)
+        codec.put_le(e.out, size - 256, 2)
     } else if size < 1 << 32 {
-        put_byte(mut e.out, 0xA4)
-        put_le(mut e.out, size, 4)
+        codec.put_byte(e.out, 0xA4)
+        codec.put_le(e.out, size, 4)
     } else {
-        put_byte(mut e.out, 0xE4)
-        put_le(mut e.out, size, 8)
+        codec.put_byte(e.out, 0xE4)
+        codec.put_le(e.out, size, 8)
     }
 }
 
@@ -527,14 +469,14 @@ fn uniform(data: []u8) -> bool {
     true
 }
 
-fn compress_block(e: *Encoder, start: i64, end: i64, last: bool) {
+fn compress_block(e: *Framer, start: i64, end: i64, last: bool) {
     start_frame(e)
     let flag = if last { 1 } else { 0 }
     let size = end - start
     let data = e.hist[start..end]
     if size > 0 && uniform(data) {
-        put_le(mut e.out, flag | 1 << 1 | size << 3, 3)
-        put_byte(mut e.out, data[0])
+        codec.put_le(e.out, flag | 1 << 1 | size << 3, 3)
+        codec.put_byte(e.out, data[0])
         return
     }
     if size > 16 {
@@ -544,55 +486,33 @@ fn compress_block(e: *Encoder, start: i64, end: i64, last: bool) {
             saved[k] = reps[k]
         }
         parse(e, start, end)
-        reset_bits(mut e.body)
+        codec.reset(e.body)
         write_literals(e)
         write_sequences(e)
         if e.body.len < size {
-            put_le(mut e.out, flag | 2 << 1 | e.body.len << 3, 3)
-            put_bytes(mut e.out, e.body.buf[..e.body.len])
+            codec.put_le(e.out, flag | 2 << 1 | e.body.len << 3, 3)
+            codec.put_bytes(e.out, codec.contents(e.body))
             return
         }
         for k in 0..3 {
             reps[k] = saved[k]
         }
     }
-    put_le(mut e.out, flag | size << 3, 3)
-    put_bytes(mut e.out, data)
+    codec.put_le(e.out, flag | size << 3, 3)
+    codec.put_bytes(e.out, data)
 }
 
-fn drain(e: *Encoder) ! io.Error {
-    if e.out.len == 0 {
-        return
-    }
-    let chunk = e.out.buf[..e.out.len]
-    e.out.len = 0
-    e.sink(chunk)?
-}
-
-fn slide_history(e: *Encoder) {
+fn slide_history(e: *Framer) {
     let delta = e.pos - e.window
     io.copy(e.hist, e.hist[delta..e.fill])
     e.fill -= delta
     e.pos -= delta
-    e.next_insert = max(0, e.next_insert - delta)
-    for c in [e.short, e.long] {
-        shift_table(c.head, delta)
-        shift_table(c.links, delta)
-    }
+    e.next_insert = math.max(0, e.next_insert - delta)
+    codec.slide(e.short, delta)
+    codec.slide(e.long, delta)
 }
 
-fn shift_table(t: []i32, delta: i64) {
-    let d = i32(delta)
-    for i in 0..t.len {
-        let v = t[i] - d
-        t[i] = if v > 0 { v } else { 0 }
-    }
-}
-
-/// Compresses `data` and passes each completed block to the encoder's `sink`.
-///
-/// Input is buffered until a block is full, so a call can produce no output. Fails with any error `sink` returns.
-pub fn encode(e: *Encoder, data: []u8) ! io.Error {
+fn feed(e: *Framer, data: []u8) {
     var at = 0
     for at < data.len {
         if e.fill == e.hist.len {
@@ -605,8 +525,47 @@ pub fn encode(e: *Encoder, data: []u8) ! io.Error {
         for e.fill - e.pos > block_size() {
             compress_block(e, e.pos, e.pos + block_size(), false)
             e.pos += block_size()
-            drain(e)?
         }
+    }
+}
+
+fn sync(e: *Framer) {
+    for e.pos < e.fill {
+        let end = math.min(e.fill, e.pos + block_size())
+        compress_block(e, e.pos, end, false)
+        e.pos = end
+    }
+}
+
+fn close(e: *Framer) {
+    for {
+        let end = math.min(e.fill, e.pos + block_size())
+        compress_block(e, e.pos, end, end == e.fill)
+        e.pos = end
+        if end == e.fill {
+            break
+        }
+    }
+    codec.put_le(e.out, i64(hash.xxh64_sum(e.sum) & 0xFFFFFFFF), 4)
+}
+
+fn drain(e: *Encoder) ! io.Error {
+    let ready = codec.drain(e.core.out)
+    if ready.len > 0 {
+        e.sink(ready)?
+    }
+}
+
+/// Compresses `data` and passes each completed block to the encoder's `sink`.
+///
+/// Input is buffered until a block is full, so a call can produce no output. Fails with any error `sink` returns.
+pub fn encode(e: *Encoder, data: []u8) ! io.Error {
+    var rest = data
+    for rest.len > 0 {
+        let n = math.min(rest.len, block_size())
+        feed(e.core, rest[..n])
+        drain(e)?
+        rest = rest[n..]
     }
 }
 
@@ -614,11 +573,7 @@ pub fn encode(e: *Encoder, data: []u8) ! io.Error {
 ///
 /// Fails with any error `sink` returns.
 pub fn flush(e: *Encoder) ! io.Error {
-    for e.pos < e.fill {
-        let end = min(e.fill, e.pos + block_size())
-        compress_block(e, e.pos, end, false)
-        e.pos = end
-    }
+    sync(e.core)
     drain(e)?
 }
 
@@ -626,15 +581,7 @@ pub fn flush(e: *Encoder) ! io.Error {
 ///
 /// Fails with any error `sink` returns.
 pub fn finish(e: *Encoder) ! io.Error {
-    for {
-        let end = min(e.fill, e.pos + block_size())
-        compress_block(e, e.pos, end, end == e.fill)
-        e.pos = end
-        if end == e.fill {
-            break
-        }
-    }
-    put_le(mut e.out, i64(hash.xxh64_sum(e.sum) & 0xFFFFFFFF), 4)
+    close(e.core)
     drain(e)?
 }
 
@@ -642,14 +589,8 @@ pub fn finish(e: *Encoder) ! io.Error {
 ///
 /// `level` is clamped to `1..22`. The frame header records the content size and the window is reduced for small inputs.
 pub fn compress(data: []u8, level: i64) -> []u8 {
-    let c = new(Collector { data: __make(data.len / 2 + 64), len: 0 })
-    let sink: fn([]u8) ! io.Error = fn(chunk) { collect(c, chunk) }
-    let e = make_encoder(level, sink, data.len)
-    encode(e, data) catch {
-        _ => {}
-    }
-    finish(e) catch {
-        _ => {}
-    }
-    c.data[..c.len]
+    let e = framer(level, data.len, data.len / 2 + 64)
+    feed(e, data)
+    close(e)
+    codec.contents(e.out)
 }
