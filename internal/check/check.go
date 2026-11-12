@@ -1324,12 +1324,8 @@ func (c *Checker) selector(e *ast.Selector, want *types.Type) {
 
 func (c *Checker) fieldReference(e *ast.Selector, t *types.Type) {
 	f := c.field(t, e.Name, e.Pos)
-	serde, loaded := c.modules[serdeModule]
-	if !loaded || serde.generics["Field"] == nil {
-		c.fail(e.Pos, "%s.%s refers to a field and needs std/serde to be imported", t, e.Name)
-	}
 	e.Reference = f
-	e.Type = c.instantiateType(serde.generics["Field"], []*types.Type{t, f.Type}, e.Pos)
+	e.Type = c.serdeFieldType(t, f, e.Pos)
 }
 
 func (c *Checker) index(e *ast.Index) {

@@ -10,7 +10,10 @@ import (
 	"lowlang/internal/types"
 )
 
-const serdeModule = "std/serde"
+const (
+	serdeModule = "std/serde"
+	serdeField  = "Field"
+)
 
 type derivation int
 
@@ -43,6 +46,14 @@ func (c *Checker) serdeType(name string, pos lexer.Pos) *types.Type {
 		c.fail(pos, "%s has no type %s", serdeModule, name)
 	}
 	return t
+}
+
+func (c *Checker) serdeFieldType(owner *types.Type, f *types.Field, pos lexer.Pos) *types.Type {
+	serde, loaded := c.modules[serdeModule]
+	if !loaded || serde.generics[serdeField] == nil {
+		c.fail(pos, "%s.%s refers to a field and needs %s to be imported", owner, f.Name, serdeModule)
+	}
+	return c.instantiateType(serde.generics[serdeField], []*types.Type{owner, f.Type}, pos)
 }
 
 func (c *Checker) serializeCall(e *ast.Call) {
@@ -215,15 +226,15 @@ func (s *synth) serialize(t *types.Type) {
 	case t.Kind == types.SliceKind && t.Elem == types.U8:
 		s.line("w.binary(v)")
 	case t.Kind == types.SliceKind:
-		s.line("w.begin_seq(v.len)\nfor x in v {\n__serialize_into(w, mut path, x)\n}\nw.end_seq()")
+		s.line("w.begin_seq()\nfor x in v {\n__serialize_into(w, mut path, x)\n}\nw.end_seq()")
 	case t.Kind == types.MapKind:
-		s.line("w.begin_map(v.len)\nfor k, x in v {\nw.key(%s)\n__serialize_into(w, mut path, x)\n}\nw.end_map()", s.keyText(t.Key))
-	case t.Kind == types.EnumKind && t.Optional:
+		s.line("w.begin_map()\nfor k, x in v {\nw.key(%s)\n__serialize_into(w, mut path, x)\n}\nw.end_map()", s.keyCodec(t.Key).write)
+	case isOptional(t):
 		s.line("match v {\nsome(x) => __serialize_into(w, mut path, x)\nnone => w.null()\n}")
 	case t.Kind == types.PointerKind:
 		s.serializePointer(t)
 	case t.Kind == types.StructKind:
-		s.line("w.begin_struct(%s, %d)", quoted(t.Name), len(t.Fields))
+		s.line("w.begin_struct()")
 		for _, f := range t.Fields {
 			s.line("w.field(%s)\n__serialize_into(w, mut path, v.%s)", quoted(f.Name), f.Name)
 		}
@@ -242,15 +253,37 @@ func (s *synth) serializePointer(t *types.Type) {
 	}, "__serialize_into(w, mut path, *v)")
 }
 
-func (s *synth) keyText(k *types.Type) string {
+func isOptional(t *types.Type) bool {
+	return t.Kind == types.EnumKind && t.Optional
+}
+
+func required(t *types.Type, defaulted bool) bool {
+	return !defaulted && !isOptional(t)
+}
+
+type keyCodec struct {
+	write string
+	read  string
+}
+
+func (s *synth) keyCodec(k *types.Type) keyCodec {
+	text := keyCodec{write: `"{k}"`}
 	switch {
 	case k == types.Str:
-		return "k"
-	case k.Kind == types.IntKind || k == types.Bool:
-		return `"{k}"`
+		return keyCodec{write: "k", read: "key"}
+	case k == types.Bool:
+		text.read = "key_boolean(key, at)?"
+	case k == types.I64:
+		text.read = "key_integer(key, at)?"
+	case k == types.U64:
+		text.read = "key_unsigned(key, at)?"
+	case k.Kind == types.IntKind:
+		low, high := bounds(k)
+		text.read = fmt.Sprintf("%s(in_range(key_integer(key, at)?, %d, %d, at)?)", s.name(k), low, high)
+	default:
+		s.unsupported(k)
 	}
-	s.unsupported(k)
-	return ""
+	return text
 }
 
 func labelOf(v *types.Variant, i int) string {
@@ -268,7 +301,7 @@ func (s *synth) serializeEnum(t *types.Type) {
 	s.line("match v {")
 	for _, v := range t.Variants {
 		if len(v.Fields) == 0 {
-			s.line("%s => w.unit_variant(%s, %s)", v.Name, quoted(t.Name), quoted(v.Name))
+			s.line("%s => w.unit_variant(%s)", v.Name, quoted(v.Name))
 			continue
 		}
 		binds := make([]string, len(v.Fields))
@@ -276,15 +309,15 @@ func (s *synth) serializeEnum(t *types.Type) {
 			binds[i] = fmt.Sprintf("f%d", i)
 		}
 		s.line("%s(%s) => {", v.Name, strings.Join(binds, ", "))
-		s.line("w.begin_variant(%s, %s, %d)", quoted(t.Name), quoted(v.Name), len(v.Fields))
+		s.line("w.begin_variant(%s)", quoted(v.Name))
 		if labelled(v) {
-			s.line("w.begin_struct(%s, %d)", quoted(v.Name), len(v.Fields))
+			s.line("w.begin_struct()")
 			for i := range v.Fields {
 				s.line("w.field(%s)\n__serialize_into(w, mut path, f%d)", quoted(labelOf(v, i)), i)
 			}
 			s.line("w.end_struct()")
 		} else {
-			s.line("w.begin_seq(%d)", len(v.Fields))
+			s.line("w.begin_seq()")
 			for i := range v.Fields {
 				s.line("__serialize_into(w, mut path, f%d)", i)
 			}
@@ -314,7 +347,7 @@ func (s *synth) deserialize(t *types.Type) {
 		s.line("r.unsigned()?")
 	case t.Kind == types.IntKind:
 		low, high := bounds(t)
-		s.line("let at = r.position()\n%s(checked(r.integer()?, %d, %d, at)?)", self, low, high)
+		s.line("%s(integer_in(r, %d, %d)?)", self, low, high)
 	case t == types.F64:
 		s.line("r.float()?")
 	case t.Kind == types.FloatKind:
@@ -328,8 +361,8 @@ func (s *synth) deserialize(t *types.Type) {
 	case t.Kind == types.MapKind:
 		s.line("var out: %s = [:]\nr.begin_map()?\nfor {\nlet at = r.position()", self)
 		s.line("let key = match r.next_key()? {\nsome(k) => k\nnone => break\n}")
-		s.line("out[%s] = __deserialize[%s](r)?\n}\nout", s.keyValue(t.Key), s.name(t.Elem))
-	case t.Kind == types.EnumKind && t.Optional:
+		s.line("out[%s] = __deserialize[%s](r)?\n}\nout", s.keyCodec(t.Key).read, s.name(t.Elem))
+	case isOptional(t):
 		s.line("if r.null()? {\nreturn none\n}\n__deserialize[%s](r)?", s.name(t.Elem))
 	case t.Kind == types.PointerKind:
 		s.line("new(__deserialize[%s](r)?)", s.name(t.Elem))
@@ -342,80 +375,74 @@ func (s *synth) deserialize(t *types.Type) {
 	}
 }
 
-func (s *synth) keyValue(k *types.Type) string {
-	switch {
-	case k == types.Str:
-		return "key"
-	case k == types.Bool:
-		return "key_boolean(key, at)?"
-	case k == types.I64:
-		return "key_integer(key, at)?"
-	case k.Kind == types.IntKind && k != types.U64:
-		low, high := bounds(k)
-		return fmt.Sprintf("%s(checked(key_integer(key, at)?, %d, %d, at)?)", s.name(k), low, high)
-	}
-	s.unsupported(k)
-	return ""
+type member struct {
+	name      string
+	t         *types.Type
+	defaulted bool
 }
 
 type slot struct {
-	label    string
+	member
 	value    string
 	present  string
-	t        *types.Type
-	optional bool
+	required bool
 }
 
-func (s *synth) readFields(names []string, fieldTypes []*types.Type) []slot {
-	slots := make([]slot, len(names))
-	for i, n := range names {
-		slots[i] = slot{
-			label:    n,
-			value:    s.temp("value"),
-			present:  s.temp("seen"),
-			t:        fieldTypes[i],
-			optional: fieldTypes[i].Kind == types.EnumKind && fieldTypes[i].Optional,
-		}
-		s.line("var %s: %s = __zero()\nvar %s = false", slots[i].value, s.name(fieldTypes[i]), slots[i].present)
+func (s *synth) structMembers(t *types.Type) []member {
+	members := make([]member, len(t.Fields))
+	for i, f := range t.Fields {
+		members[i] = member{name: f.Name, t: f.Type, defaulted: s.c.fieldSources[f] != nil}
 	}
-	s.line("r.begin_map()?\nfor {\nlet key = match r.next_key()? {\nsome(k) => k\nnone => break\n}")
+	return members
+}
+
+func variantMembers(v *types.Variant) []member {
+	members := make([]member, len(v.Fields))
+	for i, f := range v.Fields {
+		members[i] = member{name: labelOf(v, i), t: f}
+	}
+	return members
+}
+
+func (s *synth) readFields(members []member) []slot {
+	slots := make([]slot, len(members))
+	for i, m := range members {
+		slots[i] = slot{member: m, value: s.temp("value"), present: s.temp("seen"), required: required(m.t, m.defaulted)}
+		s.line("var %s: %s = __zero()\nvar %s = false", slots[i].value, s.name(m.t), slots[i].present)
+	}
+	s.line("r.begin_map()?\nfor {\nlet key = match r.next_field()? {\nsome(k) => k\nnone => break\n}")
 	for i, sl := range slots {
 		prefix := "} else if"
 		if i == 0 {
 			prefix = "if"
 		}
-		s.line("%s key == %s {\n%s = __deserialize[%s](r)?\n%s = true", prefix, quoted(sl.label), sl.value, s.name(sl.t), sl.present)
+		s.line("%s key == %s {\n%s = __deserialize[%s](r)?\n%s = true", prefix, quoted(sl.name), sl.value, s.name(sl.t), sl.present)
 	}
 	if len(slots) == 0 {
 		s.line("r.skip()?\n}")
 	} else {
 		s.line("} else {\nr.skip()?\n}\n}")
 	}
+	for _, sl := range slots {
+		if sl.required {
+			s.line("if !%s {\nfail Missing(%s)\n}", sl.present, quoted(sl.name))
+		}
+	}
 	return slots
 }
 
 func (s *synth) deserializeStruct(t *types.Type) {
-	names := make([]string, len(t.Fields))
-	fieldTypes := make([]*types.Type, len(t.Fields))
-	for i, f := range t.Fields {
-		names[i], fieldTypes[i] = f.Name, f.Type
-	}
-	slots := s.readFields(names, fieldTypes)
+	slots := s.readFields(s.structMembers(t))
 	var inits []string
-	for i, f := range t.Fields {
-		sl := slots[i]
-		if s.c.fieldSources[f] != nil {
-			continue
+	for _, sl := range slots {
+		if !sl.defaulted {
+			inits = append(inits, fmt.Sprintf("%s: %s", sl.name, sl.value))
 		}
-		if !sl.optional {
-			s.line("if !%s {\nfail Missing(%s)\n}", sl.present, quoted(f.Name))
-		}
-		inits = append(inits, fmt.Sprintf("%s: %s", f.Name, sl.value))
 	}
 	s.line("var out = %s { %s }", s.name(t), strings.Join(inits, ", "))
-	for i, f := range t.Fields {
-		if s.c.fieldSources[f] != nil {
-			s.line("if %s {\nout.%s = %s\n}", slots[i].present, f.Name, slots[i].value)
+	for _, sl := range slots {
+		if sl.defaulted {
+			s.line("if %s {\nout.%s = %s\n}", sl.present, sl.name, sl.value)
 		}
 	}
 	s.line("out")
@@ -429,15 +456,7 @@ func (s *synth) deserializeEnum(t *types.Type) {
 		switch {
 		case len(v.Fields) == 0:
 		case labelled(v):
-			names := make([]string, len(v.Fields))
-			for i := range v.Fields {
-				names[i] = labelOf(v, i)
-			}
-			slots := s.readFields(names, v.Fields)
-			for i, sl := range slots {
-				if !sl.optional {
-					s.line("if !%s {\nfail Missing(%s)\n}", sl.present, quoted(sl.label))
-				}
+			for i, sl := range s.readFields(variantMembers(v)) {
 				args[i] = sl.value
 			}
 		default:
@@ -489,7 +508,7 @@ func (s *synth) schema(t *types.Type, stack []*types.Type) string {
 		}
 		inner := append(stack, t)
 		if t.Kind == types.StructKind {
-			return fmt.Sprintf("__S { kind: Struct, name: %s, fields: [%s] }", quoted(t.Name), s.schemaFields(t, inner))
+			return fmt.Sprintf("__S { kind: Struct, name: %s, fields: [%s] }", quoted(t.Name), s.schemaProperties(s.structMembers(t), inner))
 		}
 		return fmt.Sprintf("__S { kind: Enum, name: %s, variants: [%s] }", quoted(t.Name), s.schemaVariants(t, inner))
 	}
@@ -497,14 +516,10 @@ func (s *synth) schema(t *types.Type, stack []*types.Type) string {
 	return ""
 }
 
-func required(c *Checker, f *types.Field) bool {
-	return c.fieldSources[f] == nil && !(f.Type.Kind == types.EnumKind && f.Type.Optional)
-}
-
-func (s *synth) schemaFields(t *types.Type, stack []*types.Type) string {
-	parts := make([]string, len(t.Fields))
-	for i, f := range t.Fields {
-		parts[i] = fmt.Sprintf("Property { name: %s, schema: %s, required: %t }", quoted(f.Name), s.schema(f.Type, stack), required(s.c, f))
+func (s *synth) schemaProperties(members []member, stack []*types.Type) string {
+	parts := make([]string, len(members))
+	for i, m := range members {
+		parts[i] = fmt.Sprintf("Property { name: %s, schema: %s, required: %t }", quoted(m.name), s.schema(m.t, stack), required(m.t, m.defaulted))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -512,12 +527,7 @@ func (s *synth) schemaFields(t *types.Type, stack []*types.Type) string {
 func (s *synth) schemaVariants(t *types.Type, stack []*types.Type) string {
 	parts := make([]string, len(t.Variants))
 	for i, v := range t.Variants {
-		fields := make([]string, len(v.Fields))
-		for j, f := range v.Fields {
-			optional := f.Kind == types.EnumKind && f.Optional
-			fields[j] = fmt.Sprintf("Property { name: %s, schema: %s, required: %t }", quoted(labelOf(v, j)), s.schema(f, stack), !optional)
-		}
-		parts[i] = fmt.Sprintf("Variant { name: %s, labelled: %t, fields: [%s] }", quoted(v.Name), labelled(v), strings.Join(fields, ", "))
+		parts[i] = fmt.Sprintf("Variant { name: %s, labelled: %t, fields: [%s] }", quoted(v.Name), labelled(v), s.schemaProperties(variantMembers(v), stack))
 	}
 	return strings.Join(parts, ", ")
 }

@@ -1,0 +1,341 @@
+import std/base64
+
+/// A value in the shape that tree formats such as CBOR, MessagePack, TOML and YAML share.
+///
+/// `to_tree` builds one from any serialisable value, a format's reader builds one from its own value type for `tree_reader`, and a format converts between it and its value type. Integers are `Int` when they fit an `i64` and `Uint` only above `9223372036854775807`, so each integer has one form.
+pub enum Tree {
+    /// No value.
+    Null
+    /// A boolean.
+    Bool(value: bool)
+    /// An integer that fits an `i64`.
+    Int(value: i64)
+    /// An integer above `9223372036854775807`.
+    Uint(value: u64)
+    /// A floating point number.
+    Float(value: f64)
+    /// A string.
+    Text(value: str)
+    /// A byte string.
+    Binary(data: []u8)
+    /// A sequence of values.
+    Seq(items: []Node)
+    /// A map of entries in order.
+    Map(members: []Member)
+    /// An integer outside both `i64` and `u64`. A reader of a format that has one produces it; reading it as a number fails with `Range`.
+    Overflow
+    /// A value that has no meaning to serde, such as a tagged or extension value. A reader of a format that has one produces it; reading it fails with `Mismatch`. `to_tree` never produces it.
+    Opaque
+}
+
+/// A `Tree` and where it came from.
+pub struct Node {
+    /// The value.
+    pub tree: Tree
+    /// The position reported in errors for this value, such as a source line. `0` has the reader report the number of values it has read so far instead.
+    pub at: i64 = 0
+}
+
+/// An entry of a `Tree.Map`.
+pub struct Member {
+    /// The key. A tree built by `to_tree` has `Text` keys; a format's reader may have any scalar.
+    pub key: Node
+    /// The value for the key.
+    pub value: Node
+}
+
+/// Returns `n` as a `Tree`: `Int` when it fits an `i64` and `Uint` above `9223372036854775807`.
+pub fn unsigned_tree(n: u64) -> Tree {
+    if n > 0x7FFFFFFFFFFFFFFF {
+        return Tree.Uint(n)
+    }
+    Tree.Int(i64(n))
+}
+
+struct Build {
+    sequence: bool
+    items: []Node
+    members: []Member
+    key: str
+}
+
+struct Builder {
+    frames: []*Build
+    result: Node
+}
+
+fn deliver(b: *Builder, tree: Tree) {
+    let node = Node { tree }
+    if b.frames.len == 0 {
+        b.result = node
+        return
+    }
+    let top = b.frames[b.frames.len - 1]
+    if top.sequence {
+        push(mut top.items, node)
+    } else {
+        let key = Node { tree: Tree.Text(top.key) }
+        push(mut top.members, Member { key, value: node })
+    }
+}
+
+fn open(b: *Builder, sequence: bool, key: str) {
+    let items: []Node = []
+    let members: []Member = []
+    push(mut b.frames, new(Build { sequence, items, members, key }))
+}
+
+fn close(b: *Builder) {
+    let top = b.frames[b.frames.len - 1]
+    truncate(mut b.frames, b.frames.len - 1)
+    deliver(b, if top.sequence { Tree.Seq(top.items) } else { Tree.Map(top.members) })
+}
+
+fn set_key(b: *Builder, key: str) {
+    b.frames[b.frames.len - 1].key = key
+}
+
+fn tree_writer(b: *Builder) -> Writer {
+    Writer {
+        null: fn() { deliver(b, Tree.Null) }
+        boolean: fn(v) { deliver(b, Tree.Bool(v)) }
+        integer: fn(n) { deliver(b, Tree.Int(n)) }
+        unsigned: fn(n) { deliver(b, unsigned_tree(n)) }
+        float: fn(x) { deliver(b, Tree.Float(x)) }
+        text: fn(s) { deliver(b, Tree.Text(s)) }
+        binary: fn(data) { deliver(b, Tree.Binary(data)) }
+        begin_seq: fn() { open(b, true, "") }
+        end_seq: fn() { close(b) }
+        begin_map: fn() { open(b, false, "") }
+        key: fn(k) { set_key(b, k) }
+        end_map: fn() { close(b) }
+        begin_struct: fn() { open(b, false, "") }
+        field: fn(name) { set_key(b, name) }
+        end_struct: fn() { close(b) }
+        unit_variant: fn(name) { deliver(b, Tree.Text(name)) }
+        begin_variant: fn(name) { open(b, false, name) }
+        end_variant: fn() { close(b) }
+    }
+}
+
+/// Returns `v` as a `Tree`, through `write`.
+///
+/// A struct and a map become a `Map` with `Text` keys, a slice a `Seq`, a `[]u8` a `Binary`, a `none` optional `Null`, and an enum variant without fields a `Text` of its name. A variant with fields becomes a `Map` with one member named by the variant, whose value is a `Map` of its labelled fields or a `Seq` of its positional ones. Every node has `at` of `0`.
+pub fn to_tree[T](v: T) -> Node {
+    let b = new(Builder { frames: [], result: Node { tree: Tree.Null } })
+    write(v, tree_writer(b))
+    b.result
+}
+
+struct Frame {
+    items: []Node
+    members: []Member
+    index: i64
+}
+
+struct Cursor {
+    pending: Node?
+    frames: []*Frame
+    at: i64
+    base64_text: bool
+}
+
+fn take(c: *Cursor) -> Tree ! Error {
+    match c.pending {
+        some(n) => {
+            c.pending = none
+            if n.at > 0 {
+                c.at = n.at
+            } else {
+                c.at += 1
+            }
+            n.tree
+        }
+        none => fail Syntax(c.at, "no value to read")
+    }
+}
+
+fn mismatch(c: *Cursor, what: str) -> Error {
+    Mismatch(what, c.at)
+}
+
+fn top_frame(c: *Cursor) -> *Frame ! Error {
+    if c.frames.len == 0 {
+        fail Syntax(c.at, "no open sequence or map")
+    }
+    c.frames[c.frames.len - 1]
+}
+
+fn pop_frame(c: *Cursor) {
+    truncate(mut c.frames, c.frames.len - 1)
+}
+
+/// Returns the text of the map key `key`, which is how a map key of any scalar type matches a field name or a map key of a given type.
+///
+/// A `Text` is itself, an integer is its decimal digits, a boolean is `true` or `false`, a float is its default text and `Null` is `null`. Fails with `Range` at position `at` for an `Overflow` key and with `Mismatch` for a sequence, a map or an opaque value.
+pub fn key_text(key: Node, at: i64) -> str ! Error {
+    match key.tree {
+        Text(s) => s
+        Int(n) => "{n}"
+        Uint(n) => "{n}"
+        Bool(b) => if b { "true" } else { "false" }
+        Float(x) => "{x}"
+        Null => "null"
+        Overflow => fail Range(at)
+        _ => fail Mismatch("scalar key", at)
+    }
+}
+
+fn member_key(c: *Cursor, key: Node) -> str ! Error {
+    if key.at > 0 {
+        c.at = key.at
+    }
+    key_text(key, c.at)
+}
+
+fn next_member(c: *Cursor) -> str? ! Error {
+    let f = top_frame(c)?
+    if f.index >= f.members.len {
+        pop_frame(c)
+        return none
+    }
+    let m = f.members[f.index]
+    f.index += 1
+    let name = member_key(c, m.key)?
+    c.pending = m.value
+    name
+}
+
+fn peek_null(c: *Cursor) -> bool ! Error {
+    match c.pending {
+        some(n) => {
+            match n.tree {
+                Null => {
+                    take(c)?
+                    true
+                }
+                _ => false
+            }
+        }
+        none => false
+    }
+}
+
+fn read_integer(c: *Cursor) -> i64 ! Error {
+    match take(c)? {
+        Int(n) => n
+        Uint(_) => fail Range(c.at)
+        Overflow => fail Range(c.at)
+        _ => fail mismatch(c, "integer")
+    }
+}
+
+fn read_unsigned(c: *Cursor) -> u64 ! Error {
+    match take(c)? {
+        Uint(n) => n
+        Int(n) => {
+            if n < 0 {
+                fail Range(c.at)
+            }
+            u64(n)
+        }
+        Overflow => fail Range(c.at)
+        _ => fail mismatch(c, "unsigned integer")
+    }
+}
+
+fn read_float(c: *Cursor) -> f64 ! Error {
+    match take(c)? {
+        Float(x) => x
+        Int(n) => f64(n)
+        Uint(n) => f64(n)
+        Overflow => fail Range(c.at)
+        _ => fail mismatch(c, "float")
+    }
+}
+
+fn read_binary(c: *Cursor) -> []u8 ! Error {
+    match take(c)? {
+        Binary(data) => data
+        Text(s) => {
+            if !c.base64_text {
+                fail mismatch(c, "binary")
+            }
+            base64.decode(s) catch {
+                _ => fail mismatch(c, "base64")
+            }
+        }
+        _ => fail mismatch(c, "binary")
+    }
+}
+
+fn read_variant(c: *Cursor) -> str ! Error {
+    match take(c)? {
+        Text(name) => name
+        Map(members) => {
+            if members.len != 1 {
+                fail mismatch(c, "map with one key naming the variant")
+            }
+            let name = member_key(c, members[0].key)?
+            c.pending = members[0].value
+            name
+        }
+        _ => fail mismatch(c, "variant")
+    }
+}
+
+/// Returns a `Reader` over the tree `root`, to pass to `read`.
+///
+/// A struct is read from a `Map` by key, a slice from a `Seq`, an optional from `Null`, and an enum variant from a `Text` of its name or a `Map` with one member named by the variant. An integer is read from `Int`, and from `Uint` only as a `u64`; a `u64` is read from a non-negative `Int` as well. A float is read from `Float` or an integer. A `[]u8` is read from `Binary`, and from `Text` holding base64 when `base64_text` is `true`. Keys are matched as `key_text` gives. Fails with `Mismatch` when a value has another type and with `Range` when a number does not fit. `position` is the `at` of the node last read, or the number of nodes read so far when a node has `at` of `0`.
+pub fn tree_reader(root: Node, base64_text: bool) -> Reader {
+    let c = new(Cursor { pending: root, frames: [], at: root.at, base64_text })
+    Reader {
+        null: fn() -> bool ! Error { peek_null(c) }
+        boolean: fn() -> bool ! Error {
+            match take(c)? {
+                Bool(b) => b
+                _ => fail mismatch(c, "bool")
+            }
+        }
+        integer: fn() -> i64 ! Error { read_integer(c) }
+        unsigned: fn() -> u64 ! Error { read_unsigned(c) }
+        float: fn() -> f64 ! Error { read_float(c) }
+        text: fn() -> str ! Error {
+            match take(c)? {
+                Text(s) => s
+                _ => fail mismatch(c, "string")
+            }
+        }
+        binary: fn() -> []u8 ! Error { read_binary(c) }
+        begin_seq: fn() ! Error {
+            match take(c)? {
+                Seq(items) => push(mut c.frames, new(Frame { items, members: [], index: 0 }))
+                _ => fail mismatch(c, "sequence")
+            }
+        }
+        next_element: fn() -> bool ! Error {
+            let f = top_frame(c)?
+            if f.index >= f.items.len {
+                pop_frame(c)
+                return false
+            }
+            c.pending = f.items[f.index]
+            f.index += 1
+            true
+        }
+        begin_map: fn() ! Error {
+            match take(c)? {
+                Map(members) => push(mut c.frames, new(Frame { items: [], members, index: 0 }))
+                _ => fail mismatch(c, "map")
+            }
+        }
+        next_field: fn() -> str? ! Error { next_member(c) }
+        next_key: fn() -> str? ! Error { next_member(c) }
+        begin_variant: fn() -> str ! Error { read_variant(c) }
+        end_variant: fn() ! Error {}
+        skip: fn() ! Error {
+            take(c)?
+        }
+        position: fn() -> i64 { c.at }
+    }
+}
