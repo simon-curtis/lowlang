@@ -1,3 +1,4 @@
+import std/compress/codec
 import std/io
 
 fn max_expansion() -> i64 {
@@ -8,50 +9,36 @@ fn hash_bits_limit() -> i64 {
     16
 }
 
+fn read_length(data: []u8, mut at: i64) -> i64 ! io.Error {
+    let length = codec.read_varint(data, mut at, 5)?
+    if length > 0xFFFFFFFF {
+        fail Malformed
+    }
+    i64(length)
+}
+
 /// Returns the decoded length stored in the header of the Snappy block `data`.
 ///
 /// Reads only the leading varint. Fails with `Malformed` when it is truncated, longer than five bytes or above `0xFFFFFFFF`.
 pub fn decoded_length(data: []u8) -> i64 ! io.Error {
-    let header = read_varint(data)?
-    header.value
-}
-
-struct Varint {
-    value: i64
-    size: i64
-}
-
-fn read_varint(data: []u8) -> Varint ! io.Error {
-    var value = 0
-    for i in 0..5 {
-        if i >= data.len {
-            fail Malformed
-        }
-        let b = i64(data[i])
-        value |= (b & 0x7F) << (7 * i)
-        if b < 0x80 {
-            if value > 0xFFFFFFFF {
-                fail Malformed
-            }
-            return Varint { value, size: i + 1 }
-        }
-    }
-    fail Malformed
+    var at = 0
+    read_length(data, mut at)?
 }
 
 /// Returns the bytes decoded from the Snappy block `data`, which is the raw block format with no framing.
 ///
 /// Fails with `TooLarge` when the decoded length in the header exceeds `limit` and with `Malformed` when the header is invalid, claims more than 22 times the compressed size or the block does not decode to exactly that length.
 pub fn decompress_block(data: []u8, limit: i64) -> []u8 ! io.Error {
-    let header = read_varint(data)?
-    if header.value > limit {
+    var at = 0
+    let length = read_length(data, mut at)?
+    if length > limit {
         fail TooLarge
     }
-    if header.value > max_expansion() * (data.len - header.size) {
+    if length > max_expansion() * (data.len - at) {
         fail Malformed
     }
-    let out = io.buffer(header.value)
-    unpack(data, header.size, out)?
+    let out = io.buffer(length)
+    unpack(data, at, out)?
     out
 }
 
@@ -121,103 +108,75 @@ fn unpack(data: []u8, start: i64, out: []u8) ! io.Error {
 }
 
 fn copy_match(out: []u8, op: i64, offset: i64, n: i64) {
-    let from = op - offset
     if offset >= n {
+        let from = op - offset
         io.copy(out[op..op + n], out[from..from + n])
         return
     }
-    if offset == 1 {
-        let v = out[from]
-        for i in op..op + n {
-            out[i] = v
-        }
-        return
-    }
-    var done = 0
-    for done < n {
-        var k = offset + done
-        if k > n - done {
-            k = n - done
-        }
-        io.copy(out[op + done..op + done + k], out[from..from + k])
-        done += k
-    }
+    codec.copy_match(out, op, offset, n)
 }
 
 fn max_compressed(n: i64) -> i64 {
     32 + n + n / 6
 }
 
-fn put_varint(dst: []u8, at: i64, value: i64) -> i64 {
-    var v = value
-    var op = at
-    for v >= 0x80 {
-        dst[op] = u8(v | 0x80)
-        v >>= 7
-        op += 1
-    }
-    dst[op] = u8(v)
-    op + 1
-}
-
-fn put_literal(dst: []u8, at: i64, src: []u8) -> i64 {
-    var op = at
+fn put_literal(out: *codec.Buffer, src: []u8) {
     let n = src.len - 1
+    codec.reserve(out, src.len + 5)
+    let data = out.data
+    var at = out.len
     if n < 60 {
-        dst[op] = u8(n << 2)
-        op += 1
+        data[at] = u8(n << 2)
+        at += 1
     } else {
         var width = 1
         for n >> (8 * width) != 0 {
             width += 1
         }
-        dst[op] = u8((59 + width) << 2)
-        op += 1
+        data[at] = u8((59 + width) << 2)
+        at += 1
         for k in 0..width {
-            dst[op] = u8(n >> (8 * k))
-            op += 1
+            data[at] = u8(n >> (8 * k))
+            at += 1
         }
     }
-    io.copy(dst[op..], src)
-    op + src.len
+    io.copy(data[at..], src)
+    out.len = at + src.len
 }
 
-fn put_copy_piece(dst: []u8, at: i64, offset: i64, len: i64) -> i64 {
-    var op = at
+fn put_copy_piece(out: *codec.Buffer, offset: i64, len: i64) {
+    codec.reserve(out, 5)
+    let data = out.data
+    let at = out.len
     if len < 12 && offset < 2048 {
-        dst[op] = u8(1 | (len - 4) << 2 | (offset >> 8) << 5)
-        dst[op + 1] = u8(offset)
-        return op + 2
+        data[at] = u8(1 | (len - 4) << 2 | (offset >> 8) << 5)
+        data[at + 1] = u8(offset)
+        out.len = at + 2
+        return
     }
     if offset < 65536 {
-        dst[op] = u8(2 | (len - 1) << 2)
-        dst[op + 1] = u8(offset)
-        dst[op + 2] = u8(offset >> 8)
-        return op + 3
+        data[at] = u8(2 | (len - 1) << 2)
+        data[at + 1] = u8(offset)
+        data[at + 2] = u8(offset >> 8)
+        out.len = at + 3
+        return
     }
-    dst[op] = u8(3 | (len - 1) << 2)
-    for k in 0..4 {
-        dst[op + 1 + k] = u8(offset >> (8 * k))
-    }
-    op + 5
+    data[at] = u8(3 | (len - 1) << 2)
+    io.set_le32(data, at + 1, offset)
+    out.len = at + 5
 }
 
-fn put_copy(dst: []u8, at: i64, offset: i64, length: i64) -> i64 {
-    var op = at
+fn put_copy(out: *codec.Buffer, offset: i64, length: i64) {
     var len = length
     for len >= 68 {
-        op = put_copy_piece(dst, op, offset, 64)
+        put_copy_piece(out, offset, 64)
         len -= 64
     }
     if len > 64 {
-        op = put_copy_piece(dst, op, offset, 60)
+        put_copy_piece(out, offset, 60)
         len -= 60
     }
-    put_copy_piece(dst, op, offset, len)
-}
-
-fn load32(b: []u8, at: i64) -> u32 {
-    u32(b[at]) | u32(b[at + 1]) << 8 | u32(b[at + 2]) << 16 | u32(b[at + 3]) << 24
+    put_copy_piece(out, offset, len)
 }
 
 fn slot(v: u32, shift: i64) -> i64 {
@@ -232,20 +191,12 @@ fn table_bits(n: i64) -> i64 {
     bits
 }
 
-fn match_length(src: []u8, cand: i64, ip: i64) -> i64 {
-    var len = 4
+fn compress_into(table: []u32, bits: i64, src: []u8, out: *codec.Buffer) {
     let n = src.len
-    for ip + len < n && src[cand + len] == src[ip + len] {
-        len += 1
-    }
-    len
-}
-
-fn compress_into(table: []u32, bits: i64, src: []u8, dst: []u8) -> i64 {
-    let n = src.len
-    var op = put_varint(dst, 0, n)
+    codec.reserve(out, 10)
+    out.len = codec.write_varint(out.data, out.len, u64(n))
     if n == 0 {
-        return op
+        return
     }
     for i in 0..table.len {
         table[i] = 0
@@ -255,22 +206,22 @@ fn compress_into(table: []u32, bits: i64, src: []u8, dst: []u8) -> i64 {
     var ip = 0
     var anchor = 0
     for ip <= last {
-        let v = load32(src, ip)
+        let v = io.u32_le(src, ip)
         let h = slot(v, shift)
         let cand = i64(table[h]) - 1
         table[h] = u32(ip + 1)
-        if cand >= 0 && load32(src, cand) == v {
-            let len = match_length(src, cand, ip)
+        if cand >= 0 && io.u32_le(src, cand) == v {
+            let len = 4 + codec.match_length(src, cand + 4, ip + 4, n - ip - 4)
             let offset = ip - cand
             if offset < 65536 || len >= 8 {
                 if ip > anchor {
-                    op = put_literal(dst, op, src[anchor..ip])
+                    put_literal(out, src[anchor..ip])
                 }
-                op = put_copy(dst, op, offset, len)
+                put_copy(out, offset, len)
                 ip += len
                 anchor = ip
                 if ip <= last {
-                    table[slot(load32(src, ip - 1), shift)] = u32(ip)
+                    table[slot(io.u32_le(src, ip - 1), shift)] = u32(ip)
                 }
                 continue
             }
@@ -278,9 +229,8 @@ fn compress_into(table: []u32, bits: i64, src: []u8, dst: []u8) -> i64 {
         ip += 1 + ((ip - anchor) >> 5)
     }
     if anchor < n {
-        op = put_literal(dst, op, src[anchor..])
+        put_literal(out, src[anchor..])
     }
-    op
 }
 
 /// Returns `data` compressed as one Snappy block, which is the raw block format with no framing.
@@ -289,7 +239,8 @@ fn compress_into(table: []u32, bits: i64, src: []u8, dst: []u8) -> i64 {
 pub fn compress_block(data: []u8) -> []u8 {
     let bits = table_bits(data.len)
     let table: []u32 = __make(1 << bits)
-    let dst = io.buffer(max_compressed(data.len))
-    let n = compress_into(table, bits, data, dst)
-    dst[..n]
+    let out = codec.buffer(max_compressed(data.len))
+    compress_into(table, bits, data, out)
+    codec.contents(out)
 }
+

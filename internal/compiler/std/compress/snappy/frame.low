@@ -1,5 +1,7 @@
+import std/compress/codec
 import std/hash
 import std/io
+import std/math
 
 fn chunk_limit() -> i64 {
     65536
@@ -30,22 +32,11 @@ struct Decoder {
     plain: []u8
 }
 
-fn fill(d: *Decoder, dst: []u8) ! io.Error {
-    var got = 0
-    for got < dst.len {
-        let n = io.read_some(d.r, dst[got..])?
-        if n == 0 {
-            fail Malformed
-        }
-        got += n
-    }
-}
-
 fn skip(d: *Decoder, n: i64) ! io.Error {
     var left = n
     for left > 0 {
-        let step = if left > d.packed.len { d.packed.len } else { left }
-        fill(d, d.packed[..step])?
+        let step = math.min(left, d.packed.len)
+        codec.read_full(d.r, d.packed[..step])?
         left -= step
     }
 }
@@ -70,7 +61,7 @@ pub fn decode(r: *io.Reader, sink: fn([]u8) ! io.Error, limit: i64) ! io.Error {
         if got == 0 {
             break
         }
-        fill(d, d.head[1..4])?
+        codec.read_full(d.r, d.head[1..4])?
         let kind = i64(d.head[0])
         let size = io.le16(d.head, 1) | i64(d.head[3]) << 16
         if kind == 0xFF {
@@ -98,7 +89,7 @@ fn start(d: *Decoder, size: i64) ! io.Error {
         fail Malformed
     }
     let name = d.packed[..6]
-    fill(d, name)?
+    codec.read_full(d.r, name)?
     if str(name) != "sNaPpY" {
         fail Malformed
     }
@@ -120,7 +111,7 @@ fn stored(d: *Decoder, size: i64) ! io.Error {
         fail Malformed
     }
     let body = d.packed[..size]
-    fill(d, body)?
+    codec.read_full(d.r, body)?
     emit(d, body[4..], io.le32(body, 0))?
 }
 
@@ -129,29 +120,12 @@ fn compressed(d: *Decoder, size: i64) ! io.Error {
         fail Malformed
     }
     let body = d.packed[..size]
-    fill(d, body)?
+    codec.read_full(d.r, body)?
     let plain = decompress_block(body[4..], chunk_limit()) catch {
         TooLarge => fail Malformed
         e => fail e
     }
     emit(d, plain, io.le32(body, 0))?
-}
-
-struct Collector {
-    data: []u8
-    len: i64
-}
-
-fn collect(c: *Collector, chunk: []u8) {
-    let need = c.len + chunk.len
-    if need > c.data.len {
-        let size = if c.data.len * 2 > need { c.data.len * 2 } else { need }
-        let grown: []u8 = __make(size)
-        io.copy(grown, c.data[..c.len])
-        c.data = grown
-    }
-    io.copy(c.data[c.len..], chunk)
-    c.len = need
 }
 
 /// Returns the bytes decoded from the Snappy framing format in `data`.
@@ -160,93 +134,122 @@ fn collect(c: *Collector, chunk: []u8) {
 /// Fails with `TooLarge` when the output would exceed `limit` bytes and with `Malformed` when the input is invalid or truncated.
 pub fn decompress(data: []u8, limit: i64) -> []u8 ! io.Error {
     let hint = data.len * 2 + 64
-    let c = new(Collector { data: __make(if hint < limit { hint } else if limit > 0 { limit } else { 0 }), len: 0 })
-    let sink: fn([]u8) ! io.Error = fn(chunk) { collect(c, chunk) }
-    decode(io.bytes_reader(data), sink, limit)?
-    c.data[..c.len]
+    let out = codec.buffer(if hint < limit { hint } else { limit })
+    decode(io.bytes_reader(data), codec.collector(out), limit)?
+    codec.contents(out)
 }
 
 /// A streaming encoder for the Snappy framing format made by `encoder`.
 ///
 /// `encode` takes input in any chunking and writes it as chunks of up to 64 KiB, storing a chunk uncompressed when compression saves less than an eighth. The stream identifier is written with the first call. A chunk is valid only during the call to `sink`.
 pub struct Encoder {
+    core: *Framer
     sink: fn([]u8) ! io.Error
+}
+
+struct Framer {
     pending: []u8
     len: i64
     table: []u32
-    out: []u8
+    out: *codec.Buffer
     started: bool
 }
 
 /// Returns an encoder that writes the Snappy framing format to `sink`.
 pub fn encoder(sink: fn([]u8) ! io.Error) -> *Encoder {
-    new(Encoder {
-        sink
+    let core = framer(max_compressed(chunk_limit()) + 8)
+    new(Encoder { core, sink })
+}
+
+fn framer(capacity: i64) -> *Framer {
+    new(Framer {
         pending: io.buffer(chunk_limit())
         len: 0
         table: __make(1 << frame_bits())
-        out: io.buffer(max_compressed(chunk_limit()) + 8)
+        out: codec.buffer(capacity)
         started: false
     })
 }
 
-fn put_header(out: []u8, kind: u8, size: i64, sum: i64) {
-    out[0] = kind
-    out[1] = u8(size)
-    out[2] = u8(size >> 8)
-    out[3] = u8(size >> 16)
-    io.set_le32(out, 4, sum)
+fn set_header(out: *codec.Buffer, mark: i64, kind: i64, size: i64, sum: i64) {
+    io.set_le32(out.data, mark, kind | size << 8)
+    io.set_le32(out.data, mark + 4, sum)
 }
 
-fn emit_chunk(e: *Encoder) ! io.Error {
+fn emit_chunk(e: *Framer) {
     let n = e.len
     e.len = 0
     let plain = e.pending[..n]
     let sum = checksum(plain)
-    let size = compress_into(e.table, frame_bits(), plain, e.out[8..])
+    let out = e.out
+    let mark = out.len
+    codec.put_le(out, 0, 8)
+    compress_into(e.table, frame_bits(), plain, out)
+    let size = out.len - mark - 8
     if size < n - n / 8 {
-        put_header(e.out, 0x00, size + 4, sum)
-        e.sink(e.out[..8 + size])?
+        set_header(out, mark, 0x00, size + 4, sum)
         return
     }
-    let header = io.buffer(8)
-    put_header(header, 0x01, n + 4, sum)
-    e.sink(header)?
-    e.sink(plain)?
+    out.len = mark + 8
+    codec.put_bytes(out, plain)
+    set_header(out, mark, 0x01, n + 4, sum)
 }
 
-fn start_stream(e: *Encoder) ! io.Error {
+fn start_stream(e: *Framer) {
     if e.started {
         return
     }
     e.started = true
-    e.sink(identifier())?
+    codec.put_bytes(e.out, identifier())
 }
 
-/// Compresses `data` and passes each completed 64 KiB chunk to the encoder's `sink`.
-///
-/// Input is buffered until a chunk is full, so a call can produce no output beyond the stream identifier. Fails with any error `sink` returns.
-pub fn encode(e: *Encoder, data: []u8) ! io.Error {
-    start_stream(e)?
+fn feed(e: *Framer, data: []u8) {
     var at = 0
     for at < data.len {
         let n = io.copy(e.pending[e.len..], data[at..])
         e.len += n
         at += n
         if e.len == chunk_limit() {
-            emit_chunk(e)?
+            emit_chunk(e)
         }
     }
+}
+
+fn settle(e: *Framer) {
+    if e.len > 0 {
+        emit_chunk(e)
+    }
+}
+
+fn drain(e: *Encoder) ! io.Error {
+    let ready = codec.drain(e.core.out)
+    if ready.len > 0 {
+        e.sink(ready)?
+    }
+}
+
+/// Compresses `data` and passes each completed 64 KiB chunk to the encoder's `sink`.
+///
+/// Input is buffered until a chunk is full, so a call can produce no output beyond the stream identifier. Fails with any error `sink` returns.
+pub fn encode(e: *Encoder, data: []u8) ! io.Error {
+    start_stream(e.core)
+    var rest = data
+    for rest.len > 0 {
+        let n = math.min(rest.len, chunk_limit())
+        feed(e.core, rest[..n])
+        drain(e)?
+        rest = rest[n..]
+    }
+    drain(e)?
 }
 
 /// Writes the buffered input as a chunk, so a decoder can read everything encoded so far.
 ///
 /// Fails with any error `sink` returns.
 pub fn flush(e: *Encoder) ! io.Error {
-    start_stream(e)?
-    if e.len > 0 {
-        emit_chunk(e)?
-    }
+    start_stream(e.core)
+    settle(e.core)
+    drain(e)?
 }
 
 /// Writes the buffered input as a chunk. The format has no trailer, so this equals `flush`.
@@ -258,14 +261,10 @@ pub fn finish(e: *Encoder) ! io.Error {
 
 /// Returns `data` compressed in the Snappy framing format.
 pub fn compress(data: []u8) -> []u8 {
-    let c = new(Collector { data: __make(data.len / 2 + 64), len: 0 })
-    let sink: fn([]u8) ! io.Error = fn(chunk) { collect(c, chunk) }
-    let e = encoder(sink)
-    encode(e, data) catch {
-        _ => {}
-    }
-    finish(e) catch {
-        _ => {}
-    }
-    c.data[..c.len]
+    let c = framer(data.len / 2 + 64)
+    start_stream(c)
+    feed(c, data)
+    settle(c)
+    codec.contents(c.out)
 }
+
