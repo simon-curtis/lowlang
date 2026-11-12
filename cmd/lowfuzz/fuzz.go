@@ -62,7 +62,7 @@ func (f *fuzzer) runCase(ctx context.Context, seed int64) {
 		return
 	case err != nil:
 		finding := oracle.Finding{Class: oracle.ClassGenerator, Detail: err.Error(), Source: program.String()}
-		f.handle(ctx, seed, program, finding)
+		f.claimAll(ctx, seed, program, []oracle.Finding{finding})
 		return
 	}
 	findings := f.runner.Check(ctx, program.String(), outcome)
@@ -70,6 +70,10 @@ func (f *fuzzer) runCase(ctx context.Context, seed int64) {
 		return
 	}
 	f.report.caseRan()
+	f.claimAll(ctx, seed, program, findings)
+}
+
+func (f *fuzzer) claimAll(ctx context.Context, seed int64, program *model.Program, findings []oracle.Finding) {
 	for _, finding := range findings {
 		if f.report.claim(finding.Signature()) {
 			f.handle(ctx, seed, program, finding)
