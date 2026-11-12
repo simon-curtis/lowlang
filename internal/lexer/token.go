@@ -191,6 +191,14 @@ func texts(table []spelling) []string {
 	return words
 }
 
+const After = "after"
+
+var contextualKeywords = []string{After}
+
+func ContextualKeywords() []string {
+	return contextualKeywords
+}
+
 func IsKeyword(name string) bool {
 	_, ok := keywordKinds[name]
 	return ok

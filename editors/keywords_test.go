@@ -26,6 +26,7 @@ var expected = map[string][]string{}
 
 func init() {
 	expected["keywords"] = lexer.Keywords()
+	expected["contextual keywords"] = lexer.ContextualKeywords()
 	for _, b := range check.Builtins() {
 		switch {
 		case b.Kind == check.FunctionBuiltin && b.Public():
@@ -42,17 +43,20 @@ func init() {
 var listings = []listing{
 	{"tree-sitter-low/grammar.js", "literals", "keywords", grammarKeywords},
 	{"tree-sitter-low/queries/highlights.scm", "keywords", "keywords", queryKeywords},
+	{"tree-sitter-low/queries/highlights.scm", "contextual keywords", "contextual keywords", queryList(`#eq\? @keyword ("[^"]*")`)},
 	{"tree-sitter-low/queries/highlights.scm", "constants", "constants", queryConstants},
 	{"tree-sitter-low/queries/highlights.scm", "builtin calls", "functions", queryList(`#any-of\? @function\.builtin ([^)]*)`)},
 	{"tree-sitter-low/queries/highlights.scm", "plain calls", "functions", queryList(`#not-any-of\? @function\.call ([^)]*)`)},
 	{"tree-sitter-low/queries/highlights.scm", "builtin types", "types", queryPattern(`#match\? @type\.builtin "\^\(([^)]*)\)\$"`)},
 	{"tree-sitter-low/queries/highlights.scm", "plain types", "types", queryPattern(`#not-match\? @type "\^\(([^)]*)\)\$"`)},
 	{"vscode/syntaxes/low.tmLanguage.json", "keywords", "keywords", scopes("keyword.control.", "storage.", "constant.language.boolean.")},
+	{"vscode/syntaxes/low.tmLanguage.json", "contextual keywords", "contextual keywords", scopes("keyword.other.")},
 	{"vscode/syntaxes/low.tmLanguage.json", "constants", "constants", scopes("constant.language.")},
 	{"vscode/syntaxes/low.tmLanguage.json", "types", "types", scopes("support.type.primitive.")},
 	{"vscode/syntaxes/low.tmLanguage.json", "constraints", "constraints", scopes("support.type.constraint.")},
 	{"vscode/syntaxes/low.tmLanguage.json", "builtin calls", "functions", captured("support.function.builtin.")},
 	{"../site/highlight.mjs", "keywords", "keywords", siteKeywords},
+	{"../site/highlight.mjs", "contextual keywords", "contextual keywords", moduleSet("contextual")},
 	{"../site/highlight.mjs", "types", "types", moduleSet("types")},
 	{"../site/highlight.mjs", "constants", "constants", moduleSet("constants")},
 }

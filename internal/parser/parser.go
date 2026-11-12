@@ -769,7 +769,7 @@ func (p *Parser) selectCase() *ast.SelectCase {
 	case p.at(lexer.Else):
 		p.next()
 		c.Kind = ast.ElseCase
-	case p.at(lexer.Ident) && t.Text == "after" && p.peek() == lexer.LParen:
+	case p.at(lexer.Ident) && t.Text == lexer.After && p.peek() == lexer.LParen:
 		p.next()
 		p.list(func() { c.Value = p.expr() })
 		c.Kind = ast.AfterCase

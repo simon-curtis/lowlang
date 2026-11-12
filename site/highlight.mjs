@@ -4,6 +4,7 @@ const keywords = new Set([
     "fn", "let", "var", "if", "else", "for", "break", "continue", "return", "enum", "match", "fail", "catch",
     "struct", "mut", "in", "import", "pub", "extern", "defer", "spawn", "select", "using", "drop",
 ]);
+const contextual = new Set(["after"]);
 const types = new Set([
     "i64", "i32", "u64", "u32", "u16", "u8", "f64", "f32", "bool", "str", "ptr", "chan",
     "u8x16", "u8x32", "u16x8", "u16x16", "i32x4", "i32x8", "u32x4", "u32x8", "i64x2", "i64x4", "u64x2", "u64x4", "f32x4", "f32x8", "f64x2", "f64x4",
@@ -50,6 +51,14 @@ function before(tokens, index) {
     return tokens[at];
 }
 
+function startsLine(tokens, index) {
+    let at = index - 1;
+    while (tokens[at]?.kind === "marker") {
+        at -= 1;
+    }
+    return tokens[at] === undefined || (tokens[at].kind === "space" && tokens[at].text.includes("\n"));
+}
+
 function closes(tokens, index) {
     let depth = 0;
     for (let at = index; at < tokens.length; at += 1) {
@@ -86,7 +95,7 @@ function classify(tokens, index, imported) {
     const previous = before(tokens, index);
     const next = after(tokens, index);
     const text = tokens[index].text;
-    if (keywords.has(text)) {
+    if (keywords.has(text) || (contextual.has(text) && startsLine(tokens, index) && next?.text === "(")) {
         return "k";
     }
     if (constants.has(text)) {
