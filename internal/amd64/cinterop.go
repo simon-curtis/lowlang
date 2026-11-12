@@ -8,21 +8,6 @@ import (
 	"lowlang/internal/types"
 )
 
-const (
-	tlsM      = -24
-	tlsG      = -16
-	tlsFlag   = -8
-	gScanLo   = 16
-	gUserSP   = 24
-	gPC       = 32
-	gFP       = 40
-	gLockedM  = 88
-	mG0Top    = 16
-	mG0SP     = 24
-	inC       = 3
-	savedRegs = 5
-)
-
 func (g *Generator) cCall(fr *frame, in *instr) {
 	plan := in.value.Plan
 	args := in.args
@@ -47,7 +32,7 @@ func (g *Generator) cCall(fr *frame, in *instr) {
 	if plan.StackWords > 0 {
 		g.emit("sub rsp, %d", 16*((plan.StackWords+1)/2))
 		for i := g.cRegisterSlots(); i < plan.StackWords; i++ {
-			g.emit("mov r11, [r12+%d]", 8*(savedRegs+i))
+			g.emit("mov r11, [r12+%d]", 8*(len(calleeSaved)+i))
 			g.emit("mov [rsp+%d], r11", 8*i)
 		}
 	}
@@ -87,9 +72,7 @@ func (g *Generator) stackArg(slot int, src string) {
 }
 
 func (g *Generator) leaveC() {
-	if g.os == target.Windows {
-		g.tebToG("rbx")
-	}
+	g.emit("TEB_ENTER_CURRENT_G rbx")
 	g.emit("mov rsp, r12")
 	g.emit("call rt_exitc")
 	for i := len(calleeSaved) - 1; i >= 0; i-- {
@@ -101,21 +84,19 @@ func (g *Generator) enterC(label string) {
 	for _, r := range calleeSaved {
 		g.emit("push %s", r)
 	}
-	g.tls("rax", tlsG)
-	g.emit("mov [rax+%d], rsp", gScanLo)
-	g.emit("lea r11, [rsp+%d]", 8*savedRegs)
-	g.emit("mov [rax+%d], r11", gUserSP)
-	g.emit("mov [rax+%d], rbp", gFP)
+	g.emit("TLS_GET rax, TLS_G")
+	g.emit("mov [rax+G_SCANLO], rsp")
+	g.emit("lea r11, [rsp+%d]", 8*len(calleeSaved))
+	g.emit("mov [rax+G_USERSP], r11")
+	g.emit("mov [rax+G_FP], rbp")
 	g.emit("lea r11, [rip+%s]", label)
-	g.emit("mov [rax+%d], r11", gPC)
-	g.tls("rbx", tlsM)
-	g.emit("mov r11d, %d", inC)
+	g.emit("mov [rax+G_PC], r11")
+	g.emit("TLS_GET rbx, TLS_M")
+	g.emit("mov r11d, INC")
 	g.emit("xchg [rbx], r11")
 	g.emit("mov r12, rsp")
-	if g.os == target.Windows {
-		g.tebToOS("rax", "rbx")
-	}
-	g.emit("mov rsp, [rbx+%d]", mG0SP)
+	g.emit("TEB_ENTER_OS rax, rbx")
+	g.emit("mov rsp, [rbx+M_G0SP]")
 }
 
 func (g *Generator) cTarget(symbol string) string {
@@ -166,25 +147,23 @@ func (g *Generator) thunk(f *ir.Func) {
 	for i, r := range g.cPreservedVectors() {
 		g.emit("movaps xmmword ptr [r12+%d], %s", registerBytes+16*i, r)
 	}
-	g.tls("rbx", tlsM)
-	g.emit("mov edi, %d", inC)
+	g.emit("TLS_GET rbx, TLS_M")
+	g.emit("mov edi, INC")
 	g.emit("call rt_m_running")
-	g.emit("mov r14, [rbx+%d]", mG0SP)
-	g.emit("mov [rbx+%d], r12", mG0SP)
-	g.tls("r15", tlsG)
-	g.emit("inc qword ptr [r15+%d]", gLockedM)
-	if g.os == target.Windows {
-		g.tebEnterG("r15", "rbx")
-	}
-	g.emit("mov rsp, [r15+%d]", gScanLo)
+	g.emit("mov r14, [rbx+M_G0SP]")
+	g.emit("mov [rbx+M_G0SP], r12")
+	g.emit("TLS_GET r15, TLS_G")
+	g.emit("inc qword ptr [r15+G_LOCKEDM]")
+	g.emit("TEB_ENTER_G r15, rbx")
+	g.emit("mov rsp, [r15+G_SCANLO]")
 	g.emit("and rsp, -16")
-	for _, offset := range []int{gScanLo, gUserSP, gPC, gFP, gPC, gFP} {
-		g.emit("push qword ptr [r15+%d]", offset)
+	for _, field := range []string{"G_SCANLO", "G_USERSP", "G_PC", "G_FP", "G_PC", "G_FP"} {
+		g.emit("push qword ptr [r15+%s]", field)
 	}
 	g.emit("mov rbp, rsp")
 	g.emit("push r12")
 	g.emit("push r14")
-	g.emit("push qword ptr [r15+%d]", gUserSP)
+	g.emit("push qword ptr [r15+G_USERSP]")
 	g.emit("sub rsp, 8")
 	if stack := stackWords(f.ParamWords); stack > 0 {
 		g.emit("sub rsp, %d", 16*((stack+1)/2))
@@ -197,20 +176,18 @@ func (g *Generator) thunk(f *ir.Func) {
 	if f.Ret.Float() {
 		g.emit("movq xmm0, rax")
 	}
-	for i, offset := range []int{gFP, gPC, gUserSP, gScanLo} {
+	for i, field := range []string{"G_FP", "G_PC", "G_USERSP", "G_SCANLO"} {
 		g.emit("mov rcx, [rbp+%d]", 16+8*i)
-		g.emit("mov [r15+%d], rcx", offset)
+		g.emit("mov [r15+%s], rcx", field)
 	}
-	g.emit("dec qword ptr [r15+%d]", gLockedM)
-	if g.os == target.Windows {
-		g.tebToOS("r15", "rbx")
-	}
+	g.emit("dec qword ptr [r15+G_LOCKEDM]")
+	g.emit("TEB_ENTER_OS r15, rbx")
 	g.emit("mov rsp, r12")
 	for i, r := range g.cPreservedVectors() {
 		g.emit("movaps %s, xmmword ptr [r12+%d]", r, registerBytes+16*i)
 	}
-	g.emit("mov [rbx+%d], r14", mG0SP)
-	g.emit("mov ecx, %d", inC)
+	g.emit("mov [rbx+M_G0SP], r14")
+	g.emit("mov ecx, INC")
 	g.emit("xchg [rbx], rcx")
 	g.emit("mov rsp, r13")
 	for i := len(saved) - 1; i >= 0; i-- {
@@ -281,7 +258,7 @@ func (g *Generator) cResult(fr *frame, in *instr, plan *ir.CPlan, k int) {
 		}
 	}
 	if plan.Results[k] == ir.Integer {
-		g.move(dst, []string{"rax", "rdx"}[ints])
+		g.move(dst, resultRegisters[ints])
 		return
 	}
 	source := fmt.Sprintf("xmm%d", vectors)

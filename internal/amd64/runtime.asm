@@ -82,18 +82,18 @@ rt_panic_prefix:
 	.ascii "panic: "
 rt_error_prefix:
 	.ascii "error: "
-rt_msg_divzero:
-	.quad 22
+	MSG_BEGIN rt_msg_divzero
 	.ascii "integer divide by zero"
-rt_msg_pins:
-	.quad 13
+	MSG_END
+	MSG_BEGIN rt_msg_pins
 	.ascii "too many pins"
-rt_msg_index:
-	.quad 18
+	MSG_END
+	MSG_BEGIN rt_msg_index
 	.ascii "index out of range"
-rt_msg_oom:
-	.quad 13
+	MSG_END
+	MSG_BEGIN rt_msg_oom
 	.ascii "out of memory"
+	MSG_END
 
 	.bss
 	.p2align 3

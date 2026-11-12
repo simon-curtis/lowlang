@@ -9,9 +9,9 @@ rt_patch_list:
 	.zero PATCH_BYTES
 
 	.section .rodata
-rt_msg_hot:
-	.quad 31
+	MSG_BEGIN rt_msg_hot
 	.ascii "cannot reserve hot reload space"
+	MSG_END
 
 	.text
 rt_hot_init:

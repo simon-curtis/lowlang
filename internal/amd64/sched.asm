@@ -1,19 +1,19 @@
 	.section .rodata
-rt_msg_deadlock:
-	.quad 37
+	MSG_BEGIN rt_msg_deadlock
 	.ascii "every green thread is blocked forever"
-rt_msg_overflow:
-	.quad 14
+	MSG_END
+	MSG_BEGIN rt_msg_overflow
 	.ascii "stack overflow"
-rt_msg_fault:
-	.quad 21
+	MSG_END
+	MSG_BEGIN rt_msg_fault
 	.ascii "invalid memory access"
-rt_msg_timers:
-	.quad 15
+	MSG_END
+	MSG_BEGIN rt_msg_timers
 	.ascii "too many timers"
-rt_msg_threads:
-	.quad 22
+	MSG_END
+	MSG_BEGIN rt_msg_threads
 	.ascii "too many green threads"
+	MSG_END
 
 	.bss
 	.p2align 3

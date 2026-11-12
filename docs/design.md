@@ -1470,6 +1470,8 @@ Modules:
 
 The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls. It ends the process with `exit_group`, so every thread stops.
 
+The runtime's data layout, thread-local access and Windows stack-bounds switching are defined once, in `layout.asm` and the target's `linux_header.asm` or `windows_header.asm`, as constants and macros such as `G_SCANLO`, `TLS_GET`, `TEB_ENTER_OS` and `MSG_BEGIN`. Generated code and patches use those names and macros, and `Generate` and `GeneratePatch` both prepend the headers. Go passes `RT_DYNAMIC` and the hot-reload constants to the assembly as `.set` lines. The Windows import table lists every function the Windows runtime calls through `WIN`, taken from `windows.asm`, plus the program's `extern` imports.
+
 ### Scheduler
 
 - Green threads run on OS threads, one per CPU in the process's affinity mask. Threads start as work appears, with `clone` in a static program and `pthread_create` in a dynamic one. A thread whose green thread is in a C call does not count against the limit, so another starts while C blocks.

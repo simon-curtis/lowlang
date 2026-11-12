@@ -16,8 +16,14 @@ import (
 //go:embed layout.asm
 var layout string
 
+//go:embed linux_header.asm
+var linuxHeader string
+
 //go:embed linux.asm
 var linuxRuntime string
+
+//go:embed windows_header.asm
+var windowsHeader string
 
 //go:embed windows.asm
 var windowsRuntime string
@@ -96,11 +102,29 @@ func newGenerator(os target.OS, table map[string]int, suffix string) *Generator 
 	return &Generator{os: os, dataLabels: map[string]bool{}, table: table, suffix: suffix}
 }
 
+func (g *Generator) osHeader() string {
+	if g.os == target.Windows {
+		return windowsHeader
+	}
+	return linuxHeader
+}
+
 func (g *Generator) osRuntime() string {
 	if g.os == target.Windows {
 		return windowsRuntime
 	}
 	return linuxRuntime
+}
+
+type symbol struct {
+	name  string
+	value int
+}
+
+func writeSymbols(out *strings.Builder, symbols []symbol) {
+	for _, s := range symbols {
+		fmt.Fprintf(out, "\t.set %s, %d\n", s.name, s.value)
+	}
 }
 
 func Generate(prog *ir.Program, table map[string]int) Output {
@@ -126,8 +150,10 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 		g.libcShims(prog.CSymbols)
 	}
 	var out strings.Builder
-	fmt.Fprintf(&out, "\t.intel_syntax noprefix\n\t.set RT_DYNAMIC, %d\n", dynamic)
+	out.WriteString("\t.intel_syntax noprefix\n")
+	writeSymbols(&out, []symbol{{"RT_DYNAMIC", dynamic}})
 	out.WriteString(layout)
+	out.WriteString(g.osHeader())
 	out.WriteString(g.osRuntime())
 	out.WriteString(scheduler)
 	out.WriteString(runtime)
@@ -135,7 +161,12 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 	g.writeMaps(&out)
 	writeCells(&out, prog.Cells)
 	if table != nil {
-		out.WriteString(hotRuntimeSource())
+		writeSymbols(&out, []symbol{
+			{"HOT_BASE", HotBase},
+			{"HOT_SIZE", HotSize},
+			{"PATCH_BYTES", 16 * TableSize},
+		})
+		out.WriteString(hotRuntime)
 		g.writeTable(&out)
 	}
 	if g.os == target.Windows {
@@ -156,7 +187,10 @@ func GeneratePatch(prog *ir.Program, names []string, table map[string]int, suffi
 		}
 	}
 	var out strings.Builder
-	out.WriteString("\t.intel_syntax noprefix\n\t.text\n")
+	out.WriteString("\t.intel_syntax noprefix\n")
+	out.WriteString(layout)
+	out.WriteString(g.osHeader())
+	out.WriteString("\t.text\n")
 	out.WriteString(g.text.String())
 	out.WriteString("\n\t.section .rodata\n")
 	out.WriteString(g.data.String())
@@ -178,14 +212,6 @@ func mangle(name string) string {
 		}
 	}
 	return b.String()
-}
-
-func hotRuntimeSource() string {
-	return strings.NewReplacer(
-		"HOT_BASE", fmt.Sprint(HotBase),
-		"HOT_SIZE", fmt.Sprint(HotSize),
-		"PATCH_BYTES", fmt.Sprint(16*TableSize),
-	).Replace(hotRuntime)
 }
 
 func (g *Generator) writeTable(out *strings.Builder) {
@@ -270,8 +296,8 @@ func (g *Generator) start(prog *ir.Program) {
 	}
 	g.emit("lea rdi, [rip+rt_program]")
 	g.emit("call rt_spawn_main")
-	g.tls("rax", tlsM)
-	g.emit("mov rsp, [rax+%d]", mG0Top)
+	g.emit("TLS_GET rax, TLS_M")
+	g.emit("mov rsp, [rax+M_G0TOP]")
 	g.emit("jmp rt_schedule")
 	g.program(prog, dynamic)
 }
@@ -303,7 +329,7 @@ func (g *Generator) program(prog *ir.Program, dynamic bool) {
 	g.emit("call %s", g.callTarget(prog.Main))
 	if prog.MainErr != nil {
 		exit := g.newLabel()
-		tag, variant := "rax", "rdx"
+		tag, variant := resultRegisters[0], resultRegisters[1]
 		if words > 2 {
 			tag, variant = "qword ptr [rsp]", "qword ptr [rsp+8]"
 		}
@@ -389,7 +415,7 @@ func QuoteString(text string) string {
 
 func (g *Generator) messageLabel(s string) string {
 	l := g.newLabel()
-	fmt.Fprintf(&g.data, "\t.p2align 3\n%s:\n\t.quad %d\n\t.ascii %q\n", l, len(s), s)
+	fmt.Fprintf(&g.data, "\t.p2align 3\n\tMSG_BEGIN %s\n\t.ascii %q\n\tMSG_END\n", l, s)
 	return l
 }
 
@@ -473,7 +499,7 @@ type pollStub struct {
 
 func (g *Generator) poll() {
 	stub := pollStub{label: g.newLabel(), resume: g.newLabel()}
-	g.emit("cmp byte ptr %s, 0", g.tlsOperand("r11", tlsFlag))
+	g.emit("TLS_POLL")
 	g.emit("jne %s", stub.label)
 	g.label(stub.resume)
 	g.stubs = append(g.stubs, stub)
@@ -768,7 +794,7 @@ func (g *Generator) ret(fr *frame, mb *mblock) {
 	if len(mb.results) <= 2 {
 		moves := make([]pmove, len(mb.results))
 		for i, r := range mb.results {
-			moves[i] = fr.vectorMove([]string{"rax", "rdx"}[i], r)
+			moves[i] = fr.vectorMove(resultRegisters[i], r)
 		}
 		g.parallel(moves)
 	} else {
@@ -1199,7 +1225,7 @@ func (g *Generator) result(fr *frame, in *instr) {
 		return
 	}
 	if call.Op == ir.OpRuntime || call.Target.ResultWords <= 2 {
-		g.move(fr.loc(in.dst), []string{"rax", "rdx"}[k])
+		g.move(fr.loc(in.dst), resultRegisters[k])
 		return
 	}
 	g.move(fr.loc(in.dst), fmt.Sprintf("qword ptr [rsp+%d]", 8*(stackWords(call.Target.ParamWords)+k)))

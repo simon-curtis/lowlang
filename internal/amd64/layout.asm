@@ -143,3 +143,13 @@
 	mov [rax+G_FP], rbp
 	.endm
 
+	.macro MSG_BEGIN name
+\name:
+	.quad 2f-1f
+1:
+	.endm
+
+	.macro MSG_END
+2:
+	.endm
+

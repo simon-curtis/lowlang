@@ -342,7 +342,7 @@ func TestSieveInnerLoopIsRotated(t *testing.T) {
 	lines := asmLines(functionAsm(t, prog, "sieve"))
 	inner := -1
 	for i, line := range lines {
-		if strings.HasPrefix(line, "add ") && i+3 < len(lines) && lines[i+1] == "cmp byte ptr fs:[-8], 0" {
+		if strings.HasPrefix(line, "add ") && i+3 < len(lines) && lines[i+1] == "TLS_POLL" {
 			inner = i
 		}
 	}

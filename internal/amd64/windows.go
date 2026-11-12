@@ -3,6 +3,7 @@ package amd64
 import (
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -11,16 +12,6 @@ import (
 )
 
 const (
-	gHi          = 48
-	gLo          = 56
-	gLimit       = 96
-	mCurG        = 8
-	mOSBase      = 104
-	mOSLimit     = 112
-	mOSDealloc   = 120
-	tebBase      = 0x8
-	tebLimit     = 0x10
-	tebDealloc   = 0x1478
 	pageSize     = 4096
 	cRuntimeDLL  = "msvcrt.dll"
 	mathDLL      = "api-ms-win-crt-math-l1-1-0.dll"
@@ -40,15 +31,26 @@ func (g *Generator) syscall() {
 
 var winArgRegs = []string{"rcx", "rdx", "r8", "r9"}
 
-var runtimeImports = map[string][]string{
-	kernelDLL: {
-		"AddVectoredExceptionHandler", "CloseHandle", "CreateEventW", "CreateThread", "ExitProcess",
-		"GetEnvironmentVariableA", "GetStdHandle", "GetSystemInfo", "GetSystemTimePreciseAsFileTime", "QueryPerformanceCounter", "QueryPerformanceFrequency",
-		"RegisterWaitForSingleObject", "SetEvent", "Sleep", "SwitchToThread", "TlsAlloc",
-		"UnregisterWait", "VirtualAlloc", "WaitForSingleObject", "WriteFile",
-	},
-	synchDLL:  {"WaitOnAddress", "WakeByAddressAll", "WakeByAddressSingle"},
-	randomDLL: {"ProcessPrng"},
+var runtimeImportDLLs = map[string]string{
+	"WaitOnAddress":       synchDLL,
+	"WakeByAddressAll":    synchDLL,
+	"WakeByAddressSingle": synchDLL,
+	"ProcessPrng":         randomDLL,
+}
+
+var winCall = regexp.MustCompile(`(?m)^\s*WIN\s+(\w+)\s*$`)
+
+func runtimeImports() map[string][]string {
+	imports := map[string][]string{}
+	for _, match := range winCall.FindAllStringSubmatch(windowsRuntime, -1) {
+		symbol := match[1]
+		dll, ok := runtimeImportDLLs[symbol]
+		if !ok {
+			dll = kernelDLL
+		}
+		imports[dll] = append(imports[dll], symbol)
+	}
+	return imports
 }
 
 func importSymbol(symbol string) string {
@@ -107,23 +109,6 @@ func (g *Generator) thunkSaved() []string {
 	return calleeSaved
 }
 
-func (g *Generator) tls(reg string, slot int) {
-	if g.os != target.Windows {
-		g.emit("mov %s, qword ptr fs:[%d]", reg, slot)
-		return
-	}
-	g.emit("mov %s, %s", reg, g.tlsOperand(reg, slot))
-}
-
-func (g *Generator) tlsOperand(scratch string, slot int) string {
-	if g.os != target.Windows {
-		return fmt.Sprintf("fs:[%d]", slot)
-	}
-	g.emit("mov %s, qword ptr [rip+rt_tls_slot]", scratch)
-	g.emit("mov %s, qword ptr gs:[%s]", scratch, scratch)
-	return fmt.Sprintf("[%s%+d]", scratch, slot)
-}
-
 func (g *Generator) reserve(size int) {
 	if size == 0 {
 		return
@@ -140,29 +125,6 @@ func (g *Generator) reserve(size int) {
 	g.emit("cmp rsp, r11")
 	g.emit("ja %s", probe)
 	g.emit("mov rsp, r11")
-}
-
-func (g *Generator) tebToOS(gReg, mReg string) {
-	g.emit("mov r11, qword ptr gs:[%d]", tebLimit)
-	g.emit("mov [%s+%d], r11", gReg, gLimit)
-	for _, f := range []struct{ teb, m int }{{tebBase, mOSBase}, {tebLimit, mOSLimit}, {tebDealloc, mOSDealloc}} {
-		g.emit("mov r11, [%s+%d]", mReg, f.m)
-		g.emit("mov qword ptr gs:[%d], r11", f.teb)
-	}
-}
-
-func (g *Generator) tebEnterG(gReg, mReg string) {
-	g.emit("mov r11, qword ptr gs:[%d]", tebLimit)
-	g.emit("mov [%s+%d], r11", mReg, mOSLimit)
-	for _, f := range []struct{ teb, g int }{{tebBase, gHi}, {tebLimit, gLimit}, {tebDealloc, gLo}} {
-		g.emit("mov r11, [%s+%d]", gReg, f.g)
-		g.emit("mov qword ptr gs:[%d], r11", f.teb)
-	}
-}
-
-func (g *Generator) tebToG(mReg string) {
-	g.emit("mov r10, [%s+%d]", mReg, mCurG)
-	g.tebEnterG("r10", mReg)
 }
 
 func (g *Generator) win64Args(fr *frame, plan *ir.CPlan, args []*vreg, moves []pmove) []pmove {
@@ -185,10 +147,7 @@ func (g *Generator) win64Args(fr *frame, plan *ir.CPlan, args []*vreg, moves []p
 }
 
 func importTable(prog *ir.Program) map[string][]string {
-	table := map[string][]string{}
-	for dll, symbols := range runtimeImports {
-		table[dll] = slices.Clone(symbols)
-	}
+	table := runtimeImports()
 	for library, symbols := range prog.Imports {
 		dll := dllName(library)
 		table[dll] = append(table[dll], symbols...)
