@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -8,13 +9,43 @@ import (
 )
 
 const (
-	codePoints  = 0x110000
-	propsShift  = 7
-	caseShift   = 7
-	maxRecordID = 0xFFFF
-	foldFrom    = 0x40000
-	foldTo      = 0xE0000
+	codePoints     = 0x110000
+	propsShift     = 7
+	caseShift      = 7
+	propsBlockMask = 1<<propsShift - 1
+	caseBlockMask  = 1<<caseShift - 1
+	maxRecordID    = 0xFFFF
+	foldFrom       = 0x40000
+	foldTo         = 0xE0000
+	foldGap        = foldTo - foldFrom
 )
+
+const (
+	caseUpper = iota
+	caseLower
+	caseTitle
+	caseFields
+)
+
+const (
+	propsRecordSize        = wordSize
+	caseFieldWidth         = wordSize
+	caseRecordSize         = caseFields * caseFieldWidth
+	specialCodeOffset      = 0
+	specialReferenceOffset = specialCodeOffset + wordSize
+	specialLengthOffset    = specialReferenceOffset + u16Width
+	specialFieldStride     = 2 * u16Width
+	specialSize            = specialReferenceOffset + caseFields*specialFieldStride
+	specialPoolUnit        = wordSize
+)
+
+var propertyTables = []string{
+	"props_index.bin", "props_blocks.bin", "props_records.bin",
+	"case_index.bin", "case_blocks.bin", "case_records.bin",
+	"special.bin", "special_pool.bin",
+}
+
+const propertyLayoutFile = "property_layout.low"
 
 var categoryNames = []string{
 	"Cn", "Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me", "Nd", "Nl", "No", "Pc", "Pd", "Ps",
@@ -38,20 +69,24 @@ var breakNames = []string{
 var conjunctNames = []string{"None", "Consonant", "Linker", "Extend"}
 
 const (
-	categoryMask   = 0x1F
-	widthMask      = 7
-	scriptMask     = 63
-	breakMask      = 15
-	conjunctMask   = 3
-	categoryShift  = 0
-	widthShift     = 5
-	scriptShift    = 8
-	breakShift     = 14
-	conjunctShift  = 18
-	pictographFlag = 1 << 20
-	spaceFlag      = 1 << 21
-	xidStartFlag   = 1 << 22
-	xidContinue    = 1 << 23
+	categoryMask     = 0x1F
+	widthMask        = 7
+	scriptMask       = 63
+	breakMask        = 15
+	conjunctMask     = 3
+	categoryShift    = 0
+	widthShift       = 5
+	scriptShift      = 8
+	breakShift       = 14
+	conjunctShift    = 18
+	pictographShift  = 20
+	spaceShift       = 21
+	xidStartShift    = 22
+	xidContinueShift = 23
+	pictographFlag   = 1 << pictographShift
+	spaceFlag        = 1 << spaceShift
+	xidStartFlag     = 1 << xidStartShift
+	xidContinueFlag  = 1 << xidContinueShift
 )
 
 type caseDeltas struct {
@@ -227,7 +262,7 @@ func (db *propertyDatabase) readDerived(first, last rune, fields []string) error
 	case "XID_Start":
 		db.setFlag(first, last, xidStartFlag)
 	case "XID_Continue":
-		db.setFlag(first, last, xidContinue)
+		db.setFlag(first, last, xidContinueFlag)
 	case "InCB":
 		kind, err := indexOf(conjunctNames, fields[1])
 		if err != nil {
@@ -327,27 +362,38 @@ func buildRecordTrie[R comparable](all []R, shift uint, encode func(R) []byte) (
 	return out, nil
 }
 
-func (db *propertyDatabase) specialTable() ([]section, error) {
+func (db *propertyDatabase) specialTable() (entries, pooled []byte, err error) {
 	codes := make([]rune, 0, len(db.special))
 	for c := range db.special {
 		codes = append(codes, c)
 	}
 	slices.Sort(codes)
 	pool := &sequencePool{offsets: map[string]int{}}
-	var entries []byte
+	entries = make([]byte, 0, len(codes)*specialSize)
 	for _, c := range codes {
-		entry := db.special[c]
-		entries = appendU32(entries, c)
-		for _, seq := range [][]rune{entry.upper, entry.lower, entry.title} {
-			key, err := pool.add(seq)
-			if err != nil {
-				return nil, err
-			}
-			entries = pool.appendReference(entries, key)
-			entries = appendU16(entries, len(seq))
+		encoded, err := pool.encodeSpecial(c, db.special[c])
+		if err != nil {
+			return nil, nil, err
 		}
+		entries = append(entries, encoded...)
 	}
-	return []section{{"special.bin", entries}, {"special_pool.bin", pool.data}}, nil
+	return entries, pool.data, nil
+}
+
+func (p *sequencePool) encodeSpecial(c rune, entry casing) ([]byte, error) {
+	out := make([]byte, specialSize)
+	binary.LittleEndian.PutUint32(out[specialCodeOffset:], uint32(c))
+	sequences := [caseFields][]rune{caseUpper: entry.upper, caseLower: entry.lower, caseTitle: entry.title}
+	for field, seq := range sequences {
+		key, err := p.add(seq)
+		if err != nil {
+			return nil, err
+		}
+		reference := specialReferenceOffset + field*specialFieldStride
+		copy(out[reference:], p.appendReference(nil, key))
+		binary.LittleEndian.PutUint16(out[specialLengthOffset+field*specialFieldStride:], uint16(len(seq)))
+	}
+	return out, nil
 }
 
 func (db *propertyDatabase) tables() ([]section, error) {
@@ -358,22 +404,62 @@ func (db *propertyDatabase) tables() ([]section, error) {
 		return nil, err
 	}
 	deltas, err := buildRecordTrie(db.deltas, caseShift, func(d caseDeltas) []byte {
-		return appendU32(appendU32(appendU32(nil, rune(d.upper)), rune(d.lower)), rune(d.title))
+		fields := [caseFields]int32{caseUpper: d.upper, caseLower: d.lower, caseTitle: d.title}
+		out := make([]byte, 0, caseRecordSize)
+		for _, delta := range fields {
+			out = appendU32(out, rune(delta))
+		}
+		return out
 	})
 	if err != nil {
 		return nil, err
 	}
-	special, err := db.specialTable()
+	special, specialPool, err := db.specialTable()
 	if err != nil {
 		return nil, err
 	}
-	sections := []section{
-		{"props_index.bin", props.index},
-		{"props_blocks.bin", props.blocks},
-		{"props_records.bin", props.records},
-		{"case_index.bin", deltas.index},
-		{"case_blocks.bin", deltas.blocks},
-		{"case_records.bin", deltas.records},
+	sections := namedSections(propertyTables,
+		props.index, props.blocks, props.records,
+		deltas.index, deltas.blocks, deltas.records,
+		special, specialPool)
+	return append(sections, section{propertyLayoutFile, []byte(propertyLayoutSource())}), nil
+}
+
+func propertyLayoutSource() string {
+	constants := []layoutConstant{
+		lowConstant("props_block_shift", propsShift, lowInt),
+		lowConstant("props_block_mask", propsBlockMask, lowWord),
+		lowConstant("props_record_size", propsRecordSize, lowInt),
+		lowConstant("case_block_shift", caseShift, lowInt),
+		lowConstant("case_block_mask", caseBlockMask, lowWord),
+		lowConstant("case_record_size", caseRecordSize, lowInt),
+		lowConstant("case_field_width", caseFieldWidth, lowInt),
+		lowConstant("case_upper_field", caseUpper, lowInt),
+		lowConstant("case_lower_field", caseLower, lowInt),
+		lowConstant("case_title_field", caseTitle, lowInt),
+		lowConstant("special_size", specialSize, lowInt),
+		lowConstant("special_code_offset", specialCodeOffset, lowInt),
+		lowConstant("special_reference_offset", specialReferenceOffset, lowInt),
+		lowConstant("special_length_offset", specialLengthOffset, lowInt),
+		lowConstant("special_field_stride", specialFieldStride, lowInt),
+		lowConstant("special_pool_unit", specialPoolUnit, lowInt),
+		lowConstant("fold_from", foldFrom, lowCodePoint),
+		lowConstant("fold_to", foldTo, lowCodePoint),
+		lowConstant("fold_gap", foldGap, lowCodePoint),
+		lowConstant("property_category_shift", categoryShift, lowInt),
+		lowConstant("property_category_mask", categoryMask, lowWord),
+		lowConstant("property_width_shift", widthShift, lowInt),
+		lowConstant("property_width_mask", widthMask, lowWord),
+		lowConstant("property_script_shift", scriptShift, lowInt),
+		lowConstant("property_script_mask", scriptMask, lowWord),
+		lowConstant("property_break_shift", breakShift, lowInt),
+		lowConstant("property_break_mask", breakMask, lowWord),
+		lowConstant("property_conjunct_shift", conjunctShift, lowInt),
+		lowConstant("property_conjunct_mask", conjunctMask, lowWord),
+		lowConstant("property_pictographic_shift", pictographShift, lowInt),
+		lowConstant("property_space_shift", spaceShift, lowInt),
+		lowConstant("property_identifier_start_shift", xidStartShift, lowInt),
+		lowConstant("property_identifier_continue_shift", xidContinueShift, lowInt),
 	}
-	return append(sections, special...), nil
+	return layoutSource(constants, propertyTables)
 }

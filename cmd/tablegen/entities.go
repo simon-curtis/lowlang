@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,7 +9,18 @@ import (
 	"strings"
 )
 
-const maxEntityName = 32
+const (
+	maxEntityName           = 32
+	entityNameOffset        = 0
+	entityNameLengthOffset  = entityNameOffset + u16Width
+	entityValueOffset       = entityNameLengthOffset + 1
+	entityValueLengthOffset = entityValueOffset + u16Width
+	entitySize              = entityValueLengthOffset + 1
+)
+
+var entityTables = []string{"entity_index.bin", "entity_names.bin", "entity_values.bin"}
+
+const entityLayoutFile = "entity_layout.low"
 
 type entity struct {
 	Characters string `json:"characters"`
@@ -35,19 +47,35 @@ func generateEntities(source, output string) error {
 		if len(bare) > maxEntityName || len(value) > 0xFF {
 			return fmt.Errorf("entity %s exceeds the table's limits", name)
 		}
-		index = appendU16(index, len(nameBytes))
-		index = append(index, byte(len(bare)))
-		index = appendU16(index, len(valueBytes))
-		index = append(index, byte(len(value)))
+		index = append(index, encodeEntity(len(nameBytes), len(bare), len(valueBytes), len(value))...)
 		nameBytes = append(nameBytes, bare...)
 		valueBytes = append(valueBytes, value...)
 	}
 	if len(nameBytes) > 0xFFFF || len(valueBytes) > 0xFFFF {
 		return fmt.Errorf("entity names or values overflow 16-bit offsets")
 	}
-	return writeSections(output, []section{
-		{"entity_index.bin", index},
-		{"entity_names.bin", nameBytes},
-		{"entity_values.bin", valueBytes},
-	})
+	sections := namedSections(entityTables, index, nameBytes, valueBytes)
+	sections = append(sections, section{entityLayoutFile, []byte(entityLayoutSource())})
+	return writeSections(output, sections)
+}
+
+func encodeEntity(nameAt, nameLength, valueAt, valueLength int) []byte {
+	out := make([]byte, entitySize)
+	binary.LittleEndian.PutUint16(out[entityNameOffset:], uint16(nameAt))
+	out[entityNameLengthOffset] = byte(nameLength)
+	binary.LittleEndian.PutUint16(out[entityValueOffset:], uint16(valueAt))
+	out[entityValueLengthOffset] = byte(valueLength)
+	return out
+}
+
+func entityLayoutSource() string {
+	constants := []layoutConstant{
+		lowConstant("max_entity_name", maxEntityName, lowInt),
+		lowConstant("entity_size", entitySize, lowInt),
+		lowConstant("entity_name_offset", entityNameOffset, lowInt),
+		lowConstant("entity_name_length_offset", entityNameLengthOffset, lowInt),
+		lowConstant("entity_value_offset", entityValueOffset, lowInt),
+		lowConstant("entity_value_length_offset", entityValueLengthOffset, lowInt),
+	}
+	return layoutSource(constants, entityTables)
 }

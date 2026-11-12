@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,14 +14,42 @@ import (
 const (
 	blockShift   = 6
 	blockSize    = 1 << blockShift
+	blockMask    = blockSize - 1
 	hangulBase   = 0xAC00
-	hangulCount  = 11172
 	hangulLBase  = 0x1100
 	hangulVBase  = 0x1161
 	hangulTBase  = 0x11A7
+	hangulLCount = 19
+	hangulVCount = 21
 	hangulTCount = 28
-	hangulNCount = 21 * hangulTCount
+	hangulNCount = hangulVCount * hangulTCount
+	hangulCount  = hangulLCount * hangulNCount
 )
+
+const (
+	canonicalField = iota
+	compatField
+	foldField
+	mappingFields
+)
+
+const (
+	wordSize                = 4
+	mappingUnit             = wordSize
+	u16Width                = 2
+	recordClassOffset       = 0
+	recordLengthOffset      = 1
+	recordReferenceOffset   = recordLengthOffset + mappingFields
+	recordSize              = recordReferenceOffset + mappingFields*u16Width
+	compositionFirstOffset  = 0
+	compositionSecondOffset = compositionFirstOffset + mappingUnit
+	compositionResultOffset = compositionSecondOffset + mappingUnit
+	compositionSize         = compositionResultOffset + mappingUnit
+)
+
+var unicodeTables = []string{"stage1.bin", "stage2.bin", "records.bin", "mappings.bin", "compositions.bin"}
+
+const normalizationLayoutFile = "normalization_layout.low"
 
 type character struct {
 	class      int
@@ -281,20 +310,54 @@ func (db *database) tables() ([]section, error) {
 	if err != nil {
 		return nil, err
 	}
-	var recordBytes []byte
+	recordBytes := make([]byte, 0, len(records)*recordSize)
 	for _, r := range records {
-		recordBytes = append(recordBytes, byte(r.class), byte(len([]rune(r.canonical))), byte(len([]rune(r.compat))), byte(len([]rune(r.fold))))
-		recordBytes = pool.appendReference(recordBytes, r.canonical)
-		recordBytes = pool.appendReference(recordBytes, r.compat)
-		recordBytes = pool.appendReference(recordBytes, r.fold)
+		recordBytes = append(recordBytes, pool.encodeRecord(r)...)
 	}
-	return []section{
-		{"stage1.bin", stage1},
-		{"stage2.bin", stage2},
-		{"records.bin", recordBytes},
-		{"mappings.bin", pool.data},
-		{"compositions.bin", db.compositions()},
-	}, nil
+	sections := namedSections(unicodeTables, stage1, stage2, recordBytes, pool.data, db.compositions())
+	return append(sections, section{normalizationLayoutFile, []byte(normalizationLayoutSource())}), nil
+}
+
+func (p *sequencePool) encodeRecord(r record) []byte {
+	out := make([]byte, recordSize)
+	out[recordClassOffset] = byte(r.class)
+	keys := [mappingFields]string{canonicalField: r.canonical, compatField: r.compat, foldField: r.fold}
+	for field, key := range keys {
+		out[recordLengthOffset+field] = byte(len([]rune(key)))
+		reference := recordReferenceOffset + field*u16Width
+		copy(out[reference:], p.appendReference(nil, key))
+	}
+	return out
+}
+
+func normalizationLayoutSource() string {
+	constants := []layoutConstant{
+		lowConstant("trie_block_shift", blockShift, lowInt),
+		lowConstant("trie_block_mask", blockMask, lowWord),
+		lowConstant("record_size", recordSize, lowInt),
+		lowConstant("record_class_offset", recordClassOffset, lowInt),
+		lowConstant("record_length_offset", recordLengthOffset, lowInt),
+		lowConstant("record_reference_offset", recordReferenceOffset, lowInt),
+		lowConstant("record_reference_width", u16Width, lowInt),
+		lowConstant("canonical_field", canonicalField, lowInt),
+		lowConstant("compat_field", compatField, lowInt),
+		lowConstant("fold_field", foldField, lowInt),
+		lowConstant("mapping_unit", mappingUnit, lowInt),
+		lowConstant("composition_size", compositionSize, lowInt),
+		lowConstant("composition_first_offset", compositionFirstOffset, lowInt),
+		lowConstant("composition_second_offset", compositionSecondOffset, lowInt),
+		lowConstant("composition_result_offset", compositionResultOffset, lowInt),
+		lowConstant("hangul_base", hangulBase, lowCodePoint),
+		lowConstant("hangul_count", hangulCount, lowWord),
+		lowConstant("hangul_l_base", hangulLBase, lowCodePoint),
+		lowConstant("hangul_v_base", hangulVBase, lowCodePoint),
+		lowConstant("hangul_t_base", hangulTBase, lowCodePoint),
+		lowConstant("hangul_l_count", hangulLCount, lowWord),
+		lowConstant("hangul_v_count", hangulVCount, lowWord),
+		lowConstant("hangul_t_count", hangulTCount, lowWord),
+		lowConstant("hangul_n_count", hangulNCount, lowWord),
+	}
+	return layoutSource(constants, unicodeTables)
 }
 
 func buildTrie(perCode map[rune]int, limit rune) ([]byte, []byte, error) {
@@ -338,11 +401,13 @@ func (db *database) compositions() []byte {
 		}
 		return int(a.second - b.second)
 	})
-	var out []byte
+	out := make([]byte, 0, len(pairs)*compositionSize)
 	for _, p := range pairs {
-		out = appendU32(out, p.first)
-		out = appendU32(out, p.second)
-		out = appendU32(out, p.composite)
+		entry := make([]byte, compositionSize)
+		binary.LittleEndian.PutUint32(entry[compositionFirstOffset:], uint32(p.first))
+		binary.LittleEndian.PutUint32(entry[compositionSecondOffset:], uint32(p.second))
+		binary.LittleEndian.PutUint32(entry[compositionResultOffset:], uint32(p.composite))
+		out = append(out, entry...)
 	}
 	return out
 }
