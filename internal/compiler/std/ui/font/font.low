@@ -1,0 +1,373 @@
+/// Why a font was rejected.
+pub enum Error {
+    /// A table or offset runs past the end of the data, or a count, length or index disagrees with another. `table` names the table, or `header` or `directory`.
+    Malformed(table: str)
+    /// The data is a well-formed font that holds something this module does not read: CFF outlines, a font collection or no usable character map. `table` names it.
+    Unsupported(table: str)
+}
+
+/// A TrueType font with `glyf` outlines, held as the bytes it was parsed from.
+///
+/// Metrics are in font units, `units_per_em` to the em square, with y up.
+pub struct Font {
+    data: str = ""
+    /// The number of font units in the em square.
+    pub units_per_em: i64 = 0
+    /// The distance from the baseline to the top of a line, in font units.
+    pub ascent: i64 = 0
+    /// The distance from the baseline to the bottom of a line in font units, negative below the baseline.
+    pub descent: i64 = 0
+    /// The extra space between one line's descent and the next line's ascent, in font units.
+    pub line_gap: i64 = 0
+    /// The number of glyphs, which are numbered from 0, the glyph drawn for a missing character.
+    pub glyph_count: i64 = 0
+    metric_count: i64 = 0
+    hmtx: i64 = 0
+    loca: i64 = 0
+    long_loca: bool = false
+    glyf: i64 = 0
+    cmap: i64 = 0
+    cmap_format: i64 = 0
+    kern: i64 = 0
+    kern_pairs: i64 = 0
+}
+
+struct Table {
+    offset: i64
+    length: i64
+}
+
+struct Directory {
+    data: str
+    count: i64
+}
+
+struct Cmap {
+    at: i64
+    format: i64
+}
+
+struct Kern {
+    at: i64
+    pairs: i64
+}
+
+/// Reads the TrueType font in `data`.
+///
+/// The `head`, `hhea`, `maxp`, `cmap`, `hmtx`, `loca` and `glyf` tables are required and `kern` is optional. A `cmap` subtable of format 12 or 4 is used, preferring a Unicode one that covers every plane. Only the first horizontal `kern` subtable of format 0 is read.
+///
+/// Every table in the directory, and the `loca` offsets, are checked here. Glyph data and lookup tables are read when used, and a malformed one gives glyph 0, an empty outline or a zero metric instead of an error.
+pub fn parse(data: str) -> Font ! Error {
+    let magic = if data.len >= 4 { data[0..4] } else { "" }
+    if magic == "OTTO" || magic == "ttcf" {
+        fail Unsupported(magic)
+    }
+    if data.len < 12 || (magic != "true" && be32(data, 0) != 65536) {
+        fail Malformed("header")
+    }
+    let dir = directory(data)?
+    let glyf = find(dir, "glyf") ?? fail missing_outlines(dir)
+    let head = require(dir, "head", 54)?
+    let hhea = require(dir, "hhea", 36)?
+    let maxp = require(dir, "maxp", 6)?
+    let hmtx = require(dir, "hmtx", 0)?
+    let loca = require(dir, "loca", 0)?
+    let units = be16(data, head.offset + 18)
+    if units < 16 || units > 16384 {
+        fail Malformed("head")
+    }
+    let loca_format = be16(data, head.offset + 50)
+    if loca_format > 1 {
+        fail Malformed("head")
+    }
+    let glyph_count = be16(data, maxp.offset + 4)
+    if glyph_count == 0 {
+        fail Malformed("maxp")
+    }
+    let metric_count = be16(data, hhea.offset + 34)
+    if metric_count < 1 || metric_count > glyph_count {
+        fail Malformed("hhea")
+    }
+    if hmtx.length < 4 * metric_count {
+        fail Malformed("hmtx")
+    }
+    let long_loca = loca_format == 1
+    if !loca_valid(data, loca, long_loca, glyph_count, glyf.length) {
+        fail Malformed("loca")
+    }
+    let cmap = choose_cmap(dir)?
+    let kern = read_kern(dir)?
+    Font {
+        data
+        units_per_em: units
+        ascent: be16_signed(data, hhea.offset + 4)
+        descent: be16_signed(data, hhea.offset + 6)
+        line_gap: be16_signed(data, hhea.offset + 8)
+        glyph_count
+        metric_count
+        hmtx: hmtx.offset
+        loca: loca.offset
+        long_loca
+        glyf: glyf.offset
+        cmap: cmap.at
+        cmap_format: cmap.format
+        kern: kern.at
+        kern_pairs: kern.pairs
+    }
+}
+
+/// Returns Go Regular, the font embedded in the standard library.
+pub fn fallback() -> Font {
+    parse(embed("GoRegular.ttf")) catch Font {}
+}
+
+/// Returns the number of pixels one font unit covers when the em square is `pixel_size` pixels.
+pub fn scale(f: Font, pixel_size: f32) -> f32 {
+    pixel_size / f32(f.units_per_em)
+}
+
+/// Returns the glyph that draws `code_point`, or 0 when the font has none.
+pub fn glyph_index(f: Font, code_point: u32) -> i64 {
+    let g = if f.cmap_format == 12 {
+        lookup_12(f, i64(code_point))
+    } else {
+        lookup_4(f, i64(code_point))
+    }
+    if g < f.glyph_count {
+        g
+    } else {
+        0
+    }
+}
+
+/// Returns the distance in font units from the pen position of `glyph` to the next one, or 0 for a glyph the font does not have.
+pub fn advance(f: Font, glyph: i64) -> i64 {
+    if glyph < 0 || glyph >= f.glyph_count {
+        return 0
+    }
+    let index = if glyph < f.metric_count { glyph } else { f.metric_count - 1 }
+    be16(f.data, f.hmtx + 4 * index)
+}
+
+/// Returns the font units to add to the pen position between the glyphs `left` and `right`, negative to bring them closer, or 0 when the font has no `kern` pair for them.
+pub fn kern(f: Font, left: i64, right: i64) -> i64 {
+    var lo = 0
+    var hi = f.kern_pairs
+    let key = left << 16 | right
+    for lo < hi {
+        let mid = (lo + hi) / 2
+        if be32(f.data, f.kern + 6 * mid) < key {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo < f.kern_pairs && be32(f.data, f.kern + 6 * lo) == key {
+        be16_signed(f.data, f.kern + 6 * lo + 4)
+    } else {
+        0
+    }
+}
+
+fn directory(data: str) -> Directory ! Error {
+    let count = be16(data, 4)
+    if 12 + 16 * count > data.len {
+        fail Malformed("directory")
+    }
+    for i in 0..count {
+        let record = 12 + 16 * i
+        if be32(data, record + 8) + be32(data, record + 12) > data.len {
+            fail Malformed(data[record..record + 4])
+        }
+    }
+    Directory { data, count }
+}
+
+fn find(d: Directory, tag: str) -> Table? {
+    for i in 0..d.count {
+        let record = 12 + 16 * i
+        if d.data[record..record + 4] == tag {
+            return Table { offset: be32(d.data, record + 8), length: be32(d.data, record + 12) }
+        }
+    }
+    none
+}
+
+fn require(d: Directory, tag: str, minimum: i64) -> Table ! Error {
+    let t = find(d, tag) ?? fail Malformed(tag)
+    if t.length < minimum {
+        fail Malformed(tag)
+    }
+    t
+}
+
+fn missing_outlines(d: Directory) -> Error {
+    if find(d, "CFF ") != none {
+        Unsupported("CFF ")
+    } else if find(d, "CFF2") != none {
+        Unsupported("CFF2")
+    } else {
+        Malformed("glyf")
+    }
+}
+
+fn loca_entry(data: str, at: i64, long: bool, index: i64) -> i64 {
+    if long {
+        be32(data, at + 4 * index)
+    } else {
+        be16(data, at + 2 * index) * 2
+    }
+}
+
+fn loca_valid(data: str, loca: Table, long: bool, glyph_count: i64, glyf_length: i64) -> bool {
+    let size = if long { 4 } else { 2 }
+    if loca.length < size * (glyph_count + 1) {
+        return false
+    }
+    var previous = 0
+    for i in 0..glyph_count + 1 {
+        let entry = loca_entry(data, loca.offset, long, i)
+        if entry < previous || entry > glyf_length {
+            return false
+        }
+        previous = entry
+    }
+    true
+}
+
+fn choose_cmap(d: Directory) -> Cmap ! Error {
+    let table = require(d, "cmap", 4)?
+    var best = Cmap { at: 0, format: 0 }
+    var best_rank = 0
+    for i in 0..be16(d.data, table.offset + 2) {
+        let record = table.offset + 4 + 8 * i
+        let at = table.offset + be32(d.data, record + 4)
+        if at + 2 > table.offset + table.length {
+            continue
+        }
+        let format = be16(d.data, at)
+        let rank = cmap_rank(be16(d.data, record), be16(d.data, record + 2), format)
+        if rank > best_rank {
+            best = Cmap { at, format }
+            best_rank = rank
+        }
+    }
+    if best_rank == 0 {
+        fail Unsupported("cmap")
+    }
+    if !cmap_fits(d.data, best, table.offset + table.length) {
+        fail Malformed("cmap")
+    }
+    best
+}
+
+fn cmap_rank(platform: i64, encoding: i64, format: i64) -> i64 {
+    if format == 12 && platform == 3 && encoding == 10 {
+        4
+    } else if format == 12 && platform == 0 {
+        3
+    } else if format == 4 && platform == 3 && encoding == 1 {
+        2
+    } else if format == 4 && platform == 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn cmap_fits(data: str, c: Cmap, end: i64) -> bool {
+    if c.format == 12 {
+        c.at + 16 + 12 * be32(data, c.at + 12) <= end
+    } else {
+        c.at + 16 + 4 * be16(data, c.at + 6) <= end
+    }
+}
+
+fn read_kern(d: Directory) -> Kern ! Error {
+    let table = find(d, "kern") ?? return Kern { at: 0, pairs: 0 }
+    if table.length < 4 || be16(d.data, table.offset) != 0 {
+        return Kern { at: 0, pairs: 0 }
+    }
+    let end = table.offset + table.length
+    var at = table.offset + 4
+    for _ in 0..be16(d.data, table.offset + 2) {
+        if at + 14 > end {
+            fail Malformed("kern")
+        }
+        let length = be16(d.data, at + 2)
+        let coverage = be16(d.data, at + 4)
+        if coverage == 1 {
+            let pairs = be16(d.data, at + 6)
+            if at + 14 + 6 * pairs > end {
+                fail Malformed("kern")
+            }
+            return Kern { at: at + 14, pairs }
+        }
+        if length == 0 {
+            break
+        }
+        at += length
+    }
+    Kern { at: 0, pairs: 0 }
+}
+
+fn lookup_4(f: Font, cp: i64) -> i64 {
+    if cp > 65535 {
+        return 0
+    }
+    let segments = be16(f.data, f.cmap + 6) / 2
+    let ends = f.cmap + 14
+    let starts = ends + 2 * segments + 2
+    let deltas = starts + 2 * segments
+    let offsets = deltas + 2 * segments
+    var lo = 0
+    var hi = segments
+    for lo < hi {
+        let mid = (lo + hi) / 2
+        if be16(f.data, ends + 2 * mid) < cp {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo == segments {
+        return 0
+    }
+    let start = be16(f.data, starts + 2 * lo)
+    if cp < start {
+        return 0
+    }
+    let delta = be16(f.data, deltas + 2 * lo)
+    let range = be16(f.data, offsets + 2 * lo)
+    if range == 0 {
+        return (cp + delta) & 65535
+    }
+    let g = be16(f.data, offsets + 2 * lo + range + 2 * (cp - start))
+    if g == 0 {
+        0
+    } else {
+        (g + delta) & 65535
+    }
+}
+
+fn lookup_12(f: Font, cp: i64) -> i64 {
+    let groups = f.cmap + 16
+    var lo = 0
+    var hi = be32(f.data, f.cmap + 12)
+    for lo < hi {
+        let mid = (lo + hi) / 2
+        if be32(f.data, groups + 12 * mid + 4) < cp {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo == be32(f.data, f.cmap + 12) {
+        return 0
+    }
+    let start = be32(f.data, groups + 12 * lo)
+    if cp < start {
+        return 0
+    }
+    be32(f.data, groups + 12 * lo + 8) + cp - start
+}

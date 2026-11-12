@@ -1,0 +1,291 @@
+/// A point of a glyph outline, in font units with y up.
+pub struct Point {
+    /// The distance right of the glyph's origin.
+    pub x: f32
+    /// The distance above the baseline.
+    pub y: f32
+    /// Whether the point is on the curve, or a control point of a quadratic curve.
+    pub on_curve: bool
+}
+
+/// A closed loop of points: lines between consecutive on-curve points, and a quadratic curve through each run of off-curve points.
+///
+/// Between two consecutive off-curve points the curve passes through their midpoint, which the list leaves out.
+pub struct Contour {
+    /// The points in file order.
+    pub points: []Point
+}
+
+/// The shape of a glyph, in font units.
+pub struct Outline {
+    /// The closed loops, which fill by the non-zero winding rule.
+    pub contours: []Contour
+}
+
+struct Span {
+    start: i64
+    end: i64
+}
+
+struct Matrix {
+    a: f32
+    b: f32
+    c: f32
+    d: f32
+}
+
+struct Coordinates {
+    values: []i64
+    next: i64
+}
+
+fn max_depth() -> i64 {
+    6
+}
+
+fn max_components() -> i64 {
+    64
+}
+
+/// Returns the outline of `glyph`, with each component of a composite glyph placed by its offset and scale.
+///
+/// A component placed by matching points instead of an offset is supported; `SCALED_COMPONENT_OFFSET` is not, so offsets are never scaled. A composite nests at most 6 deep and holds at most 64 components in all.
+///
+/// A space, a glyph the font does not have and a glyph whose data is truncated or inconsistent give an outline with no contours.
+pub fn outline(f: Font, glyph: i64) -> Outline {
+    var budget = max_components()
+    let found = contours_of(f, glyph, 0, mut budget) ?? none_found()
+    Outline { contours: found }
+}
+
+fn none_found() -> []Contour {
+    []
+}
+
+fn glyph_span(f: Font, glyph: i64) -> Span {
+    if glyph < 0 || glyph >= f.glyph_count {
+        return Span { start: 0, end: 0 }
+    }
+    let start = loca_entry(f.data, f.loca, f.long_loca, glyph)
+    let end = loca_entry(f.data, f.loca, f.long_loca, glyph + 1)
+    Span { start: f.glyf + start, end: f.glyf + end }
+}
+
+fn contours_of(f: Font, glyph: i64, depth: i64, mut budget: i64) -> []Contour? {
+    if depth > max_depth() {
+        return none
+    }
+    let span = glyph_span(f, glyph)
+    if span.end == span.start {
+        return none_found()
+    }
+    if span.end - span.start < 10 {
+        return none
+    }
+    let count = be16_signed(f.data, span.start)
+    if count > 0 {
+        simple_contours(f.data, span, count)
+    } else if count == -1 {
+        composite_contours(f, span, depth, mut budget)
+    } else {
+        none_found()
+    }
+}
+
+fn simple_contours(d: str, span: Span, count: i64) -> []Contour? {
+    let ends_at = span.start + 10
+    var ends: []i64 = []
+    var previous = -1
+    if ends_at + 2 * count + 2 > span.end {
+        return none
+    }
+    for i in 0..count {
+        let end = be16(d, ends_at + 2 * i)
+        if end <= previous {
+            return none
+        }
+        ends.push(end)
+        previous = end
+    }
+    let total = previous + 1
+    let flags_at = ends_at + 2 * count + 2 + be16(d, ends_at + 2 * count)
+    let flags = read_flags(d, flags_at, span.end, total) ?? return none
+    let xs = read_coordinates(d, flags.next, span.end, flags.values, 2, 16) ?? return none
+    let ys = read_coordinates(d, xs.next, span.end, flags.values, 4, 32) ?? return none
+    var out: []Contour = []
+    var first = 0
+    for end in ends {
+        var points: []Point = []
+        for i in first..end + 1 {
+            points.push(Point { x: f32(xs.values[i]), y: f32(ys.values[i]), on_curve: flags.values[i] & 1 != 0 })
+        }
+        out.push(Contour { points })
+        first = end + 1
+    }
+    out
+}
+
+fn read_flags(d: str, at: i64, end: i64, total: i64) -> Coordinates? {
+    var flags: []i64 = []
+    var pos = at
+    for flags.len < total {
+        if pos >= end {
+            return none
+        }
+        let flag = byte(d, pos)
+        pos += 1
+        flags.push(flag)
+        if flag & 8 != 0 {
+            if pos >= end {
+                return none
+            }
+            var repeats = byte(d, pos)
+            pos += 1
+            for repeats > 0 && flags.len < total {
+                flags.push(flag)
+                repeats -= 1
+            }
+        }
+    }
+    Coordinates { values: flags, next: pos }
+}
+
+fn read_coordinates(d: str, at: i64, end: i64, flags: []i64, short: i64, same: i64) -> Coordinates? {
+    var values: []i64 = []
+    var pos = at
+    var current = 0
+    for flag in flags {
+        if flag & short != 0 {
+            if pos + 1 > end {
+                return none
+            }
+            let step = byte(d, pos)
+            current += if flag & same != 0 { step } else { -step }
+            pos += 1
+        } else if flag & same == 0 {
+            if pos + 2 > end {
+                return none
+            }
+            current += be16_signed(d, pos)
+            pos += 2
+        }
+        values.push(current)
+    }
+    Coordinates { values, next: pos }
+}
+
+fn composite_contours(f: Font, span: Span, depth: i64, mut budget: i64) -> []Contour? {
+    var out: []Contour = []
+    var pos = span.start + 10
+    for {
+        if pos + 4 > span.end {
+            return none
+        }
+        let flags = be16(f.data, pos)
+        let child = be16(f.data, pos + 2)
+        let words = flags & 1 != 0
+        let offsets = flags & 2 != 0
+        let arg_width = if words { 2 } else { 1 }
+        let matrix_size = matrix_bytes(flags)
+        if pos + 4 + 2 * arg_width + matrix_size > span.end {
+            return none
+        }
+        let first = argument(f.data, pos + 4, words, offsets)
+        let second = argument(f.data, pos + 4 + arg_width, words, offsets)
+        let matrix = read_matrix(f.data, pos + 4 + 2 * arg_width, flags)
+        pos += 4 + 2 * arg_width + matrix_size
+        budget -= 1
+        if budget < 0 {
+            return none
+        }
+        let sub = contours_of(f, child, depth + 1, mut budget) ?? return none
+        let placed = transformed(sub, matrix)
+        var dx = f32(first)
+        var dy = f32(second)
+        if !offsets {
+            let parent_point = nth_point(out, first) ?? return none
+            let child_point = nth_point(placed, second) ?? return none
+            dx = parent_point.x - child_point.x
+            dy = parent_point.y - child_point.y
+        }
+        for c in translated(placed, dx, dy) {
+            out.push(c)
+        }
+        if flags & 32 == 0 {
+            break
+        }
+    }
+    out
+}
+
+fn argument(d: str, at: i64, words: bool, signed: bool) -> i64 {
+    if words && signed {
+        be16_signed(d, at)
+    } else if words {
+        be16(d, at)
+    } else if signed {
+        byte_signed(d, at)
+    } else {
+        byte(d, at)
+    }
+}
+
+fn matrix_bytes(flags: i64) -> i64 {
+    if flags & 8 != 0 {
+        2
+    } else if flags & 64 != 0 {
+        4
+    } else if flags & 128 != 0 {
+        8
+    } else {
+        0
+    }
+}
+
+fn read_matrix(d: str, at: i64, flags: i64) -> Matrix {
+    if flags & 8 != 0 {
+        let s = fixed_2_14(d, at)
+        Matrix { a: s, b: 0.0, c: 0.0, d: s }
+    } else if flags & 64 != 0 {
+        Matrix { a: fixed_2_14(d, at), b: 0.0, c: 0.0, d: fixed_2_14(d, at + 2) }
+    } else if flags & 128 != 0 {
+        Matrix { a: fixed_2_14(d, at), b: fixed_2_14(d, at + 2), c: fixed_2_14(d, at + 4), d: fixed_2_14(d, at + 6) }
+    } else {
+        Matrix { a: 1.0, b: 0.0, c: 0.0, d: 1.0 }
+    }
+}
+
+fn transformed(cs: []Contour, m: Matrix) -> []Contour {
+    var out: []Contour = []
+    for c in cs {
+        var points: []Point = []
+        for p in c.points {
+            points.push(Point { x: m.a * p.x + m.c * p.y, y: m.b * p.x + m.d * p.y, on_curve: p.on_curve })
+        }
+        out.push(Contour { points })
+    }
+    out
+}
+
+fn translated(cs: []Contour, dx: f32, dy: f32) -> []Contour {
+    var out: []Contour = []
+    for c in cs {
+        var points: []Point = []
+        for p in c.points {
+            points.push(Point { x: p.x + dx, y: p.y + dy, on_curve: p.on_curve })
+        }
+        out.push(Contour { points })
+    }
+    out
+}
+
+fn nth_point(cs: []Contour, n: i64) -> Point? {
+    var rest = n
+    for c in cs {
+        if rest < c.points.len {
+            return c.points[rest]
+        }
+        rest -= c.points.len
+    }
+    none
+}

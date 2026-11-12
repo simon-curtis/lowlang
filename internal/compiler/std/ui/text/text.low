@@ -1,0 +1,343 @@
+import std/ui/font
+import std/ui/geometry
+import std/ui/scene
+
+fn atlas_size() -> i64 {
+    1024
+}
+
+/// A glyph placed on a line.
+pub struct Placed {
+    /// The index in `System`'s fonts of the font that draws the glyph.
+    pub font: i64
+    /// The glyph in that font.
+    pub glyph: i64
+    /// The pen position of the glyph from the left edge of its line, in layout pixels.
+    pub x: f32
+}
+
+/// One line of a layout.
+pub struct Line {
+    /// The glyphs in order, spaces included.
+    pub glyphs: []Placed
+    /// The distance from the top of the layout to the line's baseline, in layout pixels.
+    pub y: f32
+    /// The distance from the left edge to the end of the last glyph that is not a space, in layout pixels.
+    pub width: f32
+}
+
+/// Text broken into lines at one size, in layout pixels.
+pub struct Layout {
+    /// The lines from the top.
+    pub lines: []Line
+    /// The em size in pixels the text was laid out at.
+    pub size: f32
+    /// The width of the widest line.
+    pub width: f32
+    /// The height of all lines: the first font's ascent, descent and line gap, times the line count.
+    pub height: f32
+}
+
+struct Tile {
+    visible: bool
+    left: f32
+    top: f32
+    width: f32
+    height: f32
+    uv: geometry.Rect
+}
+
+struct Shelf {
+    y: i64
+    height: i64
+    next: i64
+}
+
+struct Spot {
+    x: i64
+    y: i64
+}
+
+struct Shaped {
+    font: i64
+    glyph: i64
+}
+
+/// The fonts, the glyph atlas and the caches that text drawing keeps between calls.
+pub struct System {
+    fonts: []font.Font
+    /// The atlas the sprites that `paint` pushes sample, for the renderer to upload.
+    pub atlas: scene.Atlas
+    shelves: []Shelf
+    next_shelf: i64
+    full: bool
+    tiles: [i64: Tile]
+    layouts: [str: Layout]
+}
+
+struct Flow {
+    width: f32
+    size: f32
+    baseline: f32
+    height: f32
+    glyphs: []Placed
+    pen: f32
+    ink: f32
+    before: f32
+    word: i64
+    in_word: bool
+    last: Shaped
+    lines: []Line
+    widest: f32
+}
+
+/// Returns a system that draws with `fonts` in order of preference, or with `font.fallback()` when `fonts` is empty, and a glyph atlas of 1024 pixels square.
+pub fn system(fonts: []font.Font) -> System {
+    system_with_atlas(fonts, atlas_size())
+}
+
+/// Returns a system with `font.fallback()` as its only font.
+pub fn default_system() -> System {
+    system([])
+}
+
+/// Returns a system like `system` whose atlas is `size` pixels square, so a test can fill it with a few glyphs.
+pub fn system_with_atlas(fonts: []font.Font, size: i64) -> System {
+    let chosen = if fonts.len == 0 { [font.fallback()] } else { fonts }
+    System { fonts: chosen, atlas: scene.atlas(size), shelves: [], next_shelf: 0, full: false, tiles: [:], layouts: [:] }
+}
+
+/// Returns the number of layouts `wrap` holds for the current frame.
+pub fn cached(sys: System) -> i64 {
+    sys.layouts.len
+}
+
+/// Ends a frame: forgets the measured layouts, and when the atlas ran out of room during the frame, clears it and every packed glyph so the next frame packs its own text from the start.
+pub fn end_frame(mut sys: System) {
+    sys.layouts = [:]
+    if sys.full {
+        scene.clear(mut sys.atlas)
+        sys.tiles = [:]
+        sys.shelves = []
+        sys.next_shelf = 0
+        sys.full = false
+    }
+}
+
+/// Returns `s` laid out at `size` pixels in lines no wider than `width` pixels, or in lines that end only at `\n` when `width` is infinite.
+///
+/// Each code point is drawn by the first font that has it, else by the first font's glyph 0, and advances the pen by the glyph's advance plus the `kern` adjustment to the glyph before it when both come from one font. A line breaks after a space, so spaces at the end of a line hang past its width, and a word wider than `width` breaks between glyphs. `\n` ends a line, a `\r` is ignored, and a layout always has at least one line.
+///
+/// The result is kept until `end_frame`, so laying out the same `s`, `size` and `width` again returns it.
+pub fn wrap(mut sys: System, s: str, size: f32, width: f32) -> Layout {
+    let key = "{size}|{width}|{s}"
+    match sys.layouts[key] {
+        some(cached_layout) => return cached_layout
+        none => {}
+    }
+    let built = lay_out(sys, s, size, width)
+    sys.layouts[key] = built
+    built
+}
+
+/// Returns the size of `s` laid out by `wrap`.
+pub fn measure(mut sys: System, s: str, size: f32, width: f32) -> geometry.Size {
+    let l = wrap(mut sys, s, size, width)
+    geometry.size(l.width, l.height)
+}
+
+/// Pushes one sprite onto `sc` for each visible glyph of `l`, tinted `color`, with the layout's top left at `origin` and everything multiplied by `scale`.
+///
+/// Glyphs are rasterised at `l.size * scale` pixels, rounded to 1/64 pixel, the first time they are drawn, and packed into the atlas with a one-pixel empty border. Each glyph's pen position is rounded to a whole device pixel. A glyph that does not fit in the atlas is left out, and so is every glyph packed after it until `end_frame`.
+pub fn paint(mut sys: System, mut sc: scene.Scene, l: Layout, origin: geometry.Point, color: geometry.Color, scale: f32) {
+    let pixel_size = l.size * scale
+    for line in l.lines {
+        let baseline = snap((origin.y + line.y) * scale)
+        for g in line.glyphs {
+            let tile = glyph_tile(mut sys, g, pixel_size) ?? continue
+            if tile.visible {
+                let x = snap((origin.x + g.x) * scale)
+                let bounds = geometry.rect(x + tile.left, baseline + tile.top, tile.width, tile.height)
+                scene.push_sprite(mut sc, scene.Sprite { bounds, color, tile: tile.uv })
+            }
+        }
+    }
+}
+
+fn snap(v: f32) -> f32 {
+    floor(v + 0.5)
+}
+
+fn lay_out(sys: System, s: str, size: f32, width: f32) -> Layout {
+    let first = sys.fonts[0]
+    let k = font.scale(first, size)
+    let ascent = f32(first.ascent) * k
+    let height = f32(first.ascent - first.descent + first.line_gap) * k
+    var flow = Flow {
+        width
+        size
+        baseline: ascent
+        height
+        glyphs: []
+        pen: 0.0
+        ink: 0.0
+        before: 0.0
+        word: 0
+        in_word: false
+        last: Shaped { font: -1, glyph: 0 }
+        lines: []
+        widest: 0.0
+    }
+    for c in s {
+        if c == '\n' {
+            finish_line(mut flow)
+        } else if c != '\r' {
+            let shaped = shape(sys, c)
+            place(sys, mut flow, c == ' ', shaped)
+        }
+    }
+    finish_line(mut flow)
+    Layout { lines: flow.lines, size, width: flow.widest, height: height * f32(flow.lines.len) }
+}
+
+fn shape(sys: System, c: u32) -> Shaped {
+    for i, f in sys.fonts {
+        let g = font.glyph_index(f, c)
+        if g != 0 {
+            return Shaped { font: i, glyph: g }
+        }
+    }
+    Shaped { font: 0, glyph: 0 }
+}
+
+fn place(sys: System, mut flow: Flow, is_space: bool, shaped: Shaped) {
+    let f = sys.fonts[shaped.font]
+    let advance = f32(font.advance(f, shaped.glyph)) * font.scale(f, flow.size)
+    if is_space {
+        add(mut flow, sys, shaped, advance)
+        flow.in_word = false
+        return
+    }
+    if !flow.in_word {
+        flow.word = flow.glyphs.len
+        flow.before = flow.ink
+        flow.in_word = true
+    }
+    if pen_for(sys, flow, shaped) + advance > flow.width {
+        if flow.word > 0 {
+            move_word(mut flow)
+        }
+        if flow.glyphs.len > 0 && pen_for(sys, flow, shaped) + advance > flow.width {
+            finish_line(mut flow)
+            flow.in_word = true
+        }
+    }
+    add(mut flow, sys, shaped, advance)
+    flow.ink = flow.pen
+}
+
+fn pen_for(sys: System, flow: Flow, shaped: Shaped) -> f32 {
+    if flow.last.font == shaped.font {
+        let f = sys.fonts[shaped.font]
+        flow.pen + f32(font.kern(f, flow.last.glyph, shaped.glyph)) * font.scale(f, flow.size)
+    } else {
+        flow.pen
+    }
+}
+
+fn add(mut flow: Flow, sys: System, shaped: Shaped, advance: f32) {
+    let x = pen_for(sys, flow, shaped)
+    flow.glyphs.push(Placed { font: shaped.font, glyph: shaped.glyph, x })
+    flow.pen = x + advance
+    flow.last = shaped
+}
+
+fn move_word(mut flow: Flow) {
+    if flow.word == flow.glyphs.len {
+        finish_line(mut flow)
+        flow.in_word = true
+        return
+    }
+    let origin = flow.glyphs[flow.word].x
+    var carried: []Placed = []
+    for i in flow.word..flow.glyphs.len {
+        let g = flow.glyphs[i]
+        carried.push(Placed { font: g.font, glyph: g.glyph, x: g.x - origin })
+    }
+    let kept = flow.glyphs[..flow.word]
+    push_line(mut flow, kept, flow.before)
+    flow.glyphs = carried
+    flow.pen = flow.pen - origin
+    flow.ink = flow.pen
+    flow.before = 0.0
+    flow.word = 0
+}
+
+fn finish_line(mut flow: Flow) {
+    push_line(mut flow, flow.glyphs, flow.ink)
+    flow.glyphs = []
+    flow.pen = 0.0
+    flow.ink = 0.0
+    flow.before = 0.0
+    flow.word = 0
+    flow.in_word = false
+    flow.last = Shaped { font: -1, glyph: 0 }
+}
+
+fn push_line(mut flow: Flow, glyphs: []Placed, width: f32) {
+    let y = flow.baseline + flow.height * f32(flow.lines.len)
+    flow.lines.push(Line { glyphs, y, width })
+    if width > flow.widest {
+        flow.widest = width
+    }
+}
+
+fn tile_key(g: Placed, size_64: i64) -> i64 {
+    g.font << 40 | g.glyph << 24 | size_64
+}
+
+fn glyph_tile(mut sys: System, g: Placed, pixel_size: f32) -> Tile? {
+    let size_64 = i64(pixel_size * 64.0 + 0.5)
+    let key = tile_key(g, size_64)
+    match sys.tiles[key] {
+        some(known) => return known
+        none => {}
+    }
+    if sys.full {
+        return none
+    }
+    let bitmap = font.rasterize(sys.fonts[g.font], g.glyph, f32(size_64) / 64.0)
+    if bitmap.width == 0 {
+        let blank = Tile { visible: false, left: 0.0, top: 0.0, width: 0.0, height: 0.0, uv: geometry.Rect {} }
+        sys.tiles[key] = blank
+        return blank
+    }
+    let spot = reserve(mut sys, bitmap.width + 2, bitmap.height + 2) ?? return none
+    scene.write(mut sys.atlas, spot.x + 1, spot.y + 1, bitmap.width, bitmap.height, bitmap.coverage)
+    let uv = scene.tile(sys.atlas, spot.x + 1, spot.y + 1, bitmap.width, bitmap.height)
+    let tile = Tile { visible: true, left: f32(bitmap.left), top: f32(bitmap.top), width: f32(bitmap.width), height: f32(bitmap.height), uv }
+    sys.tiles[key] = tile
+    tile
+}
+
+fn reserve(mut sys: System, width: i64, height: i64) -> Spot? {
+    var best = -1
+    for i, shelf in sys.shelves {
+        if shelf.height >= height && sys.atlas.size - shelf.next >= width && (best < 0 || shelf.height < sys.shelves[best].height) {
+            best = i
+        }
+    }
+    if best >= 0 {
+        let x = sys.shelves[best].next
+        sys.shelves[best].next += width
+        return Spot { x, y: sys.shelves[best].y }
+    }
+    if width > sys.atlas.size || sys.next_shelf + height > sys.atlas.size {
+        sys.full = true
+        return none
+    }
+    let y = sys.next_shelf
+    sys.shelves.push(Shelf { y, height, next: width })
+    sys.next_shelf += height
+    Spot { x: 0, y }
+}
