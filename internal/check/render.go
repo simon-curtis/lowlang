@@ -14,7 +14,7 @@ import (
 
 func (c *Checker) derivationHome(kind derivation) *ast.File {
 	if kind == render {
-		return c.scope("").funcs[prelude.AppendStr].File
+		return c.scope("").home
 	}
 	return c.file
 }
@@ -94,7 +94,7 @@ func (s *synth) flush() {
 	}
 	text := s.text.String()
 	s.text.Reset()
-	fmt.Fprintf(&s.out, "__append_str(mut b, %s)\n", lexer.Quote(text))
+	fmt.Fprintf(&s.out, "%s(mut b, %s)\n", prelude.AppendStr, lexer.Quote(text))
 }
 
 func recurse(expr string) string {
@@ -123,9 +123,9 @@ func (s *synth) render(t *types.Type) {
 	}
 	switch {
 	case t == types.Str:
-		s.line("__append_quoted(mut b, v)")
+		s.line("%s(mut b, v)", prelude.AppendQuoted)
 	case t.Kind == types.SliceKind && t.Elem == types.U8:
-		s.line("__append_hex(mut b, v)")
+		s.line("%s(mut b, v)", prelude.AppendHex)
 	case t.Kind == types.SliceKind:
 		s.renderSlice()
 	case t.Kind == types.MapKind:
@@ -243,7 +243,7 @@ func (s *synth) renderVector(t *types.Type) {
 }
 
 func (s *synth) renderRaw(t *types.Type) {
-	s.put(fmt.Sprintf("%s(", t.String()))
-	s.line("__append_address(mut b, __address(v))")
+	s.put(fmt.Sprintf("%s(0x", t.String()))
+	s.line("%s(mut b, __address(v), 64, 4, false, 0)", prelude.AppendRadix)
 	s.put(")")
 }

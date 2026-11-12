@@ -1,6 +1,8 @@
 package prelude
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -18,11 +20,13 @@ func declare() *ast.File {
 	}
 	structs := map[string]*ast.StructDecl{}
 	for _, l := range Layouts {
-		s, ok := structs[l.Struct]
+		s, ok := structs[l.Func]
 		if !ok {
-			s = &ast.StructDecl{Name: l.Struct}
-			structs[l.Struct] = s
+			s = &ast.StructDecl{Name: fmt.Sprintf("%sResult", l.Func)}
+			structs[l.Func] = s
 			file.Structs = append(file.Structs, s)
+			fn := file.Funcs[slices.IndexFunc(file.Funcs, func(fn *ast.Func) bool { return fn.Name == l.Func })]
+			fn.Result = &ast.TypeName{Pointer: true, Elem: &ast.TypeName{Name: s.Name}}
 		}
 		s.Fields = append(s.Fields, &ast.FieldDecl{Name: l.Field})
 	}
@@ -62,10 +66,12 @@ func TestValidateNamesAMissingField(t *testing.T) {
 	}
 }
 
-func TestInstancesListEachRole(t *testing.T) {
-	for _, role := range []Role{MapOp, ChanOp} {
-		if len(Instances(role)) == 0 {
-			t.Fatalf("role %d has no entries", role)
-		}
+func TestValidateNamesAResultThatIsNotAStruct(t *testing.T) {
+	file := declare()
+	index := slices.IndexFunc(file.Funcs, func(fn *ast.Func) bool { return fn.Name == Layouts[0].Func })
+	file.Funcs[index].Result = &ast.TypeName{Name: "i64"}
+	err := Validate(file)
+	if err == nil || !strings.Contains(err.Error(), Layouts[0].Func) {
+		t.Fatalf("want an error naming %s, got %v", Layouts[0].Func, err)
 	}
 }

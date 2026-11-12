@@ -82,11 +82,7 @@ func (c *Checker) bindingsOf(fn *ast.Func) map[string]*types.Type {
 	if fn.Bound != nil {
 		return fn.Bound
 	}
-	decl := fn
-	if fn.Template != nil {
-		decl = fn.Template
-	}
-	return bindings(decl.TypeParams, fn.TypeArgs)
+	return bindings(fn.Source().TypeParams, fn.TypeArgs)
 }
 
 func (c *Checker) satisfy(args []*types.Type, decls []*ast.TypeParam, params []*types.Type, pos diag.Pos) {
@@ -99,7 +95,7 @@ func (c *Checker) satisfy(args []*types.Type, decls []*ast.TypeParam, params []*
 
 func (c *Checker) declareGeneric(name string, decls []*ast.TypeParam, pub bool, pos diag.Pos) *generic {
 	_, dupType := c.local().types[name]
-	if _, dup := c.local().generics[name]; dup || dupType || types.Reserved(name) {
+	if _, dup := c.local().generics[name]; dup || dupType || reservedType(name) {
 		c.fail(pos, "type %s already declared", name)
 	}
 	g := &generic{name: name, decls: decls, params: c.typeParams(decls), pub: pub, pos: pos, file: c.file, instances: map[string]*types.Type{}}
@@ -239,42 +235,55 @@ func (in *inference) param(t *types.Type) bool {
 	return false
 }
 
-func (in *inference) unify(pattern, actual *types.Type) {
-	if pattern == nil || actual == nil || actual == types.Never || !pattern.Abstract() {
-		return
-	}
-	if in.param(pattern) {
-		if _, ok := in.bound[pattern]; !ok {
-			in.bound[pattern] = actual
-		}
-		return
-	}
+func (in *inference) unify(pattern, actual *types.Type) bool {
 	switch {
+	case pattern == nil || actual == nil:
+		return pattern == actual
+	case actual == types.Never:
+		return true
+	case !pattern.Abstract():
+		return pattern.Accepts(actual)
+	case in.param(pattern):
+		bound, ok := in.bound[pattern]
+		if !ok {
+			in.bound[pattern] = actual
+			return actual.Satisfies(pattern.Constraint)
+		}
+		return bound == actual
 	case pattern.Optional && actual.Optional:
-		in.unify(pattern.Elem, actual.Elem)
+		return in.unify(pattern.Elem, actual.Elem)
 	case pattern.Optional:
-		in.unify(pattern.Elem, actual)
+		return in.unify(pattern.Elem, actual)
 	case pattern.Kind == types.ResultKind && actual.Kind != types.ResultKind:
-		in.unify(pattern.Ok, actual)
+		return in.unify(pattern.Ok, actual)
 	case pattern.Kind != actual.Kind:
-	case pattern.Kind == types.FuncKind && len(pattern.Params) == len(actual.Params):
-		in.pairs(pattern.Params, actual.Params)
-		in.unify(pattern.Ret, actual.Ret)
+		return false
+	case pattern.Kind == types.FuncKind && len(pattern.Params) != len(actual.Params):
+		return false
+	case pattern.Kind == types.FuncKind:
+		params := in.pairs(pattern.Params, actual.Params)
+		ret := in.unify(pattern.Ret, actual.Ret)
+		return params && ret
 	case pattern.Kind == types.ResultKind:
-		in.unify(pattern.Ok, actual.Ok)
-		in.unify(pattern.Err, actual.Err)
-	case pattern.Origin != nil && pattern.Origin == actual.Origin:
-		in.pairs(pattern.TypeArgs, actual.TypeArgs)
-	default:
-		in.unify(pattern.Key, actual.Key)
-		in.unify(pattern.Elem, actual.Elem)
+		ok := in.unify(pattern.Ok, actual.Ok)
+		failure := in.unify(pattern.Err, actual.Err)
+		return ok && failure
+	case pattern.Origin != nil:
+		return pattern.Origin == actual.Origin && in.pairs(pattern.TypeArgs, actual.TypeArgs)
 	}
+	key := in.unify(pattern.Key, actual.Key)
+	elem := in.unify(pattern.Elem, actual.Elem)
+	return key && elem
 }
 
-func (in *inference) pairs(patterns, actuals []*types.Type) {
+func (in *inference) pairs(patterns, actuals []*types.Type) bool {
+	matched := len(patterns) == len(actuals)
 	for i := range min(len(patterns), len(actuals)) {
-		in.unify(patterns[i], actuals[i])
+		if !in.unify(patterns[i], actuals[i]) {
+			matched = false
+		}
 	}
+	return matched
 }
 
 func (c *Checker) inferred(in *inference, pos diag.Pos) []*types.Type {
@@ -439,9 +448,6 @@ func (c *Checker) genericTarget(x ast.Expr) *ast.Func {
 }
 
 func (c *Checker) instanceCall(e *ast.Call, inst *ast.Instance, want *types.Type) {
-	if c.derivedCall(e, inst) {
-		return
-	}
 	if id, ok := inst.X.(*ast.Ident); ok {
 		if b := c.builtinNamed(id.Name); b != nil && b.construct != nil {
 			b.construct(c, e, inst)
@@ -508,18 +514,14 @@ func (c *Checker) genericEnum(g *generic, name string, args []ast.Expr, want *ty
 	return t, t.Variant(name), found
 }
 
-func (c *Checker) mapOps(m *types.Type) {
-	if m.Abstract() {
+func (c *Checker) instantiateOps(t *types.Type, role prelude.Role, args ...*types.Type) {
+	if t.Abstract() {
 		return
 	}
 	c.when(ready, func() {
-		c.instantiateRoots(prelude.MapOp, []*types.Type{m.Key, m.Elem})
+		home := c.scope("")
+		for _, name := range prelude.Instances(role) {
+			c.instance(home.funcs[name], args, diag.Pos{})
+		}
 	})
-}
-
-func (c *Checker) instantiateRoots(role prelude.Role, args []*types.Type) {
-	home := c.scope("")
-	for _, name := range prelude.Instances(role) {
-		c.instance(home.funcs[name], args, diag.Pos{})
-	}
 }

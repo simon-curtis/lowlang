@@ -88,7 +88,7 @@ func init() {
 func (b *builder) builtin(e *ast.Call) []*Value {
 	lower, ok := lowerings[e.Builtin]
 	if !ok {
-		panic(fmt.Sprintf("ir: no lowering for builtin %s", e.Builtin))
+		panic(fmt.Sprintf("ir: no lowering for builtin %d", e.Builtin))
 	}
 	return lower(b, e)
 }

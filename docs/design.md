@@ -918,7 +918,7 @@ wait_readable(fd)
 - `close(c)` wakes every waiter. Sending on or closing a closed channel panics.
 - `for v in c` receives until the channel is closed and drained.
 - `select` waits on several operations at once and runs the arm of the first that can proceed. It is an expression like `match`.
-  - Arms are `name = <-c`, `<-c`, `c <- v`, `after(ms)` and `else`.
+  - Arms are `name = <-c`, `<-c`, `c <- v`, `after(ms)` and `else`. `after` is a contextual keyword: it is an ordinary identifier everywhere except at the start of a `select` arm followed by `(`.
   - Channel and value expressions are evaluated first, in order.
   - Ready arms are taken in order.
   - `else` runs when nothing is ready. Without `else` the green thread waits.
@@ -1498,7 +1498,7 @@ Building a program and running `low dev` need no external tool.
 - Compilation is deterministic: the same source and target always produce the same SSA form, assembly and binary. No pass depends on map iteration order; where order matters the compiler walks slices or stacks.
 - `parser.ParseSource` is the one entry from source text to tree, for user files, the prelude, the standard library and generated code. The lexer lexes each interpolated `{}` expression into tokens when it lexes the string, and keeps the `,width:format` suffix as text that `ast.ParseSpec` parses.
 - A lexer, parser or checker error is a `*diag.Error` holding the position of the fault; `low lsp` reads it with `errors.As`.
-- `types.Universe` interns the pointer, slice, optional, raw pointer, channel, map, result and function types, and owns the built-in type names and the constraint names. The checker lays out and instantiates types in three phases: declaring, laid out, and functions ready.
+- `types.Universe` interns the pointer, slice, optional, raw pointer, channel, map, result and function types, and owns the built-in type names and the constraint names. `check.Check` creates it with the checker's callback for new types and returns it. The checker lays out and instantiates types in three phases: declaring, laid out, and functions ready.
 
 Modules:
 
@@ -1515,7 +1515,7 @@ The contracts between the stages have one owner each:
 
 - `internal/builtin` numbers every builtin. The checker records the number on each call and `internal/ir` lowers it through a table indexed by that number.
 - `internal/ir/runtime.go` lists every runtime routine generated code calls: its symbol, its register convention (plain, growth, system call or string equality), whether it returns a scalar or nothing, and whether it allocates. A system call is its own `syscall` instruction; the others are `runtime` instructions.
-- `internal/prelude` names every prelude function and struct the compiler uses, the layout of each struct, and which functions a map or channel type instantiates. The prelude is validated when it loads, so a missing or reshaped entry is an error that names it. `internal/ir` reads field offsets from the checked types.
+- `internal/prelude` names every prelude function the compiler calls or the checker's generated source calls, the fields `internal/ir` reads from the struct a function returns (`__waiter` and `__chan_new`), and which functions a map or channel type instantiates. The prelude is validated when it loads, so a missing or reshaped entry is an error that names it. `internal/ir` reads field offsets from the checked types.
 - `internal/amd64` owns the target. A `Platform` value, `sysv` for Linux and `win64` for Windows, supplies the runtime and header text, the C argument classification, the registers a C callback saves, the entry symbol, how a system call is made, stack probing and the dynamic-library shims. `PROGRAM_ENTRY` and `PROGRAM_EXIT` in each header are the program's entry and exit. `amd64` exports the entry symbols, the hot-patch list and count symbols and the `.idata` section names that `internal/link` and `internal/hot` read.
 - One `convention` value in `internal/amd64` holds the Low register convention: argument, result, caller-saved, callee-saved, system call and growth registers, and the frame offsets derived from them.
 

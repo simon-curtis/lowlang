@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io/fs"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -18,7 +19,6 @@ import (
 	"lowlang/internal/ir"
 	"lowlang/internal/parser"
 	"lowlang/internal/target"
-	"lowlang/internal/types"
 )
 
 type lengthPair struct {
@@ -120,6 +120,10 @@ fn main() {
 }
 `
 
+func noEmbeds(*ast.File, string) (check.Embedded, error) {
+	return check.Embedded{}, fs.ErrNotExist
+}
+
 func buildProbe(t *testing.T, source string) string {
 	t.Helper()
 	prelude, err := parsePrelude()
@@ -131,7 +135,7 @@ func buildProbe(t *testing.T, source string) string {
 		t.Fatal(err)
 	}
 	files := []*ast.File{prelude, probe}
-	if err := check.Check(files, nil, types.NewUniverse()); err != nil {
+	if _, err := check.Check(files, noEmbeds); err != nil {
 		t.Fatal(err)
 	}
 	host := target.Host()

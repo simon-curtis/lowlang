@@ -82,33 +82,34 @@ func (c *Checker) serializeIntoCall(e *ast.Call) {
 	}
 }
 
-func (c *Checker) derivedCall(e *ast.Call, inst *ast.Instance) bool {
-	id, ok := inst.X.(*ast.Ident)
-	if !ok || (id.Name != "__deserialize" && id.Name != "__schema") {
-		return false
+func (c *Checker) deserializeCall(e *ast.Call, inst *ast.Instance) {
+	t := c.derivedType(inst, "__deserialize")
+	if len(e.Args) != 1 {
+		c.fail(e.Pos, "__deserialize takes 1 argument, found %d", len(e.Args))
 	}
-	if len(inst.Types) != 1 {
-		c.fail(inst.Pos, "%s takes 1 type argument, found %d", id.Name, len(inst.Types))
-	}
-	t := c.resolve(inst.Types[0])
-	kind := describe
-	if id.Name == "__deserialize" {
-		kind = deserialize
-		if len(e.Args) != 1 {
-			c.fail(e.Pos, "__deserialize takes 1 argument, found %d", len(e.Args))
-		}
-		c.expectType(e.Args[0], c.serdeType("Reader", e.Pos))
-		e.Type = c.universe.Result(t, c.serdeType("Error", e.Pos))
-	} else {
-		if len(e.Args) != 0 {
-			c.fail(e.Pos, "__schema takes no arguments, found %d", len(e.Args))
-		}
-		e.Type = c.serdeType("Schema", e.Pos)
-	}
+	c.expectType(e.Args[0], c.serdeType("Reader", e.Pos))
+	e.Type = c.universe.Result(t, c.serdeType("Error", e.Pos))
 	if !t.Abstract() {
-		e.Target = c.derive(kind, t, e.Pos)
+		e.Target = c.derive(deserialize, t, e.Pos)
 	}
-	return true
+}
+
+func (c *Checker) schemaCall(e *ast.Call, inst *ast.Instance) {
+	t := c.derivedType(inst, "__schema")
+	if len(e.Args) != 0 {
+		c.fail(e.Pos, "__schema takes no arguments, found %d", len(e.Args))
+	}
+	e.Type = c.serdeType("Schema", e.Pos)
+	if !t.Abstract() {
+		e.Target = c.derive(describe, t, e.Pos)
+	}
+}
+
+func (c *Checker) derivedType(inst *ast.Instance, name string) *types.Type {
+	if len(inst.Types) != 1 {
+		c.fail(inst.Pos, "%s takes 1 type argument, found %d", name, len(inst.Types))
+	}
+	return c.resolve(inst.Types[0])
 }
 
 func (c *Checker) derive(kind derivation, t *types.Type, pos diag.Pos) *ast.Func {

@@ -72,26 +72,26 @@ func (c *Checker) vectorArgument(e ast.Expr, want *types.Type) *types.Type {
 	return t
 }
 
-func (c *Checker) vectorResult(e *ast.Call, want *types.Type) *types.Type {
+func (c *Checker) vectorResult(b *Builtin, e *ast.Call, want *types.Type) *types.Type {
 	if want == nil || (!isVector(want) && want.Kind != types.ParamKind) {
-		c.fail(e.Pos, "%s needs an expected vector type", e.Builtin)
+		c.fail(e.Pos, "%s needs an expected vector type", b.Name)
 	}
 	return want
 }
 
-func (c *Checker) vectorIntrinsic(e *ast.Call, want *types.Type) {
-	switch e.Builtin {
+func (c *Checker) vectorIntrinsic(b *Builtin, e *ast.Call, want *types.Type) {
+	switch b.ID {
 	case builtin.VLoad:
 		c.vectorSource(e.Args[0])
 		c.integer(e.Args[1])
-		e.Type = c.vectorResult(e, want)
+		e.Type = c.vectorResult(b, e, want)
 	case builtin.VStore:
 		c.vectorSource(e.Args[0])
 		c.integer(e.Args[1])
 		c.vectorArgument(e.Args[2], nil)
 		e.Type = types.Void
 	case builtin.VSplat:
-		v := c.vectorResult(e, want)
+		v := c.vectorResult(b, e, want)
 		var lane *types.Type
 		if isVector(v) {
 			lane = v.Elem
@@ -104,7 +104,7 @@ func (c *Checker) vectorIntrinsic(e *ast.Call, want *types.Type) {
 	case builtin.VShuffle, builtin.VMin, builtin.VMax:
 		t := c.vectorArgument(e.Args[0], nil)
 		c.vectorArgument(e.Args[1], t)
-		if e.Builtin == builtin.VShuffle && isVector(t) && t.Elem != types.U8 {
+		if b.ID == builtin.VShuffle && isVector(t) && t.Elem != types.U8 {
 			c.fail(e.Pos, "shuffle needs u8 lanes, found %s", t)
 		}
 		e.Type = t

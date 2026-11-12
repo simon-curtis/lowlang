@@ -5,18 +5,8 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/builtin"
-	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
-
-func (c *Checker) chanOps(t *types.Type) {
-	if t.Abstract() {
-		return
-	}
-	c.when(ready, func() {
-		c.instantiateRoots(prelude.ChanOp, []*types.Type{t.Elem})
-	})
-}
 
 func (c *Checker) channel(e ast.Expr) *types.Type {
 	t := c.plain(e, nil)
@@ -49,11 +39,14 @@ func (c *Checker) spawn(s *ast.Spawn) {
 	c.spawns++
 	call := s.Call
 	block := &ast.Block{Pos: s.Pos}
+	var lets []*ast.Let
 	bind := func(x ast.Expr, name string) ast.Expr {
 		if _, ok := x.(*ast.Ref); ok {
 			c.fail(x.Position(), "spawn cannot pass mut arguments")
 		}
-		block.Stmts = append(block.Stmts, &ast.Let{Name: name, Spawned: true, Value: x, Pos: x.Position()})
+		let := &ast.Let{Name: name, Value: x, Pos: x.Position()}
+		lets = append(lets, let)
+		block.Stmts = append(block.Stmts, let)
 		return &ast.Ident{Name: name, Pos: x.Position()}
 	}
 	if !c.namedFunc(call.Fn) {
@@ -63,10 +56,18 @@ func (c *Checker) spawn(s *ast.Spawn) {
 		call.Args[i] = bind(arg, fmt.Sprintf("__spawn%d_%d", c.spawns, i))
 	}
 	closure := &ast.Closure{Body: &ast.Block{Tail: call, Pos: s.Pos}, Pos: s.Pos}
-	start := &ast.Call{Fn: &ast.Ident{Name: "__spawn", Pos: s.Pos}, Args: []ast.Expr{closure}, Pos: s.Pos}
-	block.Stmts = append(block.Stmts, &ast.ExprStmt{X: start})
+	start := &ast.ExprStmt{X: &ast.Call{Fn: &ast.Ident{Name: "__spawn", Pos: s.Pos}, Args: []ast.Expr{closure}, Pos: s.Pos}}
+	block.Stmts = append(block.Stmts, start)
 	s.Body = block
-	c.block(block, nil)
+	c.pushScope()
+	defer c.popScope()
+	for _, let := range lets {
+		if t := c.bind(let); c.droppable(t) {
+			c.fail(let.Pos, "spawn cannot take %s; it has drop", t)
+		}
+	}
+	c.stmt(start)
+	block.Type = types.Void
 }
 
 func (c *Checker) namedFunc(x ast.Expr) bool {

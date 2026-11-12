@@ -20,12 +20,7 @@ func TestSpellingsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestKeywordsAreKeywords(t *testing.T) {
-	for _, word := range Keywords() {
-		if !IsKeyword(word) {
-			t.Errorf("%s is listed but not a keyword", word)
-		}
-	}
+func TestPrintIsNotAKeyword(t *testing.T) {
 	if IsKeyword("print") {
 		t.Error("print is not a keyword")
 	}

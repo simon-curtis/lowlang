@@ -2,6 +2,7 @@ package check
 
 import (
 	"lowlang/internal/diag"
+	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
 
@@ -39,8 +40,8 @@ func (c *Checker) created(t *types.Type) {
 			c.layout(t, diag.Pos{})
 		}
 	case t.Kind == types.MapKind:
-		c.mapOps(t)
+		c.instantiateOps(t, prelude.MapOp, t.Key, t.Elem)
 	case t.Kind == types.ChanKind:
-		c.chanOps(t)
+		c.instantiateOps(t, prelude.ChanOp, t.Elem)
 	}
 }

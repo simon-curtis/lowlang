@@ -10,48 +10,31 @@ const (
 	ChanName = "chan"
 )
 
-var (
-	builtinNames = indexNames()
-	builtins     = indexBuiltins()
-)
+type BuiltinType struct {
+	Name string
+	Type *Type
+}
 
-func indexNames() []string {
-	var names []string
+var builtinTypes = indexBuiltinTypes()
+
+func indexBuiltinTypes() []BuiltinType {
+	var list []BuiltinType
 	for _, t := range Numeric {
-		names = append(names, t.Name)
+		list = append(list, BuiltinType{t.Name, t})
 	}
-	names = append(names, Bool.Name, Str.Name, RawName, ChanName)
+	list = append(list, BuiltinType{Bool.Name, Bool}, BuiltinType{Str.Name, Str}, BuiltinType{RawName, nil}, BuiltinType{ChanName, nil})
 	for _, t := range Vectors {
-		names = append(names, t.Name)
+		list = append(list, BuiltinType{t.Name, t})
 	}
-	return names
+	return list
 }
 
-func indexBuiltins() map[string]*Type {
-	found := map[string]*Type{RawName: nil, ChanName: nil}
-	for _, group := range [][]*Type{Numeric, {Bool, Str}, Vectors} {
-		for _, t := range group {
-			found[t.Name] = t
-		}
-	}
-	return found
-}
-
-func Builtin(name string) *Type {
-	return builtins[name]
-}
-
-func Reserved(name string) bool {
-	_, ok := builtins[name]
-	return ok
-}
-
-func BuiltinNames() []string {
-	return builtinNames
+func BuiltinTypes() []BuiltinType {
+	return builtinTypes
 }
 
 type Universe struct {
-	OnCreate  func(*Type)
+	created   func(*Type)
 	pointers  map[*Type]*Type
 	slices    map[*Type]*Type
 	optionals map[*Type]*Type
@@ -62,8 +45,9 @@ type Universe struct {
 	funcs     map[string]*Type
 }
 
-func NewUniverse() *Universe {
+func NewUniverse(created func(*Type)) *Universe {
 	return &Universe{
+		created:   created,
 		pointers:  map[*Type]*Type{},
 		slices:    map[*Type]*Type{},
 		optionals: map[*Type]*Type{},
@@ -81,9 +65,7 @@ func intern[K comparable](u *Universe, cache map[K]*Type, key K, build func() *T
 	}
 	t := build()
 	cache[key] = t
-	if u.OnCreate != nil {
-		u.OnCreate(t)
-	}
+	u.created(t)
 	return t
 }
 

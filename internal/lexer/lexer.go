@@ -282,7 +282,8 @@ func (l *Lexer) string(start diag.Pos) error {
 		switch {
 		case c == '"':
 			l.advance()
-			return l.emitString(start, parts, b.String())
+			l.emitString(start, parts, b.String())
+			return nil
 		case (c == '{' && next == '{') || (c == '}' && next == '}'):
 			l.advance()
 			b.WriteByte(l.advance())
@@ -306,14 +307,13 @@ func (l *Lexer) string(start diag.Pos) error {
 	}
 }
 
-func (l *Lexer) emitString(start diag.Pos, parts []Part, tail string) error {
+func (l *Lexer) emitString(start diag.Pos, parts []Part, tail string) {
 	if parts == nil {
 		l.emit(Token{Kind: String, Text: tail, Pos: start})
-		return nil
+		return
 	}
 	parts = append(parts, Part{Text: tail})
 	l.emit(Token{Kind: String, Parts: parts, Pos: start})
-	return nil
 }
 
 func (l *Lexer) interpolation() (Part, error) {

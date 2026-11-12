@@ -46,7 +46,7 @@ func (c *Checker) generateRegex(lit *ast.StrLit) *ast.Func {
 	if err != nil {
 		panic(fmt.Sprintf("generated regex %q does not parse: %v\n%s", lit.Value, err, source))
 	}
-	home := module.funcs["compile"].File
+	home := module.home
 	for _, fn := range file.Funcs {
 		fn.File = home
 		module.funcs[fn.Name] = fn

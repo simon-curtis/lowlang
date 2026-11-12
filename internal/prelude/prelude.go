@@ -8,6 +8,8 @@ import (
 
 const (
 	AppendStr         = "__append_str"
+	AppendQuoted      = "__append_quoted"
+	AppendHex         = "__append_hex"
 	AppendBool        = "__append_bool"
 	AppendU64         = "__append_u64"
 	AppendI64         = "__append_i64"
@@ -48,8 +50,6 @@ const (
 	SelValue          = "__sel_value"
 	Waiter            = "__waiter"
 	Wake              = "__wake"
-	WaiterStruct      = "__Waiter"
-	ChanStruct        = "__Chan"
 	WaiterIndex       = "index"
 	WaiterOK          = "ok"
 	ChanLock          = "lock"
@@ -73,6 +73,8 @@ type Entry struct {
 
 var Entries = []Entry{
 	{AppendStr, Plain, 2},
+	{AppendQuoted, Plain, 2},
+	{AppendHex, Plain, 2},
 	{AppendBool, Plain, 2},
 	{AppendU64, Plain, 2},
 	{AppendI64, Plain, 2},
@@ -116,14 +118,14 @@ var Entries = []Entry{
 }
 
 type Layout struct {
-	Struct string
-	Field  string
+	Func  string
+	Field string
 }
 
 var Layouts = []Layout{
-	{WaiterStruct, WaiterIndex},
-	{WaiterStruct, WaiterOK},
-	{ChanStruct, ChanLock},
+	{Waiter, WaiterIndex},
+	{Waiter, WaiterOK},
+	{ChanNew, ChanLock},
 }
 
 func Instances(role Role) []string {
@@ -168,13 +170,28 @@ func Validate(file *ast.File) error {
 		}
 	}
 	for _, l := range Layouts {
-		s, ok := structs[l.Struct]
-		if !ok {
-			return fmt.Errorf("prelude: the compiler reads %s.%s but the prelude does not declare %s", l.Struct, l.Field, l.Struct)
+		if err := validateLayout(l, funcs, structs); err != nil {
+			return err
 		}
-		if !declaresField(s, l.Field) {
-			return fmt.Errorf("prelude: the compiler reads %s.%s but the struct has no such field", l.Struct, l.Field)
-		}
+	}
+	return nil
+}
+
+func validateLayout(l Layout, funcs map[string]*ast.Func, structs map[string]*ast.StructDecl) error {
+	fn, ok := funcs[l.Func]
+	if !ok {
+		return fmt.Errorf("prelude: the compiler reads %s from the result of %s but the prelude does not declare it", l.Field, l.Func)
+	}
+	if fn.Result == nil || !fn.Result.Pointer || fn.Result.Elem == nil {
+		return fmt.Errorf("prelude: the compiler reads %s from the result of %s but it does not return a pointer to a struct", l.Field, l.Func)
+	}
+	name := fn.Result.Elem.Name
+	s, ok := structs[name]
+	if !ok {
+		return fmt.Errorf("prelude: %s returns %s but the prelude does not declare that struct", l.Func, name)
+	}
+	if !declaresField(s, l.Field) {
+		return fmt.Errorf("prelude: the compiler reads %s.%s from the result of %s but the struct has no such field", name, l.Field, l.Func)
 	}
 	return nil
 }

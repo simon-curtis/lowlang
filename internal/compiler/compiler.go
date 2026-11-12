@@ -54,9 +54,9 @@ func Check(path string, platform target.OS, disk fs.FS) (*Unit, error) {
 		return nil, err
 	}
 	files := append([]*ast.File{file}, modules.files...)
-	universe := types.NewUniverse()
 	embeds := &embedder{disk: disk, std: stdFS}
-	if err := check.Check(files, embeds.resolve, universe); err != nil {
+	universe, err := check.Check(files, embeds.resolve)
+	if err != nil {
 		return nil, err
 	}
 	unit := &Unit{Files: files, Types: universe, Sources: append(modules.sources, embeds.paths...)}
