@@ -47,6 +47,33 @@ count += 1
 - `let` is immutable, `var` is mutable.
 - Types are inferred and may be written as `let x: i64 = 1`.
 
+<!-- prelude
+struct Point {
+    x: i64
+    y: i64
+}
+struct Rect {
+    min: Point
+    max: Point
+    label: str
+}
+let cells = [Point { x: 1, y: 2 }]
+let rect = Rect { min: Point { x: 0, y: 0 }, max: Point { x: 4, y: 3 }, label: "box" }
+-->
+```low
+let { x, y } = rect.max
+var { x: min_x, y: min_y } = cells[0]
+var { x: max_x, y: max_y } = cells[0]
+let { min: { x: left }, max, label } = rect
+```
+
+- A struct pattern `{ x, y } = value` binds each listed field to a local of the same name; `{ x: name }` binds field `x` to `name`, as in a struct literal. Entries are separated by commas or newlines.
+- A pattern lists only the fields it wants. A field named twice, two entries binding one name, an empty `{}`, a field the struct lacks and a value that is not a struct (a pointer included) are errors. A struct with `drop` cannot be destructured.
+- A field that is a struct nests a pattern: `{ min: { x, y }, max }`.
+- `var` makes every bound name mutable and `let` makes them immutable. A pattern takes no type annotation, and `using` binds one name.
+- The value is evaluated once, then each field is read from it.
+- `{` after `let` or `var` always starts a pattern.
+
 ### Functions
 
 <!-- prelude
@@ -130,6 +157,11 @@ var n = 3
 let xs = [1, 2, 3]
 let grid = [[1, 2], [3, 4]]
 let want = 4
+struct Point {
+    x: i64
+    y: i64
+}
+let points = [Point { x: 1, y: 2 }]
 -->
 ```low
 if n > 0 { print(n) } else { print(0) }
@@ -137,6 +169,8 @@ if n > 0 { print(n) } else { print(0) }
 for i in 0..10 { print(i) }
 for x in xs { print(x) }
 for i, x in xs { print(i) }
+for { x, y } in points { print(x + y) }
+for i, { x } in points { print(i + x) }
 for n > 0 { n -= 1 }
 for { break }
 
@@ -150,6 +184,7 @@ rows: for row, cells in grid {
 - `for i in a..b` counts from `a` up to but not including `b`; the bounds are integers of one type.
 - `for x in xs` visits each element of a slice; `for i, x in xs` also binds the index as `i64`.
 - Loop variables are immutable.
+- `for { x, y } in points` and `for i, { x, y } in points` destructure each element with a struct pattern, as in `### Bindings`, binding immutable names. In `for`, `{` starts a pattern only when its closing `}` is followed by `in`, so `for { break }` is still an infinite loop.
 - `break`, `continue`, `return` and `fail` are expressions of type never, so they can stand wherever a value is expected: after `??`, in an arm, or as a branch of `if`.
 - `name:` before `for` labels a loop. `break name` and `continue name` act on that loop from inside nested loops and run the deferred statements and drops of every block they leave. A label must be used, cannot repeat the label of an enclosing loop, and is not visible inside closures.
 

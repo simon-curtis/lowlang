@@ -56,7 +56,7 @@ func (b *builder) chanLoop(s *ast.ForIn) {
 	received := b.chanNamed(prelude.ChanRecv, t, c)
 	b.branch(received[0], loop.body, loop.exit)
 	b.enter(loop.body)
-	b.bind(s.ValueLocal, received[1:1+t.Elem.Size()])
+	b.bindLoopValue(s, received[1:1+t.Elem.Size()])
 	b.loopBody(loop, s.Body)
 	b.closeLoop(loop)
 }

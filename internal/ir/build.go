@@ -421,6 +421,29 @@ func (b *builder) bind(local *ast.Local, words []*Value) {
 	b.store(place{local: local}, words)
 }
 
+func (b *builder) bindLoopValue(s *ast.ForIn, words []*Value) {
+	if s.Pattern != nil {
+		b.destructure(s.Pattern, words)
+		return
+	}
+	b.bind(s.ValueLocal, words)
+}
+
+func (b *builder) destructure(p *ast.StructPattern, words []*Value) {
+	b.bind(p.Temp, words)
+	b.bindFields(p)
+}
+
+func (b *builder) bindFields(p *ast.StructPattern) {
+	for _, f := range p.Fields {
+		if f.Nested != nil {
+			b.bindFields(f.Nested)
+			continue
+		}
+		b.bind(f.Bind.Local, b.expr(f.Source))
+	}
+}
+
 func (b *builder) place(p *location) place {
 	switch {
 	case p.ptr != nil:
@@ -595,6 +618,10 @@ func (b *builder) runDefers(from int) {
 func (b *builder) stmt(s ast.Stmt) {
 	switch s := s.(type) {
 	case *ast.Let:
+		if s.Pattern != nil {
+			b.destructure(s.Pattern, b.value(s.Value, s.Pattern.Type))
+			return
+		}
 		if isVector(s.Local.Type) && !s.Local.Captured {
 			b.bindVector(s.Local, s.Value)
 		} else {

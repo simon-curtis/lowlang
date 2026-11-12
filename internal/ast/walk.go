@@ -66,8 +66,18 @@ func (w walker) node(n Node) {
 		}
 		w.expr(n.Tail)
 	case *Let:
+		w.pattern(n.Pattern)
 		w.typeName(n.TypeName)
 		w.expr(n.Value)
+	case *StructPattern:
+		for _, f := range n.Fields {
+			w.node(f)
+		}
+	case *FieldPattern:
+		w.pattern(n.Nested)
+		if n.Bind != nil {
+			w.node(n.Bind)
+		}
 	case *Assign:
 		w.expr(n.Target)
 		w.expr(n.Value)
@@ -77,6 +87,7 @@ func (w walker) node(n Node) {
 		w.expr(n.Cond)
 		w.block(n.Body)
 	case *ForIn:
+		w.pattern(n.Pattern)
 		w.expr(n.Iter)
 		w.expr(n.End)
 		w.block(n.Body)
@@ -173,6 +184,12 @@ func (w walker) expr(e Expr) {
 func (w walker) exprs(list []Expr) {
 	for _, e := range list {
 		w.expr(e)
+	}
+}
+
+func (w walker) pattern(p *StructPattern) {
+	if p != nil {
+		w.node(p)
 	}
 }
 

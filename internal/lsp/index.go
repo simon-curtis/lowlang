@@ -41,6 +41,8 @@ type indexer struct {
 	locals    map[*ast.Param]*ast.Local
 	parents   map[ast.Node]*types.Type
 	shorthand map[ast.Expr]bool
+
+	shorthandBinding map[*ast.Binding]bool
 }
 
 func newIndex(file *ast.File, t text) *index {
@@ -50,6 +52,8 @@ func newIndex(file *ast.File, t text) *index {
 		locals:    map[*ast.Param]*ast.Local{},
 		parents:   map[ast.Node]*types.Type{},
 		shorthand: map[ast.Expr]bool{},
+
+		shorthandBinding: map[*ast.Binding]bool{},
 	}
 	ast.Inspect(file, b.visit)
 	for i, o := range x.occurrences {
@@ -131,9 +135,17 @@ func (b *indexer) visit(n ast.Node) bool {
 	case *ast.TypeName:
 		b.typeName(n)
 	case *ast.Let:
-		b.declared(n.Pos, n.Name, n, n.Local)
+		if n.Pattern == nil {
+			b.declared(n.Pos, n.Name, n, n.Local)
+		}
 	case *ast.ForIn:
 		b.forIn(n)
+	case *ast.StructPattern:
+		for _, f := range n.Fields {
+			b.parents[f] = n.Type
+		}
+	case *ast.FieldPattern:
+		b.fieldPattern(n)
 	case *ast.Ident:
 		if !b.shorthand[n] {
 			b.add(occurrence{pos: n.Pos, name: n.Name, node: n})
@@ -155,7 +167,9 @@ func (b *indexer) visit(n ast.Node) bool {
 	case *ast.Pattern:
 		b.pattern(n)
 	case *ast.Binding:
-		b.add(occurrence{pos: n.Pos, name: n.Name, node: n, local: n.Local})
+		if !b.shorthandBinding[n] {
+			b.add(occurrence{pos: n.Pos, name: n.Name, node: n, local: n.Local})
+		}
 	case *ast.SelectCase:
 		if n.Name != "" {
 			b.add(occurrence{pos: n.Pos, name: n.Name, node: n, local: n.Local})
@@ -183,7 +197,18 @@ func (b *indexer) forIn(s *ast.ForIn) {
 		b.add(occurrence{pos: pos, name: s.Key, node: s, local: s.KeyLocal})
 		pos.Col += len(s.Key)
 	}
-	b.declared(pos, s.Value, s, s.ValueLocal)
+	if s.Pattern == nil {
+		b.declared(pos, s.Value, s, s.ValueLocal)
+	}
+}
+
+func (b *indexer) fieldPattern(f *ast.FieldPattern) {
+	o := occurrence{pos: f.Pos, name: f.Name, node: f, parent: b.parents[f]}
+	if f.Shorthand {
+		b.shorthandBinding[f.Bind] = true
+		o.local = f.Bind.Local
+	}
+	b.add(o)
 }
 
 func (b *indexer) callee(e *ast.Call) {

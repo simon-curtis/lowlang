@@ -46,10 +46,20 @@ func (f *finder) add(x *index, o *occurrence, s side) {
 	f.found = append(f.found, reference{location: loc, name: o.name, side: s})
 }
 
+func shorthandValue(o *occurrence) (any, bool) {
+	switch n := o.node.(type) {
+	case *ast.FieldInit:
+		return n.Value, n.Form == ast.FieldShorthand
+	case *ast.FieldPattern:
+		return n.Bind, n.Shorthand
+	}
+	return nil, false
+}
+
 func (f *finder) visit(x *index, o *occurrence) {
 	q := &query{program: f.program, index: x, occ: o}
-	init, ok := o.node.(*ast.FieldInit)
-	if !ok || init.Form != ast.FieldShorthand {
+	shared, ok := shorthandValue(o)
+	if !ok {
 		if f.resolves(q) {
 			f.add(x, o, plain)
 		}
@@ -60,7 +70,7 @@ func (f *finder) visit(x *index, o *occurrence) {
 		return
 	}
 	value := *o
-	value.node = init.Value
+	value.node = shared
 	if f.resolves(&query{program: f.program, index: x, occ: &value}) {
 		f.add(x, o, valueSide)
 	}

@@ -37,6 +37,7 @@ module.exports = grammar({
     [$._type_name, $.closure_parameter],
     [$.function_type_parameters, $.closure_parameters],
     [$._type, $.struct_literal],
+    [$._expression, $.field_pattern],
   ],
 
   supertypes: $ => [$._expression, $._statement, $._type, $._declaration],
@@ -226,12 +227,27 @@ module.exports = grammar({
 
     expression_statement: $ => $._expression,
 
-    let_declaration: $ => seq(
-      choice('let', 'var'),
-      field('name', $.identifier),
-      optional(seq(':', field('type', $._type))),
-      '=',
-      field('value', $._expression),
+    let_declaration: $ => choice(
+      seq(
+        choice('let', 'var'),
+        field('name', $.identifier),
+        optional(seq(':', field('type', $._type))),
+        '=',
+        field('value', $._expression),
+      ),
+      seq(
+        choice('let', 'var'),
+        field('pattern', $.struct_pattern),
+        '=',
+        field('value', $._expression),
+      ),
+    ),
+
+    struct_pattern: $ => seq('{', separated($, $.field_pattern), '}'),
+
+    field_pattern: $ => seq(
+      field('name', alias($.identifier, $.field_identifier)),
+      optional(seq(':', field('binding', choice($.identifier, $.struct_pattern)))),
     ),
 
     using_declaration: $ => seq(
@@ -268,7 +284,7 @@ module.exports = grammar({
       optional($.label),
       'for',
       optional(seq(field('key', $.identifier), ',')),
-      field('value', $.identifier),
+      field('value', choice($.identifier, $.struct_pattern)),
       'in',
       field('iterable', $._expression),
       optional(seq('..', field('end', $._expression))),

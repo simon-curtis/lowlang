@@ -749,7 +749,65 @@ func (c *Checker) leaving(pos diag.Pos, keyword string) {
 	}
 }
 
+func (c *Checker) destructureLet(s *ast.Let) {
+	t := c.plain(s.Value, nil)
+	temp := &ast.Local{Type: t, Owner: c.fn}
+	c.destructure(s.Pattern, t, temp, s.Mutable)
+}
+
+func (c *Checker) destructure(p *ast.StructPattern, t *types.Type, temp *ast.Local, mutable bool) {
+	if t.Kind != types.StructKind {
+		c.fail(p.Pos, "cannot destructure %s; it is not a struct", t)
+	}
+	if c.droppable(t) {
+		c.fail(p.Pos, "cannot destructure %s; it has drop", t)
+	}
+	p.Type, p.Temp = t, temp
+	root := &ast.Ident{Name: temp.Name, Local: temp}
+	root.Type = t
+	c.bindFields(p, root, mutable, map[string]bool{})
+}
+
+func (c *Checker) bindFields(p *ast.StructPattern, base ast.Expr, mutable bool, bound map[string]bool) {
+	listed := map[string]bool{}
+	for _, f := range p.Fields {
+		field := p.Type.Field(f.Name)
+		if field == nil {
+			c.fail(f.Pos, "%s has no field %s", p.Type, f.Name)
+		}
+		if listed[f.Name] {
+			c.fail(f.Pos, "field %s listed twice", f.Name)
+		}
+		listed[f.Name] = true
+		c.reachable(field, p.Type, f.Pos)
+		source := &ast.Selector{X: base, Name: f.Name, Pos: f.Pos, Field: field}
+		source.Type = field.Type
+		f.Field, f.Source = field, source
+		if f.Nested != nil {
+			c.nest(f, field.Type)
+			c.bindFields(f.Nested, source, mutable, bound)
+			continue
+		}
+		if bound[f.Bind.Name] {
+			c.fail(f.Bind.Pos, "%s is bound twice in this pattern", f.Bind.Name)
+		}
+		bound[f.Bind.Name] = true
+		f.Bind.Local = c.declare(f.Bind.Name, field.Type, mutable)
+	}
+}
+
+func (c *Checker) nest(f *ast.FieldPattern, t *types.Type) {
+	if t.Kind != types.StructKind {
+		c.fail(f.Nested.Pos, "cannot destructure field %s of type %s; it is not a struct", f.Name, t)
+	}
+	f.Nested.Type = t
+}
+
 func (c *Checker) let(s *ast.Let) {
+	if s.Pattern != nil {
+		c.destructureLet(s)
+		return
+	}
 	t := c.bind(s)
 	if s.Using {
 		c.usingBinding(s, t)
@@ -936,7 +994,12 @@ func (c *Checker) forIn(s *ast.ForIn) {
 	if s.Key != "" {
 		s.KeyLocal = c.declare(s.Key, key, false)
 	}
-	s.ValueLocal = c.declare(s.Value, value, false)
+	if s.Pattern != nil {
+		s.ValueLocal = &ast.Local{Type: value, Owner: c.fn}
+		c.destructure(s.Pattern, value, s.ValueLocal, false)
+	} else {
+		s.ValueLocal = c.declare(s.Value, value, false)
+	}
 	l := c.enterLoop(s.Label, s.Pos)
 	c.block(s.Body, nil)
 	c.exitLoop(l, s.Pos)

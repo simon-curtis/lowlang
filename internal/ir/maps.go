@@ -94,10 +94,10 @@ func (b *builder) mapLoop(s *ast.ForIn) {
 	b.enter(loop.body)
 	key := b.mapCall(prelude.MapKey, m, table, at)
 	if s.KeyLocal == nil {
-		b.bind(s.ValueLocal, key)
+		b.bindLoopValue(s, key)
 	} else {
 		b.bind(s.KeyLocal, key)
-		b.bind(s.ValueLocal, b.mapCall(prelude.MapValue, m, table, at))
+		b.bindLoopValue(s, b.mapCall(prelude.MapValue, m, table, at))
 	}
 	b.loopBody(loop, s.Body)
 	from := b.emit(OpAdd, at, b.constant(1))

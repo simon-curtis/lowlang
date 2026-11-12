@@ -593,6 +593,9 @@ func (p *Parser) stmt() ast.Stmt {
 		if mutable {
 			p.next()
 		}
+		if p.at(lexer.LBrace) {
+			p.fail(p.tok().Pos, "using binds one name")
+		}
 		s := p.binding(t.Pos, mutable)
 		s.Using = true
 		return s
@@ -642,7 +645,7 @@ func (p *Parser) stmt() ast.Stmt {
 
 func (p *Parser) loop(label string) ast.Stmt {
 	pos := p.expect(lexer.For).Pos
-	if p.at(lexer.Ident) && (p.peek() == lexer.In || p.peek() == lexer.Comma) {
+	if p.destructuringLoop() {
 		return p.forIn(label, pos)
 	}
 	var cond ast.Expr
@@ -668,11 +671,47 @@ func (p *Parser) label() string {
 	return p.next().Text
 }
 
+func (p *Parser) destructuringLoop() bool {
+	switch p.tok().Kind {
+	case lexer.Ident:
+		return p.peek() == lexer.In || p.peek() == lexer.Comma
+	case lexer.LBrace:
+		return p.closingBraceFollowedBy(lexer.In)
+	}
+	return false
+}
+
+func (p *Parser) closingBraceFollowedBy(k lexer.Kind) bool {
+	depth := 0
+	for i := p.i; i < len(p.tokens)-1; i++ {
+		switch p.tokens[i].Kind {
+		case lexer.LBrace:
+			depth++
+		case lexer.RBrace:
+			depth--
+			if depth == 0 {
+				return p.tokens[i+1].Kind == k
+			}
+		}
+	}
+	return false
+}
+
+func (p *Parser) loopValue(loop *ast.ForIn) {
+	loop.Value, loop.Pattern = "", nil
+	if p.at(lexer.LBrace) {
+		loop.Pattern = p.structPattern()
+		return
+	}
+	loop.Value = p.expect(lexer.Ident).Text
+}
+
 func (p *Parser) forIn(label string, pos diag.Pos) *ast.ForIn {
-	loop := &ast.ForIn{Label: label, Value: p.expect(lexer.Ident).Text, Pos: pos}
-	if p.accept(lexer.Comma) {
+	loop := &ast.ForIn{Label: label, Pos: pos}
+	p.loopValue(loop)
+	if loop.Pattern == nil && p.accept(lexer.Comma) {
 		loop.Key = loop.Value
-		loop.Value = p.expect(lexer.Ident).Text
+		p.loopValue(loop)
 	}
 	p.expect(lexer.In)
 	loop.Iter = p.condition()
@@ -688,7 +727,46 @@ func (p *Parser) let() *ast.Let {
 	return p.binding(t.Pos, t.Kind == lexer.Var)
 }
 
+func (p *Parser) structPattern() *ast.StructPattern {
+	open := p.expect(lexer.LBrace)
+	pattern := &ast.StructPattern{Pos: open.Pos}
+	p.sequence(lexer.RBrace, true, func() { pattern.Fields = append(pattern.Fields, p.fieldPattern()) })
+	if len(pattern.Fields) == 0 {
+		p.fail(open.Pos, "a destructuring pattern needs at least one field")
+	}
+	return pattern
+}
+
+func (p *Parser) fieldPattern() *ast.FieldPattern {
+	name := p.expect(lexer.Ident)
+	field := &ast.FieldPattern{Name: name.Text, Pos: name.Pos}
+	if !p.accept(lexer.Colon) {
+		field.Shorthand = true
+		field.Bind = &ast.Binding{Name: name.Text, Pos: name.Pos}
+		return field
+	}
+	if p.at(lexer.LBrace) {
+		field.Nested = p.structPattern()
+		return field
+	}
+	bound := p.expect(lexer.Ident)
+	field.Bind = &ast.Binding{Name: bound.Text, Pos: bound.Pos}
+	return field
+}
+
+func (p *Parser) destructure(pos diag.Pos, mutable bool) *ast.Let {
+	pattern := p.structPattern()
+	if p.at(lexer.Colon) {
+		p.fail(p.tok().Pos, "a destructuring pattern takes no type annotation")
+	}
+	p.expect(lexer.Assign)
+	return &ast.Let{Pattern: pattern, Mutable: mutable, Value: p.expr(), Pos: pos}
+}
+
 func (p *Parser) binding(pos diag.Pos, mutable bool) *ast.Let {
+	if p.at(lexer.LBrace) {
+		return p.destructure(pos, mutable)
+	}
 	name := p.expect(lexer.Ident).Text
 	var typeName *ast.TypeName
 	if p.accept(lexer.Colon) {

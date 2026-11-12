@@ -182,7 +182,7 @@ func (b *builder) forIn(s *ast.ForIn) {
 	} else {
 		elem := s.Iter.TypeOf().Elem
 		at := place{addr: b.scaled(seq[0], i, elem.Stride()), scalar: scalarOf(elem), tail: elem.Tail()}
-		b.bind(s.ValueLocal, b.load(at, elem))
+		b.bindLoopValue(s, b.load(at, elem))
 		b.writeTemp(step, []*Value{b.constant(1)})
 	}
 	b.loopBody(loop, s.Body)

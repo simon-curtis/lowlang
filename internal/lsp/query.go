@@ -105,6 +105,8 @@ func (q *query) resolve() referent {
 		return q.named(n.Module, n.Name, spelled{text: n.String()})
 	case *ast.FieldInit:
 		return q.field(q.occ.parent, n.Name, n.Field)
+	case *ast.FieldPattern:
+		return q.field(q.occ.parent, n.Name, n.Field)
 	case qualifier:
 		return q.imported(n.alias)
 	case *ast.Pattern:

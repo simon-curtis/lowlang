@@ -6,6 +6,7 @@
   (match_block)
   (select_expression)
   (field_initializer_list)
+  (struct_pattern)
   (slice_literal)
   (map_literal)
   (arguments)
