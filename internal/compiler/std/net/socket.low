@@ -1,4 +1,5 @@
 import std/io
+import std/sys
 
 /// The read and write timeouts of a connection or socket, in milliseconds.
 ///
@@ -87,16 +88,6 @@ pub struct Socket {
     drop close_socket_on(handle)
 }
 
-struct Pending {
-    fd: i64
-    kept: bool
-    drop {
-        if !kept {
-            __syscall(3, fd)
-        }
-    }
-}
-
 /// A received datagram: its length and sender.
 pub struct Packet {
     /// The number of bytes written into the receive buffer.
@@ -112,23 +103,21 @@ struct Watch {
     fired: bool
 }
 
-fn keep(mut p: Pending) -> i64 {
-    p.kept = true
-    p.fd
+fn shut_down(fd: i64) {
+    sys.shutdown(fd, sys.Shutdown.Both) catch { _ => {} }
 }
 
 fn conn_guard(fd: i64, out: i64) -> *io.Guard {
-    io.guard(fn() { __syscall(48, fd, 2) }, fn() {
+    io.guard(fn() { shut_down(fd) }, fn() {
         if out != fd {
-            __syscall(3, out)
+            sys.close_fd(out)
         }
-        __syscall(3, fd)
+        sys.close_fd(fd)
     })
 }
 
 fn conn(fd: i64, remote: Addr) -> ConnHandle {
-    let dup = __syscall(72, fd, 1030, 0)
-    let out = if dup < 0 { fd } else { dup }
+    let out = sys.duplicate(fd) catch { _ => fd }
     ConnHandle { fd, out, remote, timeouts: no_timeouts(), guard: conn_guard(fd, out) }
 }
 
@@ -140,7 +129,7 @@ fn expire(fd: i64, millis: i64, w: *Watch) {
     sleep(millis)
     if !w.done {
         w.fired = true
-        __syscall(48, fd, 2)
+        shut_down(fd)
     }
 }
 
@@ -167,65 +156,39 @@ fn wait(fd: i64, writable: bool, millis: i64) ! io.Error {
     }
 }
 
-fn retry(fd: i64, writable: bool, millis: i64, op: fn() -> i64) -> i64 ! io.Error {
+fn retry(fd: i64, writable: bool, millis: i64, op: fn() -> i64 ! io.Error) -> i64 ! io.Error {
     for {
-        let r = op()
-        if r == -11 {
-            wait(fd, writable, millis)?
-        } else if r != -4 {
-            return io.syscall_result(r)
+        let n = op() catch {
+            WouldBlock => -1
+            e => fail e
         }
+        if n >= 0 {
+            return n
+        }
+        wait(fd, writable, millis)?
     }
 }
 
-fn socket(domain: i64, kind: i64) -> i64 ! io.Error {
-    io.syscall_result(__syscall(41, domain, kind | 0x80800, 0))
-}
-
-fn set_int(fd: i64, level: i64, option: i64, value: i64) ! io.Error {
-    let v = io.buffer(4)
-    io.set_le32(v, 0, value)
-    io.syscall_result(__syscall(54, fd, level, option, __slice_ptr(v), 4))?
-}
-
-fn bind_device(fd: i64, device: str) ! io.Error {
-    let name = bytes(device)
-    io.syscall_result(__syscall(54, fd, 1, 25, __slice_ptr(name), name.len))?
-}
-
-fn socket_error(fd: i64) -> i64 {
-    let v = io.buffer(4)
-    let size = io.buffer(4)
-    io.set_le32(size, 0, 4)
-    let r = __syscall(55, fd, 1, 4, __slice_ptr(v), __slice_ptr(size))
-    if r < 0 { -r } else { io.le32(v, 0) }
-}
-
 fn local(fd: i64) -> Addr ! io.Error {
-    let buf = io.buffer(128)
-    let size = io.buffer(4)
-    io.set_le32(size, 0, 128)
-    io.syscall_result(__syscall(51, fd, __slice_ptr(buf), __slice_ptr(size)))?
-    from_sockaddr(buf, io.le32(size, 0))
+    let address = sys.local_address(fd)?
+    from_sockaddr(address, address.len)
 }
 
-fn bound(a: Addr, kind: i64, o: ListenOptions) -> Pending ! io.Error {
-    using p = Pending { fd: socket(family(a), kind)?, kept: false }
+fn bound(a: Addr, kind: sys.SocketKind, o: ListenOptions) -> sys.Fd ! io.Error {
+    let fd = sys.socket(family(a), kind)?
+    using p = sys.own(fd)
     if o.reuse_addr {
-        set_int(p.fd, 1, 2, 1) catch {
+        sys.set_option(fd, sys.SocketOption.ReuseAddr, 1) catch {
             _ => fail Invalid
         }
     }
     if o.reuse_port {
-        set_int(p.fd, 1, 15, 1) catch {
+        sys.set_option(fd, sys.SocketOption.ReusePort, 1) catch {
             _ => fail Invalid
         }
     }
     let sa = sockaddr(a)
-    let r = __syscall(49, p.fd, __slice_ptr(sa), sa.len)
-    if r < 0 {
-        fail io.errno(-r)
-    }
+    sys.bind(fd, sa)?
     p
 }
 
@@ -237,7 +200,7 @@ fn resolve_local(host: str) -> []u8 ! io.Error {
 }
 
 fn socket_guard(fd: i64) -> *io.Guard {
-    io.guard(fn() { __syscall(48, fd, 2) }, fn() { __syscall(3, fd) })
+    io.guard(fn() { shut_down(fd) }, fn() { sys.close_fd(fd) })
 }
 
 /// Options for `listen_with` and `bind_udp_with`.
@@ -261,29 +224,27 @@ pub fn listen(host: str, port: i64) -> Listener ! io.Error {
 ///
 /// `host` and `port` are used as for `listen`. Fails with `Invalid` if the system rejects `reuse_addr` or `reuse_port`.
 pub fn listen_with(host: str, port: i64, o: ListenOptions) -> Listener ! io.Error {
-    using var p = bound(Addr { ip: resolve_local(host)?, port }, 1, o)?
+    let target = Addr { ip: resolve_local(host)?, port }
+    using var p = bound(target, sys.SocketKind.Streaming, o)?
     open_listener(mut p, o.backlog, "")?
 }
 
 fn listener_guard(fd: i64, closing: *Watch, path: str) -> *io.Guard {
     io.guard(fn() {
         closing.done = true
-        __syscall(48, fd, 2)
+        shut_down(fd)
     }, fn() {
-        __syscall(3, fd)
+        sys.close_fd(fd)
         if path.len > 0 && !abstract_path(path) {
-            __syscall(87, cstr(path))
+            sys.unlink(path) catch { _ => {} }
         }
     })
 }
 
-fn open_listener(mut p: Pending, backlog: i64, path: str) -> Listener ! io.Error {
-    let r = __syscall(50, p.fd, backlog)
-    if r < 0 {
-        fail io.errno(-r)
-    }
-    let addr = local(p.fd)?
-    let fd = keep(mut p)
+fn open_listener(mut p: sys.Fd, backlog: i64, path: str) -> Listener ! io.Error {
+    sys.listen(p.handle.fd, backlog)?
+    let addr = local(p.handle.fd)?
+    let fd = sys.detach(mut p).fd
     let closing = new(Watch { done: false, fired: false })
     Listener { handle: ListenerHandle { fd, addr, closing, guard: listener_guard(fd, closing, path) } }
 }
@@ -301,21 +262,19 @@ pub fn accept(l: Listener) -> Conn ! io.Error {
 /// Parks the green thread until a connection arrives. The caller owns the connection, usually by passing the view to a green thread that binds it with `adopt`. Fails with `NotConnected` once the listener is closed, including while the call is waiting. A connection reset before it was accepted is skipped.
 pub fn accept_handle(h: ListenerHandle) -> ConnHandle ! io.Error {
     using lease = io.enter(h.guard)?
-    let buf = io.buffer(128)
-    let size = io.buffer(4)
     for {
-        io.set_le32(size, 0, 128)
-        let r = __syscall(288, h.fd, __slice_ptr(buf), __slice_ptr(size), 0x80800)
-        if r == -11 {
-            wait_readable(h.fd)
-            if h.closing.done {
-                fail NotConnected
+        let accepted = sys.accept(h.fd) catch {
+            WouldBlock => {
+                wait_readable(h.fd)
+                if h.closing.done {
+                    fail NotConnected
+                }
+                continue
             }
-        } else if r >= 0 {
-            return conn(r, from_sockaddr(buf, io.le32(size, 0)))
-        } else if r != -4 && r != -103 {
-            fail io.errno(-r)
+            e => fail e
         }
+        let remote = from_sockaddr(accepted.address, accepted.address.len)
+        return conn(accepted.fd, remote)
     }
 }
 
@@ -354,36 +313,26 @@ pub fn close_listener_on(h: ListenerHandle) {
     io.retire(h.guard)
 }
 
-fn open_stream(a: Addr, device: str, millis: i64) -> Conn ! io.Error {
-    let fd = socket(family(a), 1)?
-    using c = adopt(conn(fd, a))
-    if device.len > 0 {
-        bind_device(fd, device)?
-    }
-    let sa = sockaddr(a)
-    var r = __syscall(42, fd, __slice_ptr(sa), sa.len)
-    var queued = 0
-    let queue_limit = if millis > 0 { millis } else { 30000 }
-    for r == -4 || r == -11 && is_unix(a) {
-        if r == -11 {
-            if queued >= queue_limit {
-                fail TimedOut
+fn start_connect(fd: i64, address: []u8, unix: bool, millis: i64) -> bool ! io.Error {
+    var waited = 0
+    let limit = if millis > 0 { millis } else { 30000 }
+    for {
+        let complete = sys.connect(fd, address) catch {
+            WouldBlock => {
+                if !unix {
+                    fail WouldBlock
+                }
+                if waited >= limit {
+                    fail TimedOut
+                }
+                sleep(1)
+                waited += 1
+                continue
             }
-            sleep(1)
-            queued += 1
+            e => fail e
         }
-        r = __syscall(42, fd, __slice_ptr(sa), sa.len)
+        return complete
     }
-    if r == -115 {
-        wait(fd, true, millis) catch {
-            _ => fail TimedOut
-        }
-        r = -socket_error(fd)
-    }
-    if r < 0 {
-        fail io.errno(-r)
-    }
-    c
 }
 
 /// Connects to the TCP or Unix address `a`.
@@ -404,7 +353,20 @@ pub fn connect_within(a: Addr, millis: i64) -> Conn ! io.Error {
 ///
 /// Binds the socket to `device` before connecting, which usually needs privileges. An empty `device` leaves the choice to the system. `millis` is the timeout as for `connect_within`.
 pub fn connect_through(a: Addr, device: str, millis: i64) -> Conn ! io.Error {
-    open_stream(a, device, millis)
+    let fd = sys.socket(family(a), sys.SocketKind.Streaming)?
+    using c = adopt(conn(fd, a))
+    if device.len > 0 {
+        sys.bind_device(fd, device)?
+    }
+    let sa = sockaddr(a)
+    let complete = start_connect(fd, sa, is_unix(a), millis)?
+    if !complete {
+        wait(fd, true, millis) catch {
+            _ => fail TimedOut
+        }
+        sys.finish_connect(fd)?
+    }
+    c
 }
 
 /// Connects to the first of the addresses `ips` that accepts a connection on `port`.
@@ -416,7 +378,7 @@ pub fn connect_first(ips: [][]u8, port: i64, device: str, millis: i64) -> Conn !
     }
     for ip in ips[..ips.len - 1] {
         let a = Addr { ip, port }
-        using c = open_stream(a, device, millis) catch {
+        using c = connect_through(a, device, millis) catch {
             _ => continue
         }
         return c
@@ -428,18 +390,7 @@ pub fn connect_first(ips: [][]u8, port: i64, device: str, millis: i64) -> Conn !
 ///
 /// Fails with `Invalid` if `name` is empty or longer than 15 bytes, and with `NotFound` if there is no such interface.
 pub fn interface_index(name: str) -> i64 ! io.Error {
-    if name.len == 0 || name.len > 15 {
-        fail Invalid
-    }
-    using probe = Pending { fd: socket(2, 2)?, kept: false }
-    let request = io.buffer(40)
-    io.copy(request, bytes(name))
-    let r = __syscall(16, probe.fd, 0x8933, __slice_ptr(request))
-    if r == -19 {
-        fail NotFound
-    }
-    io.syscall_result(r)?
-    io.le32(request, 16)
+    sys.interface_index(name)?
 }
 
 /// Resolves `host` with `lookup` and connects to `port` on the first address that accepts.
@@ -468,7 +419,7 @@ pub fn read(c: Conn, buf: []u8) -> i64 ! io.Error {
 /// Parks the green thread until data arrives. If the read timeout elapses first, the connection is shut down and the call fails with `TimedOut`. Fails with `NotConnected` after the connection is closed, including while the call is waiting.
 pub fn read_on(h: ConnHandle, buf: []u8) -> i64 ! io.Error {
     using lease = io.enter(h.guard)?
-    retry(h.fd, false, h.timeouts.read, fn() -> i64 { __syscall(45, h.fd, __slice_ptr(buf), buf.len, 0, 0, 0) })
+    retry(h.fd, false, h.timeouts.read, fn() -> i64 ! io.Error { sys.recv(h.fd, buf)? })
 }
 
 /// Writes a prefix of `data` to `c` and returns how many bytes were written, which can be fewer than `data.len`.
@@ -483,7 +434,7 @@ pub fn write(c: Conn, data: []u8) -> i64 ! io.Error {
 /// Parks the green thread while the send buffer is full. If the write timeout elapses first, the connection is shut down and the call fails with `TimedOut`. A peer that has closed the connection gives `BrokenPipe` or `Reset` and never raises `SIGPIPE`. Fails with `NotConnected` after the connection is closed.
 pub fn write_on(h: ConnHandle, data: []u8) -> i64 ! io.Error {
     using lease = io.enter(h.guard)?
-    retry(h.out, true, h.timeouts.write, fn() -> i64 { __syscall(44, h.out, __slice_ptr(data), data.len, 0x4000, 0, 0) })
+    retry(h.out, true, h.timeouts.write, fn() -> i64 ! io.Error { sys.send(h.out, data)? })
 }
 
 /// Writes all of `data` to `c`.
@@ -530,7 +481,7 @@ pub fn shutdown_write(c: Conn) ! io.Error {
 /// The peer then reads end of input after the data already sent. Fails with `NotConnected` if the connection is closed.
 pub fn shutdown_write_on(h: ConnHandle) ! io.Error {
     using lease = io.enter(h.guard)?
-    io.syscall_result(__syscall(48, h.fd, 1))?
+    sys.shutdown(h.fd, sys.Shutdown.Sending)?
 }
 
 /// Returns the local address of `c`.
@@ -546,7 +497,7 @@ pub fn local_addr(c: Conn) -> Addr ! io.Error {
 /// Fails with `NotConnected` if `c` is closed.
 pub fn set_nodelay(c: Conn, on: bool) ! io.Error {
     using lease = io.enter(c.handle.guard)?
-    set_int(c.handle.fd, 6, 1, if on { 1 } else { 0 })?
+    sys.set_option(c.handle.fd, sys.SocketOption.NoDelay, if on { 1 } else { 0 })?
 }
 
 /// Sets how long reads on `c` wait for data, in milliseconds, with 0 or less meaning no limit.
@@ -592,9 +543,10 @@ pub fn bind_udp(host: str, port: i64) -> Socket ! io.Error {
 ///
 /// `host` and `port` are used as for `bind_udp`. Fails with `Invalid` if the system rejects `reuse_addr` or `reuse_port`.
 pub fn bind_udp_with(host: str, port: i64, o: ListenOptions) -> Socket ! io.Error {
-    using var p = bound(Addr { ip: resolve_local(host)?, port }, 2, o)?
-    let addr = local(p.fd)?
-    let fd = keep(mut p)
+    let target = Addr { ip: resolve_local(host)?, port }
+    using var p = bound(target, sys.SocketKind.Datagrams, o)?
+    let addr = local(p.handle.fd)?
+    let fd = sys.detach(mut p).fd
     Socket { handle: SocketHandle { fd, addr, timeouts: no_timeouts(), guard: socket_guard(fd) } }
 }
 
@@ -605,9 +557,7 @@ pub fn send_to(s: Socket, data: []u8, to: Addr) -> i64 ! io.Error {
     using lease = io.enter(s.handle.guard)?
     let h = s.handle
     let sa = sockaddr(to)
-    retry(h.fd, true, h.timeouts.write, fn() -> i64 {
-        __syscall(44, h.fd, __slice_ptr(data), data.len, 0x4000, __slice_ptr(sa), sa.len)
-    })
+    retry(h.fd, true, h.timeouts.write, fn() -> i64 ! io.Error { sys.send_to(h.fd, data, sa)? })
 }
 
 /// Receives one datagram into `buf` and returns its length and sender.
@@ -616,13 +566,17 @@ pub fn send_to(s: Socket, data: []u8, to: Addr) -> i64 ! io.Error {
 pub fn receive_from(s: Socket, buf: []u8) -> Packet ! io.Error {
     using lease = io.enter(s.handle.guard)?
     let h = s.handle
-    let sa = io.buffer(28)
-    let size = io.buffer(4)
-    let n = retry(h.fd, false, h.timeouts.read, fn() -> i64 {
-        io.set_le32(size, 0, 28)
-        __syscall(45, h.fd, __slice_ptr(buf), buf.len, 0, __slice_ptr(sa), __slice_ptr(size))
-    })?
-    Packet { size: n, from: from_sockaddr(sa, io.le32(size, 0)) }
+    for {
+        let received = sys.recv_from(h.fd, buf) catch {
+            WouldBlock => {
+                wait(h.fd, false, h.timeouts.read)?
+                continue
+            }
+            e => fail e
+        }
+        let from = from_sockaddr(received.address, received.address.len)
+        return Packet { size: received.size, from }
+    }
 }
 
 /// Sets how long `receive_from` waits on `s`, in milliseconds, with 0 or less meaning no limit.
