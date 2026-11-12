@@ -1812,6 +1812,8 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - `go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present.
   - A program with a `.needed` file must link exactly those shared libraries. Every other program must be static with no interpreter.
   - Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
+  - The time zone programs read zone rules from the embedded `std/time/tzdata`, because host databases differ by release and by build (Debian's includes `backzone`). They read the host database only for the behaviour of `zone.named` and `zone.local`, through zones whose rules every build agrees on.
+  - The `std/cdp` programs print `launch failed` when no browser starts. CI turns off Ubuntu's AppArmor restriction on unprivileged user namespaces so Chromium can create its sandbox.
 
 ## Roadmap
 
