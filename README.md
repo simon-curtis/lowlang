@@ -56,7 +56,7 @@ go build -o low ./cmd/low
 - A directory is a module. `import ui/text` loads `ui/text/` under the project root, marked by a `low.mod` file.
 - The standard library imports as `std/...`.
 - `low dev` runs the program and patches changed functions into it on every save, keeping its state.
-- On the Windows target, standard library modules that call the operating system (files, processes, sockets and everything built on them) panic with `system calls are not available on windows`. Language features and modules that only compute run unchanged.
+- On the Windows target the standard library calls Win32: files, processes, sockets, DNS, terminals and the environment work. Signals, file watches and pseudo-terminals fail with `Unsupported`; `docs/design.md` `## Compiler` lists the differences.
 - `go test ./...` runs on Linux and on Windows; `docs/design.md` `## Tests` says what it covers and which tools it uses.
 
 ## Benchmarks

@@ -10,6 +10,7 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/diag"
+	"lowlang/internal/target"
 )
 
 func TestDocumentProject(t *testing.T) {
@@ -45,7 +46,7 @@ fn hidden() {}
 	if err := os.WriteFile(filepath.Join(shapes, "box.low"), []byte(source), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	modules, err := Document(dir)
+	modules, err := Document(dir, target.Linux)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +74,7 @@ fn hidden() {}
 }
 
 func TestDocumentStd(t *testing.T) {
-	modules, err := Document("std")
+	modules, err := Document("std", target.Linux)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,6 +84,41 @@ func TestDocumentStd(t *testing.T) {
 		}
 	}
 	t.Fatal("std/io has no documented items")
+}
+
+func TestStdTargetsShareAPI(t *testing.T) {
+	linux := documentedAPI(t, target.Linux)
+	windows := documentedAPI(t, target.Windows)
+	for key, item := range linux {
+		other, ok := windows[key]
+		switch {
+		case !ok:
+			t.Errorf("%s is missing on windows", key)
+		case other != item:
+			t.Errorf("%s differs between targets:\nlinux:   %q\nwindows: %q", key, item.Text+" "+item.Doc, other.Text+" "+other.Doc)
+		}
+	}
+	for key := range windows {
+		if _, ok := linux[key]; !ok {
+			t.Errorf("%s is missing on linux", key)
+		}
+	}
+}
+
+func documentedAPI(t *testing.T, platform target.OS) map[string]ItemDoc {
+	t.Helper()
+	modules, err := Document("std", platform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := map[string]ItemDoc{}
+	for _, module := range modules {
+		for _, item := range module.Items {
+			item.File, item.Line = "", 0
+			api[fmt.Sprintf("%s %s %s.%s", module.Path, item.Kind, item.Receiver, item.Name)] = item
+		}
+	}
+	return api
 }
 
 type undocumented struct {

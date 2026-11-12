@@ -1,0 +1,459 @@
+import std/io
+
+extern "ws2_32" {
+    fn WSAStartup(version: u16, data: ptr) -> i32
+    fn WSAGetLastError() -> i32
+    fn WSASocketW(family: i32, kind: i32, protocol: i32, info: ptr, group: u32, flags: u32) -> i64
+    fn WSAEventSelect(s: i64, event: i64, events: i32) -> i32
+    fn WSAIoctl(s: i64, code: u32, input: ptr, input_size: u32, output: ptr, output_size: u32, mut returned: u32, overlapped: ptr, routine: ptr) -> i32
+    fn WSAPoll(fds: ptr, count: u32, timeout: i32) -> i32
+    fn setsockopt(s: i64, level: i32, option: i32, value: ptr, size: i32) -> i32
+    fn win_bind(s: i64, address: ptr, size: i32) -> i32 = "bind"
+    fn win_listen(s: i64, backlog: i32) -> i32 = "listen"
+    fn getsockname(s: i64, address: ptr, mut size: i32) -> i32
+    fn win_accept(s: i64, address: ptr, mut size: i32) -> i64 = "accept"
+    fn win_connect(s: i64, address: ptr, size: i32) -> i32 = "connect"
+    fn win_shutdown(s: i64, how: i32) -> i32 = "shutdown"
+    fn win_recv(s: i64, buf: ptr, size: i32, flags: i32) -> i32 = "recv"
+    fn recvfrom(s: i64, buf: ptr, size: i32, flags: i32, address: ptr, mut address_size: i32) -> i32
+    fn win_send(s: i64, buf: ptr, size: i32, flags: i32) -> i32 = "send"
+    fn sendto(s: i64, buf: ptr, size: i32, flags: i32, address: ptr, address_size: i32) -> i32
+}
+
+extern "kernel32" {
+    fn CreateEventW(attributes: ptr, manual: i32, initial: i32, name: ptr) -> i64
+    fn SetEvent(event: i64) -> i32
+    fn ResetEvent(event: i64) -> i32
+}
+
+extern "iphlpapi" {
+    fn ConvertInterfaceAliasToLuid(alias: ptr, mut luid: u64) -> u32
+    fn ConvertInterfaceNameToLuidA(name: ptr, mut luid: u64) -> u32
+    fn ConvertInterfaceLuidToIndex(mut luid: u64, mut index: u32) -> u32
+}
+
+fn socket_events() -> i32 {
+    0x3B
+}
+
+fn would_block() -> i64 {
+    10035
+}
+
+fn socket_error() -> io.Error {
+    win_error(i64(WSAGetLastError()))
+}
+
+fn socket_result(r: i32) -> i64 ! io.Error {
+    if r < 0 {
+        fail socket_error()
+    }
+    i64(r)
+}
+
+fn transfer_size(n: i64) -> i32 {
+    i32(if n < largest_transfer() { n } else { largest_transfer() })
+}
+
+fn startup() ! io.Error {
+    let data = io.buffer(408)
+    let code = WSAStartup(0x0202, __slice_ptr(data))
+    if code != 0 {
+        fail win_error(i64(code))
+    }
+}
+
+fn attach_event(s: i64) -> i64 ! io.Error {
+    let event = opened(CreateEventW(null, 1, 0, null))?
+    if WSAEventSelect(s, event, socket_events()) != 0 {
+        let e = socket_error()
+        CloseHandle(event)
+        fail e
+    }
+    s | (event << 32)
+}
+
+fn system_address(address: []u8) -> []u8 {
+    if address.len < 2 || io.le16(address, 0) != 10 {
+        return address
+    }
+    var out: []u8 = []
+    io.append(mut out, address)
+    io.set_le16(out, 0, 23)
+    out
+}
+
+fn portable_address(buf: []u8, size: i64) -> []u8 {
+    let address = address_of(buf, size)
+    if address.len >= 2 && io.le16(address, 0) == 23 {
+        io.set_le16(address, 0, 10)
+    }
+    address
+}
+
+fn system_family(family: i64) -> i32 {
+    i32(if family == 10 { 23 } else { family })
+}
+
+fn level_of(option: SocketOption) -> i32 {
+    match option {
+        ReuseAddr => 0xFFFF
+        ReusePort => 0xFFFF
+        KeepAlive => 0xFFFF
+        ReceiveBuffer => 0xFFFF
+        SendBuffer => 0xFFFF
+        NoDelay => 6
+        KeepIdle => 6
+        KeepInterval => 6
+        KeepCount => 6
+        MulticastTtl4 => 0
+        MulticastLoop4 => 0
+        MulticastTtl6 => 41
+        MulticastLoop6 => 41
+        MulticastInterface6 => 41
+    }
+}
+
+fn number_of(option: SocketOption) -> i32 {
+    match option {
+        ReuseAddr => 4
+        ReusePort => -1
+        KeepAlive => 8
+        ReceiveBuffer => 0x1002
+        SendBuffer => 0x1001
+        NoDelay => 1
+        KeepIdle => 3
+        KeepInterval => 17
+        KeepCount => 16
+        MulticastTtl4 => 10
+        MulticastLoop4 => 11
+        MulticastTtl6 => 10
+        MulticastLoop6 => 11
+        MulticastInterface6 => 9
+    }
+}
+
+fn set_bytes(fd: i64, level: i32, option: i32, value: []u8) ! io.Error {
+    socket_result(setsockopt(socket_of(fd), level, option, __slice_ptr(value), i32(value.len)))?
+}
+
+fn ignore_unreachable(fd: i64) {
+    let off = io.buffer(4)
+    var returned: u32 = 0
+    WSAIoctl(socket_of(fd), 0x9800000C, __slice_ptr(off), 4, null, 0, mut returned, null, null)
+}
+
+/// Makes a non-blocking socket closed on `exec` and returns its descriptor.
+///
+/// `family` is the address family number of the addresses the socket will use.
+pub fn socket(family: i64, kind: SocketKind) -> i64 ! io.Error {
+    startup()?
+    let type_code: i32 = match kind {
+        Streaming => 1
+        Datagrams => 2
+    }
+    let s = WSASocketW(system_family(family), type_code, 0, null, 0, 0x80)
+    if s == invalid_handle() {
+        fail socket_error()
+    }
+    let fd = attach_event(s) catch {
+        e => {
+            closesocket(s)
+            fail e
+        }
+    }
+    match kind {
+        Datagrams => ignore_unreachable(fd)
+        Streaming => {}
+    }
+    fd
+}
+
+fn loopback() -> []u8 {
+    [2, 0, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+/// Returns two connected, unnamed Unix stream sockets, non-blocking and closed on `exec`.
+pub fn socketpair() -> Pair ! io.Error {
+    let listener = socket(2, SocketKind.Streaming)?
+    using held = own(listener)
+    bind(listener, loopback())?
+    listen(listener, 1)?
+    let address = local_address(listener)?
+    let first = socket(2, SocketKind.Streaming)?
+    using var first_end = own(first)
+    if !connect(first, address)? {
+        wait_socket(first, true)
+        finish_connect(first)?
+    }
+    for {
+        let accepted = accept(listener) catch {
+            WouldBlock => {
+                wait_socket(listener, false)
+                continue
+            }
+            e => fail e
+        }
+        return Pair { first: detach(mut first_end).fd, second: accepted.fd }
+    }
+}
+
+/// Sets the integer socket option `option` of the socket `fd` to `value`.
+pub fn set_option(fd: i64, option: SocketOption, value: i64) ! io.Error {
+    if number_of(option) < 0 {
+        fail Unsupported
+    }
+    let v = io.buffer(4)
+    io.set_le32(v, 0, value)
+    set_bytes(fd, level_of(option), number_of(option), v)?
+}
+
+/// Returns the integer socket option `option` of the socket `fd`.
+pub fn get_option(fd: i64, option: SocketOption) -> i64 ! io.Error {
+    if number_of(option) < 0 {
+        fail Unsupported
+    }
+    let v = io.buffer(4)
+    var size: i32 = 4
+    socket_result(getsockopt(socket_of(fd), level_of(option), number_of(option), __slice_ptr(v), mut size))?
+    if size == 1 {
+        return i64(v[0])
+    }
+    io.le32(v, 0)
+}
+
+/// Binds the socket `fd` to the network interface `device`.
+pub fn bind_device(fd: i64, device: str) ! io.Error {
+    fail Unsupported
+}
+
+/// Binds the socket `fd` to `address`, given in the system's socket address layout.
+pub fn bind(fd: i64, address: []u8) ! io.Error {
+    let native = system_address(address)
+    socket_result(win_bind(socket_of(fd), __slice_ptr(native), i32(native.len)))?
+}
+
+/// Marks the socket `fd` as listening with a queue of `backlog` waiting connections.
+pub fn listen(fd: i64, backlog: i64) ! io.Error {
+    socket_result(win_listen(socket_of(fd), i32(backlog)))?
+}
+
+/// Returns the address the socket `fd` is bound to, in the system's socket address layout.
+pub fn local_address(fd: i64) -> []u8 ! io.Error {
+    let buf = io.buffer(128)
+    var size: i32 = 128
+    socket_result(getsockname(socket_of(fd), __slice_ptr(buf), mut size))?
+    portable_address(buf, i64(size))
+}
+
+/// Takes the next waiting connection from the listening socket `fd`.
+///
+/// Fails with `WouldBlock` when none is waiting. An interrupted call and a connection reset before it was accepted are skipped.
+pub fn accept(fd: i64) -> Accepted ! io.Error {
+    let buf = io.buffer(128)
+    for {
+        var size: i32 = 128
+        let accepted = win_accept(socket_of(fd), __slice_ptr(buf), mut size)
+        if accepted == invalid_handle() {
+            let code = i64(WSAGetLastError())
+            if code == 10054 {
+                continue
+            }
+            fail win_error(code)
+        }
+        let fd = attach_event(accepted) catch {
+            e => {
+                closesocket(accepted)
+                fail e
+            }
+        }
+        return Accepted { fd, address: portable_address(buf, i64(size)) }
+    }
+}
+
+fn is_loopback(address: []u8) -> bool {
+    if address.len >= 8 && io.le16(address, 0) == 2 {
+        return address[4] == 127
+    }
+    if address.len < 24 || io.le16(address, 0) != 10 {
+        return false
+    }
+    for i in 8..23 {
+        if address[i] != 0 {
+            return false
+        }
+    }
+    address[23] == 1
+}
+
+fn refuse_at_once(fd: i64) {
+    let parameters: []u8 = [0xFF, 0xFF, 0xFE, 0]
+    var returned: u32 = 0
+    WSAIoctl(socket_of(fd), 0x98000011, __slice_ptr(parameters), 4, null, 0, mut returned, null, null)
+}
+
+/// Starts connecting the socket `fd` to `address` and returns whether the connection is complete.
+///
+/// Returns `false` while the connection is in progress; wait for `fd` to become writable and call `finish_connect`. Fails with `WouldBlock` when a Unix socket's listener has a full queue, which no later event announces, so the caller tries again.
+pub fn connect(fd: i64, address: []u8) -> bool ! io.Error {
+    let native = system_address(address)
+    if is_loopback(address) {
+        refuse_at_once(fd)
+    }
+    if win_connect(socket_of(fd), __slice_ptr(native), i32(native.len)) == 0 {
+        return true
+    }
+    let code = i64(WSAGetLastError())
+    if code == would_block() {
+        return false
+    }
+    fail win_error(code)
+}
+
+/// Reports how a connection started by `connect` ended.
+///
+/// Fails with the error the connection met, such as `Refused`.
+pub fn finish_connect(fd: i64) ! io.Error {
+    let v = io.buffer(4)
+    var size: i32 = 4
+    socket_result(getsockopt(socket_of(fd), 0xFFFF, 0x1007, __slice_ptr(v), mut size))?
+    let code = io.le32(v, 0)
+    if code != 0 {
+        fail win_error(code)
+    }
+}
+
+/// Shuts down the socket `fd` in the direction `how`.
+pub fn shutdown(fd: i64, how: Shutdown) ! io.Error {
+    let direction: i32 = match how {
+        Sending => 1
+        Both => 2
+    }
+    let r = win_shutdown(socket_of(fd), direction)
+    let e = socket_error()
+    SetEvent(event_of(fd))
+    if r != 0 {
+        fail e
+    }
+}
+
+/// Receives up to `buf.len` bytes from the socket `fd` and returns the count, or `0` at end of input.
+///
+/// Fails with `WouldBlock` when nothing has arrived. An interrupted call is repeated.
+pub fn recv(fd: i64, buf: []u8) -> i64 ! io.Error {
+    let r = win_recv(socket_of(fd), __slice_ptr(buf), transfer_size(buf.len), 0)
+    if r >= 0 {
+        return i64(r)
+    }
+    let code = i64(WSAGetLastError())
+    if code == 10058 {
+        return 0
+    }
+    fail win_error(code)
+}
+
+/// Receives one datagram into `buf` from the socket `fd`.
+///
+/// A datagram longer than `buf` is truncated. Fails with `WouldBlock` when nothing has arrived. An interrupted call is repeated.
+pub fn recv_from(fd: i64, buf: []u8) -> Received ! io.Error {
+    let address = io.buffer(28)
+    var size: i32 = 28
+    let r = recvfrom(socket_of(fd), __slice_ptr(buf), transfer_size(buf.len), 0, __slice_ptr(address), mut size)
+    if r >= 0 {
+        return Received { size: i64(r), address: portable_address(address, i64(size)) }
+    }
+    let code = i64(WSAGetLastError())
+    if code == 10040 {
+        return Received { size: buf.len, address: portable_address(address, i64(size)) }
+    }
+    fail win_error(code)
+}
+
+/// Sends a prefix of `data` on the connected socket `fd` and returns how many bytes were sent.
+///
+/// A peer that has closed the connection gives `BrokenPipe` or `Reset` and never raises `SIGPIPE`. Fails with `WouldBlock` when the send buffer is full. An interrupted call is repeated.
+pub fn send(fd: i64, data: []u8) -> i64 ! io.Error {
+    socket_result(win_send(socket_of(fd), __slice_ptr(data), transfer_size(data.len), 0))
+}
+
+/// Sends `data` as one datagram from the socket `fd` to `address` and returns the number of bytes sent.
+///
+/// Fails with `WouldBlock` when the send buffer is full. An interrupted call is repeated.
+pub fn send_to(fd: i64, data: []u8, address: []u8) -> i64 ! io.Error {
+    let native = system_address(address)
+    socket_result(sendto(socket_of(fd), __slice_ptr(data), transfer_size(data.len), 0, __slice_ptr(native), i32(native.len)))
+}
+
+/// Returns the process id, user id and group id of the peer of the Unix socket `fd`, as recorded when the connection was made.
+pub fn peer_credentials(fd: i64) -> Credentials ! io.Error {
+    fail Unsupported
+}
+
+/// Returns the kernel index of the network interface `name`.
+///
+/// Fails with `Invalid` if `name` is empty or longer than 15 bytes, and with `NotFound` if there is no such interface.
+pub fn interface_index(name: str) -> i64 ! io.Error {
+    if name.len == 0 {
+        fail Invalid
+    }
+    var luid: u64 = 0
+    if ConvertInterfaceAliasToLuid(__slice_ptr(wide(name)), mut luid) != 0 {
+        if ConvertInterfaceNameToLuidA(cstr(name), mut luid) != 0 {
+            fail NotFound
+        }
+    }
+    var index: u32 = 0
+    if ConvertInterfaceLuidToIndex(mut luid, mut index) != 0 {
+        fail NotFound
+    }
+    i64(index)
+}
+
+fn interface_address(index: i64) -> []u8 {
+    var out: []u8 = []
+    io.put_be32(mut out, index)
+    out
+}
+
+/// Joins or leaves the multicast `group` on the UDP socket `fd`.
+///
+/// `group` is 4 bytes for IPv4 or 16 for IPv6. `index` is the interface index, or `0` to let the system choose.
+pub fn change_membership(fd: i64, group: []u8, index: i64, join: bool) ! io.Error {
+    var request: []u8 = []
+    io.append(mut request, group)
+    if group.len == 4 {
+        io.append(mut request, interface_address(index))
+        set_bytes(fd, 0, i32(if join { 12 } else { 13 }), request)?
+        return
+    }
+    let tail = io.buffer(4)
+    io.set_le32(tail, 0, index)
+    io.append(mut request, tail)
+    set_bytes(fd, 41, i32(if join { 12 } else { 13 }), request)?
+}
+
+/// Sets the interface IPv4 multicast datagrams from the socket `fd` leave through to the interface with kernel index `index`, or to the system's choice when `index` is `0`.
+pub fn set_multicast_interface4(fd: i64, index: i64) ! io.Error {
+    set_bytes(fd, 0, 9, interface_address(index))?
+}
+
+fn ready(fd: i64, writable: bool) -> bool {
+    let entry = io.buffer(16)
+    io.set_le64(entry, 0, socket_of(fd))
+    io.set_le16(entry, 8, if writable { 0x10 } else { 0x100 })
+    if WSAPoll(__slice_ptr(entry), 1, 0) != 0 {
+        return true
+    }
+    false
+}
+
+/// Parks the green thread until the socket `fd` may be ready to read, or to write when `writable` is set.
+///
+/// Can return before the socket is ready, and returns when another green thread shuts the socket down, so the caller repeats its operation and waits again.
+pub fn wait_socket(fd: i64, writable: bool) {
+    let event = event_of(fd)
+    ResetEvent(event)
+    if !ready(fd, writable) {
+        wait_readable(event)
+    }
+}

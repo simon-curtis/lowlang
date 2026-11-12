@@ -71,3 +71,9 @@ main:
 	syscall
 .endif
 	.endm
+
+	.macro LAST_ERROR_SAVE
+	.endm
+
+	.macro LAST_ERROR_RESTORE
+	.endm

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"lowlang/internal/compiler"
+	platform "lowlang/internal/target"
 )
 
 const debounce = 150 * time.Millisecond
@@ -31,7 +32,7 @@ func (j compileJob) run() (result compiled) {
 			result.err = fmt.Errorf("internal compiler error: %v", r)
 		}
 	}()
-	result.unit, result.err = compiler.Check(j.entry, j.docs)
+	result.unit, result.err = compiler.Check(j.entry, platform.Host(), j.docs)
 	return result
 }
 

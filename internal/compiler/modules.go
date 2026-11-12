@@ -13,6 +13,7 @@ import (
 	"lowlang/internal/ast"
 	"lowlang/internal/diag"
 	"lowlang/internal/parser"
+	"lowlang/internal/target"
 )
 
 const moduleFile = "low.mod"
@@ -36,18 +37,23 @@ func diskTree(files fs.FS) tree {
 	return tree{files: files, join: filepath.Join}
 }
 
-func (t tree) sources(dir string) ([]string, error) {
+func (t tree) sources(dir string, platform target.OS) ([]string, error) {
 	entries, err := fs.ReadDir(t.files, dir)
 	if err != nil {
 		return nil, err
 	}
 	var files []string
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".low") {
+		if builds(e, platform) {
 			files = append(files, t.join(dir, e.Name()))
 		}
 	}
 	return files, nil
+}
+
+func builds(entry fs.DirEntry, platform target.OS) bool {
+	name := entry.Name()
+	return !entry.IsDir() && strings.HasSuffix(name, ".low") && platform.Builds(name)
 }
 
 func (t tree) parse(name string) (*ast.File, error) {
@@ -92,17 +98,18 @@ type edge struct {
 }
 
 type loader struct {
-	root    string
-	disk    tree
-	std     tree
-	files   []*ast.File
-	sources []string
-	edges   map[string][]edge
-	pending []edge
+	root     string
+	platform target.OS
+	disk     tree
+	std      tree
+	files    []*ast.File
+	sources  []string
+	edges    map[string][]edge
+	pending  []edge
 }
 
-func load(entryPath string, disk fs.FS) (*loader, error) {
-	l := &loader{disk: diskTree(disk), std: stdTree, edges: map[string][]edge{}}
+func load(entryPath string, platform target.OS, disk fs.FS) (*loader, error) {
+	l := &loader{platform: platform, disk: diskTree(disk), std: stdTree, edges: map[string][]edge{}}
 	info, err := fs.Stat(disk, entryPath)
 	if err != nil {
 		return nil, err
@@ -110,7 +117,7 @@ func load(entryPath string, disk fs.FS) (*loader, error) {
 	dir, entry := filepath.Dir(entryPath), []string{entryPath}
 	if info.IsDir() {
 		dir = entryPath
-		if entry, err = l.disk.sources(entryPath); err != nil {
+		if entry, err = l.disk.sources(entryPath, platform); err != nil {
 			return nil, err
 		}
 		if len(entry) == 0 {
@@ -155,7 +162,7 @@ func (l *loader) imported(e edge) error {
 		dir = filepath.Join(l.root, filepath.FromSlash(e.to))
 		where = dir
 	}
-	files, err := source.sources(dir)
+	files, err := source.sources(dir, l.platform)
 	if errors.Is(err, fs.ErrNotExist) || (err == nil && len(files) == 0) {
 		return diag.Errorf(e.pos, "cannot find module %s in %s", e.to, where)
 	}

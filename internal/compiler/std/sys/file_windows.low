@@ -1,0 +1,535 @@
+import std/io
+
+extern "kernel32" {
+    fn CreateFileW(path: ptr, access: u32, share: u32, security: ptr, disposition: u32, flags: u32, template: i64) -> i64
+    fn GetFileAttributesW(path: ptr) -> u32
+    fn SetFileAttributesW(path: ptr, attributes: u32) -> i32
+    fn GetFileInformationByHandle(h: i64, info: ptr) -> i32
+    fn GetFileInformationByHandleEx(h: i64, class: i32, info: ptr, size: u32) -> i32
+    fn SetFileInformationByHandle(h: i64, class: i32, info: ptr, size: u32) -> i32
+    fn SetFileTime(h: i64, created: ptr, accessed: ptr, written: ptr) -> i32
+    fn DeleteFileW(path: ptr) -> i32
+    fn RemoveDirectoryW(path: ptr) -> i32
+    fn CreateDirectoryW(path: ptr, security: ptr) -> i32
+    fn MoveFileExW(from: ptr, to: ptr, flags: u32) -> i32
+    fn CreateSymbolicLinkW(link_path: ptr, target: ptr, flags: u32) -> u8
+    fn CreateHardLinkW(new_path: ptr, existing: ptr, security: ptr) -> i32
+    fn DeviceIoControl(h: i64, code: u32, input: ptr, input_size: u32, output: ptr, output_size: u32, mut returned: u32, overlapped: ptr) -> i32
+    fn GetDiskFreeSpaceExW(path: ptr, mut available: i64, mut total: i64, mut free: i64) -> i32
+    fn LockFileEx(h: i64, flags: u32, reserved: u32, low: u32, high: u32, overlapped: ptr) -> i32
+    fn UnlockFileEx(h: i64, reserved: u32, low: u32, high: u32, overlapped: ptr) -> i32
+    fn SetFilePointerEx(h: i64, distance: i64, mut position: i64, method: u32) -> i32
+    fn FlushFileBuffers(h: i64) -> i32
+    fn FindFirstFileExW(pattern: ptr, level: i32, data: ptr, search: i32, filter: ptr, flags: u32) -> i64
+    fn FindNextFileW(h: i64, data: ptr) -> i32
+    fn FindClose(h: i64) -> i32
+    fn GetFinalPathNameByHandleW(h: i64, path: ptr, chars: u32, flags: u32) -> u32
+}
+
+extern "bcryptprimitives" {
+    fn ProcessPrng(data: ptr, size: i64) -> i32
+}
+
+fn generic_read() -> u32 {
+    2147483648
+}
+
+fn generic_write() -> u32 {
+    1073741824
+}
+
+fn read_attributes() -> u32 {
+    128
+}
+
+fn write_attributes() -> u32 {
+    256
+}
+
+fn share_all() -> u32 {
+    7
+}
+
+fn backup_semantics() -> u32 {
+    33554432
+}
+
+fn open_reparse_point() -> u32 {
+    2097152
+}
+
+fn attribute_readonly() -> u32 {
+    1
+}
+
+fn attribute_directory() -> u32 {
+    16
+}
+
+fn attribute_reparse() -> u32 {
+    1024
+}
+
+fn invalid_attributes() -> u32 {
+    4294967295
+}
+
+fn unix_epoch_ticks() -> i64 {
+    116444736000000000
+}
+
+fn ticks_per_second() -> i64 {
+    10000000
+}
+
+struct Plan {
+    access: u32
+    disposition: u32
+    flags: u32
+}
+
+fn plan_of(how: Open) -> Plan {
+    let rw = generic_read() | generic_write()
+    match how {
+        Read => Plan { access: generic_read(), disposition: 3, flags: backup_semantics() }
+        Truncate => Plan { access: generic_write(), disposition: 2, flags: 0 }
+        Append => Plan { access: 1048708, disposition: 4, flags: 0 }
+        Update => Plan { access: rw, disposition: 4, flags: 0 }
+        Directory => Plan { access: generic_read(), disposition: 3, flags: backup_semantics() }
+        Locate => Plan { access: read_attributes(), disposition: 3, flags: backup_semantics() }
+        Fresh => Plan { access: rw, disposition: 1, flags: 0 }
+        FreshNoFollow => Plan { access: generic_write(), disposition: 1, flags: open_reparse_point() }
+        ReadWrite => Plan { access: rw, disposition: 3, flags: 0 }
+        Terminal => Plan { access: rw, disposition: 3, flags: 0 }
+    }
+}
+
+fn attributes(path: str) -> u32 {
+    GetFileAttributesW(__slice_ptr(wide(path)))
+}
+
+fn is_directory(path: str) -> bool {
+    let a = attributes(path)
+    a != invalid_attributes() && a & attribute_directory() != 0
+}
+
+fn create_flags(mode: i64) -> u32 {
+    if mode & 0o200 == 0 { 129 } else { 128 }
+}
+
+fn open_handle(path: str, access: u32, disposition: u32, flags: u32) -> i64 ! io.Error {
+    let name = wide(path)
+    let h = CreateFileW(__slice_ptr(name), access, share_all(), null, disposition, flags, 0)
+    if h != invalid_handle() {
+        return h
+    }
+    let code = i64(GetLastError())
+    if code == 5 && is_directory(path) {
+        fail IsDir
+    }
+    fail win_error(code)
+}
+
+fn seconds_of(info: []u8, at: i64) -> i64 {
+    let ticks = io.le64(info, at) - unix_epoch_ticks()
+    if ticks < 0 {
+        return -((ticks_per_second() - 1 - ticks) / ticks_per_second())
+    }
+    ticks / ticks_per_second()
+}
+
+fn filetime(seconds: i64) -> []u8 {
+    let t = io.buffer(8)
+    io.set_le64(t, 0, seconds * ticks_per_second() + unix_epoch_ticks())
+    t
+}
+
+fn link_tag(h: i64) -> bool {
+    let info = io.buffer(8)
+    if GetFileInformationByHandleEx(h, 9, __slice_ptr(info), 8) == 0 {
+        return false
+    }
+    let tag = io.le32(info, 4)
+    tag == 0xA000000C || tag == 0xA0000003
+}
+
+fn describe(h: i64, follow: bool) -> Stat ! io.Error {
+    if GetFileType(h) != 1 {
+        return Stat { kind: Kind.Other, size: 0, mode: 0o666, uid: -1, gid: -1, device: 0, inode: 0, accessed: 0, modified: 0 }
+    }
+    let info = io.buffer(52)
+    checked(GetFileInformationByHandle(h, __slice_ptr(info)))?
+    let attrs = io.le32(info, 0)
+    var kind = Kind.Regular
+    var mode = 0o644
+    if attrs & 16 != 0 {
+        kind = Kind.Dir
+        mode = 0o755
+    }
+    if !follow && attrs & 1024 != 0 && link_tag(h) {
+        kind = Kind.Symlink
+        mode = 0o777
+    }
+    if attrs & 1 != 0 && kind != Kind.Symlink {
+        mode &= ~0o222
+    }
+    Stat {
+        kind
+        size: io.le32(info, 32) << 32 | io.le32(info, 36)
+        mode
+        uid: -1
+        gid: -1
+        device: io.le32(info, 28)
+        inode: io.le32(info, 44) << 32 | io.le32(info, 48)
+        accessed: seconds_of(info, 12)
+        modified: seconds_of(info, 20)
+    }
+}
+
+/// Opens the file at `path` as `how` says and returns a view of the descriptor, which the caller closes.
+///
+/// `mode` gives the permission bits of a file that is created, filtered by the process umask, and is otherwise ignored. An interrupted call is repeated. Fails with `NotFound` when the path does not exist, `Exists` for a `Fresh` mode when it does, and `Denied` when the caller lacks permission.
+pub fn open(path: str, how: Open, mode: i64) -> FdHandle ! io.Error {
+    let plan = plan_of(how)
+    var flags = plan.flags
+    if plan.disposition != 3 {
+        flags |= create_flags(mode)
+    }
+    let h = open_handle(path, plan.access, plan.disposition, flags)?
+    if how == Open.Directory && !is_directory(path) {
+        CloseHandle(h)
+        fail NotDir
+    }
+    wrap(h)
+}
+
+/// Returns whether the caller can `how` the path.
+///
+/// Follows symbolic links. Any error gives `false`.
+pub fn access(path: str, how: Access) -> bool {
+    let a = attributes(path)
+    if a == invalid_attributes() {
+        return false
+    }
+    match how {
+        Present => true
+        Executable => a & attribute_directory() == 0
+    }
+}
+
+/// Returns the attributes of the open descriptor `fd`.
+pub fn fstat(fd: i64) -> Stat ! io.Error {
+    describe(handle(fd), true)
+}
+
+/// Returns the attributes of the file at `path`.
+///
+/// A final symbolic link is followed when `follow` is `true` and described itself otherwise.
+pub fn stat(path: str, follow: bool) -> Stat ! io.Error {
+    let flags = if follow { backup_semantics() } else { backup_semantics() | open_reparse_point() }
+    let h = open_handle(path, read_attributes(), 3, flags)?
+    defer CloseHandle(h)
+    describe(h, follow)
+}
+
+/// Sets the permission bits of the file at `path` to `mode`, following symbolic links.
+pub fn chmod(path: str, mode: i64) ! io.Error {
+    let name = wide(path)
+    let a = GetFileAttributesW(__slice_ptr(name))
+    if a == invalid_attributes() {
+        fail last_error()
+    }
+    let updated = if mode & 0o200 == 0 { a | attribute_readonly() } else { a & ~attribute_readonly() }
+    checked(SetFileAttributesW(__slice_ptr(name), updated))?
+}
+
+/// Sets the owner and group of the file at `path`.
+///
+/// A final symbolic link is followed when `follow` is `true` and changed itself otherwise.
+pub fn chown(path: str, uid: i64, gid: i64, follow: bool) ! io.Error {
+    fail Unsupported
+}
+
+/// Sets the access and modification times of the file at `path`, in whole seconds since the Unix epoch.
+///
+/// A time that is `none` is left unchanged. A final symbolic link is followed when `follow` is `true` and stamped itself otherwise.
+pub fn set_times(path: str, accessed: i64?, modified: i64?, follow: bool) ! io.Error {
+    let flags = if follow { backup_semantics() } else { backup_semantics() | open_reparse_point() }
+    let h = open_handle(path, write_attributes(), 3, flags)?
+    defer CloseHandle(h)
+    let a = filetime(accessed ?? 0)
+    let m = filetime(modified ?? 0)
+    let a_ptr = if accessed == none { null } else { __slice_ptr(a) }
+    let m_ptr = if modified == none { null } else { __slice_ptr(m) }
+    checked(SetFileTime(h, null, a_ptr, m_ptr))?
+}
+
+/// Removes the file or symbolic link at `path`.
+pub fn unlink(path: str) ! io.Error {
+    let name = wide(path)
+    if DeleteFileW(__slice_ptr(name)) != 0 {
+        return
+    }
+    let code = i64(GetLastError())
+    let a = GetFileAttributesW(__slice_ptr(name))
+    if code != 5 || a == invalid_attributes() {
+        fail win_error(code)
+    }
+    if a & attribute_directory() != 0 {
+        if a & attribute_reparse() == 0 {
+            fail IsDir
+        }
+        checked(RemoveDirectoryW(__slice_ptr(name)))?
+        return
+    }
+    if a & attribute_readonly() == 0 {
+        fail win_error(code)
+    }
+    checked(SetFileAttributesW(__slice_ptr(name), a & ~attribute_readonly()))?
+    checked(DeleteFileW(__slice_ptr(name)))?
+}
+
+/// Removes the empty directory at `path`.
+pub fn rmdir(path: str) ! io.Error {
+    checked(RemoveDirectoryW(__slice_ptr(wide(path))))?
+}
+
+/// Creates the directory `path` with permission bits `mode`, filtered by the process umask.
+pub fn mkdir(path: str, mode: i64) ! io.Error {
+    checked(CreateDirectoryW(__slice_ptr(wide(path)), null))?
+}
+
+/// Renames the entry `from` to `to`, replacing an existing `to`.
+pub fn rename(from: str, to: str) ! io.Error {
+    let source = wide(from)
+    let destination = wide(to)
+    checked(MoveFileExW(__slice_ptr(source), __slice_ptr(destination), 1))?
+}
+
+fn parent_of(path: str) -> str {
+    var at = path.len - 1
+    for at >= 0 && path[at] != '/' && path[at] != '\\' {
+        at -= 1
+    }
+    if at < 0 {
+        return ""
+    }
+    path[..at + 1]
+}
+
+fn absolute(path: str) -> bool {
+    path.len > 0 && (path[0] == '/' || path[0] == '\\') || path.len > 1 && path[1] == ':'
+}
+
+fn backslashes(path: str) -> str {
+    var out = bytes(path)
+    for i in 0..out.len {
+        if out[i] == '/' {
+            out[i] = '\\'
+        }
+    }
+    str(out)
+}
+
+/// Creates the symbolic link `link_path` that holds the text `target`.
+pub fn symlink(target: str, link_path: str) ! io.Error {
+    let resolved = if absolute(target) { target } else { parent_of(link_path) + target }
+    let flags: u32 = if is_directory(resolved) { 3 } else { 2 }
+    let link_name = wide(link_path)
+    let target_name = wide(backslashes(target))
+    if CreateSymbolicLinkW(__slice_ptr(link_name), __slice_ptr(target_name), flags) == 0 {
+        fail last_error()
+    }
+}
+
+/// Creates `new_path` as a hard link to the file `existing`.
+pub fn link(existing: str, new_path: str) ! io.Error {
+    let created = wide(new_path)
+    let source = wide(existing)
+    checked(CreateHardLinkW(__slice_ptr(created), __slice_ptr(source), null))?
+}
+
+fn reparse_text(data: []u8, offset: i64, length: i64) -> str {
+    narrow_buffer(data[offset..offset + length], length / 2)
+}
+
+/// Returns the target text of the symbolic link `path`.
+///
+/// Fails with `Invalid` when `path` is not a symbolic link and `TooLarge` when the target is 1 MiB or longer.
+pub fn readlink(path: str) -> str ! io.Error {
+    let h = open_handle(path, read_attributes(), 3, backup_semantics() | open_reparse_point())?
+    defer CloseHandle(h)
+    let data = io.buffer(16384)
+    var returned: u32 = 0
+    checked(DeviceIoControl(h, 589992, null, 0, __slice_ptr(data), u32(data.len), mut returned, null))?
+    let tag = io.le32(data, 0)
+    if tag != 0xA000000C && tag != 0xA0000003 {
+        fail Invalid
+    }
+    let base = if tag == 0xA000000C { 20 } else { 16 }
+    let print_offset = io.le16(data, 12)
+    let print_length = io.le16(data, 14)
+    if print_length > 0 {
+        return reparse_text(data, base + print_offset, print_length)
+    }
+    let name = reparse_text(data, base + io.le16(data, 8), io.le16(data, 10))
+    if name.len >= 4 && name[..4] == "\\??\\" {
+        return name[4..]
+    }
+    name
+}
+
+/// Returns the absolute path of the open descriptor `fd`, with every symbolic link resolved.
+pub fn path_of(fd: i64) -> str ! io.Error {
+    let h = handle(fd)
+    var size: u32 = 260
+    for {
+        let buf = io.buffer(2 * i64(size) + 2)
+        let n = GetFinalPathNameByHandleW(h, __slice_ptr(buf), size, 0)
+        if n == 0 {
+            fail last_error()
+        }
+        if n < size {
+            let full = narrow_buffer(buf, i64(n))
+            if full.len >= 8 && full[..8] == "\\\\?\\UNC\\" {
+                return "\\\\" + full[8..]
+            }
+            if full.len >= 4 && full[..4] == "\\\\?\\" {
+                return full[4..]
+            }
+            return full
+        }
+        size = n + 1
+    }
+}
+
+/// Returns the path of the device that discards what is written and reads as empty.
+pub fn null_device() -> str {
+    "NUL"
+}
+
+/// Returns the capacity figures of the file system that holds `path`.
+pub fn statfs(path: str) -> Usage ! io.Error {
+    var available: i64 = 0
+    var total: i64 = 0
+    var free: i64 = 0
+    checked(GetDiskFreeSpaceExW(__slice_ptr(wide(path)), mut available, mut total, mut free))?
+    Usage { total, free, available, files: 0, files_free: 0 }
+}
+
+/// Takes or releases the advisory lock on the open descriptor `fd`.
+///
+/// Returns `false` without waiting when another descriptor holds a conflicting lock.
+pub fn lock(fd: i64, kind: LockKind) -> bool ! io.Error {
+    let h = handle(fd)
+    let overlapped = io.buffer(32)
+    let all: u32 = 4294967295
+    if kind == LockKind.Unlock {
+        if UnlockFileEx(h, 0, all, all, __slice_ptr(overlapped)) == 0 && GetLastError() != 158 {
+            fail last_error()
+        }
+        return true
+    }
+    let flags: u32 = if kind == LockKind.Exclusive { 3 } else { 1 }
+    if LockFileEx(h, flags, 0, all, all, __slice_ptr(overlapped)) != 0 {
+        return true
+    }
+    let code = i64(GetLastError())
+    if code == 33 || code == 997 {
+        return false
+    }
+    fail win_error(code)
+}
+
+/// Moves the position of the descriptor `fd` by `offset` bytes relative to `from` and returns the new position.
+pub fn seek(fd: i64, offset: i64, from: Seek) -> i64 ! io.Error {
+    let method: u32 = match from {
+        FromStart => 0
+        FromCurrent => 1
+        FromEnd => 2
+    }
+    var position: i64 = 0
+    checked(SetFilePointerEx(handle(fd), offset, mut position, method))?
+    position
+}
+
+/// Flushes the data and metadata of the descriptor `fd` to the storage device.
+pub fn fsync(fd: i64) ! io.Error {
+    checked(FlushFileBuffers(handle(fd)))?
+}
+
+/// Sets the size of the file behind `fd` to `size` bytes.
+pub fn ftruncate(fd: i64, size: i64) ! io.Error {
+    let info = io.buffer(8)
+    io.set_le64(info, 0, size)
+    checked(SetFileInformationByHandle(handle(fd), 6, __slice_ptr(info), 8))?
+}
+
+fn entry_of(data: []u8) -> DirEntry {
+    let name = narrow_buffer(data[44..], wide_length(data, 44))
+    let attrs = io.le32(data, 0)
+    let tag = io.le32(data, 36)
+    let kind = if attrs & 1024 != 0 && (tag == 0xA000000C || tag == 0xA0000003) {
+        Kind.Symlink
+    } else if attrs & 16 != 0 {
+        Kind.Dir
+    } else {
+        Kind.Regular
+    }
+    DirEntry { name, kind: some(kind) }
+}
+
+fn pattern_of(path: str) -> str {
+    if path.len > 0 && (path[path.len - 1] == '/' || path[path.len - 1] == '\\') {
+        return path + "*"
+    }
+    path + "\\*"
+}
+
+/// Returns the entries of the directory `path`, without `.` and `..`, in the order the file system returns them.
+pub fn list_dir(path: str) -> []DirEntry ! io.Error {
+    let a = attributes(path)
+    if a == invalid_attributes() {
+        fail last_error()
+    }
+    if a & attribute_directory() == 0 {
+        fail NotDir
+    }
+    let data = io.buffer(600)
+    let pattern = wide(pattern_of(path))
+    let h = FindFirstFileExW(__slice_ptr(pattern), 1, __slice_ptr(data), 0, null, 2)
+    var entries: []DirEntry = []
+    if h == invalid_handle() {
+        let code = i64(GetLastError())
+        if code == 2 {
+            return entries
+        }
+        fail win_error(code)
+    }
+    defer FindClose(h)
+    for {
+        let entry = entry_of(data)
+        if entry.name != "." && entry.name != ".." {
+            push(mut entries, entry)
+        }
+        if FindNextFileW(h, __slice_ptr(data)) == 0 {
+            break
+        }
+    }
+    let code = i64(GetLastError())
+    if code != 18 {
+        fail win_error(code)
+    }
+    entries
+}
+
+/// Returns `n` bytes from the operating system's cryptographically secure random generator.
+///
+/// Blocks until the kernel pool is initialised. A short or interrupted read is repeated. Fails with the system error when the generator cannot be read.
+pub fn random_bytes(n: i64) -> []u8 ! io.Error {
+    let out = io.buffer(n)
+    if n > 0 {
+        ProcessPrng(__slice_ptr(out), n)
+    }
+    out
+}

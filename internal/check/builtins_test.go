@@ -13,6 +13,7 @@ import (
 	"lowlang/internal/check"
 	"lowlang/internal/compiler"
 	"lowlang/internal/diag"
+	"lowlang/internal/target"
 )
 
 func documentedBuiltins(t *testing.T) (names []string, signatures map[string][]string) {
@@ -120,7 +121,7 @@ func TestPublicBuiltinsRejectWrongArity(t *testing.T) {
 		if err := os.WriteFile(path, []byte(source), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		_, err := compiler.Check(path, compiler.Overlay(nil))
+		_, err := compiler.Check(path, target.Linux, compiler.Overlay(nil))
 		var failure *diag.Error
 		if !errors.As(err, &failure) || !strings.Contains(failure.Msg, "takes") {
 			t.Errorf("%s() reported %v", b.Name, err)

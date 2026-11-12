@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/target"
 )
 
 type ModuleDoc struct {
@@ -33,18 +34,19 @@ type ItemDoc struct {
 }
 
 type documenter struct {
-	fsys  fs.FS
-	parse func(name string) (*ast.File, error)
+	fsys     fs.FS
+	platform target.OS
+	parse    func(name string) (*ast.File, error)
 }
 
-func Document(target string) ([]ModuleDoc, error) {
-	if target == "std" {
-		d := documenter{fsys: stdFS, parse: stdTree.parse}
+func Document(dir string, platform target.OS) ([]ModuleDoc, error) {
+	if dir == "std" {
+		d := documenter{fsys: stdFS, platform: platform, parse: stdTree.parse}
 		return d.walk("std")
 	}
 	disk := diskTree(Overlay(nil))
-	d := documenter{fsys: os.DirFS(target), parse: func(name string) (*ast.File, error) {
-		return disk.parse(path.Join(target, name))
+	d := documenter{fsys: os.DirFS(dir), platform: platform, parse: func(name string) (*ast.File, error) {
+		return disk.parse(path.Join(dir, name))
 	}}
 	return d.walk(".")
 }
@@ -77,7 +79,7 @@ func (d documenter) module(dir string) (ModuleDoc, bool, error) {
 	}
 	var files []*ast.File
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".low") {
+		if !builds(entry, d.platform) {
 			continue
 		}
 		file, err := d.parse(path.Join(dir, entry.Name()))

@@ -108,6 +108,7 @@ rt_m_running:
 
 	push rbx
 	push r12
+	LAST_ERROR_SAVE
 	TLS_GET rbx, TLS_M
 	mov r12, rdi
 1:
@@ -127,6 +128,7 @@ rt_m_running:
 	call rt_gc_wait
 	jmp 1b
 3:
+	LAST_ERROR_RESTORE
 	pop r12
 	pop rbx
 	ret

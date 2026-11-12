@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"lowlang/internal/compiler"
+	platform "lowlang/internal/target"
 )
 
 func scratch(t *testing.T, name, src string) fixture {
@@ -93,7 +94,7 @@ func applyText(src string, edits []TextEdit) string {
 
 func compiles(t *testing.T, entry string, edited compiler.Overlay) {
 	t.Helper()
-	if _, err := compiler.Check(entry, edited); err != nil {
+	if _, err := compiler.Check(entry, platform.Host(), edited); err != nil {
 		t.Errorf("renamed program does not compile: %v", err)
 	}
 }

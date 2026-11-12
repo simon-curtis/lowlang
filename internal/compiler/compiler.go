@@ -35,7 +35,7 @@ func AnalyseDev(path string, platform target.OS) (*Unit, error) {
 }
 
 func analyse(path string, platform target.OS, opts ir.Options) (*Unit, error) {
-	unit, err := Check(path, Overlay(nil))
+	unit, err := Check(path, platform, Overlay(nil))
 	if err != nil {
 		return nil, err
 	}
@@ -44,12 +44,12 @@ func analyse(path string, platform target.OS, opts ir.Options) (*Unit, error) {
 	return unit, nil
 }
 
-func Check(path string, disk fs.FS) (*Unit, error) {
+func Check(path string, platform target.OS, disk fs.FS) (*Unit, error) {
 	file, err := parsePrelude()
 	if err != nil {
 		return nil, err
 	}
-	modules, err := load(path, disk)
+	modules, err := load(path, platform, disk)
 	if err != nil {
 		return nil, err
 	}

@@ -7,6 +7,7 @@ import (
 	"lowlang/internal/compiler"
 	"lowlang/internal/fixture"
 	"lowlang/internal/fixture/fixturetest"
+	"lowlang/internal/target"
 )
 
 func TestLint(t *testing.T) {
@@ -19,7 +20,7 @@ func TestLint(t *testing.T) {
 
 func lintFixture(t *testing.T, program fixturetest.Program) {
 	want, _ := program.Text(t, fixture.WarningsExt)
-	unit, err := compiler.Check(program.Path, compiler.Overlay(nil))
+	unit, err := compiler.Check(program.Path, target.Linux, compiler.Overlay(nil))
 	if err != nil {
 		t.Fatal(err)
 	}

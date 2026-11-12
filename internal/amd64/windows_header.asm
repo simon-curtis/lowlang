@@ -1,6 +1,7 @@
 	.set TEB_STACK_BASE, 0x8
 	.set TEB_STACK_LIMIT, 0x10
 	.set TEB_DEALLOCATION_STACK, 0x1478
+	.set TEB_LAST_ERROR, 0x68
 	.set TEB_TLS_SLOTS, 0x1480
 	.set TLS_SLOT_COUNT, 64
 	.set STACK_COMMIT, 16384
@@ -134,4 +135,16 @@
 
 	.macro PROGRAM_EXIT
 	call rt_exit
+	.endm
+
+	.macro LAST_ERROR_SAVE
+	sub rsp, 16
+	mov r11d, dword ptr gs:[TEB_LAST_ERROR]
+	mov [rsp], r11
+	.endm
+
+	.macro LAST_ERROR_RESTORE
+	mov r11, [rsp]
+	mov dword ptr gs:[TEB_LAST_ERROR], r11d
+	add rsp, 16
 	.endm

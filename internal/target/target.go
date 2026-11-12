@@ -31,6 +31,20 @@ func (o OS) Executable(name string) string {
 	return name
 }
 
+var fileSuffixes = map[OS]string{
+	Linux:   "_linux.low",
+	Windows: "_windows.low",
+}
+
+func (o OS) Builds(file string) bool {
+	for other, suffix := range fileSuffixes {
+		if other != o && strings.HasSuffix(file, suffix) {
+			return false
+		}
+	}
+	return true
+}
+
 func Names() []string {
 	out := make([]string, len(all))
 	for i, o := range all {

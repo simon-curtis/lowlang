@@ -23,8 +23,8 @@ var usage = fmt.Sprintf(`usage:
   low run <file.low>
   low asm <file.low> [-target %[1]s]
   low ir <file.low> [-target %[1]s]
-  low lint <file.low>
-  low doc <dir|std>
+  low lint <file.low> [-target %[1]s]
+  low doc <dir|std> [-target %[1]s]
   low dev <file.low>
   low lsp
   low version`, target.Choices())
@@ -82,16 +82,15 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		return compileCommand(ctx, cmd, path, opts)
-	case "lint":
-		if len(args) != 2 {
-			return usageError{}
+	case "lint", "doc":
+		opts, err := parseOptions(args[2:], false)
+		if err != nil {
+			return err
 		}
-		return lintCommand(path)
-	case "doc":
-		if len(args) != 2 {
-			return usageError{}
+		if cmd == "lint" {
+			return lintCommand(path, opts.platform)
 		}
-		return docCommand(path)
+		return docCommand(path, opts.platform)
 	case "run":
 		if len(args) != 2 {
 			return usageError{}
@@ -162,8 +161,8 @@ func parseOptions(args []string, output bool) (options, error) {
 	return opts, nil
 }
 
-func lintCommand(path string) error {
-	unit, err := compiler.Check(path, compiler.Overlay(nil))
+func lintCommand(path string, platform target.OS) error {
+	unit, err := compiler.Check(path, platform, compiler.Overlay(nil))
 	if err != nil {
 		return err
 	}
@@ -174,8 +173,8 @@ func lintCommand(path string) error {
 	return nil
 }
 
-func docCommand(target string) error {
-	modules, err := compiler.Document(target)
+func docCommand(dir string, platform target.OS) error {
+	modules, err := compiler.Document(dir, platform)
 	if err != nil {
 		return err
 	}

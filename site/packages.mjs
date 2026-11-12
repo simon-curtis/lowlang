@@ -205,7 +205,7 @@ ${rows.join("\n")}
 }
 
 export async function standard(binary) {
-    const { stdout } = await run(binary, ["doc", "std"], { maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await run(binary, ["doc", "std", "-target", "linux/amd64"], { maxBuffer: 64 * 1024 * 1024 });
     return JSON.parse(stdout);
 }
 

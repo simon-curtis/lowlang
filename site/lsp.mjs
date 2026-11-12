@@ -31,7 +31,7 @@ export class Session {
     #files = 0;
 
     get binary() {
-        return join(this.#directory, "low");
+        return join(this.#directory, process.platform === "win32" ? "low.exe" : "low");
     }
 
     async start() {
@@ -55,11 +55,13 @@ export class Session {
     async stop() {
         if (this.#process && !this.#lost) {
             await this.#request("shutdown", null);
+            const exited = new Promise((resolve) => this.#process.once("exit", resolve));
             this.#notify("exit", null);
             this.#process.kill();
+            await exited;
         }
         if (this.#directory) {
-            await rm(this.#directory, { recursive: true, force: true });
+            await rm(this.#directory, { recursive: true, force: true, maxRetries: 5 });
         }
     }
 

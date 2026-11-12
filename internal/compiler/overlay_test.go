@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"lowlang/internal/target"
 )
 
 func TestOverlayFilesJoinTheirDirectory(t *testing.T) {
@@ -14,10 +16,10 @@ func TestOverlayFilesJoinTheirDirectory(t *testing.T) {
 	}
 	unsaved := filepath.Join(dir, "helper.low")
 	overlay := Overlay{unsaved: []byte("fn helper() {\n}\n")}
-	if _, err := Check(dir, overlay); err != nil {
+	if _, err := Check(dir, target.Linux, overlay); err != nil {
 		t.Fatalf("directory with an unsaved file: %v", err)
 	}
-	if _, err := Check(dir, Overlay(nil)); err == nil {
+	if _, err := Check(dir, target.Linux, Overlay(nil)); err == nil {
 		t.Fatal("helper resolved without the unsaved file")
 	}
 }
@@ -28,11 +30,11 @@ func TestOverlayShadowsDisk(t *testing.T) {
 	if err := os.WriteFile(disk, []byte("fn main() {\n    missing()\n}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Check(disk, Overlay(nil)); err == nil {
+	if _, err := Check(disk, target.Linux, Overlay(nil)); err == nil {
 		t.Fatal("disk copy compiled")
 	}
 	overlay := Overlay{disk: []byte("fn main() {\n}\n")}
-	if _, err := Check(disk, overlay); err != nil {
+	if _, err := Check(disk, target.Linux, overlay); err != nil {
 		t.Fatalf("overlay copy: %v", err)
 	}
 }
@@ -45,14 +47,14 @@ func TestOverlayEmbedsUnsavedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	note := filepath.Join(dir, "note.txt")
-	unit, err := Check(disk, Overlay{note: []byte("held in memory")})
+	unit, err := Check(disk, target.Linux, Overlay{note: []byte("held in memory")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(unit.Sources) != 2 || unit.Sources[1] != note {
 		t.Fatalf("sources %v, want the program and %s", unit.Sources, note)
 	}
-	if _, err := Check(disk, Overlay(nil)); err == nil {
+	if _, err := Check(disk, target.Linux, Overlay(nil)); err == nil {
 		t.Fatal("embed resolved without the unsaved file")
 	}
 }
