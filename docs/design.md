@@ -1216,7 +1216,7 @@ Every public struct, enum, function, struct field and enum variant carries a doc
 | `std/process` | `Command` with arguments, an optional replacement environment, a working directory, `Inherit`, `Piped` or `Null` for each standard stream, and an optional new process group. `start` returns a droppable `Child` that kills and reaps an unwaited process and closes its pipes when released. `start_handle`, `adopt`, `wait`, `kill` (which takes a `std/os/signal` `Signal`; an `Exit` is `Exited(code)` or `Signaled(signal)` with the same type), and `wait_on`, `wait_exit_on` (waits without reaping, so the process group can still be signalled) and `kill_on` on the shared `ChildHandle`. `run` feeds input and collects both outputs. `find` searches `PATH`. `success`. |
 | `std/cdp` | The Chrome DevTools Protocol. `launch` starts a headless Chromium with a disposable profile, connects to it and returns a droppable `Browser` that shuts it down when released. Its `handle` is the shared `*BrowserHandle`; `launch_handle`, `adopt`, `shutdown_on` and `open_page_on` take it. `call` sends a command to the browser or a session, and each `subscribe` gets every other message as events. `open_page` opens a page in its own browser context, which `close_page` disposes, and every request of the page, including those of cross-site frames and workers, passes through `Handlers`. Also `navigate` and `shutdown`. |
 | `std/path` | Slash-separated path manipulation: `clean` (lexical, resolving `.` and `..`), `join`, `base`, `dir`, `ext`, `stem` and `is_absolute`. `matches` matches shell globs with `*`, `?`, `[...]` classes (ranges, `!` or `^` negation) and `\` escapes; no wildcard crosses a `/`. |
-| `std/sync` | `Mutex` with `lock`, `try_lock`, `unlock` and `locked`. `WaitGroup` with `add`, `done` and `wait`. `Once` with `run`. `RwLock`, first in first out and writer-fair, with `read_lock`, `read_unlock`, `write_lock`, `write_unlock`, `try_read_lock`, `try_write_lock`, `reading` and `writing`. `Semaphore` with `acquire`, `try_acquire`, `release` and `available`. `Cond` with `wait_cond`, `signal` and `broadcast`. `Barrier` with `wait_barrier`. `OnceValue[T]`. `ErrorGroup[E]`, whose `go` blocks while `limit` tasks run and whose `join` returns the first error. All are built on channels, so a waiting green thread parks instead of spinning. |
+| `std/sync` | `Mutex` with `lock`, `try_lock`, `unlock` and `locked`. `WaitGroup` with `add`, `done` and `wait`. `Once` with `run`. `RwLock`, first in first out and writer-fair, with `read_lock`, `read_unlock`, `write_lock`, `write_unlock`, `try_read_lock`, `try_write_lock`, `reading` and `writing`. `Semaphore` with `acquire`, `try_acquire`, `release` and `available`. `Cond` with `wait_cond`, `signal` and `broadcast`. `Barrier` with `wait_barrier`. `OnceValue[T]`. `ErrorGroup[E]`, whose `go` blocks while `limit` tasks run and whose `join` returns the first error. All are built on channels, so a waiting green thread parks instead of spinning. `lock_thread` and `unlock_thread` pin the calling green thread to its OS thread, for C libraries whose state belongs to one thread; they nest. |
 | `std/retry` | `Policy` with attempts, base, multiplier, maximum delay, `Jitter` (`None`, `Full`, `Equal`, `Decorrelated`), a deadline, a seeded `Rng` and a cancel token. `delay`; a loop driver `start` with `next` (`reserve` then `commit`) and `at_least`; `run` over a `Step` (`Done`, `Retry`, `RetryAfter`, `Fatal`) giving an `Outcome`. |
 | `std/ratelimit` | `Bucket` (token bucket in exact nanosecond units) with `allow`, `allow_n`, `reserve`, `wait` and `set_rate`. `Window`, a sliding log. `Keyed`, a bounded per-key set of buckets with idle eviction. All take a `clock.Clock`. |
 | `std/singleflight` | `Group[K, V]` with `do`, `do_shared`, `forget` and `in_flight`, which run one call per key while the others wait for its result. `Expiring[V]`, a value refreshed at most once per interval. |
@@ -1563,6 +1563,7 @@ The contracts between the stages have one owner each:
   - `rt_unlock` exchanges 0 into the word and wakes one sleeper only when the old value was 2.
 - C calls run on the OS thread's system stack (8 MB in a static program). Around a C call the generated code pushes the callee-saved registers on the green thread's stack, records where the green thread stopped, marks the thread as in C and switches stacks. On return it marks the thread running again, waiting if a collection is under way.
 - A C callback runs on the green thread's stack. Its thunk marks the thread running, switches back to the green thread's stack below the C call's saved registers, and locks the green thread to the OS thread until it returns, because the C frames live on that OS thread's system stack: if the callback waits, the OS thread waits with it. Callbacks must arrive on the thread that made the C call.
+- A green thread locked to its OS thread, by a callback or by `sync.lock_thread`, keeps a lock count. When it parks, its OS thread is marked in-call, hands its `runnext` to the global queue, wakes another thread if work is queued or a timer or descriptor wait has no poller, and sleeps on the green thread's status word. `ready` wakes that OS thread instead of queuing the green thread, and the OS thread marks itself running before resuming it.
 
 ### Linking
 
@@ -1991,27 +1992,134 @@ Mechanism:
 - `low dev` writes the machine code into the region through `/proc/<pid>/mem`, writes `(index, address)` pairs and a count into a mailbox in the program, and sends `SIGUSR1`. The handler stores each address into `fn_table` with an aligned 8-byte write and clears the count, which `low dev` waits for.
 - Frames already running keep executing their old code; the next call through the table enters the new code. Old code is never unmapped.
 
-## UI groundwork
+## UI
 
-The UI library is staged under `ui/` until it moves into the standard library as `std/ui`.
+`std/ui` holds the modules that draw a window's user interface with Vulkan, on Wayland on Linux and on Win32 on Windows: windows and input, a flexbox layout engine, fonts and text, a scene of GPU primitives, and a renderer that draws a scene into an offscreen target or a window.
 
-- `ui/protocols` holds the Wayland protocol XML the library is built from: `wayland.xml` and `xdg-shell.xml`.
-- `go run ./cmd/wlgen -o wayland.low ui/protocols/wayland.xml ui/protocols/xdg-shell.xml` generates Low bindings for libwayland-client.
+### Modules
+
+| Module | Contents |
+|---|---|
+| `std/ui/geometry` | `Point`, `Size`, `Rect`, `Edges`, `Corners` and `Color`, all in `f32`. |
+| `std/ui/layout` | The flexbox engine over a tree of styled nodes. |
+| `std/ui/font` | TrueType parsing, glyph outlines, the rasteriser and the embedded fallback font. |
+| `std/ui/text` | Shaping, line breaking, measurement and the glyph atlas. |
+| `std/ui/scene` | Quads, shadows and sprites with their clip rectangles and draw order, and batching. |
+| `std/ui/gpu` | The Vulkan renderer, its shaders, offscreen targets and swapchains, and the generated Vulkan bindings. |
+| `std/ui/platform` | Windows, input events and the waiting loop: Wayland, xkbcommon and the generated Wayland bindings on Linux, user32 and kernel32 on Windows. |
+
+- `std/ui/geometry`, `std/ui/layout`, `std/ui/font`, `std/ui/text` and `std/ui/scene` only compute, so they run on both targets with no library.
+- `std/ui/gpu` and `std/ui/platform` hold one file per target for what differs, `surface_linux.low` and `surface_windows.low`, `wayland_linux.low` and `win32_windows.low`, behind one API (see Modules under Syntax).
+- The generated bindings are private to the module that uses them. `std/ui/gpu/vulkan.low` holds the types and constants, and `vulkan_linux.low` and `vulkan_windows.low` the commands, linked from `libvulkan.so` and `vulkan-1.dll`. `std/ui/platform/wayland_linux.low` holds the Wayland bindings.
+- A Linux program that opens a window links `libvulkan.so.1`, `libwayland-client.so.0`, `libxkbcommon.so.0` and libc. A Windows one imports `vulkan-1.dll`, `user32.dll` and `kernel32.dll`.
+
+### Generators
+
+- `internal/wlgen/protocols` holds the Wayland protocol XML, `wayland.xml` and `xdg-shell.xml`. `go run ./cmd/wlgen -o internal/compiler/std/ui/platform/wayland_linux.low internal/wlgen/protocols/wayland.xml internal/wlgen/protocols/xdg-shell.xml` generates the Wayland bindings.
   - Every interface given in one run shares an `Interfaces` record of `wl_interface` tables that `interfaces()` builds in C memory. A reference to an interface that no given protocol declares is an error.
   - A request becomes `interface_request(...)` over `wl_proxy_marshal_flags`, taking the `Interfaces` record when it creates an object of a known interface. `wl_registry_bind` takes the interface table and version.
   - Destructor requests pass `WL_MARSHAL_FLAG_DESTROY`, and an interface without a `destroy` request gets one that calls `wl_proxy_destroy`.
   - Objects are `ptr`, strings `ptr[u8]`, `fixed` an `i32`.
-  - Events become an `extern struct` listener of `extern fn` fields, each defaulting to a generated function that ignores the event, so a listener names only the events it handles. `interface_add_listener` copies it into C memory. Callbacks receive the listener's `data` pointer, usually a pinned Low object.
+  - Events become an `extern struct` listener of `extern fn` fields, each defaulting to a generated function that ignores the event, so a listener names only the events it handles. `interface_add_listener` copies it into C memory. Callbacks receive the listener's `data` pointer, a pinned Low object.
   - Enum entries are functions such as `wl_shm_format_argb8888() -> u32`. Names that clash with Low keywords or builtins gain a trailing `_`.
-- `ui/shaders` holds GLSL for instanced quads with per-corner radii, borders and clipping, blurred shadows, and monochrome glyph sprites sampled from an `R8` atlas. Instances are read from a storage buffer at set 0 binding 0 and the viewport size is a push constant. `go run ./cmd/shadergen ui/shaders` compiles each stage with `glslc` to a checked-in `.spv` and records the SHA-256 sums of the sources and the `.spv` files in `shaders.sum`.
-- `ui/registry` holds the Vulkan registry, `vk.xml.gz` from Vulkan-Docs v1.4.363, and `vulkan.list`, which selects extensions, commands and extra types such as `pNext` structures.
-  - `go run ./cmd/vkgen -registry ui/registry/vk.xml.gz -select ui/registry/vulkan.list -o vulkan.low` generates Low bindings for the selected commands and every type they reach, skipping Vulkan SC variants. Enum values come from the core enums, every Vulkan feature level and the selected extensions.
+- `internal/vkgen/registry` holds the Vulkan registry, `vk.xml.gz` from Vulkan-Docs v1.4.363, and `vulkan.list`, which selects extensions, commands, extra types such as `pNext` structures, and the library each target loads.
+  - `go run ./cmd/vkgen -registry internal/vkgen/registry/vk.xml.gz -select internal/vkgen/registry/vulkan.list -o internal/compiler/std/ui/gpu` writes `vulkan.low` and one `vulkan_<os>.low` per target. A `command` line that ends with a target name, such as `command vkCreateWaylandSurfaceKHR linux`, goes only to that target's file, and `library windows vulkan-1` names the library its `extern` block links.
+  - Commands and every type they reach are generated, skipping Vulkan SC variants. Enum values come from the core enums, every Vulkan feature level and the selected extensions.
   - A handle is a one-field `extern struct`, `ptr` for dispatchable handles and `i64` for the others, so `VkBuffer {}` is the null handle and handles of different kinds do not mix.
   - Structures and unions become `extern struct`s whose fields all have defaults: zero, `null`, the empty handle, or for `sType` the structure's own value, so a literal names only what it sets. A union takes the layout of its widest member.
   - A fixed C array becomes numbered fields, `name_0` to `name_N`, with an accessor `Struct_name(s)` that returns them as a slice, or as a `str` for a character array.
-  - Vulkan types map to `u32` (`uint32_t`, `VkBool32`, `VkFlags`, 32-bit flag bits), `i32` (`int32_t`, enums), `i64` (`uint64_t`, `VkDeviceSize`, `VkFlags64`, `size_t`), `u16`, `u8`, `f32` and `f64`.
+  - Vulkan types map to `u32` (`uint32_t`, `VkBool32`, `VkFlags`, 32-bit flag bits), `i32` (`int32_t`, enums), `i64` (`uint64_t`, `VkDeviceSize`, `VkFlags64`, `size_t`), `u16`, `u8`, `f32` and `f64`. Platform types such as `HWND` and `wl_display*` are `ptr`.
   - Pointers to known types become `ptr[T]`; `void*`, function pointers and pointers to pointers become `ptr`. A command's single input or output through a pointer is a `mut` parameter; an array or optional pointer is a `ptr[T]`.
   - Enum entries and API constants are functions such as `VK_FORMAT_R8G8B8A8_UNORM() -> i32`, and `vk_make_api_version` builds version numbers.
+- Both generators emit declarations without `pub`. `internal/vkgen` and `internal/wlgen` fail when the checked-in files differ from what the generators produce.
+- `std/ui/gpu/shaders` holds the GLSL and its SPIR-V. `go run ./cmd/shadergen internal/compiler/std/ui/gpu/shaders` compiles each stage with `glslc` to a `.spv` and records the SHA-256 sums of the sources and the `.spv` files in `shaders.sum`.
+
+### Platform
+
+`std/ui/platform` gives both targets one API:
+
+- `open(Options) -> Window ! Error` creates a window of a logical size with a title. `Window` is droppable; releasing it destroys the window and closes the connection.
+- `next(mut w, timeout_ms) -> []Event` returns the events that arrived, waiting until at least one arrives, a `Waker` fires or the timeout passes. A negative timeout waits without limit.
+- `waker(w) -> Waker` is a copyable handle that another green thread uses to end a `next` early.
+- `native(w) -> Native` gives the handles Vulkan needs to make a surface: the `wl_display` and `wl_surface` on Linux, the `HINSTANCE` and `HWND` on Windows.
+- `Event` is `Resized(width, height, scale)` in logical pixels, `CloseRequested`, `PointerMoved(x, y)`, `PointerLeft`, `PointerDown(button, x, y)`, `PointerUp(button, x, y)`, `Scrolled(dx, dy)`, `Key(KeyEvent)`, `FocusChanged(bool)` and `Woken`. Pointer positions are logical pixels from the top left of the window.
+- A `KeyEvent` carries a `Key` (`Named(NamedKey)` for Enter, Escape, Tab, Backspace, Delete, the arrows, Home, End, Page Up, Page Down and F1 to F12, or `Character(str)`), the text it produces, the `Modifiers` (`shift`, `control`, `alt`, `super`), whether it is a press or a release, and whether it repeats.
+- The scale is a whole number: the Wayland surface's preferred buffer scale, or the window's DPI divided by 96 and rounded on Windows.
+
+Wayland:
+
+- `open` connects to the display, binds `wl_compositor`, `xdg_wm_base` and `wl_seat` from the registry, and makes a surface with an `xdg_toplevel`. It returns once the first `configure` has been acknowledged. The window has no decorations.
+- Listener callbacks run during `wl_display_dispatch_pending` on the green thread that called `next` and append to the window's event queue, a pinned Low object.
+- `xdg_wm_base.ping` is answered inside the callback, `xdg_toplevel.close` becomes `CloseRequested`, and a `configure` with a non-zero size becomes `Resized`.
+- The keymap arrives as a file descriptor, which is mapped with `std/sys` and compiled with `xkb_keymap_new_from_string`. Keys are translated with `xkb_state_key_get_one_sym` and `xkb_state_key_get_utf8`, and modifiers follow `xkb_state_update_mask`.
+- Key repeat follows the compositor's `repeat_info`: a held key that produces text or is a named key repeats from a timer inside `next`.
+- `next` waits on the display's file descriptor without blocking an OS thread. A green thread started by `open` loops on `wait_readable(fd)` and reports readiness on a channel; `next` prepares the read, then `select`s on that channel, the waker's channel and an `after` arm for the timeout or the next key repeat, cancelling the read when anything else wins.
+
+Win32:
+
+- `open` locks the green thread to its OS thread with `sync.lock_thread`, because a window's messages reach only the thread that created it. It sets per-monitor DPI awareness, registers a window class and creates the window with `CreateWindowExW`, its title converted to UTF-16.
+- The window procedure is a Low callback. It reaches the window's state through `GWLP_USERDATA`, a pinned pointer, and appends events for `WM_SIZE`, `WM_DPICHANGED`, `WM_CLOSE`, `WM_MOUSEMOVE`, `WM_MOUSELEAVE` (requested with `TrackMouseEvent`), the button messages, `WM_MOUSEWHEEL`, `WM_KEYDOWN`, `WM_KEYUP`, `WM_SYSKEYDOWN`, `WM_SYSKEYUP`, `WM_CHAR` (joining surrogate pairs), `WM_SETFOCUS` and `WM_KILLFOCUS`. Virtual-key codes map to `Key`; the text of a key press comes from the `WM_CHAR` that follows it.
+- `next` drains the queue with `PeekMessageW`, and when nothing is pending waits in `MsgWaitForMultipleObjectsEx` with the timeout. The OS thread is in a C call while it waits, so other green threads keep running. A `Waker` posts `WM_APP` to the window.
+
+### Renderer
+
+- `gpu.open() -> Gpu ! Error` creates a Vulkan 1.3 instance and device on the first physical device that offers dynamic rendering, synchronization2 and a graphics queue, and that can present to a surface when one is given. `Gpu` is droppable and destroys everything it made.
+- It holds three pipelines, one per primitive kind, sharing one descriptor set layout (the instance storage buffer at binding 0, the glyph atlas and its sampler at binding 1) and one pipeline layout whose push constant is the target size in pixels. Each frame in flight, two of them, owns a command buffer, a fence, its semaphores and one host-visible instance buffer per kind that grows by doubling.
+- Drawing a scene writes each kind's instances into its buffer in draw order, uploads the glyph atlas's dirty rows through a staging buffer, and records one `vkCmdDraw` of six vertices per batch, with `firstInstance` at the batch's first instance, inside one dynamic rendering pass that clears to the scene's background.
+- An offscreen `Target` renders into an `R8G8B8A8_UNORM` image and reads it back as RGBA bytes. A `Swapchain` renders into a `VkSurfaceKHR` with a `B8G8R8A8_UNORM` or `R8G8B8A8_UNORM` format and FIFO presentation, and is recreated when the window size changes or presentation reports `VK_ERROR_OUT_OF_DATE_KHR` or `VK_SUBOPTIMAL_KHR`.
+- Colours are sRGB-encoded and blended in that space with premultiplied-free `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` blending.
+- C structures that Vulkan reads through a pointer are pinned heap values kept by a droppable `Pins` list for the duration of the call or the frame.
+- The shaders:
+  - Quads have per-corner radii and per-edge border widths. The fragment shader computes the signed distance to the outer and inner rounded rectangles and covers one pixel of anti-aliasing.
+  - Shadows are a rounded rectangle blurred by a Gaussian of the given sigma, integrated in closed form along x and sampled four times along y, and drawn over the rectangle grown by three sigma.
+  - Sprites sample the `R8` atlas as coverage for a monochrome glyph tinted with the sprite's colour.
+  - Every instance carries a clip rectangle, and fragments outside it are discarded by alpha.
+
+### Scene
+
+- A `Scene` holds `Quad`, `Shadow` and `Sprite` instances in device pixels, each with its clip rectangle and its draw order, a counter that increases with every primitive pushed.
+- `push_clip` and `pop_clip` keep a stack of clip rectangles; each primitive takes the intersection of the stack.
+- `batches` walks the three lists, each already in draw order, and merges them into runs of one kind, so primitives of different kinds that overlap draw in the order they were pushed.
+
+### Layout
+
+- A `layout.Tree` holds nodes in a slice; `node(style, children)` and `leaf(style, measure)` add one and return its index, and `compute(root, size)` places every node. `rect(node)` is its border box in logical pixels relative to the window.
+- A `Style` has:
+  - `display` (`Flex` or `None`), `position` (`Relative` or `Absolute` with `inset` edges);
+  - `direction` (`Row` or `Column`), `justify` (`Start`, `End`, `Center`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly`), `align_items` and `align_self` (`Start`, `End`, `Center`, `Stretch`);
+  - `grow`, `shrink` and `basis`; `width`, `height` and their minimums and maximums as `Auto`, `Px(f32)` or `Percent(f32)`;
+  - `margin`, `padding` and `border` edges in pixels, and `gap` between children.
+- The algorithm is CSS flexbox for a single line:
+  1. Each child's flex basis is its `basis`, else its main size, else its content size: the measure function's answer for a leaf, the sum or maximum of its children for a container.
+  2. Free space is distributed by `grow` when positive and taken by `shrink` weighted by basis when negative, freezing children that hit their minimum or maximum and repeating until none does.
+  3. A child's cross size is its own, or the container's inner cross size when it stretches.
+  4. `justify` places children on the main axis and `align` on the cross axis. Auto margins are not supported.
+  5. Absolute children are placed against the padding box by their insets and do not take part in the flow.
+- A leaf's measure function takes the width available to it, infinite when unconstrained, and returns its size.
+
+### Text
+
+- `font.parse(bytes) -> Font ! Error` reads a TrueType font with `glyf` outlines from the `head`, `hhea`, `maxp`, `cmap` (formats 4 and 12), `hmtx`, `loca`, `glyf` and `kern` (format 0) tables. A CFF font fails with `Unsupported`, and a table that runs past the end of the data with `Malformed`.
+- `font.fallback()` is Go Regular, embedded, under the Go fonts' BSD licence in `std/ui/font/LICENSE`.
+- A glyph's outline is its contours of on- and off-curve points, with composite glyphs expanded through their offsets and scales.
+- The rasteriser scales the outline to pixels, flattens each quadratic curve into lines whose count grows with the curve's size, and accumulates each line's signed area and cover into an `f32` buffer. A running sum along each row gives the coverage, clamped to 0..1 and stored as one byte per pixel.
+- `text.System` holds the fonts, in order of preference, and the glyph atlas. A code point is drawn with the first font that maps it, else with the first font's missing glyph.
+- Shaping maps each code point to one glyph and places glyphs by their advances plus the `kern` pair adjustment. There are no ligatures, no `GPOS`, no bidirectional reordering and no complex scripts.
+- `text.wrap(sys, s, size, width)` breaks lines after spaces and at `\n`, and breaks a word longer than the width between glyphs. Every line has the font's ascent, descent and line gap. Measurements of the same string, size and width are cached for the frame.
+- The atlas is a 1024 by 1024 `R8` image packed in shelves. A glyph is rasterised at its pixel size the first time it is drawn, with a one-pixel border. When the atlas is full it is cleared and glyphs are packed again from the next frame's text. Glyph origins are snapped to whole device pixels.
+
+### UI tests
+
+- `std/ui/geometry`, `std/ui/layout`, `std/ui/font`, `std/ui/text` and `std/ui/scene` are tested by `testdata/run/ui_*` programs, which need no library and so run on Linux and, through `TestRunWindows`, on Windows. They check layouts against hand-computed rectangles, glyph metrics and rasterised coverage of the fallback font, line breaking, atlas packing and scene batching.
+- `internal/uitest` builds Low programs that import the `std/ui` modules and runs them:
+  - offscreen renders of every primitive kind, clipping, draw order, frames in flight, instance buffer growth and atlas updates, compared by pixels; they skip without libvulkan or a Vulkan 1.3 device;
+  - key translation through libxkbcommon from a keymap compiled from names; it skips without libxkbcommon;
+  - a Wayland window that opens, presents frames and closes; it skips without a running compositor;
+  - every program also built for Windows, and the Win32 platform run under `wine` with posted messages standing in for input.
+- `internal/vkgen` and `internal/wlgen` check that the checked-in bindings match their generators. Both find their libraries through `link.SystemDirs`.
+  - `internal/wlgen` tests the generated signatures and checks, then builds a registry client from the vendored protocols and, when a Wayland compositor is running, runs it.
+  - `internal/vkgen` tests declaration parsing, extension enum values and the selection format, checks the shape of the generated bindings, and renders a rounded, bordered quad offscreen with the quad shaders through the bindings and dynamic rendering, comparing pixels. It skips without libvulkan or a Vulkan 1.3 device.
+- `internal/shaders` checks that the sources and the SPIR-V match the sums recorded in `shaders.sum` and validates the SPIR-V with `spirv-val` when installed.
 
 ## Tests
 
@@ -2045,9 +2153,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
 - `TestBuiltinsDocumented` in `internal/check` requires each public builtin in `internal/check/builtins.go` to have an entry in `## Builtins` with the same name, parameters and `mut` markers, and each entry to name a builtin.
 - `internal/lsp` starts the server over its protocol and checks diagnostics, hover, go-to-definition, references, rename, completion, signature help, inlay hints and symbols.
 - `go test ./editors/` compares the keyword, contextual keyword, builtin function, type, constant and constraint lists of the editor grammars and `site/highlight.mjs` with the lexer and the checker, requires the copied editor files to match their sources, and requires the Zed `rev` to name a commit whose `editors/tree-sitter-low/src` equals the current one. The rev check skips outside a git checkout.
-- `internal/wlgen` tests the generated signatures and checks, then builds a registry client from the vendored protocols and, when a Wayland compositor is running, runs it.
-- `internal/vkgen` tests declaration parsing, extension enum values and the selection format, checks the shape of the generated bindings, and renders a rounded, bordered quad offscreen with the quad shaders through the bindings and dynamic rendering, comparing pixels. It skips without libvulkan or a Vulkan 1.3 device. Both generators find their libraries through `link.SystemDirs`.
-- `internal/shaders` checks that the sources and the SPIR-V match the sums recorded in `shaders.sum` and validates the SPIR-V with `spirv-val` when installed.
+- The UI tests are listed under UI tests.
 - `internal/hot` tests reload against running programs:
   - state kept across a code swap;
   - functions added;

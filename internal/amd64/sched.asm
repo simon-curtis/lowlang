@@ -383,6 +383,18 @@ rt_has_context:
 	movzx eax, al
 	ret
 
+	.globl rt_lock_thread
+rt_lock_thread:
+	TLS_GET rax, TLS_G
+	inc qword ptr [rax+G_LOCKEDM]
+	ret
+
+	.globl rt_unlock_thread
+rt_unlock_thread:
+	TLS_GET rax, TLS_G
+	dec qword ptr [rax+G_LOCKEDM]
+	ret
+
 rt_galloc:
 	push rbx
 	lea rdi, [rip+rt_allg_lock]
@@ -1075,7 +1087,7 @@ rt_park_body:
 	mov rdi, r12
 	jmp rt_resume
 2:
-	call rt_set_idle
+	call rt_set_blocked
 3:
 	cmp qword ptr [r12+G_STATUS], G_WAITING
 	jne 4f
@@ -1084,13 +1096,38 @@ rt_park_body:
 	call rt_futex_wait
 	jmp 3b
 4:
-	mov edi, IDLE
+	mov edi, INC
 	call rt_m_running
 	mov qword ptr [r12+G_STATUS], G_RUNNING
 	TLS_SET TLS_G, r12
 	mov [rbx+M_CURG], r12
 	mov rdi, r12
 	jmp rt_resume
+
+rt_set_blocked:
+	TLS_GET rcx, TLS_M
+	mov qword ptr [rcx+M_CURG], 0
+	TLS_SET TLS_G, 0
+	mov eax, INC
+	xchg [rcx+M_STATE], rax
+	xor edi, edi
+	xchg [rcx+M_RUNNEXT], rdi
+	test rdi, rdi
+	jz 1f
+	call rt_gq_put
+1:
+	call rt_queues_empty
+	test rax, rax
+	jz 2f
+	cmp qword ptr [rip+rt_poller], 0
+	jne 3f
+	mov rax, [rip+rt_ntimers]
+	or rax, [rip+rt_nfdwait]
+	jz 3f
+2:
+	call rt_wakep_full
+3:
+	ret
 
 rt_resume:
 	TEB_ENTER_G rdi, rbx

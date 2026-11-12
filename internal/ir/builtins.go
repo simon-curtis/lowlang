@@ -69,6 +69,8 @@ func init() {
 		builtin.Context:      (*builder).contextCall,
 		builtin.SetContext:   (*builder).setContextCall,
 		builtin.HasContext:   (*builder).hasContextCall,
+		builtin.LockThread:   (*builder).lockThreadCall,
+		builtin.UnlockThread: (*builder).unlockThreadCall,
 		builtin.VLoad:        (*builder).vectorValue,
 		builtin.VStore:       (*builder).vstoreCall,
 		builtin.VSplat:       (*builder).vectorValue,
@@ -344,6 +346,16 @@ func (b *builder) setContextCall(e *ast.Call) []*Value {
 
 func (b *builder) hasContextCall(e *ast.Call) []*Value {
 	return []*Value{b.runtime(rtHasContext)}
+}
+
+func (b *builder) lockThreadCall(e *ast.Call) []*Value {
+	b.runtime(rtLockThread)
+	return nil
+}
+
+func (b *builder) unlockThreadCall(e *ast.Call) []*Value {
+	b.runtime(rtUnlockThread)
+	return nil
 }
 
 func (b *builder) readyCall(e *ast.Call) []*Value {

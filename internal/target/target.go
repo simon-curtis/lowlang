@@ -51,6 +51,19 @@ func (o OS) Builds(file string) bool {
 	return true
 }
 
+func (o OS) System() string {
+	system, _, _ := strings.Cut(o.String(), "/")
+	return system
+}
+
+func All() []OS {
+	out := make([]OS, len(targets))
+	for i, t := range targets {
+		out[i] = t.os
+	}
+	return out
+}
+
 func Names() []string {
 	out := make([]string, len(targets))
 	for i, t := range targets {

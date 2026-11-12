@@ -37,3 +37,23 @@ func TestExecutableSuffix(t *testing.T) {
 		t.Errorf("windows executable %q", got)
 	}
 }
+
+func TestBuildsFilesByTargetSuffix(t *testing.T) {
+	cases := []struct {
+		os   OS
+		file string
+		want bool
+	}{
+		{Linux, "main.low", true},
+		{Linux, "surface_linux.low", true},
+		{Linux, "surface_windows.low", false},
+		{Windows, "surface_windows.low", true},
+		{Windows, "dir/surface_linux.low", false},
+		{Windows, "linux.low", true},
+	}
+	for _, c := range cases {
+		if got := c.os.Builds(c.file); got != c.want {
+			t.Errorf("%s builds %s = %v, want %v", c.os, c.file, got, c.want)
+		}
+	}
+}

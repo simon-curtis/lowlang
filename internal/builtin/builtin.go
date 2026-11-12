@@ -60,6 +60,8 @@ const (
 	Context
 	SetContext
 	HasContext
+	LockThread
+	UnlockThread
 	VLoad
 	VStore
 	VSplat

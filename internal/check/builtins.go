@@ -181,6 +181,8 @@ func privateBuiltins() []*Builtin {
 		{ID: builtin.Context, Name: "__context", handler: wanted((*Checker).contextCall)},
 		{ID: builtin.SetContext, Name: "__set_context", Params: []string{"p"}, handler: bare((*Checker).setContextCall)},
 		{ID: builtin.HasContext, Name: "__has_context", handler: bare((*Checker).hasContextCall)},
+		{ID: builtin.LockThread, Name: "__lock_thread", handler: bare((*Checker).lockThreadCall)},
+		{ID: builtin.UnlockThread, Name: "__unlock_thread", handler: bare((*Checker).lockThreadCall)},
 		{ID: builtin.VLoad, Name: "__vload", Params: []string{"src", "at"}, handler: (*Checker).vectorLoad},
 		{ID: builtin.VStore, Name: "__vstore", Params: []string{"dst", "at", "v"}, handler: bare((*Checker).vectorStore)},
 		{ID: builtin.VSplat, Name: "__vsplat", Params: []string{"x"}, handler: (*Checker).vectorSplat},
@@ -557,6 +559,10 @@ func (c *Checker) currentCall(e *ast.Call) {
 }
 
 func (c *Checker) parkCall(e *ast.Call) {
+	e.Type = types.Void
+}
+
+func (c *Checker) lockThreadCall(e *ast.Call) {
 	e.Type = types.Void
 }
 
