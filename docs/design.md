@@ -1280,9 +1280,9 @@ The compiler is written in Go. Pipeline:
 | Build IR | `internal/ir` | SSA form, one value per machine word |
 | Codegen | `internal/amd64` | x86-64 GNU assembly |
 | Assemble | `internal/asm` | object: sections, symbols and fixups |
-| Link | `internal/link` | static or dynamic ELF executable |
+| Link | `internal/link` | ELF or PE executable |
 
-`as` and `ld` assemble and link the patches of `low dev`. `clang` and `lld-link` build the Windows target.
+`as` and `ld` assemble and link the patches of `low dev`. Building a program needs no external tool.
 
 - The `low` command lives in `cmd/low`. The pipeline it shares with hot reload lives in `internal/compiler`.
 - `low ir` prints the SSA form and `low asm` the generated assembly.
@@ -1355,6 +1355,13 @@ The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emi
   - The generated `_start` calls `__libc_start_main(main, argc, argv, 0, 0, rtld_fini, stack_end)` with no init or fini functions, which is all glibc needs: stdio buffers flush and `atexit` handlers run when the program exits. `atexit` and `at_quick_exit` exist only in `libc_nonshared.a`, so a program that declares them gets shims that tail-call `__cxa_atexit` and `__cxa_at_quick_exit`.
   - glibc's start-up code calls the generated C `main`, which does the same work as `_start`.
   - When Low's `main` returns, the program calls `exit(0)`, letting libc run its exit handlers. An error from `main` prints and exits with status 1.
+- A Windows program is assembled in process with the padding and jump sizes of `clang`, and linked by `link.PE` into a PE32+ console executable that starts at `start`. No import library is read.
+  - The image is based at `0x140000000` with 4 KiB section alignment and 512-byte file alignment. It reserves 8 MB of stack and 1 MB of heap, and sets `DYNAMICBASE`, `HIGH_ENTROPY_VA` and `NX_COMPAT`.
+  - Sections merge by the name before `$`, `.bss` joins `.data` after its initialised bytes, and `.idata` joins `.rdata`. The order is `.text`, `.rdata`, `.data`, the rest by name, then `.reloc`. Code padding is `int3`. `.rodata` is writable.
+  - `.rdata` starts with a debug directory holding one `REPRO` entry. The header timestamp and that entry carry the low 32 bits of the XXH3-64 hash of the image taken with both zero, so a program always links to the same bytes.
+  - The code generator writes the import tables as `.idata$2` to `.idata$7` with `__imp_` labels. The import directory covers the `.idata$2` descriptors and a null descriptor placed after `.idata$3`, and the import address table directory covers `.idata$5`.
+  - Every `Abs64` fixup gets a `DIR64` entry in `.reloc`, one block for each 4 KiB page, so the loader can rebase the image. `ImgRel32` resolves to an RVA, and `PC32` and `PLT32` to rip-relative values. 32-bit absolute, GOT and thread-local references fail the link, and so does an undefined symbol, which the error names.
+  - `.incbin` paths are written with octal escapes for every byte outside printable ASCII, and `\` and `"` escaped, so drive letters, backslashes and non-ASCII names assemble unchanged.
 
 Prelude:
 
@@ -1800,6 +1807,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 - `internal/fuzz/reduce` minimises each new signature. It removes functions, parameters and statements, unwraps `if` and loop bodies, replaces expressions with literals or their operands, and shrinks literals, keeping only candidates that still produce the signature. `-reduce-tests` bounds the compiler runs.
   - The minimised program is saved under `-out`, one per distinct signature.
   - With `-fixtures` it is also written there as a `testdata/run` fixture (`.low` with the predicted `.out` and `.err`, named by content hash) that fails until the bug is fixed.
+- `internal/link` tests link programs with `ld` or `lld-link` where installed and require the same segments, sections, symbols and loaded bytes for ELF and the same bytes for PE. `LOW_LINK_FULL=1` covers every `testdata/run` program and benchmark.
 - `go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present.
   - A program with a `.needed` file must link exactly those shared libraries. Every other program must be static with no interpreter.
   - Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
@@ -1833,7 +1841,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
     11. Foreground and background executors on the scheduler; a background task's result is written into a signal on the UI thread.
     12. Text input element whose state is held in signals, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     13. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-3. Own assembler and linker in place of `as` and `ld` for the patches of `low dev`, and of `clang` and `lld-link` for the Windows target.
+3. Own assembler and linker in place of `as` and `ld` for the patches of `low dev`.
 4. A wasm32 target and a browser playground that runs snippets:
     1. Targets named by OS and architecture, with `wasm32` beside `amd64`.
     2. A WebAssembly back end lowered from the IR: structured control flow rebuilt from the IR's blocks, locals in place of registers, a linear-memory heap with the size-class bins, and a module written directly without an external assembler or linker.
