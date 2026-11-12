@@ -1,8 +1,27 @@
-<img src="assets/icon.svg" width="64" height="64" alt="Low">
+<div align="center">
+
+<img src="assets/icon.svg" width="96" height="96" alt="Low">
 
 # Low
 
 A compiled language with Go's speed and footprint, plus enums, typed errors and expression-oriented syntax.
+
+[![test](https://github.com/simon-curtis/lowlang/actions/workflows/test.yml/badge.svg)](https://github.com/simon-curtis/lowlang/actions/workflows/test.yml)
+[![release](https://img.shields.io/github/v/release/simon-curtis/lowlang?color=111111)](https://github.com/simon-curtis/lowlang/releases/latest)
+[![license](https://img.shields.io/github/license/simon-curtis/lowlang?color=111111)](LICENSE)
+[![go](https://img.shields.io/github/go-mod/go-version/simon-curtis/lowlang?color=111111)](go.mod)
+
+[Website](https://low.simoncurtis.dev) · [Documentation](https://low.simoncurtis.dev/docs/) · [Standard library](https://low.simoncurtis.dev/packages/) · [Releases](https://github.com/simon-curtis/lowlang/releases)
+
+</div>
+
+```sh
+curl -fsSL https://low.simoncurtis.dev/install.sh | sh
+```
+
+```powershell
+irm https://low.simoncurtis.dev/install.ps1 | iex
+```
 
 ```low
 fn fib(n: i64) -> i64 {
@@ -100,3 +119,7 @@ HTML comments directly above a block supply context readers do not see:
 
 - `<!-- prelude` holds Low code placed before the snippet. If its last line opens a function, such as `fn main() ! ParseError {`, that line wraps the statements instead of `fn main()`.
 - `<!-- prelude path/file.low` writes a file beside the snippet, for imported modules or embedded assets.
+
+## License
+
+[MIT](LICENSE)
