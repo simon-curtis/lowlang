@@ -1,13 +1,9 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
 	"flag"
 	"fmt"
-	"io"
 	"os"
-	"strings"
 
 	"lowlang/internal/vkgen"
 )
@@ -27,25 +23,8 @@ func main() {
 	}
 }
 
-func readRegistry(path string) ([]byte, error) {
-	data, err := os.ReadFile(path)
-	if err != nil || !strings.HasSuffix(path, ".gz") {
-		return data, err
-	}
-	reader, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Close()
-	return io.ReadAll(reader)
-}
-
 func run(output, registryPath, selectionPath string) error {
-	data, err := readRegistry(registryPath)
-	if err != nil {
-		return err
-	}
-	reg, err := vkgen.Parse(data)
+	reg, err := vkgen.ReadRegistry(registryPath)
 	if err != nil {
 		return err
 	}

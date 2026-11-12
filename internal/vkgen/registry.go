@@ -1,8 +1,12 @@
 package vkgen
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/xml"
 	"fmt"
+	"io"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -89,7 +93,30 @@ type Require struct {
 	Enums []Enum `xml:"enum"`
 }
 
-func Parse(data []byte) (*Registry, error) {
+func ReadRegistry(path string) (*Registry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasSuffix(path, ".gz") {
+		data, err = gunzip(data)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+	}
+	return parse(data)
+}
+
+func gunzip(data []byte) ([]byte, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
+}
+
+func parse(data []byte) (*Registry, error) {
 	var r Registry
 	if err := xml.Unmarshal(data, &r); err != nil {
 		return nil, err

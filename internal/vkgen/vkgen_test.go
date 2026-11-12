@@ -1,10 +1,7 @@
 package vkgen
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,19 +18,7 @@ import (
 var root = filepath.Join("..", "..", "ui")
 
 var registry = sync.OnceValues(func() (*Registry, error) {
-	data, err := os.ReadFile(filepath.Join(root, "registry", "vk.xml.gz"))
-	if err != nil {
-		return nil, err
-	}
-	reader, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	xml, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, err
-	}
-	return Parse(xml)
+	return ReadRegistry(filepath.Join(root, "registry", "vk.xml.gz"))
 })
 
 func generate(t *testing.T) string {
