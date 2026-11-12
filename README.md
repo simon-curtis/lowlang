@@ -85,14 +85,15 @@ python3 ../assets/brand/build.py
 - builds the compiler and starts `low lsp`;
 - renders `docs/design.md` and `editors/README.md` into `site/docs/`;
 - renders the standard library from `low doc std` into `site/packages/`, one page per module, with each module's description from the table in `docs/design.md`;
-- highlights every Low snippet with hover text and references from the LSP;
-- writes `style.css` from `tailwind.css` and copies Lenis to `lenis.js`.
+- highlights every Low snippet, including the examples in std doc comments, with hover text and references from the LSP, and links each name to its definition: a declaration in the same snippet, an item in `site/packages/`, or the builtin's entry in the `## Builtins` chapter of `docs/design.md`;
+- writes `style.css` from `tailwind.css` and copies Lenis to `lenis.js`;
+- appends a content hash to every stylesheet and script reference in the pages, as `style.css?v=…`, so a browser never pairs a new page with a cached old asset.
 
 `build.py` regenerates the icons, social images and web manifest from the mark. It needs `rsvg-convert`, `magick` and Noto Sans.
 
 ### Checked snippets
 
-The LSP checks each Low snippet in the docs as a program: declarations stay at the top level and loose statements go inside `fn main()`, and `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. The build lists every snippet that fails to check and then fails.
+The LSP checks each Low snippet in the docs and each `low` example in a std doc comment as a program: declarations stay at the top level and loose statements go inside `fn main()`, and `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. A std example that does not import its own module checks with that import added. The build lists every snippet that fails to check and then fails.
 
 HTML comments directly above a block supply context readers do not see:
 

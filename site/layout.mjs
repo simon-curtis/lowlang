@@ -11,10 +11,9 @@ const sections = [
 
 function navigation(root, current) {
     const links = sections.map((section) => {
-        const style = section.name === current ? 'class="underline underline-offset-8" aria-current="page"' : 'class="hover:underline hover:underline-offset-8"';
-        return `<a ${style} href="${root}${section.path}">${section.name}</a>`;
+        const marker = section.name === current ? ' aria-current="page"' : "";
+        return `<a${marker} href="${root}${section.path}">${section.name}</a>`;
     });
-    links.push('<a class="hover:underline hover:underline-offset-8" href="https://github.com/simon-curtis/lowlang">GitHub</a>');
     return links.join("\n");
 }
 
@@ -46,21 +45,22 @@ export function layout({ path, heading, title, description, current, sidebar, bo
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<header class="absolute inset-x-0 top-0 z-10">
-<div class="wrap flex h-16 items-center justify-between">
-<a class="flex items-center gap-2.5 text-lg font-bold" href="${root}index.html"><span class="mark size-5" aria-hidden="true"></span>Low</a>
-<nav class="flex gap-3 text-sm font-semibold sm:gap-8">
+<header class="masthead">
+<div class="wrap">
+<a class="brand" href="${root}index.html"><span class="mark size-5" aria-hidden="true"></span>Low</a>
+<nav class="menu">
 ${navigation(root, current)}
 </nav>
+<a class="repo" href="https://github.com/simon-curtis/lowlang">GitHub</a>
 </div>
 </header>
 
-<div class="wrap grid grid-cols-[minmax(0,1fr)] gap-x-16 gap-y-10 pt-28 pb-24 lg:grid-cols-[13rem_minmax(0,1fr)]">
-<nav class="lg:sticky lg:top-8 lg:max-h-[calc(100vh-4rem)] lg:self-start lg:overflow-y-auto" aria-label="${escape(current)}">
+<div class="wrap grid grid-cols-[minmax(0,1fr)] gap-x-16 gap-y-10 pt-36 pb-24 sm:pt-28 lg:grid-cols-[13rem_minmax(0,1fr)]">
+<nav class="sidebar" aria-label="${escape(current)}">
 ${sidebar}
 </nav>
 <main class="prose" id="main">
-<h1>${escape(heading)}</h1>
+<h1>${escape(heading).replaceAll("/", "/<wbr>")}</h1>
 ${body}</main>
 </div>
 ${scriptTags}

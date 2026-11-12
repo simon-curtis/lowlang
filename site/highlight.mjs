@@ -10,6 +10,15 @@ export function escape(text) {
     return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+function unbroken(part) {
+    return part.length <= 28 && /[^\p{L}\p{N}_\s]/u.test(part);
+}
+
+export function codespan({ text }) {
+    const parts = text.split(/(\s+)/).map((part) => (unbroken(part) ? `<span class="whitespace-nowrap">${escape(part)}</span>` : escape(part)));
+    return `<code>${parts.join("")}</code>`;
+}
+
 function lex(source) {
     const tokens = [];
     let offset = 0;
@@ -100,12 +109,16 @@ function classify(tokens, index, imported) {
     return "";
 }
 
-function wrap(text, style, hover, group) {
+function wrap(text, style, { hover, group, link, id } = {}) {
     const name = style ? ` class="${style}"` : "";
+    const target = id ? ` id="${id}"` : "";
     const tip = hover ? `${low(hover.code)}${hover.doc ? `<span class="doc">${escape(hover.doc)}</span>` : ""}` : "";
     const detail = tip ? ` data-hover="${escape(tip)}"` : "";
     const reference = group === undefined ? "" : ` data-ref="${group}"`;
-    return name || detail || reference ? `<span${name}${detail}${reference}>${text}</span>` : text;
+    if (link) {
+        return `<a href="${link}"${target}${name}${detail}${reference}>${text}</a>`;
+    }
+    return name || target || detail || reference ? `<span${target}${name}${detail}${reference}>${text}</span>` : text;
 }
 
 function paint(token, index, tokens, imported, facts) {
@@ -132,14 +145,17 @@ function paint(token, index, tokens, imported, facts) {
     }
     const hover = facts.hovers.get(token.offset);
     const useful = hover && hover.code !== token.text ? hover : undefined;
-    return wrap(text, style, useful, facts.references.get(token.offset));
+    const offset = token.offset;
+    return wrap(text, style, { hover: useful, group: facts.references.get(offset), link: facts.links.get(offset), id: facts.anchors.get(offset) });
 }
 
 export function words(source) {
     return lex(source).filter((token) => token.kind === "word" && !keywords.has(token.text)).map((token) => token.offset);
 }
 
-export function low(source, facts = { hovers: new Map(), references: new Map() }) {
+const unchecked = { hovers: new Map(), references: new Map(), links: new Map(), anchors: new Map() };
+
+export function low(source, facts = unchecked) {
     const tokens = lex(source);
     const imported = modules(tokens);
     return tokens.map((token, index) => paint(token, index, tokens, imported, facts)).join("");

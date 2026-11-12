@@ -68,6 +68,7 @@ export class Session {
         await published;
         const hovers = new Map();
         const references = new Map();
+        const definitions = new Map();
         for (const offset of offsets) {
             const position = program.position(offset);
             const hover = await this.#request("textDocument/hover", { textDocument: { uri }, position });
@@ -79,10 +80,16 @@ export class Session {
             if (group.includes(offset)) {
                 references.set(offset, Math.min(...group));
             }
+            const definition = await this.#request("textDocument/definition", { textDocument: { uri }, position });
+            if (definition?.uri === uri) {
+                definitions.set(offset, { offset: program.offset(definition.range.start) });
+            } else if (definition) {
+                definitions.set(offset, { uri: definition.uri, line: definition.range.start.line });
+            }
         }
         this.#notify("textDocument/didClose", { textDocument: { uri } });
         const errors = (this.#diagnostics.get(uri) ?? []).filter((item) => item.severity === 1).map((item) => item.message);
-        return { hovers, references, errors };
+        return { hovers, references, definitions, errors };
     }
 
     #await(uri) {

@@ -26,3 +26,4 @@ for (const link of links) {
 
 input.addEventListener("input", apply);
 apply();
+links.find((link) => link.dataset.category === category)?.scrollIntoView({ block: "nearest", inline: "center" });
