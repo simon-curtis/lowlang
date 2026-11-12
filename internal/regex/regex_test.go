@@ -7,29 +7,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"lowlang/internal/diag"
-	"lowlang/internal/lexer"
 )
 
 func fixturePatterns(t *testing.T, path string) []string {
 	t.Helper()
-	src, err := os.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokens, err := lexer.Lex(src, diag.Start(path), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var patterns []string
-	for i := 0; i+2 < len(tokens); i++ {
-		call := tokens[i].Kind == lexer.Ident && strings.HasPrefix(tokens[i].Text, "case_")
-		if call && tokens[i+2].Kind == lexer.String {
-			patterns = append(patterns, tokens[i+2].Text)
-		}
-	}
-	return patterns
+	return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
 }
 
 func fixtureOutcomes(t *testing.T, path string) []string {
@@ -49,7 +35,7 @@ func fixtureOutcomes(t *testing.T, path string) []string {
 
 func TestCompileAgreesWithStdErrors(t *testing.T) {
 	base := filepath.Join("..", "..", "testdata", "run", "std_regex_errors")
-	patterns := fixturePatterns(t, base+".low")
+	patterns := fixturePatterns(t, filepath.Join(base, "patterns.txt"))
 	outcomes := fixtureOutcomes(t, base+".out")
 	if len(patterns) == 0 || len(patterns) != len(outcomes) {
 		t.Fatalf("%d patterns, %d outcomes", len(patterns), len(outcomes))
