@@ -132,7 +132,7 @@ func TestPEMatchesLLD(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			source, _, err := generate(path, target.Windows)
 			if err != nil {
-				t.Skipf("compile: %v", err)
+				t.Fatalf("compile: %v", err)
 			}
 			dir := t.TempDir()
 			want, lldErr := linkWithLLD(dir, source)

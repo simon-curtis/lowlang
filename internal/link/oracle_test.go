@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	branchFlag     = "-mbranches-within-32B-boundaries"
 	noUsedNoteFlag = "-mx86-used-note=no"
 	headerBytes    = 64
 	stackNote      = "\n.section .note.GNU-stack,\"\",@progbits\n"
@@ -87,7 +86,7 @@ func linkWithLd(dir, source string) (string, error) {
 		return "", fmt.Errorf("write source: %w", err)
 	}
 	object := filepath.Join(dir, "main.o")
-	if out, err := exec.Command("as", branchFlag, noUsedNoteFlag, "-o", object, sourcePath).CombinedOutput(); err != nil {
+	if out, err := exec.Command("as", oracletool.BranchFlag, noUsedNoteFlag, "-o", object, sourcePath).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("as: %w\n%s", err, out)
 	}
 	output := filepath.Join(dir, "main.ld")
@@ -125,7 +124,7 @@ func TestMatchesGNULd(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			source, libraries, err := generate(path, target.Linux)
 			if err != nil {
-				t.Skipf("compile: %v", err)
+				t.Fatalf("compile: %v", err)
 			}
 			if len(libraries) > 0 {
 				t.Skip("program links C libraries")

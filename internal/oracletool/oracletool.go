@@ -10,6 +10,8 @@ import (
 const (
 	GNU  = "2.47"
 	LLVM = "23.1.4"
+
+	BranchFlag = "-mbranches-within-32B-boundaries"
 )
 
 func Require(t testing.TB, tool, version string) {

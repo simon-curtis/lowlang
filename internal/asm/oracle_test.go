@@ -15,8 +15,6 @@ import (
 	"lowlang/internal/target"
 )
 
-const branchFlag = "-mbranches-within-32B-boundaries"
-
 const maxMismatchLines = 3
 
 type fileResult struct {
@@ -52,7 +50,7 @@ func (r *oracleRunner) work(dir string, entry corpusEntry) {
 func (r *oracleRunner) compareAll(dir, source string, result *fileResult) {
 	variants := [][]string{nil}
 	if result.entry.platform == target.Linux {
-		variants = [][]string{{branchFlag}, nil}
+		variants = [][]string{{oracletool.BranchFlag}, nil}
 	}
 	fed := asSource(source, result.entry.platform)
 	for _, flags := range variants {
