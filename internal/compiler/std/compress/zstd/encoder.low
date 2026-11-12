@@ -26,13 +26,7 @@ pub struct Encoder {
 
 struct Framer {
     p: Params
-    window: i64
-    hist: []u8
-    fill: i64
-    pos: i64
-    next_insert: i64
-    short: *codec.Chain
-    long: *codec.Chain
+    win: *codec.History
     content_size: i64
     started: bool
     sum: *hash.Xxh64
@@ -102,13 +96,7 @@ fn framer(level: i64, content_size: i64, capacity: i64) -> *Framer {
     let of_norm = of_default()
     new(Framer {
         p
-        window
-        hist: __make(span)
-        fill: 0
-        pos: 0
-        next_insert: 0
-        short: codec.chain(p.minm, p.hlog, p.clog)
-        long: codec.chain(8, p.hlog, p.clog)
+        win: codec.history(window, span, p.minm, p.hlog, p.clog)
         content_size
         started: false
         sum: hash.xxh64_new(0)
@@ -140,25 +128,14 @@ fn framer(level: i64, content_size: i64, capacity: i64) -> *Framer {
     })
 }
 
-fn insert_to(e: *Framer, target: i64) {
-    let hist = e.hist
-    for i in e.next_insert..target {
-        codec.link(e.short, hist, i)
-        codec.link(e.long, hist, i)
-    }
-    if target > e.next_insert {
-        e.next_insert = target
-    }
-}
-
 fn find(e: *Framer, p: i64, end: i64) {
-    insert_to(e, p)
-    let hist = e.hist
+    codec.index_to(e.win, p, true)
+    let hist = e.win.data
     e.m.len = e.p.minm - 1
     e.m.off = 0
     for k in 0..2 {
         let r = e.reps[k]
-        if r <= p && r < e.window && hist[p] == hist[p - r] {
+        if r <= p && r < e.win.window && hist[p] == hist[p - r] {
             let n = codec.match_length(hist, p, p - r, end - p)
             if n > e.m.len {
                 e.m.len = n
@@ -166,8 +143,8 @@ fn find(e: *Framer, p: i64, end: i64) {
             }
         }
     }
-    codec.walk(e.long, hist, p, end, e.window, e.p.nice, e.p.depth, e.m)
-    codec.walk(e.short, hist, p, end, e.window, e.p.nice, math.max(2, e.p.depth / 4), e.m)
+    codec.walk(e.win.long, hist, p, end, e.win.window, e.p.nice, e.p.depth, e.m)
+    codec.walk(e.win.short, hist, p, end, e.win.window, e.p.nice, math.max(2, e.p.depth / 4), e.m)
     if e.m.len < e.p.minm {
         e.m.len = 0
     }
@@ -220,7 +197,7 @@ fn encode_offset(e: *Framer, ll: i64, off: i64) -> i64 {
 }
 
 fn add_literals(e: *Framer, from: i64, to: i64) {
-    io.copy(e.lits[e.nlit..], e.hist[from..to])
+    io.copy(e.lits[e.nlit..], e.win.data[from..to])
     e.nlit += to - from
 }
 
@@ -237,7 +214,7 @@ fn add_sequence(e: *Framer, anchor: i64, p: i64, off: i64, len: i64) {
 fn parse(e: *Framer, start: i64, end: i64) {
     e.nlit = 0
     e.nseq = 0
-    let hist = e.hist
+    let hist = e.win.data
     let limit = end - 8
     var anchor = start
     var p = start
@@ -260,10 +237,9 @@ fn parse(e: *Framer, start: i64, end: i64) {
             off = e.m.off
             step += 1
         }
-        for p > anchor && p - off > 0 && hist[p - 1] == hist[p - 1 - off] {
-            p -= 1
-            len += 1
-        }
+        let back = codec.extend_back(e.win, p, anchor, off)
+        p -= back
+        len += back
         add_sequence(e, anchor, p, off, len)
         p += len
         anchor = p
@@ -474,7 +450,7 @@ fn compress_block(e: *Framer, start: i64, end: i64, last: bool) {
     start_frame(e)
     let flag = if last { 1 } else { 0 }
     let size = end - start
-    let data = e.hist[start..end]
+    let data = e.win.data[start..end]
     if size > 0 && uniform(data) {
         codec.put_le(e.out, flag | 1 << 1 | size << 3, 3)
         codec.put_byte(e.out, data[0])
@@ -503,47 +479,33 @@ fn compress_block(e: *Framer, start: i64, end: i64, last: bool) {
     codec.put_bytes(e.out, data)
 }
 
-fn slide_history(e: *Framer) {
-    let delta = e.pos - e.window
-    io.copy(e.hist, e.hist[delta..e.fill])
-    e.fill -= delta
-    e.pos -= delta
-    e.next_insert = math.max(0, e.next_insert - delta)
-    codec.slide(e.short, delta)
-    codec.slide(e.long, delta)
-}
-
 fn feed(e: *Framer, data: []u8) {
     var at = 0
     for at < data.len {
-        if e.fill == e.hist.len {
-            slide_history(e)
-        }
-        let n = io.copy(e.hist[e.fill..], data[at..])
+        let n = codec.append(e.win, data[at..])
         hash.xxh64_update(e.sum, data[at..at + n])
-        e.fill += n
         at += n
-        for e.fill - e.pos > block_size() {
-            compress_block(e, e.pos, e.pos + block_size(), false)
-            e.pos += block_size()
+        for e.win.fill - e.win.pos > block_size() {
+            compress_block(e, e.win.pos, e.win.pos + block_size(), false)
+            e.win.pos += block_size()
         }
     }
 }
 
 fn sync(e: *Framer) {
-    for e.pos < e.fill {
-        let end = math.min(e.fill, e.pos + block_size())
-        compress_block(e, e.pos, end, false)
-        e.pos = end
+    for e.win.pos < e.win.fill {
+        let end = math.min(e.win.fill, e.win.pos + block_size())
+        compress_block(e, e.win.pos, end, false)
+        e.win.pos = end
     }
 }
 
 fn close(e: *Framer) {
     for {
-        let end = math.min(e.fill, e.pos + block_size())
-        compress_block(e, e.pos, end, end == e.fill)
-        e.pos = end
-        if end == e.fill {
+        let end = math.min(e.win.fill, e.win.pos + block_size())
+        compress_block(e, e.win.pos, end, end == e.win.fill)
+        e.win.pos = end
+        if end == e.win.fill {
             break
         }
     }
