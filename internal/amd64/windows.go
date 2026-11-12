@@ -21,15 +21,100 @@ const (
 	importPrefix = "__imp_"
 )
 
-func (g *Generator) syscall() {
-	if g.os == target.Windows {
-		g.emit("call rt_panic_syscall")
-		return
-	}
-	g.emit("syscall")
+var win64IntRegs = []string{"rcx", "rdx", "r8", "r9"}
+
+var winPreservedVectors = []string{
+	"xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
 }
 
-var winArgRegs = []string{"rcx", "rdx", "r8", "r9"}
+type win64 struct{}
+
+func (win64) OS() target.OS {
+	return target.Windows
+}
+
+func (win64) entry() string {
+	return PEEntrySymbol
+}
+
+func (win64) header() string {
+	return windowsHeader
+}
+
+func (win64) runtime() string {
+	return windowsRuntime
+}
+
+func (win64) classify(sig *ir.CSig) *cPlan {
+	return win64Plan(sig)
+}
+
+func (win64) intRegs() []string {
+	return win64IntRegs
+}
+
+func (win64) vectorRegs() int {
+	return len(win64IntRegs)
+}
+
+func (win64) registerSlots() int {
+	return len(win64IntRegs)
+}
+
+func (win64) preservedVectors() []string {
+	return winPreservedVectors
+}
+
+func (win64) thunkSaved() []string {
+	return append(slices.Clone(abi.saved), "rdi", "rsi")
+}
+
+func (win64) positional() bool {
+	return true
+}
+
+func (win64) syscall(g *Generator) {
+	g.emit("call rt_panic_syscall")
+}
+
+func (win64) variadicCount(*Generator, *cPlan) {}
+
+func (win64) trampolines(*Generator, []string) {}
+
+func (win64) reserve(g *Generator, size int) {
+	if size < pageSize {
+		if size > 0 {
+			g.emit("sub rsp, %d", size)
+		}
+		return
+	}
+	probe := g.newLabel()
+	g.emit("lea r11, [rsp-%d]", size)
+	g.label(probe)
+	g.emit("sub rsp, %d", pageSize)
+	g.emit("test qword ptr [rsp], rsp")
+	g.emit("cmp rsp, r11")
+	g.emit("ja %s", probe)
+	g.emit("mov rsp, r11")
+}
+
+func (win64) externalTarget(symbol string, trampolines bool) string {
+	return fmt.Sprintf("qword ptr [rip+%s]", importSymbol(symbol))
+}
+
+func (win64) symbolAddress(symbol string) string {
+	return fmt.Sprintf("qword ptr [rip+%s]", importSymbol(symbol))
+}
+
+func (win64) imports(out *strings.Builder, prog *ir.Program) {
+	writeImports(out, prog)
+}
+
+func (win64) dynamic(*ir.Program) bool {
+	return false
+}
+
+func (win64) shims(*Generator, []string) {}
 
 var runtimeImportDLLs = map[string]string{
 	"WaitOnAddress":       synchDLL,
@@ -70,82 +155,6 @@ func dllName(library string) string {
 	return fmt.Sprintf("%s.dll", strings.ToLower(library))
 }
 
-func (g *Generator) cIntRegs() []string {
-	if g.os == target.Windows {
-		return winArgRegs
-	}
-	return argRegs
-}
-
-func (g *Generator) cVectorRegs() int {
-	if g.os == target.Windows {
-		return len(winArgRegs)
-	}
-	return 8
-}
-
-func (g *Generator) cRegisterSlots() int {
-	if g.os == target.Windows {
-		return len(winArgRegs)
-	}
-	return 0
-}
-
-var winPreservedVectors = []string{
-	"xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
-}
-
-func (g *Generator) cPreservedVectors() []string {
-	if g.os != target.Windows {
-		return nil
-	}
-	return winPreservedVectors
-}
-
-func (g *Generator) thunkSaved() []string {
-	if g.os == target.Windows {
-		return append(slices.Clone(calleeSaved), "rdi", "rsi")
-	}
-	return calleeSaved
-}
-
-func (g *Generator) reserve(size int) {
-	if size == 0 {
-		return
-	}
-	if g.os != target.Windows || size < pageSize {
-		g.emit("sub rsp, %d", size)
-		return
-	}
-	probe := g.newLabel()
-	g.emit("lea r11, [rsp-%d]", size)
-	g.label(probe)
-	g.emit("sub rsp, %d", pageSize)
-	g.emit("test qword ptr [rsp], rsp")
-	g.emit("cmp rsp, r11")
-	g.emit("ja %s", probe)
-	g.emit("mov rsp, r11")
-}
-
-func (g *Generator) win64Args(fr *frame, plan *ir.CPlan, args []*vreg, moves []pmove) []pmove {
-	first := 0
-	if plan.Memory {
-		first = 1
-	}
-	for i, a := range args {
-		slot, src := first+i, fr.loc(a)
-		if slot >= len(winArgRegs) {
-			g.stackArg(slot, src)
-			continue
-		}
-		if plan.Args[i] == ir.Vector {
-			moves = append(moves, fr.vectorMove(fmt.Sprintf("xmm%d", slot), a))
-		}
-		moves = append(moves, pmove{dst: winArgRegs[slot], src: src})
-	}
-	return moves
-}
-
 func importTable(prog *ir.Program) map[string][]string {
 	table := runtimeImports()
 	for library, symbols := range prog.Imports {
@@ -163,22 +172,22 @@ func writeImports(out *strings.Builder, prog *ir.Program) {
 	table := importTable(prog)
 	dlls := slices.Sorted(maps.Keys(table))
 	for i := range dlls {
-		fmt.Fprintf(out, "\n\t.section .idata$2,\"dr\"\n\t.long .Lilt%d@IMGREL, 0, 0, .Ldll%d@IMGREL, .Liat%d@IMGREL\n", i, i, i)
+		fmt.Fprintf(out, "\n\t.section %s,\"dr\"\n\t.long .Lilt%d@IMGREL, 0, 0, .Ldll%d@IMGREL, .Liat%d@IMGREL\n", ImportDescriptors, i, i, i)
 	}
-	out.WriteString("\n\t.section .idata$3,\"dr\"\n\t.long 0, 0, 0, 0, 0\n")
+	fmt.Fprintf(out, "\n\t.section %s,\"dr\"\n\t.long 0, 0, 0, 0, 0\n", ImportNullDescriptor)
 	for i, dll := range dlls {
-		writeThunks(out, "4", fmt.Sprintf(".Lilt%d", i), i, table[dll], false)
-		writeThunks(out, "5", fmt.Sprintf(".Liat%d", i), i, table[dll], true)
-		out.WriteString("\n\t.section .idata$6,\"dr\"\n")
+		writeThunks(out, ImportLookups, fmt.Sprintf(".Lilt%d", i), i, table[dll], false)
+		writeThunks(out, ImportAddresses, fmt.Sprintf(".Liat%d", i), i, table[dll], true)
+		fmt.Fprintf(out, "\n\t.section %s,\"dr\"\n", ImportHints)
 		for j, symbol := range table[dll] {
 			fmt.Fprintf(out, "\t.p2align 1\n.Lhint%d_%d:\n\t.short 0\n\t.asciz %q\n", i, j, symbol)
 		}
-		fmt.Fprintf(out, "\n\t.section .idata$7,\"dr\"\n.Ldll%d:\n\t.asciz %q\n", i, dll)
+		fmt.Fprintf(out, "\n\t.section %s,\"dr\"\n.Ldll%d:\n\t.asciz %q\n", ImportNames, i, dll)
 	}
 }
 
 func writeThunks(out *strings.Builder, section, label string, dll int, symbols []string, named bool) {
-	fmt.Fprintf(out, "\n\t.section .idata$%s,\"dr\"\n\t.p2align 3\n%s:\n", section, label)
+	fmt.Fprintf(out, "\n\t.section %s,\"dr\"\n\t.p2align 3\n%s:\n", section, label)
 	for j, symbol := range symbols {
 		if named {
 			fmt.Fprintf(out, "%s:\n", importSymbol(symbol))

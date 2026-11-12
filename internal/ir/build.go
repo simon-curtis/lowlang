@@ -10,7 +10,6 @@ import (
 	"lowlang/internal/builtin"
 	"lowlang/internal/lexer"
 	"lowlang/internal/prelude"
-	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
 
@@ -41,7 +40,6 @@ func (p place) at(word int) place {
 
 type builder struct {
 	ssa
-	os       target.OS
 	cur      *Block
 	decl     *ast.Func
 	funcs    map[*ast.Func]*Func
@@ -57,7 +55,7 @@ type builder struct {
 	cells    *int
 }
 
-func Build(files []*ast.File, os target.OS, opts Options) *Program {
+func Build(files []*ast.File, opts Options) *Program {
 	var decls []*ast.Func
 	for _, file := range files {
 		for _, d := range file.Funcs {
@@ -66,12 +64,12 @@ func Build(files []*ast.File, os target.OS, opts Options) *Program {
 			}
 		}
 	}
-	p := &Program{OS: os}
+	p := &Program{}
 	funcs := map[*ast.Func]*Func{}
 	adapters := map[*ast.Func]*Func{}
 	named := map[string]*Func{}
 	for _, d := range decls {
-		f := &Func{Name: symbolName(d), ParamWords: paramWords(d), ResultWords: d.RetType.Size(), Ret: d.RetType, Callback: d.Callback}
+		f := &Func{Name: symbolName(d), ParamWords: paramWords(d), Ret: d.RetType, Callback: d.Callback}
 		if d.Callback {
 			f.CParams = d.ParamTypes
 		}
@@ -79,7 +77,7 @@ func Build(files []*ast.File, os target.OS, opts Options) *Program {
 		named[d.Name] = f
 		p.Funcs = append(p.Funcs, f)
 		if d.AsValue {
-			adapter := &Func{Name: fmt.Sprintf("%s..value", f.Name), ParamWords: 1 + f.ParamWords, ResultWords: f.ResultWords, Ret: f.Ret}
+			adapter := &Func{Name: fmt.Sprintf("%s..value", f.Name), ParamWords: 1 + f.ParamWords, Ret: f.Ret}
 			adapters[d] = adapter
 			p.Funcs = append(p.Funcs, adapter)
 		}
@@ -95,7 +93,6 @@ func Build(files []*ast.File, os target.OS, opts Options) *Program {
 	builderFor := func(f *Func, d *ast.Func) *builder {
 		return &builder{
 			ssa:      ws.ssaFor(f),
-			os:       os,
 			decl:     d,
 			funcs:    funcs,
 			adapters: adapters,
@@ -125,8 +122,8 @@ func Build(files []*ast.File, os target.OS, opts Options) *Program {
 	p.Cells = cells
 	p.Funcs = reachable(p.Main, p.Funcs)
 	p.optimise(opts)
+	p.splitCriticalEdges()
 	p.CSymbols = cSymbols(p.Funcs)
-	p.Libraries = libraries(files, p.CSymbols)
 	p.Imports = imports(files, p.CSymbols)
 	return p
 }
@@ -164,8 +161,8 @@ func cSymbols(funcs []*Func) []string {
 		for _, b := range f.Blocks {
 			for _, v := range b.Values {
 				switch {
-				case v.Op == OpCCall && v.Plan.Symbol != "":
-					symbols = append(symbols, v.Plan.Symbol)
+				case v.Op == OpCCall && v.Sig.Symbol != "":
+					symbols = append(symbols, v.Sig.Symbol)
 				case v.Op == OpFuncAddr && v.Aux == SymbolAddr:
 					symbols = append(symbols, v.Str)
 				}
@@ -192,26 +189,6 @@ func imports(files []*ast.File, used []string) map[string][]string {
 		byLibrary[lib] = slices.Compact(symbols)
 	}
 	return byLibrary
-}
-
-func libraries(files []*ast.File, used []string) []string {
-	var libs []string
-	for _, f := range files {
-		for _, e := range f.Externs {
-			if !slices.Contains(libs, e.Library) && declaresAny(e, used) {
-				libs = append(libs, e.Library)
-			}
-		}
-	}
-	slices.Sort(libs)
-	return libs
-}
-
-func declaresAny(e *ast.Extern, used []string) bool {
-	return slices.ContainsFunc(e.Funcs, func(fn *ast.Func) bool {
-		_, found := slices.BinarySearch(used, fn.Symbol)
-		return found
-	})
 }
 
 func reachable(main *Func, funcs []*Func) []*Func {
@@ -449,10 +426,8 @@ func (b *builder) bind(local *ast.Local, words []*Value) {
 		b.store(place{addr: box}, words)
 		return
 	}
-	if local.Addressed || isC(local.Type) || isVector(local.Type) {
-		slot := b.slot(len(words))
-		b.slots[local] = slot
-		b.store(place{addr: slot}, words)
+	if local.Addressed || local.Type.CStruct() || isVector(local.Type) {
+		b.slots[local] = b.spill(words)
 		return
 	}
 	b.store(place{local: local}, words)
@@ -749,14 +724,9 @@ func (b *builder) forStmt(s *ast.For) {
 	}
 	b.enter(body)
 	latch := b.newBlock()
-	b.loops = append(b.loops, loopTarget{cont: latch, brk: exit, depth: len(b.defers)})
-	b.block(s.Body)
-	b.loops = b.loops[:len(b.loops)-1]
-	b.jump(latch)
-	b.enter(latch)
-	b.backEdge(header)
-	b.seal(header)
-	b.enter(exit)
+	loop := loopBlocks{header: header, body: body, next: latch, exit: exit}
+	b.loopBody(loop, s.Body)
+	b.closeLoop(loop)
 }
 
 func (b *builder) backEdge(header *Block) {
@@ -833,7 +803,7 @@ func (b *builder) expr(e ast.Expr) []*Value {
 	case *ast.Closure:
 		return b.closure(e)
 	case *ast.StructLit:
-		if isC(e.Type) {
+		if e.Type.CStruct() {
 			return b.cStruct(e)
 		}
 		words := make([]*Value, e.Type.Size())
@@ -878,7 +848,7 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 	if p, ok := locate(e); ok {
 		return b.load(b.place(p), e.Type)
 	}
-	if isC(e.X.TypeOf()) {
+	if e.X.TypeOf().CStruct() {
 		return b.cField(e)
 	}
 	words := b.value(e.X, e.X.TypeOf())
@@ -1060,7 +1030,7 @@ func (b *builder) callValue(e *ast.Call) []*Value {
 		return b.cInvoke("", t.Params, t.Ret, callee, e.Args)
 	}
 	args, backs := b.arguments(e.Args, t.Params)
-	signature := &Func{Name: t.Name, ParamWords: 1 + len(args), ResultWords: t.Ret.Size(), Ret: t.Ret}
+	signature := &Func{Name: t.Name, ParamWords: 1 + len(args), Ret: t.Ret}
 	operands := append(callee, args...)
 	call := b.emit(OpCall, operands...)
 	call.Indirect = true
@@ -1134,7 +1104,7 @@ func (b *builder) invoke(target *Func, args []*Value) []*Value {
 }
 
 func (b *builder) results(call *Value, target *Func) []*Value {
-	results := make([]*Value, target.ResultWords)
+	results := make([]*Value, target.ResultWords())
 	for k := range results {
 		results[k] = b.result(call, k)
 	}

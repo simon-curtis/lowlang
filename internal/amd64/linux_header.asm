@@ -25,3 +25,49 @@
 
 	.macro HEAP_COMMIT reg
 	.endm
+
+	.macro PROGRAM_ENTRY entry
+.if RT_DYNAMIC
+	.globl \entry
+\entry:
+	xor ebp, ebp
+	mov r9, rdx
+	pop rsi
+	mov rdx, rsp
+	and rsp, -16
+	push rax
+	push rsp
+	xor r8d, r8d
+	xor ecx, ecx
+	lea rdi, [rip+main]
+	call qword ptr [rip+__libc_start_main@GOTPCREL]
+	hlt
+	.globl main
+main:
+	push rbp
+	xor ebp, ebp
+	mov [rip+rt_arg_count], rdi
+	mov [rip+rt_arg_values], rsi
+	mov [rip+rt_env_values], rdx
+	mov rdi, rdx
+.else
+	.globl \entry
+\entry:
+	mov rax, [rsp]
+	mov [rip+rt_arg_count], rax
+	lea rcx, [rsp+8]
+	mov [rip+rt_arg_values], rcx
+	lea rdi, [rsp+8*rax+16]
+	mov [rip+rt_env_values], rdi
+.endif
+	PROGRAM_BOOT
+	.endm
+
+	.macro PROGRAM_EXIT
+.if RT_DYNAMIC
+	call exit
+.else
+	mov eax, 231
+	syscall
+.endif
+	.endm

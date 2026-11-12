@@ -46,21 +46,13 @@ func (b *builder) send(s *ast.Send) {
 func (b *builder) chanLoop(s *ast.ForIn) {
 	t := s.Iter.TypeOf()
 	c := b.word(s.Iter)
-	header := b.newBlock()
-	body := b.newBlock()
-	next := b.newBlock()
-	exit := b.newBlock()
-	b.jump(header)
-	b.cur = header
+	loop := b.openLoop()
 	received := b.chanNamed(prelude.ChanRecv, t, c)
-	b.branch(received[0], body, exit)
-	b.enter(body)
+	b.branch(received[0], loop.body, loop.exit)
+	b.enter(loop.body)
 	b.bind(s.ValueLocal, received[1:1+t.Elem.Size()])
-	b.loopBody(s.Body, next, exit)
-	b.enter(next)
-	b.backEdge(header)
-	b.seal(header)
-	b.enter(exit)
+	b.loopBody(loop, s.Body)
+	b.closeLoop(loop)
 }
 
 func (b *builder) selectExpr(e *ast.Select) []*Value {

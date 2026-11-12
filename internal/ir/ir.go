@@ -2,9 +2,10 @@ package ir
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
-	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
 
@@ -85,6 +86,10 @@ func (o Op) IsCall() bool {
 	return o == OpCall || o == OpCCall || o == OpRuntime || o == OpSyscall
 }
 
+func (o Op) IsVector() bool {
+	return o == OpVector || o == OpVectorScalar
+}
+
 func (o Op) HasResult() bool {
 	return !o.IsCall() && o != OpStore && o != OpCheck && o != OpVector
 }
@@ -103,7 +108,7 @@ type Value struct {
 	Str       string
 	Runtime   *RuntimeEntry
 	Target    *Func
-	Plan      *CPlan
+	Sig       *CSig
 	Type      *types.Type
 	From      *types.Type
 	Scalar    bool
@@ -159,16 +164,19 @@ func (b *Block) String() string {
 }
 
 type Func struct {
-	Name        string
-	ParamWords  int
-	ResultWords int
-	Ret         *types.Type
-	Callback    bool
-	CParams     []*types.Type
-	Blocks      []*Block
-	Slots       []int
-	values      int
-	blockIDs    int
+	Name       string
+	ParamWords int
+	Ret        *types.Type
+	Callback   bool
+	CParams    []*types.Type
+	Blocks     []*Block
+	Slots      []int
+	values     int
+	blockIDs   int
+}
+
+func (f *Func) ResultWords() int {
+	return f.Ret.Size()
 }
 
 type Options struct {
@@ -177,14 +185,18 @@ type Options struct {
 }
 
 type Program struct {
-	OS        target.OS
-	Libraries []string
-	CSymbols  []string
-	Imports   map[string][]string
-	Funcs     []*Func
-	Main      *Func
-	MainErr   *types.Type
-	Cells     int
+	CSymbols []string
+	Imports  map[string][]string
+	Funcs    []*Func
+	Main     *Func
+	MainErr  *types.Type
+	Cells    int
+}
+
+func (p *Program) Libraries() []string {
+	libraries := slices.Collect(maps.Keys(p.Imports))
+	slices.Sort(libraries)
+	return libraries
 }
 
 func (f *Func) newBlock() *Block {
@@ -201,7 +213,7 @@ func (f *Func) newValue(b *Block, op Op, args ...*Value) *Value {
 
 func (f *Func) String() string {
 	var s strings.Builder
-	fmt.Fprintf(&s, "fn %s params=%d results=%d slots=%v\n", f.Name, f.ParamWords, f.ResultWords, f.Slots)
+	fmt.Fprintf(&s, "fn %s params=%d results=%d slots=%v\n", f.Name, f.ParamWords, f.ResultWords(), f.Slots)
 	for _, b := range f.Blocks {
 		f.writeBlock(&s, b)
 	}
@@ -244,7 +256,7 @@ func describe(v *Value) string {
 			detail = fmt.Sprintf(" %s", v.Target.Name)
 		}
 	case OpCCall:
-		detail = fmt.Sprintf(" %s", v.Plan.Symbol)
+		detail = fmt.Sprintf(" %s", v.Sig.Symbol)
 	case OpConvert:
 		detail = fmt.Sprintf(" %s->%s", v.From, v.Type)
 	case OpVector, OpVectorScalar:

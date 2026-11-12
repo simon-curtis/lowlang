@@ -80,5 +80,5 @@ func Boxed(l *ast.Local) bool {
 	if !l.Captured {
 		return false
 	}
-	return l.Assigned || l.Addressed || l.Type.Kind == types.VectorKind || (l.Type.Kind == types.StructKind && l.Type.C)
+	return l.Assigned || l.Addressed || l.Type.Kind == types.VectorKind || l.Type.CStruct()
 }

@@ -166,8 +166,8 @@ func (r *Runner) build(ctx context.Context, dir, binary, source string, mode Mod
 	if err != nil {
 		return stageError{class: ClassReject, detail: strings.ReplaceAll(err.Error(), dir+"/", "")}
 	}
-	asm := amd64.Generate(unit.Program, nil).Asm
-	if err := compiler.Link(ctx, asm, binary, unit.Program); err != nil {
+	asm := amd64.Generate(unit.Program, unit.Platform, nil).Asm
+	if err := compiler.Link(ctx, asm, binary, unit); err != nil {
 		return stageError{class: ClassLink, detail: err.Error()}
 	}
 	return nil

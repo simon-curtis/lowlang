@@ -204,7 +204,7 @@ func compileCommand(ctx context.Context, cmd, path string, opts options) error {
 		}
 		return nil
 	case "asm":
-		fmt.Print(amd64.Generate(unit.Program, nil).Asm)
+		fmt.Print(amd64.Generate(unit.Program, unit.Platform, nil).Asm)
 		return nil
 	}
 	output := opts.output
@@ -220,8 +220,8 @@ func defaultOutput(path string, platform target.OS) string {
 }
 
 func link(ctx context.Context, unit *compiler.Unit, output string) error {
-	asm := amd64.Generate(unit.Program, nil).Asm
-	return compiler.Link(ctx, asm, output, unit.Program)
+	asm := amd64.Generate(unit.Program, unit.Platform, nil).Asm
+	return compiler.Link(ctx, asm, output, unit)
 }
 
 func build(ctx context.Context, path, output string, platform target.OS) error {

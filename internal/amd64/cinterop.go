@@ -4,67 +4,82 @@ import (
 	"fmt"
 
 	"lowlang/internal/ir"
-	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
 
+type addressMove struct {
+	reg    string
+	offset int
+}
+
 func (g *Generator) cCall(fr *frame, in *instr) {
-	plan := in.value.Plan
+	plan := g.plan(in.value.Sig)
 	args := in.args
 	var moves []pmove
-	callee := g.cTarget(plan.Symbol)
-	if plan.Symbol == "" {
+	callee := g.platform.externalTarget(plan.symbol, g.table != nil)
+	if plan.symbol == "" {
 		moves = append(moves, pmove{dst: "r10", src: fr.loc(args[0])})
 		args = args[1:]
 		callee = "r10"
 	}
-	if g.os == target.Windows {
-		moves = g.win64Args(fr, plan, args, moves)
-	} else {
-		moves = g.sysvArgs(fr, plan, args, moves)
-	}
+	moves, addresses := g.cArgs(fr, plan, args, moves)
 	g.parallel(moves)
-	if plan.Memory {
-		g.emit("lea %s, [rsp+%d]", g.cIntRegs()[0], 8*plan.StackWords)
+	for _, a := range addresses {
+		g.emit("lea %s, [rsp+%d]", a.reg, a.offset)
+	}
+	if plan.memory {
+		g.emit("lea %s, [rsp+%d]", g.platform.intRegs()[0], 8*plan.stackWords)
 	}
 	label := g.newLabel()
 	g.enterC(label)
-	if plan.StackWords > 0 {
-		g.emit("sub rsp, %d", 16*((plan.StackWords+1)/2))
-		for i := g.cRegisterSlots(); i < plan.StackWords; i++ {
-			g.emit("mov r11, [r12+%d]", 8*(len(calleeSaved)+i))
+	if plan.stackWords > 0 {
+		g.emit("sub rsp, %d", 16*((plan.stackWords+1)/2))
+		for i := g.platform.registerSlots(); i < plan.stackWords; i++ {
+			g.emit("mov r11, [r12+%d]", abi.savedBytes()+8*i)
 			g.emit("mov [rsp+%d], r11", 8*i)
 		}
 	}
 	g.leaveVectors()
-	if g.os != target.Windows {
-		g.emit("mov eax, %d", plan.Vectors)
-	}
+	g.platform.variadicCount(g, plan)
 	g.emit("call %s", callee)
 	g.safepointAt(fr, in, label)
 	g.leaveC()
 }
 
-func (g *Generator) sysvArgs(fr *frame, plan *ir.CPlan, args []*vreg, moves []pmove) []pmove {
-	ints, vectors, stack := 0, 0, 0
-	if plan.Memory {
-		ints = 1
-	}
-	for i, a := range args {
-		src := fr.loc(a)
-		switch plan.Args[i] {
-		case ir.Vector:
-			moves = append(moves, fr.vectorMove(fmt.Sprintf("xmm%d", vectors), a))
-			vectors++
-		case ir.Stack:
-			g.stackArg(stack, src)
-			stack++
+func (g *Generator) cArgs(fr *frame, plan *cPlan, args []*vreg, moves []pmove) ([]pmove, []addressMove) {
+	var addresses []addressMove
+	cursor := 0
+	for _, arg := range plan.args {
+		words := args[cursor : cursor+arg.words]
+		cursor += arg.words
+		switch {
+		case arg.class == byRef:
+			offset := 8 * (plan.copyBase() + arg.copy)
+			for k, w := range words {
+				g.move(fmt.Sprintf("qword ptr [rsp+%d]", offset+8*k), fr.loc(w))
+			}
+			addresses = g.passAddress(addresses, arg, offset)
+		case arg.slot >= 0:
+			g.stackArg(arg.slot, fr.loc(words[0]))
 		default:
-			moves = append(moves, pmove{dst: argRegs[ints], src: src})
-			ints++
+			if arg.xmm != "" {
+				moves = append(moves, fr.vectorMove(arg.xmm, words[0]))
+			}
+			if arg.reg != "" {
+				moves = append(moves, pmove{dst: arg.reg, src: fr.loc(words[0])})
+			}
 		}
 	}
-	return moves
+	return moves, addresses
+}
+
+func (g *Generator) passAddress(addresses []addressMove, arg cArg, offset int) []addressMove {
+	if arg.reg != "" {
+		return append(addresses, addressMove{reg: arg.reg, offset: offset})
+	}
+	g.emit("lea r11, [rsp+%d]", offset)
+	g.stackArg(arg.slot, "r11")
+	return addresses
 }
 
 func (g *Generator) stackArg(slot int, src string) {
@@ -75,18 +90,18 @@ func (g *Generator) leaveC() {
 	g.emit("TEB_ENTER_CURRENT_G rbx")
 	g.emit("mov rsp, r12")
 	g.emit("call rt_exitc")
-	for i := len(calleeSaved) - 1; i >= 0; i-- {
-		g.emit("pop %s", calleeSaved[i])
+	for i := len(abi.saved) - 1; i >= 0; i-- {
+		g.emit("pop %s", abi.saved[i])
 	}
 }
 
 func (g *Generator) enterC(label string) {
-	for _, r := range calleeSaved {
+	for _, r := range abi.saved {
 		g.emit("push %s", r)
 	}
 	g.emit("TLS_GET rax, TLS_G")
 	g.emit("mov [rax+G_SCANLO], rsp")
-	g.emit("lea r11, [rsp+%d]", 8*len(calleeSaved))
+	g.emit("lea r11, [rsp+%d]", abi.savedBytes())
 	g.emit("mov [rax+G_USERSP], r11")
 	g.emit("mov [rax+G_FP], rbp")
 	g.emit("lea r11, [rip+%s]", label)
@@ -97,23 +112,6 @@ func (g *Generator) enterC(label string) {
 	g.emit("mov r12, rsp")
 	g.emit("TEB_ENTER_OS rax, rbx")
 	g.emit("mov rsp, [rbx+M_G0SP]")
-}
-
-func (g *Generator) cTarget(symbol string) string {
-	switch {
-	case g.os == target.Windows:
-		return fmt.Sprintf("qword ptr [rip+%s]", importSymbol(symbol))
-	case g.table != nil:
-		return fmt.Sprintf("cfn_%s", symbol)
-	}
-	return symbol
-}
-
-func (g *Generator) cSymbolAddress(symbol string) string {
-	if g.os == target.Windows {
-		return fmt.Sprintf("qword ptr [rip+%s]", importSymbol(symbol))
-	}
-	return fmt.Sprintf("qword ptr [rip+%s@GOTPCREL]", symbol)
 }
 
 func (g *Generator) trampolines(symbols []string) {
@@ -127,15 +125,16 @@ func (g *Generator) thunk(f *ir.Func) {
 	g.labels = 0
 	g.align(functionAlignment)
 	fmt.Fprintf(&g.text, "\t.globl %s\n%s:\n", g.fn, g.fn)
-	saved := g.thunkSaved()
+	saved := g.platform.thunkSaved()
+	preserved := g.platform.preservedVectors()
 	g.emit("push rbp")
 	for _, r := range saved {
 		g.emit("push %s", r)
 	}
-	ints, vectors := g.cIntRegs(), g.cVectorRegs()
+	ints, vectors := g.platform.intRegs(), g.platform.vectorRegs()
 	registerBytes := (8*(len(ints)+vectors) + 15) &^ 15
 	g.emit("mov r13, rsp")
-	g.emit("sub rsp, %d", registerBytes+16*len(g.cPreservedVectors()))
+	g.emit("sub rsp, %d", registerBytes+16*len(preserved))
 	g.emit("and rsp, -16")
 	g.emit("mov r12, rsp")
 	for i, r := range ints {
@@ -144,7 +143,7 @@ func (g *Generator) thunk(f *ir.Func) {
 	for i := range vectors {
 		g.emit("movq qword ptr [r12+%d], xmm%d", 8*(len(ints)+i), i)
 	}
-	for i, r := range g.cPreservedVectors() {
+	for i, r := range preserved {
 		g.emit("movaps xmmword ptr [r12+%d], %s", registerBytes+16*i, r)
 	}
 	g.emit("TLS_GET rbx, TLS_M")
@@ -165,7 +164,7 @@ func (g *Generator) thunk(f *ir.Func) {
 	g.emit("push r14")
 	g.emit("push qword ptr [r15+G_USERSP]")
 	g.emit("sub rsp, 8")
-	if stack := stackWords(f.ParamWords); stack > 0 {
+	if stack := abi.stackWords(f.ParamWords); stack > 0 {
 		g.emit("sub rsp, %d", 16*((stack+1)/2))
 	}
 	g.thunkArgs(f, 8*(len(saved)+2))
@@ -183,7 +182,7 @@ func (g *Generator) thunk(f *ir.Func) {
 	g.emit("dec qword ptr [r15+G_LOCKEDM]")
 	g.emit("TEB_ENTER_OS r15, rbx")
 	g.emit("mov rsp, r12")
-	for i, r := range g.cPreservedVectors() {
+	for i, r := range preserved {
 		g.emit("movaps %s, xmmword ptr [r12+%d]", r, registerBytes+16*i)
 	}
 	g.emit("mov [rbx+M_G0SP], r14")
@@ -199,10 +198,11 @@ func (g *Generator) thunk(f *ir.Func) {
 
 func (g *Generator) thunkArgs(f *ir.Func, incoming int) {
 	ints, vectors, spilled := 0, 0, 0
-	intRegs, vectorRegs := g.cIntRegs(), g.cVectorRegs()
+	intRegs, vectorRegs := g.platform.intRegs(), g.platform.vectorRegs()
+	positional := g.platform.positional()
 	for k, t := range f.CParams {
 		var src string
-		if g.os == target.Windows {
+		if positional {
 			ints, vectors = k, k
 		}
 		switch {
@@ -213,56 +213,51 @@ func (g *Generator) thunkArgs(f *ir.Func, incoming int) {
 			src = fmt.Sprintf("[r12+%d]", 8*ints)
 			ints++
 		default:
-			src = fmt.Sprintf("[r13+%d]", incoming+8*(g.cRegisterSlots()+spilled))
+			src = fmt.Sprintf("[r13+%d]", incoming+8*(g.platform.registerSlots()+spilled))
 			spilled++
 		}
 		g.emit("%s", widen(t, src))
-		if k < len(argRegs) {
-			g.emit("mov %s, r10", argRegs[k])
+		if reg, ok := abi.argument(k); ok {
+			g.emit("mov %s, r10", reg)
 			continue
 		}
-		g.emit("mov qword ptr [rsp+%d], r10", 8*(k-len(argRegs)))
+		g.emit("mov %s, r10", abi.outgoing(k))
 	}
 }
 
 func widen(t *types.Type, src string) string {
 	width := t.Width()
-	switch {
-	case width == nil:
+	if width == nil {
 		return fmt.Sprintf("mov r10, qword ptr %s", src)
-	case width.Float() || (width.Bits == 32 && !width.Signed):
-		return fmt.Sprintf("mov r10d, dword ptr %s", src)
-	case width.Bits == 32:
-		return fmt.Sprintf("movsxd r10, dword ptr %s", src)
 	}
-	extend := "movzx"
-	if width.Signed {
-		extend = "movsx"
+	sized := fmt.Sprintf("%s ptr %s", widths[width.Bits], src)
+	if width.Bits == 32 {
+		return extension("r10", sized, width)
 	}
-	return fmt.Sprintf("%s r10, %s ptr %s", extend, map[int]string{8: "byte", 16: "word"}[width.Bits], src)
+	return fmt.Sprintf("movzx r10, %s", sized)
 }
 
-func (g *Generator) cResult(fr *frame, in *instr, plan *ir.CPlan, k int) {
+func (g *Generator) cResult(fr *frame, in *instr, plan *cPlan, k int) {
 	dst := fr.loc(in.dst)
-	if plan.Memory {
-		g.emit("mov r10, qword ptr [rsp+%d]", 8*(plan.StackWords+k))
+	if plan.memory {
+		g.emit("mov r10, qword ptr [rsp+%d]", 8*(plan.stackWords+k))
 		g.move(dst, "r10")
 		return
 	}
 	ints, vectors := 0, 0
-	for _, c := range plan.Results[:k] {
-		if c == ir.Vector {
+	for _, c := range plan.results[:k] {
+		if c == vector {
 			vectors++
 		} else {
 			ints++
 		}
 	}
-	if plan.Results[k] == ir.Integer {
-		g.move(dst, resultRegisters[ints])
+	if plan.results[k] == integer {
+		g.move(dst, abi.results[ints])
 		return
 	}
 	source := fmt.Sprintf("xmm%d", vectors)
-	if plan.Ret == types.F32 {
+	if plan.ret == types.F32 {
 		g.moveSingle(dst, source)
 		return
 	}
@@ -279,17 +274,6 @@ func (g *Generator) moveSingle(dst, source string) {
 	default:
 		g.emit("movd r10d, %s", source)
 		g.move(dst, "r10")
-	}
-}
-
-func (g *Generator) libcShims(symbols []string) {
-	for _, symbol := range symbols {
-		switch symbol {
-		case "atexit":
-			g.shim(symbol, "__cxa_atexit", "xor esi, esi", "xor edx, edx")
-		case "at_quick_exit":
-			g.shim(symbol, "__cxa_at_quick_exit", "xor esi, esi")
-		}
 	}
 }
 

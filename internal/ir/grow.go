@@ -44,44 +44,27 @@ func (b *builder) extendBy(e *ast.Call) *Value {
 
 func (b *builder) room(header place, t *types.Type, extra *Value) (base, length, needed *Value) {
 	slice := b.load(header, t)
-	ptr, length, capacity := slice[0], slice[1], slice[2]
+	length = slice[1]
 	needed = b.count(OpAdd, length, extra)
-	temp := b.newTemp()
-	grow := b.newBlock()
-	keep := b.newBlock()
-	done := b.newBlock()
-	b.branch(b.emit(OpGt, needed, capacity), grow, keep)
-	b.enter(grow)
-	doubled := b.count(OpMul, capacity, b.constant(2))
-	padded := b.count(OpAdd, extra, b.constant(4))
-	grown := b.count(OpAdd, doubled, padded)
-	moved := b.regrow(ptr, length, grown, types.U8)
-	b.store(header, []*Value{moved})
-	b.store(header.at(2), []*Value{grown})
-	b.writeTemp(temp, []*Value{moved})
-	b.jump(done)
-	b.enter(keep)
-	b.writeTemp(temp, []*Value{ptr})
-	b.jump(done)
-	b.enter(done)
-	return b.readTemp(temp, 1)[0], length, needed
+	full := b.emit(OpGt, needed, slice[2])
+	base = b.ensureRoom(header, slice, full, extra, types.U8)
+	return base, length, needed
 }
 
-func (b *builder) push(e *ast.Call) {
-	ref := e.Args[0].(*ast.Ref)
-	elem := ref.Type.Elem
-	header := b.placeOf(ref.X)
-	value := b.value(e.Args[1], elem)
-	slice := b.load(header, ref.Type)
+func (b *builder) ensureRoom(header place, slice []*Value, full, extra *Value, elem *types.Type) *Value {
 	ptr, length, capacity := slice[0], slice[1], slice[2]
 	temp := b.newTemp()
 	grow := b.newBlock()
 	keep := b.newBlock()
 	done := b.newBlock()
-	b.branch(b.emit(OpEq, length, capacity), grow, keep)
+	b.branch(full, grow, keep)
 	b.enter(grow)
 	doubled := b.count(OpMul, capacity, b.constant(2))
-	grown := b.count(OpAdd, doubled, b.constant(4))
+	padding := b.constant(4)
+	if extra != nil {
+		padding = b.count(OpAdd, extra, padding)
+	}
+	grown := b.count(OpAdd, doubled, padding)
 	moved := b.regrow(ptr, length, grown, elem)
 	b.store(header, []*Value{moved})
 	b.store(header.at(2), []*Value{grown})
@@ -91,7 +74,18 @@ func (b *builder) push(e *ast.Call) {
 	b.writeTemp(temp, []*Value{ptr})
 	b.jump(done)
 	b.enter(done)
-	base := b.readTemp(temp, 1)[0]
+	return b.readTemp(temp, 1)[0]
+}
+
+func (b *builder) push(e *ast.Call) {
+	ref := e.Args[0].(*ast.Ref)
+	elem := ref.Type.Elem
+	header := b.placeOf(ref.X)
+	value := b.value(e.Args[1], elem)
+	slice := b.load(header, ref.Type)
+	length := slice[1]
+	full := b.emit(OpEq, length, slice[2])
+	base := b.ensureRoom(header, slice, full, nil, elem)
 	addr := b.scaled(base, length, elem.Stride())
 	b.store(place{addr: addr, scalar: scalarOf(elem), tail: elem.Tail()}, value)
 	b.store(header.at(1), []*Value{b.count(OpAdd, length, b.constant(1))})

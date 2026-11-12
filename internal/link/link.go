@@ -1,12 +1,13 @@
 package link
 
 import (
+	"lowlang/internal/amd64"
 	"lowlang/internal/asm"
 )
 
 const (
 	BaseAddress uint64 = 0x400000
-	EntrySymbol        = "_start"
+	EntrySymbol        = amd64.ELFEntrySymbol
 	FileSymbol         = "main.o"
 )
 

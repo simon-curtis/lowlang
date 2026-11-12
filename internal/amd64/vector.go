@@ -19,7 +19,7 @@ const vectorScratchWords = 13
 func usesVectors(f *ir.Func) bool {
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			if v.Op == ir.OpVector || v.Op == ir.OpVectorScalar {
+			if v.Op.IsVector() {
 				return true
 			}
 		}
@@ -276,14 +276,7 @@ func (g *Generator) unaryRegs(l lanes, op ir.VectorOp) {
 		return
 	}
 	if l.t.Elem.Float() {
-		for h := range l.halves {
-			if g.tier == avx2 {
-				g.emit("vpxor %s, %s, %s ptr [rip+%s]", l.reg(0, h), l.reg(0, h), g.memWidth(l), signLabel(l.t.Elem.Bits))
-			} else {
-				g.emit("movdqu xmm7, xmmword ptr [rip+%s]", signLabel(l.t.Elem.Bits))
-				g.emit("pxor %s, xmm7", l.reg(0, h))
-			}
-		}
+		g.bias(l, 0)
 		return
 	}
 	g.op2(l, "pxor", 6, 6)
@@ -457,30 +450,19 @@ func (g *Generator) maskWords(l lanes) {
 }
 
 func laneLoad(t *types.Type, dst string, mem string) string {
-	switch t.Elem.Bits {
-	case 8:
-		return fmt.Sprintf("movzx %s, byte ptr %s", narrow[dst][0], mem)
-	case 16:
-		return fmt.Sprintf("movzx %s, word ptr %s", narrow[dst][0], mem)
-	case 32:
-		if t.Elem.Signed {
-			return fmt.Sprintf("movsxd %s, dword ptr %s", dst, mem)
-		}
-		return fmt.Sprintf("mov %s, dword ptr %s", narrow[dst][0], mem)
+	width, narrowed := widths[t.Elem.Bits]
+	if !narrowed {
+		return fmt.Sprintf("mov %s, qword ptr %s", dst, mem)
 	}
-	return fmt.Sprintf("mov %s, qword ptr %s", dst, mem)
+	return extension(dst, fmt.Sprintf("%s ptr %s", width, mem), t.Elem)
 }
 
 func laneStore(t *types.Type, mem string, src string) string {
-	switch t.Elem.Bits {
-	case 8:
-		return fmt.Sprintf("mov byte ptr %s, %s", mem, narrow[src][2])
-	case 16:
-		return fmt.Sprintf("mov word ptr %s, %s", mem, narrow[src][1])
-	case 32:
-		return fmt.Sprintf("mov dword ptr %s, %s", mem, narrow[src][0])
+	width, narrowed := widths[t.Elem.Bits]
+	if !narrowed {
+		return fmt.Sprintf("mov qword ptr %s, %s", mem, src)
 	}
-	return fmt.Sprintf("mov qword ptr %s, %s", mem, src)
+	return fmt.Sprintf("mov %s ptr %s, %s", width, mem, narrow[src][subRegister[t.Elem.Bits]])
 }
 
 func (l lanes) laneAt(m maddr) string {
@@ -516,6 +498,10 @@ func (g *Generator) fallback(fr *frame, l lanes, op ir.VectorOp, binary bool) {
 	g.loadVector(l, 0, out)
 }
 
+var vectorComparisons = map[ir.VectorOp]ir.Op{
+	ir.VEq: ir.OpEq, ir.VNe: ir.OpNe, ir.VLt: ir.OpLt, ir.VLe: ir.OpLe, ir.VGt: ir.OpGt, ir.VGe: ir.OpGe,
+}
+
 func (g *Generator) scalarLane(l lanes, op ir.VectorOp, table maddr) {
 	signed := l.t.Elem.Signed
 	switch op {
@@ -523,21 +509,14 @@ func (g *Generator) scalarLane(l lanes, op ir.VectorOp, table maddr) {
 		g.emit("imul rax, rdx")
 	case ir.VMin, ir.VMax:
 		g.emit("cmp rax, rdx")
-		condition := map[bool]string{true: "g", false: "a"}[signed]
+		pick := ir.OpGt
 		if op == ir.VMax {
-			condition = map[bool]string{true: "l", false: "b"}[signed]
+			pick = ir.OpLt
 		}
-		g.emit("cmov%s rax, rdx", condition)
+		g.emit("cmov%s rax, rdx", conditionOf(pick, signed))
 	case ir.VEq, ir.VNe, ir.VLt, ir.VLe, ir.VGt, ir.VGe:
-		set := map[ir.VectorOp][2]string{
-			ir.VEq: {"e", "e"}, ir.VNe: {"ne", "ne"}, ir.VLt: {"l", "b"}, ir.VLe: {"le", "be"}, ir.VGt: {"g", "a"}, ir.VGe: {"ge", "ae"},
-		}[op]
-		condition := set[1]
-		if signed {
-			condition = set[0]
-		}
 		g.emit("cmp rax, rdx")
-		g.emit("set%s al", condition)
+		g.emit("set%s al", conditionOf(vectorComparisons[op], signed))
 		g.emit("movzx eax, al")
 		g.emit("neg rax")
 	case ir.VShuffle:

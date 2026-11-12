@@ -2,149 +2,14 @@ package ir
 
 import (
 	"lowlang/internal/ast"
-	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
 
-type Class int
-
-const (
-	Integer Class = iota
-	Vector
-	Stack
-)
-
-type CPlan struct {
-	Symbol     string
-	Args       []Class
-	Results    []Class
-	Memory     bool
-	Vectors    int
-	StackWords int
-	Ret        *types.Type
-}
-
-func isC(t *types.Type) bool {
-	return t.Kind == types.StructKind && t.C
-}
-
-func eightbytes(t *types.Type) []Class {
-	if !isC(t) {
-		if t.Float() {
-			return []Class{Vector}
-		}
-		return []Class{Integer}
-	}
-	classes := make([]Class, t.Size())
-	for k := range classes {
-		classes[k] = Vector
-	}
-	var visit func(s *types.Type, base int)
-	visit = func(s *types.Type, base int) {
-		for _, f := range s.Fields {
-			at := base + f.Bytes
-			if isC(f.Type) {
-				visit(f.Type, at)
-				continue
-			}
-			if !f.Type.Float() {
-				classes[at/8] = Integer
-			}
-		}
-	}
-	visit(t, 0)
-	return classes
-}
-
-type registers struct {
-	ints    int
-	vectors int
-}
-
-func (r *registers) fit(classes []Class) bool {
-	ints, vectors := r.ints, r.vectors
-	for _, c := range classes {
-		if c == Integer {
-			ints++
-		} else {
-			vectors++
-		}
-	}
-	if ints > 6 || vectors > 8 {
-		return false
-	}
-	r.ints, r.vectors = ints, vectors
-	return true
-}
-
-func cPlan(symbol string, ret *types.Type, argTypes []*types.Type, mut []bool) *CPlan {
-	plan := &CPlan{Symbol: symbol, Ret: ret}
-	regs := &registers{}
-	if ret != types.Void {
-		if isC(ret) && ret.Bytes > 16 {
-			plan.Memory = true
-			regs.ints = 1
-		} else {
-			plan.Results = eightbytes(ret)
-		}
-	}
-	for i, t := range argTypes {
-		classes := []Class{Integer}
-		if !mut[i] {
-			classes = eightbytes(t)
-		}
-		if (isC(t) && !mut[i] && t.Bytes > 16) || !regs.fit(classes) {
-			for range classes {
-				plan.Args = append(plan.Args, Stack)
-			}
-			plan.StackWords += len(classes)
-			continue
-		}
-		plan.Args = append(plan.Args, classes...)
-	}
-	plan.Vectors = regs.vectors
-	return plan
-}
-
-func win64Register(t *types.Type) bool {
-	return !isC(t) || t.Bytes == 1 || t.Bytes == 2 || t.Bytes == 4 || t.Bytes == 8
-}
-
-func win64Class(t *types.Type) Class {
-	if !isC(t) && t.Float() {
-		return Vector
-	}
-	return Integer
-}
-
-func win64Plan(symbol string, ret *types.Type, argTypes []*types.Type, mut []bool) *CPlan {
-	plan := &CPlan{Symbol: symbol, Ret: ret}
-	slots := 0
-	if ret != types.Void {
-		if win64Register(ret) {
-			plan.Results = []Class{win64Class(ret)}
-		} else {
-			plan.Memory = true
-			slots = 1
-		}
-	}
-	for i, t := range argTypes {
-		class := Integer
-		if !mut[i] {
-			class = win64Class(t)
-		}
-		plan.Args = append(plan.Args, class)
-		slots++
-	}
-	plan.StackWords = max(4, slots)
-	return plan
-}
-
-func (b *builder) plan(symbol string, ret *types.Type, argTypes []*types.Type, mut []bool) *CPlan {
-	if b.os == target.Windows {
-		return win64Plan(symbol, ret, argTypes, mut)
-	}
-	return cPlan(symbol, ret, argTypes, mut)
+type CSig struct {
+	Symbol string
+	Args   []*types.Type
+	ByRef  []bool
+	Ret    *types.Type
 }
 
 func (b *builder) cCall(e *ast.Call) []*Value {
@@ -173,19 +38,13 @@ func (b *builder) cInvoke(symbol string, params []*types.Type, ret *types.Type, 
 			words = []*Value{b.convert(words[0], types.F32, types.F64)}
 			t = types.F64
 		}
-		if b.os == target.Windows && !win64Register(t) {
-			copied := b.slot(len(words))
-			b.store(place{addr: copied}, words)
-			words = []*Value{copied}
-			t = types.I64
-		}
 		args = append(args, words...)
 		argTypes = append(argTypes, t)
 		mut = append(mut, false)
 	}
 	operands := append(callee, args...)
 	call := b.emit(OpCCall, operands...)
-	call.Plan = b.plan(symbol, ret, argTypes, mut)
+	call.Sig = &CSig{Symbol: symbol, Args: argTypes, ByRef: mut, Ret: ret}
 	results := make([]*Value, ret.Size())
 	for k := range results {
 		results[k] = b.result(call, k)

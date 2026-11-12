@@ -6,14 +6,12 @@ import (
 	"lowlang/internal/ir"
 )
 
-var resultRegisters = []string{"rax", "rdx"}
-
 func (in *instr) returnsInRegisters() bool {
 	switch in.op {
 	case ir.OpRuntime, ir.OpSyscall:
 		return true
 	case ir.OpCall:
-		return in.value.Target.ResultWords <= len(resultRegisters)
+		return abi.returnsInRegisters(in.value.Target.ResultWords())
 	}
 	return false
 }
@@ -37,8 +35,8 @@ func (mb *mblock) pinChain(call int) {
 	}
 	for _, in := range results {
 		k := int(in.value.Aux)
-		if k < len(resultRegisters) && !in.dst.float && in.value.Uses == 1 && mb.consumes(end, in.dst) {
-			in.dst.pinned = resultRegisters[k]
+		if k < len(abi.results) && !in.dst.float && in.value.Uses == 1 && mb.consumes(end, in.dst) {
+			in.dst.pinned = abi.results[k]
 		}
 	}
 }

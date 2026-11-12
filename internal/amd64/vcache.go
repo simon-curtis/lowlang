@@ -28,7 +28,7 @@ func vectorTemps(f *ir.Func) *vectorCache {
 			if v.Op.IsCall() {
 				calls[b] = append(calls[b], i)
 			}
-			vector := v.Op == ir.OpVector || v.Op == ir.OpVectorScalar
+			vector := v.Op.IsVector()
 			for k, a := range v.Args {
 				if a.Op != ir.OpSlot {
 					continue

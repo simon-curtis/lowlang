@@ -12,7 +12,7 @@ func (b *builder) equal(t *types.Type, x, y []*Value) *Value {
 	switch {
 	case t == types.Str:
 		return b.runtime(rtStrEq, x[0], x[1], y[0], y[1])
-	case isC(t):
+	case t.CStruct():
 		return b.cEqual(t, b.spill(x), b.spill(y), 0)
 	case t.Kind == types.StructKind:
 		return b.fieldsEqual(t, x, y)
@@ -98,7 +98,7 @@ func (b *builder) cEqual(t *types.Type, x, y *Value, base int) *Value {
 	for _, f := range t.Fields {
 		at := base + f.Bytes
 		var same *Value
-		if isC(f.Type) {
+		if f.Type.CStruct() {
 			same = b.cEqual(f.Type, x, y, at)
 		} else {
 			width := f.Type.Width()

@@ -68,7 +68,7 @@ func compileOnce(c determinismCase) (compiled, error) {
 			table[f.Name] = i
 		}
 	}
-	return compiled{ir: ir.String(), asm: amd64.Generate(unit.Program, table).Asm}, nil
+	return compiled{ir: ir.String(), asm: amd64.Generate(unit.Program, unit.Platform, table).Asm}, nil
 }
 
 func firstDifference(a, b string) string {

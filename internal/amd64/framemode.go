@@ -15,7 +15,7 @@ const (
 )
 
 func (mf *mfunc) frameMode(f *ir.Func, saved []string, vectors bool) frameMode {
-	if vectors || f.ParamWords > len(argRegs) {
+	if vectors || f.ParamWords > len(abi.args) {
 		return fullFrame
 	}
 	if mf.guard == nil {
@@ -57,7 +57,7 @@ func (in *instr) frameFree() bool {
 	case ir.OpLoad, ir.OpStore:
 		return in.args[0].mem.base.frame == nil
 	case ir.OpParam:
-		return int(in.value.Aux) < len(argRegs)
+		return int(in.value.Aux) < len(abi.args)
 	case ir.OpDiv, ir.OpRem:
 		divisor := in.args[1].konst
 		return isFloat(in.value.Type) || (divisor != nil && *divisor != 0)

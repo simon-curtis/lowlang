@@ -53,7 +53,8 @@ func (g *Generator) xmmOperand(fr *frame, r *vreg, scratch, p string) string {
 	return scratch
 }
 
-func (g *Generator) floatArithmetic(fr *frame, in *instr, op string) {
+func (g *Generator) floatArithmetic(fr *frame, in *instr) {
+	op := floatOps[in.op]
 	p := precision(in.value.Type)
 	dst := fr.loc(in.dst)
 	target := xmmTarget(dst)

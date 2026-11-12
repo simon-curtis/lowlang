@@ -102,8 +102,8 @@ func TestRegistry(t *testing.T) {
 	}
 	binary := filepath.Join(dir, "registry")
 	ctx := context.Background()
-	asm := amd64.Generate(unit.Program, nil).Asm
-	if err := compiler.Link(ctx, asm, binary, unit.Program); err != nil {
+	asm := amd64.Generate(unit.Program, unit.Platform, nil).Asm
+	if err := compiler.Link(ctx, asm, binary, unit); err != nil {
 		t.Fatal(err)
 	}
 	if os.Getenv("WAYLAND_DISPLAY") == "" {

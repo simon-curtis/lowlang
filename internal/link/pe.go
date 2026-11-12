@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"lowlang/internal/amd64"
 	"lowlang/internal/asm"
 )
 
@@ -13,7 +14,7 @@ const (
 	peImageBase      uint64 = 0x140000000
 	peSectionAlign   uint64 = pageSize
 	peFileAlign      uint64 = 0x200
-	peEntrySymbol           = "start"
+	peEntrySymbol           = amd64.PEEntrySymbol
 	peStackReserve   uint64 = 8 << 20
 	peStackCommit    uint64 = pageSize
 	peHeapReserve    uint64 = 1 << 20
@@ -51,9 +52,9 @@ const (
 )
 
 const (
-	importPrefix  = ".idata$2"
-	iatPrefix     = ".idata$5"
-	importGroup   = ".idata"
+	importPrefix  = amd64.ImportDescriptors
+	iatPrefix     = amd64.ImportAddresses
+	importGroup   = amd64.ImportGroup
 	relocName     = ".reloc"
 	rdataName     = ".rdata"
 	textName      = ".text"

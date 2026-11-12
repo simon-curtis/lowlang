@@ -166,7 +166,7 @@ func (s *Session) Reload(ctx context.Context) error {
 	if len(table) > amd64.TableSize {
 		return s.restart(ctx, unit, "function table full")
 	}
-	out := amd64.Generate(unit.Program, table)
+	out := amd64.Generate(unit.Program, unit.Platform, table)
 	if out.Funcs["main"] != s.funcs["main"] {
 		return s.restart(ctx, unit, "main changed")
 	}
@@ -176,7 +176,7 @@ func (s *Session) Reload(ctx context.Context) error {
 		return nil
 	}
 	began := time.Now()
-	if err := s.patch(ctx, unit.Program, table, changed); err != nil {
+	if err := s.patch(ctx, unit, table, changed); err != nil {
 		return s.restart(ctx, unit, fmt.Sprintf("reload failed: %v", err))
 	}
 	s.table, s.funcs = table, out.Funcs
@@ -186,7 +186,7 @@ func (s *Session) Reload(ctx context.Context) error {
 }
 
 func (s *Session) restartReason(unit *compiler.Unit) string {
-	if !slices.Equal(unit.Program.Libraries, s.libraries) {
+	if !slices.Equal(unit.Program.Libraries(), s.libraries) {
 		return "linked libraries changed"
 	}
 	if !slices.Equal(unit.Program.CSymbols, s.cSymbols) {
@@ -230,9 +230,9 @@ func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string)
 	for i, f := range unit.Program.Funcs {
 		table[f.Name] = i
 	}
-	out := amd64.Generate(unit.Program, table)
+	out := amd64.Generate(unit.Program, unit.Platform, table)
 	binary := filepath.Join(s.dir, fmt.Sprintf("app%d", s.builds))
-	if err := compiler.Link(ctx, out.Asm, binary, unit.Program); err != nil {
+	if err := compiler.Link(ctx, out.Asm, binary, unit); err != nil {
 		return err
 	}
 	symbols, err := readSymbols(binary)
@@ -250,7 +250,7 @@ func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string)
 	s.binary, s.symbols = binary, symbols
 	s.table, s.funcs = table, out.Funcs
 	s.signatures, s.layout = signatures(unit.Files), layout(unit.Files)
-	s.libraries = unit.Program.Libraries
+	s.libraries = unit.Program.Libraries()
 	s.cSymbols = unit.Program.CSymbols
 	s.next = 0
 	s.logf("%s", reason)
@@ -294,11 +294,11 @@ func readSymbols(path string) (map[string]uint64, error) {
 	return out, nil
 }
 
-func (s *Session) patch(ctx context.Context, prog *ir.Program, table map[string]int, changed []string) error {
+func (s *Session) patch(ctx context.Context, unit *compiler.Unit, table map[string]int, changed []string) error {
 	suffix := fmt.Sprintf("_r%d_%d", s.builds, s.next)
 	address := amd64.HotBase + s.next
 	output := filepath.Join(s.dir, fmt.Sprintf("patch%d_%d", s.builds, s.next))
-	asm := amd64.GeneratePatch(prog, changed, table, suffix)
+	asm := amd64.GeneratePatch(unit.Program, unit.Platform, changed, table, suffix)
 	if err := compiler.LinkAt(ctx, asm, output, s.binary, address); err != nil {
 		return err
 	}
@@ -358,10 +358,10 @@ func (s *Session) apply(ctx context.Context, code []byte, address uint64, entrie
 	if _, err := mem.WriteAt(code, int64(address)); err != nil {
 		return fmt.Errorf("writing code at %#x: %w", address, err)
 	}
-	if _, err := mem.WriteAt(entries, int64(s.symbols["rt_patch_list"])); err != nil {
+	if _, err := mem.WriteAt(entries, int64(s.symbols[amd64.PatchListSymbol])); err != nil {
 		return fmt.Errorf("writing patch list: %w", err)
 	}
-	counter := int64(s.symbols["rt_patch_count"])
+	counter := int64(s.symbols[amd64.PatchCountSymbol])
 	if _, err := mem.WriteAt(binary.LittleEndian.AppendUint64(nil, uint64(count)), counter); err != nil {
 		return fmt.Errorf("writing patch count: %w", err)
 	}

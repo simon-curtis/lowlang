@@ -82,15 +82,10 @@ func (b *builder) mapLoop(s *ast.ForIn) {
 	table := b.word(s.Iter)
 	cursor := b.newTemp()
 	b.writeTemp(cursor, b.mapCall(prelude.MapNext, m, table, b.constant(0)))
-	header := b.newBlock()
-	body := b.newBlock()
-	next := b.newBlock()
-	exit := b.newBlock()
-	b.jump(header)
-	b.cur = header
+	loop := b.openLoop()
 	at := b.readTemp(cursor, 1)[0]
-	b.branch(b.emit(OpLt, at, b.constant(0)), exit, body)
-	b.enter(body)
+	b.branch(b.emit(OpLt, at, b.constant(0)), loop.exit, loop.body)
+	b.enter(loop.body)
 	key := b.mapCall(prelude.MapKey, m, table, at)
 	if s.KeyLocal == nil {
 		b.bind(s.ValueLocal, key)
@@ -98,11 +93,8 @@ func (b *builder) mapLoop(s *ast.ForIn) {
 		b.bind(s.KeyLocal, key)
 		b.bind(s.ValueLocal, b.mapCall(prelude.MapValue, m, table, at))
 	}
-	b.loopBody(s.Body, next, exit)
-	b.enter(next)
+	b.loopBody(loop, s.Body)
 	from := b.emit(OpAdd, at, b.constant(1))
 	b.writeTemp(cursor, b.mapCall(prelude.MapNext, m, table, from))
-	b.backEdge(header)
-	b.seal(header)
-	b.enter(exit)
+	b.closeLoop(loop)
 }

@@ -143,6 +143,18 @@
 	mov [rax+G_FP], rbp
 	.endm
 
+	.macro PROGRAM_BOOT
+	call rt_cpu_init
+	call rt_gc_init
+	call rt_sched_init
+	HOT_INIT
+	lea rdi, [rip+rt_program]
+	call rt_spawn_main
+	TLS_GET rax, TLS_M
+	mov rsp, [rax+M_G0TOP]
+	jmp rt_schedule
+	.endm
+
 	.macro MSG_BEGIN name
 \name:
 	.quad 2f-1f

@@ -9,13 +9,11 @@ import (
 )
 
 var (
-	callerSaved = []string{"rcx", "rsi", "rdi", "r8", "r9"}
-	calleeSaved = []string{"rbx", "r12", "r13", "r14", "r15"}
-	floatRegs   = []string{
+	floatRegs = []string{
 		"xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8",
 		"xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
 	}
-	integerRegs = slices.Concat(callerSaved, calleeSaved)
+	integerRegs = abi.integers()
 )
 
 type segment struct {
@@ -343,7 +341,7 @@ func (f *mfunc) place(order []*vreg, cost func(*vreg) float64) outcome {
 			o.cost += float64(r.weight)
 		}
 	}
-	for _, reg := range calleeSaved {
+	for _, reg := range abi.saved {
 		if a.used[reg] {
 			o.cost += saveCost
 		}
@@ -368,7 +366,7 @@ func (f *mfunc) allocate() (spills int, saved []string) {
 	for i, r := range order {
 		r.reg, r.spill = best.placed[i].reg, best.placed[i].spill
 	}
-	for _, r := range calleeSaved {
+	for _, r := range abi.saved {
 		if best.alloc.used[r] {
 			saved = append(saved, r)
 		}
@@ -383,9 +381,9 @@ func (a *allocator) candidates(cur *vreg) []string {
 	case cur.crossesCall && cur.light:
 		return nil
 	case cur.crossesCall:
-		return calleeSaved
+		return abi.saved
 	case cur.light:
-		return callerSaved
+		return abi.caller
 	}
 	return integerRegs
 }

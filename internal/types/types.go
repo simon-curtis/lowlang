@@ -260,6 +260,10 @@ func newRaw(elem *Type) *Type {
 	return &Type{Kind: RawKind, Name: name, Elem: elem, size: 1}
 }
 
+func (t *Type) CStruct() bool {
+	return t.Kind == StructKind && t.C
+}
+
 func (t *Type) CCompatible() bool {
 	switch t.Kind {
 	case IntKind, FloatKind, BoolKind, RawKind:
@@ -275,7 +279,7 @@ func (t *Type) CScalar() bool {
 }
 
 func (t *Type) Tail() int {
-	if t.Kind == StructKind && t.C {
+	if t.CStruct() {
 		return t.Bytes % 8
 	}
 	return 0
@@ -285,7 +289,7 @@ func (t *Type) CSize() int {
 	switch {
 	case t.Kind == BoolKind:
 		return 1
-	case t.Kind == StructKind && t.C:
+	case t.CStruct():
 		return t.Bytes
 	case t.Packed():
 		return t.Bits / 8
@@ -294,7 +298,7 @@ func (t *Type) CSize() int {
 }
 
 func (t *Type) CAlign() int {
-	if t.Kind == StructKind && t.C {
+	if t.CStruct() {
 		return t.Align
 	}
 	return t.CSize()
@@ -322,7 +326,7 @@ func (t *Type) Stride() int {
 	switch {
 	case t.Packed():
 		return t.Bits / 8
-	case t.Kind == StructKind && t.C:
+	case t.CStruct():
 		return t.Bytes
 	}
 	return 8 * t.size
@@ -387,7 +391,7 @@ func (t *Type) Layout() error {
 		return &CycleError{Type: t}
 	}
 	t.size = 0
-	if t.Kind == StructKind && t.C {
+	if t.CStruct() {
 		return t.cLayout()
 	}
 	if t.Kind == StructKind {

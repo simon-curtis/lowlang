@@ -1494,12 +1494,20 @@ Modules:
 
 - `internal/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles.
 - Every file records its module path and every source position its file, so errors name the file they come from.
-- The checker keeps a scope of types and functions per module. The prelude belongs to the entry module, and its `__` names cannot clash with anything else.
+- The checker keeps a scope of types and functions per module. The prelude belongs to the entry module, and its `__` names cannot clash with anything else. Every module sees the prelude's generic `__` functions and types, so `std/container/deque` is a wrapper over the prelude's `__Queue`, the ring buffer behind channel wait queues.
 - A function in module `ui/text` becomes the symbol `fn_ui.text.shout`. Types display with their module path, such as `geometry.Circle`.
 
 The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls. It ends the process with `exit_group`, so every thread stops.
 
-The runtime's data layout, thread-local access and Windows stack-bounds switching are defined once, in `layout.asm` and the target's `linux_header.asm` or `windows_header.asm`, as constants and macros such as `G_SCANLO`, `TLS_GET`, `TEB_ENTER_OS` and `MSG_BEGIN`. Generated code and patches use those names and macros, and `Generate` and `GeneratePatch` both prepend the headers. Go passes `RT_DYNAMIC` and the hot-reload constants to the assembly as `.set` lines. The Windows import table lists every function the Windows runtime calls through `WIN`, taken from `windows.asm`, plus the program's `extern` imports.
+The runtime's data layout, thread-local access and Windows stack-bounds switching are defined once, in `layout.asm` and the target's `linux_header.asm` or `windows_header.asm`, as constants and macros such as `G_SCANLO`, `TLS_GET`, `TEB_ENTER_OS` and `MSG_BEGIN`. Generated code and patches use those names and macros, and `Generate` and `GeneratePatch` both prepend the headers. Go passes `RT_DYNAMIC` and the hot-reload constants to the assembly as `.set` lines, and defines `HOT_INIT` as the call to `rt_hot_init` in a hot build and as nothing otherwise. The Windows import table lists every function the Windows runtime calls through `WIN`, taken from `windows.asm`, plus the program's `extern` imports.
+
+The contracts between the stages have one owner each:
+
+- `internal/builtin` numbers every builtin. The checker records the number on each call and `internal/ir` lowers it through a table indexed by that number.
+- `internal/ir/runtime.go` lists every runtime routine generated code calls: its symbol, its register convention (plain, growth, system call or string equality), whether it returns a scalar or nothing, and whether it allocates. A system call is its own `syscall` instruction; the others are `runtime` instructions.
+- `internal/prelude` names every prelude function and struct the compiler uses, the layout of each struct, and which functions a map or channel type instantiates. The prelude is validated when it loads, so a missing or reshaped entry is an error that names it. `internal/ir` reads field offsets from the checked types.
+- `internal/amd64` owns the target. A `Platform` value, `sysv` for Linux and `win64` for Windows, supplies the runtime and header text, the C argument classification, the registers a C callback saves, the entry symbol, how a system call is made, stack probing and the dynamic-library shims. `PROGRAM_ENTRY` and `PROGRAM_EXIT` in each header are the program's entry and exit. `amd64` exports the entry symbols, the hot-patch list and count symbols and the `.idata` section names that `internal/link` and `internal/hot` read.
+- One `convention` value in `internal/amd64` holds the Low register convention: argument, result, caller-saved, callee-saved, system call and growth registers, and the frame offsets derived from them.
 
 ### Scheduler
 
@@ -1598,7 +1606,7 @@ Standard library intrinsics:
 
 - `__argc()`, `__argv(i)` and `__envv(i)` read the argument count, argument `i` and environment entry `i` (`null` past the end) as NUL-terminated `ptr[u8]`s. The start code saves them from the initial stack in a static program and from `main`'s arguments in a dynamic one.
 - `__syscall(n, args...)` makes Linux syscall `n` with up to six integer, `bool` or `ptr` arguments and returns `rax` as `i64`, a negative errno on failure.
-  - It lowers to a runtime-call instruction: `syscall` for a constant number on the non-blocking list and `sysblock` otherwise (see the Scheduler section).
+  - It lowers to a `syscall` instruction, which the code generator emits inline for a constant number on the non-blocking list and as a call to `rt_sysblock` otherwise (see the Scheduler section).
   - The code generator emits `syscall` inline: it moves the arguments into `rax`, `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9` with the parallel move and executes `syscall`.
   - Being a call, it keeps no value in a caller-saved register across it, which covers the `rcx` and `r11` the kernel clobbers.
 - `__slice_ptr(x)` gives the data address of a slice or `str` as a `ptr[T]`.
@@ -1668,7 +1676,7 @@ The derivations are generated as source:
 - It parses the text with the prelude's privileges, marks it trusted so it may read and build private fields, and checks it like a generic instance.
 - Calls inside it to the same intrinsics derive the types they reach. Each derived function is cached by type.
 - The serialization of a type is `fn(w: Writer, mut path: []i64, v: T)`. `path` holds the addresses of the pointers being written, pushed before a pointer's target is written and popped after it; a pointer already on it panics with `serde: cycle through *T`. `__serialize(v, w)` starts with an empty path, and the derived code recurses through `__serialize_into(w, mut path, x)`.
-- The rendering of a type is `fn(mut b: []u8, mut path: []i64, v: T)`, which appends to `b` through the prelude's `__append_*` functions. `path` holds the addresses of the pointers being rendered, pushed before a pointer's target is rendered and popped after it. A `print` or interpolation creates an empty buffer and path, calls it, and uses the buffer as the text; an interpolation appends into the buffer it is composing. `__render(v)` gives the text of any value with a `str` quoted, for `std/testing`'s `format`.
+- The rendering of a type is `fn(mut b: []u8, mut path: []i64, v: T)`, which appends to `b` through the prelude's `__append_*` functions. `path` holds the addresses of the pointers being rendered, pushed before a pointer's target is rendered and popped after it. A `print` or interpolation creates an empty buffer and path, calls it, and uses the buffer as the text; an interpolation appends into the buffer it is composing. A number, `bool` or `str` is rendered by the same `__append_*` functions, so `print` has one text path: it builds the text and writes it with `rt_print_str`. `__render(v)` gives the text of any value with a `str` quoted, for `std/testing`'s `format`.
 - Bound names resolve in type positions, struct literals and variant selectors.
 - A field reference `T.field` is checked as `serde.Field[T, F]` and lowered to the field's name and index as constants.
 
@@ -1686,7 +1694,7 @@ The derivations are generated as source:
   - `push`, `__extend`, `__extend_by` and `delete` take their `mut` operand in place. On an SSA variable they read and write its words (a slice's pointer, length and capacity) as SSA values, so a slice that is only pushed to, indexed and passed by value stays in registers.
   - Lengths and capacities these builtins compute are typed integers and never count as pointers.
 - Integer division carries its zero and overflow checks inside the instruction. A constant divisor other than 0 and -1 needs neither check.
-- A call to a C function becomes a `ccall` carrying its System V AMD64 plan. Each argument word is classified:
+- A call to a C function becomes a `ccall` carrying its C signature: the symbol, the type of each argument, which arguments are `mut` places, and the result type. `internal/amd64` classifies the signature for the target. On Linux the System V AMD64 rules classify each argument word:
   - Integers, `bool` and pointers take `rdi`, `rsi`, `rdx`, `rcx`, `r8` and `r9`.
   - Floats take `xmm0` to `xmm7`.
   - An `extern struct` of at most 16 bytes is split into eightbytes that go to vector registers when every field in them is a float and to integer registers otherwise.
@@ -1694,6 +1702,7 @@ The derivations are generated as source:
   - Variadic `f32` arguments are widened to `f64`, and `al` holds the number of vector registers used.
   - A struct result of at most 16 bytes comes back in `rax`, `rdx`, `xmm0` and `xmm1` by class. A larger one is written to a buffer whose address goes in `rdi`.
   - Narrow integer, `bool` and `f32` results are re-extended, and so are narrow places passed as `mut` once the call returns.
+- On Windows the Win64 rules apply. Every argument takes one of four slots, `rcx`, `rdx`, `r8` and `r9`, and a float also takes the matching `xmm0` to `xmm3`; a variadic float is passed in both. The slots after the fourth go on the stack above 32 bytes of shadow space. An `extern struct` of 1, 2, 4 or 8 bytes passes in its slot. Any other struct is copied into the caller's outgoing area and passed by address, and a struct result of another size is written to a buffer whose address goes in the first slot. Results come back in `rax` or `xmm0`.
 - Every frame keeps `rsp` 16-byte aligned at its calls, as C requires: frames are rounded to 16 bytes, and `_start` rounds the space it reserves for `main`'s result.
 - An `extern struct` value is its C bytes, one word per eightbyte. Its locals and parameters live in frame slots. A field is loaded or stored at its own width, and a struct literal or a field of a computed value goes through a temporary slot. A struct whose size is not a multiple of 8 is stored and loaded up to its last byte, with 4-, 2- and 1-byte accesses for the final partial word, so writing a nested field or an element of a `view` never touches the bytes after it.
 - `defer` keeps a stack of deferred statements per block and lowers them again at every exit from that block.
@@ -1710,7 +1719,7 @@ The derivations are generated as source:
   - Any other captured variable stays an SSA variable of its function and the environment holds its words inline. The closure reads them into SSA variables on entry.
   - `spawn` binds its callee and arguments to such variables, so a spawn allocates the environment and nothing else.
   - A named function used as a value goes through an adapter, `name..value`, which drops the environment and calls it.
-- A call through a function value moves the code address to `r10` and calls it, passing the environment and the arguments like any call. A call through an `extern fn` value is a `ccall` with the same System V plan as a named C function.
+- A call through a function value moves the code address to `r10` and calls it, passing the environment and the arguments like any call. A call through an `extern fn` value is a `ccall` with the same plan as a named C function.
 - A C callback is a thunk, `cb_name`, emitted once per program for every function used as one. It saves the C argument registers, re-extends narrow integers and `bool` from them and from the C stack, calls the function with Low's convention on the green thread's stack and moves a float result to `xmm0`. On Windows it also saves and restores `xmm6` to `xmm15`, which C treats as callee-saved.
 - Every loop's back-edge block is marked. The code generator ends it with `cmp byte ptr fs:[-8], 0` and a branch to an out-of-line `call rt_poll`.
 - `spawn f(a, b)` becomes a block that binds the callee and the arguments to fresh locals and passes a closure calling `f` with them to `rt_spawn`.

@@ -174,7 +174,7 @@ func (b *builder) cstrCall(e *ast.Call) []*Value {
 func (b *builder) viewCall(e *ast.Call) []*Value {
 	ptr := b.word(e.Args[0])
 	n := b.word(e.Args[1])
-	return []*Value{ptr, n, n}
+	return sliceOf(ptr, n)
 }
 
 func (b *builder) loadCall(e *ast.Call) []*Value {

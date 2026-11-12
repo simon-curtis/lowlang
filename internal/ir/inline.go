@@ -282,7 +282,7 @@ func loopDepths(f *Func) []int {
 func resultsOf(f *Func, candidates []inlineCandidate) map[*Value][]*Value {
 	results := make(map[*Value][]*Value, len(candidates))
 	for _, c := range candidates {
-		results[c.call] = make([]*Value, c.call.Target.ResultWords)
+		results[c.call] = make([]*Value, c.call.Target.ResultWords())
 	}
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {

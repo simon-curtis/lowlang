@@ -30,10 +30,14 @@ var inverse = map[string]string{
 }
 
 func condition(v *ir.Value) string {
-	if v.Type != nil && v.Type.Integer() && !v.Type.Signed {
-		return unsignedConditions[v.Op]
+	return conditionOf(v.Op, v.Type == nil || !v.Type.Integer() || v.Type.Signed)
+}
+
+func conditionOf(op ir.Op, signed bool) string {
+	if signed {
+		return signedConditions[op]
 	}
-	return signedConditions[v.Op]
+	return unsignedConditions[op]
 }
 
 func isFloat(t *types.Type) bool {
@@ -56,24 +60,26 @@ func (g *Generator) normalize(loc string, t *types.Type) {
 		g.move("r10", loc)
 		reg = "r10"
 	}
-	sub := narrow[reg]
-	switch {
-	case t.Integer() && t.Signed:
-		g.emit("movsxd %s, %s", reg, sub[0])
-	case t.Bits == 32:
-		g.emit("mov %s, %s", sub[0], sub[0])
-	case t.Bits == 16:
-		g.emit("movzx %s, %s", sub[0], sub[1])
-	default:
-		g.emit("movzx %s, %s", sub[0], sub[2])
-	}
+	g.emit("%s", extension(reg, narrow[reg][subRegister[t.Bits]], t))
 	g.move(loc, reg)
 }
 
-func (g *Generator) arithmetic(fr *frame, in *instr, op string) {
+var subRegister = map[int]int{32: 0, 16: 1, 8: 2}
+
+func extension(dst, src string, t *types.Type) string {
+	switch {
+	case t.Integer() && t.Signed:
+		return fmt.Sprintf("movsxd %s, %s", dst, src)
+	case t.Bits == 32:
+		return fmt.Sprintf("mov %s, %s", narrow[dst][0], src)
+	}
+	return fmt.Sprintf("movzx %s, %s", narrow[dst][0], src)
+}
+
+func (g *Generator) arithmetic(fr *frame, in *instr) {
 	t := in.value.Type
 	if isFloat(t) {
-		g.floatArithmetic(fr, in, op)
+		g.floatArithmetic(fr, in)
 		return
 	}
 	g.binary(fr, in, binops[in.op])
@@ -143,7 +149,7 @@ func (g *Generator) negate(fr *frame, in *instr) {
 func (g *Generator) divide(fr *frame, in *instr) {
 	t := in.value.Type
 	if isFloat(t) {
-		g.arithmetic(fr, in, "div")
+		g.arithmetic(fr, in)
 		return
 	}
 	divisor := in.args[1].konst
@@ -331,14 +337,7 @@ func (g *Generator) load(fr *frame, in *instr) {
 		reg = "r10"
 	}
 	sized := fmt.Sprintf("%s ptr %s", widths[t.Bits], memory)
-	switch {
-	case t.Integer() && t.Signed:
-		g.emit("movsxd %s, %s", reg, sized)
-	case t.Bits == 32:
-		g.emit("mov %s, %s", narrow[reg][0], sized)
-	default:
-		g.emit("movzx %s, %s", narrow[reg][0], sized)
-	}
+	g.emit("%s", extension(reg, sized, t))
 	g.move(dst, reg)
 }
 
@@ -361,7 +360,7 @@ func (g *Generator) store(fr *frame, in *instr) {
 	if t != nil {
 		width = widths[t.Bits]
 		if isReg(value) {
-			value = narrow[value][map[int]int{8: 2, 16: 1, 32: 0}[t.Bits]]
+			value = narrow[value][subRegister[t.Bits]]
 		}
 	}
 	g.emit("mov %s ptr %s, %s", width, memory, value)

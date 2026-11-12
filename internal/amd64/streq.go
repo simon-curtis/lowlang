@@ -127,7 +127,7 @@ func (g *Generator) compareChunk(c chunk, pointer, text string) {
 func (g *Generator) stringEquality(fr *frame, in *instr) {
 	moves := make([]pmove, len(in.args))
 	for i, a := range in.args {
-		moves[i] = pmove{dst: argRegs[i], src: fr.loc(a)}
+		moves[i] = pmove{dst: abi.args[i], src: fr.loc(a)}
 	}
 	g.parallel(moves)
 	done := g.newLabel()

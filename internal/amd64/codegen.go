@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"lowlang/internal/ir"
-	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
 
@@ -52,7 +51,8 @@ type Output struct {
 }
 
 type Generator struct {
-	os         target.OS
+	platform   Platform
+	plans      map[*ir.CSig]*cPlan
 	text       strings.Builder
 	data       strings.Builder
 	fn         string
@@ -92,28 +92,22 @@ type stackMap struct {
 	segment bool
 }
 
-var argRegs = []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
-
-func stackWords(params int) int {
-	return max(0, params-len(argRegs))
+func newGenerator(platform Platform, table map[string]int, suffix string) *Generator {
+	return &Generator{platform: platform, dataLabels: map[string]bool{}, plans: map[*ir.CSig]*cPlan{}, table: table, suffix: suffix}
 }
 
-func newGenerator(os target.OS, table map[string]int, suffix string) *Generator {
-	return &Generator{os: os, dataLabels: map[string]bool{}, table: table, suffix: suffix}
-}
-
-func (g *Generator) osHeader() string {
-	if g.os == target.Windows {
-		return windowsHeader
+func hotInitMacro(hot bool) string {
+	if hot {
+		return "\t.macro HOT_INIT\n\tcall rt_hot_init\n\t.endm\n"
 	}
-	return linuxHeader
+	return "\t.macro HOT_INIT\n\t.endm\n"
 }
 
-func (g *Generator) osRuntime() string {
-	if g.os == target.Windows {
-		return windowsRuntime
+func bit(on bool) int {
+	if on {
+		return 1
 	}
-	return linuxRuntime
+	return 0
 }
 
 type symbol struct {
@@ -127,8 +121,8 @@ func writeSymbols(out *strings.Builder, symbols []symbol) {
 	}
 }
 
-func Generate(prog *ir.Program, table map[string]int) Output {
-	g := newGenerator(prog.OS, table, "")
+func Generate(prog *ir.Program, platform Platform, table map[string]int) Output {
+	g := newGenerator(platform, table, "")
 	funcs := map[string]string{}
 	for _, f := range prog.Funcs {
 		from := g.text.Len()
@@ -137,24 +131,24 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 	}
 	g.start(prog)
 	if table != nil {
-		g.trampolines(prog.CSymbols)
+		platform.trampolines(g, prog.CSymbols)
 	}
 	for _, f := range prog.Funcs {
 		if f.Callback {
 			g.thunk(f)
 		}
 	}
-	dynamic := 0
-	if len(prog.Libraries) > 0 {
-		dynamic = 1
-		g.libcShims(prog.CSymbols)
+	dynamic := platform.dynamic(prog)
+	if dynamic {
+		platform.shims(g, prog.CSymbols)
 	}
 	var out strings.Builder
 	out.WriteString("\t.intel_syntax noprefix\n")
-	writeSymbols(&out, []symbol{{"RT_DYNAMIC", dynamic}})
+	writeSymbols(&out, []symbol{{"RT_DYNAMIC", bit(dynamic)}})
+	out.WriteString(hotInitMacro(table != nil))
 	out.WriteString(layout)
-	out.WriteString(g.osHeader())
-	out.WriteString(g.osRuntime())
+	out.WriteString(platform.header())
+	out.WriteString(platform.runtime())
 	out.WriteString(scheduler)
 	out.WriteString(runtime)
 	out.WriteString(collector)
@@ -169,9 +163,7 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 		out.WriteString(hotRuntime)
 		g.writeTable(&out)
 	}
-	if g.os == target.Windows {
-		writeImports(&out, prog)
-	}
+	platform.imports(&out, prog)
 	out.WriteString("\n\t.section .rodata\n")
 	out.WriteString(g.data.String())
 	out.WriteString("\n\t.text\n")
@@ -179,8 +171,8 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 	return Output{Asm: out.String(), Funcs: funcs}
 }
 
-func GeneratePatch(prog *ir.Program, names []string, table map[string]int, suffix string) string {
-	g := newGenerator(prog.OS, table, suffix)
+func GeneratePatch(prog *ir.Program, platform Platform, names []string, table map[string]int, suffix string) string {
+	g := newGenerator(platform, table, suffix)
 	for _, f := range prog.Funcs {
 		if slices.Contains(names, f.Name) {
 			g.function(f)
@@ -189,7 +181,7 @@ func GeneratePatch(prog *ir.Program, names []string, table map[string]int, suffi
 	var out strings.Builder
 	out.WriteString("\t.intel_syntax noprefix\n")
 	out.WriteString(layout)
-	out.WriteString(g.osHeader())
+	out.WriteString(platform.header())
 	out.WriteString("\t.text\n")
 	out.WriteString(g.text.String())
 	out.WriteString("\n\t.section .rodata\n")
@@ -265,71 +257,22 @@ func (g *Generator) callTarget(f *ir.Func) string {
 func (g *Generator) start(prog *ir.Program) {
 	g.fn = "start"
 	g.labels = 0
-	dynamic := len(prog.Libraries) > 0
-	switch {
-	case g.os == target.Windows:
-		g.text.WriteString("\t.globl start\nstart:\n")
-		g.emit("xor edi, edi")
-	case dynamic:
-		g.libcStart()
-		g.text.WriteString("\t.globl main\nmain:\n")
-		g.emit("push rbp")
-		g.emit("xor ebp, ebp")
-		g.emit("mov [rip+rt_arg_count], rdi")
-		g.emit("mov [rip+rt_arg_values], rsi")
-		g.emit("mov [rip+rt_env_values], rdx")
-		g.emit("mov rdi, rdx")
-	default:
-		g.text.WriteString("\t.globl _start\n_start:\n")
-		g.emit("mov rax, [rsp]")
-		g.emit("mov [rip+rt_arg_count], rax")
-		g.emit("lea rcx, [rsp+8]")
-		g.emit("mov [rip+rt_arg_values], rcx")
-		g.emit("lea rdi, [rsp+8*rax+16]")
-		g.emit("mov [rip+rt_env_values], rdi")
-	}
-	g.emit("call rt_cpu_init")
-	g.emit("call rt_gc_init")
-	g.emit("call rt_sched_init")
-	if g.table != nil {
-		g.emit("call rt_hot_init")
-	}
-	g.emit("lea rdi, [rip+rt_program]")
-	g.emit("call rt_spawn_main")
-	g.emit("TLS_GET rax, TLS_M")
-	g.emit("mov rsp, [rax+M_G0TOP]")
-	g.emit("jmp rt_schedule")
-	g.program(prog, dynamic)
+	g.emit("PROGRAM_ENTRY %s", g.platform.entry())
+	g.program(prog)
 }
 
-func (g *Generator) libcStart() {
-	g.text.WriteString("\t.globl _start\n_start:\n")
-	g.emit("xor ebp, ebp")
-	g.emit("mov r9, rdx")
-	g.emit("pop rsi")
-	g.emit("mov rdx, rsp")
-	g.emit("and rsp, -16")
-	g.emit("push rax")
-	g.emit("push rsp")
-	g.emit("xor r8d, r8d")
-	g.emit("xor ecx, ecx")
-	g.emit("lea rdi, [rip+main]")
-	g.emit("call qword ptr [rip+__libc_start_main@GOTPCREL]")
-	g.emit("hlt")
-}
-
-func (g *Generator) program(prog *ir.Program, dynamic bool) {
+func (g *Generator) program(prog *ir.Program) {
 	g.text.WriteString("rt_program:\n")
 	g.emit("push rbp")
 	g.emit("mov rbp, rsp")
-	words := prog.Main.ResultWords
+	words := prog.Main.ResultWords()
 	if words > 2 {
 		g.emit("sub rsp, %d", 16*((words+1)/2))
 	}
 	g.emit("call %s", g.callTarget(prog.Main))
 	if prog.MainErr != nil {
 		exit := g.newLabel()
-		tag, variant := resultRegisters[0], resultRegisters[1]
+		tag, variant := abi.results[0], abi.results[1]
 		if words > 2 {
 			tag, variant = "qword ptr [rsp]", "qword ptr [rsp+8]"
 		}
@@ -342,16 +285,7 @@ func (g *Generator) program(prog *ir.Program, dynamic bool) {
 		g.label(exit)
 	}
 	g.emit("xor edi, edi")
-	switch {
-	case g.os == target.Windows:
-		g.emit("call rt_exit")
-		return
-	case dynamic:
-		g.emit("call exit")
-		return
-	}
-	g.emit("mov eax, 231")
-	g.emit("syscall")
+	g.emit("PROGRAM_EXIT")
 }
 
 func (g *Generator) variantNames(enum *types.Type) string {
@@ -452,7 +386,7 @@ func (g *Generator) body(f *ir.Func, symbol, prefix string, vectors bool) {
 		spills, saved = mf.allocate()
 		mode = mf.frameMode(f, saved, vectors)
 	}
-	fr := &frame{gen: g, fn: mf, mode: mode, saved: saved, results: 16 + 8*stackWords(f.ParamWords)}
+	fr := &frame{gen: g, fn: mf, mode: mode, saved: saved, results: abi.resultsOffset(f.ParamWords)}
 	words := len(saved) + spills
 	fr.firstSlot = words + 1
 	for _, n := range f.Slots {
@@ -463,7 +397,7 @@ func (g *Generator) body(f *ir.Func, symbol, prefix string, vectors bool) {
 		words += vectorScratchWords
 		fr.vectorScratch = -8 * words
 	}
-	size := (8*(words+outgoing(f)) + 15) &^ 15
+	size := (8*(words+g.outgoing(f)) + 15) &^ 15
 	fr.size = size
 	g.align(functionAlignment)
 	g.label(symbol)
@@ -505,23 +439,19 @@ func (g *Generator) poll() {
 	g.stubs = append(g.stubs, stub)
 }
 
-func outgoing(f *ir.Func) int {
+func (g *Generator) outgoing(f *ir.Func) int {
 	most := 0
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			switch v.Op {
 			case ir.OpCall:
-				words := stackWords(v.Target.ParamWords)
-				if v.Target.ResultWords > 2 {
-					words += v.Target.ResultWords
+				words := abi.stackWords(v.Target.ParamWords)
+				if v.Target.ResultWords() > 2 {
+					words += v.Target.ResultWords()
 				}
 				most = max(most, words)
 			case ir.OpCCall:
-				words := v.Plan.StackWords
-				if v.Plan.Memory {
-					words += v.Plan.Ret.Size()
-				}
-				most = max(most, words)
+				most = max(most, g.plan(v.Sig).outgoingWords())
 			}
 		}
 	}
@@ -794,7 +724,7 @@ func (g *Generator) ret(fr *frame, mb *mblock) {
 	if len(mb.results) <= 2 {
 		moves := make([]pmove, len(mb.results))
 		for i, r := range mb.results {
-			moves[i] = fr.vectorMove(resultRegisters[i], r)
+			moves[i] = fr.vectorMove(abi.results[i], r)
 		}
 		g.parallel(moves)
 	} else {
@@ -819,7 +749,7 @@ func (g *Generator) ret(fr *frame, mb *mblock) {
 func (g *Generator) enterFrame(fr *frame) {
 	g.emit("push rbp")
 	g.emit("mov rbp, rsp")
-	g.reserve(fr.size)
+	g.platform.reserve(g, fr.size)
 }
 
 func (fr *frame) exitsWithoutFrame(mb *mblock) bool {
@@ -836,6 +766,10 @@ func (g *Generator) epilogue(fr *frame) {
 
 var binops = map[ir.Op]string{
 	ir.OpAdd: "add", ir.OpSub: "sub", ir.OpMul: "imul", ir.OpAnd: "and", ir.OpOr: "or", ir.OpXor: "xor",
+}
+
+var floatOps = map[ir.Op]string{
+	ir.OpAdd: "add", ir.OpSub: "sub", ir.OpMul: "mul", ir.OpDiv: "div",
 }
 
 func (g *Generator) instr(fr *frame, in *instr) {
@@ -857,7 +791,7 @@ func (g *Generator) instr(fr *frame, in *instr) {
 		g.address(fr.loc(in.dst), g.cellAddress(v.Aux))
 	case ir.OpUndef:
 	case ir.OpAdd, ir.OpSub, ir.OpMul:
-		g.arithmetic(fr, in, map[ir.Op]string{ir.OpAdd: "add", ir.OpSub: "sub", ir.OpMul: "mul"}[in.op])
+		g.arithmetic(fr, in)
 	case ir.OpAnd, ir.OpOr, ir.OpXor:
 		if in.rotate != 0 {
 			g.rotate(fr, in)
@@ -1015,9 +949,9 @@ func (g *Generator) params(fr *frame, entry *mblock) {
 			continue
 		}
 		k := int(in.value.Aux)
-		src := fmt.Sprintf("qword ptr [rbp+%d]", 16+8*(k-len(argRegs)))
-		if k < len(argRegs) {
-			src = argRegs[k]
+		src := abi.incoming(k)
+		if reg, ok := abi.argument(k); ok {
+			src = reg
 		}
 		moves = append(moves, pmove{dst: fr.loc(in.dst), src: src})
 	}
@@ -1031,7 +965,7 @@ func (g *Generator) funcAddr(dst string, v *ir.Value) {
 		if !isReg(dst) {
 			reg = "r10"
 		}
-		g.emit("mov %s, %s", reg, g.cSymbolAddress(v.Str))
+		g.emit("mov %s, %s", reg, g.platform.symbolAddress(v.Str))
 		g.move(dst, reg)
 	case v.Aux == ir.ThunkAddr:
 		g.address(dst, fmt.Sprintf("[rip+cb_%s]", mangle(v.Target.Name)))
@@ -1061,11 +995,11 @@ func (g *Generator) call(fr *frame, in *instr) {
 	}
 	for i, a := range args {
 		src := fr.loc(a)
-		if i < len(argRegs) {
-			moves = append(moves, pmove{dst: argRegs[i], src: src})
+		if reg, ok := abi.argument(i); ok {
+			moves = append(moves, pmove{dst: reg, src: src})
 			continue
 		}
-		g.move(fmt.Sprintf("qword ptr [rsp+%d]", 8*(i-len(argRegs))), src)
+		g.move(abi.outgoing(i), src)
 	}
 	g.parallel(moves)
 	g.leaveVectors()
@@ -1162,13 +1096,9 @@ func (g *Generator) writeMaps(out *strings.Builder) {
 	}
 }
 
-var syscallRegs = []string{"rax", "rdi", "rsi", "rdx", "r10", "r8", "r9"}
-
-var growRegs = []string{"rax", "rdx", "r10"}
-
 func (g *Generator) growCall(fr *frame, in *instr) {
-	moves := make([]pmove, len(growRegs))
-	for i, reg := range growRegs {
+	moves := make([]pmove, len(abi.grow))
+	for i, reg := range abi.grow {
 		moves[i] = pmove{dst: reg, src: fr.loc(in.args[i])}
 	}
 	g.parallel(moves)
@@ -1196,7 +1126,7 @@ func (g *Generator) runtimeCall(fr *frame, in *instr) {
 	}
 	moves := make([]pmove, len(in.args))
 	for i, a := range in.args {
-		moves[i] = pmove{dst: argRegs[i], src: fr.loc(a)}
+		moves[i] = pmove{dst: abi.args[i], src: fr.loc(a)}
 	}
 	g.parallel(moves)
 	g.leaveVectors()
@@ -1207,11 +1137,11 @@ func (g *Generator) runtimeCall(fr *frame, in *instr) {
 func (g *Generator) syscallCall(fr *frame, in *instr) {
 	moves := make([]pmove, len(in.args))
 	for i, a := range in.args {
-		moves[i] = pmove{dst: syscallRegs[i], src: fr.loc(a)}
+		moves[i] = pmove{dst: abi.syscall[i], src: fr.loc(a)}
 	}
 	g.parallel(moves)
 	if in.inlineSyscall() {
-		g.syscall()
+		g.platform.syscall(g)
 		return
 	}
 	g.leaveVectors()
@@ -1226,12 +1156,12 @@ func (g *Generator) result(fr *frame, in *instr) {
 	k := int(in.value.Aux)
 	call := in.call
 	if call.Op == ir.OpCCall {
-		g.cResult(fr, in, call.Plan, k)
+		g.cResult(fr, in, g.plan(call.Sig), k)
 		return
 	}
-	if call.Op != ir.OpCall || call.Target.ResultWords <= len(resultRegisters) {
-		g.move(fr.loc(in.dst), resultRegisters[k])
+	if call.Op != ir.OpCall || abi.returnsInRegisters(call.Target.ResultWords()) {
+		g.move(fr.loc(in.dst), abi.results[k])
 		return
 	}
-	g.move(fr.loc(in.dst), fmt.Sprintf("qword ptr [rsp+%d]", 8*(stackWords(call.Target.ParamWords)+k)))
+	g.move(fr.loc(in.dst), abi.stackResult(call.Target.ParamWords, k))
 }

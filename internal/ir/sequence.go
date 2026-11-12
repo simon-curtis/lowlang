@@ -60,7 +60,7 @@ func (b *builder) slicing(e *ast.Slicing) []*Value {
 	if e.Type == types.Str {
 		return []*Value{ptr, n}
 	}
-	return []*Value{ptr, n, n}
+	return sliceOf(ptr, n)
 }
 
 func (b *builder) sliceLit(e *ast.SliceLit) []*Value {
@@ -73,7 +73,7 @@ func (b *builder) sliceLit(e *ast.SliceLit) []*Value {
 func (b *builder) filledSlice(e *ast.SliceLit) []*Value {
 	n := b.constant(int64(len(e.Elems)))
 	if len(e.Elems) == 0 {
-		return []*Value{b.constant(0), n, n}
+		return sliceOf(b.constant(0), n)
 	}
 	elem := e.Type.Elem
 	words := (len(e.Elems)*elem.Stride() + 7) / 8
@@ -81,7 +81,7 @@ func (b *builder) filledSlice(e *ast.SliceLit) []*Value {
 	for i, el := range e.Elems {
 		b.store(place{addr: ptr, offset: i * elem.Stride(), scalar: scalarOf(elem), tail: elem.Tail()}, b.value(el, elem))
 	}
-	return []*Value{ptr, n, n}
+	return sliceOf(ptr, n)
 }
 
 func (b *builder) preludeFunc(name string) *Func {
@@ -124,9 +124,7 @@ func (b *builder) strings(e *ast.Binary) []*Value {
 func (b *builder) serialize(e *ast.Call) {
 	value := b.value(e.Args[0], e.Args[0].TypeOf())
 	writer := b.value(e.Args[1], e.Args[1].TypeOf())
-	zero := b.constant(0)
-	path := b.slot(3)
-	b.store(place{addr: path}, []*Value{zero, zero, zero})
+	path := b.emptySlice()
 	args := append(writer, path)
 	args = append(args, value...)
 	b.invoke(b.funcs[e.Target], args)
@@ -135,7 +133,12 @@ func (b *builder) serialize(e *ast.Call) {
 func (b *builder) make(elem *types.Type, n *Value) []*Value {
 	zero := b.constant(0)
 	bytes := b.emit(OpMul, n, b.constant(int64(elem.Stride())))
-	return []*Value{b.runtime(rtGrow, zero, zero, bytes, b.scan(elem)), n, n}
+	data := b.runtime(rtGrow, zero, zero, bytes, b.scan(elem))
+	return sliceOf(data, n)
+}
+
+func sliceOf(ptr, n *Value) []*Value {
+	return []*Value{ptr, n, n}
 }
 
 func (b *builder) copySlice(e *ast.Call) *Value {
@@ -165,15 +168,10 @@ func (b *builder) forIn(s *ast.ForIn) {
 	counter := b.newTemp()
 	step := b.newTemp()
 	b.writeTemp(counter, []*Value{b.constant(0)})
-	header := b.newBlock()
-	body := b.newBlock()
-	next := b.newBlock()
-	exit := b.newBlock()
-	b.jump(header)
-	b.cur = header
+	loop := b.openLoop()
 	i := b.readTemp(counter, 1)[0]
-	b.branch(b.emit(OpLt, i, seq[1]), body, exit)
-	b.enter(body)
+	b.branch(b.emit(OpLt, i, seq[1]), loop.body, loop.exit)
+	b.enter(loop.body)
 	if s.KeyLocal != nil {
 		b.bind(s.KeyLocal, []*Value{i})
 	}
@@ -187,13 +185,10 @@ func (b *builder) forIn(s *ast.ForIn) {
 		b.bind(s.ValueLocal, b.load(at, elem))
 		b.writeTemp(step, []*Value{b.constant(1)})
 	}
-	b.loopBody(s.Body, next, exit)
-	b.enter(next)
+	b.loopBody(loop, s.Body)
 	advanced := b.emit(OpAdd, b.readTemp(counter, 1)[0], b.readTemp(step, 1)[0])
 	b.writeTemp(counter, []*Value{advanced})
-	b.backEdge(header)
-	b.seal(header)
-	b.enter(exit)
+	b.closeLoop(loop)
 }
 
 func (b *builder) rangeLoop(s *ast.ForIn) {
@@ -205,30 +200,40 @@ func (b *builder) rangeLoop(s *ast.ForIn) {
 	hi := b.word(s.End)
 	counter := b.newTemp()
 	b.writeTemp(counter, []*Value{lo})
-	header := b.newBlock()
-	body := b.newBlock()
-	next := b.newBlock()
-	exit := b.newBlock()
-	b.jump(header)
-	b.cur = header
+	loop := b.openLoop()
 	i := b.readTemp(counter, 1)[0]
-	b.branch(b.typed(OpLt, t, i, hi), body, exit)
-	b.enter(body)
+	b.branch(b.typed(OpLt, t, i, hi), loop.body, loop.exit)
+	b.enter(loop.body)
 	b.bind(s.ValueLocal, []*Value{i})
-	b.loopBody(s.Body, next, exit)
-	b.enter(next)
+	b.loopBody(loop, s.Body)
 	advanced := b.typed(OpAdd, t, b.readTemp(counter, 1)[0], b.constant(1))
 	b.writeTemp(counter, []*Value{advanced})
-	b.backEdge(header)
-	b.seal(header)
-	b.enter(exit)
+	b.closeLoop(loop)
 }
 
-func (b *builder) loopBody(body *ast.Block, next, exit *Block) {
-	b.loops = append(b.loops, loopTarget{cont: next, brk: exit, depth: len(b.defers)})
+type loopBlocks struct {
+	header, body, next, exit *Block
+}
+
+func (b *builder) openLoop() loopBlocks {
+	loop := loopBlocks{header: b.newBlock(), body: b.newBlock(), next: b.newBlock(), exit: b.newBlock()}
+	b.jump(loop.header)
+	b.cur = loop.header
+	return loop
+}
+
+func (b *builder) loopBody(loop loopBlocks, body *ast.Block) {
+	b.loops = append(b.loops, loopTarget{cont: loop.next, brk: loop.exit, depth: len(b.defers)})
 	b.block(body)
 	b.loops = b.loops[:len(b.loops)-1]
-	b.jump(next)
+	b.jump(loop.next)
+	b.enter(loop.next)
+}
+
+func (b *builder) closeLoop(loop loopBlocks) {
+	b.backEdge(loop.header)
+	b.seal(loop.header)
+	b.enter(loop.exit)
 }
 
 func (b *builder) coalesce(e *ast.Binary) []*Value {

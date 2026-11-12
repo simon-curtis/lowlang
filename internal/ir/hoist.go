@@ -20,7 +20,7 @@ func constant(e ast.Expr) bool {
 	case *ast.Ident:
 		return e.Null || e.Variant != nil
 	case *ast.StructLit:
-		if isC(e.Type) {
+		if e.Type.CStruct() {
 			return false
 		}
 		for _, f := range e.Fields {
@@ -71,7 +71,7 @@ func (b *builder) hoistedSlice(e *ast.SliceLit) ([]*Value, bool) {
 	elem := e.Type.Elem
 	count := len(e.Elems)
 	bytes := int64(count * elem.Stride())
-	if !b.hoist || count == 0 || isC(elem) || isVector(elem) || !allConstant(e.Elems) {
+	if !b.hoist || count == 0 || elem.CStruct() || isVector(elem) || !allConstant(e.Elems) {
 		return nil, false
 	}
 	if !e.ReadOnly && bytes < sliceCopyBytes {
@@ -80,11 +80,11 @@ func (b *builder) hoistedSlice(e *ast.SliceLit) ([]*Value, bool) {
 	template := b.template(func() *Value { return b.filledSlice(e)[0] })
 	n := b.constant(int64(count))
 	if e.ReadOnly {
-		return []*Value{template, n, n}, true
+		return sliceOf(template, n), true
 	}
 	size := b.constant(bytes)
 	data := b.runtime(rtGrow, template, size, size, b.scan(elem))
-	return []*Value{data, n, n}, true
+	return sliceOf(data, n), true
 }
 
 func (b *builder) hoistedMap(e *ast.MapLit) ([]*Value, bool) {

@@ -83,7 +83,6 @@ type lowering struct {
 }
 
 func lower(f *ir.Func, prefix string, scalar, wrap bool) *mfunc {
-	splitCriticalEdges(f)
 	l := &lowering{
 		fn:     &mfunc{},
 		vregs:  map[*ir.Value]*vreg{},
@@ -144,8 +143,8 @@ func (c *phiCopy) hint() {
 func (in *instr) hint() {
 	switch {
 	case in.isParam():
-		if k := int(in.value.Aux); k < len(argRegs) {
-			in.dst.hint = argRegs[k]
+		if k := int(in.value.Aux); k < len(abi.args) {
+			in.dst.hint = abi.args[k]
 		}
 	case in.rotate != 0:
 		in.dst.sources = []*vreg{in.args[0]}
@@ -153,12 +152,12 @@ func (in *instr) hint() {
 		in.hintOperands()
 	case in.preservesRegisters(), in.literal != nil:
 	case in.op == ir.OpCall || in.op == ir.OpRuntime || in.op == ir.OpSyscall:
-		args, regs := in.args, argRegs
+		args, regs := in.args, abi.args
 		if in.value.Indirect {
 			args = args[1:]
 		}
 		if in.op == ir.OpSyscall {
-			regs = syscallRegs
+			regs = abi.syscall
 		}
 		for i, a := range args[:min(len(args), len(regs))] {
 			a.hint = regs[i]
@@ -185,36 +184,6 @@ func (in *instr) hintOperands() {
 	default:
 		in.dst.avoid = second
 	}
-}
-
-func splitCriticalEdges(f *ir.Func) {
-	next := 0
-	for _, b := range f.Blocks {
-		next = max(next, b.ID+1)
-	}
-	for _, b := range f.Blocks {
-		if len(b.Preds) < 2 || !hasPhi(b) {
-			continue
-		}
-		for j, pred := range b.Preds {
-			if len(pred.Succs) < 2 {
-				continue
-			}
-			mid := &ir.Block{ID: next, Kind: ir.Plain, Preds: []*ir.Block{pred}, Succs: []*ir.Block{b}}
-			next++
-			f.Blocks = append(f.Blocks, mid)
-			for i, s := range pred.Succs {
-				if s == b {
-					pred.Succs[i] = mid
-				}
-			}
-			b.Preds[j] = mid
-		}
-	}
-}
-
-func hasPhi(b *ir.Block) bool {
-	return len(b.Values) > 0 && b.Values[0].Op == ir.OpPhi
 }
 
 func (l *lowering) vreg(v *ir.Value) *vreg {

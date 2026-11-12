@@ -105,7 +105,7 @@ func (s *inlineSite) cloneValues(b *Block) {
 		c.Str = v.Str
 		c.Runtime = v.Runtime
 		c.Target = v.Target
-		c.Plan = v.Plan
+		c.Sig = v.Sig
 		c.Type = v.Type
 		c.From = v.From
 		c.Scalar = v.Scalar

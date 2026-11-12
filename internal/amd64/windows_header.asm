@@ -124,3 +124,14 @@
 	.macro WIN fn
 	call qword ptr [rip+__imp_\fn]
 	.endm
+
+	.macro PROGRAM_ENTRY entry
+	.globl \entry
+\entry:
+	xor edi, edi
+	PROGRAM_BOOT
+	.endm
+
+	.macro PROGRAM_EXIT
+	call rt_exit
+	.endm

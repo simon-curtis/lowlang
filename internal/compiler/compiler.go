@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"syscall"
 
+	"lowlang/internal/amd64"
 	"lowlang/internal/asm"
 	"lowlang/internal/ast"
 	"lowlang/internal/check"
@@ -26,6 +27,7 @@ import (
 type Unit struct {
 	Files    []*ast.File
 	Types    *types.Universe
+	Platform amd64.Platform
 	Program  *ir.Program
 	Sources  []string
 	Warnings []lint.Warning
@@ -47,7 +49,8 @@ func analyse(path string, platform target.OS, opts ir.Options) (*Unit, error) {
 	if err != nil {
 		return nil, err
 	}
-	unit.Program = ir.Build(unit.Files, platform, opts)
+	unit.Platform = amd64.NewPlatform(platform)
+	unit.Program = ir.Build(unit.Files, opts)
 	return unit, nil
 }
 
@@ -91,8 +94,8 @@ func Assemble(ctx context.Context, asm, object string, flags ...string) error {
 	return tool(ctx, "as", args...)
 }
 
-func Link(ctx context.Context, source, output string, prog *ir.Program) error {
-	windows := prog.OS == target.Windows
+func Link(ctx context.Context, source, output string, unit *Unit) error {
+	windows := unit.Platform.OS() == target.Windows
 	object, err := asm.Assemble(source, asm.Options{AlignBranches: !windows, ClangLayout: windows})
 	if err != nil {
 		return err
@@ -100,7 +103,7 @@ func Link(ctx context.Context, source, output string, prog *ir.Program) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	image, err := linkImage(object, prog)
+	image, err := linkImage(object, unit)
 	if err != nil {
 		return err
 	}
@@ -115,14 +118,14 @@ func Link(ctx context.Context, source, output string, prog *ir.Program) error {
 
 var libraryResolver = link.Resolver{Dirs: link.SystemDirs}
 
-func linkImage(object *asm.Object, prog *ir.Program) ([]byte, error) {
-	if prog.OS == target.Windows {
+func linkImage(object *asm.Object, unit *Unit) ([]byte, error) {
+	if unit.Platform.OS() == target.Windows {
 		return link.PE(object)
 	}
-	if len(prog.Libraries) == 0 {
+	if len(unit.Program.Libraries()) == 0 {
 		return link.Static(object)
 	}
-	resolved, err := libraryResolver.Resolve(prog.Libraries)
+	resolved, err := libraryResolver.Resolve(unit.Program.Libraries())
 	if err != nil {
 		return nil, err
 	}

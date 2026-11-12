@@ -135,10 +135,10 @@ func buildProbe(t *testing.T, source string) string {
 		t.Fatal(err)
 	}
 	host := target.Host()
-	program := ir.Build(files, host, ir.Options{Inline: true})
+	unit := &Unit{Platform: amd64.NewPlatform(host), Program: ir.Build(files, ir.Options{Inline: true})}
 	binary := filepath.Join(t.TempDir(), host.Executable("probe"))
-	asm := amd64.Generate(program, nil).Asm
-	if err := Link(context.Background(), asm, binary, program); err != nil {
+	asm := amd64.Generate(unit.Program, unit.Platform, nil).Asm
+	if err := Link(context.Background(), asm, binary, unit); err != nil {
 		t.Fatal(err)
 	}
 	return binary
