@@ -7,7 +7,6 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 const repository = fileURLToPath(new URL("../", import.meta.url));
-const settle = 10000;
 
 function frame(message) {
     const body = JSON.stringify(message);
@@ -26,6 +25,8 @@ export class Session {
     #pending = new Map();
     #published = new Map();
     #diagnostics = new Map();
+    #failures = [];
+    #lost;
     #next = 1;
     #files = 0;
 
@@ -36,14 +37,23 @@ export class Session {
     async start() {
         this.#directory = await mkdtemp(join(tmpdir(), "low-site-"));
         await run("go", ["build", "-o", this.binary, "./cmd/low"], { cwd: repository });
-        this.#process = spawn(this.binary, ["lsp"], { cwd: this.#directory, stdio: ["pipe", "pipe", "ignore"] });
+        this.#process = spawn(this.binary, ["lsp"], { cwd: this.#directory, stdio: ["pipe", "pipe", "inherit"] });
         this.#process.stdout.on("data", (chunk) => this.#receive(chunk));
+        this.#process.stdin.on("error", (error) => this.#abandon(error));
+        this.#process.on("error", (error) => this.#abandon(error));
+        this.#process.on("exit", (code, signal) => this.#abandon(new Error(`low lsp exited with ${code ?? signal}`)));
         await this.#request("initialize", { processId: process.pid, rootUri: pathToFileURL(this.#directory).href, capabilities: {} });
         this.#notify("initialized", {});
     }
 
+    verify() {
+        if (this.#failures.length > 0) {
+            throw new Error(`${this.#failures.length} snippets fail to check:\n${this.#failures.join("\n")}`);
+        }
+    }
+
     async stop() {
-        if (this.#process) {
+        if (this.#process && !this.#lost) {
             await this.#request("shutdown", null);
             this.#notify("exit", null);
             this.#process.kill();
@@ -53,7 +63,26 @@ export class Session {
         }
     }
 
-    async inspect(program, offsets) {
+    async inspect(program, offsets, label, expected) {
+        let checked;
+        try {
+            checked = await this.#query(program, offsets);
+        } catch (error) {
+            throw new Error(`${label}: ${error.message}`, { cause: error });
+        }
+        const failure = expected === undefined ? checked.errors.join("; ") : this.#mismatch(checked.errors, expected);
+        if (failure) {
+            this.#failures.push(`${label}: ${failure}`);
+        }
+        return checked;
+    }
+
+    #mismatch(errors, expected) {
+        const found = errors.some((message) => message.includes(expected));
+        return found ? "" : `expected an error containing "${expected}", got ${errors.length === 0 ? "none" : errors.join("; ")}`;
+    }
+
+    async #query(program, offsets) {
         this.#files += 1;
         const folder = join(this.#directory, `snippet${this.#files}`);
         for (const file of [{ path: "main.low", text: program.text }, ...program.files]) {
@@ -93,23 +122,41 @@ export class Session {
     }
 
     #await(uri) {
-        return new Promise((resolve) => {
-            const timer = setTimeout(resolve, settle);
-            this.#published.set(uri, () => {
-                clearTimeout(timer);
-                resolve();
-            });
+        return new Promise((resolve, reject) => {
+            if (this.#lost) {
+                reject(this.#lost);
+                return;
+            }
+            this.#published.set(uri, { resolve, reject });
         });
     }
 
     #notify(method, params) {
-        this.#process.stdin.write(frame({ jsonrpc: "2.0", method, params }));
+        if (!this.#lost) {
+            this.#process.stdin.write(frame({ jsonrpc: "2.0", method, params }));
+        }
+    }
+
+    #abandon(error) {
+        if (this.#lost) {
+            return;
+        }
+        this.#lost = error;
+        for (const { reject } of [...this.#pending.values(), ...this.#published.values()]) {
+            reject(error);
+        }
+        this.#pending.clear();
+        this.#published.clear();
     }
 
     #request(method, params) {
         const id = this.#next;
         this.#next += 1;
         return new Promise((resolve, reject) => {
+            if (this.#lost) {
+                reject(this.#lost);
+                return;
+            }
             this.#pending.set(id, { resolve, reject });
             this.#process.stdin.write(frame({ jsonrpc: "2.0", id, method, params }));
         });
@@ -136,7 +183,7 @@ export class Session {
     #dispatch(message) {
         if (message.method === "textDocument/publishDiagnostics") {
             this.#diagnostics.set(message.params.uri, message.params.diagnostics);
-            this.#published.get(message.params.uri)?.();
+            this.#published.get(message.params.uri)?.resolve();
             this.#published.delete(message.params.uri);
         } else if (message.id !== undefined && this.#pending.has(message.id)) {
             const { resolve, reject } = this.#pending.get(message.id);

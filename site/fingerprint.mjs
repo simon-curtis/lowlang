@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { readdir, readFile, writeFile } from "node:fs/promises";
+import { outputs } from "./config.mjs";
 
 const site = new URL("./", import.meta.url);
-const folders = ["", "docs/", "packages/"];
 const reference = /\b(href|src)="(\/|(?:\.\.\/)*)([\w.-]+\.(?:css|js))(?:\?v=\w+)?"/g;
 
 class Fingerprints {
@@ -33,7 +33,7 @@ class Fingerprints {
 
 const fingerprints = new Fingerprints();
 let pages = 0;
-for (const folder of folders) {
+for (const folder of outputs) {
     const directory = new URL(folder, site);
     const files = await readdir(directory);
     for (const file of files.filter((name) => name.endsWith(".html"))) {

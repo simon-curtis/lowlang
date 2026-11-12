@@ -73,10 +73,18 @@ const prefixes = [
     ["std/testing", ["testing"]],
 ];
 
+function covers(prefix, path) {
+    return path === prefix || path.startsWith(`${prefix}/`);
+}
+
 export function categories(path) {
-    const matches = prefixes.filter(([prefix]) => path === prefix || path.startsWith(`${prefix}/`));
+    const matches = prefixes.filter(([prefix]) => covers(prefix, path));
     const best = matches.sort(([a], [b]) => b.length - a.length)[0];
     return best ? best[1] : [];
+}
+
+export function orphaned(paths) {
+    return prefixes.map(([prefix]) => prefix).filter((prefix) => !paths.some((path) => covers(prefix, path)));
 }
 
 export function all(paths) {

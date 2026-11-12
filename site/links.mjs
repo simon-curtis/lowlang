@@ -1,3 +1,4 @@
+import { folders } from "./config.mjs";
 import { words } from "./highlight.mjs";
 
 const located = /(?<=\/)(std(?:\/\w+)*)\/(\w+\.low)$/;
@@ -26,7 +27,7 @@ export class Library {
             return undefined;
         }
         const enclosing = module.items.filter((item) => item.file === name && item.line <= line + 1).reduce((best, item) => (best && best.line >= item.line ? best : item), undefined);
-        return enclosing ? `packages/${file(path)}#${anchor(enclosing)}` : `packages/${file(path)}`;
+        return enclosing ? `${folders.packages}${file(path)}#${anchor(enclosing)}` : `${folders.packages}${file(path)}`;
     }
 
     builtin(name) {

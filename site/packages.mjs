@@ -2,23 +2,20 @@ import { execFile } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { Marked } from "marked";
-import { all, categories } from "./categories.mjs";
+import { all, categories, orphaned } from "./categories.mjs";
+import { compilerSource, folders } from "./config.mjs";
 import { codespan, escape, low, words } from "./highlight.mjs";
 import { layout } from "./layout.mjs";
 import { anchor, file, Linker } from "./links.mjs";
+import { isLow, unescape } from "./markup.mjs";
 import { Program } from "./program.mjs";
 
 const run = promisify(execFile);
 const repository = new URL("../", import.meta.url);
-const output = new URL("packages/", import.meta.url);
-const source = "https://github.com/simon-curtis/lowlang/blob/main/internal/compiler";
+const output = new URL(folders.packages, import.meta.url);
 const row = /^\| `(std[\w/]*)` \| (.*) \|$/gm;
 const github = '<svg class="size-5" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
 const markdown = new Marked({ renderer: { codespan } });
-
-function lowly(lang) {
-    return lang === undefined || lang === "" || lang === "low";
-}
 
 const comment = /^( *)\/\/\/ ?(.*)$/;
 
@@ -43,11 +40,17 @@ function note(indent, lines) {
 }
 
 function plain(html) {
-    return html.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    return unescape(html.replace(/<[^>]+>/g, ""));
 }
 
 function summary(text, limit) {
     return text.length <= limit ? text : `${text.slice(0, text.lastIndexOf(" ", limit))}…`;
+}
+
+function members(module) {
+    const types = module.items.filter((item) => item.kind !== "fn");
+    const functions = module.items.filter((item) => item.kind === "fn" && !item.receiver);
+    return { types, functions };
 }
 
 function tags(path) {
@@ -68,6 +71,8 @@ class Page {
     #module;
     #description;
     #types;
+    #functions;
+    #typeNames;
     #exports;
     #library;
     #markdown;
@@ -75,7 +80,10 @@ class Page {
     constructor(module, description, exports, examples, library) {
         this.#module = module;
         this.#description = description;
-        this.#types = new Set(module.items.filter((item) => item.kind !== "fn").map((item) => item.name));
+        const { types, functions } = members(module);
+        this.#types = types;
+        this.#functions = functions;
+        this.#typeNames = new Set(types.map((item) => item.name));
         this.#exports = exports;
         this.#library = library;
         const linker = new Linker(library, "../");
@@ -83,7 +91,7 @@ class Page {
             renderer: {
                 code({ text, lang }) {
                     const checked = examples.get(text);
-                    const body = lowly(lang) ? low(text, checked && linker.facts(checked, text)) : escape(text);
+                    const body = isLow(lang) ? low(text, checked && linker.facts(checked, text)) : escape(text);
                     return `<pre><code>${body}</code></pre>\n`;
                 },
                 codespan,
@@ -92,7 +100,7 @@ class Page {
     }
 
     get path() {
-        return `packages/${file(this.#module.path)}`;
+        return `${folders.packages}${file(this.#module.path)}`;
     }
 
     #external(alias, name, whole) {
@@ -104,7 +112,7 @@ class Page {
     }
 
     #type(name, whole) {
-        if (this.#types.has(name)) {
+        if (this.#typeNames.has(name)) {
             return `<a class="t" href="#${name}">${name}</a>`;
         }
         const builtin = this.#library.builtin(name);
@@ -122,7 +130,7 @@ class Page {
 
     #item(item, depth) {
         const id = anchor(item);
-        const link = `${source}/${this.#module.path}/${item.file}#L${item.line}`;
+        const link = `${compilerSource}/${this.#module.path}/${item.file}#L${item.line}`;
         const where = `${item.file}:${item.line}`;
         const view = `<a class="-m-3 shrink-0 p-3 no-underline opacity-60 hover:opacity-100" href="${link}" title="${escape(where)}" aria-label="${escape(where)} on GitHub">${github}</a>`;
         const heading = `<h${depth} id="${id}" class="flex items-center justify-between gap-4"><a href="#${id}">${escape(item.name)}</a>${view}</h${depth}>\n`;
@@ -135,8 +143,6 @@ class Page {
     }
 
     body() {
-        const types = this.#module.items.filter((item) => item.kind !== "fn");
-        const functions = this.#module.items.filter((item) => item.kind === "fn" && !item.receiver);
         const parts = [`<p>${tags(this.#module.path)}</p>\n`, `<pre><code>${low(`import ${this.#module.path}`)}</code></pre>\n`];
         if (this.#description) {
             parts.push(`<p>${this.#description}</p>\n`);
@@ -146,26 +152,24 @@ class Page {
             const links = paths.map((path) => `<a href="${file(path)}"><code>${path}</code></a>`);
             parts.push(`<p>Imports ${links.join(", ")}.</p>\n`);
         }
-        if (types.length > 0) {
+        if (this.#types.length > 0) {
             parts.push('<h2 id="types"><a href="#types">Types</a></h2>\n');
-            parts.push(...types.map((type) => `${this.#item(type, 3)}${this.#methods(type)}`));
+            parts.push(...this.#types.map((type) => `${this.#item(type, 3)}${this.#methods(type)}`));
         }
-        if (functions.length > 0) {
+        if (this.#functions.length > 0) {
             parts.push('<h2 id="functions"><a href="#functions">Functions</a></h2>\n');
-            parts.push(...functions.map((item) => this.#item(item, 3)));
+            parts.push(...this.#functions.map((item) => this.#item(item, 3)));
         }
         return parts.join("");
     }
 
     sidebar() {
-        const types = this.#module.items.filter((item) => item.kind !== "fn");
-        const functions = this.#module.items.filter((item) => item.kind === "fn" && !item.receiver);
         const groups = [];
-        if (types.length > 0) {
-            groups.push(`<p class="mb-2 text-sm font-semibold uppercase tracking-wide">Types</p>\n${sidebarList(types)}`);
+        if (this.#types.length > 0) {
+            groups.push(`<p class="mb-2 text-sm font-semibold uppercase tracking-wide">Types</p>\n${sidebarList(this.#types)}`);
         }
-        if (functions.length > 0) {
-            groups.push(`<p class="mb-2 text-sm font-semibold uppercase tracking-wide">Functions</p>\n${sidebarList(functions)}`);
+        if (this.#functions.length > 0) {
+            groups.push(`<p class="mb-2 text-sm font-semibold uppercase tracking-wide">Functions</p>\n${sidebarList(this.#functions)}`);
         }
         const back = '<p class="font-bold"><a class="hover:underline hover:underline-offset-4" href="index.html">← std</a></p>';
         return `<div class="space-y-8">\n${back}\n${groups.join("\n")}\n</div>`;
@@ -197,7 +201,7 @@ ${rows.join("\n")}
 </ul>
 `;
     const sidebar = '<ul class="sidelist">\n<li><a class="font-bold underline underline-offset-4" aria-current="page" href="index.html">std</a></li>\n</ul>';
-    return layout({ path: "packages/index.html", heading: "std", title: "Low packages", description: `The Low standard library: ${modules.length} modules.`, current: "Packages", sidebar, body, scripts: ["filter.js"] });
+    return layout({ path: `${folders.packages}index.html`, heading: "std", title: "Low packages", description: `The Low standard library: ${modules.length} modules.`, current: "Packages", sidebar, body, scripts: ["filter.js"] });
 }
 
 export async function standard(binary) {
@@ -210,20 +214,15 @@ function imports(text, path) {
 }
 
 async function inspect(module, examples, session) {
-    const unchecked = [];
     for (const item of module.items) {
-        const blocks = new Marked().lexer(item.doc ?? "").filter((token) => token.type === "code" && lowly(token.lang) && !examples.has(token.text));
+        const blocks = new Marked().lexer(item.doc ?? "").filter((token) => token.type === "code" && isLow(token.lang) && !examples.has(token.text));
         for (const block of blocks) {
             const preludes = imports(block.text, module.path) ? [] : [{ path: "", text: `import ${module.path}` }];
             const program = new Program(block.text, preludes);
-            const checked = await session.inspect(program, words(block.text));
+            const checked = await session.inspect(program, words(block.text), `${module.path} ${anchor(item)}`);
             examples.set(block.text, checked);
-            if (checked.errors.length > 0) {
-                unchecked.push(`${module.path} ${anchor(item)}: ${checked.errors.join("; ")}`);
-            }
         }
     }
-    return unchecked;
 }
 
 export async function packages(modules, session, library) {
@@ -231,17 +230,16 @@ export async function packages(modules, session, library) {
     if (uncategorised.length > 0) {
         throw new Error(`packages without a category: ${uncategorised.join(", ")}`);
     }
-    const examples = new Map();
-    const unchecked = [];
-    for (const module of modules) {
-        const failures = await inspect(module, examples, session);
-        unchecked.push(...failures);
+    const orphans = orphaned(modules.map((module) => module.path));
+    if (orphans.length > 0) {
+        throw new Error(`categories for packages that do not exist: ${orphans.join(", ")}`);
     }
-    if (unchecked.length > 0) {
-        throw new Error(`std doc examples fail to check: ${unchecked.join(", ")}`);
+    const examples = new Map();
+    for (const module of modules) {
+        await inspect(module, examples, session);
     }
     const about = await descriptions();
-    const exports = new Map(modules.map((module) => [module.path, new Set(module.items.filter((item) => item.kind !== "fn").map((item) => item.name))]));
+    const exports = new Map(modules.map((module) => [module.path, new Set(members(module).types.map((item) => item.name))]));
     await rm(output, { recursive: true, force: true });
     await mkdir(output);
     await writeFile(new URL("index.html", output), index(modules, about));

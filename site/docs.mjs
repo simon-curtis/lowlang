@@ -1,12 +1,14 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { Marked } from "marked";
 import { codespan, escape, low, words } from "./highlight.mjs";
+import { folders } from "./config.mjs";
 import { Program } from "./program.mjs";
 import { layout } from "./layout.mjs";
 import { Linker } from "./links.mjs";
+import { isLow } from "./markup.mjs";
 
 const repository = new URL("../", import.meta.url);
-const output = new URL("docs/", import.meta.url);
+const output = new URL(folders.docs, import.meta.url);
 const hidden = /^<!-- prelude ?(\S*)\n([\s\S]*?)\n?-->/;
 
 function slug(text) {
@@ -47,7 +49,7 @@ function render(page, facts, library) {
                 return hidden.test(text) ? "" : text;
             },
             code({ text, lang }) {
-                const body = lang === "low" ? low(text, linker.facts(facts.get(text), text)) : escape(text);
+                const body = isLow(lang) ? low(text, linker.facts(facts.get(text), text)) : escape(text);
                 return `<pre><code>${body}</code></pre>\n`;
             },
             codespan,
@@ -75,7 +77,7 @@ function document(page, pages) {
     });
     const sidebar = `<ul class="sidelist">\n${items.join("\n")}\n</ul>`;
     const title = page.file === "index.html" ? "Low documentation" : `${page.title}: Low documentation`;
-    return layout({ path: `docs/${page.file}`, heading: page.title, title, description: page.description, current: "Docs", sidebar, body: page.body });
+    return layout({ path: `${folders.docs}${page.file}`, heading: page.title, title, description: page.description, current: "Docs", sidebar, body: page.body });
 }
 
 async function read(path) {
@@ -85,27 +87,24 @@ async function read(path) {
 
 async function inspect(pages, session) {
     const facts = new Map();
-    const unchecked = [];
     for (const page of pages) {
         let preludes = [];
         for (const token of page.tokens) {
             const found = token.type === "html" ? hidden.exec(token.text) : null;
             if (found) {
                 preludes.push({ path: found[1], text: found[2] });
-            } else if (token.type === "code" && token.lang === "low" && !facts.has(token.text)) {
+            } else if (token.type === "code" && isLow(token.lang) && !facts.has(token.text)) {
                 const program = new Program(token.text, preludes);
-                const checked = await session.inspect(program, words(token.text));
+                const label = `${page.title}: ${token.text.split("\n")[0]}`;
+                const checked = await session.inspect(program, words(token.text), label);
                 facts.set(token.text, checked);
-                if (checked.errors.length > 0) {
-                    unchecked.push(`${page.title}: ${token.text.split("\n")[0]}: ${checked.errors.join("; ")}`);
-                }
                 preludes = [];
             } else if (token.type !== "space") {
                 preludes = [];
             }
         }
     }
-    return { facts, unchecked };
+    return facts;
 }
 
 function named(text) {
@@ -118,7 +117,7 @@ export async function builtins() {
     if (!chapter) {
         throw new Error("docs/design.md has no Builtins chapter");
     }
-    const page = `docs/${slug(chapter.title)}.html`;
+    const page = `${folders.docs}${slug(chapter.title)}.html`;
     const entries = new Map();
     let section = "";
     for (const token of chapter.tokens) {
@@ -142,7 +141,7 @@ export async function docs(session, library) {
     const editor = { title: "Editors", depth: 1, tokens: editors.filter((token) => token.type !== "heading" || token.depth !== 1), file: "editors.html" };
     const home = { title: "Documentation", depth: 1, tokens: preamble(design), file: "index.html" };
     const pages = [home, ...chapters, editor];
-    const { facts, unchecked } = await inspect(pages, session);
+    const facts = await inspect(pages, session);
     for (const page of pages) {
         const lead = page.tokens.find((token) => token.type === "paragraph");
         page.description = lead ? plain(lead.tokens).slice(0, 200) : `${page.title} in the Low documentation.`;
@@ -155,5 +154,5 @@ export async function docs(session, library) {
         const html = document(page, pages);
         await writeFile(new URL(page.file, output), html);
     }
-    return { pages: pages.length, unchecked };
+    return pages.length;
 }

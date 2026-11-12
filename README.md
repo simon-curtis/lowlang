@@ -103,17 +103,20 @@ python3 ../assets/brand/build.py
 `npm run build`:
 
 - builds the compiler and starts `low lsp`;
+- renders `site/content/index.html` and `404.html` into `site/index.html` and `site/404.html`, wrapping each in the head, masthead and scripts from `site/layout.mjs`; `site/pages.mjs` lists each page's title and description, and `{{origin}}` and `{{repository}}` in the content expand to the URLs in `site/config.mjs`;
 - renders `docs/design.md` and `editors/README.md` into `site/docs/`;
 - renders the standard library from `low doc std` into `site/packages/`, one page per module, with each module's description from the table in `docs/design.md`;
 - highlights every Low snippet, including the examples in std doc comments, with hover text and references from the LSP, and links each name to its definition: a declaration in the same snippet, an item in `site/packages/`, or the builtin's entry in the `## Builtins` chapter of `docs/design.md`;
 - writes `style.css` from `tailwind.css`;
-- appends a content hash to every stylesheet and script reference in the pages, as `style.css?v=…`, so a browser never pairs a new page with a cached old asset.
+- appends a content hash to every stylesheet and script reference in the pages of every output folder in `site/config.mjs`, as `style.css?v=…`, so a browser never pairs a new page with a cached old asset.
 
 `build.py` regenerates the icons, social images and web manifest from the mark. It needs `rsvg-convert`, `magick` and Noto Sans.
 
 ### Checked snippets
 
-The LSP checks each Low snippet in the docs and each `low` example in a std doc comment as a program: declarations stay at the top level and loose statements go inside `fn main()`, and `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. A std example that does not import its own module checks with that import added. The build lists every snippet that fails to check and then fails.
+The LSP checks each Low snippet as a program: every `low` fence in the docs and in a std doc comment, and every `data-lang="low"` block in `site/content/`. Declarations stay at the top level and loose statements go inside `fn main()`, and `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. A std example that does not import its own module checks with that import added. The build lists every snippet that fails to check and then fails; it also fails, naming the snippet, if the language server exits before answering. It fails when a prefix in `site/categories.mjs` names no module.
+
+A block in `site/content/` that shows a compile error carries `data-error="text"`; the build requires the snippet to fail with an error containing that text, and removes the attribute from the page.
 
 HTML comments directly above a block supply context readers do not see:
 
