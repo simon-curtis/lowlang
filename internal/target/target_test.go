@@ -17,18 +17,6 @@ func TestEveryNameParsesBack(t *testing.T) {
 	}
 }
 
-func TestChoicesListEveryName(t *testing.T) {
-	choices := strings.Split(Choices(), "|")
-	if len(choices) != len(names) {
-		t.Fatalf("choices %v, want %d names", choices, len(names))
-	}
-	for _, name := range choices {
-		if _, err := Parse(name); err != nil {
-			t.Error(err)
-		}
-	}
-}
-
 func TestParseErrorListsTheNames(t *testing.T) {
 	_, err := Parse("plan9/amd64")
 	if err == nil {

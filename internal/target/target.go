@@ -13,32 +13,38 @@ const (
 	Windows
 )
 
-var all = []OS{Linux, Windows}
+type descriptor struct {
+	os     OS
+	name   string
+	suffix string
+	exe    string
+}
 
-var names = map[OS]string{
-	Linux:   "linux/amd64",
-	Windows: "windows/amd64",
+var targets = []descriptor{
+	{Linux, "linux/amd64", "_linux.low", ""},
+	{Windows, "windows/amd64", "_windows.low", ".exe"},
 }
 
 func (o OS) String() string {
-	return names[o]
+	return o.entry().name
+}
+
+func (o OS) entry() descriptor {
+	for _, t := range targets {
+		if t.os == o {
+			return t
+		}
+	}
+	return descriptor{}
 }
 
 func (o OS) Executable(name string) string {
-	if o == Windows {
-		return fmt.Sprintf("%s.exe", name)
-	}
-	return name
-}
-
-var fileSuffixes = map[OS]string{
-	Linux:   "_linux.low",
-	Windows: "_windows.low",
+	return fmt.Sprintf("%s%s", name, o.entry().exe)
 }
 
 func (o OS) Builds(file string) bool {
-	for other, suffix := range fileSuffixes {
-		if other != o && strings.HasSuffix(file, suffix) {
+	for _, t := range targets {
+		if t.os != o && strings.HasSuffix(file, t.suffix) {
 			return false
 		}
 	}
@@ -46,9 +52,9 @@ func (o OS) Builds(file string) bool {
 }
 
 func Names() []string {
-	out := make([]string, len(all))
-	for i, o := range all {
-		out[i] = o.String()
+	out := make([]string, len(targets))
+	for i, t := range targets {
+		out[i] = t.name
 	}
 	return out
 }
@@ -58,9 +64,9 @@ func Choices() string {
 }
 
 func Parse(name string) (OS, error) {
-	for _, o := range all {
-		if o.String() == name {
-			return o, nil
+	for _, t := range targets {
+		if t.name == name {
+			return t.os, nil
 		}
 	}
 	return Linux, fmt.Errorf("unknown target %q; expected %s", name, strings.Join(Names(), " or "))
