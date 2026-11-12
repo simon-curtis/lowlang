@@ -46,7 +46,7 @@ func (b *builder) assignEntry(s *ast.Assign) {
 	m := entry.X.TypeOf()
 	value := b.value(s.Value, m.Elem)
 	table := b.word(entry.X)
-	key := append([]*Value{table}, b.value(entry.Index, m.Key)...)
+	key := b.withKey(table, entry.Index, m)
 	if op, ok := arith[s.Op.Operator()]; ok {
 		current := b.mapCall(prelude.MapGet, m, key...)
 		old := b.present(current)

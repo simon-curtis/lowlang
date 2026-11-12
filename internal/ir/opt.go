@@ -750,8 +750,12 @@ func removeEdge(from, to *Block, occurrence int) {
 		next := slices.Index(to.Preds[i+1:], from)
 		i += next + 1
 	}
-	to.Preds = slices.Delete(to.Preds, i, i+1)
-	for _, v := range to.Values {
+	to.removePred(i)
+}
+
+func (b *Block) removePred(i int) {
+	b.Preds = slices.Delete(b.Preds, i, i+1)
+	for _, v := range b.Values {
 		if v.Op == OpPhi {
 			v.Args = slices.Delete(v.Args, i, i+1)
 		}

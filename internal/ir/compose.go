@@ -115,14 +115,6 @@ func (b *builder) composedSize(pieces []piece) *Value {
 	return total
 }
 
-func (b *builder) interpolate(e *ast.Interp) []*Value {
-	return b.compose(flatten(e, nil, nil, nil))
-}
-
-func (b *builder) concatenate(e *ast.Binary) []*Value {
-	return b.compose(flatten(e, nil, nil, nil))
-}
-
 func (b *builder) compose(parts []segment) []*Value {
 	pieces := b.pieces(parts)
 	total := b.composedSize(pieces)

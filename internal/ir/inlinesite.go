@@ -52,30 +52,12 @@ func (s *inlineSite) splitHead() {
 	position := slices.Index(head.Values, s.call)
 	s.tail = s.caller.newBlock()
 	tail := s.tail
-	tail.Kind = head.Kind
-	tail.Control = head.Control
-	tail.Table = head.Table
-	tail.Results = head.Results
-	tail.Poll = head.Poll
-	tail.Succs = head.Succs
+	head.moveTerminator(tail)
 	tail.Values = slices.Clone(head.Values[position+1:])
 	for _, v := range tail.Values {
 		v.Block = tail
 	}
-	for _, succ := range tail.Succs {
-		for i, p := range succ.Preds {
-			if p == head {
-				succ.Preds[i] = tail
-			}
-		}
-	}
 	head.Values = head.Values[:position]
-	head.Kind = Plain
-	head.Control = nil
-	head.Table = nil
-	head.Results = nil
-	head.Poll = false
-	head.Succs = nil
 }
 
 func (s *inlineSite) cloneCallee() {
@@ -125,29 +107,15 @@ func (s *inlineSite) cloneBlock(b *Block) {
 			c.Args[i] = s.mapValue(a)
 		}
 	}
-	clone.Kind = b.Kind
-	clone.Table = b.Table
-	clone.Poll = b.Poll
-	if b.Control != nil {
-		clone.Control = s.mapValue(b.Control)
-	}
-	for _, p := range b.Preds {
-		clone.Preds = append(clone.Preds, s.blocks[p.ID])
-	}
-	for _, succ := range b.Succs {
-		clone.Succs = append(clone.Succs, s.blocks[succ.ID])
-	}
+	clone.copyTerminator(b, s.mapValue, func(o *Block) *Block { return s.blocks[o.ID] })
 	if b.Kind == Ret {
-		s.makeReturn(b, clone)
+		s.makeReturn(clone)
 	}
 }
 
-func (s *inlineSite) makeReturn(b, clone *Block) {
+func (s *inlineSite) makeReturn(clone *Block) {
 	clone.Kind = Plain
 	clone.Succs = []*Block{s.tail}
-	for _, r := range b.Results {
-		clone.Results = append(clone.Results, s.mapValue(r))
-	}
 	s.returns = append(s.returns, clone)
 }
 

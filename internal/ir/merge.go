@@ -32,21 +32,50 @@ func absorb(b, next *Block) {
 		v.Block = b
 	}
 	b.Values = append(b.Values, next.Values...)
-	b.Kind = next.Kind
-	b.Control = next.Control
-	b.Table = next.Table
-	b.Results = next.Results
-	b.Poll = b.Poll || next.Poll
-	b.Succs = next.Succs
-	for _, succ := range b.Succs {
+	polls := b.Poll
+	next.moveTerminator(b)
+	b.Poll = b.Poll || polls
+	next.merged = true
+	next.Values = nil
+	next.Preds = nil
+}
+
+func (b *Block) moveTerminator(to *Block) {
+	to.Kind = b.Kind
+	to.Control = b.Control
+	to.Table = b.Table
+	to.Results = b.Results
+	to.Poll = b.Poll
+	to.Succs = b.Succs
+	for _, succ := range to.Succs {
 		for i, p := range succ.Preds {
-			if p == next {
-				succ.Preds[i] = b
+			if p == b {
+				succ.Preds[i] = to
 			}
 		}
 	}
-	next.merged = true
-	next.Values = nil
-	next.Succs = nil
-	next.Preds = nil
+	b.Kind = Plain
+	b.Control = nil
+	b.Table = nil
+	b.Results = nil
+	b.Poll = false
+	b.Succs = nil
+}
+
+func (b *Block) copyTerminator(from *Block, value func(*Value) *Value, block func(*Block) *Block) {
+	b.Kind = from.Kind
+	b.Table = from.Table
+	b.Poll = from.Poll
+	if from.Control != nil {
+		b.Control = value(from.Control)
+	}
+	for _, r := range from.Results {
+		b.Results = append(b.Results, value(r))
+	}
+	for _, p := range from.Preds {
+		b.Preds = append(b.Preds, block(p))
+	}
+	for _, succ := range from.Succs {
+		b.Succs = append(b.Succs, block(succ))
+	}
 }

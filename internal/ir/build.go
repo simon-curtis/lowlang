@@ -758,7 +758,7 @@ func (b *builder) expr(e ast.Expr) []*Value {
 	case *ast.MapLit:
 		return b.mapLit(e)
 	case *ast.Interp:
-		return b.interpolate(e)
+		return b.compose(flatten(e, nil, nil, nil))
 	case *ast.Ident:
 		if e.Variant != nil {
 			return b.construct(e.Type, e.Variant, nil)

@@ -76,10 +76,5 @@ func redirect(b *Block, i int, target *Block) {
 	}
 	target.Preds = append(target.Preds, pred)
 	pred.Succs[slices.Index(pred.Succs, b)] = target
-	b.Preds = slices.Delete(b.Preds, i, i+1)
-	for _, v := range b.Values {
-		if v.Op == OpPhi {
-			v.Args = slices.Delete(v.Args, i, i+1)
-		}
-	}
+	b.removePred(i)
 }

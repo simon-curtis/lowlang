@@ -106,7 +106,7 @@ func (b *builder) preludeField(fn, name string) *types.Field {
 
 func (b *builder) strings(e *ast.Binary) []*Value {
 	if e.Op == lexer.Plus {
-		return b.concatenate(e)
+		return b.compose(flatten(e, nil, nil, nil))
 	}
 	x := b.value(e.X, types.Str)
 	y := b.value(e.Y, types.Str)

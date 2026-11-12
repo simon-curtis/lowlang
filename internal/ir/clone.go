@@ -18,7 +18,7 @@ func cloneFunc(f *Func) *funcClone {
 	duplicate.Blocks = nil
 	c.fn = &duplicate
 	for _, b := range f.Blocks {
-		c.blocks[b] = &Block{ID: b.ID, Kind: b.Kind, Table: b.Table, Poll: b.Poll}
+		c.blocks[b] = &Block{ID: b.ID}
 		duplicate.Blocks = append(duplicate.Blocks, c.blocks[b])
 	}
 	for _, b := range f.Blocks {
@@ -57,16 +57,5 @@ func (c *funcClone) connect(b *Block) {
 		}
 		v.Args = args
 	}
-	if b.Control != nil {
-		target.Control = c.mapped(b.Control)
-	}
-	for _, r := range b.Results {
-		target.Results = append(target.Results, c.mapped(r))
-	}
-	for _, p := range b.Preds {
-		target.Preds = append(target.Preds, c.blocks[p])
-	}
-	for _, s := range b.Succs {
-		target.Succs = append(target.Succs, c.blocks[s])
-	}
+	target.copyTerminator(b, c.mapped, func(o *Block) *Block { return c.blocks[o] })
 }
