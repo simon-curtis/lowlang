@@ -1,19 +1,38 @@
-const copied = 1500;
+const shown = 1500;
 
-async function copy(button) {
-    try {
-        await navigator.clipboard.writeText(button.dataset.copy);
-        button.textContent = "Copied";
-    } catch {
-        const command = button.previousElementSibling.querySelector("b");
-        getSelection().selectAllChildren(command);
-        button.textContent = "Selected";
+class CopyButton {
+    #button;
+    #status;
+    #reset;
+
+    constructor(button) {
+        this.#button = button;
+        this.#status = button.querySelector("[role=status]");
+        button.addEventListener("click", () => this.copy());
     }
-    setTimeout(() => {
-        button.textContent = "Copy";
-    }, copied);
+
+    async copy() {
+        try {
+            await navigator.clipboard.writeText(this.#button.dataset.copy);
+            this.#show("copied", "Copied");
+        } catch {
+            const command = this.#button.previousElementSibling.querySelector("b");
+            getSelection().selectAllChildren(command);
+            this.#show("selected", "Selected");
+        }
+    }
+
+    #show(state, message) {
+        clearTimeout(this.#reset);
+        this.#button.dataset.state = state;
+        this.#status.textContent = message;
+        this.#reset = setTimeout(() => {
+            delete this.#button.dataset.state;
+            this.#status.textContent = "";
+        }, shown);
+    }
 }
 
 for (const button of document.querySelectorAll(".copy")) {
-    button.addEventListener("click", () => copy(button));
+    new CopyButton(button);
 }
