@@ -1,110 +1,22 @@
+import std/file
 import std/io
 import std/path
+import std/sys
 import std/text
-
-/// The kind of filesystem object a `Stat` describes.
-pub enum Kind {
-    /// No object exists at the path.
-    ///
-    /// `lstat` reports a missing path as `NotFound`, so it never returns this variant.
-    Missing
-    /// A regular file.
-    File
-    /// A directory.
-    Dir
-    /// A symbolic link.
-    Symlink
-    /// Any other object, such as a device, pipe or socket.
-    Other
-}
-
-/// The kind, size, permission bits, owner and modification time of a path, as returned by `lstat`.
-pub struct Stat {
-    /// The kind of object, taken from the file type bits of the mode.
-    pub kind: Kind
-    /// The size in bytes as the kernel reports it; for a symbolic link, the length of its target.
-    pub size: i64
-    /// The permission bits, including setuid, setgid and sticky: the low 12 bits of the mode, without the file type.
-    pub mode: i64
-    /// The numeric id of the owning user.
-    pub uid: i64
-    /// The numeric id of the owning group.
-    pub gid: i64
-    /// The modification time in seconds since the Unix epoch.
-    pub mtime: i64
-}
 
 /// A file opened exclusively for writing by `create`.
 ///
 /// Dropping it closes the file descriptor.
 pub struct Output {
-    fd: i64
-    drop close_fd(fd)
+    fd: sys.Fd
 }
 
-fn close_fd(fd: i64) {
-    __syscall(3, fd)
-}
-
-fn at_cwd() -> i64 {
-    -100
-}
-
-fn retry(r: i64) -> bool {
-    r == -4
-}
-
-fn kind_of(mode: i64) -> Kind {
-    let format = mode & 0xF000
-    if format == 0x8000 {
-        return File
+fn probe(path: str) -> file.Info? ! io.Error {
+    let info = file.lstat(path) catch {
+        NotFound => return none
+        e => fail e
     }
-    if format == 0x4000 {
-        return Dir
-    }
-    if format == 0xA000 {
-        return Symlink
-    }
-    Other
-}
-
-fn lstat_raw(path: str, buf: []u8) -> i64 {
-    __syscall(262, at_cwd(), cstr(path), __slice_ptr(buf), 0x100)
-}
-
-fn probe(path: str) -> Kind {
-    let buf = io.buffer(144)
-    let r = lstat_raw(path, buf)
-    if r < 0 {
-        return Missing
-    }
-    kind_of(io.le32(buf, 24))
-}
-
-/// Returns the `Stat` of `path` without following a final symbolic link.
-///
-/// Fails with the error of the underlying system call, such as `NotFound` when the path or one of its parent components does not exist.
-pub fn lstat(path: str) -> Stat ! io.Error {
-    let buf = io.buffer(144)
-    io.syscall_result(lstat_raw(path, buf))?
-    let mode = io.le32(buf, 24)
-    Stat {
-        kind: kind_of(mode)
-        size: io.le64(buf, 48)
-        mode: mode & 0xFFF
-        uid: io.le32(buf, 28)
-        gid: io.le32(buf, 32)
-        mtime: io.le64(buf, 88)
-    }
-}
-
-/// Returns the target of the symbolic link at `path`.
-///
-/// A target longer than 4096 bytes is truncated to 4096 bytes. Fails with `Invalid` when `path` is not a symbolic link and with `NotFound` when it does not exist.
-pub fn read_link(path: str) -> str ! io.Error {
-    let buf = io.buffer(4096)
-    let n = io.syscall_result(__syscall(89, cstr(path), __slice_ptr(buf), buf.len))?
-    str(buf[..n])
+    some(info)
 }
 
 /// Returns `name` normalised with `path.clean`, or fails when an archive entry of that name is not safe to extract.
@@ -131,13 +43,16 @@ pub fn clean_name(name: str) -> str ! io.Error {
 }
 
 fn confine(dir: str) ! io.Error {
-    match probe(dir) {
-        Missing => {
-            io.syscall_result(__syscall(258, at_cwd(), cstr(dir), 0o755))?
+    match probe(dir)? {
+        none => file.mkdir_mode(dir, 0o755)?
+        some(info) => {
+            if info.link {
+                fail Denied
+            }
+            if !info.dir {
+                fail NotDir
+            }
         }
-        Dir => {}
-        Symlink => fail Denied
-        _ => fail NotDir
     }
 }
 
@@ -158,13 +73,17 @@ pub fn resolve(root: str, name: str) -> str ! io.Error {
     "{at}/{parts[parts.len - 1]}"
 }
 
+fn remove_existing(target: str, info: file.Info) ! io.Error {
+    if info.dir {
+        fail IsDir
+    }
+    file.remove(target)?
+}
+
 fn clear(target: str) ! io.Error {
-    match probe(target) {
-        Missing => {}
-        Dir => fail IsDir
-        _ => {
-            io.syscall_result(__syscall(263, at_cwd(), cstr(target), 0))?
-        }
+    match probe(target)? {
+        none => {}
+        some(info) => remove_existing(target, info)?
     }
 }
 
@@ -172,12 +91,16 @@ fn clear(target: str) ! io.Error {
 ///
 /// An existing directory is kept and its mode is not changed. Any other existing object, including a symbolic link, is removed first. `mode` is masked to `0o777` and always includes `0o700` so extraction can write into the directory; the process umask applies.
 pub fn make_dir(target: str, mode: i64) ! io.Error {
-    match probe(target) {
-        Dir => return
-        Missing => {}
-        _ => clear(target)?
+    match probe(target)? {
+        none => {}
+        some(info) => {
+            if info.dir {
+                return
+            }
+            remove_existing(target, info)?
+        }
     }
-    io.syscall_result(__syscall(258, at_cwd(), cstr(target), mode & 0o777 | 0o700))?
+    file.mkdir_mode(target, mode & 0o777 | 0o700)?
 }
 
 /// Creates `target` exclusively for writing and returns the open `Output`.
@@ -185,27 +108,15 @@ pub fn make_dir(target: str, mode: i64) ! io.Error {
 /// An existing file or symbolic link at `target` is removed first and an existing directory fails with `IsDir`. The file is created with `O_EXCL` and `O_NOFOLLOW`, so a link that appears in between is never followed. `mode` is masked to `0o777`, which drops the setuid, setgid and sticky bits, and the process umask applies. An interrupted open is retried.
 pub fn create(target: str, mode: i64) -> Output ! io.Error {
     clear(target)?
-    for {
-        let r = __syscall(257, at_cwd(), cstr(target), 0xA00C1, mode & 0o777)
-        if !retry(r) {
-            return Output { fd: io.syscall_result(r)? }
-        }
-    }
+    let opened = sys.open(target, sys.Open.FreshNoFollow, mode & 0o777)?
+    Output { fd: sys.adopt(opened) }
 }
 
 /// Writes all of `data` to `o`.
 ///
 /// Partial and interrupted writes are repeated until every byte is written. Fails with the error of the first write that fails.
 pub fn put(o: Output, data: []u8) ! io.Error {
-    var rest = data
-    for rest.len > 0 {
-        let r = __syscall(1, o.fd, __slice_ptr(rest), rest.len)
-        if retry(r) {
-            continue
-        }
-        let n = io.syscall_result(r)?
-        rest = rest[n..]
-    }
+    sys.write_all_on(o.fd.handle, data)?
 }
 
 /// Creates `target` as `create` does, writes `data` to it and closes it.
@@ -219,7 +130,7 @@ pub fn write_file(target: str, data: []u8, mode: i64) ! io.Error {
 /// An existing file or symbolic link at `target` is removed first and an existing directory fails with `IsDir`. `to` is stored as given and is not validated.
 pub fn symlink(target: str, to: str) ! io.Error {
     clear(target)?
-    io.syscall_result(__syscall(88, cstr(to), cstr(target)))?
+    file.symlink(to, target)?
 }
 
 /// Creates `target` as a hard link to the existing file `source`.
@@ -227,25 +138,22 @@ pub fn symlink(target: str, to: str) ! io.Error {
 /// An existing file or symbolic link at `target` is removed first and an existing directory fails with `IsDir`.
 pub fn hardlink(target: str, source: str) ! io.Error {
     clear(target)?
-    io.syscall_result(__syscall(86, cstr(source), cstr(target)))?
+    file.link(source, target)?
 }
 
 /// Sets the modification time of `target` to `seconds` since the Unix epoch and leaves the access time unchanged.
 ///
 /// A final symbolic link is not followed; the link itself is stamped.
 pub fn set_mtime(target: str, seconds: i64) ! io.Error {
-    let times = io.buffer(32)
-    io.set_le64(times, 8, 0x3FFFFFFE)
-    io.set_le64(times, 16, seconds)
-    io.syscall_result(__syscall(280, at_cwd(), cstr(target), __slice_ptr(times), 0x100))?
+    sys.set_times(target, none, some(seconds), false)?
 }
 
 /// Prepares `root` as the destination of an extraction.
 ///
 /// A missing `root` is created together with its missing parents, each by `make_dir` with mode `0o755`. An existing directory or symbolic link is accepted as it is. Any other existing object fails with `NotDir`.
 pub fn make_root(root: str) ! io.Error {
-    match probe(root) {
-        Missing => {
+    match probe(root)? {
+        none => {
             for i in 1..root.len {
                 if root[i] == '/' {
                     make_dir(root[..i], 0o755)?
@@ -253,8 +161,10 @@ pub fn make_root(root: str) ! io.Error {
             }
             make_dir(root, 0o755)?
         }
-        Dir => {}
-        Symlink => {}
-        _ => fail NotDir
+        some(info) => {
+            if !info.dir && !info.link {
+                fail NotDir
+            }
+        }
     }
 }
