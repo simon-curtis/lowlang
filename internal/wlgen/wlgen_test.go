@@ -8,10 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"lowlang/internal/check"
 	"lowlang/internal/compiler"
 	"lowlang/internal/fixture/fixturetest"
-	"lowlang/internal/lexer"
 	"lowlang/internal/target"
 )
 
@@ -61,21 +59,6 @@ func TestRejectsDuplicates(t *testing.T) {
 	_, err := Generate(load(t, "wayland.xml", "wayland.xml"))
 	if err == nil || !strings.Contains(err.Error(), "declared twice") {
 		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestReservedNames(t *testing.T) {
-	reserved := lexer.Keywords()
-	for _, b := range check.Builtins() {
-		reserved = append(reserved, b.Name)
-	}
-	for _, name := range reserved {
-		if want := name + "_"; ident(name) != want {
-			t.Errorf("ident(%q) = %q, want %q", name, ident(name), want)
-		}
-	}
-	if ident("interface") != "interface" {
-		t.Error("interface is not reserved")
 	}
 }
 

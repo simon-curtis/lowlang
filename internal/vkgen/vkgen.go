@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"lowlang/internal/check"
+	"lowlang/internal/emit"
 )
 
 type Selection struct {
@@ -63,7 +64,7 @@ type generator struct {
 	emitted   map[string]bool
 	order     []string
 	enumUse   map[string]bool
-	out       strings.Builder
+	emit.Lines
 }
 
 func Generate(reg *Registry, sel Selection) (string, error) {
@@ -77,7 +78,9 @@ func Generate(reg *Registry, sel Selection) (string, error) {
 		emitted:   map[string]bool{},
 		enumUse:   map[string]bool{},
 	}
-	g.index()
+	if err := g.index(); err != nil {
+		return "", err
+	}
 	if err := g.collectValues(sel.Extensions); err != nil {
 		return "", err
 	}
@@ -105,23 +108,13 @@ func Generate(reg *Registry, sel Selection) (string, error) {
 	if err := g.emitCommands(sel.Commands); err != nil {
 		return "", err
 	}
-	g.emitConstants()
-	return g.out.String(), nil
-}
-
-func (g *generator) line(format string, args ...any) {
-	fmt.Fprintf(&g.out, format, args...)
-	g.out.WriteString("\n")
-}
-
-func ident(name string) string {
-	if check.Reserved(name) {
-		return fmt.Sprintf("%s_", name)
+	if err := g.emitConstants(); err != nil {
+		return "", err
 	}
-	return name
+	return g.String(), nil
 }
 
-func (g *generator) index() {
+func (g *generator) index() error {
 	for i := range g.reg.Types {
 		t := &g.reg.Types[i]
 		name := t.Name
@@ -147,7 +140,7 @@ func (g *generator) index() {
 		if name == "" {
 			d, err := ParseDecl(c.Proto.Inner)
 			if err != nil {
-				continue
+				return fmt.Errorf("command prototype %q: %w", c.Proto.Inner, err)
 			}
 			name = d.Name
 		}
@@ -169,6 +162,7 @@ func (g *generator) index() {
 		}
 		g.widths[e.Name] = width
 	}
+	return nil
 }
 
 func (g *generator) collectValues(extensions []string) error {
@@ -418,20 +412,20 @@ func (g *generator) count(d Decl) (int, error) {
 	return n, nil
 }
 
-func (g *generator) cSize(name string, stars int) (int, error) {
+func (g *generator) layout(name string, stars int) (int, int, error) {
 	if stars > 0 {
-		return 8, nil
+		return 8, 8, nil
 	}
 	t, err := g.lowType(name)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if size, ok := baseSizes[t]; ok {
-		return size, nil
+		return size, size, nil
 	}
 	ty := g.resolve(name)
 	if ty.Category == "handle" {
-		return 8, nil
+		return 8, 8, nil
 	}
 	total, align, union := 0, 1, ty.Category == "union"
 	for _, m := range ty.Members {
@@ -440,19 +434,15 @@ func (g *generator) cSize(name string, stars int) (int, error) {
 		}
 		d, err := ParseDecl(m.Inner)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		n, err := g.count(d)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
-		size, err := g.cSize(d.Type, d.Stars)
+		size, a, err := g.layout(d.Type, d.Stars)
 		if err != nil {
-			return 0, err
-		}
-		a, err := g.cAlign(d.Type, d.Stars)
-		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		align = max(align, a)
 		if union {
@@ -461,55 +451,22 @@ func (g *generator) cSize(name string, stars int) (int, error) {
 		}
 		total = (total+a-1)/a*a + size*n
 	}
-	return (total + align - 1) / align * align, nil
-}
-
-func (g *generator) cAlign(name string, stars int) (int, error) {
-	if stars > 0 {
-		return 8, nil
-	}
-	t, err := g.lowType(name)
-	if err != nil {
-		return 0, err
-	}
-	if size, ok := baseSizes[t]; ok {
-		return size, nil
-	}
-	ty := g.resolve(name)
-	if ty.Category == "handle" {
-		return 8, nil
-	}
-	align := 1
-	for _, m := range ty.Members {
-		if !forVulkan(m.API) {
-			continue
-		}
-		d, err := ParseDecl(m.Inner)
-		if err != nil {
-			return 0, err
-		}
-		a, err := g.cAlign(d.Type, d.Stars)
-		if err != nil {
-			return 0, err
-		}
-		align = max(align, a)
-	}
-	return align, nil
+	return (total + align - 1) / align * align, align, nil
 }
 
 func (g *generator) prologue() {
-	g.line("pub fn vk_make_api_version(variant: u32, major: u32, minor: u32, patch: u32) -> u32 {")
-	g.line("    (variant << 29) | (major << 22) | (minor << 12) | patch")
-	g.line("}")
-	g.line("")
-	g.line("fn vk_string(bytes: []u8) -> str {")
-	g.line("    var n = 0")
-	g.line("    for n < bytes.len && bytes[n] != 0 {")
-	g.line("        n += 1")
-	g.line("    }")
-	g.line("    str(bytes[0..n])")
-	g.line("}")
-	g.line("")
+	g.Line("pub fn vk_make_api_version(variant: u32, major: u32, minor: u32, patch: u32) -> u32 {")
+	g.Line("    (variant << 29) | (major << 22) | (minor << 12) | patch")
+	g.Line("}")
+	g.Line("")
+	g.Line("fn vk_string(bytes: []u8) -> str {")
+	g.Line("    var n = 0")
+	g.Line("    for n < bytes.len && bytes[n] != 0 {")
+	g.Line("        n += 1")
+	g.Line("    }")
+	g.Line("    str(bytes[0..n])")
+	g.Line("}")
+	g.Line("")
 }
 
 func (g *generator) emitType(name string) error {
@@ -519,10 +476,10 @@ func (g *generator) emitType(name string) error {
 		if strings.Contains(t.Inner, "VK_DEFINE_HANDLE") {
 			field, def = "ptr", "null"
 		}
-		g.line("pub extern struct %s {", name)
-		g.line("    pub handle: %s = %s", field, def)
-		g.line("}")
-		g.line("")
+		g.Line("pub extern struct %s {", name)
+		g.Line("    pub handle: %s = %s", field, def)
+		g.Line("}")
+		g.Line("")
 		return nil
 	}
 	members := t.Members
@@ -534,7 +491,7 @@ func (g *generator) emitType(name string) error {
 		members = []Member{widest}
 	}
 	var arrays []array
-	g.line("pub extern struct %s {", name)
+	g.Line("pub extern struct %s {", name)
 	for _, m := range members {
 		if !forVulkan(m.API) {
 			continue
@@ -556,7 +513,7 @@ func (g *generator) emitType(name string) error {
 			def = strconv.FormatInt(v, 10)
 		}
 		if len(d.Dims) == 0 {
-			g.line("    pub %s: %s = %s", ident(d.Name), ty, def)
+			g.Line("    pub %s: %s = %s", check.Ident(d.Name), ty, def)
 			continue
 		}
 		n, err := g.count(d)
@@ -564,13 +521,13 @@ func (g *generator) emitType(name string) error {
 			return err
 		}
 		for i := range n {
-			g.line("    pub %s_%d: %s = %s", d.Name, i, ty, def)
+			g.Line("    pub %s_%d: %s = %s", d.Name, i, ty, def)
 		}
 		d.Dims = []string{strconv.Itoa(n)}
 		arrays = append(arrays, array{decl: d, elem: ty})
 	}
-	g.line("}")
-	g.line("")
+	g.Line("}")
+	g.Line("")
 	for _, a := range arrays {
 		g.accessor(name, a)
 	}
@@ -590,17 +547,17 @@ func (g *generator) accessor(owner string, a array) {
 	}
 	list := strings.Join(fields, ", ")
 	if a.decl.Type == "char" && a.decl.Stars == 0 {
-		g.line("pub fn %s_%s(s: %s) -> str {", owner, a.decl.Name, owner)
-		g.line("    let bytes: []u8 = [%s]", list)
-		g.line("    vk_string(bytes)")
-		g.line("}")
-		g.line("")
+		g.Line("pub fn %s_%s(s: %s) -> str {", owner, a.decl.Name, owner)
+		g.Line("    let bytes: []u8 = [%s]", list)
+		g.Line("    vk_string(bytes)")
+		g.Line("}")
+		g.Line("")
 		return
 	}
-	g.line("pub fn %s_%s(s: %s) -> []%s {", owner, a.decl.Name, owner, a.elem)
-	g.line("    [%s]", list)
-	g.line("}")
-	g.line("")
+	g.Line("pub fn %s_%s(s: %s) -> []%s {", owner, a.decl.Name, owner, a.elem)
+	g.Line("    [%s]", list)
+	g.Line("}")
+	g.Line("")
 }
 
 func (g *generator) widest(t *Type) (Member, error) {
@@ -618,7 +575,7 @@ func (g *generator) widest(t *Type) (Member, error) {
 		if err != nil {
 			return best, err
 		}
-		s, err := g.cSize(d.Type, d.Stars)
+		s, _, err := g.layout(d.Type, d.Stars)
 		if err != nil {
 			return best, err
 		}
@@ -662,7 +619,7 @@ func (g *generator) paramType(p Param, d Decl) (string, bool, error) {
 }
 
 func (g *generator) emitCommands(names []string) error {
-	g.line(`extern "vulkan" {`)
+	g.Line(`extern "vulkan" {`)
 	for _, name := range names {
 		cmd, err := g.command(name)
 		if err != nil {
@@ -689,7 +646,7 @@ func (g *generator) emitCommands(names []string) error {
 			if mut {
 				prefix = "mut "
 			}
-			params = append(params, fmt.Sprintf("%s%s: %s", prefix, ident(d.Name), t))
+			params = append(params, fmt.Sprintf("%s%s: %s", prefix, check.Ident(d.Name), t))
 		}
 		result := ""
 		if proto.Type != "void" || proto.Stars > 0 {
@@ -699,10 +656,10 @@ func (g *generator) emitCommands(names []string) error {
 			}
 			result = fmt.Sprintf(" -> %s", t)
 		}
-		g.line("    pub fn %s(%s)%s", name, strings.Join(params, ", "), result)
+		g.Line("    pub fn %s(%s)%s", name, strings.Join(params, ", "), result)
 	}
-	g.line("}")
-	g.line("")
+	g.Line("}")
+	g.Line("")
 	return nil
 }
 
@@ -716,14 +673,16 @@ func literal(v int64, t string) string {
 	return strconv.FormatInt(v, 10)
 }
 
+var integerConstantTypes = map[string]string{"uint32_t": "u32", "uint64_t": "i64", "int32_t": "i32"}
+
 func (g *generator) constant(name, t, body string) {
-	g.line("pub fn %s() -> %s {", name, t)
-	g.line("    %s", body)
-	g.line("}")
-	g.line("")
+	g.Line("pub fn %s() -> %s {", name, t)
+	g.Line("    %s", body)
+	g.Line("}")
+	g.Line("")
 }
 
-func (g *generator) emitConstants() {
+func (g *generator) emitConstants() error {
 	var enums []string
 	for name := range g.enumUse {
 		enums = append(enums, name)
@@ -766,18 +725,23 @@ func (g *generator) emitConstants() {
 		switch c.Type {
 		case "float":
 			g.constant(name, "f32", strings.TrimSuffix(strings.TrimSuffix(c.Value, "F"), "f"))
-		case "uint32_t":
-			if v, err := parseNumber(c.Value); err == nil {
-				g.constant(name, "u32", literal(v, "u32"))
+		case "uint32_t", "uint64_t", "int32_t":
+			if err := g.integerConstant(name, c); err != nil {
+				return err
 			}
-		case "uint64_t", "int32_t":
-			if v, err := parseNumber(c.Value); err == nil {
-				t := "i64"
-				if c.Type == "int32_t" {
-					t = "i32"
-				}
-				g.constant(name, t, literal(v, t))
-			}
+		default:
+			return fmt.Errorf("API constant %s has unsupported type %q", name, c.Type)
 		}
 	}
+	return nil
+}
+
+func (g *generator) integerConstant(name string, c Enum) error {
+	v, err := parseNumber(c.Value)
+	if err != nil {
+		return fmt.Errorf("API constant %s: %w", name, err)
+	}
+	t := integerConstantTypes[c.Type]
+	g.constant(name, t, literal(v, t))
+	return nil
 }

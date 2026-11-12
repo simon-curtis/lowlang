@@ -79,10 +79,9 @@ type Feature struct {
 }
 
 type Extension struct {
-	Name      string    `xml:"name,attr"`
-	Number    string    `xml:"number,attr"`
-	Supported string    `xml:"supported,attr"`
-	Requires  []Require `xml:"require"`
+	Name     string    `xml:"name,attr"`
+	Number   string    `xml:"number,attr"`
+	Requires []Require `xml:"require"`
 }
 
 type Require struct {

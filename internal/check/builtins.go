@@ -75,6 +75,13 @@ func Reserved(name string) bool {
 	return lexer.IsKeyword(name) || builtinIndex[name] != nil
 }
 
+func Ident(name string) string {
+	if Reserved(name) {
+		return fmt.Sprintf("%s_", name)
+	}
+	return name
+}
+
 func bare(h func(c *Checker, e *ast.Call)) builtinHandler {
 	return func(c *Checker, e *ast.Call, _ *types.Type) { h(c, e) }
 }

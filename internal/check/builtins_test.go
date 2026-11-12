@@ -13,6 +13,7 @@ import (
 	"lowlang/internal/check"
 	"lowlang/internal/compiler"
 	"lowlang/internal/diag"
+	"lowlang/internal/lexer"
 	"lowlang/internal/target"
 )
 
@@ -108,6 +109,22 @@ func TestBuiltinsAreComplete(t *testing.T) {
 	}
 	if check.Reserved("frobnicate") {
 		t.Error("frobnicate is reserved")
+	}
+}
+
+func TestIdent(t *testing.T) {
+	for _, b := range check.Builtins() {
+		if want := fmt.Sprintf("%s_", b.Name); check.Ident(b.Name) != want {
+			t.Errorf("Ident(%q) = %q, want %q", b.Name, check.Ident(b.Name), want)
+		}
+	}
+	for _, word := range lexer.Keywords() {
+		if want := fmt.Sprintf("%s_", word); check.Ident(word) != want {
+			t.Errorf("Ident(%q) = %q, want %q", word, check.Ident(word), want)
+		}
+	}
+	if check.Ident("frobnicate") != "frobnicate" {
+		t.Error("frobnicate is renamed")
 	}
 }
 

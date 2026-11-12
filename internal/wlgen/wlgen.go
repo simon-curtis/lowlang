@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"lowlang/internal/check"
+	"lowlang/internal/emit"
 )
 
 type Protocol struct {
@@ -55,7 +56,7 @@ var signatureCodes = map[string]string{
 }
 
 type generator struct {
-	out        strings.Builder
+	emit.Lines
 	interfaces map[string]bool
 }
 
@@ -93,7 +94,7 @@ func Generate(protocols []*Protocol) (string, error) {
 		g.listener(i)
 		g.enums(i)
 	}
-	return g.out.String(), nil
+	return g.String(), nil
 }
 
 func (g *generator) references(all []Interface) error {
@@ -112,18 +113,6 @@ func (g *generator) references(all []Interface) error {
 	return nil
 }
 
-func (g *generator) line(format string, args ...any) {
-	fmt.Fprintf(&g.out, format, args...)
-	g.out.WriteString("\n")
-}
-
-func ident(name string) string {
-	if check.Reserved(name) {
-		return fmt.Sprintf("%s_", name)
-	}
-	return name
-}
-
 func camel(name string) string {
 	var b strings.Builder
 	for _, part := range strings.Split(name, "_") {
@@ -137,7 +126,7 @@ func camel(name string) string {
 }
 
 func (g *generator) prologue() {
-	g.line(`extern "wayland-client" {`)
+	g.Line(`extern "wayland-client" {`)
 	for _, decl := range []string{
 		"pub fn wl_display_connect(name: ptr[u8]) -> ptr",
 		"pub fn wl_display_disconnect(display: ptr)",
@@ -154,73 +143,73 @@ func (g *generator) prologue() {
 		"fn wl_proxy_marshal_flags(proxy: ptr, opcode: u32, interface: ptr, version: u32, flags: u32, ...) -> ptr",
 		"fn wl_proxy_add_listener(proxy: ptr, listener: ptr, data: ptr) -> i32",
 	} {
-		g.line("    %s", decl)
+		g.Line("    %s", decl)
 	}
-	g.line("}")
-	g.line("")
-	g.line(`extern "c" {`)
-	g.line("    fn malloc(n: i64) -> ptr")
-	g.line("}")
-	g.line("")
-	g.line("extern struct WlInterface {")
-	g.line("    name: ptr[u8]")
-	g.line("    version: i32")
-	g.line("    method_count: i32")
-	g.line("    methods: ptr")
-	g.line("    event_count: i32")
-	g.line("    events: ptr")
-	g.line("}")
-	g.line("")
-	g.line("extern struct WlMessage {")
-	g.line("    name: ptr[u8]")
-	g.line("    signature: ptr[u8]")
-	g.line("    types: ptr")
-	g.line("}")
-	g.line("")
-	g.line("fn wl_c_string(s: str) -> ptr[u8] {")
-	g.line("    let p: ptr[u8] = malloc(s.len + 1)")
-	g.line("    let bytes = view(p, s.len + 1)")
-	g.line("    for i in 0..s.len {")
-	g.line("        bytes[i] = s[i]")
-	g.line("    }")
-	g.line("    bytes[s.len] = 0")
-	g.line("    p")
-	g.line("}")
-	g.line("")
-	g.line("fn wl_types(entries: []ptr) -> ptr {")
-	g.line("    let p: ptr[ptr] = malloc(8 * entries.len + 8)")
-	g.line("    let slots = view(p, entries.len)")
-	g.line("    for i in 0..entries.len {")
-	g.line("        slots[i] = entries[i]")
-	g.line("    }")
-	g.line("    p")
-	g.line("}")
-	g.line("")
-	g.line("fn wl_message(name: str, signature: str, types: ptr) -> WlMessage {")
-	g.line("    WlMessage { name: wl_c_string(name), signature: wl_c_string(signature), types }")
-	g.line("}")
-	g.line("")
+	g.Line("}")
+	g.Line("")
+	g.Line(`extern "c" {`)
+	g.Line("    fn malloc(n: i64) -> ptr")
+	g.Line("}")
+	g.Line("")
+	g.Line("extern struct WlInterface {")
+	g.Line("    name: ptr[u8]")
+	g.Line("    version: i32")
+	g.Line("    method_count: i32")
+	g.Line("    methods: ptr")
+	g.Line("    event_count: i32")
+	g.Line("    events: ptr")
+	g.Line("}")
+	g.Line("")
+	g.Line("extern struct WlMessage {")
+	g.Line("    name: ptr[u8]")
+	g.Line("    signature: ptr[u8]")
+	g.Line("    types: ptr")
+	g.Line("}")
+	g.Line("")
+	g.Line("fn wl_c_string(s: str) -> ptr[u8] {")
+	g.Line("    let p: ptr[u8] = malloc(s.len + 1)")
+	g.Line("    let bytes = view(p, s.len + 1)")
+	g.Line("    for i in 0..s.len {")
+	g.Line("        bytes[i] = s[i]")
+	g.Line("    }")
+	g.Line("    bytes[s.len] = 0")
+	g.Line("    p")
+	g.Line("}")
+	g.Line("")
+	g.Line("fn wl_types(entries: []ptr) -> ptr {")
+	g.Line("    let p: ptr[ptr] = malloc(8 * entries.len + 8)")
+	g.Line("    let slots = view(p, entries.len)")
+	g.Line("    for i in 0..entries.len {")
+	g.Line("        slots[i] = entries[i]")
+	g.Line("    }")
+	g.Line("    p")
+	g.Line("}")
+	g.Line("")
+	g.Line("fn wl_message(name: str, signature: str, types: ptr) -> WlMessage {")
+	g.Line("    WlMessage { name: wl_c_string(name), signature: wl_c_string(signature), types }")
+	g.Line("}")
+	g.Line("")
 }
 
 func (g *generator) table(all []Interface) {
-	g.line("pub struct Interfaces {")
+	g.Line("pub struct Interfaces {")
 	for _, i := range all {
-		g.line("    pub %s: ptr", i.Name)
+		g.Line("    pub %s: ptr", i.Name)
 	}
-	g.line("}")
-	g.line("")
-	g.line("pub fn interfaces() -> Interfaces {")
-	g.line("    let ifs = Interfaces {")
+	g.Line("}")
+	g.Line("")
+	g.Line("pub fn interfaces() -> Interfaces {")
+	g.Line("    let ifs = Interfaces {")
 	for _, i := range all {
-		g.line("        %s: malloc(40)", i.Name)
+		g.Line("        %s: malloc(40)", i.Name)
 	}
-	g.line("    }")
+	g.Line("    }")
 	for _, i := range all {
-		g.line("    wl_fill_%s(ifs)", i.Name)
+		g.Line("    wl_fill_%s(ifs)", i.Name)
 	}
-	g.line("    ifs")
-	g.line("}")
-	g.line("")
+	g.Line("    ifs")
+	g.Line("}")
+	g.Line("")
 }
 
 func signature(m Message) (string, []string) {
@@ -249,31 +238,31 @@ func signature(m Message) (string, []string) {
 }
 
 func (g *generator) messages(kind string, msgs []Message) {
-	g.line("    let %s: ptr[WlMessage] = malloc(%d)", kind, 24*max(1, len(msgs)))
+	g.Line("    let %s: ptr[WlMessage] = malloc(%d)", kind, 24*max(1, len(msgs)))
 	if len(msgs) == 0 {
 		return
 	}
-	g.line("    let %s_view = view(%s, %d)", kind, kind, len(msgs))
+	g.Line("    let %s_view = view(%s, %d)", kind, kind, len(msgs))
 	for k, m := range msgs {
 		sig, types := signature(m)
 		list := "[]"
 		if len(types) > 0 {
 			list = fmt.Sprintf("[%s]", strings.Join(types, ", "))
 		}
-		g.line("    let %s_types%d: []ptr = %s", kind, k, list)
-		g.line("    %s_view[%d] = wl_message(%q, %q, wl_types(%s_types%d))", kind, k, m.Name, sig, kind, k)
+		g.Line("    let %s_types%d: []ptr = %s", kind, k, list)
+		g.Line("    %s_view[%d] = wl_message(%q, %q, wl_types(%s_types%d))", kind, k, m.Name, sig, kind, k)
 	}
 }
 
 func (g *generator) fill(i Interface) {
-	g.line("fn wl_fill_%s(ifs: Interfaces) {", i.Name)
+	g.Line("fn wl_fill_%s(ifs: Interfaces) {", i.Name)
 	g.messages("methods", i.Requests)
 	g.messages("events", i.Events)
-	g.line("    let target: ptr[WlInterface] = ifs.%s", i.Name)
-	g.line("    store(target, WlInterface { name: wl_c_string(%q), version: %d, method_count: %d, methods, event_count: %d, events })",
+	g.Line("    let target: ptr[WlInterface] = ifs.%s", i.Name)
+	g.Line("    store(target, WlInterface { name: wl_c_string(%q), version: %d, method_count: %d, methods, event_count: %d, events })",
 		i.Name, i.Version, len(i.Requests), len(i.Events))
-	g.line("}")
-	g.line("")
+	g.Line("}")
+	g.Line("")
 }
 
 func newID(m Message) (Arg, bool) {
@@ -286,7 +275,7 @@ func newID(m Message) (Arg, bool) {
 }
 
 func (g *generator) requests(i Interface) {
-	self := ident(i.Name)
+	self := check.Ident(i.Name)
 	destroy := false
 	for opcode, m := range i.Requests {
 		name := fmt.Sprintf("%s_%s", i.Name, m.Name)
@@ -305,26 +294,26 @@ func (g *generator) requests(i Interface) {
 			case a.Type == "new_id":
 				values = append(values, "null")
 			default:
-				params = append(params, fmt.Sprintf("%s: %s", ident(a.Name), cTypes[a.Type]))
-				values = append(values, ident(a.Name))
+				params = append(params, fmt.Sprintf("%s: %s", check.Ident(a.Name), cTypes[a.Type]))
+				values = append(values, check.Ident(a.Name))
 			}
 		}
 		result := ""
 		if creates {
 			result = " -> ptr"
 		}
-		g.line("pub fn %s(%s)%s {", name, strings.Join(params, ", "), result)
+		g.Line("pub fn %s(%s)%s {", name, strings.Join(params, ", "), result)
 		target, version := "null", fmt.Sprintf("wl_proxy_get_version(%s)", self)
 		switch {
 		case creates && id.Interface == "":
-			g.line("    let described: ptr[WlInterface] = interface")
-			g.line("    let description = load(described)")
+			g.Line("    let described: ptr[WlInterface] = interface")
+			g.Line("    let description = load(described)")
 			target, version = "interface", "version"
 		case creates:
 			target = fmt.Sprintf("ifs.%s", id.Interface)
 		}
 		if version != "version" {
-			g.line("    let version = %s", version)
+			g.Line("    let version = %s", version)
 		}
 		flags := 0
 		if m.Type == "destructor" {
@@ -334,15 +323,15 @@ func (g *generator) requests(i Interface) {
 		if len(values) > 0 {
 			call = fmt.Sprintf("%s, %s", call, strings.Join(values, ", "))
 		}
-		g.line("    %s)", call)
-		g.line("}")
-		g.line("")
+		g.Line("    %s)", call)
+		g.Line("}")
+		g.Line("")
 	}
 	if !destroy && i.Name != "wl_display" {
-		g.line("pub fn %s_destroy(%s: ptr) {", i.Name, self)
-		g.line("    wl_proxy_destroy(%s)", self)
-		g.line("}")
-		g.line("")
+		g.Line("pub fn %s_destroy(%s: ptr) {", i.Name, self)
+		g.Line("    wl_proxy_destroy(%s)", self)
+		g.Line("}")
+		g.Line("")
 	}
 }
 
@@ -351,7 +340,7 @@ func eventParams(m Message) ([]string, []string) {
 	params := []string{"data: ptr", "proxy: ptr"}
 	for _, a := range m.Args {
 		types = append(types, cTypes[a.Type])
-		params = append(params, fmt.Sprintf("%s: %s", ident(a.Name), cTypes[a.Type]))
+		params = append(params, fmt.Sprintf("%s: %s", check.Ident(a.Name), cTypes[a.Type]))
 	}
 	return types, params
 }
@@ -363,33 +352,33 @@ func (g *generator) listener(i Interface) {
 	listener := fmt.Sprintf("%sListener", camel(i.Name))
 	for _, m := range i.Events {
 		_, params := eventParams(m)
-		g.line("fn %s_%s_ignore(%s) {", i.Name, m.Name, strings.Join(params, ", "))
-		g.line("}")
-		g.line("")
+		g.Line("fn %s_%s_ignore(%s) {", i.Name, m.Name, strings.Join(params, ", "))
+		g.Line("}")
+		g.Line("")
 	}
-	g.line("pub extern struct %s {", listener)
+	g.Line("pub extern struct %s {", listener)
 	for _, m := range i.Events {
 		types, _ := eventParams(m)
-		g.line("    pub %s: extern fn(%s) = %s_%s_ignore", ident(m.Name), strings.Join(types, ", "), i.Name, m.Name)
+		g.Line("    pub %s: extern fn(%s) = %s_%s_ignore", check.Ident(m.Name), strings.Join(types, ", "), i.Name, m.Name)
 	}
-	g.line("}")
-	g.line("")
-	self := ident(i.Name)
-	g.line("pub fn %s_add_listener(%s: ptr, listener: %s, data: ptr) -> i32 {", i.Name, self, listener)
-	g.line("    let copy: ptr[%s] = malloc(%d)", listener, 8*len(i.Events))
-	g.line("    store(copy, listener)")
-	g.line("    wl_proxy_add_listener(%s, copy, data)", self)
-	g.line("}")
-	g.line("")
+	g.Line("}")
+	g.Line("")
+	self := check.Ident(i.Name)
+	g.Line("pub fn %s_add_listener(%s: ptr, listener: %s, data: ptr) -> i32 {", i.Name, self, listener)
+	g.Line("    let copy: ptr[%s] = malloc(%d)", listener, 8*len(i.Events))
+	g.Line("    store(copy, listener)")
+	g.Line("    wl_proxy_add_listener(%s, copy, data)", self)
+	g.Line("}")
+	g.Line("")
 }
 
 func (g *generator) enums(i Interface) {
 	for _, e := range i.Enums {
 		for _, entry := range e.Entries {
-			g.line("pub fn %s_%s_%s() -> u32 {", i.Name, e.Name, entry.Name)
-			g.line("    %s", entry.Value)
-			g.line("}")
-			g.line("")
+			g.Line("pub fn %s_%s_%s() -> u32 {", i.Name, e.Name, entry.Name)
+			g.Line("    %s", entry.Value)
+			g.Line("}")
+			g.Line("")
 		}
 	}
 }
