@@ -146,7 +146,7 @@ let byte = u8(300)
 - Binary operators bind as in Go, from tightest to loosest: `*`, `/`, `%`, `<<`, `>>`, `&`; then `+`, `-`, `|`, `^`; then `??`; then comparisons; then `&&`; then `||`. So `a - b >> 1` is `a - (b >> 1)` and `x | y - z` is `(x | y) - z`.
 - `%` is integer only. Floats follow IEEE 754: division by zero gives an infinity, and comparisons with NaN are false except `!=`.
 - `sqrt`, `floor` and `exp` take and return `f32` or `f64`.
-- `print` accepts any integer type.
+- `print` accepts any integer or float type.
 
 ### Vectors
 
@@ -903,6 +903,126 @@ wait_readable(fd)
 - `wait_readable(fd)` and `wait_writable(fd)` wait until a file descriptor is ready, using epoll. One green thread may wait on a descriptor at a time.
 - A program ends when `main` returns, whatever other green threads are doing.
 - When every green thread is waiting and nothing can wake one, the program panics with `every green thread is blocked forever`. A green thread that exhausts its stack panics with `stack overflow`.
+
+## Builtins
+
+Every module sees these names without an import. A function in the program named `pop`, `truncate`, `close`, `sleep`, `wait_readable` or `wait_writable` takes precedence over the builtin.
+
+### `bytes`
+
+`bytes(s: str) -> []u8` copies a string's bytes into a new slice.
+
+### `close`
+
+`close(c: chan[T])` closes a channel and wakes every waiter. Sending on or closing a closed channel panics.
+
+### `cstr`
+
+`cstr(s: str) -> ptr[u8]` is a NUL-terminated copy of a string, for passing to C.
+
+### `delete`
+
+`delete(mut m: [K: V], key: K)` removes a key from a map. Removing a missing key does nothing.
+
+### `embed`
+
+`embed(path: str) -> str` is the contents of a file, read at compile time. `path` is a string literal relative to the directory of the file that calls `embed`.
+
+### `exp`
+
+`exp(x: f64) -> f64` is e raised to the power `x`. It takes and returns `f32` too.
+
+### `floor`
+
+`floor(x: f64) -> f64` rounds `x` down to a whole number. It takes and returns `f32` too.
+
+### `len`
+
+`xs.len` is an `i64`: the number of elements in a slice, the number of entries in a map, or the number of bytes in a `str`.
+
+### `load`
+
+`load(p: ptr[T]) -> T` reads one `T` from C memory. A null pointer traps.
+
+### `new`
+
+`new(value: T) -> *T` copies a value onto the garbage-collected heap and returns a pointer to it. A droppable value cannot go on the heap.
+
+### `pin`
+
+`pin(value) -> ptr` returns the address of a pointer, slice, map or string's data and keeps it alive until `unpin`. Memory C keeps after a call must be pinned.
+
+### `pop`
+
+`pop(mut xs: []T) -> T?` removes the last element and returns it, or `none` when `xs` is empty. The capacity stays.
+
+### `print`
+
+`print(value)` writes a value of any type to standard output, followed by a newline. The text is the default rendering described under `### Strings`.
+
+### `push`
+
+`push(mut xs: []T, value: T)` appends `value`, growing the capacity to twice plus four when full.
+
+### `sleep`
+
+`sleep(ms)` pauses the green thread for `ms` milliseconds. `ms` is any integer type.
+
+### `sqrt`
+
+`sqrt(x: f64) -> f64` is the square root of `x`. It takes and returns `f32` too.
+
+### `store`
+
+`store(p: ptr[T], value: T)` writes one `T` to C memory.
+
+### `truncate`
+
+`truncate(mut xs: []T, n)` sets the length to `n` and keeps the capacity. `n` is any integer type. It panics unless `0 <= n <= xs.len`.
+
+### `unpin`
+
+`unpin(p: ptr)` releases an address returned by `pin`.
+
+### `view`
+
+`view(p: ptr[T], n) -> []T` is a slice over `n` elements at `p`, bounds-checked like any slice. `n` is any integer type.
+
+### `wait_readable`
+
+`wait_readable(fd)` waits until a file descriptor is ready to read, using epoll. `fd` is any integer type. One green thread may wait on a descriptor at a time.
+
+### `wait_writable`
+
+`wait_writable(fd)` waits until a file descriptor is ready to write, using epoll. `fd` is any integer type. One green thread may wait on a descriptor at a time.
+
+### Types
+
+Calling a numeric type converts a number to it, as in `u8(x)`, `f64(n)` and `i64(f)`.
+
+| Type | Values |
+|---|---|
+| `i64` | Signed 64-bit integers. An integer literal with no expected type is an `i64`. |
+| `i32` | Signed 32-bit integers. |
+| `u64` | Unsigned 64-bit integers. |
+| `u32` | Unsigned 32-bit integers. |
+| `u16` | Unsigned 16-bit integers. |
+| `u8` | Unsigned 8-bit integers, and the bytes of a `str`. |
+| `f64` | 64-bit IEEE 754 floats. A float literal is an `f64` unless an `f32` is expected. |
+| `f32` | 32-bit IEEE 754 floats. |
+| `bool` | `true` and `false`. |
+| `str` | An immutable pointer and length over UTF-8 bytes. `str(b)` copies a `[]u8` into a string, and `str(p)` copies a NUL-terminated `ptr[u8]`. |
+| `ptr` | `ptr[T]` is a nullable pointer to C memory. `ptr` alone is `void*` and converts to and from any `ptr[T]`. |
+| `chan` | `chan[T]` is a channel of `T` values. `chan[T](n)` makes one holding up to `n` values, and `chan[T]()` an unbuffered one. |
+
+### Constants
+
+| Constant | Value |
+|---|---|
+| `true` | The true `bool`. |
+| `false` | The false `bool`. |
+| `none` | The empty optional, typed by its context. |
+| `null` | The null `ptr`, typed by its context. |
 
 ## Standard library
 

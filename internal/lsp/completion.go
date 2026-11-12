@@ -32,7 +32,7 @@ var builtinFuncs = []string{
 	"embed", "sqrt", "floor", "exp", "close", "sleep", "wait_readable", "wait_writable",
 }
 
-var builtinTypes = []string{"i64", "i32", "u32", "u16", "u8", "f64", "f32", "bool", "str", "ptr", "chan"}
+var builtinTypes = []string{"i64", "i32", "u64", "u32", "u16", "u8", "f64", "f32", "bool", "str", "ptr", "chan"}
 
 var builtinConstants = []string{"true", "false", "none", "null"}
 

@@ -4,7 +4,7 @@ Compiler for the Low language, written in Go. [docs/design.md](docs/design.md) i
 
 ## Language or syntax change
 
-Read `## Syntax`. A change runs through `internal/lexer`, `internal/parser`, `internal/ast`, `internal/check`, then `internal/ir`. Each new construct gets a `testdata/run` program, and each rejected form a `testdata/fail` program. The editor grammars in `editors/` and `site/highlight.mjs` list the keywords and move with the lexer; `go test ./editors/` catches a missed keyword.
+Read `## Syntax`. A change runs through `internal/lexer`, `internal/parser`, `internal/ast`, `internal/check`, then `internal/ir`. Each new construct gets a `testdata/run` program, and each rejected form a `testdata/fail` program. A builtin function, type or constant gets an entry in `## Builtins`; `TestBuiltinsDocumented` in `internal/lsp` fails on a missing or stale one. The editor grammars in `editors/` and `site/highlight.mjs` list the keywords and move with the lexer; `go test ./editors/` catches a missed keyword.
 
 ## Code generation or optimisation
 
