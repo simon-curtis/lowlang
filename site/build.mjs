@@ -2,6 +2,7 @@ import { builtins, docs } from "./docs.mjs";
 import { Library } from "./links.mjs";
 import { packages, standard } from "./packages.mjs";
 import { Session } from "./lsp.mjs";
+import { fetchRoadmap } from "./roadmap.mjs";
 import { lexed } from "./source.mjs";
 import { pages } from "./pages.mjs";
 
@@ -12,7 +13,8 @@ try {
     const design = await lexed("docs/design.md");
     const builtin = builtins(design);
     const library = new Library(modules, builtin);
-    const documented = await docs(design, session, library);
+    const roadmap = await fetchRoadmap();
+    const documented = await docs(design, session, library, roadmap);
     console.log(`docs: ${documented} pages`);
     const count = await packages(modules, design, session, library);
     console.log(`packages: ${count} modules`);

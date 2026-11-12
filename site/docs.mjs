@@ -6,6 +6,7 @@ import { Program } from "./program.mjs";
 import { layout, rootOf } from "./layout.mjs";
 import { codeRenderer, Linker } from "./links.mjs";
 import { escape, isLow } from "./markup.mjs";
+import { renderRoadmap } from "./roadmap.mjs";
 import { lexed } from "./source.mjs";
 
 const output = new URL(folders.docs, import.meta.url);
@@ -125,17 +126,18 @@ export function builtins(design) {
     return entries;
 }
 
-export async function docs(design, session, library) {
+export async function docs(design, session, library, roadmap) {
     const editors = await lexed("editors/README.md");
     const chapters = sections(design, 2).map((page) => ({ ...page, file: `${slug(page.title)}.html` }));
     const editor = { title: "Editors", depth: 1, tokens: editors.filter((token) => token.type !== "heading" || token.depth !== 1), file: "editors.html" };
     const home = { title: "Documentation", depth: 1, tokens: preamble(design), file: "index.html" };
-    const pages = [home, ...chapters, editor];
+    const plan = { title: "Roadmap", depth: 1, tokens: [], file: "roadmap.html", body: renderRoadmap(roadmap) };
+    const pages = [home, ...chapters, editor, plan];
     const facts = await inspect(pages, session);
     for (const page of pages) {
         const lead = page.tokens.find((token) => token.type === "paragraph");
         page.description = lead ? plain(lead.tokens).slice(0, 200) : `${page.title} in the Low documentation.`;
-        page.body = render(page, facts, library);
+        page.body ??= render(page, facts, library);
     }
     home.body = `${home.body}${contents(pages)}`;
     await rm(output, { recursive: true, force: true });
