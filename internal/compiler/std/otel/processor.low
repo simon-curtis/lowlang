@@ -38,34 +38,72 @@ struct Command {
     stop: bool
 }
 
+struct Worker {
+    control: chan[Command]
+    timeout: i64
+    stopped: bool
+}
+
+fn new_worker(timeout: i64) -> *Worker {
+    new(Worker { control: chan[Command](1), timeout, stopped: false })
+}
+
+fn deadline_in(millis: i64) -> i64 {
+    time.monotonic() / 1000000 + millis
+}
+
+fn wait_until(deadline: i64) -> i64 {
+    let wait = deadline - time.monotonic() / 1000000
+    if wait < 0 { 0 } else { wait }
+}
+
+fn ask(w: *Worker, stop: bool) -> bool {
+    if w.stopped {
+        return false
+    }
+    if stop {
+        w.stopped = true
+    }
+    let reply = chan[bool](1)
+    let sent = select {
+        w.control <- Command { reply, stop } => true
+        after(w.timeout) => false
+    }
+    if !sent {
+        return false
+    }
+    select {
+        r = <-reply => r ?? false
+        after(w.timeout) => false
+    }
+}
+
 struct Batcher[T] {
     queue: chan[T]
-    control: chan[Command]
+    worker: *Worker
     options: BatchOptions
     export: fn([]T) -> bool
     finish: fn()
     lock: i64
     dropped: i64
-    stopped: bool
 }
 
 fn batcher[T](options: BatchOptions, export: fn([]T) -> bool, finish: fn()) -> *Batcher[T] {
     let b = new(Batcher[T] {
         queue: chan[T](options.max_queue)
-        control: chan[Command](1)
+        worker: new_worker(options.timeout)
         options
         export
         finish
         lock: 0
         dropped: 0
-        stopped: false
     })
     spawn work(b)
     b
 }
 
 fn offer[T](b: *Batcher[T], v: T) {
-    if b.stopped {
+    if b.worker.stopped {
         return
     }
     let sent = select {
@@ -121,12 +159,8 @@ fn drain[T](b: *Batcher[T], mut batch: []T) {
 
 fn work[T](b: *Batcher[T]) {
     var batch: []T = []
-    var deadline = time.monotonic() / 1000000 + b.options.delay
+    var deadline = deadline_in(b.options.delay)
     for {
-        var wait = deadline - time.monotonic() / 1000000
-        if wait < 0 {
-            wait = 0
-        }
         let command: Command? = select {
             v = <-b.queue => {
                 match v {
@@ -136,17 +170,17 @@ fn work[T](b: *Batcher[T]) {
                 if batch.len >= b.options.max_batch {
                     ship(b, batch)
                     batch = []
-                    deadline = time.monotonic() / 1000000 + b.options.delay
+                    deadline = deadline_in(b.options.delay)
                 }
                 none
             }
-            c = <-b.control => c
-            after(wait) => {
+            c = <-b.worker.control => c
+            after(wait_until(deadline)) => {
                 if batch.len > 0 {
                     ship(b, batch)
                     batch = []
                 }
-                deadline = time.monotonic() / 1000000 + b.options.delay
+                deadline = deadline_in(b.options.delay)
                 none
             }
         }
@@ -155,37 +189,17 @@ fn work[T](b: *Batcher[T]) {
                 drain(b, mut batch)
                 let ok = ship(b, batch)
                 batch = []
-                deadline = time.monotonic() / 1000000 + b.options.delay
+                deadline = deadline_in(b.options.delay)
                 if c.stop {
                     b.finish()
-                    c.reply <- ok
-                    return
                 }
                 c.reply <- ok
+                if c.stop {
+                    return
+                }
             }
             none => {}
         }
-    }
-}
-
-fn request[T](b: *Batcher[T], stop: bool) -> bool {
-    if b.stopped {
-        return false
-    }
-    if stop {
-        b.stopped = true
-    }
-    let reply = chan[bool](1)
-    let sent = select {
-        b.control <- Command { reply, stop } => true
-        after(b.options.timeout) => false
-    }
-    if !sent {
-        return false
-    }
-    select {
-        r = <-reply => r ?? false
-        after(b.options.timeout) => false
     }
 }
 
@@ -200,8 +214,8 @@ pub fn batch_span_processor(exporter: SpanExporter, options: BatchOptions) -> Sp
                 offer(b, d)
             }
         }
-        force_flush: fn() -> bool { request(b, false) }
-        shutdown: fn() -> bool { request(b, true) }
+        force_flush: fn() -> bool { ask(b.worker, false) }
+        shutdown: fn() -> bool { ask(b.worker, true) }
         dropped: fn() -> i64 { dropped_count(b) }
     }
 }
