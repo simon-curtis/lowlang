@@ -2015,7 +2015,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
 
 ## Tests
 
-`go test ./...` runs every test whose tools are installed. A test that needs a tool outside the Go toolchain skips when the tool is missing, except `TestRunWindows`, which fails under `CI=true` when `wine` is missing. The workflow installs `wine` for it and sets `CI=true`. The `internal/asm` and `internal/link` oracle tests need the pinned binutils and LLVM below, which the workflow does not install, so they run by hand.
+`go test ./...` runs every test whose tools are installed. A test that needs a tool outside the Go toolchain skips when the tool is missing, except `TestRunWindows`, which fails under `CI=true` when `wine` is missing. GitHub Actions sets `CI=true` on every runner, and the workflow installs `wine`. The `internal/asm` and `internal/link` oracle tests need the pinned binutils and LLVM below, which the workflow does not install, so they run by hand.
 
 ### Fixtures
 
