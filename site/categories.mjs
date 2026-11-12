@@ -29,6 +29,7 @@ const prefixes = [
     ["std/socks", ["net"]],
     ["std/http", ["net", "web"]],
     ["std/uri", ["net", "web"]],
+    ["std/header", ["net", "web"]],
     ["std/mail", ["net"]],
     ["std/smtp", ["net"]],
     ["std/cdp", ["net"]],
