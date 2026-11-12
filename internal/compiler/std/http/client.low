@@ -140,19 +140,6 @@ struct Framing {
     done: bool
 }
 
-enum Mode {
-    Empty
-    Length
-    Chunked
-    UntilClose
-}
-
-struct Head1 {
-    status: i64
-    headers: []header.Header
-    keep: bool
-}
-
 struct Inflow {
     pending: []u8
     done: bool
@@ -1096,7 +1083,7 @@ fn exchange1(job: Job, conn: *Conn1, req: Outgoing, a: *Attempt) -> Incoming ! i
     let c = job.client
     track(c.reaper, job.deadline, conn.wire.conn)
     let before = conn.received.n
-    let opened = outcome(fn() -> Head1 ! io.Error { start1(conn, req, a) })
+    let opened = outcome(fn() -> ResponseHead ! io.Error { start1(conn, req, a) })
     let head = match opened {
         Done(h) => h
         Failed(e) => {
@@ -1106,30 +1093,15 @@ fn exchange1(job: Job, conn: *Conn1, req: Outgoing, a: *Attempt) -> Incoming ! i
             fail e
         }
     }
-    let framing = new(Framing { reader: conn.reader, attempt: a, mode: Empty, left: 0, first: true, done: false })
-    var length = -1
-    if !bodiless(req.method, head.status) && head.status != 101 {
-        if chunked(head.headers) {
-            framing.mode = Chunked
-        } else {
-            let declared = text.trim(header.get(head.headers, "content-length") ?? "")
-            if declared.len > 0 {
-                length = text.parse_uint(declared, 10) catch {
-                    _ => {
-                        untrack(c.reaper, job.deadline)
-                        release(c, conn, false)
-                        fail Malformed
-                    }
-                }
-                framing.mode = if length > 0 { Length } else { Empty }
-                framing.left = length
-            } else {
-                framing.mode = UntilClose
-            }
+    let shape = body_framing(req.method, head.status, head.headers) catch {
+        e => {
+            untrack(c.reaper, job.deadline)
+            release(c, conn, false)
+            fail e
         }
-    } else {
-        length = 0
     }
+    let framing = new(Framing { reader: conn.reader, attempt: a, mode: shape.mode, left: if shape.mode == Length { shape.length } else { 0 }, first: true, done: false })
+    let length = shape.length
     let reusable = head.keep && head.status != 101 && framing.mode != UntilClose
     let body = io.Stream {
         read: fn(buf) -> i64 ! io.Error {
@@ -1155,35 +1127,26 @@ fn exchange1(job: Job, conn: *Conn1, req: Outgoing, a: *Attempt) -> Incoming ! i
     }
 }
 
-fn start1(conn: *Conn1, req: Outgoing, a: *Attempt) -> Head1 ! io.Error {
+fn start1(conn: *Conn1, req: Outgoing, a: *Attempt) -> ResponseHead ! io.Error {
     a.phase = Sending
     write_request1(conn.stream, req)?
     a.phase = Receiving
-    for {
-        let line = io.read_line(conn.reader)?
-        let status = parse_status_line(line)?
-        let headers = read_headers(conn.reader)?
-        if status >= 100 && status < 200 && status != 101 {
-            continue
-        }
-        return Head1 { status, headers, keep: keep_alive(line, headers) }
-    }
+    read_response_head(conn.reader)?
 }
 
 fn write_request1(s: io.Stream, req: Outgoing) ! io.Error {
     var out: []u8 = []
     let target = if req.absolute { format_url(req.url) } else { req.url.target }
-    text.append(mut out, "{req.method} {target} HTTP/1.1\r\n")
+    var headers: []header.Header = []
     if req.proxy_auth.len > 0 {
-        text.append(mut out, "proxy-authorization: {req.proxy_auth}\r\n")
+        push(mut headers, header.Header { name: "proxy-authorization", value: req.proxy_auth })
     }
-    if !header.has(req.headers, "host") {
-        text.append(mut out, "host: {authority(req.url)}\r\n")
+    for h in req.headers {
+        push(mut headers, h)
     }
-    write_head(mut out, req.headers)?
     match req.source {
         some(src) => {
-            text.append(mut out, "transfer-encoding: chunked\r\n\r\n")
+            put_request_head(mut out, req.method, target, authority(req.url), headers, -1)?
             io.write_all(s, out)?
             let buf = io.buffer(16384)
             for {
@@ -1192,19 +1155,13 @@ fn write_request1(s: io.Stream, req: Outgoing) ! io.Error {
                     break
                 }
                 var chunk: []u8 = []
-                text.append(mut chunk, "{text.hex(n)}\r\n")
-                chunk = joined(chunk, buf[..n])
-                text.append(mut chunk, "\r\n")
+                put_chunk(mut chunk, buf[..n])
                 io.write_all(s, chunk)?
             }
-            io.write_str(s, "0\r\n\r\n")?
+            io.write_str(s, last_chunk())?
         }
         none => {
-            let sends_length = req.body.len > 0 || req.method == "POST" || req.method == "PUT" || req.method == "PATCH"
-            if sends_length && !header.has(req.headers, "content-length") {
-                text.append(mut out, "content-length: {req.body.len}\r\n")
-            }
-            text.append(mut out, "\r\n")
+            put_request_head(mut out, req.method, target, authority(req.url), headers, req.body.len)?
             if req.body.len <= 65536 {
                 io.write_all(s, joined(out, req.body))?
             } else {
@@ -1237,11 +1194,7 @@ fn framed_read(f: *Framing, buf: []u8) -> i64 ! io.Error {
                     fail Malformed
                 }
                 f.first = false
-                let line = io.read_line(f.reader)?
-                let semi = text.index_byte(line, ';')
-                let size = text.parse_uint(text.trim(if semi >= 0 { line[..semi] } else { line }), 16) catch {
-                    _ => fail Malformed
-                }
+                let size = read_chunk_size(f.reader)?
                 if size == 0 {
                     f.attempt.trailers = read_headers(f.reader)?
                     f.done = true
@@ -1285,8 +1238,7 @@ fn exchange2(job: Job, m: *Mux, req: Outgoing, a: *Attempt) -> Incoming ! io.Err
         }
     }
     let flow = new(Inflow { pending: [], done: false })
-    let declared = text.trim(header.get(head.headers, "content-length") ?? "")
-    let length = if bodiless(req.method, head.status) { 0 } else { text.parse_uint(declared, 10) catch -1 }
+    let length = if bodiless(req.method, head.status) { 0 } else { declared_length(head.headers) catch -1 }
     let body = io.Stream {
         read: fn(buf) -> i64 ! io.Error {
             for flow.pending.len == 0 {

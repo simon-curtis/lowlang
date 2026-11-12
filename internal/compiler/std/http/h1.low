@@ -24,33 +24,82 @@ fn read_headers(r: *io.Reader) -> []header.Header ! io.Error {
     }
 }
 
-fn content_length(headers: []header.Header) -> i64 ! io.Error {
-    let value = header.get(headers, "content-length") ?? ""
+enum Mode {
+    Empty
+    Length
+    Chunked
+    UntilClose
+}
+
+struct BodyFraming {
+    mode: Mode
+    length: i64
+}
+
+struct ResponseHead {
+    status: i64
+    headers: []header.Header
+    keep: bool
+}
+
+fn declared_length(headers: []header.Header) -> i64 ! io.Error {
+    let value = text.trim(header.get(headers, "content-length") ?? "")
     if value.len == 0 {
         return -1
     }
-    let n = text.parse_uint(value, 10) catch {
+    text.parse_uint(value, 10) catch {
         _ => fail Malformed
     }
+}
+
+fn content_length(headers: []header.Header) -> i64 ! io.Error {
+    let n = declared_length(headers)?
     if n > max_body() {
         fail TooLarge
     }
     n
 }
 
+fn body_framing(method: str, status: i64, headers: []header.Header) -> BodyFraming ! io.Error {
+    if bodiless(method, status) {
+        return BodyFraming { mode: Empty, length: 0 }
+    }
+    if chunked(headers) {
+        return BodyFraming { mode: Chunked, length: -1 }
+    }
+    let n = declared_length(headers)?
+    if n < 0 {
+        return BodyFraming { mode: UntilClose, length: -1 }
+    }
+    BodyFraming { mode: if n > 0 { Length } else { Empty }, length: n }
+}
+
 fn chunked(headers: []header.Header) -> bool {
     text.has_token(header.get(headers, "transfer-encoding") ?? "", "chunked")
+}
+
+fn read_chunk_size(r: *io.Reader) -> i64 ! io.Error {
+    let line = io.read_line(r)?
+    let semi = text.index_byte(line, ';')
+    text.parse_uint(text.trim(if semi >= 0 { line[..semi] } else { line }), 16) catch {
+        _ => fail Malformed
+    }
+}
+
+fn put_chunk(mut out: []u8, data: []u8) {
+    text.append(mut out, "{text.hex(data.len)}\r\n")
+    io.append(mut out, data)
+    text.append(mut out, "\r\n")
+}
+
+fn last_chunk() -> str {
+    "0\r\n\r\n"
 }
 
 fn read_chunked(r: *io.Reader) -> []u8 ! io.Error {
     var body: []u8 = []
     for {
-        let line = io.read_line(r)?
-        let semi = text.index_byte(line, ';')
-        let size_text = text.trim(if semi >= 0 { line[..semi] } else { line })
-        let size = text.parse_uint(size_text, 16) catch {
-            _ => fail Malformed
-        }
+        let size = read_chunk_size(r)?
         if size == 0 {
             read_headers(r)?
             return body
@@ -131,6 +180,18 @@ fn keep_alive(line: str, headers: []header.Header) -> bool {
     !text.has_token(connection, "close")
 }
 
+fn read_response_head(r: *io.Reader) -> ResponseHead ! io.Error {
+    for {
+        let line = io.read_line(r)?
+        let status = parse_status_line(line)?
+        let headers = read_headers(r)?
+        if status >= 100 && status < 200 && status != 101 {
+            continue
+        }
+        return ResponseHead { status, headers, keep: keep_alive(line, headers) }
+    }
+}
+
 fn write_head(mut out: []u8, headers: []header.Header) ! io.Error {
     for h in headers {
         if !header.token(h.name) || !header.valid_value(h.value) {
@@ -173,19 +234,23 @@ pub fn write_response(s: io.Stream, method: str, resp: Response, closing: bool) 
 /// Fails with `Invalid` before writing anything when a header name or value is not valid, and otherwise with the error of the write.
 pub fn write_request(s: io.Stream, req: Request) ! io.Error {
     var out: []u8 = []
-    text.append(mut out, "{req.method} {req.target} HTTP/1.1\r\n")
-    if !header.has(req.headers, "host") {
-        text.append(mut out, "host: {req.authority}\r\n")
-    }
-    write_head(mut out, req.headers)?
-    if req.body.len > 0 || req.method == "POST" || req.method == "PUT" || req.method == "PATCH" {
-        if !header.has(req.headers, "content-length") {
-            text.append(mut out, "content-length: {req.body.len}\r\n")
-        }
-    }
-    text.append(mut out, "\r\n")
+    put_request_head(mut out, req.method, req.target, req.authority, req.headers, req.body.len)?
     io.append(mut out, req.body)
     io.write_all(s, out)?
+}
+
+fn put_request_head(mut out: []u8, method: str, target: str, host: str, headers: []header.Header, body_len: i64) ! io.Error {
+    text.append(mut out, "{method} {target} HTTP/1.1\r\n")
+    if !header.has(headers, "host") {
+        text.append(mut out, "host: {host}\r\n")
+    }
+    write_head(mut out, headers)?
+    if body_len < 0 {
+        text.append(mut out, "transfer-encoding: chunked\r\n")
+    } else if (body_len > 0 || method == "POST" || method == "PUT" || method == "PATCH") && !header.has(headers, "content-length") {
+        text.append(mut out, "content-length: {body_len}\r\n")
+    }
+    text.append(mut out, "\r\n")
 }
 
 fn parse_status_line(line: str) -> i64 ! io.Error {
@@ -203,23 +268,23 @@ fn parse_status_line(line: str) -> i64 ! io.Error {
 ///
 /// Fails with `Eof` when the input ends early, `Malformed` for a status line that is not `HTTP/1.x` and a three-digit status, a bad header, a bad chunk size or a `content-length` that is not a number, and `TooLarge` for more than 100 headers or a body over 64 MiB.
 pub fn read_response(r: *io.Reader, method: str) -> Response ! io.Error {
-    for {
-        let line = io.read_line(r)?
-        let status = parse_status_line(line)?
-        let headers = read_headers(r)?
-        if status >= 100 && status < 200 && status != 101 {
-            continue
-        }
-        var resp = Response { status, headers, body: [] }
-        if bodiless(method, status) {
-            return resp
-        }
-        if chunked(headers) {
+    let head = read_response_head(r)?
+    let framing = body_framing(method, head.status, head.headers)?
+    var resp = Response { status: head.status, headers: head.headers, body: [] }
+    match framing.mode {
+        Empty => {}
+        Chunked => {
             resp.body = read_chunked(r)?
-            return resp
         }
-        let n = content_length(headers)?
-        resp.body = if n >= 0 { io.read_exact(r, n)? } else { read_until_close(r)? }
-        return resp
+        Length => {
+            if framing.length > max_body() {
+                fail TooLarge
+            }
+            resp.body = io.read_exact(r, framing.length)?
+        }
+        UntilClose => {
+            resp.body = read_until_close(r)?
+        }
     }
+    resp
 }
