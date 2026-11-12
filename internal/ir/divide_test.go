@@ -60,30 +60,26 @@ func divisors() []uint64 {
 	return values
 }
 
-func TestUnsignedMagicMatchesDivision(t *testing.T) {
+func TestMagicNumbersMatchDivision(t *testing.T) {
 	for _, d := range divisors() {
 		if d&(d-1) == 0 || d < 3 {
 			continue
 		}
-		m := newUnsignedMagic(d)
-		for _, x := range dividends() {
-			if got := unsignedQuotient(m, x); got != x/d {
-				t.Fatalf("%d / %d = %d, magic gives %d (%+v)", x, d, x/d, got, m)
-			}
+		unsigned := newUnsignedMagic(d)
+		var signed signedMagic
+		if d <= math.MaxInt64 {
+			signed = newSignedMagic(d)
 		}
-	}
-}
-
-func TestSignedMagicMatchesDivision(t *testing.T) {
-	for _, d := range divisors() {
-		if d&(d-1) == 0 || d < 3 || d > math.MaxInt64 {
-			continue
-		}
-		m := newSignedMagic(d)
 		for _, u := range dividends() {
+			if got := unsignedQuotient(unsigned, u); got != u/d {
+				t.Fatalf("%d / %d = %d, unsigned magic gives %d (%+v)", u, d, u/d, got, unsigned)
+			}
+			if d > math.MaxInt64 {
+				continue
+			}
 			x := int64(u)
-			if got := signedQuotient(m, x); got != x/int64(d) {
-				t.Fatalf("%d / %d = %d, magic gives %d (%+v)", x, d, x/int64(d), got, m)
+			if got := signedQuotient(signed, x); got != x/int64(d) {
+				t.Fatalf("%d / %d = %d, signed magic gives %d (%+v)", x, d, x/int64(d), got, signed)
 			}
 		}
 	}
