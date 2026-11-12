@@ -1,5 +1,7 @@
+import std/atomic
 import std/io
 import std/os
+import std/sys
 
 /// The dimensions of a terminal window in character cells.
 pub struct Size {
@@ -9,16 +11,12 @@ pub struct Size {
     pub rows: i64
 }
 
-struct Latch {
-    done: i64
-}
-
 /// A copyable view of a terminal in raw mode, used to restore it.
 pub struct RawHandle {
     /// The descriptor of the terminal.
     pub fd: i64
-    saved: []u8
-    latch: *Latch
+    saved: sys.Termios
+    restored: atomic.Flag
 }
 
 /// The owner of a terminal that was put in raw mode.
@@ -38,7 +36,7 @@ pub struct PtyHandle {
     pub slave: i64
     /// The device path of the slave side, such as `/dev/pts/3`.
     pub path: str
-    latch: *Latch
+    closed: atomic.Flag
 }
 
 /// The owner of a pseudoterminal pair.
@@ -50,158 +48,42 @@ pub struct Pty {
     drop close_pty_on(handle)
 }
 
-fn tcgets() -> i64 {
-    0x5401
-}
-
-fn tcsets() -> i64 {
-    0x5402
-}
-
-fn tcsetsw() -> i64 {
-    0x5403
-}
-
-fn tiocgwinsz() -> i64 {
-    0x5413
-}
-
-fn tiocswinsz() -> i64 {
-    0x5414
-}
-
-fn tiocgptn() -> i64 {
-    0x80045430
-}
-
-fn tiocsptlck() -> i64 {
-    0x40045431
-}
-
-fn termios_size() -> i64 {
-    64
-}
-
-fn input_flags() -> i64 {
-    0
-}
-
-fn output_flags() -> i64 {
-    4
-}
-
-fn control_flags() -> i64 {
-    8
-}
-
-fn local_flags() -> i64 {
-    12
-}
-
-fn control_chars() -> i64 {
-    17
-}
-
-fn vtime() -> i64 {
-    5
-}
-
-fn vmin() -> i64 {
-    6
-}
-
-fn canonical_and_echo() -> i64 {
-    0x0A
-}
-
-fn ioctl_result(r: i64) -> i64 ! io.Error {
-    if r == -25 {
-        fail Unsupported
-    }
-    io.syscall_result(r)
-}
-
-fn ioctl(fd: i64, request: i64, arg: []u8) ! io.Error {
-    for {
-        let r = __syscall(16, fd, request, __slice_ptr(arg))
-        if r == -4 {
-            continue
-        }
-        ioctl_result(r)?
-        return
-    }
-}
-
-fn new_latch() -> *Latch {
-    new(Latch { done: 0 })
-}
-
-fn claim(l: *Latch) -> bool {
-    __cas(mut l.done, 0, 1)
-}
-
-fn get_termios(fd: i64) -> []u8 ! io.Error {
-    let t = io.buffer(termios_size())
-    ioctl(fd, tcgets(), t)?
-    t
-}
-
 /// Returns whether the descriptor `fd` refers to a terminal.
 pub fn is_tty(fd: i64) -> bool {
-    let t = io.buffer(termios_size())
-    __syscall(16, fd, tcgets(), __slice_ptr(t)) == 0
+    sys.is_terminal(fd)
 }
 
 /// Returns the size of the terminal on `fd`.
 ///
 /// Fails with `Unsupported` if `fd` is not a terminal.
 pub fn size(fd: i64) -> Size ! io.Error {
-    let w = io.buffer(8)
-    ioctl(fd, tiocgwinsz(), w)?
-    Size { columns: io.le16(w, 2), rows: io.le16(w, 0) }
+    let w = sys.window_size(fd)?
+    Size { columns: w.columns, rows: w.rows }
 }
 
 /// Sets the size of the terminal on `fd` to `s`.
 ///
 /// Fails with `Unsupported` if `fd` is not a terminal.
 pub fn set_size(fd: i64, s: Size) ! io.Error {
-    let w = io.buffer(8)
-    io.set_le16(w, 0, s.rows)
-    io.set_le16(w, 2, s.columns)
-    ioctl(fd, tiocswinsz(), w)?
+    sys.set_window_size(fd, sys.WindowSize { columns: s.columns, rows: s.rows })?
 }
 
 /// Returns whether the terminal on `fd` has line buffering and echo both turned off.
 ///
 /// Fails with `Unsupported` if `fd` is not a terminal.
 pub fn is_raw(fd: i64) -> bool ! io.Error {
-    let t = get_termios(fd)?
-    io.le32(t, local_flags()) & canonical_and_echo() == 0
-}
-
-fn make_raw(t: []u8) {
-    let input = io.le32(t, input_flags()) & ~0x5EB
-    let output = io.le32(t, output_flags()) & ~0x1
-    let control = io.le32(t, control_flags()) & ~0x130 | 0x30
-    let local = io.le32(t, local_flags()) & ~0x804B
-    io.set_le32(t, input_flags(), input)
-    io.set_le32(t, output_flags(), output)
-    io.set_le32(t, control_flags(), control)
-    io.set_le32(t, local_flags(), local)
-    t[control_chars() + vmin()] = 1
-    t[control_chars() + vtime()] = 0
+    let t = sys.termios(fd)?
+    sys.is_raw(t)
 }
 
 /// Puts the terminal on `fd` in raw mode and returns the owner that restores it.
 ///
 /// Raw mode turns off line buffering, echo, signal-generating keys, flow control and input and output translation, uses 8-bit characters, and makes reads return after one byte. Fails with `Unsupported` if `fd` is not a terminal.
 pub fn enter_raw(fd: i64) -> Raw ! io.Error {
-    let saved = get_termios(fd)?
-    let raw = io.buffer(termios_size())
-    io.copy(raw, saved)
-    make_raw(raw)
-    ioctl(fd, tcsets(), raw)?
-    let handle = RawHandle { fd, saved, latch: new_latch() }
+    let saved = sys.termios(fd)?
+    let raw = sys.raw_mode(saved)
+    sys.set_termios(fd, raw, false)?
+    let handle = RawHandle { fd, saved, restored: atomic.flag() }
     Raw { handle }
 }
 
@@ -216,48 +98,20 @@ pub fn restore(r: Raw) {
 ///
 /// Later calls do nothing, and a failure to restore is ignored.
 pub fn restore_on(h: RawHandle) {
-    if !claim(h.latch) {
+    if !atomic.set(h.restored) {
         return
     }
-    ioctl(h.fd, tcsetsw(), h.saved) catch {
+    sys.set_termios(h.fd, h.saved, true) catch {
         _ => {}
     }
-}
-
-fn open_device(path: str) -> i64 ! io.Error {
-    for {
-        let r = __syscall(257, -100, cstr(path), 0x80102, 0)
-        if r == -4 {
-            continue
-        }
-        return io.syscall_result(r)?
-    }
-}
-
-fn slave_number(master: i64) -> i64 ! io.Error {
-    let unlock = io.buffer(4)
-    ioctl(master, tiocsptlck(), unlock)?
-    let n = io.buffer(4)
-    ioctl(master, tiocgptn(), n)?
-    io.le32(n, 0)
 }
 
 /// Opens a new pseudoterminal and returns its master and slave sides.
 ///
 /// Fails with the system error if `/dev/ptmx` or the slave device cannot be opened.
 pub fn open_pty() -> Pty ! io.Error {
-    let master = open_device("/dev/ptmx")?
-    var opened = false
-    defer {
-        if !opened {
-            __syscall(3, master)
-        }
-    }
-    let n = slave_number(master)?
-    let path = "/dev/pts/{n}"
-    let slave = open_device(path)?
-    opened = true
-    let handle = PtyHandle { master, slave, path, latch: new_latch() }
+    let pair = sys.open_pty()?
+    let handle = PtyHandle { master: pair.master, slave: pair.slave, path: pair.path, closed: atomic.flag() }
     Pty { handle }
 }
 
@@ -272,29 +126,19 @@ pub fn close_pty(p: Pty) {
 ///
 /// Later calls do nothing.
 pub fn close_pty_on(h: PtyHandle) {
-    if !claim(h.latch) {
+    if !atomic.set(h.closed) {
         return
     }
-    __syscall(3, h.slave)
-    __syscall(3, h.master)
+    sys.close_fd(h.slave)
+    sys.close_fd(h.master)
 }
 
 /// Writes all of `s` to the descriptor `fd`.
 ///
 /// Parks the green thread while `fd` is non-blocking and cannot take more output. Fails with the system error if a write fails.
 pub fn write_all(fd: i64, s: str) ! io.Error {
-    var done = 0
-    for done < s.len {
-        let r = __syscall(1, fd, __slice_ptr(s[done..]), s.len - done)
-        if r == -4 {
-            continue
-        }
-        if r == -11 {
-            wait_writable(fd)
-            continue
-        }
-        done += io.syscall_result(r)?
-    }
+    let data = bytes(s)
+    sys.write_all(fd, data)?
 }
 
 fn truthy(value: str?) -> bool {
