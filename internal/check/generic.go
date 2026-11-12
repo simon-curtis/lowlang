@@ -149,9 +149,30 @@ func (c *Checker) instantiateType(g *generic, args []*types.Type, pos diag.Pos) 
 	return t
 }
 
+func (c *Checker) localGeneric(name string) *generic {
+	if g := c.local().generics[name]; g != nil {
+		return g
+	}
+	if strings.HasPrefix(name, "__") {
+		return c.scope("").generics[name]
+	}
+	return nil
+}
+
+func (c *Checker) localFunc(name string) (*ast.Func, bool) {
+	if fn, ok := c.local().funcs[name]; ok {
+		return fn, true
+	}
+	if strings.HasPrefix(name, "__") {
+		fn, ok := c.scope("").funcs[name]
+		return fn, ok && len(fn.TypeParams) > 0
+	}
+	return nil, false
+}
+
 func (c *Checker) lookupGeneric(module, name string, pos diag.Pos) *generic {
 	if module == "" {
-		return c.local().generics[name]
+		return c.localGeneric(name)
 	}
 	g := c.imported(module, pos).generics[name]
 	if g != nil && !g.pub {
@@ -166,7 +187,7 @@ func (c *Checker) genericRef(x ast.Expr) *generic {
 		if c.find(x.Name) != nil {
 			return nil
 		}
-		return c.local().generics[x.Name]
+		return c.localGeneric(x.Name)
 	case *ast.Selector:
 		id, ok := x.X.(*ast.Ident)
 		if !ok || !c.isModule(id.Name) {

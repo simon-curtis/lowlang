@@ -1078,7 +1078,7 @@ func (c *Checker) ident(e *ast.Ident, want *types.Type) {
 		b.constant(c, e, want)
 		return
 	}
-	if fn, ok := c.local().funcs[e.Name]; ok && c.find(e.Name) == nil {
+	if fn, ok := c.localFunc(e.Name); ok && c.find(e.Name) == nil {
 		e.Func, e.Type = c.funcValue(fn, want, e.Pos)
 		return
 	}
@@ -1533,7 +1533,7 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 			c.construct(e, enum, v)
 			return
 		}
-		target, ok := c.local().funcs[fn.Name]
+		target, ok := c.localFunc(fn.Name)
 		if !ok {
 			c.fail(e.Pos, "undefined function: %s", fn.Name)
 		}

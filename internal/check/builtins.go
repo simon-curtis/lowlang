@@ -250,7 +250,7 @@ func (c *Checker) firstMut(fn ast.Expr) bool {
 		if c.find(fn.Name) != nil {
 			return false
 		}
-		target, ok := c.local().funcs[fn.Name]
+		target, ok := c.localFunc(fn.Name)
 		return ok && len(target.Params) > 0 && target.Params[0].Mut
 	case *ast.Selector:
 		id, isIdent := fn.X.(*ast.Ident)
