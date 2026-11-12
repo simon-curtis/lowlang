@@ -1,5 +1,5 @@
 import { folders, origin, repository } from "./config.mjs";
-import { escape } from "./highlight.mjs";
+import { escape } from "./markup.mjs";
 
 const sections = [
     { name: "Overview", path: "index.html" },
@@ -68,8 +68,12 @@ function scriptTags({ scripts = [] }, root) {
     return scripts.map((script) => `<script src="${root}${script}" defer></script>\n`).join("");
 }
 
+export function rootOf(page) {
+    return page.error ? "/" : "../".repeat(page.path.split("/").length - 1);
+}
+
 function shell(page, content) {
-    const root = page.error ? "/" : "../".repeat(page.path.split("/").length - 1);
+    const root = rootOf(page);
     return `<!doctype html>
 <html lang="en">
 <head>

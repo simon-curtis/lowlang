@@ -1,8 +1,8 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { low, words } from "./highlight.mjs";
-import { panels } from "./layout.mjs";
+import { panels, rootOf } from "./layout.mjs";
 import { Linker } from "./links.mjs";
-import { unescape } from "./markup.mjs";
+import { textOf } from "./markup.mjs";
 import { Program } from "./program.mjs";
 
 const content = new URL("content/", import.meta.url);
@@ -25,7 +25,7 @@ const sources = [
 ];
 
 async function repaint(body, session, linker, label, expected) {
-    const marked = unescape(body.replace(/<mark>/g, open).replace(/<\/mark>/g, close).replace(/<[^>]+>/g, ""));
+    const marked = textOf(body.replace(/<mark>/g, open).replace(/<\/mark>/g, close));
     const source = marked.replaceAll(open, "").replaceAll(close, "");
     const program = new Program(source);
     const checked = await session.inspect(program, words(source), label, expected);
@@ -33,12 +33,12 @@ async function repaint(body, session, linker, label, expected) {
 }
 
 async function render(page, session, library) {
-    const linker = new Linker(library, "../".repeat(page.path.split("/").length - 1));
+    const linker = new Linker(library, rootOf(page));
     const html = await readFile(new URL(page.path, content), "utf8");
     const blocks = [...html.matchAll(block)];
     let painted = html;
     for (const [whole, start, body, end] of blocks) {
-        const first = unescape(body.replace(/<[^>]+>/g, "")).trim().split("\n")[0];
+        const first = textOf(body).trim().split("\n")[0];
         const label = `${page.path}: ${first}`;
         const expected = expectation.exec(start)?.[1];
         const code = await repaint(body, session, linker, label, expected);

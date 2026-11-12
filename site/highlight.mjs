@@ -1,3 +1,5 @@
+import { escape } from "./markup.mjs";
+
 const keywords = new Set([
     "fn", "let", "var", "if", "else", "for", "break", "continue", "return", "enum", "match", "fail", "catch",
     "struct", "mut", "in", "import", "pub", "extern", "defer", "spawn", "select", "using", "drop",
@@ -8,10 +10,6 @@ const types = new Set([
 ]);
 const constants = new Set(["true", "false", "none", "null"]);
 const pattern = /([\u0001\u0002])|(\/\/[^\n]*)|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)')|(\d[\w.]*)|([A-Za-z_]\w*)|(\s+)|(->|=>|::|\.\.|[-+*\/%=<>!&|^?:]+)|([\s\S])/g;
-
-export function escape(text) {
-    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
 
 function unbroken(part) {
     return part.length <= 28 && /[^\p{L}\p{N}_\s]/u.test(part);

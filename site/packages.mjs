@@ -1,19 +1,17 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { Marked } from "marked";
 import { all, categories, orphaned } from "./categories.mjs";
 import { compilerSource, folders } from "./config.mjs";
-import { codespan, escape, low, words } from "./highlight.mjs";
-import { layout } from "./layout.mjs";
-import { anchor, file, Linker } from "./links.mjs";
-import { isLow, unescape } from "./markup.mjs";
+import { codespan, low, words } from "./highlight.mjs";
+import { layout, rootOf } from "./layout.mjs";
+import { anchor, codeRenderer, file, Linker } from "./links.mjs";
+import { escape, isLow, textOf } from "./markup.mjs";
 import { Program } from "./program.mjs";
 
 const run = promisify(execFile);
-const repository = new URL("../", import.meta.url);
 const output = new URL(folders.packages, import.meta.url);
-const row = /^\| `(std[\w/]*)` \| (.*) \|$/gm;
 const github = '<svg class="size-5" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
 const markdown = new Marked({ renderer: { codespan } });
 
@@ -39,10 +37,6 @@ function note(indent, lines) {
     return `<span class="note pl-[${indent}ch]"><span>${paragraphs.join("")}</span></span>`;
 }
 
-function plain(html) {
-    return unescape(html.replace(/<[^>]+>/g, ""));
-}
-
 function summary(text, limit) {
     return text.length <= limit ? text : `${text.slice(0, text.lastIndexOf(" ", limit))}…`;
 }
@@ -57,9 +51,17 @@ function tags(path) {
     return categories(path).map((name) => `<a class="tag" href="index.html?category=${name}">#${name}</a>`).join(" ");
 }
 
-async function descriptions() {
-    const design = await readFile(new URL("docs/design.md", repository), "utf8");
-    return new Map([...design.matchAll(row)].map(([, path, text]) => [path, markdown.parseInline(text)]));
+function descriptions(design) {
+    const about = new Map();
+    markdown.walkTokens(design, (token) => {
+        for (const [cell, text] of token.type === "table" ? token.rows : []) {
+            const path = /^`(std[\w/]*)`$/.exec(cell.text)?.[1];
+            if (path) {
+                about.set(path, markdown.parseInline(text.text));
+            }
+        }
+    });
+    return about;
 }
 
 function sidebarList(items) {
@@ -75,6 +77,7 @@ class Page {
     #typeNames;
     #exports;
     #library;
+    #root;
     #markdown;
 
     constructor(module, description, exports, examples, library) {
@@ -86,17 +89,9 @@ class Page {
         this.#typeNames = new Set(types.map((item) => item.name));
         this.#exports = exports;
         this.#library = library;
-        const linker = new Linker(library, "../");
-        this.#markdown = new Marked({
-            renderer: {
-                code({ text, lang }) {
-                    const checked = examples.get(text);
-                    const body = isLow(lang) ? low(text, checked && linker.facts(checked, text)) : escape(text);
-                    return `<pre><code>${body}</code></pre>\n`;
-                },
-                codespan,
-            },
-        });
+        this.#root = rootOf(this);
+        const linker = new Linker(library, this.#root);
+        this.#markdown = new Marked({ renderer: { code: codeRenderer(linker, examples), codespan } });
     }
 
     get path() {
@@ -116,7 +111,7 @@ class Page {
             return `<a class="t" href="#${name}">${name}</a>`;
         }
         const builtin = this.#library.builtin(name);
-        return builtin ? `<a class="t" href="../${builtin}">${name}</a>` : whole;
+        return builtin ? `<a class="t" href="${this.#root}${builtin}">${name}</a>` : whole;
     }
 
     #code(text) {
@@ -177,7 +172,7 @@ class Page {
 
     html() {
         const path = this.#module.path;
-        const text = this.#description ? plain(this.#description) : `The ${path} module of the Low standard library.`;
+        const text = this.#description ? textOf(this.#description) : `The ${path} module of the Low standard library.`;
         return layout({ path: this.path, heading: path, title: `${path}: Low packages`, description: summary(text, 200), current: "Packages", sidebar: this.sidebar(), body: this.body() });
     }
 }
@@ -186,7 +181,7 @@ function index(modules, about) {
     const names = all(modules.map((module) => module.path));
     const bar = names.map((name) => `<a class="tag" href="?category=${name}" data-category="${name}">#${name}</a>`);
     const rows = modules.map((module) => {
-        const text = about.has(module.path) ? summary(plain(about.get(module.path)), 160) : "";
+        const text = about.has(module.path) ? summary(textOf(about.get(module.path)), 160) : "";
         const kinds = categories(module.path).join(" ");
         return `<li class="module" data-categories="${kinds}" data-search="${escape(`${module.path} ${text}`.toLowerCase())}"><a class="hit" href="${file(module.path)}"><code>${module.path}</code></a> <span class="text-sm">${module.items.length} items</span>${text ? `<br>${escape(text)}` : ""}<span class="mt-4 flex flex-wrap gap-x-2 gap-y-5">${tags(module.path)}</span></li>`;
     });
@@ -225,7 +220,7 @@ async function inspect(module, examples, session) {
     }
 }
 
-export async function packages(modules, session, library) {
+export async function packages(modules, design, session, library) {
     const uncategorised = modules.filter((module) => categories(module.path).length === 0).map((module) => module.path);
     if (uncategorised.length > 0) {
         throw new Error(`packages without a category: ${uncategorised.join(", ")}`);
@@ -238,7 +233,7 @@ export async function packages(modules, session, library) {
     for (const module of modules) {
         await inspect(module, examples, session);
     }
-    const about = await descriptions();
+    const about = descriptions(design);
     const exports = new Map(modules.map((module) => [module.path, new Set(members(module).types.map((item) => item.name))]));
     await rm(output, { recursive: true, force: true });
     await mkdir(output);

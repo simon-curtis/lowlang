@@ -2,17 +2,19 @@ import { builtins, docs } from "./docs.mjs";
 import { Library } from "./links.mjs";
 import { packages, standard } from "./packages.mjs";
 import { Session } from "./lsp.mjs";
+import { lexed } from "./source.mjs";
 import { pages } from "./pages.mjs";
 
 const session = new Session();
 try {
     await session.start();
     const modules = await standard(session.binary);
-    const builtin = await builtins();
+    const design = await lexed("docs/design.md");
+    const builtin = builtins(design);
     const library = new Library(modules, builtin);
-    const documented = await docs(session, library);
+    const documented = await docs(design, session, library);
     console.log(`docs: ${documented} pages`);
-    const count = await packages(modules, session, library);
+    const count = await packages(modules, design, session, library);
     console.log(`packages: ${count} modules`);
     const blocks = await pages(session, library);
     console.log(`pages: ${blocks}`);

@@ -1,13 +1,13 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { Marked } from "marked";
-import { codespan, escape, low, words } from "./highlight.mjs";
+import { codespan, words } from "./highlight.mjs";
 import { folders } from "./config.mjs";
 import { Program } from "./program.mjs";
-import { layout } from "./layout.mjs";
-import { Linker } from "./links.mjs";
-import { isLow } from "./markup.mjs";
+import { layout, rootOf } from "./layout.mjs";
+import { codeRenderer, Linker } from "./links.mjs";
+import { escape, isLow } from "./markup.mjs";
+import { lexed } from "./source.mjs";
 
-const repository = new URL("../", import.meta.url);
 const output = new URL(folders.docs, import.meta.url);
 const hidden = /^<!-- prelude ?(\S*)\n([\s\S]*?)\n?-->/;
 
@@ -37,7 +37,7 @@ function preamble(tokens) {
 }
 
 function render(page, facts, library) {
-    const linker = new Linker(library, "../");
+    const linker = new Linker(library, rootOf({ path: `${folders.docs}${page.file}` }));
     const marked = new Marked({
         renderer: {
             heading({ tokens, depth, text }) {
@@ -48,10 +48,7 @@ function render(page, facts, library) {
             html({ text }) {
                 return hidden.test(text) ? "" : text;
             },
-            code({ text, lang }) {
-                const body = isLow(lang) ? low(text, linker.facts(facts.get(text), text)) : escape(text);
-                return `<pre><code>${body}</code></pre>\n`;
-            },
+            code: codeRenderer(linker, facts),
             codespan,
             table(token) {
                 const head = token.header.map((cell) => `<th scope="col">${this.parser.parseInline(cell.tokens)}</th>`).join("");
@@ -80,11 +77,6 @@ function document(page, pages) {
     return layout({ path: `${folders.docs}${page.file}`, heading: page.title, title, description: page.description, current: "Docs", sidebar, body: page.body });
 }
 
-async function read(path) {
-    const text = await readFile(new URL(path, repository), "utf8");
-    return new Marked().lexer(text);
-}
-
 async function inspect(pages, session) {
     const facts = new Map();
     for (const page of pages) {
@@ -111,8 +103,7 @@ function named(text) {
     return /^`(\w+)`$/.exec(text)?.[1];
 }
 
-export async function builtins() {
-    const design = await read("docs/design.md");
+export function builtins(design) {
     const chapter = sections(design, 2).find((page) => page.title === "Builtins");
     if (!chapter) {
         throw new Error("docs/design.md has no Builtins chapter");
@@ -134,9 +125,8 @@ export async function builtins() {
     return entries;
 }
 
-export async function docs(session, library) {
-    const design = await read("docs/design.md");
-    const editors = await read("editors/README.md");
+export async function docs(design, session, library) {
+    const editors = await lexed("editors/README.md");
     const chapters = sections(design, 2).map((page) => ({ ...page, file: `${slug(page.title)}.html` }));
     const editor = { title: "Editors", depth: 1, tokens: editors.filter((token) => token.type !== "heading" || token.depth !== 1), file: "editors.html" };
     const home = { title: "Documentation", depth: 1, tokens: preamble(design), file: "index.html" };

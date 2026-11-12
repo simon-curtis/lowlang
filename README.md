@@ -114,11 +114,11 @@ python3 ../assets/brand/build.py
 
 ### Checked snippets
 
-The LSP checks each Low snippet as a program: every `low` fence in the docs and in a std doc comment, and every `data-lang="low"` block in `site/content/`. Declarations stay at the top level and loose statements go inside `fn main()`, and `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. A std example that does not import its own module checks with that import added. The build lists every snippet that fails to check and then fails; it also fails, naming the snippet, if the language server exits before answering. It fails when a prefix in `site/categories.mjs` names no module.
+The LSP checks each Low snippet as a program: every `low` fence in the docs and in a std doc comment, and every `data-lang="low"` block in `site/content/`. Declarations stay at the top level and loose statements go inside `fn main()`, and `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. A std example that does not import its own module checks with that import added. The build lists every snippet that fails to check and then fails; it also fails, naming the snippet, if the language server exits before answering. It fails when a prefix in `site/categories.mjs` names no module, and when a std module has no category.
 
 A block in `site/content/` that shows a compile error carries `data-error="text"`; the build requires the snippet to fail with an error containing that text, and removes the attribute from the page.
 
-HTML comments directly above a block supply context readers do not see:
+HTML comments directly above a `low` fence in `docs/design.md` or `editors/README.md` supply context readers do not see. Blocks in `site/content/` do not read them.
 
 - `<!-- prelude` holds Low code placed before the snippet. If its last line opens a function, such as `fn main() ! ParseError {`, that line wraps the statements instead of `fn main()`.
 - `<!-- prelude path/file.low` writes a file beside the snippet, for imported modules or embedded assets.

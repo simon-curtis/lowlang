@@ -1,5 +1,6 @@
 import { folders } from "./config.mjs";
-import { words } from "./highlight.mjs";
+import { low, words } from "./highlight.mjs";
+import { escape, isLow } from "./markup.mjs";
 
 const located = /(?<=\/)(std(?:\/\w+)*)\/(\w+\.low)$/;
 
@@ -33,6 +34,14 @@ export class Library {
     builtin(name) {
         return this.#builtins.get(name);
     }
+}
+
+export function codeRenderer(linker, checks) {
+    return ({ text, lang }) => {
+        const checked = checks.get(text);
+        const body = isLow(lang) ? low(text, checked && linker.facts(checked, text)) : escape(text);
+        return `<pre><code>${body}</code></pre>\n`;
+    };
 }
 
 export class Linker {
