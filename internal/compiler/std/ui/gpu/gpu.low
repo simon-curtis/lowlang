@@ -1,0 +1,205 @@
+import std/ui/scene
+
+struct Frame {
+    command_buffer: VkCommandBuffer = VkCommandBuffer {}
+    fence: VkFence = VkFence {}
+    submitted: bool = false
+    instances: []Buffer = []
+    sets: []VkDescriptorSet = []
+    staging: Buffer = Buffer {}
+}
+
+struct State {
+    device: Device = Device {}
+    command_pool: VkCommandPool = VkCommandPool {}
+    set_layout: VkDescriptorSetLayout = VkDescriptorSetLayout {}
+    pipeline_layout: VkPipelineLayout = VkPipelineLayout {}
+    descriptor_pool: VkDescriptorPool = VkDescriptorPool {}
+    sampler: VkSampler = VkSampler {}
+    pipelines: [i32: Pipelines] = [:]
+    atlas: Image = Image {}
+    atlas_ready: bool = false
+    frames: []*Frame = []
+    next_frame: i64 = 0
+}
+
+/// A Vulkan 1.3 instance and device with the pipelines, glyph atlas texture and frame resources that draw a `scene.Scene`.
+///
+/// Releasing a `Gpu` waits for the device to go idle and destroys everything it created. Every `Target` made from it must be released first, which `using` does when the targets are bound after the `Gpu`.
+pub struct Gpu {
+    state: *State
+    drop destroy_state(state)
+}
+
+fn frames_in_flight() -> i64 {
+    2
+}
+
+fn kinds() -> i64 {
+    3
+}
+
+fn slot(kind: scene.Kind) -> i64 {
+    match kind {
+        Quads => 0
+        Shadows => 1
+        Sprites => 2
+    }
+}
+
+/// Opens the first Vulkan 1.3 device that offers dynamic rendering, synchronization2 and a graphics queue, for drawing into offscreen targets.
+///
+/// Fails with `NoDevice` when none does, and with `Vulkan` when a call fails.
+pub fn open() -> Gpu ! Error {
+    let state = new(State {})
+    using g = Gpu { state }
+    build_state(state, [], [])?
+    g
+}
+
+fn build_state(s: *State, instance_extensions: []str, device_extensions: []str) ! Error {
+    using var pins = new_pins()
+    s.device.instance = create_instance(mut pins, instance_extensions)?
+    let chosen = choose_device(s.device.instance, device_extensions)?
+    s.device.physical = chosen.physical
+    s.device.family = chosen.family
+    s.device.handle = create_device(chosen, device_extensions)?
+    vkGetDeviceQueue(s.device.handle, chosen.family, 0, mut s.device.queue)
+    s.device.memory_types = memory_types(chosen.physical)
+    create_command_pool(s)?
+    s.set_layout = create_set_layout(s.device)?
+    s.pipeline_layout = create_pipeline_layout(s.device, s.set_layout)?
+    s.sampler = create_sampler(s.device)?
+    create_descriptor_pool(s)?
+    for i in 0..frames_in_flight() {
+        let frame = new(Frame {})
+        s.frames.push(frame)
+        build_frame(s, frame)?
+    }
+}
+
+fn create_command_pool(s: *State) ! Error {
+    var info = VkCommandPoolCreateInfo { flags: VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT(), queueFamilyIndex: s.device.family }
+    check(vkCreateCommandPool(s.device.handle, mut info, null, mut s.command_pool), "vkCreateCommandPool")?
+}
+
+fn create_descriptor_pool(s: *State) ! Error {
+    using var pins = new_pins()
+    let sets = frames_in_flight() * kinds()
+    let storage = VkDescriptorPoolSize { type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER(), descriptorCount: u32(sets) }
+    let sampled = VkDescriptorPoolSize { type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER(), descriptorCount: u32(sets) }
+    let sizes: []VkDescriptorPoolSize = [storage, sampled]
+    let data = pins.hold_all(sizes)
+    var info = VkDescriptorPoolCreateInfo { maxSets: u32(sets), poolSizeCount: 2, pPoolSizes: data }
+    check(vkCreateDescriptorPool(s.device.handle, mut info, null, mut s.descriptor_pool), "vkCreateDescriptorPool")?
+}
+
+fn build_frame(s: *State, f: *Frame) ! Error {
+    using var pins = new_pins()
+    var buffer_info = VkCommandBufferAllocateInfo { commandPool: s.command_pool, level: VK_COMMAND_BUFFER_LEVEL_PRIMARY(), commandBufferCount: 1 }
+    let command_buffers: []VkCommandBuffer = __make(1)
+    let command_data = pins.hold_all(command_buffers)
+    check(vkAllocateCommandBuffers(s.device.handle, mut buffer_info, command_data), "vkAllocateCommandBuffers")?
+    f.command_buffer = command_buffers[0]
+    var fence_info = VkFenceCreateInfo {}
+    check(vkCreateFence(s.device.handle, mut fence_info, null, mut f.fence), "vkCreateFence")?
+
+    let layouts: []VkDescriptorSetLayout = [s.set_layout, s.set_layout, s.set_layout]
+    let layout_data = pins.hold_all(layouts)
+    var set_info = VkDescriptorSetAllocateInfo { descriptorPool: s.descriptor_pool, descriptorSetCount: u32(kinds()), pSetLayouts: layout_data }
+    let sets: []VkDescriptorSet = __make(kinds())
+    let set_data = pins.hold_all(sets)
+    check(vkAllocateDescriptorSets(s.device.handle, mut set_info, set_data), "vkAllocateDescriptorSets")?
+    f.sets = sets
+    for i in 0..kinds() {
+        f.instances.push(Buffer {})
+        ensure_buffer(s.device, mut f.instances[i], 1, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT())?
+        write_instances_binding(s.device, f.sets[i], f.instances[i])
+    }
+}
+
+fn write_instances_binding(d: Device, set: VkDescriptorSet, b: Buffer) {
+    using var pins = new_pins()
+    let info = VkDescriptorBufferInfo { buffer: b.handle, offset: 0, range: b.size }
+    let infos = pins.hold(info)
+    let write = VkWriteDescriptorSet {
+        dstSet: set
+        dstBinding: 0
+        descriptorCount: 1
+        descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER()
+        pBufferInfo: infos
+    }
+    let writes = pins.hold(write)
+    vkUpdateDescriptorSets(d.handle, 1, writes, 0, null)
+}
+
+fn write_atlas_binding(d: Device, set: VkDescriptorSet, sampler: VkSampler, atlas: Image) {
+    using var pins = new_pins()
+    let info = VkDescriptorImageInfo { sampler, imageView: atlas.view, imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL() }
+    let infos = pins.hold(info)
+    let write = VkWriteDescriptorSet {
+        dstSet: set
+        dstBinding: 1
+        descriptorCount: 1
+        descriptorType: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER()
+        pImageInfo: infos
+    }
+    let writes = pins.hold(write)
+    vkUpdateDescriptorSets(d.handle, 1, writes, 0, null)
+}
+
+fn pipelines_for(s: *State, format: i32) -> Pipelines ! Error {
+    let existing = s.pipelines[format]
+    match existing {
+        some(p) => p
+        none => {
+            let created = create_pipelines(s.device, s.pipeline_layout, format)?
+            s.pipelines[format] = created
+            created
+        }
+    }
+}
+
+fn wait_frame(d: Device, f: *Frame) ! Error {
+    if !f.submitted {
+        return
+    }
+    using var pins = new_pins()
+    let fences = pins.hold(f.fence)
+    check(vkWaitForFences(d.handle, 1, fences, 1, 30000000000), "vkWaitForFences")?
+    check(vkResetFences(d.handle, 1, fences), "vkResetFences")?
+    f.submitted = false
+}
+
+fn destroy_state(s: *State) {
+    let d = s.device
+    if d.handle.handle != null {
+        vkDeviceWaitIdle(d.handle)
+        destroy_device_objects(s)
+        vkDestroyDevice(d.handle, null)
+    }
+    if d.instance.handle != null {
+        vkDestroyInstance(d.instance, null)
+    }
+}
+
+fn destroy_device_objects(s: *State) {
+    let d = s.device
+    for f in s.frames {
+        for b in f.instances {
+            destroy_buffer(d, b)
+        }
+        destroy_buffer(d, f.staging)
+        vkDestroyFence(d.handle, f.fence, null)
+    }
+    for _, p in s.pipelines {
+        destroy_pipelines(d, p)
+    }
+    destroy_image(d, s.atlas)
+    vkDestroyDescriptorPool(d.handle, s.descriptor_pool, null)
+    vkDestroySampler(d.handle, s.sampler, null)
+    vkDestroyPipelineLayout(d.handle, s.pipeline_layout, null)
+    vkDestroyDescriptorSetLayout(d.handle, s.set_layout, null)
+    vkDestroyCommandPool(d.handle, s.command_pool, null)
+}
+

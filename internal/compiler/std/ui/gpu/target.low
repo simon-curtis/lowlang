@@ -1,0 +1,138 @@
+import std/ui/scene
+
+struct TargetState {
+    device: Device = Device {}
+    image: Image = Image {}
+    readback: Buffer = Buffer {}
+    width: i64 = 0
+    height: i64 = 0
+}
+
+/// An offscreen image that scenes are drawn into and read back from, `R8G8B8A8_UNORM` with `width` by `height` pixels.
+///
+/// A `Target` must be released before the `Gpu` it was made from. Releasing it waits for the device to go idle.
+pub struct Target {
+    /// The width in pixels.
+    pub width: i64
+    /// The height in pixels.
+    pub height: i64
+    state: *TargetState
+    drop destroy_target(state)
+}
+
+fn target_format() -> i32 {
+    VK_FORMAT_R8G8B8A8_UNORM()
+}
+
+/// Makes a target of `width` by `height` pixels on `g`.
+///
+/// Fails with `InvalidSize` when either is below one.
+pub fn target(g: Gpu, width: i64, height: i64) -> Target ! Error {
+    if width < 1 || height < 1 {
+        fail InvalidSize(width, height)
+    }
+    pipelines_for(g.state, target_format())?
+    let state = new(TargetState { device: g.state.device, width, height })
+    using t = Target { width, height, state }
+    build_target(state)?
+    t
+}
+
+fn build_target(t: *TargetState) ! Error {
+    let usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT() | VK_IMAGE_USAGE_TRANSFER_SRC_BIT()
+    t.image = create_image(t.device, target_format(), t.width, t.height, usage)?
+    t.readback = create_buffer(t.device, t.width * t.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT())?
+}
+
+fn destroy_target(t: *TargetState) {
+    let d = t.device
+    if d.handle.handle != null {
+        vkDeviceWaitIdle(d.handle)
+    }
+    destroy_buffer(d, t.readback)
+    destroy_image(d, t.image)
+}
+
+/// Draws `s` into `t`, clearing it to the scene's background first, and uploads the rows of `atlas` that changed since the last call.
+///
+/// Positions in `s` are device pixels of `t`; the scene's own width and height are not read. The call returns once the work is submitted, and `read` waits for it. The `Gpu` keeps one atlas texture that mirrors the atlas it was last given, so a `Gpu` draws with one `Atlas`. After the call `atlas` is marked clean.
+pub fn render(g: Gpu, t: Target, s: scene.Scene, mut atlas: scene.Atlas) ! Error {
+    let state = g.state
+    let target = t.state
+    let pipelines = pipelines_for(state, target_format())?
+    let frame = state.frames[state.next_frame]
+    wait_frame(state.device, frame)?
+    ensure_atlas(state, atlas.size)?
+    let band = atlas_band(state, atlas)
+    write_instances(state, frame, s)?
+    stage_atlas(state, frame, atlas, band)?
+    record_target(state, frame, target, pipelines, s, atlas, band)?
+    submit(state, frame)?
+    state.next_frame = (state.next_frame + 1) % state.frames.len
+    state.atlas_ready = true
+    scene.clean(mut atlas)
+}
+
+/// Waits for every submitted frame and returns the pixels of `t` as rows from the top of four bytes each, red, green, blue and alpha, `width * height * 4` bytes in all.
+///
+/// The bytes are unspecified until `render` has drawn into `t`.
+pub fn read(g: Gpu, t: Target) -> []u8 ! Error {
+    let state = g.state
+    check(vkQueueWaitIdle(state.device.queue), "vkQueueWaitIdle")?
+    let bytes = t.width * t.height * 4
+    let out: []u8 = __make(bytes)
+    let at: ptr[u8] = t.state.readback.mapped
+    let pixels = view(at, bytes)
+    __memmove(out, pixels)
+    out
+}
+
+fn record_target(s: *State, f: *Frame, t: *TargetState, p: Pipelines, sc: scene.Scene, atlas: scene.Atlas, band: Band) ! Error {
+    using var pins = new_pins()
+    let cmd = f.command_buffer
+    check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer")?
+    var begin = VkCommandBufferBeginInfo { flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT() }
+    check(vkBeginCommandBuffer(cmd, mut begin), "vkBeginCommandBuffer")?
+    record_atlas_upload(mut pins, cmd, s, f, atlas, band)
+    image_barrier(mut pins, cmd, t.image.handle, VK_IMAGE_LAYOUT_UNDEFINED(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL(),
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT() | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT(), VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT(),
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT(), VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT() | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT())
+    let attachment = Attachment { view: t.image.view, width: t.width, height: t.height }
+    record_pass(mut pins, cmd, s, f, p, attachment, sc)
+    image_barrier(mut pins, cmd, t.image.handle, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL(),
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT(), VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT(),
+        VK_PIPELINE_STAGE_2_COPY_BIT(), VK_ACCESS_2_TRANSFER_READ_BIT())
+    record_readback(mut pins, cmd, t)
+    check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer")?
+}
+
+fn record_readback(mut pins: Pins, cmd: VkCommandBuffer, t: *TargetState) {
+    let layers = VkImageSubresourceLayers { aspectMask: VK_IMAGE_ASPECT_COLOR_BIT(), layerCount: 1 }
+    let extent = VkExtent3D { width: u32(t.width), height: u32(t.height), depth: 1 }
+    let copy = VkBufferImageCopy { imageSubresource: layers, imageExtent: extent }
+    let regions = pins.hold(copy)
+    vkCmdCopyImageToBuffer(cmd, t.image.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL(), t.readback.handle, 1, regions)
+    let visible = VkBufferMemoryBarrier2 {
+        srcStageMask: VK_PIPELINE_STAGE_2_COPY_BIT()
+        srcAccessMask: VK_ACCESS_2_TRANSFER_WRITE_BIT()
+        dstStageMask: VK_PIPELINE_STAGE_2_HOST_BIT()
+        dstAccessMask: VK_ACCESS_2_HOST_READ_BIT()
+        srcQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED()
+        dstQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED()
+        buffer: t.readback.handle
+        size: VK_WHOLE_SIZE()
+    }
+    let barriers = pins.hold(visible)
+    var dependency = VkDependencyInfo { bufferMemoryBarrierCount: 1, pBufferMemoryBarriers: barriers }
+    vkCmdPipelineBarrier2(cmd, mut dependency)
+}
+
+fn submit(s: *State, f: *Frame) ! Error {
+    using var pins = new_pins()
+    let command = VkCommandBufferSubmitInfo { commandBuffer: f.command_buffer }
+    let commands = pins.hold(command)
+    let info = VkSubmitInfo2 { commandBufferInfoCount: 1, pCommandBufferInfos: commands }
+    let infos = pins.hold(info)
+    check(vkQueueSubmit2(s.device.queue, 1, infos, f.fence), "vkQueueSubmit2")?
+    f.submitted = true
+}
