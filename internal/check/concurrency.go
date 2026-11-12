@@ -17,12 +17,6 @@ func (c *Checker) channel(e ast.Expr) *types.Type {
 }
 
 func (c *Checker) makeChan(e *ast.Call, inst *ast.Instance) {
-	if len(inst.Types) != 1 {
-		c.fail(inst.Pos, "chan takes 1 type argument, found %d", len(inst.Types))
-	}
-	if len(e.Args) > 1 {
-		c.fail(e.Pos, "chan takes at most 1 argument, found %d", len(e.Args))
-	}
 	if len(e.Args) == 1 {
 		c.integer(e.Args[0])
 	}
@@ -109,14 +103,4 @@ func (c *Checker) selectExpr(e *ast.Select, want *types.Type) {
 		c.popScope()
 	}
 	e.Type = result
-}
-
-func (c *Checker) lockWord(arg ast.Expr, name string) {
-	r, ok := arg.(*ast.Ref)
-	if !ok {
-		c.fail(arg.Position(), "%s needs a mut i64 place", name)
-	}
-	if t := c.borrow(r); t != types.I64 {
-		c.fail(r.Pos, "%s needs an i64, found %s", name, t)
-	}
 }

@@ -261,7 +261,6 @@ type Let struct {
 	Value    Expr
 	Pos      diag.Pos
 	Local    *Local
-	Flag     *Local
 	Release  Stmt
 }
 

@@ -169,7 +169,7 @@ func (c *Checker) usingBinding(s *ast.Let, t *types.Type) {
 	}
 	c.flags++
 	flag := c.declare(fmt.Sprintf("__live%d", c.flags), types.Bool, true)
-	s.Local.Flag, s.Flag = flag, flag
+	s.Local.Flag = flag
 	call := typedCall(c.releaseFunc(t), []ast.Expr{typedIdent(s.Local, s.Pos)}, s.Pos)
 	s.Release = guarded(flag, call)
 }

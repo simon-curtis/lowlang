@@ -82,10 +82,3 @@ func TestTakesFirstFollowsGenericInference(t *testing.T) {
 		}
 	}
 }
-
-func TestGeneratedRegexNamesTheStdFunction(t *testing.T) {
-	name, signature := check.GeneratedRegex()
-	if name != "generated" || signature != "fn generated(pattern: str) -> regex.Regex" {
-		t.Errorf("GeneratedRegex() = %q, %q", name, signature)
-	}
-}

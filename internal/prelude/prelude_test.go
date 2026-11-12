@@ -25,7 +25,12 @@ func declare() *ast.File {
 			s = &ast.StructDecl{Name: fmt.Sprintf("%sResult", l.Func)}
 			structs[l.Func] = s
 			file.Structs = append(file.Structs, s)
-			fn := file.Funcs[slices.IndexFunc(file.Funcs, func(fn *ast.Func) bool { return fn.Name == l.Func })]
+			at := slices.IndexFunc(file.Funcs, func(fn *ast.Func) bool { return fn.Name == l.Func })
+			if at < 0 {
+				file.Funcs = append(file.Funcs, &ast.Func{Name: l.Func})
+				at = len(file.Funcs) - 1
+			}
+			fn := file.Funcs[at]
 			fn.Result = &ast.TypeName{Pointer: true, Elem: &ast.TypeName{Name: s.Name}}
 		}
 		s.Fields = append(s.Fields, &ast.FieldDecl{Name: l.Field})
@@ -63,6 +68,28 @@ func TestValidateNamesAMissingField(t *testing.T) {
 	err := Validate(file)
 	if err == nil || !strings.Contains(err.Error(), Layouts[0].Field) {
 		t.Fatalf("want an error naming %s, got %v", Layouts[0].Field, err)
+	}
+}
+
+func TestValidateNamesAFieldThatIsNotFirst(t *testing.T) {
+	file := declare()
+	for _, s := range file.Structs {
+		if s.Name == fmt.Sprintf("%sResult", Box) {
+			s.Fields = append([]*ast.FieldDecl{{Name: "other"}}, s.Fields...)
+		}
+	}
+	err := Validate(file)
+	if err == nil || !strings.Contains(err.Error(), BoxValue) {
+		t.Fatalf("want an error naming %s, got %v", BoxValue, err)
+	}
+}
+
+func TestValidateAcceptsAStructResultByValue(t *testing.T) {
+	file := declare()
+	index := slices.IndexFunc(file.Funcs, func(fn *ast.Func) bool { return fn.Name == SelRecv })
+	file.Funcs[index].Result = &ast.TypeName{Name: file.Funcs[index].Result.Elem.Name}
+	if err := Validate(file); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -3,12 +3,15 @@ package check
 import (
 	"fmt"
 	"hash/fnv"
+	"path"
 
 	"lowlang/internal/ast"
 	"lowlang/internal/diag"
 	"lowlang/internal/parser"
 	"lowlang/internal/regex"
 )
+
+var generatedCall = fmt.Sprintf("%s.%s", path.Base(regex.Module), regex.Generator)
 
 func (c *Checker) generatesRegex(alias, name string) bool {
 	path, _ := c.file.Imported(alias)
@@ -17,11 +20,11 @@ func (c *Checker) generatesRegex(alias, name string) bool {
 
 func (c *Checker) generatedRegex(e *ast.Call) {
 	if len(e.Args) != 1 {
-		c.fail(e.Pos, "regex.generated takes 1 argument, found %d", len(e.Args))
+		c.fail(e.Pos, "%s takes 1 argument, found %d", generatedCall, len(e.Args))
 	}
 	lit, ok := e.Args[0].(*ast.StrLit)
 	if !ok {
-		c.fail(e.Args[0].Position(), "regex.generated needs a string literal pattern")
+		c.fail(e.Args[0].Position(), "%s needs a string literal pattern", generatedCall)
 	}
 	key := fmt.Sprintf("regex:%s", lit.Value)
 	fn, ok := c.derived[key]

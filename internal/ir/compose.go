@@ -116,7 +116,10 @@ func (b *builder) composedSize(pieces []piece) *Value {
 }
 
 func (b *builder) compose(parts []segment) []*Value {
-	pieces := b.pieces(parts)
+	return b.composePieces(b.pieces(parts))
+}
+
+func (b *builder) composePieces(pieces []piece) []*Value {
 	total := b.composedSize(pieces)
 	zero := b.constant(0)
 	data := b.runtime(rtGrow, zero, zero, total, zero)

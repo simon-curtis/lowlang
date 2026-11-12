@@ -20,7 +20,7 @@ func builtinSignature(call *ast.Call) string {
 	}
 	params := make([]string, len(call.Args))
 	for i, arg := range call.Args {
-		params[i] = builtinParam(arg, b.Params, i)
+		params[i] = builtinParam(arg, b, i)
 	}
 	result := ""
 	if ret := call.TypeOf(); ret != types.Void {
@@ -29,11 +29,8 @@ func builtinSignature(call *ast.Call) string {
 	return fmt.Sprintf("fn %s(%s)%s", id.Name, strings.Join(params, ", "), result)
 }
 
-func builtinParam(arg ast.Expr, names []string, i int) string {
-	name := "value"
-	if i < len(names) {
-		name = names[i]
-	}
+func builtinParam(arg ast.Expr, b *check.Builtin, i int) string {
+	name := b.ParamName(i)
 	if _, ok := arg.(*ast.Ref); ok {
 		return fmt.Sprintf("mut %s: %s", name, arg.TypeOf())
 	}

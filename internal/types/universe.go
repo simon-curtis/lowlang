@@ -5,11 +5,6 @@ import (
 	"strings"
 )
 
-const (
-	RawName  = "ptr"
-	ChanName = "chan"
-)
-
 type BuiltinType struct {
 	Name string
 	Type *Type
@@ -22,7 +17,7 @@ func indexBuiltinTypes() []BuiltinType {
 	for _, t := range Numeric {
 		list = append(list, BuiltinType{t.Name, t})
 	}
-	list = append(list, BuiltinType{Bool.Name, Bool}, BuiltinType{Str.Name, Str}, BuiltinType{RawName, nil}, BuiltinType{ChanName, nil})
+	list = append(list, BuiltinType{Bool.Name, Bool}, BuiltinType{Str.Name, Str})
 	for _, t := range Vectors {
 		list = append(list, BuiltinType{t.Name, t})
 	}

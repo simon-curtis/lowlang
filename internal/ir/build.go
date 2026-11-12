@@ -600,8 +600,8 @@ func (b *builder) stmt(s ast.Stmt) {
 		} else {
 			b.bind(s.Local, b.value(s.Value, s.Local.Type))
 		}
-		if s.Flag != nil {
-			b.bind(s.Flag, []*Value{b.constant(1)})
+		if s.Local.Flag != nil {
+			b.bind(s.Local.Flag, []*Value{b.constant(1)})
 		}
 		if s.Release != nil {
 			top := len(b.defers) - 1
@@ -685,14 +685,20 @@ func (b *builder) assign(s *ast.Assign) {
 		b.stmt(s.Release)
 	}
 	p := b.placeOf(s.Target)
-	if op, ok := arith[s.Op.Operator()]; ok {
-		old := b.load(p, t)[0]
-		words = []*Value{b.typed(op, t, old, b.pad(words, 1)[0])}
+	if op := s.Op.Operator(); op != lexer.Assign {
+		words = b.compound(op, t, b.load(p, t), words)
 	}
 	b.store(p, b.fit(t, words))
 	if s.Flag != nil {
 		b.setFlag(s.Flag, 1)
 	}
+}
+
+func (b *builder) compound(op lexer.Kind, t *types.Type, old, value []*Value) []*Value {
+	if t == types.Str {
+		return b.composePieces([]piece{{words: old, typ: t}, {words: value, typ: t}})
+	}
+	return []*Value{b.typed(arith[op], t, old[0], b.pad(value, 1)[0])}
 }
 
 func (b *builder) setFlag(flag *ast.Local, live int64) {

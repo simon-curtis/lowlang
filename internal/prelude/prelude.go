@@ -2,6 +2,7 @@ package prelude
 
 import (
 	"fmt"
+	"slices"
 
 	"lowlang/internal/ast"
 )
@@ -53,6 +54,9 @@ const (
 	WaiterIndex       = "index"
 	WaiterOK          = "ok"
 	ChanLock          = "lock"
+	ProbeState        = "state"
+	ProbeWake         = "wake"
+	BoxValue          = "value"
 	mapTypeParams     = 2
 	chanTypeParams    = 1
 )
@@ -109,7 +113,6 @@ var Entries = []Entry{
 	{ChanSend, ChanOp, 2},
 	{ChanRecv, ChanOp, 1},
 	{ChanClose, ChanOp, 1},
-	{Box, ChanOp, 0},
 	{SelRecv, ChanOp, 2},
 	{SelSend, ChanOp, 2},
 	{SelWaitRecv, ChanOp, 4},
@@ -120,12 +123,18 @@ var Entries = []Entry{
 type Layout struct {
 	Func  string
 	Field string
+	First bool
 }
 
 var Layouts = []Layout{
-	{Waiter, WaiterIndex},
-	{Waiter, WaiterOK},
-	{ChanNew, ChanLock},
+	{Waiter, WaiterIndex, false},
+	{Waiter, WaiterOK, false},
+	{ChanNew, ChanLock, false},
+	{SelRecv, ProbeState, false},
+	{SelRecv, ProbeWake, false},
+	{SelSend, ProbeState, false},
+	{SelSend, ProbeWake, false},
+	{Box, BoxValue, true},
 }
 
 func Instances(role Role) []string {
@@ -182,25 +191,23 @@ func validateLayout(l Layout, funcs map[string]*ast.Func, structs map[string]*as
 	if !ok {
 		return fmt.Errorf("prelude: the compiler reads %s from the result of %s but the prelude does not declare it", l.Field, l.Func)
 	}
-	if fn.Result == nil || !fn.Result.Pointer || fn.Result.Elem == nil {
-		return fmt.Errorf("prelude: the compiler reads %s from the result of %s but it does not return a pointer to a struct", l.Field, l.Func)
+	if fn.Result == nil || fn.Result.Pointer && fn.Result.Elem == nil {
+		return fmt.Errorf("prelude: the compiler reads %s from the result of %s but it does not return a struct", l.Field, l.Func)
 	}
-	name := fn.Result.Elem.Name
+	name := fn.Result.Name
+	if fn.Result.Pointer {
+		name = fn.Result.Elem.Name
+	}
 	s, ok := structs[name]
 	if !ok {
 		return fmt.Errorf("prelude: %s returns %s but the prelude does not declare that struct", l.Func, name)
 	}
-	if !declaresField(s, l.Field) {
+	at := slices.IndexFunc(s.Fields, func(f *ast.FieldDecl) bool { return f.Name == l.Field })
+	if at < 0 {
 		return fmt.Errorf("prelude: the compiler reads %s.%s from the result of %s but the struct has no such field", name, l.Field, l.Func)
 	}
-	return nil
-}
-
-func declaresField(s *ast.StructDecl, name string) bool {
-	for _, f := range s.Fields {
-		if f.Name == name {
-			return true
-		}
+	if l.First && at != 0 {
+		return fmt.Errorf("prelude: the compiler expects %s.%s to be the first field", name, l.Field)
 	}
-	return false
+	return nil
 }

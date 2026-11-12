@@ -2,6 +2,7 @@ package check
 
 import (
 	"fmt"
+	"path"
 
 	"lowlang/internal/ast"
 	"lowlang/internal/regex"
@@ -9,7 +10,7 @@ import (
 )
 
 func GeneratedRegex() (name, signature string) {
-	return regex.Generator, fmt.Sprintf("fn %s(pattern: str) -> regex.Regex", regex.Generator)
+	return regex.Generator, fmt.Sprintf("fn %s(pattern: %s) -> %s.%s", regex.Generator, types.Str, path.Base(regex.Module), regex.Result)
 }
 
 func TakesFirst(fn *ast.Func, t *types.Type) bool {

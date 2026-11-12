@@ -449,6 +449,17 @@ func (p *Parser) genericLit(name lexer.Token) *ast.StructLit {
 	return lit
 }
 
+func (p *Parser) literal(name lexer.Token, module string) *ast.StructLit {
+	lit := p.genericLit(name)
+	if lit == nil && p.at(lexer.LBrace) && !p.noStruct {
+		lit = p.structLit(name)
+	}
+	if lit != nil {
+		lit.Module = module
+	}
+	return lit
+}
+
 func (p *Parser) instance(x ast.Expr) *ast.Instance {
 	start, pos := p.i, p.tok().Pos
 	var args []*ast.TypeName
@@ -838,11 +849,8 @@ func (p *Parser) primary() ast.Expr {
 		return &ast.BoolLit{Value: t.Kind == lexer.True, Pos: t.Pos}
 	case lexer.Ident:
 		p.next()
-		if lit := p.genericLit(t); lit != nil {
+		if lit := p.literal(t, ""); lit != nil {
 			return lit
-		}
-		if p.at(lexer.LBrace) && !p.noStruct {
-			return p.structLit(t)
 		}
 		return &ast.Ident{Name: t.Text, Pos: t.Pos}
 	case lexer.LParen:
@@ -985,16 +993,10 @@ func (p *Parser) postfix(x ast.Expr) ast.Expr {
 			p.next()
 			name := p.expect(lexer.Ident)
 			if module, ok := x.(*ast.Ident); ok {
-				if lit := p.genericLit(name); lit != nil {
-					lit.Module = module.Name
+				if lit := p.literal(name, module.Name); lit != nil {
 					x = lit
 					continue
 				}
-			}
-			if module, ok := x.(*ast.Ident); ok && p.at(lexer.LBrace) && !p.noStruct {
-				x = p.structLit(name)
-				x.(*ast.StructLit).Module = module.Name
-				continue
 			}
 			x = &ast.Selector{X: x, Name: name.Text, Pos: name.Pos}
 		case lexer.Question:

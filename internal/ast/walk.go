@@ -89,10 +89,11 @@ func (w walker) node(n Node) {
 			w.node(n.Body)
 		}
 	case *Spawn:
-		if n.Call != nil {
+		if n.Body != nil {
+			w.block(n.Body)
+		} else {
 			w.node(n.Call)
 		}
-		w.block(n.Body)
 	case *Send:
 		w.expr(n.Chan)
 		w.expr(n.Value)

@@ -63,13 +63,8 @@ func (c *Checker) renderCall(e *ast.Call) {
 }
 
 func (c *Checker) renderIntoCall(e *ast.Call) {
-	buffer, bufferOK := e.Args[0].(*ast.Ref)
-	path, pathOK := e.Args[1].(*ast.Ref)
-	if !bufferOK || !pathOK {
-		c.fail(e.Pos, "__render_into needs a mut []u8 and a mut []i64")
-	}
-	c.ref(buffer, c.universe.Slice(types.U8))
-	c.ref(path, c.universe.Slice(types.I64))
+	c.address(c.mutOf(e, 0, c.universe.Slice(types.U8)))
+	c.address(c.mutOf(e, 1, c.universe.Slice(types.I64)))
 	t := c.plain(e.Args[2], nil)
 	c.exclusive(e.Args)
 	e.Builtin, e.Type = builtin.None, types.Void

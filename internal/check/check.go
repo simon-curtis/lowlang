@@ -235,7 +235,7 @@ func (c *Checker) check(files []*ast.File) {
 	}
 	c.checkDrops(files)
 	c.checkDefaults(files)
-	c.checkMain()
+	c.checkMain(files)
 	for _, fn := range funcs {
 		c.function(fn)
 	}
@@ -430,15 +430,23 @@ func (c *Checker) resultOf(result, errName *ast.TypeName) *types.Type {
 	return c.universe.Result(ok, err)
 }
 
-func (c *Checker) checkMain() {
+func (c *Checker) checkMain(files []*ast.File) {
 	main, ok := c.scope("").funcs["main"]
 	if !ok {
-		c.fail(diag.Pos{Line: 1, Col: 1}, "missing function main")
+		c.fail(entryStart(files), "missing function main")
 	}
 	ret := main.RetType
 	if len(main.Params) > 0 || main.TypeParams != nil || (ret != types.Void && (ret.Kind != types.ResultKind || ret.Ok != types.Void)) {
 		c.fail(main.Pos, "main must take no parameters and return nothing or ! E")
 	}
+}
+
+func entryStart(files []*ast.File) diag.Pos {
+	i := slices.IndexFunc(files, func(f *ast.File) bool { return f.Module == "" && f.Path != "" })
+	if i < 0 {
+		return diag.Start("")
+	}
+	return diag.Start(files[i].Path)
 }
 
 func (c *Checker) function(fn *ast.Func) {
@@ -735,25 +743,37 @@ func (c *Checker) bind(s *ast.Let) *types.Type {
 func (c *Checker) assign(s *ast.Assign) {
 	t := c.assignTarget(s)
 	op := s.Op.Operator()
+	if op != lexer.Assign {
+		c.requireOperator(op, t, s.Pos)
+	}
 	switch {
-	case op == lexer.Assign:
-	case isVector(t):
-		c.vectorAssign(s, t)
-		return
-	case op == lexer.Plus || op == lexer.Minus || op == lexer.Star || op == lexer.Slash:
-		c.requireNumber(t, s.Op, s.Pos)
+	case op == lexer.Shl || op == lexer.Shr:
+		c.shiftCount(op, s.Value)
+	case op != lexer.Assign && isVector(t):
+		c.vectorSplatOperand(s, t)
 	default:
-		c.requireInteger(t, s.Op, s.Pos)
+		value := c.plain(s.Value, t)
+		if !t.Accepts(value) {
+			c.fail(s.Value.Position(), "cannot assign %s to a place of type %s", value, t)
+		}
+		c.droppableAssign(s, t)
 	}
-	if op == lexer.Shl || op == lexer.Shr {
-		c.requireInteger(c.plain(s.Value, nil), s.Op, s.Value.Position())
-		return
+}
+
+func (c *Checker) requireOperator(op lexer.Kind, t *types.Type, pos diag.Pos) {
+	switch {
+	case isVector(t):
+		c.vectorOperator(op, t, pos)
+	case op == lexer.Plus && t == types.Str:
+	case op == lexer.Plus || op == lexer.Minus || op == lexer.Star || op == lexer.Slash:
+		c.requireNumber(t, op, pos)
+	default:
+		c.requireInteger(t, op, pos)
 	}
-	value := c.plain(s.Value, t)
-	if !t.Accepts(value) {
-		c.fail(s.Value.Position(), "cannot assign %s to a place of type %s", value, t)
-	}
-	c.droppableAssign(s, t)
+}
+
+func (c *Checker) shiftCount(op lexer.Kind, count ast.Expr) {
+	c.requireInteger(c.plain(count, nil), op, count.Position())
 }
 
 func (c *Checker) assignTarget(s *ast.Assign) *types.Type {
@@ -811,10 +831,30 @@ func (c *Checker) ref(r *ast.Ref, want *types.Type) {
 
 func (c *Checker) borrow(r *ast.Ref) *types.Type {
 	t := c.borrowInPlace(r)
+	c.address(r)
+	return t
+}
+
+func (c *Checker) address(r *ast.Ref) {
 	if where, _ := rootOf(r.X); where.local != nil && !where.local.Ref {
 		where.local.Addressed = true
 	}
-	return t
+}
+
+func (c *Checker) mutOf(e *ast.Call, i int, want *types.Type) *ast.Ref {
+	r := e.Args[i].(*ast.Ref)
+	if r.Type != want {
+		c.fail(r.Pos, "expected %s, found %s", want, r.Type)
+	}
+	return r
+}
+
+func (c *Checker) mutSlice(b *Builtin, e *ast.Call) *types.Type {
+	r := e.Args[0].(*ast.Ref)
+	if r.Type.Kind != types.SliceKind {
+		c.fail(r.Pos, "%s needs a slice, found %s", b.Name, r.Type)
+	}
+	return r.Type
 }
 
 func (c *Checker) borrowInPlace(r *ast.Ref) *types.Type {
@@ -1476,16 +1516,12 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 		c.coalesce(e)
 	case lexer.Shl, lexer.Shr:
 		e.Type = c.plain(e.X, arithmetic(want))
-		if isVector(e.Type) {
-			c.vectorShift(e, e.Type)
-			return
-		}
-		c.requireInteger(e.Type, e.Op, e.X.Position())
-		c.requireInteger(c.plain(e.Y, nil), e.Op, e.Y.Position())
+		c.requireOperator(e.Op, e.Type, e.X.Position())
+		c.shiftCount(e.Op, e.Y)
 	case lexer.Eq, lexer.NotEq:
 		t := c.operands(e, nil)
 		if isVector(t) {
-			c.vectorOperator(e, t)
+			e.Type = t
 			return
 		}
 		if !t.Comparable() && t != types.Never {
@@ -1495,30 +1531,16 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 	case lexer.Lt, lexer.LtEq, lexer.Gt, lexer.GtEq:
 		t := c.operands(e, nil)
 		if isVector(t) {
-			c.vectorOperator(e, t)
+			e.Type = t
 			return
 		}
 		if !t.Ordered() && t != types.Never {
 			c.fail(e.Pos, "operator %s requires a number or str, found %s", e.Op, t)
 		}
 		e.Type = types.Bool
-	case lexer.Percent, lexer.Amp, lexer.Pipe, lexer.Caret:
-		e.Type = c.operands(e, arithmetic(want))
-		if isVector(e.Type) {
-			c.vectorOperator(e, e.Type)
-			return
-		}
-		c.requireInteger(e.Type, e.Op, e.Pos)
 	default:
 		e.Type = c.operands(e, arithmetic(want))
-		if isVector(e.Type) {
-			c.vectorOperator(e, e.Type)
-			return
-		}
-		if e.Op == lexer.Plus && e.Type == types.Str {
-			return
-		}
-		c.requireNumber(e.Type, e.Op, e.Pos)
+		c.requireOperator(e.Op, e.Type, e.Pos)
 	}
 }
 
@@ -1696,11 +1718,8 @@ func (c *Checker) embedded(e *ast.Call, abs string, data []byte) {
 }
 
 func (c *Checker) deleteEntry(e *ast.Call) {
-	r, ok := e.Args[0].(*ast.Ref)
-	if !ok {
-		c.fail(e.Args[0].Position(), "delete needs a mut map; write delete(mut m, key)")
-	}
-	t := c.borrowInPlace(r)
+	r := e.Args[0].(*ast.Ref)
+	t := r.Type
 	if t.Kind != types.MapKind {
 		c.fail(r.Pos, "delete needs a map, found %s", t)
 	}
@@ -1722,35 +1741,21 @@ func (c *Checker) cString(e ast.Expr, t *types.Type) {
 	}
 }
 
-func (c *Checker) push(e *ast.Call) {
-	r, ok := e.Args[0].(*ast.Ref)
-	if !ok {
-		c.fail(e.Args[0].Position(), "push needs a mut slice; write push(mut s, value)")
-	}
-	t := c.borrowInPlace(r)
-	if t.Kind != types.SliceKind {
-		c.fail(r.Pos, "push needs a slice, found %s", t)
-	}
+func (c *Checker) push(b *Builtin, e *ast.Call) {
+	t := c.mutSlice(b, e)
 	c.expectType(e.Args[1], t.Elem)
 	e.Type = types.Void
 }
 
-func (c *Checker) shrink(b *Builtin, e *ast.Call) {
-	name := b.Name
-	r, ok := e.Args[0].(*ast.Ref)
-	if !ok {
-		c.fail(e.Args[0].Position(), "%s needs a mut slice; write %s(mut s)", name, name)
-	}
-	t := c.borrowInPlace(r)
-	if t.Kind != types.SliceKind {
-		c.fail(r.Pos, "%s needs a slice, found %s", name, t)
-	}
-	e.Type = types.Void
-	if e.Builtin == builtin.Pop {
-		e.Type = c.universe.Optional(t.Elem)
-		return
-	}
+func (c *Checker) pop(b *Builtin, e *ast.Call) {
+	t := c.mutSlice(b, e)
+	e.Type = c.universe.Optional(t.Elem)
+}
+
+func (c *Checker) truncate(b *Builtin, e *ast.Call) {
+	c.mutSlice(b, e)
 	c.integer(e.Args[1])
+	e.Type = types.Void
 }
 
 func (c *Checker) syscall(e *ast.Call) {

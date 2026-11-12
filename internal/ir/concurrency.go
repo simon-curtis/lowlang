@@ -26,6 +26,12 @@ func (b *builder) chanField(c *types.Type, name string) *types.Field {
 	return b.preludeField(instance, name)
 }
 
+func (b *builder) probeWords(fn string, c *types.Type) (state, wake int) {
+	instance := types.InstanceName(fn, []*types.Type{c.Elem})
+	result := b.preludeFunc(instance).Ret
+	return result.Field(prelude.ProbeState).Word(), result.Field(prelude.ProbeWake).Word()
+}
+
 func (b *builder) refAddress(arg ast.Expr) *Value {
 	r := arg.(*ast.Ref)
 	return b.address(b.placeOf(r.X))
@@ -139,16 +145,19 @@ func (b *builder) trySelect(i int, a *selectArm, outcome int) {
 	b.branch(b.emit(OpLt, b.readTemp(outcome, 1)[0], b.constant(0)), try, skip)
 	b.enter(try)
 	var probe []*Value
+	var state, wake int
 	if a.sc.Kind == ast.RecvCase {
+		state, wake = b.probeWords(prelude.SelRecv, a.chant)
 		probe = b.chanNamed(prelude.SelRecv, a.chant, a.ch, a.box)
 	} else {
+		state, wake = b.probeWords(prelude.SelSend, a.chant)
 		args := append([]*Value{a.ch}, a.val...)
 		probe = b.chanNamed(prelude.SelSend, a.chant, args...)
 	}
-	b.branch(b.emit(OpLt, probe[0], b.constant(0)), skip, hit)
+	b.branch(b.emit(OpLt, probe[state], b.constant(0)), skip, hit)
 	b.enter(hit)
-	ok := b.emit(OpEq, probe[0], b.constant(1))
-	b.writeTemp(outcome, []*Value{b.constant(int64(i)), ok, probe[1]})
+	ok := b.emit(OpEq, probe[state], b.constant(1))
+	b.writeTemp(outcome, []*Value{b.constant(int64(i)), ok, probe[wake]})
 	b.jump(skip)
 	b.enter(skip)
 }

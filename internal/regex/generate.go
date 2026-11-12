@@ -10,6 +10,7 @@ import (
 const (
 	Module       = "std/regex"
 	Generator    = "generated"
+	Result       = "Regex"
 	maxGenerated = 2000
 	inlineRanges = 4
 )
@@ -59,7 +60,7 @@ func (g *generator) temp(prefix string) string {
 }
 
 func (g *generator) interpreted(pattern string) {
-	g.line("fn %s() -> Regex {", g.name)
+	g.line("fn %s() -> %s {", g.name, Result)
 	g.line("compile(%s) catch {", lexer.Quote(pattern))
 	g.line("_ => __panic(%s)", lexer.Quote("regex: a generated pattern failed to compile"))
 	g.line("}")
@@ -132,7 +133,7 @@ func (g *generator) constructor(groups int) {
 	if g.stops != nil {
 		skip = g.name + "_skip"
 	}
-	g.line("fn %s() -> Regex {", g.name)
+	g.line("fn %s() -> %s {", g.name, Result)
 	g.line("let engine = Engine { program: [], size: %d, start: %s_start, step: %s_step, skip: %s }", len(g.insts), g.name, g.name, skip)
 	g.line("Regex { engine, groups: %d }", groups)
 	g.line("}")

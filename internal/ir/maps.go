@@ -2,6 +2,7 @@ package ir
 
 import (
 	"lowlang/internal/ast"
+	"lowlang/internal/lexer"
 	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
@@ -47,26 +48,30 @@ func (b *builder) assignEntry(s *ast.Assign) {
 	value := b.value(s.Value, m.Elem)
 	table := b.word(entry.X)
 	key := b.withKey(table, entry.Index, m)
-	if op, ok := arith[s.Op.Operator()]; ok {
+	if op := s.Op.Operator(); op != lexer.Assign {
 		current := b.mapCall(prelude.MapGet, m, key...)
-		old := b.present(current)
-		value = []*Value{b.typed(op, m.Elem, old, value[0])}
+		old := b.present(current, m.Elem.Size())
+		value = b.compound(op, m.Elem, old, value)
 	}
 	args := append(key, value...)
 	b.mapCall(prelude.MapSet, m, args...)
 }
 
-func (b *builder) present(optional []*Value) *Value {
+func (b *builder) present(optional []*Value, words int) []*Value {
 	temp := b.newTemp()
 	found := b.newBlock()
 	done := b.newBlock()
-	b.writeTemp(temp, []*Value{b.constant(0)})
+	zero := make([]*Value, words)
+	for i := range zero {
+		zero[i] = b.constant(0)
+	}
+	b.writeTemp(temp, zero)
 	b.branch(optional[0], found, done)
 	b.enter(found)
-	b.writeTemp(temp, optional[1:2])
+	b.writeTemp(temp, optional[1:1+words])
 	b.jump(done)
 	b.enter(done)
-	return b.readTemp(temp, 1)[0]
+	return b.readTemp(temp, words)
 }
 
 func (b *builder) deleteEntry(e *ast.Call) []*Value {

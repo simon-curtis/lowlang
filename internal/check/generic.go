@@ -450,6 +450,8 @@ func (c *Checker) genericTarget(x ast.Expr) *ast.Func {
 func (c *Checker) instanceCall(e *ast.Call, inst *ast.Instance, want *types.Type) {
 	if id, ok := inst.X.(*ast.Ident); ok {
 		if b := c.builtinNamed(id.Name); b != nil && b.construct != nil {
+			c.typeArity(b, inst)
+			c.arity(b, e)
 			b.construct(c, e, inst)
 			return
 		}
