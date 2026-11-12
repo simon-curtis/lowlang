@@ -199,6 +199,19 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 	case "print_str":
 		b.runtimeVoid("print_str", b.value(arg, types.Str)...)
 		return nil
+	case "print_render":
+		words := b.value(arg, arg.TypeOf())
+		text := b.renderString(e.Render, words)
+		b.runtimeVoid("print_str", text...)
+		return nil
+	case "__render":
+		words := b.value(arg, arg.TypeOf())
+		return b.renderString(e.Render, words)
+	case "__address":
+		return []*Value{b.word(arg)}
+	case "__serialize":
+		b.serialize(e)
+		return nil
 	case "print_float":
 		name := "__format_f64"
 		if arg.TypeOf() == types.F32 {
@@ -209,6 +222,17 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 	}
 	b.runtimeVoid(e.Builtin, b.word(arg))
 	return nil
+}
+
+func (b *builder) serialize(e *ast.Call) {
+	value := b.value(e.Args[0], e.Args[0].TypeOf())
+	writer := b.value(e.Args[1], e.Args[1].TypeOf())
+	zero := b.constant(0)
+	path := b.slot(3)
+	b.store(place{addr: path}, []*Value{zero, zero, zero})
+	args := append(writer, path)
+	args = append(args, value...)
+	b.invoke(b.funcs[e.Target], args)
 }
 
 func (b *builder) make(elem *types.Type, n *Value) []*Value {

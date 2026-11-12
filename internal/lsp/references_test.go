@@ -149,6 +149,32 @@ func TestRenameFieldExpandsShorthand(t *testing.T) {
 	compiles(t, f.path, param)
 }
 
+func TestInterpolationWithWidthAndFormat(t *testing.T) {
+	c := start(t)
+	src := "fn main() {\n    let ratio = 3.14159\n    print(\"{ratio,10:f2}|{ratio:e1}|{ratio, -8}|{ratio}\")\n}\n"
+	f := scratch(t, "specs.low", src)
+	c.open(f, f.src)
+	for _, probe := range []string{"{ratio,10:f2}", "{ratio:e1}", "{ratio, -8}", "{ratio}"} {
+		at := f.at(t, probe, 1)
+		if got := c.hover(f, at); !strings.Contains(got, "f64") {
+			t.Errorf("hover on ratio in %s = %q, want its type", probe, got)
+		}
+		if got := c.definition(f, at); got.Range.Start != f.at(t, "let ratio", 4) {
+			t.Errorf("definition of ratio in %s = %+v", probe, got)
+		}
+	}
+	references := c.references(f, f.at(t, "{ratio,10:f2}", 1), true)
+	if len(references) != 5 {
+		t.Errorf("references to ratio = %d, want 5", len(references))
+	}
+	edited := c.renamed(f, f.at(t, "let ratio", 4), "r")
+	want := "print(\"{r,10:f2}|{r:e1}|{r, -8}|{r}\")"
+	if got := string(edited[f.path]); !strings.Contains(got, want) {
+		t.Errorf("rename left specs misplaced:\n%s", got)
+	}
+	compiles(t, f.path, edited)
+}
+
 func TestRenameBindingArm(t *testing.T) {
 	c := start(t)
 	src := `enum Oops {

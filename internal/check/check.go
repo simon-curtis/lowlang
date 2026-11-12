@@ -1428,13 +1428,33 @@ func (c *Checker) mapLit(e *ast.MapLit, want *types.Type) {
 }
 
 func (c *Checker) interp(e *ast.Interp) {
-	for _, part := range e.Parts {
+	e.Renders = make([]*ast.Func, len(e.Parts))
+	for i, part := range e.Parts {
 		t := c.plain(part, nil)
-		if !t.Number() && t != types.Bool && t != types.Str {
-			c.fail(part.Position(), "cannot interpolate a value of type %s", t)
+		if spec := e.Specs[i]; spec != nil && spec.Format != nil {
+			c.requireFormattable(spec.Format, t)
 		}
+		if t.Number() || t == types.Bool || t == types.Str {
+			continue
+		}
+		c.requireValue(part.Position(), "interpolation", t)
+		e.Renders[i] = c.renderer(t, part.Position())
 	}
 	e.Type = types.Str
+}
+
+func (c *Checker) requireFormattable(f *ast.Format, t *types.Type) {
+	if t == types.Never || f.IntegerOnly() && t.Integer() || !f.IntegerOnly() && t.Number() {
+		return
+	}
+	if t.Kind != types.ParamKind {
+		c.fail(f.Pos, "cannot format a value of type %s with %q", t, f.Text)
+	}
+	constraint := "Number"
+	if f.IntegerOnly() {
+		constraint = "Integer"
+	}
+	c.fail(f.Pos, "cannot format a value of type %s with %q; declare %s: %s", t, f.Text, t, constraint)
 }
 
 func (c *Checker) structLit(e *ast.StructLit, want *types.Type) {
@@ -1678,6 +1698,7 @@ var builtins = map[string]bool{
 	"delete": true, "embed": true, "__str_raw": true,
 	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
 	"__bits": true, "__str_view": true, "__extend": true, "__extend_by": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true, "__ctz": true, "__clock_nanos": true, "__hash_seed": true, "__argc": true, "__argv": true, "__envv": true,
+	"__render": true, "__render_into": true, "__address": true,
 	"__spawn": true, "__current": true, "__park": true, "__ready": true, "__lock": true, "__unlock": true, "__cas": true, "__panic": true,
 	"__context": true, "__set_context": true, "__has_context": true,
 }
@@ -1875,6 +1896,7 @@ func (c *Checker) print(e *ast.Call) {
 		c.fail(e.Pos, "print takes 1 argument, found %d", len(e.Args))
 	}
 	t := c.plain(e.Args[0], nil)
+	e.Render = nil
 	switch {
 	case t == types.U64:
 		e.Builtin = "print_u64"
@@ -1886,10 +1908,10 @@ func (c *Checker) print(e *ast.Call) {
 		e.Builtin = "print_bool"
 	case t == types.Str:
 		e.Builtin = "print_str"
-	case t.Kind == types.ParamKind && t.Number():
-		e.Builtin = "print_i64"
 	default:
-		c.fail(e.Args[0].Position(), "cannot print a value of type %s", t)
+		c.requireValue(e.Args[0].Position(), "print", t)
+		e.Builtin = "print_render"
+		e.Render = c.renderer(t, e.Pos)
 	}
 	e.Type = types.Void
 }
@@ -1986,6 +2008,14 @@ func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
 		c.syscall(e)
 	case "__serialize":
 		c.serializeCall(e)
+	case "__serialize_into":
+		c.serializeIntoCall(e)
+	case "__render":
+		c.renderCall(e)
+	case "__render_into":
+		c.renderIntoCall(e)
+	case "__address":
+		c.addressCall(e)
 	case "__vload", "__vstore", "__vsplat", "__vmask", "__vshuffle", "__vselect", "__vmin", "__vmax", "__vlane", "__vwith":
 		c.vectorIntrinsic(e, name, want)
 	case "__ctz":

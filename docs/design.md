@@ -174,7 +174,7 @@ fn find(data: []u8, c: u8) -> i64 {
 - A scalar operand of the lane type is broadcast, so `chunk == '"'` compares every lane.
 - `u8x32(v)` reinterprets a vector of the same width.
 - `std/simd` provides `read` and `write` between a vector and a slice at an element index, `read_str`, `splat`, `mask` (one bit per lane from its top bit), `any`, `blend`, `min`, `max`, `lane`, `with_lane`, `shuffle` and `shuffle16` (a byte table lookup within each 16-byte half, zero where the index has its top bit set), `trailing_zeros`, `count_ones` and `find_byte`. Reads and writes are bounds-checked.
-- Vectors are values: they can be passed, returned, stored in fields and slices, and compared lane by lane. They cannot be compared with `==` as a whole or printed.
+- Vectors are values: they can be passed, returned, stored in fields and slices, and compared lane by lane. They cannot be compared with `==` as a whole. They print as `<1, 2, 3, 4>`.
 
 ### Slices
 
@@ -250,6 +250,7 @@ let score = 9.0
 ```low
 let name = "Ada"
 let line = "{name} is {age}, ratio {score / 2.0}"
+let row = "{name,-8}|{age,4:d3}|{score,8:f2}|{age:x4}|{score:#,##0.0#}"
 let full = name + " Lovelace"
 for c in "héllo" { print(c) }
 let first: u8 = name[0]
@@ -259,9 +260,36 @@ let copy = str(bytes(name))
 - `str` is an immutable pointer and length over UTF-8 bytes.
 - `s.len` is the length in bytes, `s[i]` reads a byte as `u8`, and `s[a..b]` shares a byte range.
 - `for c in s` visits code points as `u32`; `for i, c in s` also binds each code point's byte offset. Invalid UTF-8 yields U+FFFD for one byte.
-- `"{expr}"` interpolates a number, `bool` or `str`; `{{` and `}}` are literal braces.
+- `"{expr}"` interpolates a value of any type; `{{` and `}}` are literal braces. `print(expr)` writes the same text followed by a newline.
+- `"{expr,width:format}"` aligns and formats the value, as in `"hello {name,13} your age is {age:##}"`, `"{price,10:f2}"`, `"{id:x8}"` and `"{n,-6}|"`. Both parts are optional, and `{x,}` and `{x:}` are errors.
+  - The expression ends at the first `,` or `:` outside brackets, which is where the width starts; the width ends at the next `:` or at the closing brace; the format is all the text up to the closing brace, so it may contain `,` and `.`.
+  - A width is a non-zero decimal integer with an optional `-` and optional surrounding spaces. A positive width right-aligns and a negative one left-aligns, padding with spaces to that many code points. A longer text is never cut. A width applies to every type, including `str` and the default text of a struct.
+  - A format has no spaces and is checked at compile time. It applies to integers and floats, and is either a standard format, one letter with an optional precision of 0 to 99, or a picture. The compiler lowers it to prelude calls with constant parameters, so no format text is parsed at run time.
+- Standard formats, where `N` is the precision:
+
+  | Format | Types | Output |
+  |---|---|---|
+  | `dN` | integers | decimal with at least `N` digits, zero-padded after the sign: `{-5:d3}` is `-005` |
+  | `xN`, `XN` | integers | lower or upper case hex with at least `N` digits. A negative value is its two's complement at the width of its type: `{i32(-1):x}` is `ffffffff`, `{-1:x}` is `ffffffffffffffff` |
+  | `bN` | integers | binary, with the rules of `x` |
+  | `fN` | integers, floats | fixed point with `N` decimals, 2 by default: `{3.14159:f3}` is `3.142`, `{7:f1}` is `7.0` |
+  | `eN` | integers, floats | one digit, then `N` decimals (6 by default) and an exponent written like the default float text: `{12345.678:e2}` is `1.23e+4` |
+  | `nN` | integers, floats | like `f` with a `,` between every three integer digits; `N` is 0 for an integer and 2 for a float by default: `{1234567:n}` is `1,234,567` |
+
+- A picture is a format of only `0`, `#`, `,` and `.`, with at least one `0` or `#` and at most one `.`.
+  - In the integer part each `0` is a digit that is always written and each `#` is a placeholder. A `,` between two placeholders groups the integer digits in threes. With no `0` in the integer part a zero integer part is omitted: `{36:##}` is `36`, `{0:##}` is empty and `{0.5:#.##}` is `.5`, while `{0.5:0.##}` is `0.5`.
+  - In the fraction part the value is rounded to the number of `0`s plus `#`s, then trailing zeros are dropped down to the number of `0`s. The `.` is dropped when no decimals remain: `{2.5:0.##}` is `2.5`, `{2:0.##}` is `2`, `{3.14159:0.00}` is `3.14`, `{1234567.891:#,##0.00}` is `1,234,567.89` and `{5:000}` is `005`.
+- Rounding is correct for the exact binary value of a float and breaks ties to even, as glibc's `printf` does: `{0.125:f2}` is `0.12`, `{0.375:f2}` is `0.38`, `{2.675:f2}` is `2.67` because 2.675 lies just below the tie, and `{1e300:f2}` writes every digit. An `f32` formats its own exact value and integers are exact up to the whole range of `u64` and `i64`. A negative value that rounds to zero keeps its sign, as in `-0.00`. `NaN`, `inf` and `-inf` ignore the format, and the width still applies.
+- A format on a value of a type other than an integer or float is an error: `cannot format a value of type str with "f2"`. So is `d`, `x`, `X` or `b` on a float, an unknown letter, a precision above 99 and a picture with other characters, two `.` or no `0` or `#`.
 - `a + b` concatenates. A chain such as `a + b + c + d`, with any interpolations inside it, is one operation that allocates the result once.
 - Floats are formatted as the shortest decimal that reads back to the same value: positional for exponents from -6 to 20, otherwise `1.5e-7` or `1e+21`. Infinities print as `inf` and `-inf`, NaN as `NaN`.
+- Every type has a default text, generated by the compiler with no annotation or constraint:
+  - Integers, floats and `bool` use the formats above and `true`/`false`. A `str` that is itself printed or interpolated is inserted unchanged; a `str` inside another value is quoted with `"`, with `"`, `\`, newline and tab escaped.
+  - A struct is `Point{x: 1, y: 2}`: its name without module or type arguments (`Stack{items: [1]}`) and every field, private ones included.
+  - An enum variant is its name, `Leaf`; with positional fields `Node(a, b)`; with labelled fields `Move{x: 1, y: 2}`. An optional is `none` or its value.
+  - A slice is `[1, 2, 3]`, a map `{k: v, k2: v2}` in iteration order with keys rendered like any nested value, and a vector `<1, 2, 3, 4>`. A `[]u8` is `0x` and lowercase hex digits, `0x6869`.
+  - A pointer renders its target. A pointer met again while it is being rendered is `<cycle>`, so shared pointers render in full each time and only a cycle is cut.
+  - A function or channel is its type, `fn(i64) -> i64` or `chan[str]`. A `ptr[T]` is its type and address, `ptr[u8](0x7ffd1c2a)`, and a null one `ptr[u8](0x0)`.
 - `'a'` is a code point of type `u32`, or `u8` where one is expected.
 - `bytes(s)` copies a string into a `[]u8`; `str(b)` copies one back.
 - `==` and `!=` compare contents. `<`, `<=`, `>` and `>=` compare bytes in order, which for UTF-8 is code point order.
@@ -820,10 +848,10 @@ let pick: fn(i64, i64) -> i64 = max
   - `Eq` allows `==` and `!=`. It is met by numbers, `bool`, `str`, pointers, channels, and structs and enums whose fields are all `Eq`.
   - `Ord` adds `<`, `<=`, `>` and `>=`. It is met by numbers and `str`.
   - `Hash` adds use as a map key. It is met by integers, `bool`, `str` and pointers.
-  - `Number` adds arithmetic, numeric literals, conversion with `T(x)` and `print`.
-  - `Integer` adds bitwise operators and shifts, and implies `Hash`.
+  - `Number` adds arithmetic, numeric literals, conversion with `T(x)` and the `f`, `e` and `n` formats and pictures of interpolation.
+  - `Integer` adds bitwise operators and shifts and the `d`, `x`, `X` and `b` formats, and implies `Hash`.
   - `Float` is met by `f64` and `f32`.
-  - An unconstrained parameter can only be moved, stored and passed. Anything else a generic function needs, such as an ordering of its elements, is passed in as a function value.
+  - An unconstrained parameter can only be moved, stored, passed, printed and interpolated, with a width but no format, each instance rendering its own type. Anything else a generic function needs, such as an ordering of its elements, is passed in as a function value.
 - A generic body is checked once against its constraints, so a missing constraint is reported at the definition, not at a use.
 - Each generic function's type parameters are its own. Two functions may both name a parameter `T`, and a function type mentioning one is distinct from the same text mentioning the other.
 - Type arguments are inferred from the arguments, then from the expected type. They can be written explicitly: `max[u8](a, b)`, `Stack[str] { ... }`.
@@ -1152,7 +1180,7 @@ Every standard library resource that must be disposed of is a droppable owner bo
 
 `std/serde` defines a `Writer` and a `Reader`, structs of closures through which values are written and read. For every concrete type the compiler derives a function that writes a value to a `Writer`, a function that reads it from a `Reader`, and a `Schema` describing it:
 
-- Booleans, integers, floats and strings map to their primitives; `[]u8` to binary; slices to sequences; maps to maps with keys written as text; optionals to null or the value; pointers to their target.
+- Booleans, integers, floats and strings map to their primitives; `[]u8` to binary; slices to sequences; maps to maps with keys written as text; optionals to null or the value; pointers to their target, a shared pointer in full each time. A pointer reached again while its target is being written is a cycle and panics.
 - A struct is a map from field names to values, and every field takes part, private ones included. Reading skips unknown keys, uses a field's default when its key is missing, treats a missing optional field as `none`, and fails with `Missing` otherwise.
 - An enum variant without fields is its name. One with labelled fields is a single-key map from its name to a map of its fields, and one with positional fields maps its name to a sequence.
 - A schema records each type's kind, name, fields with whether they are required, and variants. A struct or enum reached again through a pointer while it is being described becomes a `Ref` to its name.
@@ -1375,6 +1403,7 @@ Prelude:
   - The generic map table.
   - Integer formatting.
   - Float formatting by unrounded scaling against a table of 128-bit powers of ten from 1e-348 to 1e347, which finds the shortest digits that read back to the same value without allocating.
+  - Formats and widths for interpolation. A float's exact decimal expansion is its mantissa times 2^e, built in base 10^9 limbs by repeated multiplication by 2 for a positive `e` and by 5 for a negative one, with the decimal point moved by `-e` places. An integer's digits are its magnitude. Rounding to the requested decimals or significant digits then works on those digits, using the exact remainder to break ties to even, so `f`, `e`, `n` and pictures need no approximation. NaN and infinities take the default text.
 - `cmd/tablegen pow10` generates the table twice: as the `__pow10_hi` and `__pow10_lo` functions the prelude holds, and as `std/text/pow10.bin`, which `std/text` embeds for float parsing because standard library files cannot call prelude functions.
 - Prelude names start with `__`, which user code cannot use. Four intrinsics are available only in the prelude:
   - `__bits` gives a float's bit pattern.
@@ -1460,9 +1489,11 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 
 The derivations are generated as source:
 
-- When the checker meets `__serialize(v, w)`, `__deserialize[T](r)` or `__schema[T]()` with a concrete type, it writes a function for that type in Low text, binding the type and each type it mentions to names like `__X0`.
+- When the checker meets `__serialize(v, w)`, `__deserialize[T](r)` or `__schema[T]()` with a concrete type, or a `print` or interpolation of a type other than a number, `bool` or `str`, it writes a function for that type in Low text, binding the type and each type it mentions to names like `__X0`.
 - It parses the text with the prelude's privileges, marks it trusted so it may read and build private fields, and checks it like a generic instance.
 - Calls inside it to the same intrinsics derive the types they reach. Each derived function is cached by type.
+- The serialization of a type is `fn(w: Writer, mut path: []i64, v: T)`. `path` holds the addresses of the pointers being written, pushed before a pointer's target is written and popped after it; a pointer already on it panics with `serde: cycle through *T`. `__serialize(v, w)` starts with an empty path, and the derived code recurses through `__serialize_into(w, mut path, x)`.
+- The rendering of a type is `fn(mut b: []u8, mut path: []i64, v: T)`, which appends to `b` through the prelude's `__append_*` functions. `path` holds the addresses of the pointers being rendered, pushed before a pointer's target is rendered and popped after it. A `print` or interpolation creates an empty buffer and path, calls it, and uses the buffer as the text; an interpolation appends into the buffer it is composing. `__render(v)` gives the text of any value with a `str` quoted, for `std/testing`'s `format`.
 - Bound names resolve in type positions, struct literals and variant selectors.
 - A field reference `T.field` is checked as `serde.Field[T, F]` and lowered to the field's name and index as constants.
 
@@ -1537,6 +1568,9 @@ The derivations are generated as source:
   - A concatenation chain and an interpolation, including interpolations and chains nested inside either, are flattened into one list of pieces. Adjacent literal pieces merge.
   - Every piece is evaluated first, in order. The result buffer is allocated once with the grow routine at the sum of the literal bytes, the lengths of the `str` pieces and the widest rendering of each number (20 for an integer, 25 for a float, 5 for a `bool`), which no rendering exceeds: the longest float is a negative value with exponent -6 and 17 significant digits, `-0.0000012345678901234567`.
   - A chain with no number pieces copies each piece with `rt_memmove` at a running offset. With number pieces the buffer lives in a frame slot, `str` pieces are copied at its length and numbers go through the prelude's `__append_*`.
+  - A piece with a width adds the width's size to the estimate, is appended into the buffer and then padded in place by `__align`, which counts code points from the byte offset where the piece started. A literal piece with a width is kept as a piece rather than merged into the text around it.
+  - A piece with a format calls `__append_decimal` (`d`), `__append_radix` (`x`, `X`, `b`, which masks a signed value to its type's width), or `__append_int_layout` or `__append_float_layout` (`f`, `e`, `n` and pictures) with the format's digits, decimals, grouping and mode as constants. An `f32` is widened to `f64` first, which is exact.
+  - A piece with a format or a derived rendering can write more than its estimate. A composition containing one appends its literal and `str` pieces with `__append_str`, which grows the buffer when needed, instead of copying at a running offset.
   - String ordering calls the prelude's `__str_cmp`.
 - Unreachable blocks are pruned after construction.
 

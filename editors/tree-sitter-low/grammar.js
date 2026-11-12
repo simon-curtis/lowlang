@@ -352,8 +352,14 @@ module.exports = grammar({
     interpolation: $ => seq(
       token.immediate('{'),
       field('value', $._expression),
+      optional(seq(',', field('width', $.interpolation_width))),
+      optional(seq(':', field('format', $.interpolation_format))),
       '}',
     ),
+
+    interpolation_width: _ => /-?[0-9]+/,
+
+    interpolation_format: _ => /[^}\s"]+/,
 
     boolean: _ => choice('true', 'false'),
 

@@ -136,9 +136,15 @@ func (p Pos) String() string {
 }
 
 type Part struct {
-	Text string
-	Expr bool
-	Pos  Pos
+	Text      string
+	Expr      bool
+	Pos       Pos
+	Aligned   bool
+	Width     string
+	WidthPos  Pos
+	Formatted bool
+	Format    string
+	FormatPos Pos
 }
 
 type Token struct {

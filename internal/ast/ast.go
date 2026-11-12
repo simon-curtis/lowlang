@@ -442,8 +442,10 @@ type MapLit struct {
 
 type Interp struct {
 	Typed
-	Parts []Expr
-	Pos   lexer.Pos
+	Parts   []Expr
+	Specs   []*Spec
+	Renders []*Func
+	Pos     lexer.Pos
 }
 
 type ForIn struct {
@@ -510,6 +512,7 @@ type Call struct {
 	Pos       lexer.Pos
 	Prepended bool
 	Target    *Func
+	Render    *Func
 	Builtin   string
 	Variant   *types.Variant
 	Embed     string

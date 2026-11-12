@@ -18,16 +18,19 @@ const (
 	serialize derivation = iota
 	deserialize
 	describe
+	render
 )
 
-var derivationNames = [...]string{serialize: "__write", deserialize: "__read", describe: "__describe"}
+var derivationNames = [...]string{serialize: "__write", deserialize: "__read", describe: "__describe", render: "__render"}
 
 type synth struct {
 	c     *Checker
+	home  *ast.File
 	pos   lexer.Pos
 	bound map[string]*types.Type
 	names map[*types.Type]string
 	out   strings.Builder
+	text  strings.Builder
 	temps int
 }
 
@@ -48,6 +51,24 @@ func (c *Checker) serializeCall(e *ast.Call) {
 	}
 	t := c.plain(e.Args[0], nil)
 	c.expectType(e.Args[1], c.serdeType("Writer", e.Pos))
+	e.Builtin, e.Type = "__serialize", types.Void
+	if !t.Abstract() {
+		e.Target = c.derive(serialize, t, e.Pos)
+	}
+}
+
+func (c *Checker) serializeIntoCall(e *ast.Call) {
+	if len(e.Args) != 3 {
+		c.fail(e.Pos, "__serialize_into takes 3 arguments, found %d", len(e.Args))
+	}
+	c.expectType(e.Args[0], c.serdeType("Writer", e.Pos))
+	path, ok := e.Args[1].(*ast.Ref)
+	if !ok {
+		c.fail(e.Pos, "__serialize_into needs a mut []i64")
+	}
+	c.ref(path, c.slice(types.I64))
+	t := c.plain(e.Args[2], nil)
+	c.exclusive(e.Args)
 	e.Type = types.Void
 	if !t.Abstract() {
 		e.Target = c.derive(serialize, t, e.Pos)
@@ -88,12 +109,12 @@ func (c *Checker) derive(kind derivation, t *types.Type, pos lexer.Pos) *ast.Fun
 	if fn, ok := c.derived[key]; ok {
 		return fn
 	}
-	s := &synth{c: c, pos: pos, bound: map[string]*types.Type{}, names: map[*types.Type]string{}}
+	s := &synth{c: c, home: c.derivationHome(kind), pos: pos, bound: map[string]*types.Type{}, names: map[*types.Type]string{}}
 	s.function(kind, t)
 	fn := s.parse(kind, t)
 	c.derived[key] = fn
-	c.within(c.file, fn.Bound, func() { c.signature(fn) })
-	c.file.Funcs = append(c.file.Funcs, fn)
+	c.within(s.home, fn.Bound, func() { c.signature(fn) })
+	s.home.Funcs = append(s.home.Funcs, fn)
 	c.pending = append(c.pending, fn)
 	return fn
 }
@@ -111,7 +132,7 @@ func (s *synth) parse(kind derivation, t *types.Type) *ast.Func {
 	}
 	fn := file.Funcs[0]
 	fn.Name = name
-	fn.File = s.c.file
+	fn.File = s.home
 	fn.Bound = s.bound
 	fn.Trusted = true
 	return fn
@@ -133,6 +154,7 @@ func (s *synth) temp(prefix string) string {
 }
 
 func (s *synth) line(format string, args ...any) {
+	s.flush()
 	fmt.Fprintf(&s.out, format, args...)
 	s.out.WriteByte('\n')
 }
@@ -162,7 +184,7 @@ func (s *synth) function(kind derivation, t *types.Type) {
 	switch kind {
 	case serialize:
 		s.bound["__W"] = s.c.serdeType("Writer", s.pos)
-		s.line("fn derived(v: %s, w: __W) {", self)
+		s.line("fn derived(w: __W, mut path: []i64, v: %s) {", self)
 		s.serialize(t)
 	case deserialize:
 		s.bound["__R"] = s.c.serdeType("Reader", s.pos)
@@ -173,6 +195,9 @@ func (s *synth) function(kind derivation, t *types.Type) {
 		s.bound["__S"] = s.c.serdeType("Schema", s.pos)
 		s.line("fn derived() -> __S {")
 		s.line("%s", s.schema(t, nil))
+	case render:
+		s.line("fn derived(mut b: []u8, mut path: []i64, v: %s) {", self)
+		s.render(t)
 	}
 	s.line("}")
 }
@@ -196,17 +221,17 @@ func (s *synth) serialize(t *types.Type) {
 	case t.Kind == types.SliceKind && t.Elem == types.U8:
 		s.line("w.binary(v)")
 	case t.Kind == types.SliceKind:
-		s.line("w.begin_seq(v.len)\nfor x in v {\n__serialize(x, w)\n}\nw.end_seq()")
+		s.line("w.begin_seq(v.len)\nfor x in v {\n__serialize_into(w, mut path, x)\n}\nw.end_seq()")
 	case t.Kind == types.MapKind:
-		s.line("w.begin_map(v.len)\nfor k, x in v {\nw.key(%s)\n__serialize(x, w)\n}\nw.end_map()", s.keyText(t.Key))
+		s.line("w.begin_map(v.len)\nfor k, x in v {\nw.key(%s)\n__serialize_into(w, mut path, x)\n}\nw.end_map()", s.keyText(t.Key))
 	case t.Kind == types.EnumKind && t.Optional:
-		s.line("match v {\nsome(x) => __serialize(x, w)\nnone => w.null()\n}")
+		s.line("match v {\nsome(x) => __serialize_into(w, mut path, x)\nnone => w.null()\n}")
 	case t.Kind == types.PointerKind:
-		s.line("__serialize(*v, w)")
+		s.serializePointer(t)
 	case t.Kind == types.StructKind:
 		s.line("w.begin_struct(%s, %d)", quoted(t.Name), len(t.Fields))
 		for _, f := range t.Fields {
-			s.line("w.field(%s)\n__serialize(v.%s, w)", quoted(f.Name), f.Name)
+			s.line("w.field(%s)\n__serialize_into(w, mut path, v.%s)", quoted(f.Name), f.Name)
 		}
 		s.line("w.end_struct()")
 	case t.Kind == types.EnumKind:
@@ -214,6 +239,13 @@ func (s *synth) serialize(t *types.Type) {
 	default:
 		s.unsupported(t)
 	}
+}
+
+func (s *synth) serializePointer(t *types.Type) {
+	message := quoted(fmt.Sprintf("serde: cycle through %s", t))
+	s.guardPointer(func() {
+		s.line("__panic(%s)", message)
+	}, "__serialize_into(w, mut path, *v)")
 }
 
 func (s *synth) keyText(k *types.Type) string {
@@ -254,13 +286,13 @@ func (s *synth) serializeEnum(t *types.Type) {
 		if labelled(v) {
 			s.line("w.begin_struct(%s, %d)", quoted(v.Name), len(v.Fields))
 			for i := range v.Fields {
-				s.line("w.field(%s)\n__serialize(f%d, w)", quoted(labelOf(v, i)), i)
+				s.line("w.field(%s)\n__serialize_into(w, mut path, f%d)", quoted(labelOf(v, i)), i)
 			}
 			s.line("w.end_struct()")
 		} else {
 			s.line("w.begin_seq(%d)", len(v.Fields))
 			for i := range v.Fields {
-				s.line("__serialize(f%d, w)", i)
+				s.line("__serialize_into(w, mut path, f%d)", i)
 			}
 			s.line("w.end_seq()")
 		}

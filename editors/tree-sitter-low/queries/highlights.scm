@@ -8,6 +8,10 @@
 
 (brace_escape) @string.escape
 
+(interpolation_width) @number
+
+(interpolation_format) @string.escape
+
 (integer) @number
 
 (float) @number.float

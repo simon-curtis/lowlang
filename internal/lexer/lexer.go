@@ -307,31 +307,76 @@ func (l *Lexer) emitString(start Pos, parts []Part, tail string) error {
 func (l *Lexer) interpolation() (Part, error) {
 	open := l.pos()
 	l.advance()
-	pos := l.pos()
+	part := Part{Expr: true, Pos: l.pos()}
 	from := l.off
+	stop, err := l.expressionEnd(open)
+	if err != nil {
+		return Part{}, err
+	}
+	part.Text = string(l.src[from:l.off])
+	l.advance()
+	if strings.TrimSpace(part.Text) == "" {
+		return Part{}, &Error{Pos: open, Msg: "empty interpolation"}
+	}
+	if stop == ',' {
+		part.Aligned, part.WidthPos = true, l.pos()
+		from = l.off
+		stop, err = l.fieldEnd(open, ':')
+		if err != nil {
+			return Part{}, err
+		}
+		part.Width = string(l.src[from:l.off])
+		l.advance()
+	}
+	if stop == ':' {
+		part.Formatted, part.FormatPos = true, l.pos()
+		from = l.off
+		if _, err = l.fieldEnd(open, '}'); err != nil {
+			return Part{}, err
+		}
+		part.Format = string(l.src[from:l.off])
+		l.advance()
+	}
+	return part, nil
+}
+
+func (l *Lexer) expressionEnd(open Pos) (byte, error) {
 	depth := 0
 	for {
 		if l.unterminated() {
-			return Part{}, &Error{Pos: open, Msg: "unterminated interpolation"}
+			return 0, &Error{Pos: open, Msg: "unterminated interpolation"}
 		}
-		switch l.peek(0) {
-		case '{':
+		switch c := l.peek(0); c {
+		case '(', '[', '{':
 			depth++
+		case ')', ']':
+			depth = max(depth-1, 0)
 		case '}':
 			if depth == 0 {
-				text := string(l.src[from:l.off])
-				l.advance()
-				if strings.TrimSpace(text) == "" {
-					return Part{}, &Error{Pos: open, Msg: "empty interpolation"}
-				}
-				return Part{Text: text, Expr: true, Pos: pos}, nil
+				return c, nil
 			}
 			depth--
+		case ',', ':':
+			if depth == 0 {
+				return c, nil
+			}
 		case '"', '\'':
 			if err := l.skipQuoted(open); err != nil {
-				return Part{}, err
+				return 0, err
 			}
 			continue
+		}
+		l.advance()
+	}
+}
+
+func (l *Lexer) fieldEnd(open Pos, stop byte) (byte, error) {
+	for {
+		if l.unterminated() {
+			return 0, &Error{Pos: open, Msg: "unterminated interpolation"}
+		}
+		if c := l.peek(0); c == '}' || c == stop {
+			return c, nil
 		}
 		l.advance()
 	}

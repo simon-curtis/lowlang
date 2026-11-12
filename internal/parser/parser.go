@@ -962,6 +962,7 @@ func (p *Parser) interpolation(t lexer.Token) *ast.Interp {
 	for _, part := range t.Parts {
 		if !part.Expr {
 			n.Parts = append(n.Parts, &ast.StrLit{Value: part.Text, Pos: t.Pos})
+			n.Specs = append(n.Specs, nil)
 			continue
 		}
 		tokens, err := lexer.LexAt([]byte(part.Text), part.Pos, p.prelude)
@@ -979,8 +980,33 @@ func (p *Parser) interpolation(t lexer.Token) *ast.Interp {
 			inner.fail(inner.tok().Pos, "unexpected %s in interpolation", describe(inner.tok()))
 		}
 		n.Parts = append(n.Parts, x)
+		n.Specs = append(n.Specs, p.spec(part))
 	}
 	return n
+}
+
+func (p *Parser) spec(part lexer.Part) *ast.Spec {
+	if !part.Aligned && !part.Formatted {
+		return nil
+	}
+	spec := &ast.Spec{}
+	if part.Aligned {
+		pos := part.WidthPos
+		pos.Col += len(part.Width) - len(strings.TrimLeft(part.Width, " "))
+		width, ok := ast.ParseWidth(part.Width)
+		if !ok {
+			p.fail(pos, "invalid width %q", strings.TrimSpace(part.Width))
+		}
+		spec.Width, spec.WidthPos = width, pos
+	}
+	if part.Formatted {
+		format, ok := ast.ParseFormat(part.Format, part.FormatPos)
+		if !ok {
+			p.fail(part.FormatPos, "invalid format %q", part.Format)
+		}
+		spec.Format = format
+	}
+	return spec
 }
 
 func (p *Parser) sliceLit() ast.Expr {
