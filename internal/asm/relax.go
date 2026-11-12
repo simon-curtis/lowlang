@@ -5,6 +5,14 @@ const (
 	shortReachBackward = -127
 )
 
+func (a *assembler) aim(f *frag) int64 {
+	return f.off + a.address(f.sym) - (f.addr + int64(f.fix))
+}
+
+func fitsShort(aim int64) bool {
+	return aim < 0 && aim >= shortReachBackward || aim >= 0 && aim <= shortReachForward
+}
+
 func (a *assembler) layout(b *secBuilder) {
 	b.measureFrags()
 	b.classify()
@@ -110,18 +118,16 @@ func (a *assembler) jumpGrowth(b *secBuilder, f *frag, stretch int64) int64 {
 		return 0
 	}
 	symFrag := &b.frags[f.sym.frag]
-	target := f.off + symFrag.addr + f.sym.value - int64(symFrag.start)
-	address := f.addr + int64(f.fix)
+	aim := a.aim(f)
 	if stretch != 0 && symFrag.pass != f.pass {
 		switch {
 		case stretch < 0 || symFrag.region == f.region:
-			target += stretch
-		case target < address:
+			aim += stretch
+		case aim < 0:
 			return 0
 		}
 	}
-	aim := target - address
-	if aim < 0 && aim >= shortReachBackward || aim >= 0 && aim <= shortReachForward {
+	if fitsShort(aim) {
 		return 0
 	}
 	f.form = jumpNear

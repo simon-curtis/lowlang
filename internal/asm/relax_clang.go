@@ -11,7 +11,7 @@ func (a *assembler) growUnreachable(b *secBuilder) bool {
 	grew := false
 	for k := range b.frags {
 		f := &b.frags[k]
-		if f.kind != fragJump || f.form != jumpShort || a.reachesShort(b, f) {
+		if f.kind != fragJump || f.form != jumpShort || fitsShort(a.aim(f)) {
 			continue
 		}
 		f.form = jumpNear
@@ -19,11 +19,4 @@ func (a *assembler) growUnreachable(b *secBuilder) bool {
 		grew = true
 	}
 	return grew
-}
-
-func (a *assembler) reachesShort(b *secBuilder, f *frag) bool {
-	symFrag := &b.frags[f.sym.frag]
-	target := f.off + symFrag.addr + f.sym.value - int64(symFrag.start)
-	aim := target - (f.addr + int64(f.fix))
-	return aim < 0 && aim >= shortReachBackward || aim >= 0 && aim <= shortReachForward
 }
