@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 
 	"lowlang/internal/amd64"
@@ -26,7 +27,10 @@ const usage = `usage:
   low lint <file.low>
   low doc <dir|std>
   low dev <file.low>
-  low lsp`
+  low lsp
+  low version`
+
+var version string
 
 type usageError struct{}
 
@@ -58,9 +62,15 @@ func main() {
 }
 
 func run(ctx context.Context, args []string) error {
-	if len(args) == 1 && args[0] == "lsp" {
-		server := lsp.NewServer(os.Stdin, os.Stdout)
-		return server.Run(ctx)
+	if len(args) == 1 {
+		switch args[0] {
+		case "lsp":
+			server := lsp.NewServer(os.Stdin, os.Stdout)
+			return server.Run(ctx)
+		case "version":
+			fmt.Println(buildVersion())
+			return nil
+		}
 	}
 	if len(args) < 2 {
 		return usageError{}
@@ -100,6 +110,29 @@ func run(ctx context.Context, args []string) error {
 		return session.Run(ctx)
 	}
 	return usageError{}
+}
+
+func buildVersion() string {
+	if version != "" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	settings := make(map[string]string, len(info.Settings))
+	for _, setting := range info.Settings {
+		settings[setting.Key] = setting.Value
+	}
+	revision := settings["vcs.revision"]
+	if revision == "" {
+		return "dev"
+	}
+	revision = revision[:min(len(revision), 12)]
+	if settings["vcs.modified"] == "true" {
+		return fmt.Sprintf("dev+%s.dirty", revision)
+	}
+	return fmt.Sprintf("dev+%s", revision)
 }
 
 type options struct {

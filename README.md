@@ -30,6 +30,7 @@ go build -o low ./cmd/low
 ./low doc std
 ./low dev app.low
 ./low run app/
+./low version
 ```
 
 - `low` runs on Linux and on Windows. The target defaults to the host; `-target linux/amd64` or `-target windows/amd64` selects one.
@@ -67,7 +68,7 @@ Each `bench/<name>/` holds one program as `main.low`, `main.go` and, for most, `
 
 ## Releases
 
-Pushing a `v*` tag runs the `test` workflow, then the `release` workflow builds `low` for `linux/amd64` and `windows/amd64` and publishes them as a GitHub release, `low-linux-amd64` and `low-windows-amd64.exe`. `site/install.sh` and `site/install.ps1`, served by the website, download the latest release.
+Pushing a `v*` tag runs the `test` workflow, then the `release` workflow builds `low` for `linux/amd64` and `windows/amd64` and publishes them as a GitHub release, `low-linux-amd64` and `low-windows-amd64.exe`. Each binary is stamped with the tag, which `low version` prints; a build from source prints `dev+<commit>`. `site/install.sh` and `site/install.ps1`, served by the website, download the latest release.
 
 ## Website
 
