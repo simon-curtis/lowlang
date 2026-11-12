@@ -11,6 +11,7 @@ import { lexed } from "./source.mjs";
 
 const output = new URL(folders.docs, import.meta.url);
 const hidden = /^<!-- prelude ?(\S*)\n([\s\S]*?)\n?-->/;
+const reference = /^#{2,6} \S/;
 
 function slug(text) {
     return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -37,7 +38,40 @@ function preamble(tokens) {
     return tokens.slice(0, end).filter((token) => token.type !== "heading");
 }
 
-function render(page, facts, library) {
+class Headings {
+    #targets = new Map();
+
+    constructor(pages) {
+        for (const page of pages) {
+            this.#index(page);
+        }
+    }
+
+    #index(page) {
+        if (page.depth === 2) {
+            this.#add(`## ${page.title}`, page, page.file);
+        }
+        for (const token of page.tokens.filter((token) => token.type === "heading")) {
+            this.#add(`${"#".repeat(token.depth)} ${token.text}`, page, `${page.file}#${slug(token.text)}`);
+        }
+    }
+
+    #add(key, page, href) {
+        this.#targets.set(key, [...(this.#targets.get(key) ?? []), { page, href }]);
+    }
+
+    href(text, page) {
+        const found = this.#targets.get(text) ?? [];
+        const local = found.filter((target) => target.page === page);
+        const [target, ...rest] = local.length > 0 ? local : found;
+        if (!target || rest.length > 0) {
+            throw new Error(`docs: ${page.title} references ${text}, which names ${found.length} headings`);
+        }
+        return target.href;
+    }
+}
+
+function render(page, facts, library, headings) {
     const linker = new Linker(library, rootOf({ path: `${folders.docs}${page.file}` }));
     const marked = new Marked({
         renderer: {
@@ -50,7 +84,10 @@ function render(page, facts, library) {
                 return hidden.test(text) ? "" : text;
             },
             code: codeRenderer(linker, facts),
-            codespan,
+            codespan(token) {
+                const code = codespan(token);
+                return reference.test(token.text) ? `<a href="${headings.href(token.text, page)}">${code}</a>` : code;
+            },
             table(token) {
                 const head = token.header.map((cell) => `<th scope="col">${this.parser.parseInline(cell.tokens)}</th>`).join("");
                 const labels = token.header.map((cell) => (token.header.length > 2 ? ` data-label="${escape(cell.text)}"` : ""));
@@ -134,10 +171,11 @@ export async function docs(design, session, library, roadmap) {
     const plan = { title: "Roadmap", depth: 1, tokens: [], file: "roadmap.html", body: renderRoadmap(roadmap) };
     const pages = [home, ...chapters, editor, plan];
     const facts = await inspect(pages, session);
+    const headings = new Headings(pages);
     for (const page of pages) {
         const lead = page.tokens.find((token) => token.type === "paragraph");
         page.description = lead ? plain(lead.tokens).slice(0, 200) : `${page.title} in the Low documentation.`;
-        page.body ??= render(page, facts, library);
+        page.body ??= render(page, facts, library, headings);
     }
     home.body = `${home.body}${contents(pages)}`;
     await rm(output, { recursive: true, force: true });
