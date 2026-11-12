@@ -76,7 +76,11 @@ func generate(path string, platform target.OS) (source string, libraries []strin
 	if err != nil {
 		return "", nil, err
 	}
-	return amd64.Generate(unit.Program, unit.Platform).Asm, unit.Program.Libraries(), nil
+	out, err := amd64.Generate(unit.Program, unit.Platform, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	return out.Asm, unit.Program.Libraries(), nil
 }
 
 func linkWithLd(dir, source string) (string, error) {

@@ -18,7 +18,9 @@ func BenchmarkCompile(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				amd64.Generate(unit.Program, unit.Platform)
+				if _, err := amd64.Generate(unit.Program, unit.Platform, nil); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}

@@ -6,7 +6,7 @@ import (
 	"lowlang/internal/ir"
 )
 
-const MaxInlineLiteral = 16
+const maxInlineLiteral = 16
 
 type chunk struct {
 	width  int
@@ -48,7 +48,7 @@ func (s *selector) fuseLiteral(in *instr) {
 
 func (s *selector) literalAt(in *instr, side int) (string, bool) {
 	d := s.defs[in.args[side]]
-	if d == nil || s.dead[d] || d.op != ir.OpString || len(d.value.Str) > MaxInlineLiteral {
+	if d == nil || s.dead[d] || d.op != ir.OpString || len(d.value.Str) > maxInlineLiteral {
 		return "", false
 	}
 	length := in.args[side+1].konst
@@ -85,7 +85,10 @@ func (c chunk) value(text string) uint64 {
 }
 
 func (c chunk) operand(base string) string {
-	width := map[int]string{1: "byte", 2: "word", 4: "dword", 8: "qword"}[c.width]
+	width, narrowed := widths[8*c.width]
+	if !narrowed {
+		width = "qword"
+	}
 	if c.offset == 0 {
 		return fmt.Sprintf("%s ptr [%s]", width, base)
 	}
@@ -132,7 +135,7 @@ func (g *Generator) stringEquality(fr *frame, in *instr) {
 	g.parallel(moves)
 	done := g.newLabel()
 	g.emit("xor eax, eax")
-	g.emit("cmp rsi, rcx")
+	g.emit("cmp %s, %s", abi.args[1], abi.args[3])
 	g.emit("jne %s", done)
 	g.leaveVectors()
 	g.emit("call rt_str_eq")

@@ -69,12 +69,13 @@ func (b *builder) present(optional []*Value) *Value {
 	return b.readTemp(temp, 1)[0]
 }
 
-func (b *builder) deleteEntry(e *ast.Call) {
+func (b *builder) deleteEntry(e *ast.Call) []*Value {
 	ref := e.Args[0].(*ast.Ref)
 	m := ref.Type
 	table := b.load(b.placeOf(ref.X), m)[0]
 	args := b.withKey(table, e.Args[1], m)
 	b.mapCall(prelude.MapDelete, m, args...)
+	return nil
 }
 
 func (b *builder) mapLoop(s *ast.ForIn) {

@@ -698,19 +698,13 @@ func (b *builder) setFlag(flag *ast.Local, live int64) {
 }
 
 func (b *builder) forStmt(s *ast.For) {
-	header := b.newBlock()
-	body := b.newBlock()
-	exit := b.newBlock()
-	b.jump(header)
-	b.cur = header
+	loop := b.openLoop()
 	if s.Cond != nil {
-		b.branch(b.word(s.Cond), body, exit)
+		b.branch(b.word(s.Cond), loop.body, loop.exit)
 	} else {
-		b.jump(body)
+		b.jump(loop.body)
 	}
-	b.enter(body)
-	latch := b.newBlock()
-	loop := loopBlocks{header: header, body: body, next: latch, exit: exit}
+	b.enter(loop.body)
 	b.loopBody(loop, s.Body)
 	b.closeLoop(loop)
 }
@@ -1034,18 +1028,21 @@ func (b *builder) convert(x *Value, from, to *types.Type) *Value {
 	return v
 }
 
-func (b *builder) exp(x *Value, t *types.Type) *Value {
-	wide := b.convert(x, t, types.F64)
+func (b *builder) exp(e *ast.Call) []*Value {
+	x := b.word(e.Args[0])
+	wide := b.convert(x, e.Type, types.F64)
 	result := b.runtime(rtExp, wide)
-	return b.convert(result, types.F64, t)
+	narrowed := b.convert(result, types.F64, e.Type)
+	return []*Value{narrowed}
 }
 
-func (b *builder) allocate(arg ast.Expr) *Value {
+func (b *builder) allocate(e *ast.Call) []*Value {
+	arg := e.Args[0]
 	t := arg.TypeOf()
 	words := b.value(arg, t)
 	ptr := b.runtime(rtAlloc, b.constant(int64(t.Size())), b.scan(t))
 	b.store(place{addr: ptr}, words)
-	return ptr
+	return []*Value{ptr}
 }
 
 func (b *builder) scan(t *types.Type) *Value {

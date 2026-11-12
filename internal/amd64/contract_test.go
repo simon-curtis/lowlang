@@ -15,10 +15,20 @@ func TestHotRuntimeDefinesPatchSymbols(t *testing.T) {
 	}
 }
 
-func TestEntryMacroTakesTheExportedSymbol(t *testing.T) {
-	for name, header := range map[string]string{"linux": linuxHeader, "windows": windowsHeader} {
-		if !strings.Contains(header, ".macro PROGRAM_ENTRY entry\n") {
-			t.Errorf("%s header: PROGRAM_ENTRY does not take the entry symbol", name)
+func TestPollSavesEveryFloatRegister(t *testing.T) {
+	_, afterLabel, found := strings.Cut(scheduler, "\nrt_poll:\n")
+	if !found {
+		t.Fatal("scheduler does not define rt_poll")
+	}
+	body, _, found := strings.Cut(afterLabel, "\nrt_poll_run:")
+	if !found {
+		t.Fatal("scheduler does not define rt_poll_run after rt_poll")
+	}
+	for _, reg := range floatRegs {
+		save := fmt.Sprintf(", %s\n", reg)
+		restore := fmt.Sprintf("movq %s, [rsp", reg)
+		if !strings.Contains(body, save) || !strings.Contains(body, restore) {
+			t.Errorf("rt_poll does not save and restore %s", reg)
 		}
 	}
 }

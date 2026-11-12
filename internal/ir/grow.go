@@ -23,7 +23,7 @@ func (b *builder) regrow(ptr, length, capacity *Value, elem *types.Type) *Value 
 	return b.runtime(rtGrow, ptr, used, size, b.scan(elem))
 }
 
-func (b *builder) extend(e *ast.Call) {
+func (b *builder) extend(e *ast.Call) []*Value {
 	ref := e.Args[0].(*ast.Ref)
 	header := b.placeOf(ref.X)
 	src := b.value(e.Args[1], types.Str)
@@ -31,15 +31,16 @@ func (b *builder) extend(e *ast.Call) {
 	end := b.emit(OpAdd, base, length)
 	b.runtime(rtMemmove, end, src[0], src[1])
 	b.store(header.at(1), []*Value{needed})
+	return nil
 }
 
-func (b *builder) extendBy(e *ast.Call) *Value {
+func (b *builder) extendBy(e *ast.Call) []*Value {
 	ref := e.Args[0].(*ast.Ref)
 	header := b.placeOf(ref.X)
 	count := b.word(e.Args[1])
 	_, length, needed := b.room(header, ref.Type, count)
 	b.store(header.at(1), []*Value{needed})
-	return length
+	return []*Value{length}
 }
 
 func (b *builder) room(header place, t *types.Type, extra *Value) (base, length, needed *Value) {
@@ -77,7 +78,7 @@ func (b *builder) ensureRoom(header place, slice []*Value, full, extra *Value, e
 	return b.readTemp(temp, 1)[0]
 }
 
-func (b *builder) push(e *ast.Call) {
+func (b *builder) push(e *ast.Call) []*Value {
 	ref := e.Args[0].(*ast.Ref)
 	elem := ref.Type.Elem
 	header := b.placeOf(ref.X)
@@ -89,6 +90,7 @@ func (b *builder) push(e *ast.Call) {
 	addr := b.scaled(base, length, elem.Stride())
 	b.store(place{addr: addr, scalar: scalarOf(elem), tail: elem.Tail()}, value)
 	b.store(header.at(1), []*Value{b.count(OpAdd, length, b.constant(1))})
+	return nil
 }
 
 func (b *builder) fillLoop(s *ast.ForIn) bool {

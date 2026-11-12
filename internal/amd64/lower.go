@@ -189,7 +189,7 @@ func (in *instr) hintOperands() {
 func (l *lowering) vreg(v *ir.Value) *vreg {
 	r, ok := l.vregs[v]
 	if !ok {
-		r = l.newVreg()
+		r = l.fn.newVreg()
 		r.scalar = v.Scalar
 		switch {
 		case l.scalar && v.Op == ir.OpSlot:
@@ -334,10 +334,6 @@ func (l *lowering) immediate(v *ir.Value) bool {
 	}
 	l.vreg(v)
 	return true
-}
-
-func (l *lowering) newVreg() *vreg {
-	return l.fn.newVreg()
 }
 
 func (f *mfunc) newVreg() *vreg {

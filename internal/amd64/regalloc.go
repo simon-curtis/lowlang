@@ -350,10 +350,7 @@ func (f *mfunc) place(order []*vreg, cost func(*vreg) float64) outcome {
 }
 
 func (f *mfunc) allocate() (spills int, saved []string) {
-	f.number()
-	f.liveness()
-	f.buildRanges()
-	f.markCallCrossings()
+	f.analyse()
 	f.markLight()
 	f.weigh()
 	order := f.allocationOrder()

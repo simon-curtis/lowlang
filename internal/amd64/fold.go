@@ -100,7 +100,7 @@ func (s *selector) absorbLoad(in *instr, pending map[*vreg]*instr) {
 		in.args[0], in.args[1] = s.compareOperands(nil, in.args[0], in.args[1], pending)
 	case in.op.Compare():
 		s.absorbCompare(in, pending)
-	case isFloat(in.value.Type) && in.op >= ir.OpAdd && in.op <= ir.OpDiv && in.op != ir.OpRem:
+	case isFloat(in.value.Type) && floatOps[in.op] != "":
 		s.absorbOperand(in, in.value.Type, in.op == ir.OpAdd || in.op == ir.OpMul, pending)
 	case wordArithmetic(in.value.Type) && integerBinary(in.op):
 		s.absorbOperand(in, in.value.Type, in.op != ir.OpSub, pending)
@@ -136,24 +136,24 @@ func (s *selector) absorbOperand(in *instr, t *types.Type, commutative bool, pen
 
 func (s *selector) absorbCompare(in *instr, pending map[*vreg]*instr) {
 	if isFloat(in.value.Type) {
-		s.absorbFloatCompare(in, pending)
+		s.absorbFloatCompare(in.value.Type, in.op, in.args, pending)
 		return
 	}
 	in.args[0], in.args[1] = s.compareOperands(in.value.Type, in.args[0], in.args[1], pending)
 }
 
-func (s *selector) absorbFloatCompare(in *instr, pending map[*vreg]*instr) {
-	_, ordered := orderedOperands(in.op, in.args[0], in.args[1])
+func (s *selector) absorbFloatCompare(t *types.Type, op ir.Op, operands []*vreg, pending map[*vreg]*instr) {
+	_, ordered := orderedOperands(op, operands[0], operands[1])
 	load := s.pendingLoad(ordered, pending)
-	if load == nil || !sameWidth(in.value.Type, load.value.Type) || in.args[0] == in.args[1] {
+	if load == nil || !sameWidth(t, load.value.Type) || operands[0] == operands[1] {
 		return
 	}
 	mem := s.take(load, pending)
-	if ordered == in.args[1] {
-		in.args[1] = mem
+	if ordered == operands[1] {
+		operands[1] = mem
 		return
 	}
-	in.args[0] = mem
+	operands[0] = mem
 }
 
 func (s *selector) compareOperands(t *types.Type, a, b *vreg, pending map[*vreg]*instr) (*vreg, *vreg) {
@@ -185,21 +185,11 @@ func narrowCompare(operation, loaded *types.Type, other *vreg) bool {
 
 func (s *selector) absorbIntoBranch(mb *mblock, pending map[*vreg]*instr) {
 	t := mb.fused.Type
+	operands := []*vreg{mb.compare[0], mb.compare[1]}
 	if isFloat(t) {
-		_, ordered := orderedOperands(mb.fused.Op, mb.compare[0], mb.compare[1])
-		load := s.pendingLoad(ordered, pending)
-		if load == nil || !sameWidth(t, load.value.Type) || mb.compare[0] == mb.compare[1] {
-			return
-		}
-		mem := s.take(load, pending)
-		mb.compare = []*vreg{mb.compare[0], mb.compare[1]}
-		if ordered == mb.compare[1] {
-			mb.compare[1] = mem
-		} else {
-			mb.compare[0] = mem
-		}
-		return
+		s.absorbFloatCompare(t, mb.fused.Op, operands, pending)
+	} else {
+		operands[0], operands[1] = s.compareOperands(t, operands[0], operands[1], pending)
 	}
-	a, b := s.compareOperands(t, mb.compare[0], mb.compare[1], pending)
-	mb.compare = []*vreg{a, b}
+	mb.compare = operands
 }

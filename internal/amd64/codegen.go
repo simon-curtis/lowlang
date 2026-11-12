@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ir"
+	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
 
@@ -115,11 +116,10 @@ func writeSymbols(out *strings.Builder, symbols []symbol) {
 	}
 }
 
-func Generate(prog *ir.Program, platform Platform) Output {
-	return generate(prog, platform, nil)
-}
-
-func generate(prog *ir.Program, platform Platform, table FuncTable) Output {
+func Generate(prog *ir.Program, platform Platform, table FuncTable) (Output, error) {
+	if table != nil && platform.OS() != target.Linux {
+		return Output{}, fmt.Errorf("hot reload needs the %s target, not %s", target.Linux, platform.OS())
+	}
 	g := newGenerator(platform, table, "")
 	funcs := map[string]string{}
 	for _, f := range prog.Funcs {
@@ -160,7 +160,7 @@ func generate(prog *ir.Program, platform Platform, table FuncTable) Output {
 	out.WriteString(g.data.String())
 	out.WriteString("\n\t.text\n")
 	out.WriteString(g.text.String())
-	return Output{Asm: out.String(), Funcs: funcs}
+	return Output{Asm: out.String(), Funcs: funcs}, nil
 }
 
 func Symbol(name, suffix string) string {
@@ -211,7 +211,7 @@ func (g *Generator) callTarget(f *ir.Func) string {
 	if g.table == nil {
 		return Symbol(f.Name, "")
 	}
-	return fmt.Sprintf("qword ptr [rip+fn_table+%d]", 8*g.table[f.Name])
+	return fmt.Sprintf("qword ptr %s", g.table.slot(f.Name))
 }
 
 func (g *Generator) start(prog *ir.Program) {
@@ -932,7 +932,7 @@ func (g *Generator) funcAddr(dst string, v *ir.Value) {
 	case v.Aux == ir.ThunkAddr:
 		g.address(dst, fmt.Sprintf("[rip+cb_%s]", mangle(v.Target.Name)))
 	case g.table != nil:
-		g.address(dst, fmt.Sprintf("[rip+fn_table+%d]", 8*g.table[v.Target.Name]))
+		g.address(dst, g.table.slot(v.Target.Name))
 	default:
 		g.address(dst, fmt.Sprintf("[rip+%s]", Symbol(v.Target.Name, "")))
 	}

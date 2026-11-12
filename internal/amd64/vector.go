@@ -14,7 +14,15 @@ const (
 	avx2
 )
 
-const vectorScratchWords = 13
+const (
+	vectorSlotBytes    = 32
+	vectorScratchSlots = 3
+
+	vectorScratchWords = vectorScratchSlots*vectorSlotBytes/8 + 1
+
+	vectorRegisters     = 16
+	vectorWorkRegisters = 8
+)
 
 func usesVectors(f *ir.Func) bool {
 	for _, b := range f.Blocks {
@@ -50,7 +58,7 @@ func (g *Generator) vectorAddress(fr *frame, in *instr, k int) maddr {
 }
 
 func (fr *frame) scratch(k int) maddr {
-	return maddr{"rbp", fr.vectorScratch + 32*k}
+	return maddr{"rbp", fr.vectorScratch + vectorSlotBytes*k}
 }
 
 type lanes struct {
@@ -475,7 +483,7 @@ func (g *Generator) fallback(fr *frame, l lanes, op ir.VectorOp, binary bool) {
 	if binary {
 		g.storeVector(l, 2, b)
 	}
-	saved := maddr{"rbp", fr.vectorScratch + 96}
+	saved := fr.scratch(vectorScratchSlots)
 	if op == ir.VShl || op == ir.VShr {
 		g.emit("mov qword ptr %s, rcx", saved.at(0))
 		g.emit("mov rcx, rax")

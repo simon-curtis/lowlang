@@ -77,7 +77,10 @@ func vectorTemps(f *ir.Func) *vectorCache {
 
 func (c *vectorCache) reset() {
 	c.regs = map[*ir.Value]int{}
-	c.free = []int{15, 14, 13, 12, 11, 10, 9, 8}
+	c.free = c.free[:0]
+	for r := vectorRegisters - 1; r >= vectorWorkRegisters; r-- {
+		c.free = append(c.free, r)
+	}
 }
 
 func (g *Generator) source(fr *frame, in *instr, k int, l lanes, base int) {

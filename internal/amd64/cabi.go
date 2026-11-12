@@ -89,20 +89,26 @@ type argRegisters struct {
 	vectors int
 }
 
-func (r *argRegisters) fit(classes []class) bool {
+func (r *argRegisters) assign(classes []class) ([]cArg, bool) {
 	ints, vectors := r.ints, r.vectors
-	for _, c := range classes {
+	args := make([]cArg, len(classes))
+	for i, c := range classes {
 		if c == integer {
+			if ints == len(sysvIntRegs) {
+				return nil, false
+			}
+			args[i] = cArg{class: integer, words: 1, reg: sysvIntRegs[ints], slot: -1}
 			ints++
-		} else {
-			vectors++
+			continue
 		}
-	}
-	if ints > len(sysvIntRegs) || vectors > sysvVectorRegs {
-		return false
+		if vectors == sysvVectorRegs {
+			return nil, false
+		}
+		args[i] = cArg{class: vector, words: 1, xmm: fmt.Sprintf("xmm%d", vectors), slot: -1}
+		vectors++
 	}
 	r.ints, r.vectors = ints, vectors
-	return true
+	return args, true
 }
 
 func sysvPlan(sig *ir.CSig) *cPlan {
@@ -116,31 +122,25 @@ func sysvPlan(sig *ir.CSig) *cPlan {
 			plan.results = eightbytes(sig.Ret)
 		}
 	}
-	ints, vectors := 0, 0
-	if plan.memory {
-		ints = 1
-	}
 	for i, t := range sig.Args {
 		classes := []class{integer}
 		if !sig.ByRef[i] {
 			classes = eightbytes(t)
 		}
-		if (t.CStruct() && !sig.ByRef[i] && t.Bytes > 16) || !regs.fit(classes) {
+		var assigned []cArg
+		fits := false
+		oversized := t.CStruct() && !sig.ByRef[i] && t.Bytes > 16
+		if !oversized {
+			assigned, fits = regs.assign(classes)
+		}
+		if !fits {
 			for range classes {
 				plan.args = append(plan.args, cArg{class: stack, words: 1, slot: plan.stackWords})
 				plan.stackWords++
 			}
 			continue
 		}
-		for _, c := range classes {
-			if c == vector {
-				plan.args = append(plan.args, cArg{class: vector, words: 1, xmm: fmt.Sprintf("xmm%d", vectors), slot: -1})
-				vectors++
-				continue
-			}
-			plan.args = append(plan.args, cArg{class: integer, words: 1, reg: sysvIntRegs[ints], slot: -1})
-			ints++
-		}
+		plan.args = append(plan.args, assigned...)
 	}
 	plan.vectors = regs.vectors
 	return plan

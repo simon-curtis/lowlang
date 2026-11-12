@@ -29,11 +29,12 @@ func (b *builder) pop(e *ast.Call) []*Value {
 	return b.readTemp(temp, 1+elem.Size())
 }
 
-func (b *builder) truncate(e *ast.Call) {
+func (b *builder) truncate(e *ast.Call) []*Value {
 	ref := e.Args[0].(*ast.Ref)
 	header := b.placeOf(ref.X)
 	length := b.word(e.Args[1])
 	slice := b.load(header, types.Str)
 	b.check(length, b.count(OpAdd, slice[1], b.constant(1)))
 	b.store(header.at(1), []*Value{length})
+	return nil
 }

@@ -1982,7 +1982,7 @@ Mechanism:
 
 - Dev builds call every function through `fn_table`, a writable table of 4096 code addresses, with `call [rip+fn_table+8*i]`. Release builds call directly.
 - In dev builds a function value's code word is the address of its `fn_table` entry and calls through it use `call [r10]`, so a stored function value or closure runs the newest code. Callback thunks call through the table too.
-- `internal/amd64` owns this protocol: `GenerateHot` and `GeneratePatch`, the `fn_table` size, the patch signal and entry size, the mailbox symbol names and the region's base and size.
+- `internal/amd64` owns this protocol: `Generate` with a `FuncTable` and `GeneratePatch`, the `fn_table` size, the patch signal and entry size, the mailbox symbol names and the region's base and size.
 - At start the dev runtime installs a `SIGUSR1` handler and maps a 64 MB read-execute region at `0x40000000`, close enough to the binary for 32-bit relative references.
 - A patch is assembled and linked in process, by `Built.Patch`, at the next free address in that region, resolving its references against the symbols of the running binary that `compiler.Build` returned. It holds only the changed functions and their strings. Patched functions get a fresh symbol suffix so they never collide with the originals.
 - `low dev` writes the machine code into the region through `/proc/<pid>/mem`, writes `(index, address)` pairs and a count into a mailbox in the program, and sends `SIGUSR1`. The handler stores each address into `fn_table` with an aligned 8-byte write and clears the count, which `low dev` waits for.

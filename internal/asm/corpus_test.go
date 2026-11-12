@@ -55,5 +55,9 @@ func (e corpusEntry) generate() (source string, err error) {
 	if err != nil {
 		return "", err
 	}
-	return amd64.Generate(unit.Program, unit.Platform).Asm, nil
+	out, err := amd64.Generate(unit.Program, unit.Platform, nil)
+	if err != nil {
+		return "", err
+	}
+	return out.Asm, nil
 }

@@ -16,11 +16,11 @@ var lowerings map[builtin.ID]lowering
 func init() {
 	lowerings = map[builtin.ID]lowering{
 		builtin.Print:        (*builder).printCall,
-		builtin.New:          (*builder).newCall,
-		builtin.Push:         (*builder).pushCall,
+		builtin.New:          (*builder).allocate,
+		builtin.Push:         (*builder).push,
 		builtin.Pop:          (*builder).pop,
-		builtin.Truncate:     (*builder).truncateCall,
-		builtin.Delete:       (*builder).deleteCall,
+		builtin.Truncate:     (*builder).truncate,
+		builtin.Delete:       (*builder).deleteEntry,
 		builtin.Bytes:        (*builder).bytesCall,
 		builtin.Str:          (*builder).strCall,
 		builtin.Cstr:         (*builder).cstrCall,
@@ -32,7 +32,7 @@ func init() {
 		builtin.Embed:        (*builder).embedCall,
 		builtin.Sqrt:         (*builder).sqrtCall,
 		builtin.Floor:        (*builder).floorCall,
-		builtin.Exp:          (*builder).expCall,
+		builtin.Exp:          (*builder).exp,
 		builtin.Close:        (*builder).closeCall,
 		builtin.Sleep:        (*builder).sleepCall,
 		builtin.WaitReadable: (*builder).waitReadableCall,
@@ -41,8 +41,8 @@ func init() {
 		builtin.SlicePtr:     (*builder).slicePtrCall,
 		builtin.Bits:         (*builder).bitsCall,
 		builtin.StrView:      (*builder).strViewCall,
-		builtin.Extend:       (*builder).extendCall,
-		builtin.ExtendBy:     (*builder).extendByCall,
+		builtin.Extend:       (*builder).extend,
+		builtin.ExtendBy:     (*builder).extendBy,
 		builtin.Hash:         (*builder).hashCall,
 		builtin.Zero:         (*builder).zeroCall,
 		builtin.Syscall:      (*builder).syscallCall,
@@ -93,11 +93,6 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 	return lower(b, e)
 }
 
-func (b *builder) newCall(e *ast.Call) []*Value {
-	ptr := b.allocate(e.Args[0])
-	return []*Value{ptr}
-}
-
 func (b *builder) convertCall(e *ast.Call) []*Value {
 	from := e.Args[0].TypeOf()
 	word := b.word(e.Args[0])
@@ -112,36 +107,6 @@ func (b *builder) sqrtCall(e *ast.Call) []*Value {
 func (b *builder) floorCall(e *ast.Call) []*Value {
 	word := b.word(e.Args[0])
 	return []*Value{b.typed(OpFloor, e.Type, word)}
-}
-
-func (b *builder) expCall(e *ast.Call) []*Value {
-	word := b.word(e.Args[0])
-	return []*Value{b.exp(word, e.Type)}
-}
-
-func (b *builder) pushCall(e *ast.Call) []*Value {
-	b.push(e)
-	return nil
-}
-
-func (b *builder) truncateCall(e *ast.Call) []*Value {
-	b.truncate(e)
-	return nil
-}
-
-func (b *builder) deleteCall(e *ast.Call) []*Value {
-	b.deleteEntry(e)
-	return nil
-}
-
-func (b *builder) extendCall(e *ast.Call) []*Value {
-	b.extend(e)
-	return nil
-}
-
-func (b *builder) extendByCall(e *ast.Call) []*Value {
-	length := b.extendBy(e)
-	return []*Value{length}
 }
 
 func (b *builder) embedCall(e *ast.Call) []*Value {

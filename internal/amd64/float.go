@@ -2,7 +2,6 @@ package amd64
 
 import (
 	"fmt"
-	"strings"
 
 	"lowlang/internal/ir"
 	"lowlang/internal/types"
@@ -17,7 +16,7 @@ func xmmTarget(dst string) string {
 
 func narrowMemory(loc, p string) string {
 	if p == "s" {
-		return strings.Replace(loc, "qword", "dword", 1)
+		return dword(loc)
 	}
 	return loc
 }

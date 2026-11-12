@@ -43,14 +43,7 @@ var toolchains = map[target.OS]toolchain{
 var libraryResolver = link.Resolver{Dirs: link.SystemDirs}
 
 func Generate(unit *Unit, mode Mode) (amd64.Output, error) {
-	platform := unit.Platform
-	switch {
-	case !mode.hot:
-		return amd64.Generate(unit.Program, platform), nil
-	case platform.OS() != target.Linux:
-		return amd64.Output{}, fmt.Errorf("hot reload needs the %s target, not %s", target.Linux, platform.OS())
-	}
-	return amd64.GenerateHot(unit.Program, platform, mode.table), nil
+	return amd64.Generate(unit.Program, unit.Platform, mode.table)
 }
 
 func Build(ctx context.Context, unit *Unit, mode Mode, output string) (*Built, error) {

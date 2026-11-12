@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"lowlang/internal/amd64"
 	"lowlang/internal/ir"
 )
 
@@ -184,7 +183,7 @@ func TestLiteralComparisonIsInline(t *testing.T) {
 		}
 	}
 	if !slices.Contains(backendAsm(t, "is_long"), "call rt_str_eq") {
-		t.Errorf("a literal longer than %d bytes is compared inline", amd64.MaxInlineLiteral)
+		t.Errorf("a literal over the inline limit is compared inline")
 	}
 }
 
