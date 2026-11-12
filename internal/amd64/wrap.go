@@ -40,6 +40,10 @@ func blockSuccessors(mb *mblock) []*mblock {
 	return mb.succs
 }
 
+func (f *mfunc) dominators(preds map[*mblock][]*mblock) *ir.Dominators[*mblock] {
+	return ir.NewDominators(f.blocks[0], blockSuccessors, func(mb *mblock) []*mblock { return preds[mb] })
+}
+
 func (mb *mblock) hasCall() bool {
 	return slices.ContainsFunc(mb.instrs, func(in *instr) bool { return in.isCall() })
 }
@@ -54,7 +58,7 @@ func (f *mfunc) guardBlock(preds map[*mblock][]*mblock) *mblock {
 	if len(calls) == 0 {
 		return nil
 	}
-	d := ir.NewDominators(f.blocks[0], blockSuccessors, func(mb *mblock) []*mblock { return preds[mb] })
+	d := f.dominators(preds)
 	at := d.Index[calls[0]]
 	for _, mb := range calls[1:] {
 		at = d.Intersect(at, d.Index[mb])

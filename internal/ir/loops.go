@@ -16,58 +16,12 @@ func newDominators(fn *Func) *Dominators[*Block] {
 
 func findLoops(doms *Dominators[*Block]) []*loop {
 	var loops []*loop
-	for i, header := range doms.Nodes {
-		latches := backEdgeSources(doms, i)
-		if len(latches) == 0 {
-			continue
-		}
-		l := &loop{header: header, body: map[*Block]bool{header: true}}
-		l.collect(doms, latches)
-		l.settle(latches)
+	for _, natural := range doms.Loops() {
+		l := &loop{header: natural.Header, body: natural.Body, order: natural.Order}
+		l.settle(natural.Latches)
 		loops = append(loops, l)
 	}
-	slices.SortStableFunc(loops, func(a, b *loop) int { return len(a.body) - len(b.body) })
 	return loops
-}
-
-func backEdgeSources(doms *Dominators[*Block], header int) []*Block {
-	var sources []*Block
-	for _, p := range doms.Nodes[header].Preds {
-		pi, reachable := doms.Index[p]
-		if reachable && dominates(doms, header, pi) {
-			sources = append(sources, p)
-		}
-	}
-	return sources
-}
-
-func dominates(doms *Dominators[*Block], a, b int) bool {
-	for b > a {
-		b = doms.Idom[b]
-	}
-	return a == b
-}
-
-func (l *loop) collect(doms *Dominators[*Block], latches []*Block) {
-	work := slices.Clone(latches)
-	for len(work) > 0 {
-		b := work[len(work)-1]
-		work = work[:len(work)-1]
-		if l.body[b] {
-			continue
-		}
-		l.body[b] = true
-		for _, p := range b.Preds {
-			if _, reachable := doms.Index[p]; reachable {
-				work = append(work, p)
-			}
-		}
-	}
-	for _, b := range doms.Nodes {
-		if l.body[b] {
-			l.order = append(l.order, b)
-		}
-	}
 }
 
 func (l *loop) settle(latches []*Block) {

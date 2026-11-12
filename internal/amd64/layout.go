@@ -65,25 +65,24 @@ func (mb *mblock) rareFirstArm() bool {
 }
 
 func (f *mfunc) sinkRareArms() {
-	bodies := f.loopBodies()
+	loops := f.loops()
 	for _, mb := range slices.Clone(f.blocks) {
 		if !mb.rareFirstArm() {
 			continue
 		}
-		if body := innermostLoop(bodies, mb); body != nil {
+		if body := innermostLoop(loops, mb); body != nil {
 			f.sinkArm(mb, body)
 		}
 	}
 }
 
-func innermostLoop(bodies []map[*mblock]bool, mb *mblock) map[*mblock]bool {
-	var inner map[*mblock]bool
-	for _, body := range bodies {
-		if body[mb] && (inner == nil || len(body) < len(inner)) {
-			inner = body
+func innermostLoop(loops []*ir.NaturalLoop[*mblock], mb *mblock) map[*mblock]bool {
+	for _, l := range loops {
+		if l.Body[mb] {
+			return l.Body
 		}
 	}
-	return inner
+	return nil
 }
 
 func (mb *mblock) heavy() bool {
