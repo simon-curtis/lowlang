@@ -18,7 +18,7 @@ fn main() {
 
 ## Usage
 
-Requires Go. `low dev` also needs binutils (`as`, `ld`).
+Building `low` needs Go. Compiling and linking a program needs only the `low` binary. `low dev` needs a Linux host with binutils (`as`, `ld`).
 
 ```sh
 go build -o low ./cmd/low
@@ -32,9 +32,12 @@ go build -o low ./cmd/low
 ./low run app/
 ```
 
+- `low` runs on Linux and on Windows. The target defaults to the host; `-target linux/amd64` or `-target windows/amd64` selects one.
 - A directory is a module. `import ui/text` loads `ui/text/` under the project root, marked by a `low.mod` file.
 - The standard library imports as `std/...`.
 - `low dev` runs the program and patches changed functions into it on every save, keeping its state.
+- On the Windows target, standard library modules that call the operating system (files, processes, sockets and everything built on them) panic with `system calls are not available on windows`. Language features and modules that only compute run unchanged.
+- `go test ./...` expects a Linux host.
 
 ## Benchmarks
 

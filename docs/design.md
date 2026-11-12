@@ -1282,8 +1282,10 @@ The compiler is written in Go. Pipeline:
 | Assemble | `internal/asm` | object: sections, symbols and fixups |
 | Link | `internal/link` | ELF or PE executable |
 
-`as` and `ld` assemble and link the patches of `low dev`. Building a program needs no external tool.
+Building a program needs no external tool. `low dev` needs a Linux host and GNU binutils, because `as` and `ld` assemble and link its patches.
 
+- `low` builds and runs on Linux and on Windows. The default target is the host; `-target linux/amd64` or `-target windows/amd64` selects one. Every target is assembled and linked in process.
+- On the Windows target, `__syscall` compiles to a call that panics with `system calls are not available on windows`, so a standard library module that calls the operating system (`std/file`, `std/os`, `std/process`, `std/net` and everything built on them, `std/term`, `std/os/signal`, log sinks, `std/crypto` random generation, `std/dns`, `std/archive`, the host lookups of `std/time/zone` and `std/cdp`) panics when it runs there. Core-language programs and modules that only compute run.
 - The `low` command lives in `cmd/low`. The pipeline it shares with hot reload lives in `internal/compiler`.
 - `low ir` prints the SSA form and `low asm` the generated assembly.
 - Compilation is deterministic: the same source and target always produce the same SSA form, assembly and binary. No pass depends on map iteration order; where order matters the compiler walks slices or stacks.
@@ -1711,7 +1713,7 @@ Optimiser:
 - The poll check is `cmp byte ptr fs:[-8], 0` and `jne` to an out-of-line stub that calls `rt_poll` and jumps back to a label placed directly after the `jne`.
 - Alignment:
   - Every function and every C callback thunk starts on a 32-byte boundary.
-  - `low build` and `low run` on Linux assemble with `-mbranches-within-32B-boundaries`, which pads so that no jump, and no fused compare and jump, crosses or ends at a 32-byte boundary. Hot patches are assembled without it.
+  - A program for Linux is assembled with branch alignment, which pads so that no jump, and no fused compare and jump, crosses or ends at a 32-byte boundary. Hot patches are assembled without it.
   - A loop that is a single back-edge block, ends in its own conditional jump and has at most four instructions and phi copies besides the poll, if any, and the compare starts on a 32-byte boundary, so the whole loop sits in one window and needs no padding inside.
 
 Calling convention:
@@ -1733,7 +1735,7 @@ Calling convention:
 
 ## Hot reload
 
-`low dev app.low` or `low dev app/` builds a dev binary, runs it, and watches every source file of every loaded module, every embedded file, and the file lists of their directories. On save:
+`low dev app.low` or `low dev app/` needs a Linux host. It builds a dev binary, runs it, and watches every source file of every loaded module, every embedded file, and the file lists of their directories. On save:
 
 - A file that fails to compile is reported and the running program is left alone.
 - The program restarts when any of these changes:
@@ -1751,7 +1753,7 @@ Mechanism:
 - Dev builds call every function through `fn_table`, a writable table of 4096 code addresses, with `call [rip+fn_table+8*i]`. Release builds call directly.
 - In dev builds a function value's code word is the address of its `fn_table` entry and calls through it use `call [r10]`, so a stored function value or closure runs the newest code. Callback thunks call through the table too.
 - At start the dev runtime installs a `SIGUSR1` handler and maps a 64 MB read-execute region at `0x40000000`, close enough to the binary for 32-bit relative references.
-- A patch is assembled with only the changed functions and their strings, then linked at the next free address in that region against the running binary's symbols (`ld -R`). Patched functions get a fresh symbol suffix so they never collide with the originals.
+- A patch is assembled with `as` and linked with `ld -R` at the next free address in that region against the running binary's symbols. It holds only the changed functions and their strings. Patched functions get a fresh symbol suffix so they never collide with the originals.
 - `low dev` writes the machine code into the region through `/proc/<pid>/mem`, writes `(index, address)` pairs and a count into a mailbox in the program, and sends `SIGUSR1`. The handler stores each address into `fn_table` with an aligned 8-byte write and clears the count, which `low dev` waits for.
 - Frames already running keep executing their old code; the next call through the table enters the new code. Old code is never unmapped.
 
@@ -1809,7 +1811,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
   - With `-fixtures` it is also written there as a `testdata/run` fixture (`.low` with the predicted `.out` and `.err`, named by content hash) that fails until the bug is fixed.
 - `internal/asm` tests assemble every program with `as` or `clang` and require the same object bytes. `internal/link` tests link programs with `ld` or `lld-link` and require the same segments, sections, symbols and loaded bytes for ELF and the same bytes for PE. `LOW_LINK_FULL=1` covers every `testdata/run` program and benchmark.
   - The padding and relaxation choices these tests compare differ between tool releases, so `internal/oracletool` pins GNU binutils 2.47 and LLVM 23.1.4. The tests skip when a tool is missing or reports another version.
-- `go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present.
+- `go test ./...` expects a Linux host. It also compiles every `testdata/run/*.low` and every program directory in `testdata/run`, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present.
   - A program with a `.needed` file must link exactly those shared libraries. Every other program must be static with no interpreter.
   - Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
   - The time zone programs read zone rules from the embedded `std/time/tzdata`, because host databases differ by release and by build (Debian's includes `backzone`). They read the host database only for the behaviour of `zone.named` and `zone.local`, through zones whose rules every build agrees on.
@@ -1844,18 +1846,20 @@ The UI library is staged under `ui/` until it moves into the standard library as
     11. Foreground and background executors on the scheduler; a background task's result is written into a signal on the UI thread.
     12. Text input element whose state is held in signals, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     13. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-3. Own assembler and linker in place of `as` and `ld` for the patches of `low dev`.
+3. Patches of `low dev` assembled and linked in process, so `low dev` needs no binutils.
 4. A wasm32 target and a browser playground that runs snippets:
     1. Targets named by OS and architecture, with `wasm32` beside `amd64`.
     2. A WebAssembly back end lowered from the IR: structured control flow rebuilt from the IR's blocks, locals in place of registers, a linear-memory heap with the size-class bins, and a module written directly without an external assembler or linker.
     3. A browser host: `print` and the clock as JavaScript imports; modules that need the OS (files, sockets, processes, the UI library) are rejected at compile time for this target.
     4. The compiler built for `js/wasm`, so the page compiles and runs a snippet without a server.
     5. A Run button on every documentation snippet, and an editable playground page on the site.
-5. Standard library on windows/amd64:
+5. Standard library and tools on Windows:
     1. OS-specific std code selected by target, so each OS-facing module (`std/os`, `std/os/signal`, `std/file`, `std/net`, `std/process`) carries one implementation per OS behind one API.
     2. `__syscall` rejected at compile time on the Windows target, so a module without a Windows implementation fails the build.
     3. `std/process` over kernel32: `CreateProcessW` with Windows command-line quoting, `CreatePipe` with overlapped reads and writes for piped streams, `WaitForSingleObject` and `GetExitCodeProcess`, `TerminateProcess`, job objects for process groups, and `find` over `PATH` and `PATHEXT`.
-7. A package registry:
+    4. `low dev` on a Windows host.
+    5. `go test ./...` on a Windows host.
+6. A package registry:
     1. Dependencies declared in `low.mod` with a version each, a `low.sum` lockfile holding exact versions and content hashes, and a module cache that imports resolve to.
     2. Packages published from tagged git repositories, each version immutable once indexed, and yanking in place of deletion.
     3. A package page on the website for every indexed version, generated with `low doc` as the standard library pages are.

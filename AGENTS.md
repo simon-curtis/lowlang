@@ -8,7 +8,7 @@ Read `## Syntax`. A change runs through `internal/lexer`, `internal/parser`, `in
 
 ## Code generation or optimisation
 
-Read `## Compiler`. `internal/ir` builds SSA, `internal/amd64` emits assembly. Compiling a program twice in one process must produce identical SSA and assembly; `cmd/low` tests enforce it.
+Read `## Compiler`. `internal/ir` builds SSA, `internal/amd64` emits assembly, `internal/asm` assembles it and `internal/link` writes the ELF or PE executable, all in process. Compiling a program twice in one process must produce identical SSA and assembly; `cmd/low` tests enforce it.
 
 ## Standard library
 
@@ -16,7 +16,7 @@ Read `## Standard library`. Modules live in `internal/compiler/std/<name>/`, wri
 
 ## Tests
 
-Read `## Tests`. `go test ./...` runs every `testdata/run` program against its `.out`, `.err`, `.maxrss` and `.needed` files, and expects every `testdata/fail` program to fail with its `.err`. `cmd/lowfuzz` finds compiler bugs with generated programs.
+Read `## Tests`. `go test ./...` runs every `testdata/run` program against its `.out`, `.err`, `.maxrss` and `.needed` files, and expects every `testdata/fail` program to fail with its `.err`. The tests expect a Linux host. The `internal/asm` and `internal/link` oracle tests compare against GNU binutils and LLVM and skip when those tools are missing or at another version. `cmd/lowfuzz` finds compiler bugs with generated programs.
 
 ## Editor, LSP or lint
 
