@@ -10,7 +10,7 @@ var resultRegisters = []string{"rax", "rdx"}
 
 func (in *instr) returnsInRegisters() bool {
 	switch in.op {
-	case ir.OpRuntime:
+	case ir.OpRuntime, ir.OpSyscall:
 		return true
 	case ir.OpCall:
 		return in.value.Target.ResultWords <= len(resultRegisters)
@@ -62,7 +62,7 @@ func (in *instr) consumes(r *vreg) bool {
 		return !isFloat(in.value.Type)
 	case ir.OpStore:
 		return at == 1
-	case ir.OpCall, ir.OpRuntime:
+	case ir.OpCall, ir.OpRuntime, ir.OpSyscall:
 		return true
 	}
 	return false

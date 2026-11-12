@@ -1,4 +1,4 @@
-package ir
+package amd64
 
 var cheapSyscalls = map[int64]bool{
 	3: true, 8: true, 9: true, 10: true, 11: true, 12: true, 13: true, 14: true,
@@ -12,9 +12,7 @@ var cheapSyscalls = map[int64]bool{
 	293: true, 302: true, 318: true,
 }
 
-func syscallRuntime(number *Value) string {
-	if number.Op == OpConst && cheapSyscalls[number.Aux] {
-		return "syscall"
-	}
-	return "sysblock"
+func (in *instr) inlineSyscall() bool {
+	number := in.args[0].konst
+	return number != nil && cheapSyscalls[*number]
 }

@@ -103,6 +103,7 @@ func (s *inlineSite) cloneValues(b *Block) {
 			c.Aux += int64(s.slotBase)
 		}
 		c.Str = v.Str
+		c.Runtime = v.Runtime
 		c.Target = v.Target
 		c.Plan = v.Plan
 		c.Type = v.Type

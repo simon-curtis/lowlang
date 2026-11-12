@@ -20,10 +20,10 @@ func (f *mfunc) selectInstructions() {
 
 func (in *instr) writesMemory() bool {
 	switch in.op {
-	case ir.OpStore, ir.OpCall, ir.OpCCall, ir.OpRuntime, ir.OpVector, ir.OpVectorScalar:
+	case ir.OpStore, ir.OpVector, ir.OpVectorScalar:
 		return true
 	}
-	return false
+	return in.op.IsCall()
 }
 
 func (s *selector) doubleFloats() {

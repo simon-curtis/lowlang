@@ -2,6 +2,7 @@ package ir
 
 import (
 	"lowlang/internal/ast"
+	"lowlang/internal/builtin"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
 )
@@ -19,7 +20,7 @@ func (b *builder) regrow(ptr, length, capacity *Value, elem *types.Type) *Value 
 	stride := b.constant(int64(elem.Stride()))
 	used := b.emit(OpMul, length, stride)
 	size := b.emit(OpMul, capacity, stride)
-	return b.runtime("grow", ptr, used, size, b.scan(elem))
+	return b.runtime(rtGrow, ptr, used, size, b.scan(elem))
 }
 
 func (b *builder) extend(e *ast.Call) {
@@ -28,7 +29,7 @@ func (b *builder) extend(e *ast.Call) {
 	src := b.value(e.Args[1], types.Str)
 	base, length, needed := b.room(header, ref.Type, src[1])
 	end := b.emit(OpAdd, base, length)
-	b.runtimeVoid("memmove", end, src[0], src[1])
+	b.runtime(rtMemmove, end, src[0], src[1])
 	b.store(header.at(1), []*Value{needed})
 }
 
@@ -128,7 +129,7 @@ func loopPush(body *ast.Block) (*ast.Call, bool) {
 		x = body.Tail
 	}
 	call, ok := x.(*ast.Call)
-	if !ok || call.Builtin != "push" {
+	if !ok || call.Builtin != builtin.Push {
 		return nil, false
 	}
 	return call, true
@@ -148,7 +149,7 @@ func invariantValue(e ast.Expr, stored, counter *ast.Local) bool {
 	case *ast.Binary:
 		return pureBinary(e) && invariantValue(e.X, stored, counter) && invariantValue(e.Y, stored, counter)
 	case *ast.Call:
-		return e.Builtin == "convert" && invariantValue(e.Args[0], stored, counter)
+		return e.Builtin == builtin.Convert && invariantValue(e.Args[0], stored, counter)
 	case *ast.Selector:
 		plain := e.Field != nil && e.Variant == nil && e.Reference == nil && e.Func == nil && !e.Length
 		return plain && e.X.TypeOf().Kind == types.StructKind && invariantValue(e.X, stored, counter)
@@ -258,7 +259,7 @@ func (b *builder) rejectOversize(trips *Value, elem *types.Type) {
 	b.branch(tooMany, oversize, fits)
 	b.enter(oversize)
 	zero := b.constant(0)
-	b.runtimeVoid("grow", zero, zero, b.constant(impossibleSize), zero)
+	b.runtimeCall(rtGrow, zero, zero, b.constant(impossibleSize), zero)
 	b.cur.Kind = Unreachable
 	b.enter(fits)
 }

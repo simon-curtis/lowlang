@@ -241,34 +241,3 @@ func (b *builder) slot(words int) *Value {
 	b.fn.Slots = append(b.fn.Slots, words)
 	return slot
 }
-
-func (b *builder) pointerBuiltin(e *ast.Call) ([]*Value, bool) {
-	arg := e.Args[0]
-	switch e.Builtin {
-	case "view":
-		n := b.word(e.Args[1])
-		return []*Value{b.word(arg), n, n}, true
-	case "load":
-		elem := e.Type
-		return b.load(place{addr: b.word(arg), scalar: elem.Width(), tail: elem.Tail(), mem: MemRaw | MemTrap}, elem), true
-	case "store":
-		elem := e.Args[1].TypeOf()
-		ptr := b.word(arg)
-		b.store(place{addr: ptr, scalar: elem.Width(), tail: elem.Tail(), mem: MemRaw}, b.value(e.Args[1], elem))
-		return nil, true
-	case "cstr":
-		return b.callNamed("__cstr", b.value(arg, types.Str)...), true
-	case "from_cstr":
-		return b.callNamed("__from_cstr", b.word(arg)), true
-	case "pin":
-		w := b.value(arg, arg.TypeOf())[0]
-		b.runtimeVoid("pin", w)
-		return []*Value{w}, true
-	case "unpin":
-		b.runtimeVoid("unpin", b.word(arg))
-		return nil, true
-	case "__slice_ptr":
-		return b.value(arg, arg.TypeOf())[:1], true
-	}
-	return nil, false
-}

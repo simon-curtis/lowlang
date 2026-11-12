@@ -15,64 +15,9 @@ type selectArm struct {
 	timer *Value
 }
 
-func (b *builder) chanCall(name string, c *types.Type, args ...*Value) []*Value {
+func (b *builder) chanNamed(name string, c *types.Type, args ...*Value) []*Value {
 	instance := types.InstanceName(name, []*types.Type{c.Elem})
 	return b.callNamed(instance, args...)
-}
-
-func (b *builder) concurrencyBuiltin(e *ast.Call) ([]*Value, bool) {
-	switch e.Builtin {
-	case "chan":
-		capacity := b.constant(0)
-		if len(e.Args) == 1 {
-			capacity = b.word(e.Args[0])
-		}
-		return b.chanCall("__chan_new", e.Type, capacity), true
-	case "close":
-		c := b.word(e.Args[0])
-		b.chanCall("__chan_close", e.Args[0].TypeOf(), c)
-	case "sleep":
-		b.runtimeVoid("sleep", b.word(e.Args[0]))
-	case "wait_readable":
-		b.runtimeVoid("wait_fd", b.word(e.Args[0]), b.constant(1))
-	case "wait_writable":
-		b.runtimeVoid("wait_fd", b.word(e.Args[0]), b.constant(4))
-	case "__spawn":
-		f := b.value(e.Args[0], e.Args[0].TypeOf())
-		b.runtimeVoid("spawn", f...)
-	case "__current":
-		g := b.runtime("current")
-		g.Scalar = true
-		return []*Value{g}, true
-	case "__park":
-		b.runtimeVoid("park")
-	case "__context":
-		return []*Value{b.runtime("context")}, true
-	case "__set_context":
-		b.runtimeVoid("set_context", b.word(e.Args[0]))
-	case "__has_context":
-		has := b.runtime("has_context")
-		has.Scalar = true
-		return []*Value{has}, true
-	case "__ready":
-		b.runtimeVoid("ready", b.word(e.Args[0]))
-	case "__lock", "__unlock":
-		b.runtimeVoid(e.Builtin[2:], b.refAddress(e.Args[0]))
-	case "__cas":
-		addr := b.refAddress(e.Args[0])
-		old := b.word(e.Args[1])
-		swapped := b.runtime("cas", addr, old, b.word(e.Args[2]))
-		swapped.Scalar = true
-		return []*Value{swapped}, true
-	case "__panic":
-		msg := b.value(e.Args[0], types.Str)
-		b.runtimeVoid("panic_msg", msg...)
-		b.cur.Kind = Unreachable
-		b.dead()
-	default:
-		return nil, false
-	}
-	return nil, true
 }
 
 func (b *builder) refAddress(arg ast.Expr) *Value {
@@ -82,14 +27,14 @@ func (b *builder) refAddress(arg ast.Expr) *Value {
 
 func (b *builder) receive(e *ast.Unary) []*Value {
 	c := b.word(e.X)
-	return b.chanCall("__chan_recv", e.X.TypeOf(), c)
+	return b.chanNamed("__chan_recv", e.X.TypeOf(), c)
 }
 
 func (b *builder) send(s *ast.Send) {
 	t := s.Chan.TypeOf()
 	args := []*Value{b.word(s.Chan)}
 	args = append(args, b.value(s.Value, t.Elem)...)
-	b.chanCall("__chan_send", t, args...)
+	b.chanNamed("__chan_send", t, args...)
 }
 
 func (b *builder) chanLoop(s *ast.ForIn) {
@@ -101,7 +46,7 @@ func (b *builder) chanLoop(s *ast.ForIn) {
 	exit := b.newBlock()
 	b.jump(header)
 	b.cur = header
-	received := b.chanCall("__chan_recv", t, c)
+	received := b.chanNamed("__chan_recv", t, c)
 	b.branch(received[0], body, exit)
 	b.enter(body)
 	b.bind(s.ValueLocal, received[1:1+t.Elem.Size()])
@@ -174,13 +119,13 @@ func (b *builder) lockChannels(chans []*Value) *Value {
 	for i, ch := range chans {
 		b.store(place{addr: locks, offset: 8 * i}, []*Value{ch})
 	}
-	b.runtimeVoid("lock_all", locks, b.constant(int64(len(chans))))
+	b.runtime(rtLockAll, locks, b.constant(int64(len(chans))))
 	return locks
 }
 
 func (b *builder) unlockChannels(locks *Value, n int) {
 	if locks != nil {
-		b.runtimeVoid("unlock_all", locks, b.constant(int64(n)))
+		b.runtime(rtUnlockAll, locks, b.constant(int64(n)))
 	}
 }
 
@@ -192,10 +137,10 @@ func (b *builder) trySelect(i int, a *selectArm, outcome int) {
 	b.enter(try)
 	var probe []*Value
 	if a.sc.Kind == ast.RecvCase {
-		probe = b.chanCall("__sel_recv", a.chant, a.ch, a.box)
+		probe = b.chanNamed("__sel_recv", a.chant, a.ch, a.box)
 	} else {
 		args := append([]*Value{a.ch}, a.val...)
-		probe = b.chanCall("__sel_send", a.chant, args...)
+		probe = b.chanNamed("__sel_send", a.chant, args...)
 	}
 	b.branch(b.emit(OpLt, probe[0], b.constant(0)), skip, hit)
 	b.enter(hit)
@@ -211,24 +156,23 @@ func (b *builder) waitSelect(arms []*selectArm, locks *Value, n int, outcome int
 		index := b.constant(int64(i))
 		switch a.sc.Kind {
 		case ast.RecvCase:
-			b.chanCall("__sel_wait_recv", a.chant, a.ch, w, index, a.box)
+			b.chanNamed("__sel_wait_recv", a.chant, a.ch, w, index, a.box)
 		case ast.SendCase:
 			a.box = b.slot(max(1, len(a.val)))
 			b.store(place{addr: a.box}, a.val)
-			b.chanCall("__sel_wait_send", a.chant, a.ch, w, index, a.box)
+			b.chanNamed("__sel_wait_send", a.chant, a.ch, w, index, a.box)
 		}
 	}
 	b.unlockChannels(locks, n)
 	for i, a := range arms {
 		if a.ms != nil {
-			a.timer = b.runtime("timer_add", a.ms, w, b.constant(int64(i)))
-			a.timer.Scalar = true
+			a.timer = b.runtime(rtTimerAdd, a.ms, w, b.constant(int64(i)))
 		}
 	}
-	b.runtimeVoid("park")
+	b.runtime(rtPark)
 	for _, a := range arms {
 		if a.timer != nil {
-			b.runtimeVoid("timer_del", a.timer)
+			b.runtime(rtTimerDel, a.timer)
 		}
 		if a.sc.Kind == ast.SendCase {
 			b.clearSlot(a.box, len(a.val))
@@ -249,7 +193,7 @@ func (b *builder) selectArms(e *ast.Select, arms []*selectArm, index, ok *Value)
 		b.branch(match, body, next)
 		b.enter(body)
 		if a.sc.Local != nil {
-			b.bind(a.sc.Local, b.chanCall("__sel_value", a.chant, ok, a.box))
+			b.bind(a.sc.Local, b.chanNamed("__sel_value", a.chant, ok, a.box))
 		}
 		if a.sc.Kind == ast.RecvCase {
 			b.clearSlot(a.box, a.chant.Elem.Size())

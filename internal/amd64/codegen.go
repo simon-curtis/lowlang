@@ -905,6 +905,8 @@ func (g *Generator) instr(fr *frame, in *instr) {
 		g.call(fr, in)
 	case ir.OpRuntime:
 		g.runtimeCall(fr, in)
+	case ir.OpSyscall:
+		g.syscallCall(fr, in)
 	case ir.OpCCall:
 		g.cCall(fr, in)
 	case ir.OpResult:
@@ -1162,10 +1164,6 @@ func (g *Generator) writeMaps(out *strings.Builder) {
 
 var syscallRegs = []string{"rax", "rdi", "rsi", "rdx", "r10", "r8", "r9"}
 
-func isSyscall(name string) bool {
-	return name == "syscall" || name == "sysblock"
-}
-
 var growRegs = []string{"rax", "rdx", "r10"}
 
 func (g *Generator) growCall(fr *frame, in *instr) {
@@ -1175,11 +1173,11 @@ func (g *Generator) growCall(fr *frame, in *instr) {
 	}
 	g.parallel(moves)
 	g.leaveVectors()
-	symbol := "rt_grow_scan"
+	variant := "scan"
 	if scan := in.args[3].konst; scan != nil && *scan == 0 {
-		symbol = "rt_grow_noscan"
+		variant = "noscan"
 	}
-	g.emit("call %s", symbol)
+	g.emit("call %s_%s", in.value.Runtime.Symbol, variant)
 	g.safepoint(fr, in)
 }
 
@@ -1196,21 +1194,28 @@ func (g *Generator) runtimeCall(fr *frame, in *instr) {
 		g.stringEquality(fr, in)
 		return
 	}
-	regs := argRegs
-	if isSyscall(in.value.Str) {
-		regs = syscallRegs
-	}
 	moves := make([]pmove, len(in.args))
 	for i, a := range in.args {
-		moves[i] = pmove{dst: regs[i], src: fr.loc(a)}
+		moves[i] = pmove{dst: argRegs[i], src: fr.loc(a)}
 	}
 	g.parallel(moves)
-	if in.value.Str == "syscall" {
+	g.leaveVectors()
+	g.emit("call %s", in.value.Runtime.Symbol)
+	g.safepoint(fr, in)
+}
+
+func (g *Generator) syscallCall(fr *frame, in *instr) {
+	moves := make([]pmove, len(in.args))
+	for i, a := range in.args {
+		moves[i] = pmove{dst: syscallRegs[i], src: fr.loc(a)}
+	}
+	g.parallel(moves)
+	if in.inlineSyscall() {
 		g.syscall()
 		return
 	}
 	g.leaveVectors()
-	g.emit("call rt_%s", in.value.Str)
+	g.emit("call %s", in.value.Runtime.Symbol)
 	g.safepoint(fr, in)
 }
 
@@ -1224,7 +1229,7 @@ func (g *Generator) result(fr *frame, in *instr) {
 		g.cResult(fr, in, call.Plan, k)
 		return
 	}
-	if call.Op == ir.OpRuntime || call.Target.ResultWords <= 2 {
+	if call.Op != ir.OpCall || call.Target.ResultWords <= len(resultRegisters) {
 		g.move(fr.loc(in.dst), resultRegisters[k])
 		return
 	}

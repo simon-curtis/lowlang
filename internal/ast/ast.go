@@ -1,6 +1,7 @@
 package ast
 
 import (
+	"lowlang/internal/builtin"
 	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
@@ -448,7 +449,7 @@ type Call struct {
 	Prepended bool
 	Target    *Func
 	Render    *Func
-	Builtin   string
+	Builtin   builtin.ID
 	Variant   *types.Variant
 	Embed     string
 	Size      int64

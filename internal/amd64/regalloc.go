@@ -243,11 +243,11 @@ func (mb *mblock) buildRanges() {
 }
 
 func (in *instr) isCall() bool {
-	return in.op == ir.OpCall || in.op == ir.OpCCall || (in.op == ir.OpRuntime && in.literal == nil)
+	return in.op.IsCall() && in.literal == nil
 }
 
 func (in *instr) preservesRegisters() bool {
-	return in.op == ir.OpRuntime && in.value.Str == "grow"
+	return in.op == ir.OpRuntime && in.value.Runtime.Conv == ir.CallGrow
 }
 
 func (f *mfunc) markCallCrossings() {

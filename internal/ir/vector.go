@@ -2,6 +2,7 @@ package ir
 
 import (
 	"lowlang/internal/ast"
+	"lowlang/internal/builtin"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
 )
@@ -135,31 +136,33 @@ func (b *builder) vectorAddress(data, at ast.Expr, t *types.Type) *Value {
 	return b.scaled(words[0], index, stride)
 }
 
+var vectorBuiltins = map[builtin.ID]VectorOp{builtin.VShuffle: VShuffle, builtin.VMin: VMin, builtin.VMax: VMax}
+
 func (b *builder) vectorCall(e *ast.Call) *Value {
 	t := e.Type
-	switch e.Builtin {
-	case "vector_cast":
-		dst := b.vectorSlot(t)
-		b.vectorOp(VCopy, t, dst, b.vec(e.Args[0]))
-		return dst
-	case "__vload":
-		dst := b.vectorSlot(t)
-		b.vectorOp(VCopy, t, dst, b.vectorAddress(e.Args[0], e.Args[1], t))
-		return dst
-	case "__vsplat":
-		dst := b.vectorSlot(t)
-		b.vectorOp(VSplat, t, dst, b.value(e.Args[0], t.Elem)[0])
-		return dst
-	case "__vshuffle", "__vmin", "__vmax":
-		op := map[string]VectorOp{"__vshuffle": VShuffle, "__vmin": VMin, "__vmax": VMax}[e.Builtin]
+	if op, ok := vectorBuiltins[e.Builtin]; ok {
 		dst := b.vectorSlot(t)
 		b.vectorOp(op, t, dst, b.vec(e.Args[0]), b.vec(e.Args[1]))
 		return dst
-	case "__vselect":
+	}
+	switch e.Builtin {
+	case builtin.VectorCast:
+		dst := b.vectorSlot(t)
+		b.vectorOp(VCopy, t, dst, b.vec(e.Args[0]))
+		return dst
+	case builtin.VLoad:
+		dst := b.vectorSlot(t)
+		b.vectorOp(VCopy, t, dst, b.vectorAddress(e.Args[0], e.Args[1], t))
+		return dst
+	case builtin.VSplat:
+		dst := b.vectorSlot(t)
+		b.vectorOp(VSplat, t, dst, b.value(e.Args[0], t.Elem)[0])
+		return dst
+	case builtin.VSelect:
 		dst := b.vectorSlot(t)
 		b.vectorOp(VSelect, t, dst, b.vec(e.Args[0]), b.vec(e.Args[1]), b.vec(e.Args[2]))
 		return dst
-	case "__vwith":
+	case builtin.VWith:
 		dst := b.vectorSlot(t)
 		b.vectorOp(VCopy, t, dst, b.vec(e.Args[0]))
 		b.store(b.lanePlace(dst, e.Args[1], t), b.value(e.Args[2], t.Elem))
@@ -172,25 +175,6 @@ func (b *builder) lanePlace(addr *Value, index ast.Expr, t *types.Type) place {
 	i := b.word(index)
 	b.check(i, b.constant(int64(t.Lanes)))
 	return place{addr: b.scaled(addr, i, t.LaneBytes()), scalar: t.Elem.Width()}
-}
-
-func (b *builder) vectorBuiltin(e *ast.Call) ([]*Value, bool) {
-	switch e.Builtin {
-	case "__vstore":
-		t := e.Args[2].TypeOf()
-		b.vectorOp(VCopy, t, b.vectorAddress(e.Args[0], e.Args[1], t), b.vec(e.Args[2]))
-		return nil, true
-	case "__vmask":
-		t := e.Args[0].TypeOf()
-		v := b.typed(OpVectorScalar, types.U64, b.vec(e.Args[0]))
-		v.Aux = int64(VMask)
-		v.From = t
-		return []*Value{v}, true
-	case "__vlane":
-		t := e.Args[0].TypeOf()
-		return b.load(b.lanePlace(b.vec(e.Args[0]), e.Args[1], t), t.Elem), true
-	}
-	return nil, false
 }
 
 func (b *builder) assignVector(s *ast.Assign) {

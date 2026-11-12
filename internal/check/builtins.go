@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/builtin"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
 )
@@ -22,6 +23,7 @@ const (
 type builtinHandler func(c *Checker, e *ast.Call, want *types.Type)
 
 type Builtin struct {
+	ID         builtin.ID
 	Name       string
 	Kind       BuiltinKind
 	Shadowable bool
@@ -54,6 +56,9 @@ func init() {
 	builtins = newBuiltins()
 	builtinIndex = make(map[string]*Builtin, len(builtins))
 	for _, b := range builtins {
+		if b.Name == "" {
+			b.Name = b.ID.String()
+		}
 		builtinIndex[b.Name] = b
 	}
 }
@@ -76,27 +81,27 @@ func bare(h func(c *Checker, e *ast.Call)) builtinHandler {
 
 func newBuiltins() []*Builtin {
 	list := []*Builtin{
-		{Name: "print", Params: []string{"value"}, handler: bare((*Checker).print)},
-		{Name: "new", Params: []string{"value"}, handler: (*Checker).allocate},
-		{Name: "push", MutFirst: true, Receivers: []types.Kind{types.SliceKind}, Params: []string{"xs", "value"}, handler: bare((*Checker).push)},
-		{Name: "pop", Shadowable: true, MutFirst: true, Receivers: []types.Kind{types.SliceKind}, Params: []string{"xs"}, handler: bare((*Checker).shrink)},
-		{Name: "truncate", Shadowable: true, MutFirst: true, Receivers: []types.Kind{types.SliceKind}, Params: []string{"xs", "n"}, handler: bare((*Checker).shrink)},
-		{Name: "delete", MutFirst: true, Receivers: []types.Kind{types.MapKind}, Params: []string{"m", "key"}, handler: bare((*Checker).deleteEntry)},
-		{Name: "bytes", Params: []string{"s"}, handler: bare((*Checker).bytesCall)},
-		{Name: "cstr", Params: []string{"s"}, handler: bare((*Checker).cstrCall)},
-		{Name: "view", Params: []string{"p", "n"}, handler: bare((*Checker).viewCall)},
-		{Name: "load", Params: []string{"p"}, handler: bare((*Checker).loadCall)},
-		{Name: "store", Params: []string{"p", "value"}, handler: bare((*Checker).storeCall)},
-		{Name: "pin", Params: []string{"value"}, handler: bare((*Checker).pinCall)},
-		{Name: "unpin", Params: []string{"p"}, handler: bare((*Checker).unpinCall)},
-		{Name: "embed", Params: []string{"path"}, handler: bare((*Checker).embed)},
-		{Name: "sqrt", Params: []string{"x"}, handler: (*Checker).math},
-		{Name: "floor", Params: []string{"x"}, handler: (*Checker).math},
-		{Name: "exp", Params: []string{"x"}, handler: (*Checker).math},
-		{Name: "close", Shadowable: true, Receivers: []types.Kind{types.ChanKind}, Params: []string{"c"}, handler: bare((*Checker).closeCall)},
-		{Name: "sleep", Shadowable: true, Params: []string{"ms"}, handler: bare((*Checker).waitCall)},
-		{Name: "wait_readable", Shadowable: true, Params: []string{"fd"}, handler: bare((*Checker).waitCall)},
-		{Name: "wait_writable", Shadowable: true, Params: []string{"fd"}, handler: bare((*Checker).waitCall)},
+		{ID: builtin.Print, Params: []string{"value"}, handler: bare((*Checker).print)},
+		{ID: builtin.New, Params: []string{"value"}, handler: (*Checker).allocate},
+		{ID: builtin.Push, MutFirst: true, Receivers: []types.Kind{types.SliceKind}, Params: []string{"xs", "value"}, handler: bare((*Checker).push)},
+		{ID: builtin.Pop, Shadowable: true, MutFirst: true, Receivers: []types.Kind{types.SliceKind}, Params: []string{"xs"}, handler: bare((*Checker).shrink)},
+		{ID: builtin.Truncate, Shadowable: true, MutFirst: true, Receivers: []types.Kind{types.SliceKind}, Params: []string{"xs", "n"}, handler: bare((*Checker).shrink)},
+		{ID: builtin.Delete, MutFirst: true, Receivers: []types.Kind{types.MapKind}, Params: []string{"m", "key"}, handler: bare((*Checker).deleteEntry)},
+		{ID: builtin.Bytes, Params: []string{"s"}, handler: bare((*Checker).bytesCall)},
+		{ID: builtin.Cstr, Params: []string{"s"}, handler: bare((*Checker).cstrCall)},
+		{ID: builtin.View, Params: []string{"p", "n"}, handler: bare((*Checker).viewCall)},
+		{ID: builtin.Load, Params: []string{"p"}, handler: bare((*Checker).loadCall)},
+		{ID: builtin.Store, Params: []string{"p", "value"}, handler: bare((*Checker).storeCall)},
+		{ID: builtin.Pin, Params: []string{"value"}, handler: bare((*Checker).pinCall)},
+		{ID: builtin.Unpin, Params: []string{"p"}, handler: bare((*Checker).unpinCall)},
+		{ID: builtin.Embed, Params: []string{"path"}, handler: bare((*Checker).embed)},
+		{ID: builtin.Sqrt, Params: []string{"x"}, handler: (*Checker).math},
+		{ID: builtin.Floor, Params: []string{"x"}, handler: (*Checker).math},
+		{ID: builtin.Exp, Params: []string{"x"}, handler: (*Checker).math},
+		{ID: builtin.Close, Shadowable: true, Receivers: []types.Kind{types.ChanKind}, Params: []string{"c"}, handler: bare((*Checker).closeCall)},
+		{ID: builtin.Sleep, Shadowable: true, Params: []string{"ms"}, handler: bare((*Checker).waitCall)},
+		{ID: builtin.WaitReadable, Shadowable: true, Params: []string{"fd"}, handler: bare((*Checker).waitCall)},
+		{ID: builtin.WaitWritable, Shadowable: true, Params: []string{"fd"}, handler: bare((*Checker).waitCall)},
 	}
 	list = append(list, privateBuiltins()...)
 	list = append(list, typeBuiltins()...)
@@ -111,50 +116,50 @@ func newBuiltins() []*Builtin {
 
 func privateBuiltins() []*Builtin {
 	return []*Builtin{
-		{Name: "__str_raw", Params: []string{"address", "len"}, handler: bare((*Checker).strRawCall)},
-		{Name: "__slice_ptr", Params: []string{"xs"}, handler: bare((*Checker).slicePtrCall)},
-		{Name: "__bits", Params: []string{"x"}, handler: bare((*Checker).bitsCall)},
-		{Name: "__str_view", Params: []string{"b"}, handler: bare((*Checker).strViewCall)},
-		{Name: "__extend", Params: []string{"b", "s"}, handler: bare((*Checker).extendCall)},
-		{Name: "__extend_by", Params: []string{"b", "n"}, handler: bare((*Checker).extendByCall)},
-		{Name: "__hash", Params: []string{"value"}, handler: bare((*Checker).hashCall)},
-		{Name: "__zero", handler: (*Checker).zeroCall},
-		{Name: "__syscall", Params: []string{"number", "a", "b", "c", "d", "e", "f"}, Optional: 6, handler: bare((*Checker).syscall)},
-		{Name: "__mulhi", Params: []string{"a", "b"}, handler: bare((*Checker).mulhiCall)},
-		{Name: "__make", Params: []string{"n"}, handler: (*Checker).makeCall},
-		{Name: "__memmove", Params: []string{"dst", "src"}, handler: bare((*Checker).memmoveCall)},
-		{Name: "__ctz", Params: []string{"x"}, handler: bare((*Checker).ctzCall)},
-		{Name: "__clock_nanos", Params: []string{"clock"}, handler: bare((*Checker).clockNanosCall)},
-		{Name: "__hash_seed", Params: []string{"which"}, handler: bare((*Checker).hashSeedCall)},
-		{Name: "__argc", handler: bare((*Checker).argcCall)},
-		{Name: "__argv", Params: []string{"i"}, handler: bare((*Checker).argvCall)},
-		{Name: "__envv", Params: []string{"i"}, handler: bare((*Checker).argvCall)},
-		{Name: "__render", Params: []string{"value"}, handler: bare((*Checker).renderCall)},
-		{Name: "__render_into", Params: []string{"b", "path", "value"}, handler: bare((*Checker).renderIntoCall)},
-		{Name: "__address", Params: []string{"p"}, handler: bare((*Checker).addressCall)},
-		{Name: "__serialize", Params: []string{"value", "w"}, handler: bare((*Checker).serializeCall)},
-		{Name: "__serialize_into", Params: []string{"w", "path", "value"}, handler: bare((*Checker).serializeIntoCall)},
-		{Name: "__spawn", Params: []string{"f"}, handler: bare((*Checker).spawnCall)},
-		{Name: "__current", handler: bare((*Checker).currentCall)},
-		{Name: "__park", handler: bare((*Checker).parkCall)},
-		{Name: "__ready", Params: []string{"t"}, handler: bare((*Checker).readyCall)},
-		{Name: "__lock", Params: []string{"word"}, handler: bare((*Checker).lockCall)},
-		{Name: "__unlock", Params: []string{"word"}, handler: bare((*Checker).lockCall)},
-		{Name: "__cas", Params: []string{"word", "old", "new"}, handler: bare((*Checker).casCall)},
-		{Name: "__panic", Params: []string{"message"}, handler: bare((*Checker).panicCall)},
-		{Name: "__context", handler: (*Checker).contextCall},
-		{Name: "__set_context", Params: []string{"p"}, handler: bare((*Checker).setContextCall)},
-		{Name: "__has_context", handler: bare((*Checker).hasContextCall)},
-		{Name: "__vload", Params: []string{"src", "at"}, handler: (*Checker).vectorIntrinsic},
-		{Name: "__vstore", Params: []string{"dst", "at", "v"}, handler: (*Checker).vectorIntrinsic},
-		{Name: "__vsplat", Params: []string{"x"}, handler: (*Checker).vectorIntrinsic},
-		{Name: "__vmask", Params: []string{"v"}, handler: (*Checker).vectorIntrinsic},
-		{Name: "__vshuffle", Params: []string{"v", "order"}, handler: (*Checker).vectorIntrinsic},
-		{Name: "__vselect", Params: []string{"mask", "a", "b"}, handler: (*Checker).vectorIntrinsic},
-		{Name: "__vmin", Params: []string{"a", "b"}, handler: (*Checker).vectorIntrinsic},
-		{Name: "__vmax", Params: []string{"a", "b"}, handler: (*Checker).vectorIntrinsic},
-		{Name: "__vlane", Params: []string{"v", "i"}, handler: (*Checker).vectorIntrinsic},
-		{Name: "__vwith", Params: []string{"v", "i", "x"}, handler: (*Checker).vectorIntrinsic},
+		{ID: builtin.StrRaw, Params: []string{"address", "len"}, handler: bare((*Checker).strRawCall)},
+		{ID: builtin.SlicePtr, Params: []string{"xs"}, handler: bare((*Checker).slicePtrCall)},
+		{ID: builtin.Bits, Params: []string{"x"}, handler: bare((*Checker).bitsCall)},
+		{ID: builtin.StrView, Params: []string{"b"}, handler: bare((*Checker).strViewCall)},
+		{ID: builtin.Extend, Params: []string{"b", "s"}, handler: bare((*Checker).extendCall)},
+		{ID: builtin.ExtendBy, Params: []string{"b", "n"}, handler: bare((*Checker).extendByCall)},
+		{ID: builtin.Hash, Params: []string{"value"}, handler: bare((*Checker).hashCall)},
+		{ID: builtin.Zero, handler: (*Checker).zeroCall},
+		{ID: builtin.Syscall, Params: []string{"number", "a", "b", "c", "d", "e", "f"}, Optional: 6, handler: bare((*Checker).syscall)},
+		{ID: builtin.MulHi, Params: []string{"a", "b"}, handler: bare((*Checker).mulhiCall)},
+		{ID: builtin.Make, Params: []string{"n"}, handler: (*Checker).makeCall},
+		{ID: builtin.Memmove, Params: []string{"dst", "src"}, handler: bare((*Checker).memmoveCall)},
+		{ID: builtin.Ctz, Params: []string{"x"}, handler: bare((*Checker).ctzCall)},
+		{ID: builtin.ClockNanos, Params: []string{"clock"}, handler: bare((*Checker).clockNanosCall)},
+		{ID: builtin.HashSeed, Params: []string{"which"}, handler: bare((*Checker).hashSeedCall)},
+		{ID: builtin.Argc, handler: bare((*Checker).argcCall)},
+		{ID: builtin.Argv, Params: []string{"i"}, handler: bare((*Checker).argvCall)},
+		{ID: builtin.Envv, Params: []string{"i"}, handler: bare((*Checker).argvCall)},
+		{ID: builtin.Render, Params: []string{"value"}, handler: bare((*Checker).renderCall)},
+		{ID: builtin.RenderInto, Params: []string{"b", "path", "value"}, handler: bare((*Checker).renderIntoCall)},
+		{ID: builtin.Address, Params: []string{"p"}, handler: bare((*Checker).addressCall)},
+		{ID: builtin.Serialize, Params: []string{"value", "w"}, handler: bare((*Checker).serializeCall)},
+		{ID: builtin.SerializeInto, Params: []string{"w", "path", "value"}, handler: bare((*Checker).serializeIntoCall)},
+		{ID: builtin.Spawn, Params: []string{"f"}, handler: bare((*Checker).spawnCall)},
+		{ID: builtin.Current, handler: bare((*Checker).currentCall)},
+		{ID: builtin.Park, handler: bare((*Checker).parkCall)},
+		{ID: builtin.Ready, Params: []string{"t"}, handler: bare((*Checker).readyCall)},
+		{ID: builtin.Lock, Params: []string{"word"}, handler: bare((*Checker).lockCall)},
+		{ID: builtin.Unlock, Params: []string{"word"}, handler: bare((*Checker).lockCall)},
+		{ID: builtin.Cas, Params: []string{"word", "old", "new"}, handler: bare((*Checker).casCall)},
+		{ID: builtin.Panic, Params: []string{"message"}, handler: bare((*Checker).panicCall)},
+		{ID: builtin.Context, handler: (*Checker).contextCall},
+		{ID: builtin.SetContext, Params: []string{"p"}, handler: bare((*Checker).setContextCall)},
+		{ID: builtin.HasContext, handler: bare((*Checker).hasContextCall)},
+		{ID: builtin.VLoad, Params: []string{"src", "at"}, handler: (*Checker).vectorIntrinsic},
+		{ID: builtin.VStore, Params: []string{"dst", "at", "v"}, handler: (*Checker).vectorIntrinsic},
+		{ID: builtin.VSplat, Params: []string{"x"}, handler: (*Checker).vectorIntrinsic},
+		{ID: builtin.VMask, Params: []string{"v"}, handler: (*Checker).vectorIntrinsic},
+		{ID: builtin.VShuffle, Params: []string{"v", "order"}, handler: (*Checker).vectorIntrinsic},
+		{ID: builtin.VSelect, Params: []string{"mask", "a", "b"}, handler: (*Checker).vectorIntrinsic},
+		{ID: builtin.VMin, Params: []string{"a", "b"}, handler: (*Checker).vectorIntrinsic},
+		{ID: builtin.VMax, Params: []string{"a", "b"}, handler: (*Checker).vectorIntrinsic},
+		{ID: builtin.VLane, Params: []string{"v", "i"}, handler: (*Checker).vectorIntrinsic},
+		{ID: builtin.VWith, Params: []string{"v", "i", "x"}, handler: (*Checker).vectorIntrinsic},
 	}
 }
 
@@ -168,13 +173,13 @@ func typeBuiltins() []*Builtin {
 		case name == types.RawName:
 			entry.resolve = (*Checker).resolveRaw
 		case name == types.ChanName:
-			entry.construct, entry.resolve = (*Checker).makeChan, (*Checker).resolveChan
+			entry.ID, entry.construct, entry.resolve = builtin.Chan, (*Checker).makeChan, (*Checker).resolveChan
 		case t.Kind == types.VectorKind:
-			entry.Params, entry.handler = value, vectorCaster(t)
+			entry.ID, entry.Params, entry.handler = builtin.VectorCast, value, vectorCaster(t)
 		case t == types.Str:
-			entry.Params, entry.handler = value, bare((*Checker).strCall)
+			entry.ID, entry.Params, entry.handler = builtin.Str, value, bare((*Checker).strCall)
 		case t.Number():
-			entry.Params, entry.handler = value, converter(t)
+			entry.ID, entry.Params, entry.handler = builtin.Convert, value, converter(t)
 		}
 		list = append(list, entry)
 	}
@@ -205,7 +210,7 @@ func (c *Checker) builtinNamed(name string) *Builtin {
 
 func (c *Checker) callBuiltin(b *Builtin, e *ast.Call, want *types.Type) {
 	c.arity(b, e)
-	e.Builtin = b.Name
+	e.Builtin = b.ID
 	b.handler(c, e, want)
 }
 
@@ -306,10 +311,9 @@ func (c *Checker) bytesCall(e *ast.Call) {
 }
 
 func (c *Checker) strCall(e *ast.Call) {
-	e.Builtin, e.Type = "from_bytes", types.Str
+	e.Type = types.Str
 	if t := c.plain(e.Args[0], nil); t.Kind == types.RawKind {
 		c.cString(e.Args[0], t)
-		e.Builtin = "from_cstr"
 	} else if t != c.universe.Slice(types.U8) {
 		c.fail(e.Args[0].Position(), "str takes []u8 or ptr[u8], found %s", t)
 	}
@@ -321,17 +325,17 @@ func (c *Checker) cstrCall(e *ast.Call) {
 }
 
 func (c *Checker) viewCall(e *ast.Call) {
-	elem := c.typedRaw(e.Args[0], e.Builtin)
+	elem := c.typedRaw(e.Args[0], e.Builtin.String())
 	c.integer(e.Args[1])
 	e.Type = c.universe.Slice(elem)
 }
 
 func (c *Checker) loadCall(e *ast.Call) {
-	e.Type = c.typedRaw(e.Args[0], e.Builtin)
+	e.Type = c.typedRaw(e.Args[0], e.Builtin.String())
 }
 
 func (c *Checker) storeCall(e *ast.Call) {
-	c.expectType(e.Args[1], c.typedRaw(e.Args[0], e.Builtin))
+	c.expectType(e.Args[1], c.typedRaw(e.Args[0], e.Builtin.String()))
 	e.Type = types.Void
 }
 
@@ -519,12 +523,12 @@ func (c *Checker) readyCall(e *ast.Call) {
 }
 
 func (c *Checker) lockCall(e *ast.Call) {
-	c.lockWord(e.Args[0], e.Builtin)
+	c.lockWord(e.Args[0], e.Builtin.String())
 	e.Type = types.Void
 }
 
 func (c *Checker) casCall(e *ast.Call) {
-	c.lockWord(e.Args[0], e.Builtin)
+	c.lockWord(e.Args[0], e.Builtin.String())
 	c.expectType(e.Args[1], types.I64)
 	c.expectType(e.Args[2], types.I64)
 	e.Type = types.Bool

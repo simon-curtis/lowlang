@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/builtin"
 	"lowlang/internal/lexer"
 	"lowlang/internal/target"
 	"lowlang/internal/types"
@@ -442,7 +443,7 @@ func (b *builder) word(e ast.Expr) *Value {
 
 func (b *builder) bind(local *ast.Local, words []*Value) {
 	if Boxed(local) {
-		box := b.runtime("alloc", b.constant(int64(len(words))), b.scan(local.Type))
+		box := b.runtime(rtAlloc, b.constant(int64(len(words))), b.scan(local.Type))
 		b.slots[local] = box
 		b.store(place{addr: box}, words)
 		return
@@ -948,17 +949,7 @@ func (b *builder) logical(e *ast.Binary) []*Value {
 
 func (b *builder) call(e *ast.Call) []*Value {
 	switch {
-	case e.Builtin == "new":
-		return []*Value{b.allocate(e.Args[0])}
-	case e.Builtin == "convert":
-		return []*Value{b.convert(b.word(e.Args[0]), e.Args[0].TypeOf(), e.Type)}
-	case e.Builtin == "sqrt":
-		return []*Value{b.typed(OpSqrt, e.Type, b.word(e.Args[0]))}
-	case e.Builtin == "floor":
-		return []*Value{b.typed(OpFloor, e.Type, b.word(e.Args[0]))}
-	case e.Builtin == "exp":
-		return []*Value{b.exp(b.word(e.Args[0]), e.Type)}
-	case e.Builtin != "":
+	case e.Builtin != builtin.None:
 		return b.builtin(e)
 	case e.Variant != nil:
 		return b.construct(e.Type, e.Variant, e.Args)
@@ -1011,7 +1002,7 @@ func (b *builder) closure(e *ast.Closure) []*Value {
 	for _, local := range e.Captures {
 		words += captureWords(local)
 	}
-	env := b.runtime("alloc", b.constant(int64(words)), b.constant(1))
+	env := b.runtime(rtAlloc, b.constant(int64(words)), b.constant(1))
 	offset := 0
 	for _, local := range e.Captures {
 		b.store(place{addr: env, offset: offset}, b.captured(local))
@@ -1088,17 +1079,15 @@ func (b *builder) convert(x *Value, from, to *types.Type) *Value {
 }
 
 func (b *builder) exp(x *Value, t *types.Type) *Value {
-	call := b.emit(OpRuntime, b.convert(x, t, types.F64))
-	call.Str = "exp"
-	result := b.result(call, 0)
-	result.Scalar = true
+	wide := b.convert(x, t, types.F64)
+	result := b.runtime(rtExp, wide)
 	return b.convert(result, types.F64, t)
 }
 
 func (b *builder) allocate(arg ast.Expr) *Value {
 	t := arg.TypeOf()
 	words := b.value(arg, t)
-	ptr := b.runtime("alloc", b.constant(int64(t.Size())), b.scan(t))
+	ptr := b.runtime(rtAlloc, b.constant(int64(t.Size())), b.scan(t))
 	b.store(place{addr: ptr}, words)
 	return ptr
 }
@@ -1108,12 +1097,6 @@ func (b *builder) scan(t *types.Type) *Value {
 		return b.constant(1)
 	}
 	return b.constant(0)
-}
-
-func (b *builder) runtime(name string, args ...*Value) *Value {
-	call := b.emit(OpRuntime, args...)
-	call.Str = name
-	return b.result(call, 0)
 }
 
 func (b *builder) construct(enum *types.Type, v *types.Variant, args []ast.Expr) []*Value {

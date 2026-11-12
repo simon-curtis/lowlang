@@ -152,12 +152,12 @@ func (in *instr) hint() {
 	case in.twoOperand():
 		in.hintOperands()
 	case in.preservesRegisters(), in.literal != nil:
-	case in.op == ir.OpCall || in.op == ir.OpRuntime:
+	case in.op == ir.OpCall || in.op == ir.OpRuntime || in.op == ir.OpSyscall:
 		args, regs := in.args, argRegs
 		if in.value.Indirect {
 			args = args[1:]
 		}
-		if in.op == ir.OpRuntime && isSyscall(in.value.Str) {
+		if in.op == ir.OpSyscall {
 			regs = syscallRegs
 		}
 		for i, a := range args[:min(len(args), len(regs))] {
@@ -257,7 +257,7 @@ func (in *instr) takesFloat(k int) bool {
 		return isFloat(in.value.Type)
 	case ir.OpConvert:
 		return in.value.From.Float()
-	case ir.OpSqrt, ir.OpFloor, ir.OpCall, ir.OpCCall, ir.OpRuntime:
+	case ir.OpSqrt, ir.OpFloor, ir.OpCall, ir.OpCCall, ir.OpRuntime, ir.OpSyscall:
 		return true
 	case ir.OpStore:
 		return k == 1
@@ -398,10 +398,10 @@ func (l *lowering) block(b *ir.Block) {
 			continue
 		}
 		in := &instr{op: v.Op, value: v}
-		switch v.Op {
-		case ir.OpCall, ir.OpCCall, ir.OpRuntime:
+		switch {
+		case v.Op.IsCall():
 			call = v
-		case ir.OpResult:
+		case v.Op == ir.OpResult:
 			in.call = call
 		}
 		if v.Op != ir.OpResult {

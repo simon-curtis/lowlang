@@ -25,7 +25,7 @@ func accessOf(v *Value) access {
 }
 
 func isAlloc(v *Value) bool {
-	return v.Op == OpResult && v.Aux == 0 && v.Args[0].Op == OpRuntime && v.Args[0].Str == "alloc"
+	return v.Op == OpResult && v.Aux == 0 && v.Args[0].Op == OpRuntime && v.Args[0].Runtime.Alloc
 }
 
 func isRootCandidate(v *Value) bool {

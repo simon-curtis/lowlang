@@ -140,5 +140,5 @@ func (g *Generator) stringEquality(fr *frame, in *instr) {
 }
 
 func (in *instr) isStringEquality() bool {
-	return in.op == ir.OpRuntime && in.value.Str == "str_eq"
+	return in.op == ir.OpRuntime && in.value.Runtime.Conv == ir.CallStrEq
 }

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/builtin"
 	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
@@ -47,7 +48,7 @@ func (c *Checker) renderIntoCall(e *ast.Call) {
 	c.ref(path, c.universe.Slice(types.I64))
 	t := c.plain(e.Args[2], nil)
 	c.exclusive(e.Args)
-	e.Builtin, e.Type = "", types.Void
+	e.Builtin, e.Type = builtin.None, types.Void
 	e.Target = c.renderer(t, e.Pos)
 }
 

@@ -126,14 +126,14 @@ func (b *builder) compose(parts []segment) []*Value {
 	pieces := b.pieces(parts)
 	total := b.composedSize(pieces)
 	zero := b.constant(0)
-	data := b.runtime("grow", zero, zero, total, zero)
+	data := b.runtime(rtGrow, zero, zero, total, zero)
 	if slices.ContainsFunc(pieces, piece.formatted) {
 		return b.composeFormatted(pieces, data, total)
 	}
 	position := zero
 	for _, p := range pieces {
 		src, n := b.source(p)
-		b.runtimeVoid("memmove", b.emit(OpAdd, data, position), src, n)
+		b.runtime(rtMemmove, b.emit(OpAdd, data, position), src, n)
 		position = b.count(OpAdd, position, n)
 	}
 	return []*Value{data, position}
@@ -164,7 +164,7 @@ func (b *builder) composeFormatted(pieces []piece, data, total *Value) []*Value 
 			continue
 		}
 		buf := b.load(place{addr: slot}, types.Str)
-		b.runtimeVoid("memmove", b.emit(OpAdd, buf[0], buf[1]), src, n)
+		b.runtime(rtMemmove, b.emit(OpAdd, buf[0], buf[1]), src, n)
 		b.store(place{addr: slot}.at(1), []*Value{b.count(OpAdd, buf[1], n)})
 	}
 	return b.load(place{addr: slot}, types.Str)

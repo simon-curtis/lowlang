@@ -1,7 +1,6 @@
 package compiler
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
@@ -55,14 +54,22 @@ fn main() {
 }
 `
 
-func countInstructions(f *ir.Func, op string) int {
-	return strings.Count(f.String(), fmt.Sprintf(" = %s ", op))
+func countInstructions(f *ir.Func, symbol string) int {
+	count := 0
+	for _, b := range f.Blocks {
+		for _, v := range b.Values {
+			if v.Op == ir.OpRuntime && v.Runtime.Symbol == symbol {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func TestConcatenationChainAllocatesOnce(t *testing.T) {
 	prog := devProgram(t, allocationProgram)
 	f := function(t, prog, "join")
-	if grows := countInstructions(f, "runtime grow"); grows != 1 {
+	if grows := countInstructions(f, "rt_grow"); grows != 1 {
 		t.Errorf("a + b + c + d + e performs %d allocations:\n%s", grows, f)
 	}
 }
@@ -70,7 +77,7 @@ func TestConcatenationChainAllocatesOnce(t *testing.T) {
 func TestInterpolationAllocatesOnce(t *testing.T) {
 	prog := devProgram(t, allocationProgram)
 	f := function(t, prog, "label")
-	if grows := countInstructions(f, "runtime grow"); grows != 1 {
+	if grows := countInstructions(f, "rt_grow"); grows != 1 {
 		t.Errorf("interpolation performs %d allocations:\n%s", grows, f)
 	}
 }
@@ -78,11 +85,11 @@ func TestInterpolationAllocatesOnce(t *testing.T) {
 func TestCapturedImmutableIsNotBoxed(t *testing.T) {
 	prog := devProgram(t, allocationProgram)
 	byValue := function(t, prog, "counter")
-	if allocs := countInstructions(byValue, "runtime alloc"); allocs != 1 {
+	if allocs := countInstructions(byValue, "rt_alloc"); allocs != 1 {
 		t.Errorf("counter allocates %d objects, want the environment only:\n%s", allocs, byValue)
 	}
 	boxed := function(t, prog, "bumper")
-	if allocs := countInstructions(boxed, "runtime alloc"); allocs != 2 {
+	if allocs := countInstructions(boxed, "rt_alloc"); allocs != 2 {
 		t.Errorf("bumper allocates %d objects, want a box and an environment:\n%s", allocs, boxed)
 	}
 }

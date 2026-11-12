@@ -19,17 +19,13 @@ type slotUse struct {
 	spread  bool
 }
 
-func isCallOp(op ir.Op) bool {
-	return op == ir.OpCall || op == ir.OpCCall || op == ir.OpRuntime
-}
-
 func vectorTemps(f *ir.Func) *vectorCache {
 	uses := map[*ir.Value]*slotUse{}
 	tainted := map[*ir.Value]bool{}
 	calls := map[*ir.Block][]int{}
 	for _, b := range f.Blocks {
 		for i, v := range b.Values {
-			if isCallOp(v.Op) {
+			if v.Op.IsCall() {
 				calls[b] = append(calls[b], i)
 			}
 			vector := v.Op == ir.OpVector || v.Op == ir.OpVectorScalar

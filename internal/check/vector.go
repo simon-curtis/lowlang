@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/builtin"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
 )
@@ -57,7 +58,6 @@ func (c *Checker) vectorCast(e *ast.Call, to *types.Type) {
 	if !isVector(from) || from.Bits != to.Bits {
 		c.fail(e.Args[0].Position(), "cannot convert %s to %s; vector casts keep the width", from, to)
 	}
-	e.Builtin = "vector_cast"
 	e.Type = to
 }
 
@@ -80,18 +80,17 @@ func (c *Checker) vectorResult(e *ast.Call, want *types.Type) *types.Type {
 }
 
 func (c *Checker) vectorIntrinsic(e *ast.Call, want *types.Type) {
-	name := e.Builtin
-	switch name {
-	case "__vload":
+	switch e.Builtin {
+	case builtin.VLoad:
 		c.vectorSource(e.Args[0])
 		c.integer(e.Args[1])
 		e.Type = c.vectorResult(e, want)
-	case "__vstore":
+	case builtin.VStore:
 		c.vectorSource(e.Args[0])
 		c.integer(e.Args[1])
 		c.vectorArgument(e.Args[2], nil)
 		e.Type = types.Void
-	case "__vsplat":
+	case builtin.VSplat:
 		v := c.vectorResult(e, want)
 		var lane *types.Type
 		if isVector(v) {
@@ -99,22 +98,22 @@ func (c *Checker) vectorIntrinsic(e *ast.Call, want *types.Type) {
 		}
 		c.plain(e.Args[0], lane)
 		e.Type = v
-	case "__vmask":
+	case builtin.VMask:
 		c.vectorArgument(e.Args[0], nil)
 		e.Type = types.U64
-	case "__vshuffle", "__vmin", "__vmax":
+	case builtin.VShuffle, builtin.VMin, builtin.VMax:
 		t := c.vectorArgument(e.Args[0], nil)
 		c.vectorArgument(e.Args[1], t)
-		if name == "__vshuffle" && isVector(t) && t.Elem != types.U8 {
+		if e.Builtin == builtin.VShuffle && isVector(t) && t.Elem != types.U8 {
 			c.fail(e.Pos, "shuffle needs u8 lanes, found %s", t)
 		}
 		e.Type = t
-	case "__vselect":
+	case builtin.VSelect:
 		t := c.vectorArgument(e.Args[0], nil)
 		c.vectorArgument(e.Args[1], t)
 		c.vectorArgument(e.Args[2], t)
 		e.Type = t
-	case "__vlane":
+	case builtin.VLane:
 		t := c.vectorArgument(e.Args[0], nil)
 		c.integer(e.Args[1])
 		switch {
@@ -125,7 +124,7 @@ func (c *Checker) vectorIntrinsic(e *ast.Call, want *types.Type) {
 		default:
 			e.Type = t
 		}
-	case "__vwith":
+	case builtin.VWith:
 		t := c.vectorArgument(e.Args[0], nil)
 		c.integer(e.Args[1])
 		var lane *types.Type
@@ -182,7 +181,9 @@ func (c *Checker) forwarded(e *ast.Call, fn *ast.Func) {
 			return
 		}
 	}
-	e.Builtin = id.Name
+	if b := LookupBuiltin(id.Name); b != nil {
+		e.Builtin = b.ID
+	}
 }
 
 func (c *Checker) vectorSource(e ast.Expr) {

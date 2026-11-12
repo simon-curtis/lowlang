@@ -82,7 +82,7 @@ func (b *builder) hoistedSlice(e *ast.SliceLit) ([]*Value, bool) {
 		return []*Value{template, n, n}, true
 	}
 	size := b.constant(bytes)
-	data := b.runtime("grow", template, size, size, b.scan(elem))
+	data := b.runtime(rtGrow, template, size, size, b.scan(elem))
 	return []*Value{data, n, n}, true
 }
 

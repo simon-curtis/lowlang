@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/builtin"
 	"lowlang/internal/diag"
 	"lowlang/internal/types"
 )
@@ -43,7 +44,7 @@ func (c *Checker) makeChan(e *ast.Call, inst *ast.Instance) {
 	if len(e.Args) == 1 {
 		c.integer(e.Args[0])
 	}
-	e.Builtin = "chan"
+	e.Builtin = builtin.Chan
 	e.Type = c.universe.Chan(c.contained(inst.Types[0], "a channel"))
 }
 

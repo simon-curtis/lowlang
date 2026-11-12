@@ -11,9 +11,7 @@ func aggregate(t *types.Type) bool {
 func (b *builder) equal(t *types.Type, x, y []*Value) *Value {
 	switch {
 	case t == types.Str:
-		same := b.runtime("str_eq", x[0], x[1], y[0], y[1])
-		same.Scalar = true
-		return same
+		return b.runtime(rtStrEq, x[0], x[1], y[0], y[1])
 	case isC(t):
 		return b.cEqual(t, b.spill(x), b.spill(y), 0)
 	case t.Kind == types.StructKind:

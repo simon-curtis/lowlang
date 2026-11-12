@@ -46,6 +46,7 @@ const (
 	OpCall
 	OpCCall
 	OpRuntime
+	OpSyscall
 	OpResult
 	OpFuncAddr
 	OpMulHigh
@@ -68,7 +69,7 @@ var opNames = [...]string{
 	OpAnd: "and", OpOr: "or", OpXor: "xor", OpShl: "shl", OpShr: "shr", OpCompl: "compl",
 	OpConvert: "convert", OpSqrt: "sqrt", OpFloor: "floor",
 	OpEq: "eq", OpNe: "ne", OpLt: "lt", OpLe: "le", OpGt: "gt", OpGe: "ge",
-	OpLoad: "load", OpStore: "store", OpCheck: "check", OpSlot: "slot", OpCall: "call", OpCCall: "ccall", OpRuntime: "runtime", OpResult: "result",
+	OpLoad: "load", OpStore: "store", OpCheck: "check", OpSlot: "slot", OpCall: "call", OpCCall: "ccall", OpRuntime: "runtime", OpSyscall: "syscall", OpResult: "result",
 	OpFuncAddr: "funcaddr", OpMulHigh: "mulhigh", OpVector: "vector", OpVectorScalar: "vectorscalar", OpTrailingZeros: "ctz", OpHashSeed: "hashseed", OpCell: "cell",
 }
 
@@ -80,8 +81,12 @@ func (o Op) Compare() bool {
 	return o >= OpEq && o <= OpGe
 }
 
+func (o Op) IsCall() bool {
+	return o == OpCall || o == OpCCall || o == OpRuntime || o == OpSyscall
+}
+
 func (o Op) HasResult() bool {
-	return o != OpStore && o != OpCall && o != OpCCall && o != OpRuntime && o != OpCheck && o != OpVector
+	return !o.IsCall() && o != OpStore && o != OpCheck && o != OpVector
 }
 
 const (
@@ -96,6 +101,7 @@ type Value struct {
 	Block     *Block
 	Aux       int64
 	Str       string
+	Runtime   *RuntimeEntry
 	Target    *Func
 	Plan      *CPlan
 	Type      *types.Type
@@ -228,8 +234,8 @@ func describe(v *Value) string {
 		detail = fmt.Sprintf(" #%d", v.Aux)
 	case OpString, OpEmbed:
 		detail = fmt.Sprintf(" %q", v.Str)
-	case OpRuntime:
-		detail = fmt.Sprintf(" %s", v.Str)
+	case OpRuntime, OpSyscall:
+		detail = fmt.Sprintf(" %s", v.Runtime.Symbol)
 	case OpCall:
 		detail = fmt.Sprintf(" %s", v.Target.Name)
 	case OpFuncAddr:

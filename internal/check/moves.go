@@ -4,6 +4,7 @@ import (
 	"maps"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/builtin"
 	"lowlang/internal/types"
 )
 
@@ -235,7 +236,7 @@ func producer(e ast.Expr) bool {
 	case *ast.Receiver:
 		return producer(e.X)
 	case *ast.Call:
-		return e.Builtin == ""
+		return e.Builtin == builtin.None
 	case *ast.StructLit, *ast.Try, *ast.Catch, *ast.If, *ast.Match, *ast.Block, *ast.Select:
 		return true
 	}

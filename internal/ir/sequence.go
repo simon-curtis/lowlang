@@ -74,7 +74,7 @@ func (b *builder) filledSlice(e *ast.SliceLit) []*Value {
 	}
 	elem := e.Type.Elem
 	words := (len(e.Elems)*elem.Stride() + 7) / 8
-	ptr := b.runtime("alloc", b.constant(int64(words)), b.scan(elem))
+	ptr := b.runtime(rtAlloc, b.constant(int64(words)), b.scan(elem))
 	for i, el := range e.Elems {
 		b.store(place{addr: ptr, offset: i * elem.Stride(), scalar: scalarOf(elem), tail: elem.Tail()}, b.value(el, elem))
 	}
@@ -95,133 +95,11 @@ func (b *builder) strings(e *ast.Binary) []*Value {
 		order := b.callNamed("__str_cmp", x[0], x[1], y[0], y[1])[0]
 		return []*Value{b.typed(arith[e.Op], types.I64, order, b.constant(0))}
 	}
-	equal := b.runtime("str_eq", x[0], x[1], y[0], y[1])
-	equal.Scalar = true
+	equal := b.equal(types.Str, x, y)
 	if e.Op == lexer.NotEq {
 		return []*Value{b.typed(OpNot, types.Bool, equal)}
 	}
 	return []*Value{equal}
-}
-
-func (b *builder) runtimeVoid(name string, args ...*Value) {
-	call := b.emit(OpRuntime, args...)
-	call.Str = name
-}
-
-func (b *builder) builtin(e *ast.Call) []*Value {
-	if words, ok := b.concurrencyBuiltin(e); ok {
-		return words
-	}
-	if e.Builtin == "__argc" {
-		count := b.runtime("argc")
-		count.Scalar = true
-		return []*Value{count}
-	}
-	if e.Builtin == "__zero" {
-		zero := b.constant(0)
-		words := make([]*Value, e.Type.Size())
-		for k := range words {
-			words[k] = zero
-		}
-		return words
-	}
-	if words, ok := b.pointerBuiltin(e); ok {
-		return words
-	}
-	if words, ok := b.vectorBuiltin(e); ok {
-		return words
-	}
-	arg := e.Args[0]
-	switch e.Builtin {
-	case "push":
-		b.push(e)
-		return nil
-	case "pop":
-		return b.pop(e)
-	case "truncate":
-		b.truncate(e)
-		return nil
-	case "__extend":
-		b.extend(e)
-		return nil
-	case "__extend_by":
-		return []*Value{b.extendBy(e)}
-	case "delete":
-		b.deleteEntry(e)
-		return nil
-	case "embed":
-		v := b.emit(OpEmbed)
-		v.Str = e.Embed
-		v.Aux = int64(e.Digest)
-		v.Scalar = true
-		return []*Value{v, b.constant(e.Size)}
-	case "__str_raw":
-		return []*Value{b.word(arg), b.word(e.Args[1])}
-	case "bytes":
-		return b.callNamed("__bytes", b.value(arg, types.Str)...)
-	case "from_bytes":
-		return b.callNamed("__from_bytes", b.value(arg, arg.TypeOf())...)
-	case "__bits":
-		return []*Value{b.word(arg)}
-	case "__hash":
-		if arg.TypeOf() == types.Str {
-			return b.callNamed("__hash_str", b.value(arg, types.Str)...)
-		}
-		return b.callNamed("__hash_word", b.word(arg))
-
-	case "__str_view":
-		return b.value(arg, arg.TypeOf())[:2]
-	case "__syscall":
-		return []*Value{b.syscall(e.Args)}
-	case "__ctz":
-		return []*Value{b.typed(OpTrailingZeros, types.I64, b.word(arg))}
-	case "__argv", "__envv":
-		entry := b.runtime(e.Builtin[2:], b.word(arg))
-		entry.Scalar = true
-		return []*Value{entry}
-	case "__clock_nanos":
-		nanos := b.runtime("clock_nanos", b.word(arg))
-		nanos.Scalar = true
-		return []*Value{nanos}
-	case "__hash_seed":
-		seed := b.typed(OpHashSeed, types.U64)
-		seed.Aux = e.Args[0].(*ast.IntLit).Value
-		return []*Value{seed}
-	case "__mulhi":
-		return []*Value{b.typed(OpMulHigh, types.U64, b.word(arg), b.word(e.Args[1]))}
-	case "__make":
-		return b.make(e.Type.Elem, b.word(arg))
-	case "__memmove":
-		return []*Value{b.copySlice(e)}
-	case "print_u64":
-		b.runtimeVoid("print_str", b.callNamed("__format_u64", b.word(arg))...)
-		return nil
-	case "print_str":
-		b.runtimeVoid("print_str", b.value(arg, types.Str)...)
-		return nil
-	case "print_render":
-		words := b.value(arg, arg.TypeOf())
-		text := b.renderString(e.Render, words)
-		b.runtimeVoid("print_str", text...)
-		return nil
-	case "__render":
-		words := b.value(arg, arg.TypeOf())
-		return b.renderString(e.Render, words)
-	case "__address":
-		return []*Value{b.word(arg)}
-	case "__serialize":
-		b.serialize(e)
-		return nil
-	case "print_float":
-		name := "__format_f64"
-		if arg.TypeOf() == types.F32 {
-			name = "__format_f32"
-		}
-		b.runtimeVoid("print_str", b.callNamed(name, b.word(arg))...)
-		return nil
-	}
-	b.runtimeVoid(e.Builtin, b.word(arg))
-	return nil
 }
 
 func (b *builder) serialize(e *ast.Call) {
@@ -238,7 +116,7 @@ func (b *builder) serialize(e *ast.Call) {
 func (b *builder) make(elem *types.Type, n *Value) []*Value {
 	zero := b.constant(0)
 	bytes := b.emit(OpMul, n, b.constant(int64(elem.Stride())))
-	return []*Value{b.runtime("grow", zero, zero, bytes, b.scan(elem)), n, n}
+	return []*Value{b.runtime(rtGrow, zero, zero, bytes, b.scan(elem)), n, n}
 }
 
 func (b *builder) copySlice(e *ast.Call) *Value {
@@ -247,18 +125,8 @@ func (b *builder) copySlice(e *ast.Call) *Value {
 	src := b.value(e.Args[1], e.Args[1].TypeOf())
 	n := b.callNamed("__min", dst[1], src[1])[0]
 	stride := b.constant(int64(t.Elem.Stride()))
-	b.runtimeVoid("memmove", dst[0], src[0], b.emit(OpMul, n, stride))
+	b.runtime(rtMemmove, dst[0], src[0], b.emit(OpMul, n, stride))
 	return n
-}
-
-func (b *builder) syscall(args []ast.Expr) *Value {
-	words := make([]*Value, len(args))
-	for i, arg := range args {
-		words[i] = b.word(arg)
-	}
-	result := b.runtime(syscallRuntime(words[0]), words...)
-	result.Scalar = true
-	return result
 }
 
 func (b *builder) forIn(s *ast.ForIn) {

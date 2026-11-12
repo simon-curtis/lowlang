@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/builtin"
 	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
@@ -1649,20 +1650,8 @@ func (c *Checker) indirect(e *ast.Call) {
 func (c *Checker) print(e *ast.Call) {
 	t := c.plain(e.Args[0], nil)
 	e.Render = nil
-	switch {
-	case t == types.U64:
-		e.Builtin = "print_u64"
-	case t.Integer():
-		e.Builtin = "print_i64"
-	case t.Float():
-		e.Builtin = "print_float"
-	case t == types.Bool:
-		e.Builtin = "print_bool"
-	case t == types.Str:
-		e.Builtin = "print_str"
-	default:
+	if !t.Number() && t != types.Bool && t != types.Str {
 		c.requireValue(e.Args[0].Position(), "print", t)
-		e.Builtin = "print_render"
 		e.Render = c.renderer(t, e.Pos)
 	}
 	e.Type = types.Void
@@ -1738,7 +1727,7 @@ func materialize(out string, data []byte) error {
 func (c *Checker) embedded(e *ast.Call, abs string, data []byte) {
 	digest := fnv.New64a()
 	digest.Write(data)
-	e.Builtin, e.Embed, e.Size, e.Digest, e.Type = "embed", abs, int64(len(data)), digest.Sum64(), types.Str
+	e.Embed, e.Size, e.Digest, e.Type = abs, int64(len(data)), digest.Sum64(), types.Str
 }
 
 func (c *Checker) deleteEntry(e *ast.Call) {
@@ -1782,7 +1771,7 @@ func (c *Checker) push(e *ast.Call) {
 }
 
 func (c *Checker) shrink(e *ast.Call) {
-	name := e.Builtin
+	name := e.Builtin.String()
 	r, ok := e.Args[0].(*ast.Ref)
 	if !ok {
 		c.fail(e.Args[0].Position(), "%s needs a mut slice; write %s(mut s)", name, name)
@@ -1792,7 +1781,7 @@ func (c *Checker) shrink(e *ast.Call) {
 		c.fail(r.Pos, "%s needs a slice, found %s", name, t)
 	}
 	e.Type = types.Void
-	if name == "pop" {
+	if e.Builtin == builtin.Pop {
 		e.Type = c.universe.Optional(t.Elem)
 		return
 	}
@@ -1808,11 +1797,11 @@ func (c *Checker) syscall(e *ast.Call) {
 			c.fail(arg.Position(), "__syscall arguments are integers, bool or ptr, found %s", t)
 		}
 	}
-	e.Builtin, e.Type = "__syscall", types.I64
+	e.Type = types.I64
 }
 
 func (c *Checker) math(e *ast.Call, want *types.Type) {
-	name := e.Builtin
+	name := e.Builtin.String()
 	var arg *types.Type
 	switch {
 	case want != nil && want.Float():
@@ -1832,8 +1821,7 @@ func (c *Checker) convert(e *ast.Call, to *types.Type) {
 	if !t.Number() {
 		c.fail(e.Args[0].Position(), "cannot convert %s to %s", t, to)
 	}
-	e.Builtin = "convert"
-	e.Type = to
+	e.Builtin, e.Type = builtin.Convert, to
 }
 
 func (c *Checker) variantCall(e *ast.Call, sel *ast.Selector, t *types.Type) {
