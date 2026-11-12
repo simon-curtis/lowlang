@@ -49,19 +49,19 @@ func (r *oracleRunner) work(dir string, entry corpusEntry) {
 }
 
 func (r *oracleRunner) compareAll(dir, source string, result *fileResult) {
-	variants := [][]string{nil}
+	variants := []oracletool.GNUOptions{{}}
 	if result.entry.platform == target.Linux {
-		variants = [][]string{{oracletool.BranchFlag}, nil}
+		variants = []oracletool.GNUOptions{{AlignBranches: true}, {}}
 	}
 	fed := asSource(source, result.entry.platform)
-	for _, flags := range variants {
-		opts := asm.Options{AlignBranches: len(flags) > 0}
+	for _, variant := range variants {
+		opts := asm.Options{AlignBranches: variant.AlignBranches}
 		object, err := asm.Assemble(source, opts)
 		if err != nil {
 			result.parseError = err
 			return
 		}
-		oracle, err := runAs(dir, fed, flags)
+		oracle, err := runAs(dir, fed, variant)
 		if err != nil {
 			result.asError = err
 			return
@@ -69,7 +69,7 @@ func (r *oracleRunner) compareAll(dir, source string, result *fileResult) {
 		c := newComparison(object, oracle, result.entry.platform)
 		c.run()
 		for _, m := range c.mismatches {
-			result.mismatches = append(result.mismatches, fmt.Sprintf("as %v: %s", flags, m))
+			result.mismatches = append(result.mismatches, fmt.Sprintf("as %+v: %s", variant, m))
 		}
 		result.sections += c.checked
 	}

@@ -24,7 +24,7 @@ func assertMatchesAs(t *testing.T, source string) {
 		t.Fatalf("assemble: %v", err)
 	}
 	dir := t.TempDir()
-	oracle, err := runAs(dir, source, nil)
+	oracle, err := runAs(dir, source, oracletool.GNUOptions{})
 	if err != nil {
 		t.Fatalf("oracle: %v", err)
 	}

@@ -18,7 +18,7 @@ func TestOracleReadsObjects(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", entry.label(), err)
 		}
-		oracle, err := runAs(dir, asSource(source, platform), nil)
+		oracle, err := runAs(dir, asSource(source, platform), oracletool.GNUOptions{})
 		if err != nil {
 			t.Fatalf("%s: %v", entry.label(), err)
 		}

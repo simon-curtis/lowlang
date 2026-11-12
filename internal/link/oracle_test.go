@@ -19,10 +19,10 @@ import (
 )
 
 const (
-	noUsedNoteFlag = "-mx86-used-note=no"
-	headerBytes    = 64
-	stackNote      = "\n.section .note.GNU-stack,\"\",@progbits\n"
+	headerBytes = 64
 )
+
+var linkableObject = oracletool.GNUOptions{AlignBranches: true, Linkable: true}
 
 var sampleCorpus = []fixturetest.Program{
 	fixturetest.RunProgram("chaining"),
@@ -48,14 +48,9 @@ func corpus(t *testing.T) []fixturetest.Program {
 }
 
 func linkWithLd(dir, source string) (string, error) {
-	sourcePath := filepath.Join(dir, "main.s")
-	text := fmt.Sprintf("%s%s", source, stackNote)
-	if err := os.WriteFile(sourcePath, []byte(text), 0o644); err != nil {
-		return "", fmt.Errorf("write source: %w", err)
-	}
-	object := filepath.Join(dir, "main.o")
-	if out, err := exec.Command("as", oracletool.BranchFlag, noUsedNoteFlag, "-o", object, sourcePath).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("as: %w\n%s", err, out)
+	object, err := oracletool.AssembleGNU(dir, source, linkableObject)
+	if err != nil {
+		return "", err
 	}
 	output := filepath.Join(dir, "main.ld")
 	if out, err := exec.Command("ld", "-static", "-o", output, object).CombinedOutput(); err != nil {

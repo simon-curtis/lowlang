@@ -4,27 +4,18 @@ import (
 	"bytes"
 	"debug/pe"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"testing"
 
 	"lowlang/internal/asm"
 	"lowlang/internal/oracletool"
 )
 
-const clangTarget = "--target=x86_64-pc-windows-msvc"
-
 func clangText(t *testing.T, source string) []byte {
 	t.Helper()
 	dir := t.TempDir()
-	input := filepath.Join(dir, "in.s")
-	if err := os.WriteFile(input, []byte(source), 0o644); err != nil {
+	output, err := oracletool.AssembleClang(dir, source)
+	if err != nil {
 		t.Fatal(err)
-	}
-	output := filepath.Join(dir, "out.obj")
-	if out, err := exec.Command("clang", clangTarget, "-c", "-o", output, input).CombinedOutput(); err != nil {
-		t.Fatalf("clang: %v\n%s", err, out)
 	}
 	file, err := pe.Open(output)
 	if err != nil {

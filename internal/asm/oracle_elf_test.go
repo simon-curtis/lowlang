@@ -6,12 +6,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 
 	"lowlang/internal/asm"
+	"lowlang/internal/oracletool"
 	"lowlang/internal/target"
 )
 
@@ -89,21 +88,13 @@ func asSource(source string, platform target.OS) string {
 	return strings.ReplaceAll(source, `,"dr"`, `,"a"`)
 }
 
-func runAs(dir, source string, flags []string) (*oracleObject, error) {
-	sourcePath := filepath.Join(dir, "oracle.s")
-	if err := os.WriteFile(sourcePath, []byte(source), 0o644); err != nil {
-		return nil, fmt.Errorf("write source: %w", err)
-	}
-	objectPath := filepath.Join(dir, "oracle.o")
-	args := append(append([]string{}, flags...), "-o", objectPath, sourcePath)
-	out, err := exec.Command("as", args...).CombinedOutput()
+func runAs(dir, source string, options oracletool.GNUOptions) (*oracleObject, error) {
+	objectPath, err := oracletool.AssembleGNU(dir, source, options)
 	if err != nil {
-		return nil, fmt.Errorf("as %v: %w\n%s", flags, err, truncate(string(out), 600))
+		return nil, err
 	}
-	object, err := readObject(objectPath)
-	os.Remove(sourcePath)
-	os.Remove(objectPath)
-	return object, err
+	defer os.Remove(objectPath)
+	return readObject(objectPath)
 }
 
 func truncate(text string, limit int) string {

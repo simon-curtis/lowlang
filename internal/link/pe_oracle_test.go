@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	clangTarget  = "--target=x86_64-pc-windows-msvc"
 	llvmReadobj  = "llvm-readobj"
 	readobjFlags = "--file-headers --sections --coff-imports --coff-basereloc"
 )
@@ -37,13 +36,9 @@ func requireWindowsTools(t *testing.T) {
 }
 
 func linkWithLLD(dir, source string) ([]byte, error) {
-	sourcePath := filepath.Join(dir, "main.s")
-	if err := os.WriteFile(sourcePath, []byte(source), 0o644); err != nil {
-		return nil, fmt.Errorf("write source: %w", err)
-	}
-	object := filepath.Join(dir, "main.obj")
-	if out, err := exec.Command("clang", clangTarget, "-c", "-o", object, sourcePath).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("clang: %w\n%s", err, out)
+	object, err := oracletool.AssembleClang(dir, source)
+	if err != nil {
+		return nil, err
 	}
 	output := filepath.Join(dir, "lld.exe")
 	arguments := append(append([]string{}, lldArguments...), fmt.Sprintf("/out:%s", output), object)

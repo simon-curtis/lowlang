@@ -37,14 +37,9 @@ func dynamicPrograms(t *testing.T) []fixturetest.Program {
 }
 
 func linkDynamicWithLd(dir, source string, libraries []string) (string, error) {
-	sourcePath := filepath.Join(dir, "main.s")
-	text := fmt.Sprintf("%s%s", source, stackNote)
-	if err := os.WriteFile(sourcePath, []byte(text), 0o644); err != nil {
-		return "", fmt.Errorf("write source: %w", err)
-	}
-	object := filepath.Join(dir, "main.o")
-	if out, err := exec.Command("as", oracletool.BranchFlag, noUsedNoteFlag, "-o", object, sourcePath).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("as: %w\n%s", err, out)
+	object, err := oracletool.AssembleGNU(dir, source, linkableObject)
+	if err != nil {
+		return "", err
 	}
 	output := filepath.Join(dir, "main.ld")
 	args := []string{"-o", output, "-dynamic-linker", loaderPath, object}
