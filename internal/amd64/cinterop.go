@@ -304,3 +304,23 @@ func (g *Generator) moveSingle(dst, source string) {
 		g.move(dst, "r10")
 	}
 }
+
+func (g *Generator) libcShims(symbols []string) {
+	for _, symbol := range symbols {
+		switch symbol {
+		case "atexit":
+			g.shim(symbol, "__cxa_atexit", "xor esi, esi", "xor edx, edx")
+		case "at_quick_exit":
+			g.shim(symbol, "__cxa_at_quick_exit", "xor esi, esi")
+		}
+	}
+}
+
+func (g *Generator) shim(symbol, target string, setup ...string) {
+	g.align(functionAlignment)
+	fmt.Fprintf(&g.text, "\t.globl %s\n%s:\n", symbol, symbol)
+	for _, line := range setup {
+		g.emit("%s", line)
+	}
+	g.emit("jmp %s", target)
+}

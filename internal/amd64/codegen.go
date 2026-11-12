@@ -123,6 +123,7 @@ func Generate(prog *ir.Program, table map[string]int) Output {
 	dynamic := 0
 	if len(prog.Libraries) > 0 {
 		dynamic = 1
+		g.libcShims(prog.CSymbols)
 	}
 	var out strings.Builder
 	fmt.Fprintf(&out, "\t.intel_syntax noprefix\n\t.set RT_DYNAMIC, %d\n", dynamic)
@@ -244,6 +245,7 @@ func (g *Generator) start(prog *ir.Program) {
 		g.text.WriteString("\t.globl start\nstart:\n")
 		g.emit("xor edi, edi")
 	case dynamic:
+		g.libcStart()
 		g.text.WriteString("\t.globl main\nmain:\n")
 		g.emit("push rbp")
 		g.emit("xor ebp, ebp")
@@ -272,6 +274,22 @@ func (g *Generator) start(prog *ir.Program) {
 	g.emit("mov rsp, [rax+%d]", mG0Top)
 	g.emit("jmp rt_schedule")
 	g.program(prog, dynamic)
+}
+
+func (g *Generator) libcStart() {
+	g.text.WriteString("\t.globl _start\n_start:\n")
+	g.emit("xor ebp, ebp")
+	g.emit("mov r9, rdx")
+	g.emit("pop rsi")
+	g.emit("mov rdx, rsp")
+	g.emit("and rsp, -16")
+	g.emit("push rax")
+	g.emit("push rsp")
+	g.emit("xor r8d, r8d")
+	g.emit("xor ecx, ecx")
+	g.emit("lea rdi, [rip+main]")
+	g.emit("call qword ptr [rip+__libc_start_main@GOTPCREL]")
+	g.emit("hlt")
 }
 
 func (g *Generator) program(prog *ir.Program, dynamic bool) {

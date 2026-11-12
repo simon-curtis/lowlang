@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"lowlang/internal/asm"
@@ -87,29 +86,9 @@ func Assemble(ctx context.Context, asm, object string, flags ...string) error {
 }
 
 func Link(ctx context.Context, source, output string, prog *ir.Program) error {
-	if prog.OS != target.Windows && len(prog.Libraries) == 0 {
-		return linkStatic(ctx, source, output)
-	}
-	dir, err := os.MkdirTemp("", "low-build-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(dir)
 	if prog.OS == target.Windows {
-		return linkWindows(ctx, dir, source, output)
+		return linkWindows(ctx, source, output)
 	}
-	object := filepath.Join(dir, "main.o")
-	if err := Assemble(ctx, source, object, "-mbranches-within-32B-boundaries"); err != nil {
-		return err
-	}
-	args, err := dynamicArgs(output, object, prog.Libraries)
-	if err != nil {
-		return err
-	}
-	return tool(ctx, "ld", args...)
-}
-
-func linkStatic(ctx context.Context, source, output string) error {
 	object, err := asm.Assemble(source, asm.Options{AlignBranches: true})
 	if err != nil {
 		return err
@@ -117,7 +96,7 @@ func linkStatic(ctx context.Context, source, output string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	image, err := link.Static(object)
+	image, err := linkImage(object, prog.Libraries)
 	if err != nil {
 		return err
 	}
@@ -130,6 +109,19 @@ func linkStatic(ctx context.Context, source, output string) error {
 	return nil
 }
 
+var libraryResolver = link.Resolver{Dirs: link.SystemDirs}
+
+func linkImage(object *asm.Object, libraries []string) ([]byte, error) {
+	if len(libraries) == 0 {
+		return link.Static(object)
+	}
+	resolved, err := libraryResolver.Resolve(libraries)
+	if err != nil {
+		return nil, err
+	}
+	return link.Dynamic(object, resolved)
+}
+
 func writeWhileForksWait(path string, data []byte) error {
 	syscall.ForkLock.RLock()
 	defer syscall.ForkLock.RUnlock()
@@ -138,7 +130,12 @@ func writeWhileForksWait(path string, data []byte) error {
 
 const windowsStack = 8 << 20
 
-func linkWindows(ctx context.Context, dir, asm, output string) error {
+func linkWindows(ctx context.Context, asm, output string) error {
+	dir, err := os.MkdirTemp("", "low-build-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
 	source := filepath.Join(dir, "main.s")
 	if err := os.WriteFile(source, []byte(asm), 0o644); err != nil {
 		return err
@@ -150,36 +147,6 @@ func linkWindows(ctx context.Context, dir, asm, output string) error {
 	return tool(ctx, "lld-link",
 		"/nologo", "/brepro", "/nodefaultlib", "/entry:start", "/subsystem:console",
 		fmt.Sprintf("/stack:%d", windowsStack), fmt.Sprintf("/out:%s", output), object)
-}
-
-const dynamicLinker = "/lib64/ld-linux-x86-64.so.2"
-
-var startFileDirs = []string{"/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"}
-
-func startFiles() (string, error) {
-	for _, dir := range startFileDirs {
-		if _, err := os.Stat(filepath.Join(dir, "crt1.o")); err == nil {
-			return dir, nil
-		}
-	}
-	return "", fmt.Errorf("cannot find the C start files (crt1.o) in %s; install the C library development files", strings.Join(startFileDirs, ", "))
-}
-
-func dynamicArgs(output, object string, libraries []string) ([]string, error) {
-	dir, err := startFiles()
-	if err != nil {
-		return nil, err
-	}
-	args := []string{
-		"-o", output, "-dynamic-linker", dynamicLinker, "-L", dir,
-		filepath.Join(dir, "crt1.o"), filepath.Join(dir, "crti.o"), object,
-	}
-	for _, lib := range libraries {
-		if lib != "c" {
-			args = append(args, fmt.Sprintf("-l%s", lib))
-		}
-	}
-	return append(args, "-lc", filepath.Join(dir, "crtn.o")), nil
 }
 
 func LinkAt(ctx context.Context, asm, output, against string, address uint64) error {
