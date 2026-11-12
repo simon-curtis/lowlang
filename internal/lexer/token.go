@@ -158,6 +158,23 @@ func (k Kind) String() string {
 	return fmt.Sprintf("Kind(%d)", int(k))
 }
 
+var compound = map[Kind]Kind{
+	PlusAssign: Plus, MinusAssign: Minus, StarAssign: Star, SlashAssign: Slash, PercentAssign: Percent,
+	AmpAssign: Amp, PipeAssign: Pipe, CaretAssign: Caret, ShlAssign: Shl, ShrAssign: Shr,
+}
+
+func (k Kind) Operator() Kind {
+	if op, ok := compound[k]; ok {
+		return op
+	}
+	return k
+}
+
+func (k Kind) Assignment() bool {
+	_, ok := compound[k]
+	return ok || k == Assign
+}
+
 func Keywords() []string {
 	return texts(keywordSpellings)
 }

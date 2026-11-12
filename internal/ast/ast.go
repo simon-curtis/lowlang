@@ -64,13 +64,6 @@ type Select struct {
 	Pos   diag.Pos
 }
 
-func fieldWidth(e *Selector) *types.Type {
-	if types.StructOf(e.X.TypeOf()).C {
-		return e.Field.Type.Width()
-	}
-	return nil
-}
-
 type Import struct {
 	Alias string
 	Path  string
@@ -103,48 +96,6 @@ type TypeName struct {
 	Error    *TypeName
 	Elem     *TypeName
 	Pos      diag.Pos
-}
-
-type Place struct {
-	Local  *Local
-	Ptr    Expr
-	Index  *Index
-	Offset int
-	Width  *types.Type
-	Tail   int
-}
-
-func PlaceOf(e Expr) (*Place, bool) {
-	switch e := e.(type) {
-	case *Receiver:
-		return PlaceOf(e.X)
-	case *Ident:
-		if e.Local != nil {
-			return &Place{Local: e.Local}, true
-		}
-	case *Selector:
-		if e.Field == nil {
-			return nil, false
-		}
-		width := fieldWidth(e)
-		if e.X.TypeOf().Kind == types.PointerKind {
-			return &Place{Ptr: e.X, Offset: e.Field.Bytes, Width: width, Tail: e.Field.Type.Tail()}, true
-		}
-		p, ok := PlaceOf(e.X)
-		if !ok {
-			return nil, false
-		}
-		return &Place{Local: p.Local, Ptr: p.Ptr, Index: p.Index, Offset: p.Offset + e.Field.Bytes, Width: width, Tail: e.Field.Type.Tail()}, true
-	case *Index:
-		if e.X.TypeOf().Kind == types.SliceKind {
-			return &Place{Index: e, Tail: e.Type.Tail()}, true
-		}
-	case *Unary:
-		if e.Op == lexer.Star {
-			return &Place{Ptr: e.X, Tail: e.Type.Tail()}, true
-		}
-	}
-	return nil, false
 }
 
 type TypeParam struct {
@@ -227,13 +178,6 @@ type Func struct {
 	Trusted     bool
 }
 
-func (f *Func) ParamSize(i int) int {
-	if f.Params[i].Mut {
-		return 1
-	}
-	return f.ParamTypes[i].Size()
-}
-
 type Local struct {
 	Name      string
 	Type      *types.Type
@@ -245,13 +189,6 @@ type Local struct {
 	Assigned  bool
 	Owner     *Func
 	Flag      *Local
-}
-
-func (l *Local) Boxed() bool {
-	if !l.Captured {
-		return false
-	}
-	return l.Assigned || l.Addressed || l.Type.Kind == types.VectorKind || (l.Type.Kind == types.StructKind && l.Type.C)
 }
 
 type Node interface {
@@ -302,7 +239,6 @@ type Assign struct {
 	Op      lexer.Kind
 	Value   Expr
 	Pos     diag.Pos
-	Place   *Place
 	Entry   *Index
 	Release Stmt
 	Flag    *Local
@@ -462,9 +398,8 @@ type ForIn struct {
 
 type Ref struct {
 	Typed
-	X     Expr
-	Pos   diag.Pos
-	Place *Place
+	X   Expr
+	Pos diag.Pos
 }
 
 type Receiver struct {

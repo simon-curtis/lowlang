@@ -375,13 +375,9 @@ func (c *Checker) genericCall(e *ast.Call, fn *ast.Func, explicit []*ast.TypeNam
 	}
 	found := make([]*types.Type, len(e.Args))
 	for i, arg := range e.Args {
-		r, isRef := arg.(*ast.Ref)
-		switch {
-		case fn.Params[i].Mut && isRef:
+		if r := c.mutArgument(arg, fn.Params[i].Mut, "%s of %s", fn.Params[i].Name, fn.Name); r != nil {
 			found[i] = c.borrow(r)
-		case fn.Params[i].Mut:
-			c.fail(arg.Position(), "parameter %s of %s is mut; write mut before the argument", fn.Params[i].Name, fn.Name)
-		default:
+		} else {
 			found[i] = c.plain(arg, c.substitute(fn.ParamTypes[i], in, arg.Position()))
 		}
 		in.unify(fn.ParamTypes[i], found[i])

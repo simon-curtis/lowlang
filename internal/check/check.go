@@ -200,13 +200,13 @@ func (c *Checker) funcTypeName(t *ast.TypeName) *types.Type {
 	params := make([]*types.Type, len(t.Params))
 	for i, p := range t.Params {
 		params[i] = c.resolve(p)
-		if t.CFunc && !params[i].CCompatible() {
-			c.fail(p.Pos, "extern fn parameters must have C types, found %s", params[i])
+		if t.CFunc {
+			c.requireC(params[i], p.Pos, "extern fn parameters")
 		}
 	}
 	ret := c.resultOf(t.Result, t.Error)
-	if t.CFunc && ret != types.Void && !ret.CCompatible() {
-		c.fail(t.Pos, "extern fn results must have C types, found %s", ret)
+	if t.CFunc {
+		c.requireCResult(ret, t.Pos, "extern fn results")
 	}
 	return c.universe.Func(params, t.Muts, ret, t.CFunc)
 }
@@ -337,8 +337,8 @@ func (c *Checker) declareFields(d *ast.StructDecl, st *types.Type) {
 			c.fail(fd.Pos, "field %s already declared in %s", fd.Name, d.Name)
 		}
 		t := c.resolve(fd.TypeName)
-		if d.C && !t.CCompatible() {
-			c.fail(fd.TypeName.Pos, "extern struct fields must have C types, found %s", t)
+		if d.C {
+			c.requireC(t, fd.TypeName.Pos, "extern struct fields")
 		}
 		field := &types.Field{Name: fd.Name, Pub: fd.Pub, Type: t}
 		st.Fields = append(st.Fields, field)
@@ -364,12 +364,22 @@ func (c *Checker) declareFuncs(files []*ast.File) {
 
 func (c *Checker) cSignature(fn *ast.Func) {
 	for i, p := range fn.Params {
-		if !fn.ParamTypes[i].CCompatible() {
-			c.fail(p.TypeName.Pos, "extern parameters must have C types, found %s", fn.ParamTypes[i])
-		}
+		c.requireC(fn.ParamTypes[i], p.TypeName.Pos, "extern parameters")
 	}
-	if fn.RetType != types.Void && !fn.RetType.CCompatible() {
-		c.fail(fn.Result.Pos, "extern results must have C types, found %s", fn.RetType)
+	if fn.Result != nil {
+		c.requireCResult(fn.RetType, fn.Result.Pos, "extern results")
+	}
+}
+
+func (c *Checker) requireC(t *types.Type, pos diag.Pos, what string) {
+	if !t.CCompatible() {
+		c.fail(pos, "%s must have C types, found %s", what, t)
+	}
+}
+
+func (c *Checker) requireCResult(t *types.Type, pos diag.Pos, what string) {
+	if t != types.Void {
+		c.requireC(t, pos, what)
 	}
 }
 
@@ -529,15 +539,12 @@ func (c *Checker) funcValue(fn *ast.Func, want *types.Type, pos diag.Pos) (*ast.
 }
 
 func (c *Checker) callback(fn *ast.Func, pos diag.Pos) {
-	scalar := func(t *types.Type) bool {
-		return t.CCompatible() && t.Kind != types.StructKind
-	}
 	for i, t := range fn.ParamTypes {
-		if fn.Params[i].Mut || !scalar(t) {
+		if fn.Params[i].Mut || !t.CScalar() {
 			c.fail(pos, "%s cannot be a C callback: parameter %s must be a number, bool, ptr or extern fn", fn.Name, fn.Params[i].Name)
 		}
 	}
-	if fn.RetType != types.Void && !scalar(fn.RetType) {
+	if fn.RetType != types.Void && !fn.RetType.CScalar() {
 		c.fail(pos, "%s cannot be a C callback: it must return a number, bool, ptr or extern fn", fn.Name)
 	}
 	fn.Callback = true
@@ -719,17 +726,18 @@ func (c *Checker) let(s *ast.Let) {
 
 func (c *Checker) assign(s *ast.Assign) {
 	t := c.assignTarget(s)
+	op := s.Op.Operator()
 	switch {
-	case s.Op == lexer.Assign:
+	case op == lexer.Assign:
 	case isVector(t):
 		c.vectorAssign(s, t)
 		return
-	case s.Op == lexer.PlusAssign || s.Op == lexer.MinusAssign || s.Op == lexer.StarAssign || s.Op == lexer.SlashAssign:
+	case op == lexer.Plus || op == lexer.Minus || op == lexer.Star || op == lexer.Slash:
 		c.requireNumber(t, s.Op, s.Pos)
 	default:
 		c.requireInteger(t, s.Op, s.Pos)
 	}
-	if s.Op == lexer.ShlAssign || s.Op == lexer.ShrAssign {
+	if op == lexer.Shl || op == lexer.Shr {
 		c.requireInteger(c.plain(s.Value, nil), s.Op, s.Value.Position())
 		return
 	}
@@ -749,8 +757,7 @@ func (c *Checker) assignTarget(s *ast.Assign) *types.Type {
 			return m.Elem
 		}
 	}
-	place, t := c.place(s.Target, s.Pos, "assign to %s", "cannot assign to this expression")
-	s.Place = place
+	_, t := c.place(s.Target, s.Pos, "assign to %s", "cannot assign to this expression")
 	return t
 }
 
@@ -779,17 +786,17 @@ func (c *Checker) mutable(root *ast.Local, pos diag.Pos, action string) {
 	}
 }
 
-func (c *Checker) place(e ast.Expr, pos diag.Pos, action, invalid string) (*ast.Place, *types.Type) {
+func (c *Checker) place(e ast.Expr, pos diag.Pos, action, invalid string) (root, *types.Type) {
 	t := c.plain(e, nil)
-	place, ok := ast.PlaceOf(e)
+	where, ok := rootOf(e)
 	if !ok {
 		c.fail(pos, "%s", invalid)
 	}
-	if place.Local != nil {
-		c.mutable(place.Local, pos, action)
-		place.Local.Assigned = true
+	if where.local != nil {
+		c.mutable(where.local, pos, action)
+		where.local.Assigned = true
 	}
-	return place, t
+	return where, t
 }
 
 func (c *Checker) ref(r *ast.Ref, want *types.Type) {
@@ -800,40 +807,34 @@ func (c *Checker) ref(r *ast.Ref, want *types.Type) {
 
 func (c *Checker) borrow(r *ast.Ref) *types.Type {
 	t := c.borrowInPlace(r)
-	if local := r.Place.Local; local != nil && !local.Ref {
-		local.Addressed = true
+	if where, _ := rootOf(r.X); where.local != nil && !where.local.Ref {
+		where.local.Addressed = true
 	}
 	return t
 }
 
 func (c *Checker) borrowInPlace(r *ast.Ref) *types.Type {
-	place, t := c.place(r.X, r.Pos, "pass %s as mut", "mut argument must be a variable, a field, an element or a dereferenced pointer")
-	r.Place = place
+	_, t := c.place(r.X, r.Pos, "pass %s as mut", "mut argument must be a variable, a field, an element or a dereferenced pointer")
 	r.Type = t
 	return t
 }
 
 func (c *Checker) exclusive(args []ast.Expr) {
-	var refs []*ast.Ref
+	var held []borrowed
 	for _, arg := range args {
 		r, ok := arg.(*ast.Ref)
 		if !ok {
 			continue
 		}
-		for _, other := range refs {
-			if overlaps(r, other) {
-				c.fail(r.Pos, "%s is already passed as mut in this call", r.Place.Local.Name)
+		where, _ := rootOf(r.X)
+		current := borrowed{root: where, bytes: 8 * r.Type.Size()}
+		for _, other := range held {
+			if current.overlaps(other) {
+				c.fail(r.Pos, "%s is already passed as mut in this call", where.local.Name)
 			}
 		}
-		refs = append(refs, r)
+		held = append(held, current)
 	}
-}
-
-func overlaps(a, b *ast.Ref) bool {
-	pa, pb := a.Place, b.Place
-	return pa.Local != nil && pa.Local == pb.Local &&
-		pa.Offset < pb.Offset+8*b.Type.Size() &&
-		pb.Offset < pa.Offset+8*a.Type.Size()
 }
 
 func (c *Checker) forStmt(s *ast.For) bool {
@@ -1635,13 +1636,9 @@ func (c *Checker) indirect(e *ast.Call) {
 		prependMut(e)
 	}
 	for i, arg := range e.Args {
-		r, isRef := arg.(*ast.Ref)
-		switch {
-		case t.Muts[i] && isRef:
+		if r := c.mutArgument(arg, t.Muts[i], "%d of %s", i+1, t); r != nil {
 			c.ref(r, t.Params[i])
-		case t.Muts[i]:
-			c.fail(arg.Position(), "parameter %d of %s is mut; write mut before the argument", i+1, t)
-		default:
+		} else {
 			c.expectType(arg, t.Params[i])
 		}
 	}
@@ -1882,23 +1879,30 @@ func (c *Checker) callFunc(e *ast.Call, fn *ast.Func, want *types.Type) {
 }
 
 func (c *Checker) argument(arg ast.Expr, fn *ast.Func, i int) {
-	r, isRef := arg.(*ast.Ref)
 	param := fn.Params[i]
-	switch {
-	case param.Mut && isRef:
+	if r := c.mutArgument(arg, param.Mut, "%s of %s", param.Name, fn.Name); r != nil {
 		c.ref(r, fn.ParamTypes[i])
-	case param.Mut:
-		c.fail(arg.Position(), "parameter %s of %s is mut; write mut before the argument", param.Name, fn.Name)
-	default:
+	} else {
 		c.expectType(arg, fn.ParamTypes[i])
 	}
+}
+
+func (c *Checker) mutArgument(arg ast.Expr, mut bool, describe string, args ...any) *ast.Ref {
+	r, isRef := arg.(*ast.Ref)
+	if mut && !isRef {
+		c.fail(arg.Position(), "parameter %s is mut; write mut before the argument", fmt.Sprintf(describe, args...))
+	}
+	if mut {
+		return r
+	}
+	return nil
 }
 
 func (c *Checker) variadic(arg ast.Expr) {
 	if _, ok := arg.(*ast.Ref); ok {
 		c.fail(arg.Position(), "variadic arguments cannot be mut")
 	}
-	if t := c.plain(arg, nil); !t.CCompatible() || t.Kind == types.StructKind {
+	if t := c.plain(arg, nil); !t.CScalar() {
 		c.fail(arg.Position(), "variadic arguments must be numbers, bool or ptr, found %s", t)
 	}
 }

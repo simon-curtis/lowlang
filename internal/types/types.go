@@ -270,6 +270,10 @@ func (t *Type) CCompatible() bool {
 	return false
 }
 
+func (t *Type) CScalar() bool {
+	return t.CCompatible() && t.Kind != StructKind
+}
+
 func (t *Type) Tail() int {
 	if t.Kind == StructKind && t.C {
 		return t.Bytes % 8

@@ -8,7 +8,7 @@ import (
 func (b *builder) pop(e *ast.Call) []*Value {
 	ref := e.Args[0].(*ast.Ref)
 	elem := ref.Type.Elem
-	header := b.place(ref.Place)
+	header := b.placeOf(ref.X)
 	slice := b.load(header, types.Str)
 	temp := b.newTemp()
 	some := b.newBlock()
@@ -31,7 +31,7 @@ func (b *builder) pop(e *ast.Call) []*Value {
 
 func (b *builder) truncate(e *ast.Call) {
 	ref := e.Args[0].(*ast.Ref)
-	header := b.place(ref.Place)
+	header := b.placeOf(ref.X)
 	length := b.word(e.Args[1])
 	slice := b.load(header, types.Str)
 	b.check(length, b.count(OpAdd, slice[1], b.constant(1)))

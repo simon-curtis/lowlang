@@ -158,7 +158,7 @@ func (b *builder) cInvoke(symbol string, params []*types.Type, ret *types.Type, 
 	var refs []*ast.Ref
 	for i, arg := range exprs {
 		if r, ok := arg.(*ast.Ref); ok {
-			args = append(args, b.address(b.place(r.Place)))
+			args = append(args, b.address(b.placeOf(r.X)))
 			argTypes = append(argTypes, r.Type)
 			mut = append(mut, true)
 			refs = append(refs, r)
@@ -202,10 +202,13 @@ func (b *builder) cInvoke(symbol string, params []*types.Type, ret *types.Type, 
 
 func (b *builder) renormalize(r *ast.Ref) {
 	width := r.Type.Width()
-	if width == nil || r.Place.Width != nil {
+	if width == nil {
 		return
 	}
-	p := b.place(r.Place)
+	if mustLocate(r.X).width != nil {
+		return
+	}
+	p := b.placeOf(r.X)
 	p.scalar = width
 	value := b.load(p, r.Type)
 	p.scalar = nil

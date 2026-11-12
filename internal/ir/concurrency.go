@@ -77,7 +77,7 @@ func (b *builder) concurrencyBuiltin(e *ast.Call) ([]*Value, bool) {
 
 func (b *builder) refAddress(arg ast.Expr) *Value {
 	r := arg.(*ast.Ref)
-	return b.address(b.place(r.Place))
+	return b.address(b.placeOf(r.X))
 }
 
 func (b *builder) receive(e *ast.Unary) []*Value {

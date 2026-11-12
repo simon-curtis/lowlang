@@ -46,7 +46,7 @@ func (b *builder) assignEntry(s *ast.Assign) {
 	value := b.value(s.Value, m.Elem)
 	table := b.word(entry.X)
 	key := append([]*Value{table}, b.value(entry.Index, m.Key)...)
-	if op, ok := arith[s.Op]; ok {
+	if op, ok := arith[s.Op.Operator()]; ok {
 		current := b.mapCall("__map_get", m, key...)
 		old := b.present(current)
 		value = []*Value{b.typed(op, m.Elem, old, value[0])}
@@ -71,7 +71,7 @@ func (b *builder) present(optional []*Value) *Value {
 func (b *builder) deleteEntry(e *ast.Call) {
 	ref := e.Args[0].(*ast.Ref)
 	m := ref.Type
-	table := b.load(b.place(ref.Place), m)[0]
+	table := b.load(b.placeOf(ref.X), m)[0]
 	args := b.withKey(table, e.Args[1], m)
 	b.mapCall("__map_delete", m, args...)
 }

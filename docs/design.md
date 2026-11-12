@@ -1486,6 +1486,9 @@ Building a program needs no external tool. `low dev` needs a Linux host and GNU 
 - The `low` command lives in `cmd/low`. The pipeline it shares with hot reload lives in `internal/compiler`.
 - `low ir` prints the SSA form and `low asm` the generated assembly.
 - Compilation is deterministic: the same source and target always produce the same SSA form, assembly and binary. No pass depends on map iteration order; where order matters the compiler walks slices or stacks.
+- `parser.ParseSource` is the one entry from source text to tree, for user files, the prelude, the standard library and generated code. The lexer lexes each interpolated `{}` expression into tokens when it lexes the string, and keeps the `,width:format` suffix as text that `ast.ParseSpec` parses.
+- A lexer, parser or checker error is a `*diag.Error` holding the position of the fault; `low lsp` reads it with `errors.As`.
+- `types.Universe` interns the pointer, slice, optional, raw pointer, channel, map, result and function types, and owns the built-in type names and the constraint names. The checker lays out and instantiates types in three phases: declaring, laid out, and functions ready.
 
 Modules:
 

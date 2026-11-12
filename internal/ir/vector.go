@@ -51,9 +51,6 @@ var vectorBinary = map[lexer.Kind]VectorOp{
 	lexer.Amp: VAnd, lexer.Pipe: VOr, lexer.Caret: VXor,
 	lexer.Eq: VEq, lexer.NotEq: VNe, lexer.Lt: VLt, lexer.LtEq: VLe, lexer.Gt: VGt, lexer.GtEq: VGe,
 	lexer.Shl: VShl, lexer.Shr: VShr,
-	lexer.PlusAssign: VAdd, lexer.MinusAssign: VSub, lexer.StarAssign: VMul, lexer.SlashAssign: VDiv,
-	lexer.AmpAssign: VAnd, lexer.PipeAssign: VOr, lexer.CaretAssign: VXor,
-	lexer.ShlAssign: VShl, lexer.ShrAssign: VShr,
 }
 
 func isVector(t *types.Type) bool {
@@ -198,7 +195,7 @@ func (b *builder) vectorBuiltin(e *ast.Call) ([]*Value, bool) {
 
 func (b *builder) assignVector(s *ast.Assign) {
 	t := s.Target.TypeOf()
-	p := b.place(s.Place)
+	p := b.placeOf(s.Target)
 	dst := p.addr
 	if dst != nil {
 		dst = b.address(p)
@@ -206,13 +203,14 @@ func (b *builder) assignVector(s *ast.Assign) {
 		dst = b.vectorSlot(t)
 		b.store(place{addr: dst}, b.load(p, t))
 	}
+	op := s.Op.Operator()
 	switch {
-	case s.Op == lexer.Assign:
+	case op == lexer.Assign:
 		b.vectorOp(VCopy, t, dst, b.vec(s.Value))
-	case s.Op == lexer.ShlAssign || s.Op == lexer.ShrAssign:
-		b.vectorOp(vectorBinary[s.Op], t, dst, dst, b.word(s.Value))
+	case op == lexer.Shl || op == lexer.Shr:
+		b.vectorOp(vectorBinary[op], t, dst, dst, b.word(s.Value))
 	default:
-		b.vectorOp(vectorBinary[s.Op], t, dst, dst, b.operand(s.Value, s.Splat, t))
+		b.vectorOp(vectorBinary[op], t, dst, dst, b.operand(s.Value, s.Splat, t))
 	}
 	if p.addr == nil {
 		b.store(p, b.load(place{addr: dst}, t))

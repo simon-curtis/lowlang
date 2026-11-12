@@ -251,7 +251,7 @@ func paramWords(d *ast.Func) int {
 		words = 1
 	}
 	for i := range d.Params {
-		words += d.ParamSize(i)
+		words += paramSize(d, i)
 	}
 	return words
 }
@@ -284,7 +284,7 @@ func (b *builder) function() {
 }
 
 func captureWords(local *ast.Local) int {
-	if local.Boxed() {
+	if Boxed(local) {
 		return 1
 	}
 	return local.Type.Size()
@@ -294,7 +294,7 @@ func (b *builder) environment(captures []*ast.Local) {
 	env := b.param(0)
 	offset := 0
 	for _, local := range captures {
-		if local.Boxed() {
+		if Boxed(local) {
 			box := b.emit(OpLoad, env)
 			box.Aux = int64(offset)
 			b.slots[local] = box
@@ -311,7 +311,7 @@ func (b *builder) adapter(target *Func) {
 	var args []*Value
 	word := 1
 	for i, t := range b.decl.ParamTypes {
-		words := make([]*Value, b.decl.ParamSize(i))
+		words := make([]*Value, paramSize(b.decl, i))
 		for k := range words {
 			words[k] = b.param(word + k)
 		}
@@ -441,7 +441,7 @@ func (b *builder) word(e ast.Expr) *Value {
 }
 
 func (b *builder) bind(local *ast.Local, words []*Value) {
-	if local.Boxed() {
+	if Boxed(local) {
 		box := b.runtime("alloc", b.constant(int64(len(words))), b.scan(local.Type))
 		b.slots[local] = box
 		b.store(place{addr: box}, words)
@@ -456,30 +456,30 @@ func (b *builder) bind(local *ast.Local, words []*Value) {
 	b.store(place{local: local}, words)
 }
 
-func (b *builder) place(p *ast.Place) place {
+func (b *builder) place(p *location) place {
 	switch {
-	case p.Ptr != nil:
-		return place{addr: b.word(p.Ptr), offset: p.Offset, scalar: p.Width, tail: p.Tail, mem: memOf(p)}
-	case p.Index != nil:
-		element := b.element(p.Index)
-		element.offset += p.Offset
-		element.tail = p.Tail
+	case p.ptr != nil:
+		return place{addr: b.word(p.ptr), offset: p.offset, scalar: p.width, tail: p.tail, mem: memOf(p)}
+	case p.index != nil:
+		element := b.element(p.index)
+		element.offset += p.offset
+		element.tail = p.tail
 		element.mem = memOf(p)
-		if p.Width != nil {
-			element.scalar = p.Width
+		if p.width != nil {
+			element.scalar = p.width
 		}
 		return element
-	case p.Local.Ref:
-		return place{addr: b.refs[p.Local], offset: p.Offset, scalar: p.Width, tail: p.Tail, mem: memOf(p)}
+	case p.local.Ref:
+		return place{addr: b.refs[p.local], offset: p.offset, scalar: p.width, tail: p.tail, mem: memOf(p)}
 	}
-	if slot, ok := b.slots[p.Local]; ok {
-		return place{addr: slot, offset: p.Offset, scalar: p.Width, tail: p.Tail, mem: memOf(p)}
+	if slot, ok := b.slots[p.local]; ok {
+		return place{addr: slot, offset: p.offset, scalar: p.width, tail: p.tail, mem: memOf(p)}
 	}
-	return place{local: p.Local, word: p.Offset / 8}
+	return place{local: p.local, word: p.offset / 8}
 }
 
-func memOf(p *ast.Place) uint8 {
-	if p.Width != nil || p.Tail != 0 {
+func memOf(p *location) uint8 {
+	if p.width != nil || p.tail != 0 {
 		return MemRaw
 	}
 	return 0
@@ -688,9 +688,6 @@ func (b *builder) stmt(s ast.Stmt) {
 var arith = map[lexer.Kind]Op{
 	lexer.Plus: OpAdd, lexer.Minus: OpSub, lexer.Star: OpMul, lexer.Slash: OpDiv, lexer.Percent: OpRem,
 	lexer.Amp: OpAnd, lexer.Pipe: OpOr, lexer.Caret: OpXor, lexer.Shl: OpShl, lexer.Shr: OpShr,
-	lexer.PlusAssign: OpAdd, lexer.MinusAssign: OpSub, lexer.StarAssign: OpMul, lexer.SlashAssign: OpDiv,
-	lexer.PercentAssign: OpRem, lexer.AmpAssign: OpAnd, lexer.PipeAssign: OpOr, lexer.CaretAssign: OpXor,
-	lexer.ShlAssign: OpShl, lexer.ShrAssign: OpShr,
 	lexer.Eq: OpEq, lexer.NotEq: OpNe, lexer.Lt: OpLt, lexer.LtEq: OpLe, lexer.Gt: OpGt, lexer.GtEq: OpGe,
 }
 
@@ -715,15 +712,15 @@ func (b *builder) assign(s *ast.Assign) {
 	}
 	t := s.Target.TypeOf()
 	source := t
-	if s.Op == lexer.ShlAssign || s.Op == lexer.ShrAssign {
+	if op := s.Op.Operator(); op == lexer.Shl || op == lexer.Shr {
 		source = s.Value.TypeOf()
 	}
 	words := b.value(s.Value, source)
 	if s.Release != nil {
 		b.stmt(s.Release)
 	}
-	p := b.place(s.Place)
-	if op, ok := arith[s.Op]; ok {
+	p := b.placeOf(s.Target)
+	if op, ok := arith[s.Op.Operator()]; ok {
 		old := b.load(p, t)[0]
 		words = []*Value{b.typed(op, t, old, b.pad(words, 1)[0])}
 	}
@@ -734,7 +731,7 @@ func (b *builder) assign(s *ast.Assign) {
 }
 
 func (b *builder) setFlag(flag *ast.Local, live int64) {
-	b.store(b.place(&ast.Place{Local: flag}), []*Value{b.constant(live)})
+	b.store(b.place(&location{local: flag}), []*Value{b.constant(live)})
 }
 
 func (b *builder) forStmt(s *ast.For) {
@@ -793,9 +790,9 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		if e.X.TypeOf().Kind == types.MapKind {
 			return b.lookup(e)
 		}
-		p, _ := ast.PlaceOf(e)
-		if p == nil {
-			p = &ast.Place{Index: e, Tail: e.Type.Tail()}
+		p, ok := locate(e)
+		if !ok {
+			p = &location{index: e, tail: e.Type.Tail()}
 		}
 		return b.load(b.place(p), e.Type)
 	case *ast.Receiver:
@@ -818,7 +815,7 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		if e.Func != nil {
 			return b.funcValue(e.Func, e.Type)
 		}
-		words := b.load(b.place(&ast.Place{Local: e.Local}), e.Type)
+		words := b.load(b.place(&location{local: e.Local}), e.Type)
 		if e.Moved {
 			b.setFlag(e.Local.Flag, 0)
 		}
@@ -876,7 +873,7 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 	if e.Length {
 		return b.value(e.X, e.X.TypeOf())[1:2]
 	}
-	if p, ok := ast.PlaceOf(e); ok {
+	if p, ok := locate(e); ok {
 		return b.load(b.place(p), e.Type)
 	}
 	if isC(e.X.TypeOf()) {
@@ -889,7 +886,7 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 func (b *builder) unary(e *ast.Unary) []*Value {
 	switch e.Op {
 	case lexer.Star:
-		return b.load(b.place(&ast.Place{Ptr: e.X}), e.Type)
+		return b.load(b.place(&location{ptr: e.X}), e.Type)
 	case lexer.Not:
 		return []*Value{b.typed(OpNot, types.Bool, b.word(e.X))}
 	case lexer.Tilde:
@@ -1024,10 +1021,10 @@ func (b *builder) closure(e *ast.Closure) []*Value {
 }
 
 func (b *builder) captured(local *ast.Local) []*Value {
-	if local.Boxed() {
+	if Boxed(local) {
 		return []*Value{b.slots[local]}
 	}
-	return b.load(b.place(&ast.Place{Local: local}), local.Type)
+	return b.load(b.place(&location{local: local}), local.Type)
 }
 
 type writeBack struct {
@@ -1045,7 +1042,7 @@ func (b *builder) arguments(args []ast.Expr, params []*types.Type) ([]*Value, []
 			words = append(words, b.value(arg, params[i])...)
 			continue
 		}
-		p := b.place(r.Place)
+		p := b.placeOf(r.X)
 		if p.scalar == nil && p.tail == 0 {
 			words = append(words, b.address(p))
 			continue

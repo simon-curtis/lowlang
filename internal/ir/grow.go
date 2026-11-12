@@ -24,7 +24,7 @@ func (b *builder) regrow(ptr, length, capacity *Value, elem *types.Type) *Value 
 
 func (b *builder) extend(e *ast.Call) {
 	ref := e.Args[0].(*ast.Ref)
-	header := b.place(ref.Place)
+	header := b.placeOf(ref.X)
 	src := b.value(e.Args[1], types.Str)
 	base, length, needed := b.room(header, ref.Type, src[1])
 	end := b.emit(OpAdd, base, length)
@@ -34,7 +34,7 @@ func (b *builder) extend(e *ast.Call) {
 
 func (b *builder) extendBy(e *ast.Call) *Value {
 	ref := e.Args[0].(*ast.Ref)
-	header := b.place(ref.Place)
+	header := b.placeOf(ref.X)
 	count := b.word(e.Args[1])
 	_, length, needed := b.room(header, ref.Type, count)
 	b.store(header.at(1), []*Value{needed})
@@ -69,7 +69,7 @@ func (b *builder) room(header place, t *types.Type, extra *Value) (base, length,
 func (b *builder) push(e *ast.Call) {
 	ref := e.Args[0].(*ast.Ref)
 	elem := ref.Type.Elem
-	header := b.place(ref.Place)
+	header := b.placeOf(ref.X)
 	value := b.value(e.Args[1], elem)
 	slice := b.load(header, ref.Type)
 	ptr, length, capacity := slice[0], slice[1], slice[2]
@@ -102,11 +102,12 @@ func (b *builder) fillLoop(s *ast.ForIn) bool {
 		return false
 	}
 	ref := call.Args[0].(*ast.Ref)
-	local := ref.Place.Local
-	if local == nil || ref.Place.Ptr != nil || ref.Place.Index != nil {
+	root := mustLocate(ref.X)
+	local := root.local
+	if local == nil || root.ptr != nil || root.index != nil {
 		return false
 	}
-	header := b.place(ref.Place)
+	header := b.placeOf(ref.X)
 	if header.addr != nil || !invariantValue(call.Args[1], local, s.ValueLocal) {
 		return false
 	}

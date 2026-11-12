@@ -138,10 +138,11 @@ func (c *Checker) vectorIntrinsic(e *ast.Call, want *types.Type) {
 }
 
 func (c *Checker) vectorAssign(s *ast.Assign, t *types.Type) {
-	if s.Op == lexer.PercentAssign || (s.Op == lexer.SlashAssign && !t.Elem.Float()) {
+	op := s.Op.Operator()
+	if op == lexer.Percent || (op == lexer.Slash && !t.Elem.Float()) {
 		c.fail(s.Pos, "operator %s is not defined on %s", s.Op, t)
 	}
-	if s.Op == lexer.ShlAssign || s.Op == lexer.ShrAssign {
+	if op == lexer.Shl || op == lexer.Shr {
 		if !t.Elem.Integer() {
 			c.fail(s.Pos, "operator %s on vectors requires integer lanes, found %s", s.Op, t)
 		}

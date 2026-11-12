@@ -15,7 +15,6 @@ type Parser struct {
 	tokens   []lexer.Token
 	i        int
 	noStruct bool
-	testing  bool
 	taken    map[int]bool
 }
 
@@ -96,48 +95,92 @@ func (p *Parser) skipNewlines() {
 	}
 }
 
-func (p *Parser) nested(parse func()) {
+func (p *Parser) allowStructs(allowed bool, parse func()) {
 	saved := p.noStruct
-	p.noStruct = false
+	p.noStruct = !allowed
 	parse()
 	p.noStruct = saved
 }
 
+func (p *Parser) nested(parse func()) {
+	p.allowStructs(true, parse)
+}
+
 func (p *Parser) condition() ast.Expr {
-	saved := p.noStruct
-	p.noStruct = true
-	x := p.expr()
-	p.noStruct = saved
+	var x ast.Expr
+	p.allowStructs(false, func() { x = p.expr() })
 	return x
 }
 
-func (p *Parser) list(item func()) {
-	p.expect(lexer.LParen)
+func (p *Parser) accept(k lexer.Kind) bool {
+	if !p.at(k) {
+		return false
+	}
+	p.next()
+	return true
+}
+
+func (p *Parser) delimited(open, close lexer.Kind, item func()) {
+	p.expect(open)
 	p.nested(func() {
-		for !p.at(lexer.RParen) {
+		for !p.at(close) {
 			item()
-			if !p.at(lexer.RParen) {
+			if !p.at(close) {
 				p.expect(lexer.Comma)
 			}
 		}
 	})
-	p.expect(lexer.RParen)
+	p.expect(close)
+}
+
+func (p *Parser) list(item func()) {
+	p.delimited(lexer.LParen, lexer.RParen, item)
+}
+
+func (p *Parser) brackets(item func()) {
+	p.delimited(lexer.LBracket, lexer.RBracket, item)
+}
+
+func (p *Parser) sequence(close lexer.Kind, commas bool, item func()) {
+	p.nested(func() {
+		p.skipNewlines()
+		for !p.at(close) {
+			item()
+			if commas && p.at(lexer.Comma) {
+				p.next()
+			} else if !p.at(close) {
+				p.expect(lexer.Newline)
+			}
+			p.skipNewlines()
+		}
+	})
+	p.expect(close)
 }
 
 func (p *Parser) lines(item func()) {
 	p.expect(lexer.LBrace)
-	p.nested(func() {
-		p.skipNewlines()
-		for !p.at(lexer.RBrace) {
-			item()
-			if p.at(lexer.RBrace) {
-				break
-			}
-			p.expect(lexer.Newline)
-			p.skipNewlines()
-		}
-	})
-	p.expect(lexer.RBrace)
+	p.sequence(lexer.RBrace, false, item)
+}
+
+func (p *Parser) arrowType() *ast.TypeName {
+	if !p.accept(lexer.Arrow) {
+		return nil
+	}
+	return p.typeName()
+}
+
+func (p *Parser) signatureTail() (result, failure *ast.TypeName) {
+	result = p.arrowType()
+	if p.accept(lexer.Not) {
+		failure = p.typeName()
+	}
+	return result, failure
+}
+
+func (p *Parser) modifiers() (doc string, pub bool) {
+	doc = p.doc()
+	pub = p.accept(lexer.Pub)
+	return doc, pub
 }
 
 func (p *Parser) file() *ast.File {
@@ -156,11 +199,7 @@ func (p *Parser) file() *ast.File {
 }
 
 func (p *Parser) declaration(f *ast.File) {
-	doc := p.doc()
-	pub := p.at(lexer.Pub)
-	if pub {
-		p.next()
-	}
+	doc, pub := p.modifiers()
 	switch t := p.tok(); t.Kind {
 	case lexer.Fn:
 		d := p.fn()
@@ -209,31 +248,22 @@ func (p *Parser) extern() *ast.Extern {
 }
 
 func (p *Parser) externFn(e *ast.Extern) *ast.Func {
-	doc := p.doc()
-	pub := p.at(lexer.Pub)
-	if pub {
-		p.next()
-	}
+	doc, pub := p.modifiers()
 	pos := p.expect(lexer.Fn).Pos
 	f := &ast.Func{Name: p.expect(lexer.Ident).Text, Doc: doc, Pub: pub, Extern: e, Pos: pos}
 	p.list(func() {
 		if f.Variadic {
 			p.fail(p.tok().Pos, "... must be the last parameter")
 		}
-		if p.at(lexer.Ellipsis) {
-			p.next()
+		if p.accept(lexer.Ellipsis) {
 			f.Variadic = true
 			return
 		}
 		f.Params = append(f.Params, p.param())
 	})
-	if p.at(lexer.Arrow) {
-		p.next()
-		f.Result = p.typeName()
-	}
+	f.Result = p.arrowType()
 	f.Symbol = f.Name
-	if p.at(lexer.Assign) {
-		p.next()
+	if p.accept(lexer.Assign) {
 		symbol := p.expect(lexer.String)
 		if !validSymbol(symbol.Text) {
 			p.fail(symbol.Pos, "invalid C symbol %q", symbol.Text)
@@ -273,8 +303,7 @@ func (p *Parser) importDecl() *ast.Import {
 	pos := p.expect(lexer.Import).Pos
 	first := p.expect(lexer.Ident).Text
 	alias := ""
-	if p.at(lexer.Assign) {
-		p.next()
+	if p.accept(lexer.Assign) {
 		alias = first
 		first = p.expect(lexer.Ident).Text
 	}
@@ -329,16 +358,11 @@ func (p *Parser) structDecl() *ast.StructDecl {
 			d.Drop = p.stmt()
 			return
 		}
-		doc := p.doc()
-		pub := p.at(lexer.Pub)
-		if pub {
-			p.next()
-		}
+		doc, pub := p.modifiers()
 		name := p.expect(lexer.Ident)
 		p.expect(lexer.Colon)
 		field := &ast.FieldDecl{Name: name.Text, Doc: doc, Pub: pub, TypeName: p.typeName(), Pos: name.Pos}
-		if p.at(lexer.Assign) {
-			p.next()
+		if p.accept(lexer.Assign) {
 			field.Default = p.expr()
 		}
 		d.Fields = append(d.Fields, field)
@@ -351,19 +375,7 @@ func (p *Parser) trailing() *ast.SliceLit {
 		return nil
 	}
 	lit := &ast.SliceLit{Pos: p.next().Pos}
-	p.nested(func() {
-		p.skipNewlines()
-		for !p.at(lexer.RBrace) {
-			lit.Elems = append(lit.Elems, p.expr())
-			if p.at(lexer.Comma) {
-				p.next()
-			} else if !p.at(lexer.RBrace) {
-				p.expect(lexer.Newline)
-			}
-			p.skipNewlines()
-		}
-	})
-	p.expect(lexer.RBrace)
+	p.sequence(lexer.RBrace, true, func() { lit.Elems = append(lit.Elems, p.expr()) })
 	return lit
 }
 
@@ -372,14 +384,7 @@ func (p *Parser) fn() *ast.Func {
 	f := &ast.Func{Name: p.expect(lexer.Ident).Text, Pos: pos}
 	f.TypeParams = p.typeParams()
 	p.list(func() { f.Params = append(f.Params, p.param()) })
-	if p.at(lexer.Arrow) {
-		p.next()
-		f.Result = p.typeName()
-	}
-	if p.at(lexer.Not) {
-		p.next()
-		f.Error = p.typeName()
-	}
+	f.Result, f.Error = p.signatureTail()
 	f.Body = p.block()
 	return f
 }
@@ -392,8 +397,7 @@ func (p *Parser) typeParams() []*ast.TypeParam {
 	p.brackets(func() {
 		name := p.expect(lexer.Ident)
 		param := &ast.TypeParam{Name: name.Text, Pos: name.Pos}
-		if p.at(lexer.Colon) {
-			p.next()
+		if p.accept(lexer.Colon) {
 			param.Constraints = append(param.Constraints, p.expect(lexer.Ident).Text)
 			for p.at(lexer.Plus) {
 				p.next()
@@ -408,19 +412,6 @@ func (p *Parser) typeParams() []*ast.TypeParam {
 	return params
 }
 
-func (p *Parser) brackets(item func()) {
-	p.expect(lexer.LBracket)
-	p.nested(func() {
-		for !p.at(lexer.RBracket) {
-			item()
-			if !p.at(lexer.RBracket) {
-				p.expect(lexer.Comma)
-			}
-		}
-	})
-	p.expect(lexer.RBracket)
-}
-
 func (p *Parser) typeArgs() []*ast.TypeName {
 	var args []*ast.TypeName
 	p.brackets(func() { args = append(args, p.typeName()) })
@@ -431,9 +422,9 @@ func (p *Parser) typeArgs() []*ast.TypeName {
 }
 
 func (p *Parser) attempt(parse func()) bool {
-	start, noStruct, testing := p.i, p.noStruct, p.testing
+	start, noStruct := p.i, p.noStruct
 	if diag.Try(parse) != nil {
-		p.i, p.noStruct, p.testing = start, noStruct, testing
+		p.i, p.noStruct = start, noStruct
 		return false
 	}
 	return true
@@ -486,10 +477,7 @@ func (p *Parser) instance(x ast.Expr) *ast.Instance {
 }
 
 func (p *Parser) param() *ast.Param {
-	mut := p.at(lexer.Mut)
-	if mut {
-		p.next()
-	}
+	mut := p.accept(lexer.Mut)
 	name := p.expect(lexer.Ident)
 	p.expect(lexer.Colon)
 	return &ast.Param{Name: name.Text, Mut: mut, TypeName: p.typeName(), Pos: name.Pos}
@@ -499,21 +487,11 @@ func (p *Parser) funcType(pos diag.Pos, c bool) *ast.TypeName {
 	p.expect(lexer.Fn)
 	t := &ast.TypeName{Func: true, CFunc: c, Pos: pos}
 	p.list(func() {
-		mut := p.at(lexer.Mut)
-		if mut {
-			p.next()
-		}
+		mut := p.accept(lexer.Mut)
 		t.Muts = append(t.Muts, mut)
 		t.Params = append(t.Params, p.typeName())
 	})
-	if p.at(lexer.Arrow) {
-		p.next()
-		t.Result = p.typeName()
-	}
-	if p.at(lexer.Not) {
-		p.next()
-		t.Error = p.typeName()
-	}
+	t.Result, t.Error = p.signatureTail()
 	return t
 }
 
@@ -521,26 +499,15 @@ func (p *Parser) closure() *ast.Closure {
 	pos := p.expect(lexer.Fn).Pos
 	c := &ast.Closure{Pos: pos}
 	p.list(func() {
-		mut := p.at(lexer.Mut)
-		if mut {
-			p.next()
-		}
+		mut := p.accept(lexer.Mut)
 		name := p.expect(lexer.Ident)
 		param := &ast.Param{Name: name.Text, Mut: mut, Pos: name.Pos}
-		if p.at(lexer.Colon) {
-			p.next()
+		if p.accept(lexer.Colon) {
 			param.TypeName = p.typeName()
 		}
 		c.Params = append(c.Params, param)
 	})
-	if p.at(lexer.Arrow) {
-		p.next()
-		c.Result = p.typeName()
-	}
-	if p.at(lexer.Not) {
-		p.next()
-		c.Error = p.typeName()
-	}
+	c.Result, c.Error = p.signatureTail()
 	c.Body = p.block()
 	return c
 }
@@ -567,8 +534,7 @@ func (p *Parser) typeTerm() *ast.TypeName {
 		return &ast.TypeName{Pointer: true, Elem: p.typeTerm(), Pos: pos}
 	case p.at(lexer.LBracket):
 		p.next()
-		if p.at(lexer.RBracket) {
-			p.next()
+		if p.accept(lexer.RBracket) {
 			return &ast.TypeName{Slice: true, Elem: p.typeTerm(), Pos: pos}
 		}
 		key := p.typeName()
@@ -578,8 +544,7 @@ func (p *Parser) typeTerm() *ast.TypeName {
 		return &ast.TypeName{Map: true, Key: key, Elem: value, Pos: pos}
 	}
 	t := &ast.TypeName{Name: p.expect(lexer.Ident).Text, Pos: pos}
-	if p.at(lexer.Dot) {
-		p.next()
+	if p.accept(lexer.Dot) {
 		t.Module, t.Name = t.Name, p.expect(lexer.Ident).Text
 	}
 	if p.at(lexer.LBracket) {
@@ -598,13 +563,6 @@ func (p *Parser) block() *ast.Block {
 		}
 	}
 	return b
-}
-
-var assignOps = map[lexer.Kind]bool{
-	lexer.Assign: true, lexer.PlusAssign: true, lexer.MinusAssign: true,
-	lexer.StarAssign: true, lexer.SlashAssign: true, lexer.PercentAssign: true,
-	lexer.AmpAssign: true, lexer.PipeAssign: true, lexer.CaretAssign: true,
-	lexer.ShlAssign: true, lexer.ShrAssign: true,
 }
 
 func (p *Parser) stmt() ast.Stmt {
@@ -655,11 +613,10 @@ func (p *Parser) stmt() ast.Stmt {
 		return &ast.Spawn{Call: call, Pos: t.Pos}
 	}
 	x := p.expr()
-	if p.at(lexer.LArrow) {
-		p.next()
+	if p.accept(lexer.LArrow) {
 		return &ast.Send{Chan: x, Value: p.expr(), Pos: t.Pos}
 	}
-	if op := p.tok().Kind; assignOps[op] {
+	if op := p.tok().Kind; op.Assignment() {
 		p.next()
 		return &ast.Assign{Target: x, Op: op, Value: p.expr(), Pos: t.Pos}
 	}
@@ -696,15 +653,13 @@ func (p *Parser) label() string {
 
 func (p *Parser) forIn(label string, pos diag.Pos) *ast.ForIn {
 	loop := &ast.ForIn{Label: label, Value: p.expect(lexer.Ident).Text, Pos: pos}
-	if p.at(lexer.Comma) {
-		p.next()
+	if p.accept(lexer.Comma) {
 		loop.Key = loop.Value
 		loop.Value = p.expect(lexer.Ident).Text
 	}
 	p.expect(lexer.In)
 	loop.Iter = p.condition()
-	if p.at(lexer.DotDot) {
-		p.next()
+	if p.accept(lexer.DotDot) {
 		loop.End = p.condition()
 	}
 	loop.Body = p.block()
@@ -719,8 +674,7 @@ func (p *Parser) let() *ast.Let {
 func (p *Parser) binding(pos diag.Pos, mutable bool) *ast.Let {
 	name := p.expect(lexer.Ident).Text
 	var typeName *ast.TypeName
-	if p.at(lexer.Colon) {
-		p.next()
+	if p.accept(lexer.Colon) {
 		typeName = p.typeName()
 	}
 	p.expect(lexer.Assign)
@@ -738,14 +692,14 @@ var precedence = map[lexer.Kind]int{
 }
 
 func (p *Parser) expr() ast.Expr {
-	return p.binary(1)
+	return p.binary(1, false)
 }
 
-func (p *Parser) binary(minPrec int) ast.Expr {
-	return p.binaryFrom(p.unary(), minPrec)
+func (p *Parser) binary(minPrec int, testing bool) ast.Expr {
+	return p.binaryFrom(p.unary(testing), minPrec, testing)
 }
 
-func (p *Parser) binaryFrom(x ast.Expr, minPrec int) ast.Expr {
+func (p *Parser) binaryFrom(x ast.Expr, minPrec int, testing bool) ast.Expr {
 	for {
 		op := p.tok()
 		prec, ok := precedence[op.Kind]
@@ -757,7 +711,7 @@ func (p *Parser) binaryFrom(x ast.Expr, minPrec int) ast.Expr {
 		if op.Kind == lexer.Coalesce {
 			next = prec
 		}
-		y := p.binary(next)
+		y := p.binary(next, testing)
 		if op.Kind == lexer.PipeArrow {
 			x = p.pipe(x, y, op.Pos)
 			continue
@@ -782,10 +736,10 @@ func (p *Parser) pipe(x, y ast.Expr, pos diag.Pos) ast.Expr {
 	return nil
 }
 
-func (p *Parser) unary() ast.Expr {
+func (p *Parser) unary(testing bool) ast.Expr {
 	t := p.tok()
-	if p.testing && precedence[t.Kind] > 0 && t.Kind != lexer.Minus && t.Kind != lexer.Star {
-		return p.binaryFrom(&ast.Subject{Pos: t.Pos}, precedence[lexer.Eq])
+	if testing && precedence[t.Kind] > 0 && t.Kind != lexer.Minus && t.Kind != lexer.Star {
+		return p.binaryFrom(&ast.Subject{Pos: t.Pos}, precedence[lexer.Eq], testing)
 	}
 	switch t.Kind {
 	case lexer.Minus:
@@ -794,10 +748,10 @@ func (p *Parser) unary() ast.Expr {
 			p.next()
 			return p.postfix(p.number(lit, true, t.Pos))
 		}
-		return &ast.Unary{Op: t.Kind, X: p.unary(), Pos: t.Pos}
+		return &ast.Unary{Op: t.Kind, X: p.unary(false), Pos: t.Pos}
 	case lexer.Not, lexer.Star, lexer.Tilde, lexer.LArrow:
 		p.next()
-		return &ast.Unary{Op: t.Kind, X: p.unary(), Pos: t.Pos}
+		return &ast.Unary{Op: t.Kind, X: p.unary(false), Pos: t.Pos}
 	}
 	return p.postfix(p.primary())
 }
@@ -947,33 +901,22 @@ func (p *Parser) spec(part lexer.Part) *ast.Spec {
 
 func (p *Parser) sliceLit() ast.Expr {
 	pos := p.expect(lexer.LBracket).Pos
-	if p.at(lexer.Colon) {
-		p.next()
+	if p.accept(lexer.Colon) {
 		p.expect(lexer.RBracket)
 		return &ast.MapLit{Pos: pos}
 	}
 	var keys, values []ast.Expr
 	mapped := false
-	p.nested(func() {
-		p.skipNewlines()
-		for !p.at(lexer.RBracket) {
-			keys = append(keys, p.expr())
-			if len(keys) == 1 && p.at(lexer.Colon) {
-				mapped = true
-			}
-			if mapped {
-				p.expect(lexer.Colon)
-				values = append(values, p.expr())
-			}
-			if p.at(lexer.Comma) {
-				p.next()
-			} else if !p.at(lexer.RBracket) {
-				p.expect(lexer.Newline)
-			}
-			p.skipNewlines()
+	p.sequence(lexer.RBracket, true, func() {
+		keys = append(keys, p.expr())
+		if len(keys) == 1 && p.at(lexer.Colon) {
+			mapped = true
+		}
+		if mapped {
+			p.expect(lexer.Colon)
+			values = append(values, p.expr())
 		}
 	})
-	p.expect(lexer.RBracket)
 	if mapped {
 		return &ast.MapLit{Keys: keys, Values: values, Pos: pos}
 	}
@@ -988,8 +931,7 @@ func (p *Parser) index(x ast.Expr) ast.Expr {
 		if !p.at(lexer.DotDot) {
 			lo = p.expr()
 		}
-		if p.at(lexer.DotDot) {
-			p.next()
+		if p.accept(lexer.DotDot) {
 			sliced = true
 			if !p.at(lexer.RBracket) {
 				hi = p.expr()
@@ -1009,19 +951,7 @@ func (p *Parser) index(x ast.Expr) ast.Expr {
 func (p *Parser) structLit(name lexer.Token) *ast.StructLit {
 	lit := &ast.StructLit{Name: name.Text, Pos: name.Pos}
 	p.expect(lexer.LBrace)
-	p.nested(func() {
-		p.skipNewlines()
-		for !p.at(lexer.RBrace) {
-			lit.Fields = append(lit.Fields, p.fieldInit())
-			if p.at(lexer.Comma) {
-				p.next()
-			} else if !p.at(lexer.RBrace) {
-				p.expect(lexer.Newline)
-			}
-			p.skipNewlines()
-		}
-	})
-	p.expect(lexer.RBrace)
+	p.sequence(lexer.RBrace, true, func() { lit.Fields = append(lit.Fields, p.fieldInit()) })
 	if children := p.trailing(); children != nil {
 		lit.Fields = append(lit.Fields, &ast.FieldInit{Name: "children", Value: children, Pos: children.Pos})
 	}
@@ -1099,28 +1029,18 @@ func (p *Parser) catch(x ast.Expr, pos diag.Pos) *ast.Catch {
 		c.Arms = p.arms()
 		return c
 	}
-	c.Fallback = p.unary()
+	c.Fallback = p.unary(false)
 	return c
 }
 
 func (p *Parser) arms() []*ast.Arm {
 	var arms []*ast.Arm
 	p.expect(lexer.LBrace)
-	p.nested(func() {
-		p.skipNewlines()
-		for !p.at(lexer.RBrace) {
-			pattern := p.pattern()
-			p.expect(lexer.FatArrow)
-			arms = append(arms, &ast.Arm{Pattern: pattern, Body: p.expr()})
-			if p.at(lexer.Comma) {
-				p.next()
-			} else if !p.at(lexer.RBrace) {
-				p.expect(lexer.Newline)
-			}
-			p.skipNewlines()
-		}
+	p.sequence(lexer.RBrace, true, func() {
+		pattern := p.pattern()
+		p.expect(lexer.FatArrow)
+		arms = append(arms, &ast.Arm{Pattern: pattern, Body: p.expr()})
 	})
-	p.expect(lexer.RBrace)
 	return arms
 }
 
@@ -1152,9 +1072,7 @@ func (p *Parser) pattern() *ast.Pattern {
 		return &ast.Pattern{Test: test, Pos: t.Pos}
 	}
 	if t := p.tok(); precedence[t.Kind] > 0 {
-		p.testing = true
-		test := p.binaryFrom(&ast.Subject{Pos: t.Pos}, 0)
-		p.testing = false
+		test := p.binaryFrom(&ast.Subject{Pos: t.Pos}, 0, true)
 		return &ast.Pattern{Test: test, Pos: t.Pos}
 	}
 	name := p.expect(lexer.Ident)

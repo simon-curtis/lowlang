@@ -255,7 +255,7 @@ func (s *synth) keyCodec(k *types.Type) keyCodec {
 	case k == types.U64:
 		text.read = "key_unsigned(key, at)?"
 	case k.Kind == types.IntKind:
-		low, high := bounds(k)
+		low, high := k.Bounds()
 		text.read = fmt.Sprintf("%s(in_range(key_integer(key, at)?, %d, %d, at)?)", s.name(k), low, high)
 	default:
 		s.unsupported(k)
@@ -305,14 +305,6 @@ func (s *synth) serializeEnum(t *types.Type) {
 	s.line("}")
 }
 
-func bounds(t *types.Type) (int64, int64) {
-	if t.Signed {
-		limit := int64(1) << (t.Bits - 1)
-		return -limit, limit - 1
-	}
-	return 0, int64(1)<<t.Bits - 1
-}
-
 func (s *synth) deserialize(t *types.Type) {
 	self := s.name(t)
 	switch {
@@ -323,7 +315,7 @@ func (s *synth) deserialize(t *types.Type) {
 	case t == types.U64:
 		s.line("r.unsigned()?")
 	case t.Kind == types.IntKind:
-		low, high := bounds(t)
+		low, high := t.Bounds()
 		s.line("%s(integer_in(r, %d, %d)?)", self, low, high)
 	case t == types.F64:
 		s.line("r.float()?")
