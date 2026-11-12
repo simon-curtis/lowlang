@@ -363,6 +363,7 @@ type Closure struct {
 	Result   *TypeName
 	Error    *TypeName
 	Body     *Block
+	Inline   bool
 	Pos      diag.Pos
 	Func     *Func
 	Captures []*Local

@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"lowlang/internal/compiler"
@@ -147,6 +148,16 @@ func TestLiftNeedsAnUndeclaredErrorType(t *testing.T) {
 	}
 	if _, ok := actions["Catch the error"]; !ok {
 		t.Fatalf("want the catch action, got %v", actions)
+	}
+}
+
+func TestNoLiftIntoAnExpressionClosure(t *testing.T) {
+	c := start(t)
+	f := scratch(t, "main.low", strings.Replace(parseTwice, `print(twice("4")?)`, `let f = fn(text: str) parse(text)?`, 1))
+	c.open(f, f.src)
+	actions := c.codeActions(f, f.at(t, "parse(text)?", 0))
+	if _, ok := actions["Catch the error"]; !ok || len(actions) != 1 {
+		t.Fatalf("want only the catch action, got %v", actions)
 	}
 }
 

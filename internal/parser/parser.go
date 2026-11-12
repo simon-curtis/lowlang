@@ -519,7 +519,13 @@ func (p *Parser) closure() *ast.Closure {
 		c.Params = append(c.Params, param)
 	})
 	c.Result, c.Error = p.signatureTail()
-	c.Body = p.block()
+	if p.at(lexer.LBrace) || c.Result != nil || c.Error != nil {
+		c.Body = p.block()
+		return c
+	}
+	pos = p.tok().Pos
+	c.Body = &ast.Block{Tail: p.expr(), Pos: pos}
+	c.Inline = true
 	return c
 }
 

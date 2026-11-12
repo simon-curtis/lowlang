@@ -35,6 +35,7 @@ type owner struct {
 	result *ast.TypeName
 	err    *ast.TypeName
 	body   *ast.Block
+	inline bool
 }
 
 func (o owner) subject() string {
@@ -126,7 +127,7 @@ func collectTries(sites []trySite, o owner) []trySite {
 		case *ast.Try:
 			sites = append(sites, trySite{try: n, owner: o})
 		case *ast.Closure:
-			sites = collectTries(sites, owner{result: n.Result, err: n.Error, body: n.Body})
+			sites = collectTries(sites, owner{result: n.Result, err: n.Error, body: n.Body, inline: n.Inline})
 			return false
 		}
 		return true
@@ -149,7 +150,7 @@ func nearestTry(sites []trySite, line, col int) (trySite, bool) {
 }
 
 func (a actionContext) lift() (CodeAction, bool) {
-	if a.result == nil || a.site.owner.err != nil {
+	if a.result == nil || a.site.owner.err != nil || a.site.owner.inline {
 		return CodeAction{}, false
 	}
 	name, edits, ok := a.spell(a.result.Err.Name)

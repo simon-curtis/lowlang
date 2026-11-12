@@ -403,12 +403,22 @@ func (c *Checker) genericCall(e *ast.Call, fn *ast.Func, explicit []*ast.TypeNam
 		c.fail(e.Pos, "%s takes %d arguments, found %d", fn.Name, len(fn.Params), len(e.Args))
 	}
 	found := make([]*types.Type, len(e.Args))
+	var closures []int
 	for i, arg := range e.Args {
+		if _, ok := arg.(*ast.Closure); ok {
+			closures = append(closures, i)
+			continue
+		}
 		if r := c.mutArgument(arg, fn.Params[i].Mut, "%s of %s", fn.Params[i].Name, fn.Name); r != nil {
 			found[i] = c.borrow(r)
 		} else {
 			found[i] = c.plain(arg, c.substitute(fn.ParamTypes[i], in, arg.Position()))
 		}
+		in.unify(fn.ParamTypes[i], found[i])
+	}
+	for _, i := range closures {
+		arg := e.Args[i]
+		found[i] = c.plain(arg, c.closureHint(fn.ParamTypes[i], in, arg.Position()))
 		in.unify(fn.ParamTypes[i], found[i])
 	}
 	in.unify(fn.RetType, unwrap(want))
@@ -427,6 +437,17 @@ func (c *Checker) genericCall(e *ast.Call, fn *ast.Func, explicit []*ast.TypeNam
 	}
 	e.Type = c.substitute(fn.RetType, in, e.Pos)
 	c.forwarded(e, fn)
+}
+
+func (c *Checker) closureHint(pattern *types.Type, in *inference, pos diag.Pos) *types.Type {
+	if pattern.Kind != types.FuncKind || pattern.Optional || pattern.C {
+		return c.substitute(pattern, in, pos)
+	}
+	params := make([]*types.Type, len(pattern.Params))
+	for i, p := range pattern.Params {
+		params[i] = c.substitute(p, in, pos)
+	}
+	return &types.Type{Kind: types.FuncKind, Params: params, Muts: pattern.Muts, Ret: c.substitute(pattern.Ret, in, pos)}
 }
 
 func (c *Checker) genericTarget(x ast.Expr) *ast.Func {

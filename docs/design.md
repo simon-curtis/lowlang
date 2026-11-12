@@ -50,6 +50,7 @@ count += 1
 ### Functions
 
 <!-- prelude
+import std/slices
 import std/text
 enum ParseError {
     Bad
@@ -62,6 +63,7 @@ fn parse_int(s: str) -> i64 ! ParseError {
 }
 var items = [1, 2, 3]
 let input = "42"
+let words = ["low", "level"]
 fn main() ! ParseError {
 -->
 ```low
@@ -81,6 +83,8 @@ let twice = fn(x: i64) -> i64 { x * 2 }
 let ops: [str: fn(i64) -> i64] = ["twice": twice, "negate": negate]
 let parse: fn(str) -> i64 ! ParseError = parse_int
 let square: fn(i64) -> i64 = fn(x) { x * x }
+let cube = fn(x: i64) x * x * x
+let lengths = words |> slices.map(fn(w) w.len)
 
 fn first(s: str) -> u8 {
     s[0]
@@ -96,7 +100,11 @@ let n = input |> parse()?
 ```
 
 - A function type is written `fn(i64, mut str) -> bool`, with `! E` for a result that can fail. Two function types are the same when their parameters, `mut` markers and results are.
-- A named function is a value of its function type. `fn(params) -> R { body }` is a closure. Parameter and result types may be omitted when the expected function type supplies them; a closure with no written result and no expected type returns nothing.
+- A named function is a value of its function type. `fn(params) -> R { body }` is a closure, and `fn(params) expr` is a closure whose body is one expression, which extends as far as an expression can. A closure that writes its result or error type takes a braced body, so `!` after the parameters always starts an error type.
+- A closure's parameter and result types may be omitted when the expected function type supplies them.
+  - An argument to a generic function is checked after the arguments that are not closures, so its expected type takes the type arguments they bind: `slices.map(words, fn(w) w.len)` gives `w` the element type of `words`.
+  - When the expected type leaves the result open, as `U` in `slices.map`, or there is no expected type and the body is one expression, the result is the body's type, or the type of the first `return`'s value. `?` and `fail` need a written result.
+  - A braced closure with no written result and no expected type returns nothing.
 - Values of function type can be stored in variables, fields, slices and maps, passed and returned, and called like functions. They cannot be compared or printed.
 - A closure captures the variables it names by reference, as Go does: it reads and assigns the variable itself, which lives as long as any closure holding it.
   - Each loop iteration binds fresh variables, so closures made in different iterations see different ones.

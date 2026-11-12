@@ -1,4 +1,5 @@
 const PREC = {
+  closure: -1,
   pipe: 0,
   or: 1,
   and: 2,
@@ -8,6 +9,7 @@ const PREC = {
   multiplicative: 6,
   unary: 7,
   postfix: 8,
+  block_closure: 9,
 };
 
 const ASSIGNMENT = ['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>='];
@@ -34,6 +36,7 @@ module.exports = grammar({
     [$.call_expression],
     [$._type_name, $.closure_parameter],
     [$.function_type_parameters, $.closure_parameters],
+    [$._type, $.struct_literal],
   ],
 
   supertypes: $ => [$._expression, $._statement, $._type, $._declaration],
@@ -454,12 +457,19 @@ module.exports = grammar({
 
     map_entry: $ => seq(field('key', $._expression), ':', field('value', $._expression)),
 
-    closure_expression: $ => seq(
-      'fn',
-      field('parameters', $.closure_parameters),
-      optional(seq('->', field('result', $._type))),
-      optional(seq('!', field('error', $._type))),
-      field('body', $.block),
+    closure_expression: $ => choice(
+      prec.dynamic(1, prec(PREC.block_closure, seq(
+        'fn',
+        field('parameters', $.closure_parameters),
+        optional(seq('->', field('result', $._type))),
+        optional(seq('!', field('error', $._type))),
+        field('body', $.block),
+      ))),
+      prec.right(PREC.closure, seq(
+        'fn',
+        field('parameters', $.closure_parameters),
+        field('body', $._expression),
+      )),
     ),
 
     closure_parameters: $ => seq('(', commaSep($.closure_parameter), ')'),

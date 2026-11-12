@@ -491,6 +491,10 @@ func (c *Checker) body(fn *ast.Func) {
 		fn.ParamLocals = append(fn.ParamLocals, local)
 	}
 	body := c.expr(fn.Body, c.okType())
+	if fn.RetType == nil {
+		c.handled(fn.Body.Tail, body)
+		fn.RetType = c.inferredResult(body)
+	}
 	if body.Kind == types.ResultKind && body != fn.RetType {
 		c.handled(fn.Body.Tail, body)
 	}
@@ -519,18 +523,19 @@ func (c *Checker) closure(e *ast.Closure, want *types.Type) {
 		switch {
 		case p.TypeName != nil:
 			fn.ParamTypes = append(fn.ParamTypes, c.resolve(p.TypeName))
-		case want != nil:
+		case want != nil && want.Params[i] != nil:
 			fn.ParamTypes = append(fn.ParamTypes, want.Params[i])
 		default:
 			c.fail(p.Pos, "cannot infer the type of parameter %s; annotate it", p.Name)
 		}
 	}
-	fn.RetType = types.Void
 	switch {
 	case e.Result != nil || e.Error != nil:
 		fn.RetType = c.resultOf(e.Result, e.Error)
-	case want != nil:
+	case want != nil && want.Ret != nil:
 		fn.RetType = want.Ret
+	case want == nil && !e.Inline:
+		fn.RetType = types.Void
 	}
 	e.Func = fn
 	if !c.abstract {
@@ -582,7 +587,23 @@ func (c *Checker) callback(fn *ast.Func, pos diag.Pos) {
 	fn.Callback = true
 }
 
+func (c *Checker) inferredResult(t *types.Type) *types.Type {
+	if t == types.Never {
+		return types.Void
+	}
+	return t
+}
+
+func (c *Checker) requireResult(pos diag.Pos, what string) {
+	if c.fn.RetType == nil {
+		c.fail(pos, "%s in a closure requires its result to be written", what)
+	}
+}
+
 func (c *Checker) okType() *types.Type {
+	if c.fn.RetType == nil {
+		return nil
+	}
 	if c.fn.RetType.Kind == types.ResultKind {
 		return c.fn.RetType.Ok
 	}
@@ -998,6 +1019,13 @@ func (c *Checker) target(pos diag.Pos, keyword, label string) (*loop, int) {
 }
 
 func (c *Checker) ret(s *ast.Return) {
+	if c.fn.RetType == nil {
+		c.fn.RetType = types.Void
+		if s.Value != nil {
+			c.fn.RetType = c.inferredResult(c.plain(s.Value, nil))
+		}
+		return
+	}
 	if s.Value == nil {
 		if c.okType() != types.Void {
 			c.fail(s.Pos, "missing return value of type %s", c.okType())
@@ -1014,6 +1042,7 @@ func (c *Checker) ret(s *ast.Return) {
 }
 
 func (c *Checker) failStmt(s *ast.Fail) {
+	c.requireResult(s.Pos, "fail")
 	ret := c.fn.RetType
 	if ret.Kind != types.ResultKind {
 		c.fail(s.Pos, "fail requires %s to declare an error type", c.subject())
@@ -2083,6 +2112,7 @@ func (c *Checker) errorResult(e ast.Expr, keyword string, pos diag.Pos, want *ty
 
 func (c *Checker) try(e *ast.Try, want *types.Type) {
 	c.leaving(e.Pos, "?")
+	c.requireResult(e.Pos, "?")
 	t := c.errorResult(e.X, "?", e.Pos, want)
 	ret := c.fn.RetType
 	if ret.Kind != types.ResultKind {
