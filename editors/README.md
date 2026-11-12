@@ -19,7 +19,9 @@ npx tree-sitter generate
 npx tree-sitter test
 ```
 
-`src/` is generated and committed because Zed and Neovim compile `src/parser.c` directly; regenerate it after every change to `grammar.js`. `queries/highlights.scm` is the highlight query; `zed/languages/low/highlights.scm` and `nvim/queries/low/highlights.scm` are copies of it, kept as plain files because Windows checks symlinks out as text, and `go test ./editors/` fails when either differs.
+`src/` is generated and committed because Zed and Neovim compile `src/parser.c` directly; regenerate it after every change to `grammar.js`. `queries/highlights.scm` is the highlight query; `zed/languages/low/highlights.scm` and `nvim/queries/low/highlights.scm` are copies of it.
+
+The repository holds no symlinks, because Windows checks them out as text. Files shared between editors are plain copies, listed in `copies` in `keywords_test.go`, and `go test ./editors/` fails when a copy differs from its source.
 
 ## VS Code
 

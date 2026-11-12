@@ -1,6 +1,7 @@
 package editors
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"regexp"
@@ -226,19 +227,24 @@ func TestGrammarsMatchLanguageTables(t *testing.T) {
 	}
 }
 
-func TestEditorHighlightsCopyTreeSitterQuery(t *testing.T) {
-	const source = "tree-sitter-low/queries/highlights.scm"
-	want, err := os.ReadFile(source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{"zed/languages/low/highlights.scm", "nvim/queries/low/highlights.scm"} {
-		have, err := os.ReadFile(path)
+var copies = []struct{ path, source string }{
+	{"zed/languages/low/highlights.scm", "tree-sitter-low/queries/highlights.scm"},
+	{"nvim/queries/low/highlights.scm", "tree-sitter-low/queries/highlights.scm"},
+	{"vscode/icon.png", "../site/icon-192.png"},
+}
+
+func TestEditorFilesCopyTheirSource(t *testing.T) {
+	for _, c := range copies {
+		want, err := os.ReadFile(c.source)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(have) != string(want) {
-			t.Errorf("%s differs from %s; copy it over", path, source)
+		have, err := os.ReadFile(c.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(have, want) {
+			t.Errorf("%s differs from %s; copy it over", c.path, c.source)
 		}
 	}
 }
