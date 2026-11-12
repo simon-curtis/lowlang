@@ -86,12 +86,20 @@ func TestDocumentStd(t *testing.T) {
 }
 
 type undocumented struct {
-	missing []string
+	missing   []string
+	malformed []string
 }
 
 func (u *undocumented) check(doc string, pos lexer.Pos, name string) {
 	if doc == "" {
 		u.missing = append(u.missing, fmt.Sprintf("%s: %s", pos, name))
+		return
+	}
+	for line := range strings.SplitSeq(doc, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "///") {
+			u.malformed = append(u.malformed, fmt.Sprintf("%s: %s", pos, name))
+			return
+		}
 	}
 }
 
@@ -148,5 +156,8 @@ func TestStdDocumented(t *testing.T) {
 	}
 	if len(u.missing) > 0 {
 		t.Errorf("%d public std items have no /// doc:\n%s", len(u.missing), strings.Join(u.missing, "\n"))
+	}
+	if len(u.malformed) > 0 {
+		t.Errorf("%d public std docs have a line starting with a second ///:\n%s", len(u.malformed), strings.Join(u.malformed, "\n"))
 	}
 }

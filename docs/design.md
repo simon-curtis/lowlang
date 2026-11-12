@@ -1826,18 +1826,35 @@ The UI library is staged under `ui/` until it moves into the standard library as
     2. QUIC (RFC 9000, 9001 and 9002) over UDP with the TLS 1.3 handshake, loss recovery and congestion control; HTTP/3 (RFC 9114) with QPACK (RFC 9204).
     3. WebRTC data channels: ICE with STUN, DTLS, SCTP over DTLS and the data channel establishment protocol; media over SRTP.
     4. Cryptography:
-        1. Hashing: BLAKE3, with keyed hashing, key derivation and extendable output.
-        2. Random generation: a ChaCha20 CSPRNG seeded from `getrandom` for `crypto.random`, and AES-256-CTR-DRBG (NIST SP 800-90A).
-        3. Post-quantum signatures: ML-DSA-44, ML-DSA-65 and ML-DSA-87 (FIPS 204), SLH-DSA (FIPS 205), and Falcon (FN-DSA).
-        4. HPKE (RFC 9180) with the DHKEM(X25519) and X25519MLKEM768 KEMs, HKDF-SHA-256 and the AES-256-GCM and ChaCha20-Poly1305 AEADs.
-        5. Shamir's secret sharing over GF(2^8).
-        6. VOPRF (RFC 9497) over ristretto255 and P-256.
-        7. Zero-knowledge proofs: Groth16 over BN254 and BLS12-381, Halo2 with KZG and IPA commitments, and STARKs over FRI.
-        8. Homomorphic encryption: BFV, CKKS and TFHE.
+        1. Random generation: a ChaCha20 CSPRNG seeded from `getrandom` for `crypto.random`, and AES-256-CTR-DRBG (NIST SP 800-90A).
+        2. Post-quantum signatures: ML-DSA-44, ML-DSA-65 and ML-DSA-87 (FIPS 204), SLH-DSA (FIPS 205), and Falcon (FN-DSA).
+        3. HPKE (RFC 9180) with the DHKEM(X25519) and X25519MLKEM768 KEMs, HKDF-SHA-256 and the AES-256-GCM and ChaCha20-Poly1305 AEADs.
+        4. Shamir's secret sharing over GF(2^8).
+        5. VOPRF (RFC 9497) over ristretto255 and P-256.
+        6. Zero-knowledge proofs: Groth16 over BN254 and BLS12-381, Halo2 with KZG and IPA commitments, and STARKs over FRI.
+        7. Homomorphic encryption: BFV, CKKS and TFHE.
+        8. Certificate status: OCSP (RFC 6960) and CRL checks in `std/crypto/x509` chain validation, and OCSP stapling in `std/tls`.
+        9. ACME (RFC 8555): account keys, orders, HTTP-01 and TLS-ALPN-01 challenges, and renewal before expiry, feeding certificates to `std/tls` servers.
+    5. DNS: search domains and `ndots` from `/etc/resolv.conf`, TCP fallback on truncated replies, CNAME chasing, and MX, TXT, SRV, CAA and PTR lookups over a message encoder and decoder.
+    6. Hostnames: IDNA (UTS #46) with Punycode (RFC 3492), and an embedded public suffix list that the HTTP client's cookie jar checks domains against.
+    7. gRPC: unary and streaming clients and servers over the HTTP/2 stack with status codes, deadlines, metadata and compression; `std/otel` exports through it.
+    8. `std/protobuf`: `serialize[T]` and `deserialize[T]` through serde, and a `.proto` parser that generates Low types.
+    9. Database drivers: MySQL and MariaDB over the client/server protocol, plain or over TLS; MongoDB over `OP_MSG` with `std/bson`.
+    10. Messaging clients: MQTT 3.1.1 and 5, AMQP 0-9-1, Kafka and NATS.
+    11. SSH: the transport (RFC 4253), user authentication with keys and passwords, the connection protocol with sessions and port forwarding, clients and servers, and SFTP.
+    12. D-Bus: the wire format over Unix sockets, the session and system buses, method calls, signals and properties.
+    13. System logging and time: syslog (RFC 5424) and the journald native protocol as `std/log` destinations; an SNTP client (RFC 4330).
+    14. `std/html`: a WHATWG tree builder, CSS selector queries and an allow-list sanitizer.
+    15. Markdown: CommonMark with GitHub tables, task lists, strikethrough and autolinks, rendered to HTML.
+    16. Columnar and row formats: Avro with schema resolution and object container files; Parquet and Arrow IPC readers and writers.
+    17. `std/unicode`: grapheme cluster, word and sentence segmentation (UAX #29) and line breaking (UAX #14) from embedded Unicode tables.
+    18. Locales: CLDR plural rules, number, currency, date and time formatting, and collation (UTS #10); `std/time/humanize` and `std/text/number` take a locale.
+    19. Numerics: statistics (mean, median, variance, standard deviation, percentiles, histograms), complex numbers, dense matrices with LU and QR decomposition and linear solves, and FFT.
+    20. `std/file` memory-mapped files with `msync` and `madvise`; `std/os` user and group lookup, `getrlimit` and `setrlimit`, and cgroup v2 CPU and memory limits.
 2. GPU UI library with GPUI's renderer and platform layer and a signal-based state model, Linux first:
     1. A Wayland window through libwayland-client, with bindings generated from protocol XML; a Vulkan swapchain through `VK_KHR_wayland_surface`; a clear colour.
     2. A scene of GPU primitives (shadows, quads with rounded corners and borders, paths, underlines, monochrome, subpixel and polychrome sprites) drawn by GLSL shaders compiled to embedded SPIR-V. Primitives are sorted by draw order, batched by kind and atlas texture, and clipped by content masks.
-    3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, line layout, Unicode grapheme and line-break segmentation from embedded Unicode tables.
+    3. Text: font discovery with an embedded fallback font, OpenType parsing, rasterizing into a glyph atlas, shaping, and line layout over `std/unicode` segmentation.
     4. A retained element tree. Components run once at mount and build elements; only the closures that read a signal run again.
     5. `Signal[T]`, `Memo[T: Eq]` and effects. Reads are tracked through a current-observer scope on the UI thread. A memo whose new value is equal to the old one does not propagate.
     6. Reactive structure through explicit containers: a dynamic branch, and a keyed dynamic list.
