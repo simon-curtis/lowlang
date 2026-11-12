@@ -16,6 +16,7 @@ import (
 
 	"lowlang/internal/asm"
 	"lowlang/internal/link"
+	"lowlang/internal/target"
 )
 
 const noUnwindSection = ".eh_frame"
@@ -127,7 +128,7 @@ func TestDynamicMatchesGNULd(t *testing.T) {
 	requireTools(t)
 	for _, path := range dynamicPrograms(t) {
 		t.Run(path, func(t *testing.T) {
-			source, libraries, err := generate(path)
+			source, libraries, err := generate(path, target.Linux)
 			if err != nil {
 				t.Skipf("compile: %v", err)
 			}
@@ -425,7 +426,7 @@ func TestDynamicProgramsLoad(t *testing.T) {
 	}
 	for _, path := range dynamicPrograms(t) {
 		t.Run(path, func(t *testing.T) {
-			source, libraries, err := generate(path)
+			source, libraries, err := generate(path, target.Linux)
 			if err != nil {
 				t.Skipf("compile: %v", err)
 			}

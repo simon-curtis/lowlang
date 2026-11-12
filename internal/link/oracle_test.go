@@ -66,13 +66,13 @@ func corpusPaths(t *testing.T) []string {
 	return paths
 }
 
-func generate(path string) (source string, libraries []string, err error) {
+func generate(path string, platform target.OS) (source string, libraries []string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("compiler panic: %v", r)
 		}
 	}()
-	unit, err := compiler.Analyse(filepath.Join(repoRoot(), path), target.Linux)
+	unit, err := compiler.Analyse(filepath.Join(repoRoot(), path), platform)
 	if err != nil {
 		return "", nil, err
 	}
@@ -124,7 +124,7 @@ func TestMatchesGNULd(t *testing.T) {
 	requireTools(t)
 	for _, path := range corpusPaths(t) {
 		t.Run(path, func(t *testing.T) {
-			source, libraries, err := generate(path)
+			source, libraries, err := generate(path, target.Linux)
 			if err != nil {
 				t.Skipf("compile: %v", err)
 			}
