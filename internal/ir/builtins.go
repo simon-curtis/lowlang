@@ -98,6 +98,9 @@ func (b *builder) builtin(e *ast.Call) []*Value {
 func (b *builder) convertCall(e *ast.Call) []*Value {
 	from := e.Args[0].TypeOf()
 	word := b.word(e.Args[0])
+	if from.Kind == types.RawKind || e.Type.Kind == types.RawKind {
+		return []*Value{word}
+	}
 	return []*Value{b.convert(word, from, e.Type)}
 }
 

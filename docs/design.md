@@ -623,6 +623,7 @@ let pixels = view(buf, 64)
 - C signatures use C types: integers, floats, `bool`, `ptr`, `ptr[T]`, and `extern struct`s by value.
 - A `mut` parameter passes the address of a Low place for the duration of the call, as C# passes `ref`. C may read and write through it.
 - `ptr[T]` is a nullable pointer to C memory. `ptr` is `void*` and converts to and from any `ptr[T]`. `null` takes its type from context. `==` and `!=` compare addresses.
+- `ptr(n)` makes an address from an `i64` or `u64`, and `i64(p)` and `u64(p)` give a `ptr`'s address as a number, for C values that carry either, such as a Win32 `LPARAM`.
 - `view(p, n)` is a `[]T` over `n` elements at `p`, bounds-checked like any slice. `load(p)` and `store(p, v)` read and write one `T`.
 - `cstr(s)` is a NUL-terminated copy of a string. `str(p)` copies a NUL-terminated `ptr[u8]` back.
 - `extern struct` has C layout: fields in order at their natural alignment, size rounded to the largest alignment. Its fields must have C types. It is used like any struct, and its fields are read and written at their own width.

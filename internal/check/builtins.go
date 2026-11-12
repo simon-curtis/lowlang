@@ -206,7 +206,7 @@ func derivedBuiltins() []*Builtin {
 func typeBuiltins() []*Builtin {
 	value := []string{"value"}
 	list := []*Builtin{
-		{Name: "ptr", Kind: TypeBuiltin, resolve: (*Checker).resolveRaw},
+		{ID: builtin.Convert, Name: "ptr", Kind: TypeBuiltin, Params: value, handler: bare((*Checker).ptrConversion), resolve: (*Checker).resolveRaw},
 		{ID: builtin.Chan, Name: "chan", Kind: TypeBuiltin, Params: []string{"capacity"}, Optional: 1, TypeArgs: 1, construct: (*Checker).makeChan, resolve: (*Checker).resolveChan},
 	}
 	for _, declared := range types.BuiltinTypes() {
@@ -223,6 +223,10 @@ func typeBuiltins() []*Builtin {
 		list = append(list, entry)
 	}
 	return list
+}
+
+func (c *Checker) ptrConversion(e *ast.Call) {
+	c.convert(e, c.universe.Raw(nil))
 }
 
 func converter(to *types.Type) builtinHandler {

@@ -1785,10 +1785,20 @@ func (c *Checker) math(b *Builtin, e *ast.Call, want *types.Type) {
 
 func (c *Checker) convert(e *ast.Call, to *types.Type) {
 	t := c.plain(e.Args[0], nil)
-	if !t.Number() {
+	if !convertible(t, to) {
 		c.fail(e.Args[0].Position(), "cannot convert %s to %s", t, to)
 	}
 	e.Builtin, e.Type = builtin.Convert, to
+}
+
+func convertible(from, to *types.Type) bool {
+	switch {
+	case to.Kind == types.RawKind:
+		return from == types.I64 || from == types.U64
+	case from.Kind == types.RawKind:
+		return to == types.I64 || to == types.U64
+	}
+	return from.Number()
 }
 
 func (c *Checker) variantCall(e *ast.Call, sel *ast.Selector, t *types.Type) {
