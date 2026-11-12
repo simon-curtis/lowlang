@@ -1,4 +1,6 @@
-import std/io
+import std/bits
+import std/compress/codec
+import std/math
 
 struct Matches {
     lens: []i64
@@ -12,8 +14,7 @@ struct Lz {
     range: u32
     cache: u8
     cache_size: i64
-    out: []u8
-    olen: i64
+    out: *codec.Buffer
     mark: i64
     buf: []u8
     base: i64
@@ -42,7 +43,7 @@ struct Lz {
     need_dictionary: bool
     need_properties: bool
     need_state: bool
-    emit: fn([]u8) ! io.Error
+    emit: fn([]u8)
 }
 
 fn matches() -> *Matches {
@@ -62,7 +63,7 @@ fn preset_nice(level: i64) -> i64 {
 }
 
 fn clamp_level(level: i64) -> i64 {
-    if level < 0 { 0 } else if level > 9 { 9 } else { level }
+    math.clamp(level, 0, 9)
 }
 
 fn fitted_dict(level: i64, hint: i64) -> i64 {
@@ -85,16 +86,16 @@ fn lz_new(level: i64, dict: i64, hint: i64, chunked: bool) -> *Lz {
         prev_cap = prev_cap << 1
     }
     let head_bits: u32 = if level <= 1 { 16 } else if level <= 4 { 18 } else { 20 }
-    let mark = if chunked { 6 } else { 0 }
-    let out_size = if chunked { 65536 + 1024 } else { 65536 }
+    let mark = if chunked { 6 } else { 13 }
+    let out = codec.buffer(if chunked { 65536 + 1024 } else { 65536 })
+    out.len = mark
     new(Lz {
         model: model(3, 0, 2)
         low: 0
         range: 0xFFFFFFFF
         cache: 0
         cache_size: 1
-        out: __make(out_size)
-        olen: mark
+        out
         mark
         buf: []
         base: 0
@@ -127,22 +128,12 @@ fn lz_new(level: i64, dict: i64, hint: i64, chunked: bool) -> *Lz {
     })
 }
 
-fn put_out(lz: *Lz, b: u8) {
-    if lz.olen == lz.out.len {
-        let grown: []u8 = __make(lz.out.len * 2)
-        __memmove(grown, lz.out)
-        lz.out = grown
-    }
-    lz.out[lz.olen] = b
-    lz.olen += 1
-}
-
 fn shift_low(lz: *Lz) {
     if lz.low < 0xFF000000 || lz.low >= 0x100000000 {
         let carry = u8(lz.low >> 32)
         var temp = lz.cache
         for {
-            put_out(lz, temp + carry)
+            codec.put_byte(lz.out, temp + carry)
             temp = 0xFF
             lz.cache_size -= 1
             if lz.cache_size == 0 {
@@ -160,7 +151,7 @@ fn start_encoder(lz: *Lz) {
     lz.range = 0xFFFFFFFF
     lz.cache = 0
     lz.cache_size = 1
-    lz.olen = lz.mark
+    lz.out.len = lz.mark
 }
 
 fn flush_encoder(lz: *Lz) {
@@ -241,12 +232,7 @@ fn distance_slot(dist: i64) -> i64 {
     if dist < 4 {
         return dist
     }
-    var n = 0
-    var t = dist
-    for t >= 2 {
-        t = t >> 1
-        n += 1
-    }
+    let n = bits.bit_length(u64(dist)) - 1
     2 * n + (dist >> (n - 1) & 1)
 }
 
@@ -396,10 +382,7 @@ fn record(into: *Matches, len: i64, dist: i64) {
 fn find(lz: *Lz, p: i64, into: *Matches) {
     catch_up(lz, p)
     into.count = 0
-    var max_len = lz.end - p
-    if max_len > 273 {
-        max_len = 273
-    }
+    let max_len = math.min(lz.end - p, 273)
     if max_len < 4 {
         lz.hashed = p + 1
         return
@@ -474,10 +457,7 @@ fn choose_literal(lz: *Lz) {
 fn choose(lz: *Lz) {
     let pos = lz.pos
     let m = lz.model
-    var avail = lz.end - pos
-    if avail > 273 {
-        avail = 273
-    }
+    let avail = math.min(lz.end - pos, 273)
     var cur = lz.cur
     if lz.next_at == pos {
         lz.cur = lz.next
@@ -545,7 +525,7 @@ fn choose(lz: *Lz) {
             return
         }
     }
-    let limit = if main_len - 1 > 2 { main_len - 1 } else { 2 }
+    let limit = math.max(main_len - 1, 2)
     for i in 0..4 {
         if rep_length(lz, pos + 1, rep_distance(m, i), limit) >= limit {
             choose_literal(lz)
@@ -583,28 +563,25 @@ fn open_chunk(lz: *Lz) {
     lz.chunk_open = true
 }
 
-fn close_chunk(lz: *Lz) ! io.Error {
+fn close_chunk(lz: *Lz) {
     lz.chunk_open = false
     flush_encoder(lz)
     let unpacked = lz.pos - lz.chunk_start
-    let packed = lz.olen - lz.mark
+    let packed = lz.out.len - lz.mark
     if unpacked == 0 {
         return
     }
-    let out = lz.out
+    let out = lz.out.data
     if packed >= unpacked {
         var at = lz.chunk_start
         for at < lz.pos {
-            var n = lz.pos - at
-            if n > 65536 {
-                n = 65536
-            }
+            let n = math.min(lz.pos - at, 65536)
             out[0] = if lz.need_dictionary { 1 } else { 2 }
             out[1] = u8((n - 1) >> 8)
             out[2] = u8(n - 1)
             __memmove(out[3..3 + n], lz.buf[at..at + n])
             lz.need_dictionary = false
-            lz.emit(out[..3 + n])?
+            lz.emit(out[..3 + n])
             at += n
         }
         lz.need_state = true
@@ -625,17 +602,17 @@ fn close_chunk(lz: *Lz) ! io.Error {
     lz.need_dictionary = false
     lz.need_properties = false
     lz.need_state = false
-    lz.emit(out[start..lz.olen])?
+    lz.emit(out[start..lz.out.len])
 }
 
-fn pump(lz: *Lz, final: bool) ! io.Error {
+fn pump(lz: *Lz, final: bool) {
     let stop = if final { lz.end } else { lz.end - 274 }
     for lz.pos < stop {
         if lz.chunked {
             if !lz.chunk_open {
                 open_chunk(lz)
-            } else if lz.pos - lz.chunk_start > (1 << 21) - 274 || lz.olen - lz.mark + lz.cache_size > 65536 - 64 {
-                close_chunk(lz)?
+            } else if lz.pos - lz.chunk_start > (1 << 21) - 274 || lz.out.len - lz.mark + lz.cache_size > 65536 - 64 {
+                close_chunk(lz)
                 continue
             }
         }
@@ -670,17 +647,8 @@ fn grow(lz: *Lz, size: i64) {
 
 fn make_space(lz: *Lz) {
     if lz.buf.len < lz.window {
-        var n = lz.buf.len * 2
-        if n < lz.hint {
-            n = lz.hint
-        }
-        if n < 65536 {
-            n = 65536
-        }
-        if n > lz.window {
-            n = lz.window
-        }
-        grow(lz, n)
+        let wanted = math.max(math.max(lz.buf.len * 2, lz.hint), 65536)
+        grow(lz, math.min(wanted, lz.window))
         return
     }
     var keep = lz.pos - lz.dict
@@ -706,7 +674,7 @@ fn make_space(lz: *Lz) {
     rebase(lz.prev, shift)
 }
 
-fn feed(lz: *Lz, data: []u8) ! io.Error {
+fn feed(lz: *Lz, data: []u8) {
     var rest = data
     for rest.len > 0 {
         if lz.end == lz.buf.len {
@@ -715,13 +683,13 @@ fn feed(lz: *Lz, data: []u8) ! io.Error {
         let n = __memmove(lz.buf[lz.end..], rest)
         lz.end += n
         rest = rest[n..]
-        pump(lz, false)?
+        pump(lz, false)
     }
 }
 
-fn finish_chunks(lz: *Lz) ! io.Error {
-    pump(lz, true)?
+fn finish_chunks(lz: *Lz) {
+    pump(lz, true)
     if lz.chunk_open {
-        close_chunk(lz)?
+        close_chunk(lz)
     }
 }

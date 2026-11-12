@@ -1,10 +1,17 @@
+import std/bits
+import std/compress/codec
 import std/io
+import std/math
 
 /// A streaming bzip2 encoder made by `encoder`.
 ///
 /// `encode` takes input in any chunking and `finish` ends the stream. Each block holds up to `level * 100000` bytes of run-length encoded input. A chunk is valid only during the call to `sink`.
 pub struct Encoder {
+    core: *Compressor
     sink: fn([]u8) ! io.Error
+}
+
+struct Compressor {
     level: i64
     block: []u8
     len: i64
@@ -30,10 +37,13 @@ fn table_iterations() -> i64 {
 ///
 /// `level` is clamped to `1..9` and sets the block size to `level * 100000` bytes.
 pub fn encoder(level: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
-    let l = if level < 1 { 1 } else if level > 9 { 9 } else { level }
+    new(Encoder { core: compressor(level, 65536), sink })
+}
+
+fn compressor(level: i64, capacity: i64) -> *Compressor {
+    let l = math.clamp(level, 1, 9)
     let size = l * block_unit()
-    new(Encoder {
-        sink
+    new(Compressor {
         level: l
         block: io.buffer(size)
         len: 0
@@ -43,48 +53,65 @@ pub fn encoder(level: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
         crc: crc_new()
         combined: 0
         started: false
-        bits: bit_out()
+        bits: bit_out(capacity)
         work: work()
     })
+}
+
+fn drain(e: *Encoder) ! io.Error {
+    let ready = codec.drain(e.core.bits.out)
+    if ready.len > 0 {
+        e.sink(ready)?
+    }
 }
 
 /// Adds `data` to the current block and passes each completed block to the encoder's `sink`.
 ///
 /// Input is buffered until a block is full, so a call can produce no output. Fails with any error `sink` returns.
 pub fn encode(e: *Encoder, data: []u8) ! io.Error {
-    for b in data {
-        if e.run_len > 0 && b == e.run_byte && e.run_len < 255 {
-            e.run_len += 1
-            continue
-        }
-        end_run(e)?
-        e.run_byte = b
-        e.run_len = 1
+    var rest = data
+    for rest.len > 0 {
+        let n = math.min(rest.len, 65536)
+        feed(e.core, rest[..n])
+        drain(e)?
+        rest = rest[n..]
     }
 }
 
-fn end_run(e: *Encoder) ! io.Error {
-    let n = e.run_len
+fn feed(c: *Compressor, data: []u8) {
+    for b in data {
+        if c.run_len > 0 && b == c.run_byte && c.run_len < 255 {
+            c.run_len += 1
+            continue
+        }
+        end_run(c)
+        c.run_byte = b
+        c.run_len = 1
+    }
+}
+
+fn end_run(c: *Compressor) {
+    let n = c.run_len
     if n == 0 {
         return
     }
-    e.run_len = 0
-    crc_byte(mut e.crc, e.run_byte, n)
+    c.run_len = 0
+    crc_byte(mut c.crc, c.run_byte, n)
     if n < 4 {
         for _ in 0..n {
-            e.block[e.len] = e.run_byte
-            e.len += 1
+            c.block[c.len] = c.run_byte
+            c.len += 1
         }
     } else {
         for _ in 0..4 {
-            e.block[e.len] = e.run_byte
-            e.len += 1
+            c.block[c.len] = c.run_byte
+            c.len += 1
         }
-        e.block[e.len] = u8(n - 4)
-        e.len += 1
+        c.block[c.len] = u8(n - 4)
+        c.len += 1
     }
-    if e.len >= e.limit {
-        write_block(e)?
+    if c.len >= c.limit {
+        write_block(c)
     }
 }
 
@@ -92,44 +119,48 @@ fn end_run(e: *Encoder) ! io.Error {
 ///
 /// Fails with any error `sink` returns.
 pub fn finish(e: *Encoder) ! io.Error {
-    end_run(e)?
-    if e.len > 0 {
-        write_block(e)?
+    close(e.core)
+    drain(e)?
+}
+
+fn close(c: *Compressor) {
+    end_run(c)
+    if c.len > 0 {
+        write_block(c)
     }
-    start_stream(e)
-    let b = e.bits
+    start_stream(c)
+    let b = c.bits
     put(b, 0x177245, 24)
     put(b, 0x385090, 24)
-    put(b, i64(e.combined), 32)
+    put(b, i64(c.combined), 32)
     align_out(b)
-    drain(b, e.sink)?
 }
 
-fn start_stream(e: *Encoder) {
-    if e.started {
+fn start_stream(c: *Compressor) {
+    if c.started {
         return
     }
-    e.started = true
-    put(e.bits, 0x425A68, 24)
-    put(e.bits, 0x30 + e.level, 8)
+    c.started = true
+    put(c.bits, 0x425A68, 24)
+    put(c.bits, 0x30 + c.level, 8)
 }
 
-fn write_block(e: *Encoder) ! io.Error {
-    start_stream(e)
-    let n = e.len
-    let sum = crc_sum(e.crc)
-    e.combined = rotate_crc(e.combined, sum)
-    crc_reset(mut e.crc)
-    e.len = 0
-    let w = e.work
-    let data = e.block
+fn write_block(c: *Compressor) {
+    start_stream(c)
+    let n = c.len
+    let sum = crc_sum(c.crc)
+    c.combined = bits.rotl32(c.combined, 1) ^ sum
+    crc_reset(mut c.crc)
+    c.len = 0
+    let w = c.work
+    let data = c.block
     reserve_work(w, n)
     let orig = transform(w, data, n)
     let present = io.buffer(256)
     let map = io.buffer(256)
     let used = symbol_map(data, n, present, map)
     let count = move_to_front(w, n, map, used)
-    let b = e.bits
+    let b = c.bits
     put(b, 0x314159, 24)
     put(b, 0x265359, 24)
     put(b, i64(sum), 32)
@@ -144,7 +175,6 @@ fn write_block(e: *Encoder) ! io.Error {
     put_selectors(b, w, selectors)
     put_tables(b, w, groups, alpha)
     put_symbols(b, w, count)
-    drain(b, e.sink)?
 }
 
 fn symbol_map(data: []u8, n: i64, present: []u8, map: []u8) -> i64 {
@@ -291,7 +321,7 @@ fn fit_tables(w: *Work, count: i64, alpha: i64, groups: i64) -> i64 {
         selectors = 0
         var start = 0
         for start < count {
-            let end = if start + group_size() < count { start + group_size() } else { count }
+            let end = math.min(start + group_size(), count)
             var best = 0
             for t in 0..groups {
                 var c = 0
@@ -364,7 +394,7 @@ fn put_symbols(b: *BitOut, w: *Work, count: i64) {
     var start = 0
     var g = 0
     for start < count {
-        let end = if start + group_size() < count { start + group_size() } else { count }
+        let end = math.min(start + group_size(), count)
         let row = i64(w.selectors[g]) * max_symbols()
         for i in start..end {
             let sym = i64(w.symbols[i])
@@ -379,15 +409,9 @@ fn put_symbols(b: *BitOut, w: *Work, count: i64) {
 ///
 /// `level` is clamped to `1..9` and sets the block size to `level * 100000` bytes.
 pub fn compress(data: []u8, level: i64) -> []u8 {
-    let c = new(Collector { data: __make(data.len / 2 + 64), len: 0 })
-    let sink: fn([]u8) ! io.Error = fn(chunk) { collect(c, chunk) }
-    let e = encoder(level, sink)
-    encode(e, data) catch {
-        _ => {}
-    }
-    finish(e) catch {
-        _ => {}
-    }
-    c.data[..c.len]
+    let c = compressor(level, data.len / 2 + 64)
+    feed(c, data)
+    close(c)
+    codec.contents(c.bits.out)
 }
 

@@ -1,81 +1,125 @@
+import std/compress/codec
 import std/io
+import std/math
 import checksum = std/hash
 
 /// A streaming xz encoder made by `encoder`.
 ///
 /// `encode` takes input in any chunking and `finish` writes the end of the stream. The file holds at most one block of LZMA2 chunks with a CRC-64 integrity check. After `finish`, `encode` and `finish` fail with `Invalid`. A chunk is valid only during the call to `sink`.
 pub struct Encoder {
-    lz: *Lz
+    core: *Packer
     sink: fn([]u8) ! io.Error
+    finished: bool
+}
+
+struct Packer {
+    lz: *Lz
+    res: *codec.Buffer
     crc: *checksum.Crc64
     total: i64
     compressed: i64
     stream_started: bool
     block_started: bool
-    finished: bool
-}
-
-fn put_vli(mut b: []u8, v: i64) {
-    var rest = v
-    for rest >= 0x80 {
-        push(mut b, u8(rest & 0x7F | 0x80))
-        rest = rest >> 7
-    }
-    push(mut b, u8(rest))
 }
 
 fn append_crc32(mut b: []u8, from: i64) {
     let crc = checksum.crc32(b[from..])
-    io.append(mut b, le_bytes(u64(crc), 4))
+    io.put_le32(mut b, i64(crc))
 }
 
-fn start_stream(e: *Encoder) ! io.Error {
-    if e.stream_started {
+fn start_stream(p: *Packer) {
+    if p.stream_started {
         return
     }
-    e.stream_started = true
+    p.stream_started = true
     var h: []u8 = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0, 0, 4]
     append_crc32(mut h, 6)
-    e.sink(h)?
+    codec.put_bytes(p.res, h)
 }
 
-fn start_block(e: *Encoder) ! io.Error {
-    if e.block_started {
+fn start_block(p: *Packer) {
+    if p.block_started {
         return
     }
-    start_stream(e)?
-    e.block_started = true
-    var h: []u8 = [2, 0, 0x21, 1, dictionary_byte(e.lz.dict), 0, 0, 0]
+    start_stream(p)
+    p.block_started = true
+    var h: []u8 = [2, 0, 0x21, 1, dictionary_byte(p.lz.dict), 0, 0, 0]
     append_crc32(mut h, 0)
-    e.sink(h)?
+    codec.put_bytes(p.res, h)
 }
 
-fn make_encoder(level: i64, sink: fn([]u8) ! io.Error, hint: i64) -> *Encoder {
+fn packer(level: i64, hint: i64, capacity: i64) -> *Packer {
     let l = clamp_level(level)
     let lz = lz_new(l, fitted_dict(l, hint), hint, true)
-    let e = new(Encoder {
+    let res = codec.buffer(capacity)
+    let p = new(Packer {
         lz
-        sink
+        res
         crc: checksum.crc64_new()
         total: 0
         compressed: 0
         stream_started: false
         block_started: false
-        finished: false
     })
     lz.emit = fn(chunk) {
-        start_block(e)?
-        e.compressed += chunk.len
-        e.sink(chunk)?
+        start_block(p)
+        p.compressed += chunk.len
+        codec.put_bytes(p.res, chunk)
     }
-    e
+    p
+}
+
+fn pack(p: *Packer, data: []u8) {
+    checksum.crc64_update(p.crc, data)
+    p.total += data.len
+    feed(p.lz, data)
+}
+
+fn close(p: *Packer) {
+    finish_chunks(p.lz)
+    start_stream(p)
+    let res = p.res
+    var index: []u8 = [0]
+    if p.total > 0 {
+        let end: []u8 = [0]
+        p.lz.emit(end)
+        for _ in 0..(4 - p.compressed % 4) % 4 {
+            codec.put_byte(res, 0)
+        }
+        codec.put_le(res, i64(checksum.crc64_sum(p.crc)), 8)
+        codec.put_varint(mut index, 1)
+        codec.put_varint(mut index, u64(12 + p.compressed + 8))
+        codec.put_varint(mut index, u64(p.total))
+    } else {
+        codec.put_varint(mut index, 0)
+    }
+    for index.len % 4 != 0 {
+        push(mut index, 0)
+    }
+    append_crc32(mut index, 0)
+    codec.put_bytes(res, index)
+    var footer: []u8 = []
+    io.put_le32(mut footer, index.len / 4 - 1)
+    push(mut footer, 0)
+    push(mut footer, 4)
+    codec.put_le(res, i64(checksum.crc32(footer)), 4)
+    codec.put_bytes(res, footer)
+    codec.put_byte(res, 0x59)
+    codec.put_byte(res, 0x5A)
+}
+
+fn drain(e: *Encoder) ! io.Error {
+    let ready = codec.drain(e.core.res)
+    if ready.len > 0 {
+        e.sink(ready)?
+    }
 }
 
 /// Returns an encoder that writes an xz file to `sink`.
 ///
 /// `level` is clamped to `0..9` and selects the dictionary size, from 256 KiB at `0` to 64 MiB at `9`, and the match search effort.
 pub fn encoder(level: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
-    make_encoder(level, sink, -1)
+    new(Encoder { core: packer(level, -1, 65536), sink, finished: false })
 }
 
 /// Compresses `data` and passes the compressed bytes that are ready to the encoder's `sink`.
@@ -85,9 +129,13 @@ pub fn encode(e: *Encoder, data: []u8) ! io.Error {
     if e.finished {
         fail Invalid
     }
-    checksum.crc64_update(e.crc, data)
-    e.total += data.len
-    feed(e.lz, data)?
+    var rest = data
+    for rest.len > 0 {
+        let n = math.min(rest.len, 65536)
+        pack(e.core, rest[..n])
+        drain(e)?
+        rest = rest[n..]
+    }
 }
 
 /// Writes the buffered input, the block padding and check, the index and the stream footer.
@@ -98,52 +146,18 @@ pub fn finish(e: *Encoder) ! io.Error {
         fail Invalid
     }
     e.finished = true
-    finish_chunks(e.lz)?
-    start_stream(e)?
-    var tail: []u8 = []
-    var index: []u8 = [0]
-    if e.total > 0 {
-        let end: []u8 = [0]
-        e.lz.emit(end)?
-        for _ in 0..(4 - e.compressed % 4) % 4 {
-            push(mut tail, 0)
-        }
-        io.append(mut tail, le_bytes(checksum.crc64_sum(e.crc), 8))
-        put_vli(mut index, 1)
-        put_vli(mut index, 12 + e.compressed + 8)
-        put_vli(mut index, e.total)
-    } else {
-        put_vli(mut index, 0)
-    }
-    for index.len % 4 != 0 {
-        push(mut index, 0)
-    }
-    append_crc32(mut index, 0)
-    io.append(mut tail, index)
-    var footer: []u8 = le_bytes(u64(index.len / 4 - 1), 4)
-    push(mut footer, 0)
-    push(mut footer, 4)
-    io.append(mut tail, le_bytes(u64(checksum.crc32(footer)), 4))
-    io.append(mut tail, footer)
-    push(mut tail, 0x59)
-    push(mut tail, 0x5A)
-    e.sink(tail)?
+    close(e.core)
+    drain(e)?
 }
 
 /// Returns `data` compressed as an xz file.
 ///
 /// `level` is clamped to `0..9`; the dictionary is reduced for inputs smaller than it.
 pub fn compress(data: []u8, level: i64) -> []u8 {
-    let out = out_buffer()
-    let sink: fn([]u8) ! io.Error = fn(chunk) { append_out(out, chunk) }
-    let e = make_encoder(level, sink, data.len)
-    encode(e, data) catch {
-        _ => {}
-    }
-    finish(e) catch {
-        _ => {}
-    }
-    out_bytes(out)
+    let p = packer(level, data.len, data.len / 2 + 64)
+    pack(p, data)
+    close(p)
+    codec.contents(p.res)
 }
 
 /// Returns `data` compressed in the `.lzma` format: a 13 byte header of properties, dictionary size and uncompressed size, then an LZMA stream.
@@ -153,18 +167,12 @@ pub fn lzma_compress(data: []u8, level: i64) -> []u8 {
     let l = clamp_level(level)
     let dict = fitted_dict(l, data.len)
     let lz = lz_new(l, dict, data.len, false)
-    feed(lz, data) catch {
-        _ => {}
-    }
-    pump(lz, true) catch {
-        _ => {}
-    }
+    feed(lz, data)
+    pump(lz, true)
     flush_encoder(lz)
-    var out: []u8 = [properties_byte(lz.model)]
-    io.append(mut out, le_bytes(u64(dict), 4))
-    io.append(mut out, le_bytes(u64(data.len), 8))
-    let body: []u8 = __make(out.len + lz.olen)
-    __memmove(body, out)
-    __memmove(body[out.len..], lz.out[..lz.olen])
-    body
+    let out = lz.out.data
+    out[0] = properties_byte(lz.model)
+    io.set_le32(out, 1, dict)
+    io.set_le64(out, 5, data.len)
+    codec.contents(lz.out)
 }
