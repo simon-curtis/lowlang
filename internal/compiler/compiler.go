@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"syscall"
 
 	"lowlang/internal/asm"
@@ -86,17 +85,15 @@ func Assemble(ctx context.Context, asm, object string, flags ...string) error {
 }
 
 func Link(ctx context.Context, source, output string, prog *ir.Program) error {
-	if prog.OS == target.Windows {
-		return linkWindows(ctx, source, output)
-	}
-	object, err := asm.Assemble(source, asm.Options{AlignBranches: true})
+	windows := prog.OS == target.Windows
+	object, err := asm.Assemble(source, asm.Options{AlignBranches: !windows, ClangLayout: windows})
 	if err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	image, err := linkImage(object, prog.Libraries)
+	image, err := linkImage(object, prog)
 	if err != nil {
 		return err
 	}
@@ -111,11 +108,14 @@ func Link(ctx context.Context, source, output string, prog *ir.Program) error {
 
 var libraryResolver = link.Resolver{Dirs: link.SystemDirs}
 
-func linkImage(object *asm.Object, libraries []string) ([]byte, error) {
-	if len(libraries) == 0 {
+func linkImage(object *asm.Object, prog *ir.Program) ([]byte, error) {
+	if prog.OS == target.Windows {
+		return link.PE(object)
+	}
+	if len(prog.Libraries) == 0 {
 		return link.Static(object)
 	}
-	resolved, err := libraryResolver.Resolve(libraries)
+	resolved, err := libraryResolver.Resolve(prog.Libraries)
 	if err != nil {
 		return nil, err
 	}
@@ -126,27 +126,6 @@ func writeWhileForksWait(path string, data []byte) error {
 	syscall.ForkLock.RLock()
 	defer syscall.ForkLock.RUnlock()
 	return os.WriteFile(path, data, 0o755)
-}
-
-const windowsStack = 8 << 20
-
-func linkWindows(ctx context.Context, asm, output string) error {
-	dir, err := os.MkdirTemp("", "low-build-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(dir)
-	source := filepath.Join(dir, "main.s")
-	if err := os.WriteFile(source, []byte(asm), 0o644); err != nil {
-		return err
-	}
-	object := filepath.Join(dir, "main.obj")
-	if err := tool(ctx, "clang", "--target=x86_64-pc-windows-msvc", "-c", "-o", object, source); err != nil {
-		return err
-	}
-	return tool(ctx, "lld-link",
-		"/nologo", "/brepro", "/nodefaultlib", "/entry:start", "/subsystem:console",
-		fmt.Sprintf("/stack:%d", windowsStack), fmt.Sprintf("/out:%s", output), object)
 }
 
 func LinkAt(ctx context.Context, asm, output, against string, address uint64) error {

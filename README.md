@@ -18,7 +18,7 @@ fn main() {
 
 ## Usage
 
-Requires Go. `low dev` also needs binutils (`as`, `ld`). The windows/amd64 target needs `clang` and `lld-link`.
+Requires Go. `low dev` also needs binutils (`as`, `ld`).
 
 ```sh
 go build -o low ./cmd/low
