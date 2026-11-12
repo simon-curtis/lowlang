@@ -2,7 +2,7 @@
 
 - Zed and Neovim highlight with the `tree-sitter-low` grammar; VS Code uses the TextMate grammar in `vscode/syntaxes`.
 - All three start `low lsp`: diagnostics, hover, go-to-definition, references, rename, document and workspace symbols, completion, signature help, and inlay hints for inferred types. Rename and inlay hints answer only when the program compiles.
-- `go test ./editors/` fails when a grammar, highlight query or `site/highlight.mjs` lacks or adds a keyword, builtin function, type, constant or constraint compared with the lexer and the checker.
+- `go test ./editors/` compares each list with the lexer and the checker and fails when one lacks or adds a name. The tree-sitter grammar and highlight query list keywords, contextual keywords, builtin functions, types and constants. The TextMate grammar lists those and the constraints. `site/highlight.mjs` lists keywords, contextual keywords, types and constants.
 
 `low` must be on `PATH`:
 
@@ -19,7 +19,7 @@ npx tree-sitter generate
 npx tree-sitter test
 ```
 
-`src/` is generated and committed because Zed and Neovim compile `src/parser.c` directly; regenerate it after every change to `grammar.js`. `queries/highlights.scm` is the highlight query; `zed/languages/low/highlights.scm` and `nvim/queries/low/highlights.scm` are copies of it.
+`src/` is committed because Zed and Neovim compile `src/parser.c` and `src/scanner.c` directly. `generate` writes every file in `src/` except `scanner.c`, which is the hand-written external scanner behind `externals: [$._newline]`; regenerate after every change to `grammar.js`. `queries/highlights.scm` is the highlight query; `zed/languages/low/highlights.scm` and `nvim/queries/low/highlights.scm` are copies of it.
 
 The repository holds no symlinks, because Windows checks them out as text. Files shared between editors are plain copies, listed in `copies` in `keywords_test.go`, and `go test ./editors/` fails when a copy differs from its source.
 
@@ -36,7 +36,7 @@ The `lowlang.server.path` setting overrides the `low` binary. The `Low: Restart 
 
 ## Zed
 
-Run `zed: install dev extension` and choose `editors/zed`. Zed builds the Rust extension and compiles the grammar at the commit named by `rev` in `extension.toml`, so `rev` must name a commit that contains the current `editors/tree-sitter-low/src`.
+Run `zed: install dev extension` and choose `editors/zed`. Zed builds the Rust extension and compiles the grammar at the commit named by `rev` in `extension.toml`, so `rev` must name a commit that contains the current `editors/tree-sitter-low/src`; `go test ./editors/` fails when `src/` differs from `rev`.
 
 ## Neovim
 
