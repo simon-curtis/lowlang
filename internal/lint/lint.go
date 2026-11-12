@@ -63,8 +63,11 @@ func generated(fn *ast.Func) bool {
 }
 
 func (l *linter) visit(n ast.Node) bool {
-	if n, ok := n.(*ast.If); ok {
+	switch n := n.(type) {
+	case *ast.If:
 		l.ifChain(n)
+	case *ast.Block:
+		l.relays(n)
 	}
 	return true
 }
