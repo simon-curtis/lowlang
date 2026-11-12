@@ -40,15 +40,11 @@ func hoistable(v *Value) bool {
 	case OpMul, OpAnd, OpOr, OpXor, OpShr, OpNeg, OpNot, OpCompl, OpConvert, OpSqrt, OpFloor, OpFuncAddr, OpMulHigh, OpTrailingZeros, OpHashSeed:
 		return true
 	case OpAdd, OpSub, OpShl:
-		return !addressPiece(v)
+		return !constantOffset(v)
 	case OpDiv:
 		return floatValue(v)
 	}
 	return false
-}
-
-func addressPiece(v *Value) bool {
-	return v.Type == nil && len(v.Args) == 2 && v.Args[1].Op == OpConst
 }
 
 func (s *ssa) localiseConstants(l *loop, v *Value) {

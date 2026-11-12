@@ -77,6 +77,18 @@ func (s *ssa) addOperands(k varKey, phi *Value) *Value {
 }
 
 func (s *ssa) trivial(phi *Value) *Value {
+	same, ok := soleOperand(phi)
+	if !ok {
+		return phi
+	}
+	if same == nil {
+		same = s.prepend(phi.Block, OpUndef)
+	}
+	phi.forward = same
+	return same
+}
+
+func soleOperand(phi *Value) (*Value, bool) {
 	var same *Value
 	for _, arg := range phi.Args {
 		arg = resolve(arg)
@@ -84,15 +96,11 @@ func (s *ssa) trivial(phi *Value) *Value {
 			continue
 		}
 		if same != nil {
-			return phi
+			return nil, false
 		}
 		same = arg
 	}
-	if same == nil {
-		same = s.prepend(phi.Block, OpUndef)
-	}
-	phi.forward = same
-	return same
+	return same, true
 }
 
 func (s *ssa) seal(b *Block) {

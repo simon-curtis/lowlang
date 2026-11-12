@@ -13,13 +13,11 @@ type workspace struct {
 	incomplete [][]pendingPhi
 	reach      []bool
 	lattice    []uint8
-	uses       []int32
 
 	nonneg   []int8
 	defs     []*Value
 	visiting []bool
 
-	local       []int32
 	escaped     []bool
 	slotEscapes []bool
 	slotValues  []int32

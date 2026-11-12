@@ -31,7 +31,7 @@ func (mf *mfunc) frameMode(f *ir.Func, saved []string, vectors bool) frameMode {
 }
 
 func (mb *mblock) needsFrame() bool {
-	if mb.poll || (mb.kind == ir.Ret && len(mb.results) > 2) {
+	if mb.poll || (mb.kind == ir.Ret && !abi.returnsInRegisters(len(mb.results))) {
 		return true
 	}
 	if slices.ContainsFunc(mb.instrs, func(in *instr) bool { return !in.frameFree() }) {

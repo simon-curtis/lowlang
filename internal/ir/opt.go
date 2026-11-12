@@ -455,14 +455,14 @@ func (o *optimizer) fold(v *Value) {
 }
 
 func callDirectly(call *Value) {
-	if !call.Indirect {
+	if !call.Indirect() {
 		return
 	}
 	code := call.Args[0]
 	if code.Op != OpFuncAddr || code.Aux != CodeAddr || code.Target == nil {
 		return
 	}
-	call.Indirect = false
+	call.Signature = nil
 	call.Target = code.Target
 	call.Args = call.Args[1:]
 }
@@ -704,7 +704,7 @@ func (s *ssa) foldConstantBranches() bool {
 	folded := false
 	for _, b := range s.fn.Blocks {
 		if b.Kind == If && b.Control != nil && b.Control.Op == OpConst {
-			takeBranch(b, b.Control.Aux != 0)
+			takeCase(b, branchIndex(b.Control.Aux != 0))
 			folded = true
 		}
 		if b.Kind == Switch && b.Control.Op == OpConst {
@@ -727,15 +727,11 @@ func takeCase(b *Block, taken int) {
 	b.Table = nil
 }
 
-func takeBranch(b *Block, condition bool) {
-	taken, dead := 0, 1
-	if !condition {
-		taken, dead = 1, 0
+func branchIndex(condition bool) int {
+	if condition {
+		return 0
 	}
-	removeEdge(b, b.Succs[dead], b.occurrence(dead))
-	b.Succs = []*Block{b.Succs[taken]}
-	b.Kind = Plain
-	b.Control = nil
+	return 1
 }
 
 func (b *Block) occurrence(succ int) int {

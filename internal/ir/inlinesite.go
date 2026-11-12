@@ -98,20 +98,12 @@ func (s *inlineSite) cloneValues(b *Block) {
 			continue
 		}
 		c := s.caller.newValue(clone, v.Op)
-		c.Aux = v.Aux
+		id := c.ID
+		*c = *v
+		c.ID, c.Block, c.Args, c.Uses, c.forward = id, clone, nil, 0, nil
 		if v.Op == OpSlot {
 			c.Aux += int64(s.slotBase)
 		}
-		c.Str = v.Str
-		c.Runtime = v.Runtime
-		c.Target = v.Target
-		c.Sig = v.Sig
-		c.Type = v.Type
-		c.From = v.From
-		c.Scalar = v.Scalar
-		c.FloatBits = v.FloatBits
-		c.Indirect = v.Indirect
-		c.Mem = v.Mem
 		s.values[v.ID] = c
 		clone.Values = append(clone.Values, c)
 	}

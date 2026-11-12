@@ -11,7 +11,7 @@ func (in *instr) returnsInRegisters() bool {
 	case ir.OpRuntime, ir.OpSyscall:
 		return true
 	case ir.OpCall:
-		return abi.returnsInRegisters(in.value.Target.ResultWords())
+		return abi.returnsInRegisters(in.value.CallSignature().ResultWords())
 	}
 	return false
 }

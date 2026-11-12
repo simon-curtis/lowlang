@@ -3,63 +3,40 @@ package ir
 import "slices"
 
 func (s *ssa) threadBranches() bool {
-	var uses []int32
 	threaded := false
+	counted := false
 	for _, b := range s.fn.Blocks {
-		if !branchesOnPhiOfConstants(b) {
+		phi, not, ok := phiBranch(b)
+		if !ok {
 			continue
 		}
-		if uses == nil {
-			uses = s.useCounts()
+		if !counted {
+			s.countUses()
+			counted = true
 		}
-		phi, negated, ok := branchOnPhi(b, uses)
-		if ok && threadPredecessors(b, phi, negated) {
+		if phi.Uses != 1 || (not != nil && not.Uses != 1) {
+			continue
+		}
+		if threadPredecessors(b, phi, not != nil) {
 			threaded = true
 		}
 	}
 	return threaded
 }
 
-func branchesOnPhiOfConstants(b *Block) bool {
-	if b.Kind != If || len(b.Values) == 0 || len(b.Values) > 2 || b.Values[0].Op != OpPhi {
-		return false
-	}
-	return slices.ContainsFunc(b.Values[0].Args, func(a *Value) bool { return a.Op == OpConst })
-}
-
-func (s *ssa) useCounts() []int32 {
-	s.ws.uses = reset(s.ws.uses, s.fn.values+1)
-	uses := s.ws.uses
-	for _, b := range s.fn.Blocks {
-		for _, v := range b.Values {
-			for _, a := range v.Args {
-				uses[a.ID]++
-			}
-		}
-		if b.Control != nil {
-			uses[b.Control.ID]++
-		}
-		for _, r := range b.Results {
-			uses[r.ID]++
-		}
-	}
-	return uses
-}
-
-func branchOnPhi(b *Block, uses []int32) (*Value, bool, bool) {
+func phiBranch(b *Block) (*Value, *Value, bool) {
 	if b.Kind != If || b.Succs[0] == b.Succs[1] || len(b.Values) == 0 || len(b.Values) > 2 {
-		return nil, false, false
+		return nil, nil, false
 	}
 	phi := b.Values[0]
-	if phi.Op != OpPhi || uses[phi.ID] != 1 {
-		return nil, false, false
+	if phi.Op != OpPhi || !slices.ContainsFunc(phi.Args, func(a *Value) bool { return a.Op == OpConst }) {
+		return nil, nil, false
 	}
 	if len(b.Values) == 1 {
-		return phi, false, b.Control == phi
+		return phi, nil, b.Control == phi
 	}
 	not := b.Values[1]
-	ok := not.Op == OpNot && not.Args[0] == phi && b.Control == not && uses[not.ID] == 1
-	return phi, true, ok
+	return phi, not, not.Op == OpNot && not.Args[0] == phi && b.Control == not
 }
 
 func threadPredecessors(b *Block, phi *Value, negated bool) bool {

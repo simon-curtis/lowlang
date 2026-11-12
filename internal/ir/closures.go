@@ -16,7 +16,7 @@ func (s *specialiser) cloneForFunctions() bool {
 	funcs := make([]*Func, 0, len(s.program.Funcs))
 	for _, g := range s.program.Funcs {
 		funcs = append(funcs, g)
-		if len(sites[g]) == 0 || g == s.program.Main || g.Callback {
+		if !s.eligible(g, sites[g]) {
 			continue
 		}
 		clones, repointed := s.cloneForFunctionArguments(g, sites[g])
@@ -35,14 +35,12 @@ func (s *specialiser) cloneForFunctionArguments(g *Func, sites []callSite) ([]*F
 	if cost > maxCloneSourceCost {
 		return nil, nil
 	}
-	params := parameters(g)
-	for i := 0; i+1 < len(params); i++ {
-		param, env := params[i], params[i+1]
-		if env.Aux != param.Aux+1 || !callsParameter(g, param) {
+	for param, env := range codeEnvPairs(g) {
+		if !callsParameter(g, param) {
 			continue
 		}
 		groups := groupByFunction(sites, param.Aux)
-		if !worthCloning(groups, env.Aux) {
+		if !worthCloning(groups, env) {
 			continue
 		}
 		return s.cloneGroups(g, param, env, groups, cost)
@@ -73,7 +71,7 @@ func cloneForFunction(g *Func, param, env *Value, group functionGroup) (*Func, [
 	clone.Name = fmt.Sprintf("%s..with%d.%s", g.Name, param.Aux, group.code.Target.Name)
 	dropped := []int64{param.Aux}
 	becomeCopyOf(c.values[param], group.code)
-	if capture := agreedEnvironment(group.sites, env.Aux); capture != nil {
+	if capture := agreedConstant(nil, env, group.sites, isConstant); capture != nil {
 		becomeCopyOf(c.values[env], capture)
 		dropped = append(dropped, env.Aux)
 	}
@@ -94,7 +92,7 @@ func selfCalls(c *funcClone, g *Func, param, env *Value) []*Value {
 	var calls []*Value
 	for _, b := range c.fn.Blocks {
 		for _, v := range b.Values {
-			if v.Op == OpCall && !v.Indirect && v.Target == g && len(v.Args) > int(env.Aux) && v.Args[param.Aux] == code && v.Args[env.Aux] == capture {
+			if v.Op == OpCall && !v.Indirect() && v.Target == g && len(v.Args) > int(env.Aux) && v.Args[param.Aux] == code && v.Args[env.Aux] == capture {
 				calls = append(calls, v)
 			}
 		}
@@ -107,9 +105,9 @@ func callsParameter(g *Func, param *Value) bool {
 		for _, v := range b.Values {
 			switch {
 			case v.Op != OpCall:
-			case v.Indirect && v.Args[0] == param:
+			case v.Indirect() && v.Args[0] == param:
 				return true
-			case !v.Indirect && slices.Contains(v.Args, param):
+			case !v.Indirect() && slices.Contains(v.Args, param):
 				return true
 			}
 		}
@@ -137,31 +135,12 @@ func groupByFunction(sites []callSite, word int64) []functionGroup {
 	return groups
 }
 
-func worthCloning(groups []functionGroup, env int64) bool {
+func worthCloning(groups []functionGroup, env *Value) bool {
 	switch len(groups) {
 	case 0:
 		return false
 	case 1:
-		return agreedEnvironment(groups[0].sites, env) == nil
+		return agreedConstant(nil, env, groups[0].sites, isConstant) == nil
 	}
 	return true
-}
-
-func agreedEnvironment(sites []callSite, env int64) *Value {
-	var agreed *Value
-	for _, site := range sites {
-		if int(env) >= len(site.call.Args) {
-			return nil
-		}
-		arg := site.call.Args[env]
-		switch {
-		case !isConstant(arg):
-			return nil
-		case agreed == nil:
-			agreed = arg
-		case !sameConstant(agreed, arg):
-			return nil
-		}
-	}
-	return agreed
 }

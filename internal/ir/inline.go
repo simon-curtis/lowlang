@@ -59,11 +59,9 @@ func costOf(f *Func) int {
 
 func directCallees(f *Func) []*Func {
 	var callees []*Func
-	for _, b := range f.Blocks {
-		for _, v := range b.Values {
-			if v.Op == OpCall && !v.Indirect && v.Target != nil && !slices.Contains(callees, v.Target) {
-				callees = append(callees, v.Target)
-			}
+	for v := range f.directTargets() {
+		if v.Op == OpCall && !slices.Contains(callees, v.Target) {
+			callees = append(callees, v.Target)
 		}
 	}
 	return callees
@@ -77,7 +75,6 @@ type callGraph struct {
 	next      int
 	order     []*Func
 	recursive map[*Func]bool
-	known     map[*Func]bool
 }
 
 func (in *inliner) callOrder() []*Func {
@@ -86,10 +83,6 @@ func (in *inliner) callOrder() []*Func {
 		low:       map[*Func]int{},
 		onStack:   map[*Func]bool{},
 		recursive: map[*Func]bool{},
-		known:     map[*Func]bool{},
-	}
-	for _, f := range in.program.Funcs {
-		g.known[f] = true
 	}
 	for _, f := range in.program.Funcs {
 		if _, seen := g.index[f]; !seen {
@@ -107,9 +100,6 @@ func (g *callGraph) connect(f *Func) {
 	g.stack = append(g.stack, f)
 	g.onStack[f] = true
 	for _, c := range directCallees(f) {
-		if !g.known[c] {
-			continue
-		}
 		if c == f {
 			g.recursive[f] = true
 		}
@@ -241,7 +231,7 @@ func (in *inliner) candidates(f *Func) []inlineCandidate {
 	var depths []int
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			if v.Op != OpCall || v.Indirect || v.Target == nil || v.Target == f {
+			if v.Op != OpCall || v.Target == nil || v.Target == f {
 				continue
 			}
 			summary := in.summarise(v.Target)

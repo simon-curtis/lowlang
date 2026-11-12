@@ -1,6 +1,9 @@
 package ir
 
-import "slices"
+import (
+	"iter"
+	"slices"
+)
 
 const (
 	maxSpecialisationRounds = 4
@@ -35,7 +38,7 @@ func (s *specialiser) specialiseConstants() bool {
 	sites, escaping := s.program.directCalls()
 	changed := map[*Func]bool{}
 	for _, g := range s.program.Funcs {
-		if len(sites[g]) == 0 || escaping[g] || g == s.program.Main || g.Callback {
+		if escaping[g] || !s.eligible(g, sites[g]) {
 			continue
 		}
 		dropped := specialiseParams(g, sites[g])
@@ -53,6 +56,10 @@ func (s *specialiser) specialiseConstants() bool {
 	return len(changed) > 0
 }
 
+func (s *specialiser) eligible(g *Func, sites []callSite) bool {
+	return len(sites) > 0 && g != s.program.Main && !g.Callback
+}
+
 func simplifyAll(p *Program, changed map[*Func]bool) {
 	for _, f := range p.Funcs {
 		if changed[f] {
@@ -65,14 +72,11 @@ func (p *Program) directCalls() (map[*Func][]callSite, map[*Func]bool) {
 	sites := map[*Func][]callSite{}
 	escaping := map[*Func]bool{}
 	for _, f := range p.Funcs {
-		for _, b := range f.Blocks {
-			for _, v := range b.Values {
-				switch {
-				case v.Op == OpCall && !v.Indirect && v.Target != nil:
-					sites[v.Target] = append(sites[v.Target], callSite{call: v, caller: f})
-				case v.Op == OpFuncAddr && v.Target != nil:
-					escaping[v.Target] = true
-				}
+		for v := range f.directTargets() {
+			if v.Op == OpCall {
+				sites[v.Target] = append(sites[v.Target], callSite{call: v, caller: f})
+			} else {
+				escaping[v.Target] = true
 			}
 		}
 	}
@@ -81,10 +85,9 @@ func (p *Program) directCalls() (map[*Func][]callSite, map[*Func]bool) {
 
 func specialiseParams(g *Func, sites []callSite) []int64 {
 	var dropped []int64
-	params := parameters(g)
-	for i := 0; i+1 < len(params); i++ {
-		param, env := params[i], params[i+1]
-		if env.Aux != param.Aux+1 {
+	var consumed *Value
+	for param, env := range codeEnvPairs(g) {
+		if param == consumed {
 			continue
 		}
 		code := agreedConstant(g, param, sites, isFunction)
@@ -98,9 +101,21 @@ func specialiseParams(g *Func, sites []callSite) []int64 {
 		dropped = append(dropped, param.Aux, env.Aux)
 		becomeCopyOf(param, code)
 		becomeCopyOf(env, capture)
-		i++
+		consumed = env
 	}
 	return dropped
+}
+
+func codeEnvPairs(g *Func) iter.Seq2[*Value, *Value] {
+	return func(yield func(*Value, *Value) bool) {
+		params := parameters(g)
+		for i := 0; i+1 < len(params); i++ {
+			param, env := params[i], params[i+1]
+			if env.Aux == param.Aux+1 && !yield(param, env) {
+				return
+			}
+		}
+	}
 }
 
 type agreement struct {
@@ -215,7 +230,7 @@ func parameters(g *Func) []*Value {
 	return params
 }
 
-func agreedConstant(g *Func, param *Value, sites []callSite, accept func(*Value) bool) *Value {
+func agreedConstant(self *Func, param *Value, sites []callSite, accept func(*Value) bool) *Value {
 	var agreed *Value
 	for _, site := range sites {
 		if int(param.Aux) >= len(site.call.Args) {
@@ -223,7 +238,7 @@ func agreedConstant(g *Func, param *Value, sites []callSite, accept func(*Value)
 		}
 		arg := site.call.Args[param.Aux]
 		switch {
-		case site.caller == g && arg.Op == OpParam && arg.Aux == param.Aux:
+		case site.caller == self && arg.Op == OpParam && arg.Aux == param.Aux:
 		case !accept(arg):
 			return nil
 		case agreed == nil:

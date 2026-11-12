@@ -8,7 +8,7 @@ type access struct {
 
 func base(v *Value) (*Value, int64) {
 	var off int64
-	for v.Op == OpAdd && v.Type == nil && len(v.Args) == 2 && v.Args[1].Op == OpConst {
+	for v.Op == OpAdd && constantOffset(v) {
 		off += v.Args[1].Aux
 		v = resolve(v.Args[0])
 	}
@@ -24,12 +24,8 @@ func accessOf(v *Value) access {
 	return access{root: root, off: off + v.Aux, size: size}
 }
 
-func isAlloc(v *Value) bool {
-	return v.Op == OpResult && v.Aux == 0 && v.Args[0].Op == OpRuntime && v.Args[0].Runtime.Alloc
-}
-
-func isRootCandidate(v *Value) bool {
-	return v.Op == OpSlot || isAlloc(v)
+func constantOffset(v *Value) bool {
+	return v.Type == nil && len(v.Args) == 2 && v.Args[1].Op == OpConst
 }
 
 func addressOnlyUse(user *Value, arg int) bool {
@@ -39,14 +35,13 @@ func addressOnlyUse(user *Value, arg int) bool {
 	case user.Op.Compare():
 		return true
 	case user.Op == OpAdd:
-		return arg == 0 && user.Type == nil && len(user.Args) == 2 && user.Args[1].Op == OpConst
+		return arg == 0 && constantOffset(user)
 	}
 	return false
 }
 
 func (w *workspace) localRoots(fn *Func) {
 	size := fn.values + 1
-	w.local = reset(w.local, size)
 	w.escaped = reset(w.escaped, size)
 	w.slotEscapes = reset(w.slotEscapes, len(fn.Slots))
 	w.slotValues = reset(w.slotValues, len(fn.Slots))
@@ -68,26 +63,18 @@ func (w *workspace) localRoots(fn *Func) {
 			w.escape(r)
 		}
 	}
-	roots := int32(0)
 	for _, b := range fn.Blocks {
 		for _, v := range b.Values {
-			if !isRootCandidate(v) {
-				continue
-			}
-			escapes := w.escaped[v.ID] || (v.Op == OpSlot && w.slotValues[v.Aux] > 1)
 			if v.Op == OpSlot {
+				escapes := w.escaped[v.ID] || w.slotValues[v.Aux] > 1
 				w.slotEscapes[v.Aux] = w.slotEscapes[v.Aux] || escapes
-			}
-			if !escapes {
-				roots++
-				w.local[v.ID] = roots
 			}
 		}
 	}
 }
 
 func (w *workspace) escape(v *Value) {
-	if root, _ := base(v); isRootCandidate(root) {
+	if root, _ := base(v); root.Op == OpSlot {
 		w.escaped[root.ID] = true
 	}
 }

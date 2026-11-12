@@ -38,18 +38,11 @@ func floatFromBits(n int64, bits int) float64 {
 	return math.Float64frombits(uint64(n))
 }
 
-func bitsFromFloat(f float64, bits int) int64 {
-	if bits == 32 {
-		return int64(math.Float32bits(float32(f)))
-	}
-	return int64(math.Float64bits(f))
-}
-
 func becomeFloatConstant(v *Value, f float64, bits int) {
 	if math.IsNaN(f) {
 		return
 	}
-	becomeConstant(v, bitsFromFloat(f, bits))
+	becomeConstant(v, floatBits(bits, f))
 	v.FloatBits = bits
 }
 

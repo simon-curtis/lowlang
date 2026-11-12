@@ -29,7 +29,7 @@ func TestTakeBranchWithSharedSuccessorKeepsTakenPhiArgument(t *testing.T) {
 		want      int64
 	}{{1, 1}, {0, 2}} {
 		entry, phi := branchOnConstant(t, tc.condition)
-		takeBranch(entry, tc.condition != 0)
+		takeCase(entry, branchIndex(tc.condition != 0))
 		if len(phi.Args) != 1 || phi.Args[0].Aux != tc.want {
 			t.Errorf("condition %d: phi arguments %v, want the constant %d", tc.condition, phi.Args, tc.want)
 		}

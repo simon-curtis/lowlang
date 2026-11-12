@@ -118,9 +118,9 @@ func Build(files []*ast.File, opts Options) *Program {
 			}
 		}
 	}
-	buildReachable(p.Main, pending)
+	built := buildReachable(p.Main, pending)
+	p.keepReachable(built)
 	p.Cells = cells
-	p.Funcs = reachable(p.Main, p.Funcs)
 	p.optimise(opts)
 	p.splitCriticalEdges()
 	p.CSymbols = cSymbols(p.Funcs)
@@ -128,7 +128,8 @@ func Build(files []*ast.File, opts Options) *Program {
 	return p
 }
 
-func buildReachable(main *Func, pending map[*Func]func()) {
+func buildReachable(main *Func, pending map[*Func]func()) map[*Func]bool {
+	built := map[*Func]bool{}
 	queue := []*Func{main}
 	for len(queue) > 0 {
 		f := queue[0]
@@ -139,20 +140,12 @@ func buildReachable(main *Func, pending map[*Func]func()) {
 		}
 		delete(pending, f)
 		build()
-		queue = append(queue, callees(f)...)
-	}
-}
-
-func callees(f *Func) []*Func {
-	var targets []*Func
-	for _, b := range f.Blocks {
-		for _, v := range b.Values {
-			if (v.Op == OpCall && !v.Indirect) || (v.Op == OpFuncAddr && v.Target != nil) {
-				targets = append(targets, v.Target)
-			}
+		built[f] = true
+		for v := range f.directTargets() {
+			queue = append(queue, v.Target)
 		}
 	}
-	return targets
+	return built
 }
 
 func cSymbols(funcs []*Func) []string {
@@ -189,32 +182,6 @@ func imports(files []*ast.File, used []string) map[string][]string {
 		byLibrary[lib] = slices.Compact(symbols)
 	}
 	return byLibrary
-}
-
-func reachable(main *Func, funcs []*Func) []*Func {
-	seen := map[*Func]bool{}
-	var visit func(f *Func)
-	visit = func(f *Func) {
-		if seen[f] {
-			return
-		}
-		seen[f] = true
-		for _, b := range f.Blocks {
-			for _, v := range b.Values {
-				if (v.Op == OpCall && !v.Indirect) || (v.Op == OpFuncAddr && v.Target != nil) {
-					visit(v.Target)
-				}
-			}
-		}
-	}
-	visit(main)
-	var kept []*Func
-	for _, f := range funcs {
-		if seen[f] {
-			kept = append(kept, f)
-		}
-	}
-	return kept
 }
 
 func symbolName(d *ast.Func) string {
@@ -352,7 +319,7 @@ func classify(words []*Value, t *types.Type) {
 }
 
 func (b *builder) floatConstant(t *types.Type, f float64) *Value {
-	v := b.constant(floatBits(t, f))
+	v := b.constant(floatBits(t.Bits, f))
 	v.FloatBits = t.Bits
 	return v
 }
@@ -888,8 +855,8 @@ func (b *builder) unary(e *ast.Unary) []*Value {
 	return []*Value{b.typed(OpNeg, e.Type, b.word(e.X))}
 }
 
-func floatBits(t *types.Type, f float64) int64 {
-	if t.Bits == 32 {
+func floatBits(bits int, f float64) int64 {
+	if bits == 32 {
 		return int64(math.Float32bits(float32(f)))
 	}
 	return int64(math.Float64bits(f))
@@ -1052,8 +1019,7 @@ func (b *builder) callValue(e *ast.Call) []*Value {
 	signature := &Func{Name: t.Name, ParamWords: 1 + len(args), Ret: t.Ret}
 	operands := append(callee, args...)
 	call := b.emit(OpCall, operands...)
-	call.Indirect = true
-	call.Target = signature
+	call.Signature = signature
 	results := b.results(call, signature)
 	b.writeBack(backs)
 	return results

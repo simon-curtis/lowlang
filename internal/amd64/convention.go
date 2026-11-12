@@ -5,6 +5,8 @@ import (
 	"slices"
 )
 
+const stackAlignment = 16
+
 type convention struct {
 	args     []string
 	results  []string
@@ -54,6 +56,10 @@ func (c convention) stackResult(params, k int) string {
 
 func (c convention) returnsInRegisters(words int) bool {
 	return words <= len(c.results)
+}
+
+func (c convention) alignedBytes(words int) int {
+	return (8*words + stackAlignment - 1) / stackAlignment * stackAlignment
 }
 
 func (c convention) savedBytes() int {

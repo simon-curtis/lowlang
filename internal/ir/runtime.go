@@ -5,7 +5,6 @@ type Convention uint8
 const (
 	CallPlain Convention = iota
 	CallGrow
-	CallSyscall
 	CallStrEq
 )
 
@@ -14,48 +13,50 @@ type RuntimeEntry struct {
 	Conv   Convention
 	Void   bool
 	Scalar bool
-	Alloc  bool
+}
+
+var runtimeEntries []*RuntimeEntry
+
+func declare(entry RuntimeEntry) *RuntimeEntry {
+	runtimeEntries = append(runtimeEntries, &entry)
+	return &entry
 }
 
 var (
-	rtAlloc      = &RuntimeEntry{Symbol: "rt_alloc", Alloc: true}
-	rtGrow       = &RuntimeEntry{Symbol: "rt_grow", Conv: CallGrow}
-	rtMemmove    = &RuntimeEntry{Symbol: "rt_memmove", Void: true}
-	rtStrEq      = &RuntimeEntry{Symbol: "rt_str_eq", Conv: CallStrEq, Scalar: true}
-	rtExp        = &RuntimeEntry{Symbol: "rt_exp", Scalar: true}
-	rtPrintStr   = &RuntimeEntry{Symbol: "rt_print_str", Void: true}
-	rtPanicMsg   = &RuntimeEntry{Symbol: "rt_panic_msg", Void: true}
-	rtSleep      = &RuntimeEntry{Symbol: "rt_sleep", Void: true}
-	rtWaitFd     = &RuntimeEntry{Symbol: "rt_wait_fd", Void: true}
-	rtSpawn      = &RuntimeEntry{Symbol: "rt_spawn", Void: true}
-	rtCurrent    = &RuntimeEntry{Symbol: "rt_current", Scalar: true}
-	rtPark       = &RuntimeEntry{Symbol: "rt_park", Void: true}
-	rtReady      = &RuntimeEntry{Symbol: "rt_ready", Void: true}
-	rtLock       = &RuntimeEntry{Symbol: "rt_lock", Void: true}
-	rtUnlock     = &RuntimeEntry{Symbol: "rt_unlock", Void: true}
-	rtCas        = &RuntimeEntry{Symbol: "rt_cas", Scalar: true}
-	rtContext    = &RuntimeEntry{Symbol: "rt_context"}
-	rtSetContext = &RuntimeEntry{Symbol: "rt_set_context", Void: true}
-	rtHasContext = &RuntimeEntry{Symbol: "rt_has_context", Scalar: true}
-	rtLockAll    = &RuntimeEntry{Symbol: "rt_lock_all", Void: true}
-	rtUnlockAll  = &RuntimeEntry{Symbol: "rt_unlock_all", Void: true}
-	rtTimerAdd   = &RuntimeEntry{Symbol: "rt_timer_add", Scalar: true}
-	rtTimerDel   = &RuntimeEntry{Symbol: "rt_timer_del", Void: true}
-	rtPin        = &RuntimeEntry{Symbol: "rt_pin", Void: true}
-	rtUnpin      = &RuntimeEntry{Symbol: "rt_unpin", Void: true}
-	rtArgc       = &RuntimeEntry{Symbol: "rt_argc", Scalar: true}
-	rtArgv       = &RuntimeEntry{Symbol: "rt_argv", Scalar: true}
-	rtEnvv       = &RuntimeEntry{Symbol: "rt_envv", Scalar: true}
-	rtClockNanos = &RuntimeEntry{Symbol: "rt_clock_nanos", Scalar: true}
-	rtSysblock   = &RuntimeEntry{Symbol: "rt_sysblock", Conv: CallSyscall, Scalar: true}
+	rtAlloc      = declare(RuntimeEntry{Symbol: "rt_alloc"})
+	rtGrow       = declare(RuntimeEntry{Symbol: "rt_grow", Conv: CallGrow})
+	rtMemmove    = declare(RuntimeEntry{Symbol: "rt_memmove", Void: true})
+	rtStrEq      = declare(RuntimeEntry{Symbol: "rt_str_eq", Conv: CallStrEq, Scalar: true})
+	rtExp        = declare(RuntimeEntry{Symbol: "rt_exp", Scalar: true})
+	rtPrintStr   = declare(RuntimeEntry{Symbol: "rt_print_str", Void: true})
+	rtPanicMsg   = declare(RuntimeEntry{Symbol: "rt_panic_msg", Void: true})
+	rtSleep      = declare(RuntimeEntry{Symbol: "rt_sleep", Void: true})
+	rtWaitFd     = declare(RuntimeEntry{Symbol: "rt_wait_fd", Void: true})
+	rtSpawn      = declare(RuntimeEntry{Symbol: "rt_spawn", Void: true})
+	rtCurrent    = declare(RuntimeEntry{Symbol: "rt_current", Scalar: true})
+	rtPark       = declare(RuntimeEntry{Symbol: "rt_park", Void: true})
+	rtReady      = declare(RuntimeEntry{Symbol: "rt_ready", Void: true})
+	rtLock       = declare(RuntimeEntry{Symbol: "rt_lock", Void: true})
+	rtUnlock     = declare(RuntimeEntry{Symbol: "rt_unlock", Void: true})
+	rtCas        = declare(RuntimeEntry{Symbol: "rt_cas", Scalar: true})
+	rtContext    = declare(RuntimeEntry{Symbol: "rt_context"})
+	rtSetContext = declare(RuntimeEntry{Symbol: "rt_set_context", Void: true})
+	rtHasContext = declare(RuntimeEntry{Symbol: "rt_has_context", Scalar: true})
+	rtLockAll    = declare(RuntimeEntry{Symbol: "rt_lock_all", Void: true})
+	rtUnlockAll  = declare(RuntimeEntry{Symbol: "rt_unlock_all", Void: true})
+	rtTimerAdd   = declare(RuntimeEntry{Symbol: "rt_timer_add", Scalar: true})
+	rtTimerDel   = declare(RuntimeEntry{Symbol: "rt_timer_del", Void: true})
+	rtPin        = declare(RuntimeEntry{Symbol: "rt_pin", Void: true})
+	rtUnpin      = declare(RuntimeEntry{Symbol: "rt_unpin", Void: true})
+	rtArgc       = declare(RuntimeEntry{Symbol: "rt_argc", Scalar: true})
+	rtArgv       = declare(RuntimeEntry{Symbol: "rt_argv", Scalar: true})
+	rtEnvv       = declare(RuntimeEntry{Symbol: "rt_envv", Scalar: true})
+	rtClockNanos = declare(RuntimeEntry{Symbol: "rt_clock_nanos", Scalar: true})
+	rtSysblock   = declare(RuntimeEntry{Symbol: "rt_sysblock", Scalar: true})
 )
 
 func RuntimeEntries() []*RuntimeEntry {
-	return []*RuntimeEntry{
-		rtAlloc, rtGrow, rtMemmove, rtStrEq, rtExp, rtPrintStr, rtPanicMsg, rtSleep, rtWaitFd,
-		rtSpawn, rtCurrent, rtPark, rtReady, rtLock, rtUnlock, rtCas, rtContext, rtSetContext, rtHasContext,
-		rtLockAll, rtUnlockAll, rtTimerAdd, rtTimerDel, rtPin, rtUnpin, rtArgc, rtArgv, rtEnvv, rtClockNanos, rtSysblock,
-	}
+	return runtimeEntries
 }
 
 func (b *builder) runtimeCall(entry *RuntimeEntry, args ...*Value) *Value {

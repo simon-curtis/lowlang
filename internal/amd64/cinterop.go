@@ -33,7 +33,7 @@ func (g *Generator) cCall(fr *frame, in *instr) {
 	label := g.newLabel()
 	g.enterC(label)
 	if plan.stackWords > 0 {
-		g.emit("sub rsp, %d", 16*((plan.stackWords+1)/2))
+		g.emit("sub rsp, %d", abi.alignedBytes(plan.stackWords))
 		for i := g.platform.registerSlots(); i < plan.stackWords; i++ {
 			g.emit("mov r11, [r12+%d]", abi.savedBytes()+8*i)
 			g.emit("mov [rsp+%d], r11", 8*i)
@@ -165,7 +165,7 @@ func (g *Generator) thunk(f *ir.Func) {
 	g.emit("push qword ptr [r15+G_USERSP]")
 	g.emit("sub rsp, 8")
 	if stack := abi.stackWords(f.ParamWords); stack > 0 {
-		g.emit("sub rsp, %d", 16*((stack+1)/2))
+		g.emit("sub rsp, %d", abi.alignedBytes(stack))
 	}
 	g.thunkArgs(f, 8*(len(saved)+2))
 	label := g.newLabel()

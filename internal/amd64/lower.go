@@ -153,7 +153,7 @@ func (in *instr) hint() {
 	case in.preservesRegisters(), in.literal != nil:
 	case in.op == ir.OpCall || in.op == ir.OpRuntime || in.op == ir.OpSyscall:
 		args, regs := in.args, abi.args
-		if in.value.Indirect {
+		if in.value.Indirect() {
 			args = args[1:]
 		}
 		if in.op == ir.OpSyscall {

@@ -2,6 +2,7 @@ package ir
 
 import (
 	"fmt"
+	"iter"
 	"maps"
 	"slices"
 	"strings"
@@ -113,7 +114,7 @@ type Value struct {
 	From      *types.Type
 	Scalar    bool
 	FloatBits int
-	Indirect  bool
+	Signature *Func
 	Mem       uint8
 	Uses      int
 	forward   *Value
@@ -223,6 +224,29 @@ func (f *Func) newValue(b *Block, op Op, args ...*Value) *Value {
 	return &Value{ID: f.values, Op: op, Args: args, Block: b}
 }
 
+func (f *Func) directTargets() iter.Seq[*Value] {
+	return func(yield func(*Value) bool) {
+		for _, b := range f.Blocks {
+			for _, v := range b.Values {
+				if (v.Op == OpCall || v.Op == OpFuncAddr) && v.Target != nil && !yield(v) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func (v *Value) Indirect() bool {
+	return v.Op == OpCall && v.Target == nil
+}
+
+func (v *Value) CallSignature() *Func {
+	if v.Target != nil {
+		return v.Target
+	}
+	return v.Signature
+}
+
 func (f *Func) String() string {
 	var s strings.Builder
 	fmt.Fprintf(&s, "fn %s params=%d results=%d slots=%v\n", f.Name, f.ParamWords, f.ResultWords(), f.Slots)
@@ -261,7 +285,7 @@ func describe(v *Value) string {
 	case OpRuntime, OpSyscall:
 		detail = fmt.Sprintf(" %s", v.Runtime.Symbol)
 	case OpCall:
-		detail = fmt.Sprintf(" %s", v.Target.Name)
+		detail = fmt.Sprintf(" %s", v.CallSignature().Name)
 	case OpFuncAddr:
 		detail = fmt.Sprintf(" %s", v.Str)
 		if v.Target != nil {

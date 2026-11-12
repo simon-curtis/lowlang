@@ -192,16 +192,9 @@ func (p *promoter) join(k int, b *Block, cell int) *Value {
 }
 
 func (p *promoter) collapse(phi *Value) *Value {
-	var same *Value
-	for _, arg := range phi.Args {
-		arg = resolve(arg)
-		if arg == same || arg == phi {
-			continue
-		}
-		if same != nil {
-			return phi
-		}
-		same = arg
+	same, ok := soleOperand(phi)
+	if !ok {
+		return phi
 	}
 	if same == nil {
 		same = p.undefined()

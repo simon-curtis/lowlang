@@ -226,15 +226,16 @@ func (g *Generator) program(prog *ir.Program) {
 	g.emit("push rbp")
 	g.emit("mov rbp, rsp")
 	words := prog.Main.ResultWords()
-	if words > 2 {
-		g.emit("sub rsp, %d", 16*((words+1)/2))
+	inRegisters := abi.returnsInRegisters(words)
+	if !inRegisters {
+		g.emit("sub rsp, %d", abi.alignedBytes(words))
 	}
 	g.emit("call %s", g.callTarget(prog.Main))
 	if prog.MainErr != nil {
 		exit := g.newLabel()
 		tag, variant := abi.results[0], abi.results[1]
-		if words > 2 {
-			tag, variant = "qword ptr [rsp]", "qword ptr [rsp+8]"
+		if !inRegisters {
+			tag, variant = abi.stackResult(0, 0), abi.stackResult(0, 1)
 		}
 		g.emit("cmp %s, 0", tag)
 		g.emit("je %s", exit)
@@ -405,9 +406,10 @@ func (g *Generator) outgoing(f *ir.Func) int {
 		for _, v := range b.Values {
 			switch v.Op {
 			case ir.OpCall:
-				words := abi.stackWords(v.Target.ParamWords)
-				if v.Target.ResultWords() > 2 {
-					words += v.Target.ResultWords()
+				signature := v.CallSignature()
+				words := abi.stackWords(signature.ParamWords)
+				if !abi.returnsInRegisters(signature.ResultWords()) {
+					words += signature.ResultWords()
 				}
 				most = max(most, words)
 			case ir.OpCCall:
@@ -681,7 +683,7 @@ func (g *Generator) compare(fr *frame, a, b *vreg) {
 }
 
 func (g *Generator) ret(fr *frame, mb *mblock) {
-	if len(mb.results) <= 2 {
+	if abi.returnsInRegisters(len(mb.results)) {
 		moves := make([]pmove, len(mb.results))
 		for i, r := range mb.results {
 			moves[i] = fr.vectorMove(abi.results[i], r)
@@ -938,7 +940,7 @@ func (g *Generator) funcAddr(dst string, v *ir.Value) {
 
 func (g *Generator) callee(v *ir.Value) string {
 	switch {
-	case !v.Indirect:
+	case !v.Indirect():
 		return g.callTarget(v.Target)
 	case g.table != nil:
 		return "qword ptr [r10]"
@@ -949,7 +951,7 @@ func (g *Generator) callee(v *ir.Value) string {
 func (g *Generator) call(fr *frame, in *instr) {
 	args := in.args
 	var moves []pmove
-	if in.value.Indirect {
+	if in.value.Indirect() {
 		moves = append(moves, pmove{dst: "r10", src: fr.loc(args[0])})
 		args = args[1:]
 	}
@@ -1119,9 +1121,9 @@ func (g *Generator) result(fr *frame, in *instr) {
 		g.cResult(fr, in, g.plan(call.Sig), k)
 		return
 	}
-	if call.Op != ir.OpCall || abi.returnsInRegisters(call.Target.ResultWords()) {
+	if call.Op != ir.OpCall || abi.returnsInRegisters(call.CallSignature().ResultWords()) {
 		g.move(fr.loc(in.dst), abi.results[k])
 		return
 	}
-	g.move(fr.loc(in.dst), abi.stackResult(call.Target.ParamWords, k))
+	g.move(fr.loc(in.dst), abi.stackResult(call.CallSignature().ParamWords, k))
 }
