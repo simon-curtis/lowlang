@@ -225,3 +225,20 @@ func TestGrammarsMatchLanguageTables(t *testing.T) {
 		}
 	}
 }
+
+func TestEditorHighlightsCopyTreeSitterQuery(t *testing.T) {
+	const source = "tree-sitter-low/queries/highlights.scm"
+	want, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"zed/languages/low/highlights.scm", "nvim/queries/low/highlights.scm"} {
+		have, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(have) != string(want) {
+			t.Errorf("%s differs from %s; copy it over", path, source)
+		}
+	}
+}
