@@ -3,9 +3,11 @@ package corpus
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"lowlang/internal/fixture"
 	"lowlang/internal/fuzz/model"
 )
 
@@ -29,6 +31,24 @@ func TestWriteProducesRunFixture(t *testing.T) {
 		if err != nil || string(got) != content {
 			t.Errorf("%s is %q, %v; want %q", ext, got, err, content)
 		}
+	}
+}
+
+func TestWrittenFixtureReadsBackThroughTheRunnerFormat(t *testing.T) {
+	written := FromProgram(program(5), model.Outcome{Stdout: "5\n", Panic: "integer divide by zero"})
+	path, err := written.Write(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := fixture.Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, written.Sidecars) {
+		t.Errorf("read %+v, wrote %+v", got, written.Sidecars)
+	}
+	if !got.Panics || !got.Windows() || got.SIMD {
+		t.Errorf("run settings %+v", got)
 	}
 }
 

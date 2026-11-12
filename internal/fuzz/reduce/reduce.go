@@ -19,12 +19,6 @@ type Reducer struct {
 	tests int
 }
 
-func (r *Reducer) Tests() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.tests
-}
-
 func (r *Reducer) Reduce(ctx context.Context, p *model.Program) *model.Program {
 	r.cache = map[string]bool{}
 	current := p.Clone()

@@ -2,11 +2,11 @@ package oracle
 
 import (
 	"context"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
+	"lowlang/internal/fixture/fixturetest"
 	"lowlang/internal/fuzz/model"
 )
 
@@ -20,17 +20,8 @@ fn main() {
 }
 `
 
-func requireToolchain(t *testing.T) {
-	t.Helper()
-	for _, tool := range []string{"as", "ld"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			t.Skipf("%s is not installed", tool)
-		}
-	}
-}
-
 func TestCheckAcceptsMatchingOutcome(t *testing.T) {
-	requireToolchain(t)
+	fixturetest.RequireLinuxHost(t)
 	runner := &Runner{Timeout: 10 * time.Second}
 	expected := model.Outcome{Stdout: "5\n", Panic: "integer divide by zero"}
 	if findings := runner.Check(context.Background(), divideProgram, expected); len(findings) != 0 {
@@ -39,7 +30,7 @@ func TestCheckAcceptsMatchingOutcome(t *testing.T) {
 }
 
 func TestCheckReportsReferenceMismatch(t *testing.T) {
-	requireToolchain(t)
+	fixturetest.RequireLinuxHost(t)
 	runner := &Runner{Timeout: 10 * time.Second}
 	expected := model.Outcome{Stdout: "6\n", Panic: "integer divide by zero"}
 	findings := runner.Check(context.Background(), divideProgram, expected)
@@ -54,7 +45,7 @@ func TestCheckReportsReferenceMismatch(t *testing.T) {
 }
 
 func TestCheckReportsRejectedProgram(t *testing.T) {
-	requireToolchain(t)
+	fixturetest.RequireLinuxHost(t)
 	runner := &Runner{Timeout: 10 * time.Second}
 	findings := runner.Check(context.Background(), "fn main() {\n    print(missing)\n}\n", model.Outcome{})
 	if len(findings) != 2 || findings[0].Class != ClassReject {

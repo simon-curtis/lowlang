@@ -47,15 +47,15 @@ func (r *report) announce(format string, args ...any) {
 	fmt.Fprintf(r.out, format, args...)
 }
 
-func (r *report) save(seed int64, class, source string) string {
+func (r *report) save(seed int64, class, source string) (string, error) {
 	if err := os.MkdirAll(r.dir, 0o755); err != nil {
-		return fmt.Sprintf("cannot create %s: %v", r.dir, err)
+		return "", fmt.Errorf("create %s: %w", r.dir, err)
 	}
 	path := filepath.Join(r.dir, fmt.Sprintf("%s-%d.low", class, seed))
 	if err := os.WriteFile(path, []byte(source), 0o644); err != nil {
-		return fmt.Sprintf("cannot write %s: %v", path, err)
+		return "", fmt.Errorf("write %s: %w", path, err)
 	}
-	return path
+	return path, nil
 }
 
 func (r *report) summary() {

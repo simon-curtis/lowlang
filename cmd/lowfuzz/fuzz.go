@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 
@@ -15,29 +17,36 @@ import (
 )
 
 type fuzzer struct {
-	cfg         gen.Config
-	runner      *oracle.Runner
-	report      *report
-	budget      int
-	workers     int
-	reduce      bool
-	reduceTests int
-	fixtures    string
+	settings
+	cfg    gen.Config
+	runner *oracle.Runner
+	report *report
 }
 
-func (f *fuzzer) run(ctx context.Context, s settings) {
+func newFuzzer(s settings, out io.Writer) *fuzzer {
+	cfg := gen.DefaultConfig
+	cfg.Panics = s.panics
+	return &fuzzer{
+		settings: s,
+		cfg:      cfg,
+		runner:   &oracle.Runner{Timeout: s.timeout},
+		report:   newReport(out, s.dir),
+	}
+}
+
+func (f *fuzzer) run(ctx context.Context) {
 	var next atomic.Int64
 	var wg sync.WaitGroup
-	for range s.workers {
+	for range f.workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for ctx.Err() == nil {
 				n := next.Add(1) - 1
-				if s.cases > 0 && n >= int64(s.cases) {
+				if f.cases > 0 && n >= int64(f.cases) {
 					return
 				}
-				f.runCase(ctx, s.seed+n)
+				f.runCase(ctx, f.seed+n)
 			}
 		}()
 	}
@@ -79,9 +88,17 @@ func (f *fuzzer) handle(ctx context.Context, seed int64, program *model.Program,
 		}
 		reduced = reducer.Reduce(ctx, program)
 	}
-	path := f.report.save(seed, finding.Class, reduced.String())
-	f.report.announce("seed %d: %s\n  %d -> %d bytes, %s\n", seed, signature, len(program.String()), len(reduced.String()), path)
+	location := f.saved(seed, finding.Class, reduced)
+	f.report.announce("seed %d: %s\n  %d -> %d bytes, %s\n", seed, signature, len(program.String()), len(reduced.String()), location)
 	f.writeFixture(reduced)
+}
+
+func (f *fuzzer) saved(seed int64, class string, program *model.Program) string {
+	path, err := f.report.save(seed, class, program.String())
+	if err != nil {
+		return fmt.Sprintf("not saved: %v", err)
+	}
+	return path
 }
 
 func (f *fuzzer) writeFixture(program *model.Program) {
@@ -90,6 +107,7 @@ func (f *fuzzer) writeFixture(program *model.Program) {
 	}
 	outcome, err := model.Run(program, f.budget)
 	if err != nil {
+		f.report.announce("  fixture: %v\n", err)
 		return
 	}
 	path, err := corpus.FromProgram(program, outcome).Write(f.fixtures)

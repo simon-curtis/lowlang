@@ -9,9 +9,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
-
-	"lowlang/internal/fuzz/gen"
-	"lowlang/internal/fuzz/oracle"
 )
 
 type settings struct {
@@ -54,20 +51,9 @@ func main() {
 		s.seed = time.Now().UnixNano()
 	}
 
-	cfg := gen.DefaultConfig
-	cfg.Panics = s.panics
-	fuzzer := &fuzzer{
-		cfg:         cfg,
-		runner:      &oracle.Runner{Timeout: s.timeout},
-		report:      newReport(os.Stdout, s.dir),
-		budget:      s.budget,
-		workers:     s.workers,
-		reduce:      s.reduce,
-		reduceTests: s.reduceTests,
-		fixtures:    s.fixtures,
-	}
+	fuzzer := newFuzzer(s, os.Stdout)
 	fmt.Printf("first seed %d, %d workers\n", s.seed, s.workers)
-	fuzzer.run(ctx, s)
+	fuzzer.run(ctx)
 	fuzzer.report.summary()
 	if fuzzer.report.failed() {
 		os.Exit(1)
