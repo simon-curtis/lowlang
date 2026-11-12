@@ -145,7 +145,9 @@ func (b *indexer) visit(n ast.Node) bool {
 	case *ast.StructLit:
 		b.structLit(n)
 	case *ast.FieldInit:
-		b.add(occurrence{pos: n.Pos, name: n.Name, node: n, parent: b.parents[n]})
+		if n.Form != ast.FieldImplied {
+			b.add(occurrence{pos: n.Pos, name: n.Name, node: n, parent: b.parents[n]})
+		}
 	case *ast.Match:
 		b.patterns(n.Arms, n.X.TypeOf())
 	case *ast.Catch:
@@ -197,7 +199,7 @@ func (b *indexer) structLit(e *ast.StructLit) {
 	b.add(occurrence{pos: e.Pos, name: e.Name, node: e})
 	for _, f := range e.Fields {
 		b.parents[f] = e.Type
-		if f.Value != nil && f.Value.Position() == f.Pos {
+		if f.Form == ast.FieldShorthand {
 			b.shorthand[f.Value] = true
 		}
 	}

@@ -446,10 +446,19 @@ type StructLit struct {
 	Pos      diag.Pos
 }
 
+type FieldForm uint8
+
+const (
+	FieldWritten FieldForm = iota
+	FieldShorthand
+	FieldImplied
+)
+
 type FieldInit struct {
 	Name  string
 	Value Expr
 	Pos   diag.Pos
+	Form  FieldForm
 	Field *types.Field
 }
 

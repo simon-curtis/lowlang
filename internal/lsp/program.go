@@ -6,7 +6,6 @@ import (
 	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
 	"lowlang/internal/diag"
-	"lowlang/internal/types"
 )
 
 type program struct {
@@ -51,16 +50,15 @@ type typeDecl struct {
 	file *ast.File
 	pos  diag.Pos
 	text string
-	typ  *types.Type
 	enum *ast.EnumDecl
 }
 
 func structTypeDecl(d *ast.StructDecl) *typeDecl {
-	return &typeDecl{name: d.Name, doc: d.Doc, file: d.File, pos: d.Pos, text: d.String(), typ: d.Type}
+	return &typeDecl{name: d.Name, doc: d.Doc, file: d.File, pos: d.Pos, text: d.String()}
 }
 
 func enumTypeDecl(d *ast.EnumDecl) *typeDecl {
-	return &typeDecl{name: d.Name, doc: d.Doc, file: d.File, pos: d.Pos, text: d.String(), typ: d.Type, enum: d}
+	return &typeDecl{name: d.Name, doc: d.Doc, file: d.File, pos: d.Pos, text: d.String(), enum: d}
 }
 
 func (d *typeDecl) target() target {

@@ -961,7 +961,7 @@ func (p *Parser) structLit(name lexer.Token) *ast.StructLit {
 	p.expect(lexer.LBrace)
 	p.sequence(lexer.RBrace, true, func() { lit.Fields = append(lit.Fields, p.fieldInit()) })
 	if children := p.trailing(); children != nil {
-		lit.Fields = append(lit.Fields, &ast.FieldInit{Name: "children", Value: children, Pos: children.Pos})
+		lit.Fields = append(lit.Fields, &ast.FieldInit{Name: "children", Value: children, Pos: children.Pos, Form: ast.FieldImplied})
 	}
 	return lit
 }
@@ -971,6 +971,7 @@ func (p *Parser) fieldInit() *ast.FieldInit {
 	init := &ast.FieldInit{Name: name.Text, Pos: name.Pos}
 	if !p.at(lexer.Colon) {
 		init.Value = &ast.Ident{Name: name.Text, Pos: name.Pos}
+		init.Form = ast.FieldShorthand
 		return init
 	}
 	p.next()

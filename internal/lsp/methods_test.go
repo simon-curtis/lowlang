@@ -148,3 +148,25 @@ func TestConstrainedMethodCompletion(t *testing.T) {
 	ints := c.completeTyping(f, "print(pts.first", "    ints.")
 	expect(t, ints, []string{"first", "biggest"}, nil)
 }
+
+const localFuncSource = `struct Point {
+    x: i64
+}
+
+fn main() {
+    let p = Point { x: 1 }
+    let show = fn(q: Point?) -> i64 { 0 }
+    let other = fn(n: i64) -> i64 { n }
+    print(p.show() + other(1))
+}
+`
+
+func TestMethodCompletionOffersLocalsAcceptingTheReceiver(t *testing.T) {
+	c := start(t)
+	f := scratch(t, "localfn.low", localFuncSource)
+	if got := c.open(f, f.src); len(got) != 0 {
+		t.Fatalf("diagnostics = %+v", got)
+	}
+	items := c.completeTyping(f, "print(p.show", "    p.")
+	expect(t, items, []string{"show"}, []string{"other"})
+}

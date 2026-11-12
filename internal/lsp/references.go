@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/check"
 	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 )
@@ -48,7 +49,7 @@ func (f *finder) add(x *index, o *occurrence, s side) {
 func (f *finder) visit(x *index, o *occurrence) {
 	q := &query{program: f.program, index: x, occ: o}
 	init, ok := o.node.(*ast.FieldInit)
-	if !ok || init.Value == nil || init.Value.Position() != init.Pos {
+	if !ok || init.Form != ast.FieldShorthand {
 		if f.resolves(q) {
 			f.add(x, o, plain)
 		}
@@ -108,11 +109,12 @@ func (s *Server) references(p ReferenceParams) any {
 }
 
 func nameError(name string) error {
+	if err := check.DeclarationNameError(name); err != nil {
+		return err
+	}
 	tokens, err := lexer.Lex([]byte(name), diag.Start(""), false)
 	var lexed *diag.Error
 	switch {
-	case lexer.IsKeyword(name):
-		return fmt.Errorf("%q is a keyword", name)
 	case errors.As(err, &lexed):
 		return errors.New(lexed.Msg)
 	case err != nil || len(tokens) != 3 || tokens[0].Kind != lexer.Ident || tokens[0].Text != name:

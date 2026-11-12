@@ -393,7 +393,7 @@ func (c *Checker) declareFunc(fn *ast.Func) {
 	if _, dup := c.local().funcs[fn.Name]; dup {
 		c.fail(fn.Pos, "function %s already declared", fn.Name)
 	}
-	if b := LookupBuiltin(fn.Name); b != nil && !b.Shadowable && b.Kind != TypeBuiltin {
+	if fixedBuiltin(fn.Name) != nil {
 		c.fail(fn.Pos, "%s is a builtin", fn.Name)
 	}
 	_, generic := c.local().generics[fn.Name]
@@ -1370,7 +1370,7 @@ func (c *Checker) structLit(e *ast.StructLit, want *types.Type) {
 			continue
 		}
 		if def := c.defaultOf(f); def != nil {
-			e.Fields = append(e.Fields, &ast.FieldInit{Name: f.Name, Value: def, Pos: e.Pos, Field: f})
+			e.Fields = append(e.Fields, &ast.FieldInit{Name: f.Name, Value: def, Pos: e.Pos, Form: ast.FieldImplied, Field: f})
 			continue
 		}
 		missing = append(missing, f.Name)

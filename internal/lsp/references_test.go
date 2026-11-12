@@ -150,6 +150,21 @@ func TestRenameFieldExpandsShorthand(t *testing.T) {
 	compiles(t, f.path, param)
 }
 
+func TestRenameFieldSkipsTrailingBlock(t *testing.T) {
+	c := start(t)
+	src := "struct Box {\n    tag: i64 = 0\n    children: []i64 = []\n}\n\nfn main() {\n    let b = Box { tag: 1 } {\n        1\n        2\n    }\n    let d = Box {}\n    print(b.children.len)\n    print(d.tag)\n}\n"
+	f := scratch(t, "trailing.low", src)
+	c.open(f, f.src)
+	edited := c.renamed(f, f.at(t, "    children: []i64", 4), "items")
+	got := string(edited[f.path])
+	if strings.Contains(got, "items: children") || !strings.Contains(got, "b.items.len") || !strings.Contains(got, "Box { tag: 1 } {") {
+		t.Errorf("field rename:\n%s", got)
+	}
+	if hover := c.hover(f, f.at(t, "} {", 2)); hover != "" {
+		t.Errorf("hover on the trailing brace = %q, want nothing", hover)
+	}
+}
+
 func TestInterpolationWithWidthAndFormat(t *testing.T) {
 	c := start(t)
 	src := "fn main() {\n    let ratio = 3.14159\n    print(\"{ratio,10:f2}|{ratio:e1}|{ratio, -8}|{ratio}\")\n}\n"
@@ -244,6 +259,8 @@ func TestRenameRefusals(t *testing.T) {
 		{local, "fn", "is a keyword"},
 		{local, "2c", "not a valid name"},
 		{local, "__c", "are reserved"},
+		{local, "print", "is a builtin"},
+		{local, "str", "is a builtin type"},
 	}
 	for _, tc := range cases {
 		_, failure := c.rename(f, tc.at, tc.name)

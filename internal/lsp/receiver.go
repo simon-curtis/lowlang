@@ -43,10 +43,6 @@ func (c *cursor) head(segments []segment) (*types.Type, []byte, []segment) {
 	return t, rest, segments[1:]
 }
 
-func identical(a, b *types.Type) bool {
-	return a != nil && b != nil && (a == b || a.String() == b.String())
-}
-
 func (c *cursor) method(t *types.Type, name string) *ast.Func {
 	if fn := c.function(c.file.Module, name, false); fn != nil {
 		return fn
@@ -73,7 +69,7 @@ func (c *cursor) methods(t *types.Type) {
 		c.moduleMethods(module, t, true)
 	}
 	for _, l := range c.scope() {
-		if l.Type != nil && l.Type.Kind == types.FuncKind && len(l.Type.Params) > 0 && identical(l.Type.Params[0], t) {
+		if l.Type != nil && l.Type.Kind == types.FuncKind && len(l.Type.Params) > 0 && l.Type.Params[0].Accepts(t) {
 			c.add(l.Name, completionMethod, l.Type.String())
 		}
 	}
