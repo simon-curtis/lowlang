@@ -42,6 +42,12 @@ pub struct Page {
     pub target: str
     /// The id of the session attached to the page, used as the `session` argument of `call`.
     pub session: str
+    subscription: *Subscription
+}
+
+enum Attach {
+    Ready(session: str)
+    Failed(failure: Error)
 }
 
 struct Dispatch {
@@ -49,8 +55,9 @@ struct Dispatch {
     context: str
     target: str
     handlers: Handlers
-    ready: chan[str]
+    ready: chan[Attach]
     urls: [str: str]
+    sessions: [str: bool]
 }
 
 /// Opens a blank page in `b`. See `open_page_on`.
@@ -60,24 +67,49 @@ pub fn open_page(b: Browser, handlers: Handlers) -> Page ! Error {
 
 /// Creates an isolated browser context with downloads denied, opens a blank page in it and starts routing its network activity to `handlers`.
 ///
-/// Fails with `Timeout` when the page does not attach within `10000` milliseconds, and with the error of the first failing command otherwise. Further pages that the page itself opens, such as popups, are closed as soon as they attach.
+/// Every page receives only the events of its own context. Fails with `Timeout` when the page does not attach within `10000` milliseconds, and with the error of the first failing command, or of the command that prepares the page for interception, otherwise; a failed open disposes the context. Further pages that the page itself opens, such as popups, are closed as soon as they attach. A target of the page that cannot be prepared for interception is closed instead of resumed.
 pub fn open_page_on(b: *BrowserHandle, handlers: Handlers) -> Page ! Error {
     let c = b.connection
     let created = call(c, "", "Target.createBrowserContext", [json.bool_member("disposeOnDetach", true)])?
     let context = json.text_of(created, "browserContextId")
+    let subscription = subscribe(c)
+    let page = started(b, context, handlers, subscription) catch {
+        e => {
+            unsubscribe(c, subscription)
+            attempt(c, "", "Target.disposeBrowserContext", [json.text_member("browserContextId", context)])
+            fail e
+        }
+    }
+    page
+}
+
+fn started(b: *BrowserHandle, context: str, handlers: Handlers, subscription: *Subscription) -> Page ! Error {
+    let c = b.connection
     call(c, "", "Browser.setDownloadBehavior", [json.text_member("behavior", "deny"), json.text_member("browserContextId", context)])?
-    let d = new(Dispatch { browser: b, context, target: "", handlers, ready: chan[str](1), urls: [:] })
-    spawn dispatch(d)
+    let d = new(Dispatch { browser: b, context, target: "", handlers, ready: chan[Attach](1), urls: [:], sessions: [:] })
+    spawn dispatch(d, subscription)
     call(c, "", "Target.setAutoAttach", attach_options())?
     let target = call(c, "", "Target.createTarget", [json.text_member("url", "about:blank"), json.text_member("browserContextId", context)])?
-    let session = select {
-        s = <-d.ready => s ?? ""
-        after(10000) => ""
+    let attach: Attach? = select {
+        a = <-d.ready => a
+        after(10000) => none
     }
-    if session.len == 0 {
-        fail Timeout
+    let outcome = match attach {
+        some(a) => a
+        none => fail Timeout
     }
-    Page { browser: b, context, target: json.text_of(target, "targetId"), session }
+    match outcome {
+        Ready(session) => Page { browser: b, context, target: json.text_of(target, "targetId"), session, subscription }
+        Failed(failure) => fail failure
+    }
+}
+
+/// Ends the page: its events stop and its browser context, with every target in it, is disposed.
+///
+/// Fails with the errors of `call` when the browser cannot dispose the context; the page's events have stopped by then.
+pub fn close_page(p: Page) ! Error {
+    unsubscribe(p.browser.connection, p.subscription)
+    call(p.browser.connection, "", "Target.disposeBrowserContext", [json.text_member("browserContextId", p.context)])?
 }
 
 /// Starts navigating the page to `url`.
@@ -99,21 +131,41 @@ fn attach_options() -> []json.Member {
     [json.bool_member("autoAttach", true), json.bool_member("waitForDebuggerOnStart", true), json.bool_member("flatten", true)]
 }
 
-fn dispatch(d: *Dispatch) {
-    for e in events(d.browser.connection) {
-        handle(d, e)
+fn dispatch(d: *Dispatch, s: *Subscription) {
+    for {
+        let next: Event? = select {
+            e = <-s.events => e
+            <-s.done => none
+        }
+        match next {
+            some(e) => handle(d, e)
+            none => return
+        }
     }
 }
 
 fn handle(d: *Dispatch, e: Event) {
     if e.method == "Target.attachedToTarget" {
         let info = json.field(e.params, "targetInfo")
-        let first = d.target.len == 0 && json.text_of(info, "type") == "page" && json.text_of(info, "browserContextId") == d.context
+        if json.text_of(info, "browserContextId") != d.context {
+            return
+        }
+        d.sessions[json.text_of(e.params, "sessionId")] = true
+        let first = d.target.len == 0 && json.text_of(info, "type") == "page"
         if first {
             d.target = json.text_of(info, "targetId")
         }
         spawn attached(d, e.params, first)
-    } else if e.method == "Fetch.requestPaused" {
+        return
+    }
+    if e.method == "Target.detachedFromTarget" {
+        delete(mut d.sessions, json.text_of(e.params, "sessionId"))
+        return
+    }
+    if !(d.sessions[e.session] ?? false) {
+        return
+    }
+    if e.method == "Fetch.requestPaused" {
         spawn paused(d, e.session, e.params)
     } else if e.method == "Network.requestWillBeSent" {
         d.urls["{e.session}/{json.text_of(e.params, "requestId")}"] = json.text_of(json.field(e.params, "request"), "url")
@@ -132,21 +184,22 @@ fn attached(d: *Dispatch, params: json.Value, first: bool) {
     let info = json.field(params, "targetInfo")
     let kind = json.text_of(info, "type")
     let id = json.text_of(info, "targetId")
-    let ours = json.text_of(info, "browserContextId") == d.context
-    if !ours {
-        attempt(c, session, "Runtime.runIfWaitingForDebugger", [])
-        return
-    }
     if kind == "page" && !first {
         attempt(c, "", "Target.closeTarget", [json.text_member("targetId", id)])
         return
     }
     prepare(c, session, kind == "page") catch {
-        _ => {}
+        e => {
+            attempt(c, "", "Target.closeTarget", [json.text_member("targetId", id)])
+            if first {
+                d.ready <- Failed(e)
+            }
+            return
+        }
     }
     attempt(c, session, "Runtime.runIfWaitingForDebugger", [])
     if first {
-        d.ready <- session
+        d.ready <- Ready(session)
     }
 }
 

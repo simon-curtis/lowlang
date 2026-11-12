@@ -26,14 +26,14 @@ pub struct Event {
 
 /// A WebSocket connection to the DevTools endpoint of a browser.
 ///
-/// A background task reads every message, delivers command replies to the waiting `call` and queues events for `events`. When the socket closes, pending calls fail with `Closed` and the event channel is closed.
+/// A background task reads every message, delivers command replies to the waiting `call` and sends every event to each `Subscription`. When the socket closes, pending calls fail with `Closed` and the event channels are closed. A message that is not JSON fails every pending call with `Protocol`.
 pub struct Connection {
     socket: *websocket.SocketHandle
     writing: chan[bool]
     lock: chan[bool]
     next: i64
     waiting: [i64: chan[Reply]]
-    events: chan[Event]
+    subscribers: []*Subscription
     closed: bool
 }
 
@@ -45,7 +45,7 @@ struct Reply {
 fn connect(url: str) -> *Connection ! io.Error {
     using var dialed = websocket.dial(url)?
     let socket = websocket.detach(mut dialed)
-    let c = new(Connection { socket, writing: chan[bool](1), lock: chan[bool](1), next: 1, waiting: [:], events: chan[Event](1024), closed: false })
+    let c = new(Connection { socket, writing: chan[bool](1), lock: chan[bool](1), next: 1, waiting: [:], subscribers: [], closed: false })
     spawn pump(c)
     c
 }
@@ -57,17 +57,42 @@ fn pump(c: *Connection) {
             _ => break
         }
         let v = json.parse(m.data) catch {
-            _ => continue
+            _ => {
+                refuse(c, "unparsable message")
+                continue
+            }
         }
         route(c, v)
     }
     shut(c)
 }
 
+fn refuse(c: *Connection, message: str) {
+    c.lock <- true
+    let pending = c.waiting
+    c.waiting = [:]
+    <-c.lock
+    for _, w in pending {
+        w <- Reply { result: json.Value.Null, error: message }
+    }
+}
+
+fn deliver(c: *Connection, e: Event) {
+    c.lock <- true
+    let subscribers = c.subscribers
+    <-c.lock
+    for s in subscribers {
+        select {
+            s.events <- e => {}
+            <-s.done => {}
+        }
+    }
+}
+
 fn route(c: *Connection, v: json.Value) {
     let id = json.int_of(v, "id")
     if id == 0 {
-        c.events <- Event { method: json.text_of(v, "method"), session: json.text_of(v, "sessionId"), params: json.field(v, "params") }
+        deliver(c, Event { method: json.text_of(v, "method"), session: json.text_of(v, "sessionId"), params: json.field(v, "params") })
         return
     }
     c.lock <- true
@@ -87,18 +112,63 @@ fn shut(c: *Connection) {
     c.closed = true
     let pending = c.waiting
     c.waiting = [:]
+    let subscribers = c.subscribers
+    c.subscribers = []
     <-c.lock
     for _, w in pending {
         close(w)
     }
-    close(c.events)
+    for s in subscribers {
+        close(s.events)
+    }
 }
 
-/// Returns the channel that receives the events of every session on the connection.
+/// A stream of the events of a connection, made by `subscribe`.
+pub struct Subscription {
+    /// Receives every event of every session on the connection from the moment of the subscription, in the order the browser sent them. It holds up to `1024` queued events; while it is full, reading of further replies and events waits. It is closed when the connection closes.
+    pub events: chan[Event]
+    done: chan[bool]
+}
+
+/// Returns a new `Subscription` to the events of `c`.
 ///
-/// The channel holds up to `1024` queued events; while it is full, reading of further replies and events waits. It is closed when the connection closes. Each event is received once, by whichever task reads it.
-pub fn events(c: *Connection) -> chan[Event] {
-    c.events
+/// Every subscription receives every event, so tasks that read different subscriptions do not take events from each other. A subscription made on a closed connection has a closed channel. End it with `unsubscribe` when no longer read.
+pub fn subscribe(c: *Connection) -> *Subscription {
+    let s = new(Subscription { events: chan[Event](1024), done: chan[bool](1) })
+    c.lock <- true
+    let open = !c.closed
+    if open {
+        push(mut c.subscribers, s)
+    }
+    <-c.lock
+    if !open {
+        close(s.events)
+    }
+    s
+}
+
+/// Ends the subscription `s`: no further events are sent to it and the channel of `ended` is closed. Safe to call more than once.
+pub fn unsubscribe(c: *Connection, s: *Subscription) {
+    c.lock <- true
+    var kept: []*Subscription = []
+    var found = false
+    for x in c.subscribers {
+        if x == s {
+            found = true
+        } else {
+            push(mut kept, x)
+        }
+    }
+    c.subscribers = kept
+    <-c.lock
+    if found {
+        close(s.done)
+    }
+}
+
+/// Returns a channel that is closed once `s` has been ended with `unsubscribe`.
+pub fn ended(s: *Subscription) -> chan[bool] {
+    s.done
 }
 
 /// Sends the command `method` with `params` and waits for the reply, returning its `result`.
