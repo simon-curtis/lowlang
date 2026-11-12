@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 	"lowlang/internal/types"
 )
 
@@ -16,7 +16,7 @@ type generic struct {
 	decls     []*ast.TypeParam
 	params    []*types.Type
 	pub       bool
-	pos       lexer.Pos
+	pos       diag.Pos
 	file      *ast.File
 	strct     *ast.StructDecl
 	enum      *ast.EnumDecl
@@ -95,7 +95,7 @@ func (c *Checker) within(file *ast.File, bound map[string]*types.Type, run func(
 	c.file, c.bound = savedFile, savedBound
 }
 
-func (c *Checker) satisfy(args []*types.Type, decls []*ast.TypeParam, params []*types.Type, pos lexer.Pos) {
+func (c *Checker) satisfy(args []*types.Type, decls []*ast.TypeParam, params []*types.Type, pos diag.Pos) {
 	for i, a := range args {
 		if !a.Satisfies(params[i].Constraint) {
 			c.fail(pos, "%s does not satisfy %s", a, strings.Join(decls[i].Constraints, " + "))
@@ -103,7 +103,7 @@ func (c *Checker) satisfy(args []*types.Type, decls []*ast.TypeParam, params []*
 	}
 }
 
-func (c *Checker) declareGeneric(name string, decls []*ast.TypeParam, pub bool, pos lexer.Pos) *generic {
+func (c *Checker) declareGeneric(name string, decls []*ast.TypeParam, pub bool, pos diag.Pos) *generic {
 	_, dupType := c.local().types[name]
 	if _, dup := c.local().generics[name]; dup || dupType || isTypeName(name) {
 		c.fail(pos, "type %s already declared", name)
@@ -120,7 +120,7 @@ func (c *Checker) origin(g *generic) *types.Type {
 	return g.abstract
 }
 
-func (c *Checker) instantiateType(g *generic, args []*types.Type, pos lexer.Pos) *types.Type {
+func (c *Checker) instantiateType(g *generic, args []*types.Type, pos diag.Pos) *types.Type {
 	if len(args) != len(g.params) {
 		c.fail(pos, "%s takes %s, found %d", g.name, plural(len(g.params), "type argument"), len(args))
 	}
@@ -159,7 +159,7 @@ func (c *Checker) instantiateType(g *generic, args []*types.Type, pos lexer.Pos)
 	return t
 }
 
-func (c *Checker) lookupGeneric(module, name string, pos lexer.Pos) *generic {
+func (c *Checker) lookupGeneric(module, name string, pos diag.Pos) *generic {
 	if module == "" {
 		return c.local().generics[name]
 	}
@@ -193,7 +193,7 @@ func (c *Checker) declareGenericFunc(fn *ast.Func) {
 	c.within(c.file, c.bindingsOf(fn), func() { c.signature(fn) })
 }
 
-func (c *Checker) instance(fn *ast.Func, args []*types.Type, pos lexer.Pos) *ast.Func {
+func (c *Checker) instance(fn *ast.Func, args []*types.Type, pos diag.Pos) *ast.Func {
 	key := typeKey(args)
 	if inst, ok := c.instances[fn][key]; ok {
 		return inst
@@ -266,7 +266,7 @@ func (in *inference) pairs(patterns, actuals []*types.Type) {
 	}
 }
 
-func (c *Checker) inferred(in *inference, pos lexer.Pos) []*types.Type {
+func (c *Checker) inferred(in *inference, pos diag.Pos) []*types.Type {
 	args := make([]*types.Type, len(in.params))
 	for i, p := range in.params {
 		a, ok := in.bound[p]
@@ -279,7 +279,7 @@ func (c *Checker) inferred(in *inference, pos lexer.Pos) []*types.Type {
 	return args
 }
 
-func (c *Checker) substitute(t *types.Type, in *inference, pos lexer.Pos) *types.Type {
+func (c *Checker) substitute(t *types.Type, in *inference, pos diag.Pos) *types.Type {
 	if t == nil || !t.Abstract() {
 		return t
 	}
@@ -342,7 +342,7 @@ func (c *Checker) substitute(t *types.Type, in *inference, pos lexer.Pos) *types
 	return nil
 }
 
-func (c *Checker) genericFuncValue(fn *ast.Func, want *types.Type, pos lexer.Pos) (*ast.Func, *types.Type) {
+func (c *Checker) genericFuncValue(fn *ast.Func, want *types.Type, pos diag.Pos) (*ast.Func, *types.Type) {
 	if want == nil || want.Kind != types.FuncKind || len(want.Params) != len(fn.Params) {
 		c.fail(pos, "cannot infer type arguments of %s; annotate the binding", fn.Name)
 	}
@@ -479,7 +479,7 @@ func (c *Checker) genericLitType(e *ast.StructLit, g *generic, want *types.Type,
 	return c.instantiateType(g, c.inferred(in, e.Pos), e.Pos)
 }
 
-func (c *Checker) genericEnum(g *generic, name string, args []ast.Expr, want *types.Type, pos lexer.Pos) (*types.Type, *types.Variant, []*types.Type) {
+func (c *Checker) genericEnum(g *generic, name string, args []ast.Expr, want *types.Type, pos diag.Pos) (*types.Type, *types.Variant, []*types.Type) {
 	if g.enum == nil {
 		c.fail(pos, "%s is a type, not a value", g.name)
 	}
@@ -511,6 +511,6 @@ func (c *Checker) mapOps(m *types.Type) {
 	}
 	args := []*types.Type{m.Key, m.Elem}
 	for _, name := range mapFuncs {
-		c.instance(c.scope("").funcs[name], args, lexer.Pos{})
+		c.instance(c.scope("").funcs[name], args, diag.Pos{})
 	}
 }

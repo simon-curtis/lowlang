@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
 )
@@ -16,14 +17,14 @@ func (c *Checker) derivationHome(kind derivation) *ast.File {
 	return c.file
 }
 
-func (c *Checker) renderer(t *types.Type, pos lexer.Pos) *ast.Func {
+func (c *Checker) renderer(t *types.Type, pos diag.Pos) *ast.Func {
 	if t.Abstract() {
 		return nil
 	}
 	return c.derive(render, t, pos)
 }
 
-func (c *Checker) requireValue(pos lexer.Pos, what string, t *types.Type) {
+func (c *Checker) requireValue(pos diag.Pos, what string, t *types.Type) {
 	if t == types.Void || t == types.Never {
 		c.fail(pos, "%s needs a value, found %s", what, t)
 	}
@@ -68,7 +69,7 @@ func (s *synth) flush() {
 	}
 	text := s.text.String()
 	s.text.Reset()
-	fmt.Fprintf(&s.out, "__append_str(mut b, %s)\n", quoted(text))
+	fmt.Fprintf(&s.out, "__append_str(mut b, %s)\n", lexer.Quote(text))
 }
 
 func recurse(expr string) string {

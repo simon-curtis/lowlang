@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 )
 
 type text struct {
@@ -54,17 +54,17 @@ func utf16Len(r rune) int {
 	return 1
 }
 
-func (t text) position(p lexer.Pos) Position {
+func (t text) position(p diag.Pos) Position {
 	line := p.Line - 1
 	return Position{Line: line, Character: t.utf16(line, p.Col-1)}
 }
 
-func (t text) span(p lexer.Pos, length int) Range {
-	end := lexer.Pos{File: p.File, Line: p.Line, Col: p.Col + length}
+func (t text) span(p diag.Pos, length int) Range {
+	end := diag.Pos{File: p.File, Line: p.Line, Col: p.Col + length}
 	return Range{Start: t.position(p), End: t.position(end)}
 }
 
-func (t text) word(p lexer.Pos) Range {
+func (t text) word(p diag.Pos) Range {
 	src := t.line(p.Line - 1)
 	start := min(max(p.Col-1, 0), len(src))
 	end := start
@@ -77,7 +77,7 @@ func (t text) word(p lexer.Pos) Range {
 	return t.span(p, max(end-start, 1))
 }
 
-func (t text) nameAfter(p lexer.Pos, name string) lexer.Pos {
+func (t text) nameAfter(p diag.Pos, name string) diag.Pos {
 	src := t.line(p.Line - 1)
 	from := min(max(p.Col-1, 0), len(src))
 	for {
@@ -90,7 +90,7 @@ func (t text) nameAfter(p lexer.Pos, name string) lexer.Pos {
 		before := at == 0 || !isWord(src[at-1])
 		after := end == len(src) || !isWord(src[end])
 		if before && after {
-			return lexer.Pos{File: p.File, Line: p.Line, Col: at + 1}
+			return diag.Pos{File: p.File, Line: p.Line, Col: at + 1}
 		}
 		from = at + 1
 	}

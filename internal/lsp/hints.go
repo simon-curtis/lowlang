@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 )
 
 func (s *Server) inlayHints(p InlayHintParams) []InlayHint {
@@ -73,7 +73,7 @@ type symbolFile struct {
 	text text
 }
 
-func (f symbolFile) at(pos lexer.Pos, name string) Location {
+func (f symbolFile) at(pos diag.Pos, name string) Location {
 	start := f.text.nameAfter(pos, name)
 	return Location{URI: f.uri, Range: f.text.word(start)}
 }

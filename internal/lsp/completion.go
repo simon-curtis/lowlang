@@ -8,6 +8,7 @@ import (
 	"lowlang/internal/ast"
 	"lowlang/internal/check"
 	"lowlang/internal/compiler"
+	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 	"lowlang/internal/regex"
 	"lowlang/internal/types"
@@ -234,7 +235,7 @@ func (c *cursor) enclosing() *ast.Func {
 
 func (c *cursor) span(f *ast.Func) (int, int) {
 	end := math.MaxInt
-	var starts []lexer.Pos
+	var starts []diag.Pos
 	for _, g := range c.file.Funcs {
 		if g.Template == nil && g.Closure == nil {
 			starts = append(starts, g.Pos)

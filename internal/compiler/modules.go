@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 	"lowlang/internal/parser"
 )
 
@@ -24,7 +24,7 @@ func isStd(module string) bool {
 
 type edge struct {
 	to  string
-	pos lexer.Pos
+	pos diag.Pos
 }
 
 type loader struct {
@@ -108,7 +108,7 @@ func (l *loader) imported(e edge) error {
 	dir := filepath.Join(l.root, filepath.FromSlash(e.to))
 	files, err := sources(dir)
 	if errors.Is(err, os.ErrNotExist) || (err == nil && len(files) == 0) {
-		return fmt.Errorf("%s: cannot find module %s in %s", e.pos, e.to, dir)
+		return diag.Errorf(e.pos, "cannot find module %s in %s", e.to, dir)
 	}
 	if err != nil {
 		return err
@@ -118,7 +118,7 @@ func (l *loader) imported(e edge) error {
 
 func (l *loader) std(e edge) error {
 	entries, err := fs.ReadDir(stdFS, e.to)
-	missing := fmt.Errorf("%s: cannot find module %s in the standard library", e.pos, e.to)
+	missing := diag.Errorf(e.pos, "cannot find module %s in the standard library", e.to)
 	if err != nil {
 		return missing
 	}
@@ -158,7 +158,7 @@ func (l *loader) link(file *ast.File) error {
 	seen := map[string]bool{}
 	for _, imp := range file.Imports {
 		if seen[imp.Alias] {
-			return fmt.Errorf("%s: module name %s imported twice", imp.Pos, imp.Alias)
+			return diag.Errorf(imp.Pos, "module name %s imported twice", imp.Alias)
 		}
 		seen[imp.Alias] = true
 		e := edge{to: imp.Path, pos: imp.Pos}
@@ -176,11 +176,7 @@ func (l *loader) parseFile(name string, std bool) (*ast.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	tokens, err := lexer.Lex(src, name)
-	if err != nil {
-		return nil, err
-	}
-	file, err := parser.Parse(tokens)
+	file, err := parser.ParseSource(src, diag.Start(name), false)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +195,7 @@ func (l *loader) cycles() error {
 			switch state[e.to] {
 			case 1:
 				cycle := append(slices.Clone(stack[slices.Index(stack, e.to):]), e.to)
-				return fmt.Errorf("%s: import cycle: %s", e.pos, strings.Join(display(cycle), " -> "))
+				return diag.Errorf(e.pos, "import cycle: %s", strings.Join(display(cycle), " -> "))
 			case 0:
 				if err := visit(e.to); err != nil {
 					return err
@@ -229,11 +225,7 @@ func parseStd(name string) (*ast.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	tokens, err := lexer.LexAt(src, lexer.Pos{File: name, Line: 1, Col: 1}, true)
-	if err != nil {
-		return nil, err
-	}
-	file, err := parser.ParsePrelude(tokens)
+	file, err := parser.ParseSource(src, diag.Start(name), true)
 	if err != nil {
 		return nil, err
 	}

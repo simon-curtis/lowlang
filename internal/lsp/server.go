@@ -8,18 +8,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"time"
 
 	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 	"lowlang/internal/lint"
 	"lowlang/internal/parser"
 )
-
-var errorPos = regexp.MustCompile(`(?s)^(?:(.*?):)?(\d+):(\d+): (.*)$`)
 
 type Server struct {
 	stream       *stream
@@ -319,7 +315,7 @@ func (s *Server) warn(w lint.Warning, document string) (string, Diagnostic) {
 	if file == "" || !filepath.IsAbs(file) {
 		file = document
 	}
-	pos := lexer.Pos{File: file, Line: w.Pos.Line, Col: w.Pos.Col}
+	pos := diag.Pos{File: file, Line: w.Pos.Line, Col: w.Pos.Col}
 	d := Diagnostic{Severity: severityWarning, Source: "low", Message: w.Msg, Range: s.text(file).word(pos)}
 	return uriOf(file), d
 }
@@ -346,21 +342,17 @@ func (s *Server) publish(entry string, diagnostics map[string][]Diagnostic) erro
 
 func (s *Server) diagnose(err error, document string) (string, Diagnostic) {
 	d := Diagnostic{Severity: severityError, Source: "low", Message: err.Error()}
-	m := errorPos.FindStringSubmatch(err.Error())
-	if m == nil {
+	var located *diag.Error
+	if !errors.As(err, &located) {
 		return uriOf(document), d
 	}
-	file := m[1]
-	if file == "" || !filepath.IsAbs(file) {
-		file = document
+	pos := located.Pos
+	if !filepath.IsAbs(pos.File) {
+		pos.File = document
 	}
-	line, _ := strconv.Atoi(m[2])
-	col, _ := strconv.Atoi(m[3])
-	d.Message = m[4]
-	pos := lexer.Pos{File: file, Line: line, Col: col}
-	t := s.text(file)
-	d.Range = t.word(pos)
-	return uriOf(file), d
+	d.Message = located.Msg
+	d.Range = s.text(pos.File).word(pos)
+	return uriOf(pos.File), d
 }
 
 func (s *Server) query(p TextDocumentPositionParams) *query {
@@ -473,11 +465,7 @@ func (s *Server) parsed(path string) *ast.File {
 	if err != nil {
 		return nil
 	}
-	tokens, err := lexer.Lex(src, path)
-	if err != nil {
-		return nil
-	}
-	file, err := parser.Parse(tokens)
+	file, err := parser.ParseSource(src, diag.Start(path), false)
 	if err != nil {
 		return nil
 	}

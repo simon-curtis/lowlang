@@ -12,22 +12,10 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
 )
-
-type Error struct {
-	Pos lexer.Pos
-	Msg string
-}
-
-func (e *Error) Error() string {
-	return fmt.Sprintf("%s: %s", e.Pos, e.Msg)
-}
-
-type bailout struct {
-	err *Error
-}
 
 type loop struct {
 	label  string
@@ -87,7 +75,7 @@ type Checker struct {
 	std             fs.FS
 }
 
-func Check(files []*ast.File, std fs.FS) (embeds []string, err error) {
+func Check(files []*ast.File, std fs.FS) ([]string, error) {
 	c := &Checker{
 		std:             std,
 		modules:         map[string]*scope{},
@@ -113,18 +101,9 @@ func Check(files []*ast.File, std fs.FS) (embeds []string, err error) {
 		checkingDefault: map[*types.Field]bool{},
 		derived:         map[string]*ast.Func{},
 	}
-	defer func() {
-		r := recover()
-		if r == nil {
-			return
-		}
-		b, ok := r.(bailout)
-		if !ok {
-			panic(r)
-		}
-		err = b.err
-	}()
-	c.check(files)
+	if failure := diag.Try(func() { c.check(files) }); failure != nil {
+		return nil, failure
+	}
 	return c.embeds, nil
 }
 
@@ -148,7 +127,7 @@ func qualified(module, name string) string {
 	return fmt.Sprintf("%s.%s", module, name)
 }
 
-func (c *Checker) imported(alias string, pos lexer.Pos) *scope {
+func (c *Checker) imported(alias string, pos diag.Pos) *scope {
 	path, ok := c.file.Imported(alias)
 	if !ok {
 		c.fail(pos, "unknown module %s", alias)
@@ -161,7 +140,7 @@ func (c *Checker) isModule(name string) bool {
 	return ok && c.find(name) == nil
 }
 
-func (c *Checker) importedType(alias, name string, pos lexer.Pos) *types.Type {
+func (c *Checker) importedType(alias, name string, pos diag.Pos) *types.Type {
 	t := c.imported(alias, pos).types[name]
 	if t == nil {
 		c.fail(pos, "module %s has no type %s", alias, name)
@@ -172,7 +151,7 @@ func (c *Checker) importedType(alias, name string, pos lexer.Pos) *types.Type {
 	return t
 }
 
-func (c *Checker) importedFunc(alias, name string, pos lexer.Pos) *ast.Func {
+func (c *Checker) importedFunc(alias, name string, pos diag.Pos) *ast.Func {
 	fn := c.imported(alias, pos).funcs[name]
 	if fn == nil {
 		c.fail(pos, "module %s has no function %s", alias, name)
@@ -183,8 +162,8 @@ func (c *Checker) importedFunc(alias, name string, pos lexer.Pos) *ast.Func {
 	return fn
 }
 
-func (c *Checker) fail(pos lexer.Pos, format string, args ...any) {
-	panic(bailout{&Error{Pos: pos, Msg: fmt.Sprintf(format, args...)}})
+func (c *Checker) fail(pos diag.Pos, format string, args ...any) {
+	diag.Fail(pos, format, args...)
 }
 
 func (c *Checker) resolve(t *ast.TypeName) *types.Type {
@@ -299,7 +278,7 @@ func (c *Checker) optional(elem *types.Type) *types.Type {
 	o := types.NewOptional(elem)
 	c.opts[elem] = o
 	if elem.Size() > 0 {
-		c.layout(o, lexer.Pos{})
+		c.layout(o, diag.Pos{})
 	}
 	return o
 }
@@ -348,7 +327,7 @@ func (c *Checker) result(ok, err *types.Type) *types.Type {
 	r := types.NewResult(ok, err)
 	c.results[key] = r
 	if c.laid {
-		c.layout(r, lexer.Pos{})
+		c.layout(r, diag.Pos{})
 	} else {
 		c.unlaid = append(c.unlaid, r)
 	}
@@ -379,7 +358,7 @@ func (c *Checker) check(files []*ast.File) {
 	}
 }
 
-func (c *Checker) declareType(name string, pos lexer.Pos, t *types.Type, pub bool) {
+func (c *Checker) declareType(name string, pos diag.Pos, t *types.Type, pub bool) {
 	_, generic := c.local().generics[name]
 	if _, dup := c.local().types[name]; dup || isTypeName(name) || generic {
 		c.fail(pos, "type %s already declared", name)
@@ -445,14 +424,14 @@ func (c *Checker) declareTypes(files []*ast.File) {
 		}
 	}
 	for _, t := range c.unlaid {
-		c.layout(t, lexer.Pos{})
+		c.layout(t, diag.Pos{})
 	}
 	c.unlaid = nil
 	c.laid = true
 	c.checkContainments()
 }
 
-func (c *Checker) layout(t *types.Type, pos lexer.Pos) {
+func (c *Checker) layout(t *types.Type, pos diag.Pos) {
 	if err := t.Layout(); err != nil {
 		c.fail(pos, "%s", err)
 	}
@@ -566,7 +545,7 @@ func (c *Checker) resultOf(result, errName *ast.TypeName) *types.Type {
 func (c *Checker) checkMain() {
 	main, ok := c.scope("").funcs["main"]
 	if !ok {
-		c.fail(lexer.Pos{Line: 1, Col: 1}, "missing function main")
+		c.fail(diag.Pos{Line: 1, Col: 1}, "missing function main")
 	}
 	ret := main.RetType
 	if len(main.Params) > 0 || main.TypeParams != nil || (ret != types.Void && (ret.Kind != types.ResultKind || ret.Ok != types.Void)) {
@@ -658,7 +637,7 @@ func (c *Checker) closureName() string {
 	return fmt.Sprintf("%s..c%d", c.fn.Name, c.counts[c.fn])
 }
 
-func (c *Checker) funcValue(fn *ast.Func, want *types.Type, pos lexer.Pos) (*ast.Func, *types.Type) {
+func (c *Checker) funcValue(fn *ast.Func, want *types.Type, pos diag.Pos) (*ast.Func, *types.Type) {
 	if fn.Variadic {
 		c.fail(pos, "variadic function %s cannot be used as a value", fn.Name)
 	}
@@ -680,7 +659,7 @@ func (c *Checker) funcValue(fn *ast.Func, want *types.Type, pos lexer.Pos) (*ast
 	return fn, c.signatureOf(fn, fn.Extern != nil || callback)
 }
 
-func (c *Checker) callback(fn *ast.Func, pos lexer.Pos) {
+func (c *Checker) callback(fn *ast.Func, pos diag.Pos) {
 	scalar := func(t *types.Type) bool {
 		return t.CCompatible() && t.Kind != types.StructKind
 	}
@@ -728,7 +707,7 @@ func (c *Checker) find(name string) *ast.Local {
 	return nil
 }
 
-func (c *Checker) lookup(name string, pos lexer.Pos) *ast.Local {
+func (c *Checker) lookup(name string, pos diag.Pos) *ast.Local {
 	l := c.find(name)
 	if l == nil {
 		c.fail(pos, "undefined: %s", name)
@@ -737,7 +716,7 @@ func (c *Checker) lookup(name string, pos lexer.Pos) *ast.Local {
 	return l
 }
 
-func (c *Checker) capture(l *ast.Local, pos lexer.Pos) {
+func (c *Checker) capture(l *ast.Local, pos diag.Pos) {
 	for i := len(c.closures) - 1; i >= 0 && c.closures[i].Func != l.Owner; i-- {
 		if l.Ref {
 			c.fail(pos, "a closure cannot capture mut parameter %s", l.Name)
@@ -837,7 +816,7 @@ func (c *Checker) deferStmt(s *ast.Defer) {
 	c.deferring = false
 }
 
-func (c *Checker) leaving(pos lexer.Pos, keyword string) {
+func (c *Checker) leaving(pos diag.Pos, keyword string) {
 	if c.deferring {
 		c.fail(pos, "%s cannot appear in a deferred statement", keyword)
 	}
@@ -912,19 +891,19 @@ func (c *Checker) key(e ast.Expr, m *types.Type) {
 	c.expectType(e, m.Key)
 }
 
-func (c *Checker) requireNumber(t *types.Type, op lexer.Kind, pos lexer.Pos) {
+func (c *Checker) requireNumber(t *types.Type, op lexer.Kind, pos diag.Pos) {
 	if !t.Number() && t != types.Never {
 		c.fail(pos, "operator %s requires a number, found %s", op, t)
 	}
 }
 
-func (c *Checker) requireInteger(t *types.Type, op lexer.Kind, pos lexer.Pos) {
+func (c *Checker) requireInteger(t *types.Type, op lexer.Kind, pos diag.Pos) {
 	if !t.Integer() && t != types.Never {
 		c.fail(pos, "operator %s requires an integer, found %s", op, t)
 	}
 }
 
-func (c *Checker) mutable(root *ast.Local, pos lexer.Pos, action string) {
+func (c *Checker) mutable(root *ast.Local, pos diag.Pos, action string) {
 	switch {
 	case root.Param && !root.Ref:
 		c.fail(pos, "cannot %s; declare the parameter mut", fmt.Sprintf(action, root.Name))
@@ -933,7 +912,7 @@ func (c *Checker) mutable(root *ast.Local, pos lexer.Pos, action string) {
 	}
 }
 
-func (c *Checker) place(e ast.Expr, pos lexer.Pos, action, invalid string) (*ast.Place, *types.Type) {
+func (c *Checker) place(e ast.Expr, pos diag.Pos, action, invalid string) (*ast.Place, *types.Type) {
 	t := c.plain(e, nil)
 	place, ok := ast.PlaceOf(e)
 	if !ok {
@@ -1055,7 +1034,7 @@ func (c *Checker) rangeType(lo, hi ast.Expr) *types.Type {
 	return t
 }
 
-func (c *Checker) enterLoop(label string, pos lexer.Pos) *loop {
+func (c *Checker) enterLoop(label string, pos diag.Pos) *loop {
 	for _, outer := range c.loops {
 		if label != "" && outer.label == label {
 			c.fail(pos, "label %s is already used by an enclosing loop", label)
@@ -1066,14 +1045,14 @@ func (c *Checker) enterLoop(label string, pos lexer.Pos) *loop {
 	return l
 }
 
-func (c *Checker) exitLoop(l *loop, pos lexer.Pos) {
+func (c *Checker) exitLoop(l *loop, pos diag.Pos) {
 	c.loops = c.loops[:len(c.loops)-1]
 	if l.label != "" && !l.used {
 		c.fail(pos, "label %s is not used", l.label)
 	}
 }
 
-func (c *Checker) target(pos lexer.Pos, keyword, label string) (*loop, int) {
+func (c *Checker) target(pos diag.Pos, keyword, label string) (*loop, int) {
 	if len(c.loops) == 0 && label == "" {
 		c.fail(pos, "%s outside of a loop", keyword)
 	}
@@ -1265,7 +1244,7 @@ func (c *Checker) typeRef(x ast.Expr) *types.Type {
 	return t
 }
 
-func (c *Checker) field(t *types.Type, name string, pos lexer.Pos) *types.Field {
+func (c *Checker) field(t *types.Type, name string, pos diag.Pos) *types.Field {
 	if t.Kind != types.StructKind {
 		c.fail(pos, "%s has no field %s", t, name)
 	}
@@ -1277,7 +1256,7 @@ func (c *Checker) field(t *types.Type, name string, pos lexer.Pos) *types.Field 
 	return f
 }
 
-func (c *Checker) reachable(f *types.Field, t *types.Type, pos lexer.Pos) {
+func (c *Checker) reachable(f *types.Field, t *types.Type, pos diag.Pos) {
 	if !f.Pub && t.Module != c.file.Module && (c.fn == nil || !c.fn.Trusted) {
 		c.fail(pos, "field %s of %s is private", f.Name, t)
 	}
@@ -1485,7 +1464,7 @@ func (c *Checker) structLit(e *ast.StructLit, want *types.Type) {
 	e.Type = t
 }
 
-func (c *Checker) variant(enum *types.Type, name string, pos lexer.Pos) *types.Variant {
+func (c *Checker) variant(enum *types.Type, name string, pos diag.Pos) *types.Variant {
 	v := enum.Variant(name)
 	if v == nil {
 		c.fail(pos, "%s has no variant %s", enum, name)
@@ -1493,7 +1472,7 @@ func (c *Checker) variant(enum *types.Type, name string, pos lexer.Pos) *types.V
 	return v
 }
 
-func (c *Checker) unitVariant(v *types.Variant, pos lexer.Pos) {
+func (c *Checker) unitVariant(v *types.Variant, pos diag.Pos) {
 	if len(v.Fields) > 0 {
 		c.fail(pos, "variant %s takes %d fields", v.Name, len(v.Fields))
 	}
@@ -2161,7 +2140,7 @@ func (c *Checker) match(e *ast.Match, want *types.Type) {
 	e.Type = c.arms(e.Arms, t, want, e.Pos)
 }
 
-func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos lexer.Pos) *types.Type {
+func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos diag.Pos) *types.Type {
 	result := types.Never
 	covered := map[*types.Variant]bool{}
 	wildcard, tested := false, false
@@ -2196,7 +2175,7 @@ func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos lexer.Pos) *
 	return result
 }
 
-func (c *Checker) exhaustive(enum *types.Type, covered map[*types.Variant]bool, pos lexer.Pos) {
+func (c *Checker) exhaustive(enum *types.Type, covered map[*types.Variant]bool, pos diag.Pos) {
 	var missing []string
 	for _, v := range enum.Variants {
 		if !covered[v] {
@@ -2247,7 +2226,7 @@ func binds(name string) bool {
 	return name[0] >= 'a' && name[0] <= 'z'
 }
 
-func (c *Checker) errorResult(e ast.Expr, keyword string, pos lexer.Pos, want *types.Type) *types.Type {
+func (c *Checker) errorResult(e ast.Expr, keyword string, pos diag.Pos, want *types.Type) *types.Type {
 	t := c.expr(e, want)
 	if t.Kind != types.ResultKind {
 		c.fail(pos, "%s requires an error result, found %s", keyword, t)

@@ -1,59 +1,35 @@
 package parser
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"strconv"
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 )
-
-type Error struct {
-	Pos lexer.Pos
-	Msg string
-}
-
-func (e *Error) Error() string {
-	return fmt.Sprintf("%s: %s", e.Pos, e.Msg)
-}
-
-type bailout struct {
-	err *Error
-}
 
 type Parser struct {
 	tokens   []lexer.Token
 	i        int
 	noStruct bool
 	testing  bool
-	prelude  bool
 	taken    map[int]bool
 }
 
-func Parse(tokens []lexer.Token) (*ast.File, error) {
-	return parse(&Parser{tokens: tokens, taken: map[int]bool{}})
-}
-
-func ParsePrelude(tokens []lexer.Token) (*ast.File, error) {
-	return parse(&Parser{tokens: tokens, prelude: true, taken: map[int]bool{}})
-}
-
-func parse(p *Parser) (file *ast.File, err error) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			return
-		}
-		b, ok := r.(bailout)
-		if !ok {
-			panic(r)
-		}
-		err = b.err
-	}()
-	return p.file(), nil
+func ParseSource(src []byte, at diag.Pos, privileged bool) (*ast.File, error) {
+	tokens, err := lexer.Lex(src, at, privileged)
+	if err != nil {
+		return nil, err
+	}
+	p := &Parser{tokens: tokens, taken: map[int]bool{}}
+	var file *ast.File
+	if failure := diag.Try(func() { file = p.file() }); failure != nil {
+		return nil, failure
+	}
+	return file, nil
 }
 
 func (p *Parser) tok() lexer.Token {
@@ -92,8 +68,8 @@ func (p *Parser) next() lexer.Token {
 	return t
 }
 
-func (p *Parser) fail(pos lexer.Pos, format string, args ...any) {
-	panic(bailout{&Error{Pos: pos, Msg: fmt.Sprintf(format, args...)}})
+func (p *Parser) fail(pos diag.Pos, format string, args ...any) {
+	diag.Fail(pos, format, args...)
 }
 
 func (p *Parser) expect(k lexer.Kind) lexer.Token {
@@ -454,20 +430,12 @@ func (p *Parser) typeArgs() []*ast.TypeName {
 	return args
 }
 
-func (p *Parser) attempt(parse func()) (ok bool) {
-	start, noStruct := p.i, p.noStruct
-	defer func() {
-		r := recover()
-		if r == nil {
-			return
-		}
-		if _, failed := r.(bailout); !failed {
-			panic(r)
-		}
-		p.i, p.noStruct = start, noStruct
-		ok = false
-	}()
-	parse()
+func (p *Parser) attempt(parse func()) bool {
+	start, noStruct, testing := p.i, p.noStruct, p.testing
+	if diag.Try(parse) != nil {
+		p.i, p.noStruct, p.testing = start, noStruct, testing
+		return false
+	}
 	return true
 }
 
@@ -527,7 +495,7 @@ func (p *Parser) param() *ast.Param {
 	return &ast.Param{Name: name.Text, Mut: mut, TypeName: p.typeName(), Pos: name.Pos}
 }
 
-func (p *Parser) funcType(pos lexer.Pos, c bool) *ast.TypeName {
+func (p *Parser) funcType(pos diag.Pos, c bool) *ast.TypeName {
 	p.expect(lexer.Fn)
 	t := &ast.TypeName{Func: true, CFunc: c, Pos: pos}
 	p.list(func() {
@@ -736,7 +704,7 @@ func (p *Parser) label() string {
 	return p.next().Text
 }
 
-func (p *Parser) forIn(label string, pos lexer.Pos) *ast.ForIn {
+func (p *Parser) forIn(label string, pos diag.Pos) *ast.ForIn {
 	loop := &ast.ForIn{Label: label, Value: p.expect(lexer.Ident).Text, Pos: pos}
 	if p.at(lexer.Comma) {
 		p.next()
@@ -758,7 +726,7 @@ func (p *Parser) let() *ast.Let {
 	return p.binding(t.Pos, t.Kind == lexer.Var)
 }
 
-func (p *Parser) binding(pos lexer.Pos, mutable bool) *ast.Let {
+func (p *Parser) binding(pos diag.Pos, mutable bool) *ast.Let {
 	name := p.expect(lexer.Ident).Text
 	var typeName *ast.TypeName
 	if p.at(lexer.Colon) {
@@ -808,7 +776,7 @@ func (p *Parser) binaryFrom(x ast.Expr, minPrec int) ast.Expr {
 	}
 }
 
-func (p *Parser) pipe(x, y ast.Expr, pos lexer.Pos) ast.Expr {
+func (p *Parser) pipe(x, y ast.Expr, pos diag.Pos) ast.Expr {
 	switch y := y.(type) {
 	case *ast.Try:
 		y.X = p.pipe(x, y.X, pos)
@@ -880,7 +848,7 @@ func (p *Parser) selectCase() *ast.SelectCase {
 	return c
 }
 
-func (p *Parser) number(t lexer.Token, negative bool, pos lexer.Pos) ast.Expr {
+func (p *Parser) number(t lexer.Token, negative bool, pos diag.Pos) ast.Expr {
 	if t.Kind == lexer.Float {
 		v, err := strconv.ParseFloat(t.Text, 64)
 		if err != nil {
@@ -918,8 +886,7 @@ func (p *Parser) primary() ast.Expr {
 		return &ast.StrLit{Value: t.Text, Pos: t.Pos}
 	case lexer.Char:
 		p.next()
-		code, _ := strconv.ParseInt(t.Text, 10, 64)
-		return &ast.IntLit{Value: code, Char: true, Pos: t.Pos}
+		return &ast.IntLit{Value: int64(t.Char), Char: true, Pos: t.Pos}
 	case lexer.LBracket:
 		return p.sliceLit()
 	case lexer.True, lexer.False:
@@ -960,20 +927,12 @@ func (p *Parser) primary() ast.Expr {
 func (p *Parser) interpolation(t lexer.Token) *ast.Interp {
 	n := &ast.Interp{Pos: t.Pos}
 	for _, part := range t.Parts {
-		if !part.Expr {
+		if part.Tokens == nil {
 			n.Parts = append(n.Parts, &ast.StrLit{Value: part.Text, Pos: t.Pos})
 			n.Specs = append(n.Specs, nil)
 			continue
 		}
-		tokens, err := lexer.LexAt([]byte(part.Text), part.Pos, p.prelude)
-		if err != nil {
-			var lexErr *lexer.Error
-			if errors.As(err, &lexErr) {
-				p.fail(lexErr.Pos, "%s", lexErr.Msg)
-			}
-			p.fail(part.Pos, "%v", err)
-		}
-		inner := &Parser{tokens: tokens, prelude: p.prelude}
+		inner := &Parser{tokens: part.Tokens}
 		x := inner.expr()
 		inner.skipNewlines()
 		if !inner.at(lexer.EOF) {
@@ -986,25 +945,12 @@ func (p *Parser) interpolation(t lexer.Token) *ast.Interp {
 }
 
 func (p *Parser) spec(part lexer.Part) *ast.Spec {
-	if !part.Aligned && !part.Formatted {
+	if part.Spec == "" {
 		return nil
 	}
-	spec := &ast.Spec{}
-	if part.Aligned {
-		pos := part.WidthPos
-		pos.Col += len(part.Width) - len(strings.TrimLeft(part.Width, " "))
-		width, ok := ast.ParseWidth(part.Width)
-		if !ok {
-			p.fail(pos, "invalid width %q", strings.TrimSpace(part.Width))
-		}
-		spec.Width, spec.WidthPos = width, pos
-	}
-	if part.Formatted {
-		format, ok := ast.ParseFormat(part.Format, part.FormatPos)
-		if !ok {
-			p.fail(part.FormatPos, "invalid format %q", part.Format)
-		}
-		spec.Format = format
+	spec, failure := ast.ParseSpec(part.Spec, part.SpecPos)
+	if failure != nil {
+		p.fail(failure.Pos, "%s", failure.Msg)
 	}
 	return spec
 }
@@ -1157,7 +1103,7 @@ func (p *Parser) arg() ast.Expr {
 	return &ast.Ref{X: p.expr(), Pos: pos}
 }
 
-func (p *Parser) catch(x ast.Expr, pos lexer.Pos) *ast.Catch {
+func (p *Parser) catch(x ast.Expr, pos diag.Pos) *ast.Catch {
 	c := &ast.Catch{X: x, Pos: pos}
 	if p.at(lexer.LBrace) {
 		c.Arms = p.arms()

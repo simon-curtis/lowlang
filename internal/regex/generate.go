@@ -3,6 +3,8 @@ package regex
 import (
 	"fmt"
 	"strings"
+
+	"lowlang/internal/lexer"
 )
 
 const (
@@ -58,8 +60,8 @@ func (g *generator) temp(prefix string) string {
 
 func (g *generator) interpreted(pattern string) {
 	g.line("fn %s() -> Regex {", g.name)
-	g.line("compile(%s) catch {", quote(pattern))
-	g.line("_ => __panic(%s)", quote("regex: a generated pattern failed to compile"))
+	g.line("compile(%s) catch {", lexer.Quote(pattern))
+	g.line("_ => __panic(%s)", lexer.Quote("regex: a generated pattern failed to compile"))
 	g.line("}")
 	g.line("}")
 }
@@ -362,30 +364,4 @@ func (g *generator) skip() {
 	g.line("}")
 	g.line("i")
 	g.line("}")
-}
-
-func quote(text string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for i := range len(text) {
-		switch c := text[i]; c {
-		case '"', '\\':
-			b.WriteByte('\\')
-			b.WriteByte(c)
-		case '{':
-			b.WriteString("{{")
-		case '}':
-			b.WriteString("}}")
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case 0:
-			b.WriteString(`\0`)
-		default:
-			b.WriteByte(c)
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
 }

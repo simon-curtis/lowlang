@@ -1,6 +1,7 @@
 package ast
 
 import (
+	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 	"lowlang/internal/types"
 )
@@ -18,24 +19,24 @@ type File struct {
 type Extern struct {
 	Library string
 	Funcs   []*Func
-	Pos     lexer.Pos
+	Pos     diag.Pos
 }
 
 type Defer struct {
 	Body Stmt
-	Pos  lexer.Pos
+	Pos  diag.Pos
 }
 
 type Spawn struct {
 	Call *Call
 	Body *Block
-	Pos  lexer.Pos
+	Pos  diag.Pos
 }
 
 type Send struct {
 	Chan  Expr
 	Value Expr
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type SelectKind int
@@ -54,13 +55,13 @@ type SelectCase struct {
 	Name  string
 	Local *Local
 	Body  Expr
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type Select struct {
 	Typed
 	Cases []*SelectCase
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 func fieldWidth(e *Selector) *types.Type {
@@ -73,7 +74,7 @@ func fieldWidth(e *Selector) *types.Type {
 type Import struct {
 	Alias string
 	Path  string
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 func (f *File) Imported(alias string) (string, bool) {
@@ -102,7 +103,7 @@ type TypeName struct {
 	Result   *TypeName
 	Error    *TypeName
 	Elem     *TypeName
-	Pos      lexer.Pos
+	Pos      diag.Pos
 }
 
 type Place struct {
@@ -150,7 +151,7 @@ func PlaceOf(e Expr) (*Place, bool) {
 type TypeParam struct {
 	Name        string
 	Constraints []string
-	Pos         lexer.Pos
+	Pos         diag.Pos
 }
 
 type EnumDecl struct {
@@ -160,7 +161,7 @@ type EnumDecl struct {
 	Pub        bool
 	File       *File
 	Variants   []*VariantDecl
-	Pos        lexer.Pos
+	Pos        diag.Pos
 	Type       *types.Type
 }
 
@@ -169,7 +170,7 @@ type VariantDecl struct {
 	Doc    string
 	Fields []*TypeName
 	Labels []string
-	Pos    lexer.Pos
+	Pos    diag.Pos
 }
 
 type StructDecl struct {
@@ -181,7 +182,7 @@ type StructDecl struct {
 	Pub        bool
 	File       *File
 	Fields     []*FieldDecl
-	Pos        lexer.Pos
+	Pos        diag.Pos
 	Type       *types.Type
 }
 
@@ -191,14 +192,14 @@ type FieldDecl struct {
 	Pub      bool
 	TypeName *TypeName
 	Default  Expr
-	Pos      lexer.Pos
+	Pos      diag.Pos
 }
 
 type Param struct {
 	Name     string
 	Mut      bool
 	TypeName *TypeName
-	Pos      lexer.Pos
+	Pos      diag.Pos
 }
 
 type Func struct {
@@ -219,7 +220,7 @@ type Func struct {
 	Result      *TypeName
 	Error       *TypeName
 	Body        *Block
-	Pos         lexer.Pos
+	Pos         diag.Pos
 	ParamTypes  []*types.Type
 	RetType     *types.Type
 	ParamLocals []*Local
@@ -255,7 +256,7 @@ func (l *Local) Boxed() bool {
 }
 
 type Node interface {
-	Position() lexer.Pos
+	Position() diag.Pos
 }
 
 type Stmt interface {
@@ -281,7 +282,7 @@ type Block struct {
 	Typed
 	Stmts []Stmt
 	Tail  Expr
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type Let struct {
@@ -291,7 +292,7 @@ type Let struct {
 	Spawned  bool
 	TypeName *TypeName
 	Value    Expr
-	Pos      lexer.Pos
+	Pos      diag.Pos
 	Local    *Local
 	Flag     *Local
 	Release  Stmt
@@ -301,7 +302,7 @@ type Assign struct {
 	Target  Expr
 	Op      lexer.Kind
 	Value   Expr
-	Pos     lexer.Pos
+	Pos     diag.Pos
 	Place   *Place
 	Entry   *Index
 	Release Stmt
@@ -317,29 +318,29 @@ type For struct {
 	Label string
 	Cond  Expr
 	Body  *Block
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type Break struct {
 	Label string
 	Depth int
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type Continue struct {
 	Label string
 	Depth int
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type Return struct {
 	Value Expr
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type Fail struct {
 	Value Expr
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type IntLit struct {
@@ -347,31 +348,31 @@ type IntLit struct {
 	Value int64
 	Char  bool
 	Wide  bool
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type FloatLit struct {
 	Typed
 	Value float64
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type StrLit struct {
 	Typed
 	Value string
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type BoolLit struct {
 	Typed
 	Value bool
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type Ident struct {
 	Typed
 	Name    string
-	Pos     lexer.Pos
+	Pos     diag.Pos
 	Local   *Local
 	Variant *types.Variant
 	Null    bool
@@ -383,7 +384,7 @@ type Selector struct {
 	Typed
 	X         Expr
 	Name      string
-	Pos       lexer.Pos
+	Pos       diag.Pos
 	Variant   *types.Variant
 	Field     *types.Field
 	Reference *types.Field
@@ -397,7 +398,7 @@ type Closure struct {
 	Result   *TypeName
 	Error    *TypeName
 	Body     *Block
-	Pos      lexer.Pos
+	Pos      diag.Pos
 	Func     *Func
 	Captures []*Local
 }
@@ -407,14 +408,14 @@ type Instance struct {
 	X        Expr
 	Types    []*TypeName
 	Fallback Expr
-	Pos      lexer.Pos
+	Pos      diag.Pos
 }
 
 type Index struct {
 	Typed
 	X     Expr
 	Index Expr
-	Pos   lexer.Pos
+	Pos   diag.Pos
 }
 
 type Slicing struct {
@@ -422,14 +423,14 @@ type Slicing struct {
 	X   Expr
 	Lo  Expr
 	Hi  Expr
-	Pos lexer.Pos
+	Pos diag.Pos
 }
 
 type SliceLit struct {
 	Typed
 	Elems    []Expr
 	ReadOnly bool
-	Pos      lexer.Pos
+	Pos      diag.Pos
 }
 
 type MapLit struct {
@@ -437,7 +438,7 @@ type MapLit struct {
 	Keys     []Expr
 	Values   []Expr
 	ReadOnly bool
-	Pos      lexer.Pos
+	Pos      diag.Pos
 }
 
 type Interp struct {
@@ -445,7 +446,7 @@ type Interp struct {
 	Parts   []Expr
 	Specs   []*Spec
 	Renders []*Func
-	Pos     lexer.Pos
+	Pos     diag.Pos
 }
 
 type ForIn struct {
@@ -457,13 +458,13 @@ type ForIn struct {
 	Iter       Expr
 	End        Expr
 	Body       *Block
-	Pos        lexer.Pos
+	Pos        diag.Pos
 }
 
 type Ref struct {
 	Typed
 	X     Expr
-	Pos   lexer.Pos
+	Pos   diag.Pos
 	Place *Place
 }
 
@@ -478,13 +479,13 @@ type StructLit struct {
 	Name     string
 	TypeArgs []*TypeName
 	Fields   []*FieldInit
-	Pos      lexer.Pos
+	Pos      diag.Pos
 }
 
 type FieldInit struct {
 	Name  string
 	Value Expr
-	Pos   lexer.Pos
+	Pos   diag.Pos
 	Field *types.Field
 }
 
@@ -492,7 +493,7 @@ type Unary struct {
 	Typed
 	Op  lexer.Kind
 	X   Expr
-	Pos lexer.Pos
+	Pos diag.Pos
 }
 
 type Binary struct {
@@ -502,14 +503,14 @@ type Binary struct {
 	Y      Expr
 	SplatX bool
 	SplatY bool
-	Pos    lexer.Pos
+	Pos    diag.Pos
 }
 
 type Call struct {
 	Typed
 	Fn        Expr
 	Args      []Expr
-	Pos       lexer.Pos
+	Pos       diag.Pos
 	Prepended bool
 	Target    *Func
 	Render    *Func
@@ -525,26 +526,26 @@ type If struct {
 	Cond Expr
 	Then *Block
 	Else Expr
-	Pos  lexer.Pos
+	Pos  diag.Pos
 }
 
 type Pattern struct {
 	Name     string
 	Bindings []*Binding
 	Test     Expr
-	Pos      lexer.Pos
+	Pos      diag.Pos
 	Variant  *types.Variant
 	Local    *Local
 }
 
 type Subject struct {
 	Typed
-	Pos lexer.Pos
+	Pos diag.Pos
 }
 
 type Binding struct {
 	Name  string
-	Pos   lexer.Pos
+	Pos   diag.Pos
 	Local *Local
 }
 
@@ -557,13 +558,13 @@ type Match struct {
 	Typed
 	X    Expr
 	Arms []*Arm
-	Pos  lexer.Pos
+	Pos  diag.Pos
 }
 
 type Try struct {
 	Typed
 	X   Expr
-	Pos lexer.Pos
+	Pos diag.Pos
 }
 
 type Catch struct {
@@ -571,47 +572,47 @@ type Catch struct {
 	X        Expr
 	Arms     []*Arm
 	Fallback Expr
-	Pos      lexer.Pos
+	Pos      diag.Pos
 }
 
-func (n *Block) Position() lexer.Pos     { return n.Pos }
-func (n *Let) Position() lexer.Pos       { return n.Pos }
-func (n *Assign) Position() lexer.Pos    { return n.Pos }
-func (n *ExprStmt) Position() lexer.Pos  { return n.X.Position() }
-func (n *For) Position() lexer.Pos       { return n.Pos }
-func (n *Break) Position() lexer.Pos     { return n.Pos }
-func (n *Continue) Position() lexer.Pos  { return n.Pos }
-func (n *Return) Position() lexer.Pos    { return n.Pos }
-func (n *Fail) Position() lexer.Pos      { return n.Pos }
-func (n *Defer) Position() lexer.Pos     { return n.Pos }
-func (n *Spawn) Position() lexer.Pos     { return n.Pos }
-func (n *Send) Position() lexer.Pos      { return n.Pos }
-func (n *Select) Position() lexer.Pos    { return n.Pos }
-func (n *Subject) Position() lexer.Pos   { return n.Pos }
-func (n *Receiver) Position() lexer.Pos  { return n.X.Position() }
-func (n *IntLit) Position() lexer.Pos    { return n.Pos }
-func (n *FloatLit) Position() lexer.Pos  { return n.Pos }
-func (n *StrLit) Position() lexer.Pos    { return n.Pos }
-func (n *BoolLit) Position() lexer.Pos   { return n.Pos }
-func (n *Ident) Position() lexer.Pos     { return n.Pos }
-func (n *Selector) Position() lexer.Pos  { return n.Pos }
-func (n *StructLit) Position() lexer.Pos { return n.Pos }
-func (n *Ref) Position() lexer.Pos       { return n.Pos }
-func (n *Index) Position() lexer.Pos     { return n.Pos }
-func (n *Instance) Position() lexer.Pos  { return n.Pos }
-func (n *Closure) Position() lexer.Pos   { return n.Pos }
-func (n *Slicing) Position() lexer.Pos   { return n.Pos }
-func (n *SliceLit) Position() lexer.Pos  { return n.Pos }
-func (n *Interp) Position() lexer.Pos    { return n.Pos }
-func (n *MapLit) Position() lexer.Pos    { return n.Pos }
-func (n *ForIn) Position() lexer.Pos     { return n.Pos }
-func (n *Unary) Position() lexer.Pos     { return n.Pos }
-func (n *Binary) Position() lexer.Pos    { return n.Pos }
-func (n *Call) Position() lexer.Pos      { return n.Pos }
-func (n *If) Position() lexer.Pos        { return n.Pos }
-func (n *Match) Position() lexer.Pos     { return n.Pos }
-func (n *Try) Position() lexer.Pos       { return n.Pos }
-func (n *Catch) Position() lexer.Pos     { return n.Pos }
+func (n *Block) Position() diag.Pos     { return n.Pos }
+func (n *Let) Position() diag.Pos       { return n.Pos }
+func (n *Assign) Position() diag.Pos    { return n.Pos }
+func (n *ExprStmt) Position() diag.Pos  { return n.X.Position() }
+func (n *For) Position() diag.Pos       { return n.Pos }
+func (n *Break) Position() diag.Pos     { return n.Pos }
+func (n *Continue) Position() diag.Pos  { return n.Pos }
+func (n *Return) Position() diag.Pos    { return n.Pos }
+func (n *Fail) Position() diag.Pos      { return n.Pos }
+func (n *Defer) Position() diag.Pos     { return n.Pos }
+func (n *Spawn) Position() diag.Pos     { return n.Pos }
+func (n *Send) Position() diag.Pos      { return n.Pos }
+func (n *Select) Position() diag.Pos    { return n.Pos }
+func (n *Subject) Position() diag.Pos   { return n.Pos }
+func (n *Receiver) Position() diag.Pos  { return n.X.Position() }
+func (n *IntLit) Position() diag.Pos    { return n.Pos }
+func (n *FloatLit) Position() diag.Pos  { return n.Pos }
+func (n *StrLit) Position() diag.Pos    { return n.Pos }
+func (n *BoolLit) Position() diag.Pos   { return n.Pos }
+func (n *Ident) Position() diag.Pos     { return n.Pos }
+func (n *Selector) Position() diag.Pos  { return n.Pos }
+func (n *StructLit) Position() diag.Pos { return n.Pos }
+func (n *Ref) Position() diag.Pos       { return n.Pos }
+func (n *Index) Position() diag.Pos     { return n.Pos }
+func (n *Instance) Position() diag.Pos  { return n.Pos }
+func (n *Closure) Position() diag.Pos   { return n.Pos }
+func (n *Slicing) Position() diag.Pos   { return n.Pos }
+func (n *SliceLit) Position() diag.Pos  { return n.Pos }
+func (n *Interp) Position() diag.Pos    { return n.Pos }
+func (n *MapLit) Position() diag.Pos    { return n.Pos }
+func (n *ForIn) Position() diag.Pos     { return n.Pos }
+func (n *Unary) Position() diag.Pos     { return n.Pos }
+func (n *Binary) Position() diag.Pos    { return n.Pos }
+func (n *Call) Position() diag.Pos      { return n.Pos }
+func (n *If) Position() diag.Pos        { return n.Pos }
+func (n *Match) Position() diag.Pos     { return n.Pos }
+func (n *Try) Position() diag.Pos       { return n.Pos }
+func (n *Catch) Position() diag.Pos     { return n.Pos }
 
 func (*Let) stmt()      {}
 func (*Assign) stmt()   {}

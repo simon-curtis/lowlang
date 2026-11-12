@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 )
 
 func outline(file *ast.File, t text) []DocumentSymbol {
@@ -26,7 +26,7 @@ func outline(file *ast.File, t text) []DocumentSymbol {
 	return symbols
 }
 
-func symbol(t text, pos lexer.Pos, name, detail string, kind int) DocumentSymbol {
+func symbol(t text, pos diag.Pos, name, detail string, kind int) DocumentSymbol {
 	span := t.span(pos, len(name))
 	return DocumentSymbol{Name: name, Detail: detail, Kind: kind, Range: span, SelectionRange: span}
 }

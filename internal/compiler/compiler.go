@@ -13,8 +13,8 @@ import (
 	"lowlang/internal/asm"
 	"lowlang/internal/ast"
 	"lowlang/internal/check"
+	"lowlang/internal/diag"
 	"lowlang/internal/ir"
-	"lowlang/internal/lexer"
 	"lowlang/internal/link"
 	"lowlang/internal/lint"
 	"lowlang/internal/parser"
@@ -68,11 +68,7 @@ func Check(path string, read func(name string) ([]byte, error)) (*Unit, error) {
 }
 
 func parsePrelude() (*ast.File, error) {
-	tokens, err := lexer.LexPrelude(preludeSource)
-	if err != nil {
-		return nil, err
-	}
-	return parser.ParsePrelude(tokens)
+	return parser.ParseSource(preludeSource, diag.Start("prelude.low"), true)
 }
 
 func Assemble(ctx context.Context, asm, object string, flags ...string) error {

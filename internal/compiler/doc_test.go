@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 )
 
 func TestDocumentProject(t *testing.T) {
@@ -90,7 +90,7 @@ type undocumented struct {
 	malformed []string
 }
 
-func (u *undocumented) check(doc string, pos lexer.Pos, name string) {
+func (u *undocumented) check(doc string, pos diag.Pos, name string) {
 	if doc == "" {
 		u.missing = append(u.missing, fmt.Sprintf("%s: %s", pos, name))
 		return

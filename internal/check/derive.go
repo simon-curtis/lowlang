@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 	"lowlang/internal/parser"
 	"lowlang/internal/types"
@@ -29,7 +30,7 @@ var derivationNames = [...]string{serialize: "__write", deserialize: "__read", d
 type synth struct {
 	c     *Checker
 	home  *ast.File
-	pos   lexer.Pos
+	pos   diag.Pos
 	bound map[string]*types.Type
 	names map[*types.Type]string
 	out   strings.Builder
@@ -37,7 +38,7 @@ type synth struct {
 	temps int
 }
 
-func (c *Checker) serdeType(name string, pos lexer.Pos) *types.Type {
+func (c *Checker) serdeType(name string, pos diag.Pos) *types.Type {
 	if c.file.Module != serdeModule {
 		c.fail(pos, "only %s may derive code from types", serdeModule)
 	}
@@ -48,7 +49,7 @@ func (c *Checker) serdeType(name string, pos lexer.Pos) *types.Type {
 	return t
 }
 
-func (c *Checker) serdeFieldType(owner *types.Type, f *types.Field, pos lexer.Pos) *types.Type {
+func (c *Checker) serdeFieldType(owner *types.Type, f *types.Field, pos diag.Pos) *types.Type {
 	serde, loaded := c.modules[serdeModule]
 	if !loaded || serde.generics[serdeField] == nil {
 		c.fail(pos, "%s.%s refers to a field and needs %s to be imported", owner, f.Name, serdeModule)
@@ -109,7 +110,7 @@ func (c *Checker) derivedCall(e *ast.Call, inst *ast.Instance) bool {
 	return true
 }
 
-func (c *Checker) derive(kind derivation, t *types.Type, pos lexer.Pos) *ast.Func {
+func (c *Checker) derive(kind derivation, t *types.Type, pos diag.Pos) *ast.Func {
 	key := fmt.Sprintf("%d:%s", kind, typeKey([]*types.Type{t}))
 	if fn, ok := c.derived[key]; ok {
 		return fn
@@ -127,11 +128,7 @@ func (c *Checker) derive(kind derivation, t *types.Type, pos lexer.Pos) *ast.Fun
 func (s *synth) parse(kind derivation, t *types.Type) *ast.Func {
 	name := types.InstanceName(derivationNames[kind], []*types.Type{t})
 	source := s.out.String()
-	tokens, err := lexer.LexAt([]byte(source), lexer.Pos{File: fmt.Sprintf("<%s>", name), Line: 1, Col: 1}, true)
-	if err != nil {
-		panic(fmt.Sprintf("derived source for %s does not lex: %v\n%s", t, err, source))
-	}
-	file, err := parser.ParsePrelude(tokens)
+	file, err := parser.ParseSource([]byte(source), diag.Start(fmt.Sprintf("<%s>", name)), true)
 	if err != nil {
 		panic(fmt.Sprintf("derived source for %s does not parse: %v\n%s", t, err, source))
 	}
@@ -162,26 +159,6 @@ func (s *synth) line(format string, args ...any) {
 	s.flush()
 	fmt.Fprintf(&s.out, format, args...)
 	s.out.WriteByte('\n')
-}
-
-func quoted(text string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range text {
-		switch r {
-		case '"', '\\':
-			b.WriteByte('\\')
-			b.WriteRune(r)
-		case '{':
-			b.WriteString("{{")
-		case '}':
-			b.WriteString("}}")
-		default:
-			b.WriteRune(r)
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
 }
 
 func (s *synth) function(kind derivation, t *types.Type) {
@@ -236,7 +213,7 @@ func (s *synth) serialize(t *types.Type) {
 	case t.Kind == types.StructKind:
 		s.line("w.begin_struct()")
 		for _, f := range t.Fields {
-			s.line("w.field(%s)\n__serialize_into(w, mut path, v.%s)", quoted(f.Name), f.Name)
+			s.line("w.field(%s)\n__serialize_into(w, mut path, v.%s)", lexer.Quote(f.Name), f.Name)
 		}
 		s.line("w.end_struct()")
 	case t.Kind == types.EnumKind:
@@ -247,7 +224,7 @@ func (s *synth) serialize(t *types.Type) {
 }
 
 func (s *synth) serializePointer(t *types.Type) {
-	message := quoted(fmt.Sprintf("serde: cycle through %s", t))
+	message := lexer.Quote(fmt.Sprintf("serde: cycle through %s", t))
 	s.guardPointer(func() {
 		s.line("__panic(%s)", message)
 	}, "__serialize_into(w, mut path, *v)")
@@ -301,7 +278,7 @@ func (s *synth) serializeEnum(t *types.Type) {
 	s.line("match v {")
 	for _, v := range t.Variants {
 		if len(v.Fields) == 0 {
-			s.line("%s => w.unit_variant(%s)", v.Name, quoted(v.Name))
+			s.line("%s => w.unit_variant(%s)", v.Name, lexer.Quote(v.Name))
 			continue
 		}
 		binds := make([]string, len(v.Fields))
@@ -309,11 +286,11 @@ func (s *synth) serializeEnum(t *types.Type) {
 			binds[i] = fmt.Sprintf("f%d", i)
 		}
 		s.line("%s(%s) => {", v.Name, strings.Join(binds, ", "))
-		s.line("w.begin_variant(%s)", quoted(v.Name))
+		s.line("w.begin_variant(%s)", lexer.Quote(v.Name))
 		if labelled(v) {
 			s.line("w.begin_struct()")
 			for i := range v.Fields {
-				s.line("w.field(%s)\n__serialize_into(w, mut path, f%d)", quoted(labelOf(v, i)), i)
+				s.line("w.field(%s)\n__serialize_into(w, mut path, f%d)", lexer.Quote(labelOf(v, i)), i)
 			}
 			s.line("w.end_struct()")
 		} else {
@@ -416,7 +393,7 @@ func (s *synth) readFields(members []member) []slot {
 		if i == 0 {
 			prefix = "if"
 		}
-		s.line("%s key == %s {\n%s = __deserialize[%s](r)?\n%s = true", prefix, quoted(sl.name), sl.value, s.name(sl.t), sl.present)
+		s.line("%s key == %s {\n%s = __deserialize[%s](r)?\n%s = true", prefix, lexer.Quote(sl.name), sl.value, s.name(sl.t), sl.present)
 	}
 	if len(slots) == 0 {
 		s.line("r.skip()?\n}")
@@ -425,7 +402,7 @@ func (s *synth) readFields(members []member) []slot {
 	}
 	for _, sl := range slots {
 		if sl.required {
-			s.line("if !%s {\nfail Missing(%s)\n}", sl.present, quoted(sl.name))
+			s.line("if !%s {\nfail Missing(%s)\n}", sl.present, lexer.Quote(sl.name))
 		}
 	}
 	return slots
@@ -451,7 +428,7 @@ func (s *synth) deserializeStruct(t *types.Type) {
 func (s *synth) deserializeEnum(t *types.Type) {
 	s.line("let at = r.position()\nlet name = r.begin_variant()?")
 	for _, v := range t.Variants {
-		s.line("if name == %s {", quoted(v.Name))
+		s.line("if name == %s {", lexer.Quote(v.Name))
 		args := make([]string, len(v.Fields))
 		switch {
 		case len(v.Fields) == 0:
@@ -460,7 +437,7 @@ func (s *synth) deserializeEnum(t *types.Type) {
 				args[i] = sl.value
 			}
 		default:
-			expected := quoted(fmt.Sprintf("%d values for %s", len(v.Fields), v.Name))
+			expected := lexer.Quote(fmt.Sprintf("%d values for %s", len(v.Fields), v.Name))
 			s.line("r.begin_seq()?")
 			for i, f := range v.Fields {
 				args[i] = s.temp("item")
@@ -503,14 +480,14 @@ func (s *synth) schema(t *types.Type, stack []*types.Type) string {
 	case t.Kind == types.StructKind || t.Kind == types.EnumKind:
 		for _, seen := range stack {
 			if seen == t {
-				return fmt.Sprintf("__S { kind: Ref, name: %s }", quoted(t.Name))
+				return fmt.Sprintf("__S { kind: Ref, name: %s }", lexer.Quote(t.Name))
 			}
 		}
 		inner := append(stack, t)
 		if t.Kind == types.StructKind {
-			return fmt.Sprintf("__S { kind: Struct, name: %s, fields: [%s] }", quoted(t.Name), s.schemaProperties(s.structMembers(t), inner))
+			return fmt.Sprintf("__S { kind: Struct, name: %s, fields: [%s] }", lexer.Quote(t.Name), s.schemaProperties(s.structMembers(t), inner))
 		}
-		return fmt.Sprintf("__S { kind: Enum, name: %s, variants: [%s] }", quoted(t.Name), s.schemaVariants(t, inner))
+		return fmt.Sprintf("__S { kind: Enum, name: %s, variants: [%s] }", lexer.Quote(t.Name), s.schemaVariants(t, inner))
 	}
 	s.unsupported(t)
 	return ""
@@ -519,7 +496,7 @@ func (s *synth) schema(t *types.Type, stack []*types.Type) string {
 func (s *synth) schemaProperties(members []member, stack []*types.Type) string {
 	parts := make([]string, len(members))
 	for i, m := range members {
-		parts[i] = fmt.Sprintf("Property { name: %s, schema: %s, required: %t }", quoted(m.name), s.schema(m.t, stack), required(m.t, m.defaulted))
+		parts[i] = fmt.Sprintf("Property { name: %s, schema: %s, required: %t }", lexer.Quote(m.name), s.schema(m.t, stack), required(m.t, m.defaulted))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -527,7 +504,7 @@ func (s *synth) schemaProperties(members []member, stack []*types.Type) string {
 func (s *synth) schemaVariants(t *types.Type, stack []*types.Type) string {
 	parts := make([]string, len(t.Variants))
 	for i, v := range t.Variants {
-		parts[i] = fmt.Sprintf("Variant { name: %s, labelled: %t, fields: [%s] }", quoted(v.Name), labelled(v), s.schemaProperties(variantMembers(v), stack))
+		parts[i] = fmt.Sprintf("Variant { name: %s, labelled: %t, fields: [%s] }", lexer.Quote(v.Name), labelled(v), s.schemaProperties(variantMembers(v), stack))
 	}
 	return strings.Join(parts, ", ")
 }

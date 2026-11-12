@@ -14,8 +14,8 @@ import (
 	"lowlang/internal/amd64"
 	"lowlang/internal/ast"
 	"lowlang/internal/check"
+	"lowlang/internal/diag"
 	"lowlang/internal/ir"
-	"lowlang/internal/lexer"
 	"lowlang/internal/parser"
 	"lowlang/internal/target"
 )
@@ -125,11 +125,7 @@ func buildProbe(t *testing.T, source string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokens, err := lexer.LexAt([]byte(source), lexer.Pos{File: "probe.low", Line: 1, Col: 1}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	probe, err := parser.ParsePrelude(tokens)
+	probe, err := parser.ParseSource([]byte(source), diag.Start("probe.low"), true)
 	if err != nil {
 		t.Fatal(err)
 	}

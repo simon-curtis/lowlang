@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 	"lowlang/internal/types"
 )
 
@@ -33,7 +33,7 @@ func (c *Checker) chanOps(t *types.Type) {
 	}
 	args := []*types.Type{t.Elem}
 	for _, name := range chanFuncs {
-		c.instance(c.scope("").funcs[name], args, lexer.Pos{})
+		c.instance(c.scope("").funcs[name], args, diag.Pos{})
 	}
 }
 

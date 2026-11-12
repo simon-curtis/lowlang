@@ -6,13 +6,13 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 	"lowlang/internal/types"
 )
 
 type target struct {
 	path string
-	pos  lexer.Pos
+	pos  diag.Pos
 	name string
 }
 
@@ -130,7 +130,7 @@ func (q *query) moduleTarget(path string) (target, bool) {
 	if f == nil {
 		return target{}, false
 	}
-	return target{path: f.Path, pos: lexer.Pos{Line: 1, Col: 1}}, true
+	return target{path: f.Path, pos: diag.Pos{Line: 1, Col: 1}}, true
 }
 
 func funcTarget(f *ast.Func) (target, bool) {

@@ -2,6 +2,7 @@ package lint
 
 import (
 	"lowlang/internal/ast"
+	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 )
 
@@ -35,7 +36,7 @@ func (l *linter) relayAfter(prev, next ast.Node) {
 	}
 }
 
-func (l *linter) suggestLabel(pos lexer.Pos, r relay) {
+func (l *linter) suggestLabel(pos diag.Pos, r relay) {
 	if r.label == "" {
 		l.report(pos, preferLoopLabel,
 			"%s relays this break to the enclosing loop; use a loop label: name: for … { … %s name }",
@@ -118,8 +119,8 @@ func jumpOf(n ast.Node) ast.Node {
 	return jumpOf(inner[0])
 }
 
-func (r relay) exits(label string, body *ast.Block) []lexer.Pos {
-	var found []lexer.Pos
+func (r relay) exits(label string, body *ast.Block) []diag.Pos {
+	var found []diag.Pos
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.For, *ast.ForIn, *ast.Closure, *ast.Spawn, *ast.Defer:
@@ -132,8 +133,8 @@ func (r relay) exits(label string, body *ast.Block) []lexer.Pos {
 	return found
 }
 
-func (r relay) blockExits(label string, b *ast.Block) []lexer.Pos {
-	var found []lexer.Pos
+func (r relay) blockExits(label string, b *ast.Block) []diag.Pos {
+	var found []diag.Pos
 	set := false
 	for _, step := range steps(b) {
 		if sets, touches := r.assigns(step); touches {
@@ -160,10 +161,10 @@ func (r relay) assigns(step ast.Node) (bool, bool) {
 	return a.Op == lexer.Assign && ok && lit.Value == r.value, true
 }
 
-func exit(step ast.Node, label string) (lexer.Pos, bool) {
+func exit(step ast.Node, label string) (diag.Pos, bool) {
 	b, ok := jumpOf(step).(*ast.Break)
 	if !ok || (b.Label != "" && b.Label != label) {
-		return lexer.Pos{}, false
+		return diag.Pos{}, false
 	}
 	return b.Pos, true
 }

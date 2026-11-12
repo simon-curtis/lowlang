@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 	"lowlang/internal/types"
 )
 
@@ -19,7 +19,7 @@ type dropSource struct {
 type containment struct {
 	elem  *types.Type
 	where string
-	pos   lexer.Pos
+	pos   diag.Pos
 }
 
 func (c *Checker) recordStruct(d *ast.StructDecl, st *types.Type) {
@@ -58,7 +58,7 @@ func (c *Checker) owns(t *types.Type) bool {
 	return c.droppable(t)
 }
 
-func (c *Checker) contain(elem *types.Type, where string, pos lexer.Pos) {
+func (c *Checker) contain(elem *types.Type, where string, pos diag.Pos) {
 	if !c.laid {
 		c.containments = append(c.containments, containment{elem, where, pos})
 		return
@@ -127,13 +127,13 @@ func (c *Checker) checkDrops(files []*ast.File) {
 	}
 }
 
-func typedIdent(local *ast.Local, pos lexer.Pos) *ast.Ident {
+func typedIdent(local *ast.Local, pos diag.Pos) *ast.Ident {
 	id := &ast.Ident{Name: local.Name, Local: local, Pos: pos}
 	id.Type = local.Type
 	return id
 }
 
-func typedCall(target *ast.Func, args []ast.Expr, pos lexer.Pos) *ast.Call {
+func typedCall(target *ast.Func, args []ast.Expr, pos diag.Pos) *ast.Call {
 	call := &ast.Call{Fn: &ast.Ident{Name: target.Name, Pos: pos}, Args: args, Target: target, Pos: pos}
 	call.Type = types.Void
 	return call
@@ -151,7 +151,7 @@ func (c *Checker) releaseFunc(t *types.Type) *ast.Func {
 	fn.ParamLocals = []*ast.Local{self}
 	c.releaseFuncs[t] = fn
 	field := func(f *types.Field) ast.Expr {
-		sel := &ast.Selector{X: typedIdent(self, lexer.Pos{}), Name: f.Name, Field: f}
+		sel := &ast.Selector{X: typedIdent(self, diag.Pos{}), Name: f.Name, Field: f}
 		sel.Type = f.Type
 		return sel
 	}
@@ -161,12 +161,12 @@ func (c *Checker) releaseFunc(t *types.Type) *ast.Func {
 		for _, f := range t.Fields {
 			args = append(args, field(f))
 		}
-		stmts = append(stmts, &ast.ExprStmt{X: typedCall(c.dropFunc(t), args, lexer.Pos{})})
+		stmts = append(stmts, &ast.ExprStmt{X: typedCall(c.dropFunc(t), args, diag.Pos{})})
 	}
 	for _, f := range t.Fields {
 		if c.droppable(f.Type) {
 			release := c.releaseFunc(f.Type)
-			stmts = append(stmts, &ast.ExprStmt{X: typedCall(release, []ast.Expr{field(f)}, lexer.Pos{})})
+			stmts = append(stmts, &ast.ExprStmt{X: typedCall(release, []ast.Expr{field(f)}, diag.Pos{})})
 		}
 	}
 	fn.Body = &ast.Block{Stmts: stmts}

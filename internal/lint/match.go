@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 )
 
@@ -47,7 +48,7 @@ func (l *linter) chain(head *ast.If) ([]*ast.If, ast.Expr) {
 	}
 }
 
-func (l *linter) suggestMatch(pos lexer.Pos, subject string, constants []string) {
+func (l *linter) suggestMatch(pos diag.Pos, subject string, constants []string) {
 	cases := make([]string, len(constants))
 	for i, c := range constants {
 		cases[i] = fmt.Sprintf("%s => …", c)

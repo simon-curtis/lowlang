@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 )
 
@@ -17,7 +18,7 @@ func fixturePatterns(t *testing.T, path string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokens, err := lexer.Lex(src, path)
+	tokens, err := lexer.Lex(src, diag.Start(path), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,13 +79,5 @@ func TestGenerateFallsBackForLargePrograms(t *testing.T) {
 	source := Generate("__r", "a{2001}", prog)
 	if !strings.Contains(source, `compile("a{{2001}}")`) {
 		t.Errorf("large program is not compiled at run time:\n%s", source)
-	}
-}
-
-func TestQuote(t *testing.T) {
-	got := quote("\"\\{}\n\r\x00\xff")
-	want := `"\"\\{{}}\n\r\0` + "\xff" + `"`
-	if got != want {
-		t.Errorf("got %q, want %q", got, want)
 	}
 }

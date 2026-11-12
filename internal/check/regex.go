@@ -5,7 +5,7 @@ import (
 	"hash/fnv"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 	"lowlang/internal/parser"
 	"lowlang/internal/regex"
 )
@@ -42,11 +42,7 @@ func (c *Checker) generateRegex(lit *ast.StrLit) *ast.Func {
 	module := c.scope(regex.Module)
 	name := regexName(lit.Value, module)
 	source := regex.Generate(name, lit.Value, prog)
-	tokens, err := lexer.LexAt([]byte(source), lexer.Pos{File: fmt.Sprintf("<%s>", name), Line: 1, Col: 1}, true)
-	if err != nil {
-		panic(fmt.Sprintf("generated regex %q does not lex: %v\n%s", lit.Value, err, source))
-	}
-	file, err := parser.ParsePrelude(tokens)
+	file, err := parser.ParseSource([]byte(source), diag.Start(fmt.Sprintf("<%s>", name)), true)
 	if err != nil {
 		panic(fmt.Sprintf("generated regex %q does not parse: %v\n%s", lit.Value, err, source))
 	}

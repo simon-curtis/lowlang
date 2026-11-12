@@ -2,7 +2,7 @@ package lsp
 
 import (
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 	"lowlang/internal/types"
 )
 
@@ -11,7 +11,7 @@ type moduleRef struct {
 }
 
 type occurrence struct {
-	pos    lexer.Pos
+	pos    diag.Pos
 	name   string
 	node   any
 	local  *ast.Local

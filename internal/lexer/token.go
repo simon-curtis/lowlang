@@ -3,6 +3,8 @@ package lexer
 import (
 	"fmt"
 	"maps"
+
+	"lowlang/internal/diag"
 )
 
 type Kind int
@@ -177,36 +179,19 @@ func IsKeyword(name string) bool {
 	return ok
 }
 
-type Pos struct {
-	File string
-	Line int
-	Col  int
-}
-
-func (p Pos) String() string {
-	if p.File == "" {
-		return fmt.Sprintf("%d:%d", p.Line, p.Col)
-	}
-	return fmt.Sprintf("%s:%d:%d", p.File, p.Line, p.Col)
-}
-
 type Part struct {
-	Text      string
-	Expr      bool
-	Pos       Pos
-	Aligned   bool
-	Width     string
-	WidthPos  Pos
-	Formatted bool
-	Format    string
-	FormatPos Pos
+	Text    string
+	Tokens  []Token
+	Spec    string
+	SpecPos diag.Pos
 }
 
 type Token struct {
 	Kind  Kind
 	Text  string
+	Char  rune
 	Parts []Part
-	Pos   Pos
+	Pos   diag.Pos
 	Doc   string
-	DocAt Pos
+	DocAt diag.Pos
 }

@@ -7,11 +7,11 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 )
 
 type Warning struct {
-	Pos  lexer.Pos
+	Pos  diag.Pos
 	Rule string
 	Msg  string
 }
@@ -21,7 +21,7 @@ func (w Warning) String() string {
 }
 
 func Run(files []*ast.File) []Warning {
-	l := &linter{reported: map[lexer.Pos]bool{}, chained: map[*ast.If]bool{}}
+	l := &linter{reported: map[diag.Pos]bool{}, chained: map[*ast.If]bool{}}
 	for _, file := range files {
 		l.file(file)
 	}
@@ -41,7 +41,7 @@ func compare(a, b Warning) int {
 
 type linter struct {
 	warnings []Warning
-	reported map[lexer.Pos]bool
+	reported map[diag.Pos]bool
 	chained  map[*ast.If]bool
 }
 
@@ -72,7 +72,7 @@ func (l *linter) visit(n ast.Node) bool {
 	return true
 }
 
-func (l *linter) report(pos lexer.Pos, rule, format string, args ...any) {
+func (l *linter) report(pos diag.Pos, rule, format string, args ...any) {
 	if l.reported[pos] {
 		return
 	}

@@ -4,7 +4,7 @@ import (
 	"strconv"
 	"strings"
 
-	"lowlang/internal/lexer"
+	"lowlang/internal/diag"
 )
 
 type FormatKind byte
@@ -23,7 +23,7 @@ const (
 type Format struct {
 	Kind      FormatKind
 	Text      string
-	Pos       lexer.Pos
+	Pos       diag.Pos
 	Precision int
 	Explicit  bool
 	MinInt    int
@@ -34,8 +34,35 @@ type Format struct {
 
 type Spec struct {
 	Width    int
-	WidthPos lexer.Pos
+	WidthPos diag.Pos
 	Format   *Format
+}
+
+func ParseSpec(text string, pos diag.Pos) (*Spec, *diag.Error) {
+	spec := &Spec{}
+	format, formatPos := strings.TrimPrefix(text, ":"), pos
+	formatPos.Col++
+	if afterComma, aligned := strings.CutPrefix(text, ","); aligned {
+		width, tail, formatted := strings.Cut(afterComma, ":")
+		widthPos := pos
+		widthPos.Col += 1 + len(width) - len(strings.TrimLeft(width, " "))
+		value, ok := parseWidth(width)
+		if !ok {
+			return nil, diag.Errorf(widthPos, "invalid width %q", strings.TrimSpace(width))
+		}
+		spec.Width, spec.WidthPos = value, widthPos
+		if !formatted {
+			return spec, nil
+		}
+		format, formatPos = tail, pos
+		formatPos.Col += 2 + len(width)
+	}
+	parsed, ok := parseFormat(format, formatPos)
+	if !ok {
+		return nil, diag.Errorf(formatPos, "invalid format %q", format)
+	}
+	spec.Format = parsed
+	return spec, nil
 }
 
 func (f *Format) IntegerOnly() bool {
@@ -46,7 +73,7 @@ func (f *Format) IntegerOnly() bool {
 	return false
 }
 
-func ParseWidth(text string) (int, bool) {
+func parseWidth(text string) (int, bool) {
 	text = strings.TrimSpace(text)
 	digits := strings.TrimPrefix(text, "-")
 	if digits == "" || strings.Trim(digits, "0123456789") != "" {
@@ -59,7 +86,7 @@ func ParseWidth(text string) (int, bool) {
 	return width, true
 }
 
-func ParseFormat(text string, pos lexer.Pos) (*Format, bool) {
+func parseFormat(text string, pos diag.Pos) (*Format, bool) {
 	if text == "" {
 		return nil, false
 	}
