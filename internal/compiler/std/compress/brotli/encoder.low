@@ -1,12 +1,19 @@
+import std/bits
+import std/compress/codec
 import std/io
+import std/math
 
 /// A streaming Brotli encoder made by `encoder`.
 ///
 /// `encode` takes input in any chunking, `flush` ends the data written so far on a byte boundary, and `finish` ends the stream. After `finish`, `encode`, `flush` and `finish` fail with `Invalid`. A chunk is valid only during the call to `sink`.
 pub struct Encoder {
-    level: i64
+    core: *Compressor
     sink: fn([]u8) ! io.Error
     finished: bool
+}
+
+struct Compressor {
+    level: i64
     max_distance: i64
     full: i64
     block: i64
@@ -29,16 +36,16 @@ pub struct Encoder {
     dcodes: []u32
     dextras: []u32
     commands: i64
-    writer: *BitWriter
-    builder: *CodeBuilder
+    out: *codec.Buffer
+    builder: *codec.Builder
     tables: Tables
     command_freq: []i64
     distance_freq: []i64
     length_freq: []i64
     literals: *LiteralModel
-    command_code: *Code
-    distance_code: *Code
-    length_code: *Code
+    command_code: *codec.Code
+    distance_code: *codec.Code
+    length_code: *codec.Code
     run_syms: []u8
     run_extra: []u8
 }
@@ -50,24 +57,22 @@ struct Match {
 }
 
 fn window_bits(size: i64) -> i64 {
-    var bits = 10
-    for bits < 22 && (1 << bits) - 16 < size {
-        bits += 1
+    var width = 10
+    for width < 22 && (1 << width) - 16 < size {
+        width += 1
     }
-    bits
+    width
 }
 
-fn new_encoder(level: i64, bits: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
+fn compressor(level: i64, window: i64, capacity: i64) -> *Compressor {
     let clamped = if level < 0 { 0 } else if level > 11 { 11 } else { level }
-    let full = 1 << bits
+    let full = 1 << window
     let block = if full < 1 << 18 { full } else { 1 << 18 }
     let hash_bits = if clamped < 4 { 15 } else { 17 }
     let hist_size = if 2 * full < 65536 { 2 * full } else { 65536 }
     let chain_size = if full < 65536 { full } else { 65536 }
-    let e = new(Encoder {
+    let e = new(Compressor {
         level: clamped
-        sink
-        finished: false
         max_distance: full - 16
         full
         block
@@ -90,20 +95,20 @@ fn new_encoder(level: i64, bits: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
         dcodes: __make(1024)
         dextras: __make(1024)
         commands: 0
-        writer: bit_writer()
-        builder: code_builder()
+        out: codec.buffer(capacity)
+        builder: codec.builder(704)
         tables: tables()
         command_freq: __make(704)
         distance_freq: __make(64)
         length_freq: __make(18)
         literals: literal_model(if clamped < 5 { 1 } else { clamped * 3 - 11 })
-        command_code: code(704)
-        distance_code: code(64)
-        length_code: code(18)
+        command_code: codec.code(704)
+        distance_code: codec.code(64)
+        length_code: codec.code(18)
         run_syms: __make(720)
         run_extra: __make(720)
     })
-    write_window_bits(e.writer, bits)
+    write_window_bits(e.out, window)
     e
 }
 
@@ -111,36 +116,32 @@ fn new_encoder(level: i64, bits: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
 ///
 /// `level` is clamped to `0..11`; `0` stores the data in uncompressed meta-blocks.
 pub fn encoder(level: i64, sink: fn([]u8) ! io.Error) -> *Encoder {
-    new_encoder(level, 22, sink)
+    new(Encoder { core: compressor(level, 22, 65536), sink, finished: false })
 }
 
-fn write_window_bits(w: *BitWriter, bits: i64) {
-    if bits == 16 {
-        put(w, 0, 1)
-    } else if bits == 17 {
-        put(w, 1, 7)
-    } else if bits > 17 {
-        put(w, 1, 1)
-        put(w, bits - 17, 3)
+fn write_window_bits(w: *codec.Buffer, window: i64) {
+    if window == 16 {
+        codec.put_bits(w, 0, 1)
+    } else if window == 17 {
+        codec.put_bits(w, 1, 7)
+    } else if window > 17 {
+        codec.put_bits(w, 1, 1)
+        codec.put_bits(w, window - 17, 3)
     } else {
-        put(w, 1, 1)
-        put(w, 0, 3)
-        put(w, bits - 8, 3)
+        codec.put_bits(w, 1, 1)
+        codec.put_bits(w, 0, 3)
+        codec.put_bits(w, window - 8, 3)
     }
 }
 
-fn emit_output(e: *Encoder) ! io.Error {
-    let w = e.writer
-    drain(w)
-    if w.len == 0 {
-        return
+fn drain(e: *Encoder) ! io.Error {
+    let ready = codec.drain(e.core.out)
+    if ready.len > 0 {
+        e.sink(ready)?
     }
-    let chunk = w.data[..w.len]
-    w.len = 0
-    e.sink(chunk)?
 }
 
-fn make_room(e: *Encoder) {
+fn make_room(e: *Compressor) {
     if e.hist.len < 2 * e.full {
         let grown: []u8 = __make(e.hist.len * 2)
         __memmove(grown, e.hist[..e.fill])
@@ -153,6 +154,47 @@ fn make_room(e: *Encoder) {
     e.fill -= stale
 }
 
+fn take_input(e: *Compressor, data: []u8) -> i64 {
+    if e.fill == e.hist.len {
+        make_room(e)
+    }
+    let n = __memmove(e.hist[e.fill..], data)
+    e.fill += n
+    for e.start + e.fill - e.done >= e.block {
+        write_block(e, e.block)
+    }
+    n
+}
+
+fn feed(e: *Compressor, data: []u8) {
+    var rest = data
+    for rest.len > 0 {
+        let n = take_input(e, rest)
+        rest = rest[n..]
+    }
+}
+
+fn write_pending(e: *Compressor) {
+    let pending = e.start + e.fill - e.done
+    if pending > 0 {
+        write_block(e, pending)
+    }
+}
+
+fn sync(e: *Compressor) {
+    write_pending(e)
+    codec.put_bits(e.out, 0, 1)
+    codec.put_bits(e.out, 3, 2)
+    codec.put_bits(e.out, 0, 3)
+    codec.align(e.out)
+}
+
+fn close(e: *Compressor) {
+    write_pending(e)
+    codec.put_bits(e.out, 3, 2)
+    codec.align(e.out)
+}
+
 /// Compresses `data` and passes the compressed bytes that are ready to the encoder's `sink`.
 ///
 /// Input is buffered and written in meta-blocks of up to 256 KiB, so a call can produce no output. Fails with `Invalid` after `finish`, and with any error `sink` returns.
@@ -162,23 +204,9 @@ pub fn encode(e: *Encoder, data: []u8) ! io.Error {
     }
     var rest = data
     for rest.len > 0 {
-        if e.fill == e.hist.len {
-            make_room(e)
-        }
-        let n = __memmove(e.hist[e.fill..], rest)
-        e.fill += n
+        let n = take_input(e.core, rest)
         rest = rest[n..]
-        for e.start + e.fill - e.done >= e.block {
-            write_block(e, e.block)
-            emit_output(e)?
-        }
-    }
-}
-
-fn write_pending(e: *Encoder) {
-    let pending = e.start + e.fill - e.done
-    if pending > 0 {
-        write_block(e, pending)
+        drain(e)?
     }
 }
 
@@ -189,12 +217,8 @@ pub fn flush(e: *Encoder) ! io.Error {
     if e.finished {
         fail Invalid
     }
-    write_pending(e)
-    put(e.writer, 0, 1)
-    put(e.writer, 3, 2)
-    put(e.writer, 0, 3)
-    align_writer(e.writer)
-    emit_output(e)?
+    sync(e.core)
+    drain(e)?
 }
 
 /// Writes the buffered input and the last meta-block, ending the stream.
@@ -204,50 +228,68 @@ pub fn finish(e: *Encoder) ! io.Error {
     if e.finished {
         fail Invalid
     }
-    write_pending(e)
-    put(e.writer, 3, 2)
-    align_writer(e.writer)
+    close(e.core)
     e.finished = true
-    emit_output(e)?
+    drain(e)?
 }
 
-fn write_length_header(w: *BitWriter, length: i64) {
+fn write_length_header(w: *codec.Buffer, length: i64) {
     let m = length - 1
     let nibbles = if m < 1 << 16 { 4 } else if m < 1 << 20 { 5 } else { 6 }
-    put(w, 0, 1)
-    put(w, nibbles - 4, 2)
-    put(w, m, 4 * nibbles)
+    codec.put_bits(w, 0, 1)
+    codec.put_bits(w, nibbles - 4, 2)
+    codec.put_bits(w, m, 4 * nibbles)
 }
 
-fn write_uncompressed(e: *Encoder, length: i64) {
-    let w = e.writer
+fn write_uncompressed(e: *Compressor, length: i64) {
+    let w = e.out
     write_length_header(w, length)
-    put(w, 1, 1)
-    align_writer(w)
+    codec.put_bits(w, 1, 1)
+    codec.align(w)
     let at = e.done - e.start
-    put_bytes_aligned(w, e.hist[at..at + length])
+    codec.put_bytes(w, e.hist[at..at + length])
 }
 
-fn write_block(e: *Encoder, length: i64) {
+struct Position {
+    len: i64
+    tail: i64
+    pending: i64
+}
+
+fn position(w: *codec.Buffer) -> Position {
+    codec.flush_bits(w)
+    let pending = codec.pending_bits(w)
+    var tail = 0
+    if pending > 0 {
+        codec.align(w)
+        w.len -= 1
+        tail = i64(w.data[w.len])
+        codec.put_bits(w, tail, pending)
+    }
+    Position { len: w.len, tail, pending }
+}
+
+fn rewind(w: *codec.Buffer, p: Position) {
+    codec.align(w)
+    w.len = p.len
+    codec.put_bits(w, p.tail, p.pending)
+}
+
+fn write_block(e: *Compressor, length: i64) {
     if e.level == 0 {
         write_uncompressed(e, length)
         e.done += length
         return
     }
-    let w = e.writer
-    drain(w)
-    let mark = w.len
-    let acc = w.acc
-    let count = w.count
+    let w = e.out
+    let mark = position(w)
     __memmove(e.saved, e.distances)
     let last = e.last
     parse(e, e.done, e.done + length)
     write_compressed(e, length)
-    drain(w)
-    if w.len - mark > length + 3 {
-        w.len = mark
-        w.acc = acc
-        w.count = count
+    codec.flush_bits(w)
+    if w.len - mark.len > length + 3 {
+        rewind(w, mark)
         __memmove(e.distances, e.saved)
         e.last = last
         write_uncompressed(e, length)
@@ -255,13 +297,13 @@ fn write_block(e: *Encoder, length: i64) {
     e.done += length
 }
 
-fn hash_at(e: *Encoder, i: i64) -> i64 {
+fn hash_at(e: *Compressor, i: i64) -> i64 {
     let h = e.hist
     let v = u32(h[i]) | u32(h[i + 1]) << 8 | u32(h[i + 2]) << 16 | u32(h[i + 3]) << 24
     i64((v * 0x1E35A7BD) >> e.hash_shift)
 }
 
-fn grow_chain(e: *Encoder, need: i64) {
+fn grow_chain(e: *Compressor, need: i64) {
     var size = e.chain.len
     for size < need && size < e.full {
         size *= 2
@@ -274,7 +316,7 @@ fn grow_chain(e: *Encoder, need: i64) {
     e.chain = grown
 }
 
-fn insert_until(e: *Encoder, p: i64) {
+fn insert_until(e: *Compressor, p: i64) {
     let available = e.start + e.fill - 4
     let stop = if p <= available { p } else { available + 1 }
     if stop > e.chain.len && e.chain.len < e.full {
@@ -293,23 +335,11 @@ fn insert_until(e: *Encoder, p: i64) {
     }
 }
 
-fn match_length(h: []u8, a: i64, b: i64, limit: i64) -> i64 {
-    var n = 0
-    for n < limit && h[a + n] == h[b + n] {
-        n += 1
-    }
-    n
-}
-
-fn log2_floor(v: i64) -> i64 {
-    if v < 2 { 0 } else { bit_length(v) - 1 }
-}
-
-fn recent_distance(e: *Encoder, back: i64) -> i64 {
+fn recent_distance(e: *Compressor, back: i64) -> i64 {
     e.distances[(e.last - back) & 3]
 }
 
-fn find_match(e: *Encoder, p: i64, end: i64) -> Match {
+fn find_match(e: *Compressor, p: i64, end: i64) -> Match {
     var best = Match { len: 0, distance: 0, score: 100 }
     let limit = end - p
     if limit < 3 {
@@ -323,7 +353,7 @@ fn find_match(e: *Encoder, p: i64, end: i64) -> Match {
         if d > reach || h[i - d] != h[i] {
             continue
         }
-        let len = match_length(h, i - d, i, limit)
+        let len = codec.match_length(h, i - d, i, limit)
         if len >= 3 {
             let score = 135 * len + if k == 0 { 15 } else { -40 }
             if score > best.score {
@@ -345,9 +375,9 @@ fn find_match(e: *Encoder, p: i64, end: i64) -> Match {
         previous = d
         let j = i - d
         if best.len < limit && h[j + best.len] == h[i + best.len] {
-            let len = match_length(h, j, i, limit)
+            let len = codec.match_length(h, j, i, limit)
             if len >= 4 {
-                let score = 135 * len - 30 * log2_floor(d)
+                let score = 135 * len - 30 * (bits.bit_length(u64(d)) - 1)
                 if score > best.score {
                     best = Match { len, distance: d, score }
                     if len >= e.nice {
@@ -361,7 +391,7 @@ fn find_match(e: *Encoder, p: i64, end: i64) -> Match {
     best
 }
 
-fn grow_commands(e: *Encoder) {
+fn grow_commands(e: *Compressor) {
     let size = e.inserts.len * 2
     let inserts: []u32 = __make(size)
     let copies: []u32 = __make(size)
@@ -377,7 +407,7 @@ fn grow_commands(e: *Encoder) {
     e.dextras = dextras
 }
 
-fn short_code(e: *Encoder, d: i64) -> i64 {
+fn short_code(e: *Compressor, d: i64) -> i64 {
     for k in 0..4 {
         if recent_distance(e, k + 1) == d {
             return k
@@ -395,7 +425,7 @@ fn short_code(e: *Encoder, d: i64) -> i64 {
     -1
 }
 
-fn add_command(e: *Encoder, insert: i64, copy: i64, distance: i64) {
+fn add_command(e: *Compressor, insert: i64, copy: i64, distance: i64) {
     if e.commands == e.inserts.len {
         grow_commands(e)
     }
@@ -411,7 +441,7 @@ fn add_command(e: *Encoder, insert: i64, copy: i64, distance: i64) {
     var extra = 0
     if code < 0 {
         let x = distance + 3
-        let width = log2_floor(x) - 1
+        let width = bits.bit_length(u64(x)) - 2
         let high = (x >> width) & 1
         code = 16 + 2 * (width - 1) + high
         extra = x - ((2 + high) << width)
@@ -424,7 +454,7 @@ fn add_command(e: *Encoder, insert: i64, copy: i64, distance: i64) {
     }
 }
 
-fn parse(e: *Encoder, from: i64, end: i64) {
+fn parse(e: *Compressor, from: i64, end: i64) {
     e.commands = 0
     var p = from
     var literals = from
@@ -509,18 +539,18 @@ fn literal_context(h: []u8, k: i64, abs: i64, lut: []u8) -> i64 {
     i64(lut[1024 + p1] | lut[1280 + p2])
 }
 
-fn write_var_uint8(w: *BitWriter, v: i64) {
+fn write_var_uint8(w: *codec.Buffer, v: i64) {
     if v == 0 {
-        put(w, 0, 1)
+        codec.put_bits(w, 0, 1)
         return
     }
-    let width = log2_floor(v)
-    put(w, 1, 1)
-    put(w, width, 3)
-    put(w, v - (1 << width), width)
+    let width = bits.bit_length(u64(v)) - 1
+    codec.put_bits(w, 1, 1)
+    codec.put_bits(w, width, 3)
+    codec.put_bits(w, v - (1 << width), width)
 }
 
-fn write_context_map(e: *Encoder) {
+fn write_context_map(e: *Compressor) {
     let m = e.literals
     let n = m.clusters
     let order = m.mtf
@@ -542,16 +572,16 @@ fn write_context_map(e: *Encoder) {
         values[ctx] = u8(at)
         m.map_freq[at] += 1
     }
-    let w = e.writer
-    put(w, 0, 1)
+    let w = e.out
+    codec.put_bits(w, 0, 1)
     write_code(e, m.map_freq[..n], m.map_code, n)
     for v in values {
-        put_code(w, m.map_code, i64(v))
+        codec.put_code(w, m.map_code, i64(v))
     }
-    put(w, 1, 1)
+    codec.put_bits(w, 1, 1)
 }
 
-fn write_compressed(e: *Encoder, length: i64) {
+fn write_compressed(e: *Compressor, length: i64) {
     let t = e.tables
     let lut = t.context
     let h = e.hist
@@ -576,17 +606,17 @@ fn write_compressed(e: *Encoder, length: i64) {
         }
     }
     cluster_literals(m)
-    let w = e.writer
+    let w = e.out
     write_length_header(w, length)
-    put(w, 0, 1)
-    put(w, 0, 3)
-    put(w, 0, 6)
-    put(w, 2, 2)
+    codec.put_bits(w, 0, 1)
+    codec.put_bits(w, 0, 3)
+    codec.put_bits(w, 0, 6)
+    codec.put_bits(w, 2, 2)
     write_var_uint8(w, m.clusters - 1)
     if m.clusters > 1 {
         write_context_map(e)
     }
-    put(w, 0, 1)
+    codec.put_bits(w, 0, 1)
     for id in 0..m.clusters {
         write_code(e, cluster_freq(m, id), m.codes[id], 256)
     }
@@ -600,27 +630,27 @@ fn write_compressed(e: *Encoder, length: i64) {
         let ic = insert_code(t, insert)
         let cc = copy_code(t, copy)
         let sym = command_symbol(ic, cc, dcode == 0 || dcode == 0xFFFF)
-        put_code(w, e.command_code, sym)
-        put(w, insert - t.insert_base[ic], t.insert_extra[ic])
-        put(w, copy - t.copy_base[cc], t.copy_extra[cc])
+        codec.put_code(w, e.command_code, sym)
+        codec.put_bits(w, insert - t.insert_base[ic], t.insert_extra[ic])
+        codec.put_bits(w, copy - t.copy_base[cc], t.copy_extra[cc])
         for k in at..at + insert {
             let ctx = literal_context(h, k, k + e.start, lut)
-            put_code(w, m.codes[m.map[ctx]], i64(h[k]))
+            codec.put_code(w, m.codes[m.map[ctx]], i64(h[k]))
         }
         at += insert + copy
         if sym >= 128 && dcode != 0xFFFF {
-            put_code(w, e.distance_code, dcode)
-            put(w, i64(e.dextras[n]), distance_bits(dcode))
+            codec.put_code(w, e.distance_code, dcode)
+            codec.put_bits(w, i64(e.dextras[n]), distance_bits(dcode))
         }
     }
 }
 
-fn write_simple_code(w: *BitWriter, c: *Code, alphabet: i64) {
-    let width = bit_length(alphabet - 1)
-    put(w, 1, 2)
+fn write_simple_code(w: *codec.Buffer, c: *codec.Code, alphabet: i64) {
+    let width = bits.bit_length(u64(alphabet - 1))
+    codec.put_bits(w, 1, 2)
     if c.used <= 1 {
-        put(w, 0, 2)
-        put(w, c.first, width)
+        codec.put_bits(w, 0, 2)
+        codec.put_bits(w, c.first, width)
         return
     }
     let symbols: []i64 = [0, 0, 0, 0]
@@ -633,22 +663,22 @@ fn write_simple_code(w: *BitWriter, c: *Code, alphabet: i64) {
             }
         }
     }
-    put(w, n - 1, 2)
+    codec.put_bits(w, n - 1, 2)
     for i in 0..n {
-        put(w, symbols[i], width)
+        codec.put_bits(w, symbols[i], width)
     }
     if n == 4 {
-        put(w, if c.lens[symbols[0]] == 1 { 1 } else { 0 }, 1)
+        codec.put_bits(w, if c.lens[symbols[0]] == 1 { 1 } else { 0 }, 1)
     }
 }
 
-fn add_run_symbol(e: *Encoder, at: i64, sym: u8, extra: u8) -> i64 {
+fn add_run_symbol(e: *Compressor, at: i64, sym: u8, extra: u8) -> i64 {
     e.run_syms[at] = sym
     e.run_extra[at] = extra
     at + 1
 }
 
-fn reverse_runs(e: *Encoder, from: i64, to: i64) {
+fn reverse_runs(e: *Compressor, from: i64, to: i64) {
     var a = from
     var b = to - 1
     for a < b {
@@ -663,7 +693,7 @@ fn reverse_runs(e: *Encoder, from: i64, to: i64) {
     }
 }
 
-fn add_zero_run(e: *Encoder, at: i64, count: i64) -> i64 {
+fn add_zero_run(e: *Compressor, at: i64, count: i64) -> i64 {
     var n = at
     var reps = count
     if reps == 11 {
@@ -690,7 +720,7 @@ fn add_zero_run(e: *Encoder, at: i64, count: i64) -> i64 {
     n
 }
 
-fn add_value_run(e: *Encoder, at: i64, previous: u8, value: u8, count: i64) -> i64 {
+fn add_value_run(e: *Compressor, at: i64, previous: u8, value: u8, count: i64) -> i64 {
     var n = at
     var reps = count
     if previous != value {
@@ -721,9 +751,9 @@ fn add_value_run(e: *Encoder, at: i64, previous: u8, value: u8, count: i64) -> i
     n
 }
 
-fn write_code(e: *Encoder, freq: []i64, c: *Code, alphabet: i64) {
-    let w = e.writer
-    huffman(e.builder, freq, c, 15)
+fn write_code(e: *Compressor, freq: []i64, c: *codec.Code, alphabet: i64) {
+    let w = e.out
+    codec.build(e.builder, freq, c, 15)
     if c.used <= 4 {
         write_simple_code(w, c, alphabet)
         return
@@ -756,7 +786,7 @@ fn write_code(e: *Encoder, freq: []i64, c: *Code, alphabet: i64) {
         lf[e.run_syms[k]] += 1
     }
     let lc = e.length_code
-    huffman(e.builder, lf, lc, 5)
+    codec.build(e.builder, lf, lc, 5)
     let single = lc.used == 1
     if single {
         lc.lens[lc.first] = 1
@@ -772,22 +802,22 @@ fn write_code(e: *Encoder, freq: []i64, c: *Code, alphabet: i64) {
             stored -= 1
         }
     }
-    put(w, skip, 2)
+    codec.put_bits(w, skip, 2)
     let value_bits: []i64 = [0, 7, 3, 2, 1, 15]
     let value_lens: []i64 = [2, 4, 3, 2, 2, 4]
     for k in skip..stored {
         let v = i64(lc.lens[order[k]])
-        put(w, value_bits[v], value_lens[v])
+        codec.put_bits(w, value_bits[v], value_lens[v])
     }
     for k in 0..runs {
         let sym = i64(e.run_syms[k])
         if !single {
-            put_code(w, lc, sym)
+            codec.put_code(w, lc, sym)
         }
         if sym == 16 {
-            put(w, i64(e.run_extra[k]), 2)
+            codec.put_bits(w, i64(e.run_extra[k]), 2)
         } else if sym == 17 {
-            put(w, i64(e.run_extra[k]), 3)
+            codec.put_bits(w, i64(e.run_extra[k]), 3)
         }
     }
 }
