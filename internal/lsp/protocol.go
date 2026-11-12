@@ -89,8 +89,14 @@ type TextDocumentIdentifier struct {
 }
 
 type TextDocumentItem struct {
-	URI  string `json:"uri"`
-	Text string `json:"text"`
+	URI     string `json:"uri"`
+	Version int    `json:"version"`
+	Text    string `json:"text"`
+}
+
+type VersionedTextDocumentIdentifier struct {
+	URI     string `json:"uri"`
+	Version int    `json:"version"`
 }
 
 type TextDocumentPositionParams struct {
@@ -107,8 +113,8 @@ type ContentChange struct {
 }
 
 type DidChangeParams struct {
-	TextDocument   TextDocumentIdentifier `json:"textDocument"`
-	ContentChanges []ContentChange        `json:"contentChanges"`
+	TextDocument   VersionedTextDocumentIdentifier `json:"textDocument"`
+	ContentChanges []ContentChange                 `json:"contentChanges"`
 }
 
 type DocumentParams struct {
@@ -162,7 +168,23 @@ type TextEdit struct {
 }
 
 type WorkspaceEdit struct {
-	Changes map[string][]TextEdit `json:"changes"`
+	Changes         map[string][]TextEdit `json:"changes,omitempty"`
+	DocumentChanges []TextDocumentEdit    `json:"documentChanges,omitempty"`
+}
+
+type TextDocumentEdit struct {
+	TextDocument VersionedTextDocumentIdentifier `json:"textDocument"`
+	Edits        []SnippetTextEdit               `json:"edits"`
+}
+
+type SnippetTextEdit struct {
+	Range   Range       `json:"range"`
+	Snippet StringValue `json:"snippet"`
+}
+
+type StringValue struct {
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
 }
 
 type SignatureHelpOptions struct {
@@ -196,6 +218,7 @@ type Capabilities struct {
 	SignatureHelpProvider   SignatureHelpOptions `json:"signatureHelpProvider"`
 	InlayHintProvider       bool                 `json:"inlayHintProvider"`
 	WorkspaceSymbolProvider bool                 `json:"workspaceSymbolProvider"`
+	CodeActionProvider      bool                 `json:"codeActionProvider"`
 }
 
 type ServerInfo struct {
@@ -206,8 +229,13 @@ type InlayHintClient struct {
 	RefreshSupport bool `json:"refreshSupport"`
 }
 
+type WorkspaceEditClient struct {
+	SnippetEditSupport bool `json:"snippetEditSupport"`
+}
+
 type WorkspaceClient struct {
-	InlayHint InlayHintClient `json:"inlayHint"`
+	InlayHint     InlayHintClient     `json:"inlayHint"`
+	WorkspaceEdit WorkspaceEditClient `json:"workspaceEdit"`
 }
 
 type ClientCapabilities struct {
@@ -221,6 +249,18 @@ type InitializeParams struct {
 type InlayHintParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
 	Range        Range                  `json:"range"`
+}
+
+type CodeActionParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Range        Range                  `json:"range"`
+}
+
+type CodeAction struct {
+	Title       string        `json:"title"`
+	Kind        string        `json:"kind"`
+	IsPreferred bool          `json:"isPreferred,omitempty"`
+	Edit        WorkspaceEdit `json:"edit"`
 }
 
 type InlayHint struct {

@@ -16,20 +16,23 @@ import (
 )
 
 type Server struct {
-	stream      *stream
-	docs        compiler.Overlay
-	entries     map[string]*entryState
-	compiles    *scheduler
-	indexed     indexed
-	hintRefresh bool
-	requests    int
-	shutdown    bool
+	stream       *stream
+	docs         compiler.Overlay
+	versions     map[string]int
+	entries      map[string]*entryState
+	compiles     *scheduler
+	indexed      indexed
+	hintRefresh  bool
+	snippetEdits bool
+	requests     int
+	shutdown     bool
 }
 
 func NewServer(in io.Reader, out io.Writer) *Server {
 	return &Server{
 		stream:   newStream(in, out),
 		docs:     compiler.Overlay{},
+		versions: map[string]int{},
 		entries:  map[string]*entryState{},
 		compiles: newScheduler(),
 	}
@@ -95,6 +98,8 @@ func (s *Server) handle(req request) (bool, error) {
 		return false, serve(s, req, s.inlayHints)
 	case "workspace/symbol":
 		return false, serve(s, req, s.workspaceSymbols)
+	case "textDocument/codeAction":
+		return false, serve(s, req, s.codeActions)
 	case "shutdown":
 		s.shutdown = true
 		return false, s.reply(req.ID, nil)
@@ -167,6 +172,7 @@ func observe[P any](s *Server, req request, apply func(P)) error {
 
 func (s *Server) initialize(p InitializeParams) InitializeResult {
 	s.hintRefresh = p.Capabilities.Workspace.InlayHint.RefreshSupport
+	s.snippetEdits = p.Capabilities.Workspace.WorkspaceEdit.SnippetEditSupport
 	return InitializeResult{
 		Capabilities: Capabilities{
 			TextDocumentSync:        SyncOptions{OpenClose: true, Change: syncFull, Save: SaveOptions{}},
@@ -179,6 +185,7 @@ func (s *Server) initialize(p InitializeParams) InitializeResult {
 			SignatureHelpProvider:   SignatureHelpOptions{TriggerCharacters: []string{"(", ","}, RetriggerCharacters: []string{","}},
 			InlayHintProvider:       true,
 			WorkspaceSymbolProvider: true,
+			CodeActionProvider:      true,
 		},
 		ServerInfo: ServerInfo{Name: "low"},
 	}
@@ -187,6 +194,7 @@ func (s *Server) initialize(p InitializeParams) InitializeResult {
 func (s *Server) open(p DidOpenParams) {
 	path := pathOf(p.TextDocument.URI)
 	s.docs[path] = []byte(p.TextDocument.Text)
+	s.versions[path] = p.TextDocument.Version
 	s.schedule(path, 0)
 }
 
@@ -197,6 +205,7 @@ func (s *Server) change(p DidChangeParams) {
 	path := pathOf(p.TextDocument.URI)
 	latest := p.ContentChanges[len(p.ContentChanges)-1]
 	s.docs[path] = []byte(latest.Text)
+	s.versions[path] = p.TextDocument.Version
 	s.schedule(path, debounce)
 }
 
@@ -213,6 +222,7 @@ func (s *Server) save(p DocumentParams) {
 func (s *Server) close(p DocumentParams) {
 	path := pathOf(p.TextDocument.URI)
 	delete(s.docs, path)
+	delete(s.versions, path)
 	s.schedule(path, 0)
 }
 
@@ -272,6 +282,7 @@ func (s *Server) finish(r compiled) error {
 		return nil
 	}
 	state.fresh = r.err == nil
+	state.failure = newFailure(r)
 	diagnostics := map[string][]Diagnostic{}
 	for path := range s.docs {
 		if s.entry(path) == entry {

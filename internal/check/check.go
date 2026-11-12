@@ -52,6 +52,20 @@ type Checker struct {
 	checkingDefault map[*types.Field]bool
 	derived         map[string]*ast.Func
 	embedder        EmbedResolver
+	unpropagated    *types.Type
+}
+
+type Unpropagated struct {
+	Failure *diag.Error
+	Result  *types.Type
+}
+
+func (e *Unpropagated) Error() string {
+	return e.Failure.Error()
+}
+
+func (e *Unpropagated) Unwrap() error {
+	return e.Failure
 }
 
 type Embedded struct {
@@ -81,10 +95,14 @@ func Check(files []*ast.File, resolve EmbedResolver) (*types.Universe, error) {
 		derived:         map[string]*ast.Func{},
 	}
 	c.universe = types.NewUniverse(c.created)
-	if failure := diag.Try(func() { c.check(files) }); failure != nil {
-		return nil, failure
+	failure := diag.Try(func() { c.check(files) })
+	switch {
+	case failure == nil:
+		return c.universe, nil
+	case c.unpropagated != nil:
+		return nil, &Unpropagated{Failure: failure, Result: c.unpropagated}
 	}
-	return c.universe, nil
+	return nil, failure
 }
 
 func (c *Checker) scope(module string) *scope {
@@ -2068,6 +2086,7 @@ func (c *Checker) try(e *ast.Try, want *types.Type) {
 	t := c.errorResult(e.X, "?", e.Pos, want)
 	ret := c.fn.RetType
 	if ret.Kind != types.ResultKind {
+		c.unpropagated = t
 		c.fail(e.Pos, "? requires %s to declare an error type", c.subject())
 	}
 	if ret.Err != t.Err {

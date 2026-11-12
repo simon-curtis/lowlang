@@ -8,6 +8,7 @@ type entryState struct {
 	unit      *compiler.Unit
 	docs      compiler.Overlay
 	fresh     bool
+	failure   failure
 	published []string
 }
 

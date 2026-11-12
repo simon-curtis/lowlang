@@ -172,7 +172,7 @@ func (c *client) await(uri string, after int) []Diagnostic {
 func (c *client) change(f fixture, text string) []Diagnostic {
 	c.t.Helper()
 	before := c.publishes[f.uri]
-	change := DidChangeParams{TextDocument: TextDocumentIdentifier{URI: f.uri}, ContentChanges: []ContentChange{{Text: text}}}
+	change := DidChangeParams{TextDocument: VersionedTextDocumentIdentifier{URI: f.uri}, ContentChanges: []ContentChange{{Text: text}}}
 	c.notify("textDocument/didChange", change)
 	return c.await(f.uri, before)
 }
@@ -277,7 +277,7 @@ func TestRapidEditsPublishOnlyTheLatest(t *testing.T) {
 	before := c.publishes[f.uri]
 	for i := range 5 {
 		broken := fmt.Sprintf("%s\nfn broken%d() {\n    let x: i64 = \"s\"\n}\n", f.src, i)
-		change := DidChangeParams{TextDocument: TextDocumentIdentifier{URI: f.uri}, ContentChanges: []ContentChange{{Text: broken}}}
+		change := DidChangeParams{TextDocument: VersionedTextDocumentIdentifier{URI: f.uri}, ContentChanges: []ContentChange{{Text: broken}}}
 		c.notify("textDocument/didChange", change)
 	}
 	if got := c.change(f, f.src); len(got) != 0 {
@@ -293,7 +293,7 @@ func TestHoverDoesNotWaitForPendingCompile(t *testing.T) {
 	f := load(t, "enums.low")
 	c.open(f, f.src)
 	before := c.publishes[f.uri]
-	change := DidChangeParams{TextDocument: TextDocumentIdentifier{URI: f.uri}, ContentChanges: []ContentChange{{Text: f.src}}}
+	change := DidChangeParams{TextDocument: VersionedTextDocumentIdentifier{URI: f.uri}, ContentChanges: []ContentChange{{Text: f.src}}}
 	c.notify("textDocument/didChange", change)
 	if got := c.hover(f, f.at(t, "print(area(big))", 11)); !strings.Contains(got, "let big: Shape") {
 		t.Errorf("hover during pending compile = %q", got)
