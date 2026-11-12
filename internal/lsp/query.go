@@ -35,7 +35,7 @@ func (q *query) module(alias string) (string, bool) {
 	return q.file().Imported(alias)
 }
 
-func (q *query) declared(alias, name string) any {
+func (q *query) declared(alias, name string) *typeDecl {
 	module, ok := q.module(alias)
 	if !ok {
 		return nil
@@ -141,7 +141,7 @@ func (q *query) ident(n *ast.Ident) referent {
 		return q.variantRef(n.TypeOf(), n.Name, n.Variant)
 	}
 	if decl := q.declared("", n.Name); decl != nil {
-		return typeRef{q: q, decl: decl}
+		return typeRef{decl: decl}
 	}
 	if path, ok := q.file().Imported(n.Name); ok {
 		return importRef{q: q, path: path}
@@ -170,7 +170,7 @@ func (q *query) pattern(n *ast.Pattern) referent {
 
 func (q *query) named(alias, name string, unresolved referent) referent {
 	if decl := q.declared(alias, name); decl != nil {
-		return typeRef{q: q, decl: decl}
+		return typeRef{decl: decl}
 	}
 	return unresolved
 }
@@ -203,9 +203,9 @@ func (q *query) declaration() referent {
 	case *ast.Func:
 		return own{at: self, referent: funcRef{fn: n}}
 	case *ast.StructDecl:
-		return own{at: self, referent: typeRef{q: q, decl: n}}
+		return own{at: self, referent: typeRef{decl: structTypeDecl(n)}}
 	case *ast.EnumDecl:
-		return own{at: self, referent: typeRef{q: q, decl: n}}
+		return own{at: self, referent: typeRef{decl: enumTypeDecl(n)}}
 	case *ast.FieldDecl:
 		return own{at: self, referent: q.field(q.occ.parent, n.Name, nil)}
 	case *ast.VariantDecl:

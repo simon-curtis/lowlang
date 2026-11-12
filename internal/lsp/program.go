@@ -5,6 +5,7 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
+	"lowlang/internal/diag"
 	"lowlang/internal/types"
 )
 
@@ -44,16 +45,38 @@ func (p program) fileAt(path string) *ast.File {
 	return nil
 }
 
-func (p program) typeDecl(module, name string) any {
+type typeDecl struct {
+	name string
+	doc  string
+	file *ast.File
+	pos  diag.Pos
+	text string
+	typ  *types.Type
+	enum *ast.EnumDecl
+}
+
+func structTypeDecl(d *ast.StructDecl) *typeDecl {
+	return &typeDecl{name: d.Name, doc: d.Doc, file: d.File, pos: d.Pos, text: d.String(), typ: d.Type}
+}
+
+func enumTypeDecl(d *ast.EnumDecl) *typeDecl {
+	return &typeDecl{name: d.Name, doc: d.Doc, file: d.File, pos: d.Pos, text: d.String(), typ: d.Type, enum: d}
+}
+
+func (d *typeDecl) target() target {
+	return target{path: d.file.Path, pos: d.pos, name: d.name}
+}
+
+func (p program) typeDecl(module, name string) *typeDecl {
 	for _, f := range p.moduleFiles(module) {
 		for _, d := range f.Structs {
 			if d.Name == name {
-				return d
+				return structTypeDecl(d)
 			}
 		}
 		for _, d := range f.Enums {
 			if d.Name == name {
-				return d
+				return enumTypeDecl(d)
 			}
 		}
 	}
@@ -61,8 +84,11 @@ func (p program) typeDecl(module, name string) any {
 }
 
 func (p program) enumDecl(module, name string) *ast.EnumDecl {
-	decl, _ := p.typeDecl(module, name).(*ast.EnumDecl)
-	return decl
+	decl := p.typeDecl(module, name)
+	if decl == nil {
+		return nil
+	}
+	return decl.enum
 }
 
 func (p program) function(module, name string, public bool) *ast.Func {
@@ -85,11 +111,9 @@ func (p program) declType(file *ast.File, tn *ast.TypeName) *types.Type {
 		}
 		module = path
 	}
-	switch d := p.typeDecl(module, tn.Name).(type) {
-	case *ast.StructDecl:
-		return d.Type
-	case *ast.EnumDecl:
-		return d.Type
+	decl := p.typeDecl(module, tn.Name)
+	if decl == nil {
+		return nil
 	}
-	return nil
+	return decl.typ
 }

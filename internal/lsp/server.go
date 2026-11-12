@@ -16,28 +16,22 @@ import (
 )
 
 type Server struct {
-	stream       *stream
-	docs         compiler.Overlay
-	units        map[string]*compiler.Unit
-	published    map[string][]string
-	fresh        map[string]bool
-	compiledDocs map[string]compiler.Overlay
-	compiles     *scheduler
-	indexed      indexed
-	hintRefresh  bool
-	requests     int
-	shutdown     bool
+	stream      *stream
+	docs        compiler.Overlay
+	entries     map[string]*entryState
+	compiles    *scheduler
+	indexed     indexed
+	hintRefresh bool
+	requests    int
+	shutdown    bool
 }
 
 func NewServer(in io.Reader, out io.Writer) *Server {
 	return &Server{
-		stream:       newStream(in, out),
-		docs:         compiler.Overlay{},
-		units:        map[string]*compiler.Unit{},
-		published:    map[string][]string{},
-		fresh:        map[string]bool{},
-		compiledDocs: map[string]compiler.Overlay{},
-		compiles:     newScheduler(),
+		stream:   newStream(in, out),
+		docs:     compiler.Overlay{},
+		entries:  map[string]*entryState{},
+		compiles: newScheduler(),
 	}
 }
 
@@ -208,7 +202,7 @@ func (s *Server) change(p DidChangeParams) {
 
 func (s *Server) schedule(path string, delay time.Duration) {
 	entry := s.entry(path)
-	s.fresh[entry] = false
+	s.entryState(entry).fresh = false
 	s.compiles.mark(entry, path, delay)
 }
 
@@ -253,22 +247,31 @@ func (s *Server) entry(path string) string {
 	return path
 }
 
+func (s *Server) entryState(entry string) *entryState {
+	state, ok := s.entries[entry]
+	if !ok {
+		state = &entryState{}
+		s.entries[entry] = state
+	}
+	return state
+}
+
+func (s *Server) stateOf(path string) *entryState {
+	return s.entryState(s.entry(path))
+}
+
 func (s *Server) finish(r compiled) error {
 	current := s.compiles.finish(r)
 	entry := r.job.entry
+	state := s.entryState(entry)
 	if r.err == nil {
-		s.units[entry] = r.unit
-		s.compiledDocs[entry] = r.job.docs
+		state.unit = r.unit
+		state.docs = r.job.docs
 	}
 	if !current {
 		return nil
 	}
-	s.fresh[entry] = r.err == nil
-	if r.err == nil {
-		if err := s.refreshHints(); err != nil {
-			return err
-		}
-	}
+	state.fresh = r.err == nil
 	diagnostics := map[string][]Diagnostic{}
 	for path := range s.docs {
 		if s.entry(path) == entry {
@@ -278,37 +281,42 @@ func (s *Server) finish(r compiled) error {
 	if r.err != nil {
 		uri, d := s.diagnose(r.err, r.job.path)
 		diagnostics[uri] = append(diagnostics[uri], d)
+		return s.publish(state, diagnostics)
 	}
-	if r.err == nil {
-		for _, w := range r.unit.Warnings {
-			uri, d := s.warn(w, r.job.path)
-			diagnostics[uri] = append(diagnostics[uri], d)
-		}
+	if err := s.refreshHints(); err != nil {
+		return err
 	}
-	return s.publish(entry, diagnostics)
+	for _, w := range r.unit.Warnings {
+		uri, d := s.warn(w, r.job.path)
+		diagnostics[uri] = append(diagnostics[uri], d)
+	}
+	return s.publish(state, diagnostics)
+}
+
+func located(pos diag.Pos, document string) diag.Pos {
+	if !filepath.IsAbs(pos.File) {
+		pos.File = document
+	}
+	return pos
 }
 
 func (s *Server) warn(w lint.Warning, document string) (string, Diagnostic) {
-	file := w.Pos.File
-	if file == "" || !filepath.IsAbs(file) {
-		file = document
-	}
-	pos := diag.Pos{File: file, Line: w.Pos.Line, Col: w.Pos.Col}
-	d := Diagnostic{Severity: severityWarning, Source: "low", Message: w.Msg, Range: s.text(file).word(pos)}
-	return uriOf(file), d
+	pos := located(w.Pos, document)
+	d := Diagnostic{Severity: severityWarning, Source: "low", Message: w.Msg, Range: s.text(pos.File).word(pos)}
+	return uriOf(pos.File), d
 }
 
-func (s *Server) publish(entry string, diagnostics map[string][]Diagnostic) error {
+func (s *Server) publish(state *entryState, diagnostics map[string][]Diagnostic) error {
 	var uris []string
 	for uri := range diagnostics {
 		uris = append(uris, uri)
 	}
-	for _, uri := range s.published[entry] {
+	for _, uri := range state.published {
 		if _, ok := diagnostics[uri]; !ok {
 			diagnostics[uri] = []Diagnostic{}
 		}
 	}
-	s.published[entry] = uris
+	state.published = uris
 	for uri, list := range diagnostics {
 		params := PublishDiagnosticsParams{URI: uri, Diagnostics: list}
 		if err := s.notify("textDocument/publishDiagnostics", params); err != nil {
@@ -320,22 +328,19 @@ func (s *Server) publish(entry string, diagnostics map[string][]Diagnostic) erro
 
 func (s *Server) diagnose(err error, document string) (string, Diagnostic) {
 	d := Diagnostic{Severity: severityError, Source: "low", Message: err.Error()}
-	var located *diag.Error
-	if !errors.As(err, &located) {
+	var failure *diag.Error
+	if !errors.As(err, &failure) {
 		return uriOf(document), d
 	}
-	pos := located.Pos
-	if !filepath.IsAbs(pos.File) {
-		pos.File = document
-	}
-	d.Message = located.Msg
+	pos := located(failure.Pos, document)
+	d.Message = failure.Msg
 	d.Range = s.text(pos.File).word(pos)
 	return uriOf(pos.File), d
 }
 
 func (s *Server) query(p TextDocumentPositionParams) *query {
 	path := pathOf(p.TextDocument.URI)
-	prog := program{unit: s.units[s.entry(path)]}
+	prog := s.stateOf(path).program()
 	file := prog.fileAt(path)
 	if file == nil {
 		return nil
@@ -395,30 +400,18 @@ func (s *Server) definition(p TextDocumentPositionParams) any {
 
 func (s *Server) cursorAt(p TextDocumentPositionParams) *cursor {
 	path := pathOf(p.TextDocument.URI)
-	entry := s.entry(path)
+	state := s.stateOf(path)
 	t := s.text(path)
-	prog := program{unit: s.units[entry]}
+	prog := state.program()
 	return &cursor{
 		program:  prog,
 		file:     prog.fileAt(path),
 		text:     t,
-		compiled: s.compiledText(entry, path),
+		compiled: state.compiledText(path),
 		line:     p.Position.Line,
 		col:      t.byteCol(p.Position.Line, p.Position.Character),
 		seen:     map[string]bool{},
 	}
-}
-
-func (s *Server) compiledText(entry, path string) text {
-	docs, ok := s.compiledDocs[entry]
-	if !ok {
-		return text{}
-	}
-	src, err := docs.ReadFile(path)
-	if err != nil {
-		return text{}
-	}
-	return newText(src)
 }
 
 func (s *Server) completion(p TextDocumentPositionParams) any {
@@ -463,5 +456,5 @@ func (s *Server) symbols(path string) []DocumentSymbol {
 }
 
 func (s *Server) checked(path string) *ast.File {
-	return program{unit: s.units[s.entry(path)]}.fileAt(path)
+	return s.stateOf(path).program().fileAt(path)
 }

@@ -10,7 +10,7 @@ func (s *Server) inlayHints(p InlayHintParams) []InlayHint {
 	hints := []InlayHint{}
 	path := pathOf(p.TextDocument.URI)
 	file := s.checked(path)
-	if file == nil || !s.fresh[s.entry(path)] {
+	if file == nil || !s.stateOf(path).fresh {
 		return hints
 	}
 	x := newIndex(file, s.text(path))

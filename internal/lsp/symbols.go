@@ -114,8 +114,8 @@ func (w *symbolSearch) file(f *ast.File, t text) {
 
 func (s *Server) workspaceSymbols(p WorkspaceSymbolParams) []SymbolInformation {
 	w := &symbolSearch{query: strings.ToLower(p.Query), seen: map[Location]bool{}, found: []SymbolInformation{}}
-	for _, unit := range s.units {
-		for _, f := range (program{unit: unit}).files() {
+	for _, state := range s.entries {
+		for _, f := range state.program().files() {
 			w.file(f, s.text(f.Path))
 		}
 	}

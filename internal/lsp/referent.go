@@ -79,39 +79,12 @@ func (r importRef) hover() string          { return fmt.Sprintf("import %s", r.p
 func (r importRef) doc() string            { return "" }
 
 type typeRef struct {
-	q    *query
-	decl any
+	decl *typeDecl
 }
 
-func (r typeRef) target() (target, bool) {
-	switch d := r.decl.(type) {
-	case *ast.StructDecl:
-		return target{path: d.File.Path, pos: d.Pos, name: d.Name}, true
-	case *ast.EnumDecl:
-		return target{path: d.File.Path, pos: d.Pos, name: d.Name}, true
-	}
-	return target{}, false
-}
-
-func (r typeRef) hover() string {
-	switch d := r.decl.(type) {
-	case *ast.StructDecl:
-		return d.String()
-	case *ast.EnumDecl:
-		return d.String()
-	}
-	return ""
-}
-
-func (r typeRef) doc() string {
-	switch d := r.decl.(type) {
-	case *ast.StructDecl:
-		return d.Doc
-	case *ast.EnumDecl:
-		return d.Doc
-	}
-	return ""
-}
+func (r typeRef) target() (target, bool) { return r.decl.target(), true }
+func (r typeRef) hover() string          { return r.decl.text }
+func (r typeRef) doc() string            { return r.decl.doc }
 
 type localRef struct {
 	q     *query
@@ -257,24 +230,9 @@ func (r variantRef) hover() string {
 }
 
 func (r variantRef) doc() string {
-	enum, v := r.enumVariant()
-	if enum == nil || v == nil {
+	_, v := r.q.variantDecl(r.enum, r.name)
+	if v == nil {
 		return ""
 	}
-	if enum.Origin != nil {
-		enum = enum.Origin
-	}
-	for _, f := range r.q.files() {
-		for _, d := range f.Enums {
-			if d.Type != enum {
-				continue
-			}
-			for _, decl := range d.Variants {
-				if decl.Name == v.Name {
-					return decl.Doc
-				}
-			}
-		}
-	}
-	return ""
+	return v.Doc
 }

@@ -125,7 +125,7 @@ func (s *Server) renameError(p RenameParams) error {
 	if err := nameError(p.NewName); err != nil {
 		return err
 	}
-	if !s.fresh[s.entry(pathOf(p.TextDocument.URI))] {
+	if !s.stateOf(pathOf(p.TextDocument.URI)).fresh {
 		return errors.New("rename needs the program to compile; fix the errors or wait for the check to finish")
 	}
 	return nil
