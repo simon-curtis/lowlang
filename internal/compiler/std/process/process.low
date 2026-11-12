@@ -93,6 +93,7 @@ struct Ends {
 
 struct Collected {
     data: []u8
+    failure: io.Error?
     done: chan[bool]
 }
 
@@ -223,11 +224,10 @@ pub fn start_handle(c: Command) -> *ChildHandle ! io.Error {
     sys.close(input.child)
     sys.close(output.child)
     sys.close(errors.child)
-    let pidfd = sys.wrap(spawned.pidfd)
     let stdin = stream(sys.detach(mut input.parent))
     let stdout = stream(sys.detach(mut output.parent))
     let stderr = stream(sys.detach(mut errors.parent))
-    let handle = new(ChildHandle { pid: spawned.pid, stdin, stdout, stderr, pidfd, group: c.group, status: none })
+    let handle = new(ChildHandle { pid: spawned.pid, stdin, stdout, stderr, pidfd: spawned.pidfd, group: c.group, status: none })
     match spawned.failure {
         some(e) => {
             using failed = adopt(handle)
@@ -276,16 +276,14 @@ pub fn wait(c: Child) -> Exit ! io.Error {
 
 /// Waits for the child behind `c` to end, reaps it and returns how it ended.
 ///
-/// Parks the green thread until the process ends. The result is remembered, so later calls return it at once. When no process descriptor could be obtained for the child, the wait blocks the OS thread instead. Fails with the system error if the child cannot be reaped, and can fail with `NotConnected` when a concurrent call reaps it first.
+/// Parks the green thread until the process ends. The result is remembered, so later calls return it at once. Fails with the system error if the child cannot be reaped, and can fail with `NotConnected` when a concurrent call reaps it first.
 pub fn wait_on(c: *ChildHandle) -> Exit ! io.Error {
     match c.status {
         some(done) => return done
         none => {}
     }
     using lease = sys.enter(c.pidfd)?
-    if c.pidfd.fd >= 0 {
-        wait_readable(c.pidfd.fd)
-    }
+    wait_readable(c.pidfd.fd)
     let reaped = sys.reap(c.pidfd.fd, c.pid)?
     sys.close_on(c.pidfd)
     let status = exit_of(reaped)
@@ -295,17 +293,13 @@ pub fn wait_on(c: *ChildHandle) -> Exit ! io.Error {
 
 /// Waits for the child behind `c` to end without reaping it.
 ///
-/// Parks the green thread until the process ends. `kill_on` still signals the child's process group afterwards, and `wait_on` then reaps the child and returns at once. Returns at once when the child has been waited for. When no process descriptor could be obtained for the child, the wait blocks the OS thread instead. Fails with `NotConnected` when a concurrent `wait_on` reaps the child first.
+/// Parks the green thread until the process ends. `kill_on` still signals the child's process group afterwards, and `wait_on` then reaps the child and returns at once. Returns at once when the child has been waited for. Fails with `NotConnected` when a concurrent `wait_on` reaps the child first.
 pub fn wait_exit_on(c: *ChildHandle) ! io.Error {
     if c.status != none {
         return
     }
     using lease = sys.enter(c.pidfd)?
-    if c.pidfd.fd >= 0 {
-        wait_readable(c.pidfd.fd)
-        return
-    }
-    sys.wait_exit(c.pid)?
+    wait_readable(c.pidfd.fd)
 }
 
 /// Sends `signal` to the child owned by `c`.
@@ -327,27 +321,38 @@ pub fn kill_on(c: *ChildHandle, signal: signals.Signal) ! io.Error {
         sys.kill(-c.pid, number)?
         return
     }
-    if c.pidfd.fd >= 0 {
-        using lease = sys.enter(c.pidfd) catch {
-            _ => return
-        }
-        sys.pidfd_send_signal(c.pidfd.fd, number)?
-        return
+    using lease = sys.enter(c.pidfd) catch {
+        _ => return
     }
-    sys.kill(c.pid, number)?
+    sys.pidfd_send_signal(c.pidfd.fd, number)?
 }
 
-fn collect(s: io.Stream, into: *Collected) {
+fn drain(s: io.Stream, into: *Collected) ! io.Error {
     let buf = io.buffer(65536)
     for {
-        let n = s.read(buf) catch 0
+        let n = s.read(buf)?
         if n == 0 {
             break
         }
         io.append(mut into.data, buf[..n])
     }
+}
+
+fn collect(s: io.Stream, into: *Collected) {
+    drain(s, into) catch {
+        e => {
+            into.failure = some(e)
+        }
+    }
     s.close()
     into.done <- true
+}
+
+fn piped_stream(s: io.Stream?) -> io.Stream ! io.Error {
+    match s {
+        some(st) => st
+        none => fail Invalid
+    }
 }
 
 fn feed(s: io.Stream, data: []u8) {
@@ -364,38 +369,26 @@ fn feed(s: io.Stream, data: []u8) {
 
 /// Runs `c` to completion with all three standard streams piped, and returns its output.
 ///
-/// Overrides the `stdin`, `stdout` and `stderr` modes of `c`. Writes `input` to the child's standard input in the background and then closes it, collects standard output and standard error completely in memory, and waits for the child to end. Parks the green thread while it waits. A non-zero exit is not an error: it is reported in `Output.status`. Fails only if the child cannot be started or waited for. Errors from writing `input`, such as a child that exits without reading it, are ignored.
+/// Overrides the `stdin`, `stdout` and `stderr` modes of `c`. Writes `input` to the child's standard input in the background and then closes it, collects standard output and standard error completely in memory, and waits for the child to end. Parks the green thread while it waits. A non-zero exit is not an error: it is reported in `Output.status`. Fails if the child cannot be started or waited for, and with the error of a read of standard output or standard error that fails before the end of the output, in which case the child is killed and reaped. Errors from writing `input`, such as a child that exits without reading it, are ignored.
 pub fn run(c: Command, input: []u8) -> Output ! io.Error {
     var piped_command = c
     piped_command.stdin = Piped
     piped_command.stdout = Piped
     piped_command.stderr = Piped
     using child = start(piped_command)?
-    let out = new(Collected { data: [], done: chan[bool](1) })
-    let err = new(Collected { data: [], done: chan[bool](1) })
-    match child.handle.stdin {
-        some(s) => {
-            spawn feed(s, input)
-        }
-        none => {}
-    }
-    match child.handle.stdout {
-        some(s) => {
-            spawn collect(s, out)
-        }
-        none => {
-            out.done <- true
-        }
-    }
-    match child.handle.stderr {
-        some(s) => {
-            spawn collect(s, err)
-        }
-        none => {
-            err.done <- true
-        }
-    }
+    let stdin = piped_stream(child.handle.stdin)?
+    let stdout = piped_stream(child.handle.stdout)?
+    let stderr = piped_stream(child.handle.stderr)?
+    let out = new(Collected { data: [], failure: none, done: chan[bool](1) })
+    let err = new(Collected { data: [], failure: none, done: chan[bool](1) })
+    spawn feed(stdin, input)
+    spawn collect(stdout, out)
+    spawn collect(stderr, err)
     <-out.done
     <-err.done
+    match out.failure ?? err.failure {
+        some(e) => fail e
+        none => {}
+    }
     Output { status: wait(child)?, stdout: out.data, stderr: err.data }
 }
