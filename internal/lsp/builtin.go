@@ -2,33 +2,25 @@ package lsp
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/check"
 	"lowlang/internal/types"
 )
-
-var builtinParams = map[string][]string{
-	"print": {"value"}, "new": {"value"}, "push": {"xs", "value"}, "pop": {"xs"}, "truncate": {"xs", "n"},
-	"delete": {"map", "key"}, "bytes": {"s"}, "cstr": {"s"}, "str": {"value"}, "view": {"p", "n"},
-	"load": {"p"}, "store": {"p", "value"}, "pin": {"value"}, "unpin": {"p"}, "embed": {"path"},
-	"sqrt": {"x"}, "floor": {"x"}, "exp": {"x"}, "close": {"ch"}, "sleep": {"ms"},
-	"wait_readable": {"fd"}, "wait_writable": {"fd"},
-}
 
 func builtinSignature(call *ast.Call) string {
 	id, ok := call.Fn.(*ast.Ident)
 	if !ok || id.Local != nil || id.Func != nil || id.Variant != nil || call.TypeOf() == nil {
 		return ""
 	}
-	names, known := builtinParams[id.Name]
-	if !known && !slices.Contains(builtinTypes, id.Name) {
+	b := check.LookupBuiltin(id.Name)
+	if b == nil || (b.Kind != check.FunctionBuiltin && b.Kind != check.TypeBuiltin) {
 		return ""
 	}
 	params := make([]string, len(call.Args))
 	for i, arg := range call.Args {
-		params[i] = builtinParam(arg, names, i)
+		params[i] = builtinParam(arg, b.Params, i)
 	}
 	result := ""
 	if ret := call.TypeOf(); ret != types.Void {

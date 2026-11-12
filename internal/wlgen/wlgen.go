@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"lowlang/internal/lexer"
+	"lowlang/internal/check"
 )
 
 type Protocol struct {
@@ -44,11 +44,6 @@ type Enum struct {
 type Entry struct {
 	Name  string `xml:"name,attr"`
 	Value string `xml:"value,attr"`
-}
-
-var reserved = map[string]bool{
-	"str": true, "ptr": true, "print": true, "new": true, "null": true,
-	"none": true, "some": true, "chan": true, "close": true, "sleep": true,
 }
 
 var cTypes = map[string]string{
@@ -123,7 +118,7 @@ func (g *generator) line(format string, args ...any) {
 }
 
 func ident(name string) string {
-	if reserved[name] || lexer.IsKeyword(name) {
+	if check.Reserved(name) {
 		return fmt.Sprintf("%s_", name)
 	}
 	return name

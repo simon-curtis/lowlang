@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/check"
 	"lowlang/internal/types"
 )
 
@@ -225,15 +226,10 @@ func (c *cursor) methods(t *types.Type) {
 			c.add(l.Name, completionMethod, l.Type.String())
 		}
 	}
-	switch t.Kind {
-	case types.SliceKind:
-		c.add("push", completionMethod, "builtin")
-		c.add("pop", completionMethod, "builtin")
-		c.add("truncate", completionMethod, "builtin")
-	case types.MapKind:
-		c.add("delete", completionMethod, "builtin")
-	case types.ChanKind:
-		c.add("close", completionMethod, "builtin")
+	for _, b := range check.Builtins() {
+		if b.Kind == check.FunctionBuiltin && b.Receives(t.Kind) {
+			c.add(b.Name, completionMethod, "builtin")
+		}
 	}
 }
 

@@ -53,7 +53,6 @@ func (c *Checker) vectorUnary(e *ast.Unary, t *types.Type) {
 }
 
 func (c *Checker) vectorCast(e *ast.Call, to *types.Type) {
-	c.single(e, to.Name)
 	from := c.plain(e.Args[0], nil)
 	if !isVector(from) || from.Bits != to.Bits {
 		c.fail(e.Args[0].Position(), "cannot convert %s to %s; vector casts keep the width", from, to)
@@ -80,19 +79,8 @@ func (c *Checker) vectorResult(e *ast.Call, want *types.Type) *types.Type {
 	return want
 }
 
-func (c *Checker) vectorIntrinsic(e *ast.Call, name string, want *types.Type) bool {
-	arity := map[string]int{
-		"__vload": 2, "__vstore": 3, "__vsplat": 1, "__vmask": 1, "__vshuffle": 2,
-		"__vselect": 3, "__vmin": 2, "__vmax": 2, "__vlane": 2, "__vwith": 3,
-	}
-	n, ok := arity[name]
-	if !ok {
-		return false
-	}
-	if len(e.Args) != n {
-		c.fail(e.Pos, "%s takes %d arguments, found %d", name, n, len(e.Args))
-	}
-	e.Builtin = name
+func (c *Checker) vectorIntrinsic(e *ast.Call, want *types.Type) {
+	name := e.Builtin
 	switch name {
 	case "__vload":
 		c.vectorSource(e.Args[0])
@@ -147,7 +135,6 @@ func (c *Checker) vectorIntrinsic(e *ast.Call, name string, want *types.Type) bo
 		c.plain(e.Args[2], lane)
 		e.Type = t
 	}
-	return true
 }
 
 func (c *Checker) vectorAssign(s *ast.Assign, t *types.Type) {

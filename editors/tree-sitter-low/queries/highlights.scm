@@ -25,10 +25,10 @@
   (#match? @constructor "^[A-Z]"))
 
 ((type_identifier) @type
-  (#not-match? @type "^(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|str|ptr|chan|void)$"))
+  (#not-match? @type "^(i64|i32|u64|u32|u16|u8|f64|f32|bool|str|ptr|chan|u8x16|u8x32|u16x8|u16x16|i32x4|i32x8|u32x4|u32x8|i64x2|i64x4|u64x2|u64x4|f32x4|f32x8|f64x2|f64x4)$"))
 
 ((type_identifier) @type.builtin
-  (#match? @type.builtin "^(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|str|ptr|chan|void)$"))
+  (#match? @type.builtin "^(i64|i32|u64|u32|u16|u8|f64|f32|bool|str|ptr|chan|u8x16|u8x32|u16x8|u16x16|i32x4|i32x8|u32x4|u32x8|i64x2|i64x4|u64x2|u64x4|f32x4|f32x8|f64x2|f64x4)$"))
 
 (field_identifier) @property
 
@@ -41,11 +41,11 @@
 (call_expression
   function: (identifier) @function.call
   (#match? @function.call "^[a-z_]")
-  (#not-any-of? @function.call "print" "new" "push" "pop" "truncate" "delete" "bytes" "cstr" "str" "view" "load" "store" "pin" "unpin" "embed" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
+  (#not-any-of? @function.call "print" "new" "push" "pop" "truncate" "delete" "bytes" "cstr" "view" "load" "store" "pin" "unpin" "embed" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
 
 (call_expression
   function: (identifier) @function.builtin
-  (#any-of? @function.builtin "print" "new" "push" "pop" "truncate" "delete" "bytes" "cstr" "str" "view" "load" "store" "pin" "unpin" "embed" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
+  (#any-of? @function.builtin "print" "new" "push" "pop" "truncate" "delete" "bytes" "cstr" "view" "load" "store" "pin" "unpin" "embed" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
 
 (call_expression
   function: (field_expression

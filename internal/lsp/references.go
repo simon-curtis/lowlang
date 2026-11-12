@@ -8,6 +8,7 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
+	"lowlang/internal/lexer"
 )
 
 type side int
@@ -118,7 +119,7 @@ func (s *Server) renameError(p RenameParams) error {
 	switch {
 	case !identifier.MatchString(p.NewName):
 		return fmt.Errorf("%q is not a valid name", p.NewName)
-	case keyword(p.NewName):
+	case lexer.IsKeyword(p.NewName):
 		return fmt.Errorf("%q is a keyword", p.NewName)
 	case strings.HasPrefix(p.NewName, "__"):
 		return fmt.Errorf("names starting with __ are reserved")

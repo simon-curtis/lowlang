@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"lowlang/internal/lexer"
+	"lowlang/internal/check"
 )
 
 type Selection struct {
@@ -44,11 +44,6 @@ var baseTypes = map[string]string{
 }
 
 var baseSizes = map[string]int{"u32": 4, "i32": 4, "i64": 8, "u16": 2, "u8": 1, "f32": 4, "f64": 8, "ptr": 8}
-
-var reserved = map[string]bool{
-	"str": true, "ptr": true, "print": true, "new": true, "null": true,
-	"none": true, "some": true, "chan": true, "close": true, "sleep": true,
-}
 
 type value struct {
 	name  string
@@ -120,7 +115,7 @@ func (g *generator) line(format string, args ...any) {
 }
 
 func ident(name string) string {
-	if reserved[name] || lexer.IsKeyword(name) {
+	if check.Reserved(name) {
 		return fmt.Sprintf("%s_", name)
 	}
 	return name

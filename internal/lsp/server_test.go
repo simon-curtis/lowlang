@@ -354,7 +354,7 @@ func TestHoverOnBuiltins(t *testing.T) {
 	}{
 		{f.at(t, "print(ages.len)", 0), "fn print(value: i64)"},
 		{f.at(t, `print("{k}={v}")`, 0), "fn print(value: str)"},
-		{f.at(t, `delete(mut shared, "alan")`, 0), "fn delete(mut map: [str: i64], key: str)"},
+		{f.at(t, `delete(mut shared, "alan")`, 0), "fn delete(mut m: [str: i64], key: str)"},
 	}
 	for _, tc := range cases {
 		if got := c.hover(f, tc.at); !strings.Contains(got, tc.want) {

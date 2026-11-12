@@ -192,7 +192,7 @@ func (l *Lexer) ident(start Pos) error {
 	if strings.HasPrefix(text, "__") && !l.prelude {
 		return &Error{Pos: start, Msg: "names starting with __ are reserved"}
 	}
-	kind, ok := keywords[text]
+	kind, ok := keywordKinds[text]
 	if !ok {
 		kind = Ident
 	}
@@ -426,22 +426,9 @@ func (l *Lexer) char(start Pos) error {
 	return nil
 }
 
-var operators = []struct {
-	text string
-	kind Kind
-}{
-	{"...", Ellipsis}, {"<<=", ShlAssign}, {">>=", ShrAssign},
-	{"??", Coalesce}, {"<-", LArrow}, {"|>", PipeArrow}, {"->", Arrow}, {"=>", FatArrow}, {"%=", PercentAssign}, {"&=", AmpAssign}, {"|=", PipeAssign}, {"^=", CaretAssign},
-	{"<<", Shl}, {">>", Shr}, {"+=", PlusAssign}, {"-=", MinusAssign}, {"*=", StarAssign}, {"/=", SlashAssign},
-	{"&&", AndAnd}, {"||", OrOr}, {"==", Eq}, {"!=", NotEq}, {"<=", LtEq}, {">=", GtEq},
-	{"..", DotDot}, {"(", LParen}, {")", RParen}, {"[", LBracket}, {"]", RBracket}, {"{", LBrace}, {"}", RBrace}, {",", Comma}, {":", Colon}, {".", Dot}, {"?", Question},
-	{"=", Assign}, {"+", Plus}, {"-", Minus}, {"*", Star}, {"/", Slash}, {"%", Percent},
-	{"!", Not}, {"<", Lt}, {">", Gt}, {"&", Amp}, {"|", Pipe}, {"^", Caret}, {"~", Tilde},
-}
-
 func (l *Lexer) operator(start Pos) error {
 	rest := l.src[l.off:]
-	for _, op := range operators {
+	for _, op := range operatorSpellings {
 		if !strings.HasPrefix(string(rest[:min(len(rest), len(op.text))]), op.text) {
 			continue
 		}

@@ -6,6 +6,7 @@ import (
 	"regexp"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/check"
 	"lowlang/internal/compiler"
 	"lowlang/internal/lexer"
 	"lowlang/internal/regex"
@@ -26,15 +27,6 @@ const (
 	completionStruct     = 22
 	completionType       = 25
 )
-
-var builtinFuncs = []string{
-	"print", "new", "push", "pop", "truncate", "delete", "bytes", "cstr", "str", "view", "load", "store", "pin", "unpin",
-	"embed", "sqrt", "floor", "exp", "close", "sleep", "wait_readable", "wait_writable",
-}
-
-var builtinTypes = []string{"i64", "i32", "u64", "u32", "u16", "u8", "f64", "f32", "bool", "str", "ptr", "chan"}
-
-var builtinConstants = []string{"true", "false", "none", "null"}
 
 var funcHeader = regexp.MustCompile(`^(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
 
@@ -210,9 +202,10 @@ func (c *cursor) fields(t *types.Type, path []string) {
 		}
 		c.add(f.Name, completionField, f.Type.String())
 	}
-	switch t.Kind {
-	case types.SliceKind, types.MapKind, types.StrKind:
-		c.add("len", completionProperty, "i64")
+	for _, b := range check.Builtins() {
+		if b.Kind == check.PropertyBuiltin && b.Receives(t.Kind) {
+			c.add(b.Name, completionProperty, b.Type.String())
+		}
 	}
 	c.methods(t)
 }
@@ -354,17 +347,24 @@ func (c *cursor) imports() {
 	}
 }
 
+func (c *cursor) addBuiltin(b *check.Builtin) {
+	switch b.Kind {
+	case check.FunctionBuiltin:
+		if b.Public() {
+			c.add(b.Name, completionFunction, "builtin")
+		}
+	case check.TypeBuiltin:
+		c.add(b.Name, completionType, "type")
+	case check.ConstantBuiltin:
+		c.add(b.Name, completionConstant, "")
+	}
+}
+
 func (c *cursor) builtins() {
-	for _, name := range builtinFuncs {
-		c.add(name, completionFunction, "builtin")
+	for _, b := range check.Builtins() {
+		c.addBuiltin(b)
 	}
-	for _, name := range builtinTypes {
-		c.add(name, completionType, "type")
-	}
-	for _, name := range builtinConstants {
-		c.add(name, completionConstant, "")
-	}
-	for _, word := range keywords() {
+	for _, word := range lexer.Keywords() {
 		c.add(word, completionKeyword, "")
 	}
 }

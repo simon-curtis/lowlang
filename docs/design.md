@@ -1036,6 +1036,22 @@ Calling a numeric type converts a number to it, as in `u8(x)`, `f64(n)` and `i64
 | `str` | An immutable pointer and length over UTF-8 bytes. `str(b)` copies a `[]u8` into a string, and `str(p)` copies a NUL-terminated `ptr[u8]`. |
 | `ptr` | `ptr[T]` is a nullable pointer to C memory. `ptr` alone is `void*` and converts to and from any `ptr[T]`. |
 | `chan` | `chan[T]` is a channel of `T` values. `chan[T](n)` makes one holding up to `n` values, and `chan[T]()` an unbuffered one. |
+| `u8x16` | 16 lanes of `u8`, 128 bits. |
+| `u8x32` | 32 lanes of `u8`, 256 bits. |
+| `u16x8` | 8 lanes of `u16`, 128 bits. |
+| `u16x16` | 16 lanes of `u16`, 256 bits. |
+| `i32x4` | 4 lanes of `i32`, 128 bits. |
+| `i32x8` | 8 lanes of `i32`, 256 bits. |
+| `u32x4` | 4 lanes of `u32`, 128 bits. |
+| `u32x8` | 8 lanes of `u32`, 256 bits. |
+| `i64x2` | 2 lanes of `i64`, 128 bits. |
+| `i64x4` | 4 lanes of `i64`, 256 bits. |
+| `u64x2` | 2 lanes of `u64`, 128 bits. |
+| `u64x4` | 4 lanes of `u64`, 256 bits. |
+| `f32x4` | 4 lanes of `f32`, 128 bits. |
+| `f32x8` | 8 lanes of `f32`, 256 bits. |
+| `f64x2` | 2 lanes of `f64`, 128 bits. |
+| `f64x4` | 4 lanes of `f64`, 256 bits. |
 
 ### Constants
 

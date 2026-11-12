@@ -46,21 +46,15 @@ func (c *Checker) serdeType(name string, pos lexer.Pos) *types.Type {
 }
 
 func (c *Checker) serializeCall(e *ast.Call) {
-	if len(e.Args) != 2 {
-		c.fail(e.Pos, "__serialize takes 2 arguments, found %d", len(e.Args))
-	}
 	t := c.plain(e.Args[0], nil)
 	c.expectType(e.Args[1], c.serdeType("Writer", e.Pos))
-	e.Builtin, e.Type = "__serialize", types.Void
+	e.Type = types.Void
 	if !t.Abstract() {
 		e.Target = c.derive(serialize, t, e.Pos)
 	}
 }
 
 func (c *Checker) serializeIntoCall(e *ast.Call) {
-	if len(e.Args) != 3 {
-		c.fail(e.Pos, "__serialize_into takes 3 arguments, found %d", len(e.Args))
-	}
 	c.expectType(e.Args[0], c.serdeType("Writer", e.Pos))
 	path, ok := e.Args[1].(*ast.Ref)
 	if !ok {
@@ -69,7 +63,7 @@ func (c *Checker) serializeIntoCall(e *ast.Call) {
 	c.ref(path, c.slice(types.I64))
 	t := c.plain(e.Args[2], nil)
 	c.exclusive(e.Args)
-	e.Type = types.Void
+	e.Builtin, e.Type = "", types.Void
 	if !t.Abstract() {
 		e.Target = c.derive(serialize, t, e.Pos)
 	}

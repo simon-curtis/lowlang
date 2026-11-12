@@ -9,8 +9,10 @@ import (
 	"testing"
 
 	"lowlang/internal/amd64"
+	"lowlang/internal/check"
 	"lowlang/internal/compiler"
 	"lowlang/internal/fixture/fixturetest"
+	"lowlang/internal/lexer"
 	"lowlang/internal/target"
 )
 
@@ -64,8 +66,17 @@ func TestRejectsDuplicates(t *testing.T) {
 }
 
 func TestReservedNames(t *testing.T) {
-	if ident("interface") != "interface" || ident("fn") != "fn_" || ident("str") != "str_" {
-		t.Fatal("reserved names are not escaped")
+	reserved := lexer.Keywords()
+	for _, b := range check.Builtins() {
+		reserved = append(reserved, b.Name)
+	}
+	for _, name := range reserved {
+		if want := name + "_"; ident(name) != want {
+			t.Errorf("ident(%q) = %q, want %q", name, ident(name), want)
+		}
+	}
+	if ident("interface") != "interface" {
+		t.Error("interface is not reserved")
 	}
 }
 

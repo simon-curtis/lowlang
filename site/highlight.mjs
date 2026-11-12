@@ -2,7 +2,10 @@ const keywords = new Set([
     "fn", "let", "var", "if", "else", "for", "break", "continue", "return", "enum", "match", "fail", "catch",
     "struct", "mut", "in", "import", "pub", "extern", "defer", "spawn", "select", "using", "drop",
 ]);
-const types = new Set(["void", "never", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "bool", "str", "ptr", "cstr", "chan"]);
+const types = new Set([
+    "i64", "i32", "u64", "u32", "u16", "u8", "f64", "f32", "bool", "str", "ptr", "chan",
+    "u8x16", "u8x32", "u16x8", "u16x16", "i32x4", "i32x8", "u32x4", "u32x8", "i64x2", "i64x4", "u64x2", "u64x4", "f32x4", "f32x8", "f64x2", "f64x4",
+]);
 const constants = new Set(["true", "false", "none", "null"]);
 const pattern = /([\u0001\u0002])|(\/\/[^\n]*)|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)')|(\d[\w.]*)|([A-Za-z_]\w*)|(\s+)|(->|=>|::|\.\.|[-+*\/%=<>!&|^?:]+)|([\s\S])/g;
 

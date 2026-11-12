@@ -30,17 +30,13 @@ func (c *Checker) requireValue(pos lexer.Pos, what string, t *types.Type) {
 }
 
 func (c *Checker) renderCall(e *ast.Call) {
-	c.single(e, "__render")
 	t := c.plain(e.Args[0], nil)
 	c.requireValue(e.Args[0].Position(), "__render", t)
-	e.Builtin, e.Type = "__render", types.Str
+	e.Type = types.Str
 	e.Render = c.renderer(t, e.Pos)
 }
 
 func (c *Checker) renderIntoCall(e *ast.Call) {
-	if len(e.Args) != 3 {
-		c.fail(e.Pos, "__render_into takes 3 arguments, found %d", len(e.Args))
-	}
 	buffer, bufferOK := e.Args[0].(*ast.Ref)
 	path, pathOK := e.Args[1].(*ast.Ref)
 	if !bufferOK || !pathOK {
@@ -50,17 +46,16 @@ func (c *Checker) renderIntoCall(e *ast.Call) {
 	c.ref(path, c.slice(types.I64))
 	t := c.plain(e.Args[2], nil)
 	c.exclusive(e.Args)
-	e.Type = types.Void
+	e.Builtin, e.Type = "", types.Void
 	e.Target = c.renderer(t, e.Pos)
 }
 
 func (c *Checker) addressCall(e *ast.Call) {
-	c.single(e, "__address")
 	t := c.plain(e.Args[0], nil)
 	if t.Kind != types.PointerKind && t.Kind != types.RawKind {
 		c.fail(e.Args[0].Position(), "__address needs a pointer, found %s", t)
 	}
-	e.Builtin, e.Type = "__address", types.I64
+	e.Type = types.I64
 }
 
 func (s *synth) put(text string) {

@@ -13,8 +13,6 @@ var chanFuncs = []string{
 	"__sel_recv", "__sel_send", "__sel_wait_recv", "__sel_wait_send", "__sel_value",
 }
 
-var softBuiltins = map[string]bool{"close": true, "sleep": true, "wait_readable": true, "wait_writable": true}
-
 func (c *Checker) chanOf(elem *types.Type) *types.Type {
 	if t, ok := c.chans[elem]; ok {
 		return t
@@ -129,65 +127,6 @@ func (c *Checker) selectExpr(e *ast.Select, want *types.Type) {
 		c.popScope()
 	}
 	e.Type = result
-}
-
-func (c *Checker) concurrencyBuiltin(e *ast.Call, name string) bool {
-	if softBuiltins[name] && c.local().funcs[name] != nil {
-		return false
-	}
-	switch name {
-	case "close":
-		c.single(e, name)
-		c.channel(e.Args[0])
-		e.Type = types.Void
-	case "sleep":
-		c.single(e, name)
-		c.integer(e.Args[0])
-		e.Type = types.Void
-	case "wait_readable", "wait_writable":
-		c.single(e, name)
-		c.integer(e.Args[0])
-		e.Type = types.Void
-	case "__spawn":
-		c.single(e, name)
-		t := c.plain(e.Args[0], nil)
-		if t.Kind != types.FuncKind || t.C || len(t.Params) > 0 {
-			c.fail(e.Pos, "__spawn takes a function value with no parameters")
-		}
-		e.Type = types.Void
-	case "__current", "__park":
-		if len(e.Args) != 0 {
-			c.fail(e.Pos, "%s takes no arguments", name)
-		}
-		e.Type = types.Void
-		if name == "__current" {
-			e.Type = c.raw(nil)
-		}
-	case "__ready":
-		c.single(e, name)
-		c.expectType(e.Args[0], c.raw(nil))
-		e.Type = types.Void
-	case "__lock", "__unlock":
-		c.single(e, name)
-		c.lockWord(e.Args[0], name)
-		e.Type = types.Void
-	case "__cas":
-		if len(e.Args) != 3 {
-			c.fail(e.Pos, "__cas takes 3 arguments")
-		}
-		c.lockWord(e.Args[0], name)
-		c.expectType(e.Args[1], types.I64)
-		c.expectType(e.Args[2], types.I64)
-		e.Type = types.Bool
-	case "__panic":
-		c.single(e, name)
-		c.expectType(e.Args[0], types.Str)
-		e.Type = types.Never
-	default:
-		return false
-	}
-	e.Builtin = name
-	return true
 }
 
 func (c *Checker) lockWord(arg ast.Expr, name string) {

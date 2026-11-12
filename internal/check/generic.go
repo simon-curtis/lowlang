@@ -104,9 +104,8 @@ func (c *Checker) satisfy(args []*types.Type, decls []*ast.TypeParam, params []*
 }
 
 func (c *Checker) declareGeneric(name string, decls []*ast.TypeParam, pub bool, pos lexer.Pos) *generic {
-	_, builtin := c.builtin[name]
 	_, dupType := c.local().types[name]
-	if _, dup := c.local().generics[name]; dup || dupType || builtin {
+	if _, dup := c.local().generics[name]; dup || dupType || isTypeName(name) {
 		c.fail(pos, "type %s already declared", name)
 	}
 	g := &generic{name: name, decls: decls, params: c.typeParams(decls), pub: pub, pos: pos, file: c.file, instances: map[string]*types.Type{}}
@@ -436,9 +435,11 @@ func (c *Checker) instanceCall(e *ast.Call, inst *ast.Instance, want *types.Type
 	if c.derivedCall(e, inst) {
 		return
 	}
-	if id, ok := inst.X.(*ast.Ident); ok && id.Name == "chan" && c.find("chan") == nil && c.local().funcs["chan"] == nil {
-		c.makeChan(e, inst)
-		return
+	if id, ok := inst.X.(*ast.Ident); ok {
+		if b := c.builtinNamed(id.Name); b != nil && b.construct != nil {
+			b.construct(c, e, inst)
+			return
+		}
 	}
 	if fn := c.genericTarget(inst.X); fn != nil {
 		c.genericCall(e, fn, inst.Types, want)

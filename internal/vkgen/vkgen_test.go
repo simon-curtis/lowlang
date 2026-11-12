@@ -13,8 +13,10 @@ import (
 	"testing"
 
 	"lowlang/internal/amd64"
+	"lowlang/internal/check"
 	"lowlang/internal/compiler"
 	"lowlang/internal/fixture/fixturetest"
+	"lowlang/internal/lexer"
 	"lowlang/internal/shaders"
 	"lowlang/internal/target"
 )
@@ -189,5 +191,20 @@ func TestOffscreenRender(t *testing.T) {
 	want := "0 0 0 255\n255 0 0 255\n0 0 255 255\n0 0 0 255\n"
 	if string(out) != want {
 		t.Fatalf("pixels:\n%s\nwant:\n%s", out, want)
+	}
+}
+
+func TestReservedNames(t *testing.T) {
+	reserved := lexer.Keywords()
+	for _, b := range check.Builtins() {
+		reserved = append(reserved, b.Name)
+	}
+	for _, name := range reserved {
+		if want := name + "_"; ident(name) != want {
+			t.Errorf("ident(%q) = %q, want %q", name, ident(name), want)
+		}
+	}
+	if ident("image") != "image" {
+		t.Error("image is reserved")
 	}
 }

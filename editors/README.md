@@ -2,7 +2,7 @@
 
 - Zed and Neovim highlight with the `tree-sitter-low` grammar; VS Code uses the TextMate grammar in `vscode/syntaxes`.
 - All three start `low lsp`: diagnostics, hover, go-to-definition, references, rename, document and workspace symbols, completion, signature help, and inlay hints for inferred types. Rename and inlay hints answer only when the program compiles.
-- `go test ./editors/` fails when the lexer has a keyword that a grammar or highlight query does not cover.
+- `go test ./editors/` fails when a grammar, highlight query or `site/highlight.mjs` lacks or adds a keyword, builtin function, type, constant or constraint compared with the lexer and the checker.
 
 `low` must be on `PATH`:
 

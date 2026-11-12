@@ -44,7 +44,6 @@ type scope struct {
 type Checker struct {
 	modules         map[string]*scope
 	embeds          []string
-	builtin         map[string]*types.Type
 	file            *ast.File
 	results         map[[2]*types.Type]*types.Type
 	ptrs            map[*types.Type]*types.Type
@@ -92,7 +91,6 @@ func Check(files []*ast.File, std fs.FS) (embeds []string, err error) {
 	c := &Checker{
 		std:             std,
 		modules:         map[string]*scope{},
-		builtin:         map[string]*types.Type{"bool": types.Bool, "str": types.Str},
 		results:         map[[2]*types.Type]*types.Type{},
 		ptrs:            map[*types.Type]*types.Type{},
 		opts:            map[*types.Type]*types.Type{},
@@ -126,12 +124,6 @@ func Check(files []*ast.File, std fs.FS) (embeds []string, err error) {
 		}
 		err = b.err
 	}()
-	for _, t := range types.Numeric {
-		c.builtin[t.Name] = t
-	}
-	for _, t := range types.Vectors {
-		c.builtin[t.Name] = t
-	}
 	c.check(files)
 	return c.embeds, nil
 }
@@ -223,11 +215,8 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 		}
 		return bound
 	}
-	if t.Name == "chan" && t.Module == "" {
-		if len(t.Args) != 1 {
-			c.fail(t.Pos, "chan takes 1 type argument")
-		}
-		return c.chanOf(c.contained(t.Args[0], "a channel"))
+	if b := LookupBuiltin(t.Name); b != nil && b.Kind == TypeBuiltin && t.Module == "" {
+		return c.builtinType(b, t)
 	}
 	if g := c.lookupGeneric(t.Module, t.Name, t.Pos); g != nil {
 		if t.Args == nil {
@@ -244,9 +233,6 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 	}
 	if t.Module != "" {
 		return c.importedType(t.Module, t.Name, t.Pos)
-	}
-	if typ, ok := c.builtin[t.Name]; ok {
-		return typ
 	}
 	typ, ok := c.local().types[t.Name]
 	if !ok {
@@ -394,9 +380,8 @@ func (c *Checker) check(files []*ast.File) {
 }
 
 func (c *Checker) declareType(name string, pos lexer.Pos, t *types.Type, pub bool) {
-	_, builtin := c.builtin[name]
 	_, generic := c.local().generics[name]
-	if _, dup := c.local().types[name]; dup || builtin || generic || name == "chan" {
+	if _, dup := c.local().types[name]; dup || isTypeName(name) || generic {
 		c.fail(pos, "type %s already declared", name)
 	}
 	t.Module = c.file.Module
@@ -541,12 +526,11 @@ func (c *Checker) declareFunc(fn *ast.Func) {
 	if _, dup := c.local().funcs[fn.Name]; dup {
 		c.fail(fn.Pos, "function %s already declared", fn.Name)
 	}
-	if builtins[fn.Name] {
+	if b := LookupBuiltin(fn.Name); b != nil && !b.Shadowable && b.Kind != TypeBuiltin {
 		c.fail(fn.Pos, "%s is a builtin", fn.Name)
 	}
-	_, builtin := c.builtin[fn.Name]
 	_, generic := c.local().generics[fn.Name]
-	if _, clash := c.local().types[fn.Name]; clash || builtin || generic {
+	if _, clash := c.local().types[fn.Name]; clash || isTypeName(fn.Name) || generic {
 		c.fail(fn.Pos, "function %s has the name of a type", fn.Name)
 	}
 	if fn.TypeParams != nil {
@@ -1242,15 +1226,8 @@ func (c *Checker) ident(e *ast.Ident, want *types.Type) {
 		e.Type = enum
 		return
 	}
-	if e.Name == "none" && c.find(e.Name) == nil {
-		c.fail(e.Pos, "cannot infer the type of none; annotate the binding")
-	}
-	if e.Name == "null" && c.find(e.Name) == nil {
-		e.Null = true
-		e.Type = c.raw(nil)
-		if w := unwrap(want); w != nil && w.Kind == types.RawKind {
-			e.Type = w
-		}
+	if b := c.builtinNamed(e.Name); b != nil && b.constant != nil {
+		b.constant(c, e, want)
 		return
 	}
 	if fn, ok := c.local().funcs[e.Name]; ok && c.find(e.Name) == nil {
@@ -1333,7 +1310,7 @@ func (c *Checker) selector(e *ast.Selector, want *types.Type) {
 		return
 	}
 	t := c.plain(e.X, nil)
-	if e.Name == "len" && (t.Kind == types.SliceKind || t.Kind == types.MapKind || t == types.Str) {
+	if b := LookupBuiltin(e.Name); b != nil && b.Kind == PropertyBuiltin && b.Receives(t.Kind) {
 		e.Length = true
 		e.Type = types.I64
 		return
@@ -1693,35 +1670,14 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 	}
 }
 
-var builtins = map[string]bool{
-	"print": true, "new": true, "sqrt": true, "floor": true, "exp": true, "push": true, "bytes": true,
-	"delete": true, "embed": true, "__str_raw": true,
-	"__slice_ptr": true, "cstr": true, "view": true, "load": true, "store": true, "pin": true, "unpin": true,
-	"__bits": true, "__str_view": true, "__extend": true, "__extend_by": true, "__hash": true, "__zero": true, "__syscall": true, "__mulhi": true, "__make": true, "__memmove": true, "__ctz": true, "__clock_nanos": true, "__hash_seed": true, "__argc": true, "__argv": true, "__envv": true,
-	"__render": true, "__render_into": true, "__address": true,
-	"__spawn": true, "__current": true, "__park": true, "__ready": true, "__lock": true, "__unlock": true, "__cas": true, "__panic": true,
-	"__context": true, "__set_context": true, "__has_context": true,
-}
-
 func (c *Checker) call(e *ast.Call, want *types.Type) {
 	if e.Prepended && c.firstMut(e.Fn) {
 		prependMut(e)
 	}
 	switch fn := e.Fn.(type) {
 	case *ast.Ident:
-		if fn.Name == "print" {
-			c.print(e)
-			return
-		}
-		if fn.Name == "new" {
-			c.allocate(e, want)
-			return
-		}
-		if c.special(e, fn.Name, want) {
-			return
-		}
-		if builtins[fn.Name] {
-			c.math(e, fn.Name, want)
+		if b := c.builtinNamed(fn.Name); b != nil && b.handler != nil {
+			c.callBuiltin(b, e, want)
 			return
 		}
 		if c.find(fn.Name) != nil {
@@ -1730,14 +1686,6 @@ func (c *Checker) call(e *ast.Call, want *types.Type) {
 		}
 		if t, ok := c.bound[fn.Name]; ok && t.Number() {
 			c.convert(e, t)
-			return
-		}
-		if t, ok := c.builtin[fn.Name]; ok && t.Number() {
-			c.convert(e, t)
-			return
-		}
-		if t, ok := c.builtin[fn.Name]; ok && isVector(t) {
-			c.vectorCast(e, t)
 			return
 		}
 		if enum, v := c.inferVariant(want, fn.Name); v != nil {
@@ -1830,39 +1778,10 @@ func (c *Checker) receiverFunc(t *types.Type, name string) *ast.Func {
 	return fn
 }
 
-func (c *Checker) callable(name string) bool {
-	_, local := c.local().funcs[name]
-	_, bound := c.bound[name]
-	_, builtin := c.builtin[name]
-	return local || bound || builtin || builtins[name] || c.find(name) != nil
-}
-
 func prependMut(e *ast.Call) {
 	if _, isRef := e.Args[0].(*ast.Ref); !isRef {
 		e.Args[0] = &ast.Ref{X: e.Args[0], Pos: e.Args[0].Position()}
 	}
-}
-
-func (c *Checker) firstMut(fn ast.Expr) bool {
-	switch fn := fn.(type) {
-	case *ast.Ident:
-		if c.find(fn.Name) != nil {
-			return false
-		}
-		if fn.Name == "push" || fn.Name == "delete" || c.sliceShrink(fn.Name) {
-			return true
-		}
-		target, ok := c.local().funcs[fn.Name]
-		return ok && len(target.Params) > 0 && target.Params[0].Mut
-	case *ast.Selector:
-		id, isIdent := fn.X.(*ast.Ident)
-		if !isIdent || !c.isModule(id.Name) {
-			return false
-		}
-		target := c.importedFunc(id.Name, fn.Name, fn.Pos)
-		return len(target.Params) > 0 && target.Params[0].Mut
-	}
-	return false
 }
 
 func (c *Checker) indirect(e *ast.Call) {
@@ -1892,9 +1811,6 @@ func (c *Checker) indirect(e *ast.Call) {
 }
 
 func (c *Checker) print(e *ast.Call) {
-	if len(e.Args) != 1 {
-		c.fail(e.Pos, "print takes 1 argument, found %d", len(e.Args))
-	}
 	t := c.plain(e.Args[0], nil)
 	e.Render = nil
 	switch {
@@ -1916,219 +1832,7 @@ func (c *Checker) print(e *ast.Call) {
 	e.Type = types.Void
 }
 
-func (c *Checker) special(e *ast.Call, name string, want *types.Type) bool {
-	if c.concurrencyBuiltin(e, name) {
-		return true
-	}
-	if c.sliceShrink(name) {
-		c.shrink(e, name)
-		return true
-	}
-	switch name {
-	case "push":
-		c.push(e)
-	case "bytes":
-		c.single(e, name)
-		c.expectType(e.Args[0], types.Str)
-		e.Builtin, e.Type = name, c.slice(types.U8)
-	case "str":
-		c.single(e, name)
-		e.Builtin, e.Type = "from_bytes", types.Str
-		if t := c.plain(e.Args[0], nil); t.Kind == types.RawKind {
-			c.cString(e.Args[0], t)
-			e.Builtin = "from_cstr"
-		} else if t != c.slice(types.U8) {
-			c.fail(e.Args[0].Position(), "str takes []u8 or ptr[u8], found %s", t)
-		}
-	case "cstr":
-		c.single(e, name)
-		c.expectType(e.Args[0], types.Str)
-		e.Builtin, e.Type = name, c.raw(types.U8)
-	case "view":
-		if len(e.Args) != 2 {
-			c.fail(e.Pos, "view takes 2 arguments, found %d", len(e.Args))
-		}
-		elem := c.typedRaw(e.Args[0], name)
-		c.integer(e.Args[1])
-		e.Builtin, e.Type = name, c.slice(elem)
-	case "load":
-		c.single(e, name)
-		e.Builtin, e.Type = name, c.typedRaw(e.Args[0], name)
-	case "store":
-		if len(e.Args) != 2 {
-			c.fail(e.Pos, "store takes 2 arguments, found %d", len(e.Args))
-		}
-		c.expectType(e.Args[1], c.typedRaw(e.Args[0], name))
-		e.Builtin, e.Type = name, types.Void
-	case "pin":
-		c.single(e, name)
-		t := c.plain(e.Args[0], nil)
-		if t.Kind != types.PointerKind && t.Kind != types.SliceKind && t.Kind != types.MapKind && t != types.Str {
-			c.fail(e.Args[0].Position(), "pin takes a pointer, slice, map or str, found %s", t)
-		}
-		e.Builtin, e.Type = name, c.raw(nil)
-	case "unpin":
-		c.single(e, name)
-		if t := c.plain(e.Args[0], nil); t.Kind != types.RawKind {
-			c.fail(e.Args[0].Position(), "unpin takes the ptr returned by pin, found %s", t)
-		}
-		e.Builtin, e.Type = name, types.Void
-	case "__bits":
-		c.single(e, name)
-		t := c.plain(e.Args[0], nil)
-		e.Builtin, e.Type = name, types.I64
-		if t == types.F32 {
-			e.Type = types.U32
-		} else if t != types.F64 {
-			c.fail(e.Pos, "__bits requires a float")
-		}
-	case "delete":
-		c.deleteEntry(e)
-	case "embed":
-		c.embed(e)
-	case "__str_raw":
-		if len(e.Args) != 2 {
-			c.fail(e.Pos, "__str_raw takes 2 arguments")
-		}
-		c.integer(e.Args[0])
-		c.integer(e.Args[1])
-		e.Builtin, e.Type = name, types.Str
-	case "__slice_ptr":
-		c.single(e, name)
-		t := c.plain(e.Args[0], nil)
-		switch {
-		case t == types.Str:
-			e.Builtin, e.Type = name, c.raw(types.U8)
-		case t.Kind == types.SliceKind:
-			e.Builtin, e.Type = name, c.raw(t.Elem)
-		default:
-			c.fail(e.Pos, "__slice_ptr requires a slice or str")
-		}
-	case "__syscall":
-		c.syscall(e)
-	case "__serialize":
-		c.serializeCall(e)
-	case "__serialize_into":
-		c.serializeIntoCall(e)
-	case "__render":
-		c.renderCall(e)
-	case "__render_into":
-		c.renderIntoCall(e)
-	case "__address":
-		c.addressCall(e)
-	case "__vload", "__vstore", "__vsplat", "__vmask", "__vshuffle", "__vselect", "__vmin", "__vmax", "__vlane", "__vwith":
-		c.vectorIntrinsic(e, name, want)
-	case "__ctz":
-		c.single(e, name)
-		c.expectType(e.Args[0], types.U64)
-		e.Builtin, e.Type = name, types.I64
-	case "__clock_nanos":
-		c.single(e, name)
-		c.expectType(e.Args[0], types.I64)
-		e.Builtin, e.Type = name, types.I64
-	case "__hash_seed":
-		c.single(e, name)
-		if lit, ok := e.Args[0].(*ast.IntLit); !ok || lit.Value < 0 || lit.Value > 1 {
-			c.fail(e.Pos, "__hash_seed takes the literal 0 or 1")
-		}
-		c.expectType(e.Args[0], types.I64)
-		e.Builtin, e.Type = name, types.U64
-	case "__argc":
-		if len(e.Args) != 0 {
-			c.fail(e.Pos, "__argc takes no arguments")
-		}
-		e.Builtin, e.Type = name, types.I64
-	case "__argv", "__envv":
-		c.single(e, name)
-		c.expectType(e.Args[0], types.I64)
-		e.Builtin, e.Type = name, c.raw(types.U8)
-	case "__mulhi":
-		if len(e.Args) != 2 {
-			c.fail(e.Pos, "__mulhi takes 2 arguments, found %d", len(e.Args))
-		}
-		c.expectType(e.Args[0], types.U64)
-		c.expectType(e.Args[1], types.U64)
-		e.Builtin, e.Type = name, types.U64
-	case "__make":
-		c.single(e, name)
-		if want == nil || want.Kind != types.SliceKind {
-			c.fail(e.Pos, "__make needs an expected slice type")
-		}
-		c.integer(e.Args[0])
-		e.Builtin, e.Type = name, want
-	case "__memmove":
-		if len(e.Args) != 2 {
-			c.fail(e.Pos, "__memmove takes 2 arguments, found %d", len(e.Args))
-		}
-		dst := c.plain(e.Args[0], nil)
-		if dst.Kind != types.SliceKind {
-			c.fail(e.Args[0].Position(), "__memmove needs a slice, found %s", dst)
-		}
-		src := c.plain(e.Args[1], dst)
-		if !dst.Accepts(src) && (dst.Elem != types.U8 || src != types.Str) {
-			c.fail(e.Args[1].Position(), "expected %s, found %s", dst, src)
-		}
-		e.Builtin, e.Type = name, types.I64
-	case "__extend":
-		if len(e.Args) != 2 {
-			c.fail(e.Pos, "__extend takes 2 arguments")
-		}
-		r, ok := e.Args[0].(*ast.Ref)
-		if !ok || c.borrowInPlace(r) != c.slice(types.U8) {
-			c.fail(e.Pos, "__extend needs a mut []u8")
-		}
-		c.expectType(e.Args[1], types.Str)
-		e.Builtin, e.Type = name, types.Void
-	case "__extend_by":
-		if len(e.Args) != 2 {
-			c.fail(e.Pos, "__extend_by takes 2 arguments")
-		}
-		r, ok := e.Args[0].(*ast.Ref)
-		if !ok || c.borrowInPlace(r) != c.slice(types.U8) {
-			c.fail(e.Pos, "__extend_by needs a mut []u8")
-		}
-		c.expectType(e.Args[1], types.I64)
-		e.Builtin, e.Type = name, types.I64
-	case "__str_view":
-		c.single(e, name)
-		c.expectType(e.Args[0], c.slice(types.U8))
-		e.Builtin, e.Type = name, types.Str
-	case "__hash":
-		c.single(e, name)
-		if t := c.plain(e.Args[0], nil); !t.Hashable() {
-			c.fail(e.Args[0].Position(), "__hash requires a hashable value, found %s", t)
-		}
-		e.Builtin, e.Type = name, types.I64
-	case "__zero":
-		if len(e.Args) != 0 || want == nil {
-			c.fail(e.Pos, "__zero takes no arguments and needs an expected type")
-		}
-		e.Builtin, e.Type = name, want
-	case "__context":
-		if len(e.Args) != 0 || want == nil || want.Kind != types.PointerKind {
-			c.fail(e.Pos, "__context takes no arguments and needs an expected pointer type")
-		}
-		e.Builtin, e.Type = name, want
-	case "__set_context":
-		c.single(e, name)
-		if t := c.plain(e.Args[0], nil); t.Kind != types.PointerKind {
-			c.fail(e.Args[0].Position(), "__set_context needs a pointer, found %s", t)
-		}
-		e.Builtin, e.Type = name, types.Void
-	case "__has_context":
-		if len(e.Args) != 0 {
-			c.fail(e.Pos, "__has_context takes no arguments")
-		}
-		e.Builtin, e.Type = name, types.Bool
-
-	default:
-		return false
-	}
-	return true
-}
-
 func (c *Checker) embed(e *ast.Call) {
-	c.single(e, "embed")
 	lit, ok := e.Args[0].(*ast.StrLit)
 	if !ok {
 		c.fail(e.Args[0].Position(), "embed needs a string literal path")
@@ -2202,9 +1906,6 @@ func (c *Checker) embedded(e *ast.Call, abs string, data []byte) {
 }
 
 func (c *Checker) deleteEntry(e *ast.Call) {
-	if len(e.Args) != 2 {
-		c.fail(e.Pos, "delete takes 2 arguments, found %d", len(e.Args))
-	}
 	r, ok := e.Args[0].(*ast.Ref)
 	if !ok {
 		c.fail(e.Args[0].Position(), "delete needs a mut map; write delete(mut m, key)")
@@ -2214,7 +1915,6 @@ func (c *Checker) deleteEntry(e *ast.Call) {
 		c.fail(r.Pos, "delete needs a map, found %s", t)
 	}
 	c.key(e.Args[1], t)
-	e.Builtin = "delete"
 	e.Type = types.Void
 }
 
@@ -2233,9 +1933,6 @@ func (c *Checker) cString(e ast.Expr, t *types.Type) {
 }
 
 func (c *Checker) push(e *ast.Call) {
-	if len(e.Args) != 2 {
-		c.fail(e.Pos, "push takes 2 arguments, found %d", len(e.Args))
-	}
 	r, ok := e.Args[0].(*ast.Ref)
 	if !ok {
 		c.fail(e.Args[0].Position(), "push needs a mut slice; write push(mut s, value)")
@@ -2245,26 +1942,11 @@ func (c *Checker) push(e *ast.Call) {
 		c.fail(r.Pos, "push needs a slice, found %s", t)
 	}
 	c.expectType(e.Args[1], t.Elem)
-	e.Builtin = "push"
 	e.Type = types.Void
 }
 
-func (c *Checker) sliceShrink(name string) bool {
-	if name != "pop" && name != "truncate" {
-		return false
-	}
-	scope := c.local()
-	return scope.funcs[name] == nil && scope.generics[name] == nil && c.find(name) == nil
-}
-
-func (c *Checker) shrink(e *ast.Call, name string) {
-	want := 1
-	if name == "truncate" {
-		want = 2
-	}
-	if len(e.Args) != want {
-		c.fail(e.Pos, "%s takes %d arguments, found %d", name, want, len(e.Args))
-	}
+func (c *Checker) shrink(e *ast.Call) {
+	name := e.Builtin
 	r, ok := e.Args[0].(*ast.Ref)
 	if !ok {
 		c.fail(e.Args[0].Position(), "%s needs a mut slice; write %s(mut s)", name, name)
@@ -2273,7 +1955,6 @@ func (c *Checker) shrink(e *ast.Call, name string) {
 	if t.Kind != types.SliceKind {
 		c.fail(r.Pos, "%s needs a slice, found %s", name, t)
 	}
-	e.Builtin = name
 	e.Type = types.Void
 	if name == "pop" {
 		e.Type = c.optional(t.Elem)
@@ -2294,14 +1975,8 @@ func (c *Checker) syscall(e *ast.Call) {
 	e.Builtin, e.Type = "__syscall", types.I64
 }
 
-func (c *Checker) single(e *ast.Call, name string) {
-	if len(e.Args) != 1 {
-		c.fail(e.Pos, "%s takes 1 argument, found %d", name, len(e.Args))
-	}
-}
-
-func (c *Checker) math(e *ast.Call, name string, want *types.Type) {
-	c.single(e, name)
+func (c *Checker) math(e *ast.Call, want *types.Type) {
+	name := e.Builtin
 	var arg *types.Type
 	switch {
 	case want != nil && want.Float():
@@ -2313,12 +1988,10 @@ func (c *Checker) math(e *ast.Call, name string, want *types.Type) {
 	if !t.Float() {
 		c.fail(e.Args[0].Position(), "%s requires f32 or f64, found %s", name, t)
 	}
-	e.Builtin = name
 	e.Type = t
 }
 
 func (c *Checker) convert(e *ast.Call, to *types.Type) {
-	c.single(e, to.Name)
 	t := c.plain(e.Args[0], nil)
 	if !t.Number() {
 		c.fail(e.Args[0].Position(), "cannot convert %s to %s", t, to)
@@ -2335,9 +2008,6 @@ func (c *Checker) variantCall(e *ast.Call, sel *ast.Selector, t *types.Type) {
 }
 
 func (c *Checker) allocate(e *ast.Call, want *types.Type) {
-	if len(e.Args) != 1 {
-		c.fail(e.Pos, "new takes 1 argument, found %d", len(e.Args))
-	}
 	var elem *types.Type
 	if want != nil && want.Kind == types.PointerKind {
 		elem = want.Elem
@@ -2346,7 +2016,6 @@ func (c *Checker) allocate(e *ast.Call, want *types.Type) {
 	if t == types.Void || t == types.Never {
 		c.fail(e.Args[0].Position(), "cannot allocate a value of type %s", t)
 	}
-	e.Builtin = "new"
 	c.contain(t, "a pointer", e.Pos)
 	e.Type = c.pointer(t)
 }
