@@ -13,28 +13,16 @@ var chanFuncs = []string{
 	"__sel_recv", "__sel_send", "__sel_wait_recv", "__sel_wait_send", "__sel_value",
 }
 
-func (c *Checker) chanOf(elem *types.Type) *types.Type {
-	if t, ok := c.chans[elem]; ok {
-		return t
-	}
-	t := types.NewChan(elem)
-	c.chans[elem] = t
-	c.chanOps(t)
-	return t
-}
-
 func (c *Checker) chanOps(t *types.Type) {
 	if t.Abstract() {
 		return
 	}
-	if !c.funcsReady {
-		c.waitingChans = append(c.waitingChans, t)
-		return
-	}
-	args := []*types.Type{t.Elem}
-	for _, name := range chanFuncs {
-		c.instance(c.scope("").funcs[name], args, diag.Pos{})
-	}
+	c.when(ready, func() {
+		args := []*types.Type{t.Elem}
+		for _, name := range chanFuncs {
+			c.instance(c.scope("").funcs[name], args, diag.Pos{})
+		}
+	})
 }
 
 func (c *Checker) channel(e ast.Expr) *types.Type {
@@ -56,7 +44,7 @@ func (c *Checker) makeChan(e *ast.Call, inst *ast.Instance) {
 		c.integer(e.Args[0])
 	}
 	e.Builtin = "chan"
-	e.Type = c.chanOf(c.contained(inst.Types[0], "a channel"))
+	e.Type = c.universe.Chan(c.contained(inst.Types[0], "a channel"))
 }
 
 func (c *Checker) send(s *ast.Send) {
@@ -110,7 +98,7 @@ func (c *Checker) selectExpr(e *ast.Select, want *types.Type) {
 		case ast.RecvCase:
 			t := c.channel(sc.Chan)
 			if sc.Name != "" {
-				sc.Local = c.declare(sc.Name, c.optional(t.Elem), false)
+				sc.Local = c.declare(sc.Name, c.universe.Optional(t.Elem), false)
 			}
 		case ast.SendCase:
 			t := c.channel(sc.Chan)

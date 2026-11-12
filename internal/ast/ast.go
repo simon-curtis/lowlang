@@ -90,7 +90,6 @@ type TypeName struct {
 	Module   string
 	Name     string
 	Pointer  bool
-	Raw      bool
 	Slice    bool
 	Optional bool
 	Map      bool

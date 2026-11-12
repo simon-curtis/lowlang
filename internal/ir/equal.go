@@ -40,8 +40,8 @@ func (b *builder) both(acc, next *Value) *Value {
 func (b *builder) fieldsEqual(t *types.Type, x, y []*Value) *Value {
 	var acc *Value
 	for _, f := range t.Fields {
-		end := f.Offset + f.Type.Size()
-		same := b.equal(f.Type, x[f.Offset:end], y[f.Offset:end])
+		end := f.Word() + f.Type.Size()
+		same := b.equal(f.Type, x[f.Word():end], y[f.Word():end])
 		acc = b.both(acc, same)
 	}
 	if acc == nil {

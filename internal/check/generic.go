@@ -58,9 +58,11 @@ func (c *Checker) typeParams(decls []*ast.TypeParam) []*types.Type {
 		seen[d.Name] = true
 		var constraint types.Constraint
 		for _, name := range d.Constraints {
-			bits, ok := types.Constraints[name]
+			bits, ok := types.ParseConstraint(name)
 			if !ok {
-				c.fail(d.Pos, "unknown constraint %s; use Eq, Ord, Hash, Number, Integer or Float", name)
+				names := types.ConstraintNames()
+				last := len(names) - 1
+				c.fail(d.Pos, "unknown constraint %s; use %s or %s", name, strings.Join(names[:last], ", "), names[last])
 			}
 			constraint |= bits
 		}
@@ -88,13 +90,6 @@ func (c *Checker) bindingsOf(fn *ast.Func) map[string]*types.Type {
 	return bindings(decl.TypeParams, fn.TypeArgs)
 }
 
-func (c *Checker) within(file *ast.File, bound map[string]*types.Type, run func()) {
-	savedFile, savedBound := c.file, c.bound
-	c.file, c.bound = file, bound
-	run()
-	c.file, c.bound = savedFile, savedBound
-}
-
 func (c *Checker) satisfy(args []*types.Type, decls []*ast.TypeParam, params []*types.Type, pos diag.Pos) {
 	for i, a := range args {
 		if !a.Satisfies(params[i].Constraint) {
@@ -105,7 +100,7 @@ func (c *Checker) satisfy(args []*types.Type, decls []*ast.TypeParam, params []*
 
 func (c *Checker) declareGeneric(name string, decls []*ast.TypeParam, pub bool, pos diag.Pos) *generic {
 	_, dupType := c.local().types[name]
-	if _, dup := c.local().generics[name]; dup || dupType || isTypeName(name) {
+	if _, dup := c.local().generics[name]; dup || dupType || types.Reserved(name) {
 		c.fail(pos, "type %s already declared", name)
 	}
 	g := &generic{name: name, decls: decls, params: c.typeParams(decls), pub: pub, pos: pos, file: c.file, instances: map[string]*types.Type{}}
@@ -151,11 +146,7 @@ func (c *Checker) instantiateType(g *generic, args []*types.Type, pos diag.Pos) 
 			c.declareVariants(g.enum, t)
 		}
 	})
-	if c.laid {
-		c.layout(t, pos)
-	} else {
-		c.unlaid = append(c.unlaid, t)
-	}
+	c.when(laid, func() { c.layout(t, pos) })
 	return t
 }
 
@@ -301,38 +292,38 @@ func (c *Checker) substitute(t *types.Type, in *inference, pos diag.Pos) *types.
 		return t
 	case t.Optional:
 		if e := sub(t.Elem); e != nil {
-			return c.optional(e)
+			return c.universe.Optional(e)
 		}
 	case t.Kind == types.SliceKind:
 		if e := sub(t.Elem); e != nil {
-			return c.slice(e)
+			return c.universe.Slice(e)
 		}
 	case t.Kind == types.PointerKind:
 		if e := sub(t.Elem); e != nil {
-			return c.pointer(e)
+			return c.universe.Pointer(e)
 		}
 	case t.Kind == types.RawKind:
 		if e := sub(t.Elem); e != nil {
-			return c.raw(e)
+			return c.universe.Raw(e)
 		}
 	case t.Kind == types.ChanKind:
 		if e := sub(t.Elem); e != nil {
-			return c.chanOf(e)
+			return c.universe.Chan(e)
 		}
 	case t.Kind == types.MapKind:
 		k, v := sub(t.Key), sub(t.Elem)
 		if k != nil && v != nil {
-			return c.mapOf(k, v)
+			return c.universe.Map(k, v)
 		}
 	case t.Kind == types.ResultKind:
 		ok, err := sub(t.Ok), sub(t.Err)
 		if ok != nil && err != nil {
-			return c.result(ok, err)
+			return c.universe.Result(ok, err)
 		}
 	case t.Kind == types.FuncKind:
 		params, ret := subs(t.Params), sub(t.Ret)
 		if params != nil && ret != nil {
-			return c.funcType(params, t.Muts, ret, t.C)
+			return c.universe.Func(params, t.Muts, ret, t.C)
 		}
 	case t.Origin != nil:
 		if args := subs(t.TypeArgs); args != nil {
@@ -357,7 +348,7 @@ func (c *Checker) genericFuncValue(fn *ast.Func, want *types.Type, pos diag.Pos)
 	for i, p := range fn.ParamTypes {
 		params[i] = c.substitute(p, in, pos)
 	}
-	return nil, c.funcType(params, want.Muts, c.substitute(fn.RetType, in, pos), want.C)
+	return nil, c.universe.Func(params, want.Muts, c.substitute(fn.RetType, in, pos), want.C)
 }
 
 func (c *Checker) concrete(args []*types.Type) bool {
@@ -505,12 +496,10 @@ func (c *Checker) mapOps(m *types.Type) {
 	if m.Abstract() {
 		return
 	}
-	if !c.funcsReady {
-		c.waitingMaps = append(c.waitingMaps, m)
-		return
-	}
-	args := []*types.Type{m.Key, m.Elem}
-	for _, name := range mapFuncs {
-		c.instance(c.scope("").funcs[name], args, diag.Pos{})
-	}
+	c.when(ready, func() {
+		args := []*types.Type{m.Key, m.Elem}
+		for _, name := range mapFuncs {
+			c.instance(c.scope("").funcs[name], args, diag.Pos{})
+		}
+	})
 }

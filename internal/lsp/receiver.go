@@ -75,7 +75,7 @@ func segmentsBefore(src string, end int) ([]segment, bool) {
 	}
 }
 
-func applySuffix(t *types.Type, suffix byte) *types.Type {
+func (c *cursor) applySuffix(t *types.Type, suffix byte) *types.Type {
 	if t == nil {
 		return nil
 	}
@@ -85,7 +85,7 @@ func applySuffix(t *types.Type, suffix byte) *types.Type {
 	case suffix == '[' && t.Kind == types.SliceKind:
 		return t.Elem
 	case suffix == '[' && t.Kind == types.MapKind:
-		return types.NewOptional(t.Elem)
+		return c.unit.Types.Optional(t.Elem)
 	case suffix == '[' && t.Kind == types.StrKind:
 		return types.U8
 	case suffix == '?' && t.Kind == types.ResultKind:
@@ -237,7 +237,7 @@ func (c *cursor) typeOf(segments []segment) *types.Type {
 	t, suffixes, rest := c.head(segments)
 	for {
 		for _, s := range suffixes {
-			t = applySuffix(t, s)
+			t = c.applySuffix(t, s)
 		}
 		if t == nil || len(rest) == 0 {
 			return t

@@ -18,6 +18,7 @@ import (
 	"lowlang/internal/ir"
 	"lowlang/internal/parser"
 	"lowlang/internal/target"
+	"lowlang/internal/types"
 )
 
 type lengthPair struct {
@@ -130,7 +131,7 @@ func buildProbe(t *testing.T, source string) string {
 		t.Fatal(err)
 	}
 	files := []*ast.File{prelude, probe}
-	if _, err := check.Check(files, stdFS); err != nil {
+	if _, err := check.Check(files, stdFS, types.NewUniverse()); err != nil {
 		t.Fatal(err)
 	}
 	host := target.Host()

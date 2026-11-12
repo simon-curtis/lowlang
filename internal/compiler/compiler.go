@@ -19,10 +19,12 @@ import (
 	"lowlang/internal/lint"
 	"lowlang/internal/parser"
 	"lowlang/internal/target"
+	"lowlang/internal/types"
 )
 
 type Unit struct {
 	Files    []*ast.File
+	Types    *types.Universe
 	Program  *ir.Program
 	Sources  []string
 	Warnings []lint.Warning
@@ -58,11 +60,12 @@ func Check(path string, read func(name string) ([]byte, error)) (*Unit, error) {
 		return nil, err
 	}
 	files := append([]*ast.File{prelude}, modules.files...)
-	embeds, err := check.Check(files, stdFS)
+	universe := types.NewUniverse()
+	embeds, err := check.Check(files, stdFS, universe)
 	if err != nil {
 		return nil, err
 	}
-	unit := &Unit{Files: files, Sources: append(modules.sources, embeds...)}
+	unit := &Unit{Files: files, Types: universe, Sources: append(modules.sources, embeds...)}
 	unit.Warnings = lint.Run(modules.userFiles())
 	return unit, nil
 }

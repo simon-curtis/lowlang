@@ -9,17 +9,8 @@ import (
 )
 
 type dropSource struct {
-	decl     *ast.StructDecl
-	file     *ast.File
-	bound    map[string]*types.Type
-	clone    bool
-	abstract bool
-}
-
-type containment struct {
-	elem  *types.Type
-	where string
-	pos   diag.Pos
+	declSource
+	decl *ast.StructDecl
 }
 
 func (c *Checker) recordStruct(d *ast.StructDecl, st *types.Type) {
@@ -27,11 +18,11 @@ func (c *Checker) recordStruct(d *ast.StructDecl, st *types.Type) {
 	if d.Drop == nil {
 		return
 	}
-	c.drops[st] = &dropSource{decl: d, file: c.file, bound: c.bound, clone: d.TypeParams != nil, abstract: st.Abstract()}
+	c.drops[st] = &dropSource{declSource: c.sourceOf(st, d.TypeParams != nil), decl: d}
 }
 
 func (c *Checker) droppable(t *types.Type) bool {
-	if t == nil || t.Kind != types.StructKind || !c.laid {
+	if t == nil || t.Kind != types.StructKind || c.phase < laid {
 		return false
 	}
 	if known, ok := c.droppables[t]; ok {
@@ -59,36 +50,17 @@ func (c *Checker) owns(t *types.Type) bool {
 }
 
 func (c *Checker) contain(elem *types.Type, where string, pos diag.Pos) {
-	if !c.laid {
-		c.containments = append(c.containments, containment{elem, where, pos})
-		return
-	}
-	if c.droppable(elem) {
-		c.fail(pos, "cannot store %s in %s; it has drop", elem, where)
-	}
+	c.when(laid, func() {
+		if c.droppable(elem) {
+			c.fail(pos, "cannot store %s in %s; it has drop", elem, where)
+		}
+	})
 }
 
 func (c *Checker) contained(t *ast.TypeName, where string) *types.Type {
 	elem := c.resolve(t)
 	c.contain(elem, where, t.Pos)
 	return elem
-}
-
-func (c *Checker) checkContainments() {
-	for _, k := range c.containments {
-		c.contain(k.elem, k.where, k.pos)
-	}
-	c.containments = nil
-}
-
-func (c *Checker) detached(file *ast.File, bound map[string]*types.Type, abstract bool, run func()) {
-	fn, savedFile, savedBound, scopes := c.fn, c.file, c.bound, c.scopes
-	loops, deferring, closures, savedAbstract, dropping := c.loops, c.deferring, c.closures, c.abstract, c.dropping
-	c.file, c.bound, c.scopes = file, bound, nil
-	c.loops, c.deferring, c.closures, c.abstract, c.dropping = nil, false, nil, abstract, false
-	run()
-	c.fn, c.file, c.bound, c.scopes = fn, savedFile, savedBound, scopes
-	c.loops, c.deferring, c.closures, c.abstract, c.dropping = loops, deferring, closures, savedAbstract, dropping
 }
 
 func (c *Checker) dropFunc(t *types.Type) *ast.Func {
@@ -107,10 +79,9 @@ func (c *Checker) dropFunc(t *types.Type) *ast.Func {
 		fn.ParamTypes = append(fn.ParamTypes, f.Type)
 	}
 	c.dropFuncs[t] = fn
-	c.detached(src.file, src.bound, src.abstract, func() {
-		c.dropping = true
-		c.body(fn)
-	})
+	next := src.context()
+	next.dropping = true
+	c.enter(next, func() { c.body(fn) })
 	if !src.abstract {
 		src.file.Funcs = append(src.file.Funcs, fn)
 	}

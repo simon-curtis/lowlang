@@ -839,7 +839,7 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		}
 		words := make([]*Value, e.Type.Size())
 		for _, init := range e.Fields {
-			copy(words[init.Field.Offset:], b.value(init.Value, init.Field.Type))
+			copy(words[init.Field.Word():], b.value(init.Value, init.Field.Type))
 		}
 		return words
 	case *ast.Unary:
@@ -883,7 +883,7 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 		return b.cField(e)
 	}
 	words := b.value(e.X, e.X.TypeOf())
-	return words[e.Field.Offset : e.Field.Offset+e.Type.Size()]
+	return words[e.Field.Word() : e.Field.Word()+e.Type.Size()]
 }
 
 func (b *builder) unary(e *ast.Unary) []*Value {

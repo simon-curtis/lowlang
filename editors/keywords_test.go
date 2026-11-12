@@ -35,9 +35,7 @@ func init() {
 			expected["constants"] = append(expected["constants"], b.Name)
 		}
 	}
-	for name := range types.Constraints {
-		expected["constraints"] = append(expected["constraints"], name)
-	}
+	expected["constraints"] = types.ConstraintNames()
 }
 
 var listings = []listing{

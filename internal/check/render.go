@@ -43,8 +43,8 @@ func (c *Checker) renderIntoCall(e *ast.Call) {
 	if !bufferOK || !pathOK {
 		c.fail(e.Pos, "__render_into needs a mut []u8 and a mut []i64")
 	}
-	c.ref(buffer, c.slice(types.U8))
-	c.ref(path, c.slice(types.I64))
+	c.ref(buffer, c.universe.Slice(types.U8))
+	c.ref(path, c.universe.Slice(types.I64))
 	t := c.plain(e.Args[2], nil)
 	c.exclusive(e.Args)
 	e.Builtin, e.Type = "", types.Void

@@ -72,7 +72,7 @@ func (c *Checker) serializeIntoCall(e *ast.Call) {
 	if !ok {
 		c.fail(e.Pos, "__serialize_into needs a mut []i64")
 	}
-	c.ref(path, c.slice(types.I64))
+	c.ref(path, c.universe.Slice(types.I64))
 	t := c.plain(e.Args[2], nil)
 	c.exclusive(e.Args)
 	e.Builtin, e.Type = "", types.Void
@@ -97,7 +97,7 @@ func (c *Checker) derivedCall(e *ast.Call, inst *ast.Instance) bool {
 			c.fail(e.Pos, "__deserialize takes 1 argument, found %d", len(e.Args))
 		}
 		c.expectType(e.Args[0], c.serdeType("Reader", e.Pos))
-		e.Type = c.result(t, c.serdeType("Error", e.Pos))
+		e.Type = c.universe.Result(t, c.serdeType("Error", e.Pos))
 	} else {
 		if len(e.Args) != 0 {
 			c.fail(e.Pos, "__schema takes no arguments, found %d", len(e.Args))

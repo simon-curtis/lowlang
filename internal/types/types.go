@@ -55,11 +55,14 @@ type Type struct {
 }
 
 type Field struct {
-	Name   string
-	Bytes  int
-	Pub    bool
-	Type   *Type
-	Offset int
+	Name  string
+	Bytes int
+	Pub   bool
+	Type  *Type
+}
+
+func (f *Field) Word() int {
+	return f.Bytes / 8
 }
 
 type Variant struct {
@@ -106,10 +109,10 @@ func (t *Type) PointerWords() []bool {
 	case StructKind:
 		for _, f := range t.Fields {
 			if t.C {
-				merge(words[f.Bytes/8:], f.Type.PointerWords())
+				merge(words[f.Word():], f.Type.PointerWords())
 				continue
 			}
-			copy(words[f.Offset:], f.Type.PointerWords())
+			copy(words[f.Word():], f.Type.PointerWords())
 		}
 	case EnumKind:
 		for _, v := range t.Variants {
@@ -134,7 +137,7 @@ func (t *Type) FloatWords() []int {
 			return words
 		}
 		for _, f := range t.Fields {
-			copy(words[f.Offset:], f.Type.FloatWords())
+			copy(words[f.Word():], f.Type.FloatWords())
 		}
 	}
 	return words
@@ -162,11 +165,16 @@ func (t *Type) Holds(n int64) bool {
 	if t.Bits == 64 || t.Kind == ParamKind {
 		return t.Signed || n >= 0
 	}
+	low, high := t.Bounds()
+	return n >= low && n <= high
+}
+
+func (t *Type) Bounds() (int64, int64) {
 	if t.Signed {
 		limit := int64(1) << (t.Bits - 1)
-		return n >= -limit && n < limit
+		return -limit, limit - 1
 	}
-	return n >= 0 && n < int64(1)<<t.Bits
+	return 0, int64(1)<<t.Bits - 1
 }
 
 func NewEnum(name string) *Type {
@@ -177,11 +185,11 @@ func NewStruct(name string) *Type {
 	return &Type{Kind: StructKind, Name: name, size: -1}
 }
 
-func NewPointer(elem *Type) *Type {
+func newPointer(elem *Type) *Type {
 	return &Type{Kind: PointerKind, Name: fmt.Sprintf("*%s", elem), Elem: elem, size: 1}
 }
 
-func NewOptional(elem *Type) *Type {
+func newOptional(elem *Type) *Type {
 	t := NewEnum(fmt.Sprintf("%s?", elem))
 	t.Optional = true
 	t.Elem = elem
@@ -196,11 +204,11 @@ func (t *Type) Accepts(from *Type) bool {
 	return t == from || from == Never || (t.Optional && from == t.Elem)
 }
 
-func NewChan(elem *Type) *Type {
+func newChan(elem *Type) *Type {
 	return &Type{Kind: ChanKind, Name: fmt.Sprintf("chan[%s]", elem), Elem: elem, size: 1}
 }
 
-func NewMap(key, value *Type) *Type {
+func newMap(key, value *Type) *Type {
 	return &Type{Kind: MapKind, Name: fmt.Sprintf("[%s: %s]", key, value), Key: key, Elem: value, size: 1}
 }
 
@@ -215,7 +223,7 @@ func StructOf(t *Type) *Type {
 	return t
 }
 
-func NewFunc(params []*Type, muts []bool, ret *Type, c bool) *Type {
+func newFunc(params []*Type, muts []bool, ret *Type, c bool) *Type {
 	var b strings.Builder
 	if c {
 		b.WriteString("extern ")
@@ -244,7 +252,7 @@ func NewFunc(params []*Type, muts []bool, ret *Type, c bool) *Type {
 	return &Type{Kind: FuncKind, Name: b.String(), Params: params, Muts: muts, Ret: ret, C: c, size: size}
 }
 
-func NewRaw(elem *Type) *Type {
+func newRaw(elem *Type) *Type {
 	name := "ptr"
 	if elem != nil {
 		name = fmt.Sprintf("ptr[%s]", elem)
@@ -298,7 +306,7 @@ func (t *Type) Width() *Type {
 	return nil
 }
 
-func NewSlice(elem *Type) *Type {
+func newSlice(elem *Type) *Type {
 	return &Type{Kind: SliceKind, Name: fmt.Sprintf("[]%s", elem), Elem: elem, size: 3}
 }
 
@@ -316,7 +324,7 @@ func (t *Type) Stride() int {
 	return 8 * t.size
 }
 
-func NewResult(ok, err *Type) *Type {
+func newResult(ok, err *Type) *Type {
 	return &Type{Kind: ResultKind, Ok: ok, Err: err, size: -1}
 }
 
@@ -412,7 +420,6 @@ func (t *Type) structLayout() error {
 		if err := f.Type.Layout(); err != nil {
 			return err
 		}
-		f.Offset = words
 		f.Bytes = 8 * words
 		words += f.Type.Size()
 	}

@@ -577,16 +577,6 @@ func (p *Parser) typeTerm() *ast.TypeName {
 		p.expect(lexer.RBracket)
 		return &ast.TypeName{Map: true, Key: key, Elem: value, Pos: pos}
 	}
-	if p.at(lexer.Ident) && p.tok().Text == "ptr" {
-		p.next()
-		if !p.at(lexer.LBracket) {
-			return &ast.TypeName{Raw: true, Pos: pos}
-		}
-		p.next()
-		elem := p.typeName()
-		p.expect(lexer.RBracket)
-		return &ast.TypeName{Raw: true, Elem: elem, Pos: pos}
-	}
 	t := &ast.TypeName{Name: p.expect(lexer.Ident).Text, Pos: pos}
 	if p.at(lexer.Dot) {
 		p.next()

@@ -17,10 +17,6 @@ func (t *TypeName) String() string {
 		return fmt.Sprintf("[]%s", t.Elem)
 	case t.Map:
 		return fmt.Sprintf("[%s: %s]", t.Key, t.Elem)
-	case t.Raw && t.Elem == nil:
-		return "ptr"
-	case t.Raw:
-		return fmt.Sprintf("ptr[%s]", t.Elem)
 	case t.Func:
 		return t.funcString()
 	}

@@ -30,67 +30,42 @@ type scope struct {
 }
 
 type Checker struct {
-	modules         map[string]*scope
-	embeds          []string
-	file            *ast.File
-	results         map[[2]*types.Type]*types.Type
-	ptrs            map[*types.Type]*types.Type
-	opts            map[*types.Type]*types.Type
-	slices          map[*types.Type]*types.Type
-	maps            map[[2]*types.Type]*types.Type
-	fn              *ast.Func
-	scopes          []map[string]*ast.Local
-	loops           []*loop
-	raws            map[*types.Type]*types.Type
-	funcTypes       map[string]*types.Type
-	closures        []*ast.Closure
+	universe *types.Universe
+	phase    phase
+	waiting  map[phase][]func()
+	modules  map[string]*scope
+	embeds   []string
+	funcContext
 	counts          map[*ast.Func]int
-	bound           map[string]*types.Type
-	abstract        bool
 	generics        map[*types.Type]*generic
 	pristine        map[*ast.Func]*ast.Func
 	instances       map[*ast.Func]map[string]*ast.Func
 	pending         []*ast.Func
-	unlaid          []*types.Type
-	laid            bool
-	funcsReady      bool
-	waitingMaps     []*types.Type
-	chans           map[*types.Type]*types.Type
-	waitingChans    []*types.Type
 	spawns          int
 	drops           map[*types.Type]*dropSource
 	droppables      map[*types.Type]bool
 	dropFuncs       map[*types.Type]*ast.Func
 	releaseFuncs    map[*types.Type]*ast.Func
 	structFiles     map[*types.Type]*ast.File
-	containments    []containment
-	dropping        bool
 	flags           int
 	subjects        []*types.Type
 	fieldSources    map[*types.Field]*fieldSource
 	defaults        map[*types.Field]ast.Expr
 	checkingDefault map[*types.Field]bool
-	deferring       bool
 	derived         map[string]*ast.Func
 	std             fs.FS
 }
 
-func Check(files []*ast.File, std fs.FS) ([]string, error) {
+func Check(files []*ast.File, std fs.FS, universe *types.Universe) ([]string, error) {
 	c := &Checker{
 		std:             std,
+		universe:        universe,
+		waiting:         map[phase][]func(){},
 		modules:         map[string]*scope{},
-		results:         map[[2]*types.Type]*types.Type{},
-		ptrs:            map[*types.Type]*types.Type{},
-		opts:            map[*types.Type]*types.Type{},
-		slices:          map[*types.Type]*types.Type{},
-		maps:            map[[2]*types.Type]*types.Type{},
-		raws:            map[*types.Type]*types.Type{},
-		funcTypes:       map[string]*types.Type{},
 		counts:          map[*ast.Func]int{},
 		generics:        map[*types.Type]*generic{},
 		pristine:        map[*ast.Func]*ast.Func{},
 		instances:       map[*ast.Func]map[string]*ast.Func{},
-		chans:           map[*types.Type]*types.Type{},
 		drops:           map[*types.Type]*dropSource{},
 		droppables:      map[*types.Type]bool{},
 		dropFuncs:       map[*types.Type]*ast.Func{},
@@ -101,6 +76,8 @@ func Check(files []*ast.File, std fs.FS) ([]string, error) {
 		checkingDefault: map[*types.Field]bool{},
 		derived:         map[string]*ast.Func{},
 	}
+	universe.OnCreate = c.created
+	defer func() { universe.OnCreate = nil }()
 	if failure := diag.Try(func() { c.check(files) }); failure != nil {
 		return nil, failure
 	}
@@ -169,22 +146,14 @@ func (c *Checker) fail(pos diag.Pos, format string, args ...any) {
 func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 	switch {
 	case t.Pointer:
-		return c.pointer(c.contained(t.Elem, "a pointer"))
+		return c.universe.Pointer(c.contained(t.Elem, "a pointer"))
 	case t.Slice:
-		return c.slice(c.contained(t.Elem, "a slice"))
+		return c.universe.Slice(c.contained(t.Elem, "a slice"))
 	case t.Map:
-		key := c.resolve(t.Key)
-		if !key.Hashable() {
-			c.fail(t.Key.Pos, "map keys must be integers, bool, str or pointers, found %s", key)
-		}
-		return c.mapOf(key, c.contained(t.Elem, "a map"))
+		key := c.mapKey(c.resolve(t.Key), t.Key.Pos)
+		return c.universe.Map(key, c.contained(t.Elem, "a map"))
 	case t.Optional:
-		return c.optional(c.contained(t.Elem, "an optional"))
-	case t.Raw:
-		if t.Elem == nil {
-			return c.raw(nil)
-		}
-		return c.raw(c.contained(t.Elem, "a ptr"))
+		return c.universe.Optional(c.contained(t.Elem, "an optional"))
 	case t.Func:
 		return c.funcTypeName(t)
 	}
@@ -220,6 +189,13 @@ func (c *Checker) resolve(t *ast.TypeName) *types.Type {
 	return typ
 }
 
+func (c *Checker) mapKey(key *types.Type, pos diag.Pos) *types.Type {
+	if !key.Hashable() {
+		c.fail(pos, "map keys must be integers, bool, str or pointers, found %s", key)
+	}
+	return key
+}
+
 func (c *Checker) funcTypeName(t *ast.TypeName) *types.Type {
 	params := make([]*types.Type, len(t.Params))
 	for i, p := range t.Params {
@@ -232,26 +208,7 @@ func (c *Checker) funcTypeName(t *ast.TypeName) *types.Type {
 	if t.CFunc && ret != types.Void && !ret.CCompatible() {
 		c.fail(t.Pos, "extern fn results must have C types, found %s", ret)
 	}
-	return c.funcType(params, t.Muts, ret, t.CFunc)
-}
-
-func (c *Checker) funcType(params []*types.Type, muts []bool, ret *types.Type, cfn bool) *types.Type {
-	key := funcKey(params, muts, ret, cfn)
-	if known, ok := c.funcTypes[key]; ok {
-		return known
-	}
-	t := types.NewFunc(params, muts, ret, cfn)
-	c.funcTypes[key] = t
-	return t
-}
-
-func funcKey(params []*types.Type, muts []bool, ret *types.Type, cfn bool) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "%t %p", cfn, ret)
-	for i, p := range params {
-		fmt.Fprintf(&b, " %t %p", muts[i], p)
-	}
-	return b.String()
+	return c.universe.Func(params, t.Muts, ret, t.CFunc)
 }
 
 func (c *Checker) signatureOf(fn *ast.Func, cfn bool) *types.Type {
@@ -259,79 +216,7 @@ func (c *Checker) signatureOf(fn *ast.Func, cfn bool) *types.Type {
 	for i, p := range fn.Params {
 		muts[i] = p.Mut
 	}
-	return c.funcType(fn.ParamTypes, muts, fn.RetType, cfn)
-}
-
-func (c *Checker) raw(elem *types.Type) *types.Type {
-	if r, ok := c.raws[elem]; ok {
-		return r
-	}
-	r := types.NewRaw(elem)
-	c.raws[elem] = r
-	return r
-}
-
-func (c *Checker) optional(elem *types.Type) *types.Type {
-	if o, ok := c.opts[elem]; ok {
-		return o
-	}
-	o := types.NewOptional(elem)
-	c.opts[elem] = o
-	if elem.Size() > 0 {
-		c.layout(o, diag.Pos{})
-	}
-	return o
-}
-
-func (c *Checker) mapOf(key, value *types.Type) *types.Type {
-	k := [2]*types.Type{key, value}
-	if m, ok := c.maps[k]; ok {
-		return m
-	}
-	m := types.NewMap(key, value)
-	c.maps[k] = m
-	c.mapOps(m)
-	return m
-}
-
-func (c *Checker) slice(elem *types.Type) *types.Type {
-	if s, ok := c.slices[elem]; ok {
-		return s
-	}
-	s := types.NewSlice(elem)
-	c.slices[elem] = s
-	return s
-}
-
-func (c *Checker) pointer(elem *types.Type) *types.Type {
-	if p, ok := c.ptrs[elem]; ok {
-		return p
-	}
-	p := types.NewPointer(elem)
-	c.ptrs[elem] = p
-	return p
-}
-
-func deref(t *types.Type) *types.Type {
-	if t.Kind == types.PointerKind {
-		return t.Elem
-	}
-	return t
-}
-
-func (c *Checker) result(ok, err *types.Type) *types.Type {
-	key := [2]*types.Type{ok, err}
-	if r, found := c.results[key]; found {
-		return r
-	}
-	r := types.NewResult(ok, err)
-	c.results[key] = r
-	if c.laid {
-		c.layout(r, diag.Pos{})
-	} else {
-		c.unlaid = append(c.unlaid, r)
-	}
-	return r
+	return c.universe.Func(fn.ParamTypes, muts, fn.RetType, cfn)
 }
 
 func (c *Checker) check(files []*ast.File) {
@@ -360,7 +245,7 @@ func (c *Checker) check(files []*ast.File) {
 
 func (c *Checker) declareType(name string, pos diag.Pos, t *types.Type, pub bool) {
 	_, generic := c.local().generics[name]
-	if _, dup := c.local().types[name]; dup || isTypeName(name) || generic {
+	if _, dup := c.local().types[name]; dup || types.Reserved(name) || generic {
 		c.fail(pos, "type %s already declared", name)
 	}
 	t.Module = c.file.Module
@@ -423,12 +308,7 @@ func (c *Checker) declareTypes(files []*ast.File) {
 			c.layout(d.Type, d.Pos)
 		}
 	}
-	for _, t := range c.unlaid {
-		c.layout(t, diag.Pos{})
-	}
-	c.unlaid = nil
-	c.laid = true
-	c.checkContainments()
+	c.advance(laid)
 }
 
 func (c *Checker) layout(t *types.Type, pos diag.Pos) {
@@ -479,15 +359,7 @@ func (c *Checker) declareFuncs(files []*ast.File) {
 			}
 		}
 	}
-	c.funcsReady = true
-	for _, m := range c.waitingMaps {
-		c.mapOps(m)
-	}
-	c.waitingMaps = nil
-	for _, t := range c.waitingChans {
-		c.chanOps(t)
-	}
-	c.waitingChans = nil
+	c.advance(ready)
 }
 
 func (c *Checker) cSignature(fn *ast.Func) {
@@ -509,7 +381,7 @@ func (c *Checker) declareFunc(fn *ast.Func) {
 		c.fail(fn.Pos, "%s is a builtin", fn.Name)
 	}
 	_, generic := c.local().generics[fn.Name]
-	if _, clash := c.local().types[fn.Name]; clash || isTypeName(fn.Name) || generic {
+	if _, clash := c.local().types[fn.Name]; clash || types.Reserved(fn.Name) || generic {
 		c.fail(fn.Pos, "function %s has the name of a type", fn.Name)
 	}
 	if fn.TypeParams != nil {
@@ -539,7 +411,7 @@ func (c *Checker) resultOf(result, errName *ast.TypeName) *types.Type {
 	if err.Kind != types.EnumKind {
 		c.fail(errName.Pos, "error type must be an enum, found %s", err)
 	}
-	return c.result(ok, err)
+	return c.universe.Result(ok, err)
 }
 
 func (c *Checker) checkMain() {
@@ -554,14 +426,13 @@ func (c *Checker) checkMain() {
 }
 
 func (c *Checker) function(fn *ast.Func) {
-	c.file = fn.File
-	c.bound = c.bindingsOf(fn)
-	c.abstract = fn.TypeParams != nil
-	c.scopes = nil
-	c.body(fn)
-	if !c.abstract {
-		c.markReadOnly(fn)
-	}
+	next := funcContext{file: fn.File, bound: c.bindingsOf(fn), abstract: fn.TypeParams != nil}
+	c.enter(next, func() {
+		c.body(fn)
+		if !c.abstract {
+			c.markReadOnly(fn)
+		}
+	})
 }
 
 func (c *Checker) body(fn *ast.Func) {
@@ -623,12 +494,10 @@ func (c *Checker) closure(e *ast.Closure, want *types.Type) {
 	if !c.abstract {
 		c.file.Funcs = append(c.file.Funcs, fn)
 	}
-	outer, loops, deferring := c.fn, c.loops, c.deferring
-	c.closures = append(c.closures, e)
-	c.loops, c.deferring = nil, false
-	c.body(fn)
-	c.closures = c.closures[:len(c.closures)-1]
-	c.fn, c.loops, c.deferring = outer, loops, deferring
+	next := c.funcContext
+	next.closures = append(next.closures, e)
+	next.loops, next.deferring = nil, false
+	c.enter(next, func() { c.body(fn) })
 	e.Type = c.signatureOf(fn, false)
 }
 
@@ -804,16 +673,14 @@ func (c *Checker) deferStmt(s *ast.Defer) {
 	if c.deferring {
 		c.fail(s.Pos, "defer cannot be nested in a deferred statement")
 	}
-	c.deferring = true
-	loops := c.loops
-	c.loops = nil
-	c.pushScope()
-	if c.stmt(s.Body) {
-		c.fail(s.Pos, "a deferred statement cannot leave its scope")
-	}
-	c.popScope()
-	c.loops = loops
-	c.deferring = false
+	next := c.funcContext
+	next.loops, next.deferring = nil, true
+	c.enter(next, func() {
+		c.pushScope()
+		if c.stmt(s.Body) {
+			c.fail(s.Pos, "a deferred statement cannot leave its scope")
+		}
+	})
 }
 
 func (c *Checker) leaving(pos diag.Pos, keyword string) {
@@ -877,7 +744,7 @@ func (c *Checker) assignTarget(s *ast.Assign) *types.Type {
 	if entry, ok := s.Target.(*ast.Index); ok {
 		if m := c.plain(entry.X, nil); m.Kind == types.MapKind {
 			c.key(entry.Index, m)
-			entry.Type = c.optional(m.Elem)
+			entry.Type = c.universe.Optional(m.Elem)
 			s.Entry = entry
 			return m.Elem
 		}
@@ -1294,10 +1161,10 @@ func (c *Checker) selector(e *ast.Selector, want *types.Type) {
 		e.Type = types.I64
 		return
 	}
-	if deref(t).Field(e.Name) == nil {
+	if types.StructOf(t).Field(e.Name) == nil {
 		c.shadowedModule(e.X, e.Name)
 	}
-	e.Field = c.field(deref(t), e.Name, e.Pos)
+	e.Field = c.field(types.StructOf(t), e.Name, e.Pos)
 	e.Type = e.Field.Type
 }
 
@@ -1312,7 +1179,7 @@ func (c *Checker) index(e *ast.Index) {
 	switch {
 	case t.Kind == types.MapKind:
 		c.key(e.Index, t)
-		e.Type = c.optional(t.Elem)
+		e.Type = c.universe.Optional(t.Elem)
 		return
 	case t.Kind == types.SliceKind:
 		e.Type = t.Elem
@@ -1358,7 +1225,7 @@ func (c *Checker) sliceLit(e *ast.SliceLit, want *types.Type) {
 		c.expectType(el, elem)
 	}
 	c.contain(elem, "a slice", e.Pos)
-	e.Type = c.slice(elem)
+	e.Type = c.universe.Slice(elem)
 }
 
 func (c *Checker) mapLit(e *ast.MapLit, want *types.Type) {
@@ -1367,11 +1234,8 @@ func (c *Checker) mapLit(e *ast.MapLit, want *types.Type) {
 	} else if len(e.Keys) == 0 {
 		c.fail(e.Pos, "cannot infer the type of an empty map; annotate it")
 	} else {
-		key := c.plain(e.Keys[0], nil)
-		if !key.Hashable() {
-			c.fail(e.Keys[0].Position(), "map keys must be integers, bool, str or pointers, found %s", key)
-		}
-		e.Type = c.mapOf(key, c.plain(e.Values[0], nil))
+		key := c.mapKey(c.plain(e.Keys[0], nil), e.Keys[0].Position())
+		e.Type = c.universe.Map(key, c.plain(e.Values[0], nil))
 	}
 	for i := range e.Keys {
 		c.expectType(e.Keys[i], e.Type.Key)
@@ -1490,7 +1354,7 @@ func (c *Checker) unary(e *ast.Unary, want *types.Type) {
 		c.expectType(e.X, types.Bool)
 		e.Type = types.Bool
 	case lexer.LArrow:
-		e.Type = c.optional(c.channel(e.X).Elem)
+		e.Type = c.universe.Optional(c.channel(e.X).Elem)
 	case lexer.Tilde:
 		e.Type = c.plain(e.X, arithmetic(want))
 		if isVector(e.Type) {
@@ -1707,7 +1571,7 @@ func (c *Checker) selectorCall(e *ast.Call, sel *ast.Selector, want *types.Type)
 func (c *Checker) method(e *ast.Call, sel *ast.Selector, want *types.Type) {
 	t := c.plain(sel.X, nil)
 	receiver := &ast.Receiver{Typed: ast.Typed{Type: t}, X: sel.X}
-	if f := deref(t).Field(sel.Name); f != nil && f.Type.Kind == types.FuncKind {
+	if f := types.StructOf(t).Field(sel.Name); f != nil && f.Type.Kind == types.FuncKind {
 		sel.X = receiver
 		c.indirect(e)
 		return
@@ -1739,7 +1603,7 @@ func (c *Checker) shadowedModule(x ast.Expr, name string) {
 }
 
 func (c *Checker) receiverFunc(t *types.Type, name string) *ast.Func {
-	named := deref(t)
+	named := types.StructOf(t)
 	if named.Origin != nil {
 		named = named.Origin
 	}
@@ -1932,7 +1796,7 @@ func (c *Checker) shrink(e *ast.Call) {
 	}
 	e.Type = types.Void
 	if name == "pop" {
-		e.Type = c.optional(t.Elem)
+		e.Type = c.universe.Optional(t.Elem)
 		return
 	}
 	c.integer(e.Args[1])
@@ -1992,7 +1856,7 @@ func (c *Checker) allocate(e *ast.Call, want *types.Type) {
 		c.fail(e.Args[0].Position(), "cannot allocate a value of type %s", t)
 	}
 	c.contain(t, "a pointer", e.Pos)
-	e.Type = c.pointer(t)
+	e.Type = c.universe.Pointer(t)
 }
 
 func (c *Checker) callFunc(e *ast.Call, fn *ast.Func, want *types.Type) {

@@ -17,14 +17,36 @@ const (
 	Vector
 )
 
-var Constraints = map[string]Constraint{
-	"Eq":      Eq,
-	"Ord":     Ord | Eq,
-	"Hash":    Hash | Eq,
-	"Number":  Number | Ord | Eq,
-	"Integer": Integer | Number | Ord | Eq | Hash,
-	"Float":   Float | Number | Ord | Eq,
-	"Vector":  Vector,
+var constraints = []struct {
+	name  string
+	bit   Constraint
+	bits  Constraint
+	holds func(*Type) bool
+}{
+	{"Eq", Eq, Eq, (*Type).Comparable},
+	{"Ord", Ord, Ord | Eq, (*Type).Ordered},
+	{"Hash", Hash, Hash | Eq, (*Type).Hashable},
+	{"Number", Number, Number | Ord | Eq, (*Type).Number},
+	{"Integer", Integer, Integer | Number | Ord | Eq | Hash, (*Type).Integer},
+	{"Float", Float, Float | Number | Ord | Eq, (*Type).Float},
+	{"Vector", Vector, Vector, func(t *Type) bool { return t.Kind == VectorKind }},
+}
+
+func ParseConstraint(name string) (Constraint, bool) {
+	for _, c := range constraints {
+		if c.name == name {
+			return c.bits, true
+		}
+	}
+	return 0, false
+}
+
+func ConstraintNames() []string {
+	names := make([]string, len(constraints))
+	for i, c := range constraints {
+		names[i] = c.name
+	}
+	return names
 }
 
 func NewParam(name string, c Constraint) *Type {
@@ -36,20 +58,8 @@ func (t *Type) has(c Constraint) bool {
 }
 
 func (t *Type) Satisfies(c Constraint) bool {
-	checks := []struct {
-		bit Constraint
-		ok  func() bool
-	}{
-		{Eq, t.Comparable},
-		{Ord, t.Ordered},
-		{Hash, t.Hashable},
-		{Number, t.Number},
-		{Integer, t.Integer},
-		{Float, t.Float},
-		{Vector, func() bool { return t.Kind == VectorKind }},
-	}
-	for _, check := range checks {
-		if c&check.bit != 0 && !check.ok() {
+	for _, k := range constraints {
+		if c&k.bit != 0 && !k.holds(t) {
 			return false
 		}
 	}

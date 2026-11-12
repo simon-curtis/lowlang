@@ -161,17 +161,22 @@ func privateBuiltins() []*Builtin {
 func typeBuiltins() []*Builtin {
 	value := []string{"value"}
 	var list []*Builtin
-	for _, t := range types.Numeric {
-		list = append(list, &Builtin{Name: t.Name, Kind: TypeBuiltin, Type: t, Params: value, handler: converter(t)})
-	}
-	list = append(list,
-		&Builtin{Name: "bool", Kind: TypeBuiltin, Type: types.Bool},
-		&Builtin{Name: "str", Kind: TypeBuiltin, Type: types.Str, Params: value, handler: bare((*Checker).strCall)},
-		&Builtin{Name: "ptr", Kind: TypeBuiltin},
-		&Builtin{Name: "chan", Kind: TypeBuiltin, construct: (*Checker).makeChan, resolve: (*Checker).resolveChan},
-	)
-	for _, t := range types.Vectors {
-		list = append(list, &Builtin{Name: t.Name, Kind: TypeBuiltin, Type: t, Params: value, handler: vectorCaster(t)})
+	for _, name := range types.BuiltinNames() {
+		t := types.Builtin(name)
+		entry := &Builtin{Name: name, Kind: TypeBuiltin, Type: t}
+		switch {
+		case name == types.RawName:
+			entry.resolve = (*Checker).resolveRaw
+		case name == types.ChanName:
+			entry.construct, entry.resolve = (*Checker).makeChan, (*Checker).resolveChan
+		case t.Kind == types.VectorKind:
+			entry.Params, entry.handler = value, vectorCaster(t)
+		case t == types.Str:
+			entry.Params, entry.handler = value, bare((*Checker).strCall)
+		case t.Number():
+			entry.Params, entry.handler = value, converter(t)
+		}
+		list = append(list, entry)
 	}
 	return list
 }
@@ -226,11 +231,6 @@ func argumentCount(least, most int) string {
 	return fmt.Sprintf("%d arguments", most)
 }
 
-func isTypeName(name string) bool {
-	b := builtinIndex[name]
-	return b != nil && b.Kind == TypeBuiltin
-}
-
 func (c *Checker) callable(name string) bool {
 	b := builtinIndex[name]
 	return (b != nil && !b.Shadowable) || c.declared(name)
@@ -274,7 +274,18 @@ func (c *Checker) resolveChan(t *ast.TypeName) *types.Type {
 	if len(t.Args) != 1 {
 		c.fail(t.Pos, "chan takes 1 type argument")
 	}
-	return c.chanOf(c.contained(t.Args[0], "a channel"))
+	return c.universe.Chan(c.contained(t.Args[0], "a channel"))
+}
+
+func (c *Checker) resolveRaw(t *ast.TypeName) *types.Type {
+	switch len(t.Args) {
+	case 0:
+		return c.universe.Raw(nil)
+	case 1:
+		return c.universe.Raw(c.contained(t.Args[0], "a ptr"))
+	}
+	c.fail(t.Pos, "ptr takes at most 1 type argument")
+	return nil
 }
 
 func (c *Checker) noneConstant(e *ast.Ident, _ *types.Type) {
@@ -283,7 +294,7 @@ func (c *Checker) noneConstant(e *ast.Ident, _ *types.Type) {
 
 func (c *Checker) nullConstant(e *ast.Ident, want *types.Type) {
 	e.Null = true
-	e.Type = c.raw(nil)
+	e.Type = c.universe.Raw(nil)
 	if w := unwrap(want); w != nil && w.Kind == types.RawKind {
 		e.Type = w
 	}
@@ -291,7 +302,7 @@ func (c *Checker) nullConstant(e *ast.Ident, want *types.Type) {
 
 func (c *Checker) bytesCall(e *ast.Call) {
 	c.expectType(e.Args[0], types.Str)
-	e.Type = c.slice(types.U8)
+	e.Type = c.universe.Slice(types.U8)
 }
 
 func (c *Checker) strCall(e *ast.Call) {
@@ -299,20 +310,20 @@ func (c *Checker) strCall(e *ast.Call) {
 	if t := c.plain(e.Args[0], nil); t.Kind == types.RawKind {
 		c.cString(e.Args[0], t)
 		e.Builtin = "from_cstr"
-	} else if t != c.slice(types.U8) {
+	} else if t != c.universe.Slice(types.U8) {
 		c.fail(e.Args[0].Position(), "str takes []u8 or ptr[u8], found %s", t)
 	}
 }
 
 func (c *Checker) cstrCall(e *ast.Call) {
 	c.expectType(e.Args[0], types.Str)
-	e.Type = c.raw(types.U8)
+	e.Type = c.universe.Raw(types.U8)
 }
 
 func (c *Checker) viewCall(e *ast.Call) {
 	elem := c.typedRaw(e.Args[0], e.Builtin)
 	c.integer(e.Args[1])
-	e.Type = c.slice(elem)
+	e.Type = c.universe.Slice(elem)
 }
 
 func (c *Checker) loadCall(e *ast.Call) {
@@ -329,7 +340,7 @@ func (c *Checker) pinCall(e *ast.Call) {
 	if t.Kind != types.PointerKind && t.Kind != types.SliceKind && t.Kind != types.MapKind && t != types.Str {
 		c.fail(e.Args[0].Position(), "pin takes a pointer, slice, map or str, found %s", t)
 	}
-	e.Type = c.raw(nil)
+	e.Type = c.universe.Raw(nil)
 }
 
 func (c *Checker) unpinCall(e *ast.Call) {
@@ -369,9 +380,9 @@ func (c *Checker) slicePtrCall(e *ast.Call) {
 	t := c.plain(e.Args[0], nil)
 	switch {
 	case t == types.Str:
-		e.Type = c.raw(types.U8)
+		e.Type = c.universe.Raw(types.U8)
 	case t.Kind == types.SliceKind:
-		e.Type = c.raw(t.Elem)
+		e.Type = c.universe.Raw(t.Elem)
 	default:
 		c.fail(e.Pos, "__slice_ptr requires a slice or str")
 	}
@@ -401,7 +412,7 @@ func (c *Checker) argcCall(e *ast.Call) {
 
 func (c *Checker) argvCall(e *ast.Call) {
 	c.expectType(e.Args[0], types.I64)
-	e.Type = c.raw(types.U8)
+	e.Type = c.universe.Raw(types.U8)
 }
 
 func (c *Checker) mulhiCall(e *ast.Call) {
@@ -444,13 +455,13 @@ func (c *Checker) extendByCall(e *ast.Call) {
 
 func (c *Checker) byteBuffer(e *ast.Call) {
 	r, ok := e.Args[0].(*ast.Ref)
-	if !ok || c.borrowInPlace(r) != c.slice(types.U8) {
+	if !ok || c.borrowInPlace(r) != c.universe.Slice(types.U8) {
 		c.fail(e.Pos, "%s needs a mut []u8", e.Builtin)
 	}
 }
 
 func (c *Checker) strViewCall(e *ast.Call) {
-	c.expectType(e.Args[0], c.slice(types.U8))
+	c.expectType(e.Args[0], c.universe.Slice(types.U8))
 	e.Type = types.Str
 }
 
@@ -495,7 +506,7 @@ func (c *Checker) spawnCall(e *ast.Call) {
 }
 
 func (c *Checker) currentCall(e *ast.Call) {
-	e.Type = c.raw(nil)
+	e.Type = c.universe.Raw(nil)
 }
 
 func (c *Checker) parkCall(e *ast.Call) {
@@ -503,7 +514,7 @@ func (c *Checker) parkCall(e *ast.Call) {
 }
 
 func (c *Checker) readyCall(e *ast.Call) {
-	c.expectType(e.Args[0], c.raw(nil))
+	c.expectType(e.Args[0], c.universe.Raw(nil))
 	e.Type = types.Void
 }
 
