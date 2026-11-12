@@ -1,42 +1,83 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
-func main() {
-	if len(os.Args) != 4 {
-		fmt.Fprintln(os.Stderr, "usage: tablegen unicode <ucd directory> <output directory>")
-		fmt.Fprintln(os.Stderr, "       tablegen properties <ucd directory> <output directory>")
-		fmt.Fprintln(os.Stderr, "       tablegen charset <index directory> <output directory>")
-		fmt.Fprintln(os.Stderr, "       tablegen entities <entities.json> <output directory>")
-		fmt.Fprintln(os.Stderr, "       tablegen pow10 - <output directory>")
-		fmt.Fprintln(os.Stderr, "       tablegen tzdata <zoneinfo directory with tzdata.zi> <output directory>")
-		os.Exit(2)
+type command struct {
+	name      string
+	arguments string
+	run       func(paths []string) error
+}
+
+var commands = []command{
+	{"unicode", "<ucd directory> <output directory>", sourceAndOutput(generateUnicode)},
+	{"properties", "<ucd directory> <output directory>", sourceAndOutput(generateProperties)},
+	{"charset", "<index directory> <output directory>", sourceAndOutput(generateCharset)},
+	{"entities", "<entities.json> <output directory>", sourceAndOutput(generateEntities)},
+	{"pow10", "<output directory>", outputOnly(generatePow10)},
+	{"tzdata", "<zoneinfo directory with tzdata.zi> <output directory>", sourceAndOutput(generateTzdata)},
+}
+
+func sourceAndOutput(generate func(source, output string) error) func([]string) error {
+	return func(paths []string) error {
+		return generate(paths[0], paths[1])
 	}
-	if err := run(os.Args[1], os.Args[2], os.Args[3]); err != nil {
+}
+
+func outputOnly(generate func(output string) error) func([]string) error {
+	return func(paths []string) error {
+		return generate(paths[0])
+	}
+}
+
+func (c command) parameters() int {
+	return len(strings.Fields(c.arguments))
+}
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		var usage usageError
+		if errors.As(err, &usage) {
+			fmt.Fprintln(os.Stderr, usage.Error())
+			os.Exit(2)
+		}
 		fmt.Fprintf(os.Stderr, "tablegen: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(command, source, output string) error {
-	switch command {
-	case "unicode":
-		return generateUnicode(source, output)
-	case "properties":
-		return generateProperties(source, output)
-	case "charset":
-		return generateCharset(source, output)
-	case "entities":
-		return generateEntities(source, output)
-	case "pow10":
-		return generatePow10(source, output)
-	case "tzdata":
-		return generateTzdata(source, output)
+type usageError struct{}
+
+func (usageError) Error() string {
+	var text strings.Builder
+	for i, c := range commands {
+		prefix := "       "
+		if i == 0 {
+			prefix = "usage:"
+		}
+		fmt.Fprintf(&text, "%s tablegen %s %s\n", prefix, c.name, c.arguments)
 	}
-	return fmt.Errorf("unknown command %q", command)
+	return strings.TrimSuffix(text.String(), "\n")
+}
+
+func run(arguments []string) error {
+	if len(arguments) == 0 {
+		return usageError{}
+	}
+	for _, c := range commands {
+		if c.name != arguments[0] {
+			continue
+		}
+		if len(arguments)-1 != c.parameters() {
+			return usageError{}
+		}
+		return c.run(arguments[1:])
+	}
+	return fmt.Errorf("unknown command %q", arguments[0])
 }
 
 type section struct {

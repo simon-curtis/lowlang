@@ -16,8 +16,6 @@ const (
 
 var IntKinds = []Kind{I64, I32, U64, U32, U16, U8}
 
-var FloatKinds = []Kind{F64, F32}
-
 var kindNames = [...]string{I64: "i64", I32: "i32", U64: "u64", U32: "u32", U16: "u16", U8: "u8", F64: "f64", F32: "f32", Bool: "bool"}
 
 var kindBits = [...]int{I64: 64, I32: 32, U64: 64, U32: 32, U16: 16, U8: 8, F64: 64, F32: 32, Bool: 1}

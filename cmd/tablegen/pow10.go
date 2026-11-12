@@ -17,7 +17,7 @@ type pow10Entry struct {
 	lo uint64
 }
 
-func generatePow10(source, output string) error {
+func generatePow10(output string) error {
 	return writeSections(output, pow10Sections())
 }
 
