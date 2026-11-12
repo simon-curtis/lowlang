@@ -1,4 +1,5 @@
 import std/io
+import std/sys
 
 /// A copyable view of an open file, made of its descriptor and the guard that coordinates its closing.
 ///
@@ -6,7 +7,7 @@ import std/io
 pub struct FileHandle {
     /// The operating system file descriptor.
     pub fd: i64
-    guard: *io.Guard
+    descriptor: sys.FdHandle
 }
 
 /// An open file that closes itself when dropped.
@@ -54,32 +55,52 @@ pub enum Whence {
     End
 }
 
-fn at_cwd() -> i64 {
-    -100
+fn handle(d: sys.FdHandle) -> FileHandle {
+    FileHandle { fd: d.fd, descriptor: d }
 }
 
-fn retry(r: i64) -> bool {
-    r == -4
+fn open_with(path: str, how: sys.Open, mode: i64) -> File ! io.Error {
+    let d = sys.open(path, how, mode)?
+    File { handle: handle(d) }
 }
 
-fn handle(fd: i64) -> FileHandle {
-    FileHandle { fd, guard: io.guard(fn() {}, fn() { __syscall(3, fd) }) }
-}
-
-fn open_with(path: str, flags: i64, mode: i64) -> File ! io.Error {
-    for {
-        let r = __syscall(257, at_cwd(), cstr(path), flags, mode)
-        if !retry(r) {
-            return File { handle: handle(io.syscall_result(r)?) }
-        }
+fn info_of(st: sys.Stat) -> Info {
+    Info {
+        size: st.size
+        mode: st.mode
+        dir: st.kind == sys.Kind.Dir
+        modified: st.modified
+        regular: st.kind == sys.Kind.Regular
+        link: st.kind == sys.Kind.Symlink
+        accessed: st.accessed
+        uid: st.uid
+        gid: st.gid
+        device: st.device
+        inode: st.inode
     }
+}
+
+/// Returns the path of the entry `name` inside the directory `dir`, without cleaning either part.
+///
+/// A single `/` separates them, and none is added when `dir` already ends with one. An empty `dir` gives `name` and an empty `name` gives `dir`.
+pub fn child_path(dir: str, name: str) -> str {
+    if dir.len == 0 {
+        return name
+    }
+    if name.len == 0 {
+        return dir
+    }
+    if dir[dir.len - 1] == '/' {
+        return "{dir}{name}"
+    }
+    "{dir}/{name}"
 }
 
 /// Opens the file at `path` for reading.
 ///
 /// Fails with `NotFound` when the file does not exist. Opening a directory succeeds and the first read fails with `IsDir`. The descriptor is closed when the returned `File` is dropped or closed.
 pub fn open(path: str) -> File ! io.Error {
-    open_with(path, 0x80000, 0o644)
+    open_with(path, Read, 0o644)
 }
 
 /// Creates the file at `path` for writing, or truncates it to zero length if it exists.
@@ -93,28 +114,28 @@ pub fn create(path: str) -> File ! io.Error {
 ///
 /// `mode` is filtered by the process umask and applies only when the file is created; an existing file keeps its mode.
 pub fn create_mode(path: str, mode: i64) -> File ! io.Error {
-    open_with(path, 0x80241, mode)
+    open_with(path, Truncate, mode)
 }
 
 /// Opens the file at `path` for appending, creating it with mode `0o644` if it does not exist.
 ///
 /// Every write goes to the end of the file regardless of `seek`. The file is write-only and existing content is kept.
 pub fn append(path: str) -> File ! io.Error {
-    open_with(path, 0x80441, 0o644)
+    open_with(path, Append, 0o644)
 }
 
 /// Opens the file at `path` for reading and writing, creating it with mode `0o644` if it does not exist.
 ///
 /// Existing content is kept and the position starts at the beginning.
 pub fn update(path: str) -> File ! io.Error {
-    open_with(path, 0x80042, 0o644)
+    open_with(path, Update, 0o644)
 }
 
 /// Sets the permission bits of the file at `path` to `mode`.
 ///
 /// Follows symbolic links. Unlike the creating functions, the umask does not filter `mode`. Fails with `NotFound` when `path` does not exist and `Denied` when the caller does not own the file.
 pub fn chmod(path: str, mode: i64) ! io.Error {
-    io.syscall_result(__syscall(268, at_cwd(), cstr(path), mode, 0))?
+    sys.chmod(path, mode)?
 }
 
 /// Closes the file.
@@ -128,26 +149,22 @@ pub fn close(f: File) {
 ///
 /// Later operations on `h` or its copies fail with `NotConnected`. The descriptor is released immediately, or when the last operation in flight returns. Closing twice does nothing.
 pub fn close_on(h: FileHandle) {
-    io.retire(h.guard)
+    sys.close_on(h.descriptor)
 }
 
 /// Tries to take an advisory `flock` lock on the file, exclusive when `exclusive` is `true` and shared otherwise.
 ///
 /// Returns `false` without waiting when another descriptor holds a conflicting lock. The lock is released by `unlock` or when the file is closed.
 pub fn try_lock(f: File, exclusive: bool) -> bool ! io.Error {
-    using lease = io.enter(f.handle.guard)?
-    let r = __syscall(73, f.handle.fd, if exclusive { 6 } else { 5 })
-    if r == -11 {
-        return false
-    }
-    io.syscall_result(r)?
-    true
+    using lease = sys.enter(f.handle.descriptor)?
+    let kind = if exclusive { sys.LockKind.Exclusive } else { sys.LockKind.Shared }
+    return sys.lock(f.handle.fd, kind)
 }
 
 /// Releases the advisory `flock` lock that this file holds.
 pub fn unlock(f: File) ! io.Error {
-    using lease = io.enter(f.handle.guard)?
-    io.syscall_result(__syscall(73, f.handle.fd, 8))?
+    using lease = sys.enter(f.handle.descriptor)?
+    sys.lock(f.handle.fd, sys.LockKind.Unlock)?
 }
 
 /// Reads up to `buf.len` bytes from the current position into `buf` and returns the count, or `0` at end of file.
@@ -161,13 +178,7 @@ pub fn read(f: File, buf: []u8) -> i64 ! io.Error {
 ///
 /// Fails with `NotConnected` when the file has been closed.
 pub fn read_on(h: FileHandle, buf: []u8) -> i64 ! io.Error {
-    using lease = io.enter(h.guard)?
-    for {
-        let r = __syscall(0, h.fd, __slice_ptr(buf), buf.len)
-        if !retry(r) {
-            return io.syscall_result(r)
-        }
-    }
+    return sys.read_on(h.descriptor, buf)
 }
 
 /// Writes a prefix of `data` at the current position and returns how many bytes were written, which can be fewer than `data.len`.
@@ -181,13 +192,7 @@ pub fn write(f: File, data: []u8) -> i64 ! io.Error {
 ///
 /// Fails with `NotConnected` when the file has been closed.
 pub fn write_on(h: FileHandle, data: []u8) -> i64 ! io.Error {
-    using lease = io.enter(h.guard)?
-    for {
-        let r = __syscall(1, h.fd, __slice_ptr(data), data.len)
-        if !retry(r) {
-            return io.syscall_result(r)
-        }
-    }
+    return sys.write_on(h.descriptor, data)
 }
 
 /// Writes all of `data` at the current position, repeating `write` until nothing remains.
@@ -201,11 +206,7 @@ pub fn write_all(f: File, data: []u8) ! io.Error {
 ///
 /// Fails with the first error a write returns, after which part of `data` may have been written.
 pub fn write_all_on(h: FileHandle, data: []u8) ! io.Error {
-    var rest = data
-    for rest.len > 0 {
-        let n = write_on(h, rest)?
-        rest = rest[n..]
-    }
+    sys.write_all_on(h.descriptor, data)?
 }
 
 /// Writes the bytes of `text` to the file.
@@ -219,71 +220,51 @@ pub fn write_str(f: File, text: str) ! io.Error {
 ///
 /// `offset` can be negative. A position past the end is allowed; a later write extends the file with zeros. Fails with `Invalid` when the resulting position would be negative.
 pub fn seek(f: File, offset: i64, from: Whence) -> i64 ! io.Error {
-    using lease = io.enter(f.handle.guard)?
-    let whence = match from {
-        Start => 0
-        Current => 1
-        End => 2
+    using lease = sys.enter(f.handle.descriptor)?
+    let origin = match from {
+        Start => sys.Seek.FromStart
+        Current => sys.Seek.FromCurrent
+        End => sys.Seek.FromEnd
     }
-    io.syscall_result(__syscall(8, f.handle.fd, offset, whence))
+    return sys.seek(f.handle.fd, offset, origin)
 }
 
 /// Flushes the file's data and metadata to the storage device and returns once the device has accepted them.
 pub fn sync(f: File) ! io.Error {
-    using lease = io.enter(f.handle.guard)?
-    io.syscall_result(__syscall(74, f.handle.fd))?
+    using lease = sys.enter(f.handle.descriptor)?
+    sys.fsync(f.handle.fd)?
 }
 
 /// Sets the file's size to `size` bytes.
 ///
 /// A smaller `size` discards the tail and a larger one extends the file with zeros. The position does not change. Fails with `Invalid` when the file was not opened for writing.
 pub fn truncate(f: File, size: i64) ! io.Error {
-    using lease = io.enter(f.handle.guard)?
-    io.syscall_result(__syscall(77, f.handle.fd, size))?
-}
-
-fn decode_stat(buf: []u8) -> Info {
-    let mode = io.le32(buf, 24)
-    let kind = mode & 0xF000
-    Info {
-        size: io.le64(buf, 48)
-        mode: mode & 0xFFF
-        dir: kind == 0x4000
-        modified: io.le64(buf, 88)
-        regular: kind == 0x8000
-        link: kind == 0xA000
-        accessed: io.le64(buf, 72)
-        uid: io.le32(buf, 28)
-        gid: io.le32(buf, 32)
-        device: io.le64(buf, 0)
-        inode: io.le64(buf, 8)
-    }
+    using lease = sys.enter(f.handle.descriptor)?
+    sys.ftruncate(f.handle.fd, size)?
 }
 
 /// Returns the metadata of the open file.
 ///
 /// Fails with `NotConnected` when the file has been closed.
 pub fn info(f: File) -> Info ! io.Error {
-    using lease = io.enter(f.handle.guard)?
-    let buf = io.buffer(144)
-    io.syscall_result(__syscall(5, f.handle.fd, __slice_ptr(buf)))?
-    decode_stat(buf)
+    using lease = sys.enter(f.handle.descriptor)?
+    let st = sys.fstat(f.handle.fd)?
+    info_of(st)
 }
 
 /// Returns the metadata of the file at `path`, following symbolic links.
 ///
 /// Fails with `NotFound` when `path` does not exist, including when it is a dangling link. See `lstat` to inspect a link itself.
 pub fn stat(path: str) -> Info ! io.Error {
-    let buf = io.buffer(144)
-    io.syscall_result(__syscall(262, at_cwd(), cstr(path), __slice_ptr(buf), 0))?
-    decode_stat(buf)
+    let st = sys.stat(path, true)?
+    info_of(st)
 }
 
 /// Returns whether `path` exists.
 ///
 /// Follows symbolic links, so a dangling link gives `false`. Any error, including a denied lookup, gives `false`.
 pub fn exists(path: str) -> bool {
-    __syscall(21, cstr(path), 0) == 0
+    sys.access(path, Present)
 }
 
 /// Returns the entire contents of the file at `path`.
@@ -353,26 +334,30 @@ pub fn write_text_mode(path: str, text: str, mode: i64) ! io.Error {
 ///
 /// A symbolic link is removed, not its target. Fails with `NotFound` when `path` does not exist and `IsDir` when it is a directory; see `remove_dir` and `remove_all`.
 pub fn remove(path: str) ! io.Error {
-    io.syscall_result(__syscall(263, at_cwd(), cstr(path), 0))?
+    sys.unlink(path)?
 }
 
 /// Removes the empty directory at `path`.
 ///
 /// Fails with `NotEmpty` when the directory has entries, `NotDir` when `path` is not a directory and `NotFound` when it does not exist.
 pub fn remove_dir(path: str) ! io.Error {
-    io.syscall_result(__syscall(263, at_cwd(), cstr(path), 0x200))?
+    sys.rmdir(path)?
 }
 
 /// Removes the file, symbolic link or directory tree at `path`.
 ///
 /// Succeeds when `path` does not exist. Directory contents are removed recursively and symbolic links are removed without being followed.
 pub fn remove_all(path: str) ! io.Error {
-    let r = __syscall(263, at_cwd(), cstr(path), 0)
-    if r == 0 || r == -2 {
-        return
+    var directory = false
+    sys.unlink(path) catch {
+        NotFound => {}
+        IsDir => {
+            directory = true
+        }
+        e => fail e
     }
-    if r != -21 {
-        fail io.errno(-r)
+    if !directory {
+        return
     }
     for name in list(path)? {
         remove_all("{path}/{name}")?
@@ -380,30 +365,11 @@ pub fn remove_all(path: str) ! io.Error {
     remove_dir(path)?
 }
 
-/// Creates a private directory under `/tmp` and returns its path.
-///
-/// The name is `prefix` followed by a random decimal number and the mode is `0o700`. Fails with `Exists` after 16 name collisions. The caller removes the directory; see `temp_dir_pattern` to choose the parent.
-pub fn temp_dir(prefix: str) -> str ! io.Error {
-    let suffix = io.buffer(8)
-    for _ in 0..16 {
-        io.syscall_result(__syscall(318, __slice_ptr(suffix), suffix.len, 0))?
-        let path = "/tmp/{prefix}{io.le64(suffix, 0) & 0x7FFFFFFFFFFFFFFF}"
-        let r = __syscall(258, at_cwd(), cstr(path), 0x1C0)
-        if r == 0 {
-            return path
-        }
-        if r != -17 {
-            fail io.errno(-r)
-        }
-    }
-    fail Exists
-}
-
 /// Renames the entry `from` to `to`.
 ///
 /// An existing `to` is replaced atomically, except that a directory can only replace an empty directory. Fails with an `Os` error when the two paths are on different file systems.
 pub fn rename(from: str, to: str) ! io.Error {
-    io.syscall_result(__syscall(264, at_cwd(), cstr(from), at_cwd(), cstr(to)))?
+    sys.rename(from, to)?
 }
 
 /// Creates the directory `path` with mode `0o755`, filtered by the process umask.
@@ -417,7 +383,7 @@ pub fn mkdir(path: str) ! io.Error {
 ///
 /// Fails with `Exists` when `path` exists and `NotFound` when its parent does not.
 pub fn mkdir_mode(path: str, mode: i64) ! io.Error {
-    io.syscall_result(__syscall(258, at_cwd(), cstr(path), mode))?
+    sys.mkdir(path, mode)?
 }
 
 /// Creates the directory `path` and every missing parent, with mode `0o755` filtered by the process umask.
@@ -438,9 +404,9 @@ pub fn mkdir_all_mode(path: str, mode: i64) ! io.Error {
 }
 
 fn make_missing(path: str, mode: i64) ! io.Error {
-    let r = __syscall(258, at_cwd(), cstr(path), mode)
-    if r != -17 {
-        io.syscall_result(r)?
+    sys.mkdir(path, mode) catch {
+        Exists => {}
+        e => fail e
     }
 }
 
@@ -455,14 +421,6 @@ pub fn list(path: str) -> []str ! io.Error {
     names
 }
 
-fn entry_name(buf: []u8, from: i64) -> str {
-    var end = from
-    for buf[end] != 0 {
-        end += 1
-    }
-    str(buf[from..end])
-}
-
 /// Returns an `io.Stream` over the file.
 ///
 /// Closing the stream closes the file.
@@ -474,9 +432,5 @@ pub fn stream(f: File) -> io.Stream {
 ///
 /// Closing the stream closes the file. The stream is safe to copy and use from other green threads.
 pub fn stream_on(h: FileHandle) -> io.Stream {
-    io.Stream {
-        read: fn(buf) { read_on(h, buf) }
-        write: fn(data) { write_on(h, data) }
-        close: fn() { close_on(h) }
-    }
+    sys.stream_on(h.descriptor)
 }

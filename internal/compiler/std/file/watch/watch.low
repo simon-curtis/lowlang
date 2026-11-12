@@ -1,5 +1,6 @@
 import std/file
 import std/io
+import std/sys
 import std/text
 
 /// The kind of change an `Event` reports.
@@ -79,7 +80,7 @@ pub struct WatcherHandle {
     /// The inotify file descriptor.
     pub fd: i64
     state: *State
-    guard: *io.Guard
+    descriptor: sys.FdHandle
 }
 
 /// Watches files and directories for changes through inotify.
@@ -183,16 +184,6 @@ fn has(mask: i64, bit: i64) -> bool {
     mask & bit != 0
 }
 
-fn child_path(dir: str, name: str) -> str {
-    if name.len == 0 {
-        return dir
-    }
-    if dir[dir.len - 1] == '/' {
-        return "{dir}{name}"
-    }
-    "{dir}/{name}"
-}
-
 fn lock(s: *State) {
     __lock(mut s.lock)
 }
@@ -202,27 +193,23 @@ fn unlock(s: *State) {
 }
 
 fn poke(fd: i64) {
-    let r = __syscall(254, fd, cstr("/"), in_attrib())
-    if r >= 0 {
-        __syscall(255, fd, r)
-    }
+    let wd = sys.inotify_add(fd, "/", in_attrib()) catch { _ => return }
+    sys.inotify_remove(fd, wd) catch { _ => {} }
 }
 
-fn watcher_guard(fd: i64, s: *State) -> *io.Guard {
-    io.guard(fn() {
-        lock(s)
-        s.closed = true
-        unlock(s)
-        close(s.done)
-        poke(fd)
-    }, fn() { __syscall(3, fd) })
+fn wake_reader(fd: i64, s: *State) {
+    lock(s)
+    s.closed = true
+    unlock(s)
+    close(s.done)
+    poke(fd)
 }
 
 /// Returns a watcher that watches nothing yet, configured by `options`.
 ///
 /// Use `add` to choose the paths.
 pub fn create(options: Options) -> Watcher ! io.Error {
-    let fd = io.syscall_result(__syscall(294, 0x80800))?
+    let fd = sys.inotify_init()?
     let s = new(State {
         lock: 0
         targets: [:]
@@ -233,7 +220,8 @@ pub fn create(options: Options) -> Watcher ! io.Error {
         recursive: options.recursive
         mask: watch_mask(options)
     })
-    let view = WatcherHandle { fd, state: s, guard: watcher_guard(fd, s) }
+    let descriptor = sys.wrap_with(fd, fn() { wake_reader(fd, s) })
+    let view = WatcherHandle { fd, state: s, descriptor }
     Watcher { handle: view }
 }
 
@@ -277,7 +265,7 @@ pub fn stop(w: Watcher) {
 
 /// Stops the watcher that `h` views, as `stop` does.
 pub fn stop_on(h: WatcherHandle) {
-    io.retire(h.guard)
+    sys.close_on(h.descriptor)
 }
 
 /// Starts watching `path`.
@@ -289,7 +277,7 @@ pub fn add(w: Watcher, path: str) ! io.Error {
 
 /// Starts watching `path` through the handle `h`, as `add` does.
 pub fn add_on(h: WatcherHandle, path: str) ! io.Error {
-    using lease = io.enter(h.guard)?
+    using lease = sys.enter(h.descriptor)?
     track(h, path, true)?
 }
 
@@ -302,7 +290,7 @@ pub fn remove(w: Watcher, path: str) ! io.Error {
 
 /// Stops watching `path` and every watched path below it through the handle `h`, as `remove` does.
 pub fn remove_on(h: WatcherHandle, path: str) ! io.Error {
-    using lease = io.enter(h.guard)?
+    using lease = sys.enter(h.descriptor)?
     let wds = matching(h.state, path, true)
     if wds.len == 0 {
         fail NotFound
@@ -330,13 +318,12 @@ fn forget(h: WatcherHandle, wds: []i64) {
     }
     unlock(h.state)
     for wd in wds {
-        __syscall(255, h.fd, wd)
+        sys.inotify_remove(h.fd, wd) catch { _ => {} }
     }
 }
 
 fn track(h: WatcherHandle, path: str, root: bool) ! io.Error {
-    let r = __syscall(254, h.fd, cstr(path), h.state.mask)
-    let wd = io.syscall_result(r)?
+    let wd = sys.inotify_add(h.fd, path, h.state.mask)?
     lock(h.state)
     h.state.targets[wd] = Target { path, root }
     unlock(h.state)
@@ -348,11 +335,10 @@ fn track(h: WatcherHandle, path: str, root: bool) ! io.Error {
 fn track_children(h: WatcherHandle, path: str) ! io.Error {
     for entry in file.read_dir_info(path)? {
         if entry.dir && !entry.link {
-            track(h, child_path(path, entry.name), false) catch {
-                e => match e {
-                    NotFound => {}
-                    _ => fail e
-                }
+            let child = file.child_path(path, entry.name)
+            track(h, child, false) catch {
+                NotFound => {}
+                e => fail e
             }
         }
     }
@@ -414,7 +400,7 @@ fn event_of(t: Target, mask: i64, cookie: i64, name: str) -> Event? {
     some(Event {
         watched: t.path
         name
-        path: child_path(t.path, name)
+        path: file.child_path(t.path, name)
         kind
         dir: has(mask, in_isdir())
         cookie
@@ -522,16 +508,11 @@ fn refill(h: WatcherHandle) ! io.Error {
         if is_closed(h.state) {
             fail NotConnected
         }
-        let r = __syscall(0, h.fd, __slice_ptr(buf), buf.len)
-        if r == -11 {
-            wait_readable(h.fd)
-        } else if r != -4 {
-            let n = io.syscall_result(r)?
-            let events = decode(h, buf, n)
-            enqueue(h.state, events)
-            follow(h, events)?
-            return
-        }
+        let n = sys.read(h.fd, buf)?
+        let events = decode(h, buf, n)
+        enqueue(h.state, events)
+        follow(h, events)?
+        return
     }
 }
 
@@ -544,7 +525,7 @@ pub fn next(w: Watcher) -> Event ! io.Error {
 
 /// Returns the next event through the handle `h`, as `next` does.
 pub fn next_on(h: WatcherHandle) -> Event ! io.Error {
-    using lease = io.enter(h.guard)?
+    using lease = sys.enter(h.descriptor)?
     for {
         let ready = dequeue(h.state)
         match ready {

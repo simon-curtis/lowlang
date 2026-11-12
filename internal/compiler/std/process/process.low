@@ -1,6 +1,7 @@
-import std/file
 import std/io
 import std/os
+import signals = std/os/signal
+import std/sys
 import std/text
 
 /// Where one of a child's standard streams is connected.
@@ -39,8 +40,8 @@ pub struct Command {
 pub enum Exit {
     /// The process ended by itself with this exit status.
     Exited(code: i64)
-    /// A signal with this number ended the process.
-    Signaled(signal: i64)
+    /// This signal ended the process.
+    Signaled(signal: signals.Signal)
 }
 
 /// A copyable view of a started child process.
@@ -61,15 +62,14 @@ pub struct ChildHandle {
     ///
     /// Reads return `0` at end of output.
     pub stderr: io.Stream?
-    pidfd: i64
-    pidfd_guard: *io.Guard
+    pidfd: sys.FdHandle
     group: bool
     status: Exit?
 }
 
 /// The owner of a started child process.
 ///
-/// Dropping a child that has not been waited for kills it with signal 9, reaps it and closes its streams.
+/// Dropping a child that has not been waited for kills it with `Kill`, reaps it and closes its streams.
 pub struct Child {
     /// The shared view of the child.
     pub handle: *ChildHandle
@@ -86,24 +86,9 @@ pub struct Output {
     pub stderr: []u8
 }
 
-struct Fd {
-    fd: i64
-    open: bool = true
-    drop {
-        if open {
-            close_fd(fd)
-        }
-    }
-}
-
 struct Ends {
-    parent: Fd
-    child: Fd
-}
-
-struct End {
-    fd: i64
-    guard: *io.Guard
+    parent: sys.Fd
+    child: sys.Fd
 }
 
 struct Collected {
@@ -140,138 +125,62 @@ pub fn find(name: str) -> str? {
 }
 
 fn executable(path: str) -> bool {
-    let c = c_string(path)
-    if __syscall(21, __slice_ptr(c), 1) != 0 {
+    if !sys.access(path, sys.Access.Executable) {
         return false
     }
-    let found = file.stat(path) catch {
+    let found = sys.stat(path, true) catch {
         _ => return false
     }
-    !found.dir
-}
-
-fn c_string(s: str) -> []u8 {
-    var b = bytes(s)
-    push(mut b, 0)
-    b
-}
-
-fn pointers(strings: [][]u8) -> []ptr {
-    var out: []ptr = []
-    for s in strings {
-        push(mut out, __slice_ptr(s))
-    }
-    push(mut out, null)
-    out
-}
-
-fn close_fd(fd: i64) {
-    if fd >= 0 {
-        __syscall(3, fd)
-    }
-}
-
-fn shut(mut f: Fd) {
-    close_fd(f.fd)
-    f.open = false
-}
-
-fn keep(mut f: Fd) -> i64 {
-    f.open = false
-    f.fd
+    found.kind != sys.Kind.Dir
 }
 
 fn absent() -> Ends {
-    Ends { parent: Fd { fd: -1 }, child: Fd { fd: -1 } }
+    Ends { parent: sys.own(-1), child: sys.own(-1) }
 }
 
 fn piped(input: bool) -> Ends ! io.Error {
-    let fds = io.buffer(8)
-    io.syscall_result(__syscall(293, __slice_ptr(fds), 0x80000))?
-    let read = io.le32(fds, 0)
-    let write = io.le32(fds, 4)
+    let pair = sys.pipe(false)?
     using e = if input {
-        Ends { parent: Fd { fd: write }, child: Fd { fd: read } }
+        Ends { parent: sys.own(pair.second), child: sys.own(pair.first) }
     } else {
-        Ends { parent: Fd { fd: read }, child: Fd { fd: write } }
+        Ends { parent: sys.own(pair.first), child: sys.own(pair.second) }
     }
-    set_nonblocking(e.parent.fd)?
+    sys.set_nonblocking(e.parent.handle.fd)?
     e
-}
-
-fn set_nonblocking(fd: i64) ! io.Error {
-    let flags = io.syscall_result(__syscall(72, fd, 3))?
-    io.syscall_result(__syscall(72, fd, 4, flags | 0x800))?
 }
 
 fn ends(mode: Stdio, input: bool) -> Ends ! io.Error {
     match mode {
         Inherit => absent()
         Null => {
-            let null_path = c_string("/dev/null")
-            let fd = io.syscall_result(__syscall(257, -100, __slice_ptr(null_path), 0x80002, 0))?
-            Ends { parent: Fd { fd: -1 }, child: Fd { fd } }
+            let null_device = sys.open("/dev/null", sys.Open.ReadWrite, 0)?
+            Ends { parent: sys.own(-1), child: sys.adopt(null_device) }
         }
         Piped => piped(input)?
     }
 }
 
-fn read_fd(fd: i64, buf: []u8) -> i64 ! io.Error {
-    for {
-        let r = __syscall(0, fd, __slice_ptr(buf), buf.len)
-        if r == -11 {
-            wait_readable(fd)
-        } else if r != -4 {
-            return io.syscall_result(r)
-        }
-    }
-}
-
-fn write_fd(fd: i64, data: []u8) -> i64 ! io.Error {
-    for {
-        let r = __syscall(1, fd, __slice_ptr(data), data.len)
-        if r == -11 {
-            wait_writable(fd)
-        } else if r != -4 {
-            return io.syscall_result(r)
-        }
-    }
-}
-
-fn read_end(e: End, buf: []u8) -> i64 ! io.Error {
-    using lease = io.enter(e.guard)?
-    read_fd(e.fd, buf)
-}
-
-fn write_end(e: End, data: []u8) -> i64 ! io.Error {
-    using lease = io.enter(e.guard)?
-    write_fd(e.fd, data)
-}
-
-fn stream(fd: i64) -> io.Stream? {
-    if fd < 0 {
+fn stream(h: sys.FdHandle) -> io.Stream? {
+    if h.fd < 0 {
         return none
     }
-    let e = End { fd, guard: io.guard(fn() {}, fn() { close_fd(fd) }) }
-    some(io.Stream {
-        read: fn(buf) { read_end(e, buf) }
-        write: fn(data) { write_end(e, data) }
-        close: fn() { io.retire(e.guard) }
-    })
+    some(sys.stream_on(h))
 }
 
-fn environment(c: Command) -> [][]u8 {
-    var out: [][]u8 = []
+fn environment(c: Command) -> []str {
+    var out: []str = []
     for name, value in c.env ?? os.environment() {
-        push(mut out, c_string("{name}={value}"))
+        push(mut out, "{name}={value}")
     }
     out
 }
 
-fn redirect(fd: i64, target: i64) {
-    if fd >= 0 {
-        __syscall(33, fd, target)
+fn arguments(c: Command) -> []str {
+    var out: []str = [c.program]
+    for a in c.args {
+        push(mut out, a)
     }
+    out
 }
 
 /// Returns the `Child` that owns the process behind `h`, which kills and reaps it when dropped.
@@ -289,71 +198,40 @@ pub fn start(c: Command) -> Child ! io.Error {
 
 /// Starts the command and returns a view of the process.
 ///
-/// Resolves the program with `find`, creates the requested pipes and forks. Returns after the child has executed the program, parking the green thread while it waits for that. Fails with `NotFound` if the program is not found, with the system error if a pipe or the fork fails, and with the error of a failing `chdir` or `execve` in the child, such as `Denied`, `NotDir` or `NotFound`, in which case the child has been reaped. The caller must wait for the child with `wait_on` or hand the view to `adopt`.
+/// Resolves the program with `find`, creates the requested pipes and forks. Returns after the child has executed the program, parking the green thread while it waits for that. Fails with `NotFound` if the program is not found, with the system error if a pipe or the fork fails or the child's report cannot be read, and with the error of a failing `chdir` or `execve` in the child, such as `Denied`, `NotDir` or `NotFound`, in which case the child has been reaped. The caller must wait for the child with `wait_on` or hand the view to `adopt`.
 pub fn start_handle(c: Command) -> *ChildHandle ! io.Error {
     let path = find(c.program) ?? ""
     if path.len == 0 {
         fail NotFound
     }
-    let path_c = c_string(path)
-    var arg_strings: [][]u8 = [c_string(c.program)]
-    for a in c.args {
-        push(mut arg_strings, c_string(a))
-    }
-    let env_strings = environment(c)
-    let argv = pointers(arg_strings)
-    let envp = pointers(env_strings)
-    let dir_c = c_string(c.dir)
+    let argv = arguments(c)
+    let envp = environment(c)
     using var input = ends(c.stdin, true)?
     using var output = ends(c.stdout, false)?
     using var errors = ends(c.stderr, false)?
-    using var report = piped(false)?
-    let code = io.buffer(4)
-    let has_dir = c.dir.len > 0
-    let group = c.group
-    let pid = __syscall(57)
-    if pid == 0 {
-        if group {
-            __syscall(109, 0, 0)
+    let spawned = sys.fork_exec(path, argv, envp, c.dir, c.group, input.child.handle.fd, output.child.handle.fd, errors.child.handle.fd)?
+    sys.close(input.child)
+    sys.close(output.child)
+    sys.close(errors.child)
+    let opened = sys.pidfd_open(spawned.pid) catch { _ => -1 }
+    let pidfd = sys.wrap(opened)
+    let stdin = stream(sys.detach(mut input.parent))
+    let stdout = stream(sys.detach(mut output.parent))
+    let stderr = stream(sys.detach(mut errors.parent))
+    let handle = new(ChildHandle { pid: spawned.pid, stdin, stdout, stderr, pidfd, group: c.group, status: none })
+    match spawned.failure {
+        some(e) => {
+            using failed = adopt(handle)
+            fail e
         }
-        redirect(input.child.fd, 0)
-        redirect(output.child.fd, 1)
-        redirect(errors.child.fd, 2)
-        var r = 0
-        if has_dir {
-            r = __syscall(80, __slice_ptr(dir_c))
-        }
-        if r == 0 {
-            r = __syscall(59, __slice_ptr(path_c), __slice_ptr(argv), __slice_ptr(envp))
-        }
-        io.set_le32(code, 0, -r)
-        __syscall(1, report.child.fd, __slice_ptr(code), 4)
-        __syscall(231, 127)
-    }
-    shut(mut input.child)
-    shut(mut output.child)
-    shut(mut errors.child)
-    shut(mut report.child)
-    if pid < 0 {
-        fail io.errno(-pid)
-    }
-    let n = read_fd(report.parent.fd, code) catch 0
-    let pidfd = __syscall(434, pid, 0)
-    let pidfd_guard = io.guard(fn() {}, fn() { close_fd(pidfd) })
-    let stdin = stream(keep(mut input.parent))
-    let stdout = stream(keep(mut output.parent))
-    let stderr = stream(keep(mut errors.parent))
-    let handle = new(ChildHandle { pid, stdin, stdout, stderr, pidfd, pidfd_guard, group, status: none })
-    if n == 4 {
-        using failed = adopt(handle)
-        fail io.errno(io.le32(code, 0))
+        none => {}
     }
     handle
 }
 
 fn dispose_on(c: *ChildHandle) {
     if c.status == none {
-        kill_on(c, 9) catch {
+        kill_on(c, signals.Signal.Kill) catch {
             _ => {}
         }
         wait_on(c) catch {
@@ -372,6 +250,14 @@ fn close_streams(c: *ChildHandle) {
     }
 }
 
+fn exit_of(r: sys.Reaped) -> Exit {
+    if r.exited {
+        return Exited(r.value)
+    }
+    let signal = signals.from_number(r.value) ?? signals.Signal.Other(r.value)
+    Signaled(signal)
+}
+
 /// Waits for the child owned by `c` to end and returns how it ended.
 ///
 /// Does the same as `wait_on` on its handle.
@@ -387,24 +273,13 @@ pub fn wait_on(c: *ChildHandle) -> Exit ! io.Error {
         some(done) => return done
         none => {}
     }
-    let info = io.buffer(128)
-    using lease = io.enter(c.pidfd_guard)?
-    if c.pidfd >= 0 {
-        wait_readable(c.pidfd)
+    using lease = sys.enter(c.pidfd)?
+    if c.pidfd.fd >= 0 {
+        wait_readable(c.pidfd.fd)
     }
-    for {
-        let r = if c.pidfd >= 0 { __syscall(247, 3, c.pidfd, __slice_ptr(info), 4, 0) } else { __syscall(247, 1, c.pid, __slice_ptr(info), 4, 0) }
-        if r == 0 {
-            break
-        }
-        if r != -4 {
-            fail io.errno(-r)
-        }
-    }
-    io.retire(c.pidfd_guard)
-    let how = io.le32(info, 8)
-    let value = io.le32(info, 24)
-    let status: Exit = if how == 1 { Exited(value) } else { Signaled(value) }
+    let reaped = sys.reap(c.pidfd.fd, c.pid)?
+    sys.close_on(c.pidfd)
+    let status = exit_of(reaped)
     c.status = some(status)
     status
 }
@@ -416,49 +291,41 @@ pub fn wait_exit_on(c: *ChildHandle) ! io.Error {
     if c.status != none {
         return
     }
-    using lease = io.enter(c.pidfd_guard)?
-    if c.pidfd >= 0 {
-        wait_readable(c.pidfd)
+    using lease = sys.enter(c.pidfd)?
+    if c.pidfd.fd >= 0 {
+        wait_readable(c.pidfd.fd)
         return
     }
-    let info = io.buffer(128)
-    for {
-        let r = __syscall(247, 1, c.pid, __slice_ptr(info), 0x01000004, 0)
-        if r == 0 {
-            return
-        }
-        if r != -4 {
-            fail io.errno(-r)
-        }
-    }
+    sys.wait_exit(c.pid)?
 }
 
-/// Sends the signal number `signal` to the child owned by `c`.
+/// Sends `signal` to the child owned by `c`.
 ///
 /// Does the same as `kill_on` on its handle.
-pub fn kill(c: Child, signal: i64) ! io.Error {
+pub fn kill(c: Child, signal: signals.Signal) ! io.Error {
     kill_on(c.handle, signal)?
 }
 
-/// Sends the signal number `signal` to the child behind `c`.
+/// Sends `signal` to the child behind `c`.
 ///
 /// Does nothing once the child has been waited for. Signals the whole process group for a command started with `group`. Does not wait for the child to end.
-pub fn kill_on(c: *ChildHandle, signal: i64) ! io.Error {
+pub fn kill_on(c: *ChildHandle, signal: signals.Signal) ! io.Error {
     if c.status != none {
         return
     }
+    let number = signals.number(signal)
     if c.group {
-        io.syscall_result(__syscall(62, -c.pid, signal))?
+        sys.kill(-c.pid, number)?
         return
     }
-    if c.pidfd >= 0 {
-        using lease = io.enter(c.pidfd_guard) catch {
+    if c.pidfd.fd >= 0 {
+        using lease = sys.enter(c.pidfd) catch {
             _ => return
         }
-        io.syscall_result(__syscall(424, c.pidfd, signal, 0, 0))?
+        sys.pidfd_send_signal(c.pidfd.fd, number)?
         return
     }
-    io.syscall_result(__syscall(62, c.pid, signal))?
+    sys.kill(c.pid, number)?
 }
 
 fn collect(s: io.Stream, into: *Collected) {
