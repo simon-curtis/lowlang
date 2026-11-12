@@ -138,6 +138,7 @@ func (g *generator) prologue() {
 		"fn wl_display_prepare_read(display: ptr) -> i32",
 		"fn wl_display_read_events(display: ptr) -> i32",
 		"fn wl_display_cancel_read(display: ptr)",
+		"fn wl_display_get_error(display: ptr) -> i32",
 		"fn wl_proxy_destroy(proxy: ptr)",
 		"fn wl_proxy_get_version(proxy: ptr) -> u32",
 		"fn wl_proxy_marshal_flags(proxy: ptr, opcode: u32, interface: ptr, version: u32, flags: u32, ...) -> ptr",
@@ -149,6 +150,7 @@ func (g *generator) prologue() {
 	g.Line("")
 	g.Line(`extern "c" {`)
 	g.Line("    fn malloc(n: i64) -> ptr")
+	g.Line("    fn free(p: ptr)")
 	g.Line("}")
 	g.Line("")
 	g.Line("extern struct WlInterface {")
@@ -166,8 +168,18 @@ func (g *generator) prologue() {
 	g.Line("    types: ptr")
 	g.Line("}")
 	g.Line("")
-	g.Line("fn wl_c_string(s: str) -> ptr[u8] {")
-	g.Line("    let p: ptr[u8] = malloc(s.len + 1)")
+	g.Line("struct WlMemory {")
+	g.Line("    blocks: []ptr")
+	g.Line("}")
+	g.Line("")
+	g.Line("fn wl_alloc(m: *WlMemory, n: i64) -> ptr {")
+	g.Line("    let p = malloc(n)")
+	g.Line("    m.blocks.push(p)")
+	g.Line("    p")
+	g.Line("}")
+	g.Line("")
+	g.Line("fn wl_c_string(m: *WlMemory, s: str) -> ptr[u8] {")
+	g.Line("    let p: ptr[u8] = wl_alloc(m, s.len + 1)")
 	g.Line("    let bytes = view(p, s.len + 1)")
 	g.Line("    for i in 0..s.len {")
 	g.Line("        bytes[i] = s[i]")
@@ -176,8 +188,8 @@ func (g *generator) prologue() {
 	g.Line("    p")
 	g.Line("}")
 	g.Line("")
-	g.Line("fn wl_types(entries: []ptr) -> ptr {")
-	g.Line("    let p: ptr[ptr] = malloc(8 * entries.len + 8)")
+	g.Line("fn wl_types(m: *WlMemory, entries: []ptr) -> ptr {")
+	g.Line("    let p: ptr[ptr] = wl_alloc(m, 8 * entries.len + 8)")
 	g.Line("    let slots = view(p, entries.len)")
 	g.Line("    for i in 0..entries.len {")
 	g.Line("        slots[i] = entries[i]")
@@ -185,29 +197,39 @@ func (g *generator) prologue() {
 	g.Line("    p")
 	g.Line("}")
 	g.Line("")
-	g.Line("fn wl_message(name: str, signature: str, types: ptr) -> WlMessage {")
-	g.Line("    WlMessage { name: wl_c_string(name), signature: wl_c_string(signature), types }")
+	g.Line("fn wl_message(m: *WlMemory, name: str, signature: str, types: ptr) -> WlMessage {")
+	g.Line("    WlMessage { name: wl_c_string(m, name), signature: wl_c_string(m, signature), types }")
 	g.Line("}")
 	g.Line("")
 }
 
 func (g *generator) table(all []Interface) {
 	g.Line("struct Interfaces {")
+	g.Line("    memory: *WlMemory")
 	for _, i := range all {
 		g.Line("    %s: ptr", i.Name)
 	}
 	g.Line("}")
 	g.Line("")
 	g.Line("fn interfaces() -> Interfaces {")
+	g.Line("    let memory = new(WlMemory { blocks: [] })")
 	g.Line("    let ifs = Interfaces {")
+	g.Line("        memory")
 	for _, i := range all {
-		g.Line("        %s: malloc(40)", i.Name)
+		g.Line("        %s: wl_alloc(memory, 40)", i.Name)
 	}
 	g.Line("    }")
 	for _, i := range all {
 		g.Line("    wl_fill_%s(ifs)", i.Name)
 	}
 	g.Line("    ifs")
+	g.Line("}")
+	g.Line("")
+	g.Line("fn release_interfaces(ifs: Interfaces) {")
+	g.Line("    for p in ifs.memory.blocks {")
+	g.Line("        free(p)")
+	g.Line("    }")
+	g.Line("    ifs.memory.blocks = []")
 	g.Line("}")
 	g.Line("")
 }
@@ -238,7 +260,7 @@ func signature(m Message) (string, []string) {
 }
 
 func (g *generator) messages(kind string, msgs []Message) {
-	g.Line("    let %s: ptr[WlMessage] = malloc(%d)", kind, 24*max(1, len(msgs)))
+	g.Line("    let %s: ptr[WlMessage] = wl_alloc(ifs.memory, %d)", kind, 24*max(1, len(msgs)))
 	if len(msgs) == 0 {
 		return
 	}
@@ -250,7 +272,7 @@ func (g *generator) messages(kind string, msgs []Message) {
 			list = fmt.Sprintf("[%s]", strings.Join(types, ", "))
 		}
 		g.Line("    let %s_types%d: []ptr = %s", kind, k, list)
-		g.Line("    %s_view[%d] = wl_message(%q, %q, wl_types(%s_types%d))", kind, k, m.Name, sig, kind, k)
+		g.Line("    %s_view[%d] = wl_message(ifs.memory, %q, %q, wl_types(ifs.memory, %s_types%d))", kind, k, m.Name, sig, kind, k)
 	}
 }
 
@@ -259,7 +281,7 @@ func (g *generator) fill(i Interface) {
 	g.messages("methods", i.Requests)
 	g.messages("events", i.Events)
 	g.Line("    let target: ptr[WlInterface] = ifs.%s", i.Name)
-	g.Line("    store(target, WlInterface { name: wl_c_string(%q), version: %d, method_count: %d, methods, event_count: %d, events })",
+	g.Line("    store(target, WlInterface { name: wl_c_string(ifs.memory, %q), version: %d, method_count: %d, methods, event_count: %d, events })",
 		i.Name, i.Version, len(i.Requests), len(i.Events))
 	g.Line("}")
 	g.Line("")
@@ -364,8 +386,8 @@ func (g *generator) listener(i Interface) {
 	g.Line("}")
 	g.Line("")
 	self := check.Ident(i.Name)
-	g.Line("fn %s_add_listener(%s: ptr, listener: %s, data: ptr) -> i32 {", i.Name, self, listener)
-	g.Line("    let copy: ptr[%s] = malloc(%d)", listener, 8*len(i.Events))
+	g.Line("fn %s_add_listener(ifs: Interfaces, %s: ptr, listener: %s, data: ptr) -> i32 {", i.Name, self, listener)
+	g.Line("    let copy: ptr[%s] = wl_alloc(ifs.memory, %d)", listener, 8*len(i.Events))
 	g.Line("    store(copy, listener)")
 	g.Line("    wl_proxy_add_listener(%s, copy, data)", self)
 	g.Line("}")

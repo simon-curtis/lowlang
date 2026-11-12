@@ -1,0 +1,276 @@
+import std/ui/scene
+
+struct Swapchain {
+    handle: VkSwapchainKHR = VkSwapchainKHR {}
+    format: i32 = 0
+    width: i64 = 0
+    height: i64 = 0
+    images: []VkImage = []
+    views: []VkImageView = []
+    finished: []VkSemaphore = []
+    stale: bool = true
+}
+
+struct Extent {
+    width: i64
+    height: i64
+}
+
+/// Opens the first Vulkan 1.3 device that offers dynamic rendering, synchronization2 and the swapchain extension, and has a graphics queue that can present to `s`, for drawing into the window with `present`.
+///
+/// The `Gpu` owns the Vulkan surface it makes from `s` and destroys it on release, so the window must outlive the `Gpu`. Offscreen targets work on it as on one from `open`. Fails with `NoDevice` when no device qualifies, and with `Vulkan` when a call fails, including `VK_ERROR_EXTENSION_NOT_PRESENT` when the instance lacks the windowing extension.
+pub fn open_for(s: Surface) -> Gpu ! Error {
+    let state = new(State {})
+    using g = Gpu { state }
+    build_state(state, ["VK_KHR_surface", surface_extension()], ["VK_KHR_swapchain"], s)?
+    g
+}
+
+/// Draws `s` into the next image of the window's swapchain and presents it, and uploads the rows of `atlas` that changed since the last call.
+///
+/// The swapchain is made on the first call, at the size of `s` in device pixels, and is made again when the size of `s` changes or when presentation reports that it is out of date or suboptimal. A scene of no pixels presents nothing. The call returns once the frame is queued for presentation. The `Gpu` keeps one atlas texture that mirrors the atlas it was last given. After the call `atlas` is marked clean.
+///
+/// Fails with `NoSurface` on a `Gpu` that `open` made.
+pub fn present(g: Gpu, s: scene.Scene, mut atlas: scene.Atlas) ! Error {
+    let state = g.state
+    if state.surface.handle == 0 {
+        fail NoSurface
+    }
+    if s.width < 1 || s.height < 1 {
+        return
+    }
+    let frame = state.frames[state.next_frame]
+    wait_frame(state.device, frame)?
+    let index = acquire_image(state, frame, s.width, s.height)? ?? return
+    let chain = state.swapchain
+    let pipelines = pipelines_for(state, chain.format)?
+    ensure_atlas(state, atlas.size)?
+    let band = atlas_band(state, atlas)
+    write_instances(state, frame, s)?
+    stage_atlas(state, frame, atlas, band)?
+    record_swapchain(state, frame, chain, index, pipelines, s, atlas, band)?
+    submit_swapchain(state, frame, chain.finished[index])?
+    state.next_frame = (state.next_frame + 1) % state.frames.len
+    state.atlas_ready = true
+    scene.clean(mut atlas)
+    queue_present(state, chain, index)?
+}
+
+fn acquire_image(s: *State, f: *Frame, width: i64, height: i64) -> u32? ! Error {
+    for attempt in 0..3 {
+        if !ensure_swapchain(s, width, height)? {
+            return none
+        }
+        var index: u32 = 0
+        let result = vkAcquireNextImageKHR(s.device.handle, s.swapchain.handle, 30000000000, f.acquired, VkFence {}, mut index)
+        if result == VK_SUCCESS() {
+            return index
+        }
+        if result == VK_SUBOPTIMAL_KHR() {
+            s.swapchain.stale = true
+            return index
+        }
+        if result != VK_ERROR_OUT_OF_DATE_KHR() {
+            fail Vulkan("vkAcquireNextImageKHR", result)
+        }
+        s.swapchain.stale = true
+    }
+    fail Vulkan("vkAcquireNextImageKHR", VK_ERROR_OUT_OF_DATE_KHR())
+}
+
+fn ensure_swapchain(s: *State, width: i64, height: i64) -> bool ! Error {
+    var caps = VkSurfaceCapabilitiesKHR {}
+    check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s.device.physical, s.surface, mut caps), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")?
+    let extent = swapchain_extent(caps, width, height)
+    if extent.width < 1 || extent.height < 1 {
+        return false
+    }
+    let chain = s.swapchain
+    let current = !chain.stale && chain.width == extent.width && chain.height == extent.height
+    if !current {
+        build_swapchain(s, caps, extent)?
+    }
+    true
+}
+
+fn swapchain_extent(caps: VkSurfaceCapabilitiesKHR, width: i64, height: i64) -> Extent {
+    if caps.currentExtent.width != 0xFFFFFFFF {
+        return Extent { width: i64(caps.currentExtent.width), height: i64(caps.currentExtent.height) }
+    }
+    Extent {
+        width: clamp(width, i64(caps.minImageExtent.width), i64(caps.maxImageExtent.width))
+        height: clamp(height, i64(caps.minImageExtent.height), i64(caps.maxImageExtent.height))
+    }
+}
+
+fn clamp(value: i64, low: i64, high: i64) -> i64 {
+    if value < low {
+        return low
+    }
+    if value > high {
+        return high
+    }
+    value
+}
+
+fn build_swapchain(s: *State, caps: VkSurfaceCapabilitiesKHR, extent: Extent) ! Error {
+    let d = s.device
+    check(vkDeviceWaitIdle(d.handle), "vkDeviceWaitIdle")?
+    let format = choose_surface_format(s)?
+    let old = s.swapchain
+    var images = caps.minImageCount + 1
+    if caps.maxImageCount > 0 && images > caps.maxImageCount {
+        images = caps.maxImageCount
+    }
+    var info = VkSwapchainCreateInfoKHR {
+        surface: s.surface
+        minImageCount: images
+        imageFormat: format.format
+        imageColorSpace: format.colorSpace
+        imageExtent: VkExtent2D { width: u32(extent.width), height: u32(extent.height) }
+        imageArrayLayers: 1
+        imageUsage: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT()
+        imageSharingMode: VK_SHARING_MODE_EXCLUSIVE()
+        preTransform: caps.currentTransform
+        compositeAlpha: composite_alpha(caps)
+        presentMode: VK_PRESENT_MODE_FIFO_KHR()
+        clipped: 1
+        oldSwapchain: old.handle
+    }
+    var handle = VkSwapchainKHR {}
+    check(vkCreateSwapchainKHR(d.handle, mut info, null, mut handle), "vkCreateSwapchainKHR")?
+    destroy_swapchain(d, old)
+    s.swapchain = Swapchain { handle, format: format.format, width: extent.width, height: extent.height }
+    build_swapchain_images(s)?
+    s.swapchain.stale = false
+}
+
+fn composite_alpha(caps: VkSurfaceCapabilitiesKHR) -> u32 {
+    let preferred: []u32 = [
+        VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR()
+        VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR()
+        VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR()
+        VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR()
+    ]
+    for bit in preferred {
+        if caps.supportedCompositeAlpha & bit != 0 {
+            return bit
+        }
+    }
+    VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR()
+}
+
+fn choose_surface_format(s: *State) -> VkSurfaceFormatKHR ! Error {
+    var count: u32 = 0
+    check(vkGetPhysicalDeviceSurfaceFormatsKHR(s.device.physical, s.surface, mut count, null), "vkGetPhysicalDeviceSurfaceFormatsKHR")?
+    let formats: []VkSurfaceFormatKHR = __make(count)
+    using var pins = new_pins()
+    let data = pins.hold_all(formats)
+    check(vkGetPhysicalDeviceSurfaceFormatsKHR(s.device.physical, s.surface, mut count, data), "vkGetPhysicalDeviceSurfaceFormatsKHR")?
+    for offered in formats[..count] {
+        let drawable = offered.format == VK_FORMAT_B8G8R8A8_UNORM() || offered.format == VK_FORMAT_R8G8B8A8_UNORM()
+        if drawable && offered.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR() {
+            return offered
+        }
+    }
+    fail Vulkan("vkGetPhysicalDeviceSurfaceFormatsKHR", VK_ERROR_FORMAT_NOT_SUPPORTED())
+}
+
+fn build_swapchain_images(s: *State) ! Error {
+    let d = s.device
+    var count: u32 = 0
+    check(vkGetSwapchainImagesKHR(d.handle, s.swapchain.handle, mut count, null), "vkGetSwapchainImagesKHR")?
+    let images: []VkImage = __make(count)
+    using var pins = new_pins()
+    let data = pins.hold_all(images)
+    check(vkGetSwapchainImagesKHR(d.handle, s.swapchain.handle, mut count, data), "vkGetSwapchainImagesKHR")?
+    for image in images[..count] {
+        s.swapchain.images.push(image)
+        let view = create_view(d, image, s.swapchain.format)?
+        s.swapchain.views.push(view)
+        let finished = create_semaphore(d)?
+        s.swapchain.finished.push(finished)
+    }
+}
+
+fn create_view(d: Device, image: VkImage, format: i32) -> VkImageView ! Error {
+    let range = VkImageSubresourceRange { aspectMask: VK_IMAGE_ASPECT_COLOR_BIT(), levelCount: 1, layerCount: 1 }
+    var info = VkImageViewCreateInfo { image, viewType: VK_IMAGE_VIEW_TYPE_2D(), format, subresourceRange: range }
+    var view = VkImageView {}
+    check(vkCreateImageView(d.handle, mut info, null, mut view), "vkCreateImageView")?
+    view
+}
+
+fn create_semaphore(d: Device) -> VkSemaphore ! Error {
+    var info = VkSemaphoreCreateInfo {}
+    var semaphore = VkSemaphore {}
+    check(vkCreateSemaphore(d.handle, mut info, null, mut semaphore), "vkCreateSemaphore")?
+    semaphore
+}
+
+fn destroy_swapchain(d: Device, chain: Swapchain) {
+    if chain.handle.handle == 0 {
+        return
+    }
+    for semaphore in chain.finished {
+        vkDestroySemaphore(d.handle, semaphore, null)
+    }
+    for view in chain.views {
+        vkDestroyImageView(d.handle, view, null)
+    }
+    vkDestroySwapchainKHR(d.handle, chain.handle, null)
+}
+
+fn record_swapchain(s: *State, f: *Frame, chain: Swapchain, index: u32, p: Pipelines, sc: scene.Scene, atlas: scene.Atlas, band: Band) ! Error {
+    using var pins = new_pins()
+    let cmd = f.command_buffer
+    check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer")?
+    var begin = VkCommandBufferBeginInfo { flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT() }
+    check(vkBeginCommandBuffer(cmd, mut begin), "vkBeginCommandBuffer")?
+    record_atlas_upload(mut pins, cmd, s, f, atlas, band)
+    let image = chain.images[index]
+    image_barrier(mut pins, cmd, image, VK_IMAGE_LAYOUT_UNDEFINED(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL(),
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT(), 0,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT(), VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT())
+    let attachment = Attachment { view: chain.views[index], width: chain.width, height: chain.height }
+    record_pass(mut pins, cmd, s, f, p, attachment, sc)
+    image_barrier(mut pins, cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL(), VK_IMAGE_LAYOUT_PRESENT_SRC_KHR(),
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT(), VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT(),
+        VK_PIPELINE_STAGE_2_NONE(), 0)
+    check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer")?
+}
+
+fn submit_swapchain(s: *State, f: *Frame, finished: VkSemaphore) ! Error {
+    using var pins = new_pins()
+    let command = VkCommandBufferSubmitInfo { commandBuffer: f.command_buffer }
+    let commands = pins.hold(command)
+    let wait = VkSemaphoreSubmitInfo { semaphore: f.acquired, stageMask: VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT() }
+    let waits = pins.hold(wait)
+    let signal = VkSemaphoreSubmitInfo { semaphore: finished, stageMask: VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT() }
+    let signals = pins.hold(signal)
+    let info = VkSubmitInfo2 {
+        waitSemaphoreInfoCount: 1
+        pWaitSemaphoreInfos: waits
+        commandBufferInfoCount: 1
+        pCommandBufferInfos: commands
+        signalSemaphoreInfoCount: 1
+        pSignalSemaphoreInfos: signals
+    }
+    let infos = pins.hold(info)
+    check(vkQueueSubmit2(s.device.queue, 1, infos, f.fence), "vkQueueSubmit2")?
+    f.submitted = true
+}
+
+fn queue_present(s: *State, chain: Swapchain, index: u32) ! Error {
+    using var pins = new_pins()
+    let waits = pins.hold(chain.finished[index])
+    let chains = pins.hold(chain.handle)
+    let indices = pins.hold(index)
+    var info = VkPresentInfoKHR { waitSemaphoreCount: 1, pWaitSemaphores: waits, swapchainCount: 1, pSwapchains: chains, pImageIndices: indices }
+    let result = vkQueuePresentKHR(s.device.queue, mut info)
+    if result == VK_SUBOPTIMAL_KHR() || result == VK_ERROR_OUT_OF_DATE_KHR() {
+        s.swapchain.stale = true
+        return
+    }
+    check(result, "vkQueuePresentKHR")?
+}

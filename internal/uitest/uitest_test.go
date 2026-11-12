@@ -439,9 +439,17 @@ func TestWindowsBuilds(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !strings.Contains(strings.ToLower(string(data)), "vulkan-1.dll") {
-				t.Error("the Windows executable does not import vulkan-1.dll")
+			library := windowsLibrary(name)
+			if !strings.Contains(strings.ToLower(string(data)), library) {
+				t.Errorf("the Windows executable does not import %s", library)
 			}
 		})
 	}
+}
+
+func windowsLibrary(name string) string {
+	if strings.HasPrefix(name, "win32_") || name == "wayland_window" || name == "wayland_reopen" {
+		return "user32.dll"
+	}
+	return "vulkan-1.dll"
 }
