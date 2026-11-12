@@ -1,0 +1,198 @@
+import std/io
+
+/// Space for the two-level lookup tables that decode canonical Huffman codes read least significant bit first.
+///
+/// Made by `tables`. Each table built into `pool` starts at the base `build_table` returns: `1 << root` entries indexed by the next `root` bits, followed by second-level blocks for codes longer than `root`. An entry holds the symbol in bits 8 and up and the code length in the low four bits. An entry that links to a second-level block holds its offset from the base in bits 8 and up, `0x80`, and the number of index bits in the low four. A single-symbol table has length zero and `0x40` set. An entry of `0` is a bit pattern no code uses.
+pub struct Tables {
+    /// The entries of every table built since the last `reset_tables`.
+    pub pool: []u32
+    count: []i64
+    next: []i64
+    codes: []i64
+    sub: []i64
+    used: i64
+}
+
+/// Returns table space for codes over alphabets of up to `max_symbols` symbols and first-level sizes up to `1 << max_root`, with room for `pool_size` entries that grows when needed.
+pub fn tables(max_symbols: i64, max_root: i64, pool_size: i64) -> *Tables {
+    new(Tables { pool: __make(pool_size), count: __make(16), next: __make(16), codes: __make(max_symbols), sub: __make(1 << max_root), used: 0 })
+}
+
+/// Forgets every table built so far so the pool can be reused.
+pub fn reset_tables(t: *Tables) {
+    t.used = 0
+}
+
+fn reserve_table(t: *Tables, size: i64) -> i64 {
+    let base = t.used
+    if base + size > t.pool.len {
+        var cap = t.pool.len * 2
+        for cap < base + size {
+            cap *= 2
+        }
+        let grown: []u32 = __make(cap)
+        __memmove(grown, t.pool[..base])
+        t.pool = grown
+    }
+    t.used = base + size
+    let pool = t.pool
+    for i in base..base + size {
+        pool[i] = 0
+    }
+    base
+}
+
+/// Returns the symbol when exactly one length in `lens` is nonzero, and `-1` otherwise.
+pub fn single_symbol(lens: []u8) -> i64 {
+    var found = -1
+    for sym, l in lens {
+        if l != 0 {
+            if found >= 0 {
+                return -1
+            }
+            found = sym
+        }
+    }
+    found
+}
+
+/// Builds a table of `1 << root` entries in which every bit pattern decodes to `sym` with no bits consumed, and returns its base.
+pub fn build_single(t: *Tables, sym: i64, root: i64) -> i64 {
+    let size = 1 << root
+    let base = reserve_table(t, size)
+    let entry = u32(sym) << 8 | 0x40
+    let pool = t.pool
+    for i in 0..size {
+        pool[base + i] = entry
+    }
+    base
+}
+
+/// Builds the decoding table for the canonical code with the lengths `lens` and returns its base in `pool`.
+///
+/// Lengths run from `0`, which marks an unused symbol, to `15`, and `root` is the number of bits the first level indexes. Fails with `Malformed` when the lengths over-subscribe the code. An incomplete code is accepted, and the bit patterns it leaves unused decode to the entry `0`.
+pub fn build_table(t: *Tables, lens: []u8, root: i64) -> i64 ! io.Error {
+    let count = t.count
+    let next = t.next
+    let codes = t.codes
+    let sub = t.sub
+    for i in 0..16 {
+        count[i] = 0
+    }
+    for l in lens {
+        count[l] += 1
+    }
+    count[0] = 0
+    var left = 1
+    for len in 1..16 {
+        left = (left << 1) - count[len]
+        if left < 0 {
+            fail Malformed
+        }
+    }
+    var code = 0
+    for len in 1..16 {
+        code = (code + count[len - 1]) << 1
+        next[len] = code
+    }
+    let size = 1 << root
+    let mask = size - 1
+    for i in 0..size {
+        sub[i] = 0
+    }
+    for sym, l in lens {
+        if l == 0 {
+            continue
+        }
+        let n = i64(l)
+        let reversed = reverse_bits(next[n], n)
+        next[n] += 1
+        codes[sym] = reversed
+        if n > root && n - root > sub[reversed & mask] {
+            sub[reversed & mask] = n - root
+        }
+    }
+    var total = size
+    for i in 0..size {
+        if sub[i] > 0 {
+            total += 1 << sub[i]
+        }
+    }
+    let base = reserve_table(t, total)
+    let pool = t.pool
+    var spare = size
+    for i in 0..size {
+        if sub[i] > 0 {
+            pool[base + i] = u32(spare) << 8 | 0x80 | u32(sub[i])
+            spare += 1 << sub[i]
+        }
+    }
+    for sym, l in lens {
+        if l == 0 {
+            continue
+        }
+        let n = i64(l)
+        let reversed = codes[sym]
+        let entry = u32(sym) << 8 | u32(n)
+        if n <= root {
+            var i = reversed
+            for i < size {
+                pool[base + i] = entry
+                i += 1 << n
+            }
+            continue
+        }
+        let link = pool[base + (reversed & mask)]
+        let start = base + i64(link >> 8)
+        let span = 1 << i64(link & 15)
+        var i = reversed >> root
+        for i < span {
+            pool[start + i] = entry
+            i += 1 << (n - root)
+        }
+    }
+    base
+}
+
+fn lookup(pool: []u32, base: i64, bits: u64, root: i64) -> u32 {
+    let e = pool[base + i64(bits & ((u64(1) << u64(root)) - 1))]
+    if e & 0x80 == 0 {
+        return e
+    }
+    pool[base + i64(e >> 8) + (i64(bits >> u64(root)) & ((1 << i64(e & 15)) - 1))]
+}
+
+/// Reads one symbol from `r` with the table at `base` in `pool`, built with the same `root`.
+///
+/// Fails with `Malformed` when the bits read are a pattern no code uses or the input ends first.
+pub fn symbol(r: *BitReader, pool: []u32, base: i64, root: i64) -> i64 ! io.Error {
+    if r.count >= 15 {
+        let e = lookup(pool, base, r.bits, root)
+        if e != 0 {
+            let n = i64(e & 15)
+            r.bits >>= u64(n)
+            r.count -= n
+            return i64(e >> 8)
+        }
+    }
+    symbol_slow(r, pool, base, root)
+}
+
+fn symbol_slow(r: *BitReader, pool: []u32, base: i64, root: i64) -> i64 ! io.Error {
+    if r.count < 15 {
+        refill(r, 0)?
+    }
+    var e = lookup(pool, base, r.bits, root)
+    var n = i64(e & 15)
+    if (e == 0 || n > r.count) && r.count < 15 {
+        refill(r, 15)?
+        e = lookup(pool, base, r.bits, root)
+        n = i64(e & 15)
+    }
+    if e == 0 || n > r.count {
+        fail Malformed
+    }
+    r.bits >>= u64(n)
+    r.count -= n
+    i64(e >> 8)
+}
