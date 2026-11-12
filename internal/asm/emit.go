@@ -65,8 +65,16 @@ func (e *textEmitter) padding(k int) {
 	following := &e.b.frags[k+1]
 	count := following.addr - f.addr - int64(f.fix)
 	if count > 0 {
-		e.out = appendNops(e.out, count, f.normal)
+		e.alignmentNops(count, f.normal)
 	}
+}
+
+func (e *textEmitter) alignmentNops(count int64, normal bool) {
+	if e.a.opts.ClangLayout {
+		e.out = appendClangLayout(e.out, count)
+		return
+	}
+	e.out = appendNops(e.out, count, normal)
 }
 
 func (e *textEmitter) applyFixups(base int64, end int32) {

@@ -6,6 +6,7 @@ import (
 
 type Options struct {
 	AlignBranches bool
+	ClangLayout   bool
 }
 
 type Object struct {

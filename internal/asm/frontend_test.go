@@ -1,6 +1,7 @@
 package asm_test
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"lowlang/internal/amd64"
 	"lowlang/internal/asm"
 	"lowlang/internal/target"
 )
@@ -182,6 +184,40 @@ blob:
 	.incbin "`+path+`"
 	.quad blob
 `)
+}
+
+func TestIncbinPaths(t *testing.T) {
+	names := []string{
+		`C:\Users\simon\blob.bin`,
+		"caf\u00e9 \u00a0 \u65e5\u672c.bin",
+		`say "hi".bin`,
+		"tab\there.bin",
+		`trailing\`,
+	}
+	for i, name := range names {
+		t.Run(fmt.Sprintf("path%d", i), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+			content := []byte{byte(i), 1, 2, 3}
+			if err := os.WriteFile(path, content, 0o644); err != nil {
+				t.Skipf("filesystem rejects %q: %v", name, err)
+			}
+			source := fmt.Sprintf("\t.section .rodata\nblob:\n\t.incbin %s\n\t.quad blob\n", amd64.QuoteString(path))
+			object, err := asm.Assemble(source, asm.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []byte
+			for _, s := range object.Sections {
+				if s.Name == ".rodata" {
+					got = s.Data
+				}
+			}
+			if !bytes.HasPrefix(got, content) {
+				t.Errorf("included %v, want prefix %v", got, content)
+			}
+			assertMatchesAs(t, source)
+		})
+	}
 }
 
 func TestIncbinMissingFile(t *testing.T) {

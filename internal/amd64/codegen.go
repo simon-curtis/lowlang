@@ -364,8 +364,27 @@ func (g *Generator) embedLabel(path string, digest uint64) string {
 		return l
 	}
 	g.dataLabels[l] = true
-	fmt.Fprintf(&g.data, "\t.p2align 4\n%s:\n\t.incbin %q\n", l, path)
+	fmt.Fprintf(&g.data, "\t.p2align 4\n%s:\n\t.incbin %s\n", l, QuoteString(path))
 	return l
+}
+
+func QuoteString(text string) string {
+	var out strings.Builder
+	out.WriteByte('"')
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case c == '"' || c == '\\':
+			out.WriteByte('\\')
+			out.WriteByte(c)
+		case c >= 0x20 && c < 0x7f:
+			out.WriteByte(c)
+		default:
+			fmt.Fprintf(&out, "\\%03o", c)
+		}
+	}
+	out.WriteByte('"')
+	return out.String()
 }
 
 func (g *Generator) messageLabel(s string) string {

@@ -8,7 +8,11 @@ const (
 func (a *assembler) layout(b *secBuilder) {
 	b.measureFrags()
 	b.classify()
-	for a.relaxSegment(b) {
+	if a.opts.ClangLayout {
+		a.relaxClang(b)
+	} else {
+		for a.relaxSegment(b) {
+		}
 	}
 	open := b.openFrag()
 	b.Size = open.addr + int64(open.fix)

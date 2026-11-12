@@ -4,6 +4,7 @@ import "encoding/binary"
 
 const (
 	maxNopSize       = 11
+	maxClangNopSize  = 10
 	maxNopRun        = 7
 	plainNop         = 0x90
 	shortJumpOverMax = 127
@@ -51,4 +52,15 @@ func appendJumpOverNops(out []byte, count int64) ([]byte, int64) {
 	out = append(out, opJmpNear)
 	out = binary.LittleEndian.AppendUint32(out, uint32(count))
 	return out, count
+}
+
+func appendClangLayout(out []byte, count int64) []byte {
+	longest := nopPatterns[maxClangNopSize-1]
+	for ; count > maxClangNopSize; count -= maxClangNopSize {
+		out = append(out, longest...)
+	}
+	if count > 0 {
+		out = append(out, nopPatterns[count-1]...)
+	}
+	return out
 }
