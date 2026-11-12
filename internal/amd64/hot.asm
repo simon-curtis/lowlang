@@ -15,20 +15,10 @@ rt_patch_list:
 
 	.text
 rt_hot_init:
-	sub rsp, 32
-	lea rax, [rip+rt_hot_handler]
-	mov [rsp], rax
-	mov qword ptr [rsp+8], 0x14000000
-	lea rax, [rip+rt_hot_restorer]
-	mov [rsp+16], rax
-	mov qword ptr [rsp+24], 0
 	mov edi, PATCH_SIGNAL
-	mov rsi, rsp
-	xor edx, edx
-	mov r10d, 8
-	mov eax, 13
-	syscall
-	add rsp, 32
+	lea rsi, [rip+rt_hot_handler]
+	mov edx, 0x14000000
+	call rt_sigaction
 	mov rdi, HOT_BASE
 	mov rsi, HOT_SIZE
 	mov edx, 5
@@ -60,7 +50,3 @@ rt_hot_handler:
 2:
 	mov qword ptr [rip+rt_patch_count], 0
 	ret
-
-rt_hot_restorer:
-	mov eax, 15
-	syscall

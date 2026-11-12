@@ -41,7 +41,7 @@
 	.set PAGE_SHIFT, 12
 	.set M_QUEUE, 256
 	.set M_TLS, 2304
-	.set M_TCB, 2328
+	.set M_TCB, M_TLS+24
 	.set M_SIZE, 4096
 
 	.set LOCK_SPIN_ROUNDS, 4
@@ -54,6 +54,7 @@
 	.set GQ_BATCH, 128
 	.set SPAWN_LOCAL, 16
 
+	.set CLOCK_MONOTONIC, 1
 	.set GC_OFF, 1
 	.set GC_STRESS, 2
 	.set TICK_ENTER, 0

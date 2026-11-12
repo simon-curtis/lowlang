@@ -84,10 +84,11 @@ rt_gc_stamp:
 	push r9
 	push r10
 	push r11
-	mov r8, rdi
-	call rt_now
+	mov edi, CLOCK_MONOTONIC
+	call rt_clock_nanos
+	mov rdi, [rsp+32]
 	lea rcx, [rip+rt_gc_ticks]
-	mov [rcx+8*r8], rax
+	mov [rcx+8*rdi], rax
 	pop r11
 	pop r10
 	pop r9

@@ -297,14 +297,6 @@ rt_os_stack:
 1:
 	jmp rt_panic_oom
 
-rt_os_m_prepare:
-	lea rax, [rbx+M_TCB]
-	mov [rax], rax
-	mov [rax+TLS_M], rbx
-	lea rcx, [rax+TLS_FLAG]
-	mov [rbx+M_FLAG], rcx
-	ret
-
 rt_os_m_start:
 	OS_ENTER
 	xor ecx, ecx
@@ -354,7 +346,7 @@ rt_os_init:
 	jmp rt_panic
 
 rt_os_tls:
-	call rt_os_m_prepare
+	call rt_tcb_init
 	mov rcx, [rip+rt_tls_slot]
 	mov qword ptr gs:[rcx], rax
 	mov rax, qword ptr gs:[TEB_STACK_BASE]
@@ -439,7 +431,7 @@ rt_os_nap:
 	OS_LEAVE
 	ret
 
-rt_now:
+rt_qpc_nanos:
 	push rbp
 	mov rbp, rsp
 	and rsp, -16
@@ -613,8 +605,8 @@ rt_vdso_init:
 
 	.globl rt_clock_nanos
 rt_clock_nanos:
-	cmp rdi, 1
-	je rt_now
+	cmp rdi, CLOCK_MONOTONIC
+	je rt_qpc_nanos
 	push rbp
 	mov rbp, rsp
 	and rsp, -16

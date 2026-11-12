@@ -14,6 +14,13 @@
 	cmp byte ptr fs:[TLS_FLAG], 0
 	.endm
 
+	.macro OS_M_PREPARE
+.if RT_DYNAMIC
+.else
+	call rt_os_g0_stack
+.endif
+	.endm
+
 	.macro TEB_ENTER_OS g, m
 	.endm
 

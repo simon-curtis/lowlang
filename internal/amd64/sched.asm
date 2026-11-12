@@ -888,6 +888,14 @@ rt_wakep_locked:
 	pop rbx
 	ret
 
+rt_tcb_init:
+	lea rax, [rbx+M_TCB]
+	mov [rax], rax
+	mov [rax+TLS_M], rbx
+	lea rcx, [rax+TLS_FLAG]
+	mov [rbx+M_FLAG], rcx
+	ret
+
 rt_newm:
 	push rbx
 	push r12
@@ -897,7 +905,8 @@ rt_newm:
 	mov qword ptr [rbx+M_STATE], IDLE
 	mov qword ptr [rbx+M_SPINNING], 1
 	lock inc qword ptr [rip+rt_nspinning]
-	call rt_os_m_prepare
+	OS_M_PREPARE
+	call rt_tcb_init
 	mov rcx, [rip+rt_nm]
 	lea rax, [rip+rt_allm]
 	mov [rax+8*rcx], rbx
@@ -1059,6 +1068,12 @@ rt_park_body:
 	jne 2f
 	call rt_set_idle
 	jmp rt_schedule
+1:
+	mov qword ptr [r12+G_TOKEN], 0
+	lea rdi, [r12+G_LOCK]
+	call rt_spin_unlock
+	mov rdi, r12
+	jmp rt_resume
 2:
 	call rt_set_idle
 3:
@@ -1069,16 +1084,6 @@ rt_park_body:
 	call rt_futex_wait
 	jmp 3b
 4:
-	mov rax, r12
-	jmp 9f
-1:
-	mov qword ptr [r12+G_TOKEN], 0
-	lea rdi, [r12+G_LOCK]
-	call rt_spin_unlock
-	mov rdi, r12
-	jmp rt_resume
-9:
-	mov r12, rax
 	mov edi, IDLE
 	call rt_m_running
 	mov qword ptr [r12+G_STATUS], G_RUNNING
@@ -1370,7 +1375,8 @@ rt_timer_insert:
 	mov r13, rsi
 	mov r14, rdx
 	mov r15, rcx
-	call rt_now
+	mov edi, CLOCK_MONOTONIC
+	call rt_clock_nanos
 	imul r12, r12, 1000000
 	add r12, rax
 	lea rdi, [rip+rt_timer_lock]
@@ -1476,7 +1482,8 @@ rt_timers_run:
 	push r13
 	push r14
 	push r15
-	call rt_now
+	mov edi, CLOCK_MONOTONIC
+	call rt_clock_nanos
 	mov r14, rax
 	xor r15d, r15d
 	lea rdi, [rip+rt_timer_lock]
@@ -1565,7 +1572,8 @@ rt_timer_timeout:
 	mov rax, -1
 	cmp rbx, -1
 	je 4f
-	call rt_now
+	mov edi, CLOCK_MONOTONIC
+	call rt_clock_nanos
 	mov rcx, rbx
 	sub rcx, rax
 	xor eax, eax

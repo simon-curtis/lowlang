@@ -43,6 +43,9 @@
 	cmp byte ptr [r11+TLS_FLAG], 0
 	.endm
 
+	.macro OS_M_PREPARE
+	.endm
+
 	.macro TEB_OS m
 	mov r11, [\m+M_OSBASE]
 	mov qword ptr gs:[TEB_STACK_BASE], r11

@@ -1,6 +1,5 @@
 	.section .tbss,"awT",@nobits
 	.p2align 3
-rt_tls:
 	.zero 24
 
 	.section .rodata
@@ -295,7 +294,9 @@ rt_os_stack:
 	pop rax
 	ret
 
-rt_os_m_prepare:
+.if RT_DYNAMIC
+.else
+rt_os_g0_stack:
 	mov rsi, G0_STACK
 	call rt_mmap_stack
 	mov rdi, rax
@@ -306,12 +307,8 @@ rt_os_m_prepare:
 	lea rax, [rdi+G0_STACK]
 	mov [rbx+M_G0TOP], rax
 	mov [rbx+M_G0SP], rax
-	lea rax, [rbx+M_TCB]
-	mov [rax], rax
-	mov [rax+TLS_M], rbx
-	lea rcx, [rax+TLS_FLAG]
-	mov [rbx+M_FLAG], rcx
 	ret
+.endif
 
 rt_os_m_start:
 .if RT_DYNAMIC
@@ -346,10 +343,7 @@ rt_os_m_start:
 .if RT_DYNAMIC
 rt_mstart_c:
 	mov rbx, rdi
-	mov qword ptr fs:[TLS_M], rbx
-	mov rax, qword ptr fs:[0]
-	add rax, TLS_FLAG
-	mov [rbx+M_FLAG], rax
+	call rt_os_tls
 	and rsp, -16
 	mov [rbx+M_G0TOP], rsp
 	mov [rbx+M_G0SP], rsp
@@ -409,11 +403,8 @@ rt_os_tls:
 	add rax, TLS_FLAG
 	mov [rbx+M_FLAG], rax
 .else
-	lea rsi, [rbx+M_TCB]
-	mov [rsi], rsi
-	mov [rsi+TLS_M], rbx
-	lea rax, [rsi+TLS_FLAG]
-	mov [rbx+M_FLAG], rax
+	call rt_tcb_init
+	mov rsi, rax
 	mov edi, 0x1002
 	mov eax, 158
 	syscall
@@ -425,20 +416,22 @@ rt_os_signals:
 	jmp rt_fault_init
 
 rt_fault_init:
+	mov edi, 11
+	lea rsi, [rip+rt_fault]
+	mov edx, 0x0C000004
+	call rt_sigaction
+	mov edi, 7
+	lea rsi, [rip+rt_fault]
+	mov edx, 0x0C000004
+	jmp rt_sigaction
+
+rt_sigaction:
 	sub rsp, 32
-	lea rax, [rip+rt_fault]
-	mov [rsp], rax
-	mov qword ptr [rsp+8], 0x0C000004
+	mov [rsp], rsi
+	mov [rsp+8], rdx
 	lea rax, [rip+rt_restorer]
 	mov [rsp+16], rax
 	mov qword ptr [rsp+24], 0
-	mov edi, 11
-	mov rsi, rsp
-	xor edx, edx
-	mov r10d, 8
-	mov eax, 13
-	syscall
-	mov edi, 7
 	mov rsi, rsp
 	xor edx, edx
 	mov r10d, 8
@@ -501,17 +494,6 @@ rt_os_nap:
 	xor esi, esi
 	mov eax, 35
 	syscall
-	ret
-
-rt_now:
-	sub rsp, 24
-	mov edi, 1
-	mov rsi, rsp
-	mov eax, 228
-	syscall
-	imul rax, [rsp], 1000000000
-	add rax, [rsp+8]
-	add rsp, 24
 	ret
 
 rt_poll_init:
@@ -664,9 +646,9 @@ rt_vdso_clock_name:
 	.asciz "__vdso_clock_gettime"
 
 	.text
-rt_seed_init:
+rt_auxv:
 	test rdi, rdi
-	jz 5f
+	jz 3f
 1:
 	mov rax, [rdi]
 	add rdi, 8
@@ -675,13 +657,22 @@ rt_seed_init:
 2:
 	mov rax, [rdi]
 	test rax, rax
-	jz 5f
-	cmp rax, 25
-	je 3f
+	jz 3f
+	cmp rax, rsi
+	je 4f
 	add rdi, 16
 	jmp 2b
 3:
-	mov rsi, [rdi+8]
+	xor eax, eax
+	ret
+4:
+	mov rax, [rdi+8]
+	ret
+
+rt_seed_init:
+	mov esi, 25
+	call rt_auxv
+	mov rsi, rax
 	test rsi, rsi
 	jz 5f
 	mov rax, [rsi]
@@ -709,23 +700,9 @@ rt_vdso_init:
 	push r13
 	push r14
 	push r15
-	test rdi, rdi
-	jz 9f
-1:
-	mov rax, [rdi]
-	add rdi, 8
-	test rax, rax
-	jnz 1b
-2:
-	mov rax, [rdi]
-	test rax, rax
-	jz 9f
-	cmp rax, 33
-	je 3f
-	add rdi, 16
-	jmp 2b
-3:
-	mov r8, [rdi+8]
+	mov esi, 33
+	call rt_auxv
+	mov r8, rax
 	test r8, r8
 	jz 9f
 	cmp dword ptr [r8], 0x464c457f
@@ -879,7 +856,10 @@ rt_vdso_init:
 
 	.globl rt_clock_nanos
 rt_clock_nanos:
-	sub rsp, 24
+	push rbp
+	mov rbp, rsp
+	sub rsp, 16
+	and rsp, -16
 	mov rsi, rsp
 	mov rax, [rip+rt_vdso_clock]
 	test rax, rax
@@ -894,9 +874,11 @@ rt_clock_nanos:
 	jnz 3f
 	imul rax, [rsp], 1000000000
 	add rax, [rsp+8]
-	add rsp, 24
+	mov rsp, rbp
+	pop rbp
 	ret
 3:
 	xor eax, eax
-	add rsp, 24
+	mov rsp, rbp
+	pop rbp
 	ret
