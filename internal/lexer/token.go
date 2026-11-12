@@ -33,6 +33,7 @@ const (
 	Match
 	Fail
 	Catch
+	Or
 	Struct
 	Mut
 	In
@@ -105,7 +106,7 @@ type spelling struct {
 var keywordSpellings = []spelling{
 	{"fn", Fn}, {"let", Let}, {"var", Var}, {"if", If}, {"else", Else}, {"for", For},
 	{"break", Break}, {"continue", Continue}, {"return", Return}, {"true", True}, {"false", False},
-	{"enum", Enum}, {"match", Match}, {"fail", Fail}, {"catch", Catch}, {"struct", Struct}, {"mut", Mut}, {"in", In}, {"import", Import},
+	{"enum", Enum}, {"match", Match}, {"fail", Fail}, {"catch", Catch}, {"or", Or}, {"struct", Struct}, {"mut", Mut}, {"in", In}, {"import", Import},
 	{"pub", Pub}, {"extern", Extern}, {"defer", Defer}, {"spawn", Spawn}, {"select", Select}, {"using", Using}, {"drop", Drop},
 }
 

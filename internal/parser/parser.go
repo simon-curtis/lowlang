@@ -742,6 +742,12 @@ func (p *Parser) pipe(x, y ast.Expr, pos diag.Pos) ast.Expr {
 	case *ast.Try:
 		y.X = p.pipe(x, y.X, pos)
 		return y
+	case *ast.Catch:
+		y.X = p.pipe(x, y.X, pos)
+		return y
+	case *ast.Or:
+		y.X = p.pipe(x, y.X, pos)
+		return y
 	case *ast.Call:
 		y.Args = append([]ast.Expr{x}, y.Args...)
 		y.Prepended = true
@@ -1018,6 +1024,9 @@ func (p *Parser) postfix(x ast.Expr) ast.Expr {
 		case lexer.Catch:
 			p.next()
 			x = p.catch(x, t.Pos)
+		case lexer.Or:
+			p.next()
+			x = &ast.Or{X: x, Fallback: p.unary(false), Pos: t.Pos}
 		default:
 			return x
 		}
@@ -1038,7 +1047,13 @@ func (p *Parser) catch(x ast.Expr, pos diag.Pos) *ast.Catch {
 		c.Arms = p.arms()
 		return c
 	}
-	c.Fallback = p.unary(false)
+	m := p.unary(false)
+	switch m.(type) {
+	case *ast.Ident, *ast.Selector:
+	default:
+		p.fail(m.Position(), "catch takes { arms } or a variant or function that maps the error; use or for a fallback")
+	}
+	c.Map = &ast.Call{Fn: m, Args: []ast.Expr{&ast.Subject{Pos: m.Position()}}, Pos: m.Position()}
 	return c
 }
 

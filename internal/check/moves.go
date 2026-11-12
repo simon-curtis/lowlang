@@ -225,7 +225,7 @@ func (m *mover) root(e ast.Expr) *ast.Local {
 
 func branching(e ast.Expr) bool {
 	switch e.(type) {
-	case *ast.If, *ast.Match, *ast.Block, *ast.Select, *ast.Catch:
+	case *ast.If, *ast.Match, *ast.Block, *ast.Select, *ast.Catch, *ast.Or:
 		return true
 	}
 	return false
@@ -237,7 +237,7 @@ func producer(e ast.Expr) bool {
 		return producer(e.X)
 	case *ast.Call:
 		return e.Builtin == builtin.None
-	case *ast.StructLit, *ast.Try, *ast.Catch, *ast.If, *ast.Match, *ast.Block, *ast.Select:
+	case *ast.StructLit, *ast.Try, *ast.Catch, *ast.Or, *ast.If, *ast.Match, *ast.Block, *ast.Select:
 		return true
 	}
 	return false
@@ -332,10 +332,13 @@ func (m *mover) expr(e ast.Expr, ctx moveContext) {
 		m.arms(e.Arms, ctx)
 	case *ast.Try:
 		m.expr(e.X, borrow)
+	case *ast.Or:
+		m.expr(e.X, borrow)
+		m.branches(func() {}, func() { m.expr(e.Fallback, ctx) })
 	case *ast.Catch:
 		m.expr(e.X, borrow)
-		if e.Fallback != nil {
-			m.branches(func() {}, func() { m.expr(e.Fallback, ctx) })
+		if e.Map != nil {
+			m.branches(func() {}, func() { m.expr(e.Map, take) })
 			return
 		}
 		m.branches(append([]func(){func() {}}, m.armRuns(e.Arms, ctx)...)...)

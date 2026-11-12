@@ -543,8 +543,15 @@ type Try struct {
 
 type Catch struct {
 	Typed
+	X    Expr
+	Arms []*Arm
+	Map  *Call
+	Pos  diag.Pos
+}
+
+type Or struct {
+	Typed
 	X        Expr
-	Arms     []*Arm
 	Fallback Expr
 	Pos      diag.Pos
 }
@@ -602,6 +609,7 @@ func (n *If) Position() diag.Pos          { return n.Pos }
 func (n *Match) Position() diag.Pos       { return n.Pos }
 func (n *Try) Position() diag.Pos         { return n.Pos }
 func (n *Catch) Position() diag.Pos       { return n.Pos }
+func (n *Or) Position() diag.Pos          { return n.Pos }
 
 func (*Let) stmt()      {}
 func (*Assign) stmt()   {}
@@ -642,3 +650,4 @@ func (*Subject) expr()   {}
 func (*Receiver) expr()  {}
 func (*Try) expr()       {}
 func (*Catch) expr()     {}
+func (*Or) expr()        {}

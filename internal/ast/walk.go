@@ -153,6 +153,11 @@ func (w walker) node(n Node) {
 	case *Catch:
 		w.expr(n.X)
 		w.arms(n.Arms)
+		if n.Map != nil {
+			w.expr(n.Map)
+		}
+	case *Or:
+		w.expr(n.X)
 		w.expr(n.Fallback)
 	case *Receiver:
 		w.expr(n.X)

@@ -116,6 +116,7 @@
 [
   "fail"
   "catch"
+  "or"
 ] @keyword.exception
 
 [

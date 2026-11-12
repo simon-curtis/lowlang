@@ -819,6 +819,8 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		return b.try(e)
 	case *ast.Catch:
 		return b.catch(e)
+	case *ast.Or:
+		return b.handle(e.X, e.Type, func([]*Value) []*Value { return b.value(e.Fallback, e.Type) })
 	}
 	return nil
 }
@@ -1180,36 +1182,49 @@ func (b *builder) bindPattern(p *ast.Pattern, subject []*Value) {
 }
 
 func (b *builder) try(e *ast.Try) []*Value {
-	r := e.X.TypeOf()
-	words := b.value(e.X, r)
+	return b.propagate(e.X, func(err []*Value) []*Value { return err })
+}
+
+func (b *builder) propagate(x ast.Expr, mapError func([]*Value) []*Value) []*Value {
+	r := x.TypeOf()
+	words := b.value(x, r)
 	ok := b.newBlock()
 	failed := b.newBlock()
 	b.branch(words[0], failed, ok)
 	b.enter(failed)
+	mapped := mapError(words[1 : 1+r.Err.Size()])
 	b.runDefers(0)
-	b.fail(words[1 : 1+r.Err.Size()])
+	b.fail(mapped)
 	b.enter(ok)
 	return words[1 : 1+r.Ok.Size()]
 }
 
 func (b *builder) catch(e *ast.Catch) []*Value {
-	r := e.X.TypeOf()
-	words := b.value(e.X, r)
+	if e.Map != nil {
+		return b.propagate(e.X, func(err []*Value) []*Value {
+			b.subjects = append(b.subjects, err)
+			mapped := b.value(e.Map, e.Map.Type)
+			b.subjects = b.subjects[:len(b.subjects)-1]
+			return mapped
+		})
+	}
+	return b.handle(e.X, e.Type, func(err []*Value) []*Value { return b.dispatch(e.Arms, err, e.Type) })
+}
+
+func (b *builder) handle(x ast.Expr, result *types.Type, recover func([]*Value) []*Value) []*Value {
+	r := x.TypeOf()
+	words := b.value(x, r)
 	temp := b.newTemp()
 	ok := b.newBlock()
 	failed := b.newBlock()
 	done := b.newBlock()
 	b.branch(words[0], failed, ok)
 	b.enter(ok)
-	b.writeTemp(temp, words[1:1+r.Ok.Size()])
+	b.writeTemp(temp, b.coerce(r.Ok, result, words[1:1+r.Ok.Size()]))
 	b.jump(done)
 	b.enter(failed)
-	if e.Fallback != nil {
-		b.writeTemp(temp, b.value(e.Fallback, e.Type))
-	} else {
-		b.writeTemp(temp, b.dispatch(e.Arms, words[1:1+r.Err.Size()], e.Type))
-	}
+	b.writeTemp(temp, recover(words[1:1+r.Err.Size()]))
 	b.jump(done)
 	b.enter(done)
-	return b.readTemp(temp, e.Type.Size())
+	return b.readTemp(temp, result.Size())
 }

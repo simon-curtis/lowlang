@@ -1052,7 +1052,7 @@ func (c *Checker) failStmt(s *ast.Fail) {
 
 func (c *Checker) handled(e ast.Expr, t *types.Type) {
 	if t.Kind == types.ResultKind {
-		c.fail(e.Position(), "unhandled error %s: use ? or catch", t.Err)
+		c.fail(e.Position(), "unhandled error %s: use ?, catch or or", t.Err)
 	}
 }
 
@@ -1141,6 +1141,8 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 		c.try(e, want)
 	case *ast.Catch:
 		c.catch(e, want)
+	case *ast.Or:
+		c.or(e, want)
 	}
 	return e.TypeOf()
 }
@@ -2150,13 +2152,39 @@ func (c *Checker) try(e *ast.Try, want *types.Type) {
 
 func (c *Checker) catch(e *ast.Catch, want *types.Type) {
 	t := c.errorResult(e.X, "catch", e.Pos, want)
-	e.Type = t.Ok
-	if e.Fallback != nil {
-		c.expectType(e.Fallback, t.Ok)
+	if e.Map != nil {
+		c.mapError(e, t)
 		return
 	}
-	arms := c.arms(e.Arms, t.Err, t.Ok, e.Pos)
-	if t.Ok != types.Void && arms != t.Ok && arms != types.Never {
-		c.fail(e.Pos, "catch arms must produce %s, found %s", t.Ok, arms)
+	e.Type = handledType(t.Ok, want)
+	arms := c.arms(e.Arms, t.Err, e.Type, e.Pos)
+	if t.Ok != types.Void && !e.Type.Accepts(arms) {
+		c.fail(e.Pos, "catch arms must produce %s, found %s", e.Type, arms)
 	}
+}
+
+func (c *Checker) mapError(e *ast.Catch, t *types.Type) {
+	c.leaving(e.Pos, "catch")
+	e.Type = t.Ok
+	ret := c.fn.RetType
+	if ret.Kind != types.ResultKind {
+		c.fail(e.Pos, "catch with a mapper requires %s to declare an error type", c.subject())
+	}
+	c.subjects = append(c.subjects, t.Err)
+	c.expectType(e.Map, ret.Err)
+	c.subjects = c.subjects[:len(c.subjects)-1]
+}
+
+func (c *Checker) or(e *ast.Or, want *types.Type) {
+	t := c.errorResult(e.X, "or", e.Pos, want)
+	e.Type = handledType(t.Ok, want)
+	fallback := c.branch(e.Fallback, e.Type, e.Type)
+	c.handled(e.Fallback, fallback)
+}
+
+func handledType(ok, want *types.Type) *types.Type {
+	if want != nil && want.Optional && want.Elem == ok {
+		return want
+	}
+	return ok
 }

@@ -88,7 +88,7 @@ func (s *Server) codeActions(p CodeActionParams) []CodeAction {
 	if lift, ok := a.lift(); ok {
 		actions = append(actions, lift)
 	}
-	return append(actions, a.catch())
+	return append(actions, a.catch(), a.or())
 }
 
 func (s *Server) unpropagated(path string, pos diag.Pos) *types.Type {
@@ -206,34 +206,40 @@ func (a actionContext) importEdit(module string) TextEdit {
 }
 
 func (a actionContext) catch() CodeAction {
-	action := CodeAction{Title: "Catch the error", Kind: "quickfix", Edit: a.catchText()}
+	action := CodeAction{Title: "Catch the error", Kind: "quickfix", Edit: a.replaceTry(a.catchBlock(a.armBody(), "}"))}
 	if a.snippets {
-		action.Edit = a.catchSnippet()
+		action.Edit = a.snippetTry(a.catchBlock("$0", `\}`))
 	}
 	return action
 }
 
-func (a actionContext) catchText() WorkspaceEdit {
-	pos := a.site.try.Pos
-	indent := leadingSpace(a.text.line(pos.Line - 1))
-	inner := fmt.Sprintf("%s%s", indent, a.indentUnit())
+func (a actionContext) or() CodeAction {
+	action := CodeAction{Title: "Ignore the error with or", Kind: "quickfix", Edit: a.replaceTry(fmt.Sprintf(" or %s", a.armBody()))}
+	if a.snippets {
+		action.Edit = a.snippetTry(" or $0")
+	}
+	return action
+}
+
+func (a actionContext) catchBlock(arm, brace string) string {
+	indent := leadingSpace(a.text.line(a.site.try.Pos.Line - 1))
 	var b strings.Builder
 	fmt.Fprintf(&b, " catch {\n")
-	fmt.Fprintf(&b, "%se => %s\n", inner, a.armBody())
-	fmt.Fprintf(&b, "%s}", indent)
-	edit := TextEdit{Range: a.text.span(pos, 1), NewText: b.String()}
+	fmt.Fprintf(&b, "%s%se => %s\n", indent, a.indentUnit(), arm)
+	fmt.Fprintf(&b, "%s%s", indent, brace)
+	return b.String()
+}
+
+func (a actionContext) replaceTry(text string) WorkspaceEdit {
+	edit := TextEdit{Range: a.text.span(a.site.try.Pos, 1), NewText: text}
 	return WorkspaceEdit{Changes: map[string][]TextEdit{a.uri: {edit}}}
 }
 
-func (a actionContext) catchSnippet() WorkspaceEdit {
+func (a actionContext) snippetTry(suffix string) WorkspaceEdit {
 	pos := a.site.try.Pos
 	before := a.text.line(pos.Line - 1)[:pos.Col-1]
-	indent := leadingSpace(before)
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s catch {\n", snippetEscaper.Replace(before))
-	fmt.Fprintf(&b, "%s%se => $0\n", indent, a.indentUnit())
-	fmt.Fprintf(&b, "%s\\}", indent)
-	snippet := StringValue{Kind: "snippet", Value: b.String()}
+	escaped := snippetEscaper.Replace(before)
+	snippet := StringValue{Kind: "snippet", Value: fmt.Sprintf("%s%s", escaped, suffix)}
 	start := diag.Pos{File: pos.File, Line: pos.Line, Col: 1}
 	edit := SnippetTextEdit{Range: a.text.span(start, len(before)+1), Snippet: snippet}
 	document := VersionedTextDocumentIdentifier{URI: a.uri, Version: a.version}

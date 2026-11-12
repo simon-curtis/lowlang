@@ -99,6 +99,45 @@ fn main() {
 	compiles(t, f.path, compiler.Overlay{f.path: []byte(got)})
 }
 
+func TestOrReplacesTheTry(t *testing.T) {
+	c := start(t)
+	f := scratch(t, "main.low", openFile)
+	c.open(f, f.src)
+	or, ok := c.codeActions(f, f.at(t, "?", 0))["Ignore the error with or"]
+	if !ok {
+		t.Fatal("no or action")
+	}
+	want := `import std/file
+
+fn main() {
+  file.open("data.txt") or return
+}
+`
+	got := applied(t, f, or)
+	if got != want {
+		t.Fatalf("or produced\n%s\nwant\n%s", got, want)
+	}
+	compiles(t, f.path, compiler.Overlay{f.path: []byte(got)})
+}
+
+func TestOrPlacesTheCursorAfterOr(t *testing.T) {
+	snippets := ClientCapabilities{Workspace: WorkspaceClient{WorkspaceEdit: WorkspaceEditClient{SnippetEditSupport: true}}}
+	c := startWith(t, InitializeParams{Capabilities: snippets})
+	f := scratch(t, "main.low", parseTwice)
+	c.open(f, f.src)
+	or, ok := c.codeActions(f, f.at(t, "parse(s)?", 0))["Ignore the error with or"]
+	if !ok {
+		t.Fatal("no or action")
+	}
+	changes := or.Edit.DocumentChanges
+	if len(changes) != 1 || len(changes[0].Edits) != 1 {
+		t.Fatalf("want one snippet edit, got %+v", or.Edit)
+	}
+	if want := "    parse(s) or $0"; changes[0].Edits[0].Snippet.Value != want {
+		t.Fatalf("snippet %q, want %q", changes[0].Edits[0].Snippet.Value, want)
+	}
+}
+
 func TestCatchPlacesTheCursorInTheArm(t *testing.T) {
 	snippets := ClientCapabilities{Workspace: WorkspaceClient{WorkspaceEdit: WorkspaceEditClient{SnippetEditSupport: true}}}
 	c := startWith(t, InitializeParams{Capabilities: snippets})
@@ -142,12 +181,15 @@ func TestLiftNeedsAnUndeclaredErrorType(t *testing.T) {
 	c := start(t)
 	f := scratch(t, "main.low", parseTwice)
 	c.open(f, f.src)
-	actions := c.codeActions(f, f.at(t, `twice("4")?`, 0))
-	if len(actions) != 1 {
-		t.Fatalf("want only the catch action, got %v", actions)
-	}
-	if _, ok := actions["Catch the error"]; !ok {
-		t.Fatalf("want the catch action, got %v", actions)
+	handlers(t, c.codeActions(f, f.at(t, `twice("4")?`, 0)))
+}
+
+func handlers(t *testing.T, actions map[string]CodeAction) {
+	t.Helper()
+	_, catch := actions["Catch the error"]
+	_, or := actions["Ignore the error with or"]
+	if len(actions) != 2 || !catch || !or {
+		t.Fatalf("want only the catch and or actions, got %v", actions)
 	}
 }
 
@@ -155,10 +197,7 @@ func TestNoLiftIntoAnExpressionClosure(t *testing.T) {
 	c := start(t)
 	f := scratch(t, "main.low", strings.Replace(parseTwice, `print(twice("4")?)`, `let f = fn(text: str) parse(text)?`, 1))
 	c.open(f, f.src)
-	actions := c.codeActions(f, f.at(t, "parse(text)?", 0))
-	if _, ok := actions["Catch the error"]; !ok || len(actions) != 1 {
-		t.Fatalf("want only the catch action, got %v", actions)
-	}
+	handlers(t, c.codeActions(f, f.at(t, "parse(text)?", 0)))
 }
 
 func TestNoActionsAwayFromTry(t *testing.T) {

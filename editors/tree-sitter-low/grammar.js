@@ -303,6 +303,7 @@ module.exports = grammar({
       $.slice_expression,
       $.try_expression,
       $.catch_expression,
+      $.or_expression,
       $.struct_literal,
       $.slice_literal,
       $.map_literal,
@@ -436,6 +437,12 @@ module.exports = grammar({
       field('value', $._expression),
       'catch',
       field('handler', choice($.match_block, $._expression)),
+    )),
+
+    or_expression: $ => prec.right(PREC.postfix, seq(
+      field('value', $._expression),
+      'or',
+      field('fallback', $._expression),
     )),
 
     struct_literal: $ => prec(0, seq(

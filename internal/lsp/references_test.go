@@ -227,6 +227,51 @@ fn main() {
 	compiles(t, f.path, edited)
 }
 
+func TestRenameCatchMapper(t *testing.T) {
+	c := start(t)
+	src := `enum Inner {
+    Bad
+}
+
+enum Outer {
+    Wrap(Inner)
+}
+
+fn lift(e: Inner) -> Outer {
+    Wrap(e)
+}
+
+fn risky() -> i64 ! Inner {
+    fail Bad
+}
+
+fn variant() -> i64 ! Outer {
+    risky() catch Wrap
+}
+
+fn function() -> i64 ! Outer {
+    risky() catch lift
+}
+
+fn main() {
+    print(variant() or 0)
+    print(function() or 0)
+}
+`
+	f := scratch(t, "mapper.low", src)
+	c.open(f, f.src)
+	edited := c.renamed(f, f.at(t, "Wrap(Inner)", 0), "Parse")
+	if got := string(edited[f.path]); strings.Count(got, "Parse") != 3 {
+		t.Errorf("variant mapper rename:\n%s", got)
+	}
+	compiles(t, f.path, edited)
+	edited = c.renamed(f, f.at(t, "catch lift", 6), "raise")
+	if got := string(edited[f.path]); strings.Count(got, "raise") != 2 {
+		t.Errorf("function mapper rename:\n%s", got)
+	}
+	compiles(t, f.path, edited)
+}
+
 func TestRenameAcrossModules(t *testing.T) {
 	c := start(t)
 	f := load(t, "modules", "main.low")
@@ -257,6 +302,7 @@ func TestRenameRefusals(t *testing.T) {
 		{f.at(t, "print(geometry", 0), "show", "nothing to rename"},
 		{f.at(t, "geometry.circle(2)", 0), "geo", "only names declared"},
 		{local, "fn", "is a keyword"},
+		{local, "or", "is a keyword"},
 		{local, "2c", "not a valid name"},
 		{local, "__c", "are reserved"},
 		{local, "print", "is a builtin"},

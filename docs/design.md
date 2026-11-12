@@ -119,7 +119,7 @@ let n = input |> parse()?
 - `x |> f(args)` calls `f(x, args)`, and `x |> f` calls `f(x)`.
   - The right side is a call, a function name, a module function such as `text.repeat`, a closure, or a struct field holding a function; any other expression is an error. `x |> ops.scale` calls the stored function, never a function named `scale`.
   - `|>` has the lowest precedence of the binary operators and groups left to right: `a + b |> f()` is `f(a + b)`.
-  - A trailing `?` applies to the call: `x |> parse()?` is `parse(x)?`.
+  - A trailing `?`, `catch` or `or` applies to the call: `x |> parse()?` is `parse(x)?`.
   - A `mut` first parameter receives `x` as `mut`, as with `x.f(args)`.
 - A line that starts with `|>` or `.` continues the expression on the line before it.
 
@@ -559,21 +559,42 @@ fn validate(n: i64) ! ParseError {
     if n < 0 { fail BadDigit(n) }
 }
 
+enum ConfigError {
+    Port(ParseError)
+    Missing
+}
+
+fn describe(e: ParseError) -> ConfigError {
+    Port(e)
+}
+
+fn port(s: str) -> i64 ! ConfigError {
+    let n = parse(s) catch Port
+    let m = s |> parse() catch describe
+    let k = parse(s) or fail Missing
+    n + m + k
+}
+
 fn main() ! ParseError {
     let n = parse("42") catch {
         Empty => 0
         BadDigit(at) => at
     }
-    let m = parse("") catch -1
+    let m = parse("") or -1
+    let o: i64? = parse("") or none
     validate(n)?
 }
 ```
 
 - `fail v` returns the error `v`; `v` is checked against the function's error type, so bare variant names work.
 - Postfix `?` returns the error to the caller, whose error type must be the same enum.
-- `catch { arms }` matches the error exhaustively; a binding arm such as `e => report(e)` receives the whole error. `catch value` substitutes a fallback.
+- `catch` is for when the error matters:
+  - `catch { arms }` matches the error exhaustively; a binding arm such as `e => report(e)` receives the whole error.
+  - `catch M` returns the error to the caller after mapping it with `M`, a variant or a function written as a name or a qualified name. `parse(s) catch Port` is `parse(s) catch { e => fail Port(e) }`. `M(e)` must have the caller's error type, so `M` is a one-field variant of that enum or a function value of type `fn(E) -> F`. The mapping runs before the deferred statements.
+- `or value` is for when it does not: it discards the error and evaluates `value` in its place. The value may leave instead, as in `or fail Missing`, `or return none` or `or break`.
+- Where an optional `T?` is expected, `or` and `catch { arms }` produce one, so the fallback or an arm may be `none`.
 - `fn f() ! E` fails or returns nothing.
-- A result cannot be discarded, bound or passed on without `?` or `catch`, except by returning it from a function with the same result type.
+- A result cannot be discarded, bound or passed on without `?`, `catch` or `or`, except by returning it from a function with the same result type.
 - When `main` declares `! E` and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2.
 - A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
 
@@ -747,7 +768,7 @@ current = open_file("b")
 - `using x = expr` binds `x` and releases it when the enclosing block exits by any path: the end of the block, `return`, `fail`, `?`, `break` or `continue`. Releases and `defer`s run together, last first.
 - `using var x = expr` can be reassigned. Assignment releases the old value, and exit releases the value held then.
 - `using` cannot appear inside `defer`. Binding a non-droppable value with `using` is an error.
-- A droppable value cannot be bound with `let` or `var`: "File has drop; bind it with using". Results of droppable types are unwrapped with `?` or `catch` straight into a `using` binding.
+- A droppable value cannot be bound with `let` or `var`: "File has drop; bind it with using". Results of droppable types are unwrapped with `?`, `catch` or `or` straight into a `using` binding.
 - Droppable values are move-only:
   - `return x`, or a function body ending in `x`, moves a `using` binding out. The caller owns the value and must bind it with `using`.
   - A struct literal field or an assignment to a field of a droppable value moves the value into it, and the outer value releases it. A field is assigned through a `using var` binding or a `mut` parameter, and the field's old value is released first.
@@ -1085,25 +1106,17 @@ import std/net
 
 fn handle(req: http.Request) -> http.Response {
     if req.path == "/chat" {
-        using ws = websocket.accept(req) catch {
-            _ => return http.response(400, "")
-        }
-        let m = websocket.receive(ws) catch {
-            _ => return http.upgraded()
-        }
-        websocket.send_text(ws, str(m.data)) catch {
-            _ => {}
-        }
+        using ws = websocket.accept(req) or return http.response(400, "")
+        let m = websocket.receive(ws) or return http.upgraded()
+        websocket.send_text(ws, str(m.data)) or {}
         return http.upgraded()
     }
-    http.response(200, file.read_text("index.html") catch "missing")
+    http.response(200, file.read_text("index.html") or "missing")
 }
 
 fn main() ! io.Error {
     let client = http.client().with_bearer_token("token").with_timeout(5000).build()
-    let page = client.get("https://example.com/") catch {
-        _ => return
-    }
+    let page = client.get("https://example.com/") or return
     using l = net.listen("", 8080)?
     http.serve(l, handle)?
 }
