@@ -6,7 +6,7 @@ Low compiles to static native binaries with no libc dependency, has a tracing ga
 | --- | --- |
 | `low run` | Compiles and runs a file or a module directory. |
 | `low build` | Writes a native binary. `-o` names it and `-target` picks `linux/amd64` or `windows/amd64` and defaults to the host. |
-| `low dev` | Runs the program and patches changed functions into it on save. Changing `main`, a type's layout or a function's signature restarts it. Needs a Linux host with binutils. |
+| `low dev` | Runs the program and patches changed functions into it on save. Changing `main`, a type's layout or a function's signature restarts it. Needs a Linux host. |
 | `low ir` | Prints the optimised SSA form. |
 | `low asm` | Prints the generated assembly. |
 | `low lint` | Type-checks the program and prints its warnings. |
@@ -1479,11 +1479,11 @@ The compiler is written in Go. Pipeline:
 | Assemble | `internal/asm` | object: sections, symbols and fixups |
 | Link | `internal/link` | ELF or PE executable |
 
-Building a program needs no external tool. `low dev` needs a Linux host and GNU binutils, because `as` and `ld` assemble and link its patches.
+Building a program and running `low dev` need no external tool.
 
 - `low` builds and runs on Linux and on Windows. The default target is the host; `-target linux/amd64` or `-target windows/amd64` selects one. Every target is assembled and linked in process.
 - On the Windows target, `__syscall` compiles to a call that panics with `system calls are not available on windows`, so a standard library module that reaches the operating system through `std/sys` (`std/file`, `std/os`, `std/process`, `std/net` and everything built on them, `std/term`, `std/os/signal`, log sinks, `std/crypto` random generation, `std/dns`, `std/archive`, the host lookups of `std/time/zone` and `std/cdp`) panics when it runs there. Core-language programs and modules that only compute run.
-- The `low` command lives in `cmd/low`. The pipeline it shares with hot reload lives in `internal/compiler`.
+- The `low` command lives in `cmd/low`. `compiler.Build` is the one build entry: it generates the assembly for the unit's target, assembles it, links it with the linker that target uses and writes the executable. `low build`, `low run`, hot reload, the fuzz oracle and the Vulkan and Wayland generator tests all call it. Hot reload is the only caller that passes the hot mode value.
 - `low ir` prints the SSA form and `low asm` the generated assembly.
 - Compilation is deterministic: the same source and target always produce the same SSA form, assembly and binary. No pass depends on map iteration order; where order matters the compiler walks slices or stacks.
 - `parser.ParseSource` is the one entry from source text to tree, for user files, the prelude, the standard library and generated code. The lexer lexes each interpolated `{}` expression into tokens when it lexes the string, and keeps the `,width:format` suffix as text that `ast.ParseSpec` parses.
@@ -1492,14 +1492,14 @@ Building a program needs no external tool. `low dev` needs a Linux host and GNU 
 
 Modules:
 
-- `internal/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles.
+- `internal/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles. One loader reads the program, its imports, `embed` files and the embedded standard library through `fs.FS`. `compiler.Overlay` puts unsaved editor text over the disk for the language server, which shares the loader's `Root` lookup and `ParseFile`. `internal/check` does no file IO.
 - Every file records its module path and every source position its file, so errors name the file they come from.
 - The checker keeps a scope of types and functions per module. The prelude belongs to the entry module, and its `__` names cannot clash with anything else. Every module sees the prelude's generic `__` functions and types, so `std/container/deque` is a wrapper over the prelude's `__Queue`, the ring buffer behind channel wait queues.
 - A function in module `ui/text` becomes the symbol `fn_ui.text.shout`. Types display with their module path, such as `geometry.Circle`.
 
 The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls. It ends the process with `exit_group`, so every thread stops.
 
-The runtime's data layout, thread-local access and Windows stack-bounds switching are defined once, in `layout.asm` and the target's `linux_header.asm` or `windows_header.asm`, as constants and macros such as `G_SCANLO`, `TLS_GET`, `TEB_ENTER_OS` and `MSG_BEGIN`. Generated code and patches use those names and macros, and `Generate` and `GeneratePatch` both prepend the headers. Go passes `RT_DYNAMIC` and the hot-reload constants to the assembly as `.set` lines, and defines `HOT_INIT` as the call to `rt_hot_init` in a hot build and as nothing otherwise. The Windows import table lists every function the Windows runtime calls through `WIN`, taken from `windows.asm`, plus the program's `extern` imports.
+The runtime's data layout, thread-local access and Windows stack-bounds switching are defined once, in `layout.asm` and the target's `linux_header.asm` or `windows_header.asm`, as constants and macros such as `G_SCANLO`, `TLS_GET`, `TEB_ENTER_OS` and `MSG_BEGIN`. Generated code and patches use those names and macros, and `Generate` and `GeneratePatch` both prepend the headers. Go passes `RT_DYNAMIC` and the hot-reload constants (`HOT_BASE`, `HOT_SIZE`, `PATCH_BYTES`, `PATCH_ENTRY`, `PATCH_SIGNAL`) to the assembly as `.set` lines, and defines `HOT_INIT` as the call to `rt_hot_init` in a hot build and as nothing otherwise. The Windows import table lists every function the Windows runtime calls through `WIN`, taken from `windows.asm`, plus the program's `extern` imports.
 
 The contracts between the stages have one owner each:
 
@@ -1972,8 +1972,9 @@ Mechanism:
 
 - Dev builds call every function through `fn_table`, a writable table of 4096 code addresses, with `call [rip+fn_table+8*i]`. Release builds call directly.
 - In dev builds a function value's code word is the address of its `fn_table` entry and calls through it use `call [r10]`, so a stored function value or closure runs the newest code. Callback thunks call through the table too.
+- `internal/amd64` owns this protocol: `GenerateHot` and `GeneratePatch`, the `fn_table` size, the patch signal and entry size, the mailbox symbol names and the region's base and size.
 - At start the dev runtime installs a `SIGUSR1` handler and maps a 64 MB read-execute region at `0x40000000`, close enough to the binary for 32-bit relative references.
-- A patch is assembled with `as` and linked with `ld -R` at the next free address in that region against the running binary's symbols. It holds only the changed functions and their strings. Patched functions get a fresh symbol suffix so they never collide with the originals.
+- A patch is assembled and linked in process, by `Built.Patch`, at the next free address in that region, resolving its references against the symbols of the running binary that `compiler.Build` returned. It holds only the changed functions and their strings. Patched functions get a fresh symbol suffix so they never collide with the originals.
 - `low dev` writes the machine code into the region through `/proc/<pid>/mem`, writes `(index, address)` pairs and a count into a mailbox in the program, and sends `SIGUSR1`. The handler stores each address into `fn_table` with an aligned 8-byte write and clears the count, which `low dev` waits for.
 - Frames already running keep executing their old code; the next call through the table enters the new code. Old code is never unmapped.
 
@@ -2100,20 +2101,19 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
     11. Foreground and background executors on the scheduler; a background task's result is written into a signal on the UI thread.
     12. Text input element whose state is held in signals, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     13. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-3. Patches of `low dev` assembled and linked in process, so `low dev` needs no binutils.
-4. A wasm32 target and a browser playground that runs snippets:
+3. A wasm32 target and a browser playground that runs snippets:
     1. Targets named by OS and architecture, with `wasm32` beside `amd64`.
     2. A WebAssembly back end lowered from the IR: structured control flow rebuilt from the IR's blocks, locals in place of registers, a linear-memory heap with the size-class bins, and a module written directly without an external assembler or linker.
     3. A browser host: `print` and the clock as JavaScript imports; modules that need the OS (files, sockets, processes, the UI library) are rejected at compile time for this target.
     4. The compiler built for `js/wasm`, so the page compiles and runs a snippet without a server.
     5. A Run button on every documentation snippet, and an editable playground page on the site.
-5. Standard library and tools on Windows:
+4. Standard library and tools on Windows:
     1. OS-specific std code selected by target, so each OS-facing module (`std/os`, `std/os/signal`, `std/file`, `std/net`, `std/process`) carries one implementation per OS behind one API.
     2. `__syscall` rejected at compile time on the Windows target, so a module without a Windows implementation fails the build.
     3. `std/process` over kernel32: `CreateProcessW` with Windows command-line quoting, `CreatePipe` with overlapped reads and writes for piped streams, `WaitForSingleObject` and `GetExitCodeProcess`, `TerminateProcess`, job objects for process groups, and `find` over `PATH` and `PATHEXT`.
     4. `low dev` on a Windows host.
     5. `go test ./...` on a Windows host.
-6. A package registry:
+5. A package registry:
     1. Dependencies declared in `low.mod` with a version each, a `low.sum` lockfile holding exact versions and content hashes, and a module cache that imports resolve to.
     2. Packages published from tagged git repositories, each version immutable once indexed, and yanking in place of deletion.
     3. A package page on the website for every indexed version, generated with `low doc` as the standard library pages are.

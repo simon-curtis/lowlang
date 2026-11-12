@@ -69,7 +69,7 @@ func Build(files []*ast.File, opts Options) *Program {
 	adapters := map[*ast.Func]*Func{}
 	named := map[string]*Func{}
 	for _, d := range decls {
-		f := &Func{Name: symbolName(d), ParamWords: paramWords(d), Ret: d.RetType, Callback: d.Callback}
+		f := &Func{Name: symbolName(d), ParamWords: paramWords(d), Ret: d.RetType, Params: params(d), Captures: captures(d), Callback: d.Callback}
 		if d.Callback {
 			f.CParams = d.ParamTypes
 		}
@@ -222,6 +222,25 @@ func symbolName(d *ast.Func) string {
 		return d.Name
 	}
 	return fmt.Sprintf("%s.%s", strings.ReplaceAll(d.File.Module, "/", "."), d.Name)
+}
+
+func params(d *ast.Func) []Param {
+	out := make([]Param, len(d.Params))
+	for i, p := range d.Params {
+		out[i] = Param{Type: d.ParamTypes[i], Mut: p.Mut}
+	}
+	return out
+}
+
+func captures(d *ast.Func) []Capture {
+	if d.Closure == nil {
+		return nil
+	}
+	out := make([]Capture, len(d.Closure.Captures))
+	for i, l := range d.Closure.Captures {
+		out[i] = Capture{Type: l.Type, Boxed: Boxed(l)}
+	}
+	return out
 }
 
 func paramWords(d *ast.Func) int {

@@ -39,12 +39,6 @@ var collector string
 //go:embed hot.asm
 var hotRuntime string
 
-const (
-	HotBase   = 0x40000000
-	HotSize   = 64 << 20
-	TableSize = 4096
-)
-
 type Output struct {
 	Asm   string
 	Funcs map[string]string
@@ -59,7 +53,7 @@ type Generator struct {
 	labels     int
 	dataLabels map[string]bool
 	previous   moved
-	table      map[string]int
+	table      FuncTable
 	suffix     string
 	maps       []stackMap
 	stubs      []pollStub
@@ -92,7 +86,7 @@ type stackMap struct {
 	segment bool
 }
 
-func newGenerator(platform Platform, table map[string]int, suffix string) *Generator {
+func newGenerator(platform Platform, table FuncTable, suffix string) *Generator {
 	return &Generator{platform: platform, dataLabels: map[string]bool{}, plans: map[*ir.CSig]*cPlan{}, table: table, suffix: suffix}
 }
 
@@ -121,7 +115,11 @@ func writeSymbols(out *strings.Builder, symbols []symbol) {
 	}
 }
 
-func Generate(prog *ir.Program, platform Platform, table map[string]int) Output {
+func Generate(prog *ir.Program, platform Platform) Output {
+	return generate(prog, platform, nil)
+}
+
+func generate(prog *ir.Program, platform Platform, table FuncTable) Output {
 	g := newGenerator(platform, table, "")
 	funcs := map[string]string{}
 	for _, f := range prog.Funcs {
@@ -155,13 +153,7 @@ func Generate(prog *ir.Program, platform Platform, table map[string]int) Output 
 	g.writeMaps(&out)
 	writeCells(&out, prog.Cells)
 	if table != nil {
-		writeSymbols(&out, []symbol{
-			{"HOT_BASE", HotBase},
-			{"HOT_SIZE", HotSize},
-			{"PATCH_BYTES", 16 * TableSize},
-		})
-		out.WriteString(hotRuntime)
-		g.writeTable(&out)
+		table.writeRuntime(&out)
 	}
 	platform.imports(&out, prog)
 	out.WriteString("\n\t.section .rodata\n")
@@ -169,24 +161,6 @@ func Generate(prog *ir.Program, platform Platform, table map[string]int) Output 
 	out.WriteString("\n\t.text\n")
 	out.WriteString(g.text.String())
 	return Output{Asm: out.String(), Funcs: funcs}
-}
-
-func GeneratePatch(prog *ir.Program, platform Platform, names []string, table map[string]int, suffix string) string {
-	g := newGenerator(platform, table, suffix)
-	for _, f := range prog.Funcs {
-		if slices.Contains(names, f.Name) {
-			g.function(f)
-		}
-	}
-	var out strings.Builder
-	out.WriteString("\t.intel_syntax noprefix\n")
-	out.WriteString(layout)
-	out.WriteString(platform.header())
-	out.WriteString("\t.text\n")
-	out.WriteString(g.text.String())
-	out.WriteString("\n\t.section .rodata\n")
-	out.WriteString(g.data.String())
-	return out.String()
 }
 
 func Symbol(name, suffix string) string {
@@ -204,20 +178,6 @@ func mangle(name string) string {
 		}
 	}
 	return b.String()
-}
-
-func (g *Generator) writeTable(out *strings.Builder) {
-	entries := make([]string, TableSize)
-	for i := range entries {
-		entries[i] = "0"
-	}
-	for name, i := range g.table {
-		entries[i] = Symbol(name, "")
-	}
-	out.WriteString("\n\t.data\n\t.p2align 3\n\t.globl fn_table\nfn_table:\n")
-	for _, e := range entries {
-		fmt.Fprintf(out, "\t.quad %s\n", e)
-	}
 }
 
 func (g *Generator) emit(format string, args ...any) {

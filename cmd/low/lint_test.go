@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -20,7 +19,7 @@ func TestLint(t *testing.T) {
 
 func lintFixture(t *testing.T, program fixturetest.Program) {
 	want, _ := program.Text(t, fixture.WarningsExt)
-	unit, err := compiler.Check(program.Path, os.ReadFile)
+	unit, err := compiler.Check(program.Path, compiler.Overlay(nil))
 	if err != nil {
 		t.Fatal(err)
 	}

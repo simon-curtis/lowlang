@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -15,11 +15,75 @@ import (
 	"lowlang/internal/parser"
 )
 
+const moduleFile = "low.mod"
+
 //go:embed std
 var stdFS embed.FS
 
 func isStd(module string) bool {
 	return module == "std" || strings.HasPrefix(module, "std/")
+}
+
+type tree struct {
+	files      fs.FS
+	join       func(elem ...string) string
+	privileged bool
+}
+
+var stdTree = tree{files: stdFS, join: path.Join, privileged: true}
+
+func diskTree(files fs.FS) tree {
+	return tree{files: files, join: filepath.Join}
+}
+
+func (t tree) sources(dir string) ([]string, error) {
+	entries, err := fs.ReadDir(t.files, dir)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".low") {
+			files = append(files, t.join(dir, e.Name()))
+		}
+	}
+	return files, nil
+}
+
+func (t tree) parse(name string) (*ast.File, error) {
+	src, err := fs.ReadFile(t.files, name)
+	if err != nil {
+		return nil, err
+	}
+	file, err := parseSource(src, name, t.privileged)
+	if err != nil {
+		return nil, err
+	}
+	file.Path = name
+	return file, nil
+}
+
+func parseSource(src []byte, name string, privileged bool) (*ast.File, error) {
+	return parser.ParseSource(src, diag.Start(name), privileged)
+}
+
+func ParseFile(files fs.FS, name string) (*ast.File, error) {
+	return diskTree(files).parse(name)
+}
+
+func Root(files fs.FS, dir string) (string, bool) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", false
+	}
+	for d := abs; ; d = filepath.Dir(d) {
+		if _, err := fs.Stat(files, filepath.Join(d, moduleFile)); err == nil {
+			return d, true
+		}
+		if filepath.Dir(d) == d {
+			return "", false
+		}
+	}
 }
 
 type edge struct {
@@ -29,29 +93,34 @@ type edge struct {
 
 type loader struct {
 	root    string
+	disk    tree
+	std     tree
 	files   []*ast.File
 	sources []string
 	edges   map[string][]edge
 	pending []edge
-	read    func(name string) ([]byte, error)
 }
 
-func load(path string, read func(name string) ([]byte, error)) (*loader, error) {
-	info, err := os.Stat(path)
+func load(entryPath string, disk fs.FS) (*loader, error) {
+	l := &loader{disk: diskTree(disk), std: stdTree, edges: map[string][]edge{}}
+	info, err := fs.Stat(disk, entryPath)
 	if err != nil {
 		return nil, err
 	}
-	dir, entry := filepath.Dir(path), []string{path}
+	dir, entry := filepath.Dir(entryPath), []string{entryPath}
 	if info.IsDir() {
-		dir = path
-		if entry, err = sources(path); err != nil {
+		dir = entryPath
+		if entry, err = l.disk.sources(entryPath); err != nil {
 			return nil, err
 		}
 		if len(entry) == 0 {
-			return nil, fmt.Errorf("%s: no .low files", path)
+			return nil, fmt.Errorf("%s: no .low files", entryPath)
 		}
 	}
-	l := &loader{root: root(dir), edges: map[string][]edge{}, read: read}
+	l.root = dir
+	if root, found := Root(disk, dir); found {
+		l.root = root
+	}
 	if err := l.module("", entry); err != nil {
 		return nil, err
 	}
@@ -65,50 +134,30 @@ func load(path string, read func(name string) ([]byte, error)) (*loader, error) 
 	return l, l.cycles()
 }
 
-func root(dir string) string {
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return dir
-	}
-	for d := abs; ; d = filepath.Dir(d) {
-		if _, err := os.Stat(filepath.Join(d, "low.mod")); err == nil {
-			return d
-		}
-		if filepath.Dir(d) == d {
-			return dir
-		}
-	}
-}
-
-func sources(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	var files []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".low") {
-			files = append(files, filepath.Join(dir, e.Name()))
-		}
-	}
-	return files, nil
-}
-
 func (l *loader) userFiles() []*ast.File {
 	return slices.DeleteFunc(slices.Clone(l.files), func(f *ast.File) bool { return isStd(f.Module) })
+}
+
+func (l *loader) treeOf(module string) tree {
+	if isStd(module) {
+		return l.std
+	}
+	return l.disk
 }
 
 func (l *loader) imported(e edge) error {
 	if _, done := l.edges[e.to]; done {
 		return nil
 	}
-	if isStd(e.to) {
-		return l.std(e)
+	source := l.treeOf(e.to)
+	dir, where := e.to, "the standard library"
+	if !source.privileged {
+		dir = filepath.Join(l.root, filepath.FromSlash(e.to))
+		where = dir
 	}
-	dir := filepath.Join(l.root, filepath.FromSlash(e.to))
-	files, err := sources(dir)
-	if errors.Is(err, os.ErrNotExist) || (err == nil && len(files) == 0) {
-		return diag.Errorf(e.pos, "cannot find module %s in %s", e.to, dir)
+	files, err := source.sources(dir)
+	if errors.Is(err, fs.ErrNotExist) || (err == nil && len(files) == 0) {
+		return diag.Errorf(e.pos, "cannot find module %s in %s", e.to, where)
 	}
 	if err != nil {
 		return err
@@ -116,35 +165,17 @@ func (l *loader) imported(e edge) error {
 	return l.module(e.to, files)
 }
 
-func (l *loader) std(e edge) error {
-	entries, err := fs.ReadDir(stdFS, e.to)
-	missing := diag.Errorf(e.pos, "cannot find module %s in the standard library", e.to)
-	if err != nil {
-		return missing
-	}
-	var files []string
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".low") {
-			files = append(files, fmt.Sprintf("%s/%s", e.to, entry.Name()))
-		}
-	}
-	if len(files) == 0 {
-		return missing
-	}
-	return l.module(e.to, files)
-}
-
-func (l *loader) module(path string, files []string) error {
-	l.edges[path] = []edge{}
-	std := isStd(path)
+func (l *loader) module(module string, files []string) error {
+	l.edges[module] = []edge{}
+	source := l.treeOf(module)
 	for _, name := range files {
-		file, err := l.parseFile(name, std)
+		file, err := source.parse(name)
 		if err != nil {
 			return err
 		}
-		file.Module = path
+		file.Module = module
 		l.files = append(l.files, file)
-		if !std {
+		if !source.privileged {
 			l.sources = append(l.sources, name)
 		}
 		if err := l.link(file); err != nil {
@@ -166,22 +197,6 @@ func (l *loader) link(file *ast.File) error {
 		l.pending = append(l.pending, e)
 	}
 	return nil
-}
-
-func (l *loader) parseFile(name string, std bool) (*ast.File, error) {
-	if std {
-		return parseStd(name)
-	}
-	src, err := l.read(name)
-	if err != nil {
-		return nil, err
-	}
-	file, err := parser.ParseSource(src, diag.Start(name), false)
-	if err != nil {
-		return nil, err
-	}
-	file.Path = name
-	return file, nil
 }
 
 func (l *loader) cycles() error {
@@ -218,17 +233,4 @@ func display(modules []string) []string {
 		}
 	}
 	return out
-}
-
-func parseStd(name string) (*ast.File, error) {
-	src, err := stdFS.ReadFile(name)
-	if err != nil {
-		return nil, err
-	}
-	file, err := parser.ParseSource(src, diag.Start(name), true)
-	if err != nil {
-		return nil, err
-	}
-	file.Path = name
-	return file, nil
 }

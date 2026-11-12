@@ -12,23 +12,22 @@ import (
 	"runtime/debug"
 	"strings"
 
-	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
 	"lowlang/internal/hot"
 	"lowlang/internal/lsp"
 	"lowlang/internal/target"
 )
 
-const usage = `usage:
-  low build <file.low> [-o output] [-target linux/amd64|windows/amd64]
+var usage = fmt.Sprintf(`usage:
+  low build <file.low> [-o output] [-target %[1]s]
   low run <file.low>
-  low asm <file.low> [-target linux/amd64|windows/amd64]
-  low ir <file.low> [-target linux/amd64|windows/amd64]
+  low asm <file.low> [-target %[1]s]
+  low ir <file.low> [-target %[1]s]
   low lint <file.low>
   low doc <dir|std>
   low dev <file.low>
   low lsp
-  low version`
+  low version`, target.Choices())
 
 var version string
 
@@ -164,7 +163,7 @@ func parseOptions(args []string, output bool) (options, error) {
 }
 
 func lintCommand(path string) error {
-	unit, err := compiler.Check(path, os.ReadFile)
+	unit, err := compiler.Check(path, compiler.Overlay(nil))
 	if err != nil {
 		return err
 	}
@@ -191,12 +190,20 @@ func report(unit *compiler.Unit) {
 	}
 }
 
+func analyse(path string, platform target.OS) (*compiler.Unit, error) {
+	unit, err := compiler.Analyse(path, platform)
+	if err != nil {
+		return nil, err
+	}
+	report(unit)
+	return unit, nil
+}
+
 func compileCommand(ctx context.Context, cmd, path string, opts options) error {
-	unit, err := compiler.Analyse(path, opts.platform)
+	unit, err := analyse(path, opts.platform)
 	if err != nil {
 		return err
 	}
-	report(unit)
 	switch cmd {
 	case "ir":
 		for _, f := range unit.Program.Funcs {
@@ -204,14 +211,18 @@ func compileCommand(ctx context.Context, cmd, path string, opts options) error {
 		}
 		return nil
 	case "asm":
-		fmt.Print(amd64.Generate(unit.Program, unit.Platform, nil).Asm)
+		out, err := compiler.Generate(unit, compiler.Release)
+		if err != nil {
+			return err
+		}
+		fmt.Print(out.Asm)
 		return nil
 	}
 	output := opts.output
 	if output == "" {
 		output = defaultOutput(path, opts.platform)
 	}
-	return link(ctx, unit, output)
+	return buildUnit(ctx, unit, output)
 }
 
 func defaultOutput(path string, platform target.OS) string {
@@ -219,18 +230,17 @@ func defaultOutput(path string, platform target.OS) string {
 	return platform.Executable(name)
 }
 
-func link(ctx context.Context, unit *compiler.Unit, output string) error {
-	asm := amd64.Generate(unit.Program, unit.Platform, nil).Asm
-	return compiler.Link(ctx, asm, output, unit)
+func buildUnit(ctx context.Context, unit *compiler.Unit, output string) error {
+	_, err := compiler.Build(ctx, unit, compiler.Release, output)
+	return err
 }
 
 func build(ctx context.Context, path, output string, platform target.OS) error {
-	unit, err := compiler.Analyse(path, platform)
+	unit, err := analyse(path, platform)
 	if err != nil {
 		return err
 	}
-	report(unit)
-	return link(ctx, unit, output)
+	return buildUnit(ctx, unit, output)
 }
 
 func buildAndRun(ctx context.Context, path string) error {

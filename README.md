@@ -37,7 +37,7 @@ fn main() {
 
 ## Usage
 
-Building `low` needs Go. Compiling and linking a program needs only the `low` binary. `low dev` needs a Linux host with binutils (`as`, `ld`).
+Building `low` needs Go. Compiling, linking and `low dev` need only the `low` binary; `low dev` needs a Linux host.
 
 ```sh
 go build -o low ./cmd/low

@@ -163,10 +163,22 @@ func (b *Block) String() string {
 	return fmt.Sprintf("b%d", b.ID)
 }
 
+type Param struct {
+	Type *types.Type
+	Mut  bool
+}
+
+type Capture struct {
+	Type  *types.Type
+	Boxed bool
+}
+
 type Func struct {
 	Name       string
 	ParamWords int
 	Ret        *types.Type
+	Params     []Param
+	Captures   []Capture
 	Callback   bool
 	CParams    []*types.Type
 	Blocks     []*Block

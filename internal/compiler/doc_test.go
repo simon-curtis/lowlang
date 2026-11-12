@@ -144,7 +144,7 @@ func TestStdDocumented(t *testing.T) {
 		if err != nil || entry.IsDir() || !strings.HasSuffix(name, ".low") {
 			return err
 		}
-		f, err := parseStd(name)
+		f, err := stdTree.parse(name)
 		if err != nil {
 			return err
 		}

@@ -22,7 +22,7 @@ rt_hot_init:
 	lea rax, [rip+rt_hot_restorer]
 	mov [rsp+16], rax
 	mov qword ptr [rsp+24], 0
-	mov edi, 10
+	mov edi, PATCH_SIGNAL
 	mov rsi, rsp
 	xor edx, edx
 	mov r10d, 8
@@ -54,7 +54,7 @@ rt_hot_handler:
 	mov rax, [rsi]
 	mov rdx, [rsi+8]
 	mov [rdi+8*rax], rdx
-	add rsi, 16
+	add rsi, PATCH_ENTRY
 	dec rcx
 	jmp 1b
 2:

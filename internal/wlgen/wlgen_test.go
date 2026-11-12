@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"lowlang/internal/amd64"
 	"lowlang/internal/check"
 	"lowlang/internal/compiler"
 	"lowlang/internal/fixture/fixturetest"
@@ -102,8 +101,7 @@ func TestRegistry(t *testing.T) {
 	}
 	binary := filepath.Join(dir, "registry")
 	ctx := context.Background()
-	asm := amd64.Generate(unit.Program, unit.Platform, nil).Asm
-	if err := compiler.Link(ctx, asm, binary, unit); err != nil {
+	if _, err := compiler.Build(ctx, unit, compiler.Release, binary); err != nil {
 		t.Fatal(err)
 	}
 	if os.Getenv("WAYLAND_DISPLAY") == "" {

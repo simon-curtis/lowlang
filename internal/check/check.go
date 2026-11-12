@@ -1,13 +1,10 @@
 package check
 
 import (
-	"crypto/sha256"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io/fs"
-	"os"
-	"path"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -35,7 +32,6 @@ type Checker struct {
 	phase    phase
 	waiting  map[phase][]func()
 	modules  map[string]*scope
-	embeds   []string
 	funcContext
 	counts          map[*ast.Func]int
 	generics        map[*types.Type]*generic
@@ -54,12 +50,19 @@ type Checker struct {
 	defaults        map[*types.Field]ast.Expr
 	checkingDefault map[*types.Field]bool
 	derived         map[string]*ast.Func
-	std             fs.FS
+	embedder        EmbedResolver
 }
 
-func Check(files []*ast.File, std fs.FS, universe *types.Universe) ([]string, error) {
+type Embedded struct {
+	Path string
+	Data []byte
+}
+
+type EmbedResolver func(file *ast.File, name string) (Embedded, error)
+
+func Check(files []*ast.File, resolve EmbedResolver, universe *types.Universe) error {
 	c := &Checker{
-		std:             std,
+		embedder:        resolve,
 		universe:        universe,
 		waiting:         map[phase][]func(){},
 		modules:         map[string]*scope{},
@@ -80,9 +83,9 @@ func Check(files []*ast.File, std fs.FS, universe *types.Universe) ([]string, er
 	universe.OnCreate = c.created
 	defer func() { universe.OnCreate = nil }()
 	if failure := diag.Try(func() { c.check(files) }); failure != nil {
-		return nil, failure
+		return failure
 	}
-	return c.embeds, nil
+	return nil
 }
 
 func (c *Checker) scope(module string) *scope {
@@ -1663,65 +1666,17 @@ func (c *Checker) embed(e *ast.Call) {
 		c.fail(e.Args[0].Position(), "embed needs a string literal path")
 	}
 	lit.Type = types.Str
-	if strings.HasPrefix(c.file.Module, "std/") {
-		c.stdEmbed(e, lit)
-		return
+	if c.embedder == nil {
+		c.fail(lit.Pos, "cannot embed %s: embedding is not available", lit.Value)
 	}
-	name := lit.Value
-	if !filepath.IsAbs(name) {
-		name = filepath.Join(filepath.Dir(c.file.Path), name)
-	}
-	abs, err := filepath.Abs(name)
-	if err != nil {
-		c.fail(lit.Pos, "cannot embed %s: %v", lit.Value, err)
-	}
-	data, err := os.ReadFile(abs)
-	if err != nil {
+	embedded, err := c.embedder(c.file, lit.Value)
+	if errors.Is(err, fs.ErrNotExist) {
 		c.fail(lit.Pos, "cannot embed %s: no such file", lit.Value)
 	}
-	if !slices.Contains(c.embeds, abs) {
-		c.embeds = append(c.embeds, abs)
-	}
-	c.embedded(e, abs, data)
-}
-
-func (c *Checker) stdEmbed(e *ast.Call, lit *ast.StrLit) {
-	data, err := fs.ReadFile(c.std, path.Join(path.Dir(c.file.Path), lit.Value))
-	if err != nil {
-		c.fail(lit.Pos, "cannot embed %s: no such file", lit.Value)
-	}
-	cache, err := os.UserCacheDir()
 	if err != nil {
 		c.fail(lit.Pos, "cannot embed %s: %v", lit.Value, err)
 	}
-	sum := sha256.Sum256(data)
-	out := filepath.Join(cache, "lowlang", "embed", fmt.Sprintf("%x-%s", sum[:12], path.Base(lit.Value)))
-	if err := materialize(out, data); err != nil {
-		c.fail(lit.Pos, "cannot embed %s: %v", lit.Value, err)
-	}
-	c.embedded(e, out, data)
-}
-
-func materialize(out string, data []byte) error {
-	if info, err := os.Stat(out); err == nil && info.Size() == int64(len(data)) {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		return err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(out), "embed-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(temp.Name())
-	if _, err := temp.Write(data); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(temp.Name(), out)
+	c.embedded(e, embedded.Path, embedded.Data)
 }
 
 func (c *Checker) embedded(e *ast.Call, abs string, data []byte) {

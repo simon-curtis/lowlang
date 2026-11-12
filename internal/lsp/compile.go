@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"maps"
-	"os"
-	"path/filepath"
 	"time"
 
 	"lowlang/internal/compiler"
@@ -13,20 +11,11 @@ import (
 
 const debounce = 150 * time.Millisecond
 
-type sources map[string][]byte
-
-func (src sources) read(name string) ([]byte, error) {
-	if text, ok := src[filepath.Clean(name)]; ok {
-		return text, nil
-	}
-	return os.ReadFile(name)
-}
-
 type compileJob struct {
 	entry   string
 	path    string
 	version int
-	docs    sources
+	docs    compiler.Overlay
 }
 
 type compiled struct {
@@ -42,7 +31,7 @@ func (j compileJob) run() (result compiled) {
 			result.err = fmt.Errorf("internal compiler error: %v", r)
 		}
 	}()
-	result.unit, result.err = compiler.Check(j.entry, j.docs.read)
+	result.unit, result.err = compiler.Check(j.entry, j.docs)
 	return result
 }
 
@@ -71,7 +60,7 @@ func (c *scheduler) mark(entry, path string, delay time.Duration) {
 	c.timer.Reset(delay)
 }
 
-func (c *scheduler) next(ctx context.Context, docs sources) {
+func (c *scheduler) next(ctx context.Context, docs compiler.Overlay) {
 	if c.compiling {
 		return
 	}

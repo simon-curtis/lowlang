@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
 	"lowlang/internal/fuzz/model"
 	"lowlang/internal/target"
@@ -166,8 +165,7 @@ func (r *Runner) build(ctx context.Context, dir, binary, source string, mode Mod
 	if err != nil {
 		return stageError{class: ClassReject, detail: strings.ReplaceAll(err.Error(), dir+"/", "")}
 	}
-	asm := amd64.Generate(unit.Program, unit.Platform, nil).Asm
-	if err := compiler.Link(ctx, asm, binary, unit); err != nil {
+	if _, err := compiler.Build(ctx, unit, compiler.Release, binary); err != nil {
 		return stageError{class: ClassLink, detail: err.Error()}
 	}
 	return nil

@@ -131,14 +131,13 @@ func buildProbe(t *testing.T, source string) string {
 		t.Fatal(err)
 	}
 	files := []*ast.File{prelude, probe}
-	if _, err := check.Check(files, stdFS, types.NewUniverse()); err != nil {
+	if err := check.Check(files, nil, types.NewUniverse()); err != nil {
 		t.Fatal(err)
 	}
 	host := target.Host()
 	unit := &Unit{Platform: amd64.NewPlatform(host), Program: ir.Build(files, ir.Options{Inline: true})}
 	binary := filepath.Join(t.TempDir(), host.Executable("probe"))
-	asm := amd64.Generate(unit.Program, unit.Platform, nil).Asm
-	if err := Link(context.Background(), asm, binary, unit); err != nil {
+	if _, err := Build(context.Background(), unit, Release, binary); err != nil {
 		t.Fatal(err)
 	}
 	return binary

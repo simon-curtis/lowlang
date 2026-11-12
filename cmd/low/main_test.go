@@ -66,7 +66,7 @@ func buildLinux(t *testing.T, program fixturetest.Program, sidecars fixture.Side
 	if got := hasVectorCode(unit.Program); got != sidecars.SIMD {
 		t.Errorf("program has vector code %v, but its .tags file says simd %v", got, sidecars.SIMD)
 	}
-	if err := link(context.Background(), unit, binary); err != nil {
+	if err := buildUnit(context.Background(), unit, binary); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -159,7 +159,7 @@ func windowsLauncher(t *testing.T) launcher {
 }
 
 func runWindowsFixture(t *testing.T, launch launcher, program fixturetest.Program, sidecars fixture.Sidecars) {
-	binary := filepath.Join(t.TempDir(), "main.exe")
+	binary := filepath.Join(t.TempDir(), target.Windows.Executable("main"))
 	if err := build(context.Background(), program.Path, binary, target.Windows); err != nil {
 		t.Fatal(err)
 	}

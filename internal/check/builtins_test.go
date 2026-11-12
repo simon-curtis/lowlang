@@ -120,7 +120,7 @@ func TestPublicBuiltinsRejectWrongArity(t *testing.T) {
 		if err := os.WriteFile(path, []byte(source), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		_, err := compiler.Check(path, os.ReadFile)
+		_, err := compiler.Check(path, compiler.Overlay(nil))
 		var failure *diag.Error
 		if !errors.As(err, &failure) || !strings.Contains(failure.Msg, "takes") {
 			t.Errorf("%s() reported %v", b.Name, err)

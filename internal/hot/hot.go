@@ -2,7 +2,6 @@ package hot
 
 import (
 	"context"
-	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -18,9 +17,7 @@ import (
 	"time"
 
 	"lowlang/internal/amd64"
-	"lowlang/internal/ast"
 	"lowlang/internal/compiler"
-	"lowlang/internal/ir"
 	"lowlang/internal/target"
 )
 
@@ -37,9 +34,8 @@ type Session struct {
 	stderr     io.Writer
 	dir        string
 	child      *child
-	binary     string
-	symbols    map[string]uint64
-	table      map[string]int
+	built      *compiler.Built
+	table      amd64.FuncTable
 	funcs      map[string]string
 	signatures map[string]string
 	layout     string
@@ -162,11 +158,14 @@ func (s *Session) Reload(ctx context.Context) error {
 	if reason := s.restartReason(unit); reason != "" {
 		return s.restart(ctx, unit, reason)
 	}
-	table := s.extend(unit.Program)
-	if len(table) > amd64.TableSize {
+	table := s.table.Extend(unit.Program)
+	if table.Full() {
 		return s.restart(ctx, unit, "function table full")
 	}
-	out := amd64.Generate(unit.Program, unit.Platform, table)
+	out, err := compiler.Generate(unit, compiler.Hot(table))
+	if err != nil {
+		return err
+	}
 	if out.Funcs["main"] != s.funcs["main"] {
 		return s.restart(ctx, unit, "main changed")
 	}
@@ -180,7 +179,7 @@ func (s *Session) Reload(ctx context.Context) error {
 		return s.restart(ctx, unit, fmt.Sprintf("reload failed: %v", err))
 	}
 	s.table, s.funcs = table, out.Funcs
-	s.signatures = signatures(unit.Files)
+	s.signatures = signatures(unit.Program)
 	s.logf("reloaded %s in %s", strings.Join(changed, ", "), time.Since(began).Round(time.Millisecond))
 	return nil
 }
@@ -195,22 +194,12 @@ func (s *Session) restartReason(unit *compiler.Unit) string {
 	if layout(unit.Files) != s.layout {
 		return "type layout changed"
 	}
-	for name, sig := range signatures(unit.Files) {
+	for name, sig := range signatures(unit.Program) {
 		if old, ok := s.signatures[name]; ok && old != sig {
 			return fmt.Sprintf("signature of %s changed", name)
 		}
 	}
 	return ""
-}
-
-func (s *Session) extend(prog *ir.Program) map[string]int {
-	table := maps.Clone(s.table)
-	for _, f := range prog.Funcs {
-		if _, ok := table[f.Name]; !ok {
-			table[f.Name] = len(table)
-		}
-	}
-	return table
 }
 
 func changedFuncs(old, current map[string]string) []string {
@@ -226,16 +215,9 @@ func changedFuncs(old, current map[string]string) []string {
 
 func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string) error {
 	s.builds++
-	table := map[string]int{}
-	for i, f := range unit.Program.Funcs {
-		table[f.Name] = i
-	}
-	out := amd64.Generate(unit.Program, unit.Platform, table)
+	table := amd64.NewFuncTable(unit.Program)
 	binary := filepath.Join(s.dir, fmt.Sprintf("app%d", s.builds))
-	if err := compiler.Link(ctx, out.Asm, binary, unit); err != nil {
-		return err
-	}
-	symbols, err := readSymbols(binary)
+	built, err := compiler.Build(ctx, unit, compiler.Hot(table), binary)
 	if err != nil {
 		return err
 	}
@@ -247,9 +229,9 @@ func (s *Session) start(ctx context.Context, unit *compiler.Unit, reason string)
 	c := &child{cmd: cmd, done: make(chan error, 1)}
 	go c.wait()
 	s.child = c
-	s.binary, s.symbols = binary, symbols
-	s.table, s.funcs = table, out.Funcs
-	s.signatures, s.layout = signatures(unit.Files), layout(unit.Files)
+	s.built = built
+	s.table, s.funcs = table, built.Funcs
+	s.signatures, s.layout = signatures(unit.Program), layout(unit.Files)
 	s.libraries = unit.Program.Libraries()
 	s.cSymbols = unit.Program.CSymbols
 	s.next = 0
@@ -277,75 +259,41 @@ func (s *Session) stop() {
 	s.child = nil
 }
 
-func readSymbols(path string) (map[string]uint64, error) {
-	f, err := elf.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	syms, err := f.Symbols()
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]uint64{}
-	for _, sym := range syms {
-		out[sym.Name] = sym.Value
-	}
-	return out, nil
-}
-
-func (s *Session) patch(ctx context.Context, unit *compiler.Unit, table map[string]int, changed []string) error {
+func (s *Session) patch(ctx context.Context, unit *compiler.Unit, table amd64.FuncTable, changed []string) error {
 	suffix := fmt.Sprintf("_r%d_%d", s.builds, s.next)
-	address := amd64.HotBase + s.next
-	output := filepath.Join(s.dir, fmt.Sprintf("patch%d_%d", s.builds, s.next))
-	asm := amd64.GeneratePatch(unit.Program, unit.Platform, changed, table, suffix)
-	if err := compiler.LinkAt(ctx, asm, output, s.binary, address); err != nil {
-		return err
-	}
-	section, symbols, err := readPatch(output)
+	patch, err := s.built.Patch(unit, table, changed, suffix, amd64.HotBase+s.next)
 	if err != nil {
 		return err
 	}
-	end := section.address + uint64(len(section.code)) - amd64.HotBase
+	end := patch.Address + uint64(len(patch.Code)) - amd64.HotBase
 	if end > amd64.HotSize {
 		return errors.New("hot code space exhausted")
 	}
-	entries := make([]byte, 0, 16*len(changed))
-	for _, name := range changed {
-		entries = binary.LittleEndian.AppendUint64(entries, uint64(table[name]))
-		entries = binary.LittleEndian.AppendUint64(entries, symbols[amd64.Symbol(name, suffix)])
-	}
-	if err := s.apply(ctx, section.code, section.address, entries, len(changed)); err != nil {
+	entries := table.PatchEntries(changed, suffix, patch.Symbols)
+	if err := s.apply(ctx, patch.Code, patch.Address, entries, len(changed)); err != nil {
 		return err
 	}
 	s.next = (end + 15) &^ 15
 	return nil
 }
 
-type patchSection struct {
-	address uint64
-	code    []byte
-}
-
-func readPatch(path string) (patchSection, map[string]uint64, error) {
-	f, err := elf.Open(path)
-	if err != nil {
-		return patchSection{}, nil, err
+func (s *Session) mailbox() (list, count int64, err error) {
+	listAddress, ok := s.built.Symbols[amd64.PatchListSymbol]
+	if !ok {
+		return 0, 0, fmt.Errorf("program has no %s", amd64.PatchListSymbol)
 	}
-	defer f.Close()
-	section := f.Section(".hot")
-	if section == nil {
-		return patchSection{}, nil, errors.New("patch has no .hot section")
+	countAddress, ok := s.built.Symbols[amd64.PatchCountSymbol]
+	if !ok {
+		return 0, 0, fmt.Errorf("program has no %s", amd64.PatchCountSymbol)
 	}
-	code, err := section.Data()
-	if err != nil {
-		return patchSection{}, nil, err
-	}
-	symbols, err := readSymbols(path)
-	return patchSection{address: section.Addr, code: code}, symbols, err
+	return int64(listAddress), int64(countAddress), nil
 }
 
 func (s *Session) apply(ctx context.Context, code []byte, address uint64, entries []byte, count int) error {
+	list, counter, err := s.mailbox()
+	if err != nil {
+		return err
+	}
 	pid := s.child.cmd.Process.Pid
 	if err := waitForHotRegion(ctx, pid); err != nil {
 		return err
@@ -358,10 +306,9 @@ func (s *Session) apply(ctx context.Context, code []byte, address uint64, entrie
 	if _, err := mem.WriteAt(code, int64(address)); err != nil {
 		return fmt.Errorf("writing code at %#x: %w", address, err)
 	}
-	if _, err := mem.WriteAt(entries, int64(s.symbols[amd64.PatchListSymbol])); err != nil {
+	if _, err := mem.WriteAt(entries, list); err != nil {
 		return fmt.Errorf("writing patch list: %w", err)
 	}
-	counter := int64(s.symbols[amd64.PatchCountSymbol])
 	if _, err := mem.WriteAt(binary.LittleEndian.AppendUint64(nil, uint64(count)), counter); err != nil {
 		return fmt.Errorf("writing patch count: %w", err)
 	}
@@ -415,45 +362,4 @@ func poll(ctx context.Context, ready func() (bool, error)) error {
 		case <-time.After(time.Millisecond):
 		}
 	}
-}
-
-func layout(files []*ast.File) string {
-	var b strings.Builder
-	for _, file := range files {
-		for _, d := range file.Enums {
-			fmt.Fprintf(&b, "enum %s", d.Type.Name)
-			for _, v := range d.Type.Variants {
-				fmt.Fprintf(&b, " %s%v", v.Name, v.Fields)
-			}
-			b.WriteString(";")
-		}
-		for _, d := range file.Structs {
-			fmt.Fprintf(&b, "struct %s", d.Type.Name)
-			for _, f := range d.Type.Fields {
-				fmt.Fprintf(&b, " %s:%s", f.Name, f.Type)
-			}
-			b.WriteString(";")
-		}
-	}
-	return b.String()
-}
-
-func signatures(files []*ast.File) map[string]string {
-	out := map[string]string{}
-	for _, file := range files {
-		for _, fn := range file.Funcs {
-			var b strings.Builder
-			for i, p := range fn.Params {
-				fmt.Fprintf(&b, "%t %s,", p.Mut, fn.ParamTypes[i])
-			}
-			fmt.Fprintf(&b, "-> %s", fn.RetType)
-			if fn.Closure != nil {
-				for _, l := range fn.Closure.Captures {
-					fmt.Fprintf(&b, " %s %s %t", l.Name, l.Type, ir.Boxed(l))
-				}
-			}
-			out[fmt.Sprintf("%s.%s", file.Module, fn.Name)] = b.String()
-		}
-	}
-	return out
 }

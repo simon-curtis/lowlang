@@ -55,7 +55,7 @@ func countChecks(f *ir.Func) int {
 
 func functionAsm(t *testing.T, prog *ir.Program, name string) string {
 	t.Helper()
-	asm := amd64.Generate(prog, amd64.NewPlatform(target.Linux), nil).Asm
+	asm := amd64.Generate(prog, amd64.NewPlatform(target.Linux)).Asm
 	label := amd64.Symbol(name, "") + ":\n"
 	start := strings.Index(asm, label)
 	if start < 0 {

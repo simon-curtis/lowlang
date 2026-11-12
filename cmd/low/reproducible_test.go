@@ -57,18 +57,19 @@ func compileOnce(c determinismCase) (compiled, error) {
 	if err != nil {
 		return compiled{}, err
 	}
-	var table map[string]int
-	var ir strings.Builder
+	mode := compiler.Release
 	if c.dev {
-		table = map[string]int{}
+		mode = compiler.Hot(amd64.NewFuncTable(unit.Program))
 	}
-	for i, f := range unit.Program.Funcs {
+	out, err := compiler.Generate(unit, mode)
+	if err != nil {
+		return compiled{}, err
+	}
+	var ir strings.Builder
+	for _, f := range unit.Program.Funcs {
 		fmt.Fprint(&ir, f)
-		if c.dev {
-			table[f.Name] = i
-		}
 	}
-	return compiled{ir: ir.String(), asm: amd64.Generate(unit.Program, unit.Platform, table).Asm}, nil
+	return compiled{ir: ir.String(), asm: out.Asm}, nil
 }
 
 func firstDifference(a, b string) string {

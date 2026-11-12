@@ -49,7 +49,7 @@ func (c *client) rename(f fixture, pos Position, name string) (WorkspaceEdit, *r
 	return edit, nil
 }
 
-func (c *client) renamed(f fixture, pos Position, name string) sources {
+func (c *client) renamed(f fixture, pos Position, name string) compiler.Overlay {
 	c.t.Helper()
 	edit, failure := c.rename(f, pos, name)
 	if failure != nil {
@@ -58,9 +58,9 @@ func (c *client) renamed(f fixture, pos Position, name string) sources {
 	return applyEdit(c.t, edit)
 }
 
-func applyEdit(t *testing.T, edit WorkspaceEdit) sources {
+func applyEdit(t *testing.T, edit WorkspaceEdit) compiler.Overlay {
 	t.Helper()
-	out := sources{}
+	out := compiler.Overlay{}
 	for uri, edits := range edit.Changes {
 		path := pathOf(uri)
 		src, err := os.ReadFile(path)
@@ -91,9 +91,9 @@ func applyText(src string, edits []TextEdit) string {
 	return strings.Join(lines, "\n")
 }
 
-func compiles(t *testing.T, entry string, edited sources) {
+func compiles(t *testing.T, entry string, edited compiler.Overlay) {
 	t.Helper()
-	if _, err := compiler.Check(entry, edited.read); err != nil {
+	if _, err := compiler.Check(entry, edited); err != nil {
 		t.Errorf("renamed program does not compile: %v", err)
 	}
 }

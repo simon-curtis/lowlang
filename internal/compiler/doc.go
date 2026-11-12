@@ -39,12 +39,12 @@ type documenter struct {
 
 func Document(target string) ([]ModuleDoc, error) {
 	if target == "std" {
-		d := documenter{fsys: stdFS, parse: parseStd}
+		d := documenter{fsys: stdFS, parse: stdTree.parse}
 		return d.walk("std")
 	}
-	l := &loader{read: os.ReadFile}
+	disk := diskTree(Overlay(nil))
 	d := documenter{fsys: os.DirFS(target), parse: func(name string) (*ast.File, error) {
-		return l.parseFile(path.Join(target, name), false)
+		return disk.parse(path.Join(target, name))
 	}}
 	return d.walk(".")
 }

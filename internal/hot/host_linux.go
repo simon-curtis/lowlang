@@ -2,7 +2,8 @@ package hot
 
 import (
 	"os"
-	"syscall"
+
+	"lowlang/internal/amd64"
 )
 
 func checkHost() error {
@@ -10,5 +11,5 @@ func checkHost() error {
 }
 
 func notify(p *os.Process) error {
-	return p.Signal(syscall.SIGUSR1)
+	return p.Signal(amd64.PatchSignal)
 }

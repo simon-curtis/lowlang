@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -14,16 +13,15 @@ import (
 	"lowlang/internal/compiler"
 	"lowlang/internal/diag"
 	"lowlang/internal/lint"
-	"lowlang/internal/parser"
 )
 
 type Server struct {
 	stream       *stream
-	docs         sources
+	docs         compiler.Overlay
 	units        map[string]*compiler.Unit
 	published    map[string][]string
 	fresh        map[string]bool
-	compiledDocs map[string]sources
+	compiledDocs map[string]compiler.Overlay
 	compiles     *scheduler
 	indexed      indexed
 	hintRefresh  bool
@@ -34,11 +32,11 @@ type Server struct {
 func NewServer(in io.Reader, out io.Writer) *Server {
 	return &Server{
 		stream:       newStream(in, out),
-		docs:         sources{},
+		docs:         compiler.Overlay{},
 		units:        map[string]*compiler.Unit{},
 		published:    map[string][]string{},
 		fresh:        map[string]bool{},
-		compiledDocs: map[string]sources{},
+		compiledDocs: map[string]compiler.Overlay{},
 		compiles:     newScheduler(),
 	}
 }
@@ -256,7 +254,7 @@ func (s *Server) notify(method string, params any) error {
 }
 
 func (s *Server) text(path string) text {
-	src, err := s.docs.read(path)
+	src, err := s.docs.ReadFile(path)
 	if err != nil {
 		return text{}
 	}
@@ -264,15 +262,10 @@ func (s *Server) text(path string) text {
 }
 
 func (s *Server) entry(path string) string {
-	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
-		marker := filepath.Join(dir, "low.mod")
-		if _, err := os.Stat(marker); err == nil {
-			return dir
-		}
-		if filepath.Dir(dir) == dir {
-			return path
-		}
+	if root, found := compiler.Root(s.docs, filepath.Dir(path)); found {
+		return root
 	}
+	return path
 }
 
 func (s *Server) finish(r compiled) error {
@@ -373,7 +366,7 @@ func (s *Server) query(p TextDocumentPositionParams) *query {
 }
 
 func (s *Server) index(path string, file *ast.File) *index {
-	src, err := s.docs.read(path)
+	src, err := s.docs.ReadFile(path)
 	if err != nil {
 		return newIndex(file, text{})
 	}
@@ -435,7 +428,7 @@ func (s *Server) compiledText(entry, path string) text {
 	if !ok {
 		return text{}
 	}
-	src, err := docs.read(path)
+	src, err := docs.ReadFile(path)
 	if err != nil {
 		return text{}
 	}
@@ -461,11 +454,7 @@ func (s *Server) locate(tg target) Location {
 }
 
 func (s *Server) parsed(path string) *ast.File {
-	src, err := s.docs.read(path)
-	if err != nil {
-		return nil
-	}
-	file, err := parser.ParseSource(src, diag.Start(path), false)
+	file, err := compiler.ParseFile(s.docs, path)
 	if err != nil {
 		return nil
 	}
