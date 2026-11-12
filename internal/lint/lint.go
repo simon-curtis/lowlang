@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"fmt"
 	"slices"
-	"strings"
 
 	"lowlang/internal/ast"
 	"lowlang/internal/diag"
@@ -47,7 +46,7 @@ type linter struct {
 
 func (l *linter) file(file *ast.File) {
 	for _, fn := range file.Funcs {
-		if fn.Body != nil && !generated(fn) {
+		if fn.Body != nil && !fn.Source().Derived {
 			ast.Inspect(fn.Body, l.visit)
 		}
 	}
@@ -56,10 +55,6 @@ func (l *linter) file(file *ast.File) {
 			ast.Inspect(decl.Drop, l.visit)
 		}
 	}
-}
-
-func generated(fn *ast.Func) bool {
-	return strings.HasPrefix(fn.Pos.File, "<")
 }
 
 func (l *linter) visit(n ast.Node) bool {
