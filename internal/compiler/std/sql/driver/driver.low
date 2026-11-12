@@ -1,0 +1,134 @@
+import std/net
+import std/otel
+import std/sql
+
+/// The state of one driver connection that every call checks: whether a call is running and whether the connection is closed.
+pub struct Session {
+    /// Whether a call is running on the connection.
+    pub busy: bool
+    /// Whether the connection is closed.
+    pub closed: bool
+}
+
+/// Returns a session for a connection that is open and idle.
+pub fn session() -> *Session {
+    new(Session { busy: false, closed: false })
+}
+
+/// A column callback that ignores the columns.
+pub fn ignore_columns(columns: []sql.Column) {}
+
+/// A row callback that ignores the row and continues.
+pub fn ignore_row(columns: []sql.Column, row: []sql.Value) -> bool {
+    true
+}
+
+/// Runs `run` with a column callback and a row callback that buffer the result, and returns it.
+///
+/// A second column callback call, as for a later result set, discards the rows buffered so far.
+pub fn collect(run: fn(fn([]sql.Column), fn([]sql.Column, []sql.Value) -> bool) ! sql.Error) -> sql.Rows ! sql.Error {
+    var columns: []sql.Column = []
+    var rows: [][]sql.Value = []
+    run(fn(described) {
+        columns = described
+        rows = []
+    }, fn(cols, row) -> bool {
+        push(mut rows, row)
+        true
+    })?
+    sql.Rows { columns, rows }
+}
+
+/// Returns `o.port`, or the dialect's default port when `o.port` is `0`.
+pub fn port_of(o: sql.Options, d: sql.Dialect) -> i64 {
+    if o.port == 0 { d.default_port } else { o.port }
+}
+
+/// Opens a TCP connection to `o.host` at the dialect's port within `o.timeout`.
+///
+/// Fails with `sql.Error.Timeout` when the dial times out and `sql.Error.Connect` otherwise.
+pub fn dial(o: sql.Options, d: sql.Dialect) -> net.Conn ! sql.Error {
+    net.dial_within(o.host, port_of(o, d), o.timeout) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+}
+
+/// Runs `work` as a call on the session.
+///
+/// Fails with `sql.Error.Closed` when the session is closed and `sql.Error.Busy` when another call is running. An error for which `fatal` is `true` calls `abandon` before it is returned.
+pub fn guarded[T](s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), work: fn() -> T ! sql.Error) -> T ! sql.Error {
+    if s.closed {
+        fail Closed
+    }
+    if s.busy {
+        fail Busy
+    }
+    s.busy = true
+    defer s.busy = false
+    work() catch {
+        e => {
+            if fatal(e) {
+                abandon()
+            }
+            fail e
+        }
+    }
+}
+
+fn guarded_unit(s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), work: fn() ! sql.Error) ! sql.Error {
+    guarded(s, fatal, abandon, fn() -> bool ! sql.Error {
+        work()?
+        true
+    })?
+}
+
+/// Runs the login exchange `handshake` as a call on the session and, when it fails, calls `terminate` before returning the error.
+pub fn establish(s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), terminate: fn(), handshake: fn() ! sql.Error) ! sql.Error {
+    guarded_unit(s, fatal, abandon, handshake) catch {
+        e => {
+            terminate()
+            fail e
+        }
+    }
+}
+
+/// Returns `raw` with every operation run as a call on the session, as `guarded` does.
+pub fn guard(s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), raw: sql.ConnectionHandle) -> sql.ConnectionHandle {
+    sql.ConnectionHandle {
+        dialect: raw.dialect
+        query: fn(text, values) -> sql.Rows ! sql.Error {
+            guarded(s, fatal, abandon, fn() -> sql.Rows ! sql.Error { raw.query(text, values) })
+        }
+        each: fn(text, values, visit) ! sql.Error {
+            guarded_unit(s, fatal, abandon, fn() ! sql.Error { raw.each(text, values, visit)? })?
+        }
+        execute: fn(text, values) -> i64 ! sql.Error {
+            guarded(s, fatal, abandon, fn() -> i64 ! sql.Error { raw.execute(text, values) })
+        }
+        begin: fn() ! sql.Error {
+            guarded_unit(s, fatal, abandon, fn() ! sql.Error { raw.begin()? })?
+        }
+        commit: fn() ! sql.Error {
+            guarded_unit(s, fatal, abandon, fn() ! sql.Error { raw.commit()? })?
+        }
+        rollback: fn() ! sql.Error {
+            guarded_unit(s, fatal, abandon, fn() ! sql.Error { raw.rollback()? })?
+        }
+        close: raw.close
+    }
+}
+
+/// Returns `raw` with every `query`, `each` and `execute` recorded as an OpenTelemetry database call under `scope`, tagged with the database `o.database`, the server `o.host` and the server's port, which `port_of` resolves.
+///
+/// Every driver applies it once to the handle it returns, so a connection from any driver is traced the same way.
+pub fn traced(raw: sql.ConnectionHandle, scope: str, o: sql.Options) -> sql.ConnectionHandle {
+    otel.instrument_sql(raw, scope, o.database, o.host, port_of(o, raw.dialect))
+}
+
+/// Returns the owning `sql.Connection` for a driver's `raw` handle: guarded by the session, traced under `scope` and closed when dropped.
+pub fn connection(s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), scope: str, o: sql.Options, raw: sql.ConnectionHandle) -> sql.Connection {
+    let guarded_handle = guard(s, fatal, abandon, raw)
+    let handle = traced(guarded_handle, scope, o)
+    sql.adopt(handle)
+}

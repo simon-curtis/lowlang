@@ -1,7 +1,7 @@
 import std/io
 import std/net
-import std/otel
 import std/sql
+import std/sql/driver
 import std/text
 import std/time
 import std/tls
@@ -21,13 +21,12 @@ struct Conn {
     timed_out: bool
     attention: bool
     logged_in: bool
-    busy: bool
-    closed: bool
+    session: *driver.Session
 }
 
 fn abandon(c: *Conn) -> sql.Error {
-    if !c.closed {
-        c.closed = true
+    if !c.session.closed {
+        c.session.closed = true
         c.stream.close()
     }
     if c.timed_out { sql.Error.Timeout } else { sql.Error.Closed }
@@ -345,12 +344,6 @@ fn drive(c: *Conn, describe: fn([]sql.Column), visit: fn([]sql.Column, []sql.Val
     }
 }
 
-fn ignore_columns(columns: []sql.Column) {}
-
-fn ignore_row(columns: []sql.Column, row: []sql.Value) -> bool {
-    true
-}
-
 fn request(c: *Conn, sql_text: str, values: []sql.Value) ! sql.Error {
     if values.len == 0 {
         send_message(c, packet_batch(), batch_message(sql_text, c.transaction))?
@@ -362,60 +355,37 @@ fn request(c: *Conn, sql_text: str, values: []sql.Value) ! sql.Error {
 
 fn query(c: *Conn, sql_text: str, values: []sql.Value) -> sql.Rows ! sql.Error {
     request(c, sql_text, values)?
-    var columns: []sql.Column = []
-    var rows: [][]sql.Value = []
-    drive(c, fn(described) {
-        columns = described
-        rows = []
-    }, fn(cols, row) -> bool {
-        push(mut rows, row)
-        true
-    })?
-    sql.Rows { columns, rows }
+    driver.collect(fn(describe, visit) ! sql.Error { drive(c, describe, visit)? })
 }
 
 fn execute(c: *Conn, sql_text: str, values: []sql.Value) -> i64 ! sql.Error {
     request(c, sql_text, values)?
-    drive(c, ignore_columns, ignore_row)
+    drive(c, driver.ignore_columns, driver.ignore_row)
 }
 
 fn each(c: *Conn, sql_text: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
     request(c, sql_text, values)?
-    drive(c, ignore_columns, visit)?
+    drive(c, driver.ignore_columns, visit)?
 }
 
 fn transact(c: *Conn, message: []u8) ! sql.Error {
     send_message(c, packet_transaction(), message)?
-    drive(c, ignore_columns, ignore_row)?
+    drive(c, driver.ignore_columns, driver.ignore_row)?
 }
 
-fn guarded[T](c: *Conn, work: fn() -> T ! sql.Error) -> T ! sql.Error {
-    if c.closed {
-        fail Closed
-    }
-    if c.busy {
-        fail Busy
-    }
-    c.busy = true
-    defer c.busy = false
-    work() catch {
-        Protocol => {
-            abandon(c)
-            fail Protocol
-        }
-        Unsupported => {
-            abandon(c)
-            fail Unsupported
-        }
-        e => fail e
+fn fatal(e: sql.Error) -> bool {
+    match e {
+        Protocol => true
+        Unsupported => true
+        _ => false
     }
 }
 
 fn terminate(c: *Conn) {
-    if c.closed {
+    if c.session.closed {
         return
     }
-    c.closed = true
+    c.session.closed = true
     c.stream.close()
 }
 
@@ -429,10 +399,10 @@ fn expire(c: *Conn) {
 
 fn watch(c: *Conn) {
     var wait = c.timeout
-    for !c.closed {
+    for !c.session.closed {
         sleep(wait)
         wait = c.timeout
-        if c.reading && !c.closed {
+        if c.reading && !c.session.closed {
             let idle = (time.monotonic() - c.read_started) / 1000000
             if idle >= c.timeout {
                 expire(c)
@@ -492,15 +462,10 @@ fn establish(c: *Conn, o: sql.Options, config: tls.Config?) ! sql.Error {
         }
     }
     send_message(c, packet_login(), login_message(o, o.host))?
-    drive(c, ignore_columns, ignore_row)?
+    drive(c, driver.ignore_columns, driver.ignore_row)?
     if !c.logged_in {
         fail Authentication
     }
-}
-
-fn closed_with(c: *Conn, e: sql.Error) -> sql.Error {
-    terminate(c)
-    e
 }
 
 fn open(s: io.Stream, o: sql.Options, config: tls.Config?) -> sql.Connection ! sql.Error {
@@ -519,65 +484,29 @@ fn open(s: io.Stream, o: sql.Options, config: tls.Config?) -> sql.Connection ! s
         timed_out: false
         attention: false
         logged_in: false
-        busy: false
-        closed: false
+        session: driver.session()
     })
     if c.timeout > 0 {
         spawn watch(c)
     }
-    guarded(c, fn() -> bool ! sql.Error {
-        establish(c, o, config)?
-        true
-    }) catch {
-        e => fail closed_with(c, e)
-    }
+    let abandoned = fn() { abandon(c) }
+    let closed = fn() { terminate(c) }
+    driver.establish(c.session, fatal, abandoned, closed, fn() ! sql.Error { establish(c, o, config)? })?
     let raw = sql.ConnectionHandle {
-        dialect: SqlServer
-        query: fn(sql_text, values) -> sql.Rows ! sql.Error {
-            guarded(c, fn() -> sql.Rows ! sql.Error { query(c, sql_text, values) })
-        }
-        each: fn(sql_text, values, visit) ! sql.Error {
-            guarded(c, fn() -> bool ! sql.Error {
-                each(c, sql_text, values, visit)?
-                true
-            })?
-        }
-        execute: fn(sql_text, values) -> i64 ! sql.Error {
-            guarded(c, fn() -> i64 ! sql.Error { execute(c, sql_text, values) })
-        }
-        begin: fn() ! sql.Error {
-            guarded(c, fn() -> bool ! sql.Error {
-                transact(c, begin_message(c.transaction))?
-                true
-            })?
-        }
-        commit: fn() ! sql.Error {
-            guarded(c, fn() -> bool ! sql.Error {
-                transact(c, end_message(7, c.transaction))?
-                true
-            })?
-        }
-        rollback: fn() ! sql.Error {
-            guarded(c, fn() -> bool ! sql.Error {
-                transact(c, end_message(8, c.transaction))?
-                true
-            })?
-        }
-        close: fn() { terminate(c) }
+        dialect: sql.sqlserver()
+        query: fn(sql_text, values) -> sql.Rows ! sql.Error { query(c, sql_text, values) }
+        each: fn(sql_text, values, visit) ! sql.Error { each(c, sql_text, values, visit)? }
+        execute: fn(sql_text, values) -> i64 ! sql.Error { execute(c, sql_text, values) }
+        begin: fn() ! sql.Error { transact(c, begin_message(c.transaction))? }
+        commit: fn() ! sql.Error { transact(c, end_message(7, c.transaction))? }
+        rollback: fn() ! sql.Error { transact(c, end_message(8, c.transaction))? }
+        close: closed
     }
-    let traced = otel.instrument_sql(raw, "std/sql/sqlserver", o.database, o.host, port_of(o))
-    sql.adopt(traced)
-}
-
-fn port_of(o: sql.Options) -> i64 {
-    if o.port == 0 { 1433 } else { o.port }
+    driver.connection(c.session, fatal, abandoned, "std/sql/sqlserver", o, raw)
 }
 
 fn dial(o: sql.Options) -> net.Conn ! sql.Error {
-    using conn = net.dial_within(o.host, port_of(o), o.timeout) catch {
-        TimedOut => fail Timeout
-        _ => fail Connect
-    }
+    using conn = driver.dial(o, sql.sqlserver())?
     net.set_nodelay(conn, true) catch {
         _ => {}
     }

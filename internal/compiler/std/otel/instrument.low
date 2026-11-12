@@ -298,15 +298,6 @@ pub fn end_with(c: Call, error_type: str) {
     ])
 }
 
-/// Returns the `db.system.name` value for a SQL dialect: `postgresql`, `microsoft.sql_server` or `sqlite`.
-pub fn system_name(d: sql.Dialect) -> str {
-    match d {
-        Postgres => "postgresql"
-        SqlServer => "microsoft.sql_server"
-        Sqlite => "sqlite"
-    }
-}
-
 fn end_failed(c: Call, e: sql.Error) {
     match e {
         Server(code, _) => {
@@ -328,39 +319,50 @@ fn traced_sql[T](c: Call, work: fn() -> T ! sql.Error) -> T ! sql.Error {
     out
 }
 
-/// Runs `db.query` inside a database call and returns its rows.
-/// `operation` and `collection` name what the statement does and where; see `db_span`. An `sql.Error` is returned unchanged and its variant name becomes `error.type`; for a `Server` error the code is used and also set as `db.response.status_code`. With no SDK active the query runs directly.
-pub fn sql_query(db: sql.ConnectionHandle, scope: str, operation: str, collection: str, query: str, values: []sql.Value) -> sql.Rows ! sql.Error {
-    let c = db_span(scope, system_name(db.dialect), operation, collection, query)
+fn untagged(c: Call) {}
+
+fn sql_call[T](db: sql.ConnectionHandle, scope: str, operation: str, collection: str, query: str, endpoint: fn(Call), work: fn() -> T ! sql.Error) -> T ! sql.Error {
+    let c = db_span(scope, db.dialect.system, operation, collection, query)
     if !recording(c) {
-        return db.query(query, values)
+        return work()
     }
-    traced_sql(c, fn() -> sql.Rows ! sql.Error { db.query(query, values) })
+    endpoint(c)
+    traced_sql(c, work)
 }
 
-/// Runs `db.execute` inside a database call and returns the affected row count. The span and errors are handled as in `sql_query`.
-pub fn sql_execute(db: sql.ConnectionHandle, scope: str, operation: str, collection: str, query: str, values: []sql.Value) -> i64 ! sql.Error {
-    let c = db_span(scope, system_name(db.dialect), operation, collection, query)
-    if !recording(c) {
-        return db.execute(query, values)
-    }
-    traced_sql(c, fn() -> i64 ! sql.Error { db.execute(query, values) })
+fn query_call(db: sql.ConnectionHandle, scope: str, operation: str, collection: str, query: str, values: []sql.Value, endpoint: fn(Call)) -> sql.Rows ! sql.Error {
+    sql_call(db, scope, operation, collection, query, endpoint, fn() -> sql.Rows ! sql.Error { db.query(query, values) })
 }
 
-/// Runs `db.each` inside a database call, passing each row to `visit`. The span and errors are handled as in `sql_query`.
-pub fn sql_each(db: sql.ConnectionHandle, scope: str, operation: str, collection: str, query: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
-    let c = db_span(scope, system_name(db.dialect), operation, collection, query)
-    if !recording(c) {
-        return db.each(query, values, visit)
-    }
-    traced_sql(c, fn() -> bool ! sql.Error {
+fn execute_call(db: sql.ConnectionHandle, scope: str, operation: str, collection: str, query: str, values: []sql.Value, endpoint: fn(Call)) -> i64 ! sql.Error {
+    sql_call(db, scope, operation, collection, query, endpoint, fn() -> i64 ! sql.Error { db.execute(query, values) })
+}
+
+fn each_call(db: sql.ConnectionHandle, scope: str, operation: str, collection: str, query: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool, endpoint: fn(Call)) ! sql.Error {
+    sql_call(db, scope, operation, collection, query, endpoint, fn() -> bool ! sql.Error {
         db.each(query, values, visit)?
         true
     })?
 }
 
+/// Runs `db.query` inside a database call and returns its rows.
+/// `operation` and `collection` name what the statement does and where; see `db_span`. An `sql.Error` is returned unchanged and its variant name becomes `error.type`; for a `Server` error the code is used and also set as `db.response.status_code`. With no SDK active the query runs directly.
+pub fn sql_query(db: sql.ConnectionHandle, scope: str, operation: str, collection: str, query: str, values: []sql.Value) -> sql.Rows ! sql.Error {
+    query_call(db, scope, operation, collection, query, values, untagged)
+}
+
+/// Runs `db.execute` inside a database call and returns the affected row count. The span and errors are handled as in `sql_query`.
+pub fn sql_execute(db: sql.ConnectionHandle, scope: str, operation: str, collection: str, query: str, values: []sql.Value) -> i64 ! sql.Error {
+    execute_call(db, scope, operation, collection, query, values, untagged)
+}
+
+/// Runs `db.each` inside a database call, passing each row to `visit`. The span and errors are handled as in `sql_query`.
+pub fn sql_each(db: sql.ConnectionHandle, scope: str, operation: str, collection: str, query: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
+    each_call(db, scope, operation, collection, query, values, visit, untagged)?
+}
+
 /// Returns a connection handle whose `query`, `each` and `execute` run inside database calls and whose other functions are those of `db`.
-/// `namespace` is set as `db.namespace` when it is not empty, and `server` and `port` as `server.address` and `server.port`. The operation comes from the first word of the statement and the collection is not set.
+/// `namespace` is set as `db.namespace` when it is not empty, and `server` and `port` as `server.address` and `server.port`. The operation comes from the first word of the statement and the collection is not set. The drivers apply it once, through `std/sql/driver`.
 pub fn instrument_sql(db: sql.ConnectionHandle, scope: str, namespace: str, server: str, port: i64) -> sql.ConnectionHandle {
     let endpoint = fn(c: Call) {
         if namespace.len > 0 {
@@ -371,33 +373,9 @@ pub fn instrument_sql(db: sql.ConnectionHandle, scope: str, namespace: str, serv
     }
     sql.ConnectionHandle {
         dialect: db.dialect
-        query: fn(query, values) -> sql.Rows ! sql.Error {
-            let c = db_span(scope, system_name(db.dialect), "", "", query)
-            if !recording(c) {
-                return db.query(query, values)
-            }
-            endpoint(c)
-            traced_sql(c, fn() -> sql.Rows ! sql.Error { db.query(query, values) })
-        }
-        each: fn(query, values, visit) ! sql.Error {
-            let c = db_span(scope, system_name(db.dialect), "", "", query)
-            if !recording(c) {
-                return db.each(query, values, visit)
-            }
-            endpoint(c)
-            traced_sql(c, fn() -> bool ! sql.Error {
-                db.each(query, values, visit)?
-                true
-            })?
-        }
-        execute: fn(query, values) -> i64 ! sql.Error {
-            let c = db_span(scope, system_name(db.dialect), "", "", query)
-            if !recording(c) {
-                return db.execute(query, values)
-            }
-            endpoint(c)
-            traced_sql(c, fn() -> i64 ! sql.Error { db.execute(query, values) })
-        }
+        query: fn(query, values) -> sql.Rows ! sql.Error { query_call(db, scope, "", "", query, values, endpoint) }
+        each: fn(query, values, visit) ! sql.Error { each_call(db, scope, "", "", query, values, visit, endpoint)? }
+        execute: fn(query, values) -> i64 ! sql.Error { execute_call(db, scope, "", "", query, values, endpoint) }
         begin: db.begin
         commit: db.commit
         rollback: db.rollback

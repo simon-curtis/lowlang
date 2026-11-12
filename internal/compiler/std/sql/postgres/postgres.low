@@ -3,8 +3,8 @@ import std/crypto
 import std/crypto/md5
 import std/io
 import std/net
-import std/otel
 import std/sql
+import std/sql/driver
 import std/text
 import std/tls
 
@@ -22,8 +22,7 @@ struct Conn {
     parsing: str
     parsing_name: str
     counter: i64
-    busy: bool
-    closed: bool
+    session: *driver.Session
 }
 
 fn statement_capacity() -> i64 {
@@ -39,8 +38,8 @@ fn each_batch() -> i64 {
 }
 
 fn abandon(c: *Conn, timed_out: bool) -> sql.Error {
-    if !c.closed {
-        c.closed = true
+    if !c.session.closed {
+        c.session.closed = true
         if timed_out {
             c.cancel(c.process, c.secret)
         }
@@ -324,42 +323,27 @@ fn extended(c: *Conn, sql_text: str, values: []sql.Value, batch: i64) ! sql.Erro
     send(c, b)?
 }
 
-fn ignore_columns(columns: []sql.Column) {}
-
-fn ignore_row(columns: []sql.Column, row: []sql.Value) -> bool {
-    true
+fn start(c: *Conn, sql_text: str, values: []sql.Value) ! sql.Error {
+    if values.len == 0 {
+        simple(c, sql_text)?
+    } else {
+        extended(c, sql_text, values, 0)?
+    }
 }
 
 fn query(c: *Conn, sql_text: str, values: []sql.Value) -> sql.Rows ! sql.Error {
-    if values.len == 0 {
-        simple(c, sql_text)?
-    } else {
-        extended(c, sql_text, values, 0)?
-    }
-    var columns: []sql.Column = []
-    var rows: [][]sql.Value = []
-    drive(c, 0, fn(described) {
-        columns = described
-        rows = []
-    }, fn(cols, row) -> bool {
-        push(mut rows, row)
-        true
-    })?
-    sql.Rows { columns, rows }
+    start(c, sql_text, values)?
+    driver.collect(fn(describe, visit) ! sql.Error { drive(c, 0, describe, visit)? })
 }
 
 fn execute(c: *Conn, sql_text: str, values: []sql.Value) -> i64 ! sql.Error {
-    if values.len == 0 {
-        simple(c, sql_text)?
-    } else {
-        extended(c, sql_text, values, 0)?
-    }
-    drive(c, 0, ignore_columns, ignore_row)
+    start(c, sql_text, values)?
+    drive(c, 0, driver.ignore_columns, driver.ignore_row)
 }
 
 fn each(c: *Conn, sql_text: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
     extended(c, sql_text, values, each_batch())?
-    drive(c, each_batch(), ignore_columns, visit)?
+    drive(c, each_batch(), driver.ignore_columns, visit)?
 }
 
 fn commit(c: *Conn) ! sql.Error {
@@ -370,30 +354,19 @@ fn commit(c: *Conn) ! sql.Error {
     execute(c, "COMMIT", [])?
 }
 
-fn guarded[T](c: *Conn, work: fn() -> T ! sql.Error) -> T ! sql.Error {
-    if c.closed {
-        fail Closed
-    }
-    if c.busy {
-        fail Busy
-    }
-    c.busy = true
-    defer c.busy = false
-    work() catch {
-        Protocol => {
-            abandon(c, false)
-            fail Protocol
-        }
-        e => fail e
+fn fatal(e: sql.Error) -> bool {
+    match e {
+        Protocol => true
+        _ => false
     }
 }
 
 fn terminate(c: *Conn) {
-    if c.closed {
+    if c.session.closed {
         return
     }
-    c.closed = true
-    if !c.busy {
+    c.session.closed = true
+    if !c.session.busy {
         var b: []u8 = []
         put_empty(mut b, 'X')
         io.write_all(c.stream, b) catch {
@@ -481,61 +454,26 @@ fn open(s: io.Stream, o: sql.Options, cancel: fn(i64, []u8)) -> sql.Connection !
         parsing: ""
         parsing_name: ""
         counter: 0
-        busy: false
-        closed: false
+        session: driver.session()
     })
-    guarded(c, fn() -> bool ! sql.Error {
-        authenticate(c, o)?
-        true
-    }) catch {
-        e => fail closed_with(c, e)
-    }
+    let abandoned = fn() { abandon(c, false) }
+    let closed = fn() { terminate(c) }
+    driver.establish(c.session, fatal, abandoned, closed, fn() ! sql.Error { authenticate(c, o)? })?
     let raw = sql.ConnectionHandle {
-        dialect: Postgres
-        query: fn(sql_text, values) -> sql.Rows ! sql.Error {
-            guarded(c, fn() -> sql.Rows ! sql.Error { query(c, sql_text, values) })
-        }
-        each: fn(sql_text, values, visit) ! sql.Error {
-            guarded(c, fn() -> bool ! sql.Error {
-                each(c, sql_text, values, visit)?
-                true
-            })?
-        }
-        execute: fn(sql_text, values) -> i64 ! sql.Error {
-            guarded(c, fn() -> i64 ! sql.Error { execute(c, sql_text, values) })
-        }
-        begin: fn() ! sql.Error {
-            guarded(c, fn() -> i64 ! sql.Error { execute(c, "BEGIN", []) })?
-        }
-        commit: fn() ! sql.Error {
-            guarded(c, fn() -> bool ! sql.Error {
-                commit(c)?
-                true
-            })?
-        }
-        rollback: fn() ! sql.Error {
-            guarded(c, fn() -> i64 ! sql.Error { execute(c, "ROLLBACK", []) })?
-        }
-        close: fn() { terminate(c) }
+        dialect: sql.postgres()
+        query: fn(sql_text, values) -> sql.Rows ! sql.Error { query(c, sql_text, values) }
+        each: fn(sql_text, values, visit) ! sql.Error { each(c, sql_text, values, visit)? }
+        execute: fn(sql_text, values) -> i64 ! sql.Error { execute(c, sql_text, values) }
+        begin: fn() ! sql.Error { execute(c, "BEGIN", [])? }
+        commit: fn() ! sql.Error { commit(c)? }
+        rollback: fn() ! sql.Error { execute(c, "ROLLBACK", [])? }
+        close: closed
     }
-    let traced = otel.instrument_sql(raw, "std/sql/postgres", o.database, o.host, port_of(o))
-    sql.adopt(traced)
-}
-
-fn closed_with(c: *Conn, e: sql.Error) -> sql.Error {
-    terminate(c)
-    e
-}
-
-fn port_of(o: sql.Options) -> i64 {
-    if o.port == 0 { 5432 } else { o.port }
+    driver.connection(c.session, fatal, abandoned, "std/sql/postgres", o, raw)
 }
 
 fn dial(o: sql.Options) -> net.Conn ! sql.Error {
-    using conn = net.dial_within(o.host, port_of(o), o.timeout) catch {
-        TimedOut => fail Timeout
-        _ => fail Connect
-    }
+    using conn = driver.dial(o, sql.postgres())?
     net.set_read_timeout(conn, o.timeout)
     net.set_write_timeout(conn, o.timeout)
     conn
@@ -543,7 +481,7 @@ fn dial(o: sql.Options) -> net.Conn ! sql.Error {
 
 fn canceller(o: sql.Options) -> fn(i64, []u8) {
     fn(process: i64, secret: []u8) {
-        using conn = net.dial_within(o.host, port_of(o), o.timeout) catch {
+        using conn = driver.dial(o, sql.postgres()) catch {
             _ => return
         }
         net.write_all(conn, cancel_request(process, secret)) catch {

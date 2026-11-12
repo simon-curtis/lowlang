@@ -61,9 +61,9 @@ pub struct Entry {
 
 /// Why a migration operation failed.
 pub enum Error {
-    /// A statement outside any migration failed: creating or reading the migration table or taking the lock.
+    /// A statement outside any migration failed: creating or reading the migration table, or taking or releasing the lock.
     Sql(cause: sql.Error)
-    /// The migration with this version failed, so its transaction was rolled back and earlier migrations stay applied. `cause` is the database error.
+    /// The migration with this version failed, so its transaction was rolled back and earlier migrations stay applied. `cause` is the database error, or the rollback's error when the rollback failed too.
     Failed(version: i64, cause: sql.Error)
     /// Two migrations share this version.
     Duplicate(version: i64)
@@ -156,11 +156,9 @@ fn table_of(d: sql.Dialect, p: Plan) -> str {
 }
 
 fn create_text(d: sql.Dialect, p: Plan) -> str {
-    let t = table_of(d, p)
-    match d {
-        SqlServer => "IF OBJECT_ID(N'{p.table}', N'U') IS NULL CREATE TABLE {t} (version BIGINT NOT NULL PRIMARY KEY, name NVARCHAR(255) NOT NULL, applied_at BIGINT NOT NULL, checksum VARCHAR(64) NOT NULL)"
-        _ => "CREATE TABLE IF NOT EXISTS {t} (version BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL, checksum TEXT NOT NULL)"
-    }
+    let types = d.types
+    let columns = "version {types.large} NOT NULL PRIMARY KEY, name {types.short_text} NOT NULL, applied_at {types.large} NOT NULL, checksum {types.short_text} NOT NULL"
+    sql.create_table_if_missing(d, p.table, columns)
 }
 
 fn lock_key(p: Plan) -> i64 {
@@ -172,31 +170,15 @@ fn lock_key(p: Plan) -> i64 {
     key
 }
 
-fn lock_text(d: sql.Dialect) -> str {
-    match d {
-        Postgres => "SELECT pg_advisory_lock({sql.placeholder(d, 0)})"
-        SqlServer => "DECLARE @status INT; EXEC @status = sp_getapplock @Resource = {sql.placeholder(d, 0)}, @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = -1; SELECT @status"
-        Sqlite => ""
-    }
-}
-
-fn unlock_text(d: sql.Dialect) -> str {
-    match d {
-        Postgres => "SELECT pg_advisory_unlock({sql.placeholder(d, 0)})"
-        SqlServer => "EXEC sp_releaseapplock @Resource = {sql.placeholder(d, 0)}, @LockOwner = 'Session'"
-        Sqlite => ""
-    }
-}
-
 fn lock_value(d: sql.Dialect, p: Plan) -> sql.Value {
-    match d {
-        SqlServer => Text("low.migrate:{p.table}")
+    match d.lock.key {
+        Name => Text("low.migrate:{p.table}")
         _ => Int(lock_key(p))
     }
 }
 
 fn acquire_lock(h: sql.ConnectionHandle, p: Plan) ! Error {
-    let statement = lock_text(h.dialect)
+    let statement = h.dialect.lock.acquire
     if statement.len == 0 {
         return
     }
@@ -204,19 +186,32 @@ fn acquire_lock(h: sql.ConnectionHandle, p: Plan) ! Error {
     let rows = h.query(statement, values) catch {
         e => fail Sql(e)
     }
-    if h.dialect == SqlServer && rows.rows.len > 0 && int_at(rows.rows[0][0]) < 0 {
+    if rows.rows.len > 0 && rows.rows[0].len > 0 && int_at(rows.rows[0][0]) < 0 {
         fail Locked
     }
 }
 
-fn release_lock(h: sql.ConnectionHandle, p: Plan) {
-    let statement = unlock_text(h.dialect)
+fn release_lock(h: sql.ConnectionHandle, p: Plan) -> Error? {
+    let statement = h.dialect.lock.release
     if statement.len == 0 {
-        return
+        return none
     }
     let values = [lock_value(h.dialect, p)]
     h.execute(statement, values) catch {
-        _ => 0
+        e => return Sql(e)
+    }
+    none
+}
+
+fn released(h: sql.ConnectionHandle, p: Plan, failure: Error?) ! Error {
+    let release = release_lock(h, p)
+    match failure {
+        some(e) => fail e
+        none => {}
+    }
+    match release {
+        some(e) => fail e
+        none => {}
     }
 }
 
@@ -259,15 +254,10 @@ fn read_records(h: sql.ConnectionHandle, p: Plan) -> []Record ! Error {
     out
 }
 
-fn rollback_quietly(h: sql.ConnectionHandle) {
-    h.rollback() catch {
-        _ => {}
-    }
-}
-
 fn begin_transaction(h: sql.ConnectionHandle) ! sql.Error {
-    if h.dialect == Sqlite {
-        h.execute("BEGIN IMMEDIATE", [])?
+    let statement = h.dialect.begin_write
+    if statement.len > 0 {
+        h.execute(statement, [])?
         return
     }
     h.begin()?
@@ -278,16 +268,10 @@ fn transact(h: sql.ConnectionHandle, version: i64, work: fn() ! sql.Error) ! Err
         e => fail Failed(version, e)
     }
     work() catch {
-        e => {
-            rollback_quietly(h)
-            fail Failed(version, e)
-        }
+        e => fail Failed(version, sql.rolled_back(h, e))
     }
     h.commit() catch {
-        e => {
-            rollback_quietly(h)
-            fail Failed(version, e)
-        }
+        e => fail Failed(version, sql.rolled_back(h, e))
     }
 }
 
@@ -430,15 +414,16 @@ fn revert_latest(h: sql.ConnectionHandle, p: Plan, steps: i64, mut reverted: []i
     }
 }
 
-fn prepare(h: sql.ConnectionHandle, p: Plan) ! Error {
+fn locked(h: sql.ConnectionHandle, p: Plan, work: fn() ! Error) ! Error {
     validate(p)?
     acquire_lock(h, p)?
-    ensure_table(h, p) catch {
+    var failure: Error? = none
+    work() catch {
         e => {
-            release_lock(h, p)
-            fail e
+            failure = e
         }
     }
+    released(h, p, failure)?
 }
 
 /// Applies every pending migration of `p` through `h` and returns the versions it applied, in order.
@@ -450,21 +435,13 @@ pub fn up_on(h: sql.ConnectionHandle, p: Plan) -> []i64 ! Error {
 
 /// Applies the pending migrations of `p` up to and including `version` through `h` and returns the versions it applied, in order.
 ///
-/// Validates the plan, takes the migration lock, creates the migration table if it is missing, and releases the lock before returning. The lock is a session advisory lock on Postgres, an application lock on SQL Server that waits for the holder, and absent on SQLite. Fails with `Drift` if an applied migration's checksum no longer matches and `OutOfOrder` if a pending migration is below the highest applied version. Each migration runs in its own transaction with its record, and is skipped if another session recorded it first, so a failure leaves earlier migrations applied and returns `Failed` for the failing one. Returns an empty list when nothing is pending.
+/// Validates the plan, takes the migration lock, creates the migration table if it is missing, and releases the lock before returning; a failed release fails with `Sql` unless an earlier error is returned instead. The lock is a session advisory lock on Postgres, an application lock on SQL Server that waits for the holder, and absent on SQLite. Fails with `Drift` if an applied migration's checksum no longer matches and `OutOfOrder` if a pending migration is below the highest applied version. Each migration runs in its own transaction with its record, and is skipped if another session recorded it first, so a failure leaves earlier migrations applied and returns `Failed` for the failing one. Returns an empty list when nothing is pending.
 pub fn up_to_on(h: sql.ConnectionHandle, p: Plan, version: i64) -> []i64 ! Error {
-    prepare(h, p)?
     var applied: []i64 = []
-    var failure: Error? = none
-    apply_pending(h, p, version, mut applied) catch {
-        e => {
-            failure = e
-        }
-    }
-    release_lock(h, p)
-    match failure {
-        some(e) => fail e
-        none => {}
-    }
+    locked(h, p, fn() ! Error {
+        ensure_table(h, p)?
+        apply_pending(h, p, version, mut applied)?
+    })?
     applied
 }
 
@@ -472,19 +449,11 @@ pub fn up_to_on(h: sql.ConnectionHandle, p: Plan, version: i64) -> []i64 ! Error
 ///
 /// Validates the plan, takes the migration lock and creates the migration table as `up_to_on` does. Before reverting anything it fails with `Unknown` for an applied version missing from the plan and `NoDown` for one without `down` statements. Each migration is reverted in its own transaction together with the removal of its record, so a failure returns `Failed` and leaves the earlier reversions in place. Reverts nothing when `steps` is `0` or less or nothing is applied.
 pub fn down_on(h: sql.ConnectionHandle, p: Plan, steps: i64) -> []i64 ! Error {
-    prepare(h, p)?
     var reverted: []i64 = []
-    var failure: Error? = none
-    revert_latest(h, p, steps, mut reverted) catch {
-        e => {
-            failure = e
-        }
-    }
-    release_lock(h, p)
-    match failure {
-        some(e) => fail e
-        none => {}
-    }
+    locked(h, p, fn() ! Error {
+        ensure_table(h, p)?
+        revert_latest(h, p, steps, mut reverted)?
+    })?
     reverted
 }
 
