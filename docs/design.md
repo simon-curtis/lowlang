@@ -2,6 +2,28 @@
 
 Low compiles to static native binaries with no libc dependency, has a tracing garbage collector and green threads with channels, and adds sum-type enums and typed error returns on top of a Go-sized core.
 
+| Command | Does |
+| --- | --- |
+| `low run` | Compiles and runs a file or a module directory. |
+| `low build` | Writes a native binary. `-o` names it and `-target` picks `linux/amd64` or `windows/amd64` and defaults to the host. |
+| `low dev` | Runs the program and patches changed functions into it on save. Changing `main`, a type's layout or a function's signature restarts it. Needs a Linux host with binutils. |
+| `low ir` | Prints the optimised SSA form. |
+| `low asm` | Prints the generated assembly. |
+| `low lint` | Type-checks the program and prints its warnings. |
+| `low doc` | Prints the public API of every module under a directory as JSON. |
+| `low lsp` | Starts the language server that the editor extensions use. |
+| `low version` | Prints the release, or `dev+` and the commit for a build from source. |
+
+A directory is a module. A `low.mod` file marks the project root, and `import ui/text` loads `ui/text/` under it. The standard library is imported as `std/...`, and the editor extensions need `low` on `PATH`.
+
+Build from source with Go 1.27.3:
+
+```
+$ git clone https://github.com/simon-curtis/lowlang
+$ cd lowlang
+$ go install ./cmd/low
+```
+
 ## Goals
 
 - Compile speed and binary size comparable to Go.

@@ -87,7 +87,7 @@ python3 ../assets/brand/build.py
 - renders `docs/design.md` and `editors/README.md` into `site/docs/`;
 - renders the standard library from `low doc std` into `site/packages/`, one page per module, with each module's description from the table in `docs/design.md`;
 - highlights every Low snippet, including the examples in std doc comments, with hover text and references from the LSP, and links each name to its definition: a declaration in the same snippet, an item in `site/packages/`, or the builtin's entry in the `## Builtins` chapter of `docs/design.md`;
-- writes `style.css` from `tailwind.css` and copies Lenis to `lenis.js`;
+- writes `style.css` from `tailwind.css`;
 - appends a content hash to every stylesheet and script reference in the pages, as `style.css?v=…`, so a browser never pairs a new page with a cached old asset.
 
 `build.py` regenerates the icons, social images and web manifest from the mark. It needs `rsvg-convert`, `magick` and Noto Sans.

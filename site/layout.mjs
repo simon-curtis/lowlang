@@ -4,7 +4,6 @@ export const origin = "https://low.simoncurtis.dev";
 
 const sections = [
     { name: "Overview", path: "index.html" },
-    { name: "Reference", path: "reference.html" },
     { name: "Docs", path: "docs/index.html" },
     { name: "Packages", path: "packages/index.html" },
 ];
@@ -19,7 +18,7 @@ function navigation(root, current) {
 
 export function layout({ path, heading, title, description, current, sidebar, body, scripts = [] }) {
     const root = "../".repeat(path.split("/").length - 1);
-    const scriptTags = ["lenis.js", "scroll.js", "hover.js", ...scripts].map((script) => `<script src="${root}${script}" defer></script>`).join("\n");
+    const scriptTags = ["hover.js", ...scripts].map((script) => `<script src="${root}${script}" defer></script>`).join("\n");
     return `<!doctype html>
 <html lang="en">
 <head>
