@@ -422,6 +422,7 @@ func (b *isaBuilder) addControl() {
 
 func (b *isaBuilder) addFixed() {
 	b.add("nop", newForm(0x90))
+	b.add("hlt", newForm(0xF4))
 	b.add("leave", newForm(0xC9))
 	b.add("syscall", newForm(0x05).in(space0F))
 	b.add("cpuid", newForm(0xA2).in(space0F))

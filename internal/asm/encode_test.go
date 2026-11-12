@@ -80,6 +80,7 @@ func TestRegisterAndImmediateEncodings(t *testing.T) {
 		{"imul rax, rbx, 300", "48 69 c3 2c 01 00 00"},
 		{"shl rax, 1", "48 d1 e0"},
 		{"shl r9d, cl", "41 d3 e1"},
+		{"hlt", "f4"},
 	})
 }
 
