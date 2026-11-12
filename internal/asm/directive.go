@@ -26,7 +26,7 @@ func (a *assembler) directive(name string) {
 	case ".globl", ".global":
 		a.globals()
 	case ".text", ".data", ".bss":
-		a.section(name, "", false, false)
+		a.defaultSection(name)
 		a.expectEnd()
 	case ".section":
 		a.sectionDirective()
@@ -79,7 +79,7 @@ func (a *assembler) alignDirective() {
 }
 
 func (a *assembler) markConstantData() {
-	if a.cur.exec {
+	if a.cur.exec() {
 		a.cur.last = lastDirective
 	}
 }
@@ -151,10 +151,9 @@ func (a *assembler) sectionDirective() {
 	if name == "" {
 		a.fail(".section needs a name")
 	}
-	flags, noBits, hasFlags := "", false, false
+	spec := sectionDefaults[name]
 	if s.accept(',') {
-		hasFlags = true
-		flags = a.stringLiteral()
+		spec = sectionSpec{flags: a.sectionFlags(a.stringLiteral())}
 		for s.accept(',') {
 			s.skipSpace()
 			if s.peek() != '@' {
@@ -162,11 +161,32 @@ func (a *assembler) sectionDirective() {
 			}
 			s.pos++
 			typeName := s.ident()
-			noBits = a.sectionType(typeName)
+			spec.noBits = a.sectionType(typeName)
 		}
 	}
-	a.section(name, flags, hasFlags, noBits)
+	a.section(name, spec)
 	a.expectEnd()
+}
+
+var sectionFlagLetters = map[rune]SectionFlags{
+	'a': FlagAlloc,
+	'w': FlagWrite,
+	'x': FlagExec,
+	'T': FlagTLS,
+	'r': FlagReadOnly,
+	'd': 0,
+}
+
+func (a *assembler) sectionFlags(letters string) SectionFlags {
+	var flags SectionFlags
+	for _, letter := range letters {
+		flag, known := sectionFlagLetters[letter]
+		if !known {
+			a.fail("unsupported section flag %q", letter)
+		}
+		flags |= flag
+	}
+	return flags
 }
 
 func (a *assembler) sectionType(name string) bool {

@@ -78,7 +78,7 @@ func (a *assembler) instruction(mnemonic string) {
 		}
 	}
 	a.expectEnd()
-	if !a.cur.exec {
+	if !a.cur.exec() {
 		a.fail("instruction %s in non-executable section %s", mnemonic, a.cur.Name)
 	}
 	a.assemble(mnemonic, prefix, ops[:count])

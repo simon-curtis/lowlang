@@ -1,20 +1,21 @@
 package link
 
 import (
-	"bytes"
 	"debug/elf"
-	"encoding/binary"
 )
 
 const (
-	symSize      uint64 = 24
 	tableAlign   uint64 = 8
-	shdrSize     uint64 = 64
-	machineAMD   uint16 = 62
-	elfVersion   uint8  = 1
 	symtabName          = ".symtab"
 	strtabName          = ".strtab"
 	shstrtabName        = ".shstrtab"
+)
+
+var (
+	headerSize = structSize(elf.Header64{})
+	phdrSize   = structSize(elf.Prog64{})
+	shdrSize   = structSize(elf.Section64{})
+	symSize    = structSize(elf.Sym64{})
 )
 
 type segment struct {
@@ -68,9 +69,11 @@ func (t *stringTable) addOnce(name string) uint32 {
 	return offset
 }
 
-func (l *linker) buildTables() *tables {
+func (l *linker) buildTables() (*tables, error) {
 	t := &tables{}
-	l.buildSymbolTable(t)
+	if err := l.buildSymbolTable(t); err != nil {
+		return nil, err
+	}
 	names := newStringTable()
 	for _, s := range l.sections {
 		t.sectionName = append(t.sectionName, names.add(s.in.Name))
@@ -85,14 +88,14 @@ func (l *linker) buildTables() *tables {
 	t.shstrOff = t.strOff + uint64(len(t.strtab))
 	t.shOff = alignUp(t.shstrOff+uint64(len(t.shstrtab)), tableAlign)
 	t.size = t.shOff + l.sectionHeaderCount()*shdrSize
-	return t
+	return t, nil
 }
 
 func (l *linker) sectionHeaderCount() uint64 {
 	return uint64(len(l.sections)) + 4
 }
 
-func (l *linker) buildSymbolTable(t *tables) {
+func (l *linker) buildSymbolTable(t *tables) error {
 	names := newStringTable()
 	locals, globals := l.emittedSymbols()
 	var symbols []elf.Sym64
@@ -111,15 +114,15 @@ func (l *linker) buildSymbolTable(t *tables) {
 	for _, entry := range globals {
 		symbols = append(symbols, l.symbolEntry(names, entry, elf.STB_GLOBAL))
 	}
-	t.symtab = make([]byte, 0, len(symbols)*int(symSize))
-	for i := range symbols {
-		t.symtab = binary.LittleEndian.AppendUint32(t.symtab, symbols[i].Name)
-		t.symtab = append(t.symtab, symbols[i].Info, symbols[i].Other)
-		t.symtab = binary.LittleEndian.AppendUint16(t.symtab, symbols[i].Shndx)
-		t.symtab = binary.LittleEndian.AppendUint64(t.symtab, symbols[i].Value)
-		t.symtab = binary.LittleEndian.AppendUint64(t.symtab, symbols[i].Size)
+	w := &structWriter{}
+	w.add(symbols)
+	symtab, err := w.bytes()
+	if err != nil {
+		return err
 	}
+	t.symtab = symtab
 	t.strtab = names.data
+	return nil
 }
 
 func (l *linker) symbolEntry(names *stringTable, entry linkerSymbol, bind elf.SymBind) elf.Sym64 {
@@ -135,11 +138,11 @@ func (l *linker) symbolEntry(names *stringTable, entry linkerSymbol, bind elf.Sy
 	}
 }
 
-func (l *linker) writeHeaders(image []byte, entry uint64, t *tables) {
+func (l *linker) writeHeaders(image []byte, entry uint64, t *tables) error {
 	header := elf.Header64{
 		Type:      uint16(elf.ET_EXEC),
-		Machine:   machineAMD,
-		Version:   uint32(elfVersion),
+		Machine:   uint16(elf.EM_X86_64),
+		Version:   uint32(elf.EV_CURRENT),
 		Entry:     entry,
 		Phoff:     headerSize,
 		Shoff:     t.shOff,
@@ -153,25 +156,26 @@ func (l *linker) writeHeaders(image []byte, entry uint64, t *tables) {
 	copy(header.Ident[:], elf.ELFMAG)
 	header.Ident[elf.EI_CLASS] = byte(elf.ELFCLASS64)
 	header.Ident[elf.EI_DATA] = byte(elf.ELFDATA2LSB)
-	header.Ident[elf.EI_VERSION] = elfVersion
+	header.Ident[elf.EI_VERSION] = byte(elf.EV_CURRENT)
 	header.Ident[elf.EI_OSABI] = byte(elf.ELFOSABI_NONE)
-	l.put(image, 0, &header)
-	for i, seg := range l.segments {
+	w := &structWriter{}
+	w.add(&header)
+	for _, seg := range l.segments {
 		prog := elf.Prog64{
 			Type: uint32(seg.kind), Flags: uint32(seg.flags), Off: seg.off,
 			Vaddr: seg.addr, Paddr: seg.addr, Filesz: seg.fileSize, Memsz: seg.memSize, Align: seg.align,
 		}
-		l.put(image, headerSize+uint64(i)*phdrSize, &prog)
+		w.add(&prog)
 	}
+	encoded, err := w.bytes()
+	if err != nil {
+		return err
+	}
+	copy(image, encoded)
+	return nil
 }
 
-func (l *linker) put(image []byte, at uint64, value any) {
-	var buf bytes.Buffer
-	binary.Write(&buf, binary.LittleEndian, value)
-	copy(image[at:], buf.Bytes())
-}
-
-func (l *linker) writeTables(image []byte, t *tables) {
+func (l *linker) writeTables(image []byte, t *tables) error {
 	copy(image[t.symOff:], t.symtab)
 	copy(image[t.strOff:], t.strtab)
 	copy(image[t.shstrOff:], t.shstrtab)
@@ -193,7 +197,12 @@ func (l *linker) writeTables(image []byte, t *tables) {
 			Name: t.shstrName, Type: uint32(elf.SHT_STRTAB), Off: t.shstrOff, Size: uint64(len(t.shstrtab)), Addralign: 1,
 		},
 	)
-	for i := range headers {
-		l.put(image, t.shOff+uint64(i)*shdrSize, &headers[i])
+	w := &structWriter{}
+	w.add(headers)
+	encoded, err := w.bytes()
+	if err != nil {
+		return err
 	}
+	copy(image[t.shOff:], encoded)
+	return nil
 }

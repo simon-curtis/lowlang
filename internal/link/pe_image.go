@@ -2,18 +2,20 @@ package link
 
 import (
 	"debug/pe"
-	"encoding/binary"
 )
 
 const (
-	peSignatureSize      uint64 = 4
-	peFileHeaderSize     uint64 = 20
-	peOptionalHeaderSize uint64 = 240
-	peSectionHeaderSize  uint64 = 40
-	peLinkerMajor        uint8  = 14
-	peVersionMajor       uint16 = 6
-	peDataDirectories           = 16
-	peFileTimestamp      uint64 = 4
+	peLinkerMajor     uint8  = 14
+	peVersionMajor    uint16 = 6
+	pePlus64Magic     uint16 = 0x20b
+	peDataDirectories        = len(pe.OptionalHeader64{}.DataDirectory)
+)
+
+var (
+	peSignatureSize      = structSize(peSignature)
+	peFileHeaderSize     = structSize(pe.FileHeader{})
+	peOptionalHeaderSize = structSize(pe.OptionalHeader64{})
+	peSectionHeaderSize  = structSize(pe.SectionHeader32{})
 )
 
 const (
@@ -46,14 +48,6 @@ var peDOSStub = [120]byte{
 	0x44, 0x4f, 0x53, 0x20, 0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x24, 0x00, 0x00,
 }
 
-type peHeaderWriter struct {
-	data []byte
-}
-
-func (w *peHeaderWriter) add(value any) {
-	w.data, _ = binary.Append(w.data, binary.LittleEndian, value)
-}
-
 func (l *peLinker) sizes() (code, initialized, uninitialized uint32, baseOfCode uint32) {
 	for _, s := range l.sections {
 		switch {
@@ -62,7 +56,7 @@ func (l *peLinker) sizes() (code, initialized, uninitialized uint32, baseOfCode 
 				baseOfCode = uint32(s.rva)
 			}
 			code += uint32(s.rawSize)
-		case s.chars&scnInit != 0:
+		case s.chars&pe.IMAGE_SCN_CNT_INITIALIZED_DATA != 0:
 			initialized += uint32(s.rawSize)
 		default:
 			uninitialized += uint32(alignUp(s.virtualSize, peFileAlign))
@@ -97,19 +91,20 @@ func (l *peLinker) dataDirectories() [peDataDirectories]pe.DataDirectory {
 	return dirs
 }
 
-func (l *peLinker) writeHeaders(image []byte, entry uint64) {
+func (l *peLinker) writeHeaders(image []byte, entry uint64, timestamp uint32) error {
 	code, initialized, uninitialized, baseOfCode := l.sizes()
-	w := &peHeaderWriter{}
+	w := &structWriter{}
 	w.add(peDOSStub)
 	w.add(peSignature)
 	w.add(pe.FileHeader{
 		Machine:              pe.IMAGE_FILE_MACHINE_AMD64,
 		NumberOfSections:     uint16(len(l.sections)),
 		SizeOfOptionalHeader: uint16(peOptionalHeaderSize),
+		TimeDateStamp:        timestamp,
 		Characteristics:      peFileCharacteristics,
 	})
 	w.add(pe.OptionalHeader64{
-		Magic:                       0x20b,
+		Magic:                       pePlus64Magic,
 		MajorLinkerVersion:          peLinkerMajor,
 		SizeOfCode:                  code,
 		SizeOfInitializedData:       initialized,
@@ -129,13 +124,18 @@ func (l *peLinker) writeHeaders(image []byte, entry uint64) {
 		SizeOfStackCommit:           peStackCommit,
 		SizeOfHeapReserve:           peHeapReserve,
 		SizeOfHeapCommit:            peHeapCommit,
-		NumberOfRvaAndSizes:         peDataDirectories,
+		NumberOfRvaAndSizes:         uint32(peDataDirectories),
 		DataDirectory:               l.dataDirectories(),
 	})
 	for _, s := range l.sections {
 		w.add(s.header())
 	}
-	copy(image, w.data)
+	encoded, err := w.bytes()
+	if err != nil {
+		return err
+	}
+	copy(image, encoded)
+	return nil
 }
 
 func (s *peSection) header() pe.SectionHeader32 {
@@ -150,10 +150,15 @@ func (s *peSection) header() pe.SectionHeader32 {
 	return header
 }
 
-func (l *peLinker) stamp(image []byte) {
+func (l *peLinker) stamp(image []byte, entry uint64) error {
 	timestamp := uint32(xxh3Long(image))
-	fileField := uint64(len(peDOSStub)) + peSignatureSize + peFileTimestamp
-	binary.LittleEndian.PutUint32(image[fileField:], timestamp)
-	debugField := l.debug.fileOffset() + peTimestampOffset
-	binary.LittleEndian.PutUint32(image[debugField:], timestamp)
+	if err := l.writeHeaders(image, entry, timestamp); err != nil {
+		return err
+	}
+	debug, err := l.debugEntry(timestamp)
+	if err != nil {
+		return err
+	}
+	copy(image[l.debug.fileOffset():], debug)
+	return nil
 }

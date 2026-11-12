@@ -68,12 +68,11 @@ func (c *comparison) oracleEmpty(s *oracleSection) bool {
 	return s == nil || (len(s.data) == 0 && s.size == 0)
 }
 
-func (c *comparison) mineFlags(s *asm.Section) string {
-	flags := s.Flags
-	if c.platform == target.Windows && strings.Contains(flags, "d") {
-		flags = "a"
+func (c *comparison) mineFlags(s *asm.Section) asm.SectionFlags {
+	if c.platform == target.Windows && s.Flags.Has(asm.FlagReadOnly) {
+		return asm.FlagAlloc
 	}
-	return canonicalFlags(flags)
+	return s.Flags &^ asm.FlagReadOnly
 }
 
 func (c *comparison) compareSection(name string, mine *asm.Section, theirs *oracleSection) {
@@ -86,7 +85,7 @@ func (c *comparison) compareSection(name string, mine *asm.Section, theirs *orac
 	}
 	c.checked++
 	if got, want := c.mineFlags(mine), theirs.flags; got != want {
-		c.report("%s: flags %q, as has %q", name, got, want)
+		c.report("%s: flags %v, as has %v", name, got, want)
 	}
 	if mine.NoBits != theirs.noBits {
 		c.report("%s: nobits %v, as has %v", name, mine.NoBits, theirs.noBits)

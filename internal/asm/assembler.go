@@ -42,9 +42,9 @@ func newAssembler(opts Options) *assembler {
 		macros:        make(map[string]*macro),
 		numericLabels: make(map[int]int),
 	}
-	a.section(".text", "", false, false)
-	a.section(".data", "", false, false)
-	a.section(".bss", "", false, false)
+	a.defaultSection(".text")
+	a.defaultSection(".data")
+	a.defaultSection(".bss")
 	a.cur = a.sections[".text"]
 	return a
 }

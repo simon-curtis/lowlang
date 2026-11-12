@@ -1,8 +1,6 @@
 package link
 
 import (
-	"fmt"
-
 	"lowlang/internal/asm"
 )
 
@@ -40,22 +38,30 @@ func (l *linker) link() ([]byte, error) {
 	if l.dyn != nil {
 		l.fillDynamic()
 	}
-	tables := l.buildTables()
+	tables, err := l.buildTables()
+	if err != nil {
+		return nil, err
+	}
 	image := make([]byte, tables.size)
 	if err := l.applySections(image); err != nil {
 		return nil, err
 	}
-	l.writeHeaders(image, entry, tables)
-	l.writeTables(image, tables)
+	if err := l.writeHeaders(image, entry, tables); err != nil {
+		return nil, err
+	}
+	if err := l.writeTables(image, tables); err != nil {
+		return nil, err
+	}
 	return image, nil
 }
 
 func (l *linker) entry() (uint64, error) {
-	sym, ok := l.symbols[EntrySymbol]
-	if !ok {
-		return 0, fmt.Errorf("link: entry symbol %s is not defined", EntrySymbol)
-	}
-	return sym.value, nil
+	return entryAddress(EntrySymbol, l.addressOf)
+}
+
+func (l *linker) addressOf(name string) (uint64, bool) {
+	sym, ok := l.symbols[name]
+	return sym.value, ok
 }
 
 type linker struct {

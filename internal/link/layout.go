@@ -3,16 +3,11 @@ package link
 import (
 	"debug/elf"
 	"sort"
-	"strings"
 
 	"lowlang/internal/asm"
 )
 
-const (
-	pageSize   uint64 = 0x1000
-	headerSize uint64 = 64
-	phdrSize   uint64 = 56
-)
+const pageSize uint64 = 0x1000
 
 type class int
 
@@ -61,13 +56,13 @@ func (s *section) end() uint64 {
 
 func (s *section) flags() elf.SectionFlag {
 	flags := elf.SHF_ALLOC
-	if strings.Contains(s.in.Flags, "w") {
+	if s.in.Flags.Has(asm.FlagWrite) {
 		flags |= elf.SHF_WRITE
 	}
-	if strings.Contains(s.in.Flags, "x") {
+	if s.in.Flags.Has(asm.FlagExec) {
 		flags |= elf.SHF_EXECINSTR
 	}
-	if s.class == classTData || s.class == classTBss {
+	if s.in.Flags.Has(asm.FlagTLS) {
 		flags |= elf.SHF_TLS
 	}
 	return flags | s.shFlags
@@ -85,19 +80,19 @@ func (s *section) kind() elf.SectionType {
 
 func classOf(in *asm.Section) (class, bool) {
 	flags := in.Flags
-	if !strings.Contains(flags, "a") {
+	if !flags.Has(asm.FlagAlloc) {
 		return 0, false
 	}
 	switch {
-	case strings.Contains(flags, "T") && in.NoBits:
+	case flags.Has(asm.FlagTLS) && in.NoBits:
 		return classTBss, true
-	case strings.Contains(flags, "T"):
+	case flags.Has(asm.FlagTLS):
 		return classTData, true
-	case strings.Contains(flags, "x"):
+	case flags.Has(asm.FlagExec):
 		return classText, true
 	case in.NoBits:
 		return classBss, true
-	case strings.Contains(flags, "w"):
+	case flags.Has(asm.FlagWrite):
 		return classData, true
 	}
 	return classRodata, true

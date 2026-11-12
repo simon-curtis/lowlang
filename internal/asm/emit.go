@@ -1,13 +1,5 @@
 package asm
 
-func (k FixupKind) isPCRel() bool {
-	switch k {
-	case PC32, PLT32, GOTPCREL, GOTPCRELX, REXGOTPCRELX:
-		return true
-	}
-	return false
-}
-
 type textEmitter struct {
 	a    *assembler
 	b    *secBuilder
@@ -93,7 +85,7 @@ func (e *textEmitter) fixup(f *textFixup, at int64) {
 	case f.neg != nil:
 		value := a.differenceValue(f.sym, f.neg, f.addend)
 		e.patch(at, int(f.size), value)
-	case f.kind.isPCRel() && e.resolvesLocally(f):
+	case f.kind.PCRelative() && e.resolvesLocally(f):
 		value := a.address(f.sym) + f.addend - at
 		e.patch(at, int(f.size), value)
 	default:

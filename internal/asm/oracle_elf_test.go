@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"lowlang/internal/asm"
 	"lowlang/internal/target"
 )
 
@@ -27,7 +28,7 @@ func (r normReloc) String() string {
 
 type oracleSection struct {
 	name   string
-	flags  string
+	flags  asm.SectionFlags
 	align  uint64
 	noBits bool
 	size   uint64
@@ -63,27 +64,21 @@ var relocKinds = map[elf.R_X86_64]string{
 	elf.R_X86_64_REX_GOTPCRELX: "REX_GOTPCRELX",
 }
 
-func canonicalFlags(flags string) string {
-	letters := strings.Split(flags, "")
-	sort.Strings(letters)
-	return strings.Join(letters, "")
-}
-
-func elfFlags(flags elf.SectionFlag) string {
-	var b strings.Builder
+func elfFlags(flags elf.SectionFlag) asm.SectionFlags {
+	var mapped asm.SectionFlags
 	if flags&elf.SHF_ALLOC != 0 {
-		b.WriteByte('a')
+		mapped |= asm.FlagAlloc
 	}
 	if flags&elf.SHF_WRITE != 0 {
-		b.WriteByte('w')
+		mapped |= asm.FlagWrite
 	}
 	if flags&elf.SHF_EXECINSTR != 0 {
-		b.WriteByte('x')
+		mapped |= asm.FlagExec
 	}
 	if flags&elf.SHF_TLS != 0 {
-		b.WriteByte('T')
+		mapped |= asm.FlagTLS
 	}
-	return canonicalFlags(b.String())
+	return mapped
 }
 
 func asSource(source string, platform target.OS) string {

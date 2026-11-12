@@ -1,7 +1,7 @@
 package link
 
 import (
-	"encoding/binary"
+	"debug/pe"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,30 +10,44 @@ import (
 )
 
 const (
-	peImageBase       uint64 = 0x140000000
-	peSectionAlign    uint64 = 0x1000
-	peFileAlign       uint64 = 0x200
-	peEntrySymbol            = "start"
-	peStackReserve    uint64 = 8 << 20
-	peStackCommit     uint64 = 0x1000
-	peHeapReserve     uint64 = 1 << 20
-	peHeapCommit      uint64 = 0x1000
-	peNullImportLen   uint64 = 20
-	peDebugEntryLen   uint64 = 28
-	peCodeFill               = 0xCC
-	peDebugTypeRepro         = 16
-	peDebugTypeOffset        = 12
-	peTimestampOffset        = 4
+	peImageBase      uint64 = 0x140000000
+	peSectionAlign   uint64 = pageSize
+	peFileAlign      uint64 = 0x200
+	peEntrySymbol           = "start"
+	peStackReserve   uint64 = 8 << 20
+	peStackCommit    uint64 = pageSize
+	peHeapReserve    uint64 = 1 << 20
+	peHeapCommit     uint64 = pageSize
+	peCodeFill              = 0xCC
+	peDebugTypeRepro        = 16
+)
+
+type peDebugEntry struct {
+	Characteristics  uint32
+	TimeDateStamp    uint32
+	MajorVersion     uint16
+	MinorVersion     uint16
+	Type             uint32
+	SizeOfData       uint32
+	AddressOfRawData uint32
+	PointerToRawData uint32
+}
+
+type peImportDescriptor struct {
+	OriginalFirstThunk uint32
+	TimeDateStamp      uint32
+	ForwarderChain     uint32
+	Name               uint32
+	FirstThunk         uint32
+}
+
+var (
+	peDebugEntrySize   = structSize(peDebugEntry{})
+	peNullImportLength = structSize(peImportDescriptor{})
 )
 
 const (
-	scnCode        uint32 = 0x00000020
-	scnInit        uint32 = 0x00000040
-	scnUninit      uint32 = 0x00000080
-	scnDiscardable uint32 = 0x02000000
-	scnExec        uint32 = 0x20000000
-	scnRead        uint32 = 0x40000000
-	scnWrite       uint32 = 0x80000000
+	peReadOnlyData uint32 = pe.IMAGE_SCN_CNT_INITIALIZED_DATA | pe.IMAGE_SCN_MEM_READ
 )
 
 const (
@@ -92,7 +106,7 @@ type peSection struct {
 }
 
 func (s *peSection) isCode() bool {
-	return s.chars&scnCode != 0
+	return s.chars&pe.IMAGE_SCN_CNT_CODE != 0
 }
 
 func (s *peSection) arrange() {
@@ -115,14 +129,14 @@ func (s *peSection) arrange() {
 	}
 	s.virtualSize = offset
 	s.rawSize = alignUp(initialized, peFileAlign)
-	s.chars &^= scnInit | scnUninit
+	s.chars &^= pe.IMAGE_SCN_CNT_INITIALIZED_DATA | pe.IMAGE_SCN_CNT_UNINITIALIZED_DATA
 	switch {
 	case s.isCode():
 		return
 	case initialized > 0:
-		s.chars |= scnInit
+		s.chars |= pe.IMAGE_SCN_CNT_INITIALIZED_DATA
 	default:
-		s.chars |= scnUninit
+		s.chars |= pe.IMAGE_SCN_CNT_UNINITIALIZED_DATA
 	}
 }
 
@@ -157,7 +171,9 @@ func PE(obj *asm.Object) ([]byte, error) {
 	if err := l.collect(); err != nil {
 		return nil, err
 	}
-	l.addSyntheticChunks()
+	if err := l.addSyntheticChunks(); err != nil {
+		return nil, err
+	}
 	l.group()
 	l.findBaseRelocations()
 	l.layout()
@@ -171,8 +187,12 @@ func PE(obj *asm.Object) ([]byte, error) {
 	if err := l.applyFixups(image); err != nil {
 		return nil, err
 	}
-	l.writeHeaders(image, entry)
-	l.stamp(image)
+	if err := l.writeHeaders(image, entry, 0); err != nil {
+		return nil, err
+	}
+	if err := l.stamp(image, entry); err != nil {
+		return nil, err
+	}
 	return image, nil
 }
 
@@ -190,7 +210,7 @@ func (l *peLinker) collect() error {
 		if size == 0 {
 			continue
 		}
-		if strings.Contains(in.Flags, "T") {
+		if in.Flags.Has(asm.FlagTLS) {
 			return fmt.Errorf("link: thread-local section %s is not supported in a PE image", in.Name)
 		}
 		c := &peChunk{
@@ -207,29 +227,38 @@ func (l *peLinker) collect() error {
 }
 
 func peCharacteristics(in *asm.Section) uint32 {
-	flags := in.Flags
-	if strings.Contains(flags, "x") {
-		return scnCode | scnExec | scnRead
+	if in.Flags.Has(asm.FlagExec) {
+		return pe.IMAGE_SCN_CNT_CODE | pe.IMAGE_SCN_MEM_EXECUTE | pe.IMAGE_SCN_MEM_READ
 	}
-	chars := scnRead
-	if strings.Contains(flags, "w") || !strings.Contains(flags, "r") {
-		chars |= scnWrite
+	chars := uint32(pe.IMAGE_SCN_MEM_READ)
+	if in.Flags.Has(asm.FlagWrite) || !in.Flags.Has(asm.FlagReadOnly) {
+		chars |= pe.IMAGE_SCN_MEM_WRITE
 	}
 	if in.NoBits {
-		return chars | scnUninit
+		return chars | pe.IMAGE_SCN_CNT_UNINITIALIZED_DATA
 	}
-	return chars | scnInit
+	return chars | pe.IMAGE_SCN_CNT_INITIALIZED_DATA
 }
 
-func (l *peLinker) addSyntheticChunks() {
-	l.debug = &peChunk{name: rdataName, data: make([]byte, peDebugEntryLen), size: peDebugEntryLen, align: 4, chars: scnInit | scnRead}
-	binary.LittleEndian.PutUint32(l.debug.data[peDebugTypeOffset:], peDebugTypeRepro)
+func (l *peLinker) debugEntry(timestamp uint32) ([]byte, error) {
+	w := &structWriter{}
+	w.add(peDebugEntry{TimeDateStamp: timestamp, Type: peDebugTypeRepro})
+	return w.bytes()
+}
+
+func (l *peLinker) addSyntheticChunks() error {
+	debug, err := l.debugEntry(0)
+	if err != nil {
+		return err
+	}
+	l.debug = &peChunk{name: rdataName, data: debug, size: peDebugEntrySize, align: 4, chars: peReadOnlyData}
 	l.chunks = append(l.chunks, l.debug)
 	if len(l.chunksWithPrefix(importGroup)) == 0 {
-		return
+		return nil
 	}
-	null := &peChunk{name: importPrefix, data: make([]byte, peNullImportLen), size: peNullImportLen, align: 1, chars: scnInit | scnRead}
+	null := &peChunk{name: importPrefix, data: make([]byte, peNullImportLength), size: peNullImportLength, align: 1, chars: peReadOnlyData}
 	l.chunks = append(l.chunks, null)
+	return nil
 }
 
 func (l *peLinker) chunksWithPrefix(prefix string) []*peChunk {
@@ -251,7 +280,7 @@ func outputName(name string) string {
 }
 
 func (c *peChunk) outputChars() uint32 {
-	return c.chars&^scnUninit | scnInit
+	return c.chars&^pe.IMAGE_SCN_CNT_UNINITIALIZED_DATA | pe.IMAGE_SCN_CNT_INITIALIZED_DATA
 }
 
 type peSectionKey struct {
@@ -308,11 +337,7 @@ func (l *peLinker) layout() {
 }
 
 func (l *peLinker) entry() (uint64, error) {
-	target, ok := l.target(peEntrySymbol)
-	if !ok || target.absolute {
-		return 0, fmt.Errorf("link: entry symbol %s is not defined", peEntrySymbol)
-	}
-	return uint64(target.value), nil
+	return entryAddress(peEntrySymbol, l.entryRVA)
 }
 
 func (l *peLinker) writeSections(image []byte) {

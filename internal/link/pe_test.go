@@ -36,10 +36,10 @@ type peOptions struct {
 }
 
 func peObject(options peOptions) *asm.Object {
-	text := &asm.Section{Name: ".text", Flags: "ax", Align: 16, Data: make([]byte, 64), Fixups: options.textFixups}
-	rodata := &asm.Section{Name: ".rodata", Flags: "a", Align: 8, Data: make([]byte, 32), Fixups: options.rodataFixups}
-	data := &asm.Section{Name: ".data", Flags: "aw", Align: 8, Data: make([]byte, 24), Fixups: options.dataFixups}
-	bss := &asm.Section{Name: ".bss", Flags: "aw", Align: 8, NoBits: true, Size: 5000}
+	text := &asm.Section{Name: ".text", Flags: asm.FlagAlloc | asm.FlagExec, Align: 16, Data: make([]byte, 64), Fixups: options.textFixups}
+	rodata := &asm.Section{Name: ".rodata", Flags: asm.FlagAlloc, Align: 8, Data: make([]byte, 32), Fixups: options.rodataFixups}
+	data := &asm.Section{Name: ".data", Flags: asm.FlagAlloc | asm.FlagWrite, Align: 8, Data: make([]byte, 24), Fixups: options.dataFixups}
+	bss := &asm.Section{Name: ".bss", Flags: asm.FlagAlloc | asm.FlagWrite, Align: 8, NoBits: true, Size: 5000}
 	sections := append([]*asm.Section{text, rodata, data, bss}, options.extra...)
 	symbols := []asm.Symbol{
 		{Name: "text_label", Section: peTextIndex, Value: 8},
@@ -164,8 +164,8 @@ func TestPESectionLayout(t *testing.T) {
 
 func TestPEOrdersSectionsByName(t *testing.T) {
 	extra := []*asm.Section{
-		{Name: ".zeta", Flags: "dr", Align: 1, Data: []byte{1}},
-		{Name: ".alpha", Flags: "dr", Align: 1, Data: []byte{2}},
+		{Name: ".zeta", Flags: asm.FlagReadOnly, Align: 1, Data: []byte{1}},
+		{Name: ".alpha", Flags: asm.FlagReadOnly, Align: 1, Data: []byte{2}},
 	}
 	_, file := linkPE(t, peObject(peOptions{extra: extra}))
 	want := []string{".text", ".rdata", ".data", ".alpha", ".rodata", ".zeta"}
@@ -293,12 +293,12 @@ func TestPEOmitsRelocationsWithoutAbsoluteAddresses(t *testing.T) {
 
 func importSections() []*asm.Section {
 	return []*asm.Section{
-		{Name: ".idata$2", Flags: "dr", Align: 1, Data: make([]byte, 40)},
-		{Name: ".idata$3", Flags: "dr", Align: 1, Data: make([]byte, 20)},
-		{Name: ".idata$4", Flags: "dr", Align: 8, Data: make([]byte, 24)},
-		{Name: ".idata$5", Flags: "dr", Align: 8, Data: make([]byte, 24)},
-		{Name: ".idata$6", Flags: "dr", Align: 2, Data: make([]byte, 14)},
-		{Name: ".idata$7", Flags: "dr", Align: 1, Data: make([]byte, 13)},
+		{Name: ".idata$2", Flags: asm.FlagReadOnly, Align: 1, Data: make([]byte, 40)},
+		{Name: ".idata$3", Flags: asm.FlagReadOnly, Align: 1, Data: make([]byte, 20)},
+		{Name: ".idata$4", Flags: asm.FlagReadOnly, Align: 8, Data: make([]byte, 24)},
+		{Name: ".idata$5", Flags: asm.FlagReadOnly, Align: 8, Data: make([]byte, 24)},
+		{Name: ".idata$6", Flags: asm.FlagReadOnly, Align: 2, Data: make([]byte, 14)},
+		{Name: ".idata$7", Flags: asm.FlagReadOnly, Align: 1, Data: make([]byte, 13)},
 	}
 }
 
@@ -356,7 +356,7 @@ func TestPERejections(t *testing.T) {
 		{"relocation outside", peOptions{textFixups: []asm.Fixup{{Offset: 62, Kind: asm.PC32, Symbol: "text_label"}}}, "lies outside .text"},
 		{"rip-relative range to an absolute symbol", peOptions{textFixups: []asm.Fixup{{Offset: 0, Kind: asm.PC32, Symbol: "constant"}}}, "does not fit in 32 signed bits"},
 		{"image relative range", peOptions{textFixups: []asm.Fixup{{Offset: 0, Kind: asm.ImgRel32, Symbol: "text_label", Addend: -1 << 20}}}, "does not fit in 32 unsigned bits"},
-		{"thread local", peOptions{extra: []*asm.Section{{Name: ".tbss", Flags: "awT", NoBits: true, Size: 8, Align: 8}}}, "thread-local section .tbss"},
+		{"thread local", peOptions{extra: []*asm.Section{{Name: ".tbss", Flags: asm.FlagAlloc | asm.FlagWrite | asm.FlagTLS, NoBits: true, Size: 8, Align: 8}}}, "thread-local section .tbss"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -96,10 +96,6 @@ func newDynamicLink(libraries []*Library) *dynamicLink {
 	}
 }
 
-func isGOTKind(kind asm.FixupKind) bool {
-	return kind == asm.GOTPCREL || kind == asm.GOTPCRELX || kind == asm.REXGOTPCRELX
-}
-
 func (l *linker) definedNames() map[string]bool {
 	defined := map[string]bool{boundBssStart: true, boundEdata: true, boundEnd: true}
 	for _, sym := range l.obj.Symbols {
@@ -135,7 +131,7 @@ func (d *dynamicLink) collectReferences(l *linker) {
 
 func (d *dynamicLink) reference(f asm.Fixup, local bool) {
 	switch {
-	case isGOTKind(f.Kind):
+	case f.Kind.GOT():
 		d.addSlot(f.Symbol, local)
 		if f.Kind != asm.GOTPCRELX {
 			d.pointer[f.Symbol] = true

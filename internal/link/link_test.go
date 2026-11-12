@@ -32,11 +32,11 @@ func fixtureObject(options fixtureOptions) *asm.Object {
 	if bssSize == 0 {
 		bssSize = 64
 	}
-	text := &asm.Section{Name: ".text", Flags: "ax", Align: 16, Data: make([]byte, 64), Fixups: options.textFixups}
-	rodata := &asm.Section{Name: ".rodata", Flags: "a", Align: 8, Data: []byte{1, 2, 3, 4, 5, 6, 7, 8}}
-	data := &asm.Section{Name: ".data", Flags: "aw", Align: 8, Data: make([]byte, 32), Fixups: options.dataFixups}
-	bss := &asm.Section{Name: ".bss", Flags: "aw", Align: 8, NoBits: true, Size: bssSize}
-	tbss := &asm.Section{Name: ".tbss", Flags: "awT", Align: 8, NoBits: true, Size: 24}
+	text := &asm.Section{Name: ".text", Flags: asm.FlagAlloc | asm.FlagExec, Align: 16, Data: make([]byte, 64), Fixups: options.textFixups}
+	rodata := &asm.Section{Name: ".rodata", Flags: asm.FlagAlloc, Align: 8, Data: []byte{1, 2, 3, 4, 5, 6, 7, 8}}
+	data := &asm.Section{Name: ".data", Flags: asm.FlagAlloc | asm.FlagWrite, Align: 8, Data: make([]byte, 32), Fixups: options.dataFixups}
+	bss := &asm.Section{Name: ".bss", Flags: asm.FlagAlloc | asm.FlagWrite, Align: 8, NoBits: true, Size: bssSize}
+	tbss := &asm.Section{Name: ".tbss", Flags: asm.FlagAlloc | asm.FlagWrite | asm.FlagTLS, Align: 8, NoBits: true, Size: 24}
 	symbols := []asm.Symbol{
 		{Name: link.EntrySymbol, Section: textIndex, Global: true},
 		{Name: "text_label", Section: textIndex, Value: 8},

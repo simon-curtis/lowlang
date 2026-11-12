@@ -12,8 +12,6 @@ import (
 const (
 	pltEntrySize    uint64 = 16
 	gotEntrySize    uint64 = 8
-	relaSize        uint64 = 24
-	dynEntrySize    uint64 = 16
 	verneedSize     uint32 = 16
 	vernauxSize     uint32 = 16
 	spareDynEntries        = 5
@@ -26,12 +24,23 @@ const (
 	firstUnhashed          = 1
 )
 
+var (
+	relaSize     = structSize(elf.Rela64{})
+	dynEntrySize = structSize(elf.Dyn64{})
+)
+
+const (
+	loadedFlags     = asm.FlagAlloc
+	writableFlags   = asm.FlagAlloc | asm.FlagWrite
+	executableFlags = asm.FlagAlloc | asm.FlagExec
+)
+
 type dynTag struct {
 	tag   elf.DynTag
 	value uint64
 }
 
-func synthetic(name, flags string, c class, align uint64, size uint64) *section {
+func synthetic(name string, flags asm.SectionFlags, c class, align uint64, size uint64) *section {
 	in := &asm.Section{Name: name, Flags: flags, Align: int64(align), Data: make([]byte, size)}
 	return &section{in: in, class: c, size: size, align: align}
 }
@@ -39,23 +48,23 @@ func synthetic(name, flags string, c class, align uint64, size uint64) *section 
 func (d *dynamicLink) synthesize() []*section {
 	s := &d.sections
 	interpreter := append([]byte(Interpreter), 0)
-	s.interp = synthetic(".interp", "a", classInterp, 1, uint64(len(interpreter)))
+	s.interp = synthetic(".interp", loadedFlags, classInterp, 1, uint64(len(interpreter)))
 	copy(s.interp.in.Data, interpreter)
 
-	s.dynstr = synthetic(".dynstr", "a", classDynstr, 1, uint64(len(d.strings.data)))
+	s.dynstr = synthetic(".dynstr", loadedFlags, classDynstr, 1, uint64(len(d.strings.data)))
 	s.dynstr.shType = elf.SHT_STRTAB
 	copy(s.dynstr.in.Data, d.strings.data)
 
-	s.dynsym = synthetic(".dynsym", "a", classDynsym, 8, symSize*uint64(len(d.symbols)+1))
+	s.dynsym = synthetic(".dynsym", loadedFlags, classDynsym, 8, symSize*uint64(len(d.symbols)+1))
 	s.dynsym.shType, s.dynsym.entsize, s.dynsym.linked, s.dynsym.info = elf.SHT_DYNSYM, symSize, s.dynstr, firstUnhashed
 	d.fillDynsym()
 
 	buckets := bucketCount(len(d.symbols) + 1)
-	s.hash = synthetic(".hash", "a", classHash, 8, hashHeaderSize+4*uint64(buckets+len(d.symbols)+1))
+	s.hash = synthetic(".hash", loadedFlags, classHash, 8, hashHeaderSize+4*uint64(buckets+len(d.symbols)+1))
 	s.hash.shType, s.hash.entsize, s.hash.linked = elf.SHT_HASH, 4, s.dynsym
 	d.fillHash(buckets)
 
-	s.gnuHash = synthetic(".gnu.hash", "a", classGnuHash, 8, d.gnu.size())
+	s.gnuHash = synthetic(".gnu.hash", loadedFlags, classGnuHash, 8, d.gnu.size())
 	s.gnuHash.shType, s.gnuHash.linked = elf.SHT_GNU_HASH, s.dynsym
 	d.fillGnuHash()
 
@@ -65,7 +74,7 @@ func (d *dynamicLink) synthesize() []*section {
 	sections = append(sections, d.synthesizeGot()...)
 
 	count := uint64(len(d.tagList()) + spareDynEntries)
-	s.dynamic = synthetic(".dynamic", "aw", classDynamic, 8, count*dynEntrySize)
+	s.dynamic = synthetic(".dynamic", writableFlags, classDynamic, 8, count*dynEntrySize)
 	s.dynamic.shType, s.dynamic.entsize, s.dynamic.linked = elf.SHT_DYNAMIC, dynEntrySize, s.dynstr
 	return append(sections, s.dynamic)
 }
@@ -75,13 +84,13 @@ func (d *dynamicLink) synthesizeVersions() []*section {
 		return nil
 	}
 	s := &d.sections
-	s.versym = synthetic(".gnu.version", "a", classVersym, 2, 2*uint64(len(d.symbols)+1))
+	s.versym = synthetic(".gnu.version", loadedFlags, classVersym, 2, 2*uint64(len(d.symbols)+1))
 	s.versym.shType, s.versym.entsize, s.versym.linked = elf.SHT_GNU_VERSYM, 2, s.dynsym
 	for i, sym := range d.symbols {
 		binary.LittleEndian.PutUint16(s.versym.in.Data[2*(i+1):], sym.versionIndex)
 	}
 	data := d.verneedData()
-	s.verneed = synthetic(".gnu.version_r", "a", classVerneed, 8, uint64(len(data)))
+	s.verneed = synthetic(".gnu.version_r", loadedFlags, classVerneed, 8, uint64(len(data)))
 	s.verneed.shType, s.verneed.linked, s.verneed.info = elf.SHT_GNU_VERNEED, s.dynstr, uint32(len(d.needs))
 	copy(s.verneed.in.Data, data)
 	return []*section{s.versym, s.verneed}
@@ -134,20 +143,20 @@ func (d *dynamicLink) synthesizeRelocations() []*section {
 	s := &d.sections
 	var sections []*section
 	if count := d.importedSlots(); count > 0 {
-		s.relaDyn = synthetic(".rela.dyn", "a", classRelaDyn, 8, relaSize*uint64(count))
+		s.relaDyn = synthetic(".rela.dyn", loadedFlags, classRelaDyn, 8, relaSize*uint64(count))
 		s.relaDyn.shType, s.relaDyn.entsize, s.relaDyn.linked = elf.SHT_RELA, relaSize, s.dynsym
 		sections = append(sections, s.relaDyn)
 	}
 	if len(d.plts) > 0 {
-		s.relaPlt = synthetic(".rela.plt", "a", classRelaPlt, 8, relaSize*uint64(len(d.plts)))
+		s.relaPlt = synthetic(".rela.plt", loadedFlags, classRelaPlt, 8, relaSize*uint64(len(d.plts)))
 		s.relaPlt.shType, s.relaPlt.entsize, s.relaPlt.linked = elf.SHT_RELA, relaSize, s.dynsym
 		s.relaPlt.shFlags = elf.SHF_INFO_LINK
-		s.plt = synthetic(".plt", "ax", classPlt, 16, pltEntrySize*uint64(len(d.plts)+1))
+		s.plt = synthetic(".plt", executableFlags, classPlt, 16, pltEntrySize*uint64(len(d.plts)+1))
 		s.plt.entsize = pltEntrySize
 		sections = append(sections, s.relaPlt, s.plt)
 	}
 	if len(d.pltGots) > 0 {
-		s.pltGot = synthetic(".plt.got", "ax", classPltGot, 8, pltGotEntrySize*uint64(len(d.pltGots)))
+		s.pltGot = synthetic(".plt.got", executableFlags, classPltGot, 8, pltGotEntrySize*uint64(len(d.pltGots)))
 		s.pltGot.entsize = pltGotEntrySize
 		sections = append(sections, s.pltGot)
 	}
@@ -168,11 +177,11 @@ func (d *dynamicLink) synthesizeGot() []*section {
 	s := &d.sections
 	var sections []*section
 	if len(d.slots) > 0 {
-		s.got = synthetic(".got", "aw", classGot, 8, gotEntrySize*uint64(len(d.slots)))
+		s.got = synthetic(".got", writableFlags, classGot, 8, gotEntrySize*uint64(len(d.slots)))
 		s.got.entsize = gotEntrySize
 		sections = append(sections, s.got)
 	}
-	s.gotPlt = synthetic(".got.plt", "aw", classGotPlt, 8, gotPltReserved+gotEntrySize*uint64(len(d.plts)))
+	s.gotPlt = synthetic(".got.plt", writableFlags, classGotPlt, 8, gotPltReserved+gotEntrySize*uint64(len(d.plts)))
 	s.gotPlt.entsize = gotEntrySize
 	if s.relaPlt != nil {
 		s.relaPlt.infoSection = s.gotPlt

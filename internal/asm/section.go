@@ -2,13 +2,11 @@ package asm
 
 import (
 	"encoding/binary"
-	"strings"
 )
 
 type secBuilder struct {
 	Section
 	index  int
-	exec   bool
 	frags  []frag
 	fixups []textFixup
 	pads   []padState
@@ -23,22 +21,26 @@ type pendingDifference struct {
 	line    int
 }
 
-type sectionDefault struct {
-	flags  string
+type sectionSpec struct {
+	flags  SectionFlags
 	noBits bool
 }
 
-var sectionDefaults = map[string]sectionDefault{
-	".text":   {flags: "ax"},
-	".data":   {flags: "aw"},
-	".bss":    {flags: "aw", noBits: true},
-	".rodata": {flags: "a"},
-	".tbss":   {flags: "awT", noBits: true},
-	".tdata":  {flags: "awT"},
+var sectionDefaults = map[string]sectionSpec{
+	".text":   {flags: FlagAlloc | FlagExec},
+	".data":   {flags: FlagAlloc | FlagWrite},
+	".bss":    {flags: FlagAlloc | FlagWrite, noBits: true},
+	".rodata": {flags: FlagAlloc},
+	".tbss":   {flags: FlagAlloc | FlagWrite | FlagTLS, noBits: true},
+	".tdata":  {flags: FlagAlloc | FlagWrite | FlagTLS},
+}
+
+func (b *secBuilder) exec() bool {
+	return b.Flags.Has(FlagExec)
 }
 
 func (b *secBuilder) mark() (int64, int32) {
-	if b.exec {
+	if b.exec() {
 		return int64(len(b.Data)), b.currentFrag()
 	}
 	if b.NoBits {
@@ -53,21 +55,19 @@ func (b *secBuilder) raiseAlign(n int64) {
 	}
 }
 
-func (a *assembler) section(name, flags string, hasFlags, noBits bool) {
+func (a *assembler) defaultSection(name string) {
+	a.section(name, sectionDefaults[name])
+}
+
+func (a *assembler) section(name string, spec sectionSpec) {
 	if existing, ok := a.sections[name]; ok {
 		a.cur = existing
 		return
 	}
-	def := sectionDefaults[name]
-	if !hasFlags {
-		flags = def.flags
-		noBits = def.noBits
-	}
 	b := &secBuilder{index: len(a.secOrder)}
-	b.Name, b.Flags, b.NoBits = name, flags, noBits
+	b.Name, b.Flags, b.NoBits = name, spec.flags, spec.noBits
 	b.Align = 1
-	b.exec = strings.Contains(flags, "x")
-	if b.exec {
+	if b.exec() {
 		b.frags = []frag{{}}
 	}
 	a.sections[name] = b
@@ -127,7 +127,7 @@ func (a *assembler) emitAlign(power, max int64) {
 	b := a.cur
 	b.raiseAlign(n)
 	switch {
-	case b.exec:
+	case b.exec():
 		b.addAlign(uint8(power), int32(max), a.line)
 	case max != 0:
 		a.fail("an alignment limit is only supported in executable sections")
@@ -167,7 +167,7 @@ func (a *assembler) emitValue(size int, v Value) {
 	}
 	offset := int64(len(b.Data))
 	switch {
-	case b.exec:
+	case b.exec():
 		a.emitTextValue(size, v)
 		return
 	case v.Neg != "":
@@ -230,7 +230,7 @@ func (a *assembler) resolveDifference(p pendingDifference) {
 }
 
 func (a *assembler) address(sym *symbol) int64 {
-	if !sym.section.exec {
+	if !sym.section.exec() {
 		return sym.value
 	}
 	f := &sym.section.frags[sym.frag]
@@ -242,12 +242,12 @@ func (a *assembler) finish() {
 		a.fail("missing .endif")
 	}
 	for _, b := range a.secOrder {
-		if b.exec {
+		if b.exec() {
 			a.layout(b)
 		}
 	}
 	for _, b := range a.secOrder {
-		if b.exec {
+		if b.exec() {
 			a.emitText(b)
 		}
 	}
@@ -255,7 +255,7 @@ func (a *assembler) finish() {
 		a.resolveDifference(p)
 	}
 	for _, b := range a.secOrder {
-		if !b.NoBits && !b.exec {
+		if !b.NoBits && !b.exec() {
 			b.Size = int64(len(b.Data))
 		}
 	}
