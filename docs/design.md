@@ -1508,14 +1508,14 @@ Modules:
 - The checker keeps a scope of types and functions per module. The prelude belongs to the entry module, and its `__` names cannot clash with anything else. Every module sees the prelude's generic `__` functions and types, so `std/container/deque` is a wrapper over the prelude's `__Queue`, the ring buffer behind channel wait queues.
 - A function in module `ui/text` becomes the symbol `fn_ui.text.shout`. Types display with their module path, such as `geometry.Circle`.
 
-The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emitted with every program and talks to the kernel through raw syscalls. It ends the process with `exit_group`, so every thread stops.
+The runtime is `runtime.asm`, `sched.asm` and `gc.asm`, which are shared by every target, plus `linux.asm` or `windows.asm` for the target OS. It is emitted with every program. A Linux program talks to the kernel through raw syscalls and ends the process with `exit_group`, so every thread stops; a dynamically linked Linux program ends with `exit`. A Windows program calls kernel32 through the `WIN` macro and ends with `ExitProcess`.
 
 The runtime's data layout, thread-local access and Windows stack-bounds switching are defined once, in `layout.asm` and the target's `linux_header.asm` or `windows_header.asm`, as constants and macros such as `G_SCANLO`, `TLS_GET`, `TEB_ENTER_OS` and `MSG_BEGIN`. Generated code and patches use those names and macros, and `Generate` and `GeneratePatch` both prepend the headers. Go passes `RT_DYNAMIC` and the hot-reload constants (`HOT_BASE`, `HOT_SIZE`, `PATCH_BYTES`, `PATCH_ENTRY`, `PATCH_SIGNAL`) to the assembly as `.set` lines, and defines `HOT_INIT` as the call to `rt_hot_init` in a hot build and as nothing otherwise. The Windows import table lists every function the Windows runtime calls through `WIN`, taken from `windows.asm`, plus the program's `extern` imports.
 
 The contracts between the stages have one owner each:
 
 - `internal/builtin` numbers every builtin. The checker records the number on each call and `internal/ir` lowers it through a table indexed by that number.
-- `internal/ir/runtime.go` lists every runtime routine generated code calls: its symbol, its register convention (plain, growth, system call or string equality), whether it returns a scalar or nothing, and whether it allocates. A system call is its own `syscall` instruction; the others are `runtime` instructions.
+- `internal/ir/runtime.go` lists every runtime routine generated code calls through a `runtime` instruction: its symbol, its register convention (plain, growth or string equality) and whether it returns a scalar or nothing. A system call is its own `syscall` instruction.
 - `internal/prelude` names every prelude function the compiler calls or the checker's generated source calls, the fields `internal/ir` reads from the struct a function returns (`__waiter` and `__chan_new`), and which functions a map or channel type instantiates. The prelude is validated when it loads, so a missing or reshaped entry is an error that names it. `internal/ir` reads field offsets from the checked types.
 - `internal/amd64` owns the target. A `Platform` value, `sysv` for Linux and `win64` for Windows, supplies the runtime and header text, the C argument classification, the registers a C callback saves, the entry symbol, how a system call is made, stack probing and the dynamic-library shims. `PROGRAM_ENTRY` and `PROGRAM_EXIT` in each header are the program's entry and exit. `amd64` exports the entry symbols, the hot-patch list and count symbols and the `.idata` section names that `internal/link` and `internal/hot` read.
 - One `convention` value in `internal/amd64` holds the Low register convention: argument, result, caller-saved, callee-saved, system call and growth registers, and the frame offsets derived from them.
@@ -1732,7 +1732,7 @@ The derivations are generated as source:
   - A named function used as a value goes through an adapter, `name..value`, which drops the environment and calls it.
 - A call through a function value moves the code address to `r10` and calls it, passing the environment and the arguments like any call. A call through an `extern fn` value is a `ccall` with the same plan as a named C function.
 - A C callback is a thunk, `cb_name`, emitted once per program for every function used as one. It saves the C argument registers, re-extends narrow integers and `bool` from them and from the C stack, calls the function with Low's convention on the green thread's stack and moves a float result to `xmm0`. On Windows it also saves and restores `xmm6` to `xmm15`, which C treats as callee-saved.
-- Every loop's back-edge block is marked. The code generator ends it with `cmp byte ptr fs:[-8], 0` and a branch to an out-of-line `call rt_poll`.
+- Every loop's back-edge block is marked. The code generator ends it with the poll check described under Code generation.
 - `spawn f(a, b)` becomes a block that binds the callee and the arguments to fresh locals and passes a closure calling `f` with them to `rt_spawn`.
 - Sends, receives, `close` and channel loops call the prelude's instances for the element type. `select` calls the prelude's per-arm helpers and the runtime's `rt_lock_all`, `rt_timer_add` and `rt_park`.
 - `funcaddr` gives a function's code address, its thunk, or an `extern` function's address through the GOT. Functions reached only through `funcaddr` are kept.
@@ -1889,7 +1889,7 @@ Optimiser:
   - Evaluation order and short-circuiting of `&&` and `||` operands are unchanged.
   - A branch on the result of a `not` or a comparison defined in its own block uses that operand directly, so the `not` and the materialised boolean are not emitted.
 - Spilling:
-  - A value's spill weight is the sum over its uses and definitions of 8 raised to the block's loop depth, capped at depth 4.
+  - A value's spill weight is the sum over its uses and definitions of 8 raised to the block's loop depth, capped at depth 4. Loop depth counts the natural loops containing the block, found with the dominator tree the optimiser also uses; a cycle with more than one entry is not a loop.
   - When no register is free the allocator spills the conflicting value with the lowest spill cost, breaking ties by the later end of its live range.
   - The allocator runs three times per function, with the spill cost set to the weight, to the weight divided by the length of the live range and to the weight divided by its square root. It keeps the assignment whose spilled values have the lowest total weight plus 2 for each callee-saved register it uses. The weight alone wins ties.
 - Constants that fit in 32 bits are used as immediates and take no register. An undefined value used as an operand or stored to memory is the immediate 0, so a variant's unused payload words never hold stale pointers.
@@ -1942,7 +1942,7 @@ Optimiser:
   - The constant 0 is `xor r32, r32` where the flags are dead.
   - A 32-bit add or subtract into a different register is a `lea` with a 32-bit destination and 64-bit address registers.
   - A move that undoes the move before it is dropped.
-- The poll check is `cmp byte ptr fs:[-8], 0` and `jne` to an out-of-line stub that calls `rt_poll` and jumps back to a label placed directly after the `jne`.
+- The poll check is the `TLS_POLL` macro, which compares the thread's preemption flag with 0, and `jne` to an out-of-line stub that calls `rt_poll` and jumps back to a label placed directly after the `jne`. On Linux `TLS_POLL` is `cmp byte ptr fs:[-8], 0`; on Windows it reads the flag through `rt_tls_slot` and `gs`.
 - Alignment:
   - Every function and every C callback thunk starts on a 32-byte boundary.
   - A program for Linux is assembled with branch alignment, which pads so that no jump, and no fused compare and jump, crosses or ends at a 32-byte boundary. Hot patches are assembled without it.
