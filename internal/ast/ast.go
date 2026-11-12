@@ -177,6 +177,7 @@ type Func struct {
 	ParamLocals []*Local
 	Bound       map[string]*types.Type
 	Trusted     bool
+	Derived     bool
 }
 
 type Local struct {

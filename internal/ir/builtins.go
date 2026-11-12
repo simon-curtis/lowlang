@@ -5,6 +5,7 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/builtin"
+	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
 
@@ -153,21 +154,21 @@ func (b *builder) embedCall(e *ast.Call) []*Value {
 
 func (b *builder) bytesCall(e *ast.Call) []*Value {
 	text := b.value(e.Args[0], types.Str)
-	return b.callNamed("__bytes", text...)
+	return b.callNamed(prelude.Bytes, text...)
 }
 
 func (b *builder) strCall(e *ast.Call) []*Value {
 	arg := e.Args[0]
 	if arg.TypeOf().Kind == types.RawKind {
-		return b.callNamed("__from_cstr", b.word(arg))
+		return b.callNamed(prelude.FromCstr, b.word(arg))
 	}
 	bytes := b.value(arg, arg.TypeOf())
-	return b.callNamed("__from_bytes", bytes...)
+	return b.callNamed(prelude.FromBytes, bytes...)
 }
 
 func (b *builder) cstrCall(e *ast.Call) []*Value {
 	text := b.value(e.Args[0], types.Str)
-	return b.callNamed("__cstr", text...)
+	return b.callNamed(prelude.Cstr, text...)
 }
 
 func (b *builder) viewCall(e *ast.Call) []*Value {
@@ -231,9 +232,9 @@ func (b *builder) hashCall(e *ast.Call) []*Value {
 	arg := e.Args[0]
 	if arg.TypeOf() == types.Str {
 		text := b.value(arg, types.Str)
-		return b.callNamed("__hash_str", text...)
+		return b.callNamed(prelude.HashStr, text...)
 	}
-	return b.callNamed("__hash_word", b.word(arg))
+	return b.callNamed(prelude.HashWord, b.word(arg))
 }
 
 func (b *builder) zeroCall(e *ast.Call) []*Value {
@@ -312,30 +313,14 @@ func (b *builder) serializeCall(e *ast.Call) []*Value {
 
 func (b *builder) printCall(e *ast.Call) []*Value {
 	arg := e.Args[0]
-	t := arg.TypeOf()
-	switch {
-	case e.Render != nil:
-		words := b.value(arg, t)
-		text := b.renderString(e.Render, words)
-		b.runtime(rtPrintStr, text...)
-	case t == types.U64:
-		text := b.callNamed("__format_u64", b.word(arg))
-		b.runtime(rtPrintStr, text...)
-	case t.Integer():
-		b.runtime(rtPrintI64, b.word(arg))
-	case t.Float():
-		name := "__format_f64"
-		if t == types.F32 {
-			name = "__format_f32"
-		}
-		text := b.callNamed(name, b.word(arg))
-		b.runtime(rtPrintStr, text...)
-	case t == types.Bool:
-		b.runtime(rtPrintBool, b.word(arg))
-	default:
-		text := b.value(arg, types.Str)
-		b.runtime(rtPrintStr, text...)
+	var text []*Value
+	if e.Render == nil {
+		text = b.value(arg, types.Str)
+	} else {
+		words := b.value(arg, arg.TypeOf())
+		text = b.renderString(e.Render, words)
 	}
+	b.runtime(rtPrintStr, text...)
 	return nil
 }
 
@@ -344,12 +329,12 @@ func (b *builder) chanCall(e *ast.Call) []*Value {
 	if len(e.Args) == 1 {
 		capacity = b.word(e.Args[0])
 	}
-	return b.chanNamed("__chan_new", e.Type, capacity)
+	return b.chanNamed(prelude.ChanNew, e.Type, capacity)
 }
 
 func (b *builder) closeCall(e *ast.Call) []*Value {
 	c := b.word(e.Args[0])
-	b.chanNamed("__chan_close", e.Args[0].TypeOf(), c)
+	b.chanNamed(prelude.ChanClose, e.Args[0].TypeOf(), c)
 	return nil
 }
 

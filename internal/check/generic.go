@@ -6,6 +6,7 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/diag"
+	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
 
@@ -30,8 +31,6 @@ type inference struct {
 	params []*types.Type
 	bound  map[*types.Type]*types.Type
 }
-
-var mapFuncs = []string{"__map_new", "__map_clone", "__map_len", "__map_get", "__map_set", "__map_delete", "__map_next", "__map_key", "__map_value"}
 
 func plural(n int, noun string) string {
 	if n == 1 {
@@ -493,9 +492,13 @@ func (c *Checker) mapOps(m *types.Type) {
 		return
 	}
 	c.when(ready, func() {
-		args := []*types.Type{m.Key, m.Elem}
-		for _, name := range mapFuncs {
-			c.instance(c.scope("").funcs[name], args, diag.Pos{})
-		}
+		c.instantiateRoots(prelude.MapOp, []*types.Type{m.Key, m.Elem})
 	})
+}
+
+func (c *Checker) instantiateRoots(role prelude.Role, args []*types.Type) {
+	home := c.scope("")
+	for _, name := range prelude.Instances(role) {
+		c.instance(home.funcs[name], args, diag.Pos{})
+	}
 }

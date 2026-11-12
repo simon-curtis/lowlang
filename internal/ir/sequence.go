@@ -1,8 +1,11 @@
 package ir
 
 import (
+	"fmt"
+
 	"lowlang/internal/ast"
 	"lowlang/internal/lexer"
+	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
 
@@ -81,8 +84,24 @@ func (b *builder) filledSlice(e *ast.SliceLit) []*Value {
 	return []*Value{ptr, n, n}
 }
 
+func (b *builder) preludeFunc(name string) *Func {
+	f, ok := b.named[name]
+	if !ok {
+		panic(fmt.Sprintf("ir: the prelude declares no %s", name))
+	}
+	return f
+}
+
 func (b *builder) callNamed(name string, args ...*Value) []*Value {
-	return b.invoke(b.named[name], args)
+	return b.invoke(b.preludeFunc(name), args)
+}
+
+func (b *builder) preludeField(fn, name string) *types.Field {
+	f := b.preludeFunc(fn).Ret.Elem.Field(name)
+	if f == nil {
+		panic(fmt.Sprintf("ir: the result of %s has no field %s", fn, name))
+	}
+	return f
 }
 
 func (b *builder) strings(e *ast.Binary) []*Value {
@@ -92,7 +111,7 @@ func (b *builder) strings(e *ast.Binary) []*Value {
 	x := b.value(e.X, types.Str)
 	y := b.value(e.Y, types.Str)
 	if e.Op != lexer.Eq && e.Op != lexer.NotEq {
-		order := b.callNamed("__str_cmp", x[0], x[1], y[0], y[1])[0]
+		order := b.callNamed(prelude.StrCmp, x[0], x[1], y[0], y[1])[0]
 		return []*Value{b.typed(arith[e.Op], types.I64, order, b.constant(0))}
 	}
 	equal := b.equal(types.Str, x, y)
@@ -123,7 +142,7 @@ func (b *builder) copySlice(e *ast.Call) *Value {
 	t := e.Args[0].TypeOf()
 	dst := b.value(e.Args[0], t)
 	src := b.value(e.Args[1], e.Args[1].TypeOf())
-	n := b.callNamed("__min", dst[1], src[1])[0]
+	n := b.callNamed(prelude.Min, dst[1], src[1])[0]
 	stride := b.constant(int64(t.Elem.Stride()))
 	b.runtime(rtMemmove, dst[0], src[0], b.emit(OpMul, n, stride))
 	return n
@@ -159,7 +178,7 @@ func (b *builder) forIn(s *ast.ForIn) {
 		b.bind(s.KeyLocal, []*Value{i})
 	}
 	if s.Iter.TypeOf() == types.Str {
-		r := b.callNamed("__utf8_decode", seq[0], seq[1], i)
+		r := b.callNamed(prelude.Utf8Decode, seq[0], seq[1], i)
 		b.bind(s.ValueLocal, r[:1])
 		b.writeTemp(step, r[1:2])
 	} else {

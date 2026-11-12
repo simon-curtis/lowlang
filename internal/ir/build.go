@@ -9,6 +9,7 @@ import (
 	"lowlang/internal/ast"
 	"lowlang/internal/builtin"
 	"lowlang/internal/lexer"
+	"lowlang/internal/prelude"
 	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
@@ -869,7 +870,7 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 		return b.construct(e.Type, e.Variant, nil)
 	}
 	if e.Length && e.X.TypeOf().Kind == types.MapKind {
-		return b.mapCall("__map_len", e.X.TypeOf(), b.word(e.X))
+		return b.mapCall(prelude.MapLen, e.X.TypeOf(), b.word(e.X))
 	}
 	if e.Length {
 		return b.value(e.X, e.X.TypeOf())[1:2]

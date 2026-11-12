@@ -48,13 +48,11 @@ var (
 	rtEnvv       = &RuntimeEntry{Symbol: "rt_envv", Scalar: true}
 	rtClockNanos = &RuntimeEntry{Symbol: "rt_clock_nanos", Scalar: true}
 	rtSysblock   = &RuntimeEntry{Symbol: "rt_sysblock", Conv: CallSyscall, Scalar: true}
-	rtPrintBool  = &RuntimeEntry{Symbol: "rt_print_bool", Void: true}
-	rtPrintI64   = &RuntimeEntry{Symbol: "rt_print_i64", Void: true}
 )
 
 func RuntimeEntries() []*RuntimeEntry {
 	return []*RuntimeEntry{
-		rtAlloc, rtGrow, rtMemmove, rtStrEq, rtExp, rtPrintStr, rtPrintBool, rtPrintI64, rtPanicMsg, rtSleep, rtWaitFd,
+		rtAlloc, rtGrow, rtMemmove, rtStrEq, rtExp, rtPrintStr, rtPanicMsg, rtSleep, rtWaitFd,
 		rtSpawn, rtCurrent, rtPark, rtReady, rtLock, rtUnlock, rtCas, rtContext, rtSetContext, rtHasContext,
 		rtLockAll, rtUnlockAll, rtTimerAdd, rtTimerDel, rtPin, rtUnpin, rtArgc, rtArgv, rtEnvv, rtClockNanos, rtSysblock,
 	}

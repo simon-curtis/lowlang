@@ -21,7 +21,9 @@ fn core(n: i64) -> u32 {
 }
 
 fn main() {
-    print(core(10))
+    if core(10) == 0 {
+        print("zero")
+    }
 }
 `
 
@@ -67,8 +69,9 @@ fn main() {
     for i in 0..4 {
         pick(mut x, mut y, i % 2 == 0)
     }
-    print(x)
-    print(y)
+    if x + y == 0 {
+        print("zero")
+    }
 }
 `
 
@@ -145,8 +148,9 @@ fn main() {
     for i in 0..3 {
         swap(mut p)
     }
-    print(p.a)
-    print(p.b)
+    if p.a + p.b == 0 {
+        print("zero")
+    }
 }
 `
 

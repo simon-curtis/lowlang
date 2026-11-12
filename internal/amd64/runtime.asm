@@ -72,10 +72,6 @@ rt_vsign64:
 	.quad 0x8000000000000000
 rt_simd_env:
 	.asciz "LOW_SIMD=sse2"
-rt_true:
-	.ascii "true\n"
-rt_false:
-	.ascii "false\n"
 rt_nl:
 	.ascii "\n"
 rt_panic_prefix:
@@ -194,50 +190,6 @@ rt_env_values:
 	add r15, 8
 .Lmark_done_\@:
 	.endm
-
-	.globl rt_print_bool
-rt_print_bool:
-	lea rsi, [rip+rt_true]
-	mov edx, 5
-	lea rax, [rip+rt_false]
-	test rdi, rdi
-	cmovz rsi, rax
-	mov eax, 6
-	cmovz edx, eax
-	mov edi, 1
-	jmp rt_write
-
-	.globl rt_print_i64
-rt_print_i64:
-	sub rsp, 40
-	lea rsi, [rsp+32]
-	mov byte ptr [rsi], 10
-	mov rax, rdi
-	mov r8, rdi
-	test rax, rax
-	jns 1f
-	neg rax
-1:
-	mov ecx, 10
-2:
-	xor edx, edx
-	div rcx
-	add dl, 48
-	dec rsi
-	mov [rsi], dl
-	test rax, rax
-	jnz 2b
-	test r8, r8
-	jns 3f
-	dec rsi
-	mov byte ptr [rsi], 45
-3:
-	lea rdx, [rsp+33]
-	sub rdx, rsi
-	mov edi, 1
-	call rt_write
-	add rsp, 40
-	ret
 
 	.globl rt_str_eq
 rt_str_eq:

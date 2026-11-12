@@ -18,6 +18,7 @@ import (
 	"lowlang/internal/link"
 	"lowlang/internal/lint"
 	"lowlang/internal/parser"
+	"lowlang/internal/prelude"
 	"lowlang/internal/target"
 	"lowlang/internal/types"
 )
@@ -51,7 +52,7 @@ func analyse(path string, platform target.OS, opts ir.Options) (*Unit, error) {
 }
 
 func Check(path string, read func(name string) ([]byte, error)) (*Unit, error) {
-	prelude, err := parsePrelude()
+	file, err := parsePrelude()
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +60,7 @@ func Check(path string, read func(name string) ([]byte, error)) (*Unit, error) {
 	if err != nil {
 		return nil, err
 	}
-	files := append([]*ast.File{prelude}, modules.files...)
+	files := append([]*ast.File{file}, modules.files...)
 	universe := types.NewUniverse()
 	embeds, err := check.Check(files, stdFS, universe)
 	if err != nil {
@@ -71,7 +72,14 @@ func Check(path string, read func(name string) ([]byte, error)) (*Unit, error) {
 }
 
 func parsePrelude() (*ast.File, error) {
-	return parser.ParseSource(preludeSource, diag.Start("prelude.low"), true)
+	file, err := parser.ParseSource(preludeSource, diag.Start("prelude.low"), true)
+	if err != nil {
+		return nil, err
+	}
+	if err := prelude.Validate(file); err != nil {
+		return nil, err
+	}
+	return file, nil
 }
 
 func Assemble(ctx context.Context, asm, object string, flags ...string) error {

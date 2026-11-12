@@ -8,12 +8,13 @@ import (
 	"lowlang/internal/builtin"
 	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
+	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
 
 func (c *Checker) derivationHome(kind derivation) *ast.File {
 	if kind == render {
-		return c.scope("").funcs["__append_str"].File
+		return c.scope("").funcs[prelude.AppendStr].File
 	}
 	return c.file
 }
@@ -23,6 +24,29 @@ func (c *Checker) renderer(t *types.Type, pos diag.Pos) *ast.Func {
 		return nil
 	}
 	return c.derive(render, t, pos)
+}
+
+func primitiveAppender(t *types.Type) (string, bool) {
+	switch {
+	case t == types.Bool:
+		return prelude.AppendBool, true
+	case t == types.U64:
+		return prelude.AppendU64, true
+	case t == types.F64:
+		return prelude.AppendF64, true
+	case t == types.F32:
+		return prelude.AppendF32, true
+	case t.Integer():
+		return prelude.AppendI64, true
+	}
+	return "", false
+}
+
+func (c *Checker) appender(t *types.Type, pos diag.Pos) *ast.Func {
+	if name, ok := primitiveAppender(t); ok && !t.Abstract() {
+		return c.scope("").funcs[name]
+	}
+	return c.renderer(t, pos)
 }
 
 func (c *Checker) requireValue(pos diag.Pos, what string, t *types.Type) {
@@ -89,17 +113,15 @@ func bareName(t *types.Type) string {
 }
 
 func (s *synth) render(t *types.Type) {
+	if name, ok := primitiveAppender(t); ok {
+		operand := "v"
+		if t.Integer() && t != types.U64 {
+			operand = "i64(v)"
+		}
+		s.line("%s(mut b, %s)", name, operand)
+		return
+	}
 	switch {
-	case t == types.Bool:
-		s.line("__append_bool(mut b, v)")
-	case t == types.U64:
-		s.line("__append_u64(mut b, v)")
-	case t.Kind == types.IntKind:
-		s.line("__append_i64(mut b, i64(v))")
-	case t == types.F64:
-		s.line("__append_f64(mut b, v)")
-	case t == types.F32:
-		s.line("__append_f32(mut b, v)")
 	case t == types.Str:
 		s.line("__append_quoted(mut b, v)")
 	case t.Kind == types.SliceKind && t.Elem == types.U8:

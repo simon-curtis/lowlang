@@ -5,24 +5,16 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/builtin"
-	"lowlang/internal/diag"
+	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
-
-var chanFuncs = []string{
-	"__chan_new", "__chan_send", "__chan_recv", "__chan_close", "__box",
-	"__sel_recv", "__sel_send", "__sel_wait_recv", "__sel_wait_send", "__sel_value",
-}
 
 func (c *Checker) chanOps(t *types.Type) {
 	if t.Abstract() {
 		return
 	}
 	c.when(ready, func() {
-		args := []*types.Type{t.Elem}
-		for _, name := range chanFuncs {
-			c.instance(c.scope("").funcs[name], args, diag.Pos{})
-		}
+		c.instantiateRoots(prelude.ChanOp, []*types.Type{t.Elem})
 	})
 }
 

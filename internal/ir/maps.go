@@ -2,6 +2,7 @@ package ir
 
 import (
 	"lowlang/internal/ast"
+	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
 
@@ -25,11 +26,11 @@ func (b *builder) mapLit(e *ast.MapLit) []*Value {
 
 func (b *builder) filledMap(e *ast.MapLit) []*Value {
 	m := e.Type
-	table := b.mapCall("__map_new", m)[0]
+	table := b.mapCall(prelude.MapNew, m)[0]
 	for i, k := range e.Keys {
 		value := b.value(e.Values[i], m.Elem)
 		args := b.withKey(table, k, m, value...)
-		b.mapCall("__map_set", m, args...)
+		b.mapCall(prelude.MapSet, m, args...)
 	}
 	return []*Value{table}
 }
@@ -37,7 +38,7 @@ func (b *builder) filledMap(e *ast.MapLit) []*Value {
 func (b *builder) lookup(e *ast.Index) []*Value {
 	m := e.X.TypeOf()
 	args := b.withKey(b.word(e.X), e.Index, m)
-	return b.mapCall("__map_get", m, args...)
+	return b.mapCall(prelude.MapGet, m, args...)
 }
 
 func (b *builder) assignEntry(s *ast.Assign) {
@@ -47,12 +48,12 @@ func (b *builder) assignEntry(s *ast.Assign) {
 	table := b.word(entry.X)
 	key := append([]*Value{table}, b.value(entry.Index, m.Key)...)
 	if op, ok := arith[s.Op.Operator()]; ok {
-		current := b.mapCall("__map_get", m, key...)
+		current := b.mapCall(prelude.MapGet, m, key...)
 		old := b.present(current)
 		value = []*Value{b.typed(op, m.Elem, old, value[0])}
 	}
 	args := append(key, value...)
-	b.mapCall("__map_set", m, args...)
+	b.mapCall(prelude.MapSet, m, args...)
 }
 
 func (b *builder) present(optional []*Value) *Value {
@@ -73,14 +74,14 @@ func (b *builder) deleteEntry(e *ast.Call) {
 	m := ref.Type
 	table := b.load(b.placeOf(ref.X), m)[0]
 	args := b.withKey(table, e.Args[1], m)
-	b.mapCall("__map_delete", m, args...)
+	b.mapCall(prelude.MapDelete, m, args...)
 }
 
 func (b *builder) mapLoop(s *ast.ForIn) {
 	m := s.Iter.TypeOf()
 	table := b.word(s.Iter)
 	cursor := b.newTemp()
-	b.writeTemp(cursor, b.mapCall("__map_next", m, table, b.constant(0)))
+	b.writeTemp(cursor, b.mapCall(prelude.MapNext, m, table, b.constant(0)))
 	header := b.newBlock()
 	body := b.newBlock()
 	next := b.newBlock()
@@ -90,17 +91,17 @@ func (b *builder) mapLoop(s *ast.ForIn) {
 	at := b.readTemp(cursor, 1)[0]
 	b.branch(b.emit(OpLt, at, b.constant(0)), exit, body)
 	b.enter(body)
-	key := b.mapCall("__map_key", m, table, at)
+	key := b.mapCall(prelude.MapKey, m, table, at)
 	if s.KeyLocal == nil {
 		b.bind(s.ValueLocal, key)
 	} else {
 		b.bind(s.KeyLocal, key)
-		b.bind(s.ValueLocal, b.mapCall("__map_value", m, table, at))
+		b.bind(s.ValueLocal, b.mapCall(prelude.MapValue, m, table, at))
 	}
 	b.loopBody(s.Body, next, exit)
 	b.enter(next)
 	from := b.emit(OpAdd, at, b.constant(1))
-	b.writeTemp(cursor, b.mapCall("__map_next", m, table, from))
+	b.writeTemp(cursor, b.mapCall(prelude.MapNext, m, table, from))
 	b.backEdge(header)
 	b.seal(header)
 	b.enter(exit)

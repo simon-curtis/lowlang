@@ -138,6 +138,7 @@ func (s *synth) parse(kind derivation, t *types.Type) *ast.Func {
 	fn.File = s.home
 	fn.Bound = s.bound
 	fn.Trusted = true
+	fn.Derived = true
 	return fn
 }
 

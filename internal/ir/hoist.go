@@ -3,6 +3,7 @@ package ir
 import (
 	"lowlang/internal/ast"
 	"lowlang/internal/lexer"
+	"lowlang/internal/prelude"
 )
 
 const (
@@ -98,5 +99,5 @@ func (b *builder) hoistedMap(e *ast.MapLit) ([]*Value, bool) {
 	if e.ReadOnly {
 		return []*Value{template}, true
 	}
-	return b.mapCall("__map_clone", e.Type, template), true
+	return b.mapCall(prelude.MapClone, e.Type, template), true
 }

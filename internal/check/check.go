@@ -1252,11 +1252,11 @@ func (c *Checker) interp(e *ast.Interp) {
 		if spec := e.Specs[i]; spec != nil && spec.Format != nil {
 			c.requireFormattable(spec.Format, t)
 		}
-		if t.Number() || t == types.Bool || t == types.Str {
+		if t == types.Str {
 			continue
 		}
 		c.requireValue(part.Position(), "interpolation", t)
-		e.Renders[i] = c.renderer(t, part.Position())
+		e.Renders[i] = c.appender(t, part.Position())
 	}
 	e.Type = types.Str
 }
@@ -1650,9 +1650,9 @@ func (c *Checker) indirect(e *ast.Call) {
 func (c *Checker) print(e *ast.Call) {
 	t := c.plain(e.Args[0], nil)
 	e.Render = nil
-	if !t.Number() && t != types.Bool && t != types.Str {
+	if t != types.Str {
 		c.requireValue(e.Args[0].Position(), "print", t)
-		e.Render = c.renderer(t, e.Pos)
+		e.Render = c.appender(t, e.Pos)
 	}
 	e.Type = types.Void
 }

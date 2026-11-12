@@ -5,6 +5,7 @@ import (
 
 	"lowlang/internal/ast"
 	"lowlang/internal/lexer"
+	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
 
@@ -27,7 +28,7 @@ func (p piece) formatted() bool {
 }
 
 func (p piece) unbounded() bool {
-	return p.render != nil || p.spec != nil && p.spec.Format != nil
+	return p.render != nil && p.render.Derived || p.spec != nil && p.spec.Format != nil
 }
 
 func (p piece) padding() int64 {
@@ -160,7 +161,7 @@ func (b *builder) composeFormatted(pieces []piece, data, total *Value) []*Value 
 		}
 		src, n := b.source(p)
 		if checked {
-			b.callNamed("__append_str", slot, src, n)
+			b.callNamed(prelude.AppendStr, slot, src, n)
 			continue
 		}
 		buf := b.load(place{addr: slot}, types.Str)
@@ -177,7 +178,7 @@ func (b *builder) appendFormatted(slot *Value, p piece) {
 	}
 	buffer := b.load(place{addr: slot}, types.Str)
 	b.appendValue(slot, p)
-	b.callNamed("__align", slot, buffer[1], b.constant(int64(p.spec.Width)))
+	b.callNamed(prelude.Align, slot, buffer[1], b.constant(int64(p.spec.Width)))
 }
 
 func (b *builder) appendValue(slot *Value, p piece) {
@@ -185,11 +186,9 @@ func (b *builder) appendValue(slot *Value, p piece) {
 	case p.spec != nil && p.spec.Format != nil:
 		b.appendNumber(slot, p)
 	case p.typ == types.Str:
-		b.callNamed("__append_str", slot, p.words[0], p.words[1])
-	case p.render != nil:
-		b.renderInto(p.render, slot, p.words)
+		b.callNamed(prelude.AppendStr, slot, p.words[0], p.words[1])
 	default:
-		b.callNamed(appender(p.typ), slot, p.words[0])
+		b.renderInto(p.render, slot, p.words)
 	}
 }
 
@@ -205,14 +204,14 @@ func (b *builder) appendNumber(slot *Value, p piece) {
 	word := p.words[0]
 	switch f.Kind {
 	case ast.DecimalFormat:
-		b.callNamed("__append_decimal", slot, word, b.flag(!p.typ.Signed), b.constant(int64(f.Precision)))
+		b.callNamed(prelude.AppendDecimal, slot, word, b.flag(!p.typ.Signed), b.constant(int64(f.Precision)))
 	case ast.HexFormat, ast.UpperHexFormat, ast.BinaryFormat:
 		shift := int64(4)
 		if f.Kind == ast.BinaryFormat {
 			shift = 1
 		}
 		upper := f.Kind == ast.UpperHexFormat
-		b.callNamed("__append_radix", slot, word, b.constant(int64(p.typ.Bits)), b.constant(shift), b.flag(upper), b.constant(int64(f.Precision)))
+		b.callNamed(prelude.AppendRadix, slot, word, b.constant(int64(p.typ.Bits)), b.constant(shift), b.flag(upper), b.constant(int64(f.Precision)))
 	default:
 		b.appendLayout(slot, p)
 	}
@@ -250,44 +249,36 @@ func defaultPrecision(kind ast.FormatKind, t *types.Type) int {
 func (b *builder) appendLayout(slot *Value, p piece) {
 	l := layoutOf(p.spec.Format, p.typ)
 	args := []*Value{slot, p.words[0]}
-	name := "__append_float_layout"
+	name := prelude.AppendFloatLayout
 	switch {
 	case p.typ == types.F32:
 		args[1] = b.convert(p.words[0], types.F32, types.F64)
 	case p.typ.Integer():
-		name = "__append_int_layout"
+		name = prelude.AppendIntLayout
 		args = append(args, b.flag(!p.typ.Signed))
 	}
 	args = append(args, b.flag(l.scientific), b.constant(int64(l.intMin)), b.constant(int64(l.fracMin)), b.constant(int64(l.fracMax)), b.flag(l.group))
 	b.callNamed(name, args...)
 }
 
-func (b *builder) renderInto(render *ast.Func, buffer *Value, words []*Value) {
+func (b *builder) emptySlice() *Value {
 	zero := b.constant(0)
-	path := b.slot(3)
-	b.store(place{addr: path}, []*Value{zero, zero, zero})
-	args := append([]*Value{buffer, path}, words...)
+	slot := b.slot(3)
+	b.store(place{addr: slot}, []*Value{zero, zero, zero})
+	return slot
+}
+
+func (b *builder) renderInto(render *ast.Func, buffer *Value, words []*Value) {
+	args := []*Value{buffer}
+	if render.Derived {
+		args = append(args, b.emptySlice())
+	}
+	args = append(args, words...)
 	b.invoke(b.funcs[render], args)
 }
 
 func (b *builder) renderString(render *ast.Func, words []*Value) []*Value {
-	zero := b.constant(0)
-	buffer := b.slot(3)
-	b.store(place{addr: buffer}, []*Value{zero, zero, zero})
+	buffer := b.emptySlice()
 	b.renderInto(render, buffer, words)
 	return b.load(place{addr: buffer}, types.Str)
-}
-
-func appender(t *types.Type) string {
-	switch t {
-	case types.Bool:
-		return "__append_bool"
-	case types.F64:
-		return "__append_f64"
-	case types.F32:
-		return "__append_f32"
-	case types.U64:
-		return "__append_u64"
-	}
-	return "__append_i64"
 }
