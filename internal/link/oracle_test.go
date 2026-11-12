@@ -66,7 +66,7 @@ func corpusPaths(t *testing.T) []string {
 	return paths
 }
 
-func generate(path string) (source string, libraries int, err error) {
+func generate(path string) (source string, libraries []string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("compiler panic: %v", r)
@@ -74,9 +74,9 @@ func generate(path string) (source string, libraries int, err error) {
 	}()
 	unit, err := compiler.Analyse(filepath.Join(repoRoot(), path), target.Linux)
 	if err != nil {
-		return "", 0, err
+		return "", nil, err
 	}
-	return amd64.Generate(unit.Program, nil).Asm, len(unit.Program.Libraries), nil
+	return amd64.Generate(unit.Program, nil).Asm, unit.Program.Libraries, nil
 }
 
 func linkWithLd(dir, source string) (string, error) {
@@ -128,7 +128,7 @@ func TestMatchesGNULd(t *testing.T) {
 			if err != nil {
 				t.Skipf("compile: %v", err)
 			}
-			if libraries > 0 {
+			if len(libraries) > 0 {
 				t.Skip("program links C libraries")
 			}
 			dir := t.TempDir()

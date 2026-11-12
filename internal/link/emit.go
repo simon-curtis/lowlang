@@ -44,17 +44,27 @@ type tables struct {
 }
 
 type stringTable struct {
-	data []byte
+	data    []byte
+	offsets map[string]uint32
 }
 
 func newStringTable() *stringTable {
-	return &stringTable{data: []byte{0}}
+	return &stringTable{data: []byte{0}, offsets: map[string]uint32{}}
 }
 
 func (t *stringTable) add(name string) uint32 {
 	offset := uint32(len(t.data))
 	t.data = append(t.data, name...)
 	t.data = append(t.data, 0)
+	return offset
+}
+
+func (t *stringTable) addOnce(name string) uint32 {
+	if offset, present := t.offsets[name]; present {
+		return offset
+	}
+	offset := t.add(name)
+	t.offsets[name] = offset
 	return offset
 }
 
@@ -113,7 +123,7 @@ func (l *linker) buildSymbolTable(t *tables) {
 }
 
 func (l *linker) symbolEntry(names *stringTable, entry linkerSymbol, bind elf.SymBind) elf.Sym64 {
-	kind := elf.STT_NOTYPE
+	kind := entry.value.kind
 	if entry.value.isTLS() {
 		kind = elf.STT_TLS
 	}
@@ -169,10 +179,7 @@ func (l *linker) writeTables(image []byte, t *tables) {
 	headers := make([]elf.Section64, 0, l.sectionHeaderCount())
 	headers = append(headers, elf.Section64{})
 	for i, s := range l.sections {
-		headers = append(headers, elf.Section64{
-			Name: t.sectionName[i], Type: uint32(s.kind()), Flags: uint64(s.flags()),
-			Addr: s.addr, Off: s.off, Size: s.size, Addralign: s.align,
-		})
+		headers = append(headers, s.header(t.sectionName[i]))
 	}
 	headers = append(headers,
 		elf.Section64{

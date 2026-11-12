@@ -17,22 +17,42 @@ const (
 type class int
 
 const (
-	classText class = iota
+	classInterp class = iota
+	classHash
+	classGnuHash
+	classDynsym
+	classDynstr
+	classVersym
+	classVerneed
+	classRelaDyn
+	classRelaPlt
+	classPlt
+	classPltGot
+	classText
 	classRodata
 	classTData
 	classTBss
+	classDynamic
+	classGot
+	classGotPlt
 	classData
 	classBss
 )
 
 type section struct {
-	in    *asm.Section
-	class class
-	size  uint64
-	align uint64
-	addr  uint64
-	off   uint64
-	index int
+	in          *asm.Section
+	class       class
+	size        uint64
+	align       uint64
+	addr        uint64
+	off         uint64
+	index       int
+	shType      elf.SectionType
+	shFlags     elf.SectionFlag
+	entsize     uint64
+	linked      *section
+	infoSection *section
+	info        uint32
 }
 
 func (s *section) end() uint64 {
@@ -50,10 +70,13 @@ func (s *section) flags() elf.SectionFlag {
 	if s.class == classTData || s.class == classTBss {
 		flags |= elf.SHF_TLS
 	}
-	return flags
+	return flags | s.shFlags
 }
 
 func (s *section) kind() elf.SectionType {
+	if s.shType != elf.SHT_NULL {
+		return s.shType
+	}
 	if s.in.NoBits {
 		return elf.SHT_NOBITS
 	}
@@ -98,6 +121,9 @@ func (l *linker) collectSections() {
 		l.byInput[i] = s
 		l.sections = append(l.sections, s)
 	}
+}
+
+func (l *linker) orderSections() {
 	sort.SliceStable(l.sections, func(a, b int) bool { return l.sections[a].class < l.sections[b].class })
 	for i, s := range l.sections {
 		s.index = i + 1
@@ -123,6 +149,11 @@ func (c *cursor) place(s *section) {
 	}
 }
 
+func (c *cursor) alignTo(align uint64) {
+	c.off = alignUp(c.off, align)
+	c.addr = alignUp(c.addr, align)
+}
+
 func (c *cursor) alignToPage() {
 	c.off = alignUp(c.off, pageSize)
 	c.addr = alignUp(c.addr, pageSize)
@@ -141,6 +172,14 @@ func (l *linker) sectionsOf(classes ...class) []*section {
 }
 
 func (l *linker) layout() {
+	if l.dyn != nil {
+		l.layoutDynamic()
+		return
+	}
+	l.layoutStatic()
+}
+
+func (l *linker) layoutStatic() {
 	text := l.sectionsOf(classText)
 	rodata := l.sectionsOf(classRodata)
 	writable := l.sectionsOf(classTData, classTBss, classData, classBss)
@@ -240,4 +279,19 @@ func (l *linker) tlsSegment(members []*section) segment {
 		}
 	}
 	return seg
+}
+
+func (s *section) header(name uint32) elf.Section64 {
+	header := elf.Section64{
+		Name: name, Type: uint32(s.kind()), Flags: uint64(s.flags()),
+		Addr: s.addr, Off: s.off, Size: s.size, Addralign: s.align,
+		Entsize: s.entsize, Info: s.info,
+	}
+	if s.linked != nil {
+		header.Link = uint32(s.linked.index)
+	}
+	if s.infoSection != nil {
+		header.Info = uint32(s.infoSection.index)
+	}
+	return header
 }

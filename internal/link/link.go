@@ -14,12 +14,31 @@ const (
 
 func Static(obj *asm.Object) ([]byte, error) {
 	l := newLinker(obj)
+	return l.link()
+}
+
+func Dynamic(obj *asm.Object, libraries []*Library) ([]byte, error) {
+	l := newLinker(obj)
+	l.dyn = newDynamicLink(libraries)
+	return l.link()
+}
+
+func (l *linker) link() ([]byte, error) {
 	l.collectSections()
+	if l.dyn != nil {
+		if err := l.addDynamicSections(); err != nil {
+			return nil, err
+		}
+	}
+	l.orderSections()
 	l.layout()
 	l.resolveSymbols()
 	entry, err := l.entry()
 	if err != nil {
 		return nil, err
+	}
+	if l.dyn != nil {
+		l.fillDynamic()
 	}
 	tables := l.buildTables()
 	image := make([]byte, tables.size)
@@ -46,6 +65,7 @@ type linker struct {
 	segments []segment
 	symbols  map[string]symbolValue
 	fileEnd  uint64
+	dyn      *dynamicLink
 }
 
 func newLinker(obj *asm.Object) *linker {

@@ -8,9 +8,11 @@ import (
 )
 
 type symbolValue struct {
-	value    uint64
-	section  *section
-	absolute bool
+	value     uint64
+	section   *section
+	absolute  bool
+	undefined bool
+	kind      elf.SymType
 }
 
 type linkerSymbol struct {
@@ -69,9 +71,9 @@ func (l *linker) boundarySymbols() []linkerSymbol {
 		bssStart = symbolValue{value: firstBss.addr, section: firstBss}
 	}
 	return []linkerSymbol{
-		{"__bss_start", bssStart},
-		{"_edata", edata},
-		{"_end", endOf(lastLoaded)},
+		{boundBssStart, bssStart},
+		{boundEdata, edata},
+		{boundEnd, endOf(lastLoaded)},
 	}
 }
 
@@ -93,6 +95,9 @@ func (v symbolValue) isTLS() bool {
 }
 
 func (l *linker) symbolIndexOf(v symbolValue) uint16 {
+	if v.undefined {
+		return uint16(elf.SHN_UNDEF)
+	}
 	if v.absolute || v.section == nil {
 		return uint16(elf.SHN_ABS)
 	}
@@ -113,6 +118,7 @@ func (l *linker) emittedSymbols() (locals, globals []linkerSymbol) {
 		}
 		value, ok := l.resolve(sym)
 		if !ok {
+			globals = l.appendImported(globals, sym.Name)
 			continue
 		}
 		entry := linkerSymbol{name: sym.Name, value: value}
@@ -128,7 +134,22 @@ func (l *linker) emittedSymbols() (locals, globals []linkerSymbol) {
 		}
 		globals = append(globals, defined)
 	}
+	if l.dyn != nil {
+		locals = append(locals, l.dyn.tableSymbols()...)
+	}
 	return locals, globals
+}
+
+func (l *linker) appendImported(globals []linkerSymbol, name string) []linkerSymbol {
+	if l.dyn == nil {
+		return globals
+	}
+	imported, ok := l.dyn.bySymbol[name]
+	if !ok {
+		return globals
+	}
+	entry := linkerSymbol{name: imported.versionedName(), value: symbolValue{undefined: true, kind: imported.kind}}
+	return append(globals, entry)
 }
 
 func (l *linker) definedByObject(name string) bool {
