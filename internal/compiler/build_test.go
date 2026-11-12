@@ -18,7 +18,7 @@ func TestHotBuildExposesThePatchProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{amd64.PatchListSymbol, amd64.PatchCountSymbol, "fn_table"} {
+	for _, name := range []string{amd64.PatchListSymbol, amd64.PatchCountSymbol, amd64.FuncTableSymbol} {
 		if _, ok := built.Symbols[name]; !ok {
 			t.Errorf("image has no %s", name)
 		}

@@ -10,12 +10,12 @@ import (
 	"lowlang/internal/ir"
 )
 
-const funcTableSymbol = "fn_table"
+const FuncTableSymbol = "fn_table"
 
 type FuncTable map[string]int
 
 func (t FuncTable) slot(name string) string {
-	return fmt.Sprintf("[rip+%s+%d]", funcTableSymbol, 8*t[name])
+	return fmt.Sprintf("[rip+%s+%d]", FuncTableSymbol, 8*t[name])
 }
 
 func NewFuncTable(prog *ir.Program) FuncTable {
@@ -61,7 +61,7 @@ func (t FuncTable) writeRuntime(out *strings.Builder) {
 	for name, i := range t {
 		entries[i] = Symbol(name, "")
 	}
-	fmt.Fprintf(out, "\n\t.data\n\t.p2align 3\n\t.globl %[1]s\n%[1]s:\n", funcTableSymbol)
+	fmt.Fprintf(out, "\n\t.data\n\t.p2align 3\n\t.globl %[1]s\n%[1]s:\n", FuncTableSymbol)
 	for _, e := range entries {
 		fmt.Fprintf(out, "\t.quad %s\n", e)
 	}

@@ -129,7 +129,7 @@ func Generate(prog *ir.Program, platform Platform, table FuncTable) (Output, err
 	}
 	g.start(prog)
 	if table != nil {
-		platform.trampolines(g, prog.CSymbols)
+		g.trampolines(prog.CSymbols)
 	}
 	for _, f := range prog.Funcs {
 		if f.Callback {
@@ -358,7 +358,7 @@ func (g *Generator) body(f *ir.Func, symbol, prefix string, vectors bool) {
 		words += vectorScratchWords
 		fr.vectorScratch = -8 * words
 	}
-	size := (8*(words+g.outgoing(f)) + 15) &^ 15
+	size := abi.alignedBytes(words + g.outgoing(f))
 	fr.size = size
 	g.align(functionAlignment)
 	g.label(symbol)

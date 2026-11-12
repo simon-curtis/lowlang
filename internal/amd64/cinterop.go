@@ -16,7 +16,7 @@ func (g *Generator) cCall(fr *frame, in *instr) {
 	plan := g.plan(in.value.Sig)
 	args := in.args
 	var moves []pmove
-	callee := g.platform.externalTarget(plan.symbol, g.table != nil)
+	callee := g.externalTarget(plan.symbol)
 	if plan.symbol == "" {
 		moves = append(moves, pmove{dst: "r10", src: fr.loc(args[0])})
 		args = args[1:]
@@ -114,6 +114,13 @@ func (g *Generator) enterC(label string) {
 	g.emit("mov rsp, [rbx+M_G0SP]")
 }
 
+func (g *Generator) externalTarget(symbol string) string {
+	if g.table != nil {
+		return fmt.Sprintf("cfn_%s", symbol)
+	}
+	return g.platform.externalTarget(symbol)
+}
+
 func (g *Generator) trampolines(symbols []string) {
 	for _, s := range symbols {
 		fmt.Fprintf(&g.text, "\t.globl cfn_%s\ncfn_%s:\n\tjmp %s\n", s, s, s)
@@ -132,7 +139,7 @@ func (g *Generator) thunk(f *ir.Func) {
 		g.emit("push %s", r)
 	}
 	ints, vectors := g.platform.intRegs(), g.platform.vectorRegs()
-	registerBytes := (8*(len(ints)+vectors) + 15) &^ 15
+	registerBytes := abi.alignedBytes(len(ints) + vectors)
 	g.emit("mov r13, rsp")
 	g.emit("sub rsp, %d", registerBytes+16*len(preserved))
 	g.emit("and rsp, -16")

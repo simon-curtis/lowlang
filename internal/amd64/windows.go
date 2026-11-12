@@ -79,8 +79,6 @@ func (win64) syscall(g *Generator) {
 
 func (win64) variadicCount(*Generator, *cPlan) {}
 
-func (win64) trampolines(*Generator, []string) {}
-
 func (win64) reserve(g *Generator, size int) {
 	if size < pageSize {
 		if size > 0 {
@@ -98,7 +96,7 @@ func (win64) reserve(g *Generator, size int) {
 	g.emit("mov rsp, r11")
 }
 
-func (win64) externalTarget(symbol string, trampolines bool) string {
+func (win64) externalTarget(symbol string) string {
 	return fmt.Sprintf("qword ptr [rip+%s]", importSymbol(symbol))
 }
 

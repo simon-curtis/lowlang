@@ -26,9 +26,8 @@ type Platform interface {
 	positional() bool
 	syscall(g *Generator)
 	variadicCount(g *Generator, plan *cPlan)
-	trampolines(g *Generator, symbols []string)
 	reserve(g *Generator, size int)
-	externalTarget(symbol string, trampolines bool) string
+	externalTarget(symbol string) string
 	symbolAddress(symbol string) string
 	imports(out *strings.Builder, prog *ir.Program)
 	dynamic(prog *ir.Program) bool
@@ -96,20 +95,13 @@ func (sysv) variadicCount(g *Generator, plan *cPlan) {
 	g.emit("mov eax, %d", plan.vectors)
 }
 
-func (sysv) trampolines(g *Generator, symbols []string) {
-	g.trampolines(symbols)
-}
-
 func (sysv) reserve(g *Generator, size int) {
 	if size > 0 {
 		g.emit("sub rsp, %d", size)
 	}
 }
 
-func (sysv) externalTarget(symbol string, trampolines bool) string {
-	if trampolines {
-		return fmt.Sprintf("cfn_%s", symbol)
-	}
+func (sysv) externalTarget(symbol string) string {
 	return symbol
 }
 
