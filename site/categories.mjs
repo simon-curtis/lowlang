@@ -47,6 +47,7 @@ const prefixes = [
     ["std/ratelimit", ["concurrency"]],
     ["std/retry", ["concurrency"]],
     ["std/io", ["io"]],
+    ["std/sys", ["io", "os"]],
     ["std/file", ["io", "os"]],
     ["std/os", ["os"]],
     ["std/process", ["os"]],
