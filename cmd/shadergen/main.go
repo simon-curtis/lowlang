@@ -28,8 +28,9 @@ func run(ctx context.Context, dir string) error {
 	}
 	for _, stage := range stages {
 		source := filepath.Join(dir, stage)
-		output := fmt.Sprintf("%s.spv", source)
-		cmd := exec.CommandContext(ctx, "glslc", "-O", "--target-env=vulkan1.2", source, "-o", output)
+		output := filepath.Join(dir, shaders.Binary(stage))
+		targetEnv := fmt.Sprintf("--target-env=%s", shaders.TargetEnv)
+		cmd := exec.CommandContext(ctx, "glslc", "-O", targetEnv, source, "-o", output)
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("glslc %s: %w", stage, err)

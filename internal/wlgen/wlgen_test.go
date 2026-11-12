@@ -10,6 +10,7 @@ import (
 
 	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
+	"lowlang/internal/fixture/fixturetest"
 	"lowlang/internal/target"
 )
 
@@ -69,9 +70,7 @@ func TestReservedNames(t *testing.T) {
 }
 
 func TestRegistry(t *testing.T) {
-	if _, err := os.Stat("/usr/lib/libwayland-client.so"); err != nil {
-		t.Skip("libwayland-client is not installed")
-	}
+	fixturetest.RequireLibrary(t, "wayland-client")
 	source, err := Generate(load(t, "wayland.xml", "xdg-shell.xml"))
 	if err != nil {
 		t.Fatal(err)

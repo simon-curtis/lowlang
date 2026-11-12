@@ -14,6 +14,8 @@ import (
 
 	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
+	"lowlang/internal/fixture/fixturetest"
+	"lowlang/internal/shaders"
 	"lowlang/internal/target"
 )
 
@@ -142,21 +144,25 @@ func TestBindingsShape(t *testing.T) {
 }
 
 func TestOffscreenRender(t *testing.T) {
-	if _, err := os.Stat("/usr/lib/libvulkan.so"); err != nil {
-		t.Skip("libvulkan is not installed")
-	}
+	fixturetest.RequireLibrary(t, "vulkan")
 	dir := t.TempDir()
 	program, err := os.ReadFile(filepath.Join("testdata", "offscreen.low"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	files := map[string][]byte{"vulkan.low": []byte(generate(t)), "main.low": program}
-	for _, stage := range []string{"quad.vert.spv", "quad.frag.spv"} {
-		data, err := os.ReadFile(filepath.Join(root, "shaders", stage))
+	shaderDir := filepath.Join(root, "shaders")
+	stages, err := shaders.Stages(shaderDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range stages {
+		name := shaders.Binary(stage)
+		data, err := os.ReadFile(filepath.Join(shaderDir, name))
 		if err != nil {
 			t.Fatal(err)
 		}
-		files[stage] = data
+		files[name] = data
 	}
 	for name, data := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {

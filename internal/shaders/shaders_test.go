@@ -20,7 +20,7 @@ func TestBinariesMatchSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(got) != want {
-		t.Fatalf("SPIR-V is stale; run go run ./cmd/shadergen ui/shaders\nrecorded:\n%s\ncurrent:\n%s", got, want)
+		t.Fatalf("shader sources or SPIR-V changed without a record; run go run ./cmd/shadergen ui/shaders\nrecorded:\n%s\ncurrent:\n%s", got, want)
 	}
 }
 
@@ -33,8 +33,8 @@ func TestBinariesValidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, stage := range stages {
-		binary := filepath.Join(dir, stage+".spv")
-		out, err := exec.CommandContext(context.Background(), "spirv-val", "--target-env", "vulkan1.2", binary).CombinedOutput()
+		binary := filepath.Join(dir, Binary(stage))
+		out, err := exec.CommandContext(context.Background(), "spirv-val", "--target-env", TargetEnv, binary).CombinedOutput()
 		if err != nil {
 			t.Errorf("%s: %v\n%s", binary, err, out)
 		}
