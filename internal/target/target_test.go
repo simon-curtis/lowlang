@@ -57,3 +57,19 @@ func TestBuildsFilesByTargetSuffix(t *testing.T) {
 		}
 	}
 }
+
+func TestAllListsEveryTarget(t *testing.T) {
+	got := All()
+	if len(got) != len(Names()) {
+		t.Fatalf("All() = %v, want %d targets", got, len(Names()))
+	}
+	for i, o := range got {
+		if o.String() != Names()[i] {
+			t.Errorf("All()[%d] = %s, want %s", i, o, Names()[i])
+		}
+	}
+	got[0] = Windows
+	if All()[0] != Linux {
+		t.Error("All() returns the shared slice")
+	}
+}

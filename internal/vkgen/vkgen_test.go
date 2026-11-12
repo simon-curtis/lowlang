@@ -1,6 +1,7 @@
 package vkgen
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -15,19 +16,24 @@ import (
 	"lowlang/internal/target"
 )
 
-var root = filepath.Join("..", "..", "ui")
+var (
+	bindingsDir = filepath.Join("..", "compiler", "std", "ui", "gpu")
+	shaderDir   = filepath.Join(bindingsDir, "shaders")
+)
+
+const regenerate = "go run ./cmd/vkgen -registry internal/vkgen/registry/vk.xml.gz -select internal/vkgen/registry/vulkan.list -o internal/compiler/std/ui/gpu"
 
 var registry = sync.OnceValues(func() (*Registry, error) {
-	return ReadRegistry(filepath.Join(root, "registry", "vk.xml.gz"))
+	return ReadRegistry(filepath.Join("registry", "vk.xml.gz"))
 })
 
-func generate(t *testing.T) string {
+func generate(t *testing.T) []File {
 	t.Helper()
 	reg, err := registry()
 	if err != nil {
 		t.Fatal(err)
 	}
-	list, err := os.ReadFile(filepath.Join(root, "registry", "vulkan.list"))
+	list, err := os.ReadFile(filepath.Join("registry", "vulkan.list"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,11 +41,23 @@ func generate(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := Generate(reg, sel)
+	files, err := Generate(reg, sel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return source
+	return files
+}
+
+func TestCheckedInBindings(t *testing.T) {
+	for _, f := range generate(t) {
+		got, err := os.ReadFile(filepath.Join(bindingsDir, f.Name))
+		if err != nil {
+			t.Fatalf("%v; run %s", err, regenerate)
+		}
+		if string(got) != f.Source {
+			t.Errorf("%s differs from the generator output; run %s", f.Name, regenerate)
+		}
+	}
 }
 
 func TestParseDecl(t *testing.T) {
@@ -89,12 +107,46 @@ func TestEnumValues(t *testing.T) {
 }
 
 func TestSelection(t *testing.T) {
-	sel, err := ParseSelection("# bindings\nextension VK_KHR_surface\n\ncommand vkCreateInstance\ntype VkExtent2D\n")
-	if err != nil || len(sel.Extensions) != 1 || len(sel.Commands) != 1 || len(sel.Types) != 1 {
+	sel, err := ParseSelection("# bindings\nlibrary linux vulkan\nlibrary windows vulkan-1\nextension VK_KHR_surface\n\ncommand vkCreateInstance\ncommand vkCreateWaylandSurfaceKHR linux\ntype VkExtent2D\n")
+	if err != nil || len(sel.Extensions) != 1 || len(sel.Commands) != 2 || len(sel.Types) != 1 {
 		t.Fatalf("ParseSelection = %+v, %v", sel, err)
 	}
-	if _, err := ParseSelection("function vkCreateInstance"); err == nil {
-		t.Fatal("expected an error for an unknown entry")
+	if sel.Commands[0] != (SelectedCommand{Name: "vkCreateInstance"}) || sel.Commands[1] != (SelectedCommand{Name: "vkCreateWaylandSurfaceKHR", System: "linux"}) {
+		t.Errorf("commands = %+v", sel.Commands)
+	}
+	if sel.Libraries["linux"] != "vulkan" || sel.Libraries["windows"] != "vulkan-1" {
+		t.Errorf("libraries = %v", sel.Libraries)
+	}
+}
+
+func TestSelectionErrors(t *testing.T) {
+	cases := []struct{ text, want string }{
+		{"function vkCreateInstance", "line 1: expected"},
+		{"command", "line 1: expected"},
+		{"command vkCreateInstance linux extra", "line 1: expected"},
+		{"library linux", "line 1: expected"},
+		{"library linux vulkan extra", "line 1: expected"},
+		{"command vkCreateInstance plan9", `line 1: unknown system "plan9"`},
+		{"\nlibrary plan9 vulkan", `line 2: unknown system "plan9"`},
+		{"library linux vulkan\nlibrary linux vulkan-2", "line 2: library for linux is already named"},
+	}
+	for _, c := range cases {
+		_, err := ParseSelection(c.text)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("ParseSelection(%q) error = %v, want %q", c.text, err, c.want)
+		}
+	}
+}
+
+func TestMissingLibrary(t *testing.T) {
+	reg, err := registry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel := Selection{Commands: []SelectedCommand{{Name: "vkCreateInstance"}}, Libraries: map[string]string{"linux": "vulkan"}}
+	_, err = Generate(reg, sel)
+	if err == nil || !strings.Contains(err.Error(), `no "library windows NAME" line`) {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -103,39 +155,87 @@ func TestUnknownCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = Generate(reg, Selection{Commands: []string{"vkDoesNotExist"}})
+	sel := Selection{Commands: []SelectedCommand{{Name: "vkDoesNotExist"}}, Libraries: map[string]string{"linux": "vulkan", "windows": "vulkan-1"}}
+	_, err = Generate(reg, sel)
 	if err == nil || !strings.Contains(err.Error(), "unknown command vkDoesNotExist") {
 		t.Fatalf("err = %v", err)
 	}
 }
 
+func TestTargetFiles(t *testing.T) {
+	files := generate(t)
+	var names []string
+	for _, f := range files {
+		names = append(names, f.Name)
+	}
+	if want := "vulkan.low vulkan_linux.low vulkan_windows.low"; strings.Join(names, " ") != want {
+		t.Fatalf("files = %v, want %s", names, want)
+	}
+	shared, linux, windows := files[0].Source, files[1].Source, files[2].Source
+	if strings.Contains(shared, "extern \"") {
+		t.Error("shared file holds an extern block")
+	}
+	for _, want := range []string{`extern "vulkan" {`, "fn vkCreateInstance(", "fn vkCreateWaylandSurfaceKHR(", "fn vkGetPhysicalDeviceWaylandPresentationSupportKHR("} {
+		if !strings.Contains(linux, want) {
+			t.Errorf("linux file lacks %q", want)
+		}
+	}
+	for _, want := range []string{`extern "vulkan-1" {`, "fn vkCreateInstance(", "fn vkCreateWin32SurfaceKHR(", "fn vkGetPhysicalDeviceWin32PresentationSupportKHR("} {
+		if !strings.Contains(windows, want) {
+			t.Errorf("windows file lacks %q", want)
+		}
+	}
+	if strings.Contains(linux, "Win32") {
+		t.Error("linux file holds Win32 commands")
+	}
+	if strings.Contains(windows, "Wayland") {
+		t.Error("windows file holds Wayland commands")
+	}
+	for _, want := range []string{"extern struct VkWaylandSurfaceCreateInfoKHR {", "extern struct VkWin32SurfaceCreateInfoKHR {"} {
+		if !strings.Contains(shared, want) {
+			t.Errorf("shared file lacks %q", want)
+		}
+	}
+}
+
 func TestBindingsShape(t *testing.T) {
-	source := generate(t)
+	files := generate(t)
+	var all strings.Builder
+	for _, f := range files {
+		all.WriteString(f.Source)
+	}
+	text := all.String()
+	if strings.Contains(text, "pub ") {
+		t.Error("generated bindings declare pub items")
+	}
 	for _, want := range []string{
-		"pub fn vkCreateInstance(mut pCreateInfo: VkInstanceCreateInfo, pAllocator: ptr[VkAllocationCallbacks], mut pInstance: VkInstance) -> i32",
-		"pub fn vkMapMemory(device: VkDevice, memory: VkDeviceMemory, offset: i64, size: i64, flags: u32, mut ppData: ptr) -> i32",
-		"    pub sType: i32 = 1000314004",
-		"pub extern struct VkBuffer {\n    pub handle: i64 = 0\n}",
-		"pub extern struct VkInstance {\n    pub handle: ptr = null\n}",
-		"pub fn VkPhysicalDeviceProperties_deviceName(s: VkPhysicalDeviceProperties) -> str {",
-		"pub fn VkPhysicalDeviceMemoryProperties_memoryTypes(s: VkPhysicalDeviceMemoryProperties) -> []VkMemoryType {",
-		"pub fn VK_QUEUE_FAMILY_IGNORED() -> u32 {\n    4294967295\n}",
+		"fn vkCreateInstance(mut pCreateInfo: VkInstanceCreateInfo, pAllocator: ptr[VkAllocationCallbacks], mut pInstance: VkInstance) -> i32",
+		"fn vkMapMemory(device: VkDevice, memory: VkDeviceMemory, offset: i64, size: i64, flags: u32, mut ppData: ptr) -> i32",
+		"    sType: i32 = 1000314004",
+		"extern struct VkBuffer {\n    handle: i64 = 0\n}",
+		"extern struct VkInstance {\n    handle: ptr = null\n}",
+		"fn VkPhysicalDeviceProperties_deviceName(s: VkPhysicalDeviceProperties) -> str {",
+		"fn VkPhysicalDeviceMemoryProperties_memoryTypes(s: VkPhysicalDeviceMemoryProperties) -> []VkMemoryType {",
+		"fn VK_QUEUE_FAMILY_IGNORED() -> u32 {\n    4294967295\n}",
+		"    hwnd: ptr = null",
 	} {
-		if !strings.Contains(source, want) {
+		if !strings.Contains(text, want) {
 			t.Errorf("generated bindings lack %q", want)
 		}
 	}
 }
 
-func TestOffscreenRender(t *testing.T) {
-	fixturetest.RequireLibrary(t, "vulkan")
+func offscreenDir(t *testing.T) string {
+	t.Helper()
 	dir := t.TempDir()
 	program, err := os.ReadFile(filepath.Join("testdata", "offscreen.low"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	files := map[string][]byte{"vulkan.low": []byte(generate(t)), "main.low": program}
-	shaderDir := filepath.Join(root, "shaders")
+	files := map[string][]byte{"main.low": program}
+	for _, f := range generate(t) {
+		files[f.Name] = []byte(f.Source)
+	}
 	stages, err := shaders.Stages(shaderDir)
 	if err != nil {
 		t.Fatal(err)
@@ -153,6 +253,12 @@ func TestOffscreenRender(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	return dir
+}
+
+func TestOffscreenRender(t *testing.T) {
+	fixturetest.RequireLibrary(t, "vulkan")
+	dir := offscreenDir(t)
 	unit, err := compiler.Analyse(dir, compiler.Release(target.Linux))
 	if err != nil {
 		t.Fatal(err)
@@ -172,5 +278,24 @@ func TestOffscreenRender(t *testing.T) {
 	want := "0 0 0 255\n255 0 0 255\n0 0 255 255\n0 0 0 255\n"
 	if string(out) != want {
 		t.Fatalf("pixels:\n%s\nwant:\n%s", out, want)
+	}
+}
+
+func TestWindowsBindingsBuild(t *testing.T) {
+	dir := offscreenDir(t)
+	unit, err := compiler.Analyse(dir, compiler.Release(target.Windows))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(dir, "offscreen.exe")
+	if _, err := compiler.Build(context.Background(), unit, binary); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(bytes.ToLower(data), []byte("vulkan-1.dll")) {
+		t.Error("the Windows executable does not import vulkan-1.dll")
 	}
 }

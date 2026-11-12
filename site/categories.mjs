@@ -70,6 +70,7 @@ const prefixes = [
     ["std/uuid", ["data"]],
     ["std/semver", ["data"]],
     ["std/image", ["media"]],
+    ["std/ui", ["ui"]],
     ["std/log", ["observability"]],
     ["std/otel", ["observability"]],
     ["std/testing", ["testing"]],

@@ -9,31 +9,75 @@ import (
 
 	"lowlang/internal/check"
 	"lowlang/internal/emit"
+	"lowlang/internal/target"
 )
 
+type SelectedCommand struct {
+	Name   string
+	System string
+}
+
 type Selection struct {
-	Commands   []string
+	Commands   []SelectedCommand
 	Extensions []string
 	Types      []string
+	Libraries  map[string]string
+}
+
+type File struct {
+	Name   string
+	Source string
+}
+
+const sharedFile = "vulkan.low"
+
+func targetFile(system string) string {
+	return fmt.Sprintf("vulkan_%s.low", system)
+}
+
+func knownSystem(system string) bool {
+	return slices.ContainsFunc(target.All(), func(o target.OS) bool { return o.System() == system })
+}
+
+func systems() string {
+	var names []string
+	for _, o := range target.All() {
+		names = append(names, o.System())
+	}
+	return strings.Join(names, ", ")
 }
 
 func ParseSelection(text string) (Selection, error) {
-	var s Selection
+	s := Selection{Libraries: map[string]string{}}
 	for i, raw := range strings.Split(text, "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		kind, name, ok := strings.Cut(line, " ")
+		fields := strings.Fields(line)
+		kind, args := fields[0], fields[1:]
 		switch {
-		case ok && kind == "command":
-			s.Commands = append(s.Commands, strings.TrimSpace(name))
-		case ok && kind == "extension":
-			s.Extensions = append(s.Extensions, strings.TrimSpace(name))
-		case ok && kind == "type":
-			s.Types = append(s.Types, strings.TrimSpace(name))
+		case kind == "command" && len(args) == 1:
+			s.Commands = append(s.Commands, SelectedCommand{Name: args[0]})
+		case kind == "command" && len(args) == 2:
+			if !knownSystem(args[1]) {
+				return s, fmt.Errorf("line %d: unknown system %q; expected %s", i+1, args[1], systems())
+			}
+			s.Commands = append(s.Commands, SelectedCommand{Name: args[0], System: args[1]})
+		case kind == "extension" && len(args) == 1:
+			s.Extensions = append(s.Extensions, args[0])
+		case kind == "type" && len(args) == 1:
+			s.Types = append(s.Types, args[0])
+		case kind == "library" && len(args) == 2:
+			if !knownSystem(args[0]) {
+				return s, fmt.Errorf("line %d: unknown system %q; expected %s", i+1, args[0], systems())
+			}
+			if _, seen := s.Libraries[args[0]]; seen {
+				return s, fmt.Errorf("line %d: library for %s is already named", i+1, args[0])
+			}
+			s.Libraries[args[0]] = args[1]
 		default:
-			return s, fmt.Errorf("line %d: expected \"command NAME\", \"type NAME\" or \"extension NAME\", found %q", i+1, line)
+			return s, fmt.Errorf("line %d: expected \"command NAME [SYSTEM]\", \"type NAME\", \"extension NAME\" or \"library SYSTEM NAME\", found %q", i+1, line)
 		}
 	}
 	return s, nil
@@ -67,7 +111,7 @@ type generator struct {
 	emit.Lines
 }
 
-func Generate(reg *Registry, sel Selection) (string, error) {
+func Generate(reg *Registry, sel Selection) ([]File, error) {
 	g := &generator{
 		reg:       reg,
 		types:     map[string]*Type{},
@@ -78,40 +122,58 @@ func Generate(reg *Registry, sel Selection) (string, error) {
 		emitted:   map[string]bool{},
 		enumUse:   map[string]bool{},
 	}
+	if err := g.libraries(sel); err != nil {
+		return nil, err
+	}
 	if err := g.index(); err != nil {
-		return "", err
+		return nil, err
 	}
 	if err := g.collectValues(sel.Extensions); err != nil {
-		return "", err
+		return nil, err
 	}
-	for _, name := range sel.Commands {
-		cmd, err := g.command(name)
+	for _, c := range sel.Commands {
+		cmd, err := g.command(c.Name)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		if err := g.requireCommand(cmd); err != nil {
-			return "", fmt.Errorf("%s: %w", name, err)
+			return nil, fmt.Errorf("%s: %w", c.Name, err)
 		}
 	}
 	for _, name := range sel.Types {
 		if err := g.require(name); err != nil {
-			return "", err
+			return nil, err
 		}
 	}
 	slices.Sort(g.order)
 	g.prologue()
 	for _, name := range g.order {
 		if err := g.emitType(name); err != nil {
-			return "", fmt.Errorf("%s: %w", name, err)
+			return nil, fmt.Errorf("%s: %w", name, err)
 		}
 	}
-	if err := g.emitCommands(sel.Commands); err != nil {
-		return "", err
-	}
 	if err := g.emitConstants(); err != nil {
-		return "", err
+		return nil, err
 	}
-	return g.String(), nil
+	files := []File{{Name: sharedFile, Source: g.String()}}
+	for _, o := range target.All() {
+		system := o.System()
+		source, err := g.emitCommands(sel, system)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, File{Name: targetFile(system), Source: source})
+	}
+	return files, nil
+}
+
+func (g *generator) libraries(sel Selection) error {
+	for _, o := range target.All() {
+		if sel.Libraries[o.System()] == "" {
+			return fmt.Errorf("no \"library %s NAME\" line for the %s target", o.System(), o)
+		}
+	}
+	return nil
 }
 
 func (g *generator) index() error {
@@ -455,7 +517,7 @@ func (g *generator) layout(name string, stars int) (int, int, error) {
 }
 
 func (g *generator) prologue() {
-	g.Line("pub fn vk_make_api_version(variant: u32, major: u32, minor: u32, patch: u32) -> u32 {")
+	g.Line("fn vk_make_api_version(variant: u32, major: u32, minor: u32, patch: u32) -> u32 {")
 	g.Line("    (variant << 29) | (major << 22) | (minor << 12) | patch")
 	g.Line("}")
 	g.Line("")
@@ -476,8 +538,8 @@ func (g *generator) emitType(name string) error {
 		if strings.Contains(t.Inner, "VK_DEFINE_HANDLE") {
 			field, def = "ptr", "null"
 		}
-		g.Line("pub extern struct %s {", name)
-		g.Line("    pub handle: %s = %s", field, def)
+		g.Line("extern struct %s {", name)
+		g.Line("    handle: %s = %s", field, def)
 		g.Line("}")
 		g.Line("")
 		return nil
@@ -491,7 +553,7 @@ func (g *generator) emitType(name string) error {
 		members = []Member{widest}
 	}
 	var arrays []array
-	g.Line("pub extern struct %s {", name)
+	g.Line("extern struct %s {", name)
 	for _, m := range members {
 		if !forVulkan(m.API) {
 			continue
@@ -513,7 +575,7 @@ func (g *generator) emitType(name string) error {
 			def = strconv.FormatInt(v, 10)
 		}
 		if len(d.Dims) == 0 {
-			g.Line("    pub %s: %s = %s", check.Ident(d.Name), ty, def)
+			g.Line("    %s: %s = %s", check.Ident(d.Name), ty, def)
 			continue
 		}
 		n, err := g.count(d)
@@ -521,7 +583,7 @@ func (g *generator) emitType(name string) error {
 			return err
 		}
 		for i := range n {
-			g.Line("    pub %s_%d: %s = %s", d.Name, i, ty, def)
+			g.Line("    %s_%d: %s = %s", d.Name, i, ty, def)
 		}
 		d.Dims = []string{strconv.Itoa(n)}
 		arrays = append(arrays, array{decl: d, elem: ty})
@@ -547,14 +609,14 @@ func (g *generator) accessor(owner string, a array) {
 	}
 	list := strings.Join(fields, ", ")
 	if a.decl.Type == "char" && a.decl.Stars == 0 {
-		g.Line("pub fn %s_%s(s: %s) -> str {", owner, a.decl.Name, owner)
+		g.Line("fn %s_%s(s: %s) -> str {", owner, a.decl.Name, owner)
 		g.Line("    let bytes: []u8 = [%s]", list)
 		g.Line("    vk_string(bytes)")
 		g.Line("}")
 		g.Line("")
 		return
 	}
-	g.Line("pub fn %s_%s(s: %s) -> []%s {", owner, a.decl.Name, owner, a.elem)
+	g.Line("fn %s_%s(s: %s) -> []%s {", owner, a.decl.Name, owner, a.elem)
 	g.Line("    [%s]", list)
 	g.Line("}")
 	g.Line("")
@@ -618,49 +680,60 @@ func (g *generator) paramType(p Param, d Decl) (string, bool, error) {
 	return t, true, err
 }
 
-func (g *generator) emitCommands(names []string) error {
-	g.Line(`extern "vulkan" {`)
-	for _, name := range names {
-		cmd, err := g.command(name)
+func (g *generator) emitCommands(sel Selection, system string) (string, error) {
+	var out emit.Lines
+	out.Line(`extern "%s" {`, sel.Libraries[system])
+	for _, c := range sel.Commands {
+		if c.System != "" && c.System != system {
+			continue
+		}
+		declaration, err := g.declaration(c.Name)
 		if err != nil {
-			return err
+			return "", err
 		}
-		proto, err := ParseDecl(cmd.Proto.Inner)
-		if err != nil {
-			return err
-		}
-		var params []string
-		for _, p := range cmd.Params {
-			if !forVulkan(p.API) {
-				continue
-			}
-			d, err := ParseDecl(p.Inner)
-			if err != nil {
-				return err
-			}
-			t, mut, err := g.paramType(p, d)
-			if err != nil {
-				return fmt.Errorf("%s.%s: %w", name, d.Name, err)
-			}
-			prefix := ""
-			if mut {
-				prefix = "mut "
-			}
-			params = append(params, fmt.Sprintf("%s%s: %s", prefix, check.Ident(d.Name), t))
-		}
-		result := ""
-		if proto.Type != "void" || proto.Stars > 0 {
-			t, err := g.memberType(proto)
-			if err != nil {
-				return err
-			}
-			result = fmt.Sprintf(" -> %s", t)
-		}
-		g.Line("    pub fn %s(%s)%s", name, strings.Join(params, ", "), result)
+		out.Line("    %s", declaration)
 	}
-	g.Line("}")
-	g.Line("")
-	return nil
+	out.Line("}")
+	return out.String(), nil
+}
+
+func (g *generator) declaration(name string) (string, error) {
+	cmd, err := g.command(name)
+	if err != nil {
+		return "", err
+	}
+	proto, err := ParseDecl(cmd.Proto.Inner)
+	if err != nil {
+		return "", err
+	}
+	var params []string
+	for _, p := range cmd.Params {
+		if !forVulkan(p.API) {
+			continue
+		}
+		d, err := ParseDecl(p.Inner)
+		if err != nil {
+			return "", err
+		}
+		t, mut, err := g.paramType(p, d)
+		if err != nil {
+			return "", fmt.Errorf("%s.%s: %w", name, d.Name, err)
+		}
+		prefix := ""
+		if mut {
+			prefix = "mut "
+		}
+		params = append(params, fmt.Sprintf("%s%s: %s", prefix, check.Ident(d.Name), t))
+	}
+	result := ""
+	if proto.Type != "void" || proto.Stars > 0 {
+		t, err := g.memberType(proto)
+		if err != nil {
+			return "", err
+		}
+		result = fmt.Sprintf(" -> %s", t)
+	}
+	return fmt.Sprintf("fn %s(%s)%s", name, strings.Join(params, ", "), result), nil
 }
 
 func literal(v int64, t string) string {
@@ -676,7 +749,7 @@ func literal(v int64, t string) string {
 var integerConstantTypes = map[string]string{"uint32_t": "u32", "uint64_t": "i64", "int32_t": "i32"}
 
 func (g *generator) constant(name, t, body string) {
-	g.Line("pub fn %s() -> %s {", name, t)
+	g.Line("fn %s() -> %s {", name, t)
 	g.Line("    %s", body)
 	g.Line("}")
 	g.Line("")

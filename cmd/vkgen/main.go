@@ -4,17 +4,18 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"lowlang/internal/vkgen"
 )
 
 func main() {
-	output := flag.String("o", "", "output .low file")
+	output := flag.String("o", "", "output directory for vulkan.low and one vulkan_<system>.low per target")
 	registry := flag.String("registry", "", "vk.xml or vk.xml.gz")
-	selection := flag.String("select", "", "selection list of commands and extensions")
+	selection := flag.String("select", "", "selection list of extensions, commands, types and libraries")
 	flag.Parse()
 	if *output == "" || *registry == "" || *selection == "" {
-		fmt.Fprintln(os.Stderr, "usage: vkgen -registry vk.xml.gz -select vulkan.list -o vulkan.low")
+		fmt.Fprintln(os.Stderr, "usage: vkgen -registry vk.xml.gz -select vulkan.list -o directory")
 		os.Exit(2)
 	}
 	if err := run(*output, *registry, *selection); err != nil {
@@ -36,9 +37,17 @@ func run(output, registryPath, selectionPath string) error {
 	if err != nil {
 		return err
 	}
-	source, err := vkgen.Generate(reg, sel)
+	files, err := vkgen.Generate(reg, sel)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(output, []byte(source), 0o644)
+	if err := os.MkdirAll(output, 0o755); err != nil {
+		return err
+	}
+	for _, file := range files {
+		if err := os.WriteFile(filepath.Join(output, file.Name), []byte(file.Source), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }

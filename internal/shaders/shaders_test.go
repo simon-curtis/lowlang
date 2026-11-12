@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-var dir = filepath.Join("..", "..", "ui", "shaders")
+var dir = filepath.Join("..", "compiler", "std", "ui", "gpu", "shaders")
 
 func TestBinariesMatchSources(t *testing.T) {
 	want, err := Sum(dir)
@@ -20,7 +20,7 @@ func TestBinariesMatchSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(got) != want {
-		t.Fatalf("shader sources or SPIR-V changed without a record; run go run ./cmd/shadergen ui/shaders\nrecorded:\n%s\ncurrent:\n%s", got, want)
+		t.Fatalf("shader sources or SPIR-V changed without a record; run go run ./cmd/shadergen internal/compiler/std/ui/gpu/shaders\nrecorded:\n%s\ncurrent:\n%s", got, want)
 	}
 }
 

@@ -13,11 +13,15 @@ import (
 	"lowlang/internal/target"
 )
 
+var checkedIn = filepath.Join("..", "compiler", "std", "ui", "platform", "wayland_linux.low")
+
+const regenerate = "go run ./cmd/wlgen -o internal/compiler/std/ui/platform/wayland_linux.low internal/wlgen/protocols/wayland.xml internal/wlgen/protocols/xdg-shell.xml"
+
 func load(t *testing.T, names ...string) []*Protocol {
 	t.Helper()
 	var protocols []*Protocol
 	for _, name := range names {
-		data, err := os.ReadFile(filepath.Join("..", "..", "ui", "protocols", name))
+		data, err := os.ReadFile(filepath.Join("protocols", name))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -62,9 +66,33 @@ func TestRejectsDuplicates(t *testing.T) {
 	}
 }
 
+func TestCheckedInBindings(t *testing.T) {
+	source, err := Generate(load(t, "wayland.xml", "xdg-shell.xml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(checkedIn)
+	if err != nil {
+		t.Fatalf("%v; run %s", err, regenerate)
+	}
+	if string(got) != source {
+		t.Errorf("%s differs from the generator output; run %s", checkedIn, regenerate)
+	}
+}
+
+func TestBindingsArePrivate(t *testing.T) {
+	source, err := Generate(load(t, "wayland.xml", "xdg-shell.xml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(source, "pub ") {
+		t.Error("generated bindings declare pub items")
+	}
+}
+
 func TestRegistry(t *testing.T) {
 	fixturetest.RequireLibrary(t, "wayland-client")
-	source, err := Generate(load(t, "wayland.xml", "xdg-shell.xml"))
+	source, err := os.ReadFile(checkedIn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +101,7 @@ func TestRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, data := range map[string][]byte{"wayland.low": []byte(source), "main.low": program} {
+	for name, data := range map[string][]byte{"wayland_linux.low": source, "main.low": program} {
 		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
 			t.Fatal(err)
 		}

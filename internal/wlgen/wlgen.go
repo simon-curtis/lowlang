@@ -128,18 +128,18 @@ func camel(name string) string {
 func (g *generator) prologue() {
 	g.Line(`extern "wayland-client" {`)
 	for _, decl := range []string{
-		"pub fn wl_display_connect(name: ptr[u8]) -> ptr",
-		"pub fn wl_display_disconnect(display: ptr)",
-		"pub fn wl_display_roundtrip(display: ptr) -> i32",
-		"pub fn wl_display_dispatch(display: ptr) -> i32",
-		"pub fn wl_display_dispatch_pending(display: ptr) -> i32",
-		"pub fn wl_display_flush(display: ptr) -> i32",
-		"pub fn wl_display_get_fd(display: ptr) -> i32",
-		"pub fn wl_display_prepare_read(display: ptr) -> i32",
-		"pub fn wl_display_read_events(display: ptr) -> i32",
-		"pub fn wl_display_cancel_read(display: ptr)",
-		"pub fn wl_proxy_destroy(proxy: ptr)",
-		"pub fn wl_proxy_get_version(proxy: ptr) -> u32",
+		"fn wl_display_connect(name: ptr[u8]) -> ptr",
+		"fn wl_display_disconnect(display: ptr)",
+		"fn wl_display_roundtrip(display: ptr) -> i32",
+		"fn wl_display_dispatch(display: ptr) -> i32",
+		"fn wl_display_dispatch_pending(display: ptr) -> i32",
+		"fn wl_display_flush(display: ptr) -> i32",
+		"fn wl_display_get_fd(display: ptr) -> i32",
+		"fn wl_display_prepare_read(display: ptr) -> i32",
+		"fn wl_display_read_events(display: ptr) -> i32",
+		"fn wl_display_cancel_read(display: ptr)",
+		"fn wl_proxy_destroy(proxy: ptr)",
+		"fn wl_proxy_get_version(proxy: ptr) -> u32",
 		"fn wl_proxy_marshal_flags(proxy: ptr, opcode: u32, interface: ptr, version: u32, flags: u32, ...) -> ptr",
 		"fn wl_proxy_add_listener(proxy: ptr, listener: ptr, data: ptr) -> i32",
 	} {
@@ -192,13 +192,13 @@ func (g *generator) prologue() {
 }
 
 func (g *generator) table(all []Interface) {
-	g.Line("pub struct Interfaces {")
+	g.Line("struct Interfaces {")
 	for _, i := range all {
-		g.Line("    pub %s: ptr", i.Name)
+		g.Line("    %s: ptr", i.Name)
 	}
 	g.Line("}")
 	g.Line("")
-	g.Line("pub fn interfaces() -> Interfaces {")
+	g.Line("fn interfaces() -> Interfaces {")
 	g.Line("    let ifs = Interfaces {")
 	for _, i := range all {
 		g.Line("        %s: malloc(40)", i.Name)
@@ -302,7 +302,7 @@ func (g *generator) requests(i Interface) {
 		if creates {
 			result = " -> ptr"
 		}
-		g.Line("pub fn %s(%s)%s {", name, strings.Join(params, ", "), result)
+		g.Line("fn %s(%s)%s {", name, strings.Join(params, ", "), result)
 		target, version := "null", fmt.Sprintf("wl_proxy_get_version(%s)", self)
 		switch {
 		case creates && id.Interface == "":
@@ -328,7 +328,7 @@ func (g *generator) requests(i Interface) {
 		g.Line("")
 	}
 	if !destroy && i.Name != "wl_display" {
-		g.Line("pub fn %s_destroy(%s: ptr) {", i.Name, self)
+		g.Line("fn %s_destroy(%s: ptr) {", i.Name, self)
 		g.Line("    wl_proxy_destroy(%s)", self)
 		g.Line("}")
 		g.Line("")
@@ -356,15 +356,15 @@ func (g *generator) listener(i Interface) {
 		g.Line("}")
 		g.Line("")
 	}
-	g.Line("pub extern struct %s {", listener)
+	g.Line("extern struct %s {", listener)
 	for _, m := range i.Events {
 		types, _ := eventParams(m)
-		g.Line("    pub %s: extern fn(%s) = %s_%s_ignore", check.Ident(m.Name), strings.Join(types, ", "), i.Name, m.Name)
+		g.Line("    %s: extern fn(%s) = %s_%s_ignore", check.Ident(m.Name), strings.Join(types, ", "), i.Name, m.Name)
 	}
 	g.Line("}")
 	g.Line("")
 	self := check.Ident(i.Name)
-	g.Line("pub fn %s_add_listener(%s: ptr, listener: %s, data: ptr) -> i32 {", i.Name, self, listener)
+	g.Line("fn %s_add_listener(%s: ptr, listener: %s, data: ptr) -> i32 {", i.Name, self, listener)
 	g.Line("    let copy: ptr[%s] = malloc(%d)", listener, 8*len(i.Events))
 	g.Line("    store(copy, listener)")
 	g.Line("    wl_proxy_add_listener(%s, copy, data)", self)
@@ -375,7 +375,7 @@ func (g *generator) listener(i Interface) {
 func (g *generator) enums(i Interface) {
 	for _, e := range i.Enums {
 		for _, entry := range e.Entries {
-			g.Line("pub fn %s_%s_%s() -> u32 {", i.Name, e.Name, entry.Name)
+			g.Line("fn %s_%s_%s() -> u32 {", i.Name, e.Name, entry.Name)
 			g.Line("    %s", entry.Value)
 			g.Line("}")
 			g.Line("")
