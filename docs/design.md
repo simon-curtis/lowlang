@@ -1442,11 +1442,11 @@ Every standard library resource that must be disposed of is a droppable owner bo
 - `std/image` holds an `Image` of width, height, `Format` (`Gray8`, `GrayAlpha8`, `Rgb8`, `Rgba8`, `Gray16`, `Rgba16`, 16-bit samples big-endian), stride and pixel bytes.
   - Pixels read and write as 8-bit `Rgba`, with operations converting through 16-bit intermediates. `get` outside the image is transparent black and `set` there does nothing. Operations convert formats, crop, flip, rotate, apply EXIF orientation, fill rectangles, composite straight alpha, premultiply and unpremultiply, and resize separably on premultiplied values with nearest, bilinear, Catmull-Rom bicubic or Lanczos-3 filters.
   - `decode` picks a codec by signature and rejects images over 2^26 pixels; `decode_limited` takes another limit.
-  - PNG decodes every colour type, bit depth and Adam7, checks every CRC, and encodes with per-row adaptive filtering.
+  - PNG decodes every colour type, bit depth and Adam7, checks every CRC, and encodes with per-row adaptive filtering. The result is `Gray16` for 16-bit gray without transparency, `Rgba16` for other 16-bit images, `Gray8` or `GrayAlpha8` for gray, `Rgba8` for colour with alpha or `tRNS`, and `Rgb8` otherwise.
   - JPEG decodes baseline and progressive scans with restart markers, any sampling, grayscale and Adobe CMYK/YCCK, with libjpeg's integer IDCT and fancy upsampling, so output matches libjpeg byte for byte. It encodes baseline 4:2:0 with the standard tables scaled by quality.
   - GIF decodes 87a and 89a and composites every frame by disposal method in `decode_gif_frames`. It encodes one frame with a given or median-cut palette.
   - BMP covers 1 to 32 bits, RLE, bitfields and every header version, and encodes 24 or 32 bits.
-  - QOI decodes and encodes.
+  - QOI decodes and encodes; the result is `Rgb8` or `Rgba8` by channel count.
   - WebP decodes lossless VP8L with every transform, the colour cache and meta prefix codes. Lossy VP8, alpha chunks and animation fail with `Unsupported`.
 - Every codec has buffer functions, a streaming decoder that pulls from an `io.Reader`, pushes output to a sink and fails with `TooLarge` past a caller's limit, and a streaming encoder.
 
