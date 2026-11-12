@@ -16,7 +16,7 @@ Read `## Standard library`. Modules live in `internal/compiler/std/<name>/`, wri
 
 ## Tests
 
-Read `## Tests`. `go test ./...` runs every `testdata/run` program against its `.out`, `.err`, `.maxrss` and `.needed` files, and expects every `testdata/fail` program to fail with its `.err`. The tests expect a Linux host. The `internal/asm` and `internal/link` oracle tests compare against GNU binutils and LLVM and skip when those tools are missing or at another version. `cmd/lowfuzz` finds compiler bugs with generated programs.
+Read `## Tests`. `go test ./...` runs every `testdata/run` program against its `.out`, `.err`, `.maxrss` and `.needed` files, and expects every `testdata/fail` program to fail with its `.err`. The `testdata/run` programs are Linux binaries and skip on a Windows host, where `TestRunWindows` runs their Windows builds directly; on Linux it runs them under `wine`. The `internal/asm` and `internal/link` oracle tests compare against GNU binutils and LLVM and skip when those tools are missing or at another version. `cmd/lowfuzz` finds compiler bugs with generated programs.
 
 ## Editor, LSP or lint
 

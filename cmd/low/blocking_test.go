@@ -9,16 +9,10 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"lowlang/internal/target"
 )
 
 func TestReadiedGreenThreadRunsWhileProducerComputes(t *testing.T) {
-	source := filepath.Join("..", "..", "testdata", "run", "sched_poll_reply.low")
-	binary := filepath.Join(t.TempDir(), "main")
-	if err := build(context.Background(), source, binary, target.Linux); err != nil {
-		t.Fatal(err)
-	}
+	binary := hostBinary(t, filepath.Join("..", "..", "testdata", "run", "sched_poll_reply.low"))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	start := time.Now()
@@ -36,11 +30,8 @@ func TestReadiedGreenThreadRunsWhileProducerComputes(t *testing.T) {
 }
 
 func TestBlockedReadDoesNotStallCollection(t *testing.T) {
-	source := filepath.Join("..", "..", "testdata", "run", "std_sched_blocked_read.low")
-	binary := filepath.Join(t.TempDir(), "main")
-	if err := build(context.Background(), source, binary, target.Linux); err != nil {
-		t.Fatal(err)
-	}
+	requireLinuxHost(t)
+	binary := hostBinary(t, filepath.Join("..", "..", "testdata", "run", "std_sched_blocked_read.low"))
 	cases := []struct {
 		name    string
 		release func(w io.WriteCloser) error

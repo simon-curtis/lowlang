@@ -45,10 +45,28 @@ func relative(t *testing.T, message, path string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, prefix := range []string{abs + "/", path + "/", path + ":"} {
+	separator := string(filepath.Separator)
+	for _, prefix := range []string{abs + separator, path + separator, path + ":"} {
 		message = strings.ReplaceAll(message, prefix, "")
 	}
-	return message
+	return filepath.ToSlash(message)
+}
+
+func requireLinuxHost(t *testing.T) {
+	t.Helper()
+	if target.Host() != target.Linux {
+		t.Skip("runs Linux binaries, which need a Linux host")
+	}
+}
+
+func hostBinary(t *testing.T, source string) string {
+	t.Helper()
+	host := target.Host()
+	binary := filepath.Join(t.TempDir(), host.Executable("main"))
+	if err := build(context.Background(), source, binary, host); err != nil {
+		t.Fatal(err)
+	}
+	return binary
 }
 
 func expected(t *testing.T, path, ext string) (string, bool) {
@@ -64,6 +82,7 @@ func expected(t *testing.T, path, ext string) (string, bool) {
 }
 
 func TestRun(t *testing.T) {
+	requireLinuxHost(t)
 	for _, path := range fixtures(t, "run") {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			if _, measured := expected(t, path, ".maxrss"); !measured {
@@ -119,10 +138,7 @@ func runWithEnv(t *testing.T, path, binary string, env []string) {
 }
 
 func TestRunWindows(t *testing.T) {
-	wine, err := exec.LookPath("wine")
-	if err != nil {
-		t.Skip("wine is not installed")
-	}
+	launch := windowsLauncher(t)
 	paths := slices.DeleteFunc(fixtures(t, "run"), func(path string) bool {
 		_, glibc := expected(t, path, ".needed")
 		return glibc || strings.HasPrefix(filepath.Base(path), "std_")
@@ -130,20 +146,39 @@ func TestRunWindows(t *testing.T) {
 	for _, path := range append(paths, fixtures(t, "windows")...) {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			t.Parallel()
-			runWindowsFixture(t, wine, path)
+			runWindowsFixture(t, launch, path)
 		})
 	}
 }
 
-func runWindowsFixture(t *testing.T, wine, path string) {
+type launcher func(ctx context.Context, binary string) *exec.Cmd
+
+func windowsLauncher(t *testing.T) launcher {
+	t.Helper()
+	if target.Host() == target.Windows {
+		return func(ctx context.Context, binary string) *exec.Cmd {
+			return exec.CommandContext(ctx, binary)
+		}
+	}
+	wine, err := exec.LookPath("wine")
+	if err != nil {
+		t.Skip("wine is not installed")
+	}
+	return func(ctx context.Context, binary string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, wine, binary)
+		cmd.Env = append(os.Environ(), "WINEDEBUG=-all", "DISPLAY=", "WAYLAND_DISPLAY=")
+		return cmd
+	}
+}
+
+func runWindowsFixture(t *testing.T, launch launcher, path string) {
 	binary := filepath.Join(t.TempDir(), "main.exe")
 	if err := build(context.Background(), path, binary, target.Windows); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, wine, binary)
-	cmd.Env = append(os.Environ(), "WINEDEBUG=-all", "DISPLAY=", "WAYLAND_DISPLAY=")
+	cmd := launch(ctx, binary)
 	compareRun(t, path, func(stdout, stderr io.Writer) error {
 		cmd.Stdout, cmd.Stderr = stdout, stderr
 		return cmd.Run()

@@ -7,16 +7,10 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"lowlang/internal/target"
 )
 
 func TestSparseSurvivorsDoNotTriggerExtraCollections(t *testing.T) {
-	source := filepath.Join("..", "..", "testdata", "run", "heap_sparse_pacing.low")
-	binary := filepath.Join(t.TempDir(), "main")
-	if err := build(context.Background(), source, binary, target.Linux); err != nil {
-		t.Fatal(err)
-	}
+	binary := hostBinary(t, filepath.Join("..", "..", "testdata", "run", "heap_sparse_pacing.low"))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	start := time.Now()
