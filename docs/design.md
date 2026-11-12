@@ -2063,10 +2063,12 @@ Win32:
 
 ### Renderer
 
-- `gpu.open() -> Gpu ! Error` creates a Vulkan 1.3 instance and device on the first physical device that offers dynamic rendering, synchronization2 and a graphics queue, and that can present to a surface when one is given. `Gpu` is droppable and destroys everything it made.
+- `gpu.open() -> Gpu ! Error` creates a Vulkan 1.3 instance and device on the first physical device that offers dynamic rendering, synchronization2 and a graphics queue, and that can present to a surface when one is given. `Gpu` is droppable: it waits for the device to go idle and destroys everything it made. A `Target` or `Swapchain` made from it is droppable too and must be released first, which `using` does when it is bound after the `Gpu`.
+- `gpu.Error` is `NoDevice`, `Vulkan(call, result)` for a failed call and its `VkResult`, `NoMemoryType(allowed, flags)` when no memory type matches, and `InvalidSize(width, height)` for a target smaller than one pixel. `describe(e)` gives it as text.
+- A `Gpu` keeps one atlas texture that mirrors the `scene.Atlas` it was last given, so one `Gpu` draws with one atlas.
 - It holds three pipelines, one per primitive kind, sharing one descriptor set layout (the instance storage buffer at binding 0, the glyph atlas and its sampler at binding 1) and one pipeline layout whose push constant is the target size in pixels. Each frame in flight, two of them, owns a command buffer, a fence, its semaphores and one host-visible instance buffer per kind that grows by doubling.
 - Drawing a scene writes each kind's instances into its buffer in draw order, uploads the glyph atlas's dirty rows through a staging buffer, and records one `vkCmdDraw` of six vertices per batch, with `firstInstance` at the batch's first instance, inside one dynamic rendering pass that clears to the scene's background.
-- An offscreen `Target` renders into an `R8G8B8A8_UNORM` image and reads it back as RGBA bytes. A `Swapchain` renders into a `VkSurfaceKHR` with a `B8G8R8A8_UNORM` or `R8G8B8A8_UNORM` format and FIFO presentation, and is recreated when the window size changes or presentation reports `VK_ERROR_OUT_OF_DATE_KHR` or `VK_SUBOPTIMAL_KHR`.
+- `target(g, width, height)` makes an offscreen `Target`, an `R8G8B8A8_UNORM` image. `render(g, t, scene, mut atlas)` submits a frame and returns, and `read(g, t)` waits for the queue to go idle and returns the pixels as RGBA bytes. A `Swapchain` renders into a `VkSurfaceKHR` with a `B8G8R8A8_UNORM` or `R8G8B8A8_UNORM` format and FIFO presentation, and is recreated when the window size changes or presentation reports `VK_ERROR_OUT_OF_DATE_KHR` or `VK_SUBOPTIMAL_KHR`.
 - Colours are sRGB-encoded and blended in that space with premultiplied-free `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` blending.
 - C structures that Vulkan reads through a pointer are pinned heap values kept by a droppable `Pins` list for the duration of the call or the frame.
 - The shaders:
@@ -2083,30 +2085,35 @@ Win32:
 
 ### Layout
 
-- A `layout.Tree` holds nodes in a slice; `node(style, children)` and `leaf(style, measure)` add one and return its index, and `compute(root, size)` places every node. `rect(node)` is its border box in logical pixels relative to the window.
+- A `layout.Tree` holds nodes in a slice; `node(mut t, style, children)` and `leaf(mut t, style, measure)` add one and return its index, and `compute(mut t, root, available)` places every node. `rect(t, node)` is its border box in logical pixels relative to the window and `content(t, node)` its content box.
 - A `Style` has:
-  - `display` (`Flex` or `None`), `position` (`Relative` or `Absolute` with `inset` edges);
-  - `direction` (`Row` or `Column`), `justify` (`Start`, `End`, `Center`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly`), `align_items` and `align_self` (`Start`, `End`, `Center`, `Stretch`);
-  - `grow`, `shrink` and `basis`; `width`, `height` and their minimums and maximums as `Auto`, `Px(f32)` or `Percent(f32)`;
+  - `display` (`Flex`, or `None` for a node that takes no space), `position` (`Relative`, or `Absolute` with an `Inset` of one `Dimension` per side);
+  - `direction` (`Row` or `Column`), `justify` (`Start`, `End`, `Center`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly`), `align_items` (`Start`, `End`, `Center`, `Stretch`) and `align_self` (those or `Auto`, which follows `align_items`);
+  - `grow`, `shrink` and `basis`; `width`, `height` and their minimums and maximums as `Auto`, `Px(f32)` or `Percent(f32)`, where `Percent(50.0)` is half of the parent's inner size, or of its padding box for an absolute node;
   - `margin`, `padding` and `border` edges in pixels, and `gap` between children.
+- Sizes, minimums, maximums and `basis` are border-box lengths, and a box is never smaller than its padding and border. An `Auto` minimum is zero.
 - The algorithm is CSS flexbox for a single line:
   1. Each child's flex basis is its `basis`, else its main size, else its content size: the measure function's answer for a leaf, the sum or maximum of its children for a container.
   2. Free space is distributed by `grow` when positive and taken by `shrink` weighted by basis when negative, freezing children that hit their minimum or maximum and repeating until none does.
   3. A child's cross size is its own, or the container's inner cross size when it stretches.
   4. `justify` places children on the main axis and `align` on the cross axis. Auto margins are not supported.
-  5. Absolute children are placed against the padding box by their insets and do not take part in the flow.
-- A leaf's measure function takes the width available to it, infinite when unconstrained, and returns its size.
+  5. Absolute children are placed against the padding box by their insets and do not take part in the flow. One with no inset on an axis is placed on it by the parent's `justify` or `align_items`.
+- A leaf's measure function takes the width available to it, `unbounded()` when unconstrained (`is_bounded` tells them apart), and returns its size.
 
 ### Text
 
-- `font.parse(bytes) -> Font ! Error` reads a TrueType font with `glyf` outlines from the `head`, `hhea`, `maxp`, `cmap` (formats 4 and 12), `hmtx`, `loca`, `glyf` and `kern` (format 0) tables. A CFF font fails with `Unsupported`, and a table that runs past the end of the data with `Malformed`.
+- `font.parse(data) -> Font ! Error` reads a TrueType font with `glyf` outlines from the `head`, `hhea`, `maxp`, `cmap`, `hmtx`, `loca` and `glyf` tables and the optional `kern` table. It uses a `cmap` subtable of format 12 or 4, preferring a Unicode one that covers every plane, and the first horizontal `kern` subtable of format 0.
+  - It fails with `Unsupported(table)` for a CFF font and with `Malformed(table)` for a table directory entry or `loca` offset that runs past the data.
+  - Glyph data and lookup tables are read when used, and a malformed one gives glyph 0, an empty outline or a zero metric.
+  - `Font` metrics (`units_per_em`, `ascent`, `descent`, `line_gap`, `glyph_count`) are `i64` font units with y up. `scale(f, px)` converts them to pixels, and `glyph_index`, `advance` and `kern` look up one glyph or pair.
 - `font.fallback()` is Go Regular, embedded, under the Go fonts' BSD licence in `std/ui/font/LICENSE`.
-- A glyph's outline is its contours of on- and off-curve points, with composite glyphs expanded through their offsets and scales.
+- `outline(f, glyph)` gives a glyph's contours of on- and off-curve points, with composite glyphs expanded through their offsets and scales, at most 6 deep and 64 components in all. `rasterize(f, glyph, px)` gives a `Bitmap` of coverage bytes with its offset from the pen.
 - The rasteriser scales the outline to pixels, flattens each quadratic curve into lines whose count grows with the curve's size, and accumulates each line's signed area and cover into an `f32` buffer. A running sum along each row gives the coverage, clamped to 0..1 and stored as one byte per pixel.
-- `text.System` holds the fonts, in order of preference, and the glyph atlas. A code point is drawn with the first font that maps it, else with the first font's missing glyph.
-- Shaping maps each code point to one glyph and places glyphs by their advances plus the `kern` pair adjustment. There are no ligatures, no `GPOS`, no bidirectional reordering and no complex scripts.
-- `text.wrap(sys, s, size, width)` breaks lines after spaces and at `\n`, and breaks a word longer than the width between glyphs. Every line has the font's ascent, descent and line gap. Measurements of the same string, size and width are cached for the frame.
-- The atlas is a 1024 by 1024 `R8` image packed in shelves. A glyph is rasterised at its pixel size the first time it is drawn, with a one-pixel border. When the atlas is full it is cleared and glyphs are packed again from the next frame's text. Glyph origins are snapped to whole device pixels.
+- `text.System` holds the fonts, in order of preference, the glyph atlas and the caches. `system(fonts)` makes one, `default_system()` one with only the fallback font, and `system_with_atlas(fonts, size)` one with a smaller atlas. A code point is drawn with the first font that maps it, else with the first font's missing glyph.
+- Shaping maps each code point to one glyph and places glyphs by their advances plus the `kern` pair adjustment when both come from one font. There are no ligatures, no `GPOS`, no bidirectional reordering and no complex scripts.
+- `text.wrap(mut sys, s, size, width) -> Layout` breaks lines after spaces and at `\n`, and breaks a word longer than the width between glyphs; spaces at the end of a line hang past it. Every line has the first font's ascent, descent and line gap. `measure` gives a layout's size. Layouts of the same string, size and width are kept until `end_frame(mut sys)`, and `cached(sys)` counts them.
+- `paint(mut sys, mut scene, layout, origin, color, scale)` pushes one sprite per visible glyph. Glyph origins are snapped to whole device pixels.
+- The atlas is a 1024 by 1024 `R8` image packed in shelves. A glyph is rasterised at its pixel size, rounded to 1/64 pixel, the first time it is drawn, with a one-pixel border. A glyph that does not fit is left out, and so is every glyph after it in the frame; `end_frame` then clears the atlas so the next frame packs its own text.
 
 ### UI tests
 
