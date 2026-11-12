@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { Marked } from "marked";
 import { all, categories, orphaned } from "./categories.mjs";
 import { compilerSource, folders } from "./config.mjs";
-import { codespan, low, words } from "./highlight.mjs";
+import { codespan, isTypeName, linked, low, words } from "./highlight.mjs";
 import { layout, rootOf } from "./layout.mjs";
 import { anchor, codeRenderer, file, Linker } from "./links.mjs";
 import { escape, isLow, textOf } from "./markup.mjs";
@@ -98,29 +98,54 @@ class Page {
         return `${folders.packages}${file(this.#module.path)}`;
     }
 
-    #external(alias, name, whole) {
-        const imported = this.#module.imports.find((entry) => entry.alias === alias);
-        if (!imported || !this.#exports.get(imported.path)?.has(name)) {
-            return whole;
-        }
-        return `<a class="m" href="${file(imported.path)}">${alias}</a>.<a class="t" href="${file(imported.path)}#${name}">${name}</a>`;
-    }
-
-    #type(name, whole) {
+    #localTarget(name) {
         if (this.#typeNames.has(name)) {
-            return `<a class="t" href="#${name}">${name}</a>`;
+            return `#${name}`;
         }
         const builtin = this.#library.builtin(name);
-        return builtin ? `<a class="t" href="${this.#root}${builtin}">${name}</a>` : whole;
+        return builtin ? `${this.#root}${builtin}` : undefined;
+    }
+
+    #importedTarget(alias, name) {
+        const imported = this.#module.imports.find((entry) => entry.alias === alias);
+        return imported && this.#exports.get(imported.path)?.has(name) ? file(imported.path) : undefined;
+    }
+
+    #signature(source) {
+        const links = new Map();
+        const modules = new Set();
+        for (const offset of words(source)) {
+            const name = /^\w+/.exec(source.slice(offset))[0];
+            if (!isTypeName(name)) {
+                continue;
+            }
+            const alias = /(\w+)\.$/.exec(source.slice(0, offset))?.[1];
+            if (alias === undefined) {
+                const target = this.#localTarget(name);
+                if (target) {
+                    links.set(offset, target);
+                }
+                continue;
+            }
+            const page = this.#importedTarget(alias, name);
+            if (page) {
+                links.set(offset - alias.length - 1, page);
+                links.set(offset, `${page}#${name}`);
+                modules.add(alias);
+            }
+        }
+        return linked(links, modules);
     }
 
     #code(text) {
-        const groups = blocks(text).map((group) => (group.kind === "note" ? note(group.indent, group.lines) : low(group.lines.join("\n"))));
-        const painted = groups
-            .join("")
-            .replace(/\b(\w+)\.<span class="t">(\w+)<\/span>/g, (whole, alias, name) => this.#external(alias, name, whole))
-            .replace(/(?<!\.)<span class="t">(\w+)<\/span>/g, (whole, name) => this.#type(name, whole));
-        return `<pre class="signature"><code>${painted}</code></pre>\n`;
+        const groups = blocks(text).map((group) => {
+            if (group.kind === "note") {
+                return note(group.indent, group.lines);
+            }
+            const source = group.lines.join("\n");
+            return low(source, this.#signature(source));
+        });
+        return `<pre class="signature"><code>${groups.join("")}</code></pre>\n`;
     }
 
     #item(item, depth) {

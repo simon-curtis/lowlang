@@ -163,10 +163,18 @@ export function words(source) {
     return lex(source).filter((token) => token.kind === "word" && !keywords.has(token.text)).map((token) => token.offset);
 }
 
-const unchecked = { hovers: new Map(), references: new Map(), links: new Map(), anchors: new Map() };
+export function isTypeName(name) {
+    return /^[A-Z]/.test(name) || types.has(name);
+}
+
+export function linked(links, modules) {
+    return { hovers: new Map(), references: new Map(), links, anchors: new Map(), modules };
+}
+
+const unchecked = linked(new Map(), new Set());
 
 export function low(source, facts = unchecked) {
     const tokens = lex(source);
-    const imported = modules(tokens);
+    const imported = new Set([...modules(tokens), ...(facts.modules ?? [])]);
     return tokens.map((token, index) => paint(token, index, tokens, imported, facts)).join("");
 }
