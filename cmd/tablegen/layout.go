@@ -26,6 +26,14 @@ func lowConstant(name string, value int, kind lowType) layoutConstant {
 	return layoutConstant{name: name, value: int64(value), kind: kind}
 }
 
+func classConstants(prefix string, names []string, kind lowType) []layoutConstant {
+	constants := make([]layoutConstant, len(names))
+	for i, name := range names {
+		constants[i] = lowConstant(prefix+strings.ToLower(name), i, kind)
+	}
+	return constants
+}
+
 func layoutSource(constants []layoutConstant, tables []string) string {
 	var out strings.Builder
 	for _, c := range constants {

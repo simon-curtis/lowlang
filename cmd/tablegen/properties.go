@@ -461,5 +461,9 @@ func propertyLayoutSource() string {
 		lowConstant("property_identifier_start_shift", xidStartShift, lowInt),
 		lowConstant("property_identifier_continue_shift", xidContinueShift, lowInt),
 	}
+	constants = append(constants, classConstants("category_", categoryNames, lowWord)...)
+	constants = append(constants, classConstants("width_", widthNames, lowWord)...)
+	constants = append(constants, classConstants("break_", breakNames, lowInt)...)
+	constants = append(constants, classConstants("conjunct_", conjunctNames, lowInt)...)
 	return layoutSource(constants, propertyTables)
 }
