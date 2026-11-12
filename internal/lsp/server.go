@@ -29,6 +29,7 @@ type Server struct {
 	fresh        map[string]bool
 	compiledDocs map[string]sources
 	compiles     *scheduler
+	indexed      indexed
 	hintRefresh  bool
 	requests     int
 	shutdown     bool
@@ -364,20 +365,32 @@ func (s *Server) diagnose(err error, document string) (string, Diagnostic) {
 
 func (s *Server) query(p TextDocumentPositionParams) *query {
 	path := pathOf(p.TextDocument.URI)
-	file := s.checked(path)
+	unit := s.units[s.entry(path)]
+	file := checkedFile(unit, path)
 	if file == nil {
 		return nil
 	}
-	t := s.text(path)
-	x := newIndex(file, t)
+	x := s.index(path, file)
 	line := p.Position.Line
-	col := t.byteCol(line, p.Position.Character)
+	col := x.text.byteCol(line, p.Position.Character)
 	occ := x.at(line, col)
 	if occ == nil {
 		return nil
 	}
-	unit := s.units[s.entry(path)]
 	return &query{unit: unit, index: x, occ: occ}
+}
+
+func (s *Server) index(path string, file *ast.File) *index {
+	src, err := s.docs.read(path)
+	if err != nil {
+		return newIndex(file, text{})
+	}
+	if s.indexed.matches(path, file, src) {
+		return s.indexed.index
+	}
+	x := newIndex(file, newText(src))
+	s.indexed = indexed{path: path, file: file, src: string(src), index: x}
+	return x
 }
 
 func (s *Server) hover(p TextDocumentPositionParams) any {
@@ -413,9 +426,10 @@ func (s *Server) cursorAt(p TextDocumentPositionParams) *cursor {
 	path := pathOf(p.TextDocument.URI)
 	entry := s.entry(path)
 	t := s.text(path)
+	unit := s.units[entry]
 	return &cursor{
-		unit:     s.units[entry],
-		file:     s.checked(path),
+		unit:     unit,
+		file:     checkedFile(unit, path),
 		text:     t,
 		compiled: s.compiledText(entry, path),
 		line:     p.Position.Line,
@@ -482,7 +496,10 @@ func (s *Server) symbols(path string) []DocumentSymbol {
 }
 
 func (s *Server) checked(path string) *ast.File {
-	unit := s.units[s.entry(path)]
+	return checkedFile(s.units[s.entry(path)], path)
+}
+
+func checkedFile(unit *compiler.Unit, path string) *ast.File {
 	if unit == nil {
 		return nil
 	}

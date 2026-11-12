@@ -24,6 +24,17 @@ type index struct {
 	occurrences []occurrence
 }
 
+type indexed struct {
+	path  string
+	file  *ast.File
+	src   string
+	index *index
+}
+
+func (i indexed) matches(path string, file *ast.File, src []byte) bool {
+	return i.index != nil && i.path == path && i.file == file && i.src == string(src)
+}
+
 func newIndex(file *ast.File, t text) *index {
 	x := &index{file: file, text: t}
 	x.declarations()
