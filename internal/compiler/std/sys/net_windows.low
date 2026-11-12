@@ -4,9 +4,8 @@ extern "ws2_32" {
     fn WSAStartup(version: u16, data: ptr) -> i32
     fn WSAGetLastError() -> i32
     fn WSASocketW(family: i32, kind: i32, protocol: i32, info: ptr, group: u32, flags: u32) -> i64
-    fn WSAEventSelect(s: i64, event: i64, events: i32) -> i32
+    fn WSADuplicateSocketW(s: i64, process: u32, info: ptr) -> i32
     fn WSAIoctl(s: i64, code: u32, input: ptr, input_size: u32, output: ptr, output_size: u32, mut returned: u32, overlapped: ptr, routine: ptr) -> i32
-    fn WSAPoll(fds: ptr, count: u32, timeout: i32) -> i32
     fn setsockopt(s: i64, level: i32, option: i32, value: ptr, size: i32) -> i32
     fn win_bind(s: i64, address: ptr, size: i32) -> i32 = "bind"
     fn win_listen(s: i64, backlog: i32) -> i32 = "listen"
@@ -22,8 +21,8 @@ extern "ws2_32" {
 
 extern "kernel32" {
     fn CreateEventW(attributes: ptr, manual: i32, initial: i32, name: ptr) -> i64
-    fn SetEvent(event: i64) -> i32
-    fn ResetEvent(event: i64) -> i32
+    fn CancelIoEx(h: i64, overlapped: ptr) -> i32
+    fn GetOverlappedResult(h: i64, overlapped: ptr, mut done: u32, wait: i32) -> i32
 }
 
 extern "iphlpapi" {
@@ -32,8 +31,8 @@ extern "iphlpapi" {
     fn ConvertInterfaceLuidToIndex(mut luid: u64, mut index: u32) -> u32
 }
 
-fn socket_events() -> i32 {
-    0x3B
+fn overlapped_flags() -> u32 {
+    0x81
 }
 
 fn would_block() -> i64 {
@@ -63,14 +62,19 @@ fn startup() ! io.Error {
     }
 }
 
-fn attach_event(s: i64) -> i64 ! io.Error {
+fn waitable(s: i64) -> i64 ! io.Error {
+    socket_nonblocking(s)?
     let event = opened(CreateEventW(null, 1, 0, null))?
-    if WSAEventSelect(s, event, socket_events()) != 0 {
-        let e = socket_error()
-        CloseHandle(event)
-        fail e
-    }
     s | (event << 32)
+}
+
+fn descriptor(s: i64) -> i64 ! io.Error {
+    waitable(s) catch {
+        e => {
+            closesocket(s)
+            fail e
+        }
+    }
 }
 
 fn system_address(address: []u8) -> []u8 {
@@ -154,16 +158,8 @@ pub fn socket(family: i64, kind: SocketKind) -> i64 ! io.Error {
         Streaming => 1
         Datagrams => 2
     }
-    let s = WSASocketW(system_family(family), type_code, 0, null, 0, 0x80)
-    if s == invalid_handle() {
-        fail socket_error()
-    }
-    let fd = attach_event(s) catch {
-        e => {
-            closesocket(s)
-            fail e
-        }
-    }
+    let s = opened(WSASocketW(system_family(family), type_code, 0, null, 0, overlapped_flags()))?
+    let fd = descriptor(s)?
     match kind {
         Datagrams => ignore_unreachable(fd)
         Streaming => {}
@@ -175,7 +171,9 @@ fn loopback() -> []u8 {
     [2, 0, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 
-/// Returns two connected, unnamed Unix stream sockets, non-blocking and closed on `exec`.
+/// Returns two connected, unnamed stream sockets, non-blocking and closed on `exec`.
+///
+/// They are Unix stream sockets on Linux and a pair of loopback TCP sockets on Windows.
 pub fn socketpair() -> Pair ! io.Error {
     let listener = socket(2, SocketKind.Streaming)?
     using held = own(listener)
@@ -198,6 +196,18 @@ pub fn socketpair() -> Pair ! io.Error {
         }
         return Pair { first: detach(mut first_end).fd, second: accepted.fd }
     }
+}
+
+/// Returns a second descriptor for the socket `fd`, closed on `exec`, that carries writes so a writer waits for buffer space while a reader waits on `fd`.
+///
+/// On Linux it is a duplicate of `fd`. On Windows it is a duplicate of the socket with its own event. The caller closes it with `close_fd`.
+pub fn write_view(fd: i64) -> i64 ! io.Error {
+    let info = io.buffer(628)
+    if WSADuplicateSocketW(socket_of(fd), GetCurrentProcessId(), __slice_ptr(info)) != 0 {
+        fail socket_error()
+    }
+    let s = opened(WSASocketW(-1, -1, -1, __slice_ptr(info), 0, overlapped_flags()))?
+    descriptor(s)?
 }
 
 /// Sets the integer socket option `option` of the socket `fd` to `value`.
@@ -263,12 +273,7 @@ pub fn accept(fd: i64) -> Accepted ! io.Error {
             }
             fail win_error(code)
         }
-        let fd = attach_event(accepted) catch {
-            e => {
-                closesocket(accepted)
-                fail e
-            }
-        }
+        let fd = descriptor(accepted)?
         return Accepted { fd, address: portable_address(buf, i64(size)) }
     }
 }
@@ -330,7 +335,7 @@ pub fn shutdown(fd: i64, how: Shutdown) ! io.Error {
     }
     let r = win_shutdown(socket_of(fd), direction)
     let e = socket_error()
-    SetEvent(event_of(fd))
+    CancelIoEx(socket_of(fd), null)
     if r != 0 {
         fail e
     }
@@ -390,7 +395,7 @@ pub fn peer_credentials(fd: i64) -> Credentials ! io.Error {
 
 /// Returns the kernel index of the network interface `name`.
 ///
-/// Fails with `Invalid` if `name` is empty or longer than 15 bytes, and with `NotFound` if there is no such interface.
+/// Fails with `Invalid` if `name` is empty or, on Linux, longer than 15 bytes; Windows has no length limit. Fails with `NotFound` if there is no such interface.
 pub fn interface_index(name: str) -> i64 ! io.Error {
     if name.len == 0 {
         fail Invalid
@@ -436,23 +441,55 @@ pub fn set_multicast_interface4(fd: i64, index: i64) ! io.Error {
     set_bytes(fd, 0, 9, interface_address(index))?
 }
 
-fn ready(fd: i64, writable: bool) -> bool {
-    let entry = io.buffer(16)
-    io.set_le64(entry, 0, socket_of(fd))
-    io.set_le16(entry, 8, if writable { 0x10 } else { 0x100 })
-    if WSAPoll(__slice_ptr(entry), 1, 0) != 0 {
-        return true
+fn afd_poll() -> u32 {
+    0x12024
+}
+
+fn io_pending() -> u32 {
+    997
+}
+
+fn status_pending() -> i64 {
+    0x103
+}
+
+fn poll_events(writable: bool) -> i64 {
+    if writable { 0x114 } else { 0x199 }
+}
+
+fn poll_operation(fd: i64, writable: bool) -> []u8 {
+    let operation = io.buffer(64)
+    io.set_le64(operation, 24, event_of(fd))
+    io.set_le64(operation, 32, 0x7FFFFFFFFFFFFFFF)
+    io.set_le32(operation, 40, 1)
+    io.set_le64(operation, 48, socket_of(fd))
+    io.set_le32(operation, 56, poll_events(writable))
+    operation
+}
+
+fn settle(s: i64, operation: []u8) {
+    if io.le32(operation, 0) != status_pending() {
+        return
     }
-    false
+    CancelIoEx(s, __slice_ptr(operation))
+    var done: u32 = 0
+    GetOverlappedResult(s, __slice_ptr(operation), mut done, 1)
 }
 
 /// Parks the green thread until the socket `fd` may be ready to read, or to write when `writable` is set.
 ///
 /// Can return before the socket is ready, and returns when another green thread shuts the socket down, so the caller repeats its operation and waits again.
 pub fn wait_socket(fd: i64, writable: bool) {
-    let event = event_of(fd)
-    ResetEvent(event)
-    if !ready(fd, writable) {
-        wait_readable(event)
+    let s = socket_of(fd)
+    let operation = poll_operation(fd, writable)
+    let request = operation[32..]
+    var returned: u32 = 0
+    if DeviceIoControl(s, afd_poll(), __slice_ptr(request), 32, __slice_ptr(request), 32, mut returned, __slice_ptr(operation)) != 0 {
+        return
     }
+    if GetLastError() != io_pending() {
+        return
+    }
+    wait_readable(event_of(fd))
+    settle(s, operation)
 }
