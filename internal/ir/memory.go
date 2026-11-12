@@ -92,13 +92,6 @@ func (w *workspace) escape(v *Value) {
 	}
 }
 
-func (w *workspace) localIndex(root *Value) (int, bool) {
-	if root.ID >= len(w.local) || w.local[root.ID] == 0 {
-		return 0, false
-	}
-	return int(w.local[root.ID]) - 1, true
-}
-
 func (w *workspace) promotableSlots(fn *Func) {
 	w.localRoots(fn)
 	w.slotFirst = reset(w.slotFirst, len(fn.Slots)+1)

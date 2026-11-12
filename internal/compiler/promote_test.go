@@ -1,4 +1,4 @@
-package main
+package compiler
 
 import (
 	"strings"
@@ -26,7 +26,7 @@ fn main() {
 `
 
 func TestInlinedMutCalleeLosesSlot(t *testing.T) {
-	prog := analyseRelease(t, promoteRotProgram)
+	prog := releaseProgram(t, promoteRotProgram)
 	main := function(t, prog, "main")
 	if len(main.Slots) != 0 {
 		t.Fatalf("slots remain: %v", main.Slots)
@@ -43,7 +43,7 @@ func TestInlinedMutCalleeLosesSlot(t *testing.T) {
 }
 
 func TestEscapingSlotStays(t *testing.T) {
-	prog := analyse(t, promoteRotProgram)
+	prog := devProgram(t, promoteRotProgram)
 	core := function(t, prog, "core")
 	if len(core.Slots) != 2 {
 		t.Fatalf("want 2 slots passed to rot, got %v", core.Slots)
@@ -73,7 +73,7 @@ fn main() {
 `
 
 func TestConditionalStoresBecomePhis(t *testing.T) {
-	prog := analyseRelease(t, promoteBranchProgram)
+	prog := releaseProgram(t, promoteBranchProgram)
 	main := function(t, prog, "main")
 	if len(main.Slots) != 0 {
 		t.Fatalf("slots remain: %v\n%s", main.Slots, main)
@@ -101,7 +101,7 @@ fn main() {
 `
 
 func TestCStructSlotStays(t *testing.T) {
-	prog := analyseRelease(t, promoteCStructProgram)
+	prog := releaseProgram(t, promoteCStructProgram)
 	main := function(t, prog, "main")
 	if len(main.Slots) == 0 {
 		t.Fatalf("extern struct slot was promoted:\n%s", main)
@@ -122,7 +122,7 @@ const promoteSelectProgram = `fn main() {
 `
 
 func TestSelectBoxStays(t *testing.T) {
-	prog := analyseRelease(t, promoteSelectProgram)
+	prog := releaseProgram(t, promoteSelectProgram)
 	main := function(t, prog, "main")
 	if len(main.Slots) == 0 {
 		t.Fatalf("select box slot was promoted:\n%s", main)
@@ -151,7 +151,7 @@ fn main() {
 `
 
 func TestMultiWordSlotPromoted(t *testing.T) {
-	prog := analyseRelease(t, promoteWideProgram)
+	prog := releaseProgram(t, promoteWideProgram)
 	main := function(t, prog, "main")
 	if len(main.Slots) != 0 {
 		t.Fatalf("slots remain: %v\n%s", main.Slots, main)
@@ -171,7 +171,7 @@ fn main() {
 `
 
 func TestInlinedRawLoadKeepsTrap(t *testing.T) {
-	prog := analyseRelease(t, promoteInlinedRawProgram)
+	prog := releaseProgram(t, promoteInlinedRawProgram)
 	main := function(t, prog, "main")
 	if !strings.Contains(main.String(), " = load ") {
 		t.Fatalf("inlined unused load was discarded:\n%s", main)

@@ -1,4 +1,4 @@
-package main
+package compiler
 
 import (
 	"fmt"
@@ -10,22 +10,22 @@ import (
 	"testing"
 
 	"lowlang/internal/amd64"
-	"lowlang/internal/compiler"
+	"lowlang/internal/fixture/fixturetest"
 	"lowlang/internal/ir"
 	"lowlang/internal/target"
 )
 
-func analyse(t *testing.T, source string) *ir.Program {
+func devProgram(t *testing.T, source string) *ir.Program {
 	t.Helper()
-	return analyseWith(t, source, compiler.AnalyseDev)
+	return programWith(t, source, AnalyseDev)
 }
 
-func analyseRelease(t *testing.T, source string) *ir.Program {
+func releaseProgram(t *testing.T, source string) *ir.Program {
 	t.Helper()
-	return analyseWith(t, source, compiler.Analyse)
+	return programWith(t, source, Analyse)
 }
 
-func analyseWith(t *testing.T, source string, analyser func(string, target.OS) (*compiler.Unit, error)) *ir.Program {
+func programWith(t *testing.T, source string, analyser func(string, target.OS) (*Unit, error)) *ir.Program {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "main.low")
 	if err := os.WriteFile(path, []byte(source), 0o644); err != nil {
@@ -116,7 +116,7 @@ fn main() {
 `
 
 func TestBoundsChecksRemoved(t *testing.T) {
-	prog := analyse(t, boundsProgram)
+	prog := devProgram(t, boundsProgram)
 	cases := []struct {
 		name   string
 		checks int
@@ -141,7 +141,7 @@ func TestBoundsChecksRemoved(t *testing.T) {
 }
 
 func TestFloat32CallResultIsCleared(t *testing.T) {
-	prog := analyse(t, `extern "m" {
+	prog := devProgram(t, `extern "m" {
     fn sqrtf(x: f32) -> f32
 }
 
@@ -209,7 +209,7 @@ fn main() {
 `
 
 func TestOptimiserRemovals(t *testing.T) {
-	prog := analyse(t, foldProgram)
+	prog := devProgram(t, foldProgram)
 	cases := []struct {
 		name    string
 		pattern string
@@ -314,7 +314,7 @@ func jumpOnlyLabels(lines []string) []string {
 }
 
 func TestNoJumpToNextBlock(t *testing.T) {
-	prog := analyse(t, layoutProgram)
+	prog := devProgram(t, layoutProgram)
 	for _, name := range []string{"fib", "sieve", "search", "main"} {
 		t.Run(name, func(t *testing.T) {
 			body := functionAsm(t, prog, name)
@@ -326,7 +326,7 @@ func TestNoJumpToNextBlock(t *testing.T) {
 }
 
 func TestNoJumpOnlyBlocks(t *testing.T) {
-	prog := analyse(t, layoutProgram)
+	prog := devProgram(t, layoutProgram)
 	for _, name := range []string{"sieve", "search"} {
 		t.Run(name, func(t *testing.T) {
 			body := functionAsm(t, prog, name)
@@ -338,7 +338,7 @@ func TestNoJumpOnlyBlocks(t *testing.T) {
 }
 
 func TestSieveInnerLoopIsRotated(t *testing.T) {
-	prog := analyse(t, layoutProgram)
+	prog := devProgram(t, layoutProgram)
 	lines := asmLines(functionAsm(t, prog, "sieve"))
 	inner := -1
 	for i, line := range lines {
@@ -359,7 +359,7 @@ func TestSieveInnerLoopIsRotated(t *testing.T) {
 }
 
 func TestFibBaseCaseSavesNothing(t *testing.T) {
-	prog := analyse(t, layoutProgram)
+	prog := devProgram(t, layoutProgram)
 	body := functionAsm(t, prog, "fib")
 	base, _, found := strings.Cut(body, "\tret\n")
 	if !found {
@@ -380,13 +380,14 @@ func TestFibBaseCaseSavesNothing(t *testing.T) {
 	}
 }
 
+func fixtureSource(t *testing.T, name string) string {
+	t.Helper()
+	return fixturetest.RunProgram(name).Source(t)
+}
+
 func benchmarkSource(t *testing.T, name string) string {
 	t.Helper()
-	source, err := os.ReadFile(filepath.Join("..", "..", "bench", name, "main.low"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(source)
+	return fixturetest.BenchmarkProgram(name).Source(t)
 }
 
 var calleeSaved = regexp.MustCompile(`\b(rbx|r12|r13|r14|r15)\b`)
@@ -415,7 +416,7 @@ func TestLightPathAvoidsCalleeSavedRegisters(t *testing.T) {
 		{"mandelbrot", "main", false},
 	} {
 		t.Run(tc.bench+"/"+tc.function, func(t *testing.T) {
-			prog := analyse(t, benchmarkSource(t, tc.bench))
+			prog := devProgram(t, benchmarkSource(t, tc.bench))
 			light := lightPath(t, functionAsm(t, prog, tc.function))
 			for _, line := range light {
 				if calleeSaved.MatchString(line) {
@@ -430,7 +431,7 @@ func TestLightPathAvoidsCalleeSavedRegisters(t *testing.T) {
 }
 
 func TestSortClosureIsFrameless(t *testing.T) {
-	prog := analyse(t, benchmarkSource(t, "sort"))
+	prog := devProgram(t, benchmarkSource(t, "sort"))
 	body := functionAsm(t, prog, "main..c1")
 	for _, setup := range []string{"push", "rbp", "rsp", "leave", "call"} {
 		if strings.Contains(body, setup) {
@@ -445,7 +446,7 @@ func TestSortClosureIsFrameless(t *testing.T) {
 var slotLoad = regexp.MustCompile(`^mov (r10|r11), qword ptr \[rbp-\d+\]$`)
 
 func TestQuicksortHasNoSlotToSlotCopies(t *testing.T) {
-	prog := analyse(t, benchmarkSource(t, "sort"))
+	prog := devProgram(t, benchmarkSource(t, "sort"))
 	lines := asmLines(functionAsm(t, prog, "quicksort[i64]"))
 	for i := 0; i+1 < len(lines); i++ {
 		if !slotLoad.MatchString(lines[i]) {
@@ -490,7 +491,7 @@ fn main() {
 `
 
 func TestSmallJoinIsClonedOntoTheLightPath(t *testing.T) {
-	prog := analyse(t, joinProgram)
+	prog := devProgram(t, joinProgram)
 	lines := asmLines(functionAsm(t, prog, "small"))
 	if strings.HasPrefix(lines[0], "push") {
 		t.Errorf("small sets up a frame at entry:\n%s", strings.Join(lines, "\n"))
@@ -498,7 +499,7 @@ func TestSmallJoinIsClonedOntoTheLightPath(t *testing.T) {
 }
 
 func TestLargeJoinIsNotCloned(t *testing.T) {
-	prog := analyse(t, joinProgram)
+	prog := devProgram(t, joinProgram)
 	lines := asmLines(functionAsm(t, prog, "large"))
 	if lines[0] != "push rbp" {
 		t.Errorf("large does not set up its frame at entry:\n%s", strings.Join(lines, "\n"))
@@ -511,7 +512,7 @@ func TestLargeJoinIsNotCloned(t *testing.T) {
 var scaledElement = regexp.MustCompile(`^mov (r\w+), qword ptr \[(r\w+)\+(r\w+)\*8\]$`)
 
 func TestQuicksortElementAccessUsesScaledIndex(t *testing.T) {
-	prog := analyse(t, benchmarkSource(t, "sort"))
+	prog := devProgram(t, benchmarkSource(t, "sort"))
 	lines := asmLines(functionAsm(t, prog, "quicksort[i64]"))
 	scaled := 0
 	for _, line := range lines {
@@ -528,7 +529,7 @@ func TestQuicksortElementAccessUsesScaledIndex(t *testing.T) {
 }
 
 func TestQuicksortPartitionIndexStaysInRegister(t *testing.T) {
-	prog := analyse(t, benchmarkSource(t, "sort"))
+	prog := devProgram(t, benchmarkSource(t, "sort"))
 	lines := asmLines(functionAsm(t, prog, "quicksort[i64]"))
 	for i, line := range lines {
 		match := scaledElement.FindStringSubmatch(line)
@@ -555,7 +556,7 @@ func TestQuicksortPartitionIndexStaysInRegister(t *testing.T) {
 var floatWithMemory = regexp.MustCompile(`^(add|sub|mul|div)sd xmm\d+, qword ptr \[r\w+\+r\w+\*\d`)
 
 func TestNbodyInnerLoopFoldsLoadsIntoFloatOperations(t *testing.T) {
-	prog := analyse(t, benchmarkSource(t, "nbody"))
+	prog := devProgram(t, benchmarkSource(t, "nbody"))
 	lines := asmLines(functionAsm(t, prog, "advance"))
 	folded := 0
 	for _, line := range lines {
@@ -569,7 +570,7 @@ func TestNbodyInnerLoopFoldsLoadsIntoFloatOperations(t *testing.T) {
 }
 
 func TestMandelbrotDoublesWithoutMultiplying(t *testing.T) {
-	prog := analyse(t, benchmarkSource(t, "mandelbrot"))
+	prog := devProgram(t, benchmarkSource(t, "mandelbrot"))
 	lines := asmLines(functionAsm(t, prog, "escapes"))
 	doubled := false
 	for _, line := range lines {
@@ -612,7 +613,7 @@ func markingLoop(t *testing.T, lines []string) []string {
 }
 
 func TestSieveSliceLivesInRegisters(t *testing.T) {
-	prog := analyse(t, benchmarkSource(t, "sieve"))
+	prog := devProgram(t, benchmarkSource(t, "sieve"))
 	f := function(t, prog, "sieve")
 	if len(f.Slots) != 0 {
 		t.Errorf("sieve keeps frame slots %v\n%s", f.Slots, f)
@@ -631,7 +632,7 @@ func TestSieveSliceLivesInRegisters(t *testing.T) {
 }
 
 func TestSieveChecksOnlyTheMarkingIndex(t *testing.T) {
-	prog := analyse(t, benchmarkSource(t, "sieve"))
+	prog := devProgram(t, benchmarkSource(t, "sieve"))
 	f := function(t, prog, "sieve")
 	if got := countChecks(f); got != 1 {
 		t.Errorf("%d checks, want 1 for the square-started marking index\n%s", got, f)
@@ -673,7 +674,7 @@ func jumpsBackOver(lines []string, at int) bool {
 }
 
 func TestSieveFillGrowsOnceOutsideAnyLoop(t *testing.T) {
-	prog := analyse(t, benchmarkSource(t, "sieve"))
+	prog := devProgram(t, benchmarkSource(t, "sieve"))
 	lines := asmLines(functionAsm(t, prog, "sieve"))
 	grows := 0
 	for i, line := range lines {
@@ -691,7 +692,7 @@ func TestSieveFillGrowsOnceOutsideAnyLoop(t *testing.T) {
 }
 
 func TestPushedSliceTakesNoFrameSlot(t *testing.T) {
-	prog := analyse(t, `fn grow_in_place(n: i64) -> i64 {
+	prog := devProgram(t, `fn grow_in_place(n: i64) -> i64 {
     var xs: []i64 = []
     for i in 0..n {
         push(mut xs, i)
@@ -728,7 +729,7 @@ func hasFunction(prog *ir.Program, name string) bool {
 }
 
 func TestMandelbrotReleaseInlinesEscapes(t *testing.T) {
-	prog := analyseRelease(t, benchmarkSource(t, "mandelbrot"))
+	prog := releaseProgram(t, benchmarkSource(t, "mandelbrot"))
 	if hasFunction(prog, "escapes") {
 		t.Errorf("escapes survives inlining")
 	}
@@ -736,14 +737,14 @@ func TestMandelbrotReleaseInlinesEscapes(t *testing.T) {
 	if strings.Contains(body, "call fn_escapes") {
 		t.Errorf("main calls escapes:\n%s", body)
 	}
-	dev := analyse(t, benchmarkSource(t, "mandelbrot"))
+	dev := devProgram(t, benchmarkSource(t, "mandelbrot"))
 	if !hasFunction(dev, "escapes") {
 		t.Errorf("dev build inlined escapes")
 	}
 }
 
 func TestNbodyPairLoopMultipliesOnlyPerBody(t *testing.T) {
-	prog := analyseRelease(t, benchmarkSource(t, "nbody"))
+	prog := releaseProgram(t, benchmarkSource(t, "nbody"))
 	multiplies := 0
 	for _, line := range asmLines(functionAsm(t, prog, "advance")) {
 		if strings.HasPrefix(line, "imul ") {
@@ -758,7 +759,7 @@ func TestNbodyPairLoopMultipliesOnlyPerBody(t *testing.T) {
 var indirectCall = regexp.MustCompile(`^call (r(ax|bx|cx|dx|si|di|bp|8|9|1[0-5])|qword ptr)`)
 
 func TestSortReleaseCallsComparisonDirectly(t *testing.T) {
-	prog := analyseRelease(t, benchmarkSource(t, "sort"))
+	prog := releaseProgram(t, benchmarkSource(t, "sort"))
 	for _, line := range asmLines(functionAsm(t, prog, "quicksort[i64]")) {
 		if indirectCall.MatchString(line) {
 			t.Errorf("quicksort calls through a function value: %s", line)
@@ -767,7 +768,7 @@ func TestSortReleaseCallsComparisonDirectly(t *testing.T) {
 	if hasFunction(prog, "main..c1") {
 		t.Errorf("the comparison closure is still emitted")
 	}
-	dev := analyse(t, benchmarkSource(t, "sort"))
+	dev := devProgram(t, benchmarkSource(t, "sort"))
 	indirect := slices.ContainsFunc(asmLines(functionAsm(t, dev, "quicksort[i64]")), indirectCall.MatchString)
 	if !indirect {
 		t.Errorf("dev build specialised quicksort")
@@ -775,7 +776,7 @@ func TestSortReleaseCallsComparisonDirectly(t *testing.T) {
 }
 
 func TestSieveReleaseMarkingLoopHasNoIndexCheck(t *testing.T) {
-	prog := analyseRelease(t, benchmarkSource(t, "sieve"))
+	prog := releaseProgram(t, benchmarkSource(t, "sieve"))
 	f := function(t, prog, "sieve")
 	if f.ParamWords != 0 {
 		t.Errorf("sieve keeps %d parameter words although every call passes the same limit", f.ParamWords)
@@ -794,7 +795,7 @@ func TestSieveReleaseMarkingLoopHasNoIndexCheck(t *testing.T) {
 }
 
 func TestSieveMarkingLoopStartsOnAThirtyTwoByteBoundary(t *testing.T) {
-	prog := analyseRelease(t, benchmarkSource(t, "sieve"))
+	prog := releaseProgram(t, benchmarkSource(t, "sieve"))
 	lines := asmLines(functionAsm(t, prog, "sieve"))
 	loop := markingLoop(t, lines)
 	back := jumpTarget.FindStringSubmatch(loop[len(loop)-1])
@@ -808,7 +809,7 @@ func TestSieveMarkingLoopStartsOnAThirtyTwoByteBoundary(t *testing.T) {
 }
 
 func TestLightEqualArmStaysInLine(t *testing.T) {
-	prog := analyseRelease(t, `fn weigh(a: []i64) -> i64 {
+	prog := releaseProgram(t, `fn weigh(a: []i64) -> i64 {
     if a.len == 12345 {
         return weigh(a[1..])
     }
@@ -840,7 +841,7 @@ fn main() {
 }
 
 func TestSievePrimeArmIsOutOfLine(t *testing.T) {
-	prog := analyseRelease(t, benchmarkSource(t, "sieve"))
+	prog := releaseProgram(t, benchmarkSource(t, "sieve"))
 	lines := asmLines(functionAsm(t, prog, "sieve"))
 	branch := slices.IndexFunc(lines, func(line string) bool { return strings.HasPrefix(line, "je ") })
 	if branch < 0 {

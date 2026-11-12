@@ -1,13 +1,12 @@
-package main
+package compiler
 
 import (
-	"os"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
 
+	"lowlang/internal/amd64"
 	"lowlang/internal/ir"
 )
 
@@ -85,7 +84,7 @@ fn main() {
 
 func backendAsm(t *testing.T, name string) []string {
 	t.Helper()
-	prog := analyse(t, backendProgram)
+	prog := devProgram(t, backendProgram)
 	return asmLines(functionAsm(t, prog, name))
 }
 
@@ -100,7 +99,7 @@ func countPrefix(lines []string, prefix string) int {
 }
 
 func TestUnusedLoadIsRemoved(t *testing.T) {
-	prog := analyse(t, backendProgram)
+	prog := devProgram(t, backendProgram)
 	for _, b := range function(t, prog, "first_unused").Blocks {
 		for _, v := range b.Values {
 			if v.Op == ir.OpLoad {
@@ -185,7 +184,7 @@ func TestLiteralComparisonIsInline(t *testing.T) {
 		}
 	}
 	if !slices.Contains(backendAsm(t, "is_long"), "call rt_str_eq") {
-		t.Errorf("a literal longer than %d bytes is compared inline", 16)
+		t.Errorf("a literal longer than %d bytes is compared inline", amd64.MaxInlineLiteral)
 	}
 }
 
@@ -224,11 +223,7 @@ func TestGrowKeepsScalarsInCallerSavedRegisters(t *testing.T) {
 }
 
 func TestCompressionLoopKeepsFewFrameOperands(t *testing.T) {
-	source, err := os.ReadFile(filepath.Join("..", "..", "testdata", "run", "ra_sha256_pressure.low"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	prog := analyseRelease(t, string(source))
+	prog := releaseProgram(t, fixtureSource(t, "ra_sha256_pressure"))
 	lines := asmLines(functionAsm(t, prog, "digest"))
 	frame := 0
 	for _, line := range lines {

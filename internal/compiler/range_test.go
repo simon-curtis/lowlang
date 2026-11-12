@@ -1,20 +1,9 @@
-package main
+package compiler
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 )
-
-func fixtureSource(t *testing.T, name string) string {
-	t.Helper()
-	source, err := os.ReadFile(filepath.Join("..", "..", "testdata", "run", fmt.Sprintf("%s.low", name)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(source)
-}
 
 const squareMarking = `fn main() {
     let limit = %d
@@ -49,7 +38,7 @@ func TestSquareBoundDecidesTheMarkingCheck(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(fmt.Sprint(c.limit), func(t *testing.T) {
-			prog := analyseRelease(t, fmt.Sprintf(squareMarking, c.limit))
+			prog := releaseProgram(t, fmt.Sprintf(squareMarking, c.limit))
 			f := function(t, prog, "main")
 			if got := countChecks(f); got != c.checks {
 				t.Errorf("%d checks, want %d\n%s", got, c.checks, f)
@@ -87,7 +76,7 @@ func TestSteppedIndexKeepsItsCheckOnlyWhenTheAddCanWrap(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			prog := analyseRelease(t, fmt.Sprintf(steppedMarking, c.start, c.step))
+			prog := releaseProgram(t, fmt.Sprintf(steppedMarking, c.start, c.step))
 			f := function(t, prog, "main")
 			if got := countChecks(f); got != c.checks {
 				t.Errorf("%d checks, want %d\n%s", got, c.checks, f)
@@ -97,7 +86,7 @@ func TestSteppedIndexKeepsItsCheckOnlyWhenTheAddCanWrap(t *testing.T) {
 }
 
 func TestSpecialisedLimitRemovesTheCheck(t *testing.T) {
-	prog := analyseRelease(t, fixtureSource(t, "range_specialise_constant"))
+	prog := releaseProgram(t, fixtureSource(t, "range_specialise_constant"))
 	f := function(t, prog, "sieve")
 	if f.ParamWords != 0 {
 		t.Errorf("sieve keeps %d parameter words", f.ParamWords)
@@ -121,7 +110,7 @@ func TestConstantSpecialisationNeedsEveryCallToAgree(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%s/%s", c.fixture, c.function), func(t *testing.T) {
-			prog := analyseRelease(t, fixtureSource(t, c.fixture))
+			prog := releaseProgram(t, fixtureSource(t, c.fixture))
 			f := function(t, prog, c.function)
 			if f.ParamWords != c.params {
 				t.Errorf("%d parameter words, want %d\n%s", f.ParamWords, c.params, f)
@@ -131,7 +120,7 @@ func TestConstantSpecialisationNeedsEveryCallToAgree(t *testing.T) {
 }
 
 func TestDevBuildKeepsConstantParameters(t *testing.T) {
-	prog := analyse(t, fixtureSource(t, "range_specialise_constant"))
+	prog := devProgram(t, fixtureSource(t, "range_specialise_constant"))
 	f := function(t, prog, "sieve")
 	if f.ParamWords != 1 {
 		t.Errorf("dev build specialised sieve: %d parameter words", f.ParamWords)
@@ -159,7 +148,7 @@ fn main() {
 `
 
 func TestConstantThatFoldsNothingStaysAParameter(t *testing.T) {
-	prog := analyseRelease(t, idleConstant)
+	prog := releaseProgram(t, idleConstant)
 	f := function(t, prog, "spread")
 	if f.ParamWords != 4 {
 		t.Errorf("%d parameter words, want 4 (the slice and the scale)\n%s", f.ParamWords, f)

@@ -1,9 +1,7 @@
-package main
+package compiler
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -43,15 +41,6 @@ func clonesOf(prog *ir.Program, name string) []*ir.Func {
 	return clones
 }
 
-func readFixture(t *testing.T, name string) string {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "testdata", "run", name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(data)
-}
-
 func requireDirect(t *testing.T, prog *ir.Program, f *ir.Func) {
 	t.Helper()
 	if strings.Contains(f.String(), " call fn(") {
@@ -63,7 +52,7 @@ func requireDirect(t *testing.T, prog *ir.Program, f *ir.Func) {
 }
 
 func TestTwoLambdasCloned(t *testing.T) {
-	prog := analyseRelease(t, comparatorsProgram)
+	prog := releaseProgram(t, comparatorsProgram)
 	clones := clonesOf(prog, "insertion")
 	if len(clones) != 2 {
 		t.Fatalf("got %d clones of insertion, want 2", len(clones))
@@ -83,14 +72,14 @@ func TestTwoLambdasCloned(t *testing.T) {
 }
 
 func TestDevClonesNothing(t *testing.T) {
-	prog := analyse(t, comparatorsProgram)
+	prog := devProgram(t, comparatorsProgram)
 	if clones := clonesOf(prog, "insertion"); len(clones) != 0 {
 		t.Errorf("a dev build cloned insertion %d times", len(clones))
 	}
 }
 
 func TestCapturingClosureCloned(t *testing.T) {
-	prog := analyseRelease(t, readFixture(t, "clone_closures.low"))
+	prog := releaseProgram(t, fixtureSource(t, "clone_closures"))
 	clones := clonesOf(prog, "walk")
 	if len(clones) != 3 {
 		t.Fatalf("got %d clones of walk, want 3", len(clones))
@@ -108,7 +97,7 @@ func TestCapturingClosureCloned(t *testing.T) {
 }
 
 func TestRecursiveCloneCallsItself(t *testing.T) {
-	prog := analyseRelease(t, readFixture(t, "clone_closures.low"))
+	prog := releaseProgram(t, fixtureSource(t, "clone_closures"))
 	for _, clone := range clonesOf(prog, "walk") {
 		self := fmt.Sprintf(" call %s ", clone.Name)
 		if !strings.Contains(clone.String(), self) {
@@ -121,7 +110,7 @@ func TestRecursiveCloneCallsItself(t *testing.T) {
 }
 
 func TestUnknownFunctionValueKeepsOriginal(t *testing.T) {
-	prog := analyseRelease(t, readFixture(t, "clone_closures.low"))
+	prog := releaseProgram(t, fixtureSource(t, "clone_closures"))
 	if !hasFunction(prog, "twice") {
 		t.Error("twice was removed although pick hands it function values that are not known")
 	}
@@ -131,7 +120,7 @@ func TestUnknownFunctionValueKeepsOriginal(t *testing.T) {
 }
 
 func TestCloneBudgetIsFourPerFunction(t *testing.T) {
-	prog := analyseRelease(t, readFixture(t, "clone_budget_six.low"))
+	prog := releaseProgram(t, fixtureSource(t, "clone_budget_six"))
 	clones := clonesOf(prog, "fold")
 	if len(clones) != 4 {
 		t.Fatalf("got %d clones of fold, want 4", len(clones))
@@ -169,7 +158,7 @@ fn main() {
 `
 
 func TestSameCodeWithDifferentEnvironmentsCloned(t *testing.T) {
-	prog := analyseRelease(t, sharedCodeProgram)
+	prog := releaseProgram(t, sharedCodeProgram)
 	clones := clonesOf(prog, "apply")
 	if len(clones) != 1 {
 		t.Fatalf("got %d clones of apply, want 1", len(clones))

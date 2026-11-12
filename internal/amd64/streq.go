@@ -6,7 +6,7 @@ import (
 	"lowlang/internal/ir"
 )
 
-const maxInlineLiteral = 16
+const MaxInlineLiteral = 16
 
 type chunk struct {
 	width  int
@@ -48,7 +48,7 @@ func (s *selector) fuseLiteral(in *instr) {
 
 func (s *selector) literalAt(in *instr, side int) (string, bool) {
 	d := s.defs[in.args[side]]
-	if d == nil || s.dead[d] || d.op != ir.OpString || len(d.value.Str) > maxInlineLiteral {
+	if d == nil || s.dead[d] || d.op != ir.OpString || len(d.value.Str) > MaxInlineLiteral {
 		return "", false
 	}
 	length := in.args[side+1].konst

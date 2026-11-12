@@ -1,4 +1,4 @@
-package main
+package compiler
 
 import (
 	"fmt"
@@ -60,7 +60,7 @@ func countInstructions(f *ir.Func, op string) int {
 }
 
 func TestConcatenationChainAllocatesOnce(t *testing.T) {
-	prog := analyse(t, allocationProgram)
+	prog := devProgram(t, allocationProgram)
 	f := function(t, prog, "join")
 	if grows := countInstructions(f, "runtime grow"); grows != 1 {
 		t.Errorf("a + b + c + d + e performs %d allocations:\n%s", grows, f)
@@ -68,7 +68,7 @@ func TestConcatenationChainAllocatesOnce(t *testing.T) {
 }
 
 func TestInterpolationAllocatesOnce(t *testing.T) {
-	prog := analyse(t, allocationProgram)
+	prog := devProgram(t, allocationProgram)
 	f := function(t, prog, "label")
 	if grows := countInstructions(f, "runtime grow"); grows != 1 {
 		t.Errorf("interpolation performs %d allocations:\n%s", grows, f)
@@ -76,7 +76,7 @@ func TestInterpolationAllocatesOnce(t *testing.T) {
 }
 
 func TestCapturedImmutableIsNotBoxed(t *testing.T) {
-	prog := analyse(t, allocationProgram)
+	prog := devProgram(t, allocationProgram)
 	byValue := function(t, prog, "counter")
 	if allocs := countInstructions(byValue, "runtime alloc"); allocs != 1 {
 		t.Errorf("counter allocates %d objects, want the environment only:\n%s", allocs, byValue)
@@ -96,7 +96,7 @@ func hoistedLiterals(prog *ir.Program) int {
 }
 
 func TestDevBuildDoesNotHoistLiterals(t *testing.T) {
-	prog := analyse(t, allocationProgram)
+	prog := devProgram(t, allocationProgram)
 	if n := hoistedLiterals(prog); n != 0 {
 		t.Errorf("dev build contains %d hoisted literals", n)
 	}
@@ -106,7 +106,7 @@ func TestDevBuildDoesNotHoistLiterals(t *testing.T) {
 }
 
 func TestReleaseBuildHoistsConstantLiterals(t *testing.T) {
-	prog := analyseRelease(t, allocationProgram)
+	prog := releaseProgram(t, allocationProgram)
 	if n := hoistedLiterals(prog); n < 2 {
 		t.Errorf("release build hoists %d literals, want the map and the slice", n)
 	}
@@ -116,7 +116,7 @@ func TestReleaseBuildHoistsConstantLiterals(t *testing.T) {
 }
 
 func TestUnreachableFunctionsAreNotBuilt(t *testing.T) {
-	prog := analyse(t, allocationProgram)
+	prog := devProgram(t, allocationProgram)
 	for _, f := range prog.Funcs {
 		if f.Name == "unused" {
 			t.Fatalf("unreachable function %s was built", f.Name)

@@ -1,4 +1,4 @@
-package main
+package compiler
 
 import (
 	"fmt"
@@ -55,7 +55,7 @@ func TestSwitchLowering(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			prog := analyse(t, switchProgram(tc.keys, tc.extra))
+			prog := devProgram(t, switchProgram(tc.keys, tc.extra))
 			text := function(t, prog, "pick").String()
 			if got := countTables(text); got != tc.tables {
 				t.Errorf("tables %d, want %d\n%s", got, tc.tables, text)
@@ -81,7 +81,7 @@ func TestSwitchTablesEnumTags(t *testing.T) {
 		fmt.Fprintf(&src, "        V%d => %d\n", i, i)
 	}
 	src.WriteString("    }\n}\n\nfn main() {\n    print(pick(V3))\n}\n")
-	prog := analyse(t, src.String())
+	prog := devProgram(t, src.String())
 	text := function(t, prog, "pick").String()
 	if got := countTables(text); got != 1 {
 		t.Errorf("tables %d, want 1\n%s", got, text)
@@ -89,7 +89,7 @@ func TestSwitchTablesEnumTags(t *testing.T) {
 }
 
 func TestSwitchFoldsConstantSubject(t *testing.T) {
-	prog := analyseRelease(t, switchProgram(sequence(1, 12, 1), ""))
+	prog := releaseProgram(t, switchProgram(sequence(1, 12, 1), ""))
 	text := function(t, prog, "main").String()
 	if got := countTables(text); got != 0 {
 		t.Errorf("tables in main %d, want 0\n%s", got, text)
