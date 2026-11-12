@@ -2,30 +2,31 @@ package main
 
 import (
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"lowlang/internal/compiler"
+	"lowlang/internal/fixture"
+	"lowlang/internal/fixture/fixturetest"
 )
 
 func TestLint(t *testing.T) {
-	for _, path := range fixtures(t, "lint") {
-		t.Run(filepath.Base(path), func(t *testing.T) {
-			lintFixture(t, path)
+	for _, program := range fixturetest.Programs(t, "lint") {
+		t.Run(program.Name, func(t *testing.T) {
+			lintFixture(t, program)
 		})
 	}
 }
 
-func lintFixture(t *testing.T, path string) {
-	want, _ := expected(t, path, ".warn")
-	unit, err := compiler.Check(path, os.ReadFile)
+func lintFixture(t *testing.T, program fixturetest.Program) {
+	want, _ := program.Text(t, fixture.WarningsExt)
+	unit, err := compiler.Check(program.Path, os.ReadFile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var got []string
 	for _, w := range unit.Warnings {
-		got = append(got, relative(t, w.String(), path))
+		got = append(got, fixturetest.Relative(t, w.String(), program.Path))
 	}
 	if text := strings.Join(got, "\n"); text != strings.TrimSpace(want) {
 		t.Errorf("warnings:\n%s\nwant:\n%s", text, strings.TrimSpace(want))

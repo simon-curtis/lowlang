@@ -1951,7 +1951,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
   - Objects are `ptr`, strings `ptr[u8]`, `fixed` an `i32`.
   - Events become an `extern struct` listener of `extern fn` fields, each defaulting to a generated function that ignores the event, so a listener names only the events it handles. `interface_add_listener` copies it into C memory. Callbacks receive the listener's `data` pointer, usually a pinned Low object.
   - Enum entries are functions such as `wl_shm_format_argb8888() -> u32`. Names that clash with Low keywords or builtins gain a trailing `_`.
-- `ui/shaders` holds GLSL for instanced quads with per-corner radii, borders and clipping, blurred shadows, and monochrome glyph sprites sampled from an `R8` atlas. Instances are read from a storage buffer at set 0 binding 0 and the viewport size is a push constant. `go run ./cmd/shadergen ui/shaders` compiles each stage with `glslc` to a checked-in `.spv` and records the sources' SHA-256 sums in `sources.sum`.
+- `ui/shaders` holds GLSL for instanced quads with per-corner radii, borders and clipping, blurred shadows, and monochrome glyph sprites sampled from an `R8` atlas. Instances are read from a storage buffer at set 0 binding 0 and the viewport size is a push constant. `go run ./cmd/shadergen ui/shaders` compiles each stage with `glslc` to a checked-in `.spv` and records the SHA-256 sums of the sources and the `.spv` files in `shaders.sum`.
 - `ui/registry` holds the Vulkan registry, `vk.xml.gz` from Vulkan-Docs v1.4.363, and `vulkan.list`, which selects extensions, commands and extra types such as `pNext` structures.
   - `go run ./cmd/vkgen -registry ui/registry/vk.xml.gz -select ui/registry/vulkan.list -o vulkan.low` generates Low bindings for the selected commands and every type they reach, skipping Vulkan SC variants. Enum values come from the core enums, every Vulkan feature level and the selected extensions.
   - A handle is a one-field `extern struct`, `ptr` for dispatchable handles and `i64` for the others, so `VkBuffer {}` is the null handle and handles of different kinds do not mix.
@@ -1963,9 +1963,36 @@ The UI library is staged under `ui/` until it moves into the standard library as
 
 ## Tests
 
+`go test ./...` runs every test whose tools are installed. A test that needs a tool outside the Go toolchain skips when the tool is missing, except `TestRunWindows`, which fails under `CI=true` when `wine` is missing. The workflow installs `wine` for it and sets `CI=true`. The `internal/asm` and `internal/link` oracle tests need the pinned binutils and LLVM below, which the workflow does not install, so they run by hand.
+
+### Fixtures
+
+A fixture program is a `.low` file or a directory with a `main.low`. Its expectations sit beside it in sidecar files named after it: `name.low` and `name/` both take `name.out`. `internal/fixture` reads and writes the sidecars; `internal/fuzz/corpus` writes fixtures through it and `internal/fixture/fixturetest` lists programs for the tests.
+
+- `testdata/run` holds programs that run on Linux:
+  - `.out` is the expected stdout, empty when absent.
+  - `.err` is the expected stderr. A program has one exactly when it exits with a panic status.
+  - `.maxrss` is a limit on peak memory in KB.
+  - `.maxtime` is a limit on the wall-clock time of one run, as a Go duration such as `1s`. Only programs whose point is speed have one. A program with a `.maxtime` or `.maxrss` runs on its own, not alongside the others.
+  - `.needed` lists the shared libraries the binary must link, one per line in sorted order. Without it the binary must be static with no interpreter. A program with one has no Windows build.
+  - `.tags` declares what the runner cannot learn from the program: `simd` marks a program that compiles to vector code and runs a second time with `LOW_SIMD=sse2`, and `linux-only` marks a program that uses operating system services the Windows target lacks and has no Windows build. The runner fails when `simd` and the compiled code disagree.
+- `testdata/windows` holds programs that only run on Windows, with `.out` and `.err`.
+- `testdata/fail` holds programs that must fail to compile with the message in `.err`, with file paths shown relative to the fixture.
+- `testdata/lint` holds programs whose `low lint` warnings must equal `.warn`, one per line with relative paths. A program without a `.warn` file has none.
+- `bench/<name>/main.low` are the benchmark programs; the compile benchmark and the determinism test use them.
+
+### Checks
+
+- `go test ./...` compiles every `testdata/run` program for Linux, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and applies `.maxrss`, `.maxtime`, `.needed` and `.tags`. These tests skip on a Windows host, as do the `internal/hot` tests.
+- `TestRunWindows` builds every `testdata/run` program that has a Windows build, and every `testdata/windows` program, for Windows and compares the same way. It runs them directly on a Windows host and under `wine` on Linux.
+- Every `testdata/fail` and `testdata/lint` program is checked against its sidecar.
+- The time zone programs read zone rules from the embedded `std/time/tzdata`, because host databases differ by release and by build (Debian's includes `backzone`). They read the host database only for the behaviour of `zone.named` and `zone.local`, through zones whose rules every build agrees on.
+- The `std/cdp` programs print `launch failed` when no browser starts. CI turns off Ubuntu's AppArmor restriction on unprivileged user namespaces so Chromium can create its sandbox.
+- `cmd/low` compiles each program twice in one process and requires identical SSA form and assembly: every `testdata/run` program for Linux release, every benchmark for Linux release, Linux dev and Windows, and every `testdata/windows` program for Windows.
+- `internal/compiler` compiles inline programs, benchmarks and fixtures and checks what the optimiser and code generator did with them: inlining, specialisation, bounds checks, register use, string comparison, switch lowering and allocation.
 - `internal/wlgen` tests the generated signatures and checks, then builds a registry client from the vendored protocols and, when a Wayland compositor is running, runs it.
-- `internal/vkgen` tests declaration parsing, extension enum values and the selection format, checks the shape of the generated bindings, and renders a rounded, bordered quad offscreen with the quad shaders through the bindings and dynamic rendering, comparing pixels. It skips without libvulkan or a Vulkan 1.3 device.
-- `internal/shaders` checks that the SPIR-V matches the recorded source sums and validates it with `spirv-val` when installed.
+- `internal/vkgen` tests declaration parsing, extension enum values and the selection format, checks the shape of the generated bindings, and renders a rounded, bordered quad offscreen with the quad shaders through the bindings and dynamic rendering, comparing pixels. It skips without libvulkan or a Vulkan 1.3 device. Both generators find their libraries through `link.SystemDirs`.
+- `internal/shaders` checks that the sources and the SPIR-V match the sums recorded in `shaders.sum` and validates the SPIR-V with `spirv-val` when installed.
 - `internal/hot` tests reload against running programs:
   - state kept across a code swap;
   - functions added;
@@ -1974,11 +2001,6 @@ The UI library is staged under `ui/` until it moves into the standard library as
   - stored function values, closures and callbacks running patched code;
   - instances of an edited generic function patched;
   - restarts on layout, signature and capture changes.
-- `cmd/low` compiles each of these twice in one process and requires identical SSA form and assembly:
-  - each benchmark, for release, dev and Windows;
-  - every `testdata/run` program except the `std_` ones, for release;
-  - `std_otel_export`, for release, dev and Windows;
-  - every `testdata/windows` program, for Windows.
 - `cmd/lowfuzz` generates well-typed, terminating programs from a choice stream (`internal/fuzz/gen`), predicts their output with a reference interpreter (`internal/fuzz/model`), compiles each for release and dev, runs both, and reports any of these (`internal/fuzz/oracle`):
   - compiler panic;
   - rejected program;
@@ -1993,12 +2015,6 @@ The UI library is staged under `ui/` until it moves into the standard library as
   - With `-fixtures` it is also written there as a `testdata/run` fixture (`.low` with the predicted `.out` and `.err`, named by content hash) that fails until the bug is fixed.
 - `internal/asm` tests assemble every program with `as` or `clang` and require the same object bytes. `internal/link` tests link programs with `ld` or `lld-link` and require the same segments, sections, symbols and loaded bytes for ELF and the same bytes for PE. `LOW_LINK_FULL=1` covers every `testdata/run` program and benchmark.
   - The padding and relaxation choices these tests compare differ between tool releases, so `internal/oracletool` pins GNU binutils 2.47 and LLVM 23.1.4. The tests skip when a tool is missing or reports another version.
-- `go test ./...` also compiles every `testdata/run/*.low` and every program directory in `testdata/run` for Linux, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and checks peak memory against `.maxrss` in KB when present. These tests skip on a Windows host, as do the `internal/hot` tests.
-  - A program with a `.needed` file must link exactly those shared libraries. Every other program must be static with no interpreter.
-  - The `testdata/run` programs that are not `std_` and have no `.needed` file, and every `testdata/windows` program, are also built for Windows and compared the same way. They run directly on a Windows host and under `wine` on Linux, and skip when `wine` is missing.
-  - Each `testdata/fail/*.low` file or directory must fail to compile with the message in its `.err`, with file paths shown relative to the fixture.
-  - The time zone programs read zone rules from the embedded `std/time/tzdata`, because host databases differ by release and by build (Debian's includes `backzone`). They read the host database only for the behaviour of `zone.named` and `zone.local`, through zones whose rules every build agrees on.
-  - The `std/cdp` programs print `launch failed` when no browser starts. CI turns off Ubuntu's AppArmor restriction on unprivileged user namespaces so Chromium can create its sandbox.
 
 ## Roadmap
 

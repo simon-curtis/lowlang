@@ -2,12 +2,12 @@ package main
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"lowlang/internal/amd64"
 	"lowlang/internal/compiler"
+	"lowlang/internal/fixture/fixturetest"
 	"lowlang/internal/target"
 )
 
@@ -26,37 +26,24 @@ type compiled struct {
 func determinismCases(t *testing.T) []determinismCase {
 	t.Helper()
 	var cases []determinismCase
-	add := func(path string, platform target.OS, dev bool) {
+	add := func(group string, program fixturetest.Program, platform target.OS, dev bool) {
 		mode := "release"
 		if dev {
 			mode = "dev"
 		}
-		name := fmt.Sprintf("%s/%s/%s", filepath.Base(filepath.Dir(path)), filepath.Base(path), mode)
-		if platform == target.Windows {
-			name = fmt.Sprintf("%s/windows", name)
-		}
-		cases = append(cases, determinismCase{name: name, path: path, platform: platform, dev: dev})
+		name := fmt.Sprintf("%s/%s/%s/%s", group, program.Name, platform, mode)
+		cases = append(cases, determinismCase{name: name, path: program.Path, platform: platform, dev: dev})
 	}
-	benchmarks, err := filepath.Glob(filepath.Join("..", "..", "bench", "*", "main.low"))
-	if err != nil {
-		t.Fatal(err)
+	for _, program := range fixturetest.Programs(t, "run") {
+		add("run", program, target.Linux, false)
 	}
-	for _, path := range benchmarks {
-		add(path, target.Linux, false)
-		add(path, target.Linux, true)
-		add(path, target.Windows, false)
+	for _, program := range fixturetest.Benchmarks(t) {
+		add("bench", program, target.Linux, false)
+		add("bench", program, target.Linux, true)
+		add("bench", program, target.Windows, false)
 	}
-	for _, path := range fixtures(t, "run") {
-		name := filepath.Base(path)
-		if strings.HasPrefix(name, "std_") && name != "std_otel_export.low" {
-			continue
-		}
-		add(path, target.Linux, false)
-	}
-	add(filepath.Join("..", "..", "testdata", "run", "std_otel_export.low"), target.Linux, true)
-	add(filepath.Join("..", "..", "testdata", "run", "std_otel_export.low"), target.Windows, false)
-	for _, path := range fixtures(t, "windows") {
-		add(path, target.Windows, false)
+	for _, program := range fixturetest.Programs(t, "windows") {
+		add("windows", program, target.Windows, false)
 	}
 	return cases
 }

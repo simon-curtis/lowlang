@@ -57,7 +57,7 @@ go build -o low ./cmd/low
 - The standard library imports as `std/...`.
 - `low dev` runs the program and patches changed functions into it on every save, keeping its state.
 - On the Windows target, standard library modules that call the operating system (files, processes, sockets and everything built on them) panic with `system calls are not available on windows`. Language features and modules that only compute run unchanged.
-- `go test ./...` runs on Linux and on Windows. On a Windows host, the tests that run Linux binaries and the hot reload tests skip.
+- `go test ./...` runs on Linux and on Windows; `docs/design.md` `## Tests` says what it covers and which tools it uses.
 
 ## Benchmarks
 

@@ -3,45 +3,32 @@ package main
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"lowlang/internal/fixture/fixturetest"
 )
 
-func TestReadiedGreenThreadRunsWhileProducerComputes(t *testing.T) {
-	binary := hostBinary(t, filepath.Join("..", "..", "testdata", "run", "sched_poll_reply.low"))
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	start := time.Now()
-	out, err := exec.CommandContext(ctx, binary).Output()
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.TrimSpace(string(out)); got != "total 89700" {
-		t.Fatalf("output %q", got)
-	}
-	if elapsed > time.Second {
-		t.Errorf("300 request and reply rounds took %v", elapsed)
-	}
-}
-
 func TestBlockedReadDoesNotStallCollection(t *testing.T) {
-	requireLinuxHost(t)
-	binary := hostBinary(t, filepath.Join("..", "..", "testdata", "run", "std_sched_blocked_read.low"))
+	fixturetest.RequireLinuxHost(t)
+	program := fixturetest.RunProgram("std_sched_blocked_read")
+	binary := hostBinary(t, program.Path)
+	stdout := strings.Split(strings.TrimSuffix(program.Sidecars(t).Stdout, "\n"), "\n")
+	data := []byte("xyz")
 	cases := []struct {
 		name    string
 		release func(w io.WriteCloser) error
 		reader  string
 	}{
-		{"eof", func(w io.WriteCloser) error { return w.Close() }, "reader 0"},
+		{"eof", func(w io.WriteCloser) error { return w.Close() }, stdout[1]},
 		{"data", func(w io.WriteCloser) error {
-			_, err := w.Write([]byte("xyz"))
+			_, err := w.Write(data)
 			return err
-		}, "reader 3"},
+		}, fmt.Sprintf("reader %d", len(data))},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -52,11 +39,10 @@ func TestBlockedReadDoesNotStallCollection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			stdout, err := cmd.StdoutPipe()
+			out, err := cmd.StdoutPipe()
 			if err != nil {
 				t.Fatal(err)
 			}
-			start := time.Now()
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -64,16 +50,12 @@ func TestBlockedReadDoesNotStallCollection(t *testing.T) {
 				stdin.Close()
 				cmd.Wait()
 			}()
-			lines := bufio.NewScanner(stdout)
+			lines := bufio.NewScanner(out)
 			if !lines.Scan() {
-				t.Fatalf("no output: %v", lines.Err())
+				t.Fatalf("no output while a reader was blocked: %v", lines.Err())
 			}
-			elapsed := time.Since(start)
-			if got := lines.Text(); got != "allocated 7000000" {
-				t.Fatalf("first line %q", got)
-			}
-			if elapsed > 3*time.Second {
-				t.Errorf("allocation took %v while a reader was blocked", elapsed)
+			if got := lines.Text(); got != stdout[0] {
+				t.Fatalf("first line %q, want %q", got, stdout[0])
 			}
 			if err := c.release(stdin); err != nil {
 				t.Fatal(err)

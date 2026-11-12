@@ -4,60 +4,22 @@ import (
 	"bytes"
 	"context"
 	"debug/elf"
-	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"lowlang/internal/compiler"
+	"lowlang/internal/fixture"
+	"lowlang/internal/fixture/fixturetest"
+	"lowlang/internal/ir"
 	"lowlang/internal/peakrss"
 	"lowlang/internal/target"
 )
-
-func fixtures(t *testing.T, dir string) []string {
-	t.Helper()
-	base := filepath.Join("..", "..", "testdata", dir)
-	entries, err := os.ReadDir(base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var paths []string
-	for _, e := range entries {
-		if e.IsDir() || strings.HasSuffix(e.Name(), ".low") {
-			paths = append(paths, filepath.Join(base, e.Name()))
-		}
-	}
-	if len(paths) == 0 {
-		t.Fatalf("no fixtures in testdata/%s", dir)
-	}
-	return paths
-}
-
-func relative(t *testing.T, message, path string) string {
-	t.Helper()
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	separator := string(filepath.Separator)
-	for _, prefix := range []string{abs + separator, path + separator, path + ":"} {
-		message = strings.ReplaceAll(message, prefix, "")
-	}
-	return filepath.ToSlash(message)
-}
-
-func requireLinuxHost(t *testing.T) {
-	t.Helper()
-	if target.Host() != target.Linux {
-		t.Skip("runs Linux binaries, which need a Linux host")
-	}
-}
 
 func hostBinary(t *testing.T, source string) string {
 	t.Helper()
@@ -69,84 +31,103 @@ func hostBinary(t *testing.T, source string) string {
 	return binary
 }
 
-func expected(t *testing.T, path, ext string) (string, bool) {
-	t.Helper()
-	data, err := os.ReadFile(strings.TrimSuffix(path, ".low") + ext)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", false
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(data), true
-}
-
 func TestRun(t *testing.T) {
-	requireLinuxHost(t)
-	for _, path := range fixtures(t, "run") {
-		t.Run(filepath.Base(path), func(t *testing.T) {
-			if _, measured := expected(t, path, ".maxrss"); !measured {
+	fixturetest.RequireLinuxHost(t)
+	for _, program := range fixturetest.Programs(t, "run") {
+		sidecars := program.Sidecars(t)
+		t.Run(program.Name, func(t *testing.T) {
+			if sidecars.MaxRSSKB == 0 && sidecars.MaxTime == 0 {
 				t.Parallel()
 			}
-			runFixture(t, path)
+			runFixture(t, program, sidecars)
 		})
 	}
 }
 
-func runFixture(t *testing.T, path string) {
+func runFixture(t *testing.T, program fixturetest.Program, sidecars fixture.Sidecars) {
 	binary := filepath.Join(t.TempDir(), "main")
-	if err := build(context.Background(), path, binary, target.Linux); err != nil {
-		t.Fatal(err)
-	}
+	buildLinux(t, program, sidecars, binary)
 	environments := [][]string{nil}
-	if name := filepath.Base(path); strings.HasPrefix(name, "simd") || strings.HasPrefix(name, "std_") {
+	if sidecars.SIMD {
 		environments = append(environments, []string{"LOW_SIMD=sse2"})
 	}
 	for _, env := range environments {
-		runWithEnv(t, path, binary, env)
+		runWithEnv(t, sidecars, binary, env)
 	}
-	checkLinking(t, path, binary)
+	checkLinking(t, sidecars, binary)
 }
 
-func runWithEnv(t *testing.T, path, binary string, env []string) {
+func buildLinux(t *testing.T, program fixturetest.Program, sidecars fixture.Sidecars, binary string) {
+	t.Helper()
+	unit, err := compiler.Analyse(program.Path, target.Linux)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hasVectorCode(unit.Program); got != sidecars.SIMD {
+		t.Errorf("program has vector code %v, but its .tags file says simd %v", got, sidecars.SIMD)
+	}
+	if err := link(context.Background(), unit, binary); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func hasVectorCode(program *ir.Program) bool {
+	for _, f := range program.Funcs {
+		for _, b := range f.Blocks {
+			for _, v := range b.Values {
+				if v.Op == ir.OpVector || v.Op == ir.OpVectorScalar {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func runWithEnv(t *testing.T, sidecars fixture.Sidecars, binary string, env []string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	newCmd := func(stdout, stderr io.Writer) *exec.Cmd {
-		cmd := exec.CommandContext(ctx, binary)
-		cmd.Env = append(os.Environ(), env...)
-		cmd.Stdout, cmd.Stderr = stdout, stderr
-		return cmd
-	}
-	limit, measured := memoryLimit(t, path)
-	if !measured {
-		compareRun(t, path, func(stdout, stderr io.Writer) error {
-			return newCmd(stdout, stderr).Run()
-		}, env)
-		return
-	}
 	var peak int64
-	compareRun(t, path, func(stdout, stderr io.Writer) error {
-		result, err := peakrss.Run(func() *exec.Cmd { return newCmd(stdout, stderr) })
+	var elapsed time.Duration
+	compareRun(t, sidecars, func(stdout, stderr io.Writer) error {
+		start := time.Now()
+		defer func() { elapsed = time.Since(start) }()
+		newCmd := func() *exec.Cmd {
+			cmd := exec.CommandContext(ctx, binary)
+			cmd.Env = append(os.Environ(), env...)
+			cmd.Stdout, cmd.Stderr = stdout, stderr
+			return cmd
+		}
+		if sidecars.MaxRSSKB == 0 {
+			return newCmd().Run()
+		}
+		result, err := peakrss.Run(newCmd)
 		peak = result.PeakKB
 		return err
 	}, env)
-	t.Logf("peak memory %d KB, limit %d KB", peak, limit)
-	if peak > limit {
-		t.Errorf("peak memory %d KB exceeds %d KB", peak, limit)
+	if sidecars.MaxRSSKB > 0 {
+		t.Logf("peak memory %d KB, limit %d KB", peak, sidecars.MaxRSSKB)
+		if peak > sidecars.MaxRSSKB {
+			t.Errorf("peak memory %d KB exceeds %d KB", peak, sidecars.MaxRSSKB)
+		}
+	}
+	if sidecars.MaxTime > 0 && elapsed > sidecars.MaxTime {
+		t.Errorf("run took %v, limit %v", elapsed, sidecars.MaxTime)
 	}
 }
 
 func TestRunWindows(t *testing.T) {
 	launch := windowsLauncher(t)
-	paths := slices.DeleteFunc(fixtures(t, "run"), func(path string) bool {
-		_, glibc := expected(t, path, ".needed")
-		return glibc || strings.HasPrefix(filepath.Base(path), "std_")
-	})
-	for _, path := range append(paths, fixtures(t, "windows")...) {
-		t.Run(filepath.Base(path), func(t *testing.T) {
+	programs := slices.Concat(fixturetest.Programs(t, "run"), fixturetest.Programs(t, "windows"))
+	for _, program := range programs {
+		sidecars := program.Sidecars(t)
+		if !sidecars.Windows() {
+			continue
+		}
+		t.Run(program.Name, func(t *testing.T) {
 			t.Parallel()
-			runWindowsFixture(t, launch, path)
+			runWindowsFixture(t, launch, program, sidecars)
 		})
 	}
 }
@@ -162,48 +143,51 @@ func windowsLauncher(t *testing.T) launcher {
 	}
 	wine, err := exec.LookPath("wine")
 	if err != nil {
-		t.Skip("wine is not installed")
+		fixturetest.Unavailable(t, "wine is not installed")
+	}
+	env := append(os.Environ(), "WINEDEBUG=-all", "DISPLAY=", "WAYLAND_DISPLAY=")
+	prefix := exec.Command(wine, "wineboot", "--init")
+	prefix.Env = env
+	if out, err := prefix.CombinedOutput(); err != nil {
+		t.Fatalf("initialise the wine prefix: %v\n%s", err, out)
 	}
 	return func(ctx context.Context, binary string) *exec.Cmd {
 		cmd := exec.CommandContext(ctx, wine, binary)
-		cmd.Env = append(os.Environ(), "WINEDEBUG=-all", "DISPLAY=", "WAYLAND_DISPLAY=")
+		cmd.Env = env
 		return cmd
 	}
 }
 
-func runWindowsFixture(t *testing.T, launch launcher, path string) {
+func runWindowsFixture(t *testing.T, launch launcher, program fixturetest.Program, sidecars fixture.Sidecars) {
 	binary := filepath.Join(t.TempDir(), "main.exe")
-	if err := build(context.Background(), path, binary, target.Windows); err != nil {
+	if err := build(context.Background(), program.Path, binary, target.Windows); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	cmd := launch(ctx, binary)
-	compareRun(t, path, func(stdout, stderr io.Writer) error {
+	compareRun(t, sidecars, func(stdout, stderr io.Writer) error {
 		cmd.Stdout, cmd.Stderr = stdout, stderr
 		return cmd.Run()
 	}, nil)
 }
 
-func compareRun(t *testing.T, path string, run func(stdout, stderr io.Writer) error, env []string) {
+func compareRun(t *testing.T, want fixture.Sidecars, run func(stdout, stderr io.Writer) error, env []string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	runErr := run(&stdout, &stderr)
-
-	wantOut, _ := expected(t, path, ".out")
-	if got := stdout.String(); got != wantOut {
-		t.Errorf("%v stdout:\n%s\nwant:\n%s", env, got, wantOut)
+	if got := stdout.String(); got != want.Stdout {
+		t.Errorf("%v stdout:\n%s\nwant:\n%s", env, got, want.Stdout)
 	}
-	wantErr, panics := expected(t, path, ".err")
-	if got := stderr.String(); got != wantErr {
-		t.Errorf("%v stderr:\n%s\nwant:\n%s", env, got, wantErr)
+	if got := stderr.String(); got != want.Stderr {
+		t.Errorf("%v stderr:\n%s\nwant:\n%s", env, got, want.Stderr)
 	}
-	if panics != (runErr != nil) {
-		t.Errorf("%v exit error %v, expected panic %v", env, runErr, panics)
+	if want.Panics != (runErr != nil) {
+		t.Errorf("%v exit error %v, expected panic %v", env, runErr, want.Panics)
 	}
 }
 
-func checkLinking(t *testing.T, path, binary string) {
+func checkLinking(t *testing.T, sidecars fixture.Sidecars, binary string) {
 	f, err := elf.Open(binary)
 	if err != nil {
 		t.Fatal(err)
@@ -214,49 +198,35 @@ func checkLinking(t *testing.T, path, binary string) {
 		t.Fatal(err)
 	}
 	slices.Sort(needed)
-	want, ok := expected(t, path, ".needed")
-	if !ok {
+	if len(sidecars.Libraries) == 0 {
 		if len(needed) > 0 || slices.ContainsFunc(f.Progs, func(p *elf.Prog) bool { return p.Type == elf.PT_INTERP }) {
 			t.Errorf("expected a static binary, found shared libraries %v", needed)
 		}
 		return
 	}
-	if got := strings.Join(needed, "\n"); got != strings.TrimSpace(want) {
-		t.Errorf("shared libraries:\n%s\nwant:\n%s", got, strings.TrimSpace(want))
+	if !slices.Equal(needed, sidecars.Libraries) {
+		t.Errorf("shared libraries:\n%s\nwant:\n%s", strings.Join(needed, "\n"), strings.Join(sidecars.Libraries, "\n"))
 	}
-}
-
-func memoryLimit(t *testing.T, path string) (int64, bool) {
-	t.Helper()
-	text, ok := expected(t, path, ".maxrss")
-	if !ok {
-		return 0, false
-	}
-	kb, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
-	if err != nil {
-		t.Fatalf("invalid .maxrss: %v", err)
-	}
-	return kb, true
 }
 
 func TestFail(t *testing.T) {
-	for _, path := range fixtures(t, "fail") {
-		t.Run(filepath.Base(path), func(t *testing.T) {
-			failFixture(t, path)
+	for _, program := range fixturetest.Programs(t, "fail") {
+		t.Run(program.Name, func(t *testing.T) {
+			failFixture(t, program)
 		})
 	}
 }
 
-func failFixture(t *testing.T, path string) {
-	want, ok := expected(t, path, ".err")
+func failFixture(t *testing.T, program fixturetest.Program) {
+	want, ok := program.Text(t, fixture.CompileErrorExt)
 	if !ok {
 		t.Fatal("missing .err fixture")
 	}
-	_, err := compiler.Analyse(path, target.Linux)
+	_, err := compiler.Analyse(program.Path, target.Linux)
 	if err == nil {
 		t.Fatal("compiled without error")
 	}
-	got := relative(t, err.Error(), path)
+	got := fixturetest.Relative(t, err.Error(), program.Path)
 	if got != strings.TrimSpace(want) {
 		t.Errorf("error %q, want %q", got, strings.TrimSpace(want))
 	}
