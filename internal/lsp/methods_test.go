@@ -110,3 +110,41 @@ func TestImportedMethods(t *testing.T) {
 		t.Errorf("u.authority( help = %+v", help)
 	}
 }
+
+const constrainedSource = `struct Point {
+    x: i64
+    y: i64
+}
+
+fn biggest[T: Ord](xs: []T) -> T {
+    var best = xs[0]
+    for x in xs {
+        if x > best {
+            best = x
+        }
+    }
+    best
+}
+
+fn first[T](xs: []T) -> T {
+    xs[0]
+}
+
+fn main() {
+    let pts = [Point { x: 1, y: 2 }]
+    let ints = [1, 2]
+    print(pts.first().x + ints.biggest())
+}
+`
+
+func TestConstrainedMethodCompletion(t *testing.T) {
+	c := start(t)
+	f := scratch(t, "constrained.low", constrainedSource)
+	if got := c.open(f, f.src); len(got) != 0 {
+		t.Fatalf("diagnostics = %+v", got)
+	}
+	points := c.completeTyping(f, "let ints = ", "    pts.")
+	expect(t, points, []string{"first"}, []string{"biggest"})
+	ints := c.completeTyping(f, "print(pts.first", "    ints.")
+	expect(t, ints, []string{"first", "biggest"}, nil)
+}

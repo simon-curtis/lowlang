@@ -101,19 +101,3 @@ func (p program) function(module, name string, public bool) *ast.Func {
 	}
 	return nil
 }
-
-func (p program) declType(file *ast.File, tn *ast.TypeName) *types.Type {
-	module := file.Module
-	if tn.Module != "" {
-		path, ok := file.Imported(tn.Module)
-		if !ok {
-			return nil
-		}
-		module = path
-	}
-	decl := p.typeDecl(module, tn.Name)
-	if decl == nil {
-		return nil
-	}
-	return decl.typ
-}

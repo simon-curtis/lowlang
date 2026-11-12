@@ -131,7 +131,8 @@ func (c *cursor) moduleMembers(path string, rest []string) {
 		c.declarations(f, true)
 	}
 	if path == regex.Module {
-		c.add(regex.Generator, completionFunction, fmt.Sprintf("fn %s(pattern: str) -> regex.Regex", regex.Generator))
+		name, signature := check.GeneratedRegex()
+		c.add(name, completionFunction, signature)
 	}
 }
 

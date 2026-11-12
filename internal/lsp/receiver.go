@@ -47,45 +47,6 @@ func identical(a, b *types.Type) bool {
 	return a != nil && b != nil && (a == b || a.String() == b.String())
 }
 
-func typeParamNames(params []*ast.TypeParam) map[string]bool {
-	names := map[string]bool{}
-	for _, p := range params {
-		names[p.Name] = true
-	}
-	return names
-}
-
-func (c *cursor) fits(file *ast.File, tn *ast.TypeName, t *types.Type, params map[string]bool) bool {
-	switch {
-	case tn == nil || t == nil:
-		return false
-	case tn.Name != "" && params[tn.Name] && len(tn.Args) == 0:
-		return true
-	case tn.Slice:
-		return t.Kind == types.SliceKind && c.fits(file, tn.Elem, t.Elem, params)
-	case tn.Map:
-		return t.Kind == types.MapKind && c.fits(file, tn.Key, t.Key, params) && c.fits(file, tn.Elem, t.Elem, params)
-	case tn.Pointer:
-		return t.Kind == types.PointerKind && c.fits(file, tn.Elem, t.Elem, params)
-	case tn.Optional:
-		return t.Optional && c.fits(file, tn.Elem, t.Elem, params)
-	}
-	if decl := c.declType(file, tn); decl != nil {
-		return sameType(decl, t)
-	}
-	return len(tn.Args) == 0 && t.String() == tn.String()
-}
-
-func (c *cursor) takes(fn *ast.Func, t *types.Type) bool {
-	if len(fn.Params) == 0 {
-		return false
-	}
-	if len(fn.TypeParams) > 0 {
-		return c.fits(fn.File, fn.Params[0].TypeName, t, typeParamNames(fn.TypeParams))
-	}
-	return len(fn.ParamTypes) > 0 && identical(fn.ParamTypes[0], t)
-}
-
 func (c *cursor) method(t *types.Type, name string) *ast.Func {
 	if fn := c.function(c.file.Module, name, false); fn != nil {
 		return fn
@@ -99,7 +60,7 @@ func (c *cursor) method(t *types.Type, name string) *ast.Func {
 func (c *cursor) moduleMethods(module string, t *types.Type, public bool) {
 	for _, f := range c.moduleFiles(module) {
 		for fn := range f.Declared() {
-			if (fn.Pub || !public) && c.takes(fn, t) {
+			if (fn.Pub || !public) && check.TakesFirst(fn, t) {
 				c.add(fn.Name, completionMethod, fn.Signature())
 			}
 		}
@@ -138,7 +99,7 @@ func (c *cursor) typeOf(segments []segment) *types.Type {
 			continue
 		}
 		fn := c.method(t, next.name)
-		if fn == nil || !c.takes(fn, t) {
+		if fn == nil || !check.TakesFirst(fn, t) {
 			return nil
 		}
 		t, suffixes = called(fn, next.suffixes)
