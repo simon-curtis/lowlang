@@ -3,11 +3,9 @@ package lsp
 import (
 	"errors"
 	"fmt"
-	"regexp"
-	"strings"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/compiler"
+	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 )
 
@@ -25,18 +23,16 @@ type reference struct {
 	side     side
 }
 
-var identifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-
 type finder struct {
 	server *Server
-	unit   *compiler.Unit
-	want   Location
-	seen   map[Location]bool
-	found  []reference
+	program
+	want  Location
+	seen  map[Location]bool
+	found []reference
 }
 
 func (f *finder) resolves(q *query) bool {
-	tg, ok := q.definition()
+	tg, ok := q.resolve().target()
 	return ok && f.server.locate(tg) == f.want
 }
 
@@ -50,7 +46,7 @@ func (f *finder) add(x *index, o *occurrence, s side) {
 }
 
 func (f *finder) visit(x *index, o *occurrence) {
-	q := &query{unit: f.unit, index: x, occ: o}
+	q := &query{program: f.program, index: x, occ: o}
 	init, ok := o.node.(*ast.FieldInit)
 	if !ok || init.Value == nil || init.Value.Position() != init.Pos {
 		if f.resolves(q) {
@@ -64,16 +60,13 @@ func (f *finder) visit(x *index, o *occurrence) {
 	}
 	value := *o
 	value.node = init.Value
-	if f.resolves(&query{unit: f.unit, index: x, occ: &value}) {
+	if f.resolves(&query{program: f.program, index: x, occ: &value}) {
 		f.add(x, o, valueSide)
 	}
 }
 
 func (f *finder) search() []reference {
-	for _, file := range f.unit.Files {
-		if file.Path == "" {
-			continue
-		}
+	for _, file := range f.files() {
 		t := f.server.text(file.Path)
 		x := newIndex(file, t)
 		for i := range x.occurrences {
@@ -88,12 +81,12 @@ func (s *Server) referencesTo(p TextDocumentPositionParams) (Location, []referen
 	if q == nil {
 		return Location{}, nil, false
 	}
-	tg, ok := q.definition()
+	tg, ok := q.resolve().target()
 	if !ok {
 		return Location{}, nil, false
 	}
 	want := s.locate(tg)
-	f := &finder{server: s, unit: q.unit, want: want, seen: map[Location]bool{}}
+	f := &finder{server: s, program: q.program, want: want, seen: map[Location]bool{}}
 	refs := f.search()
 	return want, refs, true
 }
@@ -114,16 +107,25 @@ func (s *Server) references(p ReferenceParams) any {
 	return locations
 }
 
-func (s *Server) renameError(p RenameParams) error {
-	path := pathOf(p.TextDocument.URI)
+func nameError(name string) error {
+	tokens, err := lexer.Lex([]byte(name), diag.Start(""), false)
+	var lexed *diag.Error
 	switch {
-	case !identifier.MatchString(p.NewName):
-		return fmt.Errorf("%q is not a valid name", p.NewName)
-	case lexer.IsKeyword(p.NewName):
-		return fmt.Errorf("%q is a keyword", p.NewName)
-	case strings.HasPrefix(p.NewName, "__"):
-		return fmt.Errorf("names starting with __ are reserved")
-	case !s.fresh[s.entry(path)]:
+	case lexer.IsKeyword(name):
+		return fmt.Errorf("%q is a keyword", name)
+	case errors.As(err, &lexed):
+		return errors.New(lexed.Msg)
+	case err != nil || len(tokens) != 3 || tokens[0].Kind != lexer.Ident || tokens[0].Text != name:
+		return fmt.Errorf("%q is not a valid name", name)
+	}
+	return nil
+}
+
+func (s *Server) renameError(p RenameParams) error {
+	if err := nameError(p.NewName); err != nil {
+		return err
+	}
+	if !s.fresh[s.entry(pathOf(p.TextDocument.URI))] {
 		return errors.New("rename needs the program to compile; fix the errors or wait for the check to finish")
 	}
 	return nil

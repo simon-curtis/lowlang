@@ -3,11 +3,9 @@ package lsp
 import (
 	"fmt"
 	"math"
-	"regexp"
 
 	"lowlang/internal/ast"
 	"lowlang/internal/check"
-	"lowlang/internal/compiler"
 	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 	"lowlang/internal/regex"
@@ -29,10 +27,8 @@ const (
 	completionType       = 25
 )
 
-var funcHeader = regexp.MustCompile(`^(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
-
 type cursor struct {
-	unit     *compiler.Unit
+	program
 	file     *ast.File
 	text     text
 	compiled text
@@ -40,6 +36,8 @@ type cursor struct {
 	col      int
 	items    []CompletionItem
 	seen     map[string]bool
+	visible  []*ast.Local
+	scoped   bool
 }
 
 func (c *cursor) compiledLine() int {
@@ -95,37 +93,6 @@ func (c *cursor) receiver() ([]segment, bool) {
 	return segments, true
 }
 
-func chainBefore(src string, end int) []string {
-	var chain []string
-	for {
-		start := end
-		for start > 0 && isWord(src[start-1]) {
-			start--
-		}
-		if start == end {
-			return chain
-		}
-		chain = append([]string{src[start:end]}, chain...)
-		if start == 0 || src[start-1] != '.' {
-			return chain
-		}
-		end = start - 1
-	}
-}
-
-func (c *cursor) files(module string) []*ast.File {
-	var files []*ast.File
-	if c.unit == nil {
-		return files
-	}
-	for _, f := range c.unit.Files {
-		if f.Path != "" && f.Module == module {
-			files = append(files, f)
-		}
-	}
-	return files
-}
-
 func (c *cursor) members(segments []segment) {
 	if c.file == nil || len(segments) == 0 {
 		return
@@ -160,7 +127,7 @@ func (c *cursor) moduleMembers(path string, rest []string) {
 	if len(rest) > 1 {
 		return
 	}
-	for _, f := range c.files(path) {
+	for _, f := range c.moduleFiles(path) {
 		c.declarations(f, true)
 	}
 	if path == regex.Module {
@@ -169,15 +136,12 @@ func (c *cursor) moduleMembers(path string, rest []string) {
 }
 
 func (c *cursor) variants(module, name string) {
-	for _, f := range c.files(module) {
-		for _, d := range f.Enums {
-			if d.Name != name {
-				continue
-			}
-			for _, v := range d.Variants {
-				c.add(v.Name, completionEnumMember, v.String())
-			}
-		}
+	d := c.enumDecl(module, name)
+	if d == nil {
+		return
+	}
+	for _, v := range d.Variants {
+		c.add(v.Name, completionEnumMember, v.String())
 	}
 }
 
@@ -211,10 +175,25 @@ func (c *cursor) fields(t *types.Type, path []string) {
 	c.methods(t)
 }
 
+func headerName(line string) string {
+	tokens, err := lexer.Lex([]byte(line), diag.Start(""), false)
+	if err != nil {
+		return ""
+	}
+	i := 0
+	if tokens[i].Kind == lexer.Pub {
+		i++
+	}
+	if tokens[i].Kind == lexer.Fn && tokens[i+1].Kind == lexer.Ident {
+		return tokens[i+1].Text
+	}
+	return ""
+}
+
 func (c *cursor) headerLine() (int, string) {
 	for line := c.line; line >= 0; line-- {
-		if m := funcHeader.FindStringSubmatch(c.text.line(line)); m != nil {
-			return line, m[1]
+		if name := headerName(c.text.line(line)); name != "" {
+			return line, name
 		}
 	}
 	return 0, ""
@@ -225,8 +204,8 @@ func (c *cursor) enclosing() *ast.Func {
 	if c.file == nil || name == "" {
 		return nil
 	}
-	for _, f := range c.file.Funcs {
-		if f.Name == name && f.Template == nil && f.Closure == nil {
+	for f := range c.file.Declared() {
+		if f.Name == name {
 			return f
 		}
 	}
@@ -236,10 +215,8 @@ func (c *cursor) enclosing() *ast.Func {
 func (c *cursor) span(f *ast.Func) (int, int) {
 	end := math.MaxInt
 	var starts []diag.Pos
-	for _, g := range c.file.Funcs {
-		if g.Template == nil && g.Closure == nil {
-			starts = append(starts, g.Pos)
-		}
+	for g := range c.file.Declared() {
+		starts = append(starts, g.Pos)
 	}
 	for _, d := range c.file.Structs {
 		starts = append(starts, d.Pos)
@@ -259,6 +236,10 @@ func (c *cursor) span(f *ast.Func) (int, int) {
 }
 
 func (c *cursor) scope() []*ast.Local {
+	if c.scoped {
+		return c.visible
+	}
+	c.scoped = true
 	f := c.enclosing()
 	if f == nil {
 		return nil
@@ -266,13 +247,12 @@ func (c *cursor) scope() []*ast.Local {
 	from, to := c.span(f)
 	to = min(to, c.compiledLine()+2)
 	x := newIndex(c.file, c.compiled)
-	var locals []*ast.Local
 	for _, o := range x.occurrences {
 		if o.local != nil && o.pos.Line >= from && o.pos.Line < to {
-			locals = append(locals, o.local)
+			c.visible = append(c.visible, o.local)
 		}
 	}
-	return locals
+	return c.visible
 }
 
 func (c *cursor) local(name string) *ast.Local {
@@ -301,22 +281,15 @@ func (c *cursor) module() {
 	if c.file == nil {
 		return
 	}
-	for _, f := range c.files(c.file.Module) {
+	for _, f := range c.moduleFiles(c.file.Module) {
 		c.declarations(f, false)
 	}
 }
 
 func (c *cursor) declarations(f *ast.File, public bool) {
-	for _, fn := range f.Funcs {
-		if fn.Template == nil && fn.Closure == nil && (fn.Pub || !public) {
-			c.add(fn.Name, completionFunction, signature(fn))
-		}
-	}
-	for _, e := range f.Externs {
-		for _, fn := range e.Funcs {
-			if fn.Pub || !public {
-				c.add(fn.Name, completionFunction, signature(fn))
-			}
+	for fn := range f.Declared() {
+		if fn.Pub || !public {
+			c.add(fn.Name, completionFunction, fn.Signature())
 		}
 	}
 	for _, d := range f.Structs {

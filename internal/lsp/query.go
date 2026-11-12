@@ -1,11 +1,7 @@
 package lsp
 
 import (
-	"fmt"
-	"strings"
-
 	"lowlang/internal/ast"
-	"lowlang/internal/compiler"
 	"lowlang/internal/diag"
 	"lowlang/internal/types"
 )
@@ -17,7 +13,7 @@ type target struct {
 }
 
 type query struct {
-	unit  *compiler.Unit
+	program
 	index *index
 	occ   *occurrence
 }
@@ -25,21 +21,11 @@ type query struct {
 func (q *query) callee(call *ast.Call) *query {
 	occ := *q.occ
 	occ.node = call.Fn
-	return &query{unit: q.unit, index: q.index, occ: &occ}
+	return &query{program: q.program, index: q.index, occ: &occ}
 }
 
 func (q *query) file() *ast.File {
 	return q.index.file
-}
-
-func (q *query) files() []*ast.File {
-	var files []*ast.File
-	for _, f := range q.unit.Files {
-		if f.Path != "" {
-			files = append(files, f)
-		}
-	}
-	return files
 }
 
 func (q *query) module(alias string) (string, bool) {
@@ -49,35 +35,16 @@ func (q *query) module(alias string) (string, bool) {
 	return q.file().Imported(alias)
 }
 
-func (q *query) typeDecl(alias, name string) any {
+func (q *query) declared(alias, name string) any {
 	module, ok := q.module(alias)
 	if !ok {
 		return nil
 	}
-	for _, f := range q.files() {
-		if f.Module != module {
-			continue
-		}
-		for _, d := range f.Structs {
-			if d.Name == name {
-				return d
-			}
-		}
-		for _, d := range f.Enums {
-			if d.Name == name {
-				return d
-			}
-		}
-	}
-	return nil
+	return q.typeDecl(module, name)
 }
 
 func sameType(decl, t *types.Type) bool {
-	if decl == nil || t == nil {
-		return false
-	}
-	base, _, _ := strings.Cut(t.Name, "[")
-	return decl == t || decl == t.Origin || (decl.Name == base && decl.Module == t.Module)
+	return decl != nil && t != nil && (decl == t || decl == t.Origin)
 }
 
 func (q *query) structDecl(t *types.Type) *ast.StructDecl {
@@ -95,7 +62,7 @@ func (q *query) structDecl(t *types.Type) *ast.StructDecl {
 	return nil
 }
 
-func (q *query) variant(t *types.Type, name string) (*ast.EnumDecl, *ast.VariantDecl) {
+func (q *query) variantDecl(t *types.Type, name string) (*ast.EnumDecl, *ast.VariantDecl) {
 	var fallback *ast.EnumDecl
 	var fallbackVariant *ast.VariantDecl
 	for _, f := range q.files() {
@@ -116,428 +83,137 @@ func (q *query) variant(t *types.Type, name string) (*ast.EnumDecl, *ast.Variant
 	return fallback, fallbackVariant
 }
 
-func (q *query) moduleFile(path string) *ast.File {
-	for _, f := range q.files() {
-		if f.Module == path {
-			return f
-		}
-	}
-	return nil
-}
-
 func (q *query) moduleTarget(path string) (target, bool) {
-	f := q.moduleFile(path)
-	if f == nil {
+	files := q.moduleFiles(path)
+	if len(files) == 0 {
 		return target{}, false
 	}
-	return target{path: f.Path, pos: diag.Pos{Line: 1, Col: 1}}, true
+	return target{path: files[0].Path, pos: diag.Pos{Line: 1, Col: 1}}, true
 }
 
-func funcTarget(f *ast.Func) (target, bool) {
-	if f.Template != nil {
-		f = f.Template
-	}
-	if f.File == nil || f.File.Path == "" {
-		return target{}, false
-	}
-	return target{path: f.File.Path, pos: f.Pos, name: f.Name}, true
-}
-
-func declTarget(decl any) (target, bool) {
-	switch d := decl.(type) {
-	case *ast.StructDecl:
-		return target{path: d.File.Path, pos: d.Pos, name: d.Name}, true
-	case *ast.EnumDecl:
-		return target{path: d.File.Path, pos: d.Pos, name: d.Name}, true
-	}
-	return target{}, false
-}
-
-func (q *query) localTarget(l *ast.Local) (target, bool) {
-	d := q.index.declaration(l)
-	if d == nil {
-		return target{}, false
-	}
-	return target{path: q.file().Path, pos: d.pos}, true
-}
-
-func (q *query) fieldTarget(t *types.Type, name string) (target, bool) {
-	d := q.structDecl(t)
-	if d == nil {
-		return target{}, false
-	}
-	for _, f := range d.Fields {
-		if f.Name == name {
-			return target{path: d.File.Path, pos: f.Pos}, true
-		}
-	}
-	return target{}, false
-}
-
-func (q *query) variantTarget(t *types.Type, name string) (target, bool) {
-	d, v := q.variant(t, name)
-	if d == nil {
-		return target{}, false
-	}
-	return target{path: d.File.Path, pos: v.Pos}, true
-}
-
-func (q *query) nameTarget(name string) (target, bool) {
-	if decl := q.typeDecl("", name); decl != nil {
-		return declTarget(decl)
-	}
-	if path, ok := q.file().Imported(name); ok {
-		return q.moduleTarget(path)
-	}
-	return target{}, false
-}
-
-func (q *query) definition() (target, bool) {
-	self := target{path: q.file().Path, pos: q.occ.pos}
+func (q *query) resolve() referent {
 	switch n := q.occ.node.(type) {
 	case *ast.Call:
-		switch {
-		case n.Target != nil:
-			return funcTarget(n.Target)
-		case n.Variant != nil:
-			return q.variantTarget(n.TypeOf(), n.Variant.Name)
-		}
-		return q.callee(n).definition()
+		return q.call(n)
 	case *ast.Ident:
-		switch {
-		case n.Local != nil:
-			return q.localTarget(n.Local)
-		case n.Func != nil:
-			return funcTarget(n.Func)
-		case n.Variant != nil:
-			return q.variantTarget(n.TypeOf(), n.Name)
-		}
-		return q.nameTarget(n.Name)
+		return q.ident(n)
 	case *ast.Selector:
-		switch {
-		case n.Func != nil:
-			return funcTarget(n.Func)
-		case n.Field != nil:
-			return q.fieldTarget(n.X.TypeOf(), n.Name)
-		case n.Variant != nil:
-			return q.variantTarget(n.TypeOf(), n.Name)
-		}
+		return q.selector(n)
 	case *ast.StructLit:
-		return declTarget(q.typeDecl(n.Module, n.Name))
-	case *ast.FieldInit:
-		return q.fieldTarget(q.occ.parent, n.Name)
+		return q.named(n.Module, n.Name, nothing{})
 	case *ast.TypeName:
-		return declTarget(q.typeDecl(n.Module, n.Name))
-	case moduleRef:
-		if path, ok := q.file().Imported(n.alias); ok {
-			return q.moduleTarget(path)
-		}
+		return q.named(n.Module, n.Name, spelled{text: n.String()})
+	case *ast.FieldInit:
+		return q.field(q.occ.parent, n.Name, n.Field)
+	case qualifier:
+		return q.imported(n.alias)
 	case *ast.Pattern:
-		if n.Local != nil {
-			return q.localTarget(n.Local)
-		}
-		return q.variantTarget(q.occ.parent, n.Name)
+		return q.pattern(n)
 	case *ast.Binding:
-		return q.localTarget(n.Local)
+		return q.localRef(n.Local)
 	case *ast.Import:
-		return q.moduleTarget(n.Path)
-	case *ast.Func, *ast.Let, *ast.Param, *ast.ForIn, *ast.SelectCase, *ast.StructDecl, *ast.EnumDecl, *ast.FieldDecl, *ast.VariantDecl, *ast.TypeParam:
-		return self, true
+		return importRef{q: q, path: n.Path}
 	}
-	return target{}, false
+	return q.declaration()
 }
 
-func (q *query) hover() string {
-	switch n := q.occ.node.(type) {
-	case *ast.Call:
-		switch {
-		case n.Target != nil:
-			return signature(n.Target)
-		case n.Variant != nil:
-			return variantText(n.TypeOf(), n.Variant)
-		}
-		if text := builtinSignature(n); text != "" {
-			return text
-		}
-		return q.callee(n).hover()
-	case *ast.Ident:
-		return q.identHover(n)
-	case *ast.Selector:
-		switch {
-		case n.Func != nil:
-			return signature(n.Func)
-		case n.Field != nil:
-			return fmt.Sprintf("%s: %s", n.Name, n.Field.Type)
-		case n.Variant != nil:
-			return variantText(n.TypeOf(), n.Variant)
-		}
-		return typed(n.Name, n.TypeOf())
-	case *ast.StructLit:
-		return declText(q.typeDecl(n.Module, n.Name))
-	case *ast.FieldInit:
-		if n.Field != nil {
-			return fmt.Sprintf("%s: %s", n.Name, n.Field.Type)
-		}
-	case *ast.TypeName:
-		if decl := q.typeDecl(n.Module, n.Name); decl != nil {
-			return declText(decl)
-		}
-		return n.String()
-	case moduleRef:
-		if path, ok := q.file().Imported(n.alias); ok {
-			return fmt.Sprintf("import %s", path)
-		}
-	case *ast.Import:
-		return fmt.Sprintf("import %s", n.Path)
-	case *ast.Pattern:
-		if n.Local != nil {
-			return q.localText(n.Local)
-		}
-		if n.Variant != nil {
-			return variantText(q.occ.parent, n.Variant)
-		}
-	case *ast.Func:
-		return signature(n)
-	case *ast.StructDecl, *ast.EnumDecl:
-		return declText(n)
-	case *ast.FieldDecl:
-		return fmt.Sprintf("%s: %s", n.Name, n.TypeName)
-	case *ast.VariantDecl:
-		return n.String()
-	case *ast.TypeParam:
-		return n.String()
+func (q *query) call(n *ast.Call) referent {
+	switch {
+	case n.Target != nil:
+		return funcRef{fn: n.Target}
+	case n.Variant != nil:
+		return q.variantRef(n.TypeOf(), n.Variant.Name, n.Variant)
 	}
-	if q.occ.local != nil {
-		return q.localText(q.occ.local)
+	callee := q.callee(n).resolve()
+	if text := builtinSignature(n); text != "" {
+		return described{referent: callee, text: text}
 	}
-	return ""
+	return callee
 }
 
-func (q *query) doc() string {
-	switch n := q.occ.node.(type) {
-	case *ast.Call:
-		if n.Target != nil {
-			return funcDoc(n.Target)
-		}
-		if n.Variant != nil {
-			return q.variantDoc(n.TypeOf(), n.Variant)
-		}
-		return q.callee(n).doc()
-	case *ast.Ident:
-		if n.Func != nil {
-			return funcDoc(n.Func)
-		}
-		if n.Variant != nil {
-			return q.variantDoc(n.TypeOf(), n.Variant)
-		}
-		if n.Local == nil && n.Variant == nil {
-			return declDoc(q.typeDecl("", n.Name))
-		}
-	case *ast.Selector:
-		if n.Func != nil {
-			return funcDoc(n.Func)
-		}
-		if n.Variant != nil {
-			return q.variantDoc(n.TypeOf(), n.Variant)
-		}
-	case *ast.Pattern:
-		if n.Local == nil && n.Variant != nil {
-			return q.variantDoc(q.occ.parent, n.Variant)
-		}
-	case *ast.StructLit:
-		return declDoc(q.typeDecl(n.Module, n.Name))
-	case *ast.TypeName:
-		return declDoc(q.typeDecl(n.Module, n.Name))
-	case *ast.Func:
-		return funcDoc(n)
-	case *ast.StructDecl, *ast.EnumDecl:
-		return declDoc(n)
-	case *ast.FieldDecl:
-		return n.Doc
-	case *ast.VariantDecl:
-		return n.Doc
-	}
-	return ""
-}
-
-func (q *query) variantDoc(enum *types.Type, v *types.Variant) string {
-	if enum == nil || v == nil {
-		return ""
-	}
-	if enum.Origin != nil {
-		enum = enum.Origin
-	}
-	for _, f := range q.files() {
-		for _, d := range f.Enums {
-			if d.Type != enum {
-				continue
-			}
-			for _, decl := range d.Variants {
-				if decl.Name == v.Name {
-					return decl.Doc
-				}
-			}
-		}
-	}
-	return ""
-}
-
-func funcDoc(f *ast.Func) string {
-	if f.Template != nil {
-		return f.Template.Doc
-	}
-	return f.Doc
-}
-
-func declDoc(decl any) string {
-	switch d := decl.(type) {
-	case *ast.StructDecl:
-		return d.Doc
-	case *ast.EnumDecl:
-		return d.Doc
-	}
-	return ""
-}
-
-func (q *query) identHover(n *ast.Ident) string {
+func (q *query) ident(n *ast.Ident) referent {
 	switch {
 	case n.Local != nil:
-		return q.localText(n.Local)
+		return q.localRef(n.Local)
 	case n.Func != nil:
-		return signature(n.Func)
+		return funcRef{fn: n.Func}
 	case n.Variant != nil:
-		return variantText(n.TypeOf(), n.Variant)
+		return q.variantRef(n.TypeOf(), n.Name, n.Variant)
 	}
-	if decl := q.typeDecl("", n.Name); decl != nil {
-		return declText(decl)
+	if decl := q.declared("", n.Name); decl != nil {
+		return typeRef{q: q, decl: decl}
 	}
 	if path, ok := q.file().Imported(n.Name); ok {
-		return fmt.Sprintf("import %s", path)
+		return importRef{q: q, path: path}
 	}
-	return typed(n.Name, n.TypeOf())
+	return valueRef{name: n.Name, t: n.TypeOf()}
 }
 
-func typed(name string, t *types.Type) string {
-	if t == nil {
-		return ""
-	}
-	return fmt.Sprintf("%s: %s", name, t)
-}
-
-func (q *query) using(l *ast.Local) bool {
-	d := q.index.declaration(l)
-	if d == nil {
-		return false
-	}
-	let, ok := d.node.(*ast.Let)
-	return ok && let.Using
-}
-
-func (q *query) localText(l *ast.Local) string {
-	keyword := "let "
+func (q *query) selector(n *ast.Selector) referent {
 	switch {
-	case q.using(l) && l.Mutable:
-		keyword = "using var "
-	case q.using(l):
-		keyword = "using "
-	case l.Param && l.Ref:
-		keyword = "mut "
-	case l.Param:
-		keyword = ""
-	case l.Mutable:
-		keyword = "var "
+	case n.Func != nil:
+		return funcRef{fn: n.Func}
+	case n.Field != nil:
+		return q.field(n.X.TypeOf(), n.Name, n.Field)
+	case n.Variant != nil:
+		return q.variantRef(n.TypeOf(), n.Name, n.Variant)
 	}
-	if l.Type == nil {
-		return fmt.Sprintf("%s%s", keyword, l.Name)
-	}
-	return fmt.Sprintf("%s%s: %s", keyword, l.Name, l.Type)
+	return valueRef{name: n.Name, t: n.TypeOf()}
 }
 
-func variantText(enum *types.Type, v *types.Variant) string {
-	fields := make([]string, len(v.Fields))
-	for i, f := range v.Fields {
-		fields[i] = f.String()
+func (q *query) pattern(n *ast.Pattern) referent {
+	if n.Local != nil {
+		return q.localRef(n.Local)
 	}
-	name := v.Name
-	if enum != nil && enum.Kind == types.EnumKind {
-		name = fmt.Sprintf("%s.%s", enum.Name, v.Name)
-	}
-	if len(fields) == 0 {
-		return name
-	}
-	return fmt.Sprintf("%s(%s)", name, strings.Join(fields, ", "))
+	return q.variantRef(q.occ.parent, n.Name, n.Variant)
 }
 
-func signature(f *ast.Func) string {
-	head, params, tail := signatureParts(f)
-	return fmt.Sprintf("%s%s%s", head, strings.Join(params, ", "), tail)
+func (q *query) named(alias, name string, unresolved referent) referent {
+	if decl := q.declared(alias, name); decl != nil {
+		return typeRef{q: q, decl: decl}
+	}
+	return unresolved
 }
 
-func signatureParts(f *ast.Func) (string, []string, string) {
-	if f.Template != nil {
-		f = f.Template
+func (q *query) imported(alias string) referent {
+	if path, ok := q.file().Imported(alias); ok {
+		return importRef{q: q, path: path}
 	}
-	params := make([]string, 0, len(f.Params)+1)
-	for i, p := range f.Params {
-		t := p.TypeName.String()
-		if i < len(f.ParamTypes) {
-			t = f.ParamTypes[i].String()
-		}
-		prefix := ""
-		if p.Mut {
-			prefix = "mut "
-		}
-		params = append(params, fmt.Sprintf("%s%s: %s", prefix, p.Name, t))
-	}
-	if f.Variadic {
-		params = append(params, "...")
-	}
-	var b strings.Builder
-	if f.Extern != nil {
-		b.WriteString("extern ")
-	}
-	b.WriteString("fn ")
-	b.WriteString(f.Name)
-	b.WriteString(ast.TypeParams(f.TypeParams))
-	b.WriteString("(")
-	tail := fmt.Sprintf(")%s", resultText(f))
-	return b.String(), params, tail
+	return nothing{}
 }
 
-func resultText(f *ast.Func) string {
-	t := f.RetType
-	if t == nil {
-		return ast.Results(f.Result, f.Error)
+func (q *query) localRef(l *ast.Local) referent {
+	if l == nil {
+		return nothing{}
 	}
-	switch {
-	case t == types.Void:
-		return ""
-	case t.Kind == types.ResultKind && t.Ok == types.Void:
-		return fmt.Sprintf(" ! %s", t.Err)
-	case t.Kind == types.ResultKind:
-		return fmt.Sprintf(" -> %s ! %s", t.Ok, t.Err)
-	}
-	return fmt.Sprintf(" -> %s", t)
+	return localRef{q: q, local: l}
 }
 
-func declText(decl any) string {
-	var b strings.Builder
-	switch d := decl.(type) {
+func (q *query) field(owner *types.Type, name string, field *types.Field) referent {
+	return fieldRef{q: q, owner: owner, name: name, field: field}
+}
+
+func (q *query) variantRef(enum *types.Type, name string, variant *types.Variant) referent {
+	return variantRef{q: q, enum: enum, name: name, variant: variant}
+}
+
+func (q *query) declaration() referent {
+	self := target{path: q.file().Path, pos: q.occ.pos}
+	switch n := q.occ.node.(type) {
+	case *ast.Func:
+		return own{at: self, referent: funcRef{fn: n}}
 	case *ast.StructDecl:
-		if d.C {
-			b.WriteString("extern ")
-		}
-		b.WriteString(fmt.Sprintf("struct %s%s {\n", d.Name, ast.TypeParams(d.TypeParams)))
-		for _, f := range d.Fields {
-			b.WriteString(fmt.Sprintf("    %s: %s\n", f.Name, f.TypeName))
-		}
-		b.WriteString("}")
+		return own{at: self, referent: typeRef{q: q, decl: n}}
 	case *ast.EnumDecl:
-		b.WriteString(fmt.Sprintf("enum %s%s {\n", d.Name, ast.TypeParams(d.TypeParams)))
-		for _, v := range d.Variants {
-			b.WriteString(fmt.Sprintf("    %s\n", v))
-		}
-		b.WriteString("}")
+		return own{at: self, referent: typeRef{q: q, decl: n}}
+	case *ast.FieldDecl:
+		return own{at: self, referent: q.field(q.occ.parent, n.Name, nil)}
+	case *ast.VariantDecl:
+		return own{at: self, referent: q.variantRef(q.occ.parent, n.Name, nil)}
+	case *ast.TypeParam:
+		return own{at: self, referent: spelled{text: n.String()}}
+	case *ast.Let, *ast.Param, *ast.ForIn, *ast.SelectCase:
+		return own{at: self, referent: q.localRef(q.occ.local)}
 	}
-	return b.String()
+	return nothing{}
 }

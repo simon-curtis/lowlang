@@ -27,6 +27,11 @@ type response struct {
 	Error   *rpcError       `json:"error,omitempty"`
 }
 
+type LogMessageParams struct {
+	Type    int    `json:"type"`
+	Message string `json:"message"`
+}
+
 type notification struct {
 	JSONRPC string `json:"jsonrpc"`
 	Method  string `json:"method"`
@@ -253,6 +258,7 @@ const (
 	symbolFunction   = 12
 	symbolEnumMember = 22
 	symbolStruct     = 23
+	messageError     = 1
 	severityError    = 1
 	severityWarning  = 2
 	syncFull         = 1

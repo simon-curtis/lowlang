@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"lowlang/internal/ast"
 	"lowlang/internal/types"
 )
 
@@ -77,24 +78,9 @@ func (c *cursor) openCall() (opening, bool) {
 	return opening{}, false
 }
 
-func calleeChain(src string, paren int) []string {
-	end := paren
-	if end > 0 && src[end-1] == ']' {
-		depth := 0
-		for end > 0 {
-			end--
-			switch src[end] {
-			case ']':
-				depth++
-			case '[':
-				depth--
-			}
-			if depth == 0 {
-				break
-			}
-		}
-	}
-	return chainBefore(src, end)
+func fnShape(fn *ast.Func) callShape {
+	head, params, tail := fn.SignatureParts()
+	return callShape{head: head, params: params, tail: tail}
 }
 
 func (c *cursor) funcShape(module, name string, public bool) (callShape, bool) {
@@ -102,12 +88,11 @@ func (c *cursor) funcShape(module, name string, public bool) (callShape, bool) {
 	if fn == nil {
 		return callShape{}, false
 	}
-	head, params, tail := signatureParts(fn)
-	return callShape{head: head, params: params, tail: tail}, true
+	return fnShape(fn), true
 }
 
 func (c *cursor) variantShape(module, enum, name string) (callShape, bool) {
-	for _, f := range c.files(module) {
+	for _, f := range c.moduleFiles(module) {
 		for _, d := range f.Enums {
 			if enum != "" && d.Name != enum {
 				continue
@@ -116,12 +101,8 @@ func (c *cursor) variantShape(module, enum, name string) (callShape, bool) {
 				if v.Name != name || len(v.Fields) == 0 {
 					continue
 				}
-				params := make([]string, len(v.Fields))
-				for i, field := range v.Fields {
-					params[i] = field.String()
-				}
 				head := fmt.Sprintf("%s.%s(", d.Name, v.Name)
-				return callShape{head: head, params: params, tail: ")"}, true
+				return callShape{head: head, params: v.Params(), tail: ")"}, true
 			}
 		}
 	}
@@ -134,16 +115,14 @@ func valueShape(name string, t *types.Type) (callShape, bool) {
 	}
 	params := make([]string, len(t.Params))
 	for i, p := range t.Params {
-		params[i] = p.String()
-		if i < len(t.Muts) && t.Muts[i] {
-			params[i] = fmt.Sprintf("mut %s", params[i])
-		}
+		params[i] = types.ParamText(p, i < len(t.Muts) && t.Muts[i])
 	}
 	tail := ")"
-	if t.Ret != nil && t.Ret != types.Void {
-		tail = fmt.Sprintf(") -> %s", t.Ret)
+	if t.Ret != nil {
+		tail = fmt.Sprintf(")%s", types.ReturnText(t.Ret))
 	}
-	return callShape{head: fmt.Sprintf("%s(", name), params: params, tail: tail}, true
+	head := fmt.Sprintf("%s(", name)
+	return callShape{head: head, params: params, tail: tail}, true
 }
 
 func (c *cursor) shape(chain []string) (callShape, bool) {
@@ -179,10 +158,14 @@ func (c *cursor) signatureHelp() *SignatureHelp {
 		return nil
 	}
 	src := c.text.line(call.line)
-	if shape, offset, ok := c.methodShape(src, call.col); ok {
+	segments, ok := segmentsBefore(src, call.col)
+	if !ok {
+		return nil
+	}
+	if shape, offset, ok := c.methodShape(segments); ok {
 		return shape.help(call.commas + offset)
 	}
-	chain := calleeChain(src, call.col)
+	chain := calleeChain(segments)
 	if len(chain) == 0 {
 		return nil
 	}
@@ -193,9 +176,8 @@ func (c *cursor) signatureHelp() *SignatureHelp {
 	return shape.help(call.commas)
 }
 
-func (c *cursor) methodShape(src string, paren int) (callShape, int, bool) {
-	segments, ok := segmentsBefore(src, paren)
-	if !ok || len(segments) < 2 || !segments[len(segments)-1].plain() {
+func (c *cursor) methodShape(segments []segment) (callShape, int, bool) {
+	if len(segments) < 2 || !segments[len(segments)-1].plain() {
 		return callShape{}, 0, false
 	}
 	t := c.typeOf(segments[:len(segments)-1])
@@ -215,8 +197,7 @@ func (c *cursor) methodShape(src string, paren int) (callShape, int, bool) {
 	if fn == nil {
 		return callShape{}, 0, false
 	}
-	head, params, tail := signatureParts(fn)
-	return callShape{head: head, params: params, tail: tail}, 1, true
+	return fnShape(fn), 1, true
 }
 
 func (s callShape) help(commas int) *SignatureHelp {

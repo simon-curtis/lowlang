@@ -96,88 +96,38 @@ func (s *Server) handle(req request) (bool, error) {
 	case "":
 		return false, nil
 	case "initialize":
-		var p InitializeParams
-		if err := json.Unmarshal(req.Params, &p); err == nil {
-			s.hintRefresh = p.Capabilities.Workspace.InlayHint.RefreshSupport
-		}
-		return false, s.reply(req.ID, s.initialize())
+		return false, serve(s, req, s.initialize)
 	case "textDocument/inlayHint":
-		var p InlayHintParams
-		if err := json.Unmarshal(req.Params, &p); err != nil {
-			return false, s.fail(req.ID, invalidParams, err.Error())
-		}
-		hints := s.inlayHints(p)
-		return false, s.reply(req.ID, hints)
+		return false, serve(s, req, s.inlayHints)
 	case "workspace/symbol":
-		var p WorkspaceSymbolParams
-		if err := json.Unmarshal(req.Params, &p); err != nil {
-			return false, s.fail(req.ID, invalidParams, err.Error())
-		}
-		symbols := s.workspaceSymbols(p)
-		return false, s.reply(req.ID, symbols)
+		return false, serve(s, req, s.workspaceSymbols)
 	case "shutdown":
 		s.shutdown = true
 		return false, s.reply(req.ID, nil)
 	case "exit":
 		return true, nil
 	case "textDocument/didOpen":
-		var p DidOpenParams
-		if json.Unmarshal(req.Params, &p) != nil {
-			return false, nil
-		}
-		path := pathOf(p.TextDocument.URI)
-		s.docs[path] = []byte(p.TextDocument.Text)
-		s.schedule(path, 0)
-		return false, nil
+		return false, observe(s, req, s.open)
 	case "textDocument/didChange":
-		var p DidChangeParams
-		if json.Unmarshal(req.Params, &p) != nil || len(p.ContentChanges) == 0 {
-			return false, nil
-		}
-		path := pathOf(p.TextDocument.URI)
-		latest := p.ContentChanges[len(p.ContentChanges)-1]
-		s.docs[path] = []byte(latest.Text)
-		s.schedule(path, debounce)
-		return false, nil
+		return false, observe(s, req, s.change)
 	case "textDocument/didSave":
-		s.document(req, s.save)
-		return false, nil
+		return false, observe(s, req, s.save)
 	case "textDocument/didClose":
-		s.document(req, s.close)
-		return false, nil
+		return false, observe(s, req, s.close)
 	case "textDocument/hover":
-		return false, s.position(req, s.hover)
+		return false, serve(s, req, s.hover)
 	case "textDocument/definition":
-		return false, s.position(req, s.definition)
+		return false, serve(s, req, s.definition)
 	case "textDocument/completion":
-		return false, s.position(req, s.completion)
+		return false, serve(s, req, s.completion)
 	case "textDocument/signatureHelp":
-		return false, s.position(req, s.signatureHelp)
+		return false, serve(s, req, s.signatureHelp)
 	case "textDocument/references":
-		var p ReferenceParams
-		if err := json.Unmarshal(req.Params, &p); err != nil {
-			return false, s.fail(req.ID, invalidParams, err.Error())
-		}
-		locations := s.references(p)
-		return false, s.reply(req.ID, locations)
+		return false, serve(s, req, s.references)
 	case "textDocument/rename":
-		var p RenameParams
-		if err := json.Unmarshal(req.Params, &p); err != nil {
-			return false, s.fail(req.ID, invalidParams, err.Error())
-		}
-		edit, err := s.rename(p)
-		if err != nil {
-			return false, s.fail(req.ID, requestFailed, err.Error())
-		}
-		return false, s.reply(req.ID, edit)
+		return false, serveChecked(s, req, s.rename)
 	case "textDocument/documentSymbol":
-		var p DocumentParams
-		if err := json.Unmarshal(req.Params, &p); err != nil {
-			return false, s.fail(req.ID, invalidParams, err.Error())
-		}
-		path := pathOf(p.TextDocument.URI)
-		symbols := s.symbols(path)
-		return false, s.reply(req.ID, symbols)
+		return false, serve(s, req, s.documentSymbols)
 	}
 	if req.ID == nil {
 		return false, nil
@@ -186,7 +136,43 @@ func (s *Server) handle(req request) (bool, error) {
 	return false, s.fail(req.ID, methodNotFound, message)
 }
 
-func (s *Server) initialize() InitializeResult {
+func decode[P any](req request) (P, error) {
+	var p P
+	if len(req.Params) == 0 {
+		return p, nil
+	}
+	err := json.Unmarshal(req.Params, &p)
+	return p, err
+}
+
+func serve[P, R any](s *Server, req request, answer func(P) R) error {
+	return serveChecked(s, req, func(p P) (R, error) { return answer(p), nil })
+}
+
+func serveChecked[P, R any](s *Server, req request, answer func(P) (R, error)) error {
+	p, err := decode[P](req)
+	if err != nil {
+		return s.fail(req.ID, invalidParams, err.Error())
+	}
+	result, err := answer(p)
+	if err != nil {
+		return s.fail(req.ID, requestFailed, err.Error())
+	}
+	return s.reply(req.ID, result)
+}
+
+func observe[P any](s *Server, req request, apply func(P)) error {
+	p, err := decode[P](req)
+	if err != nil {
+		message := fmt.Sprintf("%s: %v", req.Method, err)
+		return s.notify("window/logMessage", LogMessageParams{Type: messageError, Message: message})
+	}
+	apply(p)
+	return nil
+}
+
+func (s *Server) initialize(p InitializeParams) InitializeResult {
+	s.hintRefresh = p.Capabilities.Workspace.InlayHint.RefreshSupport
 	return InitializeResult{
 		Capabilities: Capabilities{
 			TextDocumentSync:        SyncOptions{OpenClose: true, Change: syncFull, Save: SaveOptions{}},
@@ -204,13 +190,20 @@ func (s *Server) initialize() InitializeResult {
 	}
 }
 
-func (s *Server) document(req request, apply func(path string)) {
-	var p DocumentParams
-	if json.Unmarshal(req.Params, &p) != nil {
+func (s *Server) open(p DidOpenParams) {
+	path := pathOf(p.TextDocument.URI)
+	s.docs[path] = []byte(p.TextDocument.Text)
+	s.schedule(path, 0)
+}
+
+func (s *Server) change(p DidChangeParams) {
+	if len(p.ContentChanges) == 0 {
 		return
 	}
 	path := pathOf(p.TextDocument.URI)
-	apply(path)
+	latest := p.ContentChanges[len(p.ContentChanges)-1]
+	s.docs[path] = []byte(latest.Text)
+	s.schedule(path, debounce)
 }
 
 func (s *Server) schedule(path string, delay time.Duration) {
@@ -219,22 +212,14 @@ func (s *Server) schedule(path string, delay time.Duration) {
 	s.compiles.mark(entry, path, delay)
 }
 
-func (s *Server) save(path string) {
-	s.schedule(path, 0)
+func (s *Server) save(p DocumentParams) {
+	s.schedule(pathOf(p.TextDocument.URI), 0)
 }
 
-func (s *Server) close(path string) {
+func (s *Server) close(p DocumentParams) {
+	path := pathOf(p.TextDocument.URI)
 	delete(s.docs, path)
 	s.schedule(path, 0)
-}
-
-func (s *Server) position(req request, answer func(TextDocumentPositionParams) any) error {
-	var p TextDocumentPositionParams
-	if err := json.Unmarshal(req.Params, &p); err != nil {
-		return s.fail(req.ID, invalidParams, err.Error())
-	}
-	result := answer(p)
-	return s.reply(req.ID, result)
 }
 
 func (s *Server) reply(id json.RawMessage, result any) error {
@@ -262,7 +247,7 @@ func (s *Server) text(path string) text {
 }
 
 func (s *Server) entry(path string) string {
-	if root, found := compiler.Root(s.docs, filepath.Dir(path)); found {
+	if root, ok := compiler.Root(s.docs, filepath.Dir(path)); ok {
 		return root
 	}
 	return path
@@ -350,8 +335,8 @@ func (s *Server) diagnose(err error, document string) (string, Diagnostic) {
 
 func (s *Server) query(p TextDocumentPositionParams) *query {
 	path := pathOf(p.TextDocument.URI)
-	unit := s.units[s.entry(path)]
-	file := checkedFile(unit, path)
+	prog := program{unit: s.units[s.entry(path)]}
+	file := prog.fileAt(path)
 	if file == nil {
 		return nil
 	}
@@ -362,7 +347,7 @@ func (s *Server) query(p TextDocumentPositionParams) *query {
 	if occ == nil {
 		return nil
 	}
-	return &query{unit: unit, index: x, occ: occ}
+	return &query{program: prog, index: x, occ: occ}
 }
 
 func (s *Server) index(path string, file *ast.File) *index {
@@ -383,12 +368,13 @@ func (s *Server) hover(p TextDocumentPositionParams) any {
 	if q == nil {
 		return nil
 	}
-	content := q.hover()
+	r := q.resolve()
+	content := r.hover()
 	if content == "" {
 		return nil
 	}
 	value := fmt.Sprintf("```low\n%s\n```", content)
-	if doc := q.doc(); doc != "" {
+	if doc := r.doc(); doc != "" {
 		value = fmt.Sprintf("%s\n\n%s", value, doc)
 	}
 	span := q.index.text.span(q.occ.pos, len(q.occ.name))
@@ -400,7 +386,7 @@ func (s *Server) definition(p TextDocumentPositionParams) any {
 	if q == nil {
 		return nil
 	}
-	tg, ok := q.definition()
+	tg, ok := q.resolve().target()
 	if !ok {
 		return nil
 	}
@@ -411,10 +397,10 @@ func (s *Server) cursorAt(p TextDocumentPositionParams) *cursor {
 	path := pathOf(p.TextDocument.URI)
 	entry := s.entry(path)
 	t := s.text(path)
-	unit := s.units[entry]
+	prog := program{unit: s.units[entry]}
 	return &cursor{
-		unit:     unit,
-		file:     checkedFile(unit, path),
+		program:  prog,
+		file:     prog.fileAt(path),
 		text:     t,
 		compiled: s.compiledText(entry, path),
 		line:     p.Position.Line,
@@ -461,6 +447,10 @@ func (s *Server) parsed(path string) *ast.File {
 	return file
 }
 
+func (s *Server) documentSymbols(p DocumentParams) []DocumentSymbol {
+	return s.symbols(pathOf(p.TextDocument.URI))
+}
+
 func (s *Server) symbols(path string) []DocumentSymbol {
 	file := s.parsed(path)
 	if file == nil {
@@ -473,17 +463,5 @@ func (s *Server) symbols(path string) []DocumentSymbol {
 }
 
 func (s *Server) checked(path string) *ast.File {
-	return checkedFile(s.units[s.entry(path)], path)
-}
-
-func checkedFile(unit *compiler.Unit, path string) *ast.File {
-	if unit == nil {
-		return nil
-	}
-	for _, f := range unit.Files {
-		if f.Path != "" && filepath.Clean(f.Path) == path {
-			return f
-		}
-	}
-	return nil
+	return program{unit: s.units[s.entry(path)]}.fileAt(path)
 }

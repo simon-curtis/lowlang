@@ -1,79 +1,10 @@
 package lsp
 
 import (
-	"fmt"
-	"strings"
-
 	"lowlang/internal/ast"
 	"lowlang/internal/check"
 	"lowlang/internal/types"
 )
-
-type segment struct {
-	name     string
-	suffixes []byte
-}
-
-func (s segment) plain() bool {
-	return len(s.suffixes) == 0
-}
-
-func skipGroup(src string, end int) (int, byte) {
-	shut := src[end-1]
-	open := byte('(')
-	if shut == ']' {
-		open = '['
-	}
-	depth := 0
-	for i := end - 1; i >= 0; i-- {
-		switch src[i] {
-		case shut:
-			depth++
-		case open:
-			depth--
-			if depth == 0 {
-				return i, open
-			}
-		}
-	}
-	return -1, open
-}
-
-func segmentsBefore(src string, end int) ([]segment, bool) {
-	var segments []segment
-	for {
-		var suffixes []byte
-		for end > 0 {
-			switch src[end-1] {
-			case ')', ']':
-				start, open := skipGroup(src, end)
-				if start < 0 {
-					return nil, false
-				}
-				suffixes = append([]byte{open}, suffixes...)
-				end = start
-				continue
-			case '?':
-				suffixes = append([]byte{'?'}, suffixes...)
-				end--
-				continue
-			}
-			break
-		}
-		start := end
-		for start > 0 && isWord(src[start-1]) {
-			start--
-		}
-		if start == end {
-			return nil, false
-		}
-		segments = append([]segment{{name: src[start:end], suffixes: suffixes}}, segments...)
-		if start == 0 || src[start-1] != '.' {
-			return segments, true
-		}
-		end = start - 1
-	}
-}
 
 func (c *cursor) applySuffix(t *types.Type, suffix byte) *types.Type {
 	if t == nil {
@@ -82,34 +13,10 @@ func (c *cursor) applySuffix(t *types.Type, suffix byte) *types.Type {
 	switch {
 	case suffix == '(' && t.Kind == types.FuncKind:
 		return t.Ret
-	case suffix == '[' && t.Kind == types.SliceKind:
-		return t.Elem
-	case suffix == '[' && t.Kind == types.MapKind:
-		return c.unit.Types.Optional(t.Elem)
-	case suffix == '[' && t.Kind == types.StrKind:
-		return types.U8
+	case suffix == '[':
+		return check.IndexType(c.unit.Types, t)
 	case suffix == '?' && t.Kind == types.ResultKind:
 		return t.Ok
-	case suffix == '?' && t.Optional:
-		return t.Elem
-	}
-	return nil
-}
-
-func (c *cursor) function(module, name string, public bool) *ast.Func {
-	for _, f := range c.files(module) {
-		for _, fn := range f.Funcs {
-			if fn.Name == name && fn.Template == nil && fn.Closure == nil && (fn.Pub || !public) {
-				return fn
-			}
-		}
-		for _, e := range f.Externs {
-			for _, fn := range e.Funcs {
-				if fn.Name == name && (fn.Pub || !public) {
-					return fn
-				}
-			}
-		}
 	}
 	return nil
 }
@@ -148,69 +55,52 @@ func typeParamNames(params []*ast.TypeParam) map[string]bool {
 	return names
 }
 
-func fits(tn *ast.TypeName, t *types.Type, params map[string]bool) bool {
+func (c *cursor) fits(file *ast.File, tn *ast.TypeName, t *types.Type, params map[string]bool) bool {
 	switch {
 	case tn == nil || t == nil:
 		return false
 	case tn.Name != "" && params[tn.Name] && len(tn.Args) == 0:
 		return true
 	case tn.Slice:
-		return t.Kind == types.SliceKind && fits(tn.Elem, t.Elem, params)
+		return t.Kind == types.SliceKind && c.fits(file, tn.Elem, t.Elem, params)
 	case tn.Map:
-		return t.Kind == types.MapKind && fits(tn.Key, t.Key, params) && fits(tn.Elem, t.Elem, params)
+		return t.Kind == types.MapKind && c.fits(file, tn.Key, t.Key, params) && c.fits(file, tn.Elem, t.Elem, params)
 	case tn.Pointer:
-		return t.Kind == types.PointerKind && fits(tn.Elem, t.Elem, params)
+		return t.Kind == types.PointerKind && c.fits(file, tn.Elem, t.Elem, params)
 	case tn.Optional:
-		return t.Optional && fits(tn.Elem, t.Elem, params)
-	case len(tn.Args) > 0:
-		base, _, _ := strings.Cut(t.String(), "[")
-		return base == tn.Name || strings.HasSuffix(base, fmt.Sprintf(".%s", tn.Name))
+		return t.Optional && c.fits(file, tn.Elem, t.Elem, params)
 	}
-	return t.String() == tn.String()
+	if decl := c.declType(file, tn); decl != nil {
+		return sameType(decl, t)
+	}
+	return len(tn.Args) == 0 && t.String() == tn.String()
 }
 
-func takes(fn *ast.Func, t *types.Type) bool {
+func (c *cursor) takes(fn *ast.Func, t *types.Type) bool {
 	if len(fn.Params) == 0 {
 		return false
 	}
 	if len(fn.TypeParams) > 0 {
-		return fits(fn.Params[0].TypeName, t, typeParamNames(fn.TypeParams))
+		return c.fits(fn.File, fn.Params[0].TypeName, t, typeParamNames(fn.TypeParams))
 	}
 	return len(fn.ParamTypes) > 0 && identical(fn.ParamTypes[0], t)
-}
-
-func receiverModule(t *types.Type) string {
-	if t.Kind == types.PointerKind {
-		t = t.Elem
-	}
-	if t.Origin != nil {
-		t = t.Origin
-	}
-	return t.Module
 }
 
 func (c *cursor) method(t *types.Type, name string) *ast.Func {
 	if fn := c.function(c.file.Module, name, false); fn != nil {
 		return fn
 	}
-	if m := receiverModule(t); m != c.file.Module {
-		return c.function(m, name, true)
+	if module, foreign := check.ReceiverModule(t, c.file.Module); foreign {
+		return c.function(module, name, true)
 	}
 	return nil
 }
 
 func (c *cursor) moduleMethods(module string, t *types.Type, public bool) {
-	for _, f := range c.files(module) {
-		for _, fn := range f.Funcs {
-			if fn.Template == nil && fn.Closure == nil && (fn.Pub || !public) && takes(fn, t) {
-				c.add(fn.Name, completionMethod, signature(fn))
-			}
-		}
-		for _, e := range f.Externs {
-			for _, fn := range e.Funcs {
-				if (fn.Pub || !public) && takes(fn, t) {
-					c.add(fn.Name, completionMethod, signature(fn))
-				}
+	for _, f := range c.moduleFiles(module) {
+		for fn := range f.Declared() {
+			if (fn.Pub || !public) && c.takes(fn, t) {
+				c.add(fn.Name, completionMethod, fn.Signature())
 			}
 		}
 	}
@@ -218,8 +108,8 @@ func (c *cursor) moduleMethods(module string, t *types.Type, public bool) {
 
 func (c *cursor) methods(t *types.Type) {
 	c.moduleMethods(c.file.Module, t, false)
-	if m := receiverModule(t); m != c.file.Module {
-		c.moduleMethods(m, t, true)
+	if module, foreign := check.ReceiverModule(t, c.file.Module); foreign {
+		c.moduleMethods(module, t, true)
 	}
 	for _, l := range c.scope() {
 		if l.Type != nil && l.Type.Kind == types.FuncKind && len(l.Type.Params) > 0 && identical(l.Type.Params[0], t) {
@@ -248,7 +138,7 @@ func (c *cursor) typeOf(segments []segment) *types.Type {
 			continue
 		}
 		fn := c.method(t, next.name)
-		if fn == nil || !takes(fn, t) {
+		if fn == nil || !c.takes(fn, t) {
 			return nil
 		}
 		t, suffixes = called(fn, next.suffixes)
