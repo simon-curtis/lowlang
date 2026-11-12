@@ -1280,9 +1280,9 @@ The compiler is written in Go. Pipeline:
 | Build IR | `internal/ir` | SSA form, one value per machine word |
 | Codegen | `internal/amd64` | x86-64 GNU assembly |
 | Assemble | `internal/asm` | object: sections, symbols and fixups |
-| Link | `internal/link` | static ELF executable |
+| Link | `internal/link` | static or dynamic ELF executable |
 
-`as` and `ld` assemble and link dynamic programs and the patches of `low dev`.
+`as` and `ld` assemble and link the patches of `low dev`. `clang` and `lld-link` build the Windows target.
 
 - The `low` command lives in `cmd/low`. The pipeline it shares with hot reload lives in `internal/compiler`.
 - `low ir` prints the SSA form and `low asm` the generated assembly.
@@ -1347,8 +1347,12 @@ The runtime, `internal/amd64/sched.asm` and `internal/amd64/runtime.asm`, is emi
   - The image is based at `0x400000`, below the hot-reload region, and has the layout of `ld -static` with separate code: a read-only header segment, then read-execute `.text`, read-only `.rodata`, and read-write `.data` and `.bss`, each page-aligned in memory and congruent with its file offset. `.tbss` has a `PT_TLS` segment and the stack is non-executable.
   - Symbols resolve across the sections of the one object. `PC32` and `PLT32` resolve alike, and `Abs32` and `Abs32S` fail when the value does not fit. An undefined symbol fails the link and names the symbol.
   - The file carries section headers and a symbol table of the object's non-`.L` symbols plus `__bss_start`, `_edata` and `_end`, so `debug/elf`, `readelf` and `gdb` read it, and `low dev` reads it to link patches against it. `_start` initialises the heap and the scheduler, starts `main` on the first green thread and enters the scheduler on the process stack.
-- A dynamic program is linked with `ld -dynamic-linker /lib64/ld-linux-x86-64.so.2` against glibc's `crt1.o`, `crti.o` and `crtn.o`, then `-l<name>` for each library and `-lc`.
-  - The start files are looked for in `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/lib/x86_64-linux-gnu`.
+- A program that declares C libraries is assembled and linked in process too, by `link.Dynamic`, as a non-PIE executable that asks `/lib64/ld-linux-x86-64.so.2` to load its libraries. No C start files are linked.
+  - The layout follows `ld`: `PT_PHDR`, `PT_INTERP`, a read-only `PT_LOAD` holding the headers and the dynamic tables, a read-execute `PT_LOAD` for `.plt`, `.plt.got` and `.text`, a read-only `PT_LOAD` for `.rodata`, a read-write `PT_LOAD` for `.dynamic`, `.got`, `.got.plt`, `.data` and `.bss`, then `PT_DYNAMIC`, `PT_TLS`, `PT_GNU_STACK` and `PT_GNU_RELRO` over everything the loader may write before it starts the program.
+  - Each library's `-l<name>` is the first `lib<name>.so` in `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu`, `/lib/x86_64-linux-gnu`, `/lib64`, `/lib` and `/usr/local/lib`, with symlinks followed. `DT_NEEDED` carries the library's `DT_SONAME`. `c` and `m` name `libc.so.6` and `libm.so.6`. Libraries appear in declaration order, then libc. A library that is missing, or is not a shared object, fails the link and names the library.
+  - Every symbol a program calls or takes the address of is checked against the libraries' dynamic symbols, and one that no library exports fails the link. `.dynsym` records each import with its `GLIBC_*` version in `.gnu.version` and `.gnu.version_r`, and both `.hash` and `.gnu.hash` are written.
+  - `PLT32` calls go through a lazy `.plt` entry with a `JUMP_SLOT`, or through a `.plt.got` entry when the symbol also has a GOT slot. `GOTPCREL`, `GOTPCRELX` and `REX_GOTPCRELX` resolve to a `.got` slot with one `GLOB_DAT` for each imported symbol, and a slot for a symbol the program defines holds its address. A direct reference to an imported data symbol would need a copy relocation and fails the link.
+  - The generated `_start` calls `__libc_start_main(main, argc, argv, 0, 0, rtld_fini, stack_end)` with no init or fini functions, which is all glibc needs: stdio buffers flush and `atexit` handlers run when the program exits. `atexit` and `at_quick_exit` exist only in `libc_nonshared.a`, so a program that declares them gets shims that tail-call `__cxa_atexit` and `__cxa_at_quick_exit`.
   - glibc's start-up code calls the generated C `main`, which does the same work as `_start`.
   - When Low's `main` returns, the program calls `exit(0)`, letting libc run its exit handlers. An error from `main` prints and exits with status 1.
 
@@ -1829,7 +1833,7 @@ The UI library is staged under `ui/` until it moves into the standard library as
     11. Foreground and background executors on the scheduler; a background task's result is written into a signal on the UI thread.
     12. Text input element whose state is held in signals, clipboard, IME (`text-input-v3`), fractional scale, `cursor-shape`, `xdg-decoration` and client-side decorations.
     13. Portals and AT-SPI over D-Bus, PNG images, SVG paths.
-3. Own assembler and linker in place of `as` and `ld`, with static and dynamic ELF output.
+3. Own assembler and linker in place of `as` and `ld` for the patches of `low dev`, and of `clang` and `lld-link` for the Windows target.
 4. A wasm32 target and a browser playground that runs snippets:
     1. Targets named by OS and architecture, with `wasm32` beside `amd64`.
     2. A WebAssembly back end lowered from the IR: structured control flow rebuilt from the IR's blocks, locals in place of registers, a linear-memory heap with the size-class bins, and a module written directly without an external assembler or linker.
