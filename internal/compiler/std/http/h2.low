@@ -3,13 +3,6 @@ import std/header
 import std/io
 import std/text
 
-struct Frame {
-    kind: i64
-    flags: i64
-    stream: i64
-    payload: []u8
-}
-
 struct Exchange {
     id: i64
     fields: []header.Header
@@ -47,14 +40,6 @@ struct Peer {
     complete: fn(*Peer, *Exchange) ! io.Error
 }
 
-fn preface() -> str {
-    "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-}
-
-fn window_limit() -> i64 {
-    0x7FFFFFFF
-}
-
 fn new_peer(s: io.Stream, r: *io.Reader, server: bool, complete: fn(*Peer, *Exchange) ! io.Error) -> *Peer {
     new(Peer {
         stream: s
@@ -64,9 +49,9 @@ fn new_peer(s: io.Stream, r: *io.Reader, server: bool, complete: fn(*Peer, *Exch
         statics: static_table()
         exchanges: [:]
         dropped: [:]
-        window: 65535
-        initial: 65535
-        frame_size: 16384
+        window: default_window()
+        initial: default_window()
+        frame_size: default_frame_size()
         last: 0
         pending: 0
         settled: false
@@ -124,45 +109,17 @@ fn least(a: i64, b: i64) -> i64 {
     if a < b { a } else { b }
 }
 
-fn put_frame(mut out: []u8, kind: i64, flags: i64, stream: i64, payload: []u8) {
-    io.put_be24(mut out, payload.len)
-    push(mut out, u8(kind))
-    push(mut out, u8(flags))
-    io.put_be32(mut out, stream)
-    io.append(mut out, payload)
-}
-
-fn send_frame(p: *Peer, kind: i64, flags: i64, stream: i64, payload: []u8) ! io.Error {
-    var out: []u8 = []
-    put_frame(mut out, kind, flags, stream, payload)
-    io.write_all(p.stream, out)?
-}
-
-fn read_frame(p: *Peer) -> Frame ! io.Error {
-    let head = io.read_exact(p.reader, 9)?
-    let size = io.be24(head, 0)
-    if size > 16384 {
-        fail TooLarge
+fn framing(p: *Peer, fault: Fault) -> io.Error {
+    match fault {
+        BadSize => protocol(p, error_frame_size())
+        BadFrame => protocol(p, error_protocol())
     }
-    let payload = io.read_exact(p.reader, size)?
-    Frame { kind: i64(head[3]), flags: i64(head[4]), stream: io.be32(head, 5) & window_limit(), payload }
 }
 
-fn settings_frame(mut out: []u8, server: bool) {
-    var payload: []u8 = []
-    if server {
-        io.put_be16(mut payload, 3)
-        io.put_be32(mut payload, 100)
-    } else {
-        io.put_be16(mut payload, 2)
-        io.put_be32(mut payload, 0)
+fn unpad(p: *Peer, f: Frame) -> []u8 ! io.Error {
+    unpadded(f) catch {
+        fault => fail framing(p, fault)
     }
-    io.put_be16(mut payload, 4)
-    io.put_be32(mut payload, 1 << 20)
-    put_frame(mut out, 4, 0, 0, payload)
-    var grow: []u8 = []
-    io.put_be32(mut grow, (1 << 30) - 65535)
-    put_frame(mut out, 8, 0, 0, grow)
 }
 
 fn credit(p: *Peer, stream: i64, n: i64) ! io.Error {
@@ -170,98 +127,82 @@ fn credit(p: *Peer, stream: i64, n: i64) ! io.Error {
         return
     }
     var out: []u8 = []
-    var amount: []u8 = []
-    io.put_be32(mut amount, n)
-    put_frame(mut out, 8, 0, 0, amount)
+    put_window_update(mut out, 0, n)
     if stream > 0 {
-        put_frame(mut out, 8, 0, stream, amount)
+        put_window_update(mut out, stream, n)
     }
     io.write_all(p.stream, out)?
 }
 
-fn unpad(p: *Peer, f: Frame) -> []u8 ! io.Error {
-    if f.flags & 0x8 == 0 {
-        return f.payload
-    }
-    if f.payload.len == 0 || i64(f.payload[0]) >= f.payload.len {
-        fail protocol(p, 1)
-    }
-    f.payload[1..f.payload.len - i64(f.payload[0])]
-}
-
 fn on_settings(p: *Peer, f: Frame) ! io.Error {
-    if f.stream != 0 || (f.flags & 1 != 0 && f.payload.len != 0) || f.payload.len % 6 != 0 {
-        fail protocol(p, 6)
+    if f.stream != 0 || (f.flags & flag_ack() != 0 && f.payload.len != 0) || f.payload.len % 6 != 0 {
+        fail protocol(p, error_frame_size())
     }
-    if f.flags & 1 != 0 {
+    if f.flags & flag_ack() != 0 {
         return
     }
     p.settled = true
-    var at = 0
-    for at < f.payload.len {
-        let id = io.be16(f.payload, at)
-        let value = io.be32(f.payload, at + 2)
-        at += 6
-        if id == 2 && value > 1 {
-            fail protocol(p, 1)
-        }
-        if id == 4 {
-            if value > window_limit() {
-                fail protocol(p, 3)
-            }
-            for _, e in p.exchanges {
-                e.window += value - p.initial
-            }
-            p.initial = value
-        }
-        if id == 5 {
-            if value < 16384 || value > 16777215 {
-                fail protocol(p, 1)
-            }
-            p.frame_size = value
+    let settings = settings_of(f)
+    for s in settings {
+        let fault = setting_fault(s)
+        if fault != 0 {
+            fail protocol(p, fault)
         }
     }
-    send_frame(p, 4, 1, 0, [])?
+    for s in settings {
+        if s.id == setting_initial_window() {
+            for _, e in p.exchanges {
+                e.window += s.value - p.initial
+            }
+            p.initial = s.value
+        }
+        if s.id == setting_max_frame_size() {
+            p.frame_size = s.value
+        }
+    }
+    var ack: []u8 = []
+    put_settings_ack(mut ack)
+    io.write_all(p.stream, ack)?
 }
 
 fn on_window(p: *Peer, f: Frame) ! io.Error {
     if f.payload.len != 4 {
-        fail protocol(p, 6)
+        fail protocol(p, error_frame_size())
     }
     let n = io.be32(f.payload, 0) & window_limit()
     if f.stream == 0 {
         if n == 0 {
-            fail protocol(p, 1)
+            fail protocol(p, error_protocol())
         }
         p.window += n
         if p.window > window_limit() {
-            fail protocol(p, 3)
+            fail protocol(p, error_flow_control())
         }
         return
     }
     match p.exchanges[f.stream] {
         some(e) => {
             if n == 0 {
-                reset(p, e.id, 1)?
+                reset(p, e.id, error_protocol())?
                 return
             }
             e.window += n
             if e.window > window_limit() {
-                reset(p, e.id, 3)?
+                reset(p, e.id, error_flow_control())?
             }
         }
         none => {
             if idle(p, f.stream) {
-                fail protocol(p, 1)
+                fail protocol(p, error_protocol())
             }
         }
     }
 }
 
 fn reset(p: *Peer, id: i64, code: i64) ! io.Error {
-    var payload: []u8 = []
-    io.put_be32(mut payload, code)
-    send_frame(p, 3, 0, id, payload)?
+    var out: []u8 = []
+    put_reset(mut out, id, code)
+    io.write_all(p.stream, out)?
     delete(mut p.exchanges, id)
     p.dropped[id] = true
 }
@@ -276,10 +217,10 @@ fn opened(p: *Peer, id: i64) -> *Exchange ! io.Error {
         none => {}
     }
     if !p.server || id % 2 == 0 {
-        fail protocol(p, 1)
+        fail protocol(p, error_protocol())
     }
     if !idle(p, id) {
-        fail protocol(p, 5)
+        fail protocol(p, error_stream_closed())
     }
     p.last = id
     new_exchange(p, id)
@@ -323,26 +264,19 @@ fn has_pseudo(fields: []header.Header) -> bool {
 
 fn on_headers(p: *Peer, f: Frame) ! io.Error {
     if f.stream == 0 {
-        fail protocol(p, 1)
+        fail protocol(p, error_protocol())
     }
-    var block = unpad(p, f)?
-    if f.flags & 0x20 != 0 {
-        if block.len < 5 {
-            fail protocol(p, 6)
-        }
-        if io.be32(block, 0) & window_limit() == f.stream {
-            fail protocol(p, 1)
-        }
-        block = block[5..]
+    let block = header_block(f) catch {
+        fault => fail framing(p, fault)
     }
     let e = opened(p, f.stream)?
     if e.received {
-        fail protocol(p, 5)
+        fail protocol(p, error_stream_closed())
     }
     e.block = []
     io.append(mut e.block, block)
-    e.ends = f.flags & 1 != 0
-    if f.flags & 4 == 0 {
+    e.ends = f.flags & flag_end_stream() != 0
+    if f.flags & flag_end_headers() == 0 {
         p.pending = f.stream
         return
     }
@@ -351,14 +285,14 @@ fn on_headers(p: *Peer, f: Frame) ! io.Error {
 
 fn on_continuation(p: *Peer, f: Frame) ! io.Error {
     if p.pending == 0 || f.stream != p.pending {
-        fail protocol(p, 1)
+        fail protocol(p, error_protocol())
     }
     let e = p.exchanges[f.stream] ?? new_exchange(p, f.stream)
     io.append(mut e.block, f.payload)
-    if e.block.len > 1 << 20 {
-        fail protocol(p, 11)
+    if e.block.len > max_header_block() {
+        fail protocol(p, error_enhance_your_calm())
     }
-    if f.flags & 4 != 0 {
+    if f.flags & flag_end_headers() != 0 {
         p.pending = 0
         finish_block(p, e)?
     }
@@ -366,31 +300,31 @@ fn on_continuation(p: *Peer, f: Frame) ! io.Error {
 
 fn finish_block(p: *Peer, e: *Exchange) ! io.Error {
     let fields = decode(p.decoder, e.block) catch {
-        TooLarge => fail protocol(p, 11)
-        _ => fail protocol(p, 9)
+        TooLarge => fail protocol(p, error_enhance_your_calm())
+        _ => fail protocol(p, error_compression())
     }
     e.block = []
     if e.trailers {
         if !e.ends {
-            fail protocol(p, 1)
+            fail protocol(p, error_protocol())
         }
         if has_pseudo(fields) {
-            reset(p, e.id, 1)?
+            reset(p, e.id, error_protocol())?
             return
         }
     } else {
         for h in fields {
             if h.name != text.lower(h.name) {
-                reset(p, e.id, 1)?
+                reset(p, e.id, error_protocol())?
                 return
             }
         }
         if p.server && !valid_request(fields) {
-            reset(p, e.id, 1)?
+            reset(p, e.id, error_protocol())?
             return
         }
         if p.server && p.exchanges.len > 100 {
-            reset(p, e.id, 7)?
+            reset(p, e.id, error_refused_stream())?
             return
         }
         e.fields = fields
@@ -398,7 +332,7 @@ fn finish_block(p: *Peer, e: *Exchange) ! io.Error {
         if !p.server {
             let status = header.get(fields, ":status") ?? ""
             e.status = text.parse_uint(status, 10) catch {
-                _ => fail protocol(p, 1)
+                _ => fail protocol(p, error_protocol())
             }
             if e.status >= 100 && e.status < 200 {
                 e.trailers = false
@@ -414,7 +348,7 @@ fn end_remote(p: *Peer, e: *Exchange) ! io.Error {
     e.received = true
     let declared = header.get(e.fields, "content-length") ?? ""
     if p.server && declared.len > 0 && declared != "{e.body.len}" {
-        reset(p, e.id, 1)?
+        reset(p, e.id, error_protocol())?
         return
     }
     p.complete(p, e)?
@@ -422,21 +356,21 @@ fn end_remote(p: *Peer, e: *Exchange) ! io.Error {
 
 fn on_data(p: *Peer, f: Frame) ! io.Error {
     if f.stream == 0 {
-        fail protocol(p, 1)
+        fail protocol(p, error_protocol())
     }
     let data = unpad(p, f)?
     match p.exchanges[f.stream] {
         some(e) => {
             if e.received || !e.trailers {
-                fail protocol(p, 5)
+                fail protocol(p, error_stream_closed())
             }
             if e.body.len + data.len > max_body() {
-                reset(p, e.id, 11)?
+                reset(p, e.id, error_enhance_your_calm())?
                 credit(p, 0, f.payload.len)?
                 return
             }
             io.append(mut e.body, data)
-            let ends = f.flags & 1 != 0
+            let ends = f.flags & flag_end_stream() != 0
             credit(p, if ends { 0 } else { e.id }, f.payload.len)?
             if ends {
                 end_remote(p, e)?
@@ -444,10 +378,10 @@ fn on_data(p: *Peer, f: Frame) ! io.Error {
         }
         none => {
             if idle(p, f.stream) {
-                fail protocol(p, 1)
+                fail protocol(p, error_protocol())
             }
             if !(p.dropped[f.stream] ?? false) {
-                fail protocol(p, 5)
+                fail protocol(p, error_stream_closed())
             }
             credit(p, 0, f.payload.len)?
         }
@@ -455,76 +389,64 @@ fn on_data(p: *Peer, f: Frame) ! io.Error {
 }
 
 fn on_frame(p: *Peer, f: Frame) ! io.Error {
-    if p.pending != 0 && f.kind != 9 {
-        fail protocol(p, 1)
+    if p.pending != 0 && f.kind != frame_continuation() {
+        fail protocol(p, error_protocol())
     }
-    if !p.settled && f.kind != 4 {
-        fail protocol(p, 1)
+    if !p.settled && f.kind != frame_settings() {
+        fail protocol(p, error_protocol())
     }
-    if f.kind == 0 {
+    if f.kind == frame_data() {
         on_data(p, f)?
-    } else if f.kind == 1 {
+    } else if f.kind == frame_headers() {
         on_headers(p, f)?
-    } else if f.kind == 2 {
+    } else if f.kind == frame_priority() {
         if f.stream == 0 {
-            fail protocol(p, 1)
+            fail protocol(p, error_protocol())
         }
         if f.payload.len != 5 {
-            fail protocol(p, 6)
+            fail protocol(p, error_frame_size())
         }
         if io.be32(f.payload, 0) & window_limit() == f.stream {
-            reset(p, f.stream, 1)?
+            reset(p, f.stream, error_protocol())?
         }
-    } else if f.kind == 3 {
+    } else if f.kind == frame_reset() {
         if f.stream == 0 || idle(p, f.stream) {
-            fail protocol(p, 1)
+            fail protocol(p, error_protocol())
         }
         if f.payload.len != 4 {
-            fail protocol(p, 6)
+            fail protocol(p, error_frame_size())
         }
         if !p.server && f.stream == 1 {
             fail Reset
         }
         abandon(p.exchanges[f.stream])
         delete(mut p.exchanges, f.stream)
-    } else if f.kind == 4 {
+    } else if f.kind == frame_settings() {
         on_settings(p, f)?
-    } else if f.kind == 5 {
-        fail protocol(p, 1)
-    } else if f.kind == 6 {
+    } else if f.kind == frame_push_promise() {
+        fail protocol(p, error_protocol())
+    } else if f.kind == frame_ping() {
         if f.stream != 0 || f.payload.len != 8 {
-            fail protocol(p, 6)
+            fail protocol(p, error_frame_size())
         }
-        if f.flags & 1 == 0 {
-            send_frame(p, 6, 1, 0, f.payload)?
+        if f.flags & flag_ack() == 0 {
+            var ack: []u8 = []
+            put_ping_ack(mut ack, f.payload)
+            io.write_all(p.stream, ack)?
         }
-    } else if f.kind == 7 {
+    } else if f.kind == frame_goaway() {
         if f.stream != 0 {
-            fail protocol(p, 1)
+            fail protocol(p, error_protocol())
         }
-    } else if f.kind == 8 {
+    } else if f.kind == frame_window_update() {
         on_window(p, f)?
-    } else if f.kind == 9 {
+    } else if f.kind == frame_continuation() {
         on_continuation(p, f)?
     }
 }
 
 fn header_frames(p: *Peer, mut out: []u8, id: i64, fields: []header.Header, ends: bool) {
-    let block = encode(p.statics, fields)
-    var rest = block
-    var flags = if ends { 1 } else { 0 }
-    var kind = 1
-    for {
-        let n = if rest.len < p.frame_size { rest.len } else { p.frame_size }
-        let last = n == rest.len
-        put_frame(mut out, kind, if last { flags | 4 } else { flags }, id, rest[..n])
-        if last {
-            return
-        }
-        rest = rest[n..]
-        kind = 9
-        flags = 0
-    }
+    put_headers(mut out, p.statics, p.frame_size, id, fields, ends)
 }
 
 fn queue(p: *Peer, e: *Exchange, fields: []header.Header, body: []u8, trailers: []header.Header) ! io.Error {
@@ -555,7 +477,7 @@ fn flush(p: *Peer) ! io.Error {
         for e.queued && e.out.len > 0 && p.window > 0 && e.window > 0 {
             let n = least(least(e.out.len, p.frame_size), least(p.window, e.window))
             let last = n == e.out.len && !e.open
-            put_frame(mut out, 0, if last && e.tail.len == 0 { 1 } else { 0 }, e.id, e.out[..n])
+            put_frame(mut out, frame_data(), if last && e.tail.len == 0 { flag_end_stream() } else { 0 }, e.id, e.out[..n])
             e.out = e.out[n..]
             p.window -= n
             e.window -= n
@@ -575,10 +497,9 @@ fn flush(p: *Peer) ! io.Error {
 }
 
 fn go_away(p: *Peer) {
-    var payload: []u8 = []
-    io.put_be32(mut payload, p.last)
-    io.put_be32(mut payload, p.code)
-    send_frame(p, 7, 0, 0, payload) catch {
+    var out: []u8 = []
+    put_goaway(mut out, p.last, p.code)
+    io.write_all(p.stream, out) catch {
         _ => {}
     }
 }
@@ -599,9 +520,9 @@ struct Reply {
 
 fn pump(p: *Peer, frames: chan[Frame]) {
     for {
-        let f = read_frame(p) catch {
+        let f = read_frame(p.reader) catch {
             TooLarge => {
-                p.failure = 6
+                p.failure = error_frame_size()
                 close(frames)
                 return
             }
@@ -665,7 +586,7 @@ fn end_stream(p: *Peer, reply: Reply) ! io.Error {
         return
     }
     var out: []u8 = []
-    put_frame(mut out, 0, 1, e.id, [])
+    put_frame(mut out, frame_data(), flag_end_stream(), e.id, [])
     io.write_all(p.stream, out)?
     e.queued = false
     sent(p, e)
@@ -761,16 +682,12 @@ fn request_from(e: *Exchange) -> Request ! io.Error {
     req
 }
 
-fn connection_specific(name: str) -> bool {
-    name == "connection" || name == "keep-alive" || name == "transfer-encoding" || name == "upgrade" || name == "proxy-connection"
-}
-
 fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, handler: fn(Request) -> Response) ! io.Error {
     let replies = chan[Reply](128)
     let complete = fn(p: *Peer, e: *Exchange) ! io.Error {
         var req = request_from(e) catch {
             _ => {
-                reset(p, e.id, 1)?
+                reset(p, e.id, error_protocol())?
                 return
             }
         }
@@ -782,7 +699,7 @@ fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, handler: fn(Request) -> Re
     let p = new_peer(s, r, true, complete)
     defer abandon_all(p)
     var out: []u8 = []
-    settings_frame(mut out, true)
+    put_initial_settings(mut out, true)
     io.write_all(s, out)?
     let frames = chan[Frame](16)
     spawn pump(p, frames)
