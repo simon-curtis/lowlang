@@ -79,6 +79,10 @@
     function: (identifier) @keyword
     (#eq? @keyword "after")))
 
+(when_expression
+  operator: _ @keyword
+  (#eq? @keyword "when"))
+
 "fn" @keyword.function
 
 [

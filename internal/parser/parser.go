@@ -821,7 +821,13 @@ var precedence = map[lexer.Kind]int{
 }
 
 func (p *Parser) expr() ast.Expr {
-	return p.binary(1, false)
+	x := p.binary(1, false)
+	t := p.tok()
+	if t.Kind != lexer.Ident || t.Text != lexer.When {
+		return x
+	}
+	p.next()
+	return &ast.When{X: x, Cond: p.binary(1, false), Pos: t.Pos}
 }
 
 func (p *Parser) binary(minPrec int, testing bool) ast.Expr {

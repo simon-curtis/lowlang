@@ -193,9 +193,12 @@ func texts(table []spelling) []string {
 	return words
 }
 
-const After = "after"
+const (
+	After = "after"
+	When  = "when"
+)
 
-var contextualKeywords = []string{After}
+var contextualKeywords = []string{After, When}
 
 func ContextualKeywords() []string {
 	return contextualKeywords

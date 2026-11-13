@@ -608,6 +608,13 @@ type Or struct {
 	Pos      diag.Pos
 }
 
+type When struct {
+	Typed
+	X    Expr
+	Cond Expr
+	Pos  diag.Pos
+}
+
 func (n *File) Position() diag.Pos          { return diag.Start(n.Path) }
 func (n *Import) Position() diag.Pos        { return n.Pos }
 func (n *Extern) Position() diag.Pos        { return n.Pos }
@@ -665,6 +672,7 @@ func (n *Match) Position() diag.Pos         { return n.Pos }
 func (n *Try) Position() diag.Pos           { return n.Pos }
 func (n *Catch) Position() diag.Pos         { return n.Pos }
 func (n *Or) Position() diag.Pos            { return n.Pos }
+func (n *When) Position() diag.Pos          { return n.Pos }
 
 func (*Let) stmt()      {}
 func (*Assign) stmt()   {}
@@ -706,3 +714,4 @@ func (*Receiver) expr()  {}
 func (*Try) expr()       {}
 func (*Catch) expr()     {}
 func (*Or) expr()        {}
+func (*When) expr()      {}
