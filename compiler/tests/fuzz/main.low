@@ -1,0 +1,723 @@
+import fixture
+import fuzz/choice
+import fuzz/corpus
+import fuzz/gen
+import fuzz/model
+import fuzz/oracle
+import fuzz/reduce
+import std/cancel
+import std/file
+import std/os
+import std/testing
+import std/text
+import std/path
+
+const max_u64: u64 = 0xFFFFFFFFFFFFFFFF
+const min_i64_bits: u64 = 0x8000000000000000
+const max_i64_bits: u64 = 0x7FFFFFFFFFFFFFFF
+
+const divide_program = "fn div(a: i64, b: i64) -> i64 {{\n    a / b\n}}\n\nfn main() {{\n    print(div(10, 2))\n    print(div(1, 0))\n}}\n"
+
+struct ExprCase {
+    name: str
+    expr: model.Expr
+    want: str
+}
+
+fn literal(kind: model.Kind, bits: u64) -> model.Expr {
+    model.Expr.Lit(new(model.Lit { kind, bits }))
+}
+
+fn float_literal(kind: model.Kind, value: f64) -> model.Expr {
+    model.Expr.Lit(new(model.Lit { kind, float: value }))
+}
+
+fn variable(name: str, kind: model.Kind) -> model.Expr {
+    model.Expr.Var(new(model.Var { name, kind }))
+}
+
+fn binary(op: model.Op, l: model.Expr, r: model.Expr) -> model.Expr {
+    model.Expr.Binary(new(model.Binary { op, l, r }))
+}
+
+fn unary(op: model.Op, x: model.Expr) -> model.Expr {
+    model.Expr.Unary(new(model.Unary { op, x }))
+}
+
+fn convert(to: model.Kind, x: model.Expr) -> model.Expr {
+    model.Expr.Convert(new(model.Convert { to, x }))
+}
+
+fn conditional(cond: model.Expr, then: model.Expr, otherwise: model.Expr) -> model.Expr {
+    model.Expr.IfExpr(new(model.IfExpr { cond, then, otherwise }))
+}
+
+fn print_stmt(value: model.Expr) -> model.Stmt {
+    model.Stmt.Print(new(model.Print { value }))
+}
+
+fn main_printing(exprs: []model.Expr) -> *model.Program {
+    var main: []model.Stmt = []
+    for e in exprs {
+        push(mut main, print_stmt(e))
+    }
+    new(model.Program { funcs: [], main })
+}
+
+fn generated(seed: i64) -> *model.Program {
+    let src = choice.from_seed(seed)
+    gen.generate(src, gen.default_config())
+}
+
+fn count_lines(s: str, line: str) -> bool {
+    text.contains(s, "{line}\n")
+}
+
+fn test_seed_is_deterministic(t: *testing.T) {
+    let a = choice.from_seed(42)
+    let b = choice.from_seed(42)
+    for _ in 0..100 {
+        let x = choice.intn(a, 1000)
+        let y = choice.intn(b, 1000)
+        if x != y {
+            t.fatal("{x} != {y}")
+        }
+    }
+}
+
+fn test_bytes_are_consumed_in_order(t: *testing.T) {
+    let data: []u8 = [3, 200, 1]
+    let s = choice.from_bytes(data)
+    let got = [choice.intn(s, 10), choice.intn(s, 256), choice.intn(s, 2)]
+    let want = [3, 200, 1]
+    for i in 0..want.len {
+        if got[i] != want[i] {
+            t.error("choice {i} is {got[i]}, want {want[i]}")
+        }
+    }
+}
+
+fn test_exhausted_bytes_yield_zero(t: *testing.T) {
+    let none_left: []u8 = []
+    let s = choice.from_bytes(none_left)
+    let tens = choice.intn(s, 10)
+    let wide = choice.uint64(s)
+    let flag = choice.boolean(s)
+    if tens != 0 || wide != 0 || flag {
+        t.error("an empty source must produce zero choices")
+    }
+}
+
+fn test_range_is_inclusive(t: *testing.T) {
+    let s = choice.from_seed(1)
+    var seen: [i64: bool] = [:]
+    for _ in 0..200 {
+        let v = choice.range(s, 2, 4)
+        if v < 2 || v > 4 {
+            t.fatal("{v} out of range")
+        }
+        seen[v] = true
+    }
+    t.equal(seen.len, 3)
+}
+
+fn test_generate_is_deterministic(t: *testing.T) {
+    let first = model.to_string(generated(7))
+    let second = model.to_string(generated(7))
+    t.equal(first, second)
+    let other = model.to_string(generated(8))
+    t.not_equal(first, other)
+}
+
+fn test_generate_from_bytes(t: *testing.T) {
+    let none_left: []u8 = []
+    let zero: []u8 = [0]
+    let high: []u8 = [255, 255, 255]
+    let long = io_zeros(4096)
+    for input in [none_left, zero, high, long] {
+        let src = choice.from_bytes(input)
+        let program = gen.generate(src, gen.default_config())
+        if model.to_string(program) == "" {
+            t.error("empty source for {input.len} input bytes")
+        }
+    }
+}
+
+fn io_zeros(count: i64) -> []u8 {
+    var out: []u8 = []
+    for _ in 0..count {
+        push(mut out, 0)
+    }
+    out
+}
+
+fn test_generated_programs_terminate_within_budget(t: *testing.T) {
+    var skipped = 0
+    for seed in 0..300 {
+        let program = generated(seed)
+        let outcome = model.run(program, 2000000) catch {
+            Budget => {
+                skipped += 1
+                continue
+            }
+            Undefined => {
+                t.fatal("seed {seed}: {model.failure_message(model.Failure.Undefined)}")
+                return
+            }
+        }
+        if outcome.stdout == "" {
+            t.error("seed {seed} printed nothing")
+        }
+    }
+    if skipped > 15 {
+        t.error("{skipped} of 300 programs exceeded the step budget")
+    }
+}
+
+fn test_panics_disabled_avoids_raw_divisors(t: *testing.T) {
+    var cfg = gen.default_config()
+    cfg.panics = false
+    for seed in 0..200 {
+        let src = choice.from_seed(seed)
+        let program = gen.generate(src, cfg)
+        let outcome = model.run(program, 2000000) or continue
+        if outcome.panic_message != "" {
+            t.fatal("seed {seed} panicked: {outcome.panic_message}")
+        }
+    }
+}
+
+fn arithmetic_cases() -> []ExprCase {
+    let min_i32: u64 = 0x80000000
+    let all32: u64 = 0xFFFFFFFF
+    let minus_six: u64 = max_u64 - 6
+    [
+        ExprCase { name: "u8 add wraps", expr: binary(model.Op.Add, literal(model.Kind.U8, 250), literal(model.Kind.U8, 10)), want: "4\n" }
+        ExprCase { name: "u8 sub wraps", expr: binary(model.Op.Sub, literal(model.Kind.U8, 1), literal(model.Kind.U8, 2)), want: "255\n" }
+        ExprCase { name: "i64 min div -1", expr: binary(model.Op.Div, literal(model.Kind.I64, min_i64_bits), literal(model.Kind.I64, max_u64)), want: "-9223372036854775808\n" }
+        ExprCase { name: "i64 min rem -1", expr: binary(model.Op.Rem, literal(model.Kind.I64, min_i64_bits), literal(model.Kind.I64, max_u64)), want: "0\n" }
+        ExprCase { name: "i32 min div -1", expr: binary(model.Op.Div, literal(model.Kind.I32, min_i32), literal(model.Kind.I32, all32)), want: "-2147483648\n" }
+        ExprCase { name: "i64 rem sign follows dividend", expr: binary(model.Op.Rem, literal(model.Kind.I64, minus_six), literal(model.Kind.I64, 4)), want: "-3\n" }
+        ExprCase { name: "i32 shl by width", expr: binary(model.Op.Shl, literal(model.Kind.I32, 1), literal(model.Kind.I64, 32)), want: "0\n" }
+        ExprCase { name: "i32 shl below width", expr: binary(model.Op.Shl, literal(model.Kind.I32, 1), literal(model.Kind.U8, 31)), want: "-2147483648\n" }
+        ExprCase { name: "i32 shr sign fill", expr: binary(model.Op.Shr, literal(model.Kind.I32, 0xFFFFFFF8), literal(model.Kind.U8, 40)), want: "-1\n" }
+        ExprCase { name: "i32 shr negative count", expr: binary(model.Op.Shr, literal(model.Kind.I32, 0xFFFFFFF8), literal(model.Kind.I64, max_u64)), want: "-1\n" }
+        ExprCase { name: "u32 shr huge count", expr: binary(model.Op.Shr, literal(model.Kind.U32, 8), literal(model.Kind.U64, max_u64)), want: "0\n" }
+        ExprCase { name: "u8 shl truncates", expr: binary(model.Op.Shl, literal(model.Kind.U8, 200), literal(model.Kind.U8, 1)), want: "144\n" }
+        ExprCase { name: "neg wraps", expr: unary(model.Op.Neg, literal(model.Kind.I32, min_i32)), want: "-2147483648\n" }
+        ExprCase { name: "compl u8", expr: unary(model.Op.Compl, literal(model.Kind.U8, 5)), want: "250\n" }
+        ExprCase { name: "u64 compare", expr: binary(model.Op.Gt, literal(model.Kind.U64, max_u64), literal(model.Kind.U64, 1)), want: "true\n" }
+        ExprCase { name: "i64 compare", expr: binary(model.Op.Gt, literal(model.Kind.I64, max_u64), literal(model.Kind.I64, 1)), want: "false\n" }
+        ExprCase { name: "narrowing convert", expr: convert(model.Kind.U8, literal(model.Kind.I64, max_u64)), want: "255\n" }
+        ExprCase { name: "sign extending convert", expr: convert(model.Kind.U64, literal(model.Kind.I32, all32)), want: "18446744073709551615\n" }
+        ExprCase { name: "zero extending convert", expr: convert(model.Kind.I64, literal(model.Kind.U32, all32)), want: "4294967295\n" }
+    ]
+}
+
+fn case_name(c: ExprCase) -> str {
+    c.name
+}
+
+fn test_run_arithmetic(t: *testing.T) {
+    testing.table_of(t, arithmetic_cases(), case_name, fn(t: *testing.T, c: ExprCase) {
+        let outcome = model.run(main_printing([c.expr]), 1000) catch {
+            e => {
+                t.fatal(model.failure_message(e))
+                return
+            }
+        }
+        if outcome.stdout != c.want || outcome.panic_message != "" {
+            t.error("stdout {text.quote(outcome.stdout)} panic {text.quote(outcome.panic_message)}, want {text.quote(c.want)}")
+        }
+    })
+}
+
+fn test_run_float(t: *testing.T) {
+    let zero = float_literal(model.Kind.F64, 0.0)
+    let nan = binary(model.Op.Div, zero, zero)
+    let tenth = float_literal(model.Kind.F32, 0.1)
+    let fifth = float_literal(model.Kind.F32, 0.2)
+    let program = main_printing([binary(model.Op.Eq, nan, nan), binary(model.Op.Ne, nan, nan), binary(model.Op.Lt, tenth, fifth)])
+    let outcome = model.run(program, 1000) catch {
+        e => {
+            t.fatal(model.failure_message(e))
+            return
+        }
+    }
+    t.equal(outcome.stdout, "false\ntrue\ntrue\n")
+}
+
+fn test_run_divide_by_zero_panics(t: *testing.T) {
+    let program = main_printing([literal(model.Kind.I64, 5), binary(model.Op.Div, literal(model.Kind.I64, 1), literal(model.Kind.I64, 0)), literal(model.Kind.I64, 6)])
+    let outcome = model.run(program, 1000) catch {
+        e => {
+            t.fatal(model.failure_message(e))
+            return
+        }
+    }
+    t.equal(outcome.stdout, "5\n")
+    t.equal(model.exit_code(outcome), 2)
+    t.equal(model.stderr(outcome), "panic: integer divide by zero\n")
+}
+
+fn test_run_labelled_jump(t: *testing.T) {
+    let counter = variable("n", model.Kind.I64)
+    let zero = literal(model.Kind.I64, 0)
+    let three = literal(model.Kind.I64, 3)
+    let skip_second = binary(model.Op.Eq, variable("j", model.Kind.I64), literal(model.Kind.I64, 1))
+    let leave = model.Stmt.Jump(new(model.Jump { target: 1, is_continue: true }))
+    let guard = model.Stmt.IfStmt(new(model.IfStmt { cond: skip_second, then: [leave] }))
+    let bump = model.Stmt.Assign(new(model.Assign { name: "n", kind: model.Kind.I64, op: model.Op.Add, value: literal(model.Kind.I64, 1) }))
+    let inner = model.Stmt.Range(new(model.Range { id: 2, variable: "j", kind: model.Kind.I64, lo: zero, hi: three, body: [guard, bump] }))
+    let outer = model.Stmt.Range(new(model.Range { id: 1, variable: "i", kind: model.Kind.I64, lo: zero, hi: three, body: [inner] }))
+    let declare = model.Stmt.Let(new(model.Let { name: "n", kind: model.Kind.I64, mutable: true, init: zero }))
+    let program = new(model.Program { funcs: [], main: [declare, outer, print_stmt(counter)] })
+    let outcome = model.run(program, 1000) catch {
+        e => {
+            t.fatal(model.failure_message(e))
+            return
+        }
+    }
+    t.equal(outcome.stdout, "3\n")
+}
+
+fn test_run_budget(t: *testing.T) {
+    let huge: u64 = 0x10000000000
+    let body = print_stmt(literal(model.Kind.I64, 1))
+    let loop = model.Stmt.Range(new(model.Range { id: 1, variable: "i", kind: model.Kind.U64, lo: literal(model.Kind.U64, 0), hi: literal(model.Kind.U64, huge), body: [body] }))
+    let program = new(model.Program { funcs: [], main: [loop] })
+    t.equal(failure_text(program, 500), model.failure_message(model.Failure.Budget))
+}
+
+fn failure_text(program: *model.Program, budget: i64) -> str {
+    model.run(program, budget) catch {
+        e => return model.failure_message(e)
+    }
+    "no failure"
+}
+
+fn test_run_undefined_float_conversion(t: *testing.T) {
+    let program = main_printing([convert(model.Kind.U8, float_literal(model.Kind.F64, 300.0))])
+    t.equal(failure_text(program, 100), model.failure_message(model.Failure.Undefined))
+}
+
+fn printed(e: model.Expr) -> str {
+    let source = model.to_string(main_printing([e]))
+    let opening = text.trim_prefix(source, "fn main() {{\n    print(")
+    text.trim_suffix(opening, ")\n}}\n")
+}
+
+fn literal_cases() -> []ExprCase {
+    let negative_zero = text.float_from_bits(0x8000000000000000)
+    [
+        ExprCase { name: "i64 default", expr: literal(model.Kind.I64, 5), want: "5" }
+        ExprCase { name: "i64 negative", expr: literal(model.Kind.I64, max_u64), want: "(-1)" }
+        ExprCase { name: "i64 minimum", expr: literal(model.Kind.I64, min_i64_bits), want: "(-9223372036854775807 - 1)" }
+        ExprCase { name: "u8 wrapped", expr: literal(model.Kind.U8, 5), want: "u8(5)" }
+        ExprCase { name: "i32 minimum wrapped", expr: literal(model.Kind.I32, 0x80000000), want: "i32((-2147483648))" }
+        ExprCase { name: "u64 high wrapped", expr: literal(model.Kind.U64, max_u64), want: "(~u64(0))" }
+        ExprCase { name: "f64 default", expr: float_literal(model.Kind.F64, 1.5), want: "1.5" }
+        ExprCase { name: "f64 whole", expr: float_literal(model.Kind.F64, 2.0), want: "2.0" }
+        ExprCase { name: "f64 negative zero", expr: float_literal(model.Kind.F64, negative_zero), want: "(-0.0)" }
+        ExprCase { name: "f32 wrapped", expr: float_literal(model.Kind.F32, 0.5), want: "f32(0.5)" }
+        ExprCase { name: "f64 small", expr: float_literal(model.Kind.F64, 0.000001), want: "0.000001" }
+        ExprCase { name: "f64 large", expr: float_literal(model.Kind.F64, 1000000000.0), want: "1000000000.0" }
+        ExprCase { name: "bool", expr: literal(model.Kind.Bool, 1), want: "true" }
+    ]
+}
+
+fn test_print_literals(t: *testing.T) {
+    testing.table_of(t, literal_cases(), case_name, fn(t: *testing.T, c: ExprCase) {
+        t.equal(printed(c.expr), c.want)
+    })
+}
+
+fn sibling_cases() -> []ExprCase {
+    let x = variable("x", model.Kind.U8)
+    let one_plus_two = binary(model.Op.Add, literal(model.Kind.U8, 1), literal(model.Kind.U8, 2))
+    [
+        ExprCase { name: "literal beside variable", expr: binary(model.Op.Add, x, literal(model.Kind.U8, 3)), want: "(x + 3)" }
+        ExprCase { name: "literal left of variable", expr: binary(model.Op.Sub, literal(model.Kind.U8, 3), x), want: "(3 - x)" }
+        ExprCase { name: "two literals wrap", expr: one_plus_two, want: "(u8(1) + u8(2))" }
+        ExprCase { name: "nested literals wrap beside variable", expr: binary(model.Op.Add, one_plus_two, x), want: "((u8(1) + u8(2)) + x)" }
+        ExprCase { name: "shift count never inferred", expr: binary(model.Op.Shl, x, literal(model.Kind.U16, 3)), want: "(x << u16(3))" }
+        ExprCase { name: "unary wraps literal", expr: unary(model.Op.Neg, literal(model.Kind.U8, 1)), want: "(-u8(1))" }
+        ExprCase { name: "if branches wrap", expr: conditional(literal(model.Kind.Bool, 1), literal(model.Kind.U8, 1), x), want: "(if true {{ u8(1) }} else {{ x }})" }
+    ]
+}
+
+fn test_print_sibling_typing(t: *testing.T) {
+    testing.table_of(t, sibling_cases(), case_name, fn(t: *testing.T, c: ExprCase) {
+        t.equal(printed(c.expr), c.want)
+    })
+}
+
+fn test_print_labels(t: *testing.T) {
+    let truth = literal(model.Kind.Bool, 1)
+    let continue_outer = model.Stmt.Jump(new(model.Jump { target: 1, is_continue: true }))
+    let break_inner = model.Stmt.Jump(new(model.Jump { target: 2, is_continue: false }))
+    let first = model.Stmt.IfStmt(new(model.IfStmt { cond: truth, then: [continue_outer] }))
+    let second = model.Stmt.IfStmt(new(model.IfStmt { cond: truth, then: [break_inner] }))
+    let inner = model.Stmt.While(new(model.While { id: 2, counter: "w_2", bound: 3, cond: none, body: [first, second] }))
+    let zero = literal(model.Kind.I64, 0)
+    let two = literal(model.Kind.I64, 2)
+    let outer = model.Stmt.Range(new(model.Range { id: 1, variable: "i_1", kind: model.Kind.I64, lo: zero, hi: two, body: [inner] }))
+    let f = new(model.Func { name: "f", params: [], result: model.Kind.I64, body: [outer], tail: zero })
+    let source = model.to_string(new(model.Program { funcs: [f], main: [] }))
+    for want in ["L1: for i_1 in (0)..(2) {{", "continue L1", "for w_2 < 3 {{"] {
+        if !text.contains(source, want) {
+            t.error("missing {text.quote(want)} in:\n{source}")
+        }
+    }
+    if text.contains(source, "L2") {
+        t.error("innermost loop labelled in:\n{source}")
+    }
+}
+
+fn keeps_shift(p: *model.Program) -> bool {
+    text.contains(model.to_string(p), "<<")
+}
+
+fn test_reduce_keeps_the_triggering_construct(t: *testing.T) {
+    let keep = fn(ctx: *cancel.Token, p: *model.Program) -> bool { keeps_shift(p) }
+    var seed = 0
+    var program = generated(0)
+    for !keeps_shift(program) {
+        seed += 1
+        program = generated(seed)
+    }
+    let original = model.to_string(program)
+    let ctx = cancel.token()
+    let reduced = reduce.reduce(reduce.new_reducer(keep, 4, 0), ctx, program)
+    let reduced_text = model.to_string(reduced)
+    if !keeps_shift(reduced) {
+        t.fatal("reduced program lost the construct")
+    }
+    if reduced_text.len >= original.len / 4 {
+        t.error("reduced {original.len} bytes to {reduced_text.len}")
+    }
+    t.equal(model.to_string(program), original)
+    let again = reduce.reduce(reduce.new_reducer(keep, 4, 0), ctx, reduced)
+    t.equal(model.to_string(again), reduced_text)
+}
+
+fn test_reduce_preserves_observed_output(t: *testing.T) {
+    let program = generated(3)
+    let outcome = model.run(program, 2000000) catch {
+        e => {
+            t.fatal("seed 3 unusable: {model.failure_message(e)}")
+            return
+        }
+    }
+    if outcome.stdout == "" {
+        t.fatal("seed 3 unusable: no output")
+    }
+    let line = text.split(outcome.stdout, 10)[0]
+    let keep = fn(ctx: *cancel.Token, p: *model.Program) -> bool { prints_line(p, line) }
+    let ctx = cancel.token()
+    let reduced = reduce.reduce(reduce.new_reducer(keep, 4, 0), ctx, program)
+    if !prints_line(reduced, line) {
+        t.fatal("reduced program lost the printed line")
+    }
+    let before = model.to_string(program).len
+    let after = model.to_string(reduced).len
+    if after >= before / 2 {
+        t.error("reduced {before} bytes to {after}")
+    }
+}
+
+fn prints_line(p: *model.Program, line: str) -> bool {
+    let got = model.run(p, 2000000) or return false
+    text.contains(got.stdout, "{line}\n")
+}
+
+fn test_reduce_honours_test_budget(t: *testing.T) {
+    var calls = 0
+    let keep = fn(ctx: *cancel.Token, p: *model.Program) -> bool {
+        calls += 1
+        true
+    }
+    let ctx = cancel.token()
+    reduce.reduce(reduce.new_reducer(keep, 1, 10), ctx, generated(1))
+    if calls > 10 {
+        t.error("{calls} predicate calls")
+    }
+}
+
+fn test_removed_parameters_leave_calls_consistent(t: *testing.T) {
+    let keep = fn(ctx: *cancel.Token, p: *model.Program) -> bool { text.contains(model.to_string(p), "fn f") }
+    let ctx = cancel.token()
+    let reduced = reduce.reduce(reduce.new_reducer(keep, 4, 0), ctx, generated(9))
+    var arity: [str: i64] = [:]
+    for f in reduced.funcs {
+        arity[f.name] = f.params.len
+    }
+    reduce.each_slot(reduced, fn(mut e: model.Expr) -> bool {
+        match e {
+            Call(c) => {
+                let want = arity[c.callee] ?? 0
+                if c.args.len != want {
+                    t.error("call to {c.callee} has {c.args.len} arguments, want {want}")
+                }
+            }
+            _ => {}
+        }
+        false
+    })
+    for f in reduced.funcs {
+        if f.params.len != 0 {
+            t.error("{f.name} kept {f.params.len} unused parameters")
+        }
+    }
+}
+
+fn test_reduce_stops_on_cancel(t: *testing.T) {
+    let ctx = cancel.token()
+    cancel.cancel(ctx)
+    let keep = fn(ctx: *cancel.Token, p: *model.Program) -> bool { true }
+    let program = generated(1)
+    let reduced = reduce.reduce(reduce.new_reducer(keep, 2, 0), ctx, program)
+    t.equal(model.to_string(reduced), model.to_string(program))
+}
+
+fn test_clone_is_deep(t: *testing.T) {
+    let program = generated(5)
+    let before = model.to_string(program)
+    let copy = model.clone_program(program)
+    reduce.each_slot(copy, fn(mut e: model.Expr) -> bool {
+        match e {
+            Lit(n) => {
+                if model.is_int(n.kind) {
+                    n.bits = n.bits ^ 0xFF
+                }
+            }
+            _ => {}
+        }
+        false
+    })
+    t.equal(model.to_string(program), before)
+    t.not_equal(model.to_string(copy), before)
+}
+
+fn runner() -> oracle.Runner {
+    let executable = os.executable() or ""
+    oracle.Runner { timeout_ms: 10000, executable }
+}
+
+fn test_check_accepts_matching_outcome(t: *testing.T) {
+    let expected = model.Outcome { stdout: "5\n", panic_message: "integer divide by zero" }
+    let ctx = cancel.token()
+    let findings = oracle.check(runner(), ctx, divide_program, expected)
+    if findings.len != 0 {
+        t.error("unexpected findings: {findings.len}, first {findings[0].class}: {findings[0].detail}")
+    }
+}
+
+fn test_check_reports_reference_mismatch(t: *testing.T) {
+    let expected = model.Outcome { stdout: "6\n", panic_message: "integer divide by zero" }
+    let ctx = cancel.token()
+    let findings = oracle.check(runner(), ctx, divide_program, expected)
+    if findings.len != 2 {
+        t.fatal("got {findings.len} findings, want one per mode")
+    }
+    for f in findings {
+        if f.class != oracle.class_reference || !text.contains(f.detail, "want \"6\"") {
+            t.error("finding {f.class}: {f.detail}")
+        }
+    }
+}
+
+fn test_check_reports_rejected_program(t: *testing.T) {
+    let ctx = cancel.token()
+    let findings = oracle.check(runner(), ctx, "fn main() {{\n    print(missing)\n}}\n", model.Outcome {})
+    if findings.len != 2 || findings[0].class != oracle.class_reject {
+        t.fatal("findings {findings.len}")
+    }
+    if text.contains(findings[0].detail, "lowfuzz-") {
+        t.error("detail leaks the work directory: {findings[0].detail}")
+    }
+}
+
+fn stub_runner(t: *testing.T, script: str, timeout_ms: i64) -> oracle.Runner {
+    let dir = file.temp_dir("lowfuzz-test-") catch {
+        e => {
+            t.fatal("{e}")
+            return oracle.Runner { timeout_ms, executable: "" }
+        }
+    }
+    let executable = file.child_path(dir, "stub")
+    file.write_text_mode(executable, script, 0o755) or {
+        t.fatal("cannot write the stub compiler")
+    }
+    oracle.Runner { timeout_ms, executable }
+}
+
+fn test_check_reports_compiler_crash(t: *testing.T) {
+    let stub = stub_runner(t, "#!/bin/sh\necho 'panic: index out of range 12' >&2\nexit 2\n", 10000)
+    defer file.remove_all(path.dir(stub.executable)) or {}
+    let ctx = cancel.token()
+    let findings = oracle.check(stub, ctx, divide_program, model.Outcome {})
+    if findings.len != 2 || findings[0].class != oracle.class_ice {
+        t.fatal("findings {findings.len}")
+    }
+    t.equal(oracle.signature(findings[0]), "ice:release: panic: index out of range #")
+}
+
+fn test_check_reports_runaway_program(t: *testing.T) {
+    let stub = stub_runner(t, "#!/bin/sh\nprintf '#!/bin/sh\\nsleep 5\\n' > \"$4\"\nchmod +x \"$4\"\n", 200)
+    defer file.remove_all(path.dir(stub.executable)) or {}
+    let ctx = cancel.token()
+    let findings = oracle.check(stub, ctx, divide_program, model.Outcome {})
+    if findings.len != 2 || findings[0].class != oracle.class_timeout {
+        t.fatal("findings {findings.len}")
+    }
+    t.equal(findings[0].detail, "release: no exit within 200ms")
+}
+
+fn test_signature_ignores_numbers(t: *testing.T) {
+    let a = oracle.Finding { class: oracle.class_reject, detail: "release: main.low:3:4: 300 overflows u8\nmore", source: "" }
+    let b = oracle.Finding { class: oracle.class_reject, detail: "release: main.low:90:11: 7 overflows u8", source: "" }
+    t.equal(oracle.signature(a), oracle.signature(b))
+    let c = oracle.Finding { class: oracle.class_reject, detail: "release: main.low:3:4: 300 overflows u16", source: "" }
+    t.not_equal(oracle.signature(a), oracle.signature(c))
+}
+
+fn single_print(value: u64) -> *model.Program {
+    let stmt = print_stmt(literal(model.Kind.I64, value))
+    new(model.Program { funcs: [], main: [stmt] })
+}
+
+fn scratch_dir(t: *testing.T) -> str {
+    file.temp_dir("lowfuzz-corpus-") catch {
+        e => {
+            t.fatal("{e}")
+            return ""
+        }
+    }
+}
+
+fn read_text_or(path: str, fallback: str) -> str {
+    file.read_text(path) or fallback
+}
+
+fn test_write_produces_run_fixture(t: *testing.T) {
+    let dir = scratch_dir(t)
+    defer file.remove_all(dir) or {}
+    let built = corpus.from_program(single_print(5), model.Outcome { stdout: "5\n", panic_message: "integer divide by zero" })
+    let written = corpus.write(built, dir) catch {
+        e => {
+            t.fatal(corpus.message(e))
+            return
+        }
+    }
+    if !text.starts_with(path.base(written), "fuzz_") || !text.ends_with(written, ".low") {
+        t.error("path {written}")
+    }
+    let stem = fixture.base(written)
+    t.equal(read_text_or("{stem}.out", "missing"), "5\n")
+    t.equal(read_text_or("{stem}.err", "missing"), "panic: integer divide by zero\n")
+}
+
+fn test_written_fixture_reads_back_through_the_runner_format(t: *testing.T) {
+    let dir = scratch_dir(t)
+    defer file.remove_all(dir) or {}
+    let built = corpus.from_program(single_print(5), model.Outcome { stdout: "5\n", panic_message: "integer divide by zero" })
+    let written = corpus.write(built, dir) catch {
+        e => {
+            t.fatal(corpus.message(e))
+            return
+        }
+    }
+    let got = fixture.read(written) catch {
+        e => {
+            t.fatal(fixture.message(e))
+            return
+        }
+    }
+    t.equal(got.stdout, built.sidecars.stdout)
+    t.equal(got.stderr, built.sidecars.stderr)
+    t.equal(got.panics, built.sidecars.panics)
+    t.is_true(got.panics)
+    t.is_true(fixture.windows(got))
+    t.is_false(got.simd)
+}
+
+fn test_write_omits_empty_expectations(t: *testing.T) {
+    let dir = scratch_dir(t)
+    defer file.remove_all(dir) or {}
+    let written = corpus.write(corpus.from_program(single_print(1), model.Outcome {}), dir) catch {
+        e => {
+            t.fatal(corpus.message(e))
+            return
+        }
+    }
+    let stem = fixture.base(written)
+    t.is_false(file.exists("{stem}.out"))
+    t.is_false(file.exists("{stem}.err"))
+}
+
+fn test_name_follows_content(t: *testing.T) {
+    let a = corpus.from_program(single_print(1), model.Outcome {})
+    let b = corpus.from_program(single_print(1), model.Outcome {})
+    let c = corpus.from_program(single_print(2), model.Outcome {})
+    t.equal(a.name, b.name)
+    t.not_equal(a.name, c.name)
+}
+
+fn test_write_reports_unwritable_directory(t: *testing.T) {
+    let dir = scratch_dir(t)
+    defer file.remove_all(dir) or {}
+    let blocker = file.child_path(dir, "file")
+    file.write_text(blocker, "") or {
+        t.fatal("cannot create the blocking file")
+        return
+    }
+    let target = file.child_path(blocker, "sub")
+    let outcome = corpus.write(corpus.from_program(single_print(1), model.Outcome {}), target) catch {
+        e => return
+    }
+    t.error("expected an error, wrote {outcome}")
+}
+
+fn main() {
+    let args = os.args()
+    if args.len > 1 && args[1] == "__build" {
+        os.exit(oracle.build_main(args[2..]))
+    }
+    testing.run([
+        testing.Test { name: "seed_is_deterministic", run: test_seed_is_deterministic }
+        testing.Test { name: "bytes_are_consumed_in_order", run: test_bytes_are_consumed_in_order }
+        testing.Test { name: "exhausted_bytes_yield_zero", run: test_exhausted_bytes_yield_zero }
+        testing.Test { name: "range_is_inclusive", run: test_range_is_inclusive }
+        testing.Test { name: "generate_is_deterministic", run: test_generate_is_deterministic }
+        testing.Test { name: "generate_from_bytes", run: test_generate_from_bytes }
+        testing.Test { name: "generated_programs_terminate_within_budget", run: test_generated_programs_terminate_within_budget }
+        testing.Test { name: "panics_disabled_avoids_raw_divisors", run: test_panics_disabled_avoids_raw_divisors }
+        testing.Test { name: "run_arithmetic", run: test_run_arithmetic }
+        testing.Test { name: "run_float", run: test_run_float }
+        testing.Test { name: "run_divide_by_zero_panics", run: test_run_divide_by_zero_panics }
+        testing.Test { name: "run_labelled_jump", run: test_run_labelled_jump }
+        testing.Test { name: "run_budget", run: test_run_budget }
+        testing.Test { name: "run_undefined_float_conversion", run: test_run_undefined_float_conversion }
+        testing.Test { name: "print_literals", run: test_print_literals }
+        testing.Test { name: "print_sibling_typing", run: test_print_sibling_typing }
+        testing.Test { name: "print_labels", run: test_print_labels }
+        testing.Test { name: "reduce_keeps_the_triggering_construct", run: test_reduce_keeps_the_triggering_construct }
+        testing.Test { name: "reduce_preserves_observed_output", run: test_reduce_preserves_observed_output }
+        testing.Test { name: "reduce_honours_test_budget", run: test_reduce_honours_test_budget }
+        testing.Test { name: "removed_parameters_leave_calls_consistent", run: test_removed_parameters_leave_calls_consistent }
+        testing.Test { name: "reduce_stops_on_cancel", run: test_reduce_stops_on_cancel }
+        testing.Test { name: "clone_is_deep", run: test_clone_is_deep }
+        testing.Test { name: "check_accepts_matching_outcome", run: test_check_accepts_matching_outcome }
+        testing.Test { name: "check_reports_reference_mismatch", run: test_check_reports_reference_mismatch }
+        testing.Test { name: "check_reports_rejected_program", run: test_check_reports_rejected_program }
+        testing.Test { name: "check_reports_compiler_crash", run: test_check_reports_compiler_crash }
+        testing.Test { name: "check_reports_runaway_program", run: test_check_reports_runaway_program }
+        testing.Test { name: "signature_ignores_numbers", run: test_signature_ignores_numbers }
+        testing.Test { name: "write_produces_run_fixture", run: test_write_produces_run_fixture }
+        testing.Test { name: "written_fixture_reads_back_through_the_runner_format", run: test_written_fixture_reads_back_through_the_runner_format }
+        testing.Test { name: "write_omits_empty_expectations", run: test_write_omits_empty_expectations }
+        testing.Test { name: "name_follows_content", run: test_name_follows_content }
+        testing.Test { name: "write_reports_unwritable_directory", run: test_write_reports_unwritable_directory }
+    ])
+}

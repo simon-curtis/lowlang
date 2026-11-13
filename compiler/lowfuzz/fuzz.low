@@ -1,0 +1,123 @@
+import fuzz/corpus
+import fuzz/choice
+import fuzz/gen
+import fuzz/model
+import fuzz/oracle
+import fuzz/reduce
+import std/atomic
+import std/cancel
+import std/sync
+
+struct Fuzzer {
+    settings: Settings
+    cfg: gen.Config
+    runner: oracle.Runner
+    report: *Report
+}
+
+fn new_fuzzer(s: Settings, executable: str) -> *Fuzzer {
+    var cfg = gen.default_config()
+    cfg.panics = s.panics
+    let runner = oracle.Runner { timeout_ms: s.timeout_ms, executable }
+    let report = new_report(s.dir)
+    new(Fuzzer { settings: s, cfg, runner, report })
+}
+
+fn run(f: *Fuzzer, ctx: *cancel.Token) {
+    let next = atomic.int(0)
+    let group = sync.wait_group()
+    for _ in 0..f.settings.workers {
+        sync.add(group, 1)
+        spawn worker(f, ctx, next, group)
+    }
+    sync.wait(group)
+}
+
+fn worker(f: *Fuzzer, ctx: *cancel.Token, next: atomic.Int, group: sync.WaitGroup) {
+    for !cancel.cancelled(ctx) {
+        let n = atomic.add_int(next, 1) - 1
+        if f.settings.cases > 0 && n >= f.settings.cases {
+            break
+        }
+        run_case(f, ctx, f.settings.seed + n)
+    }
+    sync.done(group)
+}
+
+fn run_case(f: *Fuzzer, ctx: *cancel.Token, seed: i64) {
+    let src = choice.from_seed(seed)
+    let program = gen.generate(src, f.cfg)
+    let source = model.to_string(program)
+    let outcome = model.run(program, f.settings.budget) catch {
+        Budget => {
+            case_skipped(f.report)
+            return
+        }
+        Undefined => {
+            let detail = model.failure_message(model.Failure.Undefined)
+            let finding = oracle.Finding { class: oracle.class_generator, detail, source }
+            claim_all(f, ctx, seed, program, [finding])
+            return
+        }
+    }
+    let findings = oracle.check(f.runner, ctx, source, outcome)
+    if cancel.cancelled(ctx) {
+        return
+    }
+    case_ran(f.report)
+    claim_all(f, ctx, seed, program, findings)
+}
+
+fn claim_all(f: *Fuzzer, ctx: *cancel.Token, seed: i64, program: *model.Program, findings: []oracle.Finding) {
+    for finding in findings {
+        if claim(f.report, oracle.signature(finding)) {
+            handle(f, ctx, seed, program, finding)
+        }
+    }
+}
+
+fn reducible(finding: oracle.Finding) -> bool {
+    finding.class != oracle.class_generator && finding.class != oracle.class_harness
+}
+
+fn handle(f: *Fuzzer, ctx: *cancel.Token, seed: i64, program: *model.Program, finding: oracle.Finding) {
+    let signature = oracle.signature(finding)
+    var reduced = program
+    if f.settings.reduce && reducible(finding) {
+        let keep = oracle.reproduces(f.runner, signature, f.settings.budget)
+        let reducer = reduce.new_reducer(keep, f.settings.workers, f.settings.reduce_tests)
+        reduced = reduce.reduce(reducer, ctx, program)
+    }
+    let location = saved(f, seed, finding.class, reduced)
+    let before = model.to_string(program).len
+    let after = model.to_string(reduced).len
+    announce(f.report, "seed {seed}: {signature}\n  {before} -> {after} bytes, {location}")
+    write_fixture(f, reduced)
+}
+
+fn saved(f: *Fuzzer, seed: i64, class: str, program: *model.Program) -> str {
+    let source = model.to_string(program)
+    save(f.report, seed, class, source) catch {
+        e => return "not saved: {save_message(e)}"
+    }
+}
+
+fn write_fixture(f: *Fuzzer, program: *model.Program) {
+    if f.settings.fixtures == "" {
+        return
+    }
+    let outcome = model.run(program, f.settings.budget) catch {
+        e => {
+            announce(f.report, "  fixture: {model.failure_message(e)}")
+            return
+        }
+    }
+    let fixture = corpus.from_program(program, outcome)
+    let path = corpus.write(fixture, f.settings.fixtures) catch {
+        e => {
+            announce(f.report, "  fixture: {corpus.message(e)}")
+            return
+        }
+    }
+    announce(f.report, "  fixture {path}")
+}

@@ -1,0 +1,493 @@
+import std/builder
+
+pub enum Failure {
+    Budget
+    Undefined
+}
+
+pub fn failure_message(f: Failure) -> str {
+    match f {
+        Budget => "step budget exhausted"
+        Undefined => "program has undefined behaviour"
+    }
+}
+
+enum Halt {
+    Trap(message: str)
+    Budget
+    Undefined
+}
+
+struct Value {
+    bits: u64 = 0
+    float: f64 = 0.0
+}
+
+pub struct Outcome {
+    pub stdout: str = ""
+    pub panic_message: str = ""
+}
+
+pub fn exit_code(o: Outcome) -> i64 {
+    if o.panic_message != "" {
+        return 2
+    }
+    0
+}
+
+pub fn stderr(o: Outcome) -> str {
+    if o.panic_message == "" {
+        return ""
+    }
+    "panic: {o.panic_message}\n"
+}
+
+enum Signal {
+    FlowNone
+    FlowBreak
+    FlowContinue
+    FlowReturn
+}
+
+struct Flow {
+    signal: Signal
+    target: i64 = 0
+    value: Value = Value {}
+}
+
+struct LoopStep {
+    exit: bool
+    result: Flow
+}
+
+struct Frame {
+    vars: [str: Value]
+}
+
+struct Interpreter {
+    funcs: [str: *Func]
+    out: builder.Builder
+    steps: i64
+    budget: i64
+}
+
+pub fn run(p: *Program, budget: i64) -> Outcome ! Failure {
+    var funcs: [str: *Func] = [:]
+    for f in p.funcs {
+        funcs[f.name] = f
+    }
+    let out = builder.builder()
+    let ip = new(Interpreter { funcs, out, steps: 0, budget })
+    let f = new(Frame { vars: [:] })
+    block(ip, p.main, f) catch {
+        Trap(message) => return Outcome { stdout: ip.out.to_str(), panic_message: message }
+        Budget => fail Failure.Budget
+        Undefined => fail Failure.Undefined
+    }
+    Outcome { stdout: ip.out.to_str() }
+}
+
+fn flow_none() -> Flow {
+    Flow { signal: Signal.FlowNone }
+}
+
+fn tick(ip: *Interpreter) ! Halt {
+    ip.steps += 1
+    if ip.steps > ip.budget {
+        fail Budget
+    }
+}
+
+fn block(ip: *Interpreter, stmts: []Stmt, f: *Frame) -> Flow ! Halt {
+    for s in stmts {
+        let fl = stmt(ip, s, f)?
+        if fl.signal != Signal.FlowNone {
+            return fl
+        }
+    }
+    flow_none()
+}
+
+fn stmt(ip: *Interpreter, s: Stmt, f: *Frame) -> Flow ! Halt {
+    tick(ip)?
+    match s {
+        Let(n) => {
+            let v = eval(ip, n.init, f)?
+            f.vars[n.name] = v
+            flow_none()
+        }
+        Assign(n) => {
+            assign(ip, n, f)?
+            flow_none()
+        }
+        IfStmt(n) => {
+            let cond = eval(ip, n.cond, f)?
+            if cond.bits != 0 {
+                return block(ip, n.then, f)
+            }
+            block(ip, n.otherwise, f)?
+        }
+        Range(n) => range_loop(ip, n, f)?
+        While(n) => while_loop(ip, n, f)?
+        Jump(n) => jump_flow(n)
+        Return(n) => {
+            let v = eval(ip, n.value, f)?
+            Flow { signal: Signal.FlowReturn, value: v }
+        }
+        Print(n) => {
+            let v = eval(ip, n.value, f)?
+            print_value(ip, expr_type(n.value), v)
+            flow_none()
+        }
+    }
+}
+
+fn jump_flow(s: *Jump) -> Flow {
+    if s.is_continue {
+        return Flow { signal: Signal.FlowContinue, target: s.target }
+    }
+    Flow { signal: Signal.FlowBreak, target: s.target }
+}
+
+fn assign(ip: *Interpreter, s: *Assign, f: *Frame) ! Halt {
+    let value = eval(ip, s.value, f)?
+    if s.op == Op.Set {
+        f.vars[s.name] = value
+        return
+    }
+    let current = f.vars[s.name] ?? Value {}
+    let updated = binary(s.op, s.kind, expr_type(s.value), current, value)?
+    f.vars[s.name] = updated
+}
+
+fn print_value(ip: *Interpreter, kind: Kind, v: Value) {
+    if kind == Kind.Bool {
+        ip.out.write(if v.bits != 0 { "true" } else { "false" })
+    } else if signed(kind) {
+        ip.out.write("{extend(kind, v.bits)}")
+    } else {
+        ip.out.write("{v.bits}")
+    }
+    ip.out.write("\n")
+}
+
+fn loop_flow(fl: Flow, id: i64) -> LoopStep {
+    match fl.signal {
+        FlowNone => return LoopStep { exit: false, result: flow_none() }
+        FlowReturn => return LoopStep { exit: true, result: fl }
+        _ => {}
+    }
+    if fl.target != id {
+        return LoopStep { exit: true, result: fl }
+    }
+    LoopStep { exit: fl.signal == Signal.FlowBreak, result: flow_none() }
+}
+
+fn range_loop(ip: *Interpreter, s: *Range, f: *Frame) -> Flow ! Halt {
+    let lo = eval(ip, s.lo, f)?
+    let hi = eval(ip, s.hi, f)?
+    var cur = lo.bits
+    for less(s.kind, cur, hi.bits) {
+        tick(ip)?
+        f.vars[s.variable] = Value { bits: cur }
+        let fl = block(ip, s.body, f)?
+        let step = loop_flow(fl, s.id)
+        if step.exit {
+            return step.result
+        }
+        cur = wrap(s.kind, cur + 1)
+    }
+    flow_none()
+}
+
+fn while_holds(ip: *Interpreter, cond: Expr?, f: *Frame) -> bool ! Halt {
+    match cond {
+        some(c) => {
+            let v = eval(ip, c, f)?
+            v.bits != 0
+        }
+        none => true
+    }
+}
+
+fn while_loop(ip: *Interpreter, s: *While, f: *Frame) -> Flow ! Halt {
+    var counter = 0
+    for counter < s.bound {
+        if !while_holds(ip, s.cond, f)? {
+            break
+        }
+        tick(ip)?
+        counter += 1
+        let fl = block(ip, s.body, f)?
+        let step = loop_flow(fl, s.id)
+        if step.exit {
+            return step.result
+        }
+    }
+    flow_none()
+}
+
+fn less(k: Kind, a: u64, b: u64) -> bool {
+    if signed(k) {
+        return extend(k, a) < extend(k, b)
+    }
+    a < b
+}
+
+fn eval(ip: *Interpreter, e: Expr, f: *Frame) -> Value ! Halt {
+    tick(ip)?
+    match e {
+        Lit(n) => Value { bits: wrap(n.kind, n.bits), float: round_to(n.kind, n.float) }
+        Var(n) => f.vars[n.name] ?? Value {}
+        Unary(n) => unary(ip, n, f)?
+        Binary(n) => binary_expr(ip, n, f)?
+        Convert(n) => {
+            let x = eval(ip, n.x, f)?
+            convert(expr_type(n.x), n.to, x)?
+        }
+        IfExpr(n) => {
+            let cond = eval(ip, n.cond, f)?
+            if cond.bits != 0 {
+                return eval(ip, n.then, f)
+            }
+            eval(ip, n.otherwise, f)?
+        }
+        Call(n) => call(ip, n, f)?
+        Math(n) => math_expr(ip, n, f)?
+    }
+}
+
+fn unary(ip: *Interpreter, e: *Unary, f: *Frame) -> Value ! Halt {
+    let x = eval(ip, e.x, f)?
+    let k = expr_type(e.x)
+    if e.op == Op.Not {
+        return Value { bits: x.bits ^ 1 }
+    }
+    if e.op == Op.Neg && is_float(k) {
+        return Value { float: -x.float }
+    }
+    if e.op == Op.Neg {
+        return Value { bits: wrap(k, -x.bits) }
+    }
+    Value { bits: wrap(k, ~x.bits) }
+}
+
+fn binary_expr(ip: *Interpreter, e: *Binary, f: *Frame) -> Value ! Halt {
+    let l = eval(ip, e.l, f)?
+    match e.op {
+        LogAnd => {
+            if l.bits == 0 {
+                return l
+            }
+            return eval(ip, e.r, f)
+        }
+        LogOr => {
+            if l.bits != 0 {
+                return l
+            }
+            return eval(ip, e.r, f)
+        }
+        _ => {}
+    }
+    let r = eval(ip, e.r, f)?
+    if is_compare(e.op) {
+        return compare(e.op, expr_type(e.l), l, r)
+    }
+    binary(e.op, expr_type(e.l), expr_type(e.r), l, r)
+}
+
+fn bool_value(b: bool) -> Value {
+    if b {
+        return Value { bits: 1 }
+    }
+    Value {}
+}
+
+fn compare(op: Op, k: Kind, l: Value, r: Value) -> Value {
+    if is_float(k) {
+        return bool_value(compare_ordered(op, l.float, r.float))
+    }
+    if signed(k) {
+        return bool_value(compare_ordered(op, extend(k, l.bits), extend(k, r.bits)))
+    }
+    bool_value(compare_ordered(op, l.bits, r.bits))
+}
+
+fn compare_ordered[T: Ord](op: Op, a: T, b: T) -> bool {
+    match op {
+        Eq => a == b
+        Ne => a != b
+        Lt => a < b
+        Le => a <= b
+        Gt => a > b
+        _ => a >= b
+    }
+}
+
+fn binary(op: Op, k: Kind, rk: Kind, l: Value, r: Value) -> Value ! Halt {
+    if is_float(k) {
+        return float_arith(op, k, l.float, r.float)
+    }
+    if is_shift(op) {
+        return Value { bits: shift(op, k, rk, l.bits, r.bits) }
+    }
+    let bits = int_arith(op, k, l.bits, r.bits)?
+    Value { bits }
+}
+
+fn round_to(k: Kind, v: f64) -> f64 {
+    if k == Kind.F32 {
+        return f64(f32(v))
+    }
+    v
+}
+
+fn float_arith(op: Op, k: Kind, a: f64, b: f64) -> Value {
+    let v = match op {
+        Add => a + b
+        Sub => a - b
+        Mul => a * b
+        _ => a / b
+    }
+    Value { float: round_to(k, v) }
+}
+
+fn int_arith(op: Op, k: Kind, a: u64, b: u64) -> u64 ! Halt {
+    match op {
+        Add => return wrap(k, a + b)
+        Sub => return wrap(k, a - b)
+        Mul => return wrap(k, a * b)
+        And => return a & b
+        Or => return a | b
+        Xor => return a ^ b
+        _ => {}
+    }
+    if b == 0 {
+        fail Trap("integer divide by zero")
+    }
+    divide(op, k, a, b)
+}
+
+fn divide(op: Op, k: Kind, a: u64, b: u64) -> u64 {
+    if !signed(k) {
+        if op == Op.Div {
+            return a / b
+        }
+        return a % b
+    }
+    let x = extend(k, a)
+    let y = extend(k, b)
+    if y == -1 {
+        if op == Op.Div {
+            return wrap(k, u64(-x))
+        }
+        return 0
+    }
+    if op == Op.Div {
+        return wrap(k, u64(x / y))
+    }
+    wrap(k, u64(x % y))
+}
+
+fn shift(op: Op, k: Kind, ck: Kind, a: u64, count: u64) -> u64 {
+    var n = wrap(ck, count)
+    let huge = n >= 64 || (signed(ck) && extend(ck, count) < 0)
+    if op == Op.Shl {
+        if huge || i64(n) >= bits(k) {
+            return 0
+        }
+        return wrap(k, a << n)
+    }
+    if signed(k) {
+        if huge {
+            n = 63
+        }
+        return wrap(k, u64(extend(k, a) >> n))
+    }
+    if huge || i64(n) >= bits(k) {
+        return 0
+    }
+    a >> n
+}
+
+fn convert(from: Kind, to: Kind, v: Value) -> Value ! Halt {
+    if is_int(from) && is_int(to) {
+        return Value { bits: wrap(to, u64(extend(from, v.bits))) }
+    }
+    if is_int(from) {
+        return Value { float: int_to_float(from, to, v.bits) }
+    }
+    if is_int(to) {
+        let bits = float_to_int(to, v.float)?
+        return Value { bits }
+    }
+    Value { float: round_to(to, v.float) }
+}
+
+fn int_to_float(from: Kind, to: Kind, bits: u64) -> f64 {
+    if signed(from) {
+        if to == Kind.F32 {
+            return f64(f32(extend(from, bits)))
+        }
+        return f64(extend(from, bits))
+    }
+    if to == Kind.F32 {
+        return f64(f32(bits))
+    }
+    f64(bits)
+}
+
+pub fn exp2(n: i64) -> f64 {
+    var v = 1.0
+    for _ in 0..n {
+        v *= 2.0
+    }
+    v
+}
+
+fn truncate_float(v: f64) -> f64 {
+    if v < 0.0 {
+        return -floor(-v)
+    }
+    floor(v)
+}
+
+fn float_to_int(to: Kind, v: f64) -> u64 ! Halt {
+    let t = truncate_float(v)
+    let width = bits(to)
+    var lo = 0.0
+    var hi = exp2(width)
+    if signed(to) {
+        lo = -exp2(width - 1)
+        hi = exp2(width - 1)
+    }
+    if t != t || t < lo || t >= hi {
+        fail Undefined
+    }
+    if signed(to) {
+        return wrap(to, u64(i64(t)))
+    }
+    u64(t)
+}
+
+fn call(ip: *Interpreter, e: *Call, f: *Frame) -> Value ! Halt {
+    let callee = ip.funcs[e.callee] ?? panic("call of an unknown function")
+    let call_frame = new(Frame { vars: [:] })
+    for i, p in callee.params {
+        let arg = eval(ip, e.args[i], f)?
+        call_frame.vars[p.name] = arg
+    }
+    let fl = block(ip, callee.body, call_frame)?
+    if fl.signal == Signal.FlowReturn {
+        return fl.value
+    }
+    eval(ip, callee.tail, call_frame)?
+}
+
+fn math_expr(ip: *Interpreter, e: *Math, f: *Frame) -> Value ! Halt {
+    let x = eval(ip, e.x, f)?
+    if e.op == MathOp.Floor {
+        return Value { float: floor(x.float) }
+    }
+    Value { float: round_to(expr_type(e.x), sqrt(x.float)) }
+}

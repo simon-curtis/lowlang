@@ -1,0 +1,193 @@
+import emit
+import std/file
+import std/flag
+import std/os
+import std/os/signal
+import std/process
+import std/slices
+import std/text
+import std/time/duration
+
+enum Failure {
+    Usage(message: str)
+    Failed(message: str)
+}
+
+struct Config {
+    runs: i64
+    only: []str
+    langs: []str
+    low: str
+    timeout_ms: i64
+}
+
+fn flags() -> []emit.Flag {
+    [
+        emit.Flag { name: "langs", kind: "string", help: "comma-separated languages to compare", default_text: "\"low,bun\"" }
+        emit.Flag { name: "low", kind: "string", help: "prebuilt low compiler; the low on PATH when empty" }
+        emit.Flag { name: "only", kind: "string", help: "comma-separated benchmarks to run" }
+        emit.Flag { name: "runs", kind: "int", help: "timed runs per program", default_text: "5" }
+        emit.Flag { name: "timeout", kind: "duration", help: "limit for each build", default_text: "2m0s" }
+    ]
+}
+
+fn flag_specs() -> []flag.Spec {
+    [
+        flag.Spec { name: "runs", fallback: "5" }
+        flag.Spec { name: "only" }
+        flag.Spec { name: "langs", fallback: "low,bun" }
+        flag.Spec { name: "low" }
+        flag.Spec { name: "timeout", fallback: "2m" }
+    ]
+}
+
+fn main() {
+    run_command(os.args()[1..]) catch {
+        Usage(message) => {
+            emit.eprint(message)
+            os.exit(2)
+        }
+        Failed(message) => {
+            emit.eprint("bench: {message}")
+            os.exit(1)
+        }
+    }
+}
+
+fn run_command(arguments: []str) ! Failure {
+    let config = parse_config(arguments)?
+    run(config) catch {
+        Failed(message) => fail Failed(message)
+    }
+}
+
+fn parse_config(arguments: []str) -> Config ! Failure {
+    let program = os.args()[0]
+    let declared = flags()
+    let parsed = flag.parse(flag_specs(), arguments) catch {
+        e => fail Usage(emit.typed_flag_failure(program, declared, e))
+    }
+    let runs = flag.number(parsed, "runs") catch {
+        e => fail Usage(emit.typed_flag_failure(program, declared, e))
+    }
+    let spelled = flag.get(parsed, "timeout")
+    let limit = duration.parse(spelled) catch {
+        _ => fail Usage(emit.typed_flag_failure(program, flags(), Invalid("timeout", spelled)))
+    }
+    Config {
+        runs
+        only: split(flag.get(parsed, "only"))
+        langs: split(flag.get(parsed, "langs"))
+        low: flag.get(parsed, "low")
+        timeout_ms: duration.ceil_millis(limit)
+    }
+}
+
+fn split(list: str) -> []str {
+    var items: []str = []
+    for item in text.split(list, ',') {
+        let trimmed = text.trim(item)
+        if trimmed != "" {
+            push(mut items, trimmed)
+        }
+    }
+    items
+}
+
+fn run(config: Config) ! Error {
+    if config.runs < 1 {
+        fail Failed("-runs must be at least 1")
+    }
+    let root = os.getcwd() catch {
+        e => fail Failed(emit.io_message(e))
+    }
+    let benchmarks = discover(file.child_path(root, "bench"), config.only)?
+    let work = file.temp_dir("low-bench-") catch {
+        e => fail Failed(emit.io_message(e))
+    }
+    defer file.remove_all(work) or {}
+    let s = new(Suite { root, work, runs: config.runs, timeout_ms: config.timeout_ms, cancelled: false })
+    watch_interrupt(s)
+    let languages = prepare(s, config)?
+    let results = measure(s, benchmarks, languages)
+    if s.cancelled {
+        fail Failed("context canceled")
+    }
+    report(benchmarks, languages, results)
+}
+
+fn watch_interrupt(s: *Suite) {
+    let handle = signal.notify_handle([Interrupt]) or {
+        return
+    }
+    spawn wait_interrupt(handle, s)
+}
+
+fn wait_interrupt(handle: signal.WatchHandle, s: *Suite) {
+    signal.wait_for_on(handle) or {
+        return
+    }
+    s.cancelled = true
+}
+
+fn discover(dir: str, only: []str) -> []str ! Error {
+    let entries = file.read_dir_info(dir) catch {
+        e => fail Failed("open {dir}: {emit.io_message(e)}")
+    }
+    var names: []str = []
+    for e in entries {
+        if e.dir && (only.len == 0 || slices.contains(only, e.name)) {
+            push(mut names, e.name)
+        }
+    }
+    slices.sort(mut names)
+    for name in only {
+        if !slices.contains(names, name) {
+            fail Failed("no benchmark {text.quote(name)} in {dir}")
+        }
+    }
+    if names.len == 0 {
+        fail Failed("no benchmarks in {dir}")
+    }
+    names
+}
+
+fn prepare(s: *Suite, config: Config) -> []Language ! Error {
+    var languages: []Language = []
+    for name in config.langs {
+        let lang = language(s, name, config.low) catch {
+            Failed(message) => fail Failed("{name}: {message}")
+        }
+        push(mut languages, lang)
+    }
+    languages
+}
+
+fn language(s: *Suite, name: str, low: str) -> Language ! Error {
+    if name == "low" {
+        let compiler = low_compiler(low)?
+        return Language { name, source: "main.low", build: build_low(s, compiler) }
+    }
+    if name == "bun" {
+        let bun = process.find("bun") ?? fail Failed("exec: \"bun\": executable file not found in $PATH")
+        return Language { name, source: "main.ts", build: build_bun(s, bun) }
+    }
+    fail Failed("unknown language; expected low or bun")
+}
+
+fn low_compiler(prebuilt: str) -> str ! Error {
+    if prebuilt != "" {
+        return absolute(prebuilt)?
+    }
+    process.find("low") ?? fail Failed("exec: \"low\": executable file not found in $PATH; pass -low")
+}
+
+fn absolute(path: str) -> str ! Error {
+    if text.starts_with(path, "/") {
+        return path
+    }
+    let cwd = os.getcwd() catch {
+        e => fail Failed(emit.io_message(e))
+    }
+    file.child_path(cwd, path)
+}

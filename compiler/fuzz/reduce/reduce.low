@@ -1,0 +1,137 @@
+import fuzz/model
+import std/cancel
+import std/math
+import std/sync
+
+pub struct Reducer {
+    pub keep: fn(*cancel.Token, *model.Program) -> bool
+    pub workers: i64
+    pub max_tests: i64
+    mu: sync.Mutex
+    cache: [str: bool]
+    tests: i64
+}
+
+struct PassResult {
+    program: *model.Program
+    improved: bool
+}
+
+pub fn new_reducer(keep: fn(*cancel.Token, *model.Program) -> bool, workers: i64, max_tests: i64) -> *Reducer {
+    let mu = sync.mutex()
+    new(Reducer { keep, workers, max_tests, mu, cache: [:], tests: 0 })
+}
+
+pub fn reduce(r: *Reducer, ctx: *cancel.Token, p: *model.Program) -> *model.Program {
+    r.cache = [:]
+    var current = model.clone_program(p)
+    var progress = true
+    for progress && live(r, ctx) {
+        progress = false
+        for ps in passes() {
+            let result = run_pass(r, ctx, current, ps)
+            current = result.program
+            progress = progress || result.improved
+        }
+    }
+    current
+}
+
+fn live(r: *Reducer, ctx: *cancel.Token) -> bool {
+    sync.lock(r.mu)
+    let alive = !cancel.cancelled(ctx) && (r.max_tests <= 0 || r.tests < r.max_tests)
+    sync.unlock(r.mu)
+    alive
+}
+
+fn sites(p: *model.Program, ps: fn(*model.Program, *Walker)) -> i64 {
+    let w = counting()
+    ps(p, w)
+    w.seen
+}
+
+fn candidate(p: *model.Program, ps: fn(*model.Program, *Walker), index: i64) -> *model.Program {
+    let c = model.clone_program(p)
+    let w = new(Walker { target: index, seen: 0 })
+    ps(c, w)
+    c
+}
+
+fn first_kept(kept: []bool) -> i64 {
+    for j, ok in kept {
+        if ok {
+            return j
+        }
+    }
+    -1
+}
+
+fn run_pass(r: *Reducer, ctx: *cancel.Token, start: *model.Program, ps: fn(*model.Program, *Walker)) -> PassResult {
+    var current = start
+    var improved = false
+    var count = sites(current, ps)
+    var i = 0
+    for i < count && live(r, ctx) {
+        let batch = math.min(math.max(r.workers, 1), count - i)
+        var cands: []*model.Program = []
+        for j in 0..batch {
+            push(mut cands, candidate(current, ps, i + j))
+        }
+        let kept = test(r, ctx, cands)
+        let first = first_kept(kept)
+        if first < 0 {
+            i += batch
+            continue
+        }
+        current = cands[first]
+        improved = true
+        count = sites(current, ps)
+        i += first
+    }
+    PassResult { program: current, improved }
+}
+
+fn test(r: *Reducer, ctx: *cancel.Token, cands: []*model.Program) -> []bool {
+    var results: []bool = []
+    for _ in cands {
+        push(mut results, false)
+    }
+    let group = sync.wait_group()
+    for i, c in cands {
+        sync.add(group, 1)
+        spawn accept_into(r, ctx, c, results, i, group)
+    }
+    sync.wait(group)
+    results
+}
+
+fn accept_into(r: *Reducer, ctx: *cancel.Token, c: *model.Program, results: []bool, index: i64, group: sync.WaitGroup) {
+    results[index] = accept(r, ctx, c)
+    sync.done(group)
+}
+
+fn accept(r: *Reducer, ctx: *cancel.Token, c: *model.Program) -> bool {
+    let key = model.to_string(c)
+    sync.lock(r.mu)
+    match r.cache[key] {
+        some(known) => {
+            sync.unlock(r.mu)
+            return known
+        }
+        none => {}
+    }
+    if r.max_tests > 0 && r.tests >= r.max_tests {
+        sync.unlock(r.mu)
+        return false
+    }
+    r.tests += 1
+    sync.unlock(r.mu)
+    let kept = r.keep(ctx, c)
+    if cancel.cancelled(ctx) {
+        return false
+    }
+    sync.lock(r.mu)
+    r.cache[key] = kept
+    sync.unlock(r.mu)
+    kept
+}

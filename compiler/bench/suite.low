@@ -1,0 +1,288 @@
+import emit
+import peakrss
+import std/file
+import std/io
+import std/os/signal
+import std/path
+import std/process
+import std/text
+import std/time
+
+const ticks_nanos = 10000000
+
+enum Error {
+    Failed(message: str)
+}
+
+struct Suite {
+    root: str
+    work: str
+    runs: i64
+    timeout_ms: i64
+    cancelled: bool
+}
+
+struct Language {
+    name: str
+    source: str
+    build: fn(str, str) ! Error
+}
+
+struct Sample {
+    wall: i64
+    cpu: i64
+    rss: i64
+}
+
+struct Entry {
+    build: i64
+    size: i64
+    samples: []Sample
+    message: str
+}
+
+struct Compiled {
+    entry: *Entry
+    binary: str
+}
+
+struct Executed {
+    sample: Sample
+    output: str
+}
+
+struct Reference {
+    output: str
+    language: str
+}
+
+struct Collected {
+    data: []u8
+    done: chan[bool]
+}
+
+struct Watchdog {
+    finished: chan[bool]
+    expired: bool
+}
+
+fn failed_entry(message: str) -> *Entry {
+    new(Entry { build: 0, size: 0, samples: [], message })
+}
+
+fn result_key(bench: str, lang: str) -> str {
+    "{bench}\t{lang}"
+}
+
+fn exit_text(status: process.Exit) -> str {
+    match status {
+        Exited(code) => "exit status {code}"
+        Signaled(signal) => "signal: {signal}"
+    }
+}
+
+fn collect(stream: io.Stream, into: *Collected) {
+    let buffer = io.buffer(65536)
+    for {
+        let n = stream.read(buffer) or break
+        if n == 0 {
+            break
+        }
+        io.append(mut into.data, buffer[..n])
+    }
+    stream.close()
+    into.done <- true
+}
+
+fn collect_from(stream: io.Stream?, into: *Collected) {
+    match stream {
+        some(s) => {
+            spawn collect(s, into)
+        }
+        none => {
+            into.done <- true
+        }
+    }
+}
+
+fn limit(handle: *process.ChildHandle, guard: *Watchdog, limit_ms: i64) {
+    let completed = select {
+        <-guard.finished => true
+        after(limit_ms) => false
+    }
+    if !completed {
+        guard.expired = true
+        process.kill_on(handle, signal.Signal.Kill) or {}
+    }
+}
+
+fn command(s: *Suite, dir: str, program: str, args: []str) ! Error {
+    var c = process.command(program, args)
+    c.dir = dir
+    c.stdout = Piped
+    c.stderr = Piped
+    using child = process.start(c) catch {
+        NotFound => fail Failed("exec: \"{program}\": executable file not found in $PATH")
+        e => fail Failed("{program}: {emit.io_message(e)}")
+    }
+    let out_done = chan[bool](1)
+    let err_done = chan[bool](1)
+    let out = new(Collected { data: [], done: out_done })
+    let err = new(Collected { data: [], done: err_done })
+    collect_from(child.handle.stdout, out)
+    collect_from(child.handle.stderr, err)
+    let finished = chan[bool]()
+    let guard = new(Watchdog { finished, expired: false })
+    spawn limit(child.handle, guard, s.timeout_ms)
+    let status = process.wait_on(child.handle) catch {
+        e => {
+            close(guard.finished)
+            fail Failed("{program}: {emit.io_message(e)}")
+        }
+    }
+    close(guard.finished)
+    <-out.done
+    <-err.done
+    if guard.expired {
+        fail Failed("{program} {text.join(args, " ")}: signal: killed")
+    }
+    if !process.success(status) {
+        let output = text.trim("{str(out.data)}{str(err.data)}")
+        fail Failed("{program} {text.join(args, " ")}: {exit_text(status)}\n{output}")
+    }
+}
+
+fn build_low(s: *Suite, compiler: str) -> fn(str, str) ! Error {
+    fn(source: str, output: str) ! Error {
+        command(s, s.work, compiler, ["build", source, "-o", output])?
+    }
+}
+
+fn build_bun(s: *Suite, bun: str) -> fn(str, str) ! Error {
+    fn(source: str, output: str) ! Error {
+        command(s, s.work, bun, ["build", "--compile", "--minify", source, "--outfile", output])?
+    }
+}
+
+fn measure(s: *Suite, benchmarks: []str, languages: []Language) -> [str: *Entry] {
+    let results: [str: *Entry] = [:]
+    for bench in benchmarks {
+        if s.cancelled {
+            break
+        }
+        measure_benchmark(s, bench, languages, results)
+    }
+    results
+}
+
+fn measure_benchmark(s: *Suite, bench: str, languages: []Language, results: [str: *Entry]) {
+    let binaries: [str: str] = [:]
+    for lang in languages {
+        let compiled = compile(s, bench, lang)
+        results[result_key(bench, lang.name)] = compiled.entry
+        binaries[lang.name] = compiled.binary
+    }
+    verify(s, bench, languages, results, binaries)
+    for run in 0..s.runs {
+        if s.cancelled {
+            break
+        }
+        emit.eprint("{bench}: run {run + 1}/{s.runs}")
+        sample_all(s, bench, languages, results, binaries)
+    }
+}
+
+fn compile(s: *Suite, bench: str, lang: Language) -> Compiled {
+    let source = path.join([s.root, "bench", bench, lang.source])
+    file.stat(source) catch {
+        e => return Compiled { entry: failed_entry("stat {source}: {emit.io_message(e)}"), binary: "" }
+    }
+    let binary = file.child_path(s.work, "{bench}-{lang.name}")
+    emit.eprint("{bench}: building {lang.name}")
+    let start = time.monotonic()
+    let build = lang.build
+    build(source, binary) catch {
+        Failed(message) => return Compiled { entry: failed_entry(message), binary: "" }
+    }
+    let elapsed = time.monotonic() - start
+    let info = file.stat(binary) catch {
+        e => return Compiled { entry: failed_entry("stat {binary}: {emit.io_message(e)}"), binary: "" }
+    }
+    let entry = new(Entry { build: elapsed, size: info.size, samples: [], message: "" })
+    Compiled { entry, binary }
+}
+
+fn verify(s: *Suite, bench: str, languages: []Language, results: [str: *Entry], binaries: [str: str]) {
+    var reference = Reference { output: "", language: "" }
+    for lang in languages {
+        let e = results[result_key(bench, lang.name)] ?? failed_entry("missing")
+        if e.message != "" {
+            continue
+        }
+        let binary = binaries[lang.name] ?? ""
+        let executed = execute(s, binary) catch {
+            Failed(message) => {
+                e.message = message
+                continue
+            }
+        }
+        if reference.language == "" {
+            reference = Reference { output: executed.output, language: lang.name }
+            continue
+        }
+        if executed.output != reference.output {
+            e.message = "output differs from {reference.language}:\n{executed.output}"
+        }
+    }
+}
+
+fn sample_all(s: *Suite, bench: str, languages: []Language, results: [str: *Entry], binaries: [str: str]) {
+    for lang in languages {
+        let e = results[result_key(bench, lang.name)] ?? failed_entry("missing")
+        if e.message != "" {
+            continue
+        }
+        let binary = binaries[lang.name] ?? ""
+        let executed = execute(s, binary) catch {
+            Failed(message) => {
+                e.message = message
+                continue
+            }
+        }
+        push(mut e.samples, executed.sample)
+    }
+}
+
+fn children_ticks() -> i64 {
+    let stat = file.read_text("/proc/self/stat") or {
+        return 0
+    }
+    let cut = text.last_cut(stat, ")")
+    let fields = text.fields(cut.after)
+    if fields.len < 15 {
+        return 0
+    }
+    let user = text.parse_int(fields[13]) or 0
+    let system = text.parse_int(fields[14]) or 0
+    user + system
+}
+
+fn execute(s: *Suite, binary: str) -> Executed ! Error {
+    var c = process.command(binary, [])
+    c.dir = s.work
+    c.stdout = Piped
+    c.stderr = Piped
+    let name = path.base(binary)
+    let before = children_ticks()
+    let start = time.monotonic()
+    let measured = peakrss.run(c) catch {
+        e => fail Failed("{name}: {emit.io_message(e)}")
+    }
+    let wall = time.monotonic() - start
+    let after = children_ticks()
+    if !process.success(measured.exit) {
+        fail Failed("{name}: {exit_text(measured.exit)}\n{text.trim(measured.stderr)}")
+    }
+    let sample = Sample { wall, cpu: (after - before) * ticks_nanos, rss: measured.peak_kb * 1024 }
+    Executed { sample, output: measured.stdout }
+}

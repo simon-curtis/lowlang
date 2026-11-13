@@ -1,0 +1,158 @@
+import fuzz/oracle
+import std/cancel
+import std/math
+import std/flag
+import std/os
+import std/sys
+import std/text
+import std/time
+import std/time/duration
+import signals = std/os/signal
+
+struct Settings {
+    seed: i64
+    cases: i64
+    duration_ms: i64
+    workers: i64
+    budget: i64
+    dir: str
+    timeout_ms: i64
+    panics: bool
+    reduce: bool
+    reduce_tests: i64
+    fixtures: str
+}
+
+enum Error {
+    Flag(flag.Error)
+    Duration(name: str, value: str)
+    Executable(message: str)
+}
+
+fn flag_message(e: flag.Error) -> str {
+    match e {
+        Unknown(name) => "flag provided but not defined: -{name}"
+        Missing(name) => "flag needs an argument: -{name}"
+        Invalid(name, value) => "invalid value {text.quote(value)} for flag -{name}"
+    }
+}
+
+fn error_message(e: Error) -> str {
+    match e {
+        Flag(inner) => flag_message(inner)
+        Duration(name, value) => "invalid value {text.quote(value)} for flag -{name}: parse error"
+        Executable(message) => message
+    }
+}
+
+fn specs() -> []flag.Spec {
+    let temp = os.env("TMPDIR") ?? "/tmp"
+    let workers = math.max(1, os.cpu_count() / 2)
+    [
+        flag.Spec { name: "seed", help: "first seed; 0 picks one from the clock", fallback: "0" }
+        flag.Spec { name: "n", help: "number of cases; 0 runs until stopped", fallback: "0" }
+        flag.Spec { name: "time", help: "stop after this long; 0 runs until stopped", fallback: "0s" }
+        flag.Spec { name: "workers", help: "parallel workers", fallback: "{workers}" }
+        flag.Spec { name: "budget", help: "reference interpreter step limit per program", fallback: "2000000" }
+        flag.Spec { name: "out", help: "directory for failing programs", fallback: "{temp}/lowfuzz" }
+        flag.Spec { name: "timeout", help: "run limit per compiled program", fallback: "10s" }
+        flag.Spec { name: "panics", help: "allow programs that divide by zero", boolean: true, fallback: "false" }
+        flag.Spec { name: "reduce", help: "minimise each new finding", boolean: true, fallback: "true" }
+        flag.Spec { name: "reduce-tests", help: "compiler runs allowed per reduction", fallback: "600" }
+        flag.Spec { name: "fixtures", help: "directory for run fixtures of minimised findings" }
+    ]
+}
+
+fn milliseconds(parsed: flag.Parsed, name: str) -> i64 ! Error {
+    let raw = flag.get(parsed, name)
+    let length = duration.parse(raw) catch {
+        e => fail Duration(name, raw)
+    }
+    duration.ceil_millis(length)
+}
+
+fn read_settings(args: []str) -> Settings ! Error {
+    let parsed = flag.parse(specs(), args) catch Flag
+    let seed = flag.number(parsed, "seed") catch Flag
+    let cases = flag.number(parsed, "n") catch Flag
+    let workers = flag.number(parsed, "workers") catch Flag
+    let budget = flag.number(parsed, "budget") catch Flag
+    let reduce_tests = flag.number(parsed, "reduce-tests") catch Flag
+    let duration_ms = milliseconds(parsed, "time")?
+    let timeout_ms = milliseconds(parsed, "timeout")?
+    Settings {
+        seed
+        cases
+        duration_ms
+        workers
+        budget
+        dir: flag.get(parsed, "out")
+        timeout_ms
+        panics: flag.enabled(parsed, "panics")
+        reduce: flag.enabled(parsed, "reduce")
+        reduce_tests
+        fixtures: flag.get(parsed, "fixtures")
+    }
+}
+
+fn fail_usage(message: str) {
+    let usage = flag.usage(specs())
+    sys.write_all(2, bytes("{message}\nUsage of lowfuzz:\n{usage}\n")) or {}
+    os.exit(2)
+}
+
+fn main() {
+    let args = os.args()
+    if args.len > 1 && args[1] == "__build" {
+        os.exit(oracle.build_main(args[2..]))
+    }
+    let settings = read_settings(args[1..]) catch {
+        e => {
+            fail_usage(error_message(e))
+            return
+        }
+    }
+    let executable = os.executable() catch {
+        e => {
+            fail_usage("locate lowfuzz: {e}")
+            return
+        }
+    }
+    os.exit(start(settings, executable))
+}
+
+fn start(given: Settings, executable: str) -> i64 {
+    var s = given
+    if s.seed == 0 {
+        s.seed = time.now_nanos()
+    }
+    let ctx = cancel.token()
+    watch_interrupt(ctx)
+    if s.duration_ms > 0 {
+        spawn deadline(ctx, s.duration_ms)
+    }
+    let fuzzer = new_fuzzer(s, executable)
+    print("first seed {s.seed}, {s.workers} workers")
+    run(fuzzer, ctx)
+    summary(fuzzer.report)
+    if failed(fuzzer.report) {
+        return 1
+    }
+    0
+}
+
+fn deadline(ctx: *cancel.Token, millis: i64) {
+    if cancel.pause(ctx, millis) {
+        cancel.cancel(ctx)
+    }
+}
+
+fn watch_interrupt(ctx: *cancel.Token) {
+    let handle = signals.notify_handle([signals.Signal.Interrupt]) or return
+    spawn interrupted(handle, ctx)
+}
+
+fn interrupted(handle: signals.WatchHandle, ctx: *cancel.Token) {
+    let got = signals.wait_for_on(handle) or return
+    cancel.cancel(ctx)
+}
