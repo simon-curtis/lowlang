@@ -1,0 +1,520 @@
+import ast
+import builtin
+import diag
+import types
+
+enum MoveContext {
+    Borrow
+    Take
+    Discard
+}
+
+const moved = 1
+const maybe = 2
+
+struct MoveLoop {
+    breaks: [][*ast.Local: i64] = []
+    continues: [][*ast.Local: i64] = []
+}
+
+struct Mover {
+    c: *Checker
+    ret: *types.Type?
+    state: [*ast.Local: i64]
+    dead: bool = false
+    loops: []*MoveLoop = []
+}
+
+fn check_moves(c: *Checker, f: *ast.Func) ! diag.Error {
+    let m = new(Mover { c, ret: f.ret_type, state: [:] })
+    let body = f.body ?? panic("function {f.name} has no body")
+    move_block(m, body, move_context(m, f.ret_type))?
+}
+
+fn move_context(m: *Mover, t: *types.Type?) -> MoveContext {
+    if t == m.c.universe.void {
+        return MoveContext.Discard
+    }
+    if owns(m.c, t) {
+        return MoveContext.Take
+    }
+    MoveContext.Borrow
+}
+
+fn clone_state(s: [*ast.Local: i64]) -> [*ast.Local: i64] {
+    let out: [*ast.Local: i64] = [:]
+    for l, v in s {
+        out[l] = v
+    }
+    out
+}
+
+fn same_state(a: [*ast.Local: i64], b: [*ast.Local: i64]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for l, v in a {
+        let other = b[l] ?? return false
+        if other != v {
+            return false
+        }
+    }
+    true
+}
+
+fn join_states(states: [][*ast.Local: i64]) -> [*ast.Local: i64] {
+    let out: [*ast.Local: i64] = [:]
+    for s in states {
+        for l, v in s {
+            let current = out[l] ?? 0
+            if v > current {
+                out[l] = v
+            } else {
+                out[l] = current
+            }
+        }
+    }
+    var keys: []*ast.Local = []
+    for l, v in out {
+        push(mut keys, l)
+    }
+    for l in keys {
+        let v = out[l] ?? 0
+        for s in states {
+            if (s[l] ?? 0) != v {
+                out[l] = maybe
+            }
+        }
+    }
+    out
+}
+
+fn snapshot(m: *Mover) -> [*ast.Local: i64] {
+    clone_state(m.state)
+}
+
+fn branches(m: *Mover, run: []fn() ! diag.Error) ! diag.Error {
+    let start = snapshot(m)
+    var ends: [][*ast.Local: i64] = []
+    for r in run {
+        m.state = clone_state(start)
+        m.dead = false
+        r()?
+        if !m.dead {
+            push(mut ends, m.state)
+        }
+    }
+    if ends.len == 0 {
+        m.dead = true
+        return
+    }
+    m.state = join_states(ends)
+    m.dead = false
+}
+
+fn move_block(m: *Mover, b: *ast.Block, ctx: MoveContext) ! diag.Error {
+    for s in b.stmts {
+        if m.dead {
+            return
+        }
+        move_stmt(m, s)?
+    }
+    match b.tail {
+        some(tail) => {
+            if !m.dead {
+                move_expr(m, tail, ctx)?
+            }
+        }
+        none => {}
+    }
+}
+
+fn move_stmt(m: *Mover, s: ast.Stmt) ! diag.Error {
+    match s {
+        Let(l) => {
+            if l.is_using {
+                move_expr(m, l.value, MoveContext.Take)?
+                let bound = l.local ?? panic("using binding has no local")
+                delete(mut m.state, bound)
+                return
+            }
+            move_expr(m, l.value, MoveContext.Borrow)?
+        }
+        Assign(a) => move_assign(m, a)?
+        ExprStmt(x) => {
+            let t = ast.type_of(x.x)
+            move_expr(m, x.x, MoveContext.Discard)?
+            if t == m.c.universe.never {
+                m.dead = true
+            }
+        }
+        Return(r) => {
+            match r.value {
+                some(value) => move_expr(m, value, move_context(m, m.ret))?
+                none => {}
+            }
+            m.dead = true
+        }
+        Fail(f) => {
+            move_expr(m, f.value, MoveContext.Borrow)?
+            m.dead = true
+        }
+        Break(b) => {
+            let lp = m.loops[m.loops.len - 1 - b.depth]
+            push(mut lp.breaks, snapshot(m))
+            m.dead = true
+        }
+        Continue(b) => {
+            let lp = m.loops[m.loops.len - 1 - b.depth]
+            push(mut lp.continues, snapshot(m))
+            m.dead = true
+        }
+        For(f) => {
+            let forever = f.cond == none
+            move_loop(m, forever, fn() ! diag.Error {
+                match f.cond {
+                    some(cond) => move_expr(m, cond, MoveContext.Borrow)?
+                    none => {}
+                }
+            }, f.body)?
+        }
+        ForIn(f) => {
+            move_expr(m, f.iter, MoveContext.Borrow)?
+            match f.end {
+                some(end) => move_expr(m, end, MoveContext.Borrow)?
+                none => {}
+            }
+            move_loop(m, false, fn() ! diag.Error {}, f.body)?
+        }
+        Defer(d) => {
+            let saved = snapshot(m)
+            let dead = m.dead
+            move_stmt(m, d.body)?
+            m.state = saved
+            m.dead = dead
+        }
+        Spawn(sp) => {
+            let body = sp.body ?? panic("spawn has no body")
+            move_block(m, body, MoveContext.Borrow)?
+        }
+        Send(sd) => {
+            move_expr(m, sd.chan, MoveContext.Borrow)?
+            move_expr(m, sd.value, MoveContext.Borrow)?
+        }
+    }
+}
+
+fn move_loop(m: *Mover, forever: bool, head: fn() ! diag.Error, body: *ast.Block) ! diag.Error {
+    var entry = snapshot(m)
+    var exit: [][*ast.Local: i64] = []
+    for pass in 0..2 {
+        let lp = new(MoveLoop {})
+        push(mut m.loops, lp)
+        m.state = clone_state(entry)
+        m.dead = false
+        head()?
+        if !forever {
+            exit = [snapshot(m)]
+        }
+        move_block(m, body, MoveContext.Borrow)?
+        truncate(mut m.loops, m.loops.len - 1)
+        var back: [][*ast.Local: i64] = []
+        for s in lp.continues {
+            push(mut back, s)
+        }
+        if !m.dead {
+            push(mut back, m.state)
+        }
+        for s in lp.breaks {
+            push(mut exit, s)
+        }
+        var joined: [][*ast.Local: i64] = [entry]
+        for s in back {
+            push(mut joined, s)
+        }
+        let next = join_states(joined)
+        if same_state(next, entry) {
+            break
+        }
+        entry = next
+    }
+    if exit.len == 0 {
+        m.dead = true
+        return
+    }
+    m.state = join_states(exit)
+    m.dead = false
+}
+
+fn move_assign(m: *Mover, s: *ast.Assign) ! diag.Error {
+    if s.release == none {
+        move_expr(m, s.value, MoveContext.Borrow)?
+        move_expr(m, s.target, MoveContext.Borrow)?
+        return
+    }
+    move_expr(m, s.value, MoveContext.Take)?
+    match s.target {
+        Ident(target) => {
+            match target.local {
+                some(l) => delete(mut m.state, l)
+                none => {}
+            }
+        }
+        Selector(target) => {
+            let root = move_root(s.target)
+            var allowed = false
+            match root {
+                some(r) => { allowed = r.flag != none || r.ref }
+                none => {}
+            }
+            if !allowed {
+                fail At(s.pos, "a field with drop can only be assigned in a value bound with using")
+            }
+            move_expr(m, target.x, MoveContext.Borrow)?
+        }
+        _ => {
+            let t = ast.type_of(s.target) ?? panic("assignment target has no type")
+            fail At(s.pos, "cannot store {t.text()} here; it has drop")
+        }
+    }
+}
+
+fn move_root(target: ast.Expr) -> *ast.Local? {
+    var e = target
+    for {
+        match e {
+            Selector(x) => { e = x.x }
+            Ident(x) => return x.local
+            _ => return none
+        }
+    }
+}
+
+fn branching(e: ast.Expr) -> bool {
+    match e {
+        If(x) => true
+        Match(x) => true
+        Block(x) => true
+        Select(x) => true
+        Catch(x) => true
+        Or(x) => true
+        _ => false
+    }
+}
+
+fn producer(e: ast.Expr) -> bool {
+    match e {
+        Receiver(x) => producer(x.x)
+        Call(x) => x.builtin == builtin.ID.None
+        StructLit(x) => true
+        Try(x) => true
+        Catch(x) => true
+        Or(x) => true
+        If(x) => true
+        Match(x) => true
+        Block(x) => true
+        Select(x) => true
+        _ => false
+    }
+}
+
+fn move_use(m: *Mover, e: *ast.Ident) ! diag.Error {
+    let l = e.local ?? panic("{e.name} has no local")
+    let state = m.state[l] ?? 0
+    if state == moved {
+        fail At(e.pos, "{e.name} is used after it was moved")
+    }
+    if state == maybe {
+        fail At(e.pos, "{e.name} may have been moved")
+    }
+}
+
+fn move_expr(m: *Mover, e: ast.Expr, ctx: MoveContext) ! diag.Error {
+    let found = ast.type_of(e)
+    let discarding = match ctx {
+        Discard => true
+        _ => false
+    }
+    let taking = match ctx {
+        Take => true
+        _ => false
+    }
+    if discarding && owns(m.c, found) && producer(e) && !branching(e) {
+        let t = found ?? panic("discarded value has no type")
+        fail At(ast.position(e), "{t.text()} has drop; bind it with using")
+    }
+    let owned = taking && owns(m.c, found)
+    match e {
+        Ident(id) => {
+            let l = id.local ?? return
+            if l.flag != none {
+                move_use(m, id)?
+                if owned {
+                    m.state[l] = moved
+                    id.moved = true
+                }
+                return
+            }
+            if owned {
+                fail At(id.pos, "cannot move {id.name}; it is borrowed")
+            }
+        }
+        Selector(sel) => {
+            move_expr(m, sel.x, MoveContext.Borrow)?
+            if owned {
+                fail At(sel.pos, "cannot move field {sel.name} out of its struct")
+            }
+        }
+        Call(call) => move_call(m, call)?
+        StructLit(lit) => {
+            for init in lit.fields {
+                let field = init.field ?? panic("field {init.name} is not resolved")
+                move_expr(m, init.value, move_context(m, field.type))?
+            }
+        }
+        Unary(u) => move_expr(m, u.x, MoveContext.Borrow)?
+        Binary(b) => {
+            move_expr(m, b.x, MoveContext.Borrow)?
+            move_expr(m, b.y, MoveContext.Borrow)?
+        }
+        Receiver(r) => move_expr(m, r.x, ctx)?
+        Ref(r) => move_expr(m, r.x, MoveContext.Borrow)?
+        Index(i) => {
+            move_expr(m, i.x, MoveContext.Borrow)?
+            move_expr(m, i.index, MoveContext.Borrow)?
+        }
+        Slicing(sl) => {
+            move_expr(m, sl.x, MoveContext.Borrow)?
+            match sl.lo {
+                some(lo) => move_expr(m, lo, MoveContext.Borrow)?
+                none => {}
+            }
+            match sl.hi {
+                some(hi) => move_expr(m, hi, MoveContext.Borrow)?
+                none => {}
+            }
+        }
+        SliceLit(lit) => {
+            for el in lit.elems {
+                move_expr(m, el, MoveContext.Borrow)?
+            }
+        }
+        MapLit(lit) => {
+            for i, key in lit.keys {
+                move_expr(m, key, MoveContext.Borrow)?
+                move_expr(m, lit.values[i], MoveContext.Borrow)?
+            }
+        }
+        Interp(n) => {
+            for part in n.parts {
+                move_expr(m, part.x, MoveContext.Borrow)?
+            }
+        }
+        Block(b) => move_block(m, b, ctx)?
+        If(n) => {
+            move_expr(m, n.cond, MoveContext.Borrow)?
+            let then = fn() ! diag.Error { move_block(m, n.then, ctx)? }
+            let otherwise = fn() ! diag.Error {
+                match n.otherwise {
+                    some(rest) => move_expr(m, rest, ctx)?
+                    none => {}
+                }
+            }
+            branches(m, [then, otherwise])?
+        }
+        Match(n) => {
+            move_expr(m, n.x, MoveContext.Borrow)?
+            move_arms(m, n.arms, ctx)?
+        }
+        Try(n) => move_expr(m, n.x, MoveContext.Borrow)?
+        Or(n) => {
+            move_expr(m, n.x, MoveContext.Borrow)?
+            let fallback = fn() ! diag.Error { move_expr(m, n.fallback, ctx)? }
+            branches(m, [fn() ! diag.Error {}, fallback])?
+        }
+        Catch(n) => {
+            move_expr(m, n.x, MoveContext.Borrow)?
+            match n.map {
+                some(mapped) => {
+                    let remap = fn() ! diag.Error { move_expr(m, ast.Expr.Call(mapped), MoveContext.Take)? }
+                    branches(m, [fn() ! diag.Error {}, remap])?
+                    return
+                }
+                none => {}
+            }
+            var runs: []fn() ! diag.Error = [fn() ! diag.Error {}]
+            for r in arm_runs(m, n.arms, ctx) {
+                push(mut runs, r)
+            }
+            branches(m, runs)?
+        }
+        Select(n) => {
+            var runs: []fn() ! diag.Error = []
+            for sc in n.cases {
+                push(mut runs, case_run(m, sc, ctx))
+            }
+            branches(m, runs)?
+        }
+        _ => {}
+    }
+}
+
+fn case_run(m: *Mover, sc: *ast.SelectCase, ctx: MoveContext) -> fn() ! diag.Error {
+    fn() ! diag.Error {
+        match sc.chan {
+            some(part) => move_expr(m, part, MoveContext.Borrow)?
+            none => {}
+        }
+        match sc.value {
+            some(part) => move_expr(m, part, MoveContext.Borrow)?
+            none => {}
+        }
+        move_expr(m, sc.body, ctx)?
+    }
+}
+
+fn move_arms(m: *Mover, arms: []*ast.Arm, ctx: MoveContext) ! diag.Error {
+    branches(m, arm_runs(m, arms, ctx))?
+}
+
+fn arm_runs(m: *Mover, arms: []*ast.Arm, ctx: MoveContext) -> []fn() ! diag.Error {
+    var run: []fn() ! diag.Error = []
+    for arm in arms {
+        push(mut run, arm_run(m, arm, ctx))
+    }
+    run
+}
+
+fn arm_run(m: *Mover, arm: *ast.Arm, ctx: MoveContext) -> fn() ! diag.Error {
+    fn() ! diag.Error {
+        match arm.pattern.test {
+            some(test) => move_expr(m, test, MoveContext.Borrow)?
+            none => {}
+        }
+        move_expr(m, arm.body, ctx)?
+    }
+}
+
+fn move_call(m: *Mover, e: *ast.Call) ! diag.Error {
+    var direct = false
+    match e.callee {
+        Ident(id) => { direct = true }
+        _ => {}
+    }
+    if !direct || e.target == none {
+        move_expr(m, e.callee, MoveContext.Borrow)?
+    }
+    for arg in e.args {
+        var is_ref = false
+        match arg {
+            Ref(r) => { is_ref = true }
+            _ => {}
+        }
+        let found = ast.type_of(arg)
+        if !is_ref && owns(m.c, found) && producer(arg) {
+            let t = found ?? panic("argument has no type")
+            fail At(ast.position(arg), "{t.text()} has drop; bind it with using before passing it")
+        }
+        move_expr(m, arg, MoveContext.Borrow)?
+    }
+}

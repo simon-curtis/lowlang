@@ -1,0 +1,259 @@
+import ast
+import builtin
+import diag
+import lexer
+import prelude
+import types
+import std/text
+
+fn derivation_home(c: *Checker, kind: Derivation) -> *ast.File {
+    match kind {
+        Render => scope(c, "").home ?? panic("the root module has no home file")
+        _ => c.ctx.file
+    }
+}
+
+fn renderer(c: *Checker, t: *types.Type, pos: diag.Pos) -> *ast.Func? ! diag.Error {
+    if types.abstract(t) {
+        return none
+    }
+    derive(c, Derivation.Render, t, pos)?
+}
+
+fn primitive_appender(c: *Checker, t: *types.Type) -> str? {
+    let u = c.universe
+    if t == u.bool {
+        return prelude.append_bool
+    }
+    if t == u.u64 {
+        return prelude.append_u64
+    }
+    if t == u.f64 {
+        return prelude.append_f64
+    }
+    if t == u.f32 {
+        return prelude.append_f32
+    }
+    if t.is_integer() {
+        return prelude.append_i64
+    }
+    none
+}
+
+fn appender(c: *Checker, t: *types.Type, pos: diag.Pos) -> *ast.Func? ! diag.Error {
+    match primitive_appender(c, t) {
+        some(found) => {
+            if !types.abstract(t) {
+                return scope(c, "").funcs[found]
+            }
+        }
+        none => {}
+    }
+    renderer(c, t, pos)?
+}
+
+fn require_value(c: *Checker, pos: diag.Pos, what: str, t: *types.Type) ! diag.Error {
+    if t == c.universe.void || t == c.universe.never {
+        fail At(pos, "{what} needs a value, found {t.text()}")
+    }
+}
+
+fn render_call(c: *Checker, e: *ast.Call) ! diag.Error {
+    let t = plain(c, e.args[0], none)?
+    require_value(c, ast.position(e.args[0]), "__render", t)?
+    e.type = c.universe.str
+    e.render = renderer(c, t, e.pos)?
+}
+
+fn render_into_call(c: *Checker, e: *ast.Call) ! diag.Error {
+    let buffer_type = c.universe.slice(c.universe.u8)?
+    let buffer = mut_of(c, e, 0, buffer_type)?
+    address(c, buffer)
+    let path_type = c.universe.slice(c.universe.i64)?
+    let path = mut_of(c, e, 1, path_type)?
+    address(c, path)
+    let t = plain(c, e.args[2], none)?
+    exclusive(c, e.args)?
+    e.builtin = builtin.ID.None
+    e.type = c.universe.void
+    e.target = renderer(c, t, e.pos)?
+}
+
+fn address_call(c: *Checker, e: *ast.Call) ! diag.Error {
+    let t = plain(c, e.args[0], none)?
+    if t.kind != PointerKind && t.kind != RawKind {
+        fail At(ast.position(e.args[0]), "__address needs a pointer, found {t.text()}")
+    }
+    e.type = c.universe.i64
+}
+
+fn put(s: *Synth, fragment: str) {
+    s.text.write(fragment)
+}
+
+fn flush(s: *Synth) {
+    if s.text.len() == 0 {
+        return
+    }
+    let pending = s.text.to_str()
+    s.text.reset()
+    s.out.write("{prelude.append_str}(mut b, {lexer.quote(pending)})\n")
+}
+
+fn recurse(expr: str) -> str {
+    "__render_into(mut b, mut path, {expr})"
+}
+
+fn bare_name(t: *types.Type) -> str {
+    var base = t.name
+    let open = text.index_byte(base, '[')
+    if open >= 0 {
+        base = base[0..open]
+    }
+    let dot = text.last_index_byte(base, '.')
+    if dot >= 0 {
+        base = base[dot + 1..]
+    }
+    base
+}
+
+fn render(s: *Synth, t: *types.Type) ! diag.Error {
+    let u = s.c.universe
+    match primitive_appender(s.c, t) {
+        some(found) => {
+            var operand = "v"
+            if t.is_integer() && t != u.u64 {
+                operand = "i64(v)"
+            }
+            line(s, "{found}(mut b, {operand})")
+            return
+        }
+        none => {}
+    }
+    if t == u.str {
+        line(s, "{prelude.append_quoted}(mut b, v)")
+    } else if t.kind == SliceKind && t.elem == u.u8 {
+        line(s, "{prelude.append_hex}(mut b, v)")
+    } else if t.kind == SliceKind {
+        render_slice(s)
+    } else if t.kind == MapKind {
+        render_map(s)
+    } else if t.kind == EnumKind && t.optional {
+        render_optional(s)
+    } else if t.kind == PointerKind {
+        render_pointer(s)?
+    } else if t.kind == StructKind {
+        render_struct(s, t)
+    } else if t.kind == EnumKind {
+        render_enum(s, t)
+    } else if t.kind == VectorKind {
+        render_vector(s, t)
+    } else if t.kind == RawKind {
+        render_raw(s, t)
+    } else {
+        put(s, t.text())
+    }
+}
+
+fn render_slice(s: *Synth) {
+    put(s, "[")
+    line(s, "for i, x in v {{\nif i > 0 {{")
+    put(s, ", ")
+    line(s, "}}\n{recurse("x")}\n}}")
+    put(s, "]")
+}
+
+fn render_map(s: *Synth) {
+    put(s, "{{")
+    line(s, "var n = 0\nfor k, x in v {{\nif n > 0 {{")
+    put(s, ", ")
+    line(s, "}}\nn += 1\n{recurse("k")}")
+    put(s, ": ")
+    line(s, "{recurse("x")}\n}}")
+    put(s, "}}")
+}
+
+fn render_optional(s: *Synth) {
+    line(s, "match v {{\nsome(x) => {{\n{recurse("x")}\n}}\nnone => {{")
+    put(s, "none")
+    line(s, "}}\n}}")
+}
+
+fn render_pointer(s: *Synth) ! diag.Error {
+    guard_pointer(s, fn() ! diag.Error {
+        put(s, "<cycle>")
+        line(s, "return")
+    }, recurse("*v"))?
+}
+
+fn guard_pointer(s: *Synth, on_cycle: fn() ! diag.Error, target: str) ! diag.Error {
+    line(s, "let address = __address(v)\nfor seen in path {{\nif seen == address {{")
+    on_cycle()?
+    line(s, "}}\n}}\npush(mut path, address)\n{target}\ntruncate(mut path, path.len - 1)")
+}
+
+fn render_struct(s: *Synth, t: *types.Type) {
+    put(s, "{bare_name(t)}{{")
+    for i, f in t.fields {
+        if i > 0 {
+            put(s, ", ")
+        }
+        put(s, "{f.name}: ")
+        line(s, recurse("v.{f.name}"))
+    }
+    put(s, "}}")
+}
+
+fn render_enum(s: *Synth, t: *types.Type) {
+    line(s, "match v {{")
+    for v in t.variants {
+        render_variant(s, v)
+    }
+    line(s, "}}")
+}
+
+fn render_variant(s: *Synth, v: *types.Variant) {
+    if v.fields.len == 0 {
+        line(s, "{v.name} => {{")
+        put(s, v.name)
+        line(s, "}}")
+        return
+    }
+    var binds: []str = []
+    for i in 0..v.fields.len {
+        push(mut binds, "f{i}")
+    }
+    var opening = "("
+    var closing = ")"
+    if labelled(v) {
+        opening = "{{"
+        closing = "}}"
+    }
+    line(s, "{v.name}({text.join(binds, ", ")}) => {{")
+    put(s, "{v.name}{opening}")
+    for i, bind in binds {
+        if i > 0 {
+            put(s, ", ")
+        }
+        if labelled(v) {
+            put(s, "{label_of(v, i)}: ")
+        }
+        line(s, recurse(bind))
+    }
+    put(s, closing)
+    line(s, "}}")
+}
+
+fn render_vector(s: *Synth, t: *types.Type) {
+    put(s, "<")
+    line(s, "for i in 0..{t.lanes} {{\nif i > 0 {{")
+    put(s, ", ")
+    line(s, "}}\n{recurse("__vlane(v, i)")}\n}}")
+    put(s, ">")
+}
+
+fn render_raw(s: *Synth, t: *types.Type) {
+    put(s, "{t.text()}(0x")
+    line(s, "{prelude.append_radix}(mut b, __address(v), 64, 4, false, 0)")
+    put(s, ")")
+}

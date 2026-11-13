@@ -1,0 +1,314 @@
+import ast
+import diag
+import parser
+import target
+import std/file
+import std/io
+import std/os
+import std/path
+import std/slices
+import std/sys
+import std/text
+
+const module_file = "low.mod"
+const examples_dir = "examples"
+const std_dir = "internal/compiler/std"
+
+pub enum Error {
+    Diag(diag.Error)
+    Prelude(msg: str)
+    Failed(msg: str)
+}
+
+pub fn message(e: Error) -> str {
+    match e {
+        Diag(inner) => diag.message(inner)
+        Prelude(msg) => msg
+        Failed(msg) => msg
+    }
+}
+
+pub fn std_root() -> str {
+    os.env("LOW_STD") ?? std_dir
+}
+
+fn is_std(module: str) -> bool {
+    module == "std" || text.starts_with(module, "std/")
+}
+
+fn reason(e: io.Error) -> str {
+    match e {
+        NotFound => "no such file or directory"
+        Denied => "permission denied"
+        NotDir => "not a directory"
+        IsDir => "is a directory"
+        Exists => "file exists"
+        NotEmpty => "directory not empty"
+        Invalid => "invalid argument"
+        Os(code) => "errno {code}"
+        _ => "input/output error"
+    }
+}
+
+fn failed(op: str, name: str, e: io.Error) -> Error {
+    Error.Failed("{op} {name}: {reason(e)}")
+}
+
+fn real_name(privileged: bool, name: str) -> str {
+    if !privileged {
+        return name
+    }
+    let root = std_root()
+    if name == "std" {
+        return root
+    }
+    path.join([root, name[4..]])
+}
+
+struct Tree {
+    privileged: bool
+}
+
+struct Listing {
+    files: []str
+    absent: bool
+}
+
+struct Directory {
+    entries: []file.Entry
+    absent: bool
+}
+
+fn read_dir(t: Tree, dir: str) -> Directory ! Error {
+    let found = file.read_dir_info(real_name(t.privileged, dir)) catch {
+        NotFound => return Directory { entries: [], absent: true }
+        NotDir => fail Error.Failed("readdirent {dir}: not a directory")
+        e => fail failed("open", dir, e)
+    }
+    Directory { entries: found, absent: false }
+}
+
+fn sources(t: Tree, dir: str, platform: target.OS) -> Listing ! Error {
+    let entries = read_dir(t, dir)?
+    var sorted = entries.entries
+    slices.sort_by(mut sorted, fn(a: file.Entry, b: file.Entry) -> bool { a.name < b.name })
+    var files: []str = []
+    for entry in sorted {
+        if builds(entry, platform) {
+            push(mut files, path.join([dir, entry.name]))
+        }
+    }
+    Listing { files, absent: entries.absent }
+}
+
+fn builds(entry: file.Entry, platform: target.OS) -> bool {
+    !entry.dir && text.ends_with(entry.name, ".low") && target.builds(platform, entry.name)
+}
+
+fn parse(t: Tree, name: str) -> *ast.File ! Error {
+    let src = file.read_text(real_name(t.privileged, name)) catch {
+        e => fail failed("open", name, e)
+    }
+    let f = parse_source(src, name, t.privileged)?
+    f.path = name
+    f
+}
+
+pub fn parse_source(src: str, name: str, privileged: bool) -> *ast.File ! Error {
+    parser.parse_source(src, diag.start(name), privileged) catch Diag
+}
+
+pub fn parse_file(name: str) -> *ast.File ! Error {
+    parse(Tree { privileged: false }, name)?
+}
+
+fn root(dir: str) -> str? {
+    let cwd = sys.getcwd() or return none
+    var d = absolute(cwd, dir)
+    for true {
+        if file.exists(path.join([d, module_file])) {
+            return d
+        }
+        let parent = path.dir(d)
+        if parent == d {
+            return none
+        }
+        d = parent
+    }
+    none
+}
+
+fn absolute(cwd: str, name: str) -> str {
+    if path.is_absolute(name) {
+        return path.clean(name)
+    }
+    path.join([cwd, name])
+}
+
+pub fn absolute_path(name: str) -> str ! Error {
+    let cwd = sys.getcwd() catch {
+        e => fail failed("getwd", "", e)
+    }
+    absolute(cwd, name)
+}
+
+struct Edge {
+    to: str
+    pos: diag.Pos
+}
+
+pub struct Loader {
+    root: str = ""
+    platform: target.OS
+    files: []*ast.File = []
+    sources: []str = []
+    edges: [str: []Edge] = [:]
+    pending: []Edge = []
+    loaded: [str: bool] = [:]
+}
+
+pub fn load_modules(entry_path: str, platform: target.OS) -> *Loader ! Error {
+    let l = new(Loader { platform })
+    let disk = Tree { privileged: false }
+    let info = file.stat(entry_path) catch {
+        e => fail failed("stat", entry_path, e)
+    }
+    var dir = path.dir(entry_path)
+    var entry: []str = [entry_path]
+    if info.dir {
+        dir = entry_path
+        let listing = sources(disk, entry_path, platform)?
+        entry = listing.files
+        if entry.len == 0 {
+            fail Error.Failed("{entry_path}: no .low files")
+        }
+    }
+    l.root = dir
+    match root(dir) {
+        some(found) => {
+            l.root = found
+        }
+        none => {}
+    }
+    module(l, "", entry)?
+    var head = 0
+    for head < l.pending.len {
+        let next = l.pending[head]
+        head += 1
+        imported(l, next)?
+    }
+    cycles(l)?
+    l
+}
+
+pub fn user_files(l: *Loader) -> []*ast.File {
+    var out: []*ast.File = []
+    for f in l.files {
+        if !is_std(f.module) {
+            push(mut out, f)
+        }
+    }
+    out
+}
+
+fn tree_of(module_name: str) -> Tree {
+    Tree { privileged: is_std(module_name) }
+}
+
+fn imported(l: *Loader, e: Edge) ! Error {
+    if l.loaded[e.to] != none {
+        return
+    }
+    for part in text.split(e.to, '/') {
+        if part == examples_dir {
+            fail Error.Diag(diag.Error.At(e.pos, "cannot import {e.to}: an examples directory holds programs, not modules"))
+        }
+    }
+    let source = tree_of(e.to)
+    var dir = e.to
+    var place = "the standard library"
+    if !source.privileged {
+        dir = path.join([l.root, e.to])
+        place = dir
+    }
+    let listing = sources(source, dir, l.platform)?
+    if listing.absent || listing.files.len == 0 {
+        fail Error.Diag(diag.Error.At(e.pos, "cannot find module {e.to} in {place}"))
+    }
+    module(l, e.to, listing.files)?
+}
+
+fn module(l: *Loader, name: str, files: []str) ! Error {
+    l.loaded[name] = true
+    l.edges[name] = []
+    let source = tree_of(name)
+    for file_name in files {
+        let f = parse(source, file_name)?
+        f.module = name
+        push(mut l.files, f)
+        if !source.privileged {
+            push(mut l.sources, file_name)
+        }
+        link(l, f)?
+    }
+}
+
+fn link(l: *Loader, f: *ast.File) ! Error {
+    var seen: [str: bool] = [:]
+    for imp in f.imports {
+        if seen[imp.alias] != none {
+            fail Error.Diag(diag.Error.At(imp.pos, "module name {imp.alias} imported twice"))
+        }
+        seen[imp.alias] = true
+        let e = Edge { to: imp.path, pos: imp.pos }
+        var held = l.edges[f.module] ?? []
+        push(mut held, e)
+        l.edges[f.module] = held
+        push(mut l.pending, e)
+    }
+}
+
+struct Cycles {
+    state: [str: i64] = [:]
+    stack: []str = []
+}
+
+fn cycles(l: *Loader) ! Error {
+    let c = new(Cycles {})
+    visit(l, c, "")?
+}
+
+fn visit(l: *Loader, c: *Cycles, module_name: str) ! Error {
+    c.state[module_name] = 1
+    push(mut c.stack, module_name)
+    for e in l.edges[module_name] ?? [] {
+        let state = c.state[e.to] ?? 0
+        if state == 1 {
+            var cycle: []str = []
+            var at = 0
+            for i, m in c.stack {
+                if m == e.to {
+                    at = i
+                    break
+                }
+            }
+            for i in at..c.stack.len {
+                push(mut cycle, display(c.stack[i]))
+            }
+            push(mut cycle, display(e.to))
+            fail Error.Diag(diag.Error.At(e.pos, "import cycle: {text.join(cycle, " -> ")}"))
+        }
+        if state == 0 {
+            visit(l, c, e.to)?
+        }
+    }
+    c.stack = c.stack[0..c.stack.len - 1]
+    c.state[module_name] = 2
+}
+
+fn display(module_name: str) -> str {
+    if module_name == "" {
+        return "main"
+    }
+    module_name
+}

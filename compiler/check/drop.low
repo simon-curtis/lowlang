@@ -1,0 +1,206 @@
+import ast
+import diag
+import types
+
+struct DropSource {
+    source: DeclSource
+    decl: *ast.StructDecl
+}
+
+fn record_struct(c: *Checker, d: *ast.StructDecl, st: *types.Type) {
+    c.struct_files[st] = c.ctx.file
+    if d.on_drop == none {
+        return
+    }
+    c.drops[st] = new(DropSource { source: source_of(c, st, d.type_params.len > 0), decl: d })
+}
+
+fn droppable(c: *Checker, t: *types.Type) -> bool {
+    if t.kind != StructKind || c.phase.index < Phase.Laid.index {
+        return false
+    }
+    match c.droppables[t] {
+        some(known) => return known
+        none => {}
+    }
+    c.droppables[t] = false
+    var result = c.drops[t] != none
+    for f in t.fields {
+        if droppable(c, f.type) {
+            result = true
+        }
+    }
+    c.droppables[t] = result
+    result
+}
+
+fn owns(c: *Checker, target: *types.Type?) -> bool {
+    let t = target ?? return false
+    if t.kind == ResultKind {
+        return droppable(c, t.ok_of())
+    }
+    droppable(c, t)
+}
+
+fn contain(c: *Checker, elem: *types.Type, what: str, pos: diag.Pos) ! diag.Error {
+    when(c, Laid, fn() ! diag.Error {
+        if droppable(c, elem) {
+            fail At(pos, "cannot store {elem.text()} in {what}; it has drop")
+        }
+    })?
+}
+
+fn contained(c: *Checker, t: *ast.TypeName, what: str) -> *types.Type ! diag.Error {
+    let elem = resolve(c, t)?
+    contain(c, elem, what, t.pos)?
+    elem
+}
+
+fn drop_func(c: *Checker, t: *types.Type) -> *ast.Func ! diag.Error {
+    match c.drop_funcs[t] {
+        some(known) => return known
+        none => {}
+    }
+    let src = c.drops[t] ?? panic("{t.name} has no drop source")
+    var drop_body = src.decl.on_drop ?? panic("{t.name} has no drop")
+    if src.source.clone {
+        drop_body = ast.clone_stmt(drop_body)
+    }
+    let f = new(ast.Func { name: "{t.name}..drop", file: src.source.file, pos: src.decl.pos, ret_type: c.universe.void })
+    f.body = new(ast.Block { stmts: [drop_body], pos: src.decl.pos })
+    for field in t.fields {
+        push(mut f.params, new(ast.Param { name: field.name, pos: src.decl.pos }))
+        push(mut f.param_types, field.type)
+    }
+    c.drop_funcs[t] = f
+    var next = context(src.source)
+    next.dropping = true
+    enter(c, next, fn() ! diag.Error { body(c, f)? })?
+    if !src.source.abstract {
+        push(mut src.source.file.funcs, f)
+    }
+    f
+}
+
+fn check_drops(c: *Checker, files: []*ast.File) ! diag.Error {
+    for file in files {
+        for d in file.structs {
+            if d.on_drop != none {
+                drop_func(c, decl_type(d.type))?
+            }
+        }
+    }
+}
+
+fn typed_ident(l: *ast.Local, pos: diag.Pos) -> *ast.Ident {
+    let id = new(ast.Ident { name: l.name, local: l, pos })
+    id.type = l.type
+    id
+}
+
+fn typed_call(c: *Checker, target: *ast.Func, args: []ast.Expr, pos: diag.Pos) -> *ast.Call {
+    let call = new(ast.Call { callee: ast.Expr.Ident(new(ast.Ident { name: target.name, pos })), args, target, pos })
+    call.type = c.universe.void
+    call
+}
+
+fn release_func(c: *Checker, t: *types.Type) -> *ast.Func ! diag.Error {
+    match c.release_funcs[t] {
+        some(known) => return known
+        none => {}
+    }
+    let file = c.struct_files[t] ?? panic("{t.name} has no declaring file")
+    let f = new(ast.Func { name: "{t.name}..release", file, pos: diag.Pos {}, ret_type: c.universe.void })
+    let self = new(ast.Local { name: "self", type: t, param: true, owner: f })
+    f.params = [new(ast.Param { name: "self", pos: diag.Pos {} })]
+    f.param_types = [t]
+    f.param_locals = [self]
+    c.release_funcs[t] = f
+    let field = fn(member: *types.Field) -> ast.Expr {
+        let sel = new(ast.Selector { x: ast.Expr.Ident(typed_ident(self, diag.Pos {})), name: member.name, pos: diag.Pos {}, field: member })
+        sel.type = member.type
+        ast.Expr.Selector(sel)
+    }
+    var stmts: []ast.Stmt = []
+    if c.drops[t] != none {
+        var args: []ast.Expr = []
+        for member in t.fields {
+            push(mut args, field(member))
+        }
+        let dropper = drop_func(c, t)?
+        push(mut stmts, ast.Stmt.ExprStmt(new(ast.ExprStmt { x: ast.Expr.Call(typed_call(c, dropper, args, diag.Pos {})) })))
+    }
+    for member in t.fields {
+        if droppable(c, member.type) {
+            let release = release_func(c, member.type)?
+            let args: []ast.Expr = [field(member)]
+            push(mut stmts, ast.Stmt.ExprStmt(new(ast.ExprStmt { x: ast.Expr.Call(typed_call(c, release, args, diag.Pos {})) })))
+        }
+    }
+    let body = new(ast.Block { stmts, pos: diag.Pos {} })
+    body.type = c.universe.void
+    f.body = body
+    if !types.abstract(t) {
+        push(mut file.funcs, f)
+    }
+    f
+}
+
+fn guarded(c: *Checker, flag: *ast.Local, call: *ast.Call) -> ast.Stmt {
+    let then = new(ast.Block { stmts: [ast.Stmt.ExprStmt(new(ast.ExprStmt { x: ast.Expr.Call(call) }))], pos: diag.Pos {} })
+    then.type = c.universe.void
+    let branch = new(ast.If { cond: ast.Expr.Ident(typed_ident(flag, call.pos)), then, pos: call.pos })
+    branch.type = c.universe.void
+    ast.Stmt.ExprStmt(new(ast.ExprStmt { x: ast.Expr.If(branch) }))
+}
+
+fn using_binding(c: *Checker, s: *ast.Let, t: *types.Type) ! diag.Error {
+    if c.ctx.deferring {
+        fail At(s.pos, "using cannot appear in a deferred statement")
+    }
+    if c.ctx.dropping {
+        fail At(s.pos, "using cannot appear in a drop")
+    }
+    if types.abstract(t) {
+        return
+    }
+    if !droppable(c, t) {
+        fail At(s.pos, "{t.text()} has no drop; bind it with let")
+    }
+    c.flags += 1
+    let flag = declare(c, "__live{c.flags}", c.universe.bool, true)
+    let bound = s.local ?? panic("using binding has no local")
+    bound.flag = flag
+    let release = release_func(c, t)?
+    let args: []ast.Expr = [ast.Expr.Ident(typed_ident(bound, s.pos))]
+    let call = typed_call(c, release, args, s.pos)
+    s.release = guarded(c, flag, call)
+}
+
+fn droppable_assign(c: *Checker, s: *ast.Assign, t: *types.Type) ! diag.Error {
+    if types.abstract(t) || !droppable(c, t) {
+        return
+    }
+    let release = release_func(c, t)?
+    let args: []ast.Expr = [s.target]
+    let call = typed_call(c, release, args, s.pos)
+    match s.target {
+        Ident(id) => {
+            match id.local {
+                some(l) => {
+                    match l.flag {
+                        some(flag) => {
+                            s.release = guarded(c, flag, call)
+                            s.flag = flag
+                            return
+                        }
+                        none => {}
+                    }
+                }
+                none => {}
+            }
+        }
+        _ => {}
+    }
+    s.release = ast.Stmt.ExprStmt(new(ast.ExprStmt { x: ast.Expr.Call(call) }))
+}

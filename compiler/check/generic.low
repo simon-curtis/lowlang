@@ -1,0 +1,661 @@
+import ast
+import diag
+import prelude
+import types
+import std/text
+
+const instance_limit = 1000
+
+struct Generic {
+    name: str
+    decls: []*ast.TypeParam
+    params: []*types.Type
+    exported: bool
+    pos: diag.Pos
+    file: *ast.File
+    struct_decl: *ast.StructDecl? = none
+    enum_decl: *ast.EnumDecl? = none
+    instances: [str: *types.Type] = [:]
+    abstract: *types.Type? = none
+}
+
+struct Inference {
+    name: str = ""
+    decls: []*ast.TypeParam = []
+    params: []*types.Type
+    bound: [*types.Type: *types.Type]
+}
+
+fn plural(n: i64, noun: str) -> str {
+    if n == 1 {
+        return "1 {noun}"
+    }
+    "{n} {noun}s"
+}
+
+fn type_key(args: []*types.Type) -> str {
+    var parts: []str = []
+    for a in args {
+        push(mut parts, "{a.id}")
+    }
+    text.join(parts, ",")
+}
+
+fn type_params(c: *Checker, decls: []*ast.TypeParam) -> []*types.Type ! diag.Error {
+    var params: []*types.Type = []
+    let seen: [str: bool] = [:]
+    for d in decls {
+        if seen[d.name] != none {
+            fail At(d.pos, "type parameter {d.name} already declared")
+        }
+        seen[d.name] = true
+        var constraint = 0
+        for name in d.constraints {
+            let bits = types.parse_constraint(name) ?? unknown_constraint(name, d.pos)?
+            constraint = constraint | bits
+        }
+        push(mut params, types.new_param(c.universe, d.name, constraint))
+    }
+    params
+}
+
+fn unknown_constraint(name: str, pos: diag.Pos) -> i64 ! diag.Error {
+    let names = types.constraint_names()
+    let last = names.len - 1
+    let head = text.join(names[0..last], ", ")
+    fail At(pos, "unknown constraint {name}; use {head} or {names[last]}")
+}
+
+fn bindings(decls: []*ast.TypeParam, args: []*types.Type) -> [str: *types.Type] {
+    let bound: [str: *types.Type] = [:]
+    for i, d in decls {
+        bound[d.name] = args[i]
+    }
+    bound
+}
+
+fn bindings_of(c: *Checker, f: *ast.Func) -> [str: *types.Type] {
+    if f.bound.len > 0 {
+        return f.bound
+    }
+    bindings(ast.source(f).type_params, f.type_args)
+}
+
+fn satisfy(c: *Checker, args: []*types.Type, decls: []*ast.TypeParam, params: []*types.Type, pos: diag.Pos) ! diag.Error {
+    for i, a in args {
+        if !a.satisfies(params[i].constraint) {
+            fail At(pos, "{a.text()} does not satisfy {text.join(decls[i].constraints, " + ")}")
+        }
+    }
+}
+
+fn declare_generic(c: *Checker, name: str, decls: []*ast.TypeParam, exported: bool, pos: diag.Pos) -> *Generic ! diag.Error {
+    let home = local(c)
+    let dup_type = home.types[name] != none
+    let dup = home.generics[name] != none
+    if dup || dup_type || reserved_type(c, name) {
+        fail At(pos, "type {name} already declared")
+    }
+    let params = type_params(c, decls)?
+    let g = new(Generic { name, decls, params, exported, pos, file: c.ctx.file })
+    home.generics[name] = g
+    g
+}
+
+fn origin(c: *Checker, g: *Generic) -> *types.Type ! diag.Error {
+    if g.abstract == none {
+        instantiate_type(c, g, g.params, g.pos)?
+    }
+    g.abstract ?? panic("generic {g.name} has no abstract instance")
+}
+
+fn instantiate_type(c: *Checker, g: *Generic, args: []*types.Type, pos: diag.Pos) -> *types.Type ! diag.Error {
+    if args.len != g.params.len {
+        fail At(pos, "{g.name} takes {plural(g.params.len, "type argument")}, found {args.len}")
+    }
+    satisfy(c, args, g.decls, g.params, pos)?
+    let key = type_key(args)
+    match g.instances[key] {
+        some(known) => return known
+        none => {}
+    }
+    if g.instances.len >= instance_limit {
+        fail At(pos, "too many instances of {g.name}")
+    }
+    let name = types.instance_name(qualified(g.file.module, g.name), args)
+    var t = types.new_struct(c.universe, name)
+    if g.enum_decl != none {
+        t = types.new_enum(c.universe, name)
+    }
+    t.module = g.file.module
+    t.exported = g.exported
+    t.type_args = args
+    g.instances[key] = t
+    if g.abstract == none && type_key(g.params) == key {
+        g.abstract = t
+        c.generics[t] = g
+    }
+    t.origin = origin(c, g)?
+    within(c, g.file, bindings(g.decls, args), fn() ! diag.Error {
+        match g.struct_decl {
+            some(d) => declare_fields(c, d, t)?
+            none => {
+                let d = g.enum_decl ?? panic("generic {g.name} has no declaration")
+                declare_variants(c, d, t)?
+            }
+        }
+    })?
+    when(c, Laid, fn() ! diag.Error { layout(c, t, pos) })?
+    t
+}
+
+fn local_generic(c: *Checker, name: str) -> *Generic? {
+    match local(c).generics[name] {
+        some(g) => return g
+        none => {}
+    }
+    if text.starts_with(name, "__") {
+        return scope(c, "").generics[name]
+    }
+    none
+}
+
+fn local_func(c: *Checker, name: str) -> *ast.Func? {
+    match local(c).funcs[name] {
+        some(f) => return f
+        none => {}
+    }
+    if text.starts_with(name, "__") {
+        let f = scope(c, "").funcs[name] ?? return none
+        if f.type_params.len > 0 {
+            return f
+        }
+    }
+    none
+}
+
+fn lookup_generic(c: *Checker, module: str, name: str, pos: diag.Pos) -> *Generic? ! diag.Error {
+    if module == "" {
+        return local_generic(c, name)
+    }
+    let g = imported_scope(c, module, pos)?.generics[name] ?? return none
+    if !g.exported {
+        fail At(pos, "{module}.{name} is private")
+    }
+    g
+}
+
+fn generic_ref(c: *Checker, x: ast.Expr) -> *Generic? ! diag.Error {
+    match x {
+        Ident(id) => {
+            if find(c, id.name) != none {
+                return none
+            }
+            return local_generic(c, id.name)
+        }
+        Selector(sel) => {
+            match sel.x {
+                Ident(id) => {
+                    if !is_module(c, id.name) {
+                        return none
+                    }
+                    return lookup_generic(c, id.name, sel.name, sel.pos)?
+                }
+                _ => return none
+            }
+        }
+        _ => return none
+    }
+}
+
+fn declare_generic_func(c: *Checker, f: *ast.Func) ! diag.Error {
+    c.pristine[f] = ast.clone_func(f)
+    f.type_args = type_params(c, f.type_params)?
+    within(c, c.ctx.file, bindings_of(c, f), fn() ! diag.Error { signature(c, f) })?
+}
+
+fn instance(c: *Checker, f: *ast.Func, args: []*types.Type, pos: diag.Pos) -> *ast.Func ! diag.Error {
+    let key = type_key(args)
+    let known = c.instances[f] ?? [:]
+    match known[key] {
+        some(inst) => return inst
+        none => {}
+    }
+    c.instances[f] = known
+    if known.len >= instance_limit {
+        fail At(pos, "too many instances of {f.name}")
+    }
+    let template = c.pristine[f] ?? panic("function {f.name} has no pristine copy")
+    let inst = ast.clone_func(template)
+    inst.name = types.instance_name(f.name, args)
+    inst.type_params = []
+    inst.template = f
+    inst.type_args = args
+    known[key] = inst
+    let owner = f.file ?? panic("function {f.name} has no file")
+    within(c, owner, bindings_of(c, inst), fn() ! diag.Error { signature(c, inst) })?
+    push(mut owner.funcs, inst)
+    push(mut c.pending, inst)
+    inst
+}
+
+fn infer(name: str, decls: []*ast.TypeParam, params: []*types.Type) -> *Inference {
+    new(Inference { name, decls, params, bound: [:] })
+}
+
+fn is_param(inf: *Inference, t: *types.Type) -> bool {
+    for p in inf.params {
+        if p == t {
+            return true
+        }
+    }
+    false
+}
+
+fn unify_types(inf: *Inference, pattern: *types.Type?, actual: *types.Type?) -> bool {
+    let p = pattern ?? return actual == none
+    let a = actual ?? return false
+    if a.kind == NeverKind {
+        return true
+    }
+    if !types.abstract(p) {
+        return p.accepts(a)
+    }
+    if is_param(inf, p) {
+        match inf.bound[p] {
+            some(bound) => return bound == a
+            none => {
+                inf.bound[p] = a
+                return a.satisfies(p.constraint)
+            }
+        }
+    }
+    if p.optional && a.optional {
+        return unify_types(inf, p.elem, a.elem)
+    }
+    if p.optional {
+        return unify_types(inf, p.elem, a)
+    }
+    if p.kind == ResultKind && a.kind != ResultKind {
+        return unify_types(inf, p.ok, a)
+    }
+    if p.kind != a.kind {
+        return false
+    }
+    if p.kind == FuncKind && p.params.len != a.params.len {
+        return false
+    }
+    if p.kind == FuncKind {
+        let matched = unify_pairs(inf, p.params, a.params)
+        let ret = unify_types(inf, p.ret, a.ret)
+        return matched && ret
+    }
+    if p.kind == ResultKind {
+        let ok = unify_types(inf, p.ok, a.ok)
+        let failure = unify_types(inf, p.err, a.err)
+        return ok && failure
+    }
+    if p.origin != none {
+        return p.origin == a.origin && unify_pairs(inf, p.type_args, a.type_args)
+    }
+    let key = unify_types(inf, p.key, a.key)
+    let elem = unify_types(inf, p.elem, a.elem)
+    key && elem
+}
+
+fn unify_pairs(inf: *Inference, patterns: []*types.Type, actuals: []*types.Type) -> bool {
+    var matched = patterns.len == actuals.len
+    var n = patterns.len
+    if actuals.len < n {
+        n = actuals.len
+    }
+    for i in 0..n {
+        if !unify_types(inf, patterns[i], actuals[i]) {
+            matched = false
+        }
+    }
+    matched
+}
+
+fn inferred(c: *Checker, inf: *Inference, pos: diag.Pos) -> []*types.Type ! diag.Error {
+    var args: []*types.Type = []
+    for p in inf.params {
+        let a = inf.bound[p] ?? fail At(pos, "cannot infer type argument {p.text()} of {inf.name}; write {inf.name}[...]")
+        push(mut args, a)
+    }
+    satisfy(c, args, inf.decls, inf.params, pos)?
+    args
+}
+
+struct Substituted {
+    types: []*types.Type
+    complete: bool
+}
+
+fn substitute_all(c: *Checker, xs: []*types.Type, inf: *Inference, pos: diag.Pos) -> Substituted ! diag.Error {
+    var out: []*types.Type = []
+    for x in xs {
+        let s = substitute(c, x, inf, pos)? ?? return Substituted { types: [], complete: false }
+        push(mut out, s)
+    }
+    Substituted { types: out, complete: true }
+}
+
+fn substitute(c: *Checker, target: *types.Type?, inf: *Inference, pos: diag.Pos) -> *types.Type? ! diag.Error {
+    let t = target ?? return none
+    if !types.abstract(t) {
+        return t
+    }
+    if is_param(inf, t) {
+        return inf.bound[t]
+    }
+    if t.kind == ParamKind {
+        return t
+    }
+    if t.optional {
+        let e = substitute(c, t.elem, inf, pos)? ?? return none
+        return c.universe.optional(e)?
+    }
+    match t.kind {
+        SliceKind => {
+            let e = substitute(c, t.elem, inf, pos)? ?? return none
+            return c.universe.slice(e)?
+        }
+        PointerKind => {
+            let e = substitute(c, t.elem, inf, pos)? ?? return none
+            return c.universe.pointer(e)?
+        }
+        RawKind => {
+            let e = substitute(c, t.elem, inf, pos)? ?? return none
+            return c.universe.raw(e)?
+        }
+        ChanKind => {
+            let e = substitute(c, t.elem, inf, pos)? ?? return none
+            return c.universe.channel(e)?
+        }
+        MapKind => {
+            let k = substitute(c, t.key, inf, pos)?
+            let v = substitute(c, t.elem, inf, pos)?
+            let key = k ?? return none
+            let value = v ?? return none
+            return c.universe.map(key, value)?
+        }
+        ResultKind => {
+            let ok = substitute(c, t.ok, inf, pos)?
+            let err = substitute(c, t.err, inf, pos)?
+            let done = ok ?? return none
+            let failed = err ?? return none
+            return c.universe.result(done, failed)?
+        }
+        FuncKind => {
+            let params = substitute_all(c, t.params, inf, pos)?
+            let ret = substitute(c, t.ret, inf, pos)?
+            if !params.complete {
+                return none
+            }
+            let r = ret ?? return none
+            return c.universe.func(params.types, t.muts, r, t.c)?
+        }
+        _ => {}
+    }
+    if t.origin != none {
+        let args = substitute_all(c, t.type_args, inf, pos)?
+        if args.complete {
+            let origin_type = t.origin ?? panic("origin vanished")
+            let g = c.generics[origin_type] ?? panic("generic of {t.text()} is not registered")
+            return instantiate_type(c, g, args.types, pos)?
+        }
+    }
+    none
+}
+
+struct GenericValue {
+    inst: *ast.Func? = none
+    abstract: *types.Type? = none
+}
+
+fn generic_func_value(c: *Checker, f: *ast.Func, target: *types.Type?, pos: diag.Pos) -> GenericValue ! diag.Error {
+    let want = target ?? fail At(pos, "cannot infer type arguments of {f.name}; annotate the binding")
+    if want.kind != FuncKind || want.params.len != f.params.len {
+        fail At(pos, "cannot infer type arguments of {f.name}; annotate the binding")
+    }
+    let inf = infer(f.name, f.type_params, f.type_args)
+    unify_pairs(inf, f.param_types, want.params)
+    unify_types(inf, f.ret_type, want.ret)
+    let args = inferred(c, inf, pos)?
+    if concrete(args) {
+        let inst = instance(c, f, args, pos)?
+        return GenericValue { inst }
+    }
+    var params: []*types.Type = []
+    for p in f.param_types {
+        let s = substitute(c, p, inf, pos)? ?? panic("parameter of {f.name} is not substituted")
+        push(mut params, s)
+    }
+    let ret = substitute(c, f.ret_type, inf, pos)? ?? panic("result of {f.name} is not substituted")
+    let abstract_type = c.universe.func(params, want.muts, ret, want.c)?
+    GenericValue { abstract: abstract_type }
+}
+
+fn concrete(args: []*types.Type) -> bool {
+    for a in args {
+        if types.abstract(a) {
+            return false
+        }
+    }
+    true
+}
+
+fn generic_call(c: *Checker, e: *ast.Call, f: *ast.Func, explicit: []*ast.TypeName, want: *types.Type?) ! diag.Error {
+    let inf = infer(f.name, f.type_params, f.type_args)
+    if explicit.len > 0 {
+        if explicit.len != inf.params.len {
+            fail At(e.pos, "{f.name} takes {plural(inf.params.len, "type argument")}, found {explicit.len}")
+        }
+        for i, t in explicit {
+            inf.bound[inf.params[i]] = resolve(c, t)?
+        }
+    }
+    if e.args.len != f.params.len {
+        fail At(e.pos, "{f.name} takes {f.params.len} arguments, found {e.args.len}")
+    }
+    var found: []*types.Type = []
+    var closures: []i64 = []
+    for arg in e.args {
+        push(mut found, c.universe.void)
+    }
+    for i, arg in e.args {
+        match arg {
+            Closure(n) => {
+                push(mut closures, i)
+                continue
+            }
+            _ => {}
+        }
+        let describe = "{f.params[i].name} of {f.name}"
+        let r = mut_argument(c, arg, f.params[i].mutable, describe)?
+        match r {
+            some(ref_arg) => { found[i] = borrow(c, ref_arg)? }
+            none => {
+                let hint = substitute(c, f.param_types[i], inf, ast.position(arg))?
+                found[i] = plain(c, arg, hint)?
+            }
+        }
+        unify_types(inf, f.param_types[i], found[i])
+    }
+    for i in closures {
+        let arg = e.args[i]
+        let hint = closure_hint(c, f.param_types[i], inf, ast.position(arg))?
+        found[i] = plain(c, arg, hint)?
+        unify_types(inf, f.param_types[i], found[i])
+    }
+    unify_types(inf, f.ret_type, unwrap(want))
+    let args = inferred(c, inf, e.pos)?
+    for i, arg in e.args {
+        let param = substitute(c, f.param_types[i], inf, ast.position(arg))? ?? panic("parameter of {f.name} is not substituted")
+        let exact = f.params[i].mutable && param != found[i]
+        if exact || !param.accepts(found[i]) {
+            fail At(ast.position(arg), "expected {param.text()}, found {found[i].text()}")
+        }
+    }
+    exclusive(c, e.args)?
+    e.target = f
+    if concrete(args) {
+        e.target = instance(c, f, args, e.pos)?
+    }
+    e.type = substitute(c, f.ret_type, inf, e.pos)?
+    forwarded(c, e, f)
+}
+
+fn closure_hint(c: *Checker, pattern: *types.Type, inf: *Inference, pos: diag.Pos) -> *types.Type? ! diag.Error {
+    if pattern.kind != FuncKind || pattern.optional || pattern.c {
+        return substitute(c, pattern, inf, pos)?
+    }
+    var params: []*types.Type = []
+    for p in pattern.params {
+        let s = substitute(c, p, inf, pos)? ?? c.unresolved
+        push(mut params, s)
+    }
+    let ret = substitute(c, pattern.ret, inf, pos)?
+    new(types.Type { kind: FuncKind, params, muts: pattern.muts, ret })
+}
+
+fn generic_target(c: *Checker, x: ast.Expr) -> *ast.Func? ! diag.Error {
+    var f: *ast.Func? = none
+    match x {
+        Ident(id) => {
+            if find(c, id.name) == none {
+                f = local(c).funcs[id.name]
+            }
+        }
+        Selector(sel) => {
+            match sel.x {
+                Ident(id) => {
+                    if is_module(c, id.name) {
+                        f = imported_func(c, id.name, sel.name, sel.pos)?
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    let found = f ?? return none
+    if found.type_params.len == 0 {
+        return none
+    }
+    found
+}
+
+fn instance_call(c: *Checker, e: *ast.Call, inst: *ast.Instance, want: *types.Type?) ! diag.Error {
+    match inst.x {
+        Ident(id) => {
+            match builtin_named(c, id.name) {
+                some(b) => {
+                    if b.has_construct {
+                        type_arity(c, b, inst)?
+                        arity(c, b, e)?
+                        let build = b.construct
+                        build(c, e, inst)?
+                        return
+                    }
+                }
+                none => {}
+            }
+        }
+        _ => {}
+    }
+    match generic_target(c, inst.x)? {
+        some(f) => {
+            generic_call(c, e, f, inst.types, want)?
+            return
+        }
+        none => {}
+    }
+    let fallback = inst.fallback ?? fail At(inst.pos, "only generic functions take type arguments")
+    e.callee = fallback
+    call(c, e, want)?
+}
+
+fn generic_lit_type(c: *Checker, e: *ast.StructLit, g: *Generic, want: *types.Type?, checked: [*ast.FieldInit: *types.Type]) -> *types.Type ! diag.Error {
+    if g.struct_decl == none {
+        fail At(e.pos, "{e.name} is not a struct")
+    }
+    if e.type_args.len > 0 {
+        var args: []*types.Type = []
+        for t in e.type_args {
+            push(mut args, resolve(c, t)?)
+        }
+        return instantiate_type(c, g, args, e.pos)?
+    }
+    let origin_type = origin(c, g)?
+    match unwrap(want) {
+        some(w) => {
+            if w.origin == origin_type {
+                return w
+            }
+        }
+        none => {}
+    }
+    let inf = infer(g.name, g.decls, g.params)
+    for init in e.fields {
+        let f = origin_type.field(init.name) ?? fail At(init.pos, "{g.name} has no field {init.name}")
+        let hint = substitute(c, f.type, inf, init.pos)?
+        let t = plain(c, init.value, hint)?
+        checked[init] = t
+        unify_types(inf, f.type, t)
+    }
+    let args = inferred(c, inf, e.pos)?
+    instantiate_type(c, g, args, e.pos)?
+}
+
+struct GenericEnum {
+    type: *types.Type
+    variant: *types.Variant
+    args: []*types.Type
+}
+
+fn generic_enum(c: *Checker, g: *Generic, name: str, args: []ast.Expr, want: *types.Type?, pos: diag.Pos) -> GenericEnum ! diag.Error {
+    if g.enum_decl == none {
+        fail At(pos, "{g.name} is a type, not a value")
+    }
+    let origin_type = origin(c, g)?
+    match unwrap(want) {
+        some(w) => {
+            if w.origin == origin_type {
+                let v = variant_of(c, w, name, pos)?
+                return GenericEnum { type: w, variant: v, args: [] }
+            }
+        }
+        none => {}
+    }
+    let v = variant_of(c, origin_type, name, pos)?
+    if args.len != v.fields.len {
+        fail At(pos, "variant {name} takes {v.fields.len} fields, found {args.len}")
+    }
+    let inf = infer(g.name, g.decls, g.params)
+    var found: []*types.Type = []
+    for i, arg in args {
+        let hint = substitute(c, v.fields[i], inf, ast.position(arg))?
+        let t = plain(c, arg, hint)?
+        push(mut found, t)
+        unify_types(inf, v.fields[i], t)
+    }
+    let inferred_args = inferred(c, inf, pos)?
+    let t = instantiate_type(c, g, inferred_args, pos)?
+    let chosen = t.variant(name) ?? panic("{t.text()} has no variant {name}")
+    GenericEnum { type: t, variant: chosen, args: found }
+}
+
+fn instantiate_ops(c: *Checker, t: *types.Type, role: prelude.Role, args: []*types.Type) ! diag.Error {
+    if types.abstract(t) {
+        return
+    }
+    when(c, Ready, fn() ! diag.Error {
+        let home = scope(c, "")
+        for name in prelude.instances(role) {
+            let f = home.funcs[name] ?? panic("prelude function {name} is missing")
+            instance(c, f, args, diag.Pos {})?
+        }
+    })?
+}

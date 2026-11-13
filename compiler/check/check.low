@@ -1,0 +1,2681 @@
+import ast
+import builtin
+import diag
+import lexer
+import prelude
+import types
+import std/builder
+import std/hash
+import std/slices
+import std/text
+
+struct Loop {
+    label: str
+    broken: bool = false
+    used: bool = false
+}
+
+struct Scope {
+    types: [str: *types.Type] = [:]
+    generics: [str: *Generic] = [:]
+    funcs: [str: *ast.Func] = [:]
+    consts: [str: *ast.Const] = [:]
+    home: *ast.File? = none
+}
+
+pub struct Checker {
+    universe: *types.Universe
+    phase: Phase = Declaring
+    waiting: [i64: []fn() ! diag.Error] = [:]
+    modules: [str: *Scope] = [:]
+    ctx: FuncContext
+    builtins: [str: *Builtin] = [:]
+    counts: [*ast.Func: i64] = [:]
+    generics: [*types.Type: *Generic] = [:]
+    pristine: [*ast.Func: *ast.Func] = [:]
+    instances: [*ast.Func: [str: *ast.Func]] = [:]
+    pending: []*ast.Func = []
+    spawns: i64 = 0
+    drops: [*types.Type: *DropSource] = [:]
+    droppables: [*types.Type: bool] = [:]
+    drop_funcs: [*types.Type: *ast.Func] = [:]
+    release_funcs: [*types.Type: *ast.Func] = [:]
+    struct_files: [*types.Type: *ast.File] = [:]
+    flags: i64 = 0
+    subjects: []*types.Type = []
+    field_sources: [*types.Field: *FieldSource] = [:]
+    defaults: [*types.Field: ast.Expr] = [:]
+    checking_default: [*types.Field: bool] = [:]
+    derived: [str: *ast.Func] = [:]
+    folding: [*ast.Const: bool] = [:]
+    embedder: fn(*ast.File, str) -> Embedded ! EmbedError
+    unresolved: *types.Type
+    unpropagated: *types.Type? = none
+}
+
+pub struct Embedded {
+    pub path: str
+    pub data: []u8
+}
+
+pub enum EmbedError {
+    Missing
+    Failed(msg: str)
+}
+
+struct Link {
+    checker: *Checker? = none
+}
+
+pub fn check(files: []*ast.File, resolve: fn(*ast.File, str) -> Embedded ! EmbedError) -> *types.Universe ! diag.Error {
+    let link = new(Link {})
+    let u = types.new_universe(fn(t: *types.Type) ! diag.Error {
+        let c = link.checker ?? panic("the universe announced a type before the checker existed")
+        created(c, t)?
+    })
+    let c = new(Checker {
+        universe: u
+        ctx: FuncContext { file: new(ast.File {}), bound: [:], scopes: [] }
+        builtins: builtin_index(u)
+        embedder: resolve
+        unresolved: new(types.Type { kind: ParamKind, name: "?" })
+    })
+    link.checker = c
+    check_files(c, files)?
+    u
+}
+
+fn scope(c: *Checker, module: str) -> *Scope {
+    match c.modules[module] {
+        some(s) => s
+        none => {
+            let s = new(Scope {})
+            c.modules[module] = s
+            s
+        }
+    }
+}
+
+fn local(c: *Checker) -> *Scope {
+    scope(c, c.ctx.file.module)
+}
+
+fn qualified(module: str, name: str) -> str {
+    if module == "" {
+        return name
+    }
+    "{module}.{name}"
+}
+
+fn imported_scope(c: *Checker, alias: str, pos: diag.Pos) -> *Scope ! diag.Error {
+    let path = c.ctx.file.imported(alias) ?? fail At(pos, "unknown module {alias}")
+    scope(c, path)
+}
+
+fn is_module(c: *Checker, name: str) -> bool {
+    c.ctx.file.imported(name) != none && find(c, name) == none
+}
+
+fn imported_type(c: *Checker, alias: str, name: str, pos: diag.Pos) -> *types.Type ! diag.Error {
+    let home = imported_scope(c, alias, pos)?
+    let t = home.types[name] ?? fail At(pos, "module {alias} has no type {name}")
+    if !t.exported {
+        fail At(pos, "{alias}.{name} is private")
+    }
+    t
+}
+
+fn imported_func(c: *Checker, alias: str, name: str, pos: diag.Pos) -> *ast.Func ! diag.Error {
+    let home = imported_scope(c, alias, pos)?
+    let f = home.funcs[name] ?? fail At(pos, "module {alias} has no function {name}")
+    if !f.exported {
+        fail At(pos, "{alias}.{name} is private")
+    }
+    f
+}
+
+fn named(t: *ast.TypeName?) -> *ast.TypeName {
+    t ?? panic("missing type name")
+}
+
+fn resolve(c: *Checker, t: *ast.TypeName) -> *types.Type ! diag.Error {
+    if t.is_pointer {
+        let elem = contained(c, named(t.elem), "a pointer")?
+        return c.universe.pointer(elem)?
+    }
+    if t.is_slice {
+        let elem = contained(c, named(t.elem), "a slice")?
+        return c.universe.slice(elem)?
+    }
+    if t.is_map {
+        let key_name = named(t.key)
+        let resolved = resolve(c, key_name)?
+        let key = map_key(c, resolved, key_name.pos)?
+        let elem = contained(c, named(t.elem), "a map")?
+        return c.universe.map(key, elem)?
+    }
+    if t.is_optional {
+        let elem = contained(c, named(t.elem), "an optional")?
+        return c.universe.optional(elem)?
+    }
+    if t.is_func {
+        return func_type_name(c, t)?
+    }
+    let bound = c.ctx.bound[t.name]
+    if t.module == "" {
+        match bound {
+            some(b) => {
+                if t.args.len > 0 {
+                    fail At(t.pos, "type parameter {t.name} takes no type arguments")
+                }
+                return b
+            }
+            none => {}
+        }
+    }
+    let found = lookup_builtin(c, t.name)
+    if t.module == "" {
+        match found {
+            some(b) => {
+                if b.kind == TypeBuiltin {
+                    return builtin_type(c, b, t)?
+                }
+            }
+            none => {}
+        }
+    }
+    let g = lookup_generic(c, t.module, t.name, t.pos)?
+    match g {
+        some(generic) => {
+            if t.args.len == 0 {
+                fail At(t.pos, "{t.name} needs type arguments")
+            }
+            var args: []*types.Type = []
+            for a in t.args {
+                let arg = resolve(c, a)?
+                push(mut args, arg)
+            }
+            return instantiate_type(c, generic, args, t.pos)?
+        }
+        none => {}
+    }
+    if t.args.len > 0 {
+        fail At(t.pos, "{t.name} is not generic")
+    }
+    if t.module != "" {
+        return imported_type(c, t.module, t.name, t.pos)?
+    }
+    let home = local(c)
+    home.types[t.name] ?? fail At(t.pos, "unknown type {t.name}")
+}
+
+fn map_key(c: *Checker, key: *types.Type, pos: diag.Pos) -> *types.Type ! diag.Error {
+    if !key.hashable() {
+        fail At(pos, "map keys must be integers, bool, str or pointers, found {key.text()}")
+    }
+    key
+}
+
+fn func_type_name(c: *Checker, t: *ast.TypeName) -> *types.Type ! diag.Error {
+    var params: []*types.Type = []
+    for i, p in t.params {
+        let param = resolve(c, p)?
+        push(mut params, param)
+        if t.is_c_func {
+            require_c(c, param, p.pos, "extern fn parameters")?
+        }
+    }
+    let ret = result_of(c, t.result, t.error)?
+    if t.is_c_func {
+        require_c_result(c, ret, t.pos, "extern fn results")?
+    }
+    c.universe.func(params, t.muts, ret, t.is_c_func)?
+}
+
+fn signature_of(c: *Checker, f: *ast.Func, cfn: bool) -> *types.Type ! diag.Error {
+    var muts: []bool = []
+    for p in f.params {
+        push(mut muts, p.mutable)
+    }
+    c.universe.func(f.param_types, muts, ret_type_of(f), cfn)?
+}
+
+fn ret_type_of(f: *ast.Func) -> *types.Type {
+    f.ret_type ?? panic("function {f.name} has no result type yet")
+}
+
+fn check_files(c: *Checker, files: []*ast.File) ! diag.Error {
+    declare_types(c, files)?
+    declare_funcs(c, files)?
+    declare_consts(c, files)?
+    var funcs: []*ast.Func = []
+    for f in files {
+        for fn_decl in f.funcs {
+            if fn_decl.template == none {
+                push(mut funcs, fn_decl)
+            }
+        }
+    }
+    check_drops(c, files)?
+    check_defaults(c, files)?
+    check_main(c, files)?
+    for f in funcs {
+        function(c, f)?
+    }
+    for c.pending.len > 0 {
+        let f = c.pending[0]
+        c.pending = c.pending[1..]
+        function(c, f)?
+    }
+}
+
+fn declare_type(c: *Checker, name: str, pos: diag.Pos, t: *types.Type, exported: bool) ! diag.Error {
+    let home = local(c)
+    let is_generic = home.generics[name] != none
+    if home.types[name] != none || reserved_type(c, name) || is_generic {
+        fail At(pos, "type {name} already declared")
+    }
+    t.module = c.ctx.file.module
+    t.exported = exported
+    home.types[name] = t
+}
+
+fn declare_types(c: *Checker, files: []*ast.File) ! diag.Error {
+    for f in files {
+        c.ctx.file = f
+        let home = local(c)
+        if home.home == none {
+            home.home = f
+        }
+        for d in f.enums {
+            if d.variants.len == 0 {
+                fail At(d.pos, "enum {d.name} has no variants")
+            }
+            if d.type_params.len > 0 {
+                let g = declare_generic(c, d.name, d.type_params, d.exported, d.pos)?
+                g.enum_decl = d
+                continue
+            }
+            let t = types.new_enum(c.universe, qualified(f.module, d.name))
+            d.type = t
+            declare_type(c, d.name, d.pos, t, d.exported)?
+        }
+        for d in f.structs {
+            if d.fields.len == 0 {
+                fail At(d.pos, "struct {d.name} has no fields")
+            }
+            if d.type_params.len > 0 && d.c {
+                fail At(d.pos, "extern struct {d.name} cannot be generic")
+            }
+            if d.type_params.len > 0 {
+                let g = declare_generic(c, d.name, d.type_params, d.exported, d.pos)?
+                g.struct_decl = d
+                continue
+            }
+            let t = types.new_struct(c.universe, qualified(f.module, d.name))
+            t.c = d.c
+            d.type = t
+            declare_type(c, d.name, d.pos, t, d.exported)?
+        }
+    }
+    for f in files {
+        c.ctx.file = f
+        for d in f.enums {
+            if d.type_params.len > 0 {
+                let g = local(c).generics[d.name] ?? panic("generic {d.name} is not declared")
+                d.type = origin(c, g)?
+                continue
+            }
+            declare_variants(c, d, decl_type(d.type))?
+        }
+        for d in f.structs {
+            if d.type_params.len > 0 {
+                let g = local(c).generics[d.name] ?? panic("generic {d.name} is not declared")
+                d.type = origin(c, g)?
+                continue
+            }
+            declare_fields(c, d, decl_type(d.type))?
+        }
+    }
+    for f in files {
+        for d in f.enums {
+            layout(c, decl_type(d.type), d.pos)?
+        }
+        for d in f.structs {
+            layout(c, decl_type(d.type), d.pos)?
+        }
+    }
+    advance(c, Laid)?
+}
+
+fn decl_type(t: *types.Type?) -> *types.Type {
+    t ?? panic("declaration has no type")
+}
+
+fn layout(c: *Checker, t: *types.Type, pos: diag.Pos) ! diag.Error {
+    types.layout(t) catch {
+        e => fail At(pos, types.message(e))
+    }
+}
+
+fn declare_variants(c: *Checker, d: *ast.EnumDecl, t: *types.Type) ! diag.Error {
+    for i, vd in d.variants {
+        if t.variant(vd.name) != none {
+            fail At(vd.pos, "variant {vd.name} already declared in {d.name}")
+        }
+        let v = new(types.Variant { name: vd.name, tag: i, labels: vd.labels })
+        for f in vd.fields {
+            let field = contained(c, f, "an enum variant")?
+            push(mut v.fields, field)
+        }
+        push(mut t.variants, v)
+    }
+    declare_indexes(c, d, t)?
+}
+
+fn declare_indexes(c: *Checker, d: *ast.EnumDecl, t: *types.Type) ! diag.Error {
+    t.indexed = false
+    for vd in d.variants {
+        if vd.index != none {
+            t.indexed = true
+        }
+    }
+    if !t.indexed {
+        return
+    }
+    for i, vd in d.variants {
+        let index = vd.index ?? fail At(vd.pos, "variant {vd.name} has no index; give every variant of {d.name} an index or none")
+        if index.wide {
+            fail At(index.pos, "index of variant {vd.name} does not fit in i64")
+        }
+        t.variants[i].index = index.value
+    }
+}
+
+fn declare_fields(c: *Checker, d: *ast.StructDecl, st: *types.Type) ! diag.Error {
+    record_struct(c, d, st)
+    for fd in d.fields {
+        if st.field(fd.name) != none {
+            fail At(fd.pos, "field {fd.name} already declared in {d.name}")
+        }
+        let t = resolve(c, fd.type_name)?
+        if d.c {
+            require_c(c, t, fd.type_name.pos, "extern struct fields")?
+        }
+        let field = new(types.Field { name: fd.name, exported: fd.exported, type: t })
+        push(mut st.fields, field)
+        record_default(c, d, st, fd, field)
+    }
+}
+
+fn declare_funcs(c: *Checker, files: []*ast.File) ! diag.Error {
+    for f in files {
+        c.ctx.file = f
+        for fn_decl in f.funcs {
+            declare_func(c, fn_decl)?
+        }
+        for e in f.externs {
+            for fn_decl in e.funcs {
+                declare_func(c, fn_decl)?
+                c_signature(c, fn_decl)?
+            }
+        }
+    }
+    advance(c, Ready)?
+}
+
+fn c_signature(c: *Checker, f: *ast.Func) ! diag.Error {
+    for i, p in f.params {
+        require_c(c, f.param_types[i], named(p.type_name).pos, "extern parameters")?
+    }
+    match f.result {
+        some(result) => require_c_result(c, ret_type_of(f), result.pos, "extern results")?
+        none => {}
+    }
+}
+
+fn require_c(c: *Checker, t: *types.Type, pos: diag.Pos, what: str) ! diag.Error {
+    if !t.c_compatible() {
+        fail At(pos, "{what} must have C types, found {t.text()}")
+    }
+}
+
+fn require_c_result(c: *Checker, t: *types.Type, pos: diag.Pos, what: str) ! diag.Error {
+    if t != c.universe.void {
+        require_c(c, t, pos, what)?
+    }
+}
+
+fn declare_func(c: *Checker, f: *ast.Func) ! diag.Error {
+    let home = local(c)
+    if home.funcs[f.name] != none {
+        fail At(f.pos, "function {f.name} already declared")
+    }
+    if fixed_builtin(c, f.name) != none {
+        fail At(f.pos, "{f.name} is a builtin")
+    }
+    let is_generic = home.generics[f.name] != none
+    if home.types[f.name] != none || reserved_type(c, f.name) || is_generic {
+        fail At(f.pos, "function {f.name} has the name of a type")
+    }
+    if f.type_params.len > 0 {
+        declare_generic_func(c, f)?
+    } else {
+        signature(c, f)?
+    }
+    home.funcs[f.name] = f
+}
+
+fn signature(c: *Checker, f: *ast.Func) ! diag.Error {
+    for p in f.params {
+        let t = resolve(c, named(p.type_name))?
+        push(mut f.param_types, t)
+    }
+    f.ret_type = result_of(c, f.result, f.error)?
+}
+
+fn result_of(c: *Checker, ok_name: *ast.TypeName?, error_name: *ast.TypeName?) -> *types.Type ! diag.Error {
+    var ok = c.universe.void
+    match ok_name {
+        some(r) => { ok = resolve(c, r)? }
+        none => {}
+    }
+    let error_type = error_name ?? return ok
+    let err = resolve(c, error_type)?
+    if err.kind != EnumKind {
+        fail At(error_type.pos, "error type must be an enum, found {err.text()}")
+    }
+    c.universe.result(ok, err)?
+}
+
+fn check_main(c: *Checker, files: []*ast.File) ! diag.Error {
+    let entry = scope(c, "")
+    let main = entry.funcs["main"] ?? fail At(entry_start(files), "missing function main")
+    let ret = ret_type_of(main)
+    if main.params.len > 0 || main.type_params.len > 0 || (ret != c.universe.void && (ret.kind != ResultKind || ret.ok_of() != c.universe.void)) {
+        fail At(main.pos, "main must take no parameters and return nothing or ! E")
+    }
+}
+
+fn entry_start(files: []*ast.File) -> diag.Pos {
+    for f in files {
+        if f.module == "" && f.path != "" {
+            return diag.start(f.path)
+        }
+    }
+    diag.start("")
+}
+
+fn function(c: *Checker, f: *ast.Func) ! diag.Error {
+    let owner = f.file ?? panic("function {f.name} has no file")
+    let next = FuncContext { file: owner, bound: bindings_of(c, f), scopes: [], abstract: f.type_params.len > 0 }
+    enter(c, next, fn() ! diag.Error {
+        body(c, f)?
+        if !c.ctx.abstract {
+            mark_read_only(c, f)
+        }
+    })?
+}
+
+fn body(c: *Checker, f: *ast.Func) ! diag.Error {
+    c.ctx.func = f
+    push_scope(c)
+    let params = c.ctx.scopes[c.ctx.scopes.len - 1]
+    for i, p in f.params {
+        if params[p.name] != none {
+            fail At(p.pos, "parameter {p.name} already declared")
+        }
+        let l = new(ast.Local { name: p.name, type: f.param_types[i], mutable: p.mutable, param: true, ref: p.mutable, owner: f })
+        params[p.name] = l
+        push(mut f.param_locals, l)
+    }
+    let block_body = f.body ?? panic("function {f.name} has no body")
+    let got = expr(c, ast.Expr.Block(block_body), ok_type(c))?
+    if f.ret_type == none {
+        handled(c, block_body.tail, got)?
+        f.ret_type = inferred_result(c, got)
+    }
+    let declared = ret_type_of(f)
+    if got.kind == ResultKind && got != declared {
+        handled(c, block_body.tail, got)?
+    }
+    if !returnable(c, got) {
+        let want = ok_type(c) ?? panic("function {f.name} has no result type yet")
+        fail At(block_body.pos, "{subject(c)} must return {want.text()}, body produces {got.text()}")
+    }
+    if !c.ctx.abstract {
+        check_moves(c, f)?
+    }
+    pop_scope(c)
+}
+
+fn current(c: *Checker) -> *ast.Func {
+    c.ctx.func ?? panic("no function is being checked")
+}
+
+fn subject(c: *Checker) -> str {
+    let f = current(c)
+    if f.closure != none {
+        return "the closure"
+    }
+    "function {f.name}"
+}
+
+fn closure(c: *Checker, e: *ast.Closure, expected: *types.Type?) ! diag.Error {
+    var want = unwrap(expected)
+    match want {
+        some(w) => {
+            if w.kind != FuncKind || w.c || w.params.len != e.params.len {
+                want = none
+            }
+        }
+        none => {}
+    }
+    let f = new(ast.Func { name: closure_name(c), file: c.ctx.file, closure: e, params: e.params, result: e.result, error: e.error, body: e.body, pos: e.pos })
+    for i, p in e.params {
+        match p.type_name {
+            some(tn) => {
+                let t = resolve(c, tn)?
+                push(mut f.param_types, t)
+            }
+            none => {
+                var inferred: *types.Type? = none
+                match want {
+                    some(w) => {
+                        if w.params[i] != c.unresolved {
+                            inferred = w.params[i]
+                        }
+                    }
+                    none => {}
+                }
+                let t = inferred ?? fail At(p.pos, "cannot infer the type of parameter {p.name}; annotate it")
+                push(mut f.param_types, t)
+            }
+        }
+    }
+    if e.result != none || e.error != none {
+        f.ret_type = result_of(c, e.result, e.error)?
+    } else {
+        match want {
+            some(w) => {
+                if w.ret != none {
+                    f.ret_type = w.ret
+                }
+            }
+            none => {
+                if !e.inline {
+                    f.ret_type = c.universe.void
+                }
+            }
+        }
+    }
+    e.func = f
+    if !c.ctx.abstract {
+        push(mut c.ctx.file.funcs, f)
+    }
+    var next = c.ctx
+    push(mut next.closures, e)
+    next.loops = []
+    next.deferring = false
+    enter(c, next, fn() ! diag.Error { body(c, f) })?
+    e.type = signature_of(c, f, false)?
+}
+
+fn closure_name(c: *Checker) -> str {
+    let f = current(c)
+    let n = (c.counts[f] ?? 0) + 1
+    c.counts[f] = n
+    "{f.name}..c{n}"
+}
+
+struct FuncValue {
+    func: *ast.Func
+    type: *types.Type
+}
+
+fn func_value(c: *Checker, f: *ast.Func, expected: *types.Type?, pos: diag.Pos) -> FuncValue ! diag.Error {
+    if f.variadic {
+        fail At(pos, "variadic function {f.name} cannot be used as a value")
+    }
+    let want = unwrap(expected)
+    var target = f
+    if f.type_params.len > 0 {
+        let made = generic_func_value(c, f, want, pos)?
+        match made.inst {
+            some(inst) => { target = inst }
+            none => {
+                let t = made.abstract ?? panic("generic function value without a type")
+                return FuncValue { func: f, type: t }
+            }
+        }
+    }
+    var is_callback = false
+    if target.external == none {
+        match want {
+            some(w) => { is_callback = w.kind == FuncKind && w.c }
+            none => {}
+        }
+    }
+    if is_callback {
+        callback(c, target, pos)?
+    }
+    if target.external == none && !is_callback {
+        target.as_value = true
+    }
+    let t = signature_of(c, target, target.external != none || is_callback)?
+    FuncValue { func: target, type: t }
+}
+
+fn callback(c: *Checker, f: *ast.Func, pos: diag.Pos) ! diag.Error {
+    for i, t in f.param_types {
+        if f.params[i].mutable || !t.c_scalar() {
+            fail At(pos, "{f.name} cannot be a C callback: parameter {f.params[i].name} must be a number, bool, ptr or extern fn")
+        }
+    }
+    let ret = ret_type_of(f)
+    if ret != c.universe.void && !ret.c_scalar() {
+        fail At(pos, "{f.name} cannot be a C callback: it must return a number, bool, ptr or extern fn")
+    }
+    f.callback = true
+}
+
+fn inferred_result(c: *Checker, t: *types.Type) -> *types.Type {
+    if t == c.universe.never {
+        return c.universe.void
+    }
+    t
+}
+
+fn require_result(c: *Checker, pos: diag.Pos, what: str) ! diag.Error {
+    if current(c).ret_type == none {
+        fail At(pos, "{what} in a closure requires its result to be written")
+    }
+}
+
+fn ok_type(c: *Checker) -> *types.Type? {
+    let ret = current(c).ret_type ?? return none
+    if ret.kind == ResultKind {
+        return ret.ok
+    }
+    ret
+}
+
+fn current_ok(c: *Checker) -> *types.Type {
+    ok_type(c) ?? panic("function {current(c).name} has no result type yet")
+}
+
+fn returnable(c: *Checker, t: *types.Type) -> bool {
+    let ret = ret_type_of(current(c))
+    let ok = current_ok(c)
+    if ret.accepts(t) || ok.accepts(t) {
+        return true
+    }
+    if t.kind == ResultKind {
+        return false
+    }
+    ok == c.universe.void
+}
+
+fn declare(c: *Checker, name: str, t: *types.Type, mutable: bool) -> *ast.Local {
+    let l = new(ast.Local { name, type: t, mutable, owner: c.ctx.func })
+    c.ctx.scopes[c.ctx.scopes.len - 1][name] = l
+    l
+}
+
+fn find(c: *Checker, name: str) -> *ast.Local? {
+    var i = c.ctx.scopes.len - 1
+    for i >= 0 {
+        match c.ctx.scopes[i][name] {
+            some(l) => return l
+            none => {}
+        }
+        i -= 1
+    }
+    none
+}
+
+fn lookup(c: *Checker, name: str, pos: diag.Pos) -> *ast.Local ! diag.Error {
+    let l = find(c, name) ?? fail At(pos, "undefined: {name}")
+    capture(c, l, pos)?
+    l
+}
+
+fn capture(c: *Checker, l: *ast.Local, pos: diag.Pos) ! diag.Error {
+    var i = c.ctx.closures.len - 1
+    for i >= 0 && c.ctx.closures[i].func != l.owner {
+        if l.ref {
+            fail At(pos, "a closure cannot capture mut parameter {l.name}")
+        }
+        let lt = l.type ?? panic("local {l.name} has no type")
+        if droppable(c, lt) {
+            fail At(pos, "a closure cannot capture {l.name}; {lt.text()} has drop")
+        }
+        l.captured = true
+        let closure_expr = c.ctx.closures[i]
+        if !slices.contains(closure_expr.captures, l) {
+            push(mut closure_expr.captures, l)
+        }
+        i -= 1
+    }
+}
+
+fn push_scope(c: *Checker) {
+    push(mut c.ctx.scopes, [:])
+}
+
+fn pop_scope(c: *Checker) {
+    c.ctx.scopes = c.ctx.scopes[..c.ctx.scopes.len - 1]
+}
+
+fn block(c: *Checker, b: *ast.Block, want: *types.Type?) -> *types.Type ! diag.Error {
+    push_scope(c)
+    var diverges = false
+    for s in b.stmts {
+        if stmt(c, s)? {
+            diverges = true
+        }
+    }
+    b.type = c.universe.void
+    match b.tail {
+        some(tail) => { b.type = expr(c, tail, want)? }
+        none => {}
+    }
+    if diverges {
+        b.type = c.universe.never
+    }
+    pop_scope(c)
+    b.type ?? panic("block has no type")
+}
+
+fn stmt(c: *Checker, s: ast.Stmt) -> bool ! diag.Error {
+    match s {
+        Let(n) => let_stmt(c, n)?
+        Assign(n) => assign(c, n)?
+        ExprStmt(n) => {
+            let t = expr(c, n.x, none)?
+            handled(c, n.x, t)?
+            return t == c.universe.never
+        }
+        For(n) => return for_stmt(c, n)?
+        ForIn(n) => for_in(c, n)?
+        Break(n) => {
+            leaving(c, n.pos, "break")?
+            let found = target(c, n.pos, "break", n.label)?
+            found.loop.broken = true
+            n.depth = found.depth
+            return true
+        }
+        Continue(n) => {
+            leaving(c, n.pos, "continue")?
+            let found = target(c, n.pos, "continue", n.label)?
+            n.depth = found.depth
+            return true
+        }
+        Return(n) => {
+            leaving(c, n.pos, "return")?
+            ret(c, n)?
+            return true
+        }
+        Fail(n) => {
+            leaving(c, n.pos, "fail")?
+            fail_stmt(c, n)?
+            return true
+        }
+        Defer(n) => defer_stmt(c, n)?
+        Spawn(n) => spawn_stmt(c, n)?
+        Send(n) => send(c, n)?
+    }
+    false
+}
+
+fn defer_stmt(c: *Checker, s: *ast.Defer) ! diag.Error {
+    if c.ctx.deferring {
+        fail At(s.pos, "defer cannot be nested in a deferred statement")
+    }
+    var next = c.ctx
+    next.loops = []
+    next.deferring = true
+    enter(c, next, fn() ! diag.Error {
+        push_scope(c)
+        if stmt(c, s.body)? {
+            fail At(s.pos, "a deferred statement cannot leave its scope")
+        }
+    })?
+}
+
+fn leaving(c: *Checker, pos: diag.Pos, keyword: str) ! diag.Error {
+    if c.ctx.deferring {
+        fail At(pos, "{keyword} cannot appear in a deferred statement")
+    }
+}
+
+fn destructure_let(c: *Checker, s: *ast.Let) ! diag.Error {
+    let t = plain(c, s.value, none)?
+    let temp = new(ast.Local { name: "", type: t, owner: c.ctx.func })
+    let pattern = s.pattern ?? panic("destructuring let without a pattern")
+    destructure(c, pattern, t, temp, s.mutable)?
+}
+
+fn destructure(c: *Checker, p: *ast.StructPattern, t: *types.Type, temp: *ast.Local, mutable: bool) ! diag.Error {
+    if t.kind != StructKind {
+        fail At(p.pos, "cannot destructure {t.text()}; it is not a struct")
+    }
+    if droppable(c, t) {
+        fail At(p.pos, "cannot destructure {t.text()}; it has drop")
+    }
+    p.type = t
+    p.temp = temp
+    let root = new(ast.Ident { name: temp.name, pos: diag.Pos {}, local: temp })
+    root.type = t
+    bind_fields(c, p, ast.Expr.Ident(root), mutable, [:])?
+}
+
+fn bind_fields(c: *Checker, p: *ast.StructPattern, base: ast.Expr, mutable: bool, bound: [str: bool]) ! diag.Error {
+    let listed: [str: bool] = [:]
+    let pt = p.type ?? panic("struct pattern has no type")
+    for f in p.fields {
+        let field = pt.field(f.name) ?? fail At(f.pos, "{pt.text()} has no field {f.name}")
+        if listed[f.name] != none {
+            fail At(f.pos, "field {f.name} listed twice")
+        }
+        listed[f.name] = true
+        reachable(c, field, pt, f.pos)?
+        let source = new(ast.Selector { x: base, name: f.name, pos: f.pos, field })
+        source.type = field.type
+        f.field = field
+        f.source = ast.Expr.Selector(source)
+        match f.nested {
+            some(nested) => {
+                nest(c, f, field.type)?
+                bind_fields(c, nested, ast.Expr.Selector(source), mutable, bound)?
+                continue
+            }
+            none => {}
+        }
+        let bind = f.bind ?? panic("field pattern {f.name} binds nothing")
+        if bound[bind.name] != none {
+            fail At(bind.pos, "{bind.name} is bound twice in this pattern")
+        }
+        bound[bind.name] = true
+        bind.local = declare(c, bind.name, field.type, mutable)
+    }
+}
+
+fn nest(c: *Checker, f: *ast.FieldPattern, t: *types.Type) ! diag.Error {
+    let nested = f.nested ?? panic("field pattern {f.name} is not nested")
+    if t.kind != StructKind {
+        fail At(nested.pos, "cannot destructure field {f.name} of type {t.text()}; it is not a struct")
+    }
+    nested.type = t
+}
+
+fn let_stmt(c: *Checker, s: *ast.Let) ! diag.Error {
+    if s.pattern != none {
+        destructure_let(c, s)?
+        return
+    }
+    let t = bind(c, s)?
+    if s.is_using {
+        using_binding(c, s, t)?
+        return
+    }
+    if droppable(c, t) {
+        fail At(s.pos, "{t.text()} has drop; bind it with using")
+    }
+}
+
+fn bind(c: *Checker, s: *ast.Let) -> *types.Type ! diag.Error {
+    var want: *types.Type? = none
+    match s.type_name {
+        some(tn) => { want = resolve(c, tn)? }
+        none => {}
+    }
+    var t = plain(c, s.value, want)?
+    if t == c.universe.void || t == c.universe.never {
+        fail At(ast.position(s.value), "cannot bind a value of type {t.text()}")
+    }
+    match want {
+        some(w) => {
+            if !w.accepts(t) {
+                fail At(ast.position(s.value), "cannot use {t.text()} as {w.text()}")
+            }
+            t = w
+        }
+        none => {}
+    }
+    s.local = declare(c, s.name, t, s.mutable)
+    t
+}
+
+fn assign(c: *Checker, s: *ast.Assign) ! diag.Error {
+    let t = assign_target(c, s)?
+    let op = lexer.operator(s.op)
+    if op != lexer.Kind.Assign {
+        require_operator(c, op, t, s.pos)?
+    }
+    if op == lexer.Kind.Shl || op == lexer.Kind.Shr {
+        shift_count(c, op, s.value)?
+    } else if op != lexer.Kind.Assign && is_vector(t) {
+        vector_splat_operand(c, s, t)?
+    } else {
+        let value = plain(c, s.value, t)?
+        if !t.accepts(value) {
+            fail At(ast.position(s.value), "cannot assign {value.text()} to a place of type {t.text()}")
+        }
+        droppable_assign(c, s, t)?
+    }
+}
+
+fn require_operator(c: *Checker, op: lexer.Kind, t: *types.Type, pos: diag.Pos) ! diag.Error {
+    if is_vector(t) {
+        vector_operator(c, op, t, pos)?
+    } else if op == lexer.Kind.Plus && t == c.universe.str {
+    } else if op == lexer.Kind.Plus || op == lexer.Kind.Minus || op == lexer.Kind.Star || op == lexer.Kind.Slash {
+        require_number(c, t, op, pos)?
+    } else {
+        require_integer(c, t, op, pos)?
+    }
+}
+
+fn shift_count(c: *Checker, op: lexer.Kind, count: ast.Expr) ! diag.Error {
+    let t = plain(c, count, none)?
+    require_integer(c, t, op, ast.position(count))?
+}
+
+fn assign_target(c: *Checker, s: *ast.Assign) -> *types.Type ! diag.Error {
+    match s.target {
+        Index(entry) => {
+            let m = plain(c, entry.x, none)?
+            if m.kind == MapKind {
+                expect_type(c, entry.index, m.key_of())?
+                entry.type = c.universe.optional(m.elem_of())?
+                s.entry = entry
+                return m.elem_of()
+            }
+        }
+        _ => {}
+    }
+    let found = place(c, s.target, s.pos, "assign to %s", "cannot assign to this expression")?
+    found.type
+}
+
+fn require_number(c: *Checker, t: *types.Type, op: lexer.Kind, pos: diag.Pos) ! diag.Error {
+    if !t.is_number() && t != c.universe.never {
+        fail At(pos, "operator {lexer.kind_text(op)} requires a number, found {t.text()}")
+    }
+}
+
+fn require_integer(c: *Checker, t: *types.Type, op: lexer.Kind, pos: diag.Pos) ! diag.Error {
+    if !t.is_integer() && t != c.universe.never {
+        fail At(pos, "operator {lexer.kind_text(op)} requires an integer, found {t.text()}")
+    }
+}
+
+fn mutable(c: *Checker, r: *ast.Local, pos: diag.Pos, action: str) ! diag.Error {
+    if r.param && !r.ref {
+        fail At(pos, "cannot {text.replace(action, "%s", r.name)}; declare the parameter mut")
+    }
+    if !r.mutable {
+        fail At(pos, "cannot {text.replace(action, "%s", r.name)}, declared with let")
+    }
+}
+
+struct Place {
+    where: Root
+    type: *types.Type
+}
+
+fn place(c: *Checker, e: ast.Expr, pos: diag.Pos, action: str, invalid: str) -> Place ! diag.Error {
+    let t = plain(c, e, none)?
+    let found = root_of(e)
+    match ast.const_of(e) {
+        some(k) => fail At(pos, "cannot {text.replace(action, "%s", k.name)}, declared with const")
+        none => {}
+    }
+    if !found.ok {
+        fail At(pos, invalid)
+    }
+    match found.root.local {
+        some(l) => {
+            mutable(c, l, pos, action)?
+            l.assigned = true
+        }
+        none => {}
+    }
+    Place { where: found.root, type: t }
+}
+
+fn ref(c: *Checker, r: *ast.Ref, want: *types.Type) ! diag.Error {
+    let t = borrow(c, r)?
+    if t != want {
+        fail At(r.pos, "expected {want.text()}, found {t.text()}")
+    }
+}
+
+fn borrow(c: *Checker, r: *ast.Ref) -> *types.Type ! diag.Error {
+    let t = borrow_in_place(c, r)?
+    address(c, r)
+    t
+}
+
+fn address(c: *Checker, r: *ast.Ref) {
+    let found = root_of(r.x)
+    match found.root.local {
+        some(l) => {
+            if !l.ref {
+                l.addressed = true
+            }
+        }
+        none => {}
+    }
+}
+
+fn mut_of(c: *Checker, e: *ast.Call, i: i64, want: *types.Type) -> *ast.Ref ! diag.Error {
+    let r = ref_arg(e, i)
+    let rt = r.type ?? panic("mut argument has no type")
+    if rt != want {
+        fail At(r.pos, "expected {want.text()}, found {rt.text()}")
+    }
+    r
+}
+
+fn ref_arg(e: *ast.Call, i: i64) -> *ast.Ref {
+    match e.args[i] {
+        Ref(r) => r
+        _ => panic("argument {i} is not a mut reference")
+    }
+}
+
+fn mut_slice(c: *Checker, b: *Builtin, e: *ast.Call) -> *types.Type ! diag.Error {
+    let r = ref_arg(e, 0)
+    let rt = r.type ?? panic("mut argument has no type")
+    if rt.kind != SliceKind {
+        fail At(r.pos, "{b.name} needs a slice, found {rt.text()}")
+    }
+    rt
+}
+
+fn borrow_in_place(c: *Checker, r: *ast.Ref) -> *types.Type ! diag.Error {
+    let found = place(c, r.x, r.pos, "pass %s as mut", "mut argument must be a variable, a field, an element or a dereferenced pointer")?
+    r.type = found.type
+    found.type
+}
+
+fn exclusive(c: *Checker, args: []ast.Expr) ! diag.Error {
+    var held: []Borrowed = []
+    for arg in args {
+        match arg {
+            Ref(r) => {
+                let found = root_of(r.x)
+                let rt = r.type ?? panic("mut argument has no type")
+                let current = Borrowed { root: found.root, bytes: 8 * rt.size() }
+                for other in held {
+                    if overlaps(current, other) {
+                        let l = found.root.local ?? panic("overlapping borrow without a local")
+                        fail At(r.pos, "{l.name} is already passed as mut in this call")
+                    }
+                }
+                push(mut held, current)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn for_stmt(c: *Checker, s: *ast.For) -> bool ! diag.Error {
+    match s.cond {
+        some(cond) => expect_type(c, cond, c.universe.bool)?
+        none => {}
+    }
+    let l = enter_loop(c, s.label, s.pos)?
+    block(c, s.body, none)?
+    exit_loop(c, l, s.pos)?
+    s.cond == none && !l.broken
+}
+
+fn for_in(c: *Checker, s: *ast.ForIn) ! diag.Error {
+    let it = iteration(c, s)?
+    push_scope(c)
+    if s.key != "" {
+        let key = it.key ?? panic("range loop binds a key")
+        s.key_local = declare(c, s.key, key, false)
+    }
+    match s.pattern {
+        some(pattern) => {
+            let temp = new(ast.Local { name: "", type: it.value, owner: c.ctx.func })
+            s.value_local = temp
+            destructure(c, pattern, it.value, temp, false)?
+        }
+        none => { s.value_local = declare(c, s.value, it.value, false) }
+    }
+    let l = enter_loop(c, s.label, s.pos)?
+    block(c, s.body, none)?
+    exit_loop(c, l, s.pos)?
+    pop_scope(c)
+}
+
+struct Iteration {
+    key: *types.Type?
+    value: *types.Type
+}
+
+fn iteration(c: *Checker, s: *ast.ForIn) -> Iteration ! diag.Error {
+    match s.end {
+        some(end) => {
+            if s.key != "" {
+                fail At(s.pos, "a range loop binds one name")
+            }
+            let t = range_type(c, s.iter, end)?
+            return Iteration { key: none, value: t }
+        }
+        none => {}
+    }
+    let t = plain(c, s.iter, none)?
+    match t.kind {
+        SliceKind => return Iteration { key: c.universe.i64, value: t.elem_of() }
+        StrKind => return Iteration { key: c.universe.i64, value: c.universe.u32 }
+        MapKind => {
+            if s.key == "" {
+                return Iteration { key: none, value: t.key_of() }
+            }
+            return Iteration { key: t.key_of(), value: t.elem_of() }
+        }
+        ChanKind => {
+            if s.key != "" {
+                fail At(s.pos, "a channel loop binds one name")
+            }
+            return Iteration { key: none, value: t.elem_of() }
+        }
+        _ => {}
+    }
+    fail At(ast.position(s.iter), "cannot iterate over {t.text()}")
+}
+
+fn range_type(c: *Checker, lo: ast.Expr, hi: ast.Expr) -> *types.Type ! diag.Error {
+    var first = lo
+    var second = hi
+    if literal(first) && !literal(second) {
+        first = hi
+        second = lo
+    }
+    let t = plain(c, first, none)?
+    expect_type(c, second, t)?
+    if !t.is_integer() {
+        fail At(ast.position(lo), "range bounds must be integers, found {t.text()}")
+    }
+    t
+}
+
+fn enter_loop(c: *Checker, label: str, pos: diag.Pos) -> *Loop ! diag.Error {
+    for outer in c.ctx.loops {
+        if label != "" && outer.label == label {
+            fail At(pos, "label {label} is already used by an enclosing loop")
+        }
+    }
+    let l = new(Loop { label })
+    push(mut c.ctx.loops, l)
+    l
+}
+
+fn exit_loop(c: *Checker, l: *Loop, pos: diag.Pos) ! diag.Error {
+    c.ctx.loops = c.ctx.loops[..c.ctx.loops.len - 1]
+    if l.label != "" && !l.used {
+        fail At(pos, "label {l.label} is not used")
+    }
+}
+
+struct Target {
+    loop: *Loop
+    depth: i64
+}
+
+fn target(c: *Checker, pos: diag.Pos, keyword: str, label: str) -> Target ! diag.Error {
+    if c.ctx.loops.len == 0 && label == "" {
+        fail At(pos, "{keyword} outside of a loop")
+    }
+    for depth in 0..c.ctx.loops.len {
+        let l = c.ctx.loops[c.ctx.loops.len - 1 - depth]
+        if l.label == label || label == "" {
+            l.used = l.used || label != ""
+            return Target { loop: l, depth }
+        }
+    }
+    fail At(pos, "{keyword} {label}: no enclosing loop is labelled {label}")
+}
+
+fn ret(c: *Checker, s: *ast.Return) ! diag.Error {
+    let f = current(c)
+    if f.ret_type == none {
+        f.ret_type = c.universe.void
+        match s.value {
+            some(v) => {
+                let t = plain(c, v, none)?
+                f.ret_type = inferred_result(c, t)
+            }
+            none => {}
+        }
+        return
+    }
+    let want = current_ok(c)
+    let value = s.value ?? {
+        if want != c.universe.void {
+            fail At(s.pos, "missing return value of type {want.text()}")
+        }
+        return
+    }
+    let t = expr(c, value, want)?
+    if want == c.universe.void && t != ret_type_of(f) && t != c.universe.never {
+        fail At(ast.position(value), "{subject(c)} does not return a value")
+    }
+    if !returnable(c, t) {
+        fail At(ast.position(value), "expected {want.text()}, found {t.text()}")
+    }
+}
+
+fn fail_stmt(c: *Checker, s: *ast.Fail) ! diag.Error {
+    require_result(c, s.pos, "fail")?
+    let r = ret_type_of(current(c))
+    if r.kind != ResultKind {
+        fail At(s.pos, "fail requires {subject(c)} to declare an error type")
+    }
+    expect_type(c, s.value, r.err_of())?
+}
+
+fn handled(c: *Checker, e: ast.Expr?, t: *types.Type) ! diag.Error {
+    if t.kind == ResultKind {
+        let at = e ?? panic("unhandled error without an expression")
+        fail At(ast.position(at), "unhandled error {t.err_of().text()}: use ?, catch or or")
+    }
+}
+
+fn plain(c: *Checker, e: ast.Expr, want: *types.Type?) -> *types.Type ! diag.Error {
+    let t = expr(c, e, want)?
+    handled(c, e, t)?
+    t
+}
+
+fn expect_type(c: *Checker, e: ast.Expr, want: *types.Type) ! diag.Error {
+    let got = plain(c, e, want)?
+    if !want.accepts(got) {
+        fail At(ast.position(e), "expected {want.text()}, found {got.text()}")
+    }
+}
+
+fn expr(c: *Checker, e: ast.Expr, expected: *types.Type?) -> *types.Type ! diag.Error {
+    match e {
+        IntLit(n) => {
+            let want = unwrap(expected)
+            var t = c.universe.i64
+            if n.char {
+                t = c.universe.u32
+            }
+            match want {
+                some(w) => {
+                    if w.is_number() {
+                        t = w
+                    }
+                }
+                none => {}
+            }
+            n.type = t
+            if n.wide && t != c.universe.u64 {
+                fail At(n.pos, "{u64(n.value)} overflows {t.text()}")
+            }
+            if !n.wide && t.is_integer() && !t.holds(n.value) {
+                fail At(n.pos, "{n.value} overflows {t.text()}")
+            }
+        }
+        FloatLit(n) => {
+            let want = unwrap(expected)
+            var t = c.universe.f64
+            match want {
+                some(w) => {
+                    if w.is_float() {
+                        t = w
+                    }
+                }
+                none => {}
+            }
+            n.type = t
+        }
+        StrLit(n) => { n.type = c.universe.str }
+        BoolLit(n) => { n.type = c.universe.bool }
+        Ident(n) => ident(c, n, expected)?
+        Selector(n) => selector(c, n, expected)?
+        Closure(n) => closure(c, n, expected)?
+        StructLit(n) => struct_lit(c, n, expected)?
+        Instance(n) => fail At(n.pos, "type arguments must be followed by a call")
+        Ref(n) => fail At(n.pos, "mut is only allowed as an argument to a mut parameter")
+        Receiver(n) => {}
+        Index(n) => index_expr(c, n)?
+        Slicing(n) => slicing(c, n)?
+        SliceLit(n) => slice_lit(c, n, unwrap(expected))?
+        MapLit(n) => map_lit(c, n, unwrap(expected))?
+        Interp(n) => interp(c, n)?
+        Unary(n) => unary(c, n, expected)?
+        Binary(n) => binary(c, n, expected)?
+        Call(n) => call(c, n, expected)?
+        If(n) => if_expr(c, n, expected)?
+        Block(n) => { block(c, n, expected)? }
+        Match(n) => match_expr(c, n, expected)?
+        Select(n) => select_expr(c, n, expected)?
+        Subject(n) => {
+            if c.subjects.len == 0 {
+                fail At(n.pos, "the match subject is only available in a match arm")
+            }
+            n.type = c.subjects[c.subjects.len - 1]
+        }
+        Try(n) => try_expr(c, n, expected)?
+        Catch(n) => catch_expr(c, n, expected)?
+        Or(n) => or_expr(c, n, expected)?
+    }
+    ast.type_of(e) ?? panic("expression has no type after checking")
+}
+
+struct Inferred {
+    type: *types.Type
+    variant: *types.Variant
+}
+
+fn variant_in(t: *types.Type?, name: str) -> Inferred? {
+    let enum_type = t ?? return none
+    if enum_type.kind != EnumKind {
+        return none
+    }
+    let v = enum_type.variant(name) ?? return none
+    Inferred { type: enum_type, variant: v }
+}
+
+fn infer_variant(c: *Checker, want: *types.Type?, name: str) -> Inferred? {
+    let direct = variant_in(want, name)
+    if direct != none {
+        return direct
+    }
+    variant_in(unwrap(want), name)
+}
+
+fn ident(c: *Checker, e: *ast.Ident, want: *types.Type?) ! diag.Error {
+    match infer_variant(c, want, e.name) {
+        some(found) => {
+            unit_variant(c, found.variant, e.pos)?
+            e.variant = found.variant
+            e.type = found.type
+            return
+        }
+        none => {}
+    }
+    match builtin_named(c, e.name) {
+        some(b) => {
+            if b.has_constant {
+                let constant = b.constant
+                constant(c, e, want)?
+                return
+            }
+        }
+        none => {}
+    }
+    match local(c).consts[e.name] {
+        some(k) => {
+            if find(c, e.name) == none {
+                e.constant = k
+                e.type = ast.type_of(folded(c, k)?)
+                return
+            }
+        }
+        none => {}
+    }
+    match local_func(c, e.name) {
+        some(f) => {
+            if find(c, e.name) == none {
+                let made = func_value(c, f, want, e.pos)?
+                e.func = made.func
+                e.type = made.type
+                return
+            }
+        }
+        none => {}
+    }
+    let l = lookup(c, e.name, e.pos)?
+    e.local = l
+    e.type = l.type
+}
+
+fn type_ref(c: *Checker, x: ast.Expr) -> *types.Type? ! diag.Error {
+    var t: *types.Type? = none
+    match x {
+        Ident(id) => {
+            if find(c, id.name) != none {
+                return none
+            }
+            t = local(c).types[id.name]
+            match c.ctx.bound[id.name] {
+                some(bound) => { t = bound }
+                none => {}
+            }
+        }
+        Selector(sel) => {
+            let id = match sel.x {
+                Ident(i) => i
+                _ => return none
+            }
+            if !is_module(c, id.name) {
+                return none
+            }
+            let home = imported_scope(c, id.name, id.pos)?
+            if home.types[sel.name] == none {
+                return none
+            }
+            t = imported_type(c, id.name, sel.name, sel.pos)?
+        }
+        _ => {}
+    }
+    let found = t ?? return none
+    if found.kind != EnumKind && found.kind != StructKind {
+        return none
+    }
+    found
+}
+
+fn field_of(c: *Checker, t: *types.Type, name: str, pos: diag.Pos) -> *types.Field ! diag.Error {
+    if t.kind != StructKind {
+        fail At(pos, "{t.text()} has no field {name}")
+    }
+    let f = t.field(name) ?? fail At(pos, "{t.text()} has no field {name}")
+    reachable(c, f, t, pos)?
+    f
+}
+
+fn reachable(c: *Checker, f: *types.Field, t: *types.Type, pos: diag.Pos) ! diag.Error {
+    let trusted = match c.ctx.func {
+        some(current_fn) => current_fn.trusted
+        none => false
+    }
+    if !f.exported && t.module != c.ctx.file.module && !trusted {
+        fail At(pos, "field {f.name} of {t.text()} is private")
+    }
+}
+
+fn selector(c: *Checker, e: *ast.Selector, want: *types.Type?) ! diag.Error {
+    match e.x {
+        Ident(id) => {
+            if is_module(c, id.name) && type_ref(c, e.x)? == none {
+                let module = imported_scope(c, id.name, id.pos)?
+                match module.consts[e.name] {
+                    some(k) => {
+                        e.constant = imported_const(id.name, k, e.pos)?
+                        e.type = ast.type_of(folded(c, k)?)
+                        return
+                    }
+                    none => {}
+                }
+                if module.generics[e.name] == none {
+                    let target = imported_func(c, id.name, e.name, e.pos)?
+                    let made = func_value(c, target, want, e.pos)?
+                    e.func = made.func
+                    e.type = made.type
+                    return
+                }
+            }
+        }
+        _ => {}
+    }
+    match generic_ref(c, e.x)? {
+        some(g) => {
+            let found = generic_enum(c, g, e.name, [], want, e.pos)?
+            e.type = found.type
+            e.variant = found.variant
+            unit_variant(c, found.variant, e.pos)?
+            return
+        }
+        none => {}
+    }
+    match type_ref(c, e.x)? {
+        some(t) => {
+            if t.kind == StructKind {
+                field_reference(c, e, t)?
+                return
+            }
+            let v = t.variant(e.name) ?? fail At(e.pos, "{t.text()} has no variant {e.name}")
+            e.variant = v
+            unit_variant(c, v, e.pos)?
+            e.type = t
+            return
+        }
+        none => {}
+    }
+    let t = plain(c, e.x, none)?
+    match lookup_builtin(c, e.name) {
+        some(b) => {
+            if b.kind == PropertyBuiltin && receives(b, t.kind) {
+                if !reads(b, t) {
+                    fail At(e.pos, "{t.text()} declares no variant indexes")
+                }
+                e.property = b.id
+                e.type = b.type
+                return
+            }
+        }
+        none => {}
+    }
+    if t.struct_of().field(e.name) == none {
+        shadowed_module(c, e.x, e.name)?
+    }
+    let f = field_of(c, t.struct_of(), e.name, e.pos)?
+    e.field = f
+    e.type = f.type
+}
+
+fn field_reference(c: *Checker, e: *ast.Selector, t: *types.Type) ! diag.Error {
+    let f = field_of(c, t, e.name, e.pos)?
+    e.reference = f
+    e.type = serde_field_type(c, t, f, e.pos)?
+}
+
+pub fn index_type(u: *types.Universe, t: *types.Type) -> *types.Type? ! diag.Error {
+    if t.kind == MapKind {
+        return u.optional(t.elem_of())?
+    }
+    if t.kind == SliceKind {
+        return t.elem_of()
+    }
+    if t == u.str {
+        return u.u8
+    }
+    none
+}
+
+fn index_expr(c: *Checker, e: *ast.Index) ! diag.Error {
+    let t = plain(c, e.x, none)?
+    e.type = index_type(c.universe, t)?
+    if e.type == none {
+        fail At(e.pos, "cannot index a value of type {t.text()}")
+    }
+    if t.kind == MapKind {
+        expect_type(c, e.index, t.key_of())?
+    } else {
+        integer(c, e.index)?
+    }
+}
+
+fn integer(c: *Checker, e: ast.Expr) ! diag.Error {
+    let t = plain(c, e, none)?
+    if !t.is_integer() && t != c.universe.never {
+        fail At(ast.position(e), "expected an integer, found {t.text()}")
+    }
+}
+
+fn slicing(c: *Checker, e: *ast.Slicing) ! diag.Error {
+    let t = plain(c, e.x, none)?
+    e.type = t
+    if t.kind != SliceKind && t != c.universe.str {
+        fail At(e.pos, "cannot slice a value of type {t.text()}")
+    }
+    match e.lo {
+        some(lo) => integer(c, lo)?
+        none => {}
+    }
+    match e.hi {
+        some(hi) => integer(c, hi)?
+        none => {}
+    }
+}
+
+fn slice_lit(c: *Checker, e: *ast.SliceLit, want: *types.Type?) ! diag.Error {
+    match want {
+        some(w) => {
+            if w.kind == SliceKind {
+                e.type = w
+                for el in e.elems {
+                    expect_type(c, el, w.elem_of())?
+                }
+                return
+            }
+        }
+        none => {}
+    }
+    if e.elems.len == 0 {
+        fail At(e.pos, "cannot infer the type of an empty slice; annotate it")
+    }
+    let elem = plain(c, e.elems[0], none)?
+    for i in 1..e.elems.len {
+        expect_type(c, e.elems[i], elem)?
+    }
+    contain(c, elem, "a slice", e.pos)?
+    e.type = c.universe.slice(elem)?
+}
+
+fn map_lit(c: *Checker, e: *ast.MapLit, want: *types.Type?) ! diag.Error {
+    var literal_type: *types.Type? = none
+    match want {
+        some(w) => {
+            if w.kind == MapKind {
+                literal_type = w
+            }
+        }
+        none => {}
+    }
+    if literal_type == none {
+        if e.keys.len == 0 {
+            fail At(e.pos, "cannot infer the type of an empty map; annotate it")
+        }
+        let first = plain(c, e.keys[0], none)?
+        let key = map_key(c, first, ast.position(e.keys[0]))?
+        let value = plain(c, e.values[0], none)?
+        literal_type = c.universe.map(key, value)?
+    }
+    let t = literal_type ?? panic("map literal has no type")
+    e.type = t
+    for i, k in e.keys {
+        expect_type(c, k, t.key_of())?
+        expect_type(c, e.values[i], t.elem_of())?
+    }
+}
+
+fn interp(c: *Checker, e: *ast.Interp) ! diag.Error {
+    for part in e.parts {
+        part.render = none
+        let t = plain(c, part.x, none)?
+        match part.spec {
+            some(spec) => {
+                match spec.format {
+                    some(format) => require_formattable(c, format, t)?
+                    none => {}
+                }
+            }
+            none => {}
+        }
+        if t == c.universe.str {
+            continue
+        }
+        require_value(c, ast.position(part.x), "interpolation", t)?
+        part.render = appender(c, t, ast.position(part.x))?
+    }
+    e.type = c.universe.str
+}
+
+fn require_formattable(c: *Checker, f: *ast.Format, t: *types.Type) ! diag.Error {
+    let integer_only = ast.integer_only(f)
+    if t == c.universe.never || (integer_only && t.is_integer()) || (!integer_only && t.is_number()) {
+        return
+    }
+    if t.kind != ParamKind {
+        fail At(f.pos, "cannot format a value of type {t.text()} with {diag.quote(f.text)}")
+    }
+    var constraint = "Number"
+    if integer_only {
+        constraint = "Integer"
+    }
+    fail At(f.pos, "cannot format a value of type {t.text()} with {diag.quote(f.text)}; declare {t.text()}: {constraint}")
+}
+
+fn struct_lit(c: *Checker, e: *ast.StructLit, want: *types.Type?) ! diag.Error {
+    var found: *types.Type? = none
+    let checked: [*ast.FieldInit: *types.Type] = [:]
+    let generic = lookup_generic(c, e.module, e.name, e.pos)?
+    match generic {
+        some(g) => { found = generic_lit_type(c, e, g, want, checked)? }
+        none => {
+            if e.type_args.len > 0 {
+                fail At(e.pos, "{e.name} is not generic")
+            }
+            if e.module != "" {
+                found = imported_type(c, e.module, e.name, e.pos)?
+            } else {
+                match c.ctx.bound[e.name] {
+                    some(b) => { found = b }
+                    none => { found = local(c).types[e.name] }
+                }
+            }
+        }
+    }
+    let t = found ?? fail At(e.pos, "{e.name} is not a struct")
+    if t.kind != StructKind {
+        fail At(e.pos, "{e.name} is not a struct")
+    }
+    let given: [*types.Field: bool] = [:]
+    for fi in e.fields {
+        let f = t.field(fi.name) ?? fail At(fi.pos, "{t.text()} has no field {fi.name}")
+        if given[f] != none {
+            fail At(fi.pos, "field {fi.name} given twice")
+        }
+        reachable(c, f, t, fi.pos)?
+        given[f] = true
+        fi.field = f
+        match checked[fi] {
+            some(seen) => {
+                if !f.type.accepts(seen) {
+                    fail At(ast.position(fi.value), "expected {f.type.text()}, found {seen.text()}")
+                }
+                continue
+            }
+            none => {}
+        }
+        expect_type(c, fi.value, f.type)?
+    }
+    var missing: []str = []
+    for f in t.fields {
+        if given[f] != none {
+            continue
+        }
+        match default_of(c, f)? {
+            some(def) => {
+                push(mut e.fields, new(ast.FieldInit { name: f.name, value: def, pos: e.pos, form: FieldImplied, field: f }))
+                continue
+            }
+            none => {}
+        }
+        push(mut missing, f.name)
+    }
+    if missing.len > 0 {
+        fail At(e.pos, "missing fields for {t.text()}: {text.join(missing, ", ")}")
+    }
+    e.type = t
+}
+
+fn variant_of(c: *Checker, enum_type: *types.Type, name: str, pos: diag.Pos) -> *types.Variant ! diag.Error {
+    enum_type.variant(name) ?? fail At(pos, "{enum_type.text()} has no variant {name}")
+}
+
+fn unit_variant(c: *Checker, v: *types.Variant, pos: diag.Pos) ! diag.Error {
+    if v.fields.len > 0 {
+        fail At(pos, "variant {v.name} takes {v.fields.len} fields")
+    }
+}
+
+fn unary(c: *Checker, e: *ast.Unary, want: *types.Type?) ! diag.Error {
+    match e.op {
+        Star => {
+            let t = plain(c, e.x, none)?
+            if t.kind != PointerKind {
+                fail At(e.pos, "cannot dereference a value of type {t.text()}")
+            }
+            e.type = t.elem_of()
+        }
+        Not => {
+            expect_type(c, e.x, c.universe.bool)?
+            e.type = c.universe.bool
+        }
+        LArrow => {
+            let ch = channel_operand(c, e.x)?
+            e.type = c.universe.optional(ch.elem_of())?
+        }
+        Tilde => {
+            let t = plain(c, e.x, arithmetic(want))?
+            e.type = t
+            if is_vector(t) {
+                vector_unary(c, e, t)?
+                return
+            }
+            require_integer(c, t, e.op, e.pos)?
+        }
+        _ => {
+            let t = plain(c, e.x, arithmetic(want))?
+            e.type = t
+            if is_vector(t) {
+                vector_unary(c, e, t)?
+                return
+            }
+            require_number(c, t, e.op, e.pos)?
+        }
+    }
+}
+
+fn unwrap(want: *types.Type?) -> *types.Type? {
+    let t = want ?? return none
+    if t.optional {
+        return t.elem
+    }
+    t
+}
+
+fn numeric(want: *types.Type?) -> *types.Type? {
+    let t = unwrap(want) ?? return none
+    if t.is_number() {
+        return t
+    }
+    none
+}
+
+fn literal(e: ast.Expr) -> bool {
+    match e {
+        IntLit(n) => true
+        FloatLit(n) => true
+        _ => false
+    }
+}
+
+fn coalesce(c: *Checker, e: *ast.Binary) ! diag.Error {
+    let x = plain(c, e.x, none)?
+    if !x.optional {
+        fail At(ast.position(e.x), "?? requires an optional, found {x.text()}")
+    }
+    let elem = x.elem_of()
+    let y = plain(c, e.y, elem)?
+    if elem.accepts(y) {
+        e.type = elem
+    } else if y == x {
+        e.type = x
+    } else {
+        fail At(ast.position(e.y), "expected {elem.text()}, found {y.text()}")
+    }
+}
+
+fn operands(c: *Checker, e: *ast.Binary, want: *types.Type?) -> *types.Type ! diag.Error {
+    var first = e.x
+    var second = e.y
+    if literal(first) && !literal(second) {
+        first = e.y
+        second = e.x
+    }
+    var t = plain(c, first, want)?
+    var s = t
+    if is_vector(t) && literal(second) {
+        s = plain(c, second, t.elem)?
+    } else {
+        s = plain(c, second, t)?
+    }
+    if is_vector(t) && is_vector(s) {
+        if s != t {
+            fail At(ast.position(second), "expected {t.text()}, found {s.text()}")
+        }
+    } else if is_vector(t) {
+        if !t.elem_of().accepts(s) {
+            fail At(ast.position(second), "expected {t.text()} or {t.elem_of().text()}, found {s.text()}")
+        }
+        splat(c, e, second)
+    } else if is_vector(s) {
+        if !s.elem_of().accepts(t) {
+            fail At(ast.position(first), "expected {s.text()} or {s.elem_of().text()}, found {t.text()}")
+        }
+        splat(c, e, first)
+        t = s
+    } else if !t.accepts(s) {
+        fail At(ast.position(second), "expected {t.text()}, found {s.text()}")
+    }
+    t
+}
+
+fn splat(c: *Checker, e: *ast.Binary, operand: ast.Expr) {
+    if operand == e.x {
+        e.splat_x = true
+    } else {
+        e.splat_y = true
+    }
+}
+
+fn binary(c: *Checker, e: *ast.Binary, want: *types.Type?) ! diag.Error {
+    match e.op {
+        AndAnd => {
+            expect_type(c, e.x, c.universe.bool)?
+            expect_type(c, e.y, c.universe.bool)?
+            e.type = c.universe.bool
+        }
+        OrOr => {
+            expect_type(c, e.x, c.universe.bool)?
+            expect_type(c, e.y, c.universe.bool)?
+            e.type = c.universe.bool
+        }
+        Coalesce => coalesce(c, e)?
+        Shl => shift_expr(c, e, want)?
+        Shr => shift_expr(c, e, want)?
+        Eq => equality(c, e)?
+        NotEq => equality(c, e)?
+        Lt => ordering(c, e)?
+        LtEq => ordering(c, e)?
+        Gt => ordering(c, e)?
+        GtEq => ordering(c, e)?
+        _ => {
+            let t = operands(c, e, arithmetic(want))?
+            e.type = t
+            require_operator(c, e.op, t, e.pos)?
+        }
+    }
+}
+
+fn shift_expr(c: *Checker, e: *ast.Binary, want: *types.Type?) ! diag.Error {
+    let t = plain(c, e.x, arithmetic(want))?
+    e.type = t
+    require_operator(c, e.op, t, ast.position(e.x))?
+    shift_count(c, e.op, e.y)?
+}
+
+fn equality(c: *Checker, e: *ast.Binary) ! diag.Error {
+    let t = operands(c, e, none)?
+    if is_vector(t) {
+        e.type = t
+        return
+    }
+    if !t.comparable() && t != c.universe.never {
+        fail At(ast.position(e.x), "cannot compare values of type {t.text()}")
+    }
+    e.type = c.universe.bool
+}
+
+fn ordering(c: *Checker, e: *ast.Binary) ! diag.Error {
+    let t = operands(c, e, none)?
+    if is_vector(t) {
+        e.type = t
+        return
+    }
+    if !t.ordered() && t != c.universe.never {
+        fail At(e.pos, "operator {lexer.kind_text(e.op)} requires a number or str, found {t.text()}")
+    }
+    e.type = c.universe.bool
+}
+
+fn call(c: *Checker, e: *ast.Call, want: *types.Type?) ! diag.Error {
+    if e.prepended && first_mut(c, e.callee)? {
+        prepend_mut(e)
+    }
+    match e.callee {
+        Ident(fn_ident) => {
+            match builtin_named(c, fn_ident.name) {
+                some(b) => {
+                    if b.has_handler {
+                        call_builtin(c, b, e, want)?
+                        return
+                    }
+                }
+                none => {}
+            }
+            if find(c, fn_ident.name) != none {
+                indirect(c, e)?
+                return
+            }
+            match c.ctx.bound[fn_ident.name] {
+                some(t) => {
+                    if t.is_number() {
+                        convert(c, e, t)?
+                        return
+                    }
+                }
+                none => {}
+            }
+            match infer_variant(c, want, fn_ident.name) {
+                some(found) => {
+                    construct(c, e, found.type, found.variant, [])?
+                    return
+                }
+                none => {}
+            }
+            let target = local_func(c, fn_ident.name) ?? fail At(e.pos, "undefined function: {fn_ident.name}")
+            call_func(c, e, target, want)?
+        }
+        Selector(sel) => selector_call(c, e, sel, want)?
+        Instance(inst) => instance_call(c, e, inst, want)?
+        _ => indirect(c, e)?
+    }
+}
+
+fn selector_call(c: *Checker, e: *ast.Call, sel: *ast.Selector, want: *types.Type?) ! diag.Error {
+    let id: *ast.Ident? = match sel.x {
+        Ident(i) => i
+        _ => none
+    }
+    let t = type_ref(c, sel.x)?
+    let g = generic_ref(c, sel.x)?
+    match t {
+        some(found) => {
+            variant_call(c, e, sel, found)?
+            return
+        }
+        none => {}
+    }
+    match g {
+        some(generic) => {
+            let found = generic_enum(c, generic, sel.name, e.args, want, sel.pos)?
+            construct(c, e, found.type, found.variant, found.args)?
+            return
+        }
+        none => {}
+    }
+    match id {
+        some(ident_node) => {
+            if is_module(c, ident_node.name) {
+                if generates_regex(c, ident_node.name, sel.name) {
+                    generated_regex(c, e)?
+                    return
+                }
+                let target = imported_func(c, ident_node.name, sel.name, sel.pos)?
+                call_func(c, e, target, want)?
+                return
+            }
+            if find(c, ident_node.name) == none {
+                fail At(ident_node.pos, "undefined: {ident_node.name}")
+            }
+        }
+        none => {}
+    }
+    if e.prepended {
+        indirect(c, e)?
+        return
+    }
+    method(c, e, sel, want)?
+}
+
+fn method(c: *Checker, e: *ast.Call, sel: *ast.Selector, want: *types.Type?) ! diag.Error {
+    let t = plain(c, sel.x, none)?
+    let receiver = new(ast.Receiver { type: t, x: sel.x })
+    match t.struct_of().field(sel.name) {
+        some(f) => {
+            if f.type.kind == FuncKind {
+                sel.x = ast.Expr.Receiver(receiver)
+                indirect(c, e)?
+                return
+            }
+        }
+        none => {}
+    }
+    e.callee = ast.Expr.Ident(new(ast.Ident { name: sel.name, pos: sel.pos }))
+    e.args = slices.concat([ast.Expr.Receiver(receiver)], e.args)
+    e.prepended = true
+    var target = receiver_func(c, t, sel.name)?
+    if target == none && !callable(c, sel.name) {
+        target = imported_receiver_func(c, t, sel.name, sel.pos)?
+    }
+    match target {
+        some(f) => {
+            if f.params.len > 0 && f.params[0].mutable {
+                prepend_mut(e)
+            }
+            call_func(c, e, f, want)?
+            return
+        }
+        none => {}
+    }
+    if !callable(c, sel.name) {
+        shadowed_module(c, sel.x, sel.name)?
+    }
+    call(c, e, want)?
+}
+
+fn shadowed_module(c: *Checker, x: ast.Expr, name: str) ! diag.Error {
+    match x {
+        Ident(id) => {
+            match c.ctx.file.imported(id.name) {
+                some(path) => fail At(id.pos, "{id.name} is a local here, not the module {path}; rename the local to use {id.name}.{name}")
+                none => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+struct ReceiverHome {
+    module: str
+    foreign: bool
+}
+
+pub fn receiver_module(t: *types.Type, current_module: str) -> ReceiverHome {
+    var home = t.struct_of()
+    match home.origin {
+        some(o) => { home = o }
+        none => {}
+    }
+    ReceiverHome { module: home.module, foreign: home.module != current_module }
+}
+
+fn receiver_func(c: *Checker, t: *types.Type, name: str) -> *ast.Func? ! diag.Error {
+    let home = receiver_module(t, c.ctx.file.module)
+    if !home.foreign || callable(c, name) {
+        return none
+    }
+    let f = scope(c, home.module).funcs[name] ?? return none
+    if !f.exported {
+        return none
+    }
+    f
+}
+
+fn imported_receiver_func(c: *Checker, t: *types.Type, name: str, pos: diag.Pos) -> *ast.Func? ! diag.Error {
+    var found: []*ast.Func = []
+    var modules: []str = []
+    for imp in c.ctx.file.imports {
+        match scope(c, imp.path).funcs[name] {
+            some(f) => {
+                if f.exported && takes_first(f, t) {
+                    push(mut found, f)
+                    push(mut modules, "{imp.alias}.{name}")
+                }
+            }
+            none => {}
+        }
+    }
+    if found.len > 1 {
+        fail At(pos, "{name} is ambiguous for {t.text()}: {text.join(modules, ", ")}; call one of them by its module")
+    }
+    if found.len == 0 {
+        return none
+    }
+    found[0]
+}
+
+fn prepend_mut(e: *ast.Call) {
+    match e.args[0] {
+        Ref(r) => {}
+        _ => {
+            let first = e.args[0]
+            e.args[0] = ast.Expr.Ref(new(ast.Ref { x: first, pos: ast.position(first) }))
+        }
+    }
+}
+
+fn indirect(c: *Checker, e: *ast.Call) ! diag.Error {
+    let t = plain(c, e.callee, none)?
+    if t.kind != FuncKind {
+        fail At(e.pos, "cannot call a value of type {t.text()}")
+    }
+    if e.args.len != t.params.len {
+        fail At(e.pos, "{t.text()} takes {t.params.len} arguments, found {e.args.len}")
+    }
+    if e.prepended && t.muts[0] {
+        prepend_mut(e)
+    }
+    for i, arg in e.args {
+        match mut_argument(c, arg, t.muts[i], "{i + 1} of {t.text()}")? {
+            some(r) => ref(c, r, t.params[i])?
+            none => expect_type(c, arg, t.params[i])?
+        }
+    }
+    exclusive(c, e.args)?
+    e.type = t.ret
+}
+
+fn print_call(c: *Checker, e: *ast.Call) ! diag.Error {
+    let t = plain(c, e.args[0], none)?
+    e.render = none
+    if t != c.universe.str {
+        require_value(c, ast.position(e.args[0]), "print", t)?
+        e.render = appender(c, t, e.pos)?
+    }
+    e.type = c.universe.void
+}
+
+fn embed_call(c: *Checker, e: *ast.Call) ! diag.Error {
+    let lit = match e.args[0] {
+        StrLit(s) => s
+        _ => fail At(ast.position(e.args[0]), "embed needs a string literal path")
+    }
+    lit.type = c.universe.str
+    let resolve_embed = c.embedder
+    let found = resolve_embed(c.ctx.file, lit.value) catch {
+        Missing => fail At(lit.pos, "cannot embed {lit.value}: no such file")
+        Failed(msg) => fail At(lit.pos, "cannot embed {lit.value}: {msg}")
+    }
+    embedded(c, e, found.path, found.data)
+}
+
+fn embedded(c: *Checker, e: *ast.Call, abs: str, data: []u8) {
+    e.embed = abs
+    e.size = data.len
+    e.digest = hash.fnv1a_64(data)
+    e.type = c.universe.str
+}
+
+fn delete_entry(c: *Checker, e: *ast.Call) ! diag.Error {
+    let r = ref_arg(e, 0)
+    let t = r.type ?? panic("mut argument has no type")
+    if t.kind != MapKind {
+        fail At(r.pos, "delete needs a map, found {t.text()}")
+    }
+    expect_type(c, e.args[1], t.key_of())?
+    e.type = c.universe.void
+}
+
+fn typed_raw(c: *Checker, e: ast.Expr, name: str) -> *types.Type ! diag.Error {
+    let t = plain(c, e, none)?
+    if t.kind != RawKind {
+        fail At(ast.position(e), "{name} needs a typed ptr[T], found {t.text()}")
+    }
+    t.elem ?? fail At(ast.position(e), "{name} needs a typed ptr[T], found {t.text()}")
+}
+
+fn c_string(c: *Checker, e: ast.Expr, t: *types.Type) ! diag.Error {
+    match t.elem {
+        some(elem) => {
+            if elem != c.universe.u8 {
+                fail At(ast.position(e), "str takes ptr[u8], found {t.text()}")
+            }
+        }
+        none => {}
+    }
+}
+
+fn push_call(c: *Checker, b: *Builtin, e: *ast.Call) ! diag.Error {
+    let t = mut_slice(c, b, e)?
+    expect_type(c, e.args[1], t.elem_of())?
+    e.type = c.universe.void
+}
+
+fn pop_call(c: *Checker, b: *Builtin, e: *ast.Call) ! diag.Error {
+    let t = mut_slice(c, b, e)?
+    e.type = c.universe.optional(t.elem_of())?
+}
+
+fn truncate_call(c: *Checker, b: *Builtin, e: *ast.Call) ! diag.Error {
+    mut_slice(c, b, e)?
+    integer(c, e.args[1])?
+    e.type = c.universe.void
+}
+
+fn syscall(c: *Checker, e: *ast.Call) ! diag.Error {
+    for arg in e.args {
+        let t = plain(c, arg, none)?
+        if !t.is_integer() && t.kind != RawKind && t != c.universe.bool {
+            fail At(ast.position(arg), "__syscall arguments are integers, bool or ptr, found {t.text()}")
+        }
+    }
+    e.type = c.universe.i64
+}
+
+fn math(c: *Checker, b: *Builtin, e: *ast.Call, want: *types.Type?) ! diag.Error {
+    var arg: *types.Type? = none
+    match want {
+        some(w) => {
+            if w.is_float() {
+                arg = w
+            }
+        }
+        none => {}
+    }
+    if arg == none && numeric_literals(e.args[0]) {
+        arg = c.universe.f64
+    }
+    let t = plain(c, e.args[0], arg)?
+    if !t.is_float() {
+        fail At(ast.position(e.args[0]), "{b.name} requires f32 or f64, found {t.text()}")
+    }
+    e.type = t
+}
+
+fn convert(c: *Checker, e: *ast.Call, to: *types.Type) ! diag.Error {
+    let t = plain(c, e.args[0], none)?
+    if !convertible(c, t, to) {
+        fail At(ast.position(e.args[0]), "cannot convert {t.text()} to {to.text()}")
+    }
+    e.builtin = builtin.ID.Convert
+    e.type = to
+}
+
+fn convertible(c: *Checker, from: *types.Type, to: *types.Type) -> bool {
+    if to.kind == RawKind {
+        return from == c.universe.i64 || from == c.universe.u64
+    }
+    if from.kind == RawKind {
+        return to == c.universe.i64 || to == c.universe.u64
+    }
+    from.is_number()
+}
+
+fn variant_call(c: *Checker, e: *ast.Call, sel: *ast.Selector, t: *types.Type) ! diag.Error {
+    if t.kind != EnumKind {
+        fail At(e.pos, "cannot call this expression")
+    }
+    let v = variant_of(c, t, sel.name, sel.pos)?
+    construct(c, e, t, v, [])?
+}
+
+fn allocate(c: *Checker, e: *ast.Call, want: *types.Type?) ! diag.Error {
+    var elem: *types.Type? = none
+    match want {
+        some(w) => {
+            if w.kind == PointerKind {
+                elem = w.elem
+            }
+        }
+        none => {}
+    }
+    let t = plain(c, e.args[0], elem)?
+    if t == c.universe.void || t == c.universe.never {
+        fail At(ast.position(e.args[0]), "cannot allocate a value of type {t.text()}")
+    }
+    contain(c, t, "a pointer", e.pos)?
+    e.type = c.universe.pointer(t)?
+}
+
+fn call_func(c: *Checker, e: *ast.Call, f: *ast.Func, want: *types.Type?) ! diag.Error {
+    if f.type_params.len > 0 {
+        generic_call(c, e, f, [], want)?
+        return
+    }
+    let short = e.args.len < f.params.len
+    if short || (e.args.len > f.params.len && !f.variadic) {
+        fail At(e.pos, "{f.name} takes {f.params.len} arguments, found {e.args.len}")
+    }
+    for i, arg in e.args {
+        if i >= f.params.len {
+            variadic(c, arg)?
+            continue
+        }
+        argument(c, arg, f, i)?
+    }
+    exclusive(c, e.args)?
+    e.target = f
+    e.type = f.ret_type
+    forwarded(c, e, f)
+}
+
+fn argument(c: *Checker, arg: ast.Expr, f: *ast.Func, i: i64) ! diag.Error {
+    let param = f.params[i]
+    match mut_argument(c, arg, param.mutable, "{param.name} of {f.name}")? {
+        some(r) => ref(c, r, f.param_types[i])?
+        none => expect_type(c, arg, f.param_types[i])?
+    }
+}
+
+fn mut_argument(c: *Checker, arg: ast.Expr, is_mut: bool, describe: str) -> *ast.Ref? ! diag.Error {
+    let r: *ast.Ref? = match arg {
+        Ref(x) => x
+        _ => none
+    }
+    if is_mut && r == none {
+        fail At(ast.position(arg), "parameter {describe} is mut; write mut before the argument")
+    }
+    if is_mut {
+        return r
+    }
+    none
+}
+
+fn variadic(c: *Checker, arg: ast.Expr) ! diag.Error {
+    match arg {
+        Ref(r) => fail At(ast.position(arg), "variadic arguments cannot be mut")
+        _ => {}
+    }
+    let t = plain(c, arg, none)?
+    if !t.c_scalar() {
+        fail At(ast.position(arg), "variadic arguments must be numbers, bool or ptr, found {t.text()}")
+    }
+}
+
+fn construct(c: *Checker, e: *ast.Call, enum_type: *types.Type, v: *types.Variant, found: []*types.Type) ! diag.Error {
+    if e.args.len != v.fields.len {
+        fail At(e.pos, "variant {v.name} takes {v.fields.len} fields, found {e.args.len}")
+    }
+    for i, arg in e.args {
+        if found.len == 0 {
+            expect_type(c, arg, v.fields[i])?
+            continue
+        }
+        if !v.fields[i].accepts(found[i]) {
+            fail At(ast.position(arg), "expected {v.fields[i].text()}, found {found[i].text()}")
+        }
+    }
+    e.variant = v
+    e.type = enum_type
+}
+
+fn unify(c: *Checker, a: *types.Type, b: *types.Type) -> *types.Type {
+    if a.accepts(b) {
+        return a
+    }
+    if b.accepts(a) {
+        return b
+    }
+    c.universe.void
+}
+
+fn if_expr(c: *Checker, e: *ast.If, want: *types.Type?) ! diag.Error {
+    expect_type(c, e.cond, c.universe.bool)?
+    let otherwise = e.otherwise ?? {
+        block(c, e.then, want)?
+        e.type = c.universe.void
+        return
+    }
+    let then_expr = ast.Expr.Block(e.then)
+    var then = branch(c, then_expr, want, want)?
+    var hint = want
+    if hint == none && then.is_number() && bare_number(otherwise) {
+        hint = then
+    }
+    let other = branch(c, otherwise, hint, want)?
+    if want == none && bare_number(then_expr) && other.is_number() {
+        then = block(c, e.then, other)?
+    }
+    e.type = unify(c, then, other)
+}
+
+fn branch(c: *Checker, e: ast.Expr, hint: *types.Type?, want: *types.Type?) -> *types.Type ! diag.Error {
+    let t = expr(c, e, hint)?
+    match want {
+        some(w) => {
+            if w != c.universe.void && t != c.universe.never && t.kind != ResultKind && !w.accepts(t) {
+                fail At(ast.position(produced(e)), "expected {w.text()}, found {t.text()}")
+            }
+        }
+        none => {}
+    }
+    t
+}
+
+fn bare_number(e: ast.Expr) -> bool {
+    match e {
+        Block(b) => {
+            if b.stmts.len > 0 {
+                return false
+            }
+            match b.tail {
+                some(tail) => {
+                    match tail {
+                        IntLit(n) => true
+                        FloatLit(n) => true
+                        _ => false
+                    }
+                }
+                none => false
+            }
+        }
+        _ => false
+    }
+}
+
+fn numeric_literals(e: ast.Expr) -> bool {
+    match e {
+        IntLit(n) => true
+        FloatLit(n) => true
+        Unary(n) => numeric_literals(n.x)
+        Binary(n) => numeric_literals(n.x) && numeric_literals(n.y)
+        Block(n) => {
+            if n.stmts.len > 0 {
+                return false
+            }
+            match n.tail {
+                some(tail) => numeric_literals(tail)
+                none => false
+            }
+        }
+        If(n) => {
+            match n.otherwise {
+                some(otherwise) => numeric_literals(ast.Expr.Block(n.then)) && numeric_literals(otherwise)
+                none => false
+            }
+        }
+        _ => false
+    }
+}
+
+fn produced(e: ast.Expr) -> ast.Expr {
+    match e {
+        Block(b) => {
+            match b.tail {
+                some(tail) => produced(tail)
+                none => e
+            }
+        }
+        _ => e
+    }
+}
+
+fn match_expr(c: *Checker, e: *ast.Match, want: *types.Type?) ! diag.Error {
+    let t = plain(c, e.x, none)?
+    if t == c.universe.void || t == c.universe.never {
+        fail At(ast.position(e.x), "cannot match on a value of type {t.text()}")
+    }
+    e.type = arms(c, e.arms, t, want, e.pos)?
+}
+
+fn arms(c: *Checker, list: []*ast.Arm, enum_type: *types.Type, want: *types.Type?, pos: diag.Pos) -> *types.Type ! diag.Error {
+    var result = c.universe.never
+    let covered: [*types.Variant: bool] = [:]
+    var wildcard = false
+    var tested = false
+    for arm in list {
+        if wildcard {
+            fail At(arm.pattern.pos, "unreachable arm; an earlier arm matches everything")
+        }
+        push_scope(c)
+        pattern(c, arm.pattern, enum_type)?
+        let produced_type = branch(c, arm.body, want, want)?
+        result = unify(c, result, produced_type)
+        pop_scope(c)
+        if arm.pattern.test != none {
+            tested = true
+            continue
+        }
+        match arm.pattern.variant {
+            some(v) => {
+                if covered[v] != none {
+                    fail At(arm.pattern.pos, "duplicate arm for {arm.pattern.name}")
+                }
+                covered[v] = true
+            }
+            none => { wildcard = true }
+        }
+    }
+    if !wildcard {
+        if tested || enum_type.kind != EnumKind {
+            fail At(pos, "match on {enum_type.text()} needs a final _ arm")
+        }
+        exhaustive(c, enum_type, covered, pos)?
+    }
+    result
+}
+
+fn exhaustive(c: *Checker, enum_type: *types.Type, covered: [*types.Variant: bool], pos: diag.Pos) ! diag.Error {
+    var missing: []str = []
+    for v in enum_type.variants {
+        if covered[v] == none {
+            push(mut missing, v.name)
+        }
+    }
+    if missing.len > 0 {
+        fail At(pos, "missing arms for {text.join(missing, ", ")}")
+    }
+}
+
+fn pattern(c: *Checker, p: *ast.Pattern, enum_type: *types.Type) ! diag.Error {
+    match p.test {
+        some(test) => {
+            push(mut c.subjects, enum_type)
+            expect_type(c, test, c.universe.bool)?
+            c.subjects = c.subjects[..c.subjects.len - 1]
+            return
+        }
+        none => {}
+    }
+    if const_arm(c, p, enum_type)? {
+        pattern(c, p, enum_type)?
+        return
+    }
+    if binds(p.name) && (enum_type.kind != EnumKind || enum_type.variant(p.name) == none) {
+        if p.bindings.len > 0 {
+            fail At(p.pos, "{enum_type.text()} has no variant {p.name}")
+        }
+        p.local = declare(c, p.name, enum_type, false)
+        return
+    }
+    if p.name != "_" && enum_type.kind != EnumKind {
+        fail At(p.pos, "an arm matching {enum_type.text()} starts with a literal or an operator, such as 4, == or <")
+    }
+    if p.name == "_" {
+        if p.bindings.len > 0 {
+            fail At(p.pos, "_ cannot bind fields")
+        }
+        return
+    }
+    let v = variant_of(c, enum_type, p.name, p.pos)?
+    p.variant = v
+    let fields = v.fields
+    if p.bindings.len > 0 && p.bindings.len != fields.len {
+        fail At(p.pos, "variant {p.name} has {fields.len} fields, pattern binds {p.bindings.len}")
+    }
+    for i, b in p.bindings {
+        if b.name != "_" {
+            b.local = declare(c, b.name, fields[i], false)
+        }
+    }
+}
+
+fn binds(name: str) -> bool {
+    name[0] >= 'a' && name[0] <= 'z'
+}
+
+fn error_result(c: *Checker, e: ast.Expr, keyword: str, pos: diag.Pos, want: *types.Type?) -> *types.Type ! diag.Error {
+    let t = expr(c, e, want)?
+    if t.kind != ResultKind {
+        fail At(pos, "{keyword} requires an error result, found {t.text()}")
+    }
+    t
+}
+
+fn try_expr(c: *Checker, e: *ast.Try, want: *types.Type?) ! diag.Error {
+    leaving(c, e.pos, "?")?
+    require_result(c, e.pos, "?")?
+    let t = error_result(c, e.x, "?", e.pos, want)?
+    let ret_type = ret_type_of(current(c))
+    if ret_type.kind != ResultKind {
+        c.unpropagated = t
+        fail At(e.pos, "? requires {subject(c)} to declare an error type")
+    }
+    if ret_type.err_of() != t.err_of() {
+        fail At(e.pos, "cannot propagate {t.err_of().text()} from function with error type {ret_type.err_of().text()}")
+    }
+    e.type = t.ok_of()
+}
+
+fn catch_expr(c: *Checker, e: *ast.Catch, want: *types.Type?) ! diag.Error {
+    let t = error_result(c, e.x, "catch", e.pos, want)?
+    if e.map != none {
+        map_error(c, e, t)?
+        return
+    }
+    let handled_as = handled_type(t.ok_of(), want)
+    e.type = handled_as
+    let produced_type = arms(c, e.arms, t.err_of(), handled_as, e.pos)?
+    if t.ok_of() != c.universe.void && !handled_as.accepts(produced_type) {
+        fail At(e.pos, "catch arms must produce {handled_as.text()}, found {produced_type.text()}")
+    }
+}
+
+fn map_error(c: *Checker, e: *ast.Catch, t: *types.Type) ! diag.Error {
+    leaving(c, e.pos, "catch")?
+    e.type = t.ok_of()
+    let ret_type = ret_type_of(current(c))
+    if ret_type.kind != ResultKind {
+        fail At(e.pos, "catch with a mapper requires {subject(c)} to declare an error type")
+    }
+    let mapper = e.map ?? panic("catch has no mapper")
+    push(mut c.subjects, t.err_of())
+    expect_type(c, ast.Expr.Call(mapper), ret_type.err_of())?
+    c.subjects = c.subjects[..c.subjects.len - 1]
+}
+
+fn or_expr(c: *Checker, e: *ast.Or, want: *types.Type?) ! diag.Error {
+    let t = error_result(c, e.x, "or", e.pos, want)?
+    let handled_as = handled_type(t.ok_of(), want)
+    e.type = handled_as
+    let fallback = branch(c, e.fallback, handled_as, handled_as)?
+    handled(c, e.fallback, fallback)?
+}
+
+fn handled_type(ok: *types.Type, want: *types.Type?) -> *types.Type {
+    match want {
+        some(w) => {
+            if w.optional && w.elem == ok {
+                return w
+            }
+        }
+        none => {}
+    }
+    ok
+}

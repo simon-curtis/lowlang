@@ -17,7 +17,7 @@ $ /tmp/low build compiler/lowdump -o /tmp/lowdump-low
 $ /tmp/lowdump-go tokens file.low > a; /tmp/lowdump-low tokens file.low > b; cmp a b
 ```
 
-The commands are `tokens`, `ast`, `check` and `object`. `check` loads a whole program and prints every file's AST with the types, locals, targets and layouts the checker resolved; `cmd/lowdump/ast.go` and `compiler/lowdump/ast.low` print the same lines, so a field the checker sets is compared as soon as the Low checker sets it.
+The commands are `tokens`, `ast`, `check` and `object`. `check` loads a whole program and prints every file's AST with the types, locals, targets and layouts the checker resolved; `cmd/lowdump/ast.go` and `compiler/lowdump/ast.low` print the same lines, so a field the checker sets is compared as soon as the Low checker sets it. The Go compiler embeds `internal/compiler/std` and `internal/compiler/prelude.low`; the Low `compiler` module reads them from disk, from the directory in `LOW_STD` or else `internal/compiler/std` relative to the working directory, with `prelude.low` beside it.
 
 Compare stdout, stderr and the exit status over every `.low` file under `testdata/`, `internal/compiler/` and `bench/`, including the files that must fail.
 

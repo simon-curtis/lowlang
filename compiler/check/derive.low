@@ -1,0 +1,533 @@
+import ast
+import builtin
+import diag
+import lexer
+import parser
+import types
+import std/builder
+import std/text
+
+const serde_module = "std/serde"
+const serde_field = "Field"
+
+enum Derivation {
+    Serialize = 0
+    Deserialize = 1
+    Describe = 2
+    Render = 3
+}
+
+fn derivation_name(kind: Derivation) -> str {
+    match kind {
+        Serialize => "__write"
+        Deserialize => "__read"
+        Describe => "__describe"
+        Render => "__render"
+    }
+}
+
+struct Synth {
+    c: *Checker
+    home: *ast.File
+    pos: diag.Pos
+    bound: [str: *types.Type] = [:]
+    names: [*types.Type: str] = [:]
+    out: builder.Builder = builder.builder()
+    text: builder.Builder = builder.builder()
+    temps: i64 = 0
+}
+
+fn serde_type(c: *Checker, name: str, pos: diag.Pos) -> *types.Type ! diag.Error {
+    if c.ctx.file.module != serde_module {
+        fail At(pos, "only {serde_module} may derive code from types")
+    }
+    local(c).types[name] ?? fail At(pos, "{serde_module} has no type {name}")
+}
+
+fn serde_field_type(c: *Checker, owner: *types.Type, f: *types.Field, pos: diag.Pos) -> *types.Type ! diag.Error {
+    let serde = c.modules[serde_module] ?? fail At(pos, "{owner.text()}.{f.name} refers to a field and needs {serde_module} to be imported")
+    let g = serde.generics[serde_field] ?? fail At(pos, "{owner.text()}.{f.name} refers to a field and needs {serde_module} to be imported")
+    instantiate_type(c, g, [owner, f.type], pos)?
+}
+
+fn serialize_call(c: *Checker, e: *ast.Call) ! diag.Error {
+    let t = plain(c, e.args[0], none)?
+    let writer = serde_type(c, "Writer", e.pos)?
+    expect_type(c, e.args[1], writer)?
+    e.type = c.universe.void
+    if !types.abstract(t) {
+        e.target = derive(c, Derivation.Serialize, t, e.pos)?
+    }
+}
+
+fn serialize_into_call(c: *Checker, e: *ast.Call) ! diag.Error {
+    let writer = serde_type(c, "Writer", e.pos)?
+    expect_type(c, e.args[0], writer)?
+    let path_type = c.universe.slice(c.universe.i64)?
+    let path = mut_of(c, e, 1, path_type)?
+    address(c, path)
+    let t = plain(c, e.args[2], none)?
+    exclusive(c, e.args)?
+    e.builtin = builtin.ID.None
+    e.type = c.universe.void
+    if !types.abstract(t) {
+        e.target = derive(c, Derivation.Serialize, t, e.pos)?
+    }
+}
+
+fn deserialize_call(c: *Checker, e: *ast.Call, inst: *ast.Instance) ! diag.Error {
+    let t = resolve(c, inst.types[0])?
+    let reader = serde_type(c, "Reader", e.pos)?
+    expect_type(c, e.args[0], reader)?
+    let failure = serde_type(c, "Error", e.pos)?
+    e.type = c.universe.result(t, failure)?
+    if !types.abstract(t) {
+        e.target = derive(c, Derivation.Deserialize, t, e.pos)?
+    }
+}
+
+fn schema_call(c: *Checker, e: *ast.Call, inst: *ast.Instance) ! diag.Error {
+    let t = resolve(c, inst.types[0])?
+    e.type = serde_type(c, "Schema", e.pos)?
+    if !types.abstract(t) {
+        e.target = derive(c, Derivation.Describe, t, e.pos)?
+    }
+}
+
+fn derive(c: *Checker, kind: Derivation, t: *types.Type, pos: diag.Pos) -> *ast.Func ! diag.Error {
+    let key = "{kind.index}:{type_key([t])}"
+    match c.derived[key] {
+        some(known) => return known
+        none => {}
+    }
+    let home = derivation_home(c, kind)
+    let s = new(Synth { c, home, pos })
+    derive_body(s, kind, t)?
+    let f = parse(s, kind, t)
+    c.derived[key] = f
+    within(c, home, f.bound, fn() ! diag.Error { signature(c, f) })?
+    push(mut home.funcs, f)
+    push(mut c.pending, f)
+    f
+}
+
+fn parse(s: *Synth, kind: Derivation, t: *types.Type) -> *ast.Func {
+    let name = types.instance_name(derivation_name(kind), [t])
+    let source = s.out.to_str()
+    let file = parser.parse_source(source, diag.start("<{name}>"), true) catch {
+        err => panic("derived source for {t.text()} does not parse: {diag.message(err)}\n{source}")
+    }
+    let f = file.funcs[0]
+    f.name = name
+    f.file = s.home
+    f.bound = s.bound
+    f.trusted = true
+    f.derived = true
+    f
+}
+
+fn bound_name(s: *Synth, t: *types.Type) -> str {
+    match s.names[t] {
+        some(known) => return known
+        none => {}
+    }
+    let n = "__X{s.names.len}"
+    s.names[t] = n
+    s.bound[n] = t
+    n
+}
+
+fn temp(s: *Synth, prefix: str) -> str {
+    s.temps += 1
+    "{prefix}{s.temps}"
+}
+
+fn line(s: *Synth, text: str) {
+    flush(s)
+    s.out.write(text)
+    s.out.write_byte('\n')
+}
+
+fn derive_body(s: *Synth, kind: Derivation, t: *types.Type) ! diag.Error {
+    let self = bound_name(s, t)
+    match kind {
+        Serialize => {
+            s.bound["__W"] = serde_type(s.c, "Writer", s.pos)?
+            line(s, "fn derived(w: __W, mut path: []i64, v: {self}) {{")
+            serialize(s, t)?
+        }
+        Deserialize => {
+            s.bound["__R"] = serde_type(s.c, "Reader", s.pos)?
+            s.bound["__E"] = serde_type(s.c, "Error", s.pos)?
+            line(s, "fn derived(r: __R) -> {self} ! __E {{")
+            deserialize(s, t)?
+        }
+        Describe => {
+            s.bound["__S"] = serde_type(s.c, "Schema", s.pos)?
+            line(s, "fn derived() -> __S {{")
+            let body = schema(s, t, [])?
+            line(s, body)
+        }
+        Render => {
+            line(s, "fn derived(mut b: []u8, mut path: []i64, v: {self}) {{")
+            render(s, t)?
+        }
+    }
+    line(s, "}}")
+}
+
+fn unsupported(s: *Synth, t: *types.Type) ! diag.Error {
+    fail At(s.pos, "cannot derive serialization for {t.text()}")
+}
+
+fn serialize(s: *Synth, t: *types.Type) ! diag.Error {
+    let u = s.c.universe
+    if t == u.bool {
+        line(s, "w.boolean(v)")
+    } else if t == u.u64 {
+        line(s, "w.unsigned(v)")
+    } else if t.kind == IntKind {
+        line(s, "w.integer(i64(v))")
+    } else if t.kind == FloatKind {
+        line(s, "w.float(f64(v))")
+    } else if t == u.str {
+        line(s, "w.text(v)")
+    } else if t.kind == SliceKind && t.elem == u.u8 {
+        line(s, "w.binary(v)")
+    } else if t.kind == SliceKind {
+        line(s, "w.begin_seq()\nfor x in v {{\n__serialize_into(w, mut path, x)\n}}\nw.end_seq()")
+    } else if t.kind == MapKind {
+        let codec = key_codec(s, t.key_of())?
+        line(s, "w.begin_map()\nfor k, x in v {{\nw.key({codec.write})\n__serialize_into(w, mut path, x)\n}}\nw.end_map()")
+    } else if is_optional(t) {
+        line(s, "match v {{\nsome(x) => __serialize_into(w, mut path, x)\nnone => w.null()\n}}")
+    } else if t.kind == PointerKind {
+        serialize_pointer(s, t)?
+    } else if t.kind == StructKind {
+        line(s, "w.begin_struct()")
+        for f in t.fields {
+            line(s, "w.field({lexer.quote(f.name)})\n__serialize_into(w, mut path, v.{f.name})")
+        }
+        line(s, "w.end_struct()")
+    } else if t.kind == EnumKind {
+        serialize_enum(s, t)
+    } else {
+        unsupported(s, t)?
+    }
+}
+
+fn serialize_pointer(s: *Synth, t: *types.Type) ! diag.Error {
+    let message = lexer.quote("serde: cycle through {t.text()}")
+    guard_pointer(s, fn() ! diag.Error { line(s, "panic({message})") }, "__serialize_into(w, mut path, *v)")?
+}
+
+fn is_optional(t: *types.Type) -> bool {
+    t.kind == EnumKind && t.optional
+}
+
+fn required(t: *types.Type, defaulted: bool) -> bool {
+    !defaulted && !is_optional(t)
+}
+
+struct KeyCodec {
+    write: str
+    read: str
+}
+
+fn key_codec(s: *Synth, k: *types.Type) -> KeyCodec ! diag.Error {
+    let u = s.c.universe
+    var codec = KeyCodec { write: "\"{{k}}\"", read: "" }
+    if k == u.str {
+        return KeyCodec { write: "k", read: "key" }
+    }
+    if k == u.bool {
+        codec.read = "key_boolean(key, at)?"
+    } else if k == u.i64 {
+        codec.read = "key_integer(key, at)?"
+    } else if k == u.u64 {
+        codec.read = "key_unsigned(key, at)?"
+    } else if k.kind == IntKind {
+        let range = k.bounds()
+        let wide = bound_name(s, k)
+        codec.read = "{wide}(in_range(key_integer(key, at)?, {range.low}, {range.high}, at)?)"
+    } else {
+        unsupported(s, k)?
+    }
+    codec
+}
+
+fn label_of(v: *types.Variant, i: i64) -> str {
+    if i < v.labels.len && v.labels[i] != "" {
+        return v.labels[i]
+    }
+    "{i}"
+}
+
+fn labelled(v: *types.Variant) -> bool {
+    v.labels.len > 0 && v.labels[0] != ""
+}
+
+fn serialize_enum(s: *Synth, t: *types.Type) {
+    line(s, "match v {{")
+    for v in t.variants {
+        if v.fields.len == 0 {
+            line(s, "{v.name} => w.unit_variant({lexer.quote(v.name)})")
+            continue
+        }
+        var binds: []str = []
+        for i in 0..v.fields.len {
+            push(mut binds, "f{i}")
+        }
+        line(s, "{v.name}({text.join(binds, ", ")}) => {{")
+        line(s, "w.begin_variant({lexer.quote(v.name)})")
+        if labelled(v) {
+            line(s, "w.begin_struct()")
+            for i in 0..v.fields.len {
+                line(s, "w.field({lexer.quote(label_of(v, i))})\n__serialize_into(w, mut path, f{i})")
+            }
+            line(s, "w.end_struct()")
+        } else {
+            line(s, "w.begin_seq()")
+            for i in 0..v.fields.len {
+                line(s, "__serialize_into(w, mut path, f{i})")
+            }
+            line(s, "w.end_seq()")
+        }
+        line(s, "w.end_variant()\n}}")
+    }
+    line(s, "}}")
+}
+
+fn deserialize(s: *Synth, t: *types.Type) ! diag.Error {
+    let u = s.c.universe
+    let self = bound_name(s, t)
+    if t == u.bool {
+        line(s, "r.boolean()?")
+    } else if t == u.i64 {
+        line(s, "r.integer()?")
+    } else if t == u.u64 {
+        line(s, "r.unsigned()?")
+    } else if t.kind == IntKind {
+        let range = t.bounds()
+        line(s, "{self}(integer_in(r, {range.low}, {range.high})?)")
+    } else if t == u.f64 {
+        line(s, "r.float()?")
+    } else if t.kind == FloatKind {
+        line(s, "f32(r.float()?)")
+    } else if t == u.str {
+        line(s, "r.text()?")
+    } else if t.kind == SliceKind && t.elem == u.u8 {
+        line(s, "r.binary()?")
+    } else if t.kind == SliceKind {
+        let elem = bound_name(s, t.elem_of())
+        line(s, "var out: {self} = []\nr.begin_seq()?\nfor r.next_element()? {{\npush(mut out, __deserialize[{elem}](r)?)\n}}\nout")
+    } else if t.kind == MapKind {
+        line(s, "var out: {self} = [:]\nr.begin_map()?\nfor {{\nlet at = r.position()")
+        line(s, "let key = match r.next_key()? {{\nsome(k) => k\nnone => break\n}}")
+        let codec = key_codec(s, t.key_of())?
+        let elem = bound_name(s, t.elem_of())
+        line(s, "out[{codec.read}] = __deserialize[{elem}](r)?\n}}\nout")
+    } else if is_optional(t) {
+        let elem = bound_name(s, t.elem_of())
+        line(s, "if r.null()? {{\nreturn none\n}}\n__deserialize[{elem}](r)?")
+    } else if t.kind == PointerKind {
+        let elem = bound_name(s, t.elem_of())
+        line(s, "new(__deserialize[{elem}](r)?)")
+    } else if t.kind == StructKind {
+        deserialize_struct(s, t)
+    } else if t.kind == EnumKind {
+        deserialize_enum(s, t)
+    } else {
+        unsupported(s, t)?
+    }
+}
+
+struct Member {
+    name: str
+    type: *types.Type
+    defaulted: bool = false
+}
+
+struct Slot {
+    name: str
+    type: *types.Type
+    defaulted: bool
+    value: str
+    present: str
+    required: bool
+}
+
+fn struct_members(s: *Synth, t: *types.Type) -> []Member {
+    var members: []Member = []
+    for f in t.fields {
+        push(mut members, Member { name: f.name, type: f.type, defaulted: s.c.field_sources[f] != none })
+    }
+    members
+}
+
+fn variant_members(v: *types.Variant) -> []Member {
+    var members: []Member = []
+    for i, f in v.fields {
+        push(mut members, Member { name: label_of(v, i), type: f })
+    }
+    members
+}
+
+fn read_fields(s: *Synth, members: []Member) -> []Slot {
+    var slots: []Slot = []
+    for m in members {
+        let value = temp(s, "value")
+        let present = temp(s, "seen")
+        let slot = Slot { name: m.name, type: m.type, defaulted: m.defaulted, value, present, required: required(m.type, m.defaulted) }
+        push(mut slots, slot)
+        let member_type = bound_name(s, m.type)
+        line(s, "var {value}: {member_type} = __zero()\nvar {present} = false")
+    }
+    line(s, "r.begin_map()?\nfor {{\nlet key = match r.next_field()? {{\nsome(k) => k\nnone => break\n}}")
+    for i, sl in slots {
+        var prefix = "}} else if"
+        if i == 0 {
+            prefix = "if"
+        }
+        let slot_type = bound_name(s, sl.type)
+        line(s, "{prefix} key == {lexer.quote(sl.name)} {{\n{sl.value} = __deserialize[{slot_type}](r)?\n{sl.present} = true")
+    }
+    if slots.len == 0 {
+        line(s, "r.skip()?\n}}")
+    } else {
+        line(s, "}} else {{\nr.skip()?\n}}\n}}")
+    }
+    for sl in slots {
+        if sl.required {
+            line(s, "if !{sl.present} {{\nfail Missing({lexer.quote(sl.name)})\n}}")
+        }
+    }
+    slots
+}
+
+fn deserialize_struct(s: *Synth, t: *types.Type) {
+    let slots = read_fields(s, struct_members(s, t))
+    var inits: []str = []
+    for sl in slots {
+        if !sl.defaulted {
+            push(mut inits, "{sl.name}: {sl.value}")
+        }
+    }
+    let self = bound_name(s, t)
+    line(s, "var out = {self} {{ {text.join(inits, ", ")} }}")
+    for sl in slots {
+        if sl.defaulted {
+            line(s, "if {sl.present} {{\nout.{sl.name} = {sl.value}\n}}")
+        }
+    }
+    line(s, "out")
+}
+
+fn deserialize_enum(s: *Synth, t: *types.Type) {
+    line(s, "let at = r.position()\nlet name = r.begin_variant()?")
+    for v in t.variants {
+        line(s, "if name == {lexer.quote(v.name)} {{")
+        var args: []str = []
+        for i in 0..v.fields.len {
+            push(mut args, "")
+        }
+        if v.fields.len > 0 && labelled(v) {
+            for i, sl in read_fields(s, variant_members(v)) {
+                args[i] = sl.value
+            }
+        } else if v.fields.len > 0 {
+            let expected = lexer.quote("{v.fields.len} values for {v.name}")
+            line(s, "r.begin_seq()?")
+            for i, f in v.fields {
+                args[i] = temp(s, "item")
+                let field_type = bound_name(s, f)
+                line(s, "if !r.next_element()? {{\nfail Mismatch({expected}, at)\n}}\nlet {args[i]} = __deserialize[{field_type}](r)?")
+            }
+            line(s, "if r.next_element()? {{\nfail Mismatch({expected}, at)\n}}")
+        }
+        line(s, "r.end_variant()?")
+        let self = bound_name(s, t)
+        if v.fields.len == 0 {
+            line(s, "return {self}.{v.name}\n}}")
+        } else {
+            line(s, "return {self}.{v.name}({text.join(args, ", ")})\n}}")
+        }
+    }
+    line(s, "fail UnknownVariant(name)")
+}
+
+fn schema(s: *Synth, t: *types.Type, stack: []*types.Type) -> str ! diag.Error {
+    let u = s.c.universe
+    if t == u.bool {
+        return "__S {{ kind: Bool }}"
+    }
+    if t == u.u64 || (t.kind == IntKind && !t.signed) {
+        return "__S {{ kind: Uint, bits: {t.bits} }}"
+    }
+    if t.kind == IntKind {
+        return "__S {{ kind: Int, bits: {t.bits} }}"
+    }
+    if t.kind == FloatKind {
+        return "__S {{ kind: Float, bits: {t.bits} }}"
+    }
+    if t == u.str {
+        return "__S {{ kind: Text }}"
+    }
+    if t.kind == SliceKind && t.elem == u.u8 {
+        return "__S {{ kind: Binary }}"
+    }
+    if t.kind == SliceKind {
+        let items = schema(s, t.elem_of(), stack)?
+        return "__S {{ kind: Seq, items: [{items}] }}"
+    }
+    if t.kind == MapKind {
+        let key = schema(s, t.key_of(), stack)?
+        let value = schema(s, t.elem_of(), stack)?
+        return "__S {{ kind: Map, items: [{key}, {value}] }}"
+    }
+    if t.kind == EnumKind && t.optional {
+        let items = schema(s, t.elem_of(), stack)?
+        return "__S {{ kind: Optional, items: [{items}] }}"
+    }
+    if t.kind == PointerKind {
+        return schema(s, t.elem_of(), stack)?
+    }
+    if t.kind == StructKind || t.kind == EnumKind {
+        for seen in stack {
+            if seen == t {
+                return "__S {{ kind: Ref, name: {lexer.quote(t.name)} }}"
+            }
+        }
+        var inner: []*types.Type = []
+        for seen in stack {
+            push(mut inner, seen)
+        }
+        push(mut inner, t)
+        if t.kind == StructKind {
+            let fields = schema_properties(s, struct_members(s, t), inner)?
+            return "__S {{ kind: Struct, name: {lexer.quote(t.name)}, fields: [{fields}] }}"
+        }
+        let variants = schema_variants(s, t, inner)?
+        return "__S {{ kind: Enum, name: {lexer.quote(t.name)}, variants: [{variants}] }}"
+    }
+    unsupported(s, t)?
+    ""
+}
+
+fn schema_properties(s: *Synth, members: []Member, stack: []*types.Type) -> str ! diag.Error {
+    var parts: []str = []
+    for m in members {
+        let inner = schema(s, m.type, stack)?
+        push(mut parts, "Property {{ name: {lexer.quote(m.name)}, schema: {inner}, required: {required(m.type, m.defaulted)} }}")
+    }
+    text.join(parts, ", ")
+}
+
+fn schema_variants(s: *Synth, t: *types.Type, stack: []*types.Type) -> str ! diag.Error {
+    var parts: []str = []
+    for v in t.variants {
+        let fields = schema_properties(s, variant_members(v), stack)?
+        push(mut parts, "Variant {{ name: {lexer.quote(v.name)}, labelled: {labelled(v)}, fields: [{fields}] }}")
+    }
+    text.join(parts, ", ")
+}

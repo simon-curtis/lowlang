@@ -1,0 +1,378 @@
+import ast
+import builtin
+import diag
+import lexer
+import types
+
+const two_pow_63 = 9223372036854775808.0
+
+fn declare_consts(c: *Checker, files: []*ast.File) ! diag.Error {
+    for f in files {
+        c.ctx.file = f
+        for k in f.consts {
+            declare_const(c, k)?
+        }
+    }
+    for f in files {
+        c.ctx.file = f
+        for k in f.consts {
+            folded(c, k)?
+        }
+    }
+}
+
+fn declare_const(c: *Checker, k: *ast.Const) ! diag.Error {
+    let home = local(c)
+    let generic = home.generics[k.name] != none
+    let dup = home.consts[k.name] != none
+    let is_func = home.funcs[k.name] != none
+    let is_type = home.types[k.name] != none
+    if dup {
+        fail At(k.pos, "constant {k.name} already declared")
+    }
+    if fixed_builtin(c, k.name) != none {
+        fail At(k.pos, "{k.name} is a builtin")
+    }
+    if is_func || generic {
+        fail At(k.pos, "constant {k.name} has the name of a function")
+    }
+    if is_type || reserved_type(c, k.name) {
+        fail At(k.pos, "constant {k.name} has the name of a type")
+    }
+    home.consts[k.name] = k
+}
+
+fn imported_const(alias: str, k: *ast.Const, pos: diag.Pos) -> *ast.Const ! diag.Error {
+    if !k.exported {
+        fail At(pos, "{alias}.{k.name} is private")
+    }
+    k
+}
+
+fn const_arm(c: *Checker, p: *ast.Pattern, enum_type: *types.Type) -> bool ! diag.Error {
+    let named_const = local(c).consts[p.name] != none
+    if !named_const || find(c, p.name) != none || enum_type.variant(p.name) != none {
+        return false
+    }
+    if p.bindings.len > 0 {
+        fail At(p.pos, "constant {p.name} cannot bind fields")
+    }
+    let value = new(ast.Ident { name: p.name, pos: p.pos })
+    let subject = new(ast.Subject { pos: p.pos })
+    p.test = ast.Expr.Binary(new(ast.Binary { op: lexer.Kind.Eq, x: ast.Expr.Subject(subject), y: ast.Expr.Ident(value), pos: p.pos }))
+    true
+}
+
+fn folded(c: *Checker, k: *ast.Const) -> ast.Expr ! diag.Error {
+    match k.folded {
+        some(done) => return done
+        none => {}
+    }
+    if c.folding[k] != none {
+        fail At(k.pos, "constant {k.name} refers to itself")
+    }
+    c.folding[k] = true
+    let file = k.file ?? panic("constant {k.name} has no file")
+    let owner = new(ast.Func { name: k.name, file, ret_type: c.universe.void, pos: k.pos })
+    let next = FuncContext { func: owner, file, bound: [:], scopes: [] }
+    enter(c, next, fn() ! diag.Error {
+        push_scope(c)
+        let t = const_type(c, k)?
+        if !t.is_integer() && !t.is_float() && t != c.universe.bool && t != c.universe.str {
+            fail At(ast.position(k.value), "constant {k.name} must be a number, bool or str, found {t.text()}")
+        }
+        k.folded = fold(c, k.value)?
+    })?
+    k.folded ?? panic("constant {k.name} was not folded")
+}
+
+fn const_type(c: *Checker, k: *ast.Const) -> *types.Type ! diag.Error {
+    let declared = k.type_name ?? return plain(c, k.value, none)?
+    let t = resolve(c, declared)?
+    expect_type(c, k.value, t)?
+    t
+}
+
+fn fold(c: *Checker, e: ast.Expr) -> ast.Expr ! diag.Error {
+    match e {
+        IntLit(lit) => {
+            let t = lit.type ?? panic("integer literal has no type")
+            if t.is_float() {
+                return float_lit(t, f64(lit.value), lit.pos)
+            }
+            return e
+        }
+        FloatLit(lit) => return e
+        StrLit(lit) => return e
+        BoolLit(lit) => return e
+        Ident(id) => {
+            match id.constant {
+                some(k) => return k.folded ?? panic("constant {k.name} is not folded")
+                none => {}
+            }
+        }
+        Selector(sel) => {
+            match sel.constant {
+                some(k) => return k.folded ?? panic("constant {k.name} is not folded")
+                none => {}
+            }
+        }
+        Unary(u) => return fold_unary(c, u)?
+        Binary(b) => return fold_binary(c, b)?
+        Call(call) => {
+            if call.builtin == builtin.ID.Convert {
+                return fold_convert(c, call)?
+            }
+        }
+        _ => {}
+    }
+    fail At(ast.position(e), "a constant is built from literals, constants, operators and numeric conversions")
+}
+
+fn int_lit(t: *types.Type, n: i64, pos: diag.Pos) -> ast.Expr {
+    ast.Expr.IntLit(new(ast.IntLit { type: t, value: t.wrap(n), pos }))
+}
+
+fn float_lit(t: *types.Type, f: f64, pos: diag.Pos) -> ast.Expr {
+    var value = f
+    if t.bits == 32 {
+        value = f64(f32(f))
+    }
+    ast.Expr.FloatLit(new(ast.FloatLit { type: t, value, pos }))
+}
+
+fn bool_lit(c: *Checker, b: bool, pos: diag.Pos) -> ast.Expr {
+    ast.Expr.BoolLit(new(ast.BoolLit { type: c.universe.bool, value: b, pos }))
+}
+
+fn fold_unary(c: *Checker, e: *ast.Unary) -> ast.Expr ! diag.Error {
+    let x = fold(c, e.x)?
+    let t = e.type ?? panic("unary has no type")
+    match x {
+        IntLit(lit) => {
+            if e.op == lexer.Kind.Tilde {
+                return int_lit(t, ~lit.value, e.pos)
+            }
+            return int_lit(t, 0 - lit.value, e.pos)
+        }
+        FloatLit(lit) => return float_lit(t, -lit.value, e.pos)
+        BoolLit(lit) => return bool_lit(c, !lit.value, e.pos)
+        _ => {}
+    }
+    fail At(e.pos, "operator {lexer.kind_text(e.op)} is not constant")
+}
+
+fn fold_binary(c: *Checker, e: *ast.Binary) -> ast.Expr ! diag.Error {
+    let x = fold(c, e.x)?
+    let y = fold(c, e.y)?
+    match x {
+        IntLit(xl) => {
+            match y {
+                IntLit(yl) => return fold_int(c, e, xl, yl)?
+                _ => panic("constant operands differ in kind")
+            }
+        }
+        FloatLit(xl) => {
+            match y {
+                FloatLit(yl) => return fold_float(c, e, xl.value, yl.value)
+                _ => panic("constant operands differ in kind")
+            }
+        }
+        StrLit(xl) => {
+            match y {
+                StrLit(yl) => return fold_str(c, e, xl.value, yl.value)
+                _ => panic("constant operands differ in kind")
+            }
+        }
+        BoolLit(xl) => {
+            match y {
+                BoolLit(yl) => return fold_bool(c, e, xl.value, yl.value)
+                _ => panic("constant operands differ in kind")
+            }
+        }
+        _ => {}
+    }
+    fail At(e.pos, "operator {lexer.kind_text(e.op)} is not constant")
+}
+
+fn fold_int(c: *Checker, e: *ast.Binary, xl: *ast.IntLit, yl: *ast.IntLit) -> ast.Expr ! diag.Error {
+    let t = xl.type ?? panic("integer literal has no type")
+    let x = xl.value
+    let y = yl.value
+    match e.op {
+        Plus => return int_lit(t, x + y, e.pos)
+        Minus => return int_lit(t, x - y, e.pos)
+        Star => return int_lit(t, x * y, e.pos)
+        Amp => return int_lit(t, x & y, e.pos)
+        Pipe => return int_lit(t, x | y, e.pos)
+        Caret => return int_lit(t, x ^ y, e.pos)
+        Shl => return int_lit(t, shift_value(e.op, t, x, y), e.pos)
+        Shr => return int_lit(t, shift_value(e.op, t, x, y), e.pos)
+        Slash => {
+            if y == 0 {
+                fail At(e.pos, "division by zero")
+            }
+            return int_lit(t, divide(e.op, t, x, y), e.pos)
+        }
+        Percent => {
+            if y == 0 {
+                fail At(e.pos, "division by zero")
+            }
+            return int_lit(t, divide(e.op, t, x, y), e.pos)
+        }
+        _ => {}
+    }
+    if t.signed {
+        return bool_lit(c, compare_result(e.op, x < y, x == y), e.pos)
+    }
+    bool_lit(c, compare_result(e.op, u64(x) < u64(y), x == y), e.pos)
+}
+
+fn shift_value(op: lexer.Kind, t: *types.Type, x: i64, count: i64) -> i64 {
+    let wide = u64(count) >= 64
+    if op == lexer.Kind.Shl {
+        if wide {
+            return 0
+        }
+        return x << u64(count)
+    }
+    if wide {
+        if t.signed {
+            return x >> 63
+        }
+        return 0
+    }
+    if t.signed {
+        return x >> u64(count)
+    }
+    i64(u64(x) >> u64(count))
+}
+
+fn divide(op: lexer.Kind, t: *types.Type, x: i64, y: i64) -> i64 {
+    if !t.signed {
+        if op == lexer.Kind.Slash {
+            return i64(u64(x) / u64(y))
+        }
+        return i64(u64(x) % u64(y))
+    }
+    if y == -1 {
+        if op == lexer.Kind.Slash {
+            return 0 - x
+        }
+        return 0
+    }
+    if op == lexer.Kind.Slash {
+        return x / y
+    }
+    x % y
+}
+
+fn compare_result(op: lexer.Kind, less: bool, equal: bool) -> bool {
+    match op {
+        Eq => equal
+        NotEq => !equal
+        Lt => less
+        LtEq => less || equal
+        Gt => !less && !equal
+        _ => !less
+    }
+}
+
+fn fold_float(c: *Checker, e: *ast.Binary, x: f64, y: f64) -> ast.Expr {
+    let t = ast.type_of(e.x) ?? panic("float operand has no type")
+    match e.op {
+        Plus => float_result(e, t, x + y, f32(x) + f32(y))
+        Minus => float_result(e, t, x - y, f32(x) - f32(y))
+        Star => float_result(e, t, x * y, f32(x) * f32(y))
+        Slash => float_result(e, t, x / y, f32(x) / f32(y))
+        NotEq => bool_lit(c, x != y, e.pos)
+        Eq => bool_lit(c, x == y, e.pos)
+        Lt => bool_lit(c, x < y, e.pos)
+        LtEq => bool_lit(c, x <= y, e.pos)
+        Gt => bool_lit(c, x > y, e.pos)
+        _ => bool_lit(c, x >= y, e.pos)
+    }
+}
+
+fn float_result(e: *ast.Binary, t: *types.Type, wide: f64, narrow: f32) -> ast.Expr {
+    if t.bits == 32 {
+        return float_lit(t, f64(narrow), e.pos)
+    }
+    float_lit(t, wide, e.pos)
+}
+
+fn fold_str(c: *Checker, e: *ast.Binary, x: str, y: str) -> ast.Expr {
+    if e.op == lexer.Kind.Plus {
+        return ast.Expr.StrLit(new(ast.StrLit { type: c.universe.str, value: "{x}{y}", pos: e.pos }))
+    }
+    bool_lit(c, compare_result(e.op, x < y, x == y), e.pos)
+}
+
+fn fold_bool(c: *Checker, e: *ast.Binary, x: bool, y: bool) -> ast.Expr {
+    match e.op {
+        AndAnd => bool_lit(c, x && y, e.pos)
+        OrOr => bool_lit(c, x || y, e.pos)
+        Eq => bool_lit(c, x == y, e.pos)
+        _ => bool_lit(c, x != y, e.pos)
+    }
+}
+
+fn fold_convert(c: *Checker, e: *ast.Call) -> ast.Expr ! diag.Error {
+    let to = e.type ?? panic("conversion has no type")
+    let x = fold(c, e.args[0])?
+    match x {
+        IntLit(lit) => {
+            if to.is_integer() {
+                return int_lit(to, lit.value, e.pos)
+            }
+            return float_lit(to, integer_float(lit, to), e.pos)
+        }
+        FloatLit(lit) => {
+            if to.is_float() {
+                return float_lit(to, lit.value, e.pos)
+            }
+            return int_lit(to, float_integer(c, lit.value, to, e.pos)?, e.pos)
+        }
+        _ => {}
+    }
+    fail At(e.pos, "cannot convert a constant to {to.text()}")
+}
+
+fn integer_float(x: *ast.IntLit, to: *types.Type) -> f64 {
+    let from = x.type ?? panic("integer literal has no type")
+    if from.signed {
+        if to.bits == 32 {
+            return f64(f32(x.value))
+        }
+        return f64(x.value)
+    }
+    if to.bits == 32 {
+        return f64(f32(u64(x.value)))
+    }
+    f64(u64(x.value))
+}
+
+fn float_integer(c: *Checker, f: f64, to: *types.Type, pos: diag.Pos) -> i64 ! diag.Error {
+    let unsigned_range = f > -1.0 && f < 2.0 * two_pow_63
+    let in_range = f >= -two_pow_63 && f < two_pow_63
+    if to == c.universe.u64 {
+        if !unsigned_range {
+            fail At(pos, "{float_text(f)} overflows {to.text()}")
+        }
+        if f < 0.0 {
+            return 0
+        }
+        return i64(u64(f))
+    }
+    if !in_range {
+        return -9223372036854775807 - 1
+    }
+    i64(f)
+}
+
+fn float_text(f: f64) -> str {
+    if f == f64(i64(f)) && f > -1.0e18 && f < 1.0e18 {
+        return "{i64(f)}"
+    }
+    "{f}"
+}

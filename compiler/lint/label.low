@@ -1,0 +1,249 @@
+import ast
+import diag
+import lexer
+
+const prefer_loop_label = "prefer-loop-label"
+
+struct Relay {
+    flag: *ast.Local
+    value: bool
+    keyword: str
+    label: str
+}
+
+struct Loop {
+    label: str
+    body: *ast.Block
+}
+
+struct FlagTest {
+    flag: *ast.Local
+    value: bool
+}
+
+struct Assigns {
+    sets: bool
+    touches: bool
+}
+
+fn relays(l: *Linter, b: *ast.Block) {
+    let list = steps(b)
+    for i in 1..list.len {
+        relay_after(l, list[i - 1], list[i])
+    }
+}
+
+fn relay_after(l: *Linter, prev: ast.Node, next: ast.Node) {
+    let loop = loop_of(prev) ?? return
+    let r = relay_of(next) ?? return
+    for pos in exits(r, loop.label, loop.body) {
+        suggest_label(l, pos, r)
+    }
+}
+
+fn suggest_label(l: *Linter, pos: diag.Pos, r: Relay) {
+    if r.label == "" {
+        report(l, pos, prefer_loop_label, "{r.flag.name} relays this break to the enclosing loop; use a loop label: name: for … {{ … {r.keyword} name }}")
+        return
+    }
+    report(l, pos, prefer_loop_label, "{r.flag.name} relays this break to loop {r.label}; use {r.keyword} {r.label}")
+}
+
+fn steps(b: *ast.Block) -> []ast.Node {
+    var out: []ast.Node = []
+    for s in b.stmts {
+        push(mut out, unwrap(ast.Node.Stmt(s)))
+    }
+    match b.tail {
+        some(t) => push(mut out, unwrap(ast.Node.Expr(t)))
+        none => {}
+    }
+    out
+}
+
+fn unwrap(n: ast.Node) -> ast.Node {
+    match n {
+        Stmt(s) => {
+            match s {
+                ExprStmt(es) => ast.Node.Expr(es.x)
+                _ => n
+            }
+        }
+        _ => n
+    }
+}
+
+fn loop_of(n: ast.Node) -> Loop? {
+    match n {
+        Stmt(s) => {
+            match s {
+                For(f) => Loop { label: f.label, body: f.body }
+                ForIn(f) => Loop { label: f.label, body: f.body }
+                _ => none
+            }
+        }
+        _ => none
+    }
+}
+
+fn relay_of(n: ast.Node) -> Relay? {
+    let cond: *ast.If? = match n {
+        Expr(e) => {
+            match e {
+                If(i) => i
+                _ => none
+            }
+        }
+        _ => none
+    }
+    let c = cond ?? return none
+    if c.otherwise != none {
+        return none
+    }
+    let test = flag_test(c.cond) ?? return none
+    let jump = jump_of(ast.Node.Expr(ast.Expr.Block(c.then))) ?? return none
+    match jump {
+        Stmt(s) => {
+            match s {
+                Break(j) => Relay { flag: test.flag, value: test.value, keyword: "break", label: j.label }
+                Continue(j) => Relay { flag: test.flag, value: test.value, keyword: "continue", label: j.label }
+                _ => none
+            }
+        }
+        _ => none
+    }
+}
+
+fn flag_test(cond: ast.Expr) -> FlagTest? {
+    match cond {
+        Ident(c) => {
+            let local = c.local ?? return none
+            FlagTest { flag: local, value: true }
+        }
+        Unary(c) => {
+            match c.x {
+                Ident(x) => {
+                    let local = x.local ?? return none
+                    if c.op != lexer.Kind.Not {
+                        return none
+                    }
+                    FlagTest { flag: local, value: false }
+                }
+                _ => none
+            }
+        }
+        _ => none
+    }
+}
+
+fn jump_of(n: ast.Node) -> ast.Node? {
+    match n {
+        Expr(e) => {
+            match e {
+                Block(b) => {
+                    let inner = steps(b)
+                    if inner.len != 1 {
+                        return none
+                    }
+                    jump_of(inner[0])
+                }
+                _ => n
+            }
+        }
+        _ => n
+    }
+}
+
+fn exits(r: Relay, label: str, body: *ast.Block) -> []diag.Pos {
+    var found: []diag.Pos = []
+    ast.inspect(ast.Node.Expr(ast.Expr.Block(body)), fn(n: ast.Node) -> bool { exits_visit(r, label, mut found, n) })
+    found
+}
+
+fn exits_visit(r: Relay, label: str, mut found: []diag.Pos, n: ast.Node) -> bool {
+    match n {
+        Stmt(s) => {
+            match s {
+                For(f) => return false
+                ForIn(f) => return false
+                Spawn(f) => return false
+                Defer(f) => return false
+                _ => {}
+            }
+        }
+        Expr(e) => {
+            match e {
+                Closure(c) => return false
+                Block(b) => {
+                    for pos in block_exits(r, label, b) {
+                        push(mut found, pos)
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn block_exits(r: Relay, label: str, b: *ast.Block) -> []diag.Pos {
+    var found: []diag.Pos = []
+    var set = false
+    for step in steps(b) {
+        let a = assigns(r, step)
+        if a.touches {
+            set = a.sets
+            continue
+        }
+        let pos = exit(step, label) ?? continue
+        if set {
+            push(mut found, pos)
+        }
+    }
+    found
+}
+
+fn assigns(r: Relay, step: ast.Node) -> Assigns {
+    let none_found = Assigns { sets: false, touches: false }
+    match step {
+        Stmt(s) => {
+            match s {
+                Assign(a) => {
+                    match a.target {
+                        Ident(target) => {
+                            if target.local != r.flag {
+                                return none_found
+                            }
+                            match a.value {
+                                BoolLit(lit) => Assigns { sets: a.op == lexer.Kind.Assign && lit.value == r.value, touches: true }
+                                _ => Assigns { sets: false, touches: true }
+                            }
+                        }
+                        _ => none_found
+                    }
+                }
+                _ => none_found
+            }
+        }
+        _ => none_found
+    }
+}
+
+fn exit(step: ast.Node, label: str) -> diag.Pos? {
+    let jump = jump_of(step) ?? return none
+    match jump {
+        Stmt(s) => {
+            match s {
+                Break(b) => {
+                    if b.label != "" && b.label != label {
+                        return none
+                    }
+                    b.pos
+                }
+                _ => none
+            }
+        }
+        _ => none
+    }
+}
