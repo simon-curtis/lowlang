@@ -94,6 +94,16 @@ func registers(regs []*vreg) []*vreg {
 	return out
 }
 
+func collectable(regs []*vreg) []*vreg {
+	var out []*vreg
+	for _, r := range regs {
+		if !r.scalar {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 func copyStep(pos int, copies []*phiCopy) step {
 	st := step{pos: pos}
 	for _, c := range copies {
@@ -142,6 +152,9 @@ func (mb *mblock) buildSteps() {
 			st.defs = []*vreg{in.dst}
 		}
 		mb.steps = append(mb.steps, st)
+		if in.op == ir.OpCCall {
+			mb.steps = append(mb.steps, step{pos: in.pos + 1, uses: collectable(st.uses)})
+		}
 	}
 	if len(mb.copies) > 0 {
 		mb.steps = append(mb.steps, copyStep(mb.copyPos, mb.copies))

@@ -56,10 +56,10 @@ var listings = []listing{
 	{"vscode/syntaxes/low.tmLanguage.json", "types", "types", scopes("support.type.primitive.")},
 	{"vscode/syntaxes/low.tmLanguage.json", "constraints", "constraints", scopes("support.type.constraint.")},
 	{"vscode/syntaxes/low.tmLanguage.json", "builtin calls", "functions", captured("support.function.builtin.")},
-	{"../site/highlight.mjs", "keywords", "keywords", siteKeywords},
-	{"../site/highlight.mjs", "contextual keywords", "contextual keywords", moduleSet("contextual")},
-	{"../site/highlight.mjs", "types", "types", moduleSet("types")},
-	{"../site/highlight.mjs", "constants", "constants", moduleSet("constants")},
+	{"../site/gen/highlight.low", "keywords", "keywords", siteKeywords},
+	{"../site/gen/highlight.low", "contextual keywords", "contextual keywords", moduleSet("contextual_keywords")},
+	{"../site/gen/highlight.low", "types", "types", moduleSet("type_names")},
+	{"../site/gen/highlight.low", "constants", "constants", moduleSet("constants")},
 }
 
 func quoted(text, quote string) []string {
@@ -188,7 +188,7 @@ func captured(prefix string) func(string) []string {
 }
 
 func moduleSet(name string) func(string) []string {
-	pattern := regexp.MustCompile(`const ` + name + ` = new Set\(\[([^\]]*)\]\)`)
+	pattern := regexp.MustCompile(`fn ` + name + `\(\) -> \[\]str \{\s*\[([^\]]*)\]\s*\}`)
 	return func(text string) []string {
 		return quoted(pattern.FindStringSubmatch(text)[1], `"`)
 	}
@@ -235,7 +235,7 @@ func TestGrammarsMatchLanguageTables(t *testing.T) {
 var copies = []struct{ path, source string }{
 	{"zed/languages/low/highlights.scm", "tree-sitter-low/queries/highlights.scm"},
 	{"nvim/queries/low/highlights.scm", "tree-sitter-low/queries/highlights.scm"},
-	{"vscode/icon.png", "../site/icon-192.png"},
+	{"vscode/icon.png", "../site/public/icon-192.png"},
 }
 
 func TestEditorFilesCopyTheirSource(t *testing.T) {

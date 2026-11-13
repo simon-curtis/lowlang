@@ -1,0 +1,301 @@
+import std/atomic
+import std/file
+import std/json
+import std/os
+import std/path
+import std/process
+import std/sync
+import std/text
+
+struct Target {
+    local: bool
+    offset: i64
+    path: str
+    line: i64
+}
+
+struct Checked {
+    hovers: [i64: Hover] = [:]
+    references: [i64: i64] = [:]
+    definitions: [i64: Target] = [:]
+    errors: []str = []
+}
+
+struct Job {
+    program: Program
+    label: str
+}
+
+struct NamedDefinition {
+    path: str
+    line: i64
+    column: i64
+    local: bool
+}
+
+struct NamedEntry {
+    line: i64
+    column: i64
+    name: str
+    hover: str?
+    doc: str?
+    definition: NamedDefinition?
+    first: i64?
+}
+
+struct Checker {
+    directory: str
+    binary: str
+    sequence: atomic.Int
+    failures: []str
+}
+
+fn compiler_extension(root: str) -> str ! BuildError {
+    var command = process.command("go", ["env", "GOEXE"])
+    command.dir = root
+    let extension = command_output(command)?
+    text.trim(extension)
+}
+
+fn build_compiler(root: str, binary: str) ! BuildError {
+    var command = process.command("go", ["build", "-o", binary, "./cmd/low"])
+    command.dir = root
+    command_output(command)?
+}
+
+fn temporary_directory() -> str ! BuildError {
+    let created = file.temp_dir("low-site-") catch {
+        cause => fail Io("create", "a temporary directory", cause)
+    }
+    slashed(created)
+}
+
+fn start_checker(root: str) -> *Checker ! BuildError {
+    let directory = temporary_directory()?
+    let extension = compiler_extension(root) catch {
+        cause => {
+            remove_tree(directory) or {}
+            fail cause
+        }
+    }
+    let binary = path.join([directory, "low{extension}"])
+    build_compiler(root, binary) catch {
+        cause => {
+            remove_tree(directory) or {}
+            fail cause
+        }
+    }
+    new(Checker { directory, binary, sequence: atomic.int(0), failures: [] })
+}
+
+fn stop_checker(checker: *Checker) ! BuildError {
+    remove_tree(checker.directory)?
+}
+
+fn verify(checker: *Checker) ! BuildError {
+    if checker.failures.len > 0 {
+        fail Snippets(checker.failures.len, text.join(checker.failures, "\n"))
+    }
+}
+
+fn write_program(folder: str, program: Program) ! BuildError {
+    var files = [Prelude { path: "main.low", text: program.text }]
+    for extra in program.files {
+        push(mut files, extra)
+    }
+    for entry in files {
+        let target = path.join([folder, entry.path])
+        make_directories(path.dir(target))?
+        write_text(target, entry.text)?
+    }
+}
+
+fn names_command(checker: *Checker, folder: str) -> process.Command {
+    var command = process.command(checker.binary, ["names", "main.low", "-target", check_target])
+    command.dir = folder
+    command
+}
+
+fn failure_messages(output: process.Output) -> []str {
+    var messages: []str = []
+    for line in text.lines(failure_detail(output)) {
+        let message = text.trim(line)
+        if message.len > 0 {
+            push(mut messages, message)
+        }
+    }
+    messages
+}
+
+fn parse_names(data: []u8) -> []NamedEntry ! BuildError {
+    json.deserialize[[]NamedEntry](data) catch {
+        cause => fail Data("low names", "unreadable output: {cause}")
+    }
+}
+
+fn entry_offsets(program: Program, entries: []NamedEntry) -> []i64 {
+    var offsets: []i64 = []
+    for entry in entries {
+        push(mut offsets, offset_at(program, entry.line - 1, entry.column - 1))
+    }
+    offsets
+}
+
+fn entries_by_line(entries: []NamedEntry) -> [i64: []i64] {
+    var lines: [i64: []i64] = [:]
+    for index, entry in entries {
+        var indexes = lines[entry.line] ?? []
+        push(mut indexes, index)
+        lines[entry.line] = indexes
+    }
+    lines
+}
+
+fn group_minimums(entries: []NamedEntry, offsets: []i64) -> [i64: i64] {
+    var minimums: [i64: i64] = [:]
+    for index, entry in entries {
+        let first = entry.first ?? -1
+        if first < 0 || offsets[index] < 0 {
+            continue
+        }
+        let known = minimums[first] ?? offsets[index]
+        minimums[first] = if offsets[index] < known { offsets[index] } else { known }
+    }
+    minimums
+}
+
+fn covering_entry(entries: []NamedEntry, candidates: []i64, column: i64) -> i64 {
+    for index in candidates {
+        let entry = entries[index]
+        if entry.column <= column && column <= entry.column + entry.name.len {
+            return index
+        }
+    }
+    -1
+}
+
+fn target_of(program: Program, definition: NamedDefinition) -> Target {
+    if definition.local {
+        return Target { local: true, offset: offset_at(program, definition.line - 1, definition.column - 1), path: "", line: 0 }
+    }
+    Target { local: false, offset: -1, path: definition.path, line: definition.line }
+}
+
+fn facts_of(program: Program, entries: []NamedEntry) -> Checked {
+    let offsets = entry_offsets(program, entries)
+    let lines = entries_by_line(entries)
+    let minimums = group_minimums(entries, offsets)
+    var checked = Checked {}
+    for offset in words(program.source) {
+        let at = position(program, offset)
+        let candidates = lines[at.row + 1] ?? []
+        let index = covering_entry(entries, candidates, at.column + 1)
+        if index < 0 {
+            continue
+        }
+        let entry = entries[index]
+        match entry.hover {
+            some(code) => {
+                checked.hovers[offset] = Hover { code, doc: entry.doc ?? "" }
+            }
+            none => {}
+        }
+        match entry.definition {
+            some(definition) => {
+                checked.definitions[offset] = target_of(program, definition)
+            }
+            none => {}
+        }
+        let first = entry.first ?? -1
+        if first >= 0 && offsets[index] == offset {
+            var group = minimums[first] ?? offset
+            let target = checked.definitions[offset]
+            match target {
+                some(found) => {
+                    if found.local && found.offset >= 0 && found.offset < group {
+                        group = found.offset
+                    }
+                }
+                none => {}
+            }
+            checked.references[offset] = group
+        }
+    }
+    checked
+}
+
+fn inspect(checker: *Checker, program: Program, label: str) -> Checked ! BuildError {
+    let number = checker.sequence.add_int(1)
+    let folder = path.join([checker.directory, "snippet{number}"])
+    write_program(folder, program)?
+    let output = run_command(names_command(checker, folder))?
+    if !process.success(output.status) {
+        return Checked { errors: failure_messages(output) }
+    }
+    let entries = parse_names(output.stdout) catch {
+        cause => fail Data(label, describe(cause))
+    }
+    facts_of(program, entries)
+}
+
+fn record_failure(checker: *Checker, label: str, checked: Checked) {
+    if checked.errors.len > 0 {
+        push(mut checker.failures, "{label}: {text.join(checked.errors, "; ")}")
+    }
+}
+
+fn check(checker: *Checker, program: Program, label: str) -> Checked ! BuildError {
+    let checked = inspect(checker, program, label)?
+    record_failure(checker, label, checked)
+    checked
+}
+
+fn work(checker: *Checker, jobs: []Job, results: []Checked, faults: []str, queue: chan[i64], group: sync.WaitGroup) {
+    for index in queue {
+        let job = jobs[index]
+        let checked = inspect(checker, job.program, job.label) catch {
+            cause => {
+                faults[index] = describe(cause)
+                Checked {}
+            }
+        }
+        results[index] = checked
+    }
+    group.done()
+}
+
+fn worker_count(jobs: i64) -> i64 {
+    let cpus = os.cpu_count()
+    if cpus < 1 {
+        return 1
+    }
+    if cpus > jobs {
+        return jobs
+    }
+    cpus
+}
+
+fn check_all(checker: *Checker, jobs: []Job) -> []Checked ! BuildError {
+    var results: []Checked = []
+    var faults: []str = []
+    let queue = chan[i64](jobs.len)
+    for index in 0..jobs.len {
+        push(mut results, Checked {})
+        push(mut faults, "")
+        queue <- index
+    }
+    close(queue)
+    let group = sync.wait_group()
+    for worker in 0..worker_count(jobs.len) {
+        group.add(1)
+        spawn work(checker, jobs, results, faults, queue, group)
+    }
+    group.wait()
+    for index in 0..jobs.len {
+        if faults[index].len > 0 {
+            fail Data(jobs[index].label, faults[index])
+        }
+        record_failure(checker, jobs[index].label, results[index])
+    }
+    results
+}

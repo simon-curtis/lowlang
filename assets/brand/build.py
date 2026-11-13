@@ -102,11 +102,11 @@ def manifest():
 def build(brand):
     require_typeface()
     assets = brand.parent
-    site = assets.parent / "site"
+    site = assets.parent / "site" / "public"
     rounded = standard_tile(112, 144)
     (assets / "icon.svg").write_text(rounded)
     (site / "icon.svg").write_text(rounded)
-    (site / "mark.svg").write_text(bare_mark())
+    (assets.parent / "site" / "src" / "mark.svg").write_text(bare_mark())
     favicons = {
         16: tile(64, 96, 104, 40),
         32: tile(96, 104, 96, 28),

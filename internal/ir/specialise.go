@@ -21,10 +21,11 @@ type specialiser struct {
 	program  *Program
 	cloned   int
 	clonesOf map[*Func]int
+	named    map[string]int
 }
 
 func (p *Program) specialiseConstantArguments() {
-	s := &specialiser{program: p, clonesOf: map[*Func]int{}}
+	s := &specialiser{program: p, clonesOf: map[*Func]int{}, named: map[string]int{}}
 	for round := 0; round < maxSpecialisationRounds; round++ {
 		constants := s.specialiseConstants()
 		clones := s.cloneForFunctions()

@@ -25,6 +25,7 @@ var usage = fmt.Sprintf(`usage:
   low ir <file.low> [-target %[1]s]
   low lint <file.low> [-target %[1]s]
   low doc <dir|std> [-target %[1]s]
+  low names <file.low> [-target %[1]s]
   low dev <file.low>
   low lsp
   low version`, target.Choices())
@@ -82,13 +83,16 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		return compileCommand(ctx, cmd, path, opts)
-	case "lint", "doc":
+	case "lint", "doc", "names":
 		opts, err := parseOptions(args[2:], false)
 		if err != nil {
 			return err
 		}
-		if cmd == "lint" {
+		switch cmd {
+		case "lint":
 			return lintCommand(path, opts.platform)
+		case "names":
+			return namesCommand(path, opts.platform)
 		}
 		return docCommand(path, opts.platform)
 	case "run", "dev":
@@ -179,6 +183,14 @@ func docCommand(dir string, platform target.OS) error {
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(modules)
+}
+
+func namesCommand(path string, platform target.OS) error {
+	names, err := lsp.Names(path, platform)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(names)
 }
 
 func report(unit *compiler.Unit) {

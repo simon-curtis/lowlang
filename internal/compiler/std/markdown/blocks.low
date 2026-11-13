@@ -1,0 +1,992 @@
+import std/text
+
+enum Kind {
+    Root
+    Quoted
+    Listing
+    Entry
+    Title
+    Divider
+    Fence
+    Markup
+    Para
+    Grid
+}
+
+struct Node {
+    kind: Kind
+    parent: *Node?
+    children: []*Node = []
+    open: bool = true
+    blank_end: bool = false
+    blank_checked: bool = false
+    start_line: i64 = 0
+    content: []u8 = []
+    ordered: bool = false
+    bullet: u8 = 0
+    delimiter: u8 = 0
+    start: i64 = 1
+    tight: bool = true
+    marker_offset: i64 = 0
+    padding: i64 = 0
+    level: i64 = 0
+    fenced: bool = false
+    fence_char: u8 = 0
+    fence_len: i64 = 0
+    fence_offset: i64 = 0
+    info: str = ""
+    html_kind: i64 = 0
+    header: str = ""
+    aligns: []Align = []
+}
+
+struct Parser {
+    doc: *Node
+    tip: *Node
+    old_tip: *Node
+    last_matched: *Node
+    all_closed: bool
+    line: str
+    line_no: i64
+    offset: i64
+    column: i64
+    next_nonspace: i64
+    next_column: i64
+    indent: i64
+    indented: bool
+    blank: bool
+    partial_tab: bool
+    refs: [str: Reference]
+    final_newline: bool
+    raw_offset: i64
+}
+
+const html_block_names = "address,article,aside,base,basefont,blockquote,body,caption,center,col,colgroup,dd,details,dialog,dir,div,dl,dt,fieldset,figcaption,figure,footer,form,frame,frameset,h1,h2,h3,h4,h5,h6,head,header,hr,html,iframe,legend,li,link,main,menu,menuitem,meta,nav,noframes,ol,optgroup,option,p,param,search,section,summary,table,tbody,td,tfoot,th,thead,title,tr,track,ul"
+
+fn parse_blocks(source: str) -> *Parser {
+    let doc = new(Node { kind: Kind.Root, parent: none })
+    let p = new(Parser {
+        doc,
+        tip: doc,
+        old_tip: doc,
+        last_matched: doc,
+        all_closed: true,
+        line: "",
+        line_no: 0,
+        offset: 0,
+        column: 0,
+        next_nonspace: 0,
+        next_column: 0,
+        indent: 0,
+        indented: false,
+        blank: false,
+        partial_tab: false,
+        refs: [:],
+        final_newline: false,
+        raw_offset: 0,
+    })
+    let normalized = text.replace(text.replace(source, "\r\n", "\n"), "\r", "\n")
+    p.final_newline = text.ends_with(normalized, "\n")
+    var lines = text.split(normalized, '\n')
+    if lines.len > 0 && lines[lines.len - 1] == "" {
+        truncate(mut lines, lines.len - 1)
+    }
+    for line in lines {
+        incorporate_line(p, line)
+    }
+    for p.tip.open && p.tip != p.doc {
+        finalize(p, p.tip)
+    }
+    finalize(p, p.doc)
+    p
+}
+
+fn find_next_nonspace(p: *Parser) {
+    var i = p.offset
+    var cols = p.column
+    for i < p.line.len {
+        let c = p.line[i]
+        if c == ' ' {
+            i += 1
+            cols += 1
+        } else if c == '\t' {
+            i += 1
+            cols += 4 - cols % 4
+        } else {
+            break
+        }
+    }
+    p.blank = i >= p.line.len
+    p.next_nonspace = i
+    p.next_column = cols
+    p.indent = cols - p.column
+    p.indented = p.indent >= 4
+}
+
+fn advance_next_nonspace(p: *Parser) {
+    p.offset = p.next_nonspace
+    p.column = p.next_column
+    p.partial_tab = false
+}
+
+fn advance_offset(p: *Parser, count: i64, columns: bool) {
+    var n = count
+    for n > 0 && p.offset < p.line.len {
+        if p.line[p.offset] == '\t' {
+            let to_tab = 4 - p.column % 4
+            if columns {
+                p.partial_tab = to_tab > n
+                let step = if to_tab > n { n } else { to_tab }
+                p.column += step
+                if !p.partial_tab {
+                    p.offset += 1
+                }
+                n -= step
+            } else {
+                p.partial_tab = false
+                p.column += to_tab
+                p.offset += 1
+                n -= 1
+            }
+        } else {
+            p.partial_tab = false
+            p.offset += 1
+            p.column += 1
+            n -= 1
+        }
+    }
+}
+
+fn add_line(p: *Parser) {
+    if p.partial_tab {
+        p.offset += 1
+        text.append(mut p.tip.content, text.repeat(" ", 4 - p.column % 4))
+    }
+    let from = if p.tip.kind == Kind.Para && !p.partial_tab { p.raw_offset } else { p.offset }
+    text.append(mut p.tip.content, p.line[from..])
+    push(mut p.tip.content, '\n')
+}
+
+fn can_contain(parent: Kind, child: Kind) -> bool {
+    match parent {
+        Root => child != Kind.Entry
+        Quoted => child != Kind.Entry
+        Entry => child != Kind.Entry
+        Listing => child == Kind.Entry
+        _ => false
+    }
+}
+
+fn accepts_lines(kind: Kind) -> bool {
+    match kind {
+        Fence => true
+        Markup => true
+        Para => true
+        Grid => true
+        _ => false
+    }
+}
+
+fn add_child(p: *Parser, kind: Kind) -> *Node {
+    for !can_contain(p.tip.kind, kind) {
+        finalize(p, p.tip)
+    }
+    let node = new(Node { kind, parent: p.tip, start_line: p.line_no })
+    push(mut p.tip.children, node)
+    p.tip = node
+    node
+}
+
+fn close_unmatched(p: *Parser) {
+    if !p.all_closed {
+        for p.old_tip != p.last_matched {
+            let parent = p.old_tip.parent ?? p.doc
+            finalize(p, p.old_tip)
+            p.old_tip = parent
+        }
+        p.all_closed = true
+    }
+}
+
+fn last_line_blank_deep(node: *Node) -> bool {
+    var current = node
+    for {
+        if current.blank_end {
+            return true
+        }
+        let container = current.kind == Kind.Listing || current.kind == Kind.Entry
+        if !current.blank_checked && container && current.children.len > 0 {
+            current.blank_checked = true
+            current = current.children[current.children.len - 1]
+        } else {
+            current.blank_checked = true
+            return false
+        }
+    }
+    false
+}
+
+fn finalize(p: *Parser, node: *Node) {
+    let above = node.parent
+    node.open = false
+    match node.kind {
+        Para => finalize_paragraph(p, node)
+        Fence => finalize_code(node)
+        Markup => finalize_markup(node)
+        Listing => finalize_list(node)
+        _ => {}
+    }
+    p.tip = above ?? node
+}
+
+fn finalize_paragraph(p: *Parser, node: *Node) {
+    let content = without_definitions(p, str(node.content))
+    if is_blank_line(content) {
+        match node.parent {
+            some(parent) => pop(mut parent.children)
+            none => {}
+        }
+        return
+    }
+    node.content = bytes(content)
+}
+
+fn without_definitions(p: *Parser, source: str) -> str {
+    var content = source
+    for {
+        let lead = skip_blanks(content, 0)
+        if byte_at(content, lead) != '[' {
+            break
+        }
+        let consumed = parse_reference(content[lead..], mut p.refs)
+        if consumed == 0 {
+            break
+        }
+        content = content[lead + consumed..]
+    }
+    content
+}
+
+fn strip_trailing_blank_lines(content: str) -> str {
+    var end = content.len
+    for {
+        var i = end
+        for i > 0 && content[i - 1] == ' ' {
+            i -= 1
+        }
+        if i > 0 && content[i - 1] == '\n' {
+            end = i - 1
+        } else {
+            break
+        }
+    }
+    content[..end]
+}
+
+fn finalize_code(node: *Node) {
+    let content = str(node.content)
+    if node.fenced {
+        let newline = find_byte_from(content, 0, '\n')
+        let first = if newline < 0 { content } else { content[..newline] }
+        let rest = if newline < 0 { "" } else { content[newline + 1..] }
+        node.info = unescape_punct(trim_blanks(first))
+        node.content = bytes(rest)
+    } else {
+        node.content = bytes(strip_trailing_blank_lines(content) + "\n")
+    }
+}
+
+fn finalize_markup(node: *Node) {
+    node.content = bytes(strip_trailing_blank_lines(str(node.content)))
+}
+
+fn finalize_list(node: *Node) {
+    let items = node.children
+    for i, item in items {
+        let has_next = i + 1 < items.len
+        if last_line_blank_deep(item) && has_next {
+            node.tight = false
+            return
+        }
+        for j, sub in item.children {
+            if last_line_blank_deep(sub) && (has_next || j + 1 < item.children.len) {
+                node.tight = false
+                return
+            }
+        }
+    }
+}
+
+fn byte_in_special(c: u8) -> bool {
+    c == '#' || c == '`' || c == '~' || c == '*' || c == '+' || c == '_' || c == '=' || c == '<' || c == '>' || c == '-' || c == '|' || c == ':' || is_digit(c)
+}
+
+fn continue_block(p: *Parser, node: *Node) -> i64 {
+    match node.kind {
+        Root => 0
+        Listing => 0
+        Quoted => {
+            if !p.indented && byte_at(p.line, p.next_nonspace) == '>' {
+                advance_next_nonspace(p)
+                advance_offset(p, 1, false)
+                if is_blank(byte_at(p.line, p.offset)) {
+                    advance_offset(p, 1, true)
+                }
+                0
+            } else {
+                1
+            }
+        }
+        Entry => {
+            if p.blank {
+                if node.children.len == 0 {
+                    return 1
+                }
+                advance_next_nonspace(p)
+                0
+            } else if p.indent >= node.marker_offset + node.padding {
+                advance_offset(p, node.marker_offset + node.padding, true)
+                0
+            } else {
+                1
+            }
+        }
+        Title => 1
+        Divider => 1
+        Fence => continue_fence(p, node)
+        Markup => if p.blank && (node.html_kind == 6 || node.html_kind == 7) { 1 } else { 0 }
+        Para => if p.blank { 1 } else { 0 }
+        Grid => if p.blank || table_row_ends(p) { 1 } else { 0 }
+    }
+}
+
+fn continue_fence(p: *Parser, node: *Node) -> i64 {
+    if node.fenced {
+        if p.indent <= 3 && byte_at(p.line, p.next_nonspace) == node.fence_char {
+            let rest = p.line[p.next_nonspace..]
+            var n = 0
+            for n < rest.len && rest[n] == node.fence_char {
+                n += 1
+            }
+            if n >= node.fence_len && is_blank_line(rest[n..]) {
+                finalize(p, node)
+                return 2
+            }
+        }
+        var skip = node.fence_offset
+        for skip > 0 && is_blank(byte_at(p.line, p.offset)) {
+            advance_offset(p, 1, true)
+            skip -= 1
+        }
+        return 0
+    }
+    if p.indent >= 4 {
+        advance_offset(p, 4, true)
+        return 0
+    }
+    if p.blank {
+        advance_next_nonspace(p)
+        return 0
+    }
+    1
+}
+
+fn incorporate_line(p: *Parser, line: str) {
+    var all_matched = true
+    var container = p.doc
+    p.old_tip = p.tip
+    p.offset = 0
+    p.column = 0
+    p.blank = false
+    p.partial_tab = false
+    p.line_no += 1
+    p.line = line
+
+    for {
+        if container.children.len == 0 {
+            break
+        }
+        let last_child = container.children[container.children.len - 1]
+        if !last_child.open {
+            break
+        }
+        container = last_child
+        find_next_nonspace(p)
+        let verdict = continue_block(p, container)
+        if verdict == 1 {
+            all_matched = false
+        } else if verdict == 2 {
+            return
+        }
+        if !all_matched {
+            container = container.parent ?? p.doc
+            break
+        }
+    }
+
+    p.all_closed = container == p.old_tip
+    p.last_matched = container
+    var matched_leaf = container.kind != Kind.Para && accepts_lines(container.kind)
+
+    for !matched_leaf {
+        p.raw_offset = p.offset
+        find_next_nonspace(p)
+        if !p.indented && !byte_in_special(byte_at(p.line, p.next_nonspace)) {
+            advance_next_nonspace(p)
+            break
+        }
+        var result = 0
+        var k = 0
+        for k < 9 && result == 0 {
+            result = try_start(p, k, container)
+            k += 1
+        }
+        if result == 1 {
+            container = p.tip
+        } else if result == 2 {
+            container = p.tip
+            matched_leaf = true
+        } else {
+            advance_next_nonspace(p)
+            break
+        }
+    }
+
+    if !p.all_closed && !p.blank && p.tip.kind == Kind.Para {
+        add_line(p)
+        return
+    }
+    close_unmatched(p)
+    if p.blank && container.children.len > 0 {
+        container.children[container.children.len - 1].blank_end = true
+    }
+    let kind = container.kind
+    let empty_item_start = kind == Kind.Entry && container.children.len == 0 && container.start_line == p.line_no
+    let last_blank = p.blank && !(kind == Kind.Quoted || (kind == Kind.Fence && container.fenced) || empty_item_start)
+    var up: *Node? = container
+    for {
+        match up {
+            some(node) => {
+                node.blank_end = last_blank
+                up = node.parent
+            }
+            none => break
+        }
+    }
+    if accepts_lines(kind) {
+        add_line(p)
+        if kind == Kind.Markup && container.html_kind >= 1 && container.html_kind <= 5 && html_closes(p.line[p.offset..], container.html_kind) {
+            finalize(p, container)
+        }
+    } else if p.offset < p.line.len && !p.blank {
+        add_child(p, Kind.Para)
+        advance_next_nonspace(p)
+        add_line(p)
+    }
+}
+
+fn try_start(p: *Parser, k: i64, container: *Node) -> i64 {
+    match k {
+        0 => start_quote(p)
+        1 => start_atx(p)
+        2 => start_fence(p)
+        3 => start_html(p, container)
+        4 => start_table(p, container)
+        5 => start_setext(p, container)
+        6 => start_divider(p)
+        7 => start_entry(p, container)
+        _ => start_indented(p)
+    }
+}
+
+fn start_quote(p: *Parser) -> i64 {
+    if p.indented || byte_at(p.line, p.next_nonspace) != '>' {
+        return 0
+    }
+    advance_next_nonspace(p)
+    advance_offset(p, 1, false)
+    if is_blank(byte_at(p.line, p.offset)) {
+        advance_offset(p, 1, true)
+    }
+    close_unmatched(p)
+    add_child(p, Kind.Quoted)
+    1
+}
+
+fn start_atx(p: *Parser) -> i64 {
+    if p.indented {
+        return 0
+    }
+    let rest = p.line[p.next_nonspace..]
+    var hashes = 0
+    for hashes < rest.len && rest[hashes] == '#' {
+        hashes += 1
+    }
+    if hashes < 1 || hashes > 6 || (hashes < rest.len && !is_blank(rest[hashes])) {
+        return 0
+    }
+    let marker_end = skip_blanks(rest, hashes)
+    advance_next_nonspace(p)
+    advance_offset(p, marker_end, false)
+    close_unmatched(p)
+    let node = add_child(p, Kind.Title)
+    node.level = hashes
+    node.content = bytes(strip_closing_hashes(p.line[p.offset..]))
+    advance_offset(p, p.line.len - p.offset, false)
+    2
+}
+
+fn strip_closing_hashes(content: str) -> str {
+    var end = content.len
+    for end > 0 && is_blank(content[end - 1]) {
+        end -= 1
+    }
+    var hashes = end
+    for hashes > 0 && content[hashes - 1] == '#' {
+        hashes -= 1
+    }
+    if hashes == end {
+        return content[..end]
+    }
+    if hashes == 0 {
+        return ""
+    }
+    if is_blank(content[hashes - 1]) {
+        return trim_end_blanks(content[..hashes])
+    }
+    content[..end]
+}
+
+fn start_fence(p: *Parser) -> i64 {
+    if p.indented {
+        return 0
+    }
+    let rest = p.line[p.next_nonspace..]
+    let c = byte_at(rest, 0)
+    if c != '`' && c != '~' {
+        return 0
+    }
+    var n = 0
+    for n < rest.len && rest[n] == c {
+        n += 1
+    }
+    if n < 3 || (c == '`' && find_byte_from(rest, n, '`') >= 0) {
+        return 0
+    }
+    close_unmatched(p)
+    let node = add_child(p, Kind.Fence)
+    node.fenced = true
+    node.fence_char = c
+    node.fence_len = n
+    node.fence_offset = p.indent
+    advance_next_nonspace(p)
+    advance_offset(p, n, false)
+    2
+}
+
+fn html_block_name(s: str) -> bool {
+    var at = 1
+    if byte_at(s, at) == '/' {
+        at += 1
+    }
+    var end = at
+    for end < s.len && is_alnum(s[end]) {
+        end += 1
+    }
+    let next = byte_at(s, end)
+    let closed = next == 0 || is_line_space(next) || next == '>' || (next == '/' && byte_at(s, end + 1) == '>')
+    end > at && closed && text.has_token(html_block_names, s[at..end])
+}
+
+fn html_opens(s: str, kind: i64) -> bool {
+    match kind {
+        1 => {
+            for name in ["script", "pre", "style", "textarea"] {
+                if starts_with_fold_at(s, 1, name) {
+                    let next = byte_at(s, 1 + name.len)
+                    if next == 0 || is_line_space(next) || next == '>' {
+                        return true
+                    }
+                }
+            }
+            false
+        }
+        2 => starts_with_at(s, 0, "<!--")
+        3 => starts_with_at(s, 0, "<?")
+        4 => starts_with_at(s, 0, "<!") && is_alpha(byte_at(s, 2))
+        5 => starts_with_at(s, 0, "<![CDATA[")
+        6 => html_block_name(s)
+        _ => {
+            var end = open_tag_end(s, 0)
+            if end < 0 {
+                end = close_tag_end(s, 0)
+            }
+            end >= 0 && is_blank_line(s[end..])
+        }
+    }
+}
+
+fn html_closes(s: str, kind: i64) -> bool {
+    match kind {
+        1 => {
+            for name in ["</script>", "</pre>", "</style>", "</textarea>"] {
+                var at = 0
+                for at < s.len {
+                    if starts_with_fold_at(s, at, name) {
+                        return true
+                    }
+                    at += 1
+                }
+            }
+            false
+        }
+        2 => find_from(s, 0, "-->") >= 0
+        3 => find_from(s, 0, "?>") >= 0
+        4 => find_byte_from(s, 0, '>') >= 0
+        _ => find_from(s, 0, "]]>") >= 0
+    }
+}
+
+fn start_html(p: *Parser, container: *Node) -> i64 {
+    if p.indented || byte_at(p.line, p.next_nonspace) != '<' {
+        return 0
+    }
+    let rest = p.line[p.next_nonspace..]
+    for kind in 1..8 {
+        let interrupts = kind < 7 || (container.kind != Kind.Para && !(!p.all_closed && p.tip.kind == Kind.Para))
+        if interrupts && html_opens(rest, kind) {
+            close_unmatched(p)
+            let node = add_child(p, Kind.Markup)
+            node.html_kind = kind
+            return 2
+        }
+    }
+    0
+}
+
+fn is_divider(s: str) -> bool {
+    let c = byte_at(s, 0)
+    if c != '-' && c != '_' && c != '*' {
+        return false
+    }
+    var count = 0
+    for i in 0..s.len {
+        if s[i] == c {
+            count += 1
+        } else if !is_blank(s[i]) {
+            return false
+        }
+    }
+    count >= 3
+}
+
+fn start_divider(p: *Parser) -> i64 {
+    if p.indented || !is_divider(p.line[p.next_nonspace..]) {
+        return 0
+    }
+    close_unmatched(p)
+    add_child(p, Kind.Divider)
+    advance_offset(p, p.line.len - p.offset, false)
+    2
+}
+
+fn start_setext(p: *Parser, container: *Node) -> i64 {
+    if p.indented || container.kind != Kind.Para {
+        return 0
+    }
+    let rest = p.line[p.next_nonspace..]
+    let c = byte_at(rest, 0)
+    if c != '=' && c != '-' {
+        return 0
+    }
+    var n = 0
+    for n < rest.len && rest[n] == c {
+        n += 1
+    }
+    if !is_blank_line(rest[n..]) {
+        return 0
+    }
+    close_unmatched(p)
+    let content = without_definitions(p, str(container.content))
+    if content.len == 0 {
+        return 0
+    }
+    container.kind = Kind.Title
+    container.level = if c == '=' { 1 } else { 2 }
+    container.content = bytes(content)
+    p.tip = container
+    advance_offset(p, p.line.len - p.offset, false)
+    2
+}
+
+struct Marker {
+    ok: bool
+    ordered: bool
+    bullet: u8
+    delimiter: u8
+    start: i64
+    padding: i64
+    marker_offset: i64
+}
+
+fn no_marker() -> Marker {
+    Marker { ok: false, ordered: false, bullet: 0, delimiter: 0, start: 0, padding: 0, marker_offset: 0 }
+}
+
+fn parse_marker(p: *Parser, container: *Node) -> Marker {
+    if p.indent >= 4 {
+        return no_marker()
+    }
+    let rest = p.line[p.next_nonspace..]
+    let first = byte_at(rest, 0)
+    var width = 0
+    var ordered = false
+    var start = 1
+    var delimiter: u8 = 0
+    if first == '*' || first == '+' || first == '-' {
+        width = 1
+    } else if is_digit(first) {
+        var digits = 0
+        for digits < rest.len && is_digit(rest[digits]) {
+            digits += 1
+        }
+        let mark = byte_at(rest, digits)
+        if digits > 9 || (mark != '.' && mark != ')') {
+            return no_marker()
+        }
+        start = text.parse_int(rest[..digits]) or 1
+        if container.kind == Kind.Para && start != 1 {
+            return no_marker()
+        }
+        ordered = true
+        delimiter = mark
+        width = digits + 1
+    } else {
+        return no_marker()
+    }
+    let after = byte_at(rest, width)
+    if after != 0 && after != ' ' && after != '\t' {
+        return no_marker()
+    }
+    if container.kind == Kind.Para && is_blank_line(rest[width..]) {
+        return no_marker()
+    }
+    let marker_offset = p.indent
+    advance_next_nonspace(p)
+    advance_offset(p, width, true)
+    let spaces_column = p.column
+    let spaces_offset = p.offset
+    for {
+        advance_offset(p, 1, true)
+        if !(p.column - spaces_column < 5 && is_blank(byte_at(p.line, p.offset))) {
+            break
+        }
+    }
+    let blank_item = p.offset >= p.line.len
+    let spaces = p.column - spaces_column
+    var padding = width + spaces
+    if spaces >= 5 || spaces < 1 || blank_item {
+        padding = width + 1
+        p.column = spaces_column
+        p.offset = spaces_offset
+        if is_blank(byte_at(p.line, p.offset)) {
+            advance_offset(p, 1, true)
+        }
+    }
+    Marker { ok: true, ordered, bullet: if ordered { 0 } else { first }, delimiter, start, padding, marker_offset }
+}
+
+fn lists_match(list: *Node, marker: Marker) -> bool {
+    list.ordered == marker.ordered && list.delimiter == marker.delimiter && list.bullet == marker.bullet
+}
+
+fn start_entry(p: *Parser, container: *Node) -> i64 {
+    if p.indented && container.kind != Kind.Listing {
+        return 0
+    }
+    let marker = parse_marker(p, container)
+    if !marker.ok {
+        return 0
+    }
+    close_unmatched(p)
+    if p.tip.kind != Kind.Listing || !lists_match(p.tip, marker) {
+        let list = add_child(p, Kind.Listing)
+        list.ordered = marker.ordered
+        list.bullet = marker.bullet
+        list.delimiter = marker.delimiter
+        list.start = marker.start
+    }
+    let item = add_child(p, Kind.Entry)
+    item.marker_offset = marker.marker_offset
+    item.padding = marker.padding
+    1
+}
+
+fn start_indented(p: *Parser) -> i64 {
+    if p.indented && p.tip.kind != Kind.Para && !p.blank {
+        advance_offset(p, 4, true)
+        close_unmatched(p)
+        add_child(p, Kind.Fence)
+        return 2
+    }
+    0
+}
+
+fn table_row_ends(p: *Parser) -> bool {
+    if p.indented {
+        return true
+    }
+    let rest = p.line[p.next_nonspace..]
+    let c = byte_at(rest, 0)
+    if c == '>' || is_divider(rest) {
+        return true
+    }
+    if c == '#' {
+        var hashes = 0
+        for hashes < rest.len && rest[hashes] == '#' {
+            hashes += 1
+        }
+        if hashes <= 6 && (hashes == rest.len || is_line_space(rest[hashes])) {
+            return true
+        }
+    }
+    if c == '`' || c == '~' {
+        var n = 0
+        for n < rest.len && rest[n] == c {
+            n += 1
+        }
+        if n >= 3 && (c == '~' || find_byte_from(rest, n, '`') < 0) {
+            return true
+        }
+    }
+    if (c == '*' || c == '+' || c == '-') && is_blank(byte_at(rest, 1)) {
+        return true
+    }
+    if c == '1' && (byte_at(rest, 1) == '.' || byte_at(rest, 1) == ')') && is_blank(byte_at(rest, 2)) {
+        return true
+    }
+    c == '<' && (html_block_name(rest) || html_opens(rest, 1) || html_opens(rest, 2) || html_opens(rest, 3) || html_opens(rest, 4) || html_opens(rest, 5))
+}
+
+fn delimiter_aligns(row: str) -> []Align? {
+    let s = trim_space(row)
+    var i = 0
+    if byte_at(s, i) == '|' {
+        i = skip_spaces(s, i + 1)
+    }
+    var aligns: []Align = []
+    for i < s.len {
+        let left = s[i] == ':'
+        if left {
+            i += 1
+        }
+        let dashes = i
+        for i < s.len && s[i] == '-' {
+            i += 1
+        }
+        if i == dashes {
+            return none
+        }
+        let right = byte_at(s, i) == ':'
+        if right {
+            i += 1
+        }
+        i = skip_spaces(s, i)
+        let align = if left && right {
+            Align.Center
+        } else if left {
+            Align.Left
+        } else if right {
+            Align.Right
+        } else {
+            Align.Default
+        }
+        push(mut aligns, align)
+        if i >= s.len {
+            break
+        }
+        if s[i] != '|' {
+            return none
+        }
+        i = skip_spaces(s, i + 1)
+    }
+    if aligns.len == 0 {
+        return none
+    }
+    aligns
+}
+
+fn start_table(p: *Parser, container: *Node) -> i64 {
+    if p.indented || container.kind != Kind.Para {
+        return 0
+    }
+    let row = p.line[p.next_nonspace..]
+    if find_byte_from(row, 0, '|') < 0 && find_byte_from(row, 0, ':') < 0 {
+        return 0
+    }
+    let aligns = delimiter_aligns(row) ?? return 0
+    let content = str(container.content)
+    let body = content[..content.len - 1]
+    let header_start = text.last_index_byte(body, '\n') + 1
+    let header = body[header_start..]
+    if split_cells(header, 0).len != aligns.len {
+        return 0
+    }
+    close_unmatched(p)
+    let before = content[..header_start]
+    var parent = container.parent ?? p.doc
+    if before.len == 0 {
+        pop(mut parent.children)
+    } else {
+        container.content = bytes(before)
+        finalize(p, container)
+        if container.parent == none {
+            return 0
+        }
+    }
+    p.tip = parent
+    let node = add_child(p, Kind.Grid)
+    node.header = header
+    node.aligns = aligns
+    advance_offset(p, p.line.len - p.offset, false)
+    2
+}
+
+fn split_cells(row: str, count: i64) -> []str {
+    var spaced: []u8 = []
+    for i in 0..row.len {
+        if row[i] == '|' {
+            var slashes = 0
+            var back = i - 1
+            for back >= 0 && row[back] == '\\' {
+                slashes += 1
+                back -= 1
+            }
+            if slashes % 2 == 0 {
+                push(mut spaced, ' ')
+            }
+        }
+        push(mut spaced, row[i])
+    }
+    var cells = text.split_str(str(spaced), " |")
+    if cells.len > 0 && trim_space(cells[0]) == "" {
+        cells = cells[1..]
+    }
+    if cells.len > 0 && trim_space(cells[cells.len - 1]) == "" {
+        cells = cells[..cells.len - 1]
+    }
+    if count > 0 {
+        if cells.len > count {
+            cells = cells[..count]
+        } else {
+            for cells.len < count {
+                push(mut cells, "")
+            }
+        }
+    }
+    var out: []str = []
+    for cell in cells {
+        push(mut out, text.replace(trim_space(cell), "\\|", "|"))
+    }
+    out
+}

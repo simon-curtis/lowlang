@@ -1,0 +1,550 @@
+import std/builder
+import std/slices
+import std/text
+import std/unicode
+
+fn keywords() -> []str {
+    [
+        "fn", "let", "var", "if", "else", "for", "break", "continue", "return", "enum", "match", "fail", "catch", "or",
+        "struct", "const", "mut", "in", "import", "pub", "extern", "defer", "spawn", "select", "using", "drop",
+    ]
+}
+
+fn contextual_keywords() -> []str {
+    ["after", "when"]
+}
+
+fn type_names() -> []str {
+    [
+        "i64", "i32", "u64", "u32", "u16", "u8", "f64", "f32", "bool", "str", "ptr", "chan",
+        "u8x16", "u8x32", "u16x8", "u16x16", "i32x4", "i32x8", "u32x4", "u32x8", "i64x2", "i64x4", "u64x2", "u64x4", "f32x4", "f32x8", "f64x2", "f64x4",
+    ]
+}
+
+fn constants() -> []str {
+    ["true", "false", "none", "null"]
+}
+
+const operator_characters = "-+*/%=<>!&|^?:"
+
+enum Kind {
+    Comment
+    Quote
+    Digits
+    Word
+    Space
+    Operator
+    Punctuation
+}
+
+struct Token {
+    kind: Kind
+    text: str
+    offset: i64
+}
+
+struct Hover {
+    code: str
+    doc: str
+}
+
+struct Facts {
+    hovers: [i64: Hover] = [:]
+    references: [i64: i64] = [:]
+    links: [i64: str] = [:]
+    anchors: [i64: str] = [:]
+    modules: []str = []
+}
+
+fn is_keyword(word: str) -> bool {
+    slices.contains(keywords(), word)
+}
+
+fn is_contextual(word: str) -> bool {
+    slices.contains(contextual_keywords(), word)
+}
+
+fn is_builtin_type(word: str) -> bool {
+    slices.contains(type_names(), word)
+}
+
+fn is_constant(word: str) -> bool {
+    slices.contains(constants(), word)
+}
+
+fn is_type_name(name: str) -> bool {
+    is_upper_byte(name[0]) || is_builtin_type(name)
+}
+
+fn is_operator_byte(c: u8) -> bool {
+    text.index_byte(operator_characters, c) >= 0
+}
+
+fn byte_after(source: str, at: i64) -> u8 {
+    if at + 1 < source.len {
+        source[at + 1]
+    } else {
+        0
+    }
+}
+
+fn line_end(source: str, from: i64) -> i64 {
+    let newline = text.index_byte(source[from..], '\n')
+    if newline < 0 {
+        source.len
+    } else {
+        from + newline
+    }
+}
+
+fn is_line_terminator(source: str, at: i64) -> bool {
+    let c = source[at]
+    if c == '\n' || c == '\r' {
+        return true
+    }
+    let rune = unicode.decode_rune(source, at)
+    rune.code == 0x2028 || rune.code == 0x2029
+}
+
+fn escaped_width(source: str, at: i64) -> i64 {
+    if at >= source.len || is_line_terminator(source, at) {
+        return 0
+    }
+    rune_size(source, at)
+}
+
+fn string_end(source: str, at: i64) -> i64 {
+    var cursor = at + 1
+    for cursor < source.len {
+        let c = source[cursor]
+        if c == '"' {
+            return cursor + 1
+        }
+        if c == '\n' {
+            return -1
+        }
+        if c == '\\' {
+            let width = escaped_width(source, cursor + 1)
+            if width == 0 {
+                return -1
+            }
+            cursor += 1 + width
+        } else {
+            cursor += 1
+        }
+    }
+    -1
+}
+
+fn basic_width(source: str, at: i64) -> i64 {
+    let rune = unicode.decode_rune(source, at)
+    if rune.code >= 0x10000 {
+        return 0
+    }
+    rune.size
+}
+
+fn character_width(source: str, at: i64) -> i64 {
+    if at >= source.len {
+        return 0
+    }
+    let c = source[at]
+    if c == '\\' {
+        if at + 1 >= source.len || is_line_terminator(source, at + 1) {
+            return 0
+        }
+        let escaped = basic_width(source, at + 1)
+        if escaped == 0 {
+            return 0
+        }
+        return 1 + escaped
+    }
+    if c == '\'' || c == '\n' {
+        return 0
+    }
+    basic_width(source, at)
+}
+
+fn character_end(source: str, at: i64) -> i64 {
+    let width = character_width(source, at + 1)
+    if width == 0 {
+        return -1
+    }
+    let close = at + 1 + width
+    if close < source.len && source[close] == '\'' {
+        return close + 1
+    }
+    -1
+}
+
+fn quote_end(source: str, at: i64) -> i64 {
+    if source[at] == '"' {
+        return string_end(source, at)
+    }
+    character_end(source, at)
+}
+
+fn digits_end(source: str, from: i64) -> i64 {
+    var at = from
+    for at < source.len && (is_word_byte(source[at]) || source[at] == '.') {
+        at += 1
+    }
+    at
+}
+
+fn operator_end(source: str, at: i64) -> i64 {
+    let c = source[at]
+    let next = byte_after(source, at)
+    if (c == '-' && next == '>') || (c == '=' && next == '>') || (c == ':' && next == ':') || (c == '.' && next == '.') {
+        return at + 2
+    }
+    var end = at
+    for end < source.len && is_operator_byte(source[end]) {
+        end += 1
+    }
+    end
+}
+
+fn scan(source: str, at: i64) -> Token {
+    let c = source[at]
+    if c == '/' && byte_after(source, at) == '/' {
+        return token(Comment, source, at, line_end(source, at))
+    }
+    if c == '"' || c == '\'' {
+        let end = quote_end(source, at)
+        if end > at {
+            return token(Quote, source, at, end)
+        }
+    }
+    if is_digit_byte(c) {
+        return token(Digits, source, at, digits_end(source, at + 1))
+    }
+    if is_word_start_byte(c) {
+        return token(Word, source, at, word_end(source, at + 1))
+    }
+    let blank = space_end(source, at)
+    if blank > at {
+        return token(Space, source, at, blank)
+    }
+    let operator = operator_end(source, at)
+    if operator > at {
+        return token(Operator, source, at, operator)
+    }
+    token(Punctuation, source, at, at + rune_size(source, at))
+}
+
+fn token(kind: Kind, source: str, start: i64, end: i64) -> Token {
+    Token { kind, text: source[start..end], offset: start }
+}
+
+fn lex(source: str) -> []Token {
+    var tokens: []Token = []
+    var at = 0
+    for at < source.len {
+        let next = scan(source, at)
+        push(mut tokens, next)
+        at += next.text.len
+    }
+    tokens
+}
+
+fn text_at(tokens: []Token, index: i64) -> str {
+    if index < 0 || index >= tokens.len {
+        return ""
+    }
+    tokens[index].text
+}
+
+fn is_word(tokens: []Token, index: i64) -> bool {
+    index >= 0 && index < tokens.len && tokens[index].kind == Word
+}
+
+fn is_inline_space(token: Token) -> bool {
+    token.kind == Space && text.index_byte(token.text, '\n') < 0
+}
+
+fn is_newline_space(token: Token) -> bool {
+    token.kind == Space && text.index_byte(token.text, '\n') >= 0
+}
+
+fn after(tokens: []Token, index: i64) -> i64 {
+    var at = index + 1
+    for at < tokens.len && is_inline_space(tokens[at]) {
+        at += 1
+    }
+    if at < tokens.len {
+        at
+    } else {
+        -1
+    }
+}
+
+fn before(tokens: []Token, index: i64) -> i64 {
+    var at = index - 1
+    for at >= 0 && tokens[at].kind == Space {
+        at -= 1
+    }
+    at
+}
+
+fn same_line_before(tokens: []Token, index: i64) -> i64 {
+    var at = index - 1
+    for at >= 0 && is_inline_space(tokens[at]) {
+        at -= 1
+    }
+    if at >= 0 && tokens[at].kind == Space {
+        return -1
+    }
+    at
+}
+
+fn starts_line(tokens: []Token, index: i64) -> bool {
+    let at = index - 1
+    at < 0 || is_newline_space(tokens[at])
+}
+
+fn closes(tokens: []Token, index: i64) -> bool {
+    var depth = 0
+    for at in index..tokens.len {
+        let mark = tokens[at].text
+        if mark == "[" {
+            depth += 1
+        } else if mark == "]" {
+            depth -= 1
+            if depth == 0 {
+                return text_at(tokens, after(tokens, at)) == "("
+            }
+        }
+    }
+    false
+}
+
+fn imported_modules(tokens: []Token, facts: Facts) -> [str: bool] {
+    var names: [str: bool] = [:]
+    for name in facts.modules {
+        names[name] = true
+    }
+    for index in 0..tokens.len {
+        if tokens[index].text != "import" {
+            continue
+        }
+        var at = index + 1
+        for at < tokens.len && text.index_byte(tokens[at].text, '\n') < 0 {
+            if tokens[at].kind == Word {
+                names[tokens[at].text] = true
+            }
+            at += 1
+        }
+    }
+    names
+}
+
+fn ends_value(tokens: []Token, index: i64) -> bool {
+    if index < 0 {
+        return false
+    }
+    let current = tokens[index]
+    if is_keyword(current.text) {
+        return false
+    }
+    current.kind == Word || current.kind == Digits || current.kind == Quote || text.contains(")]}}?", current.text)
+}
+
+fn starts_value(tokens: []Token, index: i64) -> bool {
+    if index < 0 {
+        return false
+    }
+    let current = tokens[index]
+    current.kind == Word || current.kind == Digits || current.kind == Quote || text.contains("([!-*~", current.text)
+}
+
+fn is_contextual_keyword(tokens: []Token, index: i64) -> bool {
+    let next = after(tokens, index)
+    if tokens[index].text == "after" {
+        return starts_line(tokens, index) && text_at(tokens, next) == "("
+    }
+    ends_value(tokens, same_line_before(tokens, index)) && starts_value(tokens, next)
+}
+
+fn classify(tokens: []Token, index: i64, imported: [str: bool]) -> str {
+    let previous = text_at(tokens, before(tokens, index))
+    let next = after(tokens, index)
+    let following = text_at(tokens, next)
+    let word = tokens[index].text
+    let module = imported[word] ?? false
+    if is_keyword(word) || (is_contextual(word) && is_contextual_keyword(tokens, index)) {
+        return "k"
+    }
+    if is_constant(word) {
+        return "n"
+    }
+    if previous == "import" || (previous == "/" && module) {
+        return "m"
+    }
+    if module && following == "." {
+        return "m"
+    }
+    if is_upper_byte(word[0]) {
+        return "t"
+    }
+    if previous == "fn" || following == "(" || (following == "[" && !is_builtin_type(word) && closes(tokens, next)) {
+        return "f"
+    }
+    if is_builtin_type(word) {
+        return "t"
+    }
+    ""
+}
+
+fn attribute(name: str, value: str) -> str {
+    " {name}=\"{value}\""
+}
+
+fn hover_attribute(hover: Hover?) -> str {
+    match hover {
+        some(found) => {
+            let note = if found.doc.len > 0 { "<span class=\"doc\">{escape(found.doc)}</span>" } else { "" }
+            let tip = "{low_unchecked(found.code)}{note}"
+            attribute("data-hover", escape(tip))
+        }
+        none => ""
+    }
+}
+
+fn optional_attribute(name: str, value: str?) -> str {
+    match value {
+        some(found) => attribute(name, found)
+        none => ""
+    }
+}
+
+fn reference_attribute(group: i64?) -> str {
+    match group {
+        some(found) => attribute("data-ref", "{found}")
+        none => ""
+    }
+}
+
+fn wrap(content: str, style: str, hover: Hover?, group: i64?, link: str?, id: str?) -> str {
+    let name = if style.len > 0 { attribute("class", style) } else { "" }
+    let target = optional_attribute("id", id)
+    let detail = hover_attribute(hover)
+    let reference = reference_attribute(group)
+    match link {
+        some(href) => "<a href=\"{href}\"{target}{name}{detail}{reference}>{content}</a>"
+        none => {
+            if name.len > 0 || target.len > 0 || detail.len > 0 || reference.len > 0 {
+                "<span{target}{name}{detail}{reference}>{content}</span>"
+            } else {
+                content
+            }
+        }
+    }
+}
+
+fn styled(content: str, style: str) -> str {
+    wrap(content, style, none, none, none, none)
+}
+
+fn paint_word(tokens: []Token, index: i64, imported: [str: bool], facts: Facts) -> str {
+    let current = tokens[index]
+    let content = escape(current.text)
+    let style = classify(tokens, index, imported)
+    if style == "k" {
+        return styled(content, "k")
+    }
+    let hover = informative(facts.hovers[current.offset], current.text)
+    wrap(content, style, hover, facts.references[current.offset], facts.links[current.offset], facts.anchors[current.offset])
+}
+
+fn informative(hover: Hover?, word: str) -> Hover? {
+    match hover {
+        some(found) => if found.code != word { hover } else { none }
+        none => none
+    }
+}
+
+fn paint(tokens: []Token, index: i64, imported: [str: bool], facts: Facts) -> str {
+    let current = tokens[index]
+    let content = escape(current.text)
+    match current.kind {
+        Comment => styled(content, "c")
+        Quote => styled(content, "s")
+        Digits => styled(content, "n")
+        Operator => styled(content, "o")
+        Word => paint_word(tokens, index, imported, facts)
+        Space => content
+        Punctuation => content
+    }
+}
+
+fn words(source: str) -> []i64 {
+    var offsets: []i64 = []
+    for token in lex(source) {
+        if token.kind == Word && !is_keyword(token.text) {
+            push(mut offsets, token.offset)
+        }
+    }
+    offsets
+}
+
+fn linked(links: [i64: str], modules: []str) -> Facts {
+    Facts { links, modules }
+}
+
+fn low(source: str, facts: Facts) -> str {
+    let tokens = lex(source)
+    let imported = imported_modules(tokens, facts)
+    var out = builder.with_capacity(source.len * 2)
+    for index in 0..tokens.len {
+        out.write(paint(tokens, index, imported, facts))
+    }
+    out.to_str()
+}
+
+fn low_unchecked(source: str) -> str {
+    low(source, Facts {})
+}
+
+fn is_unbroken(part: str) -> bool {
+    if utf16_length(part) > 28 {
+        return false
+    }
+    var at = 0
+    for at < part.len {
+        let rune = unicode.decode_rune(part, at)
+        let plain = unicode.is_letter(rune.code) || unicode.is_number(rune.code) || rune.code == '_'
+        if !plain && space_width(part, at) == 0 {
+            return true
+        }
+        at += rune.size
+    }
+    false
+}
+
+fn codespan(content: str) -> str {
+    var out = builder.with_capacity(content.len + 16)
+    out.write("<code>")
+    var at = 0
+    for at < content.len {
+        let blank = space_end(content, at)
+        if blank > at {
+            out.write(escape(content[at..blank]))
+            at = blank
+            continue
+        }
+        var end = at
+        for end < content.len && space_width(content, end) == 0 {
+            end += rune_size(content, end)
+        }
+        let part = content[at..end]
+        if is_unbroken(part) {
+            out.write("<span class=\"whitespace-nowrap\">{escape(part)}</span>")
+        } else {
+            out.write(escape(part))
+        }
+        at = end
+    }
+    out.write("</code>")
+    out.to_str()
+}

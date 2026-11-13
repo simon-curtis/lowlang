@@ -47,6 +47,7 @@ go build -o low ./cmd/low
 ./low asm testdata/run/fib.low
 ./low lint app.low
 ./low doc std
+./low names app.low
 ./low dev app.low
 ./low run app/
 ./low version
@@ -87,38 +88,48 @@ Each `bench/<name>/` holds one program as `main.low`, `main.go` and, for most, `
 
 ## Releases
 
-Pushing a `v*` tag runs the `test` workflow, then the `release` workflow builds `low` for `linux/amd64` and `windows/amd64` and publishes them as a GitHub release, `low-linux-amd64` and `low-windows-amd64.exe`. Each binary is stamped with the tag, which `low version` prints; a build from source prints `dev+<commit>`. `site/install.sh` and `site/install.ps1`, served by the website, download the latest release.
+Pushing a `v*` tag runs the `test` workflow, then the `release` workflow builds `low` for `linux/amd64` and `windows/amd64` and publishes them as a GitHub release, `low-linux-amd64` and `low-windows-amd64.exe`. Each binary is stamped with the tag, which `low version` prints; a build from source prints `dev+<commit>`. `site/public/install.sh` and `site/public/install.ps1`, served by the website, download the latest release.
 
 ## Website
 
-`site/` is a static site styled with Tailwind. Its output is committed, so the directory serves as it is. The `test` workflow runs `go vet` and `go test` on every push and pull request to `main`. The `site` workflow rebuilds the site and deploys it to Cloudflare Pages on every push to `main`, whether or not `test` passes. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
+`site/` is a static site. `site/gen` is a Low program that writes the pages, and Vite+ bundles them with their styles and scripts into `site/dist`, which is what Cloudflare Pages serves. The `test` workflow runs `go vet` and `go test` on every push and pull request to `main`. The `site` workflow builds the site and deploys `site/dist` on every push to `main`, whether or not `test` passes. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
 
 ```sh
 cd site
 npm install
 npm run build
+npm run dev
 python3 ../assets/brand/build.py
 ```
 
-`npm run build`:
+| Path | Holds |
+|---|---|
+| `site/gen/` | The generator, a Low module run with `low run site/gen` from the repository root. |
+| `site/content/` | The hand-written bodies of the landing page and `404.html`. |
+| `site/src/` | The stylesheet (Tailwind, in `style.css`), the scripts, the fonts and the inlined marks. |
+| `site/public/` | Files copied to the site root unchanged: icons, the web manifest, `install.sh`, `install.ps1`, `_headers` and `_redirects`. |
+| `site/index.html`, `404.html`, `docs/`, `packages/`, `search.json` | The generator's output, ignored by git. |
+| `site/dist/` | The bundled site, ignored by git. |
 
-- builds the compiler and starts `low lsp`;
-- renders `site/content/index.html` and `404.html` into `site/index.html` and `site/404.html`, wrapping each in the head, masthead, footer and scripts from `site/layout.mjs`; the footer links the commit `git rev-parse HEAD` names, so a deployed page shows the commit it was built from; `site/pages.mjs` lists each page's title and description, and `{{origin}}` and `{{repository}}` in the content expand to the URLs in `site/config.mjs`;
-- renders `docs/design.md` and `editors/README.md` into `site/docs/`, linking each code span that names a heading, such as `### Strings`, to that heading; a heading on the same page wins, and the build fails when the span names no heading or several;
-- renders `site/docs/roadmap.html`, the last docs page, from the issues of the repository in `site/config.mjs` that carry the `roadmap` label (state open or closed, in ascending number order) and each issue's sub-issues, recursively, in sub-issue order. `site/roadmap.mjs` fetches them from the GitHub REST API at build time with `fetch`, sends `Authorization: Bearer $GITHUB_TOKEN` when `GITHUB_TOKEN` is set and makes anonymous requests otherwise, and fails the build on a network error or a response that is not 2xx. Anonymous requests share GitHub's low rate limit, so set `GITHUB_TOKEN` for repeated builds. Each issue becomes a list item that links its title to the issue, renders its body as markdown and marks a closed issue `Done`;
-- renders the standard library from `low doc std` into `site/packages/`, one page per module, with each module's description from the table in `docs/design.md` and its examples, each with its expected output, above its types;
-- highlights every Low snippet, including the examples in std doc comments and `examples` directories, with hover text and references from the LSP, and links each name to its definition: a declaration in the same snippet, an item in `site/packages/`, or the builtin's entry in the `## Builtins` chapter of `docs/design.md`;
-- writes `site/search.json` through `site/search.mjs` as it renders: one entry per page with its title, section, description and opening text, and one per item on it. A docs or overview item is an `h2` to `h4` heading with its anchor and the text up to the next heading; a package item is a type, method, constant, function or example from `low doc std`, with its kind, a name qualified by the module or receiver (`msgpack.encode`, `Stream.read_all`), its signature and its doc text. Every page carries a search palette, opened from the masthead's `Search` button, Ctrl K, ⌘ K or `/`. `site/search.js` fetches the index in the background when the pointer or focus reaches the button, or when the palette opens, and groups matches by page. Every query word must match. A word matched whole or at its start counts more than one matched inside a word, and a match in a name or title counts more than one in a description, a signature or the text, which counts more the more often it occurs. A name that equals or starts with the query ranks above the rest, and a page ranks by its own score or its best item, whichever is higher;
-- writes `style.css` from `tailwind.css`;
-- appends a content hash to every stylesheet and script reference, and to the search index reference, in the pages of every output folder in `site/config.mjs`, as `style.css?v=…`, so a browser never pairs a new page with a cached old asset.
+`npm run build` runs the `site` task in `site/vite.config.ts`: `go run ./cmd/low run site/gen`, then `vp build`. `npm run dev` generates once and serves the pages, reloading styles and scripts as they change. `vp build` bundles every generated page and gives each stylesheet, script, font and the search index a content-hashed name under `assets/`; `site/public/_headers` lets browsers cache `assets/` without revalidating.
 
-`build.py` regenerates the icons, social images and web manifest from the mark. It needs `rsvg-convert`, `magick` and Noto Sans.
+The generator:
+
+- runs `low doc std` once for the standard library and `low names` once per Low snippet, several at a time. `low names` type-checks the snippet and prints every name in it with its hover text, its doc comment, its definition and the first name that refers to the same definition, so the generator needs no language server;
+- renders `site/content/index.html` and `404.html` into `site/index.html` and `site/404.html`, wrapping each in the head, masthead, footer and scripts from `site/gen/layout.low`; the footer links the commit `git rev-parse HEAD` names, so a deployed page shows the commit it was built from; `site/gen/pages.low` lists each page's title and description, and `{{origin}}` and `{{repository}}` in the content expand to the URLs in `site/gen/config.low`; `{{examples}}` expands to the std examples that `site/gen/examples.low` names, each with its source, its expected output and a link to its package page, and the build fails when a named example does not exist;
+- renders `docs/design.md` and `editors/README.md` into `site/docs/` with `std/markdown`, linking each code span that names a heading, such as `### Strings`, to that heading; a heading on the same page wins, and the build fails when the span names no heading or several;
+- renders `site/docs/roadmap.html`, the last docs page, from the issues of the repository in `site/gen/config.low` that carry the `roadmap` label (state open or closed, in ascending number order) and each issue's sub-issues, recursively, in sub-issue order. It fetches them from the GitHub REST API with `std/http`, sends `Authorization: Bearer $GITHUB_TOKEN` when `GITHUB_TOKEN` is set and makes anonymous requests otherwise, and fails the build on a network error or a response that is not 2xx. Anonymous requests share GitHub's low rate limit, so set `GITHUB_TOKEN` for repeated builds. Each issue becomes a list item that links its title to the issue, renders its body as markdown and marks a closed issue `Done`;
+- renders the standard library into `site/packages/`, one page per module, with each module's description from the table in `docs/design.md` and its examples, each with its expected output, above its types;
+- highlights every Low snippet, including the examples in std doc comments and `examples` directories, with hover text and references from `low names`, and links each name to its definition: a declaration in the same snippet, an item in `site/packages/`, or the builtin's entry in the `## Builtins` chapter of `docs/design.md`;
+- writes `site/search.json` as it renders: one entry per page with its title, section, description and opening text, and one per item on it. A docs or overview item is an `h2` to `h4` heading with its anchor and the text up to the next heading; a package item is a type, method, constant, function or example from `low doc std`, with its kind, a name qualified by the module or receiver (`msgpack.encode`, `Stream.read_all`), its signature and its doc text.
+
+Every page carries a search palette, opened from the masthead's `Search` button, Ctrl K, ⌘ K or `/`. `site/src/search.js` fetches the index in the background when the pointer or focus reaches the button, or when the palette opens, and groups matches by page. Every query word must match. A word matched whole or at its start counts more than one matched inside a word, and a match in a name or title counts more than one in a description, a signature or the text, which counts more the more often it occurs. A name that equals or starts with the query ranks above the rest, and a page ranks by its own score or its best item, whichever is higher.
+
+`build.py` regenerates the icons, social images and web manifest in `site/public/` and the mark in `site/src/` from the brand mark. It needs `rsvg-convert`, `magick` and Noto Sans.
 
 ### Checked snippets
 
-The LSP checks each Low snippet as a program: every `low` fence in the docs and in a std doc comment, and every `data-lang="low"` block in `site/content/`. Declarations stay at the top level and loose statements go inside `fn main()`, and `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. A std example that does not import its own module checks with that import added. The build lists every snippet that fails to check and then fails; it also fails, naming the snippet, if the language server exits before answering. It fails when a prefix in `site/categories.mjs` names no module, and when a std module has no category.
-
-A block in `site/content/` that shows a compile error carries `data-error="text"`; the build requires the snippet to fail with an error containing that text, and removes the attribute from the page.
+`low names` checks each Low snippet as a program: every `low` fence in the docs and in a std doc comment, and every `data-lang="low"` block in `site/content/`. Declarations stay at the top level and loose statements go inside `fn main()`, and `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. A std example that does not import its own module checks with that import added. The build lists every snippet that fails to check and then fails. It fails when a prefix in `site/gen/categories.low` names no module, and when a std module has no category.
 
 HTML comments directly above a `low` fence in `docs/design.md` or `editors/README.md` supply context readers do not see. Blocks in `site/content/` do not read them.
 

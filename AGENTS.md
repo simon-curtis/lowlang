@@ -4,7 +4,7 @@ Compiler for the Low language, written in Go. [docs/design.md](docs/design.md) i
 
 ## Language or syntax change
 
-Read `## Syntax`. A change runs through `internal/lexer`, `internal/parser`, `internal/ast`, `internal/check`, then `internal/ir`. Each new construct gets a `testdata/run` program, and each rejected form a `testdata/fail` program. A builtin function, type or constant is one entry in `internal/check/builtins.go` (the only table of builtin names, parameters, `mut` markers, receivers and handlers) and one entry in `## Builtins`; `TestBuiltinsDocumented` in `internal/check` fails on a missing, stale or differently named one, or one whose parameters or `mut` markers differ. Keywords, contextual keywords and operators are the tables in `internal/lexer/token.go`. The editor grammars in `editors/` and `site/highlight.mjs` list the keywords, contextual keywords, types and constants; the grammars also list the builtin functions and the TextMate grammar the constraints. The lists move with those tables, and `go test ./editors/` fails when a list lacks or adds a name.
+Read `## Syntax`. A change runs through `internal/lexer`, `internal/parser`, `internal/ast`, `internal/check`, then `internal/ir`. Each new construct gets a `testdata/run` program, and each rejected form a `testdata/fail` program. A builtin function, type or constant is one entry in `internal/check/builtins.go` (the only table of builtin names, parameters, `mut` markers, receivers and handlers) and one entry in `## Builtins`; `TestBuiltinsDocumented` in `internal/check` fails on a missing, stale or differently named one, or one whose parameters or `mut` markers differ. Keywords, contextual keywords and operators are the tables in `internal/lexer/token.go`. The editor grammars in `editors/` and `site/gen/highlight.low` list the keywords, contextual keywords, types and constants; the grammars also list the builtin functions and the TextMate grammar the constraints. The lists move with those tables, and `go test ./editors/` fails when a list lacks or adds a name.
 
 ## Code generation or optimisation
 
@@ -20,8 +20,8 @@ Read `## Tests`: it lists the fixture directories, the sidecar files that declar
 
 ## Editor, LSP or lint
 
-Read `editors/README.md`. `internal/lsp` serves `low lsp`; `internal/lint` backs `low lint`. The website's hovers and reference highlighting come from the LSP, so an LSP change shows up in `site/` after a rebuild.
+Read `editors/README.md`. `internal/lsp` serves `low lsp`; `internal/lint` backs `low lint`. The website's hovers and reference highlighting come from `low names`, so a change to it shows up in `site/` after a rebuild.
 
 ## Docs or website
 
-Read `README.md` `## Website` before editing a Low snippet in `docs/design.md` or anything in `site/`. `site/index.html`, `404.html`, `search.json`, `docs/`, `packages/` and `style.css` are generated; page content is in `site/content/`, and the origin, repository URL and output folders are in `site/config.mjs`. Edit the sources and run `npm run build` in `site/`.
+Read `README.md` `## Website` before editing a Low snippet in `docs/design.md` or anything in `site/`. `site/index.html`, `404.html`, `search.json`, `docs/` and `packages/` are written by the Low program in `site/gen/` and ignored by git, and `site/dist/` is the bundle Vite+ makes of them. Page content is in `site/content/`, styles and scripts are in `site/src/`, and the origin and repository URL are in `site/gen/config.low`. Edit the sources and run `npm run build` in `site/`.

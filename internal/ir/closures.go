@@ -57,12 +57,22 @@ func (s *specialiser) cloneGroups(g *Func, param, env *Value, groups []functionG
 			break
 		}
 		clone, sites := cloneForFunction(g, param, env, group)
+		clone.Name = s.unique(clone.Name)
 		s.cloned += cost
 		s.clonesOf[g]++
 		clones = append(clones, clone)
 		repointed = append(repointed, sites...)
 	}
 	return clones, repointed
+}
+
+func (s *specialiser) unique(name string) string {
+	earlier := s.named[name]
+	s.named[name]++
+	if earlier == 0 {
+		return name
+	}
+	return fmt.Sprintf("%s.%d", name, earlier)
 }
 
 func cloneForFunction(g *Func, param, env *Value, group functionGroup) (*Func, []callSite) {
