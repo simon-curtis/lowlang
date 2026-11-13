@@ -594,7 +594,12 @@ fn find(xs: []i64, target: i64) -> i64? {
     none
 }
 
+fn first(xs: []i64) -> i64? {
+    xs[0] when xs.len > 0
+}
+
 let index = find(xs, 7) ?? -1
+let head = (xs[0] when xs.len > 0) ?? 0
 match find(xs, 4) {
     some(i) => print("at {i}")
     none => print("missing")
@@ -612,6 +617,12 @@ struct Node {
   - The fallback may itself be a `T?`, making the result a `T?`.
   - The fallback may leave instead, as in `let line = read_line() ?? break`.
   - `??` binds tighter than comparisons and looser than arithmetic, and groups to the right: `a ?? b ?? 0` tries `a`, then `b`.
+- `value when cond` gives `value` when the `bool` `cond` is true and `none` otherwise.
+  - `cond` is evaluated first, and `value` only when `cond` is true.
+  - The result is a `T?` for a `value` of type `T` or `T?`, so `find(xs, 7) when xs.len > 0` is an `i64?`. A `value` of no type, such as a call that returns nothing, is an error.
+  - `when` binds looser than every binary operator, `|>` included, and does not chain: `a + b when c && d` is `(a + b) when (c && d)`, and a second `when` needs parentheses.
+  - `return v when c` returns `v when c`, and an expression-bodied closure `fn(n) n * 2 when n > 1` has the whole `when` as its body.
+  - `when` is a contextual keyword: it is an ordinary identifier everywhere except directly after an expression on the same line.
 - `match` unwraps an optional with `some(v)` and `none` arms and must cover both.
 - `?` after a type binds to everything before it: `*Node?` is an optional pointer and `[]i64?` an optional slice.
 - An optional is an enum with `none` as tag 0 and `some` as tag 1, so it takes one word more than its value.

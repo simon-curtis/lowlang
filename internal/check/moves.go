@@ -225,7 +225,7 @@ func (m *mover) root(e ast.Expr) *ast.Local {
 
 func branching(e ast.Expr) bool {
 	switch e.(type) {
-	case *ast.If, *ast.Match, *ast.Block, *ast.Select, *ast.Catch, *ast.Or:
+	case *ast.If, *ast.Match, *ast.Block, *ast.Select, *ast.Catch, *ast.Or, *ast.When:
 		return true
 	}
 	return false
@@ -237,7 +237,7 @@ func producer(e ast.Expr) bool {
 		return producer(e.X)
 	case *ast.Call:
 		return e.Builtin == builtin.None
-	case *ast.StructLit, *ast.Try, *ast.Catch, *ast.Or, *ast.If, *ast.Match, *ast.Block, *ast.Select:
+	case *ast.StructLit, *ast.Try, *ast.Catch, *ast.Or, *ast.When, *ast.If, *ast.Match, *ast.Block, *ast.Select:
 		return true
 	}
 	return false
@@ -335,6 +335,9 @@ func (m *mover) expr(e ast.Expr, ctx moveContext) {
 	case *ast.Or:
 		m.expr(e.X, borrow)
 		m.branches(func() {}, func() { m.expr(e.Fallback, ctx) })
+	case *ast.When:
+		m.expr(e.Cond, borrow)
+		m.branches(func() { m.expr(e.X, ctx) }, func() {})
 	case *ast.Catch:
 		m.expr(e.X, borrow)
 		if e.Map != nil {

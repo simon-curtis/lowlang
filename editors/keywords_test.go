@@ -27,6 +27,7 @@ var expected = map[string][]string{}
 func init() {
 	expected["keywords"] = lexer.Keywords()
 	expected["contextual keywords"] = lexer.ContextualKeywords()
+	expected["grammar literals"] = append(lexer.Keywords(), lexer.When)
 	for _, b := range check.Builtins() {
 		switch {
 		case b.Kind == check.FunctionBuiltin && b.Public():
@@ -41,7 +42,7 @@ func init() {
 }
 
 var listings = []listing{
-	{"tree-sitter-low/grammar.js", "literals", "keywords", grammarKeywords},
+	{"tree-sitter-low/grammar.js", "literals", "grammar literals", grammarKeywords},
 	{"tree-sitter-low/queries/highlights.scm", "keywords", "keywords", queryKeywords},
 	{"tree-sitter-low/queries/highlights.scm", "contextual keywords", "contextual keywords", queryList(`#eq\? @keyword ("[^"]*")`)},
 	{"tree-sitter-low/queries/highlights.scm", "constants", "constants", queryConstants},
