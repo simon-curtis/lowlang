@@ -132,13 +132,15 @@ func TestRunWindows(t *testing.T) {
 	}
 }
 
-type launcher func(ctx context.Context, binary string) *exec.Cmd
+type launcher func(ctx context.Context, binary string, stdout, stderr io.Writer) error
 
 func windowsLauncher(t *testing.T) launcher {
 	t.Helper()
 	if target.Host() == target.Windows {
-		return func(ctx context.Context, binary string) *exec.Cmd {
-			return exec.CommandContext(ctx, binary)
+		return func(ctx context.Context, binary string, stdout, stderr io.Writer) error {
+			cmd := exec.CommandContext(ctx, binary)
+			cmd.Stdout, cmd.Stderr = stdout, stderr
+			return cmd.Run()
 		}
 	}
 	wine, err := exec.LookPath("wine")
@@ -151,11 +153,28 @@ func windowsLauncher(t *testing.T) launcher {
 	if out, err := prefix.CombinedOutput(); err != nil {
 		t.Fatalf("initialise the wine prefix: %v\n%s", err, out)
 	}
-	return func(ctx context.Context, binary string) *exec.Cmd {
+	return func(ctx context.Context, binary string, stdout, stderr io.Writer) error {
+		var raw bytes.Buffer
 		cmd := exec.CommandContext(ctx, wine, binary)
 		cmd.Env = env
-		return cmd
+		cmd.Stdout, cmd.Stderr = stdout, &raw
+		runErr := cmd.Run()
+		program := withoutWineDiagnostics(raw.Bytes())
+		if _, err := stderr.Write(program); err != nil {
+			return err
+		}
+		return runErr
 	}
+}
+
+func withoutWineDiagnostics(stderr []byte) []byte {
+	var kept []byte
+	for line := range bytes.Lines(stderr) {
+		if !bytes.HasPrefix(line, []byte("wine client error:")) {
+			kept = append(kept, line...)
+		}
+	}
+	return kept
 }
 
 func runWindowsFixture(t *testing.T, launch launcher, program fixturetest.Program, sidecars fixture.Sidecars) {
@@ -165,10 +184,8 @@ func runWindowsFixture(t *testing.T, launch launcher, program fixturetest.Progra
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	cmd := launch(ctx, binary)
 	compareRun(t, sidecars, func(stdout, stderr io.Writer) error {
-		cmd.Stdout, cmd.Stderr = stdout, stderr
-		return cmd.Run()
+		return launch(ctx, binary, stdout, stderr)
 	}, nil)
 }
 

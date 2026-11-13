@@ -2216,7 +2216,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
 ### Checks
 
 - `go test ./...` compiles every `testdata/run` program for Linux, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and applies `.maxrss`, `.maxtime`, `.needed` and `.tags`. These tests skip on a Windows host, as do the `internal/hot` tests.
-- `TestRunWindows` builds every `testdata/run` program that has a Windows build, and every `testdata/windows` program, for Windows and compares the same way. It runs them directly on a Windows host and under `wine` on Linux.
+- `TestRunWindows` builds every `testdata/run` program that has a Windows build, and every `testdata/windows` program, for Windows and compares the same way. It runs them directly on a Windows host and under `wine` on Linux, where lines `wine` itself writes to stderr, starting `wine client error:`, are dropped before the comparison.
 - Every `testdata/fail` and `testdata/lint` program is checked against its sidecar.
 - The time zone programs read zone rules from the embedded `std/time/tzdata`, because host databases differ by release and by build (Debian's includes `backzone`). They read the host database only for the behaviour of `zone.named` and `zone.local`, through zones whose rules every build agrees on.
 - The `std/cdp` programs print `launch failed` when no browser starts. CI turns off Ubuntu's AppArmor restriction on unprivileged user namespaces so Chromium can create its sandbox.
