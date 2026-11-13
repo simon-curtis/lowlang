@@ -75,4 +75,6 @@ const (
 	Chan
 	Convert
 	VectorCast
+	Len
+	Index
 )

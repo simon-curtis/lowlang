@@ -47,6 +47,7 @@ type linter struct {
 func (l *linter) file(file *ast.File) {
 	for _, fn := range file.Funcs {
 		if fn.Body != nil && !fn.Source().Derived {
+			l.constantFunc(fn)
 			ast.Inspect(fn.Body, l.visit)
 		}
 	}

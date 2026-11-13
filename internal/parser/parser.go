@@ -163,6 +163,11 @@ func (p *Parser) lines(item func()) {
 	p.sequence(lexer.RBrace, false, item)
 }
 
+func (p *Parser) members(item func()) {
+	p.expect(lexer.LBrace)
+	p.sequence(lexer.RBrace, true, item)
+}
+
 func (p *Parser) arrowType() *ast.TypeName {
 	if !p.accept(lexer.Arrow) {
 		return nil
@@ -340,7 +345,7 @@ func (p *Parser) enum() *ast.EnumDecl {
 	pos := p.expect(lexer.Enum).Pos
 	d := &ast.EnumDecl{Name: p.expect(lexer.Ident).Text, Pos: pos}
 	d.TypeParams = p.typeParams()
-	p.lines(func() { d.Variants = append(d.Variants, p.variant()) })
+	p.members(func() { d.Variants = append(d.Variants, p.variant()) })
 	return d
 }
 
@@ -348,26 +353,35 @@ func (p *Parser) variant() *ast.VariantDecl {
 	doc := p.doc()
 	name := p.expect(lexer.Ident)
 	v := &ast.VariantDecl{Name: name.Text, Doc: doc, Pos: name.Pos}
-	if !p.at(lexer.LParen) {
-		return v
+	if p.at(lexer.LParen) {
+		p.list(func() {
+			label := ""
+			if p.peek() == lexer.Colon {
+				label = p.expect(lexer.Ident).Text
+				p.expect(lexer.Colon)
+			}
+			v.Labels = append(v.Labels, label)
+			v.Fields = append(v.Fields, p.typeName())
+		})
 	}
-	p.list(func() {
-		label := ""
-		if p.peek() == lexer.Colon {
-			label = p.expect(lexer.Ident).Text
-			p.expect(lexer.Colon)
-		}
-		v.Labels = append(v.Labels, label)
-		v.Fields = append(v.Fields, p.typeName())
-	})
+	if p.accept(lexer.Assign) {
+		v.Index = p.variantIndex()
+	}
 	return v
+}
+
+func (p *Parser) variantIndex() *ast.IntLit {
+	pos := p.tok().Pos
+	negative := p.accept(lexer.Minus)
+	digits := p.expect(lexer.Int)
+	return p.number(digits, negative, pos).(*ast.IntLit)
 }
 
 func (p *Parser) structDecl() *ast.StructDecl {
 	pos := p.expect(lexer.Struct).Pos
 	d := &ast.StructDecl{Name: p.expect(lexer.Ident).Text, Pos: pos}
 	d.TypeParams = p.typeParams()
-	p.lines(func() {
+	p.members(func() {
 		if t := p.tok(); t.Kind == lexer.Drop {
 			p.next()
 			if d.Drop != nil {

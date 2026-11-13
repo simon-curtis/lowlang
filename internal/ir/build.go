@@ -862,10 +862,13 @@ func (b *builder) selector(e *ast.Selector) []*Value {
 	if e.Variant != nil {
 		return b.construct(e.Type, e.Variant, nil)
 	}
-	if e.Length && e.X.TypeOf().Kind == types.MapKind {
+	if e.Property == builtin.Index {
+		return b.variantIndex(e)
+	}
+	if e.Property == builtin.Len && e.X.TypeOf().Kind == types.MapKind {
 		return b.mapCall(prelude.MapLen, e.X.TypeOf(), b.word(e.X))
 	}
-	if e.Length {
+	if e.Property == builtin.Len {
 		return b.value(e.X, e.X.TypeOf())[1:2]
 	}
 	if p, ok := locate(e); ok {

@@ -147,7 +147,7 @@ func invariantValue(e ast.Expr, stored, counter *ast.Local) bool {
 	case *ast.Call:
 		return e.Builtin == builtin.Convert && invariantValue(e.Args[0], stored, counter)
 	case *ast.Selector:
-		plain := e.Field != nil && e.Variant == nil && e.Reference == nil && e.Func == nil && !e.Length
+		plain := e.Field != nil && e.Variant == nil && e.Reference == nil && e.Func == nil && e.Property == builtin.None
 		return plain && e.X.TypeOf().Kind == types.StructKind && invariantValue(e.X, stored, counter)
 	}
 	return false

@@ -91,7 +91,7 @@ Pushing a `v*` tag runs the `test` workflow, then the `release` workflow builds 
 
 ## Website
 
-`site/` is a static site styled with Tailwind. Its output is committed, so the directory serves as it is. The `test` workflow runs `go vet` and `go test` on every push and pull request to `main`. When it passes on a push to `main`, the `site` workflow rebuilds the site and deploys it to Cloudflare Pages. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
+`site/` is a static site styled with Tailwind. Its output is committed, so the directory serves as it is. The `test` workflow runs `go vet` and `go test` on every push and pull request to `main`. The `site` workflow rebuilds the site and deploys it to Cloudflare Pages on every push to `main`, whether or not `test` passes. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
 
 ```sh
 cd site
@@ -103,7 +103,7 @@ python3 ../assets/brand/build.py
 `npm run build`:
 
 - builds the compiler and starts `low lsp`;
-- renders `site/content/index.html` and `404.html` into `site/index.html` and `site/404.html`, wrapping each in the head, masthead and scripts from `site/layout.mjs`; `site/pages.mjs` lists each page's title and description, and `{{origin}}` and `{{repository}}` in the content expand to the URLs in `site/config.mjs`;
+- renders `site/content/index.html` and `404.html` into `site/index.html` and `site/404.html`, wrapping each in the head, masthead, footer and scripts from `site/layout.mjs`; the footer links the commit `git rev-parse HEAD` names, so a deployed page shows the commit it was built from; `site/pages.mjs` lists each page's title and description, and `{{origin}}` and `{{repository}}` in the content expand to the URLs in `site/config.mjs`;
 - renders `docs/design.md` and `editors/README.md` into `site/docs/`, linking each code span that names a heading, such as `### Strings`, to that heading; a heading on the same page wins, and the build fails when the span names no heading or several;
 - renders `site/docs/roadmap.html`, the last docs page, from the issues of the repository in `site/config.mjs` that carry the `roadmap` label (state open or closed, in ascending number order) and each issue's sub-issues, recursively, in sub-issue order. `site/roadmap.mjs` fetches them from the GitHub REST API at build time with `fetch`, sends `Authorization: Bearer $GITHUB_TOKEN` when `GITHUB_TOKEN` is set and makes anonymous requests otherwise, and fails the build on a network error or a response that is not 2xx. Anonymous requests share GitHub's low rate limit, so set `GITHUB_TOKEN` for repeated builds. Each issue becomes a list item that links its title to the issue, renders its body as markdown and marks a closed issue `Done`;
 - renders the standard library from `low doc std` into `site/packages/`, one page per module, with each module's description from the table in `docs/design.md` and its examples, each with its expected output, above its types;

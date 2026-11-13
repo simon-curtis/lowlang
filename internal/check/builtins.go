@@ -60,6 +60,10 @@ func (b *Builtin) Receives(kind types.Kind) bool {
 	return slices.Contains(b.Receivers, kind)
 }
 
+func (b *Builtin) Reads(t *types.Type) bool {
+	return b.Kind == PropertyBuiltin && b.Receives(t.Kind) && (b.ID != builtin.Index || t.Indexed)
+}
+
 var (
 	builtins     []*Builtin
 	builtinIndex map[string]*Builtin
@@ -137,7 +141,8 @@ func newBuiltins() []*Builtin {
 	list = append(list, typeBuiltins()...)
 	list = append(list, derivedBuiltins()...)
 	return append(list,
-		&Builtin{Name: "len", Kind: PropertyBuiltin, Shadowable: true, Receivers: []types.Kind{types.SliceKind, types.MapKind, types.StrKind}, Type: types.I64},
+		&Builtin{ID: builtin.Len, Name: "len", Kind: PropertyBuiltin, Shadowable: true, Receivers: []types.Kind{types.SliceKind, types.MapKind, types.StrKind}, Type: types.I64},
+		&Builtin{ID: builtin.Index, Name: "index", Kind: PropertyBuiltin, Shadowable: true, Receivers: []types.Kind{types.EnumKind}, Type: types.I64},
 		&Builtin{Name: "true", Kind: ConstantBuiltin, Shadowable: true, Type: types.Bool},
 		&Builtin{Name: "false", Kind: ConstantBuiltin, Shadowable: true, Type: types.Bool},
 		&Builtin{Name: "none", Kind: ConstantBuiltin, Shadowable: true, constant: (*Checker).noneConstant},
