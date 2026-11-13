@@ -1,0 +1,260 @@
+import asm
+import oracletool
+import target
+import std/math
+import std/slices
+import std/text
+
+struct Comparison {
+    object: asm.Object
+    oracle: OracleObject
+    platform: target.OS
+    by_name: [str: asm.Section]
+    symbols: [str: asm.Symbol]
+    mismatches: []str = []
+    checked: i64 = 0
+}
+
+struct MineReloc {
+    reloc: NormReloc
+    line: i64
+}
+
+fn new_comparison(object: asm.Object, oracle: OracleObject, platform: target.OS) -> *Comparison {
+    var by_name: [str: asm.Section] = [:]
+    for s in object.sections {
+        by_name[s.name] = s
+    }
+    var symbols: [str: asm.Symbol] = [:]
+    for sym in object.symbols {
+        symbols[sym.name] = sym
+    }
+    new(Comparison { object, oracle, platform, by_name, symbols })
+}
+
+fn report(c: *Comparison, message: str) {
+    push(mut c.mismatches, message)
+}
+
+fn run_comparison(c: *Comparison) {
+    var names: []str = []
+    for name, _ in c.by_name {
+        push(mut names, name)
+    }
+    for name, _ in c.oracle.sections {
+        if !slices.contains(names, name) {
+            push(mut names, name)
+        }
+    }
+    slices.sort(mut names)
+    for name in names {
+        let mine = c.by_name[name]
+        let theirs = c.oracle.sections[name]
+        compare_section(c, name, mine, theirs)
+    }
+    compare_symbols(c)
+}
+
+fn mine_empty(s: asm.Section) -> bool {
+    s.data.len == 0 && s.size == 0 && s.fixups.len == 0
+}
+
+fn oracle_empty(s: OracleSection) -> bool {
+    s.data.len == 0 && s.size == 0
+}
+
+fn mine_flags(c: *Comparison, s: asm.Section) -> i64 {
+    if c.platform == target.OS.Windows && asm.flags_has(s.flags, asm.flag_read_only) {
+        return asm.flag_alloc
+    }
+    s.flags & ~asm.flag_read_only
+}
+
+fn compare_section(c: *Comparison, name: str, mine: asm.Section?, theirs: OracleSection?) {
+    match mine {
+        some(m) => match theirs {
+            some(th) => {
+                if mine_empty(m) && oracle_empty(th) {
+                    return
+                }
+                compare_present(c, name, m, th)
+            }
+            none => {
+                if !mine_empty(m) {
+                    report(c, "{name}: present only in asm")
+                }
+            }
+        }
+        none => match theirs {
+            some(th) => {
+                if !oracle_empty(th) {
+                    report(c, "{name}: present only in as")
+                }
+            }
+            none => {}
+        }
+    }
+}
+
+fn compare_present(c: *Comparison, name: str, mine: asm.Section, theirs: OracleSection) {
+    c.checked += 1
+    let got_flags = mine_flags(c, mine)
+    if got_flags != theirs.flags {
+        let got_text = asm.flags_text(got_flags)
+        let want_text = asm.flags_text(theirs.flags)
+        report(c, "{name}: flags {got_text}, as has {want_text}")
+    }
+    if mine.nobits != theirs.nobits {
+        report(c, "{name}: nobits {mine.nobits}, as has {theirs.nobits}")
+    }
+    if mine.align != theirs.align {
+        report(c, "{name}: align {mine.align}, as has {theirs.align}")
+    }
+    if mine.size != theirs.size {
+        report(c, "{name}: size {mine.size}, as has {theirs.size}")
+    }
+    if !theirs.nobits {
+        compare_bytes(c, name, mine, theirs)
+    }
+    compare_relocs(c, name, mine, theirs)
+}
+
+fn compare_bytes(c: *Comparison, name: str, mine: asm.Section, theirs: OracleSection) {
+    let got = mine.data
+    let want = theirs.data
+    if got.len != want.len {
+        report(c, "{name}: {got.len} bytes, as has {want.len}")
+        return
+    }
+    let i = oracletool.first_difference(got, want)
+    if i == got.len {
+        return
+    }
+    let end = math.min(i + 8, got.len)
+    let context = symbol_context(c, mine, i)
+    let offset = oracletool.hex_text(i)
+    let got_bytes = oracletool.spaced_hex(got[i..end])
+    let want_bytes = oracletool.spaced_hex(want[i..end])
+    report(c, "{name} +{offset} ({context}): {got_bytes}, as has {want_bytes}")
+}
+
+fn symbol_context(c: *Comparison, section: asm.Section, offset: i64) -> str {
+    var index = -1
+    for i, s in c.object.sections {
+        if s.name == section.name {
+            index = i
+        }
+    }
+    var best = ""
+    var best_value = -1
+    for sym in c.object.symbols {
+        if sym.section == index && sym.value <= offset && sym.value > best_value {
+            best = sym.name
+            best_value = sym.value
+        }
+    }
+    if best == "" {
+        return "start"
+    }
+    "{best}+{offset - best_value}"
+}
+
+fn mine_relocs(c: *Comparison, section: asm.Section) -> []MineReloc {
+    var relocs: []MineReloc = []
+    for f in section.fixups {
+        let entry = MineReloc { reloc: normalise_fixup(c, f), line: f.line }
+        push(mut relocs, entry)
+    }
+    slices.sort_stable_by(mut relocs, fn(a: MineReloc, b: MineReloc) -> bool { a.reloc.offset < b.reloc.offset })
+    relocs
+}
+
+fn normalise_fixup(c: *Comparison, f: asm.Fixup) -> NormReloc {
+    let kind = asm.fixup_kind_text(f.kind)
+    let sym = c.symbols[f.symbol] ?? return NormReloc { offset: f.offset, kind, target: "sym:{f.symbol}", addend: f.addend }
+    if sym.section < 0 || sym.global {
+        return NormReloc { offset: f.offset, kind, target: "sym:{f.symbol}", addend: f.addend }
+    }
+    let section = c.object.sections[sym.section]
+    NormReloc { offset: f.offset, kind, target: "sec:{section.name}", addend: f.addend + sym.value }
+}
+
+fn compare_relocs(c: *Comparison, name: str, mine: asm.Section, theirs: OracleSection) {
+    let got = mine_relocs(c, mine)
+    var want = theirs.relocs
+    if c.platform == target.OS.Windows {
+        want = windows_relocs(want)
+    }
+    var i = 0
+    for i < got.len && i < want.len {
+        if !same_reloc(got[i].reloc, want[i]) {
+            let got_text = reloc_text(got[i].reloc)
+            let want_text = reloc_text(want[i])
+            report(c, "{name} reloc {i} (line {got[i].line}): {got_text}, as has {want_text}")
+            return
+        }
+        i += 1
+    }
+    if got.len != want.len {
+        report(c, "{name}: {got.len} relocations, as has {want.len}")
+    }
+}
+
+fn windows_relocs(relocs: []NormReloc) -> []NormReloc {
+    var out: []NormReloc = []
+    for r in relocs {
+        var converted = r
+        if r.kind == "Abs32" {
+            converted.kind = "ImgRel32"
+        }
+        push(mut out, converted)
+    }
+    out
+}
+
+fn mine_section_name(c: *Comparison, sym: asm.Symbol) -> str {
+    if sym.section == asm.section_undefined {
+        return section_undefined_name
+    }
+    if sym.section == asm.section_absolute {
+        return section_absolute_name
+    }
+    c.object.sections[sym.section].name
+}
+
+fn compare_symbols(c: *Comparison) {
+    var mine: [str: asm.Symbol] = [:]
+    for name, sym in c.symbols {
+        if !text.starts_with(name, ".L") {
+            mine[name] = sym
+        }
+    }
+    for name, want in c.oracle.symbols {
+        match mine[name] {
+            some(got) => compare_symbol(c, got, want)
+            none => report(c, "symbol {name}: missing from asm")
+        }
+    }
+    for name, _ in mine {
+        match c.oracle.symbols[name] {
+            some(_) => {}
+            none => report(c, "symbol {name}: not in as")
+        }
+    }
+}
+
+fn compare_symbol(c: *Comparison, got: asm.Symbol, want: OracleSymbol) {
+    let section = mine_section_name(c, got)
+    if section != want.section {
+        report(c, "symbol {got.name}: section {section}, as has {want.section}")
+        return
+    }
+    if got.global != want.global {
+        report(c, "symbol {got.name}: global {got.global}, as has {want.global}")
+    }
+    if section != section_undefined_name && got.value != want.value {
+        let got_value = oracletool.hex_text(got.value)
+        let want_value = oracletool.hex_text(want.value)
+        report(c, "symbol {got.name}: value {got_value}, as has {want_value}")
+    }
+}

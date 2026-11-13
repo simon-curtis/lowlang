@@ -1,0 +1,179 @@
+import asm
+import oracletool
+import target
+import std/builder
+import std/file
+import std/testing
+import std/text
+import std/time
+
+const max_mismatch_lines = 3
+const skip_reason_limit = 100
+const timing_runs = 5
+const nanos_per_millisecond = 1000000.0
+const bytes_per_megabyte = 1000000.0
+
+struct Tracker {
+    largest: CorpusEntry
+    largest_size: i64
+    entries: i64
+    skipped: i64
+    sections: i64
+    total_bytes: i64
+}
+
+fn new_tracker() -> *Tracker {
+    let none_yet = CorpusEntry { name: "", path: "", platform: target.OS.Linux }
+    new(Tracker { largest: none_yet, largest_size: 0, entries: 0, skipped: 0, sections: 0, total_bytes: 0 })
+}
+
+fn oracle_variants(platform: target.OS) -> []oracletool.GNUOptions {
+    if platform == target.OS.Linux {
+        return [oracletool.GNUOptions { align_branches: true }, oracletool.GNUOptions {}]
+    }
+    [oracletool.GNUOptions {}]
+}
+
+fn skip_reason(message: str) -> str {
+    let line = text.cut(message, "\n").before
+    if line.len > skip_reason_limit {
+        return line[..skip_reason_limit]
+    }
+    line
+}
+
+fn format_mismatches(label: str, variant: oracletool.GNUOptions, mismatches: []str) -> str {
+    var out = builder.builder()
+    out.write("{label}: {mismatches.len} mismatches")
+    for i, m in mismatches {
+        if i == max_mismatch_lines {
+            break
+        }
+        out.write("\n    as align_branches={variant.align_branches}: {m}")
+    }
+    out.to_str()
+}
+
+fn compare_variant(t: *testing.T, tracker: *Tracker, e: CorpusEntry, dir: str, source: str, variant: oracletool.GNUOptions) -> bool {
+    let label = entry_label(e)
+    let options = asm.Options { align_branches: variant.align_branches }
+    let object = asm.assemble(source, options) catch {
+        err => {
+            t.error("{label}: parse: {asm.message(err)}")
+            return false
+        }
+    }
+    let fed = as_source(source, e.platform)
+    let oracle = run_as(dir, fed, variant) catch {
+        err => {
+            t.error("{label}: oracle: {oracletool.message(err)}")
+            return false
+        }
+    }
+    let c = new_comparison(object, oracle, e.platform)
+    run_comparison(c)
+    tracker.sections += c.checked
+    if c.mismatches.len > 0 {
+        t.error(format_mismatches(label, variant, c.mismatches))
+    }
+    true
+}
+
+fn run_oracle_entry(t: *testing.T, tracker: *Tracker, e: CorpusEntry) {
+    oracletool.require(t, "as", oracletool.gnu)
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    tracker.entries += 1
+    let source = generate_entry(dir, e) catch {
+        err => {
+            tracker.skipped += 1
+            t.skip(skip_reason(oracletool.message(err)))
+            return
+        }
+    }
+    tracker.total_bytes += source.len
+    if source.len > tracker.largest_size {
+        tracker.largest = e
+        tracker.largest_size = source.len
+    }
+    for variant in oracle_variants(e.platform) {
+        if !compare_variant(t, tracker, e, dir, source, variant) {
+            return
+        }
+    }
+}
+
+fn oracle_entry_tests(tracker: *Tracker, entries: []CorpusEntry) -> []testing.Test {
+    var tests: []testing.Test = []
+    for e in entries {
+        let label = entry_label(e)
+        push(mut tests, testing.Test { name: "oracle/{label}", run: fn(t) { run_oracle_entry(t, tracker, e) } })
+    }
+    tests
+}
+
+fn log_oracle_summary(t: *testing.T, tracker: *Tracker) {
+    let compiled = tracker.entries - tracker.skipped
+    let megabytes = text.fixed(f64(tracker.total_bytes) / bytes_per_megabyte, 0)
+    t.log("corpus: {tracker.entries} entries, {compiled} compiled, {tracker.skipped} skipped (compile failures); {megabytes} MB of assembly")
+    t.log("sections compared {tracker.sections}")
+}
+
+fn milliseconds(nanos: i64) -> str {
+    text.fixed(f64(nanos) / nanos_per_millisecond, 1)
+}
+
+fn time_assemble(t: *testing.T, source: str, options: asm.Options) -> str {
+    var best: i64 = 0
+    var total: i64 = 0
+    for _ in 0..timing_runs {
+        let started = time.monotonic()
+        asm.assemble(source, options) catch {
+            err => {
+                t.error("largest file: {asm.message(err)}")
+                return ""
+            }
+        }
+        let elapsed = time.monotonic() - started
+        total += elapsed
+        if best == 0 || elapsed < best {
+            best = elapsed
+        }
+    }
+    let mean = total / timing_runs
+    "Assemble best {milliseconds(best)}ms, mean {milliseconds(mean)}ms"
+}
+
+fn test_oracle_timing(t: *testing.T, tracker: *Tracker) {
+    log_oracle_summary(t, tracker)
+    if tracker.largest_size == 0 {
+        t.skip("no corpus entry was assembled")
+        return
+    }
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let source = generate_entry(dir, tracker.largest) catch {
+        err => {
+            t.fatal("largest file: {oracletool.message(err)}")
+            return
+        }
+    }
+    let megabytes = text.fixed(f64(source.len) / bytes_per_megabyte, 1)
+    for align in [false, true] {
+        let report = time_assemble(t, source, asm.Options { align_branches: align })
+        t.log("largest file: {megabytes} MB, align_branches {align}, {report}")
+    }
+}
+
+fn oracle_tests() -> []testing.Test {
+    let tracker = new_tracker()
+    let entries = corpus_entries() catch {
+        err => {
+            let message = oracletool.message(err)
+            return [testing.Test { name: "oracle", run: fn(t) { t.fatal(message) } }]
+        }
+    }
+    var tests = oracle_entry_tests(tracker, entries)
+    push(mut tests, testing.Test { name: "oracle_timing", run: fn(t) { test_oracle_timing(t, tracker) } })
+    tests
+}

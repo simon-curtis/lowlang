@@ -1,0 +1,474 @@
+import asm
+import link
+import oracletool
+import std/io
+import std/slices
+import std/testing
+import std/text
+
+const pe_text_index = 0
+const pe_rodata_index = 1
+const pe_data_index = 2
+const pe_bss_index = 3
+
+const pe_image_base = 0x140000000
+const page_mask = 0xFFF
+const file_alignment = 0x200
+const int3 = 0xCC
+const reloc_type_dir64 = 10
+
+struct PeOptions {
+    text_fixups: []asm.Fixup = []
+    rodata_fixups: []asm.Fixup = []
+    data_fixups: []asm.Fixup = []
+    extra: []asm.Section = []
+    symbols: []asm.Symbol = []
+    omit_entry: bool = false
+}
+
+struct LinkedPe {
+    image: []u8
+    file: oracletool.PeFile
+}
+
+struct RelocBlock {
+    page: i64
+    entries: []i64
+}
+
+struct PeRejection {
+    name: str
+    options: PeOptions
+    want: str
+}
+
+fn pe_object(options: PeOptions) -> asm.Object {
+    let text = asm.Section {
+        name: ".text"
+        flags: asm.flag_alloc | asm.flag_exec
+        align: 16
+        data: io.buffer(64)
+        fixups: options.text_fixups
+    }
+    let rodata = asm.Section { name: ".rodata", flags: asm.flag_alloc, align: 8, data: io.buffer(32), fixups: options.rodata_fixups }
+    let data = asm.Section {
+        name: ".data"
+        flags: asm.flag_alloc | asm.flag_write
+        align: 8
+        data: io.buffer(24)
+        fixups: options.data_fixups
+    }
+    let bss = asm.Section { name: ".bss", flags: asm.flag_alloc | asm.flag_write, align: 8, nobits: true, size: 5000 }
+    var symbols = [
+        asm.Symbol { name: "text_label", section: pe_text_index, value: 8 }
+        asm.Symbol { name: "rodata_label", section: pe_rodata_index, value: 4 }
+        asm.Symbol { name: "data_label", section: pe_data_index, value: 16 }
+        asm.Symbol { name: "bss_label", section: pe_bss_index, value: 8 }
+        absolute_symbol("constant", 0x1234)
+    ]
+    if !options.omit_entry {
+        push(mut symbols, asm.Symbol { name: "start", section: pe_text_index, global: true })
+    }
+    asm.Object {
+        sections: slices.concat([text, rodata, data, bss], options.extra)
+        symbols: slices.concat(symbols, options.symbols)
+    }
+}
+
+fn link_pe(t: *testing.T, obj: asm.Object) -> LinkedPe {
+    let image = link.pe(obj) catch {
+        e => {
+            t.fatal("link: {link.message(e)}")
+            return LinkedPe { image: [], file: oracletool.PeFile {} }
+        }
+    }
+    let file = oracletool.read_pe(image) catch {
+        e => {
+            t.fatal("parse image: {oracletool.message(e)}")
+            return LinkedPe { image, file: oracletool.PeFile {} }
+        }
+    }
+    LinkedPe { image, file }
+}
+
+fn pe_error(obj: asm.Object) -> str {
+    link.pe(obj) catch {
+        e => return link.message(e)
+    }
+    ""
+}
+
+fn pe_section_of(t: *testing.T, file: oracletool.PeFile, name: str) -> oracletool.PeSection {
+    match oracletool.pe_section(file, name) {
+        some(section) => section
+        none => {
+            t.fatal("no section {name}")
+            oracletool.PeSection { name }
+        }
+    }
+}
+
+fn pe_header_of(t: *testing.T, file: oracletool.PeFile) -> oracletool.PeOptionalHeader {
+    match file.header {
+        some(header) => header
+        none => {
+            t.fatal("the image has no optional header")
+            oracletool.PeOptionalHeader {}
+        }
+    }
+}
+
+fn pe_section_names(file: oracletool.PeFile) -> []str {
+    var names: []str = []
+    for s in file.sections {
+        push(mut names, s.name)
+    }
+    names
+}
+
+fn expect_sections(t: *testing.T, file: oracletool.PeFile, want: []str) -> bool {
+    let got = pe_section_names(file)
+    if slices.equal(got, want) {
+        return true
+    }
+    let got_text = text.join(got, " ")
+    let want_text = text.join(want, " ")
+    t.error("sections {got_text}, want {want_text}")
+    false
+}
+
+fn round_up_page(value: i64) -> i64 {
+    (value + page_mask) & ~page_mask
+}
+
+fn test_pe_headers(t: *testing.T) {
+    let obj = pe_object(PeOptions {})
+    let linked = link_pe(t, obj)
+    let file = linked.file
+    let header = pe_header_of(t, file)
+    if file.machine != oracletool.pe_machine_amd64 || file.characteristics != 0x22 {
+        t.error("machine 0x{file.machine:x} characteristics 0x{file.characteristics:x}")
+    }
+    if header.image_base != pe_image_base || header.section_alignment != 0x1000 || header.file_alignment != file_alignment {
+        t.error("image base 0x{header.image_base:x} section alignment 0x{header.section_alignment:x} file alignment 0x{header.file_alignment:x}")
+    }
+    if header.subsystem != oracletool.pe_subsystem_windows_cui || header.dll_characteristics != 0x8160 {
+        t.error("subsystem {header.subsystem} dll characteristics 0x{header.dll_characteristics:x}")
+    }
+    let stack_reserve = 8 << 20
+    let heap_reserve = 1 << 20
+    if header.size_of_stack_reserve != stack_reserve || header.size_of_stack_commit != 0x1000 || header.size_of_heap_reserve != heap_reserve || header.size_of_heap_commit != 0x1000 {
+        t.error("stack {header.size_of_stack_reserve}/{header.size_of_stack_commit} heap {header.size_of_heap_reserve}/{header.size_of_heap_commit}")
+    }
+    if header.major_operating_system_version != 6 || header.major_subsystem_version != 6 || header.major_linker_version != 14 {
+        t.error("versions os {header.major_operating_system_version} subsystem {header.major_subsystem_version} linker {header.major_linker_version}")
+    }
+    let code = pe_section_of(t, file, ".text")
+    if header.address_of_entry_point != code.virtual_address || header.base_of_code != code.virtual_address {
+        t.error("entry 0x{header.address_of_entry_point:x} base of code 0x{header.base_of_code:x}, text at 0x{code.virtual_address:x}")
+    }
+    if header.size_of_headers % file_alignment != 0 || linked.image.len % file_alignment != 0 {
+        t.error("headers 0x{header.size_of_headers:x} or file 0x{linked.image.len:x} not file aligned")
+    }
+    let last = file.sections[file.sections.len - 1]
+    expect_equal(t, "size of image", header.size_of_image, round_up_page(last.virtual_address + last.virtual_size))
+}
+
+fn check_section_chain(t: *testing.T, file: oracletool.PeFile) {
+    for i in 1..file.sections.len {
+        let previous = file.sections[i - 1]
+        let current = file.sections[i]
+        if current.virtual_address != round_up_page(previous.virtual_address + previous.virtual_size) {
+            t.error("{current.name} at 0x{current.virtual_address:x} does not follow {previous.name}")
+        }
+        if current.offset != previous.offset + previous.size {
+            t.error("{current.name} at file offset 0x{current.offset:x} does not follow {previous.name}")
+        }
+    }
+}
+
+fn test_pe_section_layout(t: *testing.T) {
+    let obj = pe_object(PeOptions {})
+    let linked = link_pe(t, obj)
+    let file = linked.file
+    if !expect_sections(t, file, [".text", ".rdata", ".data", ".rodata"]) {
+        return
+    }
+    let code = pe_section_of(t, file, ".text")
+    if code.characteristics != 0x60000020 || code.virtual_address != 0x1000 || code.virtual_size != 64 {
+        t.error("text characteristics 0x{code.characteristics:x} at 0x{code.virtual_address:x} size {code.virtual_size}")
+    }
+    let padding = linked.image[code.offset + code.virtual_size..code.offset + code.size]
+    for b in padding {
+        if i64(b) != int3 {
+            t.error("text padding is not int3")
+            break
+        }
+    }
+    let data = pe_section_of(t, file, ".data")
+    if data.characteristics != 0xC0000040 {
+        t.error("data characteristics 0x{data.characteristics:x}")
+    }
+    if data.virtual_size != 24 + 5000 || data.size != file_alignment {
+        t.error("data virtual {data.virtual_size} raw {data.size}: bss must follow data in the same section without file bytes")
+    }
+    let rodata = pe_section_of(t, file, ".rodata")
+    if rodata.characteristics != 0xC0000040 {
+        t.error("rodata characteristics 0x{rodata.characteristics:x}")
+    }
+    check_section_chain(t, file)
+}
+
+fn test_pe_orders_sections_by_name(t: *testing.T) {
+    let zeta_data: []u8 = [1]
+    let alpha_data: []u8 = [2]
+    let extra = [
+        asm.Section { name: ".zeta", flags: asm.flag_read_only, align: 1, data: zeta_data }
+        asm.Section { name: ".alpha", flags: asm.flag_read_only, align: 1, data: alpha_data }
+    ]
+    let obj = pe_object(PeOptions { extra })
+    let linked = link_pe(t, obj)
+    expect_sections(t, linked.file, [".text", ".rdata", ".data", ".alpha", ".rodata", ".zeta"])
+    let alpha = pe_section_of(t, linked.file, ".alpha")
+    if alpha.characteristics != 0x40000040 {
+        t.error("read-only data characteristics 0x{alpha.characteristics:x}")
+    }
+}
+
+fn rva(file: oracletool.PeFile, name: str, offset: i64) -> i64 {
+    match oracletool.pe_section(file, name) {
+        some(section) => section.virtual_address + offset
+        none => 0
+    }
+}
+
+fn read_at(linked: LinkedPe, name: str, offset: i64) -> []u8 {
+    match oracletool.pe_section(linked.file, name) {
+        some(section) => linked.image[section.offset + offset..]
+        none => []
+    }
+}
+
+fn test_pe_fixups(t: *testing.T) {
+    let obj = pe_object(PeOptions {
+        text_fixups: [
+            fixup(4, asm.pc32, "data_label", -4)
+            fixup(12, asm.plt32, "text_label", -4)
+            fixup(20, asm.img_rel32, "rodata_label", 8)
+        ]
+        rodata_fixups: [fixup(8, asm.abs64, "text_label", 3)]
+        data_fixups: [fixup(0, asm.abs64, "constant", 1)]
+    })
+    let linked = link_pe(t, obj)
+    let file = linked.file
+    let code = read_at(linked, ".text", 0)
+    let text_rva = rva(file, ".text", 0)
+    let data_label = rva(file, ".data", 16)
+    let mask32 = 0xFFFFFFFF
+    expect_equal(t, "PC32", io.le32(code, 4), (data_label - (text_rva + 4) - 4) & mask32)
+    expect_equal(t, "PLT32", io.le32(code, 12), (text_rva + 8 - (text_rva + 12) - 4) & mask32)
+    expect_equal(t, "ImgRel32", io.le32(code, 20), rva(file, ".rodata", 4) + 8)
+    let rodata = read_at(linked, ".rodata", 0)
+    expect_equal(t, "Abs64", io.le64(rodata, 8), pe_image_base + text_rva + 8 + 3)
+    let data = read_at(linked, ".data", 0)
+    expect_equal(t, "Abs64 against an absolute symbol", io.le64(data, 0), 0x1235)
+}
+
+fn parse_reloc_blocks(raw: []u8) -> []RelocBlock {
+    var blocks: []RelocBlock = []
+    var at = 0
+    for at < raw.len {
+        let size = io.le32(raw, at + 4)
+        var entries: []i64 = []
+        var i = 8
+        for i < size {
+            push(mut entries, io.le16(raw, at + i))
+            i += 2
+        }
+        push(mut blocks, RelocBlock { page: io.le32(raw, at), entries })
+        at += size
+    }
+    blocks
+}
+
+fn test_pe_base_relocations(t: *testing.T) {
+    let obj = pe_object(PeOptions {
+        rodata_fixups: [
+            fixup(16, asm.abs64, "text_label", 0)
+            fixup(0, asm.abs64, "data_label", 0)
+            fixup(8, asm.abs64, "constant", 0)
+        ]
+        data_fixups: [fixup(0, asm.abs64, "text_label", 0)]
+    })
+    let linked = link_pe(t, obj)
+    let file = linked.file
+    let reloc = pe_section_of(t, file, ".reloc")
+    let last = file.sections[file.sections.len - 1]
+    if reloc.characteristics != 0x42000040 || reloc.virtual_address != last.virtual_address {
+        t.error(".reloc characteristics 0x{reloc.characteristics:x}, last section {last.name}")
+    }
+    let header = pe_header_of(t, file)
+    let directory = header.directories[oracletool.pe_dir_base_reloc]
+    if directory.virtual_address != reloc.virtual_address || directory.size != reloc.virtual_size {
+        t.error("base relocation directory 0x{directory.virtual_address:x}+{directory.size}, section at 0x{reloc.virtual_address:x} size {reloc.virtual_size}")
+    }
+    let raw = linked.image[reloc.offset..reloc.offset + reloc.virtual_size]
+    let blocks = parse_reloc_blocks(raw)
+    let data_page = rva(file, ".data", 0) & ~page_mask
+    let rodata_page = rva(file, ".rodata", 0) & ~page_mask
+    if blocks.len != 2 || blocks[0].page != data_page || blocks[1].page != rodata_page {
+        t.fatal("got {blocks.len} blocks, want pages 0x{data_page:x} and 0x{rodata_page:x}")
+        return
+    }
+    let data_entry = reloc_type_dir64 << 12 | (rva(file, ".data", 0) & page_mask)
+    if blocks[0].entries.len != 2 || blocks[0].entries[0] != data_entry || blocks[0].entries[1] != 0 {
+        t.error("first block entries {blocks[0].entries}, want {data_entry} padded with an absolute entry")
+    }
+    let rodata_base = rva(file, ".rodata", 0)
+    let first = reloc_type_dir64 << 12 | (rodata_base & page_mask)
+    let second = reloc_type_dir64 << 12 | ((rodata_base + 16) & page_mask)
+    if blocks[1].entries.len != 2 || blocks[1].entries[0] != first || blocks[1].entries[1] != second {
+        t.error("second block entries {blocks[1].entries}, want {first} and {second}")
+    }
+}
+
+fn test_pe_omits_relocations_without_absolute_addresses(t: *testing.T) {
+    let obj = pe_object(PeOptions { text_fixups: [fixup(4, asm.pc32, "data_label", -4)] })
+    let linked = link_pe(t, obj)
+    for s in linked.file.sections {
+        if s.name == ".reloc" {
+            t.fatal("unexpected .reloc section")
+            return
+        }
+    }
+    let header = pe_header_of(t, linked.file)
+    let directory = header.directories[oracletool.pe_dir_base_reloc]
+    if directory.virtual_address != 0 || directory.size != 0 {
+        t.error("base relocation directory {directory.virtual_address}+{directory.size}")
+    }
+}
+
+fn import_sections() -> []asm.Section {
+    [
+        asm.Section { name: ".idata$2", flags: asm.flag_read_only, align: 1, data: io.buffer(40) }
+        asm.Section { name: ".idata$3", flags: asm.flag_read_only, align: 1, data: io.buffer(20) }
+        asm.Section { name: ".idata$4", flags: asm.flag_read_only, align: 8, data: io.buffer(24) }
+        asm.Section { name: ".idata$5", flags: asm.flag_read_only, align: 8, data: io.buffer(24) }
+        asm.Section { name: ".idata$6", flags: asm.flag_read_only, align: 2, data: io.buffer(14) }
+        asm.Section { name: ".idata$7", flags: asm.flag_read_only, align: 1, data: io.buffer(13) }
+    ]
+}
+
+fn test_pe_import_directories(t: *testing.T) {
+    let extra = import_sections()
+    let obj = pe_object(PeOptions { extra })
+    let linked = link_pe(t, obj)
+    let file = linked.file
+    let header = pe_header_of(t, file)
+    let rdata = pe_section_of(t, file, ".rdata")
+    let debug = header.directories[oracletool.pe_dir_debug]
+    if debug.virtual_address != rdata.virtual_address || debug.size != 28 {
+        t.error("debug directory 0x{debug.virtual_address:x}+{debug.size}")
+    }
+    let imports = header.directories[oracletool.pe_dir_import]
+    if imports.virtual_address != rdata.virtual_address + 28 || imports.size != 40 + 20 {
+        t.error("import directory 0x{imports.virtual_address:x}+{imports.size}")
+    }
+    let iat = header.directories[oracletool.pe_dir_iat]
+    if iat.size != 24 || iat.virtual_address % 8 != 0 {
+        t.error("import address table 0x{iat.virtual_address:x}+{iat.size}")
+    }
+    let lookup = rdata.virtual_address + 28 + 40 + 20 + 20
+    if lookup + (8 - lookup % 8) % 8 > iat.virtual_address {
+        t.error("import address table at 0x{iat.virtual_address:x} precedes the lookup table, which starts at 0x{lookup:x}")
+    }
+    let entry = linked.image[rdata.offset..]
+    let kind = io.le32(entry, 12)
+    if kind != 16 {
+        t.error("debug entry type {kind}, want 16 (reproducible build)")
+    }
+}
+
+fn test_pe_stamps_content_hash(t: *testing.T) {
+    let extra = import_sections()
+    let obj = pe_object(PeOptions { extra })
+    let first = link_pe(t, obj)
+    let again = pe_object(PeOptions { extra })
+    let second = link_pe(t, again)
+    if !slices.equal(first.image, second.image) {
+        t.fatal("linking twice gives different images")
+        return
+    }
+    let changed = pe_object(PeOptions { extra, data_fixups: [fixup(0, asm.abs64, "text_label", 0)] })
+    let other = link_pe(t, changed)
+    let first_stamp = first.file.time_date_stamp
+    let other_stamp = other.file.time_date_stamp
+    if first_stamp == 0 || first_stamp == other_stamp {
+        t.error("timestamps 0x{first_stamp:x} and 0x{other_stamp:x} do not follow the content")
+    }
+    let rdata = pe_section_of(t, first.file, ".rdata")
+    let entry_stamp = io.le32(first.image, rdata.offset + 4)
+    if entry_stamp != first_stamp {
+        t.error("debug entry stamp 0x{entry_stamp:x}, header stamp 0x{first_stamp:x}")
+    }
+}
+
+fn pe_rejections() -> []PeRejection {
+    let tbss = asm.Section { name: ".tbss", flags: asm.flag_alloc | asm.flag_write | asm.flag_tls, nobits: true, size: 8, align: 8 }
+    [
+        PeRejection {
+            name: "undefined symbol"
+            options: PeOptions { text_fixups: [fixup(0, asm.pc32, "missing_b", 0), fixup(8, asm.plt32, "missing_a", 0)] }
+            want: "undefined symbol missing_a, missing_b"
+        }
+        PeRejection { name: "missing entry", options: PeOptions { omit_entry: true }, want: "entry symbol start is not defined" }
+        PeRejection {
+            name: "absolute 32-bit"
+            options: PeOptions { data_fixups: [fixup(0, asm.abs32, "text_label", 0)] }
+            want: "Abs32 relocation against text_label in .data is not supported"
+        }
+        PeRejection {
+            name: "signed absolute 32-bit"
+            options: PeOptions { data_fixups: [fixup(0, asm.abs32s, "text_label", 0)] }
+            want: "Abs32S relocation"
+        }
+        PeRejection {
+            name: "global offset table"
+            options: PeOptions { text_fixups: [fixup(0, asm.gotpcrel, "text_label", 0)] }
+            want: "GOTPCREL relocation"
+        }
+        PeRejection {
+            name: "relocation outside"
+            options: PeOptions { text_fixups: [fixup(62, asm.pc32, "text_label", 0)] }
+            want: "lies outside .text"
+        }
+        PeRejection {
+            name: "rip-relative range to an absolute symbol"
+            options: PeOptions { text_fixups: [fixup(0, asm.pc32, "constant", 0)] }
+            want: "does not fit in 32 signed bits"
+        }
+        PeRejection {
+            name: "image relative range"
+            options: PeOptions { text_fixups: [fixup(0, asm.img_rel32, "text_label", -1 << 20)] }
+            want: "does not fit in 32 unsigned bits"
+        }
+        PeRejection { name: "thread local", options: PeOptions { extra: [tbss] }, want: "thread-local section .tbss" }
+    ]
+}
+
+fn pe_rejection_name(c: PeRejection) -> str {
+    c.name
+}
+
+fn check_pe_rejection(t: *testing.T, c: PeRejection) {
+    let obj = pe_object(c.options)
+    let message = pe_error(obj)
+    if message == "" || !text.contains(message, c.want) {
+        let wanted = text.quote(c.want)
+        t.error("error {message}, want mention of {wanted}")
+    }
+}
+
+fn test_pe_rejections(t: *testing.T) {
+    t.table_of(pe_rejections(), pe_rejection_name, check_pe_rejection)
+}

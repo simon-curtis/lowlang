@@ -1,0 +1,194 @@
+import asm
+import oracletool
+import target
+import std/file
+import std/io
+import std/slices
+import std/text
+
+const section_undefined_name = "*UND*"
+const section_absolute_name = "*ABS*"
+const rela_entry_size = 24
+
+struct NormReloc {
+    offset: i64
+    kind: str
+    target: str
+    addend: i64
+}
+
+fn reloc_text(r: NormReloc) -> str {
+    let offset = oracletool.hex_text(r.offset)
+    let addend = oracletool.signed(r.addend)
+    "+{offset} {r.kind} {r.target}{addend}"
+}
+
+fn same_reloc(a: NormReloc, b: NormReloc) -> bool {
+    a.offset == b.offset && a.kind == b.kind && a.target == b.target && a.addend == b.addend
+}
+
+struct OracleSection {
+    name: str
+    flags: i64
+    align: i64
+    nobits: bool
+    size: i64
+    data: []u8
+    relocs: []NormReloc
+}
+
+struct OracleSymbol {
+    name: str
+    section: str
+    value: i64
+    global: bool
+}
+
+struct OracleObject {
+    sections: [str: OracleSection]
+    symbols: [str: OracleSymbol]
+}
+
+fn reloc_kind_name(kind: i64) -> str {
+    match kind {
+        oracletool.r_x86_64_64 => "Abs64"
+        oracletool.r_x86_64_32 => "Abs32"
+        oracletool.r_x86_64_32s => "Abs32S"
+        oracletool.r_x86_64_pc32 => "PC32"
+        oracletool.r_x86_64_plt32 => "PLT32"
+        oracletool.r_x86_64_gotpcrel => "GOTPCREL"
+        oracletool.r_x86_64_gotpcrelx => "GOTPCRELX"
+        oracletool.r_x86_64_rex_gotpcrelx => "REX_GOTPCRELX"
+        _ => "R_X86_64_{kind}"
+    }
+}
+
+fn elf_flags(flags: i64) -> i64 {
+    var mapped = 0
+    if flags & oracletool.shf_alloc != 0 {
+        mapped |= asm.flag_alloc
+    }
+    if flags & oracletool.shf_write != 0 {
+        mapped |= asm.flag_write
+    }
+    if flags & oracletool.shf_execinstr != 0 {
+        mapped |= asm.flag_exec
+    }
+    if flags & oracletool.shf_tls != 0 {
+        mapped |= asm.flag_tls
+    }
+    mapped
+}
+
+fn as_source(source: str, platform: target.OS) -> str {
+    if platform != target.OS.Windows {
+        return source
+    }
+    let without_image_relative = text.replace(source, "@IMGREL", "")
+    text.replace(without_image_relative, ",\"dr\"", ",\"a\"")
+}
+
+fn run_as(dir: str, source: str, options: oracletool.GNUOptions) -> OracleObject ! oracletool.Error {
+    let object_path = oracletool.assemble_gnu(dir, source, options)?
+    defer file.remove(object_path) or {}
+    read_object(object_path)?
+}
+
+fn read_object(path: str) -> OracleObject ! oracletool.Error {
+    let data = file.read_file(path) catch {
+        e => fail oracletool.Error.Failed("open object: {e}")
+    }
+    let elf = oracletool.read_elf(data)?
+    let symbols = oracletool.elf_symbols(elf)?
+    var object = OracleObject { sections: [:], symbols: [:] }
+    for s in elf.sections {
+        add_section(mut object, elf, s)?
+    }
+    for s in elf.sections {
+        if s.kind == oracletool.sht_rela {
+            add_relocs(mut object, elf, s, symbols)?
+        }
+    }
+    for sym in symbols {
+        add_symbol(mut object, elf, sym)
+    }
+    object
+}
+
+fn add_section(mut object: OracleObject, elf: oracletool.ElfFile, s: oracletool.ElfSection) ! oracletool.Error {
+    if s.kind != oracletool.sht_progbits && s.kind != oracletool.sht_nobits {
+        return
+    }
+    let nobits = s.kind == oracletool.sht_nobits
+    var data: []u8 = []
+    if !nobits {
+        data = oracletool.elf_data(elf, s)?
+    }
+    object.sections[s.name] = OracleSection {
+        name: s.name
+        flags: elf_flags(s.flags)
+        align: s.addralign
+        nobits
+        size: s.size
+        data
+        relocs: []
+    }
+}
+
+fn add_relocs(mut object: OracleObject, elf: oracletool.ElfFile, rela: oracletool.ElfSection, symbols: []oracletool.ElfSymbol) ! oracletool.Error {
+    let target_section = elf.sections[rela.info]
+    var section = object.sections[target_section.name] ?? return
+    let data = oracletool.elf_data(elf, rela)?
+    var at = 0
+    for at + rela_entry_size <= data.len {
+        let offset = io.le64(data, at)
+        let info = io.le64(data, at + 8)
+        let addend = io.le64(data, at + 16)
+        let reloc = normalise(elf, symbols, offset, info, addend)
+        push(mut section.relocs, reloc)
+        at += rela_entry_size
+    }
+    slices.sort_stable_by(mut section.relocs, fn(a: NormReloc, b: NormReloc) -> bool { a.offset < b.offset })
+    object.sections[target_section.name] = section
+}
+
+fn normalise(elf: oracletool.ElfFile, symbols: []oracletool.ElfSymbol, offset: i64, info: i64, addend: i64) -> NormReloc {
+    let kind = reloc_kind_name(info & 0xffffffff)
+    let index = info >> 32
+    if index == 0 {
+        return NormReloc { offset, kind, target: "none", addend }
+    }
+    let sym = symbols[index - 1]
+    let bind = sym.info >> 4
+    if sym.info & 0xf == oracletool.stt_section {
+        let name = oracletool.elf_section_name(elf, sym.shndx)
+        return NormReloc { offset, kind, target: "sec:{name}", addend }
+    }
+    if bind == oracletool.stb_local && sym.shndx != oracletool.shn_undef && sym.shndx < oracletool.shn_loreserve {
+        let name = oracletool.elf_section_name(elf, sym.shndx)
+        return NormReloc { offset, kind, target: "sec:{name}", addend: addend + sym.value }
+    }
+    NormReloc { offset, kind, target: "sym:{sym.name}", addend }
+}
+
+fn add_symbol(mut object: OracleObject, elf: oracletool.ElfFile, sym: oracletool.ElfSymbol) {
+    let kind = sym.info & 0xf
+    if kind == oracletool.stt_section || kind == oracletool.stt_file {
+        return
+    }
+    if text.starts_with(sym.name, ".L") || sym.name == "" {
+        return
+    }
+    var section = section_undefined_name
+    if sym.shndx == oracletool.shn_abs {
+        section = section_absolute_name
+    } else if sym.shndx != oracletool.shn_undef && sym.shndx < oracletool.shn_loreserve {
+        section = oracletool.elf_section_name(elf, sym.shndx)
+    }
+    object.symbols[sym.name] = OracleSymbol {
+        name: sym.name
+        section
+        value: sym.value
+        global: sym.info >> 4 != oracletool.stb_local
+    }
+}

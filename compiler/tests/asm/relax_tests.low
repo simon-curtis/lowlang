@@ -1,0 +1,150 @@
+import asm
+import std/testing
+import std/text
+
+const nop11 = "66662e0f1f840000000000"
+
+struct TextCase {
+    name: str
+    source: str
+    want: str
+}
+
+fn expect_bytes(spec: str) -> str {
+    var hex = ""
+    for token in text.fields(spec) {
+        let cut = text.cut(token, "*")
+        let count = text.parse_int(cut.after) or 1
+        hex = "{hex}{text.repeat(cut.before, count)}"
+    }
+    hex
+}
+
+fn repeated(line: str, count: i64, rest: str) -> str {
+    let lines = text.repeat(line, count)
+    "{lines}{rest}"
+}
+
+fn check_text(t: *testing.T, name: str, source: str, opts: asm.Options, spec: str) {
+    let data = assemble_text(t, source, opts)
+    let got = text.encode_hex(data)
+    let want = expect_bytes(spec)
+    if got != want {
+        t.error("{name}: got {got}, want {want}")
+    }
+}
+
+fn text_case_name(c: TextCase) -> str {
+    c.name
+}
+
+fn check_plain_case(t: *testing.T, c: TextCase) {
+    check_text(t, c.name, c.source, asm.Options {}, c.want)
+}
+
+fn relaxation_boundary_cases() -> []TextCase {
+    [
+        TextCase { name: "forward short at the limit", source: "jne c\n.zero 127\nc:\nret", want: "757f 00*127 c3" }
+        TextCase { name: "forward near past the limit", source: "jne c\n.zero 128\nc:\nret", want: "0f85 80000000 00*128 c3" }
+        TextCase { name: "backward short at the limit", source: "top:\n.zero 126\njmp top", want: "00*126 eb80" }
+        TextCase { name: "backward near past the limit", source: "top:\n.zero 127\njmp top", want: "00*127 e9 7cffffff" }
+        TextCase { name: "two short jumps", source: "jne c\n.zero 126\nc:\njne d\n.zero 126\nd:\nret", want: "757e 00*126 757e 00*126 c3" }
+        TextCase { name: "backward pair", source: "top:\n.zero 120\njmp top\njmp top", want: "00*120 eb86 eb84" }
+    ]
+}
+
+fn test_relaxation_boundaries(t: *testing.T) {
+    t.table_of(relaxation_boundary_cases(), text_case_name, check_plain_case)
+}
+
+fn chain_source(first: i64, second: i64) -> str {
+    "jmp far1\n.zero {first}\njmp far2\nfar1:\n.zero {second}\nfar2:\nret"
+}
+
+fn test_relaxation_chain(t: *testing.T) {
+    let fits = chain_source(124, 100)
+    check_text(t, "inner jump stays short", fits, asm.Options {}, "eb7e 00*124 eb64 00*100 c3")
+    let grows = chain_source(124, 130)
+    check_text(t, "inner growth forces the outer jump", grows, asm.Options {}, "e9 81000000 00*124 e9 82000000 00*130 c3")
+}
+
+fn alignment_relaxation_source(first: i64) -> str {
+    "jne end\n.zero {first}\n.p2align 4\njmp end\n.zero 100\nend:\nret"
+}
+
+fn test_relaxation_through_alignment(t: *testing.T) {
+    let six = alignment_relaxation_source(116)
+    check_text(t, "six byte pad", six, asm.Options {}, "0f85 e0000000 00*116 90 0f1f4400 00 eb64 00*100 c3")
+    let four = alignment_relaxation_source(118)
+    check_text(t, "four byte pad", four, asm.Options {}, "0f85 e0000000 00*118 90 0f1f00 eb64 00*100 c3")
+}
+
+fn test_unresolved_jumps_keep_relocations(t: *testing.T) {
+    let program = ".intel_syntax noprefix\n.text\njne ext\njmp ext\ncall ext\nret\n"
+    let object = asm.assemble(program, asm.Options {}) catch {
+        e => {
+            t.fatal(asm.message(e))
+            return
+        }
+    }
+    let section = object.sections[0]
+    let want = expect_bytes("0f85 00000000 e9 00000000 e8 00000000 c3")
+    let got = text.encode_hex(section.data)
+    if got != want {
+        t.error("got {got}, want {want}")
+    }
+    if section.fixups.len != 3 {
+        t.fatal("got {section.fixups.len} relocations, want 3")
+        return
+    }
+    let offsets = [2, 7, 12]
+    for i, f in section.fixups {
+        if f.offset != offsets[i] || f.kind != asm.plt32 || f.addend != -4 {
+            t.error("relocation {i}: {f}")
+        }
+    }
+}
+
+fn align_padding(n: i64) -> str {
+    match n {
+        1 => "0f1f4000 {nop11}"
+        2 => "0f1f00 {nop11}"
+        3 => "6690 {nop11}"
+        4 => "90 {nop11}"
+        5 => nop11
+        6 => "662e0f1f840000000000"
+        7 => "660f1f840000000000"
+        8 => "0f1f840000000000"
+        9 => "0f1f8000000000"
+        10 => "660f1f440000"
+        11 => "0f1f440000"
+        12 => "0f1f4000"
+        13 => "0f1f00"
+        14 => "6690"
+        15 => "90"
+        _ => ""
+    }
+}
+
+fn test_align_padding_lengths(t: *testing.T) {
+    for n in 1..16 {
+        let source = repeated("ret\n", n, ".p2align 4\nret")
+        let padding = align_padding(n)
+        let spec = "c3*{n} {padding} c3"
+        check_text(t, "{n} bytes before the boundary", source, asm.Options {}, spec)
+    }
+}
+
+fn test_align_jumps_over_long_padding(t: *testing.T) {
+    check_text(t, "short jump over 127 bytes", "ret\n.p2align 7\nret", asm.Options {}, "c3 eb7d 0f1f4000 {nop11}*11 c3")
+    let eighty = repeated("ret\n", 40, ".p2align 7\nret")
+    check_text(t, "jump over eight patterns", eighty, asm.Options {}, "c3*40 eb56 660f1f840000000000 {nop11}*7 c3")
+    check_text(t, "near jump over 511 bytes", "ret\n.p2align 9\nret", asm.Options {}, "c3 e9fa010000 {nop11}*46 c3")
+}
+
+fn test_align_max_skip(t: *testing.T) {
+    let skipped = repeated("ret\n", 13, ".p2align 4,,2\nret")
+    check_text(t, "skip exceeds the limit", skipped, asm.Options {}, "c3*14")
+    let padded = repeated("ret\n", 13, ".p2align 4,,3\nret")
+    check_text(t, "skip equals the limit", padded, asm.Options {}, "c3*13 0f1f00 c3")
+}

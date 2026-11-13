@@ -1,0 +1,125 @@
+import amd64
+import asm
+import link
+import oracletool
+import std/io
+import std/testing
+
+const patch_base = 0x40000000
+
+struct PatchRejection {
+    name: str
+    fixups: []asm.Fixup
+    want: str
+}
+
+fn patch_object(fixups: []asm.Fixup) -> asm.Object {
+    let text = asm.Section {
+        name: ".text"
+        flags: asm.flag_alloc | asm.flag_exec
+        align: 32
+        data: io.buffer(32)
+        fixups
+    }
+    let rodata_bytes: []u8 = [1, 2, 3, 4, 5, 6, 7, 8]
+    let rodata = asm.Section { name: ".rodata", flags: asm.flag_alloc, align: 8, data: rodata_bytes }
+    asm.Object {
+        sections: [text, rodata]
+        symbols: [
+            asm.Symbol { name: "fn_patched", section: 0, global: true }
+            asm.Symbol { name: "message", section: 1, value: 4 }
+            absolute_symbol("constant", 0x1234)
+        ]
+    }
+}
+
+fn test_patch_resolves_against_the_running_image(t: *testing.T) {
+    let running: [str: i64] = ["rt_entry": 0x401000]
+    let obj = patch_object([
+        fixup(1, asm.plt32, "rt_entry", -4)
+        fixup(8, asm.pc32, "message", -4)
+        fixup(16, asm.abs64, "constant", 0)
+    ])
+    let patch = link.patch(obj, patch_base + 5, running) catch {
+        e => {
+            t.fatal(link.message(e))
+            return
+        }
+    }
+    let boundary = patch_base + 32
+    if patch.address != boundary {
+        let got = oracletool.hex_text(patch.address)
+        let want = oracletool.hex_text(boundary)
+        t.fatal("patch at {got}, want the next 32-byte boundary {want}")
+        return
+    }
+    expect_equal(t, "fn_patched", patch.symbols["fn_patched"] ?? 0, patch.address)
+    let want_message = patch.address + 32 + 4
+    expect_equal(t, "message", patch.symbols["message"] ?? 0, want_message)
+    let call = sign_extend_32(io.le32(patch.code, 1))
+    let want_call = 0x401000 - 4 - (patch.address + 1)
+    if call != want_call {
+        t.error("call displacement {call}, want {want_call}")
+    }
+    let reference = sign_extend_32(io.le32(patch.code, 8))
+    let want_reference = want_message - 4 - (patch.address + 8)
+    if reference != want_reference {
+        t.error("rodata displacement {reference}, want {want_reference}")
+    }
+    expect_equal(t, "absolute value", io.le64(patch.code, 16), 0x1234)
+}
+
+fn patch_rejections() -> []PatchRejection {
+    [
+        PatchRejection { name: "undefined symbol", fixups: [fixup(1, asm.plt32, "missing", 0)], want: "undefined symbol missing" }
+        PatchRejection { name: "got relocation", fixups: [fixup(1, asm.gotpcrel, "rt_entry", 0)], want: "not supported" }
+        PatchRejection { name: "out of range", fixups: [fixup(1, asm.pc32, "far", 0)], want: "does not fit" }
+    ]
+}
+
+fn patch_rejection_name(c: PatchRejection) -> str {
+    c.name
+}
+
+fn check_patch_rejection(t: *testing.T, c: PatchRejection) {
+    let running: [str: i64] = ["rt_entry": 0x401000, "far": 1 << 40]
+    let obj = patch_object(c.fixups)
+    link.patch(obj, patch_base, running) catch {
+        e => {
+            let message = link.message(e)
+            t.contains(message, c.want)
+            return
+        }
+    }
+    t.fatal("patch succeeded, want an error mentioning {c.want}")
+}
+
+fn test_patch_rejects_what_it_cannot_resolve(t: *testing.T) {
+    t.table_of(patch_rejections(), patch_rejection_name, check_patch_rejection)
+}
+
+fn test_patch_rejects_writable_sections(t: *testing.T) {
+    var obj = patch_object([])
+    let writable = asm.Section { name: ".data", flags: asm.flag_alloc | asm.flag_write, align: 8, data: io.buffer(8) }
+    push(mut obj.sections, writable)
+    let running: [str: i64] = [:]
+    link.patch(obj, patch_base, running) catch {
+        e => return
+    }
+    t.fatal("patched a program that owns writable data")
+}
+
+fn test_link_returns_the_resolved_symbols(t: *testing.T) {
+    let obj = fixture_object(FixtureOptions {})
+    let image = link.static(obj) catch {
+        e => {
+            t.fatal(link.message(e))
+            return
+        }
+    }
+    let entry = image.symbols[amd64.elf_entry_symbol] ?? 0
+    let label = image.symbols["data_label"] ?? 0
+    if entry == 0 || label == 0 {
+        t.error("entry and data labels missing from the image symbols")
+    }
+}

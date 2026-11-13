@@ -1,0 +1,331 @@
+import asm
+import link
+import oracletool
+import std/file
+import std/io
+import std/slices
+import std/testing
+import std/text
+
+struct Relocation {
+    offset: i64
+    symbol: str
+    kind: i64
+}
+
+fn system_resolver() -> link.Resolver {
+    link.Resolver { dirs: link.system_dirs() }
+}
+
+fn system_libraries(t: *testing.T, names: []str) -> []*link.Library {
+    link.resolve(system_resolver(), names) catch {
+        e => {
+            t.skip("system libraries are unavailable: {link.message(e)}")
+            return []
+        }
+    }
+}
+
+fn imported_symbols(names: []str) -> []asm.Symbol {
+    var symbols: []asm.Symbol = []
+    for name in names {
+        push(mut symbols, undefined_symbol(name))
+    }
+    symbols
+}
+
+fn must_link_dynamic(t: *testing.T, obj: asm.Object) -> oracletool.ElfFile {
+    let libraries = system_libraries(t, [])
+    let image = link.dynamic(obj, libraries) catch {
+        e => {
+            t.fatal("link: {link.message(e)}")
+            return oracletool.ElfFile {}
+        }
+    }
+    parse_image(t, image)
+}
+
+fn dynamic_error(t: *testing.T, obj: asm.Object) -> str {
+    let libraries = system_libraries(t, [])
+    link.dynamic(obj, libraries) catch {
+        e => return link.message(e)
+    }
+    ""
+}
+
+fn relocations(t: *testing.T, file: oracletool.ElfFile, name: str) -> []Relocation {
+    let data = section_data(t, file, name)
+    let symbols = oracletool.elf_dynamic_symbols(file) catch {
+        e => {
+            t.fatal("read dynamic symbols: {oracletool.message(e)}")
+            return []
+        }
+    }
+    var found: []Relocation = []
+    var at = 0
+    for at + rela_entry_size <= data.len {
+        let info = io.le64(data, at + 8)
+        let symbol = symbols[(info >> 32) - 1].name
+        push(mut found, Relocation { offset: io.le64(data, at), symbol, kind: info & 0xffffffff })
+        at += rela_entry_size
+    }
+    found
+}
+
+fn slot_of(t: *testing.T, file: oracletool.ElfFile, symbol: str) -> i64 {
+    for r in relocations(t, file, ".rela.dyn") {
+        if r.symbol == symbol {
+            return r.offset
+        }
+    }
+    t.fatal("no GLOB_DAT relocation for {symbol}")
+    0
+}
+
+fn displacement(t: *testing.T, file: oracletool.ElfFile, offset: i64) -> i64 {
+    let code = section_data(t, file, ".text")
+    sign_extend_32(io.le32(code, offset))
+}
+
+fn resolved_target(t: *testing.T, file: oracletool.ElfFile, offset: i64) -> i64 {
+    let code = section_of(t, file, ".text")
+    code.addr + offset + 4 + displacement(t, file, offset)
+}
+
+fn within(file: oracletool.ElfFile, name: str, address: i64) -> bool {
+    match oracletool.elf_section(file, name) {
+        some(section) => address >= section.addr && address < section.addr + section.size
+        none => false
+    }
+}
+
+fn check_dynamic_slots(t: *testing.T, file: oracletool.ElfFile) {
+    for r in relocations(t, file, ".rela.dyn") {
+        if r.kind != oracletool.r_x86_64_glob_dat {
+            t.error("{r.symbol}: .rela.dyn relocation {r.kind}, want GLOB_DAT")
+        }
+    }
+    let plt = relocations(t, file, ".rela.plt")
+    if plt.len != 1 || plt[0].symbol != "qsort" || plt[0].kind != oracletool.r_x86_64_jmp_slot {
+        t.fatal(".rela.plt has {plt.len} entries, want one JUMP_SLOT for qsort")
+    }
+}
+
+fn check_got_references(t: *testing.T, file: oracletool.ElfFile) {
+    let malloc_slot = slot_of(t, file, "malloc")
+    let free_slot = slot_of(t, file, "free")
+    let malloc_target = resolved_target(t, file, 8)
+    if malloc_target != malloc_slot {
+        let got = oracletool.hex_text(malloc_target)
+        let want = oracletool.hex_text(malloc_slot)
+        t.error("malloc GOT reference resolves to {got}, want slot {want}")
+    }
+    let first_free = resolved_target(t, file, 16)
+    let second_free = resolved_target(t, file, 24)
+    if first_free != free_slot || second_free != free_slot {
+        let first = oracletool.hex_text(first_free)
+        let second = oracletool.hex_text(second_free)
+        let shared = oracletool.hex_text(free_slot)
+        t.error("free GOT references resolve to {first} and {second}, want shared slot {shared}")
+    }
+    if !within(file, ".got", malloc_slot) || !within(file, ".got", free_slot) {
+        let malloc_text = oracletool.hex_text(malloc_slot)
+        let free_text = oracletool.hex_text(free_slot)
+        t.error("slots {malloc_text} and {free_text} are outside .got")
+    }
+}
+
+fn check_local_slot(t: *testing.T, file: oracletool.ElfFile) {
+    let got = section_of(t, file, ".got")
+    let local_slot = resolved_target(t, file, 32)
+    if !within(file, ".got", local_slot) {
+        let slot = oracletool.hex_text(local_slot)
+        t.fatal("local slot {slot} is outside .got")
+        return
+    }
+    let slots = section_data(t, file, ".got")
+    let held = io.le64(slots, local_slot - got.addr)
+    let want = symbol_address(t, file, "text_label")
+    if held != want {
+        let held_text = oracletool.hex_text(held)
+        let want_text = oracletool.hex_text(want)
+        t.error("local GOT slot holds {held_text}, want the address of text_label {want_text}")
+    }
+}
+
+fn check_plt_targets(t: *testing.T, file: oracletool.ElfFile) {
+    let direct = resolved_target(t, file, 0)
+    if !within(file, ".plt.got", direct) {
+        let target_text = oracletool.hex_text(direct)
+        t.error("PLT32 to a symbol with a GOT slot resolves to {target_text}, want an entry in .plt.got")
+    }
+    let lazy = resolved_target(t, file, 40)
+    let plt = section_of(t, file, ".plt")
+    if !within(file, ".plt", lazy) || lazy == plt.addr {
+        let target_text = oracletool.hex_text(lazy)
+        t.error("PLT32 to qsort resolves to {target_text}, want a lazy entry in .plt past the header")
+    }
+}
+
+fn test_dynamic_got_and_plt_relocations(t: *testing.T) {
+    let obj = fixture_object(FixtureOptions {
+        symbols: imported_symbols(["malloc", "free", "qsort"])
+        text_fixups: [
+            fixup(0, asm.plt32, "malloc", -4)
+            fixup(8, asm.rex_gotpcrelx, "malloc", -4)
+            fixup(16, asm.rex_gotpcrelx, "free", -4)
+            fixup(24, asm.gotpcrelx, "free", -4)
+            fixup(32, asm.gotpcrel, "text_label", -4)
+            fixup(40, asm.plt32, "qsort", -4)
+        ]
+    })
+    let file = must_link_dynamic(t, obj)
+    for symbol in ["malloc", "free"] {
+        slot_of(t, file, symbol)
+    }
+    check_dynamic_slots(t, file)
+    check_got_references(t, file)
+    check_local_slot(t, file)
+    check_plt_targets(t, file)
+}
+
+fn test_dynamic_plt_slot_holds_lazy_entry(t: *testing.T) {
+    let obj = fixture_object(FixtureOptions {
+        symbols: imported_symbols(["qsort"])
+        text_fixups: [fixup(0, asm.plt32, "qsort", -4)]
+    })
+    let file = must_link_dynamic(t, obj)
+    let plt = relocations(t, file, ".rela.plt")
+    if plt.len != 1 {
+        t.fatal(".rela.plt has {plt.len} entries, want 1")
+        return
+    }
+    let got_plt = section_of(t, file, ".got.plt")
+    let data = section_data(t, file, ".got.plt")
+    let held = io.le64(data, plt[0].offset - got_plt.addr)
+    let entry = resolved_target(t, file, 0)
+    expect_equal(t, "JUMP_SLOT slot", held, entry + 6)
+}
+
+fn test_dynamic_undefined_symbol_names_libraries(t: *testing.T) {
+    let obj = fixture_object(FixtureOptions {
+        symbols: imported_symbols(["no_such_function_anywhere"])
+        text_fixups: [fixup(0, asm.plt32, "no_such_function_anywhere", -4)]
+    })
+    let message = dynamic_error(t, obj)
+    if message == "" {
+        t.fatal("link succeeded with an unresolvable symbol")
+        return
+    }
+    for want in ["no_such_function_anywhere", "libc.so.6"] {
+        t.contains(message, want)
+    }
+}
+
+fn test_dynamic_rejects_copy_relocation(t: *testing.T) {
+    let obj = fixture_object(FixtureOptions {
+        symbols: imported_symbols(["environ"])
+        text_fixups: [
+            fixup(0, asm.rex_gotpcrelx, "environ", -4)
+            fixup(8, asm.pc32, "environ", -4)
+        ]
+    })
+    let message = dynamic_error(t, obj)
+    if message == "" {
+        t.fatal("link succeeded, want a rejected copy relocation against environ")
+        return
+    }
+    t.contains(message, "environ")
+    t.contains(message, "copy relocation")
+}
+
+fn test_dynamic_records_libraries_in_link_order(t: *testing.T) {
+    let obj = fixture_object(FixtureOptions {})
+    let libraries = system_libraries(t, ["m", "c"])
+    let image = link.dynamic(obj, libraries) catch {
+        e => {
+            t.fatal(link.message(e))
+            return
+        }
+    }
+    let file = parse_image(t, image)
+    let needed = oracletool.elf_needed(file) catch {
+        e => {
+            t.fatal(oracletool.message(e))
+            return
+        }
+    }
+    let joined = text.join(needed, " ")
+    t.equal(joined, "libm.so.6 libc.so.6")
+}
+
+fn sonames_of(libraries: []*link.Library) -> []str {
+    var sonames: []str = []
+    for library in libraries {
+        push(mut sonames, library.soname)
+    }
+    sonames
+}
+
+fn test_resolve_maps_runtime_libraries_and_puts_libc_last(t: *testing.T) {
+    let libraries = system_libraries(t, ["c", "m", "m"])
+    let sonames = sonames_of(libraries)
+    let joined = text.join(sonames, " ")
+    t.equal(joined, "libm.so.6 libc.so.6")
+}
+
+fn test_resolve_reads_soname_through_symlink(t: *testing.T) {
+    let math_libraries = system_libraries(t, ["m"])
+    let target_path = math_libraries[0].path
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let alias = file.child_path(dir, "libfoo.so")
+    file.symlink(target_path, alias) catch {
+        e => {
+            t.fatal("symlink: {e}")
+            return
+        }
+    }
+    let dirs = slices.concat([dir], link.system_dirs())
+    let libraries = link.resolve(link.Resolver { dirs }, ["foo"]) catch {
+        e => {
+            t.fatal(link.message(e))
+            return
+        }
+    }
+    t.equal(libraries[0].soname, "libm.so.6")
+    t.equal(libraries[0].path, target_path)
+}
+
+fn test_resolve_missing_library(t: *testing.T) {
+    link.resolve(system_resolver(), ["definitely_not_installed"]) catch {
+        e => {
+            let message = link.message(e)
+            for want in ["definitely_not_installed", "libdefinitely_not_installed.so"] {
+                t.contains(message, want)
+            }
+            return
+        }
+    }
+    t.fatal("resolved a library that does not exist")
+}
+
+fn test_resolve_rejects_non_shared_object(t: *testing.T) {
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let bad = file.child_path(dir, "libbad.so")
+    file.write_text(bad, "not an elf file") catch {
+        e => {
+            t.fatal("write {bad}: {e}")
+            return
+        }
+    }
+    link.resolve(link.Resolver { dirs: [dir] }, ["bad"]) catch {
+        e => {
+            let message = link.message(e)
+            t.contains(message, "not a shared object")
+            return
+        }
+    }
+    t.fatal("resolved a file that is not a shared object")
+}

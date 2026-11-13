@@ -1,0 +1,186 @@
+import amd64
+import asm
+import oracletool
+import target
+import std/file
+import std/slices
+import std/testing
+import std/text
+
+struct ErrorCase {
+    source: str
+    want: str
+}
+
+fn scratch(t: *testing.T) -> str {
+    file.temp_dir("asm-test-") catch {
+        e => {
+            t.fatal("temp dir: {e}")
+            return ""
+        }
+    }
+}
+
+fn assert_matches_as(t: *testing.T, source: str) {
+    oracletool.require(t, "as", oracletool.gnu)
+    let object = asm.assemble(source, asm.Options {}) catch {
+        e => {
+            t.fatal("assemble: {asm.message(e)}")
+            return
+        }
+    }
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let oracle = run_as(dir, source, oracletool.GNUOptions {}) catch {
+        e => {
+            t.fatal("oracle: {oracletool.message(e)}")
+            return
+        }
+    }
+    let c = new_comparison(object, oracle, target.OS.Linux)
+    run_comparison(c)
+    for m in c.mismatches {
+        t.error(m)
+    }
+}
+
+fn test_constant_expressions(t: *testing.T) {
+    assert_matches_as(t, embed("programs/constant_expressions.s"))
+}
+
+fn test_symbol_differences(t: *testing.T) {
+    assert_matches_as(t, embed("programs/symbol_differences.s"))
+}
+
+fn test_text_symbol_difference(t: *testing.T) {
+    assert_matches_as(t, embed("programs/text_symbol_difference.s"))
+}
+
+fn test_macros_conditionals_and_local_labels(t: *testing.T) {
+    assert_matches_as(t, embed("programs/macros_conditionals_local_labels.s"))
+}
+
+fn test_strings_floats_and_fill(t: *testing.T) {
+    assert_matches_as(t, embed("programs/strings_floats_fill.s"))
+}
+
+fn test_incbin(t: *testing.T) {
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let path = file.child_path(dir, "blob.bin")
+    let content: []u8 = [1, 2, 3, 4, 5]
+    file.write_file(path, content) catch {
+        e => {
+            t.fatal("write {path}: {e}")
+            return
+        }
+    }
+    let source = "\n\t.intel_syntax noprefix\n\t.section .rodata\n\t.p2align 4\nblob:\n\t.incbin \"{path}\"\n\t.quad blob\n"
+    assert_matches_as(t, source)
+}
+
+fn incbin_path_names() -> []str {
+    let no_break_space = text.from_char(0xa0)
+    [
+        "C:\\Users\\simon\\blob.bin"
+        "café {no_break_space} 日本.bin"
+        "say \"hi\".bin"
+        "tab\there.bin"
+        "trailing\\"
+    ]
+}
+
+fn incbin_path_case(t: *testing.T, index: i64, name: str) {
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let path = file.child_path(dir, name)
+    let content: []u8 = [u8(index), 1, 2, 3]
+    file.write_file(path, content) catch {
+        e => {
+            let quoted = text.quote(name)
+            t.skip("filesystem rejects {quoted}: {e}")
+            return
+        }
+    }
+    let quoted_path = amd64.quote_string(path)
+    let source = "\t.section .rodata\nblob:\n\t.incbin {quoted_path}\n\t.quad blob\n"
+    let object = asm.assemble(source, asm.Options {}) catch {
+        e => {
+            t.fatal(asm.message(e))
+            return
+        }
+    }
+    var got: []u8 = []
+    for s in object.sections {
+        if s.name == ".rodata" {
+            got = s.data
+        }
+    }
+    if !slices.starts_with(got, content) {
+        t.error("included {got}, want prefix {content}")
+    }
+    assert_matches_as(t, source)
+}
+
+fn test_incbin_paths(t: *testing.T) {
+    for i, name in incbin_path_names() {
+        t.sub("path{i}", fn(st) { incbin_path_case(st, i, name) })
+    }
+}
+
+fn test_incbin_missing_file(t: *testing.T) {
+    let source = "\t.section .rodata\n\n\t.incbin \"/nonexistent/blob.bin\"\n"
+    asm.assemble(source, asm.Options {}) catch {
+        e => {
+            let message = asm.message(e)
+            t.contains(message, "no such file or directory")
+            t.contains(message, "line 3")
+            return
+        }
+    }
+    t.fatal("expected a wrapped not-exist error, got none")
+}
+
+fn error_cases() -> []ErrorCase {
+    [
+        ErrorCase { source: "\t.bogus 1\n", want: "unsupported directive" }
+        ErrorCase { source: "\t.if 1\n", want: "missing .endif" }
+        ErrorCase { source: "\t.macro M\n", want: "missing .endm" }
+        ErrorCase { source: "\t.quad 1b\n", want: "no definition" }
+        ErrorCase { source: "a:\na:\n", want: "already defined" }
+        ErrorCase { source: "\t.section .bss\n\t.quad 1\n", want: "nobits" }
+        ErrorCase { source: "\tmov rax, [rax+rbx+rcx]\n", want: "too many registers" }
+        ErrorCase { source: "\t.quad 1 +\n", want: "unexpected" }
+        ErrorCase { source: "\t.ascii \"open\n", want: "unterminated" }
+        ErrorCase { source: "\t.set X, sym\n", want: "constant" }
+        ErrorCase { source: "\t.section .data\n\tmov rax, rbx\n", want: "non-executable" }
+        ErrorCase { source: "\t.quad 5 / 0\n", want: "division by zero" }
+        ErrorCase { source: "\t.intel_syntax prefix\n", want: "noprefix" }
+        ErrorCase { source: "\t.section .data\n\t.quad a, b - c\n", want: "undefined symbol" }
+    ]
+}
+
+fn error_case_name(c: ErrorCase) -> str {
+    text.quote(c.source)
+}
+
+fn check_error_case(t: *testing.T, c: ErrorCase) {
+    asm.assemble(c.source, asm.Options {}) catch {
+        e => {
+            let message = asm.message(e)
+            if !text.contains(message, c.want) {
+                let quoted = text.quote(c.source)
+                let wanted = text.quote(c.want)
+                t.error("{quoted}: error {message}, want mention of {wanted}")
+            }
+            return
+        }
+    }
+    let quoted = text.quote(c.source)
+    let wanted = text.quote(c.want)
+    t.error("{quoted}: no error, want mention of {wanted}")
+}
+
+fn test_errors(t: *testing.T) {
+    t.table_of(error_cases(), error_case_name, check_error_case)
+}

@@ -1,0 +1,177 @@
+import asm
+import compiler
+import link
+import oracletool
+import target
+import std/file
+import std/process
+import std/slices
+import std/testing
+import std/text
+
+const readobj = "llvm-readobj"
+
+fn readobj_flags() -> []str {
+    ["--file-headers", "--sections", "--coff-imports", "--coff-basereloc"]
+}
+
+fn lld_arguments() -> []str {
+    ["/nologo", "/brepro", "/nodefaultlib", "/entry:start", "/subsystem:console", "/stack:8388608"]
+}
+
+fn link_with_lld(dir: str, source: str) -> []u8 ! oracletool.Error {
+    let object = oracletool.assemble_clang(dir, source)?
+    let output = file.child_path(dir, "lld.exe")
+    let arguments = slices.concat(lld_arguments(), ["/out:{output}", object])
+    oracletool.run_tool("lld-link", arguments)?
+    read_output(output)?
+}
+
+fn link_with_pe(source: str) -> []u8 ! oracletool.Error {
+    let object = asm.assemble(source, compiler.assembler(target.OS.Windows)) catch {
+        e => fail oracletool.Error.Failed("assemble: {asm.message(e)}")
+    }
+    link.pe(object) catch {
+        e => fail oracletool.Error.Failed(link.message(e))
+    }
+}
+
+fn describe_with_readobj(t: *testing.T, dir: str, name: str, image: []u8) -> str {
+    match process.find(readobj) {
+        some(path) => {}
+        none => return ""
+    }
+    let path = file.child_path(dir, name)
+    file.write_file(path, image) catch {
+        e => {
+            t.fatal("write {name}: {e}")
+            return ""
+        }
+    }
+    let arguments = slices.concat(readobj_flags(), [path])
+    let output = process.run(process.command(readobj, arguments), []) catch {
+        e => return "{readobj} failed: {e}"
+    }
+    let report = "{str(output.stdout)}{str(output.stderr)}"
+    if !process.success(output.status) {
+        return "{readobj} failed: {output.status}\n{report}"
+    }
+    text.replace(report, path, name)
+}
+
+fn section_header_text(s: oracletool.PeSection) -> str {
+    "{s.name} virtual size {s.virtual_size} address {s.virtual_address} size {s.size} offset {s.offset} relocations {s.relocations_offset}/{s.relocation_count} line numbers {s.line_numbers_offset}/{s.line_number_count} characteristics {s.characteristics}"
+}
+
+fn same_pe_header(a: oracletool.PeSection, b: oracletool.PeSection) -> bool {
+    a.name == b.name && a.virtual_size == b.virtual_size && a.virtual_address == b.virtual_address && a.size == b.size && a.offset == b.offset && a.relocations_offset == b.relocations_offset && a.line_numbers_offset == b.line_numbers_offset && a.relocation_count == b.relocation_count && a.line_number_count == b.line_number_count && a.characteristics == b.characteristics
+}
+
+fn pe_section_bytes(file_data: oracletool.PeFile, s: oracletool.PeSection) -> []u8 {
+    oracletool.pe_data(file_data, s) catch {
+        e => []
+    }
+}
+
+fn describe_section_difference(got: []u8, want: []u8) -> str {
+    let got_file = oracletool.read_pe(got) catch {
+        e => return "parse linked image: {oracletool.message(e)}"
+    }
+    let want_file = oracletool.read_pe(want) catch {
+        e => return "parse lld image: {oracletool.message(e)}"
+    }
+    if got_file.sections.len != want_file.sections.len {
+        return "{got_file.sections.len} sections, want {want_file.sections.len}"
+    }
+    for i, want_section in want_file.sections {
+        let got_section = got_file.sections[i]
+        if !same_pe_header(got_section, want_section) {
+            let got_text = section_header_text(got_section)
+            let want_text = section_header_text(want_section)
+            return "section {i} header {got_text}, want {want_text}"
+        }
+        let got_data = pe_section_bytes(got_file, got_section)
+        let want_data = pe_section_bytes(want_file, want_section)
+        if !slices.equal(got_data, want_data) {
+            let at = oracletool.first_difference(got_data, want_data)
+            return "section {want_section.name} differs at offset {at}"
+        }
+    }
+    "sections are identical"
+}
+
+fn first_differing_line(got: str, want: str) -> str {
+    let got_lines = text.split(got, '\n')
+    let want_lines = text.split(want, '\n')
+    let shared = if got_lines.len < want_lines.len { got_lines.len } else { want_lines.len }
+    for i in 0..shared {
+        if got_lines[i] != want_lines[i] {
+            let got_quoted = text.quote(got_lines[i])
+            let want_quoted = text.quote(want_lines[i])
+            return "line {i + 1}: got {got_quoted}, want {want_quoted}"
+        }
+    }
+    "line counts differ: got {got_lines.len}, want {want_lines.len}"
+}
+
+fn report_pe_difference(t: *testing.T, dir: str, got: []u8, want: []u8) {
+    let at = oracletool.first_difference(got, want)
+    let section_report = describe_section_difference(got, want)
+    t.error("image differs from lld-link at byte {at} (got {got.len} bytes, want {want.len}): {section_report}")
+    let got_text = describe_with_readobj(t, dir, "pe.exe", got)
+    let want_text = describe_with_readobj(t, dir, "pe.exe", want)
+    if got_text != want_text {
+        let line = first_differing_line(got_text, want_text)
+        t.error("{readobj}: {line}")
+    }
+}
+
+fn run_pe_program(t: *testing.T, program: oracletool.Program) {
+    oracletool.require(t, "clang", oracletool.llvm)
+    oracletool.require(t, "lld-link", oracletool.llvm)
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let generated = oracletool.generate(dir, program.path, target.OS.Windows) catch {
+        e => {
+            t.fatal("compile: {oracletool.message(e)}")
+            return
+        }
+    }
+    let empty: []u8 = []
+    var lld_failure = ""
+    let want = link_with_lld(dir, generated.asm) catch {
+        e => {
+            lld_failure = oracletool.message(e)
+            empty
+        }
+    }
+    var pe_failure = ""
+    let got = link_with_pe(generated.asm) catch {
+        e => {
+            pe_failure = oracletool.message(e)
+            empty
+        }
+    }
+    if lld_failure != "" {
+        if pe_failure == "" {
+            t.fatal("lld-link rejects the program but the PE writer accepts it: {lld_failure}")
+        }
+        return
+    }
+    if pe_failure != "" {
+        t.fatal(pe_failure)
+        return
+    }
+    if slices.equal(got, want) {
+        return
+    }
+    report_pe_difference(t, dir, got, want)
+}
+
+fn pe_oracle_tests(programs: []oracletool.Program) -> []testing.Test {
+    var tests: []testing.Test = []
+    for program in programs {
+        push(mut tests, testing.Test { name: "pe_matches_lld/{program.name}", run: fn(t) { run_pe_program(t, program) } })
+    }
+    tests
+}

@@ -1,0 +1,448 @@
+import asm
+import compiler
+import link
+import oracletool
+import target
+import std/file
+import std/maps
+import std/os
+import std/process
+import std/slices
+import std/testing
+import std/text
+
+const unwind_section = ".eh_frame"
+const header_load_limit = 0x401000
+
+fn contents_sections() -> []str {
+    [".hash", ".gnu.hash", ".rela.dyn", ".rela.plt", ".plt", ".plt.got", ".text", ".rodata", ".got", ".got.plt", ".data"]
+}
+
+fn link_dynamic_with_ld(dir: str, source: str, libraries: []str) -> []u8 ! oracletool.Error {
+    let options = oracletool.GNUOptions { align_branches: true, linkable: true }
+    let object = oracletool.assemble_gnu(dir, source, options)?
+    let output = file.child_path(dir, "main.ld")
+    var args: []str = ["-o", output, "-dynamic-linker", link.interpreter, object]
+    for name in libraries {
+        if name != "c" {
+            push(mut args, "-l{name}")
+        }
+    }
+    push(mut args, "-lc")
+    oracletool.run_tool("ld", args)?
+    read_output(output)?
+}
+
+fn import_order(data: []u8) -> []str ! oracletool.Error {
+    let elf = oracletool.read_elf(data)?
+    let symbols = oracletool.elf_dynamic_symbols(elf)?
+    var names: []str = []
+    for sym in symbols {
+        push(mut names, sym.name)
+    }
+    names
+}
+
+fn order_imports(object: asm.Object, names: []str) -> asm.Object {
+    var rank: [str: i64] = [:]
+    for i, name in names {
+        rank[name] = i
+    }
+    var slots: []i64 = []
+    var moved: []asm.Symbol = []
+    for i, sym in object.symbols {
+        if maps.has(rank, sym.name) && sym.section == asm.section_undefined {
+            push(mut slots, i)
+            push(mut moved, sym)
+        }
+    }
+    slices.sort_by(mut moved, fn(a, b) { (rank[a.name] ?? 0) < (rank[b.name] ?? 0) })
+    var ordered = object
+    for i, slot in slots {
+        ordered.symbols[slot] = moved[i]
+    }
+    ordered
+}
+
+fn link_dynamic_in_process(source: str, libraries: []str, order: []str) -> []u8 ! oracletool.Error {
+    let assembled = asm.assemble(source, compiler.assembler(target.OS.Linux)) catch {
+        e => fail oracletool.Error.Failed("assemble: {asm.message(e)}")
+    }
+    let object = order_imports(assembled, order)
+    let resolver = link.Resolver { dirs: link.system_dirs() }
+    let resolved = link.resolve(resolver, libraries) catch {
+        e => fail oracletool.Error.Failed(link.message(e))
+    }
+    let image = link.dynamic(object, resolved) catch {
+        e => fail oracletool.Error.Failed(link.message(e))
+    }
+    image.bytes
+}
+
+fn link_name(file_sections: oracletool.ElfFile, index: i64) -> str {
+    oracletool.elf_section_name(file_sections, index)
+}
+
+fn without_unwind(sections: []oracletool.ElfSection) -> []oracletool.ElfSection {
+    var kept: []oracletool.ElfSection = []
+    for s in sections {
+        if s.name != unwind_section {
+            push(mut kept, s)
+        }
+    }
+    kept
+}
+
+fn compare_dynamic_programs(t: *testing.T, got: oracletool.ElfFile, want: oracletool.ElfFile) {
+    if got.progs.len != want.progs.len {
+        t.error("program headers: got {got.progs.len}, want {want.progs.len}")
+        return
+    }
+    var header_load = true
+    for i, w in want.progs {
+        var g = got.progs[i]
+        var expected = w
+        if w.kind == oracletool.pt_load && header_load {
+            header_load = false
+            g.filesz = 0
+            g.memsz = 0
+            expected.filesz = 0
+            expected.memsz = 0
+        }
+        if !same_prog(g, expected) {
+            let got_text = prog_text(got.progs[i])
+            let want_text = prog_text(w)
+            t.error("program header {i}: got {got_text}, want {want_text}")
+        }
+    }
+}
+
+fn in_header_segment(want: oracletool.ElfFile, s: oracletool.ElfSection) -> bool {
+    for p in want.progs {
+        if p.kind == oracletool.pt_load {
+            return s.addr >= p.vaddr && s.addr < p.vaddr + p.memsz && s.addr < header_load_limit
+        }
+    }
+    false
+}
+
+fn same_section_identity(a: oracletool.ElfSection, b: oracletool.ElfSection) -> bool {
+    a.name == b.name && a.kind == b.kind && a.flags == b.flags && a.addralign == b.addralign && a.entsize == b.entsize
+}
+
+fn compare_dynamic_section(t: *testing.T, got_file: oracletool.ElfFile, want_file: oracletool.ElfFile, got: oracletool.ElfSection, want: oracletool.ElfSection) {
+    if !same_section_identity(got, want) {
+        let got_text = section_text(got)
+        let want_text = section_text(want)
+        t.error("section {want.name}: got {got_text}, want {want_text}")
+        return
+    }
+    let got_link = link_name(got_file, got.linked)
+    let want_link = link_name(want_file, want.linked)
+    if got_link != want_link {
+        t.error("section {want.name}: links to {got_link}, want {want_link}")
+    }
+    if want.flags & oracletool.shf_info_link != 0 {
+        let got_info = link_name(got_file, got.info)
+        let want_info = link_name(want_file, want.info)
+        if got_info != want_info {
+            t.error("section {want.name}: info names {got_info}, want {want_info}")
+        }
+    }
+    if want.flags & oracletool.shf_alloc == 0 {
+        return
+    }
+    if want.name != ".dynstr" && got.size != want.size {
+        let got_size = oracletool.hex_text(got.size)
+        let want_size = oracletool.hex_text(want.size)
+        t.error("section {want.name}: size {got_size}, want {want_size}")
+    }
+    if in_header_segment(want_file, want) {
+        return
+    }
+    if got.addr != want.addr || got.offset != want.offset {
+        let got_addr = oracletool.hex_text(got.addr)
+        let got_offset = oracletool.hex_text(got.offset)
+        let want_addr = oracletool.hex_text(want.addr)
+        let want_offset = oracletool.hex_text(want.offset)
+        t.error("section {want.name}: at {got_addr}/{got_offset}, want {want_addr}/{want_offset}")
+    }
+}
+
+fn compare_dynamic_sections(t: *testing.T, got: oracletool.ElfFile, want: oracletool.ElfFile) {
+    let got_sections = without_unwind(got.sections)
+    let want_sections = without_unwind(want.sections)
+    if got_sections.len != want_sections.len {
+        t.error("sections: got {got_sections.len}, want {want_sections.len}")
+        return
+    }
+    for i, w in want_sections {
+        compare_dynamic_section(t, got, want, got_sections[i], w)
+    }
+}
+
+fn is_exact_tag(tag: i64) -> bool {
+    tag == oracletool.dt_pltgot || tag == oracletool.dt_debug || tag == oracletool.dt_syment || tag == oracletool.dt_pltrel || tag == oracletool.dt_pltrelsz || tag == oracletool.dt_relasz || tag == oracletool.dt_relaent || tag == oracletool.dt_verneednum
+}
+
+fn read_tags(t: *testing.T, file_data: oracletool.ElfFile) -> []oracletool.ElfTag {
+    oracletool.elf_tags(file_data) catch {
+        e => {
+            t.fatal("read .dynamic: {oracletool.message(e)}")
+            return []
+        }
+    }
+}
+
+fn read_needed(t: *testing.T, file_data: oracletool.ElfFile) -> []str {
+    oracletool.elf_needed(file_data) catch {
+        e => {
+            t.fatal("read needed libraries: {oracletool.message(e)}")
+            return []
+        }
+    }
+}
+
+fn compare_tags(t: *testing.T, got_file: oracletool.ElfFile, want_file: oracletool.ElfFile) {
+    let got = read_tags(t, got_file)
+    let want = read_tags(t, want_file)
+    if got.len != want.len {
+        t.error("dynamic tags: got {got.len}, want {want.len}")
+        return
+    }
+    for i, w in want {
+        let g = got[i]
+        if g.tag != w.tag || is_exact_tag(w.tag) && g.value != w.value {
+            let got_value = oracletool.hex_text(g.value)
+            let want_value = oracletool.hex_text(w.value)
+            t.error("dynamic tag {i}: got {g.tag} {got_value}, want {w.tag} {want_value}")
+        }
+    }
+    let got_needed = read_needed(t, got_file)
+    let want_needed = read_needed(t, want_file)
+    if !slices.equal(got_needed, want_needed) {
+        let got_names = text.join(got_needed, " ")
+        let want_names = text.join(want_needed, " ")
+        t.error("needed libraries: got [{got_names}], want [{want_names}]")
+    }
+}
+
+fn same_dynamic_symbol(a: oracletool.ElfDynamicSymbol, b: oracletool.ElfDynamicSymbol) -> bool {
+    a.name == b.name && a.info == b.info && a.shndx == b.shndx && a.version == b.version && a.library == b.library
+}
+
+fn dynamic_symbol_text(s: oracletool.ElfDynamicSymbol) -> str {
+    "{s.name} info {s.info} section {s.shndx} version {s.version} library {s.library}"
+}
+
+fn read_dynamic_symbols(t: *testing.T, what: str, file_data: oracletool.ElfFile) -> []oracletool.ElfDynamicSymbol {
+    oracletool.elf_dynamic_symbols(file_data) catch {
+        e => {
+            t.fatal("read {what}: {oracletool.message(e)}")
+            return []
+        }
+    }
+}
+
+fn compare_imports(t: *testing.T, got_file: oracletool.ElfFile, want_file: oracletool.ElfFile) {
+    let got = read_dynamic_symbols(t, "dynamic symbols", got_file)
+    let want = read_dynamic_symbols(t, "ld dynamic symbols", want_file)
+    if got.len != want.len {
+        t.error("dynamic symbols: got {got.len}, want {want.len}")
+        return
+    }
+    for i, w in want {
+        if !same_dynamic_symbol(got[i], w) {
+            let got_text = dynamic_symbol_text(got[i])
+            let want_text = dynamic_symbol_text(w)
+            t.error("dynamic symbol {i}: got {got_text}, want {want_text}")
+        }
+    }
+}
+
+fn section_bytes(t: *testing.T, file_data: oracletool.ElfFile, s: oracletool.ElfSection) -> []u8 {
+    oracletool.elf_data(file_data, s) catch {
+        e => {
+            t.fatal("read {s.name}: {oracletool.message(e)}")
+            return []
+        }
+    }
+}
+
+fn compare_contents(t: *testing.T, got_file: oracletool.ElfFile, want_file: oracletool.ElfFile) {
+    for name in contents_sections() {
+        let want = oracletool.elf_section(want_file, name)
+        let got = oracletool.elf_section(got_file, name)
+        match want {
+            some(w) => match got {
+                some(g) => {
+                    let want_data = section_bytes(t, want_file, w)
+                    let got_data = section_bytes(t, got_file, g)
+                    if !slices.equal(got_data, want_data) {
+                        let at = oracletool.first_difference(got_data, want_data)
+                        t.error("section {name} differs from ld at byte {at}")
+                    }
+                }
+                none => t.error("section {name} present in only one output")
+            }
+            none => match got {
+                some(g) => t.error("section {name} present in only one output")
+                none => {}
+            }
+        }
+    }
+}
+
+fn compare_dynamic_executables(t: *testing.T, got_bytes: []u8, want_bytes: []u8) {
+    let got = parse_elf(t, "linked output", got_bytes)
+    let want = parse_elf(t, "ld output", want_bytes)
+    compare_header(t, got, want)
+    compare_dynamic_programs(t, got, want)
+    compare_dynamic_sections(t, got, want)
+    compare_tags(t, got, want)
+    compare_imports(t, got, want)
+    compare_contents(t, got, want)
+    compare_symbols_ignoring_files(t, got, want)
+}
+
+fn run_dynamic_program(t: *testing.T, program: oracletool.Program) {
+    oracletool.require(t, "as", oracletool.gnu)
+    oracletool.require(t, "ld", oracletool.gnu)
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let generated = oracletool.generate(dir, program.path, target.OS.Linux) catch {
+        e => {
+            t.fatal("compile: {oracletool.message(e)}")
+            return
+        }
+    }
+    let want = link_dynamic_with_ld(dir, generated.asm, generated.libraries) catch {
+        e => {
+            t.fatal(oracletool.message(e))
+            return
+        }
+    }
+    let order = import_order(want) catch {
+        e => {
+            t.fatal(oracletool.message(e))
+            return
+        }
+    }
+    let got = link_dynamic_in_process(generated.asm, generated.libraries, order) catch {
+        e => {
+            t.fatal(oracletool.message(e))
+            return
+        }
+    }
+    compare_dynamic_executables(t, got, want)
+}
+
+fn bound_symbols(log: str, binary: str) -> [str: bool] {
+    let prefix = "binding file {binary} ["
+    var bound: [str: bool] = [:]
+    for line in text.lines(log) {
+        let first = text.cut(line, prefix)
+        if !first.found {
+            continue
+        }
+        let second = text.cut(first.after, "symbol `")
+        if !second.found {
+            continue
+        }
+        let third = text.cut(second.after, "'")
+        if third.found {
+            bound[third.before] = true
+        }
+    }
+    bound
+}
+
+fn check_libraries_resolve(t: *testing.T, binary: str) {
+    let output = process.run(process.command("ldd", [binary]), []) catch {
+        e => {
+            t.fatal("ldd: {e}")
+            return
+        }
+    }
+    let report = "{str(output.stdout)}{str(output.stderr)}"
+    if !process.success(output.status) {
+        t.fatal("ldd: {output.status}\n{report}")
+        return
+    }
+    if text.contains(report, "not found") {
+        t.error("ldd reports a missing library:\n{report}")
+    }
+}
+
+fn check_every_import_binds(t: *testing.T, binary: str, data: []u8) {
+    let imports = import_order(data) catch {
+        e => {
+            t.fatal(oracletool.message(e))
+            return
+        }
+    }
+    var environment = os.environment()
+    environment["LD_BIND_NOW"] = "1"
+    environment["LD_DEBUG"] = "bindings"
+    let command = process.Command { program: binary, env: environment }
+    let output = process.run(command, []) catch {
+        e => {
+            t.fatal("run {binary}: {e}")
+            return
+        }
+    }
+    let bound = bound_symbols(str(output.stderr), binary)
+    for name in imports {
+        if name != "" && !maps.has(bound, name) {
+            t.error("imported symbol {name} was not bound by the loader")
+        }
+    }
+}
+
+fn run_dynamic_load(t: *testing.T, program: oracletool.Program) {
+    match process.find("ldd") {
+        some(path) => {}
+        none => {
+            t.skip("ldd is not on PATH")
+            return
+        }
+    }
+    if !file.exists(link.interpreter) {
+        t.skip("no dynamic loader at {link.interpreter}")
+        return
+    }
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let generated = oracletool.generate(dir, program.path, target.OS.Linux) catch {
+        e => {
+            t.fatal("compile: {oracletool.message(e)}")
+            return
+        }
+    }
+    let data = link_dynamic_in_process(generated.asm, generated.libraries, []) catch {
+        e => {
+            t.fatal(oracletool.message(e))
+            return
+        }
+    }
+    let binary = file.child_path(dir, "main.low")
+    file.write_file_mode(binary, data, 0o755) catch {
+        e => {
+            t.fatal("write {binary}: {e}")
+            return
+        }
+    }
+    check_libraries_resolve(t, binary)
+    check_every_import_binds(t, binary, data)
+}
+
+fn dynamic_oracle_tests(programs: []oracletool.Program) -> []testing.Test {
+    var tests: []testing.Test = []
+    for program in programs {
+        push(mut tests, testing.Test { name: "dynamic_matches_gnu_ld/{program.name}", run: fn(t) { run_dynamic_program(t, program) } })
+    }
+    for program in programs {
+        push(mut tests, testing.Test { name: "dynamic_programs_load/{program.name}", run: fn(t) { run_dynamic_load(t, program) } })
+    }
+    tests
+}
