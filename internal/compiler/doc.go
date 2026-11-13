@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -9,13 +10,21 @@ import (
 	"strings"
 
 	"lowlang/internal/ast"
+	"lowlang/internal/fixture"
 	"lowlang/internal/target"
 )
 
 type ModuleDoc struct {
-	Path    string      `json:"path"`
-	Imports []ImportDoc `json:"imports"`
-	Items   []ItemDoc   `json:"items"`
+	Path     string       `json:"path"`
+	Imports  []ImportDoc  `json:"imports"`
+	Items    []ItemDoc    `json:"items"`
+	Examples []ExampleDoc `json:"examples"`
+}
+
+type ExampleDoc struct {
+	Name   string `json:"name"`
+	Source string `json:"source"`
+	Output string `json:"output"`
 }
 
 type ImportDoc struct {
@@ -60,6 +69,9 @@ func (d documenter) walk(base string) ([]ModuleDoc, error) {
 		if !entry.IsDir() {
 			return nil
 		}
+		if entry.Name() == examplesDir {
+			return fs.SkipDir
+		}
 		module, found, err := d.module(dir)
 		if err != nil {
 			return err
@@ -91,7 +103,11 @@ func (d documenter) module(dir string) (ModuleDoc, bool, error) {
 	if len(files) == 0 {
 		return ModuleDoc{}, false, nil
 	}
-	module := ModuleDoc{Path: dir, Imports: []ImportDoc{}, Items: []ItemDoc{}}
+	examples, err := d.examples(dir)
+	if err != nil {
+		return ModuleDoc{}, false, err
+	}
+	module := ModuleDoc{Path: dir, Imports: []ImportDoc{}, Items: []ItemDoc{}, Examples: examples}
 	if dir == "." {
 		module.Path = ""
 	}
@@ -103,6 +119,42 @@ func (d documenter) module(dir string) (ModuleDoc, bool, error) {
 	module.Imports = slices.Compact(module.Imports)
 	slices.SortStableFunc(module.Items, func(a, b ItemDoc) int { return strings.Compare(a.Name, b.Name) })
 	return module, true, nil
+}
+
+func (d documenter) examples(dir string) ([]ExampleDoc, error) {
+	examples := []ExampleDoc{}
+	folder := path.Join(dir, examplesDir)
+	entries, err := fs.ReadDir(d.fsys, folder)
+	if errors.Is(err, fs.ErrNotExist) {
+		return examples, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), fixture.SourceExt) {
+			continue
+		}
+		example, err := d.example(folder, entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		examples = append(examples, example)
+	}
+	return examples, nil
+}
+
+func (d documenter) example(folder, name string) (ExampleDoc, error) {
+	source, err := fs.ReadFile(d.fsys, path.Join(folder, name))
+	if err != nil {
+		return ExampleDoc{}, err
+	}
+	base := fixture.Base(name)
+	output, err := fs.ReadFile(d.fsys, path.Join(folder, base+fixture.StdoutExt))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return ExampleDoc{}, err
+	}
+	return ExampleDoc{Name: base, Source: string(source), Output: string(output)}, nil
 }
 
 func publicTypes(files []*ast.File) map[string]bool {
