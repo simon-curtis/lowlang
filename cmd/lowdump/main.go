@@ -9,13 +9,14 @@ import (
 	"lowlang/internal/diag"
 	"lowlang/internal/lexer"
 	"lowlang/internal/parser"
-	"lowlang/internal/target"
 )
 
 const usage = `usage:
   lowdump tokens [-privileged] <file.low>
   lowdump ast [-privileged] <file.low>
-  lowdump check [-windows] <file.low|dir>`
+  lowdump check [-windows] <file.low|dir>
+  lowdump ir [-windows] [-unoptimised] <file.low|dir>
+  lowdump asm [-windows] <file.low|dir>`
 
 func main() {
 	out := bufio.NewWriter(os.Stdout)
@@ -33,12 +34,14 @@ func run(out io.Writer, args []string) error {
 	}
 	privileged := args[1] == "-privileged"
 	path := args[len(args)-1]
-	if args[0] == "check" {
-		platform := target.Linux
-		if args[1] == "-windows" {
-			platform = target.Windows
-		}
-		return dumpCheckCommand(out, path, platform)
+	flags := args[1 : len(args)-1]
+	switch args[0] {
+	case "check":
+		return dumpCheckCommand(out, path, platformOf(flags))
+	case "ir":
+		return dumpIRCommand(out, path, flags)
+	case "asm":
+		return dumpAsmCommand(out, path, flags)
 	}
 	src, err := os.ReadFile(path)
 	if err != nil {
