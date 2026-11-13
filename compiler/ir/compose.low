@@ -1,0 +1,372 @@
+import ast
+import lexer
+import prelude
+import std/slices
+import types
+
+pub struct Segment {
+    pub expr: ast.Expr
+    pub render: *ast.Func? = none
+    pub spec: *ast.Spec? = none
+}
+
+pub struct Piece {
+    pub text: str = ""
+    pub words: []*Value = []
+    pub has_words: bool = false
+    pub typ: *types.Type? = none
+    pub render: *ast.Func? = none
+    pub spec: *ast.Spec? = none
+}
+
+fn formatted(b: *Builder, p: Piece) -> bool {
+    if !p.has_words {
+        return false
+    }
+    p.typ != b.u.str || p.spec != none
+}
+
+fn unbounded(p: Piece) -> bool {
+    var derived = false
+    match p.render {
+        some(render) => { derived = render.derived }
+        none => {}
+    }
+    var custom = false
+    match p.spec {
+        some(spec) => { custom = spec.format != none }
+        none => {}
+    }
+    derived || custom
+}
+
+fn padding(p: Piece) -> i64 {
+    match p.spec {
+        some(spec) => {
+            if spec.width < 0 {
+                return -spec.width
+            }
+            spec.width
+        }
+        none => 0
+    }
+}
+
+fn rendered_size(b: *Builder, t: *types.Type) -> i64 {
+    if t == b.u.bool {
+        return 5
+    }
+    if types.is_float(t) {
+        return 25
+    }
+    if types.is_integer(t) {
+        return 20
+    }
+    32
+}
+
+pub fn flatten(e: ast.Expr, render: *ast.Func?, spec: *ast.Spec?) -> []Segment {
+    var out: []Segment = []
+    flatten_into(e, render, spec, mut out)
+    out
+}
+
+fn flatten_into(e: ast.Expr, render: *ast.Func?, spec: *ast.Spec?, mut out: []Segment) {
+    if spec != none {
+        push(mut out, Segment { expr: e, render, spec })
+        return
+    }
+    match e {
+        Interp(n) => {
+            for part in n.parts {
+                flatten_into(part.x, part.render, part.spec, mut out)
+            }
+            return
+        }
+        Binary(n) => {
+            if n.op == lexer.Kind.Plus && is_string(typ(n.x)) {
+                flatten_into(n.x, none, none, mut out)
+                flatten_into(n.y, none, none, mut out)
+                return
+            }
+        }
+        _ => {}
+    }
+    push(mut out, Segment { expr: e, render })
+}
+
+fn is_string(t: *types.Type) -> bool {
+    t.kind == StrKind
+}
+
+fn append_text(mut pieces: []Piece, text: str) {
+    if text == "" {
+        return
+    }
+    if pieces.len > 0 && !pieces[pieces.len - 1].has_words {
+        var last = pieces[pieces.len - 1]
+        last.text = "{last.text}{text}"
+        pieces[pieces.len - 1] = last
+        return
+    }
+    push(mut pieces, Piece { text })
+}
+
+fn pieces_of(b: *Builder, parts: []Segment) -> []Piece {
+    var out: []Piece = []
+    for part in parts {
+        match part.expr {
+            StrLit(lit) => {
+                if part.spec == none {
+                    append_text(mut out, lit.value)
+                    continue
+                }
+            }
+            _ => {}
+        }
+        let t = typ(part.expr)
+        let words = value(b, part.expr, t)
+        push(mut out, Piece { words, has_words: true, typ: t, render: part.render, spec: part.spec })
+    }
+    out
+}
+
+fn composed_size(b: *Builder, pieces: []Piece) -> *Value {
+    var fixed = 0
+    var lengths: []*Value = []
+    for p in pieces {
+        if !p.has_words {
+            fixed += p.text.len
+            continue
+        }
+        let t = types.must(p.typ)
+        if t == b.u.str {
+            push(mut lengths, p.words[1])
+            fixed += padding(p)
+        } else {
+            fixed += rendered_size(b, t) + padding(p)
+        }
+    }
+    var total = constant(b, fixed)
+    for n in lengths {
+        total = count(b, OpAdd, total, n)
+    }
+    total
+}
+
+pub fn compose(b: *Builder, parts: []Segment) -> []*Value {
+    let pieces = pieces_of(b, parts)
+    compose_pieces(b, pieces)
+}
+
+pub fn compose_pieces(b: *Builder, pieces: []Piece) -> []*Value {
+    let total = composed_size(b, pieces)
+    let zero = constant(b, 0)
+    let data = runtime(b, RtGrow, [zero, zero, total, zero]) ?? panic("grow without a result")
+    for p in pieces {
+        if formatted(b, p) {
+            return compose_formatted(b, pieces, data, total)
+        }
+    }
+    var position = zero
+    for p in pieces {
+        let part = source(b, p)
+        let end = emit(b, OpAdd, [data, position])
+        runtime(b, RtMemmove, [end, part.src, part.len])
+        position = count(b, OpAdd, position, part.len)
+    }
+    [data, position]
+}
+
+struct Source {
+    src: *Value
+    len: *Value
+}
+
+fn source(b: *Builder, p: Piece) -> Source {
+    if p.has_words {
+        return Source { src: p.words[0], len: p.words[1] }
+    }
+    let text = emit(b, OpString, [])
+    text.str = p.text
+    text.scalar = true
+    let length = constant(b, p.text.len)
+    Source { src: text, len: length }
+}
+
+fn any_unbounded(pieces: []Piece) -> bool {
+    for p in pieces {
+        if unbounded(p) {
+            return true
+        }
+    }
+    false
+}
+
+fn compose_formatted(b: *Builder, pieces: []Piece, data: *Value, total: *Value) -> []*Value {
+    let held = slot(b, 3)
+    let zero = constant(b, 0)
+    store_words(b, Place { addr: held }, [data, zero, total])
+    let checked = any_unbounded(pieces)
+    for p in pieces {
+        if formatted(b, p) {
+            append_formatted(b, held, p)
+            continue
+        }
+        let part = source(b, p)
+        if checked {
+            call_named(b, prelude.append_str, [held, part.src, part.len])
+            continue
+        }
+        let buf = load_words(b, Place { addr: held }, b.u.str)
+        let end = emit(b, OpAdd, [buf[0], buf[1]])
+        runtime(b, RtMemmove, [end, part.src, part.len])
+        let grown = count(b, OpAdd, buf[1], part.len)
+        store_words(b, place_at(Place { addr: held }, 1), [grown])
+    }
+    load_words(b, Place { addr: held }, b.u.str)
+}
+
+fn append_formatted(b: *Builder, held: *Value, p: Piece) {
+    let spec = p.spec ?? return append_value(b, held, p)
+    if spec.width == 0 {
+        append_value(b, held, p)
+        return
+    }
+    let buffer = load_words(b, Place { addr: held }, b.u.str)
+    append_value(b, held, p)
+    let width = constant(b, spec.width)
+    call_named(b, prelude.align, [held, buffer[1], width])
+}
+
+fn append_value(b: *Builder, held: *Value, p: Piece) {
+    let words = p.words
+    match p.spec {
+        some(spec) => {
+            if spec.format != none {
+                append_number(b, held, p, spec)
+                return
+            }
+        }
+        none => {}
+    }
+    if p.typ == b.u.str {
+        call_named(b, prelude.append_str, [held, words[0], words[1]])
+        return
+    }
+    let render = p.render ?? panic("piece without a renderer")
+    render_into(b, render, held, words)
+}
+
+fn flag_word(b: *Builder, on: bool) -> *Value {
+    if on {
+        return constant(b, 1)
+    }
+    constant(b, 0)
+}
+
+fn append_number(b: *Builder, held: *Value, p: Piece, spec: *ast.Spec) {
+    let f = spec.format ?? panic("number without a format")
+    let words = p.words
+    let t = types.must(p.typ)
+    let number = words[0]
+    if f.kind == ast.decimal_format {
+        let unsigned = flag_word(b, !t.signed)
+        let precision = constant(b, f.precision)
+        call_named(b, prelude.append_decimal, [held, number, unsigned, precision])
+        return
+    }
+    if f.kind == ast.hex_format || f.kind == ast.upper_hex_format || f.kind == ast.binary_format {
+        var shift = 4
+        if f.kind == ast.binary_format {
+            shift = 1
+        }
+        let upper = f.kind == ast.upper_hex_format
+        let bits = constant(b, t.bits)
+        let step = constant(b, shift)
+        let capital = flag_word(b, upper)
+        let precision = constant(b, f.precision)
+        call_named(b, prelude.append_radix, [held, number, bits, step, capital, precision])
+        return
+    }
+    append_layout(b, held, p, f)
+}
+
+struct DecimalLayout {
+    scientific: bool = false
+    int_min: i64 = 0
+    frac_min: i64 = 0
+    frac_max: i64 = 0
+    group: bool = false
+}
+
+fn layout_of(f: *ast.Format, t: *types.Type) -> DecimalLayout {
+    if f.kind == ast.picture_format {
+        return DecimalLayout { int_min: f.min_int, frac_min: f.min_frac, frac_max: f.max_frac, group: f.group }
+    }
+    var precision = f.precision
+    if !f.explicit {
+        precision = default_precision(f.kind, t)
+    }
+    DecimalLayout { scientific: f.kind == ast.scientific_format, int_min: 1, frac_min: precision, frac_max: precision, group: f.kind == ast.grouped_format }
+}
+
+fn default_precision(kind: u8, t: *types.Type) -> i64 {
+    if kind == ast.scientific_format {
+        return 6
+    }
+    if kind == ast.grouped_format && types.is_integer(t) {
+        return 0
+    }
+    2
+}
+
+fn append_layout(b: *Builder, held: *Value, p: Piece, f: *ast.Format) {
+    let t = types.must(p.typ)
+    let words = p.words
+    let l = layout_of(f, t)
+    var args: []*Value = [held, words[0]]
+    var name = prelude.append_float_layout
+    if t == b.u.f32 {
+        args[1] = convert(b, words[0], b.u.f32, b.u.f64)
+    } else if types.is_integer(t) {
+        name = prelude.append_int_layout
+        let unsigned = flag_word(b, !t.signed)
+        push(mut args, unsigned)
+    }
+    let scientific = flag_word(b, l.scientific)
+    let int_min = constant(b, l.int_min)
+    let frac_min = constant(b, l.frac_min)
+    let frac_max = constant(b, l.frac_max)
+    let group = flag_word(b, l.group)
+    for extra in [scientific, int_min, frac_min, frac_max, group] {
+        push(mut args, extra)
+    }
+    call_named(b, name, args)
+}
+
+pub fn empty_slice(b: *Builder) -> *Value {
+    let zero = constant(b, 0)
+    let held = slot(b, 3)
+    store_words(b, Place { addr: held }, [zero, zero, zero])
+    held
+}
+
+pub fn render_into(b: *Builder, render: *ast.Func, buffer: *Value, words: []*Value) {
+    var args: []*Value = [buffer]
+    if render.derived {
+        let path = empty_slice(b)
+        push(mut args, path)
+    }
+    for w in words {
+        push(mut args, w)
+    }
+    let target = b.funcs[render] ?? panic("renderer {render.name} was not built")
+    invoke(b, target, args)
+}
+
+pub fn render_string(b: *Builder, render: *ast.Func, words: []*Value) -> []*Value {
+    let buffer = empty_slice(b)
+    render_into(b, render, buffer, words)
+    load_words(b, Place { addr: buffer }, b.u.str)
+}

@@ -1,0 +1,154 @@
+import ast
+import lexer
+import std/slices
+import types
+
+pub const linear_switch_max = 3
+pub const min_table_cases = 12
+pub const min_tree_cases = 48
+pub const max_table_span = 4096
+pub const max_table_sparsity = 3
+
+pub struct SwitchCase {
+    pub key: i64
+    pub target: *Block
+}
+
+pub struct SwitchPlan {
+    pub typ: *types.Type? = none
+    pub cases: []SwitchCase = []
+}
+
+struct ArmKey {
+    key: i64
+    typ: *types.Type
+}
+
+pub fn switch_of(u: *types.Universe, arms: []*ast.Arm, targets: []*Block) -> *SwitchPlan? {
+    let keyed = arms[..arms.len - 1]
+    if keyed.len < min_table_cases {
+        return none
+    }
+    let plan = new(SwitchPlan {})
+    for i, arm in keyed {
+        let found = arm_key(u, arm.pattern) ?? return none
+        let previous = plan.typ ?? found.typ
+        if found.typ != previous {
+            return none
+        }
+        plan.typ = found.typ
+        push(mut plan.cases, SwitchCase { key: found.key, target: targets[i] })
+    }
+    sort_by_key(plan)
+    for i in 1..plan.cases.len {
+        if plan.cases[i].key == plan.cases[i - 1].key {
+            return none
+        }
+    }
+    if !dense(plan) && plan.cases.len < min_tree_cases {
+        return none
+    }
+    plan
+}
+
+pub fn sort_by_key(p: *SwitchPlan) {
+    slices.sort_by(mut p.cases, fn(a: SwitchCase, b: SwitchCase) -> bool { a.key < b.key })
+}
+
+fn arm_key(u: *types.Universe, p: *ast.Pattern) -> ArmKey? {
+    match p.test {
+        none => {
+            let variant = p.variant ?? return none
+            return ArmKey { key: variant.tag, typ: u.i64 }
+        }
+        some(test) => {
+            match test {
+                Binary(binary) => {
+                    if binary.op != lexer.Kind.Eq {
+                        return none
+                    }
+                    match binary.x {
+                        Subject(_) => {}
+                        _ => return none
+                    }
+                    match ast.literal(binary.y) {
+                        IntLit(lit) => {
+                            let subject_type = ast.type_of(binary.x) ?? return none
+                            if subject_type.kind != IntKind || !types.holds(subject_type, lit.value) {
+                                return none
+                            }
+                            return ArmKey { key: lit.value, typ: subject_type }
+                        }
+                        _ => return none
+                    }
+                }
+                _ => return none
+            }
+        }
+    }
+}
+
+fn span_of(p: *SwitchPlan) -> i64 {
+    p.cases[p.cases.len - 1].key - p.cases[0].key + 1
+}
+
+pub fn dense(p: *SwitchPlan) -> bool {
+    let count = p.cases.len
+    let span = span_of(p)
+    count >= min_table_cases && span >= 0 && span <= max_table_span && span <= max_table_sparsity * count
+}
+
+pub fn lower_switch(b: *Builder, plan: *SwitchPlan, subject: *Value, fallback: *Block) {
+    if dense(plan) {
+        jump_table(b, plan, subject, fallback)
+        return
+    }
+    search(b, plan, subject, plan.cases, fallback)
+}
+
+fn jump_table(b: *Builder, plan: *SwitchPlan, subject: *Value, fallback: *Block) {
+    let low = plan.cases[0].key
+    let table = new(JumpTable { low })
+    for _ in 0..span_of(plan) {
+        push(mut table.cases, 0)
+    }
+    b.cur.kind = Switch
+    b.cur.control = subject
+    b.cur.table = table
+    link(b.cur, fallback)
+    for i, c in plan.cases {
+        table.cases[c.key - low] = i + 1
+        link(b.cur, c.target)
+    }
+}
+
+fn search(b: *Builder, plan: *SwitchPlan, subject: *Value, cases: []SwitchCase, fallback: *Block) {
+    if cases.len <= linear_switch_max {
+        probe(b, plan, subject, cases, fallback)
+        return
+    }
+    let mid = cases.len / 2
+    let below = fresh_block(b)
+    let at_least = fresh_block(b)
+    let pivot = constant(b, cases[mid].key)
+    let less = typed(b, OpLt, plan.typ, [subject, pivot])
+    branch(b, less, below, at_least)
+    enter(b, below)
+    search(b, plan, subject, cases[..mid], fallback)
+    enter(b, at_least)
+    search(b, plan, subject, cases[mid..], fallback)
+}
+
+fn probe(b: *Builder, plan: *SwitchPlan, subject: *Value, cases: []SwitchCase, fallback: *Block) {
+    for i, c in cases {
+        let key = constant(b, c.key)
+        let same = typed(b, OpEq, plan.typ, [subject, key])
+        if i == cases.len - 1 {
+            branch(b, same, c.target, fallback)
+            return
+        }
+        let next = fresh_block(b)
+        branch(b, same, c.target, next)
+        enter(b, next)
+    }
+}

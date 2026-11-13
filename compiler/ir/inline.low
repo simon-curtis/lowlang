@@ -1,0 +1,316 @@
+import std/math
+import std/slices
+import types
+
+pub const max_inline_cost = 48
+pub const max_inline_loops = 1
+pub const free_inline_cost = 6
+pub const max_caller_growth = 240
+pub const min_program_growth = 6000
+pub const max_program_growth = 40000
+pub const program_share = 5
+pub const loop_reserve_share = 4
+pub const max_inline_rounds = 4
+
+pub struct CalleeSummary {
+    pub cost: i64 = 0
+    pub eligible: bool = false
+}
+
+pub struct Inliner {
+    pub program: *Program
+    pub u: *types.Universe
+    pub recursive: [*Func: bool] = [:]
+    pub summaries: [*Func: CalleeSummary] = [:]
+    pub budget: i64
+    pub reserve: i64
+}
+
+pub fn inline_calls(p: *Program, u: *types.Universe) {
+    let budget = program_budget(p)
+    let inl = new(Inliner { program: p, u, budget, reserve: budget / loop_reserve_share })
+    let order = call_order(inl)
+    for f in order {
+        inline_into(inl, f)
+    }
+}
+
+fn program_budget(p: *Program) -> i64 {
+    var total = 0
+    for f in p.funcs {
+        total += cost_of(f)
+    }
+    math.min(max_program_growth, math.max(min_program_growth, total / program_share))
+}
+
+pub fn cost_of(f: *Func) -> i64 {
+    var cost = 0
+    for b in f.blocks {
+        for v in b.values {
+            if counts_toward_cost(v.op) {
+                cost += 1
+            }
+        }
+    }
+    cost
+}
+
+fn direct_callees(f: *Func) -> []*Func {
+    var callees: []*Func = []
+    for v in direct_targets(f) {
+        let target = v.target ?? continue
+        if v.op == OpCall && !slices.contains(callees, target) {
+            push(mut callees, target)
+        }
+    }
+    callees
+}
+
+pub struct CallGraph {
+    pub index: [*Func: i64] = [:]
+    pub low: [*Func: i64] = [:]
+    pub on_stack: [*Func: bool] = [:]
+    pub stack: []*Func = []
+    pub next: i64 = 0
+    pub order: []*Func = []
+    pub recursive: [*Func: bool] = [:]
+}
+
+fn call_order(inl: *Inliner) -> []*Func {
+    let g = new(CallGraph {})
+    for f in inl.program.funcs {
+        if g.index[f] == none {
+            connect_graph(g, f)
+        }
+    }
+    inl.recursive = g.recursive
+    g.order
+}
+
+fn connect_graph(g: *CallGraph, f: *Func) {
+    g.index[f] = g.next
+    g.low[f] = g.next
+    g.next += 1
+    push(mut g.stack, f)
+    g.on_stack[f] = true
+    for c in direct_callees(f) {
+        if c == f {
+            g.recursive[f] = true
+        }
+        match g.index[c] {
+            none => {
+                connect_graph(g, c)
+                g.low[f] = math.min(g.low[f] ?? 0, g.low[c] ?? 0)
+            }
+            some(seen) => {
+                if g.on_stack[c] ?? false {
+                    g.low[f] = math.min(g.low[f] ?? 0, seen)
+                }
+            }
+        }
+    }
+    if g.low[f] == g.index[f] {
+        pop_component(g, f)
+    }
+}
+
+fn pop_component(g: *CallGraph, root: *Func) {
+    var members: []*Func = []
+    for {
+        let top = g.stack[g.stack.len - 1]
+        truncate(mut g.stack, g.stack.len - 1)
+        g.on_stack[top] = false
+        push(mut members, top)
+        if top == root {
+            break
+        }
+    }
+    if members.len > 1 {
+        for m in members {
+            g.recursive[m] = true
+        }
+    }
+    for m in members {
+        push(mut g.order, m)
+    }
+}
+
+fn summarise(inl: *Inliner, g: *Func) -> CalleeSummary {
+    match inl.summaries[g] {
+        some(s) => return s
+        none => {}
+    }
+    let s = measure(inl, g)
+    inl.summaries[g] = s
+    s
+}
+
+fn measure(inl: *Inliner, g: *Func) -> CalleeSummary {
+    if (inl.recursive[g] ?? false) || g.callback || g.blocks[0].preds.len > 0 {
+        return CalleeSummary {}
+    }
+    var cost = 0
+    var loops = 0
+    for b in g.blocks {
+        if b.poll {
+            loops += 1
+        }
+        for v in b.values {
+            if !inlinable_op(v.op) {
+                return CalleeSummary {}
+            }
+            if counts_toward_cost(v.op) {
+                cost += 1
+            }
+        }
+    }
+    CalleeSummary { cost, eligible: cost <= max_inline_cost && loops <= max_inline_loops }
+}
+
+fn inlinable_op(op: Op) -> bool {
+    !is_vector_op(op)
+}
+
+pub fn counts_toward_cost(op: Op) -> bool {
+    match op {
+        OpConst => false
+        OpParam => false
+        OpResult => false
+        OpUndef => false
+        _ => true
+    }
+}
+
+pub struct InlineCandidate {
+    pub call: *Value
+    pub depth: i64
+    pub cost: i64
+}
+
+fn inline_into(inl: *Inliner, f: *Func) {
+    var grown = 0
+    for _ in 0..max_inline_rounds {
+        let expanded = expand_round(inl, f, grown)
+        if !expanded.expanded {
+            return
+        }
+        grown = expanded.grown
+        simplify(inl.u, f)
+    }
+}
+
+struct Expansion {
+    expanded: bool
+    grown: i64
+}
+
+fn expand_round(inl: *Inliner, f: *Func, start: i64) -> Expansion {
+    let found = candidates(inl, f)
+    if found.len == 0 {
+        return Expansion { expanded: false, grown: start }
+    }
+    let results = results_of(f, found)
+    var grown = start
+    var expanded = false
+    for c in found {
+        let free = c.cost <= free_inline_cost
+        if !free && !admits(inl, c, grown) {
+            continue
+        }
+        let target = c.call.target ?? panic("inline candidate without a target")
+        let site = new_inline_site(inl.u, f, c.call, target)
+        let words = results[c.call] ?? panic("inline candidate without results")
+        expand(site, words)
+        expanded = true
+        if !free {
+            grown += c.cost
+            inl.budget -= c.cost
+        }
+    }
+    Expansion { expanded, grown }
+}
+
+fn admits(inl: *Inliner, c: InlineCandidate, grown: i64) -> bool {
+    var available = inl.budget
+    if c.depth == 0 {
+        available -= inl.reserve
+    }
+    grown + c.cost <= max_caller_growth && c.cost <= available
+}
+
+fn candidates(inl: *Inliner, f: *Func) -> []InlineCandidate {
+    var found: []InlineCandidate = []
+    var depths: []i64 = []
+    var measured = false
+    for b in f.blocks {
+        for v in b.values {
+            let target = v.target ?? continue
+            if v.op != OpCall || target == f {
+                continue
+            }
+            let summary = summarise(inl, target)
+            if !summary.eligible || v.args.len != target.param_words {
+                continue
+            }
+            if !measured {
+                depths = loop_depths(f)
+                measured = true
+            }
+            push(mut found, InlineCandidate { call: v, depth: depths[b.id], cost: summary.cost })
+        }
+    }
+    slices.sort_by(mut found, fn(a: InlineCandidate, b: InlineCandidate) -> bool { candidate_before(a, b) })
+    found
+}
+
+fn candidate_before(a: InlineCandidate, b: InlineCandidate) -> bool {
+    if a.depth != b.depth {
+        return a.depth > b.depth
+    }
+    if a.cost != b.cost {
+        return a.cost < b.cost
+    }
+    a.call.id < b.call.id
+}
+
+fn loop_depths(f: *Func) -> []i64 {
+    let depths = counts(f.block_ids)
+    var polled = false
+    for b in f.blocks {
+        if b.poll {
+            polled = true
+        }
+    }
+    if !polled {
+        return depths
+    }
+    for l in find_loops(func_dominators(f)) {
+        for b in l.order {
+            depths[b.id] += 1
+        }
+    }
+    depths
+}
+
+fn results_of(f: *Func, found: []InlineCandidate) -> [*Value: [i64: *Value]] {
+    var results: [*Value: [i64: *Value]] = [:]
+    for c in found {
+        results[c.call] = [:]
+    }
+    for b in f.blocks {
+        for v in b.values {
+            if v.op != OpResult {
+                continue
+            }
+            match results[v.args[0]] {
+                some(found_words) => {
+                    var words = found_words
+                    words[v.aux] = v
+                    results[v.args[0]] = words
+                }
+                none => {}
+            }
+        }
+    }
+    results
+}

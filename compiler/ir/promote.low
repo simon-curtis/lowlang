@@ -1,0 +1,283 @@
+import std/slices
+
+pub const max_promotion_cells = 262144
+
+pub struct Promoter {
+    pub s: *Ssa
+    pub func: *Func
+    pub vars: i64
+    pub slot_var: []i64
+    pub block_index: []i64
+    pub last: [i64: *Value] = [:]
+    pub entry: [i64: *Value] = [:]
+    pub current: [i64: *Value] = [:]
+    pub phis: [][]*Value = []
+    pub chain: []i64 = []
+    pub undef: *Value? = none
+}
+
+pub fn promote_slots(s: *Ssa) -> bool {
+    let f = s.func
+    if f.slots.len == 0 || f.blocks[0].preds.len > 0 {
+        return false
+    }
+    let info = promotable_slots(f)
+    let block_index = counts(f.block_ids)
+    for i, b in f.blocks {
+        block_index[b.id] = i
+    }
+    var changed = false
+    var slot = 0
+    for slot < f.slots.len {
+        let slot_var = counts(f.slots.len)
+        for i in 0..slot_var.len {
+            slot_var[i] = -1
+        }
+        var vars = 0
+        for slot < f.slots.len {
+            if !info.promotable[slot] {
+                slot += 1
+                continue
+            }
+            if (vars + f.slots[slot]) * f.blocks.len > max_promotion_cells {
+                if vars > 0 {
+                    break
+                }
+                info.promotable[slot] = false
+                slot += 1
+                continue
+            }
+            slot_var[slot] = vars
+            vars += f.slots[slot]
+            slot += 1
+        }
+        if vars == 0 {
+            continue
+        }
+        let p = new(Promoter { s, func: f, vars, slot_var, block_index })
+        if promote(p) {
+            changed = true
+        }
+    }
+    changed
+}
+
+fn variable(p: *Promoter, v: *Value) -> i64? {
+    let acc = access_of(v)
+    if acc.root.op != OpSlot || acc.root.aux >= p.slot_var.len {
+        return none
+    }
+    let first = p.slot_var[acc.root.aux]
+    if first < 0 {
+        return none
+    }
+    first + acc.off / 8
+}
+
+fn promote(p: *Promoter) -> bool {
+    let blocks = p.func.blocks
+    for _ in 0..blocks.len {
+        push(mut p.phis, [])
+    }
+    for i, b in blocks {
+        record_stores(p, i, b)
+    }
+    var changed = false
+    for i, b in blocks {
+        if rewrite(p, i, b) {
+            changed = true
+        }
+    }
+    if !changed {
+        return false
+    }
+    insert_phis(p)
+    for b in blocks {
+        resolve_block(p.s, b)
+    }
+    true
+}
+
+fn record_stores(p: *Promoter, i: i64, b: *Block) {
+    for v in b.values {
+        if v.op != OpStore {
+            continue
+        }
+        match variable(p, v) {
+            some(k) => { p.last[i * p.vars + k] = resolve(v.args[1]) }
+            none => {}
+        }
+    }
+}
+
+fn rewrite(p: *Promoter, i: i64, b: *Block) -> bool {
+    p.current = [:]
+    var changed = false
+    var kept: []*Value = []
+    for v in b.values {
+        if v.op != OpLoad && v.op != OpStore {
+            push(mut kept, v)
+            continue
+        }
+        let tracked = variable(p, v)
+        if tracked == none {
+            push(mut kept, v)
+            continue
+        }
+        let k = tracked ?? 0
+        changed = true
+        if v.op == OpStore {
+            p.current[k] = resolve(v.args[1])
+            continue
+        }
+        var known = p.current[k]
+        if known == none {
+            let found = at_entry(p, k, b)
+            p.current[k] = found
+            known = found
+        }
+        forward_to(v, known ?? panic("promotion lost a value"))
+        push(mut kept, v)
+    }
+    b.values = kept
+    changed
+}
+
+fn position(p: *Promoter, b: *Block) -> i64 {
+    p.block_index[b.id]
+}
+
+fn at_end(p: *Promoter, k: i64, b: *Block) -> *Value {
+    match p.last[position(p, b) * p.vars + k] {
+        some(v) => resolve(v)
+        none => at_entry(p, k, b)
+    }
+}
+
+fn at_entry(p: *Promoter, k: i64, start: *Block) -> *Value {
+    let base_len = p.chain.len
+    var b = start
+    var found: *Value? = none
+    for found == none {
+        let cell = position(p, b) * p.vars + k
+        match p.entry[cell] {
+            some(v) => { found = resolve(v) }
+            none => {}
+        }
+        if found != none {
+            break
+        }
+        push(mut p.chain, cell)
+        match b.preds.len {
+            0 => { found = undefined(p) }
+            1 => {
+                let pred = b.preds[0]
+                match p.last[position(p, pred) * p.vars + k] {
+                    some(v) => { found = resolve(v) }
+                    none => { b = pred }
+                }
+            }
+            _ => { found = join(p, k, b, cell) }
+        }
+    }
+    let result = found ?? panic("promotion found no value")
+    for cell in p.chain[base_len..] {
+        p.entry[cell] = result
+    }
+    truncate(mut p.chain, base_len)
+    result
+}
+
+fn join(p: *Promoter, k: i64, b: *Block, cell: i64) -> *Value {
+    let node = new_value(p.func, b, OpPhi, [])
+    p.entry[cell] = node
+    let i = position(p, b)
+    var list = p.phis[i]
+    push(mut list, node)
+    p.phis[i] = list
+    for pred in b.preds {
+        let arg = at_end(p, k, pred)
+        push(mut node.args, arg)
+    }
+    let result = collapse(p, node)
+    p.entry[cell] = result
+    result
+}
+
+fn collapse(p: *Promoter, node: *Value) -> *Value {
+    let found = sole_operand(node)
+    if !found.ok {
+        return node
+    }
+    let same = found.value ?? undefined(p)
+    node.forward = same
+    same
+}
+
+fn undefined(p: *Promoter) -> *Value {
+    match p.undef {
+        some(u) => u
+        none => {
+            let u = new_value(p.func, p.func.blocks[0], OpUndef, [])
+            p.undef = u
+            u
+        }
+    }
+}
+
+fn insert_phis(p: *Promoter) {
+    match p.undef {
+        some(u) => {
+            let entry = p.func.blocks[0]
+            entry.values = slices.concat([u], entry.values)
+        }
+        none => {}
+    }
+    for i, b in p.func.blocks {
+        var live: []*Value = []
+        for node in p.phis[i] {
+            if node.forward == none {
+                push(mut live, node)
+            }
+        }
+        if live.len > 0 {
+            b.values = slices.concat(live, b.values)
+        }
+    }
+}
+
+pub fn compact_slots(s: *Ssa) {
+    let f = s.func
+    if f.slots.len == 0 {
+        return
+    }
+    let remap = counts(f.slots.len)
+    for b in f.blocks {
+        for v in b.values {
+            if v.op == OpSlot {
+                remap[v.aux] = 1
+            }
+        }
+    }
+    var kept = 0
+    for i, used in remap {
+        if used == 0 {
+            remap[i] = -1
+            continue
+        }
+        remap[i] = kept
+        f.slots[kept] = f.slots[i]
+        kept += 1
+    }
+    if kept == f.slots.len {
+        return
+    }
+    truncate(mut f.slots, kept)
+    for b in f.blocks {
+        for v in b.values {
+            if v.op == OpSlot {
+                v.aux = remap[v.aux]
+            }
+        }
+    }
+}

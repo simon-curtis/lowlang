@@ -1,0 +1,289 @@
+import ast
+import lexer
+import prelude
+import std/slices
+import types
+
+pub fn element_type(b: *Builder, t: *types.Type) -> *types.Type {
+    if t == b.u.str {
+        return b.u.u8
+    }
+    types.elem_of(t)
+}
+
+pub fn bounds_check(b: *Builder, index: *Value, limit: *Value) {
+    emit(b, OpCheck, [index, limit])
+}
+
+pub fn scaled(b: *Builder, base: *Value, index: *Value, stride: i64) -> *Value {
+    var offset = index
+    if stride != 1 {
+        let factor = constant(b, stride)
+        offset = emit(b, OpMul, [index, factor])
+    }
+    emit(b, OpAdd, [base, offset])
+}
+
+pub fn scalar_of(elem: *types.Type) -> *types.Type? {
+    if types.packed(elem) {
+        return elem
+    }
+    none
+}
+
+pub fn element_of(b: *Builder, e: *ast.Index) -> Place {
+    let container = typ(e.x)
+    let seq = value(b, e.x, container)
+    let index = word(b, e.index)
+    bounds_check(b, index, seq[1])
+    let elem = element_type(b, container)
+    let addr = scaled(b, seq[0], index, types.stride(elem))
+    Place { addr, scalar: scalar_of(elem), tail: types.tail(elem) }
+}
+
+pub fn slicing(b: *Builder, e: *ast.Slicing) -> []*Value {
+    let t = types.must(e.type)
+    let seq = value(b, e.x, t)
+    var lo = constant(b, 0)
+    var hi = seq[1]
+    match e.lo {
+        some(low) => { lo = word(b, low) }
+        none => {}
+    }
+    match e.hi {
+        some(high) => { hi = word(b, high) }
+        none => {}
+    }
+    let one = constant(b, 1)
+    let hi_limit = emit(b, OpAdd, [seq[1], one])
+    bounds_check(b, hi, hi_limit)
+    let lo_limit = emit(b, OpAdd, [hi, one])
+    bounds_check(b, lo, lo_limit)
+    let n = emit(b, OpSub, [hi, lo])
+    let ptr = scaled(b, seq[0], lo, types.stride(element_type(b, t)))
+    if t == b.u.str {
+        return [ptr, n]
+    }
+    slice_of(ptr, n)
+}
+
+pub fn slice_lit(b: *Builder, e: *ast.SliceLit) -> []*Value {
+    match hoisted_slice(b, e) {
+        some(found) => found.words
+        none => filled_slice(b, e)
+    }
+}
+
+fn filled_slice(b: *Builder, e: *ast.SliceLit) -> []*Value {
+    let n = constant(b, e.elems.len)
+    if e.elems.len == 0 {
+        let empty = constant(b, 0)
+        return slice_of(empty, n)
+    }
+    let elem = types.elem_of(types.must(e.type))
+    let words = (e.elems.len * types.stride(elem) + 7) / 8
+    let size = constant(b, words)
+    let flag = scan(b, elem)
+    let ptr = runtime(b, RtAlloc, [size, flag]) ?? panic("alloc without a result")
+    for i, el in e.elems {
+        let held = value(b, el, elem)
+        store_words(b, Place { addr: ptr, offset: i * types.stride(elem), scalar: scalar_of(elem), tail: types.tail(elem) }, held)
+    }
+    slice_of(ptr, n)
+}
+
+pub fn prelude_func(b: *Builder, name: str) -> *Func {
+    b.named[name] ?? panic("ir: the prelude declares no {name}")
+}
+
+pub fn call_named(b: *Builder, name: str, args: []*Value) -> []*Value {
+    invoke(b, prelude_func(b, name), args)
+}
+
+pub fn prelude_field(b: *Builder, fn_name: str, name: str) -> *types.Field {
+    let result = types.elem_of(prelude_func(b, fn_name).ret)
+    types.field(result, name) ?? panic("ir: the result of {fn_name} has no field {name}")
+}
+
+pub fn strings(b: *Builder, e: *ast.Binary) -> []*Value {
+    if e.op == lexer.Kind.Plus {
+        return compose(b, flatten(ast.Expr.Binary(e), none, none))
+    }
+    let x = value(b, e.x, b.u.str)
+    let y = value(b, e.y, b.u.str)
+    if e.op != lexer.Kind.Eq && e.op != lexer.Kind.NotEq {
+        let order = call_named(b, prelude.str_cmp, [x[0], x[1], y[0], y[1]])[0]
+        let zero = constant(b, 0)
+        return [typed(b, arith(e.op), b.u.i64, [order, zero])]
+    }
+    let same = equal(b, b.u.str, x, y)
+    if e.op == lexer.Kind.NotEq {
+        return [typed(b, OpNot, b.u.bool, [same])]
+    }
+    [same]
+}
+
+pub fn serialize(b: *Builder, e: *ast.Call) {
+    let first = e.args[0]
+    let second = e.args[1]
+    let serialised = value(b, first, typ(first))
+    let writer = value(b, second, typ(second))
+    let path = empty_slice(b)
+    var args = slices.concat(writer, [path])
+    args = slices.concat(args, serialised)
+    let target = e.target ?? panic("serialize without a target")
+    invoke(b, b.funcs[target] ?? panic("serializer {target.name} was not built"), args)
+}
+
+pub fn make_slice(b: *Builder, elem: *types.Type, n: *Value) -> []*Value {
+    let zero = constant(b, 0)
+    let stride = constant(b, types.stride(elem))
+    let bytes = emit(b, OpMul, [n, stride])
+    let flag = scan(b, elem)
+    let data = runtime(b, RtGrow, [zero, zero, bytes, flag]) ?? panic("grow without a result")
+    slice_of(data, n)
+}
+
+pub fn slice_of(ptr: *Value, n: *Value) -> []*Value {
+    [ptr, n, n]
+}
+
+pub fn copy_slice(b: *Builder, e: *ast.Call) -> *Value {
+    let t = typ(e.args[0])
+    let dst = value(b, e.args[0], t)
+    let src = value(b, e.args[1], typ(e.args[1]))
+    let n = call_named(b, prelude.min, [dst[1], src[1]])[0]
+    let stride = constant(b, types.stride(types.elem_of(t)))
+    let bytes = emit(b, OpMul, [n, stride])
+    runtime(b, RtMemmove, [dst[0], src[0], bytes])
+    n
+}
+
+pub fn for_in(b: *Builder, s: *ast.ForIn) {
+    if s.end != none {
+        range_loop(b, s)
+        return
+    }
+    let t = typ(s.iter)
+    if t.kind == ChanKind {
+        chan_loop(b, s)
+        return
+    }
+    if t.kind == MapKind {
+        map_loop(b, s)
+        return
+    }
+    let seq = value(b, s.iter, t)
+    let counter = new_temp(b)
+    let step = new_temp(b)
+    let start = constant(b, 0)
+    write_temp(b, counter, [start])
+    let loop = open_loop(b)
+    let i = read_temp(b, counter, 1)[0]
+    let below = emit(b, OpLt, [i, seq[1]])
+    branch(b, below, loop.body, loop.exit)
+    enter(b, loop.body)
+    match s.key_local {
+        some(key) => { bind(b, key, [i]) }
+        none => {}
+    }
+    if t == b.u.str {
+        let r = call_named(b, prelude.utf8_decode, [seq[0], seq[1], i])
+        let value_local = s.value_local ?? panic("string loop without a value local")
+        bind(b, value_local, r[..1])
+        write_temp(b, step, r[1..2])
+    } else {
+        let elem = types.elem_of(t)
+        let addr = scaled(b, seq[0], i, types.stride(elem))
+        let at = Place { addr, scalar: scalar_of(elem), tail: types.tail(elem) }
+        let element = load_words(b, at, elem)
+        bind_loop_value(b, s, element)
+        let one = constant(b, 1)
+        write_temp(b, step, [one])
+    }
+    loop_body(b, loop, s.body)
+    let current = read_temp(b, counter, 1)[0]
+    let stride = read_temp(b, step, 1)[0]
+    let advanced = emit(b, OpAdd, [current, stride])
+    write_temp(b, counter, [advanced])
+    close_loop(b, loop)
+}
+
+fn range_loop(b: *Builder, s: *ast.ForIn) {
+    if fill_loop(b, s) {
+        return
+    }
+    let counter_local = s.value_local ?? panic("range loop without a value local")
+    let end = s.end ?? panic("range loop without an end")
+    let lo = word(b, s.iter)
+    let hi = word(b, end)
+    let counter = new_temp(b)
+    write_temp(b, counter, [lo])
+    let loop = open_loop(b)
+    let i = read_temp(b, counter, 1)[0]
+    let below = typed(b, OpLt, counter_local.type, [i, hi])
+    branch(b, below, loop.body, loop.exit)
+    enter(b, loop.body)
+    bind(b, counter_local, [i])
+    loop_body(b, loop, s.body)
+    let current = read_temp(b, counter, 1)[0]
+    let one = constant(b, 1)
+    let advanced = typed(b, OpAdd, counter_local.type, [current, one])
+    write_temp(b, counter, [advanced])
+    close_loop(b, loop)
+}
+
+pub struct LoopBlocks {
+    pub header: *Block
+    pub body: *Block
+    pub next: *Block
+    pub exit: *Block
+}
+
+pub fn open_loop(b: *Builder) -> LoopBlocks {
+    let header = fresh_block(b)
+    let body = fresh_block(b)
+    let next = fresh_block(b)
+    let exit = fresh_block(b)
+    jump(b, header)
+    b.cur = header
+    LoopBlocks { header, body, next, exit }
+}
+
+pub fn loop_body(b: *Builder, loop: LoopBlocks, body: *ast.Block) {
+    push(mut b.loops, LoopTarget { cont: loop.next, brk: loop.exit, depth: b.defers.len })
+    lower_block(b, body)
+    truncate(mut b.loops, b.loops.len - 1)
+    jump(b, loop.next)
+    enter(b, loop.next)
+}
+
+pub fn close_loop(b: *Builder, loop: LoopBlocks) {
+    back_edge(b, loop.header)
+    seal(b.s, loop.header)
+    enter(b, loop.exit)
+}
+
+pub fn coalesce(b: *Builder, e: *ast.Binary) -> []*Value {
+    let optional = typ(e.x)
+    let result_type = types.must(e.type)
+    let words = value(b, e.x, optional)
+    let temp = new_temp(b)
+    let present_block = fresh_block(b)
+    let absent = fresh_block(b)
+    let done = fresh_block(b)
+    branch(b, words[0], present_block, absent)
+    enter(b, present_block)
+    if result_type == optional {
+        write_temp(b, temp, words)
+    } else {
+        write_temp(b, temp, words[1..])
+    }
+    jump(b, done)
+    enter(b, absent)
+    let fallback = value(b, e.y, result_type)
+    write_temp(b, temp, fallback)
+    jump(b, done)
+    enter(b, done)
+    read_temp(b, temp, types.size(result_type))
+}

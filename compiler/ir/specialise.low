@@ -1,0 +1,293 @@
+import std/slices
+import types
+
+pub const max_specialisation_rounds = 4
+pub const max_clones_per_function = 4
+pub const max_clone_source_cost = 150
+pub const max_cloned_program_cost = 4000
+
+pub struct CallSite {
+    pub call: *Value
+    pub caller: *Func
+}
+
+pub struct Specialiser {
+    pub program: *Program
+    pub u: *types.Universe
+    pub cloned: i64 = 0
+    pub clones_of: [*Func: i64] = [:]
+}
+
+pub fn specialise_constant_arguments(p: *Program, u: *types.Universe) {
+    let s = new(Specialiser { program: p, u })
+    for _ in 0..max_specialisation_rounds {
+        let constants = specialise_constants(s)
+        let clones = clone_for_functions(s)
+        if !constants && !clones {
+            return
+        }
+    }
+}
+
+fn sites_of(calls: *DirectCalls, g: *Func) -> []CallSite {
+    calls.sites[g] ?? []
+}
+
+fn specialise_constants(s: *Specialiser) -> bool {
+    let calls = direct_calls(s.program)
+    var changed: [*Func: bool] = [:]
+    for g in s.program.funcs {
+        let sites = sites_of(calls, g)
+        if calls.escaping[g] ?? false {
+            continue
+        }
+        if !eligible(s, g, sites) {
+            continue
+        }
+        var dropped = specialise_params(g, sites)
+        for word in specialise_integers(s, g, sites) {
+            push(mut dropped, word)
+        }
+        if dropped.len == 0 {
+            continue
+        }
+        drop_parameters(g, sites, dropped)
+        changed[g] = true
+        for site in sites {
+            changed[site.caller] = true
+        }
+    }
+    simplify_all(s, changed)
+    changed.len > 0
+}
+
+fn eligible(s: *Specialiser, g: *Func, sites: []CallSite) -> bool {
+    let main = s.program.main ?? panic("program without main")
+    sites.len > 0 && g != main && !g.callback
+}
+
+fn simplify_all(s: *Specialiser, changed: [*Func: bool]) {
+    for f in s.program.funcs {
+        if changed[f] ?? false {
+            simplify(s.u, f)
+        }
+    }
+}
+
+pub struct DirectCalls {
+    pub sites: [*Func: []CallSite] = [:]
+    pub escaping: [*Func: bool] = [:]
+}
+
+fn direct_calls(p: *Program) -> *DirectCalls {
+    let calls = new(DirectCalls {})
+    for f in p.funcs {
+        for v in direct_targets(f) {
+            let target = v.target ?? continue
+            if v.op == OpCall {
+                var list = calls.sites[target] ?? []
+                push(mut list, CallSite { call: v, caller: f })
+                calls.sites[target] = list
+            } else {
+                calls.escaping[target] = true
+            }
+        }
+    }
+    calls
+}
+
+fn code_env_pair(params: []*Value, i: i64) -> bool {
+    params[i + 1].aux == params[i].aux + 1
+}
+
+fn specialise_params(g: *Func, sites: []CallSite) -> []i64 {
+    var dropped: []i64 = []
+    var consumed: *Value? = none
+    let params = parameters(g)
+    for i in 0..params.len - 1 {
+        if !code_env_pair(params, i) {
+            continue
+        }
+        let param = params[i]
+        let env = params[i + 1]
+        if consumed == param {
+            continue
+        }
+        let code = agreed_constant(g, param, sites, is_function) ?? continue
+        let capture = agreed_constant(g, env, sites, is_constant) ?? continue
+        push(mut dropped, param.aux)
+        push(mut dropped, env.aux)
+        become_copy_of(param, code)
+        become_copy_of(env, capture)
+        consumed = env
+    }
+    dropped
+}
+
+pub struct Agreement {
+    pub param: *Value
+    pub constant: *Value
+}
+
+fn specialise_integers(s: *Specialiser, g: *Func, sites: []CallSite) -> []i64 {
+    var agreed: []Agreement = []
+    for param in parameters(g) {
+        match agreed_constant(g, param, sites, is_integer) {
+            some(constant) => { push(mut agreed, Agreement { param, constant }) }
+            none => {}
+        }
+    }
+    if agreed.len == 0 || !unlocks_folding(s, g, agreed) {
+        return []
+    }
+    var dropped: []i64 = []
+    for a in agreed {
+        push(mut dropped, a.param.aux)
+        become_copy_of(a.param, a.constant)
+    }
+    dropped
+}
+
+pub fn is_integer(v: *Value) -> bool {
+    v.op == OpConst && v.float_bits == 0
+}
+
+pub struct Shape {
+    pub checks: i64 = 0
+    pub blocks: i64 = 0
+    pub values: i64 = 0
+}
+
+fn shape_of(f: *Func) -> Shape {
+    var s = Shape { blocks: f.blocks.len }
+    for b in f.blocks {
+        for v in b.values {
+            match v.op {
+                OpCheck => { s.checks += 1 }
+                OpConst => {}
+                OpParam => {}
+                OpUndef => {}
+                _ => { s.values += 1 }
+            }
+        }
+    }
+    s
+}
+
+fn smaller_than(s: Shape, other: Shape) -> bool {
+    s.checks < other.checks || s.blocks < other.blocks || s.values < other.values
+}
+
+fn unlocks_folding(s: *Specialiser, g: *Func, agreed: []Agreement) -> bool {
+    let baseline = clone_func(g)
+    simplify(s.u, baseline.func)
+    let trial = clone_func(g)
+    for a in agreed {
+        let substituted = clone_of(trial, a.param)
+        become_copy_of(substituted, a.constant)
+    }
+    simplify(s.u, trial.func)
+    let before = shape_of(baseline.func)
+    let after = shape_of(trial.func)
+    smaller_than(after, before)
+}
+
+pub fn clone_of(c: *FuncClone, v: *Value) -> *Value {
+    c.values[v] ?? panic("v{v.id} was not cloned")
+}
+
+pub fn simplify(u: *types.Universe, f: *Func) {
+    let s = new_ssa(u, f)
+    finalize(s)
+}
+
+fn drop_parameters(g: *Func, sites: []CallSite, dropped: []i64) {
+    for param in parameters(g) {
+        param.aux -= count_below(dropped, param.aux)
+    }
+    for site in sites {
+        site.call.args = without_words(site.call.args, dropped)
+    }
+    g.param_words -= dropped.len
+}
+
+fn count_below(words: []i64, limit: i64) -> i64 {
+    var n = 0
+    for w in words {
+        if w < limit {
+            n += 1
+        }
+    }
+    n
+}
+
+fn without_words(args: []*Value, dropped: []i64) -> []*Value {
+    var kept: []*Value = []
+    for i, a in args {
+        if !slices.contains(dropped, i) {
+            push(mut kept, a)
+        }
+    }
+    kept
+}
+
+pub fn parameters(g: *Func) -> []*Value {
+    var params: []*Value = []
+    for v in g.blocks[0].values {
+        if v.op == OpParam {
+            push(mut params, v)
+        }
+    }
+    params
+}
+
+pub fn agreed_constant(owner: *Func?, param: *Value, sites: []CallSite, accept: fn(*Value) -> bool) -> *Value? {
+    var agreed: *Value? = none
+    for site in sites {
+        if param.aux >= site.call.args.len {
+            return none
+        }
+        let arg = site.call.args[param.aux]
+        let own_call = match owner {
+            some(o) => o == site.caller
+            none => false
+        }
+        if own_call && arg.op == OpParam && arg.aux == param.aux {
+            continue
+        }
+        if !accept(arg) {
+            return none
+        }
+        match agreed {
+            none => { agreed = arg }
+            some(first) => {
+                if !same_constant(first, arg) {
+                    return none
+                }
+            }
+        }
+    }
+    agreed
+}
+
+pub fn is_function(v: *Value) -> bool {
+    v.op == OpFuncAddr && v.target != none && v.aux == code_addr
+}
+
+pub fn is_constant(v: *Value) -> bool {
+    v.op == OpConst
+}
+
+fn same_constant(a: *Value, b: *Value) -> bool {
+    a.op == b.op && a.aux == b.aux && a.target == b.target && a.float_bits == b.float_bits && a.str == b.str
+}
+
+pub fn become_copy_of(v: *Value, constant: *Value) {
+    v.op = constant.op
+    v.aux = constant.aux
+    v.target = constant.target
+    v.str = constant.str
+    v.float_bits = constant.float_bits
+    v.type = constant.type
+    v.scalar = constant.scalar
+}

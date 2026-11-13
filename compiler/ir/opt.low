@@ -1,0 +1,888 @@
+import std/bits
+import std/builder
+import std/slices
+import types
+
+pub struct Operand {
+    pub id: i64 = 0
+    pub konst: bool = false
+    pub n: i64 = 0
+    pub bits: i64 = 0
+}
+
+pub fn same_operand(a: Operand, b: Operand) -> bool {
+    a.id == b.id && a.konst == b.konst && a.n == b.n && a.bits == b.bits
+}
+
+pub struct Fact {
+    pub smaller: Operand
+    pub larger: Operand
+    pub unsigned: bool = false
+    pub or_equal: bool = false
+}
+
+pub fn same_fact(f: Fact, g: Fact) -> bool {
+    same_operand(f.smaller, g.smaller) && same_operand(f.larger, g.larger) && f.unsigned == g.unsigned && f.or_equal == g.or_equal
+}
+
+pub struct Optimizer {
+    pub func: *Func
+    pub ws: *Workspace
+    pub u: *types.Universe
+    pub doms: *Dominators
+    pub reps: [str: *Value] = [:]
+    pub added: []str = []
+    pub facts: []Fact = []
+    pub out: []*Value = []
+    pub nonneg: [i64: i64] = [:]
+    pub defs: [i64: *Value] = [:]
+    pub visiting: [i64: bool] = [:]
+}
+
+pub fn new_optimizer(f: *Func, ws: *Workspace, u: *types.Universe, doms: *Dominators) -> *Optimizer {
+    new(Optimizer { func: f, ws, u, doms })
+}
+
+pub fn optimize(s: *Ssa) {
+    let doms = func_dominators(s.func)
+    let o = new_optimizer(s.func, s.ws, s.u, doms)
+    visit(o, 0)
+    for b in s.func.blocks {
+        resolve_block(s, b)
+    }
+}
+
+fn visit(o: *Optimizer, i: i64) {
+    let b = o.doms.nodes[i]
+    let mark = o.added.len
+    let edge = edge_fact(o, b)
+    match edge {
+        some(f) => { push(mut o.facts, f) }
+        none => {}
+    }
+    o.out = []
+    optimize_block(o, b)
+    b.values = o.out
+    for c in o.doms.children[i] {
+        visit(o, c)
+    }
+    for key in o.added[mark..] {
+        delete(mut o.reps, key)
+    }
+    truncate(mut o.added, mark)
+    if edge != none {
+        truncate(mut o.facts, o.facts.len - 1)
+    }
+}
+
+fn optimize_block(o: *Optimizer, b: *Block) {
+    for v in b.values {
+        define(o, v)
+        for i, a in v.args {
+            v.args[i] = resolve(a)
+        }
+        if v.op == OpCheck {
+            check(o, v)
+            continue
+        }
+        fold(o, v)
+        if v.forward != none {
+            continue
+        }
+        if cse_op(v.op) && merge(o, v) {
+            continue
+        }
+        push(mut o.out, v)
+    }
+}
+
+fn merge(o: *Optimizer, v: *Value) -> bool {
+    let key = key_of(o, v)
+    match o.reps[key] {
+        some(rep) => {
+            rep.scalar = rep.scalar && v.scalar
+            v.forward = rep
+            return true
+        }
+        none => {}
+    }
+    o.reps[key] = v
+    push(mut o.added, key)
+    false
+}
+
+fn check(o: *Optimizer, v: *Value) {
+    if checked(o, v) || in_range(o, v.args[0], v.args[1], v.block) {
+        return
+    }
+    if tighten(o, v) && checked(o, v) {
+        return
+    }
+    let key = key_of(o, v)
+    o.reps[key] = v
+    push(mut o.added, key)
+    push(mut o.out, v)
+}
+
+fn checked(o: *Optimizer, v: *Value) -> bool {
+    o.reps[key_of(o, v)] != none
+}
+
+fn tighten(o: *Optimizer, c: *Value) -> bool {
+    let found = bound_below(o, ref(c.args[0]), c.args[1])
+    let bound = found ?? return false
+    let limit = definition(o, bound.id) ?? return false
+    if bound.konst || limit == c.args[1] {
+        return false
+    }
+    c.args[1] = limit
+    true
+}
+
+pub fn cse_op(op: Op) -> bool {
+    match op {
+        OpAdd => true
+        OpSub => true
+        OpMul => true
+        OpAnd => true
+        OpOr => true
+        OpXor => true
+        OpShl => true
+        OpShr => true
+        OpConvert => true
+        OpFuncAddr => true
+        OpHashSeed => true
+        _ => false
+    }
+}
+
+pub fn ref(v: *Value) -> Operand {
+    if v.op == OpConst {
+        return Operand { konst: true, n: v.aux, bits: v.float_bits }
+    }
+    Operand { id: v.id }
+}
+
+fn operand_text(a: Operand) -> str {
+    if a.konst {
+        return "c{a.n}/{a.bits}"
+    }
+    "v{a.id}"
+}
+
+fn type_id(t: *types.Type?) -> i64 {
+    match t {
+        some(inner) => inner.id
+        none => 0
+    }
+}
+
+fn func_number(ws: *Workspace, f: *Func?) -> i64 {
+    match f {
+        some(target) => {
+            match ws.func_ids[target] {
+                some(id) => id
+                none => {
+                    let id = ws.func_ids.len + 1
+                    ws.func_ids[target] = id
+                    id
+                }
+            }
+        }
+        none => 0
+    }
+}
+
+fn key_of(o: *Optimizer, v: *Value) -> str {
+    var a = Operand {}
+    var b = Operand {}
+    if v.args.len > 0 {
+        a = ref(v.args[0])
+    }
+    if v.args.len > 1 {
+        b = ref(v.args[1])
+    }
+    var k = builder.builder()
+    k.write("{v.op.index} {v.aux} {v.str.len}:{v.str} ")
+    k.write("{func_number(o.ws, v.target)} {type_id(v.type)} {type_id(v.from)} ")
+    k.write(operand_text(a))
+    k.write_byte(' ')
+    k.write(operand_text(b))
+    k.to_str()
+}
+
+pub fn edge_fact(o: *Optimizer, b: *Block) -> Fact? {
+    if b.preds.len != 1 {
+        return none
+    }
+    let p = b.preds[0]
+    let control = p.control ?? return none
+    if p.kind != If || p.succs[0] == p.succs[1] {
+        return none
+    }
+    let c = resolve(control)
+    if !is_compare(c.op) {
+        return none
+    }
+    let ct = c.type ?? return none
+    if !types.is_integer(ct) {
+        return none
+    }
+    let taken = p.succs[0] == b
+    let x = ref(resolve(c.args[0]))
+    let y = ref(resolve(c.args[1]))
+    let unsigned = !ct.signed
+    if (taken && c.op == OpLt) || (!taken && c.op == OpGe) {
+        return Fact { smaller: x, larger: y, unsigned }
+    }
+    if (taken && c.op == OpGt) || (!taken && c.op == OpLe) {
+        return Fact { smaller: y, larger: x, unsigned }
+    }
+    if (!taken && c.op == OpLt) || (taken && c.op == OpGe) {
+        return Fact { smaller: y, larger: x, unsigned, or_equal: true }
+    }
+    if (!taken && c.op == OpGt) || (taken && c.op == OpLe) {
+        return Fact { smaller: x, larger: y, unsigned, or_equal: true }
+    }
+    none
+}
+
+fn has_fact(facts: []Fact, want: Fact) -> bool {
+    for f in facts {
+        if same_fact(f, want) {
+            return true
+        }
+    }
+    false
+}
+
+fn in_range(o: *Optimizer, i: *Value, n: *Value, at: *Block) -> bool {
+    if i.op == OpConst && n.op == OpConst {
+        return u64(i.aux) < u64(n.aux)
+    }
+    if n.op == OpConst && below_constant(o, i, n.aux, at) {
+        return true
+    }
+    let ri = ref(i)
+    let rn = ref(n)
+    if has_fact(o.facts, Fact { smaller: ri, larger: rn, unsigned: true }) {
+        return true
+    }
+    if !non_negative(o, i) {
+        return false
+    }
+    if has_fact(o.facts, Fact { smaller: ri, larger: rn }) {
+        return true
+    }
+    bound_below(o, ri, n) != none
+}
+
+fn below_constant(o: *Optimizer, i: *Value, n: i64, at: *Block) -> bool {
+    if !non_negative(o, i) {
+        return false
+    }
+    let bound = upper(o, i, at, range_depth)
+    bound.known && bound.value < n
+}
+
+fn bound_below(o: *Optimizer, i: Operand, n: *Value) -> Operand? {
+    var at = o.facts.len - 1
+    for at >= 0 {
+        let f = o.facts[at]
+        if same_operand(f.smaller, i) && !f.unsigned && !f.or_equal && at_least(o, n, f.larger, phi_depth) {
+            return f.larger
+        }
+        at -= 1
+    }
+    none
+}
+
+pub const phi_depth = 3
+
+fn at_least(o: *Optimizer, value: *Value, bound: Operand, depth: i64) -> bool {
+    let v = resolve(value)
+    if same_operand(ref(v), bound) {
+        return true
+    }
+    if v.op == OpConst && bound.konst {
+        return v.aux >= bound.n
+    }
+    if v.op != OpPhi || depth == 0 {
+        return false
+    }
+    for k, a in v.args {
+        let arg = resolve(a)
+        if arg != v && !at_least_from(o, arg, bound, v.block.preds[k], depth - 1) {
+            return false
+        }
+    }
+    true
+}
+
+fn at_least_from(o: *Optimizer, v: *Value, bound: Operand, pred: *Block, depth: i64) -> bool {
+    if at_least(o, v, bound, depth) {
+        return true
+    }
+    var i = o.doms.index[pred] ?? return false
+    let want = ref(v)
+    for {
+        let found = edge_fact(o, o.doms.nodes[i])
+        match found {
+            some(f) => {
+                if !f.unsigned && same_operand(f.smaller, bound) && same_operand(f.larger, want) {
+                    return true
+                }
+            }
+            none => {}
+        }
+        if i == 0 {
+            return false
+        }
+        i = o.doms.idom[i]
+    }
+}
+
+pub fn non_negative(o: *Optimizer, v: *Value) -> bool {
+    match memoised_non_negative(o, v) {
+        some(known) => return known
+        none => {}
+    }
+    let result = proves_non_negative(o, v)
+    o.nonneg[v.id] = if result { 1 } else { -1 }
+    result
+}
+
+fn memoised_non_negative(o: *Optimizer, v: *Value) -> bool? {
+    let verdict = o.nonneg[v.id] ?? return none
+    if verdict == 0 {
+        return none
+    }
+    verdict > 0
+}
+
+fn define(o: *Optimizer, v: *Value) {
+    o.defs[v.id] = v
+}
+
+fn definition(o: *Optimizer, id: i64) -> *Value? {
+    o.defs[id]
+}
+
+fn proves_non_negative(o: *Optimizer, v: *Value) -> bool {
+    if v.op == OpConst {
+        return v.aux >= 0
+    }
+    if unsigned_narrow(v.type) {
+        return true
+    }
+    if v.op == OpPhi {
+        return induction_non_negative(o, v) || bounded_below_by_fact(o, v)
+    }
+    if v.op == OpAdd {
+        return increases_non_negative(o, v) || bounded_below_by_fact(o, v)
+    }
+    if v.op == OpMul {
+        return product_non_negative(o, v) || bounded_below_by_fact(o, v)
+    }
+    bounded_below_by_fact(o, v)
+}
+
+pub fn unsigned_narrow(t: *types.Type?) -> bool {
+    match t {
+        some(inner) => types.is_integer(inner) && !inner.signed && inner.bits > 0 && inner.bits < 64
+        none => false
+    }
+}
+
+fn induction_non_negative(o: *Optimizer, p: *Value) -> bool {
+    if o.visiting[p.id] ?? false {
+        return true
+    }
+    o.visiting[p.id] = true
+    let result = phi_args_non_negative(o, p)
+    o.visiting[p.id] = false
+    result
+}
+
+fn phi_args_non_negative(o: *Optimizer, p: *Value) -> bool {
+    for a in p.args {
+        let arg = resolve(a)
+        if arg == p || non_negative_unmemoised(o, arg) {
+            continue
+        }
+        return false
+    }
+    true
+}
+
+pub fn non_negative_unmemoised(o: *Optimizer, v: *Value) -> bool {
+    match memoised_non_negative(o, v) {
+        some(known) => return known
+        none => {}
+    }
+    proves_non_negative(o, v)
+}
+
+fn increases_non_negative(o: *Optimizer, add: *Value) -> bool {
+    var base = resolve(add.args[0])
+    var step = resolve(add.args[1])
+    if base.op == OpConst {
+        let swap = base
+        base = step
+        step = swap
+    }
+    if !signed_or_untyped(add.type) || !non_negative_unmemoised(o, step) {
+        return false
+    }
+    non_negative_unmemoised(o, base) && cannot_overflow(o, add, base, step)
+}
+
+pub fn signed_or_untyped(t: *types.Type?) -> bool {
+    match t {
+        some(inner) => types.is_integer(inner) && inner.signed && inner.bits > 0
+        none => true
+    }
+}
+
+pub fn max_of(t: *types.Type?) -> i64 {
+    match t {
+        some(inner) => {
+            if inner.bits >= 64 {
+                return max_i64
+            }
+            (1 << (inner.bits - 1)) - 1
+        }
+        none => max_i64
+    }
+}
+
+fn cannot_overflow(o: *Optimizer, add: *Value, base: *Value, step: *Value) -> bool {
+    if step.op == OpConst && step_below_bound(o, add, base, step.aux) {
+        return true
+    }
+    sum_upper(o, add, range_depth).known
+}
+
+fn step_below_bound(o: *Optimizer, add: *Value, base: *Value, step: i64) -> bool {
+    if step == 0 {
+        return true
+    }
+    let limit = max_of(add.type)
+    let want = ref(base)
+    for f in facts_at(o, add.block) {
+        if !f.unsigned && !f.or_equal && same_operand(f.smaller, want) && bounded(f.larger, step, limit) {
+            return true
+        }
+    }
+    false
+}
+
+fn bounded(larger: Operand, step: i64, limit: i64) -> bool {
+    if step == 1 {
+        return true
+    }
+    larger.konst && larger.n >= 0 && larger.n <= limit && step - 1 <= limit - larger.n
+}
+
+fn is_arithmetic(op: Op) -> bool {
+    match op {
+        OpAdd => true
+        OpSub => true
+        OpMul => true
+        OpAnd => true
+        OpOr => true
+        OpXor => true
+        OpShl => true
+        OpShr => true
+        OpDiv => true
+        OpRem => true
+        _ => false
+    }
+}
+
+fn fold(o: *Optimizer, v: *Value) {
+    if is_arithmetic(v.op) {
+        fold_arithmetic(o, v)
+        return
+    }
+    match v.op {
+        OpNeg => fold_negation(v)
+        OpCompl => fold_negation(v)
+        OpNot => {
+            if v.args[0].op == OpConst {
+                become_constant(v, v.args[0].aux ^ 1)
+            }
+        }
+        OpEq => fold_comparison(v)
+        OpNe => fold_comparison(v)
+        OpLt => fold_comparison(v)
+        OpLe => fold_comparison(v)
+        OpGt => fold_comparison(v)
+        OpGe => fold_comparison(v)
+        OpConvert => fold_conversion(o, v)
+        OpSqrt => fold_float(v)
+        OpFloor => fold_float(v)
+        OpCall => call_directly(v)
+        _ => {}
+    }
+}
+
+fn fold_negation(v: *Value) {
+    if float_value(v) {
+        fold_float(v)
+        return
+    }
+    if integer_op(v) && v.args[0].op == OpConst {
+        var x = v.args[0].aux
+        if v.op == OpNeg {
+            x = -x
+        } else {
+            x = ~x
+        }
+        become_constant(v, types.wrap(v.type, x))
+    }
+}
+
+pub fn call_directly(call: *Value) {
+    if !is_indirect(call) {
+        return
+    }
+    let code = call.args[0]
+    if code.op != OpFuncAddr || code.aux != code_addr {
+        return
+    }
+    let target = code.target ?? return
+    call.signature = none
+    call.target = target
+    call.args = call.args[1..]
+}
+
+fn fold_arithmetic(o: *Optimizer, v: *Value) {
+    if float_value(v) {
+        fold_float(v)
+        return
+    }
+    if integer_op(v) {
+        fold_binary(o, v)
+    }
+}
+
+fn fold_comparison(v: *Value) {
+    let x = v.args[0]
+    let y = v.args[1]
+    let t = v.type ?? return
+    if x.op != OpConst || y.op != OpConst || !types.is_integer(t) {
+        return
+    }
+    var less = x.aux < y.aux
+    let equal = x.aux == y.aux
+    if !t.signed {
+        less = u64(x.aux) < u64(y.aux)
+    }
+    v.type = none
+    if comparison_holds(v.op, less, equal) {
+        become_constant(v, 1)
+        return
+    }
+    become_constant(v, 0)
+}
+
+fn comparison_holds(op: Op, less: bool, equal: bool) -> bool {
+    match op {
+        OpEq => equal
+        OpNe => !equal
+        OpLt => less
+        OpLe => less || equal
+        OpGt => !less && !equal
+        _ => !less
+    }
+}
+
+pub fn integer_op(v: *Value) -> bool {
+    let t = v.type ?? return true
+    types.is_integer(t) && (t.bits == 8 || t.bits == 16 || t.bits == 32 || t.bits == 64)
+}
+
+pub fn become_constant(v: *Value, n: i64) {
+    v.op = OpConst
+    v.args = []
+    v.aux = n
+}
+
+pub fn commutative(op: Op) -> bool {
+    op == OpAdd || op == OpMul || op == OpAnd || op == OpOr || op == OpXor
+}
+
+fn fold_binary(o: *Optimizer, v: *Value) {
+    if commutative(v.op) && v.args[0].op == OpConst && v.args[1].op != OpConst {
+        let swap = v.args[0]
+        v.args[0] = v.args[1]
+        v.args[1] = swap
+    }
+    let x = v.args[0]
+    let y = v.args[1]
+    if y.op != OpConst {
+        return
+    }
+    if x.op == OpConst {
+        match evaluate(v.op, v.type, x.aux, y.aux) {
+            some(n) => { become_constant(v, n) }
+            none => {}
+        }
+        return
+    }
+    strengthen_multiply(o, v, x, y.aux)
+}
+
+fn strengthen_multiply(o: *Optimizer, v: *Value, x: *Value, n: i64) {
+    if n == 0 && (v.op == OpAdd || v.op == OpSub || v.op == OpOr || v.op == OpXor || v.op == OpShl || v.op == OpShr) {
+        forward_to(v, x)
+    } else if n == 1 && v.op == OpMul {
+        forward_to(v, x)
+    } else if n == 0 && (v.op == OpMul || v.op == OpAnd) {
+        become_constant(v, 0)
+    } else if v.op == OpMul && n > 1 && n & (n - 1) == 0 {
+        mul_to_shift(o, v, x, n)
+    } else if (v.op == OpDiv || v.op == OpRem) && divides_by_constant(v, n) {
+        divide_by_constant(o, v, x, n)
+    }
+}
+
+pub fn forward_to(v: *Value, to: *Value) {
+    to.scalar = to.scalar && v.scalar
+    v.forward = to
+}
+
+fn mul_to_shift(o: *Optimizer, v: *Value, x: *Value, n: i64) {
+    let count = constant_for(o, v, bits.trailing_zeros(u64(n)))
+    become(v, OpShl, [x, count])
+}
+
+pub fn evaluate(op: Op, t: *types.Type?, x: i64, y: i64) -> i64? {
+    var r = 0
+    match op {
+        OpAdd => { r = x + y }
+        OpSub => { r = x - y }
+        OpMul => { r = x * y }
+        OpAnd => { r = x & y }
+        OpOr => { r = x | y }
+        OpXor => { r = x ^ y }
+        OpShl => return shift_constant(op, t, x, y)
+        OpShr => return shift_constant(op, t, x, y)
+        OpDiv => return divide_constant(op, t, x, y)
+        OpRem => return divide_constant(op, t, x, y)
+        _ => {}
+    }
+    types.wrap(t, r)
+}
+
+fn shift_constant(op: Op, t: *types.Type?, x: i64, count: i64) -> i64? {
+    let ty = t ?? return none
+    var r = 0
+    let wide = u64(count) >= 64
+    if op == OpShl && wide {
+        r = 0
+    } else if op == OpShl {
+        r = x << count
+    } else if wide && ty.signed {
+        r = x >> 63
+    } else if wide {
+        r = 0
+    } else if ty.signed {
+        r = x >> count
+    } else {
+        r = i64(u64(x) >> u64(count))
+    }
+    types.wrap(t, r)
+}
+
+fn divide_constant(op: Op, t: *types.Type?, x: i64, y: i64) -> i64? {
+    if y == 0 || y == -1 {
+        return none
+    }
+    var unsigned = false
+    match t {
+        some(ty) => { unsigned = !ty.signed }
+        none => {}
+    }
+    var r = 0
+    if unsigned && op == OpDiv {
+        r = i64(u64(x) / u64(y))
+    } else if unsigned {
+        r = i64(u64(x) % u64(y))
+    } else if op == OpDiv {
+        r = x / y
+    } else {
+        r = x % y
+    }
+    types.wrap(t, r)
+}
+
+pub fn remove_dead_values(s: *Ssa) {
+    let live = flags(s.func.values + 1)
+    var work: []*Value = []
+    for b in s.func.blocks {
+        for v in b.values {
+            if !discardable(v) {
+                mark_live(live, mut work, v)
+            }
+        }
+        match b.control {
+            some(c) => { mark_live(live, mut work, c) }
+            none => {}
+        }
+        for r in b.results {
+            mark_live(live, mut work, r)
+        }
+    }
+    for work.len > 0 {
+        let v = work[work.len - 1]
+        truncate(mut work, work.len - 1)
+        for a in v.args {
+            mark_live(live, mut work, a)
+        }
+    }
+    for b in s.func.blocks {
+        var kept: []*Value = []
+        for v in b.values {
+            if live[v.id] {
+                push(mut kept, v)
+            }
+        }
+        b.values = kept
+    }
+}
+
+fn mark_live(live: []bool, mut work: []*Value, v: *Value) {
+    if !live[v.id] {
+        live[v.id] = true
+        push(mut work, v)
+    }
+}
+
+pub fn discardable(v: *Value) -> bool {
+    match v.op {
+        OpConst => true
+        OpString => true
+        OpEmbed => true
+        OpUndef => true
+        OpPhi => true
+        OpAdd => true
+        OpSub => true
+        OpMul => true
+        OpAnd => true
+        OpOr => true
+        OpXor => true
+        OpShl => true
+        OpShr => true
+        OpNeg => true
+        OpNot => true
+        OpCompl => true
+        OpConvert => true
+        OpSqrt => true
+        OpFloor => true
+        OpEq => true
+        OpNe => true
+        OpLt => true
+        OpLe => true
+        OpGt => true
+        OpGe => true
+        OpFuncAddr => true
+        OpMulHigh => true
+        OpTrailingZeros => true
+        OpHashSeed => true
+        OpSlot => true
+        OpLoad => v.mem & mem_trap == 0
+        OpDiv => float_value(v) || divisor_cannot_fault(v)
+        OpRem => float_value(v) || divisor_cannot_fault(v)
+        _ => false
+    }
+}
+
+pub fn float_value(v: *Value) -> bool {
+    match v.type {
+        some(t) => types.is_float(t)
+        none => false
+    }
+}
+
+fn divisor_cannot_fault(v: *Value) -> bool {
+    let d = v.args[1]
+    d.op == OpConst && d.aux != 0 && d.aux != -1
+}
+
+pub fn fold_constant_branches(s: *Ssa) -> bool {
+    var folded = false
+    for b in s.func.blocks {
+        let control = b.control ?? continue
+        if b.kind == If && control.op == OpConst {
+            take_case(b, branch_index(control.aux != 0))
+            folded = true
+        }
+        if b.kind == Switch && control.op == OpConst {
+            let table = b.table ?? panic("switch without a table")
+            take_case(b, table_index(table, control.aux))
+            folded = true
+        }
+    }
+    folded
+}
+
+fn take_case(b: *Block, taken: i64) {
+    for i, succ in b.succs {
+        if i != taken {
+            remove_edge(b, succ, occurrence(b, i))
+        }
+    }
+    b.succs = [b.succs[taken]]
+    b.kind = Plain
+    b.control = none
+    b.table = none
+}
+
+fn branch_index(condition: bool) -> i64 {
+    if condition {
+        return 0
+    }
+    1
+}
+
+fn occurrence(b: *Block, succ: i64) -> i64 {
+    var n = 0
+    for s in b.succs[..succ] {
+        if s == b.succs[succ] {
+            n += 1
+        }
+    }
+    n
+}
+
+fn remove_edge(from: *Block, to: *Block, count: i64) {
+    var i = -1
+    var left = count
+    for left >= 0 {
+        let next = slices.index(to.preds[i + 1..], from) ?? panic("edge without a predecessor entry")
+        i += next + 1
+        left -= 1
+    }
+    remove_pred(to, i)
+}
+
+pub fn remove_pred(b: *Block, i: i64) {
+    b.preds = removed(b.preds, i)
+    for v in b.values {
+        if v.op == OpPhi {
+            v.args = removed(v.args, i)
+        }
+    }
+}
+
+pub fn removed[T](xs: []T, at: i64) -> []T {
+    var out: []T = []
+    for i, x in xs {
+        if i != at {
+            push(mut out, x)
+        }
+    }
+    out
+}

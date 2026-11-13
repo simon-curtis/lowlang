@@ -1,0 +1,296 @@
+import ast
+import prelude
+import std/math
+import types
+
+pub struct SelectArm {
+    pub sc: *ast.SelectCase
+    pub chant: *types.Type? = none
+    pub ch: *Value? = none
+    pub val: []*Value = []
+    pub box: *Value? = none
+    pub ms: *Value? = none
+    pub timer: *Value? = none
+}
+
+fn channel_of(a: *SelectArm) -> *types.Type {
+    a.chant ?? panic("select arm without a channel type")
+}
+
+fn chan_word(a: *SelectArm) -> *Value {
+    a.ch ?? panic("select arm without a channel")
+}
+
+fn box_of(a: *SelectArm) -> *Value {
+    a.box ?? panic("select arm without a box")
+}
+
+pub fn chan_named(b: *Builder, name: str, c: *types.Type, args: []*Value) -> []*Value {
+    let instance = types.instance_name(name, [types.elem_of(c)])
+    call_named(b, instance, args)
+}
+
+fn chan_field(b: *Builder, c: *types.Type, name: str) -> *types.Field {
+    let instance = types.instance_name(prelude.chan_new, [types.elem_of(c)])
+    prelude_field(b, instance, name)
+}
+
+struct ProbeWords {
+    state: i64
+    wake: i64
+}
+
+fn probe_words(b: *Builder, name: str, c: *types.Type) -> ProbeWords {
+    let instance = types.instance_name(name, [types.elem_of(c)])
+    let result = prelude_func(b, instance).ret
+    let state = types.field(result, prelude.probe_state) ?? panic("probe result without a state field")
+    let wake = types.field(result, prelude.probe_wake) ?? panic("probe result without a wake field")
+    ProbeWords { state: types.word(state), wake: types.word(wake) }
+}
+
+pub fn ref_address(b: *Builder, arg: ast.Expr) -> *Value {
+    let r = ref_arg(arg)
+    address(b, place_of(b, r.x))
+}
+
+pub fn receive(b: *Builder, e: *ast.Unary) -> []*Value {
+    let c = word(b, e.x)
+    chan_named(b, prelude.chan_recv, typ(e.x), [c])
+}
+
+pub fn send(b: *Builder, s: *ast.Send) {
+    let t = typ(s.chan)
+    let c = word(b, s.chan)
+    let sent = value(b, s.value, types.elem_of(t))
+    var args: []*Value = [c]
+    for w in sent {
+        push(mut args, w)
+    }
+    chan_named(b, prelude.chan_send, t, args)
+}
+
+pub fn chan_loop(b: *Builder, s: *ast.ForIn) {
+    let t = typ(s.iter)
+    let c = word(b, s.iter)
+    let loop = open_loop(b)
+    let received = chan_named(b, prelude.chan_recv, t, [c])
+    branch(b, received[0], loop.body, loop.exit)
+    enter(b, loop.body)
+    bind_loop_value(b, s, received[1..1 + types.size(types.elem_of(t))])
+    loop_body(b, loop, s.body)
+    close_loop(b, loop)
+}
+
+pub fn select_expr(b: *Builder, e: *ast.Select) -> []*Value {
+    var arms: []*SelectArm = []
+    var chans: []*SelectArm = []
+    var else_index = -1
+    for i, sc in e.cases {
+        let a = new(SelectArm { sc })
+        push(mut arms, a)
+        match sc.kind {
+            RecvCase => {
+                let chan_expr = sc.chan ?? panic("receive case without a channel")
+                let c = typ(chan_expr)
+                a.chant = c
+                a.ch = word(b, chan_expr)
+                a.box = slot(b, math.max(1, types.size(types.elem_of(c))))
+                push(mut chans, a)
+            }
+            SendCase => {
+                let chan_expr = sc.chan ?? panic("send case without a channel")
+                let sent = sc.value ?? panic("send case without a value")
+                let c = typ(chan_expr)
+                a.chant = c
+                a.ch = word(b, chan_expr)
+                a.val = value(b, sent, types.elem_of(c))
+                push(mut chans, a)
+            }
+            AfterCase => {
+                let delay = sc.value ?? panic("after case without a delay")
+                a.ms = word(b, delay)
+            }
+            ElseCase => { else_index = i }
+        }
+    }
+    let locks = lock_channels(b, chans)
+    let outcome = new_temp(b)
+    let pending_index = constant(b, -1)
+    let no_ok = constant(b, 0)
+    let no_wake = constant(b, 0)
+    write_temp(b, outcome, [pending_index, no_ok, no_wake])
+    for i, a in arms {
+        if a.ch != none {
+            try_select(b, i, a, outcome)
+        }
+    }
+    let fired = fresh_block(b)
+    let waiting = fresh_block(b)
+    let finish = fresh_block(b)
+    let current = read_temp(b, outcome, 1)[0]
+    let zero = constant(b, 0)
+    let pending = emit(b, OpLt, [current, zero])
+    branch(b, pending, waiting, fired)
+    enter(b, fired)
+    unlock_channels(b, locks, chans.len)
+    let waker = read_temp(b, outcome, 3)[2]
+    call_named(b, prelude.wake, [waker])
+    jump(b, finish)
+    enter(b, waiting)
+    if else_index >= 0 {
+        unlock_channels(b, locks, chans.len)
+        let chosen = constant(b, else_index)
+        write_temp(b, outcome, [chosen])
+    } else {
+        wait_select(b, arms, locks, chans.len, outcome)
+    }
+    jump(b, finish)
+    enter(b, finish)
+    let result = read_temp(b, outcome, 2)
+    select_arms(b, e, arms, result[0], result[1])
+}
+
+fn lock_channels(b: *Builder, chans: []*SelectArm) -> *Value? {
+    if chans.len == 0 {
+        return none
+    }
+    let locks = slot(b, chans.len)
+    for i, a in chans {
+        let lock = chan_field(b, channel_of(a), prelude.chan_lock)
+        var lock_word = chan_word(a)
+        if lock.bytes != 0 {
+            let offset = constant(b, lock.bytes)
+            lock_word = emit(b, OpAdd, [chan_word(a), offset])
+        }
+        store_words(b, Place { addr: locks, offset: 8 * i }, [lock_word])
+    }
+    let n = constant(b, chans.len)
+    runtime(b, RtLockAll, [locks, n])
+    locks
+}
+
+fn unlock_channels(b: *Builder, locks: *Value?, n: i64) {
+    match locks {
+        some(held) => {
+            let count_word = constant(b, n)
+            runtime(b, RtUnlockAll, [held, count_word])
+        }
+        none => {}
+    }
+}
+
+fn try_select(b: *Builder, i: i64, a: *SelectArm, outcome: i64) {
+    let attempt = fresh_block(b)
+    let hit = fresh_block(b)
+    let skip = fresh_block(b)
+    let current = read_temp(b, outcome, 1)[0]
+    let zero = constant(b, 0)
+    let pending = emit(b, OpLt, [current, zero])
+    branch(b, pending, attempt, skip)
+    enter(b, attempt)
+    var probe: []*Value = []
+    var words = ProbeWords { state: 0, wake: 0 }
+    if a.sc.kind == ast.SelectKind.RecvCase {
+        words = probe_words(b, prelude.sel_recv, channel_of(a))
+        probe = chan_named(b, prelude.sel_recv, channel_of(a), [chan_word(a), box_of(a)])
+    } else {
+        words = probe_words(b, prelude.sel_send, channel_of(a))
+        var args: []*Value = [chan_word(a)]
+        for w in a.val {
+            push(mut args, w)
+        }
+        probe = chan_named(b, prelude.sel_send, channel_of(a), args)
+    }
+    let none_ready = constant(b, 0)
+    let unready = emit(b, OpLt, [probe[words.state], none_ready])
+    branch(b, unready, skip, hit)
+    enter(b, hit)
+    let one = constant(b, 1)
+    let ok = emit(b, OpEq, [probe[words.state], one])
+    let chosen = constant(b, i)
+    write_temp(b, outcome, [chosen, ok, probe[words.wake]])
+    jump(b, skip)
+    enter(b, skip)
+}
+
+fn wait_select(b: *Builder, arms: []*SelectArm, locks: *Value?, n: i64, outcome: i64) {
+    let w = call_named(b, prelude.waiter, [])[0]
+    for i, a in arms {
+        let index = constant(b, i)
+        match a.sc.kind {
+            RecvCase => { chan_named(b, prelude.sel_wait_recv, channel_of(a), [chan_word(a), w, index, box_of(a)]) }
+            SendCase => {
+                let held = slot(b, math.max(1, a.val.len))
+                a.box = held
+                store_words(b, Place { addr: held }, a.val)
+                chan_named(b, prelude.sel_wait_send, channel_of(a), [chan_word(a), w, index, held])
+            }
+            _ => {}
+        }
+    }
+    unlock_channels(b, locks, n)
+    for i, a in arms {
+        match a.ms {
+            some(ms) => {
+                let which = constant(b, i)
+                a.timer = runtime(b, RtTimerAdd, [ms, w, which])
+            }
+            none => {}
+        }
+    }
+    runtime(b, RtPark, [])
+    for a in arms {
+        match a.timer {
+            some(timer) => { runtime(b, RtTimerDel, [timer]) }
+            none => {}
+        }
+        if a.sc.kind == ast.SelectKind.SendCase {
+            clear_slot(b, box_of(a), a.val.len)
+        }
+    }
+    let index_field = prelude_field(b, prelude.waiter, prelude.waiter_index)
+    let ok_field = prelude_field(b, prelude.waiter, prelude.waiter_ok)
+    let index = load_words(b, Place { addr: w, offset: index_field.bytes }, index_field.type)[0]
+    let ok = load_words(b, Place { addr: w, offset: ok_field.bytes }, ok_field.type)[0]
+    write_temp(b, outcome, [index, ok])
+}
+
+fn select_arms(b: *Builder, e: *ast.Select, arms: []*SelectArm, index: *Value, ok: *Value) -> []*Value {
+    let result_type = types.must(e.type)
+    let temp = new_temp(b)
+    let done = fresh_block(b)
+    for i, a in arms {
+        let body = fresh_block(b)
+        let next = fresh_block(b)
+        let which = constant(b, i)
+        let hit = emit(b, OpEq, [index, which])
+        branch(b, hit, body, next)
+        enter(b, body)
+        match a.sc.local {
+            some(local) => {
+                let received = chan_named(b, prelude.sel_value, channel_of(a), [ok, box_of(a)])
+                bind(b, local, received)
+            }
+            none => {}
+        }
+        if a.sc.kind == ast.SelectKind.RecvCase {
+            clear_slot(b, box_of(a), types.size(types.elem_of(channel_of(a))))
+        }
+        let words = value(b, a.sc.body, result_type)
+        write_temp(b, temp, words)
+        jump(b, done)
+        enter(b, next)
+    }
+    b.cur.kind = Unreachable
+    enter(b, done)
+    read_temp(b, temp, types.size(result_type))
+}
+
+fn clear_slot(b: *Builder, held: *Value, words: i64) {
+    var zeros: []*Value = []
+    for _ in 0..math.max(1, words) {
+        let z = constant(b, 0)
+        push(mut zeros, z)
+    }
+    store_words(b, Place { addr: held }, zeros)
+}

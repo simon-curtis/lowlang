@@ -1,0 +1,322 @@
+import ast
+import builtin
+import lexer
+import std/math
+import types
+
+pub const max_fill_bytes = 1099511627776
+pub const impossible_size = 4611686018427387904
+
+pub fn count(b: *Builder, op: Op, x: *Value, y: *Value) -> *Value {
+    typed(b, op, b.u.i64, [x, y])
+}
+
+fn regrow(b: *Builder, ptr: *Value, length: *Value, capacity: *Value, elem: *types.Type) -> *Value {
+    let stride = constant(b, types.stride(elem))
+    let used = emit(b, OpMul, [length, stride])
+    let size = emit(b, OpMul, [capacity, stride])
+    let scanned = scan(b, elem)
+    runtime(b, RtGrow, [ptr, used, size, scanned]) ?? panic("grow without a result")
+}
+
+pub fn extend(b: *Builder, e: *ast.Call) -> []*Value {
+    let reference = ref_arg(e.args[0])
+    let header = place_of(b, reference.x)
+    let src = value(b, e.args[1], b.u.str)
+    let found = room(b, header, types.must(reference.type), src[1])
+    let end = emit(b, OpAdd, [found.base, found.length])
+    runtime(b, RtMemmove, [end, src[0], src[1]])
+    store_words(b, place_at(header, 1), [found.needed])
+    []
+}
+
+pub fn extend_by(b: *Builder, e: *ast.Call) -> []*Value {
+    let reference = ref_arg(e.args[0])
+    let header = place_of(b, reference.x)
+    let extra = word(b, e.args[1])
+    let found = room(b, header, types.must(reference.type), extra)
+    store_words(b, place_at(header, 1), [found.needed])
+    [found.length]
+}
+
+struct Room {
+    base: *Value
+    length: *Value
+    needed: *Value
+}
+
+fn room(b: *Builder, header: Place, t: *types.Type, extra: *Value) -> Room {
+    let slice = load_words(b, header, t)
+    let length = slice[1]
+    let needed = count(b, OpAdd, length, extra)
+    let full = emit(b, OpGt, [needed, slice[2]])
+    let base = ensure_room(b, header, slice, full, extra, b.u.u8)
+    Room { base, length, needed }
+}
+
+fn ensure_room(b: *Builder, header: Place, slice: []*Value, full: *Value, extra: *Value?, elem: *types.Type) -> *Value {
+    let ptr = slice[0]
+    let length = slice[1]
+    let capacity = slice[2]
+    let temp = new_temp(b)
+    let grow = fresh_block(b)
+    let keep = fresh_block(b)
+    let done = fresh_block(b)
+    branch(b, full, grow, keep)
+    enter(b, grow)
+    let twice = constant(b, 2)
+    let doubled = count(b, OpMul, capacity, twice)
+    var padding = constant(b, 4)
+    match extra {
+        some(more) => { padding = count(b, OpAdd, more, padding) }
+        none => {}
+    }
+    let grown = count(b, OpAdd, doubled, padding)
+    let moved = regrow(b, ptr, length, grown, elem)
+    store_words(b, header, [moved])
+    store_words(b, place_at(header, 2), [grown])
+    write_temp(b, temp, [moved])
+    jump(b, done)
+    enter(b, keep)
+    write_temp(b, temp, [ptr])
+    jump(b, done)
+    enter(b, done)
+    read_temp(b, temp, 1)[0]
+}
+
+pub fn lower_push(b: *Builder, e: *ast.Call) -> []*Value {
+    let reference = ref_arg(e.args[0])
+    let slice_type = types.must(reference.type)
+    let elem = types.elem_of(slice_type)
+    let header = place_of(b, reference.x)
+    let pushed = value(b, e.args[1], elem)
+    let slice = load_words(b, header, slice_type)
+    let length = slice[1]
+    let full = emit(b, OpEq, [length, slice[2]])
+    let base = ensure_room(b, header, slice, full, none, elem)
+    let addr = scaled(b, base, length, types.stride(elem))
+    store_words(b, Place { addr, scalar: scalar_of(elem), tail: types.tail(elem) }, pushed)
+    let one = constant(b, 1)
+    let longer = count(b, OpAdd, length, one)
+    store_words(b, place_at(header, 1), [longer])
+    []
+}
+
+pub fn fill_loop(b: *Builder, s: *ast.ForIn) -> bool {
+    let call = loop_push(s.body) ?? return false
+    let reference = ref_arg(call.args[0])
+    let root = must_locate(b.u, reference.x)
+    let local = root.local ?? return false
+    if root.ptr != none || root.index != none {
+        return false
+    }
+    let header = place_of(b, reference.x)
+    if header.addr != none || !invariant_value(call.args[1], local, s.value_local) {
+        return false
+    }
+    fill(b, s, header, types.must(reference.type), call.args[1])
+    true
+}
+
+fn loop_push(body: *ast.Block) -> *ast.Call? {
+    var found: ast.Expr? = none
+    if body.stmts.len == 1 && body.tail == none {
+        match body.stmts[0] {
+            ExprStmt(n) => { found = n.x }
+            _ => return none
+        }
+    } else if body.stmts.len == 0 {
+        found = body.tail
+    }
+    let x = found ?? return none
+    match x {
+        Call(call) => {
+            if call.builtin != builtin.ID.Push {
+                return none
+            }
+            call
+        }
+        _ => none
+    }
+}
+
+fn is_local(l: *ast.Local, other: *ast.Local?) -> bool {
+    match other {
+        some(o) => o == l
+        none => false
+    }
+}
+
+fn invariant_value(e: ast.Expr, stored: *ast.Local, counter: *ast.Local?) -> bool {
+    match ast.literal(e) {
+        IntLit(_) => true
+        FloatLit(_) => true
+        BoolLit(_) => true
+        Ident(n) => {
+            if n.variant != none || n.null {
+                return true
+            }
+            let local = n.local ?? return false
+            n.func == none && !n.moved && local != stored && !is_local(local, counter)
+        }
+        Unary(n) => (n.op == lexer.Kind.Minus || n.op == lexer.Kind.Tilde || n.op == lexer.Kind.Not) && invariant_value(n.x, stored, counter)
+        Binary(n) => pure_binary(n) && invariant_value(n.x, stored, counter) && invariant_value(n.y, stored, counter)
+        Call(n) => n.builtin == builtin.ID.Convert && invariant_value(n.args[0], stored, counter)
+        Selector(n) => {
+            let plain = n.field != none && n.variant == none && n.reference == none && n.func == none && n.property == builtin.ID.None
+            plain && typ(n.x).kind == StructKind && invariant_value(n.x, stored, counter)
+        }
+        _ => false
+    }
+}
+
+fn pure_binary(e: *ast.Binary) -> bool {
+    let t = typ(e.x)
+    if e.splat_x || e.splat_y || is_vector(t) {
+        return false
+    }
+    if !types.is_integer(t) && !types.is_float(t) {
+        return false
+    }
+    match e.op {
+        Plus => true
+        Minus => true
+        Star => true
+        Amp => true
+        Pipe => true
+        Caret => true
+        Shl => true
+        Shr => true
+        Eq => true
+        NotEq => true
+        Lt => true
+        LtEq => true
+        Gt => true
+        GtEq => true
+        _ => false
+    }
+}
+
+fn zero_word(v: *Value) -> bool {
+    match v.op {
+        OpConst => v.aux == 0
+        OpConvert => zero_word(v.args[0])
+        _ => false
+    }
+}
+
+fn all_zero(words: []*Value) -> bool {
+    for w in words {
+        if !zero_word(w) {
+            return false
+        }
+    }
+    true
+}
+
+fn fill(b: *Builder, s: *ast.ForIn, header: Place, t: *types.Type, value_expr: ast.Expr) {
+    let elem = types.elem_of(t)
+    let counter = s.value_local ?? panic("fill loop without a counter")
+    let end = s.end ?? panic("fill loop without an end")
+    let lo = word(b, s.iter)
+    let hi = word(b, end)
+    let filler = value(b, value_expr, elem)
+    let non_empty = typed(b, OpLt, counter.type, [lo, hi])
+    let fill_block = fresh_block(b)
+    let skip = fresh_block(b)
+    let done = fresh_block(b)
+    branch(b, non_empty, fill_block, skip)
+    enter(b, skip)
+    jump(b, done)
+    enter(b, fill_block)
+    let trips = count(b, OpSub, hi, lo)
+    reject_oversize(b, trips, elem)
+    let slice = load_words(b, header, t)
+    let ptr = slice[0]
+    let length = slice[1]
+    let capacity = slice[2]
+    let needed = count(b, OpAdd, length, trips)
+    let zero = all_zero(filler)
+    var reserved = Reserved { base: ptr, room: needed }
+    if zero_word(length) && zero_word(capacity) {
+        reserved = Reserved { base: regrow(b, ptr, length, needed, elem), room: needed }
+    } else {
+        reserved = reserve(b, ptr, length, capacity, needed, elem, filler, zero)
+    }
+    if !zero {
+        fill_range(b, reserved.base, length, needed, filler, elem)
+    }
+    store_words(b, header, [reserved.base])
+    store_words(b, place_at(header, 1), [needed])
+    store_words(b, place_at(header, 2), [reserved.room])
+    jump(b, done)
+    enter(b, done)
+}
+
+struct Reserved {
+    base: *Value
+    room: *Value
+}
+
+fn reserve(b: *Builder, ptr: *Value, length: *Value, capacity: *Value, needed: *Value, elem: *types.Type, filler: []*Value, zeroed: bool) -> Reserved {
+    let ptr_temp = new_temp(b)
+    let room_temp = new_temp(b)
+    let grow = fresh_block(b)
+    let keep = fresh_block(b)
+    let joined = fresh_block(b)
+    let over = emit(b, OpGt, [needed, capacity])
+    branch(b, over, grow, keep)
+    enter(b, grow)
+    let moved = regrow(b, ptr, length, needed, elem)
+    write_temp(b, ptr_temp, [moved])
+    write_temp(b, room_temp, [needed])
+    jump(b, joined)
+    enter(b, keep)
+    write_temp(b, ptr_temp, [ptr])
+    write_temp(b, room_temp, [capacity])
+    if zeroed {
+        fill_range(b, ptr, length, needed, filler, elem)
+    }
+    jump(b, joined)
+    enter(b, joined)
+    let base = read_temp(b, ptr_temp, 1)[0]
+    let space = read_temp(b, room_temp, 1)[0]
+    Reserved { base, room: space }
+}
+
+fn reject_oversize(b: *Builder, trips: *Value, elem: *types.Type) {
+    let stride = math.max(types.stride(elem), 1)
+    let limit = constant(b, max_fill_bytes / stride)
+    let too_many = typed(b, OpGt, b.u.u64, [trips, limit])
+    let oversize = fresh_block(b)
+    let fits = fresh_block(b)
+    branch(b, too_many, oversize, fits)
+    enter(b, oversize)
+    let zero = constant(b, 0)
+    let impossible = constant(b, impossible_size)
+    runtime_call(b, RtGrow, [zero, zero, impossible, zero])
+    b.cur.kind = Unreachable
+    enter(b, fits)
+}
+
+fn fill_range(b: *Builder, base: *Value, from: *Value, to: *Value, filler: []*Value, elem: *types.Type) {
+    let counter = new_temp(b)
+    write_temp(b, counter, [from])
+    let header = fresh_block(b)
+    let body = fresh_block(b)
+    let exit = fresh_block(b)
+    jump(b, header)
+    b.cur = header
+    let i = read_temp(b, counter, 1)[0]
+    let below = typed(b, OpLt, b.u.i64, [i, to])
+    branch(b, below, body, exit)
+    enter(b, body)
+    let addr = scaled(b, base, i, types.stride(elem))
+    store_words(b, Place { addr, scalar: scalar_of(elem), tail: types.tail(elem) }, filler)
+    let one = constant(b, 1)
+    let next = count(b, OpAdd, i, one)
+    write_temp(b, counter, [next])
+    back_edge(b, header)
+    seal(b.s, header)
+    enter(b, exit)
+}

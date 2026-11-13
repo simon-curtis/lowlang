@@ -1,0 +1,1540 @@
+import ast
+import builtin
+import lexer
+import prelude
+import std/slices
+import std/text
+import types
+
+pub struct LoopTarget {
+    pub cont: *Block
+    pub brk: *Block
+    pub depth: i64
+}
+
+pub struct Place {
+    pub local: *ast.Local? = none
+    pub word: i64 = 0
+    pub addr: *Value? = none
+    pub offset: i64 = 0
+    pub scalar: *types.Type? = none
+    pub tail: i64 = 0
+    pub mem: i64 = 0
+}
+
+pub fn place_at(p: Place, word: i64) -> Place {
+    var moved = p
+    if p.addr == none {
+        moved.word += word
+    } else {
+        moved.offset += 8 * word
+    }
+    moved
+}
+
+pub struct Counter {
+    pub n: i64 = 0
+}
+
+pub struct Builder {
+    pub s: *Ssa
+    pub u: *types.Universe
+    pub cur: *Block
+    pub decl: *ast.Func
+    pub funcs: [*ast.Func: *Func]
+    pub adapters: [*ast.Func: *Func]
+    pub named: [str: *Func]
+    pub slots: [*ast.Local: *Value] = [:]
+    pub refs: [*ast.Local: *Value] = [:]
+    pub loops: []LoopTarget = []
+    pub temps: i64 = 0
+    pub defers: [][]ast.Stmt = []
+    pub subjects: [][]*Value = []
+    pub hoist: bool
+    pub cells: *Counter
+}
+
+struct Pending {
+    decl: *ast.Func
+    func: *Func
+    adapter: bool
+}
+
+pub fn build(u: *types.Universe, files: []*ast.File, optimise_program: bool) -> *Program {
+    var decls: []*ast.Func = []
+    for file in files {
+        for d in file.funcs {
+            if d.type_params.len == 0 {
+                push(mut decls, d)
+            }
+        }
+    }
+    let p = new(Program {})
+    var funcs: [*ast.Func: *Func] = [:]
+    var adapters: [*ast.Func: *Func] = [:]
+    var named: [str: *Func] = [:]
+    for d in decls {
+        let f = new(Func {
+            name: symbol_name(d)
+            param_words: param_words(d)
+            ret: types.must(d.ret_type)
+            params: params(d)
+            captures: captures(d)
+            callback: d.callback
+        })
+        if d.callback {
+            f.c_params = d.param_types
+        }
+        funcs[d] = f
+        named[d.name] = f
+        push(mut p.funcs, f)
+        if d.as_value {
+            let adapter = new(Func { name: "{f.name}..value", param_words: 1 + f.param_words, ret: f.ret })
+            adapters[d] = adapter
+            push(mut p.funcs, adapter)
+        }
+        let module = declared_module(d)
+        if d.name == "main" && module == "" {
+            p.main = f
+            let ret = types.must(d.ret_type)
+            if ret.kind == ResultKind {
+                p.main_err = ret.err
+            }
+        }
+    }
+    let cells = new(Counter {})
+    let ws = new(Workspace {})
+    var pending: [*Func: Pending] = [:]
+    for d in decls {
+        let f = funcs[d] ?? panic("declaration without a function")
+        pending[f] = Pending { decl: d, func: f, adapter: false }
+        match adapters[d] {
+            some(adapter) => { pending[adapter] = Pending { decl: d, func: adapter, adapter: true } }
+            none => {}
+        }
+    }
+    let main = p.main ?? panic("program without main")
+    let built = build_reachable(u, ws, cells, optimise_program, funcs, adapters, named, main, mut pending)
+    keep_reachable(p, built)
+    p.cells = cells.n
+    if optimise_program {
+        optimise(p, u)
+    }
+    split_critical_edges(p)
+    p.c_symbols = c_symbols(p.funcs)
+    p.imports = imports(files, p.c_symbols)
+    p
+}
+
+fn declared_module(d: *ast.Func) -> str {
+    let file = d.file ?? panic("declaration without a file")
+    file.module
+}
+
+fn builder_for(u: *types.Universe, ws: *Workspace, cells: *Counter, optimise_program: bool, funcs: [*ast.Func: *Func], adapters: [*ast.Func: *Func], named: [str: *Func], f: *Func, d: *ast.Func) -> *Builder {
+    let s = ssa_for(ws, u, f)
+    let entry = new_block(f)
+    new(Builder {
+        s
+        u
+        cur: entry
+        decl: d
+        funcs
+        adapters
+        named
+        hoist: optimise_program
+        cells
+    })
+}
+
+fn build_reachable(u: *types.Universe, ws: *Workspace, cells: *Counter, optimise_program: bool, funcs: [*ast.Func: *Func], adapters: [*ast.Func: *Func], named: [str: *Func], main: *Func, mut pending: [*Func: Pending]) -> [*Func: bool] {
+    var built: [*Func: bool] = [:]
+    var queue: []*Func = [main]
+    var at = 0
+    for at < queue.len {
+        let f = queue[at]
+        at += 1
+        let entry = pending[f] ?? continue
+        delete(mut pending, f)
+        let b = builder_for(u, ws, cells, optimise_program, funcs, adapters, named, f, entry.decl)
+        if entry.adapter {
+            let target = funcs[entry.decl] ?? panic("adapter without a target")
+            adapter(b, target)
+        } else {
+            function(b)
+        }
+        finalize(b.s)
+        built[f] = true
+        for v in direct_targets(f) {
+            let target = v.target ?? continue
+            push(mut queue, target)
+        }
+    }
+    built
+}
+
+fn c_symbols(funcs: []*Func) -> []str {
+    var symbols: []str = []
+    for f in funcs {
+        for b in f.blocks {
+            for v in b.values {
+                if v.op == OpCCall {
+                    let sig = v.sig ?? panic("ccall without a signature")
+                    if sig.symbol != "" {
+                        push(mut symbols, sig.symbol)
+                    }
+                } else if v.op == OpFuncAddr && v.aux == symbol_addr {
+                    push(mut symbols, v.str)
+                }
+            }
+        }
+    }
+    slices.sort(mut symbols)
+    compact(symbols)
+}
+
+fn compact(sorted: []str) -> []str {
+    var out: []str = []
+    for s in sorted {
+        if out.len == 0 || out[out.len - 1] != s {
+            push(mut out, s)
+        }
+    }
+    out
+}
+
+fn imports(files: []*ast.File, used: []str) -> [str: []str] {
+    var by_library: [str: []str] = [:]
+    for f in files {
+        for e in f.externs {
+            for fn_decl in e.funcs {
+                if slices.binary_search(used, fn_decl.symbol) != none {
+                    var list = by_library[e.library] ?? []
+                    push(mut list, fn_decl.symbol)
+                    by_library[e.library] = list
+                }
+            }
+        }
+    }
+    var result: [str: []str] = [:]
+    for lib, symbols in by_library {
+        var sorted = symbols
+        slices.sort(mut sorted)
+        result[lib] = compact(sorted)
+    }
+    result
+}
+
+fn symbol_name(d: *ast.Func) -> str {
+    let module = declared_module(d)
+    if module == "" {
+        return d.name
+    }
+    "{text.replace(module, "/", ".")}.{d.name}"
+}
+
+fn params(d: *ast.Func) -> []Param {
+    var out: []Param = []
+    for i, p in d.params {
+        push(mut out, Param { type: d.param_types[i], mutable: p.mutable })
+    }
+    out
+}
+
+fn captures(d: *ast.Func) -> []Capture {
+    let closure = d.closure ?? return []
+    var out: []Capture = []
+    for l in closure.captures {
+        push(mut out, Capture { type: local_type(l), boxed: boxed(l) })
+    }
+    out
+}
+
+fn param_words(d: *ast.Func) -> i64 {
+    var words = 0
+    if d.closure != none {
+        words = 1
+    }
+    for i in 0..d.params.len {
+        words += param_size(d, i)
+    }
+    words
+}
+
+pub fn local_type(l: *ast.Local) -> *types.Type {
+    l.type ?? panic("local {l.name} has no type")
+}
+
+pub fn typ(e: ast.Expr) -> *types.Type {
+    ast.type_of(e) ?? panic("expression without a type")
+}
+
+pub fn unwrap(words: [i64: *Value], count: i64) -> []*Value {
+    var out: []*Value = []
+    for k in 0..count {
+        push(mut out, words[k] ?? panic("missing word"))
+    }
+    out
+}
+
+pub fn function(b: *Builder) {
+    seal(b.s, b.cur)
+    var word = 0
+    match b.decl.closure {
+        some(closure) => {
+            environment(b, closure.captures)
+            word = 1
+        }
+        none => {}
+    }
+    for i, local in b.decl.param_locals {
+        if b.decl.params[i].mutable {
+            let reference = param(b, word)
+            b.refs[local] = reference
+            word += 1
+            continue
+        }
+        let t = local_type(local)
+        var words: []*Value = []
+        for k in 0..types.size(t) {
+            let w = param(b, word + k)
+            push(mut words, w)
+        }
+        classify(words, t)
+        bind(b, local, words)
+        word += words.len
+    }
+    let body_block = b.decl.body ?? panic("function without a body")
+    let body = lower_block(b, body_block)
+    ret(b, types.must(body_block.type), body)
+}
+
+fn capture_words(local: *ast.Local) -> i64 {
+    if boxed(local) {
+        return 1
+    }
+    types.size(local_type(local))
+}
+
+fn environment(b: *Builder, captured: []*ast.Local) {
+    let env = param(b, 0)
+    var offset = 0
+    for local in captured {
+        if boxed(local) {
+            let box = emit(b, OpLoad, [env])
+            box.aux = offset
+            b.slots[local] = box
+        } else {
+            let words = load_words(b, Place { addr: env, offset }, local_type(local))
+            store_words(b, Place { local }, words)
+        }
+        offset += 8 * capture_words(local)
+    }
+}
+
+fn adapter(b: *Builder, target: *Func) {
+    seal(b.s, b.cur)
+    var args: []*Value = []
+    var word = 1
+    for i, t in b.decl.param_types {
+        var words: []*Value = []
+        for k in 0..param_size(b.decl, i) {
+            let w = param(b, word + k)
+            push(mut words, w)
+        }
+        if !b.decl.params[i].mutable {
+            classify(words, t)
+        }
+        for w in words {
+            push(mut args, w)
+        }
+        word += words.len
+    }
+    b.cur.kind = Ret
+    b.cur.results = invoke(b, target, args)
+}
+
+pub fn param(b: *Builder, word: i64) -> *Value {
+    let v = emit(b, OpParam, [])
+    v.aux = word
+    v
+}
+
+pub fn emit(b: *Builder, op: Op, args: []*Value) -> *Value {
+    let v = new_value(b.s.func, b.cur, op, args)
+    push(mut b.cur.values, v)
+    v
+}
+
+pub fn constant(b: *Builder, n: i64) -> *Value {
+    let v = emit(b, OpConst, [])
+    v.aux = n
+    v.scalar = true
+    v
+}
+
+pub fn classify(words: []*Value, t: *types.Type) {
+    for k, pointer in types.pointer_words(t) {
+        words[k].scalar = !pointer
+    }
+    for k, bits in types.float_words(t) {
+        words[k].float_bits = bits
+    }
+}
+
+pub fn float_constant(b: *Builder, t: *types.Type, f: f64) -> *Value {
+    let v = constant(b, float_bits(t.bits, f))
+    v.float_bits = t.bits
+    v
+}
+
+pub fn emit_result(b: *Builder, call: *Value, k: i64) -> *Value {
+    let v = emit(b, OpResult, [call])
+    v.aux = k
+    v
+}
+
+pub fn fresh_block(b: *Builder) -> *Block {
+    new_block(b.s.func)
+}
+
+pub fn link(from: *Block, to: *Block) {
+    push(mut from.succs, to)
+    push(mut to.preds, from)
+}
+
+pub fn jump(b: *Builder, to: *Block) {
+    b.cur.kind = Plain
+    link(b.cur, to)
+}
+
+pub fn branch(b: *Builder, cond: *Value, then: *Block, otherwise: *Block) {
+    b.cur.kind = If
+    b.cur.control = cond
+    link(b.cur, then)
+    link(b.cur, otherwise)
+}
+
+pub fn enter(b: *Builder, block: *Block) {
+    seal(b.s, block)
+    b.cur = block
+}
+
+pub fn dead(b: *Builder) {
+    let block = fresh_block(b)
+    enter(b, block)
+}
+
+pub fn new_temp(b: *Builder) -> i64 {
+    b.temps += 1
+    b.temps
+}
+
+pub fn write_temp(b: *Builder, temp: i64, words: []*Value) {
+    for k, w in words {
+        write_var(b.s, VarKey { temp, word: k }, b.cur, w)
+    }
+}
+
+pub fn read_temp(b: *Builder, temp: i64, n: i64) -> []*Value {
+    var words: []*Value = []
+    for k in 0..n {
+        let w = read_var(b.s, VarKey { temp, word: k }, b.cur)
+        push(mut words, w)
+    }
+    words
+}
+
+pub fn pad(b: *Builder, words: []*Value, n: i64) -> []*Value {
+    var out = words
+    for out.len < n {
+        let undef = emit(b, OpUndef, [])
+        push(mut out, undef)
+    }
+    out[..n]
+}
+
+pub fn fit(b: *Builder, to: *types.Type, words: []*Value) -> []*Value {
+    pad(b, words, types.size(to))
+}
+
+pub fn value(b: *Builder, e: ast.Expr, want: *types.Type) -> []*Value {
+    let words = expr(b, e)
+    coerce(b, typ(e), want, words)
+}
+
+pub fn coerce(b: *Builder, from: *types.Type, to: *types.Type, words: []*Value) -> []*Value {
+    var out = words
+    if to.optional && to.elem == from {
+        let tag = constant(b, 1)
+        out = slices.concat([tag], words)
+    }
+    fit(b, to, out)
+}
+
+pub fn word(b: *Builder, e: ast.Expr) -> *Value {
+    let words = expr(b, e)
+    pad(b, words, 1)[0]
+}
+
+pub fn bind(b: *Builder, local: *ast.Local, words: []*Value) {
+    let t = local_type(local)
+    if boxed(local) {
+        let size = constant(b, words.len)
+        let flag = scan(b, t)
+        let box = runtime(b, RtAlloc, [size, flag]) ?? panic("alloc without a result")
+        b.slots[local] = box
+        store_words(b, Place { addr: box }, words)
+        return
+    }
+    if local.addressed || types.c_struct(t) || is_vector(t) {
+        b.slots[local] = spill(b, words)
+        return
+    }
+    store_words(b, Place { local }, words)
+}
+
+pub fn bind_loop_value(b: *Builder, s: *ast.ForIn, words: []*Value) {
+    match s.pattern {
+        some(pattern) => { destructure(b, pattern, words) }
+        none => {
+            let local = s.value_local ?? panic("loop without a value local")
+            bind(b, local, words)
+        }
+    }
+}
+
+pub fn destructure(b: *Builder, p: *ast.StructPattern, words: []*Value) {
+    let temp = p.temp ?? panic("pattern without a temporary")
+    bind(b, temp, words)
+    bind_fields(b, p)
+}
+
+fn bind_fields(b: *Builder, p: *ast.StructPattern) {
+    for f in p.fields {
+        match f.nested {
+            some(nested) => { bind_fields(b, nested) }
+            none => {
+                let binding = f.bind ?? panic("field pattern without a binding")
+                let local = binding.local ?? panic("binding without a local")
+                let source = f.source ?? panic("field pattern without a source")
+                let words = expr(b, source)
+                bind(b, local, words)
+            }
+        }
+    }
+}
+
+pub fn build_place(b: *Builder, p: *Location) -> Place {
+    match p.ptr {
+        some(ptr) => {
+            let addr = word(b, ptr)
+            return Place { addr, offset: p.offset, scalar: p.width, tail: p.tail, mem: mem_of(p) }
+        }
+        none => {}
+    }
+    match p.index {
+        some(index) => {
+            var element = element_of(b, index)
+            element.offset += p.offset
+            element.tail = p.tail
+            element.mem = mem_of(p)
+            if p.width != none {
+                element.scalar = p.width
+            }
+            return element
+        }
+        none => {}
+    }
+    let local = p.local ?? panic("location without a local")
+    if local.ref {
+        return Place { addr: b.refs[local], offset: p.offset, scalar: p.width, tail: p.tail, mem: mem_of(p) }
+    }
+    match b.slots[local] {
+        some(slot) => Place { addr: slot, offset: p.offset, scalar: p.width, tail: p.tail, mem: mem_of(p) }
+        none => Place { local, word: p.offset / 8 }
+    }
+}
+
+fn mem_of(p: *Location) -> i64 {
+    if p.width != none || p.tail != 0 {
+        return mem_raw
+    }
+    0
+}
+
+pub fn address_of(p: Place) -> *Value {
+    p.addr ?? panic("place without an address")
+}
+
+pub fn load_words(b: *Builder, p: Place, t: *types.Type) -> []*Value {
+    let size = types.size(t)
+    var words: []*Value = []
+    let pointers = types.pointer_words(t)
+    let floats = types.float_words(t)
+    for k in 0..size {
+        match p.addr {
+            none => {
+                let w = read_var(b.s, VarKey { local: p.local, word: p.word + k }, b.cur)
+                push(mut words, w)
+            }
+            some(addr) => {
+                if p.tail != 0 && k == size - 1 {
+                    let w = load_tail(b, addr, p.offset + 8 * k, p.tail, p.mem)
+                    push(mut words, w)
+                    continue
+                }
+                let v = typed(b, OpLoad, p.scalar, [addr])
+                v.aux = p.offset + 8 * k
+                v.mem = p.mem
+                v.scalar = !pointers[k]
+                if floats[k] != 0 {
+                    v.float_bits = floats[k]
+                }
+                push(mut words, v)
+            }
+        }
+    }
+    words
+}
+
+struct TailWidth {
+    bytes: i64
+    width: *types.Type
+}
+
+fn tail_widths(b: *Builder) -> []TailWidth {
+    [TailWidth { bytes: 4, width: b.u.u32 }, TailWidth { bytes: 2, width: b.u.u16 }, TailWidth { bytes: 1, width: b.u.u8 }]
+}
+
+fn load_tail(b: *Builder, addr: *Value, offset: i64, tail: i64, mem: i64) -> *Value {
+    var acc: *Value? = none
+    var at = 0
+    for part in tail_widths(b) {
+        if tail - at < part.bytes {
+            continue
+        }
+        var v = typed(b, OpLoad, part.width, [addr])
+        v.aux = offset + at
+        v.mem = mem | mem_raw
+        if at > 0 {
+            let shift = constant(b, 8 * at)
+            v = typed(b, OpShl, b.u.i64, [v, shift])
+        }
+        match acc {
+            none => { acc = v }
+            some(previous) => { acc = typed(b, OpOr, b.u.i64, [previous, v]) }
+        }
+        at += part.bytes
+    }
+    acc ?? panic("tail load without parts")
+}
+
+fn store_tail(b: *Builder, addr: *Value, offset: i64, tail: i64, w: *Value, mem: i64) {
+    var at = 0
+    for part in tail_widths(b) {
+        if tail - at < part.bytes {
+            continue
+        }
+        var v = w
+        if at > 0 {
+            let shift = constant(b, 8 * at)
+            v = typed(b, OpShr, b.u.i64, [w, shift])
+        }
+        let st = typed(b, OpStore, part.width, [addr, v])
+        st.aux = offset + at
+        st.mem = mem | mem_raw
+        at += part.bytes
+    }
+}
+
+pub fn store_words(b: *Builder, p: Place, words: []*Value) {
+    for k, w in words {
+        match p.addr {
+            none => { write_var(b.s, VarKey { local: p.local, word: p.word + k }, b.cur, w) }
+            some(addr) => {
+                if p.tail != 0 && k == words.len - 1 {
+                    store_tail(b, addr, p.offset + 8 * k, p.tail, w, p.mem)
+                    continue
+                }
+                let v = typed(b, OpStore, p.scalar, [addr, w])
+                v.aux = p.offset + 8 * k
+                v.mem = p.mem
+            }
+        }
+    }
+}
+
+pub fn address(b: *Builder, p: Place) -> *Value {
+    let addr = address_of(p)
+    if p.offset == 0 {
+        return addr
+    }
+    let offset = constant(b, p.offset)
+    emit(b, OpAdd, [addr, offset])
+}
+
+pub fn ret(b: *Builder, t: *types.Type, words: []*Value) {
+    let result_type = types.must(b.decl.ret_type)
+    var results: []*Value = []
+    if result_type == b.u.void {
+        results = []
+    } else if t == result_type {
+        results = fit(b, result_type, words)
+    } else if result_type.kind == ResultKind {
+        let tag = constant(b, 0)
+        results = [tag]
+        if types.accepts(types.ok_of(result_type), t) {
+            let coerced = coerce(b, t, types.ok_of(result_type), words)
+            results = slices.concat(results, coerced)
+        }
+        results = pad(b, results, types.size(result_type))
+    } else if types.accepts(result_type, t) {
+        results = coerce(b, t, result_type, words)
+    } else {
+        results = pad(b, [], types.size(result_type))
+    }
+    b.cur.kind = Ret
+    b.cur.results = results
+}
+
+pub fn fail_words(b: *Builder, err_words: []*Value) {
+    let tag = constant(b, 1)
+    let results = slices.concat([tag], err_words)
+    b.cur.kind = Ret
+    b.cur.results = pad(b, results, types.size(types.must(b.decl.ret_type)))
+}
+
+pub fn lower_block(b: *Builder, blk: *ast.Block) -> []*Value {
+    push(mut b.defers, [])
+    for s in blk.stmts {
+        stmt(b, s)
+    }
+    var words: []*Value = []
+    match blk.tail {
+        some(tail) => { words = expr(b, tail) }
+        none => {}
+    }
+    run_defers(b, b.defers.len - 1)
+    truncate(mut b.defers, b.defers.len - 1)
+    words
+}
+
+pub fn run_defers(b: *Builder, from: i64) {
+    var i = b.defers.len - 1
+    for i >= from {
+        let list = b.defers[i]
+        var j = list.len - 1
+        for j >= 0 {
+            stmt(b, list[j])
+            j -= 1
+        }
+        i -= 1
+    }
+}
+
+fn add_defer(b: *Builder, s: ast.Stmt) {
+    let top = b.defers.len - 1
+    var list = b.defers[top]
+    push(mut list, s)
+    b.defers[top] = list
+}
+
+pub fn stmt(b: *Builder, s: ast.Stmt) {
+    match s {
+        Let(n) => lower_let(b, n)
+        Assign(n) => assign(b, n)
+        ExprStmt(n) => { expr(b, n.x) }
+        For(n) => for_stmt(b, n)
+        ForIn(n) => for_in(b, n)
+        Break(n) => {
+            let target = b.loops[b.loops.len - 1 - n.depth]
+            run_defers(b, target.depth)
+            jump(b, target.brk)
+            dead(b)
+        }
+        Continue(n) => {
+            let target = b.loops[b.loops.len - 1 - n.depth]
+            run_defers(b, target.depth)
+            jump(b, target.cont)
+            dead(b)
+        }
+        Return(n) => {
+            var t = b.u.void
+            var words: []*Value = []
+            match n.value {
+                some(v) => {
+                    t = typ(v)
+                    words = expr(b, v)
+                }
+                none => {}
+            }
+            run_defers(b, 0)
+            ret(b, t, words)
+            dead(b)
+        }
+        Fail(n) => {
+            let words = value(b, n.value, typ(n.value))
+            run_defers(b, 0)
+            fail_words(b, words)
+            dead(b)
+        }
+        Spawn(n) => {
+            match n.body {
+                some(body) => { lower_block(b, body) }
+                none => {}
+            }
+        }
+        Send(n) => send(b, n)
+        Defer(n) => add_defer(b, n.body)
+    }
+}
+
+fn lower_let(b: *Builder, s: *ast.Let) {
+    match s.pattern {
+        some(pattern) => {
+            let t = types.must(pattern.type)
+            let words = value(b, s.value, t)
+            destructure(b, pattern, words)
+            return
+        }
+        none => {}
+    }
+    let local = s.local ?? panic("let without a local")
+    let t = local_type(local)
+    if is_vector(t) && !local.captured {
+        bind_vector(b, local, s.value)
+    } else {
+        let words = value(b, s.value, t)
+        bind(b, local, words)
+    }
+    match local.flag {
+        some(flag) => {
+            let live = constant(b, 1)
+            bind(b, flag, [live])
+        }
+        none => {}
+    }
+    match s.release {
+        some(release) => { add_defer(b, release) }
+        none => {}
+    }
+}
+
+pub fn arith(k: lexer.Kind) -> Op {
+    match k {
+        Plus => OpAdd
+        Minus => OpSub
+        Star => OpMul
+        Slash => OpDiv
+        Percent => OpRem
+        Amp => OpAnd
+        Pipe => OpOr
+        Caret => OpXor
+        Shl => OpShl
+        Shr => OpShr
+        Eq => OpEq
+        NotEq => OpNe
+        Lt => OpLt
+        LtEq => OpLe
+        Gt => OpGt
+        GtEq => OpGe
+        _ => panic("ir: no operation for {lexer.kind_text(k)}")
+    }
+}
+
+pub fn typed(b: *Builder, op: Op, t: *types.Type?, args: []*Value) -> *Value {
+    let v = emit(b, op, args)
+    v.type = t
+    match t {
+        some(ty) => {
+            v.scalar = !types.has_pointers(ty)
+            if types.is_float(ty) && !is_compare(op) {
+                v.float_bits = ty.bits
+            }
+        }
+        none => { v.scalar = false }
+    }
+    v
+}
+
+fn assign(b: *Builder, s: *ast.Assign) {
+    if s.entry != none {
+        assign_entry(b, s)
+        return
+    }
+    let t = typ(s.target)
+    if is_vector(t) {
+        assign_vector(b, s)
+        return
+    }
+    var source = t
+    let op = lexer.operator(s.op)
+    if op == Shl || op == Shr {
+        source = typ(s.value)
+    }
+    var words = value(b, s.value, source)
+    match s.release {
+        some(release) => { stmt(b, release) }
+        none => {}
+    }
+    let p = place_of(b, s.target)
+    if op != Assign {
+        let old = load_words(b, p, t)
+        words = compound(b, op, t, old, words)
+    }
+    let stored = fit(b, t, words)
+    store_words(b, p, stored)
+    match s.flag {
+        some(flag) => { set_flag(b, flag, 1) }
+        none => {}
+    }
+}
+
+fn compound(b: *Builder, op: lexer.Kind, t: *types.Type, old: []*Value, value_words: []*Value) -> []*Value {
+    if t == b.u.str {
+        return compose_pieces(b, [Piece { words: old, has_words: true, typ: t }, Piece { words: value_words, has_words: true, typ: t }])
+    }
+    let rhs = pad(b, value_words, 1)[0]
+    [typed(b, arith(op), t, [old[0], rhs])]
+}
+
+pub fn set_flag(b: *Builder, flag: *ast.Local, live: i64) {
+    let p = build_place(b, new(Location { local: flag }))
+    let c = constant(b, live)
+    store_words(b, p, [c])
+}
+
+fn for_stmt(b: *Builder, s: *ast.For) {
+    let loop = open_loop(b)
+    match s.cond {
+        some(cond) => {
+            let c = word(b, cond)
+            branch(b, c, loop.body, loop.exit)
+        }
+        none => { jump(b, loop.body) }
+    }
+    enter(b, loop.body)
+    loop_body(b, loop, s.body)
+    close_loop(b, loop)
+}
+
+pub fn back_edge(b: *Builder, header: *Block) {
+    b.cur.poll = true
+    jump(b, header)
+}
+
+pub fn expr(b: *Builder, e: ast.Expr) -> []*Value {
+    let t = ast.type_of(e)
+    match t {
+        some(ty) => {
+            if is_vector(ty) {
+                match vector_node(b, e) {
+                    some(addr) => { return load_words(b, Place { addr }, ty) }
+                    none => {}
+                }
+            }
+        }
+        none => {}
+    }
+    match e {
+        IntLit(n) => {
+            let ty = types.must(n.type)
+            if types.is_float(ty) {
+                return [float_constant(b, ty, f64(n.value))]
+            }
+            [constant(b, n.value)]
+        }
+        FloatLit(n) => [float_constant(b, types.must(n.type), n.value)]
+        BoolLit(n) => {
+            if n.value {
+                return [constant(b, 1)]
+            }
+            [constant(b, 0)]
+        }
+        StrLit(n) => {
+            let v = emit(b, OpString, [])
+            v.str = n.value
+            v.scalar = true
+            let length = constant(b, n.value.len)
+            [v, length]
+        }
+        Index(n) => {
+            if typ(n.x).kind == MapKind {
+                return lookup(b, n)
+            }
+            let found = locate(b.u, e) ?? new(Location { index: n, tail: types.tail(types.must(n.type)) })
+            let p = build_place(b, found)
+            load_words(b, p, types.must(n.type))
+        }
+        Receiver(n) => expr(b, n.x)
+        Slicing(n) => slicing(b, n)
+        SliceLit(n) => slice_lit(b, n)
+        MapLit(n) => map_lit(b, n)
+        Interp(_) => compose(b, flatten(e, none, none))
+        Ident(n) => lower_ident(b, e, n)
+        Selector(n) => lower_selector_expr(b, e, n)
+        Closure(n) => lower_closure(b, n)
+        StructLit(n) => {
+            let ty = types.must(n.type)
+            if types.c_struct(ty) {
+                return c_struct(b, n)
+            }
+            var words: [i64: *Value] = [:]
+            for init in n.fields {
+                let f = init.field ?? panic("field initialiser without a field")
+                let vs = value(b, init.value, f.type)
+                let at = types.word(f)
+                for k, w in vs {
+                    words[at + k] = w
+                }
+            }
+            unwrap(words, types.size(ty))
+        }
+        Unary(n) => unary(b, n)
+        Binary(n) => binary(b, n)
+        Call(n) => lower_call(b, n)
+        If(n) => if_expr(b, n)
+        Block(n) => lower_block(b, n)
+        Match(n) => {
+            let subject = value(b, n.x, typ(n.x))
+            dispatch(b, n.arms, subject, types.must(n.type))
+        }
+        Select(n) => select_expr(b, n)
+        Subject(n) => b.subjects[b.subjects.len - 1]
+        Try(n) => lower_try(b, n)
+        Catch(n) => lower_catch(b, n)
+        Or(n) => {
+            let result_type = types.must(n.type)
+            handle(b, n.x, result_type, fn(err: []*Value) -> []*Value { value(b, n.fallback, result_type) })
+        }
+        _ => []
+    }
+}
+
+fn lower_ident(b: *Builder, e: ast.Expr, n: *ast.Ident) -> []*Value {
+    let t = types.must(n.type)
+    match n.variant {
+        some(v) => { return construct(b, t, v, []) }
+        none => {}
+    }
+    if n.null {
+        return [constant(b, 0)]
+    }
+    match n.func {
+        some(f) => { return func_value(b, f, t) }
+        none => {}
+    }
+    match n.constant {
+        some(k) => { return expr(b, folded(k)) }
+        none => {}
+    }
+    let local = n.local ?? panic("identifier {n.name} is not a local")
+    let words = load_words(b, build_place(b, new(Location { local })), t)
+    if n.moved {
+        let flag = local.flag ?? panic("moved local without a flag")
+        set_flag(b, flag, 0)
+    }
+    words
+}
+
+pub fn folded(k: *ast.Const) -> ast.Expr {
+    k.folded ?? panic("constant {k.name} is not folded")
+}
+
+fn lower_selector_expr(b: *Builder, e: ast.Expr, n: *ast.Selector) -> []*Value {
+    let t = types.must(n.type)
+    match n.func {
+        some(f) => { return func_value(b, f, t) }
+        none => {}
+    }
+    match n.constant {
+        some(k) => { return expr(b, folded(k)) }
+        none => {}
+    }
+    if n.reference != none {
+        return field_reference(b, n)
+    }
+    selector(b, e, n)
+}
+
+fn selector(b: *Builder, e: ast.Expr, n: *ast.Selector) -> []*Value {
+    let t = types.must(n.type)
+    match n.variant {
+        some(v) => { return construct(b, t, v, []) }
+        none => {}
+    }
+    let owner = typ(n.x)
+    if n.property == Index {
+        return variant_index(b, n)
+    }
+    if n.property == Len && owner.kind == MapKind {
+        let m = word(b, n.x)
+        return map_call(b, prelude.map_len, owner, [m])
+    }
+    if n.property == Len {
+        let words = value(b, n.x, owner)
+        return words[1..2]
+    }
+    match locate(b.u, e) {
+        some(p) => { return load_words(b, build_place(b, p), t) }
+        none => {}
+    }
+    if types.c_struct(owner) {
+        return c_field(b, n)
+    }
+    let words = value(b, n.x, owner)
+    let f = n.field ?? panic("selector without a field")
+    words[types.word(f)..types.word(f) + types.size(t)]
+}
+
+fn unary(b: *Builder, e: *ast.Unary) -> []*Value {
+    let t = types.must(e.type)
+    match e.op {
+        Star => {
+            let p = build_place(b, new(Location { ptr: e.x }))
+            return load_words(b, p, t)
+        }
+        Not => {
+            let x = word(b, e.x)
+            return [typed(b, OpNot, b.u.bool, [x])]
+        }
+        Tilde => {
+            let x = word(b, e.x)
+            return [typed(b, OpCompl, t, [x])]
+        }
+        LArrow => return receive(b, e)
+        _ => {}
+    }
+    let x = word(b, e.x)
+    [typed(b, OpNeg, t, [x])]
+}
+
+fn binary(b: *Builder, e: *ast.Binary) -> []*Value {
+    if e.op == AndAnd || e.op == OrOr {
+        return logical(b, e)
+    }
+    if e.op == Coalesce {
+        return coalesce(b, e)
+    }
+    let t = typ(e.x)
+    if t == b.u.str {
+        return strings(b, e)
+    }
+    if aggregate(t) {
+        let x = value(b, e.x, t)
+        let y = value(b, e.y, t)
+        var same = equal(b, t, x, y)
+        if e.op == NotEq {
+            same = typed(b, OpNot, b.u.bool, [same])
+        }
+        return [same]
+    }
+    let x = word(b, e.x)
+    let y = word(b, e.y)
+    [typed(b, arith(e.op), t, [x, y])]
+}
+
+fn logical(b: *Builder, e: *ast.Binary) -> []*Value {
+    let temp = new_temp(b)
+    let rhs = fresh_block(b)
+    let done = fresh_block(b)
+    let x = word(b, e.x)
+    write_temp(b, temp, [x])
+    if e.op == AndAnd {
+        branch(b, x, rhs, done)
+    } else {
+        branch(b, x, done, rhs)
+    }
+    enter(b, rhs)
+    let y = word(b, e.y)
+    write_temp(b, temp, [y])
+    jump(b, done)
+    enter(b, done)
+    read_temp(b, temp, 1)
+}
+
+fn lower_call(b: *Builder, e: *ast.Call) -> []*Value {
+    if e.builtin != None {
+        return lower_builtin(b, e)
+    }
+    match e.variant {
+        some(v) => { return construct(b, types.must(e.type), v, e.args) }
+        none => {}
+    }
+    if e.target == none {
+        return call_value(b, e)
+    }
+    call_func(b, e)
+}
+
+fn field_reference(b: *Builder, e: *ast.Selector) -> []*Value {
+    let reference = e.reference ?? panic("selector without a reference")
+    let name = emit(b, OpString, [])
+    name.str = reference.name
+    name.scalar = true
+    let owner = types.must(e.type).type_args[0]
+    var index = 0
+    for i, f in owner.fields {
+        if f == reference {
+            index = i
+        }
+    }
+    let length = constant(b, reference.name.len)
+    let at = constant(b, index)
+    [name, length, at]
+}
+
+pub fn func_addr(b: *Builder, kind: i64, target: *Func?) -> *Value {
+    let v = emit(b, OpFuncAddr, [])
+    v.aux = kind
+    v.target = target
+    v.scalar = true
+    v
+}
+
+fn func_value(b: *Builder, f: *ast.Func, t: *types.Type) -> []*Value {
+    if f.external != none {
+        let v = func_addr(b, symbol_addr, none)
+        v.str = f.symbol
+        return [v]
+    }
+    if t.c {
+        return [func_addr(b, thunk_addr, b.funcs[f])]
+    }
+    let code = func_addr(b, code_addr, b.adapters[f])
+    let env = constant(b, 0)
+    [code, env]
+}
+
+fn lower_closure(b: *Builder, e: *ast.Closure) -> []*Value {
+    let closure_func = e.func ?? panic("closure without a function")
+    let code = func_addr(b, code_addr, b.funcs[closure_func])
+    if e.captures.len == 0 {
+        let env = constant(b, 0)
+        return [code, env]
+    }
+    var words = 0
+    for local in e.captures {
+        words += capture_words(local)
+    }
+    let size = constant(b, words)
+    let flag = constant(b, 1)
+    let env = runtime(b, RtAlloc, [size, flag]) ?? panic("alloc without a result")
+    var offset = 0
+    for local in e.captures {
+        let held = captured(b, local)
+        store_words(b, Place { addr: env, offset }, held)
+        offset += 8 * capture_words(local)
+    }
+    [code, env]
+}
+
+fn captured(b: *Builder, local: *ast.Local) -> []*Value {
+    if boxed(local) {
+        return [b.slots[local] ?? panic("boxed capture without a box")]
+    }
+    load_words(b, build_place(b, new(Location { local })), local_type(local))
+}
+
+pub struct WriteBack {
+    pub to: Place
+    pub from: *Value
+    pub typ: *types.Type
+}
+
+pub struct Arguments {
+    pub words: []*Value = []
+    pub backs: []WriteBack = []
+}
+
+pub fn arguments(b: *Builder, args: []ast.Expr, params_of: []*types.Type) -> Arguments {
+    var found = Arguments {}
+    for i, arg in args {
+        match arg {
+            Ref(r) => {
+                let p = place_of(b, r.x)
+                if p.scalar == none && p.tail == 0 {
+                    push(mut found.words, address(b, p))
+                    continue
+                }
+                let ref_type = types.must(r.type)
+                let held = slot(b, types.size(ref_type))
+                let loaded = load_words(b, p, ref_type)
+                store_words(b, Place { addr: held }, loaded)
+                push(mut found.words, held)
+                push(mut found.backs, WriteBack { to: p, from: held, typ: ref_type })
+            }
+            _ => {
+                let vs = value(b, arg, params_of[i])
+                for w in vs {
+                    push(mut found.words, w)
+                }
+            }
+        }
+    }
+    found
+}
+
+pub fn write_back(b: *Builder, backs: []WriteBack) {
+    for w in backs {
+        let loaded = load_words(b, Place { addr: w.from }, w.typ)
+        store_words(b, w.to, loaded)
+    }
+}
+
+fn call_value(b: *Builder, e: *ast.Call) -> []*Value {
+    let t = typ(e.callee)
+    let callee = value(b, e.callee, t)
+    let ret_type = types.ret_of(t)
+    if t.c {
+        return c_invoke(b, "", t.params, ret_type, callee, e.args)
+    }
+    let args = arguments(b, e.args, t.params)
+    let signature = new(Func { name: t.name, param_words: 1 + args.words.len, ret: ret_type })
+    let operands = slices.concat(callee, args.words)
+    let call = emit(b, OpCall, operands)
+    call.signature = signature
+    let found = results(b, call, signature)
+    write_back(b, args.backs)
+    found
+}
+
+pub fn convert(b: *Builder, x: *Value, from: *types.Type, to: *types.Type) -> *Value {
+    if from == to {
+        return x
+    }
+    let v = typed(b, OpConvert, to, [x])
+    v.from = from
+    v
+}
+
+pub fn exp_call(b: *Builder, e: *ast.Call) -> []*Value {
+    let x = word(b, e.args[0])
+    let t = types.must(e.type)
+    let wide = convert(b, x, t, b.u.f64)
+    let result = runtime(b, RtExp, [wide]) ?? panic("exp without a result")
+    let narrowed = convert(b, result, b.u.f64, t)
+    [narrowed]
+}
+
+pub fn allocate(b: *Builder, e: *ast.Call) -> []*Value {
+    let arg = e.args[0]
+    let t = typ(arg)
+    let words = value(b, arg, t)
+    let size = constant(b, types.size(t))
+    let flag = scan(b, t)
+    let ptr = runtime(b, RtAlloc, [size, flag]) ?? panic("alloc without a result")
+    store_words(b, Place { addr: ptr }, words)
+    [ptr]
+}
+
+pub fn scan(b: *Builder, t: *types.Type) -> *Value {
+    if types.has_pointers(t) {
+        return constant(b, 1)
+    }
+    constant(b, 0)
+}
+
+pub fn construct(b: *Builder, enum_type: *types.Type, v: *types.Variant, args: []ast.Expr) -> []*Value {
+    if types.scalar(enum_type) {
+        return [constant(b, v.tag)]
+    }
+    var words: [i64: *Value] = [:]
+    words[0] = constant(b, v.tag)
+    for i, arg in args {
+        let vs = value(b, arg, v.fields[i])
+        for k, w in vs {
+            words[v.offsets[i] + k] = w
+        }
+    }
+    var out: []*Value = []
+    for k in 0..types.size(enum_type) {
+        match words[k] {
+            some(present) => { push(mut out, present) }
+            none => {
+                let undef = emit(b, OpUndef, [])
+                push(mut out, undef)
+            }
+        }
+    }
+    out
+}
+
+fn call_func(b: *Builder, e: *ast.Call) -> []*Value {
+    let target = e.target ?? panic("call without a target")
+    if target.external != none {
+        return c_call(b, e)
+    }
+    let args = arguments(b, e.args, target.param_types)
+    let callee = b.funcs[target] ?? panic("call to an undeclared function {target.name}")
+    let found = invoke(b, callee, args.words)
+    write_back(b, args.backs)
+    found
+}
+
+pub fn invoke(b: *Builder, target: *Func, args: []*Value) -> []*Value {
+    let call = emit(b, OpCall, args)
+    call.target = target
+    results(b, call, target)
+}
+
+pub fn results(b: *Builder, call: *Value, target: *Func) -> []*Value {
+    var found: []*Value = []
+    for k in 0..result_words(target) {
+        let r = emit_result(b, call, k)
+        push(mut found, r)
+    }
+    classify(found, target.ret)
+    found
+}
+
+fn if_expr(b: *Builder, e: *ast.If) -> []*Value {
+    let t = types.must(e.type)
+    let temp = new_temp(b)
+    let then = fresh_block(b)
+    let otherwise = fresh_block(b)
+    let done = fresh_block(b)
+    let cond = word(b, e.cond)
+    branch(b, cond, then, otherwise)
+    enter(b, then)
+    let then_words = value(b, ast.Expr.Block(e.then), t)
+    write_temp(b, temp, then_words)
+    jump(b, done)
+    enter(b, otherwise)
+    match e.otherwise {
+        some(other) => {
+            let other_words = value(b, other, t)
+            write_temp(b, temp, other_words)
+        }
+        none => {}
+    }
+    jump(b, done)
+    enter(b, done)
+    read_temp(b, temp, types.size(t))
+}
+
+pub fn dispatch(b: *Builder, arms: []*ast.Arm, subject: []*Value, result_type: *types.Type) -> []*Value {
+    let temp = new_temp(b)
+    let done = fresh_block(b)
+    var targets: []*Block = []
+    for _ in 0..arms.len {
+        let target = fresh_block(b)
+        push(mut targets, target)
+    }
+    select_arm(b, arms, targets, subject)
+    for i, arm in arms {
+        enter(b, targets[i])
+        bind_pattern(b, arm.pattern, subject)
+        let words = value(b, arm.body, result_type)
+        write_temp(b, temp, words)
+        jump(b, done)
+    }
+    enter(b, done)
+    read_temp(b, temp, types.size(result_type))
+}
+
+fn select_arm(b: *Builder, arms: []*ast.Arm, targets: []*Block, subject: []*Value) {
+    let last = arms.len - 1
+    match switch_of(b.u, arms, targets) {
+        some(plan) => {
+            lower_switch(b, plan, subject[0], targets[last])
+            return
+        }
+        none => {}
+    }
+    for i, arm in arms {
+        if (arm.pattern.variant == none && arm.pattern.test == none) || i == last {
+            jump(b, targets[i])
+            return
+        }
+        let next = fresh_block(b)
+        let matched = arm_matches(b, arm.pattern, subject)
+        branch(b, matched, targets[i], next)
+        enter(b, next)
+    }
+}
+
+pub fn arm_matches(b: *Builder, p: *ast.Pattern, subject: []*Value) -> *Value {
+    match p.test {
+        none => {
+            let variant = p.variant ?? panic("pattern without a variant")
+            let tag = constant(b, variant.tag)
+            return emit(b, OpEq, [subject[0], tag])
+        }
+        some(test) => {
+            push(mut b.subjects, subject)
+            let matched = word(b, test)
+            truncate(mut b.subjects, b.subjects.len - 1)
+            return matched
+        }
+    }
+}
+
+pub fn bind_pattern(b: *Builder, p: *ast.Pattern, subject: []*Value) {
+    match p.local {
+        some(local) => { bind(b, local, subject[..types.size(local_type(local))]) }
+        none => {}
+    }
+    for i, binding in p.bindings {
+        let local = binding.local ?? continue
+        let variant = p.variant ?? panic("binding without a variant")
+        let offset = variant.offsets[i]
+        bind(b, local, subject[offset..offset + types.size(local_type(local))])
+    }
+}
+
+fn lower_try(b: *Builder, e: *ast.Try) -> []*Value {
+    propagate(b, e.x, fn(err: []*Value) -> []*Value { err })
+}
+
+fn propagate(b: *Builder, x: ast.Expr, map_error: fn([]*Value) -> []*Value) -> []*Value {
+    let r = typ(x)
+    let words = value(b, x, r)
+    let ok = fresh_block(b)
+    let failed = fresh_block(b)
+    branch(b, words[0], failed, ok)
+    enter(b, failed)
+    let mapped = map_error(words[1..1 + types.size(types.err_of(r))])
+    run_defers(b, 0)
+    fail_words(b, mapped)
+    enter(b, ok)
+    words[1..1 + types.size(types.ok_of(r))]
+}
+
+fn lower_catch(b: *Builder, e: *ast.Catch) -> []*Value {
+    let result_type = types.must(e.type)
+    match e.map {
+        some(mapping) => {
+            return propagate(b, e.x, fn(err: []*Value) -> []*Value {
+                push(mut b.subjects, err)
+                let mapped = value(b, ast.Expr.Call(mapping), types.must(mapping.type))
+                truncate(mut b.subjects, b.subjects.len - 1)
+                mapped
+            })
+        }
+        none => {}
+    }
+    handle(b, e.x, result_type, fn(err: []*Value) -> []*Value { dispatch(b, e.arms, err, result_type) })
+}
+
+pub fn handle(b: *Builder, x: ast.Expr, result_type: *types.Type, recover: fn([]*Value) -> []*Value) -> []*Value {
+    let r = typ(x)
+    let words = value(b, x, r)
+    let temp = new_temp(b)
+    let ok = fresh_block(b)
+    let failed = fresh_block(b)
+    let done = fresh_block(b)
+    branch(b, words[0], failed, ok)
+    enter(b, ok)
+    let ok_type = types.ok_of(r)
+    let coerced = coerce(b, ok_type, result_type, words[1..1 + types.size(ok_type)])
+    write_temp(b, temp, coerced)
+    jump(b, done)
+    enter(b, failed)
+    let recovered = recover(words[1..1 + types.size(types.err_of(r))])
+    write_temp(b, temp, recovered)
+    jump(b, done)
+    enter(b, done)
+    read_temp(b, temp, types.size(result_type))
+}

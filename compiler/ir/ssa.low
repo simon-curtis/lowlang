@@ -1,0 +1,356 @@
+import std/slices
+
+pub fn resolve(v: *Value) -> *Value {
+    var cur = v
+    for {
+        match cur.forward {
+            some(next) => { cur = next }
+            none => return cur
+        }
+    }
+}
+
+pub fn write_var(s: *Ssa, k: VarKey, b: *Block, v: *Value) {
+    s.ws.variables[def_key(s.ws, k, b.id)] = v
+}
+
+pub fn read_var(s: *Ssa, k: VarKey, b: *Block) -> *Value {
+    match s.ws.variables[def_key(s.ws, k, b.id)] {
+        some(v) => resolve(v)
+        none => read_recursive(s, k, b)
+    }
+}
+
+fn read_recursive(s: *Ssa, k: VarKey, b: *Block) -> *Value {
+    let v = if !is_sealed(s.ws, b) {
+        let p = new_phi(s, b)
+        add_incomplete(s.ws, b, PendingPhi { key: k, phi: p })
+        p
+    } else if b.preds.len == 0 {
+        prepend(s, b, OpUndef)
+    } else if b.preds.len == 1 {
+        read_var(s, k, b.preds[0])
+    } else {
+        let p = new_phi(s, b)
+        write_var(s, k, b, p)
+        add_operands(s, k, p)
+    }
+    write_var(s, k, b, v)
+    v
+}
+
+pub fn new_phi(s: *Ssa, b: *Block) -> *Value {
+    prepend(s, b, OpPhi)
+}
+
+pub fn prepend(s: *Ssa, b: *Block, op: Op) -> *Value {
+    let v = new_value(s.func, b, op, [])
+    b.values = slices.concat([v], b.values)
+    v
+}
+
+fn add_operands(s: *Ssa, k: VarKey, p: *Value) -> *Value {
+    for pred in p.block.preds {
+        let arg = read_var(s, k, pred)
+        push(mut p.args, arg)
+    }
+    trivial(s, p)
+}
+
+pub fn trivial(s: *Ssa, p: *Value) -> *Value {
+    let found = sole_operand(p)
+    if !found.ok {
+        return p
+    }
+    let same = found.value ?? prepend(s, p.block, OpUndef)
+    p.forward = same
+    same
+}
+
+pub struct Sole {
+    pub value: *Value?
+    pub ok: bool
+}
+
+fn sole_operand(p: *Value) -> Sole {
+    var same: *Value? = none
+    for a in p.args {
+        let arg = resolve(a)
+        if arg == p || same == arg {
+            continue
+        }
+        if same != none {
+            return Sole { value: none, ok: false }
+        }
+        same = arg
+    }
+    Sole { value: same, ok: true }
+}
+
+pub fn seal(s: *Ssa, b: *Block) {
+    var i = 0
+    for {
+        match take_incomplete(s.ws, b, i) {
+            some(pending) => {
+                add_operands(s, pending.key, pending.phi)
+                i += 1
+            }
+            none => break
+        }
+    }
+    drop_incomplete(s.ws, b)
+    mark_sealed(s.ws, b)
+}
+
+pub fn finalize(s: *Ssa) {
+    optimize_until_stable(s)
+    optimize_loops(s)
+    remove_dead_values(s)
+    compact_slots(s)
+    count_uses(s)
+    classify_phis(s)
+    classify_float_phis(s)
+}
+
+fn optimize_until_stable(s: *Ssa) {
+    for {
+        prune(s)
+        for remove_trivial_phis(s) {
+        }
+        let promoted = promote_slots(s)
+        optimize(s)
+        for remove_trivial_phis(s) {
+        }
+        let folded = fold_constant_branches(s)
+        let threaded = thread_branches(s)
+        let merged = merge_blocks(s)
+        if !folded && !threaded && !merged && !promoted {
+            return
+        }
+    }
+}
+
+fn is_unscalar(a: *Value) -> bool {
+    !a.scalar
+}
+
+fn classify_phis(s: *Ssa) {
+    var phis: []*Value = []
+    for b in s.func.blocks {
+        for v in b.values {
+            if v.op == OpPhi {
+                v.scalar = true
+                push(mut phis, v)
+            }
+            if v.op == OpUndef || v.op == OpSlot {
+                v.scalar = true
+            }
+        }
+    }
+    var changed = true
+    for changed {
+        changed = false
+        for p in phis {
+            if p.scalar && slices.any(p.args, is_unscalar) {
+                p.scalar = false
+                changed = true
+            }
+        }
+    }
+}
+
+fn prune(s: *Ssa) {
+    let reachable = flags(s.func.block_ids)
+    var work: []*Block = [s.func.blocks[0]]
+    for work.len > 0 {
+        let b = work[work.len - 1]
+        truncate(mut work, work.len - 1)
+        if reachable[b.id] {
+            continue
+        }
+        reachable[b.id] = true
+        for succ in b.succs {
+            push(mut work, succ)
+        }
+    }
+    var kept: []*Block = []
+    for b in s.func.blocks {
+        if reachable[b.id] {
+            drop_dead_preds(b, reachable)
+            push(mut kept, b)
+        }
+    }
+    s.func.blocks = kept
+}
+
+fn drop_dead_preds(b: *Block, reachable: []bool) {
+    var live: []i64 = []
+    for i, p in b.preds {
+        if reachable[p.id] {
+            push(mut live, i)
+        }
+    }
+    if live.len == b.preds.len {
+        return
+    }
+    var preds: []*Block = []
+    for i in live {
+        push(mut preds, b.preds[i])
+    }
+    b.preds = preds
+    for v in b.values {
+        if v.op != OpPhi || v.forward != none {
+            continue
+        }
+        var args: []*Value = []
+        for i in live {
+            push(mut args, v.args[i])
+        }
+        v.args = args
+    }
+}
+
+fn remove_trivial_phis(s: *Ssa) -> bool {
+    var changed = false
+    for b in s.func.blocks {
+        for v in b.values {
+            if v.op == OpPhi && v.forward == none && trivial(s, v) != v {
+                changed = true
+            }
+        }
+    }
+    for b in s.func.blocks {
+        resolve_block(s, b)
+    }
+    changed
+}
+
+pub fn resolve_block(s: *Ssa, b: *Block) {
+    var kept: []*Value = []
+    for v in b.values {
+        if v.forward != none {
+            continue
+        }
+        for i, arg in v.args {
+            v.args[i] = resolve(arg)
+        }
+        push(mut kept, v)
+    }
+    b.values = kept
+    match b.control {
+        some(c) => { b.control = resolve(c) }
+        none => {}
+    }
+    for i, r in b.results {
+        b.results[i] = resolve(r)
+    }
+}
+
+fn count_uses(s: *Ssa) {
+    for b in s.func.blocks {
+        for v in b.values {
+            v.uses = 0
+        }
+    }
+    for b in s.func.blocks {
+        for v in b.values {
+            for arg in v.args {
+                arg.uses += 1
+            }
+        }
+        match b.control {
+            some(c) => { c.uses += 1 }
+            none => {}
+        }
+        for r in b.results {
+            r.uses += 1
+        }
+    }
+}
+
+fn classify_float_phis(s: *Ssa) {
+    var phis: []*Value = []
+    for b in s.func.blocks {
+        for v in b.values {
+            if v.op == OpPhi {
+                push(mut phis, v)
+            }
+        }
+    }
+    let lattice = counts(s.func.values + 1)
+    var changed = true
+    for changed {
+        changed = false
+        for p in phis {
+            if refine_float(lattice, p) {
+                changed = true
+            }
+        }
+    }
+    for p in phis {
+        p.float_bits = lattice_bits(lattice, p)
+    }
+}
+
+fn lattice_known(l: []i64, v: *Value) -> bool {
+    l[v.id] != 0
+}
+
+fn lattice_value(l: []i64, v: *Value) -> i64 {
+    l[v.id] - 1
+}
+
+fn lattice_bits(l: []i64, v: *Value) -> i64 {
+    if lattice_known(l, v) {
+        return lattice_value(l, v)
+    }
+    0
+}
+
+fn refine_float(l: []i64, p: *Value) -> bool {
+    let joined = join_float(l, p)
+    let known = lattice_known(l, p)
+    if !joined.determined || (known && lattice_value(l, p) == joined.bits) {
+        return false
+    }
+    l[p.id] = joined.bits + 1
+    true
+}
+
+struct Joined {
+    bits: i64
+    determined: bool
+}
+
+fn join_float(l: []i64, p: *Value) -> Joined {
+    var bits = 0
+    var determined = false
+    for a in p.args {
+        if a == p || a.op == OpUndef {
+            continue
+        }
+        let arg = bits_of(l, a)
+        if !arg.known {
+            continue
+        }
+        if !determined {
+            bits = arg.bits
+            determined = true
+        } else if bits != arg.bits {
+            return Joined { bits: 0, determined: true }
+        }
+    }
+    Joined { bits, determined }
+}
+
+struct KnownBits {
+    bits: i64
+    known: bool
+}
+
+fn bits_of(l: []i64, v: *Value) -> KnownBits {
+    if v.op != OpPhi {
+        return KnownBits { bits: v.float_bits, known: true }
+    }
+    KnownBits { bits: lattice_value(l, v), known: lattice_known(l, v) }
+}
