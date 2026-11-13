@@ -1,0 +1,516 @@
+import asm
+import std/io
+import std/text
+
+const plt_entry_size = 16
+const got_entry_size = 8
+const verneed_size = 16
+const vernaux_size = 16
+const spare_dyn_entries = 5
+const plt_got_entry_size = 8
+const gnu_hash_header = 16
+const bloom_word_bytes = 8
+const bloom_word_bits = 64
+const bloom_shift = 6
+const hash_header_size = 8
+const first_unhashed = 1
+
+const loaded_flags = asm.flag_alloc
+const writable_flags = asm.flag_alloc | asm.flag_write
+const executable_flags = asm.flag_alloc | asm.flag_exec
+
+struct DynTag {
+    tag: i64
+    value: i64
+}
+
+fn synthetic(name: str, flags: i64, class: i64, align: i64, size: i64) -> *Section {
+    let input = new(asm.Section { name, flags, align, data: io.buffer(size) })
+    new(Section { input, class, size, align })
+}
+
+fn synthesize(d: *DynamicLink) -> []*Section {
+    var interp_bytes: []u8 = []
+    text.append(mut interp_bytes, interpreter)
+    push(mut interp_bytes, 0)
+    let interp = synthetic(".interp", loaded_flags, class_interp, 1, interp_bytes.len)
+    io.copy(interp.input.data, interp_bytes)
+    d.sections.interp = interp
+
+    let dynstr = synthetic(".dynstr", loaded_flags, class_dynstr, 1, d.strings.data.len)
+    dynstr.sh_type = sht_strtab
+    io.copy(dynstr.input.data, d.strings.data)
+    d.sections.dynstr = dynstr
+
+    let dynsym = synthetic(".dynsym", loaded_flags, class_dynsym, 8, sym_size * (d.symbols.len + 1))
+    dynsym.sh_type = sht_dynsym
+    dynsym.entsize = sym_size
+    dynsym.linked = dynstr
+    dynsym.info = first_unhashed
+    d.sections.dynsym = dynsym
+    fill_dynsym(d)
+
+    let buckets = bucket_count(d.symbols.len + 1)
+    let hash = synthetic(".hash", loaded_flags, class_hash, 8, hash_header_size + 4 * (buckets + d.symbols.len + 1))
+    hash.sh_type = sht_hash
+    hash.entsize = 4
+    hash.linked = dynsym
+    d.sections.hash = hash
+    fill_hash(d, buckets)
+
+    let gnu_hash = synthetic(".gnu.hash", loaded_flags, class_gnu_hash, 8, gnu_hash_size(d.gnu))
+    gnu_hash.sh_type = sht_gnu_hash
+    gnu_hash.linked = dynsym
+    d.sections.gnu_hash = gnu_hash
+    fill_gnu_hash(d)
+
+    var sections: []*Section = [interp, hash, gnu_hash, dynsym, dynstr]
+    for s in synthesize_versions(d) {
+        push(mut sections, s)
+    }
+    for s in synthesize_relocations(d) {
+        push(mut sections, s)
+    }
+    for s in synthesize_got(d) {
+        push(mut sections, s)
+    }
+
+    let count = tag_list(d).len + spare_dyn_entries
+    let dynamic = synthetic(".dynamic", writable_flags, class_dynamic, 8, count * dyn_entry_size)
+    dynamic.sh_type = sht_dynamic
+    dynamic.entsize = dyn_entry_size
+    dynamic.linked = dynstr
+    d.sections.dynamic = dynamic
+    push(mut sections, dynamic)
+    sections
+}
+
+fn synthesize_versions(d: *DynamicLink) -> []*Section {
+    if !versioned(d) {
+        return []
+    }
+    let dynsym = required(d.sections.dynsym)
+    let dynstr = required(d.sections.dynstr)
+    let versym = synthetic(".gnu.version", loaded_flags, class_versym, 2, 2 * (d.symbols.len + 1))
+    versym.sh_type = sht_gnu_versym
+    versym.entsize = 2
+    versym.linked = dynsym
+    for i, sym in d.symbols {
+        io.set_le16(versym.input.data, 2 * (i + 1), sym.version_index)
+    }
+    d.sections.versym = versym
+    let data = verneed_data(d)
+    let verneed = synthetic(".gnu.version_r", loaded_flags, class_verneed, 8, data.len)
+    verneed.sh_type = sht_gnu_verneed
+    verneed.linked = dynstr
+    verneed.info = d.needs.len
+    io.copy(verneed.input.data, data)
+    d.sections.verneed = verneed
+    [versym, verneed]
+}
+
+fn verneed_data(d: *DynamicLink) -> []u8 {
+    var data: []u8 = []
+    for i, need in d.needs {
+        var next = 0
+        if i < d.needs.len - 1 {
+            next = verneed_size + vernaux_size * need.versions.len
+        }
+        io.put_le(mut data, 1, 2)
+        io.put_le(mut data, need.versions.len, 2)
+        let soname_offset = add_once(d.strings, need.library.soname)
+        io.put_le(mut data, soname_offset, 4)
+        io.put_le(mut data, verneed_size, 4)
+        io.put_le(mut data, next, 4)
+        append_vernaux(mut data, need)
+    }
+    data
+}
+
+fn append_vernaux(mut data: []u8, need: LibraryNeeds) {
+    for j, version in need.versions {
+        var next = 0
+        if j < need.versions.len - 1 {
+            next = vernaux_size
+        }
+        io.put_le(mut data, i64(sysv_hash(version.name)), 4)
+        io.put_le(mut data, 0, 2)
+        io.put_le(mut data, version.index, 2)
+        io.put_le(mut data, version.name_offset, 4)
+        io.put_le(mut data, next, 4)
+    }
+}
+
+fn sysv_hash(name: str) -> u32 {
+    var hash: u32 = 0
+    for i in 0..name.len {
+        hash = hash << 4 + u32(name[i])
+        let high = hash & 0xf0000000
+        hash = hash ^ high >> 24
+        hash = hash & ~high
+    }
+    hash
+}
+
+fn synthesize_relocations(d: *DynamicLink) -> []*Section {
+    let dynsym = required(d.sections.dynsym)
+    var sections: []*Section = []
+    let count = imported_slots(d)
+    if count > 0 {
+        let rela_dyn = synthetic(".rela.dyn", loaded_flags, class_rela_dyn, 8, rela_size * count)
+        rela_dyn.sh_type = sht_rela
+        rela_dyn.entsize = rela_size
+        rela_dyn.linked = dynsym
+        d.sections.rela_dyn = rela_dyn
+        push(mut sections, rela_dyn)
+    }
+    if d.plts.len > 0 {
+        let rela_plt = synthetic(".rela.plt", loaded_flags, class_rela_plt, 8, rela_size * d.plts.len)
+        rela_plt.sh_type = sht_rela
+        rela_plt.entsize = rela_size
+        rela_plt.linked = dynsym
+        rela_plt.sh_flags = shf_info_link
+        d.sections.rela_plt = rela_plt
+        let plt = synthetic(".plt", executable_flags, class_plt, 16, plt_entry_size * (d.plts.len + 1))
+        plt.entsize = plt_entry_size
+        d.sections.plt = plt
+        push(mut sections, rela_plt)
+        push(mut sections, plt)
+    }
+    if d.plt_gots.len > 0 {
+        let plt_got = synthetic(".plt.got", executable_flags, class_plt_got, 8, plt_got_entry_size * d.plt_gots.len)
+        plt_got.entsize = plt_got_entry_size
+        d.sections.plt_got = plt_got
+        push(mut sections, plt_got)
+    }
+    sections
+}
+
+fn imported_slots(d: *DynamicLink) -> i64 {
+    var count = 0
+    for slot in d.slots {
+        if slot.imported != none {
+            count += 1
+        }
+    }
+    count
+}
+
+fn synthesize_got(d: *DynamicLink) -> []*Section {
+    var sections: []*Section = []
+    if d.slots.len > 0 {
+        let got = synthetic(".got", writable_flags, class_got, 8, got_entry_size * d.slots.len)
+        got.entsize = got_entry_size
+        d.sections.got = got
+        push(mut sections, got)
+    }
+    let got_plt = synthetic(".got.plt", writable_flags, class_got_plt, 8, got_plt_reserved + got_entry_size * d.plts.len)
+    got_plt.entsize = got_entry_size
+    d.sections.got_plt = got_plt
+    match d.sections.rela_plt {
+        some(rela_plt) => {
+            rela_plt.info_section = got_plt
+        }
+        none => {}
+    }
+    push(mut sections, got_plt)
+    sections
+}
+
+fn fill_dynsym(d: *DynamicLink) {
+    let data = required(d.sections.dynsym).input.data
+    for sym in d.symbols {
+        let at = sym_size * sym.index
+        io.set_le32(data, at, sym.name_offset)
+        data[at + 4] = u8(st_info(stb_global, sym.kind))
+    }
+}
+
+fn hash_bucket_sizes() -> []i64 {
+    [1, 3, 17, 37, 67, 97, 131, 197, 263, 521, 1031, 2053, 4099, 8209, 16411, 32771, 65537, 131101, 262147]
+}
+
+fn bucket_count(symbols: i64) -> i64 {
+    let sizes = hash_bucket_sizes()
+    var best = sizes[0]
+    var i = 0
+    for i + 1 < sizes.len {
+        best = sizes[i]
+        if symbols < sizes[i + 1] {
+            break
+        }
+        i += 1
+    }
+    best
+}
+
+fn hash_insertion_order(d: *DynamicLink) -> []*DynamicSymbol {
+    var ordered: []*DynamicSymbol = []
+    for sym in d.hashed {
+        push(mut ordered, sym)
+    }
+    for sym in d.symbols {
+        if !is_hashed(d, sym) {
+            push(mut ordered, sym)
+        }
+    }
+    ordered
+}
+
+fn is_hashed(d: *DynamicLink, sym: *DynamicSymbol) -> bool {
+    (d.pointer[sym.name] ?? false) && (d.plt_set[sym.name] ?? false)
+}
+
+fn fill_hash(d: *DynamicLink, buckets: i64) {
+    let data = required(d.sections.hash).input.data
+    io.set_le32(data, 0, buckets)
+    io.set_le32(data, 4, d.symbols.len + 1)
+    let table = data[hash_header_size..]
+    let chains = table[4 * buckets..]
+    for sym in hash_insertion_order(d) {
+        let slot = 4 * (i64(sysv_hash(sym.name)) % buckets)
+        io.set_le32(chains, 4 * sym.index, io.le32(table, slot))
+        io.set_le32(table, slot, sym.index)
+    }
+}
+
+struct GnuHashLayout {
+    hashed: i64 = 0
+    buckets: i64 = 0
+    first_hashed: i64 = 0
+    bloom_words: i64 = 0
+    shift: i64 = 0
+}
+
+fn new_gnu_hash_layout(hashed: i64, first_hashed: i64) -> GnuHashLayout {
+    if hashed == 0 {
+        return GnuHashLayout { buckets: 1, first_hashed: first_unhashed, bloom_words: 1 }
+    }
+    var buckets = bucket_count(hashed)
+    if buckets < 2 {
+        buckets = 2
+    }
+    GnuHashLayout {
+        hashed,
+        buckets,
+        first_hashed,
+        bloom_words: bloom_bits(hashed) / bloom_word_bits,
+        shift: bloom_shift
+    }
+}
+
+fn bit_length(n: i64) -> i64 {
+    var length = 0
+    var rest = n
+    for rest > 0 {
+        length += 1
+        rest >>= 1
+    }
+    length
+}
+
+fn bloom_bits(hashed: i64) -> i64 {
+    let ceil_log2 = bit_length(hashed - 1)
+    var log2 = ceil_log2 + 1
+    if log2 < 3 {
+        log2 = 5
+    } else if (1 << (log2 - 2)) & hashed != 0 {
+        log2 += 3
+    } else {
+        log2 += 2
+    }
+    if log2 < 6 {
+        log2 = 6
+    }
+    1 << log2
+}
+
+fn gnu_hash_size(g: GnuHashLayout) -> i64 {
+    gnu_hash_header + bloom_word_bytes * g.bloom_words + 4 * g.buckets + 4 * g.hashed
+}
+
+fn gnu_bucket(g: GnuHashLayout, name: str) -> i64 {
+    i64(gnu_hash_of(name)) % g.buckets
+}
+
+fn gnu_hash_of(name: str) -> u32 {
+    var hash: u32 = 5381
+    for i in 0..name.len {
+        hash = hash * 33 + u32(name[i])
+    }
+    hash
+}
+
+fn fill_gnu_hash(d: *DynamicLink) {
+    let g = d.gnu
+    let data = required(d.sections.gnu_hash).input.data
+    io.set_le32(data, 0, g.buckets)
+    io.set_le32(data, 4, g.first_hashed)
+    io.set_le32(data, 8, g.bloom_words)
+    io.set_le32(data, 12, g.shift)
+    let bloom = data[gnu_hash_header..]
+    let table = bloom[bloom_word_bytes * g.bloom_words..]
+    let chain = table[4 * g.buckets..]
+    let one: u64 = 1
+    for i, sym in d.hashed {
+        let hash = i64(gnu_hash_of(sym.name))
+        let word = bloom_word_bytes * (hash / bloom_word_bits % g.bloom_words)
+        var mask = io.u64_le(bloom, word)
+        mask = mask | one << (hash % bloom_word_bits) | one << ((hash >> g.shift) % bloom_word_bits)
+        io.set_le64(bloom, word, i64(mask))
+        let bucket = gnu_bucket(g, sym.name)
+        if io.le32(table, 4 * bucket) == 0 {
+            io.set_le32(table, 4 * bucket, sym.index)
+        }
+        let last = i + 1 == d.hashed.len || gnu_bucket(g, d.hashed[i + 1].name) != bucket
+        var value = hash & ~1
+        if last {
+            value |= 1
+        }
+        io.set_le32(chain, 4 * i, value)
+    }
+}
+
+fn fill_dynamic(l: *Linker, d: *DynamicLink) {
+    fill_got(l, d)
+    fill_got_plt(d)
+    fill_plt(d)
+    fill_plt_got(d)
+    fill_relocations(d)
+    fill_tags(d)
+}
+
+fn fill_got(l: *Linker, d: *DynamicLink) {
+    let got = d.sections.got ?? return
+    for i, slot in d.slots {
+        if slot.imported == none {
+            var value = 0
+            match l.symbols[slot.name] {
+                some(sym) => {
+                    value = sym.value
+                }
+                none => {}
+            }
+            io.set_le64(got.input.data, got_entry_size * i, value)
+        }
+    }
+}
+
+fn fill_got_plt(d: *DynamicLink) {
+    let data = required(d.sections.got_plt).input.data
+    io.set_le64(data, 0, required(d.sections.dynamic).addr)
+    for i in 0..d.plts.len {
+        let entry = required(d.sections.plt).addr + plt_entry_size * (i + 1)
+        io.set_le64(data, got_plt_reserved + got_entry_size * i, entry + 6)
+    }
+}
+
+fn fill_plt(d: *DynamicLink) {
+    let plt = d.sections.plt ?? return
+    let data = plt.input.data
+    let base = plt.addr
+    let got = required(d.sections.got_plt).addr
+    io.copy(data, [0xff, 0x35, 0, 0, 0, 0, 0xff, 0x25, 0, 0, 0, 0, 0x0f, 0x1f, 0x40, 0x00])
+    put_rel32(data[2..], got + 8, base + 6)
+    put_rel32(data[8..], got + 16, base + 12)
+    for i in 0..d.plts.len {
+        let offset = plt_entry_size * (i + 1)
+        let entry = base + offset
+        let slot = got + got_plt_reserved + got_entry_size * i
+        let code = data[offset..]
+        io.copy(code, [0xff, 0x25, 0, 0, 0, 0, 0x68, 0, 0, 0, 0, 0xe9, 0, 0, 0, 0])
+        put_rel32(code[2..], slot, entry + 6)
+        io.set_le32(code, 7, i)
+        put_rel32(code[12..], base, entry + 16)
+    }
+}
+
+fn fill_plt_got(d: *DynamicLink) {
+    let section = d.sections.plt_got ?? return
+    for i, sym in d.plt_gots {
+        let offset = plt_got_entry_size * i
+        let code = section.input.data[offset..]
+        io.copy(code, [0xff, 0x25, 0, 0, 0, 0, 0x66, 0x90])
+        put_rel32(code[2..], got_address(d, sym.name), section.addr + offset + 6)
+    }
+}
+
+fn put_rel32(field: []u8, target: i64, next: i64) {
+    io.set_le32(field, 0, target - next)
+}
+
+fn fill_relocations(d: *DynamicLink) {
+    var next = 0
+    for i, slot in d.slots {
+        let imported = slot.imported ?? continue
+        let address = required(d.sections.got).addr + got_entry_size * i
+        let field = required(d.sections.rela_dyn).input.data[rela_size * next..]
+        put_rela(field, address, imported.index, r_x86_64_glob_dat)
+        next += 1
+    }
+    for i, sym in d.plts {
+        let address = required(d.sections.got_plt).addr + got_plt_reserved + got_entry_size * i
+        let field = required(d.sections.rela_plt).input.data[rela_size * i..]
+        put_rela(field, address, sym.index, r_x86_64_jmp_slot)
+    }
+}
+
+fn put_rela(field: []u8, address: i64, symbol: i64, kind: i64) {
+    io.set_le64(field, 0, address)
+    io.set_le64(field, 8, symbol << 32 | kind)
+}
+
+fn tag_list(d: *DynamicLink) -> []DynTag {
+    let hash = required(d.sections.hash)
+    let gnu_hash = required(d.sections.gnu_hash)
+    let dynstr = required(d.sections.dynstr)
+    let dynsym = required(d.sections.dynsym)
+    let got_plt = required(d.sections.got_plt)
+    var tags: []DynTag = []
+    for offset in d.needed_offsets {
+        push(mut tags, DynTag { tag: dt_needed, value: offset })
+    }
+    push(mut tags, DynTag { tag: dt_hash, value: hash.addr })
+    push(mut tags, DynTag { tag: dt_gnu_hash, value: gnu_hash.addr })
+    push(mut tags, DynTag { tag: dt_strtab, value: dynstr.addr })
+    push(mut tags, DynTag { tag: dt_symtab, value: dynsym.addr })
+    push(mut tags, DynTag { tag: dt_strsz, value: dynstr.size })
+    push(mut tags, DynTag { tag: dt_syment, value: sym_size })
+    push(mut tags, DynTag { tag: dt_debug, value: 0 })
+    push(mut tags, DynTag { tag: dt_pltgot, value: got_plt.addr })
+    match d.sections.rela_plt {
+        some(rela_plt) => {
+            push(mut tags, DynTag { tag: dt_pltrelsz, value: rela_plt.size })
+            push(mut tags, DynTag { tag: dt_pltrel, value: dt_rela })
+            push(mut tags, DynTag { tag: dt_jmprel, value: rela_plt.addr })
+        }
+        none => {}
+    }
+    match d.sections.rela_dyn {
+        some(rela_dyn) => {
+            push(mut tags, DynTag { tag: dt_rela, value: rela_dyn.addr })
+            push(mut tags, DynTag { tag: dt_relasz, value: rela_dyn.size })
+            push(mut tags, DynTag { tag: dt_relaent, value: rela_size })
+        }
+        none => {}
+    }
+    match d.sections.verneed {
+        some(verneed) => {
+            let versym = required(d.sections.versym)
+            push(mut tags, DynTag { tag: dt_verneed, value: verneed.addr })
+            push(mut tags, DynTag { tag: dt_verneednum, value: d.needs.len })
+            push(mut tags, DynTag { tag: dt_versym, value: versym.addr })
+        }
+        none => {}
+    }
+    push(mut tags, DynTag { tag: dt_null, value: 0 })
+    tags
+}
+
+fn fill_tags(d: *DynamicLink) {
+    let data = required(d.sections.dynamic).input.data
+    for i, entry in tag_list(d) {
+        io.set_le64(data, dyn_entry_size * i, entry.tag)
+        io.set_le64(data, dyn_entry_size * i + 8, entry.value)
+    }
+}

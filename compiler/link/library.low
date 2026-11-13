@@ -1,0 +1,687 @@
+import std/file
+import std/io
+import std/path
+import std/text
+
+const libc_name = "c"
+const shn_loreserve = 0xff00
+const shn_xindex = 0xffff
+const pn_xnum = 0xffff
+const shf_compressed = 0x800
+const compression_header_size = 24
+
+pub fn system_dirs() -> []str {
+    ["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu", "/lib64", "/lib", "/usr/local/lib"]
+}
+
+fn runtime_file(name: str) -> str? {
+    match name {
+        "c" => "libc.so.6"
+        "m" => "libm.so.6"
+        _ => none
+    }
+}
+
+pub struct Library {
+    pub name: str
+    pub soname: str
+    pub path: str
+    symbols: [str: LibrarySymbol]
+}
+
+struct LibrarySymbol {
+    kind: i64
+    version: str
+}
+
+pub struct Resolver {
+    pub dirs: []str
+}
+
+pub fn resolve(r: Resolver, names: []str) -> []*Library ! Error {
+    let ordered = link_order(names)
+    var libraries: []*Library = []
+    for name in ordered {
+        let library = open(r, name)?
+        push(mut libraries, library)
+    }
+    libraries
+}
+
+fn link_order(names: []str) -> []str {
+    var ordered: []str = []
+    for name in names {
+        if name != libc_name && !contains(ordered, name) {
+            push(mut ordered, name)
+        }
+    }
+    push(mut ordered, libc_name)
+    ordered
+}
+
+fn contains(names: []str, name: str) -> bool {
+    for n in names {
+        if n == name {
+            return true
+        }
+    }
+    false
+}
+
+fn open(r: Resolver, name: str) -> *Library ! Error {
+    let found = find(r, name)?
+    load_library(name, found)?
+}
+
+fn find(r: Resolver, name: str) -> str ! Error {
+    let file_name = runtime_file(name) ?? "lib{name}.so"
+    for dir in r.dirs {
+        let candidate = path.join([dir, file_name])
+        if file.exists(candidate) {
+            return candidate
+        }
+    }
+    fail LibraryNotFound(name, file_name, text.join(r.dirs, ", "))
+}
+
+fn load_library(name: str, library_path: str) -> *Library ! Error {
+    let resolved = file.realpath(library_path) catch {
+        e => fail LibraryPath(name, io_message(e, library_path))
+    }
+    let data = file.read_file(resolved) catch {
+        e => fail NotShared(name, resolved, io_message(e, resolved))
+    }
+    let elf = elf_open(data) catch {
+        e => fail NotShared(name, resolved, elf_message(e))
+    }
+    if elf.kind != et_dyn {
+        fail NotSharedType(name, resolved)
+    }
+    let symbols = dynamic_symbols(elf) catch {
+        e => fail NoDynamicSymbols(name, resolved, elf_message(e))
+    }
+    new(Library {
+        name,
+        soname: soname_of(elf, library_path),
+        path: resolved,
+        symbols: exported_symbols(symbols)
+    })
+}
+
+fn io_message(e: io.Error, subject: str) -> str {
+    match e {
+        NotFound => "open {subject}: no such file or directory"
+        Denied => "open {subject}: permission denied"
+        IsDir => "cannot read ELF identifier 'read {subject}: is a directory' in record at byte 0x0"
+        _ => "open {subject}: input/output error"
+    }
+}
+
+fn soname_of(elf: ElfFile, library_path: str) -> str {
+    let names = dyn_strings(elf, dt_soname) catch {
+        _ => []
+    }
+    if names.len == 0 {
+        return path.base(library_path)
+    }
+    names[0]
+}
+
+fn exported_symbols(symbols: []ElfSymbol) -> [str: LibrarySymbol] {
+    var exported: [str: LibrarySymbol] = [:]
+    for sym in symbols {
+        if !exports_default(sym) {
+            continue
+        }
+        match exported[sym.name] {
+            some(_) => {}
+            none => {
+                exported[sym.name] = LibrarySymbol { kind: sym.info & 0xf, version: sym.version }
+            }
+        }
+    }
+    exported
+}
+
+fn exports_default(sym: ElfSymbol) -> bool {
+    if sym.shndx == shn_undef || sym.name == "" {
+        return false
+    }
+    let bind = sym.info >> 4
+    if bind != stb_global && bind != stb_weak {
+        return false
+    }
+    if !sym.has_version {
+        return true
+    }
+    sym.version_index & 0x8000 == 0 && sym.version_index & 0x7fff != 0
+}
+
+enum ElfError {
+    Format(text: str)
+}
+
+fn elf_message(e: ElfError) -> str {
+    match e {
+        Format(text) => text
+    }
+}
+
+fn format_error(message: str, value: str, offset: i64) -> ElfError {
+    var detail = message
+    if value != "" {
+        detail = "{message} '{value}' "
+    }
+    Format("{detail}in record at byte {hex(offset)}")
+}
+
+struct ElfSection {
+    kind: i64
+    flags: i64
+    offset: i64
+    size: i64
+    link: i64
+}
+
+struct ElfFile {
+    data: []u8
+    kind: i64
+    sections: []ElfSection
+}
+
+struct ElfSymbol {
+    name: str
+    info: i64
+    shndx: i64
+    has_version: bool
+    version_index: i64
+    version: str
+}
+
+struct VersionDef {
+    name: str
+    index: i64
+}
+
+struct VersionDep {
+    name: str
+    index: i64
+    file: str
+}
+
+struct VersionTables {
+    versym: []u8 = []
+    defs: []VersionDef = []
+    deps: []VersionDep = []
+}
+
+struct SymbolVersion {
+    has_version: bool = false
+    index: i64 = 0
+    version: str = ""
+}
+
+fn elf_open(data: []u8) -> ElfFile ! ElfError {
+    if data.len < eh_ident_size {
+        fail Format("cannot read ELF identifier 'EOF' in record at byte 0x0")
+    }
+    if data[0] != 0x7f || data[1] != 'E' || data[2] != 'L' || data[3] != 'F' {
+        fail Format("bad magic number '[{data[0]} {data[1]} {data[2]} {data[3]}]' in record at byte 0x0")
+    }
+    if i64(data[4]) != elfclass64 {
+        fail format_error("unknown ELF class", int_name(i64(data[4]), class_names()), 0)
+    }
+    if i64(data[5]) != elfdata2lsb {
+        fail format_error("unknown ELF data encoding", int_name(i64(data[5]), data_names()), 0)
+    }
+    if i64(data[6]) != ev_current {
+        fail format_error("unknown ELF version", int_name(i64(data[6]), version_names()), 0)
+    }
+    if data.len < header_size {
+        fail Format("EOF")
+    }
+    let kind = io.le16(data, 16)
+    let version = io.le32(data, 20) & 0xff
+    if version != i64(data[6]) {
+        fail format_error("mismatched ELF version", int_name(version, version_names()), 0)
+    }
+    let phoff = io.le64(data, 32)
+    let shoff = io.le64(data, 40)
+    let phentsize = io.le16(data, 54)
+    var phnum = io.le16(data, 56)
+    let shentsize = io.le16(data, 58)
+    var shnum = io.le16(data, 60)
+    var shstrndx = io.le16(data, 62)
+    if shoff < 0 {
+        fail format_error("invalid shoff", "{shoff}", 0)
+    }
+    if phoff < 0 {
+        fail format_error("invalid phoff", "{phoff}", 0)
+    }
+    if shoff == 0 && shnum != 0 {
+        fail format_error("invalid ELF shnum for shoff=0", "{shnum}", 0)
+    }
+    if shnum > 0 && shstrndx >= shnum {
+        fail format_error("invalid ELF shstrndx", "{shstrndx}", 0)
+    }
+    if phnum > 0 && phentsize < phdr_size {
+        fail format_error("invalid ELF phentsize", "{phentsize}", 0)
+    }
+    if shoff > 0 && (shnum == 0 || phnum == pn_xnum) {
+        if shoff >= data.len {
+            fail Format("EOF")
+        }
+        if shoff + shdr_size > data.len {
+            fail Format("unexpected EOF")
+        }
+        let initial_type = io.le32(data, shoff + 4)
+        let initial_size = io.le64(data, shoff + 32)
+        let initial_link = io.le32(data, shoff + 40)
+        let initial_info = io.le32(data, shoff + 44)
+        if initial_type != sht_null {
+            fail format_error("invalid type of the initial section", int_name(initial_type, section_type_names()), shoff)
+        }
+        if shnum == 0 {
+            if initial_size < shn_loreserve {
+                fail format_error("invalid ELF shnum contained in sh_size", "{shnum}", shoff)
+            }
+            shnum = initial_size
+        }
+        if phnum == pn_xnum {
+            if initial_info < pn_xnum {
+                fail format_error("invalid ELF phnum contained in sh_info", "{initial_info}", shoff)
+            }
+            phnum = initial_info
+        }
+        if shstrndx == shn_xindex {
+            shstrndx = initial_link
+            if shstrndx < shn_loreserve || shstrndx >= shnum {
+                fail format_error("invalid ELF shstrndx contained in sh_link", "{shstrndx}", shoff)
+            }
+        }
+    }
+    let phdata_size = phnum * phentsize
+    let phdata = read_data_at(data, phdata_size, phoff)?
+    for i in 0..phnum {
+        let at = i * phentsize
+        let prog_offset = io.le64(phdata, at + 8)
+        let prog_size = io.le64(phdata, at + 32)
+        if prog_offset < 0 {
+            fail format_error("invalid program header offset", u64_text(prog_offset), phoff + at)
+        }
+        if prog_size < 0 {
+            fail format_error("invalid program header file size", u64_text(prog_size), phoff + at)
+        }
+    }
+    if shnum > 0 && shentsize < shdr_size {
+        fail format_error("invalid ELF shentsize", "{shentsize}", 0)
+    }
+    let shdata = read_data_at(data, shnum * shentsize, shoff)?
+    var sections: []ElfSection = []
+    var names: []i64 = []
+    for i in 0..shnum {
+        let at = i * shentsize
+        let section = ElfSection {
+            kind: io.le32(shdata, at + 4),
+            flags: io.le64(shdata, at + 8),
+            offset: io.le64(shdata, at + 24),
+            size: io.le64(shdata, at + 32),
+            link: io.le32(shdata, at + 40)
+        }
+        push(mut names, io.le32(shdata, at))
+        if section.offset < 0 {
+            fail format_error("invalid section offset", "{section.offset}", shoff + at)
+        }
+        if section.size < 0 {
+            fail format_error("invalid section size", "{section.size}", shoff + at)
+        }
+        if section.flags & shf_compressed != 0 {
+            if section.size < compression_header_size || section.offset + compression_header_size > data.len {
+                fail Format("EOF")
+            }
+        }
+        push(mut sections, section)
+    }
+    let file = ElfFile { data, kind, sections }
+    if sections.len == 0 || shstrndx == 0 {
+        return file
+    }
+    let shstr = sections[shstrndx]
+    if shstr.kind != sht_strtab {
+        fail format_error("invalid ELF section name string table type", int_name(shstr.kind, section_type_names()), shoff + shstrndx * shentsize)
+    }
+    let shstrtab = section_data(file, shstr)?
+    for i in 0..sections.len {
+        match get_string(shstrtab, names[i]) {
+            some(_) => {}
+            none => fail format_error("bad section name index", "{names[i]}", shoff + i * shentsize)
+        }
+    }
+    file
+}
+
+struct IntName {
+    value: i64
+    name: str
+}
+
+fn int_name(i: i64, names: []IntName) -> str {
+    for n in names {
+        if n.value == i {
+            return n.name
+        }
+    }
+    var j = names.len - 1
+    for j >= 0 {
+        let n = names[j]
+        if n.value < i {
+            return "{n.name}+{i - n.value}"
+        }
+        j -= 1
+    }
+    "{i}"
+}
+
+fn u64_text(v: i64) -> str {
+    let unsigned = u64(v)
+    "{unsigned}"
+}
+
+fn class_names() -> []IntName {
+    [
+        IntName { value: 0, name: "ELFCLASSNONE" },
+        IntName { value: 1, name: "ELFCLASS32" },
+        IntName { value: 2, name: "ELFCLASS64" }
+    ]
+}
+
+fn data_names() -> []IntName {
+    [
+        IntName { value: 0, name: "ELFDATANONE" },
+        IntName { value: 1, name: "ELFDATA2LSB" },
+        IntName { value: 2, name: "ELFDATA2MSB" }
+    ]
+}
+
+fn version_names() -> []IntName {
+    [
+        IntName { value: 0, name: "EV_NONE" },
+        IntName { value: 1, name: "EV_CURRENT" }
+    ]
+}
+
+fn section_type_names() -> []IntName {
+    [
+        IntName { value: 0, name: "SHT_NULL" },
+        IntName { value: 1, name: "SHT_PROGBITS" },
+        IntName { value: 2, name: "SHT_SYMTAB" },
+        IntName { value: 3, name: "SHT_STRTAB" },
+        IntName { value: 4, name: "SHT_RELA" },
+        IntName { value: 5, name: "SHT_HASH" },
+        IntName { value: 6, name: "SHT_DYNAMIC" },
+        IntName { value: 7, name: "SHT_NOTE" },
+        IntName { value: 8, name: "SHT_NOBITS" },
+        IntName { value: 9, name: "SHT_REL" },
+        IntName { value: 10, name: "SHT_SHLIB" },
+        IntName { value: 11, name: "SHT_DYNSYM" },
+        IntName { value: 14, name: "SHT_INIT_ARRAY" },
+        IntName { value: 15, name: "SHT_FINI_ARRAY" },
+        IntName { value: 16, name: "SHT_PREINIT_ARRAY" },
+        IntName { value: 17, name: "SHT_GROUP" },
+        IntName { value: 18, name: "SHT_SYMTAB_SHNDX" },
+        IntName { value: 0x60000000, name: "SHT_LOOS" },
+        IntName { value: 0x6ffffff5, name: "SHT_GNU_ATTRIBUTES" },
+        IntName { value: 0x6ffffff6, name: "SHT_GNU_HASH" },
+        IntName { value: 0x6ffffff7, name: "SHT_GNU_LIBLIST" },
+        IntName { value: 0x6ffffffd, name: "SHT_GNU_VERDEF" },
+        IntName { value: 0x6ffffffe, name: "SHT_GNU_VERNEED" },
+        IntName { value: 0x6fffffff, name: "SHT_GNU_VERSYM" },
+        IntName { value: 0x70000000, name: "SHT_LOPROC" },
+        IntName { value: 0x7000002a, name: "SHT_MIPS_ABIFLAGS" },
+        IntName { value: 0x7fffffff, name: "SHT_HIPROC" },
+        IntName { value: 0x80000000, name: "SHT_LOUSER" },
+        IntName { value: 0xffffffff, name: "SHT_HIUSER" }
+    ]
+}
+
+fn read_data_at(data: []u8, n: i64, off: i64) -> []u8 ! ElfError {
+    if n == 0 {
+        return []
+    }
+    if off < 0 || off + n > data.len {
+        fail Format("EOF")
+    }
+    data[off..off + n]
+}
+
+fn section_by_type(f: ElfFile, kind: i64) -> ElfSection? {
+    for s in f.sections {
+        if s.kind == kind {
+            return s
+        }
+    }
+    none
+}
+
+fn section_data(f: ElfFile, s: ElfSection) -> []u8 ! ElfError {
+    if s.kind == sht_nobits {
+        fail Format("unexpected read from SHT_NOBITS section")
+    }
+    if s.size == 0 {
+        return []
+    }
+    if s.offset >= f.data.len {
+        fail Format("EOF")
+    }
+    if s.offset + s.size > f.data.len {
+        fail Format("unexpected EOF")
+    }
+    f.data[s.offset..s.offset + s.size]
+}
+
+fn string_table(f: ElfFile, link: i64) -> []u8 ! ElfError {
+    if link <= 0 || link >= f.sections.len {
+        fail Format("section has invalid string table link")
+    }
+    section_data(f, f.sections[link])?
+}
+
+fn get_string(section: []u8, start: i64) -> str? {
+    if start < 0 || start >= section.len {
+        return none
+    }
+    for end in start..section.len {
+        if section[end] == 0 {
+            return str(section[start..end])
+        }
+    }
+    none
+}
+
+fn dynamic_symbols(f: ElfFile) -> []ElfSymbol ! ElfError {
+    let symtab = section_by_type(f, sht_dynsym) ?? fail Format("no symbol section")
+    let data = section_data(f, symtab) catch {
+        e => fail Format("cannot load symbol section: {elf_message(e)}")
+    }
+    if data.len == 0 {
+        fail Format("no symbol section")
+    }
+    if data.len % sym_size != 0 {
+        fail Format("length of symbol section is not a multiple of Sym64Size")
+    }
+    let strdata = string_table(f, symtab.link) catch {
+        e => fail Format("cannot load string table section: {elf_message(e)}")
+    }
+    let tables = version_tables(f, strdata)?
+    let versioned = section_by_type(f, sht_gnu_versym) != none
+    var symbols: []ElfSymbol = []
+    var at = sym_size
+    var i = 0
+    for at < data.len {
+        let name_offset = io.le32(data, at)
+        let name = get_string(strdata, name_offset) ?? ""
+        var sym = ElfSymbol {
+            name,
+            info: i64(data[at + 4]),
+            shndx: io.le16(data, at + 6),
+            has_version: false,
+            version_index: 0,
+            version: ""
+        }
+        if versioned {
+            let found = gnu_version(tables, i)
+            sym.has_version = found.has_version
+            sym.version_index = found.index
+            sym.version = found.version
+        }
+        push(mut symbols, sym)
+        at += sym_size
+        i += 1
+    }
+    symbols
+}
+
+fn version_tables(f: ElfFile, strdata: []u8) -> VersionTables ! ElfError {
+    var tables = VersionTables {}
+    let versym = section_by_type(f, sht_gnu_versym) ?? return tables
+    tables.versym = section_data(f, versym) or []
+    tables.defs = dynamic_versions(f, strdata)?
+    tables.deps = dynamic_version_needs(f, strdata)?
+    tables
+}
+
+fn dynamic_versions(f: ElfFile, strdata: []u8) -> []VersionDef ! ElfError {
+    var defs: []VersionDef = []
+    let section = section_by_type(f, sht_gnu_verdef) ?? return defs
+    let d = section_data(f, section) or []
+    var i = 0
+    for {
+        if i + 20 > d.len {
+            break
+        }
+        let version = io.le16(d, i)
+        if version != 1 {
+            fail format_error("unexpected dynamic version", "{version}", section.offset + i)
+        }
+        let index = io.le16(d, i + 4)
+        let count = io.le16(d, i + 6)
+        let aux = io.le32(d, i + 12)
+        let next = io.le32(d, i + 16)
+        if count == 0 {
+            fail format_error("dynamic version has no name", "", section.offset + i)
+        }
+        var name = ""
+        var j = i + aux
+        for c in 0..count {
+            if j + 8 > d.len {
+                break
+            }
+            let name_offset = io.le32(d, j)
+            let name_next = io.le32(d, j + 4)
+            let dep_name = get_string(strdata, name_offset) ?? ""
+            if c == 0 {
+                name = dep_name
+            }
+            if name_next == 0 {
+                break
+            }
+            j += name_next
+        }
+        push(mut defs, VersionDef { name, index })
+        if next == 0 {
+            break
+        }
+        i += next
+    }
+    defs
+}
+
+fn dynamic_version_needs(f: ElfFile, strdata: []u8) -> []VersionDep ! ElfError {
+    var deps: []VersionDep = []
+    let section = section_by_type(f, sht_gnu_verneed) ?? return deps
+    let d = section_data(f, section) or []
+    var i = 0
+    for {
+        if i + 16 > d.len {
+            break
+        }
+        let version = io.le16(d, i)
+        if version != 1 {
+            fail format_error("unexpected dynamic need version", "{version}", section.offset + i)
+        }
+        let count = io.le16(d, i + 2)
+        let file_offset = io.le32(d, i + 4)
+        let aux = io.le32(d, i + 8)
+        let next = io.le32(d, i + 12)
+        let file_name = get_string(strdata, file_offset) ?? ""
+        var j = i + aux
+        for _ in 0..count {
+            if j + 16 > d.len {
+                break
+            }
+            let index = io.le16(d, j + 6)
+            let name_offset = io.le32(d, j + 8)
+            let dep_next = io.le32(d, j + 12)
+            let dep_name = get_string(strdata, name_offset) ?? ""
+            push(mut deps, VersionDep { name: dep_name, index, file: file_name })
+            if dep_next == 0 {
+                break
+            }
+            j += dep_next
+        }
+        if next == 0 {
+            break
+        }
+        i += next
+    }
+    deps
+}
+
+fn gnu_version(tables: VersionTables, i: i64) -> SymbolVersion {
+    let at = (i + 1) * 2
+    if at >= tables.versym.len {
+        return SymbolVersion {}
+    }
+    if tables.versym.len - at < 2 {
+        return SymbolVersion {}
+    }
+    let vi = io.le16(tables.versym, at)
+    let ndx = vi & 0x7fff
+    if ndx == 0 || ndx == 1 {
+        return SymbolVersion { has_version: true, index: vi }
+    }
+    for dep in tables.deps {
+        if ndx == dep.index {
+            return SymbolVersion { has_version: true, index: vi, version: dep.name }
+        }
+    }
+    for def in tables.defs {
+        if ndx == def.index {
+            return SymbolVersion { has_version: true, index: vi, version: def.name }
+        }
+    }
+    SymbolVersion {}
+}
+
+fn dyn_strings(f: ElfFile, tag: i64) -> []str ! ElfError {
+    var all: []str = []
+    let section = section_by_type(f, sht_dynamic) ?? return all
+    let d = section_data(f, section)?
+    if d.len % dyn_entry_size != 0 {
+        fail Format("length of dynamic section is not a multiple of dynamic entry size")
+    }
+    let strdata = string_table(f, section.link)?
+    var at = 0
+    for at < d.len {
+        let entry_tag = io.le64(d, at)
+        let value = io.le64(d, at + 8)
+        if entry_tag == tag {
+            match get_string(strdata, value) {
+                some(s) => push(mut all, s)
+                none => {}
+            }
+        }
+        at += dyn_entry_size
+    }
+    all
+}

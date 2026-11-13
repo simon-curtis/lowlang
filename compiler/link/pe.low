@@ -1,0 +1,368 @@
+import asm
+import std/io
+import std/slices
+import std/text
+
+const pe_image_base = 0x140000000
+const pe_section_align = page_size
+const pe_file_align = 0x200
+const pe_stack_reserve = 8388608
+const pe_stack_commit = page_size
+const pe_heap_reserve = 1048576
+const pe_heap_commit = page_size
+const pe_code_fill = 0xCC
+const pe_debug_type_repro = 16
+const pe_debug_entry_size = 28
+const pe_null_import_length = 20
+
+const pe_read_only_data = pe_scn_cnt_initialized_data | pe_scn_mem_read
+
+const reloc_name = ".reloc"
+const rdata_name = ".rdata"
+const text_name = ".text"
+const data_name = ".data"
+const group_splitter = "$"
+
+struct PeChunk {
+    input: *asm.Section? = none
+    name: str
+    data: []u8 = []
+    size: i64
+    align: i64
+    chars: i64
+    uninit: bool = false
+    section: *PeSection? = none
+    offset: i64 = 0
+}
+
+fn chunk_section(c: *PeChunk) -> *PeSection {
+    match c.section {
+        some(s) => s
+        none => panic("link: chunk has no section")
+    }
+}
+
+fn chunk_rva(c: *PeChunk) -> i64 {
+    chunk_section(c).rva + c.offset
+}
+
+fn chunk_file_offset(c: *PeChunk) -> i64 {
+    chunk_section(c).raw_offset + c.offset
+}
+
+fn chunk_sort_name(c: *PeChunk) -> str {
+    if text.contains(c.name, group_splitter) {
+        return c.name
+    }
+    ""
+}
+
+fn chunk_before(a: *PeChunk, b: *PeChunk) -> bool {
+    if a.uninit != b.uninit {
+        return b.uninit
+    }
+    chunk_sort_name(a) < chunk_sort_name(b)
+}
+
+struct PeSection {
+    name: str
+    chars: i64
+    chunks: []*PeChunk = []
+    rva: i64 = 0
+    virtual_size: i64 = 0
+    raw_offset: i64 = 0
+    raw_size: i64 = 0
+}
+
+fn pe_section_is_code(s: *PeSection) -> bool {
+    s.chars & pe_scn_cnt_code != 0
+}
+
+fn pe_section_arrange(s: *PeSection) {
+    slices.sort_stable_by(mut s.chunks, chunk_before)
+    var offset = 0
+    var initialized = 0
+    for c in s.chunks {
+        offset = align_up(offset, c.align)
+        c.offset = offset
+        offset += c.size
+        if !c.uninit {
+            initialized = offset
+        }
+    }
+    s.virtual_size = offset
+    s.raw_size = align_up(initialized, pe_file_align)
+    let content = pe_scn_cnt_initialized_data | pe_scn_cnt_uninitialized_data
+    s.chars = s.chars & (0xFFFFFFFF ^ content)
+    if pe_section_is_code(s) {
+        return
+    }
+    if initialized > 0 {
+        s.chars |= pe_scn_cnt_initialized_data
+    } else {
+        s.chars |= pe_scn_cnt_uninitialized_data
+    }
+}
+
+fn pe_section_place(s: *PeSection, rva: i64, offset: i64) {
+    s.rva = rva
+    if s.raw_size == 0 {
+        return
+    }
+    s.raw_offset = offset
+}
+
+struct PeSite {
+    chunk: *PeChunk
+    offset: i64
+}
+
+struct PeLinker {
+    obj: asm.Object
+    symbols: [str: asm.Symbol]
+    chunk_of: [i64: *PeChunk]
+    chunks: []*PeChunk = []
+    sections: []*PeSection = []
+    debug: *PeChunk? = none
+    sites: []PeSite = []
+    header_size: i64 = 0
+    image_size: i64 = 0
+    file_size: i64 = 0
+}
+
+pub fn pe(obj: asm.Object) -> []u8 ! Error {
+    let l = new_pe_linker(obj)
+    pe_collect(l)?
+    pe_add_synthetic_chunks(l)
+    pe_group(l)
+    pe_find_base_relocations(l)
+    pe_layout(l)
+    pe_add_relocations(l)
+    let start = pe_entry(l)?
+    let image = io.buffer(l.file_size)
+    pe_write_sections(l, image)
+    pe_apply_fixups(l, image)?
+    pe_write_headers(l, image, start, 0)
+    pe_stamp(l, image, start)
+    image
+}
+
+fn new_pe_linker(obj: asm.Object) -> *PeLinker {
+    var symbols: [str: asm.Symbol] = [:]
+    for sym in obj.symbols {
+        symbols[sym.name] = sym
+    }
+    new(PeLinker { obj, symbols, chunk_of: [:] })
+}
+
+fn pe_collect(l: *PeLinker) ! Error {
+    for i, input in l.obj.sections {
+        let size = size_of(input)
+        if size == 0 {
+            continue
+        }
+        if asm.flags_has(input.flags, asm.flag_tls) {
+            fail ThreadLocal(input.name)
+        }
+        let align = if input.align > 1 { input.align } else { 1 }
+        let c = new(PeChunk {
+            input: new(input),
+            name: input.name,
+            size,
+            align,
+            chars: pe_characteristics(input),
+            uninit: input.nobits
+        })
+        if !input.nobits {
+            c.data = input.data
+        }
+        l.chunk_of[i] = c
+        push(mut l.chunks, c)
+    }
+}
+
+fn pe_characteristics(input: asm.Section) -> i64 {
+    if asm.flags_has(input.flags, asm.flag_exec) {
+        return pe_scn_cnt_code | pe_scn_mem_execute | pe_scn_mem_read
+    }
+    var chars = pe_scn_mem_read
+    if asm.flags_has(input.flags, asm.flag_write) || !asm.flags_has(input.flags, asm.flag_read_only) {
+        chars |= pe_scn_mem_write
+    }
+    if input.nobits {
+        return chars | pe_scn_cnt_uninitialized_data
+    }
+    chars | pe_scn_cnt_initialized_data
+}
+
+fn pe_debug_entry(timestamp: i64) -> []u8 {
+    var out: []u8 = []
+    io.put_le(mut out, 0, 4)
+    io.put_le(mut out, timestamp, 4)
+    io.put_le(mut out, 0, 2)
+    io.put_le(mut out, 0, 2)
+    io.put_le(mut out, pe_debug_type_repro, 4)
+    io.put_le(mut out, 0, 4)
+    io.put_le(mut out, 0, 4)
+    io.put_le(mut out, 0, 4)
+    out
+}
+
+fn pe_add_synthetic_chunks(l: *PeLinker) {
+    let debug = new(PeChunk {
+        name: rdata_name,
+        data: pe_debug_entry(0),
+        size: pe_debug_entry_size,
+        align: 4,
+        chars: pe_read_only_data
+    })
+    l.debug = debug
+    push(mut l.chunks, debug)
+    if pe_chunks_with_prefix(l, import_group).len == 0 {
+        return
+    }
+    let null = new(PeChunk {
+        name: import_descriptors,
+        data: io.buffer(pe_null_import_length),
+        size: pe_null_import_length,
+        align: 1,
+        chars: pe_read_only_data
+    })
+    push(mut l.chunks, null)
+}
+
+fn pe_chunks_with_prefix(l: *PeLinker, prefix: str) -> []*PeChunk {
+    var found: []*PeChunk = []
+    for c in l.chunks {
+        if text.starts_with(c.name, prefix) {
+            push(mut found, c)
+        }
+    }
+    found
+}
+
+fn pe_prefix_span(l: *PeLinker, prefix: str) -> DataDirectory? {
+    let chunks = pe_chunks_with_prefix(l, prefix)
+    if chunks.len == 0 {
+        return none
+    }
+    var size = 0
+    for c in chunks {
+        size += c.size
+    }
+    DataDirectory { virtual_address: chunk_rva(chunks[0]), size }
+}
+
+fn output_name(name: str) -> str {
+    let base = text.cut(name, group_splitter).before
+    if base == ".bss" {
+        return data_name
+    }
+    if base == ".idata" {
+        return rdata_name
+    }
+    base
+}
+
+fn chunk_output_chars(c: *PeChunk) -> i64 {
+    (c.chars & (0xFFFFFFFF ^ pe_scn_cnt_uninitialized_data)) | pe_scn_cnt_initialized_data
+}
+
+fn pe_section_rank(name: str) -> i64? {
+    if name == text_name {
+        return 0
+    }
+    if name == rdata_name {
+        return 1
+    }
+    if name == data_name {
+        return 2
+    }
+    none
+}
+
+fn pe_section_before(left: *PeSection, right: *PeSection) -> bool {
+    let left_rank = pe_section_rank(left.name)
+    let right_rank = pe_section_rank(right.name)
+    match left_rank {
+        some(a) => {
+            match right_rank {
+                some(b) => return a < b
+                none => return true
+            }
+        }
+        none => {
+            if right_rank != none {
+                return false
+            }
+        }
+    }
+    left.name < right.name
+}
+
+fn pe_group(l: *PeLinker) {
+    var by_key: [str: *PeSection] = [:]
+    for c in l.chunks {
+        let name = output_name(c.name)
+        let chars = chunk_output_chars(c)
+        let key = "{name}:{chars}"
+        let s = match by_key[key] {
+            some(found) => found
+            none => {
+                let created = new(PeSection { name, chars })
+                by_key[key] = created
+                push(mut l.sections, created)
+                created
+            }
+        }
+        c.section = s
+        push(mut s.chunks, c)
+    }
+    slices.sort_stable_by(mut l.sections, pe_section_before)
+    for s in l.sections {
+        pe_section_arrange(s)
+    }
+}
+
+fn pe_layout(l: *PeLinker) {
+    var count = l.sections.len
+    if l.sites.len > 0 {
+        count += 1
+    }
+    let preamble = pe_dos_stub().len + pe_signature_size + pe_file_header_size + pe_optional_header_size
+    l.header_size = align_up(preamble + count * pe_section_header_size, pe_file_align)
+    var rva = align_up(l.header_size, pe_section_align)
+    var offset = l.header_size
+    for s in l.sections {
+        pe_section_place(s, rva, offset)
+        rva = align_up(rva + s.virtual_size, pe_section_align)
+        offset += s.raw_size
+    }
+    l.image_size = rva
+    l.file_size = offset
+}
+
+fn pe_entry(l: *PeLinker) -> i64 ! Error {
+    entry_address(pe_entry_symbol, fn(name: str) -> i64? { pe_entry_rva(l, name) })?
+}
+
+fn pe_write_sections(l: *PeLinker, image: []u8) {
+    for s in l.sections {
+        if pe_section_is_code(s) {
+            pe_section_fill_code(s, image)
+        }
+        for c in s.chunks {
+            if c.data.len == 0 {
+                continue
+            }
+            let start = chunk_file_offset(c)
+            io.copy(image[start..], c.data)
+        }
+    }
+}
+
+fn pe_section_fill_code(s: *PeSection, image: []u8) {
+    for i in s.raw_offset..s.raw_offset + s.raw_size {
+        image[i] = u8(pe_code_fill)
+    }
+}

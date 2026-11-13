@@ -1,0 +1,127 @@
+import asm
+import std/io
+import std/slices
+
+const pe_rel_based_dir64 = 10
+const pe_block_header = 8
+const pe_reloc_chars = pe_read_only_data | pe_scn_mem_discardable
+
+fn pe_rva_of(l: *PeLinker, sym: asm.Symbol) -> i64? {
+    if sym.section < 0 {
+        return none
+    }
+    match l.chunk_of[sym.section] {
+        some(c) => chunk_rva(c) + sym.value
+        none => none
+    }
+}
+
+fn pe_supports(kind: i64) -> bool {
+    kind == asm.abs64 || kind == asm.img_rel32 || kind == asm.pc32 || kind == asm.plt32
+}
+
+fn pe_target(l: *PeLinker, f: asm.Fixup) -> i64? ! Error {
+    let sym = l.symbols[f.symbol] ?? return none
+    if sym.section == asm.section_absolute {
+        return sym.value
+    }
+    let rva = pe_rva_of(l, sym) ?? return none
+    if asm.fixup_image_relative(f.kind) {
+        return rva
+    }
+    pe_image_base + rva
+}
+
+fn pe_entry_rva(l: *PeLinker, name: str) -> i64? {
+    let sym = l.symbols[name] ?? return none
+    pe_rva_of(l, sym)
+}
+
+fn pe_find_base_relocations(l: *PeLinker) {
+    for c in l.chunks {
+        let input = c.input ?? continue
+        for f in input.fixups {
+            if f.kind != asm.abs64 {
+                continue
+            }
+            let sym = l.symbols[f.symbol] ?? continue
+            if sym.section < 0 {
+                continue
+            }
+            if l.chunk_of[sym.section] == none {
+                continue
+            }
+            push(mut l.sites, PeSite { chunk: c, offset: f.offset })
+        }
+    }
+}
+
+fn pe_add_relocations(l: *PeLinker) {
+    if l.sites.len == 0 {
+        return
+    }
+    var rvas: []i64 = []
+    for site in l.sites {
+        push(mut rvas, chunk_rva(site.chunk) + site.offset)
+    }
+    slices.sort(mut rvas)
+    let data = encode_base_relocations(rvas)
+    let size = data.len
+    let c = new(PeChunk { name: reloc_name, data, size, align: 1, chars: pe_reloc_chars })
+    let s = new(PeSection { name: reloc_name, chars: pe_reloc_chars, chunks: [c] })
+    c.section = s
+    pe_section_arrange(s)
+    pe_section_place(s, l.image_size, l.file_size)
+    push(mut l.sections, s)
+    l.image_size = align_up(s.rva + s.virtual_size, pe_section_align)
+    l.file_size += s.raw_size
+}
+
+fn encode_base_relocations(rvas: []i64) -> []u8 {
+    var data: []u8 = []
+    var start = 0
+    for start < rvas.len {
+        let page = rvas[start] / page_size * page_size
+        var end = start
+        for end < rvas.len && rvas[end] / page_size * page_size == page {
+            end += 1
+        }
+        let size = align_up(pe_block_header + (end - start) * 2, 4)
+        io.put_le(mut data, page, 4)
+        io.put_le(mut data, size, 4)
+        for rva in rvas[start..end] {
+            let entry = pe_rel_based_dir64 << 12 | (rva - page)
+            io.put_le(mut data, entry, 2)
+        }
+        var written = pe_block_header + (end - start) * 2
+        for written < size {
+            push(mut data, 0)
+            written += 1
+        }
+        start = end
+    }
+    data
+}
+
+fn pe_format(l: *PeLinker) -> FixupFormat {
+    FixupFormat {
+        supports: pe_supports,
+        target: fn(space: *FixupSpace, f: asm.Fixup) -> i64? ! Error { pe_target(l, f)? }
+    }
+}
+
+fn pe_apply_fixups(l: *PeLinker, image: []u8) ! Error {
+    var spaces: []*FixupSpace = []
+    for c in l.chunks {
+        let input = c.input ?? continue
+        let space = new(FixupSpace {
+            name: c.name,
+            addr: pe_image_base + chunk_rva(c),
+            offset: chunk_file_offset(c),
+            size: c.size,
+            fixups: input.fixups
+        })
+        push(mut spaces, space)
+    }
+    relocate(pe_format(l), image, spaces)?
+}

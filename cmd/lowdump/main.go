@@ -18,6 +18,8 @@ const usage = `usage:
   lowdump ir [-windows] [-unoptimised] <file.low|dir>
   lowdump asm [-windows] <file.low|dir>
   lowdump object [-clang] [-align-branches] <file.s>
+  lowdump link [-windows] [-embed name=file]... [-lib name]... [-libdir dir]... <file.s> <output>
+  lowdump patch [-embed name=file]... <file.s> <base> <running.txt>
   lowdump regex <patterns.txt>`
 
 func main() {
@@ -38,6 +40,10 @@ func run(out io.Writer, args []string) error {
 	path := args[len(args)-1]
 	flags := args[1 : len(args)-1]
 	switch args[0] {
+	case "link":
+		return dumpLinkCommand(args[1:])
+	case "patch":
+		return dumpPatchCommand(out, args[1:])
 	case "check":
 		return dumpCheckCommand(out, path, platformOf(flags))
 	case "ir":

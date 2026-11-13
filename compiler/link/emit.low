@@ -1,0 +1,177 @@
+import std/io
+import std/text
+
+const table_align = 8
+const symtab_name = ".symtab"
+const strtab_name = ".strtab"
+const shstrtab_name = ".shstrtab"
+
+struct Segment {
+    kind: i64
+    flags: i64
+    off: i64 = 0
+    addr: i64 = 0
+    file_size: i64 = 0
+    mem_size: i64 = 0
+    align: i64 = 0
+}
+
+struct Tables {
+    symtab: []u8 = []
+    strtab: []u8 = []
+    shstrtab: []u8 = []
+    first_global: i64 = 0
+    section_name: []i64 = []
+    symtab_name: i64 = 0
+    strtab_name: i64 = 0
+    shstr_name: i64 = 0
+    sym_off: i64 = 0
+    str_off: i64 = 0
+    shstr_off: i64 = 0
+    sh_off: i64 = 0
+    size: i64 = 0
+}
+
+struct StringTable {
+    data: []u8
+    offsets: [str: i64]
+}
+
+fn new_string_table() -> *StringTable {
+    new(StringTable { data: [0], offsets: [:] })
+}
+
+fn add(t: *StringTable, name: str) -> i64 {
+    let offset = t.data.len
+    text.append(mut t.data, name)
+    push(mut t.data, 0)
+    offset
+}
+
+fn add_once(t: *StringTable, name: str) -> i64 {
+    match t.offsets[name] {
+        some(offset) => return offset
+        none => {}
+    }
+    let offset = add(t, name)
+    t.offsets[name] = offset
+    offset
+}
+
+fn build_tables(l: *Linker) -> Tables {
+    var t = Tables {}
+    build_symbol_table(l, mut t)
+    let names = new_string_table()
+    for s in l.sections {
+        let offset = add(names, s.input.name)
+        push(mut t.section_name, offset)
+    }
+    t.symtab_name = add(names, symtab_name)
+    t.strtab_name = add(names, strtab_name)
+    t.shstr_name = add(names, shstrtab_name)
+    t.shstrtab = names.data
+
+    t.sym_off = align_up(l.file_end, table_align)
+    t.str_off = t.sym_off + t.symtab.len
+    t.shstr_off = t.str_off + t.strtab.len
+    t.sh_off = align_up(t.shstr_off + t.shstrtab.len, table_align)
+    t.size = t.sh_off + section_header_count(l) * shdr_size
+    t
+}
+
+fn section_header_count(l: *Linker) -> i64 {
+    l.sections.len + 4
+}
+
+fn build_symbol_table(l: *Linker, mut t: Tables) {
+    let names = new_string_table()
+    let emitted = emitted_symbols(l)
+    var symtab: []u8 = []
+    var count = 1
+    append_sym64(mut symtab, Sym64 {})
+    if emitted.locals.len > 0 {
+        let file = Sym64 { name: add(names, file_symbol), info: st_info(stb_local, stt_file), shndx: shn_abs }
+        append_sym64(mut symtab, file)
+        count += 1
+    }
+    for entry in emitted.locals {
+        let sym = symbol_entry(l, names, entry, stb_local)
+        append_sym64(mut symtab, sym)
+        count += 1
+    }
+    t.first_global = count
+    for entry in emitted.globals {
+        let sym = symbol_entry(l, names, entry, stb_global)
+        append_sym64(mut symtab, sym)
+    }
+    t.symtab = symtab
+    t.strtab = names.data
+}
+
+fn symbol_entry(l: *Linker, names: *StringTable, entry: LinkerSymbol, bind: i64) -> Sym64 {
+    var kind = entry.value.kind
+    if is_tls(entry.value) {
+        kind = stt_tls
+    }
+    Sym64 {
+        name: add(names, entry.name),
+        info: st_info(bind, kind),
+        shndx: symbol_index_of(entry.value),
+        value: emitted_value(l, entry.value)
+    }
+}
+
+fn write_headers(l: *Linker, image: []u8, entry: i64, t: Tables) {
+    let count = section_header_count(l)
+    let header = Header64 {
+        kind: et_exec,
+        machine: em_x86_64,
+        version: ev_current,
+        entry,
+        phoff: header_size,
+        shoff: t.sh_off,
+        ehsize: header_size,
+        phentsize: phdr_size,
+        phnum: l.segments.len,
+        shentsize: shdr_size,
+        shnum: count,
+        shstrndx: count - 1
+    }
+    var encoded: []u8 = []
+    append_header64(mut encoded, header)
+    for seg in l.segments {
+        let prog = Prog64 {
+            kind: seg.kind, flags: seg.flags, off: seg.off,
+            vaddr: seg.addr, filesz: seg.file_size, memsz: seg.mem_size, align: seg.align
+        }
+        append_prog64(mut encoded, prog)
+    }
+    io.copy(image, encoded)
+}
+
+fn write_tables(l: *Linker, image: []u8, t: Tables) {
+    io.copy(image[t.sym_off..], t.symtab)
+    io.copy(image[t.str_off..], t.strtab)
+    io.copy(image[t.shstr_off..], t.shstrtab)
+    let symtab_index = l.sections.len + 1
+    var encoded: []u8 = []
+    append_section64(mut encoded, Section64 {})
+    for i, s in l.sections {
+        let header = section_header(s, t.section_name[i])
+        append_section64(mut encoded, header)
+    }
+    let symtab = Section64 {
+        name: t.symtab_name, kind: sht_symtab, off: t.sym_off, size: t.symtab.len,
+        link: symtab_index + 1, info: t.first_global, addralign: table_align, entsize: sym_size
+    }
+    append_section64(mut encoded, symtab)
+    let strtab = Section64 {
+        name: t.strtab_name, kind: sht_strtab, off: t.str_off, size: t.strtab.len, addralign: 1
+    }
+    append_section64(mut encoded, strtab)
+    let shstrtab = Section64 {
+        name: t.shstr_name, kind: sht_strtab, off: t.shstr_off, size: t.shstrtab.len, addralign: 1
+    }
+    append_section64(mut encoded, shstrtab)
+    io.copy(image[t.sh_off..], encoded)
+}

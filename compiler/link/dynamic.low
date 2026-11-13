@@ -1,0 +1,381 @@
+import asm
+import std/slices
+import std/text
+
+const interpreter = "/lib64/ld-linux-x86-64.so.2"
+const unversioned_index = 0
+const first_version_index = 2
+const bound_bss_start = "__bss_start"
+const bound_edata = "_edata"
+const bound_end = "_end"
+
+struct DynamicSymbol {
+    name: str
+    library: *Library
+    kind: i64
+    version: str
+    index: i64 = 0
+    name_offset: i64 = 0
+    version_index: i64 = 0
+}
+
+struct GotSlot {
+    name: str
+    imported: *DynamicSymbol? = none
+}
+
+struct VersionNeed {
+    name: str
+    index: i64
+    name_offset: i64
+}
+
+struct LibraryNeeds {
+    library: *Library
+    versions: []VersionNeed
+}
+
+struct DynamicSections {
+    interp: *Section? = none
+    hash: *Section? = none
+    gnu_hash: *Section? = none
+    dynsym: *Section? = none
+    dynstr: *Section? = none
+    versym: *Section? = none
+    verneed: *Section? = none
+    rela_dyn: *Section? = none
+    rela_plt: *Section? = none
+    plt: *Section? = none
+    dynamic: *Section? = none
+    got: *Section? = none
+    got_plt: *Section? = none
+    plt_got: *Section? = none
+}
+
+struct DynamicLink {
+    libraries: []*Library
+    needed_offsets: []i64 = []
+    symbols: []*DynamicSymbol = []
+    by_symbol: [str: *DynamicSymbol]
+    slots: []*GotSlot = []
+    slot_index: [str: i64]
+    plt_set: [str: bool]
+    plts: []*DynamicSymbol = []
+    plt_index: [str: i64]
+    plt_gots: []*DynamicSymbol = []
+    plt_got_index: [str: i64]
+    pointer: [str: bool]
+    hashed: []*DynamicSymbol = []
+    gnu: GnuHashLayout = GnuHashLayout {}
+    wanted: [str: bool]
+    wanted_order: []str = []
+    strings: *StringTable
+    needs: []LibraryNeeds = []
+    sections: DynamicSections = DynamicSections {}
+}
+
+fn new_dynamic_link(libraries: []*Library) -> *DynamicLink {
+    new(DynamicLink {
+        libraries,
+        by_symbol: [:],
+        slot_index: [:],
+        plt_index: [:],
+        plt_got_index: [:],
+        plt_set: [:],
+        pointer: [:],
+        wanted: [:],
+        strings: new_string_table()
+    })
+}
+
+fn add_dynamic_sections(l: *Linker, d: *DynamicLink) ! Error {
+    collect_references(l, d)
+    bind(l, d)?
+    build_strings(d)
+    let synthesized = synthesize(d)
+    for s in synthesized {
+        push(mut l.sections, s)
+    }
+}
+
+fn collect_references(l: *Linker, d: *DynamicLink) {
+    let defined = defined_names(l)
+    for i, input in l.obj.sections {
+        if l.by_input[i] == none {
+            continue
+        }
+        for f in input.fixups {
+            reference(d, f, defined[f.symbol] ?? false)
+        }
+    }
+}
+
+fn reference(d: *DynamicLink, f: asm.Fixup, local: bool) {
+    if asm.fixup_got(f.kind) {
+        add_slot(d, f.symbol, local)
+        if f.kind != asm.gotpcrelx {
+            d.pointer[f.symbol] = true
+        }
+    } else if f.kind == asm.plt32 && !local {
+        add_plt(d, f.symbol)
+    }
+}
+
+fn add_slot(d: *DynamicLink, name: str, local: bool) {
+    if d.slot_index[name] != none {
+        return
+    }
+    d.slot_index[name] = d.slots.len
+    let slot = new(GotSlot { name })
+    push(mut d.slots, slot)
+    if !local {
+        want(d, name)
+    }
+}
+
+fn add_plt(d: *DynamicLink, name: str) {
+    if d.plt_set[name] ?? false {
+        return
+    }
+    d.plt_set[name] = true
+    want(d, name)
+}
+
+fn want(d: *DynamicLink, name: str) {
+    if d.wanted[name] ?? false {
+        return
+    }
+    d.wanted[name] = true
+    push(mut d.wanted_order, name)
+}
+
+fn import_order(l: *Linker, d: *DynamicLink) -> []str {
+    var ordered: []str = []
+    var seen: [str: bool] = [:]
+    for sym in l.obj.symbols {
+        if (d.wanted[sym.name] ?? false) && !(seen[sym.name] ?? false) {
+            seen[sym.name] = true
+            push(mut ordered, sym.name)
+        }
+    }
+    for name in d.wanted_order {
+        if !(seen[name] ?? false) {
+            push(mut ordered, name)
+        }
+    }
+    ordered
+}
+
+fn bind(l: *Linker, d: *DynamicLink) ! Error {
+    var missing: []str = []
+    var resolved: []*DynamicSymbol = []
+    for name in import_order(l, d) {
+        match lookup(d, name) {
+            some(sym) => push(mut resolved, sym)
+            none => push(mut missing, name)
+        }
+    }
+    if missing.len > 0 {
+        fail undefined_error(d, missing)
+    }
+    assign_indices(d, resolved)
+    order_tables(d)
+}
+
+fn assign_indices(d: *DynamicLink, resolved: []*DynamicSymbol) {
+    var plain: []*DynamicSymbol = []
+    for sym in resolved {
+        if is_hashed(d, sym) {
+            push(mut d.hashed, sym)
+        } else {
+            push(mut plain, sym)
+        }
+    }
+    d.gnu = new_gnu_hash_layout(d.hashed.len, plain.len + 1)
+    let gnu = d.gnu
+    slices.sort_stable_by(mut d.hashed, fn(a: *DynamicSymbol, b: *DynamicSymbol) -> bool { gnu_bucket(gnu, a.name) < gnu_bucket(gnu, b.name) })
+    var symbols = plain
+    for sym in d.hashed {
+        push(mut symbols, sym)
+    }
+    d.symbols = symbols
+    for i, sym in d.symbols {
+        sym.index = i + 1
+        d.by_symbol[sym.name] = sym
+    }
+}
+
+fn order_tables(d: *DynamicLink) {
+    for sym in d.symbols {
+        if !(d.plt_set[sym.name] ?? false) {
+            continue
+        }
+        if d.slot_index[sym.name] != none {
+            d.plt_got_index[sym.name] = d.plt_gots.len
+            push(mut d.plt_gots, sym)
+            continue
+        }
+        d.plt_index[sym.name] = d.plts.len
+        push(mut d.plts, sym)
+    }
+    var locals: []*GotSlot = []
+    var imported: []*GotSlot = []
+    for slot in d.slots {
+        slot.imported = d.by_symbol[slot.name]
+        if slot.imported == none {
+            push(mut locals, slot)
+        } else {
+            push(mut imported, slot)
+        }
+    }
+    slices.sort_by(mut imported, fn(a: *GotSlot, b: *GotSlot) -> bool { got_rank(d, a) < got_rank(d, b) })
+    var ordered = locals
+    for slot in imported {
+        push(mut ordered, slot)
+    }
+    d.slots = ordered
+    for i, slot in d.slots {
+        d.slot_index[slot.name] = i
+    }
+}
+
+fn undefined_error(d: *DynamicLink, missing: []str) -> Error {
+    var names = missing
+    slices.sort(mut names)
+    var sonames: []str = []
+    for library in d.libraries {
+        push(mut sonames, library.soname)
+    }
+    NotExported(text.join(names, ", "), text.join(sonames, ", "))
+}
+
+fn lookup(d: *DynamicLink, name: str) -> *DynamicSymbol? {
+    for library in d.libraries {
+        match library.symbols[name] {
+            some(sym) => {
+                return new(DynamicSymbol { name, library, kind: imported_kind(sym.kind), version: sym.version })
+            }
+            none => {}
+        }
+    }
+    none
+}
+
+fn imported_kind(kind: i64) -> i64 {
+    if kind == stt_func || kind == stt_gnu_ifunc {
+        return stt_func
+    }
+    if kind == stt_object || kind == stt_tls {
+        return kind
+    }
+    stt_notype
+}
+
+fn imports(d: *DynamicLink, name: str) -> bool {
+    d.by_symbol[name] != none
+}
+
+fn got_address(d: *DynamicLink, name: str) -> i64 {
+    let got = required(d.sections.got)
+    got.addr + 8 * (d.slot_index[name] ?? 0)
+}
+
+fn plt_address(d: *DynamicLink, name: str) -> i64? {
+    match d.plt_index[name] {
+        some(index) => {
+            let plt = required(d.sections.plt)
+            return plt.addr + plt_entry_size * (index + 1)
+        }
+        none => {}
+    }
+    match d.plt_got_index[name] {
+        some(index) => {
+            let plt_got = required(d.sections.plt_got)
+            return plt_got.addr + plt_got_entry_size * index
+        }
+        none => {}
+    }
+    none
+}
+
+fn build_strings(d: *DynamicLink) {
+    d.strings = new_string_table()
+    for sym in d.symbols {
+        sym.name_offset = add_once(d.strings, sym.name)
+    }
+    for library in d.libraries {
+        let offset = add_once(d.strings, library.soname)
+        push(mut d.needed_offsets, offset)
+    }
+    assign_versions(d)
+}
+
+fn assign_versions(d: *DynamicLink) {
+    var next = first_version_index
+    var indices: [str: i64] = [:]
+    var by_library: [*Library: []VersionNeed] = [:]
+    for sym in d.symbols {
+        if sym.version == "" {
+            sym.version_index = unversioned_index
+            continue
+        }
+        let key = "{sym.library.name}:{sym.version}"
+        var index = 0
+        match indices[key] {
+            some(assigned) => {
+                index = assigned
+            }
+            none => {
+                index = next
+                next += 1
+                indices[key] = index
+                let name_offset = add_once(d.strings, sym.version)
+                let need = VersionNeed { name: sym.version, index, name_offset }
+                var versions = by_library[sym.library] ?? []
+                push(mut versions, need)
+                by_library[sym.library] = versions
+            }
+        }
+        sym.version_index = index
+    }
+    for library in d.libraries {
+        var versions = by_library[library] ?? []
+        if versions.len == 0 {
+            continue
+        }
+        slices.sort_by(mut versions, fn(a: VersionNeed, b: VersionNeed) -> bool { a.index > b.index })
+        let needs = LibraryNeeds { library, versions }
+        push(mut d.needs, needs)
+    }
+}
+
+fn versioned(d: *DynamicLink) -> bool {
+    d.needs.len > 0
+}
+
+fn versioned_name(s: *DynamicSymbol) -> str {
+    if s.version == "" {
+        return s.name
+    }
+    "{s.name}@{s.version}"
+}
+
+fn table_symbols(d: *DynamicLink) -> []LinkerSymbol {
+    let dynamic = required(d.sections.dynamic)
+    let got_plt = required(d.sections.got_plt)
+    let dynamic_value = SymbolValue { value: dynamic.addr, section: dynamic, kind: stt_object }
+    let got_plt_value = SymbolValue { value: got_plt.addr, section: got_plt, kind: stt_object }
+    [
+        LinkerSymbol { name: "_DYNAMIC", value: dynamic_value },
+        LinkerSymbol { name: "_GLOBAL_OFFSET_TABLE_", value: got_plt_value }
+    ]
+}
+
+fn got_rank(d: *DynamicLink, slot: *GotSlot) -> i64 {
+    let imported = slot.imported ?? panic("link: slot has no import")
+    var rank = imported.index
+    if is_hashed(d, imported) {
+        rank -= d.symbols.len + 1
+    }
+    rank
+}

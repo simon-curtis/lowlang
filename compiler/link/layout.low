@@ -1,0 +1,304 @@
+import asm
+import std/slices
+
+const page_size = 0x1000
+
+const class_interp = 0
+const class_hash = 1
+const class_gnu_hash = 2
+const class_dynsym = 3
+const class_dynstr = 4
+const class_versym = 5
+const class_verneed = 6
+const class_rela_dyn = 7
+const class_rela_plt = 8
+const class_plt = 9
+const class_plt_got = 10
+const class_text = 11
+const class_rodata = 12
+const class_tdata = 13
+const class_tbss = 14
+const class_dynamic = 15
+const class_got = 16
+const class_got_plt = 17
+const class_data = 18
+const class_bss = 19
+
+struct Section {
+    input: *asm.Section
+    class: i64
+    size: i64
+    align: i64
+    addr: i64 = 0
+    off: i64 = 0
+    index: i64 = 0
+    sh_type: i64 = 0
+    sh_flags: i64 = 0
+    entsize: i64 = 0
+    linked: *Section? = none
+    info_section: *Section? = none
+    info: i64 = 0
+}
+
+fn section_end(s: *Section) -> i64 {
+    s.addr + s.size
+}
+
+fn section_flags(s: *Section) -> i64 {
+    var flags = shf_alloc
+    if asm.flags_has(s.input.flags, asm.flag_write) {
+        flags |= shf_write
+    }
+    if asm.flags_has(s.input.flags, asm.flag_exec) {
+        flags |= shf_execinstr
+    }
+    if asm.flags_has(s.input.flags, asm.flag_tls) {
+        flags |= shf_tls
+    }
+    flags | s.sh_flags
+}
+
+fn section_kind(s: *Section) -> i64 {
+    if s.sh_type != sht_null {
+        return s.sh_type
+    }
+    if s.input.nobits {
+        return sht_nobits
+    }
+    sht_progbits
+}
+
+fn class_of(input: asm.Section) -> i64? {
+    let flags = input.flags
+    if !asm.flags_has(flags, asm.flag_alloc) {
+        return none
+    }
+    let tls = asm.flags_has(flags, asm.flag_tls)
+    if tls && input.nobits {
+        return class_tbss
+    }
+    if tls {
+        return class_tdata
+    }
+    if asm.flags_has(flags, asm.flag_exec) {
+        return class_text
+    }
+    if input.nobits {
+        return class_bss
+    }
+    if asm.flags_has(flags, asm.flag_write) {
+        return class_data
+    }
+    class_rodata
+}
+
+fn size_of(input: asm.Section) -> i64 {
+    if input.nobits {
+        return input.size
+    }
+    input.data.len
+}
+
+fn collect_sections(l: *Linker) {
+    for i, input in l.obj.sections {
+        let class = class_of(input) ?? continue
+        let size = size_of(input)
+        if size == 0 {
+            continue
+        }
+        let align = if input.align > 1 { input.align } else { 1 }
+        let s = new(Section { input: new(input), class, size, align })
+        l.by_input[i] = s
+        push(mut l.sections, s)
+    }
+}
+
+fn order_sections(l: *Linker) {
+    slices.sort_stable_by(mut l.sections, fn(a: *Section, b: *Section) -> bool { a.class < b.class })
+    for i, s in l.sections {
+        s.index = i + 1
+    }
+}
+
+struct Cursor {
+    off: i64
+    addr: i64
+}
+
+fn place(c: *Cursor, s: *Section) {
+    let aligned = align_up(c.addr, s.align)
+    let shift = aligned - c.addr
+    s.off = c.off + shift
+    s.addr = aligned
+    if s.class == class_tbss {
+        return
+    }
+    c.off += shift
+    c.addr = aligned + s.size
+    if !s.input.nobits {
+        c.off += s.size
+    }
+}
+
+fn align_to(c: *Cursor, align: i64) {
+    c.off = align_up(c.off, align)
+    c.addr = align_up(c.addr, align)
+}
+
+fn align_to_page(c: *Cursor) {
+    c.off = align_up(c.off, page_size)
+    c.addr = align_up(c.addr, page_size)
+}
+
+fn sections_of(l: *Linker, classes: []i64) -> []*Section {
+    var found: []*Section = []
+    for s in l.sections {
+        for c in classes {
+            if s.class == c {
+                push(mut found, s)
+            }
+        }
+    }
+    found
+}
+
+fn layout(l: *Linker) {
+    match l.dyn {
+        some(d) => layout_dynamic(l, d)
+        none => layout_static(l)
+    }
+}
+
+fn layout_static(l: *Linker) {
+    let text = sections_of(l, [class_text])
+    let rodata = sections_of(l, [class_rodata])
+    let writable = sections_of(l, [class_tdata, class_tbss, class_data, class_bss])
+    let tls = sections_of(l, [class_tdata, class_tbss])
+    let loads_writable = sections_of(l, [class_tdata, class_data, class_bss]).len > 0
+
+    var count = 2
+    for present in [text.len > 0, rodata.len > 0, loads_writable, tls.len > 0] {
+        if present {
+            count += 1
+        }
+    }
+    let headers = header_size + count * phdr_size
+    let first = Segment { kind: pt_load, flags: pf_r, addr: base_address, file_size: headers, mem_size: headers, align: page_size }
+    push(mut l.segments, first)
+    let c = new(Cursor { off: headers, addr: base_address + headers })
+    align_to_page(c)
+    if text.len > 0 {
+        let seg = load_segment(c, text, pf_r | pf_x)
+        push(mut l.segments, seg)
+    }
+    if rodata.len > 0 {
+        align_to_page(c)
+        let seg = load_segment(c, rodata, pf_r)
+        push(mut l.segments, seg)
+    }
+    if loads_writable {
+        let seg = writable_segment(c, writable)
+        push(mut l.segments, seg)
+    }
+    if tls.len > 0 {
+        let seg = tls_segment(tls)
+        push(mut l.segments, seg)
+    }
+    let stack = Segment { kind: pt_gnu_stack, flags: pf_r | pf_w, align: 16 }
+    push(mut l.segments, stack)
+    l.file_end = c.off
+}
+
+fn writable_segment(c: *Cursor, members: []*Section) -> Segment {
+    let shared = new(*c)
+    if shared.addr % page_size != 0 {
+        shared.addr += page_size
+    }
+    let base = shared.addr
+    let seg = load_segment(shared, members, pf_r | pf_w)
+    if !saves_page(base, seg) {
+        *c = *shared
+        return seg
+    }
+    align_to_page(c)
+    load_segment(c, members, pf_r | pf_w)
+}
+
+fn saves_page(base: i64, seg: Segment) -> bool {
+    let end = align_up(seg.addr + seg.mem_size, 8)
+    let first = (page_size - base % page_size) % page_size
+    let last = end % page_size
+    first != 0 && last != 0 && base / page_size != end / page_size && first + last <= page_size
+}
+
+fn load_segment(c: *Cursor, members: []*Section, flags: i64) -> Segment {
+    for s in members {
+        place(c, s)
+    }
+    let first = loaded_first(members)
+    var last = members[members.len - 1]
+    for s in members {
+        if s.class != class_tbss {
+            last = s
+        }
+    }
+    var seg = Segment { kind: pt_load, flags, off: first.off, addr: first.addr, align: page_size }
+    seg.mem_size = section_end(last) - first.addr
+    for s in members {
+        if !s.input.nobits {
+            seg.file_size = section_end(s) - first.addr
+        }
+    }
+    seg
+}
+
+fn loaded_first(members: []*Section) -> *Section {
+    for s in members {
+        if s.class != class_tbss {
+            return s
+        }
+    }
+    members[0]
+}
+
+fn tls_segment(members: []*Section) -> Segment {
+    let first = members[0]
+    var seg = Segment { kind: pt_tls, flags: pf_r, off: first.off, addr: first.addr, align: 1 }
+    for s in members {
+        if s.align > seg.align {
+            seg.align = s.align
+        }
+        seg.mem_size = section_end(s) - first.addr
+        if s.class == class_tdata {
+            seg.file_size = section_end(s) - first.addr
+        }
+    }
+    seg
+}
+
+fn section_header(s: *Section, name: i64) -> Section64 {
+    var header = Section64 {
+        name,
+        kind: section_kind(s),
+        flags: section_flags(s),
+        addr: s.addr,
+        off: s.off,
+        size: s.size,
+        addralign: s.align,
+        entsize: s.entsize,
+        info: s.info
+    }
+    match s.linked {
+        some(linked) => {
+            header.link = linked.index
+        }
+        none => {}
+    }
+    match s.info_section {
+        some(info_section) => {
+            header.info = info_section.index
+        }
+        none => {}
+    }
+    header
+}

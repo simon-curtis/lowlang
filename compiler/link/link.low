@@ -1,0 +1,151 @@
+import asm
+import diag
+import std/io
+
+pub const base_address = 0x400000
+pub const file_symbol = "main.o"
+
+const elf_entry_symbol = "_start"
+const pe_entry_symbol = "start"
+const import_descriptors = ".idata$2"
+const import_addresses = ".idata$5"
+const import_group = ".idata"
+
+pub struct Image {
+    pub bytes: []u8 = []
+    pub symbols: [str: i64] = [:]
+}
+
+pub enum Error {
+    EntryUndefined(symbol: str)
+    Undefined(names: str)
+    Unsupported(kind: str, symbol: str, section: str)
+    Outside(kind: str, symbol: str, section: str)
+    OutOfRange(kind: str, symbol: str, section: str, offset: i64, value: i64, signedness: str)
+    NeedsCopy(kind: str, symbol: str, section: str)
+    GotInStatic(kind: str, symbol: str, section: str)
+    NotExported(names: str, sonames: str)
+    LibraryNotFound(name: str, file: str, dirs: str)
+    LibraryPath(name: str, cause: str)
+    NotShared(name: str, path: str, cause: str)
+    NotSharedType(name: str, path: str)
+    NoDynamicSymbols(name: str, path: str, cause: str)
+    PatchEmpty
+    PatchSection(name: str)
+    ThreadLocal(name: str)
+}
+
+pub fn message(e: Error) -> str {
+    match e {
+        EntryUndefined(symbol) => "link: entry symbol {symbol} is not defined"
+        Undefined(names) => "link: undefined symbol {names}"
+        Unsupported(kind, symbol, section) => "link: {kind} relocation against {symbol} in {section} is not supported"
+        Outside(kind, symbol, section) => "link: {kind} relocation against {symbol} lies outside {section}"
+        OutOfRange(kind, symbol, section, offset, value, signedness) => "link: {kind} relocation against {symbol} at {section}+{hex(offset)}: value {hex(value)} does not fit in 32 {signedness} bits"
+        NeedsCopy(kind, symbol, section) => "link: {kind} relocation against {symbol} in {section} needs a copy relocation or canonical PLT entry, which are not supported"
+        GotInStatic(kind, symbol, section) => "link: {kind} relocation against {symbol} in {section} is not supported in a static program"
+        NotExported(names, sonames) => "link: undefined symbol {names} (not exported by {sonames})"
+        LibraryNotFound(name, file, dirs) => "link: cannot find library {diag.quote(name)}: no {file} in {dirs}"
+        LibraryPath(name, cause) => "link: library {diag.quote(name)}: {cause}"
+        NotShared(name, path, cause) => "link: library {diag.quote(name)} at {path} is not a shared object: {cause}"
+        NotSharedType(name, path) => "link: library {diag.quote(name)} at {path} is not a shared object"
+        NoDynamicSymbols(name, path, cause) => "link: library {diag.quote(name)} at {path} has no dynamic symbols: {cause}"
+        PatchEmpty => "link: patch has no code"
+        PatchSection(name) => "link: patch section {name} is neither code nor read-only data"
+        ThreadLocal(name) => "link: thread-local section {name} is not supported in a PE image"
+    }
+}
+
+fn hex(v: i64) -> str {
+    if v < 0 {
+        let magnitude = 0 - u64(v)
+        return "-0x{magnitude:x}"
+    }
+    "0x{v:x}"
+}
+
+pub fn static(obj: asm.Object) -> Image ! Error {
+    let l = new_linker(obj)
+    link(l)?
+}
+
+pub fn dynamic(obj: asm.Object, libraries: []*Library) -> Image ! Error {
+    let l = new_linker(obj)
+    l.dyn = new_dynamic_link(libraries)
+    link(l)?
+}
+
+fn link(l: *Linker) -> Image ! Error {
+    collect_sections(l)
+    match l.dyn {
+        some(d) => add_dynamic_sections(l, d)?
+        none => {}
+    }
+    order_sections(l)
+    layout(l)
+    resolve_symbols(l)
+    let start = entry(l)?
+    match l.dyn {
+        some(d) => fill_dynamic(l, d)
+        none => {}
+    }
+    let t = build_tables(l)
+    let image = io.buffer(t.size)
+    apply_sections(l, image)?
+    write_headers(l, image, start, t)
+    write_tables(l, image, t)
+    Image { bytes: image, symbols: addresses(l) }
+}
+
+fn entry(l: *Linker) -> i64 ! Error {
+    entry_address(elf_entry_symbol, fn(name: str) -> i64? { address_of(l, name) })?
+}
+
+fn address_of(l: *Linker, name: str) -> i64? {
+    match l.symbols[name] {
+        some(sym) => sym.value
+        none => none
+    }
+}
+
+struct Linker {
+    obj: asm.Object
+    sections: []*Section = []
+    by_input: [i64: *Section]
+    segments: []Segment = []
+    symbols: [str: SymbolValue]
+    file_end: i64 = 0
+    dyn: *DynamicLink? = none
+}
+
+fn new_linker(obj: asm.Object) -> *Linker {
+    new(Linker {
+        obj,
+        by_input: [:],
+        symbols: [:]
+    })
+}
+
+fn align_up(value: i64, align: i64) -> i64 {
+    if align <= 1 {
+        return value
+    }
+    (value + align - 1) / align * align
+}
+
+fn max_align(members: []*Section) -> i64 {
+    var largest = 1
+    for s in members {
+        if s.align > largest {
+            largest = s.align
+        }
+    }
+    largest
+}
+
+fn required(s: *Section?) -> *Section {
+    match s {
+        some(found) => found
+        none => panic("link: missing section")
+    }
+}
