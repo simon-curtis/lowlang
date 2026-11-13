@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io/fs"
+	"path"
 	"slices"
 	"strings"
 
@@ -54,6 +55,7 @@ type Checker struct {
 	derived         map[string]*ast.Func
 	folding         map[*ast.Const]bool
 	embedder        EmbedResolver
+	lister          EmbedLister
 	unpropagated    *types.Type
 }
 
@@ -77,9 +79,12 @@ type Embedded struct {
 
 type EmbedResolver func(file *ast.File, name string) (Embedded, error)
 
-func Check(files []*ast.File, resolve EmbedResolver) (*types.Universe, error) {
+type EmbedLister func(file *ast.File, dir string) ([]string, error)
+
+func Check(files []*ast.File, resolve EmbedResolver, list EmbedLister) (*types.Universe, error) {
 	c := &Checker{
 		embedder:        resolve,
+		lister:          list,
 		waiting:         map[phase][]func(){},
 		modules:         map[string]*scope{},
 		counts:          map[*ast.Func]int{},
@@ -1883,6 +1888,30 @@ func (c *Checker) embed(e *ast.Call) {
 		c.fail(lit.Pos, "cannot embed %s: %v", lit.Value, err)
 	}
 	c.embedded(e, embedded.Path, embedded.Data)
+}
+
+func (c *Checker) embedDir(e *ast.Call) {
+	lit, ok := e.Args[0].(*ast.StrLit)
+	if !ok {
+		c.fail(e.Args[0].Position(), "embed_dir needs a string literal path")
+	}
+	lit.Type = types.Str
+	names, err := c.lister(c.file, lit.Value)
+	if errors.Is(err, fs.ErrNotExist) {
+		c.fail(lit.Pos, "cannot embed %s: no such directory", lit.Value)
+	}
+	if err != nil {
+		c.fail(lit.Pos, "cannot embed %s: %v", lit.Value, err)
+	}
+	dir := &ast.MapLit{Pos: e.Pos}
+	for _, name := range names {
+		file := &ast.StrLit{Value: path.Join(lit.Value, name), Pos: lit.Pos}
+		dir.Keys = append(dir.Keys, &ast.StrLit{Value: name, Pos: lit.Pos})
+		dir.Values = append(dir.Values, &ast.Call{Fn: &ast.Ident{Name: "embed", Pos: e.Pos}, Args: []ast.Expr{file}, Pos: e.Pos})
+	}
+	e.Type = c.universe.Map(types.Str, types.Str)
+	c.mapLit(dir, e.Type)
+	e.Dir = dir
 }
 
 func (c *Checker) embedded(e *ast.Call, abs string, data []byte) {

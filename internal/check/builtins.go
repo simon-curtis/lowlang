@@ -130,6 +130,7 @@ func newBuiltins() []*Builtin {
 		{ID: builtin.Pin, Name: "pin", Params: []string{"value"}, handler: bare((*Checker).pinCall)},
 		{ID: builtin.Unpin, Name: "unpin", Params: []string{"p"}, handler: bare((*Checker).unpinCall)},
 		{ID: builtin.Embed, Name: "embed", Params: []string{"path"}, handler: bare((*Checker).embed)},
+		{ID: builtin.EmbedDir, Name: "embed_dir", Params: []string{"path"}, handler: bare((*Checker).embedDir)},
 		{ID: builtin.Sqrt, Name: "sqrt", Params: []string{"x"}, handler: (*Checker).math},
 		{ID: builtin.Floor, Name: "floor", Params: []string{"x"}, handler: (*Checker).math},
 		{ID: builtin.Exp, Name: "exp", Params: []string{"x"}, handler: (*Checker).math},

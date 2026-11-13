@@ -73,7 +73,7 @@ func Check(path string, platform target.OS, disk fs.FS) (*Unit, error) {
 	}
 	files := append([]*ast.File{file}, modules.files...)
 	embeds := &embedder{disk: disk, std: stdFS, data: map[string][]byte{}}
-	universe, err := check.Check(files, embeds.resolve)
+	universe, err := check.Check(files, embeds.resolve, embeds.list)
 	if err != nil {
 		return nil, err
 	}

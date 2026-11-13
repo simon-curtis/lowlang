@@ -122,6 +122,10 @@ func noEmbeds(*ast.File, string) (check.Embedded, error) {
 	return check.Embedded{}, fs.ErrNotExist
 }
 
+func noEmbedDirs(*ast.File, string) ([]string, error) {
+	return nil, fs.ErrNotExist
+}
+
 func buildProbe(t *testing.T, source string) string {
 	t.Helper()
 	prelude, err := parsePrelude()
@@ -133,7 +137,7 @@ func buildProbe(t *testing.T, source string) string {
 		t.Fatal(err)
 	}
 	files := []*ast.File{prelude, probe}
-	if _, err := check.Check(files, noEmbeds); err != nil {
+	if _, err := check.Check(files, noEmbeds, noEmbedDirs); err != nil {
 		t.Fatal(err)
 	}
 	host := target.Host()

@@ -333,6 +333,9 @@ func (d astDumper) call(depth int, label string, e *ast.Call) {
 	}
 	d.line(depth, label, head.String())
 	d.expr(depth+1, "fn: ", e.Fn)
+	if e.Dir != nil {
+		d.expr(depth+1, "dir: ", e.Dir)
+	}
 	d.exprs(depth+1, "arg: ", e.Args)
 }
 

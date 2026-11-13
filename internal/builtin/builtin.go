@@ -19,6 +19,7 @@ const (
 	Pin
 	Unpin
 	Embed
+	EmbedDir
 	Sqrt
 	Floor
 	Exp

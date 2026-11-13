@@ -705,6 +705,7 @@ print(shader.len)
 - `embed("path")` is the contents of a file as a `str`, read at compile time. The path must be a string literal and is relative to the directory of the file that calls `embed`, so a module carries its own assets.
 - The bytes live in the binary's read-only data, aligned to 16 bytes; nothing is copied at run time. Indexing, slicing, `.len` and `bytes(...)` work as on any string.
 - A missing file is a compile error. `low dev` watches embedded files, and a change to one reloads the functions that embed it.
+- `embed_dir("path")` embeds every regular file under a directory, however deep, as a `[str: str]` from each file's path inside the directory, with `/` between segments, to its contents. The entries are in byte order of those paths. Each call builds a new map; the contents are the same read-only bytes `embed` gives.
 ### C interop
 
 <!-- prelude
@@ -1077,6 +1078,10 @@ Every module sees these names without an import. A function in the program named
 ### `embed`
 
 `embed(path: str) -> str` is the contents of a file, read at compile time. `path` is a string literal relative to the directory of the file that calls `embed`.
+
+### `embed_dir`
+
+`embed_dir(path: str) -> [str: str]` is the contents of every regular file under a directory, read at compile time and keyed by the file's path inside the directory. `path` is a string literal relative to the directory of the file that calls `embed_dir`.
 
 ### `exp`
 

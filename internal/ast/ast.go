@@ -528,6 +528,7 @@ type Call struct {
 	Embed     string
 	Size      int64
 	Digest    uint64
+	Dir       *MapLit
 }
 
 type If struct {

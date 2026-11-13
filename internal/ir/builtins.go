@@ -30,6 +30,7 @@ func init() {
 		builtin.Pin:          (*builder).pinCall,
 		builtin.Unpin:        (*builder).unpinCall,
 		builtin.Embed:        (*builder).embedCall,
+		builtin.EmbedDir:     (*builder).embedDir,
 		builtin.Sqrt:         (*builder).sqrtCall,
 		builtin.Floor:        (*builder).floorCall,
 		builtin.Exp:          (*builder).exp,
@@ -120,6 +121,10 @@ func (b *builder) embedCall(e *ast.Call) []*Value {
 	v.Aux = int64(e.Digest)
 	v.Scalar = true
 	return []*Value{v, b.constant(e.Size)}
+}
+
+func (b *builder) embedDir(e *ast.Call) []*Value {
+	return b.filledMap(e.Dir)
 }
 
 func (b *builder) bytesCall(e *ast.Call) []*Value {
