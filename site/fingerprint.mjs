@@ -3,7 +3,7 @@ import { readdir, readFile, writeFile } from "node:fs/promises";
 import { outputs } from "./config.mjs";
 
 const site = new URL("./", import.meta.url);
-const reference = /\b(href|src)="(\/|(?:\.\.\/)*)([\w.-]+\.(?:css|js))(?:\?v=\w+)?"/g;
+const reference = /\b(href|src|data-index)="(\/|(?:\.\.\/)*)([\w.-]+\.(?:css|js|json))(?:\?v=\w+)?"/g;
 
 class Fingerprints {
     #hashes = new Map();

@@ -12,6 +12,7 @@ import { lexed } from "./source.mjs";
 const output = new URL(folders.docs, import.meta.url);
 const hidden = /^<!-- prelude ?(\S*)\n([\s\S]*?)\n?-->/;
 const reference = /^#{2,6} \S/;
+const current = "Docs";
 
 function slug(text) {
     return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -112,7 +113,7 @@ function document(page, pages) {
     });
     const sidebar = `<ul class="sidelist">\n${items.join("\n")}\n</ul>`;
     const title = page.file === "index.html" ? "Low documentation" : `${page.title}: Low documentation`;
-    return layout({ path: `${folders.docs}${page.file}`, heading: page.title, title, description: page.description, current: "Docs", sidebar, body: page.body });
+    return layout({ path: `${folders.docs}${page.file}`, heading: page.title, title, description: page.description, current, sidebar, body: page.body });
 }
 
 async function inspect(pages, session) {
@@ -163,7 +164,7 @@ export function builtins(design) {
     return entries;
 }
 
-export async function docs(design, session, library, roadmap) {
+export async function docs(design, session, library, roadmap, search) {
     const editors = await lexed("editors/README.md");
     const chapters = sections(design, 2).map((page) => ({ ...page, file: `${slug(page.title)}.html` }));
     const editor = { title: "Editors", depth: 1, tokens: editors.filter((token) => token.type !== "heading" || token.depth !== 1), file: "editors.html" };
@@ -178,6 +179,9 @@ export async function docs(design, session, library, roadmap) {
         page.body ??= render(page, facts, library, headings);
     }
     home.body = `${home.body}${contents(pages)}`;
+    for (const page of pages) {
+        search.document({ title: page.title, area: current, path: `${folders.docs}${page.file}`, description: page.description, html: page.body });
+    }
     await rm(output, { recursive: true, force: true });
     await mkdir(output);
     for (const page of pages) {
