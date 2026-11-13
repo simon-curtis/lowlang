@@ -112,7 +112,7 @@ func (s *Server) handle(req request) (bool, error) {
 	case "textDocument/didSave":
 		return false, observe(s, req, s.save)
 	case "textDocument/didClose":
-		return false, observe(s, req, s.close)
+		return false, observeChecked(s, req, s.close)
 	case "textDocument/hover":
 		return false, serve(s, req, s.hover)
 	case "textDocument/definition":
@@ -161,13 +161,19 @@ func serveChecked[P, R any](s *Server, req request, answer func(P) (R, error)) e
 }
 
 func observe[P any](s *Server, req request, apply func(P)) error {
+	return observeChecked(s, req, func(p P) error {
+		apply(p)
+		return nil
+	})
+}
+
+func observeChecked[P any](s *Server, req request, apply func(P) error) error {
 	p, err := decode[P](req)
 	if err != nil {
 		message := fmt.Sprintf("%s: %v", req.Method, err)
 		return s.notify("window/logMessage", LogMessageParams{Type: messageError, Message: message})
 	}
-	apply(p)
-	return nil
+	return apply(p)
 }
 
 func (s *Server) initialize(p InitializeParams) InitializeResult {
@@ -219,11 +225,40 @@ func (s *Server) save(p DocumentParams) {
 	s.schedule(pathOf(p.TextDocument.URI), 0)
 }
 
-func (s *Server) close(p DocumentParams) {
+func (s *Server) close(p DocumentParams) error {
 	path := pathOf(p.TextDocument.URI)
 	delete(s.docs, path)
 	delete(s.versions, path)
-	s.schedule(path, 0)
+	if s.indexed.path == path {
+		s.indexed = indexed{}
+	}
+	open := s.openEntries()
+	if open[s.entry(path)] {
+		s.schedule(path, 0)
+	}
+	for entry, state := range s.entries {
+		if open[entry] {
+			continue
+		}
+		if err := s.release(entry, state); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) openEntries() map[string]bool {
+	open := map[string]bool{}
+	for path := range s.docs {
+		open[s.entry(path)] = true
+	}
+	return open
+}
+
+func (s *Server) release(entry string, state *entryState) error {
+	delete(s.entries, entry)
+	s.compiles.forget(entry)
+	return s.publish(state, map[string][]Diagnostic{})
 }
 
 func (s *Server) reply(id json.RawMessage, result any) error {
@@ -267,13 +302,19 @@ func (s *Server) entryState(entry string) *entryState {
 }
 
 func (s *Server) stateOf(path string) *entryState {
-	return s.entryState(s.entry(path))
+	if state, ok := s.entries[s.entry(path)]; ok {
+		return state
+	}
+	return &entryState{}
 }
 
 func (s *Server) finish(r compiled) error {
 	current := s.compiles.finish(r)
 	entry := r.job.entry
-	state := s.entryState(entry)
+	state, ok := s.entries[entry]
+	if !ok {
+		return nil
+	}
 	if r.err == nil {
 		state.unit = r.unit
 		state.docs = r.job.docs
