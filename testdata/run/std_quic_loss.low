@@ -1,0 +1,170 @@
+import std/atomic
+import std/crypto/hash
+import std/crypto/x509
+import std/io
+import std/net
+import std/quic
+import std/tls
+
+struct Relay {
+    socket: net.SocketHandle
+    server: net.Addr
+    quiet: atomic.Flag
+    bulk: atomic.Flag
+}
+
+fn server_config() -> quic.Config ! io.Error {
+    let pem = embed("std_tls_ec.pem")
+    let certificates = x509.pem_certificates(pem)
+    let key = x509.pem_private_key(pem)?
+    let secure = tls.Config { certificates, key, alpn: ["hq-loss"] }
+    quic.Config { tls: secure }
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        push(mut out, x509.parse(der) or return out)
+    }
+    out
+}
+
+fn client_config() -> quic.Config {
+    let secure = tls.Config { roots: roots(), alpn: ["hq-loss"] }
+    quic.Config { tls: secure }
+}
+
+fn same_address(a: net.Addr, b: net.Addr) -> bool {
+    a.port == b.port && hash.equal(a.ip, b.ip)
+}
+
+fn copies(r: *Relay, n: i64) -> i64 {
+    if atomic.is_set(r.quiet) {
+        return 1
+    }
+    if atomic.is_set(r.bulk) {
+        if n % 7 == 0 {
+            return 0
+        }
+        if n % 11 == 0 {
+            return 2
+        }
+        return 1
+    }
+    if n == 1 || n % 3 == 0 {
+        return 0
+    }
+    if n % 4 == 0 {
+        return 2
+    }
+    1
+}
+
+fn send_later(r: *Relay, data: []u8, to: net.Addr) {
+    sleep(20)
+    let sent = net.send_to_on(r.socket, data, to) catch {
+        _ => 0
+    }
+}
+
+fn forward(r: *Relay, data: []u8, to: net.Addr, n: i64) {
+    let count = copies(r, n)
+    let delayed = atomic.is_set(r.bulk) && !atomic.is_set(r.quiet) && n % 5 == 0
+    for i in 0..count {
+        if delayed {
+            let copy = io.buffer(data.len)
+            io.copy(copy, data)
+            spawn send_later(r, copy, to)
+        } else {
+            let sent = net.send_to_on(r.socket, data, to) catch {
+                _ => 0
+            }
+        }
+    }
+}
+
+fn relay_loop(r: *Relay) {
+    let buf = io.buffer(2048)
+    var client: net.Addr? = none
+    var to_server = 0
+    var to_client = 0
+    for {
+        let packet = net.receive_from_on(r.socket, buf) catch {
+            _ => return
+        }
+        let data = buf[..packet.size]
+        if same_address(packet.from, r.server) {
+            to_client += 1
+            match client {
+                some(address) => forward(r, data, address, to_client)
+                none => {}
+            }
+        } else {
+            client = some(packet.from)
+            to_server += 1
+            forward(r, data, r.server, to_server)
+        }
+    }
+}
+
+fn pattern(n: i64) -> []u8 {
+    var out: []u8 = []
+    for i in 0..n {
+        push(mut out, u8(i * 31 + i / 251))
+    }
+    out
+}
+
+fn checksum(data: []u8) -> i64 {
+    var sum = 17
+    for b in data {
+        sum = (sum * 131 + i64(b)) % 1000000007
+    }
+    sum
+}
+
+fn send_all(s: quic.Stream, data: []u8) {
+    let channel = quic.stream(s)
+    io.write_all(channel, data) catch {
+        _ => return
+    }
+    channel.close()
+}
+
+fn wait_for_close(h: *quic.ConnectionHandle) {
+    for waited in 0..300 {
+        if h.close_code != 0 {
+            return
+        }
+        sleep(10)
+    }
+}
+
+fn main() ! io.Error {
+    let config = server_config()?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using var socket = net.bind_udp("127.0.0.1", 0)?
+    let view = net.detach_socket(mut socket)
+    defer net.close_socket_on(view)
+    let relay = new(Relay { socket: view, server: l.handle.addr, quiet: atomic.flag(), bulk: atomic.flag() })
+    spawn relay_loop(relay)
+    using client = quic.dial("127.0.0.1", view.addr.port, client_config())?
+    print("client dialled through the relay: protocol {client.handle.protocol}")
+    let accepted = quic.accept_handle(l.handle)?
+    print("server accepted: protocol {accepted.protocol}")
+    atomic.set(relay.bulk)
+    let payload = pattern(1000000)
+    let upload = quic.open_stream(client)?
+    spawn send_all(upload, payload)
+    let incoming = quic.accept_stream_on(accepted)?
+    let received = io.read_all(quic.stream(incoming))?
+    print("bulk transfer: {received.len} bytes, intact {checksum(received) == checksum(payload)}, checksum {checksum(received)}")
+    let client_stats = quic.stats(client)?
+    let server_stats = quic.stats_on(accepted)?
+    print("packets sent: client {client_stats.packets_sent > 0}, server {server_stats.packets_sent > 0}")
+    print("packets declared lost: {client_stats.packets_lost > 0 || server_stats.packets_lost > 0}")
+    atomic.set(relay.quiet)
+    quic.close_on(client.handle, 9, "done")
+    wait_for_close(accepted)
+    print("server saw: code {accepted.close_code}, by peer {accepted.closed_by_peer}")
+}

@@ -1,0 +1,248 @@
+import std/crypto/aead
+import std/crypto/hash
+import std/io
+import std/tls
+
+/// The packet protection keys of one direction at one encryption level (RFC 9001 section 5).
+///
+/// Made by `keys`, `next_keys` or `initial_keys`.
+pub struct Keys {
+    /// The AEAD that protects packet payloads, keyed with the `quic key` value.
+    pub aead: aead.Aead
+    /// The AEAD key, derived with the label `quic key`.
+    pub key: []u8
+    /// The 12-byte IV that a packet number is XORed into to form the nonce.
+    pub iv: []u8
+    /// The header protection key.
+    pub hp: []u8
+    /// The traffic secret the keys derive from.
+    pub secret: []u8
+    /// The cipher suite the keys belong to.
+    pub suite: tls.Suite
+    hp_mask: fn([]u8) -> []u8
+}
+
+/// The result of removing protection from a packet.
+pub struct Opened {
+    /// The full packet number, decoded against the largest number received so far.
+    pub number: i64
+    /// The decrypted payload, which `parse_frames` reads.
+    pub payload: []u8
+    /// The key phase bit of a short header packet, and false for a long header packet.
+    pub key_phase: bool
+    /// The first byte of the header with header protection removed.
+    pub first_byte: i64
+    /// Whether any reserved bit of the unprotected first byte is set. A connection treats it as a PROTOCOL_VIOLATION after the packet decrypted.
+    pub reserved_bits_set: bool
+}
+
+fn initial_salt() -> []u8 {
+    [0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a]
+}
+
+fn retry_key() -> []u8 {
+    [0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e]
+}
+
+fn retry_nonce() -> []u8 {
+    [0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb]
+}
+
+fn mask_aes(cipher: *aead.Aes) -> fn([]u8) -> []u8 {
+    fn(sample: []u8) -> []u8 {
+        aead.encrypt_block(cipher, sample)
+    }
+}
+
+fn mask_chacha(hp: []u8) -> fn([]u8) -> []u8 {
+    fn(sample: []u8) -> []u8 {
+        let counter = u32(io.le32(sample, 0))
+        let zeros: []u8 = __make(5)
+        let nonce = sample[4..16]
+        aead.chacha20_xor(hp, counter, nonce, zeros) catch {
+            e => __panic("quic: header protection failed: {e}")
+        }
+    }
+}
+
+fn derive(suite: tls.Suite, secret: []u8, hp: []u8) -> Keys ! io.Error {
+    let h = tls.suite_hash(suite)
+    let key = tls.expand_label(h, secret, "quic key", [], tls.key_size(suite))
+    let iv = tls.expand_label(h, secret, "quic iv", [], 12)
+    let cipher = tls.cipher(suite, key)?
+    let hp_mask = match suite {
+        ChaCha20Poly1305 => mask_chacha(hp)
+        _ => mask_aes(aead.aes_key(hp)?)
+    }
+    Keys { aead: cipher, key, iv, hp, secret, suite, hp_mask }
+}
+
+/// Derives the packet protection keys of `suite` from the traffic secret `secret` (RFC 9001 section 5.1).
+///
+/// The key, IV and header protection key come from HKDF-Expand-Label with the labels `quic key`, `quic iv` and `quic hp`. Fails with `Invalid` when `secret` has the wrong length for the suite's hash.
+pub fn keys(suite: tls.Suite, secret: []u8) -> Keys ! io.Error {
+    let h = tls.suite_hash(suite)
+    if secret.len != h.size {
+        fail Invalid
+    }
+    let hp = tls.expand_label(h, secret, "quic hp", [], tls.key_size(suite))
+    derive(suite, secret, hp)
+}
+
+/// Derives the keys of the next key phase from `k` (RFC 9001 section 6).
+///
+/// The secret is advanced with the label `quic ku`, which gives a new key and IV. The header protection key is kept.
+pub fn next_keys(k: Keys) -> Keys ! io.Error {
+    let h = tls.suite_hash(k.suite)
+    let secret = tls.expand_label(h, k.secret, "quic ku", [], h.size)
+    derive(k.suite, secret, k.hp)
+}
+
+/// Returns the keys that protect Initial packets sent by the server when `server` is true and by the client otherwise (RFC 9001 section 5.2).
+///
+/// `dcid` is the destination connection ID of the first Initial packet the client sent. The keys use the version 1 salt and AES-128-GCM.
+pub fn initial_keys(dcid: []u8, server: bool) -> Keys {
+    let h = hash.sha256()
+    let initial_secret = hash.hkdf_extract(h, initial_salt(), dcid)
+    let label = if server { "server in" } else { "client in" }
+    let secret = tls.expand_label(h, initial_secret, label, [], h.size)
+    keys(Aes128Gcm, secret) catch {
+        e => __panic("quic: initial keys failed: {e}")
+    }
+}
+
+fn nonce_of(iv: []u8, pn: i64) -> []u8 {
+    let out: []u8 = __make(12)
+    io.copy(out, iv)
+    for i in 0..8 {
+        out[11 - i] = out[11 - i] ^ u8(pn >> (8 * i))
+    }
+    out
+}
+
+fn first_byte_mask(first: i64) -> u8 {
+    if first & 0x80 != 0 {
+        return 0x0f
+    }
+    0x1f
+}
+
+/// Returns the protected packet for `payload`.
+///
+/// `header` is the unprotected header up to and including the packet number field, which the caller has written with the chosen length; for a long header the Length field covers the packet number, the payload and the 16-byte tag. `pn` is the full packet number, which forms the nonce. The header is the associated data. Header protection is applied over the packet number and the low bits of the first byte, sampling the ciphertext from 4 bytes past the start of the packet number field. The payload must be at least `4 - packet number length` bytes so the sample exists; a shorter one panics, and a sender pads it with PADDING frames.
+pub fn seal(k: Keys, header: []u8, pn: i64, payload: []u8) -> []u8 {
+    let pn_length = i64(header[0] & 3) + 1
+    let pn_offset = header.len - pn_length
+    let nonce = nonce_of(k.iv, pn)
+    let sealed = k.aead.seal(nonce, payload, header)
+    var out: []u8 = []
+    io.append(mut out, header)
+    io.append(mut out, sealed)
+    let sample = out[pn_offset + 4..pn_offset + 20]
+    let mask = k.hp_mask(sample)
+    out[0] = out[0] ^ mask[0] & first_byte_mask(i64(out[0]))
+    for i in 0..pn_length {
+        out[pn_offset + i] = out[pn_offset + i] ^ mask[1 + i]
+    }
+    out
+}
+
+fn unprotect(k: Keys, packet: []u8, h: Header) -> []u8 ! io.Error {
+    let has_number = match h.kind {
+        Initial => true
+        ZeroRtt => true
+        Handshake => true
+        Short => true
+        _ => false
+    }
+    if !has_number {
+        fail Invalid
+    }
+    let sample_at = h.pn_offset + 4
+    if packet.len != h.size || packet.len < sample_at + 16 {
+        fail Malformed
+    }
+    let head: []u8 = __make(sample_at)
+    io.copy(head, packet)
+    let mask = k.hp_mask(packet[sample_at..sample_at + 16])
+    head[0] = head[0] ^ mask[0] & first_byte_mask(i64(head[0]))
+    let pn_length = i64(head[0] & 3) + 1
+    for i in 0..pn_length {
+        head[h.pn_offset + i] = head[h.pn_offset + i] ^ mask[1 + i]
+    }
+    head[..h.pn_offset + pn_length]
+}
+
+/// Returns the key phase bit of the short header packet `packet`, found by removing header protection.
+///
+/// Header protection keys do not change with the key phase, so a receiver reads the bit with the current keys to learn whether the packet needs the next keys. Returns false for a long header packet. Fails with `Malformed` when the packet is too short to sample and `Invalid` for a kind without a packet number.
+pub fn peek_key_phase(k: Keys, packet: []u8, h: Header) -> bool ! io.Error {
+    let header = unprotect(k, packet, h)?
+    header[0] & 0x80 == 0 && header[0] & 0x04 != 0
+}
+
+/// Removes header protection and decrypts the packet `packet`, which is exactly `h.size` bytes of the datagram.
+///
+/// `h` comes from `parse_header`. The packet number is decoded against `largest`, the largest packet number received in that space, or -1 when none has arrived. The input is not modified, so a packet that fails can be opened again with other keys. Fails with `Malformed` when the packet is not `h.size` bytes or is too short to sample, `Invalid` when authentication fails, the packet number decodes above 2^62-1 or `h` is a kind without a packet number. The reserved bits and key phase of the first byte are reported in the result.
+pub fn open(k: Keys, packet: []u8, h: Header, largest: i64) -> Opened ! io.Error {
+    let header = unprotect(k, packet, h)?
+    let first = i64(header[0])
+    let pn_length = header.len - h.pn_offset
+    var truncated = 0
+    for i in 0..pn_length {
+        truncated = truncated << 8 | i64(header[h.pn_offset + i])
+    }
+    let number = decode_packet_number(largest, truncated, 8 * pn_length)
+    if number > max_varint() {
+        fail Invalid
+    }
+    let nonce = nonce_of(k.iv, number)
+    let payload = k.aead.open(nonce, packet[header.len..], header)?
+    let long = first & 0x80 != 0
+    let reserved = if long { first & 0x0c } else { first & 0x18 }
+    Opened { number, payload, key_phase: !long && first & 0x04 != 0, first_byte: first, reserved_bits_set: reserved != 0 }
+}
+
+/// Returns the 16-byte Retry Integrity Tag of a Retry packet (RFC 9001 section 5.8).
+///
+/// `original_dcid` is the destination connection ID of the Initial packet the Retry answers and `retry_without_tag` is the Retry packet up to but not including the tag.
+pub fn retry_tag(original_dcid: []u8, retry_without_tag: []u8) -> []u8 {
+    var pseudo: []u8 = []
+    push(mut pseudo, u8(original_dcid.len))
+    io.append(mut pseudo, original_dcid)
+    io.append(mut pseudo, retry_without_tag)
+    let cipher = aead.aes_gcm(retry_key()) catch {
+        e => __panic("quic: retry key failed: {e}")
+    }
+    let empty: []u8 = []
+    cipher.seal(retry_nonce(), empty, pseudo)
+}
+
+/// Returns a Retry packet (RFC 9000 section 17.2.5) that carries `token`, with its integrity tag.
+///
+/// `dcid` is the source connection ID of the Initial packet being answered and `scid` is the connection ID the client must use from now on. `original_dcid` is the destination connection ID of that Initial packet; it is covered by the tag and not sent. The first byte is `0xff`.
+pub fn retry_packet(version: i64, dcid: []u8, scid: []u8, original_dcid: []u8, token: []u8) -> []u8 {
+    var out: []u8 = []
+    push(mut out, 0xff)
+    io.put_be32(mut out, version)
+    push(mut out, u8(dcid.len))
+    io.append(mut out, dcid)
+    push(mut out, u8(scid.len))
+    io.append(mut out, scid)
+    io.append(mut out, token)
+    let tag = retry_tag(original_dcid, out)
+    io.append(mut out, tag)
+    out
+}
+
+/// Returns whether the last 16 bytes of the Retry packet `packet` are the integrity tag for `original_dcid`.
+///
+/// `original_dcid` is the destination connection ID of the first Initial packet this endpoint sent. A packet shorter than 16 bytes is not valid.
+pub fn retry_valid(original_dcid: []u8, packet: []u8) -> bool {
+    if packet.len < 16 {
+        return false
+    }
+    let body = packet[..packet.len - 16]
+    let expected = retry_tag(original_dcid, body)
+    hash.equal(expected, packet[packet.len - 16..])
+}

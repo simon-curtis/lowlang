@@ -1,0 +1,561 @@
+import std/header
+import std/http/huffman
+import std/http/qpack
+import std/io
+import std/slices
+import std/text
+
+struct Counts {
+    ok: i64
+    blocked: i64
+    failed: i64
+}
+
+fn unhex(s: str) -> []u8 {
+    text.decode_hex(s) or []
+}
+
+fn hex(b: []u8) -> str {
+    text.encode_hex(b)
+}
+
+fn show_fields(fields: []header.Header) {
+    for f in fields {
+        print("  {f.name}: {f.value}")
+    }
+}
+
+fn show_decoded(label: str, result: qpack.Decoded) {
+    match result {
+        Fields(fields) => {
+            print("{label}: {fields.len} fields")
+            show_fields(fields)
+        }
+        Blocked => print("{label}: blocked")
+    }
+}
+
+fn show_table(d: *qpack.Decoder) {
+    let entries = qpack.table_entries(d)
+    print("table: inserts={qpack.insert_count(d)} size={qpack.table_size(d)} entries={entries.len}")
+    for e in entries {
+        print("  {e.name}={e.value}")
+    }
+}
+
+fn show_owed(d: *qpack.Decoder) {
+    print("decoder stream: {hex(qpack.take_decoder_stream(d))}")
+}
+
+fn feed_bytes(d: *qpack.Decoder, label: str, data: []u8) {
+    let ready = qpack.on_encoder_stream(d, data) or {
+        print("{label}: failed")
+        return
+    }
+    print("{label}: ready {ready} inserts={qpack.insert_count(d)}")
+}
+
+fn feed(d: *qpack.Decoder, label: str, data: str) {
+    feed_bytes(d, label, unhex(data))
+}
+
+fn section(d: *qpack.Decoder, label: str, stream: i64, data: str) {
+    let result = qpack.decode(d, stream, unhex(data)) or {
+        print("{label}: failed")
+        return
+    }
+    show_decoded(label, result)
+}
+
+fn put_prefixed(mut out: []u8, first: u8, prefix: i64, n: i64) {
+    let mask = (1 << prefix) - 1
+    if n < mask {
+        push(mut out, first | u8(n))
+        return
+    }
+    push(mut out, first | u8(mask))
+    var rest = n - mask
+    for rest >= 0x80 {
+        push(mut out, u8(rest & 0x7F | 0x80))
+        rest = rest >> 7
+    }
+    push(mut out, u8(rest))
+}
+
+fn repeated(c: u8, n: i64) -> []u8 {
+    var out: []u8 = []
+    for _ in 0..n {
+        push(mut out, c)
+    }
+    out
+}
+
+fn literal_insert(name: []u8, value_len: i64, value: []u8) -> []u8 {
+    var out: []u8 = []
+    put_prefixed(mut out, 0x40, 5, name.len)
+    for b in name {
+        push(mut out, b)
+    }
+    put_prefixed(mut out, 0, 7, value_len)
+    for b in value {
+        push(mut out, b)
+    }
+    out
+}
+
+fn capacity_instruction(n: i64) -> []u8 {
+    var out: []u8 = []
+    put_prefixed(mut out, 0x20, 5, n)
+    out
+}
+
+fn joined(a: []u8, b: []u8) -> []u8 {
+    var out: []u8 = []
+    for x in a {
+        push(mut out, x)
+    }
+    for x in b {
+        push(mut out, x)
+    }
+    out
+}
+
+fn primed() -> *qpack.Decoder {
+    let d = qpack.decoder(220, 4, 65536)
+    qpack.on_encoder_stream(d, unhex(all_encoder_stream())) or []
+    qpack.take_decoder_stream(d)
+    d
+}
+
+fn all_encoder_stream() -> str {
+    "3fbd01c00f7777772e6578616d706c652e636f6dc10c2f73616d706c652f706174684a637573746f6d2d6b65790c637573746f6d2d76616c756502"
+}
+
+fn rfc_examples() {
+    print("-- B.1")
+    let d = qpack.decoder(220, 4, 65536)
+    section(d, "stream 0", 0, "0000510b2f696e6465782e68746d6c")
+    show_owed(d)
+
+    print("-- B.2")
+    feed(d, "encoder", "3fbd01c00f7777772e6578616d706c652e636f6dc10c2f73616d706c652f70617468")
+    show_table(d)
+    section(d, "stream 4", 4, "03811011")
+    show_owed(d)
+
+    print("-- B.3")
+    feed(d, "encoder", "4a637573746f6d2d6b65790c637573746f6d2d76616c7565")
+    show_table(d)
+    show_owed(d)
+
+    print("-- B.4")
+    section(d, "stream 8", 8, "050080c181")
+    show_owed(d)
+    qpack.cancel_stream(d, 8)
+    show_owed(d)
+    feed(d, "encoder", "02")
+    show_table(d)
+    show_owed(d)
+
+    print("-- B.5")
+    feed(d, "encoder", "810d637573746f6d2d76616c756532")
+    show_table(d)
+    show_owed(d)
+}
+
+fn blocked_streams() {
+    print("-- blocked streams")
+    let d = qpack.decoder(220, 2, 65536)
+    section(d, "stream 4", 4, "03811011")
+    section(d, "stream 4 again", 4, "03811011")
+    section(d, "stream 12", 12, "03811011")
+    section(d, "stream 16", 16, "03811011")
+    show_owed(d)
+    feed(d, "encoder part", "3fbd01c00f7777772e6578616d706c652e636f6d")
+    feed(d, "encoder rest", "c10c2f73616d706c652f70617468")
+    section(d, "stream 4 retry", 4, "03811011")
+    section(d, "stream 12 retry", 12, "03811011")
+    show_owed(d)
+
+    let cancelled = qpack.decoder(220, 1, 65536)
+    section(cancelled, "stream 4", 4, "03811011")
+    section(cancelled, "stream 8", 8, "03811011")
+    qpack.cancel_stream(cancelled, 4)
+    section(cancelled, "stream 8 after cancel", 8, "03811011")
+    show_owed(cancelled)
+
+    let none = qpack.decoder(220, 0, 65536)
+    section(none, "no blocking allowed", 4, "03811011")
+    let zero = qpack.decoder(0, 0, 65536)
+    qpack.cancel_stream(zero, 4)
+    show_owed(zero)
+    section(zero, "zero capacity", 0, "0000510b2f696e6465782e68746d6c")
+}
+
+fn split_feed() {
+    print("-- split encoder stream")
+    let stream = unhex(all_encoder_stream())
+    let whole = qpack.decoder(220, 4, 65536)
+    qpack.on_encoder_stream(whole, stream) or []
+    var same = 0
+    for cut in 0..stream.len + 1 {
+        let d = qpack.decoder(220, 4, 65536)
+        qpack.on_encoder_stream(d, stream[..cut]) or []
+        qpack.on_encoder_stream(d, stream[cut..]) or []
+        if qpack.insert_count(d) == qpack.insert_count(whole) && qpack.table_size(d) == qpack.table_size(whole) {
+            same += 1
+        }
+    }
+    print("two-part splits equal: {same} of {stream.len + 1}")
+    let single = qpack.decoder(220, 4, 65536)
+    for i in 0..stream.len {
+        qpack.on_encoder_stream(single, stream[i..i + 1]) or []
+    }
+    show_table(single)
+}
+
+fn encoder_round_trip() {
+    print("-- encoder")
+    let e = qpack.encoder()
+    var long_value = ""
+    for i in 0..30 {
+        long_value += "value-{i}-"
+    }
+    let fields = [
+        header.Header { name: ":method", value: "GET" }
+        header.Header { name: ":scheme", value: "https" }
+        header.Header { name: ":path", value: "/index.html" }
+        header.Header { name: ":authority", value: "www.example.com" }
+        header.Header { name: ":status", value: "200" }
+        header.Header { name: "Accept", value: "*/*" }
+        header.Header { name: "Content-Type", value: "text/html; charset=utf-8" }
+        header.Header { name: "content-type", value: "application/x-custom" }
+        header.Header { name: "custom-key", value: "custom-value" }
+        header.Header { name: "x-empty", value: "" }
+        header.Header { name: "cookie", value: "" }
+        header.Header { name: "x-long", value: long_value }
+    ]
+    let section_bytes = qpack.encode(e, fields)
+    print("encoded {section_bytes.len} bytes: {hex(section_bytes[..40])}")
+    let d = qpack.decoder(0, 0, 65536)
+    section(d, "decoded", 0, hex(section_bytes))
+    show_owed(d)
+    let empty = qpack.encode(e, [])
+    print("empty section: {hex(empty)}")
+    for f in qpack.static_table()[..3] {
+        print("static {f.name}={f.value}")
+    }
+    let table = qpack.static_table()
+    print("static table: {table.len} entries, 98 is {table[98].name}={table[98].value}")
+    print("codes: {qpack.decompression_failed()} {qpack.encoder_stream_error()} {qpack.decoder_stream_error()}")
+}
+
+fn show_error(label: str, d: *qpack.Decoder, data: str) {
+    let result = qpack.decode(d, 0, unhex(data)) or {
+        print("{label}: failed")
+        return
+    }
+    show_decoded(label, result)
+}
+
+fn decoder_errors() {
+    print("-- decode errors")
+    let d = qpack.decoder(220, 2, 65536)
+    show_error("empty block", d, "")
+    show_error("prefix only half", d, "00")
+    show_error("static index 99", d, "0000ff24")
+    show_error("static index 2^62-1", d, "0000ffc0ffffffffffffff3f")
+    show_error("integer continuation overflow", d, "0000ff80808080808080808000")
+    show_error("integer 2^62", d, "0000ffffffffffffffffff40")
+    show_error("required count past range", d, "0d00")
+    show_error("required count wraps below", d, "0c00")
+    show_error("base underflow", d, "0281")
+    show_error("dynamic with empty table", d, "000080")
+    show_error("post-base with empty table", d, "000010")
+    show_error("truncated string", d, "0000510b2f69")
+    show_error("huffman EOS", d, "00005183ffffff")
+    show_error("literal name past end", d, "00002f")
+    show_error("empty value", d, "00005100")
+    let primed_decoder = primed()
+    show_error("dynamic at required count", primed_decoder, "020180")
+    show_error("post-base at base", primed_decoder, "020110")
+    show_error("relative underflow", primed_decoder, "020081")
+    show_error("dynamic reference ok", primed_decoder, "03811011")
+    let small = qpack.decoder(220, 2, 40)
+    show_error("section over limit", small, "0000510b2f696e6465782e68746d6c")
+    let exact = qpack.decoder(220, 2, 48)
+    show_error("section at limit", exact, "0000510b2f696e6465782e68746d6c")
+    let evicted = primed()
+    qpack.on_encoder_stream(evicted, unhex("810d637573746f6d2d76616c756532")) or []
+    show_error("evicted entry", evicted, "020080")
+    show_error("entry kept", evicted, "030080")
+}
+
+fn encoder_stream_errors() {
+    print("-- encoder stream errors")
+    let above = qpack.decoder(220, 2, 65536)
+    feed(above, "capacity above maximum", "3fbe01")
+    let at_maximum = qpack.decoder(220, 2, 65536)
+    feed(at_maximum, "capacity at maximum", "3fbd01")
+    let no_capacity = qpack.decoder(220, 2, 65536)
+    feed(no_capacity, "insert with capacity 0", "c00f7777772e6578616d706c652e636f6d")
+    let static_past = qpack.decoder(220, 2, 65536)
+    feed(static_past, "static index 99", "3fbd01ff2400")
+    let dynamic_empty = qpack.decoder(220, 2, 65536)
+    feed(dynamic_empty, "dynamic name on empty table", "3fbd018000")
+    let duplicate_empty = qpack.decoder(220, 2, 65536)
+    feed(duplicate_empty, "duplicate on empty table", "3fbd0100")
+    let duplicate_far = qpack.decoder(220, 2, 65536)
+    feed(duplicate_far, "duplicate index 2^62-1", "3fbd011fe0ffffffffffffff3f")
+    let overflow = qpack.decoder(220, 2, 65536)
+    feed(overflow, "capacity integer overflow", "3fffffffffffffffffffff")
+    let too_big = qpack.decoder(220, 2, 65536)
+    let big_entry = joined(capacity_instruction(220), literal_insert(repeated('a', 200), 0, []))
+    feed_bytes(too_big, "entry larger than capacity", big_entry)
+    let exact_entry = qpack.decoder(220, 2, 65536)
+    let fitting = joined(capacity_instruction(220), literal_insert(repeated('a', 180), 8, repeated('b', 8)))
+    feed_bytes(exact_entry, "entry equal to capacity", fitting)
+    print("size={qpack.table_size(exact_entry)}")
+    let long_name = qpack.decoder(220, 2, 65536)
+    feed(long_name, "name length past maximum, input absent", "3fbd017fffff03")
+    let huge = qpack.decoder(1000000, 2, 65536)
+    var huge_header: []u8 = capacity_instruction(1000000)
+    put_prefixed(mut huge_header, 0x40, 5, 70000)
+    feed_bytes(huge, "name length over buffer limit", huge_header)
+    let buffered = qpack.decoder(1000000, 2, 65536)
+    var partial: []u8 = capacity_instruction(1000000)
+    for b in literal_insert(repeated('a', 60000), 60000, repeated('b', 10000)) {
+        push(mut partial, b)
+    }
+    feed_bytes(buffered, "unparsed tail over buffer limit", partial)
+    let within = qpack.decoder(1000000, 2, 65536)
+    var held: []u8 = capacity_instruction(1000000)
+    for b in literal_insert(repeated('a', 60000), 100, repeated('b', 10)) {
+        push(mut held, b)
+    }
+    feed_bytes(within, "unparsed tail within buffer limit", held)
+    feed_bytes(within, "tail completed", repeated('b', 90))
+    print("size={qpack.table_size(within)}")
+}
+
+fn decoder_stream_errors() {
+    print("-- decoder stream")
+    let checks = [
+        ["cancel", "48"]
+        ["cancel wide", "7fe001"]
+        ["incomplete cancel", "7f"]
+        ["section acknowledgment", "84"]
+        ["increment", "01"]
+        ["increment zero", "00"]
+        ["increment wide", "3fe001"]
+        ["acknowledgment overflow", "ffffffffffffffffffffff"]
+        ["cancel 2^62", "7fc1ffffffffffffff3f"]
+    ]
+    for c in checks {
+        let fresh = qpack.encoder()
+        qpack.on_decoder_stream(fresh, unhex(c[1])) or {
+            print("{c[0]}: failed")
+            continue
+        }
+        print("{c[0]}: accepted")
+    }
+    let split = qpack.encoder()
+    qpack.on_decoder_stream(split, unhex("7f")) or {}
+    qpack.on_decoder_stream(split, unhex("e001")) or {}
+    qpack.on_decoder_stream(split, unhex("48")) or {}
+    print("split cancellations accepted")
+    let split_bad = qpack.encoder()
+    qpack.on_decoder_stream(split_bad, unhex("3f")) or {}
+    qpack.on_decoder_stream(split_bad, unhex("e001")) or { print("split increment: failed") }
+}
+
+fn huffman_vectors() {
+    print("-- huffman")
+    let samples = [
+        ["www.example.com", "f1e3c2e5f23a6ba0ab90f4ff"]
+        ["no-cache", "a8eb10649cbf"]
+        ["custom-key", "25a849e95ba97d7f"]
+        ["custom-value", "25a849e95bb8e8b4bf"]
+        ["302", "6402"]
+        ["private", "aec3771a4b"]
+        ["Mon, 21 Oct 2013 20:13:21 GMT", "d07abe941054d444a8200595040b8166e082a62d1bff"]
+        ["https://www.example.com", "9d29ad171863c78f0b97c8e9ae82ae43d3"]
+        ["gzip", "9bd9ab"]
+        ["foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1", "94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007"]
+    ]
+    for s in samples {
+        var out: []u8 = []
+        huffman.encode(mut out, s[0])
+        let decoded = huffman.decode(unhex(s[1])) or "failed"
+        print("{s[0]}: {hex(out) == s[1]} {decoded == s[0]} size={huffman.encoded_size(s[0])}/{out.len}")
+    }
+    var every: []u8 = []
+    for i in 0..256 {
+        push(mut every, u8(i))
+    }
+    var coded: []u8 = []
+    huffman.encode(mut coded, str(every))
+    let back = huffman.decode(coded) or ""
+    print("all 256 bytes: {coded.len} bytes, round trip {slices.equal(bytes(back), every)}")
+    var empty: []u8 = []
+    huffman.encode(mut empty, "")
+    print("empty: {empty.len} {huffman.encoded_size("")} [{huffman.decode([]) or "failed"}]")
+    let bad = [
+        ["padding not ones", "18"]
+        ["padding over 7 bits", "1fff"]
+        ["EOS", "ffffffff"]
+        ["EOS prefix 29 ones", "fffffffc"]
+        ["only padding byte", "ff"]
+        ["truncated code", "f1e3c2"]
+    ]
+    for b in bad {
+        let r = huffman.decode(unhex(b[1])) or "failed"
+        print("{b[0]}: {r}")
+    }
+}
+
+fn tally_block(mut c: Counts, d: *qpack.Decoder, block: []u8) {
+    let r = qpack.decode(d, 4, block) or {
+        c.failed += 1
+        return
+    }
+    match r {
+        Fields(_) => { c.ok += 1 }
+        Blocked => { c.blocked += 1 }
+    }
+}
+
+fn tally_stream(mut c: Counts, data: []u8) {
+    let d = qpack.decoder(220, 4, 65536)
+    qpack.on_encoder_stream(d, data) or {
+        c.failed += 1
+        return
+    }
+    qpack.take_decoder_stream(d)
+    c.ok += 1
+}
+
+fn flipped(data: []u8, at: i64, mask: u8) -> []u8 {
+    var out: []u8 = []
+    for i, b in data {
+        push(mut out, if i == at { b ^ mask } else { b })
+    }
+    out
+}
+
+fn table_for(warm: bool) -> *qpack.Decoder {
+    if warm {
+        return primed()
+    }
+    qpack.decoder(220, 4, 65536)
+}
+
+fn mutate_blocks(label: str, block: str, warm: bool) {
+    let data = unhex(block)
+    var truncated = Counts { ok: 0, blocked: 0, failed: 0 }
+    for cut in 0..data.len + 1 {
+        tally_block(mut truncated, table_for(warm), data[..cut])
+    }
+    var flips = Counts { ok: 0, blocked: 0, failed: 0 }
+    for at in 0..data.len {
+        for mask in [0xFF, 0x01, 0x80, 0x40] {
+            tally_block(mut flips, table_for(warm), flipped(data, at, u8(mask)))
+        }
+    }
+    print("{label} truncated: ok={truncated.ok} blocked={truncated.blocked} failed={truncated.failed}")
+    print("{label} flipped: ok={flips.ok} blocked={flips.blocked} failed={flips.failed}")
+}
+
+fn mutate_stream(label: str, stream: str) {
+    let data = unhex(stream)
+    var truncated = Counts { ok: 0, blocked: 0, failed: 0 }
+    for cut in 0..data.len + 1 {
+        tally_stream(mut truncated, data[..cut])
+    }
+    var flips = Counts { ok: 0, blocked: 0, failed: 0 }
+    for at in 0..data.len {
+        for mask in [0xFF, 0x01, 0x80, 0x40, 0x20] {
+            tally_stream(mut flips, flipped(data, at, u8(mask)))
+        }
+    }
+    print("{label} truncated: ok={truncated.ok} failed={truncated.failed}")
+    print("{label} flipped: ok={flips.ok} failed={flips.failed}")
+}
+
+fn mutate_huffman() {
+    var ok = 0
+    var failed = 0
+    for a in 0..256 {
+        let one = huffman.decode([u8(a)]) or {
+            failed += 1
+            continue
+        }
+        ok += 1
+        for b in 0..256 {
+            let two = huffman.decode([u8(a), u8(b)]) or {
+                failed += 1
+                continue
+            }
+            ok += 1
+        }
+    }
+    print("huffman one and two byte inputs: ok={ok} failed={failed}")
+    let vectors = ["f1e3c2e5f23a6ba0ab90f4ff", "d07abe941054d444a8200595040b8166e082a62d1bff"]
+    var vector_ok = 0
+    var vector_failed = 0
+    for v in vectors {
+        let data = unhex(v)
+        for cut in 0..data.len + 1 {
+            let r = huffman.decode(data[..cut]) or {
+                vector_failed += 1
+                continue
+            }
+            vector_ok += 1
+        }
+        for at in 0..data.len {
+            for mask in [0xFF, 0x01, 0x80] {
+                let r = huffman.decode(flipped(data, at, u8(mask))) or {
+                    vector_failed += 1
+                    continue
+                }
+                vector_ok += 1
+            }
+        }
+    }
+    print("huffman mutated vectors: ok={vector_ok} failed={vector_failed}")
+}
+
+fn mutations() {
+    print("-- mutations")
+    mutate_blocks("B.1 section", "0000510b2f696e6465782e68746d6c", true)
+    mutate_blocks("B.2 section", "03811011", true)
+    mutate_blocks("B.4 section", "050080c181", true)
+    mutate_blocks("cold B.2 section", "03811011", false)
+    mutate_blocks("cold B.4 section", "050080c181", false)
+    mutate_stream("encoder stream", all_encoder_stream())
+    mutate_stream("B.5 stream", "3fbd01810d637573746f6d2d76616c756532")
+    mutate_huffman()
+    var accepted = 0
+    var rejected = 0
+    for a in 0..256 {
+        let e = qpack.encoder()
+        qpack.on_decoder_stream(e, [u8(a)]) or {
+            rejected += 1
+            continue
+        }
+        accepted += 1
+    }
+    print("decoder stream single bytes: accepted={accepted} rejected={rejected}")
+}
+
+fn main() {
+    rfc_examples()
+    blocked_streams()
+    split_feed()
+    encoder_round_trip()
+    decoder_errors()
+    encoder_stream_errors()
+    decoder_stream_errors()
+    huffman_vectors()
+    mutations()
+}

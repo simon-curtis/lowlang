@@ -1,0 +1,388 @@
+import std/crypto/x509
+import std/io
+import std/quic
+import std/tls
+
+fn limits(secure: tls.Config, max_streams: i64, max_stream_data: i64, max_data: i64) -> quic.Config {
+    quic.Config { tls: secure, max_streams, max_stream_data, max_data }
+}
+
+fn server_config(max_streams: i64, max_stream_data: i64, max_data: i64) -> quic.Config ! io.Error {
+    let pem = embed("std_tls_ec.pem")
+    let certificates = x509.pem_certificates(pem)
+    let key = x509.pem_private_key(pem)?
+    let secure = tls.Config { certificates, key, alpn: ["hq-streams"] }
+    limits(secure, max_streams, max_stream_data, max_data)
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        push(mut out, x509.parse(der) or return out)
+    }
+    out
+}
+
+fn client_config(max_stream_data: i64, max_data: i64) -> quic.Config {
+    let secure = tls.Config { roots: roots(), alpn: ["hq-streams"] }
+    limits(secure, 100, max_stream_data, max_data)
+}
+
+fn pattern(n: i64, seed: i64) -> []u8 {
+    var out: []u8 = []
+    for i in 0..n {
+        push(mut out, u8(seed + i * 31 + i / 251))
+    }
+    out
+}
+
+fn checksum(data: []u8) -> i64 {
+    var sum = 17
+    for b in data {
+        sum = (sum * 131 + i64(b)) % 1000000007
+    }
+    sum
+}
+
+fn echo_one(s: quic.Stream) {
+    let channel = quic.stream(s)
+    let data = io.read_all(channel) catch {
+        _ => return
+    }
+    io.write_all(channel, data) catch {
+        _ => return
+    }
+    channel.close()
+}
+
+fn echo_loop(h: *quic.ConnectionHandle) {
+    for {
+        let s = quic.accept_stream_on(h) catch {
+            _ => return
+        }
+        spawn echo_one(s)
+    }
+}
+
+fn send_pattern(s: quic.Stream, data: []u8) {
+    let channel = quic.stream(s)
+    io.write_all(channel, data) catch {
+        _ => return
+    }
+    channel.close()
+}
+
+fn check_echo() ! io.Error {
+    let config = server_config(100, 1048576, 16777216)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(1048576, 16777216))?
+    let server = quic.accept_handle(l.handle)?
+    spawn echo_loop(server)
+    for i in 0..3 {
+        let s = quic.open_stream(client)?
+        let channel = quic.stream(s)
+        io.write_str(channel, "echo number {i}")?
+        channel.close()
+        let back = io.read_all(channel)?
+        print("echo on stream {s.id}: {str(back)}")
+    }
+}
+
+fn check_uni() ! io.Error {
+    let config = server_config(100, 1048576, 16777216)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(1048576, 16777216))?
+    let server = quic.accept_handle(l.handle)?
+    let out = quic.open_uni_stream_on(server)?
+    let sender = quic.stream(out)
+    io.write_str(sender, "from the server")?
+    sender.close()
+    let incoming = quic.accept_uni_stream(client)?
+    let text = io.read_all(quic.stream(incoming))?
+    print("uni stream {incoming.id}: {str(text)}")
+    let buf = io.buffer(8)
+    let wrong = quic.read(out, buf) catch {
+        e => {
+            print("reading a write-only stream: {e}")
+            return
+        }
+    }
+    print("reading a write-only stream: {wrong} bytes")
+}
+
+fn read_failure(s: quic.Stream) -> str {
+    let buf = io.buffer(64)
+    for i in 0..8 {
+        let n = quic.read(s, buf) catch {
+            e => return "{e}"
+        }
+        if n == 0 {
+            return "end of stream"
+        }
+    }
+    "no error"
+}
+
+fn write_failure(s: quic.Stream) -> str {
+    let chunk = pattern(1000, 3)
+    for i in 0..400 {
+        let n = quic.write(s, chunk) catch {
+            e => return "{e}"
+        }
+        sleep(5)
+    }
+    "no error"
+}
+
+fn check_ends() ! io.Error {
+    let config = server_config(100, 1048576, 16777216)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(1048576, 16777216))?
+    let server = quic.accept_handle(l.handle)?
+    let buf = io.buffer(16)
+
+    let first = quic.open_stream(client)?
+    quic.write(first, bytes("abc"))?
+    quic.finish(first)?
+    let first_peer = quic.accept_stream_on(server)?
+    let a = quic.read(first_peer, buf)?
+    let b = quic.read(first_peer, buf)?
+    let c = quic.read(first_peer, buf)?
+    print("finish with data: read {a} bytes, then {b}, then {c}")
+
+    let empty = quic.open_stream(client)?
+    quic.finish(empty)?
+    let empty_peer = quic.accept_stream_on(server)?
+    let e = quic.read(empty_peer, buf)?
+    print("finish without data: read {e}")
+
+    let aborted = quic.open_stream(client)?
+    quic.write(aborted, bytes("partial"))?
+    quic.reset(aborted, 5)
+    let aborted_peer = quic.accept_stream_on(server)?
+    print("reset: reader saw {read_failure(aborted_peer)}")
+    let after = quic.write(aborted, bytes("more")) catch {
+        e => {
+            print("write after reset: {e}")
+            return
+        }
+    }
+    print("write after reset: {after} bytes")
+}
+
+fn check_stop() ! io.Error {
+    let config = server_config(100, 1048576, 16777216)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(1048576, 16777216))?
+    let server = quic.accept_handle(l.handle)?
+    let writer = quic.open_stream(client)?
+    quic.write(writer, bytes("x"))?
+    let reader = quic.accept_stream_on(server)?
+    quic.stop(reader, 9)
+    print("stop: writer saw {write_failure(writer)}")
+    let buf = io.buffer(8)
+    let stopped = quic.read(reader, buf) catch {
+        e => {
+            print("stop: reader saw {e}")
+            return
+        }
+    }
+    print("stop: reader read {stopped} bytes")
+}
+
+fn check_flow_control() ! io.Error {
+    let size = 2000000
+    let config = server_config(100, 65536, 262144)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(65536, 262144))?
+    let server = quic.accept_handle(l.handle)?
+    let upload = pattern(size, 1)
+    let download = pattern(size, 2)
+    let s = quic.open_stream(client)?
+    spawn send_pattern(s, upload)
+    let peer = quic.accept_stream_on(server)?
+    spawn send_pattern(peer, download)
+    let at_server = io.read_all(quic.stream(peer))?
+    let at_client = io.read_all(quic.stream(s))?
+    print("upload: {at_server.len} bytes, intact {checksum(at_server) == checksum(upload)}, checksum {checksum(at_server)}")
+    print("download: {at_client.len} bytes, intact {checksum(at_client) == checksum(download)}, checksum {checksum(at_client)}")
+}
+
+fn check_many_streams() ! io.Error {
+    let config = server_config(10, 1048576, 16777216)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(1048576, 16777216))?
+    let server = quic.accept_handle(l.handle)?
+    spawn echo_loop(server)
+    var total = 0
+    var last = 0
+    var intact = true
+    for i in 0..300 {
+        let s = quic.open_stream(client)?
+        let channel = quic.stream(s)
+        let text = "sequential stream {i}"
+        io.write_str(channel, text)?
+        channel.close()
+        let back = io.read_all(channel)?
+        if str(back) != text {
+            intact = false
+        }
+        total += back.len
+        last = s.id
+    }
+    print("sequential streams under a limit of 10: {total} bytes, intact {intact}, last id {last}")
+}
+
+fn open_uni_later(h: *quic.ConnectionHandle, outcome: chan[str]) {
+    let s = quic.open_uni_stream_on(h) catch {
+        e => {
+            outcome <- "failed {e}"
+            return
+        }
+    }
+    outcome <- "opened {s.id}"
+}
+
+fn check_accept_credit() ! io.Error {
+    var config = server_config(100, 1048576, 16777216)?
+    config.max_uni_streams = 4
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(1048576, 16777216))?
+    let server = quic.accept_handle(l.handle)?
+    for k in 0..4 {
+        let s = quic.open_uni_stream(client)?
+        quic.finish(s)?
+    }
+    let outcome = chan[str](1)
+    spawn open_uni_later(client.handle, outcome)
+    sleep(500)
+    select {
+        v = <-outcome => print("finished streams the server has not accepted: fifth stream {outcome_text(v)}")
+        else => print("finished streams the server has not accepted: fifth stream waits")
+    }
+    let first = quic.accept_uni_stream_on(server)?
+    let v = <-outcome
+    print("after the server accepted stream {first.id}: fifth stream {outcome_text(v)}")
+}
+
+fn outcome_text(v: str?) -> str {
+    match v {
+        some(text) => text
+        none => "closed"
+    }
+}
+
+fn update_when_acked(h: *quic.ConnectionHandle) -> str {
+    for i in 0..400 {
+        var outcome = "ok"
+        quic.update_keys_on(h) catch {
+            Invalid => {
+                outcome = "Invalid"
+            }
+            e => return "{e}"
+        }
+        if outcome == "ok" {
+            return outcome
+        }
+        sleep(5)
+    }
+    "never acknowledged"
+}
+
+fn upload_across_update(s: quic.Stream, h: *quic.ConnectionHandle, data: []u8, outcome: chan[str]) {
+    let channel = quic.stream(s)
+    let half = data.len / 2
+    let first = data[..half]
+    let second = data[half..]
+    io.write_all(channel, first) catch {
+        _ => return
+    }
+    let updated = update_when_acked(h)
+    outcome <- updated
+    io.write_all(channel, second) catch {
+        _ => return
+    }
+    channel.close()
+}
+
+fn download_across_update(s: quic.Stream, h: *quic.ConnectionHandle, data: []u8, outcome: chan[str]) {
+    let channel = quic.stream(s)
+    let half = data.len / 2
+    let first = data[..half]
+    let second = data[half..]
+    io.write_all(channel, first) catch {
+        _ => return
+    }
+    sleep(50)
+    let updated = update_when_acked(h)
+    outcome <- updated
+    io.write_all(channel, second) catch {
+        _ => return
+    }
+    channel.close()
+}
+
+fn check_key_update() ! io.Error {
+    let size = 1048576
+    let config = server_config(100, 1048576, 16777216)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(1048576, 16777216))?
+    let server = quic.accept_handle(l.handle)?
+    let upload = pattern(size, 5)
+    let download = pattern(size, 6)
+    let client_outcome = chan[str](1)
+    let server_outcome = chan[str](1)
+    let s = quic.open_stream(client)?
+    spawn upload_across_update(s, client.handle, upload, client_outcome)
+    let peer = quic.accept_stream_on(server)?
+    spawn download_across_update(peer, server, download, server_outcome)
+    let at_server = io.read_all(quic.stream(peer))?
+    let at_client = io.read_all(quic.stream(s))?
+    let from_client = <-client_outcome
+    let from_server = <-server_outcome
+    print("key update: client update {from_client ?? "none"}, server update {from_server ?? "none"}")
+    print("key update: upload {at_server.len} bytes, intact {checksum(at_server) == checksum(upload)}, checksum {checksum(at_server)}")
+    print("key update: download {at_client.len} bytes, intact {checksum(at_client) == checksum(download)}, checksum {checksum(at_client)}")
+    let client_stats = quic.stats(client)?
+    let server_stats = quic.stats_on(server)?
+    print("key update: both ends replaced their keys {client_stats.key_updates >= 1 && server_stats.key_updates >= 1}")
+}
+
+fn check_key_update_limits() ! io.Error {
+    let config = server_config(100, 1048576, 16777216)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(1048576, 16777216))?
+    let server = quic.accept_handle(l.handle)?
+    spawn echo_loop(server)
+    let s = quic.open_stream(client)?
+    let channel = quic.stream(s)
+    io.write_str(channel, "before the update")?
+    channel.close()
+    let back = io.read_all(channel)?
+    print("key update limits: echo before the update {str(back)}")
+    let first = update_when_acked(client.handle)
+    print("key update limits: first update {first}")
+    quic.update_keys(client) catch {
+        e => print("key update limits: second update without traffic {e}")
+    }
+    let again = quic.open_stream(client)?
+    let second_channel = quic.stream(again)
+    io.write_str(second_channel, "after the update")?
+    second_channel.close()
+    let reply = io.read_all(second_channel)?
+    print("key update limits: echo after the update {str(reply)}")
+    let third = update_when_acked(client.handle)
+    print("key update limits: update after traffic {third}")
+}
+
+fn main() ! io.Error {
+    check_echo()?
+    check_uni()?
+    check_ends()?
+    check_stop()?
+    check_flow_control()?
+    check_many_streams()?
+    check_accept_credit()?
+    check_key_update()?
+    check_key_update_limits()?
+}

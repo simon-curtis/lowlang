@@ -70,8 +70,10 @@ pub struct Listener {
 ///
 /// Every copy shares the socket, its timeouts and its closed state. The view does not close the socket when released; `close_socket_on` does, and `Socket` does when dropped.
 pub struct SocketHandle {
-    /// The descriptor of the socket.
+    /// The descriptor used for receiving.
     pub fd: i64
+    /// The descriptor used for sending, from `sys.write_view`, which waits for buffer space independently of receives from `fd`.
+    pub out: i64
     /// The address the socket is bound to, with the actual port when port 0 was requested.
     pub addr: Addr
     /// The timeouts, shared by every copy of the handle.
@@ -81,11 +83,16 @@ pub struct SocketHandle {
 
 /// The owner of a UDP socket.
 ///
-/// Dropping it closes the socket.
+/// Dropping it closes the socket unless `detach_socket` took the view.
 pub struct Socket {
     /// The copyable view of the socket.
     pub handle: SocketHandle
-    drop close_socket_on(handle)
+    detached: bool = false
+    drop {
+        if !detached {
+            close_socket_on(handle)
+        }
+    }
 }
 
 /// A received datagram: its length and sender.
@@ -199,8 +206,11 @@ fn resolve_local(host: str) -> []u8 ! io.Error {
     lookup(host)?[0]
 }
 
-fn socket_guard(fd: i64) -> *io.Guard {
-    io.guard(fn() { shut_down(fd) }, fn() { sys.close_fd(fd) })
+fn socket_guard(fd: i64, out: i64) -> *io.Guard {
+    io.guard(fn() { shut_down_conn(fd, out) }, fn() {
+        sys.close_fd(out)
+        sys.close_fd(fd)
+    })
 }
 
 /// Options for `listen_with` and `bind_udp_with`.
@@ -544,36 +554,78 @@ pub fn bind_udp_with(host: str, port: i64, o: ListenOptions) -> Socket ! io.Erro
     using var p = bound(target, sys.SocketKind.Datagrams, o)?
     let addr = local(p.handle.fd)?
     let fd = sys.detach(mut p).fd
-    Socket { handle: SocketHandle { fd, addr, timeouts: no_timeouts(), guard: socket_guard(fd) } }
+    let out = sys.write_view(fd) catch {
+        e => {
+            sys.close_fd(fd)
+            fail e
+        }
+    }
+    Socket { handle: SocketHandle { fd, out, addr, timeouts: no_timeouts(), guard: socket_guard(fd, out) } }
 }
 
 /// Sends `data` as one datagram to `to` and returns the number of bytes sent.
 ///
-/// Parks the green thread while the send buffer is full. `to` must be an address of the socket's family. Fails with `NotConnected` if the socket is closed.
+/// Does the same as `send_to_on` on its handle.
 pub fn send_to(s: Socket, data: []u8, to: Addr) -> i64 ! io.Error {
-    using lease = io.enter(s.handle.guard)?
-    let h = s.handle
+    send_to_on(s.handle, data, to)
+}
+
+/// Sends `data` as one datagram to `to` through the socket behind `h` and returns the number of bytes sent.
+///
+/// Parks the green thread while the send buffer is full, waiting on the write view, so another green thread can wait in `receive_from_on` at the same time. `to` must be an address of the socket's family. Fails with `NotConnected` if the socket is closed.
+pub fn send_to_on(h: SocketHandle, data: []u8, to: Addr) -> i64 ! io.Error {
+    using lease = io.enter(h.guard)?
     let sa = sockaddr(to)
-    retry(h.fd, true, h.timeouts.write, fn() { shut_down(h.fd) }, fn() -> i64 ! io.Error { sys.send_to(h.fd, data, sa)? })
+    retry(h.out, true, h.timeouts.write, fn() { shut_down_conn(h.fd, h.out) }, fn() -> i64 ! io.Error { sys.send_to(h.out, data, sa)? })
 }
 
 /// Receives one datagram into `buf` and returns its length and sender.
 ///
-/// Parks the green thread until a datagram arrives. A datagram longer than `buf` is truncated. If the receive timeout elapses first, the socket is shut down and the call fails with `TimedOut`. Fails with `NotConnected` if the socket is closed.
+/// Does the same as `receive_from_on` on its handle.
 pub fn receive_from(s: Socket, buf: []u8) -> Packet ! io.Error {
-    using lease = io.enter(s.handle.guard)?
-    let h = s.handle
+    receive_from_on(s.handle, buf)
+}
+
+/// Receives one datagram into `buf` through the socket behind `h` and returns its length and sender.
+///
+/// Parks the green thread until a datagram arrives. A datagram longer than `buf` is truncated. If the receive timeout elapses first, the socket is shut down and the call fails with `TimedOut`. Fails with `NotConnected` if the socket is closed and with `Malformed` if the system reports a sender address that is not IPv4 or IPv6. An empty `buf` receives a datagram of size 0.
+pub fn receive_from_on(h: SocketHandle, buf: []u8) -> Packet ! io.Error {
+    using lease = io.enter(h.guard)?
     for {
         let received = sys.recv_from(h.fd, buf) catch {
             WouldBlock => {
-                wait(h.fd, false, h.timeouts.read, fn() { shut_down(h.fd) })?
+                wait(h.fd, false, h.timeouts.read, fn() { shut_down_conn(h.fd, h.out) })?
                 continue
             }
             e => fail e
         }
-        let from = from_sockaddr(received.address, received.address.len)
+        let from = datagram_source(received.address)?
         return Packet { size: received.size, from }
     }
+}
+
+fn datagram_source(address: []u8) -> Addr ! io.Error {
+    if address.len < 2 {
+        fail Malformed
+    }
+    let family = io.le16(address, 0)
+    if family == 10 && address.len >= 24 || family == 2 && address.len >= 8 {
+        return from_sockaddr(address, address.len)
+    }
+    fail Malformed
+}
+
+/// Returns the `Socket` that owns the socket behind `h`, which closes it when dropped.
+pub fn adopt_socket(h: SocketHandle) -> Socket {
+    Socket { handle: h }
+}
+
+/// Stops `s` from closing the socket when dropped, and returns its view.
+///
+/// The caller must close the socket with `close_socket_on`.
+pub fn detach_socket(mut s: Socket) -> SocketHandle {
+    s.detached = true
+    s.handle
 }
 
 /// Sets how long `receive_from` waits on `s`, in milliseconds, with 0 or less meaning no limit.

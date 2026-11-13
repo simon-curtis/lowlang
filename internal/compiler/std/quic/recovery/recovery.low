@@ -1,0 +1,305 @@
+import std/io
+
+/// A packet number space: the Initial, Handshake and Application Data (0-RTT and 1-RTT) packets are numbered, acknowledged and declared lost separately.
+pub enum Space {
+    /// Packets protected with the Initial keys.
+    Initial
+    /// Packets protected with the Handshake keys.
+    Handshake
+    /// Packets protected with the 0-RTT or 1-RTT keys.
+    Application
+}
+
+/// A packet the endpoint sent, as reported to `on_sent` and handed back in `AckResult` and `Timeout`.
+///
+/// Times are nanoseconds on a monotonic clock chosen by the caller and are never negative. Sizes include the QUIC header and the AEAD tag but not UDP or IP overhead.
+pub struct Sent {
+    /// The packet number, strictly greater than every number already reported in its space.
+    pub number: i64
+    /// The time the packet was sent.
+    pub time: i64
+    /// The size of the packet in bytes.
+    pub size: i64
+    /// Whether the packet holds a frame that obliges the peer to acknowledge it.
+    pub ack_eliciting: bool
+    /// Whether the packet counts toward bytes in flight: it holds an ack-eliciting or PADDING frame. A packet that is not in flight is not tracked and must not be ack-eliciting.
+    pub in_flight: bool
+}
+
+/// A contiguous run of acknowledged packet numbers, both ends inclusive.
+pub struct AckRange {
+    /// The lowest packet number of the run.
+    pub smallest: i64
+    /// The highest packet number of the run.
+    pub largest: i64
+}
+
+/// The outcome of processing an ACK frame.
+pub struct AckResult {
+    /// The in-flight packets the frame acknowledged for the first time, in packet number order.
+    pub acked: []Sent
+    /// The packets the frame caused to be declared lost, in packet number order.
+    pub lost: []Sent
+    /// Whether the frame produced a round-trip time sample.
+    pub rtt_updated: bool
+}
+
+/// The outcome of a loss detection timeout.
+pub struct Timeout {
+    /// The packets declared lost by the time threshold, in packet number order. Empty for a probe timeout.
+    pub lost: []Sent
+    /// The space that needs ack-eliciting probe packets, or `none` when the timeout declared packets lost or no timer was armed.
+    pub probe: Space?
+    /// The number of ack-eliciting datagrams to send as probes: 2 after a probe timeout and 1 for the client's anti-deadlock packet.
+    pub probes: i64
+}
+
+struct Tracking {
+    sent: []Sent
+    largest_acked: i64
+    largest_sent: i64
+    loss_time: i64
+    last_eliciting: i64
+    eliciting: i64
+    skipped: []i64
+}
+
+/// The loss detection and congestion control state of one connection path (RFC 9002).
+///
+/// The module reads no clock and performs no I/O: every time is a nanosecond reading supplied by the caller, and every timer is a value for the caller to wait for. Fields marked as set by the caller are read at the next event or `rearm_timer` call. A new value comes from `recovery`.
+pub struct Recovery {
+    /// The most recent round-trip time sample in nanoseconds.
+    pub latest_rtt: i64
+    /// The exponentially weighted moving average of the round-trip time in nanoseconds, initially 333 ms.
+    pub smoothed_rtt: i64
+    /// The mean deviation of the round-trip time in nanoseconds, initially half of 333 ms.
+    pub rttvar: i64
+    /// The lowest round-trip time sample in nanoseconds, ignoring acknowledgment delay, or 0 before the first sample.
+    pub min_rtt: i64
+    /// The time the first round-trip time sample was taken, or -1 before it.
+    pub first_rtt_sample: i64
+    /// The peer's `max_ack_delay` transport parameter in nanoseconds, set by the caller. It starts at 25 ms.
+    pub max_ack_delay: i64
+    /// The number of probe timeouts since an acknowledgment reset the backoff.
+    pub pto_count: i64
+    /// The maximum datagram payload in bytes, set from `recovery`. It sizes the minimum window and the congestion avoidance step.
+    pub max_datagram_size: i64
+    /// The number of bytes the sender may have in flight.
+    pub congestion_window: i64
+    /// The sum of the sizes of the in-flight packets that are neither acknowledged nor declared lost.
+    pub bytes_in_flight: i64
+    /// The slow start threshold in bytes, or the largest `i64` before the first congestion event.
+    pub ssthresh: i64
+    /// The time the current recovery period started, or -1 when none is active. A packet sent at or before this time does not grow the window when acknowledged.
+    pub recovery_start_time: i64
+    /// Whether the handshake is confirmed (RFC 9001 section 4.1.2), set by the caller. A confirmed handshake caps acknowledgment delays by `max_ack_delay` and arms the Application space.
+    pub handshake_confirmed: bool
+    /// Whether the peer has finished validating this endpoint's address, set by the caller to `true` on a server. A client sets it implicitly when a Handshake packet is acknowledged, and the confirmed handshake implies it.
+    pub peer_completed_address_validation: bool
+    /// Whether this endpoint holds Handshake keys, set by the caller. It selects the space of a client's anti-deadlock probe.
+    pub has_handshake_keys: bool
+    /// Whether a server may send nothing more until it receives datagrams from the client, set by the caller. A blocked server arms no probe timer.
+    pub amplification_blocked: bool
+    /// Whether the sender is limited by the application or by flow control instead of the window, set by the caller. Acknowledgments do not grow the window while it is `true`.
+    pub limited: bool
+    timer: i64
+    credit: i64
+    reset_min_rtt: bool
+    acked_times: []i64
+    spaces: []Tracking
+}
+
+fn granularity() -> i64 {
+    1000000
+}
+
+fn skipped_limit() -> i64 {
+    32
+}
+
+fn range_limit() -> i64 {
+    256
+}
+
+fn rtt_limit() -> i64 {
+    1099511627776
+}
+
+fn initial_rtt() -> i64 {
+    333000000
+}
+
+fn larger(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+fn smaller(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+fn distance(a: i64, b: i64) -> i64 {
+    if a > b { a - b } else { b - a }
+}
+
+fn slot(space: Space) -> i64 {
+    match space {
+        Initial => 0
+        Handshake => 1
+        Application => 2
+    }
+}
+
+fn space_at(i: i64) -> Space {
+    match i {
+        0 => Initial
+        1 => Handshake
+        _ => Application
+    }
+}
+
+fn total_eliciting(r: *Recovery) -> i64 {
+    r.spaces[0].eliciting + r.spaces[1].eliciting + r.spaces[2].eliciting
+}
+
+fn validated(r: *Recovery) -> bool {
+    r.peer_completed_address_validation || r.handshake_confirmed
+}
+
+fn minimum_window(r: *Recovery) -> i64 {
+    2 * r.max_datagram_size
+}
+
+fn timer_base(r: *Recovery) -> i64 {
+    r.smoothed_rtt + larger(4 * r.rttvar, granularity())
+}
+
+/// Returns the state of a new path whose datagrams carry at most `max_datagram_size` bytes of payload, which is at least 1200 for QUIC.
+///
+/// The round-trip time starts at 333 ms, the window at `min(10 * size, max(14720, 2 * size))` bytes in slow start, and the minimum window at `2 * size`. The packet threshold is 3, the time threshold 9/8 of the round-trip time, the timer granularity 1 ms, the loss reduction factor 1/2 and the persistent congestion threshold 3. A client starts without a validated address, so `peer_completed_address_validation` is `false`; a server sets it.
+pub fn recovery(max_datagram_size: i64) -> *Recovery {
+    let window = smaller(10 * max_datagram_size, larger(14720, 2 * max_datagram_size))
+    let empty = Tracking {
+        sent: [],
+        largest_acked: -1,
+        largest_sent: -1,
+        loss_time: -1,
+        last_eliciting: -1,
+        eliciting: 0,
+        skipped: []
+    }
+    let state = Recovery {
+        latest_rtt: 0,
+        smoothed_rtt: initial_rtt(),
+        rttvar: initial_rtt() / 2,
+        min_rtt: 0,
+        first_rtt_sample: -1,
+        max_ack_delay: 25000000,
+        pto_count: 0,
+        max_datagram_size,
+        congestion_window: window,
+        bytes_in_flight: 0,
+        ssthresh: 9223372036854775807,
+        recovery_start_time: -1,
+        handshake_confirmed: false,
+        peer_completed_address_validation: false,
+        has_handshake_keys: false,
+        amplification_blocked: false,
+        limited: false,
+        timer: -1,
+        credit: 0,
+        reset_min_rtt: false,
+        acked_times: [],
+        spaces: [empty, empty, empty]
+    }
+    new(state)
+}
+
+/// Returns the highest packet number the peer has acknowledged in `space`, or -1 when it has acknowledged none.
+pub fn largest_acked(r: *Recovery, space: Space) -> i64 {
+    r.spaces[slot(space)].largest_acked
+}
+
+/// Returns the time at which an unacknowledged packet in `space` becomes eligible for time threshold loss, or -1 when none is waiting.
+pub fn loss_time(r: *Recovery, space: Space) -> i64 {
+    r.spaces[slot(space)].loss_time
+}
+
+/// Returns the number of in-flight packets in `space` that are neither acknowledged nor declared lost.
+pub fn unresolved(r: *Recovery, space: Space) -> i64 {
+    r.spaces[slot(space)].sent.len
+}
+
+/// Returns the probe timeout period in nanoseconds without backoff: the smoothed round-trip time, four times its variation (at least 1 ms) and `max_ack_delay`.
+///
+/// A connection that sends CONNECTION_CLOSE waits three times this period in the closing and draining states, which is `closing_duration`.
+pub fn pto_duration(r: *Recovery) -> i64 {
+    timer_base(r) + r.max_ack_delay
+}
+
+/// Returns three times `pto_duration` in nanoseconds, the length of the closing and draining periods.
+pub fn closing_duration(r: *Recovery) -> i64 {
+    3 * pto_duration(r)
+}
+
+/// Returns whether sending `bytes` more bytes keeps the bytes in flight within the congestion window.
+///
+/// Probe packets sent after a timeout and the packet that follows entering recovery bypass the window; the caller decides when to ask.
+pub fn can_send(r: *Recovery, bytes: i64) -> bool {
+    r.bytes_in_flight + bytes <= r.congestion_window
+}
+
+/// Returns the time at which the caller must call `on_timeout`, or -1 when no timer is armed.
+///
+/// The value is the time threshold loss time of the earliest space when one is waiting. Otherwise it is the probe timeout of the earliest space with an ack-eliciting packet in flight, which backs off by 2 for each `pto_count`. Initial and Handshake periods omit `max_ack_delay`, the Application space is never armed before `handshake_confirmed`, and a server with `amplification_blocked` has no timer. A client that has not completed address validation arms the timer even with nothing in flight, starting from the time of the last event.
+///
+/// The value only changes when an event or `rearm_timer` recomputes it. A value in the past means the timeout is due.
+pub fn deadline(r: *Recovery) -> i64 {
+    r.timer
+}
+
+/// Recomputes the loss detection timer at time `now`.
+///
+/// Call it after changing `handshake_confirmed`, `peer_completed_address_validation`, `has_handshake_keys` or `amplification_blocked`, and when a server receives a datagram while `amplification_blocked` was set. Then compare `deadline` with `now`: a timer already in the past is due, so the caller runs `on_timeout`.
+pub fn rearm_timer(r: *Recovery, now: i64) {
+    set_timer(r, now)
+}
+
+/// Marks `number` as a packet number the sender deliberately leaves unused in `space`, the defence against optimistic acknowledgments (RFC 9000 section 21.4).
+///
+/// Call it for numbers above every number already sent, then continue numbering above it. `on_ack` fails `Malformed` for a frame that covers a skipped number. The most recent 32 skipped numbers per space are remembered. Packet threshold loss assumes consecutive numbers, so a skipped number makes a loss one packet later than otherwise. A number at or below the highest number sent is ignored.
+pub fn skip(r: *Recovery, space: Space, number: i64) {
+    let i = slot(space)
+    if number <= r.spaces[i].largest_sent {
+        return
+    }
+    r.spaces[i].largest_sent = number
+    if r.spaces[i].skipped.len >= skipped_limit() {
+        let remembered = r.spaces[i].skipped
+        let keep = remembered.len - 1
+        for k in 0..keep {
+            remembered[k] = remembered[k + 1]
+        }
+        truncate(mut r.spaces[i].skipped, keep)
+    }
+    push(mut r.spaces[i].skipped, number)
+}
+
+/// Records that the packet `p` was sent in `space`.
+///
+/// A packet that is not in flight only raises the highest number sent, so an acknowledgment of it is accepted but reports nothing. An in-flight packet is tracked until it is acknowledged or declared lost, adds its size to `bytes_in_flight`, and, when ack-eliciting, becomes the last ack-eliciting packet of its space. The timer is recomputed at `p.time`. Numbers in one space must strictly increase and times must not decrease.
+pub fn on_sent(r: *Recovery, space: Space, p: Sent) {
+    let i = slot(space)
+    if p.number > r.spaces[i].largest_sent {
+        r.spaces[i].largest_sent = p.number
+    }
+    if !p.in_flight {
+        return
+    }
+    push(mut r.spaces[i].sent, p)
+    if p.ack_eliciting {
+        r.spaces[i].last_eliciting = p.time
+        r.spaces[i].eliciting += 1
+    }
+    r.bytes_in_flight += p.size
+    set_timer(r, p.time)
+}

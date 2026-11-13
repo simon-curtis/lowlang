@@ -1,0 +1,367 @@
+import std/cancel
+import std/header
+import std/http/qpack
+import std/io
+import std/net
+import std/quic
+import std/quic/wire
+import std/sync
+
+struct H3 {
+    handle: *quic.ConnectionHandle
+    remote: str
+    client: bool
+    token: *cancel.Token
+    decoder: *qpack.Decoder
+    encoder: *qpack.Encoder
+    lock: sync.Mutex
+    gate: chan[bool]
+    ready: [i64: bool]
+    feedback: quic.Stream
+    feedback_lock: sync.Mutex
+    guard: sync.Mutex
+    control_seen: bool
+    encoder_seen: bool
+    decoder_seen: bool
+    uni_live: i64
+    on_goaway: fn(i64)
+}
+
+fn write_critical(h: *quic.ConnectionHandle, s: quic.Stream, data: []u8) ! io.Error {
+    quic.write(s, data) catch {
+        BrokenPipe => {
+            quic.close_on(h, h3_closed_critical_stream(), "")
+            fail BrokenPipe
+        }
+        e => fail e
+    }
+}
+
+fn open_h3(h: *quic.ConnectionHandle, client: bool) -> *H3 ! io.Error {
+    let control = quic.open_uni_stream_on(h)?
+    var start: []u8 = []
+    put_h3_control_start(mut start)
+    write_critical(h, control, start)?
+    let feedback = quic.open_uni_stream_on(h)?
+    var kind: []u8 = []
+    wire.put_varint(mut kind, h3_stream_qpack_decoder())
+    write_critical(h, feedback, kind)?
+    new(H3 {
+        handle: h
+        remote: net.format_ip(h.remote.ip)
+        client
+        token: cancel.token()
+        decoder: qpack.decoder(h3_qpack_capacity(), h3_qpack_blocked(), h3_max_field_section())
+        encoder: qpack.encoder()
+        lock: sync.mutex()
+        gate: chan[bool]()
+        ready: [:]
+        feedback
+        feedback_lock: sync.mutex()
+        guard: sync.mutex()
+        control_seen: false
+        encoder_seen: false
+        decoder_seen: false
+        uni_live: 0
+        on_goaway: fn(id: i64) {}
+    })
+}
+
+fn close_with(c: *H3, code: i64) {
+    quic.close_on(c.handle, code, "")
+}
+
+fn send_feedback(c: *H3) {
+    var stopped = false
+    sync.lock(c.feedback_lock)
+    sync.lock(c.lock)
+    let owed = qpack.take_decoder_stream(c.decoder)
+    sync.unlock(c.lock)
+    if owed.len > 0 {
+        quic.write(c.feedback, owed) catch {
+            BrokenPipe => {
+                stopped = true
+                0
+            }
+            _ => 0
+        }
+    }
+    sync.unlock(c.feedback_lock)
+    if stopped {
+        close_with(c, h3_closed_critical_stream())
+    }
+}
+
+fn abandon_section(c: *H3, id: i64) {
+    sync.lock(c.lock)
+    qpack.cancel_stream(c.decoder, id)
+    sync.unlock(c.lock)
+    send_feedback(c)
+}
+
+fn accept_uni(c: *H3) {
+    for {
+        let s = quic.accept_uni_stream_on(c.handle) catch {
+            _ => return
+        }
+        if reserve_uni(c) {
+            spawn read_uni(c, s)
+        } else {
+            quic.stop(s, h3_stream_creation_error())
+        }
+    }
+}
+
+fn reserve_uni(c: *H3) -> bool {
+    sync.lock(c.guard)
+    let room = c.uni_live < h3_max_uni_streams()
+    if room {
+        c.uni_live += 1
+    }
+    sync.unlock(c.guard)
+    room
+}
+
+fn release_uni(c: *H3) {
+    sync.lock(c.guard)
+    c.uni_live -= 1
+    sync.unlock(c.guard)
+}
+
+fn claim_uni(c: *H3, kind: i64) -> bool {
+    sync.lock(c.guard)
+    var fresh = true
+    if kind == h3_stream_control() {
+        fresh = !c.control_seen
+        c.control_seen = true
+    } else if kind == h3_stream_qpack_encoder() {
+        fresh = !c.encoder_seen
+        c.encoder_seen = true
+    } else {
+        fresh = !c.decoder_seen
+        c.decoder_seen = true
+    }
+    sync.unlock(c.guard)
+    fresh
+}
+
+fn critical_stream(kind: i64) -> bool {
+    kind == h3_stream_control() || kind == h3_stream_qpack_encoder() || kind == h3_stream_qpack_decoder()
+}
+
+fn read_uni(c: *H3, s: quic.Stream) {
+    defer release_uni(c)
+    let r = io.reader(quic.stream(s))
+    let kind = read_h3_varint(r) catch {
+        _ => return
+    }
+    if kind == h3_stream_push() {
+        close_with(c, if c.client { h3_id_error() } else { h3_stream_creation_error() })
+        return
+    }
+    if !critical_stream(kind) {
+        quic.stop(s, h3_stream_creation_error())
+        return
+    }
+    if !claim_uni(c, kind) {
+        close_with(c, h3_stream_creation_error())
+        return
+    }
+    if kind == h3_stream_control() {
+        read_control(c, r)
+    } else if kind == h3_stream_qpack_encoder() {
+        read_encoder_stream(c, r)
+    } else {
+        read_decoder_stream(c, r)
+    }
+    close_with(c, h3_closed_critical_stream())
+}
+
+fn read_control(c: *H3, r: *io.Reader) {
+    control_loop(c, r) catch {
+        e => {
+            let code = h3_failure_code(e)
+            if code != 0 {
+                close_with(c, code)
+            }
+        }
+    }
+}
+
+fn control_loop(c: *H3, r: *io.Reader) ! io.Error {
+    var settled = false
+    var goaway = -1
+    var max_push = -1
+    for {
+        let head = read_h3_head(r)?
+        let h = match head {
+            some(x) => x
+            none => return
+        }
+        if !settled && h.kind != h3_frame_settings() {
+            close_with(c, h3_missing_settings())
+            return
+        }
+        if h.kind == h3_frame_settings() {
+            if settled {
+                close_with(c, h3_frame_unexpected())
+                return
+            }
+            let block = read_h3_block(r, h.length, h3_max_control_frame())?
+            parse_h3_settings(block)?
+            settled = true
+        } else if h.kind == h3_frame_goaway() {
+            let id = control_varint(r, h)?
+            if goaway >= 0 && id > goaway || c.client && id % 4 != 0 {
+                close_with(c, h3_id_error())
+                return
+            }
+            goaway = id
+            c.on_goaway(id)
+        } else if h.kind == h3_frame_max_push_id() {
+            if c.client {
+                close_with(c, h3_frame_unexpected())
+                return
+            }
+            let id = control_varint(r, h)?
+            if id < max_push {
+                close_with(c, h3_id_error())
+                return
+            }
+            max_push = id
+        } else if h.kind == h3_frame_cancel_push() {
+            let id = control_varint(r, h)?
+            if id > max_push {
+                close_with(c, h3_id_error())
+                return
+            }
+        } else if unexpected_on_control(h.kind) {
+            close_with(c, h3_frame_unexpected())
+            return
+        } else {
+            skip_h3(r, h.length)?
+        }
+    }
+}
+
+fn control_varint(r: *io.Reader, h: H3Head) -> i64 ! io.Error {
+    let block = read_h3_block(r, h.length, h3_max_control_frame())?
+    parse_h3_varint_payload(block)?
+}
+
+fn unexpected_on_control(kind: i64) -> bool {
+    kind == h3_frame_data() || kind == h3_frame_headers() || kind == h3_frame_push_promise() || h3_frame_reserved_http2(kind)
+}
+
+fn unexpected_on_request(kind: i64) -> bool {
+    kind == h3_frame_cancel_push() || kind == h3_frame_settings() || kind == h3_frame_push_promise() || kind == h3_frame_goaway() || kind == h3_frame_max_push_id() || h3_frame_reserved_http2(kind)
+}
+
+fn read_encoder_stream(c: *H3, r: *io.Reader) {
+    let buf = io.buffer(4096)
+    for {
+        let n = io.read_some(r, buf) catch {
+            _ => return
+        }
+        if n == 0 {
+            return
+        }
+        if !apply_encoder_data(c, buf[..n]) {
+            return
+        }
+    }
+}
+
+fn apply_encoder_data(c: *H3, data: []u8) -> bool {
+    sync.lock(c.lock)
+    let woken = qpack.on_encoder_stream(c.decoder, data) catch {
+        _ => {
+            sync.unlock(c.lock)
+            close_with(c, qpack.encoder_stream_error())
+            return false
+        }
+    }
+    for id in woken {
+        c.ready[id] = true
+    }
+    let old = c.gate
+    c.gate = chan[bool]()
+    sync.unlock(c.lock)
+    close(old)
+    send_feedback(c)
+    true
+}
+
+fn read_decoder_stream(c: *H3, r: *io.Reader) {
+    let buf = io.buffer(4096)
+    for {
+        let n = io.read_some(r, buf) catch {
+            _ => return
+        }
+        if n == 0 {
+            return
+        }
+        qpack.on_decoder_stream(c.encoder, buf[..n]) catch {
+            _ => {
+                close_with(c, qpack.decoder_stream_error())
+                return
+            }
+        }
+    }
+}
+
+fn decode_fields(c: *H3, stream: i64, block: []u8, halt: chan[bool]) -> []header.Header ! io.Error {
+    for {
+        sync.lock(c.lock)
+        let outcome = qpack.decode(c.decoder, stream, block) catch {
+            TooLarge => {
+                sync.unlock(c.lock)
+                fail TooLarge
+            }
+            _ => {
+                sync.unlock(c.lock)
+                close_with(c, qpack.decompression_failed())
+                fail Malformed
+            }
+        }
+        let gate = c.gate
+        sync.unlock(c.lock)
+        send_feedback(c)
+        match outcome {
+            Fields(fields) => return fields
+            Blocked => wait_unblocked(c, stream, gate, halt)?
+        }
+    }
+}
+
+fn forget_ready(c: *H3, stream: i64) {
+    sync.lock(c.lock)
+    delete(mut c.ready, stream)
+    sync.unlock(c.lock)
+}
+
+fn wait_unblocked(c: *H3, stream: i64, first: chan[bool], halt: chan[bool]) ! io.Error {
+    defer forget_ready(c, stream)
+    let gone = cancel.done(c.token)
+    var gate = first
+    for {
+        select {
+            <-gate => {}
+            <-gone => fail Aborted
+            <-halt => fail Aborted
+        }
+        sync.lock(c.lock)
+        let woken = c.ready[stream] ?? false
+        gate = c.gate
+        sync.unlock(c.lock)
+        if woken {
+            return
+        }
+    }
+}
+
+fn abort_stream(c: *H3, s: quic.Stream, code: i64) {
+    quic.reset(s, code)
+    quic.stop(s, code)
+    abandon_section(c, s.id)
+}

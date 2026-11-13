@@ -1,0 +1,371 @@
+import std/crypto/hash
+import std/crypto/x509
+import std/io
+import std/text
+import std/tls
+
+enum Tamper {
+    Nothing
+    StripParameters
+    Relabel
+    Truncate(i64)
+    Declare(i64)
+    Trailing
+}
+
+struct Side {
+    steps: []str
+    secrets: [str: []u8]
+    alerts: []i64
+    sent: i64
+    initial: i64
+}
+
+struct Outcome {
+    result: str
+    steps: []str
+    alerts: []i64
+    sent: i64
+    initial: i64
+}
+
+struct Run {
+    client: Outcome
+    server: Outcome
+    secrets: str
+}
+
+fn level_name(level: tls.Level) -> str {
+    match level {
+        Initial => "initial"
+        Handshake => "handshake"
+        Application => "application"
+    }
+}
+
+fn client_hello_list_at(data: []u8) -> i64 {
+    var at = 4 + 2 + 32
+    at += 1 + i64(data[at])
+    at += 2 + io.be16(data, at)
+    at += 1 + i64(data[at])
+    at
+}
+
+fn extension_list_at(data: []u8) -> i64 {
+    match data[0] {
+        1 => client_hello_list_at(data)
+        8 => 4
+        _ => -1
+    }
+}
+
+fn set_length(mut data: []u8, body: i64) {
+    data[1] = u8(body >> 16)
+    data[2] = u8(body >> 8)
+    data[3] = u8(body)
+}
+
+fn strip_parameters(data: []u8) -> []u8 {
+    let list_at = extension_list_at(data)
+    if list_at < 0 {
+        return data
+    }
+    let size = 4 + io.be24(data, 1)
+    let message = data[..size]
+    let list = message[list_at + 2..]
+    var kept: []u8 = []
+    var at = 0
+    for at < list.len {
+        let kind = io.be16(list, at)
+        let length = io.be16(list, at + 2)
+        if kind != 57 {
+            io.append(mut kept, list[at..at + 4 + length])
+        }
+        at += 4 + length
+    }
+    var out: []u8 = []
+    io.append(mut out, message[..list_at])
+    io.put_be16(mut out, kept.len)
+    io.append(mut out, kept)
+    set_length(mut out, out.len - 4)
+    io.append(mut out, data[size..])
+    out
+}
+
+fn truncate_body(data: []u8, keep: i64) -> []u8 {
+    if extension_list_at(data) < 0 {
+        return data
+    }
+    let size = 4 + io.be24(data, 1)
+    let kept = if keep < size - 4 { keep } else { size - 4 }
+    var out: []u8 = []
+    io.append(mut out, data[..4 + kept])
+    set_length(mut out, kept)
+    io.append(mut out, data[size..])
+    out
+}
+
+fn declare_size(data: []u8, size: i64) -> []u8 {
+    if extension_list_at(data) < 0 {
+        return data
+    }
+    var out: []u8 = []
+    io.append(mut out, data)
+    set_length(mut out, size)
+    out
+}
+
+fn with_trailing(level: tls.Level, data: []u8) -> []u8 {
+    if level != tls.Level.Initial {
+        return data
+    }
+    var out: []u8 = []
+    io.append(mut out, data)
+    io.append(mut out, [20, 0, 0, 32])
+    out
+}
+
+fn tampered(tamper: Tamper, level: tls.Level, data: []u8) -> tls.QuicData {
+    match tamper {
+        StripParameters => tls.QuicData { level, data: strip_parameters(data) }
+        Truncate(keep) => tls.QuicData { level, data: truncate_body(data, keep) }
+        Declare(size) => tls.QuicData { level, data: declare_size(data, size) }
+        Trailing => tls.QuicData { level, data: with_trailing(level, data) }
+        Relabel => {
+            let relabelled = if level == tls.Level.Handshake { tls.Level.Application } else { level }
+            tls.QuicData { level: relabelled, data }
+        }
+        Nothing => tls.QuicData { level, data }
+    }
+}
+
+fn deliver(side: *Side, outbox: chan[tls.QuicData], tamper: Tamper, level: tls.Level, data: []u8) ! io.Error {
+    let message = tampered(tamper, level, data)
+    side.sent += data.len
+    if level == tls.Level.Initial {
+        side.initial += 1
+    }
+    var at = 0
+    for at < message.data.len {
+        let end = if at + 200 < message.data.len { at + 200 } else { message.data.len }
+        outbox <- tls.QuicData { level: message.level, data: message.data[at..end] }
+        at = end
+    }
+}
+
+fn receive(inbox: chan[tls.QuicData]) -> tls.QuicData ! io.Error {
+    let next = (<-inbox) ?? fail Eof
+    next
+}
+
+fn install(side: *Side, secret: tls.QuicSecret) ! io.Error {
+    let direction = if secret.writing { "write" } else { "read" }
+    let name = "{level_name(secret.level)} {direction}"
+    push(mut side.steps, "{name} {secret.secret.len}")
+    side.secrets[name] = secret.secret
+}
+
+fn transport(side: *Side, parameters: str, inbox: chan[tls.QuicData], outbox: chan[tls.QuicData], tamper: Tamper) -> tls.QuicTransport {
+    tls.QuicTransport {
+        parameters: bytes(parameters)
+        send: fn(level, data) { deliver(side, outbox, tamper, level, data) }
+        receive: fn() -> tls.QuicData ! io.Error { receive(inbox) }
+        install: fn(secret) { install(side, secret) }
+        alert: fn(description) { push(mut side.alerts, description) }
+    }
+}
+
+fn describe(r: tls.QuicResult) -> str {
+    let parameters = if r.peer_parameters.len > 32 { "{r.peer_parameters.len} bytes" } else { str(r.peer_parameters) }
+    "ok protocol={r.protocol} group={r.group:x4} suite={r.suite} certificates={r.peer_certificates.len} peer_parameters={parameters}"
+}
+
+fn attempt(handshake: fn(tls.QuicTransport, tls.Config) -> tls.QuicResult ! io.Error, t: tls.QuicTransport, config: tls.Config) -> str {
+    let result = handshake(t, config) catch {
+        e => return "failed {e}"
+    }
+    describe(result)
+}
+
+fn joined(steps: []str) -> str {
+    if steps.len == 0 {
+        return "none"
+    }
+    text.join(steps, ", ")
+}
+
+fn succeeded(o: Outcome) -> bool {
+    o.result.len >= 2 && o.result[..2] == "ok"
+}
+
+fn play(side: *Side, handshake: fn(tls.QuicTransport, tls.Config) -> tls.QuicResult ! io.Error, t: tls.QuicTransport, config: tls.Config, outbox: chan[tls.QuicData], done: chan[Outcome]) {
+    let result = attempt(handshake, t, config)
+    close(outbox)
+    done <- Outcome { result, steps: side.steps, alerts: side.alerts, sent: side.sent, initial: side.initial }
+}
+
+fn same(a: []u8, b: []u8) -> bool {
+    a.len > 0 && hash.equal(a, b)
+}
+
+fn compare(client: *Side, server: *Side) -> str {
+    var parts: []str = []
+    for level in ["handshake", "application"] {
+        let up = same(client.secrets["{level} write"] ?? [], server.secrets["{level} read"] ?? [])
+        let down = same(server.secrets["{level} write"] ?? [], client.secrets["{level} read"] ?? [])
+        push(mut parts, "{level} client-to-server {up} server-to-client {down}")
+    }
+    text.join(parts, "; ")
+}
+
+fn handshake(client_config: tls.Config, server_config: tls.Config, client_tamper: Tamper, server_tamper: Tamper) -> Run {
+    negotiate(client_config, server_config, client_tamper, server_tamper, "client-parameters")
+}
+
+fn negotiate(client_config: tls.Config, server_config: tls.Config, client_tamper: Tamper, server_tamper: Tamper, client_parameters: str) -> Run {
+    let to_server = chan[tls.QuicData](256)
+    let to_client = chan[tls.QuicData](256)
+    let client = new(Side { steps: [], secrets: [:], alerts: [], sent: 0, initial: 0 })
+    let server = new(Side { steps: [], secrets: [:], alerts: [], sent: 0, initial: 0 })
+    let client_done = chan[Outcome](1)
+    let server_done = chan[Outcome](1)
+    let client_transport = transport(client, client_parameters, to_client, to_server, client_tamper)
+    let server_transport = transport(server, "server-parameters", to_server, to_client, server_tamper)
+    spawn play(client, tls.quic_client, client_transport, client_config, to_server, client_done)
+    spawn play(server, tls.quic_server, server_transport, server_config, to_client, server_done)
+    let client_outcome = (<-client_done) ?? Outcome { result: "missing", steps: [], alerts: [], sent: 0, initial: 0 }
+    let server_outcome = (<-server_done) ?? Outcome { result: "missing", steps: [], alerts: [], sent: 0, initial: 0 }
+    let completed = succeeded(client_outcome) && succeeded(server_outcome)
+    let secrets = if completed { compare(client, server) } else { "not derived" }
+    Run { client: client_outcome, server: server_outcome, secrets }
+}
+
+fn show(title: str, r: Run) {
+    print("== {title}")
+    print("client: {r.client.result}")
+    print("  installs: {joined(r.client.steps)}")
+    print("  alerts: {r.client.alerts}")
+    if r.client.sent == 0 {
+        print("  nothing sent")
+    }
+    print("  initial messages: {r.client.initial}")
+    print("server: {r.server.result}")
+    print("  installs: {joined(r.server.steps)}")
+    print("  alerts: {r.server.alerts}")
+    print("  initial messages: {r.server.initial}")
+    print("secrets: {r.secrets}")
+}
+
+fn brief(title: str, r: Run) {
+    print("{title}: client {r.client.result} {r.client.alerts}, server {r.server.result} {r.server.alerts}")
+}
+
+fn roots() ->[]x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        push(mut out, x509.parse(der) or return out)
+    }
+    out
+}
+
+fn server_config(alpn: []str, groups: []i64, suites: []i64) -> tls.Config ! io.Error {
+    let pem = embed("std_tls_ec.pem")
+    tls.Config { certificates: x509.pem_certificates(pem), key: x509.pem_private_key(pem)?, alpn, groups, cipher_suites: suites }
+}
+
+fn client_config(alpn: []str, groups: []i64, suites: []i64) -> tls.Config {
+    tls.Config { server_name: "localhost", roots: roots(), alpn, groups, cipher_suites: suites }
+}
+
+fn main() ! io.Error {
+    let all_groups = [0x11EC, 0x001D, 0x0017, 0x0018]
+    let all_suites = [0x1301, 0x1303, 0x1302, 0xC02B]
+    let nothing = Tamper.Nothing
+
+    let defaults = handshake(client_config(["h2", "h3"], all_groups, all_suites), server_config(["h3"], all_groups, all_suites)?, nothing, nothing)
+    show("defaults", defaults)
+
+    let aes256 = handshake(client_config(["h3"], [0x001D], [0x1302]), server_config(["h3"], all_groups, all_suites)?, nothing, nothing)
+    show("aes-256-gcm over x25519", aes256)
+
+    let chacha = handshake(client_config(["h3"], [0x0017], [0x1303]), server_config(["h3"], all_groups, all_suites)?, nothing, nothing)
+    show("chacha20-poly1305 over p-256", chacha)
+
+    let retry = handshake(client_config(["h3"], all_groups, all_suites), server_config(["h3"], [0x0017], all_suites)?, nothing, nothing)
+    show("hello retry request", retry)
+
+    let no_protocol = handshake(client_config(["h2"], all_groups, all_suites), server_config(["h3"], all_groups, all_suites)?, nothing, nothing)
+    show("no common protocol", no_protocol)
+
+    let no_client_parameters = handshake(client_config(["h3"], all_groups, all_suites), server_config(["h3"], all_groups, all_suites)?, Tamper.StripParameters, nothing)
+    show("client omits transport parameters", no_client_parameters)
+
+    let no_server_parameters = handshake(client_config(["h3"], all_groups, all_suites), server_config(["h3"], all_groups, all_suites)?, nothing, Tamper.StripParameters)
+    show("server omits transport parameters", no_server_parameters)
+
+    let wrong_level = handshake(client_config(["h3"], all_groups, all_suites), server_config(["h3"], all_groups, all_suites)?, nothing, Tamper.Relabel)
+    show("handshake data at the wrong level", wrong_level)
+
+    let no_alpn = handshake(client_config([], all_groups, all_suites), server_config(["h3"], all_groups, all_suites)?, nothing, nothing)
+    show("client without alpn", no_alpn)
+
+    var old = client_config(["h3"], all_groups, all_suites)
+    old.max_version = tls.tls12()
+    let tls12_only = handshake(old, server_config(["h3"], all_groups, all_suites)?, nothing, nothing)
+    show("client limited to tls 1.2", tls12_only)
+
+    var old_server = server_config(["h3"], all_groups, all_suites)?
+    old_server.max_version = tls.tls12()
+    let tls12_server = handshake(client_config(["h3"], all_groups, all_suites), old_server, nothing, nothing)
+    show("server limited to tls 1.2", tls12_server)
+
+    var permissive = client_config(["h3"], all_groups, all_suites)
+    permissive.min_version = tls.tls12()
+    let widened = handshake(permissive, server_config(["h3"], all_groups, [0xC02B, 0x1301])?, nothing, nothing)
+    show("tls 1.2 suites and min_version ignored", widened)
+
+    let good_client = client_config(["h3"], all_groups, all_suites)
+    let good_server = server_config(["h3"], all_groups, all_suites)?
+
+    print("== client hello truncated to a body length")
+    for keep in [0, 1, 2, 33, 34, 35, 36, 40, 47, 50, 100, 300] {
+        let run = handshake(good_client, good_server, Tamper.Truncate(keep), nothing)
+        brief("keep {keep}", run)
+    }
+
+    print("== encrypted extensions truncated to a body length")
+    for keep in [0, 1, 2, 3, 4, 10] {
+        let run = handshake(good_client, good_server, nothing, Tamper.Truncate(keep))
+        brief("keep {keep}", run)
+    }
+
+    print("== client hello declaring a length")
+    for size in [65537, 70000, 16777215] {
+        let run = handshake(good_client, good_server, Tamper.Declare(size), nothing)
+        brief("declared {size}", run)
+    }
+
+    print("== encrypted extensions declaring a length")
+    for size in [65537, 70000, 16777215] {
+        let run = handshake(good_client, good_server, nothing, Tamper.Declare(size))
+        brief("declared {size}", run)
+    }
+
+    print("== bytes left in the handshake buffer at a key change")
+    let client_leftover = handshake(good_client, good_server, Tamper.Trailing, nothing)
+    brief("after the client hello", client_leftover)
+    let server_leftover = handshake(good_client, good_server, nothing, Tamper.Trailing)
+    brief("after the server hello", server_leftover)
+
+    print("== client data at the wrong level")
+    let client_relabelled = handshake(good_client, good_server, Tamper.Relabel, nothing)
+    brief("finished", client_relabelled)
+
+    print("== transport parameters over the limit")
+    let oversized = text.repeat("p", 16385)
+    let too_long = negotiate(good_client, good_server, nothing, nothing, oversized)
+    brief("client", too_long)
+    let limit = text.repeat("p", 16384)
+    let at_limit = negotiate(good_client, good_server, nothing, nothing, limit)
+    brief("client at the limit", at_limit)
+}

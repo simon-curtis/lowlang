@@ -165,9 +165,15 @@ fn alpn_extension(mut exts: []u8, protocol: str) {
     put_extension(mut exts, 16, alpn)
 }
 
-fn encrypted_extensions(protocol: str) -> []u8 {
+fn encrypted_extensions(c: *Channel, protocol: str) -> []u8 {
     var exts: []u8 = []
     alpn_extension(mut exts, protocol)
+    match c.quic {
+        some(t) => {
+            put_extension(mut exts, 57, t.parameters)
+        }
+        none => {}
+    }
     var body: []u8 = []
     put_vector16(mut body, exts)
     handshake_message(8, body)
@@ -239,10 +245,28 @@ pub fn server_handle(s: io.Stream, config: Config) -> *SessionHandle ! io.Error 
     if version == 0x0303 {
         return server12(c, config, key, hello, m.raw)
     }
-    server13(c, config, key, hello, m.raw)
+    let done = server13(c, config, key, hello, m.raw)?
+    session(c, done.protocol, done.group, done.suite, suite_code(done.suite), done.chain)
 }
 
-fn server13(c: *Channel, config: Config, key: x509.PrivateKey, first_hello: ClientHello, first: []u8) -> *SessionHandle ! io.Error {
+fn check_quic_hello(c: *Channel, hello: ClientHello) ! io.Error {
+    if !is_quic(c) {
+        return
+    }
+    if hello.session_id.len > 0 {
+        fail refuse(c, 47)
+    }
+    let _ = peer_parameters(c, hello.exts)?
+}
+
+fn require_protocol(c: *Channel, protocol: str) ! io.Error {
+    if is_quic(c) && protocol.len == 0 {
+        fail refuse(c, 120)
+    }
+}
+
+fn server13(c: *Channel, config: Config, key: x509.PrivateKey, first_hello: ClientHello, first: []u8) -> Done13 ! io.Error {
+    check_quic_hello(c, first_hello)?
     var hello = first_hello
     var transcript = first
     let suite = match choose_suite(config.cipher_suites, hello.suites) {
@@ -271,6 +295,7 @@ fn server13(c: *Channel, config: Config, key: x509.PrivateKey, first_hello: Clie
         write_record(c, 20, [1])?
         let m = expect_message(c, 1)?
         hello = parse_client_hello(m.body) or fail abort(c, 50, Malformed)
+        check_quic_hello(c, hello)?
         io.append(mut transcript, m.raw)
         share = share_of(hello, group)
     }
@@ -279,16 +304,17 @@ fn server13(c: *Channel, config: Config, key: x509.PrivateKey, first_hello: Clie
         none => fail refuse(c, 47)
     }
     let exchanged = server_exchange(entry.group, entry.key) or fail refuse(c, 47)
+    let protocol = choose_protocol(hello.protocols, config.alpn)
+    require_protocol(c, protocol)?
     let reply = server_hello(crypto.random(32), hello.session_id, suite, entry.group, exchanged.public, false)
     io.append(mut transcript, reply)
     write_record(c, 22, reply)?
     write_record(c, 20, [1])?
     let k = schedule(suite, exchanged.secret, transcript)
-    c.write_key = protection(suite, k.server_handshake)?
-    c.read_key = protection(suite, k.client_handshake)?
-    let protocol = choose_protocol(hello.protocols, config.alpn)
+    set_write_key(c, suite, k.server_handshake)?
+    set_read_key(c, suite, k.client_handshake)?
     var flight: []u8 = []
-    let ee = encrypted_extensions(protocol)
+    let ee = encrypted_extensions(c, protocol)
     io.append(mut transcript, ee)
     io.append(mut flight, ee)
     let cert = certificate_message([], config.certificates)
@@ -312,7 +338,8 @@ fn server13(c: *Channel, config: Config, key: x509.PrivateKey, first_hello: Clie
     if !hash.equal(client_fin.body, finished(k, k.client_handshake, transcript)) {
         fail abort(c, 51, Invalid)
     }
-    c.write_key = protection(suite, server_app)?
-    c.read_key = protection(suite, client_app)?
-    session(c, protocol, entry.group, suite, suite_code(suite), [])
+    set_write_key(c, suite, server_app)?
+    set_read_key(c, suite, client_app)?
+    let parameters = peer_parameters(c, hello.exts)?
+    Done13 { protocol, group: entry.group, suite, chain: [], peer_parameters: parameters }
 }

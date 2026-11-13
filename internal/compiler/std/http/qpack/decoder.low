@@ -1,0 +1,385 @@
+import std/header
+import std/io
+import std/slices
+
+struct Prefix {
+    required: i64
+    base: i64
+}
+
+struct Waiting {
+    stream: i64
+    required: i64
+}
+
+/// The result of decoding one encoded field section.
+pub enum Decoded {
+    /// The field lines of the section, in the order the section lists them.
+    Fields(fields: []header.Header)
+    /// The section needs dynamic table entries the encoder stream has not delivered yet.
+    ///
+    /// The stream is recorded as blocked. The caller keeps the section bytes and decodes them again after `on_encoder_stream` lists the stream as ready.
+    Blocked
+}
+
+/// A QPACK decoder (RFC 9204): the dynamic table, the encoder stream parser and the decoder stream instructions owed to the peer's encoder.
+///
+/// A decoder does no I/O and is not safe for concurrent use. The caller owns the streams. It feeds bytes read from the peer's encoder stream to `on_encoder_stream`, field sections read from request or response streams to `decode`, and writes `take_decoder_stream` to its own decoder stream.
+///
+/// Failures map to HTTP/3 error codes by the function that failed. A failure of `decode` is `QPACK_DECOMPRESSION_FAILED` (`decompression_failed`), except `TooLarge`, which is a field section over the size limit and is handled as RFC 9114 section 4.2.2 describes. A failure of `on_encoder_stream` is `QPACK_ENCODER_STREAM_ERROR` (`encoder_stream_error`). After any failure the connection is to be closed with that code, so the decoder is not used again.
+pub struct Decoder {
+    statics: []header.Header
+    max_capacity: i64
+    max_blocked: i64
+    section_limit: i64
+    capacity: i64
+    size: i64
+    entries: []header.Header
+    evicted: i64
+    pending: []u8
+    known: i64
+    waiting: []Waiting
+    queued: []u8
+}
+
+/// Returns a decoder with an empty dynamic table.
+///
+/// `max_capacity` is the largest dynamic table capacity the peer's encoder may set, the value advertised as `SETTINGS_QPACK_MAX_TABLE_CAPACITY`. `max_blocked` is the most streams that may be blocked at once, the value of `SETTINGS_QPACK_BLOCKED_STREAMS`. `max_field_section_size` is the most a decoded field section may measure, the value of `SETTINGS_MAX_FIELD_SECTION_SIZE`, where each field line counts its name length, its value length and 32. A negative argument is treated as 0.
+pub fn decoder(max_capacity: i64, max_blocked: i64, max_field_section_size: i64) -> *Decoder {
+    new(Decoder {
+        statics: static_table()
+        max_capacity: if max_capacity < 0 { 0 } else { max_capacity }
+        max_blocked: if max_blocked < 0 { 0 } else { max_blocked }
+        section_limit: if max_field_section_size < 0 { 0 } else { max_field_section_size }
+        capacity: 0
+        size: 0
+        entries: []
+        evicted: 0
+        pending: []
+        known: 0
+        waiting: []
+        queued: []
+    })
+}
+
+/// Returns the number of entries the decoder has inserted into the dynamic table, counting those since evicted.
+pub fn insert_count(d: *Decoder) -> i64 {
+    d.evicted + d.entries.len
+}
+
+/// Returns the size of the dynamic table in bytes: each entry counts its name length, its value length and 32.
+pub fn table_size(d: *Decoder) -> i64 {
+    d.size
+}
+
+/// Returns the entries still in the dynamic table, oldest first.
+pub fn table_entries(d: *Decoder) -> []header.Header {
+    slices.clone(d.entries)
+}
+
+fn evict_to(d: *Decoder, room: i64) {
+    for d.size > room && d.entries.len > 0 {
+        d.size -= entry_size(d.entries[0])
+        d.entries = d.entries[1..]
+        d.evicted += 1
+    }
+}
+
+fn insert(d: *Decoder, h: header.Header) ! io.Error {
+    let size = entry_size(h)
+    if size > d.capacity {
+        fail Malformed
+    }
+    evict_to(d, d.capacity - size)
+    push(mut d.entries, h)
+    d.size += size
+}
+
+fn static_entry(d: *Decoder, index: i64) -> header.Header ! io.Error {
+    if index < 0 || index >= d.statics.len {
+        fail Malformed
+    }
+    d.statics[index]
+}
+
+fn dynamic_entry(d: *Decoder, absolute: i64) -> header.Header ! io.Error {
+    if absolute < d.evicted || absolute >= insert_count(d) {
+        fail Malformed
+    }
+    d.entries[absolute - d.evicted]
+}
+
+fn pending_limit() -> i64 {
+    65536
+}
+
+fn string_limit(d: *Decoder) -> i64 {
+    if d.max_capacity < pending_limit() {
+        return d.max_capacity
+    }
+    pending_limit()
+}
+
+fn apply_instruction(d: *Decoder, buf: []u8, mut at: i64) ! io.Error {
+    let c = buf[at]
+    let limit = string_limit(d)
+    if c & 0x80 != 0 {
+        let from_static = c & 0x40 != 0
+        let index = read_int(buf, mut at, 6)?
+        let value = read_string(buf, mut at, 8, limit)?
+        var name = ""
+        if from_static {
+            name = static_entry(d, index)?.name
+        } else {
+            name = dynamic_entry(d, insert_count(d) - 1 - index)?.name
+        }
+        insert(d, header.Header { name, value })?
+    } else if c & 0x40 != 0 {
+        let name = read_string(buf, mut at, 6, limit)?
+        let value = read_string(buf, mut at, 8, limit)?
+        insert(d, header.Header { name, value })?
+    } else if c & 0x20 != 0 {
+        let capacity = read_int(buf, mut at, 5)?
+        if capacity > d.max_capacity {
+            fail Malformed
+        }
+        d.capacity = capacity
+        evict_to(d, capacity)
+    } else {
+        let index = read_int(buf, mut at, 5)?
+        let source = dynamic_entry(d, insert_count(d) - 1 - index)?
+        insert(d, source)?
+    }
+}
+
+fn try_instruction(d: *Decoder, buf: []u8, mut at: i64) -> bool ! io.Error {
+    apply_instruction(d, buf, mut at) catch {
+        Eof => return false
+        e => fail e
+    }
+    true
+}
+
+fn release_ready(d: *Decoder) -> []i64 {
+    var ready: []i64 = []
+    var still: []Waiting = []
+    let inserted = insert_count(d)
+    for w in d.waiting {
+        if w.required <= inserted {
+            push(mut ready, w.stream)
+        } else {
+            push(mut still, w)
+        }
+    }
+    d.waiting = still
+    ready
+}
+
+/// Consumes bytes of the peer's encoder stream and returns the streams that were blocked and can now be decoded.
+///
+/// The instructions are Set Dynamic Table Capacity, Insert With Name Reference (static or dynamic), Insert With Literal Name and Duplicate. An instruction may be split across calls: the unparsed tail is kept and joined to the next call's data. The tail is never larger than 65536 bytes, and no string in an instruction may declare a longer length, so a peer cannot make the decoder buffer more.
+///
+/// The returned stream IDs are those `decode` reported as `Blocked` whose Required Insert Count the table has now reached, in the order they became blocked. Each is returned once. The caller decodes its stored section for each stream again.
+///
+/// Fails `Malformed`, which the caller reports as `QPACK_ENCODER_STREAM_ERROR`, for a capacity above `max_capacity`, an entry larger than the capacity, a static index past the table, a dynamic index that was evicted or never inserted, an integer over 2^62-1, a string longer than its limit, invalid Huffman data and a tail over the buffer limit.
+pub fn on_encoder_stream(d: *Decoder, data: []u8) -> []i64 ! io.Error {
+    let buf = slices.concat(d.pending, data)
+    var at = 0
+    for at < buf.len {
+        let start = at
+        let complete = try_instruction(d, buf, mut at)?
+        if !complete {
+            at = start
+            break
+        }
+    }
+    let tail = buf[at..]
+    if tail.len > pending_limit() {
+        fail Malformed
+    }
+    d.pending = tail
+    release_ready(d)
+}
+
+fn required_insert_count(d: *Decoder, encoded: i64) -> i64 ! io.Error {
+    if encoded == 0 {
+        return 0
+    }
+    let max_entries = d.max_capacity / 32
+    let full_range = 2 * max_entries
+    if encoded > full_range {
+        fail Malformed
+    }
+    let max_value = insert_count(d) + max_entries
+    let max_wrapped = max_value / full_range * full_range
+    var required = max_wrapped + encoded - 1
+    if required > max_value {
+        if required <= full_range {
+            fail Malformed
+        }
+        required -= full_range
+    }
+    if required == 0 {
+        fail Malformed
+    }
+    required
+}
+
+fn read_prefix(d: *Decoder, block: []u8, mut at: i64) -> Prefix ! io.Error {
+    let encoded = read_int(block, mut at, 8)?
+    let required = required_insert_count(d, encoded)?
+    if at >= block.len {
+        fail Eof
+    }
+    let negative = block[at] & 0x80 != 0
+    let delta = read_int(block, mut at, 7)?
+    if !negative {
+        return Prefix { required, base: required + delta }
+    }
+    if required <= delta {
+        fail Malformed
+    }
+    Prefix { required, base: required - delta - 1 }
+}
+
+fn reference(d: *Decoder, p: Prefix, absolute: i64) -> header.Header ! io.Error {
+    if absolute >= p.required {
+        fail Malformed
+    }
+    dynamic_entry(d, absolute)?
+}
+
+fn post_base(d: *Decoder, p: Prefix, index: i64) -> header.Header ! io.Error {
+    if p.base >= p.required || index >= p.required - p.base {
+        fail Malformed
+    }
+    dynamic_entry(d, p.base + index)?
+}
+
+fn read_line(d: *Decoder, p: Prefix, block: []u8, mut at: i64) -> header.Header ! io.Error {
+    let c = block[at]
+    let limit = block.len
+    if c & 0x80 != 0 {
+        let index = read_int(block, mut at, 6)?
+        if c & 0x40 != 0 {
+            return static_entry(d, index)?
+        }
+        return reference(d, p, p.base - 1 - index)?
+    }
+    if c & 0xC0 == 0x40 {
+        let index = read_int(block, mut at, 4)?
+        var name = ""
+        if c & 0x10 != 0 {
+            name = static_entry(d, index)?.name
+        } else {
+            name = reference(d, p, p.base - 1 - index)?.name
+        }
+        let value = read_string(block, mut at, 8, limit)?
+        return header.Header { name, value }
+    }
+    if c & 0xE0 == 0x20 {
+        let name = read_string(block, mut at, 4, limit)?
+        let value = read_string(block, mut at, 8, limit)?
+        return header.Header { name, value }
+    }
+    if c & 0xF0 == 0x10 {
+        let index = read_int(block, mut at, 4)?
+        return post_base(d, p, index)?
+    }
+    let index = read_int(block, mut at, 3)?
+    let name = post_base(d, p, index)?.name
+    let value = read_string(block, mut at, 8, limit)?
+    header.Header { name, value }
+}
+
+fn read_lines(d: *Decoder, p: Prefix, block: []u8, mut at: i64) -> []header.Header ! io.Error {
+    var fields: []header.Header = []
+    var size = 0
+    for at < block.len {
+        let h = read_line(d, p, block, mut at)?
+        size += entry_size(h)
+        if size > d.section_limit {
+            fail TooLarge
+        }
+        push(mut fields, h)
+    }
+    fields
+}
+
+fn forget_waiting(d: *Decoder, stream: i64) {
+    var still: []Waiting = []
+    for w in d.waiting {
+        if w.stream != stream {
+            push(mut still, w)
+        }
+    }
+    d.waiting = still
+}
+
+fn wait_for(d: *Decoder, stream: i64, required: i64) ! io.Error {
+    for i, w in d.waiting {
+        if w.stream == stream {
+            d.waiting[i] = Waiting { stream, required }
+            return
+        }
+    }
+    if d.waiting.len >= d.max_blocked {
+        fail Malformed
+    }
+    push(mut d.waiting, Waiting { stream, required })
+}
+
+/// Decodes one encoded field section read from `stream`, which is a non-negative QUIC stream ID.
+///
+/// Returns `Fields` with the field lines in order. When the section's Required Insert Count is above `insert_count`, returns `Blocked` and records the stream as blocked; the caller keeps the section bytes and decodes them again once `on_encoder_stream` lists the stream. A blocked section is parsed only as far as its prefix, so its field lines are checked on the second call.
+///
+/// After a section whose Required Insert Count is not zero is decoded, a Section Acknowledgment for `stream` is queued for `take_decoder_stream`.
+///
+/// Fails `Malformed`, which the caller reports as `QPACK_DECOMPRESSION_FAILED`, for a truncated section, an integer over 2^62-1, an invalid Required Insert Count encoding, a Base below zero, an index past the static table, a dynamic reference that is evicted, at or above the Required Insert Count or relative to a Base it underflows, a string that runs past the section, invalid Huffman data, and a block that would exceed `max_blocked` blocked streams. Fails `TooLarge` when the decoded field section would exceed `max_field_section_size`; the decoder stops before building more than that.
+pub fn decode(d: *Decoder, stream: i64, block: []u8) -> Decoded ! io.Error {
+    var at = 0
+    let p = read_prefix(d, block, mut at) catch {
+        Eof => fail Malformed
+        e => fail e
+    }
+    if p.required > insert_count(d) {
+        wait_for(d, stream, p.required)?
+        return Blocked
+    }
+    forget_waiting(d, stream)
+    let fields = read_lines(d, p, block, mut at) catch {
+        Eof => fail Malformed
+        e => fail e
+    }
+    if p.required > 0 {
+        put_int(mut d.queued, 0x80, 7, stream)
+        if p.required > d.known {
+            d.known = p.required
+        }
+    }
+    Fields(fields)
+}
+
+/// Records that `stream` was reset or abandoned before its field sections were all decoded, and queues a Stream Cancellation for the peer's encoder.
+///
+/// A blocked section of the stream is forgotten and no longer counts against `max_blocked`. When `max_capacity` is 0 the encoder cannot hold references and no instruction is queued.
+pub fn cancel_stream(d: *Decoder, stream: i64) {
+    forget_waiting(d, stream)
+    if d.max_capacity > 0 {
+        put_int(mut d.queued, 0x40, 6, stream)
+    }
+}
+
+/// Returns the bytes to write to the decoder stream and clears them.
+///
+/// They are the Section Acknowledgments and Stream Cancellations queued since the last call, in order, followed by one Insert Count Increment covering the insertions the peer has not yet been told about, either by an increment or by the Required Insert Count of an acknowledged section. The result is empty when nothing is owed. Call it after `on_encoder_stream`, `decode` and `cancel_stream`.
+pub fn take_decoder_stream(d: *Decoder) -> []u8 {
+    var out = d.queued
+    d.queued = []
+    let inserted = insert_count(d)
+    if inserted > d.known {
+        put_int(mut out, 0, 6, inserted - d.known)
+        d.known = inserted
+    }
+    out
+}

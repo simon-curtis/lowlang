@@ -1,0 +1,92 @@
+import std/header
+import std/io
+import std/slices
+import std/text
+
+/// A QPACK encoder (RFC 9204) that uses only the static table.
+///
+/// It never inserts into the dynamic table and writes nothing to the encoder stream, so every field section it produces has a Required Insert Count of 0 and can be decoded at once. A peer decoder needs no `SETTINGS_QPACK_MAX_TABLE_CAPACITY` for it. The caller feeds the bytes it reads from the peer's decoder stream to `on_decoder_stream`.
+pub struct Encoder {
+    statics: []header.Header
+    pending: []u8
+}
+
+/// Returns an encoder.
+pub fn encoder() -> *Encoder {
+    new(Encoder { statics: static_table(), pending: [] })
+}
+
+/// Encodes `fields` as one field section and returns its bytes.
+///
+/// The name of each field is lowercased. A field that equals a static table entry is written as an indexed field line, a field whose name is in the static table as a literal with a name reference, and any other as a literal with a literal name. A string is Huffman coded when that is shorter. The section starts with a Required Insert Count of 0 and a Base of 0. An empty `fields` gives the two prefix bytes alone.
+pub fn encode(e: *Encoder, fields: []header.Header) -> []u8 {
+    var out: []u8 = [0, 0]
+    for f in fields {
+        let name = text.lower(f.name)
+        var name_index = -1
+        var exact_index = -1
+        for i, s in e.statics {
+            if s.name == name {
+                if name_index < 0 {
+                    name_index = i
+                }
+                if s.value == f.value {
+                    exact_index = i
+                    break
+                }
+            }
+        }
+        if exact_index >= 0 {
+            put_int(mut out, 0xC0, 6, exact_index)
+            continue
+        }
+        if name_index >= 0 {
+            put_int(mut out, 0x50, 4, name_index)
+        } else {
+            put_string(mut out, 0x20, 4, name)
+        }
+        put_string(mut out, 0, 8, f.value)
+    }
+    out
+}
+
+fn apply_decoder_instruction(buf: []u8, mut at: i64) ! io.Error {
+    let c = buf[at]
+    if c & 0x80 != 0 {
+        read_int(buf, mut at, 7)?
+        fail Malformed
+    }
+    if c & 0x40 != 0 {
+        read_int(buf, mut at, 6)?
+        return
+    }
+    read_int(buf, mut at, 6)?
+    fail Malformed
+}
+
+fn try_decoder_instruction(buf: []u8, mut at: i64) -> bool ! io.Error {
+    apply_decoder_instruction(buf, mut at) catch {
+        Eof => return false
+        e => fail e
+    }
+    true
+}
+
+/// Consumes bytes of the peer's decoder stream.
+///
+/// An instruction may be split across calls; the unparsed tail is kept. A Stream Cancellation is accepted and has no effect, because this encoder holds no references. Any other instruction contradicts what the encoder sent: a Section Acknowledgment names a section with no dynamic table references, and an Insert Count Increment, whatever its value, exceeds the zero insertions made.
+///
+/// Fails `Malformed`, which the caller reports as `QPACK_DECODER_STREAM_ERROR`, for a Section Acknowledgment, an Insert Count Increment, or an integer over 2^62-1.
+pub fn on_decoder_stream(e: *Encoder, data: []u8) ! io.Error {
+    let buf = slices.concat(e.pending, data)
+    var at = 0
+    for at < buf.len {
+        let start = at
+        let complete = try_decoder_instruction(buf, mut at)?
+        if !complete {
+            at = start
+            break
+        }
+    }
+    e.pending = buf[at..]
+}

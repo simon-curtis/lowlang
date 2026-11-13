@@ -1,0 +1,279 @@
+import std/cancel
+import std/header
+import std/http/qpack
+import std/io
+import std/quic
+import std/text
+
+/// Accepts QUIC connections from `l` and serves each on its own green thread over HTTP/3, calling `handler` for every request.
+///
+/// Blocks until accepting fails and returns that error, which is `NotConnected` once the listener is closed. The listener's `config.tls.alpn` should be `["h3"]`; a connection that negotiated another protocol is closed with `H3_GENERAL_PROTOCOL_ERROR`. Each request stream runs on its own green thread, and a connection runs at most the listener's `config.max_streams` handlers at a time: the next request stream is not accepted until one of them has returned and written its response, so the QUIC stream credit of the peer stays held back meanwhile. A request that is malformed, or that carries a body over 64 MiB, is answered by resetting its stream with `H3_MESSAGE_ERROR` or `H3_EXCESSIVE_LOAD` and the handler is not called; a field section over 64 KiB is answered with `431`; a protocol violation on a connection closes that connection with the matching HTTP/3 error code. `Request.token` is cancelled when the response is complete, when a write of the response fails because the client stopped or reset the stream, and when the connection ends; a client that stops the stream while the handler is still running is not noticed until the handler's response is written. The server sends no push, accepts no extended `CONNECT` and no HTTP datagrams, and uses only the static QPACK table for the field sections it sends. Errors on one connection never reach the caller.
+pub fn serve_quic(l: quic.Listener, handler: fn(Request) -> Response) ! io.Error {
+    serve_quic_on(l.handle, handler)?
+}
+
+/// Serves HTTP/3 as `serve_quic` does, accepting from a `ListenerHandle`.
+pub fn serve_quic_on(l: *quic.ListenerHandle, handler: fn(Request) -> Response) ! io.Error {
+    for {
+        let h = quic.accept_handle(l)?
+        spawn serve_h3(h, handler, l.config.max_streams)
+    }
+}
+
+enum RequestPhase {
+    Start
+    Body
+    Done
+}
+
+enum ReadStep {
+    More
+    Complete
+    Abandoned
+}
+
+struct InboundRequest {
+    id: i64
+    phase: RequestPhase
+    fields: []header.Header
+    body: []u8
+}
+
+fn serve_h3(h: *quic.ConnectionHandle, handler: fn(Request) -> Response, max_handlers: i64) {
+    using owner = quic.adopt(h)
+    if h.protocol != "h3" {
+        quic.close_on(h, h3_general_protocol_error(), "")
+        return
+    }
+    let c = open_h3(h, false) catch {
+        _ => return
+    }
+    spawn watch_peer_streams(c)
+    accept_requests(c, handler, max_handlers)
+    cancel.cancel(c.token)
+}
+
+fn watch_peer_streams(c: *H3) {
+    accept_uni(c)
+    cancel.cancel(c.token)
+}
+
+fn accept_requests(c: *H3, handler: fn(Request) -> Response, max_handlers: i64) {
+    let capacity = if max_handlers < 1 { 1 } else { max_handlers }
+    let slots = chan[bool](capacity)
+    let gone = cancel.done(c.token)
+    for {
+        select {
+            slots <- true => {}
+            <-gone => return
+        }
+        let s = quic.accept_stream_on(c.handle) catch {
+            _ => {
+                <-slots
+                return
+            }
+        }
+        spawn serve_request(c, s, handler, slots)
+    }
+}
+
+fn release_handler(slots: chan[bool]) {
+    <-slots
+}
+
+fn serve_request(c: *H3, s: quic.Stream, handler: fn(Request) -> Response, slots: chan[bool]) {
+    defer release_handler(slots)
+    let token = cancel.child(c.token)
+    defer cancel.cancel(token)
+    let r = io.reader(quic.stream(s))
+    let p = new(InboundRequest { id: s.id, phase: Start, fields: [], body: [] })
+    for {
+        match read_step(c, s, r, p) {
+            More => {}
+            Complete => break
+            Abandoned => return
+        }
+    }
+    answer(c, s, p, token, handler)
+}
+
+fn interrupted(c: *H3, s: quic.Stream, e: io.Error) -> ReadStep {
+    match e {
+        Reset => {
+            quic.reset(s, h3_request_cancelled())
+            abandon_section(c, s.id)
+        }
+        Malformed => close_with(c, h3_frame_error())
+        _ => {}
+    }
+    Abandoned
+}
+
+fn read_step(c: *H3, s: quic.Stream, r: *io.Reader, p: *InboundRequest) -> ReadStep {
+    let head = read_h3_head(r) catch {
+        e => return interrupted(c, s, e)
+    }
+    let h = match head {
+        some(x) => x
+        none => return Complete
+    }
+    if h.kind == h3_frame_data() {
+        return step_data(c, s, r, p, h.length)
+    }
+    if h.kind == h3_frame_headers() {
+        return step_headers(c, s, r, p, h.length)
+    }
+    if unexpected_on_request(h.kind) {
+        close_with(c, h3_frame_unexpected())
+        return Abandoned
+    }
+    skip_h3(r, h.length) catch {
+        e => return interrupted(c, s, e)
+    }
+    More
+}
+
+fn step_data(c: *H3, s: quic.Stream, r: *io.Reader, p: *InboundRequest, length: i64) -> ReadStep {
+    if p.phase != Body {
+        close_with(c, h3_frame_unexpected())
+        return Abandoned
+    }
+    if p.body.len + length > max_body() {
+        abort_stream(c, s, h3_excessive_load())
+        return Abandoned
+    }
+    read_h3_data(r, length, mut p.body) catch {
+        e => return interrupted(c, s, e)
+    }
+    More
+}
+
+fn step_headers(c: *H3, s: quic.Stream, r: *io.Reader, p: *InboundRequest, length: i64) -> ReadStep {
+    if p.phase == Done {
+        close_with(c, h3_frame_unexpected())
+        return Abandoned
+    }
+    let block = read_h3_block(r, length, h3_max_field_section()) catch {
+        TooLarge => {
+            close_with(c, h3_excessive_load())
+            return Abandoned
+        }
+        e => return interrupted(c, s, e)
+    }
+    let fields = decode_fields(c, s.id, block, chan[bool]()) catch {
+        TooLarge => return oversized_section(c, s)
+        _ => return Abandoned
+    }
+    if p.phase == Start {
+        if !valid_h3_request(fields) {
+            abort_stream(c, s, h3_message_error())
+            return Abandoned
+        }
+        p.fields = fields
+        p.phase = Body
+        return More
+    }
+    if !valid_h3_trailers(fields) {
+        abort_stream(c, s, h3_message_error())
+        return Abandoned
+    }
+    p.phase = Done
+    More
+}
+
+fn oversized_section(c: *H3, s: quic.Stream) -> ReadStep {
+    let denied = response(431, status_text(431))
+    send_response(c, s, "GET", denied, cancel.token()) catch {
+        _ => {}
+    }
+    quic.stop(s, h3_no_error())
+    abandon_section(c, s.id)
+    Abandoned
+}
+
+fn answer(c: *H3, s: quic.Stream, p: *InboundRequest, token: *cancel.Token, handler: fn(Request) -> Response) {
+    if p.phase == Start || !h3_length_matches(p.fields, p.body.len) {
+        abort_stream(c, s, h3_message_error())
+        return
+    }
+    var req = request_of(p.fields, p.body, Http3) catch {
+        _ => {
+            abort_stream(c, s, h3_message_error())
+            return
+        }
+    }
+    req.remote = c.remote
+    req.token = token
+    let produced = traced(handler, req)
+    let outgoing = unstreamed(req.method, produced, token)
+    send_response(c, s, req.method, outgoing, token) catch {
+        _ => {}
+    }
+}
+
+fn send_response(c: *H3, s: quic.Stream, method: str, resp: Response, token: *cancel.Token) ! io.Error {
+    var body = resp.body
+    if bodiless(method, resp.status) {
+        body = []
+    }
+    let chunks = resp.stream
+    var fields: []header.Header = [header.Header { name: ":status", value: "{resp.status}" }]
+    for h in resp.headers {
+        let name = text.lower(h.name)
+        if !connection_specific(name) && !pseudo_name(name) {
+            push(mut fields, header.Header { name, value: h.value })
+        }
+    }
+    if !header.has(resp.headers, "content-length") && !streaming(resp) {
+        push(mut fields, header.Header { name: "content-length", value: "{body.len}" })
+    }
+    var out: []u8 = []
+    put_h3_frame(mut out, h3_frame_headers(), qpack.encode(c.encoder, fields))
+    if body.len > 0 {
+        put_h3_head(mut out, h3_frame_data(), body.len)
+    }
+    quic.write(s, out)?
+    if body.len > 0 {
+        quic.write(s, body)?
+    }
+    match chunks {
+        some(channel) => relay_chunks(s, channel, token)?
+        none => {}
+    }
+    var trailers: []header.Header = []
+    for h in resp.trailers {
+        let name = text.lower(h.name)
+        if !connection_specific(name) && !pseudo_name(name) {
+            push(mut trailers, header.Header { name, value: h.value })
+        }
+    }
+    if trailers.len > 0 {
+        var tail: []u8 = []
+        put_h3_frame(mut tail, h3_frame_headers(), qpack.encode(c.encoder, trailers))
+        quic.write(s, tail)?
+    }
+    quic.finish(s)?
+}
+
+fn relay_chunks(s: quic.Stream, chunks: chan[[]u8], token: *cancel.Token) ! io.Error {
+    let gone = cancel.done(token)
+    for {
+        select {
+            part = <-chunks => match part {
+                some(data) => send_chunk(s, data)?
+                none => break
+            }
+            <-gone => break
+        }
+    }
+}
+
+fn send_chunk(s: quic.Stream, data: []u8) ! io.Error {
+    if data.len == 0 {
+        return
+    }
+    var head: []u8 = []
+    put_h3_head(mut head, h3_frame_data(), data.len)
+    quic.write(s, head)?
+    quic.write(s, data)?
+}

@@ -1,0 +1,429 @@
+import std/crypto/hash
+import std/io
+import std/quic/recovery
+import std/quic/wire
+import std/time
+import std/tls
+
+fn max_crypto_buffer() -> i64 {
+    65536
+}
+
+fn max_crypto_chunks() -> i64 {
+    64
+}
+
+fn max_waiting() -> i64 {
+    16
+}
+
+fn max_ack_ranges() -> i64 {
+    32
+}
+
+fn max_ack_frame_ranges() -> i64 {
+    256
+}
+
+fn on_datagram(c: *Conn, d: Datagram) {
+    if !same_peer(c.peer, d.from) {
+        return
+    }
+    c.bytes_received += d.data.len
+    match c.phase {
+        Closing => {
+            on_datagram_closing(c)
+            return
+        }
+        Draining => return
+        Open => {}
+    }
+    var at = 0
+    for at < d.data.len && !ended(c) {
+        let h = wire.parse_header(d.data, at, cid_length()) catch {
+            _ => break
+        }
+        if h.size <= 0 || at + h.size > d.data.len {
+            break
+        }
+        process_packet(c, d.data[at..at + h.size], h, d.received)
+        at += h.size
+    }
+    answer_parked(c)
+}
+
+fn level_of(kind: wire.PacketKind) -> tls.Level? {
+    match kind {
+        Initial => some(tls.Level.Initial)
+        Handshake => some(tls.Level.Handshake)
+        Short => some(tls.Level.Application)
+        _ => none
+    }
+}
+
+fn max_retry_token() -> i64 {
+    512
+}
+
+fn on_unprotected(c: *Conn, packet: []u8, h: wire.Header) {
+    match h.kind {
+        Retry => on_retry(c, packet, h)
+        VersionNegotiation => on_version_negotiation(c, h)
+        _ => {}
+    }
+}
+
+fn on_retry(c: *Conn, packet: []u8, h: wire.Header) {
+    if c.server || c.packets_received > 0 || present(c.retry_scid) {
+        return
+    }
+    if h.token.len == 0 || h.token.len > max_retry_token() {
+        return
+    }
+    if hash.equal(h.scid, c.dcid) || !wire.retry_valid(c.original_dcid, packet) {
+        return
+    }
+    set_dcid(c, h.scid)
+    c.retry_scid = some(h.scid)
+    c.token = h.token
+    let space = c.initial
+    space.read = some(wire.initial_keys(h.scid, !c.server))
+    space.write = some(wire.initial_keys(h.scid, c.server))
+    space.sent = [:]
+    space.crypto_resend = []
+    space.crypto_sent = 0
+    recovery.discard_space(c.recovery, recovery.Space.Initial, time.monotonic())
+}
+
+fn on_version_negotiation(c: *Conn, h: wire.Header) {
+    if c.server || c.packets_received > 0 || present(c.retry_scid) {
+        return
+    }
+    if !hash.equal(h.dcid, c.scid) || !hash.equal(h.scid, c.dcid) {
+        return
+    }
+    for version in h.versions {
+        if version == wire.version1() {
+            return
+        }
+    }
+    answer_ready(c, some(Unsupported))
+    end_silently(c, Unsupported)
+}
+
+fn buffer_packet(c: *Conn, packet: []u8, h: wire.Header, received: i64) {
+    if c.waiting.len >= max_waiting() {
+        return
+    }
+    push(mut c.waiting, Waiting { packet, header: h, received })
+}
+
+fn process_waiting(c: *Conn) {
+    let pending = c.waiting
+    c.waiting = []
+    for w in pending {
+        if ended(c) {
+            return
+        }
+        process_packet(c, w.packet, w.header, w.received)
+    }
+}
+
+fn process_packet(c: *Conn, packet: []u8, h: wire.Header, received: i64) {
+    let level = match level_of(h.kind) {
+        some(l) => l
+        none => {
+            on_unprotected(c, packet, h)
+            return
+        }
+    }
+    let space = space_of(c, level)
+    if space.discarded {
+        return
+    }
+    let keys = match space.read {
+        some(k) => k
+        none => {
+            buffer_packet(c, packet, h, received)
+            return
+        }
+    }
+    let opened = match open_packet(c, space, keys, packet, h) {
+        some(o) => o
+        none => {
+            if h.kind == wire.PacketKind.Short && !ended(c) {
+                check_stateless_reset(c, packet)
+            }
+            return
+        }
+    }
+    accept_packet(c, level, space, h, opened, received)
+}
+
+fn handshake_frames_only(frames: []wire.Frame) -> bool {
+    for f in frames {
+        let allowed = match f {
+            Padding(_) => true
+            Ping => true
+            Ack(_) => true
+            Crypto(_, _) => true
+            ConnectionClose(close) => !close.application
+            _ => false
+        }
+        if !allowed {
+            return false
+        }
+    }
+    true
+}
+
+fn accept_packet(c: *Conn, level: tls.Level, space: *Space, h: wire.Header, o: wire.Opened, received: i64) {
+    if has_received(space, o.number) || below_tracked(space, o.number) {
+        return
+    }
+    if o.reserved_bits_set {
+        fail_connection(c, wire.protocol_violation(), 0, "reserved bits set")
+        return
+    }
+    let frames = wire.parse_frames(o.payload) catch {
+        _ => {
+            fail_connection(c, wire.frame_encoding_error(), 0, "malformed frame")
+            return
+        }
+    }
+    if level != tls.Level.Application && !handshake_frames_only(frames) {
+        fail_connection(c, wire.protocol_violation(), 0, "frame not allowed at this level")
+        return
+    }
+    c.packets_received += 1
+    if c.server && level == tls.Level.Handshake {
+        c.validated = true
+        discard_keys(c, tls.Level.Initial)
+    }
+    if !c.server && level == tls.Level.Initial && !c.dcid_switched {
+        set_dcid(c, h.scid)
+        c.dcid_switched = true
+    }
+    let in_order = o.number == space.largest_received + 1
+    record_received(space, o.number, received)
+    note_received(c, received)
+    var eliciting = false
+    for f in frames {
+        if wire.ack_eliciting(f) {
+            eliciting = true
+        }
+        on_frame(c, level, space, f)
+        if ended(c) {
+            return
+        }
+    }
+    if eliciting {
+        note_eliciting(level, space, received, in_order)
+    }
+}
+
+fn below_tracked(space: *Space, number: i64) -> bool {
+    if space.received.len < max_ack_ranges() {
+        return false
+    }
+    number < space.received[space.received.len - 1].smallest
+}
+
+fn has_received(space: *Space, number: i64) -> bool {
+    for r in space.received {
+        if number >= r.smallest && number <= r.largest {
+            return true
+        }
+    }
+    false
+}
+
+fn record_received(space: *Space, number: i64, received: i64) {
+    if number > space.largest_received {
+        space.largest_received = number
+        space.largest_received_time = received
+    }
+    var merged: []wire.AckRange = []
+    var current = wire.AckRange { smallest: number, largest: number }
+    var placed = false
+    for r in space.received {
+        if r.smallest > current.largest + 1 {
+            push(mut merged, r)
+        } else if r.largest + 1 < current.smallest {
+            if !placed {
+                push(mut merged, current)
+                placed = true
+            }
+            push(mut merged, r)
+        } else {
+            let low = least(current.smallest, r.smallest)
+            let high = if current.largest > r.largest { current.largest } else { r.largest }
+            current = wire.AckRange { smallest: low, largest: high }
+        }
+    }
+    if !placed {
+        push(mut merged, current)
+    }
+    if merged.len > max_ack_ranges() {
+        truncate(mut merged, max_ack_ranges())
+    }
+    space.received = merged
+}
+
+fn on_frame(c: *Conn, level: tls.Level, space: *Space, f: wire.Frame) {
+    match f {
+        Padding(_) => {}
+        Ping => {}
+        Ack(a) => on_ack_frame(c, level, space, a)
+        Crypto(offset, data) => on_crypto_frame(c, level, space, offset, data)
+        ConnectionClose(close) => on_peer_close(c, close)
+        HandshakeDone => on_handshake_done(c)
+        PathChallenge(data) => on_path_challenge(c, data)
+        NewToken(_) => {
+            if c.server {
+                fail_connection(c, wire.protocol_violation(), 0x07, "NEW_TOKEN from a client")
+            }
+        }
+        _ => on_other_frame(c, f)
+    }
+}
+
+fn on_other_frame(c: *Conn, f: wire.Frame) {
+    match f {
+        Stream(_) => on_stream_frame(c, f)
+        ResetStream(_, _, _) => on_stream_frame(c, f)
+        StopSending(_, _) => on_stream_frame(c, f)
+        MaxData(_) => on_flow_frame(c, f)
+        MaxStreamData(_, _) => on_flow_frame(c, f)
+        MaxStreams(_, _) => on_flow_frame(c, f)
+        DataBlocked(_) => on_flow_frame(c, f)
+        StreamDataBlocked(_, _) => on_flow_frame(c, f)
+        StreamsBlocked(_, _) => on_flow_frame(c, f)
+        NewConnectionId(_, _, _, _) => on_connection_id_frame(c, f)
+        RetireConnectionId(_) => on_connection_id_frame(c, f)
+        PathResponse(_) => on_path_response(c, f)
+        _ => {}
+    }
+}
+
+fn on_path_response(c: *Conn, f: wire.Frame) {
+}
+
+fn on_ack_frame(c: *Conn, level: tls.Level, space: *Space, a: wire.AckFrame) {
+    var ranges: []recovery.AckRange = []
+    let count = least(a.ranges.len, max_ack_frame_ranges())
+    for i in 0..count {
+        let r = a.ranges[i]
+        push(mut ranges, recovery.AckRange { smallest: r.smallest, largest: r.largest })
+    }
+    let exponent = match c.peer_parameters {
+        some(p) => p.ack_delay_exponent
+        none => 3
+    }
+    let delay = wire.ack_delay_ns(a, exponent)
+    let result = recovery.on_ack(c.recovery, rspace(level), ranges, delay, time.monotonic()) catch {
+        _ => {
+            fail_connection(c, wire.protocol_violation(), 0x02, "invalid acknowledgment")
+            return
+        }
+    }
+    for p in result.acked {
+        match space.sent[p.number] {
+            some(sent) => on_stream_acked(c, sent)
+            none => {}
+        }
+        delete(mut space.sent, p.number)
+    }
+    on_packets_lost(c, level, result.lost)
+    if level == tls.Level.Application {
+        on_application_ack(c, a.largest)
+    }
+}
+
+fn on_crypto_frame(c: *Conn, level: tls.Level, space: *Space, offset: i64, data: []u8) {
+    if level == tls.Level.Application && c.handshake_complete {
+        return
+    }
+    let end = offset + data.len
+    if end > space.crypto_in_next + max_crypto_buffer() {
+        crypto_overflow(c)
+        return
+    }
+    if end <= space.crypto_in_next {
+        return
+    }
+    var at = offset
+    var body = data
+    if offset < space.crypto_in_next {
+        body = data[space.crypto_in_next - offset..]
+        at = space.crypto_in_next
+    }
+    if at == space.crypto_in_next {
+        append_ready(c, space, body)
+        drain_chunks(c, space)
+        return
+    }
+    hold_chunk(c, space, at, body)
+}
+
+fn crypto_overflow(c: *Conn) {
+    fail_connection(c, wire.crypto_buffer_exceeded(), 0x06, "crypto buffer exceeded")
+}
+
+fn append_ready(c: *Conn, space: *Space, body: []u8) {
+    if space.crypto_ready.len + body.len > max_crypto_buffer() {
+        crypto_overflow(c)
+        return
+    }
+    io.append(mut space.crypto_ready, body)
+    space.crypto_in_next += body.len
+}
+
+fn hold_chunk(c: *Conn, space: *Space, at: i64, body: []u8) {
+    let known = space.crypto_in_chunks[at]
+    match known {
+        some(_) => return
+        none => {}
+    }
+    if space.crypto_in_chunks.len >= max_crypto_chunks() {
+        crypto_overflow(c)
+        return
+    }
+    let copy = io.buffer(body.len)
+    io.copy(copy, body)
+    space.crypto_in_chunks[at] = copy
+}
+
+fn drain_chunks(c: *Conn, space: *Space) {
+    for !c.finished {
+        var taken = -1
+        for offset, chunk in space.crypto_in_chunks {
+            if offset <= space.crypto_in_next {
+                taken = offset
+                break
+            }
+        }
+        if taken < 0 {
+            return
+        }
+        let chunk = space.crypto_in_chunks[taken] ?? []
+        delete(mut space.crypto_in_chunks, taken)
+        if taken + chunk.len > space.crypto_in_next {
+            append_ready(c, space, chunk[space.crypto_in_next - taken..])
+        }
+    }
+}
+
+fn on_handshake_done(c: *Conn) {
+    if c.server {
+        fail_connection(c, wire.protocol_violation(), 0x1e, "HANDSHAKE_DONE from a client")
+        return
+    }
+    confirm_handshake(c)
+}
+
+fn on_path_challenge(c: *Conn, data: []u8) {
+    let copy = io.buffer(data.len)
+    io.copy(copy, data)
+    c.path_response = some(copy)
+}

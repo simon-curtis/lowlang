@@ -1,0 +1,615 @@
+import std/crypto/hash
+import std/io
+import std/quic/wire
+import std/text
+import std/tls
+
+struct Tally {
+    header_failed: i64
+    open_failed: i64
+    frames_failed: i64
+    parsed: i64
+    other: i64
+}
+
+fn hex(s: str) -> []u8 {
+    let empty: []u8 = []
+    text.decode_hex(s) or empty
+}
+
+fn show(b: []u8) -> str {
+    text.encode_hex(b)
+}
+
+fn check(name: str, got: []u8, want: str) {
+    let expected = hex(want)
+    if hash.equal(got, expected) {
+        print("{name} ok")
+    } else {
+        print("{name} MISMATCH {show(got)} want {want}")
+    }
+}
+
+fn expect(name: str, got: i64, want: i64) {
+    if got == want {
+        print("{name} {got}")
+    } else {
+        print("{name} MISMATCH {got} want {want}")
+    }
+}
+
+fn varints() ! io.Error {
+    for item in ["c2197c5eff14e88c", "9d7f3e7d", "7bbd", "25", "4025"] {
+        let c = wire.cursor(hex(item))
+        let v = wire.varint(c)?
+        var again: []u8 = []
+        wire.put_varint(mut again, v)
+        print("varint {item} = {v}, shortest {show(again)}, left {wire.left(c)}")
+    }
+    for v in [0, 63, 64, 16383, 16384, 1073741823, 1073741824, wire.max_varint()] {
+        var out: []u8 = []
+        wire.put_varint(mut out, v)
+        print("put_varint {v} size {wire.varint_size(v)} bytes {show(out)}")
+    }
+    var sized: []u8 = []
+    wire.put_varint_sized(mut sized, 37, 2)
+    wire.put_varint_sized(mut sized, 15293, 4)
+    wire.put_varint_sized(mut sized, 1, 8)
+    print("put_varint_sized {show(sized)}")
+    let c = wire.cursor(hex("4025"))
+    expect("max_varint", wire.max_varint(), 4611686018427387903)
+    let minimal = wire.varint(c)?
+    expect("varint 4025 minimal read", minimal, 37)
+    let short = wire.cursor(hex("9d7f3e"))
+    let truncated = wire.varint(short) or -1
+    expect("varint truncated", truncated, -1)
+}
+
+fn packet_numbers() {
+    expect("encode 0xac5c02 acked 0xabe8b3", wire.encode_packet_number(0xac5c02, 0xabe8b3), 2)
+    expect("encode 0xace8fe acked 0xabe8b3", wire.encode_packet_number(0xace8fe, 0xabe8b3), 3)
+    expect("encode 0 acked none", wire.encode_packet_number(0, -1), 1)
+    expect("encode 2^40 acked 0", wire.encode_packet_number(1099511627776, 0), 4)
+    let decoded = wire.decode_packet_number(0xa82f30ea, 0x9b32, 16)
+    print("decode 0xa82f30ea 0x9b32 16 = {decoded:x}")
+    expect("decode first packet", wire.decode_packet_number(-1, 0, 8), 0)
+    expect("decode wrap up", wire.decode_packet_number(255, 0, 8), 256)
+    expect("decode wrap down", wire.decode_packet_number(256, 255, 8), 255)
+    var out: []u8 = []
+    wire.put_packet_number(mut out, 0xa82f9b32, 2)
+    print("put_packet_number {show(out)}")
+}
+
+fn open_outcome(k: wire.Keys, packet: []u8, h: wire.Header, largest: i64) -> str {
+    let o = wire.open(k, packet, h, largest) catch {
+        e => return "{e}"
+    }
+    "opened {o.number}"
+}
+
+fn print_frames(payload: []u8) ! io.Error {
+    let frames = wire.parse_frames(payload)?
+    for f in frames {
+        match f {
+            Crypto(offset, data) => print("  crypto offset {offset} length {data.len}")
+            Padding(count) => print("  padding {count}")
+            Ack(a) => print("  ack largest {a.largest} delay {a.delay} ranges {a.ranges}")
+            _ => print("  {f}")
+        }
+    }
+}
+
+fn initial_vectors() ! io.Error {
+    let dcid = hex("8394c8f03e515708")
+    let client = wire.initial_keys(dcid, false)
+    let server = wire.initial_keys(dcid, true)
+    check("a1 client secret", client.secret, "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea")
+    check("a1 client key", client.key, "1f369613dd76d5467730efcbe3b1a22d")
+    check("a1 client iv", client.iv, "fa044b2f42a3fd3b46fb255c")
+    check("a1 client hp", client.hp, "9f50449e04a0e810283a1e9933adedd2")
+    check("a1 server secret", server.secret, "3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b")
+    check("a1 server key", server.key, "cf3a5331653c364c88f0f379b6067e37")
+    check("a1 server iv", server.iv, "0ac1493ca1905853b0bba03e")
+    check("a1 server hp", server.hp, "c206b8d9b9f0f37644430b490eeaa314")
+
+    let header = hex("c300000001088394c8f03e5157080000449e00000002")
+    var payload: []u8 = []
+    io.append(mut payload, hex(embed("std_quic_wire_a2_payload.hex")))
+    for payload.len < 1162 {
+        push(mut payload, 0)
+    }
+    expect("a2 payload length", payload.len, 1162)
+    let packet = wire.seal(client, header, 2, payload)
+    check("a2 packet", packet, embed("std_quic_wire_a2_packet.hex"))
+    check("a2 protected header", packet[..22], "c000000001088394c8f03e5157080000449e7b9aec34")
+    check("a2 sample", packet[22..38], "d1b1c98dd7689fb8ec11d242b123dc9b")
+    let h = wire.parse_header(packet, 0, 0)?
+    print("a2 header {h.kind} version {h.version} dcid {show(h.dcid)} scid {h.scid.len} token {h.token.len} pn_offset {h.pn_offset} size {h.size}")
+    let opened = wire.open(client, packet, h, -1)?
+    print("a2 opened number {opened.number} first byte {opened.first_byte:x} key phase {opened.key_phase} reserved {opened.reserved_bits_set}")
+    check("a2 payload", opened.payload, show(payload))
+    print_frames(opened.payload)?
+    print("a2 server keys {open_outcome(server, packet, h, -1)}")
+    var tampered: []u8 = []
+    io.append(mut tampered, packet)
+    tampered[600] = tampered[600] ^ 1
+    print("a2 tampered {open_outcome(client, tampered, h, -1)}")
+    print("a2 with large largest {open_outcome(client, packet, h, 100000)}")
+
+    let server_header = hex("c1000000010008f067a5502a4262b50040750001")
+    let server_payload = hex(embed("std_quic_wire_a3_payload.hex"))
+    let server_packet = wire.seal(server, server_header, 1, server_payload)
+    check("a3 packet", server_packet, embed("std_quic_wire_a3_packet.hex"))
+    check("a3 protected header", server_packet[..20], "cf000000010008f067a5502a4262b5004075c0d9")
+    check("a3 sample", server_packet[22..38], "2cd0991cd25b0aac406a5816b6394100")
+    let sh = wire.parse_header(server_packet, 0, 0)?
+    print("a3 header {sh.kind} dcid {sh.dcid.len} scid {show(sh.scid)} pn_offset {sh.pn_offset} size {sh.size}")
+    let server_opened = wire.open(server, server_packet, sh, 0)?
+    print("a3 opened number {server_opened.number}")
+    check("a3 payload", server_opened.payload, show(server_payload))
+    print_frames(server_opened.payload)?
+
+    var datagram: []u8 = []
+    io.append(mut datagram, server_packet)
+    io.append(mut datagram, server_packet)
+    let first = wire.parse_header(datagram, 0, 0)?
+    let second = wire.parse_header(datagram, first.size, 0)?
+    print("coalesced first size {first.size} second {second.kind} size {second.size} total {first.size + second.size} of {datagram.len}")
+}
+
+fn retry_vector() ! io.Error {
+    let dcid: []u8 = []
+    let scid = hex("f067a5502a4262b5")
+    let odcid = hex("8394c8f03e515708")
+    let packet = wire.retry_packet(1, dcid, scid, odcid, bytes("token"))
+    check("a4 retry packet", packet, "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba")
+    check("a4 tag", wire.retry_tag(odcid, packet[..packet.len - 16]), "04a265ba2eff4d829058fb3f0f2496ba")
+    let h = wire.parse_header(packet, 0, 0)?
+    print("a4 header {h.kind} version {h.version} dcid {h.dcid.len} scid {show(h.scid)} token {str(h.token)} tag {show(h.tag)} size {h.size}")
+    print("a4 valid {wire.retry_valid(odcid, packet)}")
+    var bad: []u8 = []
+    io.append(mut bad, packet)
+    bad[packet.len - 1] = bad[packet.len - 1] ^ 1
+    print("a4 flipped tag valid {wire.retry_valid(odcid, bad)}")
+    print("a4 other odcid valid {wire.retry_valid(scid, packet)}")
+    print("a4 short valid {wire.retry_valid(odcid, packet[..10])}")
+}
+
+fn chacha_vector() ! io.Error {
+    let secret = hex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b")
+    let k = wire.keys(tls.Suite.ChaCha20Poly1305, secret)?
+    check("a5 key", k.key, "c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8")
+    check("a5 iv", k.iv, "e0459b3474bdd0e44a41c144")
+    check("a5 hp", k.hp, "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4")
+    let next = wire.next_keys(k)?
+    check("a5 ku secret", next.secret, "1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9")
+    check("a5 ku hp kept", next.hp, show(k.hp))
+    let header = hex("4200bff4")
+    let packet = wire.seal(k, header, 654360564, hex("01"))
+    check("a5 packet", packet, "4cfe4189655e5cd55c41f69080575d7999c25a5bfb")
+    let h = wire.parse_header(packet, 0, 0)?
+    print("a5 header {h.kind} dcid {h.dcid.len} pn_offset {h.pn_offset} size {h.size}")
+    let opened = wire.open(k, packet, h, 654360000)?
+    print("a5 opened number {opened.number} payload {opened.payload} first byte {opened.first_byte:x} key phase {opened.key_phase}")
+    let peeked = wire.peek_key_phase(k, packet, h)?
+    print("a5 peek {peeked}")
+    let frames = wire.parse_frames(opened.payload)?
+    print("a5 frames {frames}")
+
+    let updated_header = hex("46000007")
+    let updated = wire.seal(next, updated_header, 7, hex("01"))
+    let uh = wire.parse_header(updated, 0, 0)?
+    let updated_phase = wire.peek_key_phase(k, updated, uh)?
+    print("ku peek {updated_phase}")
+    print("ku old keys {open_outcome(k, updated, uh, 6)}")
+    let ku = wire.open(next, updated, uh, 6)?
+    print("ku new keys number {ku.number} key phase {ku.key_phase} payload {ku.payload}")
+
+    let aes = wire.keys(tls.Suite.Aes256Gcm, hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"))?
+    let aes_packet = wire.seal(aes, hex("4000"), 0, hex("0102030405060708"))
+    let ah = wire.parse_header(aes_packet, 0, 0)?
+    let aes_opened = wire.open(aes, aes_packet, ah, -1)?
+    print("aes256 round trip {aes_opened.payload} number {aes_opened.number} key {aes.key.len} hp {aes.hp.len}")
+    let bad_secret = wire.keys(tls.Suite.Aes128Gcm, hex("0011")) or aes
+    print("keys wrong secret length {bad_secret.key.len}")
+}
+
+fn version_negotiation() ! io.Error {
+    let dcid = hex("0102030405060708")
+    let scid = hex("aabbcc")
+    let packet = wire.version_negotiation(dcid, scid, [1, 0x6b3343cf])
+    print("vn length {packet.len} long bit {packet[0] >> 7} version {show(packet[1..5])}")
+    let h = wire.parse_header(packet, 0, 0)?
+    print("vn header {h.kind} version {h.version} dcid {show(h.dcid)} scid {show(h.scid)} versions {h.versions} size {h.size}")
+    let unknown_hex = "c0deadbeef1e" + text.repeat("ab", 30) + "00ffff"
+    let unknown = hex(unknown_hex)
+    let u = wire.parse_header(unknown, 0, 0)?
+    print("unknown header {u.kind} version {u.version:x} dcid {u.dcid.len} scid {u.scid.len} size {u.size}")
+}
+
+fn header_cases() {
+    let cases = [
+        ["empty", ""],
+        ["initial with a 21 byte dcid", "c00000000115" + text.repeat("aa", 21) + "00000000"],
+        ["initial token past datagram", "c00000000100004fffffffffffffffff"],
+        ["initial length past datagram", "c00000000100000044000102030405"],
+        ["initial fixed bit clear", "8000000001000000050102030405"],
+        ["retry shorter than its tag", "ff00000001000000010203040506070809"],
+        ["version negotiation without versions", "c0000000000000"],
+        ["version negotiation with a partial version", "c0000000000000000001"],
+        ["long header truncated in the version", "c00000"],
+        ["short header fixed bit clear", "0001020304"],
+        ["short header truncated connection id", "40010203"]
+    ]
+    for pair in cases {
+        let data = hex(pair[1])
+        let h = wire.parse_header(data, 0, 8) catch {
+            e => {
+                print("header {pair[0]}: {e}")
+                continue
+            }
+        }
+        print("header {pair[0]}: {h.kind} size {h.size}")
+    }
+    let past = wire.parse_header(hex("40"), 5, 0) catch {
+        e => {
+            print("header offset past the end: {e}")
+            return
+        }
+    }
+    print("header offset past the end: {past.kind}")
+}
+
+fn short_sample_case() {
+    let short = hex("c0000000010000000501020304050607")
+    let h = wire.parse_header(short, 0, 0) catch {
+        e => {
+            print("short sample: header {e}")
+            return
+        }
+    }
+    let k = wire.initial_keys(hex("8394c8f03e515708"), false)
+    print("short sample: {h.kind} pn_offset {h.pn_offset} size {h.size} open {open_outcome(k, short[..h.size], h, -1)}")
+}
+
+fn frame_samples() -> []wire.Frame {
+    [
+        wire.Frame.Padding(3),
+        wire.Frame.Ping,
+        wire.Frame.Ack(wire.AckFrame { largest: 100, delay: 25, ranges: [wire.AckRange { smallest: 90, largest: 100 }] }),
+        wire.Frame.Ack(wire.AckFrame { largest: 1000, delay: 3, ranges: [wire.AckRange { smallest: 990, largest: 1000 }, wire.AckRange { smallest: 900, largest: 980 }, wire.AckRange { smallest: 0, largest: 5 }] }),
+        wire.Frame.Ack(wire.AckFrame { largest: 7, delay: 0, ranges: [wire.AckRange { smallest: 7, largest: 7 }], ecn: true, ect0: 1, ect1: 2, ce: 3 }),
+        wire.Frame.ResetStream(4, 0x100, 5000),
+        wire.Frame.StopSending(8, 7),
+        wire.Frame.Crypto(0, hex("010203")),
+        wire.Frame.Crypto(70000, hex("aa")),
+        wire.Frame.NewToken(hex("0badc0de")),
+        wire.Frame.Stream(wire.StreamFrame { id: 4, offset: 0, data: bytes("hi"), fin: false }),
+        wire.Frame.Stream(wire.StreamFrame { id: 5, offset: 0x1234, data: bytes("hello"), fin: true }),
+        wire.Frame.Stream(wire.StreamFrame { id: 1, offset: 0, data: [], fin: true }),
+        wire.Frame.MaxData(1048576),
+        wire.Frame.MaxStreamData(4, 65536),
+        wire.Frame.MaxStreams(true, 100),
+        wire.Frame.MaxStreams(false, 1152921504606846976),
+        wire.Frame.DataBlocked(2000),
+        wire.Frame.StreamDataBlocked(12, 3000),
+        wire.Frame.StreamsBlocked(true, 8),
+        wire.Frame.StreamsBlocked(false, 9),
+        wire.Frame.NewConnectionId(3, 1, hex("0102030405060708"), hex("000102030405060708090a0b0c0d0e0f")),
+        wire.Frame.RetireConnectionId(2),
+        wire.Frame.PathChallenge(hex("0102030405060708")),
+        wire.Frame.PathResponse(hex("0807060504030201")),
+        wire.Frame.ConnectionClose(wire.CloseFrame { application: false, code: 0x0a, frame_type: 0x06, reason: "bad frame" }),
+        wire.Frame.ConnectionClose(wire.CloseFrame { application: true, code: 0x100, frame_type: 0, reason: "" }),
+        wire.Frame.HandshakeDone
+    ]
+}
+
+fn frame_round_trips() ! io.Error {
+    for f in frame_samples() {
+        var out: []u8 = []
+        wire.put_frame(mut out, f)
+        let parsed = wire.parse_frames(out)?
+        var again: []u8 = []
+        for g in parsed {
+            wire.put_frame(mut again, g)
+        }
+        let same = hash.equal(out, again) && parsed.len == 1 && out.len == wire.frame_size(f)
+        print("{show(out)} size {out.len} ack_eliciting {wire.ack_eliciting(f)} stable {same}")
+        print("  {parsed[0]}")
+    }
+    let stream = wire.StreamFrame { id: 4, offset: 100, data: bytes("tail"), fin: true }
+    var packed: []u8 = []
+    wire.put_frame(mut packed, wire.Frame.Ping)
+    wire.put_stream_frame(mut packed, stream, true)
+    print("last stream frame {show(packed)} size {wire.stream_frame_size(stream, true)} with length {wire.stream_frame_size(stream, false)}")
+    let frames = wire.parse_frames(packed)?
+    print("  {frames}")
+    var pair: []u8 = []
+    wire.put_stream_frame(mut pair, stream, false)
+    wire.put_frame(mut pair, wire.Frame.HandshakeDone)
+    print("stream frame with length {show(pair)}")
+    let pair_frames = wire.parse_frames(pair)?
+    print("  {pair_frames}")
+    let padded = wire.parse_frames(hex("0000000100"))?
+    print("collapsed padding {padded}")
+    let delayed = wire.parse_frames(hex("0200ffffffffffffffff0000"))?
+    match delayed[0] {
+        Ack(a) => print("hostile ack delay {a.delay} -> {wire.ack_delay_ns(a, 3)} ns, exponent 20 -> {wire.ack_delay_ns(a, 20)}, exponent 99 -> {wire.ack_delay_ns(a, 99)}")
+        _ => print("no ack")
+    }
+    let small = wire.AckFrame { largest: 1, delay: 25, ranges: [wire.AckRange { smallest: 1, largest: 1 }] }
+    print("ack delay 25 at exponent 3 -> {wire.ack_delay_ns(small, 3)} ns, at exponent -4 -> {wire.ack_delay_ns(small, -4)} ns")
+}
+
+fn try_frames(label: str, raw: str) {
+    let data = hex(raw)
+    let frames = wire.parse_frames(data) catch {
+        e => {
+            print("frames {label}: {e}")
+            return
+        }
+    }
+    print("frames {label}: {frames.len} parsed {frames}")
+}
+
+fn frame_cases() {
+    try_frames("empty payload", "")
+    try_frames("unknown type", "21")
+    try_frames("non minimal ping", "4001")
+    try_frames("non minimal padding", "4000")
+    try_frames("truncated crypto", "060004aabb")
+    try_frames("crypto length past payload", "0600ffffffffffffffff")
+    try_frames("crypto offset plus length overflow", "06ffffffffffffffff01aa")
+    try_frames("crypto at the limit", "06ffffffffffffffff00")
+    try_frames("stream offset plus length overflow", "0e00ffffffffffffffff01aa")
+    try_frames("stream without length past the limit", "0c00ffffffffffffffffaa")
+    try_frames("stream without length at the limit", "0c00ffffffffffffffff")
+    try_frames("stream length past payload", "0a0405aabb")
+    try_frames("stream id truncated", "08c0")
+    try_frames("max streams above 2^60", "12d000000000000001")
+    try_frames("max streams at 2^60", "12d000000000000000")
+    try_frames("streams blocked above 2^60", "17d000000000000001")
+    try_frames("ack range below zero", "0205000106")
+    try_frames("ack gap below zero", "02050001000500")
+    try_frames("ack range count past payload", "020000ffffffffffffffff00")
+    try_frames("ack truncated ecn", "03000000000102")
+    try_frames("ack delay 2^62-1", "0200ffffffffffffffff0000")
+    try_frames("new token empty", "0700")
+    try_frames("new connection id length 0", "1801010000000000000000000000000000000000")
+    try_frames("new connection id length 21", "180101150000000000000000000000000000000000000000000000000000000000000000000000000000")
+    try_frames("new connection id retire above sequence", "18010204aabbccdd00000000000000000000000000000000")
+    try_frames("new connection id short token", "18010104aabbccdd0000")
+    try_frames("retire connection id", "1905")
+    try_frames("path challenge short", "1a01020304")
+    try_frames("path response short", "1b01020304050607")
+    try_frames("connection close reason past payload", "1c0a0605aabb")
+    try_frames("connection close reason huge", "1d0affffffffffffffff")
+    try_frames("connection close truncated", "1c0a")
+    try_frames("padding then truncated frame", "000000010400")
+}
+
+fn param_cases() {
+    let cases = [
+        ["empty", ""],
+        ["duplicate", "040105040105"],
+        ["length past input", "040805"],
+        ["truncated id", "40"],
+        ["truncated length", "04"],
+        ["integer length mismatch", "04020500"],
+        ["max_udp_payload_size 1199", "030244af"],
+        ["max_udp_payload_size 1200", "030244b0"],
+        ["ack_delay_exponent 21", "0a0115"],
+        ["ack_delay_exponent 20", "0a0114"],
+        ["max_ack_delay 16384", "0b0480004000"],
+        ["max_ack_delay 16383", "0b027fff"],
+        ["active_connection_id_limit 1", "0e0101"],
+        ["initial_max_streams_bidi above 2^60", "0808d000000000000001"],
+        ["initial_max_streams_uni above 2^60", "0908d000000000000001"],
+        ["initial_max_streams_bidi at 2^60", "0808d000000000000000"],
+        ["stateless_reset_token of 15 bytes", "020f000102030405060708090a0b0c0d0e"],
+        ["disable_active_migration with a value", "0c0100"],
+        ["disable_active_migration", "0c00"],
+        ["preferred_address too short", "0d0101"],
+        ["original_destination_connection_id of 21 bytes", "0015" + text.repeat("00", 21)],
+        ["unknown and reserved ids", "1b02abcd3a00404001ff040105"],
+        ["max value", "0408ffffffffffffffff"]
+    ]
+    for pair in cases {
+        let raw = hex(pair[1])
+        let p = wire.decode_parameters(raw) catch {
+            e => {
+                print("params {pair[0]}: {e}")
+                continue
+            }
+        }
+        print("params {pair[0]}: ok idle {p.max_idle_timeout} udp {p.max_udp_payload_size} data {p.initial_max_data} streams {p.initial_max_streams_bidi} {p.initial_max_streams_uni} exponent {p.ack_delay_exponent} delay {p.max_ack_delay} migration {p.disable_active_migration} limit {p.active_connection_id_limit}")
+    }
+}
+
+fn parameter_vectors() ! io.Error {
+    let raw = hex(embed("std_quic_wire_a2_params.hex"))
+    let p = wire.decode_parameters(raw)?
+    print("a2 params idle {p.max_idle_timeout} data {p.initial_max_data} bidi_local {p.initial_max_stream_data_bidi_local} bidi_remote {p.initial_max_stream_data_bidi_remote} uni {p.initial_max_stream_data_uni} streams {p.initial_max_streams_bidi} {p.initial_max_streams_uni} source {p.initial_source_connection_id}")
+    let defaults = wire.Parameters {}
+    print("defaults encode {show(wire.encode_parameters(defaults))}")
+    let defaulted = wire.decode_parameters(hex(""))?
+    print("defaults decode udp {defaulted.max_udp_payload_size} exponent {defaulted.ack_delay_exponent} delay {defaulted.max_ack_delay} limit {defaulted.active_connection_id_limit} idle {defaulted.max_idle_timeout}")
+    let full = wire.Parameters {
+        original_destination_connection_id: hex("8394c8f03e515708")
+        max_idle_timeout: 30000
+        stateless_reset_token: hex("000102030405060708090a0b0c0d0e0f")
+        max_udp_payload_size: 1452
+        initial_max_data: 1048576
+        initial_max_stream_data_bidi_local: 262144
+        initial_max_stream_data_bidi_remote: 131072
+        initial_max_stream_data_uni: 65536
+        initial_max_streams_bidi: 100
+        initial_max_streams_uni: 3
+        ack_delay_exponent: 10
+        max_ack_delay: 1000
+        disable_active_migration: true
+        preferred_address: hex("7f00000101bb0000000000000000000000000000000101bb0401020304aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        active_connection_id_limit: 8
+        initial_source_connection_id: hex("0102030405060708")
+        retry_source_connection_id: hex("a1a2a3a4")
+    }
+    let encoded = wire.encode_parameters(full)
+    print("full encode {show(encoded)}")
+    let back = wire.decode_parameters(encoded)?
+    let again = wire.encode_parameters(back)
+    print("full stable {hash.equal(encoded, again)} idle {back.max_idle_timeout} udp {back.max_udp_payload_size} data {back.initial_max_data} exponent {back.ack_delay_exponent} delay {back.max_ack_delay} migration {back.disable_active_migration} limit {back.active_connection_id_limit}")
+    print("full ids {back.original_destination_connection_id} {back.stateless_reset_token} {back.initial_source_connection_id} {back.retry_source_connection_id}")
+    print("full preferred {back.preferred_address}")
+}
+
+fn error_codes() {
+    print("codes {wire.no_error()} {wire.internal_error()} {wire.connection_refused()} {wire.flow_control_error()} {wire.stream_limit_error()} {wire.stream_state_error()} {wire.final_size_error()} {wire.frame_encoding_error()} {wire.transport_parameter_error()} {wire.connection_id_limit_error()} {wire.protocol_violation()} {wire.invalid_token()} {wire.application_error()} {wire.crypto_buffer_exceeded()} {wire.key_update_error()} {wire.aead_limit_reached()} {wire.no_viable_path()}")
+    print("crypto_error 40 {wire.crypto_error(40):x} crypto_error 120 {wire.crypto_error(120):x}")
+}
+
+fn note(mut t: Tally, e: io.Error) {
+    if e != io.Error.Malformed && e != io.Error.Invalid {
+        t.other += 1
+    }
+}
+
+fn probe_packet(k: wire.Keys, data: []u8, short_dcid_len: i64, largest: i64, mut t: Tally) {
+    let h = wire.parse_header(data, 0, short_dcid_len) catch {
+        e => {
+            note(mut t, e)
+            t.header_failed += 1
+            return
+        }
+    }
+    let one = data[..h.size]
+    let opened = wire.open(k, one, h, largest) catch {
+        e => {
+            note(mut t, e)
+            t.open_failed += 1
+            return
+        }
+    }
+    let frames = wire.parse_frames(opened.payload) catch {
+        e => {
+            note(mut t, e)
+            t.frames_failed += 1
+            return
+        }
+    }
+    t.parsed += frames.len
+}
+
+fn probe_frames(data: []u8, mut t: Tally) {
+    let frames = wire.parse_frames(data) catch {
+        e => {
+            note(mut t, e)
+            t.frames_failed += 1
+            return
+        }
+    }
+    t.parsed += 1
+}
+
+fn probe_parameters(data: []u8, mut t: Tally) {
+    let p = wire.decode_parameters(data) catch {
+        e => {
+            note(mut t, e)
+            t.frames_failed += 1
+            return
+        }
+    }
+    t.parsed += 1
+}
+
+fn report(name: str, t: Tally) {
+    print("hostile {name}: header failed {t.header_failed} open failed {t.open_failed} frames failed {t.frames_failed} parsed {t.parsed} other {t.other}")
+}
+
+fn flipped(data: []u8, at: i64) -> []u8 {
+    var out: []u8 = []
+    io.append(mut out, data)
+    out[at] = out[at] ^ 0xff
+    out
+}
+
+fn hostile() ! io.Error {
+    let dcid = hex("8394c8f03e515708")
+    let client = wire.initial_keys(dcid, false)
+    let packet = hex(embed("std_quic_wire_a2_packet.hex"))
+    let header = wire.parse_header(packet, 0, 0)?
+    let opened = wire.open(client, packet, header, -1)?
+    let payload = opened.payload
+
+    var cut = Tally { header_failed: 0, open_failed: 0, frames_failed: 0, parsed: 0, other: 0 }
+    for n in 0..packet.len + 1 {
+        probe_packet(client, packet[..n], 8, -1, mut cut)
+    }
+    report("initial truncated at every length", cut)
+
+    var flips = Tally { header_failed: 0, open_failed: 0, frames_failed: 0, parsed: 0, other: 0 }
+    for i in 0..packet.len {
+        probe_packet(client, flipped(packet, i), 8, -1, mut flips)
+    }
+    report("initial with each byte flipped", flips)
+
+    var plain_cut = Tally { header_failed: 0, open_failed: 0, frames_failed: 0, parsed: 0, other: 0 }
+    for n in 0..payload.len + 1 {
+        probe_frames(payload[..n], mut plain_cut)
+    }
+    report("frames truncated at every length", plain_cut)
+
+    var plain_flips = Tally { header_failed: 0, open_failed: 0, frames_failed: 0, parsed: 0, other: 0 }
+    for i in 0..payload.len {
+        probe_frames(flipped(payload, i), mut plain_flips)
+    }
+    report("frames with each byte flipped", plain_flips)
+
+    let secret = hex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b")
+    let k = wire.keys(tls.Suite.ChaCha20Poly1305, secret)?
+    let short = hex("4cfe4189655e5cd55c41f69080575d7999c25a5bfb")
+    var short_cut = Tally { header_failed: 0, open_failed: 0, frames_failed: 0, parsed: 0, other: 0 }
+    for n in 0..short.len + 1 {
+        probe_packet(k, short[..n], 0, 654360000, mut short_cut)
+    }
+    report("short packet truncated at every length", short_cut)
+    var short_flips = Tally { header_failed: 0, open_failed: 0, frames_failed: 0, parsed: 0, other: 0 }
+    for i in 0..short.len {
+        probe_packet(k, flipped(short, i), 0, 654360000, mut short_flips)
+    }
+    report("short packet with each byte flipped", short_flips)
+    var long_dcid = Tally { header_failed: 0, open_failed: 0, frames_failed: 0, parsed: 0, other: 0 }
+    for n in 0..short.len + 1 {
+        probe_packet(k, short[..n], 20, 654360000, mut long_dcid)
+    }
+    report("short packet with a 20 byte connection id", long_dcid)
+
+    let params = hex(embed("std_quic_wire_a2_params.hex"))
+    var params_cut = Tally { header_failed: 0, open_failed: 0, frames_failed: 0, parsed: 0, other: 0 }
+    for n in 0..params.len + 1 {
+        probe_parameters(params[..n], mut params_cut)
+    }
+    report("parameters truncated at every length", params_cut)
+    var params_flips = Tally { header_failed: 0, open_failed: 0, frames_failed: 0, parsed: 0, other: 0 }
+    for i in 0..params.len {
+        probe_parameters(flipped(params, i), mut params_flips)
+    }
+    report("parameters with each byte flipped", params_flips)
+}
+
+fn main() ! io.Error {
+    varints()?
+    packet_numbers()
+    initial_vectors()?
+    retry_vector()?
+    chacha_vector()?
+    version_negotiation()?
+    header_cases()
+    short_sample_case()
+    frame_round_trips()?
+    frame_cases()
+    param_cases()
+    parameter_vectors()?
+    error_codes()
+    hostile()?
+}

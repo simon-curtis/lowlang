@@ -1,0 +1,395 @@
+import std/crypto
+import std/crypto/hash
+import std/io
+import std/net
+import std/quic/recovery
+import std/quic/wire
+import std/time
+import std/tls
+
+struct Space {
+    read: wire.Keys? = none
+    write: wire.Keys? = none
+    discarded: bool = false
+    next_pn: i64 = 0
+    largest_received: i64 = -1
+    received: []wire.AckRange = []
+    largest_received_time: i64 = 0
+    ack_pending: bool = false
+    ack_deadline: i64 = -1
+    unacked: i64 = 0
+    skip_at: i64 = -1
+    crypto_resend: []CryptoRange = []
+    crypto_out: []u8 = []
+    crypto_sent: i64 = 0
+    crypto_in_next: i64 = 0
+    crypto_in_chunks: [i64: []u8] = [:]
+    crypto_ready: []u8 = []
+    sent: [i64: SentPacket] = [:]
+}
+
+struct CryptoRange {
+    offset: i64
+    length: i64
+}
+
+enum Retransmit {
+    Crypto(offset: i64, length: i64)
+    HandshakeDone
+    Ping
+    RetireConnectionId(sequence: i64)
+    Stream(id: i64, offset: i64, length: i64, fin: bool)
+    ResetStream(id: i64)
+    StopSending(id: i64)
+    MaxData
+    MaxStreamData(id: i64)
+    MaxStreams(bidi: bool)
+    DataBlocked
+    StreamDataBlocked(id: i64)
+    StreamsBlocked(bidi: bool)
+}
+
+enum Phase {
+    Open
+    Closing
+    Draining
+}
+
+struct PeerId {
+    sequence: i64
+    id: []u8
+    token: []u8
+}
+
+struct SentPacket {
+    number: i64
+    time: i64
+    size: i64
+    ack_eliciting: bool
+    retransmit: []Retransmit
+}
+
+enum Event {
+    Crypto(level: tls.Level, data: []u8)
+    Secret(s: tls.QuicSecret)
+    Receive(reply: chan[tls.QuicData])
+    Alert(code: i64)
+    Finished(r: tls.QuicResult)
+    Failed(e: io.Error)
+}
+
+enum Command {
+    Stats(reply: chan[Stats])
+    Close(code: i64, reason: str, reply: chan[bool])
+    OpenStream(bidi: bool, reply: chan[Answer])
+    AcceptStream(bidi: bool, reply: chan[Answer])
+    StreamRead(id: i64, buf: []u8, reply: chan[Answer])
+    StreamWrite(id: i64, data: []u8, reply: chan[Answer])
+    StreamFinish(id: i64, reply: chan[Answer])
+    StreamReset(id: i64, code: i64, reply: chan[Answer])
+    StreamStop(id: i64, code: i64, reply: chan[Answer])
+    UpdateKeys(reply: chan[Answer])
+}
+
+struct Answer {
+    value: i64
+    error: io.Error?
+}
+
+struct CloseWait {
+    code: i64
+    reason: str
+    deadline: i64
+    replies: []chan[bool]
+}
+
+struct Waiting {
+    packet: []u8
+    header: wire.Header
+    received: i64
+}
+
+struct Conn {
+    endpoint: *Endpoint
+    owns_endpoint: bool
+    server: bool
+    handle: *ConnectionHandle
+    config: Config
+    peer: net.Addr
+    dcid: []u8
+    scid: []u8
+    initial_dcid: []u8
+    original_dcid: []u8
+    retry_scid: []u8?
+    initial: *Space
+    handshake: *Space
+    application: *Space
+    recovery: *recovery.Recovery
+    streams: *Streams
+    keys: *KeyState
+    close_wait: *CloseWait? = none
+    waiting: []Waiting = []
+    incoming: chan[Datagram]
+    events: chan[Event]
+    parked: chan[tls.QuicData]? = none
+    bytes_received: i64 = 0
+    bytes_sent: i64 = 0
+    validated: bool
+    dcid_switched: bool = false
+    half_open: bool
+    handshake_done_pending: bool = false
+    handshake_complete: bool = false
+    handshake_confirmed: bool = false
+    peer_parameters: wire.Parameters? = none
+    phase: Phase = Phase.Open
+    phase_end: i64 = 0
+    close_frame: wire.CloseFrame? = none
+    pending_close: wire.CloseFrame? = none
+    close_sent_at: i64 = -1
+    token: []u8 = []
+    created: i64
+    idle_start: i64
+    idle_refreshed: bool = false
+    last_eliciting_sent: i64
+    ping_pending: bool = false
+    peer_ids: []PeerId
+    retire_prior: i64 = 0
+    retire_queue: []i64 = []
+    path_response: []u8? = none
+    alerted: bool = false
+    ready_answered: bool = false
+    finished: bool = false
+    packets_sent: i64 = 0
+    packets_received: i64 = 0
+    packets_lost: i64 = 0
+}
+
+fn least(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+fn levels() -> []tls.Level {
+    [tls.Level.Initial, tls.Level.Handshake, tls.Level.Application]
+}
+
+fn rspace(level: tls.Level) -> recovery.Space {
+    match level {
+        Initial => recovery.Space.Initial
+        Handshake => recovery.Space.Handshake
+        Application => recovery.Space.Application
+    }
+}
+
+fn space_of(c: *Conn, level: tls.Level) -> *Space {
+    match level {
+        Initial => c.initial
+        Handshake => c.handshake
+        Application => c.application
+    }
+}
+
+fn same_peer(a: net.Addr, b: net.Addr) -> bool {
+    a.port == b.port && hash.equal(a.ip, b.ip)
+}
+
+fn new_handle(local: net.Addr, remote: net.Addr, server: bool) -> *ConnectionHandle {
+    new(ConnectionHandle {
+        protocol: ""
+        remote
+        local
+        server
+        group: 0
+        suite: tls.Suite.Aes128Gcm
+        peer_certificates: []
+        close_code: 0
+        close_reason: ""
+        closed_by_peer: false
+        application_close: false
+        terminal: none
+        gone: chan[bool]()
+        commands: chan[Command](64)
+        ready: chan[io.Error?](1)
+    })
+}
+
+fn new_conn(ep: *Endpoint, server: bool, handle: *ConnectionHandle, peer: net.Addr, dcid: []u8, scid: []u8, initial_dcid: []u8, original_dcid: []u8, retry_scid: []u8?, incoming: chan[Datagram]) -> *Conn {
+    let read_keys = wire.initial_keys(initial_dcid, !server)
+    let write_keys = wire.initial_keys(initial_dcid, server)
+    let initial = new(Space { read: some(read_keys), write: some(write_keys) })
+    let r = recovery.recovery(min_initial())
+    r.peer_completed_address_validation = server
+    let authenticated = match retry_scid {
+        some(_) => true
+        none => false
+    }
+    let now = time.monotonic()
+    new(Conn {
+        endpoint: ep
+        owns_endpoint: !server
+        server
+        handle
+        config: ep.config
+        peer
+        dcid
+        scid
+        initial_dcid
+        original_dcid
+        retry_scid
+        initial
+        handshake: new(Space {})
+        application: new(Space {})
+        recovery: r
+        streams: new_streams(ep.config)
+        keys: new(KeyState {})
+        incoming
+        events: chan[Event](64)
+        validated: !server || authenticated
+        half_open: server
+        created: now
+        idle_start: now
+        last_eliciting_sent: now
+        peer_ids: [PeerId { sequence: 0, id: dcid, token: [] }]
+    })
+}
+
+fn start_server(ep: *Endpoint, d: Datagram, h: wire.Header, original_dcid: []u8, retry_scid: []u8?) {
+    if !begin_half_open(ep, d.from.ip) {
+        return
+    }
+    let scid = crypto.random(cid_length())
+    let incoming = chan[Datagram](128)
+    if !add_route(ep, h.dcid, incoming) {
+        end_half_open(ep, d.from.ip)
+        return
+    }
+    if !add_route(ep, scid, incoming) {
+        remove_route(ep, h.dcid)
+        end_half_open(ep, d.from.ip)
+        return
+    }
+    let handle = new_handle(ep.socket.addr, d.from, true)
+    if !add_live(ep, scid, handle) {
+        remove_route(ep, h.dcid)
+        remove_route(ep, scid)
+        end_half_open(ep, d.from.ip)
+        return
+    }
+    let c = new_conn(ep, true, handle, d.from, h.scid, scid, h.dcid, original_dcid, retry_scid, incoming)
+    spawn run_connection(c)
+    spawn handshake_thread(c.events, handle.gone, true, ep.config.tls, wire.encode_parameters(local_parameters(c)))
+    incoming <- d
+}
+
+fn start_client(ep: *Endpoint, peer: net.Addr) -> *ConnectionHandle ! io.Error {
+    let dcid = crypto.random(cid_length())
+    let scid = crypto.random(cid_length())
+    let incoming = chan[Datagram](128)
+    if !add_route(ep, scid, incoming) {
+        fail Refused
+    }
+    let handle = new_handle(ep.socket.addr, peer, false)
+    let c = new_conn(ep, false, handle, peer, dcid, scid, dcid, dcid, none, incoming)
+    spawn run_connection(c)
+    spawn handshake_thread(c.events, handle.gone, false, ep.config.tls, wire.encode_parameters(local_parameters(c)))
+    handle
+}
+
+fn run_connection(c: *Conn) {
+    for !c.finished {
+        settle(c)
+        flush(c)
+        if c.finished {
+            break
+        }
+        let wait = next_wait_ms(c)
+        select {
+            d = <-c.incoming => match d {
+                some(datagram) => on_datagram(c, datagram)
+                none => {}
+            }
+            e = <-c.events => match e {
+                some(event) => {
+                    on_event(c, event)
+                    drain_events(c)
+                }
+                none => {}
+            }
+            k = <-c.handle.commands => match k {
+                some(command) => on_command(c, command)
+                none => {}
+            }
+            after(wait) => on_deadline(c)
+        }
+    }
+    finish_connection(c)
+}
+
+fn drain_events(c: *Conn) {
+    for !c.finished {
+        select {
+            e = <-c.events => match e {
+                some(event) => on_event(c, event)
+                none => return
+            }
+            else => return
+        }
+    }
+}
+
+fn on_command(c: *Conn, k: Command) {
+    match k {
+        Stats(reply) => {
+            if c.phase != Phase.Open {
+                close(reply)
+                return
+            }
+            let current = snapshot(c)
+            reply <- current
+        }
+        Close(code, reason, reply) => close_by_owner(c, code, reason, reply)
+        OpenStream(bidi, reply) => on_open_stream(c, bidi, reply)
+        AcceptStream(bidi, reply) => on_accept_stream(c, bidi, reply)
+        StreamRead(id, buf, reply) => on_stream_read(c, id, buf, reply)
+        StreamWrite(id, data, reply) => on_stream_write(c, id, data, reply)
+        StreamFinish(id, reply) => on_stream_finish(c, id, reply)
+        StreamReset(id, code, reply) => on_stream_reset(c, id, code, reply)
+        StreamStop(id, code, reply) => on_stream_stop(c, id, code, reply)
+        UpdateKeys(reply) => on_update_keys(c, reply)
+    }
+}
+
+fn snapshot(c: *Conn) -> Stats {
+    let r = c.recovery
+    Stats {
+        smoothed_rtt: r.smoothed_rtt
+        min_rtt: r.min_rtt
+        congestion_window: r.congestion_window
+        bytes_in_flight: r.bytes_in_flight
+        packets_sent: c.packets_sent
+        packets_received: c.packets_received
+        packets_lost: c.packets_lost
+        key_updates: c.keys.updates
+    }
+}
+
+fn answer_ready(c: *Conn, outcome: io.Error?) {
+    if c.ready_answered {
+        return
+    }
+    c.ready_answered = true
+    c.handle.ready <- outcome
+}
+
+fn finish_connection(c: *Conn) {
+    set_terminal(c, NotConnected)
+    settle(c)
+    close(c.handle.gone)
+    remove_route(c.endpoint, c.scid)
+    remove_route(c.endpoint, c.initial_dcid)
+    remove_live(c.endpoint, c.scid)
+    release_half_open(c)
+    answer_ready(c, some(Aborted))
+    if c.owns_endpoint {
+        close_endpoint(c.endpoint)
+    }
+}

@@ -1,0 +1,257 @@
+import std/io
+
+fn check_ranges(r: *Recovery, i: i64, ranges: []AckRange) -> i64 ! io.Error {
+    if ranges.len == 0 {
+        fail Malformed
+    }
+    let top = ranges[0].largest
+    if top > r.spaces[i].largest_sent || top < 0 {
+        fail Malformed
+    }
+    let count = smaller(ranges.len, range_limit())
+    let skipped = r.spaces[i].skipped
+    var ceiling = top + 1
+    for k in 0..count {
+        let entry = ranges[k]
+        if entry.smallest < 0 || entry.smallest > entry.largest || entry.largest >= ceiling {
+            fail Malformed
+        }
+        for s in skipped {
+            if s >= entry.smallest && s <= entry.largest {
+                fail Malformed
+            }
+        }
+        ceiling = entry.smallest
+    }
+    top
+}
+
+struct Cut {
+    from: i64
+    to: i64
+}
+
+fn first_at_least(sent: []Sent, number: i64) -> i64 {
+    var lo = 0
+    var hi = sent.len
+    for lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if sent[mid].number < number {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+fn remove_cuts(r: *Recovery, i: i64, cuts: []Cut) {
+    if cuts.len == 0 {
+        return
+    }
+    let sent = r.spaces[i].sent
+    var kept = cuts[0].from
+    for c in 0..cuts.len {
+        let from = cuts[c].to
+        let to = if c + 1 < cuts.len { cuts[c + 1].from } else { sent.len }
+        for k in from..to {
+            sent[kept] = sent[k]
+            kept += 1
+        }
+    }
+    truncate(mut r.spaces[i].sent, kept)
+}
+
+fn take_acked(r: *Recovery, i: i64, ranges: []AckRange) -> []Sent {
+    var acked: []Sent = []
+    var cuts: []Cut = []
+    let sent = r.spaces[i].sent
+    var j = smaller(ranges.len, range_limit()) - 1
+    for j >= 0 {
+        let from = first_at_least(sent, ranges[j].smallest)
+        var to = from
+        for to < sent.len && sent[to].number <= ranges[j].largest {
+            let p = sent[to]
+            push(mut acked, p)
+            if p.in_flight && p.ack_eliciting {
+                r.spaces[i].eliciting -= 1
+            }
+            to += 1
+        }
+        if to > from {
+            let cut = Cut { from, to }
+            push(mut cuts, cut)
+        }
+        j -= 1
+    }
+    remove_cuts(r, i, cuts)
+    acked
+}
+
+fn detect_lost(r: *Recovery, i: i64, now: i64) -> []Sent {
+    r.spaces[i].loss_time = -1
+    var lost: []Sent = []
+    let largest = r.spaces[i].largest_acked
+    if largest < 0 {
+        return lost
+    }
+    let threshold = larger(larger(r.latest_rtt, r.smoothed_rtt) * 9 / 8, granularity())
+    let lost_send_time = now - threshold
+    let sent = r.spaces[i].sent
+    let limit = first_at_least(sent, largest + 1)
+    var kept = 0
+    for k in 0..limit {
+        let p = sent[k]
+        if p.time <= lost_send_time || largest >= p.number + 3 {
+            push(mut lost, p)
+            if p.in_flight && p.ack_eliciting {
+                r.spaces[i].eliciting -= 1
+            }
+            continue
+        }
+        let due = p.time + threshold
+        if r.spaces[i].loss_time < 0 || due < r.spaces[i].loss_time {
+            r.spaces[i].loss_time = due
+        }
+        sent[kept] = p
+        kept += 1
+    }
+    if kept == limit {
+        return lost
+    }
+    for k in limit..sent.len {
+        sent[kept] = sent[k]
+        kept += 1
+    }
+    truncate(mut r.spaces[i].sent, kept)
+    lost
+}
+
+fn prune_acked(r: *Recovery) {
+    var oldest = -1
+    for i in 0..3 {
+        let sent = r.spaces[i].sent
+        if sent.len > 0 && (oldest < 0 || sent[0].time < oldest) {
+            oldest = sent[0].time
+        }
+    }
+    if oldest < 0 {
+        truncate(mut r.acked_times, 0)
+        return
+    }
+    let times = r.acked_times
+    var kept = 0
+    for t in times {
+        if t > oldest {
+            times[kept] = t
+            kept += 1
+        }
+    }
+    truncate(mut r.acked_times, kept)
+}
+
+fn rtt_sample(now: i64, sent_time: i64) -> i64 {
+    smaller(larger(now - sent_time, 0), rtt_limit())
+}
+
+fn includes_ack_eliciting(packets: []Sent) -> bool {
+    for p in packets {
+        if p.ack_eliciting {
+            return true
+        }
+    }
+    false
+}
+
+/// Processes an ACK frame received in `space` at time `now` and returns what it newly acknowledged and caused to be lost.
+///
+/// `ranges` are the acknowledged packet numbers in the descending order of the frame, and `ack_delay_ns` is the decoded acknowledgment delay in nanoseconds. Fails `Malformed` without changing any state when `ranges` is empty, when a range is reversed or negative, when ranges overlap or are not in descending order, when the frame acknowledges a number never sent, or when a range covers a number marked by `skip`. The caller answers with a PROTOCOL_VIOLATION connection error. Only the first 256 ranges are processed. Each range is located by binary search over the tracked packets, so the work is bounded by the number of ranges and the packets they newly acknowledge, never by the size of a range or by how many packets are outstanding. A number that was sent without being in flight, was acknowledged before or was declared lost is accepted and ignored.
+///
+/// The largest acknowledged number counts as a round-trip time sample when the frame newly acknowledges that packet, which must have been in flight, and at least one newly acknowledged packet is ack-eliciting. The sample is never negative and is capped at 2^40 ns. `min_rtt` takes the raw sample. The acknowledgment delay is ignored in the Initial space, capped by `max_ack_delay` once `handshake_confirmed` is set, never exceeds the sample and is not subtracted when that would put the sample below `min_rtt`.
+///
+/// It then declares lost the earlier packets that are three or more packet numbers or more than 9/8 of the round-trip time older than the largest acknowledged, applies the NewReno window rules to the losses and acknowledgments, and resets `pto_count` unless this is a client that has not completed address validation. An acknowledgment in the Handshake space sets `peer_completed_address_validation`. A frame that acknowledges no new packet and does not raise the largest acknowledged number changes nothing; one that raises it still runs loss detection, so an acknowledgment of a packet that was not in flight can declare earlier packets lost.
+///
+/// Persistent congestion is established when two ack-eliciting packets sent after the first round-trip time sample are declared lost together, no packet sent between them was acknowledged, and the span exceeds three probe timeout periods including `max_ack_delay`. It sets the window to the minimum, ends the recovery period and makes the next sample the new `min_rtt`.
+pub fn on_ack(r: *Recovery, space: Space, ranges: []AckRange, ack_delay_ns: i64, now: i64) -> AckResult ! io.Error {
+    let i = slot(space)
+    let largest = check_ranges(r, i, ranges)?
+    let raised = largest > r.spaces[i].largest_acked
+    if raised {
+        r.spaces[i].largest_acked = largest
+    }
+    let acked = take_acked(r, i, ranges)
+    if acked.len == 0 && !raised {
+        return AckResult { acked, lost: [], rtt_updated: false }
+    }
+    var rtt_updated = false
+    if acked.len > 0 {
+        let top = acked[acked.len - 1]
+        if top.number == largest && includes_ack_eliciting(acked) {
+            r.latest_rtt = rtt_sample(now, top.time)
+            update_rtt(r, space, ack_delay_ns, now)
+            rtt_updated = true
+        }
+    }
+    for p in acked {
+        push(mut r.acked_times, p.time)
+    }
+    let lost = detect_lost(r, i, now)
+    on_lost(r, lost, now)
+    on_acked(r, acked)
+    if space == Handshake {
+        r.peer_completed_address_validation = true
+    }
+    if validated(r) {
+        r.pto_count = 0
+    }
+    set_timer(r, now)
+    prune_acked(r)
+    AckResult { acked, lost, rtt_updated }
+}
+
+fn no_timeout() -> Timeout {
+    Timeout { lost: [], probe: none, probes: 0 }
+}
+
+/// Handles the expiry of the loss detection timer at time `now` and returns what the caller must do.
+///
+/// Call it when `now` reaches `deadline`. When a space has a time threshold loss time, the packets that are now overdue are declared lost and returned in `lost`, the window rules apply, and no probe is requested. Otherwise it is a probe timeout: `pto_count` increases, which doubles the next period, and `probe` names the space whose ack-eliciting data the caller sends again, in `probes` datagrams. A probe timeout does not declare packets lost. When nothing is in flight at a client that has not completed address validation, `probe` is the Handshake space if `has_handshake_keys` is set and the Initial space otherwise, with one probe; the caller sends an ack-eliciting Handshake packet, or an Initial packet padded to 1200 bytes. Probe packets bypass `can_send` and are reported through `on_sent`.
+///
+/// Returns a `Timeout` with no loss and no probe when no timer is armed.
+pub fn on_timeout(r: *Recovery, now: i64) -> Timeout {
+    let loss = earliest_loss(r)
+    if loss >= 0 {
+        let lost = detect_lost(r, loss, now)
+        on_lost(r, lost, now)
+        set_timer(r, now)
+        prune_acked(r)
+        return Timeout { lost, probe: none, probes: 0 }
+    }
+    if r.timer < 0 {
+        return no_timeout()
+    }
+    let pto = pto_timer(r, now)
+    let probes = if total_eliciting(r) == 0 { 1 } else { 2 }
+    r.pto_count += 1
+    set_timer(r, now)
+    Timeout { lost: [], probe: space_at(pto.space), probes }
+}
+
+/// Forgets every packet of `space` at time `now`, as when its keys are discarded.
+///
+/// The packets leave `bytes_in_flight`, the space's loss time and last ack-eliciting time are cleared, `pto_count` returns to 0 and the timer is recomputed. Call it for the Initial space when Handshake packets are first sent or received, and for the Handshake space when the handshake is confirmed.
+pub fn discard_space(r: *Recovery, space: Space, now: i64) {
+    let i = slot(space)
+    for p in r.spaces[i].sent {
+        if p.in_flight {
+            r.bytes_in_flight -= p.size
+        }
+    }
+    truncate(mut r.spaces[i].sent, 0)
+    r.spaces[i].eliciting = 0
+    r.spaces[i].last_eliciting = -1
+    r.spaces[i].loss_time = -1
+    r.pto_count = 0
+    set_timer(r, now)
+    prune_acked(r)
+}

@@ -1,0 +1,430 @@
+import std/atomic
+import std/crypto
+import std/crypto/hash
+import std/io
+import std/net
+import std/quic/wire
+import std/sync
+import std/time
+
+struct Datagram {
+    data: []u8
+    from: net.Addr
+    received: i64
+}
+
+struct PendingClose {
+    handle: *ConnectionHandle
+    reply: chan[bool]
+}
+
+struct Endpoint {
+    socket: net.SocketHandle
+    server: bool
+    config: Config
+    send_lock: sync.Mutex
+    routes: [str: chan[Datagram]]
+    routes_lock: sync.Mutex
+    half_open: i64
+    half_open_by_ip: [str: i64]
+    token_key: []u8
+    reset_key: []u8
+    live: [str: *ConnectionHandle]
+    accepted: chan[*ConnectionHandle]
+    closed: chan[bool]
+    closing: atomic.Flag
+    shutdown: atomic.Flag
+}
+
+fn max_datagram() -> i64 {
+    1500
+}
+
+fn min_initial() -> i64 {
+    1200
+}
+
+fn max_routes() -> i64 {
+    4096
+}
+
+fn max_half_open() -> i64 {
+    256
+}
+
+fn retry_half_open() -> i64 {
+    128
+}
+
+fn max_half_open_per_ip() -> i64 {
+    8
+}
+
+fn min_reset_trigger() -> i64 {
+    42
+}
+
+fn max_reset_size() -> i64 {
+    43
+}
+
+fn token_lifetime_ms() -> i64 {
+    10000
+}
+
+fn cid_length() -> i64 {
+    8
+}
+
+fn endpoint(socket: net.SocketHandle, server: bool, config: Config) -> *Endpoint {
+    new(Endpoint {
+        socket
+        server
+        config
+        send_lock: sync.mutex()
+        routes: [:]
+        routes_lock: sync.mutex()
+        half_open: 0
+        half_open_by_ip: [:]
+        token_key: crypto.random(32)
+        reset_key: crypto.random(32)
+        live: [:]
+        accepted: chan[*ConnectionHandle](128)
+        closed: chan[bool]()
+        closing: atomic.flag()
+        shutdown: atomic.flag()
+    })
+}
+
+fn start(ep: *Endpoint) {
+    spawn reader(ep)
+}
+
+fn close_endpoint(ep: *Endpoint) {
+    if atomic.set(ep.closing) {
+        close(ep.closed)
+    }
+    net.close_socket_on(ep.socket)
+}
+
+fn send(ep: *Endpoint, data: []u8, to: net.Addr) ! io.Error {
+    sync.lock(ep.send_lock)
+    defer sync.unlock(ep.send_lock)
+    let sent = net.send_to_on(ep.socket, data, to)?
+}
+
+fn add_route(ep: *Endpoint, cid: []u8, ch: chan[Datagram]) -> bool {
+    let key = str(cid)
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    if ep.routes.len >= max_routes() {
+        return false
+    }
+    ep.routes[key] = ch
+    true
+}
+
+fn remove_route(ep: *Endpoint, cid: []u8) {
+    let key = str(cid)
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    delete(mut ep.routes, key)
+}
+
+fn find_route(ep: *Endpoint, cid: []u8) -> chan[Datagram]? {
+    let key = str(cid)
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    ep.routes[key]
+}
+
+fn add_live(ep: *Endpoint, cid: []u8, handle: *ConnectionHandle) -> bool {
+    let key = str(cid)
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    if ep.live.len >= max_routes() {
+        return false
+    }
+    ep.live[key] = handle
+    true
+}
+
+fn remove_live(ep: *Endpoint, cid: []u8) {
+    let key = str(cid)
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    delete(mut ep.live, key)
+}
+
+fn live_handles(ep: *Endpoint) -> []*ConnectionHandle {
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    var out: []*ConnectionHandle = []
+    for key, handle in ep.live {
+        push(mut out, handle)
+    }
+    out
+}
+
+fn sole_route(ep: *Endpoint) -> chan[Datagram]? {
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    for key, ch in ep.routes {
+        return some(ch)
+    }
+    none
+}
+
+fn shutdown_endpoint(ep: *Endpoint) {
+    if !atomic.set(ep.shutdown) {
+        return
+    }
+    let handles = live_handles(ep)
+    close_together(handles)
+    close_endpoint(ep)
+    let queued = drain_accepted(ep)
+    close_together(queued)
+}
+
+fn close_together(handles: []*ConnectionHandle) {
+    var pending: []PendingClose = []
+    for handle in handles {
+        match request_close(handle, 0, "") {
+            some(reply) => {
+                let entry = PendingClose { handle, reply }
+                push(mut pending, entry)
+            }
+            none => {}
+        }
+    }
+    for p in pending {
+        await_close(p.handle, p.reply)
+    }
+}
+
+fn drain_accepted(ep: *Endpoint) -> []*ConnectionHandle {
+    var out: []*ConnectionHandle = []
+    for {
+        select {
+            next = <-ep.accepted => match next {
+                some(handle) => push(mut out, handle)
+                none => return out
+            }
+            else => return out
+        }
+    }
+}
+
+fn reset_token(ep: *Endpoint, cid: []u8) -> []u8 {
+    let mac = hash.hmac(hash.sha256(), ep.reset_key, cid)
+    let token = io.buffer(16)
+    io.copy(token, mac[..16])
+    token
+}
+
+fn held_by(ep: *Endpoint, key: str) -> i64 {
+    match ep.half_open_by_ip[key] {
+        some(n) => n
+        none => 0
+    }
+}
+
+fn begin_half_open(ep: *Endpoint, ip: []u8) -> bool {
+    let key = str(ip)
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    let held = held_by(ep, key)
+    if ep.half_open >= max_half_open() || held >= max_half_open_per_ip() {
+        return false
+    }
+    ep.half_open += 1
+    ep.half_open_by_ip[key] = held + 1
+    true
+}
+
+fn end_half_open(ep: *Endpoint, ip: []u8) {
+    let key = str(ip)
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    if ep.half_open > 0 {
+        ep.half_open -= 1
+    }
+    let held = held_by(ep, key)
+    if held > 1 {
+        ep.half_open_by_ip[key] = held - 1
+    } else {
+        delete(mut ep.half_open_by_ip, key)
+    }
+}
+
+fn half_open_count(ep: *Endpoint) -> i64 {
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    ep.half_open
+}
+
+fn half_open_from(ep: *Endpoint, ip: []u8) -> i64 {
+    let key = str(ip)
+    sync.lock(ep.routes_lock)
+    defer sync.unlock(ep.routes_lock)
+    held_by(ep, key)
+}
+
+fn reader(ep: *Endpoint) {
+    let buf = io.buffer(65536)
+    for {
+        let packet = net.receive_from_on(ep.socket, buf) catch {
+            Malformed => continue
+            Reset => continue
+            _ => return
+        }
+        dispatch(ep, buf, packet)
+    }
+}
+
+fn dispatch(ep: *Endpoint, buf: []u8, packet: net.Packet) {
+    if packet.size > max_datagram() {
+        return
+    }
+    let data = io.buffer(packet.size)
+    io.copy(data, buf[..packet.size])
+    let h = wire.parse_header(data, 0, cid_length()) catch {
+        _ => return
+    }
+    let datagram = Datagram { data, from: packet.from, received: time.monotonic() }
+    match find_route(ep, h.dcid) {
+        some(ch) => select {
+            ch <- datagram => {}
+            else => {}
+        }
+        none => unrouted(ep, datagram, h)
+    }
+}
+
+fn unrouted(ep: *Endpoint, d: Datagram, h: wire.Header) {
+    if !ep.server {
+        if h.kind == wire.PacketKind.Short {
+            forward_to_sole(ep, d)
+        }
+        return
+    }
+    match h.kind {
+        Unknown => negotiate_version(ep, d, h)
+        Initial => admit(ep, d, h)
+        Short => stateless_reset(ep, d, h)
+        _ => {}
+    }
+}
+
+fn forward_to_sole(ep: *Endpoint, d: Datagram) {
+    match sole_route(ep) {
+        some(ch) => select {
+            ch <- d => {}
+            else => {}
+        }
+        none => {}
+    }
+}
+
+fn stateless_reset(ep: *Endpoint, d: Datagram, h: wire.Header) {
+    let received = d.data.len
+    if received < min_reset_trigger() {
+        return
+    }
+    let size = least(received - 1, max_reset_size())
+    let packet = crypto.random(size)
+    packet[0] = 0x40 | (packet[0] & 0x3f)
+    let token = reset_token(ep, h.dcid)
+    io.copy(packet[size - 16..], token)
+    send(ep, packet, d.from) catch {
+        _ => {}
+    }
+}
+
+fn negotiate_version(ep: *Endpoint, d: Datagram, h: wire.Header) {
+    if d.data.len < min_initial() {
+        return
+    }
+    let reply = wire.version_negotiation(h.scid, h.dcid, [wire.version1()])
+    send(ep, reply, d.from) catch {
+        _ => {}
+    }
+}
+
+fn admit(ep: *Endpoint, d: Datagram, h: wire.Header) {
+    if d.data.len < min_initial() || h.dcid.len < cid_length() || atomic.is_set(ep.shutdown) {
+        return
+    }
+    let open = half_open_count(ep)
+    if open >= max_half_open() || half_open_from(ep, d.from.ip) >= max_half_open_per_ip() {
+        return
+    }
+    if !ep.config.retry && open < retry_half_open() {
+        start_server(ep, d, h, h.dcid, none)
+        return
+    }
+    if h.token.len == 0 {
+        answer_retry(ep, d, h)
+        return
+    }
+    match check_token(ep, d.from, h.token, h.dcid) {
+        some(original) => start_server(ep, d, h, original, some(h.dcid))
+        none => {}
+    }
+}
+
+fn answer_retry(ep: *Endpoint, d: Datagram, h: wire.Header) {
+    let scid = crypto.random(cid_length())
+    let token = retry_token(ep, d.from, h.dcid, scid)
+    let reply = wire.retry_packet(wire.version1(), h.scid, scid, h.dcid, token)
+    send(ep, reply, d.from) catch {
+        _ => {}
+    }
+}
+
+fn token_mac(ep: *Endpoint, addr: net.Addr, expiry: []u8, original_dcid: []u8, retry_scid: []u8) -> []u8 {
+    var input: []u8 = []
+    io.append(mut input, addr.ip)
+    io.put_be16(mut input, addr.port)
+    io.append(mut input, expiry)
+    push(mut input, u8(original_dcid.len))
+    io.append(mut input, original_dcid)
+    io.append(mut input, retry_scid)
+    hash.hmac(hash.sha256(), ep.token_key, input)
+}
+
+fn retry_token(ep: *Endpoint, addr: net.Addr, original_dcid: []u8, retry_scid: []u8) -> []u8 {
+    var expiry: []u8 = []
+    io.put_be64(mut expiry, time.monotonic() / 1000000 + token_lifetime_ms())
+    let mac = token_mac(ep, addr, expiry, original_dcid, retry_scid)
+    var token: []u8 = []
+    io.append(mut token, expiry)
+    push(mut token, u8(original_dcid.len))
+    io.append(mut token, original_dcid)
+    io.append(mut token, mac)
+    token
+}
+
+fn check_token(ep: *Endpoint, addr: net.Addr, token: []u8, dcid: []u8) -> []u8? {
+    let mac_size = 32
+    if token.len < 9 + mac_size {
+        return none
+    }
+    let length = i64(token[8])
+    if token.len != 9 + length + mac_size {
+        return none
+    }
+    let expiry = token[..8]
+    let original = token[9..9 + length]
+    let tag = token[9 + length..]
+    let expected = token_mac(ep, addr, expiry, original, dcid)
+    if !hash.equal(expected, tag) {
+        return none
+    }
+    if io.be64(expiry, 0) < time.monotonic() / 1000000 {
+        return none
+    }
+    let copy = io.buffer(length)
+    io.copy(copy, original)
+    some(copy)
+}
