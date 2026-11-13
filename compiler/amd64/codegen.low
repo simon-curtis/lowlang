@@ -1,5 +1,6 @@
 import diag
 import ir
+import parallel
 import target
 import types
 import std/builder
@@ -40,7 +41,7 @@ struct Generator {
     platform: Platform
     plans: [*ir.CSig: *CPlan] = [:]
     text: builder.Builder = builder.builder()
-    data: builder.Builder = builder.builder()
+    chunks: []DataChunk = []
     scope: str = ""
     labels: i64 = 0
     data_labels: [str: bool] = [:]
@@ -52,6 +53,11 @@ struct Generator {
     jumps: []JumpTable = []
     tier: Tier = Baseline
     cache: *VectorCache? = none
+}
+
+struct DataChunk {
+    key: str
+    text: str
 }
 
 struct Moved {
@@ -118,21 +124,22 @@ fn write_symbols(mut out: builder.Builder, symbols: []Define) {
     }
 }
 
-pub fn generate(prog: *ir.Program, platform: Platform, table: *FuncTable?) -> Output ! Error {
+pub fn generate(prog: *ir.Program, platform: Platform, table: *FuncTable?, release: bool) -> Output ! Error {
     if table != none && platform_os(platform) != target.OS.Linux {
         fail HotTarget("hot reload needs the {target.string(target.OS.Linux)} target, not {target.string(platform_os(platform))}")
     }
     let g = new_generator(platform, table, "")
+    let parts = generate_parts(prog.funcs, platform, table, release)
     var funcs: [str: str] = [:]
     var body = builder.builder()
-    for f in prog.funcs {
-        g.text = builder.builder()
-        g.function(f)
-        let part = g.text.to_str()
-        funcs[f.name] = part
-        body.write(part)
+    for i, f in prog.funcs {
+        let part = parts[i]
+        if !release {
+            funcs[f.name] = part.text
+        }
+        body.write(part.text)
+        g.adopt(part)
     }
-    g.text = builder.builder()
     g.start(prog)
     if table != none {
         g.trampolines(prog.c_symbols)
@@ -164,11 +171,56 @@ pub fn generate(prog: *ir.Program, platform: Platform, table: *FuncTable?) -> Ou
     }
     platform_imports(platform, mut out, prog)
     out.write("\n\t.section .rodata\n")
-    out.write(g.data.to_str())
+    out.write(data_text(g.chunks))
     out.write("\n\t.text\n")
     out.write(body.to_str())
     out.write(g.text.to_str())
     Output { asm: out.to_str(), funcs }
+}
+
+struct Part {
+    text: str = ""
+    chunks: []DataChunk = []
+    maps: []StackMap = []
+}
+
+fn generate_parts(funcs: []*ir.Func, platform: Platform, table: *FuncTable?, release: bool) -> []Part {
+    var parts: []Part = []
+    for _ in funcs {
+        push(mut parts, Part {})
+    }
+    if table != none {
+        for i, f in funcs {
+            parts[i] = generate_part(f, platform, table, release)
+        }
+        return parts
+    }
+    parallel.each(funcs.len, fn(i: i64) {
+        parts[i] = generate_part(funcs[i], platform, none, release)
+    })
+    parts
+}
+
+fn generate_part(f: *ir.Func, platform: Platform, table: *FuncTable?, release: bool) -> Part {
+    let g = new_generator(platform, table, "")
+    g.function(f)
+    if release {
+        f.blocks = []
+    }
+    Part { text: g.text.to_str(), chunks: g.chunks, maps: g.maps }
+}
+
+fn adopt(g: *Generator, part: Part) {
+    for c in part.chunks {
+        if c.key == "" {
+            push(mut g.chunks, c)
+        } else if g.first_use(c.key) {
+            push(mut g.chunks, c)
+        }
+    }
+    for m in part.maps {
+        push(mut g.maps, m)
+    }
 }
 
 pub fn symbol(name: str, suffix: str) -> str {
@@ -271,8 +323,32 @@ fn variant_names(g: *Generator, enum_type: *types.Type) -> str {
     for v in enum_type.variants {
         push(mut names, g.message_label(v.name))
     }
-    g.data.write("\t.p2align 3\n{table}:\n\t.quad {text.join(names, ",")}\n")
+    g.data_always("\t.p2align 3\n{table}:\n\t.quad {text.join(names, ",")}\n")
     table
+}
+
+fn data_always(g: *Generator, text: str) {
+    push(mut g.chunks, DataChunk { key: "", text })
+}
+
+fn first_use(g: *Generator, key: str) -> bool {
+    if g.data_labels[key] ?? false {
+        return false
+    }
+    g.data_labels[key] = true
+    true
+}
+
+fn data_keyed(g: *Generator, key: str, text: str) {
+    push(mut g.chunks, DataChunk { key, text })
+}
+
+fn data_text(chunks: []DataChunk) -> str {
+    var out = builder.builder()
+    for c in chunks {
+        out.write(c.text)
+    }
+    out.to_str()
 }
 
 fn string_label(g: *Generator, s: str) -> str {
@@ -282,29 +358,26 @@ fn string_label(g: *Generator, s: str) -> str {
         h = h * 1099511628211
     }
     let l = ".Lstr_{h:x}"
-    if g.data_labels[l] ?? false {
+    if !g.first_use(l) {
         return l
     }
-    g.data_labels[l] = true
-    g.data.write("{l}:\n")
     if s.len == 0 {
+        g.data_keyed(l, "{l}:\n")
         return l
     }
     var bytes: []str = []
     for i in 0..s.len {
         push(mut bytes, "{s[i]}")
     }
-    g.data.write("\t.byte {text.join(bytes, ",")}\n")
+    g.data_keyed(l, "{l}:\n\t.byte {text.join(bytes, ",")}\n")
     l
 }
 
 fn embed_label(g: *Generator, path: str, digest: u64) -> str {
     let l = ".Lembed_{digest:x}"
-    if g.data_labels[l] ?? false {
-        return l
+    if g.first_use(l) {
+        g.data_keyed(l, "\t.p2align 4\n{l}:\n\t.incbin {quote_string(path)}\n")
     }
-    g.data_labels[l] = true
-    g.data.write("\t.p2align 4\n{l}:\n\t.incbin {quote_string(path)}\n")
     l
 }
 
@@ -328,7 +401,7 @@ pub fn quote_string(s: str) -> str {
 
 fn message_label(g: *Generator, s: str) -> str {
     let l = g.new_label()
-    g.data.write("\t.p2align 3\n\tMSG_BEGIN {l}\n\t.ascii {diag.quote(s)}\n\tMSG_END\n")
+    g.data_always("\t.p2align 3\n\tMSG_BEGIN {l}\n\t.ascii {diag.quote(s)}\n\tMSG_END\n")
     l
 }
 
@@ -506,19 +579,17 @@ fn move_to_xmm(g: *Generator, dst: str, src: str) {
 
 fn float_label(g: *Generator, bits: i64) -> str {
     let l = ".Lfc_{u64(bits):x}"
-    if !(g.data_labels[l] ?? false) {
-        g.data_labels[l] = true
-        g.data.write("\t.p2align 3\n{l}:\n\t.quad {bits}\n")
+    if g.first_use(l) {
+        g.data_keyed(l, "\t.p2align 3\n{l}:\n\t.quad {bits}\n")
     }
     l
 }
 
 fn sign_mask(g: *Generator, bits: i64) -> str {
     let l = ".Lsign_{bits}"
-    if !(g.data_labels[l] ?? false) {
-        g.data_labels[l] = true
+    if g.first_use(l) {
         let mask = u64(1) << u64(bits - 1)
-        g.data.write("\t.p2align 4\n{l}:\n\t.quad 0x{mask:x}, 0\n")
+        g.data_keyed(l, "\t.p2align 4\n{l}:\n\t.quad 0x{mask:x}, 0\n")
     }
     l
 }
