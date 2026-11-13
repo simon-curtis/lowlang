@@ -25,6 +25,7 @@ type scope struct {
 	types    map[string]*types.Type
 	generics map[string]*generic
 	funcs    map[string]*ast.Func
+	consts   map[string]*ast.Const
 	home     *ast.File
 }
 
@@ -51,6 +52,7 @@ type Checker struct {
 	defaults        map[*types.Field]ast.Expr
 	checkingDefault map[*types.Field]bool
 	derived         map[string]*ast.Func
+	folding         map[*ast.Const]bool
 	embedder        EmbedResolver
 	unpropagated    *types.Type
 }
@@ -93,6 +95,7 @@ func Check(files []*ast.File, resolve EmbedResolver) (*types.Universe, error) {
 		defaults:        map[*types.Field]ast.Expr{},
 		checkingDefault: map[*types.Field]bool{},
 		derived:         map[string]*ast.Func{},
+		folding:         map[*ast.Const]bool{},
 	}
 	c.universe = types.NewUniverse(c.created)
 	failure := diag.Try(func() { c.check(files) })
@@ -108,7 +111,7 @@ func Check(files []*ast.File, resolve EmbedResolver) (*types.Universe, error) {
 func (c *Checker) scope(module string) *scope {
 	s, ok := c.modules[module]
 	if !ok {
-		s = &scope{types: map[string]*types.Type{}, generics: map[string]*generic{}, funcs: map[string]*ast.Func{}}
+		s = &scope{types: map[string]*types.Type{}, generics: map[string]*generic{}, funcs: map[string]*ast.Func{}, consts: map[string]*ast.Const{}}
 		c.modules[module] = s
 	}
 	return s
@@ -243,6 +246,7 @@ func (c *Checker) signatureOf(fn *ast.Func, cfn bool) *types.Type {
 func (c *Checker) check(files []*ast.File) {
 	c.declareTypes(files)
 	c.declareFuncs(files)
+	c.declareConsts(files)
 	var funcs []*ast.Func
 	for _, f := range files {
 		for _, fn := range f.Funcs {
@@ -910,6 +914,9 @@ func (c *Checker) mutable(root *ast.Local, pos diag.Pos, action string) {
 func (c *Checker) place(e ast.Expr, pos diag.Pos, action, invalid string) (root, *types.Type) {
 	t := c.plain(e, nil)
 	where, ok := rootOf(e)
+	if k := ast.ConstOf(e); k != nil {
+		c.fail(pos, "cannot %s, declared with const", fmt.Sprintf(action, k.Name))
+	}
 	if !ok {
 		c.fail(pos, "%s", invalid)
 	}
@@ -1233,6 +1240,10 @@ func (c *Checker) ident(e *ast.Ident, want *types.Type) {
 		b.constant(c, e, want)
 		return
 	}
+	if k, ok := c.local().consts[e.Name]; ok && c.find(e.Name) == nil {
+		e.Const, e.Type = k, c.folded(k).TypeOf()
+		return
+	}
 	if fn, ok := c.localFunc(e.Name); ok && c.find(e.Name) == nil {
 		e.Func, e.Type = c.funcValue(fn, want, e.Pos)
 		return
@@ -1288,7 +1299,13 @@ func (c *Checker) reachable(f *types.Field, t *types.Type, pos diag.Pos) {
 
 func (c *Checker) selector(e *ast.Selector, want *types.Type) {
 	if id, ok := e.X.(*ast.Ident); ok && c.isModule(id.Name) && c.typeRef(e.X) == nil {
-		if g := c.imported(id.Name, id.Pos).generics[e.Name]; g == nil {
+		module := c.imported(id.Name, id.Pos)
+		if k := module.consts[e.Name]; k != nil {
+			e.Const = c.importedConst(id.Name, k, e.Pos)
+			e.Type = c.folded(k).TypeOf()
+			return
+		}
+		if g := module.generics[e.Name]; g == nil {
 			e.Func, e.Type = c.funcValue(c.importedFunc(id.Name, e.Name, e.Pos), want, e.Pos)
 			return
 		}
@@ -2156,6 +2173,10 @@ func (c *Checker) pattern(p *ast.Pattern, enum *types.Type) {
 		c.subjects = append(c.subjects, enum)
 		c.expectType(p.Test, types.Bool)
 		c.subjects = c.subjects[:len(c.subjects)-1]
+		return
+	}
+	if c.constArm(p, enum) {
+		c.pattern(p, enum)
 		return
 	}
 	if binds(p.Name) && (enum.Kind != types.EnumKind || enum.Variant(p.Name) == nil) {

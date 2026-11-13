@@ -38,7 +38,11 @@ func layoutSource(constants []layoutConstant, tables []string) string {
 	var out strings.Builder
 	for _, c := range constants {
 		value := fmt.Sprintf(c.kind.format, c.value)
-		fmt.Fprintf(&out, "fn %s() -> %s { %s }\n", c.name, c.kind.name, value)
+		if c.kind == lowInt {
+			fmt.Fprintf(&out, "const %s = %s\n", c.name, value)
+			continue
+		}
+		fmt.Fprintf(&out, "const %s: %s = %s\n", c.name, c.kind.name, value)
 	}
 	out.WriteString("\n")
 	for _, table := range tables {

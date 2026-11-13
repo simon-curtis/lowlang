@@ -216,7 +216,7 @@ func TestBindingsShape(t *testing.T) {
 		"extern struct VkInstance {\n    handle: ptr = null\n}",
 		"fn VkPhysicalDeviceProperties_deviceName(s: VkPhysicalDeviceProperties) -> str {",
 		"fn VkPhysicalDeviceMemoryProperties_memoryTypes(s: VkPhysicalDeviceMemoryProperties) -> []VkMemoryType {",
-		"fn VK_QUEUE_FAMILY_IGNORED() -> u32 {\n    4294967295\n}",
+		"const VK_QUEUE_FAMILY_IGNORED: u32 = 4294967295",
 		"    hwnd: ptr = null",
 	} {
 		if !strings.Contains(text, want) {

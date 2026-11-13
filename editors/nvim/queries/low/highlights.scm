@@ -38,6 +38,9 @@
 (extern_function
   name: (identifier) @function)
 
+(const_declaration
+  name: (identifier) @constant)
+
 (call_expression
   function: (identifier) @function.call
   (#match? @function.call "^[a-z_]")
@@ -83,6 +86,7 @@
   "var"
   "struct"
   "enum"
+  "const"
   "extern"
   "defer"
   "spawn"

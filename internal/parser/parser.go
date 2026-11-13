@@ -12,6 +12,7 @@ import (
 )
 
 type Parser struct {
+	src      []byte
 	tokens   []lexer.Token
 	i        int
 	noStruct bool
@@ -23,7 +24,7 @@ func ParseSource(src []byte, at diag.Pos, privileged bool) (*ast.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Parser{tokens: tokens, taken: map[int]bool{}}
+	p := &Parser{src: src, tokens: tokens, taken: map[int]bool{}}
 	var file *ast.File
 	if failure := diag.Try(func() { file = p.file() }); failure != nil {
 		return nil, failure
@@ -213,6 +214,10 @@ func (p *Parser) declaration(f *ast.File) {
 		d := p.structDecl()
 		d.Pub, d.File, d.Doc = pub, f, doc
 		f.Structs = append(f.Structs, d)
+	case lexer.Const:
+		d := p.constDecl()
+		d.Pub, d.File, d.Doc = pub, f, doc
+		f.Consts = append(f.Consts, d)
 	case lexer.Extern:
 		if p.peek() == lexer.Struct {
 			p.next()
@@ -232,8 +237,21 @@ func (p *Parser) declaration(f *ast.File) {
 	case lexer.Import:
 		p.fail(t.Pos, "imports must come before declarations")
 	default:
-		p.fail(t.Pos, "expected fn, enum or struct, found %s", describe(t))
+		p.fail(t.Pos, "expected fn, enum, struct or const, found %s", describe(t))
 	}
+}
+
+func (p *Parser) constDecl() *ast.Const {
+	pos := p.expect(lexer.Const).Pos
+	d := &ast.Const{Name: p.expect(lexer.Ident).Text, Pos: pos}
+	if p.accept(lexer.Colon) {
+		d.TypeName = p.typeName()
+	}
+	p.expect(lexer.Assign)
+	from := p.tok().Start
+	d.Value = p.expr()
+	d.Text = string(p.src[from:p.tokens[p.i-1].End])
+	return d
 }
 
 func (p *Parser) extern() *ast.Extern {
@@ -587,6 +605,8 @@ func (p *Parser) stmt() ast.Stmt {
 	switch t.Kind {
 	case lexer.Let, lexer.Var:
 		return p.let()
+	case lexer.Const:
+		p.fail(t.Pos, "const declares a module constant; use let inside a function")
 	case lexer.Using:
 		p.next()
 		mutable := p.at(lexer.Var)

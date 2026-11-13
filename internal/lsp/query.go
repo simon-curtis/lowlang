@@ -137,6 +137,8 @@ func (q *query) ident(n *ast.Ident) referent {
 	switch {
 	case n.Local != nil:
 		return q.localRef(n.Local)
+	case n.Const != nil:
+		return constRef{k: n.Const}
 	case n.Func != nil:
 		return funcRef{fn: n.Func}
 	case n.Variant != nil:
@@ -153,6 +155,8 @@ func (q *query) ident(n *ast.Ident) referent {
 
 func (q *query) selector(n *ast.Selector) referent {
 	switch {
+	case n.Const != nil:
+		return constRef{k: n.Const}
 	case n.Func != nil:
 		return funcRef{fn: n.Func}
 	case n.Field != nil:
@@ -202,6 +206,8 @@ func (q *query) variantRef(enum *types.Type, name string, variant *types.Variant
 func (q *query) declaration() referent {
 	self := target{path: q.file().Path, pos: q.occ.pos}
 	switch n := q.occ.node.(type) {
+	case *ast.Const:
+		return own{at: self, referent: constRef{k: n}}
 	case *ast.Func:
 		return own{at: self, referent: funcRef{fn: n}}
 	case *ast.StructDecl:

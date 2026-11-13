@@ -123,6 +123,8 @@ func (b *indexer) visit(n ast.Node) bool {
 		b.add(occurrence{pos: n.Pos, name: n.Name, node: n, parent: b.parents[n]})
 	case *ast.TypeParam:
 		b.add(occurrence{pos: n.Pos, name: n.Name, node: n})
+	case *ast.Const:
+		b.declared(n.Pos, n.Name, n, nil)
 	case *ast.Func:
 		b.declared(n.Pos, n.Name, n, nil)
 		b.bindParams(n.Params, n.ParamLocals)

@@ -11,6 +11,7 @@ type Lexer struct {
 	src        []byte
 	file       string
 	off        int
+	from       int
 	line       int
 	col        int
 	last       Kind
@@ -66,6 +67,7 @@ func (l *Lexer) advance() byte {
 }
 
 func (l *Lexer) emit(t Token) {
+	t.Start, t.End = l.from, l.off
 	if t.Kind != Newline && len(l.doc) > 0 {
 		t.Doc, t.DocAt = strings.Join(l.doc, "\n"), l.docAt
 		l.doc = nil
@@ -145,6 +147,7 @@ func (l *Lexer) lineStart(at int) bool {
 
 func (l *Lexer) next() error {
 	start := l.pos()
+	l.from = l.off
 	c := l.peek(0)
 	switch {
 	case c == '\n':
@@ -156,8 +159,7 @@ func (l *Lexer) next() error {
 	case isLetter(c):
 		return l.ident(start)
 	case isDigit(c):
-		l.number(start)
-		return nil
+		return l.number(start)
 	case c == '"':
 		return l.string(start)
 	case c == '\'':
@@ -183,15 +185,14 @@ func (l *Lexer) ident(start diag.Pos) error {
 	return nil
 }
 
-func (l *Lexer) number(start diag.Pos) {
+func (l *Lexer) number(start diag.Pos) error {
 	from := l.off
 	kind := Int
 	if l.peek(0) == '0' && (l.peek(1) == 'x' || l.peek(1) == 'b' || l.peek(1) == 'o') {
 		l.advance()
 		l.advance()
 		l.digits(isHexDigit)
-		l.emitNumber(kind, from, start)
-		return
+		return l.emitNumber(kind, from, start, isHexDigit)
 	}
 	l.digits(isDigit)
 	if l.peek(0) == '.' && isDigit(l.peek(1)) {
@@ -207,7 +208,7 @@ func (l *Lexer) number(start diag.Pos) {
 		}
 		l.digits(isDigit)
 	}
-	l.emitNumber(kind, from, start)
+	return l.emitNumber(kind, from, start, isDigit)
 }
 
 func (l *Lexer) digits(accept func(byte) bool) {
@@ -216,9 +217,16 @@ func (l *Lexer) digits(accept func(byte) bool) {
 	}
 }
 
-func (l *Lexer) emitNumber(kind Kind, from int, start diag.Pos) {
-	text := strings.ReplaceAll(string(l.src[from:l.off]), "_", "")
+func (l *Lexer) emitNumber(kind Kind, from int, start diag.Pos, digit func(byte) bool) error {
+	raw := l.src[from:l.off]
+	for i, c := range raw {
+		if c == '_' && (i == 0 || i == len(raw)-1 || !digit(raw[i-1]) || !digit(raw[i+1])) {
+			return diag.Errorf(start, "_ in a number must sit between two digits")
+		}
+	}
+	text := strings.ReplaceAll(string(raw), "_", "")
 	l.emit(Token{Kind: kind, Text: text, Pos: start})
+	return nil
 }
 
 var escapes = map[byte]byte{'n': '\n', 't': '\t', 'r': '\r', '0': 0, '\\': '\\', '"': '"', '\'': '\''}

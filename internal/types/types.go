@@ -169,6 +169,17 @@ func (t *Type) Holds(n int64) bool {
 	return n >= low && n <= high
 }
 
+func (t *Type) Wrap(n int64) int64 {
+	if t == nil || t.Bits == 0 || t.Bits >= 64 {
+		return n
+	}
+	shift := 64 - t.Bits
+	if t.Signed {
+		return n << shift >> shift
+	}
+	return int64(uint64(n) << shift >> shift)
+}
+
 func (t *Type) Bounds() (int64, int64) {
 	if t.Signed {
 		limit := int64(1) << (t.Bits - 1)

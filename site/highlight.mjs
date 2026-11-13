@@ -2,7 +2,7 @@ import { escape } from "./markup.mjs";
 
 const keywords = new Set([
     "fn", "let", "var", "if", "else", "for", "break", "continue", "return", "enum", "match", "fail", "catch", "or",
-    "struct", "mut", "in", "import", "pub", "extern", "defer", "spawn", "select", "using", "drop",
+    "struct", "const", "mut", "in", "import", "pub", "extern", "defer", "spawn", "select", "using", "drop",
 ]);
 const contextual = new Set(["after"]);
 const types = new Set([

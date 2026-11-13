@@ -20,6 +20,9 @@ func outline(file *ast.File, t text) []DocumentSymbol {
 	for _, d := range file.Enums {
 		symbols = append(symbols, enumSymbol(d, t))
 	}
+	for _, k := range file.Consts {
+		symbols = append(symbols, constSymbol(k, t))
+	}
 	for f := range file.Declared() {
 		if f.Extern == nil {
 			symbols = append(symbols, funcSymbol(f, t))
@@ -36,6 +39,11 @@ func symbol(t text, pos diag.Pos, name, detail string, kind int) DocumentSymbol 
 func funcSymbol(f *ast.Func, t text) DocumentSymbol {
 	pos := t.nameAfter(f.Pos, f.Name)
 	return symbol(t, pos, f.Name, f.Signature(), symbolFunction)
+}
+
+func constSymbol(k *ast.Const, t text) DocumentSymbol {
+	pos := t.nameAfter(k.Pos, k.Name)
+	return symbol(t, pos, k.Name, k.String(), symbolConstant)
 }
 
 func externSymbol(e *ast.Extern, t text) DocumentSymbol {
@@ -100,6 +108,9 @@ func (w *symbolSearch) file(f *ast.File, t text) {
 	}
 	for fn := range f.Declared() {
 		w.add(fn.Name, symbolFunction, sf.at(fn.Pos, fn.Name), container)
+	}
+	for _, k := range f.Consts {
+		w.add(k.Name, symbolConstant, sf.at(k.Pos, k.Name), container)
 	}
 	for _, d := range f.Structs {
 		w.add(d.Name, symbolStruct, sf.at(d.Pos, d.Name), container)

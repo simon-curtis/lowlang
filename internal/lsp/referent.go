@@ -69,6 +69,20 @@ func (r funcRef) target() (target, bool) {
 func (r funcRef) hover() string { return r.fn.Signature() }
 func (r funcRef) doc() string   { return r.fn.Source().Doc }
 
+type constRef struct {
+	k *ast.Const
+}
+
+func (r constRef) target() (target, bool) {
+	if r.k.File == nil || r.k.File.Path == "" {
+		return target{}, false
+	}
+	return target{path: r.k.File.Path, pos: r.k.Pos, name: r.k.Name}, true
+}
+
+func (r constRef) hover() string { return r.k.String() }
+func (r constRef) doc() string   { return r.k.Doc }
+
 type importRef struct {
 	q    *query
 	path string

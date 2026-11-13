@@ -185,6 +185,11 @@ func (m *ModuleDoc) add(file *ast.File, types map[string]bool) {
 			m.Items = append(m.Items, ItemDoc{Kind: "enum", Name: e.Name, Text: e.Interface(), Doc: e.Doc, File: name, Line: e.Pos.Line})
 		}
 	}
+	for _, k := range file.Consts {
+		if k.Pub {
+			m.Items = append(m.Items, ItemDoc{Kind: "const", Name: k.Name, Text: fmt.Sprintf("pub %s", k), Doc: k.Doc, File: name, Line: k.Pos.Line})
+		}
+	}
 	for _, f := range file.Funcs {
 		if f.Pub {
 			m.Items = append(m.Items, ItemDoc{Kind: "fn", Name: f.Name, Receiver: receiver(f, types), Text: fmt.Sprintf("pub %s", f), Doc: f.Doc, File: name, Line: f.Pos.Line})

@@ -296,6 +296,7 @@ const (
 	symbolField      = 8
 	symbolEnum       = 10
 	symbolFunction   = 12
+	symbolConstant   = 14
 	symbolEnumMember = 22
 	symbolStruct     = 23
 	messageError     = 1

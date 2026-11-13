@@ -437,7 +437,7 @@ func (o *optimizer) fold(v *Value) {
 			} else {
 				x = ^x
 			}
-			becomeConstant(v, wrap(x, v.Type))
+			becomeConstant(v, v.Type.Wrap(x))
 		}
 	case OpNot:
 		if v.Args[0].Op == OpConst {
@@ -523,17 +523,6 @@ func becomeConstant(v *Value, n int64) {
 	v.Aux = n
 }
 
-func wrap(n int64, t *types.Type) int64 {
-	if t == nil || t.Bits == 0 || t.Bits >= 64 {
-		return n
-	}
-	shift := 64 - t.Bits
-	if t.Signed {
-		return n << shift >> shift
-	}
-	return int64(uint64(n) << shift >> shift)
-}
-
 func commutative(op Op) bool {
 	return op == OpAdd || op == OpMul || op == OpAnd || op == OpOr || op == OpXor
 }
@@ -600,7 +589,7 @@ func evaluate(op Op, t *types.Type, x, y int64) (int64, bool) {
 	case OpDiv, OpRem:
 		return divideConstant(op, t, x, y)
 	}
-	return wrap(r, t), true
+	return t.Wrap(r), true
 }
 
 func shiftConstant(op Op, t *types.Type, x, count int64) (int64, bool) {
@@ -622,7 +611,7 @@ func shiftConstant(op Op, t *types.Type, x, count int64) (int64, bool) {
 	default:
 		r = int64(uint64(x) >> uint64(count))
 	}
-	return wrap(r, t), true
+	return t.Wrap(r), true
 }
 
 func divideConstant(op Op, t *types.Type, x, y int64) (int64, bool) {
@@ -640,7 +629,7 @@ func divideConstant(op Op, t *types.Type, x, y int64) (int64, bool) {
 	default:
 		r = x % y
 	}
-	return wrap(r, t), true
+	return t.Wrap(r), true
 }
 
 func (s *ssa) removeDeadValues() {

@@ -34,6 +34,9 @@ func (w walker) node(n Node) {
 		}
 	case *VariantDecl:
 		w.typeNames(n.Fields)
+	case *Const:
+		w.typeName(n.TypeName)
+		w.expr(n.Value)
 	case *Func:
 		w.typeParams(n.TypeParams)
 		w.params(n.Params)
@@ -214,6 +217,9 @@ func (w walker) file(f *File) {
 		w.node(d)
 	}
 	for _, d := range f.Enums {
+		w.node(d)
+	}
+	for _, d := range f.Consts {
 		w.node(d)
 	}
 	for fn := range f.Declared() {

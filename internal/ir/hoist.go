@@ -12,7 +12,7 @@ const (
 )
 
 func constant(e ast.Expr) bool {
-	switch e := e.(type) {
+	switch e := ast.Literal(e).(type) {
 	case *ast.IntLit, *ast.FloatLit, *ast.BoolLit, *ast.StrLit:
 		return true
 	case *ast.Unary:

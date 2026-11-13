@@ -42,9 +42,10 @@ function summary(text, limit) {
 }
 
 function members(module) {
-    const types = module.items.filter((item) => item.kind !== "fn");
+    const types = module.items.filter((item) => item.kind === "struct" || item.kind === "enum");
+    const constants = module.items.filter((item) => item.kind === "const");
     const functions = module.items.filter((item) => item.kind === "fn" && !item.receiver);
-    return { types, functions };
+    return { types, constants, functions };
 }
 
 function tags(path) {
@@ -81,6 +82,7 @@ class Page {
     #module;
     #description;
     #types;
+    #constants;
     #functions;
     #typeNames;
     #exports;
@@ -93,8 +95,9 @@ class Page {
     constructor(module, description, exports, snippets, library) {
         this.#module = module;
         this.#description = description;
-        const { types, functions } = members(module);
+        const { types, constants, functions } = members(module);
         this.#types = types;
+        this.#constants = constants;
         this.#functions = functions;
         this.#typeNames = new Set(types.map((item) => item.name));
         this.#exports = exports;
@@ -203,6 +206,10 @@ class Page {
             parts.push('<h2 id="types"><a href="#types">Types</a></h2>\n');
             parts.push(...this.#types.map((type) => `${this.#item(type, 3)}${this.#methods(type)}`));
         }
+        if (this.#constants.length > 0) {
+            parts.push('<h2 id="constants"><a href="#constants">Constants</a></h2>\n');
+            parts.push(...this.#constants.map((item) => this.#item(item, 3)));
+        }
         if (this.#functions.length > 0) {
             parts.push('<h2 id="functions"><a href="#functions">Functions</a></h2>\n');
             parts.push(...this.#functions.map((item) => this.#item(item, 3)));
@@ -218,6 +225,9 @@ class Page {
         }
         if (this.#types.length > 0) {
             groups.push(`<p class="mb-2 text-sm font-semibold uppercase tracking-wide">Types</p>\n${sidebarList(this.#types)}`);
+        }
+        if (this.#constants.length > 0) {
+            groups.push(`<p class="mb-2 text-sm font-semibold uppercase tracking-wide">Constants</p>\n${sidebarList(this.#constants)}`);
         }
         if (this.#functions.length > 0) {
             groups.push(`<p class="mb-2 text-sm font-semibold uppercase tracking-wide">Functions</p>\n${sidebarList(this.#functions)}`);
@@ -241,7 +251,7 @@ function index(modules, about) {
         const kinds = categories(module.path).join(" ");
         return `<li class="module" data-categories="${kinds}" data-search="${escape(`${module.path} ${text}`.toLowerCase())}"><a class="hit" href="${file(module.path)}"><code>${module.path}</code></a> <span class="text-sm">${module.items.length} items</span>${text ? `<br>${escape(text)}` : ""}<span class="mt-4 flex flex-wrap gap-x-2 gap-y-5">${tags(module.path)}</span></li>`;
     });
-    const body = `<p>The packages that ship with Low, extracted from their source by <code>low doc std</code>. Each page lists a module's public types, the functions that take them as their first argument, and its other public functions.</p>
+    const body = `<p>The packages that ship with Low, extracted from their source by <code>low doc std</code>. Each page lists a module's public types, the functions that take them as their first argument, its public constants and its other public functions.</p>
 <label class="mt-6 block"><span class="sr-only">Filter modules</span><input id="filter" type="search" placeholder="Filter ${modules.length} modules" class="w-full border px-3 py-2"></label>
 <nav class="tags" aria-label="Categories">
 <a class="tag" href="index.html" data-category="">all</a>

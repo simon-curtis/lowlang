@@ -45,6 +45,7 @@ const (
 	Select
 	Using
 	Drop
+	Const
 
 	LParen
 	RParen
@@ -107,7 +108,7 @@ var keywordSpellings = []spelling{
 	{"fn", Fn}, {"let", Let}, {"var", Var}, {"if", If}, {"else", Else}, {"for", For},
 	{"break", Break}, {"continue", Continue}, {"return", Return}, {"true", True}, {"false", False},
 	{"enum", Enum}, {"match", Match}, {"fail", Fail}, {"catch", Catch}, {"or", Or}, {"struct", Struct}, {"mut", Mut}, {"in", In}, {"import", Import},
-	{"pub", Pub}, {"extern", Extern}, {"defer", Defer}, {"spawn", Spawn}, {"select", Select}, {"using", Using}, {"drop", Drop},
+	{"pub", Pub}, {"extern", Extern}, {"defer", Defer}, {"spawn", Spawn}, {"select", Select}, {"using", Using}, {"drop", Drop}, {"const", Const},
 }
 
 var operatorSpellings = []spelling{
@@ -218,6 +219,8 @@ type Token struct {
 	Char  rune
 	Parts []Part
 	Pos   diag.Pos
+	Start int
+	End   int
 	Doc   string
 	DocAt diag.Pos
 }

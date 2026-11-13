@@ -8,6 +8,7 @@ var shared = map[reflect.Type]bool{
 	reflect.TypeFor[File]():   true,
 	reflect.TypeFor[Extern](): true,
 	reflect.TypeFor[Func]():   true,
+	reflect.TypeFor[Const]():  true,
 	reflect.TypeFor[Local]():  true,
 }
 

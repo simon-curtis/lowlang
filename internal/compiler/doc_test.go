@@ -43,6 +43,17 @@ pub fn unit() -> Box {
 }
 
 fn hidden() {}
+
+const base = 8
+
+/// The most boxes in a row.
+pub const limit = base * 4
+
+pub const scale: f32 = 1.5
+
+pub const clamp = u8(300)
+
+pub const label = "box" + "es"
 `
 	if err := os.WriteFile(filepath.Join(shapes, "box.low"), []byte(source), 0o644); err != nil {
 		t.Fatal(err)
@@ -73,6 +84,10 @@ fn hidden() {}
 		{Kind: "struct", Name: "Box", Text: "pub struct Box {\n    /// Across.\n    pub width: i64\n    ...\n}", Doc: "A box.", File: "box.low", Line: 4},
 		{Kind: "enum", Name: "Shape", Text: "pub enum Shape {\n    Dot\n    Square(i64)\n}", File: "box.low", Line: 10},
 		{Kind: "fn", Name: "area", Receiver: "Box", Text: "pub fn area(b: *Box) -> i64", File: "box.low", Line: 15},
+		{Kind: "const", Name: "clamp", Text: "pub const clamp = u8(300)", File: "box.low", Line: 32},
+		{Kind: "const", Name: "label", Text: "pub const label = \"box\" + \"es\"", File: "box.low", Line: 34},
+		{Kind: "const", Name: "limit", Text: "pub const limit = base * 4", Doc: "The most boxes in a row.", File: "box.low", Line: 28},
+		{Kind: "const", Name: "scale", Text: "pub const scale: f32 = 1.5", File: "box.low", Line: 30},
 		{Kind: "fn", Name: "unit", Text: "pub fn unit() -> Box", File: "box.low", Line: 19},
 	}
 	if len(module.Items) != len(want) {
@@ -131,6 +146,9 @@ func documentedAPI(t *testing.T, platform target.OS) map[string]ItemDoc {
 	for _, module := range modules {
 		for _, item := range module.Items {
 			item.File, item.Line = "", 0
+			if item.Kind == "const" {
+				item.Text, _, _ = strings.Cut(item.Text, " = ")
+			}
 			api[fmt.Sprintf("%s %s %s.%s", module.Path, item.Kind, item.Receiver, item.Name)] = item
 		}
 	}
@@ -174,6 +192,11 @@ func (u *undocumented) file(f *ast.File) {
 		u.check(e.Doc, e.Pos, e.Name)
 		for _, v := range e.Variants {
 			u.check(v.Doc, v.Pos, fmt.Sprintf("%s.%s", e.Name, v.Name))
+		}
+	}
+	for _, k := range f.Consts {
+		if k.Pub {
+			u.check(k.Doc, k.Pos, k.Name)
 		}
 	}
 	for _, fn := range f.Funcs {

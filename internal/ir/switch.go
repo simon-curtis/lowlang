@@ -74,7 +74,7 @@ func armKey(p *ast.Pattern) (int64, *types.Type, bool) {
 	if _, subject := test.X.(*ast.Subject); !subject {
 		return 0, nil, false
 	}
-	lit, ok := test.Y.(*ast.IntLit)
+	lit, ok := ast.Literal(test.Y).(*ast.IntLit)
 	typ := test.X.TypeOf()
 	if !ok || typ == nil || typ.Kind != types.IntKind || !typ.Holds(lit.Value) {
 		return 0, nil, false

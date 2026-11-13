@@ -123,7 +123,7 @@ func foldConversion(v *Value) {
 	}
 	switch {
 	case v.From.Integer() && v.Type.Integer():
-		becomeConstant(v, wrap(c.Aux, v.Type))
+		becomeConstant(v, v.Type.Wrap(c.Aux))
 	case v.From.Integer() && v.Type.Float():
 		foldIntegerToFloat(v, c)
 	case v.From.Float() && v.Type.Integer():
@@ -155,9 +155,9 @@ func foldFloatToInteger(v, c *Value) {
 	case v.Type == types.U64 && !(inRange && truncated >= 0):
 		return
 	case !inRange:
-		becomeConstant(v, wrap(math.MinInt64, v.Type))
+		becomeConstant(v, v.Type.Wrap(math.MinInt64))
 	default:
-		becomeConstant(v, wrap(int64(truncated), v.Type))
+		becomeConstant(v, v.Type.Wrap(int64(truncated)))
 	}
 	v.FloatBits = 0
 }

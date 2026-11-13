@@ -219,6 +219,9 @@ func (c *cursor) span(f *ast.Func) (int, int) {
 	for g := range c.file.Declared() {
 		starts = append(starts, g.Pos)
 	}
+	for _, k := range c.file.Consts {
+		starts = append(starts, k.Pos)
+	}
 	for _, d := range c.file.Structs {
 		starts = append(starts, d.Pos)
 	}
@@ -288,6 +291,11 @@ func (c *cursor) module() {
 }
 
 func (c *cursor) declarations(f *ast.File, public bool) {
+	for _, k := range f.Consts {
+		if k.Pub || !public {
+			c.add(k.Name, completionConstant, k.String())
+		}
+	}
 	for fn := range f.Declared() {
 		if fn.Pub || !public {
 			c.add(fn.Name, completionFunction, fn.Signature())

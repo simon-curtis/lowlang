@@ -13,6 +13,11 @@
   "enum" @context
   name: (_) @name) @item
 
+(const_declaration
+  (visibility)? @context
+  "const" @context
+  name: (_) @name) @item
+
 (field_declaration
   name: (_) @name) @item
 

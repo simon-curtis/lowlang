@@ -96,8 +96,12 @@ func constantOf(e ast.Expr) (string, bool) {
 	case *ast.StrLit:
 		return strconv.Quote(e.Value), true
 	case *ast.Ident:
-		return e.Name, e.Variant != nil
+		return e.Name, e.Variant != nil || e.Const != nil
 	case *ast.Selector:
+		if e.Const != nil {
+			x, _ := subjectOf(e.X)
+			return fmt.Sprintf("%s.%s", x, e.Name), true
+		}
 		return e.Name, e.Variant != nil
 	}
 	return "", false

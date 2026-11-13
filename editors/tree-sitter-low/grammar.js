@@ -64,6 +64,7 @@ module.exports = grammar({
       $.function_declaration,
       $.struct_declaration,
       $.enum_declaration,
+      $.const_declaration,
       $.extern_block,
     ),
 
@@ -151,6 +152,15 @@ module.exports = grammar({
       field('name', alias($.identifier, $.type_identifier)),
       optional(field('type_parameters', $.type_parameters)),
       field('body', $.variant_list),
+    ),
+
+    const_declaration: $ => seq(
+      optional($.visibility),
+      'const',
+      field('name', $.identifier),
+      optional(seq(':', field('type', $._type))),
+      '=',
+      field('value', $._expression),
     ),
 
     variant_list: $ => seq('{', lines($, $.variant), '}'),

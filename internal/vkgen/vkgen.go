@@ -749,10 +749,11 @@ func literal(v int64, t string) string {
 var integerConstantTypes = map[string]string{"uint32_t": "u32", "uint64_t": "i64", "int32_t": "i32"}
 
 func (g *generator) constant(name, t, body string) {
-	g.Line("fn %s() -> %s {", name, t)
-	g.Line("    %s", body)
-	g.Line("}")
-	g.Line("")
+	if t == "i64" {
+		g.Line("const %s = %s", name, body)
+		return
+	}
+	g.Line("const %s: %s = %s", name, t, body)
 }
 
 func (g *generator) emitConstants() error {

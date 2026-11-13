@@ -802,6 +802,9 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		if e.Func != nil {
 			return b.funcValue(e.Func, e.Type)
 		}
+		if e.Const != nil {
+			return b.expr(e.Const.Folded)
+		}
 		words := b.load(b.place(&location{local: e.Local}), e.Type)
 		if e.Moved {
 			b.setFlag(e.Local.Flag, 0)
@@ -810,6 +813,9 @@ func (b *builder) expr(e ast.Expr) []*Value {
 	case *ast.Selector:
 		if e.Func != nil {
 			return b.funcValue(e.Func, e.Type)
+		}
+		if e.Const != nil {
+			return b.expr(e.Const.Folded)
 		}
 		if e.Reference != nil {
 			return b.fieldReference(e)

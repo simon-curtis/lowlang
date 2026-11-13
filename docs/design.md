@@ -74,6 +74,33 @@ let { min: { x: left }, max, label } = rect
 - The value is evaluated once, then each field is read from it.
 - `{` after `let` or `var` always starts a pattern.
 
+### Module constants
+
+```low
+/// The width that stands for no limit.
+pub const unbounded: f32 = 1.0 / 0.0
+const kib = 1 << 10
+const mib = kib * kib
+const greeting = "hello, " + name
+const name = "low"
+const ok = 200
+
+fn status(code: i64) -> str {
+    match code {
+        ok => "ok"
+        404 => "not found"
+        _ => "other"
+    }
+}
+```
+
+- `const name: T = value` declares a constant at the top level of a module. Without a type it takes the type `let` would infer: an integer literal is `i64` and a float literal `f64`.
+- A constant is a number, a `bool` or a `str`. Its value is built from literals, other constants, unary and binary operators and numeric conversions such as `u8(x)`, and is evaluated at compile time with the wrapping, shifts, rounding and conversions of the same expression at run time. Division by zero, a constant that depends on itself and a float out of the range of `u64` converted to `u64` are errors.
+- Constants of a module may be declared in any order and in any of its files. Each use is the folded value.
+- `pub` exports a constant, read as `module.name`. A constant cannot share its name with a function, type or builtin of its module, and a local of the same name hides it.
+- A constant cannot be assigned or passed as `mut`, and `const` inside a function body is an error.
+- In a `match` arm, a constant's name, or `module.name`, compares the subject with the constant instead of binding a new name.
+
 ### Functions
 
 <!-- prelude
@@ -203,7 +230,7 @@ let byte = u8(300)
 ```
 
 - Integer types are `i64`, `i32`, `u64`, `u32`, `u16` and `u8`; float types are `f64` and `f32`.
-- Integer literals are decimal, or hexadecimal, binary and octal with `0x`, `0b` and `0o`; `_` may separate digits. Float literals may have an exponent.
+- Integer literals are decimal, or hexadecimal, binary and octal with `0x`, `0b` and `0o`. Float literals may have an exponent. In any number literal `_` may separate two digits, as in `1_000_000.0` or `0xFF_FF`; an `_` anywhere else is an error.
 - An integer literal takes the type the context expects, including the other operand of a binary operator, and must fit it; otherwise it is `i64`. A literal above the `i64` range is accepted only as a `u64`. In an `if` expression with no expected type, an integer literal branch takes the type of the other branch.
 - A float literal is `f64` unless an `f32` is expected.
 - Integer arithmetic wraps at the type's width. Division by zero panics.
@@ -864,9 +891,9 @@ fn main() {
 - `import ui/text` loads `<root>/ui/text/`. A path starting with `std/` names a module of the standard library, which is compiled into `low`, so a project directory named `std` cannot be imported.
 - `low build dir` builds the directory as the entry module. `low build file.low` builds that one file as the entry module, without the other files beside it.
 - `low lint file.low` type-checks the program, prints warnings for the program's own modules (not the standard library), and exits with status 1 if there were any. `-target` picks the operating system whose files are checked and defaults to the host. `low build`, `low run`, `low asm` and `low ir` print the same warnings to stderr and continue. The language server reports them as warnings.
-  - `prefer-match` flags an `if` / `else if` / `else` chain with at least two conditions in which every condition is `==` between one side-effect-free subject (a variable, field, index or dereference) and a non-negative integer, character or string literal or an enum variant. It suggests `match subject { 4 => ..., _ => ... }`.
+  - `prefer-match` flags an `if` / `else if` / `else` chain with at least two conditions in which every condition is `==` between one side-effect-free subject (a variable, field, index or dereference) and a non-negative integer, character or string literal, a constant or an enum variant. It suggests `match subject { 4 => ..., _ => ... }`.
   - `prefer-loop-label` flags a `break` out of an inner loop that sets a boolean flag to a literal when the statement right after that loop is `if flag { break }` or `if flag { continue }` (or `if !flag` for a flag set to `false`), with no `else`. It suggests labelling the loop that `if` acts on and jumping to it with `break name` or `continue name`, reusing the label the `if` already names. Breaks inside a nested loop, closure, `spawn` or `defer` are not counted.
-- `low doc dir` prints, as JSON, every module under the directory with its imports, each with the name it is used through, and its public structs, enums and functions, each with its declaration as text, its file and its line. A struct shows its public fields, and `...` stands for its private ones. A function whose first parameter is a public type of its module, or a pointer to one, names that type as its receiver. Each module lists its examples with their name, source and expected output. `low doc std` documents the standard library, and the website builds its package pages from it with `-target linux/amd64`. `-target` picks the operating system whose files are documented and defaults to the host.
+- `low doc dir` prints, as JSON, every module under the directory with its imports, each with the name it is used through, and its public structs, enums, constants and functions, each with its declaration as written, its file and its line. A struct shows its public fields, and `...` stands for its private ones. A function whose first parameter is a public type of its module, or a pointer to one, names that type as its receiver. Each module lists its examples with their name, source and expected output. `low doc std` documents the standard library, and the website builds its package pages from it with `-target linux/amd64`. `-target` picks the operating system whose files are documented and defaults to the host.
 - Imports come before declarations and apply to their file.
 - A module is used through its last path segment, `text.shout(...)`, or through a name given with `import t = ui/text`.
 - Types are written `geometry.Shape` and built with `geometry.Point { ... }`. A variant can be named `geometry.Shape.Dot` or, where the type is expected, `Dot`.
@@ -1400,7 +1427,7 @@ Every standard library resource that must be disposed of is a droppable owner bo
 
 ### TLS
 
-- TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246), client and server. `Config.min_version` and `Config.max_version`, written with `tls12()` and `tls13()`, bound the versions and default to 1.2 through 1.3. A client offers its range through `supported_versions`, and a server answers with the highest version both support. `Session.handle.version` holds the result.
+- TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246), client and server. `Config.min_version` and `Config.max_version`, written with `tls12` and `tls13`, bound the versions and default to 1.2 through 1.3. A client offers its range through `supported_versions`, and a server answers with the highest version both support. `Session.handle.version` holds the result.
 - Downgrade protection: a server that supports 1.3 ends a 1.2 ServerHello random with the RFC 8446 downgrade sentinel; a client that offered 1.3 aborts with `illegal_parameter` when it sees either sentinel; a server refuses `TLS_FALLBACK_SCSV` below its highest version with `inappropriate_fallback`.
 - `Config.cipher_suites` lists suites in preference order, and a server takes the first of its own list that the client offers. `Session.handle.cipher_suite` holds the IANA code and `Session.handle.suite` the AEAD and hash.
 - TLS 1.3 has TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256 and TLS_AES_256_GCM_SHA384. TLS 1.2 has ECDHE with ECDSA or RSA authentication and AES-128-GCM with SHA-256, ChaCha20-Poly1305 with SHA-256 or AES-256-GCM with SHA-384, AEAD only: GCM records carry the 64-bit sequence number as their explicit nonce, and ChaCha20-Poly1305 records use the RFC 7905 nonce.
@@ -1484,7 +1511,7 @@ A `Reader` reports `at` in an `Error` as its `position`, whose unit is the forma
 
 #### Unicode
 
-- `std/unicode` reads tables generated by `cmd/tablegen unicode` from UnicodeData.txt, CaseFolding.txt and DerivedNormalizationProps.txt of Unicode 16.0.0, the version Python's `unicodedata` reports, and agrees with it on every code point. `cmd/tablegen unicode` and `cmd/tablegen properties` also write `normalization_layout.low` and `property_layout.low`: zero-argument functions for the record sizes, field offsets, trie shifts and masks, Hangul constants and packed property bit fields, and one `<table>_table()` accessor per `.bin` file that `embed`s it. The module sources read these instead of literals, and `TestLayoutFilesMatchGenerator` fails when a committed layout file differs from the generator.
+- `std/unicode` reads tables generated by `cmd/tablegen unicode` from UnicodeData.txt, CaseFolding.txt and DerivedNormalizationProps.txt of Unicode 16.0.0, the version Python's `unicodedata` reports, and agrees with it on every code point. `cmd/tablegen unicode` and `cmd/tablegen properties` also write `normalization_layout.low` and `property_layout.low`: constants for the record sizes, field offsets, trie shifts and masks, Hangul constants and packed property bit fields, and one `<table>_table()` accessor per `.bin` file that `embed`s it. The module sources read these instead of literals, and `TestLayoutFilesMatchGenerator` fails when a committed layout file differs from the generator.
 - The tables are `embed`ded binary files. A two-level trie of 64-entry blocks covers code points below U+2FA40 and gives 0 above. It maps each code point to a 16-bit record id. Each record holds the canonical combining class and 16-bit offsets and lengths into a pool of `u32` code points for the full canonical decomposition, the full compatibility decomposition and the C and F case folding.
 - Hangul syllables decompose and compose algorithmically. Decomposition is followed by a stable canonical reordering by combining class. Composition binary-searches a sorted table of primary composites, leaving out Full_Composition_Exclusion. ASCII input returns at once, or lowercased by `casefold` and `search_key`.
 - `search_key(s)` equals Python's `''.join(c for c in unicodedata.normalize('NFKD', s.casefold()) if not unicodedata.combining(c))`. It skips reordering, since every reordered character is dropped.
@@ -2100,7 +2127,7 @@ Mechanism:
   - Destructor requests pass `WL_MARSHAL_FLAG_DESTROY`, and an interface without a `destroy` request gets one that calls `wl_proxy_destroy`.
   - Objects are `ptr`, strings `ptr[u8]`, `fixed` an `i32`.
   - Events become an `extern struct` listener of `extern fn` fields, each defaulting to a generated function that ignores the event, so a listener names only the events it handles. `interface_add_listener(ifs, proxy, listener, data)` copies it into the record's C memory. Callbacks receive the listener's `data` pointer, a pinned Low object.
-  - Enum entries are functions such as `wl_shm_format_argb8888() -> u32`. Names that clash with Low keywords or builtins gain a trailing `_`.
+  - Enum entries are constants such as `wl_shm_format_argb8888: u32`. Names that clash with Low keywords or builtins gain a trailing `_`.
 - `internal/vkgen/registry` holds the Vulkan registry, `vk.xml.gz` from Vulkan-Docs v1.4.363, and `vulkan.list`, which selects extensions, commands, extra types such as `pNext` structures, and the library each target loads.
   - `go run ./cmd/vkgen -registry internal/vkgen/registry/vk.xml.gz -select internal/vkgen/registry/vulkan.list -o internal/compiler/std/ui/gpu` writes `vulkan.low` and one `vulkan_<os>.low` per target. A `command` line that ends with a target name, such as `command vkCreateWaylandSurfaceKHR linux`, goes only to that target's file, and `library windows vulkan-1` names the library its `extern` block links.
   - Commands and every type they reach are generated, skipping Vulkan SC variants. Enum values come from the core enums, every Vulkan feature level and the selected extensions.
@@ -2109,7 +2136,7 @@ Mechanism:
   - A fixed C array becomes numbered fields, `name_0` to `name_N`, with an accessor `Struct_name(s)` that returns them as a slice, or as a `str` for a character array.
   - Vulkan types map to `u32` (`uint32_t`, `VkBool32`, `VkFlags`, 32-bit flag bits), `i32` (`int32_t`, enums), `i64` (`uint64_t`, `VkDeviceSize`, `VkFlags64`, `size_t`), `u16`, `u8`, `f32` and `f64`. Platform types such as `HWND` and `wl_display*` are `ptr`.
   - Pointers to known types become `ptr[T]`; `void*`, function pointers and pointers to pointers become `ptr`. A command's single input or output through a pointer is a `mut` parameter; an array or optional pointer is a `ptr[T]`.
-  - Enum entries and API constants are functions such as `VK_FORMAT_R8G8B8A8_UNORM() -> i32`, and `vk_make_api_version` builds version numbers.
+  - Enum entries and API constants are constants such as `VK_FORMAT_R8G8B8A8_UNORM: i32`, and `vk_make_api_version` builds version numbers.
 - Both generators emit declarations without `pub`. `internal/vkgen` and `internal/wlgen` fail when the checked-in files differ from what the generators produce.
 - `std/ui/gpu/shaders` holds the GLSL and its SPIR-V. `go run ./cmd/shadergen internal/compiler/std/ui/gpu/shaders` compiles each stage with `glslc` to a `.spv` and records the SHA-256 sums of the sources and the `.spv` files in `shaders.sum`.
 
@@ -2184,7 +2211,7 @@ Win32:
   3. A child's cross size is its own, or the container's inner cross size when it stretches.
   4. `justify` places children on the main axis and `align` on the cross axis. Auto margins are not supported.
   5. Absolute children are placed against the padding box by their insets and do not take part in the flow. One with no inset on an axis is placed on it by the parent's `justify` or `align_items`.
-- A leaf's measure function takes the width available to it, `unbounded()` when unconstrained (`is_bounded` tells them apart), and returns its size.
+- A leaf's measure function takes the width available to it, `unbounded` when unconstrained (`is_bounded` tells them apart), and returns its size.
 
 ### Text
 

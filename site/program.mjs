@@ -1,4 +1,4 @@
-const declaration = /^(\/\/\/|(pub\s+)?(fn\s+\w|struct\s|enum\s|import\s|extern\s))/;
+const declaration = /^(\/\/\/|(pub\s+)?(fn\s+\w|struct\s|enum\s|const\s|import\s|extern\s))/;
 const continuation = /^(\s|[})\]]|$)/;
 const elision = /(^\s*|\{\s*)\.\.\.(?=\s*(\}|$))/gm;
 

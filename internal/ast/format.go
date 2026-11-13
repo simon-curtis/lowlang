@@ -143,6 +143,20 @@ func (f *Func) parts(resolved bool) (string, []string, string) {
 	return b.String(), params, fmt.Sprintf(")%s", tail)
 }
 
+func (k *Const) String() string {
+	if t := k.typeText(); t != "" {
+		return fmt.Sprintf("const %s: %s = %s", k.Name, t, k.Text)
+	}
+	return fmt.Sprintf("const %s = %s", k.Name, k.Text)
+}
+
+func (k *Const) typeText() string {
+	if k.Folded != nil {
+		return k.Folded.TypeOf().String()
+	}
+	return k.TypeName.String()
+}
+
 func (d *StructDecl) String() string {
 	return d.render(false)
 }

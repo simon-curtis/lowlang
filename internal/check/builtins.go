@@ -240,7 +240,7 @@ func vectorCaster(to *types.Type) builtinHandler {
 func (c *Checker) declared(name string) bool {
 	scope := c.local()
 	_, bound := c.bound[name]
-	return scope.funcs[name] != nil || scope.generics[name] != nil || bound || c.find(name) != nil
+	return scope.funcs[name] != nil || scope.consts[name] != nil || scope.generics[name] != nil || bound || c.find(name) != nil
 }
 
 func (c *Checker) builtinNamed(name string) *Builtin {

@@ -132,7 +132,7 @@ func loopPush(body *ast.Block) (*ast.Call, bool) {
 }
 
 func invariantValue(e ast.Expr, stored, counter *ast.Local) bool {
-	switch e := e.(type) {
+	switch e := ast.Literal(e).(type) {
 	case *ast.IntLit, *ast.FloatLit, *ast.BoolLit:
 		return true
 	case *ast.Ident:

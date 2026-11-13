@@ -397,9 +397,9 @@ func (g *generator) listener(i Interface) {
 func (g *generator) enums(i Interface) {
 	for _, e := range i.Enums {
 		for _, entry := range e.Entries {
-			g.Line("fn %s_%s_%s() -> u32 {", i.Name, e.Name, entry.Name)
-			g.Line("    %s", entry.Value)
-			g.Line("}")
+			g.Line("const %s_%s_%s: u32 = %s", i.Name, e.Name, entry.Name, entry.Value)
+		}
+		if len(e.Entries) > 0 {
 			g.Line("")
 		}
 	}

@@ -16,7 +16,37 @@ type File struct {
 	Externs []*Extern
 	Enums   []*EnumDecl
 	Structs []*StructDecl
+	Consts  []*Const
 	Funcs   []*Func
+}
+
+type Const struct {
+	Name     string
+	Doc      string
+	Pub      bool
+	File     *File
+	TypeName *TypeName
+	Value    Expr
+	Text     string
+	Folded   Expr
+	Pos      diag.Pos
+}
+
+func ConstOf(e Expr) *Const {
+	switch e := e.(type) {
+	case *Ident:
+		return e.Const
+	case *Selector:
+		return e.Const
+	}
+	return nil
+}
+
+func Literal(e Expr) Expr {
+	if k := ConstOf(e); k != nil {
+		return k.Folded
+	}
+	return e
 }
 
 type Extern struct {
@@ -343,6 +373,7 @@ type Ident struct {
 	Variant *types.Variant
 	Null    bool
 	Func    *Func
+	Const   *Const
 	Moved   bool
 }
 
@@ -356,6 +387,7 @@ type Selector struct {
 	Reference *types.Field
 	Length    bool
 	Func      *Func
+	Const     *Const
 }
 
 type Closure struct {
@@ -584,6 +616,7 @@ func (n *TypeParam) Position() diag.Pos     { return n.Pos }
 func (n *TypeName) Position() diag.Pos      { return n.Pos }
 func (n *StructDecl) Position() diag.Pos    { return n.Pos }
 func (n *EnumDecl) Position() diag.Pos      { return n.Pos }
+func (n *Const) Position() diag.Pos         { return n.Pos }
 func (n *FieldDecl) Position() diag.Pos     { return n.Pos }
 func (n *VariantDecl) Position() diag.Pos   { return n.Pos }
 func (n *FieldInit) Position() diag.Pos     { return n.Pos }
