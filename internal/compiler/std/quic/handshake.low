@@ -1,0 +1,311 @@
+import std/crypto/hash
+import std/io
+import std/quic/recovery
+import std/quic/wire
+import std/time
+import std/tls
+
+fn local_parameters(c: *Conn) -> wire.Parameters {
+    let config = c.config
+    let original: []u8? = if c.server { some(c.original_dcid) } else { none }
+    let retry: []u8? = if c.server { c.retry_scid } else { none }
+    let reset: []u8? = if c.server { some(reset_token(c.endpoint, c.scid)) } else { none }
+    wire.Parameters {
+        original_destination_connection_id: original
+        stateless_reset_token: reset
+        max_idle_timeout: config.idle_timeout
+        max_udp_payload_size: max_datagram()
+        initial_max_data: config.max_data
+        initial_max_stream_data_bidi_local: config.max_stream_data
+        initial_max_stream_data_bidi_remote: config.max_stream_data
+        initial_max_stream_data_uni: config.max_stream_data
+        initial_max_streams_bidi: clamp_streams(config.max_streams)
+        initial_max_streams_uni: clamp_streams(config.max_uni_streams)
+        ack_delay_exponent: 3
+        max_ack_delay: 25
+        disable_active_migration: c.server
+        active_connection_id_limit: 2
+        initial_source_connection_id: some(c.scid)
+        retry_source_connection_id: retry
+    }
+}
+
+fn post(events: chan[Event], gone: chan[bool], event: Event) {
+    select {
+        events <- event => {}
+        <-gone => {}
+    }
+}
+
+fn hook_send(events: chan[Event], gone: chan[bool], level: tls.Level, data: []u8) ! io.Error {
+    let copy = io.buffer(data.len)
+    io.copy(copy, data)
+    let event = Event.Crypto(level, copy)
+    select {
+        events <- event => {}
+        <-gone => fail NotConnected
+    }
+}
+
+fn hook_receive(events: chan[Event], gone: chan[bool]) -> tls.QuicData ! io.Error {
+    let reply = chan[tls.QuicData](1)
+    let request = Event.Receive(reply)
+    select {
+        events <- request => {}
+        <-gone => fail NotConnected
+    }
+    select {
+        data = <-reply => match data {
+            some(d) => d
+            none => fail NotConnected
+        }
+        <-gone => fail NotConnected
+    }
+}
+
+fn hook_install(events: chan[Event], gone: chan[bool], secret: tls.QuicSecret) ! io.Error {
+    let event = Event.Secret(secret)
+    select {
+        events <- event => {}
+        <-gone => fail NotConnected
+    }
+}
+
+fn hook_alert(events: chan[Event], gone: chan[bool], code: i64) {
+    post(events, gone, Event.Alert(code))
+}
+
+fn handshake_thread(events: chan[Event], gone: chan[bool], server: bool, config: tls.Config, parameters: []u8) {
+    let transport = tls.QuicTransport {
+        parameters
+        send: fn(level, data) { hook_send(events, gone, level, data) }
+        receive: fn() -> tls.QuicData ! io.Error { hook_receive(events, gone) }
+        install: fn(secret) { hook_install(events, gone, secret) }
+        alert: fn(code) { hook_alert(events, gone, code) }
+    }
+    if server {
+        let result = tls.quic_server(transport, config) catch {
+            e => {
+                post(events, gone, Event.Failed(e))
+                return
+            }
+        }
+        post(events, gone, Event.Finished(result))
+        return
+    }
+    let result = tls.quic_client(transport, config) catch {
+        e => {
+            post(events, gone, Event.Failed(e))
+            return
+        }
+    }
+    post(events, gone, Event.Finished(result))
+}
+
+fn on_event(c: *Conn, e: Event) {
+    match e {
+        Crypto(level, data) => queue_crypto(c, level, data)
+        Secret(s) => install_secret(c, s)
+        Receive(reply) => {
+            c.parked = some(reply)
+            answer_parked(c)
+        }
+        Alert(code) => on_alert(c, code)
+        Finished(r) => on_finished(c, r)
+        Failed(error) => on_failed(c, error)
+    }
+}
+
+fn queue_crypto(c: *Conn, level: tls.Level, data: []u8) {
+    let space = space_of(c, level)
+    if space.discarded {
+        return
+    }
+    io.append(mut space.crypto_out, data)
+}
+
+fn install_secret(c: *Conn, s: tls.QuicSecret) {
+    if ended(c) {
+        return
+    }
+    let keys = wire.keys(s.suite, s.secret) catch {
+        _ => {
+            fail_connection(c, wire.internal_error(), 0, "key derivation failed")
+            return
+        }
+    }
+    let space = space_of(c, s.level)
+    if space.discarded {
+        return
+    }
+    if s.writing {
+        space.write = some(keys)
+    } else {
+        space.read = some(keys)
+    }
+    if s.level == tls.Level.Handshake {
+        c.recovery.has_handshake_keys = true
+        recovery.rearm_timer(c.recovery, time.monotonic())
+    }
+    if !s.writing && s.level == tls.Level.Application {
+        derive_next_read(c, keys)
+    }
+    if !s.writing {
+        process_waiting(c)
+        answer_parked(c)
+    }
+}
+
+fn answer_parked(c: *Conn) {
+    let reply = match c.parked {
+        some(r) => r
+        none => return
+    }
+    for level in levels() {
+        let space = space_of(c, level)
+        if space.crypto_ready.len > 0 {
+            let data = space.crypto_ready
+            space.crypto_ready = []
+            c.parked = none
+            reply <- tls.QuicData { level, data }
+            return
+        }
+    }
+}
+
+fn on_alert(c: *Conn, code: i64) {
+    if ended(c) {
+        return
+    }
+    c.alerted = true
+    let value = wire.crypto_error(code)
+    let frame = wire.CloseFrame { application: false, code: value, frame_type: 0, reason: "" }
+    record_close(c, value, "", false, false)
+    enter_closing(c, frame, Malformed)
+}
+
+fn on_failed(c: *Conn, error: io.Error) {
+    if c.finished {
+        return
+    }
+    answer_ready(c, some(error))
+    if !c.alerted {
+        fail_connection(c, wire.internal_error(), 0, "handshake failed")
+    }
+}
+
+fn optional_equal(value: []u8?, expected: []u8) -> bool {
+    match value {
+        some(v) => hash.equal(v, expected)
+        none => false
+    }
+}
+
+fn present(value: []u8?) -> bool {
+    match value {
+        some(_) => true
+        none => false
+    }
+}
+
+fn parameters_valid(c: *Conn, p: wire.Parameters) -> bool {
+    if c.server {
+        return optional_equal(p.initial_source_connection_id, c.dcid) && !present(p.original_destination_connection_id) && !present(p.preferred_address) && !present(p.retry_source_connection_id) && !present(p.stateless_reset_token)
+    }
+    let retry_matches = match c.retry_scid {
+        some(retry) => optional_equal(p.retry_source_connection_id, retry)
+        none => !present(p.retry_source_connection_id)
+    }
+    c.dcid_switched && optional_equal(p.initial_source_connection_id, c.dcid) && optional_equal(p.original_destination_connection_id, c.initial_dcid) && retry_matches
+}
+
+fn on_finished(c: *Conn, r: tls.QuicResult) {
+    if c.finished {
+        return
+    }
+    if c.phase != Phase.Open {
+        if c.server {
+            publish_connection(c)
+        }
+        return
+    }
+    let params = wire.decode_parameters(r.peer_parameters) catch {
+        _ => {
+            answer_ready(c, some(Malformed))
+            fail_connection(c, wire.transport_parameter_error(), 0, "invalid transport parameters")
+            return
+        }
+    }
+    if !parameters_valid(c, params) {
+        answer_ready(c, some(Malformed))
+        fail_connection(c, wire.transport_parameter_error(), 0, "transport parameters do not match the connection")
+        return
+    }
+    c.peer_parameters = some(params)
+    apply_peer_parameters(c, params)
+    c.recovery.max_ack_delay = params.max_ack_delay * 1000000
+    c.handshake_complete = true
+    c.handle.protocol = r.protocol
+    c.handle.group = r.group
+    c.handle.suite = r.suite
+    c.handle.peer_certificates = r.peer_certificates
+    match params.stateless_reset_token {
+        some(token) => set_initial_token(c, token)
+        none => {}
+    }
+    if c.server {
+        complete_server(c)
+        return
+    }
+    answer_ready(c, none)
+}
+
+fn complete_server(c: *Conn) {
+    flush(c)
+    c.handshake_done_pending = true
+    confirm_handshake(c)
+    release_half_open(c)
+    publish_connection(c)
+}
+
+fn publish_connection(c: *Conn) {
+    let ep = c.endpoint
+    select {
+        ep.accepted <- c.handle => {}
+        <-ep.closed => {
+            c.finished = true
+        }
+        else => fail_connection(c, wire.connection_refused(), 0, "")
+    }
+}
+
+fn confirm_handshake(c: *Conn) {
+    if c.handshake_confirmed {
+        return
+    }
+    c.handshake_confirmed = true
+    c.recovery.handshake_confirmed = true
+    c.recovery.peer_completed_address_validation = true
+    discard_keys(c, tls.Level.Handshake)
+    if c.server {
+        remove_route(c.endpoint, c.initial_dcid)
+    }
+    recovery.rearm_timer(c.recovery, time.monotonic())
+}
+
+fn discard_keys(c: *Conn, level: tls.Level) {
+    let space = space_of(c, level)
+    if space.discarded {
+        return
+    }
+    space.discarded = true
+    space.read = none
+    space.write = none
+    space.ack_pending = false
+    space.ack_deadline = -1
+    space.crypto_resend = []
+    space.crypto_ready = []
+    space.crypto_in_chunks = [:]
+    space.sent = [:]
+    recovery.discard_space(c.recovery, rspace(level), time.monotonic())
+}

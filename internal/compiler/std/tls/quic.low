@@ -1,0 +1,158 @@
+import std/crypto
+import std/crypto/x509
+import std/io
+import std/slices
+
+/// The QUIC encryption level a handshake message or traffic secret belongs to (RFC 9001 section 4.1.4).
+pub enum Level {
+    /// The level of the packets protected with the keys derived from the destination connection ID, which carry the ClientHello and ServerHello.
+    Initial
+    /// The level of the packets protected with the handshake traffic secrets, which carry the rest of the handshake.
+    Handshake
+    /// The level of the 1-RTT packets protected with the application traffic secrets.
+    Application
+}
+
+/// Handshake bytes received in QUIC CRYPTO frames, with the level of the packets that carried them.
+pub struct QuicData {
+    /// The level of the packets that carried `data`.
+    pub level: Level
+    /// The contiguous CRYPTO stream bytes, which may end inside a handshake message.
+    pub data: []u8
+}
+
+/// A traffic secret the handshake hands to QUIC.
+pub struct QuicSecret {
+    /// The level whose packets the secret protects.
+    pub level: Level
+    /// Whether the secret protects the packets this endpoint sends. `false` means the packets it receives.
+    pub writing: bool
+    /// The AEAD and hash of the negotiated cipher suite, which QUIC uses to derive the packet protection keys.
+    pub suite: Suite
+    /// The traffic secret, as long as the hash output of `suite`.
+    pub secret: []u8
+}
+
+/// The QUIC side of a handshake run by `quic_client` or `quic_server`.
+///
+/// The handshake calls these functions from the green thread that runs it, so they may block.
+pub struct QuicTransport {
+    /// The encoded QUIC transport parameters of this endpoint, sent in the `quic_transport_parameters` extension (0x39) of the ClientHello or EncryptedExtensions.
+    pub parameters: []u8
+    /// Sends handshake bytes in CRYPTO frames at a level.
+    ///
+    /// Called with a whole handshake message, or several, at the level that was current when the handshake wrote them. An error aborts the handshake and is returned by it.
+    pub send: fn(Level, []u8) ! io.Error
+    /// Blocks for the next handshake bytes received in CRYPTO frames.
+    ///
+    /// An error, such as `Eof` or `TimedOut` for a connection that failed, aborts the handshake and is returned by it.
+    pub receive: fn() -> QuicData ! io.Error
+    /// Installs a traffic secret.
+    ///
+    /// Called in the order the handshake derives the secrets. An error aborts the handshake and is returned by it.
+    pub install: fn(QuicSecret) ! io.Error
+    /// Reports a fatal TLS alert, which QUIC sends as a connection error with code `0x100` plus the alert description.
+    pub alert: fn(i64)
+}
+
+/// The outcome of a QUIC handshake.
+pub struct QuicResult {
+    /// The ALPN protocol that was negotiated. Never empty.
+    pub protocol: str
+    /// The named group code of the key exchange.
+    pub group: i64
+    /// The authenticated cipher in use.
+    pub suite: Suite
+    /// The certificate chain the server presented, leaf first. Empty on the server side, which does not request client certificates.
+    pub peer_certificates: []x509.Certificate
+    /// The body of the peer's `quic_transport_parameters` extension, as received.
+    pub peer_parameters: []u8
+}
+
+fn max_parameters() -> i64 {
+    16384
+}
+
+fn quic_config(config: Config) -> Config ! io.Error {
+    if config.max_version < 0x0304 {
+        fail Invalid
+    }
+    var suites: []i64 = []
+    for code in config.cipher_suites {
+        if suite_of(code) != none && !slices.contains(suites, code) {
+            push(mut suites, code)
+        }
+    }
+    var out = config
+    out.min_version = 0x0304
+    out.cipher_suites = suites
+    out
+}
+
+/// Performs the client side of a QUIC TLS 1.3 handshake (RFC 9001) through `t` and returns the outcome.
+///
+/// Only TLS 1.3 is used, whatever `config.min_version` says, and only the TLS 1.3 suites of `config.cipher_suites` are offered. The ClientHello carries an empty `legacy_session_id`, the ALPN list `config.alpn` and `t.parameters` as extension 0x39. The server certificate is verified as `client` does. Handshake messages go out through `t.send`, come in through `t.receive` and the traffic secrets go to `t.install`: Handshake read, Handshake write, Application write and Application read, in that order. Returns after the client Finished has been sent and reads no post-handshake messages.
+///
+/// Fails with `Invalid` when `config.max_version` is below TLS 1.3, when `t.parameters` is longer than 16384 bytes, when `config.alpn` is empty, when no usable suite or group remains or when verification fails, with `Unsupported` when the server selects nothing the client offered or no application protocol, with `TooLarge` for a handshake message longer than 65536 bytes (alert 22) and with `Malformed` for other protocol violations: an EncryptedExtensions without transport parameters (alert 109) or with more than 16384 bytes of them (alert 47), handshake data received at a level other than the current one and bytes left in the handshake buffer when a key changes (alert 10), and messages that do not parse (alert 50). A fatal failure is reported once through `t.alert`. Errors of `t.send`, `t.receive` and `t.install` are returned unchanged.
+pub fn quic_client(t: QuicTransport, config: Config) -> QuicResult ! io.Error {
+    let quic = quic_config(config)?
+    if t.parameters.len > max_parameters() {
+        fail Invalid
+    }
+    if quic.alpn.len == 0 {
+        fail Invalid
+    }
+    let offer = Offer {
+        random: crypto.random(32)
+        session_id: []
+        suites: offered_suites(quic)
+        groups: offered_groups(quic)
+        parameters: t.parameters
+    }
+    if offer.suites.len == 0 || offer.groups.len == 0 {
+        fail Invalid
+    }
+    let c = quic_channel(t)
+    let reply = greet(c, quic, offer)?
+    let done = client13(c, quic, offer, reply)?
+    QuicResult {
+        protocol: done.protocol
+        group: done.group
+        suite: done.suite
+        peer_certificates: done.chain
+        peer_parameters: done.peer_parameters
+    }
+}
+
+/// Performs the server side of a QUIC TLS 1.3 handshake (RFC 9001) through `t` and returns the outcome.
+///
+/// Requires `config.certificates` and `config.key`. Only TLS 1.3 is used, whatever `config.min_version` says, and only the TLS 1.3 suites of `config.cipher_suites` are chosen. Suite, group and signature scheme are chosen as `server` does, with a HelloRetryRequest when the client sent no share for the chosen group. The first protocol in `config.alpn` that the client also offers is selected and `t.parameters` goes out as extension 0x39 of the EncryptedExtensions. Handshake messages go out through `t.send`, come in through `t.receive` and the traffic secrets go to `t.install`: Handshake write, Handshake read, then after the client Finished, Application write and Application read. Returns after the client Finished has been verified and reads no post-handshake messages.
+///
+/// Fails with `Invalid` for missing certificates or key, when `config.max_version` is below TLS 1.3 or when `t.parameters` is longer than 16384 bytes, with `Unsupported` when no version, suite, group, scheme or application protocol is shared (alert 120, `no_application_protocol`, for the last), with `TooLarge` for a handshake message longer than 65536 bytes (alert 22) and with `Malformed` for other protocol violations: a ClientHello with a non-empty `legacy_session_id` (alert 47), without transport parameters (alert 109) or with more than 16384 bytes of them (alert 47), handshake data received at a level other than the current one and bytes left in the handshake buffer when a key changes (alert 10), and messages that do not parse (alert 50). A fatal failure is reported once through `t.alert`. Errors of `t.send`, `t.receive` and `t.install` are returned unchanged.
+pub fn quic_server(t: QuicTransport, config: Config) -> QuicResult ! io.Error {
+    let key = match config.key {
+        some(k) => k
+        none => fail Invalid
+    }
+    if config.certificates.len == 0 {
+        fail Invalid
+    }
+    let quic = quic_config(config)?
+    if t.parameters.len > max_parameters() {
+        fail Invalid
+    }
+    let c = quic_channel(t)
+    let m = expect_message(c, 1)?
+    let hello = parse_client_hello(m.body) or fail abort(c, 50, Malformed)
+    if choose_version(quic, hello) != 0x0304 {
+        fail refuse(c, 70)
+    }
+    let done = server13(c, quic, key, hello, m.raw)?
+    QuicResult {
+        protocol: done.protocol
+        group: done.group
+        suite: done.suite
+        peer_certificates: done.chain
+        peer_parameters: done.peer_parameters
+    }
+}

@@ -27,6 +27,22 @@ struct Offer {
     session_id: []u8
     suites: []i64
     groups: []i64
+    parameters: []u8?
+}
+
+struct Reply {
+    shares: []Share
+    transcript: []u8
+    message: Message
+    hello: ServerHello
+}
+
+struct Done13 {
+    protocol: str
+    group: i64
+    suite: Suite
+    chain: []x509.Certificate
+    peer_parameters: []u8
 }
 
 fn offered_suites(config: Config) -> []i64 {
@@ -110,6 +126,12 @@ fn client_hello(config: Config, offer: Offer, shares: []Share, cookie: []u8) -> 
         var body_cookie: []u8 = []
         put_vector16(mut body_cookie, cookie)
         put_extension(mut exts, 44, body_cookie)
+    }
+    match offer.parameters {
+        some(parameters) => {
+            put_extension(mut exts, 57, parameters)
+        }
+        none => {}
     }
     put_vector16(mut body, exts)
     handshake_message(1, body)
@@ -202,7 +224,27 @@ fn negotiated_protocol(c: *Channel, config: Config, exts: []Extension) -> str ! 
             }
             fail abort(c, 47, Malformed)
         }
-        none => ""
+        none => {
+            if is_quic(c) {
+                fail abort(c, 120, Unsupported)
+            }
+            ""
+        }
+    }
+}
+
+fn peer_parameters(c: *Channel, exts: []Extension) -> []u8 ! io.Error {
+    if !is_quic(c) {
+        return []
+    }
+    match find(exts, 57) {
+        some(raw) => {
+            if raw.len > max_parameters() {
+                fail abort(c, 47, Malformed)
+            }
+            raw
+        }
+        none => fail abort(c, 109, Malformed)
     }
 }
 
@@ -249,12 +291,24 @@ pub fn client_handle(s: io.Stream, config: Config) -> *SessionHandle ! io.Error 
         session_id: crypto.random(32)
         suites: offered_suites(config)
         groups: offered_groups(config)
+        parameters: none
     }
     if !versions_valid(config) || offer.suites.len == 0 || offer.groups.len == 0 {
         fail Invalid
     }
     let c = channel(s)
     c.plaintext_version = 0x0301
+    let reply = greet(c, config, offer)?
+    if c.version == 0x0303 {
+        var transcript = reply.transcript
+        io.append(mut transcript, reply.message.raw)
+        return client12(c, config, offer, transcript, reply.hello)
+    }
+    let done = client13(c, config, offer, reply)?
+    session(c, done.protocol, done.group, done.suite, suite_code(done.suite), done.chain)
+}
+
+fn greet(c: *Channel, config: Config, offer: Offer) -> Reply ! io.Error {
     var shares: []Share = []
     if offers13(config) {
         let first_group = offer.groups[0]
@@ -271,19 +325,15 @@ pub fn client_handle(s: io.Stream, config: Config) -> *SessionHandle ! io.Error 
     c.version = negotiate_version(c, config, hello)?
     var transcript: []u8 = []
     io.append(mut transcript, first)
-    if c.version == 0x0303 {
-        io.append(mut transcript, m.raw)
-        return client12(c, config, offer, transcript, hello)
-    }
-    client13(c, config, offer, shares, transcript, m, hello)
+    Reply { shares, transcript, message: m, hello }
 }
 
-fn client13(c: *Channel, config: Config, offer: Offer, offered_shares: []Share, first: []u8, first_reply: Message, first_hello: ServerHello) -> *SessionHandle ! io.Error {
-    var shares = offered_shares
-    var transcript = first
-    var m = first_reply
-    var echoed = first_hello.session_id
-    var hello = hello13(c, offer, first_hello)?
+fn client13(c: *Channel, config: Config, offer: Offer, reply: Reply) -> Done13 ! io.Error {
+    var shares = reply.shares
+    var transcript = reply.transcript
+    var m = reply.message
+    var echoed = reply.hello.session_id
+    var hello = hello13(c, offer, reply.hello)?
     if hello.retry {
         if !slices.contains(offer.groups, hello.group) {
             fail abort(c, 47, Unsupported)
@@ -324,12 +374,13 @@ fn client13(c: *Channel, config: Config, offer: Offer, offered_shares: []Share, 
         fail abort(c, 47, Malformed)
     }
     let k = schedule(hello.suite, secret, transcript)
-    c.read_key = protection(hello.suite, k.server_handshake)?
+    set_read_key(c, hello.suite, k.server_handshake)?
     let ee = expect_message(c, 8)?
     let ec = cursor(ee.body)
     let ee_exts = extensions(ec) or fail abort(c, 50, Malformed)
     end(ec)?
     let protocol = negotiated_protocol(c, config, ee_exts)?
+    let parameters = peer_parameters(c, ee_exts)?
     io.append(mut transcript, ee.raw)
     var next = read_handshake(c)?
     var requested = false
@@ -363,7 +414,7 @@ fn client13(c: *Channel, config: Config, offer: Offer, offered_shares: []Share, 
     io.append(mut transcript, fin.raw)
     let client_app = derive_secret(k.hash, k.master, "c ap traffic", transcript)
     let server_app = derive_secret(k.hash, k.master, "s ap traffic", transcript)
-    c.write_key = protection(hello.suite, k.client_handshake)?
+    set_write_key(c, hello.suite, k.client_handshake)?
     var flight: []u8 = []
     if requested {
         let empty = certificate_message(request_context, [])
@@ -372,9 +423,9 @@ fn client13(c: *Channel, config: Config, offer: Offer, offered_shares: []Share, 
     }
     io.append(mut flight, handshake_message(20, finished(k, k.client_handshake, transcript)))
     write_record(c, 22, flight)?
-    c.write_key = protection(hello.suite, client_app)?
-    c.read_key = protection(hello.suite, server_app)?
-    session(c, protocol, hello.group, hello.suite, suite_code(hello.suite), chain)
+    set_write_key(c, hello.suite, client_app)?
+    set_read_key(c, hello.suite, server_app)?
+    Done13 { protocol, group: hello.group, suite: hello.suite, chain, peer_parameters: parameters }
 }
 
 /// Connects to `host` and `port` over TCP and performs a TLS client handshake.

@@ -1,0 +1,144 @@
+import std/crypto/hash
+import std/io
+import std/quic/wire
+
+fn active_id_limit() -> i64 {
+    2
+}
+
+fn max_retire_queue() -> i64 {
+    8
+}
+
+fn copied(b: []u8) -> []u8 {
+    let out = io.buffer(b.len)
+    io.copy(out, b)
+    out
+}
+
+fn set_dcid(c: *Conn, id: []u8) {
+    c.dcid = id
+    for i in 0..c.peer_ids.len {
+        if c.peer_ids[i].sequence == 0 {
+            var first = c.peer_ids[i]
+            first.id = id
+            c.peer_ids[i] = first
+        }
+    }
+}
+
+fn set_initial_token(c: *Conn, token: []u8) {
+    for i in 0..c.peer_ids.len {
+        if c.peer_ids[i].sequence == 0 {
+            var first = c.peer_ids[i]
+            first.token = copied(token)
+            c.peer_ids[i] = first
+        }
+    }
+}
+
+fn queue_retire(c: *Conn, sequence: i64) -> bool {
+    for queued in c.retire_queue {
+        if queued == sequence {
+            return true
+        }
+    }
+    if c.retire_queue.len >= max_retire_queue() {
+        return false
+    }
+    push(mut c.retire_queue, sequence)
+    true
+}
+
+fn on_connection_id_frame(c: *Conn, f: wire.Frame) {
+    match f {
+        NewConnectionId(sequence, retire_prior_to, id, token) => on_new_connection_id(c, sequence, retire_prior_to, id, token)
+        RetireConnectionId(_) => fail_connection(c, wire.protocol_violation(), 0x19, "RETIRE_CONNECTION_ID for a connection ID that was not issued")
+        _ => {}
+    }
+}
+
+fn conflicts(c: *Conn, sequence: i64, id: []u8, token: []u8) -> bool {
+    for p in c.peer_ids {
+        if p.sequence == sequence {
+            return !(hash.equal(p.id, id) && hash.equal(p.token, token))
+        }
+        if hash.equal(p.id, id) {
+            return true
+        }
+    }
+    false
+}
+
+fn known(c: *Conn, sequence: i64) -> bool {
+    for p in c.peer_ids {
+        if p.sequence == sequence {
+            return true
+        }
+    }
+    false
+}
+
+fn lowest(ids: []PeerId) -> []u8 {
+    var best = ids[0]
+    for p in ids {
+        if p.sequence < best.sequence {
+            best = p
+        }
+    }
+    best.id
+}
+
+fn holds(ids: []PeerId, id: []u8) -> bool {
+    for p in ids {
+        if hash.equal(p.id, id) {
+            return true
+        }
+    }
+    false
+}
+
+fn on_new_connection_id(c: *Conn, sequence: i64, retire_prior_to: i64, id: []u8, token: []u8) {
+    if c.dcid.len == 0 || token.len != 16 {
+        fail_connection(c, wire.protocol_violation(), 0x18, "invalid NEW_CONNECTION_ID")
+        return
+    }
+    if conflicts(c, sequence, id, token) {
+        fail_connection(c, wire.protocol_violation(), 0x18, "NEW_CONNECTION_ID repeats a connection ID")
+        return
+    }
+    let prior = if retire_prior_to > c.retire_prior { retire_prior_to } else { c.retire_prior }
+    var kept: []PeerId = []
+    var retired: []i64 = []
+    for p in c.peer_ids {
+        if p.sequence < prior {
+            push(mut retired, p.sequence)
+        } else {
+            push(mut kept, p)
+        }
+    }
+    if sequence < prior {
+        push(mut retired, sequence)
+    } else if !known(c, sequence) {
+        push(mut kept, PeerId { sequence, id: copied(id), token: copied(token) })
+    }
+    if kept.len == 0 {
+        fail_connection(c, wire.protocol_violation(), 0x18, "NEW_CONNECTION_ID retires every connection ID")
+        return
+    }
+    if kept.len > active_id_limit() {
+        fail_connection(c, wire.connection_id_limit_error(), 0x18, "too many connection IDs")
+        return
+    }
+    for owed in retired {
+        if !queue_retire(c, owed) {
+            fail_connection(c, wire.connection_id_limit_error(), 0x18, "too many connection IDs to retire")
+            return
+        }
+    }
+    c.peer_ids = kept
+    c.retire_prior = prior
+    if !holds(kept, c.dcid) {
+        c.dcid = lowest(kept)
+    }
+}

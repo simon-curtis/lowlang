@@ -1,0 +1,219 @@
+import std/io
+import std/quic/recovery
+import std/quic/wire
+import std/time
+import std/tls
+
+struct KeyState {
+    read_phase: bool = false
+    write_phase: bool = false
+    next_read: wire.Keys? = none
+    previous_read: wire.Keys? = none
+    previous_until: i64 = 0
+    first_received: i64 = 0
+    first_sent: i64 = 0
+    write_unacked: bool = false
+    peer_update_pending: bool = false
+    sent_in_phase: i64 = 0
+    failed: i64 = 0
+    updates: i64 = 0
+}
+
+fn update_after_packets() -> i64 {
+    8388608
+}
+
+fn integrity_limit(suite: tls.Suite) -> i64 {
+    match suite {
+        ChaCha20Poly1305 => 68719476736
+        _ => 4503599627370496
+    }
+}
+
+fn derive_next_read(c: *Conn, current: wire.Keys) {
+    let next = wire.next_keys(current) catch {
+        _ => {
+            fail_connection(c, wire.internal_error(), 0, "key derivation failed")
+            return
+        }
+    }
+    c.keys.next_read = some(next)
+}
+
+fn try_open(k: wire.Keys, packet: []u8, h: wire.Header, largest: i64) -> wire.Opened? {
+    let opened = wire.open(k, packet, h, largest) catch {
+        _ => return none
+    }
+    some(opened)
+}
+
+fn note_failed(c: *Conn, current: wire.Keys) {
+    let ks = c.keys
+    ks.failed += 1
+    if ks.failed > integrity_limit(current.suite) {
+        fail_connection(c, wire.aead_limit_reached(), 0, "too many packets failed authentication")
+    }
+}
+
+fn expire_previous(c: *Conn) {
+    let ks = c.keys
+    if time.monotonic() >= ks.previous_until {
+        ks.previous_read = none
+    }
+}
+
+fn open_packet(c: *Conn, space: *Space, keys: wire.Keys, packet: []u8, h: wire.Header) -> wire.Opened? {
+    if h.kind != wire.PacketKind.Short {
+        return try_open(keys, packet, h, space.largest_received)
+    }
+    let phase = wire.peek_key_phase(keys, packet, h) catch {
+        _ => return none
+    }
+    let ks = c.keys
+    if phase == ks.read_phase {
+        let opened = try_open(keys, packet, h, space.largest_received)
+        match opened {
+            some(_) => {}
+            none => note_failed(c, keys)
+        }
+        return opened
+    }
+    expire_previous(c)
+    match ks.previous_read {
+        some(previous) => {
+            let old = try_open(previous, packet, h, space.largest_received)
+            match old {
+                some(o) => {
+                    if o.number < ks.first_received {
+                        return old
+                    }
+                    return none
+                }
+                none => {}
+            }
+        }
+        none => {}
+    }
+    let next = match ks.next_read {
+        some(n) => n
+        none => return none
+    }
+    let updated = try_open(next, packet, h, space.largest_received)
+    match updated {
+        some(o) => {
+            if o.number <= space.largest_received {
+                return none
+            }
+            return follow_peer_update(c, space, keys, next, o)
+        }
+        none => {
+            note_failed(c, keys)
+            return none
+        }
+    }
+}
+
+fn follow_peer_update(c: *Conn, space: *Space, current: wire.Keys, next: wire.Keys, o: wire.Opened) -> wire.Opened? {
+    let ks = c.keys
+    let write_follows = ks.write_phase == ks.read_phase
+    if write_follows && ks.peer_update_pending {
+        fail_connection(c, wire.key_update_error(), 0, "key update before the previous one was acknowledged")
+        return none
+    }
+    ks.previous_read = some(current)
+    ks.previous_until = time.monotonic() + 3 * recovery.pto_duration(c.recovery)
+    space.read = some(next)
+    ks.read_phase = !ks.read_phase
+    ks.first_received = o.number
+    derive_next_read(c, next)
+    if write_follows {
+        rotate_write(c, space)
+        ks.peer_update_pending = true
+    }
+    some(o)
+}
+
+fn rotate_write(c: *Conn, space: *Space) {
+    let current = match space.write {
+        some(k) => k
+        none => return
+    }
+    let next = wire.next_keys(current) catch {
+        _ => {
+            fail_connection(c, wire.internal_error(), 0, "key derivation failed")
+            return
+        }
+    }
+    let ks = c.keys
+    space.write = some(next)
+    ks.write_phase = !ks.write_phase
+    ks.first_sent = space.next_pn
+    ks.write_unacked = true
+    ks.sent_in_phase = 0
+    ks.updates += 1
+    c.ping_pending = true
+}
+
+fn update_error(c: *Conn) -> io.Error? {
+    if ended(c) {
+        return some(NotConnected)
+    }
+    if !c.handshake_confirmed || c.keys.write_unacked {
+        return some(Invalid)
+    }
+    none
+}
+
+fn start_update(c: *Conn) -> io.Error? {
+    let refused = update_error(c)
+    match refused {
+        some(_) => return refused
+        none => {}
+    }
+    rotate_write(c, c.application)
+    if ended(c) {
+        return some(Aborted)
+    }
+    none
+}
+
+fn on_update_keys(c: *Conn, reply: chan[Answer]) {
+    if ended(c) {
+        let e = ended_error(c)
+        reply_error(reply, e)
+        return
+    }
+    let outcome = start_update(c)
+    let answer = Answer { value: 0, error: outcome }
+    reply <- answer
+}
+
+fn maybe_update_for_limit(c: *Conn) {
+    if c.keys.sent_in_phase < update_after_packets() {
+        return
+    }
+    let refused = update_error(c)
+    match refused {
+        some(_) => return
+        none => {}
+    }
+    rotate_write(c, c.application)
+}
+
+fn note_application_sent(c: *Conn, acked: bool) {
+    let ks = c.keys
+    ks.sent_in_phase += 1
+    if acked {
+        ks.peer_update_pending = false
+    }
+    maybe_update_for_limit(c)
+}
+
+fn on_application_ack(c: *Conn, largest: i64) {
+    let ks = c.keys
+    if !ks.write_unacked || largest < ks.first_sent {
+        return
+    }
+    ks.write_unacked = false
+    maybe_update_for_limit(c)
+}

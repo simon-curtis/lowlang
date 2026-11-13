@@ -1,0 +1,519 @@
+import std/crypto
+import std/crypto/hash
+import std/crypto/x509
+import std/io
+import std/net
+import std/quic
+import std/quic/wire
+import std/tls
+
+fn kind_name(k: wire.PacketKind) -> str {
+    match k {
+        Initial => "Initial"
+        ZeroRtt => "ZeroRtt"
+        Handshake => "Handshake"
+        Retry => "Retry"
+        VersionNegotiation => "VersionNegotiation"
+        Short => "Short"
+        Unknown => "Unknown"
+    }
+}
+
+fn server_config_for(retry: bool, alpn: []str) -> quic.Config ! io.Error {
+    let pem = embed("std_tls_ec.pem")
+    let certificates = x509.pem_certificates(pem)
+    let key = x509.pem_private_key(pem)?
+    let secure = tls.Config { certificates, key, alpn }
+    quic.Config { tls: secure, retry }
+}
+
+fn server_config(retry: bool) -> quic.Config ! io.Error {
+    server_config_for(retry, ["h3"])
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        push(mut out, x509.parse(der) or return out)
+    }
+    out
+}
+
+fn client_config(alpn: []str) -> quic.Config {
+    let secure = tls.Config { roots: roots(), alpn }
+    quic.Config { tls: secure }
+}
+
+fn pattern(n: i64, seed: i64) -> []u8 {
+    var out: []u8 = []
+    for i in 0..n {
+        push(mut out, u8(seed + i))
+    }
+    out
+}
+
+fn padded(head: []u8, size: i64) -> []u8 {
+    var out = head
+    for out.len < size {
+        push(mut out, 0)
+    }
+    out
+}
+
+fn foreign_version(dcid: []u8, scid: []u8, size: i64) -> []u8 {
+    var head: []u8 = []
+    push(mut head, 0xc3)
+    io.put_be32(mut head, 0x1a2a3a4a)
+    push(mut head, u8(dcid.len))
+    io.append(mut head, dcid)
+    push(mut head, u8(scid.len))
+    io.append(mut head, scid)
+    padded(head, size)
+}
+
+fn initial_shaped(dcid: []u8, scid: []u8, size: i64) -> []u8 {
+    var head: []u8 = []
+    push(mut head, 0xc0)
+    io.put_be32(mut head, 1)
+    push(mut head, u8(dcid.len))
+    io.append(mut head, dcid)
+    push(mut head, u8(scid.len))
+    io.append(mut head, scid)
+    push(mut head, 0)
+    let length = size - head.len - 2
+    io.put_be16(mut head, 0x4000 | length)
+    padded(head, size)
+}
+
+fn initial_with_token(dcid: []u8, scid: []u8, token: []u8, size: i64) -> []u8 {
+    var head: []u8 = []
+    push(mut head, 0xc0)
+    io.put_be32(mut head, 1)
+    push(mut head, u8(dcid.len))
+    io.append(mut head, dcid)
+    push(mut head, u8(scid.len))
+    io.append(mut head, scid)
+    wire.put_varint(mut head, token.len)
+    io.append(mut head, token)
+    let length = size - head.len - 2
+    io.put_be16(mut head, 0x4000 | length)
+    padded(head, size)
+}
+
+fn listener_address(l: quic.Listener) -> net.Addr {
+    net.Addr { ip: l.handle.addr.ip, port: l.handle.addr.port }
+}
+
+fn reply_to(socket: net.Socket, request: []u8, to: net.Addr) -> []u8 ! io.Error {
+    let sent = net.send_to(socket, request, to)?
+    let buf = io.buffer(2048)
+    let packet = net.receive_from(socket, buf)?
+    buf[..packet.size]
+}
+
+fn check_version_negotiation() ! io.Error {
+    let config = server_config(false)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    print("listen port is non-zero: {l.handle.addr.port != 0}")
+    using socket = net.bind_udp("127.0.0.1", 0)?
+    net.set_receive_timeout(socket, 2000)
+    let dcid = pattern(8, 1)
+    let scid = pattern(5, 100)
+    let request = foreign_version(dcid, scid, 1200)
+    let to = listener_address(l)
+    let reply = reply_to(socket, request, to)?
+    let h = wire.parse_header(reply, 0, 8)?
+    let kind = kind_name(h.kind)
+    let swapped_dcid = hash.equal(h.dcid, scid)
+    let swapped_scid = hash.equal(h.scid, dcid)
+    print("version negotiation reply: kind {kind}, versions {h.versions}")
+    print("  dcid is the request scid: {swapped_dcid}, scid is the request dcid: {swapped_scid}")
+}
+
+fn check_small_datagram() ! io.Error {
+    let config = server_config(false)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using socket = net.bind_udp("127.0.0.1", 0)?
+    net.set_receive_timeout(socket, 300)
+    let request = foreign_version(pattern(8, 1), pattern(5, 100), 100)
+    let to = listener_address(l)
+    let reply = reply_to(socket, request, to) catch {
+        TimedOut => {
+            print("100 byte datagram: no reply")
+            return
+        }
+        e => fail e
+    }
+    print("100 byte datagram: reply of {reply.len} bytes")
+}
+
+fn check_retry() ! io.Error {
+    let config = server_config(true)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using socket = net.bind_udp("127.0.0.1", 0)?
+    net.set_receive_timeout(socket, 2000)
+    let dcid = pattern(8, 40)
+    let scid = pattern(4, 90)
+    let request = initial_shaped(dcid, scid, 1200)
+    let to = listener_address(l)
+    let reply = reply_to(socket, request, to)?
+    let h = wire.parse_header(reply, 0, 8)?
+    let kind = kind_name(h.kind)
+    let valid = wire.retry_valid(dcid, reply)
+    let echoed = hash.equal(h.dcid, scid)
+    print("retry reply: kind {kind}, integrity tag valid: {valid}, token length {h.token.len}")
+    print("  dcid is the request scid: {echoed}, new scid length {h.scid.len}")
+}
+
+fn dial_outcome(port: i64, timeout: i64) -> str {
+    var settings = client_config(["h3"])
+    settings.handshake_timeout = timeout
+    let handle = quic.dial_handle("127.0.0.1", port, settings) catch {
+        e => return "{e}"
+    }
+    quic.close_on(handle, 0, "")
+    "connected"
+}
+
+fn check_retry_token_reuse() ! io.Error {
+    var config = server_config(true)?
+    config.handshake_timeout = 1500
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using socket = net.bind_udp("127.0.0.1", 0)?
+    net.set_receive_timeout(socket, 2000)
+    let to = listener_address(l)
+    let scid = pattern(4, 90)
+    let request = initial_shaped(pattern(8, 40), scid, 1200)
+    let reply = reply_to(socket, request, to)?
+    let retry = wire.parse_header(reply, 0, 8)?
+    for k in 0..20 {
+        let fresh = pattern(8, 100 + k)
+        let replay = initial_with_token(fresh, scid, retry.token, 1200)
+        let sent = net.send_to(socket, replay, to)?
+    }
+    sleep(200)
+    let after_fresh = dial_outcome(l.handle.addr.port, 3000)
+    print("retry token replayed on 20 other destination IDs: dial {after_fresh}")
+    for k in 0..20 {
+        let replay = initial_with_token(retry.scid, scid, retry.token, 1200)
+        let sent = net.send_to(socket, replay, to)?
+    }
+    sleep(200)
+    let after_same = dial_outcome(l.handle.addr.port, 3000)
+    print("retry token replayed 20 times on its own destination ID: dial {after_same}")
+}
+
+fn check_half_open_per_address() ! io.Error {
+    var config = server_config(false)?
+    config.handshake_timeout = 1500
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using socket = net.bind_udp("127.0.0.1", 0)?
+    let to = listener_address(l)
+    for k in 0..12 {
+        let request = initial_shaped(pattern(8, 10 * k + 1), pattern(4, 90), 1200)
+        let sent = net.send_to(socket, request, to)?
+    }
+    sleep(200)
+    let blocked = dial_outcome(l.handle.addr.port, 700)
+    print("12 half-open attempts from one address: dial {blocked}")
+    sleep(1800)
+    let released = dial_outcome(l.handle.addr.port, 3000)
+    print("after they time out: dial {released}")
+}
+
+fn check_invalid_config() ! io.Error {
+    var config = server_config(false)?
+    config.tls.alpn = []
+    using without_alpn = quic.listen("127.0.0.1", 0, config) catch {
+        Invalid => {
+            print("empty alpn: Invalid")
+            return
+        }
+        e => fail e
+    }
+    print("empty alpn: listened")
+}
+
+fn check_missing_credentials() ! io.Error {
+    var bare = server_config(false)?
+    bare.tls.certificates = []
+    using without_certificates = quic.listen("127.0.0.1", 0, bare) catch {
+        Invalid => {
+            print("no certificates: Invalid")
+            return
+        }
+        e => fail e
+    }
+    print("no certificates: listened")
+}
+
+fn check_missing_key() ! io.Error {
+    var keyless = server_config(false)?
+    keyless.tls.key = none
+    using without_key = quic.listen("127.0.0.1", 0, keyless) catch {
+        Invalid => {
+            print("no key: Invalid")
+            return
+        }
+        e => fail e
+    }
+    print("no key: listened")
+}
+
+fn close_later(h: *quic.ListenerHandle) {
+    sleep(100)
+    quic.close_listener_on(h)
+}
+
+fn check_accept() ! io.Error {
+    let config = server_config(false)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    spawn close_later(l.handle)
+    let waiting = quic.accept_handle(l.handle) catch {
+        NotConnected => {
+            print("accept while closing: NotConnected")
+            return
+        }
+        e => fail e
+    }
+    print("accept while closing: accepted")
+}
+
+fn check_accept_after_close() ! io.Error {
+    let config = server_config(false)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    quic.close_listener(l)
+    quic.close_listener_on(l.handle)
+    let late = quic.accept_handle(l.handle) catch {
+        NotConnected => {
+            print("accept after close: NotConnected")
+            return
+        }
+        e => fail e
+    }
+    print("accept after close: accepted")
+}
+
+fn wait_for_close(h: *quic.ConnectionHandle) {
+    for waited in 0..200 {
+        if h.close_code != 0 {
+            return
+        }
+        sleep(10)
+    }
+}
+
+fn check_handshake() ! io.Error {
+    let config = server_config_for(false, ["hq-test"])?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    let port = l.handle.addr.port
+    using client = quic.dial("127.0.0.1", port, client_config(["hq-test"]))?
+    let accepted = quic.accept_handle(l.handle)?
+    print("client protocol: {client.handle.protocol}, server protocol: {accepted.protocol}")
+    print("server remote port equals client local port: {accepted.remote.port == client.handle.local.port}")
+    print("suites: {client.handle.suite}, {accepted.suite}")
+    print("roles: client server {client.handle.server}, accepted server {accepted.server}")
+    let s = quic.stats(client)?
+    print("client stats: packets sent {s.packets_sent > 0}, received {s.packets_received > 0}")
+    quic.close_on(client.handle, 7, "bye")
+    wait_for_close(accepted)
+    print("server saw: code {accepted.close_code}, reason {accepted.close_reason}, by peer {accepted.closed_by_peer}, application {accepted.application_close}")
+}
+
+fn check_alpn_mismatch() ! io.Error {
+    let config = server_config_for(false, ["hq-test"])?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using attempt = quic.dial("127.0.0.1", l.handle.addr.port, client_config(["other"])) catch {
+        e => {
+            print("alpn mismatch: {e}")
+            return
+        }
+    }
+    print("alpn mismatch: connected")
+}
+
+fn wait_for_end(h: *quic.ConnectionHandle) -> str {
+    for waited in 0..200 {
+        let s = quic.stats_on(h) catch {
+            e => return "{e}"
+        }
+        sleep(10)
+    }
+    "still open"
+}
+
+fn check_retry_connect() ! io.Error {
+    let config = server_config(true)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(["h3"]))?
+    let accepted = quic.accept_handle(l.handle)?
+    print("retry connect: client protocol {client.handle.protocol}, server protocol {accepted.protocol}")
+    let s = quic.stats(client)?
+    let t = quic.stats_on(accepted)?
+    print("retry connect: both sides exchange packets {s.packets_received > 0 && t.packets_received > 0}")
+}
+
+fn check_client_close() ! io.Error {
+    let config = server_config(false)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(["h3"]))?
+    let accepted = quic.accept_handle(l.handle)?
+    quic.close_on(client.handle, 7, "bye")
+    let failure = wait_for_end(accepted)
+    print("client close: server stats_on {failure}")
+    print("client close: code {accepted.close_code}, reason {accepted.close_reason}, by peer {accepted.closed_by_peer}, application {accepted.application_close}")
+    let own = wait_for_end(client.handle)
+    print("client close: client stats_on {own}")
+}
+
+fn check_server_close() ! io.Error {
+    let config = server_config(false)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, client_config(["h3"]))?
+    let accepted = quic.accept_handle(l.handle)?
+    quic.close_on(accepted, 3, "going away")
+    let failure = wait_for_end(client.handle)
+    print("server close: client stats_on {failure}")
+    print("server close: code {client.handle.close_code}, reason {client.handle.close_reason}, by peer {client.handle.closed_by_peer}, application {client.handle.application_close}")
+}
+
+fn check_idle_timeout() ! io.Error {
+    var config = server_config(false)?
+    config.idle_timeout = 300
+    var settings = client_config(["h3"])
+    settings.idle_timeout = 300
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, settings)?
+    let accepted = quic.accept_handle(l.handle)?
+    sleep(1000)
+    let client_end = wait_for_end(client.handle)
+    let server_end = wait_for_end(accepted)
+    print("idle timeout: client stats_on {client_end}, server stats_on {server_end}")
+}
+
+fn check_keep_alive() ! io.Error {
+    var config = server_config(false)?
+    config.idle_timeout = 1500
+    var settings = client_config(["h3"])
+    settings.idle_timeout = 1500
+    settings.keep_alive = 200
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, settings)?
+    let accepted = quic.accept_handle(l.handle)?
+    sleep(2500)
+    let client_stats = quic.stats(client)?
+    let server_stats = quic.stats_on(accepted)?
+    print("keep alive: both connections open after the idle timeout {client_stats.packets_sent > 0 && server_stats.packets_sent > 0}")
+}
+
+fn check_handshake_timeout() ! io.Error {
+    using socket = net.bind_udp("127.0.0.1", 0)?
+    var settings = client_config(["h3"])
+    settings.handshake_timeout = 300
+    using attempt = quic.dial("127.0.0.1", socket.handle.addr.port, settings) catch {
+        e => {
+            print("handshake timeout: {e}")
+            return
+        }
+    }
+    print("handshake timeout: connected")
+}
+
+fn version_responder(socket: net.SocketHandle) {
+    let buf = io.buffer(2048)
+    let packet = net.receive_from_on(socket, buf) catch {
+        _ => return
+    }
+    let datagram = buf[..packet.size]
+    let h = wire.parse_header(datagram, 0, 8) catch {
+        _ => return
+    }
+    let reply = wire.version_negotiation(h.scid, h.dcid, [0x1a2a3a4a])
+    let sent = net.send_to_on(socket, reply, packet.from) catch {
+        _ => 0
+    }
+}
+
+fn check_crafted_version_negotiation() ! io.Error {
+    using var socket = net.bind_udp("127.0.0.1", 0)?
+    let view = net.detach_socket(mut socket)
+    defer net.close_socket_on(view)
+    spawn version_responder(view)
+    using attempt = quic.dial("127.0.0.1", view.addr.port, client_config(["h3"])) catch {
+        e => {
+            print("crafted version negotiation: {e}")
+            return
+        }
+    }
+    print("crafted version negotiation: connected")
+}
+
+fn check_listener_close() ! io.Error {
+    let config = server_config(false)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    let port = l.handle.addr.port
+    using first = quic.dial("127.0.0.1", port, client_config(["h3"]))?
+    using second = quic.dial("127.0.0.1", port, client_config(["h3"]))?
+    let accepted = quic.accept_handle(l.handle)?
+    quic.close_listener(l)
+    let first_end = wait_for_end(first.handle)
+    let second_end = wait_for_end(second.handle)
+    print("listener close: accepted client stats_on {first_end}, queued client stats_on {second_end}")
+    let own = wait_for_end(accepted)
+    print("listener close: accepted server stats_on {own}")
+    let late = quic.accept_handle(l.handle) catch {
+        NotConnected => {
+            print("listener close: accept NotConnected")
+            return
+        }
+        e => fail e
+    }
+    print("listener close: accepted after close")
+}
+
+fn check_stateless_reset() ! io.Error {
+    let config = server_config(false)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    using socket = net.bind_udp("127.0.0.1", 0)?
+    net.set_receive_timeout(socket, 2000)
+    let datagram = crypto.random(60)
+    datagram[0] = 0x40 | (datagram[0] & 0x3f)
+    let to = listener_address(l)
+    let reply = reply_to(socket, datagram, to)?
+    print("stateless reset: length in range {reply.len >= 41 && reply.len < 60}, short header {(reply[0] & 0xc0) == 0x40}")
+    net.set_receive_timeout(socket, 300)
+    let small = crypto.random(30)
+    small[0] = 0x40 | (small[0] & 0x3f)
+    let silent = reply_to(socket, small, to) catch {
+        TimedOut => {
+            print("stateless reset: 30 byte datagram gets no reply")
+            return
+        }
+        e => fail e
+    }
+    print("stateless reset: 30 byte datagram got a reply")
+}
+
+fn main() ! io.Error {
+    check_version_negotiation()?
+    check_small_datagram()?
+    check_retry()?
+    check_retry_token_reuse()?
+    check_half_open_per_address()?
+    check_invalid_config()?
+    check_missing_credentials()?
+    check_missing_key()?
+    check_accept()?
+    check_accept_after_close()?
+    check_handshake()?
+    check_alpn_mismatch()?
+    check_retry_connect()?
+    check_client_close()?
+    check_server_close()?
+    check_idle_timeout()?
+    check_keep_alive()?
+    check_handshake_timeout()?
+    check_crafted_version_negotiation()?
+    check_listener_close()?
+    check_stateless_reset()?
+}

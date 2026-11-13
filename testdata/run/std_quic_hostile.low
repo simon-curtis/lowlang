@@ -1,0 +1,996 @@
+import std/crypto
+import std/crypto/x509
+import std/io
+import std/net
+import std/quic
+import std/quic/wire
+import std/text
+import std/time
+import std/tls
+
+enum Out {
+    Crypto(level: tls.Level, data: []u8)
+    Secret(secret: tls.QuicSecret)
+    Done(result: str)
+}
+
+struct Space {
+    write: wire.Keys? = none
+    read: wire.Keys? = none
+    next_pn: i64 = 0
+    crypto_sent: i64 = 0
+    crypto_next: i64 = 0
+    pieces: [i64: []u8] = [:]
+    largest: i64 = -1
+    ranges: []wire.AckRange = []
+    seen: [i64: bool] = [:]
+    owed: bool = false
+}
+
+struct Held {
+    packet: []u8
+    header: wire.Header
+}
+
+struct Server {
+    port: i64
+    addr: net.Addr
+    seen: chan[*quic.ConnectionHandle]
+}
+
+struct Raw {
+    socket: net.SocketHandle
+    to: net.Addr
+    scid: []u8
+    original: []u8
+    dcid: []u8
+    initial: *Space
+    handshake: *Space
+    application: *Space
+    rx: chan[[]u8]
+    outbox: chan[Out]
+    inbox: chan[tls.QuicData]
+    held: []Held = []
+    switched: bool = false
+    confirmed: bool = false
+    finished: str = ""
+    first: []u8 = []
+    hello: []u8 = []
+    close_code: i64 = -1
+    responses: i64 = 0
+    acked: i64 = -1
+}
+
+struct Rng {
+    state: u64
+}
+
+fn least(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        push(mut out, x509.parse(der) or return out)
+    }
+    out
+}
+
+fn server_config() -> quic.Config ! io.Error {
+    let pem = embed("std_tls_ec.pem")
+    let certificates = x509.pem_certificates(pem)
+    let key = x509.pem_private_key(pem)?
+    let secure = tls.Config { certificates, key, alpn: ["hostile"] }
+    quic.Config { tls: secure, max_stream_data: 65536, max_data: 65536, max_streams: 8, handshake_timeout: 1000 }
+}
+
+fn client_config() -> quic.Config {
+    let secure = tls.Config { roots: roots(), alpn: ["hostile"] }
+    quic.Config { tls: secure, handshake_timeout: 600 }
+}
+
+fn echo_one(s: quic.Stream) {
+    let channel = quic.stream(s)
+    let data = io.read_all(channel) catch {
+        _ => return
+    }
+    io.write_all(channel, data) catch {
+        _ => return
+    }
+    channel.close()
+}
+
+fn echo_loop(h: *quic.ConnectionHandle) {
+    for {
+        let s = quic.accept_stream_on(h) catch {
+            _ => return
+        }
+        spawn echo_one(s)
+    }
+}
+
+fn accept_loop(l: *quic.ListenerHandle, seen: chan[*quic.ConnectionHandle]) {
+    for {
+        let h = quic.accept_handle(l) catch {
+            _ => return
+        }
+        select {
+            seen <- h => {}
+            else => {}
+        }
+        spawn echo_loop(h)
+    }
+}
+
+fn echo_once(port: i64) -> bool ! io.Error {
+    using c = quic.dial("127.0.0.1", port, client_config())?
+    let s = quic.open_stream(c)?
+    let channel = quic.stream(s)
+    io.write_str(channel, "still here")?
+    channel.close()
+    let back = io.read_all(channel)?
+    str(back) == "still here"
+}
+
+fn healthy(port: i64) -> bool {
+    echo_once(port) catch {
+        _ => false
+    }
+}
+
+fn serves(port: i64) -> bool {
+    let limit = time.monotonic() + 5000000000
+    for {
+        if healthy(port) {
+            return true
+        }
+        if time.monotonic() >= limit {
+            return false
+        }
+        sleep(200)
+    }
+}
+
+fn next(r: *Rng) -> u64 {
+    var x = r.state
+    x = x ^ (x << u64(13))
+    x = x ^ (x >> u64(7))
+    x = x ^ (x << u64(17))
+    r.state = x
+    x
+}
+
+fn below(r: *Rng, n: i64) -> i64 {
+    i64(next(r) % u64(n))
+}
+
+fn noise(r: *Rng, n: i64) -> []u8 {
+    let out = io.buffer(n)
+    for i in 0..n {
+        out[i] = u8(next(r) & u64(255))
+    }
+    out
+}
+
+fn mutated(r: *Rng, datagram: []u8) -> []u8 {
+    let out = io.buffer(datagram.len)
+    io.copy(out, datagram)
+    let flips = 1 + below(r, 8)
+    for i in 0..flips {
+        let at = below(r, out.len)
+        let change = 1 + below(r, 255)
+        out[at] = out[at] ^ u8(change)
+    }
+    out
+}
+
+fn long_header(first: i64, dcid: []u8, scid: []u8, initial: bool, number: i64, payload_length: i64) -> []u8 {
+    var out: []u8 = []
+    push(mut out, u8(first))
+    io.put_be32(mut out, wire.version1())
+    push(mut out, u8(dcid.len))
+    io.append(mut out, dcid)
+    push(mut out, u8(scid.len))
+    io.append(mut out, scid)
+    if initial {
+        wire.put_varint(mut out, 0)
+    }
+    io.put_be16(mut out, 0x4000 | (4 + payload_length + 16))
+    wire.put_packet_number(mut out, number, 4)
+    out
+}
+
+fn long_packet(first: i64, keys: wire.Keys, dcid: []u8, scid: []u8, initial: bool, number: i64, frames: []u8) -> []u8 {
+    let shell = long_header(first, dcid, scid, initial, number, 0)
+    var payload: []u8 = []
+    io.append(mut payload, frames)
+    if initial {
+        let target = 1200 - shell.len - 16
+        for payload.len < target {
+            push(mut payload, 0)
+        }
+    }
+    for payload.len < 4 {
+        push(mut payload, 0)
+    }
+    let header = long_header(first, dcid, scid, initial, number, payload.len)
+    wire.seal(keys, header, number, payload)
+}
+
+fn initial_datagram(dcid: []u8, scid: []u8, hello: []u8) -> []u8 {
+    var frames: []u8 = []
+    wire.put_frame(mut frames, wire.Frame.Crypto(0, hello))
+    let keys = wire.initial_keys(dcid, false)
+    long_packet(0xc3, keys, dcid, scid, true, 0, frames)
+}
+
+fn level_space(a: *Raw, level: tls.Level) -> *Space {
+    match level {
+        Initial => a.initial
+        Handshake => a.handshake
+        Application => a.application
+    }
+}
+
+fn client_parameters(scid: []u8) -> []u8 {
+    let p = wire.Parameters {
+        max_idle_timeout: 10000
+        initial_max_data: 1048576
+        initial_max_stream_data_bidi_local: 65536
+        initial_max_stream_data_bidi_remote: 65536
+        initial_max_stream_data_uni: 65536
+        initial_max_streams_bidi: 8
+        initial_max_streams_uni: 8
+        initial_source_connection_id: some(scid)
+    }
+    wire.encode_parameters(p)
+}
+
+fn client_tls() -> tls.Config {
+    tls.Config { server_name: "localhost", roots: roots(), alpn: ["hostile"], groups: [0x001D] }
+}
+
+fn deliver(outbox: chan[Out], level: tls.Level, data: []u8) ! io.Error {
+    let copy = io.buffer(data.len)
+    io.copy(copy, data)
+    outbox <- Out.Crypto(level, copy)
+}
+
+fn hand_over(outbox: chan[Out], secret: tls.QuicSecret) ! io.Error {
+    outbox <- Out.Secret(secret)
+}
+
+fn next_data(inbox: chan[tls.QuicData]) -> tls.QuicData ! io.Error {
+    let data = (<-inbox) ?? fail Eof
+    data
+}
+
+fn ignore_alert(code: i64) {
+}
+
+fn run_tls(t: tls.QuicTransport, config: tls.Config, outbox: chan[Out]) {
+    let result = tls.quic_client(t, config) catch {
+        e => {
+            outbox <- Out.Done("failed {e}")
+            return
+        }
+    }
+    outbox <- Out.Done("ok {result.protocol}")
+}
+
+fn read_socket(socket: net.SocketHandle, rx: chan[[]u8]) {
+    let buf = io.buffer(2048)
+    for {
+        let packet = net.receive_from_on(socket, buf) catch {
+            _ => return
+        }
+        let data = io.buffer(packet.size)
+        io.copy(data, buf[..packet.size])
+        select {
+            rx <- data => {}
+            else => {}
+        }
+    }
+}
+
+fn connect_raw(server: *Server) -> *Raw ! io.Error {
+    using var socket = net.bind_udp("127.0.0.1", 0)?
+    let view = net.detach_socket(mut socket)
+    let scid = crypto.random(8)
+    let original = crypto.random(8)
+    let read_keys = wire.initial_keys(original, true)
+    let write_keys = wire.initial_keys(original, false)
+    let initial = new(Space { read: some(read_keys), write: some(write_keys) })
+    let handshake = new(Space {})
+    let application = new(Space {})
+    let rx = chan[[]u8](8192)
+    let outbox = chan[Out](64)
+    let inbox = chan[tls.QuicData](64)
+    let a = new(Raw { socket: view, to: server.addr, scid, original, dcid: original, initial, handshake, application, rx, outbox, inbox })
+    spawn read_socket(view, rx)
+    let parameters = client_parameters(scid)
+    let config = client_tls()
+    let transport = tls.QuicTransport {
+        parameters
+        send: fn(level, data) { deliver(outbox, level, data) }
+        receive: fn() -> tls.QuicData ! io.Error { next_data(inbox) }
+        install: fn(secret) { hand_over(outbox, secret) }
+        alert: ignore_alert
+    }
+    spawn run_tls(transport, config, outbox)
+    for !a.confirmed {
+        let failed = a.finished.len >= 6 && a.finished[..6] == "failed"
+        if failed || !pump(a, 3000) {
+            close_raw(a)
+            fail TimedOut
+        }
+    }
+    a
+}
+
+fn close_raw(a: *Raw) {
+    let bye = wire.CloseFrame { application: true, code: 0, frame_type: 0, reason: "" }
+    send_frames(a, [wire.Frame.ConnectionClose(bye)])
+    net.close_socket_on(a.socket)
+}
+
+fn pump(a: *Raw, wait: i64) -> bool {
+    select {
+        d = <-a.rx => match d {
+            some(data) => on_datagram(a, data)
+            none => false
+        }
+        o = <-a.outbox => match o {
+            some(item) => on_out(a, item)
+            none => false
+        }
+        after(wait) => false
+    }
+}
+
+fn on_out(a: *Raw, item: Out) -> bool {
+    match item {
+        Crypto(level, data) => send_crypto(a, level, data)
+        Secret(secret) => install(a, secret)
+        Done(result) => {
+            a.finished = result
+        }
+    }
+    true
+}
+
+fn transmit(a: *Raw, packet: []u8) {
+    if a.first.len == 0 {
+        a.first = packet
+    }
+    let sent = net.send_to_on(a.socket, packet, a.to) catch {
+        _ => 0
+    }
+}
+
+fn send_long(a: *Raw, level: tls.Level, payload: []u8) {
+    let s = level_space(a, level)
+    let keys = match s.write {
+        some(k) => k
+        none => return
+    }
+    let number = s.next_pn
+    s.next_pn += 1
+    let initial = level == tls.Level.Initial
+    let first = if initial { 0xc3 } else { 0xe3 }
+    let packet = long_packet(first, keys, a.dcid, a.scid, initial, number, payload)
+    transmit(a, packet)
+}
+
+fn send_crypto(a: *Raw, level: tls.Level, data: []u8) {
+    let s = level_space(a, level)
+    if level == tls.Level.Initial && a.hello.len == 0 {
+        a.hello = data
+    }
+    var at = 0
+    for at < data.len {
+        let end = least(at + 1000, data.len)
+        var payload: []u8 = []
+        wire.put_frame(mut payload, wire.Frame.Crypto(s.crypto_sent, data[at..end]))
+        s.crypto_sent += end - at
+        send_long(a, level, payload)
+        at = end
+    }
+}
+
+fn send_payload(a: *Raw, payload: []u8) -> i64 {
+    let s = a.application
+    let keys = match s.write {
+        some(k) => k
+        none => return -1
+    }
+    let number = s.next_pn
+    s.next_pn += 1
+    var header: []u8 = []
+    push(mut header, 0x43)
+    io.append(mut header, a.dcid)
+    wire.put_packet_number(mut header, number, 4)
+    var body: []u8 = []
+    io.append(mut body, payload)
+    for body.len < 4 {
+        push(mut body, 0)
+    }
+    let packet = wire.seal(keys, header, number, body)
+    transmit(a, packet)
+    number
+}
+
+fn send_frames(a: *Raw, frames: []wire.Frame) -> i64 {
+    var payload: []u8 = []
+    for f in frames {
+        wire.put_frame(mut payload, f)
+    }
+    send_payload(a, payload)
+}
+
+fn send_batches(a: *Raw, frames: []wire.Frame, limit: i64) {
+    var payload: []u8 = []
+    for f in frames {
+        let size = wire.frame_size(f)
+        if payload.len > 0 && payload.len + size > limit {
+            send_payload(a, payload)
+            payload = []
+        }
+        wire.put_frame(mut payload, f)
+    }
+    if payload.len > 0 {
+        send_payload(a, payload)
+    }
+}
+
+fn install(a: *Raw, secret: tls.QuicSecret) {
+    let keys = wire.keys(secret.suite, secret.secret) catch {
+        _ => return
+    }
+    let s = level_space(a, secret.level)
+    if secret.writing {
+        s.write = some(keys)
+        return
+    }
+    s.read = some(keys)
+    let pending = a.held
+    a.held = []
+    for h in pending {
+        process_packet(a, h.packet, h.header)
+    }
+    acknowledge(a)
+}
+
+fn level_of(kind: wire.PacketKind) -> tls.Level? {
+    match kind {
+        Initial => some(tls.Level.Initial)
+        Handshake => some(tls.Level.Handshake)
+        Short => some(tls.Level.Application)
+        _ => none
+    }
+}
+
+fn on_datagram(a: *Raw, data: []u8) -> bool {
+    var at = 0
+    for at < data.len {
+        let h = wire.parse_header(data, at, 8) catch {
+            _ => break
+        }
+        if h.size <= 0 || at + h.size > data.len {
+            break
+        }
+        process_packet(a, data[at..at + h.size], h)
+        at += h.size
+    }
+    acknowledge(a)
+    true
+}
+
+fn process_packet(a: *Raw, packet: []u8, h: wire.Header) {
+    let level = match level_of(h.kind) {
+        some(l) => l
+        none => return
+    }
+    let s = level_space(a, level)
+    let keys = match s.read {
+        some(k) => k
+        none => {
+            if a.held.len < 64 {
+                push(mut a.held, Held { packet, header: h })
+            }
+            return
+        }
+    }
+    let opened = wire.open(keys, packet, h, s.largest) catch {
+        _ => return
+    }
+    if level == tls.Level.Initial && !a.switched {
+        a.dcid = h.scid
+        a.switched = true
+    }
+    note_received(s, opened.number)
+    let frames = wire.parse_frames(opened.payload) catch {
+        _ => return
+    }
+    for f in frames {
+        if wire.ack_eliciting(f) {
+            s.owed = true
+        }
+        on_frame(a, level, s, f)
+    }
+}
+
+fn on_frame(a: *Raw, level: tls.Level, s: *Space, f: wire.Frame) {
+    match f {
+        Crypto(offset, data) => feed(a, level, s, offset, data)
+        ConnectionClose(close) => {
+            if a.close_code < 0 {
+                a.close_code = close.code
+            }
+        }
+        PathResponse(_) => {
+            a.responses += 1
+        }
+        HandshakeDone => {
+            a.confirmed = true
+        }
+        Ack(ack) => {
+            if level == tls.Level.Application && ack.largest > a.acked {
+                a.acked = ack.largest
+            }
+        }
+        _ => {}
+    }
+}
+
+fn note_received(s: *Space, number: i64) {
+    if number > s.largest {
+        s.largest = number
+    }
+    s.seen[number] = true
+    var merged: []wire.AckRange = []
+    var current = wire.AckRange { smallest: number, largest: number }
+    var placed = false
+    for r in s.ranges {
+        if r.smallest > current.largest + 1 {
+            push(mut merged, r)
+        } else if r.largest + 1 < current.smallest {
+            if !placed {
+                push(mut merged, current)
+                placed = true
+            }
+            push(mut merged, r)
+        } else {
+            let low = least(current.smallest, r.smallest)
+            let high = if current.largest > r.largest { current.largest } else { r.largest }
+            current = wire.AckRange { smallest: low, largest: high }
+        }
+    }
+    if !placed {
+        push(mut merged, current)
+    }
+    if merged.len > 32 {
+        truncate(mut merged, 32)
+    }
+    s.ranges = merged
+}
+
+fn feed(a: *Raw, level: tls.Level, s: *Space, offset: i64, data: []u8) {
+    if offset + data.len <= s.crypto_next {
+        return
+    }
+    if offset > s.crypto_next {
+        if s.pieces.len < 64 {
+            s.pieces[offset] = data
+        }
+        return
+    }
+    var ready: []u8 = []
+    io.append(mut ready, data[s.crypto_next - offset..])
+    s.crypto_next += ready.len
+    for {
+        var taken = -1
+        for at, piece in s.pieces {
+            if at <= s.crypto_next {
+                taken = at
+                break
+            }
+        }
+        if taken < 0 {
+            break
+        }
+        let piece = s.pieces[taken] ?? []
+        delete(mut s.pieces, taken)
+        if taken + piece.len > s.crypto_next {
+            let more = piece[s.crypto_next - taken..]
+            io.append(mut ready, more)
+            s.crypto_next += more.len
+        }
+    }
+    let item = tls.QuicData { level, data: ready }
+    select {
+        a.inbox <- item => {}
+        else => {}
+    }
+}
+
+fn acknowledge(a: *Raw) {
+    for level in [tls.Level.Initial, tls.Level.Handshake, tls.Level.Application] {
+        let s = level_space(a, level)
+        if !s.owed {
+            continue
+        }
+        s.owed = false
+        let ack = wire.AckFrame { largest: s.largest, delay: 0, ranges: s.ranges }
+        var payload: []u8 = []
+        wire.put_frame(mut payload, wire.Frame.Ack(ack))
+        if level == tls.Level.Application {
+            send_payload(a, payload)
+        } else {
+            send_long(a, level, payload)
+        }
+    }
+}
+
+fn remaining(limit: i64) -> i64 {
+    let ms = (limit - time.monotonic()) / 1000000
+    if ms < 1 { 1 } else { ms }
+}
+
+fn outcome(a: *Raw) -> str {
+    let probe = send_frames(a, [wire.Frame.Ping])
+    let limit = time.monotonic() + 2000000000
+    for a.close_code < 0 && a.acked < probe && time.monotonic() < limit {
+        let wait = remaining(limit)
+        pump(a, wait)
+    }
+    if a.close_code >= 0 {
+        return "close 0x{a.close_code:x}"
+    }
+    "no close"
+}
+
+fn settle(a: *Raw, wait: i64) {
+    for pump(a, wait) {
+    }
+}
+
+fn fresh(server: *Server, label: str) -> *Raw? {
+    let a = connect_raw(server) catch {
+        e => {
+            print("{label}: raw connection failed {e}")
+            return none
+        }
+    }
+    some(a)
+}
+
+fn conclude(server: *Server, a: *Raw) {
+    close_raw(a)
+    let ok = serves(server.port)
+    print("still serves: {ok}")
+}
+
+fn attack_random(server: *Server, captured: []u8) {
+    using socket = net.bind_udp("127.0.0.1", 0) catch {
+        e => {
+            print("random: bind failed {e}")
+            return
+        }
+    }
+    let r = new(Rng { state: 0x9E3779B97F4A7C15 })
+    var sent = 0
+    for i in 0..500 {
+        let length = below(r, 1501)
+        let datagram = noise(r, length)
+        let n = net.send_to(socket, datagram, server.addr) catch {
+            _ => 0
+        }
+        sent += 1
+    }
+    for i in 0..500 {
+        let datagram = mutated(r, captured)
+        let n = net.send_to(socket, datagram, server.addr) catch {
+            _ => 0
+        }
+        sent += 1
+    }
+    print("random: sent {sent}")
+    let ok = serves(server.port)
+    print("still serves: {ok}")
+}
+
+fn count_replies(socket: net.SocketHandle, index: i64, answers: chan[i64]) {
+    let buf = io.buffer(2048)
+    for {
+        let packet = net.receive_from_on(socket, buf) catch {
+            _ => return
+        }
+        select {
+            answers <- index => {}
+            else => {}
+        }
+    }
+}
+
+fn attack_flood(server: *Server, scid: []u8, hello: []u8) ! io.Error {
+    let answers = chan[i64](8192)
+    var sockets: []net.SocketHandle = []
+    for i in 0..40 {
+        using var socket = net.bind_udp("127.0.0.1", 0)?
+        let view = net.detach_socket(mut socket)
+        push(mut sockets, view)
+        spawn count_replies(view, i, answers)
+    }
+    var sent = 0
+    for round in 0..10 {
+        for i in 0..40 {
+            let dcid = crypto.random(8)
+            let datagram = initial_datagram(dcid, scid, hello)
+            let n = net.send_to_on(sockets[i], datagram, server.addr) catch {
+                _ => 0
+            }
+            sent += 1
+        }
+    }
+    sleep(500)
+    var heard: [i64: bool] = [:]
+    for {
+        select {
+            who = <-answers => match who {
+                some(i) => {
+                    heard[i] = true
+                }
+                none => break
+            }
+            else => break
+        }
+    }
+    for s in sockets {
+        net.close_socket_on(s)
+    }
+    print("initial flood: {sent} sent, some answered: {heard.len >= 1}, at most 8 sources answered: {heard.len <= 8}")
+    let ok = serves(server.port)
+    print("still serves: {ok}")
+}
+
+fn attack_path_challenge(server: *Server) {
+    let a = fresh(server, "path challenge flood") ?? return
+    for p in 0..200 {
+        var group: []wire.Frame = []
+        for k in 0..10 {
+            let data = crypto.random(8)
+            push(mut group, wire.Frame.PathChallenge(data))
+        }
+        send_frames(a, group)
+    }
+    let result = outcome(a)
+    print("path challenge flood: {result}, at most one response per packet: {a.responses <= 200}")
+    conclude(server, a)
+}
+
+fn attack_new_connection_ids(server: *Server) {
+    let a = fresh(server, "new connection id churn") ?? return
+    var frames: []wire.Frame = []
+    for i in 0..100 {
+        let id = crypto.random(8)
+        let token = crypto.random(16)
+        push(mut frames, wire.Frame.NewConnectionId(i + 1, i + 1, id, token))
+    }
+    send_batches(a, frames, 1100)
+    let result = outcome(a)
+    print("new connection id churn: {result}")
+    conclude(server, a)
+}
+
+fn attack_retire_unissued(server: *Server) {
+    let a = fresh(server, "retire unissued connection id") ?? return
+    send_frames(a, [wire.Frame.RetireConnectionId(1000)])
+    let result = outcome(a)
+    print("retire unissued connection id: {result}")
+    conclude(server, a)
+}
+
+fn attack_ack_unsent(server: *Server) {
+    let a = fresh(server, "ack of unsent packet") ?? return
+    let target = a.application.largest + 1000
+    let ack = wire.AckFrame { largest: target, delay: 0, ranges: [wire.AckRange { smallest: target, largest: target }] }
+    send_frames(a, [wire.Frame.Ack(ack)])
+    let result = outcome(a)
+    print("ack of unsent packet: {result}")
+    conclude(server, a)
+}
+
+fn raise_server_numbers(a: *Raw, target: i64) {
+    for round in 0..60 {
+        if a.application.largest >= target {
+            return
+        }
+        for i in 0..200 {
+            send_frames(a, [wire.Frame.Ping])
+        }
+        settle(a, 20)
+    }
+}
+
+fn received_ranges(a: *Raw) -> []wire.AckRange {
+    var out: []wire.AckRange = []
+    var n = a.application.largest
+    for n >= 0 {
+        let held = a.application.seen[n] ?? false
+        if held && (out.len == 0 || n <= out[out.len - 1].smallest - 2) {
+            push(mut out, wire.AckRange { smallest: n, largest: n })
+        }
+        n -= 1
+    }
+    out
+}
+
+fn fitting_ack(a: *Raw, delay: i64) -> wire.AckFrame {
+    let all = received_ranges(a)
+    var count = all.len
+    for {
+        let candidate = all[..count]
+        let ack = wire.AckFrame { largest: a.application.largest, delay, ranges: candidate }
+        let frame = wire.Frame.Ack(ack)
+        if count <= 1 || wire.frame_size(frame) <= 1150 {
+            return ack
+        }
+        count -= 10
+        if count < 1 {
+            count = 1
+        }
+    }
+}
+
+fn attack_ack_ranges(server: *Server) {
+    let a = fresh(server, "ack with a huge delay and many ranges") ?? return
+    raise_server_numbers(a, 1300)
+    let ack = fitting_ack(a, wire.max_varint())
+    send_frames(a, [wire.Frame.Ack(ack)])
+    let result = outcome(a)
+    print("ack with a huge delay and many ranges: {result}, ranges beyond the cap of 256: {ack.ranges.len > 256}")
+    conclude(server, a)
+}
+
+fn attack_crypto_far(server: *Server) {
+    let a = fresh(server, "crypto at the largest offset") ?? return
+    send_frames(a, [wire.Frame.Crypto(wire.max_varint() - 1, [1, 2, 3, 4])])
+    let result = outcome(a)
+    print("crypto at offset 2^62-2: {result}")
+    conclude(server, a)
+}
+
+fn attack_crypto_late(server: *Server) {
+    let a = fresh(server, "crypto at offset 70000") ?? return
+    send_frames(a, [wire.Frame.Crypto(70000, [1, 2, 3, 4])])
+    let result = outcome(a)
+    print("crypto at offset 70000: {result}")
+    conclude(server, a)
+}
+
+fn stream_frame(id: i64, offset: i64, data: []u8, fin: bool) -> wire.Frame {
+    wire.Frame.Stream(wire.StreamFrame { id, offset, data, fin })
+}
+
+fn attack_stream_offset(server: *Server) {
+    let a = fresh(server, "stream at the largest offset") ?? return
+    let frame = stream_frame(0, wire.max_varint(), crypto.random(10), false)
+    send_frames(a, [frame])
+    let result = outcome(a)
+    print("stream at offset 2^62-1: {result}")
+    conclude(server, a)
+}
+
+fn attack_stream_limit_data(server: *Server) {
+    let a = fresh(server, "stream beyond the stream limit") ?? return
+    let frame = stream_frame(0, 65530, crypto.random(100), false)
+    send_frames(a, [frame])
+    let result = outcome(a)
+    print("stream data beyond max_stream_data: {result}")
+    conclude(server, a)
+}
+
+fn attack_stream_gaps(server: *Server) {
+    let a = fresh(server, "stream with gaps") ?? return
+    var frames: []wire.Frame = []
+    for i in 0..1000 {
+        push(mut frames, stream_frame(0, 2 * i, [7], false))
+    }
+    send_batches(a, frames, 1100)
+    let result = outcome(a)
+    print("1000 one byte fragments at even offsets: {result}")
+    conclude(server, a)
+}
+
+fn attack_stream_id(server: *Server) {
+    let a = fresh(server, "stream id above the limit") ?? return
+    send_frames(a, [stream_frame(32, 0, [1], false)])
+    let result = outcome(a)
+    print("stream id above max_streams: {result}")
+    conclude(server, a)
+}
+
+fn attack_final_size(server: *Server) {
+    let a = fresh(server, "changed final size") ?? return
+    let data = crypto.random(100)
+    let first = stream_frame(0, 0, data, true)
+    let second = wire.Frame.ResetStream(0, 0, 50)
+    send_frames(a, [first, second])
+    let result = outcome(a)
+    print("final size 100 then reset at 50: {result}")
+    conclude(server, a)
+}
+
+fn find_handle(server: *Server, port: i64) -> *quic.ConnectionHandle? {
+    for {
+        select {
+            next = <-server.seen => match next {
+                some(handle) => {
+                    if handle.remote.port == port {
+                        return some(handle)
+                    }
+                }
+                none => return none
+            }
+            after(2000) => return none
+        }
+    }
+}
+
+fn attack_long_reason(server: *Server) {
+    let a = fresh(server, "close with a long reason") ?? return
+    let reason = text.repeat("r", 1300)
+    let close = wire.CloseFrame { application: true, code: 7, frame_type: 0, reason }
+    let port = a.socket.addr.port
+    let found = find_handle(server, port)
+    send_frames(a, [wire.Frame.ConnectionClose(close)])
+    match found {
+        some(handle) => {
+            for i in 0..200 {
+                if handle.closed_by_peer {
+                    break
+                }
+                sleep(10)
+            }
+            print("close with a 1300 byte reason: server recorded {handle.close_reason.len} bytes, code {handle.close_code}, by peer {handle.closed_by_peer}")
+        }
+        none => print("close with a 1300 byte reason: connection not accepted")
+    }
+    net.close_socket_on(a.socket)
+    let ok = serves(server.port)
+    print("still serves: {ok}")
+}
+
+fn main() ! io.Error {
+    let config = server_config()?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    let server = new(Server { port: l.handle.addr.port, addr: l.handle.addr, seen: chan[*quic.ConnectionHandle](512) })
+    spawn accept_loop(l.handle, server.seen)
+
+    let baseline = connect_raw(server)?
+    print("raw client handshake confirmed: {baseline.confirmed}")
+    let captured = baseline.first
+    let hello = baseline.hello
+    let scid = baseline.scid
+    close_raw(baseline)
+    let ok = serves(server.port)
+    print("still serves: {ok}")
+
+    attack_random(server, captured)
+    attack_flood(server, scid, hello)?
+    attack_path_challenge(server)
+    attack_new_connection_ids(server)
+    attack_retire_unissued(server)
+    attack_ack_unsent(server)
+    attack_ack_ranges(server)
+    attack_crypto_far(server)
+    attack_crypto_late(server)
+    attack_stream_offset(server)
+    attack_stream_limit_data(server)
+    attack_stream_gaps(server)
+    attack_stream_id(server)
+    attack_final_size(server)
+    attack_long_reason(server)
+}

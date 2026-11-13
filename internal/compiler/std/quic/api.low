@@ -1,0 +1,401 @@
+import std/io
+import std/net
+
+/// Binds a UDP socket to `host` and `port` and starts a QUIC server endpoint on it.
+///
+/// Port 0 chooses a free port, which `handle.addr.port` reports. Fails `Invalid` when `config.tls.alpn` is empty or `config.tls` has no certificates or no key, and with the error `net.bind_udp` returns when the socket cannot be bound. Dropping the listener closes the socket.
+pub fn listen(host: str, port: i64, config: Config) -> Listener ! io.Error {
+    if config.tls.alpn.len == 0 || config.tls.certificates.len == 0 {
+        fail Invalid
+    }
+    match config.tls.key {
+        some(_) => {}
+        none => fail Invalid
+    }
+    using var socket = net.bind_udp(host, port)?
+    let view = net.detach_socket(mut socket)
+    let ep = endpoint(view, true, config)
+    start(ep)
+    let handle = new(ListenerHandle { addr: view.addr, config, endpoint: ep })
+    Listener { handle }
+}
+
+/// Opens a QUIC connection to the host `host` on `port` and returns it.
+///
+/// Does the same as `dial_handle` and wraps the result in a `Connection`.
+pub fn dial(host: str, port: i64, config: Config) -> Connection ! io.Error {
+    let handle = dial_handle(host, port, config)?
+    Connection { handle }
+}
+
+/// Resolves `host`, opens a QUIC connection to its first address on `port`, completes the handshake and returns the view of the connection.
+///
+/// `config.tls.server_name` defaults to `host` when empty. Otherwise behaves as `connect_handle`, and also fails with `NotFound` when `host` cannot be resolved.
+pub fn dial_handle(host: str, port: i64, config: Config) -> *ConnectionHandle ! io.Error {
+    let addresses = net.lookup(host)?
+    if addresses.len == 0 {
+        fail NotFound
+    }
+    var settings = config
+    if settings.tls.server_name.len == 0 {
+        settings.tls.server_name = host
+    }
+    let target = net.Addr { ip: addresses[0], port }
+    connect_handle(target, settings)
+}
+
+/// Opens a QUIC connection to the address `a` and returns it.
+///
+/// Does the same as `connect_handle` and wraps the result in a `Connection`.
+pub fn connect(a: net.Addr, config: Config) -> Connection ! io.Error {
+    let handle = connect_handle(a, config)?
+    Connection { handle }
+}
+
+/// Opens a QUIC connection to the address `a`, completes the handshake and returns the view of the connection.
+///
+/// Binds a UDP socket of the family of `a` on a free port that belongs to the connection and is closed when it ends. `config.tls.server_name` defaults to the text of `a.ip` when empty. Parks the green thread until the handshake finishes. Fails `Invalid` when `config.tls.alpn` is empty and with the error `net.bind_udp` returns when no socket can be bound. A handshake that fails fails with the error the TLS handshake returned, `Refused` when the server closed the connection during the handshake and `Malformed` when this end closed it for a protocol violation, such as invalid transport parameters.
+pub fn connect_handle(a: net.Addr, config: Config) -> *ConnectionHandle ! io.Error {
+    if config.tls.alpn.len == 0 {
+        fail Invalid
+    }
+    let any = if net.v6(a.ip) { "::" } else { "0.0.0.0" }
+    using var socket = net.bind_udp(any, 0)?
+    let view = net.detach_socket(mut socket)
+    var settings = config
+    if settings.tls.server_name.len == 0 {
+        settings.tls.server_name = net.format_ip(a.ip)
+    }
+    let ep = endpoint(view, false, settings)
+    start(ep)
+    let handle = start_client(ep, a) catch {
+        e => {
+            close_endpoint(ep)
+            fail e
+        }
+    }
+    let outcome = <-handle.ready
+    match outcome {
+        some(failure) => match failure {
+            some(e) => fail e
+            none => handle
+        }
+        none => fail Aborted
+    }
+}
+
+/// Returns the `Connection` that owns the connection behind `h`, which closes it when dropped.
+pub fn adopt(h: *ConnectionHandle) -> Connection {
+    Connection { handle: h }
+}
+
+/// Stops `c` from closing the connection when dropped, and returns its view.
+///
+/// The caller must close the connection with `close_on`.
+pub fn detach(mut c: Connection) -> *ConnectionHandle {
+    c.detached = true
+    c.handle
+}
+
+/// Closes the connection `c` with the application error `code` and `reason`.
+///
+/// Does the same as `close_on` on its handle.
+pub fn close_connection(c: Connection, code: i64, reason: str) {
+    close_on(c.handle, code, reason)
+}
+
+/// Closes the connection behind `h` with the application error `code` and `reason`.
+///
+/// Sends a CONNECTION_CLOSE, records `code` and `reason` on the handle and parks the green thread until the frame has been sent. While a stream still holds data the peer has not acknowledged, the close is held back until the streams settle, for at most 5 seconds and never past the idle timeout, so a peer cannot keep the call parked longer. The connection then stays in the closing state for three times the probe timeout, answering datagrams from the peer with the same frame, and `stats_on` fails with `NotConnected` from the moment of the call. Before the handshake completes the frame is a transport error with code 0x0c and no reason. A `code` outside 0 to 2^62 - 1 is clamped into that range and a `reason` longer than 1024 bytes is truncated. Does nothing when the connection has already ended or is closing.
+pub fn close_on(h: *ConnectionHandle, code: i64, reason: str) {
+    match request_close(h, code, reason) {
+        some(reply) => await_close(h, reply)
+        none => {}
+    }
+}
+
+fn request_close(h: *ConnectionHandle, code: i64, reason: str) -> chan[bool]? {
+    let reply = chan[bool](1)
+    let command = Command.Close(code, reason, reply)
+    select {
+        h.commands <- command => {}
+        <-h.gone => return none
+    }
+    some(reply)
+}
+
+fn await_close(h: *ConnectionHandle, reply: chan[bool]) {
+    select {
+        <-reply => {}
+        <-h.gone => {}
+    }
+}
+
+/// Returns a snapshot of the transport counters of the connection `c`.
+///
+/// Does the same as `stats_on` on its handle.
+pub fn stats(c: Connection) -> Stats ! io.Error {
+    stats_on(c.handle)
+}
+
+/// Returns a snapshot of the transport counters of the connection behind `h`.
+///
+/// Parks the green thread until the connection answers. Once the connection is closing, draining or ended it fails with the error that explains the end: `NotConnected` after this end closed it, `Aborted` after the peer closed it, `Malformed` after this end closed it for a protocol error, `TimedOut` after the idle or handshake timeout, `Reset` after a stateless reset and `Unsupported` after a Version Negotiation packet.
+pub fn stats_on(h: *ConnectionHandle) -> Stats ! io.Error {
+    match h.terminal {
+        some(e) => fail e
+        none => {}
+    }
+    let reply = chan[Stats](1)
+    let command = Command.Stats(reply)
+    select {
+        h.commands <- command => {}
+        <-h.gone => {
+            let ended = terminal_error(h)
+            fail ended
+        }
+    }
+    select {
+        s = <-reply => match s {
+            some(snapshot) => snapshot
+            none => {
+                let ended = terminal_error(h)
+                fail ended
+            }
+        }
+        <-h.gone => {
+            let ended = terminal_error(h)
+            fail ended
+        }
+    }
+}
+
+fn terminal_error(h: *ConnectionHandle) -> io.Error {
+    match h.terminal {
+        some(e) => e
+        none => NotConnected
+    }
+}
+
+fn unpack(h: *ConnectionHandle, a: Answer?) -> i64 ! io.Error {
+    match a {
+        some(answer) => match answer.error {
+            some(e) => fail e
+            none => answer.value
+        }
+        none => {
+            let ended = terminal_error(h)
+            fail ended
+        }
+    }
+}
+
+fn ask(h: *ConnectionHandle, command: Command, reply: chan[Answer]) -> i64 ! io.Error {
+    match h.terminal {
+        some(e) => fail e
+        none => {}
+    }
+    select {
+        h.commands <- command => {}
+        <-h.gone => {
+            let ended = terminal_error(h)
+            fail ended
+        }
+    }
+    select {
+        a = <-reply => unpack(h, a)?
+        <-h.gone => {
+            select {
+                a = <-reply => unpack(h, a)?
+                else => {
+                    let ended = terminal_error(h)
+                    fail ended
+                }
+            }
+        }
+    }
+}
+
+/// Opens a new bidirectional stream on the connection `c`.
+///
+/// Does the same as `open_stream_on` on its handle.
+pub fn open_stream(c: Connection) -> Stream ! io.Error {
+    open_stream_on(c.handle)
+}
+
+/// Opens a new bidirectional stream on the connection behind `h`.
+///
+/// Stream IDs count up in steps of 4 from 0 for a client and from 1 for a server. Parks the green thread while the peer's limit on bidirectional streams is reached, which the peer raises with MAX_STREAMS as it finishes streams, and sends STREAMS_BLOCKED once per limit value. Fails with the error that ended the connection, as `stats_on` does, including while parked.
+pub fn open_stream_on(h: *ConnectionHandle) -> Stream ! io.Error {
+    let reply = chan[Answer](1)
+    let command = Command.OpenStream(true, reply)
+    let id = ask(h, command, reply)?
+    Stream { id, connection: h }
+}
+
+/// Opens a new unidirectional stream on the connection `c`.
+///
+/// Does the same as `open_uni_stream_on` on its handle.
+pub fn open_uni_stream(c: Connection) -> Stream ! io.Error {
+    open_uni_stream_on(c.handle)
+}
+
+/// Opens a new unidirectional stream on the connection behind `h`, which this end can only write.
+///
+/// Stream IDs count up in steps of 4 from 2 for a client and from 3 for a server. Parks and fails as `open_stream_on` does, with the limit on unidirectional streams.
+pub fn open_uni_stream_on(h: *ConnectionHandle) -> Stream ! io.Error {
+    let reply = chan[Answer](1)
+    let command = Command.OpenStream(false, reply)
+    let id = ask(h, command, reply)?
+    Stream { id, connection: h }
+}
+
+/// Accepts the next bidirectional stream the peer opened on the connection `c`.
+///
+/// Does the same as `accept_stream_on` on its handle.
+pub fn accept_stream(c: Connection) -> Stream ! io.Error {
+    accept_stream_on(c.handle)
+}
+
+/// Accepts the next bidirectional stream the peer opened on the connection behind `h`.
+///
+/// Streams are returned in ID order, including ones the peer opened implicitly by using a higher ID, so a stream can be returned before any of its data has arrived. Parks the green thread until the peer opens one. Fails with the error that ended the connection, including while parked.
+pub fn accept_stream_on(h: *ConnectionHandle) -> Stream ! io.Error {
+    let reply = chan[Answer](1)
+    let command = Command.AcceptStream(true, reply)
+    let id = ask(h, command, reply)?
+    Stream { id, connection: h }
+}
+
+/// Accepts the next unidirectional stream the peer opened on the connection `c`.
+///
+/// Does the same as `accept_uni_stream_on` on its handle.
+pub fn accept_uni_stream(c: Connection) -> Stream ! io.Error {
+    accept_uni_stream_on(c.handle)
+}
+
+/// Accepts the next unidirectional stream the peer opened on the connection behind `h`, which this end can only read.
+///
+/// Behaves as `accept_stream_on` does for unidirectional streams.
+pub fn accept_uni_stream_on(h: *ConnectionHandle) -> Stream ! io.Error {
+    let reply = chan[Answer](1)
+    let command = Command.AcceptStream(false, reply)
+    let id = ask(h, command, reply)?
+    Stream { id, connection: h }
+}
+
+/// Reads up to `buf.len` bytes from the stream `s` into `buf` and returns the count.
+///
+/// Parks the green thread until at least one byte is available. Returns 0 at the end of a finished stream, for an empty `buf` and for a stream whose state has been released after it was read to the end. Fails `Reset` when the peer reset the stream, `Aborted` after this end called `stop`, `Invalid` for a stream this end only writes, and with the error that ended the connection, including while parked.
+pub fn read(s: Stream, buf: []u8) -> i64 ! io.Error {
+    let reply = chan[Answer](1)
+    let command = Command.StreamRead(s.id, buf, reply)
+    ask(s.connection, command, reply)
+}
+
+/// Writes `data` to the stream `s` and returns `data.len`.
+///
+/// Copies the bytes into the stream's send buffer, which holds at most 1 MiB of bytes the peer has not acknowledged, and parks the green thread while it is full, so a write of any length completes once the peer has acknowledged enough. Returns before the bytes are delivered. Fails `BrokenPipe` after `finish` or `reset`, after the peer sent STOP_SENDING and for a stream whose state has been released, `Invalid` for a stream this end only reads, and with the error that ended the connection, including while parked.
+pub fn write(s: Stream, data: []u8) -> i64 ! io.Error {
+    let reply = chan[Answer](1)
+    let command = Command.StreamWrite(s.id, data, reply)
+    ask(s.connection, command, reply)
+}
+
+/// Ends the sending side of the stream `s` after the bytes already written.
+///
+/// Sends FIN with the last data. Calling it again does nothing. Fails `BrokenPipe` after `reset` or STOP_SENDING, `Invalid` for a stream this end only reads, and with the error that ended the connection.
+pub fn finish(s: Stream) ! io.Error {
+    let reply = chan[Answer](1)
+    let command = Command.StreamFinish(s.id, reply)
+    ask(s.connection, command, reply)?
+}
+
+/// Abandons the sending side of the stream `s` with the application error `code`.
+///
+/// Sends RESET_STREAM carrying the highest offset sent and drops the unacknowledged bytes. Parked and later writes fail `BrokenPipe`. A `code` outside 0 to 2^62 - 1 is clamped into that range. Does nothing on a finished stream, a stream this end only reads or an ended connection.
+pub fn reset(s: Stream, code: i64) {
+    let reply = chan[Answer](1)
+    let command = Command.StreamReset(s.id, code, reply)
+    ask(s.connection, command, reply) catch {
+        _ => 0
+    }
+}
+
+/// Abandons the receiving side of the stream `s` with the application error `code`.
+///
+/// Sends STOP_SENDING, discards the unread bytes and every byte that arrives later, and fails parked and later reads `Aborted`. The peer's writer sees `BrokenPipe` once it receives the frame. A `code` outside 0 to 2^62 - 1 is clamped into that range. Does nothing on a stream that is already finished or reset, a stream this end only writes or an ended connection.
+pub fn stop(s: Stream, code: i64) {
+    let reply = chan[Answer](1)
+    let command = Command.StreamStop(s.id, code, reply)
+    ask(s.connection, command, reply) catch {
+        _ => 0
+    }
+}
+
+/// Returns an `io.Stream` over the stream `s`.
+///
+/// Its `read` and `write` call `read` and `write`, and its `close` calls `finish` and ignores its error.
+pub fn stream(s: Stream) -> io.Stream {
+    io.Stream {
+        read: fn(buf) { read(s, buf) }
+        write: fn(data) { write(s, data) }
+        close: fn() {
+            finish(s) catch {
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Replaces the packet protection keys of the connection `c`.
+///
+/// Does the same as `update_keys_on` on its handle.
+pub fn update_keys(c: Connection) ! io.Error {
+    update_keys_on(c.handle)
+}
+
+/// Starts a key update on the connection behind `h` (RFC 9001 section 6).
+///
+/// Derives the next sending keys, flips the key phase bit of the packets sent from now on, and returns without waiting for the peer; the peer answers by updating its own sending keys, which this end follows when the first packet of the new phase arrives. A connection also updates by itself after 2^23 packets sent with one key. Fails `Invalid` before the handshake is confirmed and while the first packet sent with the current keys after the previous update is unacknowledged, which includes a second call without traffic in between, and with the error that ended the connection, as `stats_on` does.
+pub fn update_keys_on(h: *ConnectionHandle) ! io.Error {
+    let reply = chan[Answer](1)
+    let command = Command.UpdateKeys(reply)
+    ask(h, command, reply)?
+}
+
+/// Closes the listener `l`.
+///
+/// Does the same as `close_listener_on` on its handle.
+pub fn close_listener(l: Listener) {
+    close_listener_on(l.handle)
+}
+
+/// Closes the listener behind `h`.
+///
+/// Closes every connection of the listener with application error code 0 and an empty reason, including the ones that are queued for `accept`, then closes the socket, which ends the endpoint's reader, and wakes every green thread waiting in `accept` or `accept_handle`, which fail with `NotConnected`. Asks every connection to close before it waits for any, then parks the green thread until each has sent its CONNECTION_CLOSE, so the wait is that of the slowest connection, at most 5 seconds as for `close_on`, and not the sum. New connections are refused from the first call on, and later calls do nothing.
+pub fn close_listener_on(h: *ListenerHandle) {
+    shutdown_endpoint(h.endpoint)
+}
+
+/// Accepts the next connection on `l`.
+///
+/// Does the same as `accept_handle` on its handle and wraps the result in a `Connection`.
+pub fn accept(l: Listener) -> Connection ! io.Error {
+    let handle = accept_handle(l.handle)?
+    Connection { handle }
+}
+
+/// Accepts the next connection on the listener behind `h` and returns its view.
+///
+/// Parks the green thread until a connection arrives. Fails with `NotConnected` once the listener is closed, including while the call is waiting.
+pub fn accept_handle(h: *ListenerHandle) -> *ConnectionHandle ! io.Error {
+    let ep = h.endpoint
+    select {
+        <-ep.closed => fail NotConnected
+        next = <-ep.accepted => match next {
+            some(handle) => handle
+            none => fail NotConnected
+        }
+    }
+}

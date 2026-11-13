@@ -1,0 +1,532 @@
+import std/io
+
+/// A range of consecutive packet numbers an ACK frame acknowledges.
+pub struct AckRange {
+    /// The lowest packet number in the range.
+    pub smallest: i64
+    /// The highest packet number in the range.
+    pub largest: i64
+}
+
+/// The contents of an ACK frame (RFC 9000 section 19.3).
+pub struct AckFrame {
+    /// The largest packet number acknowledged.
+    pub largest: i64
+    /// The acknowledgment delay as encoded, in units of 2^ack_delay_exponent microseconds.
+    pub delay: i64
+    /// The acknowledged ranges from the highest to the lowest. The first range ends at `largest`, and each later range lies below the previous one with at least one unacknowledged packet between them.
+    pub ranges: []AckRange
+    /// Whether the frame carries ECN counts.
+    pub ecn: bool = false
+    /// The count of packets received with the ECT(0) codepoint, when `ecn` is set.
+    pub ect0: i64 = 0
+    /// The count of packets received with the ECT(1) codepoint, when `ecn` is set.
+    pub ect1: i64 = 0
+    /// The count of packets received with the ECN-CE codepoint, when `ecn` is set.
+    pub ce: i64 = 0
+}
+
+/// The contents of a STREAM frame (RFC 9000 section 19.8).
+pub struct StreamFrame {
+    /// The stream ID.
+    pub id: i64
+    /// The offset of `data` within the stream.
+    pub offset: i64
+    /// The stream data.
+    pub data: []u8
+    /// Whether the frame ends the stream, so `offset + data.len` is the final size.
+    pub fin: bool
+}
+
+/// The contents of a CONNECTION_CLOSE frame (RFC 9000 section 19.19).
+pub struct CloseFrame {
+    /// Whether the frame closes with an application error code, which has frame type 0x1d and no `frame_type`, instead of a transport error code.
+    pub application: bool
+    /// The error code.
+    pub code: i64
+    /// The type of the frame that caused a transport error, and 0 for an application error.
+    pub frame_type: i64
+    /// The human-readable reason, which can be empty.
+    pub reason: str
+}
+
+/// A QUIC frame (RFC 9000 section 19).
+pub enum Frame {
+    /// A run of PADDING frames, each one byte. The parser collapses consecutive ones into a single value.
+    Padding(count: i64)
+    /// A PING frame.
+    Ping
+    /// An ACK frame.
+    Ack(AckFrame)
+    /// A RESET_STREAM frame that abruptly ends a stream's sending side.
+    ResetStream(id: i64, code: i64, final_size: i64)
+    /// A STOP_SENDING frame that asks the peer to stop sending on a stream.
+    StopSending(id: i64, code: i64)
+    /// A CRYPTO frame carrying handshake data at `offset`.
+    Crypto(offset: i64, data: []u8)
+    /// A NEW_TOKEN frame carrying an address validation token for later connections.
+    NewToken(token: []u8)
+    /// A STREAM frame.
+    Stream(StreamFrame)
+    /// A MAX_DATA frame raising the connection-wide data limit.
+    MaxData(limit: i64)
+    /// A MAX_STREAM_DATA frame raising the data limit of one stream.
+    MaxStreamData(id: i64, limit: i64)
+    /// A MAX_STREAMS frame raising the limit on bidirectional streams when `bidi` is true and on unidirectional streams otherwise.
+    MaxStreams(bidi: bool, limit: i64)
+    /// A DATA_BLOCKED frame reporting that the connection-wide limit blocks sending.
+    DataBlocked(limit: i64)
+    /// A STREAM_DATA_BLOCKED frame reporting that the limit of one stream blocks sending.
+    StreamDataBlocked(id: i64, limit: i64)
+    /// A STREAMS_BLOCKED frame reporting that the stream limit blocks opening bidirectional streams when `bidi` is true and unidirectional streams otherwise.
+    StreamsBlocked(bidi: bool, limit: i64)
+    /// A NEW_CONNECTION_ID frame. `id` is 1 to 20 bytes and `reset_token` is 16 bytes.
+    NewConnectionId(sequence: i64, retire_prior_to: i64, id: []u8, reset_token: []u8)
+    /// A RETIRE_CONNECTION_ID frame naming a connection ID by sequence number.
+    RetireConnectionId(sequence: i64)
+    /// A PATH_CHALLENGE frame carrying 8 bytes.
+    PathChallenge(data: []u8)
+    /// A PATH_RESPONSE frame echoing 8 bytes.
+    PathResponse(data: []u8)
+    /// A CONNECTION_CLOSE frame.
+    ConnectionClose(CloseFrame)
+    /// A HANDSHAKE_DONE frame.
+    HandshakeDone
+}
+
+fn stream_limit() -> i64 {
+    1152921504606846976
+}
+
+fn frame_type(c: *Cursor) -> i64 ! io.Error {
+    let start = position(c)
+    let kind = varint(c)?
+    if position(c) - start != varint_size(kind) {
+        fail Malformed
+    }
+    kind
+}
+
+fn flag(kind: i64, bit: i64) -> bool {
+    kind & bit != 0
+}
+
+fn checked_end(offset: i64, length: i64) -> i64 ! io.Error {
+    if offset > max_varint() - length {
+        fail Malformed
+    }
+    offset + length
+}
+
+fn parse_ack(c: *Cursor, ecn: bool) -> AckFrame ! io.Error {
+    let largest = varint(c)?
+    let delay = varint(c)?
+    let count = varint(c)?
+    let first = varint(c)?
+    if count > left(c) / 2 || first > largest {
+        fail Malformed
+    }
+    var smallest = largest - first
+    var ranges: []AckRange = [AckRange { smallest, largest }]
+    for _ in 0..count {
+        let gap = varint(c)?
+        let length = varint(c)?
+        let top = smallest - gap - 2
+        if top < 0 || length > top {
+            fail Malformed
+        }
+        smallest = top - length
+        push(mut ranges, AckRange { smallest, largest: top })
+    }
+    if !ecn {
+        return AckFrame { largest, delay, ranges }
+    }
+    let ect0 = varint(c)?
+    let ect1 = varint(c)?
+    let ce = varint(c)?
+    AckFrame { largest, delay, ranges, ecn: true, ect0, ect1, ce }
+}
+
+fn parse_stream(c: *Cursor, kind: i64) -> StreamFrame ! io.Error {
+    let id = varint(c)?
+    let offset = if flag(kind, 0x04) { varint(c)? } else { 0 }
+    let length = if flag(kind, 0x02) { varint(c)? } else { left(c) }
+    let data = take(c, length)?
+    checked_end(offset, data.len)?
+    StreamFrame { id, offset, data, fin: flag(kind, 0x01) }
+}
+
+fn parse_new_connection_id(c: *Cursor) -> Frame ! io.Error {
+    let sequence = varint(c)?
+    let retire_prior_to = varint(c)?
+    let length = byte(c)?
+    if length < 1 || length > 20 || retire_prior_to > sequence {
+        fail Malformed
+    }
+    let id = take(c, length)?
+    let reset_token = take(c, 16)?
+    Frame.NewConnectionId(sequence, retire_prior_to, id, reset_token)
+}
+
+fn parse_close(c: *Cursor, application: bool) -> CloseFrame ! io.Error {
+    let code = varint(c)?
+    let frame_type = if application { 0 } else { varint(c)? }
+    let length = varint(c)?
+    let reason = take(c, length)?
+    CloseFrame { application, code, frame_type, reason: str(reason) }
+}
+
+fn parse_frame(c: *Cursor, kind: i64) -> Frame ! io.Error {
+    if kind >= 0x08 && kind <= 0x0f {
+        let s = parse_stream(c, kind)?
+        return Frame.Stream(s)
+    }
+    match kind {
+        0x01 => Frame.Ping
+        0x02 => {
+            let a = parse_ack(c, false)?
+            Frame.Ack(a)
+        }
+        0x03 => {
+            let a = parse_ack(c, true)?
+            Frame.Ack(a)
+        }
+        0x04 => {
+            let id = varint(c)?
+            let code = varint(c)?
+            let final_size = varint(c)?
+            Frame.ResetStream(id, code, final_size)
+        }
+        0x05 => {
+            let id = varint(c)?
+            let code = varint(c)?
+            Frame.StopSending(id, code)
+        }
+        0x06 => {
+            let offset = varint(c)?
+            let length = varint(c)?
+            let data = take(c, length)?
+            checked_end(offset, length)?
+            Frame.Crypto(offset, data)
+        }
+        0x07 => {
+            let length = varint(c)?
+            if length == 0 {
+                fail Malformed
+            }
+            let token = take(c, length)?
+            Frame.NewToken(token)
+        }
+        0x10 => {
+            let limit = varint(c)?
+            Frame.MaxData(limit)
+        }
+        0x11 => {
+            let id = varint(c)?
+            let limit = varint(c)?
+            Frame.MaxStreamData(id, limit)
+        }
+        0x12 => parse_stream_limit(c, true, false)?
+        0x13 => parse_stream_limit(c, false, false)?
+        0x14 => {
+            let limit = varint(c)?
+            Frame.DataBlocked(limit)
+        }
+        0x15 => {
+            let id = varint(c)?
+            let limit = varint(c)?
+            Frame.StreamDataBlocked(id, limit)
+        }
+        0x16 => parse_stream_limit(c, true, true)?
+        0x17 => parse_stream_limit(c, false, true)?
+        0x18 => parse_new_connection_id(c)?
+        0x19 => {
+            let sequence = varint(c)?
+            Frame.RetireConnectionId(sequence)
+        }
+        0x1a => {
+            let data = take(c, 8)?
+            Frame.PathChallenge(data)
+        }
+        0x1b => {
+            let data = take(c, 8)?
+            Frame.PathResponse(data)
+        }
+        0x1c => {
+            let close = parse_close(c, false)?
+            Frame.ConnectionClose(close)
+        }
+        0x1d => {
+            let close = parse_close(c, true)?
+            Frame.ConnectionClose(close)
+        }
+        0x1e => Frame.HandshakeDone
+        _ => fail Malformed
+    }
+}
+
+fn parse_stream_limit(c: *Cursor, bidi: bool, blocked: bool) -> Frame ! io.Error {
+    let limit = varint(c)?
+    if limit > stream_limit() {
+        fail Malformed
+    }
+    if blocked {
+        return Frame.StreamsBlocked(bidi, limit)
+    }
+    Frame.MaxStreams(bidi, limit)
+}
+
+/// Parses the frames of a decrypted packet payload.
+///
+/// Consecutive PADDING bytes become one `Padding`. Fails with `Malformed` for an empty payload, a truncated frame, an unknown frame type, a frame type encoded in more bytes than necessary, a STREAM or CRYPTO frame whose offset plus length exceeds 2^62 - 1, a MAX_STREAMS or STREAMS_BLOCKED limit above 2^60, a NEW_TOKEN with an empty token, a NEW_CONNECTION_ID whose ID is not 1 to 20 bytes or whose `retire_prior_to` exceeds `sequence`, and ACK ranges that reach below packet number 0. A connection maps `Malformed` to FRAME_ENCODING_ERROR. Byte slices in the frames share `payload`.
+pub fn parse_frames(payload: []u8) -> []Frame ! io.Error {
+    if payload.len == 0 {
+        fail Malformed
+    }
+    let c = cursor(payload)
+    var out: []Frame = []
+    for left(c) > 0 {
+        let kind = frame_type(c)?
+        if kind == 0 {
+            var count = 1
+            for left(c) > 0 && c.data[c.at] == 0 {
+                c.at += 1
+                count += 1
+            }
+            push(mut out, Frame.Padding(count))
+        } else {
+            let f = parse_frame(c, kind)?
+            push(mut out, f)
+        }
+    }
+    out
+}
+
+/// Returns the acknowledgment delay of `ack` in nanoseconds, given the peer's `ack_delay_exponent`.
+///
+/// The delay is `ack.delay * 2^exponent` microseconds. The result saturates at the largest `i64` instead of overflowing, so a hostile delay such as 2^62 - 1 is safe to use. An `exponent` outside 0 to 20 is clamped into that range, and a negative delay gives 0.
+pub fn ack_delay_ns(ack: AckFrame, exponent: i64) -> i64 {
+    if ack.delay <= 0 {
+        return 0
+    }
+    var shift = exponent
+    if shift < 0 {
+        shift = 0
+    }
+    if shift > 20 {
+        shift = 20
+    }
+    let unit = (1 << shift) * 1000
+    let ceiling = 9223372036854775807
+    if ack.delay > ceiling / unit {
+        return ceiling
+    }
+    ack.delay * unit
+}
+
+fn put_ack(mut out: []u8, a: AckFrame) {
+    put_varint(mut out, if a.ecn { 3 } else { 2 })
+    put_varint(mut out, a.largest)
+    put_varint(mut out, a.delay)
+    if a.ranges.len == 0 {
+        put_varint(mut out, 0)
+        put_varint(mut out, 0)
+    } else {
+        put_varint(mut out, a.ranges.len - 1)
+        put_varint(mut out, a.largest - a.ranges[0].smallest)
+        for i in 1..a.ranges.len {
+            let above = a.ranges[i - 1]
+            let range = a.ranges[i]
+            put_varint(mut out, above.smallest - range.largest - 2)
+            put_varint(mut out, range.largest - range.smallest)
+        }
+    }
+    if a.ecn {
+        put_varint(mut out, a.ect0)
+        put_varint(mut out, a.ect1)
+        put_varint(mut out, a.ce)
+    }
+}
+
+fn ack_size(a: AckFrame) -> i64 {
+    var size = 1 + varint_size(a.largest) + varint_size(a.delay)
+    if a.ranges.len == 0 {
+        size += 2
+    } else {
+        size += varint_size(a.ranges.len - 1) + varint_size(a.largest - a.ranges[0].smallest)
+        for i in 1..a.ranges.len {
+            let above = a.ranges[i - 1]
+            let range = a.ranges[i]
+            size += varint_size(above.smallest - range.largest - 2) + varint_size(range.largest - range.smallest)
+        }
+    }
+    if a.ecn {
+        size += varint_size(a.ect0) + varint_size(a.ect1) + varint_size(a.ce)
+    }
+    size
+}
+
+fn stream_type(s: StreamFrame, last: bool) -> i64 {
+    var kind = 0x08
+    if s.offset != 0 {
+        kind |= 0x04
+    }
+    if !last {
+        kind |= 0x02
+    }
+    if s.fin {
+        kind |= 0x01
+    }
+    kind
+}
+
+/// Returns the number of bytes `put_stream_frame` writes for `s`.
+///
+/// The offset is written only when it is not 0, and the length only when `last` is false.
+pub fn stream_frame_size(s: StreamFrame, last: bool) -> i64 {
+    var size = 1 + varint_size(s.id) + s.data.len
+    if s.offset != 0 {
+        size += varint_size(s.offset)
+    }
+    if !last {
+        size += varint_size(s.data.len)
+    }
+    size
+}
+
+/// Appends the STREAM frame `s`.
+///
+/// The offset is written only when it is not 0. When `last` is false the frame carries an explicit length; when `last` is true the length is omitted and the frame must be the final one of the packet, since its data runs to the end of the payload.
+pub fn put_stream_frame(mut out: []u8, s: StreamFrame, last: bool) {
+    put_varint(mut out, stream_type(s, last))
+    put_varint(mut out, s.id)
+    if s.offset != 0 {
+        put_varint(mut out, s.offset)
+    }
+    if !last {
+        put_varint(mut out, s.data.len)
+    }
+    io.append(mut out, s.data)
+}
+
+fn put_close(mut out: []u8, close: CloseFrame) {
+    put_varint(mut out, if close.application { 0x1d } else { 0x1c })
+    put_varint(mut out, close.code)
+    if !close.application {
+        put_varint(mut out, close.frame_type)
+    }
+    put_varint(mut out, close.reason.len)
+    io.append(mut out, bytes(close.reason))
+}
+
+fn close_size(close: CloseFrame) -> i64 {
+    var size = 1 + varint_size(close.code) + varint_size(close.reason.len) + close.reason.len
+    if !close.application {
+        size += varint_size(close.frame_type)
+    }
+    size
+}
+
+fn put_pair(mut out: []u8, kind: i64, a: i64, b: i64) {
+    put_varint(mut out, kind)
+    put_varint(mut out, a)
+    put_varint(mut out, b)
+}
+
+fn put_single(mut out: []u8, kind: i64, a: i64) {
+    put_varint(mut out, kind)
+    put_varint(mut out, a)
+}
+
+fn put_chunk(mut out: []u8, kind: i64, data: []u8) {
+    put_varint(mut out, kind)
+    put_varint(mut out, data.len)
+    io.append(mut out, data)
+}
+
+fn put_blob(mut out: []u8, kind: i64, data: []u8) {
+    put_varint(mut out, kind)
+    io.append(mut out, data)
+}
+
+/// Appends the frame `f`.
+///
+/// A STREAM frame is written with an explicit length, so other frames can follow it; use `put_stream_frame` to omit the length of the last one. `Padding` appends `count` zero bytes. An `Ack` with no ranges acknowledges only `largest`. The `id` and `reset_token` of `NewConnectionId` and the data of `PathChallenge` and `PathResponse` are written as given and must have the lengths their variants document. Panics when an integer is negative or above 2^62 - 1.
+pub fn put_frame(mut out: []u8, f: Frame) {
+    match f {
+        Padding(count) => {
+            for _ in 0..count {
+                push(mut out, 0)
+            }
+        }
+        Ping => put_varint(mut out, 0x01)
+        Ack(a) => put_ack(mut out, a)
+        ResetStream(id, code, final_size) => {
+            put_pair(mut out, 0x04, id, code)
+            put_varint(mut out, final_size)
+        }
+        StopSending(id, code) => put_pair(mut out, 0x05, id, code)
+        Crypto(offset, data) => {
+            put_pair(mut out, 0x06, offset, data.len)
+            io.append(mut out, data)
+        }
+        NewToken(token) => put_chunk(mut out, 0x07, token)
+        Stream(s) => put_stream_frame(mut out, s, false)
+        MaxData(limit) => put_single(mut out, 0x10, limit)
+        MaxStreamData(id, limit) => put_pair(mut out, 0x11, id, limit)
+        MaxStreams(bidi, limit) => put_single(mut out, if bidi { 0x12 } else { 0x13 }, limit)
+        DataBlocked(limit) => put_single(mut out, 0x14, limit)
+        StreamDataBlocked(id, limit) => put_pair(mut out, 0x15, id, limit)
+        StreamsBlocked(bidi, limit) => put_single(mut out, if bidi { 0x16 } else { 0x17 }, limit)
+        NewConnectionId(sequence, retire_prior_to, id, reset_token) => {
+            put_pair(mut out, 0x18, sequence, retire_prior_to)
+            push(mut out, u8(id.len))
+            io.append(mut out, id)
+            io.append(mut out, reset_token)
+        }
+        RetireConnectionId(sequence) => put_single(mut out, 0x19, sequence)
+        PathChallenge(data) => put_blob(mut out, 0x1a, data)
+        PathResponse(data) => put_blob(mut out, 0x1b, data)
+        ConnectionClose(close) => put_close(mut out, close)
+        HandshakeDone => put_varint(mut out, 0x1e)
+    }
+}
+
+/// Returns the number of bytes `put_frame` writes for `f`.
+///
+/// A packet writer uses it to fit frames into the space left in a packet.
+pub fn frame_size(f: Frame) -> i64 {
+    match f {
+        Padding(count) => count
+        Ping => 1
+        Ack(a) => ack_size(a)
+        ResetStream(id, code, final_size) => 1 + varint_size(id) + varint_size(code) + varint_size(final_size)
+        StopSending(id, code) => 1 + varint_size(id) + varint_size(code)
+        Crypto(offset, data) => 1 + varint_size(offset) + varint_size(data.len) + data.len
+        NewToken(token) => 1 + varint_size(token.len) + token.len
+        Stream(s) => stream_frame_size(s, false)
+        MaxData(limit) => 1 + varint_size(limit)
+        MaxStreamData(id, limit) => 1 + varint_size(id) + varint_size(limit)
+        MaxStreams(_, limit) => 1 + varint_size(limit)
+        DataBlocked(limit) => 1 + varint_size(limit)
+        StreamDataBlocked(id, limit) => 1 + varint_size(id) + varint_size(limit)
+        StreamsBlocked(_, limit) => 1 + varint_size(limit)
+        NewConnectionId(sequence, retire_prior_to, id, reset_token) => 2 + varint_size(sequence) + varint_size(retire_prior_to) + id.len + reset_token.len
+        RetireConnectionId(sequence) => 1 + varint_size(sequence)
+        PathChallenge(data) => 1 + data.len
+        PathResponse(data) => 1 + data.len
+        ConnectionClose(close) => close_size(close)
+        HandshakeDone => 1
+    }
+}
+
+/// Returns whether `f` makes the peer send an acknowledgment: every frame except `Ack`, `Padding` and `ConnectionClose`.
+pub fn ack_eliciting(f: Frame) -> bool {
+    match f {
+        Ack => false
+        Padding => false
+        ConnectionClose => false
+        _ => true
+    }
+}
+

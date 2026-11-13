@@ -1,0 +1,181 @@
+import std/bits
+import std/io
+
+/// A read position over a byte slice, made by `cursor`.
+///
+/// Every read advances the position and fails with `io.Error.Malformed` when fewer bytes remain than the read needs.
+pub struct Cursor {
+    data: []u8
+    at: i64
+}
+
+/// Returns the largest value a variable-length integer holds, 2^62 - 1.
+pub fn max_varint() -> i64 {
+    4611686018427387903
+}
+
+/// Returns a cursor at the start of `data`.
+pub fn cursor(data: []u8) -> *Cursor {
+    new(Cursor { data, at: 0 })
+}
+
+/// Returns the number of bytes not yet read.
+pub fn left(c: *Cursor) -> i64 {
+    c.data.len - c.at
+}
+
+/// Returns the offset of the next byte to read.
+pub fn position(c: *Cursor) -> i64 {
+    c.at
+}
+
+/// Reads the next `n` bytes and returns them as a slice that shares the cursor's data.
+///
+/// Fails with `Malformed` when `n` is negative or more than `left(c)`.
+pub fn take(c: *Cursor, n: i64) -> []u8 ! io.Error {
+    if n < 0 || left(c) < n {
+        fail Malformed
+    }
+    let out = c.data[c.at..c.at + n]
+    c.at += n
+    out
+}
+
+/// Reads every remaining byte and returns them as a slice that shares the cursor's data.
+pub fn rest(c: *Cursor) -> []u8 {
+    let out = c.data[c.at..]
+    c.at = c.data.len
+    out
+}
+
+/// Reads one byte and returns it as a value from 0 to 255.
+///
+/// Fails with `Malformed` at the end of the data.
+pub fn byte(c: *Cursor) -> i64 ! io.Error {
+    let b = take(c, 1)?
+    i64(b[0])
+}
+
+/// Reads a big-endian 16-bit unsigned integer.
+///
+/// Fails with `Malformed` when fewer than 2 bytes remain.
+pub fn u16_of(c: *Cursor) -> i64 ! io.Error {
+    let b = take(c, 2)?
+    io.be16(b, 0)
+}
+
+/// Reads a big-endian 32-bit unsigned integer.
+///
+/// Fails with `Malformed` when fewer than 4 bytes remain.
+pub fn u32_of(c: *Cursor) -> i64 ! io.Error {
+    let b = take(c, 4)?
+    io.be32(b, 0)
+}
+
+/// Reads a variable-length integer (RFC 9000 section 16) and returns its value, from 0 to 2^62 - 1.
+///
+/// Fails with `Malformed` when the data ends inside the integer. Encodings longer than necessary are accepted.
+pub fn varint(c: *Cursor) -> i64 ! io.Error {
+    let first = byte(c)?
+    let size = 1 << (first >> 6)
+    var v = first & 0x3f
+    if size > 1 {
+        let tail = take(c, size - 1)?
+        for b in tail {
+            v = v << 8 | i64(b)
+        }
+    }
+    v
+}
+
+/// Returns the number of bytes `put_varint` writes for `v`: 1, 2, 4 or 8.
+///
+/// `v` must be from 0 to `max_varint()`; a larger or negative value gives 8.
+pub fn varint_size(v: i64) -> i64 {
+    if v < 0 {
+        return 8
+    }
+    if v < 64 {
+        return 1
+    }
+    if v < 16384 {
+        return 2
+    }
+    if v < 1073741824 {
+        return 4
+    }
+    8
+}
+
+/// Appends `v` as a variable-length integer in its shortest form.
+///
+/// Panics when `v` is negative or above `max_varint()`.
+pub fn put_varint(mut out: []u8, v: i64) {
+    if v < 0 || v > max_varint() {
+        __panic("quic: varint out of range")
+    }
+    put_varint_sized(mut out, v, varint_size(v))
+}
+
+/// Appends `v` as a variable-length integer of exactly `size` bytes, which is 1, 2, 4 or 8.
+///
+/// A packet writer uses it to reserve a Length field of known size before the payload length is known. Panics when `v` does not fit in `size` bytes or `size` is not one of the four lengths.
+pub fn put_varint_sized(mut out: []u8, v: i64, size: i64) {
+    let limit = match size {
+        1 => 64
+        2 => 16384
+        4 => 1073741824
+        8 => max_varint() + 1
+        _ => __panic("quic: varint size is not 1, 2, 4 or 8")
+    }
+    if v < 0 || v >= limit {
+        __panic("quic: varint out of range")
+    }
+    let prefix = match size {
+        1 => 0
+        2 => 1
+        4 => 2
+        _ => 3
+    }
+    let first = u8(v >> (8 * (size - 1))) | u8(prefix << 6)
+    push(mut out, first)
+    for i in 1..size {
+        push(mut out, u8(v >> (8 * (size - 1 - i))))
+    }
+}
+
+/// Returns the number of bytes of a packet number field for `full`, given the largest packet number the peer has acknowledged.
+///
+/// Implements RFC 9000 appendix A.2 and returns 1 to 4. `largest_acked` is -1 when nothing has been acknowledged. The length covers twice the number of packets in flight, so the receiver can decode the number unambiguously.
+pub fn encode_packet_number(full: i64, largest_acked: i64) -> i64 {
+    let unacked = full - largest_acked
+    let min_bits = bits.bit_length(u64(unacked)) + 1
+    let length = (min_bits + 7) / 8
+    if length > 4 {
+        return 4
+    }
+    length
+}
+
+/// Returns the full packet number a truncated one stands for (RFC 9000 appendix A.3).
+///
+/// `largest` is the largest packet number received so far in the packet number space, or -1 when none has arrived. `truncated` is the value of the packet number field and `pn_bits` its width: 8, 16, 24 or 32.
+pub fn decode_packet_number(largest: i64, truncated: i64, pn_bits: i64) -> i64 {
+    let expected = largest + 1
+    let window = 1 << pn_bits
+    let half = window / 2
+    let mask = window - 1
+    let candidate = expected & ~mask | truncated
+    if candidate <= expected - half && candidate < (1 << 62) - window {
+        return candidate + window
+    }
+    if candidate > expected + half && candidate >= window {
+        return candidate - window
+    }
+    candidate
+}
+
+/// Appends the low `length` bytes of the packet number `pn`, for a `length` from 1 to 4.
+pub fn put_packet_number(mut out: []u8, pn: i64, length: i64) {
+    io.put_be(mut out, pn, length)
+}

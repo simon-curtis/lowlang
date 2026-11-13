@@ -1,0 +1,338 @@
+import std/crypto/x509
+import std/header
+import std/http
+import std/http/qpack
+import std/io
+import std/quic
+import std/quic/wire
+import std/sync
+import std/time
+import std/tls
+
+struct State {
+    lock: sync.Mutex
+    connections: i64
+    resets: i64
+    refusals: i64
+    code: i64
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        push(mut out, x509.parse(der) or return out)
+    }
+    out
+}
+
+fn count_connection(s: *State) {
+    sync.lock(s.lock)
+    s.connections += 1
+    sync.unlock(s.lock)
+}
+
+fn first_time(s: *State, which: str) -> bool {
+    sync.lock(s.lock)
+    var first = false
+    if which == "reset" {
+        first = s.resets == 0
+        s.resets += 1
+    } else {
+        first = s.refusals == 0
+        s.refusals += 1
+    }
+    sync.unlock(s.lock)
+    first
+}
+
+fn connections(s: *State) -> i64 {
+    sync.lock(s.lock)
+    let n = s.connections
+    sync.unlock(s.lock)
+    n
+}
+
+fn frame(kind: i64, payload: []u8) -> []u8 {
+    var out: []u8 = []
+    wire.put_varint(mut out, kind)
+    wire.put_varint(mut out, payload.len)
+    io.append(mut out, payload)
+    out
+}
+
+fn section(fields: []header.Header) -> []u8 {
+    frame(1, qpack.encode(qpack.encoder(), fields))
+}
+
+fn status_fields(status: str) -> []header.Header {
+    [header.Header { name: ":status", value: status }]
+}
+
+fn goaway(id: i64) -> []u8 {
+    var payload: []u8 = []
+    wire.put_varint(mut payload, id)
+    frame(7, payload)
+}
+
+fn open_control(h: *quic.ConnectionHandle) ! io.Error {
+    let s = quic.open_uni_stream_on(h)?
+    var out: []u8 = []
+    wire.put_varint(mut out, 0)
+    io.append(mut out, frame(4, []))
+    quic.write(s, out)?
+}
+
+fn request_path(id: i64, raw: []u8) -> str {
+    let c = wire.cursor(raw)
+    let d = qpack.decoder(0, 0, 65536)
+    for wire.left(c) > 0 {
+        let kind = wire.varint(c) or return ""
+        let length = wire.varint(c) or return ""
+        let payload = wire.take(c, length) or return ""
+        if kind == 1 {
+            let decoded = qpack.decode(d, id, payload) or return ""
+            match decoded {
+                Fields(fields) => return header.get(fields, ":path") ?? ""
+                Blocked => return ""
+            }
+        }
+    }
+    ""
+}
+
+fn answer(s: quic.Stream, parts: []u8) {
+    quic.write(s, parts) or return
+    quic.finish(s) or {}
+}
+
+fn ok_with(body: str) -> []u8 {
+    var out = section(status_fields("200"))
+    io.append(mut out, frame(0, bytes(body)))
+    out
+}
+
+fn write_quietly(s: quic.Stream, data: []u8) {
+    quic.write(s, data) catch {
+        _ => 0
+    }
+}
+
+fn interim_flood() -> []u8 {
+    var out: []u8 = []
+    for _ in 0..17 {
+        io.append(mut out, section(status_fields("103")))
+    }
+    io.append(mut out, section(status_fields("200")))
+    out
+}
+
+fn interim_then_ok() -> []u8 {
+    var out = section([header.Header { name: ":status", value: "103" }, header.Header { name: "link", value: "</x>" }])
+    io.append(mut out, section(status_fields("102")))
+    io.append(mut out, section([header.Header { name: ":status", value: "200" }, header.Header { name: "content-length", value: "2" }]))
+    io.append(mut out, frame(0, bytes("ok")))
+    out
+}
+
+fn short_body() -> []u8 {
+    var out = section([header.Header { name: ":status", value: "200" }, header.Header { name: "content-length", value: "5" }])
+    io.append(mut out, frame(0, bytes("abc")))
+    out
+}
+
+fn push_stream(h: *quic.ConnectionHandle) {
+    let s = quic.open_uni_stream_on(h) or return
+    var out: []u8 = []
+    wire.put_varint(mut out, 1)
+    wire.put_varint(mut out, 0)
+    write_quietly(s, out)
+}
+
+fn respond(h: *quic.ConnectionHandle, control: quic.Stream, s: quic.Stream, state: *State, path: str) {
+    match path {
+        "/interim" => answer(s, interim_then_ok())
+        "/flood" => answer(s, interim_flood())
+        "/bad-status" => answer(s, section(status_fields("abc")))
+        "/no-status" => answer(s, section([header.Header { name: "x-a", value: "1" }]))
+        "/pseudo-last" => answer(s, section([header.Header { name: "x-a", value: "1" }, header.Header { name: ":status", value: "200" }]))
+        "/length-mismatch" => answer(s, short_body())
+        "/early-data" => answer(s, frame(0, bytes("early")))
+        "/reset" => {
+            if first_time(state, "reset") {
+                quic.reset(s, 0x10b)
+                return
+            }
+            answer(s, ok_with("recovered"))
+        }
+        "/refused" => {
+            if first_time(state, "refused") {
+                write_quietly(control, goaway(s.id))
+                return
+            }
+            answer(s, ok_with("recovered after goaway"))
+        }
+        "/draining" => {
+            write_quietly(control, goaway(s.id + 4))
+            sleep(100)
+            answer(s, ok_with("last on this connection"))
+        }
+        "/push" => push_stream(h)
+        "/silent" => sleep(500)
+        _ => answer(s, ok_with("plain"))
+    }
+}
+
+fn raw_request(h: *quic.ConnectionHandle, control: quic.Stream, s: quic.Stream, state: *State) {
+    let raw = io.read_all(quic.stream(s)) or return
+    respond(h, control, s, state, request_path(s.id, raw))
+}
+
+fn raw_connection(h: *quic.ConnectionHandle, state: *State) {
+    using owner = quic.adopt(h)
+    let control = quic.open_uni_stream_on(h) or return
+    var start: []u8 = []
+    wire.put_varint(mut start, 0)
+    io.append(mut start, frame(4, []))
+    quic.write(control, start) or return
+    for {
+        let s = quic.accept_stream_on(h) catch {
+            _ => break
+        }
+        spawn raw_request(h, control, s, state)
+    }
+    note_close(state, h)
+}
+
+fn note_close(state: *State, h: *quic.ConnectionHandle) {
+    sync.lock(state.lock)
+    state.code = h.close_code
+    sync.unlock(state.lock)
+}
+
+fn last_code(state: *State) -> str {
+    sync.lock(state.lock)
+    let code = state.code
+    sync.unlock(state.lock)
+    "0x{hex(code)}"
+}
+
+fn hex(n: i64) -> str {
+    let digits = "0123456789abcdef"
+    if n == 0 {
+        return "0"
+    }
+    var out = ""
+    var rest = n
+    for rest > 0 {
+        out = "{digits[rest & 15..(rest & 15) + 1]}{out}"
+        rest = rest >> 4
+    }
+    out
+}
+
+fn raw_serve(l: *quic.ListenerHandle, state: *State) {
+    for {
+        let h = quic.accept_handle(l) or return
+        count_connection(state)
+        spawn raw_connection(h, state)
+    }
+}
+
+fn failure(e: http.Error) -> str {
+    match e {
+        InvalidUrl(u) => "invalid url {u}"
+        Connect(_) => "connect error"
+        Tls(_) => "tls error"
+        Timeout => "timeout"
+        TooManyRedirects(n) => "too many redirects {n}"
+        Protocol(cause) => "protocol error {cause}"
+        Decode(_) => "decode error"
+        Json(_) => "json error"
+        Status(code) => "status {code}"
+        Io(cause) => "io error {cause}"
+    }
+}
+
+fn result(op: fn() -> http.Response ! http.Error) -> str {
+    let r = op() catch {
+        e => return failure(e)
+    }
+    "{r.status} {r.text()}"
+}
+
+fn show(label: str, c: *http.Client, path: str) {
+    print("{label}: {result(fn() -> http.Response ! http.Error { c.get(path) })}")
+}
+
+fn fresh_client(port: i64) -> *http.Client {
+    http.client().with_base_url("https://localhost:{port}").with_roots(roots()).with_version(http.Version.Http3).build()
+}
+
+fn within(label: str, limit: i64, op: fn() -> http.Response ! http.Error) {
+    let began = time.monotonic()
+    let text = result(op)
+    let millis = (time.monotonic() - began) / 1000000
+    print("{label}: {text} within limit={millis < limit}")
+}
+
+fn narrow_checks(narrow: *quic.ListenerHandle) {
+    let port = narrow.addr.port
+    let timed = fresh_client(port)
+    within("one uni stream", 2000, fn() -> http.Response ! http.Error { timed.request("GET", "/plain").with_timeout(300).send() })
+    within("one uni stream again", 2000, fn() -> http.Response ! http.Error { timed.request("GET", "/plain").with_timeout(300).send() })
+    let bounded = http.client().with_base_url("https://localhost:{port}").with_roots(roots()).with_version(http.Version.Http3).with_connect_timeout(300).build()
+    within("one uni stream without request timeout", 2000, fn() -> http.Response ! http.Error { bounded.get("/plain") })
+}
+
+fn main() ! http.Error {
+    let pem = embed("std_tls_ec.pem")
+    let key = x509.pem_private_key(pem) or fail Tls(Invalid)
+    let config = quic.Config { tls: tls.Config { certificates: x509.pem_certificates(pem), key, alpn: ["h3"] } }
+    using l = quic.listen("127.0.0.1", 0, config) or fail Connect(Refused)
+    let state = new(State { lock: sync.mutex(), connections: 0, resets: 0, refusals: 0, code: 0 })
+    spawn raw_serve(l.handle, state)
+    let port = l.handle.addr.port
+
+    let c = fresh_client(port)
+    show("interim", c, "/interim")
+    show("interim flood", c, "/flood")
+    show("bad status", c, "/bad-status")
+    show("no status", c, "/no-status")
+    show("pseudo-header after regular", c, "/pseudo-last")
+    show("length mismatch", c, "/length-mismatch")
+    show("same connection", c, "/plain")
+    print("connections after malformed responses: {connections(state)}")
+
+    let timed = fresh_client(port)
+    print("timeout: {result(fn() -> http.Response ! http.Error { timed.request("GET", "/silent").with_timeout(100).send() })}")
+    show("after timeout", timed, "/plain")
+    print("connections after timeout: {connections(state)}")
+
+    let reset = fresh_client(port)
+    show("reset before response", reset, "/reset")
+    print("resets seen: {state.resets} connections: {connections(state)}")
+
+    let refused = fresh_client(port)
+    show("refused by goaway", refused, "/refused")
+    print("refusals seen: {state.refusals} connections: {connections(state)}")
+
+    let drained = fresh_client(port)
+    let before = connections(state)
+    show("draining", drained, "/draining")
+    show("after goaway", drained, "/plain")
+    print("connections used: {connections(state) - before}")
+
+    let pushed = fresh_client(port)
+    show("push stream", pushed, "/push")
+    sleep(200)
+    print("push close code: {last_code(state)}")
+
+    let early = fresh_client(port)
+    show("data before headers", early, "/early-data")
+    show("after connection error", early, "/plain")
+
+    let few = quic.Config { tls: tls.Config { certificates: x509.pem_certificates(pem), key, alpn: ["h3"] }, max_uni_streams: 1 }
+    using stingy = quic.listen("127.0.0.1", 0, few) or fail Connect(Refused)
+    spawn raw_serve(stingy.handle, state)
+    narrow_checks(stingy.handle)
+}

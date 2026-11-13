@@ -1,0 +1,392 @@
+import std/io
+import std/quic/recovery
+import std/quic/wire
+import std/time
+import std/tls
+
+struct Plan {
+    level: tls.Level
+    keys: wire.Keys
+    number: i64
+    length: i64
+    payload: []u8
+    left: i64
+    key_phase: bool
+    eliciting: bool
+    padded: bool
+    acked: bool = false
+    closing: bool
+    retransmit: []Retransmit
+}
+
+fn tag_size() -> i64 {
+    16
+}
+
+fn min_payload() -> i64 {
+    4
+}
+
+fn min_allowance() -> i64 {
+    64
+}
+
+fn header_size(c: *Conn, level: tls.Level, pn_length: i64) -> i64 {
+    match level {
+        Application => 1 + c.dcid.len + pn_length
+        Initial => 1 + 4 + 1 + c.dcid.len + 1 + c.scid.len + wire.varint_size(c.token.len) + c.token.len + 2 + pn_length
+        Handshake => 1 + 4 + 1 + c.dcid.len + 1 + c.scid.len + 2 + pn_length
+    }
+}
+
+fn flush(c: *Conn) {
+    if c.phase == Phase.Draining {
+        return
+    }
+    for !c.finished && send_datagram(c) {
+    }
+}
+
+fn set_blocked(c: *Conn, blocked: bool, now: i64) {
+    if c.recovery.amplification_blocked != blocked {
+        c.recovery.amplification_blocked = blocked
+        recovery.rearm_timer(c.recovery, now)
+    }
+}
+
+fn datagram_budget(c: *Conn, now: i64) -> i64 {
+    if c.server && !c.validated {
+        let allowance = 3 * c.bytes_received - c.bytes_sent
+        let blocked = allowance < min_allowance()
+        set_blocked(c, blocked, now)
+        if blocked {
+            return 0
+        }
+        return least(min_initial(), allowance)
+    }
+    set_blocked(c, false, now)
+    min_initial()
+}
+
+fn send_datagram(c: *Conn) -> bool {
+    let now = time.monotonic()
+    let budget = datagram_budget(c, now)
+    if budget == 0 {
+        return false
+    }
+    let may_send = recovery.can_send(c.recovery, min_initial())
+    var plans: []*Plan = []
+    var used = 0
+    for level in levels() {
+        match plan_packet(c, level, budget - used, may_send, now) {
+            some(p) => {
+                push(mut plans, p)
+                used += header_size(c, p.level, p.length) + p.payload.len + tag_size()
+            }
+            none => {}
+        }
+    }
+    if plans.len == 0 {
+        c.recovery.limited = may_send
+        return false
+    }
+    let first = plans[0]
+    if first.level == tls.Level.Initial && (!c.server || first.eliciting) && used < budget {
+        pad_plan(first, budget - used)
+    }
+    transmit(c, plans, now)
+    true
+}
+
+fn pad_plan(plan: *Plan, size: i64) {
+    wire.put_frame(mut plan.payload, wire.Frame.Padding(size))
+    plan.padded = true
+}
+
+fn transmit(c: *Conn, plans: []*Plan, now: i64) {
+    var datagram: []u8 = []
+    var carries_handshake = false
+    for p in plans {
+        let header = build_header(c, p)
+        let packet = wire.seal(p.keys, header, p.number, p.payload)
+        io.append(mut datagram, packet)
+        record_sent(c, p, packet.len, now)
+        if p.level == tls.Level.Handshake {
+            carries_handshake = true
+        }
+        if p.closing {
+            c.pending_close = none
+            c.close_sent_at = now
+        }
+    }
+    c.bytes_sent += datagram.len
+    send(c.endpoint, datagram, c.peer) catch {
+        NotConnected => {
+            c.finished = true
+        }
+        _ => {}
+    }
+    if carries_handshake && !c.server {
+        discard_keys(c, tls.Level.Initial)
+    }
+}
+
+fn new_plan(c: *Conn, level: tls.Level, room: i64) -> *Plan? {
+    let space = space_of(c, level)
+    if space.discarded {
+        return none
+    }
+    let keys = match space.write {
+        some(k) => k
+        none => return none
+    }
+    skip_number(c, level, space)
+    let length = wire.encode_packet_number(space.next_pn, recovery.largest_acked(c.recovery, rspace(level)))
+    let left = room - header_size(c, level, length) - tag_size()
+    if left < min_payload() {
+        return none
+    }
+    let plan = new(Plan {
+        level
+        keys
+        number: space.next_pn
+        length
+        key_phase: c.keys.write_phase
+        payload: []
+        left
+        eliciting: false
+        padded: false
+        closing: false
+        retransmit: []
+    })
+    some(plan)
+}
+
+fn pad_to_minimum(plan: *Plan) {
+    for plan.payload.len < min_payload() {
+        push(mut plan.payload, 0)
+        plan.padded = true
+    }
+}
+
+fn plan_packet(c: *Conn, level: tls.Level, room: i64, may_send: bool, now: i64) -> *Plan? {
+    let plan = match new_plan(c, level, room) {
+        some(p) => p
+        none => return none
+    }
+    let space = space_of(c, level)
+    if c.phase == Phase.Closing {
+        add_close(c, plan)
+    } else {
+        add_ack(space, plan, now)
+        if may_send {
+            add_handshake_done(c, plan)
+            add_path_response(c, plan)
+            add_retire_ids(c, plan)
+            add_ping(c, plan)
+            add_crypto(space, plan)
+            add_streams(c, plan)
+        }
+    }
+    if plan.payload.len == 0 {
+        return none
+    }
+    pad_to_minimum(plan)
+    some(plan)
+}
+
+fn put(plan: *Plan, f: wire.Frame) {
+    wire.put_frame(mut plan.payload, f)
+    plan.left -= wire.frame_size(f)
+    if wire.ack_eliciting(f) {
+        plan.eliciting = true
+    }
+}
+
+fn ack_of(space: *Space, ranges: []wire.AckRange, now: i64) -> wire.Frame {
+    let micros = (now - space.largest_received_time) / 1000
+    let delay = if micros > 0 { micros >> 3 } else { 0 }
+    wire.Frame.Ack(wire.AckFrame { largest: ranges[0].largest, delay, ranges })
+}
+
+fn add_ack(space: *Space, plan: *Plan, now: i64) {
+    if !space.ack_pending || space.received.len == 0 {
+        return
+    }
+    var ranges = space.received
+    var frame = ack_of(space, ranges, now)
+    for wire.frame_size(frame) > plan.left && ranges.len > 1 {
+        ranges = ranges[..ranges.len - 1]
+        frame = ack_of(space, ranges, now)
+    }
+    if wire.frame_size(frame) > plan.left {
+        return
+    }
+    put(plan, frame)
+    plan.acked = true
+    space.ack_pending = false
+    space.ack_deadline = -1
+    space.unacked = 0
+}
+
+fn close_for(level: tls.Level, close: wire.CloseFrame, left: i64) -> wire.CloseFrame? {
+    var out = close
+    if close.application && level != tls.Level.Application {
+        out = wire.CloseFrame { application: false, code: wire.application_error(), frame_type: 0, reason: "" }
+    }
+    let size = wire.frame_size(wire.Frame.ConnectionClose(out))
+    if size <= left {
+        return some(out)
+    }
+    let over = size - left
+    if over > out.reason.len {
+        return none
+    }
+    out.reason = out.reason[..out.reason.len - over]
+    some(out)
+}
+
+fn add_close(c: *Conn, plan: *Plan) {
+    let pending = match c.pending_close {
+        some(close) => close
+        none => return
+    }
+    match close_for(plan.level, pending, plan.left) {
+        some(close) => {
+            put(plan, wire.Frame.ConnectionClose(close))
+            plan.closing = true
+        }
+        none => {}
+    }
+}
+
+fn add_handshake_done(c: *Conn, plan: *Plan) {
+    if plan.level != tls.Level.Application || !c.handshake_done_pending || plan.left < 1 {
+        return
+    }
+    put(plan, wire.Frame.HandshakeDone)
+    c.handshake_done_pending = false
+    push(mut plan.retransmit, Retransmit.HandshakeDone)
+}
+
+fn add_path_response(c: *Conn, plan: *Plan) {
+    if plan.level != tls.Level.Application {
+        return
+    }
+    let data = match c.path_response {
+        some(d) => d
+        none => return
+    }
+    if plan.left < 1 + data.len {
+        return
+    }
+    put(plan, wire.Frame.PathResponse(data))
+    c.path_response = none
+}
+
+fn add_retire_ids(c: *Conn, plan: *Plan) {
+    if plan.level != tls.Level.Application {
+        return
+    }
+    var remaining: []i64 = []
+    for sequence in c.retire_queue {
+        let frame = wire.Frame.RetireConnectionId(sequence)
+        if wire.frame_size(frame) <= plan.left {
+            put(plan, frame)
+            push(mut plan.retransmit, Retransmit.RetireConnectionId(sequence))
+        } else {
+            push(mut remaining, sequence)
+        }
+    }
+    c.retire_queue = remaining
+}
+
+fn add_ping(c: *Conn, plan: *Plan) {
+    if plan.level != tls.Level.Application || !c.ping_pending || plan.left < 1 {
+        return
+    }
+    put(plan, wire.Frame.Ping)
+    c.ping_pending = false
+    push(mut plan.retransmit, Retransmit.Ping)
+}
+
+fn add_crypto(space: *Space, plan: *Plan) {
+    add_crypto_resend(space, plan)
+    add_crypto_new(space, plan)
+}
+
+fn add_crypto_resend(space: *Space, plan: *Plan) {
+    let pending = space.crypto_resend
+    space.crypto_resend = []
+    for r in pending {
+        let n = put_crypto_range(space, plan, r.offset, r.length)
+        if n < r.length {
+            push(mut space.crypto_resend, CryptoRange { offset: r.offset + n, length: r.length - n })
+        }
+    }
+}
+
+fn add_crypto_new(space: *Space, plan: *Plan) {
+    let offset = space.crypto_sent
+    let remaining = space.crypto_out.len - offset
+    if remaining <= 0 {
+        return
+    }
+    let n = put_crypto_range(space, plan, offset, remaining)
+    space.crypto_sent += n
+}
+
+fn put_crypto_range(space: *Space, plan: *Plan, offset: i64, length: i64) -> i64 {
+    let available = space.crypto_out.len - offset
+    if offset < 0 || available <= 0 {
+        return length
+    }
+    let overhead = 1 + wire.varint_size(offset) + 2
+    let n = least(least(length, available), plan.left - overhead)
+    if n <= 0 {
+        return 0
+    }
+    put(plan, wire.Frame.Crypto(offset, space.crypto_out[offset..offset + n]))
+    push(mut plan.retransmit, Retransmit.Crypto(offset, n))
+    n
+}
+
+fn build_header(c: *Conn, p: *Plan) -> []u8 {
+    var header: []u8 = []
+    if p.level == tls.Level.Application {
+        let phase_bit = if p.key_phase { 0x04 } else { 0 }
+        push(mut header, u8(0x40 | phase_bit | (p.length - 1)))
+        io.append(mut header, c.dcid)
+        wire.put_packet_number(mut header, p.number, p.length)
+        return header
+    }
+    let kind = if p.level == tls.Level.Initial { 0 } else { 2 }
+    push(mut header, u8(0xc0 | (kind << 4) | (p.length - 1)))
+    io.put_be32(mut header, wire.version1())
+    push(mut header, u8(c.dcid.len))
+    io.append(mut header, c.dcid)
+    push(mut header, u8(c.scid.len))
+    io.append(mut header, c.scid)
+    if p.level == tls.Level.Initial {
+        wire.put_varint(mut header, c.token.len)
+        io.append(mut header, c.token)
+    }
+    wire.put_varint_sized(mut header, p.length + p.payload.len + tag_size(), 2)
+    wire.put_packet_number(mut header, p.number, p.length)
+    header
+}
+
+fn record_sent(c: *Conn, p: *Plan, size: i64, now: i64) {
+    let space = space_of(c, p.level)
+    space.next_pn = p.number + 1
+    c.packets_sent += 1
+    if p.level == tls.Level.Application {
+        note_application_sent(c, p.acked)
+    }
+    if p.eliciting {
+        note_sent_eliciting(c, now)
+        space.sent[p.number] = SentPacket { number: p.number, time: now, size, ack_eliciting: true, retransmit: p.retransmit }
+    }
+    let sent = recovery.Sent { number: p.number, time: now, size, ack_eliciting: p.eliciting, in_flight: p.eliciting || p.padded }
+    recovery.on_sent(c.recovery, rspace(p.level), sent)
+}

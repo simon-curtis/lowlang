@@ -1,0 +1,257 @@
+import std/crypto
+import std/quic/recovery
+import std/quic/wire
+import std/time
+import std/tls
+
+fn ack_delay_limit() -> i64 {
+    5000000
+}
+
+fn level_of_space(space: recovery.Space) -> tls.Level {
+    match space {
+        Initial => tls.Level.Initial
+        Handshake => tls.Level.Handshake
+        Application => tls.Level.Application
+    }
+}
+
+fn note_eliciting(level: tls.Level, space: *Space, received: i64, in_order: bool) {
+    if level != tls.Level.Application || !in_order {
+        space.ack_pending = true
+        return
+    }
+    space.unacked += 1
+    if space.unacked >= 2 {
+        space.ack_pending = true
+        return
+    }
+    if space.ack_deadline < 0 {
+        space.ack_deadline = received + ack_delay_limit()
+    }
+}
+
+fn earliest_deadline(c: *Conn) -> i64 {
+    if c.phase != Phase.Open {
+        return c.phase_end
+    }
+    var best = recovery.deadline(c.recovery)
+    best = earlier(best, c.application.ack_deadline)
+    best = earlier(best, idle_deadline(c))
+    best = earlier(best, handshake_deadline(c))
+    best = earlier(best, keep_alive_deadline(c))
+    best = earlier(best, close_wait_deadline(c))
+    best
+}
+
+fn next_wait_ms(c: *Conn) -> i64 {
+    let deadline = earliest_deadline(c)
+    if deadline < 0 {
+        return 1000
+    }
+    let remaining = deadline - time.monotonic()
+    if remaining <= 0 {
+        return 0
+    }
+    (remaining + 999999) / 1000000
+}
+
+fn on_deadline(c: *Conn) {
+    let now = time.monotonic()
+    if c.phase != Phase.Open {
+        if now >= c.phase_end {
+            c.finished = true
+        }
+        return
+    }
+    if on_timers(c, now) {
+        return
+    }
+    let space = c.application
+    if space.ack_deadline >= 0 && space.ack_deadline <= now {
+        space.ack_deadline = -1
+        space.ack_pending = true
+    }
+    let due = recovery.deadline(c.recovery)
+    if due >= 0 && due <= now {
+        on_recovery_timeout(c, now)
+    }
+}
+
+fn loss_space(r: *recovery.Recovery) -> recovery.Space? {
+    var found: recovery.Space? = none
+    var at = -1
+    for space in [recovery.Space.Initial, recovery.Space.Handshake, recovery.Space.Application] {
+        let t = recovery.loss_time(r, space)
+        if t >= 0 && (at < 0 || t < at) {
+            at = t
+            found = some(space)
+        }
+    }
+    found
+}
+
+fn on_recovery_timeout(c: *Conn, now: i64) {
+    let lossy = loss_space(c.recovery)
+    let outcome = recovery.on_timeout(c.recovery, now)
+    match lossy {
+        some(space) => on_packets_lost(c, level_of_space(space), outcome.lost)
+        none => {}
+    }
+    match outcome.probe {
+        some(space) => send_probes(c, space, outcome.probes)
+        none => {}
+    }
+}
+
+fn on_packets_lost(c: *Conn, level: tls.Level, lost: []recovery.Sent) {
+    let space = space_of(c, level)
+    if space.discarded {
+        return
+    }
+    c.packets_lost += lost.len
+    for p in lost {
+        match space.sent[p.number] {
+            some(sent) => requeue(c, space, sent)
+            none => {}
+        }
+        delete(mut space.sent, p.number)
+    }
+}
+
+fn requeue(c: *Conn, space: *Space, sent: SentPacket) {
+    for r in sent.retransmit {
+        match r {
+            Crypto(offset, length) => requeue_crypto(space, offset, length)
+            HandshakeDone => {
+                c.handshake_done_pending = true
+            }
+            Ping => {
+                c.ping_pending = c.ping_pending || c.keys.write_unacked
+            }
+            RetireConnectionId(sequence) => requeue_retire(c, sequence)
+            _ => requeue_stream_frame(c, r)
+        }
+    }
+}
+
+fn requeue_retire(c: *Conn, sequence: i64) {
+    if !queue_retire(c, sequence) {
+        fail_connection(c, wire.connection_id_limit_error(), 0, "too many connection IDs to retire")
+    }
+}
+
+fn requeue_crypto(space: *Space, offset: i64, length: i64) {
+    for r in space.crypto_resend {
+        if r.offset == offset && r.length == length {
+            return
+        }
+    }
+    push(mut space.crypto_resend, CryptoRange { offset, length })
+}
+
+fn skip_interval() -> i64 {
+    let bytes = crypto.random(2)
+    ((i64(bytes[0]) << 8) | i64(bytes[1])) % 257 + 128
+}
+
+fn skip_number(c: *Conn, level: tls.Level, space: *Space) {
+    if level != tls.Level.Application {
+        return
+    }
+    if space.skip_at < 0 {
+        space.skip_at = space.next_pn + skip_interval()
+        return
+    }
+    if space.next_pn < space.skip_at {
+        return
+    }
+    recovery.skip(c.recovery, recovery.Space.Application, space.next_pn)
+    space.next_pn += 1
+    space.skip_at = space.next_pn + skip_interval()
+}
+
+fn unacked_crypto(space: *Space) -> []CryptoRange {
+    var out: []CryptoRange = []
+    for number, p in space.sent {
+        for r in p.retransmit {
+            match r {
+                Crypto(offset, length) => insert_range(mut out, CryptoRange { offset, length })
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn insert_range(mut ranges: []CryptoRange, r: CryptoRange) {
+    push(mut ranges, r)
+    var i = ranges.len - 1
+    for i > 0 && ranges[i - 1].offset > ranges[i].offset {
+        let held = ranges[i]
+        ranges[i] = ranges[i - 1]
+        ranges[i - 1] = held
+        i -= 1
+    }
+}
+
+fn add_probe_crypto(space: *Space, plan: *Plan, index: i64) {
+    add_crypto_resend(space, plan)
+    if plan.eliciting {
+        return
+    }
+    let ranges = unacked_crypto(space)
+    if ranges.len > 0 {
+        let r = ranges[index % ranges.len]
+        put_crypto_range(space, plan, r.offset, r.length)
+    }
+    if plan.eliciting {
+        return
+    }
+    add_crypto_new(space, plan)
+}
+
+fn plan_probe(c: *Conn, level: tls.Level, room: i64, index: i64, now: i64) -> *Plan? {
+    let plan = match new_plan(c, level, room) {
+        some(p) => p
+        none => return none
+    }
+    let space = space_of(c, level)
+    add_ack(space, plan, now)
+    add_probe_crypto(space, plan, index)
+    add_probe_streams(c, plan, index)
+    if !plan.eliciting {
+        put(plan, wire.Frame.Ping)
+        push(mut plan.retransmit, Retransmit.Ping)
+    }
+    pad_to_minimum(plan)
+    some(plan)
+}
+
+fn send_probe(c: *Conn, level: tls.Level, index: i64) -> bool {
+    let now = time.monotonic()
+    let budget = datagram_budget(c, now)
+    if budget == 0 {
+        return false
+    }
+    let plan = match plan_probe(c, level, budget, index, now) {
+        some(p) => p
+        none => return false
+    }
+    let used = header_size(c, level, plan.length) + plan.payload.len + tag_size()
+    if level == tls.Level.Initial && used < budget {
+        pad_plan(plan, budget - used)
+    }
+    let plans = [plan]
+    transmit(c, plans, now)
+    true
+}
+
+fn send_probes(c: *Conn, space: recovery.Space, count: i64) {
+    let level = level_of_space(space)
+    for index in 0..count {
+        if c.finished || !send_probe(c, level, index) {
+            return
+        }
+    }
+}

@@ -1,0 +1,317 @@
+import std/crypto/hash
+import std/io
+import std/quic/recovery
+import std/quic/wire
+import std/time
+
+fn max_timeout_ms() -> i64 {
+    86400000
+}
+
+fn default_handshake_ms() -> i64 {
+    10000
+}
+
+fn max_code() -> i64 {
+    4611686018427387903
+}
+
+fn ms_to_ns(ms: i64) -> i64 {
+    if ms > max_timeout_ms() {
+        return max_timeout_ms() * 1000000
+    }
+    ms * 1000000
+}
+
+fn ended(c: *Conn) -> bool {
+    c.finished || c.phase != Phase.Open
+}
+
+fn truncated_reason(reason: str) -> str {
+    if reason.len > 1024 {
+        return reason[..1024]
+    }
+    reason
+}
+
+fn clamped_code(code: i64) -> i64 {
+    if code < 0 {
+        return 0
+    }
+    if code > max_code() {
+        return max_code()
+    }
+    code
+}
+
+fn record_close(c: *Conn, code: i64, reason: str, by_peer: bool, application: bool) {
+    c.handle.close_code = code
+    c.handle.close_reason = reason
+    c.handle.closed_by_peer = by_peer
+    c.handle.application_close = application
+}
+
+fn set_terminal(c: *Conn, e: io.Error) {
+    match c.handle.terminal {
+        some(_) => {}
+        none => {
+            c.handle.terminal = some(e)
+        }
+    }
+}
+
+fn release_half_open(c: *Conn) {
+    if c.half_open {
+        c.half_open = false
+        end_half_open(c.endpoint, c.peer.ip)
+    }
+}
+
+fn enter_closing(c: *Conn, close: wire.CloseFrame, terminal: io.Error) {
+    if ended(c) {
+        return
+    }
+    set_terminal(c, terminal)
+    c.close_frame = some(close)
+    c.pending_close = some(close)
+    c.phase = Phase.Closing
+    c.phase_end = time.monotonic() + recovery.closing_duration(c.recovery)
+    release_half_open(c)
+}
+
+fn enter_draining(c: *Conn, terminal: io.Error) {
+    if ended(c) {
+        return
+    }
+    set_terminal(c, terminal)
+    c.pending_close = none
+    c.phase = Phase.Draining
+    c.phase_end = time.monotonic() + recovery.closing_duration(c.recovery)
+    release_half_open(c)
+}
+
+fn end_silently(c: *Conn, terminal: io.Error) {
+    if c.finished {
+        return
+    }
+    set_terminal(c, terminal)
+    c.pending_close = none
+    c.finished = true
+    release_half_open(c)
+}
+
+fn max_close_wait_ns() -> i64 {
+    5000000000
+}
+
+fn close_by_owner(c: *Conn, code: i64, reason: str, reply: chan[bool]) {
+    match c.close_wait {
+        some(wait) => {
+            push(mut wait.replies, reply)
+            return
+        }
+        none => {}
+    }
+    if ended(c) {
+        reply <- true
+        return
+    }
+    if !streams_settled(c) {
+        let idle = idle_duration(c)
+        let span = if idle > 0 { least(idle, max_close_wait_ns()) } else { max_close_wait_ns() }
+        let deadline = time.monotonic() + span
+        c.close_wait = some(new(CloseWait { code, reason, deadline, replies: [reply] }))
+        return
+    }
+    close_now(c, code, reason)
+    reply <- true
+}
+
+fn close_now(c: *Conn, code: i64, reason: str) {
+    if ended(c) {
+        return
+    }
+    let text = truncated_reason(reason)
+    let value = clamped_code(code)
+    let frame = wire.CloseFrame { application: true, code: value, frame_type: 0, reason: text }
+    record_close(c, value, text, false, true)
+    answer_ready(c, some(Aborted))
+    enter_closing(c, frame, NotConnected)
+    fail_waiters(c)
+    flush(c)
+}
+
+fn close_wait_deadline(c: *Conn) -> i64 {
+    match c.close_wait {
+        some(wait) => wait.deadline
+        none => -1
+    }
+}
+
+fn release_close_wait(c: *Conn) {
+    match c.close_wait {
+        some(wait) => {
+            c.close_wait = none
+            for reply in wait.replies {
+                reply <- true
+            }
+        }
+        none => {}
+    }
+}
+
+fn settle(c: *Conn) {
+    if ended(c) {
+        fail_waiters(c)
+        release_close_wait(c)
+        return
+    }
+    let wait = match c.close_wait {
+        some(w) => w
+        none => return
+    }
+    if streams_settled(c) || time.monotonic() >= wait.deadline {
+        c.close_wait = none
+        close_now(c, wait.code, wait.reason)
+        for reply in wait.replies {
+            reply <- true
+        }
+    }
+}
+
+fn fail_connection(c: *Conn, code: i64, frame_type: i64, reason: str) {
+    if ended(c) {
+        return
+    }
+    let frame = wire.CloseFrame { application: false, code, frame_type, reason }
+    record_close(c, code, reason, false, false)
+    answer_ready(c, some(Malformed))
+    enter_closing(c, frame, Malformed)
+}
+
+fn on_peer_close(c: *Conn, close: wire.CloseFrame) {
+    if ended(c) {
+        return
+    }
+    let reason = truncated_reason(close.reason)
+    record_close(c, close.code, reason, true, close.application)
+    if !c.handshake_complete {
+        answer_ready(c, some(Refused))
+    }
+    enter_draining(c, Aborted)
+}
+
+fn on_datagram_closing(c: *Conn) {
+    let now = time.monotonic()
+    let quiet = recovery.pto_duration(c.recovery)
+    if c.close_sent_at >= 0 && now - c.close_sent_at < quiet {
+        return
+    }
+    c.pending_close = c.close_frame
+}
+
+fn check_stateless_reset(c: *Conn, packet: []u8) {
+    if packet.len < 21 {
+        return
+    }
+    let tail = packet[packet.len - 16..]
+    var matched = false
+    for id in c.peer_ids {
+        if id.token.len == 16 && hash.equal(id.token, tail) {
+            matched = true
+        }
+    }
+    if matched {
+        record_close(c, 0, "", true, false)
+        answer_ready(c, some(Reset))
+        end_silently(c, Reset)
+    }
+}
+
+fn timed_out(c: *Conn) {
+    answer_ready(c, some(TimedOut))
+    end_silently(c, TimedOut)
+}
+
+fn earlier(a: i64, b: i64) -> i64 {
+    if a < 0 {
+        return b
+    }
+    if b < 0 {
+        return a
+    }
+    if a < b { a } else { b }
+}
+
+fn due(deadline: i64, now: i64) -> bool {
+    deadline >= 0 && deadline <= now
+}
+
+fn idle_duration(c: *Conn) -> i64 {
+    var ms = c.config.idle_timeout
+    match c.peer_parameters {
+        some(p) => {
+            if p.max_idle_timeout > 0 && (ms <= 0 || p.max_idle_timeout < ms) {
+                ms = p.max_idle_timeout
+            }
+        }
+        none => {}
+    }
+    if ms <= 0 {
+        return -1
+    }
+    let floor = 3 * recovery.pto_duration(c.recovery)
+    let ns = ms_to_ns(ms)
+    if ns < floor { floor } else { ns }
+}
+
+fn idle_deadline(c: *Conn) -> i64 {
+    let duration = idle_duration(c)
+    if duration < 0 {
+        return -1
+    }
+    c.idle_start + duration
+}
+
+fn handshake_deadline(c: *Conn) -> i64 {
+    if c.handshake_complete {
+        return -1
+    }
+    let ms = if c.config.handshake_timeout > 0 { c.config.handshake_timeout } else { default_handshake_ms() }
+    c.created + ms_to_ns(ms)
+}
+
+fn keep_alive_deadline(c: *Conn) -> i64 {
+    if c.config.keep_alive <= 0 || !c.handshake_complete || c.ping_pending {
+        return -1
+    }
+    c.last_eliciting_sent + ms_to_ns(c.config.keep_alive)
+}
+
+fn note_received(c: *Conn, now: i64) {
+    c.idle_start = now
+    c.idle_refreshed = false
+}
+
+fn note_sent_eliciting(c: *Conn, now: i64) {
+    c.last_eliciting_sent = now
+    if !c.idle_refreshed {
+        c.idle_refreshed = true
+        c.idle_start = now
+    }
+}
+
+fn on_timers(c: *Conn, now: i64) -> bool {
+    if due(handshake_deadline(c), now) {
+        timed_out(c)
+        return true
+    }
+    if due(idle_deadline(c), now) {
+        timed_out(c)
+        return true
+    }
+    if due(keep_alive_deadline(c), now) {
+        c.ping_pending = true
+    }
+    false
+}

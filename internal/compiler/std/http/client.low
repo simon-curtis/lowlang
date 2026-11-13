@@ -80,7 +80,7 @@ pub struct Builder[K] {
 
 /// A pooled HTTP client, made by `build`.
 ///
-/// It keeps HTTP/1.1 connections alive and reuses them after a response has been read in full, and sends concurrent requests to an HTTPS host, or to any host with `with_prior_knowledge`, over one multiplexed HTTP/2 connection when the server accepts it. It is safe to use from several tasks. It holds no drop: idle connections are closed after the idle timeout or by `close_idle`. Its fields are private.
+/// It keeps HTTP/1.1 connections alive and reuses them after a response has been read in full, and sends concurrent requests to an HTTPS host, or to any host with `with_prior_knowledge`, over one multiplexed HTTP/2 connection when the server accepts it. With `with_version(Http3)` it sends concurrent `https` requests to a host over one QUIC connection. It is safe to use from several tasks. It holds no drop: idle connections are closed after the idle timeout or by `close_idle`. Its fields are private.
 pub struct Client {
     options: Builder[Client]
     lock: chan[bool]
@@ -243,14 +243,14 @@ pub fn with_timeout[K](b: Builder[K], millis: i64) -> Builder[K] {
 
 /// Sets the time limit for the TCP connection to the target, or to the proxy, in milliseconds.
 ///
-/// A connection that is not established in time fails with `Timeout`. The time left under `with_timeout` also bounds it. Name lookup and proxy negotiation are not counted. `0`, the default, sets no limit of its own.
+/// A connection that is not established in time fails with `Timeout`. The time left under `with_timeout` also bounds it. Over HTTP/3 it bounds the whole QUIC handshake, which includes TLS. Name lookup and proxy negotiation are not counted. `0`, the default, sets no limit of its own.
 pub fn with_connect_timeout[K](b: Builder[K], millis: i64) -> Builder[K] {
     var out = b
     out.connect_timeout = millis
     out
 }
 
-/// Binds every connection the client makes to the network interface named `device`, for example `eth0`. An empty name, the default, leaves the choice to the system. It does not apply to connections opened by `with_dialer`.
+/// Binds every connection the client makes to the network interface named `device`, for example `eth0`. An empty name, the default, leaves the choice to the system. It does not apply to connections opened by `with_dialer`. HTTP/3 requests fail with `Connect` holding `Unsupported`, because a QUIC connection cannot be bound to an interface.
 pub fn with_interface(b: Builder[Client], device: str) -> Builder[Client] {
     var out = b
     out.device = device
@@ -295,9 +295,11 @@ pub fn with_retries[K](b: Builder[K], n: i64) -> Builder[K] {
     out
 }
 
-/// Sets the HTTP version to use. `Http2`, the default, offers HTTP/2 and falls back to HTTP/1.1 when the server does not accept it; `Http1` always uses HTTP/1.1.
+/// Sets the HTTP version to use. `Http2`, the default, offers HTTP/2 and falls back to HTTP/1.1 when the server does not accept it; `Http1` always uses HTTP/1.1; `Http3` sends `https` requests over HTTP/3 on QUIC with no fallback.
 ///
 /// HTTP/2 is negotiated through ALPN on `https` and is not used through a forwarding proxy. Plain `http` uses HTTP/2 only with `with_prior_knowledge`.
+///
+/// HTTP/3 offers only ALPN `h3` and keeps one QUIC connection per host and port, shared by concurrent requests and replaced when it has ended or the server sent GOAWAY. A connection that cannot be made fails with `Connect`, `Tls` or `Timeout` and is not retried over TCP. The TLS settings, the resolver, the connect timeout, which bounds the QUIC handshake, and `with_idle_timeout` apply. `http` requests, and `https` requests through a proxy or a dialer, use HTTP/1.1. A client with a network interface from `with_interface` fails its HTTP/3 requests with `Connect(Unsupported)`. The request is `HEADERS`, `DATA` and a FIN on a bidirectional stream, the response is read the same way, and `Response.trailers` holds a trailing `HEADERS`. A request that ran out of time or was cancelled resets only its stream. A request whose stream the server reset before the response head, or that the server refused with GOAWAY, is sent once more on a new connection when its body can be replayed.
 pub fn with_version[K](b: Builder[K], v: Version) -> Builder[K] {
     var out = b
     out.version = v
@@ -349,7 +351,7 @@ pub fn with_cookie_jar(b: Builder[Client], jar: CookieJar) -> Builder[Client] {
 
 /// Limits the open HTTP/1.1 connections the client keeps to one host to `n`.
 ///
-/// A request over the limit waits until a connection is free, or fails with `Timeout` when the request time runs out. `0`, the default, sets no limit. HTTP/2 requests share one connection per host and are not counted.
+/// A request over the limit waits until a connection is free, or fails with `Timeout` when the request time runs out. `0`, the default, sets no limit. HTTP/2 and HTTP/3 requests share one connection per host and are not counted.
 pub fn with_max_connections_per_host(b: Builder[Client], n: i64) -> Builder[Client] {
     var out = b
     out.max_per_host = n
@@ -578,7 +580,7 @@ pub fn cookies_for(c: *Client, url: str) -> str {
 
 /// Closes the idle pooled connections of `c`.
 ///
-/// HTTP/1.1 connections that are idle are closed, and an HTTP/2 connection is closed once its in-flight requests finish. Requests in flight are not interrupted, and later requests open new connections.
+/// HTTP/1.1 connections that are idle are closed, and an HTTP/2 or HTTP/3 connection is closed once its in-flight requests finish. Requests in flight are not interrupted, and later requests open new connections.
 pub fn close_idle(c: *Client) {
     c.lock <- true
     var hosts: []*Host = []
@@ -593,12 +595,18 @@ pub fn close_idle(c: *Client) {
         h.open -= idle.len
         let current = h.mux
         h.mux = none
+        let current_quic = h.quic
+        h.quic = none
         <-h.lock
         for conn in idle {
             conn.wire.stream.close()
         }
         match current {
             some(m) => drain_mux(m)
+            none => {}
+        }
+        match current_quic {
+            some(q) => drain_quic(q)
             none => {}
         }
     }
@@ -802,11 +810,13 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing, trace: *Trace?) -> In
     retry.next(retries)
     var fresh = false
     var avoid: *Mux? = none
+    var avoid_quic: *H3Conn? = none
     var stale_retried = false
     for {
-        let a = new_attempt(fresh, avoid, route)
+        let a = new_attempt(fresh, avoid, avoid_quic, route)
         fresh = false
         avoid = none
+        avoid_quic = none
         let announced = announce(trace, req)
         let result = outcome(fn() -> Incoming ! io.Error { open(job, h, announced, a) })
         match result {
@@ -833,6 +843,7 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing, trace: *Trace?) -> In
                     stale_retried = true
                     fresh = true
                     avoid = a.used
+                    avoid_quic = a.used_quic
                     continue
                 }
                 let retryable = a.phase == Connecting || safe && a.phase != Handshaking && transport_failure(e)
@@ -840,6 +851,7 @@ fn attempt(job: Job, b: Builder[Response], base: Outgoing, trace: *Trace?) -> In
                     retry.commit(retries)
                     fresh = true
                     avoid = a.used
+                    avoid_quic = a.used_quic
                     continue
                 }
                 fail failure
@@ -874,6 +886,7 @@ fn open(job: Job, h: *Host, req: Outgoing, a: *Attempt) -> Incoming ! io.Error {
     match acquire(job, h, req.url, a)? {
         Single(conn) => exchange1(job, conn, req, a)
         Multiplexed(m) => exchange2(job, m, req, a)
+        Quic(q) => exchange3(job, q, req, a)
     }
 }
 

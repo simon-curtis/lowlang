@@ -16,6 +16,9 @@ struct Channel {
     version: i64
     closed: bool
     failed: bool
+    quic: QuicTransport?
+    read_level: Level
+    write_level: Level
 }
 
 fn channel(s: io.Stream) -> *Channel {
@@ -30,10 +33,101 @@ fn channel(s: io.Stream) -> *Channel {
         version: 0
         closed: false
         failed: false
+        quic: none
+        read_level: Level.Initial
+        write_level: Level.Initial
     })
 }
 
+fn quic_channel(t: QuicTransport) -> *Channel {
+    let empty = io.bytes_reader([])
+    new(Channel {
+        stream: io.reader_stream(empty)
+        reader: empty
+        read_key: none
+        write_key: none
+        write_lock: chan[bool](1)
+        pending: []
+        plaintext_version: 0x0303
+        version: 0x0304
+        closed: false
+        failed: false
+        quic: t
+        read_level: Level.Initial
+        write_level: Level.Initial
+    })
+}
+
+fn is_quic(c: *Channel) -> bool {
+    match c.quic {
+        some(_) => true
+        none => false
+    }
+}
+
+fn next_level(l: Level) -> Level {
+    match l {
+        Initial => Level.Handshake
+        _ => Level.Application
+    }
+}
+
+fn set_read_key(c: *Channel, suite: Suite, secret: []u8) ! io.Error {
+    match c.quic {
+        some(t) => {
+            if c.pending.len > 0 {
+                send_alert(c, 10)
+                fail Malformed
+            }
+            c.read_level = next_level(c.read_level)
+            let installed = QuicSecret { level: c.read_level, writing: false, suite, secret }
+            t.install(installed)?
+        }
+        none => {
+            c.read_key = protection(suite, secret)?
+        }
+    }
+}
+
+fn set_write_key(c: *Channel, suite: Suite, secret: []u8) ! io.Error {
+    match c.quic {
+        some(t) => {
+            c.write_level = next_level(c.write_level)
+            let installed = QuicSecret { level: c.write_level, writing: true, suite, secret }
+            t.install(installed)?
+        }
+        none => {
+            c.write_key = protection(suite, secret)?
+        }
+    }
+}
+
+fn write_quic(c: *Channel, t: QuicTransport, kind: i64, payload: []u8) ! io.Error {
+    if c.failed {
+        fail Aborted
+    }
+    if kind == 22 {
+        t.send(c.write_level, payload)?
+    }
+}
+
+fn read_quic(c: *Channel, t: QuicTransport) -> Record ! io.Error {
+    let received = t.receive()?
+    if received.level != c.read_level {
+        send_alert(c, 10)
+        fail Malformed
+    }
+    Record { kind: 22, data: received.data }
+}
+
 fn write_record(c: *Channel, kind: i64, payload: []u8) ! io.Error {
+    match c.quic {
+        some(t) => {
+            write_quic(c, t, kind, payload)?
+            return
+        }
+        none => {}
+    }
     c.write_lock <- true
     defer <-c.write_lock
     write_locked(c, kind, payload)?
@@ -148,6 +242,12 @@ fn read_record(c: *Channel) -> Record ! io.Error {
     if c.failed {
         fail Aborted
     }
+    match c.quic {
+        some(t) => {
+            return read_quic(c, t)
+        }
+        none => {}
+    }
     let tls12 = c.version == 0x0303
     let limit = if tls12 { 16384 + 2048 } else { 16384 + 256 }
     for {
@@ -253,11 +353,21 @@ fn alert(data: []u8) -> io.Error {
 }
 
 fn send_alert(c: *Channel, description: i64) {
-    write_record(c, 21, [2, u8(description)]) or {}
+    match c.quic {
+        some(t) => {
+            t.alert(description)
+        }
+        none => {
+            write_record(c, 21, [2, u8(description)]) or {}
+        }
+    }
     c.failed = true
 }
 
 fn warn(c: *Channel, description: i64) {
+    if is_quic(c) {
+        return
+    }
     write_record(c, 21, [1, u8(description)]) or {}
 }
 

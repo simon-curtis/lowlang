@@ -1,0 +1,1405 @@
+import std/io
+import std/quic/wire
+import std/tls
+
+struct Span {
+    start: i64
+    end: i64
+}
+
+struct ParkedRead {
+    buf: []u8
+    reply: chan[Answer]
+}
+
+struct ParkedWrite {
+    data: []u8
+    done: i64
+    finish: bool
+    reply: chan[Answer]
+}
+
+struct Lane {
+    bidi: bool
+    opened: i64 = 0
+    peer_limit: i64 = 0
+    blocked_value: i64 = -1
+    blocked_pending: bool = false
+    peer_opened: i64 = 0
+    limit: i64
+    limit_pending: bool = false
+    accepts: []i64 = []
+    openers: []chan[Answer] = []
+    acceptors: []chan[Answer] = []
+}
+
+struct StreamState {
+    id: i64
+    sends: bool
+    receives: bool
+    removed: bool = false
+    accepted: bool = false
+    send_buf: []u8 = []
+    send_base: i64 = 0
+    send_total: i64 = 0
+    send_next: i64 = 0
+    send_limit: i64
+    send_blocked_value: i64 = -1
+    send_blocked_pending: bool = false
+    resend: []Span = []
+    acked: []Span = []
+    finish_requested: bool = false
+    fin_sent: bool = false
+    fin_resend: bool = false
+    fin_acked: bool = false
+    writers: []*ParkedWrite = []
+    reset_requested: bool = false
+    reset_code: i64 = 0
+    reset_final: i64 = 0
+    reset_pending: bool = false
+    reset_acked: bool = false
+    consumed: i64 = 0
+    recv: []u8 = []
+    recv_base: i64 = 0
+    ranges: []Span = []
+    highest: i64 = 0
+    final_size: i64 = -1
+    recv_limit: i64
+    limit_pending: bool = false
+    reset_received: bool = false
+    reset_observed: bool = false
+    stopped: bool = false
+    stop_code: i64 = 0
+    stop_pending: bool = false
+    readers: []ParkedRead = []
+}
+
+struct Streams {
+    bidi: *Lane
+    uni: *Lane
+    table: [i64: *StreamState] = [:]
+    order: []*StreamState = []
+    cursor: i64 = 0
+    peer_max_data: i64 = 0
+    sent: i64 = 0
+    blocked_value: i64 = -1
+    blocked_pending: bool = false
+    max_data: i64
+    max_data_pending: bool = false
+    received: i64 = 0
+    consumed: i64 = 0
+    failed: bool = false
+}
+
+fn max_i62() -> i64 {
+    4611686018427387903
+}
+
+fn max_i60() -> i64 {
+    1152921504606846976
+}
+
+fn write_cap() -> i64 {
+    1048576
+}
+
+fn max_ranges() -> i64 {
+    256
+}
+
+fn min_recv_buffer() -> i64 {
+    1024
+}
+
+fn stream_cap() -> i64 {
+    4096
+}
+
+fn min_stream_room() -> i64 {
+    16
+}
+
+fn most(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+fn clamp_streams(n: i64) -> i64 {
+    most(0, least(n, stream_cap()))
+}
+
+fn new_streams(config: Config) -> *Streams {
+    let bidi = new(Lane { bidi: true, limit: clamp_streams(config.max_streams) })
+    let uni = new(Lane { bidi: false, limit: clamp_streams(config.max_uni_streams) })
+    new(Streams { bidi, uni, max_data: config.max_data })
+}
+
+fn lane_of(c: *Conn, bidi: bool) -> *Lane {
+    if bidi { c.streams.bidi } else { c.streams.uni }
+}
+
+fn is_local(c: *Conn, id: i64) -> bool {
+    let initiator = if c.server { 1 } else { 0 }
+    (id & 1) == initiator
+}
+
+fn is_bidi(id: i64) -> bool {
+    (id & 2) == 0
+}
+
+fn stream_id(index: i64, bidi: bool, server_initiated: bool) -> i64 {
+    let direction = if bidi { 0 } else { 2 }
+    let initiator = if server_initiated { 1 } else { 0 }
+    (index << 2) | direction | initiator
+}
+
+fn reply_value(reply: chan[Answer], value: i64) {
+    let answer = Answer { value, error: none }
+    reply <- answer
+}
+
+fn reply_error(reply: chan[Answer], e: io.Error) {
+    let answer = Answer { value: 0, error: some(e) }
+    reply <- answer
+}
+
+fn ended_error(c: *Conn) -> io.Error {
+    match c.handle.terminal {
+        some(e) => e
+        none => NotConnected
+    }
+}
+
+fn initial_send_limit(c: *Conn, local: bool, bidi: bool) -> i64 {
+    match c.peer_parameters {
+        some(p) => {
+            if !bidi {
+                p.initial_max_stream_data_uni
+            } else if local {
+                p.initial_max_stream_data_bidi_remote
+            } else {
+                p.initial_max_stream_data_bidi_local
+            }
+        }
+        none => 0
+    }
+}
+
+fn apply_peer_parameters(c: *Conn, p: wire.Parameters) {
+    let st = c.streams
+    st.peer_max_data = most(st.peer_max_data, p.initial_max_data)
+    st.bidi.peer_limit = most(st.bidi.peer_limit, least(p.initial_max_streams_bidi, max_i60()))
+    st.uni.peer_limit = most(st.uni.peer_limit, least(p.initial_max_streams_uni, max_i60()))
+    for s in st.order {
+        let initial = initial_send_limit(c, is_local(c, s.id), is_bidi(s.id))
+        s.send_limit = most(s.send_limit, initial)
+    }
+    serve_openers(c, st.bidi)
+    serve_openers(c, st.uni)
+}
+
+fn new_state(c: *Conn, id: i64) -> *StreamState {
+    let local = is_local(c, id)
+    let bidi = is_bidi(id)
+    let limit = initial_send_limit(c, local, bidi)
+    let s = new(StreamState {
+        id
+        sends: local || bidi
+        receives: !local || bidi
+        send_limit: limit
+        recv_limit: c.config.max_stream_data
+    })
+    c.streams.table[id] = s
+    push(mut c.streams.order, s)
+    s
+}
+
+fn forget_order(st: *Streams, s: *StreamState) {
+    var kept: []*StreamState = []
+    for t in st.order {
+        if t.id != s.id {
+            push(mut kept, t)
+        }
+    }
+    st.order = kept
+    if st.cursor >= kept.len {
+        st.cursor = 0
+    }
+}
+
+fn remove_stream(c: *Conn, s: *StreamState) {
+    let st = c.streams
+    delete(mut st.table, s.id)
+    forget_order(st, s)
+    if !is_local(c, s.id) && s.accepted {
+        let lane = lane_of(c, is_bidi(s.id))
+        credit_peer_stream(lane)
+    }
+}
+
+fn credit_peer_stream(lane: *Lane) {
+    lane.limit = least(lane.limit + 1, max_i60())
+    lane.limit_pending = true
+}
+
+fn send_complete(s: *StreamState) -> bool {
+    if !s.sends {
+        return true
+    }
+    if s.reset_requested {
+        return s.reset_acked
+    }
+    s.finish_requested && s.fin_acked && s.send_base == s.send_total
+}
+
+fn at_end(s: *StreamState) -> bool {
+    s.final_size >= 0 && s.consumed == s.final_size
+}
+
+fn recv_complete(s: *StreamState) -> bool {
+    if !s.receives {
+        return true
+    }
+    if s.reset_received {
+        return s.reset_observed || s.stopped
+    }
+    at_end(s)
+}
+
+fn maybe_remove(c: *Conn, s: *StreamState) {
+    if s.removed || !send_complete(s) || !recv_complete(s) {
+        return
+    }
+    s.removed = true
+    remove_stream(c, s)
+}
+
+fn refresh(c: *Conn, s: *StreamState) {
+    serve_readers(c, s)
+    serve_writers(s)
+    maybe_remove(c, s)
+}
+
+fn known_stream(c: *Conn, id: i64) -> bool {
+    if id < 0 {
+        return false
+    }
+    let lane = lane_of(c, is_bidi(id))
+    let index = id >> 2
+    if is_local(c, id) {
+        return index < lane.opened
+    }
+    index < lane.peer_opened
+}
+
+fn usable(c: *Conn, id: i64, sending: bool) -> bool {
+    if !known_stream(c, id) {
+        return false
+    }
+    if is_bidi(id) {
+        return true
+    }
+    is_local(c, id) == sending
+}
+
+fn state_of(c: *Conn, id: i64) -> *StreamState? {
+    c.streams.table[id]
+}
+
+fn open_local(c: *Conn, lane: *Lane) -> i64 {
+    let index = lane.opened
+    lane.opened += 1
+    let id = stream_id(index, lane.bidi, c.server)
+    new_state(c, id)
+    id
+}
+
+fn note_streams_blocked(lane: *Lane) {
+    if lane.blocked_value != lane.peer_limit {
+        lane.blocked_value = lane.peer_limit
+        lane.blocked_pending = true
+    }
+}
+
+fn serve_openers(c: *Conn, lane: *Lane) {
+    for lane.openers.len > 0 && lane.opened < lane.peer_limit {
+        let reply = lane.openers[0]
+        lane.openers = lane.openers[1..]
+        let id = open_local(c, lane)
+        reply_value(reply, id)
+    }
+}
+
+fn serve_acceptors(c: *Conn, lane: *Lane) {
+    for lane.acceptors.len > 0 && lane.accepts.len > 0 {
+        let reply = lane.acceptors[0]
+        lane.acceptors = lane.acceptors[1..]
+        let id = lane.accepts[0]
+        lane.accepts = lane.accepts[1..]
+        match state_of(c, id) {
+            some(s) => {
+                s.accepted = true
+            }
+            none => credit_peer_stream(lane)
+        }
+        reply_value(reply, id)
+    }
+}
+
+fn on_open_stream(c: *Conn, bidi: bool, reply: chan[Answer]) {
+    if ended(c) {
+        let e = ended_error(c)
+        reply_error(reply, e)
+        return
+    }
+    let lane = lane_of(c, bidi)
+    if lane.opened >= lane.peer_limit {
+        push(mut lane.openers, reply)
+        note_streams_blocked(lane)
+        return
+    }
+    let id = open_local(c, lane)
+    reply_value(reply, id)
+}
+
+fn on_accept_stream(c: *Conn, bidi: bool, reply: chan[Answer]) {
+    if ended(c) {
+        let e = ended_error(c)
+        reply_error(reply, e)
+        return
+    }
+    let lane = lane_of(c, bidi)
+    push(mut lane.acceptors, reply)
+    serve_acceptors(c, lane)
+}
+
+fn on_stream_read(c: *Conn, id: i64, buf: []u8, reply: chan[Answer]) {
+    if ended(c) {
+        let e = ended_error(c)
+        reply_error(reply, e)
+        return
+    }
+    if !usable(c, id, false) {
+        reply_error(reply, Invalid)
+        return
+    }
+    let s = match state_of(c, id) {
+        some(v) => v
+        none => {
+            reply_value(reply, 0)
+            return
+        }
+    }
+    if buf.len == 0 {
+        reply_value(reply, 0)
+        return
+    }
+    push(mut s.readers, ParkedRead { buf, reply })
+    refresh(c, s)
+}
+
+fn on_stream_write(c: *Conn, id: i64, data: []u8, reply: chan[Answer]) {
+    if ended(c) {
+        let e = ended_error(c)
+        reply_error(reply, e)
+        return
+    }
+    if !usable(c, id, true) {
+        reply_error(reply, Invalid)
+        return
+    }
+    let s = match state_of(c, id) {
+        some(v) => v
+        none => {
+            reply_error(reply, BrokenPipe)
+            return
+        }
+    }
+    if s.reset_requested || s.finish_requested {
+        reply_error(reply, BrokenPipe)
+        return
+    }
+    if data.len == 0 {
+        reply_value(reply, 0)
+        return
+    }
+    let parked = new(ParkedWrite { data, done: 0, finish: false, reply })
+    push(mut s.writers, parked)
+    refresh(c, s)
+}
+
+fn on_stream_finish(c: *Conn, id: i64, reply: chan[Answer]) {
+    if ended(c) {
+        let e = ended_error(c)
+        reply_error(reply, e)
+        return
+    }
+    if !usable(c, id, true) {
+        reply_error(reply, Invalid)
+        return
+    }
+    let s = match state_of(c, id) {
+        some(v) => v
+        none => {
+            reply_value(reply, 0)
+            return
+        }
+    }
+    if s.reset_requested {
+        reply_error(reply, BrokenPipe)
+        return
+    }
+    let parked = new(ParkedWrite { data: [], done: 0, finish: true, reply })
+    push(mut s.writers, parked)
+    refresh(c, s)
+}
+
+fn on_stream_reset(c: *Conn, id: i64, code: i64, reply: chan[Answer]) {
+    if ended(c) {
+        let e = ended_error(c)
+        reply_error(reply, e)
+        return
+    }
+    if !usable(c, id, true) {
+        reply_error(reply, Invalid)
+        return
+    }
+    let s = match state_of(c, id) {
+        some(v) => v
+        none => {
+            reply_value(reply, 0)
+            return
+        }
+    }
+    let value = clamped_code(code)
+    reset_send(c, s, value)
+    reply_value(reply, 0)
+}
+
+fn on_stream_stop(c: *Conn, id: i64, code: i64, reply: chan[Answer]) {
+    if ended(c) {
+        let e = ended_error(c)
+        reply_error(reply, e)
+        return
+    }
+    if !usable(c, id, false) {
+        reply_error(reply, Invalid)
+        return
+    }
+    let s = match state_of(c, id) {
+        some(v) => v
+        none => {
+            reply_value(reply, 0)
+            return
+        }
+    }
+    if !s.stopped && !s.reset_received && !at_end(s) {
+        s.stopped = true
+        s.stop_code = clamped_code(code)
+        s.stop_pending = true
+        discard_unread(c, s)
+    }
+    refresh(c, s)
+    reply_value(reply, 0)
+}
+
+fn reset_send(c: *Conn, s: *StreamState, code: i64) {
+    if s.reset_requested || send_complete(s) {
+        return
+    }
+    s.reset_requested = true
+    s.reset_code = code
+    s.reset_final = s.send_next
+    s.reset_pending = true
+    s.send_buf = []
+    s.resend = []
+    s.acked = []
+    s.fin_resend = false
+    refresh(c, s)
+}
+
+fn serve_writers(s: *StreamState) {
+    for s.writers.len > 0 {
+        let w = s.writers[0]
+        if s.reset_requested {
+            s.writers = s.writers[1..]
+            reply_error(w.reply, BrokenPipe)
+            continue
+        }
+        if w.finish {
+            s.finish_requested = true
+            s.writers = s.writers[1..]
+            reply_value(w.reply, 0)
+            continue
+        }
+        if s.finish_requested {
+            s.writers = s.writers[1..]
+            reply_error(w.reply, BrokenPipe)
+            continue
+        }
+        let room = write_cap() - s.send_buf.len
+        if room <= 0 {
+            return
+        }
+        let n = least(room, w.data.len - w.done)
+        let end = w.done + n
+        io.append(mut s.send_buf, w.data[w.done..end])
+        s.send_total += n
+        w.done = end
+        if w.done < w.data.len {
+            return
+        }
+        s.writers = s.writers[1..]
+        reply_value(w.reply, w.data.len)
+    }
+}
+
+fn serve_readers(c: *Conn, s: *StreamState) {
+    for s.readers.len > 0 {
+        let r = s.readers[0]
+        if s.stopped {
+            s.readers = s.readers[1..]
+            reply_error(r.reply, Aborted)
+            continue
+        }
+        if s.reset_received {
+            s.reset_observed = true
+            s.readers = s.readers[1..]
+            reply_error(r.reply, Reset)
+            continue
+        }
+        let available = ready_len(s)
+        if available > 0 {
+            let from = s.consumed - s.recv_base
+            let window = s.recv[from..from + available]
+            let n = io.copy(r.buf, window)
+            take_ready(s, n)
+            s.readers = s.readers[1..]
+            note_consumed(c, s, n)
+            release_drained(s)
+            reply_value(r.reply, n)
+            continue
+        }
+        if at_end(s) {
+            s.readers = s.readers[1..]
+            reply_value(r.reply, 0)
+            continue
+        }
+        return
+    }
+}
+
+fn ready_len(s: *StreamState) -> i64 {
+    if s.ranges.len == 0 || s.ranges[0].start != s.consumed {
+        return 0
+    }
+    s.ranges[0].end - s.consumed
+}
+
+fn take_ready(s: *StreamState, n: i64) {
+    let first = s.ranges[0]
+    let start = first.start + n
+    if start >= first.end {
+        s.ranges = s.ranges[1..]
+    } else {
+        s.ranges[0] = Span { start, end: first.end }
+    }
+}
+
+fn release_drained(s: *StreamState) {
+    if s.ranges.len == 0 {
+        s.recv_base = s.consumed
+    }
+}
+
+fn discard_unread(c: *Conn, s: *StreamState) {
+    let n = ready_len(s)
+    if n > 0 {
+        take_ready(s, n)
+        note_consumed(c, s, n)
+        release_drained(s)
+    }
+}
+
+fn note_consumed(c: *Conn, s: *StreamState, n: i64) {
+    s.consumed += n
+    c.streams.consumed += n
+    extend_stream_credit(c, s)
+    extend_connection_credit(c)
+}
+
+fn extend_stream_credit(c: *Conn, s: *StreamState) {
+    if s.final_size >= 0 || s.reset_received {
+        return
+    }
+    let window = c.config.max_stream_data
+    if s.recv_limit - s.consumed < window / 2 {
+        s.recv_limit = least(s.consumed + window, max_i62())
+        s.limit_pending = true
+    }
+}
+
+fn extend_connection_credit(c: *Conn) {
+    let st = c.streams
+    let window = c.config.max_data
+    if st.max_data - st.consumed < window / 2 {
+        st.max_data = least(st.consumed + window, max_i62())
+        st.max_data_pending = true
+    }
+}
+
+fn fail_waiters(c: *Conn) {
+    let st = c.streams
+    if st.failed {
+        return
+    }
+    st.failed = true
+    let e = ended_error(c)
+    for s in st.order {
+        for r in s.readers {
+            reply_error(r.reply, e)
+        }
+        s.readers = []
+        for w in s.writers {
+            reply_error(w.reply, e)
+        }
+        s.writers = []
+    }
+    for lane in [st.bidi, st.uni] {
+        for reply in lane.openers {
+            reply_error(reply, e)
+        }
+        lane.openers = []
+        for reply in lane.acceptors {
+            reply_error(reply, e)
+        }
+        lane.acceptors = []
+    }
+}
+
+fn streams_settled(c: *Conn) -> bool {
+    for s in c.streams.order {
+        if !s.sends || s.reset_requested {
+            continue
+        }
+        if s.writers.len > 0 || s.send_base != s.send_total {
+            return false
+        }
+        if s.finish_requested && !s.fin_acked {
+            return false
+        }
+    }
+    true
+}
+
+fn find_stream(c: *Conn, id: i64, frame_type: i64) -> *StreamState? {
+    let bidi = is_bidi(id)
+    let lane = lane_of(c, bidi)
+    let index = id >> 2
+    if is_local(c, id) {
+        if index >= lane.opened {
+            fail_connection(c, wire.stream_state_error(), frame_type, "frame for a stream that was not opened")
+            return none
+        }
+        return state_of(c, id)
+    }
+    if index >= lane.limit {
+        fail_connection(c, wire.stream_limit_error(), frame_type, "stream limit exceeded")
+        return none
+    }
+    if index >= lane.peer_opened {
+        open_peer_streams(c, lane, index)
+    }
+    state_of(c, id)
+}
+
+fn open_peer_streams(c: *Conn, lane: *Lane, last: i64) {
+    for index in lane.peer_opened..last + 1 {
+        let id = stream_id(index, lane.bidi, !c.server)
+        new_state(c, id)
+        push(mut lane.accepts, id)
+    }
+    lane.peer_opened = last + 1
+    serve_acceptors(c, lane)
+}
+
+fn on_stream_frame(c: *Conn, f: wire.Frame) {
+    match f {
+        Stream(frame) => on_stream_data(c, frame)
+        ResetStream(id, _, final_size) => on_reset_stream(c, id, final_size)
+        StopSending(id, code) => on_stop_sending(c, id, code)
+        _ => {}
+    }
+}
+
+fn on_stream_data(c: *Conn, frame: wire.StreamFrame) {
+    let found = find_stream(c, frame.id, 0x08)
+    let s = match found {
+        some(v) => v
+        none => return
+    }
+    if !s.receives {
+        fail_connection(c, wire.stream_state_error(), 0x08, "STREAM frame for a send-only stream")
+        return
+    }
+    let end = frame.offset + frame.data.len
+    if end > s.recv_limit {
+        fail_connection(c, wire.flow_control_error(), 0x08, "stream data beyond the stream limit")
+        return
+    }
+    if s.final_size >= 0 {
+        if end > s.final_size || (frame.fin && end != s.final_size) {
+            fail_connection(c, wire.final_size_error(), 0x08, "stream data contradicts the final size")
+            return
+        }
+    } else if frame.fin && end < s.highest {
+        fail_connection(c, wire.final_size_error(), 0x08, "final size below received data")
+        return
+    }
+    let growth = if end > s.highest { end - s.highest } else { 0 }
+    let st = c.streams
+    if st.received + growth > st.max_data {
+        fail_connection(c, wire.flow_control_error(), 0x08, "stream data beyond the connection limit")
+        return
+    }
+    if frame.fin {
+        s.final_size = end
+    }
+    s.highest += growth
+    st.received += growth
+    if s.reset_received {
+        return
+    }
+    if !store_data(c, s, frame.offset, frame.data) {
+        return
+    }
+    if s.stopped {
+        discard_unread(c, s)
+    }
+    refresh(c, s)
+}
+
+fn store_data(c: *Conn, s: *StreamState, offset: i64, data: []u8) -> bool {
+    var at = offset
+    var body = data
+    if at < s.consumed {
+        if at + body.len <= s.consumed {
+            return true
+        }
+        body = data[s.consumed - at..]
+        at = s.consumed
+    }
+    if body.len == 0 {
+        return true
+    }
+    reserve_received(s, at + body.len)
+    place_data(s, at, body)
+    if s.ranges.len > max_ranges() {
+        fail_connection(c, wire.protocol_violation(), 0x08, "too many out-of-order stream ranges")
+        return false
+    }
+    true
+}
+
+fn reserve_received(s: *StreamState, end: i64) {
+    if end - s.recv_base <= s.recv.len {
+        return
+    }
+    let stored = if s.ranges.len > 0 { s.ranges[s.ranges.len - 1].end } else { s.consumed }
+    let live = stored - s.consumed
+    let needed = end - s.consumed
+    let limit = s.recv_limit - s.consumed
+    let doubled = most(min_recv_buffer(), 2 * live)
+    let size = least(limit, most(needed, doubled))
+    let grown = io.buffer(size)
+    if live > 0 {
+        let from = s.consumed - s.recv_base
+        let kept = s.recv[from..from + live]
+        io.copy(grown, kept)
+    }
+    s.recv = grown
+    s.recv_base = s.consumed
+}
+
+fn first_reaching(ranges: []Span, at: i64) -> i64 {
+    var lo = 0
+    var hi = ranges.len
+    for lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if ranges[mid].end < at {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+fn copy_gap(s: *StreamState, at: i64, body: []u8, from: i64, to: i64) {
+    let target = s.recv[from - s.recv_base..to - s.recv_base]
+    let source = body[from - at..to - at]
+    io.copy(target, source)
+}
+
+fn place_data(s: *StreamState, at: i64, body: []u8) {
+    let end = at + body.len
+    let first = first_reaching(s.ranges, at)
+    var next = first
+    var cursor = at
+    var low = at
+    var high = end
+    for next < s.ranges.len && s.ranges[next].start <= end {
+        let r = s.ranges[next]
+        if r.start > cursor {
+            copy_gap(s, at, body, cursor, r.start)
+        }
+        cursor = most(cursor, r.end)
+        low = least(low, r.start)
+        high = most(high, r.end)
+        next += 1
+    }
+    if cursor < end {
+        copy_gap(s, at, body, cursor, end)
+    }
+    let merged = Span { start: low, end: high }
+    replace_ranges(s, first, next, merged)
+}
+
+fn replace_ranges(s: *StreamState, first: i64, last: i64, merged: Span) {
+    if first == last {
+        push(mut s.ranges, merged)
+        var k = s.ranges.len - 1
+        for k > first {
+            s.ranges[k] = s.ranges[k - 1]
+            k -= 1
+        }
+        s.ranges[first] = merged
+        return
+    }
+    s.ranges[first] = merged
+    let removed = last - first - 1
+    if removed == 0 {
+        return
+    }
+    for k in last..s.ranges.len {
+        s.ranges[k - removed] = s.ranges[k]
+    }
+    truncate(mut s.ranges, s.ranges.len - removed)
+}
+
+fn on_reset_stream(c: *Conn, id: i64, final_size: i64) {
+    let found = find_stream(c, id, 0x04)
+    let s = match found {
+        some(v) => v
+        none => return
+    }
+    if !s.receives {
+        fail_connection(c, wire.stream_state_error(), 0x04, "RESET_STREAM for a send-only stream")
+        return
+    }
+    if final_size > s.recv_limit {
+        fail_connection(c, wire.flow_control_error(), 0x04, "reset final size beyond the stream limit")
+        return
+    }
+    if (s.final_size >= 0 && s.final_size != final_size) || final_size < s.highest {
+        fail_connection(c, wire.final_size_error(), 0x04, "reset final size contradicts received data")
+        return
+    }
+    let growth = final_size - s.highest
+    let st = c.streams
+    if st.received + growth > st.max_data {
+        fail_connection(c, wire.flow_control_error(), 0x04, "reset final size beyond the connection limit")
+        return
+    }
+    if s.reset_received {
+        return
+    }
+    s.reset_received = true
+    s.final_size = final_size
+    s.highest = final_size
+    st.received += growth
+    let unread = final_size - s.consumed
+    s.consumed = final_size
+    s.recv = []
+    s.recv_base = final_size
+    s.ranges = []
+    st.consumed += unread
+    extend_connection_credit(c)
+    refresh(c, s)
+}
+
+fn on_stop_sending(c: *Conn, id: i64, code: i64) {
+    let found = find_stream(c, id, 0x05)
+    let s = match found {
+        some(v) => v
+        none => return
+    }
+    if !s.sends {
+        fail_connection(c, wire.stream_state_error(), 0x05, "STOP_SENDING for a receive-only stream")
+        return
+    }
+    reset_send(c, s, clamped_code(code))
+}
+
+fn on_flow_frame(c: *Conn, f: wire.Frame) {
+    let st = c.streams
+    match f {
+        MaxData(limit) => {
+            if limit > st.peer_max_data {
+                st.peer_max_data = limit
+            }
+        }
+        MaxStreamData(id, limit) => on_max_stream_data(c, id, limit)
+        MaxStreams(bidi, limit) => on_max_streams(c, bidi, limit)
+        StreamDataBlocked(id, _) => on_stream_data_blocked(c, id)
+        _ => {}
+    }
+}
+
+fn on_max_stream_data(c: *Conn, id: i64, limit: i64) {
+    let found = find_stream(c, id, 0x11)
+    let s = match found {
+        some(v) => v
+        none => return
+    }
+    if !s.sends {
+        fail_connection(c, wire.stream_state_error(), 0x11, "MAX_STREAM_DATA for a receive-only stream")
+        return
+    }
+    if limit > s.send_limit {
+        s.send_limit = limit
+    }
+}
+
+fn on_max_streams(c: *Conn, bidi: bool, limit: i64) {
+    let lane = lane_of(c, bidi)
+    let value = least(limit, max_i60())
+    if value > lane.peer_limit {
+        lane.peer_limit = value
+        serve_openers(c, lane)
+    }
+}
+
+fn on_stream_data_blocked(c: *Conn, id: i64) {
+    let found = find_stream(c, id, 0x15)
+    let s = match found {
+        some(v) => v
+        none => return
+    }
+    if !s.receives {
+        fail_connection(c, wire.stream_state_error(), 0x15, "STREAM_DATA_BLOCKED for a send-only stream")
+    }
+}
+
+fn add_span(spans: []Span, start: i64, end: i64) -> []Span {
+    var out: []Span = []
+    var current = Span { start, end }
+    var placed = false
+    for r in spans {
+        if r.end < current.start {
+            push(mut out, r)
+        } else if r.start > current.end {
+            if !placed {
+                push(mut out, current)
+                placed = true
+            }
+            push(mut out, r)
+        } else {
+            current = Span { start: least(r.start, current.start), end: most(r.end, current.end) }
+        }
+    }
+    if !placed {
+        push(mut out, current)
+    }
+    out
+}
+
+fn trim_acked(s: *StreamState, range: Span) -> Span {
+    var r = range
+    if r.start < s.send_base {
+        r.start = s.send_base
+    }
+    for a in s.acked {
+        if r.start >= r.end || a.start >= r.end {
+            break
+        }
+        if a.end <= r.start {
+            continue
+        }
+        if a.start <= r.start {
+            r.start = a.end
+        } else {
+            r.end = a.start
+            break
+        }
+    }
+    r
+}
+
+fn next_resend(s: *StreamState) -> Span? {
+    for s.resend.len > 0 {
+        let r = s.resend[0]
+        s.resend = s.resend[1..]
+        let trimmed = trim_acked(s, r)
+        if trimmed.start < trimmed.end {
+            return some(trimmed)
+        }
+    }
+    none
+}
+
+fn advance_base(s: *StreamState) {
+    for s.acked.len > 0 && s.acked[0].start <= s.send_base {
+        let top = s.acked[0].end
+        s.acked = s.acked[1..]
+        if top > s.send_base {
+            let freed = top - s.send_base
+            s.send_buf = s.send_buf[freed..]
+            s.send_base = top
+        }
+    }
+}
+
+fn on_stream_acked(c: *Conn, sent: SentPacket) {
+    for r in sent.retransmit {
+        match r {
+            Stream(id, offset, length, fin) => ack_stream(c, id, offset, length, fin)
+            ResetStream(id) => ack_reset(c, id)
+            _ => {}
+        }
+    }
+}
+
+fn ack_stream(c: *Conn, id: i64, offset: i64, length: i64, fin: bool) {
+    let s = match state_of(c, id) {
+        some(v) => v
+        none => return
+    }
+    if s.reset_requested {
+        return
+    }
+    if length > 0 {
+        let top = offset + length
+        if top > s.send_base {
+            s.acked = add_span(s.acked, most(offset, s.send_base), top)
+            advance_base(s)
+        }
+    }
+    if fin {
+        s.fin_acked = true
+    }
+    refresh(c, s)
+}
+
+fn ack_reset(c: *Conn, id: i64) {
+    let s = match state_of(c, id) {
+        some(v) => v
+        none => return
+    }
+    s.reset_acked = true
+    refresh(c, s)
+}
+
+fn requeue_stream_frame(c: *Conn, r: Retransmit) {
+    let st = c.streams
+    match r {
+        Stream(id, offset, length, fin) => requeue_stream(c, id, offset, length, fin)
+        ResetStream(id) => {
+            match state_of(c, id) {
+                some(s) => {
+                    if s.reset_requested && !s.reset_acked {
+                        s.reset_pending = true
+                    }
+                }
+                none => {}
+            }
+        }
+        StopSending(id) => {
+            match state_of(c, id) {
+                some(s) => {
+                    if s.stopped && !s.reset_received && !at_end(s) {
+                        s.stop_pending = true
+                    }
+                }
+                none => {}
+            }
+        }
+        MaxData => {
+            st.max_data_pending = true
+        }
+        MaxStreamData(id) => {
+            match state_of(c, id) {
+                some(s) => {
+                    if s.final_size < 0 && !s.reset_received {
+                        s.limit_pending = true
+                    }
+                }
+                none => {}
+            }
+        }
+        MaxStreams(bidi) => {
+            let lane = lane_of(c, bidi)
+            lane.limit_pending = true
+        }
+        DataBlocked => {
+            if st.blocked_value == st.peer_max_data {
+                st.blocked_pending = true
+            }
+        }
+        StreamDataBlocked(id) => {
+            match state_of(c, id) {
+                some(s) => {
+                    if s.send_blocked_value == s.send_limit && !s.reset_requested {
+                        s.send_blocked_pending = true
+                    }
+                }
+                none => {}
+            }
+        }
+        StreamsBlocked(bidi) => {
+            let lane = lane_of(c, bidi)
+            if lane.blocked_value == lane.peer_limit && lane.openers.len > 0 {
+                lane.blocked_pending = true
+            }
+        }
+        _ => {}
+    }
+}
+
+fn requeue_stream(c: *Conn, id: i64, offset: i64, length: i64, fin: bool) {
+    let s = match state_of(c, id) {
+        some(v) => v
+        none => return
+    }
+    if s.reset_requested {
+        return
+    }
+    if length > 0 {
+        s.resend = add_span(s.resend, offset, offset + length)
+    }
+    if fin && !s.fin_acked {
+        s.fin_resend = true
+    }
+}
+
+fn put_control(plan: *Plan, f: wire.Frame, r: Retransmit) -> bool {
+    if wire.frame_size(f) > plan.left {
+        return false
+    }
+    put(plan, f)
+    push(mut plan.retransmit, r)
+    true
+}
+
+fn add_streams(c: *Conn, plan: *Plan) {
+    if plan.level != tls.Level.Application {
+        return
+    }
+    add_connection_controls(c, plan)
+    for s in c.streams.order {
+        add_stream_controls(s, plan)
+        add_stream_resend(s, plan)
+    }
+    add_stream_new(c, plan)
+}
+
+fn add_connection_controls(c: *Conn, plan: *Plan) {
+    let st = c.streams
+    if st.max_data_pending {
+        let frame = wire.Frame.MaxData(st.max_data)
+        if put_control(plan, frame, Retransmit.MaxData) {
+            st.max_data_pending = false
+        }
+    }
+    if st.blocked_pending {
+        let frame = wire.Frame.DataBlocked(st.blocked_value)
+        if put_control(plan, frame, Retransmit.DataBlocked) {
+            st.blocked_pending = false
+        }
+    }
+    for lane in [st.bidi, st.uni] {
+        if lane.limit_pending {
+            let frame = wire.Frame.MaxStreams(lane.bidi, lane.limit)
+            if put_control(plan, frame, Retransmit.MaxStreams(lane.bidi)) {
+                lane.limit_pending = false
+            }
+        }
+        if lane.blocked_pending {
+            let frame = wire.Frame.StreamsBlocked(lane.bidi, lane.blocked_value)
+            if put_control(plan, frame, Retransmit.StreamsBlocked(lane.bidi)) {
+                lane.blocked_pending = false
+            }
+        }
+    }
+}
+
+fn add_stream_controls(s: *StreamState, plan: *Plan) {
+    if s.reset_pending {
+        let frame = wire.Frame.ResetStream(s.id, s.reset_code, s.reset_final)
+        if put_control(plan, frame, Retransmit.ResetStream(s.id)) {
+            s.reset_pending = false
+        }
+    }
+    if s.stop_pending {
+        let frame = wire.Frame.StopSending(s.id, s.stop_code)
+        if put_control(plan, frame, Retransmit.StopSending(s.id)) {
+            s.stop_pending = false
+        }
+    }
+    if s.limit_pending {
+        if s.final_size >= 0 || s.reset_received {
+            s.limit_pending = false
+        } else {
+            let frame = wire.Frame.MaxStreamData(s.id, s.recv_limit)
+            if put_control(plan, frame, Retransmit.MaxStreamData(s.id)) {
+                s.limit_pending = false
+            }
+        }
+    }
+    if s.send_blocked_pending {
+        let frame = wire.Frame.StreamDataBlocked(s.id, s.send_blocked_value)
+        if put_control(plan, frame, Retransmit.StreamDataBlocked(s.id)) {
+            s.send_blocked_pending = false
+        }
+    }
+}
+
+fn put_stream_data(s: *StreamState, plan: *Plan, start: i64, want: i64, with_fin: bool) -> i64 {
+    var overhead = 1 + wire.varint_size(s.id) + 2
+    if start != 0 {
+        overhead += wire.varint_size(start)
+    }
+    let room = plan.left - overhead
+    if room < 0 {
+        return -1
+    }
+    let n = least(want, room)
+    let fin = with_fin && n == want
+    if n == 0 && !fin {
+        return -1
+    }
+    let skip = start - s.send_base
+    let slice = s.send_buf[skip..skip + n]
+    let frame = wire.StreamFrame { id: s.id, offset: start, data: slice, fin }
+    let wrapped = wire.Frame.Stream(frame)
+    put(plan, wrapped)
+    let record = Retransmit.Stream(s.id, start, n, fin)
+    push(mut plan.retransmit, record)
+    n
+}
+
+fn add_stream_resend(s: *StreamState, plan: *Plan) {
+    if !s.sends || s.reset_requested {
+        return
+    }
+    for plan.left >= min_stream_room() {
+        let r = match next_resend(s) {
+            some(v) => v
+            none => break
+        }
+        let want = r.end - r.start
+        let with_fin = s.fin_resend && r.end == s.send_total
+        let n = put_stream_data(s, plan, r.start, want, with_fin)
+        if n < 0 {
+            s.resend = add_span(s.resend, r.start, r.end)
+            return
+        }
+        if with_fin && n == want {
+            s.fin_resend = false
+        }
+        if n < want {
+            s.resend = add_span(s.resend, r.start + n, r.end)
+            return
+        }
+    }
+    if s.fin_resend && s.resend.len == 0 && plan.left >= min_stream_room() {
+        let n = put_stream_data(s, plan, s.send_total, 0, true)
+        if n >= 0 {
+            s.fin_resend = false
+        }
+    }
+}
+
+fn note_blocked(c: *Conn, s: *StreamState, stream_blocked: bool, connection_blocked: bool) {
+    if stream_blocked && s.send_blocked_value != s.send_limit {
+        s.send_blocked_value = s.send_limit
+        s.send_blocked_pending = true
+    }
+    let st = c.streams
+    if connection_blocked && st.blocked_value != st.peer_max_data {
+        st.blocked_value = st.peer_max_data
+        st.blocked_pending = true
+    }
+}
+
+fn send_new(c: *Conn, s: *StreamState, plan: *Plan) {
+    if !s.sends || s.reset_requested {
+        return
+    }
+    let st = c.streams
+    let want = s.send_total - s.send_next
+    let fin_new = s.finish_requested && !s.fin_sent
+    if want == 0 && !fin_new {
+        return
+    }
+    let stream_credit = most(0, s.send_limit - s.send_next)
+    let connection_credit = most(0, st.peer_max_data - st.sent)
+    let allowed = least(want, least(stream_credit, connection_credit))
+    if allowed < want {
+        note_blocked(c, s, stream_credit == allowed, connection_credit == allowed)
+    }
+    let with_fin = fin_new && allowed == want
+    if allowed == 0 && !with_fin {
+        return
+    }
+    let n = put_stream_data(s, plan, s.send_next, allowed, with_fin)
+    if n < 0 {
+        return
+    }
+    if with_fin && n == allowed {
+        s.fin_sent = true
+    }
+    s.send_next += n
+    st.sent += n
+}
+
+fn add_stream_new(c: *Conn, plan: *Plan) {
+    let st = c.streams
+    let count = st.order.len
+    if count == 0 {
+        return
+    }
+    let first = st.cursor % count
+    for step in 0..count {
+        if plan.left < min_stream_room() {
+            break
+        }
+        let s = st.order[(first + step) % count]
+        send_new(c, s, plan)
+    }
+    st.cursor = (first + 1) % count
+}
+
+fn add_probe_streams(c: *Conn, plan: *Plan, index: i64) {
+    if plan.level != tls.Level.Application {
+        return
+    }
+    add_streams(c, plan)
+    if plan.eliciting {
+        return
+    }
+    var candidates: []*StreamState = []
+    for s in c.streams.order {
+        let unacked = s.send_base < s.send_next || (s.fin_sent && !s.fin_acked)
+        if s.sends && !s.reset_requested && unacked {
+            push(mut candidates, s)
+        }
+    }
+    if candidates.len == 0 {
+        return
+    }
+    let s = candidates[index % candidates.len]
+    let whole = Span { start: s.send_base, end: s.send_next }
+    let r = trim_acked(s, whole)
+    let with_fin = s.fin_sent && !s.fin_acked && r.end == s.send_total
+    put_stream_data(s, plan, r.start, r.end - r.start, with_fin)
+}

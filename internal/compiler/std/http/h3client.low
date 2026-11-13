@@ -1,0 +1,766 @@
+import std/cancel
+import std/header
+import std/http/qpack
+import std/io
+import std/net
+import std/quic
+import std/sync
+import std/text
+
+struct H3Conn {
+    link: *H3
+    host: *Host
+    lock: sync.Mutex
+    streams: [i64: *H3Request]
+    active: i64
+    goaway: i64
+    draining: bool
+    ended: bool
+    idle_since: i64
+}
+
+struct H3Request {
+    stream: quic.Stream
+    done: chan[bool]
+    halt: chan[bool]
+    finished: bool
+    refused: bool
+}
+
+struct H3Response {
+    status: i64
+    headers: []header.Header
+}
+
+struct H3Inflow {
+    reader: *io.Reader
+    left: i64
+    total: i64
+    done: bool
+    tail: bool
+    bodiless: bool
+    headers: []header.Header
+}
+
+struct Dialed {
+    handle: *quic.ConnectionHandle?
+    failure: io.Error?
+}
+
+struct Linked {
+    link: *H3?
+    failure: io.Error?
+}
+
+struct Opening {
+    stream: quic.Stream?
+    failure: io.Error?
+}
+
+fn max_interim() -> i64 {
+    16
+}
+
+fn quic_route(job: Job, u: Url, a: *Attempt) -> bool {
+    if job.version != Http3 || !secure_scheme(u.scheme) {
+        return false
+    }
+    match job.client.options.dialer {
+        some(_) => return false
+        none => {}
+    }
+    match a.route {
+        Direct => true
+        _ => false
+    }
+}
+
+fn acquire_quic(job: Job, h: *Host, u: Url, a: *Attempt) -> Route ! io.Error {
+    for {
+        h.lock <- true
+        match h.quic {
+            some(q) => {
+                if a.avoid_quic != q && quic_usable(q) {
+                    <-h.lock
+                    a.reused = true
+                    return Quic(q)
+                }
+                h.quic = none
+                <-h.lock
+                drain_quic(q)
+                continue
+            }
+            none => {}
+        }
+        if h.quic_dialing {
+            let w = chan[bool](1)
+            push(mut h.quic_waiters, w)
+            <-h.lock
+            await(w, job.deadline)?
+            continue
+        }
+        h.quic_dialing = true
+        <-h.lock
+        let dialed = outcome(fn() -> *H3Conn ! io.Error { establish_quic(job, h, u, a) })
+        h.lock <- true
+        h.quic_dialing = false
+        let waiters = h.quic_waiters
+        h.quic_waiters = []
+        let q = match dialed {
+            Done(q) => q
+            Failed(e) => {
+                <-h.lock
+                wake_all(waiters)
+                fail e
+            }
+        }
+        h.quic = some(q)
+        <-h.lock
+        wake_all(waiters)
+        keep_tidy(job.client)
+        return Quic(q)
+    }
+}
+
+fn establish_quic(job: Job, h: *Host, u: Url, a: *Attempt) -> *H3Conn ! io.Error {
+    let handle = dial_quic(job, u, a)?
+    if handle.protocol != "h3" {
+        quic.close_on(handle, h3_general_protocol_error(), "")
+        fail Unsupported
+    }
+    let link = open_h3_within(job, handle, a) catch {
+        e => {
+            quic.close_on(handle, h3_internal_error(), "")
+            fail e
+        }
+    }
+    let q = new(H3Conn { link, host: h, lock: sync.mutex(), streams: [:], active: 0, goaway: -1, draining: false, ended: false, idle_since: now_ms() })
+    link.on_goaway = fn(id: i64) { goaway_quic(q, id) }
+    spawn run_quic(q)
+    q
+}
+
+fn open_link_into(handle: *quic.ConnectionHandle, out: chan[Linked]) {
+    let link = open_h3(handle, true) catch {
+        e => {
+            out <- Linked { link: none, failure: some(e) }
+            return
+        }
+    }
+    out <- Linked { link: some(link), failure: none }
+}
+
+fn close_quietly(handle: *quic.ConnectionHandle) {
+    quic.close_on(handle, h3_no_error(), "")
+}
+
+fn open_h3_within(job: Job, handle: *quic.ConnectionHandle, a: *Attempt) -> *H3 ! io.Error {
+    let d = job.deadline
+    let left = remaining(d)
+    a.phase = Connecting
+    if left < 0 || d.fired {
+        close_quietly(handle)
+        fail TimedOut
+    }
+    var bound = if job.connect_timeout > 0 { job.connect_timeout } else { default_connect_ms() }
+    if left > 0 && left < bound {
+        bound = left
+    }
+    let result = chan[Linked](1)
+    spawn open_link_into(handle, result)
+    let stop = d.stop
+    var got: Linked? = none
+    select {
+        r = <-result => {
+            got = r
+        }
+        <-stop => {
+            spawn close_quietly(handle)
+            fail TimedOut
+        }
+        after(bound) => {
+            spawn close_quietly(handle)
+            fail TimedOut
+        }
+    }
+    let linked = match got {
+        some(x) => x
+        none => fail Aborted
+    }
+    match linked.link {
+        some(link) => link
+        none => fail linked.failure ?? io.Error.Aborted
+    }
+}
+
+fn default_connect_ms() -> i64 {
+    10000
+}
+
+fn dial_quic(job: Job, u: Url, a: *Attempt) -> *quic.ConnectionHandle ! io.Error {
+    a.phase = Connecting
+    let d = job.deadline
+    let left = remaining(d)
+    if left < 0 || d.fired {
+        fail TimedOut
+    }
+    let options = job.client.options
+    if options.device.len > 0 {
+        fail Unsupported
+    }
+    var limit = job.connect_timeout
+    if left > 0 && (limit == 0 || left < limit) {
+        limit = left
+    }
+    let ips = options.resolver(u.host)?
+    var config = quic.Config { tls: client_tls(options.tls, ["h3"], u), max_streams: 0 }
+    if limit > 0 {
+        config.handshake_timeout = limit
+    }
+    a.phase = Handshaking
+    let result = chan[Dialed](1)
+    spawn connect_into(ips, u.port, config, result)
+    let stop = d.stop
+    var got: Dialed? = none
+    select {
+        r = <-result => {
+            got = r
+        }
+        <-stop => {
+            spawn discard_dial(result)
+            fail TimedOut
+        }
+    }
+    let dialed = match got {
+        some(x) => x
+        none => fail Aborted
+    }
+    match dialed.handle {
+        some(handle) => handle
+        none => {
+            let failure = dialed.failure ?? io.Error.Aborted
+            if failure == io.Error.TimedOut || failure == io.Error.Refused {
+                a.phase = Connecting
+            }
+            fail failure
+        }
+    }
+}
+
+fn connect_into(ips: [][]u8, port: i64, config: quic.Config, out: chan[Dialed]) {
+    var failure = io.Error.NotFound
+    var first = true
+    for ip in ips {
+        let target = net.Addr { ip, port }
+        let handle = quic.connect_handle(target, config) catch {
+            e => {
+                if first {
+                    failure = e
+                    first = false
+                }
+                if e == io.Error.TimedOut || e == io.Error.Refused {
+                    continue
+                }
+                break
+            }
+        }
+        out <- Dialed { handle: some(handle), failure: none }
+        return
+    }
+    out <- Dialed { handle: none, failure: some(failure) }
+}
+
+fn discard_dial(out: chan[Dialed]) {
+    let late = <-out
+    match late {
+        some(d) => match d.handle {
+            some(handle) => quic.close_on(handle, h3_no_error(), "")
+            none => {}
+        }
+        none => {}
+    }
+}
+
+fn run_quic(q: *H3Conn) {
+    accept_uni(q.link)
+    end_quic(q)
+}
+
+fn quic_usable(q: *H3Conn) -> bool {
+    sync.lock(q.lock)
+    let usable = !q.ended && !q.draining
+    sync.unlock(q.lock)
+    usable
+}
+
+fn detach_quic(q: *H3Conn) {
+    let h = q.host
+    h.lock <- true
+    match h.quic {
+        some(current) => {
+            if current == q {
+                h.quic = none
+            }
+        }
+        none => {}
+    }
+    <-h.lock
+}
+
+fn end_quic(q: *H3Conn) {
+    sync.lock(q.lock)
+    q.ended = true
+    q.draining = true
+    sync.unlock(q.lock)
+    cancel.cancel(q.link.token)
+    detach_quic(q)
+}
+
+fn goaway_quic(q: *H3Conn, id: i64) {
+    var refused: []*H3Request = []
+    sync.lock(q.lock)
+    q.draining = true
+    q.goaway = id
+    for sid, r in q.streams {
+        if sid >= id {
+            r.refused = true
+            push(mut refused, r)
+        }
+    }
+    let idle = q.active == 0
+    sync.unlock(q.lock)
+    detach_quic(q)
+    for r in refused {
+        quic.reset(r.stream, h3_request_cancelled())
+        quic.stop(r.stream, h3_request_cancelled())
+    }
+    if idle {
+        shutdown_quic(q)
+    }
+}
+
+fn shutdown_quic(q: *H3Conn) {
+    quic.close_on(q.link.handle, h3_no_error(), "")
+}
+
+fn drain_quic(q: *H3Conn) {
+    sync.lock(q.lock)
+    q.draining = true
+    let idle = q.active == 0
+    sync.unlock(q.lock)
+    if idle {
+        shutdown_quic(q)
+    }
+}
+
+fn quic_ended(q: *H3Conn) -> bool {
+    sync.lock(q.lock)
+    let ended = q.ended
+    sync.unlock(q.lock)
+    ended
+}
+
+fn retire_idle_quic(q: *H3Conn, now: i64, limit: i64) -> bool {
+    sync.lock(q.lock)
+    let idle = q.active == 0 && now - q.idle_since >= limit
+    if idle {
+        q.draining = true
+    }
+    sync.unlock(q.lock)
+    idle
+}
+
+fn reserve_quic(q: *H3Conn) ! io.Error {
+    sync.lock(q.lock)
+    let usable = !q.ended && !q.draining
+    if usable {
+        q.active += 1
+    }
+    sync.unlock(q.lock)
+    if !usable {
+        fail Reset
+    }
+}
+
+fn release_slot(q: *H3Conn, id: i64) {
+    sync.lock(q.lock)
+    if id >= 0 {
+        delete(mut q.streams, id)
+    }
+    q.active -= 1
+    q.idle_since = now_ms()
+    let finished = q.draining && q.active == 0
+    sync.unlock(q.lock)
+    if finished {
+        shutdown_quic(q)
+    }
+}
+
+fn finish_request(q: *H3Conn, r: *H3Request, complete: bool) {
+    sync.lock(q.lock)
+    let first = !r.finished
+    r.finished = true
+    sync.unlock(q.lock)
+    if !first {
+        return
+    }
+    close(r.done)
+    if !complete {
+        quic.reset(r.stream, h3_request_cancelled())
+        quic.stop(r.stream, h3_request_cancelled())
+        abandon_section(q.link, r.stream.id)
+    }
+    release_slot(q, r.stream.id)
+}
+
+fn connection_ended(h: *quic.ConnectionHandle) -> bool {
+    quic.stats_on(h) catch {
+        _ => return true
+    }
+    false
+}
+
+fn mark_stale(q: *H3Conn, r: *H3Request, a: *Attempt, e: io.Error) {
+    if r.refused || e == io.Error.Reset {
+        a.stale = true
+        return
+    }
+    if a.reused && connection_ended(q.link.handle) {
+        a.stale = true
+    }
+}
+
+fn halt_request(r: *H3Request) {
+    quic.reset(r.stream, h3_request_cancelled())
+    quic.stop(r.stream, h3_request_cancelled())
+    close(r.halt)
+}
+
+fn guard_request(r: *H3Request, d: *Deadline) {
+    let left = if d.at == 0 { unbounded() } else { remaining(d) }
+    if left >= 0 {
+        select {
+            <-r.done => return
+            <-d.stop => {}
+            after(left) => {}
+        }
+    }
+    halt_request(r)
+}
+
+fn open_into(h: *quic.ConnectionHandle, out: chan[Opening]) {
+    let s = quic.open_stream_on(h) catch {
+        e => {
+            out <- Opening { stream: none, failure: some(e) }
+            return
+        }
+    }
+    out <- Opening { stream: some(s), failure: none }
+}
+
+fn discard_opening(out: chan[Opening]) {
+    let late = <-out
+    match late {
+        some(o) => match o.stream {
+            some(s) => {
+                quic.reset(s, h3_request_cancelled())
+                quic.stop(s, h3_request_cancelled())
+            }
+            none => {}
+        }
+        none => {}
+    }
+}
+
+fn open_request(q: *H3Conn, d: *Deadline) -> quic.Stream ! io.Error {
+    let out = chan[Opening](1)
+    spawn open_into(q.link.handle, out)
+    let left = if d.at == 0 { unbounded() } else { remaining(d) }
+    var got: Opening? = none
+    if left >= 0 {
+        select {
+            o = <-out => {
+                got = o
+            }
+            <-d.stop => {}
+            after(left) => {}
+        }
+    }
+    let opening = match got {
+        some(o) => o
+        none => {
+            spawn discard_opening(out)
+            fail TimedOut
+        }
+    }
+    match opening.stream {
+        some(s) => s
+        none => fail opening.failure ?? io.Error.Aborted
+    }
+}
+
+fn exchange3(job: Job, q: *H3Conn, req: Outgoing, a: *Attempt) -> Incoming ! io.Error {
+    let d = job.deadline
+    a.phase = Sending
+    a.used_quic = some(q)
+    reserve_quic(q) catch {
+        _ => {
+            a.stale = true
+            fail Reset
+        }
+    }
+    let s = open_request(q, d) catch {
+        e => {
+            if a.reused && connection_ended(q.link.handle) {
+                a.stale = true
+            }
+            release_slot(q, -1)
+            fail e
+        }
+    }
+    let r = new(H3Request { stream: s, done: chan[bool](), halt: chan[bool](), finished: false, refused: false })
+    sync.lock(q.lock)
+    q.streams[s.id] = r
+    let rejected = q.goaway >= 0 && s.id >= q.goaway
+    sync.unlock(q.lock)
+    spawn guard_request(r, d)
+    if rejected {
+        a.stale = true
+        finish_request(q, r, false)
+        fail Reset
+    }
+    let reader = io.reader(quic.stream(s))
+    let started = outcome(fn() -> H3Response ! io.Error { start3(q, r, reader, req, a) })
+    let head = match started {
+        Done(h) => h
+        Failed(e) => {
+            mark_stale(q, r, a, e)
+            finish_request(q, r, false)
+            fail e
+        }
+    }
+    let headless = bodiless(req.method, head.status)
+    let flow = new(H3Inflow { reader, left: 0, total: 0, done: false, tail: false, bodiless: headless, headers: head.headers })
+    let length = if headless { 0 } else { declared_length(head.headers) or -1 }
+    let c = q.link
+    let body = io.Stream {
+        read: fn(buf) -> i64 ! io.Error {
+            a.broken = true
+            let n = read_body3(c, r, flow, a, buf)?
+            a.broken = false
+            n
+        }
+        write: fn(data) -> i64 ! io.Error { fail Unsupported }
+        close: fn() {}
+    }
+    Incoming {
+        status: head.status
+        headers: head.headers
+        version: Http3
+        body
+        length
+        attempt: a
+        finish: fn(ok: bool) {
+            finish_request(q, r, ok && flow.done)
+        }
+    }
+}
+
+fn start3(q: *H3Conn, r: *H3Request, reader: *io.Reader, req: Outgoing, a: *Attempt) -> H3Response ! io.Error {
+    var fields: []header.Header = [
+        header.Header { name: ":method", value: req.method }
+        header.Header { name: ":scheme", value: req.url.scheme }
+        header.Header { name: ":authority", value: authority(req.url) }
+        header.Header { name: ":path", value: req.url.target }
+    ]
+    for h in req.headers {
+        let name = text.lower(h.name)
+        if !header.token(name) || !header.valid_value(h.value) {
+            fail Invalid
+        }
+        if connection_specific(name) || name == "host" || name == "te" && h.value != "trailers" {
+            continue
+        }
+        push(mut fields, header.Header { name, value: h.value })
+    }
+    let streamed = req.source != none
+    if !streamed && sends_length(req.method, req.body.len) && !header.has(req.headers, "content-length") {
+        push(mut fields, header.Header { name: "content-length", value: "{req.body.len}" })
+    }
+    send_request(q.link, r.stream, req, fields) catch {
+        BrokenPipe => {}
+        e => fail e
+    }
+    a.phase = Receiving
+    read_head3(q.link, r.stream, reader, r.halt)?
+}
+
+fn send_request(c: *H3, s: quic.Stream, req: Outgoing, fields: []header.Header) ! io.Error {
+    let block = qpack.encode(c.encoder, fields)
+    var out: []u8 = []
+    put_h3_frame(mut out, h3_frame_headers(), block)
+    match req.source {
+        some(src) => {
+            quic.write(s, out)?
+            let buf = io.buffer(h3_read_chunk())
+            for {
+                let n = io.read_some(src, buf)?
+                if n == 0 {
+                    break
+                }
+                var chunk: []u8 = []
+                put_h3_head(mut chunk, h3_frame_data(), n)
+                io.append(mut chunk, buf[..n])
+                quic.write(s, chunk)?
+            }
+        }
+        none => {
+            if req.body.len > 0 {
+                put_h3_head(mut out, h3_frame_data(), req.body.len)
+            }
+            quic.write(s, out)?
+            if req.body.len > 0 {
+                quic.write(s, req.body)?
+            }
+        }
+    }
+    quic.finish(s)?
+}
+
+fn malformed_response(c: *H3, s: quic.Stream) -> io.Error {
+    abort_stream(c, s, h3_message_error())
+    Malformed
+}
+
+fn read_section(c: *H3, s: quic.Stream, reader: *io.Reader, length: i64, halt: chan[bool]) -> []header.Header ! io.Error {
+    let block = read_h3_block(reader, length, h3_max_field_section()) catch {
+        TooLarge => {
+            abort_stream(c, s, h3_excessive_load())
+            fail TooLarge
+        }
+        e => fail e
+    }
+    decode_fields(c, s.id, block, halt) catch {
+        TooLarge => {
+            abort_stream(c, s, h3_excessive_load())
+            fail TooLarge
+        }
+        e => fail e
+    }
+}
+
+fn response_status(fields: []header.Header) -> i64 {
+    let value = header.get(fields, ":status") ?? ""
+    let status = text.parse_uint(value, 10) or return -1
+    if status < 100 || status > 999 {
+        return -1
+    }
+    status
+}
+
+fn regular_fields(fields: []header.Header) -> []header.Header {
+    var out: []header.Header = []
+    for h in fields {
+        if !pseudo_name(h.name) {
+            push(mut out, h)
+        }
+    }
+    out
+}
+
+fn read_head3(c: *H3, s: quic.Stream, reader: *io.Reader, halt: chan[bool]) -> H3Response ! io.Error {
+    var interim = 0
+    for {
+        let next = read_h3_head(reader)?
+        let h = match next {
+            some(x) => x
+            none => fail Eof
+        }
+        if h.kind == h3_frame_data() || unexpected_on_request(h.kind) {
+            close_with(c, h3_frame_unexpected())
+            fail Malformed
+        }
+        if h.kind != h3_frame_headers() {
+            skip_h3(reader, h.length)?
+            continue
+        }
+        let fields = read_section(c, s, reader, h.length, halt)?
+        if !valid_h3_response(fields) {
+            fail malformed_response(c, s)
+        }
+        let status = response_status(fields)
+        if status < 0 {
+            fail malformed_response(c, s)
+        }
+        if status >= 200 {
+            return H3Response { status, headers: regular_fields(fields) }
+        }
+        interim += 1
+        if interim > max_interim() {
+            fail malformed_response(c, s)
+        }
+    }
+}
+
+fn read_body3(c: *H3, r: *H3Request, flow: *H3Inflow, a: *Attempt, buf: []u8) -> i64 ! io.Error {
+    if buf.len == 0 {
+        return 0
+    }
+    for {
+        if flow.done {
+            return 0
+        }
+        if flow.left > 0 {
+            let want = if flow.left < buf.len { flow.left } else { buf.len }
+            let n = io.read_some(flow.reader, buf[..want])?
+            if n == 0 {
+                fail malformed_response(c, r.stream)
+            }
+            flow.left -= n
+            flow.total += n
+            return n
+        }
+        step_body3(c, r, flow, a)?
+    }
+}
+
+fn step_body3(c: *H3, r: *H3Request, flow: *H3Inflow, a: *Attempt) ! io.Error {
+    let s = r.stream
+    let next = read_h3_head(flow.reader)?
+    let h = match next {
+        some(x) => x
+        none => {
+            if !flow.bodiless && !h3_length_matches(flow.headers, flow.total) {
+                fail malformed_response(c, s)
+            }
+            flow.done = true
+            return
+        }
+    }
+    if h.kind == h3_frame_data() {
+        if flow.tail {
+            close_with(c, h3_frame_unexpected())
+            fail Malformed
+        }
+        if flow.bodiless && h.length > 0 {
+            fail malformed_response(c, s)
+        }
+        flow.left = h.length
+    } else if h.kind == h3_frame_headers() {
+        if flow.tail {
+            close_with(c, h3_frame_unexpected())
+            fail Malformed
+        }
+        let fields = read_section(c, s, flow.reader, h.length, r.halt)?
+        if !valid_h3_trailers(fields) {
+            fail malformed_response(c, s)
+        }
+        a.trailers = fields
+        flow.tail = true
+    } else if unexpected_on_request(h.kind) {
+        close_with(c, h3_frame_unexpected())
+        fail Malformed
+    } else {
+        skip_h3(flow.reader, h.length)?
+    }
+}

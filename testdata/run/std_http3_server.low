@@ -1,0 +1,811 @@
+import std/cancel
+import std/crypto/x509
+import std/header
+import std/http
+import std/http/qpack
+import std/io
+import std/quic
+import std/quic/wire
+import std/sync
+import std/text
+import std/tls
+
+struct Load {
+    lock: sync.Mutex
+    running: i64
+    peak: i64
+    finished: i64
+    release: chan[bool]
+}
+
+struct Parsed {
+    status: str
+    headers: []header.Header
+    trailers: []header.Header
+    body: []u8
+    data_frames: i64
+}
+
+fn server_config() -> quic.Config ! io.Error {
+    let pem = embed("std_tls_ec.pem")
+    let certificates = x509.pem_certificates(pem)
+    let key = x509.pem_private_key(pem)?
+    quic.Config { tls: tls.Config { certificates, key, alpn: ["h3"] } }
+}
+
+fn roots() -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        push(mut out, x509.parse(der) or return out)
+    }
+    out
+}
+
+fn client_config() -> quic.Config {
+    quic.Config { tls: tls.Config { roots: roots(), alpn: ["h3"] } }
+}
+
+fn pattern(n: i64) -> []u8 {
+    var out: []u8 = []
+    for i in 0..n {
+        push(mut out, u8(i * 7 + i / 251))
+    }
+    out
+}
+
+fn checksum(data: []u8) -> i64 {
+    var sum = 17
+    for b in data {
+        sum = (sum * 131 + i64(b)) % 1000000007
+    }
+    sum
+}
+
+fn produce(chunks: chan[[]u8]) {
+    for part in ["one,", "two,", "three"] {
+        chunks <- bytes(part)
+        sleep(5)
+    }
+    close(chunks)
+}
+
+fn endless(chunks: chan[[]u8], token: *cancel.Token, events: chan[str]) {
+    let gone = cancel.done(token)
+    for {
+        select {
+            chunks <- bytes("tick") => {}
+            <-gone => {
+                events <- "endless cancelled"
+                close(chunks)
+                return
+            }
+        }
+        sleep(10)
+    }
+}
+
+fn enter(load: *Load) {
+    sync.lock(load.lock)
+    load.running += 1
+    if load.running > load.peak {
+        load.peak = load.running
+    }
+    sync.unlock(load.lock)
+}
+
+fn leave(load: *Load) {
+    sync.lock(load.lock)
+    load.running -= 1
+    load.finished += 1
+    sync.unlock(load.lock)
+}
+
+fn load_peak(load: *Load) -> i64 {
+    sync.lock(load.lock)
+    let peak = load.peak
+    sync.unlock(load.lock)
+    peak
+}
+
+fn load_finished(load: *Load) -> i64 {
+    sync.lock(load.lock)
+    let finished = load.finished
+    sync.unlock(load.lock)
+    finished
+}
+
+fn handle(req: http.Request, events: chan[str], load: *Load) -> http.Response {
+    if req.path == "/block" {
+        enter(load)
+        <-load.release
+        leave(load)
+        return http.response(200, "released")
+    }
+    if req.path == "/endless" {
+        let chunks = chan[[]u8](4)
+        spawn endless(chunks, req.token, events)
+        return http.Response { status: 200, headers: [], body: [], stream: some(chunks) }
+    }
+    if req.path == "/hold" {
+        let finished = cancel.pause(req.token, 10000)
+        events <- if finished { "hold finished" } else { "hold cancelled" }
+        return http.response(200, "held")
+    }
+    if req.path == "/dyn" {
+        return http.response(200, header.get(req.headers, "x-dyn") ?? "missing")
+    }
+    if req.path == "/hello" {
+        let version = if req.version == Http3 { "h3" } else { "other" }
+        return http.response(200, "hello {req.method} {version} remote={req.remote} authority={req.authority}")
+    }
+    if req.path == "/echo" {
+        return http.Response { status: 200, headers: [header.Header { name: "x-body-size", value: "{req.body.len}" }], body: req.body }
+    }
+    if req.path == "/stream" {
+        let chunks = chan[[]u8](4)
+        spawn produce(chunks)
+        return http.Response { status: 200, headers: [], body: [], stream: some(chunks) }
+    }
+    if req.path == "/trailers" {
+        return http.Response { status: 200, headers: [], body: bytes("payload"), trailers: [header.Header { name: "X-Sum", value: "7" }, header.Header { name: "connection", value: "drop" }] }
+    }
+    if req.path == "/n" {
+        return http.response(200, "number {req.query}")
+    }
+    http.response(404, "no such path")
+}
+
+fn serve(l: *quic.ListenerHandle, events: chan[str], load: *Load) {
+    let handler = fn(req: http.Request) -> http.Response { handle(req, events, load) }
+    http.serve_quic_on(l, handler) catch {
+        _ => {}
+    }
+}
+
+fn frame(kind: i64, payload: []u8) -> []u8 {
+    var out: []u8 = []
+    wire.put_varint(mut out, kind)
+    wire.put_varint(mut out, payload.len)
+    io.append(mut out, payload)
+    out
+}
+
+fn settings_payload(id: i64) -> []u8 {
+    var out: []u8 = []
+    wire.put_varint(mut out, id)
+    wire.put_varint(mut out, 0)
+    out
+}
+
+fn open_control(h: *quic.ConnectionHandle, setting: i64) ! io.Error {
+    let s = quic.open_uni_stream_on(h)?
+    var out: []u8 = []
+    wire.put_varint(mut out, 0)
+    io.append(mut out, frame(4, settings_payload(setting)))
+    quic.write(s, out)?
+}
+
+fn dial(port: i64) -> *quic.ConnectionHandle ! io.Error {
+    quic.dial_handle("127.0.0.1", port, client_config())?
+}
+
+fn connect(port: i64) -> *quic.ConnectionHandle ! io.Error {
+    let h = dial(port)?
+    open_control(h, 1)?
+    h
+}
+
+fn request_fields(method: str, path: str, extra: []header.Header) -> []header.Header {
+    var fields: []header.Header = [
+        header.Header { name: ":method", value: method }
+        header.Header { name: ":scheme", value: "https" }
+        header.Header { name: ":authority", value: "localhost" }
+        header.Header { name: ":path", value: path }
+    ]
+    for h in extra {
+        push(mut fields, h)
+    }
+    fields
+}
+
+fn send_request(h: *quic.ConnectionHandle, fields: []header.Header, body: []u8) -> quic.Stream ! io.Error {
+    let encoder = qpack.encoder()
+    let section = qpack.encode(encoder, fields)
+    var out = frame(1, section)
+    if body.len > 0 {
+        io.append(mut out, frame(0, body))
+    }
+    send_raw(h, out)?
+}
+
+fn send_raw(h: *quic.ConnectionHandle, raw: []u8) -> quic.Stream ! io.Error {
+    let s = quic.open_stream_on(h)?
+    quic.write(s, raw)?
+    quic.finish(s)?
+    s
+}
+
+fn parse_response(id: i64, raw: []u8) -> Parsed ! io.Error {
+    let c = wire.cursor(raw)
+    let d = qpack.decoder(0, 0, 65536)
+    var out = Parsed { status: "", headers: [], trailers: [], body: [], data_frames: 0 }
+    var seen = false
+    for wire.left(c) > 0 {
+        let kind = wire.varint(c)?
+        let length = wire.varint(c)?
+        let payload = wire.take(c, length)?
+        if kind == 0 {
+            io.append(mut out.body, payload)
+            out.data_frames += 1
+        } else if kind == 1 {
+            let decoded = qpack.decode(d, id, payload)?
+            match decoded {
+                Fields(fields) => {
+                    if seen {
+                        out.trailers = fields
+                    } else {
+                        out.headers = fields
+                        out.status = header.get(fields, ":status") ?? ""
+                        seen = true
+                    }
+                }
+                Blocked => fail Malformed
+            }
+        }
+    }
+    out
+}
+
+fn fetch(h: *quic.ConnectionHandle, method: str, path: str, extra: []header.Header, body: []u8) -> Parsed ! io.Error {
+    let s = send_request(h, request_fields(method, path, extra), body)?
+    let raw = io.read_all(quic.stream(s))?
+    parse_response(s.id, raw)?
+}
+
+fn summary(label: str, p: Parsed) {
+    print("{label}: status={p.status} body={str(p.body)} data_frames={p.data_frames} trailers={p.trailers.len}")
+}
+
+fn show(label: str, h: *quic.ConnectionHandle, method: str, path: str) {
+    let p = fetch(h, method, path, [], []) catch {
+        e => {
+            print("{label}: failed {e}")
+            return
+        }
+    }
+    summary(label, p)
+}
+
+fn await_close(h: *quic.ConnectionHandle) -> str {
+    for i in 0..300 {
+        quic.stats_on(h) catch {
+            _ => return "code=0x{hex(h.close_code)} by_peer={h.closed_by_peer} application={h.application_close}"
+        }
+        sleep(20)
+    }
+    "still open"
+}
+
+fn hex(n: i64) -> str {
+    let digits = "0123456789abcdef"
+    if n == 0 {
+        return "0"
+    }
+    var out = ""
+    var rest = n
+    for rest > 0 {
+        out = "{digits[rest & 15..(rest & 15) + 1]}{out}"
+        rest = rest >> 4
+    }
+    out
+}
+
+fn echo_check(h: *quic.ConnectionHandle) {
+    let data = pattern(100000)
+    let p = fetch(h, "POST", "/echo", [], data) catch {
+        e => {
+            print("echo: failed {e}")
+            return
+        }
+    }
+    let size = header.get(p.headers, "x-body-size") ?? "-"
+    print("echo: status={p.status} size={p.body.len} declared={size} same={checksum(p.body) == checksum(data)}")
+}
+
+fn stream_check(h: *quic.ConnectionHandle) {
+    let p = fetch(h, "GET", "/stream", [], []) catch {
+        e => {
+            print("stream: failed {e}")
+            return
+        }
+    }
+    let length = header.get(p.headers, "content-length") ?? "none"
+    print("stream: status={p.status} body={str(p.body)} data_frames={p.data_frames} content-length={length}")
+}
+
+fn trailer_check(h: *quic.ConnectionHandle) {
+    let p = fetch(h, "GET", "/trailers", [], []) catch {
+        e => {
+            print("trailers: failed {e}")
+            return
+        }
+    }
+    var names: []str = []
+    for t in p.trailers {
+        push(mut names, "{t.name}={t.value}")
+    }
+    print("trailers: status={p.status} body={str(p.body)} trailers={names}")
+}
+
+fn head_check(h: *quic.ConnectionHandle) {
+    let p = fetch(h, "HEAD", "/hello", [], []) catch {
+        e => {
+            print("head: failed {e}")
+            return
+        }
+    }
+    let length = header.get(p.headers, "content-length") ?? "none"
+    print("head: status={p.status} body_bytes={p.body.len} content-length={length}")
+}
+
+fn numbered(h: *quic.ConnectionHandle, i: i64, results: chan[i64]) {
+    let p = fetch(h, "GET", "/n?{i}", [], []) catch {
+        _ => {
+            results <- -1
+            return
+        }
+    }
+    results <- if p.status == "200" && str(p.body) == "number {i}" { i } else { -1 }
+}
+
+fn concurrent_check(h: *quic.ConnectionHandle) {
+    let results = chan[i64](16)
+    for i in 0..10 {
+        spawn numbered(h, i, results)
+    }
+    var ok = 0
+    var total = 0
+    for i in 0..10 {
+        let r = (<-results) ?? -1
+        if r >= 0 {
+            ok += 1
+            total += r
+        }
+    }
+    print("concurrent: ok={ok} sum={total}")
+}
+
+fn uppercase_check(h: *quic.ConnectionHandle) {
+    var section = get_section("/hello", [])
+    io.append(mut section, [0x27, 0x00])
+    io.append(mut section, bytes("X-Upper"))
+    io.append(mut section, [0x01])
+    io.append(mut section, bytes("1"))
+    print("uppercase: {outcome(h, frame(1, section))}")
+}
+
+fn get_section(path: str, extra: []header.Header) -> []u8 {
+    let encoder = qpack.encoder()
+    let fields = request_fields("GET", path, extra)
+    qpack.encode(encoder, fields)
+}
+
+fn outcome(h: *quic.ConnectionHandle, raw: []u8) -> str {
+    let s = send_raw(h, raw) catch {
+        BrokenPipe => return "stream ended with Reset"
+        e => return "send failed {e}"
+    }
+    let reply = io.read_all(quic.stream(s)) catch {
+        e => return "stream ended with {e}"
+    }
+    let p = parse_response(s.id, reply) catch {
+        e => return "unparsable response {e}"
+    }
+    "status={p.status} body={str(p.body)}"
+}
+
+fn malformed_checks(h: *quic.ConnectionHandle) {
+    var junk = frame(0x21, bytes("junk"))
+    io.append(mut junk, frame(1, get_section("/hello", [])))
+    print("unknown frame skipped: {outcome(h, junk)}")
+
+    let connection = get_section("/hello", [header.Header { name: "connection", value: "close" }])
+    print("connection field: {outcome(h, frame(1, connection))}")
+
+    let encoder = qpack.encoder()
+    let pathless = qpack.encode(encoder, [header.Header { name: ":method", value: "GET" }, header.Header { name: ":scheme", value: "https" }])
+    print("missing path: {outcome(h, frame(1, pathless))}")
+
+    var mismatch = frame(1, get_section("/echo", [header.Header { name: "content-length", value: "5" }]))
+    io.append(mut mismatch, frame(0, bytes("abc")))
+    print("content-length mismatch: {outcome(h, mismatch)}")
+
+    var pseudo_trailer = frame(1, get_section("/echo", []))
+    let trailer = qpack.encode(encoder, [header.Header { name: ":path", value: "/" }])
+    io.append(mut pseudo_trailer, frame(1, trailer))
+    print("pseudo-header in trailers: {outcome(h, pseudo_trailer)}")
+
+    var valid_trailer = frame(1, get_section("/hello", []))
+    let fine = qpack.encode(encoder, [header.Header { name: "x-checked", value: "1" }])
+    io.append(mut valid_trailer, frame(1, fine))
+    print("request trailers: {outcome(h, valid_trailer)}")
+
+    print("no headers: {outcome(h, frame(0x21, []))}")
+}
+
+fn data_after_trailers(h: *quic.ConnectionHandle) ! io.Error {
+    let encoder = qpack.encoder()
+    var raw = frame(1, get_section("/echo", []))
+    io.append(mut raw, frame(0, bytes("a")))
+    io.append(mut raw, frame(1, qpack.encode(encoder, [header.Header { name: "x-t", value: "1" }])))
+    io.append(mut raw, frame(0, bytes("b")))
+    send_raw(h, raw) catch {
+        _ => return
+    }
+}
+
+fn dynamic_check(h: *quic.ConnectionHandle) {
+    let encoder = qpack.encoder()
+    let base = qpack.encode(encoder, request_fields("GET", "/dyn", []))
+    var section: []u8 = [0x02, 0x00]
+    io.append(mut section, base[2..])
+    io.append(mut section, [0x80])
+    let s = send_raw(h, frame(1, section)) catch {
+        e => {
+            print("dynamic table: send failed {e}")
+            return
+        }
+    }
+    sleep(100)
+    var inserts: []u8 = [2, 0x3f, 0xe1, 0x1f, 0x45]
+    io.append(mut inserts, bytes("x-dyn"))
+    io.append(mut inserts, [0x03])
+    io.append(mut inserts, bytes("abc"))
+    let encoder_stream = quic.open_uni_stream_on(h) catch {
+        e => {
+            print("dynamic table: encoder stream failed {e}")
+            return
+        }
+    }
+    quic.write(encoder_stream, inserts) catch {
+        e => {
+            print("dynamic table: insert failed {e}")
+            return
+        }
+    }
+    let reply = io.read_all(quic.stream(s)) catch {
+        e => {
+            print("dynamic table: stream ended with {e}")
+            return
+        }
+    }
+    let p = parse_response(s.id, reply) catch {
+        e => {
+            print("dynamic table: unparsable {e}")
+            return
+        }
+    }
+    print("dynamic table: status={p.status} body={str(p.body)}")
+}
+
+fn cancel_checks(h: *quic.ConnectionHandle, events: chan[str]) {
+    let s = send_request(h, request_fields("GET", "/endless", []), []) catch {
+        e => {
+            print("endless: send failed {e}")
+            return
+        }
+    }
+    let buf = io.buffer(64)
+    let n = quic.read(s, buf) catch {
+        e => {
+            print("endless: read failed {e}")
+            return
+        }
+    }
+    quic.stop(s, 0x10c)
+    print("endless: read {n > 0} then {(<-events) ?? "none"}")
+    let held = send_request(h, request_fields("GET", "/hold", []), []) catch {
+        e => {
+            print("hold: send failed {e}")
+            return
+        }
+    }
+    sleep(100)
+    quic.close_on(h, 0, "")
+    print("hold: {(<-events) ?? "none"}")
+}
+
+fn stop_each(h: *quic.ConnectionHandle, count: i64, done: chan[bool]) {
+    for i in 0..count {
+        let s = send_request(h, request_fields("GET", "/block", []), []) catch {
+            _ => break
+        }
+        quic.stop(s, 0x10c)
+    }
+    done <- true
+}
+
+fn handler_cap_check(h: *quic.ConnectionHandle, load: *Load) {
+    let count = 140
+    let done = chan[bool](1)
+    spawn stop_each(h, count, done)
+    sleep(1500)
+    let peak = load_peak(load)
+    close(load.release)
+    <-done
+    for i in 0..500 {
+        if load_finished(load) >= count {
+            break
+        }
+        sleep(20)
+    }
+    print("handler cap: peak={peak} handled={load_finished(load)}")
+    show("after handler cap", h, "GET", "/hello")
+}
+
+fn tiny_frames_check(h: *quic.ConnectionHandle) {
+    let data = pattern(3000)
+    var raw = frame(1, qpack.encode(qpack.encoder(), request_fields("POST", "/echo", [])))
+    for b in data {
+        io.append(mut raw, frame(0, [b]))
+    }
+    let s = send_raw(h, raw) catch {
+        e => {
+            print("tiny frames: send failed {e}")
+            return
+        }
+    }
+    let reply = io.read_all(quic.stream(s)) catch {
+        e => {
+            print("tiny frames: stream ended with {e}")
+            return
+        }
+    }
+    let p = parse_response(s.id, reply) catch {
+        e => {
+            print("tiny frames: unparsable {e}")
+            return
+        }
+    }
+    print("tiny frames: status={p.status} size={p.body.len} same={checksum(p.body) == checksum(data)}")
+}
+
+fn after(label: str, port: i64) {
+    let h = connect(port) catch {
+        e => {
+            print("{label}: reconnect failed {e}")
+            return
+        }
+    }
+    show("{label}: new connection", h, "GET", "/hello")
+    quic.close_on(h, 0, "")
+}
+
+fn wire_case(label: str, port: i64, control: bool, body: fn(*quic.ConnectionHandle) ! io.Error) {
+    let h = dial(port) catch {
+        e => {
+            print("{label}: connect failed {e}")
+            return
+        }
+    }
+    if control {
+        open_control(h, 1) catch {
+            e => print("{label}: control failed {e}")
+        }
+    }
+    body(h) catch {
+        e => print("{label}: client error {e}")
+    }
+    print("{label}: {await_close(h)}")
+    after(label, port)
+}
+
+fn data_first(h: *quic.ConnectionHandle) ! io.Error {
+    let s = quic.open_stream_on(h)?
+    quic.write(s, frame(0, bytes("early")))?
+}
+
+fn second_control(h: *quic.ConnectionHandle) ! io.Error {
+    open_control(h, 1)?
+}
+
+fn reserved_setting(h: *quic.ConnectionHandle) ! io.Error {
+    let s = quic.open_uni_stream_on(h)?
+    var out: []u8 = []
+    wire.put_varint(mut out, 0)
+    io.append(mut out, frame(4, settings_payload(2)))
+    quic.write(s, out)?
+}
+
+fn huge_headers(h: *quic.ConnectionHandle) ! io.Error {
+    let s = quic.open_stream_on(h)?
+    var out: []u8 = []
+    wire.put_varint(mut out, 1)
+    wire.put_varint_sized(mut out, 1 << 40, 8)
+    quic.write(s, out)?
+}
+
+fn missing_settings(h: *quic.ConnectionHandle) ! io.Error {
+    let s = quic.open_uni_stream_on(h)?
+    var out: []u8 = []
+    wire.put_varint(mut out, 0)
+    io.append(mut out, frame(0, bytes("x")))
+    quic.write(s, out)?
+}
+
+fn closed_control(h: *quic.ConnectionHandle) ! io.Error {
+    let s = quic.open_uni_stream_on(h)?
+    var out: []u8 = []
+    wire.put_varint(mut out, 0)
+    io.append(mut out, frame(4, []))
+    quic.write(s, out)?
+    quic.finish(s)?
+}
+
+fn push_stream(h: *quic.ConnectionHandle) ! io.Error {
+    let s = quic.open_uni_stream_on(h)?
+    var out: []u8 = []
+    wire.put_varint(mut out, 1)
+    quic.write(s, out)?
+}
+
+fn settings_twice(h: *quic.ConnectionHandle) ! io.Error {
+    let s = quic.open_uni_stream_on(h)?
+    var out: []u8 = []
+    wire.put_varint(mut out, 0)
+    io.append(mut out, frame(4, settings_payload(1)))
+    io.append(mut out, frame(4, settings_payload(1)))
+    quic.write(s, out)?
+}
+
+fn encoder_stream(h: *quic.ConnectionHandle, instructions: []u8) ! io.Error {
+    let s = quic.open_uni_stream_on(h)?
+    var out: []u8 = []
+    wire.put_varint(mut out, 2)
+    io.append(mut out, instructions)
+    quic.write(s, out)?
+}
+
+fn capacity_over_limit(h: *quic.ConnectionHandle) ! io.Error {
+    encoder_stream(h, [0x3f, 0xe2, 0x1f])?
+}
+
+fn entry_over_capacity(h: *quic.ConnectionHandle) ! io.Error {
+    var instructions: []u8 = [0x3f, 0x21, 0x54]
+    io.append(mut instructions, bytes(text.repeat("n", 20)))
+    push(mut instructions, 0x14)
+    io.append(mut instructions, bytes(text.repeat("v", 20)))
+    encoder_stream(h, instructions)?
+}
+
+fn counted_section(encoded_count: i64, path: str) -> []u8 {
+    let plain = get_section(path, [])
+    var out: []u8 = [u8(encoded_count), 0x00]
+    io.append(mut out, plain[2..])
+    out
+}
+
+fn blocked_section() -> []u8 {
+    var out = counted_section(2, "/hello")
+    push(mut out, 0x80)
+    out
+}
+
+fn impossible_count(h: *quic.ConnectionHandle) ! io.Error {
+    let section = counted_section(200, "/hello")
+    send_raw(h, frame(1, section))?
+}
+
+fn many_blocked(h: *quic.ConnectionHandle) ! io.Error {
+    let raw = frame(1, blocked_section())
+    for i in 0..17 {
+        send_raw(h, raw)?
+    }
+}
+
+fn first_read(s: quic.Stream, done: chan[str]) {
+    let buf = io.buffer(64)
+    let n = quic.read(s, buf) catch {
+        e => {
+            done <- "ended with {e}"
+            return
+        }
+    }
+    done <- "read {n} bytes"
+}
+
+fn blocked_check(port: i64) {
+    let h = connect(port) catch {
+        e => {
+            print("blocked stream: connect failed {e}")
+            return
+        }
+    }
+    let s = send_raw(h, frame(1, blocked_section())) catch {
+        e => {
+            print("blocked stream: send failed {e}")
+            return
+        }
+    }
+    let done = chan[str](1)
+    spawn first_read(s, done)
+    sleep(100)
+    show("blocked stream: another request", h, "GET", "/hello")
+    let first = select {
+        r = <-done => r ?? "closed"
+        else => "still waiting"
+    }
+    print("blocked stream: first request {first}")
+    quic.close_on(h, 0, "")
+    after("blocked stream", port)
+}
+
+fn reset_storm(port: i64) {
+    let h = connect(port) catch {
+        e => {
+            print("reset storm: connect failed {e}")
+            return
+        }
+    }
+    let raw = frame(1, get_section("/hello", []))
+    var opened = 0
+    for i in 0..500 {
+        let s = quic.open_stream_on(h) catch {
+            _ => break
+        }
+        quic.write(s, raw) catch {
+            _ => 0
+        }
+        quic.reset(s, 0x10c)
+        quic.stop(s, 0x10c)
+        opened += 1
+    }
+    print("reset storm: opened and reset {opened} streams")
+    show("reset storm: normal request", h, "GET", "/hello")
+    quic.close_on(h, 0, "")
+    after("reset storm", port)
+}
+
+fn main() ! io.Error {
+    let config = server_config()?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    let port = l.handle.addr.port
+    let events = chan[str](8)
+    let load = new(Load { lock: sync.mutex(), running: 0, peak: 0, finished: 0, release: chan[bool]() })
+    spawn serve(l.handle, events, load)
+
+    let h = connect(port)?
+    show("get", h, "GET", "/hello")
+    echo_check(h)
+    tiny_frames_check(h)
+    stream_check(h)
+    trailer_check(h)
+    head_check(h)
+    show("missing", h, "GET", "/missing")
+    concurrent_check(h)
+    uppercase_check(h)
+    malformed_checks(h)
+    dynamic_check(h)
+    show("after malformed requests", h, "GET", "/hello")
+    cancel_checks(h, events)
+
+    let crowded = connect(port)?
+    handler_cap_check(crowded, load)
+    quic.close_on(crowded, 0, "")
+
+    wire_case("data after trailers", port, true, data_after_trailers)
+    wire_case("data before headers", port, true, data_first)
+    wire_case("second control stream", port, true, second_control)
+    wire_case("reserved setting", port, false, reserved_setting)
+    wire_case("huge headers", port, true, huge_headers)
+    wire_case("missing settings", port, false, missing_settings)
+    wire_case("closed control stream", port, false, closed_control)
+    wire_case("push stream", port, true, push_stream)
+    wire_case("settings twice", port, false, settings_twice)
+    wire_case("encoder capacity over the limit", port, true, capacity_over_limit)
+    wire_case("encoder entry over the capacity", port, true, entry_over_capacity)
+    wire_case("required insert count beyond the table", port, true, impossible_count)
+    blocked_check(port)
+    wire_case("17 blocked streams", port, true, many_blocked)
+    reset_storm(port)
+}
