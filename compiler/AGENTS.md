@@ -1,0 +1,34 @@
+# Low compiler in Low
+
+`compiler/` is the Low port of the Go compiler in `internal/` and `cmd/`. [docs/self-hosting/plan.md](../docs/self-hosting/plan.md) orders the work. The Go compiler is the oracle: a ported stage is done when its output equals the Go stage's output byte for byte.
+
+## Layout
+
+- `compiler/low.mod` marks the project root, so `import lexer` loads `compiler/lexer/`.
+- One Go package `internal/<name>` becomes one module `compiler/<name>/`, keeping the Go file names with a `.low` extension.
+- `compiler/lowdump/` and `cmd/lowdump/` are the same dump tool in Low and in Go. Each stage adds one command to both, in its own file, printing that stage's output as text or writing it as bytes.
+
+## Build and compare
+
+```
+$ go build -o /tmp/low ./cmd/low
+$ go build -o /tmp/lowdump-go ./cmd/lowdump
+$ /tmp/low build compiler/lowdump -o /tmp/lowdump-low
+$ /tmp/lowdump-go tokens file.low > a; /tmp/lowdump-low tokens file.low > b; cmp a b
+```
+
+Compare stdout, stderr and the exit status over every `.low` file under `testdata/`, `internal/compiler/` and `bench/`, including the files that must fail.
+
+## Porting rules
+
+- Keep the Go structure: the same functions in the same order with the same names in `snake_case`, so a later change to the Go source maps onto the Low source line by line.
+- Low has no module-level variables. A Go table becomes a function that returns it, or a `match`.
+- Low has no methods or overloading and one function namespace per module. `l.peek(0)` calls `peek(l, 0)`. Two Go methods with one name on different receivers need different names.
+- State that Go mutates through a pointer receiver is a struct built with `new` and passed as `*T`.
+- An error is the enum `diag.Error`. A Go function that returns `error` returns `! diag.Error`, and the callers use `?`. Go code that panics with `diag.Fail` and recovers with `diag.Try` fails with `diag.Error` and propagates the same way.
+- A Go interface with a type switch over its implementations is an enum with one variant per implementation. A Go interface called through its methods is a struct of function values.
+- A Go `map` keyed by a struct is keyed by a `str` or integer built from the same fields.
+- Source text is a `str`. `s[a..b]` shares the bytes, so token and name text is sliced, never copied.
+- Output must not depend on map hash order. Low maps iterate in insertion order, which is deterministic; where Go sorts keys, sort the same way.
+- Assignments are statements: a `match` arm that assigns takes a `{ }` block.
+- `"{{"` and `"}}"` are literal braces in a string.
