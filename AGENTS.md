@@ -24,4 +24,4 @@ Read `editors/README.md`. `internal/lsp` serves `low lsp`; `internal/lint` backs
 
 ## Docs or website
 
-Read `README.md` `## Website` before editing a Low snippet in `docs/design.md` or anything in `site/`. `site/index.html`, `404.html`, `docs/`, `packages/` and `style.css` are generated; page content is in `site/content/`, and the origin, repository URL and output folders are in `site/config.mjs`. Edit the sources and run `npm run build` in `site/`.
+Read `README.md` `## Website` before editing a Low snippet in `docs/design.md` or anything in `site/`. `site/index.html`, `404.html`, `search.json`, `docs/`, `packages/` and `style.css` are generated; page content is in `site/content/`, and the origin, repository URL and output folders are in `site/config.mjs`. Edit the sources and run `npm run build` in `site/`.

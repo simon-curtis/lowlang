@@ -59,13 +59,23 @@ function masthead(root, current) {
 <nav class="menu">
 ${navigation(root, current)}
 </nav>
+<button class="find" type="button" aria-haspopup="dialog" aria-keyshortcuts="Control+K Meta+K /"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>Search<kbd>Ctrl K</kbd></button>
 <a class="repo" href="${repository}">GitHub</a>
 </div>
 </header>`;
 }
 
+function palette(root) {
+    return `<dialog class="palette" aria-label="Search the site" data-index="${root}search.json">
+<input type="text" role="combobox" aria-expanded="true" aria-controls="palette-results" aria-autocomplete="list" aria-label="Search the site" placeholder="Search docs and packages" autocomplete="off" spellcheck="false">
+<p class="palette-status" role="status"></p>
+<ul id="palette-results" role="listbox" aria-label="Results"></ul>
+<p class="palette-keys" aria-hidden="true"><span><kbd>↑</kbd><kbd>↓</kbd> move</span><span><kbd>Enter</kbd> open</span><span><kbd>Esc</kbd> close</span></p>
+</dialog>`;
+}
+
 function scriptTags({ scripts = [] }, root) {
-    return scripts.map((script) => `<script src="${root}${script}" defer></script>\n`).join("");
+    return [...scripts, "search.js"].map((script) => `<script type="module" src="${root}${script}"></script>\n`).join("");
 }
 
 export function rootOf(page) {
@@ -84,12 +94,13 @@ ${head(page, root)}
 ${masthead(root, page.current)}
 
 ${content}
+${palette(root)}
 ${scriptTags(page, root)}</body>
 </html>
 `;
 }
 
-function expand(body) {
+export function expand(body) {
     return body.replace(/\{\{(\w+)\}\}/g, (whole, name) => {
         if (!(name in substitutions)) {
             throw new Error(`unknown placeholder ${whole}`);

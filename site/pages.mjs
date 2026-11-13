@@ -1,6 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { low, words } from "./highlight.mjs";
-import { panels, rootOf } from "./layout.mjs";
+import { expand, panels, rootOf } from "./layout.mjs";
 import { Linker } from "./links.mjs";
 import { textOf } from "./markup.mjs";
 import { Program } from "./program.mjs";
@@ -32,7 +32,7 @@ async function repaint(body, session, linker, label, expected) {
     return low(marked, linker.facts(checked, source)).replaceAll(open, "<mark>").replaceAll(close, "</mark>");
 }
 
-async function render(page, session, library) {
+async function render(page, session, library, search) {
     const linker = new Linker(library, rootOf(page));
     const html = await readFile(new URL(page.path, content), "utf8");
     const blocks = [...html.matchAll(block)];
@@ -45,15 +45,18 @@ async function render(page, session, library) {
         const opening = start.replace(expectation, "");
         painted = painted.replace(whole, () => `${opening}${code}${end}`);
     }
+    if (!page.error) {
+        search.document({ title: page.current, area: page.current, path: page.path, description: page.description, html: expand(painted) });
+    }
     const document = panels({ ...page, body: painted });
     await writeFile(new URL(page.path, site), document);
     return blocks.length;
 }
 
-export async function pages(session, library) {
+export async function pages(session, library, search) {
     const counts = [];
     for (const page of sources) {
-        const count = await render(page, session, library);
+        const count = await render(page, session, library, search);
         counts.push(`${page.path} ${count}`);
     }
     return counts.join(", ");
