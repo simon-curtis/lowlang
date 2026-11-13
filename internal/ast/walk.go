@@ -173,6 +173,9 @@ func (w walker) node(n Node) {
 	case *Or:
 		w.expr(n.X)
 		w.expr(n.Fallback)
+	case *When:
+		w.expr(n.X)
+		w.expr(n.Cond)
 	case *Receiver:
 		w.expr(n.X)
 	}

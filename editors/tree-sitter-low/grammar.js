@@ -1,5 +1,6 @@
 const PREC = {
-  closure: -1,
+  closure: -2,
+  when: -1,
   pipe: 0,
   or: 1,
   and: 2,
@@ -308,9 +309,9 @@ module.exports = grammar({
 
     continue_expression: $ => prec.right(seq('continue', optional(field('label', alias($.identifier, $.label_identifier))))),
 
-    return_expression: $ => prec.right(seq('return', optional(field('value', $._expression)))),
+    return_expression: $ => prec.right(PREC.when, seq('return', optional(field('value', $._expression)))),
 
-    fail_expression: $ => prec.right(seq('fail', field('value', $._expression))),
+    fail_expression: $ => prec.right(PREC.when, seq('fail', field('value', $._expression))),
 
     defer_statement: $ => seq('defer', field('body', $._statement)),
 
@@ -333,6 +334,7 @@ module.exports = grammar({
       $.try_expression,
       $.catch_expression,
       $.or_expression,
+      $.when_expression,
       $.struct_literal,
       $.slice_literal,
       $.map_literal,
@@ -472,6 +474,12 @@ module.exports = grammar({
       field('value', $._expression),
       'or',
       field('fallback', $._expression),
+    )),
+
+    when_expression: $ => prec.right(PREC.when, seq(
+      field('value', $._expression),
+      field('operator', 'when'),
+      field('condition', $._expression),
     )),
 
     struct_literal: $ => prec(0, seq(

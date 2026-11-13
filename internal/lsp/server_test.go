@@ -270,6 +270,46 @@ func TestDiagnosticsFollowOverlay(t *testing.T) {
 	}
 }
 
+func TestCloseReleasesTheEntry(t *testing.T) {
+	c := start(t)
+	f := load(t, "enums.low")
+	c.open(f, f.src)
+	at := f.at(t, "print(area(big))", 11)
+	if got := c.hover(f, at); got == "" {
+		t.Fatal("no hover while the document is open")
+	}
+	broken := f.src + "\nfn broken() {\n    let x: i64 = \"s\"\n}\n"
+	if got := c.change(f, broken); len(got) != 1 {
+		t.Fatalf("diagnostics = %+v, want one", got)
+	}
+	before := c.publishes[f.uri]
+	c.notify("textDocument/didClose", DocumentParams{TextDocument: TextDocumentIdentifier{URI: f.uri}})
+	if got := c.await(f.uri, before); len(got) != 0 {
+		t.Errorf("diagnostics after close = %+v, want none", got)
+	}
+	if got := c.hover(f, at); got != "" {
+		t.Errorf("hover after close = %q, want none", got)
+	}
+	if got := c.open(f, f.src); len(got) != 0 {
+		t.Errorf("diagnostics after reopening = %+v, want none", got)
+	}
+	if got := c.hover(f, at); got == "" {
+		t.Error("no hover after reopening")
+	}
+}
+
+func TestCloseKeepsAnEntryWithOpenDocuments(t *testing.T) {
+	c := start(t)
+	f := load(t, "modules", "main.low")
+	g := load(t, "modules", "helper.low")
+	c.open(f, f.src)
+	c.open(g, g.src)
+	c.notify("textDocument/didClose", DocumentParams{TextDocument: TextDocumentIdentifier{URI: g.uri}})
+	if got := c.hover(f, f.at(t, "geometry.circle(2)", 9)); got == "" {
+		t.Error("no hover in the document that stayed open")
+	}
+}
+
 func TestRapidEditsPublishOnlyTheLatest(t *testing.T) {
 	c := start(t)
 	f := load(t, "enums.low")

@@ -1230,6 +1230,8 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 		c.catch(e, want)
 	case *ast.Or:
 		c.or(e, want)
+	case *ast.When:
+		c.whenExpr(e, want)
 	}
 	return e.TypeOf()
 }
@@ -2088,6 +2090,21 @@ func (c *Checker) ifExpr(e *ast.If, want *types.Type) {
 		then = c.block(e.Then, other)
 	}
 	e.Type = unify(then, other)
+}
+
+func (c *Checker) whenExpr(e *ast.When, want *types.Type) {
+	c.expectType(e.Cond, types.Bool)
+	t := c.expr(e.X, want)
+	switch {
+	case t == types.Void || t == types.Never || t.Kind == types.ResultKind:
+		c.fail(e.X.Position(), "when needs a value to wrap, found %s", t)
+	case want != nil && want.Optional && want.Accepts(t):
+		e.Type = want
+	case t.Optional:
+		e.Type = t
+	default:
+		e.Type = c.universe.Optional(t)
+	}
 }
 
 func (c *Checker) branch(e ast.Expr, hint, want *types.Type) *types.Type {

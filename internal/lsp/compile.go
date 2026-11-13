@@ -38,6 +38,7 @@ func (j compileJob) run() (result compiled) {
 
 type scheduler struct {
 	versions  map[string]int
+	sequence  int
 	dirty     map[string]string
 	compiling bool
 	timer     *time.Timer
@@ -56,9 +57,15 @@ func newScheduler() *scheduler {
 }
 
 func (c *scheduler) mark(entry, path string, delay time.Duration) {
-	c.versions[entry]++
+	c.sequence++
+	c.versions[entry] = c.sequence
 	c.dirty[entry] = path
 	c.timer.Reset(delay)
+}
+
+func (c *scheduler) forget(entry string) {
+	delete(c.versions, entry)
+	delete(c.dirty, entry)
 }
 
 func (c *scheduler) next(ctx context.Context, docs compiler.Overlay) {

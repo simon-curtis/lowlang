@@ -854,6 +854,8 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		return b.catch(e)
 	case *ast.Or:
 		return b.handle(e.X, e.Type, func([]*Value) []*Value { return b.value(e.Fallback, e.Type) })
+	case *ast.When:
+		return b.when(e)
 	}
 	return nil
 }
@@ -1153,6 +1155,22 @@ func (b *builder) ifExpr(e *ast.If) []*Value {
 	if e.Else != nil {
 		b.writeTemp(temp, b.value(e.Else, e.Type))
 	}
+	b.jump(done)
+	b.enter(done)
+	return b.readTemp(temp, e.Type.Size())
+}
+
+func (b *builder) when(e *ast.When) []*Value {
+	temp := b.newTemp()
+	held := b.newBlock()
+	empty := b.newBlock()
+	done := b.newBlock()
+	b.branch(b.word(e.Cond), held, empty)
+	b.enter(held)
+	b.writeTemp(temp, b.value(e.X, e.Type))
+	b.jump(done)
+	b.enter(empty)
+	b.writeTemp(temp, b.fit(e.Type, []*Value{b.constant(0)}))
 	b.jump(done)
 	b.enter(done)
 	return b.readTemp(temp, e.Type.Size())

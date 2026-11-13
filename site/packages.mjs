@@ -9,6 +9,7 @@ import { layout, rootOf } from "./layout.mjs";
 import { anchor, codeRenderer, file, Linker } from "./links.mjs";
 import { escape, isLow, textOf } from "./markup.mjs";
 import { Program } from "./program.mjs";
+import { plain } from "./search.mjs";
 
 const run = promisify(execFile);
 const output = new URL(folders.packages, import.meta.url);
@@ -16,6 +17,7 @@ const github = '<svg class="size-5" viewBox="0 0 16 16" fill="currentColor" aria
 const markdown = new Marked({ renderer: { codespan } });
 
 const comment = /^( *)\/\/\/ ?(.*)$/;
+const current = "Packages";
 
 function blocks(text) {
     const groups = [];
@@ -236,10 +238,40 @@ class Page {
         return `<div class="space-y-8">\n${back}\n${groups.join("\n")}\n</div>`;
     }
 
+    #entry(item) {
+        const lines = item.text.split("\n");
+        const code = lines.filter((line) => !comment.test(line)).join(" ");
+        const notes = lines.map((line) => comment.exec(line)?.[2]).filter((line) => line !== undefined);
+        const doc = markdown.parse(item.doc ?? "");
+        const fields = markdown.parseInline(notes.join(" "));
+        const alias = this.#module.path.split("/").at(-1);
+        return {
+            kind: item.receiver ? "method" : item.kind,
+            name: item.receiver ? anchor(item) : `${alias}.${item.name}`,
+            href: `${this.path}#${anchor(item)}`,
+            signature: code.replace(/\s+/g, " ").trim().replace(/^pub /, ""),
+            text: plain(`${doc} ${fields}`),
+        };
+    }
+
+    register(search) {
+        const description = this.#description ? plain(this.#description) : "";
+        const page = search.page({ title: this.#module.path, area: current, href: this.path, description, text: "" });
+        for (const example of this.#module.examples) {
+            const text = exampleSource(example).replace(/\s+/g, " ");
+            search.section(page, { kind: "example", name: example.name, href: `${this.path}#${exampleAnchor(example)}`, text });
+        }
+        const methods = this.#types.flatMap((type) => this.#module.items.filter((item) => item.receiver === type.name));
+        for (const item of [...this.#types, ...methods, ...this.#constants, ...this.#functions]) {
+            const entry = this.#entry(item);
+            search.section(page, entry);
+        }
+    }
+
     html() {
         const path = this.#module.path;
         const text = this.#description ? textOf(this.#description) : `The ${path} module of the Low standard library.`;
-        return layout({ path: this.path, heading: path, title: `${path}: Low packages`, description: summary(text, 200), current: "Packages", sidebar: this.sidebar(), body: this.body() });
+        return layout({ path: this.path, heading: path, title: `${path}: Low packages`, description: summary(text, 200), current, sidebar: this.sidebar(), body: this.body() });
     }
 }
 
@@ -262,7 +294,7 @@ ${rows.join("\n")}
 </ul>
 `;
     const sidebar = '<ul class="sidelist">\n<li><a class="font-bold underline underline-offset-4" aria-current="page" href="index.html">std</a></li>\n</ul>';
-    return layout({ path: `${folders.packages}index.html`, heading: "std", title: "Low packages", description: `The Low standard library: ${modules.length} modules.`, current: "Packages", sidebar, body, scripts: ["filter.js"] });
+    return layout({ path: `${folders.packages}index.html`, heading: "std", title: "Low packages", description: `The Low standard library: ${modules.length} modules.`, current, sidebar, body, scripts: ["filter.js"] });
 }
 
 export async function standard(binary) {
@@ -291,7 +323,7 @@ async function inspect(module, snippets, session) {
     }
 }
 
-export async function packages(modules, design, session, library) {
+export async function packages(modules, design, session, library, search) {
     const uncategorised = modules.filter((module) => categories(module.path).length === 0).map((module) => module.path);
     if (uncategorised.length > 0) {
         throw new Error(`packages without a category: ${uncategorised.join(", ")}`);
@@ -312,6 +344,7 @@ export async function packages(modules, design, session, library) {
     for (const module of modules) {
         const page = new Page(module, about.get(module.path), exports, snippets, library);
         const html = page.html();
+        page.register(search);
         await writeFile(new URL(file(module.path), output), html);
     }
     return modules.length;
