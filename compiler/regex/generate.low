@@ -1,0 +1,377 @@
+import lexer
+import std/builder
+import std/math
+import std/slices
+import std/text
+
+pub const module = "std/regex"
+pub const generator = "generated"
+pub const result = "Regex"
+const max_generated = 2000
+const inline_ranges = 4
+
+pub fn generate(name: str, pattern: str, prog: Program) -> str {
+    let g = new(Generator { name, insts: prog.insts })
+    if prog.insts.len > max_generated {
+        g.interpreted(pattern)
+        return g.out.to_str()
+    }
+    g.analyse()
+    g.constructor(prog.groups)
+    g.start()
+    g.step()
+    for pc in 0..g.insts.len {
+        if g.called[pc] {
+            g.add(pc)
+        }
+    }
+    for pc in g.leaves {
+        if g.insts[pc].op == Class && g.insts[pc].ranges.len > inline_ranges {
+            g.class_function(pc)
+        }
+    }
+    g.skip()
+    g.out.to_str()
+}
+
+struct Generator {
+    name: str
+    insts: []Inst
+    called: []bool = []
+    leaves: []i64 = []
+    stops: []Range = []
+    out: builder.Builder = builder.builder()
+    temps: i64 = 0
+}
+
+fn line(g: *Generator, s: str) {
+    g.out.write(s)
+    g.out.write_byte('\n')
+}
+
+fn temp(g: *Generator, prefix: str) -> str {
+    g.temps += 1
+    "{prefix}{g.temps}"
+}
+
+fn interpreted(g: *Generator, pattern: str) {
+    let quoted = lexer.quote(pattern)
+    let failure = lexer.quote("regex: a generated pattern failed to compile")
+    g.line("fn {g.name}() -> {result} {{")
+    g.line("compile({quoted}) or panic({failure})")
+    g.line("}}")
+}
+
+fn consumes(inst: Inst) -> bool {
+    inst.op == Char || inst.op == Class
+}
+
+fn leaf(inst: Inst) -> bool {
+    inst.consumes() || inst.op == Done
+}
+
+fn epsilons(inst: Inst, pc: i64) -> []i64 {
+    match inst.op {
+        Split => [inst.x, inst.y]
+        Jump => [inst.x]
+        Save => [pc + 1]
+        Check => [pc + 1]
+        _ => []
+    }
+}
+
+fn analyse(g: *Generator) {
+    let n = g.insts.len
+    var reached = slices.repeat([false], n)
+    var incoming = slices.repeat([0], n)
+    var entry = slices.repeat([false], n)
+    entry[0] = true
+    var work = [0]
+    reached[0] = true
+    for work.len > 0 {
+        let pc = work[work.len - 1]
+        truncate(mut work, work.len - 1)
+        let inst = g.insts[pc]
+        var next = inst.epsilons(pc)
+        if inst.consumes() {
+            entry[pc + 1] = true
+            next = [pc + 1]
+        }
+        for to in next {
+            if !inst.consumes() {
+                incoming[to] += 1
+            }
+            if !reached[to] {
+                reached[to] = true
+                push(mut work, to)
+            }
+        }
+    }
+    g.called = slices.repeat([false], n)
+    for pc in 0..n {
+        g.called[pc] = reached[pc] && (entry[pc] || incoming[pc] > 1)
+        if reached[pc] && g.insts[pc].leaf() {
+            push(mut g.leaves, pc)
+        }
+    }
+    g.stops = g.first()
+}
+
+fn adder(g: *Generator, pc: i64) -> str {
+    "{g.name}_a{pc}"
+}
+
+fn constructor(g: *Generator, groups: i64) {
+    var skip_name = "stay"
+    if g.stops.len > 0 {
+        skip_name = "{g.name}_skip"
+    }
+    g.line("fn {g.name}() -> {result} {{")
+    g.line("let engine = Engine {{ program: [], size: {g.insts.len}, start: {g.name}_start, step: {g.name}_step, skip: {skip_name} }}")
+    g.line("Regex {{ engine, groups: {groups} }}")
+    g.line("}}")
+}
+
+fn start(g: *Generator) {
+    let first_add = g.adder(0)
+    g.line("fn {g.name}_start(mut core: Core, mut q: Queue, pos: i64) {{")
+    g.line("for i in 0..core.width {{\ncore.scratch[i] = -1\n}}")
+    g.line("{first_add}(mut core, mut q, pos)")
+    g.line("}}")
+}
+
+fn step(g: *Generator) {
+    g.line("fn {g.name}_step(mut m: Machine, s: Search, pos: i64, c: u32, next: i64) {{")
+    g.line("for j in 0..m.run.len {{")
+    g.line("let pc = m.run.pcs[j]")
+    g.dispatch(g.leaves)
+    g.line("}}")
+    g.line("}}")
+}
+
+fn dispatch(g: *Generator, pcs: []i64) {
+    if pcs.len <= inline_ranges {
+        for i, pc in pcs {
+            if i > 0 {
+                g.out.write("}} else ")
+            }
+            g.line("if pc == {pc} {{")
+            g.act(pc)
+        }
+        if pcs.len > 0 {
+            g.line("}}")
+        }
+        return
+    }
+    let mid = pcs.len / 2
+    let split = pcs[mid]
+    g.line("if pc < {split} {{")
+    g.dispatch(pcs[..mid])
+    g.line("}} else {{")
+    g.dispatch(pcs[mid..])
+    g.line("}}")
+}
+
+fn act(g: *Generator, pc: i64) {
+    let inst = g.insts[pc]
+    match inst.op {
+        Done => {
+            g.line("if accepts(m.core, s, pos) {{\nkeep(mut m, j)\nreturn\n}}")
+            return
+        }
+        Char => {
+            g.line("if c == {inst.c} {{")
+        }
+        Class => {
+            let test = g.member(pc)
+            g.line("if {test} {{")
+        }
+        _ => {}
+    }
+    let follow_add = g.adder(pc + 1)
+    g.line("resume(mut m, j)")
+    g.line("{follow_add}(mut m.core, mut m.next, next)")
+    g.line("}}")
+}
+
+fn member(g: *Generator, pc: i64) -> str {
+    let ranges = g.insts[pc].ranges
+    if ranges.len > inline_ranges {
+        return "{g.name}_c{pc}(c)"
+    }
+    within("c", ranges)
+}
+
+fn within(v: str, ranges: []Range) -> str {
+    if ranges.len == 0 {
+        return "false"
+    }
+    var terms: []str = []
+    for r in ranges {
+        if r.lo == r.hi {
+            push(mut terms, "{v} == {r.lo}")
+        } else if r.lo == 0 {
+            push(mut terms, "{v} <= {r.hi}")
+        } else {
+            push(mut terms, "{v} >= {r.lo} && {v} <= {r.hi}")
+        }
+    }
+    text.join(terms, " || ")
+}
+
+fn class_function(g: *Generator, pc: i64) {
+    g.line("fn {g.name}_c{pc}(c: u32) -> bool {{")
+    g.search(g.insts[pc].ranges, true)
+    g.line("}}")
+}
+
+fn search(g: *Generator, ranges: []Range, tail: bool) {
+    if ranges.len <= inline_ranges {
+        let test = within("c", ranges)
+        if tail {
+            g.line(test)
+        } else {
+            g.line("return {test}")
+        }
+        return
+    }
+    let mid = ranges.len / 2
+    let split = ranges[mid].lo
+    g.line("if c < {split} {{")
+    g.search(ranges[..mid], false)
+    g.line("}}")
+    g.search(ranges[mid..], tail)
+}
+
+fn add(g: *Generator, pc: i64) {
+    let add_name = g.adder(pc)
+    g.line("fn {add_name}(mut core: Core, mut q: Queue, pos: i64) {{")
+    g.line("let at = q.sparse[{pc}]")
+    g.line("if at < q.len && q.pcs[at] == {pc} {{\nreturn\n}}")
+    if !g.insts[pc].leaf() {
+        g.mark(pc)
+    }
+    g.expand(pc)
+    g.line("}}")
+}
+
+fn mark(g: *Generator, pc: i64) -> str {
+    let k = g.temp("k")
+    g.line("let {k} = q.len")
+    g.line("q.sparse[{pc}] = {k}")
+    g.line("q.pcs[{k}] = {pc}")
+    g.line("q.len = {k} + 1")
+    k
+}
+
+fn follow(g: *Generator, pc: i64) {
+    if g.called[pc] {
+        let call = g.adder(pc)
+        g.line("{call}(mut core, mut q, pos)")
+        return
+    }
+    g.expand(pc)
+}
+
+fn expand(g: *Generator, pc: i64) {
+    let inst = g.insts[pc]
+    if inst.leaf() {
+        let k = g.mark(pc)
+        g.line("for i in 0..core.width {{\nq.slots[{k} * core.width + i] = core.scratch[i]\n}}")
+        return
+    }
+    match inst.op {
+        Jump => g.follow(inst.x)
+        Split => {
+            g.follow(inst.x)
+            g.follow(inst.y)
+        }
+        Save => {
+            let old = g.temp("o")
+            g.line("let {old} = core.scratch[{inst.x}]")
+            g.line("core.scratch[{inst.x}] = pos")
+            g.follow(pc + 1)
+            g.line("core.scratch[{inst.x}] = {old}")
+        }
+        Check => {
+            let test = holds(inst.look)
+            g.line("if {test} {{")
+            g.follow(pc + 1)
+            g.line("}}")
+        }
+        _ => {}
+    }
+}
+
+fn holds(look: Look) -> str {
+    match look {
+        TextStart => "pos == 0"
+        TextEnd => "pos == core.input.len"
+        EndOrFinalNewline => "pos == core.input.len || pos == core.input.len - 1 && core.input[pos] == 10"
+        LineStart => "pos == 0 || core.input[pos - 1] == 10"
+        LineEnd => "pos == core.input.len || core.input[pos] == 10"
+        WordBoundary => "word_before(core.input, pos) != word_at(core.input, pos)"
+        NotWordBoundary => "word_before(core.input, pos) == word_at(core.input, pos)"
+    }
+}
+
+fn first(g: *Generator) -> []Range {
+    var seen = slices.repeat([false], g.insts.len)
+    var ranges: []Range = []
+    var work = [0]
+    seen[0] = true
+    for work.len > 0 {
+        let pc = work[work.len - 1]
+        truncate(mut work, work.len - 1)
+        let inst = g.insts[pc]
+        match inst.op {
+            Done => return []
+            Char => push(mut ranges, Range { lo: inst.c, hi: inst.c })
+            Class => {
+                for r in inst.ranges {
+                    push(mut ranges, r)
+                }
+            }
+            _ => {}
+        }
+        for to in inst.epsilons(pc) {
+            if !seen[to] {
+                seen[to] = true
+                push(mut work, to)
+            }
+        }
+    }
+    let narrowed = ascii(normalize(ranges))
+    if narrowed.len == 1 && narrowed[0].lo == 0 && narrowed[0].hi == 127 {
+        return []
+    }
+    var widened = narrowed
+    push(mut widened, Range { lo: 128, hi: 255 })
+    normalize(widened)
+}
+
+fn ascii(ranges: []Range) -> []Range {
+    var out: []Range = []
+    for r in ranges {
+        if r.lo <= 127 {
+            push(mut out, Range { lo: r.lo, hi: math.min(r.hi, 127) })
+        }
+    }
+    out
+}
+
+fn skip(g: *Generator) {
+    if g.stops.len == 0 {
+        return
+    }
+    let test = within("b", g.stops)
+    g.line("fn {g.name}_skip(input: str, from: i64) -> i64 {{")
+    g.line("var i = from")
+    g.line("for i < input.len {{")
+    g.line("let b = input[i]")
+    g.line("if {test} {{\nreturn i\n}}")
+    g.line("i += 1")
+    g.line("}}")
+    g.line("i")
+    g.line("}}")
+}

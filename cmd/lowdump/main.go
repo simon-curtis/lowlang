@@ -16,7 +16,8 @@ const usage = `usage:
   lowdump ast [-privileged] <file.low>
   lowdump check [-windows] <file.low|dir>
   lowdump ir [-windows] [-unoptimised] <file.low|dir>
-  lowdump asm [-windows] <file.low|dir>`
+  lowdump asm [-windows] <file.low|dir>
+  lowdump regex <patterns.txt>`
 
 func main() {
 	out := bufio.NewWriter(os.Stdout)
@@ -61,6 +62,9 @@ func run(out io.Writer, args []string) error {
 			return err
 		}
 		astDumper{out}.file(f)
+		return nil
+	case "regex":
+		dumpRegexCommand(out, src)
 		return nil
 	}
 	return fmt.Errorf("%s", usage)
