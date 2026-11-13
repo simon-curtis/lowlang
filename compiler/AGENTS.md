@@ -7,9 +7,10 @@
 - `compiler/low.mod` marks the project root, so `import lexer` loads `compiler/lexer/`.
 - One Go package `internal/<name>` becomes one module `compiler/<name>/`, keeping the Go file names with a `.low` extension.
 - `compiler/lowdump/` and `cmd/lowdump/` are the same dump tool in Low and in Go. Each stage adds one command to both, in its own file, printing that stage's output as text or writing it as bytes.
-
-- `compiler/low/` is the `low` command: `build`, `run`, `asm`, `ir`, `lint`, `doc` and `version`. `version` prints `compiler/low/version.txt`. The command has no `dev` or `lsp`, so its usage text lists neither.
-- `compiler/lowtest/` is the fixture harness. `/tmp/low build compiler/lowtest -o /tmp/lowtest`, then `/tmp/lowtest <low binary> [run|examples|fail|lint|windows]... [-filter text]` from the repository root checks any `low` binary against the sidecar files, using only its command line. `.maxrss` is sampled from `/proc` every millisecond.
+- `compiler/low/` is the `low` command: `build`, `run`, `asm`, `ir`, `lint`, `doc`, `dev`, `lsp` and `version`. `version` prints `compiler/low/version.txt`. `dev` runs `compiler/hot` and `lsp` runs `compiler/lsp`; `compiler/compiler/overlay.low` holds the language server's unsaved text and is passed down as state.
+- `compiler/lowfuzz/`, `compiler/tablegen/`, `compiler/vkgen/`, `compiler/wlgen/`, `compiler/shadergen/` and `compiler/bench/` are the Low tools of the same names in `cmd/`. `lowfuzz` builds each case in a child process through its hidden `__build` command. `bench` compares `low` with `bun`.
+- `compiler/lowtest/` is the fixture harness. `/tmp/low build compiler/lowtest -o /tmp/lowtest`, then `/tmp/lowtest <low binary> [run|examples|fail|lint|windows]... [-filter text]` from the repository root checks any `low` binary against the sidecar files, using only its command line. `compiler/peakrss` and `lowtest` sample `.maxrss` from `/proc` every millisecond.
+- `compiler/tests/<name>/` holds the `std/testing` program for the Go tests of `internal/<name>` (`low` for `cmd/low`, `ui` for `internal/uitest`). Run one with `/tmp/low run compiler/tests/<name>` from the repository root. The `asm` and `link` oracle tests skip unless the binutils and LLVM versions `compiler/oracletool` pins are installed.
 
 ## Build and compare
 
