@@ -1,0 +1,535 @@
+import emit
+import ident
+import std/slices
+import std/text
+import std/xml
+
+pub enum Error {
+    Failed(message: str)
+}
+
+pub struct Protocol {
+    pub name: str
+    pub interfaces: []Interface
+}
+
+pub struct Interface {
+    pub name: str
+    pub version: i64
+    pub requests: []Message
+    pub events: []Message
+    pub enums: []Enum
+}
+
+pub struct Message {
+    pub name: str = ""
+    pub kind: str = ""
+    pub since: i64 = 0
+    pub args: []Arg = []
+}
+
+pub struct Arg {
+    pub name: str = ""
+    pub kind: str = ""
+    pub interface_name: str = ""
+    pub allow_null: bool = false
+}
+
+pub struct Enum {
+    pub name: str
+    pub entries: []Entry
+}
+
+pub struct Entry {
+    pub name: str
+    pub value: str
+}
+
+pub struct Signature {
+    pub code: str
+    pub types: []str
+}
+
+struct Generator {
+    lines: emit.Lines
+    interfaces: [str: bool]
+    names: ident.Reserved
+}
+
+struct EventParams {
+    types: []str
+    params: []str
+}
+
+fn c_type(kind: str) -> str {
+    match kind {
+        "int" => "i32"
+        "uint" => "u32"
+        "fixed" => "i32"
+        "string" => "ptr[u8]"
+        "object" => "ptr"
+        "new_id" => "ptr"
+        "array" => "ptr"
+        "fd" => "i32"
+        _ => ""
+    }
+}
+
+fn signature_code(kind: str) -> str {
+    match kind {
+        "int" => "i"
+        "uint" => "u"
+        "fixed" => "f"
+        "string" => "s"
+        "object" => "o"
+        "new_id" => "n"
+        "array" => "a"
+        "fd" => "h"
+        _ => ""
+    }
+}
+
+fn xml_failure(e: xml.Error) -> Error {
+    Failed(emit.xml_message(e))
+}
+
+fn attribute_text(e: *xml.Element, name: str) -> str {
+    emit.attribute_text(e, name)
+}
+
+fn attribute_count(e: *xml.Element, name: str) -> i64 ! Error {
+    let raw = text.trim(attribute_text(e, name))
+    if raw == "" {
+        return 0
+    }
+    text.parse_int(raw) or fail Failed("strconv.ParseInt: parsing {text.quote(raw)}: invalid syntax")
+}
+
+fn attribute_flag(e: *xml.Element, name: str) -> bool ! Error {
+    let raw = text.trim(attribute_text(e, name))
+    match raw {
+        "" => false
+        "1" => true
+        "t" => true
+        "T" => true
+        "TRUE" => true
+        "true" => true
+        "True" => true
+        "0" => false
+        "f" => false
+        "F" => false
+        "FALSE" => false
+        "false" => false
+        "False" => false
+        _ => fail Failed("strconv.ParseBool: parsing {text.quote(raw)}: invalid syntax")
+    }
+}
+
+pub fn parse(data: []u8) -> Protocol ! Error {
+    let root = xml.parse(data) catch xml_failure
+    let name = attribute_text(root, "name")
+    if name == "" {
+        fail Failed("not a Wayland protocol: missing <protocol name>")
+    }
+    var interfaces: []Interface = []
+    for element in xml.children(root, "interface") {
+        let parsed = read_interface(element)?
+        push(mut interfaces, parsed)
+    }
+    Protocol { name, interfaces }
+}
+
+fn read_interface(e: *xml.Element) -> Interface ! Error {
+    let version = attribute_count(e, "version")?
+    let requests = read_messages(e, "request")?
+    let events = read_messages(e, "event")?
+    var enums: []Enum = []
+    for element in xml.children(e, "enum") {
+        push(mut enums, read_enum(element))
+    }
+    Interface { name: attribute_text(e, "name"), version, requests, events, enums }
+}
+
+fn read_messages(e: *xml.Element, tag: str) -> []Message ! Error {
+    var messages: []Message = []
+    for element in xml.children(e, tag) {
+        let message = read_message(element)?
+        push(mut messages, message)
+    }
+    messages
+}
+
+fn read_message(e: *xml.Element) -> Message ! Error {
+    let since = attribute_count(e, "since")?
+    var args: []Arg = []
+    for element in xml.children(e, "arg") {
+        let arg = read_arg(element)?
+        push(mut args, arg)
+    }
+    Message { name: attribute_text(e, "name"), kind: attribute_text(e, "type"), since, args }
+}
+
+fn read_arg(e: *xml.Element) -> Arg ! Error {
+    let allow_null = attribute_flag(e, "allow-null")?
+    Arg {
+        name: attribute_text(e, "name")
+        kind: attribute_text(e, "type")
+        interface_name: attribute_text(e, "interface")
+        allow_null
+    }
+}
+
+fn read_enum(e: *xml.Element) -> Enum {
+    var entries: []Entry = []
+    for element in xml.children(e, "entry") {
+        let name = attribute_text(element, "name")
+        let value = attribute_text(element, "value")
+        push(mut entries, Entry { name, value })
+    }
+    Enum { name: attribute_text(e, "name"), entries }
+}
+
+pub fn generate(protocols: []Protocol) -> str ! Error {
+    var g = Generator { lines: emit.lines(), interfaces: [:], names: ident.reserved() }
+    var all: []Interface = []
+    for p in protocols {
+        for i in p.interfaces {
+            if g.interfaces[i.name] != none {
+                fail Failed("interface {i.name} is declared twice")
+            }
+            g.interfaces[i.name] = true
+            push(mut all, i)
+        }
+    }
+    references(g, all)?
+    prologue(mut g)
+    table(mut g, all)
+    for i in all {
+        fill(mut g, i)
+        requests(mut g, i)
+        listener(mut g, i)
+        enums(mut g, i)
+    }
+    emit.string(g.lines)
+}
+
+fn references(g: Generator, all: []Interface) ! Error {
+    for i in all {
+        for m in slices.concat(i.requests, i.events) {
+            for a in m.args {
+                if a.interface_name != "" && g.interfaces[a.interface_name] == none {
+                    fail Failed("{i.name}.{m.name} refers to interface {a.interface_name}, which no given protocol declares")
+                }
+                if c_type(a.kind) == "" {
+                    fail Failed("{i.name}.{m.name} argument {a.name} has unknown type {a.kind}")
+                }
+            }
+        }
+    }
+}
+
+fn camel(name: str) -> str {
+    var out: []str = []
+    for part in text.split(name, '_') {
+        if part == "" {
+            continue
+        }
+        push(mut out, "{text.upper(part[..1])}{part[1..]}")
+    }
+    text.join(out, "")
+}
+
+fn line(mut g: Generator, content: str) {
+    emit.line(mut g.lines, content)
+}
+
+fn prologue_declarations() -> []str {
+    [
+        "fn wl_display_connect(name: ptr[u8]) -> ptr"
+        "fn wl_display_disconnect(display: ptr)"
+        "fn wl_display_roundtrip(display: ptr) -> i32"
+        "fn wl_display_dispatch(display: ptr) -> i32"
+        "fn wl_display_dispatch_pending(display: ptr) -> i32"
+        "fn wl_display_flush(display: ptr) -> i32"
+        "fn wl_display_get_fd(display: ptr) -> i32"
+        "fn wl_display_prepare_read(display: ptr) -> i32"
+        "fn wl_display_read_events(display: ptr) -> i32"
+        "fn wl_display_cancel_read(display: ptr)"
+        "fn wl_display_get_error(display: ptr) -> i32"
+        "fn wl_proxy_destroy(proxy: ptr)"
+        "fn wl_proxy_get_version(proxy: ptr) -> u32"
+        "fn wl_proxy_marshal_flags(proxy: ptr, opcode: u32, interface: ptr, version: u32, flags: u32, ...) -> ptr"
+        "fn wl_proxy_add_listener(proxy: ptr, listener: ptr, data: ptr) -> i32"
+    ]
+}
+
+fn prologue(mut g: Generator) {
+    line(mut g, "extern \"wayland-client\" {{")
+    for decl in prologue_declarations() {
+        line(mut g, "    {decl}")
+    }
+    line(mut g, "}}")
+    line(mut g, "")
+    line(mut g, "extern \"c\" {{")
+    line(mut g, "    fn malloc(n: i64) -> ptr")
+    line(mut g, "    fn free(p: ptr)")
+    line(mut g, "}}")
+    line(mut g, "")
+    line(mut g, "extern struct WlInterface {{")
+    line(mut g, "    name: ptr[u8]")
+    line(mut g, "    version: i32")
+    line(mut g, "    method_count: i32")
+    line(mut g, "    methods: ptr")
+    line(mut g, "    event_count: i32")
+    line(mut g, "    events: ptr")
+    line(mut g, "}}")
+    line(mut g, "")
+    line(mut g, "extern struct WlMessage {{")
+    line(mut g, "    name: ptr[u8]")
+    line(mut g, "    signature: ptr[u8]")
+    line(mut g, "    types: ptr")
+    line(mut g, "}}")
+    line(mut g, "")
+    line(mut g, "struct WlMemory {{")
+    line(mut g, "    blocks: []ptr")
+    line(mut g, "}}")
+    line(mut g, "")
+    line(mut g, "fn wl_alloc(m: *WlMemory, n: i64) -> ptr {{")
+    line(mut g, "    let p = malloc(n)")
+    line(mut g, "    m.blocks.push(p)")
+    line(mut g, "    p")
+    line(mut g, "}}")
+    line(mut g, "")
+    line(mut g, "fn wl_c_string(m: *WlMemory, s: str) -> ptr[u8] {{")
+    line(mut g, "    let p: ptr[u8] = wl_alloc(m, s.len + 1)")
+    line(mut g, "    let bytes = view(p, s.len + 1)")
+    line(mut g, "    for i in 0..s.len {{")
+    line(mut g, "        bytes[i] = s[i]")
+    line(mut g, "    }}")
+    line(mut g, "    bytes[s.len] = 0")
+    line(mut g, "    p")
+    line(mut g, "}}")
+    line(mut g, "")
+    line(mut g, "fn wl_types(m: *WlMemory, entries: []ptr) -> ptr {{")
+    line(mut g, "    let p: ptr[ptr] = wl_alloc(m, 8 * entries.len + 8)")
+    line(mut g, "    let slots = view(p, entries.len)")
+    line(mut g, "    for i in 0..entries.len {{")
+    line(mut g, "        slots[i] = entries[i]")
+    line(mut g, "    }}")
+    line(mut g, "    p")
+    line(mut g, "}}")
+    line(mut g, "")
+    line(mut g, "fn wl_message(m: *WlMemory, name: str, signature: str, types: ptr) -> WlMessage {{")
+    line(mut g, "    WlMessage {{ name: wl_c_string(m, name), signature: wl_c_string(m, signature), types }}")
+    line(mut g, "}}")
+    line(mut g, "")
+}
+
+fn table(mut g: Generator, all: []Interface) {
+    line(mut g, "struct Interfaces {{")
+    line(mut g, "    memory: *WlMemory")
+    for i in all {
+        line(mut g, "    {i.name}: ptr")
+    }
+    line(mut g, "}}")
+    line(mut g, "")
+    line(mut g, "fn interfaces() -> Interfaces {{")
+    line(mut g, "    let memory = new(WlMemory {{ blocks: [] }})")
+    line(mut g, "    let ifs = Interfaces {{")
+    line(mut g, "        memory")
+    for i in all {
+        line(mut g, "        {i.name}: wl_alloc(memory, 40)")
+    }
+    line(mut g, "    }}")
+    for i in all {
+        line(mut g, "    wl_fill_{i.name}(ifs)")
+    }
+    line(mut g, "    ifs")
+    line(mut g, "}}")
+    line(mut g, "")
+    line(mut g, "fn release_interfaces(ifs: Interfaces) {{")
+    line(mut g, "    for p in ifs.memory.blocks {{")
+    line(mut g, "        free(p)")
+    line(mut g, "    }}")
+    line(mut g, "    ifs.memory.blocks = []")
+    line(mut g, "}}")
+    line(mut g, "")
+}
+
+pub fn signature(m: Message) -> Signature {
+    var code: []str = []
+    var types: []str = []
+    if m.since > 1 {
+        push(mut code, "{m.since}")
+    }
+    for a in m.args {
+        if a.allow_null {
+            push(mut code, "?")
+        }
+        if a.kind == "new_id" && a.interface_name == "" {
+            push(mut code, "sun")
+            push(mut types, "null")
+            push(mut types, "null")
+            push(mut types, "null")
+            continue
+        }
+        push(mut code, signature_code(a.kind))
+        if a.interface_name != "" {
+            push(mut types, "ifs.{a.interface_name}")
+            continue
+        }
+        push(mut types, "null")
+    }
+    Signature { code: text.join(code, ""), types }
+}
+
+fn messages(mut g: Generator, kind: str, msgs: []Message) {
+    let size = 24 * if msgs.len > 1 { msgs.len } else { 1 }
+    line(mut g, "    let {kind}: ptr[WlMessage] = wl_alloc(ifs.memory, {size})")
+    if msgs.len == 0 {
+        return
+    }
+    line(mut g, "    let {kind}_view = view({kind}, {msgs.len})")
+    for k, m in msgs {
+        let sig = signature(m)
+        let list = if sig.types.len > 0 { "[{text.join(sig.types, ", ")}]" } else { "[]" }
+        line(mut g, "    let {kind}_types{k}: []ptr = {list}")
+        line(mut g, "    {kind}_view[{k}] = wl_message(ifs.memory, {text.quote(m.name)}, {text.quote(sig.code)}, wl_types(ifs.memory, {kind}_types{k}))")
+    }
+}
+
+fn fill(mut g: Generator, i: Interface) {
+    line(mut g, "fn wl_fill_{i.name}(ifs: Interfaces) {{")
+    messages(mut g, "methods", i.requests)
+    messages(mut g, "events", i.events)
+    line(mut g, "    let target: ptr[WlInterface] = ifs.{i.name}")
+    line(mut g, "    store(target, WlInterface {{ name: wl_c_string(ifs.memory, {text.quote(i.name)}), version: {i.version}, method_count: {i.requests.len}, methods, event_count: {i.events.len}, events }})")
+    line(mut g, "}}")
+    line(mut g, "")
+}
+
+fn new_id(m: Message) -> Arg? {
+    for a in m.args {
+        if a.kind == "new_id" {
+            return a
+        }
+    }
+    none
+}
+
+fn requests(mut g: Generator, i: Interface) {
+    let self_name = ident.ident(g.names, i.name)
+    var destroy = false
+    for opcode, m in i.requests {
+        request(mut g, i, self_name, opcode, m)
+        destroy = destroy || m.name == "destroy"
+    }
+    if !destroy && i.name != "wl_display" {
+        line(mut g, "fn {i.name}_destroy({self_name}: ptr) {{")
+        line(mut g, "    wl_proxy_destroy({self_name})")
+        line(mut g, "}}")
+        line(mut g, "")
+    }
+}
+
+fn request(mut g: Generator, i: Interface, self_name: str, opcode: i64, m: Message) {
+    let name = "{i.name}_{m.name}"
+    let created = new_id(m)
+    let creates = match created {
+        some(_) => true
+        none => false
+    }
+    let id = created ?? Arg {}
+    var params = ["{self_name}: ptr"]
+    if creates && id.interface_name != "" {
+        params = slices.concat(["ifs: Interfaces"], params)
+    }
+    var values: []str = []
+    for a in m.args {
+        if a.kind == "new_id" && a.interface_name == "" {
+            push(mut params, "interface: ptr")
+            push(mut params, "version: u32")
+            push(mut values, "description.name")
+            push(mut values, "version")
+            push(mut values, "null")
+        } else if a.kind == "new_id" {
+            push(mut values, "null")
+        } else {
+            let argument = ident.ident(g.names, a.name)
+            push(mut params, "{argument}: {c_type(a.kind)}")
+            push(mut values, argument)
+        }
+    }
+    let result = if creates { " -> ptr" } else { "" }
+    line(mut g, "fn {name}({text.join(params, ", ")}){result} {{")
+    var target = "null"
+    var version = "wl_proxy_get_version({self_name})"
+    if creates && id.interface_name == "" {
+        line(mut g, "    let described: ptr[WlInterface] = interface")
+        line(mut g, "    let description = load(described)")
+        target = "interface"
+        version = "version"
+    } else if creates {
+        target = "ifs.{id.interface_name}"
+    }
+    if version != "version" {
+        line(mut g, "    let version = {version}")
+    }
+    let flags = if m.kind == "destructor" { 1 } else { 0 }
+    var call = "wl_proxy_marshal_flags({self_name}, {opcode}, {target}, version, {flags}"
+    if values.len > 0 {
+        call = "{call}, {text.join(values, ", ")}"
+    }
+    line(mut g, "    {call})")
+    line(mut g, "}}")
+    line(mut g, "")
+}
+
+fn event_params(g: Generator, m: Message) -> EventParams {
+    var types = ["ptr", "ptr"]
+    var params = ["data: ptr", "proxy: ptr"]
+    for a in m.args {
+        push(mut types, c_type(a.kind))
+        push(mut params, "{ident.ident(g.names, a.name)}: {c_type(a.kind)}")
+    }
+    EventParams { types, params }
+}
+
+fn listener(mut g: Generator, i: Interface) {
+    if i.events.len == 0 || i.name == "wl_display" {
+        return
+    }
+    let listener_name = "{camel(i.name)}Listener"
+    for m in i.events {
+        let parameters = event_params(g, m)
+        line(mut g, "fn {i.name}_{m.name}_ignore({text.join(parameters.params, ", ")}) {{")
+        line(mut g, "}}")
+        line(mut g, "")
+    }
+    line(mut g, "extern struct {listener_name} {{")
+    for m in i.events {
+        let parameters = event_params(g, m)
+        line(mut g, "    {ident.ident(g.names, m.name)}: extern fn({text.join(parameters.types, ", ")}) = {i.name}_{m.name}_ignore")
+    }
+    line(mut g, "}}")
+    line(mut g, "")
+    let self_name = ident.ident(g.names, i.name)
+    let slots = 8 * i.events.len
+    line(mut g, "fn {i.name}_add_listener(ifs: Interfaces, {self_name}: ptr, listener: {listener_name}, data: ptr) -> i32 {{")
+    line(mut g, "    let copy: ptr[{listener_name}] = wl_alloc(ifs.memory, {slots})")
+    line(mut g, "    store(copy, listener)")
+    line(mut g, "    wl_proxy_add_listener({self_name}, copy, data)")
+    line(mut g, "}}")
+    line(mut g, "")
+}
+
+fn enums(mut g: Generator, i: Interface) {
+    for e in i.enums {
+        for entry in e.entries {
+            line(mut g, "const {i.name}_{e.name}_{entry.name}: u32 = {entry.value}")
+        }
+        if e.entries.len > 0 {
+            line(mut g, "")
+        }
+    }
+}

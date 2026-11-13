@@ -1,0 +1,401 @@
+import std/builder
+import std/slices
+import std/text
+
+const block_shift = 6
+const block_size = 1 << block_shift
+const block_mask = block_size - 1
+const hangul_base = 0xAC00
+const hangul_l_base = 0x1100
+const hangul_v_base = 0x1161
+const hangul_t_base = 0x11A7
+const hangul_l_count = 19
+const hangul_v_count = 21
+const hangul_t_count = 28
+const hangul_n_count = hangul_v_count * hangul_t_count
+const hangul_count = hangul_l_count * hangul_n_count
+
+const canonical_field = 0
+const compat_field = 1
+const fold_field = 2
+const mapping_fields = 3
+
+const word_size = 4
+const mapping_unit = word_size
+const u16_width = 2
+const record_class_offset = 0
+const record_length_offset = 1
+const record_reference_offset = record_length_offset + mapping_fields
+const record_size = record_reference_offset + mapping_fields * u16_width
+const composition_first_offset = 0
+const composition_second_offset = composition_first_offset + mapping_unit
+const composition_result_offset = composition_second_offset + mapping_unit
+const composition_size = composition_result_offset + mapping_unit
+
+pub const normalization_layout_file = "normalization_layout.low"
+
+pub fn unicode_tables() -> []str {
+    ["stage1.bin", "stage2.bin", "records.bin", "mappings.bin", "compositions.bin"]
+}
+
+struct Character {
+    class: i64
+    compatible: bool
+    mapping: []i64
+}
+
+struct Database {
+    chars: [i64: Character]
+    folds: [i64: []i64]
+    excluded: [i64: bool]
+    canonical: [i64: []i64]
+    compat: [i64: []i64]
+}
+
+struct Record {
+    class: i64
+    canonical: str
+    compat: str
+    fold: str
+}
+
+fn record_key(r: Record) -> str {
+    "{r.class},{r.canonical.len},{r.compat.len},{r.canonical}{r.compat}{r.fold}"
+}
+
+fn generate_unicode(dir: str, output: str) ! Error {
+    let db = new(Database {
+        chars: [:]
+        folds: [:]
+        excluded: [:]
+        canonical: [:]
+        compat: [:]
+    })
+    each_line("{dir}/UnicodeData.txt", fn(fields: []str) ! Error { read_character(db, fields)? })?
+    each_line("{dir}/CaseFolding.txt", fn(fields: []str) ! Error { read_folding(db, fields)? })?
+    each_line("{dir}/DerivedNormalizationProps.txt", fn(fields: []str) ! Error { read_exclusion(db, fields)? })?
+    for c in db.chars {
+        db.canonical[c] = decompose(db, c, false)
+        db.compat[c] = decompose(db, c, true)
+    }
+    let sections = tables(db)?
+    write_sections(output, sections)?
+}
+
+fn prefixed(base: str, e: Error) -> Error {
+    match e {
+        Failed(message) => Error.Failed("{base}: {message}")
+        Usage => Error.Usage
+    }
+}
+
+fn each_line(path: str, handle: fn([]str) ! Error) ! Error {
+    let data = read_source(path)?
+    let base = path_base(path)
+    for raw in text.lines(data) {
+        let line = text.cut(raw, "#").before
+        if text.trim(line) == "" {
+            continue
+        }
+        var fields = text.split(line, ';')
+        for i, f in fields {
+            fields[i] = text.trim(f)
+        }
+        handle(fields) catch {
+            e => fail prefixed(base, e)
+        }
+    }
+}
+
+fn parse_code(s: str) -> i64 ! Error {
+    let v = text.parse_uint(s, 16) or fail Failed("strconv.ParseUint: parsing {text.quote(s)}: invalid syntax")
+    if v > 0xFFFFFFFF {
+        fail Failed("strconv.ParseUint: parsing {text.quote(s)}: value out of range")
+    }
+    v
+}
+
+fn parse_codes(s: str) -> []i64 ! Error {
+    var out: []i64 = []
+    for field in text.fields(s) {
+        push(mut out, parse_code(field)?)
+    }
+    out
+}
+
+fn read_character(db: *Database, fields: []str) ! Error {
+    if fields.len < 6 {
+        fail Failed("short UnicodeData line {fields}")
+    }
+    if text.ends_with(fields[1], "First>") || text.ends_with(fields[1], "Last>") {
+        return
+    }
+    let c = parse_code(fields[0])?
+    let class = text.parse_int(fields[3]) or fail Failed("strconv.Atoi: parsing {text.quote(fields[3])}: invalid syntax")
+    var decomposition = fields[5]
+    let compatible = text.starts_with(decomposition, "<")
+    if compatible {
+        decomposition = text.cut(decomposition, ">").after
+    }
+    let mapping = parse_codes(decomposition)?
+    db.chars[c] = Character { class, compatible, mapping }
+}
+
+fn read_folding(db: *Database, fields: []str) ! Error {
+    if fields.len < 3 {
+        fail Failed("short CaseFolding line {fields}")
+    }
+    if fields[1] != "C" && fields[1] != "F" {
+        return
+    }
+    let c = parse_code(fields[0])?
+    let mapping = parse_codes(fields[2])?
+    db.folds[c] = mapping
+}
+
+fn read_exclusion(db: *Database, fields: []str) ! Error {
+    if fields.len < 2 {
+        fail Failed("short DerivedNormalizationProps line {fields}")
+    }
+    if fields[1] != "Full_Composition_Exclusion" {
+        return
+    }
+    let cut = text.cut(fields[0], "..")
+    let first = cut.before
+    var last = cut.after
+    if !cut.found {
+        last = first
+    }
+    let from = parse_code(first)?
+    let to = parse_code(last)?
+    for c in from..to + 1 {
+        db.excluded[c] = true
+    }
+}
+
+fn decompose(db: *Database, c: i64, compat: bool) -> []i64 {
+    if c >= hangul_base && c < hangul_base + hangul_count {
+        let index = c - hangul_base
+        var out = [hangul_l_base + index / hangul_n_count, hangul_v_base + index % hangul_n_count / hangul_t_count]
+        let t = index % hangul_t_count
+        if t != 0 {
+            push(mut out, hangul_t_base + t)
+        }
+        return out
+    }
+    let ch = db.chars[c] ?? Character { class: 0, compatible: false, mapping: [] }
+    if ch.mapping.len == 0 || (ch.compatible && !compat) {
+        return [c]
+    }
+    var out: []i64 = []
+    for part in ch.mapping {
+        for piece in decompose(db, part, compat) {
+            push(mut out, piece)
+        }
+    }
+    out
+}
+
+fn record_of(db: *Database, c: i64, pool: *SequencePool) -> Record ! Error {
+    let ch = db.chars[c] ?? Character { class: 0, compatible: false, mapping: [] }
+    let canonical = pool_mapping(pool, c, db.canonical[c] ?? [])?
+    let compat = pool_mapping(pool, c, db.compat[c] ?? [])?
+    var fold = ""
+    match db.folds[c] {
+        some(seq) => {
+            fold = pool_add(pool, seq)?
+        }
+        none => {}
+    }
+    Record { class: ch.class, canonical, compat, fold }
+}
+
+struct SequencePool {
+    data: []u8
+    offsets: [str: i64]
+}
+
+fn sequence_key(seq: []i64) -> str {
+    var key = builder.builder()
+    for c in seq {
+        builder.write_char(mut key, u32(c))
+    }
+    builder.to_str(key)
+}
+
+fn pool_mapping(p: *SequencePool, c: i64, seq: []i64) -> str ! Error {
+    if seq.len == 0 || (seq.len == 1 && seq[0] == c) {
+        return ""
+    }
+    pool_add(p, seq)?
+}
+
+fn pool_add(p: *SequencePool, seq: []i64) -> str ! Error {
+    let key = sequence_key(seq)
+    if p.offsets[key] != none {
+        return key
+    }
+    let offset = p.data.len / 4
+    if offset + seq.len > 0xFFFF || seq.len > 0xFF {
+        fail Failed("sequence pool overflows 16-bit offsets")
+    }
+    p.offsets[key] = offset
+    for c in seq {
+        append_u32(mut p.data, c)
+    }
+    key
+}
+
+fn pool_reference(p: *SequencePool, key: str) -> i64 {
+    if key == "" {
+        return 0
+    }
+    p.offsets[key] ?? 0
+}
+
+fn tables(db: *Database) -> []Section ! Error {
+    let pool = new(SequencePool { data: [], offsets: [:] })
+    var records = [Record { class: 0, canonical: "", compat: "", fold: "" }]
+    let ids: [str: i64] = [record_key(records[0]): 0]
+    var limit = 0
+    let per_code: [i64: i64] = [:]
+    var codes: []i64 = []
+    for c in db.chars {
+        push(mut codes, c)
+    }
+    slices.sort(mut codes)
+    for c in codes {
+        let r = record_of(db, c, pool)?
+        let key = record_key(r)
+        var id = ids[key] ?? -1
+        if id < 0 {
+            id = records.len
+            ids[key] = id
+            push(mut records, r)
+        }
+        if id != 0 {
+            per_code[c] = id
+            if c + 1 > limit {
+                limit = c + 1
+            }
+        }
+    }
+    if records.len > 0xFFFF {
+        fail Failed("{records.len} records overflow 16-bit ids")
+    }
+    let stages = build_trie(per_code, limit)?
+    var record_bytes: []u8 = []
+    for r in records {
+        for b in encode_record(pool, r) {
+            push(mut record_bytes, b)
+        }
+    }
+    let composition_bytes = compositions(db)
+    var sections = named_sections(unicode_tables(), [stages.stage1, stages.stage2, record_bytes, pool.data, composition_bytes])
+    let layout = bytes(normalization_layout_source())
+    push(mut sections, Section { name: normalization_layout_file, data: layout })
+    sections
+}
+
+fn encode_record(p: *SequencePool, r: Record) -> []u8 {
+    var out = zeros(record_size)
+    out[record_class_offset] = u8(r.class)
+    let keys = [r.canonical, r.compat, r.fold]
+    for field, key in keys {
+        out[record_length_offset + field] = u8(text.char_count(key))
+        let reference = record_reference_offset + field * u16_width
+        put_u16(mut out, reference, pool_reference(p, key))
+    }
+    out
+}
+
+pub fn normalization_layout_source() -> str {
+    let constants = [
+        low_constant("trie_block_shift", block_shift, LowType.Int)
+        low_constant("trie_block_mask", block_mask, LowType.Word)
+        low_constant("record_size", record_size, LowType.Int)
+        low_constant("record_class_offset", record_class_offset, LowType.Int)
+        low_constant("record_length_offset", record_length_offset, LowType.Int)
+        low_constant("record_reference_offset", record_reference_offset, LowType.Int)
+        low_constant("record_reference_width", u16_width, LowType.Int)
+        low_constant("canonical_field", canonical_field, LowType.Int)
+        low_constant("compat_field", compat_field, LowType.Int)
+        low_constant("fold_field", fold_field, LowType.Int)
+        low_constant("mapping_unit", mapping_unit, LowType.Int)
+        low_constant("composition_size", composition_size, LowType.Int)
+        low_constant("composition_first_offset", composition_first_offset, LowType.Int)
+        low_constant("composition_second_offset", composition_second_offset, LowType.Int)
+        low_constant("composition_result_offset", composition_result_offset, LowType.Int)
+        low_constant("hangul_base", hangul_base, LowType.CodePoint)
+        low_constant("hangul_count", hangul_count, LowType.Word)
+        low_constant("hangul_l_base", hangul_l_base, LowType.CodePoint)
+        low_constant("hangul_v_base", hangul_v_base, LowType.CodePoint)
+        low_constant("hangul_t_base", hangul_t_base, LowType.CodePoint)
+        low_constant("hangul_l_count", hangul_l_count, LowType.Word)
+        low_constant("hangul_v_count", hangul_v_count, LowType.Word)
+        low_constant("hangul_t_count", hangul_t_count, LowType.Word)
+        low_constant("hangul_n_count", hangul_n_count, LowType.Word)
+    ]
+    layout_source(constants, unicode_tables())
+}
+
+struct Stages {
+    stage1: []u8
+    stage2: []u8
+}
+
+fn build_trie(per_code: [i64: i64], limit: i64) -> Stages ! Error {
+    let blocks = (limit + block_size - 1) / block_size
+    var stage1: []u8 = []
+    var stage2: []u8 = []
+    let seen: [str: i64] = [:]
+    for b in 0..blocks {
+        var block: []u8 = []
+        for i in 0..block_size {
+            append_u16(mut block, per_code[b * block_size + i] ?? 0)
+        }
+        let block_key = str(block)
+        var index = seen[block_key] ?? -1
+        if index < 0 {
+            index = stage2.len / (2 * block_size)
+            seen[block_key] = index
+            for byte in block {
+                push(mut stage2, byte)
+            }
+        }
+        if index > 0xFFFF {
+            fail Failed("trie block index overflows 16 bits")
+        }
+        append_u16(mut stage1, index)
+    }
+    Stages { stage1, stage2 }
+}
+
+struct Composition {
+    first: i64
+    second: i64
+    composite: i64
+}
+
+fn compositions(db: *Database) -> []u8 {
+    var pairs: []Composition = []
+    for c, ch in db.chars {
+        if ch.compatible || ch.mapping.len != 2 || db.excluded[c] != none {
+            continue
+        }
+        push(mut pairs, Composition { first: ch.mapping[0], second: ch.mapping[1], composite: c })
+    }
+    slices.sort_by(mut pairs, fn(a: Composition, b: Composition) -> bool {
+        if a.first != b.first {
+            return a.first < b.first
+        }
+        a.second < b.second
+    })
+    var out: []u8 = []
+    for p in pairs {
+        append_u32(mut out, p.first)
+        append_u32(mut out, p.second)
+        append_u32(mut out, p.composite)
+    }
+    out
+}

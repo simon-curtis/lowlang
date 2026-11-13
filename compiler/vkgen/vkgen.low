@@ -1,0 +1,791 @@
+import emit
+import ident
+import std/regex
+import std/slices
+import std/text
+import target
+
+pub enum Error {
+    Failed(message: str)
+}
+
+pub struct SelectedCommand {
+    pub name: str
+    pub system: str = ""
+}
+
+pub struct Selection {
+    pub commands: []SelectedCommand
+    pub extensions: []str
+    pub types: []str
+    pub libraries: [str: str]
+}
+
+pub struct File {
+    pub name: str
+    pub source: str
+}
+
+const shared_file = "vulkan.low"
+
+fn target_file(system: str) -> str {
+    "vulkan_{system}.low"
+}
+
+fn known_system(system: str) -> bool {
+    for o in target.all() {
+        if target.system(o) == system {
+            return true
+        }
+    }
+    false
+}
+
+fn systems() -> str {
+    var names: []str = []
+    for o in target.all() {
+        push(mut names, target.system(o))
+    }
+    text.join(names, ", ")
+}
+
+pub fn parse_selection(source: str) -> Selection ! Error {
+    var s = Selection { commands: [], extensions: [], types: [], libraries: [:] }
+    for i, raw in text.split(source, '\n') {
+        let line = text.trim(raw)
+        if line == "" || text.starts_with(line, "#") {
+            continue
+        }
+        let fields = text.fields(line)
+        let kind = fields[0]
+        let args = fields[1..]
+        let number = i + 1
+        if kind == "command" && args.len == 1 {
+            push(mut s.commands, SelectedCommand { name: args[0] })
+        } else if kind == "command" && args.len == 2 {
+            if !known_system(args[1]) {
+                fail Failed("line {number}: unknown system {text.quote(args[1])}; expected {systems()}")
+            }
+            push(mut s.commands, SelectedCommand { name: args[0], system: args[1] })
+        } else if kind == "extension" && args.len == 1 {
+            push(mut s.extensions, args[0])
+        } else if kind == "type" && args.len == 1 {
+            push(mut s.types, args[0])
+        } else if kind == "library" && args.len == 2 {
+            if !known_system(args[0]) {
+                fail Failed("line {number}: unknown system {text.quote(args[0])}; expected {systems()}")
+            }
+            if s.libraries[args[0]] != none {
+                fail Failed("line {number}: library for {args[0]} is already named")
+            }
+            s.libraries[args[0]] = args[1]
+        } else {
+            fail Failed("line {number}: expected \"command NAME [SYSTEM]\", \"type NAME\", \"extension NAME\" or \"library SYSTEM NAME\", found {text.quote(line)}")
+        }
+    }
+    s
+}
+
+fn base_type(name: str) -> str {
+    match name {
+        "uint32_t" => "u32"
+        "int32_t" => "i32"
+        "uint64_t" => "i64"
+        "int64_t" => "i64"
+        "uint16_t" => "u16"
+        "int16_t" => "u16"
+        "uint8_t" => "u8"
+        "int8_t" => "u8"
+        "char" => "u8"
+        "float" => "f32"
+        "double" => "f64"
+        "size_t" => "i64"
+        "int" => "i32"
+        _ => ""
+    }
+}
+
+fn base_size(name: str) -> i64 {
+    match name {
+        "u32" => 4
+        "i32" => 4
+        "i64" => 8
+        "u16" => 2
+        "u8" => 1
+        "f32" => 4
+        "f64" => 8
+        "ptr" => 8
+        _ => 0
+    }
+}
+
+struct Value {
+    name: str
+    value: i64
+    ok: bool
+    alias: str
+}
+
+struct Generator {
+    reg: Registry
+    types: [str: Type]
+    commands: [str: Command]
+    constants: [str: Enum]
+    values: [str: []Value]
+    widths: [str: str]
+    emitted: [str: bool]
+    order: []str
+    enum_use: [str: bool]
+    names: ident.Reserved
+    lines: emit.Lines
+}
+
+struct ParamType {
+    type: str
+    mutable: bool
+}
+
+struct Layout {
+    size: i64
+    align: i64
+}
+
+struct ArrayField {
+    decl: Decl
+    elem: str
+}
+
+pub fn generate(reg: Registry, sel: Selection) -> []File ! Error {
+    let g = new(Generator {
+        reg
+        types: [:]
+        commands: [:]
+        constants: [:]
+        values: [:]
+        widths: [:]
+        emitted: [:]
+        order: []
+        enum_use: [:]
+        names: ident.reserved()
+        lines: emit.lines()
+    })
+    libraries(sel)?
+    index(g)?
+    collect_values(g, sel.extensions)?
+    for c in sel.commands {
+        let cmd = command(g, c.name)?
+        require_command(g, cmd) catch {
+            Failed(message) => fail Failed("{c.name}: {message}")
+        }
+    }
+    for name in sel.types {
+        require(g, name)?
+    }
+    slices.sort(mut g.order)
+    prologue(g)
+    for name in g.order {
+        emit_type(g, name) catch {
+            Failed(message) => fail Failed("{name}: {message}")
+        }
+    }
+    emit_constants(g)?
+    var files = [File { name: shared_file, source: emit.string(g.lines) }]
+    for o in target.all() {
+        let system = target.system(o)
+        let source = emit_commands(g, sel, system)?
+        let name = target_file(system)
+        push(mut files, File { name, source })
+    }
+    files
+}
+
+fn libraries(sel: Selection) ! Error {
+    for o in target.all() {
+        let library = sel.libraries[target.system(o)] ?? ""
+        if library == "" {
+            fail Failed("no \"library {target.system(o)} NAME\" line for the {target.string(o)} target")
+        }
+    }
+}
+
+fn index(g: *Generator) ! Error {
+    for t in g.reg.types {
+        var name = t.name
+        if name == "" {
+            name = t.name_inside
+        }
+        if name == "" {
+            name = t.proto_name
+        }
+        if name == "" || !for_vulkan(t.api) {
+            continue
+        }
+        match g.types[name] {
+            some(_) => {}
+            none => {
+                g.types[name] = t
+            }
+        }
+    }
+    for c in g.reg.commands {
+        if !for_vulkan(c.api) {
+            continue
+        }
+        var name = c.name
+        if name == "" {
+            let d = parse_decl(c.proto.inner) catch {
+                Failed(message) => fail Failed("command prototype {text.quote(c.proto.inner)}: {message}")
+            }
+            name = d.name
+        }
+        g.commands[name] = c
+    }
+    for e in g.reg.enums {
+        if e.name == "API Constants" {
+            for c in e.values {
+                g.constants[c.name] = c
+            }
+            continue
+        }
+        var width = "i32"
+        if e.kind == "bitmask" {
+            width = "u32"
+            if e.bit_width == "64" {
+                width = "i64"
+            }
+        }
+        g.widths[e.name] = width
+    }
+}
+
+fn collect_values(g: *Generator, extensions: []str) ! Error {
+    for e in g.reg.enums {
+        if e.name == "API Constants" {
+            continue
+        }
+        for v in e.values {
+            if !for_vulkan(v.api) {
+                continue
+            }
+            add_value(g, e.name, v, 0)?
+        }
+    }
+    for f in g.reg.features {
+        if !for_vulkan(f.api) {
+            continue
+        }
+        for r in f.requires {
+            if !for_vulkan(r.api) {
+                continue
+            }
+            for v in r.enums {
+                if v.extends != "" {
+                    add_value(g, v.extends, v, 0)?
+                }
+            }
+        }
+    }
+    for want in extensions {
+        let ext = find_extension(g, want)?
+        let number = text.parse_int(ext.number) or fail Failed("extension {want} has no number")
+        for r in ext.requires {
+            if !for_vulkan(r.api) {
+                continue
+            }
+            for v in r.enums {
+                if v.extends != "" {
+                    add_value(g, v.extends, v, number)?
+                }
+            }
+        }
+    }
+}
+
+fn find_extension(g: *Generator, name: str) -> Extension ! Error {
+    for x in g.reg.extensions {
+        if x.name == name {
+            return x
+        }
+    }
+    fail Failed("unknown extension {name}")
+}
+
+fn add_value(g: *Generator, enum_name: str, e: Enum, extension: i64) ! Error {
+    let existing: []Value = g.values[enum_name] ?? []
+    for have in existing {
+        if have.name == e.name {
+            return
+        }
+    }
+    let evaluated = enum_value(e, extension) catch {
+        Failed(message) => fail Failed("{e.name}: {message}")
+    }
+    var updated = existing
+    push(mut updated, Value { name: e.name, value: evaluated.value, ok: evaluated.ok, alias: e.alias })
+    g.values[enum_name] = updated
+}
+
+fn command(g: *Generator, name: str) -> Command ! Error {
+    var found = g.commands[name]
+    for true {
+        let cmd = found ?? fail Failed("unknown command {name}")
+        if cmd.alias == "" {
+            return cmd
+        }
+        found = g.commands[cmd.alias]
+    }
+    fail Failed("unknown command {name}")
+}
+
+fn resolve(g: *Generator, name: str) -> Type? {
+    var current = g.types[name]
+    for true {
+        let found = current ?? return none
+        if found.alias == "" {
+            return found
+        }
+        current = g.types[found.alias]
+    }
+    none
+}
+
+fn require_command(g: *Generator, cmd: Command) ! Error {
+    let proto = parse_decl(cmd.proto.inner)?
+    require(g, proto.type)?
+    for p in cmd.params {
+        if !for_vulkan(p.api) {
+            continue
+        }
+        let d = parse_decl(p.inner)?
+        require(g, d.type)?
+    }
+}
+
+fn require(g: *Generator, name: str) ! Error {
+    if base_type(name) != "" || name == "void" || (g.emitted[name] ?? false) {
+        return
+    }
+    let t = resolve(g, name) ?? fail Failed("unknown type {name}")
+    g.emitted[name] = true
+    if t.category == "struct" || t.category == "union" {
+        push(mut g.order, name)
+        for m in t.members {
+            if !for_vulkan(m.api) {
+                continue
+            }
+            let d = parse_decl(m.inner)?
+            if d.bit_field {
+                fail Failed("{name}.{d.name} is a bit-field")
+            }
+            require(g, d.type)?
+        }
+    } else if t.category == "handle" {
+        push(mut g.order, name)
+    } else if t.category == "enum" {
+        g.enum_use[name] = true
+    } else if t.category == "bitmask" {
+        var bits = t.requires
+        if bits == "" {
+            bits = t.bit_values
+        }
+        if bits != "" {
+            g.enum_use[bits] = true
+        }
+    }
+}
+
+fn low_type(g: *Generator, name: str) -> str ! Error {
+    let base = base_type(name)
+    if base != "" {
+        return base
+    }
+    let t = resolve(g, name) ?? fail Failed("unknown type {name}")
+    if t.category == "basetype" {
+        let type_tag = regex.generated("<type[^>]*>(.*?)</type>")
+        let found = regex.find(type_tag, t.inner) ?? return "ptr"
+        let under = regex.group(found, 1) ?? ""
+        return low_type(g, under)?
+    }
+    if t.category == "bitmask" {
+        if text.contains(t.inner, "VkFlags64") {
+            return "i64"
+        }
+        return "u32"
+    }
+    if t.category == "enum" {
+        let width = g.widths[t.name] ?? ""
+        if width != "" {
+            return width
+        }
+        return "i32"
+    }
+    if t.category == "handle" || t.category == "struct" || t.category == "union" {
+        return name
+    }
+    "ptr"
+}
+
+fn pointee(g: *Generator, d: Decl) -> str ! Error {
+    if d.type == "void" || d.stars > 1 {
+        return "ptr"
+    }
+    if d.type == "char" {
+        return "ptr[u8]"
+    }
+    let t = low_type(g, d.type)?
+    if t == "ptr" {
+        return "ptr"
+    }
+    "ptr[{t}]"
+}
+
+fn member_type(g: *Generator, d: Decl) -> str ! Error {
+    if d.stars > 0 {
+        return pointee(g, d)?
+    }
+    low_type(g, d.type)?
+}
+
+fn default_for(t: str) -> str {
+    if text.starts_with(t, "ptr") {
+        return "null"
+    }
+    if t == "f32" || t == "f64" {
+        return "0.0"
+    }
+    if base_size(t) > 0 {
+        return "0"
+    }
+    "{t} {{}}"
+}
+
+fn integer(s: str) -> i64? {
+    let n = text.parse_int(s) or {
+        return none
+    }
+    n
+}
+
+fn dimension(g: *Generator, d: str) -> i64 ! Error {
+    match integer(d) {
+        some(n) => return n
+        none => {}
+    }
+    let c = g.constants[d] ?? fail Failed("unknown array size {d}")
+    parse_number(c.value)?
+}
+
+fn count(g: *Generator, d: Decl) -> i64 ! Error {
+    var n = 1
+    for dim in d.dims {
+        let k = dimension(g, dim)?
+        n *= k
+    }
+    n
+}
+
+fn larger(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+fn layout(g: *Generator, name: str, stars: i64) -> Layout ! Error {
+    if stars > 0 {
+        return Layout { size: 8, align: 8 }
+    }
+    let t = low_type(g, name)?
+    let size = base_size(t)
+    if size > 0 {
+        return Layout { size, align: size }
+    }
+    let ty = resolve(g, name) ?? fail Failed("unknown type {name}")
+    if ty.category == "handle" {
+        return Layout { size: 8, align: 8 }
+    }
+    var total = 0
+    var align = 1
+    let union = ty.category == "union"
+    for m in ty.members {
+        if !for_vulkan(m.api) {
+            continue
+        }
+        let d = parse_decl(m.inner)?
+        let n = count(g, d)?
+        let member = layout(g, d.type, d.stars)?
+        align = larger(align, member.align)
+        if union {
+            total = larger(total, member.size * n)
+            continue
+        }
+        total = (total + member.align - 1) / member.align * member.align + member.size * n
+    }
+    Layout { size: (total + align - 1) / align * align, align }
+}
+
+fn line(g: *Generator, content: str) {
+    emit.line(mut g.lines, content)
+}
+
+fn prologue(g: *Generator) {
+    line(g, "fn vk_make_api_version(variant: u32, major: u32, minor: u32, patch: u32) -> u32 {{")
+    line(g, "    (variant << 29) | (major << 22) | (minor << 12) | patch")
+    line(g, "}}")
+    line(g, "")
+    line(g, "fn vk_string(bytes: []u8) -> str {{")
+    line(g, "    var n = 0")
+    line(g, "    for n < bytes.len && bytes[n] != 0 {{")
+    line(g, "        n += 1")
+    line(g, "    }}")
+    line(g, "    str(bytes[0..n])")
+    line(g, "}}")
+    line(g, "")
+}
+
+fn emit_type(g: *Generator, name: str) ! Error {
+    let t = resolve(g, name) ?? fail Failed("unknown type {name}")
+    if t.category == "handle" {
+        var field = "i64"
+        var default = "0"
+        if text.contains(t.inner, "VK_DEFINE_HANDLE") {
+            field = "ptr"
+            default = "null"
+        }
+        line(g, "extern struct {name} {{")
+        line(g, "    handle: {field} = {default}")
+        line(g, "}}")
+        line(g, "")
+        return
+    }
+    var members = t.members
+    if t.category == "union" {
+        let best = widest(g, t)?
+        members = [best]
+    }
+    var arrays: []ArrayField = []
+    line(g, "extern struct {name} {{")
+    for m in members {
+        if !for_vulkan(m.api) {
+            continue
+        }
+        var d = parse_decl(m.inner)?
+        let ty = member_type(g, d)?
+        var default = default_for(ty)
+        if d.name == "sType" && m.values != "" {
+            let v = structure_type(g, m.values)?
+            default = "{v}"
+        }
+        if d.dims.len == 0 {
+            line(g, "    {ident.ident(g.names, d.name)}: {ty} = {default}")
+            continue
+        }
+        let n = count(g, d)?
+        for i in 0..n {
+            line(g, "    {d.name}_{i}: {ty} = {default}")
+        }
+        d.dims = ["{n}"]
+        push(mut arrays, ArrayField { decl: d, elem: ty })
+    }
+    line(g, "}}")
+    line(g, "")
+    for a in arrays {
+        accessor(g, name, a)
+    }
+}
+
+fn accessor(g: *Generator, owner: str, a: ArrayField) {
+    let n = integer(a.decl.dims[0]) ?? 0
+    var fields: []str = []
+    for i in 0..n {
+        push(mut fields, "s.{a.decl.name}_{i}")
+    }
+    let list = text.join(fields, ", ")
+    if a.decl.type == "char" && a.decl.stars == 0 {
+        line(g, "fn {owner}_{a.decl.name}(s: {owner}) -> str {{")
+        line(g, "    let bytes: []u8 = [{list}]")
+        line(g, "    vk_string(bytes)")
+        line(g, "}}")
+        line(g, "")
+        return
+    }
+    line(g, "fn {owner}_{a.decl.name}(s: {owner}) -> []{a.elem} {{")
+    line(g, "    [{list}]")
+    line(g, "}}")
+    line(g, "")
+}
+
+fn widest(g: *Generator, t: Type) -> Member ! Error {
+    var best = Member {}
+    var size = -1
+    for m in t.members {
+        if !for_vulkan(m.api) {
+            continue
+        }
+        let d = parse_decl(m.inner)?
+        let n = count(g, d)?
+        let member = layout(g, d.type, d.stars)?
+        if member.size * n > size {
+            best = m
+            size = member.size * n
+        }
+    }
+    best
+}
+
+fn structure_type(g: *Generator, name: str) -> i64 ! Error {
+    let known: []Value = g.values["VkStructureType"] ?? []
+    for v in known {
+        if v.name == name && v.ok {
+            return v.value
+        }
+    }
+    fail Failed("unknown structure type {name}")
+}
+
+fn first_optional(optional: str) -> bool {
+    text.cut(optional, ",").before == "true"
+}
+
+fn param_type(g: *Generator, p: Param, d: Decl) -> ParamType ! Error {
+    if d.stars == 0 {
+        let t = low_type(g, d.type)?
+        return ParamType { type: t, mutable: false }
+    }
+    if d.stars == 2 && d.type == "void" && !d.constant {
+        return ParamType { type: "ptr", mutable: true }
+    }
+    if d.stars > 1 || d.type == "void" || (d.type == "char" && d.constant) {
+        let t = pointee(g, d)?
+        return ParamType { type: t, mutable: false }
+    }
+    if p.length != "" || (d.constant && first_optional(p.optional)) {
+        let t = pointee(g, d)?
+        return ParamType { type: t, mutable: false }
+    }
+    let t = low_type(g, d.type)?
+    ParamType { type: t, mutable: true }
+}
+
+fn emit_commands(g: *Generator, sel: Selection, system: str) -> str ! Error {
+    var out = emit.lines()
+    let library = sel.libraries[system] ?? ""
+    emit.line(mut out, "extern \"{library}\" {{")
+    for c in sel.commands {
+        if c.system != "" && c.system != system {
+            continue
+        }
+        let text = declaration(g, c.name)?
+        emit.line(mut out, "    {text}")
+    }
+    emit.line(mut out, "}}")
+    emit.string(out)
+}
+
+fn declaration(g: *Generator, name: str) -> str ! Error {
+    let cmd = command(g, name)?
+    let proto = parse_decl(cmd.proto.inner)?
+    var params: []str = []
+    for p in cmd.params {
+        if !for_vulkan(p.api) {
+            continue
+        }
+        let d = parse_decl(p.inner)?
+        let resolved = param_type(g, p, d) catch {
+            Failed(message) => fail Failed("{name}.{d.name}: {message}")
+        }
+        let prefix = if resolved.mutable { "mut " } else { "" }
+        push(mut params, "{prefix}{ident.ident(g.names, d.name)}: {resolved.type}")
+    }
+    var result = ""
+    if proto.type != "void" || proto.stars > 0 {
+        let t = member_type(g, proto)?
+        result = " -> {t}"
+    }
+    "fn {name}({text.join(params, ", ")}){result}"
+}
+
+pub fn literal(v: i64, t: str) -> str {
+    if t == "u32" {
+        return "{u32(v)}"
+    }
+    if v == -9223372036854775807 - 1 {
+        return "-9223372036854775807 - 1"
+    }
+    "{v}"
+}
+
+fn integer_constant_type(kind: str) -> str {
+    match kind {
+        "uint32_t" => "u32"
+        "uint64_t" => "i64"
+        "int32_t" => "i32"
+        _ => ""
+    }
+}
+
+fn constant(g: *Generator, name: str, t: str, body: str) {
+    if t == "i64" {
+        line(g, "const {name} = {body}")
+        return
+    }
+    line(g, "const {name}: {t} = {body}")
+}
+
+fn emit_constants(g: *Generator) ! Error {
+    var wanted: [str: bool] = [:]
+    for name, used in g.enum_use {
+        wanted[name] = true
+    }
+    wanted["VkStructureType"] = true
+    wanted["VkResult"] = true
+    var enums: []str = []
+    for name, used in wanted {
+        push(mut enums, name)
+    }
+    slices.sort(mut enums)
+    var done: [str: bool] = [:]
+    for enum_name in enums {
+        let width = g.widths[enum_name] ?? ""
+        let t = if width == "" { "i32" } else { width }
+        var known: [str: Value] = [:]
+        let listed: []Value = g.values[enum_name] ?? []
+        for v in listed {
+            known[v.name] = v
+        }
+        for v in listed {
+            var resolved = v
+            for !resolved.ok && resolved.alias != "" {
+                resolved = known[resolved.alias] ?? Value { name: "", value: 0, ok: false, alias: "" }
+            }
+            if !resolved.ok || (done[v.name] ?? false) {
+                continue
+            }
+            done[v.name] = true
+            constant(g, v.name, t, literal(resolved.value, t))
+        }
+    }
+    var names: []str = []
+    for name, c in g.constants {
+        push(mut names, name)
+    }
+    slices.sort(mut names)
+    for name in names {
+        let c = g.constants[name] ?? Enum {}
+        if c.alias != "" {
+            continue
+        }
+        if c.kind == "float" {
+            constant(g, name, "f32", text.trim_suffix(text.trim_suffix(c.value, "F"), "f"))
+        } else if integer_constant_type(c.kind) != "" {
+            integer_constant(g, name, c)?
+        } else {
+            fail Failed("API constant {name} has unsupported type {text.quote(c.kind)}")
+        }
+    }
+}
+
+fn integer_constant(g: *Generator, name: str, c: Enum) ! Error {
+    let v = parse_number(c.value) catch {
+        Failed(message) => fail Failed("API constant {name}: {message}")
+    }
+    let t = integer_constant_type(c.kind)
+    constant(g, name, t, literal(v, t))
+}
