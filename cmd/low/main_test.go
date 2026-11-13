@@ -163,6 +163,7 @@ func windowsLauncher(t *testing.T) launcher {
 		fixturetest.Unavailable(t, "wine is not installed")
 	}
 	env := append(os.Environ(), "WINEDEBUG=-all", "DISPLAY=", "WAYLAND_DISPLAY=")
+	startWineServer(env)
 	prefix := exec.Command(wine, "wineboot", "--init")
 	prefix.Env = env
 	if out, err := prefix.CombinedOutput(); err != nil {
@@ -190,6 +191,16 @@ func withoutWineDiagnostics(stderr []byte) []byte {
 		}
 	}
 	return kept
+}
+
+func startWineServer(env []string) {
+	path, err := exec.LookPath("wineserver")
+	if err != nil {
+		return
+	}
+	server := exec.Command(path, "--persistent=60")
+	server.Env = env
+	_ = server.Run()
 }
 
 func runWindowsFixture(t *testing.T, launch launcher, program fixturetest.Program, sidecars fixture.Sidecars) {
