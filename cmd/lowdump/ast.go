@@ -451,6 +451,10 @@ func (d astDumper) expr(depth int, label string, e ast.Expr) {
 		d.line(depth, label, fmt.Sprintf("Or %s%s", at(e.Pos), typed("type", e.Type)))
 		d.expr(depth+1, "x: ", e.X)
 		d.expr(depth+1, "fallback: ", e.Fallback)
+	case *ast.When:
+		d.line(depth, label, fmt.Sprintf("When %s%s", at(e.Pos), typed("type", e.Type)))
+		d.expr(depth+1, "x: ", e.X)
+		d.expr(depth+1, "cond: ", e.Cond)
 	default:
 		panic(fmt.Sprintf("lowdump: unhandled expression %T", e))
 	}
