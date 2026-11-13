@@ -1,0 +1,582 @@
+import ir
+import std/slices
+
+const spill_cost_modes = 3
+
+fn float_regs() -> []str {
+    ["xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"]
+}
+
+fn fixed(r: *Vreg) -> bool {
+    r.konst != none || r.pool != none || r.frame != none || r.mem != none || r.pinned != ""
+}
+
+fn first(r: *Vreg) -> i64 {
+    r.ranges[0].start
+}
+
+fn last(r: *Vreg) -> i64 {
+    r.ranges[r.ranges.len - 1].end
+}
+
+fn add_range(r: *Vreg, start: i64, end: i64) {
+    let n = r.ranges.len
+    if n > 0 && r.ranges[n - 1].start <= end {
+        r.ranges[n - 1].start = min_int(r.ranges[n - 1].start, start)
+        r.ranges[n - 1].end = max_int(r.ranges[n - 1].end, end)
+        return
+    }
+    push(mut r.ranges, Segment { start, end })
+}
+
+fn live_across(r: *Vreg, pos: i64) -> bool {
+    for s in r.ranges {
+        if s.start < pos && pos < s.end {
+            return true
+        }
+    }
+    false
+}
+
+fn overlaps(a: []Segment, b: []Segment) -> bool {
+    var i = 0
+    var j = 0
+    for i < a.len && j < b.len {
+        if a[i].start < b[j].end && b[j].start < a[i].end {
+            return true
+        }
+        if a[i].end < b[j].end {
+            i += 1
+        } else {
+            j += 1
+        }
+    }
+    false
+}
+
+fn terminator_uses(mb: *Mblock) -> []*Vreg {
+    var uses = slices.clone(mb.compare)
+    match mb.control {
+        some(c) => push(mut uses, c)
+        none => {}
+    }
+    slices.concat(uses, mb.results)
+}
+
+fn registers(regs: []*Vreg) -> []*Vreg {
+    var out: []*Vreg = []
+    for r in regs {
+        match r.mem {
+            some(m) => {
+                out = slices.concat(out, registers(pieces(m)))
+            }
+            none => {
+                if !r.fixed() {
+                    push(mut out, r)
+                }
+            }
+        }
+    }
+    out
+}
+
+fn copy_step(pos: i64, copies: []*PhiCopy) -> Step {
+    var st = Step { pos }
+    for c in copies {
+        st.uses = slices.concat(st.uses, registers([c.src]))
+        push(mut st.defs, c.dst)
+    }
+    st
+}
+
+fn number(f: *Mfunc) {
+    var pos = 0
+    for mb in f.blocks {
+        mb.start = pos
+        pos += 2
+        for ins in mb.instrs {
+            ins.pos = pos
+            pos += 2
+        }
+        mb.copy_pos = pos
+        pos += 2
+        mb.end = pos
+        mb.build_steps()
+    }
+}
+
+fn build_steps(mb: *Mblock) {
+    mb.steps = []
+    var params: []*Vreg = []
+    for ins in mb.instrs {
+        if ins.is_param() {
+            push(mut params, dest(ins))
+        }
+    }
+    if params.len > 0 {
+        push(mut mb.steps, Step { pos: mb.start, defs: params })
+    }
+    if mb.heads.len > 0 {
+        push(mut mb.steps, copy_step(mb.start + 1, mb.heads))
+    }
+    for ins in mb.instrs {
+        if ins.is_param() {
+            continue
+        }
+        var st = Step { pos: ins.pos, uses: registers(ins.args) }
+        match ins.dst {
+            some(d) => {
+                st.defs = [d]
+            }
+            none => {}
+        }
+        push(mut mb.steps, st)
+    }
+    if mb.copies.len > 0 {
+        push(mut mb.steps, copy_step(mb.copy_pos, mb.copies))
+    }
+    push(mut mb.steps, Step { pos: mb.end, uses: registers(mb.terminator_uses()) })
+}
+
+fn liveness(f: *Mfunc) {
+    var use: [*Mblock: [*Vreg: bool]] = [:]
+    var def: [*Mblock: [*Vreg: bool]] = [:]
+    for mb in f.blocks {
+        var u: [*Vreg: bool] = [:]
+        var d: [*Vreg: bool] = [:]
+        for st in mb.steps {
+            for r in st.uses {
+                if !(d[r] ?? false) {
+                    u[r] = true
+                }
+            }
+            for r in st.defs {
+                d[r] = true
+            }
+        }
+        use[mb] = u
+        def[mb] = d
+        mb.live_in = [:]
+        mb.live_out = [:]
+    }
+    var changed = true
+    for changed {
+        changed = false
+        var i = f.blocks.len - 1
+        for i >= 0 {
+            if f.blocks[i].propagate(use, def) {
+                changed = true
+            }
+            i -= 1
+        }
+    }
+}
+
+fn propagate(mb: *Mblock, use: [*Mblock: [*Vreg: bool]], def: [*Mblock: [*Vreg: bool]]) -> bool {
+    var changed = false
+    for s in mb.succs {
+        for r in s.live_in {
+            if !(mb.live_out[r] ?? false) {
+                mb.live_out[r] = true
+                changed = true
+            }
+        }
+    }
+    let used = use[mb] ?? [:]
+    for r in used {
+        if !(mb.live_in[r] ?? false) {
+            mb.live_in[r] = true
+            changed = true
+        }
+    }
+    let defined = def[mb] ?? [:]
+    for r in mb.live_out {
+        if !(defined[r] ?? false) && !(mb.live_in[r] ?? false) {
+            mb.live_in[r] = true
+            changed = true
+        }
+    }
+    changed
+}
+
+fn build_ranges(f: *Mfunc) {
+    for r in f.vregs {
+        r.ranges = []
+    }
+    var i = f.blocks.len - 1
+    for i >= 0 {
+        f.blocks[i].build_block_ranges()
+        i -= 1
+    }
+    for r in f.vregs {
+        r.ranges = reversed(r.ranges)
+    }
+}
+
+fn reversed(list: []Segment) -> []Segment {
+    var out: []Segment = []
+    var i = list.len - 1
+    for i >= 0 {
+        push(mut out, list[i])
+        i -= 1
+    }
+    out
+}
+
+fn build_block_ranges(mb: *Mblock) {
+    var open: [*Vreg: i64] = [:]
+    for r in mb.live_out {
+        open[r] = mb.end
+    }
+    var i = mb.steps.len - 1
+    for i >= 0 {
+        let st = mb.steps[i]
+        for d in st.defs {
+            match open[d] {
+                some(end) => {
+                    d.add_range(st.pos, end)
+                    delete(mut open, d)
+                }
+                none => {
+                    d.add_range(st.pos, st.pos + 1)
+                }
+            }
+        }
+        for u in st.uses {
+            if open[u] == none {
+                open[u] = st.pos
+            }
+        }
+        i -= 1
+    }
+    for r, end in open {
+        r.add_range(mb.start, end)
+    }
+}
+
+fn is_call(ins: *Instr) -> bool {
+    ir.is_call(ins.op) && ins.literal == none
+}
+
+fn preserves_registers(ins: *Instr) -> bool {
+    if ins.op != OpRuntime {
+        return false
+    }
+    let rt = ins.value.runtime ?? return false
+    ir.runtime_convention(rt) == CallGrow
+}
+
+fn mark_call_crossings(f: *Mfunc) {
+    var clobbering: []i64 = []
+    var preserving: []i64 = []
+    for mb in f.blocks {
+        for ins in mb.instrs {
+            if ins.preserves_registers() {
+                push(mut preserving, ins.pos)
+            } else if ins.is_call() {
+                push(mut clobbering, ins.pos)
+            }
+        }
+    }
+    for r in f.vregs {
+        r.crosses_preserving = r.crosses_any(preserving)
+        r.crosses_call = r.crosses_any(clobbering) || (r.crosses_preserving && !r.scalar)
+    }
+}
+
+fn crosses_any(r: *Vreg, calls: []i64) -> bool {
+    if calls.len == 0 {
+        return false
+    }
+    for s in r.ranges {
+        let i = slices.lower_bound(calls, s.start + 1)
+        if i < calls.len && calls[i] < s.end {
+            return true
+        }
+    }
+    false
+}
+
+fn is_param(ins: *Instr) -> bool {
+    ins.op == OpParam
+}
+
+struct Allocator {
+    assigned: [str: []*Vreg] = [:]
+    slots: [][]*Vreg = []
+    used: [str: bool] = [:]
+    mode: i64
+}
+
+struct Placement {
+    reg: str
+    spill: i64
+}
+
+struct Outcome {
+    alloc: *Allocator
+    placed: []Placement = []
+    cost: f64 = 0.0
+}
+
+struct Allocation {
+    spills: i64
+    saved: []str
+}
+
+fn spill_cost(mode: i64, r: *Vreg) -> f64 {
+    let weight = f64(r.weight)
+    let length = f64(r.length)
+    match mode {
+        0 => weight
+        1 => weight / length
+        _ => weight / sqrt(length)
+    }
+}
+
+fn measure(r: *Vreg) {
+    r.length = 0
+    for s in r.ranges {
+        r.length += s.end - s.start
+    }
+}
+
+fn allocation_order(f: *Mfunc) -> []*Vreg {
+    var order: []*Vreg = []
+    for r in f.vregs {
+        if r.ranges.len > 0 {
+            r.measure()
+            push(mut order, r)
+        }
+    }
+    slices.sort_stable_by(mut order, fn(x: *Vreg, y: *Vreg) -> bool { x.first() < y.first() })
+    order
+}
+
+fn place(f: *Mfunc, order: []*Vreg, mode: i64) -> Outcome {
+    for r in order {
+        r.reg = ""
+        r.spill = -1
+    }
+    let a = new(Allocator { mode })
+    for r in order {
+        a.assign(r)
+    }
+    var o = Outcome { alloc: a }
+    for r in order {
+        push(mut o.placed, Placement { reg: r.reg, spill: r.spill })
+        if r.reg == "" {
+            o.cost += f64(r.weight)
+        }
+    }
+    for reg in abi_saved() {
+        if a.used[reg] ?? false {
+            o.cost += f64(save_cost)
+        }
+    }
+    o
+}
+
+fn allocate(f: *Mfunc) -> Allocation {
+    f.analyse()
+    f.mark_light()
+    f.weigh()
+    let order = f.allocation_order()
+    var best: Outcome? = none
+    for mode in 0..spill_cost_modes {
+        let o = f.place(order, mode)
+        match best {
+            some(b) => {
+                if o.cost < b.cost {
+                    best = o
+                }
+            }
+            none => {
+                best = o
+            }
+        }
+    }
+    let chosen = best ?? panic("no allocation outcome")
+    for i, r in order {
+        r.reg = chosen.placed[i].reg
+        r.spill = chosen.placed[i].spill
+    }
+    var saved: []str = []
+    for r in abi_saved() {
+        if chosen.alloc.used[r] ?? false {
+            push(mut saved, r)
+        }
+    }
+    Allocation { spills: chosen.alloc.slots.len, saved }
+}
+
+fn candidates(a: *Allocator, cur: *Vreg) -> []str {
+    if cur.float {
+        return float_regs()
+    }
+    if cur.crosses_call && cur.light {
+        return []
+    }
+    if cur.crosses_call {
+        return abi_saved()
+    }
+    if cur.light {
+        return abi_caller()
+    }
+    abi_integers()
+}
+
+fn assign(a: *Allocator, cur: *Vreg) {
+    a.expire(cur.first())
+    if cur.float && (cur.crosses_call || cur.crosses_preserving) {
+        a.spill(cur)
+        return
+    }
+    let regs = a.candidates(cur)
+    for reg in cur.preferred() {
+        if slices.contains(regs, reg) && a.fits(cur, reg) {
+            a.occupy(cur, reg)
+            return
+        }
+    }
+    let reg = a.first_fit(cur, regs)
+    if reg != "" {
+        a.occupy(cur, reg)
+        return
+    }
+    a.displace(cur, regs)
+}
+
+fn fits(a: *Allocator, cur: *Vreg, reg: str) -> bool {
+    a.conflicts(cur, reg).len == 0
+}
+
+fn conflicts(a: *Allocator, cur: *Vreg, reg: str) -> []*Vreg {
+    var found: []*Vreg = []
+    for r in a.assigned[reg] ?? [] {
+        if overlaps(cur.ranges, r.ranges) {
+            push(mut found, r)
+        }
+    }
+    found
+}
+
+fn first_fit(a: *Allocator, cur: *Vreg, regs: []str) -> str {
+    var fallback = ""
+    for reg in regs {
+        if !a.fits(cur, reg) {
+            continue
+        }
+        if cur.avoids(reg) {
+            fallback = reg
+            continue
+        }
+        return reg
+    }
+    fallback
+}
+
+fn avoids(r: *Vreg, reg: str) -> bool {
+    let other = r.avoid ?? return false
+    other.reg == reg
+}
+
+fn cheaper_to_spill(a: *Allocator, r: *Vreg, other: *Vreg) -> bool {
+    let x = spill_cost(a.mode, r)
+    let y = spill_cost(a.mode, other)
+    if x != y {
+        return x < y
+    }
+    r.last() > other.last()
+}
+
+fn displace(a: *Allocator, cur: *Vreg, regs: []str) {
+    var victim: *Vreg? = none
+    for reg in regs {
+        let found = a.conflicts(cur, reg)
+        if found.len != 1 {
+            continue
+        }
+        match victim {
+            some(v) => {
+                if a.cheaper_to_spill(found[0], v) {
+                    victim = found[0]
+                }
+            }
+            none => {
+                victim = found[0]
+            }
+        }
+    }
+    let v = victim ?? {
+        a.spill(cur)
+        return
+    }
+    if !a.cheaper_to_spill(v, cur) {
+        a.spill(cur)
+        return
+    }
+    let reg = v.reg
+    a.assigned[reg] = slices.filter(a.assigned[reg] ?? [], fn(r: *Vreg) -> bool { r != v })
+    v.reg = ""
+    a.spill(v)
+    a.occupy(cur, reg)
+}
+
+fn preferred(r: *Vreg) -> []str {
+    var regs: []str = []
+    if r.hint != "" {
+        push(mut regs, r.hint)
+    }
+    for s in r.sources {
+        if s.reg != "" {
+            push(mut regs, s.reg)
+        }
+    }
+    for s in r.sinks {
+        if s.reg != "" {
+            push(mut regs, s.reg)
+        }
+    }
+    regs
+}
+
+fn expire(a: *Allocator, pos: i64) {
+    for reg in a.assigned {
+        let list = a.assigned[reg] ?? []
+        a.assigned[reg] = slices.filter(list, fn(r: *Vreg) -> bool { r.last() > pos })
+    }
+}
+
+fn occupy(a: *Allocator, r: *Vreg, reg: str) {
+    r.reg = reg
+    a.used[reg] = true
+    var list = a.assigned[reg] ?? []
+    push(mut list, r)
+    a.assigned[reg] = list
+}
+
+fn spill(a: *Allocator, r: *Vreg) {
+    var slot = a.shared_slot(r)
+    if slot < 0 {
+        slot = a.slots.len
+        push(mut a.slots, [])
+    }
+    r.spill = slot
+    var occupants = a.slots[slot]
+    push(mut occupants, r)
+    a.slots[slot] = occupants
+}
+
+fn shared_slot(a: *Allocator, r: *Vreg) -> i64 {
+    for related in r.copy_peers {
+        if related.spill < 0 || related.reg != "" {
+            continue
+        }
+        let free = !slices.any(a.slots[related.spill], fn(occupant: *Vreg) -> bool { overlaps(occupant.ranges, r.ranges) })
+        if free {
+            return related.spill
+        }
+    }
+    -1
+}

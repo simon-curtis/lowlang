@@ -1,0 +1,485 @@
+import ir
+import types
+import std/slices
+
+struct Segment {
+    start: i64
+    end: i64
+}
+
+struct Step {
+    pos: i64
+    uses: []*Vreg = []
+    defs: []*Vreg = []
+}
+
+struct Vreg {
+    konst: i64? = none
+    pool: i64? = none
+    mem: *Address? = none
+    frame: *ir.Value? = none
+    pinned: str = ""
+    float: bool = false
+    light: bool = false
+    ranges: []Segment = []
+    crosses_call: bool = false
+    crosses_preserving: bool = false
+    scalar: bool = false
+    hint: str = ""
+    sources: []*Vreg = []
+    sinks: []*Vreg = []
+    copy_peers: []*Vreg = []
+    avoid: *Vreg? = none
+    reg: str = ""
+    spill: i64 = -1
+    weight: i64 = 0
+    length: i64 = 0
+}
+
+struct Instr {
+    op: ir.Op
+    dst: *Vreg? = none
+    args: []*Vreg = []
+    value: *ir.Value
+    call: *ir.Value? = none
+    pos: i64 = 0
+    negated: bool = false
+    rotate: i64 = 0
+    literal: str? = none
+}
+
+struct PhiCopy {
+    dst: *Vreg
+    src: *Vreg
+}
+
+struct Mblock {
+    label: str
+    kind: ir.Kind
+    poll: bool
+    instrs: []*Instr = []
+    copies: []*PhiCopy = []
+    heads: []*PhiCopy = []
+    light: bool = false
+    succs: []*Mblock = []
+    control: *Vreg? = none
+    table: *ir.JumpTable? = none
+    fused: *ir.Value? = none
+    compare: []*Vreg = []
+    results: []*Vreg = []
+    steps: []Step = []
+    live_in: [*Vreg: bool] = [:]
+    live_out: [*Vreg: bool] = [:]
+    start: i64 = 0
+    copy_pos: i64 = 0
+    end: i64 = 0
+}
+
+struct Mfunc {
+    blocks: []*Mblock = []
+    vregs: []*Vreg = []
+    guard: *Mblock? = none
+}
+
+struct Lowering {
+    func: *Mfunc
+    vregs: [*ir.Value: *Vreg] = [:]
+    blocks: [*ir.Block: *Mblock] = [:]
+    scalar: bool
+}
+
+fn dest(ins: *Instr) -> *Vreg {
+    ins.dst ?? panic("instruction without a destination")
+}
+
+fn lower(f: *ir.Func, prefix: str, scalar: bool, wrap: bool) -> *Mfunc {
+    let l = new(Lowering { func: new(Mfunc {}), scalar })
+    for b in f.blocks {
+        let mb = new(Mblock { label: ".L{prefix}_{b.id}", kind: b.kind, poll: b.poll })
+        l.blocks[b] = mb
+        push(mut l.func.blocks, mb)
+    }
+    for b in f.blocks {
+        l.lower_block(b)
+    }
+    for b in f.blocks {
+        l.phi_copies(b)
+    }
+    if scalar {
+        l.func.simplify_branches()
+        l.func.select_instructions()
+    }
+    l.func.duplicate_returns()
+    if scalar {
+        l.func.rematerialize_frame_addresses()
+    }
+    l.func.rotate_loops()
+    l.func.layout()
+    if wrap {
+        l.func.shrink_wrap()
+    }
+    l.func.hint_function()
+    l.func.settle_floats()
+    l.func.pin_results()
+    l.func
+}
+
+fn hint_function(f: *Mfunc) {
+    for mb in f.blocks {
+        for ins in mb.instrs {
+            ins.hint_instr()
+        }
+        for c in slices.concat(mb.heads, mb.copies) {
+            c.hint_copy()
+        }
+    }
+}
+
+fn hint_copy(c: *PhiCopy) {
+    if c.src.fixed() {
+        return
+    }
+    push(mut c.dst.sources, c.src)
+    push(mut c.src.sinks, c.dst)
+    push(mut c.dst.copy_peers, c.src)
+    push(mut c.src.copy_peers, c.dst)
+}
+
+fn hint_instr(ins: *Instr) {
+    if ins.is_param() {
+        let k = ins.value.aux
+        if k < arg_count {
+            dest(ins).hint = abi_args()[k]
+        }
+        return
+    }
+    if ins.rotate != 0 {
+        dest(ins).sources = [ins.args[0]]
+        return
+    }
+    if ins.two_operand() {
+        ins.hint_operands()
+        return
+    }
+    if ins.preserves_registers() || ins.literal != none {
+        return
+    }
+    if ins.op == OpCall || ins.op == OpRuntime || ins.op == OpSyscall {
+        var args = ins.args
+        var regs = abi_args()
+        if ir.is_indirect(ins.value) {
+            args = args[1..]
+        }
+        if ins.op == OpSyscall {
+            regs = abi_syscall()
+        }
+        let count = min_int(args.len, regs.len)
+        for i in 0..count {
+            args[i].hint = regs[i]
+        }
+    }
+}
+
+fn two_operand(ins: *Instr) -> bool {
+    match ins.op {
+        OpAdd => ins.rotate == 0
+        OpSub => ins.rotate == 0
+        OpMul => ins.rotate == 0
+        OpAnd => ins.rotate == 0
+        OpOr => ins.rotate == 0
+        OpXor => ins.rotate == 0
+        OpShl => ins.rotate == 0
+        OpShr => ins.rotate == 0
+        OpDiv => is_float(ins.value.type)
+        _ => false
+    }
+}
+
+fn hint_operands(ins: *Instr) {
+    let first = ins.args[0]
+    let second = ins.args[1]
+    let dst = dest(ins)
+    dst.sources = [first]
+    match ins.op {
+        OpAdd => push(mut dst.sources, second)
+        OpMul => push(mut dst.sources, second)
+        OpAnd => push(mut dst.sources, second)
+        OpOr => push(mut dst.sources, second)
+        OpXor => push(mut dst.sources, second)
+        _ => {
+            dst.avoid = second
+        }
+    }
+}
+
+fn vreg(l: *Lowering, v: *ir.Value) -> *Vreg {
+    match l.vregs[v] {
+        some(found) => return found
+        none => {}
+    }
+    let r = l.func.new_vreg()
+    r.scalar = v.scalar
+    if l.scalar && v.op == OpSlot {
+        r.frame = v
+    } else if fits_immediate(v) {
+        r.konst = v.aux
+    } else if l.scalar && v.op == OpConst && v.float_bits > 0 {
+        r.pool = v.aux
+        r.float = true
+    } else {
+        r.float = l.scalar && floatable(v)
+    }
+    l.vregs[v] = r
+    r
+}
+
+fn floatable(v: *ir.Value) -> bool {
+    if v.float_bits == 0 {
+        return false
+    }
+    match v.op {
+        OpAdd => true
+        OpSub => true
+        OpMul => true
+        OpDiv => true
+        OpNeg => true
+        OpSqrt => true
+        OpFloor => true
+        OpLoad => true
+        OpParam => true
+        OpResult => true
+        OpPhi => true
+        OpConvert => types.is_float(types.must(v.type))
+        _ => false
+    }
+}
+
+fn takes_float(ins: *Instr, k: i64) -> bool {
+    match ins.op {
+        OpAdd => is_float(ins.value.type)
+        OpSub => is_float(ins.value.type)
+        OpMul => is_float(ins.value.type)
+        OpDiv => is_float(ins.value.type)
+        OpNeg => is_float(ins.value.type)
+        OpEq => is_float(ins.value.type)
+        OpNe => is_float(ins.value.type)
+        OpLt => is_float(ins.value.type)
+        OpLe => is_float(ins.value.type)
+        OpGt => is_float(ins.value.type)
+        OpGe => is_float(ins.value.type)
+        OpConvert => types.is_float(types.must(ins.value.from))
+        OpSqrt => true
+        OpFloor => true
+        OpCall => true
+        OpCCall => true
+        OpRuntime => true
+        OpSyscall => true
+        OpStore => k == 1
+        _ => false
+    }
+}
+
+fn settle_floats(f: *Mfunc) {
+    for mb in f.blocks {
+        for ins in mb.instrs {
+            for k, a in ins.args {
+                if !ins.takes_float(k) {
+                    a.float = false
+                }
+            }
+        }
+        mb.restrict_floats()
+    }
+    f.drop_idle_floats()
+    for r in f.vregs {
+        if r.pool != none && !r.float {
+            r.pool = none
+        }
+        if r.float {
+            r.scalar = true
+        }
+    }
+    for mb in f.blocks {
+        mb.instrs = slices.filter(mb.instrs, fn(ins: *Instr) -> bool { !(ins.op == OpConst && dest(ins).pool != none) })
+    }
+}
+
+fn computes_float(ins: *Instr) -> bool {
+    match ins.op {
+        OpAdd => is_float(ins.value.type)
+        OpSub => is_float(ins.value.type)
+        OpMul => is_float(ins.value.type)
+        OpDiv => is_float(ins.value.type)
+        OpNeg => is_float(ins.value.type)
+        OpEq => is_float(ins.value.type)
+        OpNe => is_float(ins.value.type)
+        OpLt => is_float(ins.value.type)
+        OpLe => is_float(ins.value.type)
+        OpGt => is_float(ins.value.type)
+        OpGe => is_float(ins.value.type)
+        OpConvert => types.is_float(types.must(ins.value.from)) || types.is_float(types.must(ins.value.type))
+        OpSqrt => true
+        OpFloor => true
+        _ => false
+    }
+}
+
+fn drop_idle_floats(f: *Mfunc) {
+    var busy: [*Vreg: bool] = [:]
+    for mb in f.blocks {
+        for ins in mb.instrs {
+            if ins.computes_float() {
+                busy[dest(ins)] = true
+                for a in ins.args {
+                    busy[a] = true
+                }
+            }
+        }
+        match mb.fused {
+            some(fused) => {
+                if is_float(fused.type) {
+                    for r in mb.compare {
+                        busy[r] = true
+                    }
+                }
+            }
+            none => {}
+        }
+    }
+    var changed = true
+    for changed {
+        changed = false
+        for mb in f.blocks {
+            for c in slices.concat(mb.heads, mb.copies) {
+                let dst_busy = busy[c.dst] ?? false
+                let src_busy = busy[c.src] ?? false
+                if c.dst.float && c.src.float && dst_busy != src_busy {
+                    busy[c.dst] = true
+                    busy[c.src] = true
+                    changed = true
+                }
+            }
+        }
+    }
+    for r in f.vregs {
+        if r.float && !(busy[r] ?? false) {
+            r.float = false
+        }
+    }
+}
+
+fn restrict_floats(mb: *Mblock) {
+    match mb.control {
+        some(c) => {
+            c.float = false
+        }
+        none => {}
+    }
+    match mb.fused {
+        some(fused) => {
+            if is_float(fused.type) {
+                return
+            }
+        }
+        none => {}
+    }
+    for r in mb.compare {
+        r.float = false
+    }
+}
+
+fn fits_immediate(v: *ir.Value) -> bool {
+    match v.op {
+        OpConst => v.aux >= -(1 << 31) && v.aux < 1 << 31
+        OpUndef => true
+        _ => false
+    }
+}
+
+fn lowering_immediate(l: *Lowering, v: *ir.Value) -> bool {
+    if !fits_immediate(v) {
+        return false
+    }
+    l.vreg(v)
+    true
+}
+
+fn new_vreg(f: *Mfunc) -> *Vreg {
+    let r = new(Vreg {})
+    push(mut f.vregs, r)
+    r
+}
+
+fn fusible(b: *ir.Block) -> *ir.Value? {
+    if b.kind != If || b.values.len == 0 {
+        return none
+    }
+    let last = b.values[b.values.len - 1]
+    if b.control != last ||!ir.is_compare(last.op) || last.uses != 1 {
+        return none
+    }
+    last
+}
+
+fn lower_block(l: *Lowering, b: *ir.Block) {
+    let mb = l.blocks[b] ?? panic("block without a machine block")
+    mb.fused = fusible(b)
+    mb.table = b.table
+    var call: *ir.Value? = none
+    for v in b.values {
+        if mb.fused == v || v.op == OpPhi || l.lowering_immediate(v) || (v.op == OpParam && v.uses == 0) {
+            continue
+        }
+        let ins = new(Instr { op: v.op, value: v })
+        if ir.is_call(v.op) {
+            call = v
+        } else if v.op == OpResult {
+            ins.call = call
+        }
+        if v.op != OpResult {
+            for arg in v.args {
+                push(mut ins.args, l.vreg(arg))
+            }
+        }
+        if v.op == OpLoad || v.op == OpStore {
+            ins.args[0] = new_address(ins.args[0], v.aux, v.type)
+        }
+        if ir.has_result(v.op) {
+            ins.dst = l.vreg(v)
+        }
+        push(mut mb.instrs, ins)
+    }
+    for s in b.succs {
+        push(mut mb.succs, l.blocks[s] ?? panic("successor without a machine block"))
+    }
+    match mb.fused {
+        some(fused) => {
+            mb.compare = [l.vreg(fused.args[0]), l.vreg(fused.args[1])]
+        }
+        none => {
+            match b.control {
+                some(control) => {
+                    mb.control = l.vreg(control)
+                }
+                none => {}
+            }
+        }
+    }
+    for r in b.results {
+        push(mut mb.results, l.vreg(r))
+    }
+}
+
+fn phi_copies(l: *Lowering, b: *ir.Block) {
+    for v in b.values {
+        if v.op != OpPhi {
+            break
+        }
+        for j, pred in b.preds {
+            let mp = l.blocks[pred] ?? panic("predecessor without a machine block")
+            let dst = l.vreg(v)
+            let src = l.vreg(v.args[j])
+            push(mut mp.copies, new(PhiCopy { dst, src }))
+        }
+    }
+}

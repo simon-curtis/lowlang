@@ -1,0 +1,1223 @@
+import diag
+import ir
+import target
+import types
+import std/builder
+import std/slices
+import std/text
+import std/unicode
+
+fn layout_asm() -> str { embed("../../internal/amd64/layout.asm") }
+fn linux_header() -> str { embed("../../internal/amd64/linux_header.asm") }
+fn linux_runtime() -> str { embed("../../internal/amd64/linux.asm") }
+fn windows_header() -> str { embed("../../internal/amd64/windows_header.asm") }
+fn windows_runtime() -> str { embed("../../internal/amd64/windows.asm") }
+fn runtime_asm() -> str { embed("../../internal/amd64/runtime.asm") }
+fn scheduler_asm() -> str { embed("../../internal/amd64/sched.asm") }
+fn collector_asm() -> str { embed("../../internal/amd64/gc.asm") }
+fn hot_runtime() -> str { embed("../../internal/amd64/hot.asm") }
+
+const function_alignment = 5
+const loop_alignment = 5
+const max_aligned_instrs = 4
+
+pub struct Output {
+    pub asm: str
+    pub funcs: [str: str] = [:]
+}
+
+pub enum Error {
+    HotTarget(str)
+}
+
+pub fn error_message(e: Error) -> str {
+    match e {
+        HotTarget(msg) => msg
+    }
+}
+
+struct Generator {
+    platform: Platform
+    plans: [*ir.CSig: *CPlan] = [:]
+    text: builder.Builder = builder.builder()
+    data: builder.Builder = builder.builder()
+    scope: str = ""
+    labels: i64 = 0
+    data_labels: [str: bool] = [:]
+    previous: Moved = Moved {}
+    table: *FuncTable? = none
+    suffix: str = ""
+    maps: []StackMap = []
+    stubs: []PollStub = []
+    jumps: []JumpTable = []
+    tier: Tier = Baseline
+    cache: *VectorCache? = none
+}
+
+struct Moved {
+    dst: str = ""
+    src: str = ""
+}
+
+struct Frame {
+    gen: *Generator
+    func: *Mfunc
+    saved: []str
+    slots: []i64 = []
+    first_slot: i64 = 0
+    vector_scratch: i64 = 0
+    results: i64
+    size: i64 = 0
+    direct: *Vreg? = none
+    mode: FrameMode
+}
+
+struct StackMap {
+    label: str
+    offsets: []i64 = []
+    segment: bool = false
+}
+
+struct PollStub {
+    label: str
+    resume: str
+}
+
+struct Pmove {
+    dst: str
+    src: str
+    bits: i64? = none
+}
+
+struct Define {
+    name: str
+    value: i64
+}
+
+fn new_generator(platform: Platform, table: *FuncTable?, suffix: str) -> *Generator {
+    new(Generator { platform, table, suffix })
+}
+
+fn hot_init_macro(hot: bool) -> str {
+    if hot {
+        return "\t.macro HOT_INIT\n\tcall rt_hot_init\n\t.endm\n"
+    }
+    "\t.macro HOT_INIT\n\t.endm\n"
+}
+
+fn bit(on: bool) -> i64 {
+    if on {
+        return 1
+    }
+    0
+}
+
+fn write_symbols(mut out: builder.Builder, symbols: []Define) {
+    for s in symbols {
+        out.write("\t.set {s.name}, {s.value}\n")
+    }
+}
+
+pub fn generate(prog: *ir.Program, platform: Platform, table: *FuncTable?) -> Output ! Error {
+    if table != none && platform_os(platform) != target.OS.Linux {
+        fail HotTarget("hot reload needs the {target.string(target.OS.Linux)} target, not {target.string(platform_os(platform))}")
+    }
+    let g = new_generator(platform, table, "")
+    var funcs: [str: str] = [:]
+    var body = builder.builder()
+    for f in prog.funcs {
+        g.text = builder.builder()
+        g.function(f)
+        let part = g.text.to_str()
+        funcs[f.name] = part
+        body.write(part)
+    }
+    g.text = builder.builder()
+    g.start(prog)
+    if table != none {
+        g.trampolines(prog.c_symbols)
+    }
+    for f in prog.funcs {
+        if f.callback {
+            g.thunk(f)
+        }
+    }
+    let dynamic = platform_dynamic(platform, prog)
+    if dynamic {
+        platform_shims(platform, g, prog.c_symbols)
+    }
+    var out = builder.builder()
+    out.write("\t.intel_syntax noprefix\n")
+    write_symbols(mut out, [Define { name: "RT_DYNAMIC", value: bit(dynamic) }])
+    out.write(hot_init_macro(table != none))
+    out.write(layout_asm())
+    out.write(platform_header(platform))
+    out.write(platform_runtime(platform))
+    out.write(scheduler_asm())
+    out.write(runtime_asm())
+    out.write(collector_asm())
+    g.write_maps(mut out)
+    write_cells(mut out, prog.cells)
+    match table {
+        some(t) => t.write_runtime(mut out)
+        none => {}
+    }
+    platform_imports(platform, mut out, prog)
+    out.write("\n\t.section .rodata\n")
+    out.write(g.data.to_str())
+    out.write("\n\t.text\n")
+    out.write(body.to_str())
+    out.write(g.text.to_str())
+    Output { asm: out.to_str(), funcs }
+}
+
+pub fn symbol(name: str, suffix: str) -> str {
+    "fn_{mangle(name)}{suffix}"
+}
+
+fn mangle(name: str) -> str {
+    var b = builder.with_capacity(name.len)
+    var at = 0
+    for at < name.len {
+        let c = name[at]
+        if c < 128 {
+            if c == 95 || c == 46 || (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) {
+                b.write_byte(c)
+            } else {
+                b.write(".{c:x}")
+            }
+            at += 1
+            continue
+        }
+        let r = unicode.decode_rune(name, at)
+        b.write(".{r.code:x}")
+        at += r.size
+    }
+    b.to_str()
+}
+
+fn emit(g: *Generator, line: str) {
+    g.previous = Moved {}
+    g.text.write("\t{line}\n")
+}
+
+fn align(g: *Generator, power: i64) {
+    g.text.write("\t.p2align {power}\n")
+}
+
+fn label(g: *Generator, name: str) {
+    g.previous = Moved {}
+    g.text.write("{name}:\n")
+}
+
+fn new_label(g: *Generator) -> str {
+    g.labels += 1
+    ".L{g.scope}_g{g.labels}"
+}
+
+fn call_target(g: *Generator, f: *ir.Func) -> str {
+    match g.table {
+        some(t) => "qword ptr {t.slot_of(f.name)}"
+        none => symbol(f.name, "")
+    }
+}
+
+fn start(g: *Generator, prog: *ir.Program) {
+    g.scope = "start"
+    g.labels = 0
+    g.emit("PROGRAM_ENTRY {platform_entry(g.platform)}")
+    g.program(prog)
+}
+
+fn program(g: *Generator, prog: *ir.Program) {
+    g.text.write("rt_program:\n")
+    g.emit("push rbp")
+    g.emit("mov rbp, rsp")
+    let main = prog.main ?? panic("program without main")
+    let words = ir.result_words(main)
+    let in_registers = abi_returns_in_registers(words)
+    if !in_registers {
+        g.emit("sub rsp, {abi_aligned_bytes(words)}")
+    }
+    g.emit("call {g.call_target(main)}")
+    match prog.main_err {
+        some(err) => g.exit_on_error(err, in_registers)
+        none => {}
+    }
+    g.emit("xor edi, edi")
+    g.emit("PROGRAM_EXIT")
+}
+
+fn exit_on_error(g: *Generator, err: *types.Type, in_registers: bool) {
+    let exit = g.new_label()
+    var tag = abi_results()[0]
+    var variant = abi_results()[1]
+    if !in_registers {
+        tag = abi_stack_result(0, 0)
+        variant = abi_stack_result(0, 1)
+    }
+    g.emit("cmp {tag}, 0")
+    g.emit("je {exit}")
+    g.emit("mov rax, {variant}")
+    g.emit("lea rcx, [rip+{g.variant_names(err)}]")
+    g.emit("mov rdi, [rcx+8*rax]")
+    g.emit("call rt_error")
+    g.label(exit)
+}
+
+fn variant_names(g: *Generator, enum_type: *types.Type) -> str {
+    let table = g.new_label()
+    var names: []str = []
+    for v in enum_type.variants {
+        push(mut names, g.message_label(v.name))
+    }
+    g.data.write("\t.p2align 3\n{table}:\n\t.quad {text.join(names, ",")}\n")
+    table
+}
+
+fn string_label(g: *Generator, s: str) -> str {
+    var h: u64 = 14695981039346656037
+    for i in 0..s.len {
+        h = h ^ u64(s[i])
+        h = h * 1099511628211
+    }
+    let l = ".Lstr_{h:x}"
+    if g.data_labels[l] ?? false {
+        return l
+    }
+    g.data_labels[l] = true
+    g.data.write("{l}:\n")
+    if s.len == 0 {
+        return l
+    }
+    var bytes: []str = []
+    for i in 0..s.len {
+        push(mut bytes, "{s[i]}")
+    }
+    g.data.write("\t.byte {text.join(bytes, ",")}\n")
+    l
+}
+
+fn embed_label(g: *Generator, path: str, digest: u64) -> str {
+    let l = ".Lembed_{digest:x}"
+    if g.data_labels[l] ?? false {
+        return l
+    }
+    g.data_labels[l] = true
+    g.data.write("\t.p2align 4\n{l}:\n\t.incbin {quote_string(path)}\n")
+    l
+}
+
+pub fn quote_string(s: str) -> str {
+    var out = builder.with_capacity(s.len + 2)
+    out.write_byte(34)
+    for i in 0..s.len {
+        let c = s[i]
+        if c == 34 || c == 92 {
+            out.write_byte(92)
+            out.write_byte(c)
+        } else if c >= 32 && c < 127 {
+            out.write_byte(c)
+        } else {
+            out.write("\\{c / 64}{c / 8 % 8}{c % 8}")
+        }
+    }
+    out.write_byte(34)
+    out.to_str()
+}
+
+fn message_label(g: *Generator, s: str) -> str {
+    let l = g.new_label()
+    g.data.write("\t.p2align 3\n\tMSG_BEGIN {l}\n\t.ascii {diag.quote(s)}\n\tMSG_END\n")
+    l
+}
+
+fn function(g: *Generator, f: *ir.Func) {
+    let sym = symbol(f.name, g.suffix)
+    if !uses_vectors(f) {
+        g.tier = Baseline
+        g.body(f, sym, mangle(f.name), false)
+        return
+    }
+    g.align(function_alignment)
+    g.label(sym)
+    g.emit("cmp byte ptr [rip+rt_avx2], 0")
+    g.emit("jne {sym}.avx2")
+    g.emit("jmp {sym}.sse2")
+    g.tier = Avx2
+    g.body(f, "{sym}.avx2", "{mangle(f.name)}.avx2", true)
+    g.tier = Baseline
+    g.body(f, "{sym}.sse2", "{mangle(f.name)}.sse2", true)
+}
+
+fn body(g: *Generator, f: *ir.Func, sym: str, prefix: str, vectors: bool) {
+    g.scope = prefix
+    g.labels = 0
+    g.cache = none
+    if vectors && g.tier == Avx2 {
+        g.cache = vector_temps(f)
+    }
+    var mf = lower(f, prefix, !vectors, !vectors)
+    var allocation = mf.allocate()
+    var mode = mf.frame_mode(f, allocation.saved, vectors)
+    if mf.guard != none && allocation.saved.len == 0 && mode != DeferredFrame {
+        mf = lower(f, prefix, !vectors, false)
+        allocation = mf.allocate()
+        mode = mf.frame_mode(f, allocation.saved, vectors)
+    }
+    let fr = new(Frame { gen: g, func: mf, mode, saved: allocation.saved, results: abi_results_offset(f.param_words) })
+    var words = allocation.saved.len + allocation.spills
+    fr.first_slot = words + 1
+    for n in f.slots {
+        words += n
+        push(mut fr.slots, words)
+    }
+    if vectors {
+        words += vector_scratch_words
+        fr.vector_scratch = -8 * words
+    }
+    let size = abi_aligned_bytes(words + g.outgoing(f))
+    fr.size = size
+    g.align(function_alignment)
+    g.label(sym)
+    if mode == FullFrame {
+        g.enter_frame(fr)
+        if mf.guard == none {
+            g.save_registers(fr)
+        }
+    }
+    g.params(fr, mf.blocks[0])
+    let emitted = fr.emitted()
+    for i, mb in emitted {
+        var next: *Mblock? = none
+        if i + 1 < emitted.len {
+            next = emitted[i + 1]
+        }
+        g.block(fr, mb, next)
+    }
+    for stub in g.stubs {
+        g.label(stub.label)
+        g.leave_vectors()
+        g.emit("call rt_poll")
+        g.emit("jmp {stub.resume}")
+    }
+    g.stubs = []
+    g.flush_jump_tables()
+}
+
+fn poll(g: *Generator) {
+    let stub = PollStub { label: g.new_label(), resume: g.new_label() }
+    g.emit("TLS_POLL")
+    g.emit("jne {stub.label}")
+    g.label(stub.resume)
+    push(mut g.stubs, stub)
+}
+
+fn outgoing(g: *Generator, f: *ir.Func) -> i64 {
+    var most = 0
+    for b in f.blocks {
+        for v in b.values {
+            if v.op == OpCall {
+                let signature = ir.call_signature(v)
+                var words = abi_stack_words(signature.param_words)
+                if !abi_returns_in_registers(ir.result_words(signature)) {
+                    words += ir.result_words(signature)
+                }
+                most = max_int(most, words)
+            } else if v.op == OpCCall {
+                let sig = v.sig ?? panic("c call without a signature")
+                most = max_int(most, g.plan(sig).outgoing_words())
+            }
+        }
+    }
+    most
+}
+
+fn loc(fr: *Frame, r: *Vreg) -> str {
+    if fr.direct == r {
+        return "rax"
+    }
+    if r.pinned != "" {
+        return r.pinned
+    }
+    match r.konst {
+        some(k) => return "{k}"
+        none => {}
+    }
+    if r.mem != none {
+        return "qword ptr {fr.frame_address(r)}"
+    }
+    match r.pool {
+        some(p) => return "qword ptr [rip+{fr.gen.float_label(p)}]"
+        none => {}
+    }
+    if r.reg != "" {
+        return r.reg
+    }
+    "qword ptr [rbp-{8 * (fr.saved.len + r.spill + 1)}]"
+}
+
+fn slot(fr: *Frame, index: i64) -> i64 {
+    -8 * fr.slots[index]
+}
+
+fn is_mem(loc: str) -> bool {
+    text.starts_with(loc, "qword") || text.starts_with(loc, "dword")
+}
+
+fn is_reg(loc: str) -> bool {
+    !is_mem(loc) && !is_imm(loc) && !is_xmm(loc)
+}
+
+fn is_imm(loc: str) -> bool {
+    let c = loc[0]
+    c == 45 || (c >= 48 && c <= 57)
+}
+
+fn is_xmm(loc: str) -> bool {
+    text.starts_with(loc, "xmm")
+}
+
+fn move(g: *Generator, dst: str, src: str) {
+    let reverse = Moved { dst: src, src: dst }
+    if dst == src || g.previous == reverse {
+        return
+    }
+    if is_xmm(dst) {
+        g.move_to_xmm(dst, src)
+    } else if is_xmm(src) {
+        g.emit("movq {dst}, {src}")
+    } else if is_mem(dst) && is_mem(src) {
+        g.emit("mov r10, {src}")
+        g.emit("mov {dst}, r10")
+    } else {
+        g.emit("mov {dst}, {src}")
+        g.previous = Moved { dst, src }
+    }
+}
+
+fn move_to_xmm(g: *Generator, dst: str, src: str) {
+    if is_xmm(src) {
+        g.emit("movaps {dst}, {src}")
+        return
+    }
+    g.emit("movq {dst}, {src}")
+}
+
+fn float_label(g: *Generator, bits: i64) -> str {
+    let l = ".Lfc_{u64(bits):x}"
+    if !(g.data_labels[l] ?? false) {
+        g.data_labels[l] = true
+        g.data.write("\t.p2align 3\n{l}:\n\t.quad {bits}\n")
+    }
+    l
+}
+
+fn sign_mask(g: *Generator, bits: i64) -> str {
+    let l = ".Lsign_{bits}"
+    if !(g.data_labels[l] ?? false) {
+        g.data_labels[l] = true
+        let mask = u64(1) << u64(bits - 1)
+        g.data.write("\t.p2align 4\n{l}:\n\t.quad 0x{mask:x}, 0\n")
+    }
+    l
+}
+
+fn load_float_bits(g: *Generator, dst: str, bits: i64) {
+    if bits == 0 {
+        g.emit("xorps {dst}, {dst}")
+        return
+    }
+    g.emit("movq {dst}, qword ptr [rip+{g.float_label(bits)}]")
+}
+
+fn save_registers(g: *Generator, fr: *Frame) {
+    for i, r in fr.saved {
+        g.emit("mov qword ptr [rbp-{8 * (i + 1)}], {r}")
+    }
+}
+
+fn empty(fr: *Frame, mb: *Mblock) -> bool {
+    if mb.kind != Plain || mb.poll || mb.instrs.len != 0 || mb.heads.len != 0 || fr.func.guard == mb {
+        return false
+    }
+    for c in mb.copies {
+        if fr.loc(c.dst) != fr.loc(c.src) {
+            return false
+        }
+    }
+    true
+}
+
+fn aligns_loop(fr: *Frame, mb: *Mblock) -> bool {
+    if !mb.poll || mb.kind != If || mb.instrs.len + mb.copies.len > max_aligned_instrs {
+        return false
+    }
+    for s in mb.succs {
+        if fr.final(s) == mb {
+            return true
+        }
+    }
+    false
+}
+
+fn final(fr: *Frame, mb: *Mblock) -> *Mblock {
+    var current = mb
+    var hops = 0
+    for hops < fr.func.blocks.len && fr.empty(current) {
+        current = current.succs[0]
+        hops += 1
+    }
+    current
+}
+
+fn emitted(fr: *Frame) -> []*Mblock {
+    var reached: [*Mblock: bool] = [:]
+    let entry = fr.func.blocks[0]
+    reached[entry] = true
+    var stack: []*Mblock = []
+    push_successors(mut stack, entry)
+    for stack.len > 0 {
+        let pending = stack[stack.len - 1]
+        truncate(mut stack, stack.len - 1)
+        let mb = fr.final(pending)
+        if reached[mb] ?? false {
+            continue
+        }
+        reached[mb] = true
+        push_successors(mut stack, mb)
+    }
+    slices.filter(fr.func.blocks, fn(mb: *Mblock) -> bool { reached[mb] ?? false })
+}
+
+fn push_successors(mut stack: []*Mblock, mb: *Mblock) {
+    var i = mb.succs.len - 1
+    for i >= 0 {
+        push(mut stack, mb.succs[i])
+        i -= 1
+    }
+}
+
+fn returned_last(mb: *Mblock) -> *Vreg? {
+    if mb.kind != Ret || mb.results.len == 0 || mb.instrs.len == 0 {
+        return none
+    }
+    let last = mb.instrs[mb.instrs.len - 1]
+    let d = last.dst ?? return none
+    if d != mb.results[0] || d.pinned != "" || last.value.uses != 1 || last.is_call() || last.is_param() {
+        return none
+    }
+    d
+}
+
+fn copies(g: *Generator, fr: *Frame, list: []*PhiCopy) {
+    var moves: []Pmove = []
+    for c in list {
+        push(mut moves, fr.vector_move(fr.loc(c.dst), c.src))
+    }
+    g.parallel(moves)
+}
+
+fn block(g: *Generator, fr: *Frame, mb: *Mblock, next: *Mblock?) {
+    if fr.aligns_loop(mb) {
+        g.align(loop_alignment)
+    }
+    g.label(mb.label)
+    match g.cache {
+        some(cache) => cache.reset()
+        none => {}
+    }
+    if fr.func.guard == mb {
+        if fr.mode == DeferredFrame {
+            g.enter_frame(fr)
+        }
+        g.save_registers(fr)
+    }
+    fr.direct = none
+    g.copies(fr, mb.heads)
+    fr.direct = mb.returned_last()
+    for ins in mb.instrs {
+        g.instr(fr, ins)
+    }
+    g.copies(fr, mb.copies)
+    if mb.poll {
+        g.poll()
+    }
+    match mb.kind {
+        Plain => {
+            let target = fr.final(mb.succs[0])
+            if next != target {
+                g.emit("jmp {target.label}")
+            }
+        }
+        If => g.branch(fr, mb, next)
+        Switch => g.jump_table(fr, mb)
+        Ret => g.ret(fr, mb)
+        Unreachable => g.emit("ud2")
+    }
+}
+
+fn branch(g: *Generator, fr: *Frame, mb: *Mblock, next: *Mblock?) {
+    let then = fr.final(mb.succs[0])
+    let otherwise = fr.final(mb.succs[1])
+    if then == otherwise {
+        if next != then {
+            g.emit("jmp {then.label}")
+        }
+        return
+    }
+    var cond = "nz"
+    for r in mb.compare {
+        g.reload_pieces(fr, r)
+    }
+    match mb.fused {
+        some(fused) => {
+            if is_float(fused.type) {
+                g.float_branch(fr, mb, then, otherwise, next)
+                return
+            }
+            g.compare(fr, mb.compare[0], mb.compare[1])
+            cond = condition(fused)
+        }
+        none => {
+            let control = mb.control ?? panic("branch without a control value")
+            g.test(fr.loc(control))
+        }
+    }
+    g.jump(cond, then, otherwise, next)
+}
+
+fn jump(g: *Generator, cond: str, then: *Mblock, otherwise: *Mblock, next: *Mblock?) {
+    if next == then {
+        g.emit("j{inverse(cond)} {otherwise.label}")
+        return
+    }
+    g.emit("j{cond} {then.label}")
+    if next != otherwise {
+        g.emit("jmp {otherwise.label}")
+    }
+}
+
+fn test(g: *Generator, loc: str) {
+    if is_reg(loc) {
+        g.emit("test {loc}, {loc}")
+    } else if is_imm(loc) {
+        g.emit("mov r10, {loc}")
+        g.emit("test r10, r10")
+    } else {
+        g.emit("cmp {loc}, 0")
+    }
+}
+
+fn compare(g: *Generator, fr: *Frame, a: *Vreg, b: *Vreg) {
+    var x = fr.loc(a)
+    let y = fr.loc(b)
+    if narrow_memory_operand(a) {
+        let loaded = types.must(address_of(a).loaded)
+        g.emit("cmp {width_name(loaded.bits)} ptr {fr.frame_address(a)}, {y}")
+    } else if is_reg(x) && y == "0" {
+        g.emit("test {x}, {x}")
+    } else if is_mem(x) && !is_mem(y) {
+        g.emit("cmp {x}, {y}")
+    } else {
+        if !is_reg(x) {
+            var scratch = "r10"
+            if a.mem != none || b.mem != none {
+                scratch = "rax"
+            }
+            g.move(scratch, x)
+            x = scratch
+        }
+        g.emit("cmp {x}, {y}")
+    }
+}
+
+fn ret(g: *Generator, fr: *Frame, mb: *Mblock) {
+    if abi_returns_in_registers(mb.results.len) {
+        var moves: []Pmove = []
+        for i, r in mb.results {
+            push(mut moves, fr.vector_move(abi_results()[i], r))
+        }
+        g.parallel(moves)
+    } else {
+        for k, r in mb.results {
+            g.move("qword ptr [rbp+{fr.results + 8 * k}]", fr.loc(r))
+        }
+    }
+    if fr.exits_without_frame(mb) {
+        g.emit("ret")
+        return
+    }
+    if mb.restores() {
+        for i, r in fr.saved {
+            g.emit("mov {r}, qword ptr [rbp-{8 * (i + 1)}]")
+        }
+    }
+    g.epilogue(fr)
+    g.leave_vectors()
+    g.emit("ret")
+}
+
+fn enter_frame(g: *Generator, fr: *Frame) {
+    g.emit("push rbp")
+    g.emit("mov rbp, rsp")
+    platform_reserve(g.platform, g, fr.size)
+}
+
+fn exits_without_frame(fr: *Frame, mb: *Mblock) -> bool {
+    fr.mode == FramelessFrame || (fr.mode == DeferredFrame && mb.light)
+}
+
+fn epilogue(g: *Generator, fr: *Frame) {
+    if fr.size == 0 {
+        g.emit("pop rbp")
+        return
+    }
+    g.emit("leave")
+}
+
+fn binops(op: ir.Op) -> str {
+    match op {
+        OpAdd => "add"
+        OpSub => "sub"
+        OpMul => "imul"
+        OpAnd => "and"
+        OpOr => "or"
+        OpXor => "xor"
+        _ => ""
+    }
+}
+
+fn instr(g: *Generator, fr: *Frame, ins: *Instr) {
+    if ins.is_param() {
+        return
+    }
+    let v = ins.value
+    for a in ins.args {
+        g.reload_pieces(fr, a)
+    }
+    match ins.op {
+        OpConst => g.constant(fr.loc(dest(ins)), v.aux)
+        OpEmbed => g.address(fr.loc(dest(ins)), "[rip+{g.embed_label(v.str, u64(v.aux))}]")
+        OpString => g.address(fr.loc(dest(ins)), "[rip+{g.string_label(v.str)}]")
+        OpCell => g.address(fr.loc(dest(ins)), cell_address(v.aux))
+        OpUndef => {}
+        OpAdd => g.arithmetic(fr, ins)
+        OpSub => g.arithmetic(fr, ins)
+        OpMul => g.arithmetic(fr, ins)
+        OpAnd => g.bitwise(fr, ins)
+        OpOr => g.bitwise(fr, ins)
+        OpXor => g.bitwise(fr, ins)
+        OpMulHigh => g.mul_high(fr, ins)
+        OpHashSeed => g.hash_seed(fr.loc(dest(ins)), v.aux)
+        OpVector => g.vector(fr, ins)
+        OpVectorScalar => g.vector(fr, ins)
+        OpTrailingZeros => {
+            g.move("rax", fr.loc(ins.args[0]))
+            g.emit("mov edx, 64")
+            g.emit("bsf rax, rax")
+            g.emit("cmovz rax, rdx")
+            g.move(fr.loc(dest(ins)), "rax")
+        }
+        OpShl => g.shift(fr, ins)
+        OpShr => g.shift(fr, ins)
+        OpDiv => g.divide(fr, ins)
+        OpRem => g.divide(fr, ins)
+        OpNeg => g.negate(fr, ins)
+        OpCompl => g.negate(fr, ins)
+        OpNot => g.logical_not(fr, ins)
+        OpConvert => g.convert(fr, ins)
+        OpSqrt => g.float_unary(fr, ins)
+        OpFloor => g.float_unary(fr, ins)
+        OpEq => g.compare_values(fr, ins)
+        OpNe => g.compare_values(fr, ins)
+        OpLt => g.compare_values(fr, ins)
+        OpLe => g.compare_values(fr, ins)
+        OpGt => g.compare_values(fr, ins)
+        OpGe => g.compare_values(fr, ins)
+        OpLoad => g.emit_load(fr, ins)
+        OpStore => g.emit_store(fr, ins)
+        OpCheck => {
+            g.compare(fr, ins.args[0], ins.args[1])
+            g.emit("jae rt_panic_index")
+        }
+        OpSlot => g.address(fr.loc(dest(ins)), "[rbp{plus(fr.slot(v.aux))}]")
+        OpFuncAddr => g.func_addr(fr.loc(dest(ins)), v)
+        OpCall => g.call(fr, ins)
+        OpRuntime => g.runtime_call(fr, ins)
+        OpSyscall => g.syscall_call(fr, ins)
+        OpCCall => g.c_call(fr, ins)
+        OpResult => g.result(fr, ins)
+        _ => {}
+    }
+}
+
+fn bitwise(g: *Generator, fr: *Frame, ins: *Instr) {
+    if ins.rotate != 0 {
+        g.rotate(fr, ins)
+        return
+    }
+    g.binary(fr, ins, binops(ins.op))
+}
+
+fn address(g: *Generator, dst: str, operand: str) {
+    if is_reg(dst) {
+        g.emit("lea {dst}, {operand}")
+        return
+    }
+    g.emit("lea r10, {operand}")
+    g.move(dst, "r10")
+}
+
+fn hash_seed(g: *Generator, dst: str, index: i64) {
+    let operand = "qword ptr [rip+rt_hash_seed+{8 * index}]"
+    if is_reg(dst) {
+        g.emit("mov {dst}, {operand}")
+        return
+    }
+    g.emit("mov r10, {operand}")
+    g.move(dst, "r10")
+}
+
+fn constant(g: *Generator, dst: str, n: i64) {
+    if n == 0 && is_reg(dst) {
+        g.zero(dst)
+        return
+    }
+    if is_reg(dst) || (n >= -(1 << 31) && n < 1 << 31) {
+        g.emit("mov {dst}, {n}")
+        return
+    }
+    g.emit("mov r10, {n}")
+    g.emit("mov {dst}, r10")
+}
+
+fn binary(g: *Generator, fr: *Frame, ins: *Instr, op: str) {
+    let dst = fr.loc(dest(ins))
+    var a = fr.loc(ins.args[0])
+    var b = fr.loc(ins.args[1])
+    let commutative = ins.op != OpSub
+    if commutative && is_imm(a) && !is_imm(b) {
+        let held = a
+        a = b
+        b = held
+    }
+    var work = "r10"
+    if ins.memory_operand() != none {
+        work = "rax"
+    }
+    let direct = is_reg(dst) && !fr.overwrites_address(ins, dst)
+    if is_reg(dst) && g.three_operand(ins, dst, a, b) {
+        return
+    }
+    if direct && dst != b {
+        g.move(sized(ins, dst), sized(ins, a))
+        g.emit("{op} {sized(ins, dst)}, {sized(ins, b)}")
+    } else if direct && commutative {
+        g.emit("{op} {sized(ins, dst)}, {sized(ins, a)}")
+    } else {
+        g.move(sized(ins, work), sized(ins, a))
+        g.emit("{op} {sized(ins, work)}, {sized(ins, b)}")
+        g.move(dst, work)
+    }
+}
+
+fn three_operand(g: *Generator, ins: *Instr, dst: str, a: str, b: str) -> bool {
+    let op = ins.op
+    if op == OpMul && is_imm(b) && !is_imm(a) {
+        g.emit("imul {sized(ins, dst)}, {sized(ins, a)}, {b}")
+    } else if op == OpAdd && is_reg(a) && is_imm(b) && dst != a {
+        g.emit("lea {sized(ins, dst)}, [{a}{plus(immediate(b))}]")
+    } else if op == OpSub && is_reg(a) && is_imm(b) && dst != a && immediate(b) != -(1 << 31) {
+        g.emit("lea {sized(ins, dst)}, [{a}{plus(-immediate(b))}]")
+    } else if op == OpAdd && is_reg(a) && is_reg(b) && dst != a && dst != b {
+        g.emit("lea {sized(ins, dst)}, [{a}+{b}]")
+    } else {
+        return false
+    }
+    true
+}
+
+fn immediate(loc: str) -> i64 {
+    var negative = false
+    var at = 0
+    if loc[0] == 45 {
+        negative = true
+        at = 1
+    }
+    var n = 0
+    for at < loc.len {
+        let c = loc[at]
+        if c < 48 || c > 57 {
+            break
+        }
+        n = n * 10 + i64(c - 48)
+        at += 1
+    }
+    if negative {
+        return -n
+    }
+    n
+}
+
+fn work_register(g: *Generator, dst: str) -> str {
+    if is_reg(dst) {
+        return dst
+    }
+    "r10"
+}
+
+fn logical_not(g: *Generator, fr: *Frame, ins: *Instr) {
+    let dst = fr.loc(dest(ins))
+    let work = g.work_register(dst)
+    g.move(work, fr.loc(ins.args[0]))
+    g.emit("xor {work}, 1")
+    g.move(dst, work)
+}
+
+fn params(g: *Generator, fr: *Frame, entry: *Mblock) {
+    var moves: []Pmove = []
+    for ins in entry.instrs {
+        if !ins.is_param() || ins.value.uses == 0 {
+            continue
+        }
+        let k = ins.value.aux
+        let src = abi_argument(k) ?? abi_incoming(k)
+        push(mut moves, Pmove { dst: fr.loc(dest(ins)), src })
+    }
+    g.parallel(moves)
+}
+
+fn func_addr(g: *Generator, dst: str, v: *ir.Value) {
+    if v.aux == ir.symbol_addr {
+        var reg = dst
+        if !is_reg(dst) {
+            reg = "r10"
+        }
+        g.emit("mov {reg}, {platform_symbol_address(g.platform, v.str)}")
+        g.move(dst, reg)
+        return
+    }
+    let callee = v.target ?? panic("function address without a target")
+    if v.aux == ir.thunk_addr {
+        g.address(dst, "[rip+cb_{mangle(callee.name)}]")
+        return
+    }
+    match g.table {
+        some(t) => g.address(dst, t.slot_of(callee.name))
+        none => g.address(dst, "[rip+{symbol(callee.name, "")}]")
+    }
+}
+
+fn callee(g: *Generator, v: *ir.Value) -> str {
+    if !ir.is_indirect(v) {
+        return g.call_target(v.target ?? panic("direct call without a target"))
+    }
+    if g.table != none {
+        return "qword ptr [r10]"
+    }
+    "r10"
+}
+
+fn call(g: *Generator, fr: *Frame, ins: *Instr) {
+    var args = ins.args
+    var moves: []Pmove = []
+    if ir.is_indirect(ins.value) {
+        push(mut moves, Pmove { dst: "r10", src: fr.loc(args[0]) })
+        args = args[1..]
+    }
+    for i, a in args {
+        let src = fr.loc(a)
+        match abi_argument(i) {
+            some(reg) => push(mut moves, Pmove { dst: reg, src })
+            none => g.move(abi_outgoing(i), src)
+        }
+    }
+    g.parallel(moves)
+    g.leave_vectors()
+    g.emit("call {g.callee(ins.value)}")
+    g.safepoint(fr, ins)
+}
+
+fn vector_move(fr: *Frame, dst: str, r: *Vreg) -> Pmove {
+    Pmove { dst, src: fr.loc(r), bits: r.konst }
+}
+
+fn zero(g: *Generator, reg: str) {
+    let low = narrow(reg, 0)
+    g.emit("xor {low}, {low}")
+}
+
+fn perform_move(g: *Generator, m: Pmove) {
+    match m.bits {
+        some(bits) => {
+            if is_xmm(m.dst) {
+                g.load_float_bits(m.dst, bits)
+                return
+            }
+        }
+        none => {}
+    }
+    if m.src == "0" && is_reg(m.dst) {
+        g.zero(m.dst)
+        return
+    }
+    g.move(m.dst, m.src)
+}
+
+fn blocked_move(moves: []Pmove) -> i64 {
+    for i, m in moves {
+        var read = false
+        for o in moves {
+            if o.src == m.dst {
+                read = true
+                break
+            }
+        }
+        if !read {
+            return i
+        }
+    }
+    -1
+}
+
+fn parallel(g: *Generator, initial: []Pmove) {
+    var moves = slices.filter(initial, fn(m: Pmove) -> bool { m.dst != m.src })
+    for moves.len > 0 {
+        let i = blocked_move(moves)
+        if i < 0 {
+            let held = moves[0].src
+            g.move("r11", held)
+            for j in 0..moves.len {
+                if moves[j].src == held {
+                    moves[j].src = "r11"
+                }
+            }
+            continue
+        }
+        g.perform_move(moves[i])
+        moves = slices.concat(moves[..i], moves[i + 1..])
+    }
+}
+
+fn safepoint(g: *Generator, fr: *Frame, ins: *Instr) {
+    g.safepoint_at(fr, ins, g.new_label())
+}
+
+fn safepoint_at(g: *Generator, fr: *Frame, ins: *Instr, name: str) {
+    g.label(name)
+    var offsets: []i64 = []
+    for i in 0..fr.saved.len {
+        push(mut offsets, -8 * (i + 1))
+    }
+    for r in fr.func.vregs {
+        if r.spill >= 0 && !r.scalar && r.live_across(ins.pos) {
+            push(mut offsets, -8 * (fr.saved.len + r.spill + 1))
+        }
+    }
+    let n = fr.slots.len
+    if n > 0 {
+        for word in fr.first_slot..fr.slots[n - 1] + 1 {
+            push(mut offsets, -8 * word)
+        }
+    }
+    push(mut g.maps, StackMap { label: name, offsets })
+}
+
+fn write_maps(g: *Generator, mut out: builder.Builder) {
+    out.write("\n\t.section .rodata\n\t.p2align 3\n\t.globl rt_maps\nrt_maps:\n")
+    out.write("\t.quad {g.maps.len}\n")
+    for i, m in g.maps {
+        out.write("\t.quad {m.label}, .Lmap{i}\n")
+    }
+    for i, m in g.maps {
+        var count = m.offsets.len
+        if m.segment {
+            count = -1
+        }
+        out.write(".Lmap{i}:\n\t.quad {count}\n")
+        for off in m.offsets {
+            out.write("\t.quad {off}\n")
+        }
+    }
+}
+
+fn grow_call(g: *Generator, fr: *Frame, ins: *Instr) {
+    var moves: []Pmove = []
+    for i, reg in abi_grow() {
+        push(mut moves, Pmove { dst: reg, src: fr.loc(ins.args[i]) })
+    }
+    g.parallel(moves)
+    g.leave_vectors()
+    var variant = "scan"
+    match ins.args[3].konst {
+        some(scan) => {
+            if scan == 0 {
+                variant = "noscan"
+            }
+        }
+        none => {}
+    }
+    let rt = ins.value.runtime ?? panic("runtime call without an entry")
+    g.emit("call {ir.runtime_symbol(rt)}_{variant}")
+    g.safepoint(fr, ins)
+}
+
+fn runtime_call(g: *Generator, fr: *Frame, ins: *Instr) {
+    if ins.preserves_registers() {
+        g.grow_call(fr, ins)
+        return
+    }
+    if ins.literal != none {
+        g.literal_equality(fr, ins)
+        return
+    }
+    if ins.is_string_equality() {
+        g.string_equality(fr, ins)
+        return
+    }
+    var moves: []Pmove = []
+    for i, a in ins.args {
+        push(mut moves, Pmove { dst: abi_args()[i], src: fr.loc(a) })
+    }
+    g.parallel(moves)
+    g.leave_vectors()
+    let rt = ins.value.runtime ?? panic("runtime call without an entry")
+    g.emit("call {ir.runtime_symbol(rt)}")
+    g.safepoint(fr, ins)
+}
+
+fn syscall_call(g: *Generator, fr: *Frame, ins: *Instr) {
+    var moves: []Pmove = []
+    for i, a in ins.args {
+        push(mut moves, Pmove { dst: abi_syscall()[i], src: fr.loc(a) })
+    }
+    g.parallel(moves)
+    if ins.inline_syscall() {
+        platform_syscall(g.platform, g)
+        return
+    }
+    g.leave_vectors()
+    let rt = ins.value.runtime ?? panic("syscall without an entry")
+    g.emit("call {ir.runtime_symbol(rt)}")
+    g.safepoint(fr, ins)
+}
+
+fn result(g: *Generator, fr: *Frame, ins: *Instr) {
+    let dst = dest(ins)
+    if dst.pinned != "" {
+        return
+    }
+    let k = ins.value.aux
+    let call = ins.call ?? panic("result without a call")
+    if call.op == OpCCall {
+        let sig = call.sig ?? panic("c call without a signature")
+        g.c_result(fr, ins, g.plan(sig), k)
+        return
+    }
+    if call.op != OpCall || abi_returns_in_registers(ir.result_words(ir.call_signature(call))) {
+        g.move(fr.loc(dst), abi_results()[k])
+        return
+    }
+    g.move(fr.loc(dst), abi_stack_result(ir.call_signature(call).param_words, k))
+}

@@ -1,0 +1,296 @@
+import ir
+import types
+
+fn xmm_target(dst: str) -> str {
+    if is_xmm(dst) {
+        return dst
+    }
+    "xmm0"
+}
+
+fn narrow_memory(loc: str, p: str) -> str {
+    if p == "s" {
+        return dword(loc)
+    }
+    loc
+}
+
+fn move_value(g: *Generator, fr: *Frame, dst: str, r: *Vreg) {
+    match r.konst {
+        some(k) => {
+            if is_xmm(dst) {
+                g.load_float_bits(dst, k)
+                return
+            }
+        }
+        none => {}
+    }
+    g.move(dst, fr.loc(r))
+}
+
+fn xmm_register(g: *Generator, fr: *Frame, r: *Vreg, scratch: str) -> str {
+    let loc = fr.loc(r)
+    if is_xmm(loc) {
+        return loc
+    }
+    g.move_value(fr, scratch, r)
+    scratch
+}
+
+fn xmm_operand(g: *Generator, fr: *Frame, r: *Vreg, scratch: str, p: str) -> str {
+    let loc = fr.loc(r)
+    if is_xmm(loc) {
+        return loc
+    }
+    if is_mem(loc) {
+        return narrow_memory(loc, p)
+    }
+    match r.konst {
+        some(k) => {
+            if k != 0 {
+                return narrow_memory("qword ptr [rip+{g.float_label(k)}]", p)
+            }
+        }
+        none => {}
+    }
+    g.move_value(fr, scratch, r)
+    scratch
+}
+
+fn float_op(op: ir.Op) -> str {
+    match op {
+        OpAdd => "add"
+        OpSub => "sub"
+        OpMul => "mul"
+        OpDiv => "div"
+        _ => ""
+    }
+}
+
+fn float_arithmetic(g: *Generator, fr: *Frame, ins: *Instr) {
+    let op = float_op(ins.op)
+    let p = precision(types.must(ins.value.type))
+    let dst = fr.loc(dest(ins))
+    let target = xmm_target(dst)
+    let first = ins.args[0]
+    let second = ins.args[1]
+    var operand = ""
+    if first == second {
+        g.move_value(fr, target, first)
+        operand = target
+    } else if fr.loc(second) != target || fr.loc(first) == target {
+        g.move_value(fr, target, first)
+        operand = g.xmm_operand(fr, second, "xmm1", p)
+    } else if op == "add" || op == "mul" {
+        g.move_value(fr, target, second)
+        operand = g.xmm_operand(fr, first, "xmm1", p)
+    } else {
+        g.emit("movaps xmm1, {target}")
+        g.move_value(fr, target, first)
+        operand = "xmm1"
+    }
+    g.emit("{op}s{p} {target}, {operand}")
+    g.move(dst, target)
+}
+
+fn float_negate(g: *Generator, fr: *Frame, ins: *Instr) {
+    let dst = fr.loc(dest(ins))
+    let target = xmm_target(dst)
+    g.move_value(fr, target, ins.args[0])
+    let bits = types.must(ins.value.type).bits
+    g.emit("xorps {target}, xmmword ptr [rip+{g.sign_mask(bits)}]")
+    g.move(dst, target)
+}
+
+fn float_unary(g: *Generator, fr: *Frame, ins: *Instr) {
+    let p = precision(types.must(ins.value.type))
+    let dst = fr.loc(dest(ins))
+    let target = xmm_target(dst)
+    let operand = g.xmm_operand(fr, ins.args[0], "xmm0", p)
+    if operand != target {
+        g.emit("xorps {target}, {target}")
+    }
+    if ins.op == OpSqrt {
+        g.emit("sqrts{p} {target}, {operand}")
+    } else {
+        g.emit("rounds{p} {target}, {operand}, 1")
+    }
+    g.move(dst, target)
+}
+
+fn ordered_operands(op: ir.Op, a: *Vreg, b: *Vreg) -> Operands {
+    if op == OpLt || op == OpLe {
+        return Operands { first: b, second: a }
+    }
+    Operands { first: a, second: b }
+}
+
+fn ucomis(g: *Generator, fr: *Frame, t: *types.Type, first: *Vreg, second: *Vreg) {
+    let p = precision(t)
+    let register = g.xmm_register(fr, first, "xmm0")
+    let operand = g.xmm_operand(fr, second, "xmm1", p)
+    g.emit("ucomis{p} {register}, {operand}")
+}
+
+fn float_compare(g: *Generator, fr: *Frame, ins: *Instr) {
+    let ordered = ordered_operands(ins.op, ins.args[0], ins.args[1])
+    g.ucomis(fr, types.must(ins.value.type), ordered.first, ordered.second)
+    var op = ins.op
+    if ins.negated && op == OpEq {
+        op = OpNe
+    } else if ins.negated && op == OpNe {
+        op = OpEq
+    }
+    if op == OpEq {
+        g.emit("sete al")
+        g.emit("setnp r11b")
+        g.emit("and al, r11b")
+    } else if op == OpNe {
+        g.emit("setne al")
+        g.emit("setp r11b")
+        g.emit("or al, r11b")
+    } else if ins.negated && (op == OpLt || op == OpGt) {
+        g.emit("setbe al")
+    } else if ins.negated {
+        g.emit("setb al")
+    } else if op == OpLt || op == OpGt {
+        g.emit("seta al")
+    } else {
+        g.emit("setae al")
+    }
+}
+
+fn float_branch(g: *Generator, fr: *Frame, mb: *Mblock, then: *Mblock, otherwise: *Mblock, next: *Mblock?) {
+    let fused = mb.fused ?? panic("float branch without a comparison")
+    let op = fused.op
+    let ordered = ordered_operands(op, mb.compare[0], mb.compare[1])
+    g.ucomis(fr, types.must(fused.type), ordered.first, ordered.second)
+    if op == OpEq {
+        g.emit("jne {otherwise.label}")
+        g.emit("jp {otherwise.label}")
+        if next != then {
+            g.emit("jmp {then.label}")
+        }
+    } else if op == OpNe {
+        g.emit("jne {then.label}")
+        g.emit("jp {then.label}")
+        if next != otherwise {
+            g.emit("jmp {otherwise.label}")
+        }
+    } else if op == OpLt || op == OpGt {
+        g.jump("a", then, otherwise, next)
+    } else {
+        g.jump("ae", then, otherwise, next)
+    }
+}
+
+fn integer_to_float(g: *Generator, src: str, dst: str, to: *types.Type) {
+    let p = precision(to)
+    let target = xmm_target(dst)
+    var operand = src
+    if !is_reg(src) {
+        g.move("r10", src)
+        operand = "r10"
+    }
+    g.emit("xorps {target}, {target}")
+    g.emit("cvtsi2s{p} {target}, {operand}")
+    g.move(dst, target)
+}
+
+fn unsigned_to_float(g: *Generator, src: str, dst: str, to: *types.Type) {
+    let p = precision(to)
+    let target = xmm_target(dst)
+    let big = g.new_label()
+    let done = g.new_label()
+    g.move("r10", src)
+    g.emit("xorps {target}, {target}")
+    g.emit("test r10, r10")
+    g.emit("js {big}")
+    g.emit("cvtsi2s{p} {target}, r10")
+    g.emit("jmp {done}")
+    g.label(big)
+    g.emit("mov r11, r10")
+    g.emit("shr r10, 1")
+    g.emit("and r11d, 1")
+    g.emit("or r10, r11")
+    g.emit("cvtsi2s{p} {target}, r10")
+    g.emit("adds{p} {target}, {target}")
+    g.label(done)
+    g.move(dst, target)
+}
+
+fn float_to_integer(g: *Generator, fr: *Frame, src: *Vreg, dst: str, from: *types.Type, to: *types.Type) {
+    let p = precision(from)
+    let operand = g.xmm_operand(fr, src, "xmm0", p)
+    g.emit("cvtts{p}2si r10, {operand}")
+    g.normalize("r10", to)
+    g.move(dst, "r10")
+}
+
+fn float_to_unsigned(g: *Generator, fr: *Frame, src: *Vreg, dst: str, from: *types.Type) {
+    let p = precision(from)
+    let big = g.new_label()
+    let done = g.new_label()
+    var limit: i64 = 0x43E0000000000000
+    if p == "s" {
+        limit = 0x5F000000
+    }
+    g.move_value(fr, "xmm0", src)
+    g.load_float_bits("xmm1", limit)
+    g.emit("ucomis{p} xmm0, xmm1")
+    g.emit("jae {big}")
+    g.emit("cvtts{p}2si r10, xmm0")
+    g.emit("jmp {done}")
+    g.label(big)
+    g.emit("subs{p} xmm0, xmm1")
+    g.emit("cvtts{p}2si r10, xmm0")
+    g.emit("btc r10, 63")
+    g.label(done)
+    g.move(dst, "r10")
+}
+
+fn float_to_float(g: *Generator, fr: *Frame, src: *Vreg, dst: str, from: *types.Type, to: *types.Type) {
+    let operand = g.xmm_operand(fr, src, "xmm0", precision(from))
+    var target = xmm_target(dst)
+    if to.bits == 32 {
+        if target == operand {
+            target = "xmm1"
+        }
+        g.emit("xorps {target}, {target}")
+        g.emit("cvtsd2ss {target}, {operand}")
+        g.move(dst, target)
+        return
+    }
+    g.emit("cvtss2sd {target}, {operand}")
+    g.move(dst, target)
+}
+
+fn float_load(g: *Generator, dst: str, t: *types.Type?, memory: str) {
+    match t {
+        some(ty) => {
+            if ty.bits == 32 {
+                g.emit("movss {dst}, dword ptr {memory}")
+                return
+            }
+        }
+        none => {}
+    }
+    g.emit("movsd {dst}, qword ptr {memory}")
+}
+
+fn float_store(g: *Generator, memory: str, ins: *Instr, value: str) -> bool {
+    let t = ins.value.type
+    match t {
+        none => {
+            g.emit("movsd qword ptr {memory}, {value}")
+            return true
+        }
+        some(ty) => {
+            if types.is_float(ty) && ty.bits == 32 {
+                g.emit("movss dword ptr {memory}, {value}")
+                return true
+            }
+        }
+    }
+    false
+}

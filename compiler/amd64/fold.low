@@ -1,0 +1,237 @@
+import ir
+import types
+
+fn select_instructions(f: *Mfunc) {
+    let s = new_selector(f)
+    s.negate_compares()
+    s.fold_addresses()
+    s.double_floats()
+    s.fold_loads()
+    s.fuse_rotates()
+    s.fuse_literal_equality()
+    s.sweep()
+}
+
+fn writes_memory(ins: *Instr) -> bool {
+    match ins.op {
+        OpStore => true
+        OpVector => true
+        OpVectorScalar => true
+        _ => ir.is_call(ins.op)
+    }
+}
+
+fn double_floats(s: *Selector) {
+    for mb in s.func.blocks {
+        for ins in mb.instrs {
+            if ins.op != OpMul || !is_float(ins.value.type) {
+                continue
+            }
+            let t = types.must(ins.value.type)
+            var x = ins.args[0]
+            let y = ins.args[1]
+            if !is_two(y, t) {
+                if !is_two(x, t) {
+                    continue
+                }
+                x = y
+            }
+            s.uses[ins.args[0]] -= 1
+            s.uses[ins.args[1]] -= 1
+            s.uses[x] += 2
+            ins.op = OpAdd
+            ins.args = [x, x]
+        }
+    }
+}
+
+fn is_two(r: *Vreg, t: *types.Type) -> bool {
+    if t.bits == 32 {
+        return r.konst == 0x40000000
+    }
+    r.pool == 0x4000000000000000
+}
+
+fn fold_loads(s: *Selector) {
+    for mb in s.func.blocks {
+        var pending: [*Vreg: *Instr] = [:]
+        for ins in mb.instrs {
+            if s.is_dead(ins) {
+                continue
+            }
+            s.absorb_load(ins, mut pending)
+            if ins.writes_memory() {
+                pending = [:]
+            } else if ins.op == OpLoad && s.use_count(dest(ins)) == 1 {
+                pending[dest(ins)] = ins
+            }
+        }
+        if mb.fused != none && !mb.poll {
+            s.absorb_into_branch(mb, mut pending)
+        }
+    }
+}
+
+fn take(s: *Selector, load: *Instr, mut pending: [*Vreg: *Instr]) -> *Vreg {
+    delete(mut pending, dest(load))
+    s.dead[load] = true
+    s.uses[dest(load)] -= 1
+    load.args[0]
+}
+
+fn pending_load(s: *Selector, r: *Vreg, pending: [*Vreg: *Instr]) -> *Instr? {
+    let load = pending[r] ?? return none
+    if s.is_dead(load) {
+        return none
+    }
+    load
+}
+
+struct Operands {
+    first: *Vreg
+    second: *Vreg
+}
+
+fn absorb_load(s: *Selector, ins: *Instr, mut pending: [*Vreg: *Instr]) {
+    if pending.len == 0 || ins.args.len != 2 || ins.memory_operand() != none {
+        return
+    }
+    if ins.op == OpCheck {
+        let picked = s.compare_operands(none, ins.args[0], ins.args[1], mut pending)
+        ins.args[0] = picked.first
+        ins.args[1] = picked.second
+    } else if ir.is_compare(ins.op) {
+        s.absorb_compare(ins, mut pending)
+    } else if is_float(ins.value.type) && float_op(ins.op) != "" {
+        s.absorb_operand(ins, ins.value.type, ins.op == OpAdd || ins.op == OpMul, mut pending)
+    } else if word_arithmetic(ins.value.type) && integer_binary(ins.op) {
+        s.absorb_operand(ins, ins.value.type, ins.op != OpSub, mut pending)
+    }
+}
+
+fn integer_binary(op: ir.Op) -> bool {
+    match op {
+        OpAdd => true
+        OpSub => true
+        OpMul => true
+        OpAnd => true
+        OpOr => true
+        OpXor => true
+        _ => false
+    }
+}
+
+fn same_width(operation: *types.Type?, loaded: *types.Type?) -> bool {
+    match operation {
+        some(op) => {
+            if types.is_float(op) {
+                var loaded_single = false
+                match loaded {
+                    some(l) => {
+                        loaded_single = l.bits == 32
+                    }
+                    none => {}
+                }
+                return (op.bits == 32) == loaded_single
+            }
+        }
+        none => {}
+    }
+    match loaded {
+        some(l) => l.bits == 64
+        none => true
+    }
+}
+
+fn absorb_operand(s: *Selector, ins: *Instr, t: *types.Type?, commutative: bool, mut pending: [*Vreg: *Instr]) {
+    let second = s.pending_load(ins.args[1], pending)
+    let first = s.pending_load(ins.args[0], pending)
+    match second {
+        some(load) => {
+            if ins.args[0] != ins.args[1] && same_width(t, load.value.type) {
+                ins.args[1] = s.take(load, mut pending)
+                return
+            }
+        }
+        none => {}
+    }
+    match first {
+        some(load) => {
+            if commutative && ins.args[0] != ins.args[1] && same_width(t, load.value.type) {
+                ins.args[0] = ins.args[1]
+                ins.args[1] = s.take(load, mut pending)
+            }
+        }
+        none => {}
+    }
+}
+
+fn absorb_compare(s: *Selector, ins: *Instr, mut pending: [*Vreg: *Instr]) {
+    if is_float(ins.value.type) {
+        s.absorb_float_compare(ins.value.type, ins.op, mut ins.args, mut pending)
+        return
+    }
+    let picked = s.compare_operands(ins.value.type, ins.args[0], ins.args[1], mut pending)
+    ins.args[0] = picked.first
+    ins.args[1] = picked.second
+}
+
+fn absorb_float_compare(s: *Selector, t: *types.Type?, op: ir.Op, mut operands: []*Vreg, mut pending: [*Vreg: *Instr]) {
+    let ordered = ordered_operands(op, operands[0], operands[1]).second
+    let load = s.pending_load(ordered, pending) ?? return
+    if !same_width(t, load.value.type) || operands[0] == operands[1] {
+        return
+    }
+    let mem = s.take(load, mut pending)
+    if ordered == operands[1] {
+        operands[1] = mem
+        return
+    }
+    operands[0] = mem
+}
+
+fn compare_operands(s: *Selector, t: *types.Type?, a: *Vreg, b: *Vreg, mut pending: [*Vreg: *Instr]) -> Operands {
+    if a == b {
+        return Operands { first: a, second: b }
+    }
+    match s.pending_load(b, pending) {
+        some(load) => {
+            if same_width(t, load.value.type) {
+                return Operands { first: a, second: s.take(load, mut pending) }
+            }
+        }
+        none => {}
+    }
+    let load = s.pending_load(a, pending) ?? return Operands { first: a, second: b }
+    if same_width(t, load.value.type) || narrow_compare(t, load.value.type, b) {
+        return Operands { first: s.take(load, mut pending), second: b }
+    }
+    Operands { first: a, second: b }
+}
+
+fn narrow_compare(operation: *types.Type?, loaded: *types.Type?, other: *Vreg) -> bool {
+    let l = loaded ?? return false
+    let op = operation ?? return false
+    let n = other.konst ?? return false
+    if l.bits == 64 || !types.is_integer(l) {
+        return false
+    }
+    if op.bits != l.bits || op.signed != l.signed {
+        return false
+    }
+    types.holds(l, n)
+}
+
+fn absorb_into_branch(s: *Selector, mb: *Mblock, mut pending: [*Vreg: *Instr]) {
+    let fused = mb.fused ?? return
+    let t = fused.type
+    var operands = [mb.compare[0], mb.compare[1]]
+    if is_float(t) {
+        s.absorb_float_compare(t, fused.op, mut operands, mut pending)
+    } else {
+        let picked = s.compare_operands(t, operands[0], operands[1], mut pending)
+        operands[0] = picked.first
+        operands[1] = picked.second
+    }
+    mb.compare = operands
+}

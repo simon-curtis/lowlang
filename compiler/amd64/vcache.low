@@ -1,0 +1,129 @@
+import ir
+
+struct VectorCache {
+    eligible: [*ir.Value: bool] = [:]
+    last: [*ir.Value: *ir.Value] = [:]
+    regs: [*ir.Value: i64] = [:]
+    free: []i64 = []
+}
+
+struct SlotUse {
+    block: *ir.Block
+    writes: i64 = 0
+    writer: i64 = -1
+    first: i64 = -1
+    last: i64 = 0
+    last_use: *ir.Value? = none
+    spread: bool = false
+}
+
+fn vector_temps(f: *ir.Func) -> *VectorCache {
+    var uses: [*ir.Value: *SlotUse] = [:]
+    var tainted: [*ir.Value: bool] = [:]
+    var calls: [*ir.Block: []i64] = [:]
+    for b in f.blocks {
+        for i, v in b.values {
+            if ir.is_call(v.op) {
+                var list = calls[b] ?? []
+                push(mut list, i)
+                calls[b] = list
+            }
+            let vector = ir.is_vector_op(v.op)
+            for k, a in v.args {
+                if a.op != OpSlot {
+                    continue
+                }
+                if !vector {
+                    tainted[a] = true
+                    continue
+                }
+                let u = uses[a] ?? new(SlotUse { block: b })
+                uses[a] = u
+                if u.block != b {
+                    u.spread = true
+                }
+                if v.op == OpVector && k == 0 {
+                    u.writes += 1
+                    u.writer = i
+                } else if u.first < 0 {
+                    u.first = i
+                }
+                u.last = i
+                u.last_use = v
+            }
+        }
+    }
+    let c = new(VectorCache {})
+    for slot in uses {
+        let u = uses[slot] ?? continue
+        if (tainted[slot] ?? false) || u.spread || u.writes != 1 || (u.first >= 0 && u.first < u.writer) {
+            continue
+        }
+        var blocked = false
+        for at in calls[u.block] ?? [] {
+            if at > u.writer && at < u.last {
+                blocked = true
+            }
+        }
+        if !blocked {
+            c.eligible[slot] = true
+            c.last[slot] = u.last_use ?? panic("slot use without a value")
+        }
+    }
+    c
+}
+
+fn reset(c: *VectorCache) {
+    c.regs = [:]
+    c.free = []
+    var r = vector_registers - 1
+    for r >= vector_work_registers {
+        push(mut c.free, r)
+        r -= 1
+    }
+}
+
+fn source(g: *Generator, fr: *Frame, ins: *Instr, k: i64, l: Lanes, base: i64) {
+    match g.cache {
+        some(cache) => {
+            match cache.regs[ins.value.args[k]] {
+                some(r) => {
+                    g.emit("vmovdqa {l.lane_reg(base, 0)}, {l.lane_reg(r, 0)}")
+                    return
+                }
+                none => {}
+            }
+        }
+        none => {}
+    }
+    g.load_vector(l, base, g.vector_address(fr, ins, k))
+}
+
+fn vector_result(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes, base: i64) {
+    let dst = ins.value.args[0]
+    match g.cache {
+        some(cache) => {
+            if (cache.eligible[dst] ?? false) && cache.free.len > 0 {
+                let r = cache.free[cache.free.len - 1]
+                truncate(mut cache.free, cache.free.len - 1)
+                cache.regs[dst] = r
+                g.emit("vmovdqa {l.lane_reg(r, 0)}, {l.lane_reg(base, 0)}")
+                return
+            }
+        }
+        none => {}
+    }
+    g.store_vector(l, base, g.vector_address(fr, ins, 0))
+}
+
+fn release(g: *Generator, ins: *Instr) {
+    let cache = g.cache ?? return
+    for a in ins.value.args {
+        let r = cache.regs[a] ?? continue
+        let last = cache.last[a] ?? continue
+        if last == ins.value {
+            delete(mut cache.regs, a)
+            push(mut cache.free, r)
+        }
+    }
+}

@@ -1,0 +1,194 @@
+import ir
+import types
+import std/slices
+
+enum Class {
+    ClassInteger = 0
+    ClassVector = 1
+    ClassStack = 2
+    ClassByRef = 3
+}
+
+struct CArg {
+    class: Class
+    words: i64
+    reg: str = ""
+    xmm: str = ""
+    slot: i64 = -1
+    copy: i64 = 0
+}
+
+struct CPlan {
+    symbol: str
+    args: []CArg = []
+    results: []Class = []
+    memory: bool = false
+    vectors: i64 = 0
+    stack_words: i64 = 0
+    copy_words: i64 = 0
+    ret: *types.Type
+}
+
+fn copy_base(p: *CPlan) -> i64 {
+    if p.memory {
+        return p.stack_words + types.size(p.ret)
+    }
+    p.stack_words
+}
+
+fn outgoing_words(p: *CPlan) -> i64 {
+    p.copy_base() + p.copy_words
+}
+
+fn plan(g: *Generator, sig: *ir.CSig) -> *CPlan {
+    match g.plans[sig] {
+        some(found) => return found
+        none => {}
+    }
+    let made = platform_classify(g.platform, sig)
+    g.plans[sig] = made
+    made
+}
+
+fn eightbytes(t: *types.Type) -> []Class {
+    if !types.c_struct(t) {
+        if types.is_float(t) {
+            return [ClassVector]
+        }
+        return [ClassInteger]
+    }
+    var classes: []Class = []
+    for _ in 0..types.size(t) {
+        push(mut classes, ClassVector)
+    }
+    visit_eightbytes(t, 0, mut classes)
+    classes
+}
+
+fn visit_eightbytes(s: *types.Type, base: i64, mut classes: []Class) {
+    for f in s.fields {
+        let at = base + f.bytes
+        if types.c_struct(f.type) {
+            visit_eightbytes(f.type, at, mut classes)
+            continue
+        }
+        if !types.is_float(f.type) {
+            classes[at / 8] = ClassInteger
+        }
+    }
+}
+
+struct ArgRegisters {
+    ints: i64 = 0
+    vectors: i64 = 0
+}
+
+struct Assigned {
+    args: []CArg = []
+    ok: bool = false
+}
+
+fn assign_registers(r: *ArgRegisters, classes: []Class) -> Assigned {
+    var ints = r.ints
+    var vectors = r.vectors
+    var args: []CArg = []
+    let regs = sysv_int_regs()
+    for c in classes {
+        if c == ClassInteger {
+            if ints == regs.len {
+                return Assigned {}
+            }
+            push(mut args, CArg { class: ClassInteger, words: 1, reg: regs[ints] })
+            ints += 1
+            continue
+        }
+        if vectors == sysv_vector_regs {
+            return Assigned {}
+        }
+        push(mut args, CArg { class: ClassVector, words: 1, xmm: "xmm{vectors}" })
+        vectors += 1
+    }
+    r.ints = ints
+    r.vectors = vectors
+    Assigned { args, ok: true }
+}
+
+fn sysv_plan(sig: *ir.CSig) -> *CPlan {
+    let plan = new(CPlan { symbol: sig.symbol, ret: sig.ret })
+    let regs = new(ArgRegisters {})
+    if !types.is_void(sig.ret) {
+        if types.c_struct(sig.ret) && sig.ret.bytes > 16 {
+            plan.memory = true
+            regs.ints = 1
+        } else {
+            plan.results = eightbytes(sig.ret)
+        }
+    }
+    for i, t in sig.args {
+        var classes: []Class = [ClassInteger]
+        if !sig.by_ref[i] {
+            classes = eightbytes(t)
+        }
+        var assigned = Assigned {}
+        let oversized = types.c_struct(t) && !sig.by_ref[i] && t.bytes > 16
+        if !oversized {
+            assigned = regs.assign_registers(classes)
+        }
+        if !assigned.ok {
+            for _ in classes {
+                push(mut plan.args, CArg { class: ClassStack, words: 1, slot: plan.stack_words })
+                plan.stack_words += 1
+            }
+            continue
+        }
+        plan.args = slices.concat(plan.args, assigned.args)
+    }
+    plan.vectors = regs.vectors
+    plan
+}
+
+fn win64_register(t: *types.Type) -> bool {
+    !types.c_struct(t) || t.bytes == 1 || t.bytes == 2 || t.bytes == 4 || t.bytes == 8
+}
+
+fn win64_class(t: *types.Type) -> Class {
+    if !types.c_struct(t) && types.is_float(t) {
+        return ClassVector
+    }
+    ClassInteger
+}
+
+fn win64_plan(sig: *ir.CSig) -> *CPlan {
+    let plan = new(CPlan { symbol: sig.symbol, ret: sig.ret })
+    var slots = 0
+    let regs = win64_int_regs()
+    if !types.is_void(sig.ret) {
+        if win64_register(sig.ret) {
+            plan.results = [win64_class(sig.ret)]
+        } else {
+            plan.memory = true
+            slots = 1
+        }
+    }
+    for i, t in sig.args {
+        var arg = CArg { class: ClassInteger, words: 1 }
+        if !sig.by_ref[i] && !win64_register(t) {
+            arg = CArg { class: ClassByRef, words: types.size(t), copy: plan.copy_words }
+            plan.copy_words += types.size(t)
+        } else if !sig.by_ref[i] {
+            arg.class = win64_class(t)
+        }
+        if slots < regs.len {
+            arg.reg = regs[slots]
+            if arg.class == ClassVector {
+                arg.xmm = "xmm{slots}"
+            }
+        } else {
+            arg.slot = slots
+        }
+        push(mut plan.args, arg)
+        slots += 1
+    }
+    plan.stack_words = max_int(regs.len, slots)
+    plan
+}

@@ -1,0 +1,304 @@
+import ir
+import std/slices
+
+const max_join_size = 8
+
+fn predecessors(f: *Mfunc) -> [*Mblock: []*Mblock] {
+    var preds: [*Mblock: []*Mblock] = [:]
+    for mb in f.blocks {
+        for s in mb.succs {
+            var list = preds[s] ?? []
+            push(mut list, mb)
+            preds[s] = list
+        }
+    }
+    preds
+}
+
+fn reach(f: *Mfunc, from: *Mblock, avoid: *Mblock?) -> [*Mblock: bool] {
+    var seen: [*Mblock: bool] = [:]
+    var stack: []*Mblock = [from]
+    for stack.len > 0 {
+        let mb = stack[stack.len - 1]
+        truncate(mut stack, stack.len - 1)
+        if (seen[mb] ?? false) || avoid == mb {
+            continue
+        }
+        seen[mb] = true
+        var i = mb.succs.len - 1
+        for i >= 0 {
+            push(mut stack, mb.succs[i])
+            i -= 1
+        }
+    }
+    seen
+}
+
+fn has_call(mb: *Mblock) -> bool {
+    slices.any(mb.instrs, fn(ins: *Instr) -> bool { ins.is_call() })
+}
+
+fn guard_block(f: *Mfunc, preds: [*Mblock: []*Mblock]) -> *Mblock? {
+    var calls: []*Mblock = []
+    for mb in f.blocks {
+        if mb.has_call() {
+            push(mut calls, mb)
+        }
+    }
+    if calls.len == 0 {
+        return none
+    }
+    let d = f.dominators(preds)
+    var at = d.index[calls[0]] ?? 0
+    for mb in calls[1..] {
+        at = d.intersect(at, d.index[mb] ?? 0)
+    }
+    if at == 0 {
+        return none
+    }
+    d.nodes[at]
+}
+
+fn shrink_wrap(f: *Mfunc) {
+    let preds = f.predecessors()
+    let guard = f.guard_block(preds) ?? return
+    let heavy = f.reach(guard, none)
+    let light = f.reach(f.blocks[0], guard)
+    let guard_preds = preds[guard] ?? []
+    if slices.any(guard_preds, fn(p: *Mblock) -> bool { heavy[p] ?? false }) {
+        return
+    }
+    var joins: []*Mblock = []
+    for mb in f.blocks {
+        if (heavy[mb] ?? false) && (light[mb] ?? false) {
+            push(mut joins, mb)
+        }
+    }
+    if !light_only(light) || !cloneable(joins) {
+        return
+    }
+    f.guard = guard
+    f.clone_joins(joins, light)
+    for mb in light {
+        mb.light = !(heavy[mb] ?? false)
+    }
+    f.split_at_guard(guard, heavy)
+}
+
+fn light_only(light: [*Mblock: bool]) -> bool {
+    for mb in light {
+        if mb.has_call() || mb.poll {
+            return false
+        }
+    }
+    true
+}
+
+fn cloneable(joins: []*Mblock) -> bool {
+    var count = 0
+    for j in joins {
+        count += j.instrs.len + j.copies.len
+        for s in j.succs {
+            if !slices.contains(joins, s) {
+                return false
+            }
+        }
+    }
+    count <= max_join_size
+}
+
+fn clone(mb: *Mblock) -> *Mblock {
+    let c = mb.duplicate("{mb.label}c")
+    c.light = true
+    c
+}
+
+fn duplicate(mb: *Mblock, label: str) -> *Mblock {
+    let c = new(*mb)
+    c.label = label
+    c.instrs = []
+    for ins in mb.instrs {
+        let copied = new(*ins)
+        copied.args = slices.clone(ins.args)
+        push(mut c.instrs, copied)
+    }
+    c.copies = []
+    for cp in mb.copies {
+        push(mut c.copies, new(*cp))
+    }
+    c.succs = slices.clone(mb.succs)
+    c.compare = slices.clone(mb.compare)
+    c.results = slices.clone(mb.results)
+    c
+}
+
+fn clone_joins(f: *Mfunc, joins: []*Mblock, light: [*Mblock: bool]) {
+    var clones: [*Mblock: *Mblock] = [:]
+    for j in joins {
+        clones[j] = j.clone()
+    }
+    for _, c in clones {
+        for i, s in c.succs {
+            c.succs[i] = clones[s] ?? panic("join successor outside the joins")
+        }
+    }
+    var last_ref: [*Mblock: i64] = [:]
+    for i, mb in f.blocks {
+        if !(light[mb] ?? false) || clones[mb] != none {
+            continue
+        }
+        for k, s in mb.succs {
+            match clones[s] {
+                some(c) => {
+                    mb.succs[k] = c
+                    last_ref[c] = i
+                }
+                none => {}
+            }
+        }
+    }
+    var blocks: []*Mblock = []
+    var placed: [*Mblock: bool] = [:]
+    for i, mb in f.blocks {
+        push(mut blocks, mb)
+        for j in joins {
+            let c = clones[j] ?? continue
+            let idx = last_ref[c] ?? continue
+            if idx == i && !(placed[c] ?? false) {
+                push(mut blocks, c)
+                placed[c] = true
+            }
+        }
+    }
+    for j in joins {
+        let c = clones[j] ?? continue
+        if !(placed[c] ?? false) {
+            push(mut blocks, c)
+        }
+    }
+    f.blocks = blocks
+}
+
+fn split_at_guard(f: *Mfunc, guard: *Mblock, heavy: [*Mblock: bool]) {
+    f.analyse()
+    for v in slices.clone(f.vregs) {
+        if !(guard.live_in[v] ?? false) || !v.crosses_call || v.float {
+            continue
+        }
+        let fresh = f.new_vreg()
+        fresh.scalar = v.scalar
+        if f.defined_in(heavy, v) {
+            f.rename_light(v, fresh)
+            push(mut guard.heads, new(PhiCopy { dst: v, src: fresh }))
+            continue
+        }
+        for mb in heavy {
+            mb.rename(v, fresh)
+        }
+        push(mut guard.heads, new(PhiCopy { dst: fresh, src: v }))
+    }
+    f.reset_analysis()
+}
+
+fn analyse(f: *Mfunc) {
+    f.number()
+    f.liveness()
+    f.build_ranges()
+    f.mark_call_crossings()
+}
+
+fn rename_light(f: *Mfunc, from: *Vreg, to: *Vreg) {
+    for mb in f.blocks {
+        if mb.light {
+            mb.rename(from, to)
+        }
+    }
+}
+
+fn reset_analysis(f: *Mfunc) {
+    for r in f.vregs {
+        r.ranges = []
+        r.crosses_call = false
+    }
+}
+
+fn defined_in(f: *Mfunc, blocks: [*Mblock: bool], v: *Vreg) -> bool {
+    for mb in blocks {
+        for ins in mb.instrs {
+            if ins.dst == v {
+                return true
+            }
+        }
+        for c in mb.copies {
+            if c.dst == v {
+                return true
+            }
+        }
+    }
+    false
+}
+
+fn swap(mut list: []*Vreg, from: *Vreg, to: *Vreg) {
+    for i, r in list {
+        if r == from {
+            list[i] = to
+            continue
+        }
+        match r.mem {
+            some(m) => {
+                if m.address_uses(from) {
+                    list[i] = m.renamed(from, to)
+                }
+            }
+            none => {}
+        }
+    }
+}
+
+fn rename(mb: *Mblock, from: *Vreg, to: *Vreg) {
+    for ins in mb.instrs {
+        swap(mut ins.args, from, to)
+        if ins.dst == from {
+            ins.dst = to
+        }
+    }
+    for c in mb.copies {
+        if c.src == from {
+            c.src = to
+        }
+        if c.dst == from {
+            c.dst = to
+        }
+    }
+    swap(mut mb.compare, from, to)
+    swap(mut mb.results, from, to)
+    if mb.control == from {
+        mb.control = to
+    }
+}
+
+fn mark_light(f: *Mfunc) {
+    for mb in f.blocks {
+        if !mb.light {
+            continue
+        }
+        for r in mb.live_in {
+            r.light = true
+        }
+        for r in mb.live_out {
+            r.light = true
+        }
+        for st in mb.steps {
+            for r in st.uses {
+                r.light = true
+            }
+            for r in st.defs {
+                r.light = true
+            }
+        }
+    }
+}
+
+fn restores(mb: *Mblock) -> bool {
+    mb.kind == Ret && !mb.light
+}

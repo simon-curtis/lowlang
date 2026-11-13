@@ -1,0 +1,309 @@
+import ir
+import types
+import std/builder
+import std/slices
+
+struct AddressMove {
+    reg: str
+    offset: i64
+}
+
+struct CArgMoves {
+    moves: []Pmove
+    addresses: []AddressMove
+}
+
+fn c_call(g: *Generator, fr: *Frame, ins: *Instr) {
+    let sig = ins.value.sig ?? panic("c call without a signature")
+    let cplan = g.plan(sig)
+    var args = ins.args
+    var moves: []Pmove = []
+    var callee = g.external_target(cplan.symbol)
+    if cplan.symbol == "" {
+        push(mut moves, Pmove { dst: "r10", src: fr.loc(args[0]) })
+        args = args[1..]
+        callee = "r10"
+    }
+    let prepared = g.c_args(fr, cplan, args, moves)
+    g.parallel(prepared.moves)
+    for a in prepared.addresses {
+        g.emit("lea {a.reg}, [rsp+{a.offset}]")
+    }
+    if cplan.memory {
+        g.emit("lea {platform_int_regs(g.platform)[0]}, [rsp+{8 * cplan.stack_words}]")
+    }
+    let site = g.new_label()
+    g.enter_c(site)
+    if cplan.stack_words > 0 {
+        g.emit("sub rsp, {abi_aligned_bytes(cplan.stack_words)}")
+        for i in platform_register_slots(g.platform)..cplan.stack_words {
+            g.emit("mov r11, [r12+{abi_saved_bytes + 8 * i}]")
+            g.emit("mov [rsp+{8 * i}], r11")
+        }
+    }
+    g.leave_vectors()
+    platform_variadic_count(g.platform, g, cplan)
+    g.emit("call {callee}")
+    g.safepoint_at(fr, ins, site)
+    g.leave_c()
+}
+
+fn c_args(g: *Generator, fr: *Frame, cplan: *CPlan, args: []*Vreg, initial: []Pmove) -> CArgMoves {
+    var moves = initial
+    var addresses: []AddressMove = []
+    var cursor = 0
+    for arg in cplan.args {
+        let words = args[cursor..cursor + arg.words]
+        cursor += arg.words
+        if arg.class == ClassByRef {
+            let offset = 8 * (cplan.copy_base() + arg.copy)
+            for k, w in words {
+                g.move("qword ptr [rsp+{offset + 8 * k}]", fr.loc(w))
+            }
+            addresses = g.pass_address(addresses, arg, offset)
+        } else if arg.slot >= 0 {
+            g.stack_arg(arg.slot, fr.loc(words[0]))
+        } else {
+            if arg.xmm != "" {
+                push(mut moves, fr.vector_move(arg.xmm, words[0]))
+            }
+            if arg.reg != "" {
+                push(mut moves, Pmove { dst: arg.reg, src: fr.loc(words[0]) })
+            }
+        }
+    }
+    CArgMoves { moves, addresses }
+}
+
+fn pass_address(g: *Generator, addresses: []AddressMove, arg: CArg, offset: i64) -> []AddressMove {
+    if arg.reg != "" {
+        return slices.concat(addresses, [AddressMove { reg: arg.reg, offset }])
+    }
+    g.emit("lea r11, [rsp+{offset}]")
+    g.stack_arg(arg.slot, "r11")
+    addresses
+}
+
+fn stack_arg(g: *Generator, slot: i64, src: str) {
+    g.move("qword ptr [rsp+{8 * slot}]", src)
+}
+
+fn leave_c(g: *Generator) {
+    g.emit("TEB_ENTER_CURRENT_G rbx")
+    g.emit("mov rsp, r12")
+    g.emit("call rt_exitc")
+    let saved = abi_saved()
+    var i = saved.len - 1
+    for i >= 0 {
+        g.emit("pop {saved[i]}")
+        i -= 1
+    }
+}
+
+fn enter_c(g: *Generator, label: str) {
+    for r in abi_saved() {
+        g.emit("push {r}")
+    }
+    g.emit("TLS_GET rax, TLS_G")
+    g.emit("mov [rax+G_SCANLO], rsp")
+    g.emit("lea r11, [rsp+{abi_saved_bytes}]")
+    g.emit("mov [rax+G_USERSP], r11")
+    g.emit("mov [rax+G_FP], rbp")
+    g.emit("lea r11, [rip+{label}]")
+    g.emit("mov [rax+G_PC], r11")
+    g.emit("TLS_GET rbx, TLS_M")
+    g.emit("mov r11d, INC")
+    g.emit("xchg [rbx], r11")
+    g.emit("mov r12, rsp")
+    g.emit("TEB_ENTER_OS rax, rbx")
+    g.emit("mov rsp, [rbx+M_G0SP]")
+}
+
+fn external_target(g: *Generator, symbol: str) -> str {
+    if g.table != none {
+        return "cfn_{symbol}"
+    }
+    platform_external_target(g.platform, symbol)
+}
+
+fn trampolines(g: *Generator, symbols: []str) {
+    for s in symbols {
+        builder.write(mut g.text, "\t.globl cfn_{s}\ncfn_{s}:\n\tjmp {s}\n")
+    }
+}
+
+fn thunk(g: *Generator, f: *ir.Func) {
+    g.scope = "cb_{mangle(f.name)}"
+    g.labels = 0
+    g.align(function_alignment)
+    builder.write(mut g.text, "\t.globl {g.scope}\n{g.scope}:\n")
+    let saved = platform_thunk_saved(g.platform)
+    let preserved = platform_preserved_vectors(g.platform)
+    g.emit("push rbp")
+    for r in saved {
+        g.emit("push {r}")
+    }
+    let ints = platform_int_regs(g.platform)
+    let vectors = platform_vector_regs(g.platform)
+    let register_bytes = abi_aligned_bytes(ints.len + vectors)
+    g.emit("mov r13, rsp")
+    g.emit("sub rsp, {register_bytes + 16 * preserved.len}")
+    g.emit("and rsp, -16")
+    g.emit("mov r12, rsp")
+    for i, r in ints {
+        g.emit("mov [r12+{8 * i}], {r}")
+    }
+    for i in 0..vectors {
+        g.emit("movq qword ptr [r12+{8 * (ints.len + i)}], xmm{i}")
+    }
+    for i, r in preserved {
+        g.emit("movaps xmmword ptr [r12+{register_bytes + 16 * i}], {r}")
+    }
+    g.emit("TLS_GET rbx, TLS_M")
+    g.emit("mov edi, INC")
+    g.emit("call rt_m_running")
+    g.emit("mov r14, [rbx+M_G0SP]")
+    g.emit("mov [rbx+M_G0SP], r12")
+    g.emit("TLS_GET r15, TLS_G")
+    g.emit("inc qword ptr [r15+G_LOCKEDM]")
+    g.emit("TEB_ENTER_G r15, rbx")
+    g.emit("mov rsp, [r15+G_SCANLO]")
+    g.emit("and rsp, -16")
+    for field in ["G_SCANLO", "G_USERSP", "G_PC", "G_FP", "G_PC", "G_FP"] {
+        g.emit("push qword ptr [r15+{field}]")
+    }
+    g.emit("mov rbp, rsp")
+    g.emit("push r12")
+    g.emit("push r14")
+    g.emit("push qword ptr [r15+G_USERSP]")
+    g.emit("sub rsp, 8")
+    let stack = abi_stack_words(f.param_words)
+    if stack > 0 {
+        g.emit("sub rsp, {abi_aligned_bytes(stack)}")
+    }
+    g.thunk_args(f, 8 * (saved.len + 2))
+    let site = g.new_label()
+    g.emit("call {g.call_target(f)}")
+    g.label(site)
+    push(mut g.maps, StackMap { label: site, segment: true })
+    if types.is_float(f.ret) {
+        g.emit("movq xmm0, rax")
+    }
+    for i, field in ["G_FP", "G_PC", "G_USERSP", "G_SCANLO"] {
+        g.emit("mov rcx, [rbp+{16 + 8 * i}]")
+        g.emit("mov [r15+{field}], rcx")
+    }
+    g.emit("dec qword ptr [r15+G_LOCKEDM]")
+    g.emit("TEB_ENTER_OS r15, rbx")
+    g.emit("mov rsp, r12")
+    for i, r in preserved {
+        g.emit("movaps {r}, xmmword ptr [r12+{register_bytes + 16 * i}]")
+    }
+    g.emit("mov [rbx+M_G0SP], r14")
+    g.emit("mov ecx, INC")
+    g.emit("xchg [rbx], rcx")
+    g.emit("mov rsp, r13")
+    var i = saved.len - 1
+    for i >= 0 {
+        g.emit("pop {saved[i]}")
+        i -= 1
+    }
+    g.emit("pop rbp")
+    g.emit("ret")
+}
+
+fn thunk_args(g: *Generator, f: *ir.Func, incoming: i64) {
+    var ints = 0
+    var vectors = 0
+    var spilled = 0
+    let int_regs = platform_int_regs(g.platform)
+    let vector_regs = platform_vector_regs(g.platform)
+    let positional = platform_positional(g.platform)
+    for k, t in f.c_params {
+        var src = ""
+        if positional {
+            ints = k
+            vectors = k
+        }
+        if types.is_float(t) && vectors < vector_regs {
+            src = "[r12+{8 * (int_regs.len + vectors)}]"
+            vectors += 1
+        } else if !types.is_float(t) && ints < int_regs.len {
+            src = "[r12+{8 * ints}]"
+            ints += 1
+        } else {
+            src = "[r13+{incoming + 8 * (platform_register_slots(g.platform) + spilled)}]"
+            spilled += 1
+        }
+        g.emit(widen(t, src))
+        match abi_argument(k) {
+            some(reg) => g.emit("mov {reg}, r10")
+            none => g.emit("mov {abi_outgoing(k)}, r10")
+        }
+    }
+}
+
+fn widen(t: *types.Type, src: str) -> str {
+    var bits = 0
+    if t.kind == BoolKind {
+        bits = 8
+    } else if types.packed(t) {
+        bits = t.bits
+    } else {
+        return "mov r10, qword ptr {src}"
+    }
+    let sized = "{width_name(bits)} ptr {src}"
+    if bits == 32 {
+        return extension("r10", sized, t)
+    }
+    "movzx r10, {sized}"
+}
+
+fn c_result(g: *Generator, fr: *Frame, ins: *Instr, cplan: *CPlan, k: i64) {
+    let dst = fr.loc(dest(ins))
+    if cplan.memory {
+        g.emit("mov r10, qword ptr [rsp+{8 * (cplan.stack_words + k)}]")
+        g.move(dst, "r10")
+        return
+    }
+    var ints = 0
+    var vectors = 0
+    for c in cplan.results[..k] {
+        if c == ClassVector {
+            vectors += 1
+        } else {
+            ints += 1
+        }
+    }
+    if cplan.results[k] == ClassInteger {
+        g.move(dst, abi_results()[ints])
+        return
+    }
+    let source = "xmm{vectors}"
+    if is_f32(cplan.ret) {
+        g.move_single(dst, source)
+        return
+    }
+    g.move(dst, source)
+}
+
+fn move_single(g: *Generator, dst: str, source: str) {
+    if is_xmm(dst) {
+        g.emit("xorps {dst}, {dst}")
+        g.emit("movss {dst}, {source}")
+    } else if is_reg(dst) {
+        g.emit("movd {narrow(dst, 0)}, {source}")
+    } else {
+        g.emit("movd r10d, {source}")
+        g.move(dst, "r10")
+    }
+}
+
+fn shim(g: *Generator, symbol: str, target: str, setup: []str) {
+    g.align(function_alignment)
+    builder.write(mut g.text, "\t.globl {symbol}\n{symbol}:\n")
+    for line in setup {
+        g.emit(line)
+    }
+    g.emit("jmp {target}")
+}

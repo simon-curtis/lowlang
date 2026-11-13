@@ -1,0 +1,373 @@
+import ir
+import types
+
+const max_displacement = 1 << 30
+
+struct Address {
+    base: *Vreg
+    index: *Vreg? = none
+    scale: i64 = 1
+    disp: i64 = 0
+    loaded: *types.Type? = none
+}
+
+fn new_address(base: *Vreg, disp: i64, loaded: *types.Type?) -> *Vreg {
+    new(Vreg { mem: new(Address { base, scale: 1, disp, loaded }) })
+}
+
+fn address_of(r: *Vreg) -> *Address {
+    r.mem ?? panic("operand is not a memory address")
+}
+
+fn pieces(a: *Address) -> []*Vreg {
+    var found: []*Vreg = []
+    if a.base.frame == none {
+        push(mut found, a.base)
+    }
+    match a.index {
+        some(index) => push(mut found, index)
+        none => {}
+    }
+    found
+}
+
+fn address_uses(a: *Address, r: *Vreg) -> bool {
+    a.base == r || a.index == r
+}
+
+fn renamed(a: *Address, from: *Vreg, to: *Vreg) -> *Vreg {
+    let c = new(*a)
+    if c.base == from {
+        c.base = to
+    }
+    if c.index == from {
+        c.index = to
+    }
+    new(Vreg { mem: c })
+}
+
+fn piece(fr: *Frame, r: *Vreg, scratch: str) -> str {
+    let loc = fr.loc(r)
+    if is_reg(loc) {
+        return loc
+    }
+    scratch
+}
+
+fn frame_address(fr: *Frame, r: *Vreg) -> str {
+    let m = address_of(r)
+    var disp = m.disp
+    var base = "rbp"
+    match m.base.frame {
+        some(origin) => {
+            disp += fr.slot(origin.aux)
+        }
+        none => {
+            base = fr.piece(m.base, "r10")
+        }
+    }
+    var body = base
+    match m.index {
+        some(index) => {
+            body = "{base}+{fr.piece(index, "r11")}*{m.scale}"
+        }
+        none => {}
+    }
+    if disp != 0 {
+        body = "{body}{plus(disp)}"
+    }
+    "[{body}]"
+}
+
+fn plus(n: i64) -> str {
+    if n < 0 {
+        return "{n}"
+    }
+    "+{n}"
+}
+
+fn reload_piece(g: *Generator, fr: *Frame, r: *Vreg, scratch: str) {
+    let loc = fr.loc(r)
+    if !is_reg(loc) {
+        g.move(scratch, loc)
+    }
+}
+
+fn reload_pieces(g: *Generator, fr: *Frame, r: *Vreg) {
+    let m = r.mem ?? return
+    if m.base.frame == none {
+        g.reload_piece(fr, m.base, "r10")
+    }
+    match m.index {
+        some(index) => g.reload_piece(fr, index, "r11")
+        none => {}
+    }
+}
+
+fn narrow_memory_operand(r: *Vreg) -> bool {
+    let m = r.mem ?? return false
+    let loaded = m.loaded ?? return false
+    types.is_integer(loaded) && loaded.bits < 64
+}
+
+fn overwrites_address(fr: *Frame, ins: *Instr, dst: str) -> bool {
+    let m = ins.memory_operand() ?? return false
+    for p in pieces(address_of(m)) {
+        if fr.loc(p) == dst {
+            return true
+        }
+    }
+    false
+}
+
+fn memory_operand(ins: *Instr) -> *Vreg? {
+    for a in ins.args {
+        if a.mem != none {
+            return a
+        }
+    }
+    none
+}
+
+struct Selector {
+    func: *Mfunc
+    defs: [*Vreg: *Instr] = [:]
+    uses: [*Vreg: i64] = [:]
+    address: [*Vreg: i64] = [:]
+    dead: [*Instr: bool] = [:]
+}
+
+fn new_selector(f: *Mfunc) -> *Selector {
+    let s = new(Selector { func: f })
+    s.count()
+    s
+}
+
+fn is_dead(s: *Selector, ins: *Instr) -> bool {
+    s.dead[ins] ?? false
+}
+
+fn use_count(s: *Selector, r: *Vreg) -> i64 {
+    s.uses[r] ?? 0
+}
+
+fn address_count(s: *Selector, r: *Vreg) -> i64 {
+    s.address[r] ?? 0
+}
+
+fn fold_addresses(s: *Selector) {
+    for mb in s.func.blocks {
+        for ins in mb.instrs {
+            if ins.op == OpLoad || ins.op == OpStore {
+                s.fold(address_of(ins.args[0]))
+            }
+        }
+    }
+}
+
+fn count(s: *Selector) {
+    for mb in s.func.blocks {
+        for ins in mb.instrs {
+            match ins.dst {
+                some(d) => {
+                    s.defs[d] = ins
+                }
+                none => {}
+            }
+            for a in ins.args {
+                s.use(a)
+            }
+            if ins.op == OpLoad || ins.op == OpStore {
+                s.address[address_of(ins.args[0]).base] += 1
+            }
+        }
+        for r in mb.terminator_uses() {
+            s.use(r)
+        }
+        for c in mb.copies {
+            s.use(c.src)
+        }
+    }
+}
+
+fn use(s: *Selector, r: *Vreg) {
+    match r.mem {
+        some(m) => {
+            for p in pieces(m) {
+                s.uses[p] += 1
+            }
+        }
+        none => {
+            s.uses[r] += 1
+        }
+    }
+}
+
+fn foldable(s: *Selector, v: *Vreg) -> *Instr? {
+    let d = s.defs[v] ?? return none
+    if v.fixed() || s.is_dead(d) || s.use_count(v) != s.address_count(v) {
+        return none
+    }
+    if d.op != OpAdd || !word_arithmetic(d.value.type) {
+        return none
+    }
+    d
+}
+
+fn word_arithmetic(t: *types.Type?) -> bool {
+    match t {
+        some(ty) => types.is_integer(ty) && ty.bits == 64
+        none => true
+    }
+}
+
+fn fold(s: *Selector, m: *Address) {
+    for {
+        let d = s.foldable(m.base) ?? return
+        if !s.absorb(m, d) {
+            return
+        }
+    }
+}
+
+fn absorb(s: *Selector, m: *Address, d: *Instr) -> bool {
+    let x = d.args[0]
+    let y = d.args[1]
+    let next = new(*m)
+    if y.konst != none {
+        next.base = x
+        next.disp = m.disp + (y.konst ?? 0)
+    } else if x.konst != none {
+        next.base = y
+        next.disp = m.disp + (x.konst ?? 0)
+    } else if m.index != none {
+        return false
+    } else if !s.split(next, x, y) {
+        return false
+    }
+    if next.disp <= -max_displacement || next.disp >= max_displacement {
+        return false
+    }
+    let old = m.base
+    s.address[old] -= 1
+    s.uses[old] -= 1
+    s.address[next.base] += 1
+    s.uses[next.base] += 1
+    match next.index {
+        some(index) => {
+            s.uses[index] += 1
+        }
+        none => {}
+    }
+    *m = *next
+    if s.use_count(old) == 0 {
+        s.kill(old)
+    }
+    true
+}
+
+struct Scaled {
+    index: *Vreg
+    scale: i64
+}
+
+fn split(s: *Selector, m: *Address, x: *Vreg, y: *Vreg) -> bool {
+    match s.scaled(y) {
+        some(found) => {
+            if x.frame == none {
+                m.base = x
+                m.index = found.index
+                m.scale = found.scale
+                return true
+            }
+        }
+        none => {}
+    }
+    match s.scaled(x) {
+        some(found) => {
+            if y.frame == none {
+                m.base = y
+                m.index = found.index
+                m.scale = found.scale
+                return true
+            }
+        }
+        none => {}
+    }
+    var base = x
+    var index = y
+    if y.frame != none && x.frame != none {
+        return false
+    } else if y.frame != none {
+        base = y
+        index = x
+    } else if x.fixed() || y.fixed() {
+        return false
+    }
+    m.base = base
+    m.index = index
+    m.scale = 1
+    true
+}
+
+fn scaled(s: *Selector, r: *Vreg) -> Scaled? {
+    let d = s.defs[r] ?? return none
+    if s.is_dead(d) || s.use_count(r) != 1 || r.fixed() || (d.op != OpShl && d.op != OpMul) || !word_arithmetic(d.value.type) {
+        return none
+    }
+    let x = d.args[0]
+    let k = d.args[1].konst ?? return none
+    if x.fixed() {
+        return none
+    }
+    if d.op == OpShl && k >= 0 && k <= 3 {
+        return Scaled { index: x, scale: 1 << k }
+    }
+    if d.op == OpMul && (k == 1 || k == 2 || k == 4 || k == 8) {
+        return Scaled { index: x, scale: k }
+    }
+    none
+}
+
+fn kill(s: *Selector, r: *Vreg) {
+    let d = s.defs[r] ?? return
+    if s.is_dead(d) || !discardable(d) {
+        return
+    }
+    s.dead[d] = true
+    for a in d.args {
+        if a.mem != none || a.fixed() {
+            continue
+        }
+        s.uses[a] -= 1
+        if s.use_count(a) == 0 {
+            s.kill(a)
+        }
+    }
+}
+
+fn discardable(ins: *Instr) -> bool {
+    match ins.op {
+        OpAdd => word_arithmetic(ins.value.type)
+        OpShl => word_arithmetic(ins.value.type)
+        OpMul => word_arithmetic(ins.value.type)
+        OpString => true
+        _ => false
+    }
+}
+
+fn sweep(s: *Selector) {
+    for mb in s.func.blocks {
+        var kept: []*Instr = []
+        for ins in mb.instrs {
+            if !s.is_dead(ins) && !s.unused_constant(ins) {
+                push(mut kept, ins)
+            }
+        }
+        mb.instrs = kept
+    }
+}
+
+fn unused_constant(s: *Selector, ins: *Instr) -> bool {
+    ins.op == OpConst && s.use_count(dest(ins)) == 0
+}
