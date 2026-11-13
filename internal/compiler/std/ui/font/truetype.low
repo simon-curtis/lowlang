@@ -1,0 +1,315 @@
+struct Span {
+    start: i64
+    end: i64
+}
+
+struct Matrix {
+    xx: i64
+    xy: i64
+    yx: i64
+    yy: i64
+}
+
+struct Coordinates {
+    values: []i64
+    next: i64
+}
+
+struct Loaded {
+    outline: ScaledOutline
+    origin: i64
+}
+
+struct Component {
+    flags: i64
+    glyph: i64
+    first: i64
+    second: i64
+    matrix: Matrix
+    next: i64
+}
+
+const max_depth = 6
+const max_components = 64
+const unit_scale = 0x10000
+const identity = 0x10000
+const overlap_simple = 0x40
+const overlap_compound = 0x400
+const scaled_component_offset = 0x800
+const use_my_metrics = 0x200
+
+fn empty_outline() -> ScaledOutline {
+    ScaledOutline { points: [], ends: [], overlap: false }
+}
+
+fn glyph_span(f: Font, glyph: i64) -> Span {
+    if glyph < 0 || glyph >= f.glyph_count {
+        return Span { start: 0, end: 0 }
+    }
+    let start = loca_entry(f.data, f.loca, f.long_loca, glyph)
+    let end = loca_entry(f.data, f.loca, f.long_loca, glyph + 1)
+    Span { start: f.glyf + start, end: f.glyf + end }
+}
+
+fn load_scaled(f: Font, glyph: i64, scale: i64) -> ScaledOutline? {
+    var budget = max_components
+    let loaded = load_glyph(f, glyph, scale, 0, mut budget) ?? return none
+    if loaded.origin == 0 {
+        return loaded.outline
+    }
+    translated(loaded.outline, -loaded.origin, 0)
+}
+
+fn load_glyph(f: Font, glyph: i64, scale: i64, depth: i64, mut budget: i64) -> Loaded? {
+    if depth > max_depth {
+        return none
+    }
+    let span = glyph_span(f, glyph)
+    let bearing = left_bearing(f, glyph)
+    if span.end == span.start {
+        return Loaded { outline: empty_outline(), origin: mul_fix(-bearing, scale) }
+    }
+    if span.end - span.start < 10 {
+        return none
+    }
+    let count = be16_signed(f.data, span.start)
+    if count == 0 {
+        return Loaded { outline: empty_outline(), origin: mul_fix(-bearing, scale) }
+    }
+    let x_min = be16_signed(f.data, span.start + 2)
+    let origin = mul_fix(x_min - bearing, scale)
+    if count > 0 {
+        let outline = simple_outline(f.data, span, count, scale) ?? return none
+        return Loaded { outline, origin }
+    }
+    composite_glyph(f, span, scale, origin, depth, mut budget)
+}
+
+fn simple_outline(d: str, span: Span, count: i64, scale: i64) -> ScaledOutline? {
+    let ends_at = span.start + 10
+    var ends: []i64 = []
+    var previous = -1
+    if ends_at + 2 * count + 2 > span.end {
+        return none
+    }
+    for i in 0..count {
+        let end = be16(d, ends_at + 2 * i)
+        if end <= previous {
+            return none
+        }
+        ends.push(end)
+        previous = end
+    }
+    let total = previous + 1
+    let flags_at = ends_at + 2 * count + 2 + be16(d, ends_at + 2 * count)
+    let flags = read_flags(d, flags_at, span.end, total) ?? return none
+    let xs = read_coordinates(d, flags.next, span.end, flags.values, 2, 16) ?? return none
+    let ys = read_coordinates(d, xs.next, span.end, flags.values, 4, 32) ?? return none
+    var points: []ScaledPoint = []
+    for i in 0..total {
+        let x = mul_fix(xs.values[i], scale)
+        let y = mul_fix(ys.values[i], scale)
+        points.push(ScaledPoint { x, y, on_curve: flags.values[i] & 1 != 0 })
+    }
+    let overlap = flags.values[0] & overlap_simple != 0
+    ScaledOutline { points, ends, overlap }
+}
+
+fn read_flags(d: str, at: i64, end: i64, total: i64) -> Coordinates? {
+    var flags: []i64 = []
+    var pos = at
+    for flags.len < total {
+        if pos >= end {
+            return none
+        }
+        let flag = byte(d, pos)
+        pos += 1
+        flags.push(flag)
+        if flag & 8 != 0 {
+            if pos >= end {
+                return none
+            }
+            var repeats = byte(d, pos)
+            pos += 1
+            for repeats > 0 && flags.len < total {
+                flags.push(flag)
+                repeats -= 1
+            }
+        }
+    }
+    Coordinates { values: flags, next: pos }
+}
+
+fn read_coordinates(d: str, at: i64, end: i64, flags: []i64, short: i64, same: i64) -> Coordinates? {
+    var values: []i64 = []
+    var pos = at
+    var current = 0
+    for flag in flags {
+        if flag & short != 0 {
+            if pos + 1 > end {
+                return none
+            }
+            let step = byte(d, pos)
+            current += if flag & same != 0 { step } else { -step }
+            pos += 1
+        } else if flag & same == 0 {
+            if pos + 2 > end {
+                return none
+            }
+            current += be16_signed(d, pos)
+            pos += 2
+        }
+        values.push(current)
+    }
+    Coordinates { values, next: pos }
+}
+
+fn composite_glyph(f: Font, span: Span, scale: i64, origin: i64, depth: i64, mut budget: i64) -> Loaded? {
+    var points: []ScaledPoint = []
+    var ends: []i64 = []
+    var overlap = false
+    var first_flags = 0
+    var shift = origin
+    var pos = span.start + 10
+    var index = 0
+    for {
+        let part = read_component(f, pos, span.end) ?? return none
+        if index == 0 {
+            first_flags = part.flags
+        }
+        index += 1
+        pos = part.next
+        budget -= 1
+        if budget < 0 {
+            return none
+        }
+        let child = load_glyph(f, part.glyph, scale, depth + 1, mut budget) ?? return none
+        overlap = overlap || child.outline.overlap
+        if part.flags & use_my_metrics != 0 {
+            shift = child.origin
+        }
+        if child.outline.points.len > 0 {
+            let moved = place_component(points, child.outline.points, part, scale) ?? return none
+            for end in child.outline.ends {
+                ends.push(points.len + end)
+            }
+            for p in moved {
+                points.push(p)
+            }
+        }
+        if part.flags & 32 == 0 {
+            break
+        }
+    }
+    if depth == 0 && first_flags & overlap_compound != 0 {
+        overlap = true
+    }
+    Loaded { outline: ScaledOutline { points, ends, overlap }, origin: shift }
+}
+
+fn read_component(f: Font, pos: i64, end: i64) -> Component? {
+    if pos + 4 > end {
+        return none
+    }
+    let flags = be16(f.data, pos)
+    let glyph = be16(f.data, pos + 2)
+    let words = flags & 1 != 0
+    let offsets = flags & 2 != 0
+    let arg_width = if words { 2 } else { 1 }
+    let matrix_size = matrix_bytes(flags)
+    let next = pos + 4 + 2 * arg_width + matrix_size
+    if next > end || glyph >= f.glyph_count {
+        return none
+    }
+    let first = argument(f.data, pos + 4, words, offsets)
+    let second = argument(f.data, pos + 4 + arg_width, words, offsets)
+    let matrix = read_matrix(f.data, pos + 4 + 2 * arg_width, flags)
+    Component { flags, glyph, first, second, matrix, next }
+}
+
+fn argument(d: str, at: i64, words: bool, signed: bool) -> i64 {
+    if words && signed {
+        be16_signed(d, at)
+    } else if words {
+        be16(d, at)
+    } else if signed {
+        byte_signed(d, at)
+    } else {
+        byte(d, at)
+    }
+}
+
+fn matrix_bytes(flags: i64) -> i64 {
+    if flags & 8 != 0 {
+        2
+    } else if flags & 64 != 0 {
+        4
+    } else if flags & 128 != 0 {
+        8
+    } else {
+        0
+    }
+}
+
+fn read_matrix(d: str, at: i64, flags: i64) -> Matrix {
+    if flags & 8 != 0 {
+        let s = component_scale(d, at)
+        Matrix { xx: s, xy: 0, yx: 0, yy: s }
+    } else if flags & 64 != 0 {
+        Matrix { xx: component_scale(d, at), xy: 0, yx: 0, yy: component_scale(d, at + 2) }
+    } else if flags & 128 != 0 {
+        Matrix { xx: component_scale(d, at), yx: component_scale(d, at + 2), xy: component_scale(d, at + 4), yy: component_scale(d, at + 6) }
+    } else {
+        Matrix { xx: identity, xy: 0, yx: 0, yy: identity }
+    }
+}
+
+fn place_component(base: []ScaledPoint, child: []ScaledPoint, part: Component, scale: i64) -> []ScaledPoint? {
+    let transformed = if part.flags & 0xC8 != 0 { transform_points(child, part.matrix) } else { child }
+    var dx = 0
+    var dy = 0
+    if part.flags & 2 == 0 {
+        if part.first >= base.len || part.second >= transformed.len {
+            return none
+        }
+        dx = base[part.first].x - transformed[part.second].x
+        dy = base[part.first].y - transformed[part.second].y
+    } else if part.first != 0 || part.second != 0 {
+        dx = part.first
+        dy = part.second
+        if part.flags & 0xC8 != 0 && part.flags & scaled_component_offset != 0 {
+            let along_x = vector_length(part.matrix.xx, part.matrix.xy)
+            let along_y = vector_length(part.matrix.yy, part.matrix.yx)
+            dx = mul_fix(dx, along_x)
+            dy = mul_fix(dy, along_y)
+        }
+        dx = mul_fix(dx, scale)
+        dy = mul_fix(dy, scale)
+    }
+    if dx == 0 && dy == 0 {
+        return transformed
+    }
+    shifted_points(transformed, dx, dy)
+}
+
+fn transform_points(points: []ScaledPoint, m: Matrix) -> []ScaledPoint {
+    var out: []ScaledPoint = []
+    for p in points {
+        let x = mul_fix(p.x, m.xx) + mul_fix(p.y, m.xy)
+        let y = mul_fix(p.x, m.yx) + mul_fix(p.y, m.yy)
+        out.push(ScaledPoint { x, y, on_curve: p.on_curve })
+    }
+    out
+}
+
+fn shifted_points(points: []ScaledPoint, dx: i64, dy: i64) -> []ScaledPoint {
+    var out: []ScaledPoint = []
+    for p in points {
+        out.push(ScaledPoint { x: p.x + dx, y: p.y + dy, on_curve: p.on_curve })
+    }
+    out
+}
+
+fn translated(shape: ScaledOutline, dx: i64, dy: i64) -> ScaledOutline {
+    ScaledOutline { points: shifted_points(shape.points, dx, dy), ends: shape.ends, overlap: shape.overlap }
+}

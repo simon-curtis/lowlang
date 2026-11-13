@@ -62,13 +62,13 @@ func installedFonts(t *testing.T) []string {
 	return opentype
 }
 
-func buildFontProgram(t *testing.T) string {
+func buildProgram(t *testing.T, dir string) string {
 	t.Helper()
-	unit, err := compiler.Analyse("fonttest", compiler.Release(target.Linux))
+	unit, err := compiler.Analyse(dir, compiler.Release(target.Linux))
 	if err != nil {
 		t.Fatal(err)
 	}
-	binary := filepath.Join(t.TempDir(), "fonttest")
+	binary := filepath.Join(t.TempDir(), filepath.Base(dir))
 	if _, err := compiler.Build(context.Background(), unit, binary); err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func number(t *testing.T, text string) float64 {
 func TestInstalledOpenTypeFonts(t *testing.T) {
 	fixturetest.RequireLinuxHost(t)
 	paths := installedFonts(t)
-	binary := buildFontProgram(t)
+	binary := buildProgram(t, "fonttest")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	stdout, err := exec.CommandContext(ctx, binary, paths...).Output()

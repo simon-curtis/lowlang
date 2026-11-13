@@ -14,299 +14,124 @@ pub struct Bitmap {
     pub coverage: []u8
 }
 
-struct Space {
-    scale: f32
-    left: f32
-    top: f32
-}
-
-struct Canvas {
+struct PixelBox {
+    left: i64
+    top: i64
     width: i64
     height: i64
-    cells: []f32
-}
-
-struct Walk {
-    at: geometry.Point
-    control: geometry.Point
-    pending: bool
 }
 
 const max_side = 2048
-const flatness: f32 = 0.05
+const reach_per_ppem = 16
+const largest_size: f32 = 65536.0
+const coordinate_limit: f32 = 1048576.0
 
 /// Returns the coverage of `glyph` with the em square `pixel_size` pixels tall, the pen at the origin of an integer pixel grid.
 ///
-/// The outline is flattened into lines, each of which adds its signed area and cover to the pixels it crosses; a running sum along each row then gives the winding coverage, clamped to full.
+/// The bitmap is the one FreeType 2.15 renders without hinting (`FT_LOAD_NO_HINTING`, `FT_RENDER_MODE_NORMAL`) at the character size `pixel_size` rounded to 1/64 pixel: the same `width`, `height`, `left`, `top` and coverage bytes for a TrueType glyph. The outline is scaled to 26.6 fixed point with FreeType's integer arithmetic, and its lines and quadratic curves are accumulated into 1/256 pixel cells that give the non-zero winding coverage, as FreeType's smooth rasteriser does. An outline that sets the overlap flag is drawn at four times the resolution and averaged.
 ///
-/// A glyph with no outline, a `pixel_size` that is not positive and a glyph more than 2048 pixels wide or tall give an empty bitmap.
+/// A size below one pixel is drawn as one pixel. A glyph with no outline and a glyph the font does not have give a bitmap with no columns or rows. A `pixel_size` that is not positive or reaches 65536, a glyph wider or taller than 16 times the pixel size, and a glyph more than 2048 pixels wide or tall give an empty bitmap.
 pub fn rasterize(f: Font, glyph: i64, pixel_size: f32) -> Bitmap {
     rasterize_at(f, glyph, pixel_size, 0.0)
 }
 
-/// Returns the coverage of `glyph` as `rasterize` does, with the pen `pen_x` pixels right of the origin of the pixel grid, so a glyph placed at a fraction of a pixel keeps its shape and spacing. `left` counts from the grid's origin.
+/// Returns the coverage of `glyph` as `rasterize` does, with the pen `pen_x` pixels right of the origin of the pixel grid, rounded to 1/64 pixel, so a glyph placed at a fraction of a pixel keeps its shape and spacing. `left` counts from the grid's origin.
+///
+/// FreeType renders the same bitmap for an outline moved right by `pen_x` before it is drawn.
 pub fn rasterize_at(f: Font, glyph: i64, pixel_size: f32, pen_x: f32) -> Bitmap {
-    if !(pixel_size > 0.0) {
+    let sizes_fit = pixel_size > 0.0 && pixel_size < largest_size
+    let pen_fits = pen_x > -coordinate_limit && pen_x < coordinate_limit
+    if !sizes_fit || !pen_fits {
         return empty_bitmap()
     }
-    let shape = outline(f, glyph)
-    let s = scale(f, pixel_size)
-    let box = geometry.offset(bounds(shape, s), pen_x, 0.0)
-    let left = i64(floor(box.x))
-    let top = i64(floor(box.y))
-    let width = ceil_i(box.x + box.width) - left
-    let height = ceil_i(box.y + box.height) - top
-    if width <= 0 || height <= 0 || width > max_side || height > max_side {
-        return empty_bitmap()
-    }
-    var canvas = Canvas { width, height, cells: __make(width * height + 4) }
-    let space = Space { scale: s, left: f32(left) - pen_x, top: f32(top) }
-    for c in shape.contours {
-        trace(mut canvas, c, space)
-    }
-    Bitmap { width, height, left, top, coverage: resolve(canvas, NonZero) }
+    let size = max_of(to_fixed(pixel_size), one_pixel)
+    let phase = to_fixed(pen_x)
+    let request = request_size(f, size) ?? return empty_bitmap()
+    let shape = scaled_outline(f, glyph, request.scale) ?? return empty_bitmap()
+    let reach = min_of(max_side, reach_per_ppem * request.ppem)
+    draw(shape, phase, reach, false)
 }
 
 /// Returns the coverage of `polygons`, in pixels and each closed implicitly, filled by `rule`; `NonZero` fills as `rasterize` fills a glyph. `left` and `top` are the pixel position of the first column and row.
 ///
-/// Polygons that cover nothing, or more than 2048 pixels wide or tall, give an empty bitmap.
+/// Each point is rounded to 1/64 pixel and its area is accumulated as FreeType's smooth rasteriser does, so a polygon's coverage is the coverage FreeType gives the same outline.
+///
+/// Polygons that cover nothing, or more than 2048 pixels wide or tall, or reach a point a million pixels from the origin, give an empty bitmap.
 pub fn fill(polygons: [][]geometry.Point, rule: geometry.FillRule) -> Bitmap {
-    var box = geometry.Rect {}
-    var seen = false
-    for poly in polygons {
-        for p in poly {
-            let dot = geometry.rect(p.x, p.y, 0.0, 0.0)
-            box = if seen { geometry.union(box, dot) } else { dot }
-            seen = true
-        }
+    let shape = polygon_outline(polygons) ?? return empty_bitmap()
+    let even_odd = match rule {
+        NonZero => false
+        EvenOdd => true
     }
-    let left = i64(floor(box.x))
-    let top = i64(floor(box.y))
-    let width = ceil_i(box.x + box.width) - left
-    let height = ceil_i(box.y + box.height) - top
-    if width <= 0 || height <= 0 || width > max_side || height > max_side {
+    let bitmap = draw(shape, 0, max_side, even_odd)
+    if bitmap.width == 0 || bitmap.height == 0 {
         return empty_bitmap()
     }
-    var canvas = Canvas { width, height, cells: __make(width * height + 4) }
-    for poly in polygons {
-        let n = poly.len
-        for i, p in poly {
-            let q = poly[(i + 1) % n]
-            line(mut canvas, geometry.point(p.x - f32(left), p.y - f32(top)), geometry.point(q.x - f32(left), q.y - f32(top)))
-        }
-    }
-    Bitmap { width, height, left, top, coverage: resolve(canvas, rule) }
+    bitmap
 }
 
 fn empty_bitmap() -> Bitmap {
     Bitmap { width: 0, height: 0, left: 0, top: 0, coverage: [] }
 }
 
-fn bounds(shape: Outline, s: f32) -> geometry.Rect {
-    var x0: f32 = 0.0
-    var y0: f32 = 0.0
-    var x1: f32 = 0.0
-    var y1: f32 = 0.0
-    var seen = false
-    for c in shape.contours {
-        for p in c.points {
-            let x = p.x * s
-            let y = -p.y * s
-            if !seen || x < x0 {
-                x0 = x
-            }
-            if !seen || x > x1 {
-                x1 = x
-            }
-            if !seen || y < y0 {
-                y0 = y
-            }
-            if !seen || y > y1 {
-                y1 = y
-            }
-            seen = true
+fn to_fixed(v: f32) -> i64 {
+    i64(floor(v * 64.0 + 0.5))
+}
+
+fn polygon_outline(polygons: [][]geometry.Point) -> ScaledOutline? {
+    var points: []ScaledPoint = []
+    var ends: []i64 = []
+    for polygon in polygons {
+        if polygon.len == 0 {
+            continue
         }
-    }
-    geometry.rect(x0, y0, x1 - x0, y1 - y0)
-}
-
-fn ceil_i(v: f32) -> i64 {
-    let whole = i64(floor(v))
-    if f32(whole) < v {
-        whole + 1
-    } else {
-        whole
-    }
-}
-
-fn pixel(sp: Space, p: Point) -> geometry.Point {
-    geometry.point(p.x * sp.scale - sp.left, -p.y * sp.scale - sp.top)
-}
-
-fn midpoint(a: geometry.Point, b: geometry.Point) -> geometry.Point {
-    geometry.point((a.x + b.x) * 0.5, (a.y + b.y) * 0.5)
-}
-
-fn trace(mut cv: Canvas, c: Contour, sp: Space) {
-    let n = c.points.len
-    if n < 2 {
-        return
-    }
-    var first = 0
-    for first < n && !c.points[first].on_curve {
-        first += 1
-    }
-    var walk = Walk { at: pixel(sp, c.points[0]), control: geometry.point(0.0, 0.0), pending: false }
-    var from = 0
-    var count = n
-    if first < n {
-        walk.at = pixel(sp, c.points[first])
-        from = first + 1
-        count = n - 1
-    } else {
-        let last = pixel(sp, c.points[n - 1])
-        walk.at = midpoint(last, walk.at)
-    }
-    let start = walk.at
-    for k in 0..count {
-        let q = c.points[(from + k) % n]
-        let target = pixel(sp, q)
-        step(mut cv, mut walk, target, q.on_curve)
-    }
-    if walk.pending {
-        curve(mut cv, walk.at, walk.control, start)
-    } else {
-        line(mut cv, walk.at, start)
-    }
-}
-
-fn step(mut cv: Canvas, mut walk: Walk, q: geometry.Point, on_curve: bool) {
-    if on_curve {
-        if walk.pending {
-            curve(mut cv, walk.at, walk.control, q)
-        } else {
-            line(mut cv, walk.at, q)
+        for p in polygon {
+            let inside = p.x > -coordinate_limit && p.x < coordinate_limit && p.y > -coordinate_limit && p.y < coordinate_limit
+            if !inside {
+                return none
+            }
+            let x = to_fixed(p.x)
+            let y = -to_fixed(p.y)
+            points.push(ScaledPoint { x, y, on_curve: true })
         }
-        walk.at = q
-        walk.pending = false
-    } else if walk.pending {
-        let mid = midpoint(walk.control, q)
-        curve(mut cv, walk.at, walk.control, mid)
-        walk.at = mid
-        walk.control = q
-    } else {
-        walk.control = q
-        walk.pending = true
+        ends.push(points.len - 1)
     }
+    ScaledOutline { points, ends, overlap: false }
 }
 
-fn curve(mut cv: Canvas, p0: geometry.Point, c: geometry.Point, p2: geometry.Point) {
-    let dx = p0.x - 2.0 * c.x + p2.x
-    let dy = p0.y - 2.0 * c.y + p2.y
-    var n = i64(sqrt(sqrt(dx * dx + dy * dy) / (4.0 * flatness))) + 1
-    if n > 64 {
-        n = 64
+fn draw(shape: ScaledOutline, phase: i64, reach: i64, even_odd: bool) -> Bitmap {
+    let placed = translated(shape, phase, 0)
+    let box = pixel_box(placed)
+    if box.width > reach || box.height > reach {
+        return empty_bitmap()
     }
-    var previous = p0
-    for i in 1..n + 1 {
-        let t = f32(i) / f32(n)
-        let u = 1.0 - t
-        let next = geometry.point(u * u * p0.x + 2.0 * u * t * c.x + t * t * p2.x, u * u * p0.y + 2.0 * u * t * c.y + t * t * p2.y)
-        line(mut cv, previous, next)
-        previous = next
+    let top = -box.top
+    if box.width == 0 || box.height == 0 {
+        return Bitmap { width: box.width, height: box.height, left: box.left, top, coverage: [] }
     }
+    let bottom = box.top - box.height
+    let grid = translated(placed, -box.left * one_pixel, -bottom * one_pixel)
+    let coverage = render_coverage(grid, box.width, box.height, even_odd)
+    Bitmap { width: box.width, height: box.height, left: box.left, top, coverage }
 }
 
-fn clamp(v: f32, hi: f32) -> f32 {
-    if v < 0.0 {
-        0.0
-    } else if v > hi {
-        hi
-    } else {
-        v
+fn pixel_box(shape: ScaledOutline) -> PixelBox {
+    if shape.points.len == 0 {
+        return PixelBox { left: 0, top: 0, width: 0, height: 0 }
     }
-}
-
-fn line(mut cv: Canvas, a: geometry.Point, b: geometry.Point) {
-    let w = f32(cv.width)
-    let h = f32(cv.height)
-    var x0 = clamp(a.x, w)
-    var y0 = clamp(a.y, h)
-    var x1 = clamp(b.x, w)
-    var y1 = clamp(b.y, h)
-    if y0 == y1 {
-        return
+    var x_min = shape.points[0].x
+    var x_max = x_min
+    var y_min = shape.points[0].y
+    var y_max = y_min
+    for p in shape.points {
+        x_min = min_of(x_min, p.x)
+        x_max = max_of(x_max, p.x)
+        y_min = min_of(y_min, p.y)
+        y_max = max_of(y_max, p.y)
     }
-    var dir: f32 = 1.0
-    if y0 > y1 {
-        dir = -1.0
-        let tx = x0
-        let ty = y0
-        x0 = x1
-        y0 = y1
-        x1 = tx
-        y1 = ty
-    }
-    let dxdy = (x1 - x0) / (y1 - y0)
-    var x = x0
-    for row in i64(y0)..ceil_i(y1) {
-        let top = if f32(row) > y0 { f32(row) } else { y0 }
-        let bottom = if f32(row + 1) < y1 { f32(row + 1) } else { y1 }
-        let dy = bottom - top
-        let next = x + dxdy * dy
-        cover(mut cv, row * cv.width, x, next, dy * dir)
-        x = next
-    }
-}
-
-fn cover(mut cv: Canvas, start: i64, xa: f32, xb: f32, d: f32) {
-    let lo = if xa < xb { xa } else { xb }
-    let hi = if xa < xb { xb } else { xa }
-    let lo_floor = floor(lo)
-    let lo_i = i64(lo_floor)
-    let hi_i = ceil_i(hi)
-    if hi_i <= lo_i + 1 {
-        let mid = 0.5 * (xa + xb) - lo_floor
-        cv.cells[start + lo_i] += d - d * mid
-        cv.cells[start + lo_i + 1] += d * mid
-        return
-    }
-    let inverse = 1.0 / (hi - lo)
-    let lo_frac = lo - lo_floor
-    let first = 0.5 * inverse * (1.0 - lo_frac) * (1.0 - lo_frac)
-    let hi_frac = hi - f32(hi_i) + 1.0
-    let last = 0.5 * inverse * hi_frac * hi_frac
-    cv.cells[start + lo_i] += d * first
-    if hi_i == lo_i + 2 {
-        cv.cells[start + lo_i + 1] += d * (1.0 - first - last)
-    } else {
-        let second = inverse * (1.5 - lo_frac)
-        cv.cells[start + lo_i + 1] += d * (second - first)
-        for x in lo_i + 2..hi_i - 1 {
-            cv.cells[start + x] += d * inverse
-        }
-        let before_last = second + f32(hi_i - lo_i - 3) * inverse
-        cv.cells[start + hi_i - 1] += d * (1.0 - before_last - last)
-    }
-    cv.cells[start + hi_i] += d * last
-}
-
-fn resolve(cv: Canvas, rule: geometry.FillRule) -> []u8 {
-    var out: []u8 = __make(cv.width * cv.height)
-    var sum: f32 = 0.0
-    for i in 0..out.len {
-        sum += cv.cells[i]
-        let winding = if sum < 0.0 { -sum } else { sum }
-        let v = match rule {
-            NonZero => winding
-            EvenOdd => alternate(winding)
-        }
-        out[i] = u8((if v > 1.0 { 1.0 } else { v }) * 255.0 + 0.5)
-    }
-    out
-}
-
-fn alternate(winding: f32) -> f32 {
-    let folded = winding - 2.0 * floor(winding * 0.5)
-    if folded > 1.0 { 2.0 - folded } else { folded }
+    let left = x_min >> 6
+    let right = (x_max + 63) >> 6
+    let bottom = y_min >> 6
+    let top = (y_max + 63) >> 6
+    PixelBox { left, top, width: right - left, height: top - bottom }
 }
