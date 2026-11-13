@@ -26,6 +26,7 @@ const prefixes = [
     ["std/xml", ["formats"]],
     ["std/yaml", ["formats"]],
     ["std/net", ["net"]],
+    ["std/quic", ["net"]],
     ["std/socks", ["net"]],
     ["std/http", ["net", "web"]],
     ["std/uri", ["net", "web"]],
