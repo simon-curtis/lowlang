@@ -55,12 +55,16 @@ func countChecks(f *ir.Func) int {
 
 func functionAsm(t *testing.T, prog *ir.Program, name string) string {
 	t.Helper()
+	return asmAfter(t, prog, amd64.Symbol(name, "")+":\n")
+}
+
+func asmAfter(t *testing.T, prog *ir.Program, label string) string {
+	t.Helper()
 	out, err := amd64.Generate(prog, amd64.NewPlatform(target.Linux), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	asm := out.Asm
-	label := amd64.Symbol(name, "") + ":\n"
 	start := strings.Index(asm, label)
 	if start < 0 {
 		t.Fatalf("no label %s", label)
@@ -635,6 +639,60 @@ func TestSieveSliceLivesInRegisters(t *testing.T) {
 	}
 }
 
+const vectorAccumulatorProgram = `import std/simd
+
+fn accumulate(data: []u32) -> u32x8 {
+    var acc: u32x8 = simd.splat(0)
+    let cap: u32x8 = simd.splat(1000)
+    var i = 0
+    for i + 8 <= data.len {
+        let chunk: u32x8 = simd.read(data, i)
+        acc += simd.min(chunk, cap)
+        i += 8
+    }
+    acc
+}
+
+fn main() {
+    print(accumulate([1, 2, 3, 4, 5, 6, 7, 8, 9]))
+}
+`
+
+func firstBackEdge(t *testing.T, lines []string) []string {
+	t.Helper()
+	labels := map[string]int{}
+	for i, line := range lines {
+		if asmLabel.MatchString(line) {
+			labels[strings.TrimSuffix(line, ":")] = i
+		}
+	}
+	for i, line := range lines {
+		match := jumpTarget.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		if head, ok := labels[match[1]]; ok && head < i {
+			return lines[head : i+1]
+		}
+	}
+	t.Fatalf("no loop:\n%s", strings.Join(lines, "\n"))
+	return nil
+}
+
+func TestVectorAccumulatorLivesInRegisters(t *testing.T) {
+	prog := devProgram(t, vectorAccumulatorProgram)
+	body := asmAfter(t, prog, amd64.Symbol("accumulate", "")+".avx2:\n")
+	loop := firstBackEdge(t, asmLines(body))
+	for _, line := range loop {
+		if strings.Contains(line, "[rbp") {
+			t.Errorf("accumulator loop reaches the frame: %s", line)
+		}
+	}
+	if !slices.ContainsFunc(loop, func(line string) bool { return strings.HasPrefix(line, "vpaddd ymm") }) {
+		t.Errorf("accumulator loop lost its register addition:\n%s", strings.Join(loop, "\n"))
+	}
+}
+
 func TestSieveChecksOnlyTheMarkingIndex(t *testing.T) {
 	prog := devProgram(t, benchmarkSource(t, "sieve"))
 	f := function(t, prog, "sieve")
@@ -656,7 +714,7 @@ func TestSieveChecksOnlyTheMarkingIndex(t *testing.T) {
 	}
 }
 
-var jumpTarget = regexp.MustCompile(`^j[a-z]+ (\.L[A-Za-z0-9_]+)$`)
+var jumpTarget = regexp.MustCompile(`^j[a-z]+ (\.L[A-Za-z0-9_.]+)$`)
 
 func jumpsBackOver(lines []string, at int) bool {
 	labels := map[string]int{}

@@ -14,6 +14,7 @@ var (
 		"xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
 	}
 	integerRegs = abi.integers()
+	vectorRegs  = []string{"ymm8", "ymm9", "ymm10", "ymm11", "ymm12", "ymm13", "ymm14", "ymm15"}
 )
 
 type segment struct {
@@ -137,16 +138,26 @@ func (mb *mblock) buildSteps() {
 		if in.isParam() {
 			continue
 		}
-		st := step{pos: in.pos, uses: registers(in.args)}
-		if in.dst != nil {
-			st.defs = []*vreg{in.dst}
-		}
-		mb.steps = append(mb.steps, st)
+		mb.steps = append(mb.steps, in.step())
 	}
 	if len(mb.copies) > 0 {
 		mb.steps = append(mb.steps, copyStep(mb.copyPos, mb.copies))
 	}
 	mb.steps = append(mb.steps, step{pos: mb.end, uses: registers(mb.terminatorUses())})
+}
+
+func (in *instr) step() step {
+	st := step{pos: in.pos}
+	operands := in.args
+	if in.op == ir.OpVector && operands[0].home != nil {
+		st.defs = append(st.defs, operands[0])
+		operands = operands[1:]
+	}
+	st.uses = registers(operands)
+	if in.dst != nil {
+		st.defs = append(st.defs, in.dst)
+	}
+	return st
 }
 
 func (f *mfunc) liveness() {
@@ -373,6 +384,8 @@ func (f *mfunc) allocate() (spills int, saved []string) {
 
 func (a *allocator) candidates(cur *vreg) []string {
 	switch {
+	case cur.home != nil:
+		return vectorRegs
 	case cur.float:
 		return floatRegs
 	case cur.crossesCall && cur.light:
@@ -387,7 +400,7 @@ func (a *allocator) candidates(cur *vreg) []string {
 
 func (a *allocator) assign(cur *vreg) {
 	a.expire(cur.first())
-	if cur.float && (cur.crossesCall || cur.crossesPreserving) {
+	if cur.clobbered() {
 		a.spill(cur)
 		return
 	}
@@ -403,6 +416,10 @@ func (a *allocator) assign(cur *vreg) {
 		return
 	}
 	a.displace(cur, regs)
+}
+
+func (r *vreg) clobbered() bool {
+	return (r.float || r.home != nil) && (r.crossesCall || r.crossesPreserving)
 }
 
 func (a *allocator) fits(cur *vreg, reg string) bool {
@@ -497,6 +514,9 @@ func (a *allocator) take(r *vreg, reg string) {
 }
 
 func (a *allocator) spill(r *vreg) {
+	if r.home != nil {
+		return
+	}
 	slot := a.sharedSlot(r)
 	if slot < 0 {
 		slot = len(a.slots)

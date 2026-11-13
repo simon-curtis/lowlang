@@ -3,7 +3,13 @@ package amd64
 import "lowlang/internal/ir"
 
 func (in *instr) addressesMemory(k int) bool {
-	return (in.op == ir.OpLoad || in.op == ir.OpStore) && k == 0
+	switch in.op {
+	case ir.OpLoad, ir.OpStore:
+		return k == 0
+	case ir.OpVector, ir.OpVectorScalar:
+		return addressOperand(in.value, k)
+	}
+	return false
 }
 
 func (f *mfunc) frameAddress(slot *vreg) *instr {

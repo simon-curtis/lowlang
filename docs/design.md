@@ -1901,8 +1901,7 @@ Optimiser:
     - is not part of a cycle;
     - is not a callback;
     - has at most 48 values besides constants, parameters and results;
-    - has at most one loop and an entry block no jump returns to;
-    - uses no vector instruction.
+    - has at most one loop and an entry block no jump returns to.
   - Frame slots, `ccall`s and runtime calls are cloned with the body, and the callee's slots are appended to the caller's.
   - A callee of at most 6 values is free. Any other site is charged to the caller, which grows by at most 240 values, and to the program, whose budget is a fifth of its value count before inlining, at least 6000 and at most 40000. The last quarter of the program budget is kept for call sites inside loops.
   - A caller inlines up to four rounds. Each round takes its sites inside the deepest loops first, then the smaller callees, then the earlier values; splits the call's block; clones the callee's blocks with parameters bound to the arguments; forwards a single return's values or joins several returns in phis; and simplifies the caller. Calls that an inlined body or a devirtualised call exposes are inlined in the next round.
@@ -1976,6 +1975,7 @@ Optimiser:
   - `rcx`, `rsi`, `rdi`, `r8` and `r9` hold values that are not live across a call. `rbx` and `r12` to `r15` hold values that are, and are saved in the function's frame when used. Values that find no register are spilled to the frame. `rax`, `rdx`, `r10` and `r11` are scratch.
   - A growth call, `rt_grow_scan` or `rt_grow_noscan` according to whether the new buffer may hold pointers, takes the old pointer, the used bytes and the new size in `rax`, `rdx` and `r10` and returns the new pointer in `rax`. It preserves every other general register, so a value that cannot hold a pointer stays in `rcx`, `rsi`, `rdi`, `r8` or `r9` across it. A value that may hold a pointer is treated as live across a call: the routine saves the preserved registers below the scanned part of the stack, where the collector does not read them. The routine records the caller's return address and frame pointer like any runtime entry, and the old buffer stays reachable through the words it keeps in the scanned region.
   - Float register values are allocated from `xmm2` to `xmm15` by the same scan. No `xmm` register survives a call, so a float live across a call is spilled, and spilled floats are not in the stack maps. A function that uses vectors gets no float registers, so its float operations go through `xmm0` and `xmm1`.
+  - In the AVX2 version of a vector function, vector values in register slots are allocated from `ymm8` to `ymm15` by the same scan; see Vectors.
 - Register preferences:
   - A value used as a call argument prefers that argument's register, a parameter prefers the register it arrives in, and a copy and its source prefer each other's registers.
   - The result of a two-operand add, subtract, multiply, and, or, xor, shift or float divide prefers the register of its first operand, and for a commutative operation of its second, so the instruction can work in place. Where it cannot share, it avoids the register of the operand it still has to read.
@@ -2021,7 +2021,13 @@ Calling convention:
 - At calls, returns, fields and other aggregates a vector is its words, loaded from or stored to a slot. A `let` of a computed vector adopts the slot of the result instead of copying it.
 - A function containing vector instructions is compiled twice. Its symbol is a stub that jumps to the AVX2 version when the CPU and the operating system support AVX2, and to the SSE2 version otherwise. `rt_cpu_init` checks `cpuid` and `xgetbv` at startup.
 - `LOW_SIMD=sse2` in the environment selects the SSE2 versions, which the fixture runner uses to test both.
-- The AVX2 version uses three-operand VEX instructions on `ymm` registers. A slot written once and read only by vector instructions later in the same block, with no call in between, is kept in `ymm8` to `ymm15` instead of memory. `vzeroupper` runs before every call and return of such a function.
+- The AVX2 version uses three-operand VEX instructions on `ymm` registers. `ymm0` to `ymm7` are scratch. `vzeroupper` runs before every call, return and poll of such a function.
+- A vector slot is a register slot in the AVX2 version when every use is an operand of a vector instruction, the address operand of a load or store, or an `add` of a lane offset whose every use is the address of a load or store. Each register slot has a home in the frame and a vector value allocated from `ymm8` to `ymm15` by the linear scan, the same way as general and float values.
+  - A vector instruction reads and writes the value. Its first operand is a definition, not a use. The other slots of the function keep the memory form.
+  - The value is in its register, in both register and home, or in its home only. A word store covering the whole slot defines the value in its home. A partial store, `simd.with_lane` for one, reads and writes the home. A call, an inlined system call, a growth call, `rt_str_eq` or a C call spills the value to its home when it is live across it, and a later vector instruction or the end of the block that needs it in a register fills it.
+  - A value that finds no register, or is chosen as the victim of another, stays in its home. No spill slot is added, since the home is the slot. A copy between two values prefers the same register and a copy within one register emits nothing.
+  - The poll stub saves the register values live out of the poll to their homes, runs `vzeroupper`, calls `rt_poll` and restores them, since `vzeroupper` clears the upper halves that `rt_poll` does not save.
+  - These operations are one three-operand instruction that writes the destination's register and reads its second operand from a register or from memory: integer and float add and subtract, native multiply, and, or, xor, native minimum and maximum, `pshufb`, integer equality and float divide. Other operations copy their operands into the scratch registers and copy the result out.
 - The SSE2 version splits 256-bit operations into two 128-bit halves and keeps every vector in memory.
 - An operation without an instruction in the version being generated runs as a scalar loop over the lanes in a scratch area of the frame. These operations are `pshufb` on SSE2, 64-bit multiplication, minimum, maximum and comparison where unavailable, byte shifts and arithmetic 64-bit shifts. Unsigned comparisons flip the sign bit of both operands and compare signed.
 

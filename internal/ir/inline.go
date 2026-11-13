@@ -153,23 +153,12 @@ func (in *inliner) measure(g *Func) calleeSummary {
 			loops++
 		}
 		for _, v := range b.Values {
-			if !inlinableOp(v.Op) {
-				return calleeSummary{}
-			}
 			if countsTowardCost(v.Op) {
 				cost++
 			}
 		}
 	}
 	return calleeSummary{cost: cost, eligible: cost <= maxInlineCost && loops <= maxInlineLoops}
-}
-
-func inlinableOp(op Op) bool {
-	switch op {
-	case OpVector, OpVectorScalar:
-		return false
-	}
-	return true
 }
 
 func countsTowardCost(op Op) bool {
