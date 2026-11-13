@@ -15,7 +15,7 @@ import (
 
 var checkedIn = filepath.Join("..", "compiler", "std", "ui", "platform", "wayland_linux.low")
 
-const regenerate = "go run ./cmd/wlgen -o internal/compiler/std/ui/platform/wayland_linux.low internal/wlgen/protocols/wayland.xml internal/wlgen/protocols/xdg-shell.xml"
+const regenerate = "go run ./cmd/wlgen -o internal/compiler/std/ui/platform/wayland_linux.low internal/wlgen/protocols/wayland.xml internal/wlgen/protocols/xdg-shell.xml internal/wlgen/protocols/cursor-shape-v1.xml internal/wlgen/protocols/xdg-decoration-unstable-v1.xml internal/wlgen/protocols/text-input-unstable-v3.xml internal/wlgen/protocols/fractional-scale-v1.xml internal/wlgen/protocols/viewporter.xml"
 
 func load(t *testing.T, names ...string) []*Protocol {
 	t.Helper()
@@ -43,18 +43,24 @@ func TestSignatures(t *testing.T) {
 		{Message{Args: []Arg{{Type: "uint"}, {Type: "new_id"}}}, "usun", "null null null null"},
 		{Message{Since: 3, Args: []Arg{{Type: "object", Interface: "wl_surface", AllowNull: true}, {Type: "fixed"}}}, "3?of", "ifs.wl_surface null"},
 		{Message{Args: []Arg{{Type: "new_id", Interface: "wl_callback"}, {Type: "fd"}, {Type: "array"}, {Type: "string"}}}, "nhas", "ifs.wl_callback null null null"},
+		{Message{Args: []Arg{{Type: "object", Interface: "zwp_tablet_tool_v2"}}}, "o", "null"},
 	}
+	declared := map[string]bool{"wl_surface": true, "wl_callback": true}
 	for _, c := range cases {
-		sig, types := signature(c.msg)
+		sig, types := signature(c.msg, declared)
 		if sig != c.sig || strings.Join(types, " ") != c.types {
 			t.Errorf("signature = %q %v, want %q %q", sig, types, c.sig, c.types)
 		}
 	}
 }
 
-func TestRejectsUnknownReferences(t *testing.T) {
-	_, err := Generate(load(t, "xdg-shell.xml"))
-	if err == nil || !strings.Contains(err.Error(), "refers to interface wl_surface") {
+func TestRejectsUnknownCreations(t *testing.T) {
+	p, err := Parse([]byte(`<protocol name="made"><interface name="maker" version="1"><request name="make"><arg name="id" type="new_id" interface="made_thing"/></request></interface></protocol>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Generate([]*Protocol{p})
+	if err == nil || !strings.Contains(err.Error(), "creates interface made_thing") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -67,7 +73,7 @@ func TestRejectsDuplicates(t *testing.T) {
 }
 
 func TestCheckedInBindings(t *testing.T) {
-	source, err := Generate(load(t, "wayland.xml", "xdg-shell.xml"))
+	source, err := Generate(load(t, "wayland.xml", "xdg-shell.xml", "cursor-shape-v1.xml", "xdg-decoration-unstable-v1.xml", "text-input-unstable-v3.xml", "fractional-scale-v1.xml", "viewporter.xml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +87,7 @@ func TestCheckedInBindings(t *testing.T) {
 }
 
 func TestBindingsArePrivate(t *testing.T) {
-	source, err := Generate(load(t, "wayland.xml", "xdg-shell.xml"))
+	source, err := Generate(load(t, "wayland.xml", "xdg-shell.xml", "cursor-shape-v1.xml", "xdg-decoration-unstable-v1.xml", "text-input-unstable-v3.xml", "fractional-scale-v1.xml", "viewporter.xml"))
 	if err != nil {
 		t.Fatal(err)
 	}

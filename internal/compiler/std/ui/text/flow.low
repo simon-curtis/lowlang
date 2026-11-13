@@ -1,0 +1,352 @@
+import std/slices
+import std/ui/font
+import std/unicode
+
+/// How text is laid out: its font and size, the height of its lines, where they sit, and how they fit the width.
+pub struct Format {
+    /// The font asked for.
+    pub typeface: Typeface = Typeface {}
+    /// The em size in pixels.
+    pub size: f32 = 16.0
+    /// The distance from the top of one line to the top of the next in pixels, or `none` for the chosen font's ascent, descent and line gap. The font's ascent and descent are centred in the line.
+    pub line_height: f32? = none
+    /// Where each line sits across the width.
+    pub align: Align = Left
+    /// Whether lines break to fit the width. Without wrapping, lines end only where the text breaks them.
+    pub wrap: bool = true
+    /// The most lines kept, or 0 for any number.
+    pub max_lines: i64 = 0
+    /// The text that ends a line cut short, such as `…`, or `none` to drop lines past `max_lines` and let unwrapped lines run past the width.
+    pub ellipsis: str? = none
+}
+
+/// Where lines sit across the width they are laid out in.
+pub enum Align {
+    /// At the left edge.
+    Left
+    /// Centred.
+    Center
+    /// At the right edge.
+    Right
+}
+
+struct Item {
+    at: i64
+    end: i64
+    shaped: Shaped
+    advance: f32
+    space: bool
+    newline: bool
+    cluster: bool
+    attached: bool = false
+    root: i64 = 0
+    dx: f32 = 0.0
+    dy: f32 = 0.0
+}
+
+struct Unit {
+    at: i64
+    end: i64
+    shaped: Shaped
+    space: bool
+    cluster: bool
+}
+
+struct Row {
+    glyphs: []Placed = []
+    starts: []bool = []
+    width: f32 = 0.0
+    end: i64 = 0
+}
+
+struct Filled {
+    row: Row
+    next: i64
+    newline: bool
+}
+
+fn unbounded() -> f32 {
+    1000000000.0
+}
+
+fn lay_out(mut sys: System, s: str, f: Format, width: f32) -> Layout {
+    let primary = font_for(mut sys, f.typeface)
+    let m = metrics(sys.fonts[primary], f.size)
+    let line_height = f.line_height ?? m.height
+    let baseline = m.ascent + (line_height - m.height) / 2.0
+    let breaks = break_offsets(s)
+    let items = itemize(mut sys, s, primary, f.size, breaks)
+    let limit = if f.wrap { width } else { unbounded() }
+    var rows: []Row = []
+    var start = 0
+    for {
+        let filled = fill(sys, items, breaks, start, limit, f.size, s.len)
+        rows.push(filled.row)
+        start = filled.next
+        if start >= items.len && !filled.newline {
+            break
+        }
+    }
+    var clamped = false
+    if f.max_lines > 0 && rows.len > f.max_lines {
+        clamped = dropped_text(s, rows[f.max_lines..])
+        rows = rows[..f.max_lines]
+    }
+    var truncated = clamped
+    match f.ellipsis {
+        some(mark) => {
+            let mark_breaks = break_offsets(mark)
+            let tail = itemize(mut sys, mark, primary, f.size, mark_breaks)
+            for i, row in rows {
+                if clamped && i == rows.len - 1 || !f.wrap && row.width > width {
+                    rows[i] = cut(s, row, tail, width)
+                    truncated = true
+                }
+            }
+        }
+        none => {}
+    }
+    var widest: f32 = 0.0
+    for row in rows {
+        if row.width > widest {
+            widest = row.width
+        }
+    }
+    let span = if width < unbounded() { width } else { widest }
+    var lines: []Line = []
+    for i, row in rows {
+        let x = match f.align {
+            Left => 0.0
+            Center => (span - row.width) / 2.0
+            Right => span - row.width
+        }
+        lines.push(Line { glyphs: row.glyphs, y: baseline + line_height * f32(i), width: row.width, x })
+    }
+    Layout { lines, size: f.size, width: widest, height: line_height * f32(lines.len), line_height, baseline, font: primary, truncated }
+}
+
+fn dropped_text(s: str, rows: []Row) -> bool {
+    for row in rows {
+        for g in row.glyphs {
+            for at, c in s[g.at..g.end] {
+                if !unicode.is_space(c) {
+                    return true
+                }
+            }
+        }
+    }
+    false
+}
+
+fn itemize(mut sys: System, s: str, primary: i64, size: f32, breaks: [i64: bool]) -> []Item {
+    var items: []Item = []
+    var units: []Unit = []
+    var cluster_end = 0
+    for at, c in s {
+        let starts = at >= cluster_end
+        if starts {
+            cluster_end = unicode.grapheme_end(s, at)
+        }
+        if c == '\r' && at + 1 < s.len && s[at + 1] == '\n' {
+            continue
+        }
+        let end = at + unicode.decode_rune(s, at).size
+        if is_newline(c) {
+            shape_units(sys, units, size, mut items)
+            units = []
+            let nothing = Shaped { font: primary, glyph: 0 }
+            items.push(Item { at, end, shaped: nothing, advance: 0.0, space: false, newline: true, cluster: true })
+            continue
+        }
+        let shaped = shape(mut sys, primary, c)
+        if units.len > 0 && (shaped.font != units[0].shaped.font || breaks[at] != none) {
+            shape_units(sys, units, size, mut items)
+            units = []
+        }
+        units.push(Unit { at, end, shaped, space: c == ' ', cluster: starts })
+    }
+    shape_units(sys, units, size, mut items)
+    items
+}
+
+fn shape_units(sys: System, units: []Unit, size: f32, mut items: []Item) {
+    if units.len == 0 {
+        return
+    }
+    let first_item = items.len
+    let f = sys.fonts[units[0].shaped.font]
+    let scale = font.scale(f, size)
+    let glyphs = units.map(fn(u) u.shaped.glyph)
+    let covers = font.substitute(f, glyphs)
+    for cover in covers {
+        let head = units[cover.first]
+        let last = units[cover.end - 1]
+        let shaped = Shaped { font: head.shaped.font, glyph: cover.glyph }
+        let advance = f32(font.advance(f, cover.glyph)) * scale
+        let single = cover.end - cover.first == 1
+        items.push(Item { at: head.at, end: last.end, shaped, advance, space: head.space && single, newline: false, cluster: head.cluster })
+    }
+    attach_marks(f, scale, first_item, mut items)
+}
+
+fn attach_marks(f: font.Font, scale: f32, start: i64, mut items: []Item) {
+    var base = -1
+    for i in start..items.len {
+        let glyph = items[i].shaped.glyph
+        if !font.is_mark(f, glyph) {
+            base = i
+            continue
+        }
+        if base < 0 {
+            continue
+        }
+        let anchored = anchor_mark(f, scale, items, i, base)
+        match anchored {
+            some(a) => {
+                items[i].attached = true
+                items[i].root = a.root
+                items[i].dx = a.dx
+                items[i].dy = a.dy
+                items[i].advance = 0.0
+            }
+            none => {}
+        }
+    }
+}
+
+struct Anchored {
+    root: i64
+    dx: f32
+    dy: f32
+}
+
+fn anchor_mark(f: font.Font, scale: f32, items: []Item, i: i64, base: i64) -> Anchored? {
+    let glyph = items[i].shaped.glyph
+    let before = items[i - 1]
+    if before.attached {
+        let chained = font.mark_offset(f, before.shaped.glyph, glyph)
+        match chained {
+            some(o) => return some(Anchored { root: before.root, dx: before.dx + f32(o.x) * scale, dy: before.dy - f32(o.y) * scale })
+            none => {}
+        }
+    }
+    let direct = font.mark_offset(f, items[base].shaped.glyph, glyph)
+    match direct {
+        some(o) => some(Anchored { root: base, dx: f32(o.x) * scale, dy: 0.0 - f32(o.y) * scale })
+        none => none
+    }
+}
+
+/// Whether `c` ends a line: a line feed, carriage return, vertical tab, form feed, next line, or line or paragraph separator.
+pub fn is_newline(c: u32) -> bool {
+    c == '\n' || c == '\r' || c == 0x0B || c == 0x0C || c == 0x85 || c == 0x2028 || c == 0x2029
+}
+
+fn break_offsets(s: str) -> [i64: bool] {
+    var out: [i64: bool] = [:]
+    for b in unicode.line_breaks(s) {
+        if !b.mandatory {
+            out[b.at] = true
+        }
+    }
+    out
+}
+
+fn fill(sys: System, items: []Item, breaks: [i64: bool], start: i64, limit: f32, size: f32, length: i64) -> Filled {
+    var glyphs: []Placed = []
+    var starts: []bool = []
+    var pen: f32 = 0.0
+    var inked: f32 = 0.0
+    var widths: []f32 = []
+    var last = Shaped { font: -1, glyph: 0 }
+    var candidate = -1
+    var i = start
+    for i < items.len {
+        let it = items[i]
+        if it.newline {
+            return Filled { row: Row { glyphs, starts, width: inked, end: it.at }, next: i + 1, newline: true }
+        }
+        if i > start && breaks[it.at] != none {
+            candidate = i
+        }
+        if it.attached {
+            let root_x = if it.root >= start { glyphs[it.root - start].x } else { pen }
+            glyphs.push(Placed { font: it.shaped.font, glyph: it.shaped.glyph, x: root_x + it.dx, y: it.dy, advance: 0.0, at: it.at, end: it.end })
+            starts.push(it.cluster)
+            widths.push(inked)
+            i += 1
+            continue
+        }
+        let x = pen + kerning(sys, last, it.shaped, size)
+        if !it.space && x + it.advance > limit && i > start {
+            let next = if candidate > start { candidate } else { cluster_start(items, start, i) }
+            let kept = next - start
+            let width = if kept > 0 { widths[kept - 1] } else { 0.0 }
+            return Filled { row: Row { glyphs: glyphs[..kept], starts: starts[..kept], width, end: items[next].at }, next, newline: false }
+        }
+        glyphs.push(Placed { font: it.shaped.font, glyph: it.shaped.glyph, x, y: 0.0, advance: it.advance, at: it.at, end: it.end })
+        starts.push(it.cluster)
+        pen = x + it.advance
+        if !it.space {
+            inked = pen
+        }
+        widths.push(inked)
+        last = it.shaped
+        i += 1
+    }
+    Filled { row: Row { glyphs, starts, width: inked, end: length }, next: items.len, newline: false }
+}
+
+fn kerning(sys: System, last: Shaped, next: Shaped, size: f32) -> f32 {
+    if last.font != next.font {
+        return 0.0
+    }
+    let f = sys.fonts[next.font]
+    f32(font.kern(f, last.glyph, next.glyph)) * font.scale(f, size)
+}
+
+fn cluster_start(items: []Item, start: i64, at: i64) -> i64 {
+    var j = at
+    for j > start && !items[j].cluster {
+        j -= 1
+    }
+    if j == start { at } else { j }
+}
+
+fn overflows(g: Placed, mark: f32, width: f32) -> bool {
+    width < unbounded() && g.x + g.advance + mark > width
+}
+
+fn cut(s: str, row: Row, tail: []Item, width: f32) -> Row {
+    var mark: f32 = 0.0
+    for t in tail {
+        mark += t.advance
+    }
+    var n = 0
+    for n < row.glyphs.len && !overflows(row.glyphs[n], mark, width) {
+        n += 1
+    }
+    for n > 0 && n < row.glyphs.len && !row.starts[n] {
+        n -= 1
+    }
+    var end = if n < row.glyphs.len { row.glyphs[n].at } else { row.end }
+    var kept = row.glyphs[..n]
+    for kept.len > 0 && s[kept[kept.len - 1].at] == ' ' {
+        end = kept[kept.len - 1].at
+        kept = kept[..kept.len - 1]
+    }
+    var pen: f32 = 0.0
+    for g in kept {
+        if g.x + g.advance > pen {
+            pen = g.x + g.advance
+        }
+    }
+    var tail_x: []f32 = []
+    for t in tail {
+        let x = if t.attached { tail_x[t.root] + t.dx } else { pen }
+        tail_x.push(x)
+        kept.push(Placed { font: t.shaped.font, glyph: t.shaped.glyph, x, y: t.dy, advance: t.advance, at: end, end })
+        pen += t.advance
+    }
+    Row { glyphs: kept, width: pen }
+}

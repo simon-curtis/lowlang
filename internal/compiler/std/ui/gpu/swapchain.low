@@ -26,9 +26,39 @@ pub fn open_for(s: Surface) -> Gpu ! Error {
     g
 }
 
-/// Draws `s` into the next image of the window's swapchain and presents it, and uploads the rows of `atlas` that changed since the last call.
+/// A copyable view of a `Gpu`'s instance and device, from which `open_beside` makes a `Gpu` for another window on any green thread.
+pub struct Shared {
+    state: *State
+}
+
+/// Returns the view of `g` that `open_beside` takes.
+pub fn shared(g: Gpu) -> Shared {
+    Shared { state: g.state }
+}
+
+/// Returns a `Gpu` that draws into the window behind `s` with the Vulkan instance and device of the `Gpu` behind `from`, for another window of the same program.
 ///
-/// The swapchain is made on the first call, at the size of `s` in device pixels, and is made again when the size of `s` changes or when presentation reports that it is out of date or suboptimal. A scene of no pixels presents nothing. The call returns once the frame is queued for presentation. The `Gpu` keeps one atlas texture that mirrors the atlas it was last given. After the call `atlas` is marked clean.
+/// It has its own surface, swapchain, pipelines, atlas textures and frame resources, and it takes turns with every `Gpu` sharing the device to submit work. The instance and device last until every `Gpu` sharing them is released, in any order; the window must outlive it. Fails with `NoSurface` when the `Gpu` behind `from` came from `open` or has been released, with `NoDevice` when the device's queue cannot present to `s`, and with `Vulkan` when a call fails.
+pub fn open_beside(from: Shared, s: Surface) -> Gpu ! Error {
+    if from.state.surface.handle == 0 {
+        fail NoSurface
+    }
+    if !join(from.state.device) {
+        fail NoDevice
+    }
+    let state = new(State { device: from.state.device })
+    using out = Gpu { state }
+    state.surface = create_surface(state.device.instance, s)?
+    if !can_present(state.device.physical, state.device.family, state.surface)? {
+        fail NoDevice
+    }
+    build_resources(state)?
+    out
+}
+
+/// Draws `s` into the next image of the window's swapchain and presents it, and uploads the rows of each plane of `atlas` that changed since the last call.
+///
+/// The swapchain is made on the first call, at the size of `s` in device pixels, and is made again when the size of `s` changes or when presentation reports that it is out of date or suboptimal. A scene of no pixels presents nothing. The call returns once the frame is queued for presentation. The `Gpu` keeps one texture per atlas plane that mirrors the atlas it was last given. After the call `atlas` is marked clean.
 ///
 /// Fails with `NoSurface` on a `Gpu` that `open` made.
 pub fn present(g: Gpu, s: scene.Scene, mut atlas: scene.Atlas) ! Error {
@@ -45,10 +75,10 @@ pub fn present(g: Gpu, s: scene.Scene, mut atlas: scene.Atlas) ! Error {
     let chain = state.swapchain
     let pipelines = pipelines_for(state, chain.format)?
     ensure_atlas(state, atlas.size)?
-    let band = atlas_band(state, atlas)
+    let bands = atlas_bands(state, atlas)
     write_instances(state, frame, s)?
-    stage_atlas(state, frame, atlas, band)?
-    record_swapchain(state, frame, chain, index, pipelines, s, atlas, band)?
+    stage_atlas(state, frame, atlas, bands)?
+    record_swapchain(state, frame, chain, index, pipelines, s, atlas, bands)?
     submit_swapchain(state, frame, chain.finished[index])?
     state.next_frame = (state.next_frame + 1) % state.frames.len
     state.atlas_ready = true
@@ -115,7 +145,7 @@ fn clamp(value: i64, low: i64, high: i64) -> i64 {
 
 fn build_swapchain(s: *State, caps: VkSurfaceCapabilitiesKHR, extent: Extent) ! Error {
     let d = s.device
-    check(vkDeviceWaitIdle(d.handle), "vkDeviceWaitIdle")?
+    check(wait_idle(d), "vkDeviceWaitIdle")?
     let format = choose_surface_format(s)?
     let old = s.swapchain
     var images = caps.minImageCount + 1
@@ -221,13 +251,13 @@ fn destroy_swapchain(d: Device, chain: Swapchain) {
     vkDestroySwapchainKHR(d.handle, chain.handle, null)
 }
 
-fn record_swapchain(s: *State, f: *Frame, chain: Swapchain, index: u32, p: Pipelines, sc: scene.Scene, atlas: scene.Atlas, band: Band) ! Error {
+fn record_swapchain(s: *State, f: *Frame, chain: Swapchain, index: u32, p: Pipelines, sc: scene.Scene, atlas: scene.Atlas, bands: Bands) ! Error {
     using var pins = new_pins()
     let cmd = f.command_buffer
     check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer")?
     var begin = VkCommandBufferBeginInfo { flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT() }
     check(vkBeginCommandBuffer(cmd, mut begin), "vkBeginCommandBuffer")?
-    record_atlas_upload(mut pins, cmd, s, f, atlas, band)
+    record_atlas_upload(mut pins, cmd, s, f, atlas, bands)
     let image = chain.images[index]
     image_barrier(mut pins, cmd, image, VK_IMAGE_LAYOUT_UNDEFINED(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL(),
         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT(), 0,
@@ -257,7 +287,7 @@ fn submit_swapchain(s: *State, f: *Frame, finished: VkSemaphore) ! Error {
         pSignalSemaphoreInfos: signals
     }
     let infos = pins.hold(info)
-    check(vkQueueSubmit2(s.device.queue, 1, infos, f.fence), "vkQueueSubmit2")?
+    check(submit_work(s.device, infos, f.fence), "vkQueueSubmit2")?
     f.submitted = true
 }
 
@@ -266,8 +296,8 @@ fn queue_present(s: *State, chain: Swapchain, index: u32) ! Error {
     let waits = pins.hold(chain.finished[index])
     let chains = pins.hold(chain.handle)
     let indices = pins.hold(index)
-    var info = VkPresentInfoKHR { waitSemaphoreCount: 1, pWaitSemaphores: waits, swapchainCount: 1, pSwapchains: chains, pImageIndices: indices }
-    let result = vkQueuePresentKHR(s.device.queue, mut info)
+    let info = VkPresentInfoKHR { waitSemaphoreCount: 1, pWaitSemaphores: waits, swapchainCount: 1, pSwapchains: chains, pImageIndices: indices }
+    let result = present_work(s.device, info)
     if result == VK_SUBOPTIMAL_KHR() || result == VK_ERROR_OUT_OF_DATE_KHR() {
         s.swapchain.stale = true
         return

@@ -14,6 +14,38 @@ pub extern struct Quad {
     pub corner_radii: geometry.Corners = geometry.Corners {}
     /// The width of the border on each side.
     pub border_widths: geometry.Edges = geometry.Edges {}
+    /// The colour the fill changes to along `gradient`.
+    pub background_end: geometry.Color = geometry.Color {}
+    /// How the fill changes from `background` to `background_end`; the default keeps it `background`.
+    pub gradient: Gradient = Gradient {}
+}
+
+/// A linear change across a quad's fill, as the quad shader reads it.
+///
+/// A pixel's place on the gradient line is `0.5` plus its offset from the quad's centre dotted with `(dx, dy)`. The fill is `background` up to `from`, `background_end` from `to`, and blended between.
+pub extern struct Gradient {
+    /// How far along the line one device pixel to the right moves, as a fraction of the line. With `dy` zero, the fill is solid.
+    pub dx: f32 = 0.0
+    /// How far along the line one device pixel down moves.
+    pub dy: f32 = 0.0
+    /// Where on the line the fill starts to change.
+    pub from: f32 = 0.0
+    /// Where on the line the fill reaches `background_end`.
+    pub to: f32 = 1.0
+}
+
+/// Returns the gradient across `bounds` in the direction `degrees` clockwise from straight up, changing between `from` and `to` along a line as CSS draws it: through the centre, just long enough that the corners it starts and ends at sit on its ends.
+pub fn linear(bounds: geometry.Rect, degrees: f32, from: f32, to: f32) -> Gradient {
+    let d = geometry.direction(degrees)
+    let across = abs(bounds.width * d.x) + abs(bounds.height * d.y)
+    if !(across > 0.0) {
+        return Gradient { from, to }
+    }
+    Gradient { dx: d.x / across, dy: d.y / across, from, to }
+}
+
+fn abs(v: f32) -> f32 {
+    if v < 0.0 { -v } else { v }
 }
 
 /// A rounded rectangle blurred by a Gaussian, as the shadow shader reads it.
@@ -45,6 +77,24 @@ pub extern struct Sprite {
     pub tile: geometry.Rect = geometry.Rect {}
 }
 
+/// An image drawn from the atlas's colour plane, as the picture shader reads it.
+pub extern struct Picture {
+    /// Where the image lands, in device pixels.
+    pub bounds: geometry.Rect
+    /// The visible area. `push_picture` replaces it with the scene's current clip.
+    pub clip: geometry.Rect = geometry.Rect {}
+    /// The radius of each corner the image is rounded to.
+    pub corner_radii: geometry.Corners = geometry.Corners {}
+    /// The image's place in the colour plane, as fractions of the atlas size.
+    pub tile: geometry.Rect = geometry.Rect {}
+    /// How opaque the image is drawn, from `0.0` to `1.0`.
+    pub opacity: f32 = 1.0
+    /// How far the colours are blended toward their luminance, from `0.0` to `1.0` for gray.
+    pub grayscale: f32 = 0.0
+    spare_0: f32 = 0.0
+    spare_1: f32 = 0.0
+}
+
 /// The kind of primitive a `Batch` draws.
 pub enum Kind {
     /// Entries of `Scene.quads`.
@@ -53,6 +103,8 @@ pub enum Kind {
     Shadows
     /// Entries of `Scene.sprites`.
     Sprites
+    /// Entries of `Scene.pictures`.
+    Pictures
 }
 
 /// A run of consecutive primitives of one kind, drawn with one call.
@@ -79,9 +131,12 @@ pub struct Scene {
     pub shadows: []Shadow = []
     /// The sprites in draw order.
     pub sprites: []Sprite = []
+    /// The pictures in draw order.
+    pub pictures: []Picture = []
     quad_order: []i64 = []
     shadow_order: []i64 = []
     sprite_order: []i64 = []
+    picture_order: []i64 = []
     clips: []geometry.Rect = []
     pushed: i64 = 0
 }
@@ -136,28 +191,37 @@ pub fn push_sprite(mut s: Scene, sp: Sprite) {
     s.pushed += 1
 }
 
+/// Adds `p` above everything pushed so far, clipped to the current clip.
+pub fn push_picture(mut s: Scene, p: Picture) {
+    var clipped = p
+    clipped.clip = clip(s)
+    s.pictures.push(clipped)
+    s.picture_order.push(s.pushed)
+    s.pushed += 1
+}
+
 /// Returns the runs to draw, in order, so that primitives of every kind draw in the order they were pushed.
 ///
 /// Consecutive primitives of one kind share a run, so a scene of quads under text is two batches however many of each it holds.
 pub fn batches(s: Scene) -> []Batch {
+    let kinds: []Kind = [Quads, Shadows, Sprites, Pictures]
+    let orders = [s.quad_order, s.shadow_order, s.sprite_order, s.picture_order]
+    var next = [0, 0, 0, 0]
     var out: []Batch = []
-    var q = 0
-    var sh = 0
-    var sp = 0
-    for q < s.quads.len || sh < s.shadows.len || sp < s.sprites.len {
-        let qo = if q < s.quads.len { s.quad_order[q] } else { s.pushed }
-        let sho = if sh < s.shadows.len { s.shadow_order[sh] } else { s.pushed }
-        let spo = if sp < s.sprites.len { s.sprite_order[sp] } else { s.pushed }
-        if qo < sho && qo < spo {
-            out.extend_run(Quads, q)
-            q += 1
-        } else if sho < spo {
-            out.extend_run(Shadows, sh)
-            sh += 1
-        } else {
-            out.extend_run(Sprites, sp)
-            sp += 1
+    for {
+        var chosen = -1
+        var lowest = s.pushed
+        for k, order in orders {
+            if next[k] < order.len && order[next[k]] < lowest {
+                lowest = order[next[k]]
+                chosen = k
+            }
         }
+        if chosen < 0 {
+            return out
+        }
+        out.extend_run(kinds[chosen], next[chosen])
+        next[chosen] += 1
     }
     out
 }
@@ -170,11 +234,24 @@ fn extend_run(mut out: []Batch, kind: Kind, index: i64) {
     out.push(Batch { kind, first: index, count: 1 })
 }
 
-/// A square single-channel image of glyph coverage that sprites sample, with the band of rows changed since the GPU last copied it.
+
+/// Two square images the GPU samples: glyph and shape coverage for sprites, and colours for pictures.
 pub struct Atlas {
+    /// The width and height of each plane in pixels.
+    pub size: i64
+    /// One coverage byte per pixel.
+    pub coverage: Plane
+    /// Four bytes per pixel: red, green, blue and alpha, not premultiplied.
+    pub colors: Plane
+}
+
+/// One image of an atlas, rows from the top, with the band of rows changed since the GPU last copied it.
+pub struct Plane {
     /// The width and height in pixels.
     pub size: i64
-    /// One coverage byte per pixel, rows from the top.
+    /// The number of bytes per pixel.
+    pub channels: i64
+    /// The pixels, `channels` bytes each.
     pub pixels: []u8
     /// The first row changed since `clean`, or `size` when none has.
     pub dirty_top: i64
@@ -182,49 +259,65 @@ pub struct Atlas {
     pub dirty_bottom: i64
 }
 
-/// Returns a clear atlas of `size` by `size` pixels, all of it marked changed.
+/// Returns a clear atlas whose planes are `size` by `size` pixels, all of them marked changed.
 pub fn atlas(size: i64) -> Atlas {
-    Atlas { size, pixels: __make(size * size), dirty_top: 0, dirty_bottom: size }
+    Atlas { size, coverage: plane(size, 1), colors: plane(size, 4) }
 }
 
-/// Copies `coverage`, `width` by `height` bytes in rows, into the atlas with its top-left pixel at `x`, `y`, and marks those rows changed.
+fn plane(size: i64, channels: i64) -> Plane {
+    Plane { size, channels, pixels: __make(size * size * channels), dirty_top: 0, dirty_bottom: size }
+}
+
+/// Copies `coverage`, `width` by `height` bytes in rows, into the coverage plane with its top-left pixel at `x`, `y`, and marks those rows changed.
 pub fn write(mut a: Atlas, x: i64, y: i64, width: i64, height: i64, coverage: []u8) {
+    a.coverage.put(x, y, width, height, coverage)
+}
+
+/// Copies `rgba`, `width` by `height` pixels of four bytes in rows, into the colour plane with its top-left pixel at `x`, `y`, and marks those rows changed.
+pub fn write_colors(mut a: Atlas, x: i64, y: i64, width: i64, height: i64, rgba: []u8) {
+    a.colors.put(x, y, width, height, rgba)
+}
+
+fn put(mut p: Plane, x: i64, y: i64, width: i64, height: i64, data: []u8) {
+    let row_bytes = width * p.channels
     for row in 0..height {
-        let from = row * width
-        let to = (y + row) * a.size + x
-        for col in 0..width {
-            a.pixels[to + col] = coverage[from + col]
+        let from = row * row_bytes
+        let to = ((y + row) * p.size + x) * p.channels
+        for i in 0..row_bytes {
+            p.pixels[to + i] = data[from + i]
         }
     }
-    if y < a.dirty_top {
-        a.dirty_top = y
+    if y < p.dirty_top {
+        p.dirty_top = y
     }
-    if y + height > a.dirty_bottom {
-        a.dirty_bottom = y + height
+    if y + height > p.dirty_bottom {
+        p.dirty_bottom = y + height
     }
 }
 
-/// Zeroes every pixel and marks the whole atlas changed.
-pub fn clear(mut a: Atlas) {
-    for i in 0..a.pixels.len {
-        a.pixels[i] = 0
+/// Zeroes every pixel of `p` and marks all of it changed.
+pub fn clear(mut p: Plane) {
+    for i in 0..p.pixels.len {
+        p.pixels[i] = 0
     }
-    a.dirty_top = 0
-    a.dirty_bottom = a.size
+    p.dirty_top = 0
+    p.dirty_bottom = p.size
 }
 
-/// Returns `true` when rows have changed since the last `clean`.
+/// Returns `true` when rows of either plane have changed since the last `clean`.
 pub fn dirty(a: Atlas) -> bool {
-    a.dirty_top < a.dirty_bottom
+    a.coverage.dirty_top < a.coverage.dirty_bottom || a.colors.dirty_top < a.colors.dirty_bottom
 }
 
-/// Marks every row as copied.
+/// Marks every row of both planes as copied.
 pub fn clean(mut a: Atlas) {
-    a.dirty_top = a.size
-    a.dirty_bottom = 0
+    a.coverage.dirty_top = a.size
+    a.coverage.dirty_bottom = 0
+    a.colors.dirty_top = a.size
+    a.colors.dirty_bottom = 0
 }
 
-/// Returns the fractions of the atlas that a `width` by `height` pixel tile at `x`, `y` covers, for `Sprite.tile`.
+/// Returns the fractions of a plane that a `width` by `height` pixel tile at `x`, `y` covers, for `Sprite.tile` and `Picture.tile`.
 pub fn tile(a: Atlas, x: i64, y: i64, width: i64, height: i64) -> geometry.Rect {
     let size = f32(a.size)
     geometry.rect(f32(x) / size, f32(y) / size, f32(width) / size, f32(height) / size)

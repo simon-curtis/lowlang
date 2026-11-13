@@ -51,27 +51,54 @@ func (s *specialiser) cloneForFunctionArguments(g *Func, sites []callSite) ([]*F
 func (s *specialiser) cloneGroups(g *Func, param, env *Value, groups []functionGroup, cost int) ([]*Func, []callSite) {
 	var clones []*Func
 	var repointed []callSite
-	allowed := max(0, min(len(groups), maxClonesPerFunction-s.clonesOf[g]))
-	for _, group := range groups[:allowed] {
-		if s.cloned+cost > maxClonedProgramCost {
-			break
+	for _, group := range groups {
+		key := cloneKey{source: g, word: param.Aux, code: group.code.Target}
+		capture := agreedConstant(nil, env, group.sites, isConstant)
+		if made, ok := s.made[key]; ok && made.accepts(capture) {
+			made.repoint(group.sites)
+			repointed = append(repointed, group.sites...)
+			continue
 		}
-		clone, sites := cloneForFunction(g, param, env, group)
+		if s.clonesOf[g] >= maxClonesPerFunction || s.cloned+cost > maxClonedProgramCost {
+			continue
+		}
+		made := cloneForFunction(g, param, env, group, capture)
+		made.fn.Name = s.uniqueName(fmt.Sprintf("%s..with%d.%s", g.Name, param.Aux, group.code.Target.Name))
+		s.made[key] = made
 		s.cloned += cost
 		s.clonesOf[g]++
-		clones = append(clones, clone)
-		repointed = append(repointed, sites...)
+		clones = append(clones, made.fn)
+		repointed = append(repointed, group.sites...)
 	}
 	return clones, repointed
 }
 
-func cloneForFunction(g *Func, param, env *Value, group functionGroup) (*Func, []callSite) {
+func (s *specialiser) uniqueName(name string) string {
+	n := s.names[name]
+	s.names[name] = n + 1
+	if n == 0 {
+		return name
+	}
+	return fmt.Sprintf("%s..%d", name, n+1)
+}
+
+func (m madeClone) accepts(capture *Value) bool {
+	return m.capture == nil || capture != nil && sameConstant(m.capture, capture)
+}
+
+func (m madeClone) repoint(sites []callSite) {
+	for _, site := range sites {
+		site.call.Args = withoutWords(site.call.Args, m.dropped)
+		site.call.Target = m.fn
+	}
+}
+
+func cloneForFunction(g *Func, param, env *Value, group functionGroup, capture *Value) madeClone {
 	c := cloneFunc(g)
 	clone := c.fn
-	clone.Name = fmt.Sprintf("%s..with%d.%s", g.Name, param.Aux, group.code.Target.Name)
 	dropped := []int64{param.Aux}
 	becomeCopyOf(c.values[param], group.code)
-	if capture := agreedConstant(nil, env, group.sites, isConstant); capture != nil {
+	if capture != nil {
 		becomeCopyOf(c.values[env], capture)
 		dropped = append(dropped, env.Aux)
 	}
@@ -84,7 +111,7 @@ func cloneForFunction(g *Func, param, env *Value, group functionGroup) (*Func, [
 		site.call.Target = clone
 	}
 	simplify(clone)
-	return clone, group.sites
+	return madeClone{fn: clone, dropped: dropped, capture: capture}
 }
 
 func selfCalls(c *funcClone, g *Func, param, env *Value) []*Value {

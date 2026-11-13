@@ -27,6 +27,22 @@ fn on_global(data: ptr, registry: ptr, name: u32, interface: ptr[u8], version: u
     } else if kind == "wl_seat" && s.seat == null {
         s.seat = wl_registry_bind(registry, name, s.ifs.wl_seat, at_most(version, 9))
         wl_seat_add_listener(s.ifs, s.seat, WlSeatListener { capabilities: on_capabilities }, data)
+        ensure_data_device(s)
+        ensure_text_input(s)
+    } else if kind == "wl_data_device_manager" {
+        s.data_manager = wl_registry_bind(registry, name, s.ifs.wl_data_device_manager, at_most(version, 3))
+        ensure_data_device(s)
+    } else if kind == "wp_cursor_shape_manager_v1" {
+        s.cursor_manager = wl_registry_bind(registry, name, s.ifs.wp_cursor_shape_manager_v1, 1)
+    } else if kind == "wp_fractional_scale_manager_v1" {
+        s.fraction_manager = wl_registry_bind(registry, name, s.ifs.wp_fractional_scale_manager_v1, 1)
+    } else if kind == "wp_viewporter" {
+        s.viewporter = wl_registry_bind(registry, name, s.ifs.wp_viewporter, 1)
+    } else if kind == "zwp_text_input_manager_v3" {
+        s.text_manager = wl_registry_bind(registry, name, s.ifs.zwp_text_input_manager_v3, 1)
+        ensure_text_input(s)
+    } else if kind == "zxdg_decoration_manager_v1" {
+        s.decoration_manager = wl_registry_bind(registry, name, s.ifs.zxdg_decoration_manager_v1, 1)
     }
 }
 
@@ -52,8 +68,13 @@ fn on_capabilities(data: ptr, seat: ptr, capabilities: u32) {
         wl_pointer_add_listener(s.ifs, s.pointer, listener, data)
     }
     if !has_pointer && s.pointer != null {
+        if s.cursor_device != null {
+            wp_cursor_shape_device_v1_destroy(s.cursor_device)
+            s.cursor_device = null
+        }
         release_pointer(s.pointer)
         s.pointer = null
+        s.pointer_inside = false
     }
     if has_keyboard && s.keyboard == null {
         s.keyboard = wl_seat_get_keyboard(s.ifs, seat)
@@ -100,25 +121,35 @@ fn release_seat(seat: ptr) {
 
 fn on_scale(data: ptr, surface: ptr, factor: i32) {
     let s = window_of(data)
-    if apply_scale(s, factor) {
-        wl_surface_set_buffer_scale(s.surface, i32(s.scale))
+    if s.viewport != null {
+        return
+    }
+    let whole = if factor >= 1 { factor } else { 1 }
+    if apply_scale(s, f32(whole)) {
+        wl_surface_set_buffer_scale(s.surface, whole)
     }
 }
 
-fn apply_scale(s: *WindowState, factor: i32) -> bool {
-    let scale = if factor >= 1 { i64(factor) } else { 1 }
+fn on_fractional_scale(data: ptr, fraction: ptr, scale: u32) {
+    let s = window_of(data)
+    apply_scale(s, f32(scale) / 120.0)
+}
+
+fn apply_scale(s: *WindowState, requested: f32) -> bool {
+    let scale = if requested > 0.0 { requested } else { 1.0 }
     if scale == s.scale {
         return false
     }
     s.scale = scale
     if s.configured {
-        s.events.push(Event.Resized(s.width, s.height, s.scale))
+        s.events.push(Event.Resized(f32(s.width), f32(s.height), s.scale))
     }
     true
 }
 
 fn on_toplevel_configure(data: ptr, toplevel: ptr, width: i32, height: i32, states: ptr) {
     let s = window_of(data)
+    s.pending_status = status_of(states)
     s.pending_width = i64(width)
     s.pending_height = i64(height)
 }
@@ -141,13 +172,20 @@ fn apply_configure(s: *WindowState) {
     s.width = width
     s.height = height
     s.configured = true
+    apply_status(s)
     if changed {
-        s.events.push(Event.Resized(width, height, s.scale))
+        if s.viewport != null {
+            wp_viewport_set_destination(s.viewport, i32(width), i32(height))
+        }
+        s.events.push(Event.Resized(f32(width), f32(height), s.scale))
     }
 }
 
 fn on_pointer_enter(data: ptr, pointer: ptr, serial: u32, surface: ptr, x: i32, y: i32) {
     let s = window_of(data)
+    s.pointer_inside = true
+    s.enter_serial = serial
+    show_cursor(s)
     s.pointer_x = fixed_to_f32(x)
     s.pointer_y = fixed_to_f32(y)
     s.events.push(Event.PointerMoved(s.pointer_x, s.pointer_y))
@@ -155,6 +193,7 @@ fn on_pointer_enter(data: ptr, pointer: ptr, serial: u32, surface: ptr, x: i32, 
 
 fn on_pointer_leave(data: ptr, pointer: ptr, serial: u32, surface: ptr) {
     let s = window_of(data)
+    s.pointer_inside = false
     s.events.push(Event.PointerLeft)
 }
 
@@ -167,8 +206,10 @@ fn on_pointer_motion(data: ptr, pointer: ptr, time: u32, x: i32, y: i32) {
 
 fn on_pointer_button(data: ptr, pointer: ptr, serial: u32, time: u32, button: u32, state: u32) {
     let s = window_of(data)
+    s.input_serial = serial
     let which = pointer_button(button)
     if state == wl_pointer_button_state_pressed() {
+        s.press_serial = serial
         s.events.push(Event.PointerDown(which, s.pointer_x, s.pointer_y))
     } else {
         s.events.push(Event.PointerUp(which, s.pointer_x, s.pointer_y))
@@ -206,6 +247,7 @@ fn on_keymap(data: ptr, keyboard: ptr, format: u32, fd: i32, size: u32) {
 
 fn on_keyboard_enter(data: ptr, keyboard: ptr, serial: u32, surface: ptr, keys: ptr) {
     let s = window_of(data)
+    s.input_serial = serial
     s.events.push(Event.FocusChanged(true))
 }
 
@@ -217,6 +259,7 @@ fn on_keyboard_leave(data: ptr, keyboard: ptr, serial: u32, surface: ptr) {
 
 fn on_key(data: ptr, keyboard: ptr, serial: u32, time: u32, key: u32, state: u32) {
     let s = window_of(data)
+    s.input_serial = serial
     let pressed = state != wl_keyboard_key_state_released()
     let translated = translate_key(s, key, pressed) ?? return
     track_repeat(s, key, translated)

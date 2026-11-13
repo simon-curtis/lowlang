@@ -215,7 +215,7 @@ func (g *Generator) callTarget(f *ir.Func) string {
 }
 
 func (g *Generator) start(prog *ir.Program) {
-	g.fn = "start"
+	g.fn = ".entry"
 	g.labels = 0
 	g.emit("PROGRAM_ENTRY %s", g.platform.entry())
 	g.program(prog)

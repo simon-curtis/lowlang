@@ -414,7 +414,7 @@ func (b *builder) bind(local *ast.Local, words []*Value) {
 		b.store(place{addr: box}, words)
 		return
 	}
-	if local.Addressed || local.Type.CStruct() || isVector(local.Type) {
+	if local.Addressed || inMemory(local.Type) {
 		b.slots[local] = b.spill(words)
 		return
 	}

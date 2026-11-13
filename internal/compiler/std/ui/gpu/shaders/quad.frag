@@ -25,6 +25,14 @@ void main() {
     float coverage = clamp(0.5 - outer, 0.0, 1.0);
     float border = clamp(0.5 + inner, 0.0, 1.0);
     bool has_border = any(greaterThan(widths, vec4(0.0)));
-    vec4 fill = has_border ? mix(quad.background, quad.border_color, border) : quad.background;
+    vec4 background = quad.background;
+    vec4 gradient = quad.gradient;
+    if (gradient.x != 0.0 || gradient.y != 0.0) {
+        float along = 0.5 + dot(offset, gradient.xy);
+        float span = gradient.w - gradient.z;
+        float blend = span > 0.0 ? clamp((along - gradient.z) / span, 0.0, 1.0) : step(gradient.z, along);
+        background = mix(quad.background, quad.background_end, blend);
+    }
+    vec4 fill = has_border ? mix(background, quad.border_color, border) : background;
     color = vec4(fill.rgb, fill.a * coverage * clip_alpha(pixel, quad.clip));
 }

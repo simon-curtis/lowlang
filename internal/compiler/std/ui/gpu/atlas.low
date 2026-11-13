@@ -5,6 +5,11 @@ struct Band {
     bottom: i64
 }
 
+struct Bands {
+    coverage: Band
+    colors: Band
+}
+
 fn ensure_atlas(s: *State, size: i64) ! Error {
     if size < 1 {
         fail InvalidSize(size, size)
@@ -14,56 +19,90 @@ fn ensure_atlas(s: *State, size: i64) ! Error {
     }
     let d = s.device
     let usage = VK_IMAGE_USAGE_SAMPLED_BIT() | VK_IMAGE_USAGE_TRANSFER_DST_BIT()
-    let image = create_image(d, VK_FORMAT_R8_UNORM(), size, size, usage)?
-    check(vkDeviceWaitIdle(d.handle), "vkDeviceWaitIdle")?
+    let coverage = create_image(d, VK_FORMAT_R8_UNORM(), size, size, usage)?
+    let colors = create_image(d, VK_FORMAT_R8G8B8A8_UNORM(), size, size, usage) catch {
+        e => {
+            destroy_image(d, coverage)
+            fail e
+        }
+    }
+    check(wait_idle(d), "vkDeviceWaitIdle")?
     destroy_image(d, s.atlas)
-    s.atlas = image
+    destroy_image(d, s.colors)
+    s.atlas = coverage
+    s.colors = colors
     s.atlas_ready = false
     for f in s.frames {
         for set in f.sets {
-            write_atlas_binding(d, set, s.sampler, image)
+            write_atlas_binding(d, set, s.sampler, coverage, 1)
+            write_atlas_binding(d, set, s.sampler, colors, 2)
         }
     }
 }
 
-fn atlas_band(s: *State, a: scene.Atlas) -> Band {
+fn atlas_bands(s: *State, a: scene.Atlas) -> Bands {
+    Bands { coverage: band(s, a.coverage), colors: band(s, a.colors) }
+}
+
+fn band(s: *State, p: scene.Plane) -> Band {
     if !s.atlas_ready {
-        return Band { top: 0, bottom: a.size }
+        return Band { top: 0, bottom: p.size }
     }
-    if !scene.dirty(a) {
+    let top = if p.dirty_top > 0 { p.dirty_top } else { 0 }
+    let bottom = if p.dirty_bottom < p.size { p.dirty_bottom } else { p.size }
+    if bottom <= top {
         return Band { top: 0, bottom: 0 }
     }
-    let top = if a.dirty_top > 0 { a.dirty_top } else { 0 }
-    let bottom = if a.dirty_bottom < a.size { a.dirty_bottom } else { a.size }
     Band { top, bottom }
 }
 
-fn stage_atlas(s: *State, f: *Frame, a: scene.Atlas, band: Band) ! Error {
-    if band.bottom <= band.top {
-        return
-    }
-    let bytes = (band.bottom - band.top) * a.size
-    ensure_buffer(s.device, mut f.staging, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT())?
-    let at: ptr[u8] = f.staging.mapped
-    let rows = view(at, bytes)
-    __memmove(rows, a.pixels[band.top * a.size..band.bottom * a.size])
+fn band_bytes(p: scene.Plane, b: Band) -> i64 {
+    (b.bottom - b.top) * p.size * p.channels
 }
 
-fn record_atlas_upload(mut pins: Pins, cmd: VkCommandBuffer, s: *State, f: *Frame, a: scene.Atlas, band: Band) {
+fn colors_offset(a: scene.Atlas, bands: Bands) -> i64 {
+    (band_bytes(a.coverage, bands.coverage) + 3) / 4 * 4
+}
+
+fn stage_atlas(s: *State, f: *Frame, a: scene.Atlas, bands: Bands) ! Error {
+    let first = band_bytes(a.coverage, bands.coverage)
+    let offset = colors_offset(a, bands)
+    let total = offset + band_bytes(a.colors, bands.colors)
+    if total == 0 {
+        return
+    }
+    ensure_buffer(s.device, mut f.staging, total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT())?
+    let at: ptr[u8] = f.staging.mapped
+    let staged = view(at, total)
+    __memmove(staged[0..first], a.coverage.rows(bands.coverage))
+    __memmove(staged[offset..total], a.colors.rows(bands.colors))
+}
+
+fn record_atlas_upload(mut pins: Pins, cmd: VkCommandBuffer, s: *State, f: *Frame, a: scene.Atlas, bands: Bands) {
+    record_plane_upload(mut pins, cmd, s, f, s.atlas, a.size, bands.coverage, 0)
+    record_plane_upload(mut pins, cmd, s, f, s.colors, a.size, bands.colors, colors_offset(a, bands))
+}
+
+fn record_plane_upload(mut pins: Pins, cmd: VkCommandBuffer, s: *State, f: *Frame, image: Image, size: i64, band: Band, offset: i64) {
     if band.bottom <= band.top {
         return
     }
     let from = if s.atlas_ready { VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL() } else { VK_IMAGE_LAYOUT_UNDEFINED() }
-    image_barrier(mut pins, cmd, s.atlas.handle, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(),
+    image_barrier(mut pins, cmd, image.handle, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(),
         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT(), VK_ACCESS_2_SHADER_SAMPLED_READ_BIT(),
         VK_PIPELINE_STAGE_2_COPY_BIT(), VK_ACCESS_2_TRANSFER_WRITE_BIT())
     let layers = VkImageSubresourceLayers { aspectMask: VK_IMAGE_ASPECT_COLOR_BIT(), layerCount: 1 }
-    let offset = VkOffset3D { x: 0, y: i32(band.top), z: 0 }
-    let extent = VkExtent3D { width: u32(a.size), height: u32(band.bottom - band.top), depth: 1 }
-    let copy = VkBufferImageCopy { imageSubresource: layers, imageOffset: offset, imageExtent: extent }
+    let at = VkOffset3D { x: 0, y: i32(band.top), z: 0 }
+    let extent = VkExtent3D { width: u32(size), height: u32(band.bottom - band.top), depth: 1 }
+    let copy = VkBufferImageCopy { bufferOffset: offset, imageSubresource: layers, imageOffset: at, imageExtent: extent }
     let regions = pins.hold(copy)
-    vkCmdCopyBufferToImage(cmd, f.staging.handle, s.atlas.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(), 1, regions)
-    image_barrier(mut pins, cmd, s.atlas.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL(),
+    vkCmdCopyBufferToImage(cmd, f.staging.handle, image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(), 1, regions)
+    image_barrier(mut pins, cmd, image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL(),
         VK_PIPELINE_STAGE_2_COPY_BIT(), VK_ACCESS_2_TRANSFER_WRITE_BIT(),
         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT(), VK_ACCESS_2_SHADER_SAMPLED_READ_BIT())
+}
+
+fn rows(p: scene.Plane, b: Band) -> []u8 {
+    let row_bytes = p.size * p.channels
+    p.pixels[b.top * row_bytes..b.bottom * row_bytes]
 }

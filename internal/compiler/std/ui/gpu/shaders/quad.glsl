@@ -5,6 +5,8 @@ struct Quad {
     vec4 border_color;
     vec4 corner_radii;
     vec4 border_widths;
+    vec4 background_end;
+    vec4 gradient;
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer Quads {
