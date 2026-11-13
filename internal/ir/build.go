@@ -856,6 +856,8 @@ func (b *builder) expr(e ast.Expr) []*Value {
 		return b.handle(e.X, e.Type, func([]*Value) []*Value { return b.value(e.Fallback, e.Type) })
 	case *ast.When:
 		return b.when(e)
+	case *ast.Region:
+		return b.region(e)
 	}
 	return nil
 }

@@ -485,6 +485,9 @@ func (d astDumper) expr(depth int, label string, e ast.Expr) {
 		d.line(depth, label, fmt.Sprintf("When %s%s", at(e.Pos), typed("type", e.Type)))
 		d.expr(depth+1, "x: ", e.X)
 		d.expr(depth+1, "cond: ", e.Cond)
+	case *ast.Region:
+		d.line(depth, label, fmt.Sprintf("Region %s%s%s", at(e.Pos), funcRef("copy", e.Copy), typed("type", e.Type)))
+		d.block(depth+1, "body: ", e.Body)
 	default:
 		panic(fmt.Sprintf("lowdump: unhandled expression %T", e))
 	}

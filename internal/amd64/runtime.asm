@@ -90,6 +90,9 @@ rt_error_prefix:
 	MSG_BEGIN rt_msg_oom
 	.ascii "out of memory"
 	MSG_END
+	MSG_BEGIN rt_msg_region_full
+	.ascii "region: address space exhausted"
+	MSG_END
 
 	.bss
 	.p2align 3
@@ -149,7 +152,7 @@ rt_env_values:
 	cmp rdi, rax
 	jb .Lmark_search_\@
 	cmp rdi, [rip+rt_heap_bump]
-	jae .Lmark_done_\@
+	jae .Lmark_far_\@
 	lea rax, [rdi-8]
 	sub rax, r8
 	shr rax, 3
@@ -160,6 +163,16 @@ rt_env_values:
 	bt rdx, rax
 	jnc .Lmark_search_\@
 	jmp .Lmark_resolved_\@
+.Lmark_far_\@:
+	mov rax, rdi
+	sub rax, [rip+rt_region_start]
+	mov rcx, rax
+	shr rcx, REGION_BITS
+	jnz .Lmark_done_\@
+	shr rax, REGION_SHIFT
+	mov rcx, [rip+rt_region_hits]
+	bts qword ptr [rcx], rax
+	jmp .Lmark_done_\@
 .Lmark_search_\@:
 	call rt_find
 	test rax, rax
@@ -337,10 +350,16 @@ rt_memmove:
 	call rt_alloc_small
 	jmp 2f
 1:
+	cmp qword ptr [rcx+G_REGION], 0
+	jne 3f
 	call rt_heap_acquire
 	call rt_alloc_body
 	mov qword ptr [rip+rt_heap_lock], 0
 	call rt_zero_payload
+	jmp 2f
+3:
+	mov rax, rcx
+	call rt_region_alloc
 2:
 	mov rdi, rax
 	mov r11, rax
@@ -487,13 +506,14 @@ rt_panic_oom:
 
 rt_gc_init:
 	call rt_gc_env
-	mov rsi, 17179869184
+	mov rsi, 85899345920
 	call rt_mmap
 	mov [rip+rt_heap_start], rax
 	mov [rip+rt_heap_bump], rax
 	mov rcx, 17179869184
 	add rcx, rax
 	mov [rip+rt_heap_end], rcx
+	mov [rip+rt_region_start], rcx
 	mov rsi, 268435456
 	call rt_mmap_sparse
 	mov [rip+rt_bitmap], rax
@@ -512,6 +532,7 @@ rt_gc_init:
 	mov rsi, 524288
 	call rt_mmap
 	mov [rip+rt_dirty], rax
+	call rt_region_init
 	xor eax, eax
 	call rt_gc_set_threshold
 	ret
@@ -1002,6 +1023,9 @@ rt_alloc:
 	adc rdi, 0
 	cmp rdi, ALLOC_SMALL
 	jbe rt_alloc_small
+	cmp qword ptr [rax+G_REGION], 0
+	jne rt_region_alloc
+rt_alloc_large:
 	push rsi
 	call rt_heap_acquire
 	pop rsi
@@ -1062,6 +1086,9 @@ rt_alloc_small:
 	lea rax, [r9+8]
 	ret
 5:
+	TLS_GET rax, TLS_G
+	cmp qword ptr [rax+G_REGION], 0
+	jne rt_region_alloc
 	push rdx
 	push rsi
 	mov rdi, rdx
@@ -1173,8 +1200,13 @@ rt_alloc_retire_all:
 	inc r12
 	mov rdi, [rbx+M_ALLOC_CUR]
 	mov rsi, [rbx+M_ALLOC_END]
+	test rsi, rsi
+	jnz 3f
+	mov rsi, [rbx+M_ALLOC_HELD]
+3:
 	mov qword ptr [rbx+M_ALLOC_CUR], 0
 	mov qword ptr [rbx+M_ALLOC_END], 0
+	mov qword ptr [rbx+M_ALLOC_HELD], 0
 	call rt_alloc_retire
 	jmp 1b
 2:
@@ -1362,6 +1394,7 @@ rt_gc:
 	call rt_gc_stamp
 	call rt_alloc_retire_all
 	mov qword ptr [rip+rt_live_words], 0
+	call rt_region_hits_clear
 	mov r15, [rip+rt_mark_base]
 	lea rdi, [rip+rt_pins]
 	mov rsi, [rip+rt_pin_count]
@@ -1370,6 +1403,7 @@ rt_gc:
 	lea rdi, [rip+rt_cells]
 	lea rsi, [rip+rt_cells_end]
 	call rt_scan_range
+	call rt_scan_regions
 	xor r12d, r12d
 1:
 	cmp r12, [rip+rt_ngs]
@@ -1430,6 +1464,7 @@ rt_gc:
 	ja 6b
 	mov edi, TICK_MARKED
 	call rt_gc_stamp
+	call rt_region_reclaim
 	call rt_sweep
 	mov edi, TICK_SWEPT
 	call rt_gc_stamp

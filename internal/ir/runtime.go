@@ -56,6 +56,10 @@ var (
 	rtEnvv         = declare(RuntimeEntry{Symbol: "rt_envv", Scalar: true})
 	rtClockNanos   = declare(RuntimeEntry{Symbol: "rt_clock_nanos", Scalar: true})
 	rtSysblock     = declare(RuntimeEntry{Symbol: "rt_sysblock", Scalar: true})
+
+	rtRegionEnter = declare(RuntimeEntry{Symbol: "rt_region_enter", Scalar: true})
+	rtRegionLeave = declare(RuntimeEntry{Symbol: "rt_region_leave", Void: true})
+	rtRegionFree  = declare(RuntimeEntry{Symbol: "rt_region_free", Void: true})
 )
 
 func RuntimeEntries() []*RuntimeEntry {

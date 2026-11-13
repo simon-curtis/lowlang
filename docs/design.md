@@ -511,6 +511,42 @@ let copy = *c
 - `==` and `!=` on pointers compare identity.
 - `mut` arguments through pointers are not checked for overlap, since two pointers may refer to the same object.
 
+### Regions
+
+```low
+struct Report {
+    lines: []str
+    total: i64
+}
+
+fn summarise(rows: []str) -> Report {
+    region {
+        var lines: []str = []
+        var total = 0
+        for row in rows {
+            let upper = new(row.len)
+            push(mut lines, "{row}: {upper}")
+            total += *upper
+        }
+        Report { lines, total }
+    }
+}
+```
+
+- `region { ... }` is an expression with the type and value of its block. While the block runs, every allocation of the green thread goes to a fresh region of memory: `new`, the growth of slices and maps, strings, interpolation, closure environments, derived code and the standard library. The region is freed when the block ends, so the garbage collector never sees that memory.
+- `region` is a contextual keyword: it is an ordinary identifier except where an expression begins and `{` follows, outside the head of an `if`, `for` or `match`.
+- Regions nest. An allocation goes to the innermost region, and a nested region's value is copied to the region around it.
+- The value of the block is deep-copied to the allocator that was current outside the block before the region is freed, so the result owns its memory:
+  - numbers and `bool` are values; a `str` is copied; slices keep their elements and order; maps keep their insertion order; structs, enums and optionals copy each field.
+  - A `*T` is copied to a new object each time it occurs, so two pointers to one object in the block become two objects in the result. A pointer that leads back to itself panics with `region: cycle through *T`.
+  - A result without pointers, strings, slices or maps is not copied.
+- The result type cannot contain a function, closure, channel, `ptr`, extern struct, droppable struct or error result; the checker rejects it with the offending type named.
+- `return`, `break`, `continue`, `fail`, `?`, `or return`, `or break` and `catch` mappings cannot leave the block. A loop or closure inside the block may use them for itself.
+- A pointer, slice or string that points into the region and is stored outside it, in a variable, a heap object or a channel, dangles once the block ends. Reading it panics with `region: use of freed memory`.
+- `spawn` inside a region starts a green thread whose allocations go to the garbage-collected heap. The call's closure environment is copied to the heap, but the values it holds that point into the region are freed with the region.
+- An allocation in a region does not count toward the collector's trigger, so allocation in regions alone does not start a collection.
+- A panic ends the process without freeing regions.
+
 ### Enums
 
 ```low
@@ -1795,7 +1831,7 @@ Standard library intrinsics:
 
 The garbage collector is a non-moving mark-sweep collector in the runtime:
 
-- The heap is a 16 GB reservation made with `mmap` and `MAP_NORESERVE`. Pages are committed as they are touched.
+- The runtime reserves 80 GiB with `mmap` and `MAP_NORESERVE`. The heap is the first 16 GiB and its pages are committed as they are touched. Region memory is the 64 GiB after it.
 - Object layout:
   - Each object has a one-word header. Bits 3 and up hold the object's size in words, header included, so the word is the size in bytes with its low three bits used as flags: bit 0 is always zero, bit 1 marks a free chunk and bit 2 marks an object with no pointers to scan.
   - A bitmap records the first word of every object and free chunk, which resolves pointers into the middle of an object, such as a `mut` parameter aimed at a heap field.
@@ -1821,7 +1857,18 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
   - The walk starts at the first bin that can hold such a chunk and visits dirty bins only, so a chunk is advised once and not again until it is reused and freed.
   - Resident memory holds the live objects and the new one rather than also the chunks that were too small.
   - On Windows the pages stay committed and chunks stay dirty.
-- Collection runs when the words allocated since the last one exceed the words that survived it, with a 4 MB floor. A thread's allocation buffer counts by the size of the chunk it receives, so refilling from small free chunks after a sweep counts no more than the memory handed out.
+- Collection runs when the words allocated since the last one exceed the words that survived it, with a 4 MB floor. A thread's allocation buffer counts by the size of the chunk it receives, so refilling from small free chunks after a sweep counts no more than the memory handed out. Region allocation does not count.
+- Regions (`region { ... }`, see `### Regions`) allocate outside the heap:
+  - Each green thread holds a pointer to its current region, or 0. The allocation fast path does not test it: while a region is current, the OS thread's allocation buffer has its end moved to `M_ALLOC_HELD` and zeroed, so the buffer's bounds check fails and the allocation reaches the slow path, which tests the region first. `rt_region_enter` and `rt_resume` hold the buffer when the green thread that runs has a region, and `rt_region_leave` (back to no region) and `rt_resume` give it back otherwise. A collection retires the buffer from whichever field holds its end. A region's allocations do not take the heap lock.
+  - A region is a descriptor and a list of chunks. A chunk is a power-of-two multiple of 64 KiB in the region range, aligned to its size. The first chunk of a region is 64 KiB and later ones 2 MiB, so the kernel backs them with huge pages where it can; an object over 32 KB gets a chunk of its own of the smallest size that holds it. The 64 KiB units skipped to align a chunk go to the pool of 64 KiB chunks. Scan and noscan objects bump through separate chunks, with the header format of heap objects, so the descriptor sits at the start of the first noscan chunk.
+  - A chunk is zero when handed out, so allocation writes the header and nothing else. Linux commits a chunk with `mprotect(PROT_READ|PROT_WRITE)` and frees it with `madvise(MADV_DONTNEED)` followed by `mprotect(PROT_NONE)`; Windows uses `MEM_COMMIT` and `MEM_DECOMMIT` inside a range reserved with `MEM_RESERVE`.
+  - `rt_region_enter` creates the region and makes it current, `rt_region_leave` makes its parent current while the region stays registered, and `rt_region_free` unregisters it, decommits each chunk and appends the chunk's range to a quarantine list.
+  - Every live region's scan chunks, from the first object to the bump pointer, are conservative roots of a collection. Noscan chunks are never read. A candidate word that points into region memory is not followed; it sets a bit for its 64 KiB unit in a hit bitmap that each collection clears.
+  - A quarantined range returns to the per-size pool of chunks after a collection in which no candidate word pointed into it, and a chunk is taken from the pool of its size before the range's bump pointer moves. When the range is exhausted, a chunk request collects once and retries, then panics with `region: address space exhausted`.
+  - The 64 GiB range holds 32768 chunks of 2 MiB. A program that needs 3.3 GB of live region memory at once uses about 5% of it, and freed ranges are reused after one collection.
+  - A fault on a freed chunk, from the signal handler on Linux and a vectored exception handler on Windows, panics with `region: use of freed memory`.
+  - `spawn` inside a region copies the call's environment from region memory to the heap before the green thread starts, and the new green thread has no current region.
+  - Regions hold no state the hot-reload patches touch: a patch changes function code through `fn_table`, so an open region stays open.
 - `LOW_GCTRACE=1` prints one line per collection to stderr: `gc N pause_us= mark_us= sweep_us= live_kb= heap_kb= slow_allocs= refills=`, from timestamps around the stop, mark, sweep and restart and from per-thread counters of buffer refills.
 - `LOW_GC=off` never collects. `LOW_GC=stress` collects after every 8192 words allocated.
 - An allocation whose type holds no pointers is noscan: `new` of a pointer-free value, and the backing arrays of slices whose elements hold none, such as `[]u8`, `[]i64` and `[]f32`. A noscan object is marked but its contents are never read. Other objects are scanned word by word.
@@ -1852,6 +1899,7 @@ The derivations are generated as source:
 - Calls inside it to the same intrinsics derive the types they reach. Each derived function is cached by type.
 - The serialization of a type is `fn(w: Writer, mut path: []i64, v: T)`. `path` holds the addresses of the pointers being written, pushed before a pointer's target is written and popped after it; a pointer already on it panics with `serde: cycle through *T`. `__serialize(v, w)` starts with an empty path, and the derived code recurses through `__serialize_into(w, mut path, x)`.
 - The rendering of a type is `fn(mut b: []u8, mut path: []i64, v: T)`, which appends to `b` through the prelude's `__append_*` functions. `path` holds the addresses of the pointers being rendered, pushed before a pointer's target is rendered and popped after it. A `print` or interpolation creates an empty buffer and path, calls it, and uses the buffer as the text; an interpolation appends into the buffer it is composing. A number, `bool` or `str` is rendered by the same `__append_*` functions, so `print` has one text path: it builds the text and writes it with `rt_print_str`. `__render(v)` gives the text of any value with a `str` quoted, for `std/testing`'s `format`.
+- The copy of a region's result is derived the same way when the type holds pointers, strings, slices or maps: `fn(mut path: []i64, v: T) -> T`. It copies each value to the allocator that is current when it runs, which is the one outside the region. `path` holds the addresses of the pointers being copied, as for the rendering, and a pointer already on it panics with `region: cycle through *T`. The private builtin `__copy_into(mut path, v)` calls the derived function for the type of `v`. Types it cannot copy are errors at the `region`.
 - Bound names resolve in type positions, struct literals and variant selectors.
 - A field reference `T.field` is checked as `serde.Field[T, F]` and lowered to the field's name and index as constants.
 
@@ -1898,6 +1946,7 @@ The derivations are generated as source:
 - A C callback is a thunk, `cb_name`, emitted once per program for every function used as one. It saves the C argument registers, re-extends narrow integers and `bool` from them and from the C stack, calls the function with Low's convention on the green thread's stack and moves a float result to `xmm0`. On Windows it also saves and restores `xmm6` to `xmm15`, which C treats as callee-saved.
 - Every loop's back-edge block is marked. The code generator ends it with the poll check described under Code generation.
 - `spawn f(a, b)` becomes a block that binds the callee and the arguments to fresh locals and passes a closure calling `f` with them to `rt_spawn`.
+- `region { body }` becomes `rt_region_enter`, the body, `rt_region_leave`, a call of the derived copy function on the body's value when the checker attached one, and `rt_region_free`. Nothing in the body leaves the block, so each of the four runs exactly once.
 - Sends, receives, `close` and channel loops call the prelude's instances for the element type. `select` calls the prelude's per-arm helpers and the runtime's `rt_lock_all`, `rt_timer_add` and `rt_park`.
 - `funcaddr` gives a function's code address, its thunk, or an `extern` function's address through the GOT. Functions reached only through `funcaddr` are kept.
 - In dev builds every C function gets a global trampoline, `cfn_name: jmp name`, and calls go through it, so a patch can link against the running binary.
@@ -2143,7 +2192,7 @@ Calling convention:
   - `main`.
 
   A running frame of old code may still call any function, so it must keep the old calling convention and data layout. `main` never returns to pick up new code.
-- Otherwise every function whose generated assembly differs from the running version is recompiled, including callers whose code changed only because a callee did, every instance of an edited generic function, and new functions. Heap, stack and all live values are kept.
+- Otherwise every function whose generated assembly differs from the running version is recompiled, including callers whose code changed only because a callee did, every instance of an edited generic function, and new functions. Heap, stack, open regions and all live values are kept.
 
 Mechanism:
 

@@ -30,6 +30,24 @@ rt_stat_slow:
 	.zero 8
 rt_stat_refills:
 	.zero 8
+rt_region_start:
+	.zero 8
+rt_region_hits:
+	.zero 8
+rt_region_bump:
+	.zero 8
+rt_region_list:
+	.zero 8
+rt_region_count:
+	.zero 8
+rt_rq:
+	.zero 8
+rt_rq_count:
+	.zero 8
+rt_rp:
+	.zero 8
+rt_rp_count:
+	.zero 8*21
 
 	.text
 rt_gc_env:
@@ -124,6 +142,474 @@ rt_gc_stats_collect:
 	mov [rcx+40], rax
 	mov [rcx+48], rdx
 	ret
+
+rt_region_init:
+	mov rdi, [rip+rt_region_start]
+	mov rsi, 68719476736
+	call rt_region_decommit
+	mov rsi, 8388608
+	call rt_mmap_stack
+	mov [rip+rt_region_list], rax
+	mov rsi, 8388608
+	call rt_mmap_stack
+	mov [rip+rt_rq], rax
+	mov rsi, 16777216
+	call rt_mmap_stack
+	mov [rip+rt_rp], rax
+	mov rsi, 131072
+	call rt_mmap_stack
+	mov [rip+rt_region_hits], rax
+	ret
+
+rt_region_hits_clear:
+	mov rcx, [rip+rt_region_bump]
+	test rcx, rcx
+	jz 1f
+	add rcx, 63
+	shr rcx, 6
+	mov rdi, [rip+rt_region_hits]
+	xor eax, eax
+	rep stosq
+1:
+	ret
+
+rt_region_pool_base:
+	mov ecx, 21
+	sub ecx, esi
+	mov edx, 1
+	shl rdx, cl
+	mov rax, 2097152
+	sub rax, rdx
+	mov rdx, [rip+rt_rp]
+	lea rdx, [rdx+8*rax]
+	ret
+
+rt_region_pool_push:
+	call rt_region_pool_base
+	lea rcx, [rip+rt_rp_count]
+	mov rax, [rcx+8*rsi]
+	mov [rdx+8*rax], rdi
+	inc rax
+	mov [rcx+8*rsi], rax
+	ret
+
+rt_region_pool_pop:
+	lea rcx, [rip+rt_rp_count]
+	cmp qword ptr [rcx+8*rsi], 0
+	je 1f
+	call rt_region_pool_base
+	lea rcx, [rip+rt_rp_count]
+	mov rax, [rcx+8*rsi]
+	dec rax
+	mov [rcx+8*rsi], rax
+	mov rax, [rdx+8*rax]
+	ret
+1:
+	mov rax, -1
+	ret
+
+rt_region_reclaim:
+	push rbx
+	push r12
+	push r13
+	push r14
+	xor ebx, ebx
+	xor r12d, r12d
+	mov r13, [rip+rt_rq]
+	mov r14, [rip+rt_region_hits]
+1:
+	cmp rbx, [rip+rt_rq_count]
+	jae 5f
+	mov rax, [r13+8*rbx]
+	inc rbx
+	mov edi, eax
+	mov rsi, rax
+	shr rsi, 32
+	mov ecx, esi
+	mov r8d, 1
+	shl r8, cl
+	lea r9, [rdi+r8]
+	mov r10, rdi
+2:
+	cmp r10, r9
+	jae 4f
+	bt qword ptr [r14], r10
+	jc 3f
+	inc r10
+	jmp 2b
+3:
+	mov [r13+8*r12], rax
+	inc r12
+	jmp 1b
+4:
+	call rt_region_pool_push
+	jmp 1b
+5:
+	mov [rip+rt_rq_count], r12
+	pop r14
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+rt_scan_regions:
+	push rbx
+	push r12
+	push r13
+	xor ebx, ebx
+1:
+	cmp rbx, [rip+rt_region_count]
+	jae 5f
+	mov rax, [rip+rt_region_list]
+	mov r12, [rax+8*rbx]
+	inc rbx
+	mov r13, [r12+R_CHUNKS]
+2:
+	test r13, r13
+	jz 1b
+	test byte ptr [r13+CH_KIND], 1
+	jz 4f
+	lea rdi, [r13+CH_SIZE]
+	mov rsi, [r13+CH_USED]
+	cmp r13, [r12+R_SCAN_CHUNK]
+	jne 3f
+	mov rsi, [r12+R_SCAN_BUMP]
+3:
+	call rt_scan_range
+4:
+	mov r13, [r13+CH_NEXT]
+	jmp 2b
+5:
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+rt_region_fill:
+	push rax
+1:
+	cmp r9, r10
+	jae 2f
+	mov rdi, r9
+	xor esi, esi
+	call rt_region_pool_push
+	inc r9
+	jmp 1b
+2:
+	pop rax
+	ret
+
+rt_region_chunk:
+	push rbx
+	push r12
+	push r13
+	mov ebx, edi
+	mov r12d, esi
+	xor r13d, r13d
+1:
+	mov esi, ebx
+	call rt_region_pool_pop
+	cmp rax, -1
+	jne 3f
+	mov r9, [rip+rt_region_bump]
+	mov ecx, ebx
+	mov edx, 1
+	shl rdx, cl
+	lea rax, [r9+rdx-1]
+	mov r8, rdx
+	neg r8
+	and rax, r8
+	add rdx, rax
+	cmp rdx, REGION_UNITS
+	ja 2f
+	mov [rip+rt_region_bump], rdx
+	mov r10, rax
+	call rt_region_fill
+	jmp 3f
+2:
+	test r13d, r13d
+	jnz 9f
+	inc r13d
+	call rt_gc
+	jmp 1b
+9:
+	lea rdi, [rip+rt_msg_region_full]
+	jmp rt_panic
+3:
+	shl rax, REGION_SHIFT
+	add rax, [rip+rt_region_start]
+	mov rdi, rax
+	mov ecx, ebx
+	mov esi, 65536
+	shl rsi, cl
+	push rdi
+	call rt_region_commit
+	pop rax
+	mov byte ptr [rax+CH_CLASS], bl
+	mov byte ptr [rax+CH_KIND], r12b
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+	.macro REGION_REFILL chunk, bump, limit, kind
+	mov rax, [rbx+\chunk]
+	test rax, rax
+	jz 1f
+	mov rcx, [rbx+\bump]
+	mov [rax+CH_USED], rcx
+	mov edi, REGION_NEXT
+	jmp 2f
+1:
+	mov edi, REGION_FIRST
+2:
+	mov esi, \kind
+	call rt_region_chunk
+	mov rcx, [rbx+R_CHUNKS]
+	mov [rax+CH_NEXT], rcx
+	mov [rbx+R_CHUNKS], rax
+	mov [rbx+\chunk], rax
+	lea rcx, [rax+CH_SIZE]
+	mov [rbx+\bump], rcx
+	movzx ecx, byte ptr [rax+CH_CLASS]
+	mov edx, 65536
+	shl rdx, cl
+	add rdx, rax
+	mov [rbx+\limit], rdx
+	.endm
+
+rt_region_alloc:
+	mov rcx, [rax+G_REGION]
+	lea rdx, [rdi+1]
+	shl rdx, 3
+rt_region_take:
+	test rsi, rsi
+	jz 2f
+	mov rax, [rcx+R_SCAN_BUMP]
+	lea r8, [rax+rdx]
+	cmp r8, [rcx+R_SCAN_END]
+	ja 3f
+	mov [rcx+R_SCAN_BUMP], r8
+	mov [rax], rdx
+	add rax, 8
+	ret
+2:
+	mov rax, [rcx+R_NOSCAN_BUMP]
+	lea r8, [rax+rdx]
+	cmp r8, [rcx+R_NOSCAN_END]
+	ja 3f
+	mov [rcx+R_NOSCAN_BUMP], r8
+	or rdx, 4
+	mov [rax], rdx
+	add rax, 8
+	ret
+3:
+	push rbx
+	push r12
+	push r13
+	mov rbx, rcx
+	mov r12, rdx
+	mov r13, rsi
+	call rt_heap_acquire
+	cmp r12, REGION_LARGE
+	ja 5f
+	test r13, r13
+	jz 4f
+	REGION_REFILL R_SCAN_CHUNK, R_SCAN_BUMP, R_SCAN_END, 1
+	jmp 8f
+4:
+	REGION_REFILL R_NOSCAN_CHUNK, R_NOSCAN_BUMP, R_NOSCAN_END, 0
+8:
+	mov qword ptr [rip+rt_heap_lock], 0
+	mov rcx, rbx
+	mov rdx, r12
+	mov rsi, r13
+	pop r13
+	pop r12
+	pop rbx
+	jmp rt_region_take
+5:
+	xor edi, edi
+	lea rax, [r12+CH_SIZE+65535]
+	shr rax, REGION_SHIFT
+	dec rax
+	jz 6f
+	bsr rdi, rax
+	inc edi
+6:
+	xor esi, esi
+	test r13, r13
+	jz 7f
+	mov esi, 1
+7:
+	call rt_region_chunk
+	mov rcx, [rbx+R_CHUNKS]
+	mov [rax+CH_NEXT], rcx
+	mov [rbx+R_CHUNKS], rax
+	lea rdx, [rax+CH_SIZE]
+	lea rcx, [rdx+r12]
+	mov [rax+CH_USED], rcx
+	mov rcx, r12
+	test r13, r13
+	jnz 9f
+	or rcx, 4
+9:
+	mov [rdx], rcx
+	lea rax, [rdx+8]
+	mov qword ptr [rip+rt_heap_lock], 0
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+	.globl rt_region_enter
+rt_region_enter:
+	ENTER_RT
+	push rbx
+	call rt_heap_acquire
+	mov edi, REGION_FIRST
+	xor esi, esi
+	call rt_region_chunk
+	lea rbx, [rax+CH_SIZE]
+	mov [rbx+R_CHUNKS], rax
+	mov [rbx+R_NOSCAN_CHUNK], rax
+	lea rcx, [rbx+R_SIZE]
+	mov [rbx+R_NOSCAN_BUMP], rcx
+	add rax, 65536
+	mov [rbx+R_NOSCAN_END], rax
+	TLS_GET rax, TLS_G
+	mov rcx, [rax+G_REGION]
+	mov [rbx+R_PARENT], rcx
+	mov [rax+G_REGION], rbx
+	mov rcx, [rip+rt_region_count]
+	mov rdx, [rip+rt_region_list]
+	mov [rdx+8*rcx], rbx
+	mov [rbx+R_INDEX], rcx
+	inc rcx
+	mov [rip+rt_region_count], rcx
+	mov qword ptr [rip+rt_heap_lock], 0
+	call rt_alloc_hold
+	mov rax, rbx
+	pop rbx
+	ret
+
+	.globl rt_region_leave
+rt_region_leave:
+	TLS_GET rax, TLS_G
+	mov rcx, [rdi+R_PARENT]
+	mov [rax+G_REGION], rcx
+	test rcx, rcx
+	jz rt_alloc_unhold
+	ret
+
+rt_alloc_hold:
+	TLS_GET rcx, TLS_M
+	mov rax, [rcx+M_ALLOC_END]
+	test rax, rax
+	jz 1f
+	mov [rcx+M_ALLOC_HELD], rax
+	mov qword ptr [rcx+M_ALLOC_END], 0
+1:
+	ret
+
+rt_alloc_unhold:
+	TLS_GET rcx, TLS_M
+	mov rax, [rcx+M_ALLOC_HELD]
+	test rax, rax
+	jz 1f
+	mov [rcx+M_ALLOC_END], rax
+	mov qword ptr [rcx+M_ALLOC_HELD], 0
+1:
+	ret
+
+	.globl rt_region_free
+rt_region_free:
+	ENTER_RT
+	push rbx
+	push r12
+	push r13
+	mov rbx, rdi
+	call rt_heap_acquire
+	mov rax, [rbx+R_INDEX]
+	mov rcx, [rip+rt_region_count]
+	dec rcx
+	mov [rip+rt_region_count], rcx
+	mov rdx, [rip+rt_region_list]
+	mov rsi, [rdx+8*rcx]
+	mov [rdx+8*rax], rsi
+	mov [rsi+R_INDEX], rax
+	mov r12, [rbx+R_CHUNKS]
+1:
+	test r12, r12
+	jz 2f
+	mov r13, [r12+CH_NEXT]
+	mov rdi, r12
+	call rt_region_release
+	mov r12, r13
+	jmp 1b
+2:
+	mov qword ptr [rip+rt_heap_lock], 0
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+rt_region_release:
+	push rbx
+	push r12
+	mov rbx, rdi
+	movzx r12d, byte ptr [rbx+CH_CLASS]
+	mov ecx, r12d
+	mov esi, 65536
+	shl rsi, cl
+	call rt_region_decommit
+	mov rax, rbx
+	sub rax, [rip+rt_region_start]
+	shr rax, REGION_SHIFT
+	mov rdx, r12
+	shl rdx, 32
+	or rax, rdx
+	mov rcx, [rip+rt_rq_count]
+	mov rdx, [rip+rt_rq]
+	mov [rdx+8*rcx], rax
+	inc rcx
+	mov [rip+rt_rq_count], rcx
+	pop r12
+	pop rbx
+	ret
+
+rt_spawn_region:
+	test rsi, rsi
+	jz rt_spawn_start
+	mov rax, rsi
+	sub rax, [rip+rt_region_start]
+	shr rax, REGION_BITS
+	jnz rt_spawn_start
+	ENTER_RT
+	push rdi
+	push rsi
+	mov rdi, [rsi-8]
+	shr rdi, 3
+	dec rdi
+	push rdi
+	TLS_GET rax, TLS_G
+	mov rcx, [rax+G_REGION]
+	push rcx
+	mov qword ptr [rax+G_REGION], 0
+	mov esi, 1
+	call rt_alloc_large
+	pop r9
+	pop rcx
+	pop rsi
+	pop rdx
+	TLS_GET r8, TLS_G
+	mov [r8+G_REGION], r9
+	mov rdi, rax
+	shl rcx, 3
+	rep movsb
+	mov rsi, rax
+	mov rdi, rdx
+	jmp rt_spawn_start
 
 rt_gc_trace_print:
 	push rbx

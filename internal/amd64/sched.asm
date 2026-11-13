@@ -8,6 +8,9 @@
 	MSG_BEGIN rt_msg_fault
 	.ascii "invalid memory access"
 	MSG_END
+	MSG_BEGIN rt_msg_region_freed
+	.ascii "region: use of freed memory"
+	MSG_END
 	MSG_BEGIN rt_msg_timers
 	.ascii "too many timers"
 	MSG_END
@@ -959,6 +962,12 @@ rt_sched_init:
 
 	.globl rt_spawn
 rt_spawn:
+	TLS_GET rax, TLS_G
+	test rax, rax
+	jz rt_spawn_start
+	cmp qword ptr [rax+G_REGION], 0
+	jne rt_spawn_region
+rt_spawn_start:
 	push rbx
 	push r12
 	push r13
@@ -984,6 +993,7 @@ rt_spawn:
 	mov qword ptr [rbx+G_TOKEN], 0
 	mov qword ptr [rbx+G_LOCK], 0
 	mov qword ptr [rbx+G_LOCKEDM], 0
+	mov qword ptr [rbx+G_REGION], 0
 	TLS_GET rax, TLS_G
 	test rax, rax
 	jz 1f
@@ -1031,6 +1041,7 @@ rt_spawn_main:
 	mov [rbx+G_SP], rax
 	mov [rbx+G_SCANLO], rax
 	mov qword ptr [rbx+G_CTX], 0
+	mov qword ptr [rbx+G_REGION], 0
 	mov qword ptr [rbx+G_STATUS], G_RUNNABLE
 	mov rdi, rbx
 	call rt_gq_put
@@ -1130,6 +1141,13 @@ rt_set_blocked:
 	ret
 
 rt_resume:
+	cmp qword ptr [rdi+G_REGION], 0
+	jne 1f
+	call rt_alloc_unhold
+	jmp 2f
+1:
+	call rt_alloc_hold
+2:
 	TEB_ENTER_G rdi, rbx
 	mov rsp, [rdi+G_SP]
 	RESTORE_ALL

@@ -41,6 +41,22 @@ Language and codegen changes freeze during this phase, or each lands twice.
 - Gate: stage 2 and stage 3 are byte-identical, and stage 2 passes the Phase 1 harness.
 - Gate: compile time and peak RSS on the benchmarks are within an agreed factor of the Go build.
 
+### Regions and data-oriented layout
+
+The perf gate is met by cutting allocation and collector work, not by reserving heap headroom.
+
+Regions are a language and runtime feature, built in the Go and Low compilers before the seed is tagged, so the Low compiler can use them:
+
+- `region { ... }` is a block expression, and `region` is a contextual keyword. Every allocation the green thread makes inside the block goes to a fresh region: `new`, slice and map growth, strings, closures and derived code. A spawned green thread allocates on the collected heap.
+- The block's value is deep-copied to the enclosing allocator before the region is freed. The copy is derived per type, like the serializer. It covers numbers, `bool`, `str`, slices, maps, structs, enums, optionals and `*T`. A cycle panics, and the checker rejects function, channel and `ptr` types in the result.
+- Regions nest, and the innermost one receives allocations.
+- Allocation is a per-green-thread bump pointer over chunks. Pointer-free allocations go to noscan chunks.
+- The collector treats live scan chunks as roots, scanned conservatively. Region allocation does not count towards the collection trigger.
+- Region memory comes from a reserved address range. Freeing returns the pages to the operating system and makes the range inaccessible, so a pointer that escaped by any route other than the result traps with a region fault instead of reading reused memory.
+- A freed range is reused only after a full collection finds no candidate word pointing into it.
+
+The compiler's per-function IR, register allocation and assembler state become struct-of-arrays tables indexed by integer IDs, held in pointer-free slices. Each function is compiled inside a region, and only its output bytes and data chunks are copied out.
+
 ## Phase 4: port the rest
 
 - `lsp`, `hot`, `fuzz`, `cmd/lowfuzz`, `tablegen`, `vkgen`, `wlgen`, `shadergen`, `cmd/bench`, `peakrss` and `oracletool`.

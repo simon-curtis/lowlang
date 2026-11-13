@@ -13,7 +13,7 @@ import (
 )
 
 func (c *Checker) derivationHome(kind derivation) *ast.File {
-	if kind == render {
+	if kind == render || kind == duplicate {
 		return c.scope("").home
 	}
 	return c.file

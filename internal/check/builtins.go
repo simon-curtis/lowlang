@@ -174,6 +174,7 @@ func privateBuiltins() []*Builtin {
 		{ID: builtin.Envv, Name: "__envv", Params: []string{"i"}, handler: bare((*Checker).argvCall)},
 		{ID: builtin.Render, Name: "__render", Params: []string{"value"}, handler: bare((*Checker).renderCall)},
 		{ID: builtin.RenderInto, Name: "__render_into", Params: []string{"mut b", "mut path", "value"}, handler: bare((*Checker).renderIntoCall)},
+		{ID: builtin.CopyInto, Name: "__copy_into", Params: []string{"mut path", "value"}, handler: bare((*Checker).copyIntoCall)},
 		{ID: builtin.Address, Name: "__address", Params: []string{"p"}, handler: bare((*Checker).addressCall)},
 		{ID: builtin.Serialize, Name: "__serialize", Params: []string{"value", "w"}, handler: bare((*Checker).serializeCall)},
 		{ID: builtin.SerializeInto, Name: "__serialize_into", Params: []string{"w", "mut path", "value"}, handler: bare((*Checker).serializeIntoCall)},

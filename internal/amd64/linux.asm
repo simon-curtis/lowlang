@@ -137,6 +137,27 @@ rt_mmap:
 	ja rt_panic_oom
 	ret
 
+rt_region_commit:
+	mov edx, 3
+	mov eax, 10
+	syscall
+	cmp rax, -4096
+	ja rt_panic_oom
+	ret
+
+rt_region_decommit:
+	push rdi
+	push rsi
+	mov edx, 4
+	mov eax, 28
+	syscall
+	pop rsi
+	pop rdi
+	xor edx, edx
+	mov eax, 10
+	syscall
+	ret
+
 rt_mmap_sparse:
 	push rsi
 	call rt_mmap
@@ -447,6 +468,12 @@ rt_fault:
 	lea rdi, [rip+rt_msg_overflow]
 	jmp rt_panic
 1:
+	sub rax, [rip+rt_region_start]
+	shr rax, REGION_BITS
+	jnz 2f
+	lea rdi, [rip+rt_msg_region_freed]
+	jmp rt_panic
+2:
 	lea rdi, [rip+rt_msg_fault]
 	jmp rt_panic
 

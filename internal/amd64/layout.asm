@@ -31,6 +31,7 @@
 	.set M_WAKETICK, 208
 	.set M_SLOWS, 216
 	.set M_REFILLS, 224
+	.set M_ALLOC_HELD, 232
 	.set ALLOC_SMALL, 255
 	.set ALLOC_BUFFER, 4096
 	.set RELEASE_MIN, 131072
@@ -84,6 +85,29 @@
 	.set G_LOCKEDM, 88
 	.set G_CTX, 104
 	.set G_LIMIT, 96
+	.set G_REGION, 112
+
+	.set REGION_SHIFT, 16
+	.set REGION_BITS, 36
+	.set REGION_UNITS, 1048576
+	.set REGION_FIRST, 0
+	.set REGION_NEXT, 5
+	.set REGION_LARGE, 32768
+	.set CH_NEXT, 0
+	.set CH_CLASS, 8
+	.set CH_KIND, 9
+	.set CH_USED, 16
+	.set CH_SIZE, 32
+	.set R_PARENT, 0
+	.set R_SCAN_CHUNK, 8
+	.set R_SCAN_BUMP, 16
+	.set R_SCAN_END, 24
+	.set R_NOSCAN_CHUNK, 32
+	.set R_NOSCAN_BUMP, 40
+	.set R_NOSCAN_END, 48
+	.set R_INDEX, 56
+	.set R_CHUNKS, 64
+	.set R_SIZE, 80
 
 	.set G_FREE, 0
 	.set G_RUNNABLE, 1

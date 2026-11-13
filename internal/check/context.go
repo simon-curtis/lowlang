@@ -15,6 +15,9 @@ type funcContext struct {
 	abstract  bool
 	deferring bool
 	dropping  bool
+
+	regions     int
+	regionLoops int
 }
 
 func (c *Checker) enter(next funcContext, run func()) {

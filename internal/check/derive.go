@@ -24,9 +24,10 @@ const (
 	deserialize
 	describe
 	render
+	duplicate
 )
 
-var derivationNames = [...]string{serialize: "__write", deserialize: "__read", describe: "__describe", render: "__render"}
+var derivationNames = [...]string{serialize: "__write", deserialize: "__read", describe: "__describe", render: "__render", duplicate: "__copy"}
 
 type synth struct {
 	c     *Checker
@@ -166,6 +167,9 @@ func (s *synth) function(kind derivation, t *types.Type) {
 	case render:
 		s.line("fn derived(mut b: []u8, mut path: []i64, v: %s) {", self)
 		s.render(t)
+	case duplicate:
+		s.line("fn derived(mut path: []i64, v: %s) -> %s {", self, self)
+		s.duplicate(t)
 	}
 	s.line("}")
 }

@@ -897,6 +897,15 @@ func (p *Parser) unary(testing bool) ast.Expr {
 	return p.postfix(p.primary())
 }
 
+func (p *Parser) atRegion() bool {
+	return p.at(lexer.Ident) && p.tok().Text == lexer.Region && p.peek() == lexer.LBrace && !p.noStruct
+}
+
+func (p *Parser) regionExpr() *ast.Region {
+	pos := p.expect(lexer.Ident).Pos
+	return &ast.Region{Body: p.block(), Pos: pos}
+}
+
 func (p *Parser) selectExpr() *ast.Select {
 	s := &ast.Select{Pos: p.expect(lexer.Select).Pos}
 	p.lines(func() { s.Cases = append(s.Cases, p.selectCase()) })
@@ -978,6 +987,9 @@ func (p *Parser) primary() ast.Expr {
 		p.next()
 		return &ast.BoolLit{Value: t.Kind == lexer.True, Pos: t.Pos}
 	case lexer.Ident:
+		if p.atRegion() {
+			return p.regionExpr()
+		}
 		p.next()
 		if lit := p.literal(t, ""); lit != nil {
 			return lit

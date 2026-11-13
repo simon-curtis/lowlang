@@ -83,6 +83,11 @@
   operator: _ @keyword
   (#eq? @keyword "when"))
 
+((identifier) @keyword
+  .
+  (block)
+  (#eq? @keyword "region"))
+
 "fn" @keyword.function
 
 [

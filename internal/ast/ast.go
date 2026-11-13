@@ -616,6 +616,13 @@ type When struct {
 	Pos  diag.Pos
 }
 
+type Region struct {
+	Typed
+	Body *Block
+	Copy *Func
+	Pos  diag.Pos
+}
+
 func (n *File) Position() diag.Pos          { return diag.Start(n.Path) }
 func (n *Import) Position() diag.Pos        { return n.Pos }
 func (n *Extern) Position() diag.Pos        { return n.Pos }
@@ -674,6 +681,7 @@ func (n *Try) Position() diag.Pos           { return n.Pos }
 func (n *Catch) Position() diag.Pos         { return n.Pos }
 func (n *Or) Position() diag.Pos            { return n.Pos }
 func (n *When) Position() diag.Pos          { return n.Pos }
+func (n *Region) Position() diag.Pos        { return n.Pos }
 
 func (*Let) stmt()      {}
 func (*Assign) stmt()   {}
@@ -716,3 +724,4 @@ func (*Try) expr()       {}
 func (*Catch) expr()     {}
 func (*Or) expr()        {}
 func (*When) expr()      {}
+func (*Region) expr()    {}

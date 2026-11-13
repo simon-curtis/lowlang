@@ -160,6 +160,20 @@ rt_commit:
 	jz rt_panic_oom
 	ret
 
+rt_region_commit:
+	mov rcx, rdi
+	mov rdx, rsi
+	jmp rt_commit
+
+rt_region_decommit:
+	OS_ENTER
+	mov rcx, rdi
+	mov rdx, rsi
+	mov r8d, MEM_DECOMMIT
+	WIN VirtualFree
+	OS_LEAVE
+	ret
+
 rt_heap_commit:
 	push rbx
 	push r12
@@ -383,10 +397,16 @@ rt_fault:
 	jz 2f
 	mov r11, [rax+EXCEPTION_ADDRESS]
 	cmp r11, [r10+G_LO]
-	jb 2f
+	jb 3f
 	cmp r11, [r10+G_HI]
-	jae 2f
+	jae 3f
 	lea r9, [rip+rt_msg_overflow]
+	jmp 2f
+3:
+	sub r11, [rip+rt_region_start]
+	shr r11, REGION_BITS
+	jnz 2f
+	lea r9, [rip+rt_msg_region_freed]
 2:
 	mov rax, [rcx+8]
 	mov [rax+CONTEXT_RDI], r9

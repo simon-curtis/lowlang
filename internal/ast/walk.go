@@ -173,6 +173,8 @@ func (w walker) node(n Node) {
 	case *When:
 		w.expr(n.X)
 		w.expr(n.Cond)
+	case *Region:
+		w.block(n.Body)
 	case *Receiver:
 		w.expr(n.X)
 	}

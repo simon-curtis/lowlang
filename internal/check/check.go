@@ -570,6 +570,7 @@ func (c *Checker) closure(e *ast.Closure, want *types.Type) {
 	next := c.funcContext
 	next.closures = append(next.closures, e)
 	next.loops, next.deferring = nil, false
+	next.regions, next.regionLoops = 0, 0
 	c.enter(next, func() { c.body(fn) })
 	e.Type = c.signatureOf(fn, false)
 }
@@ -761,6 +762,7 @@ func (c *Checker) deferStmt(s *ast.Defer) {
 	}
 	next := c.funcContext
 	next.loops, next.deferring = nil, true
+	next.regions, next.regionLoops = 0, 0
 	c.enter(next, func() {
 		c.pushScope()
 		if c.stmt(s.Body) {
@@ -772,6 +774,9 @@ func (c *Checker) deferStmt(s *ast.Defer) {
 func (c *Checker) leaving(pos diag.Pos, keyword string) {
 	if c.deferring {
 		c.fail(pos, "%s cannot appear in a deferred statement", keyword)
+	}
+	if c.regions > 0 && keyword != "break" && keyword != "continue" {
+		c.fail(pos, "%s cannot leave a region", keyword)
 	}
 }
 
@@ -1100,8 +1105,12 @@ func (c *Checker) target(pos diag.Pos, keyword, label string) (*loop, int) {
 		c.fail(pos, "%s outside of a loop", keyword)
 	}
 	for depth := range len(c.loops) {
-		l := c.loops[len(c.loops)-1-depth]
+		index := len(c.loops) - 1 - depth
+		l := c.loops[index]
 		if l.label == label || label == "" {
+			if c.regions > 0 && index < c.regionLoops {
+				c.fail(pos, "%s cannot leave a region", keyword)
+			}
 			l.used = l.used || label != ""
 			return l, depth
 		}
@@ -1242,6 +1251,8 @@ func (c *Checker) expr(e ast.Expr, want *types.Type) *types.Type {
 		c.or(e, want)
 	case *ast.When:
 		c.whenExpr(e, want)
+	case *ast.Region:
+		c.region(e, want)
 	}
 	return e.TypeOf()
 }
