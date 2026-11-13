@@ -1,0 +1,234 @@
+import std/file
+import std/os
+import std/sync
+import std/text
+
+const std_directory = "internal/compiler/std"
+
+struct Context {
+    low: str
+    root: str
+    work: str
+    filter: str
+}
+
+struct Task {
+    name: str
+    exclusive: bool
+    check: fn(str) -> []str
+}
+
+struct Result {
+    name: str
+    problems: []str
+}
+
+struct Tally {
+    passed: i64
+    failed: i64
+    skipped: i64
+}
+
+struct Case {
+    program: Program
+    sidecars: Sidecars
+}
+
+fn suite_names() -> []str {
+    ["run", "examples", "fail", "lint", "windows"]
+}
+
+fn run_suite(ctx: Context, suite: str) -> Tally {
+    let tasks = tasks_for(ctx, suite) catch {
+        Unavailable(message, count) => return unavailable(suite, message, count)
+        Skipped(message, count) => return skipped(suite, message, count)
+        f => return broken(suite, f)
+    }
+    run_tasks(ctx, suite, tasks)
+}
+
+fn tasks_for(ctx: Context, suite: str) -> []Task ! Fault {
+    match suite {
+        "run" => run_task_list(ctx)
+        "examples" => example_task_list(ctx)
+        "fail" => fail_task_list(ctx)
+        "lint" => lint_task_list(ctx)
+        _ => windows_task_list(ctx)
+    }
+}
+
+fn matching(ctx: Context, suite: str, programs: []Program) -> []Program {
+    var kept: []Program = []
+    for program in programs {
+        if text.contains("{suite}/{program.name}", ctx.filter) {
+            push(mut kept, program)
+        }
+    }
+    kept
+}
+
+fn read_cases(programs: []Program) -> []Case ! Fault {
+    var cases: []Case = []
+    for program in programs {
+        let sidecars = read_sidecars(program.path)?
+        push(mut cases, Case { program, sidecars })
+    }
+    cases
+}
+
+fn require_linux_host(count: i64) ! Fault {
+    if windows_host {
+        fail Skipped("runs Linux binaries, which need a Linux host", count)
+    }
+}
+
+fn run_task_list(ctx: Context) -> []Task ! Fault {
+    let programs = read_programs("testdata/run")?
+    let selected = matching(ctx, "run", programs)
+    require_linux_host(selected.len)?
+    let cases = read_cases(selected)?
+    var tasks: []Task = []
+    for c in cases {
+        let exclusive = c.sidecars.max_rss_kb > 0 || c.sidecars.max_time_ns > 0
+        let check = fn(scratch: str) -> []str { check_run(ctx, c.program, c.sidecars, scratch) }
+        push(mut tasks, Task { name: c.program.name, exclusive, check })
+    }
+    tasks
+}
+
+fn example_task_list(ctx: Context) -> []Task ! Fault {
+    let programs = read_examples(std_directory)?
+    let selected = matching(ctx, "examples", programs)
+    require_linux_host(selected.len)?
+    let cases = read_cases(selected)?
+    var tasks: []Task = []
+    for c in cases {
+        let check = fn(scratch: str) -> []str { check_example(ctx, c.program, c.sidecars, scratch) }
+        push(mut tasks, Task { name: c.program.name, exclusive: false, check })
+    }
+    tasks
+}
+
+fn fail_task_list(ctx: Context) -> []Task ! Fault {
+    let programs = read_programs("testdata/fail")?
+    var tasks: []Task = []
+    for program in matching(ctx, "fail", programs) {
+        let check = fn(scratch: str) -> []str { check_fail(ctx, program, scratch) }
+        push(mut tasks, Task { name: program.name, exclusive: false, check })
+    }
+    tasks
+}
+
+fn lint_task_list(ctx: Context) -> []Task ! Fault {
+    let programs = read_programs("testdata/lint")?
+    var tasks: []Task = []
+    for program in matching(ctx, "lint", programs) {
+        let check = fn(scratch: str) -> []str { check_lint(ctx, program) }
+        push(mut tasks, Task { name: program.name, exclusive: false, check })
+    }
+    tasks
+}
+
+fn windows_task_list(ctx: Context) -> []Task ! Fault {
+    let run = read_programs("testdata/run")?
+    let windows = read_programs("testdata/windows")?
+    let examples = read_examples(std_directory)?
+    let candidates = matching(ctx, "windows", windows_programs(run, windows, examples))
+    let cases = read_cases(candidates)?
+    var buildable: []Case = []
+    for c in cases {
+        if windows_build(c.sidecars) {
+            push(mut buildable, c)
+        }
+    }
+    var tasks: []Task = []
+    if buildable.len == 0 {
+        return tasks
+    }
+    let launcher = windows_launcher() catch {
+        Unavailable(message, _) => fail Unavailable(message, buildable.len)
+        f => fail f
+    }
+    for c in buildable {
+        let check = fn(scratch: str) -> []str { check_windows(ctx, launcher, c.program, c.sidecars, scratch) }
+        push(mut tasks, Task { name: c.program.name, exclusive: false, check })
+    }
+    tasks
+}
+
+fn ci() -> bool {
+    (os.env("CI") ?? "") == "true"
+}
+
+fn unavailable(suite: str, message: str, count: i64) -> Tally {
+    if ci() {
+        print("FAIL {suite}: {message}")
+        return Tally { passed: 0, failed: 1, skipped: 0 }
+    }
+    skipped(suite, message, count)
+}
+
+fn skipped(suite: str, message: str, count: i64) -> Tally {
+    print("{suite}: skipped: {message}")
+    Tally { passed: 0, failed: 0, skipped: count }
+}
+
+fn broken(suite: str, f: Fault) -> Tally {
+    let message = describe(f)
+    print("FAIL {suite}: {message}")
+    Tally { passed: 0, failed: 1, skipped: 0 }
+}
+
+fn run_tasks(ctx: Context, suite: str, tasks: []Task) -> Tally {
+    var results: []Result = []
+    for task in tasks {
+        push(mut results, Result { name: task.name, problems: [] })
+    }
+    for i, task in tasks {
+        if task.exclusive {
+            results[i] = run_task(ctx, suite, i, task)
+        }
+    }
+    let group = sync.wait_group()
+    let permits = sync.semaphore(os.cpu_count())
+    for i, task in tasks {
+        if !task.exclusive {
+            sync.add(group, 1)
+            spawn run_parallel(ctx, suite, i, task, results, permits, group)
+        }
+    }
+    sync.wait(group)
+    tally(suite, results)
+}
+
+fn run_parallel(ctx: Context, suite: str, index: i64, task: Task, results: []Result, permits: sync.Semaphore, group: sync.WaitGroup) {
+    sync.acquire(permits)
+    results[index] = run_task(ctx, suite, index, task)
+    sync.release(permits)
+    sync.done(group)
+}
+
+fn run_task(ctx: Context, suite: str, index: i64, task: Task) -> Result {
+    let scratch = "{ctx.work}/{suite}-{index}"
+    file.mkdir_all(scratch) catch {
+        e => return Result { name: task.name, problems: ["{scratch}: {e}"] }
+    }
+    let problems = task.check(scratch)
+    file.remove_all(scratch) or {}
+    Result { name: task.name, problems }
+}
+
+fn tally(suite: str, results: []Result) -> Tally {
+    var passed = 0
+    var failed = 0
+    for result in results {
+        if result.problems.len == 0 {
+            passed += 1
+        } else {
+            failed += 1
+            let joined = text.join(result.problems, "; ")
+            print("FAIL {suite}/{result.name}: {joined}")
+        }
+    }
+    Tally { passed, failed, skipped: 0 }
+}

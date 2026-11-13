@@ -1,0 +1,188 @@
+import std/file
+import std/io
+import std/os
+import std/os/signal
+import std/process
+import std/text
+import std/time
+
+const run_limit_ms = 60000
+const compile_limit_ms = 600000
+const sample_interval_ms = 1
+
+struct Invocation {
+    program: str
+    args: []str
+    extra_env: [str: str] = [:]
+    limit_ms: i64 = run_limit_ms
+    measure_memory: bool = false
+}
+
+struct Captured {
+    exit: process.Exit
+    stdout: str
+    stderr: str
+    elapsed_ns: i64
+    peak_kb: i64
+    timed_out: bool
+}
+
+struct Collected {
+    data: []u8
+    done: chan[bool]
+}
+
+struct Sampler {
+    peak_kb: i64
+    stop: chan[bool]
+    done: chan[bool]
+}
+
+fn execute(inv: Invocation) -> Captured ! io.Error {
+    let environment = merged_environment(inv.extra_env)
+    let command = process.Command {
+        program: inv.program
+        args: inv.args
+        env: some(environment)
+        stdin: process.Stdio.Null
+        stdout: process.Stdio.Piped
+        stderr: process.Stdio.Piped
+        group: true
+    }
+    let began = time.monotonic()
+    using child = process.start(command)?
+    let stdout_stream = piped(child.handle.stdout)?
+    let stderr_stream = piped(child.handle.stderr)?
+    let out = new(Collected { data: [], done: chan[bool](1) })
+    let err = new(Collected { data: [], done: chan[bool](1) })
+    spawn collect(stdout_stream, out)
+    spawn collect(stderr_stream, err)
+    let sampler = start_sampler(child.handle.pid, inv.measure_memory)
+    let timed_out = wait_for_exit(child.handle, inv.limit_ms)
+    let peak_kb = finish_sampler(sampler)
+    <-out.done
+    <-err.done
+    let exit = process.wait(child)?
+    let elapsed_ns = time.monotonic() - began
+    Captured {
+        exit
+        stdout: str(out.data)
+        stderr: str(err.data)
+        elapsed_ns
+        peak_kb
+        timed_out
+    }
+}
+
+fn run_detached(program: str, args: []str, extra_env: [str: str]) -> process.Exit ! io.Error {
+    let environment = merged_environment(extra_env)
+    let command = process.Command {
+        program
+        args
+        env: some(environment)
+        stdin: process.Stdio.Null
+        stdout: process.Stdio.Null
+        stderr: process.Stdio.Null
+    }
+    using child = process.start(command)?
+    process.wait(child)?
+}
+
+fn merged_environment(extra: [str: str]) -> [str: str] {
+    var environment = os.environment()
+    for name, value in extra {
+        environment[name] = value
+    }
+    environment
+}
+
+fn piped(stream: io.Stream?) -> io.Stream ! io.Error {
+    match stream {
+        some(s) => s
+        none => fail Invalid
+    }
+}
+
+fn collect(stream: io.Stream, into: *Collected) {
+    let buffer = io.buffer(65536)
+    for {
+        let n = stream.read(buffer) or break
+        if n == 0 {
+            break
+        }
+        io.append(mut into.data, buffer[..n])
+    }
+    stream.close()
+    into.done <- true
+}
+
+fn wait_for_exit(handle: *process.ChildHandle, limit_ms: i64) -> bool {
+    let exited = chan[bool](1)
+    spawn await_exit(handle, exited)
+    select {
+        <-exited => false
+        after(limit_ms) => {
+            process.kill_on(handle, signal.Signal.Kill) or {}
+            <-exited
+            true
+        }
+    }
+}
+
+fn await_exit(handle: *process.ChildHandle, exited: chan[bool]) {
+    process.wait_exit_on(handle) or {}
+    exited <- true
+}
+
+fn start_sampler(pid: i64, enabled: bool) -> *Sampler? {
+    if !enabled {
+        return none
+    }
+    let sampler = new(Sampler { peak_kb: 0, stop: chan[bool](), done: chan[bool](1) })
+    spawn sample(pid, sampler)
+    sampler
+}
+
+fn finish_sampler(sampler: *Sampler?) -> i64 {
+    match sampler {
+        some(s) => {
+            close(s.stop)
+            <-s.done
+            s.peak_kb
+        }
+        none => 0
+    }
+}
+
+fn sample(pid: i64, sampler: *Sampler) {
+    for {
+        let kb = high_water_kb(pid)
+        if kb > sampler.peak_kb {
+            sampler.peak_kb = kb
+        }
+        let stopped = select {
+            <-sampler.stop => true
+            after(sample_interval_ms) => false
+        }
+        if stopped {
+            break
+        }
+    }
+    sampler.done <- true
+}
+
+fn high_water_kb(pid: i64) -> i64 {
+    let status = file.read_text("/proc/{pid}/status") or return 0
+    for line in text.lines(status) {
+        match text.strip_prefix(line, "VmHWM:") {
+            some(rest) => return parse_kb(rest)
+            none => {}
+        }
+    }
+    0
+}
+
+fn parse_kb(field: str) -> i64 {
+    let digits = text.trim(text.trim_suffix(text.trim(field), "kB"))
+    text.parse_int(digits) or 0
+}
