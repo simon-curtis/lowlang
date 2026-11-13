@@ -97,5 +97,24 @@ func TestVexEncodings(t *testing.T) {
 		{"vpshufb xmm1, xmm2, xmm3", "c4 e2 69 00 cb"},
 		{"vzeroupper", "c5 f8 77"},
 		{"vpbroadcastb ymm0, xmm1", "c4 e2 7d 78 c1"},
+		{"vsubps ymm0, ymm1, ymm2", "c5 f4 5c c2"},
+		{"vmaxpd ymm8, ymm1, [rax]", "c5 75 5f 00"},
+		{"vdivps xmm0, xmm1, xmm2", "c5 f0 5e c2"},
+		{"vminps ymm0, ymm1, ymm2", "c5 f4 5d c2"},
+		{"vpbroadcastw ymm0, xmm1", "c4 e2 7d 79 c1"},
+		{"vpbroadcastq ymm2, xmm0", "c4 e2 7d 59 d0"},
+		{"vpcmpeqw ymm0, ymm1, ymm2", "c5 f5 75 c2"},
+		{"vpsubq ymm0, ymm1, ymm2", "c5 f5 fb c2"},
+		{"vpandn ymm0, ymm1, ymm2", "c5 f5 df c2"},
+		{"vpslld ymm0, ymm1, xmm6", "c5 f5 f2 c6"},
+	})
+}
+
+func TestPackedEncodings(t *testing.T) {
+	checkEncodings(t, []encodingCase{
+		{"pcmpeqw xmm0, xmm1", "66 0f 75 c1"},
+		{"pslld xmm0, xmm6", "66 0f f2 c6"},
+		{"psubq xmm0, xmm1", "66 0f fb c1"},
+		{"punpcklqdq xmm0, xmm0", "66 0f 6c c0"},
 	})
 }
