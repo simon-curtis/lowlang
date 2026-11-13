@@ -1,0 +1,315 @@
+struct SecBuilder {
+    sec: Section
+    index: i64
+    frags: []*Frag = []
+    fixups: []TextFixup = []
+    pads: []*PadState = []
+    last: LastKind = Other
+}
+
+struct PendingDifference {
+    section: *SecBuilder
+    offset: i64
+    size: i64
+    value: Value
+    line: i64
+}
+
+struct SectionSpec {
+    flags: i64 = 0
+    nobits: bool = false
+}
+
+fn section_defaults(name: str) -> SectionSpec {
+    match name {
+        ".text" => SectionSpec { flags: flag_alloc | flag_exec }
+        ".data" => SectionSpec { flags: flag_alloc | flag_write }
+        ".bss" => SectionSpec { flags: flag_alloc | flag_write, nobits: true }
+        ".rodata" => SectionSpec { flags: flag_alloc }
+        ".tbss" => SectionSpec { flags: flag_alloc | flag_write | flag_tls, nobits: true }
+        ".tdata" => SectionSpec { flags: flag_alloc | flag_write | flag_tls }
+        _ => SectionSpec {}
+    }
+}
+
+fn exec(b: *SecBuilder) -> bool {
+    flags_has(b.sec.flags, flag_exec)
+}
+
+struct Mark {
+    value: i64
+    frag: i64
+}
+
+fn mark(b: *SecBuilder) -> Mark {
+    if exec(b) {
+        return Mark { value: b.sec.data.len, frag: current_frag(b) }
+    }
+    if b.sec.nobits {
+        return Mark { value: b.sec.size, frag: 0 }
+    }
+    Mark { value: b.sec.data.len, frag: 0 }
+}
+
+fn raise_align(b: *SecBuilder, n: i64) {
+    if n > b.sec.align {
+        b.sec.align = n
+    }
+}
+
+fn default_section(a: *Assembler, name: str) {
+    section(a, name, section_defaults(name))
+}
+
+fn section(a: *Assembler, name: str, spec: SectionSpec) {
+    match a.sections[name] {
+        some(existing) => {
+            a.cur = existing
+            return
+        }
+        none => {}
+    }
+    let b = new(SecBuilder {
+        sec: Section { name, flags: spec.flags, nobits: spec.nobits, align: 1 },
+        index: a.sec_order.len
+    })
+    if exec(b) {
+        b.frags = [new(Frag {})]
+    }
+    a.sections[name] = b
+    push(mut a.sec_order, b)
+    a.cur = b
+}
+
+fn target(a: *Assembler) ! Error {
+    let b = a.cur
+    if b.sec.nobits {
+        fail failure(a, "cannot emit data into nobits section {b.sec.name}")
+    }
+}
+
+fn emit_bytes(a: *Assembler, data: []u8) ! Error {
+    target(a)?
+    let b = a.cur
+    for c in data {
+        push(mut b.sec.data, c)
+    }
+}
+
+fn emit_string(a: *Assembler, text: str) ! Error {
+    target(a)?
+    let b = a.cur
+    for i in 0..text.len {
+        push(mut b.sec.data, text[i])
+    }
+}
+
+fn emit_zero(a: *Assembler, n: i64, fill: u8) ! Error {
+    if n < 0 {
+        fail failure(a, "negative size {n}")
+    }
+    let b = a.cur
+    if b.sec.nobits {
+        b.sec.size += n
+        return
+    }
+    target(a)?
+    append_fill(mut b.sec.data, n, fill)
+}
+
+fn append_bytes(mut out: []u8, data: []u8) {
+    for c in data {
+        push(mut out, c)
+    }
+}
+
+fn append_fill(mut data: []u8, n: i64, fill: u8) {
+    for _ in 0..n {
+        push(mut data, fill)
+    }
+}
+
+fn emit_align(a: *Assembler, power: i64, max: i64) ! Error {
+    if power < 0 || power > 16 {
+        fail failure(a, "bad alignment {power}")
+    }
+    if power == 0 {
+        return
+    }
+    let n = 1 << power
+    let b = a.cur
+    raise_align(b, n)
+    if exec(b) {
+        add_align(b, power, max, a.line)
+    } else if max != 0 {
+        fail failure(a, "an alignment limit is only supported in executable sections")
+    } else if b.sec.nobits {
+        b.sec.size = (b.sec.size + n - 1) & ~(n - 1)
+    } else {
+        let pad = (n - b.sec.data.len % n) % n
+        append_fill(mut b.sec.data, pad, 0)
+    }
+}
+
+fn emit_const(a: *Assembler, size: i64, v: i64) ! Error {
+    target(a)?
+    let b = a.cur
+    append_int(mut b.sec.data, size, v)
+}
+
+fn append_int(mut data: []u8, size: i64, v: i64) {
+    let width = match size {
+        1 => 1
+        2 => 2
+        4 => 4
+        _ => 8
+    }
+    for i in 0..width {
+        push(mut data, u8(v >> (8 * i)))
+    }
+}
+
+fn emit_value(a: *Assembler, size: i64, v: Value) ! Error {
+    if is_const(v) {
+        emit_const(a, size, v.add)?
+        return
+    }
+    let b = a.cur
+    if b.sec.nobits {
+        fail failure(a, "cannot emit data into nobits section {b.sec.name}")
+    }
+    let offset = b.sec.data.len
+    if exec(b) {
+        emit_text_value(a, size, v)?
+        return
+    }
+    if v.neg != "" {
+        let diff = PendingDifference { section: b, offset, size, value: v, line: a.line }
+        push(mut a.pending, diff)
+    } else {
+        let kind = data_fixup_kind(a, size, v.reloc)?
+        push(mut b.sec.fixups, Fixup { offset, kind, symbol: v.sym, addend: v.add, line: a.line })
+    }
+    append_fill(mut b.sec.data, size, 0)
+}
+
+fn emit_text_value(a: *Assembler, size: i64, v: Value) ! Error {
+    let b = a.cur
+    var fixup = TextFixup { at: b.sec.data.len, size, addend: v.add, line: a.line }
+    if v.neg != "" {
+        fixup.neg = lookup(a, v.neg).index
+    } else {
+        fixup.kind = data_fixup_kind(a, size, v.reloc)?
+    }
+    if v.sym != "" {
+        fixup.sym = lookup(a, v.sym).index
+    }
+    add_fixup(b, fixup)
+    append_fill(mut b.sec.data, size, 0)
+}
+
+fn data_fixup_kind(a: *Assembler, size: i64, reloc: i64) -> i64 ! Error {
+    if size == 8 && reloc == reloc_none {
+        return abs64
+    }
+    if size == 4 && reloc == reloc_none {
+        return abs32
+    }
+    if size == 4 && reloc == reloc_img_rel {
+        return img_rel32
+    }
+    fail failure(a, "unsupported relocation for a {size}-byte value")
+}
+
+fn difference_value(a: *Assembler, plus: i64, minus: i64, add: i64) -> i64 ! Error {
+    if plus < 0 || a.sym_order[plus].state != sym_label || a.sym_order[minus].state != sym_label {
+        fail failure(a, "symbol difference uses an undefined symbol")
+    }
+    let left = a.sym_order[plus]
+    let right = a.sym_order[minus]
+    if left.section != right.section {
+        fail failure(a, "symbol difference {left.name} - {right.name} spans sections")
+    }
+    address(a, left) - address(a, right) + add
+}
+
+fn resolve_difference(a: *Assembler, p: PendingDifference) ! Error {
+    a.line = p.line
+    let v = p.value
+    if v.sym == "" || v.reloc != reloc_none {
+        fail failure(a, "unsupported symbol difference")
+    }
+    let plus = lookup(a, v.sym).index
+    let minus = lookup(a, v.neg).index
+    let value = difference_value(a, plus, minus, v.add)?
+    var patch: []u8 = []
+    append_int(mut patch, p.size, value)
+    for i in 0..patch.len {
+        if p.offset + i < p.section.sec.data.len {
+            p.section.sec.data[p.offset + i] = patch[i]
+        }
+    }
+}
+
+fn address(a: *Assembler, sym: *Sym) -> i64 {
+    let section = a.sec_order[sym.section]
+    if !exec(section) {
+        return sym.value
+    }
+    let f = section.frags[sym.frag]
+    f.addr + sym.value - f.start
+}
+
+fn finish(a: *Assembler) ! Error {
+    if a.conds.len != 0 {
+        fail failure(a, "missing .endif")
+    }
+    for b in a.sec_order {
+        if exec(b) {
+            layout(a, b)?
+        }
+    }
+    for b in a.sec_order {
+        if exec(b) {
+            emit_text(a, b)?
+        }
+    }
+    for p in a.pending {
+        resolve_difference(a, p)?
+    }
+    for b in a.sec_order {
+        if !b.sec.nobits && !exec(b) {
+            b.sec.size = b.sec.data.len
+        }
+    }
+}
+
+fn object(a: *Assembler) -> Object {
+    var o = Object {}
+    for b in a.sec_order {
+        push(mut o.sections, b.sec)
+    }
+    for sym in a.sym_order {
+        let exported = export_symbol(a, sym)
+        push(mut o.symbols, exported)
+    }
+    o
+}
+
+fn export_symbol(a: *Assembler, sym: *Sym) -> Symbol {
+    var out = Symbol { name: sym.name, global: sym.global, value: sym.value }
+    match sym.state {
+        sym_undefined => {
+            out.section = section_undefined
+            out.global = true
+        }
+        sym_absolute => {
+            out.section = section_absolute
+        }
+        _ => {
+            out.section = sym.section
+            out.value = address(a, sym)
+        }
+    }
+    out
+}

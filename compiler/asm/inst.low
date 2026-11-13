@@ -1,0 +1,319 @@
+import diag
+const max_operands = 5
+
+const prefix_lock = 1
+const prefix_rep = 2
+const prefix_repne = 4
+
+enum OperandKind {
+    OpReg
+    OpMem
+    OpImm
+}
+
+struct Operand {
+    kind: OperandKind = OpReg
+    reg: i64 = 0
+    size: i64 = 0
+    seg: i64 = 0
+    base: i64 = 0
+    index: i64 = 0
+    scale: i64 = 0
+    value: Value = Value {}
+}
+
+fn prefix_of(name: str) -> i64 {
+    match name {
+        "lock" => prefix_lock
+        "rep" => prefix_rep
+        "repe" => prefix_rep
+        "repz" => prefix_rep
+        "repne" => prefix_repne
+        "repnz" => prefix_repne
+        _ => 0
+    }
+}
+
+fn pointer_size_of(name: str) -> i64 {
+    match name {
+        "byte" => 1
+        "word" => 2
+        "dword" => 4
+        "qword" => 8
+        "tbyte" => 10
+        "xmmword" => 16
+        "oword" => 16
+        "ymmword" => 32
+        _ => 0
+    }
+}
+
+fn instruction(a: *Assembler, name: str) ! Error {
+    let s = a.sc
+    var mnemonic = name
+    var prefix = 0
+    for {
+        let p = prefix_of(mnemonic)
+        if p == 0 || at_end(s) {
+            break
+        }
+        prefix |= p
+        mnemonic = ident(s)
+        if mnemonic == "" {
+            fail failure(a, "expected an instruction after a prefix")
+        }
+    }
+    var ops: []Operand = []
+    if !at_end(s) {
+        for {
+            if ops.len == max_operands {
+                fail failure(a, "{mnemonic} has too many operands")
+            }
+            let op = operand(a)?
+            push(mut ops, op)
+            if !accept(s, ',') {
+                break
+            }
+        }
+    }
+    expect_end(a)?
+    if !exec(a.cur) {
+        fail failure(a, "instruction {mnemonic} in non-executable section {a.cur.sec.name}")
+    }
+    assemble_instruction(a, mnemonic, prefix, ops)?
+    a.cur.last = Other
+    if a.opts.align_branches {
+        end_instruction(a.cur)
+    }
+}
+
+fn assemble_instruction(a: *Assembler, mnemonic: str, prefix: i64, ops: []Operand) ! Error {
+    if assemble_branch(a, mnemonic, ops)? {
+        return
+    }
+    var forms: []Form = []
+    match a.isa[mnemonic] {
+        some(found) => {
+            forms = found
+        }
+        none => fail failure(a, "unsupported instruction {mnemonic}")
+    }
+    for i in 0..forms.len {
+        let f = forms[i]
+        let size = form_match(f, ops) ?? continue
+        let enc = encode(a, f, size, ops, prefix)?
+        let padding = add_instruction_padding(a, f, ops)
+        emit_encoding(a, enc)
+        if padding != no_link {
+            reserve_prefix_room(a.cur, padding, enc)
+        }
+        return
+    }
+    fail failure(a, "no form of {mnemonic} accepts these operands")
+}
+
+fn emit_encoding(a: *Assembler, e: *Encoding) {
+    let b = a.cur
+    if e.has_fixup {
+        let sym = lookup(a, e.fixup_symbol)
+        let at = b.sec.data.len + e.fixup_at
+        add_fixup(b, TextFixup { at, size: 4, kind: e.fixup_kind, sym: sym.index, addend: e.fixup_addend, line: a.line })
+    }
+    append_bytes(mut b.sec.data, e.bytes)
+}
+
+fn operand(a: *Assembler) -> Operand ! Error {
+    let s = a.sc
+    skip_space(s)
+    let size = pointer_size(a)?
+    let seg = segment_override(a)
+    skip_space(s)
+    if peek(s) == '[' {
+        return memory(a, size, seg)?
+    }
+    if size == 0 && seg == reg_none {
+        let reg = register_operand(a)
+        if reg != reg_none {
+            return Operand { kind: OpReg, reg }
+        }
+    }
+    let v = parse_expr(a)?
+    if seg != reg_none {
+        return Operand { kind: OpMem, size, seg, value: v, scale: 1 }
+    }
+    Operand { kind: OpImm, size, value: v }
+}
+
+fn pointer_size(a: *Assembler) -> i64 ! Error {
+    let s = a.sc
+    if !is_ident_start(peek(s)) {
+        return 0
+    }
+    let start = s.pos
+    let word = ident(s)
+    let size = pointer_size_of(word)
+    if size == 0 {
+        s.pos = start
+        return 0
+    }
+    skip_space(s)
+    let keyword = ident(s)
+    if keyword != "ptr" {
+        fail failure(a, "expected ptr after the size keyword")
+    }
+    skip_space(s)
+    size
+}
+
+fn segment_override(a: *Assembler) -> i64 {
+    let s = a.sc
+    if !is_ident_start(peek(s)) {
+        return reg_none
+    }
+    let start = s.pos
+    let name = ident(s)
+    let reg = lookup_reg(a, name)
+    if reg != reg_none && reg_class(reg) == class_segment && peek(s) == ':' {
+        s.pos += 1
+        return reg
+    }
+    s.pos = start
+    reg_none
+}
+
+fn register_operand(a: *Assembler) -> i64 {
+    let s = a.sc
+    if !is_ident_start(peek(s)) {
+        return reg_none
+    }
+    let start = s.pos
+    let name = ident(s)
+    let reg = lookup_reg(a, name)
+    if reg != reg_none && (at_end(s) || peek(s) == ',') {
+        return reg
+    }
+    s.pos = start
+    reg_none
+}
+
+fn memory(a: *Assembler, size: i64, seg: i64) -> Operand ! Error {
+    let s = a.sc
+    s.pos += 1
+    var op = Operand { kind: OpMem, size, seg, scale: 1 }
+    var sign = 1
+    for {
+        skip_space(s)
+        let c = peek(s)
+        if c == '-' || c == '+' {
+            sign = 1
+            if c == '-' {
+                sign = -1
+            }
+            s.pos += 1
+            skip_space(s)
+        }
+        if !register_term(a, mut op, sign)? {
+            displacement_term(a, mut op, sign)?
+        }
+        sign = 1
+        skip_space(s)
+        if peek(s) == ']' {
+            s.pos += 1
+            return op
+        }
+        let next = peek(s)
+        if next != '-' && next != '+' {
+            fail failure(a, "unexpected {diag.quote(rest(s))} in memory operand")
+        }
+    }
+    op
+}
+
+fn register_term(a: *Assembler, mut op: Operand, sign: i64) -> bool ! Error {
+    let s = a.sc
+    let start = s.pos
+    let found = scaled_register(a)?
+    if found.reg == reg_none {
+        s.pos = start
+        return false
+    }
+    if sign < 0 {
+        fail failure(a, "a register cannot be subtracted")
+    }
+    let scale = found.scale
+    if scale == 0 && op.base == reg_none {
+        op.base = found.reg
+    } else if scale == 0 && op.index == reg_none {
+        op.index = found.reg
+        op.scale = 1
+    } else if scale != 0 && op.index == reg_none {
+        if scale != 1 && scale != 2 && scale != 4 && scale != 8 {
+            fail failure(a, "bad index scale {scale}")
+        }
+        op.index = found.reg
+        op.scale = scale
+    } else {
+        fail failure(a, "too many registers in memory operand")
+    }
+    true
+}
+
+struct ScaledRegister {
+    scale: i64 = 0
+    reg: i64 = 0
+}
+
+fn scaled_register(a: *Assembler) -> ScaledRegister ! Error {
+    let s = a.sc
+    if is_ident_start(peek(s)) {
+        let name = ident(s)
+        let reg = lookup_reg(a, name)
+        if reg == reg_none {
+            return ScaledRegister {}
+        }
+        skip_space(s)
+        if peek(s) != '*' {
+            return ScaledRegister { reg }
+        }
+        s.pos += 1
+        skip_space(s)
+        let scale = parse_unary(a)?
+        if !is_const(scale) {
+            fail failure(a, "index scale must be a constant")
+        }
+        return ScaledRegister { scale: scale.add, reg }
+    }
+    if !is_digit(peek(s)) {
+        return ScaledRegister {}
+    }
+    let scale = scale_before_register(a)? ?? return ScaledRegister {}
+    let name = ident(s)
+    let reg = lookup_reg(a, name)
+    ScaledRegister { scale, reg }
+}
+
+fn scale_before_register(a: *Assembler) -> i64? ! Error {
+    let s = a.sc
+    if !is_digit(peek(s)) {
+        return none
+    }
+    let scale = parse_number(a)?
+    skip_space(s)
+    if peek(s) != '*' || !is_const(scale) {
+        return none
+    }
+    s.pos += 1
+    skip_space(s)
+    if !is_ident_start(peek(s)) {
+        return none
+    }
+    scale.add
+}
+
+fn displacement_term(a: *Assembler, mut op: Operand, sign: i64) ! Error {
+    var v = parse_rank(a, rank_bitwise)?
+    if sign < 0 {
+        v = negated(v)
+    }
+    op.value = combine(a, op.value, v)?
+}

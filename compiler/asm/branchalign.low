@@ -1,0 +1,345 @@
+const branch_boundary = 32
+const branch_padding_max = 14
+const fused_padding_max = 20
+const prefix_padding_max = 5
+const cs_prefix = 0x2E
+const no_link = -1
+
+const jcc_c = 1
+const jcc_na = 3
+const jcc_e = 2
+const jcc_l = 6
+const jcc_le = 7
+
+struct PadState {
+    address: i64 = 0
+    link: i64 = 0
+    mf: i64 = 0
+    max_bytes: i64 = 0
+    max_prefix: i64 = 0
+    cmp_size: i64 = 0
+    length: i64 = 0
+    last_length: i64 = 0
+    prefix_length: i64 = 0
+    default_prefix: i64 = 0
+}
+
+fn min(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    b
+}
+
+fn add_pad(b: *SecBuilder, kind: FragKind, mf: i64, max: i64) -> i64 {
+    let f = open_frag(b)
+    f.kind = kind
+    f.pad = b.pads.len
+    push(mut b.pads, new(PadState { link: no_link, mf, max_bytes: max }))
+    start_frag(b)
+    current_frag(b) - 1
+}
+
+fn pad_of(b: *SecBuilder, f: *Frag) -> *PadState {
+    b.pads[f.pad]
+}
+
+fn end_instruction(b: *SecBuilder) {
+    if b.sec.data.len > open_frag(b).start {
+        start_frag(b)
+    }
+}
+
+fn add_branch_padding(a: *Assembler, opcode: i64) {
+    let b = a.cur
+    if !a.opts.align_branches || b.last != Other {
+        return
+    }
+    let mf = (opcode & 0x0E) >> 1
+    add_pad(b, Padding, mf, branch_padding_max)
+    raise_align(b, branch_boundary)
+}
+
+fn add_instruction_padding(a: *Assembler, f: Form, ops: []Operand) -> i64 {
+    let b = a.cur
+    if !a.opts.align_branches || f.branch || b.last != Other {
+        return no_link
+    }
+    let class = fusion(f, ops)
+    if class != fuse_none {
+        return add_pad(b, Fused, class, fused_padding_max)
+    }
+    if ops.len > 0 {
+        return add_pad(b, Prefix, 0, prefix_padding_max)
+    }
+    no_link
+}
+
+fn fusion(f: Form, ops: []Operand) -> i64 {
+    if f.fuse == fuse_none {
+        return fuse_none
+    }
+    var mem = false
+    var imm = false
+    for op in ops {
+        match op.kind {
+            OpMem => {
+                if op.base == reg_rip {
+                    return fuse_none
+                }
+                mem = true
+            }
+            OpImm => {
+                imm = true
+            }
+            _ => {}
+        }
+    }
+    if mem && (imm || f.fuse == fuse_inc_dec) {
+        return fuse_none
+    }
+    f.fuse
+}
+
+fn reserve_prefix_room(b: *SecBuilder, k: i64, e: *Encoding) {
+    let f = b.frags[k]
+    let st = pad_of(b, f)
+    let room = max_instruction_length - e.bytes.len
+    let limit = min(prefix_padding_max, room)
+    let count = e.prefixes
+    match f.kind {
+        Prefix => {
+            st.max_bytes = 0
+            if limit > count {
+                st.max_bytes = limit - count
+            }
+        }
+        _ => {
+            if limit > count {
+                st.max_prefix = limit - count
+            }
+        }
+    }
+    st.default_prefix = cs_prefix
+    if e.segment != 0 {
+        st.default_prefix = e.segment
+    }
+}
+
+fn fusible(cmp: i64, jcc: i64) -> bool {
+    match cmp {
+        fuse_alu_cmp => {
+            return jcc >= jcc_c && jcc <= jcc_na || jcc == jcc_l || jcc == jcc_le
+        }
+        fuse_inc_dec => {
+            return jcc == jcc_e || jcc == jcc_l || jcc == jcc_le
+        }
+        fuse_test_and => {
+            return true
+        }
+        _ => {}
+    }
+    false
+}
+
+fn next_non_empty(b: *SecBuilder, k: i64) -> i64 {
+    var n = k + 1
+    for n < b.frags.len {
+        let f = b.frags[n]
+        if f.kind != Fixed || f.fix != 0 {
+            break
+        }
+        n += 1
+    }
+    n
+}
+
+fn classify(b: *SecBuilder) {
+    if b.pads.len == 0 {
+        return
+    }
+    var k = 0
+    for k < b.frags.len {
+        match b.frags[k].kind {
+            Padding => {
+                pad_of(b, b.frags[k]).link = next_non_empty(b, k)
+            }
+            Fused => {
+                k = classify_fused(b, k)
+            }
+            _ => {}
+        }
+        k += 1
+    }
+    classify_prefixes(b)
+}
+
+fn classify_fused(b: *SecBuilder, k: i64) -> i64 {
+    let f = b.frags[k]
+    let st = pad_of(b, f)
+    let cmp = next_non_empty(b, k)
+    let pad = next_non_empty(b, cmp)
+    let branch = fusible_branch(b, k, pad)
+    if branch >= 0 {
+        st.link = branch
+        st.cmp_size = b.frags[cmp].fix
+        b.frags[pad].kind = Fixed
+        return branch
+    }
+    if st.max_prefix != 0 {
+        f.kind = Prefix
+        st.max_bytes = st.max_prefix
+        st.max_prefix = 0
+    } else {
+        f.kind = Fixed
+    }
+    k
+}
+
+fn fusible_branch(b: *SecBuilder, fused: i64, pad: i64) -> i64 {
+    if pad >= b.frags.len || b.frags[pad].kind != Padding {
+        return no_link
+    }
+    let branch = next_non_empty(b, pad)
+    if branch >= b.frags.len {
+        return no_link
+    }
+    let target = b.frags[branch]
+    if target.kind != Jump || !target.cond {
+        return no_link
+    }
+    let cmp = pad_of(b, b.frags[fused]).mf
+    if !fusible(cmp, pad_of(b, b.frags[pad]).mf) {
+        return no_link
+    }
+    branch
+}
+
+fn classify_prefixes(b: *SecBuilder) {
+    var k = 0
+    for k < b.frags.len {
+        if b.frags[k].kind == Prefix {
+            k = classify_prefix_run(b, k)
+        }
+        k += 1
+    }
+}
+
+fn classify_prefix_run(b: *SecBuilder, first: i64) -> i64 {
+    var total = 0
+    var n = first
+    for n < b.frags.len {
+        let g = b.frags[n]
+        if g.kind == Fixed {
+            n += 1
+            continue
+        }
+        if g.kind == Padding || g.kind == Fused {
+            pad_of(b, b.frags[first]).link = n
+            break
+        }
+        if g.kind != Prefix {
+            break
+        }
+        if total >= fused_padding_max {
+            total = fused_padding_max
+            g.kind = Fixed
+            n += 1
+            continue
+        }
+        total += pad_of(b, g).max_bytes
+        n += 1
+    }
+    pad_of(b, b.frags[first]).max_prefix = total
+    n
+}
+
+fn padding_size(b: *SecBuilder, f: *Frag, start: i64) -> i64 {
+    let st = pad_of(b, f)
+    var address = start
+    if address == 0 {
+        address = f.addr
+    }
+    address += f.fix
+    let branch = b.frags[st.link]
+    var size = st.cmp_size + branch.fix
+    if branch.kind == Jump {
+        size += branch.size
+    }
+    let offset = address & (branch_boundary - 1)
+    if offset + size >= branch_boundary {
+        return branch_boundary - offset
+    }
+    0
+}
+
+fn padding_growth(a: *Assembler, b: *SecBuilder, f: *Frag) -> i64 ! Error {
+    let st = pad_of(b, f)
+    let size = padding_size(b, f, 0)
+    let grow = size - st.length
+    if st.address != 0 && (st.address != f.addr || size != 0) {
+        a.line = f.line
+        fail failure(a, "branch padding in section {b.sec.name} does not converge")
+    }
+    if grow != 0 {
+        st.length = size
+    }
+    grow
+}
+
+fn prefix_growth(a: *Assembler, b: *SecBuilder, k: i64, stretch: i64) -> i64 {
+    let f = b.frags[k]
+    let st = pad_of(b, f)
+    if st.link == no_link {
+        return st.length - st.last_length
+    }
+    let padding = b.frags[st.link]
+    let padding_state = pad_of(b, padding)
+    if st.address == 0 {
+        st.address = padding.addr - (f.addr - stretch)
+    }
+    distribute(b, k, st.link, st.prefix_length, true)
+    var size = padding_size(b, padding, f.addr + st.address)
+    if size == st.prefix_length {
+        padding_state.address = f.addr + size + st.address
+        return 0
+    }
+    if size > st.max_prefix {
+        padding_state.address = 0
+        size = 0
+    } else {
+        padding_state.address = f.addr + size + st.address
+    }
+    st.prefix_length = size
+    distribute(b, k, st.link, size, false)
+    st.length - st.last_length
+}
+
+fn distribute(b: *SecBuilder, first: i64, end: i64, total: i64, last: bool) {
+    var left = total
+    for n in first..end {
+        let g = b.frags[n]
+        if g.kind != Prefix {
+            continue
+        }
+        let gs = pad_of(b, g)
+        if left == 0 {
+            assign(gs, last, 0)
+            continue
+        }
+        if gs.max_bytes == 0 {
+            continue
+        }
+        let size = min(gs.max_bytes, left)
+        left -= size
+        assign(gs, last, size)
+    }
+}
+
+fn assign(s: *PadState, last: bool, size: i64) {
+    if last {
+        s.last_length = size
+        return
+    }
+    s.length = size
+}

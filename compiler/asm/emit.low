@@ -1,0 +1,172 @@
+struct TextEmitter {
+    a: *Assembler
+    b: *SecBuilder
+    out: []u8 = []
+    next: i64 = 0
+}
+
+fn emit_text(a: *Assembler, b: *SecBuilder) ! Error {
+    let e = new(TextEmitter { a, b })
+    for k in 0..b.frags.len {
+        emit_frag(e, k)?
+    }
+    b.sec.data = e.out
+}
+
+fn emit_frag(e: *TextEmitter, k: i64) ! Error {
+    let b = e.b
+    let f = b.frags[k]
+    let end = f.start + f.fix
+    var chunk_end = end
+    if f.kind == Jump {
+        chunk_end -= 1
+    }
+    let base = e.out.len - f.start
+    for i in f.start..chunk_end {
+        push(mut e.out, b.sec.data[i])
+    }
+    apply_fixups(e, base, chunk_end)?
+    match f.kind {
+        Jump => {
+            emit_jump(e, f, b.sec.data[chunk_end])?
+        }
+        Align => {
+            padding(e, k)
+        }
+        Padding => {
+            branch_padding(e, f)
+        }
+        Fused => {
+            branch_padding(e, f)
+        }
+        Prefix => {
+            prefix_bytes(e, f)
+        }
+        _ => {}
+    }
+}
+
+fn branch_padding(e: *TextEmitter, f: *Frag) {
+    let count = pad_of(e.b, f).length
+    if count > 0 {
+        append_nops(mut e.out, count, true)
+    }
+}
+
+fn prefix_bytes(e: *TextEmitter, f: *Frag) {
+    let st = pad_of(e.b, f)
+    for _ in 0..st.length {
+        push(mut e.out, u8(st.default_prefix))
+    }
+}
+
+fn padding(e: *TextEmitter, k: i64) {
+    let f = e.b.frags[k]
+    let following = e.b.frags[k + 1]
+    let count = following.addr - f.addr - f.fix
+    if count > 0 {
+        alignment_nops(e, count, f.normal)
+    }
+}
+
+fn alignment_nops(e: *TextEmitter, count: i64, normal: bool) {
+    if e.a.opts.clang_layout {
+        append_clang_layout(mut e.out, count)
+        return
+    }
+    append_nops(mut e.out, count, normal)
+}
+
+fn apply_fixups(e: *TextEmitter, base: i64, end: i64) ! Error {
+    let b = e.b
+    for e.next < b.fixups.len && b.fixups[e.next].at < end {
+        let f = b.fixups[e.next]
+        e.next += 1
+        emit_fixup(e, f, f.at + base)?
+    }
+}
+
+fn emit_fixup(e: *TextEmitter, f: TextFixup, at: i64) ! Error {
+    let a = e.a
+    a.line = f.line
+    if f.neg >= 0 {
+        let value = difference_value(a, f.sym, f.neg, f.addend)?
+        patch(e, at, f.size, value)
+    } else if fixup_pc_relative(f.kind) && resolves_locally(e, f) {
+        let value = address(a, a.sym_order[f.sym]) + f.addend - at
+        patch(e, at, f.size, value)
+    } else {
+        relocate(e, at, f.kind, a.sym_order[f.sym], f.addend, a.line)
+    }
+}
+
+fn resolves_locally(e: *TextEmitter, f: TextFixup) -> bool {
+    let sym = e.a.sym_order[f.sym]
+    (f.kind == pc32 || f.kind == plt32) && sym.state == sym_label && sym.section == e.b.index && !sym.global
+}
+
+fn patch(e: *TextEmitter, at: i64, size: i64, value: i64) {
+    var encoded: []u8 = []
+    append_int(mut encoded, size, value)
+    for i in 0..encoded.len {
+        if at + i < e.out.len {
+            e.out[at + i] = encoded[i]
+        }
+    }
+}
+
+fn relocate(e: *TextEmitter, at: i64, kind: i64, sym: *Sym, addend: i64, line: i64) {
+    let fixup = Fixup { offset: at, kind, symbol: sym.name, addend, line }
+    push(mut e.b.sec.fixups, fixup)
+}
+
+fn emit_jump(e: *TextEmitter, f: *Frag, opcode: u8) ! Error {
+    if f.form == jump_forced {
+        forced_jump(e, f, opcode)
+        return
+    }
+    let target = address(e.a, e.a.sym_order[f.sym]) + f.off
+    let field = f.addr + f.fix
+    if f.form == jump_short {
+        short_jump(e, f, opcode, target - field - short_jump_size)?
+        return
+    }
+    near_jump(e, f, opcode, target - field)
+}
+
+fn short_jump(e: *TextEmitter, f: *Frag, opcode: u8, disp: i64) ! Error {
+    if disp < -128 || disp > 127 {
+        e.a.line = f.line
+        fail failure(e.a, "short jump displacement {disp} out of range")
+    }
+    push(mut e.out, opcode)
+    push(mut e.out, u8(disp))
+}
+
+fn near_jump(e: *TextEmitter, f: *Frag, opcode: u8, from_field: i64) {
+    let size = f.size
+    if f.cond {
+        push(mut e.out, u8(op_two_byte))
+        push(mut e.out, opcode + u8(jcc_near_bias))
+    } else {
+        push(mut e.out, u8(op_jmp_near))
+    }
+    append_int(mut e.out, 4, from_field - size)
+}
+
+fn forced_jump(e: *TextEmitter, f: *Frag, opcode: u8) {
+    if f.cond {
+        push(mut e.out, u8(op_two_byte))
+        push(mut e.out, opcode + u8(jcc_near_bias))
+    } else {
+        push(mut e.out, u8(op_jmp_near))
+    }
+    let at = e.out.len
+    append_int(mut e.out, 4, 0)
+    var kind = pc32
+    let sym = e.a.sym_order[f.sym]
+    if f.off == 0 && needs_plt(e.a, sym) {
+        kind = plt32
+    }
+    relocate(e, at, kind, sym, f.off - 4, f.line)
+}

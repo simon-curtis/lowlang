@@ -17,6 +17,7 @@ const usage = `usage:
   lowdump check [-windows] <file.low|dir>
   lowdump ir [-windows] [-unoptimised] <file.low|dir>
   lowdump asm [-windows] <file.low|dir>
+  lowdump object [-clang] [-align-branches] <file.s>
   lowdump regex <patterns.txt>`
 
 func main() {
@@ -63,6 +64,8 @@ func run(out io.Writer, args []string) error {
 		}
 		astDumper{out}.file(f)
 		return nil
+	case "object":
+		return dumpObjectCommand(out, src, args[1:len(args)-1])
 	case "regex":
 		dumpRegexCommand(out, src)
 		return nil

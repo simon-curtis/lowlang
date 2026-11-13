@@ -1,0 +1,615 @@
+const max_instruction_length = 15
+
+const rex_base = 0x40
+const rex_w_bit = 8
+const rex_r_bit = 4
+const rex_x_bit = 2
+const rex_b_bit = 1
+const prefix_os = 0x66
+const prefix_f2 = 0xF2
+const prefix_f3 = 0xF3
+const prefix_lk = 0xF0
+
+fn segment_prefix(n: i64) -> i64 {
+    match n {
+        0 => 0x26
+        1 => 0x2E
+        2 => 0x36
+        3 => 0x3E
+        4 => 0x64
+        5 => 0x65
+        _ => 0
+    }
+}
+
+struct Encoding {
+    bytes: []u8 = []
+    prefixes: i64 = 0
+    segment: i64 = 0
+    has_fixup: bool = false
+    fixup_at: i64 = 0
+    fixup_kind: i64 = 0
+    fixup_symbol: str = ""
+    fixup_addend: i64 = 0
+}
+
+fn put(e: *Encoding, b: i64) {
+    push(mut e.bytes, u8(b & 0xFF))
+}
+
+fn put_int(e: *Encoding, size: i64, v: i64) {
+    for i in 0..size {
+        let shifted = v >> (8 * i)
+        push(mut e.bytes, u8(shifted & 0xFF))
+    }
+}
+
+struct Addressing {
+    mod: i64 = 0
+    rm: i64 = 0
+    sib: i64 = 0
+    has_sib: bool = false
+    disp_size: i64 = 0
+    disp: i64 = 0
+    rex_x: i64 = 0
+    rex_b: i64 = 0
+    rip_value: Value = Value {}
+    rip_reloc: bool = false
+}
+
+fn size_of_class(c: i64) -> i64 {
+    match c {
+        class_gp8 => 1
+        class_gp8_high => 1
+        class_gp16 => 2
+        class_gp32 => 4
+        class_gp64 => 8
+        _ => 0
+    }
+}
+
+fn size_bit(size: i64) -> i64 {
+    match size {
+        1 => size8
+        2 => size16
+        4 => size32
+        8 => size64
+        _ => 0
+    }
+}
+
+fn signed_at(v: i64, size: i64) -> i64 {
+    if size == 2 {
+        let low = v & 0xFFFF
+        if low >= 0x8000 {
+            return low - 0x10000
+        }
+        return low
+    }
+    if size == 4 {
+        let low = v & 0xFFFFFFFF
+        if low >= 0x80000000 {
+            return low - 0x100000000
+        }
+        return low
+    }
+    v
+}
+
+fn accepted(ok: bool) -> i64? {
+    if ok {
+        return 0
+    }
+    none
+}
+
+fn slot_accepts(s: Slot, op: Operand, mut vec: i64) -> i64? {
+    match s.kind {
+        slot_gp => return accepts_gp(s, op)
+        slot_gp_mem => {
+            if op.kind == OpMem {
+                return accepts_pointer(s, op)
+            }
+            return accepts_gp(s, op)
+        }
+        slot_mem => return accepted(op.kind == OpMem)
+        slot_acc => {
+            if op.kind != OpReg || reg_num(op.reg) != 0 {
+                return none
+            }
+            let class = reg_class(op.reg)
+            let size = size_of_class(class)
+            if class != class_gp8_high && size != 0 {
+                return size
+            }
+            return none
+        }
+        slot_cl => {
+            let ok = op.kind == OpReg && reg_class(op.reg) == class_gp8 && reg_num(op.reg) == 1
+            return accepted(ok)
+        }
+        slot_xmm => {
+            let ok = op.kind == OpReg && reg_class(op.reg) == class_xmm
+            return accepted(ok)
+        }
+        slot_xmm_mem => {
+            let ok = op.kind == OpMem || (op.kind == OpReg && reg_class(op.reg) == class_xmm)
+            return accepted(ok)
+        }
+        slot_ymm => {
+            let ok = op.kind == OpReg && reg_class(op.reg) == class_ymm
+            return accepted(ok)
+        }
+        slot_vec => {
+            let ok = op.kind == OpReg && accepts_vector(reg_class(op.reg), mut vec)
+            return accepted(ok)
+        }
+        slot_vec_mem => {
+            if op.kind == OpMem {
+                return 0
+            }
+            let ok = op.kind == OpReg && accepts_vector(reg_class(op.reg), mut vec)
+            return accepted(ok)
+        }
+        _ => {}
+    }
+    none
+}
+
+fn accepts_vector(class: i64, mut vec: i64) -> bool {
+    if class != class_xmm && class != class_ymm {
+        return false
+    }
+    if vec != class_none && vec != class {
+        return false
+    }
+    vec = class
+    true
+}
+
+fn accepts_gp(s: Slot, op: Operand) -> i64? {
+    if op.kind != OpReg {
+        return none
+    }
+    let size = size_of_class(reg_class(op.reg))
+    if size == 0 {
+        return none
+    }
+    if s.size != 0 {
+        return accepted(size == s.size)
+    }
+    size
+}
+
+fn accepts_pointer(s: Slot, op: Operand) -> i64? {
+    let p = op.size
+    if s.size != 0 {
+        return accepted(p == 0 || p == s.size)
+    }
+    if p == 0 {
+        return 0
+    }
+    if size_bit(p) != 0 {
+        return p
+    }
+    none
+}
+
+fn accepts_immediate(s: Slot, op: Operand, size: i64) -> bool {
+    if op.kind != OpImm || !is_const(op.value) {
+        return false
+    }
+    let v = op.value.add
+    match s.kind {
+        slot_imm8 => return v >= -128 && v <= 255
+        slot_imm8s => {
+            let w = signed_at(v, size)
+            return w >= -128 && w <= 127
+        }
+        slot_imm_osz => return immediate_fits(v, size)
+        slot_imm64 => return true
+        slot_imm_one => return v == 1
+        _ => {}
+    }
+    false
+}
+
+fn immediate_fits(v: i64, size: i64) -> bool {
+    match size {
+        1 => return v >= -128 && v <= 255
+        2 => return v >= -32768 && v <= 65535
+        4 => return v >= -2147483648 && v <= 4294967295
+        _ => {}
+    }
+    v >= -2147483648 && v < 2147483648
+}
+
+fn immediate_bytes(s: Slot, size: i64) -> i64 {
+    match s.kind {
+        slot_imm8 => return 1
+        slot_imm8s => return 1
+        slot_imm_osz => {
+            if size == 1 {
+                return 1
+            }
+            if size == 2 {
+                return 2
+            }
+            return 4
+        }
+        slot_imm64 => return 8
+        _ => {}
+    }
+    0
+}
+
+fn form_match(f: Form, ops: []Operand) -> i64? {
+    if ops.len != f.count {
+        return none
+    }
+    var size = 0
+    var vec = class_none
+    for i in 0..ops.len {
+        let s = f.slots[i]
+        if s.kind >= slot_imm8 && s.kind <= slot_imm_one {
+            continue
+        }
+        let contributed = slot_accepts(s, ops[i], mut vec) ?? return none
+        if contributed != 0 {
+            if size != 0 && size != contributed {
+                return none
+            }
+            size = contributed
+        }
+    }
+    if f.width != width_fixed && (size == 0 || (f.sizes & size_bit(size)) == 0) {
+        return none
+    }
+    for i in 0..ops.len {
+        let s = f.slots[i]
+        if s.kind >= slot_imm8 && s.kind <= slot_imm_one && !accepts_immediate(s, ops[i], size) {
+            return none
+        }
+    }
+    size
+}
+
+fn immediate_size(f: Form, size: i64) -> i64 {
+    var total = 0
+    for i in 0..f.count {
+        total += immediate_bytes(f.slots[i], size)
+    }
+    total
+}
+
+fn vector_length(f: Form, ops: []Operand) -> i64 {
+    if f.vex_l256 {
+        return 1
+    }
+    for i in 0..f.count {
+        let k = f.slots[i].kind
+        if (k == slot_vec || k == slot_vec_mem) && ops[i].kind == OpReg && reg_class(ops[i].reg) == class_ymm {
+            return 1
+        }
+    }
+    0
+}
+
+fn needs_rex_w(f: Form, size: i64) -> bool {
+    if f.rex_w {
+        return true
+    }
+    f.width != width_fixed && !f.no_w && size == 8
+}
+
+fn swaps_operands(f: Form, ops: []Operand) -> bool {
+    if f.swap == 0 || f.count != 2 || ops[0].kind != OpReg || ops[1].kind != OpReg {
+        return false
+    }
+    reg_num(ops[1].reg) >= 8 && reg_num(ops[0].reg) < 8
+}
+
+fn memory_addressing(a: *Assembler, op: Operand) -> Addressing ! Error {
+    var m = Addressing {}
+    if op.base == reg_rip {
+        m.rm = 5
+        m.disp_size = 4
+        m.disp = op.value.add
+        if !is_const(op.value) {
+            m.rip_value = op.value
+            m.rip_reloc = true
+        }
+        return m
+    }
+    if !is_const(op.value) {
+        fail failure(a, "symbolic displacement needs a rip-relative operand")
+    }
+    let disp = op.value.add
+    if disp < -2147483648 || disp >= 2147483648 {
+        fail failure(a, "displacement {disp} does not fit in 32 bits")
+    }
+    m.disp = disp
+    check_address_registers(a, op)?
+    if op.base == reg_none && op.index == reg_none {
+        m.rm = 4
+        m.has_sib = true
+        m.sib = 0x25
+        m.disp_size = 4
+    } else if op.base == reg_none {
+        let index = reg_num(op.index)
+        m.rm = 4
+        m.has_sib = true
+        m.disp_size = 4
+        m.sib = (scale_bits(op.scale) << 6) | ((index & 7) << 3) | 5
+        m.rex_x = rex_x_bit * (index >> 3)
+    } else {
+        base_addressing(mut m, op)
+    }
+    m
+}
+
+fn check_address_registers(a: *Assembler, op: Operand) ! Error {
+    if op.base != reg_none && reg_class(op.base) != class_gp64 {
+        fail failure(a, "address register {reg_name(op.base)} is not 64-bit")
+    }
+    if op.index != reg_none && reg_class(op.index) != class_gp64 {
+        fail failure(a, "index register {reg_name(op.index)} is not 64-bit")
+    }
+    if op.index != reg_none && reg_num(op.index) == 4 {
+        fail failure(a, "rsp cannot be an index register")
+    }
+}
+
+fn base_addressing(mut m: Addressing, op: Operand) {
+    let base = reg_num(op.base)
+    m.rex_b = rex_b_bit * (base >> 3)
+    let need_sib = op.index != reg_none || (base & 7) == 4
+    if m.disp == 0 && (base & 7) != 5 {
+        m.mod = 0
+        m.disp_size = 0
+    } else if m.disp >= -128 && m.disp <= 127 {
+        m.mod = 1
+        m.disp_size = 1
+    } else {
+        m.mod = 2
+        m.disp_size = 4
+    }
+    if !need_sib {
+        m.rm = base & 7
+        return
+    }
+    m.rm = 4
+    m.has_sib = true
+    var index = 4
+    var scale = 0
+    if op.index != reg_none {
+        index = reg_num(op.index)
+        scale = scale_bits(op.scale)
+        m.rex_x = rex_x_bit * (index >> 3)
+    }
+    m.sib = (scale << 6) | ((index & 7) << 3) | (base & 7)
+}
+
+fn scale_bits(scale: i64) -> i64 {
+    match scale {
+        2 => 1
+        4 => 2
+        8 => 3
+        _ => 0
+    }
+}
+
+fn encode(a: *Assembler, f: Form, size: i64, ops: []Operand, prefix: i64) -> *Encoding ! Error {
+    let e = new(Encoding {})
+    var opcode = f.opcode
+    var reg_ref = f.reg
+    var rm_ref = f.rm
+    if swaps_operands(f, ops) {
+        opcode = f.swap
+        let held = reg_ref
+        reg_ref = rm_ref
+        rm_ref = held
+    }
+    if f.width == width_opcode && size != 1 {
+        opcode |= 1
+    }
+    var rex = 0
+    if needs_rex_w(f, size) {
+        rex |= rex_w_bit
+    }
+    var addr = Addressing {}
+    var seg = reg_none
+    var reg_field = f.digit
+    if reg_ref != 0 {
+        reg_field = reg_num(ops[reg_ref - 1].reg)
+        rex |= rex_r_bit * (reg_field >> 3)
+    }
+    var rm_is_memory = false
+    if f.modrm {
+        let rm_op = ops[rm_ref - 1]
+        if rm_op.kind == OpMem {
+            rm_is_memory = true
+            seg = rm_op.seg
+            addr = memory_addressing(a, rm_op)?
+            rex |= addr.rex_x | addr.rex_b
+        } else {
+            let rm_num = reg_num(rm_op.reg)
+            addr.mod = 3
+            addr.rm = rm_num & 7
+            rex |= rex_b_bit * (rm_num >> 3)
+        }
+    }
+    if f.plus_reg != 0 {
+        let num = reg_num(ops[f.plus_reg - 1].reg)
+        opcode += num & 7
+        rex |= rex_b_bit * (num >> 3)
+    }
+    let rex_required = register_restrictions(a, f, ops)?
+    var vvvv = 0
+    if f.vvvv != 0 {
+        vvvv = reg_num(ops[f.vvvv - 1].reg)
+    }
+    if rm_is_memory && seg != reg_none {
+        e.segment = segment_prefix(reg_num(seg))
+        put(e, e.segment)
+    }
+    if f.vex {
+        put_vex(e, f, ops, rex, vvvv)
+    } else {
+        put_legacy(e, f, size, prefix, rex, rex_required)
+        put_opcode_bytes(e, f)
+    }
+    e.prefixes = e.bytes.len
+    put(e, opcode)
+    if f.has_tail {
+        put(e, f.tail)
+    }
+    if f.modrm {
+        put(e, (addr.mod << 6) | ((reg_field & 7) << 3) | addr.rm)
+        if addr.has_sib {
+            put(e, addr.sib)
+        }
+    }
+    var trailing = immediate_size(f, size)
+    if f.is4 != 0 {
+        trailing += 1
+    }
+    let rex_present = rex != 0 || rex_required
+    put_displacement(e, f, addr, opcode, rex_present, reg_field, trailing)
+    put_immediates(e, f, size, ops)
+    e
+}
+
+fn register_restrictions(a: *Assembler, f: Form, ops: []Operand) -> bool ! Error {
+    var needs_rex = false
+    var has_high = false
+    for i in 0..f.count {
+        if ops[i].kind != OpReg {
+            continue
+        }
+        let class = reg_class(ops[i].reg)
+        if class == class_gp8_high {
+            has_high = true
+        } else if class == class_gp8 {
+            let n = reg_num(ops[i].reg)
+            needs_rex = needs_rex || (n >= 4 && n < 8)
+        }
+    }
+    if has_high && needs_rex {
+        fail failure(a, "a high-byte register cannot be encoded with a REX prefix")
+    }
+    needs_rex
+}
+
+fn put_opcode_bytes(e: *Encoding, f: Form) {
+    match f.space {
+        space_0f => {
+            put(e, 0x0F)
+        }
+        space_0f38 => {
+            put(e, 0x0F)
+            put(e, 0x38)
+        }
+        space_0f3a => {
+            put(e, 0x0F)
+            put(e, 0x3A)
+        }
+        _ => {}
+    }
+}
+
+fn put_legacy(e: *Encoding, f: Form, size: i64, prefix: i64, rex: i64, rex_required: bool) {
+    if f.prefix == prefix_os || (f.width != width_fixed && size == 2) {
+        put(e, prefix_os)
+    }
+    if f.prefix == prefix_f2 || f.prefix == prefix_f3 {
+        put(e, f.prefix)
+    } else if (prefix & prefix_rep) != 0 {
+        put(e, prefix_f3)
+    } else if (prefix & prefix_repne) != 0 {
+        put(e, prefix_f2)
+    }
+    if (prefix & prefix_lock) != 0 {
+        put(e, prefix_lk)
+    }
+    if rex != 0 || rex_required {
+        put(e, rex_base | rex)
+    }
+}
+
+fn put_vex(e: *Encoding, f: Form, ops: []Operand, rex: i64, vvvv: i64) {
+    var pp = 0
+    if f.prefix == prefix_os {
+        pp = 1
+    } else if f.prefix == prefix_f3 {
+        pp = 2
+    } else if f.prefix == prefix_f2 {
+        pp = 3
+    }
+    let length = vector_length(f, ops)
+    let inverted = ((~vvvv) & 0xF) << 3
+    let w = f.vex_w || (rex & rex_w_bit) != 0
+    if !w && f.space == space_0f && (rex & (rex_x_bit | rex_b_bit)) == 0 {
+        var r = 0x80
+        if (rex & rex_r_bit) != 0 {
+            r = 0
+        }
+        put(e, 0xC5)
+        put(e, r | inverted | (length << 2) | pp)
+        return
+    }
+    put(e, 0xC4)
+    put(e, (((~rex) & 7) << 5) | f.space)
+    var w_bit = 0
+    if w {
+        w_bit = 0x80
+    }
+    put(e, w_bit | inverted | (length << 2) | pp)
+}
+
+fn put_displacement(e: *Encoding, f: Form, m: Addressing, opcode: i64, rex_present: bool, reg_field: i64, trailing: i64) {
+    if m.disp_size == 0 {
+        return
+    }
+    if !m.rip_reloc {
+        put_int(e, m.disp_size, m.disp)
+        return
+    }
+    e.has_fixup = true
+    e.fixup_at = e.bytes.len
+    e.fixup_symbol = m.rip_value.sym
+    e.fixup_addend = m.rip_value.add - 4 - trailing
+    e.fixup_kind = pc32
+    if m.rip_value.reloc == reloc_gotpcrel {
+        e.fixup_kind = got_kind(f, opcode, rex_present, reg_field)
+    }
+    put_int(e, 4, 0)
+}
+
+fn got_kind(f: Form, opcode: i64, rex_present: bool, reg_field: i64) -> i64 {
+    if f.prefix == prefix_os || f.space != space_base {
+        return gotpcrel
+    }
+    let indirect = opcode == 0xFF && (reg_field == 2 || reg_field == 4 || reg_field == 6)
+    let relaxable = indirect || opcode == 0x8B || opcode == 0x85 || (opcode | 0x38) == 0x3B
+    if !relaxable {
+        return gotpcrel
+    }
+    if rex_present {
+        return rex_gotpcrelx
+    }
+    gotpcrelx
+}
+
+fn put_immediates(e: *Encoding, f: Form, size: i64, ops: []Operand) {
+    for i in 0..f.count {
+        let n = immediate_bytes(f.slots[i], size)
+        if n == 0 {
+            continue
+        }
+        put_int(e, n, ops[i].value.add)
+    }
+    if f.is4 != 0 {
+        put(e, reg_num(ops[f.is4 - 1].reg) << 4)
+    }
+}
