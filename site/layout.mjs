@@ -1,3 +1,4 @@
+import { headCommit } from "./commit.mjs";
 import { folders, origin, repository } from "./config.mjs";
 import { escape } from "./markup.mjs";
 
@@ -8,6 +9,7 @@ const sections = [
 ];
 const grid = "wrap grid grid-cols-[minmax(0,1fr)] gap-x-16 gap-y-10 pt-36 pb-24 sm:pt-28 lg:grid-cols-[13rem_minmax(0,1fr)]";
 const substitutions = { origin, repository };
+const commit = await headCommit();
 
 function navigation(root, current) {
     const links = sections.map((section) => {
@@ -64,6 +66,14 @@ ${navigation(root, current)}
 </header>`;
 }
 
+function footer() {
+    return `<footer class="footer">
+<div class="wrap">
+Built from <a href="${repository}/commit/${commit}">${commit.slice(0, 7)}</a>
+</div>
+</footer>`;
+}
+
 function scriptTags({ scripts = [] }, root) {
     return scripts.map((script) => `<script src="${root}${script}" defer></script>\n`).join("");
 }
@@ -84,6 +94,7 @@ ${head(page, root)}
 ${masthead(root, page.current)}
 
 ${content}
+${footer()}
 ${scriptTags(page, root)}</body>
 </html>
 `;
