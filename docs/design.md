@@ -13,16 +13,16 @@ Low compiles to static native binaries with no libc dependency, has a tracing ga
 | `low doc` | Prints the public API of every module under a directory as JSON. |
 | `low names` | Prints every name in a file as JSON, with its hover text, definition and reference group. |
 | `low lsp` | Starts the language server that the editor extensions use. |
-| `low version` | Prints the release, or `dev+` and the commit for a build from source. |
+| `low version` | Prints the release, or `dev` for a build from source. |
 
 A directory is a module. A `low.mod` file marks the project root, and `import ui/text` loads `ui/text/` under it. The standard library is imported as `std/...`, and the editor extensions need `low` on `PATH`.
 
-Build from source with Go 1.27.3:
+Build from source on Linux with `curl` and `sha256sum`: `bootstrap.sh` downloads the release that `bootstrap.txt` names, checks its SHA-256, builds the compiler with it three times and writes the result to its first argument.
 
 ```
 $ git clone https://github.com/simon-curtis/lowlang
 $ cd lowlang
-$ go install ./cmd/low
+$ ./bootstrap.sh ~/.local/bin/low
 ```
 
 ## Goals
@@ -1093,7 +1093,7 @@ wait_readable(fd)
 
 ## Builtins
 
-Every module sees these names without an import. A function in the program named `pop`, `truncate`, `close`, `sleep`, `wait_readable` or `wait_writable` takes precedence over the builtin.
+Every module sees these names without an import. A function in the program named `pop`, `truncate`, `close`, `sleep`, `wait_readable` or `wait_writable` takes precedence over the builtin. `compiler/check/builtins.low` is the only table of builtin names, parameters, `mut` markers, receivers and handlers, and `compiler/tests/check` requires an entry here for each public one.
 
 ### `bytes`
 
@@ -1270,7 +1270,7 @@ fn main() ! io.Error {
 
 Every module except `std/math` and `std/sql/sqlite` talks to the kernel through raw syscalls. `std/math` calls libm and `std/sql/sqlite` calls libsqlite3 through `extern` blocks. A library is linked only when reachable code calls it, so a program stays static unless it calls one of their C functions.
 
-Every public struct, enum, function, struct field and enum variant carries a doc comment, and `TestStdDocumented` in `internal/compiler` fails on any that does not. A doc is written for a caller reading it on hover:
+Every public struct, enum, function, struct field and enum variant carries a doc comment, and `StdDocumented` in `compiler/tests/compiler` fails on any that does not. A doc is written for a caller reading it on hover:
 
 - The first sentence is the summary: a verb phrase for a function (`Returns the ...`, `Parses ...`), a noun phrase for a type, field or variant.
 - Later paragraphs carry the contract the signature cannot: which error variant is returned and when, whether the call blocks, what dropping or closing releases, limits, defaults and edge cases such as empty input or end of input.
@@ -1376,7 +1376,7 @@ Every public struct, enum, function, struct field and enum variant carries a doc
 | `std/uri` | RFC 3986 percent coding and references. `escape` leaves the unreserved bytes, `escape_form` writes a space as `+`, `escape_target` encodes only the bytes a request target cannot hold and keeps existing escapes, and `escape_where` takes the set to keep. `unescape` returns `str?` and is `none` on a bad escape; `unescape_lossy` leaves a bad escape in place and `unescape_form_lossy` also reads `+` as a space. `encode_form` writes a list of `Field`s as `application/x-www-form-urlencoded`, and `parse_query` reads one into a `[str: str]` where the last value of a name wins. `scheme_end`, `without_fragment`, `remove_dots` and `resolve` follow RFC 3986 section 5, working on strings. |
 | `std/builder` | A `Builder` over a growing byte buffer, appended in place through `mut`: `write`, `write_bytes`, `write_byte`, `write_char`, `write_i64`, `write_f64`, `write_line`, `write_repeat`, `write_join`, `len`, `capacity`, `reserve`, `truncate`, `reset`, `to_str` and `to_bytes`. |
 | `std/regex` | Linear-time regular expressions in the RE2 style: `compile` and `compile_with` with `Flags`, `generated` (a pattern compiled into specialised code at build time), `is_match`, `find`, `full_match`, `find_all`, `replace_all` (with a closure receiving each `Match`), `split` and `split_n`. A match offers `start`, `end`, `text`, `group` and `span`, with byte offsets. |
-| `std/unicode` | Normalization (Unicode 16.0.0): `nfd`, `nfkd`, `nfc` and `nfkc`; `combining_class`; full case folding with `casefold`; `search_key`, which case-folds, applies NFKD and drops combining marks in one pass. Properties: `category`, `is_letter`, `is_upper`, `is_lower`, `is_digit`, `is_space`, `is_punct`, `is_identifier_start` and the other predicates; `east_asian_width`, `display_width` and `text_width`; `script`. Case mapping: `to_upper`, `to_lower` and `to_title`, and `upper` and `lower` with SpecialCasing but without final-sigma or locale rules. Segmentation: UAX #29 `graphemes`, `grapheme_count` and `grapheme_end`. UTF-8 helpers: `decode_rune`, `is_invalid`, `encode_rune`, `utf8_valid`, `utf8_to_valid`. `Order` is the byte order of UTF-16 and UTF-32, and `bom_order` reads the byte order mark of either width. Category, width and identifier data are Unicode 16.0.0; script, grapheme break and case data come from 17.0.0 restricted to characters assigned in 16.0.0. The tables are generated by `cmd/tablegen` and linked only when a function that reads them is reachable. |
+| `std/unicode` | Normalization (Unicode 16.0.0): `nfd`, `nfkd`, `nfc` and `nfkc`; `combining_class`; full case folding with `casefold`; `search_key`, which case-folds, applies NFKD and drops combining marks in one pass. Properties: `category`, `is_letter`, `is_upper`, `is_lower`, `is_digit`, `is_space`, `is_punct`, `is_identifier_start` and the other predicates; `east_asian_width`, `display_width` and `text_width`; `script`. Case mapping: `to_upper`, `to_lower` and `to_title`, and `upper` and `lower` with SpecialCasing but without final-sigma or locale rules. Segmentation: UAX #29 `graphemes`, `grapheme_count` and `grapheme_end`. UTF-8 helpers: `decode_rune`, `is_invalid`, `encode_rune`, `utf8_valid`, `utf8_to_valid`. `Order` is the byte order of UTF-16 and UTF-32, and `bom_order` reads the byte order mark of either width. Category, width and identifier data are Unicode 16.0.0; script, grapheme break and case data come from 17.0.0 restricted to characters assigned in 16.0.0. The tables are generated by `compiler/tablegen` and linked only when a function that reads them is reachable. |
 | `std/unicode/utf16`, `std/unicode/utf32` | Encoding and decoding of code points, `[]u16` and `[]u32`, and byte forms in either order with BOM handling, strict or lossy, with surrogate validation. `join` combines a surrogate pair, `units` reads a byte form into code units, and `decode_escape` in `utf16` decodes a `\uXXXX` escape with its trailing pair. Their byte forms take `unicode.Order`. |
 | `std/charset` | `decode`, `decode_lossy`, `encode`, `encode_replace`, `canonical` (WHATWG labels) and `detect_bom` for UTF-8, UTF-16, UTF-32, ISO-8859-1, -2 and -15, windows-1250, -1251 and -1252, KOI8-R, IBM437 and IBM850, and `windows_1252` for the code point of one windows-1252 byte. The CJK encodings are not provided. |
 | `std/html` | An HTML tokenizer: a pull `Tokenizer` returning `StartTag`, `EndTag`, `Text`, `Comment`, `Doctype` and `End` tokens, `attribute` lookup, `unescape` for character references and `escape` for text and attribute values. |
@@ -1593,7 +1593,7 @@ A `Reader` reports `at` in an `Error` as its `position`, whose unit is the forma
 
 #### Unicode
 
-- `std/unicode` reads tables generated by `cmd/tablegen unicode` from UnicodeData.txt, CaseFolding.txt and DerivedNormalizationProps.txt of Unicode 16.0.0, the version Python's `unicodedata` reports, and agrees with it on every code point. `cmd/tablegen unicode` and `cmd/tablegen properties` also write `normalization_layout.low` and `property_layout.low`: constants for the record sizes, field offsets, trie shifts and masks, Hangul constants and packed property bit fields, and one `<table>_table()` accessor per `.bin` file that `embed`s it. The module sources read these instead of literals, and `TestLayoutFilesMatchGenerator` fails when a committed layout file differs from the generator.
+- `std/unicode` reads tables generated by `compiler/tablegen unicode` from UnicodeData.txt, CaseFolding.txt and DerivedNormalizationProps.txt of Unicode 16.0.0, the version Python's `unicodedata` reports, and agrees with it on every code point. `compiler/tablegen unicode` and `compiler/tablegen properties` also write `normalization_layout.low` and `property_layout.low`: constants for the record sizes, field offsets, trie shifts and masks, Hangul constants and packed property bit fields, and one `<table>_table()` accessor per `.bin` file that `embed`s it. The module sources read these instead of literals, and `layout_files_match_generator` in `compiler/tests/tablegen` fails when a committed layout file differs from the generator.
 - The tables are `embed`ded binary files. A two-level trie of 64-entry blocks covers code points below U+2FA40 and gives 0 above. It maps each code point to a 16-bit record id. Each record holds the canonical combining class and 16-bit offsets and lengths into a pool of `u32` code points for the full canonical decomposition, the full compatibility decomposition and the C and F case folding.
 - Hangul syllables decompose and compose algorithmically. Decomposition is followed by a stable canonical reordering by combining class. Composition binary-searches a sorted table of primary composites, leaving out Full_Composition_Exclusion. ASCII input returns at once, or lowercased by `casefold` and `search_key`.
 - `search_key(s)` equals Python's `''.join(c for c in unicodedata.normalize('NFKD', s.casefold()) if not unicodedata.combining(c))`. It skips reordering, since every reordered character is dropped.
@@ -1603,7 +1603,7 @@ A `Reader` reports `at` in an `Error` as its `position`, whose unit is the forma
 - `std/html` tokenizes UTF-8 HTML following the WHATWG tokenization states. It builds no tree and never fails. Tag and attribute names are lowercased in ASCII, attribute values may be double-quoted, single-quoted or unquoted, a repeated attribute keeps its first value, and a tag cut off by the end of input is dropped.
 - A start tag for `script`, `style`, `xmp`, `iframe`, `noembed` or `noframes` switches to raw text, and one for `title` or `textarea` to escapable raw text, until the matching end tag in any case. `plaintext` takes the rest of the input. The script-data double-escape states are not implemented, and `noscript` is tokenized as when scripting is disabled.
 - Comments end at `-->` or `--!>`, with `<!-->` and `<!--->` empty. `<?...>`, `<!...>` other than comments and doctypes, `<![CDATA[...]]>` and `</` followed by a non-letter become comments, and `</>` is skipped. `Doctype` carries the lowercased name and the optional public and system identifiers.
-- Character references are decoded in text, escapable raw text and attribute values. Named references match the longest name against the full WHATWG table of 2,231 names, including the names valid without a semicolon. `cmd/tablegen entities` generates the table and also writes `entity_layout.low` with the index entry layout, the name length limit and the table accessors. Decimal and hexadecimal references work with or without a semicolon. Zero, surrogates and values above U+10FFFF become U+FFFD, and 0x80 to 0x9F map through Windows-1252. Inside an attribute, a match without a semicolon that is followed by `=` or a letter or digit stays literal. Text without references is a view into the input.
+- Character references are decoded in text, escapable raw text and attribute values. Named references match the longest name against the full WHATWG table of 2,231 names, including the names valid without a semicolon. `compiler/tablegen entities` generates the table and also writes `entity_layout.low` with the index entry layout, the name length limit and the table accessors. Decimal and hexadecimal references work with or without a semicolon. Zero, surrogates and values above U+10FFFF become U+FFFD, and 0x80 to 0x9F map through Windows-1252. Inside an attribute, a match without a semicolon that is followed by `=` or a letter or digit stays literal. Text without references is a view into the input.
 - The tokens match Python's `html.parser` except where it departs from WHATWG: duplicate attributes, processing instructions and CDATA as comments, raw text after `<script/>`, and control-character references.
 
 #### Markdown
@@ -1625,7 +1625,7 @@ A `Reader` reports `at` in an `Error` as its `position`, whose unit is the forma
 - Matching is leftmost-first, as in Python and RE2, and results agree with Python's `re` under `re.ASCII`. `find_all`, `replace_all` and `split` follow Python 3.7: an empty match is allowed right after a non-empty one, and after an empty match the next one may start at the same offset only if it is not empty. `split` does not include group text. `split_n` splits at most `max` times; a negative `max` splits everywhere.
 - Repeat counts are limited to 10000 and programs to 100,000 instructions. Invalid patterns fail with `Invalid(at, message)`, at the byte offset Python reports. Backreferences, lookaround, named groups and possessive quantifiers are rejected.
 - `regex.generated("pattern")` is a `Regex` built at compile time, like .NET's `[GeneratedRegex]`. The pattern must be a string literal; flags are written inline. An invalid pattern is a compile error at the literal, `invalid regex at byte N: message`, with the offset and message `compile` would fail with. The result is used through the same functions as a compiled `Regex` and matches identically.
-- `internal/regex` holds a Go copy of the parser and assembler, held to the Low one by running the `std_regex_errors` fixture's patterns through it. The checker turns each distinct literal into Low functions named `__regex_` and the FNV-1a hash of the pattern, parsed with the prelude's privileges and added to `std/regex`, so they reach its private types.
+- `compiler/regex` holds the parser and assembler the checker runs on a literal pattern, held to the `std/regex` one by running the `std_regex_errors` fixture's patterns through it. The checker turns each distinct literal into Low functions named `__regex_` and the FNV-1a hash of the pattern, parsed with the prelude's privileges and added to `std/regex`, so they reach its private types.
 - A `Regex` carries an `Engine` of thread-start, step and skip functions with the queue size. `compile` fills it with the Pike VM. The generated engine keeps the VM's queues, priorities and capture slots but replaces interpretation with code per instruction:
   - One function per instruction that starts a thread, follows a consumed character or joins two epsilon paths, each guarded by the queue's sparse set. The remaining jumps, splits, saves and assertions are inlined into it.
   - Characters and classes of up to four ranges compare inline in the step, which dispatches on the program counter by binary search. Larger classes get a binary-search function.
@@ -1669,17 +1669,17 @@ A `Reader` reports `at` in an `Error` as its `position`, whose unit is the forma
 - `web.static` decodes each path segment and answers 400 for `..`, an embedded separator, NUL or a bad escape, and 404 for dotfiles, non-regular files and any file whose real path leaves the root. A directory without a trailing slash is redirected, and a directory serves `index.html` or an optional listing. `precompressed` picks `.br` then `.gz` by `Accept-Encoding`. A multi-range or malformed `Range` gives the whole file. Files stream in 64 KiB chunks.
 ## Compiler
 
-The compiler is written in Go. Pipeline:
+The compiler is written in Low, in `compiler/`. Pipeline:
 
-| Stage | Package | Output |
+| Stage | Module | Output |
 |---|---|---|
-| Lex | `internal/lexer` | tokens |
-| Parse | `internal/parser` | `internal/ast` tree |
-| Check | `internal/check` | types attached to the tree |
-| Build IR | `internal/ir` | SSA form, one value per machine word |
-| Codegen | `internal/amd64` | x86-64 GNU assembly |
-| Assemble | `internal/asm` | object: sections, symbols and fixups |
-| Link | `internal/link` | ELF or PE executable |
+| Lex | `compiler/lexer` | tokens |
+| Parse | `compiler/parser` | `compiler/ast` tree |
+| Check | `compiler/check` | types attached to the tree |
+| Build IR | `compiler/ir` | SSA form, one value per machine word |
+| Codegen | `compiler/amd64` | x86-64 GNU assembly |
+| Assemble | `compiler/asm` | object: sections, symbols and fixups |
+| Link | `compiler/link` | ELF or PE executable |
 
 Building a program and running `low dev` need no external tool.
 
@@ -1692,31 +1692,31 @@ Building a program and running `low dev` need no external tool.
   - A refused connection to a loopback address fails at once rather than after the SYN retransmissions Windows would otherwise make.
   - Signals, inotify watches, pseudo-terminals, setting a terminal's size, `chown`, peer credentials, binding to a device and `SO_REUSEPORT` fail with `Unsupported`. User and group IDs are -1 and the umask is 0.
   - Returning from a C call can wait out a collection; the wait keeps the thread's last-error value, so `GetLastError` after an extern call reads that call's error.
-- The `low` command lives in `cmd/low`. `compiler.Analyse` takes a profile and `compiler.Build` is the one build entry: it generates the assembly for the unit, assembles it with the unit's embedded files, links it with the linker its target uses and writes the executable. `low build`, `low run`, hot reload, the fuzz oracle and the Vulkan and Wayland generator tests all call it. Only the `Dev` profile produces a hot-reloadable build.
+- The `low` command lives in `compiler/low`. `compiler.analyse` takes a profile and `compiler.build` is the one build entry: it generates the assembly for the unit, assembles it with the unit's embedded files, links it with the linker its target uses and writes the executable. `low build`, `low run`, hot reload, the fuzz oracle and the Vulkan and Wayland generator tests all call it. Only the `dev` profile produces a hot-reloadable build.
 - `low ir` prints the SSA form and `low asm` the generated assembly.
 - Compilation is deterministic: the same source and target always produce the same SSA form, assembly and binary. No pass depends on map iteration order; where order matters the compiler walks slices or stacks.
-- `parser.ParseSource` is the one entry from source text to tree, for user files, the prelude, the standard library and generated code. The lexer lexes each interpolated `{}` expression into tokens when it lexes the string, and keeps the `,width:format` suffix as text that `ast.ParseSpec` parses.
-- A lexer, parser or checker error is a `*diag.Error` holding the position of the fault; `low lsp` reads it with `errors.As`.
-- `types.Universe` interns the pointer, slice, optional, raw pointer, channel, map, result and function types, and owns the built-in type names and the constraint names. `check.Check` creates it with the checker's callback for new types and returns it. The checker lays out and instantiates types in three phases: declaring, laid out, and functions ready.
+- `parser.parse_source` is the one entry from source text to tree, for user files, the prelude, the standard library and generated code. The lexer lexes each interpolated `{}` expression into tokens when it lexes the string, and keeps the `,width:format` suffix as text that `ast.parse_spec` parses.
+- A lexer, parser or checker error is a `diag.Error` holding the position of the fault, and `low lsp` reads the position from it.
+- `types.Universe` interns the pointer, slice, optional, raw pointer, channel, map, result and function types, and owns the built-in type names and the constraint names. `check.check` creates it with the checker's callback for new types and returns it. The checker lays out and instantiates types in three phases: declaring, laid out, and functions ready.
 
 Modules:
 
-- `internal/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles. One loader reads the program, its imports, `embed` files and the embedded standard library through `fs.FS`. `compiler.Overlay` puts unsaved editor text over the disk for the language server, which shares the loader's `Root` lookup and `ParseFile`. `internal/check` does no file IO.
+- `compiler/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles. One loader reads the program, its imports, `embed` files and the embedded standard library, which is the map `embed_dir("../../std")` returns. `compiler.Overlay` puts unsaved editor text over the disk for the language server, which shares the loader's `root` lookup and `parse_file`. `compiler/check` does no file IO.
 - Every file records its module path and every source position its file, so errors name the file they come from.
 - The checker keeps a scope of types and functions per module. The prelude belongs to the entry module, and its `__` names cannot clash with anything else. Every module sees the prelude's generic `__` functions and types, so `std/container/deque` is a wrapper over the prelude's `__Queue`, the ring buffer behind channel wait queues.
 - A function in module `ui/text` becomes the symbol `fn_ui.text.shout`. Types display with their module path, such as `geometry.Circle`.
 
 The runtime is `runtime.asm`, `sched.asm` and `gc.asm`, which are shared by every target, plus `linux.asm` or `windows.asm` for the target OS. It is emitted with every program. A Linux program talks to the kernel through raw syscalls and ends the process with `exit_group`, so every thread stops; a dynamically linked Linux program ends with `exit`. A Windows program calls kernel32 through the `WIN` macro and ends with `ExitProcess`.
 
-The runtime's data layout, thread-local access and Windows stack-bounds switching are defined once, in `layout.asm` and the target's `linux_header.asm` or `windows_header.asm`, as constants and macros such as `G_SCANLO`, `TLS_GET`, `TEB_ENTER_OS` and `MSG_BEGIN`. Generated code and patches use those names and macros, and `Generate` and `GeneratePatch` both prepend the headers. Go passes `RT_DYNAMIC` and the hot-reload constants (`HOT_BASE`, `HOT_SIZE`, `PATCH_BYTES`, `PATCH_ENTRY`, `PATCH_SIGNAL`) to the assembly as `.set` lines, and defines `HOT_INIT` as the call to `rt_hot_init` in a hot build and as nothing otherwise. The Windows import table lists every function the Windows runtime calls through `WIN`, taken from `windows.asm`, plus the program's `extern` imports.
+The runtime's data layout, thread-local access and Windows stack-bounds switching are defined once, in `layout.asm` and the target's `linux_header.asm` or `windows_header.asm`, as constants and macros such as `G_SCANLO`, `TLS_GET`, `TEB_ENTER_OS` and `MSG_BEGIN`. Generated code and patches use those names and macros, and `generate` and `generate_patch` both prepend the headers. The code generator passes `RT_DYNAMIC` and the hot-reload constants (`HOT_BASE`, `HOT_SIZE`, `PATCH_BYTES`, `PATCH_ENTRY`, `PATCH_SIGNAL`) to the assembly as `.set` lines, and defines `HOT_INIT` as the call to `rt_hot_init` in a hot build and as nothing otherwise. The Windows import table lists every function the Windows runtime calls through `WIN`, taken from `windows.asm`, plus the program's `extern` imports.
 
 The contracts between the stages have one owner each:
 
-- `internal/builtin` numbers every builtin. The checker records the number on each call and `internal/ir` lowers it through a table indexed by that number.
-- `internal/ir/runtime.go` lists every runtime routine generated code calls through a `runtime` instruction: its symbol, its register convention (plain, growth or string equality) and whether it returns a scalar or nothing. A system call is its own `syscall` instruction.
-- `internal/prelude` names every prelude function the compiler calls or the checker's generated source calls, the fields `internal/ir` reads from the struct a function returns (`__waiter` and `__chan_new`), and which functions a map or channel type instantiates. The prelude is validated when it loads, so a missing or reshaped entry is an error that names it. `internal/ir` reads field offsets from the checked types.
-- `internal/amd64` owns the target. A `Platform` value, `sysv` for Linux and `win64` for Windows, supplies the runtime and header text, the C argument classification, the registers a C callback saves, the entry symbol, how a system call is made, stack probing and the dynamic-library shims. `PROGRAM_ENTRY` and `PROGRAM_EXIT` in each header are the program's entry and exit. `amd64` exports the entry symbols, the hot-patch list and count symbols and the `.idata` section names that `internal/link` and `internal/hot` read.
-- One `convention` value in `internal/amd64` holds the Low register convention: argument, result, caller-saved, callee-saved, system call and growth registers, and the frame offsets derived from them.
+- `compiler/builtin` numbers every builtin. The checker records the number on each call and `compiler/ir` lowers it through a table indexed by that number.
+- `compiler/ir/runtime.low` lists every runtime routine generated code calls through a `runtime` instruction: its symbol, its register convention (plain, growth or string equality) and whether it returns a scalar or nothing. A system call is its own `syscall` instruction.
+- `compiler/prelude` names every prelude function the compiler calls or the checker's generated source calls, the fields `compiler/ir` reads from the struct a function returns (`__waiter` and `__chan_new`), and which functions a map or channel type instantiates. The prelude is validated when it loads, so a missing or reshaped entry is an error that names it. `compiler/ir` reads field offsets from the checked types.
+- `compiler/amd64` owns the target. A `Platform` value, `Sysv` for Linux and `Win64` for Windows, supplies the runtime and header text, the C argument classification, the registers a C callback saves, the entry symbol, how a system call is made, stack probing and the dynamic-library shims. `PROGRAM_ENTRY` and `PROGRAM_EXIT` in each header are the program's entry and exit. `amd64` exports the entry symbols, the hot-patch list and count symbols and the `.idata` section names that `compiler/link` and `compiler/hot` read.
+- `compiler/amd64/convention.low` holds the Low register convention: argument, result, caller-saved, callee-saved, system call and growth registers, and the frame offsets derived from them.
 
 ### Scheduler
 
@@ -1765,9 +1765,9 @@ The contracts between the stages have one owner each:
 
 ### Linking
 
-The in-process assembler and linker reproduce GNU `as` and `ld` and `clang` and `lld-link` output byte for byte: `internal/asm` matches the object bytes of `as` for Linux and `clang` for Windows, and `internal/link` matches the segments, sections, symbols and loaded bytes of `ld` for ELF and the whole image of `lld-link` for PE. Layout choices that look arbitrary, such as `clang`'s padding and jump sizes or the XXH3 timestamp, are there to match. The oracle tests in `internal/asm` and `internal/link` check this against the pinned tool versions.
+The in-process assembler and linker reproduce GNU `as` and `ld` and `clang` and `lld-link` output byte for byte: `compiler/asm` matches the object bytes of `as` for Linux and `clang` for Windows, and `compiler/link` matches the segments, sections, symbols and loaded bytes of `ld` for ELF and the whole image of `lld-link` for PE. Layout choices that look arbitrary, such as `clang`'s padding and jump sizes or the XXH3 timestamp, are there to match. The oracle tests in `compiler/tests/asm` and `compiler/tests/link` check this against the pinned tool versions.
 
-- A static program is assembled by `internal/asm` and linked in process by `internal/link`, which writes the executable without running `as` or `ld`. It starts at the generated `_start`.
+- A static program is assembled by `compiler/asm` and linked in process by `compiler/link`, which writes the executable without running `as` or `ld`. It starts at the generated `_start`.
   - The image is based at `0x400000`, below the hot-reload region, and has the layout of `ld -static` with separate code: a read-only header segment, then read-execute `.text`, read-only `.rodata`, and read-write `.data` and `.bss`, each page-aligned in memory and congruent with its file offset. `.tbss` has a `PT_TLS` segment and the stack is non-executable.
   - Symbols resolve across the sections of the one object. `PC32` and `PLT32` resolve alike, and `Abs32` and `Abs32S` fail when the value does not fit. An undefined symbol fails the link and names the symbol.
   - The file carries section headers and a symbol table of the object's non-`.L` symbols plus `__bss_start`, `_edata` and `_end`, so `debug/elf`, `readelf` and `gdb` read it, and `low dev` reads it to link patches against it. `_start` initialises the heap and the scheduler, starts `main` on the first green thread and enters the scheduler on the process stack.
@@ -1790,14 +1790,14 @@ The in-process assembler and linker reproduce GNU `as` and `ld` and `clang` and 
 
 Prelude:
 
-- `internal/compiler/prelude.low` is Low source compiled ahead of every program. It holds:
+- `compiler/compiler/prelude/prelude.low` is Low source compiled ahead of every program. It holds:
   - UTF-8 decoding.
   - The string builder behind interpolation and concatenation.
   - The generic map table.
   - Integer formatting.
   - Float formatting by unrounded scaling against a table of 128-bit powers of ten from 1e-348 to 1e347, which finds the shortest digits that read back to the same value without allocating.
   - Formats and widths for interpolation. A float's exact decimal expansion is its mantissa times 2^e, built in base 10^9 limbs by repeated multiplication by 2 for a positive `e` and by 5 for a negative one, with the decimal point moved by `-e` places. An integer's digits are its magnitude. Rounding to the requested decimals or significant digits then works on those digits, using the exact remainder to break ties to even, so `f`, `e`, `n` and pictures need no approximation. NaN and infinities take the default text.
-- `cmd/tablegen pow10` generates the table twice: as the `__pow10_hi` and `__pow10_lo` functions the prelude holds, and as `std/text/pow10.bin`, which `std/text` embeds for float parsing because standard library modules see only the prelude's generic functions and types, not its other functions.
+- `compiler/tablegen pow10` generates the table twice: as the `__pow10_hi` and `__pow10_lo` functions the prelude holds, and as `std/text/pow10.bin`, which `std/text` embeds for float parsing because standard library modules see only the prelude's generic functions and types, not its other functions.
 - Prelude names start with `__`, which user code cannot use. Four intrinsics are privileged names that the prelude and the standard library can use:
   - `__bits` gives a float's bit pattern.
   - `__str_view` turns a `[]u8` into a `str` without copying.
@@ -1807,7 +1807,7 @@ Prelude:
 
 Standard library:
 
-- It lives in `internal/compiler/std` and is embedded in `low` with `go:embed`.
+- It lives in `std/` and is embedded in `low` with `embed_dir`.
 - An import whose path is `std` or starts with `std/` is read from there, never from the project root.
 - Its files are lexed like the prelude, so they may use `__` names and intrinsics, and they are left out of the sources `low dev` watches.
 - `embed` in a standard library file reads from the embedded tree. Every embedded file, standard or not, is held by its path in the unit, and the assembler resolves `.incbin` from that map before it reads the disk.
@@ -1917,7 +1917,7 @@ The derivations are generated as source:
   - `push`, `__extend`, `__extend_by` and `delete` take their `mut` operand in place. On an SSA variable they read and write its words (a slice's pointer, length and capacity) as SSA values, so a slice that is only pushed to, indexed and passed by value stays in registers.
   - Lengths and capacities these builtins compute are typed integers and never count as pointers.
 - Integer division carries its zero and overflow checks inside the instruction. A constant divisor other than 0 and -1 needs neither check.
-- A call to a C function becomes a `ccall` carrying its C signature: the symbol, the type of each argument, which arguments are `mut` places, and the result type. `internal/amd64` classifies the signature for the target. On Linux the System V AMD64 rules classify each argument word:
+- A call to a C function becomes a `ccall` carrying its C signature: the symbol, the type of each argument, which arguments are `mut` places, and the result type. `compiler/amd64` classifies the signature for the target. On Linux the System V AMD64 rules classify each argument word:
   - Integers, `bool` and pointers take `rdi`, `rsi`, `rdx`, `rcx`, `r8` and `r9`.
   - Floats take `xmm0` to `xmm7`.
   - An `extern struct` of at most 16 bytes is split into eightbytes that go to vector registers when every field in them is a float and to integer registers otherwise.
@@ -2061,7 +2061,7 @@ Optimiser:
   - A caller inlines up to four rounds. Each round takes its sites inside the deepest loops first, then the smaller callees, then the earlier values; splits the call's block; clones the callee's blocks with parameters bound to the arguments; forwards a single return's values or joins several returns in phis; and simplifies the caller. Calls that an inlined body or a devirtualised call exposes are inlined in the next round.
   - Loop back edges keep their marks, and checks and divisions keep their panics.
   - Dev builds do not inline, specialise or hoist literals, so hot reload patches see every function and every literal's data.
-  - A `compiler.Profile` chooses the target, whether the IR is optimised and whether code generation is hot-reloadable. `Release(target)` optimises and generates plain code. `Dev` skips the optimiser, generates `fn_table` code and is Linux-only.
+  - A `compiler.Profile` chooses the target, whether the IR is optimised and whether code generation is hot-reloadable. `release(target)` optimises and generates plain code. `dev` skips the optimiser, generates `fn_table` code and is Linux-only.
 - Literal hoisting:
   - A release build hoists a non-empty slice or map literal whose elements are all constants: integer, float, `bool` and `str` literals, negated numbers, `none`, enum variants without payload and non-C struct literals of constants.
   - The checker marks a literal read-only when it is the operand of an index, a `for` or `.len`, or is bound by a `let` whose every use is such an operand. An assignment, a `mut` argument or any other use anywhere in the target path of an element or field makes the binding non-read-only.
@@ -2198,7 +2198,7 @@ Mechanism:
 
 - Dev builds call every function through `fn_table`, a writable table of 4096 code addresses, with `call [rip+fn_table+8*i]`. Release builds call directly.
 - In dev builds a function value's code word is the address of its `fn_table` entry and calls through it use `call [r10]`, so a stored function value or closure runs the newest code. Callback thunks call through the table too.
-- `internal/amd64` owns this protocol: `Generate` with a `FuncTable` and `GeneratePatch`, the `fn_table` size, the patch signal and entry size, the mailbox symbol names and the region's base and size.
+- `compiler/amd64` owns this protocol: `generate` with a `FuncTable` and `generate_patch`, the `fn_table` size, the patch signal and entry size, the mailbox symbol names and the region's base and size.
 - At start the dev runtime installs a `SIGUSR1` handler and maps a 64 MB read-execute region at `0x40000000`, close enough to the binary for 32-bit relative references.
 - A patch is assembled and linked in process, by `Built.Patch`, at the next free address in that region, resolving its references against the symbols of the running binary that the linker returned with its image. It holds only the changed functions and their strings. Patched functions get a fresh symbol suffix so they never collide with the originals.
 - `low dev` writes the machine code into the region through `/proc/<pid>/mem`, writes `(index, address)` pairs and a count into a mailbox in the program, and sends `SIGUSR1`. The handler stores each address into `fn_table` with an aligned 8-byte write and clears the count, which `low dev` waits for.
@@ -2227,15 +2227,15 @@ Mechanism:
 
 ### Generators
 
-- `internal/wlgen/protocols` holds the Wayland protocol XML, `wayland.xml` and `xdg-shell.xml`. `go run ./cmd/wlgen -o internal/compiler/std/ui/platform/wayland_linux.low internal/wlgen/protocols/wayland.xml internal/wlgen/protocols/xdg-shell.xml` generates the Wayland bindings.
+- `compiler/wlgen/protocols` holds the Wayland protocol XML, `wayland.xml` and `xdg-shell.xml`. `low run compiler/wlgen -o std/ui/platform/wayland_linux.low compiler/wlgen/protocols/wayland.xml compiler/wlgen/protocols/xdg-shell.xml` generates the Wayland bindings.
   - Every interface given in one run shares an `Interfaces` record of `wl_interface` tables that `interfaces()` builds in C memory. The record keeps every block it allocates, listener copies included, and `release_interfaces(ifs)` frees them once the connection is closed. A reference to an interface that no given protocol declares is an error.
   - A request becomes `interface_request(...)` over `wl_proxy_marshal_flags`, taking the `Interfaces` record when it creates an object of a known interface. `wl_registry_bind` takes the interface table and version.
   - Destructor requests pass `WL_MARSHAL_FLAG_DESTROY`, and an interface without a `destroy` request gets one that calls `wl_proxy_destroy`.
   - Objects are `ptr`, strings `ptr[u8]`, `fixed` an `i32`.
   - Events become an `extern struct` listener of `extern fn` fields, each defaulting to a generated function that ignores the event, so a listener names only the events it handles. `interface_add_listener(ifs, proxy, listener, data)` copies it into the record's C memory. Callbacks receive the listener's `data` pointer, a pinned Low object.
   - Enum entries are constants such as `wl_shm_format_argb8888: u32`. Names that clash with Low keywords or builtins gain a trailing `_`.
-- `internal/vkgen/registry` holds the Vulkan registry, `vk.xml.gz` from Vulkan-Docs v1.4.363, and `vulkan.list`, which selects extensions, commands, extra types such as `pNext` structures, and the library each target loads.
-  - `go run ./cmd/vkgen -registry internal/vkgen/registry/vk.xml.gz -select internal/vkgen/registry/vulkan.list -o internal/compiler/std/ui/gpu` writes `vulkan.low` and one `vulkan_<os>.low` per target. A `command` line that ends with a target name, such as `command vkCreateWaylandSurfaceKHR linux`, goes only to that target's file, and `library windows vulkan-1` names the library its `extern` block links.
+- `compiler/vkgen/registry` holds the Vulkan registry, `vk.xml.gz` from Vulkan-Docs v1.4.363, and `vulkan.list`, which selects extensions, commands, extra types such as `pNext` structures, and the library each target loads.
+  - `low run compiler/vkgen -registry compiler/vkgen/registry/vk.xml.gz -select compiler/vkgen/registry/vulkan.list -o std/ui/gpu` writes `vulkan.low` and one `vulkan_<os>.low` per target. A `command` line that ends with a target name, such as `command vkCreateWaylandSurfaceKHR linux`, goes only to that target's file, and `library windows vulkan-1` names the library its `extern` block links.
   - Commands and every type they reach are generated, skipping Vulkan SC variants. Enum values come from the core enums, every Vulkan feature level and the selected extensions.
   - A handle is a one-field `extern struct`, `ptr` for dispatchable handles and `i64` for the others, so `VkBuffer {}` is the null handle and handles of different kinds do not mix.
   - Structures and unions become `extern struct`s whose fields all have defaults: zero, `null`, the empty handle, or for `sType` the structure's own value, so a literal names only what it sets. A union takes the layout of its widest member.
@@ -2243,8 +2243,8 @@ Mechanism:
   - Vulkan types map to `u32` (`uint32_t`, `VkBool32`, `VkFlags`, 32-bit flag bits), `i32` (`int32_t`, enums), `i64` (`uint64_t`, `VkDeviceSize`, `VkFlags64`, `size_t`), `u16`, `u8`, `f32` and `f64`. Platform types such as `HWND` and `wl_display*` are `ptr`.
   - Pointers to known types become `ptr[T]`; `void*`, function pointers and pointers to pointers become `ptr`. A command's single input or output through a pointer is a `mut` parameter; an array or optional pointer is a `ptr[T]`.
   - Enum entries and API constants are constants such as `VK_FORMAT_R8G8B8A8_UNORM: i32`, and `vk_make_api_version` builds version numbers.
-- Both generators emit declarations without `pub`. `internal/vkgen` and `internal/wlgen` fail when the checked-in files differ from what the generators produce.
-- `std/ui/gpu/shaders` holds the GLSL and its SPIR-V. `go run ./cmd/shadergen internal/compiler/std/ui/gpu/shaders` compiles each stage with `glslc` to a `.spv` and records the SHA-256 sums of the sources and the `.spv` files in `shaders.sum`.
+- Both generators emit declarations without `pub`. `compiler/tests/vkgen` and `compiler/tests/wlgen` fail when the checked-in files differ from what the generators produce.
+- `std/ui/gpu/shaders` holds the GLSL and its SPIR-V. `low run compiler/shadergen std/ui/gpu/shaders` compiles each stage with `glslc` to a `.spv` and records the SHA-256 sums of the sources and the `.spv` files in `shaders.sum`.
 
 ### Platform
 
@@ -2336,52 +2336,52 @@ Win32:
 
 ### UI tests
 
-- `std/ui/geometry`, `std/ui/layout`, `std/ui/font`, `std/ui/text` and `std/ui/scene` are tested by `testdata/run/ui_*` programs, which need no library and so run on Linux and, through `TestRunWindows`, on Windows. They check layouts against hand-computed rectangles, glyph metrics and rasterised coverage of the fallback font, line breaking, atlas packing and scene batching.
-- `internal/uitest` builds Low programs that import the `std/ui` modules and runs them:
+- `std/ui/geometry`, `std/ui/layout`, `std/ui/font`, `std/ui/text` and `std/ui/scene` are tested by `testdata/run/ui_*` programs, which need no library and so run on Linux and, through the `windows` suite, on Windows. They check layouts against hand-computed rectangles, glyph metrics and rasterised coverage of the fallback font, line breaking, atlas packing and scene batching.
+- `compiler/tests/ui` builds Low programs that import the `std/ui` modules and runs them:
   - offscreen renders of every primitive kind, clipping, draw order, frames in flight, instance buffer growth and atlas updates, compared by pixels; they skip without libvulkan or a Vulkan 1.3 device;
   - the Wayland listener callbacks and key translation, driven directly by a program built from the platform's sources; key translation skips without libxkbcommon;
   - a Wayland window that opens, opens again after closing, and presents frames through `open_for` and `present`; these skip without a running compositor;
-  - every program also built for Windows, and the Win32 platform run under `wine` with posted and sent messages standing in for input, on windows disabled so the desktop's own pointer does not reach them: opening, pairs of windows, pointer, keys, resizing and waking.
-- `internal/vkgen` and `internal/wlgen` check that the checked-in bindings match their generators. Both find their libraries through `link.SystemDirs`.
-  - `internal/wlgen` tests the generated signatures and checks, then builds a registry client from the vendored protocols and, when a Wayland compositor is running, runs it.
-  - `internal/vkgen` tests declaration parsing, extension enum values and the selection format, checks the shape of the generated bindings, and renders a rounded, bordered quad offscreen with the quad shaders through the bindings and dynamic rendering, comparing pixels. It skips without libvulkan or a Vulkan 1.3 device.
-- `internal/shaders` checks that the sources and the SPIR-V match the sums recorded in `shaders.sum` and validates the SPIR-V with `spirv-val` when installed.
+  - on a Windows host, the Win32 platform run with posted and sent messages standing in for input, on windows disabled so the desktop's own pointer does not reach them: opening, pairs of windows, pointer, keys, resizing and waking.
+- `compiler/tests/vkgen` and `compiler/tests/wlgen` check that the checked-in bindings match their generators. Both find their libraries through `link.system_dirs`.
+  - `compiler/tests/wlgen` tests the generated signatures and checks, then builds a registry client from the vendored protocols and, when a Wayland compositor is running, runs it.
+  - `compiler/tests/vkgen` tests declaration parsing, extension enum values and the selection format, checks the shape of the generated bindings, and renders a rounded, bordered quad offscreen with the quad shaders through the bindings and dynamic rendering, comparing pixels. It skips without libvulkan or a Vulkan 1.3 device.
+- `compiler/tests/shaders` checks that the sources and the SPIR-V match the sums recorded in `shaders.sum` and validates the SPIR-V with `spirv-val` when installed.
 
 ## Tests
 
-`go test ./...` runs every test whose tools are installed. A test that needs a tool outside the Go toolchain skips when the tool is missing, except `TestRunWindows`, which fails under `CI=true` when `wine` is missing. GitHub Actions sets `CI=true` on every runner, and the workflow installs `wine`. The `internal/asm` and `internal/link` oracle tests need the pinned binutils and LLVM below, which the workflow does not install, so they run by hand.
+The tests are Low programs. `compiler/lowtest` is the fixture harness: `low build compiler/lowtest -o lowtest`, then `lowtest <low binary> [run|examples|fail|lint|windows]... [-filter text]` from the repository root checks any `low` binary against the sidecar files using only its command line. Each `compiler/tests/<name>` is a `std/testing` program for `compiler/<name>`, run with `low run compiler/tests/<name>`; `low` tests `compiler/low`, `editors` the editor grammars and `ui` the `std/ui` modules. A test that needs a tool outside `low` skips when the tool is missing. The `run` and `examples` suites skip on a Windows host and the `windows` suite skips on a Linux host, so the workflow runs `windows` and the Win32 tests on a Windows runner with a `low.exe` and `lowtest.exe` built for Windows. The `compiler/tests/asm` and `compiler/tests/link` oracle tests need the pinned binutils and LLVM below, which the workflow does not install, so they run by hand.
 
 ### Fixtures
 
-A fixture program is a `.low` file or a directory with a `main.low`. Its expectations sit beside it in sidecar files named after it: `name.low` and `name/` both take `name.out`. `internal/fixture` reads and writes the sidecars; `internal/fuzz/corpus` writes fixtures through it and `internal/fixture/fixturetest` lists programs for the tests.
+A fixture program is a `.low` file or a directory with a `main.low`. Its expectations sit beside it in sidecar files named after it: `name.low` and `name/` both take `name.out`. `compiler/fixture` reads and writes the sidecars; `compiler/fuzz/corpus` writes fixtures through it and `compiler/lowtest` lists programs for the harness.
 
 - `testdata/run` holds programs that run on Linux:
   - `.out` is the expected stdout, empty when absent.
   - `.err` is the expected stderr. A program has one exactly when it exits with a panic status.
   - `.maxrss` is a limit on peak memory in KB.
-  - `.maxtime` is a limit on the wall-clock time of one run, as a Go duration such as `1s`. Only programs whose point is speed have one. A program with a `.maxtime` or `.maxrss` runs on its own, not alongside the others.
+  - `.maxtime` is a limit on the wall-clock time of one run, as a duration such as `1s`. Only programs whose point is speed have one. A program with a `.maxtime` or `.maxrss` runs on its own, not alongside the others.
   - `.needed` lists the shared libraries the binary must link, one per line in sorted order. Without it the binary must be static with no interpreter. A program with one has no Windows build.
-  - `.tags` declares what the runner cannot learn from the program: `simd` marks a program that compiles to vector code and runs a second time with `LOW_SIMD=sse2`, and `linux-only` marks a program that uses operating system services the Windows standard library lacks, such as signals, pseudo-terminals, inotify, Unix sockets, file modes or `/proc`, or relies on a kernel guarantee `wine` does not keep, such as appends from concurrent threads landing whole, and has no Windows build. The runner fails when `simd` and the compiled code disagree.
+  - `.tags` declares what the runner cannot learn from the program: `simd` marks a program that compiles to vector code and runs a second time with `LOW_SIMD=sse2`, and `linux-only` marks a program that uses operating system services the Windows standard library lacks, such as signals, pseudo-terminals, inotify, Unix sockets, file modes or `/proc`, or relies on a Linux kernel guarantee, such as appends from concurrent threads landing whole, and has no Windows build. The runner fails when `simd` and the compiled code disagree.
 - `testdata/windows` holds programs that only run on Windows, with `.out` and `.err`.
-- `internal/compiler/std/<module>/examples` holds the module's examples, with `.out` and, for an example with no Windows build, a `.tags` of `linux-only`. The runner does not check `simd` for them.
+- `std/<module>/examples` holds the module's examples, with `.out` and, for an example with no Windows build, a `.tags` of `linux-only`. The runner does not check `simd` for them.
 - `testdata/fail` holds programs that must fail to compile with the message in `.err`, with file paths shown relative to the fixture.
 - `testdata/lint` holds programs whose `low lint` warnings must equal `.warn`, one per line with relative paths. A program without a `.warn` file has none.
 - `bench/<name>/main.low` are the benchmark programs; the compile benchmark and the determinism test use them.
 
 ### Checks
 
-- `go test ./...` compiles every `testdata/run` program and std example for Linux, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and applies `.maxrss`, `.maxtime`, `.needed` and `.tags`. These tests skip on a Windows host, as do the `internal/hot` tests.
-- `TestRunWindows` builds every `testdata/run` program and std example that has a Windows build, and every `testdata/windows` program, for Windows and compares the same way. It runs them directly on a Windows host and under `wine` on Linux, where lines `wine` itself writes to stderr, starting `wine client error:`, are dropped before the comparison.
-- Every `testdata/fail` and `testdata/lint` program is checked against its sidecar.
+- The `run` and `examples` suites compile every `testdata/run` program and std example for Linux, run it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and applies `.maxrss`, `.maxtime`, `.needed` and `.tags`. These suites skip on a Windows host.
+- The `windows` suite builds every `testdata/run` program and std example that has a Windows build, and every `testdata/windows` program, for Windows and compares the same way. It runs only on a Windows host.
+- The `fail` and `lint` suites check every `testdata/fail` and `testdata/lint` program against its sidecar.
 - The time zone programs read zone rules from the embedded `std/time/tzdata`, because host databases differ by release and by build (Debian's includes `backzone`). They read the host database only for the behaviour of `zone.named` and `zone.local`, through zones whose rules every build agrees on.
 - The `std/cdp` programs print `launch failed` when no browser starts. CI turns off Ubuntu's AppArmor restriction on unprivileged user namespaces so Chromium can create its sandbox.
-- `cmd/low` compiles each program twice in one process and requires identical SSA form and assembly: every `testdata/run` program for Linux release, every benchmark for Linux release, Linux dev and Windows, and every `testdata/windows` program for Windows.
-- `internal/compiler` compiles inline programs, benchmarks and fixtures and checks what the optimiser and code generator did with them: inlining, specialisation, bounds checks, register use, string comparison, switch lowering and allocation.
-- `TestBuiltinsDocumented` in `internal/check` requires each public builtin in `internal/check/builtins.go` to have an entry in `## Builtins` with the same name, parameters and `mut` markers, and each entry to name a builtin.
-- `internal/lsp` starts the server over its protocol and checks diagnostics, hover, go-to-definition, references, rename, completion, signature help, inlay hints and symbols.
-- `go test ./editors/` compares the keyword, contextual keyword, builtin function, type, constant and constraint lists of the editor grammars and `site/gen/highlight.low` with the lexer and the checker, requires the copied editor files to match their sources, and requires the Zed `rev` to name a commit whose `editors/tree-sitter-low/src` equals the current one. The rev check skips outside a git checkout.
+- `compiler/tests/low` compiles each program twice in one process and requires identical SSA form and assembly: every `testdata/run` program for Linux release, every benchmark for Linux release, Linux dev and Windows, and every `testdata/windows` program for Windows.
+- `compiler/tests/compiler` compiles inline programs, benchmarks and fixtures and checks what the optimiser and code generator did with them: inlining, specialisation, bounds checks, register use, string comparison, switch lowering and allocation.
+- `compiler/tests/check` requires each public builtin in `compiler/check/builtins.low` to have an entry in `## Builtins` with the same name, parameters and `mut` markers, and each entry to name a builtin.
+- `compiler/tests/lsp` starts the server over its protocol and checks diagnostics, hover, go-to-definition, references, rename, completion, signature help, inlay hints and symbols.
+- `compiler/tests/editors` compares the keyword, contextual keyword, builtin function, type, constant and constraint lists of the editor grammars and `site/gen/highlight.low` with the lexer and the checker, requires the copied editor files to match their sources, and requires the Zed `rev` to name a commit whose `editors/tree-sitter-low/src` equals the current one. The rev check skips outside a git checkout.
 - The UI tests are listed under UI tests.
-- `internal/hot` tests reload against running programs:
+- `compiler/tests/hot` tests reload against running programs:
   - state kept across a code swap;
   - functions added;
   - compile errors leaving the program running;
@@ -2389,7 +2389,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - stored function values, closures and callbacks running patched code;
   - instances of an edited generic function patched;
   - restarts on layout, signature and capture changes.
-- `cmd/lowfuzz` generates well-typed, terminating programs from a choice stream (`internal/fuzz/gen`), predicts their output with a reference interpreter (`internal/fuzz/model`), builds each with the release profile and the dev profile, the same optimisation and hot-reload code generation as `low build` and `low dev`, runs both, and reports any of these (`internal/fuzz/oracle`):
+- `compiler/lowfuzz` generates well-typed, terminating programs from a choice stream (`compiler/fuzz/gen`), predicts their output with a reference interpreter (`compiler/fuzz/model`), builds each with the release profile and the dev profile, the same optimisation and hot-reload code generation as `low build` and `low dev`, runs both, and reports any of these (`compiler/fuzz/oracle`):
   - compiler panic;
   - rejected program;
   - link failure;
@@ -2398,8 +2398,8 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - difference from the prediction.
 
   The generator covers every integer width, `f32` and `f64`, shifts, conversions, `if` expressions, functions, and `for` loops with labelled `break` and `continue`. Float values are observed through clamped integer conversions and NaN comparisons.
-- `internal/fuzz/reduce` minimises each new signature. It removes functions, parameters and statements, unwraps `if` and loop bodies, replaces expressions with literals or their operands, and shrinks literals, keeping only candidates that still produce the signature. `-reduce-tests` bounds the compiler runs.
+- `compiler/fuzz/reduce` minimises each new signature. It removes functions, parameters and statements, unwraps `if` and loop bodies, replaces expressions with literals or their operands, and shrinks literals, keeping only candidates that still produce the signature. `-reduce-tests` bounds the compiler runs.
   - The minimised program is saved under `-out`, one per distinct signature.
   - With `-fixtures` it is also written there as a `testdata/run` fixture (`.low` with the predicted `.out` and `.err`, named by content hash) that fails until the bug is fixed.
-- `internal/asm` tests assemble every program with `as` or `clang` and require the same object bytes. `internal/link` tests link programs with `ld` or `lld-link` and require the same segments, sections, symbols and loaded bytes for ELF and the same bytes for PE. `LOW_LINK_FULL=1` covers every `testdata/run` program and benchmark.
-  - The padding and relaxation choices these tests compare differ between tool releases, so `internal/oracletool` pins GNU binutils 2.47 and LLVM 23.1.4. The tests skip when a tool is missing or reports another version.
+- `compiler/tests/asm` assembles every program with `as` or `clang` and require the same object bytes. `compiler/tests/link` links programs with `ld` or `lld-link` and require the same segments, sections, symbols and loaded bytes for ELF and the same bytes for PE. `LOW_LINK_FULL=1` covers every `testdata/run` program and benchmark.
+  - The padding and relaxation choices these tests compare differ between tool releases, so `compiler/oracletool` pins GNU binutils 2.47 and LLVM 23.1.4. The tests skip when a tool is missing or reports another version.

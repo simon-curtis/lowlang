@@ -9,7 +9,6 @@ A compiled language with Go's speed and footprint, plus enums, typed errors and 
 [![test](https://github.com/simon-curtis/lowlang/actions/workflows/test.yml/badge.svg)](https://github.com/simon-curtis/lowlang/actions/workflows/test.yml)
 [![release](https://img.shields.io/github/v/release/simon-curtis/lowlang?color=111111)](https://github.com/simon-curtis/lowlang/releases/latest)
 [![license](https://img.shields.io/github/license/simon-curtis/lowlang?color=111111)](LICENSE)
-[![go](https://img.shields.io/github/go-mod/go-version/simon-curtis/lowlang?color=111111)](go.mod)
 
 [Website](https://low.simoncurtis.dev) · [Documentation](https://low.simoncurtis.dev/docs/) · [Standard library](https://low.simoncurtis.dev/packages/) · [Releases](https://github.com/simon-curtis/lowlang/releases)
 
@@ -37,10 +36,10 @@ fn main() {
 
 ## Usage
 
-Building `low` needs Go. Compiling, linking and `low dev` need only the `low` binary; `low dev` needs a Linux host.
+`low` is written in Low. Building it from source needs a Linux host with `curl` and `sha256sum`: `./bootstrap.sh` builds the compiler with a published release and writes it to `./low`, or to the path given as its first argument. Compiling, linking and `low dev` need only the `low` binary; `low dev` needs a Linux host.
 
 ```sh
-go build -o low ./cmd/low
+./bootstrap.sh
 ./low run testdata/run/fib.low
 ./low build testdata/run/fib.low -o fib
 ./low build testdata/run/fib.low -target windows/amd64
@@ -58,16 +57,16 @@ go build -o low ./cmd/low
 - The standard library imports as `std/...`.
 - `low dev` runs the program and patches changed functions into it on every save, keeping its state.
 - On the Windows target the standard library calls Win32: files, processes, sockets, DNS, terminals and the environment work. Signals, file watches and pseudo-terminals fail with `Unsupported`; `docs/design.md` `## Compiler` lists the differences.
-- `go test ./...` runs on Linux and on Windows; `docs/design.md` `## Tests` says what it covers and which tools it uses.
+- The tests are Low programs: `compiler/lowtest` runs the fixtures and each `compiler/tests/<name>` runs with `low run`. `docs/design.md` `## Tests` says what they cover and which tools they use.
 
 ## Benchmarks
 
 ```sh
-go run ./cmd/bench
-go run ./cmd/bench -runs 10 -only fib,nbody -langs low,go
+./low run compiler/bench
+./low run compiler/bench -runs 10 -only fib,nbody
 ```
 
-Each `bench/<name>/` holds one program as `main.low`, `main.go` and, for most, `main.ts`. The runner builds them with `low build`, `go build` (`CGO_ENABLED=0`, standard library cached) and `bun build --compile`, and fails a language whose output differs. It reports build time, binary size, median and minimum wall time, CPU time and peak RSS, with wall time relative to Go. `-low` uses a prebuilt compiler instead of building `./cmd/low`.
+Each `bench/<name>/` holds one program as `main.low` and, for most, `main.ts`. The runner builds them with `low build` and `bun build --compile`, and fails a language whose output differs. It reports build time, binary size, median and minimum wall time, CPU time and peak RSS, with wall time relative to the first language. `-low` names the compiler to build with; the `low` on `PATH` is the default.
 
 | Benchmark | Exercises |
 |---|---|
@@ -88,11 +87,15 @@ Each `bench/<name>/` holds one program as `main.low`, `main.go` and, for most, `
 
 ## Releases
 
-Pushing a `v*` tag runs the `test` workflow, then the `release` workflow builds `low` for `linux/amd64` and `windows/amd64` and publishes them as a GitHub release, `low-linux-amd64` and `low-windows-amd64.exe`. Each binary is stamped with the tag, which `low version` prints; a build from source prints `dev+<commit>`. `site/public/install.sh` and `site/public/install.ps1`, served by the website, download the latest release.
+Pushing a `v*` tag runs the `test` workflow, then the `release` workflow builds `low` for `linux/amd64` and `windows/amd64` and publishes them as a GitHub release, `low-linux-amd64` and `low-windows-amd64.exe`. The workflow writes the tag into `compiler/low/version.txt` before it builds, so each binary prints the tag from `low version`; a build from source prints `dev`. `site/public/install.sh` and `site/public/install.ps1`, served by the website, download the latest release.
+
+`bootstrap.txt` names the release that builds the compiler, `release v…`, and the SHA-256 of its Linux binary, `sha256 …`. `bootstrap.sh` downloads that release into `${XDG_CACHE_HOME:-$HOME/.cache}/lowlang/<release>/`, builds stage 1 with it, stage 2 with stage 1 and stage 3 with stage 2, fails unless stages 2 and 3 are byte-identical, and keeps stage 2. `LOW_SEED=<path>` uses a local binary instead of downloading one, and still checks its hash unless `LOW_SEED_UNCHECKED=1`.
+
+The source at release N builds with release N-1, so the compiler uses a language feature only in the release after the one that adds it. After a release is published, `bootstrap.txt` moves to it with the SHA-256 of its `low-linux-amd64`.
 
 ## Website
 
-`site/` is a static site. `site/gen` is a Low program that writes the pages, and Vite+ bundles them with their styles and scripts into `site/dist`, which is what Cloudflare Pages serves. The `test` workflow runs `go vet` and `go test` on every push and pull request to `main`. The `site` workflow builds the site and deploys `site/dist` on every push to `main`, whether or not `test` passes. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
+`site/` is a static site. `site/gen` is a Low program that writes the pages, and Vite+ bundles them with their styles and scripts into `site/dist`, which is what Cloudflare Pages serves. The `test` workflow runs the fixtures and the `compiler/tests` programs on every push and pull request to `main`. The `site` workflow builds the site and deploys `site/dist` on every push to `main`, whether or not `test` passes. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
 
 ```sh
 cd site
@@ -111,7 +114,7 @@ python3 ../assets/brand/build.py
 | `site/index.html`, `404.html`, `docs/`, `packages/`, `search.json` | The generator's output, ignored by git. |
 | `site/dist/` | The bundled site, ignored by git. |
 
-`npm run build` runs the `site` task in `site/vite.config.ts`: `go run ./cmd/low run site/gen`, then `vp build`. `npm run dev` generates once and serves the pages, reloading styles and scripts as they change. `vp build` bundles every generated page and gives each stylesheet, script, font and the search index a content-hashed name under `assets/`; `site/public/_headers` lets browsers cache `assets/` without revalidating.
+`npm run build` runs the `site` task in `site/vite.config.ts`: `low run site/gen`, then `vp build`; the generator runs the `low` on `PATH`. `npm run dev` generates once and serves the pages, reloading styles and scripts as they change. `vp build` bundles every generated page and gives each stylesheet, script, font and the search index a content-hashed name under `assets/`; `site/public/_headers` lets browsers cache `assets/` without revalidating.
 
 The generator:
 

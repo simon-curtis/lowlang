@@ -26,7 +26,7 @@ export default defineConfig({
   run: {
     tasks: {
       generate: {
-        command: "go run ./cmd/low run site/gen",
+        command: "low run site/gen",
         cwd: "..",
         cache: false,
       },
