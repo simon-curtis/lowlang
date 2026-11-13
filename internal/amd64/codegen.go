@@ -60,7 +60,6 @@ type Generator struct {
 	stubs      []pollStub
 	jumps      []jumpTable
 	tier       tier
-	cache      *vectorCache
 }
 
 type moved struct {
@@ -335,15 +334,13 @@ func (g *Generator) function(f *ir.Func) {
 func (g *Generator) body(f *ir.Func, symbol, prefix string, vectors bool) {
 	g.fn = prefix
 	g.labels = 0
-	g.cache = nil
-	if vectors && g.tier == avx2 {
-		g.cache = vectorTemps(f)
-	}
-	mf := lower(f, prefix, !vectors, !vectors)
+	plan := lowerMode{floats: !vectors, wrap: !vectors, vectorRegisters: vectors && g.tier == avx2}
+	mf := lower(f, prefix, plan)
 	spills, saved := mf.allocate()
 	mode := mf.frameMode(f, saved, vectors)
 	if mf.guard != nil && len(saved) == 0 && mode != deferredFrame {
-		mf = lower(f, prefix, !vectors, false)
+		plan.wrap = false
+		mf = lower(f, prefix, plan)
 		spills, saved = mf.allocate()
 		mode = mf.frameMode(f, saved, vectors)
 	}
@@ -379,8 +376,10 @@ func (g *Generator) body(f *ir.Func, symbol, prefix string, vectors bool) {
 	}
 	for _, stub := range g.stubs {
 		g.label(stub.label)
+		g.saveVectors(fr, stub.vectors)
 		g.leaveVectors()
 		g.emit("call rt_poll")
+		g.restoreVectors(fr, stub.vectors)
 		g.emit("jmp %s", stub.resume)
 	}
 	g.stubs = nil
@@ -388,12 +387,13 @@ func (g *Generator) body(f *ir.Func, symbol, prefix string, vectors bool) {
 }
 
 type pollStub struct {
-	label  string
-	resume string
+	label   string
+	resume  string
+	vectors []*vreg
 }
 
-func (g *Generator) poll() {
-	stub := pollStub{label: g.newLabel(), resume: g.newLabel()}
+func (g *Generator) poll(fr *frame, mb *mblock) {
+	stub := pollStub{label: g.newLabel(), resume: g.newLabel(), vectors: fr.heldVectors(mb)}
 	g.emit("TLS_POLL")
 	g.emit("jne %s", stub.label)
 	g.label(stub.resume)
@@ -576,9 +576,6 @@ func (g *Generator) block(fr *frame, mb *mblock, next *mblock) {
 		g.align(loopAlignment)
 	}
 	g.label(mb.label)
-	if g.cache != nil {
-		g.cache.reset()
-	}
 	if mb == fr.fn.guard {
 		if fr.mode == deferredFrame {
 			g.enterFrame(fr)
@@ -593,7 +590,7 @@ func (g *Generator) block(fr *frame, mb *mblock, next *mblock) {
 	}
 	g.copies(fr, mb.copies)
 	if mb.poll {
-		g.poll()
+		g.poll(fr, mb)
 	}
 	switch mb.kind {
 	case ir.Plain:
@@ -766,6 +763,10 @@ func (g *Generator) instr(fr *frame, in *instr) {
 		g.hashSeed(fr.loc(in.dst), v.Aux)
 	case ir.OpVector, ir.OpVectorScalar:
 		g.vector(fr, in)
+	case opSpill:
+		g.spillVector(fr, in)
+	case opFill:
+		g.fillVector(fr, in)
 	case ir.OpTrailingZeros:
 		g.move("rax", fr.loc(in.args[0]))
 		g.emit("mov edx, 64")

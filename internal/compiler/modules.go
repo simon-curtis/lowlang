@@ -16,7 +16,10 @@ import (
 	"lowlang/internal/target"
 )
 
-const moduleFile = "low.mod"
+const (
+	moduleFile  = "low.mod"
+	examplesDir = "examples"
+)
 
 //go:embed std
 var stdFS embed.FS
@@ -155,6 +158,9 @@ func (l *loader) treeOf(module string) tree {
 func (l *loader) imported(e edge) error {
 	if _, done := l.edges[e.to]; done {
 		return nil
+	}
+	if slices.Contains(strings.Split(e.to, "/"), examplesDir) {
+		return diag.Errorf(e.pos, "cannot import %s: an examples directory holds programs, not modules", e.to)
 	}
 	source := l.treeOf(e.to)
 	dir, where := e.to, "the standard library"

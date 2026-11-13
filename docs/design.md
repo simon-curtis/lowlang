@@ -859,13 +859,14 @@ fn main() {
 
 - A module is a directory. Every `.low` file in it shares one namespace, so files of a module need no imports between them.
 - A file whose name ends in `_linux.low` or `_windows.low` belongs to the module only when building for that operating system. The standard library uses this to give `std/sys` and the operating-system parts of `std/os`, `std/process`, `std/net` and `std/crypto/x509` one implementation per target; a test requires every target to declare the same public items with the same doc comments.
+- A directory named `examples` inside a module holds that module's examples: each `.low` file in it is a whole program that imports the module, with its expected output in a `.out` file of the same name. An `examples` directory is never a module, and importing a path with an `examples` segment is an error.
 - The project root is the nearest directory, starting at the entry, that holds a `low.mod` file. Without one it is the entry's directory.
 - `import ui/text` loads `<root>/ui/text/`. A path starting with `std/` names a module of the standard library, which is compiled into `low`, so a project directory named `std` cannot be imported.
 - `low build dir` builds the directory as the entry module. `low build file.low` builds that one file as the entry module, without the other files beside it.
 - `low lint file.low` type-checks the program, prints warnings for the program's own modules (not the standard library), and exits with status 1 if there were any. `-target` picks the operating system whose files are checked and defaults to the host. `low build`, `low run`, `low asm` and `low ir` print the same warnings to stderr and continue. The language server reports them as warnings.
   - `prefer-match` flags an `if` / `else if` / `else` chain with at least two conditions in which every condition is `==` between one side-effect-free subject (a variable, field, index or dereference) and a non-negative integer, character or string literal or an enum variant. It suggests `match subject { 4 => ..., _ => ... }`.
   - `prefer-loop-label` flags a `break` out of an inner loop that sets a boolean flag to a literal when the statement right after that loop is `if flag { break }` or `if flag { continue }` (or `if !flag` for a flag set to `false`), with no `else`. It suggests labelling the loop that `if` acts on and jumping to it with `break name` or `continue name`, reusing the label the `if` already names. Breaks inside a nested loop, closure, `spawn` or `defer` are not counted.
-- `low doc dir` prints, as JSON, every module under the directory with its imports, each with the name it is used through, and its public structs, enums and functions, each with its declaration as text, its file and its line. A struct shows its public fields, and `...` stands for its private ones. A function whose first parameter is a public type of its module, or a pointer to one, names that type as its receiver. `low doc std` documents the standard library, and the website builds its package pages from it with `-target linux/amd64`. `-target` picks the operating system whose files are documented and defaults to the host.
+- `low doc dir` prints, as JSON, every module under the directory with its imports, each with the name it is used through, and its public structs, enums and functions, each with its declaration as text, its file and its line. A struct shows its public fields, and `...` stands for its private ones. A function whose first parameter is a public type of its module, or a pointer to one, names that type as its receiver. Each module lists its examples with their name, source and expected output. `low doc std` documents the standard library, and the website builds its package pages from it with `-target linux/amd64`. `-target` picks the operating system whose files are documented and defaults to the host.
 - Imports come before declarations and apply to their file.
 - A module is used through its last path segment, `text.shout(...)`, or through a name given with `import t = ui/text`.
 - Types are written `geometry.Shape` and built with `geometry.Point { ... }`. A variant can be named `geometry.Shape.Dot` or, where the type is expected, `Dot`.
@@ -1165,7 +1166,7 @@ Every public struct, enum, function, struct field and enum variant carries a doc
 
 - The first sentence is the summary: a verb phrase for a function (`Returns the ...`, `Parses ...`), a noun phrase for a type, field or variant.
 - Later paragraphs carry the contract the signature cannot: which error variant is returned and when, whether the call blocks, what dropping or closing releases, limits, defaults and edge cases such as empty input or end of input.
-- Identifiers and literals are in backticks. A `low` example block appears only where usage is not obvious from the signature, and it type-checks.
+- Identifiers and literals are in backticks. A `low` example block appears only where usage is not obvious from the signature, and it type-checks. It stays a few lines long; a program that shows how to use the module goes in the module's `examples` directory, where it runs.
 - A doc states the current behaviour as read from the code.
 
 | Module | Contents |
@@ -1900,8 +1901,7 @@ Optimiser:
     - is not part of a cycle;
     - is not a callback;
     - has at most 48 values besides constants, parameters and results;
-    - has at most one loop and an entry block no jump returns to;
-    - uses no vector instruction.
+    - has at most one loop and an entry block no jump returns to.
   - Frame slots, `ccall`s and runtime calls are cloned with the body, and the callee's slots are appended to the caller's.
   - A callee of at most 6 values is free. Any other site is charged to the caller, which grows by at most 240 values, and to the program, whose budget is a fifth of its value count before inlining, at least 6000 and at most 40000. The last quarter of the program budget is kept for call sites inside loops.
   - A caller inlines up to four rounds. Each round takes its sites inside the deepest loops first, then the smaller callees, then the earlier values; splits the call's block; clones the callee's blocks with parameters bound to the arguments; forwards a single return's values or joins several returns in phis; and simplifies the caller. Calls that an inlined body or a devirtualised call exposes are inlined in the next round.
@@ -1975,6 +1975,7 @@ Optimiser:
   - `rcx`, `rsi`, `rdi`, `r8` and `r9` hold values that are not live across a call. `rbx` and `r12` to `r15` hold values that are, and are saved in the function's frame when used. Values that find no register are spilled to the frame. `rax`, `rdx`, `r10` and `r11` are scratch.
   - A growth call, `rt_grow_scan` or `rt_grow_noscan` according to whether the new buffer may hold pointers, takes the old pointer, the used bytes and the new size in `rax`, `rdx` and `r10` and returns the new pointer in `rax`. It preserves every other general register, so a value that cannot hold a pointer stays in `rcx`, `rsi`, `rdi`, `r8` or `r9` across it. A value that may hold a pointer is treated as live across a call: the routine saves the preserved registers below the scanned part of the stack, where the collector does not read them. The routine records the caller's return address and frame pointer like any runtime entry, and the old buffer stays reachable through the words it keeps in the scanned region.
   - Float register values are allocated from `xmm2` to `xmm15` by the same scan. No `xmm` register survives a call, so a float live across a call is spilled, and spilled floats are not in the stack maps. A function that uses vectors gets no float registers, so its float operations go through `xmm0` and `xmm1`.
+  - In the AVX2 version of a vector function, vector values in register slots are allocated from `ymm8` to `ymm15` by the same scan; see Vectors.
 - Register preferences:
   - A value used as a call argument prefers that argument's register, a parameter prefers the register it arrives in, and a copy and its source prefer each other's registers.
   - The result of a two-operand add, subtract, multiply, and, or, xor, shift or float divide prefers the register of its first operand, and for a commutative operation of its second, so the instruction can work in place. Where it cannot share, it avoids the register of the operand it still has to read.
@@ -2020,7 +2021,13 @@ Calling convention:
 - At calls, returns, fields and other aggregates a vector is its words, loaded from or stored to a slot. A `let` of a computed vector adopts the slot of the result instead of copying it.
 - A function containing vector instructions is compiled twice. Its symbol is a stub that jumps to the AVX2 version when the CPU and the operating system support AVX2, and to the SSE2 version otherwise. `rt_cpu_init` checks `cpuid` and `xgetbv` at startup.
 - `LOW_SIMD=sse2` in the environment selects the SSE2 versions, which the fixture runner uses to test both.
-- The AVX2 version uses three-operand VEX instructions on `ymm` registers. A slot written once and read only by vector instructions later in the same block, with no call in between, is kept in `ymm8` to `ymm15` instead of memory. `vzeroupper` runs before every call and return of such a function.
+- The AVX2 version uses three-operand VEX instructions on `ymm` registers. `ymm0` to `ymm7` are scratch. `vzeroupper` runs before every call, return and poll of such a function.
+- A vector slot is a register slot in the AVX2 version when every use is an operand of a vector instruction, the address operand of a load or store, or an `add` of a lane offset whose every use is the address of a load or store. Each register slot has a home in the frame and a vector value allocated from `ymm8` to `ymm15` by the linear scan, the same way as general and float values.
+  - A vector instruction reads and writes the value. Its first operand is a definition, not a use. The other slots of the function keep the memory form.
+  - The value is in its register, in both register and home, or in its home only. A word store covering the whole slot defines the value in its home. A partial store, `simd.with_lane` for one, reads and writes the home. A call, an inlined system call, a growth call, `rt_str_eq` or a C call spills the value to its home when it is live across it, and a later vector instruction or the end of the block that needs it in a register fills it.
+  - A value that finds no register, or is chosen as the victim of another, stays in its home. No spill slot is added, since the home is the slot. A copy between two values prefers the same register and a copy within one register emits nothing.
+  - The poll stub saves the register values live out of the poll to their homes, runs `vzeroupper`, calls `rt_poll` and restores them, since `vzeroupper` clears the upper halves that `rt_poll` does not save.
+  - These operations are one three-operand instruction that writes the destination's register and reads its second operand from a register or from memory: integer and float add and subtract, native multiply, and, or, xor, native minimum and maximum, `pshufb`, integer equality and float divide. Other operations copy their operands into the scratch registers and copy the result out.
 - The SSE2 version splits 256-bit operations into two 128-bit halves and keeps every vector in memory.
 - An operation without an instruction in the version being generated runs as a scalar loop over the lanes in a scratch area of the frame. These operations are `pshufb` on SSE2, 64-bit multiplication, minimum, maximum and comparison where unavailable, byte shifts and arithmetic 64-bit shifts. Unsigned comparisons flip the sign bit of both operands and compare signed.
 
@@ -2209,14 +2216,15 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - `.needed` lists the shared libraries the binary must link, one per line in sorted order. Without it the binary must be static with no interpreter. A program with one has no Windows build.
   - `.tags` declares what the runner cannot learn from the program: `simd` marks a program that compiles to vector code and runs a second time with `LOW_SIMD=sse2`, and `linux-only` marks a program that uses operating system services the Windows standard library lacks, such as signals, pseudo-terminals, inotify, Unix sockets, file modes or `/proc`, or relies on a kernel guarantee `wine` does not keep, such as appends from concurrent threads landing whole, and has no Windows build. The runner fails when `simd` and the compiled code disagree.
 - `testdata/windows` holds programs that only run on Windows, with `.out` and `.err`.
+- `internal/compiler/std/<module>/examples` holds the module's examples, with `.out` and, for an example with no Windows build, a `.tags` of `linux-only`. The runner does not check `simd` for them.
 - `testdata/fail` holds programs that must fail to compile with the message in `.err`, with file paths shown relative to the fixture.
 - `testdata/lint` holds programs whose `low lint` warnings must equal `.warn`, one per line with relative paths. A program without a `.warn` file has none.
 - `bench/<name>/main.low` are the benchmark programs; the compile benchmark and the determinism test use them.
 
 ### Checks
 
-- `go test ./...` compiles every `testdata/run` program for Linux, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and applies `.maxrss`, `.maxtime`, `.needed` and `.tags`. These tests skip on a Windows host, as do the `internal/hot` tests.
-- `TestRunWindows` builds every `testdata/run` program that has a Windows build, and every `testdata/windows` program, for Windows and compares the same way. It runs them directly on a Windows host and under `wine` on Linux.
+- `go test ./...` compiles every `testdata/run` program and std example for Linux, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and applies `.maxrss`, `.maxtime`, `.needed` and `.tags`. These tests skip on a Windows host, as do the `internal/hot` tests.
+- `TestRunWindows` builds every `testdata/run` program and std example that has a Windows build, and every `testdata/windows` program, for Windows and compares the same way. It runs them directly on a Windows host and under `wine` on Linux.
 - Every `testdata/fail` and `testdata/lint` program is checked against its sidecar.
 - The time zone programs read zone rules from the embedded `std/time/tzdata`, because host databases differ by release and by build (Debian's includes `backzone`). They read the host database only for the behaviour of `zone.named` and `zone.local`, through zones whose rules every build agrees on.
 - The `std/cdp` programs print `launch failed` when no browser starts. CI turns off Ubuntu's AppArmor restriction on unprivileged user namespaces so Chromium can create its sandbox.

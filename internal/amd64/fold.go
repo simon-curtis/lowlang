@@ -20,7 +20,7 @@ func (f *mfunc) selectInstructions() {
 
 func (in *instr) writesMemory() bool {
 	switch in.op {
-	case ir.OpStore, ir.OpVector, ir.OpVectorScalar:
+	case ir.OpStore, ir.OpVector, ir.OpVectorScalar, opSpill, opFill:
 		return true
 	}
 	return in.op.IsCall()

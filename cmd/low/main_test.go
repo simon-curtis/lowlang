@@ -44,6 +44,21 @@ func TestRun(t *testing.T) {
 	}
 }
 
+func TestExamples(t *testing.T) {
+	fixturetest.RequireLinuxHost(t)
+	for _, program := range fixturetest.Examples(t) {
+		sidecars := program.Sidecars(t)
+		t.Run(program.Name, func(t *testing.T) {
+			t.Parallel()
+			binary := filepath.Join(t.TempDir(), "main")
+			if err := build(context.Background(), program.Path, binary, target.Linux); err != nil {
+				t.Fatal(err)
+			}
+			runWithEnv(t, sidecars, binary, nil)
+		})
+	}
+}
+
 func runFixture(t *testing.T, program fixturetest.Program, sidecars fixture.Sidecars) {
 	binary := filepath.Join(t.TempDir(), "main")
 	buildLinux(t, program, sidecars, binary)
@@ -119,7 +134,7 @@ func runWithEnv(t *testing.T, sidecars fixture.Sidecars, binary string, env []st
 
 func TestRunWindows(t *testing.T) {
 	launch := windowsLauncher(t)
-	programs := slices.Concat(fixturetest.Programs(t, "run"), fixturetest.Programs(t, "windows"))
+	programs := slices.Concat(fixturetest.Programs(t, "run"), fixturetest.Programs(t, "windows"), fixturetest.Examples(t))
 	for _, program := range programs {
 		sidecars := program.Sidecars(t)
 		if !sidecars.Windows() {

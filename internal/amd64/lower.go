@@ -12,6 +12,8 @@ type vreg struct {
 	pool              *int64
 	mem               *address
 	frame             *ir.Value
+	home              *ir.Value
+	wide              bool
 	pinned            string
 	float             bool
 	light             bool
@@ -76,18 +78,33 @@ type mfunc struct {
 }
 
 type lowering struct {
-	fn     *mfunc
-	vregs  map[*ir.Value]*vreg
-	blocks map[*ir.Block]*mblock
-	scalar bool
+	fn        *mfunc
+	vregs     map[*ir.Value]*vreg
+	blocks    map[*ir.Block]*mblock
+	floats    bool
+	slots     []int
+	registers map[int64]bool
+	homes     map[int64]*vreg
+	ordered   []*vreg
 }
 
-func lower(f *ir.Func, prefix string, scalar, wrap bool) *mfunc {
+type lowerMode struct {
+	floats          bool
+	wrap            bool
+	vectorRegisters bool
+}
+
+func lower(f *ir.Func, prefix string, mode lowerMode) *mfunc {
 	l := &lowering{
 		fn:     &mfunc{},
 		vregs:  map[*ir.Value]*vreg{},
 		blocks: map[*ir.Block]*mblock{},
-		scalar: scalar,
+		floats: mode.floats,
+		slots:  f.Slots,
+		homes:  map[int64]*vreg{},
+	}
+	if mode.vectorRegisters {
+		l.registers = registerSlots(f)
 	}
 	for _, b := range f.Blocks {
 		mb := &mblock{label: fmt.Sprintf(".L%s_%d", prefix, b.ID), kind: b.Kind, poll: b.Poll}
@@ -100,17 +117,14 @@ func lower(f *ir.Func, prefix string, scalar, wrap bool) *mfunc {
 	for _, b := range f.Blocks {
 		l.phiCopies(b)
 	}
-	if scalar {
-		l.fn.simplifyBranches()
-		l.fn.selectInstructions()
-	}
+	l.fn.simplifyBranches()
+	l.insertTransfers()
+	l.fn.selectInstructions()
 	l.fn.duplicateReturns()
-	if scalar {
-		l.fn.rematerializeFrameAddresses()
-	}
+	l.fn.rematerializeFrameAddresses()
 	l.fn.rotateLoops()
 	l.fn.layout()
-	if wrap {
+	if mode.wrap {
 		l.fn.shrinkWrap()
 	}
 	l.fn.hint()
@@ -148,6 +162,9 @@ func (in *instr) hint() {
 		}
 	case in.rotate != 0:
 		in.dst.sources = []*vreg{in.args[0]}
+	case in.copiesBetweenHomes():
+		in.args[0].sources = append(in.args[0].sources, in.args[1])
+		in.args[1].sinks = append(in.args[1].sinks, in.args[0])
 	case in.twoOperand():
 		in.hintOperands()
 	case in.preservesRegisters(), in.literal != nil:
@@ -192,15 +209,15 @@ func (l *lowering) vreg(v *ir.Value) *vreg {
 		r = l.fn.newVreg()
 		r.scalar = v.Scalar
 		switch {
-		case l.scalar && v.Op == ir.OpSlot:
+		case v.Op == ir.OpSlot:
 			r.frame = v
 		case fitsImmediate(v):
 			r.konst = &v.Aux
-		case l.scalar && v.Op == ir.OpConst && v.FloatBits > 0:
+		case l.floats && v.Op == ir.OpConst && v.FloatBits > 0:
 			r.pool = &v.Aux
 			r.float = true
 		default:
-			r.float = l.scalar && floatable(v)
+			r.float = l.floats && floatable(v)
 		}
 		l.vregs[v] = r
 	}
@@ -370,8 +387,8 @@ func (l *lowering) block(b *ir.Block) {
 			in.call = call
 		}
 		if v.Op != ir.OpResult {
-			for _, arg := range v.Args {
-				in.args = append(in.args, l.vreg(arg))
+			for k := range v.Args {
+				in.args = append(in.args, l.operand(v, k))
 			}
 		}
 		if v.Op == ir.OpLoad || v.Op == ir.OpStore {

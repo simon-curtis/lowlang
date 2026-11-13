@@ -494,8 +494,9 @@ func (b *isaBuilder) addSSEArithmetic() {
 	ops := []sseOp{
 		{"addps", 0, 0x58, 16}, {"addpd", 0x66, 0x58, 16}, {"addss", 0xF3, 0x58, 4}, {"addsd", 0xF2, 0x58, 8},
 		{"mulps", 0, 0x59, 16}, {"mulpd", 0x66, 0x59, 16}, {"mulss", 0xF3, 0x59, 4}, {"mulsd", 0xF2, 0x59, 8},
-		{"subss", 0xF3, 0x5C, 4}, {"subsd", 0xF2, 0x5C, 8},
-		{"minpd", 0x66, 0x5D, 16},
+		{"subps", 0, 0x5C, 16}, {"subpd", 0x66, 0x5C, 16}, {"subss", 0xF3, 0x5C, 4}, {"subsd", 0xF2, 0x5C, 8},
+		{"minps", 0, 0x5D, 16}, {"minpd", 0x66, 0x5D, 16},
+		{"maxps", 0, 0x5F, 16}, {"maxpd", 0x66, 0x5F, 16},
 		{"divps", 0, 0x5E, 16}, {"divpd", 0x66, 0x5E, 16}, {"divss", 0xF3, 0x5E, 4}, {"divsd", 0xF2, 0x5E, 8},
 		{"sqrtss", 0xF3, 0x51, 4}, {"sqrtsd", 0xF2, 0x51, 8},
 		{"ucomiss", 0, 0x2E, 4}, {"ucomisd", 0x66, 0x2E, 8},
@@ -538,11 +539,11 @@ func (b *isaBuilder) addSSEPacked() {
 	}{
 		{"packsswb", 0x63}, {"paddb", 0xFC}, {"paddw", 0xFD}, {"paddd", 0xFE}, {"paddq", 0xD4},
 		{"pand", 0xDB}, {"pandn", 0xDF}, {"por", 0xEB}, {"pxor", 0xEF},
-		{"pcmpeqb", 0x74}, {"pcmpeqd", 0x76}, {"pcmpgtb", 0x64}, {"pcmpgtw", 0x65}, {"pcmpgtd", 0x66},
+		{"pcmpeqb", 0x74}, {"pcmpeqw", 0x75}, {"pcmpeqd", 0x76}, {"pcmpgtb", 0x64}, {"pcmpgtw", 0x65}, {"pcmpgtd", 0x66},
 		{"pmaxub", 0xDE}, {"pminub", 0xDA}, {"pmullw", 0xD5},
-		{"psllw", 0xF1}, {"psllq", 0xF3}, {"psrlw", 0xD1}, {"psrld", 0xD2}, {"psrlq", 0xD3}, {"psrad", 0xE2},
-		{"psubb", 0xF8}, {"psubw", 0xF9}, {"psubd", 0xFA},
-		{"punpcklbw", 0x60}, {"punpcklwd", 0x61},
+		{"psllw", 0xF1}, {"pslld", 0xF2}, {"psllq", 0xF3}, {"psrlw", 0xD1}, {"psrld", 0xD2}, {"psrlq", 0xD3}, {"psrad", 0xE2},
+		{"psubb", 0xF8}, {"psubw", 0xF9}, {"psubd", 0xFA}, {"psubq", 0xFB},
+		{"punpcklbw", 0x60}, {"punpcklwd", 0x61}, {"punpcklqdq", 0x6C},
 	}
 	for _, p := range packed {
 		b.add(p.name, newForm(p.opcode, xmm(), xmmm(16)).pfx(0x66).in(space0F).rr(r1, r2))
@@ -582,23 +583,26 @@ func (b *isaBuilder) addVEXThreeOperand() {
 	ops := []vexOp{
 		{"vaddps", 0, space0F, 0x58}, {"vaddpd", 0x66, space0F, 0x58},
 		{"vmulps", 0, space0F, 0x59}, {"vmulpd", 0x66, space0F, 0x59},
-		{"vminpd", 0x66, space0F, 0x5D}, {"vdivpd", 0x66, space0F, 0x5E},
+		{"vsubps", 0, space0F, 0x5C}, {"vsubpd", 0x66, space0F, 0x5C},
+		{"vminps", 0, space0F, 0x5D}, {"vminpd", 0x66, space0F, 0x5D},
+		{"vdivps", 0, space0F, 0x5E}, {"vdivpd", 0x66, space0F, 0x5E},
+		{"vmaxps", 0, space0F, 0x5F}, {"vmaxpd", 0x66, space0F, 0x5F},
 		{"vpacksswb", 0x66, space0F, 0x63},
 		{"vpaddb", 0x66, space0F, 0xFC}, {"vpaddw", 0x66, space0F, 0xFD}, {"vpaddd", 0x66, space0F, 0xFE}, {"vpaddq", 0x66, space0F, 0xD4},
-		{"vpand", 0x66, space0F, 0xDB}, {"vpor", 0x66, space0F, 0xEB}, {"vpxor", 0x66, space0F, 0xEF},
-		{"vpcmpeqb", 0x66, space0F, 0x74}, {"vpcmpeqd", 0x66, space0F, 0x76}, {"vpcmpeqq", 0x66, space0F38, 0x29},
+		{"vpand", 0x66, space0F, 0xDB}, {"vpandn", 0x66, space0F, 0xDF}, {"vpor", 0x66, space0F, 0xEB}, {"vpxor", 0x66, space0F, 0xEF},
+		{"vpcmpeqb", 0x66, space0F, 0x74}, {"vpcmpeqw", 0x66, space0F, 0x75}, {"vpcmpeqd", 0x66, space0F, 0x76}, {"vpcmpeqq", 0x66, space0F38, 0x29},
 		{"vpcmpgtb", 0x66, space0F, 0x64}, {"vpcmpgtw", 0x66, space0F, 0x65}, {"vpcmpgtd", 0x66, space0F, 0x66}, {"vpcmpgtq", 0x66, space0F38, 0x37},
-		{"vpmaxsd", 0x66, space0F38, 0x3D}, {"vpmaxub", 0x66, space0F, 0xDE}, {"vpmaxuw", 0x66, space0F38, 0x3E},
+		{"vpmaxsd", 0x66, space0F38, 0x3D}, {"vpmaxud", 0x66, space0F38, 0x3F}, {"vpmaxub", 0x66, space0F, 0xDE}, {"vpmaxuw", 0x66, space0F38, 0x3E},
 		{"vpminsd", 0x66, space0F38, 0x39}, {"vpminub", 0x66, space0F, 0xDA}, {"vpminud", 0x66, space0F38, 0x3B}, {"vpminuw", 0x66, space0F38, 0x3A},
 		{"vpmulld", 0x66, space0F38, 0x40}, {"vpmullw", 0x66, space0F, 0xD5},
 		{"vpshufb", 0x66, space0F38, 0x00},
-		{"vpsubb", 0x66, space0F, 0xF8}, {"vpsubw", 0x66, space0F, 0xF9}, {"vpsubd", 0x66, space0F, 0xFA},
+		{"vpsubb", 0x66, space0F, 0xF8}, {"vpsubw", 0x66, space0F, 0xF9}, {"vpsubd", 0x66, space0F, 0xFA}, {"vpsubq", 0x66, space0F, 0xFB},
 	}
 	for _, op := range ops {
 		b.add(op.name, newForm(op.opcode, vec(), vec(), vecm()).vexEncoded().pfx(op.prefix).in(op.space).rr(r1, r3).nds(r2))
 	}
 	shifts := []vexOp{
-		{"vpsllw", 0x66, space0F, 0xF1}, {"vpsllq", 0x66, space0F, 0xF3},
+		{"vpsllw", 0x66, space0F, 0xF1}, {"vpslld", 0x66, space0F, 0xF2}, {"vpsllq", 0x66, space0F, 0xF3},
 		{"vpsrlw", 0x66, space0F, 0xD1}, {"vpsrld", 0x66, space0F, 0xD2}, {"vpsrlq", 0x66, space0F, 0xD3}, {"vpsrad", 0x66, space0F, 0xE2},
 	}
 	for _, op := range shifts {
@@ -617,5 +621,7 @@ func (b *isaBuilder) addVEXMisc() {
 	b.add("vmovmskps", newForm(0x50, gp(4), vec()).vexEncoded().in(space0F).rr(r1, r2))
 	b.add("vpmovmskb", newForm(0xD7, gp(4), vec()).vexEncoded().pfx(0x66).in(space0F).rr(r1, r2))
 	b.add("vpbroadcastb", newForm(0x78, vec(), xmmm(1)).vexEncoded().pfx(0x66).in(space0F38).rr(r1, r2))
+	b.add("vpbroadcastw", newForm(0x79, vec(), xmmm(2)).vexEncoded().pfx(0x66).in(space0F38).rr(r1, r2))
 	b.add("vpbroadcastd", newForm(0x58, vec(), xmmm(4)).vexEncoded().pfx(0x66).in(space0F38).rr(r1, r2))
+	b.add("vpbroadcastq", newForm(0x59, vec(), xmmm(8)).vexEncoded().pfx(0x66).in(space0F38).rr(r1, r2))
 }
