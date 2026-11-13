@@ -17,6 +17,8 @@ $ /tmp/low build compiler/lowdump -o /tmp/lowdump-low
 $ /tmp/lowdump-go tokens file.low > a; /tmp/lowdump-low tokens file.low > b; cmp a b
 ```
 
+The commands are `tokens`, `ast`, `check` and `object`. `check` loads a whole program and prints every file's AST with the types, locals, targets and layouts the checker resolved; `cmd/lowdump/ast.go` and `compiler/lowdump/ast.low` print the same lines, so a field the checker sets is compared as soon as the Low checker sets it.
+
 Compare stdout, stderr and the exit status over every `.low` file under `testdata/`, `internal/compiler/` and `bench/`, including the files that must fail.
 
 ## Porting rules
@@ -30,5 +32,11 @@ Compare stdout, stderr and the exit status over every `.low` file under `testdat
 - A Go `map` keyed by a struct is keyed by a `str` or integer built from the same fields.
 - Source text is a `str`. `s[a..b]` shares the bytes, so token and name text is sliced, never copied.
 - Output must not depend on map hash order. Low maps iterate in insertion order, which is deterministic; where Go sorts keys, sort the same way.
+- A Go nil pointer is `*T?`, and a nil interface value is `Expr?`. `[]*T?` is an optional slice, not a slice of optionals: parallel Go slices with nil holes become one slice of a struct with optional fields, as `ast.InterpPart` does.
+- Low has no module-level state, so the Go package-level type singletons live on `types.Universe`, which every stage receives. Compare them by kind (`is_void`, `is_never`) or through the universe (`u.i64`).
+- A struct copy is `new(*p)`. `ast/clone.low` copies each node that way and then replaces its children.
+- A local cannot share the name of a function it calls, and a function cannot be named after a keyword or a type.
+- An enum converts to an integer only through `.index`, which needs `= n` on every variant.
+- `diag.quote` and `diag.quote_char` format as Go's `%q`. `lexer.quote` is the dump format.
 - Assignments are statements: a `match` arm that assigns takes a `{ }` block.
 - `"{{"` and `"}}"` are literal braces in a string.

@@ -1,0 +1,1412 @@
+import ast
+import diag
+import lexer
+import std/math
+import std/text
+
+struct Parser {
+    src: str = ""
+    tokens: []lexer.Token
+    i: i64 = 0
+    no_struct: bool = false
+    taken: [i64: bool] = [:]
+}
+
+pub fn parse_source(src: str, at: diag.Pos, privileged: bool) -> *ast.File ! diag.Error {
+    let tokens = lexer.lex(src, at, privileged)?
+    let p = new(Parser { src, tokens })
+    p.file()?
+}
+
+fn tok(p: *Parser) -> lexer.Token {
+    p.tokens[p.i]
+}
+
+fn doc(p: *Parser) -> str {
+    let t = p.tok()
+    if t.doc != "" {
+        p.taken[p.i] = true
+    }
+    t.doc
+}
+
+fn stray_docs(p: *Parser) ! diag.Error {
+    for i, t in p.tokens {
+        if t.doc != "" && p.taken[i] == none {
+            fail At(t.doc_at, "a /// comment must come before a declaration, struct field or enum variant")
+        }
+    }
+}
+
+fn peek(p: *Parser) -> lexer.Kind {
+    let last = p.tokens.len - 1
+    p.tokens[if p.i + 1 < last { p.i + 1 } else { last }].kind
+}
+
+fn at(p: *Parser, k: lexer.Kind) -> bool {
+    p.tokens[p.i].kind == k
+}
+
+fn next(p: *Parser) -> lexer.Token {
+    let t = p.tok()
+    if t.kind != EOF {
+        p.i += 1
+    }
+    t
+}
+
+fn expect(p: *Parser, k: lexer.Kind) -> lexer.Token ! diag.Error {
+    let t = p.tok()
+    if t.kind != k {
+        fail At(t.pos, "expected {lexer.kind_text(k)}, found {describe(t)}")
+    }
+    p.next()
+}
+
+fn describe(t: lexer.Token) -> str {
+    match t.kind {
+        Ident => "{lexer.kind_text(t.kind)} {t.text}"
+        Int => "{lexer.kind_text(t.kind)} {t.text}"
+        Float => "{lexer.kind_text(t.kind)} {t.text}"
+        String => "string {diag.quote(t.text)}"
+        _ => lexer.kind_text(t.kind)
+    }
+}
+
+fn skip_newlines(p: *Parser) {
+    for p.at(Newline) {
+        p.next()
+    }
+}
+
+fn allow_structs(p: *Parser, allowed: bool, parse: fn() ! diag.Error) ! diag.Error {
+    let saved = p.no_struct
+    p.no_struct = !allowed
+    parse()?
+    p.no_struct = saved
+}
+
+fn nested(p: *Parser, parse: fn() ! diag.Error) ! diag.Error {
+    p.allow_structs(true, parse)?
+}
+
+fn condition(p: *Parser) -> ast.Expr ! diag.Error {
+    let saved = p.no_struct
+    p.no_struct = true
+    let x = p.expr()?
+    p.no_struct = saved
+    x
+}
+
+fn accept(p: *Parser, k: lexer.Kind) -> bool {
+    if !p.at(k) {
+        return false
+    }
+    p.next()
+    true
+}
+
+fn delimited(p: *Parser, open: lexer.Kind, close: lexer.Kind, item: fn() ! diag.Error) ! diag.Error {
+    p.expect(open)?
+    let saved = p.no_struct
+    p.no_struct = false
+    for !p.at(close) {
+        item()?
+        if !p.at(close) {
+            p.expect(Comma)?
+        }
+    }
+    p.no_struct = saved
+    p.expect(close)?
+}
+
+fn list(p: *Parser, item: fn() ! diag.Error) ! diag.Error {
+    p.delimited(LParen, RParen, item)?
+}
+
+fn brackets(p: *Parser, item: fn() ! diag.Error) ! diag.Error {
+    p.delimited(LBracket, RBracket, item)?
+}
+
+fn sequence(p: *Parser, close: lexer.Kind, commas: bool, item: fn() ! diag.Error) ! diag.Error {
+    let saved = p.no_struct
+    p.no_struct = false
+    p.skip_newlines()
+    for !p.at(close) {
+        item()?
+        if commas && p.at(Comma) {
+            p.next()
+        } else if !p.at(close) {
+            p.expect(Newline)?
+        }
+        p.skip_newlines()
+    }
+    p.no_struct = saved
+    p.expect(close)?
+}
+
+fn lines(p: *Parser, item: fn() ! diag.Error) ! diag.Error {
+    p.expect(LBrace)?
+    p.sequence(RBrace, false, item)?
+}
+
+fn members(p: *Parser, item: fn() ! diag.Error) ! diag.Error {
+    p.expect(LBrace)?
+    p.sequence(RBrace, true, item)?
+}
+
+fn arrow_type(p: *Parser) -> *ast.TypeName? ! diag.Error {
+    if !p.accept(Arrow) {
+        return none
+    }
+    p.type_name()?
+}
+
+struct Tail {
+    result: *ast.TypeName?
+    failure: *ast.TypeName?
+}
+
+fn signature_tail(p: *Parser) -> Tail ! diag.Error {
+    let result = p.arrow_type()?
+    var failure: *ast.TypeName? = none
+    if p.accept(Not) {
+        failure = p.type_name()?
+    }
+    Tail { result, failure }
+}
+
+fn file(p: *Parser) -> *ast.File ! diag.Error {
+    let f = new(ast.File {})
+    p.skip_newlines()
+    for p.at(Import) {
+        let decl = p.import_decl()?
+        push(mut f.imports, decl)
+        p.skip_newlines()
+    }
+    for !p.at(EOF) {
+        p.declaration(f)?
+        p.skip_newlines()
+    }
+    p.stray_docs()?
+    f
+}
+
+fn declaration(p: *Parser, f: *ast.File) ! diag.Error {
+    let doc = p.doc()
+    let exported = p.accept(Pub)
+    let t = p.tok()
+    match t.kind {
+        Fn => {
+            let d = p.func()?
+            d.exported = exported
+            d.file = f
+            d.doc = doc
+            push(mut f.funcs, d)
+        }
+        Enum => {
+            let d = p.enum_decl()?
+            d.exported = exported
+            d.file = f
+            d.doc = doc
+            push(mut f.enums, d)
+        }
+        Struct => {
+            let d = p.struct_decl()?
+            d.exported = exported
+            d.file = f
+            d.doc = doc
+            push(mut f.structs, d)
+        }
+        Const => {
+            let d = p.const_decl()?
+            d.exported = exported
+            d.file = f
+            d.doc = doc
+            push(mut f.consts, d)
+        }
+        Extern => {
+            if p.peek() == Struct {
+                p.next()
+                let d = p.struct_decl()?
+                d.exported = exported
+                d.file = f
+                d.c = true
+                d.doc = doc
+                push(mut f.structs, d)
+                return
+            }
+            if exported {
+                fail At(t.pos, "extern blocks cannot be pub")
+            }
+            let e = p.extern_block()?
+            for func in e.funcs {
+                func.file = f
+            }
+            push(mut f.externs, e)
+        }
+        Import => fail At(t.pos, "imports must come before declarations")
+        _ => fail At(t.pos, "expected fn, enum, struct or const, found {describe(t)}")
+    }
+}
+
+fn const_decl(p: *Parser) -> *ast.Const ! diag.Error {
+    let pos = p.expect(Const)?.pos
+    let name = p.expect(Ident)?.text
+    var annotation: *ast.TypeName? = none
+    if p.accept(Colon) {
+        annotation = p.type_name()?
+    }
+    p.expect(Assign)?
+    let from = p.tok().start
+    let value = p.expr()?
+    new(ast.Const { name, pos, type_name: annotation, value, text: p.src[from..p.tokens[p.i - 1].end] })
+}
+
+fn extern_block(p: *Parser) -> *ast.Extern ! diag.Error {
+    let pos = p.expect(Extern)?.pos
+    let name = p.expect(String)?
+    if !valid_library(name.text) {
+        fail At(name.pos, "invalid library name {diag.quote(name.text)}")
+    }
+    let e = new(ast.Extern { library: name.text, pos })
+    p.lines(fn() ! diag.Error {
+        let func = p.extern_fn(e)?
+        push(mut e.funcs, func)
+    })?
+    e
+}
+
+fn extern_fn(p: *Parser, e: *ast.Extern) -> *ast.Func ! diag.Error {
+    let doc = p.doc()
+    let exported = p.accept(Pub)
+    let pos = p.expect(Fn)?.pos
+    let f = new(ast.Func { name: p.expect(Ident)?.text, doc, exported, external: e, pos })
+    p.list(fn() ! diag.Error {
+        if f.variadic {
+            fail At(p.tok().pos, "... must be the last parameter")
+        }
+        if p.accept(Ellipsis) {
+            f.variadic = true
+            return
+        }
+        let param = p.param()?
+        push(mut f.params, param)
+    })?
+    f.result = p.arrow_type()?
+    f.symbol = f.name
+    if p.accept(Assign) {
+        let symbol = p.expect(String)?
+        if !valid_symbol(symbol.text) {
+            fail At(symbol.pos, "invalid C symbol {diag.quote(symbol.text)}")
+        }
+        f.symbol = symbol.text
+    }
+    f
+}
+
+fn alphanumeric(c: u8) -> bool {
+    c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+fn valid_symbol(name: str) -> bool {
+    if name == "" || (name[0] >= '0' && name[0] <= '9') {
+        return false
+    }
+    for i in 0..name.len {
+        if !alphanumeric(name[i]) {
+            return false
+        }
+    }
+    true
+}
+
+fn valid_library(name: str) -> bool {
+    if name == "" || name[0] == '-' {
+        return false
+    }
+    for i in 0..name.len {
+        let c = name[i]
+        if !alphanumeric(c) && c != '.' && c != '+' && c != '-' {
+            return false
+        }
+    }
+    true
+}
+
+fn import_decl(p: *Parser) -> *ast.Import ! diag.Error {
+    let pos = p.expect(Import)?.pos
+    var first = p.expect(Ident)?.text
+    var alias = ""
+    if p.accept(Assign) {
+        alias = first
+        first = p.expect(Ident)?.text
+    }
+    var segments = [first]
+    for p.at(Slash) {
+        p.next()
+        push(mut segments, p.expect(Ident)?.text)
+    }
+    if alias == "" {
+        alias = segments[segments.len - 1]
+    }
+    new(ast.Import { alias, path: text.join(segments, "/"), pos })
+}
+
+fn enum_decl(p: *Parser) -> *ast.EnumDecl ! diag.Error {
+    let pos = p.expect(Enum)?.pos
+    let d = new(ast.EnumDecl { name: p.expect(Ident)?.text, pos })
+    d.type_params = p.type_params()?
+    p.members(fn() ! diag.Error {
+        let v = p.variant()?
+        push(mut d.variants, v)
+    })?
+    d
+}
+
+fn variant(p: *Parser) -> *ast.VariantDecl ! diag.Error {
+    let doc = p.doc()
+    let name = p.expect(Ident)?
+    let v = new(ast.VariantDecl { name: name.text, doc, pos: name.pos })
+    if p.at(LParen) {
+        p.list(fn() ! diag.Error {
+            var label = ""
+            if p.peek() == Colon {
+                label = p.expect(Ident)?.text
+                p.expect(Colon)?
+            }
+            push(mut v.labels, label)
+            let field = p.type_name()?
+            push(mut v.fields, field)
+        })?
+    }
+    if p.accept(Assign) {
+        v.index = p.variant_index()?
+    }
+    v
+}
+
+fn variant_index(p: *Parser) -> *ast.IntLit ! diag.Error {
+    let pos = p.tok().pos
+    let negative = p.accept(Minus)
+    let digits = p.expect(Int)?
+    p.integer(digits, negative, pos)?
+}
+
+fn struct_decl(p: *Parser) -> *ast.StructDecl ! diag.Error {
+    let pos = p.expect(Struct)?.pos
+    let d = new(ast.StructDecl { name: p.expect(Ident)?.text, pos })
+    d.type_params = p.type_params()?
+    p.members(fn() ! diag.Error {
+        let t = p.tok()
+        if t.kind == Drop {
+            p.next()
+            if d.on_drop != none {
+                fail At(t.pos, "struct {d.name} already has a drop")
+            }
+            d.on_drop = p.stmt()?
+            return
+        }
+        let doc = p.doc()
+        let exported = p.accept(Pub)
+        let name = p.expect(Ident)?
+        p.expect(Colon)?
+        let field = new(ast.FieldDecl { name: name.text, doc, exported, type_name: p.type_name()?, pos: name.pos })
+        if p.accept(Assign) {
+            field.default = p.expr()?
+        }
+        push(mut d.fields, field)
+    })?
+    d
+}
+
+fn trailing(p: *Parser) -> *ast.SliceLit? ! diag.Error {
+    if !p.at(LBrace) || p.no_struct {
+        return none
+    }
+    let lit = new(ast.SliceLit { pos: p.next().pos })
+    p.sequence(RBrace, true, fn() ! diag.Error {
+        let elem = p.expr()?
+        push(mut lit.elems, elem)
+    })?
+    lit
+}
+
+fn func(p: *Parser) -> *ast.Func ! diag.Error {
+    let pos = p.expect(Fn)?.pos
+    let f = new(ast.Func { name: p.expect(Ident)?.text, pos })
+    f.type_params = p.type_params()?
+    p.list(fn() ! diag.Error {
+        let param = p.param()?
+        push(mut f.params, param)
+    })?
+    let tail = p.signature_tail()?
+    f.result = tail.result
+    f.error = tail.failure
+    f.body = p.block()?
+    f
+}
+
+fn type_params(p: *Parser) -> []*ast.TypeParam ! diag.Error {
+    var params: []*ast.TypeParam = []
+    if !p.at(LBracket) {
+        return params
+    }
+    p.brackets(fn() ! diag.Error {
+        let name = p.expect(Ident)?
+        let param = new(ast.TypeParam { name: name.text, pos: name.pos })
+        if p.accept(Colon) {
+            push(mut param.constraints, p.expect(Ident)?.text)
+            for p.at(Plus) {
+                p.next()
+                push(mut param.constraints, p.expect(Ident)?.text)
+            }
+        }
+        push(mut params, param)
+    })?
+    if params.len == 0 {
+        fail At(p.tok().pos, "expected type parameters")
+    }
+    params
+}
+
+fn type_args(p: *Parser) -> []*ast.TypeName ! diag.Error {
+    var args: []*ast.TypeName = []
+    p.brackets(fn() ! diag.Error {
+        let arg = p.type_name()?
+        push(mut args, arg)
+    })?
+    if args.len == 0 {
+        fail At(p.tok().pos, "expected type arguments")
+    }
+    args
+}
+
+fn attempt(p: *Parser, parse: fn() ! diag.Error) -> bool {
+    let start = p.i
+    let no_struct = p.no_struct
+    var found = true
+    parse() catch {
+        e => {
+            found = false
+        }
+    }
+    if !found {
+        p.i = start
+        p.no_struct = no_struct
+    }
+    found
+}
+
+fn generic_lit(p: *Parser, name: lexer.Token) -> *ast.StructLit? ! diag.Error {
+    if !p.at(LBracket) || p.no_struct {
+        return none
+    }
+    var args: []*ast.TypeName = []
+    let found = p.attempt(fn() ! diag.Error {
+        args = p.type_args()?
+        if !p.at(LBrace) {
+            fail At(p.tok().pos, "expected {{")
+        }
+    })
+    if !found {
+        return none
+    }
+    let lit = p.struct_lit(name)?
+    lit.type_args = args
+    lit
+}
+
+fn literal(p: *Parser, name: lexer.Token, module: str) -> *ast.StructLit? ! diag.Error {
+    var lit = p.generic_lit(name)?
+    if lit == none && p.at(LBrace) && !p.no_struct {
+        lit = p.struct_lit(name)?
+    }
+    match lit {
+        some(l) => {
+            l.module = module
+        }
+        none => {}
+    }
+    lit
+}
+
+fn instance(p: *Parser, x: ast.Expr) -> *ast.Instance? ! diag.Error {
+    let start = p.i
+    let pos = p.tok().pos
+    var args: []*ast.TypeName = []
+    let found = p.attempt(fn() ! diag.Error {
+        args = p.type_args()?
+        if !p.at(LParen) {
+            fail At(p.tok().pos, "expected (")
+        }
+    })
+    if !found {
+        return none
+    }
+    let end = p.i
+    p.i = start
+    var fallback: ast.Expr? = none
+    let indexed = p.attempt(fn() ! diag.Error {
+        fallback = p.index(x)?
+        if p.i != end {
+            fail At(p.tok().pos, "expected (")
+        }
+    })
+    if !indexed {
+        fallback = none
+    }
+    p.i = end
+    new(ast.Instance { x, types: args, fallback, pos })
+}
+
+fn param(p: *Parser) -> *ast.Param ! diag.Error {
+    let mutable = p.accept(Mut)
+    let name = p.expect(Ident)?
+    p.expect(Colon)?
+    new(ast.Param { name: name.text, mutable, type_name: p.type_name()?, pos: name.pos })
+}
+
+fn func_type(p: *Parser, pos: diag.Pos, c: bool) -> *ast.TypeName ! diag.Error {
+    p.expect(Fn)?
+    let t = new(ast.TypeName { is_func: true, is_c_func: c, pos })
+    p.list(fn() ! diag.Error {
+        let mutable = p.accept(Mut)
+        push(mut t.muts, mutable)
+        let param = p.type_name()?
+        push(mut t.params, param)
+    })?
+    let tail = p.signature_tail()?
+    t.result = tail.result
+    t.error = tail.failure
+    t
+}
+
+fn closure(p: *Parser) -> *ast.Closure ! diag.Error {
+    let start = p.expect(Fn)?.pos
+    var params: []*ast.Param = []
+    p.list(fn() ! diag.Error {
+        let mutable = p.accept(Mut)
+        let name = p.expect(Ident)?
+        let param = new(ast.Param { name: name.text, mutable, pos: name.pos })
+        if p.accept(Colon) {
+            param.type_name = p.type_name()?
+        }
+        push(mut params, param)
+    })?
+    let tail = p.signature_tail()?
+    if p.at(LBrace) || tail.result != none || tail.failure != none {
+        return new(ast.Closure { pos: start, params, result: tail.result, error: tail.failure, body: p.block()? })
+    }
+    let pos = p.tok().pos
+    let body = new(ast.Block { tail: p.expr()?, pos })
+    new(ast.Closure { pos: start, params, body, inline: true })
+}
+
+fn type_name(p: *Parser) -> *ast.TypeName ! diag.Error {
+    var t = p.type_term()?
+    for p.at(Question) {
+        p.next()
+        t = new(ast.TypeName { is_optional: true, elem: t, pos: t.pos })
+    }
+    t
+}
+
+fn type_term(p: *Parser) -> *ast.TypeName ! diag.Error {
+    let pos = p.tok().pos
+    if p.at(Fn) {
+        return p.func_type(pos, false)?
+    }
+    if p.at(Extern) && p.peek() == Fn {
+        p.next()
+        return p.func_type(pos, true)?
+    }
+    if p.at(Star) {
+        p.next()
+        return new(ast.TypeName { is_pointer: true, elem: p.type_term()?, pos })
+    }
+    if p.at(LBracket) {
+        p.next()
+        if p.accept(RBracket) {
+            return new(ast.TypeName { is_slice: true, elem: p.type_term()?, pos })
+        }
+        let key = p.type_name()?
+        p.expect(Colon)?
+        let value = p.type_name()?
+        p.expect(RBracket)?
+        return new(ast.TypeName { is_map: true, key, elem: value, pos })
+    }
+    let t = new(ast.TypeName { name: p.expect(Ident)?.text, pos })
+    if p.accept(Dot) {
+        t.module = t.name
+        t.name = p.expect(Ident)?.text
+    }
+    if p.at(LBracket) {
+        t.args = p.type_args()?
+    }
+    t
+}
+
+fn block(p: *Parser) -> *ast.Block ! diag.Error {
+    let b = new(ast.Block { pos: p.tok().pos })
+    p.lines(fn() ! diag.Error {
+        let s = p.stmt()?
+        push(mut b.stmts, s)
+    })?
+    let n = b.stmts.len
+    if n > 0 {
+        match b.stmts[n - 1] {
+            ExprStmt(es) => {
+                b.tail = es.x
+                b.stmts = b.stmts[..n - 1]
+            }
+            _ => {}
+        }
+    }
+    b
+}
+
+fn stmt(p: *Parser) -> ast.Stmt ! diag.Error {
+    let t = p.tok()
+    match t.kind {
+        Let => return Let(p.let_stmt()?)
+        Var => return Let(p.let_stmt()?)
+        Const => fail At(t.pos, "const declares a module constant; use let inside a function")
+        Using => {
+            p.next()
+            let mutable = p.at(Var)
+            if mutable {
+                p.next()
+            }
+            if p.at(LBrace) {
+                fail At(p.tok().pos, "using binds one name")
+            }
+            let s = p.binding(t.pos, mutable)?
+            s.is_using = true
+            return Let(s)
+        }
+        For => return p.loop("")?
+        Break => {
+            p.next()
+            return Break(new(ast.Break { label: p.label(), pos: t.pos }))
+        }
+        Continue => {
+            p.next()
+            return Continue(new(ast.Continue { label: p.label(), pos: t.pos }))
+        }
+        Ident => {
+            if p.peek() == Colon {
+                return p.labelled(t)?
+            }
+        }
+        Return => {
+            p.next()
+            var value: ast.Expr? = none
+            if !p.at_end() {
+                value = p.expr()?
+            }
+            return Return(new(ast.Return { value, pos: t.pos }))
+        }
+        Fail => {
+            p.next()
+            return Fail(new(ast.Fail { value: p.expr()?, pos: t.pos }))
+        }
+        Defer => {
+            p.next()
+            return Defer(new(ast.Defer { body: p.stmt()?, pos: t.pos }))
+        }
+        Spawn => {
+            p.next()
+            match p.expr()? {
+                Call(call) => return Spawn(new(ast.Spawn { call, pos: t.pos }))
+                _ => fail At(t.pos, "spawn needs a function call")
+            }
+        }
+        _ => {}
+    }
+    let x = p.expr()?
+    if p.accept(LArrow) {
+        return Send(new(ast.Send { chan: x, value: p.expr()?, pos: t.pos }))
+    }
+    let op = p.tok().kind
+    if lexer.assignment(op) {
+        p.next()
+        return Assign(new(ast.Assign { target: x, op, value: p.expr()?, pos: t.pos }))
+    }
+    ExprStmt(new(ast.ExprStmt { x }))
+}
+
+fn loop(p: *Parser, label: str) -> ast.Stmt ! diag.Error {
+    let pos = p.expect(For)?.pos
+    if p.destructuring_loop() {
+        return ForIn(p.for_in(label, pos)?)
+    }
+    var cond: ast.Expr? = none
+    if !p.at(LBrace) {
+        cond = p.condition()?
+    }
+    For(new(ast.For { label, cond, body: p.block()?, pos }))
+}
+
+fn labelled(p: *Parser, name: lexer.Token) -> ast.Stmt ! diag.Error {
+    p.next()
+    p.next()
+    if !p.at(For) {
+        fail At(name.pos, "label {name.text} must be followed by a for loop")
+    }
+    p.loop(name.text)?
+}
+
+fn label(p: *Parser) -> str {
+    if !p.at(Ident) {
+        return ""
+    }
+    p.next().text
+}
+
+fn destructuring_loop(p: *Parser) -> bool {
+    match p.tok().kind {
+        Ident => p.peek() == In || p.peek() == Comma
+        LBrace => p.closing_brace_followed_by(In)
+        _ => false
+    }
+}
+
+fn closing_brace_followed_by(p: *Parser, k: lexer.Kind) -> bool {
+    var depth = 0
+    for i in p.i..p.tokens.len - 1 {
+        let kind = p.tokens[i].kind
+        if kind == LBrace {
+            depth += 1
+        } else if kind == RBrace {
+            depth -= 1
+            if depth == 0 {
+                return p.tokens[i + 1].kind == k
+            }
+        }
+    }
+    false
+}
+
+struct LoopValue {
+    value: str = ""
+    pattern: *ast.StructPattern? = none
+}
+
+fn loop_value(p: *Parser) -> LoopValue ! diag.Error {
+    if p.at(LBrace) {
+        return LoopValue { pattern: p.struct_pattern()? }
+    }
+    LoopValue { value: p.expect(Ident)?.text }
+}
+
+fn for_in(p: *Parser, label: str, pos: diag.Pos) -> *ast.ForIn ! diag.Error {
+    var bound = p.loop_value()?
+    var key = ""
+    if bound.pattern == none && p.accept(Comma) {
+        key = bound.value
+        bound = p.loop_value()?
+    }
+    p.expect(In)?
+    let iter = p.condition()?
+    var end: ast.Expr? = none
+    if p.accept(DotDot) {
+        end = p.condition()?
+    }
+    new(ast.ForIn { label, key, value: bound.value, pattern: bound.pattern, iter, end, body: p.block()?, pos })
+}
+
+fn let_stmt(p: *Parser) -> *ast.Let ! diag.Error {
+    let t = p.next()
+    p.binding(t.pos, t.kind == Var)?
+}
+
+fn struct_pattern(p: *Parser) -> *ast.StructPattern ! diag.Error {
+    let open = p.expect(LBrace)?
+    let pattern = new(ast.StructPattern { pos: open.pos })
+    p.sequence(RBrace, true, fn() ! diag.Error {
+        let field = p.field_pattern()?
+        push(mut pattern.fields, field)
+    })?
+    if pattern.fields.len == 0 {
+        fail At(open.pos, "a destructuring pattern needs at least one field")
+    }
+    pattern
+}
+
+fn field_pattern(p: *Parser) -> *ast.FieldPattern ! diag.Error {
+    let name = p.expect(Ident)?
+    let field = new(ast.FieldPattern { name: name.text, pos: name.pos })
+    if !p.accept(Colon) {
+        field.shorthand = true
+        field.bind = new(ast.Binding { name: name.text, pos: name.pos })
+        return field
+    }
+    if p.at(LBrace) {
+        field.nested = p.struct_pattern()?
+        return field
+    }
+    let bound = p.expect(Ident)?
+    field.bind = new(ast.Binding { name: bound.text, pos: bound.pos })
+    field
+}
+
+fn destructure(p: *Parser, pos: diag.Pos, mutable: bool) -> *ast.Let ! diag.Error {
+    let pattern = p.struct_pattern()?
+    if p.at(Colon) {
+        fail At(p.tok().pos, "a destructuring pattern takes no type annotation")
+    }
+    p.expect(Assign)?
+    new(ast.Let { pattern, mutable, value: p.expr()?, pos })
+}
+
+fn binding(p: *Parser, pos: diag.Pos, mutable: bool) -> *ast.Let ! diag.Error {
+    if p.at(LBrace) {
+        return p.destructure(pos, mutable)?
+    }
+    let name = p.expect(Ident)?.text
+    var annotation: *ast.TypeName? = none
+    if p.accept(Colon) {
+        annotation = p.type_name()?
+    }
+    p.expect(Assign)?
+    new(ast.Let { name, mutable, type_name: annotation, value: p.expr()?, pos })
+}
+
+fn precedence(k: lexer.Kind) -> i64 {
+    match k {
+        PipeArrow => 1
+        OrOr => 2
+        AndAnd => 3
+        Eq => 4
+        NotEq => 4
+        Lt => 4
+        LtEq => 4
+        Gt => 4
+        GtEq => 4
+        Coalesce => 5
+        Plus => 6
+        Minus => 6
+        Pipe => 6
+        Caret => 6
+        Star => 7
+        Slash => 7
+        Percent => 7
+        Amp => 7
+        Shl => 7
+        Shr => 7
+        _ => 0
+    }
+}
+
+fn expr(p: *Parser) -> ast.Expr ! diag.Error {
+    p.binary(1, false)?
+}
+
+fn binary(p: *Parser, min_prec: i64, testing: bool) -> ast.Expr ! diag.Error {
+    let x = p.unary(testing)?
+    p.binary_from(x, min_prec, testing)?
+}
+
+fn binary_from(p: *Parser, first: ast.Expr, min_prec: i64, testing: bool) -> ast.Expr ! diag.Error {
+    var x = first
+    for {
+        let op = p.tok()
+        let prec = precedence(op.kind)
+        if prec == 0 || prec < min_prec {
+            return x
+        }
+        p.next()
+        let following = if op.kind == Coalesce { prec } else { prec + 1 }
+        let y = p.binary(following, testing)?
+        if op.kind == PipeArrow {
+            x = p.pipe(x, y, op.pos)?
+            continue
+        }
+        x = Binary(new(ast.Binary { op: op.kind, x, y, pos: op.pos }))
+    }
+    x
+}
+
+fn pipe(p: *Parser, x: ast.Expr, y: ast.Expr, pos: diag.Pos) -> ast.Expr ! diag.Error {
+    match y {
+        Try(n) => {
+            n.x = p.pipe(x, n.x, pos)?
+        }
+        Catch(n) => {
+            n.x = p.pipe(x, n.x, pos)?
+        }
+        Or(n) => {
+            n.x = p.pipe(x, n.x, pos)?
+        }
+        Call(n) => {
+            var args = [x]
+            for arg in n.args {
+                push(mut args, arg)
+            }
+            n.args = args
+            n.prepended = true
+        }
+        Ident(n) => return Call(new(ast.Call { callee: y, args: [x], pos, prepended: true }))
+        Selector(n) => return Call(new(ast.Call { callee: y, args: [x], pos, prepended: true }))
+        Instance(n) => return Call(new(ast.Call { callee: y, args: [x], pos, prepended: true }))
+        Closure(n) => return Call(new(ast.Call { callee: y, args: [x], pos, prepended: true }))
+        _ => fail At(ast.position(y), "the right side of |> must be a function or a call")
+    }
+    y
+}
+
+fn unary(p: *Parser, testing: bool) -> ast.Expr ! diag.Error {
+    let t = p.tok()
+    if testing && precedence(t.kind) > 0 && t.kind != Minus && t.kind != Star {
+        return p.binary_from(Subject(new(ast.Subject { pos: t.pos })), precedence(Eq), testing)?
+    }
+    match t.kind {
+        Minus => {
+            p.next()
+            let lit = p.tok()
+            if lit.kind == Int || lit.kind == Float {
+                p.next()
+                return p.postfix(p.number(lit, true, t.pos)?)?
+            }
+            return Unary(new(ast.Unary { op: t.kind, x: p.unary(false)?, pos: t.pos }))
+        }
+        Not => {
+            p.next()
+            return Unary(new(ast.Unary { op: t.kind, x: p.unary(false)?, pos: t.pos }))
+        }
+        Star => {
+            p.next()
+            return Unary(new(ast.Unary { op: t.kind, x: p.unary(false)?, pos: t.pos }))
+        }
+        Tilde => {
+            p.next()
+            return Unary(new(ast.Unary { op: t.kind, x: p.unary(false)?, pos: t.pos }))
+        }
+        LArrow => {
+            p.next()
+            return Unary(new(ast.Unary { op: t.kind, x: p.unary(false)?, pos: t.pos }))
+        }
+        _ => {}
+    }
+    p.postfix(p.primary()?)?
+}
+
+fn select_expr(p: *Parser) -> *ast.Select ! diag.Error {
+    let s = new(ast.Select { pos: p.expect(Select)?.pos })
+    p.lines(fn() ! diag.Error {
+        let c = p.select_case()?
+        push(mut s.cases, c)
+    })?
+    s
+}
+
+fn select_case(p: *Parser) -> *ast.SelectCase ! diag.Error {
+    let t = p.tok()
+    var kind = ast.SelectKind.RecvCase
+    var chan: ast.Expr? = none
+    var value: ast.Expr? = none
+    var name = ""
+    if p.at(Else) {
+        p.next()
+        kind = ElseCase
+    } else if p.at(Ident) && t.text == lexer.after && p.peek() == LParen {
+        p.next()
+        p.list(fn() ! diag.Error {
+            value = p.expr()?
+        })?
+        kind = AfterCase
+    } else if p.at(Ident) && p.peek() == Assign {
+        name = p.next().text
+        p.next()
+        p.expect(LArrow)?
+        chan = p.expr()?
+    } else if p.at(LArrow) {
+        p.next()
+        chan = p.expr()?
+    } else {
+        chan = p.expr()?
+        p.expect(LArrow)?
+        value = p.expr()?
+        kind = SendCase
+    }
+    p.expect(FatArrow)?
+    new(ast.SelectCase { kind, chan, value, name, body: p.expr()?, pos: t.pos })
+}
+
+fn integer_base(digits: str) -> i64 {
+    if digits.len > 1 && digits[0] == '0' {
+        match digits[1] {
+            'x' => 16
+            'b' => 2
+            'o' => 8
+            _ => 0
+        }
+    } else {
+        10
+    }
+}
+
+fn integer(p: *Parser, t: lexer.Token, negative: bool, pos: diag.Pos) -> *ast.IntLit ! diag.Error {
+    let base = integer_base(t.text)
+    let digits = if base == 16 || base == 2 || base == 8 { t.text[2..] } else if base == 0 { t.text[1..] } else { t.text }
+    let u = text.parse_u64(digits, if base == 0 { 8 } else { base }) or fail At(t.pos, "integer {t.text} out of range")
+    if negative && u > 0x8000000000000000 {
+        fail At(t.pos, "integer {t.text} out of range")
+    }
+    var v = i64(u)
+    if negative {
+        v = -v
+    }
+    new(ast.IntLit { value: v, wide: !negative && u > 0x7FFFFFFFFFFFFFFF, pos })
+}
+
+fn number(p: *Parser, t: lexer.Token, negative: bool, pos: diag.Pos) -> ast.Expr ! diag.Error {
+    if t.kind == Float {
+        var v = text.parse_float(t.text) or fail At(t.pos, "invalid float literal {t.text}")
+        if math.is_inf(v) {
+            fail At(t.pos, "invalid float literal {t.text}")
+        }
+        if negative {
+            v = -v
+        }
+        return FloatLit(new(ast.FloatLit { value: v, pos }))
+    }
+    IntLit(p.integer(t, negative, pos)?)
+}
+
+fn primary(p: *Parser) -> ast.Expr ! diag.Error {
+    let t = p.tok()
+    match t.kind {
+        Break => Block(new(ast.Block { stmts: [p.stmt()?], pos: t.pos }))
+        Continue => Block(new(ast.Block { stmts: [p.stmt()?], pos: t.pos }))
+        Return => Block(new(ast.Block { stmts: [p.stmt()?], pos: t.pos }))
+        Fail => Block(new(ast.Block { stmts: [p.stmt()?], pos: t.pos }))
+        Int => {
+            p.next()
+            p.number(t, false, t.pos)?
+        }
+        Float => {
+            p.next()
+            p.number(t, false, t.pos)?
+        }
+        String => {
+            p.next()
+            if t.parts.len > 0 {
+                return Interp(p.interpolation(t)?)
+            }
+            StrLit(new(ast.StrLit { value: t.text, pos: t.pos }))
+        }
+        Char => {
+            p.next()
+            IntLit(new(ast.IntLit { value: i64(t.char), char: true, pos: t.pos }))
+        }
+        LBracket => p.slice_lit()?
+        True => {
+            p.next()
+            BoolLit(new(ast.BoolLit { value: true, pos: t.pos }))
+        }
+        False => {
+            p.next()
+            BoolLit(new(ast.BoolLit { value: false, pos: t.pos }))
+        }
+        Ident => {
+            p.next()
+            match p.literal(t, "")? {
+                some(lit) => StructLit(lit)
+                none => Ident(new(ast.Ident { name: t.text, pos: t.pos }))
+            }
+        }
+        LParen => {
+            p.next()
+            let saved = p.no_struct
+            p.no_struct = false
+            let x = p.expr()?
+            p.no_struct = saved
+            p.expect(RParen)?
+            x
+        }
+        If => If(p.if_expr()?)
+        LBrace => Block(p.block()?)
+        Fn => Closure(p.closure()?)
+        Select => Select(p.select_expr()?)
+        Match => {
+            p.next()
+            let x = p.condition()?
+            Match(new(ast.Match { x, arms: p.arms()?, pos: t.pos }))
+        }
+        _ => fail At(t.pos, "expected expression, found {describe(t)}")
+    }
+}
+
+fn interpolation(p: *Parser, t: lexer.Token) -> *ast.Interp ! diag.Error {
+    let n = new(ast.Interp { pos: t.pos })
+    for part in t.parts {
+        if !part.expr {
+            let lit = new(ast.StrLit { value: part.text, pos: t.pos })
+            push(mut n.parts, new(ast.InterpPart { x: StrLit(lit) }))
+            continue
+        }
+        let inner = new(Parser { tokens: part.tokens })
+        let x = inner.expr()?
+        inner.skip_newlines()
+        if !inner.at(EOF) {
+            fail At(inner.tok().pos, "unexpected {describe(inner.tok())} in interpolation")
+        }
+        push(mut n.parts, new(ast.InterpPart { x, spec: p.spec(part)? }))
+    }
+    n
+}
+
+fn spec(p: *Parser, part: lexer.Part) -> *ast.Spec? ! diag.Error {
+    if part.spec == "" {
+        return none
+    }
+    ast.parse_spec(part.spec, part.spec_pos)?
+}
+
+fn slice_lit(p: *Parser) -> ast.Expr ! diag.Error {
+    let pos = p.expect(LBracket)?.pos
+    if p.accept(Colon) {
+        p.expect(RBracket)?
+        return MapLit(new(ast.MapLit { pos }))
+    }
+    var keys: []ast.Expr = []
+    var values: []ast.Expr = []
+    var mapped = false
+    p.sequence(RBracket, true, fn() ! diag.Error {
+        let key = p.expr()?
+        push(mut keys, key)
+        if keys.len == 1 && p.at(Colon) {
+            mapped = true
+        }
+        if mapped {
+            p.expect(Colon)?
+            let value = p.expr()?
+            push(mut values, value)
+        }
+    })?
+    if mapped {
+        return MapLit(new(ast.MapLit { keys, values, pos }))
+    }
+    SliceLit(new(ast.SliceLit { elems: keys, pos }))
+}
+
+fn index(p: *Parser, x: ast.Expr) -> ast.Expr ! diag.Error {
+    let pos = p.expect(LBracket)?.pos
+    var lo: ast.Expr? = none
+    var hi: ast.Expr? = none
+    var sliced = false
+    let saved = p.no_struct
+    p.no_struct = false
+    if !p.at(DotDot) {
+        lo = p.expr()?
+    }
+    if p.accept(DotDot) {
+        sliced = true
+        if !p.at(RBracket) {
+            hi = p.expr()?
+        }
+    }
+    p.no_struct = saved
+    p.expect(RBracket)?
+    if sliced {
+        return Slicing(new(ast.Slicing { x, lo, hi, pos }))
+    }
+    let at = lo ?? fail At(pos, "missing index")
+    Index(new(ast.Index { x, index: at, pos }))
+}
+
+fn struct_lit(p: *Parser, name: lexer.Token) -> *ast.StructLit ! diag.Error {
+    let lit = new(ast.StructLit { name: name.text, pos: name.pos })
+    p.expect(LBrace)?
+    p.sequence(RBrace, true, fn() ! diag.Error {
+        let field = p.field_init()?
+        push(mut lit.fields, field)
+    })?
+    match p.trailing()? {
+        some(children) => {
+            push(mut lit.fields, new(ast.FieldInit { name: "children", value: SliceLit(children), pos: children.pos, form: FieldImplied }))
+        }
+        none => {}
+    }
+    lit
+}
+
+fn field_init(p: *Parser) -> *ast.FieldInit ! diag.Error {
+    let name = p.expect(Ident)?
+    if !p.at(Colon) {
+        let value = new(ast.Ident { name: name.text, pos: name.pos })
+        return new(ast.FieldInit { name: name.text, pos: name.pos, value: Ident(value), form: FieldShorthand })
+    }
+    p.next()
+    new(ast.FieldInit { name: name.text, pos: name.pos, value: p.expr()? })
+}
+
+fn postfix(p: *Parser, first: ast.Expr) -> ast.Expr ! diag.Error {
+    var x = first
+    for {
+        let t = p.tok()
+        match t.kind {
+            LParen => {
+                let call = new(ast.Call { callee: x, pos: ast.position(x) })
+                p.list(fn() ! diag.Error {
+                    let arg = p.arg()?
+                    push(mut call.args, arg)
+                })?
+                match p.trailing()? {
+                    some(children) => push(mut call.args, SliceLit(children))
+                    none => {}
+                }
+                x = Call(call)
+            }
+            Dot => {
+                p.next()
+                let name = p.expect(Ident)?
+                var lit: *ast.StructLit? = none
+                match x {
+                    Ident(module) => {
+                        lit = p.literal(name, module.name)?
+                    }
+                    _ => {}
+                }
+                match lit {
+                    some(l) => {
+                        x = StructLit(l)
+                    }
+                    none => {
+                        x = Selector(new(ast.Selector { x, name: name.text, pos: name.pos }))
+                    }
+                }
+            }
+            Question => {
+                p.next()
+                x = Try(new(ast.Try { x, pos: t.pos }))
+            }
+            LBracket => {
+                match p.instance(x)? {
+                    some(inst) => {
+                        x = Instance(inst)
+                    }
+                    none => {
+                        x = p.index(x)?
+                    }
+                }
+            }
+            Catch => {
+                p.next()
+                x = Catch(p.catch_expr(x, t.pos)?)
+            }
+            Or => {
+                p.next()
+                x = Or(new(ast.Or { x, fallback: p.unary(false)?, pos: t.pos }))
+            }
+            _ => return x
+        }
+    }
+    x
+}
+
+fn arg(p: *Parser) -> ast.Expr ! diag.Error {
+    if !p.at(Mut) {
+        return p.expr()?
+    }
+    let pos = p.next().pos
+    Ref(new(ast.Ref { x: p.expr()?, pos }))
+}
+
+fn catch_expr(p: *Parser, x: ast.Expr, pos: diag.Pos) -> *ast.Catch ! diag.Error {
+    let c = new(ast.Catch { x, pos })
+    if p.at(LBrace) {
+        c.arms = p.arms()?
+        return c
+    }
+    let m = p.unary(false)?
+    match m {
+        Ident(n) => {}
+        Selector(n) => {}
+        _ => fail At(ast.position(m), "catch takes {{ arms }} or a variant or function that maps the error; use or for a fallback")
+    }
+    let subject = new(ast.Subject { pos: ast.position(m) })
+    c.map = new(ast.Call { callee: m, args: [Subject(subject)], pos: ast.position(m) })
+    c
+}
+
+fn arms(p: *Parser) -> []*ast.Arm ! diag.Error {
+    var arms: []*ast.Arm = []
+    p.expect(LBrace)?
+    p.sequence(RBrace, true, fn() ! diag.Error {
+        let pattern = p.pattern()?
+        p.expect(FatArrow)?
+        push(mut arms, new(ast.Arm { pattern, body: p.expr()? }))
+    })?
+    arms
+}
+
+fn at_end(p: *Parser) -> bool {
+    match p.tok().kind {
+        Newline => true
+        RBrace => true
+        RParen => true
+        RBracket => true
+        Comma => true
+        _ => false
+    }
+}
+
+fn value_arm(p: *Parser) -> bool {
+    match p.tok().kind {
+        Int => true
+        Float => true
+        Char => true
+        String => true
+        True => true
+        False => true
+        LParen => true
+        Not => true
+        Tilde => true
+        Minus => p.peek() == Int || p.peek() == Float
+        Ident => p.peek() == Dot
+        _ => false
+    }
+}
+
+fn pattern(p: *Parser) -> *ast.Pattern ! diag.Error {
+    let t = p.tok()
+    if p.value_arm() {
+        let subject = new(ast.Subject { pos: t.pos })
+        let test = new(ast.Binary { op: Eq, x: Subject(subject), y: p.expr()?, pos: t.pos })
+        return new(ast.Pattern { test: Binary(test), pos: t.pos })
+    }
+    if precedence(t.kind) > 0 {
+        let test = p.binary_from(Subject(new(ast.Subject { pos: t.pos })), 0, true)?
+        return new(ast.Pattern { test, pos: t.pos })
+    }
+    let name = p.expect(Ident)?
+    let pat = new(ast.Pattern { name: name.text, pos: name.pos })
+    if !p.at(LParen) {
+        return pat
+    }
+    p.list(fn() ! diag.Error {
+        let b = p.expect(Ident)?
+        push(mut pat.bindings, new(ast.Binding { name: b.text, pos: b.pos }))
+    })?
+    pat
+}
+
+fn if_expr(p: *Parser) -> *ast.If ! diag.Error {
+    let pos = p.expect(If)?.pos
+    let cond = p.condition()?
+    let then = p.block()?
+    let n = new(ast.If { cond, then, pos })
+    if !p.at(Else) {
+        return n
+    }
+    p.next()
+    if p.at(If) {
+        n.otherwise = If(p.if_expr()?)
+        return n
+    }
+    n.otherwise = Block(p.block()?)
+    n
+}
