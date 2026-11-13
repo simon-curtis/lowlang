@@ -212,7 +212,7 @@ func (s *synth) serialize(t *types.Type) {
 func (s *synth) serializePointer(t *types.Type) {
 	message := lexer.Quote(fmt.Sprintf("serde: cycle through %s", t))
 	s.guardPointer(func() {
-		s.line("__panic(%s)", message)
+		s.line("panic(%s)", message)
 	}, "__serialize_into(w, mut path, *v)")
 }
 

@@ -61,7 +61,7 @@ func (g *generator) temp(prefix string) string {
 
 func (g *generator) interpreted(pattern string) {
 	g.line("fn %s() -> %s {", g.name, Result)
-	g.line("compile(%s) or __panic(%s)", lexer.Quote(pattern), lexer.Quote("regex: a generated pattern failed to compile"))
+	g.line("compile(%s) or panic(%s)", lexer.Quote(pattern), lexer.Quote("regex: a generated pattern failed to compile"))
 	g.line("}")
 }
 

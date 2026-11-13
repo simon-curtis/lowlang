@@ -117,6 +117,7 @@ func newBuiltins() []*Builtin {
 	list := []*Builtin{
 		{ID: builtin.Print, Name: "print", Params: []string{"value"}, handler: bare((*Checker).print)},
 		{ID: builtin.New, Name: "new", Params: []string{"value"}, handler: wanted((*Checker).allocate)},
+		{ID: builtin.Panic, Name: "panic", Params: []string{"message"}, handler: bare((*Checker).panicCall)},
 		{ID: builtin.Push, Name: "push", Receivers: []types.Kind{types.SliceKind}, Params: []string{"mut xs", "value"}, handler: named((*Checker).push)},
 		{ID: builtin.Pop, Name: "pop", Shadowable: true, Receivers: []types.Kind{types.SliceKind}, Params: []string{"mut xs"}, handler: named((*Checker).pop)},
 		{ID: builtin.Truncate, Name: "truncate", Shadowable: true, Receivers: []types.Kind{types.SliceKind}, Params: []string{"mut xs", "n"}, handler: named((*Checker).truncate)},
@@ -182,7 +183,6 @@ func privateBuiltins() []*Builtin {
 		{ID: builtin.Lock, Name: "__lock", Params: []string{"mut word"}, handler: bare((*Checker).lockCall)},
 		{ID: builtin.Unlock, Name: "__unlock", Params: []string{"mut word"}, handler: bare((*Checker).lockCall)},
 		{ID: builtin.Cas, Name: "__cas", Params: []string{"mut word", "old", "new"}, handler: bare((*Checker).casCall)},
-		{ID: builtin.Panic, Name: "__panic", Params: []string{"message"}, handler: bare((*Checker).panicCall)},
 		{ID: builtin.Context, Name: "__context", handler: wanted((*Checker).contextCall)},
 		{ID: builtin.SetContext, Name: "__set_context", Params: []string{"p"}, handler: bare((*Checker).setContextCall)},
 		{ID: builtin.HasContext, Name: "__has_context", handler: bare((*Checker).hasContextCall)},

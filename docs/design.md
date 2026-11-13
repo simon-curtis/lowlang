@@ -687,7 +687,7 @@ fn main() ! ParseError {
 - Where an optional `T?` is expected, `or` and `catch { arms }` produce one, so the fallback or an arm may be `none`.
 - `fn f() ! E` fails or returns nothing.
 - A result cannot be discarded, bound or passed on without `?`, `catch` or `or`, except by returning it from a function with the same result type.
-- When `main` declares `! E` and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2.
+- When `main` declares `! E` and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2, as does `panic(message)`.
 - A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
 
 ### Embedded data
@@ -1101,6 +1101,10 @@ Every module sees these names without an import. A function in the program named
 ### `new`
 
 `new(value: T) -> *T` copies a value onto the garbage-collected heap and returns a pointer to it. A droppable value cannot go on the heap.
+
+### `panic`
+
+`panic(message: str)` writes `panic: ` and the message to standard error and exits with status 2. It never returns, so it can stand wherever a value is expected.
 
 ### `pin`
 
