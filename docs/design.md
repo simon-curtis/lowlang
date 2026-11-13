@@ -445,6 +445,7 @@ let page = Div { padding: 8.0 } {
 }
 ```
 
+- A declaration's fields are separated by commas or newlines.
 - Literals name their fields, separated by commas or newlines; `x` alone means `x: x`. A field declared with `= expr` may be left out; every other field must be given.
 - A default is any expression. It is checked once against the field's type, in the declaring module's scope, with no access to locals or other fields. It is evaluated at every literal that leaves the field out, after the written fields. A field with a default can be left out of a literal in another module even when it is private.
 - A brace block on the same line after a struct literal holds its children: the entries, one per line or separated by commas, become a slice literal for the struct's `children` field.
@@ -551,6 +552,23 @@ fn classify(n: i64) -> str {
 - Patterns bind fields by position; `_` ignores a field, and a bare variant name ignores all of them.
 - An arm body is an expression, or `break`, `continue`, `return` or `fail`.
 - Variants are constructed as `Shape.Circle(2)`. Where the expected type is known (an annotated `let`, an argument, an assignment, a return, `fail`), the bare name works: `let s: Shape = Empty`.
+- Variants are separated by commas or newlines.
+
+```low
+enum Colour {
+    Black = 0,
+    Red = 1,
+    Indexed(n: u8) = -1,
+    Rgb(r: u8, g: u8, b: u8) = -1,
+}
+
+let index = Colour.Red.index
+```
+
+- `= n` after a variant gives it an index: an integer literal, with an optional leading `-`, that fits in an `i64`. When one variant has an index, every variant must have one. Variants may share an index.
+- `e.index` is the `i64` index of the variant `e` holds. It is an error on an enum whose variants have no indexes, an optional included.
+- The index is a value the variant carries, not its tag: layout, `==` and `match` are the same with or without indexes.
+- `e.index` compiles to the tag plus a constant when every variant's index is its tag plus that constant. Otherwise it is a switch on the tag, as for a `match`, whose default is the index shared by the most variants.
 - Code generation for a `match` depends on its arms. It applies when the arms before the last are all distinct variants of one enum, or all distinct integer or character literals of one type:
   - With at least 12 such arms whose values span at most 4096 and at most three times the arm count, it compiles to a `switch` block: the backend emits a bounds check and an indirect jump through a table of 32-bit offsets.
   - Without that density, 48 or more arms compile to a binary search over the values.
@@ -1053,6 +1071,10 @@ Every module sees these names without an import. A function in the program named
 ### `floor`
 
 `floor(x: f64) -> f64` rounds `x` down to a whole number. It takes and returns `f32` too.
+
+### `index`
+
+`e.index` is an `i64`: the index declared with `= n` on the variant an enum value holds. The enum's variants must have indexes; see `### Enums`.
 
 ### `len`
 

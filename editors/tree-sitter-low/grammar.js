@@ -134,7 +134,7 @@ module.exports = grammar({
       field('body', $.field_declaration_list),
     ),
 
-    field_declaration_list: $ => seq('{', lines($, choice($.field_declaration, $.drop_declaration)), '}'),
+    field_declaration_list: $ => seq('{', separated($, choice($.field_declaration, $.drop_declaration)), '}'),
 
     field_declaration: $ => seq(
       optional($.visibility),
@@ -163,12 +163,15 @@ module.exports = grammar({
       field('value', $._expression),
     ),
 
-    variant_list: $ => seq('{', lines($, $.variant), '}'),
+    variant_list: $ => seq('{', separated($, $.variant), '}'),
 
     variant: $ => seq(
       field('name', $.identifier),
       optional(field('fields', $.variant_fields)),
+      optional(seq('=', field('index', $.variant_index))),
     ),
+
+    variant_index: $ => seq(optional('-'), $.integer),
 
     variant_fields: $ => seq('(', commaSep($.variant_field), ')'),
 

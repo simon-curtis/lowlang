@@ -169,7 +169,7 @@ func (c *cursor) fields(t *types.Type, path []string) {
 		c.add(f.Name, completionField, f.Type.String())
 	}
 	for _, b := range check.Builtins() {
-		if b.Kind == check.PropertyBuiltin && b.Receives(t.Kind) {
+		if b.Reads(t) {
 			c.add(b.Name, completionProperty, b.Type.String())
 		}
 	}

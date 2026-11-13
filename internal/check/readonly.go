@@ -1,6 +1,9 @@
 package check
 
-import "lowlang/internal/ast"
+import (
+	"lowlang/internal/ast"
+	"lowlang/internal/builtin"
+)
 
 type readScan struct {
 	skip   map[ast.Expr]bool
@@ -47,7 +50,7 @@ func (s *readScan) visit(n ast.Node) bool {
 			s.read(n.X)
 		}
 	case *ast.Selector:
-		if n.Length && !s.skip[n] {
+		if n.Property != builtin.None && !s.skip[n] {
 			s.read(n.X)
 		}
 	case *ast.ForIn:

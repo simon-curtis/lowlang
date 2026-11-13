@@ -91,10 +91,14 @@ func TypeParams(params []*TypeParam) string {
 }
 
 func (v *VariantDecl) String() string {
-	if len(v.Fields) == 0 {
-		return v.Name
+	head := v.Name
+	if len(v.Fields) > 0 {
+		head = fmt.Sprintf("%s(%s)", v.Name, TypeNames(v.Fields))
 	}
-	return fmt.Sprintf("%s(%s)", v.Name, TypeNames(v.Fields))
+	if v.Index == nil {
+		return head
+	}
+	return fmt.Sprintf("%s = %d", head, v.Index.Value)
 }
 
 func (p *Param) String() string {

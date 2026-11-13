@@ -42,6 +42,7 @@ type Type struct {
 	Bits       int
 	Signed     bool
 	Optional   bool
+	Indexed    bool
 	Module     string
 	Pub        bool
 	C          bool
@@ -68,6 +69,7 @@ func (f *Field) Word() int {
 type Variant struct {
 	Name    string
 	Tag     int
+	Index   int64
 	Fields  []*Type
 	Labels  []string
 	Offsets []int

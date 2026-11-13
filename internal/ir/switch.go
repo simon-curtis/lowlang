@@ -40,15 +40,7 @@ func switchOf(arms []*ast.Arm, targets []*Block) (*switchPlan, bool) {
 		plan.typ = typ
 		plan.cases = append(plan.cases, switchCase{key: key, target: targets[i]})
 	}
-	slices.SortFunc(plan.cases, func(a, b switchCase) int {
-		switch {
-		case a.key < b.key:
-			return -1
-		case a.key > b.key:
-			return 1
-		}
-		return 0
-	})
+	plan.sortByKey()
 	for i := 1; i < len(plan.cases); i++ {
 		if plan.cases[i].key == plan.cases[i-1].key {
 			return nil, false
@@ -58,6 +50,18 @@ func switchOf(arms []*ast.Arm, targets []*Block) (*switchPlan, bool) {
 		return nil, false
 	}
 	return plan, true
+}
+
+func (p *switchPlan) sortByKey() {
+	slices.SortFunc(p.cases, func(a, b switchCase) int {
+		switch {
+		case a.key < b.key:
+			return -1
+		case a.key > b.key:
+			return 1
+		}
+		return 0
+	})
 }
 
 func armKey(p *ast.Pattern) (int64, *types.Type, bool) {

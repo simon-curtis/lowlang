@@ -153,6 +153,7 @@ type VariantDecl struct {
 	Doc    string
 	Fields []*TypeName
 	Labels []string
+	Index  *IntLit
 	Pos    diag.Pos
 }
 
@@ -385,7 +386,7 @@ type Selector struct {
 	Variant   *types.Variant
 	Field     *types.Field
 	Reference *types.Field
-	Length    bool
+	Property  builtin.ID
 	Func      *Func
 	Const     *Const
 }

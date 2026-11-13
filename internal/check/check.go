@@ -356,6 +356,23 @@ func (c *Checker) declareVariants(d *ast.EnumDecl, t *types.Type) {
 		}
 		t.Variants = append(t.Variants, v)
 	}
+	c.declareIndexes(d, t)
+}
+
+func (c *Checker) declareIndexes(d *ast.EnumDecl, t *types.Type) {
+	t.Indexed = slices.ContainsFunc(d.Variants, func(vd *ast.VariantDecl) bool { return vd.Index != nil })
+	if !t.Indexed {
+		return
+	}
+	for i, vd := range d.Variants {
+		if vd.Index == nil {
+			c.fail(vd.Pos, "variant %s has no index; give every variant of %s an index or none", vd.Name, d.Name)
+		}
+		if vd.Index.Wide {
+			c.fail(vd.Index.Pos, "index of variant %s does not fit in i64", vd.Name)
+		}
+		t.Variants[i].Index = vd.Index.Value
+	}
 }
 
 func (c *Checker) declareFields(d *ast.StructDecl, st *types.Type) {
@@ -1331,8 +1348,11 @@ func (c *Checker) selector(e *ast.Selector, want *types.Type) {
 	}
 	t := c.plain(e.X, nil)
 	if b := LookupBuiltin(e.Name); b != nil && b.Kind == PropertyBuiltin && b.Receives(t.Kind) {
-		e.Length = true
-		e.Type = types.I64
+		if !b.Reads(t) {
+			c.fail(e.Pos, "%s declares no variant indexes", t)
+		}
+		e.Property = b.ID
+		e.Type = b.Type
 		return
 	}
 	if types.StructOf(t).Field(e.Name) == nil {

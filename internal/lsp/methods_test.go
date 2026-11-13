@@ -14,6 +14,15 @@ struct Op {
     apply: fn(i64) -> i64
 }
 
+enum Level {
+    Low = 1,
+    High = 2,
+}
+
+enum Mode {
+    On, Off,
+}
+
 fn scale(p: Point, by: i64) -> Point {
     Point { x: p.x * by, y: p.y * by }
 }
@@ -33,8 +42,11 @@ fn unrelated(n: i64) -> i64 {
 fn main() {
     let p = Point { x: 1, y: 2 }
     let pts = [p]
+    let level = Level.Low
+    let mode = Mode.On
     let op = Op { apply: fn(n: i64) -> i64 { n } }
-    print(p.norm() + op.apply(1) + pts.first().x)
+    print(p.norm() + op.apply(1) + pts.first().x + level.index)
+    print(mode == Mode.Off)
 }
 `
 
@@ -53,6 +65,8 @@ func TestMethodCompletion(t *testing.T) {
 		{"    pts.", []string{"len", "first", "push"}, []string{"norm", "x"}},
 		{"    p.scale(2).", []string{"x", "y", "norm"}, []string{"len"}},
 		{"    p.scale(2).norm().", nil, []string{"x", "norm"}},
+		{"    level.", []string{"index"}, []string{"len"}},
+		{"    mode.", nil, []string{"index"}},
 	}
 	for _, tc := range cases {
 		items := c.completeTyping(f, "let op = ", tc.typed)
