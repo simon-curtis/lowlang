@@ -1,0 +1,231 @@
+import ast
+import check
+import diag
+import lexer
+
+pub enum Side {
+    Plain
+    FieldSide
+    ValueSide
+}
+
+pub struct Reference {
+    pub location: Location
+    pub name: str
+    pub side: Side
+}
+
+pub struct Referenced {
+    pub declaration: Location
+    pub found: []Reference
+}
+
+struct Finder {
+    server: *Server
+    program: Program
+    want: Location
+    seen: [str: bool] = [:]
+    found: []Reference = []
+}
+
+pub fn same_position(a: Position, b: Position) -> bool {
+    a.line == b.line && a.character == b.character
+}
+
+pub fn same_location(a: Location, b: Location) -> bool {
+    a.uri == b.uri && same_position(a.range.start, b.range.start) && same_position(a.range.end, b.range.end)
+}
+
+fn location_key(l: Location) -> str {
+    "{l.uri}|{l.range.start.line}:{l.range.start.character}|{l.range.end.line}:{l.range.end.character}"
+}
+
+fn resolves(f: *Finder, q: *Query) -> bool {
+    let tg = referent_target(resolve(q)) ?? return false
+    same_location(server_locate(f.server, tg), f.want)
+}
+
+fn add_reference(f: *Finder, x: *Index, o: *Occurrence, side: Side) {
+    let loc = Location { uri: uri_of(x.file.path), range: word(x.text, o.pos) }
+    let key = location_key(loc)
+    if f.seen[key] != none {
+        return
+    }
+    f.seen[key] = true
+    let found = Reference { location: loc, name: o.name, side }
+    push(mut f.found, found)
+}
+
+fn shorthand_anchor(o: *Occurrence) -> Anchor? {
+    match o.anchor {
+        FieldInit(n) => {
+            if n.form != ast.FieldForm.FieldShorthand {
+                return none
+            }
+            match n.value {
+                Ident(i) => Anchor.Ident(i)
+                _ => Anchor.Other
+            }
+        }
+        FieldPattern(n) => {
+            if !n.shorthand {
+                return none
+            }
+            let bound = n.bind
+            match bound {
+                some(b) => Anchor.Binding(b)
+                none => Anchor.Other
+            }
+        }
+        _ => none
+    }
+}
+
+fn visit_occurrence(f: *Finder, x: *Index, o: *Occurrence) {
+    let q = new(Query { program: f.program, index: x, occ: o })
+    let shared = shorthand_anchor(o)
+    match shared {
+        none => {
+            if resolves(f, q) {
+                add_reference(f, x, o, Side.Plain)
+            }
+        }
+        some(anchor) => {
+            if resolves(f, q) {
+                add_reference(f, x, o, Side.FieldSide)
+                return
+            }
+            let value = new(Occurrence { pos: o.pos, name: o.name, anchor, local: o.local, parent: o.parent })
+            let value_query = new(Query { program: f.program, index: x, occ: value })
+            if resolves(f, value_query) {
+                add_reference(f, x, o, Side.ValueSide)
+            }
+        }
+    }
+}
+
+fn search(f: *Finder) -> []Reference {
+    for file in program_files(f.program) {
+        let t = server_text(f.server, file.path)
+        let x = new_index(file, t)
+        for o in x.occurrences {
+            visit_occurrence(f, x, o)
+        }
+    }
+    f.found
+}
+
+pub fn references_to(s: *Server, p: PositionParams) -> Referenced? {
+    let q = server_query(s, p) ?? return none
+    let tg = referent_target(resolve(q)) ?? return none
+    let want = server_locate(s, tg)
+    let f = new(Finder { server: s, program: q.program, want })
+    let refs = search(f)
+    Referenced { declaration: want, found: refs }
+}
+
+pub fn references(s: *Server, p: ReferenceParams) -> str {
+    let at = PositionParams { uri: p.uri, position: p.position }
+    let referenced = references_to(s, at) ?? return "null"
+    var locations: []Location = []
+    for r in referenced.found {
+        if same_location(r.location, referenced.declaration) && !p.include_declaration {
+            continue
+        }
+        push(mut locations, r.location)
+    }
+    encode_locations(locations)
+}
+
+pub fn name_error(tables: *Tables, name: str) -> str? {
+    let declared = declaration_name_error(tables, name)
+    if declared != none {
+        return declared
+    }
+    let tokens = lexer.lex(name, diag.start(""), false) catch {
+        At(_, msg) => return msg
+    }
+    if tokens.len != 3 || tokens[0].kind != lexer.Kind.Ident || tokens[0].text != name {
+        return "{diag.quote(name)} is not a valid name"
+    }
+    none
+}
+
+fn declaration_name_error(tables: *Tables, name: str) -> str? {
+    if lexer.is_keyword(name) {
+        return "{diag.quote(name)} is a keyword"
+    }
+    let b = tables.index[name] ?? return none
+    if b.kind == check.BuiltinKind.TypeBuiltin {
+        return "{diag.quote(name)} is a builtin type"
+    }
+    if !b.shadowable {
+        return "{diag.quote(name)} is a builtin"
+    }
+    none
+}
+
+fn rename_error(s: *Server, p: RenameParams) -> str? {
+    let invalid = name_error(s.tables, p.new_name)
+    if invalid != none {
+        return invalid
+    }
+    let state = state_of(s, path_of(p.uri))
+    if !state.fresh {
+        return "rename needs the program to compile; fix the errors or wait for the check to finish"
+    }
+    none
+}
+
+pub fn rename(s: *Server, p: RenameParams) -> str ! Refusal {
+    let refused = rename_error(s, p)
+    match refused {
+        some(msg) => fail Refusal.Refused(msg)
+        none => {}
+    }
+    let at = PositionParams { uri: p.uri, position: p.position }
+    let referenced = references_to(s, at) ?? fail Refusal.Refused("nothing to rename here")
+    if !declares(s, referenced.declaration, referenced.found) {
+        fail Refusal.Refused("only names declared in this program can be renamed")
+    }
+    let edit = WorkspaceEdit {}
+    for r in referenced.found {
+        let item = TextEdit { range: r.location.range, new_text: rewrite(r, p.new_name) }
+        var held = edit.changes[r.location.uri] ?? []
+        push(mut held, item)
+        edit.changes[r.location.uri] = held
+    }
+    encode_edit(edit)
+}
+
+fn declares(s: *Server, declaration: Location, refs: []Reference) -> bool {
+    for r in refs {
+        if !same_location(r.location, declaration) {
+            continue
+        }
+        let t = server_text(s, path_of(declaration.uri))
+        let line = text_line(t, declaration.range.start.line)
+        let from = byte_col(t, declaration.range.start.line, declaration.range.start.character)
+        let to = byte_col(t, declaration.range.end.line, declaration.range.end.character)
+        return line[from..to] == r.name
+    }
+    false
+}
+
+fn rewrite(r: Reference, name: str) -> str {
+    match r.side {
+        FieldSide => "{name}: {r.name}"
+        ValueSide => "{r.name}: {name}"
+        Plain => name
+    }
+}
+
+pub enum Refusal {
+    Refused(msg: str)
+}
+
+pub fn refusal_message(e: Refusal) -> str {
+    match e {
+        Refused(msg) => msg
+    }
+}

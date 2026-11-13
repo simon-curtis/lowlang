@@ -1,0 +1,341 @@
+import ast
+import compiler
+import diag
+import types
+import std/builder
+import std/path
+import std/text
+
+const default_indent = "    "
+
+struct Owner {
+    name: str = ""
+    result: *ast.TypeName? = none
+    err: *ast.TypeName? = none
+    body: *ast.Block
+    inline: bool = false
+}
+
+fn owner_subject(o: Owner) -> str {
+    if o.name == "" {
+        return "the closure"
+    }
+    o.name
+}
+
+struct TrySite {
+    node: *ast.Try
+    owner: Owner
+}
+
+struct Collector {
+    sites: []TrySite = []
+}
+
+struct ActionContext {
+    uri: str
+    version: i64
+    snippets: bool
+    file: *ast.File
+    text: Text
+    site: TrySite
+    result: *types.Type?
+}
+
+struct Spelled {
+    name: str
+    edits: []TextEdit = []
+}
+
+pub fn code_actions(s: *Server, p: RangeParams) -> str {
+    var actions: []CodeAction = []
+    let file_path = path_of(p.uri)
+    let file = server_parsed(s, file_path) ?? return encode_actions(actions)
+    let t = server_text(s, file_path)
+    let start = p.range.start
+    let col = byte_col(t, start.line, start.character) + 1
+    let sites = try_sites(file)
+    let site = nearest_try(sites, start.line + 1, col) ?? return encode_actions(actions)
+    let result = unpropagated(s, file_path, site.node.pos)
+    let version = s.versions[file_path]
+    let a = ActionContext {
+        uri: p.uri,
+        version: version ?? 0,
+        snippets: s.snippet_edits && version != none,
+        file,
+        text: t,
+        site,
+        result,
+    }
+    let lifted = action_lift(a)
+    match lifted {
+        some(action) => push(mut actions, action)
+        none => {}
+    }
+    let caught = action_catch(a)
+    push(mut actions, caught)
+    let ignored = action_or(a)
+    push(mut actions, ignored)
+    encode_actions(actions)
+}
+
+fn unpropagated(s: *Server, file_path: str, pos: diag.Pos) -> *types.Type? {
+    let state = state_of(s, file_path)
+    let f = state.failure
+    if !f.present {
+        return none
+    }
+    if path.clean(f.site) != file_path || f.line != pos.line || f.col != pos.col {
+        return none
+    }
+    let docs = f.docs ?? return none
+    let compiled = compiler.overlay_read(docs, file_path) or return none
+    let current = compiler.overlay_read(s.docs, file_path) or return none
+    if compiled != current {
+        return none
+    }
+    f.result
+}
+
+fn try_sites(file: *ast.File) -> []TrySite {
+    let collector = new(Collector {})
+    for f in file.funcs {
+        let body = f.body ?? continue
+        collect_tries(collector, Owner { name: f.name, result: f.result, err: f.error, body })
+    }
+    collector.sites
+}
+
+fn collect_visit(collector: *Collector, o: Owner, n: ast.Node) -> bool {
+    match n {
+        Expr(e) => {
+            match e {
+                Try(node) => {
+                    let site = TrySite { node, owner: o }
+                    push(mut collector.sites, site)
+                }
+                Closure(c) => {
+                    collect_tries(collector, Owner { result: c.result, err: c.error, body: c.body, inline: c.inline })
+                    return false
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn collect_tries(collector: *Collector, o: Owner) {
+    ast.inspect(ast.Node.Expr(ast.Expr.Block(o.body)), fn(n: ast.Node) -> bool { collect_visit(collector, o, n) })
+}
+
+fn nearest_try(sites: []TrySite, line: i64, col: i64) -> TrySite? {
+    var following: TrySite? = none
+    var last: TrySite? = none
+    for s in sites {
+        if s.node.pos.line != line {
+            continue
+        }
+        match last {
+            some(held) => {
+                if s.node.pos.col > held.node.pos.col {
+                    last = s
+                }
+            }
+            none => {
+                last = s
+            }
+        }
+        if s.node.pos.col < col {
+            continue
+        }
+        match following {
+            some(held) => {
+                if s.node.pos.col < held.node.pos.col {
+                    following = s
+                }
+            }
+            none => {
+                following = s
+            }
+        }
+    }
+    if following != none {
+        return following
+    }
+    last
+}
+
+fn action_lift(a: ActionContext) -> CodeAction? {
+    let result = a.result ?? return none
+    if a.site.owner.err != none || a.site.owner.inline {
+        return none
+    }
+    let failed = result.err ?? return none
+    let spelled = spell(a, failed.name) ?? return none
+    let body = a.site.owner.body.pos
+    var clause = "! {spelled.name} "
+    let line = text_line(a.text, body.line - 1)
+    let before = line[..lesser(body.col - 1, line.len)]
+    if !text.ends_with(before, " ") {
+        clause = " {clause}"
+    }
+    let at = position_of(a.text, body)
+    var edits = spelled.edits
+    let insertion = TextEdit { range: Range { start: at, end: at }, new_text: clause }
+    push(mut edits, insertion)
+    let subject = owner_subject(a.site.owner)
+    let changes: [str: []TextEdit] = [a.uri: edits]
+    CodeAction {
+        title: "Add ! {spelled.name} to {subject}",
+        kind: "quickfix",
+        is_preferred: true,
+        edit: WorkspaceEdit { changes },
+    }
+}
+
+fn spell(a: ActionContext, qualified: str) -> Spelled? {
+    if text.contains(qualified, "[") {
+        return none
+    }
+    let dot = text.last_index_byte(qualified, '.')
+    if dot < 0 {
+        return Spelled { name: qualified }
+    }
+    let module = qualified[..dot]
+    let name = qualified[dot + 1..]
+    if module == a.file.module {
+        return Spelled { name }
+    }
+    for imp in a.file.imports {
+        if imp.path == module {
+            return Spelled { name: "{imp.alias}.{name}" }
+        }
+    }
+    let slash = text.last_index_byte(module, '/')
+    let alias = module[slash + 1..]
+    if ast.imported(a.file, alias) != none {
+        return none
+    }
+    let edit = import_edit(a, module)
+    Spelled { name: "{alias}.{name}", edits: [edit] }
+}
+
+fn import_edit(a: ActionContext, module: str) -> TextEdit {
+    let line = "import {module}\n"
+    let n = a.file.imports.len
+    if n > 0 {
+        let at = Position { line: a.file.imports[n - 1].pos.line }
+        return TextEdit { range: Range { start: at, end: at }, new_text: line }
+    }
+    TextEdit { new_text: "{line}\n" }
+}
+
+fn action_catch(a: ActionContext) -> CodeAction {
+    let arm = arm_body(a)
+    let block = catch_block(a, arm, "}}")
+    var edit = replace_try(a, block)
+    if a.snippets {
+        let snippet = catch_block(a, "$0", "\\}}")
+        edit = snippet_try(a, snippet)
+    }
+    CodeAction { title: "Catch the error", kind: "quickfix", edit }
+}
+
+fn action_or(a: ActionContext) -> CodeAction {
+    let arm = arm_body(a)
+    var edit = replace_try(a, " or {arm}")
+    if a.snippets {
+        edit = snippet_try(a, " or $0")
+    }
+    CodeAction { title: "Ignore the error with or", kind: "quickfix", edit }
+}
+
+fn catch_block(a: ActionContext, arm: str, brace: str) -> str {
+    let indent = leading_space(text_line(a.text, a.site.node.pos.line - 1))
+    let unit = indent_unit(a)
+    var b = builder.builder()
+    b.write(" catch {{\n")
+    b.write("{indent}{unit}e => {arm}\n")
+    b.write("{indent}{brace}")
+    b.to_str()
+}
+
+fn replace_try(a: ActionContext, replacement: str) -> WorkspaceEdit {
+    let edit = TextEdit { range: span(a.text, a.site.node.pos, 1), new_text: replacement }
+    let changes: [str: []TextEdit] = [a.uri: [edit]]
+    WorkspaceEdit { changes }
+}
+
+fn snippet_escape(s: str) -> str {
+    var b = builder.with_capacity(s.len)
+    for i in 0..s.len {
+        let c = s[i]
+        if c == '\\' || c == '$' || c == '}' {
+            b.write_byte('\\')
+        }
+        b.write_byte(c)
+    }
+    b.to_str()
+}
+
+fn snippet_try(a: ActionContext, suffix: str) -> WorkspaceEdit {
+    let pos = a.site.node.pos
+    let line = text_line(a.text, pos.line - 1)
+    let before = line[..lesser(pos.col - 1, line.len)]
+    let escaped = snippet_escape(before)
+    let snippet = StringValue { kind: "snippet", value: "{escaped}{suffix}" }
+    let start = diag.Pos { file: pos.file, line: pos.line, col: 1 }
+    let edit = SnippetTextEdit { range: span(a.text, start, before.len + 1), snippet }
+    let document = TextDocumentEdit { uri: a.uri, version: a.version, edits: [edit] }
+    WorkspaceEdit { document_changes: [document] }
+}
+
+fn arm_body(a: ActionContext) -> str {
+    match a.result {
+        some(r) => {
+            let ok = r.ok
+            match ok {
+                some(value) => {
+                    if types.is_void(value) {
+                        return "{{}}"
+                    }
+                }
+                none => {}
+            }
+        }
+        none => {}
+    }
+    if a.site.owner.result == none {
+        return "return"
+    }
+    "{{}}"
+}
+
+fn indent_unit(a: ActionContext) -> str {
+    let body = a.site.owner.body.pos
+    let outer = leading_space(text_line(a.text, body.line - 1))
+    var n = body.line
+    for n < a.text.lines.len {
+        let line = text_line(a.text, n)
+        n += 1
+        if text.trim(line) == "" {
+            continue
+        }
+        let inner = leading_space(line)
+        if inner.len > outer.len && text.starts_with(inner, outer) {
+            return inner[outer.len..]
+        }
+        return default_indent
+    }
+    default_indent
+}
+
+fn leading_space(line: str) -> str {
+    var n = 0
+    for n < line.len && (line[n] == ' ' || line[n] == '\t') {
+        n += 1
+    }
+    line[..n]
+}

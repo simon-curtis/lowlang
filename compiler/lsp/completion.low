@@ -1,0 +1,373 @@
+import ast
+import check
+import diag
+import lexer
+import regex
+import types
+
+pub const completion_method = 2
+pub const completion_function = 3
+pub const completion_field = 5
+pub const completion_variable = 6
+pub const completion_module = 9
+pub const completion_property = 10
+pub const completion_enum = 13
+pub const completion_keyword = 14
+pub const completion_enum_member = 20
+pub const completion_constant = 21
+pub const completion_struct = 22
+pub const completion_type = 25
+
+const unbounded = 4611686018427387904
+
+pub struct Cursor {
+    pub program: Program
+    pub file: *ast.File? = none
+    pub text: Text
+    pub compiled: Text
+    pub line: i64
+    pub col: i64
+    pub items: []CompletionItem = []
+    pub seen: [str: bool] = [:]
+    pub visible: []*ast.Local = []
+    pub scoped: bool = false
+}
+
+fn lesser(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    b
+}
+
+pub fn compiled_line(c: *Cursor) -> i64 {
+    let old = c.compiled.lines
+    let now = c.text.lines
+    var prefix = 0
+    for prefix < old.len && prefix < now.len && old[prefix] == now[prefix] {
+        prefix += 1
+    }
+    var suffix = 0
+    for suffix < old.len - prefix && suffix < now.len - prefix && old[old.len - 1 - suffix] == now[now.len - 1 - suffix] {
+        suffix += 1
+    }
+    if c.line < prefix {
+        return c.line
+    }
+    if c.line >= now.len - suffix {
+        return c.line - now.len + old.len
+    }
+    prefix - 1
+}
+
+pub fn add_item(c: *Cursor, label: str, kind: i64, detail: str) {
+    if c.seen[label] != none {
+        return
+    }
+    c.seen[label] = true
+    push(mut c.items, CompletionItem { label, kind, detail })
+}
+
+pub fn complete(c: *Cursor) -> []CompletionItem {
+    let segments = receiver(c)
+    match segments {
+        some(found) => {
+            members(c, found)
+            return c.items
+        }
+        none => {}
+    }
+    local_items(c)
+    module_items(c)
+    import_items(c)
+    builtin_items(c)
+    c.items
+}
+
+fn receiver(c: *Cursor) -> []Segment? {
+    let src = text_line(c.text, c.line)
+    var at = lesser(c.col, src.len)
+    for at > 0 && is_word(src[at - 1]) {
+        at -= 1
+    }
+    if at == 0 || src[at - 1] != '.' {
+        return none
+    }
+    segments_before(src, at - 1) ?? []
+}
+
+fn members(c: *Cursor, segments: []Segment) {
+    let file = c.file ?? return
+    if segments.len == 0 {
+        return
+    }
+    var chain: []str = []
+    for s in segments {
+        if !segment_plain(s) {
+            let t = type_of(c, segments)
+            fields(c, t, [])
+            return
+        }
+        push(mut chain, s.name)
+    }
+    let first = chain[0]
+    let rest = chain[1..]
+    let local = find_local(c, first)
+    match local {
+        some(l) => {
+            fields(c, l.type, rest)
+            return
+        }
+        none => {}
+    }
+    let imported = ast.imported(file, first)
+    match imported {
+        some(path) => {
+            module_members(c, path, rest)
+            return
+        }
+        none => {}
+    }
+    if rest.len == 0 {
+        variants(c, file.module, first)
+    }
+}
+
+fn module_members(c: *Cursor, path: str, rest: []str) {
+    if rest.len == 1 {
+        variants(c, path, rest[0])
+        return
+    }
+    if rest.len > 1 {
+        return
+    }
+    for f in module_files(c.program, path) {
+        declarations(c, f, true)
+    }
+    if path == regex.module {
+        let generated = check.generated_regex_signature()
+        add_item(c, generated.name, completion_function, generated.signature)
+    }
+}
+
+fn variants(c: *Cursor, module: str, name: str) {
+    let d = find_enum_decl(c.program, module, name) ?? return
+    for v in d.variants {
+        add_item(c, v.name, completion_enum_member, ast.variant_text(v))
+    }
+}
+
+fn fields(c: *Cursor, start: *types.Type?, path: []str) {
+    let file = c.file ?? return
+    var t = start
+    for name in path {
+        let held = t ?? return
+        let f = types.field(types.struct_of(held), name) ?? return
+        t = f.type
+    }
+    let found = t ?? return
+    let s = types.struct_of(found)
+    let external = s.module != file.module
+    for f in s.fields {
+        if external && !f.exported {
+            continue
+        }
+        add_item(c, f.name, completion_field, types.text(f.type))
+    }
+    for b in c.program.tables.list {
+        if !check.reads(b, found) {
+            continue
+        }
+        let property = b.type ?? continue
+        add_item(c, b.name, completion_property, types.text(property))
+    }
+    methods(c, found)
+}
+
+pub fn header_name(line: str) -> str {
+    let tokens = lexer.lex(line, diag.start(""), false) catch {
+        _ => return ""
+    }
+    var i = 0
+    if tokens.len > i && tokens[i].kind == lexer.Kind.Pub {
+        i += 1
+    }
+    if i + 1 < tokens.len && tokens[i].kind == lexer.Kind.Fn && tokens[i + 1].kind == lexer.Kind.Ident {
+        return tokens[i + 1].text
+    }
+    ""
+}
+
+struct Header {
+    line: i64
+    name: str
+}
+
+fn header_line(c: *Cursor) -> Header {
+    var line = c.line
+    for line >= 0 {
+        let name = header_name(text_line(c.text, line))
+        if name != "" {
+            return Header { line, name }
+        }
+        line -= 1
+    }
+    Header { line: 0, name: "" }
+}
+
+fn enclosing(c: *Cursor) -> *ast.Func? {
+    let header = header_line(c)
+    let file = c.file ?? return none
+    if header.name == "" {
+        return none
+    }
+    for f in ast.declared_funcs(file) {
+        if f.name == header.name {
+            return f
+        }
+    }
+    none
+}
+
+struct Span {
+    from: i64
+    to: i64
+}
+
+fn span_of(file: *ast.File, f: *ast.Func) -> Span {
+    var end = unbounded
+    var starts: []diag.Pos = []
+    for g in ast.declared_funcs(file) {
+        push(mut starts, g.pos)
+    }
+    for k in file.consts {
+        push(mut starts, k.pos)
+    }
+    for d in file.structs {
+        push(mut starts, d.pos)
+    }
+    for d in file.enums {
+        push(mut starts, d.pos)
+    }
+    for e in file.externs {
+        push(mut starts, e.pos)
+    }
+    for p in starts {
+        if p.line > f.pos.line && p.line < end {
+            end = p.line
+        }
+    }
+    Span { from: f.pos.line, to: end }
+}
+
+pub fn scope(c: *Cursor) -> []*ast.Local {
+    if c.scoped {
+        return c.visible
+    }
+    c.scoped = true
+    let f = enclosing(c) ?? return []
+    let file = c.file ?? return []
+    let span = span_of(file, f)
+    let to = lesser(span.to, compiled_line(c) + 2)
+    let x = new_index(file, c.compiled)
+    for o in x.occurrences {
+        let l = o.local ?? continue
+        if o.pos.line >= span.from && o.pos.line < to {
+            push(mut c.visible, l)
+        }
+    }
+    c.visible
+}
+
+pub fn find_local(c: *Cursor, name: str) -> *ast.Local? {
+    var found: *ast.Local? = none
+    for l in scope(c) {
+        if l.name == name {
+            found = l
+        }
+    }
+    found
+}
+
+fn local_items(c: *Cursor) {
+    let visible = scope(c)
+    var i = visible.len - 1
+    for i >= 0 {
+        let l = visible[i]
+        var detail = ""
+        match l.type {
+            some(t) => {
+                detail = types.text(t)
+            }
+            none => {}
+        }
+        add_item(c, l.name, completion_variable, detail)
+        i -= 1
+    }
+}
+
+fn module_items(c: *Cursor) {
+    let file = c.file ?? return
+    for f in module_files(c.program, file.module) {
+        declarations(c, f, false)
+    }
+}
+
+fn declarations(c: *Cursor, f: *ast.File, public: bool) {
+    for k in f.consts {
+        if k.exported || !public {
+            add_item(c, k.name, completion_constant, ast.const_text(k))
+        }
+    }
+    for fn_decl in ast.declared_funcs(f) {
+        if fn_decl.exported || !public {
+            add_item(c, fn_decl.name, completion_function, ast.signature(fn_decl))
+        }
+    }
+    for d in f.structs {
+        if d.exported || !public {
+            add_item(c, d.name, completion_struct, "struct")
+        }
+    }
+    for d in f.enums {
+        if !d.exported && public {
+            continue
+        }
+        add_item(c, d.name, completion_enum, "enum")
+        if public {
+            continue
+        }
+        for v in d.variants {
+            add_item(c, v.name, completion_enum_member, "{d.name}.{ast.variant_text(v)}")
+        }
+    }
+}
+
+fn import_items(c: *Cursor) {
+    let file = c.file ?? return
+    for imp in file.imports {
+        add_item(c, imp.alias, completion_module, imp.path)
+    }
+}
+
+fn add_builtin(c: *Cursor, b: *check.Builtin) {
+    match b.kind {
+        FunctionBuiltin => {
+            if check.is_public(b) {
+                add_item(c, b.name, completion_function, "builtin")
+            }
+        }
+        TypeBuiltin => add_item(c, b.name, completion_type, "type")
+        ConstantBuiltin => add_item(c, b.name, completion_constant, "")
+        PropertyBuiltin => {}
+    }
+}
+
+fn builtin_items(c: *Cursor) {
+    for b in c.program.tables.list {
+        add_builtin(c, b)
+    }
+    for word in lexer.keyword_spellings() {
+        add_item(c, word.text, completion_keyword, "")
+    }
+}

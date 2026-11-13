@@ -1,0 +1,156 @@
+import ast
+import compiler
+import diag
+import target
+import std/text
+import std/time
+
+pub const debounce = 150
+pub const idle = 3600000
+
+pub struct Job {
+    pub entry: str
+    pub path: str
+    pub version: i64
+    pub docs: *compiler.Overlay
+}
+
+pub struct Compiled {
+    pub job: Job
+    pub checked: *compiler.Checked
+}
+
+pub struct Scheduler {
+    pub versions: [str: i64] = [:]
+    pub sequence: i64 = 0
+    pub dirty: [str: str] = [:]
+    pub compiling: bool = false
+    pub deadline: i64 = -1
+    pub results: chan[Compiled]
+}
+
+pub fn new_scheduler() -> *Scheduler {
+    new(Scheduler { results: chan[Compiled]() })
+}
+
+fn now_millis() -> i64 {
+    time.monotonic() / 1000000
+}
+
+pub fn mark(c: *Scheduler, entry: str, file_path: str, delay: i64) {
+    c.sequence += 1
+    c.versions[entry] = c.sequence
+    c.dirty[entry] = file_path
+    c.deadline = now_millis() + delay
+}
+
+pub fn forget(c: *Scheduler, entry: str) {
+    delete(mut c.versions, entry)
+    delete(mut c.dirty, entry)
+}
+
+pub fn wait_millis(c: *Scheduler) -> i64 {
+    if c.deadline < 0 {
+        return idle
+    }
+    let remaining = c.deadline - now_millis()
+    if remaining < 0 {
+        return 0
+    }
+    remaining
+}
+
+pub fn expire(c: *Scheduler) {
+    c.deadline = -1
+}
+
+fn run_job(results: chan[Compiled], std: *compiler.Std, job: Job) {
+    let checked = compiler.check_overlay(job.entry, target.host(), std, job.docs)
+    results <- Compiled { job, checked }
+}
+
+pub fn next(c: *Scheduler, std: *compiler.Std, docs: *compiler.Overlay) {
+    if c.compiling {
+        return
+    }
+    for entry in c.dirty {
+        let file_path = c.dirty[entry] ?? continue
+        delete(mut c.dirty, entry)
+        c.compiling = true
+        let version = c.versions[entry] ?? 0
+        let snapshot = compiler.overlay_copy(docs)
+        let job = Job { entry, path: file_path, version, docs: snapshot }
+        spawn run_job(c.results, std, job)
+        return
+    }
+}
+
+pub fn finish_job(c: *Scheduler, r: Compiled) -> bool {
+    c.compiling = false
+    if c.dirty.len > 0 {
+        c.deadline = now_millis() + debounce
+    }
+    let latest = c.versions[r.job.entry] ?? 0
+    r.job.version == latest
+}
+
+struct TryFinder {
+    pos: diag.Pos
+    found: *ast.Try? = none
+}
+
+fn find_visit(finder: *TryFinder, n: ast.Node) -> bool {
+    if finder.found != none {
+        return false
+    }
+    match n {
+        Expr(e) => {
+            match e {
+                Try(node) => {
+                    if node.pos.line == finder.pos.line && node.pos.col == finder.pos.col {
+                        finder.found = node
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn find_try(files: []*ast.File, pos: diag.Pos) -> *ast.Try? {
+    let finder = new(TryFinder { pos })
+    for f in files {
+        if f.path != pos.file {
+            continue
+        }
+        ast.inspect(ast.Node.File(f), fn(n: ast.Node) -> bool { find_visit(finder, n) })
+    }
+    finder.found
+}
+
+fn unpropagated_site(r: Compiled) -> diag.Pos? {
+    let e = r.checked.error ?? return none
+    match e {
+        Diag(d) => {
+            match d {
+                At(pos, msg) => {
+                    if text.starts_with(msg, "? requires ") && text.ends_with(msg, " to declare an error type") {
+                        return pos
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    none
+}
+
+pub fn new_failure(r: Compiled) -> Failure {
+    let base = Failure { docs: r.job.docs }
+    let pos = unpropagated_site(r) ?? return base
+    let site = find_try(r.checked.files, pos) ?? return base
+    let result = ast.type_of(site.x) ?? return base
+    Failure { site: pos.file, line: pos.line, col: pos.col, result, docs: r.job.docs, present: true }
+}

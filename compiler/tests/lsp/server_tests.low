@@ -1,0 +1,280 @@
+import lsp
+import std/file
+import std/json
+import std/os
+import std/path
+import std/testing
+import std/text
+
+struct HoverCase {
+    at: lsp.Position
+    want: str
+}
+
+struct DefinitionCase {
+    at: lsp.Position
+    want: lsp.Position
+}
+
+const broken_tail = "\nfn broken() {{\n    let x: i64 = \"s\"\n}}\n"
+
+fn check_hovers(t: *testing.T, c: *Client, f: Fixture, cases: []HoverCase) {
+    for tc in cases {
+        let got = hover(c, f, tc.at)
+        testing.error_if(t, !text.contains(got, tc.want), "hover at {position_text(tc.at)} = {got}, want {tc.want}")
+    }
+}
+
+fn check_definitions(t: *testing.T, c: *Client, f: Fixture, cases: []DefinitionCase) {
+    for tc in cases {
+        let loc = definition(c, f, tc.at)
+        let uri = json.text_of(loc, "uri")
+        let ok = uri == f.uri && same_position(start_of(loc), tc.want)
+        testing.error_if(t, !ok, "definition at {position_text(tc.at)} = {uri} {position_text(start_of(loc))}, want {position_text(tc.want)}")
+    }
+}
+
+fn test_diagnostics_follow_overlay(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "enums.low")
+    let broken = "{f.src}{broken_tail}"
+    let got = open(c, f, broken)
+    testing.fatal_if(t, got.len != 1, "diagnostics = {got.len}, want one")
+    let want_line = text.count(f.src, "\n") + 2
+    let line = start_of(got[0]).line
+    testing.error_if(t, line != want_line, "diagnostic line = {line}, want {want_line} ({json.text_of(got[0], "message")})")
+    let fixed = change(c, f, f.src)
+    testing.error_if(t, fixed.len != 0, "diagnostics after fix = {fixed.len}, want none")
+}
+
+fn test_close_releases_the_entry(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "enums.low")
+    open(c, f, f.src)
+    let at = fixture_at(t, f, "print(area(big))", 11)
+    let opened = hover(c, f, at)
+    testing.fatal_if(t, opened == "", "no hover while the document is open")
+    let broken = "{f.src}{broken_tail}"
+    let got = change(c, f, broken)
+    testing.fatal_if(t, got.len != 1, "diagnostics = {got.len}, want one")
+    let before = published(c, f.uri)
+    close_document(c, f)
+    let closed = await(c, f.uri, before)
+    testing.error_if(t, closed.len != 0, "diagnostics after close = {closed.len}, want none")
+    let gone = hover(c, f, at)
+    testing.error_if(t, gone != "", "hover after close = {gone}, want none")
+    let reopened = open(c, f, f.src)
+    testing.error_if(t, reopened.len != 0, "diagnostics after reopening = {reopened.len}, want none")
+    let again = hover(c, f, at)
+    testing.error_if(t, again == "", "no hover after reopening")
+}
+
+fn test_close_keeps_an_entry_with_open_documents(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "modules/main.low")
+    let g = read_fixture(t, "modules/helper.low")
+    open(c, f, f.src)
+    open(c, g, g.src)
+    close_document(c, g)
+    let got = hover(c, f, fixture_at(t, f, "geometry.circle(2)", 9))
+    testing.error_if(t, got == "", "no hover in the document that stayed open")
+}
+
+fn test_rapid_edits_publish_only_the_latest(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "enums.low")
+    open(c, f, f.src)
+    let before = published(c, f.uri)
+    for i in 0..5 {
+        let broken = "{f.src}\nfn broken{i}() {{\n    let x: i64 = \"s\"\n}}\n"
+        change_silently(c, f, broken)
+    }
+    let got = change(c, f, f.src)
+    testing.error_if(t, got.len != 0, "diagnostics = {got.len}, want none from the superseded edits")
+    let count = published(c, f.uri) - before
+    testing.error_if(t, count != 1, "published {count} times for six edits, want 1")
+}
+
+fn test_hover_does_not_wait_for_pending_compile(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "enums.low")
+    open(c, f, f.src)
+    let before = published(c, f.uri)
+    change_silently(c, f, f.src)
+    let got = hover(c, f, fixture_at(t, f, "print(area(big))", 11))
+    testing.error_if(t, !text.contains(got, "let big: Shape"), "hover during pending compile = {got}")
+    testing.error_if(t, published(c, f.uri) != before, "hover waited for the debounced compile")
+    await(c, f.uri, before)
+}
+
+fn test_hover(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "enums.low")
+    open(c, f, f.src)
+    let cases = [
+        HoverCase { at: fixture_at(t, f, "print(area(big))", 11), want: "let big: Shape" }
+        HoverCase { at: fixture_at(t, f, "print(area(big))", 6), want: "fn area(s: Shape) -> i64" }
+        HoverCase { at: fixture_at(t, f, "Circle(r) =>", 0), want: "Shape.Circle(i64)" }
+        HoverCase { at: fixture_at(t, f, "var s: Shape", 7), want: "enum Shape {{" }
+    ]
+    check_hovers(t, c, f, cases)
+}
+
+fn test_hover_shows_doc_comments(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "doc_comments.low")
+    open(c, f, f.src)
+    let cases = [
+        HoverCase { at: fixture_at(t, f, "match side(", 6), want: "fn side(p: Point) -> Side\n```\n\nClassifies a point.\n\n```low\nside(Point {{ x: -1, y: 0 }})\n```" }
+        HoverCase { at: fixture_at(t, f, "side(Point {{ x: -3", 5), want: "A point on the plane." }
+        HoverCase { at: fixture_at(t, f, "Left =>", 0), want: "Left of the y axis." }
+        HoverCase { at: fixture_at(t, f, "pub x: i64", 4), want: "Distance from the y axis." }
+    ]
+    check_hovers(t, c, f, cases)
+}
+
+fn test_hover_on_builtins(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "maps.low")
+    open(c, f, f.src)
+    let cases = [
+        HoverCase { at: fixture_at(t, f, "print(ages.len)", 0), want: "fn print(value: i64)" }
+        HoverCase { at: fixture_at(t, f, "print(\"{{k}}={{v}}\")", 0), want: "fn print(value: str)" }
+        HoverCase { at: fixture_at(t, f, "delete(mut shared, \"alan\")", 0), want: "fn delete(mut m: [str: i64], key: str)" }
+    ]
+    check_hovers(t, c, f, cases)
+}
+
+fn test_definition(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "enums.low")
+    open(c, f, f.src)
+    let cases = [
+        DefinitionCase { at: fixture_at(t, f, "print(area(big))", 6), want: fixture_at(t, f, "fn area(", 3) }
+        DefinitionCase { at: fixture_at(t, f, "print(area(big))", 11), want: fixture_at(t, f, "let big", 4) }
+        DefinitionCase { at: fixture_at(t, f, "Circle(r) =>", 0), want: fixture_at(t, f, "Circle(radius", 0) }
+        DefinitionCase { at: fixture_at(t, f, "Circle(r) =>", 7), want: fixture_at(t, f, "Circle(r) =>", 7) }
+        DefinitionCase { at: fixture_at(t, f, "fn area(s: Shape)", 11), want: fixture_at(t, f, "enum Shape", 5) }
+    ]
+    check_definitions(t, c, f, cases)
+}
+
+fn test_definition_across_modules(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "modules/main.low")
+    let opened = open(c, f, f.src)
+    testing.fatal_if(t, opened.len != 0, "diagnostics = {opened.len}")
+    let loc = definition(c, f, fixture_at(t, f, "geometry.circle(2)", 9))
+    let target_path = path_of_location(loc)
+    let line = file_line(t, target_path, start_of(loc).line)
+    let ok = path.base(path.dir(target_path)) == "geometry" && text.contains(line, "fn circle")
+    testing.error_if(t, !ok, "definition = {target_path}:{start_of(loc).line} {line}")
+    let module = definition(c, f, fixture_at(t, f, "import geometry", 7))
+    let module_dir = path.base(path.dir(path_of_location(module)))
+    testing.error_if(t, module_dir != "geometry", "import definition = {json.text_of(module, "uri")}")
+}
+
+fn test_document_symbols(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let f = read_fixture(t, "enums.low")
+    let list = symbols(c, f)
+    var names: [str: json.Value] = [:]
+    for s in list {
+        names[json.text_of(s, "name")] = s
+    }
+    for want in ["Shape", "Color", "Wrapper", "area", "main"] {
+        testing.error_if(t, !has(names, want), "missing symbol {want}")
+    }
+    let shape = names["Shape"] ?? json.Value.Null
+    let children = items(json.field(shape, "children"))
+    let first = if children.len > 0 { json.text_of(children[0], "name") } else { "" }
+    testing.error_if(t, children.len != 3 || first != "Circle", "Shape children = {children.len} first {first}")
+    let detail = detail_of(names, "area")
+    testing.error_if(t, detail != "fn area(s: Shape) -> i64", "area detail = {detail}")
+}
+
+fn test_shutdown(t: *testing.T) {
+    let c = start(t)
+    request(c, "shutdown", "null")
+    notify(c, "exit", "null")
+    select {
+        got = <-c.done => {
+            let message = got ?? ""
+            testing.error_if(t, message != "", "Run = {message}")
+        }
+        after(5000) => {
+            testing.fatal(t, "server did not exit")
+        }
+    }
+    c.to.close()
+    c.server_out.close()
+}
+
+fn word_starts(src: str) -> []lsp.Position {
+    var found: []lsp.Position = []
+    for line, row in text.split(src, '\n') {
+        for col in 0..row.len {
+            if !lsp.is_word(row[col]) || (col > 0 && lsp.is_word(row[col - 1])) {
+                continue
+            }
+            push(mut found, lsp.Position { line, character: col })
+        }
+    }
+    found
+}
+
+fn fixtures_in(dir: str, prefix: str) -> []str {
+    var names: []str = []
+    let entries = file.read_dir_info(dir) catch {
+        _ => return names
+    }
+    for entry in entries {
+        if !entry.dir && path.ext(entry.name) == ".low" {
+            push(mut names, "{prefix}{entry.name}")
+        }
+    }
+    names
+}
+
+fn every_fixture(t: *testing.T) -> []str {
+    let root = os.getcwd() catch {
+        e => testing.must(t, e, "")
+    }
+    let base = path.join([root, "testdata", "run"])
+    var names = fixtures_in(base, "")
+    let groups = file.read_dir_info(path.join([base, "modules"])) catch {
+        _ => return names
+    }
+    for group in groups {
+        if group.dir {
+            for name in fixtures_in(path.join([base, "modules", group.name]), "modules/{group.name}/") {
+                push(mut names, name)
+            }
+        }
+    }
+    names
+}
+
+fn test_every_occurrence_answers(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    for rel in every_fixture(t) {
+        let f = read_fixture(t, rel)
+        open(c, f, f.src)
+        for p in word_starts(f.src) {
+            hover(c, f, p)
+            request(c, "textDocument/definition", position_params(f, p))
+        }
+    }
+}

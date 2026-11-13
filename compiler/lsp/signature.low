@@ -1,0 +1,240 @@
+import ast
+import types
+import std/builder
+
+pub struct Opening {
+    pub char: u8
+    pub line: i64
+    pub col: i64
+    pub commas: i64 = 0
+}
+
+pub struct CallShape {
+    pub head: str
+    pub params: []str
+    pub tail: str
+}
+
+struct MethodShape {
+    shape: CallShape
+    offset: i64
+}
+
+fn openings(c: *Cursor) -> []*Opening {
+    let from = header_line(c).line
+    var stack: []*Opening = []
+    for line in from..c.line + 1 {
+        let src = text_line(c.text, line)
+        var limit = src.len
+        if line == c.line {
+            limit = lesser(c.col, src.len)
+        }
+        stack = scan_line(src[..limit], line, stack)
+    }
+    stack
+}
+
+fn scan_line(src: str, line: i64, start: []*Opening) -> []*Opening {
+    var stack = start
+    var i = 0
+    for i < src.len {
+        let ch = src[i]
+        if ch == '/' && i + 1 < src.len && src[i + 1] == '/' {
+            return stack
+        }
+        if ch == '"' || ch == '\'' {
+            i = skip_quoted(src, i)
+        } else if ch == '(' || ch == '[' || ch == '{' {
+            push(mut stack, new(Opening { char: ch, line, col: i }))
+        } else if ch == ')' || ch == ']' || ch == '}' {
+            if stack.len > 0 {
+                pop(mut stack)
+            }
+        } else if ch == ',' && stack.len > 0 {
+            stack[stack.len - 1].commas += 1
+        }
+        i += 1
+    }
+    stack
+}
+
+fn skip_quoted(src: str, at: i64) -> i64 {
+    let quote = src[at]
+    var i = at + 1
+    for i < src.len {
+        if src[i] == '\\' {
+            i += 1
+        } else if src[i] == quote {
+            return i
+        }
+        i += 1
+    }
+    src.len
+}
+
+fn open_call(c: *Cursor) -> *Opening? {
+    let stack = openings(c)
+    var i = stack.len - 1
+    for i >= 0 {
+        if stack[i].char == '(' {
+            return stack[i]
+        }
+        i -= 1
+    }
+    none
+}
+
+fn func_call_shape(f: *ast.Func) -> CallShape {
+    let parts = ast.signature_parts(f)
+    CallShape { head: parts.head, params: parts.params, tail: parts.tail }
+}
+
+fn func_shape(c: *Cursor, module: str, name: str, public: bool) -> CallShape? {
+    let f = find_function(c.program, module, name, public) ?? return none
+    func_call_shape(f)
+}
+
+fn variant_shape(c: *Cursor, module: str, enum_name: str, name: str) -> CallShape? {
+    for f in module_files(c.program, module) {
+        for d in f.enums {
+            if enum_name != "" && d.name != enum_name {
+                continue
+            }
+            for v in d.variants {
+                if v.name != name || v.fields.len == 0 {
+                    continue
+                }
+                return CallShape { head: "{d.name}.{v.name}(", params: ast.variant_params(v), tail: ")" }
+            }
+        }
+    }
+    none
+}
+
+fn value_shape(name: str, t: *types.Type?) -> CallShape? {
+    let held = t ?? return none
+    if held.kind != types.Kind.FuncKind {
+        return none
+    }
+    var params: []str = []
+    for i, p in held.params {
+        let mutable = i < held.muts.len && held.muts[i]
+        push(mut params, types.param_text(p, mutable))
+    }
+    var tail = ")"
+    match held.ret {
+        some(ret) => {
+            let returned = types.return_text(ret)
+            tail = "){returned}"
+        }
+        none => {}
+    }
+    CallShape { head: "{name}(", params, tail }
+}
+
+fn call_shape(c: *Cursor, chain: []str) -> CallShape? {
+    let file = c.file ?? return none
+    if chain.len == 1 {
+        let local = find_local(c, chain[0])
+        match local {
+            some(l) => return value_shape(chain[0], l.type)
+            none => {}
+        }
+        let own = func_shape(c, file.module, chain[0], false)
+        match own {
+            some(shape) => return shape
+            none => {}
+        }
+        return variant_shape(c, file.module, "", chain[0])
+    }
+    if chain.len == 2 {
+        let imported = ast.imported(file, chain[0])
+        match imported {
+            some(path) => return func_shape(c, path, chain[1], true)
+            none => {}
+        }
+        return variant_shape(c, file.module, chain[0], chain[1])
+    }
+    if chain.len == 3 {
+        let imported = ast.imported(file, chain[0])
+        match imported {
+            some(path) => return variant_shape(c, path, chain[1], chain[2])
+            none => {}
+        }
+    }
+    none
+}
+
+pub fn signature_help(c: *Cursor) -> SignatureHelp? {
+    if c.file == none {
+        return none
+    }
+    let call = open_call(c) ?? return none
+    let src = text_line(c.text, call.line)
+    let segments = segments_before(src, call.col) ?? return none
+    let method = method_shape(c, segments)
+    match method {
+        some(m) => return help(m.shape, call.commas + m.offset)
+        none => {}
+    }
+    let chain = callee_chain(segments)
+    if chain.len == 0 {
+        return none
+    }
+    let shape = call_shape(c, chain) ?? return none
+    help(shape, call.commas)
+}
+
+fn method_shape(c: *Cursor, segments: []Segment) -> MethodShape? {
+    if segments.len < 2 || !segment_plain(segments[segments.len - 1]) {
+        return none
+    }
+    let t = type_of(c, segments[..segments.len - 1]) ?? return none
+    let name = segments[segments.len - 1].name
+    let field = types.field(types.struct_of(t), name)
+    match field {
+        some(f) => {
+            if f.type.kind == types.Kind.FuncKind {
+                let shape = value_shape(name, f.type) ?? return none
+                return MethodShape { shape, offset: 0 }
+            }
+        }
+        none => {}
+    }
+    let local = find_local(c, name)
+    match local {
+        some(l) => {
+            let shape = value_shape(name, l.type) ?? return none
+            return MethodShape { shape, offset: 1 }
+        }
+        none => {}
+    }
+    let declared = method(c, t, name) ?? return none
+    MethodShape { shape: func_call_shape(declared), offset: 1 }
+}
+
+fn help(s: CallShape, commas: i64) -> SignatureHelp {
+    var label = builder.builder()
+    label.write(s.head)
+    var length = s.head.len
+    var params: []ParameterInformation = []
+    for i, p in s.params {
+        if i > 0 {
+            label.write(", ")
+            length += 2
+        }
+        let start = length
+        label.write(p)
+        length += p.len
+        let parameter = ParameterInformation { start, end: length }
+        push(mut params, parameter)
+    }
+    label.write(s.tail)
+    var last = params.len - 1
+    if last < 0 {
+        last = 0
+    }
+    let active = lesser(commas, last)
+    let info = SignatureInformation { label: label.to_str(), parameters: params }
+    SignatureHelp { signatures: [info], active_parameter: active }
+}

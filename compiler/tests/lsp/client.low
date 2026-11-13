@@ -1,0 +1,535 @@
+import lsp
+import std/builder
+import std/file
+import std/io
+import std/json
+import std/os
+import std/path
+import std/sys
+import std/testing
+import std/text
+
+const wait_millis = 10000
+
+struct Message {
+    id: i64
+    method: str
+    params: json.Value
+    result: json.Value
+    failure: json.Value
+}
+
+struct Failure {
+    code: i64
+    message: str
+}
+
+struct Reply {
+    result: json.Value
+    failure: Failure?
+}
+
+struct Pipe {
+    reader: io.Stream
+    writer: io.Stream
+}
+
+struct Client {
+    t: *testing.T
+    to: io.Stream
+    server_out: io.Stream
+    inbox: chan[Message]
+    done: chan[str]
+    diagnostics: [str: json.Value] = [:]
+    publishes: [str: i64] = [:]
+    asked: [str: i64] = [:]
+    next: i64 = 0
+}
+
+struct Fixture {
+    path: str
+    uri: str
+    src: str
+}
+
+struct Typing {
+    text: str
+    at: lsp.Position
+}
+
+fn open_pipe(t: *testing.T) -> Pipe {
+    let ends = sys.pipe(true) catch {
+        e => testing.must(t, e, sys.Pair { first: -1, second: -1 })
+    }
+    let reader = sys.stream_on(sys.wrap(ends.first))
+    let writer = sys.stream_on(sys.wrap(ends.second))
+    Pipe { reader, writer }
+}
+
+fn initialize_params(refresh: bool, snippets: bool) -> str {
+    var b = builder.builder()
+    b.write("{{\"capabilities\":{{\"workspace\":{{")
+    b.write("\"inlayHint\":{{\"refreshSupport\":{refresh}}},")
+    b.write("\"workspaceEdit\":{{\"snippetEditSupport\":{snippets}}}")
+    b.write("}}}}}}")
+    b.to_str()
+}
+
+fn start(t: *testing.T) -> *Client {
+    start_with(t, false, false)
+}
+
+fn start_with(t: *testing.T, refresh: bool, snippets: bool) -> *Client {
+    let up = open_pipe(t)
+    let down = open_pipe(t)
+    let server = lsp.new_server(up.reader, down.writer)
+    let inbox = chan[Message]()
+    let done = chan[str]()
+    let c = new(Client { t, to: up.writer, server_out: down.writer, inbox, done })
+    spawn run_server(server, done)
+    spawn receive(down.reader, inbox)
+    request(c, "initialize", initialize_params(refresh, snippets))
+    notify(c, "initialized", "{{}}")
+    c
+}
+
+fn run_server(server: *lsp.Server, done: chan[str]) {
+    lsp.serve(server) catch {
+        e => {
+            done <- lsp.serve_message(e)
+            return
+        }
+    }
+    done <- ""
+}
+
+fn stop(c: *Client) {
+    c.to.close()
+    let ended = <-c.done
+    c.server_out.close()
+}
+
+fn read_frame(r: *io.Reader) -> []u8 ! io.Error {
+    var length = 0
+    for {
+        let line = io.read_line(r)?
+        if line == "" {
+            break
+        }
+        let colon = text.index_byte(line, ':')
+        if colon > 0 && text.equal_fold(line[..colon], "Content-Length") {
+            length = text.parse_int(text.trim(line[colon + 1..])) or 0
+        }
+    }
+    io.read_exact(r, length)?
+}
+
+fn receive(input: io.Stream, inbox: chan[Message]) {
+    let r = io.reader(input)
+    for {
+        let body = read_frame(r) or break
+        let parsed = json.parse(body) or break
+        let m = Message {
+            id: json.field_int(parsed, "id") ?? -1
+            method: json.text_of(parsed, "method")
+            params: json.field(parsed, "params")
+            result: json.field(parsed, "result")
+            failure: json.field(parsed, "error")
+        }
+        inbox <- m
+    }
+    close(inbox)
+}
+
+fn send(c: *Client, body: str) {
+    let framed = "Content-Length: {body.len}\r\n\r\n{body}"
+    io.write_str(c.to, framed) catch {
+        e => testing.must(c.t, e, {})
+    }
+}
+
+fn notify(c: *Client, method: str, params: str) {
+    let name = lsp.quote_json(method)
+    send(c, "{{\"jsonrpc\":\"2.0\",\"method\":{name},\"params\":{params}}}")
+}
+
+fn request(c: *Client, method: str, params: str) -> json.Value {
+    let reply = call(c, method, params)
+    match reply.failure {
+        some(f) => testing.fatal(c.t, "{method} failed: {f.message}")
+        none => {}
+    }
+    reply.result
+}
+
+fn call(c: *Client, method: str, params: str) -> Reply {
+    c.next += 1
+    let id = c.next
+    let name = lsp.quote_json(method)
+    send(c, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":{name},\"params\":{params}}}")
+    for {
+        select {
+            got = <-c.inbox => {
+                let m = inbound(c, got, method)
+                if m.method != "" {
+                    record(c, m)
+                } else if m.id == id {
+                    return reply_of(m)
+                }
+            }
+            after(wait_millis) => {
+                testing.fatal(c.t, "timed out waiting for {method}")
+            }
+        }
+    }
+}
+
+fn inbound(c: *Client, got: Message?, waiting: str) -> Message {
+    match got {
+        some(m) => m
+        none => {
+            testing.fatal(c.t, "connection closed waiting for {waiting}")
+            Message { id: -1, method: "", params: json.Value.Null, result: json.Value.Null, failure: json.Value.Null }
+        }
+    }
+}
+
+fn reply_of(m: Message) -> Reply {
+    match m.failure {
+        Object(_) => {
+            let failure = Failure { code: json.int_of(m.failure, "code"), message: json.text_of(m.failure, "message") }
+            Reply { result: json.Value.Null, failure: failure }
+        }
+        _ => Reply { result: m.result, failure: none }
+    }
+}
+
+fn record(c: *Client, m: Message) {
+    if m.method != "textDocument/publishDiagnostics" {
+        c.asked[m.method] = (c.asked[m.method] ?? 0) + 1
+        return
+    }
+    let uri = json.text_of(m.params, "uri")
+    c.diagnostics[uri] = json.field(m.params, "diagnostics")
+    c.publishes[uri] = (c.publishes[uri] ?? 0) + 1
+}
+
+fn published(c: *Client, uri: str) -> i64 {
+    c.publishes[uri] ?? 0
+}
+
+fn asked_count(c: *Client, method: str) -> i64 {
+    c.asked[method] ?? 0
+}
+
+fn await(c: *Client, uri: str, seen: i64) -> []json.Value {
+    for published(c, uri) <= seen {
+        select {
+            got = <-c.inbox => {
+                let m = inbound(c, got, "diagnostics on {uri}")
+                if m.method != "" {
+                    record(c, m)
+                }
+            }
+            after(wait_millis) => {
+                testing.fatal(c.t, "timed out waiting for diagnostics on {uri}")
+            }
+        }
+    }
+    items(c.diagnostics[uri] ?? json.Value.Null)
+}
+
+fn items(v: json.Value) -> []json.Value {
+    match v {
+        Array(list) => list
+        _ => []
+    }
+}
+
+fn did_change_params(f: Fixture, version: i64, contents: str) -> str {
+    let quoted = lsp.quote_json(contents)
+    "{{\"textDocument\":{{\"uri\":{lsp.quote_json(f.uri)},\"version\":{version}}},\"contentChanges\":[{{\"text\":{quoted}}}]}}"
+}
+
+fn change(c: *Client, f: Fixture, contents: str) -> []json.Value {
+    let before = published(c, f.uri)
+    notify(c, "textDocument/didChange", did_change_params(f, 0, contents))
+    await(c, f.uri, before)
+}
+
+fn change_versioned(c: *Client, f: Fixture, version: i64, contents: str) -> []json.Value {
+    let before = published(c, f.uri)
+    notify(c, "textDocument/didChange", did_change_params(f, version, contents))
+    await(c, f.uri, before)
+}
+
+fn change_silently(c: *Client, f: Fixture, contents: str) {
+    notify(c, "textDocument/didChange", did_change_params(f, 0, contents))
+}
+
+fn open(c: *Client, f: Fixture, contents: str) -> []json.Value {
+    let before = published(c, f.uri)
+    let quoted = lsp.quote_json(contents)
+    let params = "{{\"textDocument\":{{\"uri\":{lsp.quote_json(f.uri)},\"text\":{quoted}}}}}"
+    notify(c, "textDocument/didOpen", params)
+    await(c, f.uri, before)
+}
+
+fn close_document(c: *Client, f: Fixture) {
+    notify(c, "textDocument/didClose", document_params(f))
+}
+
+fn document_params(f: Fixture) -> str {
+    "{{\"textDocument\":{{\"uri\":{lsp.quote_json(f.uri)}}}}}"
+}
+
+fn position_json(p: lsp.Position) -> str {
+    "{{\"line\":{p.line},\"character\":{p.character}}}"
+}
+
+fn range_json(from: lsp.Position, to: lsp.Position) -> str {
+    "{{\"start\":{position_json(from)},\"end\":{position_json(to)}}}"
+}
+
+fn position_params(f: Fixture, p: lsp.Position) -> str {
+    "{{\"textDocument\":{{\"uri\":{lsp.quote_json(f.uri)}}},\"position\":{position_json(p)}}}"
+}
+
+fn scratch_dir(t: *testing.T) -> str {
+    file.temp_dir("low-lsp-") catch {
+        e => testing.must(t, e, "")
+    }
+}
+
+fn scratch(t: *testing.T, name: str, src: str) -> Fixture {
+    let dir = scratch_dir(t)
+    let file_path = path.join([dir, name])
+    file.write_text(file_path, src) catch {
+        e => testing.must(t, e, {})
+    }
+    Fixture { path: file_path, uri: lsp.uri_of(file_path), src }
+}
+
+fn drop_scratch(f: Fixture) {
+    file.remove_all(path.dir(f.path)) catch {
+        _ => {}
+    }
+}
+
+fn read_fixture(t: *testing.T, rel: str) -> Fixture {
+    let root = os.getcwd() catch {
+        e => testing.must(t, e, "")
+    }
+    let file_path = path.join([root, "testdata", "run", rel])
+    let src = file.read_text(file_path) catch {
+        e => testing.must(t, e, "")
+    }
+    Fixture { path: file_path, uri: lsp.uri_of(file_path), src }
+}
+
+fn fixture_at(t: *testing.T, f: Fixture, needle: str, offset: i64) -> lsp.Position {
+    let lines = text.split(f.src, '\n')
+    for i, line in lines {
+        let col = text.index(line, needle)
+        if col >= 0 {
+            return lsp.Position { line: i, character: col + offset }
+        }
+    }
+    testing.fatal(t, "{needle} not found in {f.path}")
+    lsp.Position {}
+}
+
+fn type_after(t: *testing.T, f: Fixture, needle: str, typed: str) -> Typing {
+    let lines = text.split(f.src, '\n')
+    let typed_lines = text.split(typed, '\n')
+    for i, line in lines {
+        if text.contains(line, needle) {
+            var joined: []str = []
+            for before in lines[..i + 1] {
+                push(mut joined, before)
+            }
+            for inserted in typed_lines {
+                push(mut joined, inserted)
+            }
+            for rest in lines[i + 1..] {
+                push(mut joined, rest)
+            }
+            let last = typed_lines.len - 1
+            let at = lsp.Position { line: i + 1 + last, character: typed_lines[last].len }
+            return Typing { text: text.join(joined, "\n"), at }
+        }
+    }
+    testing.fatal(t, "{needle} not found in {f.path}")
+    Typing { text: "", at: lsp.Position {} }
+}
+
+fn same_position(a: lsp.Position, b: lsp.Position) -> bool {
+    a.line == b.line && a.character == b.character
+}
+
+fn position_text(p: lsp.Position) -> str {
+    "{p.line}:{p.character}"
+}
+
+fn start_of(v: json.Value) -> lsp.Position {
+    let range = json.field(v, "range")
+    let start = json.field(range, "start")
+    lsp.Position { line: json.int_of(start, "line"), character: json.int_of(start, "character") }
+}
+
+fn end_of(v: json.Value) -> lsp.Position {
+    let range = json.field(v, "range")
+    let end = json.field(range, "end")
+    lsp.Position { line: json.int_of(end, "line"), character: json.int_of(end, "character") }
+}
+
+fn hover(c: *Client, f: Fixture, p: lsp.Position) -> str {
+    let result = request(c, "textDocument/hover", position_params(f, p))
+    json.text_of(json.field(result, "contents"), "value")
+}
+
+fn definition(c: *Client, f: Fixture, p: lsp.Position) -> json.Value {
+    let result = request(c, "textDocument/definition", position_params(f, p))
+    match result {
+        Null => testing.fatal(c.t, "no definition at {position_text(p)}")
+        _ => {}
+    }
+    result
+}
+
+fn symbols(c: *Client, f: Fixture) -> []json.Value {
+    items(request(c, "textDocument/documentSymbol", document_params(f)))
+}
+
+fn references(c: *Client, f: Fixture, p: lsp.Position, declaration: bool) -> []json.Value {
+    let extra = "\"context\":{{\"includeDeclaration\":{declaration}}}"
+    let params = position_params_with(f, p, extra)
+    items(request(c, "textDocument/references", params))
+}
+
+fn rename(c: *Client, f: Fixture, p: lsp.Position, name: str) -> Reply {
+    let quoted = lsp.quote_json(name)
+    let extra = "\"newName\":{quoted}"
+    let params = position_params_with(f, p, extra)
+    call(c, "textDocument/rename", params)
+}
+
+fn position_params_with(f: Fixture, p: lsp.Position, extra: str) -> str {
+    let uri = lsp.quote_json(f.uri)
+    "{{\"textDocument\":{{\"uri\":{uri}}},\"position\":{position_json(p)},{extra}}}"
+}
+
+fn complete(c: *Client, f: Fixture, p: lsp.Position) -> [str: json.Value] {
+    let result = request(c, "textDocument/completion", position_params(f, p))
+    var found: [str: json.Value] = [:]
+    for item in items(json.field(result, "items")) {
+        found[json.text_of(item, "label")] = item
+    }
+    found
+}
+
+fn complete_typing(c: *Client, f: Fixture, needle: str, typed: str) -> [str: json.Value] {
+    let edit = type_after(c.t, f, needle, typed)
+    change(c, f, edit.text)
+    complete(c, f, edit.at)
+}
+
+fn expect(t: *testing.T, found: [str: json.Value], present: []str, absent: []str) {
+    for name in present {
+        if !has(found, name) {
+            testing.error(t, "missing {name}")
+        }
+    }
+    for name in absent {
+        if has(found, name) {
+            testing.error(t, "unexpected {name}")
+        }
+    }
+}
+
+fn has(found: [str: json.Value], name: str) -> bool {
+    match found[name] {
+        some(_) => true
+        none => false
+    }
+}
+
+fn detail_of(found: [str: json.Value], name: str) -> str {
+    json.text_of(found[name] ?? json.Value.Null, "detail")
+}
+
+fn code_actions(c: *Client, f: Fixture, p: lsp.Position) -> [str: json.Value] {
+    let range = range_json(p, p)
+    let params = "{{\"textDocument\":{{\"uri\":{lsp.quote_json(f.uri)}}},\"range\":{range}}}"
+    let result = request(c, "textDocument/codeAction", params)
+    var actions: [str: json.Value] = [:]
+    for action in items(result) {
+        actions[json.text_of(action, "title")] = action
+    }
+    actions
+}
+
+fn signature(c: *Client, f: Fixture, needle: str, typed: str) -> json.Value {
+    let edit = type_after(c.t, f, needle, typed)
+    change(c, f, edit.text)
+    request(c, "textDocument/signatureHelp", position_params(f, edit.at))
+}
+
+fn has_help(help: json.Value) -> bool {
+    match help {
+        Null => false
+        _ => true
+    }
+}
+
+fn first_signature(help: json.Value) -> json.Value {
+    let list = items(json.field(help, "signatures"))
+    if list.len == 0 {
+        return json.Value.Null
+    }
+    list[0]
+}
+
+fn signature_label(help: json.Value) -> str {
+    json.text_of(first_signature(help), "label")
+}
+
+fn active_param(help: json.Value) -> str {
+    let info = first_signature(help)
+    let label = json.text_of(info, "label")
+    let parameters = items(json.field(info, "parameters"))
+    let at = json.int_of(help, "activeParameter")
+    let span = items(json.field(parameters[at], "label"))
+    let from = span_bound(span[0])
+    let to = span_bound(span[1])
+    label[from..to]
+}
+
+fn span_bound(v: json.Value) -> i64 {
+    match v {
+        Int(n) => n
+        _ => 0
+    }
+}
+
+fn inlay_hints(c: *Client, f: Fixture) -> []json.Value {
+    let lines = text.count(f.src, "\n") + 1
+    let params = "{{\"textDocument\":{{\"uri\":{lsp.quote_json(f.uri)}}},\"range\":{range_json(lsp.Position {}, lsp.Position { line: lines })}}}"
+    items(request(c, "textDocument/inlayHint", params))
+}
+
+fn workspace_symbols(c: *Client, query: str) -> []json.Value {
+    let params = "{{\"query\":{lsp.quote_json(query)}}}"
+    items(request(c, "workspace/symbol", params))
+}
+
+fn path_of_location(v: json.Value) -> str {
+    lsp.path_of(json.text_of(v, "uri"))
+}
+
+fn file_line(t: *testing.T, file_path: str, line: i64) -> str {
+    let src = file.read_text(file_path) catch {
+        e => testing.must(t, e, "")
+    }
+    text.split(src, '\n')[line]
+}

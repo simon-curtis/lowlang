@@ -1,0 +1,624 @@
+import ast
+import compiler
+import diag
+import lint
+import std/io
+import std/path
+import std/sys
+
+pub struct Server {
+    pub wire: Wire
+    pub docs: *compiler.Overlay
+    pub std: *compiler.Std
+    pub tables: *Tables
+    pub versions: [str: i64] = [:]
+    pub entries: [str: *EntryState] = [:]
+    pub compiles: *Scheduler
+    pub indexed: Indexed = Indexed {}
+    pub hint_refresh: bool = false
+    pub snippet_edits: bool = false
+    pub requests: i64 = 0
+    pub shutdown: bool = false
+}
+
+pub enum ServeError {
+    Io(io.Error)
+    Read(msg: str)
+    Exit(msg: str)
+}
+
+pub fn serve_message(e: ServeError) -> str {
+    match e {
+        Io(inner) => "{inner}"
+        Read(msg) => msg
+        Exit(msg) => msg
+    }
+}
+
+enum Inbound {
+    Message(Request)
+    Failed(ReadError)
+}
+
+struct Located {
+    uri: str
+    diagnostic: Diagnostic
+}
+
+pub fn new_server(input: io.Stream, out: io.Stream) -> *Server {
+    let wire = new_wire(input, out)
+    let docs = compiler.new_overlay()
+    let std = compiler.new_std()
+    let tables = new_tables()
+    let compiles = new_scheduler()
+    new(Server { wire, docs, std, tables, compiles })
+}
+
+pub fn serve_stdio() ! ServeError {
+    let input = sys.stream(0)
+    let output = sys.stream(1)
+    let s = new_server(input, output)
+    serve(s)?
+}
+
+pub fn serve(s: *Server) ! ServeError {
+    let inbox = chan[Inbound]()
+    spawn receive(s.wire, inbox)
+    for {
+        let wait = wait_millis(s.compiles)
+        select {
+            got = <-inbox => {
+                let inbound = got ?? return
+                let stop = on_inbound(s, inbound)?
+                if stop {
+                    return
+                }
+            }
+            done = <-s.compiles.results => {
+                let result = done ?? return
+                finish(s, result) catch Io
+                next(s.compiles, s.std, s.docs)
+            }
+            after(wait) => {
+                expire(s.compiles)
+                next(s.compiles, s.std, s.docs)
+            }
+        }
+    }
+}
+
+fn receive(wire: Wire, inbox: chan[Inbound]) {
+    for {
+        let request = read_request(wire) catch {
+            e => {
+                inbox <- Inbound.Failed(e)
+                return
+            }
+        }
+        inbox <- Inbound.Message(request)
+    }
+}
+
+fn on_inbound(s: *Server, inbound: Inbound) -> bool ! ServeError {
+    match inbound {
+        Failed(e) => {
+            match e {
+                Closed => return true
+                Failed(msg) => fail ServeError.Read(msg)
+            }
+        }
+        Message(request) => {
+            let exit = handle(s, request) catch Io
+            if exit && !s.shutdown {
+                fail ServeError.Exit("exit before shutdown")
+            }
+            exit
+        }
+    }
+}
+
+fn handle(s: *Server, req: Request) -> bool ! io.Error {
+    if req.method == "exit" {
+        return true
+    }
+    dispatch(s, req)?
+    false
+}
+
+fn dispatch(s: *Server, req: Request) ! io.Error {
+    match req.method {
+        "" => {}
+        "initialize" => on_initialize(s, req)?
+        "textDocument/inlayHint" => on_inlay_hint(s, req)?
+        "workspace/symbol" => on_workspace_symbol(s, req)?
+        "textDocument/codeAction" => on_code_action(s, req)?
+        "shutdown" => {
+            s.shutdown = true
+            reply(s, req.id, "null")?
+        }
+        "textDocument/didOpen" => on_open(s, req)?
+        "textDocument/didChange" => on_change(s, req)?
+        "textDocument/didSave" => on_save(s, req)?
+        "textDocument/didClose" => on_close(s, req)?
+        "textDocument/hover" => on_hover(s, req)?
+        "textDocument/definition" => on_definition(s, req)?
+        "textDocument/completion" => on_completion(s, req)?
+        "textDocument/signatureHelp" => on_signature_help(s, req)?
+        "textDocument/references" => on_references(s, req)?
+        "textDocument/rename" => on_rename(s, req)?
+        "textDocument/documentSymbol" => on_document_symbols(s, req)?
+        _ => {
+            if req.id == none {
+                return
+            }
+            let message = "method {req.method} not supported"
+            fail_reply(s, req.id, method_not_found, message)?
+        }
+    }
+}
+
+fn reject(s: *Server, req: Request, e: DecodeError) ! io.Error {
+    fail_reply(s, req.id, invalid_params, decode_message(e))?
+}
+
+fn complain(s: *Server, req: Request, e: DecodeError) ! io.Error {
+    let message = "{req.method}: {decode_message(e)}"
+    let params = encode_log(message_error, message)
+    notify(s, "window/logMessage", params)?
+}
+
+fn on_initialize(s: *Server, req: Request) ! io.Error {
+    let p = decode_initialize_params(req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    s.hint_refresh = p.refresh_support
+    s.snippet_edits = p.snippet_support
+    reply(s, req.id, encode_initialize())?
+}
+
+fn on_inlay_hint(s: *Server, req: Request) ! io.Error {
+    let p = decode_range_params("InlayHintParams", req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    let body = inlay_hints(s, p)
+    reply(s, req.id, body)?
+}
+
+fn on_workspace_symbol(s: *Server, req: Request) ! io.Error {
+    let p = decode_workspace_symbol_params(req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    let body = workspace_symbols(s, p)
+    reply(s, req.id, body)?
+}
+
+fn on_code_action(s: *Server, req: Request) ! io.Error {
+    let p = decode_range_params("CodeActionParams", req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    let body = code_actions(s, p)
+    reply(s, req.id, body)?
+}
+
+fn on_open(s: *Server, req: Request) ! io.Error {
+    let p = decode_open_params(req.params) catch {
+        e => {
+            complain(s, req, e)?
+            return
+        }
+    }
+    let file_path = path_of(p.uri)
+    compiler.overlay_put(s.docs, file_path, p.text)
+    s.versions[file_path] = p.version
+    schedule(s, file_path, 0)
+}
+
+fn on_change(s: *Server, req: Request) ! io.Error {
+    let p = decode_change_params(req.params) catch {
+        e => {
+            complain(s, req, e)?
+            return
+        }
+    }
+    if p.texts.len == 0 {
+        return
+    }
+    let file_path = path_of(p.uri)
+    compiler.overlay_put(s.docs, file_path, p.texts[p.texts.len - 1])
+    s.versions[file_path] = p.version
+    schedule(s, file_path, debounce)
+}
+
+fn schedule(s: *Server, file_path: str, delay: i64) {
+    let entry = entry_of(s, file_path)
+    let state = entry_state(s, entry)
+    state.fresh = false
+    mark(s.compiles, entry, file_path, delay)
+}
+
+fn on_save(s: *Server, req: Request) ! io.Error {
+    let p = decode_document_params(req.params) catch {
+        e => {
+            complain(s, req, e)?
+            return
+        }
+    }
+    schedule(s, path_of(p.uri), 0)
+}
+
+fn on_close(s: *Server, req: Request) ! io.Error {
+    let p = decode_document_params(req.params) catch {
+        e => {
+            complain(s, req, e)?
+            return
+        }
+    }
+    close(s, p)?
+}
+
+fn close(s: *Server, p: DocumentParams) ! io.Error {
+    let file_path = path_of(p.uri)
+    compiler.overlay_drop(s.docs, file_path)
+    delete(mut s.versions, file_path)
+    if s.indexed.path == file_path {
+        s.indexed = Indexed {}
+    }
+    let open = open_entries(s)
+    if open[entry_of(s, file_path)] != none {
+        schedule(s, file_path, 0)
+    }
+    var entries: []str = []
+    for entry in s.entries {
+        push(mut entries, entry)
+    }
+    for entry in entries {
+        if open[entry] != none {
+            continue
+        }
+        let state = s.entries[entry] ?? continue
+        release(s, entry, state)?
+    }
+}
+
+fn open_entries(s: *Server) -> [str: bool] {
+    let open: [str: bool] = [:]
+    for file_path in s.versions {
+        open[entry_of(s, file_path)] = true
+    }
+    open
+}
+
+fn release(s: *Server, entry: str, state: *EntryState) ! io.Error {
+    delete(mut s.entries, entry)
+    forget(s.compiles, entry)
+    let empty: [str: []Diagnostic] = [:]
+    publish(s, state, empty)?
+}
+
+fn reply(s: *Server, id: str?, result: str) ! io.Error {
+    let body = response_body(id, result)
+    write_message(s.wire, body)?
+}
+
+fn fail_reply(s: *Server, id: str?, code: i64, message: str) ! io.Error {
+    let body = error_body(id, code, message)
+    write_message(s.wire, body)?
+}
+
+fn notify(s: *Server, method: str, params: str) ! io.Error {
+    let body = notification_body(method, params)
+    write_message(s.wire, body)?
+}
+
+pub fn server_text(s: *Server, file_path: str) -> Text {
+    let src = compiler.overlay_read(s.docs, file_path) or return Text {}
+    new_text(src)
+}
+
+fn entry_of(s: *Server, file_path: str) -> str {
+    let dir = path.dir(file_path)
+    compiler.root(s.docs, dir) ?? file_path
+}
+
+fn entry_state(s: *Server, entry: str) -> *EntryState {
+    let held = s.entries[entry]
+    match held {
+        some(state) => return state
+        none => {}
+    }
+    let state = new(EntryState {})
+    s.entries[entry] = state
+    state
+}
+
+pub fn state_of(s: *Server, file_path: str) -> *EntryState {
+    let held = s.entries[entry_of(s, file_path)]
+    match held {
+        some(state) => state
+        none => new(EntryState {})
+    }
+}
+
+fn finish(s: *Server, r: Compiled) ! io.Error {
+    let current = finish_job(s.compiles, r)
+    let entry = r.job.entry
+    let state = s.entries[entry] ?? return
+    let failure = r.checked.error
+    if failure == none {
+        state.unit = r.checked.unit
+        state.docs = r.job.docs
+    }
+    if !current {
+        return
+    }
+    state.fresh = failure == none
+    state.failure = new_failure(r)
+    let diagnostics: [str: []Diagnostic] = [:]
+    for file_path in s.versions {
+        if entry_of(s, file_path) == entry {
+            diagnostics[uri_of(file_path)] = []
+        }
+    }
+    match failure {
+        some(e) => {
+            let found = diagnose(s, e, r.job.path)
+            add_diagnostic(diagnostics, found)
+            publish(s, state, diagnostics)?
+            return
+        }
+        none => {}
+    }
+    refresh_hints(s)?
+    let unit = r.checked.unit ?? return
+    for w in unit.warnings {
+        let found = warn(s, w, r.job.path)
+        add_diagnostic(diagnostics, found)
+    }
+    publish(s, state, diagnostics)?
+}
+
+fn add_diagnostic(diagnostics: [str: []Diagnostic], found: Located) {
+    var list = diagnostics[found.uri] ?? []
+    push(mut list, found.diagnostic)
+    diagnostics[found.uri] = list
+}
+
+fn located(pos: diag.Pos, document: str) -> diag.Pos {
+    var at = pos
+    if !path.is_absolute(at.file) {
+        at.file = document
+    }
+    at
+}
+
+fn warn(s: *Server, w: lint.Warning, document: str) -> Located {
+    let pos = located(w.pos, document)
+    let covered = word(server_text(s, pos.file), pos)
+    let d = Diagnostic { severity: severity_warning, source: "low", message: w.msg, range: covered }
+    Located { uri: uri_of(pos.file), diagnostic: d }
+}
+
+fn publish(s: *Server, state: *EntryState, diagnostics: [str: []Diagnostic]) ! io.Error {
+    var uris: []str = []
+    for uri in diagnostics {
+        push(mut uris, uri)
+    }
+    for uri in state.published {
+        let held = diagnostics[uri]
+        match held {
+            some(_) => {}
+            none => {
+                diagnostics[uri] = []
+            }
+        }
+    }
+    state.published = uris
+    for uri in diagnostics {
+        let list = diagnostics[uri] ?? []
+        let params = encode_diagnostics(uri, list)
+        notify(s, "textDocument/publishDiagnostics", params)?
+    }
+}
+
+fn diagnose(s: *Server, e: compiler.Error, document: str) -> Located {
+    var d = Diagnostic { severity: severity_error, source: "low", message: compiler.message(e) }
+    match e {
+        Diag(inner) => {
+            match inner {
+                At(pos, msg) => {
+                    let at = located(pos, document)
+                    d.message = msg
+                    d.range = word(server_text(s, at.file), at)
+                    return Located { uri: uri_of(at.file), diagnostic: d }
+                }
+            }
+        }
+        _ => {}
+    }
+    Located { uri: uri_of(document), diagnostic: d }
+}
+
+pub fn server_query(s: *Server, p: PositionParams) -> *Query? {
+    let file_path = path_of(p.uri)
+    let state = state_of(s, file_path)
+    let prog = entry_program(state, s.tables)
+    let file = file_at(prog, file_path) ?? return none
+    let x = server_index(s, file_path, file)
+    let col = byte_col(x.text, p.position.line, p.position.character)
+    let occ = index_at(x, p.position.line, col) ?? return none
+    new(Query { program: prog, index: x, occ })
+}
+
+fn server_index(s: *Server, file_path: str, file: *ast.File) -> *Index {
+    let src = compiler.overlay_read(s.docs, file_path) or return new_index(file, Text {})
+    let held = indexed_matches(s.indexed, file_path, file, src)
+    match held {
+        some(x) => return x
+        none => {}
+    }
+    let x = new_index(file, new_text(src))
+    s.indexed = Indexed { path: file_path, src, index: x }
+    x
+}
+
+fn hover(s: *Server, p: PositionParams) -> str {
+    let q = server_query(s, p) ?? return "null"
+    let r = resolve(q)
+    let content = referent_hover(r)
+    if content == "" {
+        return "null"
+    }
+    var value = "```low\n{content}\n```"
+    let doc = referent_doc(r)
+    if doc != "" {
+        value = "{value}\n\n{doc}"
+    }
+    let covered = span(q.index.text, q.occ.pos, q.occ.name.len)
+    encode_hover(Hover { value, range: covered })
+}
+
+fn on_hover(s: *Server, req: Request) ! io.Error {
+    let p = decode_position_params(req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    let body = hover(s, p)
+    reply(s, req.id, body)?
+}
+
+fn definition(s: *Server, p: PositionParams) -> str {
+    let q = server_query(s, p) ?? return "null"
+    let tg = referent_target(resolve(q)) ?? return "null"
+    encode_location(server_locate(s, tg))
+}
+
+fn on_definition(s: *Server, req: Request) ! io.Error {
+    let p = decode_position_params(req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    let body = definition(s, p)
+    reply(s, req.id, body)?
+}
+
+fn cursor_at(s: *Server, p: PositionParams) -> *Cursor {
+    let file_path = path_of(p.uri)
+    let state = state_of(s, file_path)
+    let t = server_text(s, file_path)
+    let prog = entry_program(state, s.tables)
+    let col = byte_col(t, p.position.line, p.position.character)
+    let compiled = compiled_text(state, file_path)
+    new(Cursor { program: prog, file: file_at(prog, file_path), text: t, compiled, line: p.position.line, col })
+}
+
+fn on_completion(s: *Server, req: Request) ! io.Error {
+    let p = decode_position_params(req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    let items = complete(cursor_at(s, p))
+    reply(s, req.id, encode_completion(items))?
+}
+
+fn on_signature_help(s: *Server, req: Request) ! io.Error {
+    let p = decode_position_params(req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    let help = signature_help(cursor_at(s, p))
+    var body = "null"
+    match help {
+        some(h) => {
+            body = encode_signature_help(h)
+        }
+        none => {}
+    }
+    reply(s, req.id, body)?
+}
+
+fn on_references(s: *Server, req: Request) ! io.Error {
+    let p = decode_reference_params(req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    let body = references(s, p)
+    reply(s, req.id, body)?
+}
+
+fn on_rename(s: *Server, req: Request) ! io.Error {
+    let p = decode_rename_params(req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    let body = rename(s, p) catch {
+        e => {
+            fail_reply(s, req.id, request_failed, refusal_message(e))?
+            return
+        }
+    }
+    reply(s, req.id, body)?
+}
+
+pub fn server_locate(s: *Server, tg: Target) -> Location {
+    let t = server_text(s, tg.file_path)
+    var pos = tg.pos
+    if tg.name != "" {
+        pos = name_after(t, pos, tg.name)
+    }
+    Location { uri: uri_of(tg.file_path), range: word(t, pos) }
+}
+
+pub fn server_parsed(s: *Server, file_path: str) -> *ast.File? {
+    compiler.parse_file(s.docs, file_path) catch {
+        _ => none
+    }
+}
+
+fn on_document_symbols(s: *Server, req: Request) ! io.Error {
+    let p = decode_document_params(req.params) catch {
+        e => {
+            reject(s, req, e)?
+            return
+        }
+    }
+    let body = encode_symbols(symbols(s, path_of(p.uri)))
+    reply(s, req.id, body)?
+}
+
+fn symbols(s: *Server, file_path: str) -> []DocumentSymbol {
+    var file = server_parsed(s, file_path)
+    if file == none {
+        file = server_checked(s, file_path)
+    }
+    let found = file ?? return []
+    outline(found, server_text(s, file_path))
+}
+
+pub fn server_checked(s: *Server, file_path: str) -> *ast.File? {
+    let state = state_of(s, file_path)
+    file_at(entry_program(state, s.tables), file_path)
+}
