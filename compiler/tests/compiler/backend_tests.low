@@ -1,0 +1,168 @@
+import ir
+import std/math
+import std/regex
+import std/testing
+import std/text
+
+struct Literal {
+    name: str
+    want: str
+}
+
+struct Rotation {
+    name: str
+    width: str
+}
+
+fn backend_asm(t: *testing.T, name: str) -> []str {
+    let prog = dev_program(t, embed("programs/backend.txt"))
+    let body = function_asm(t, prog, name)
+    asm_lines(body)
+}
+
+fn dword_arithmetic(t: *testing.T) -> regex.Regex {
+    pattern(t, "^(add|sub|imul|shl|lea) (e[a-z]{{2}}|r\\d+d),")
+}
+
+fn self_extend(t: *testing.T) -> regex.Regex {
+    pattern(t, "^mov (e[a-z]{{2}}|r\\d+d), (e[a-z]{{2}}|r\\d+d)$")
+}
+
+fn test_unused_load_is_removed(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/backend.txt"))
+    let f = function(t, prog, "first_unused")
+    for b in f.blocks {
+        for v in b.values {
+            if v.op == ir.Op.OpLoad {
+                t.error("load of an unused element survives in block {b.id}:\n{ir.text(f)}")
+            }
+        }
+    }
+}
+
+fn test_unsigned_32_bit_arithmetic_uses_dword_forms(t: *testing.T) {
+    let dword_form = dword_arithmetic(t)
+    let extend_form = self_extend(t)
+    for name in ["add32", "mix32"] {
+        let lines = backend_asm(t, name)
+        var dword = 0
+        for line in lines {
+            if regex.is_match(extend_form, line) {
+                t.error("{name} moves between 32-bit registers: {line}")
+            }
+            if regex.is_match(dword_form, line) {
+                dword += 1
+            }
+        }
+        if dword == 0 {
+            t.error("{name} has no 32-bit arithmetic:\n{joined(lines)}")
+        }
+    }
+}
+
+fn test_unsigned_32_bit_add_uses_no_address_size_prefix(t: *testing.T) {
+    let lines = backend_asm(t, "add32")
+    if !contains_line(lines, "lea eax, [rdi+rsi]") {
+        t.error("add32 is not one lea with 64-bit address registers:\n{joined(lines)}")
+    }
+}
+
+fn test_widening_conversion_needs_no_normalisation(t: *testing.T) {
+    let dword_form = dword_arithmetic(t)
+    let extend_form = self_extend(t)
+    let lines = backend_asm(t, "widen")
+    for line in lines {
+        if regex.is_match(dword_form, line) || regex.is_match(extend_form, line) {
+            t.error("widening a u32 touches a 32-bit register: {line}")
+        }
+    }
+}
+
+fn test_shift_pair_becomes_rotate(t: *testing.T) {
+    let rotations = [Rotation { name: "rotl32", width: "rol e" }, Rotation { name: "rotr64", width: "rol r" }]
+    for rotation in rotations {
+        let lines = backend_asm(t, rotation.name)
+        if count_prefix(lines, rotation.width) != 1 {
+            t.error("{rotation.name} does not use one \"{rotation.width}\":\n{joined(lines)}")
+        }
+        if count_prefix(lines, "shr ") + count_prefix(lines, "shl ") != 0 {
+            t.error("{rotation.name} keeps its shifts:\n{joined(lines)}")
+        }
+    }
+}
+
+fn test_shift_pair_that_does_not_cover_the_width_is_not_a_rotate(t: *testing.T) {
+    let lines = backend_asm(t, "shifted_pair")
+    if count_prefix(lines, "rol ") != 0 {
+        t.error("shifts 7 and 24 of a 32-bit word are not a rotate:\n{joined(lines)}")
+    }
+}
+
+fn test_literal_comparison_is_inline(t: *testing.T) {
+    let literals = [Literal { name: "is_get", want: "cmp word ptr [rdi], 0x4547" }, Literal { name: "is_empty", want: "cmp rsi, 0" }]
+    for literal in literals {
+        let lines = backend_asm(t, literal.name)
+        if !contains_line(lines, literal.want) {
+            t.error("{literal.name} lacks \"{literal.want}\":\n{joined(lines)}")
+        }
+    }
+    for name in ["is_get", "is_empty"] {
+        let lines = backend_asm(t, name)
+        if contains_line(lines, "call rt_str_eq") {
+            t.error("{name} calls rt_str_eq")
+        }
+    }
+    let long_lines = backend_asm(t, "is_long")
+    if !contains_line(long_lines, "call rt_str_eq") {
+        t.error("a literal over the inline limit is compared inline")
+    }
+}
+
+fn test_string_comparison_checks_lengths_before_calling(t: *testing.T) {
+    let lines = backend_asm(t, "same")
+    var call = -1
+    for i, line in lines {
+        if line == "call rt_str_eq" {
+            call = i
+        }
+    }
+    if call < 3 || lines[call - 2] != "cmp rsi, rcx" || !text.starts_with(lines[call - 1], "jne ") {
+        t.error("the call is not guarded by a length comparison:\n{joined(lines)}")
+    }
+}
+
+fn test_grow_keeps_scalars_in_caller_saved_registers(t: *testing.T) {
+    let grow_call = pattern(t, "^call rt_grow_(scan|noscan)$")
+    let spill = pattern(t, register_spill)
+    let lines = backend_asm(t, "collect")
+    var grows = 0
+    for i, line in lines {
+        if !regex.is_match(grow_call, line) {
+            continue
+        }
+        grows += 1
+        for around in lines[math.max(0, i - 12)..i] {
+            if regex.is_match(spill, around) {
+                t.error("a caller-saved register is spilled around the grow call: {around}\n{joined(lines)}")
+            }
+        }
+    }
+    if grows != 1 {
+        t.error("{grows} grow calls:\n{joined(lines)}")
+    }
+}
+
+fn test_compression_loop_keeps_few_frame_operands(t: *testing.T) {
+    let source = fixture_source(t, "ra_sha256_pressure")
+    let prog = release_program(t, source)
+    let lines = function_lines(t, prog, "digest")
+    var frame = 0
+    for line in lines {
+        if text.contains(line, "[rbp-") {
+            frame += 1
+        }
+    }
+    if frame > 120 {
+        t.error("{frame} instructions address the frame in digest:\n{joined(lines)}")
+    }
+}

@@ -1,0 +1,593 @@
+import ir
+import std/math
+import std/regex
+import std/testing
+import std/text
+
+struct BoundsCase {
+    name: str
+    checks: i64
+}
+
+struct RemovalCase {
+    name: str
+    pattern: str
+    count: i64
+}
+
+struct LightCase {
+    bench: str
+    name: str
+    spills: bool
+}
+
+fn bounds_cases() -> []BoundsCase {
+    [
+        BoundsCase { name: "sum", checks: 0 }
+        BoundsCase { name: "nested", checks: 0 }
+        BoundsCase { name: "bump", checks: 1 }
+        BoundsCase { name: "grow", checks: 1 }
+    ]
+}
+
+fn test_bounds_checks_removed(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/bounds.txt"))
+    t.table_of(bounds_cases(), fn(c: BoundsCase) -> str { c.name }, fn(st: *testing.T, c: BoundsCase) {
+        let f = function(st, prog, c.name)
+        let got = count_checks(f)
+        if got != c.checks {
+            st.error("{got} checks, want {c.checks}\n{ir.text(f)}")
+        }
+        let panics = text.count(function_asm(st, prog, c.name), "rt_panic_index")
+        if (panics > 0) != (c.checks > 0) {
+            st.error("{panics} references to rt_panic_index with {c.checks} checks")
+        }
+    })
+}
+
+fn test_float32_call_result_is_cleared(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/float32_call.txt"))
+    let body = function_asm(t, prog, "root")
+    let cut = text.cut(body, "call sqrtf")
+    if !cut.found {
+        t.fatal("no call to sqrtf:\n{body}")
+    }
+    let cleared = pattern(t, "movd e[a-z0-9]+, xmm0|xorps (xmm\\d+), xmm\\d+\n\\s+movss xmm\\d+, xmm0")
+    if !regex.is_match(cleared, cut.after) {
+        t.error("the f32 result keeps its upper bits:\n{cut.after}")
+    }
+}
+
+fn removal_cases() -> []RemovalCase {
+    [
+        RemovalCase { name: "constant_branch", pattern: "\n  if ", count: 0 }
+        RemovalCase { name: "constant_branch", pattern: " = mul", count: 0 }
+        RemovalCase { name: "dead_cycle", pattern: " = add", count: 1 }
+        RemovalCase { name: "dead_cycle", pattern: " = phi", count: 1 }
+        RemovalCase { name: "unused_slot_load", pattern: " = load", count: 0 }
+        RemovalCase { name: "divisions", pattern: " = div", count: 0 }
+        RemovalCase { name: "divisions", pattern: " = rem", count: 0 }
+        RemovalCase { name: "kept_divisions", pattern: " = div", count: 2 }
+        RemovalCase { name: "kept_divisions", pattern: " = rem", count: 1 }
+    ]
+}
+
+fn test_optimiser_removals(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/fold.txt"))
+    t.table_of(removal_cases(), fn(c: RemovalCase) -> str { "{c.name}{c.pattern}" }, fn(st: *testing.T, c: RemovalCase) {
+        let f = function(st, prog, c.name)
+        let body = ir.text(f)
+        let got = text.count(body, c.pattern)
+        if got != c.count {
+            st.error("{got} of {text.quote(c.pattern)}, want {c.count}\n{body}")
+        }
+    })
+}
+
+fn jumps_to_next_label(lines: []str) -> []str {
+    var found: []str = []
+    for i in 0..lines.len - 1 {
+        let cut = text.strip_prefix(lines[i], "jmp ") ?? continue
+        if lines[i + 1] == "{cut}:" {
+            push(mut found, lines[i])
+        }
+    }
+    found
+}
+
+fn jump_only_labels(t: *testing.T, lines: []str) -> []str {
+    let label = pattern(t, asm_label)
+    var found: []str = []
+    for i in 0..lines.len - 1 {
+        if regex.is_match(label, lines[i]) && text.starts_with(lines[i + 1], "jmp ") {
+            push(mut found, lines[i])
+        }
+    }
+    found
+}
+
+fn test_no_jump_to_next_block(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/layout.txt"))
+    t.table_of(["fib", "sieve", "search", "main"], same_name, fn(st: *testing.T, name: str) {
+        let body = function_asm(st, prog, name)
+        let lines = asm_lines(body)
+        let found = jumps_to_next_label(lines)
+        if found.len > 0 {
+            st.error("jumps to the following label {testing.format(found)}:\n{body}")
+        }
+    })
+}
+
+fn test_no_jump_only_blocks(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/layout.txt"))
+    t.table_of(["sieve", "search"], same_name, fn(st: *testing.T, name: str) {
+        let body = function_asm(st, prog, name)
+        let lines = asm_lines(body)
+        let found = jump_only_labels(st, lines)
+        if found.len > 0 {
+            st.error("jump-only blocks {testing.format(found)}:\n{body}")
+        }
+    })
+}
+
+fn test_sieve_inner_loop_is_rotated(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/layout.txt"))
+    let lines = function_lines(t, prog, "sieve")
+    var inner = -1
+    for i, line in lines {
+        if text.starts_with(line, "add ") && i + 3 < lines.len && lines[i + 1] == "TLS_POLL" {
+            inner = i
+        }
+    }
+    if inner < 0 {
+        t.fatal("no polled latch after an add:\n{joined(lines)}")
+    }
+    let label = pattern(t, asm_label)
+    if !text.starts_with(lines[inner + 2], "jne ") || !regex.is_match(label, lines[inner + 3]) {
+        t.fatal("poll check is not followed by a resume label:\n{joined(lines[inner..inner + 4])}")
+    }
+    let rest = lines[inner + 4..]
+    let branch = pattern(t, "^j(l|b|ge|ae|le|g|a|be) ")
+    if rest.len < 2 || !text.starts_with(rest[0], "cmp ") || !regex.is_match(branch, rest[1]) {
+        let shown = lines[inner..math.min(inner + 7, lines.len)]
+        t.error("latch does not end with a compare and conditional branch:\n{joined(shown)}")
+    }
+}
+
+fn test_fib_base_case_saves_nothing(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/layout.txt"))
+    let body = function_asm(t, prog, "fib")
+    let cut = text.cut(body, "\tret\n")
+    if !cut.found {
+        t.fatal("no return in fib:\n{body}")
+    }
+    let base = cut.before
+    for reg in ["rbx", "r12", "r13", "r14", "r15"] {
+        if text.contains(base, reg) {
+            t.error("base case touches {reg}:\n{base}")
+        }
+    }
+    let saves = text.count(body, "], rbx") + text.count(body, "], r12")
+    if saves == 0 {
+        t.error("recursive path does not save callee-saved registers:\n{body}")
+    }
+    for setup in ["push rbp", "mov rbp, rsp", "sub rsp", "leave"] {
+        if text.contains(base, setup) {
+            t.error("base case contains {text.quote(setup)}:\n{base}")
+        }
+    }
+}
+
+fn light_path(t: *testing.T, body: str) -> []str {
+    let store = pattern(t, callee_saved_store)
+    let lines = asm_lines(body)
+    for i, line in lines {
+        if regex.is_match(store, line) {
+            return lines[..i]
+        }
+    }
+    t.fatal("no callee-saved register is saved:\n{body}")
+    []
+}
+
+fn light_cases() -> []LightCase {
+    [
+        LightCase { bench: "sort", name: "main", spills: false }
+        LightCase { bench: "sort", name: "quicksort[i64]", spills: true }
+        LightCase { bench: "mandelbrot", name: "main", spills: false }
+    ]
+}
+
+fn test_light_path_avoids_callee_saved_registers(t: *testing.T) {
+    t.table_of(light_cases(), fn(c: LightCase) -> str { "{c.bench}/{c.name}" }, fn(st: *testing.T, c: LightCase) {
+        let prog = dev_benchmark(st, c.bench)
+        let body = function_asm(st, prog, c.name)
+        let light = light_path(st, body)
+        let saved = pattern(st, callee_saved)
+        let spill = pattern(st, register_spill)
+        for line in light {
+            if regex.is_match(saved, line) {
+                st.error("light path uses a callee-saved register: {line}")
+            }
+            if !c.spills && regex.is_match(spill, line) {
+                st.error("light path spills a register: {line}")
+            }
+        }
+    })
+}
+
+fn test_sort_closure_is_frameless(t: *testing.T) {
+    let prog = dev_benchmark(t, "sort")
+    let body = function_asm(t, prog, "main..c1")
+    for setup in ["push", "rbp", "rsp", "leave", "call"] {
+        if text.contains(body, setup) {
+            t.error("closure contains {text.quote(setup)}:\n{body}")
+        }
+    }
+    let lines = asm_lines(body)
+    if !contains_line(lines, "ret") {
+        t.error("closure has no return:\n{body}")
+    }
+}
+
+fn test_quicksort_has_no_slot_to_slot_copies(t: *testing.T) {
+    let prog = dev_benchmark(t, "sort")
+    let lines = function_lines(t, prog, "quicksort[i64]")
+    let slot_load = pattern(t, "^mov (r10|r11), qword ptr \\[rbp-\\d+\\]$")
+    for i in 0..lines.len - 1 {
+        let scratch = group_of(slot_load, lines[i], 1) ?? continue
+        if text.starts_with(lines[i + 1], "mov qword ptr [rbp-") && text.ends_with(lines[i + 1], ", {scratch}") {
+            t.error("slot to slot copy: {lines[i]} ; {lines[i + 1]}")
+        }
+    }
+}
+
+fn test_small_join_is_cloned_onto_the_light_path(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/join.txt"))
+    let lines = function_lines(t, prog, "small")
+    if text.starts_with(lines[0], "push") {
+        t.error("small sets up a frame at entry:\n{joined(lines)}")
+    }
+}
+
+fn test_large_join_is_not_cloned(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/join.txt"))
+    let lines = function_lines(t, prog, "large")
+    if lines[0] != "push rbp" {
+        t.error("large does not set up its frame at entry:\n{joined(lines)}")
+    }
+    let cloned = text.count(joined(lines), "c:\n")
+    if cloned > 0 {
+        t.error("large contains {cloned} cloned blocks")
+    }
+}
+
+fn test_quicksort_element_access_uses_scaled_index(t: *testing.T) {
+    let prog = dev_benchmark(t, "sort")
+    let lines = function_lines(t, prog, "quicksort[i64]")
+    let scaled_form = pattern(t, scaled_element)
+    var scaled = 0
+    for line in lines {
+        if regex.is_match(scaled_form, line) {
+            scaled += 1
+        }
+        if text.starts_with(line, "shl ") && text.ends_with(line, ", 3") {
+            t.error("element offset computed by shift: {line}")
+        }
+    }
+    if scaled == 0 {
+        t.error("no load through a scaled index:\n{joined(lines)}")
+    }
+}
+
+fn test_quicksort_partition_index_stays_in_register(t: *testing.T) {
+    let prog = dev_benchmark(t, "sort")
+    let lines = function_lines(t, prog, "quicksort[i64]")
+    let scaled_form = pattern(t, scaled_element)
+    for i, line in lines {
+        let index = group_of(scaled_form, line, 3) ?? continue
+        let window = lines[i..math.min(i + 16, lines.len)]
+        if !contains_line(window, "add {index}, 1") && !contains_line(window, "sub {index}, 1") {
+            continue
+        }
+        let reload = "mov {index}, qword ptr [rbp-"
+        let store = "], {index}"
+        for w in window {
+            if text.starts_with(w, reload) || (text.starts_with(w, "mov qword ptr [rbp-") && text.ends_with(w, store)) {
+                t.error("loop index {index} is accessed through the frame: {w}")
+            }
+        }
+        return
+    }
+    t.fatal("no partition loop with a stepped register index:\n{joined(lines)}")
+}
+
+fn test_nbody_inner_loop_folds_loads_into_float_operations(t: *testing.T) {
+    let prog = dev_benchmark(t, "nbody")
+    let lines = function_lines(t, prog, "advance")
+    let with_memory = pattern(t, "^(add|sub|mul|div)sd xmm\\d+, qword ptr \\[r\\w+\\+r\\w+\\*\\d")
+    let folded = count_matches(with_memory, lines)
+    if folded < 6 {
+        t.error("{folded} float operations take a memory operand:\n{joined(lines)}")
+    }
+}
+
+fn test_mandelbrot_doubles_without_multiplying(t: *testing.T) {
+    let prog = dev_benchmark(t, "mandelbrot")
+    let lines = function_lines(t, prog, "escapes")
+    var doubled = false
+    for line in lines {
+        if text.starts_with(line, "mulsd ") && text.contains(line, "[rip+") {
+            t.error("multiplication by a constant: {line}")
+        }
+        let rest = text.strip_prefix(line, "addsd ") ?? continue
+        let operands = text.split_str(rest, ", ")
+        if operands.len == 2 && operands[0] == operands[1] {
+            doubled = true
+        }
+    }
+    if !doubled {
+        t.error("no register added to itself:\n{joined(lines)}")
+    }
+}
+
+fn label_positions(t: *testing.T, lines: []str) -> [str: i64] {
+    let label = pattern(t, asm_label)
+    var labels: [str: i64] = [:]
+    for i, line in lines {
+        if regex.is_match(label, line) {
+            labels[text.trim_suffix(line, ":")] = i
+        }
+    }
+    labels
+}
+
+fn marking_loop(t: *testing.T, lines: []str) -> []str {
+    var start = -1
+    for i, line in lines {
+        if text.starts_with(line, "imul ") {
+            start = i
+            break
+        }
+    }
+    if start < 0 {
+        t.fatal("no square before the marking loop:\n{joined(lines)}")
+    }
+    let labels = label_positions(t, lines)
+    let jump = pattern(t, jump_target)
+    for i in start + 1..lines.len {
+        let name = group_of(jump, lines[i], 1) ?? continue
+        match labels[name] {
+            some(head) => {
+                if head > start && head < i {
+                    return lines[head..i + 1]
+                }
+            }
+            none => {}
+        }
+    }
+    t.fatal("marking loop has no back edge:\n{joined(lines)}")
+    []
+}
+
+fn test_sieve_slice_lives_in_registers(t: *testing.T) {
+    let prog = dev_benchmark(t, "sieve")
+    let f = function(t, prog, "sieve")
+    if f.slots.len != 0 {
+        t.error("sieve keeps frame slots {testing.format(f.slots)}\n{ir.text(f)}")
+    }
+    let lines = function_lines(t, prog, "sieve")
+    for line in marking_loop(t, lines) {
+        if text.contains(line, "[rbp") {
+            t.error("marking loop reaches the frame: {line}")
+        }
+    }
+    let store = pattern(t, callee_saved_store)
+    for line in lines {
+        if text.contains(line, "[rbp") && !regex.is_match(store, line) && !text.starts_with(line, "mov rbx, qword ptr [rbp-") {
+            t.error("frame access outside the callee-saved registers: {line}")
+        }
+    }
+}
+
+fn test_sieve_checks_only_the_marking_index(t: *testing.T) {
+    let prog = dev_benchmark(t, "sieve")
+    let f = function(t, prog, "sieve")
+    let got = count_checks(f)
+    if got != 1 {
+        t.error("{got} checks, want 1 for the square-started marking index\n{ir.text(f)}")
+    }
+    let body = ir.text(f)
+    let param = group_of(pattern(t, "(v\\d+) = param #0"), body, 1)
+    match param {
+        some(name) => {
+            let guard = pattern(t, " = check \\[v\\d+ {name}\\]")
+            if !regex.is_match(guard, body) {
+                t.error("the check is not against the limit the slice was filled to\n{body}")
+            }
+        }
+        none => t.error("the check is not against the limit the slice was filled to\n{body}")
+    }
+    let lines = function_lines(t, prog, "sieve")
+    let loop = marking_loop(t, lines)
+    var checked = false
+    for line in loop {
+        if text.contains(line, "rt_panic_index") {
+            checked = true
+        }
+    }
+    if !checked {
+        t.error("marking loop lost the check on an index that starts at a square:\n{joined(loop)}")
+    }
+    let outside = text.count(joined(lines), "rt_panic_index") - 1
+    if outside != 0 {
+        t.error("{outside} other references to rt_panic_index")
+    }
+}
+
+fn jumps_back_over(t: *testing.T, lines: []str, at: i64) -> bool {
+    let labels = label_positions(t, lines)
+    let jump = pattern(t, jump_target)
+    for i in at + 1..lines.len {
+        let name = group_of(jump, lines[i], 1) ?? continue
+        match labels[name] {
+            some(head) => {
+                if head < at {
+                    return true
+                }
+            }
+            none => {}
+        }
+    }
+    false
+}
+
+fn test_sieve_fill_grows_once_outside_any_loop(t: *testing.T) {
+    let prog = dev_benchmark(t, "sieve")
+    let lines = function_lines(t, prog, "sieve")
+    var grows = 0
+    for i, line in lines {
+        if line != "call rt_grow_scan" && line != "call rt_grow_noscan" {
+            continue
+        }
+        grows += 1
+        if jumps_back_over(t, lines, i) {
+            t.error("the grow routine is called inside a loop:\n{joined(lines)}")
+        }
+    }
+    if grows == 0 {
+        t.error("no allocation for the filled slice:\n{joined(lines)}")
+    }
+}
+
+fn test_pushed_slice_takes_no_frame_slot(t: *testing.T) {
+    let prog = dev_program(t, embed("programs/pushed_slice.txt"))
+    let grown = function(t, prog, "grow_in_place").slots
+    if grown.len != 0 {
+        t.error("pushing to a local keeps frame slots {testing.format(grown)}")
+    }
+    let passed = function(t, prog, "passed_on").slots
+    if passed.len != 1 {
+        t.error("a slice passed as mut to a function has slots {testing.format(passed)}, want one")
+    }
+}
+
+fn test_mandelbrot_release_inlines_escapes(t: *testing.T) {
+    let prog = release_benchmark(t, "mandelbrot")
+    if has_function(prog, "escapes") {
+        t.error("escapes survives inlining")
+    }
+    let body = function_asm(t, prog, "main")
+    if text.contains(body, "call fn_escapes") {
+        t.error("main calls escapes:\n{body}")
+    }
+    let dev = dev_benchmark(t, "mandelbrot")
+    if !has_function(dev, "escapes") {
+        t.error("dev build inlined escapes")
+    }
+}
+
+fn test_nbody_pair_loop_multiplies_only_per_body(t: *testing.T) {
+    let prog = release_benchmark(t, "nbody")
+    let lines = function_lines(t, prog, "advance")
+    let multiplies = count_prefix(lines, "imul ")
+    if multiplies != 1 {
+        t.error("advance has {multiplies} multiplies, want the one outer body offset")
+    }
+}
+
+fn test_sort_release_calls_comparison_directly(t: *testing.T) {
+    let prog = release_benchmark(t, "sort")
+    let indirect = pattern(t, indirect_call)
+    let lines = function_lines(t, prog, "quicksort[i64]")
+    for line in lines {
+        if regex.is_match(indirect, line) {
+            t.error("quicksort calls through a function value: {line}")
+        }
+    }
+    if has_function(prog, "main..c1") {
+        t.error("the comparison closure is still emitted")
+    }
+    let dev = dev_benchmark(t, "sort")
+    let dev_lines = function_lines(t, dev, "quicksort[i64]")
+    if !any_match(indirect, dev_lines) {
+        t.error("dev build specialised quicksort")
+    }
+}
+
+fn test_sieve_release_marking_loop_has_no_index_check(t: *testing.T) {
+    let prog = release_benchmark(t, "sieve")
+    let f = function(t, prog, "sieve")
+    if f.param_words != 0 {
+        t.error("sieve keeps {f.param_words} parameter words although every call passes the same limit")
+    }
+    let got = count_checks(f)
+    if got != 0 {
+        t.error("{got} checks remain in sieve\n{ir.text(f)}")
+    }
+    let lines = function_lines(t, prog, "sieve")
+    let loop = marking_loop(t, lines)
+    for line in loop {
+        if text.contains(line, "rt_panic_index") {
+            t.error("marking loop still checks its index:\n{joined(loop)}")
+            break
+        }
+    }
+    let refs = text.count(joined(lines), "rt_panic_index")
+    if refs != 0 {
+        t.error("{refs} references to rt_panic_index in sieve")
+    }
+}
+
+fn test_sieve_marking_loop_starts_on_a_thirty_two_byte_boundary(t: *testing.T) {
+    let prog = release_benchmark(t, "sieve")
+    let lines = function_lines(t, prog, "sieve")
+    let loop = marking_loop(t, lines)
+    let jump = pattern(t, jump_target)
+    let back = group_of(jump, loop[loop.len - 1], 1) ?? ""
+    if back == "" {
+        t.fatal("marking loop does not end in a conditional jump:\n{joined(loop)}")
+    }
+    let head = index_of_line(lines, "{back}:")
+    if head < 1 || lines[head - 1] != ".p2align 5" {
+        t.error("marking loop head {back} is not aligned:\n{joined(lines)}")
+    }
+}
+
+fn test_light_equal_arm_stays_in_line(t: *testing.T) {
+    let prog = release_program(t, embed("programs/light_equal.txt"))
+    let lines = function_lines(t, prog, "weigh")
+    for i, line in lines {
+        let destination = text.strip_prefix(line, "jmp ") ?? continue
+        if i > 0 && lines[i - 1] == "call rt_poll" {
+            continue
+        }
+        let at = index_of_line(lines, "{destination}:")
+        if at >= 0 && at < i {
+            t.error("{line} jumps back from an out-of-line arm:\n{joined(lines)}")
+        }
+    }
+}
+
+fn test_sieve_prime_arm_is_out_of_line(t: *testing.T) {
+    let prog = release_benchmark(t, "sieve")
+    let lines = function_lines(t, prog, "sieve")
+    var branch = -1
+    var latch = -1
+    for i, line in lines {
+        if branch < 0 && text.starts_with(line, "je ") {
+            branch = i
+        }
+        if latch < 0 && text.starts_with(line, "jl ") {
+            latch = i
+        }
+    }
+    if branch < 0 {
+        t.fatal("no branch into the prime arm:\n{joined(lines)}")
+    }
+    let label = "{text.trim_prefix(lines[branch], "je ")}:"
+    let arm = index_of_line(lines, label)
+    if arm < branch || latch < branch || arm < latch {
+        t.error("prime arm at line {arm} does not follow the outer back edge at line {latch}:\n{joined(lines)}")
+    }
+}

@@ -1,0 +1,270 @@
+import amd64
+import compiler
+import ir
+import target
+import std/file
+import std/regex
+import std/testing
+import std/text
+
+const asm_label = "^[.A-Za-z_][.A-Za-z0-9_]*:$"
+const register_spill = "^mov qword ptr \\[rbp-\\d+\\], (rax|rcx|rdx|rsi|rdi|r8|r9|r10|r11)$"
+const callee_saved = "\\b(rbx|r12|r13|r14|r15)\\b"
+const callee_saved_store = "^mov qword ptr \\[rbp-\\d+\\], (rbx|r12|r13|r14|r15)$"
+const indirect_call = "^call (r(ax|bx|cx|dx|si|di|bp|8|9|1[0-5])|qword ptr)"
+const jump_target = "^j[a-z]+ (\\.L[A-Za-z0-9_]+)$"
+const scaled_element = "^mov (r\\w+), qword ptr \\[(r\\w+)\\+(r\\w+)\\*8\\]$"
+
+fn make_temp_dir(t: *testing.T) -> str {
+    file.temp_dir("low-compiler-") catch {
+        e => {
+            testing.fatal(t, "create temporary directory: {testing.format(e)}")
+            panic("fatal returned")
+        }
+    }
+}
+
+fn remove_dir(dir: str) {
+    file.remove_all(dir) or {}
+}
+
+fn write_text(t: *testing.T, location: str, contents: str) {
+    file.write_text(location, contents) catch {
+        e => testing.fatal(t, "write {location}: {testing.format(e)}")
+    }
+}
+
+fn read_text(t: *testing.T, location: str) -> str {
+    file.read_text(location) catch {
+        e => {
+            testing.fatal(t, "read {location}: {testing.format(e)}")
+            panic("fatal returned")
+        }
+    }
+}
+
+fn make_dir(t: *testing.T, location: str) {
+    file.mkdir_all(location) catch {
+        e => testing.fatal(t, "create {location}: {testing.format(e)}")
+    }
+}
+
+fn unit_with(t: *testing.T, source: str, profile: compiler.Profile) -> *compiler.Unit {
+    let dir = make_temp_dir(t)
+    let location = "{dir}/main.low"
+    write_text(t, location, source)
+    let analysed = compiler.analyse(location, profile) catch {
+        e => {
+            remove_dir(dir)
+            testing.fatal(t, compiler.message(e))
+            panic("fatal returned")
+        }
+    }
+    remove_dir(dir)
+    analysed
+}
+
+fn program_of(unit: *compiler.Unit) -> *ir.Program {
+    unit.program ?? panic("unit without a program")
+}
+
+fn dev_program(t: *testing.T, source: str) -> *ir.Program {
+    let unit = unit_with(t, source, compiler.dev())
+    program_of(unit)
+}
+
+fn release_program(t: *testing.T, source: str) -> *ir.Program {
+    let unit = unit_with(t, source, compiler.release(target.OS.Linux))
+    program_of(unit)
+}
+
+fn function(t: *testing.T, prog: *ir.Program, name: str) -> *ir.Func {
+    for f in prog.funcs {
+        if f.name == name {
+            return f
+        }
+    }
+    testing.fatal(t, "no function {name}")
+    panic("fatal returned")
+}
+
+fn has_function(prog: *ir.Program, name: str) -> bool {
+    for f in prog.funcs {
+        if f.name == name {
+            return true
+        }
+    }
+    false
+}
+
+fn count_checks(f: *ir.Func) -> i64 {
+    text.count(ir.text(f), " = check [")
+}
+
+fn count_instructions(f: *ir.Func, symbol: str) -> i64 {
+    var count = 0
+    for b in f.blocks {
+        for v in b.values {
+            if v.op != ir.Op.OpRuntime {
+                continue
+            }
+            let entry = v.runtime ?? panic("runtime value without an entry")
+            if ir.runtime_symbol(entry) == symbol {
+                count += 1
+            }
+        }
+    }
+    count
+}
+
+fn is_function_label(line: str) -> bool {
+    if line.len < 5 || !text.starts_with(line, "fn_") || !text.ends_with(line, ":") {
+        return false
+    }
+    for i in 3..line.len - 1 {
+        let c = line[i]
+        let word = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.'
+        if !word {
+            return false
+        }
+    }
+    true
+}
+
+fn function_body(asm: str, name: str) -> str? {
+    let label = "{amd64.symbol(name, "")}:\n"
+    let start = text.index(asm, label)
+    if start < 0 {
+        return none
+    }
+    let body = asm[start + label.len..]
+    var offset = 0
+    for line in text.split(body, '\n') {
+        if is_function_label(line) {
+            return body[..offset]
+        }
+        offset += line.len + 1
+    }
+    body
+}
+
+fn function_asm(t: *testing.T, prog: *ir.Program, name: str) -> str {
+    let platform = amd64.new_platform(target.OS.Linux)
+    let out = amd64.generate(prog, platform, none) catch {
+        e => {
+            testing.fatal(t, amd64.error_message(e))
+            panic("fatal returned")
+        }
+    }
+    let body = function_body(out.asm, name)
+    match body {
+        some(found) => found
+        none => {
+            testing.fatal(t, "no label {amd64.symbol(name, "")}:")
+            panic("fatal returned")
+        }
+    }
+}
+
+fn asm_lines(body: str) -> []str {
+    var lines: []str = []
+    for line in text.split(body, '\n') {
+        let trimmed = text.trim(line)
+        if trimmed.len > 0 {
+            push(mut lines, trimmed)
+        }
+    }
+    lines
+}
+
+fn joined(lines: []str) -> str {
+    text.join(lines, "\n")
+}
+
+fn count_prefix(lines: []str, prefix: str) -> i64 {
+    var count = 0
+    for line in lines {
+        if text.starts_with(line, prefix) {
+            count += 1
+        }
+    }
+    count
+}
+
+fn contains_line(lines: []str, want: str) -> bool {
+    index_of_line(lines, want) >= 0
+}
+
+fn index_of_line(lines: []str, want: str) -> i64 {
+    for i, line in lines {
+        if line == want {
+            return i
+        }
+    }
+    -1
+}
+
+fn pattern(t: *testing.T, source: str) -> regex.Regex {
+    regex.compile(source) catch {
+        e => {
+            testing.fatal(t, "pattern {source}: {testing.format(e)}")
+            panic("fatal returned")
+        }
+    }
+}
+
+fn same_name(name: str) -> str {
+    name
+}
+
+fn count_matches(re: regex.Regex, lines: []str) -> i64 {
+    var count = 0
+    for line in lines {
+        if regex.is_match(re, line) {
+            count += 1
+        }
+    }
+    count
+}
+
+fn any_match(re: regex.Regex, lines: []str) -> bool {
+    count_matches(re, lines) > 0
+}
+
+fn group_of(re: regex.Regex, line: str, index_of_group: i64) -> str? {
+    let m = regex.find(re, line) ?? return none
+    regex.group(m, index_of_group)
+}
+
+fn fixture_source(t: *testing.T, name: str) -> str {
+    read_text(t, "testdata/run/{name}.low")
+}
+
+fn benchmark_source(t: *testing.T, name: str) -> str {
+    read_text(t, "bench/{name}/main.low")
+}
+
+fn dev_fixture(t: *testing.T, name: str) -> *ir.Program {
+    let source = fixture_source(t, name)
+    dev_program(t, source)
+}
+
+fn release_fixture(t: *testing.T, name: str) -> *ir.Program {
+    let source = fixture_source(t, name)
+    release_program(t, source)
+}
+
+fn dev_benchmark(t: *testing.T, name: str) -> *ir.Program {
+    let source = benchmark_source(t, name)
+    dev_program(t, source)
+}
+
+fn release_benchmark(t: *testing.T, name: str) -> *ir.Program {
+    let source = benchmark_source(t, name)
+    release_program(t, source)
+}
+
+fn function_lines(t: *testing.T, prog: *ir.Program, name: str) -> []str {
+    let body = function_asm(t, prog, name)
+    asm_lines(body)
+}
