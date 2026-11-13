@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,6 +31,26 @@ type output struct {
 }
 
 type pixel [4]int
+
+type tint [3]float64
+
+var (
+	red   = tint{1, 0, 0}
+	green = tint{0, 1, 0}
+	blue  = tint{0, 0, 1}
+	white = tint{1, 1, 1}
+)
+
+func (c tint) drawn(coverage int) int {
+	const enhancedContrast = 1.0
+	ratios := [4]float64{0.1469 / 4, -0.8911 / 4, 1.4644 / 4, -0.3234 / 4}
+	light := 0.30*c[0] + 0.59*c[1] + 0.11*c[2]
+	k := enhancedContrast * min(max(4*(0.75-light), 0), 1)
+	raw := float64(coverage) / 255
+	a := raw * (k + 1) / (raw*k + 1)
+	shift := (ratios[0]*light+ratios[1])*a + (ratios[2]*light + ratios[3])
+	return int(math.Round(255 * min(max(a+a*(1-a)*shift, 0), 1)))
+}
 
 func programs(t *testing.T) []string {
 	t.Helper()
@@ -281,30 +302,30 @@ func TestSprites(t *testing.T) {
 
 	f.expect(t, 4, 4, pixel{255, 0, 0, 255}, 1)
 	f.expect(t, 5, 4, pixel{255, 0, 0, 255}, 1)
-	f.expect(t, 6, 4, pixel{128, 0, 0, 255}, 2)
-	f.expect(t, 7, 4, pixel{128, 0, 0, 255}, 2)
+	f.expect(t, 6, 4, pixel{red.drawn(128), 0, 0, 255}, 2)
+	f.expect(t, 7, 4, pixel{red.drawn(128), 0, 0, 255}, 2)
 	f.expect(t, 8, 4, pixel{0, 0, 0, 255}, 0)
 	f.expect(t, 9, 4, pixel{0, 0, 0, 255}, 0)
-	f.expect(t, 10, 4, pixel{64, 0, 0, 255}, 2)
-	f.expect(t, 11, 4, pixel{64, 0, 0, 255}, 2)
+	f.expect(t, 10, 4, pixel{red.drawn(64), 0, 0, 255}, 2)
+	f.expect(t, 11, 4, pixel{red.drawn(64), 0, 0, 255}, 2)
 	f.expect(t, 4, 5, pixel{255, 0, 0, 255}, 1)
 	f.expect(t, 12, 4, pixel{0, 0, 0, 255}, 0)
 	f.expect(t, 4, 6, pixel{0, 0, 0, 255}, 0)
 
-	f.expect(t, 4, 10, pixel{0, 128, 0, 255}, 2)
-	f.expect(t, 6, 10, pixel{0, 64, 0, 255}, 2)
+	f.expect(t, 4, 10, pixel{0, 0x80, 0, 255}, 2)
+	f.expect(t, 6, 10, pixel{0, green.drawn(128) * 0x80 / 0xff, 0, 255}, 2)
 	f.expect(t, 8, 10, pixel{0, 0, 0, 255}, 0)
-	f.expect(t, 10, 10, pixel{0, 32, 0, 255}, 2)
+	f.expect(t, 10, 10, pixel{0, green.drawn(64) * 0x80 / 0xff, 0, 255}, 2)
 
 	for y := 16; y < 20; y++ {
 		f.expect(t, 4, y, pixel{0, 0, 255, 255}, 1)
 		f.expect(t, 7, y, pixel{0, 0, 255, 255}, 1)
-		f.expect(t, 8, y, pixel{0, 0, 128, 255}, 2)
-		f.expect(t, 11, y, pixel{0, 0, 128, 255}, 2)
+		f.expect(t, 8, y, pixel{0, 0, blue.drawn(128), 255}, 2)
+		f.expect(t, 11, y, pixel{0, 0, blue.drawn(128), 255}, 2)
 		f.expect(t, 12, y, pixel{0, 0, 0, 255}, 0)
 		f.expect(t, 15, y, pixel{0, 0, 0, 255}, 0)
-		f.expect(t, 16, y, pixel{0, 0, 64, 255}, 2)
-		f.expect(t, 19, y, pixel{0, 0, 64, 255}, 2)
+		f.expect(t, 16, y, pixel{0, 0, blue.drawn(64), 255}, 2)
+		f.expect(t, 19, y, pixel{0, 0, blue.drawn(64), 255}, 2)
 	}
 	f.expect(t, 20, 16, pixel{0, 0, 0, 255}, 0)
 	f.expect(t, 4, 20, pixel{0, 0, 0, 255}, 0)
@@ -431,7 +452,8 @@ func TestAtlasUpdates(t *testing.T) {
 	covered := func(coverage ...int) []pixel {
 		pixels := make([]pixel, len(coverage))
 		for i, c := range coverage {
-			pixels[i] = pixel{c, c, c, 255}
+			v := white.drawn(c)
+			pixels[i] = pixel{v, v, v, 255}
 		}
 		return pixels
 	}

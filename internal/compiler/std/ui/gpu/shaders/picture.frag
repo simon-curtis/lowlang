@@ -16,7 +16,9 @@ void main() {
     vec2 center = picture.bounds.xy + half_size;
     float radius = pick_corner(pixel - center, picture.corner_radii);
     float coverage = clamp(0.5 - rounded_distance(pixel, center, half_size, radius), 0.0, 1.0);
-    vec4 sampled = texture(colors, uv);
+    vec2 half_texel = 0.5 / vec2(textureSize(colors, 0));
+    vec2 inside = clamp(uv, picture.tile.xy + half_texel, picture.tile.xy + picture.tile.zw - half_texel);
+    vec4 sampled = texture(colors, inside);
     float luminance = dot(sampled.rgb, vec3(0.2126, 0.7152, 0.0722));
     vec3 rgb = mix(sampled.rgb, vec3(luminance), picture.tone.y);
     color = vec4(rgb, sampled.a * picture.tone.x * coverage * clip_alpha(pixel, picture.clip));
