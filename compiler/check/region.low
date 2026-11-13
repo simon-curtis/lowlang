@@ -1,0 +1,179 @@
+import ast
+import builtin
+import diag
+import lexer
+import types
+import std/text
+
+fn region(c: *Checker, e: *ast.Region, want: *types.Type?) ! diag.Error {
+    let t = region_body(c, e.body, want)?
+    e.type = t
+    if types.abstract(t) || !t.has_pointers() {
+        return
+    }
+    let seen: [*types.Type: bool] = [:]
+    let blocker = copy_blocker(c, t, seen)
+    if blocker != "" {
+        fail At(e.pos, "a region cannot return {t.text()}: it contains {blocker}")
+    }
+    e.copy = derive(c, Derivation.Duplicate, t, e.pos)?
+}
+
+fn region_body(c: *Checker, body: *ast.Block, want: *types.Type?) -> *types.Type ! diag.Error {
+    let outer = c.ctx.region_loops
+    c.ctx.regions += 1
+    c.ctx.region_loops = c.ctx.loops.len
+    defer {
+        c.ctx.regions -= 1
+        c.ctx.region_loops = outer
+    }
+    block(c, body, want)?
+}
+
+fn copy_blocker(c: *Checker, t: *types.Type, seen: [*types.Type: bool]) -> str {
+    if seen[t] != none {
+        return ""
+    }
+    seen[t] = true
+    match t.kind {
+        FuncKind => "a function"
+        ChanKind => "a channel"
+        RawKind => "a ptr"
+        ResultKind => "an error result"
+        SliceKind => copy_blocker(c, t.elem_of(), seen)
+        PointerKind => copy_blocker(c, t.elem_of(), seen)
+        MapKind => first_blocker(c, seen, [t.key_of(), t.elem_of()])
+        EnumKind => variant_blocker(c, t, seen)
+        StructKind => struct_blocker(c, t, seen)
+        _ => ""
+    }
+}
+
+fn variant_blocker(c: *Checker, t: *types.Type, seen: [*types.Type: bool]) -> str {
+    if t.optional {
+        return copy_blocker(c, t.elem_of(), seen)
+    }
+    for v in t.variants {
+        let blocker = first_blocker(c, seen, v.fields)
+        if blocker != "" {
+            return blocker
+        }
+    }
+    ""
+}
+
+fn struct_blocker(c: *Checker, t: *types.Type, seen: [*types.Type: bool]) -> str {
+    if t.c {
+        return "{t.text()}, an extern struct"
+    }
+    if droppable(c, t) {
+        return "{t.text()}, which has drop"
+    }
+    for f in t.fields {
+        let blocker = copy_blocker(c, f.type, seen)
+        if blocker != "" {
+            return blocker
+        }
+    }
+    ""
+}
+
+fn first_blocker(c: *Checker, seen: [*types.Type: bool], list: []*types.Type) -> str {
+    for t in list {
+        let blocker = copy_blocker(c, t, seen)
+        if blocker != "" {
+            return blocker
+        }
+    }
+    ""
+}
+
+fn copy_into_call(c: *Checker, e: *ast.Call) ! diag.Error {
+    let path_type = c.universe.slice(c.universe.i64)?
+    let path = mut_of(c, e, 0, path_type)?
+    address(c, path)
+    let t = plain(c, e.args[1], none)?
+    exclusive(c, e.args)?
+    e.builtin = builtin.ID.None
+    e.type = t
+    if !types.abstract(t) {
+        e.target = derive(c, Derivation.Duplicate, t, e.pos)?
+    }
+}
+
+fn copy_into(expr: str, t: *types.Type) -> str {
+    if !t.has_pointers() {
+        return expr
+    }
+    "__copy_into(mut path, {expr})"
+}
+
+fn duplicate(s: *Synth, t: *types.Type) ! diag.Error {
+    let self = bound_name(s, t)
+    let u = s.c.universe
+    if t == u.str {
+        line(s, "if v.len == 0 {{\nreturn \"\"\n}}\nvar bytes: []u8 = __make(v.len)\n__memmove(bytes, v)\n__str_view(bytes)")
+    } else if t.kind == SliceKind && !t.elem_of().has_pointers() {
+        line(s, "if v.len == 0 {{\nreturn []\n}}\nvar out: {self} = __make(v.len)\n__memmove(out, v)\nout")
+    } else if t.kind == SliceKind {
+        let element = copy_into("x", t.elem_of())
+        line(s, "var out: {self} = __make(v.len)\nfor i, x in v {{\nout[i] = {element}\n}}\nout")
+    } else if t.kind == MapKind {
+        let key = copy_into("k", t.key_of())
+        let element = copy_into("x", t.elem_of())
+        line(s, "var out: {self} = [:]\nfor k, x in v {{\nout[{key}] = {element}\n}}\nout")
+    } else if is_optional(t) {
+        let element = copy_into("x", t.elem_of())
+        line(s, "match v {{\nsome(x) => {element}\nnone => none\n}}")
+    } else if t.kind == PointerKind {
+        duplicate_pointer(s, t)
+    } else if t.kind == StructKind {
+        duplicate_struct(s, t, self)
+    } else if t.kind == EnumKind {
+        duplicate_enum(s, t, self)
+    } else {
+        unsupported(s, t)?
+    }
+}
+
+fn duplicate_pointer(s: *Synth, t: *types.Type) {
+    let message = lexer.quote("region: cycle through {t.text()}")
+    line(s, "let address = __address(v)\nfor seen in path {{\nif seen == address {{\npanic({message})\n}}\n}}")
+    let target = copy_into("*v", t.elem_of())
+    line(s, "push(mut path, address)\nlet out = new({target})\ntruncate(mut path, path.len - 1)\nout")
+}
+
+fn duplicate_struct(s: *Synth, t: *types.Type, self: str) {
+    var inits: []str = []
+    for f in t.fields {
+        let init = copy_into("v.{f.name}", f.type)
+        push(mut inits, "{f.name}: {init}")
+    }
+    let fields = text.join(inits, ", ")
+    line(s, "{self} {{ {fields} }}")
+}
+
+fn duplicate_enum(s: *Synth, t: *types.Type, self: str) {
+    line(s, "match v {{")
+    for v in t.variants {
+        duplicate_variant(s, v, self)
+    }
+    line(s, "}}")
+}
+
+fn duplicate_variant(s: *Synth, v: *types.Variant, self: str) {
+    if v.fields.len == 0 {
+        line(s, "{v.name} => {self}.{v.name}")
+        return
+    }
+    var binds: []str = []
+    var args: []str = []
+    for i, f in v.fields {
+        let bind = "f{i}"
+        push(mut binds, bind)
+        push(mut args, copy_into(bind, f))
+    }
+    let bound = text.join(binds, ", ")
+    let passed = text.join(args, ", ")
+    line(s, "{v.name}({bound}) => {self}.{v.name}({passed})")
+}

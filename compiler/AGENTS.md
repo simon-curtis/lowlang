@@ -26,6 +26,8 @@ The commands are `tokens`, `ast`, `check`, `ir`, `asm`, `object`, `link`, `patch
 
 Compare stdout, stderr and the exit status over every `.low` file under `testdata/`, `internal/compiler/` and `bench/`, including the files that must fail.
 
+Sweeps, snapshots and test runs write gigabytes. Where `/tmp` is a `tmpfs` it is held in memory, so keep that work on disk and point both toolchains' temporary files there: `TMPDIR=<disk dir> GOTMPDIR=<disk dir>`. Run sweeps with at most 8 jobs at once.
+
 The Low `low` builds itself: `/tmp/low build compiler/low -o /tmp/low1`, then `/tmp/low1 build compiler/low -o /tmp/low2` and `/tmp/low2 build compiler/low -o /tmp/low3` give three byte-identical executables, and each builds every program to the same bytes as the Go `low`.
 
 ## Porting rules
