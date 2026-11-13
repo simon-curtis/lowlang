@@ -1,0 +1,510 @@
+import diag
+import std/builder
+import std/text
+import std/unicode
+
+struct Lexer {
+    src: str
+    file: str
+    off: i64 = 0
+    from: i64 = 0
+    line: i64
+    col: i64
+    last: Kind = Newline
+    tokens: []Token = []
+    doc: []str = []
+    doc_at: diag.Pos = diag.Pos {}
+    privileged: bool
+    operators: []Spelling
+}
+
+pub fn lex(src: str, at: diag.Pos, privileged: bool) -> []Token ! diag.Error {
+    lex_with(src, at, privileged, operator_spellings())?
+}
+
+fn lex_with(src: str, at: diag.Pos, privileged: bool, operators: []Spelling) -> []Token ! diag.Error {
+    let l = new(Lexer { src, file: at.file, line: at.line, col: at.col, privileged, operators })
+    for {
+        l.skip_space()
+        if l.off >= l.src.len {
+            l.emit_newline(l.pos())
+            l.emit(Token { kind: EOF, pos: l.pos() })
+            return l.tokens
+        }
+        l.next()?
+    }
+    l.tokens
+}
+
+fn pos(l: *Lexer) -> diag.Pos {
+    diag.Pos { file: l.file, line: l.line, col: l.col }
+}
+
+fn peek(l: *Lexer, ahead: i64) -> u8 {
+    if l.off + ahead >= l.src.len {
+        return 0
+    }
+    l.src[l.off + ahead]
+}
+
+fn advance(l: *Lexer) -> u8 {
+    let c = l.src[l.off]
+    l.off += 1
+    if c == '\n' {
+        l.line += 1
+        l.col = 1
+    } else {
+        l.col += 1
+    }
+    c
+}
+
+fn emit(l: *Lexer, token: Token) {
+    var t = token
+    t.start = l.from
+    t.end = l.off
+    if t.kind != Newline && l.doc.len > 0 {
+        t.doc = text.join(l.doc, "\n")
+        t.doc_at = l.doc_at
+        l.doc = []
+    }
+    push(mut l.tokens, t)
+    l.last = t.kind
+}
+
+fn ends_statement(k: Kind) -> bool {
+    match k {
+        Ident => true
+        Int => true
+        Float => true
+        Char => true
+        String => true
+        True => true
+        False => true
+        Break => true
+        Continue => true
+        Return => true
+        RParen => true
+        RBrace => true
+        RBracket => true
+        Question => true
+        _ => false
+    }
+}
+
+fn emit_newline(l: *Lexer, p: diag.Pos) {
+    if ends_statement(l.last) {
+        l.emit(Token { kind: Newline, pos: p })
+    }
+}
+
+fn continued(l: *Lexer) -> bool {
+    let src = l.src
+    var at = l.off
+    for at < src.len {
+        let c = src[at]
+        if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+            at += 1
+        } else if c == '/' && at + 1 < src.len && src[at + 1] == '/' {
+            for at < src.len && src[at] != '\n' {
+                at += 1
+            }
+        } else if c == '|' {
+            return at + 1 < src.len && src[at + 1] == '>'
+        } else if c == '.' {
+            return at + 1 >= src.len || src[at + 1] != '.'
+        } else {
+            return false
+        }
+    }
+    false
+}
+
+fn skip_space(l: *Lexer) {
+    for l.off < l.src.len {
+        let c = l.peek(0)
+        if c == ' ' || c == '\t' || c == '\r' {
+            l.advance()
+        } else if c == '/' && l.peek(1) == '/' {
+            l.comment()
+        } else {
+            return
+        }
+    }
+}
+
+fn comment(l: *Lexer) {
+    let start = l.off
+    let at = l.pos()
+    for l.off < l.src.len && l.peek(0) != '\n' {
+        l.advance()
+    }
+    let line = l.src[start..l.off]
+    if !text.starts_with(line, "///") {
+        return
+    }
+    let body = line[3..]
+    if text.starts_with(body, "/") || !l.line_start(start) {
+        return
+    }
+    if l.doc.len == 0 {
+        l.doc_at = at
+    }
+    push(mut l.doc, text.trim_suffix(text.trim_prefix(body, " "), "\r"))
+}
+
+fn line_start(l: *Lexer, from: i64) -> bool {
+    var at = from
+    for at > 0 {
+        at -= 1
+        let c = l.src[at]
+        if c == '\n' {
+            return true
+        }
+        if c != ' ' && c != '\t' {
+            return false
+        }
+    }
+    true
+}
+
+fn next(l: *Lexer) ! diag.Error {
+    let start = l.pos()
+    l.from = l.off
+    let c = l.peek(0)
+    if c == '\n' {
+        if !l.continued() {
+            l.emit_newline(start)
+        }
+        l.advance()
+    } else if is_letter(c) {
+        l.ident(start)?
+    } else if is_digit(c) {
+        l.number(start)?
+    } else if c == '"' {
+        l.string(start)?
+    } else if c == '\'' {
+        l.char(start)?
+    } else {
+        l.symbol(start)?
+    }
+}
+
+fn ident(l: *Lexer, start: diag.Pos) ! diag.Error {
+    let from = l.off
+    for l.off < l.src.len && (is_letter(l.peek(0)) || is_digit(l.peek(0))) {
+        l.advance()
+    }
+    let name = l.src[from..l.off]
+    if text.starts_with(name, "__") && !l.privileged {
+        fail At(start, "names starting with __ are reserved")
+    }
+    l.emit(Token { kind: keyword(name) ?? Ident, text: name, pos: start })
+}
+
+fn number(l: *Lexer, start: diag.Pos) ! diag.Error {
+    let from = l.off
+    var kind = Kind.Int
+    if l.peek(0) == '0' && (l.peek(1) == 'x' || l.peek(1) == 'b' || l.peek(1) == 'o') {
+        l.advance()
+        l.advance()
+        l.digits(is_hex_digit)
+        l.emit_number(kind, from, start, is_hex_digit)?
+        return
+    }
+    l.digits(is_digit)
+    if l.peek(0) == '.' && is_digit(l.peek(1)) {
+        kind = Float
+        l.advance()
+        l.digits(is_digit)
+    }
+    let e = l.peek(0)
+    if e == 'e' || e == 'E' {
+        kind = Float
+        l.advance()
+        let sign = l.peek(0)
+        if sign == '+' || sign == '-' {
+            l.advance()
+        }
+        l.digits(is_digit)
+    }
+    l.emit_number(kind, from, start, is_digit)?
+}
+
+fn digits(l: *Lexer, accept: fn(u8) -> bool) {
+    for l.off < l.src.len && (accept(l.peek(0)) || l.peek(0) == '_') {
+        l.advance()
+    }
+}
+
+fn emit_number(l: *Lexer, kind: Kind, from: i64, start: diag.Pos, digit: fn(u8) -> bool) ! diag.Error {
+    let raw = l.src[from..l.off]
+    var separated = false
+    for i in 0..raw.len {
+        if raw[i] != '_' {
+            continue
+        }
+        separated = true
+        if i == 0 || i == raw.len - 1 || !digit(raw[i - 1]) || !digit(raw[i + 1]) {
+            fail At(start, "_ in a number must sit between two digits")
+        }
+    }
+    let digits = if separated { text.replace(raw, "_", "") } else { raw }
+    l.emit(Token { kind, text: digits, pos: start })
+}
+
+fn escape_value(letter: u8) -> u8? {
+    match letter {
+        'n' => '\n'
+        't' => '\t'
+        'r' => '\r'
+        '0' => 0
+        '\\' => '\\'
+        '"' => '"'
+        '\'' => '\''
+        _ => none
+    }
+}
+
+fn escape_letter(c: u8) -> u8? {
+    match c {
+        '\n' => 'n'
+        '\t' => 't'
+        '\r' => 'r'
+        0 => '0'
+        '\\' => '\\'
+        '"' => '"'
+        '\'' => '\''
+        _ => none
+    }
+}
+
+pub fn quote(s: str) -> str {
+    var b = builder.with_capacity(s.len + 2)
+    b.write_byte('"')
+    for i in 0..s.len {
+        let c = s[i]
+        match escape_letter(c) {
+            some(letter) => {
+                b.write_byte('\\')
+                b.write_byte(letter)
+            }
+            none => {
+                if c == '{' || c == '}' {
+                    b.write_byte(c)
+                }
+                b.write_byte(c)
+            }
+        }
+    }
+    b.write_byte('"')
+    b.to_str()
+}
+
+fn unterminated(l: *Lexer) -> bool {
+    l.off >= l.src.len || l.peek(0) == '\n'
+}
+
+fn escape(l: *Lexer, mut b: builder.Builder) ! diag.Error {
+    let at = l.pos()
+    l.advance()
+    if l.unterminated() {
+        fail At(at, "unterminated escape sequence")
+    }
+    let e = escape_value(l.advance()) ?? fail At(at, "unknown escape sequence")
+    b.write_byte(e)
+}
+
+fn string(l: *Lexer, start: diag.Pos) ! diag.Error {
+    l.advance()
+    var parts: []Part = []
+    var b = builder.builder()
+    for {
+        if l.unterminated() {
+            fail At(start, "unterminated string")
+        }
+        let c = l.peek(0)
+        let following = l.peek(1)
+        if c == '"' {
+            l.advance()
+            l.emit_string(start, parts, b.to_str())
+            return
+        } else if (c == '{' && following == '{') || (c == '}' && following == '}') {
+            l.advance()
+            b.write_byte(l.advance())
+        } else if c == '}' {
+            fail At(l.pos(), "unmatched }} in string; write }}}}")
+        } else if c == '{' {
+            push(mut parts, Part { text: b.to_str() })
+            b.reset()
+            let part = l.interpolation()?
+            push(mut parts, part)
+        } else if c == '\\' {
+            l.escape(mut b)?
+        } else {
+            b.write_byte(l.advance())
+        }
+    }
+}
+
+fn emit_string(l: *Lexer, start: diag.Pos, parts: []Part, tail: str) {
+    if parts.len == 0 {
+        l.emit(Token { kind: String, text: tail, pos: start })
+        return
+    }
+    var all = parts
+    push(mut all, Part { text: tail })
+    l.emit(Token { kind: String, parts: all, pos: start })
+}
+
+fn interpolation(l: *Lexer) -> Part ! diag.Error {
+    let open = l.pos()
+    l.advance()
+    let at = l.pos()
+    var from = l.off
+    let stop = l.expression_end(open)?
+    let source = l.src[from..l.off]
+    if text.trim(source) == "" {
+        fail At(open, "empty interpolation")
+    }
+    let tokens = lex_with(source, at, l.privileged, l.operators)?
+    var part = Part { expr: true, tokens }
+    if stop != '}' {
+        part.spec_pos = l.pos()
+        from = l.off
+        l.spec_end(open)?
+        part.spec = l.src[from..l.off]
+    }
+    l.advance()
+    part
+}
+
+fn expression_end(l: *Lexer, open: diag.Pos) -> u8 ! diag.Error {
+    var depth = 0
+    for {
+        if l.unterminated() {
+            fail At(open, "unterminated interpolation")
+        }
+        let c = l.peek(0)
+        if c == '(' || c == '[' || c == '{' {
+            depth += 1
+        } else if c == ')' || c == ']' {
+            depth = if depth > 0 { depth - 1 } else { 0 }
+        } else if c == '}' {
+            if depth == 0 {
+                return c
+            }
+            depth -= 1
+        } else if c == ',' || c == ':' {
+            if depth == 0 {
+                return c
+            }
+        } else if c == '"' || c == '\'' {
+            l.skip_quoted(open)?
+            continue
+        }
+        l.advance()
+    }
+    0
+}
+
+fn spec_end(l: *Lexer, open: diag.Pos) ! diag.Error {
+    for l.peek(0) != '}' {
+        if l.unterminated() {
+            fail At(open, "unterminated interpolation")
+        }
+        l.advance()
+    }
+}
+
+fn skip_quoted(l: *Lexer, open: diag.Pos) ! diag.Error {
+    let quote = l.advance()
+    for {
+        if l.unterminated() {
+            fail At(open, "unterminated interpolation")
+        }
+        let c = l.advance()
+        if c == quote {
+            return
+        }
+        if c == '\\' && !l.unterminated() {
+            l.advance()
+        }
+    }
+}
+
+fn char(l: *Lexer, start: diag.Pos) ! diag.Error {
+    l.advance()
+    var code: u32 = 0
+    if l.unterminated() || l.peek(0) == '\'' {
+        fail At(start, "empty character literal")
+    } else if l.peek(0) == '\\' {
+        var b = builder.builder()
+        l.escape(mut b)?
+        code = u32(b.to_bytes()[0])
+    } else {
+        let r = unicode.decode_rune(l.src, l.off)
+        if r.code == 0xFFFD {
+            fail At(start, "invalid UTF-8 in character literal")
+        }
+        for _ in 0..r.size {
+            l.advance()
+        }
+        code = r.code
+    }
+    if l.unterminated() || l.peek(0) != '\'' {
+        fail At(start, "character literal must hold one character")
+    }
+    l.advance()
+    l.emit(Token { kind: Char, char: code, pos: start })
+}
+
+fn symbol(l: *Lexer, start: diag.Pos) ! diag.Error {
+    let rest = l.src[l.off..]
+    for op in l.operators {
+        if !text.starts_with(rest, op.text) {
+            continue
+        }
+        for _ in 0..op.text.len {
+            l.advance()
+        }
+        l.emit(Token { kind: op.kind, text: op.text, pos: start })
+        return
+    }
+    fail At(start, "unexpected character {quote_byte(l.peek(0))}")
+}
+
+fn quote_byte(c: u8) -> str {
+    match c {
+        '\'' => "'\\''"
+        '\\' => "'\\\\'"
+        7 => "'\\a'"
+        8 => "'\\b'"
+        12 => "'\\f'"
+        '\n' => "'\\n'"
+        '\r' => "'\\r'"
+        '\t' => "'\\t'"
+        11 => "'\\v'"
+        _ => {
+            if c < 0x20 || c == 0x7F {
+                "'\\x{c:x2}'"
+            } else if c >= 0x80 && c < 0xA1 || c == 0xAD {
+                "'\\u{c:x4}'"
+            } else {
+                "'{text.from_char(u32(c))}'"
+            }
+        }
+    }
+}
+
+fn is_letter(c: u8) -> bool {
+    c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+fn is_hex_digit(c: u8) -> bool {
+    is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+fn is_digit(c: u8) -> bool {
+    c >= '0' && c <= '9'
+}
