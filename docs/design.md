@@ -859,13 +859,14 @@ fn main() {
 
 - A module is a directory. Every `.low` file in it shares one namespace, so files of a module need no imports between them.
 - A file whose name ends in `_linux.low` or `_windows.low` belongs to the module only when building for that operating system. The standard library uses this to give `std/sys` and the operating-system parts of `std/os`, `std/process`, `std/net` and `std/crypto/x509` one implementation per target; a test requires every target to declare the same public items with the same doc comments.
+- A directory named `examples` inside a module holds that module's examples: each `.low` file in it is a whole program that imports the module, with its expected output in a `.out` file of the same name. An `examples` directory is never a module, and importing a path with an `examples` segment is an error.
 - The project root is the nearest directory, starting at the entry, that holds a `low.mod` file. Without one it is the entry's directory.
 - `import ui/text` loads `<root>/ui/text/`. A path starting with `std/` names a module of the standard library, which is compiled into `low`, so a project directory named `std` cannot be imported.
 - `low build dir` builds the directory as the entry module. `low build file.low` builds that one file as the entry module, without the other files beside it.
 - `low lint file.low` type-checks the program, prints warnings for the program's own modules (not the standard library), and exits with status 1 if there were any. `-target` picks the operating system whose files are checked and defaults to the host. `low build`, `low run`, `low asm` and `low ir` print the same warnings to stderr and continue. The language server reports them as warnings.
   - `prefer-match` flags an `if` / `else if` / `else` chain with at least two conditions in which every condition is `==` between one side-effect-free subject (a variable, field, index or dereference) and a non-negative integer, character or string literal or an enum variant. It suggests `match subject { 4 => ..., _ => ... }`.
   - `prefer-loop-label` flags a `break` out of an inner loop that sets a boolean flag to a literal when the statement right after that loop is `if flag { break }` or `if flag { continue }` (or `if !flag` for a flag set to `false`), with no `else`. It suggests labelling the loop that `if` acts on and jumping to it with `break name` or `continue name`, reusing the label the `if` already names. Breaks inside a nested loop, closure, `spawn` or `defer` are not counted.
-- `low doc dir` prints, as JSON, every module under the directory with its imports, each with the name it is used through, and its public structs, enums and functions, each with its declaration as text, its file and its line. A struct shows its public fields, and `...` stands for its private ones. A function whose first parameter is a public type of its module, or a pointer to one, names that type as its receiver. `low doc std` documents the standard library, and the website builds its package pages from it with `-target linux/amd64`. `-target` picks the operating system whose files are documented and defaults to the host.
+- `low doc dir` prints, as JSON, every module under the directory with its imports, each with the name it is used through, and its public structs, enums and functions, each with its declaration as text, its file and its line. A struct shows its public fields, and `...` stands for its private ones. A function whose first parameter is a public type of its module, or a pointer to one, names that type as its receiver. Each module lists its examples with their name, source and expected output. `low doc std` documents the standard library, and the website builds its package pages from it with `-target linux/amd64`. `-target` picks the operating system whose files are documented and defaults to the host.
 - Imports come before declarations and apply to their file.
 - A module is used through its last path segment, `text.shout(...)`, or through a name given with `import t = ui/text`.
 - Types are written `geometry.Shape` and built with `geometry.Point { ... }`. A variant can be named `geometry.Shape.Dot` or, where the type is expected, `Dot`.
@@ -1165,7 +1166,7 @@ Every public struct, enum, function, struct field and enum variant carries a doc
 
 - The first sentence is the summary: a verb phrase for a function (`Returns the ...`, `Parses ...`), a noun phrase for a type, field or variant.
 - Later paragraphs carry the contract the signature cannot: which error variant is returned and when, whether the call blocks, what dropping or closing releases, limits, defaults and edge cases such as empty input or end of input.
-- Identifiers and literals are in backticks. A `low` example block appears only where usage is not obvious from the signature, and it type-checks.
+- Identifiers and literals are in backticks. A `low` example block appears only where usage is not obvious from the signature, and it type-checks. It stays a few lines long; a program that shows how to use the module goes in the module's `examples` directory, where it runs.
 - A doc states the current behaviour as read from the code.
 
 | Module | Contents |
@@ -2209,14 +2210,15 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - `.needed` lists the shared libraries the binary must link, one per line in sorted order. Without it the binary must be static with no interpreter. A program with one has no Windows build.
   - `.tags` declares what the runner cannot learn from the program: `simd` marks a program that compiles to vector code and runs a second time with `LOW_SIMD=sse2`, and `linux-only` marks a program that uses operating system services the Windows standard library lacks, such as signals, pseudo-terminals, inotify, Unix sockets, file modes or `/proc`, or relies on a kernel guarantee `wine` does not keep, such as appends from concurrent threads landing whole, and has no Windows build. The runner fails when `simd` and the compiled code disagree.
 - `testdata/windows` holds programs that only run on Windows, with `.out` and `.err`.
+- `internal/compiler/std/<module>/examples` holds the module's examples, with `.out` and, for an example with no Windows build, a `.tags` of `linux-only`. The runner does not check `simd` for them.
 - `testdata/fail` holds programs that must fail to compile with the message in `.err`, with file paths shown relative to the fixture.
 - `testdata/lint` holds programs whose `low lint` warnings must equal `.warn`, one per line with relative paths. A program without a `.warn` file has none.
 - `bench/<name>/main.low` are the benchmark programs; the compile benchmark and the determinism test use them.
 
 ### Checks
 
-- `go test ./...` compiles every `testdata/run` program for Linux, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and applies `.maxrss`, `.maxtime`, `.needed` and `.tags`. These tests skip on a Windows host, as do the `internal/hot` tests.
-- `TestRunWindows` builds every `testdata/run` program that has a Windows build, and every `testdata/windows` program, for Windows and compares the same way. It runs them directly on a Windows host and under `wine` on Linux.
+- `go test ./...` compiles every `testdata/run` program and std example for Linux, runs it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and applies `.maxrss`, `.maxtime`, `.needed` and `.tags`. These tests skip on a Windows host, as do the `internal/hot` tests.
+- `TestRunWindows` builds every `testdata/run` program and std example that has a Windows build, and every `testdata/windows` program, for Windows and compares the same way. It runs them directly on a Windows host and under `wine` on Linux.
 - Every `testdata/fail` and `testdata/lint` program is checked against its sidecar.
 - The time zone programs read zone rules from the embedded `std/time/tzdata`, because host databases differ by release and by build (Debian's includes `backzone`). They read the host database only for the behaviour of `zone.named` and `zone.local`, through zones whose rules every build agrees on.
 - The `std/cdp` programs print `launch failed` when no browser starts. CI turns off Ubuntu's AppArmor restriction on unprivileged user namespaces so Chromium can create its sandbox.

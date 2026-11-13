@@ -64,8 +64,16 @@ function descriptions(design) {
     return about;
 }
 
+function exampleAnchor(example) {
+    return `example-${example.name}`;
+}
+
+function exampleSource(example) {
+    return example.source.trimEnd();
+}
+
 function sidebarList(items) {
-    const links = items.map((item) => `<li><a class="hover:underline hover:underline-offset-4" href="#${item.name}">${escape(item.name)}</a></li>`);
+    const links = items.map((item) => `<li><a class="hover:underline hover:underline-offset-4" href="#${item.id ?? item.name}">${escape(item.name)}</a></li>`);
     return `<ul class="sidelist">\n${links.join("\n")}\n</ul>`;
 }
 
@@ -79,8 +87,10 @@ class Page {
     #library;
     #root;
     #markdown;
+    #linker;
+    #snippets;
 
-    constructor(module, description, exports, examples, library) {
+    constructor(module, description, exports, snippets, library) {
         this.#module = module;
         this.#description = description;
         const { types, functions } = members(module);
@@ -90,8 +100,9 @@ class Page {
         this.#exports = exports;
         this.#library = library;
         this.#root = rootOf(this);
-        const linker = new Linker(library, this.#root);
-        this.#markdown = new Marked({ renderer: { code: codeRenderer(linker, examples), codespan } });
+        this.#linker = new Linker(library, this.#root);
+        this.#snippets = snippets;
+        this.#markdown = new Marked({ renderer: { code: codeRenderer(this.#linker, snippets), codespan } });
     }
 
     get path() {
@@ -148,14 +159,26 @@ class Page {
         return `<pre class="signature"><code>${groups.join("")}</code></pre>\n`;
     }
 
-    #item(item, depth) {
-        const id = anchor(item);
-        const link = `${compilerSource}/${this.#module.path}/${item.file}#L${item.line}`;
-        const where = `${item.file}:${item.line}`;
+    #heading(id, name, depth, target, where) {
+        const link = `${compilerSource}/${this.#module.path}/${target}`;
         const view = `<a class="-m-3 shrink-0 p-3 no-underline opacity-60 hover:opacity-100" href="${link}" title="${escape(where)}" aria-label="${escape(where)} on GitHub">${github}</a>`;
-        const heading = `<h${depth} id="${id}" class="flex items-center justify-between gap-4"><a href="#${id}">${escape(item.name)}</a>${view}</h${depth}>\n`;
+        return `<h${depth} id="${id}" class="flex items-center justify-between gap-4"><a href="#${id}">${escape(name)}</a>${view}</h${depth}>\n`;
+    }
+
+    #item(item, depth) {
+        const heading = this.#heading(anchor(item), item.name, depth, `${item.file}#L${item.line}`, `${item.file}:${item.line}`);
         const doc = item.doc ? this.#markdown.parse(item.doc) : "";
         return `<section class="item">\n${heading}${this.#code(item.text)}${doc}</section>\n`;
+    }
+
+    #example(example) {
+        const where = `examples/${example.name}.low`;
+        const heading = this.#heading(exampleAnchor(example), example.name, 3, where, where);
+        const source = exampleSource(example);
+        const facts = this.#linker.facts(this.#snippets.get(source), source);
+        const code = `<pre><code>${low(source, facts)}</code></pre>\n`;
+        const output = example.output ? `<p class="text-sm font-semibold uppercase tracking-wide">Output</p>\n<pre><code>${escape(example.output.trimEnd())}</code></pre>\n` : "";
+        return `<section class="item">\n${heading}${code}${output}</section>\n`;
     }
 
     #methods(type) {
@@ -172,6 +195,10 @@ class Page {
             const links = paths.map((path) => `<a href="${file(path)}"><code>${path}</code></a>`);
             parts.push(`<p>Imports ${links.join(", ")}.</p>\n`);
         }
+        if (this.#module.examples.length > 0) {
+            parts.push('<h2 id="examples"><a href="#examples">Examples</a></h2>\n');
+            parts.push(...this.#module.examples.map((example) => this.#example(example)));
+        }
         if (this.#types.length > 0) {
             parts.push('<h2 id="types"><a href="#types">Types</a></h2>\n');
             parts.push(...this.#types.map((type) => `${this.#item(type, 3)}${this.#methods(type)}`));
@@ -185,6 +212,10 @@ class Page {
 
     sidebar() {
         const groups = [];
+        if (this.#module.examples.length > 0) {
+            const links = this.#module.examples.map((example) => ({ name: example.name, id: exampleAnchor(example) }));
+            groups.push(`<p class="mb-2 text-sm font-semibold uppercase tracking-wide">Examples</p>\n${sidebarList(links)}`);
+        }
         if (this.#types.length > 0) {
             groups.push(`<p class="mb-2 text-sm font-semibold uppercase tracking-wide">Types</p>\n${sidebarList(this.#types)}`);
         }
@@ -233,15 +264,20 @@ function imports(text, path) {
     return text.split("\n").some((line) => new RegExp(`^import (\\w+ = )?${path}$`).test(line));
 }
 
-async function inspect(module, examples, session) {
+async function inspect(module, snippets, session) {
     for (const item of module.items) {
-        const blocks = new Marked().lexer(item.doc ?? "").filter((token) => token.type === "code" && isLow(token.lang) && !examples.has(token.text));
+        const blocks = new Marked().lexer(item.doc ?? "").filter((token) => token.type === "code" && isLow(token.lang) && !snippets.has(token.text));
         for (const block of blocks) {
             const preludes = imports(block.text, module.path) ? [] : [{ path: "", text: `import ${module.path}` }];
             const program = new Program(block.text, preludes);
             const checked = await session.inspect(program, words(block.text), `${module.path} ${anchor(item)}`);
-            examples.set(block.text, checked);
+            snippets.set(block.text, checked);
         }
+    }
+    for (const example of module.examples) {
+        const source = exampleSource(example);
+        const checked = await session.inspect(new Program(source), words(source), `${module.path} examples/${example.name}.low`);
+        snippets.set(source, checked);
     }
 }
 
@@ -254,9 +290,9 @@ export async function packages(modules, design, session, library) {
     if (orphans.length > 0) {
         throw new Error(`categories for packages that do not exist: ${orphans.join(", ")}`);
     }
-    const examples = new Map();
+    const snippets = new Map();
     for (const module of modules) {
-        await inspect(module, examples, session);
+        await inspect(module, snippets, session);
     }
     const about = descriptions(design);
     const exports = new Map(modules.map((module) => [module.path, new Set(members(module).types.map((item) => item.name))]));
@@ -264,7 +300,7 @@ export async function packages(modules, design, session, library) {
     await mkdir(output);
     await writeFile(new URL("index.html", output), index(modules, about));
     for (const module of modules) {
-        const page = new Page(module, about.get(module.path), exports, examples, library);
+        const page = new Page(module, about.get(module.path), exports, snippets, library);
         const html = page.html();
         await writeFile(new URL(file(module.path), output), html);
     }

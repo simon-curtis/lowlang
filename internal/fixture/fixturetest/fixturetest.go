@@ -1,6 +1,7 @@
 package fixturetest
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -37,6 +38,27 @@ func Programs(t testing.TB, dir string) []Program {
 	}
 	if len(programs) == 0 {
 		t.Fatalf("no programs in testdata/%s", dir)
+	}
+	return programs
+}
+
+func Examples(t testing.TB) []Program {
+	t.Helper()
+	std := filepath.Join(Root(), "internal", "compiler", "std")
+	var programs []Program
+	err := filepath.WalkDir(std, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || filepath.Base(filepath.Dir(path)) != "examples" || !strings.HasSuffix(path, fixture.SourceExt) {
+			return err
+		}
+		name, err := filepath.Rel(std, fixture.Base(path))
+		programs = append(programs, Program{Name: filepath.ToSlash(name), Path: path})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(programs) == 0 {
+		t.Fatal("no std examples")
 	}
 	return programs
 }

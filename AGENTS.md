@@ -12,7 +12,7 @@ Read `## Compiler`. `internal/ir` builds SSA, `internal/amd64` emits assembly, `
 
 ## Standard library
 
-Read `## Standard library`. Modules live in `internal/compiler/std/<name>/`, written in Low. `internal/compiler/prelude.low` carries the runtime and the generic map code.
+Read `## Standard library`. Modules live in `internal/compiler/std/<name>/`, written in Low, with runnable programs that show how to use the module in `examples/`. `internal/compiler/prelude.low` carries the runtime and the generic map code.
 
 ## Tests
 

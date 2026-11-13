@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -46,6 +47,17 @@ fn hidden() {}
 	if err := os.WriteFile(filepath.Join(shapes, "box.low"), []byte(source), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	examples := filepath.Join(shapes, "examples")
+	if err := os.Mkdir(examples, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	example := "import shapes\n\nfn main() {\n    print(shapes.unit().width)\n}\n"
+	files := map[string]string{"unit.low": example, "unit.out": "1\n", "notes.txt": "skipped"}
+	for name, text := range files {
+		if err := os.WriteFile(filepath.Join(examples, name), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	modules, err := Document(dir, target.Linux)
 	if err != nil {
 		t.Fatal(err)
@@ -70,6 +82,10 @@ fn hidden() {}
 		if item != want[i] {
 			t.Errorf("item %d = %+v, want %+v", i, item, want[i])
 		}
+	}
+	wantExamples := []ExampleDoc{{Name: "unit", Source: example, Output: "1\n"}}
+	if !slices.Equal(module.Examples, wantExamples) {
+		t.Errorf("examples = %+v, want %+v", module.Examples, wantExamples)
 	}
 }
 
