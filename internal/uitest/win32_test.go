@@ -90,6 +90,10 @@ func repeated(times int, lines ...string) []string {
 }
 
 func TestWin32(t *testing.T) {
+	completed := "preedit [] hidden"
+	if target.Host() == target.Windows {
+		completed = "commit [bc]"
+	}
 	cases := []struct {
 		name string
 		want []string
@@ -240,7 +244,8 @@ func TestWin32(t *testing.T) {
 			"preedit [a\U0001F600é] 7-7",
 			"preedit [] hidden",
 			"preedit [bc] 2-2",
-			"preedit [] hidden",
+			completed,
+			"no events",
 			"preedit [d] 1-1",
 			"off false",
 			"preedit [] hidden",
