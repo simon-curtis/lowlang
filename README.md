@@ -91,7 +91,7 @@ Pushing a `v*` tag runs the `test` workflow, then the `release` workflow builds 
 
 ## Website
 
-`site/` is a static site styled with Tailwind. Its output is committed, so the directory serves as it is. The `test` workflow runs `go vet` and `go test` on every push and pull request to `main`. When it passes on a push to `main`, the `site` workflow rebuilds the site and deploys it to Cloudflare Pages. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
+`site/` is a static site styled with Tailwind. Its output is committed, so the directory serves as it is. The `test` workflow runs `go vet` and `go test` on every push and pull request to `main`. The `site` workflow rebuilds the site and deploys it to Cloudflare Pages on every push to `main`, whether or not `test` passes. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
 
 ```sh
 cd site
