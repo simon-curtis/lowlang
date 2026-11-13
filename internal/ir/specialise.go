@@ -21,10 +21,24 @@ type specialiser struct {
 	program  *Program
 	cloned   int
 	clonesOf map[*Func]int
+	made     map[cloneKey]madeClone
+	names    map[string]int
+}
+
+type cloneKey struct {
+	source *Func
+	word   int64
+	code   *Func
+}
+
+type madeClone struct {
+	fn      *Func
+	dropped []int64
+	capture *Value
 }
 
 func (p *Program) specialiseConstantArguments() {
-	s := &specialiser{program: p, clonesOf: map[*Func]int{}}
+	s := &specialiser{program: p, clonesOf: map[*Func]int{}, made: map[cloneKey]madeClone{}, names: map[string]int{}}
 	for round := 0; round < maxSpecialisationRounds; round++ {
 		constants := s.specialiseConstants()
 		clones := s.cloneForFunctions()
@@ -47,6 +61,7 @@ func (s *specialiser) specialiseConstants() bool {
 			continue
 		}
 		dropParameters(g, sites[g], dropped)
+		s.forget(g)
 		changed[g] = true
 		for _, site := range sites[g] {
 			changed[site.caller] = true
@@ -54,6 +69,14 @@ func (s *specialiser) specialiseConstants() bool {
 	}
 	simplifyAll(s.program, changed)
 	return len(changed) > 0
+}
+
+func (s *specialiser) forget(g *Func) {
+	for key, made := range s.made {
+		if key.source == g || made.fn == g {
+			delete(s.made, key)
+		}
+	}
 }
 
 func (s *specialiser) eligible(g *Func, sites []callSite) bool {

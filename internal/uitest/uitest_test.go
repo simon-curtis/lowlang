@@ -189,6 +189,20 @@ func TestQuads(t *testing.T) {
 	rounded.expectAll(t, white, 0, [2]int{8, 8}, [2]int{55, 8}, [2]int{8, 55}, [2]int{55, 55}, [2]int{2, 2})
 	rounded.expectAll(t, green, 0, [2]int{32, 32}, [2]int{20, 20})
 	rounded.expectAll(t, black, 0, [2]int{32, 8}, [2]int{32, 11}, [2]int{8, 32}, [2]int{55, 32}, [2]int{32, 55})
+
+	shaded := out.frame(t, "shaded")
+	shaded.expect(t, 0, 16, pixel{253, 0, 2, 255}, 1)
+	shaded.expect(t, 63, 16, pixel{2, 0, 253, 255}, 1)
+	shaded.expect(t, 31, 16, pixel{129, 0, 126, 255}, 1)
+	shaded.expect(t, 32, 0, pixel{125, 0, 130, 255}, 1)
+	shaded.expectAll(t, black, 0, [2]int{10, 32}, [2]int{50, 39})
+	shaded.expectAll(t, green, 0, [2]int{10, 56}, [2]int{50, 63})
+	shaded.expect(t, 20, 47, pixel{0, 120, 0, 255}, 1)
+	for y := 40; y < 56; y++ {
+		if shaded.at(5, y)[1] <= shaded.at(5, y-1)[1] {
+			t.Errorf("the gradient does not brighten from row %d to row %d", y-1, y)
+		}
+	}
 }
 
 func TestShadow(t *testing.T) {
@@ -236,6 +250,29 @@ func TestShadow(t *testing.T) {
 	if inside, corner := r.at(48, 32)[0], r.at(32, 16)[0]; corner < inside+100 {
 		t.Errorf("the rounded shadow's corner %d is not much lighter than its middle %d", corner, inside)
 	}
+}
+
+func TestPictures(t *testing.T) {
+	out := run(t, "picture")
+	f := out.frame(t, "pictures")
+	black := pixel{0, 0, 0, 255}
+
+	f.expect(t, 3, 3, pixel{255, 0, 0, 255}, 0)
+	f.expect(t, 8, 3, pixel{0, 255, 0, 255}, 0)
+	f.expect(t, 3, 8, pixel{0, 0, 255, 255}, 0)
+	f.expect(t, 8, 8, pixel{128, 128, 128, 255}, 1)
+	f.expect(t, 10, 3, black, 0)
+
+	f.expect(t, 13, 3, pixel{128, 0, 0, 255}, 1)
+	f.expect(t, 18, 8, pixel{64, 64, 64, 255}, 1)
+
+	f.expect(t, 23, 3, pixel{54, 54, 54, 255}, 1)
+	f.expect(t, 28, 3, pixel{182, 182, 182, 255}, 1)
+	f.expect(t, 23, 8, pixel{18, 18, 18, 255}, 1)
+
+	f.expect(t, 10, 22, pixel{255, 0, 0, 255}, 0)
+	f.expectAll(t, pixel{255, 0, 0, 255}, 5, [2]int{2, 22}, [2]int{10, 14}, [2]int{17, 22})
+	f.expectAll(t, black, 0, [2]int{2, 14}, [2]int{3, 15}, [2]int{17, 29}, [2]int{2, 29})
 }
 
 func TestSprites(t *testing.T) {
@@ -439,17 +476,52 @@ func TestWindowsBuilds(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			library := windowsLibrary(name)
-			if !strings.Contains(strings.ToLower(string(data)), library) {
-				t.Errorf("the Windows executable does not import %s", library)
+			for _, library := range windowsLibraries(name) {
+				if !strings.Contains(strings.ToLower(string(data)), library) {
+					t.Errorf("the Windows executable does not import %s", library)
+				}
 			}
 		})
 	}
 }
 
-func windowsLibrary(name string) string {
-	if strings.HasPrefix(name, "win32_") || name == "wayland_window" || name == "wayland_reopen" {
-		return "user32.dll"
+func windowsLibraries(name string) []string {
+	switch {
+	case name == "win32_ime":
+		return []string{"user32.dll", "imm32.dll"}
+	case strings.HasPrefix(name, "win32_") || name == "wayland_window" || name == "wayland_reopen" || name == "wayland_clipboard":
+		return []string{"user32.dll"}
+	case name == "app" || name == "counter":
+		return []string{"vulkan-1.dll", "user32.dll", "kernel32.dll"}
 	}
-	return "vulkan-1.dll"
+	return []string{"vulkan-1.dll"}
+}
+
+func TestElements(t *testing.T) {
+	out := run(t, "elements")
+	black := pixel{0, 0, 0, 255}
+	blue := pixel{0, 0, 255, 255}
+	magenta := pixel{255, 0, 255, 255}
+	white := pixel{255, 255, 255, 255}
+	dark := pixel{64, 64, 64, 255}
+
+	for _, name := range []string{"plain", "hovered"} {
+		f := out.frame(t, name)
+		f.expectAll(t, black, 0, [2]int{1, 1}, [2]int{62, 62}, [2]int{2, 30}, [2]int{25, 22}, [2]int{50, 24})
+		f.expectAll(t, blue, 0, [2]int{4, 4}, [2]int{5, 10}, [2]int{59, 15}, [2]int{30, 4})
+		f.expectAll(t, magenta, 0, [2]int{4, 20}, [2]int{19, 27})
+		f.expectAll(t, white, 0, [2]int{4, 28}, [2]int{19, 35})
+		f.expectAll(t, dark, 0, [2]int{4, 40}, [2]int{50, 50}, [2]int{59, 59})
+		brightest := 0
+		for y := 42; y < 58; y++ {
+			for x := 6; x < 20; x++ {
+				brightest = max(brightest, f.at(x, y)[0])
+			}
+		}
+		if brightest < 200 {
+			t.Errorf("%s: the text is not drawn: the brightest pixel in its box is %d", name, brightest)
+		}
+	}
+	out.frame(t, "plain").expectAll(t, pixel{255, 0, 0, 255}, 0, [2]int{10, 8}, [2]int{57, 13})
+	out.frame(t, "hovered").expectAll(t, pixel{0, 255, 0, 255}, 0, [2]int{10, 8}, [2]int{57, 13})
 }

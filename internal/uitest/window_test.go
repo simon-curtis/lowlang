@@ -123,6 +123,11 @@ func TestWaylandWindow(t *testing.T) {
 	})
 }
 
+func TestWaylandClipboard(t *testing.T) {
+	got := runWindow(t, "wayland_clipboard")
+	expectLines(t, got, []string{`read "héllo 😀\nline"`, `kept "héllo 😀\nline"`})
+}
+
 func TestWaylandReopen(t *testing.T) {
 	got := runWindow(t, "wayland_reopen")
 	expectLines(t, got, []string{"cycle 0", "cycle 1", "cycle 2", "cycle 3", "cycle 4", "cycle 5"})
@@ -139,4 +144,59 @@ func TestWaylandPresent(t *testing.T) {
 		"offscreen 255 0 0 255",
 		"no surface",
 	})
+}
+
+func TestApp(t *testing.T) {
+	got := runWindow(t, "app", "vulkan")
+	expectLines(t, got, []string{
+		"count 1",
+		`pasted "from the app"`,
+		"frames true",
+		"closed true",
+	})
+}
+
+func TestWindows(t *testing.T) {
+	got := runWindow(t, "windows", "vulkan")
+	expectLines(t, got, []string{
+		"left closed true count 1",
+		"right closed true count 3",
+	})
+}
+
+func TestCounterExample(t *testing.T) {
+	fixturetest.RequireLinuxHost(t)
+	for _, library := range []string{"wayland-client", "xkbcommon", "vulkan"} {
+		fixturetest.RequireLibrary(t, library)
+	}
+	if os.Getenv("WAYLAND_DISPLAY") == "" {
+		t.Skip("no Wayland compositor to connect to")
+	}
+	binary := filepath.Join(t.TempDir(), "counter")
+	build(t, "counter", target.Linux, binary)
+	var stdout, stderr strings.Builder
+	cmd := exec.Command(binary)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	select {
+	case err := <-exited:
+		text := stdout.String()
+		if strings.HasPrefix(text, noDisplay) || strings.HasPrefix(text, noDevice) {
+			t.Skip(strings.TrimSpace(text))
+		}
+		t.Fatalf("the example exited while its window was open: %v\n%s\n%s", err, text, stderr.String())
+	case <-time.After(2 * time.Second):
+		if err := cmd.Process.Kill(); err != nil {
+			t.Fatal(err)
+		}
+		<-exited
+	}
+	if stderr.Len() > 0 {
+		t.Errorf("the example wrote to stderr: %s", stderr.String())
+	}
 }

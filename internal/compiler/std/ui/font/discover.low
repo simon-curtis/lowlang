@@ -1,0 +1,207 @@
+import std/file
+import std/io
+import std/slices
+import strings = std/text
+
+/// A font the system has, in a file of its own or in a collection, described without reading its outlines.
+pub struct Face {
+    /// The path of the file.
+    pub path: str
+    /// The font's position in a collection file, 0 for a file that holds one font.
+    pub index: i64 = 0
+    /// What the font's tables say about it.
+    pub description: Description = Description {}
+}
+
+/// Returns every font in `.ttf`, `.otf`, `.ttc` and `.otc` files under `font_directories()`, ordered by path and index within each directory and without repeats.
+///
+/// Only each file's table directory and its `name`, `OS/2` and `head` tables are read. A file that cannot be read, is not a font, or names no family is left out. A symbolic link to a font file or to a directory is followed, and a file reached by several paths is listed once, under the first.
+pub fn discover() -> []Face {
+    var seen: [str: bool] = [:]
+    var out: []Face = []
+    for dir in font_directories() {
+        for face in faces_under(dir, mut seen) {
+            out.push(face)
+        }
+    }
+    out
+}
+
+/// Returns the fonts in files under `dir` and its subdirectories, as `discover` does.
+pub fn discover_in(dir: str) -> []Face {
+    var seen: [str: bool] = [:]
+    faces_under(dir, mut seen)
+}
+
+/// Reads and parses the font `face` names, or returns `none` when its file cannot be read or holds no font that `parse` or `parse_collection` accepts.
+pub fn open_face(face: Face) -> Font? {
+    let bytes = file.read_file(face.path) or return none
+    let data = str(bytes)
+    if face.index > 0 || data.len >= 4 && data[0..4] == "ttcf" {
+        return parse_collection(data, face.index) or none
+    }
+    parse(data) or none
+}
+
+/// Returns whether the font `face` names maps `code_point` to a glyph, reading only its table directory, `maxp` and `cmap`. A file that cannot be read, or whose character map `parse` would reject, gives `false`.
+pub fn maps(face: Face, code_point: u32) -> bool {
+    using f = file.open(face.path) or return false
+    let at = font_offset(f, face.index) ?? return false
+    let records = records_at(f, at) ?? return false
+    let cmap = table_in(f, records, "cmap")
+    let maxp = table_in(f, records, "maxp")
+    cmap_maps(cmap, be16(maxp, 4), code_point)
+}
+
+fn faces_under(dir: str, mut seen: [str: bool]) -> []Face {
+    var paths: []str = []
+    collect(dir, mut paths, mut seen)
+    slices.sort(mut paths)
+    var out: []Face = []
+    for path in paths {
+        for face in faces_in(path) {
+            out.push(face)
+        }
+    }
+    out
+}
+
+fn collect(dir: str, mut paths: []str, mut seen: [str: bool]) {
+    let meta = file.stat(dir) or return
+    if !meta.dir || !first_visit(meta, mut seen) {
+        return
+    }
+    var entries = file.read_dir_info(dir) or return
+    slices.sort_by(mut entries, fn(a: file.Entry, b: file.Entry) -> bool { a.name < b.name })
+    for entry in entries {
+        if entry.regular && !is_font_file(entry.name) {
+            continue
+        }
+        let path = file.child_path(dir, entry.name)
+        let target = file.stat(path) or continue
+        if target.dir {
+            collect(path, mut paths, mut seen)
+        } else if target.regular && is_font_file(entry.name) && first_visit(target, mut seen) {
+            paths.push(path)
+        }
+    }
+}
+
+fn first_visit(meta: file.Info, mut seen: [str: bool]) -> bool {
+    let key = "{meta.device}:{meta.inode}"
+    if seen[key] != none {
+        return false
+    }
+    seen[key] = true
+    true
+}
+
+fn is_font_file(name: str) -> bool {
+    let lower = strings.lower(name)
+    strings.ends_with(lower, ".ttf") || strings.ends_with(lower, ".otf") || strings.ends_with(lower, ".ttc") || strings.ends_with(lower, ".otc")
+}
+
+fn faces_in(path: str) -> []Face {
+    using f = file.open(path) or return []
+    let header = read_span(f, 0, 12) or return []
+    if header.len < 12 {
+        return []
+    }
+    if header[0..4] != "ttcf" {
+        let face = face_at(f, path, 0, 0) ?? return []
+        return [face]
+    }
+    let count = be32(header, 8)
+    if count < 1 || count > 1024 {
+        return []
+    }
+    let offsets = read_span(f, 12, 4 * count) or return []
+    if offsets.len < 4 * count {
+        return []
+    }
+    var out: []Face = []
+    for i in 0..count {
+        match face_at(f, path, i, be32(offsets, 4 * i)) {
+            some(face) => out.push(face)
+            none => {}
+        }
+    }
+    out
+}
+
+fn font_offset(f: file.File, index: i64) -> i64? {
+    let header = read_span(f, 0, 12) or return none
+    if header.len < 12 {
+        return none
+    }
+    if header[0..4] != "ttcf" {
+        return if index == 0 { 0 } else { none }
+    }
+    let count = be32(header, 8)
+    if index < 0 || index >= count {
+        return none
+    }
+    let entry = read_span(f, 12 + 4 * index, 4) or return none
+    if entry.len < 4 {
+        return none
+    }
+    be32(entry, 0)
+}
+
+fn records_at(f: file.File, at: i64) -> str? {
+    let header = read_span(f, at, 12) or return none
+    if header.len < 12 || !is_sfnt(header) {
+        return none
+    }
+    let count = be16(header, 4)
+    let records = read_span(f, at + 12, 16 * count) or return none
+    if records.len < 16 * count {
+        return none
+    }
+    records
+}
+
+fn face_at(f: file.File, path: str, index: i64, at: i64) -> Face? {
+    let records = records_at(f, at) ?? return none
+    let name = table_in(f, records, "name")
+    let os2 = table_in(f, records, "OS/2")
+    let head = table_in(f, records, "head")
+    let description = described(name, os2, head)
+    if description.family == "" {
+        return none
+    }
+    Face { path, index, description }
+}
+
+fn is_sfnt(header: str) -> bool {
+    let magic = header[0..4]
+    magic == "OTTO" || magic == "true" || be32(header, 0) == 65536
+}
+
+fn table_in(f: file.File, records: str, tag: str) -> str {
+    for i in 0..records.len / 16 {
+        let record = 16 * i
+        if records[record..record + 4] == tag {
+            let length = be32(records, record + 12)
+            if length > 1 << 20 {
+                return ""
+            }
+            return read_span(f, be32(records, record + 8), length) or ""
+        }
+    }
+    ""
+}
+
+fn read_span(f: file.File, at: i64, length: i64) -> str ! io.Error {
+    file.seek(f, at, Start)?
+    let buf: []u8 = __make(length)
+    var got = 0
+    for got < length {
+        let n = file.read(f, buf[got..])?
+        if n <= 0 {
+            break
+        }
+        got += n
+    }
+    str(buf[..got])
+}

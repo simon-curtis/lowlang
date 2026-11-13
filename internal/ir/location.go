@@ -80,5 +80,21 @@ func Boxed(l *ast.Local) bool {
 	if !l.Captured {
 		return false
 	}
-	return l.Assigned || l.Addressed || l.Type.Kind == types.VectorKind || l.Type.CStruct()
+	return l.Assigned || l.Addressed || inMemory(l.Type)
+}
+
+func inMemory(t *types.Type) bool {
+	return t.Kind == types.VectorKind || t.CStruct() || holdsCStruct(t)
+}
+
+func holdsCStruct(t *types.Type) bool {
+	if t.Kind != types.StructKind || t.C {
+		return false
+	}
+	for _, f := range t.Fields {
+		if f.Type.CStruct() || holdsCStruct(f.Type) {
+			return true
+		}
+	}
+	return false
 }

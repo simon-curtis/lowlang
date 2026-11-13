@@ -2079,11 +2079,13 @@ func (c *Checker) branch(e ast.Expr, hint, want *types.Type) *types.Type {
 }
 
 func bareNumber(e ast.Expr) bool {
-	block, ok := e.(*ast.Block)
-	if !ok || len(block.Stmts) > 0 {
-		return false
+	if block, ok := e.(*ast.Block); ok {
+		if len(block.Stmts) > 0 {
+			return false
+		}
+		e = block.Tail
 	}
-	switch block.Tail.(type) {
+	switch e.(type) {
 	case *ast.IntLit, *ast.FloatLit:
 		return true
 	}
@@ -2122,16 +2124,16 @@ func (c *Checker) match(e *ast.Match, want *types.Type) {
 }
 
 func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos diag.Pos) *types.Type {
-	result := types.Never
+	produces := make([]*types.Type, len(arms))
 	covered := map[*types.Variant]bool{}
 	wildcard, tested := false, false
-	for _, arm := range arms {
+	for i, arm := range arms {
 		if wildcard {
 			c.fail(arm.Pattern.Pos, "unreachable arm; an earlier arm matches everything")
 		}
 		c.pushScope()
 		c.pattern(arm.Pattern, enum)
-		result = unify(result, c.branch(arm.Body, want, want))
+		produces[i] = c.branch(arm.Body, want, want)
 		c.popScope()
 		if arm.Pattern.Test != nil {
 			tested = true
@@ -2153,7 +2155,32 @@ func (c *Checker) arms(arms []*ast.Arm, enum, want *types.Type, pos diag.Pos) *t
 	default:
 		c.exhaustive(enum, covered, pos)
 	}
+	if want == nil {
+		c.retypeLiteralArms(arms, produces)
+	}
+	result := types.Never
+	for _, t := range produces {
+		result = unify(result, t)
+	}
 	return result
+}
+
+func (c *Checker) retypeLiteralArms(arms []*ast.Arm, produces []*types.Type) {
+	var number *types.Type
+	for i, arm := range arms {
+		if !bareNumber(arm.Body) && produces[i].Number() {
+			number = produces[i]
+			break
+		}
+	}
+	if number == nil {
+		return
+	}
+	for i, arm := range arms {
+		if bareNumber(arm.Body) && produces[i] != number {
+			produces[i] = c.expr(arm.Body, number)
+		}
+	}
 }
 
 func (c *Checker) exhaustive(enum *types.Type, covered map[*types.Variant]bool, pos diag.Pos) {

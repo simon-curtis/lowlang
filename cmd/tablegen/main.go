@@ -35,7 +35,7 @@ func outputOnly(generate func(output string) error) func([]string) error {
 }
 
 func (c command) parameters() int {
-	return len(strings.Fields(c.arguments))
+	return strings.Count(c.arguments, "<")
 }
 
 func main() {

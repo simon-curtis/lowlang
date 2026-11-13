@@ -43,6 +43,7 @@ var propertyTables = []string{
 	"props_index.bin", "props_blocks.bin", "props_records.bin",
 	"case_index.bin", "case_blocks.bin", "case_records.bin",
 	"special.bin", "special_pool.bin",
+	"breaks_index.bin", "breaks_blocks.bin", "breaks_records.bin",
 }
 
 const propertyLayoutFile = "property_layout.low"
@@ -102,6 +103,7 @@ type propertyDatabase struct {
 	props      []uint32
 	deltas     []caseDeltas
 	special    map[rune]casing
+	breaks     breakClasses
 }
 
 func generateProperties(dir, output string) error {
@@ -109,6 +111,7 @@ func generateProperties(dir, output string) error {
 		props:   make([]uint32, codePoints),
 		deltas:  make([]caseDeltas, codePoints),
 		special: map[rune]casing{},
+		breaks:  newBreakClasses(),
 	}
 	steps := []struct {
 		file   string
@@ -121,6 +124,8 @@ func generateProperties(dir, output string) error {
 		{"emoji-data.txt", db.readPictographic},
 		{"PropList.txt", db.readSpace},
 		{"DerivedCoreProperties.txt", db.readDerived},
+		{"LineBreak.txt", db.readLineBreak},
+		{"WordBreakProperty.txt", db.readWordBreak},
 	}
 	for _, step := range steps {
 		if err := eachRange(filepath.Join(dir, step.file), step.handle); err != nil {
@@ -418,10 +423,15 @@ func (db *propertyDatabase) tables() ([]section, error) {
 	if err != nil {
 		return nil, err
 	}
+	breaks, err := db.breakTrie()
+	if err != nil {
+		return nil, err
+	}
 	sections := namedSections(propertyTables,
 		props.index, props.blocks, props.records,
 		deltas.index, deltas.blocks, deltas.records,
-		special, specialPool)
+		special, specialPool,
+		breaks.index, breaks.blocks, breaks.records)
 	return append(sections, section{propertyLayoutFile, []byte(propertyLayoutSource())}), nil
 }
 
@@ -465,5 +475,6 @@ func propertyLayoutSource() string {
 	constants = append(constants, classConstants("width_", widthNames, lowWord)...)
 	constants = append(constants, classConstants("break_", breakNames, lowInt)...)
 	constants = append(constants, classConstants("conjunct_", conjunctNames, lowInt)...)
+	constants = append(constants, breakLayoutConstants()...)
 	return layoutSource(constants, propertyTables)
 }

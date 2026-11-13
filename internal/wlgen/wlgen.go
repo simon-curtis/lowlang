@@ -101,8 +101,8 @@ func (g *generator) references(all []Interface) error {
 	for _, i := range all {
 		for _, m := range slices.Concat(i.Requests, i.Events) {
 			for _, a := range m.Args {
-				if a.Interface != "" && !g.interfaces[a.Interface] {
-					return fmt.Errorf("%s.%s refers to interface %s, which no given protocol declares", i.Name, m.Name, a.Interface)
+				if a.Type == "new_id" && a.Interface != "" && !g.interfaces[a.Interface] {
+					return fmt.Errorf("%s.%s creates interface %s, which no given protocol declares", i.Name, m.Name, a.Interface)
 				}
 				if _, ok := cTypes[a.Type]; !ok {
 					return fmt.Errorf("%s.%s argument %s has unknown type %s", i.Name, m.Name, a.Name, a.Type)
@@ -234,7 +234,7 @@ func (g *generator) table(all []Interface) {
 	g.Line("")
 }
 
-func signature(m Message) (string, []string) {
+func signature(m Message, declared map[string]bool) (string, []string) {
 	var sig strings.Builder
 	var types []string
 	if m.Since > 1 {
@@ -250,7 +250,7 @@ func signature(m Message) (string, []string) {
 			continue
 		}
 		sig.WriteString(signatureCodes[a.Type])
-		if a.Interface != "" {
+		if declared[a.Interface] {
 			types = append(types, fmt.Sprintf("ifs.%s", a.Interface))
 			continue
 		}
@@ -266,7 +266,7 @@ func (g *generator) messages(kind string, msgs []Message) {
 	}
 	g.Line("    let %s_view = view(%s, %d)", kind, kind, len(msgs))
 	for k, m := range msgs {
-		sig, types := signature(m)
+		sig, types := signature(m, g.interfaces)
 		list := "[]"
 		if len(types) > 0 {
 			list = fmt.Sprintf("[%s]", strings.Join(types, ", "))
