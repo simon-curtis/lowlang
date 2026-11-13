@@ -76,12 +76,25 @@ func (m *mover) branches(run ...func()) {
 	start := m.snapshot()
 	var ends []moveState
 	for _, r := range run {
-		m.state, m.dead = maps.Clone(start), false
+		m.openArm(start)
 		r()
-		if !m.dead {
-			ends = append(ends, m.state)
-		}
+		ends = m.closeArm(ends)
 	}
+	m.merge(ends)
+}
+
+func (m *mover) openArm(start moveState) {
+	m.state, m.dead = maps.Clone(start), false
+}
+
+func (m *mover) closeArm(ends []moveState) []moveState {
+	if m.dead {
+		return ends
+	}
+	return append(ends, m.state)
+}
+
+func (m *mover) merge(ends []moveState) {
 	if len(ends) == 0 {
 		m.dead = true
 		return
@@ -287,8 +300,7 @@ func (m *mover) expr(e ast.Expr, ctx moveContext) {
 	case *ast.Unary:
 		m.expr(e.X, borrow)
 	case *ast.Binary:
-		m.expr(e.X, borrow)
-		m.expr(e.Y, borrow)
+		m.binary(e)
 	case *ast.Receiver:
 		m.expr(e.X, ctx)
 	case *ast.Ref:
@@ -319,14 +331,7 @@ func (m *mover) expr(e ast.Expr, ctx moveContext) {
 	case *ast.Block:
 		m.block(e, ctx)
 	case *ast.If:
-		m.expr(e.Cond, borrow)
-		then := func() { m.block(e.Then, ctx) }
-		otherwise := func() {
-			if e.Else != nil {
-				m.expr(e.Else, ctx)
-			}
-		}
-		m.branches(then, otherwise)
+		m.ifChain(e, ctx)
 	case *ast.Match:
 		m.expr(e.X, borrow)
 		m.arms(e.Arms, ctx)
@@ -359,6 +364,36 @@ func (m *mover) expr(e ast.Expr, ctx moveContext) {
 		}
 		m.branches(arms...)
 	}
+}
+
+func (m *mover) binary(e *ast.Binary) {
+	spine := ast.LeftSpine(e)
+	m.expr(spine[len(spine)-1].X, borrow)
+	for i := len(spine) - 1; i >= 0; i-- {
+		m.expr(spine[i].Y, borrow)
+	}
+}
+
+func (m *mover) ifChain(e *ast.If, ctx moveContext) {
+	var ends []moveState
+	for link := e; ; {
+		m.expr(link.Cond, borrow)
+		start := m.snapshot()
+		m.openArm(start)
+		m.block(link.Then, ctx)
+		ends = m.closeArm(ends)
+		m.openArm(start)
+		next, chained := link.Else.(*ast.If)
+		if !chained {
+			if link.Else != nil {
+				m.expr(link.Else, ctx)
+			}
+			ends = m.closeArm(ends)
+			break
+		}
+		link = next
+	}
+	m.merge(ends)
 }
 
 func (m *mover) arms(arms []*ast.Arm, ctx moveContext) {

@@ -72,7 +72,30 @@ func (s *ssa) optimize() {
 	}
 }
 
-func (o *optimizer) visit(i int) {
+type visitFrame struct {
+	node    int
+	mark    int
+	hasEdge bool
+	next    int
+}
+
+func (o *optimizer) visit(root int) {
+	stack := []visitFrame{o.enterNode(root)}
+	for len(stack) > 0 {
+		top := &stack[len(stack)-1]
+		children := o.doms.Children[top.node]
+		if top.next < len(children) {
+			child := children[top.next]
+			top.next++
+			stack = append(stack, o.enterNode(child))
+			continue
+		}
+		o.leaveNode(*top)
+		stack = stack[:len(stack)-1]
+	}
+}
+
+func (o *optimizer) enterNode(i int) visitFrame {
 	b := o.doms.Nodes[i]
 	mark := len(o.added)
 	edge, hasEdge := o.edgeFact(b)
@@ -82,14 +105,15 @@ func (o *optimizer) visit(i int) {
 	o.out = nil
 	o.block(b)
 	b.Values = o.out
-	for _, c := range o.doms.Children[i] {
-		o.visit(c)
-	}
-	for _, k := range o.added[mark:] {
+	return visitFrame{node: i, mark: mark, hasEdge: hasEdge}
+}
+
+func (o *optimizer) leaveNode(f visitFrame) {
+	for _, k := range o.added[f.mark:] {
 		delete(o.reps, k)
 	}
-	o.added = o.added[:mark]
-	if hasEdge {
+	o.added = o.added[:f.mark]
+	if f.hasEdge {
 		o.facts = o.facts[:len(o.facts)-1]
 	}
 }

@@ -44,11 +44,21 @@ func constant(e ast.Expr) bool {
 	case *ast.Unary:
 		return foldedUnary(e.Op) && constant(e.X)
 	case *ast.Binary:
-		return foldedBinary(e.Op) && constant(e.X) && constant(e.Y)
+		return constantBinary(e)
 	case *ast.Call:
 		return e.Builtin == builtin.Convert && e.Args[0].TypeOf().Number() && constant(e.Args[0])
 	}
 	return false
+}
+
+func constantBinary(e *ast.Binary) bool {
+	spine := ast.LeftSpine(e)
+	for _, link := range spine {
+		if !foldedBinary(link.Op) || !constant(link.Y) {
+			return false
+		}
+	}
+	return constant(spine[len(spine)-1].X)
 }
 
 func foldedUnary(op lexer.Kind) bool {

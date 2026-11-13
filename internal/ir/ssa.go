@@ -33,30 +33,99 @@ func (s *ssa) write(k varKey, b *Block, v *Value) {
 	s.ws.variables[defKey{variable: k, block: b.ID}] = v
 }
 
+func (s *ssa) defined(k varKey, b *Block) (*Value, bool) {
+	v, ok := s.ws.variables[defKey{variable: k, block: b.ID}]
+	return v, ok
+}
+
 func (s *ssa) read(k varKey, b *Block) *Value {
-	if v, ok := s.ws.variables[defKey{variable: k, block: b.ID}]; ok {
+	if v, ok := s.defined(k, b); ok {
 		return resolve(v)
 	}
 	return s.readRecursive(k, b)
 }
 
+type readFrame struct {
+	block   *Block
+	phi     *Value
+	next    int
+	waiting bool
+}
+
 func (s *ssa) readRecursive(k varKey, b *Block) *Value {
-	var v *Value
+	var stack []readFrame
+	var result *Value
+	start := b
+	for {
+		if start != nil {
+			frame, v, done := s.beginRead(k, start)
+			if done {
+				s.write(k, start, v)
+				result = v
+			} else {
+				stack = append(stack, frame)
+			}
+			start = nil
+		}
+		if len(stack) == 0 {
+			return result
+		}
+		top := &stack[len(stack)-1]
+		pending, v := s.advanceRead(k, top, result)
+		if pending != nil {
+			start = pending
+			continue
+		}
+		s.write(k, top.block, v)
+		result = v
+		stack = stack[:len(stack)-1]
+	}
+}
+
+func (s *ssa) beginRead(k varKey, b *Block) (readFrame, *Value, bool) {
 	switch {
 	case !s.ws.isSealed(b):
-		v = s.phi(b)
+		v := s.phi(b)
 		s.ws.addIncomplete(b, pendingPhi{key: k, phi: v})
+		return readFrame{}, v, true
 	case len(b.Preds) == 0:
-		v = s.prepend(b, OpUndef)
+		return readFrame{}, s.prepend(b, OpUndef), true
 	case len(b.Preds) == 1:
-		v = s.read(k, b.Preds[0])
-	default:
-		phi := s.phi(b)
-		s.write(k, b, phi)
-		v = s.addOperands(k, phi)
+		return readFrame{block: b}, nil, false
 	}
-	s.write(k, b, v)
-	return v
+	phi := s.phi(b)
+	s.write(k, b, phi)
+	return readFrame{block: b, phi: phi}, nil, false
+}
+
+func (s *ssa) advanceRead(k varKey, f *readFrame, result *Value) (*Block, *Value) {
+	preds := f.block.Preds
+	if f.phi == nil {
+		if f.waiting {
+			return nil, result
+		}
+		f.waiting = true
+		if v, ok := s.defined(k, preds[0]); ok {
+			return nil, resolve(v)
+		}
+		return preds[0], nil
+	}
+	if f.waiting {
+		f.phi.Args = append(f.phi.Args, result)
+		f.waiting = false
+		f.next++
+	}
+	for f.next < len(preds) {
+		pred := preds[f.next]
+		if v, ok := s.defined(k, pred); ok {
+			f.phi.Args = append(f.phi.Args, resolve(v))
+			f.next++
+			continue
+		}
+		f.waiting = true
+		return pred, nil
+	}
+	return nil, s.trivial(f.phi)
 }
 
 func (s *ssa) phi(b *Block) *Value {

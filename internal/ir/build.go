@@ -904,18 +904,72 @@ func floatBits(bits int, f float64) int64 {
 	return int64(math.Float64bits(f))
 }
 
+type logicalFrame struct {
+	temp int
+	rhs  *Block
+	done *Block
+}
+
+func concatenates(e *ast.Binary) bool {
+	return e.Op == lexer.Plus && e.X.TypeOf() == types.Str
+}
+
+func binarySpine(e *ast.Binary) []*ast.Binary {
+	spine := []*ast.Binary{e}
+	for !concatenates(e) {
+		next, ok := e.X.(*ast.Binary)
+		if !ok || isVector(next.Type) {
+			break
+		}
+		spine = append(spine, next)
+		e = next
+	}
+	return spine
+}
+
 func (b *builder) binary(e *ast.Binary) []*Value {
+	spine := binarySpine(e)
+	frames := make([]logicalFrame, len(spine))
+	for i, link := range spine {
+		frames[i] = b.openBinary(link)
+	}
+	tail := len(spine) - 1
+	base := spine[tail]
+	var words []*Value
+	if concatenates(base) {
+		words = b.compose(flatten(base, nil, nil, nil))
+	} else {
+		first := b.expr(base.X)
+		words = b.closeBinary(base, frames[tail], first)
+	}
+	for i := tail - 1; i >= 0; i-- {
+		words = b.closeBinary(spine[i], frames[i], words)
+	}
+	return words
+}
+
+func (b *builder) openBinary(e *ast.Binary) logicalFrame {
+	if e.Op != lexer.AndAnd && e.Op != lexer.OrOr {
+		return logicalFrame{}
+	}
+	temp := b.newTemp()
+	rhs := b.newBlock()
+	done := b.newBlock()
+	return logicalFrame{temp: temp, rhs: rhs, done: done}
+}
+
+func (b *builder) closeBinary(e *ast.Binary, frame logicalFrame, first []*Value) []*Value {
 	if e.Op == lexer.AndAnd || e.Op == lexer.OrOr {
-		return b.logical(e)
+		return b.logical(e, frame, first)
 	}
 	if e.Op == lexer.Coalesce {
-		return b.coalesce(e)
+		return b.coalesce(e, first)
 	}
 	if e.X.TypeOf() == types.Str {
-		return b.strings(e)
+		return b.compareStrings(e, first)
 	}
 	if t := e.X.TypeOf(); aggregate(t) {
-		x := b.value(e.X, t)
+		x := b.coerce(t, t, first)
 		y := b.value(e.Y, t)
 		same := b.equal(t, x, y)
 		if e.Op == lexer.NotEq {
@@ -923,27 +977,24 @@ func (b *builder) binary(e *ast.Binary) []*Value {
 		}
 		return []*Value{same}
 	}
-	x := b.word(e.X)
+	x := b.pad(first, 1)[0]
 	y := b.word(e.Y)
 	return []*Value{b.typed(arith[e.Op], e.X.TypeOf(), x, y)}
 }
 
-func (b *builder) logical(e *ast.Binary) []*Value {
-	temp := b.newTemp()
-	rhs := b.newBlock()
-	done := b.newBlock()
-	x := b.word(e.X)
-	b.writeTemp(temp, []*Value{x})
+func (b *builder) logical(e *ast.Binary, frame logicalFrame, first []*Value) []*Value {
+	x := b.pad(first, 1)[0]
+	b.writeTemp(frame.temp, []*Value{x})
 	if e.Op == lexer.AndAnd {
-		b.branch(x, rhs, done)
+		b.branch(x, frame.rhs, frame.done)
 	} else {
-		b.branch(x, done, rhs)
+		b.branch(x, frame.done, frame.rhs)
 	}
-	b.enter(rhs)
-	b.writeTemp(temp, []*Value{b.word(e.Y)})
-	b.jump(done)
-	b.enter(done)
-	return b.readTemp(temp, 1)
+	b.enter(frame.rhs)
+	b.writeTemp(frame.temp, []*Value{b.word(e.Y)})
+	b.jump(frame.done)
+	b.enter(frame.done)
+	return b.readTemp(frame.temp, 1)
 }
 
 func (b *builder) call(e *ast.Call) []*Value {
@@ -1142,7 +1193,32 @@ func (b *builder) results(call *Value, target *Func) []*Value {
 	return results
 }
 
+type ifFrame struct {
+	temp int
+	done *Block
+}
+
 func (b *builder) ifExpr(e *ast.If) []*Value {
+	chain := ast.ElseChain(e)
+	frames := make([]ifFrame, len(chain))
+	for i, link := range chain {
+		frames[i] = b.openIf(link)
+	}
+	tail := len(chain) - 1
+	last := chain[tail]
+	var words []*Value
+	if last.Else != nil {
+		words = b.value(last.Else, last.Type)
+	}
+	words = b.closeIf(last, frames[tail], words)
+	for i := tail - 1; i >= 0; i-- {
+		other := b.coerce(chain[i+1].Type, chain[i].Type, words)
+		words = b.closeIf(chain[i], frames[i], other)
+	}
+	return words
+}
+
+func (b *builder) openIf(e *ast.If) ifFrame {
 	temp := b.newTemp()
 	then := b.newBlock()
 	otherwise := b.newBlock()
@@ -1152,12 +1228,14 @@ func (b *builder) ifExpr(e *ast.If) []*Value {
 	b.writeTemp(temp, b.value(e.Then, e.Type))
 	b.jump(done)
 	b.enter(otherwise)
-	if e.Else != nil {
-		b.writeTemp(temp, b.value(e.Else, e.Type))
-	}
-	b.jump(done)
-	b.enter(done)
-	return b.readTemp(temp, e.Type.Size())
+	return ifFrame{temp: temp, done: done}
+}
+
+func (b *builder) closeIf(e *ast.If, frame ifFrame, other []*Value) []*Value {
+	b.writeTemp(frame.temp, other)
+	b.jump(frame.done)
+	b.enter(frame.done)
+	return b.readTemp(frame.temp, e.Type.Size())
 }
 
 func (b *builder) when(e *ast.When) []*Value {

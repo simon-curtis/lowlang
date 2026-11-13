@@ -339,6 +339,38 @@ func (d astDumper) call(depth int, label string, e *ast.Call) {
 	d.exprs(depth+1, "arg: ", e.Args)
 }
 
+func (d astDumper) binary(depth int, label string, e *ast.Binary) {
+	spine := ast.LeftSpine(e)
+	for i, link := range spine {
+		linkLabel := "x: "
+		if i == 0 {
+			linkLabel = label
+		}
+		d.line(depth+i, linkLabel, fmt.Sprintf("Binary %s op=%s%s%s%s", at(link.Pos), link.Op, flag("splat_x", link.SplatX), flag("splat_y", link.SplatY), typed("type", link.Type)))
+	}
+	last := len(spine) - 1
+	d.expr(depth+last+1, "x: ", spine[last].X)
+	for i := last; i >= 0; i-- {
+		d.expr(depth+i+1, "y: ", spine[i].Y)
+	}
+}
+
+func (d astDumper) ifChain(depth int, label string, e *ast.If) {
+	for cur := e; ; {
+		d.line(depth, label, fmt.Sprintf("If %s%s", at(cur.Pos), typed("type", cur.Type)))
+		d.expr(depth+1, "cond: ", cur.Cond)
+		d.block(depth+1, "then: ", cur.Then)
+		next, ok := cur.Else.(*ast.If)
+		if !ok {
+			d.expr(depth+1, "else: ", cur.Else)
+			return
+		}
+		cur = next
+		depth++
+		label = "else: "
+	}
+}
+
 func (d astDumper) expr(depth int, label string, e ast.Expr) {
 	switch e := e.(type) {
 	case nil:
@@ -413,16 +445,11 @@ func (d astDumper) expr(depth int, label string, e ast.Expr) {
 		d.line(depth, label, fmt.Sprintf("Unary %s op=%s%s", at(e.Pos), e.Op, typed("type", e.Type)))
 		d.expr(depth+1, "x: ", e.X)
 	case *ast.Binary:
-		d.line(depth, label, fmt.Sprintf("Binary %s op=%s%s%s%s", at(e.Pos), e.Op, flag("splat_x", e.SplatX), flag("splat_y", e.SplatY), typed("type", e.Type)))
-		d.expr(depth+1, "x: ", e.X)
-		d.expr(depth+1, "y: ", e.Y)
+		d.binary(depth, label, e)
 	case *ast.Call:
 		d.call(depth, label, e)
 	case *ast.If:
-		d.line(depth, label, fmt.Sprintf("If %s%s", at(e.Pos), typed("type", e.Type)))
-		d.expr(depth+1, "cond: ", e.Cond)
-		d.block(depth+1, "then: ", e.Then)
-		d.expr(depth+1, "else: ", e.Else)
+		d.ifChain(depth, label, e)
 	case *ast.Match:
 		d.line(depth, label, fmt.Sprintf("Match %s%s", at(e.Pos), typed("type", e.Type)))
 		d.expr(depth+1, "x: ", e.X)

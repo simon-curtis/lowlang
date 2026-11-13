@@ -158,7 +158,16 @@ func (c *Checker) foldUnary(e *ast.Unary) ast.Expr {
 }
 
 func (c *Checker) foldBinary(e *ast.Binary) ast.Expr {
-	x, y := c.fold(e.X), c.fold(e.Y)
+	spine := ast.LeftSpine(e)
+	x := c.fold(spine[len(spine)-1].X)
+	for i := len(spine) - 1; i >= 0; i-- {
+		y := c.fold(spine[i].Y)
+		x = c.foldLink(spine[i], x, y)
+	}
+	return x
+}
+
+func (c *Checker) foldLink(e *ast.Binary, x, y ast.Expr) ast.Expr {
 	switch x := x.(type) {
 	case *ast.IntLit:
 		return c.foldInt(e, x, y.(*ast.IntLit))

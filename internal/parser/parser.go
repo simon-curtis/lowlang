@@ -1230,18 +1230,23 @@ func (p *Parser) pattern() *ast.Pattern {
 }
 
 func (p *Parser) ifExpr() *ast.If {
+	head := p.ifArm()
+	for cur := head; p.at(lexer.Else); {
+		p.next()
+		if !p.at(lexer.If) {
+			cur.Else = p.block()
+			break
+		}
+		next := p.ifArm()
+		cur.Else = next
+		cur = next
+	}
+	return head
+}
+
+func (p *Parser) ifArm() *ast.If {
 	pos := p.expect(lexer.If).Pos
 	cond := p.condition()
 	then := p.block()
-	n := &ast.If{Cond: cond, Then: then, Pos: pos}
-	if !p.at(lexer.Else) {
-		return n
-	}
-	p.next()
-	if p.at(lexer.If) {
-		n.Else = p.ifExpr()
-		return n
-	}
-	n.Else = p.block()
-	return n
+	return &ast.If{Cond: cond, Then: then, Pos: pos}
 }

@@ -1155,7 +1155,12 @@ func (c *Checker) plain(e ast.Expr, want *types.Type) *types.Type {
 }
 
 func (c *Checker) expectType(e ast.Expr, want *types.Type) {
-	if got := c.plain(e, want); !want.Accepts(got) {
+	got := c.plain(e, want)
+	c.accept(e, want, got)
+}
+
+func (c *Checker) accept(e ast.Expr, want, got *types.Type) {
+	if !want.Accepts(got) {
 		c.fail(e.Position(), "expected %s, found %s", want, got)
 	}
 }
@@ -1604,8 +1609,8 @@ func literal(e ast.Expr) bool {
 	return false
 }
 
-func (c *Checker) coalesce(e *ast.Binary) {
-	x := c.plain(e.X, nil)
+func (c *Checker) coalesce(e *ast.Binary, settled *types.Type) {
+	x := c.firstOperand(e.X, nil, settled)
 	if !x.Optional {
 		c.fail(e.X.Position(), "?? requires an optional, found %s", x)
 	}
@@ -1620,12 +1625,12 @@ func (c *Checker) coalesce(e *ast.Binary) {
 	}
 }
 
-func (c *Checker) operands(e *ast.Binary, want *types.Type) *types.Type {
+func (c *Checker) operands(e *ast.Binary, want, settled *types.Type) *types.Type {
 	first, second := e.X, e.Y
 	if literal(first) && !literal(second) {
 		first, second = second, first
 	}
-	t := c.plain(first, want)
+	t := c.firstOperand(first, want, settled)
 	var s *types.Type
 	if isVector(t) && literal(second) {
 		s = c.plain(second, t.Elem)
@@ -1662,20 +1667,56 @@ func (c *Checker) splat(e *ast.Binary, operand ast.Expr) {
 	}
 }
 
+func firstWant(op lexer.Kind, want *types.Type) *types.Type {
+	switch op {
+	case lexer.AndAnd, lexer.OrOr:
+		return types.Bool
+	case lexer.Coalesce, lexer.Eq, lexer.NotEq, lexer.Lt, lexer.LtEq, lexer.Gt, lexer.GtEq:
+		return nil
+	}
+	return arithmetic(want)
+}
+
+func (c *Checker) firstOperand(e ast.Expr, want, settled *types.Type) *types.Type {
+	if settled != nil {
+		return settled
+	}
+	return c.plain(e, want)
+}
+
 func (c *Checker) binary(e *ast.Binary, want *types.Type) {
+	spine := ast.LeftSpine(e)
+	firsts := make([]*types.Type, len(spine))
+	for i, link := range spine {
+		firsts[i] = firstWant(link.Op, want)
+		want = firsts[i]
+	}
+	var settled *types.Type
+	for i := len(spine) - 1; i >= 0; i-- {
+		link := spine[i]
+		c.binaryLink(link, firsts[i], settled)
+		settled = link.Type
+		if i > 0 {
+			c.handled(link, settled)
+		}
+	}
+}
+
+func (c *Checker) binaryLink(e *ast.Binary, first, settled *types.Type) {
 	switch e.Op {
 	case lexer.AndAnd, lexer.OrOr:
-		c.expectType(e.X, types.Bool)
+		got := c.firstOperand(e.X, first, settled)
+		c.accept(e.X, types.Bool, got)
 		c.expectType(e.Y, types.Bool)
 		e.Type = types.Bool
 	case lexer.Coalesce:
-		c.coalesce(e)
+		c.coalesce(e, settled)
 	case lexer.Shl, lexer.Shr:
-		e.Type = c.plain(e.X, arithmetic(want))
+		e.Type = c.firstOperand(e.X, first, settled)
 		c.requireOperator(e.Op, e.Type, e.X.Position())
 		c.shiftCount(e.Op, e.Y)
 	case lexer.Eq, lexer.NotEq:
-		t := c.operands(e, nil)
+		t := c.operands(e, first, settled)
 		if isVector(t) {
 			e.Type = t
 			return
@@ -1685,7 +1726,7 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 		}
 		e.Type = types.Bool
 	case lexer.Lt, lexer.LtEq, lexer.Gt, lexer.GtEq:
-		t := c.operands(e, nil)
+		t := c.operands(e, first, settled)
 		if isVector(t) {
 			e.Type = t
 			return
@@ -1695,7 +1736,7 @@ func (c *Checker) binary(e *ast.Binary, want *types.Type) {
 		}
 		e.Type = types.Bool
 	default:
-		e.Type = c.operands(e, arithmetic(want))
+		e.Type = c.operands(e, first, settled)
 		c.requireOperator(e.Op, e.Type, e.Pos)
 	}
 }
@@ -2103,18 +2144,42 @@ func unify(a, b *types.Type) *types.Type {
 }
 
 func (c *Checker) ifExpr(e *ast.If, want *types.Type) {
+	chain := ast.ElseChain(e)
+	thens := make([]*types.Type, len(chain))
+	for i, link := range chain {
+		thens[i] = c.ifThen(link, want)
+	}
+	tail := len(chain) - 1
+	c.ifTail(chain[tail], thens[tail], want)
+	for i := tail - 1; i >= 0; i-- {
+		next := chain[i+1]
+		c.admit(next, next.Type, want)
+		c.ifJoin(chain[i], thens[i], next.Type, want)
+	}
+}
+
+func (c *Checker) ifThen(e *ast.If, want *types.Type) *types.Type {
 	c.expectType(e.Cond, types.Bool)
 	if e.Else == nil {
-		c.block(e.Then, want)
+		return c.block(e.Then, want)
+	}
+	return c.branch(e.Then, want, want)
+}
+
+func (c *Checker) ifTail(e *ast.If, then, want *types.Type) {
+	if e.Else == nil {
 		e.Type = types.Void
 		return
 	}
-	then := c.branch(e.Then, want, want)
 	hint := want
 	if hint == nil && then.Number() && bareNumber(e.Else) {
 		hint = then
 	}
 	other := c.branch(e.Else, hint, want)
+	c.ifJoin(e, then, other, want)
+}
+
+func (c *Checker) ifJoin(e *ast.If, then, other, want *types.Type) {
 	if want == nil && bareNumber(e.Then) && other.Number() {
 		then = c.block(e.Then, other)
 	}
@@ -2138,10 +2203,14 @@ func (c *Checker) whenExpr(e *ast.When, want *types.Type) {
 
 func (c *Checker) branch(e ast.Expr, hint, want *types.Type) *types.Type {
 	t := c.expr(e, hint)
+	c.admit(e, t, want)
+	return t
+}
+
+func (c *Checker) admit(e ast.Expr, t, want *types.Type) {
 	if want != nil && want != types.Void && t != types.Never && t.Kind != types.ResultKind && !want.Accepts(t) {
 		c.fail(produced(e).Position(), "expected %s, found %s", want, t)
 	}
-	return t
 }
 
 func bareNumber(e ast.Expr) bool {
@@ -2163,13 +2232,33 @@ func numericLiterals(e ast.Expr) bool {
 	case *ast.Unary:
 		return numericLiterals(e.X)
 	case *ast.Binary:
-		return numericLiterals(e.X) && numericLiterals(e.Y)
+		return numericBinary(e)
 	case *ast.Block:
 		return len(e.Stmts) == 0 && e.Tail != nil && numericLiterals(e.Tail)
 	case *ast.If:
-		return e.Else != nil && numericLiterals(e.Then) && numericLiterals(e.Else)
+		return numericIf(e)
 	}
 	return false
+}
+
+func numericBinary(e *ast.Binary) bool {
+	spine := ast.LeftSpine(e)
+	for _, link := range spine {
+		if !numericLiterals(link.Y) {
+			return false
+		}
+	}
+	return numericLiterals(spine[len(spine)-1].X)
+}
+
+func numericIf(e *ast.If) bool {
+	chain := ast.ElseChain(e)
+	for _, link := range chain {
+		if link.Else == nil || !numericLiterals(link.Then) {
+			return false
+		}
+	}
+	return numericLiterals(chain[len(chain)-1].Else)
 }
 
 func produced(e ast.Expr) ast.Expr {

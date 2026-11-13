@@ -143,7 +143,7 @@ func invariantValue(e ast.Expr, stored, counter *ast.Local) bool {
 	case *ast.Unary:
 		return (e.Op == lexer.Minus || e.Op == lexer.Tilde || e.Op == lexer.Not) && invariantValue(e.X, stored, counter)
 	case *ast.Binary:
-		return pureBinary(e) && invariantValue(e.X, stored, counter) && invariantValue(e.Y, stored, counter)
+		return invariantBinary(e, stored, counter)
 	case *ast.Call:
 		return e.Builtin == builtin.Convert && invariantValue(e.Args[0], stored, counter)
 	case *ast.Selector:
@@ -151,6 +151,16 @@ func invariantValue(e ast.Expr, stored, counter *ast.Local) bool {
 		return plain && e.X.TypeOf().Kind == types.StructKind && invariantValue(e.X, stored, counter)
 	}
 	return false
+}
+
+func invariantBinary(e *ast.Binary, stored, counter *ast.Local) bool {
+	spine := ast.LeftSpine(e)
+	for _, link := range spine {
+		if !pureBinary(link) || !invariantValue(link.Y, stored, counter) {
+			return false
+		}
+	}
+	return invariantValue(spine[len(spine)-1].X, stored, counter)
 }
 
 func pureBinary(e *ast.Binary) bool {

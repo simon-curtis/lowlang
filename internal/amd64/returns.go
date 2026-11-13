@@ -26,12 +26,15 @@ func (f *mfunc) duplicateReturns() {
 		if !slices.ContainsFunc(from, func(p *mblock) bool { return p.returnsDirectly() }) {
 			continue
 		}
+		remaining := 0
 		for _, p := range from {
 			if p.returnsDirectly() {
 				p.returnInstead(ret)
+			} else {
+				remaining++
 			}
 		}
-		if len(f.predecessors()[ret]) == 0 {
+		if remaining == 0 {
 			f.blocks = slices.DeleteFunc(f.blocks, func(mb *mblock) bool { return mb == ret })
 		}
 	}

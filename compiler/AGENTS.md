@@ -44,5 +44,6 @@ The Low `low` builds itself: `/tmp/low build compiler/low -o /tmp/low1`, then `/
 - A local cannot share the name of a function it calls, and a function cannot be named after a keyword or a type.
 - An enum converts to an integer only through `.index`, which needs `= n` on every variant.
 - `diag.quote` and `diag.quote_char` format as Go's `%q`. `lexer.quote` is the dump format.
+- The Low compiler runs on a 1 MB green thread stack, so no pass recurses once per link of a left-deep binary chain or an `else if` chain. `ast.left_spine` and `ast.else_chain` list the links outermost first; a pass visits them in a loop with open and close steps that keep the Go order of work (`ir.binary`, `ir.if_expr`, `check.binary`, `check.if_expr`), and the walkers, printers and clones iterate the same lists. The same holds for the SSA reader (`ir.read_recursive`) and the optimiser's dominator walk (`ir.visit`), which keep their own frames. `testdata/run/long_chains.low` and `testdata/fail/long_chain_error.low` hold chains of 20,000 terms.
 - Assignments are statements: a `match` arm that assigns takes a `{ }` block.
 - `"{{"` and `"}}"` are literal braces in a string.

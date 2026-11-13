@@ -4,7 +4,6 @@ import (
 	"slices"
 
 	"lowlang/internal/ast"
-	"lowlang/internal/lexer"
 	"lowlang/internal/prelude"
 	"lowlang/internal/types"
 )
@@ -61,12 +60,28 @@ func flatten(e ast.Expr, render *ast.Func, spec *ast.Spec, out []segment) []segm
 		}
 		return out
 	case *ast.Binary:
-		if e.Op == lexer.Plus && e.X.TypeOf() == types.Str {
-			left := flatten(e.X, nil, nil, out)
-			return flatten(e.Y, nil, nil, left)
+		if concatenates(e) {
+			return flattenConcat(e, out)
 		}
 	}
 	return append(out, segment{expr: e, render: render})
+}
+
+func flattenConcat(e *ast.Binary, out []segment) []segment {
+	spine := []*ast.Binary{e}
+	for {
+		next, ok := e.X.(*ast.Binary)
+		if !ok || !concatenates(next) {
+			break
+		}
+		spine = append(spine, next)
+		e = next
+	}
+	out = flatten(e.X, nil, nil, out)
+	for i := len(spine) - 1; i >= 0; i-- {
+		out = flatten(spine[i].Y, nil, nil, out)
+	}
+	return out
 }
 
 func appendText(pieces []piece, text string) []piece {

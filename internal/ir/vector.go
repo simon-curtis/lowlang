@@ -110,15 +110,53 @@ func (b *builder) operand(e ast.Expr, splat bool, t *types.Type) *Value {
 	return slot
 }
 
+func vectorShift(e *ast.Binary) bool {
+	op := vectorBinary[e.Op]
+	return op == VShl || op == VShr
+}
+
+func vectorSpine(e *ast.Binary) []*ast.Binary {
+	spine := []*ast.Binary{e}
+	for vectorShift(e) || !e.SplatX {
+		next, ok := e.X.(*ast.Binary)
+		if !ok {
+			break
+		}
+		spine = append(spine, next)
+		e = next
+	}
+	return spine
+}
+
 func (b *builder) vectorBinary(e *ast.Binary) *Value {
+	spine := vectorSpine(e)
+	slots := make([]*Value, len(spine))
+	for i, link := range spine {
+		slots[i] = b.vectorSlot(link.Type)
+	}
+	tail := len(spine) - 1
+	first := b.vectorFirst(spine[tail])
+	for i := tail; i >= 0; i-- {
+		first = b.vectorLink(spine[i], slots[i], first)
+	}
+	return first
+}
+
+func (b *builder) vectorFirst(e *ast.Binary) *Value {
+	if vectorShift(e) {
+		return b.vec(e.X)
+	}
+	return b.operand(e.X, e.SplatX, e.Type)
+}
+
+func (b *builder) vectorLink(e *ast.Binary, dst, first *Value) *Value {
 	t := e.Type
 	op := vectorBinary[e.Op]
-	dst := b.vectorSlot(t)
-	if op == VShl || op == VShr {
-		b.vectorOp(op, t, dst, b.vec(e.X), b.word(e.Y))
+	if vectorShift(e) {
+		b.vectorOp(op, t, dst, first, b.word(e.Y))
 		return dst
 	}
-	b.vectorOp(op, t, dst, b.operand(e.X, e.SplatX, t), b.operand(e.Y, e.SplatY, t))
+	b.vectorOp(op, t, dst, first, b.operand(e.Y, e.SplatY, t))
 	return dst
 }
 

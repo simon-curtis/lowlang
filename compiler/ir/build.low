@@ -1111,19 +1111,77 @@ fn unary(b: *Builder, e: *ast.Unary) -> []*Value {
     [typed(b, OpNeg, t, [x])]
 }
 
+struct LogicalFrame {
+    temp: i64
+    rhs: *Block? = none
+    done: *Block? = none
+}
+
+fn binary_spine(e: *ast.Binary) -> []*ast.Binary {
+    var spine: []*ast.Binary = [e]
+    var cur = e
+    for !concatenates(cur) {
+        match cur.x {
+            Binary(next) => {
+                if is_vector(types.must(next.type)) {
+                    break
+                }
+                push(mut spine, next)
+                cur = next
+            }
+            _ => break
+        }
+    }
+    spine
+}
+
 fn binary(b: *Builder, e: *ast.Binary) -> []*Value {
+    let spine = binary_spine(e)
+    var frames: []LogicalFrame = []
+    for link in spine {
+        let frame = open_binary(b, link)
+        push(mut frames, frame)
+    }
+    let tail = spine.len - 1
+    let base = spine[tail]
+    var words: []*Value = []
+    if concatenates(base) {
+        words = compose(b, flatten(ast.Expr.Binary(base), none, none))
+    } else {
+        let first = expr(b, base.x)
+        words = close_binary(b, base, frames[tail], first)
+    }
+    var i = tail
+    for i > 0 {
+        i = i - 1
+        words = close_binary(b, spine[i], frames[i], words)
+    }
+    words
+}
+
+fn open_binary(b: *Builder, e: *ast.Binary) -> LogicalFrame {
+    if e.op != AndAnd && e.op != OrOr {
+        return LogicalFrame { temp: 0 }
+    }
+    let temp = new_temp(b)
+    let rhs = fresh_block(b)
+    let done = fresh_block(b)
+    LogicalFrame { temp, rhs, done }
+}
+
+fn close_binary(b: *Builder, e: *ast.Binary, frame: LogicalFrame, first: []*Value) -> []*Value {
     if e.op == AndAnd || e.op == OrOr {
-        return logical(b, e)
+        return logical(b, e, frame, first)
     }
     if e.op == Coalesce {
-        return coalesce(b, e)
+        return coalesce(b, e, first)
     }
     let t = typ(e.x)
     if t == b.u.str {
-        return strings(b, e)
+        return compare_strings(b, e, first)
     }
     if aggregate(t) {
-        let x = value(b, e.x, t)
+        let x = coerce(b, t, t, first)
         let y = value(b, e.y, t)
         var same = equal(b, t, x, y)
         if e.op == NotEq {
@@ -1131,17 +1189,16 @@ fn binary(b: *Builder, e: *ast.Binary) -> []*Value {
         }
         return [same]
     }
-    let x = word(b, e.x)
+    let x = pad(b, first, 1)[0]
     let y = word(b, e.y)
     [typed(b, arith(e.op), t, [x, y])]
 }
 
-fn logical(b: *Builder, e: *ast.Binary) -> []*Value {
-    let temp = new_temp(b)
-    let rhs = fresh_block(b)
-    let done = fresh_block(b)
-    let x = word(b, e.x)
-    write_temp(b, temp, [x])
+fn logical(b: *Builder, e: *ast.Binary, frame: LogicalFrame, first: []*Value) -> []*Value {
+    let rhs = frame.rhs ?? panic("logical frame without blocks")
+    let done = frame.done ?? panic("logical frame without blocks")
+    let x = pad(b, first, 1)[0]
+    write_temp(b, frame.temp, [x])
     if e.op == AndAnd {
         branch(b, x, rhs, done)
     } else {
@@ -1149,10 +1206,10 @@ fn logical(b: *Builder, e: *ast.Binary) -> []*Value {
     }
     enter(b, rhs)
     let y = word(b, e.y)
-    write_temp(b, temp, [y])
+    write_temp(b, frame.temp, [y])
     jump(b, done)
     enter(b, done)
-    read_temp(b, temp, 1)
+    read_temp(b, frame.temp, 1)
 }
 
 fn lower_call(b: *Builder, e: *ast.Call) -> []*Value {
@@ -1390,7 +1447,36 @@ pub fn results(b: *Builder, call: *Value, target: *Func) -> []*Value {
     found
 }
 
+struct IfFrame {
+    temp: i64
+    done: *Block
+}
+
 fn if_expr(b: *Builder, e: *ast.If) -> []*Value {
+    let chain = ast.else_chain(e)
+    var frames: []IfFrame = []
+    for link in chain {
+        let frame = open_if(b, link)
+        push(mut frames, frame)
+    }
+    let tail = chain.len - 1
+    let last = chain[tail]
+    var words: []*Value = []
+    match last.otherwise {
+        some(other) => { words = value(b, other, types.must(last.type)) }
+        none => {}
+    }
+    words = close_if(b, last, frames[tail], words)
+    var i = tail
+    for i > 0 {
+        i = i - 1
+        let other = coerce(b, types.must(chain[i + 1].type), types.must(chain[i].type), words)
+        words = close_if(b, chain[i], frames[i], other)
+    }
+    words
+}
+
+fn open_if(b: *Builder, e: *ast.If) -> IfFrame {
     let t = types.must(e.type)
     let temp = new_temp(b)
     let then = fresh_block(b)
@@ -1403,16 +1489,14 @@ fn if_expr(b: *Builder, e: *ast.If) -> []*Value {
     write_temp(b, temp, then_words)
     jump(b, done)
     enter(b, otherwise)
-    match e.otherwise {
-        some(other) => {
-            let other_words = value(b, other, t)
-            write_temp(b, temp, other_words)
-        }
-        none => {}
-    }
-    jump(b, done)
-    enter(b, done)
-    read_temp(b, temp, types.size(t))
+    IfFrame { temp, done }
+}
+
+fn close_if(b: *Builder, e: *ast.If, frame: IfFrame, other: []*Value) -> []*Value {
+    write_temp(b, frame.temp, other)
+    jump(b, frame.done)
+    enter(b, frame.done)
+    read_temp(b, frame.temp, types.size(types.must(e.type)))
 }
 
 fn lower_when(b: *Builder, e: *ast.When) -> []*Value {

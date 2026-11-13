@@ -150,15 +150,12 @@ func (w walker) node(n Node) {
 	case *Unary:
 		w.expr(n.X)
 	case *Binary:
-		w.expr(n.X)
-		w.expr(n.Y)
+		w.binary(n)
 	case *Call:
 		w.expr(n.Fn)
 		w.exprs(n.Args)
 	case *If:
-		w.expr(n.Cond)
-		w.block(n.Then)
-		w.expr(n.Else)
+		w.ifChain(n)
 	case *Match:
 		w.expr(n.X)
 		w.arms(n.Arms)
@@ -178,6 +175,41 @@ func (w walker) node(n Node) {
 		w.expr(n.Cond)
 	case *Receiver:
 		w.expr(n.X)
+	}
+}
+
+func (w walker) binary(e *Binary) {
+	spine := []*Binary{e}
+	for {
+		next, ok := e.X.(*Binary)
+		if !ok {
+			w.expr(e.X)
+			break
+		}
+		if !w.visit(next) {
+			break
+		}
+		spine = append(spine, next)
+		e = next
+	}
+	for i := len(spine) - 1; i >= 0; i-- {
+		w.expr(spine[i].Y)
+	}
+}
+
+func (w walker) ifChain(e *If) {
+	for {
+		w.expr(e.Cond)
+		w.block(e.Then)
+		next, ok := e.Else.(*If)
+		if !ok {
+			w.expr(e.Else)
+			return
+		}
+		if !w.visit(next) {
+			return
+		}
+		e = next
 	}
 }
 

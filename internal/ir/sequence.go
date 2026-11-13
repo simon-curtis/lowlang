@@ -104,11 +104,8 @@ func (b *builder) preludeField(fn, name string) *types.Field {
 	return f
 }
 
-func (b *builder) strings(e *ast.Binary) []*Value {
-	if e.Op == lexer.Plus {
-		return b.compose(flatten(e, nil, nil, nil))
-	}
-	x := b.value(e.X, types.Str)
+func (b *builder) compareStrings(e *ast.Binary, first []*Value) []*Value {
+	x := b.coerce(types.Str, types.Str, first)
 	y := b.value(e.Y, types.Str)
 	if e.Op != lexer.Eq && e.Op != lexer.NotEq {
 		order := b.callNamed(prelude.StrCmp, x[0], x[1], y[0], y[1])[0]
@@ -236,9 +233,9 @@ func (b *builder) closeLoop(loop loopBlocks) {
 	b.enter(loop.exit)
 }
 
-func (b *builder) coalesce(e *ast.Binary) []*Value {
+func (b *builder) coalesce(e *ast.Binary, first []*Value) []*Value {
 	optional := e.X.TypeOf()
-	words := b.value(e.X, optional)
+	words := b.coerce(optional, optional, first)
 	temp := b.newTemp()
 	present := b.newBlock()
 	absent := b.newBlock()
