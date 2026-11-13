@@ -1,0 +1,243 @@
+import ast
+import target
+import std/file
+import std/path
+import std/slices
+import std/text
+
+pub struct ModuleDoc {
+    pub path: str
+    pub imports: []ImportDoc
+    pub items: []ItemDoc
+    pub examples: []ExampleDoc
+}
+
+pub struct ExampleDoc {
+    pub name: str
+    pub source: str
+    pub output: str
+}
+
+pub struct ImportDoc {
+    pub path: str
+    pub alias: str
+}
+
+pub struct ItemDoc {
+    pub kind: str
+    pub name: str
+    pub receiver: str = ""
+    pub text: str
+    pub doc: str = ""
+    pub file: str
+    pub line: i64
+}
+
+struct Documenter {
+    std: *Std
+    privileged: bool
+    root: str
+    platform: target.OS
+}
+
+struct Found {
+    modules: []*ModuleDoc = []
+}
+
+pub fn document(dir: str, platform: target.OS) -> []*ModuleDoc ! Error {
+    let std = new_std()
+    let found = new(Found {})
+    if dir == "std" {
+        let d = Documenter { std, privileged: true, root: "", platform }
+        walk(d, "std", found)?
+        return found.modules
+    }
+    let d = Documenter { std, privileged: false, root: dir, platform }
+    let info = file.stat(dir) catch {
+        NotFound => fail Error.Failed("stat .: no such file or directory")
+        e => fail Error.Failed("stat .: {reason(e)}")
+    }
+    if !info.dir {
+        fail Error.Failed("stat .: not a directory")
+    }
+    walk(d, ".", found)?
+    found.modules
+}
+
+fn fs_path(d: Documenter, name: str) -> str {
+    if d.privileged {
+        return name
+    }
+    path.join([d.root, name])
+}
+
+fn entries_of(d: Documenter, dir: str) -> Directory ! Error {
+    let tree = Tree { privileged: d.privileged, std: d.std }
+    let found = read_dir(tree, fs_path(d, dir))?
+    var sorted = found.entries
+    slices.sort_by(mut sorted, fn(a: file.Entry, b: file.Entry) -> bool { a.name < b.name })
+    Directory { entries: sorted, absent: found.absent }
+}
+
+fn parse_doc(d: Documenter, name: str) -> *ast.File ! Error {
+    let tree = Tree { privileged: d.privileged, std: d.std }
+    parse(tree, fs_path(d, name))?
+}
+
+fn walk(d: Documenter, dir: str, found: *Found) ! Error {
+    let doc = module_doc(d, dir)?
+    match doc {
+        some(module) => {
+            push(mut found.modules, module)
+        }
+        none => {}
+    }
+    let directory = entries_of(d, dir)?
+    for entry in directory.entries {
+        if entry.dir && entry.name != examples_dir {
+            let child = path.join([dir, entry.name])
+            walk(d, child, found)?
+        }
+    }
+}
+
+fn module_doc(d: Documenter, dir: str) -> *ModuleDoc? ! Error {
+    let directory = entries_of(d, dir)?
+    var files: []*ast.File = []
+    for entry in directory.entries {
+        if !builds(entry, d.platform) {
+            continue
+        }
+        let parsed = parse_doc(d, path.join([dir, entry.name]))?
+        push(mut files, parsed)
+    }
+    if files.len == 0 {
+        return none
+    }
+    let examples = examples_of(d, dir)?
+    let module = new(ModuleDoc { path: dir, imports: [], items: [], examples })
+    if dir == "." {
+        module.path = ""
+    }
+    let types = public_types(files)
+    for f in files {
+        add_file(module, f, types)
+    }
+    slices.sort_stable_by(mut module.imports, fn(a: ImportDoc, b: ImportDoc) -> bool { a.path < b.path })
+    module.imports = compact(module.imports)
+    slices.sort_stable_by(mut module.items, fn(a: ItemDoc, b: ItemDoc) -> bool { a.name < b.name })
+    module
+}
+
+fn compact(imports: []ImportDoc) -> []ImportDoc {
+    var out: []ImportDoc = []
+    for imp in imports {
+        if out.len > 0 {
+            let last = out[out.len - 1]
+            if last.path == imp.path && last.alias == imp.alias {
+                continue
+            }
+        }
+        push(mut out, imp)
+    }
+    out
+}
+
+fn examples_of(d: Documenter, dir: str) -> []ExampleDoc ! Error {
+    var examples: []ExampleDoc = []
+    let folder = path.join([dir, examples_dir])
+    let directory = entries_of(d, folder)?
+    if directory.absent {
+        return examples
+    }
+    for entry in directory.entries {
+        if entry.dir || !text.ends_with(entry.name, ".low") {
+            continue
+        }
+        let example = example_of(d, folder, entry.name)?
+        push(mut examples, example)
+    }
+    examples
+}
+
+fn example_of(d: Documenter, folder: str, name: str) -> ExampleDoc ! Error {
+    let location = path.join([folder, name])
+    let held = read_doc_file(d, location)?
+    let source = held ?? fail Error.Failed("open {location}: no such file or directory")
+    let base = text.trim_suffix(name, ".low")
+    let sidecar = read_doc_file(d, path.join([folder, "{base}.out"]))?
+    ExampleDoc { name: base, source, output: sidecar ?? "" }
+}
+
+fn read_doc_file(d: Documenter, name: str) -> str? ! Error {
+    let location = fs_path(d, name)
+    if d.privileged {
+        return std_file_data(d.std, location)
+    }
+    let contents = file.read_text(location) catch {
+        NotFound => return none
+        e => fail failed("open", location, e)
+    }
+    contents
+}
+
+fn public_types(files: []*ast.File) -> [str: bool] {
+    let types: [str: bool] = [:]
+    for f in files {
+        for s in f.structs {
+            types[s.name] = s.exported
+        }
+        for e in f.enums {
+            types[e.name] = e.exported
+        }
+    }
+    types
+}
+
+fn add_file(m: *ModuleDoc, f: *ast.File, types: [str: bool]) {
+    let name = path.base(f.path)
+    for imp in f.imports {
+        push(mut m.imports, ImportDoc { path: imp.path, alias: imp.alias })
+    }
+    for s in f.structs {
+        if s.exported {
+            push(mut m.items, ItemDoc { kind: "struct", name: s.name, text: ast.struct_interface(s), doc: s.doc, file: name, line: s.pos.line })
+        }
+    }
+    for e in f.enums {
+        if e.exported {
+            push(mut m.items, ItemDoc { kind: "enum", name: e.name, text: ast.enum_interface(e), doc: e.doc, file: name, line: e.pos.line })
+        }
+    }
+    for k in f.consts {
+        if k.exported {
+            push(mut m.items, ItemDoc { kind: "const", name: k.name, text: "pub {ast.const_text(k)}", doc: k.doc, file: name, line: k.pos.line })
+        }
+    }
+    for fn_decl in f.funcs {
+        if fn_decl.exported {
+            push(mut m.items, ItemDoc { kind: "fn", name: fn_decl.name, receiver: receiver_of(fn_decl, types), text: "pub {ast.func_text_of(fn_decl)}", doc: fn_decl.doc, file: name, line: fn_decl.pos.line })
+        }
+    }
+    for x in f.externs {
+        for fn_decl in x.funcs {
+            if fn_decl.exported {
+                push(mut m.items, ItemDoc { kind: "fn", name: fn_decl.name, text: "pub {ast.func_text_of(fn_decl)}", doc: fn_decl.doc, file: name, line: fn_decl.pos.line })
+            }
+        }
+    }
+}
+
+fn receiver_of(f: *ast.Func, types: [str: bool]) -> str {
+    if f.params.len == 0 {
+        return ""
+    }
+    var t = f.params[0].type_name ?? return ""
+    if t.is_pointer {
+        t = t.elem ?? return ""
+    }
+    if t.module != "" || !(types[t.name] ?? false) {
+        return ""
+    }
+    t.name
+}

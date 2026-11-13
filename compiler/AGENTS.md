@@ -8,6 +8,9 @@
 - One Go package `internal/<name>` becomes one module `compiler/<name>/`, keeping the Go file names with a `.low` extension.
 - `compiler/lowdump/` and `cmd/lowdump/` are the same dump tool in Low and in Go. Each stage adds one command to both, in its own file, printing that stage's output as text or writing it as bytes.
 
+- `compiler/low/` is the `low` command: `build`, `run`, `asm`, `ir`, `lint`, `doc` and `version`. `version` prints `compiler/low/version.txt`. The command has no `dev` or `lsp`, so its usage text lists neither.
+- `compiler/lowtest/` is the fixture harness. `/tmp/low build compiler/lowtest -o /tmp/lowtest`, then `/tmp/lowtest <low binary> [run|examples|fail|lint|windows]... [-filter text]` from the repository root checks any `low` binary against the sidecar files, using only its command line. `.maxrss` is sampled from `/proc` every millisecond.
+
 ## Build and compare
 
 ```
@@ -17,9 +20,11 @@ $ /tmp/low build compiler/lowdump -o /tmp/lowdump-low
 $ /tmp/lowdump-go tokens file.low > a; /tmp/lowdump-low tokens file.low > b; cmp a b
 ```
 
-The commands are `tokens`, `ast`, `check`, `ir`, `asm`, `object`, `link`, `patch` and `regex`; run either tool without arguments for their flags. `ir` prints the SSA of every function, `asm` the assembly of the whole program, `object` the assembled sections, symbols and relocations of a `.s` file, `link` writes the executable for a `.s` file, `patch` prints the hot patch for a `.s` file against a base executable, and `regex` prints the matcher generated for each pattern in a file. `check` loads a whole program and prints every file's AST with the types, locals, targets and layouts the checker resolved; `cmd/lowdump/ast.go` and `compiler/lowdump/ast.low` print the same lines, so a field the checker sets is compared as soon as the Low checker sets it. The Go compiler embeds `internal/compiler/std` and `internal/compiler/prelude.low`; the Low `compiler` module reads them from disk, from the directory in `LOW_STD` or else `internal/compiler/std` relative to the working directory, with `prelude.low` beside it.
+The commands are `tokens`, `ast`, `check`, `ir`, `asm`, `object`, `link`, `patch` and `regex`; run either tool without arguments for their flags. `ir` prints the SSA of every function, `asm` the assembly of the whole program, `object` the assembled sections, symbols and relocations of a `.s` file, `link` writes the executable for a `.s` file, `patch` prints the hot patch for a `.s` file against a base executable, and `regex` prints the matcher generated for each pattern in a file. `check` loads a whole program and prints every file's AST with the types, locals, targets and layouts the checker resolved; `cmd/lowdump/ast.go` and `compiler/lowdump/ast.low` print the same lines, so a field the checker sets is compared as soon as the Low checker sets it. Both compilers embed `internal/compiler/std` and `internal/compiler/prelude.low`: the Low `compiler` module calls `embed_dir` on the std tree once per compilation, holds the map in the `Std` value it passes to the loader and the embedder, and takes the prelude with `embed`.
 
 Compare stdout, stderr and the exit status over every `.low` file under `testdata/`, `internal/compiler/` and `bench/`, including the files that must fail.
+
+The Low `low` builds itself: `/tmp/low build compiler/low -o /tmp/low1`, then `/tmp/low1 build compiler/low -o /tmp/low2` and `/tmp/low2 build compiler/low -o /tmp/low3` give three byte-identical executables, and each builds every program to the same bytes as the Go `low`.
 
 ## Porting rules
 

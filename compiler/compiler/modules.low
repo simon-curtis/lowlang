@@ -1,11 +1,12 @@
 import amd64
+import asm
 import ast
 import diag
+import link
 import parser
 import target
 import std/file
 import std/io
-import std/os
 import std/path
 import std/slices
 import std/sys
@@ -13,26 +14,77 @@ import std/text
 
 const module_file = "low.mod"
 const examples_dir = "examples"
-const std_dir = "internal/compiler/std"
 
 pub enum Error {
     Diag(diag.Error)
     Prelude(msg: str)
     Failed(msg: str)
     Backend(amd64.Error)
+    Assemble(asm.Error)
+    Link(link.Error)
 }
 
 pub fn message(e: Error) -> str {
     match e {
         Backend(inner) => amd64.error_message(inner)
+        Assemble(inner) => asm.message(inner)
+        Link(inner) => link.message(inner)
         Diag(inner) => diag.message(inner)
         Prelude(msg) => msg
         Failed(msg) => msg
     }
 }
 
-pub fn std_root() -> str {
-    os.env("LOW_STD") ?? std_dir
+pub struct Std {
+    files: [str: str]
+    dirs: [str: []file.Entry]
+}
+
+fn new_std() -> *Std {
+    let files = embed_dir("../../internal/compiler/std")
+    let dirs: [str: []file.Entry] = ["std": []]
+    for name in files {
+        index_std_file(dirs, name)
+    }
+    for dir in dirs {
+        var entries = dirs[dir] ?? []
+        slices.sort_by(mut entries, fn(a: file.Entry, b: file.Entry) -> bool { a.name < b.name })
+        dirs[dir] = entries
+    }
+    new(Std { files, dirs })
+}
+
+fn index_std_file(dirs: [str: []file.Entry], name: str) {
+    var dir = "std"
+    let parts = text.split(name, '/')
+    for i, part in parts {
+        let child = "{dir}/{part}"
+        if i == parts.len - 1 {
+            add_std_entry(dirs, dir, file.Entry { name: part, dir: false, link: false, regular: true })
+        } else if !has_dir(dirs, child) {
+            add_std_entry(dirs, dir, file.Entry { name: part, dir: true, link: false, regular: false })
+            dirs[child] = []
+        }
+        dir = child
+    }
+}
+
+fn has_dir(dirs: [str: []file.Entry], name: str) -> bool {
+    match dirs[name] {
+        some(_) => true
+        none => false
+    }
+}
+
+fn add_std_entry(dirs: [str: []file.Entry], dir: str, entry: file.Entry) {
+    var held = dirs[dir] ?? []
+    push(mut held, entry)
+    dirs[dir] = held
+}
+
+fn std_file_data(s: *Std, key: str) -> str? {
+    let inside = text.strip_prefix(key, "std/") ?? return none
+    s.files[inside]
 }
 
 fn is_std(module: str) -> bool {
@@ -57,19 +109,9 @@ fn failed(op: str, name: str, e: io.Error) -> Error {
     Error.Failed("{op} {name}: {reason(e)}")
 }
 
-fn real_name(privileged: bool, name: str) -> str {
-    if !privileged {
-        return name
-    }
-    let root = std_root()
-    if name == "std" {
-        return root
-    }
-    path.join([root, name[4..]])
-}
-
 struct Tree {
     privileged: bool
+    std: *Std
 }
 
 struct Listing {
@@ -83,7 +125,11 @@ struct Directory {
 }
 
 fn read_dir(t: Tree, dir: str) -> Directory ! Error {
-    let found = file.read_dir_info(real_name(t.privileged, dir)) catch {
+    if t.privileged {
+        let found = t.std.dirs[dir] ?? return Directory { entries: [], absent: true }
+        return Directory { entries: found, absent: false }
+    }
+    let found = file.read_dir_info(dir) catch {
         NotFound => return Directory { entries: [], absent: true }
         NotDir => fail Error.Failed("readdirent {dir}: not a directory")
         e => fail failed("open", dir, e)
@@ -109,20 +155,23 @@ fn builds(entry: file.Entry, platform: target.OS) -> bool {
 }
 
 fn parse(t: Tree, name: str) -> *ast.File ! Error {
-    let src = file.read_text(real_name(t.privileged, name)) catch {
-        e => fail failed("open", name, e)
-    }
+    let src = read_source(t, name)?
     let f = parse_source(src, name, t.privileged)?
     f.path = name
     f
 }
 
-pub fn parse_source(src: str, name: str, privileged: bool) -> *ast.File ! Error {
-    parser.parse_source(src, diag.start(name), privileged) catch Diag
+fn read_source(t: Tree, name: str) -> str ! Error {
+    if t.privileged {
+        return std_file_data(t.std, name) ?? fail Error.Failed("open {name}: no such file or directory")
+    }
+    file.read_text(name) catch {
+        e => fail failed("open", name, e)
+    }
 }
 
-pub fn parse_file(name: str) -> *ast.File ! Error {
-    parse(Tree { privileged: false }, name)?
+pub fn parse_source(src: str, name: str, privileged: bool) -> *ast.File ! Error {
+    parser.parse_source(src, diag.start(name), privileged) catch Diag
 }
 
 fn root(dir: str) -> str? {
@@ -163,6 +212,7 @@ struct Edge {
 pub struct Loader {
     root: str = ""
     platform: target.OS
+    std: *Std
     files: []*ast.File = []
     sources: []str = []
     edges: [str: []Edge] = [:]
@@ -170,9 +220,9 @@ pub struct Loader {
     loaded: [str: bool] = [:]
 }
 
-pub fn load_modules(entry_path: str, platform: target.OS) -> *Loader ! Error {
-    let l = new(Loader { platform })
-    let disk = Tree { privileged: false }
+pub fn load_modules(entry_path: str, platform: target.OS, std: *Std) -> *Loader ! Error {
+    let l = new(Loader { platform, std })
+    let disk = Tree { privileged: false, std }
     let info = file.stat(entry_path) catch {
         e => fail failed("stat", entry_path, e)
     }
@@ -214,8 +264,8 @@ pub fn user_files(l: *Loader) -> []*ast.File {
     out
 }
 
-fn tree_of(module_name: str) -> Tree {
-    Tree { privileged: is_std(module_name) }
+fn tree_of(l: *Loader, module_name: str) -> Tree {
+    Tree { privileged: is_std(module_name), std: l.std }
 }
 
 fn imported(l: *Loader, e: Edge) ! Error {
@@ -227,7 +277,7 @@ fn imported(l: *Loader, e: Edge) ! Error {
             fail Error.Diag(diag.Error.At(e.pos, "cannot import {e.to}: an examples directory holds programs, not modules"))
         }
     }
-    let source = tree_of(e.to)
+    let source = tree_of(l, e.to)
     var dir = e.to
     var place = "the standard library"
     if !source.privileged {
@@ -244,7 +294,7 @@ fn imported(l: *Loader, e: Edge) ! Error {
 fn module(l: *Loader, name: str, files: []str) ! Error {
     l.loaded[name] = true
     l.edges[name] = []
-    let source = tree_of(name)
+    let source = tree_of(l, name)
     for file_name in files {
         let f = parse(source, file_name)?
         f.module = name
@@ -252,11 +302,11 @@ fn module(l: *Loader, name: str, files: []str) ! Error {
         if !source.privileged {
             push(mut l.sources, file_name)
         }
-        link(l, f)?
+        link_imports(l, f)?
     }
 }
 
-fn link(l: *Loader, f: *ast.File) ! Error {
+fn link_imports(l: *Loader, f: *ast.File) ! Error {
     var seen: [str: bool] = [:]
     for imp in f.imports {
         if seen[imp.alias] != none {
