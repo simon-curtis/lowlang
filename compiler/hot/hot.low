@@ -1,0 +1,572 @@
+import amd64
+import compiler
+import ir
+import std/atomic
+import std/cancel
+import std/file
+import std/hash
+import std/io
+import std/os/signal
+import std/path
+import std/process
+import std/slices
+import std/sync
+import std/sys
+import std/text
+import std/time
+
+pub enum Error {
+    Compile(compiler.Error)
+    Failed(msg: str)
+    Cancelled
+}
+
+pub fn message(e: Error) -> str {
+    match e {
+        Compile(inner) => compiler.message(inner)
+        Failed(msg) => msg
+        Cancelled => "context canceled"
+    }
+}
+
+pub struct Capture {
+    guard: sync.Mutex
+    data: []u8
+}
+
+pub fn new_capture() -> *Capture {
+    new(Capture { guard: sync.mutex(), data: [] })
+}
+
+pub fn captured(c: *Capture) -> str {
+    sync.lock(c.guard)
+    let copy = str(c.data)
+    sync.unlock(c.guard)
+    copy
+}
+
+fn capture_write(c: *Capture, data: []u8) {
+    sync.lock(c.guard)
+    io.append(mut c.data, data)
+    sync.unlock(c.guard)
+}
+
+pub enum Sink {
+    Descriptor(fd: i64)
+    Buffer(capture: *Capture)
+}
+
+fn write_sink(sink: Sink, data: []u8) {
+    match sink {
+        Descriptor(fd) => sys.write_all(fd, data) or {}
+        Buffer(capture) => capture_write(capture, data)
+    }
+}
+
+fn stdio_of(sink: Sink) -> process.Stdio {
+    match sink {
+        Descriptor(_) => process.Stdio.Inherit
+        Buffer(_) => process.Stdio.Piped
+    }
+}
+
+struct Ended {
+    description: str
+}
+
+struct Child {
+    handle: *process.ChildHandle
+    done: chan[Ended]
+    exited: atomic.Flag
+    pumps: sync.WaitGroup
+}
+
+pub struct Session {
+    pub path: str
+    sources: []str = []
+    stdout: Sink
+    stderr: Sink
+    dir: str
+    child: *Child? = none
+    idle: chan[Ended] = chan[Ended]()
+    built: compiler.Built? = none
+    table: *amd64.FuncTable = new(amd64.FuncTable {})
+    funcs: [str: str] = [:]
+    signatures: [str: str] = [:]
+    layout: str = ""
+    libraries: []str = []
+    c_symbols: []str = []
+    pub next: i64 = 0
+    builds: i64 = 0
+}
+
+pub fn new_session(source: str, stdout: Sink, stderr: Sink) -> *Session ! Error {
+    check_host()?
+    let dir = file.temp_dir("low-dev-") catch {
+        e => fail Failed("create temporary directory: {e}")
+    }
+    new(Session { path: source, stdout, stderr, dir })
+}
+
+pub fn close_session(s: *Session) {
+    stop(s)
+    file.remove_all(s.dir) or {}
+}
+
+fn log_line(s: *Session, line: str) {
+    let out = bytes("low: {line}\n")
+    write_sink(s.stderr, out)
+}
+
+pub fn run(s: *Session, token: *cancel.Token) ! Error {
+    reload(s, token)?
+    var last = stamp(s)
+    for {
+        let exits = exited(s)
+        select {
+            <-cancel.done(token) => return
+            ended = <-exits => {
+                s.child = none
+                log_line(s, "program exited: {describe_ended(ended)}")
+            }
+            after(100) => {
+                let current = stamp(s)
+                if current != last {
+                    last = current
+                    reload(s, token)?
+                }
+            }
+        }
+    }
+}
+
+fn describe_ended(ended: Ended?) -> str {
+    match ended {
+        some(e) => e.description
+        none => "exit status 0"
+    }
+}
+
+fn describe_exit(handle: *process.ChildHandle) -> str {
+    let exit = process.wait_on(handle) catch {
+        e => return "{e}"
+    }
+    match exit {
+        Exited(code) => "exit status {code}"
+        Signaled(sig) => "signal: {signal_text(signal.number(sig))}"
+    }
+}
+
+fn signal_text(n: i64) -> str {
+    match n {
+        == 1 => "hangup"
+        == 2 => "interrupt"
+        == 3 => "quit"
+        == 4 => "illegal instruction"
+        == 5 => "trace/breakpoint trap"
+        == 6 => "aborted"
+        == 7 => "bus error"
+        == 8 => "floating point exception"
+        == 9 => "killed"
+        == 10 => "user defined signal 1"
+        == 11 => "segmentation fault"
+        == 12 => "user defined signal 2"
+        == 13 => "broken pipe"
+        == 14 => "alarm clock"
+        == 15 => "terminated"
+        == 16 => "stack fault"
+        == 17 => "child exited"
+        == 18 => "continued"
+        == 19 => "stopped (signal)"
+        == 20 => "stopped"
+        == 21 => "stopped (tty input)"
+        == 22 => "stopped (tty output)"
+        == 23 => "urgent I/O condition"
+        == 24 => "CPU time limit exceeded"
+        == 25 => "file size limit exceeded"
+        == 26 => "virtual timer expired"
+        == 27 => "profiling timer expired"
+        == 28 => "window changed"
+        == 29 => "I/O possible"
+        == 30 => "power failure"
+        == 31 => "bad system call"
+        _ => "signal {n}"
+    }
+}
+
+fn exited(s: *Session) -> chan[Ended] {
+    match s.child {
+        some(c) => c.done
+        none => s.idle
+    }
+}
+
+fn stamp(s: *Session) -> u64 {
+    let digest = hash.fnv64a_new()
+    var dirs: [str: bool] = [:]
+    for source in watched(s) {
+        let name = bytes(source)
+        hash.fnv64_update(digest, name)
+        let contents = file.read_file(source) or io.buffer(0)
+        hash.fnv64_update(digest, contents)
+        dirs[path.dir(source)] = true
+    }
+    var folders: []str = []
+    for folder in dirs {
+        push(mut folders, folder)
+    }
+    slices.sort(mut folders)
+    for folder in folders {
+        hash_listing(digest, folder)
+    }
+    hash.fnv64_sum(digest)
+}
+
+fn hash_listing(digest: *hash.Fnv64, folder: str) {
+    var names = file.list(folder) or return
+    slices.sort(mut names)
+    for entry in names {
+        let name = bytes(entry)
+        hash.fnv64_update(digest, name)
+    }
+}
+
+fn watched(s: *Session) -> []str {
+    if s.sources.len > 0 {
+        return s.sources
+    }
+    var entries = file.list(s.path) or return [s.path]
+    slices.sort(mut entries)
+    var paths: []str = []
+    for entry in entries {
+        let parts = [s.path, entry]
+        push(mut paths, path.join(parts))
+    }
+    paths
+}
+
+pub fn reload(s: *Session, token: *cancel.Token) ! Error {
+    let unit = compiler.analyse(s.path, compiler.dev()) catch {
+        e => {
+            log_line(s, compiler.message(e))
+            return
+        }
+    }
+    s.sources = unit.sources
+    if s.child == none {
+        start(s, unit, "started")?
+        return
+    }
+    let reason = restart_reason(s, unit)
+    if reason != "" {
+        restart(s, unit, reason)?
+        return
+    }
+    let program = unit.program ?? panic("unit without a program")
+    let table = amd64.func_table_extend(s.table, program)
+    if amd64.func_table_full(table) {
+        restart(s, unit, "function table full")?
+        return
+    }
+    let out = compiler.generate_with(unit, table) catch Compile
+    if out.funcs["main"] != s.funcs["main"] {
+        restart(s, unit, "main changed")?
+        return
+    }
+    let changed = changed_funcs(s.funcs, out.funcs)
+    if changed.len == 0 {
+        log_line(s, "no code changes")
+        return
+    }
+    let began = time.monotonic()
+    patch(s, token, unit, table, changed) catch {
+        e => {
+            restart(s, unit, "reload failed: {message(e)}")?
+            return
+        }
+    }
+    s.table = table
+    s.funcs = out.funcs
+    s.signatures = signatures(program)
+    let elapsed = elapsed_text(time.monotonic() - began)
+    log_line(s, "reloaded {text.join(changed, ", ")} in {elapsed}")
+}
+
+fn elapsed_text(nanos: i64) -> str {
+    let millis = (nanos + 500000) / 1000000
+    if millis == 0 {
+        return "0s"
+    }
+    if millis < 1000 {
+        return "{millis}ms"
+    }
+    let total = millis / 1000
+    let fraction = fraction_text(millis % 1000)
+    let seconds = total % 60
+    let minutes = total / 60 % 60
+    let hours = total / 3600
+    if hours > 0 {
+        return "{hours}h{minutes}m{seconds}{fraction}s"
+    }
+    if minutes > 0 {
+        return "{minutes}m{seconds}{fraction}s"
+    }
+    "{seconds}{fraction}s"
+}
+
+fn fraction_text(millis: i64) -> str {
+    let hundreds = millis / 100
+    let tens = millis / 10 % 10
+    let ones = millis % 10
+    if ones != 0 {
+        return ".{hundreds}{tens}{ones}"
+    }
+    if tens != 0 {
+        return ".{hundreds}{tens}"
+    }
+    if hundreds != 0 {
+        return ".{hundreds}"
+    }
+    ""
+}
+
+fn restart_reason(s: *Session, unit: *compiler.Unit) -> str {
+    let program = unit.program ?? panic("unit without a program")
+    if !slices.equal(ir.libraries(program), s.libraries) {
+        return "linked libraries changed"
+    }
+    if !slices.equal(program.c_symbols, s.c_symbols) {
+        return "called C functions changed"
+    }
+    if layout(unit.files) != s.layout {
+        return "type layout changed"
+    }
+    let current = signatures(program)
+    for name in current {
+        let old = s.signatures[name] ?? continue
+        let sig = current[name] ?? ""
+        if old != sig {
+            return "signature of {name} changed"
+        }
+    }
+    ""
+}
+
+fn changed_funcs(old: [str: str], current: [str: str]) -> []str {
+    var changed: []str = []
+    for name in current {
+        if old[name] != current[name] {
+            push(mut changed, name)
+        }
+    }
+    slices.sort(mut changed)
+    changed
+}
+
+fn start(s: *Session, unit: *compiler.Unit, reason: str) ! Error {
+    s.builds += 1
+    let name = "app{s.builds}"
+    let parts = [s.dir, name]
+    let binary = path.join(parts)
+    let built = compiler.build(unit, binary) catch Compile
+    let child = start_child(s, binary)?
+    let program = unit.program ?? panic("unit without a program")
+    s.child = some(child)
+    s.built = some(built)
+    s.table = built.table ?? panic("build without a function table")
+    s.funcs = built.funcs
+    s.signatures = signatures(program)
+    s.layout = layout(unit.files)
+    s.libraries = ir.libraries(program)
+    s.c_symbols = program.c_symbols
+    s.next = 0
+    log_line(s, reason)
+}
+
+fn start_child(s: *Session, binary: str) -> *Child ! Error {
+    var command = process.command(binary, [])
+    command.stdin = process.Stdio.Null
+    command.stdout = stdio_of(s.stdout)
+    command.stderr = stdio_of(s.stderr)
+    let handle = process.start_handle(command) catch {
+        e => fail Failed("start {binary}: {e}")
+    }
+    let child = new(Child { handle, done: chan[Ended](1), exited: atomic.flag(), pumps: sync.wait_group() })
+    attach(child, handle.stdout, s.stdout)
+    attach(child, handle.stderr, s.stderr)
+    spawn wait_child(child)
+    child
+}
+
+fn attach(c: *Child, stream: io.Stream?, sink: Sink) {
+    let source = stream ?? return
+    sync.add(c.pumps, 1)
+    spawn pump(source, sink, c.pumps)
+}
+
+fn pump(source: io.Stream, sink: Sink, group: sync.WaitGroup) {
+    let buf = io.buffer(65536)
+    for {
+        let n = source.read(buf) or 0
+        if n == 0 {
+            break
+        }
+        write_sink(sink, buf[..n])
+    }
+    source.close()
+    sync.done(group)
+}
+
+fn wait_child(c: *Child) {
+    let description = describe_exit(c.handle)
+    sync.wait(c.pumps)
+    atomic.set(c.exited)
+    let ended = Ended { description }
+    c.done <- ended
+}
+
+fn restart(s: *Session, unit: *compiler.Unit, reason: str) ! Error {
+    stop(s)
+    start(s, unit, "restarted: {reason}")?
+}
+
+fn stop(s: *Session) {
+    let child = s.child ?? return
+    process.kill_on(child.handle, signal.Signal.Kill) or {}
+    <-child.done
+    s.child = none
+}
+
+fn patch(s: *Session, token: *cancel.Token, unit: *compiler.Unit, table: *amd64.FuncTable, changed: []str) ! Error {
+    let suffix = "_r{s.builds}_{s.next}"
+    let built = s.built ?? panic("session without a build")
+    let base = amd64.hot_base + s.next
+    let image = compiler.patch(built, unit, table, changed, suffix, base) catch Compile
+    let end = image.address + image.code.len - amd64.hot_base
+    if end > amd64.hot_size {
+        fail Failed("hot code space exhausted")
+    }
+    let symbols = unsigned_symbols(image.symbols)
+    let entries = amd64.func_table_patch_entries(table, changed, suffix, symbols)
+    apply(s, token, image.code, image.address, entries, changed.len)?
+    s.next = (end + 15) & -16
+}
+
+fn unsigned_symbols(symbols: [str: i64]) -> [str: u64] {
+    var out: [str: u64] = [:]
+    for name in symbols {
+        out[name] = u64(symbols[name] ?? 0)
+    }
+    out
+}
+
+struct Mailbox {
+    list: i64
+    count: i64
+}
+
+fn mailbox(s: *Session) -> Mailbox ! Error {
+    let built = s.built ?? panic("session without a build")
+    let list = built.symbols[amd64.patch_list_symbol] ?? -1
+    if list < 0 {
+        fail Failed("program has no {amd64.patch_list_symbol}")
+    }
+    let count = built.symbols[amd64.patch_count_symbol] ?? -1
+    if count < 0 {
+        fail Failed("program has no {amd64.patch_count_symbol}")
+    }
+    Mailbox { list, count }
+}
+
+fn apply(s: *Session, token: *cancel.Token, code: []u8, address: i64, entries: []u8, count: i64) ! Error {
+    let box = mailbox(s)?
+    let child = s.child ?? panic("session without a program")
+    let pid = child.handle.pid
+    wait_for_hot_region(token, pid)?
+    let memory_path = "/proc/{pid}/mem"
+    let opened = sys.open(memory_path, sys.Open.ReadWrite, 0) catch {
+        e => fail Failed("open {memory_path}: {e}")
+    }
+    using mem = sys.adopt(opened)
+    write_at(mem.handle, code, address) catch {
+        e => fail Failed("writing code at 0x{text.hex(address)}: {e}")
+    }
+    write_at(mem.handle, entries, box.list) catch {
+        e => fail Failed("writing patch list: {e}")
+    }
+    let total = le64_bytes(count)
+    write_at(mem.handle, total, box.count) catch {
+        e => fail Failed("writing patch count: {e}")
+    }
+    notify(child.handle)?
+    wait_for_zero(token, mem.handle, box.count) catch {
+        e => {
+            await_exit(child, token) catch {
+                _ => fail Failed("waiting for the program to apply the patch: {message(e)}")
+            }
+        }
+    }
+}
+
+fn le64_bytes(n: i64) -> []u8 {
+    var out: []u8 = []
+    for i in 0..8 {
+        push(mut out, u8((n >> (8 * i)) & 255))
+    }
+    out
+}
+
+fn write_at(mem: sys.FdHandle, data: []u8, address: i64) ! io.Error {
+    sys.seek(mem.fd, address, sys.Seek.FromStart)?
+    sys.write_all_on(mem, data)?
+}
+
+fn read_at(mem: sys.FdHandle, data: []u8, address: i64) ! io.Error {
+    sys.seek(mem.fd, address, sys.Seek.FromStart)?
+    let n = sys.read_on(mem, data)?
+    if n != data.len {
+        fail Eof
+    }
+}
+
+fn await_exit(c: *Child, token: *cancel.Token) ! Error {
+    let exited_check = fn() -> bool ! Error { atomic.is_set(c.exited) }
+    poll(token, exited_check)?
+}
+
+fn wait_for_hot_region(token: *cancel.Token, pid: i64) ! Error {
+    let region = "{text.hex(amd64.hot_base)}-"
+    let mapped = fn() -> bool ! Error {
+        let maps = file.read_text("/proc/{pid}/maps") catch {
+            e => fail Failed("read /proc/{pid}/maps: {e}")
+        }
+        text.contains(maps, region)
+    }
+    poll(token, mapped)?
+}
+
+fn wait_for_zero(token: *cancel.Token, mem: sys.FdHandle, address: i64) ! Error {
+    let word = io.buffer(8)
+    let zero = fn() -> bool ! Error {
+        read_at(mem, word, address) catch {
+            e => fail Failed("read patch count: {e}")
+        }
+        io.le64(word, 0) == 0
+    }
+    poll(token, zero)?
+}
+
+fn poll(token: *cancel.Token, ready: fn() -> bool ! Error) ! Error {
+    let deadline = time.monotonic() + 2000000000
+    for {
+        if ready()? {
+            return
+        }
+        if time.monotonic() > deadline {
+            fail Failed("program did not respond")
+        }
+        if !cancel.pause(token, 1) {
+            fail Cancelled
+        }
+    }
+}
