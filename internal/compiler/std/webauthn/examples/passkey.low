@@ -1,0 +1,144 @@
+import std/base64
+import std/cbor
+import std/crypto/ecdsa
+import std/crypto/hash
+import std/json
+import std/slices
+import std/webauthn
+
+const rp_id = "example.test"
+const origin = "https://example.test"
+
+struct Authenticator {
+    private: []u8
+    credential_id: []u8
+}
+
+fn url(data: []u8) -> str {
+    base64.encode_url(data)
+}
+
+fn client_data(kind: str, challenge: []u8, site: str) -> []u8 {
+    let members: []json.Member = [
+        json.text_member("type", kind),
+        json.text_member("challenge", url(challenge)),
+        json.text_member("origin", site),
+    ]
+    bytes(json.stringify(json.object_value(members), 0))
+}
+
+fn authenticator_data(flags: u8, counter: u8, attested: []u8) -> []u8 {
+    let head = hash.sum(hash.sha256(), bytes(rp_id))
+    let tail: []u8 = [flags, 0, 0, 0, counter]
+    slices.concat(slices.concat(head, tail), attested)
+}
+
+fn cose_key(point: []u8) -> []u8 {
+    let x = point[1..33]
+    let y = point[33..65]
+    cbor.encode(cbor.Value.Map([
+        cbor.Entry { key: cbor.integer(1), value: cbor.integer(2) },
+        cbor.Entry { key: cbor.integer(3), value: cbor.integer(-7) },
+        cbor.Entry { key: cbor.integer(-1), value: cbor.integer(1) },
+        cbor.Entry { key: cbor.integer(-2), value: cbor.Value.Bytes(x) },
+        cbor.Entry { key: cbor.integer(-3), value: cbor.Value.Bytes(y) },
+    ]))
+}
+
+fn attested_data(a: Authenticator, point: []u8) -> []u8 {
+    let aaguid: []u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let length: []u8 = [u8(a.credential_id.len >> 8), u8(a.credential_id.len & 0xFF)]
+    slices.concat(slices.concat(slices.concat(aaguid, length), a.credential_id), cose_key(point))
+}
+
+fn registration_response(a: Authenticator, challenge: []u8) -> json.Value {
+    let point = ecdsa.public_key(ecdsa.Curve.P256, a.private) or []
+    let data = authenticator_data(0x45, 0, attested_data(a, point))
+    let object = cbor.encode(cbor.Value.Map([
+        cbor.Entry { key: cbor.Value.Text("fmt"), value: cbor.Value.Text("none") },
+        cbor.Entry { key: cbor.Value.Text("attStmt"), value: cbor.Value.Map([]) },
+        cbor.Entry { key: cbor.Value.Text("authData"), value: cbor.Value.Bytes(data) },
+    ]))
+    let response: []json.Member = [
+        json.text_member("clientDataJSON", url(client_data("webauthn.create", challenge, origin))),
+        json.text_member("attestationObject", url(object)),
+    ]
+    envelope(a, response)
+}
+
+fn assertion_response(a: Authenticator, challenge: []u8, counter: u8, site: str) -> json.Value {
+    let client = client_data("webauthn.get", challenge, site)
+    let data = authenticator_data(0x05, counter, [])
+    let signed = slices.concat(data, hash.sum(hash.sha256(), client))
+    let signature = ecdsa.sign(ecdsa.Curve.P256, a.private, hash.sum(hash.sha256(), signed)) or []
+    let response: []json.Member = [
+        json.text_member("clientDataJSON", url(client)),
+        json.text_member("authenticatorData", url(data)),
+        json.text_member("signature", url(signature)),
+    ]
+    envelope(a, response)
+}
+
+fn envelope(a: Authenticator, response: []json.Member) -> json.Value {
+    json.object_value([
+        json.text_member("id", url(a.credential_id)),
+        json.text_member("rawId", url(a.credential_id)),
+        json.text_member("type", "public-key"),
+        json.member("response", json.object_value(response)),
+    ])
+}
+
+fn attempt(label: str, response: json.Value, expected: webauthn.Expected, key: []u8, counter: i64) {
+    let outcome = webauthn.verify_authentication(response, expected, key, counter) catch {
+        BadSignature => {
+            print("{label}: bad signature")
+            return
+        }
+        ChallengeMismatch => {
+            print("{label}: challenge mismatch")
+            return
+        }
+        OriginMismatch(found) => {
+            print("{label}: origin {found} refused")
+            return
+        }
+        SignCountRegression(received, stored) => {
+            print("{label}: counter {received} does not exceed {stored}")
+            return
+        }
+        _ => {
+            print("{label}: rejected")
+            return
+        }
+    }
+    print("{label}: signed in, counter now {outcome.new_sign_count}")
+}
+
+/// Plays both sides of a passkey flow with a software authenticator: builds the registration options, verifies a registration, then verifies assertions and rejects a replay, a wrong challenge and a wrong origin.
+fn main() {
+    let challenge = hash.sum(hash.sha256(), bytes("registration challenge"))
+    let options = webauthn.registration_options(webauthn.RegistrationOptions {
+        rp_id, rp_name: "Example", user_name: "ada", user_id: bytes("user-1"), challenge,
+    })
+    print(json.stringify(options, 0))
+
+    let authenticator = Authenticator { private: hash.sum(hash.sha256(), bytes("device key")), credential_id: bytes("credential-0001") }
+    let expected = webauthn.Expected { challenge, rp_id, origin }
+    let registered = webauthn.verify_registration(registration_response(authenticator, challenge), expected) catch {
+        _ => {
+            print("registration rejected")
+            return
+        }
+    }
+    print("registered {registered.credential_id.len} byte credential, counter {registered.sign_count}, user verified {registered.user_verified}")
+
+    let login = hash.sum(hash.sha256(), bytes("login challenge"))
+    let session = webauthn.Expected { challenge: login, rp_id, origin }
+    let stored = registered.public_key
+    attempt("first sign in", assertion_response(authenticator, login, 1, origin), session, stored, registered.sign_count)
+    attempt("replayed counter", assertion_response(authenticator, login, 1, origin), session, stored, 1)
+    attempt("old challenge", assertion_response(authenticator, challenge, 2, origin), session, stored, 1)
+    attempt("phishing origin", assertion_response(authenticator, login, 2, "https://example.test.evil"), session, stored, 1)
+    let stranger = Authenticator { private: hash.sum(hash.sha256(), bytes("other key")), credential_id: authenticator.credential_id }
+    attempt("another device", assertion_response(stranger, login, 2, origin), session, stored, 1)
+}
