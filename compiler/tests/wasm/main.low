@@ -1,12 +1,22 @@
 import compiler
+import fixture
+import ir
 import native
 import target
 import wasm
 import std/file
+import std/os
 import std/path
 import std/process
 import std/testing
 import std/text
+
+const stress_variable = "LOW_GC"
+const stress_value = "stress"
+const bounded_fixture = "gc_total_bounded"
+const bounded_pages = 1024
+const runtime_entries = 15
+const slow_timeout = 900000
 
 enum Problem {
     Failed(msg: str)
@@ -27,7 +37,9 @@ struct Ran {
 fn fixtures() -> []str {
     [
         "fib", "closures", "generics", "float_nan", "match_switch", "structs_wide", "std_ordered", "long_chains",
-        "cf_deep_recursion", "index_panic", "errors", "overflow_frames", "std_rand_more", "crypto_random_large",
+        "cf_deep_recursion", "index_panic", "errors", "overflow_frames", "std_rand_more", "crypto_random_large", "gc", "gc_large",
+        "rt_gc_churn", "heap_fit", "heap_release_reuse", "heap_sparse_pacing", "heap_lazy_zero", "rt_heap_release", "ssa_fill_memory",
+        "cf_enum_none", "region_reuse", "region_large", "gc_total_bounded",
     ]
 }
 
@@ -79,6 +91,18 @@ fn build_for(source: str, platform: target.OS, output: str) ! Problem {
     }
 }
 
+fn browser_environment(extra: [str: str], stress: bool) -> [str: str] {
+    var environment = os.environment()
+    delete(mut environment, stress_variable)
+    for name, value in extra {
+        environment[name] = value
+    }
+    if stress {
+        environment[stress_variable] = stress_value
+    }
+    environment
+}
+
 fn execute(command: process.Command) -> Ran ! Problem {
     let output = process.run(command, []) catch {
         e => fail Failed("run {command.program}: {testing.format(e)}")
@@ -103,11 +127,22 @@ fn compare(t: *testing.T, dir: str, name: str, node: str) ! Problem {
     }
     let native_command = process.command(native, [])
     let want = execute(native_command)?
-    let browser_command = process.command(node, [script, module])
-    let got = execute(browser_command)?
-    t.equal(got.stdout, want.stdout)
-    t.equal(got.stderr, want.stderr)
-    t.equal(got.status, want.status)
+    let sidecars = fixture.read(source) catch {
+        e => fail Failed(fixture.message(e))
+    }
+    let extra = fixture.browser_page_environment(name, sidecars)
+    for stress in [false, true] {
+        let got = run_module(node, script, module, extra, stress)?
+        t.equal(got.stdout, want.stdout)
+        t.equal(got.stderr, want.stderr)
+        t.equal(got.status, want.status)
+    }
+}
+
+fn run_module(node: str, script: str, module: str, extra: [str: str], stress: bool) -> Ran ! Problem {
+    var command = process.command(node, [script, module])
+    command.env = some(browser_environment(extra, stress))
+    execute(command)
 }
 
 fn check_fixture(t: *testing.T, name: str) {
@@ -143,10 +178,119 @@ fn test_c_libraries_are_rejected_at_load(t: *testing.T) {
     t.error("built a program that calls the C library")
 }
 
+fn capped(dir: str, node: str, name: str, pages: i64) -> Ran ! Problem {
+    let module = path.join([dir, target.executable(target.OS.Browser, "capped")])
+    let script = path.join([dir, "host.mjs"])
+    build_for("testdata/run/{name}.low", target.OS.Browser, module)?
+    let host = wasm.host_script()
+    file.write_file(script, bytes(host)) catch {
+        e => fail Failed("write {script}: {testing.format(e)}")
+    }
+    let extra = [fixture.browser_page_limit_variable: "{pages}"]
+    run_module(node, script, module, extra, false)
+}
+
+fn run_capped(t: *testing.T, name: str, pages: i64) -> Ran? {
+    let node = match process.find("node") {
+        some(found) => found
+        none => {
+            t.skip("node is not on PATH")
+            return none
+        }
+    }
+    let dir = make_temp_dir(t)
+    let ran = capped(dir, node, name, pages) catch {
+        e => {
+            remove_dir(dir)
+            t.error(describe(e))
+            return none
+        }
+    }
+    remove_dir(dir)
+    some(ran)
+}
+
+fn test_allocation_beyond_the_cap_runs_in_bounded_memory(t: *testing.T) {
+    let ran = run_capped(t, bounded_fixture, bounded_pages) ?? return
+    let want = file.read_text("testdata/run/{bounded_fixture}.out") catch {
+        e => {
+            t.error("read the expected output: {testing.format(e)}")
+            return
+        }
+    }
+    t.equal(ran.stdout, want)
+    t.equal(ran.stderr, "")
+    t.equal(ran.status, 0)
+}
+
+fn test_a_page_cap_below_the_live_data_panics(t: *testing.T) {
+    let ran = run_capped(t, bounded_fixture, 0) ?? return
+    t.equal(ran.stderr, "panic: out of memory\n")
+    t.equal(ran.status, 2)
+}
+
+fn runtime_violation(f: *ir.Func) -> str {
+    for b in f.blocks {
+        for v in b.values {
+            if v.op == ir.Op.OpRuntime {
+                let entry = v.runtime ?? panic("runtime value without an entry")
+                if entry == ir.Runtime.RtAlloc || entry == ir.Runtime.RtGrow {
+                    return "{f.name} allocates through {ir.runtime_symbol(entry)}"
+                }
+            }
+            if v.op == ir.Op.OpCall {
+                let callee = v.target ?? continue
+                if !text.starts_with(callee.name, ir.runtime_prefix) {
+                    return "{f.name} calls {callee.name}"
+                }
+            }
+        }
+    }
+    ""
+}
+
+fn test_runtime_functions_never_allocate(t: *testing.T) {
+    let unit = unit_for("testdata/run/fib.low", target.OS.Browser) catch {
+        e => {
+            t.error(describe(e))
+            return
+        }
+    }
+    let program = unit.program ?? panic("unit without a program")
+    var runtime_functions = 0
+    for f in program.funcs {
+        if !text.starts_with(f.name, ir.runtime_prefix) {
+            continue
+        }
+        runtime_functions += 1
+        t.equal(runtime_violation(f), "")
+    }
+    t.equal(runtime_functions >= runtime_entries, true)
+}
+
 fn main() {
-    testing.run([
+    let tests = [
         testing.Test { name: "fixtures_match_the_host", run: test_fixtures_match_the_host }
+        testing.Test { name: "allocation_beyond_the_cap_runs_in_bounded_memory", run: test_allocation_beyond_the_cap_runs_in_bounded_memory }
+        testing.Test { name: "a_page_cap_below_the_live_data_panics", run: test_a_page_cap_below_the_live_data_panics }
+        testing.Test { name: "runtime_functions_never_allocate", run: test_runtime_functions_never_allocate }
         testing.Test { name: "c_libraries_are_rejected_at_load", run: test_c_libraries_are_rejected_at_load }
         testing.Test { name: "host_math_matches_the_script", run: test_host_math_matches_the_script }
-    ])
+    ]
+    let args = os.args()
+    var settings = testing.settings_from(args[1..]) catch {
+        e => {
+            print("flags: {e}")
+            os.exit(2)
+            testing.Settings {}
+        }
+    }
+    let defaults = testing.Settings {}
+    if settings.timeout_ms == defaults.timeout_ms {
+        settings.timeout_ms = slow_timeout
+    }
+    let failed = testing.run_with(tests, settings)
+    if failed > 0 {
+        os.exit(1)
+    }
 }
