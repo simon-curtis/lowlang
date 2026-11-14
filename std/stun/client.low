@@ -1,0 +1,153 @@
+import std/crypto/hash
+import std/io
+import std/net
+import std/time
+
+/// One received datagram and its sender.
+pub struct Datagram {
+    /// The bytes of the datagram.
+    pub data: u8[]
+    /// The address it came from.
+    pub from: net.Addr
+}
+
+/// The retransmission timing of a request over UDP (RFC 8489 section 6.2.1).
+pub struct Config {
+    /// The initial retransmission timeout in milliseconds, doubled after each transmission. The default is 500.
+    pub rto: i64 = 500
+    /// The number of times the request is sent, the first included. The default is 7.
+    pub transmissions: i64 = 7
+    /// The number of retransmission timeouts the client waits after the last transmission. The default is 16.
+    pub final_wait: i64 = 16
+}
+
+/// A UDP socket with a green thread that reads its datagrams into `inbox`, and the owner that closes it when dropped.
+///
+/// `inbox` closes once the socket is closed. A datagram that arrives while 64 others wait is dropped.
+pub struct Client {
+    /// The bound socket.
+    pub socket: net.SocketHandle
+    /// The datagrams received so far, in order.
+    pub inbox: chan[Datagram]
+    drop net.close_socket_on(socket)
+}
+
+/// Returns the waits that follow each transmission under `c`: `rto`, `2 * rto` and so on up to the last transmission, then `final_wait * rto`.
+///
+/// With the defaults the transmissions leave at 0, 500, 1500, 3500, 7500, 15500 and 31500 ms and the request fails at 39500 ms.
+pub fn waits(c: Config) -> i64[] {
+    var out: i64[] = []
+    for i in 0..c.transmissions - 1 {
+        out.push(c.rto << i)
+    }
+    out.push(c.final_wait * c.rto)
+    out
+}
+
+fn read_into(s: net.SocketHandle, inbox: chan[Datagram]) {
+    let buf = io.buffer(65536)
+    for {
+        let packet = net.receive_from_on(s, buf) catch {
+            _ => break
+        }
+        let data = io.buffer(packet.size)
+        io.copy(data, buf[..packet.size])
+        select {
+            inbox <- Datagram { data, from: packet.from } => {}
+            else => {}
+        }
+    }
+    close(inbox)
+}
+
+/// Binds a UDP socket on `host`, port 0, and starts reading from it.
+///
+/// An empty `host` binds the IPv4 wildcard address; use `"::"` to reach IPv6 servers. Fails with the error of `net.bind_udp`.
+pub fn client(host: str) -> Client ! io.Error {
+    using var socket = net.bind_udp(host, 0)?
+    let h = net.detach_socket(mut socket)
+    let inbox = chan[Datagram](64)
+    spawn read_into(h, inbox)
+    Client { socket: h, inbox }
+}
+
+fn now() -> i64 {
+    time.monotonic() / 1000000
+}
+
+enum Event {
+    Arrived(Datagram)
+    Closed
+    Elapsed
+}
+
+fn same_address(a: net.Addr, b: net.Addr) -> bool {
+    a.port == b.port && hash.equal(a.ip, b.ip)
+}
+
+fn acceptable(d: Datagram, server: net.Addr, transaction: u8[], key: u8[]?) -> Message? {
+    if !same_address(d.from, server) || !looks_like(d.data) {
+        return none
+    }
+    let reply = parse(d.data) or return none
+    if !hash.equal(reply.transaction, transaction) {
+        return none
+    }
+    match key {
+        some(k) => {
+            check_integrity(reply, k, Integrity.Sha1) or return none
+            reply
+        }
+        none => reply
+    }
+}
+
+/// Sends `m` to `server` through `c` and returns the response with the same transaction ID, retransmitting as `config` says.
+///
+/// `p`, when given, appends the hashes and fingerprint to the request. `key`, when given, is the key the response must be protected with: a response without a valid MESSAGE-INTEGRITY is ignored like any datagram from another address, another transaction or one that does not parse. The response is returned whatever its class, so a caller checks for `Class.Error` and reads `error_code`. Fails with `TimedOut` when no response arrives before the last wait ends and `NotConnected` when `c` closed.
+pub fn request(c: Client, server: net.Addr, m: Message, p: Protection?, key: u8[]?, config: Config) -> Message ! io.Error {
+    let wire = match p {
+        some(protection) => seal(m, protection)
+        none => encode(m)
+    }
+    for wait in waits(config) {
+        net.send_to_on(c.socket, wire, server)?
+        let deadline = now() + wait
+        for {
+            let left = deadline - now()
+            if left <= 0 {
+                break
+            }
+            let event = select {
+                d = <-c.inbox => match d {
+                    some(arrived) => Event.Arrived(arrived)
+                    none => Event.Closed
+                }
+                after(left) => Event.Elapsed
+            }
+            match event {
+                Arrived(d) => {
+                    match acceptable(d, server, m.transaction, key) {
+                        some(reply) => return reply
+                        none => {}
+                    }
+                }
+                Closed => fail NotConnected
+                Elapsed => {}
+            }
+        }
+    }
+    fail TimedOut
+}
+
+/// Asks the STUN server at `server` for the address it sees the request come from and returns it.
+///
+/// Sends a Binding request through `c` and returns the XOR-MAPPED-ADDRESS, or the MAPPED-ADDRESS of an older server, of the response. Fails with `Refused` when the server answers with an error and with the errors of `request` and `reflexive_address` otherwise.
+pub fn binding_address(c: Client, server: net.Addr, config: Config) -> net.Addr ! io.Error {
+    let m = message(Class.Request, binding)
+    let reply = request(c, server, m, none, none, config)?
+    if reply.class != Class.Success {
+        fail Refused
+    }
+    reflexive_address(reply)?
+}

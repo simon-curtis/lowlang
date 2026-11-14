@@ -1,0 +1,163 @@
+import std/io
+import std/net
+import std/text
+import checksum = std/hash
+
+/// The type of a candidate (RFC 8445 section 5.1.1).
+pub enum Kind {
+    /// An address of a local interface.
+    Host = 0
+    /// The address a STUN server saw a host candidate's packets come from.
+    ServerReflexive = 1
+    /// An address learned from a connectivity check.
+    PeerReflexive = 2
+    /// An address allocated on a TURN server.
+    Relayed = 3
+}
+
+/// A transport address a peer can be reached at.
+pub struct Candidate {
+    /// Candidates with equal foundations share a type, base address, server and transport.
+    pub foundation: str
+    /// The priority from `priority`.
+    pub priority: i64
+    /// The transport address.
+    pub addr: net.Addr
+    /// How the address was obtained.
+    pub kind: Kind
+    /// The component: 1 for RTP and everything multiplexed with it, 2 for RTCP without multiplexing.
+    pub component: i64 = 1
+    /// The transport protocol name, `"udp"`.
+    pub transport: str = "udp"
+    /// The address the candidate was derived from, which a reflexive or relayed candidate reports as `raddr` and `rport`.
+    pub related: net.Addr? = none
+}
+
+/// Returns the type preference of `k` (RFC 8445 section 5.1.2.2): 126 for host, 110 for peer reflexive, 100 for server reflexive and 0 for relayed.
+pub fn type_preference(k: Kind) -> i64 {
+    match k {
+        Host => 126
+        PeerReflexive => 110
+        ServerReflexive => 100
+        Relayed => 0
+    }
+}
+
+/// Returns the local preference of the address `ip` at position `rank` in the agent's address list: 65535 less `rank` for IPv6 and 32768 less `rank` for IPv4, so IPv6 addresses are preferred and earlier addresses win within a family.
+pub fn local_preference(ip: u8[], rank: i64) -> i64 {
+    let base = if net.v6(ip) { 65535 } else { 32768 }
+    if rank > base { 0 } else { base - rank }
+}
+
+/// Returns `(2^24) * type_preference(k) + (2^8) * local_preference + (256 - component)` (RFC 8445 section 5.1.2.1).
+pub fn priority(k: Kind, local_preference: i64, component: i64) -> i64 {
+    (type_preference(k) << 24) + (local_preference << 8) + (256 - component)
+}
+
+/// Returns the priority of a pair whose controlling agent's candidate has priority `controlling` and whose controlled agent's has `controlled`: `2^32 * MIN(G, D) + 2 * MAX(G, D) + (G > D ? 1 : 0)` (RFC 8445 section 6.1.2.3).
+pub fn pair_priority(controlling: i64, controlled: i64) -> i64 {
+    let low = if controlling < controlled { controlling } else { controlled }
+    let high = if controlling < controlled { controlled } else { controlling }
+    (low << 32) + 2 * high + if controlling > controlled { 1 } else { 0 }
+}
+
+/// Returns the foundation for a candidate of kind `k` whose base address is `base` and, for a reflexive or relayed one, whose STUN or TURN server is `server`.
+///
+/// Two candidates get the same foundation exactly when their type, base IP, server IP and transport agree. The result is eight hexadecimal digits.
+pub fn foundation(k: Kind, base: u8[], server: u8[], transport: str) -> str {
+    let base_text = net.format_ip(base)
+    let server_text = net.format_ip(server)
+    let key = "{k.index}/{base_text}/{server_text}/{transport}"
+    var out: u8[] = []
+    let digest = checksum.crc32(bytes(key))
+    text.append_hex(mut out, i64(digest), 8, false)
+    str(out)
+}
+
+fn kind_name(k: Kind) -> str {
+    match k {
+        Host => "host"
+        ServerReflexive => "srflx"
+        PeerReflexive => "prflx"
+        Relayed => "relay"
+    }
+}
+
+fn kind_of(name: str) -> Kind ! io.Error {
+    match name {
+        "host" => Kind.Host
+        "srflx" => Kind.ServerReflexive
+        "prflx" => Kind.PeerReflexive
+        "relay" => Kind.Relayed
+        _ => fail Malformed
+    }
+}
+
+/// Returns the SDP `candidate` attribute value for `c`: `candidate:<foundation> <component> <transport> <priority> <ip> <port> typ <type>`, followed by `raddr` and `rport` when `c` has a related address (RFC 8839 section 5.1).
+pub fn format(c: Candidate) -> str {
+    var line = "candidate:{c.foundation} {c.component} {c.transport} {c.priority} {net.format_ip(c.addr.ip)} {c.addr.port} typ {kind_name(c.kind)}"
+    match c.related {
+        some(r) => {
+            line = "{line} raddr {net.format_ip(r.ip)} rport {r.port}"
+        }
+        none => {}
+    }
+    line
+}
+
+fn port_of(s: str) -> i64 ! io.Error {
+    let n = text.parse_int(s) or fail Malformed
+    if n < 0 || n > 65535 {
+        fail Malformed
+    }
+    n
+}
+
+/// Parses the value of an SDP `candidate` attribute, with or without a leading `a=` and `candidate:`.
+///
+/// Extension attributes after the type are skipped. Fails with `Malformed` for a line that is not a candidate, and with `Unsupported` for a TCP candidate or a host name address, which includes the `.local` names of mDNS candidates.
+pub fn parse(line: str) -> Candidate ! io.Error {
+    var s = text.trim(line)
+    s = text.trim_prefix(s, "a=")
+    s = text.trim_prefix(s, "candidate:")
+    let f = text.fields(s)
+    if f.len < 8 || f[6] != "typ" {
+        fail Malformed
+    }
+    let component = text.parse_int(f[1]) or fail Malformed
+    if component < 1 || component > 256 {
+        fail Malformed
+    }
+    if text.lower(f[2]) != "udp" {
+        fail Unsupported
+    }
+    let priority = text.parse_int(f[3]) or fail Malformed
+    if priority < 1 || priority > 4294967295 {
+        fail Malformed
+    }
+    let ip = net.parse_ip(f[4]) or fail Unsupported
+    let port = port_of(f[5])?
+    let kind = kind_of(f[7])?
+    var related: net.Addr? = none
+    var i = 8
+    for i + 1 < f.len {
+        if f[i] == "raddr" {
+            let rip = net.parse_ip(f[i + 1]) or fail Malformed
+            var rport = 0
+            if i + 3 < f.len && f[i + 2] == "rport" {
+                rport = port_of(f[i + 3])?
+            }
+            related = net.Addr { ip: rip, port: rport }
+        }
+        i += 2
+    }
+    Candidate {
+        foundation: f[0]
+        priority
+        addr: net.Addr { ip, port }
+        kind
+        component
+        transport: "udp"
+        related
+    }
+}
