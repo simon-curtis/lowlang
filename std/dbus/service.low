@@ -1,0 +1,609 @@
+import std/file
+import std/io
+import std/slices
+import std/sync
+import std/text
+
+const unknown_object = "org.freedesktop.DBus.Error.UnknownObject"
+const unknown_interface = "org.freedesktop.DBus.Error.UnknownInterface"
+const unknown_method = "org.freedesktop.DBus.Error.UnknownMethod"
+const unknown_property = "org.freedesktop.DBus.Error.UnknownProperty"
+const property_read_only = "org.freedesktop.DBus.Error.PropertyReadOnly"
+const property_write_only = "org.freedesktop.DBus.Error.PropertyWriteOnly"
+const invalid_args = "org.freedesktop.DBus.Error.InvalidArgs"
+const failed = "org.freedesktop.DBus.Error.Failed"
+
+/// A method call delivered to a handler of a `Service`.
+pub struct Call {
+    /// The method call, with its sender, serial, body and descriptors. The handler owns the descriptors in `message.fds` and closes them with `sys.close_fd`.
+    pub message: Message
+    /// The connection the call arrived on, for calls and signals from inside the handler.
+    pub connection: *ConnectionHandle
+}
+
+/// A method an object implements.
+pub struct MethodSpec {
+    /// The method name.
+    pub name: str
+    /// The signature of the arguments the method takes. A call with another body fails with `org.freedesktop.DBus.Error.InvalidArgs`.
+    pub in_signature: str = ""
+    /// The signature of the values the handler returns.
+    pub out_signature: str = ""
+    /// The argument names for introspection, in order. It may be shorter than the arguments.
+    pub in_names: []str = []
+    /// The result names for introspection, in order. It may be shorter than the results.
+    pub out_names: []str = []
+    /// Runs the call and returns the values of the reply. Failing with `Remote(name, message)` replies with that error; `Signature`, `Marshal`, `Malformed` and `Name` reply with `org.freedesktop.DBus.Error.InvalidArgs`, and any other error with `org.freedesktop.DBus.Error.Failed`.
+    pub handler: fn(Call) -> []Value ! Error
+}
+
+/// A property an object exposes.
+pub struct PropertySpec {
+    /// The property name.
+    pub name: str
+    /// The signature of the property, one complete type.
+    pub signature: str
+    /// `read`, `write` or `readwrite`.
+    pub access: str
+    /// Returns the current value, which must have `signature`.
+    pub get: fn() -> Value ! Error
+    /// Stores a value that has `signature`.
+    pub set: fn(Value) ! Error
+}
+
+/// A signal an object emits, for introspection.
+pub struct SignalSpec {
+    /// The signal name.
+    pub name: str
+    /// The signature of the signal arguments.
+    pub signature: str = ""
+    /// The argument names for introspection, in order. It may be shorter than the arguments.
+    pub names: []str = []
+}
+
+/// An interface an object implements: its methods, properties and signals.
+pub struct InterfaceSpec {
+    /// The interface name.
+    pub name: str
+    /// The methods of the interface.
+    pub methods: []MethodSpec = []
+    /// The properties of the interface.
+    pub properties: []PropertySpec = []
+    /// The signals of the interface.
+    pub signals: []SignalSpec = []
+}
+
+/// The objects a connection exports.
+///
+/// The `Service` is a filter of its connection: it answers every method call that arrives. Calls to the standard interfaces `org.freedesktop.DBus.Introspectable`, `org.freedesktop.DBus.Properties` and `org.freedesktop.DBus.Peer` are answered from the exported specifications. Each call runs on its own green thread, so a handler may call back on the connection.
+pub struct Service {
+    connection: *ConnectionHandle
+    objects: [str: []InterfaceSpec]
+    lock: sync.Mutex
+    filter: i64
+}
+
+/// Returns a read-only property whose value `get` supplies.
+pub fn read_only_property(name: str, signature: str, get: fn() -> Value ! Error) -> PropertySpec {
+    PropertySpec { name, signature, access: "read", get, set: fn(v) ! Error { fail Remote(property_read_only, "{name} is read-only") } }
+}
+
+/// Returns a property that `get` reads and `set` writes.
+pub fn read_write_property(name: str, signature: str, get: fn() -> Value ! Error, set: fn(Value) ! Error) -> PropertySpec {
+    PropertySpec { name, signature, access: "readwrite", get, set }
+}
+
+/// Returns a write-only property that `set` writes.
+pub fn write_only_property(name: str, signature: str, set: fn(Value) ! Error) -> PropertySpec {
+    PropertySpec { name, signature, access: "write", get: fn() -> Value ! Error { fail Remote(property_write_only, "{name} is write-only") }, set }
+}
+
+/// Starts answering the method calls that arrive on the connection behind `h` from the objects exported on the returned `Service`.
+pub fn serve_on(h: *ConnectionHandle) -> *Service {
+    let s = new(Service { connection: h, objects: [:], lock: sync.mutex(), filter: 0 })
+    s.filter = add_filter_on(h, fn(m) { accept(s, m) })
+    s
+}
+
+/// Starts answering the method calls that arrive on `c`.
+///
+/// Does the same as `serve_on` on its handle.
+pub fn serve(c: Connection) -> *Service {
+    serve_on(c.handle)
+}
+
+/// Stops `s` answering calls. Calls already running finish, and later calls get the default `UnknownMethod` error.
+pub fn stop_service(s: *Service) {
+    remove_filter_on(s.connection, s.filter)
+}
+
+fn accept(s: *Service, m: Message) -> bool {
+    if m.kind != MessageType.MethodCall {
+        return false
+    }
+    spawn run_call(s, m)
+    true
+}
+
+fn failure_reply(m: Message, e: Error) -> Message {
+    match e {
+        Remote(name, message) => error_reply(m, name, message)
+        Signature(reason) => error_reply(m, invalid_args, reason)
+        Marshal(reason) => error_reply(m, invalid_args, reason)
+        Malformed(reason) => error_reply(m, invalid_args, reason)
+        Name(reason) => error_reply(m, invalid_args, reason)
+        _ => error_reply(m, failed, "{e}")
+    }
+}
+
+fn run_call(s: *Service, m: Message) {
+    let reply = answer(s, m) catch {
+        e => failure_reply(m, e)
+    }
+    if m.flags & no_reply_expected == 0 {
+        send_on(s.connection, reply) or return
+    }
+}
+
+fn find_object(s: *Service, path: str) -> []InterfaceSpec? {
+    sync.lock(s.lock)
+    let found = s.objects[path]
+    sync.unlock(s.lock)
+    found
+}
+
+fn find_interface(specs: []InterfaceSpec, name: str) -> InterfaceSpec? {
+    for spec in specs {
+        if spec.name == name {
+            return spec
+        }
+    }
+    none
+}
+
+fn has_method(spec: InterfaceSpec, name: str) -> bool {
+    for m in spec.methods {
+        if m.name == name {
+            return true
+        }
+    }
+    false
+}
+
+fn has_interface(specs: []InterfaceSpec, name: str) -> bool {
+    for spec in specs {
+        if spec.name == name {
+            return true
+        }
+    }
+    false
+}
+
+fn find_method(spec: InterfaceSpec, name: str) -> MethodSpec? {
+    for m in spec.methods {
+        if m.name == name {
+            return m
+        }
+    }
+    none
+}
+
+fn find_property(spec: InterfaceSpec, name: str) -> PropertySpec? {
+    for p in spec.properties {
+        if p.name == name {
+            return p
+        }
+    }
+    none
+}
+
+fn standard_interface(name: str) -> bool {
+    name == properties_interface || name == introspectable_interface || name == peer_interface
+}
+
+fn is_standard_member(member: str) -> bool {
+    member == "Ping" || member == "GetMachineId" || member == "Introspect" || member == "Get" || member == "Set" || member == "GetAll"
+}
+
+fn standard_interface_of(member: str) -> str {
+    if member == "Ping" || member == "GetMachineId" {
+        return peer_interface
+    }
+    if member == "Introspect" {
+        return introspectable_interface
+    }
+    properties_interface
+}
+
+fn answer(s: *Service, m: Message) -> Message ! Error {
+    let specs = find_object(s, m.path)
+    var interface = m.interface
+    if interface.len == 0 {
+        var owner = ""
+        for spec in specs ?? [] {
+            if has_method(spec, m.member) {
+                owner = spec.name
+            }
+        }
+        if owner.len > 0 {
+            interface = owner
+        } else if is_standard_member(m.member) {
+            interface = standard_interface_of(m.member)
+        }
+    }
+    if interface == peer_interface {
+        close_all(m.fds)
+        return peer_call(m)?
+    }
+    if interface == introspectable_interface {
+        close_all(m.fds)
+        return introspect_call(s, m)?
+    }
+    if interface == properties_interface {
+        close_all(m.fds)
+        return properties_call(s, m, specs)?
+    }
+    let objects = match specs {
+        some(list) => list
+        none => {
+            close_all(m.fds)
+            fail Remote(unknown_object, "no object at {m.path}")
+        }
+    }
+    let spec = match find_interface(objects, interface) {
+        some(found) => found
+        none => {
+            close_all(m.fds)
+            fail Remote(unknown_interface, "{m.path} has no interface {interface}")
+        }
+    }
+    let method = match find_method(spec, m.member) {
+        some(found) => found
+        none => {
+            close_all(m.fds)
+            fail Remote(unknown_method, "{interface} has no method {m.member}")
+        }
+    }
+    let given = values_signature(m.body)?
+    if given != method.in_signature {
+        close_all(m.fds)
+        fail Remote(invalid_args, "{m.member} takes ({method.in_signature}), not ({given})")
+    }
+    let results = method.handler(Call { message: m, connection: s.connection })?
+    let produced = values_signature(results)?
+    if produced != method.out_signature {
+        fail Remote(failed, "{m.member} returned ({produced}), not ({method.out_signature})")
+    }
+    method_return(m, results)
+}
+
+fn peer_call(m: Message) -> Message ! Error {
+    if m.body.len != 0 {
+        fail Remote(invalid_args, "{m.member} takes no arguments")
+    }
+    match m.member {
+        "Ping" => method_return(m, [])
+        "GetMachineId" => method_return(m, [Value.String(local_machine_id()?)])
+        _ => fail Remote(unknown_method, "{peer_interface} has no method {m.member}")
+    }
+}
+
+/// Returns the machine id of this host, 32 hexadecimal digits, read from `/etc/machine-id` or `/var/lib/dbus/machine-id`.
+///
+/// Fails with `Io` when neither file can be read and with `Malformed` when the content is not 32 hexadecimal digits.
+pub fn local_machine_id() -> str ! Error {
+    var last = Error.Io(io.Error.NotFound)
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        let content = file.read_text(path) catch {
+            e => {
+                last = Error.Io(e)
+                continue
+            }
+        }
+        let id = text.trim(content)
+        let raw = text.decode_hex(id) or []
+        if id.len != 32 || raw.len != 16 {
+            fail Malformed("the machine id in {path} is not 32 hexadecimal digits")
+        }
+        return id
+    }
+    fail last
+}
+
+fn argument(name: str, signature: str, direction: str) -> ArgumentInfo {
+    ArgumentInfo { name, signature, direction }
+}
+
+fn standard_interfaces() -> []InterfaceInfo {
+    [
+        InterfaceInfo {
+            name: introspectable_interface,
+            methods: [MethodInfo { name: "Introspect", arguments: [argument("xml_data", "s", "out")] }],
+            signals: [],
+            properties: [],
+        },
+        InterfaceInfo {
+            name: properties_interface,
+            methods: [
+                MethodInfo { name: "Get", arguments: [argument("interface_name", "s", "in"), argument("property_name", "s", "in"), argument("value", "v", "out")] },
+                MethodInfo { name: "GetAll", arguments: [argument("interface_name", "s", "in"), argument("properties", "a{{sv}}", "out")] },
+                MethodInfo { name: "Set", arguments: [argument("interface_name", "s", "in"), argument("property_name", "s", "in"), argument("value", "v", "in")] },
+            ],
+            signals: [
+                SignalInfo {
+                    name: "PropertiesChanged",
+                    arguments: [argument("interface_name", "s", "out"), argument("changed_properties", "a{{sv}}", "out"), argument("invalidated_properties", "as", "out")],
+                },
+            ],
+            properties: [],
+        },
+        InterfaceInfo {
+            name: peer_interface,
+            methods: [
+                MethodInfo { name: "Ping", arguments: [] },
+                MethodInfo { name: "GetMachineId", arguments: [argument("machine_uuid", "s", "out")] },
+            ],
+            signals: [],
+            properties: [],
+        },
+    ]
+}
+
+fn name_at(names: []str, i: i64) -> str {
+    if i < names.len {
+        return names[i]
+    }
+    ""
+}
+
+fn arguments_info(signature: str, names: []str, direction: str) -> []ArgumentInfo ! Error {
+    var out: []ArgumentInfo = []
+    let types = parse_signature(signature)?
+    for i in 0..types.len {
+        push(mut out, argument(name_at(names, i), type_signature(types[i]), direction))
+    }
+    out
+}
+
+fn described(spec: InterfaceSpec) -> InterfaceInfo ! Error {
+    var methods: []MethodInfo = []
+    for m in spec.methods {
+        var arguments = arguments_info(m.in_signature, m.in_names, "in")?
+        for a in arguments_info(m.out_signature, m.out_names, "out")? {
+            push(mut arguments, a)
+        }
+        push(mut methods, MethodInfo { name: m.name, arguments })
+    }
+    var signals: []SignalInfo = []
+    for g in spec.signals {
+        push(mut signals, SignalInfo { name: g.name, arguments: arguments_info(g.signature, g.names, "out")? })
+    }
+    var properties: []PropertyInfo = []
+    for p in spec.properties {
+        push(mut properties, PropertyInfo { name: p.name, signature: p.signature, access: p.access })
+    }
+    InterfaceInfo { name: spec.name, methods, signals, properties }
+}
+
+fn child_names(s: *Service, path: str) -> []str {
+    let prefix = if path == "/" { "/" } else { "{path}/" }
+    var names: []str = []
+    sync.lock(s.lock)
+    for p, _ in s.objects {
+        if p.len > prefix.len && text.starts_with(p, prefix) {
+            let rest = p[prefix.len..]
+            let slash = text.index_byte(rest, '/')
+            let name = if slash < 0 { rest } else { rest[..slash] }
+            if !slices.contains(names, name) {
+                push(mut names, name)
+            }
+        }
+    }
+    sync.unlock(s.lock)
+    slices.sort(mut names)
+    names
+}
+
+fn introspect_call(s: *Service, m: Message) -> Message ! Error {
+    if m.body.len != 0 {
+        fail Remote(invalid_args, "Introspect takes no arguments")
+    }
+    let specs = find_object(s, m.path)
+    let children = child_names(s, m.path)
+    let exported = match specs {
+        some(_) => true
+        none => false
+    }
+    if !exported && children.len == 0 {
+        fail Remote(unknown_object, "no object at {m.path}")
+    }
+    var interfaces: []InterfaceInfo = []
+    for spec in specs ?? [] {
+        push(mut interfaces, described(spec)?)
+    }
+    for standard in standard_interfaces() {
+        push(mut interfaces, standard)
+    }
+    method_return(m, [Value.String(introspection_xml(NodeInfo { name: "", interfaces, nodes: children }))])
+}
+
+struct Located {
+    spec: InterfaceSpec
+    property: PropertySpec
+}
+
+fn locate(objects: []InterfaceSpec, interface: str, name: str, path: str) -> Located ! Error {
+    if interface.len > 0 {
+        let spec = match find_interface(objects, interface) {
+            some(found) => found
+            none => fail Remote(unknown_interface, "{path} has no interface {interface}")
+        }
+        return match find_property(spec, name) {
+            some(p) => Located { spec, property: p }
+            none => fail Remote(unknown_property, "{interface} has no property {name}")
+        }
+    }
+    for spec in objects {
+        match find_property(spec, name) {
+            some(p) => return Located { spec, property: p }
+            none => {}
+        }
+    }
+    fail Remote(unknown_property, "{path} has no property {name}")
+}
+
+fn read_property(p: PropertySpec) -> Value ! Error {
+    if p.access == "write" {
+        fail Remote(property_write_only, "{p.name} is write-only")
+    }
+    let v = p.get()?
+    let found = signature_of(v)?
+    if found != p.signature {
+        fail Remote(failed, "{p.name} is ({found}), not ({p.signature})")
+    }
+    v
+}
+
+fn properties_call(s: *Service, m: Message, specs: []InterfaceSpec?) -> Message ! Error {
+    let objects = match specs {
+        some(list) => list
+        none => fail Remote(unknown_object, "no object at {m.path}")
+    }
+    let given = values_signature(m.body)?
+    match m.member {
+        "Get" => {
+            if given != "ss" {
+                fail Remote(invalid_args, "Get takes (ss), not ({given})")
+            }
+            let found = locate(objects, string_of(m.body[0])?, string_of(m.body[1])?, m.path)?
+            method_return(m, [variant(read_property(found.property)?)])
+        }
+        "Set" => {
+            if given != "ssv" {
+                fail Remote(invalid_args, "Set takes (ssv), not ({given})")
+            }
+            let found = locate(objects, string_of(m.body[0])?, string_of(m.body[1])?, m.path)?
+            if found.property.access == "read" {
+                fail Remote(property_read_only, "{found.property.name} is read-only")
+            }
+            let v = unwrap(m.body[2])?
+            let supplied = signature_of(v)?
+            if supplied != found.property.signature {
+                fail Remote(invalid_args, "{found.property.name} is ({found.property.signature}), not ({supplied})")
+            }
+            found.property.set(v)?
+            send_on(s.connection, properties_changed_signal(m.path, found.spec.name, [found.property.name: v], []))?
+            method_return(m, [])
+        }
+        "GetAll" => {
+            if given != "s" {
+                fail Remote(invalid_args, "GetAll takes (s), not ({given})")
+            }
+            let interface = string_of(m.body[0])?
+            var values: [str: Value] = [:]
+            var matched = interface.len == 0
+            for spec in objects {
+                if interface.len == 0 || spec.name == interface {
+                    matched = true
+                    for p in spec.properties {
+                        if p.access != "write" {
+                            values[p.name] = read_property(p)?
+                        }
+                    }
+                }
+            }
+            if !matched {
+                fail Remote(unknown_interface, "{m.path} has no interface {interface}")
+            }
+            method_return(m, [dict(values)])
+        }
+        _ => fail Remote(unknown_method, "{properties_interface} has no method {m.member}")
+    }
+}
+
+fn validate_spec(path: str, spec: InterfaceSpec) ! Error {
+    if !valid_object_path(path) {
+        fail Name("invalid object path {text.quote(path)}")
+    }
+    if !valid_interface(spec.name) || standard_interface(spec.name) {
+        fail Name("invalid interface name {text.quote(spec.name)}")
+    }
+    for m in spec.methods {
+        if !valid_member(m.name) {
+            fail Name("invalid method name {text.quote(m.name)}")
+        }
+        parse_signature(m.in_signature)?
+        parse_signature(m.out_signature)?
+    }
+    for g in spec.signals {
+        if !valid_member(g.name) {
+            fail Name("invalid signal name {text.quote(g.name)}")
+        }
+        parse_signature(g.signature)?
+    }
+    for p in spec.properties {
+        if !valid_member(p.name) {
+            fail Name("invalid property name {text.quote(p.name)}")
+        }
+        parse_type(p.signature)?
+        if p.access != "read" && p.access != "write" && p.access != "readwrite" {
+            fail Name("invalid property access {text.quote(p.access)}")
+        }
+    }
+}
+
+/// Exports the interface `spec` on the object `path` of the service `s`.
+///
+/// Fails with `Name` when the path, the interface name, a member name or a property access is invalid, or when `spec` names one of the standard interfaces, which the service provides itself, with `Signature` for an invalid signature, and with `Marshal` when the object already has the interface.
+pub fn export(s: *Service, path: str, spec: InterfaceSpec) ! Error {
+    validate_spec(path, spec)?
+    sync.lock(s.lock)
+    var list = s.objects[path] ?? []
+    let taken = has_interface(list, spec.name)
+    if !taken {
+        push(mut list, spec)
+        s.objects[path] = list
+    }
+    sync.unlock(s.lock)
+    if taken {
+        fail Marshal("{path} already exports {spec.name}")
+    }
+}
+
+/// Removes every interface exported on the object `path` of the service `s`. A path that is not exported is ignored.
+pub fn unexport(s: *Service, path: str) {
+    sync.lock(s.lock)
+    delete(mut s.objects, path)
+    sync.unlock(s.lock)
+}
+
+/// Sends `PropertiesChanged` for the properties `names` of `interface` on the object `path`, with their current values.
+///
+/// With no `names` every readable property of the interface is sent. Fails with `Remote` for an unknown object, interface or property, and with the errors of `send_on`.
+pub fn emit_changed(s: *Service, path: str, interface: str, names: []str) ! Error {
+    let objects = match find_object(s, path) {
+        some(list) => list
+        none => fail Remote(unknown_object, "no object at {path}")
+    }
+    let spec = match find_interface(objects, interface) {
+        some(found) => found
+        none => fail Remote(unknown_interface, "{path} has no interface {interface}")
+    }
+    var changed: [str: Value] = [:]
+    if names.len == 0 {
+        for p in spec.properties {
+            if p.access != "write" {
+                changed[p.name] = read_property(p)?
+            }
+        }
+    } else {
+        for name in names {
+            let p = match find_property(spec, name) {
+                some(found) => found
+                none => fail Remote(unknown_property, "{interface} has no property {name}")
+            }
+            changed[name] = read_property(p)?
+        }
+    }
+    send_on(s.connection, properties_changed_signal(path, interface, changed, []))?
+}

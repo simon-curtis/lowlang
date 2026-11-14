@@ -1,0 +1,688 @@
+import std/file
+import std/io
+import std/os
+import std/process
+import std/sys
+import std/testing
+import std/text
+
+struct Daemon {
+    address: str
+    handle: *process.ChildHandle
+    dir: str
+}
+
+struct Level {
+    value: i64
+}
+
+struct Tool {
+    out: str
+    err: str
+    ok: bool
+}
+
+fn python_service() -> str {
+    text.join([
+        "import sys",
+        "import gi",
+        "gi.require_version('Gio', '2.0')",
+        "from gi.repository import Gio, GLib",
+        "XML = '''<node>",
+        "  <interface name='org.example.Py'>",
+        "    <method name='Echo'><arg type='s' direction='in' name='text'/><arg type='s' direction='out' name='reply'/></method>",
+        "    <method name='Sum'><arg type='ai' direction='in' name='numbers'/><arg type='x' direction='out' name='total'/></method>",
+        "    <method name='Details'><arg type='a{{sv}}' direction='out' name='details'/></method>",
+        "    <method name='Fail'/>",
+        "    <property name='Count' type='u' access='read'/>",
+        "    <property name='Label' type='s' access='readwrite'/>",
+        "    <signal name='Tick'><arg type='u' name='n'/></signal>",
+        "  </interface>",
+        "</node>'''",
+        "labels = dict(current='start')",
+        "",
+        "def on_call(conn, sender, path, iface, method, params, invocation):",
+        "    if method == 'Echo':",
+        "        conn.emit_signal(None, path, iface, 'Tick', GLib.Variant('(u)', (7,)))",
+        "        invocation.return_value(GLib.Variant('(s)', ('py: ' + params.unpack()[0],)))",
+        "    elif method == 'Sum':",
+        "        invocation.return_value(GLib.Variant('(x)', (sum(params.unpack()[0]),)))",
+        "    elif method == 'Details':",
+        "        details = dict(name=GLib.Variant('s', 'python'), count=GLib.Variant('u', 5))",
+        "        invocation.return_value(GLib.Variant('(a{{sv}})', (details,)))",
+        "    elif method == 'Fail':",
+        "        invocation.return_dbus_error('org.example.Py.Failed', 'python says no')",
+        "",
+        "def on_get(conn, sender, path, iface, name):",
+        "    if name == 'Count':",
+        "        return GLib.Variant('u', 5)",
+        "    return GLib.Variant('s', labels['current'])",
+        "",
+        "def on_set(conn, sender, path, iface, name, value):",
+        "    labels['current'] = value.unpack()",
+        "    return True",
+        "",
+        "flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION",
+        "conn = Gio.DBusConnection.new_for_address_sync(sys.argv[1], flags, None, None)",
+        "info = Gio.DBusNodeInfo.new_for_xml(XML)",
+        "conn.register_object('/org/example/Py', info.interfaces[0], on_call, on_get, on_set)",
+        "request = GLib.Variant('(su)', ('org.example.Py', 0))",
+        "conn.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'RequestName', request, None, Gio.DBusCallFlags.NONE, -1, None)",
+        "print('ready', flush=True)",
+        "GLib.MainLoop().run()",
+    ], "\n")
+}
+
+fn bus_config(dir: str) -> str {
+    "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n<busconfig>\n  <type>session</type>\n  <listen>unix:path={dir}/bus</listen>\n  <auth>EXTERNAL</auth>\n  <policy context=\"default\">\n    <allow send_destination=\"*\" eavesdrop=\"true\"/>\n    <allow eavesdrop=\"true\"/>\n    <allow own=\"*\"/>\n  </policy>\n</busconfig>\n"
+}
+
+fn first_line(s: io.Stream) -> str ! io.Error {
+    var collected: []u8 = []
+    let buf = io.buffer(512)
+    for {
+        let n = s.read(buf)?
+        if n == 0 {
+            break
+        }
+        io.append(mut collected, buf[..n])
+        if text.index_byte(str(collected), '\n') >= 0 {
+            break
+        }
+    }
+    let line = text.trim(str(collected))
+    line
+}
+
+fn piped_output(c: *process.ChildHandle) -> io.Stream ! io.Error {
+    match c.stdout {
+        some(s) => s
+        none => fail Invalid
+    }
+}
+
+fn start_daemon(dir: str) -> Daemon ! io.Error {
+    let config = "{dir}/bus.conf"
+    file.write_text(config, bus_config(dir))?
+    var command = process.command("dbus-daemon", ["--config-file={config}", "--nofork", "--nopidfile", "--print-address=1"])
+    command.stdout = process.Stdio.Piped
+    let handle = process.start_handle(command)?
+    let stream = piped_output(handle)?
+    let address = first_line(stream)?
+    if address.len == 0 {
+        fail Invalid
+    }
+    Daemon { address, handle, dir }
+}
+
+fn with_daemon(t: *testing.T, body: fn(*testing.T, Daemon)) {
+    let program = process.find("dbus-daemon") ?? ""
+    if program.len == 0 {
+        t.skip("dbus-daemon is not installed")
+    }
+    let dir = file.temp_dir("lowdbus") catch {
+        e => {
+            t.error("temporary directory: {e}")
+            return
+        }
+    }
+    let daemon = start_daemon(dir) catch {
+        e => {
+            t.error("starting dbus-daemon: {e}")
+            file.remove_all(dir) or {}
+            return
+        }
+    }
+    using child = process.adopt(daemon.handle)
+    body(t, daemon)
+    file.remove_all(dir) or {}
+}
+
+fn connect(t: *testing.T, d: Daemon) -> *ConnectionHandle {
+    let addresses = parse_addresses(d.address) catch {
+        e => {
+            t.fatal("address {d.address}: {e}")
+            panic("unreachable")
+        }
+    }
+    using var c = connect_addresses(addresses) catch {
+        e => {
+            t.fatal("connect: {e}")
+            panic("unreachable")
+        }
+    }
+    detach(mut c)
+}
+
+fn run_tool(t: *testing.T, program: str, args: []str) -> Tool {
+    let found = process.find(program) ?? ""
+    if found.len == 0 {
+        t.skip("{program} is not installed")
+    }
+    let out = process.run(process.command(program, args), []) catch {
+        e => {
+            t.error("{program}: {e}")
+            return Tool { out: "", err: "", ok: false }
+        }
+    }
+    Tool { out: str(out.stdout), err: str(out.stderr), ok: process.success(out.status) }
+}
+
+fn echo(c: Call) -> []Value ! Error {
+    [Value.String("echo: {string_of(c.message.body[0])?}")]
+}
+
+fn add(c: Call) -> []Value ! Error {
+    [Value.Int32(i32(int_of(c.message.body[0])? + int_of(c.message.body[1])?))]
+}
+
+fn explode(c: Call) -> []Value ! Error {
+    fail Error.Remote("org.example.Low.Exploded", "boom")
+}
+
+fn describe(c: Call) -> []Value ! Error {
+    [dict(["name": Value.String("low"), "version": Value.UInt32(1)])]
+}
+
+fn size_of_descriptor(c: Call) -> []Value ! Error {
+    let buf = io.buffer(64)
+    let n = sys.read(c.message.fds[0], buf) catch {
+        e => fail Error.Io(e)
+    }
+    sys.close_fd(c.message.fds[0])
+    [Value.String(str(buf[..n]))]
+}
+
+fn echo_bytes(c: Call) -> []Value ! Error {
+    [Value.Bytes(bytes_of(c.message.body[0])?)]
+}
+
+fn low_spec(level: *Level) -> InterfaceSpec {
+    InterfaceSpec {
+        name: "org.example.Low",
+        methods: [
+            MethodSpec { name: "Echo", in_signature: "s", out_signature: "s", in_names: ["text"], out_names: ["reply"], handler: echo },
+            MethodSpec { name: "Add", in_signature: "ii", out_signature: "i", handler: add },
+            MethodSpec { name: "Describe", out_signature: "a{{sv}}", handler: describe },
+            MethodSpec { name: "Explode", handler: explode },
+            MethodSpec { name: "ReadDescriptor", in_signature: "h", out_signature: "s", handler: size_of_descriptor },
+            MethodSpec { name: "EchoBytes", in_signature: "ay", out_signature: "ay", handler: echo_bytes },
+        ],
+        properties: [
+            read_write_property("Volume", "i", fn() -> Value ! Error { Value.Int32(i32(level.value)) }, fn(v) ! Error {
+                level.value = int_of(v)?
+            }),
+            read_only_property("Name", "s", fn() -> Value ! Error { Value.String("low") }),
+        ],
+        signals: [SignalSpec { name: "Changed", signature: "i", names: ["level"] }],
+    }
+}
+
+fn serve_low(t: *testing.T, d: Daemon, level: *Level) -> *ConnectionHandle {
+    let h = connect(t, d)
+    let reply = request_name_on(h, "org.example.Low", 0) catch {
+        e => {
+            t.fatal("request_name: {e}")
+            panic("unreachable")
+        }
+    }
+    t.equal(reply, NameReply.PrimaryOwner)
+    let service = serve_on(h)
+    export(service, "/org/example/Low", low_spec(level)) catch {
+        e => t.fatal("export: {e}")
+    }
+    h
+}
+
+fn test_hello_and_name_ownership(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        let a_handle = connect(t, d)
+        using a = adopt(a_handle)
+        let b_handle = connect(t, d)
+        using b = adopt(b_handle)
+        t.is_true(text.starts_with(unique_name(a), ":1."))
+        t.not_equal(unique_name(a), unique_name(b))
+        t.is_true(passes_fds(a))
+        let addresses = parse_addresses(d.address) or []
+        t.equal(server_guid(a), address_guid(addresses[0]))
+        t.equal(request_name(a, "org.example.Name", 0) or NameReply.Exists, NameReply.PrimaryOwner)
+        t.equal(request_name(a, "org.example.Name", 0) or NameReply.Exists, NameReply.AlreadyOwner)
+        t.equal(request_name(b, "org.example.Name", name_do_not_queue) or NameReply.PrimaryOwner, NameReply.Exists)
+        t.equal(request_name(b, "org.example.Name", 0) or NameReply.PrimaryOwner, NameReply.InQueue)
+        t.is_true(name_has_owner(b, "org.example.Name") or false)
+        t.is_false(name_has_owner(b, "org.example.Unowned") or true)
+        t.equal(release_name(b, "org.example.Unowned") or ReleaseReply.Released, ReleaseReply.NonExistent)
+        t.equal(release_name(a, "org.example.Name") or ReleaseReply.NonExistent, ReleaseReply.Released)
+        t.is_true(name_has_owner(a, "org.example.Name") or false)
+        t.equal(release_name(b, "org.example.Name") or ReleaseReply.NonExistent, ReleaseReply.Released)
+        t.is_false(name_has_owner(a, "org.example.Name") or true)
+        request_name(a, "org.example.Replaceable", name_allow_replacement) or panic("request")
+        t.equal(request_name(b, "org.example.Replaceable", name_replace_existing) or NameReply.Exists, NameReply.PrimaryOwner)
+        let invalid = request_name(a, "nodots", 0) catch {
+            e => {
+                t.equal("{e}", "{Error.Name("invalid bus name \"nodots\"")}")
+                NameReply.Exists
+            }
+        }
+    })
+}
+
+fn test_calls_to_an_unknown_name_fail_with_the_daemon_error(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        let c_handle = connect(t, d)
+        using c = adopt(c_handle)
+        let reply = call(c, method_call("org.example.Nobody", "/", "org.example.I", "M", [])) catch {
+            e => {
+                match e {
+                    Remote(name, _) => t.equal(name, "org.freedesktop.DBus.Error.ServiceUnknown")
+                    _ => t.error("wrong error {e}")
+                }
+                return
+            }
+        }
+        t.error("the call succeeded")
+    })
+}
+
+fn test_low_client_and_low_service_through_the_daemon(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        let level = new(Level { value: 7 })
+        let service_handle = serve_low(t, d, level)
+        using service = adopt(service_handle)
+        let client_handle = connect(t, d)
+        using client = adopt(client_handle)
+        let reply = call(client, method_call("org.example.Low", "/org/example/Low", "org.example.Low", "Echo", [Value.String("hi")])) or {
+            t.fatal("echo failed")
+            return
+        }
+        t.equal("{reply.body}", "{[Value.String("echo: hi")]}")
+        t.equal(reply.sender, unique_name(service))
+        let total = call(client, method_call("org.example.Low", "/org/example/Low", "org.example.Low", "Add", [Value.Int32(40), Value.Int32(2)])) or {
+            t.fatal("add failed")
+            return
+        }
+        t.equal(int_of(total.body[0]) or -1, 42)
+        let volume = get_property(client, "org.example.Low", "/org/example/Low", "org.example.Low", "Volume") or Value.Int32(-1)
+        t.equal(int_of(volume) or -1, 7)
+        set_property(client, "org.example.Low", "/org/example/Low", "org.example.Low", "Volume", Value.Int32(9)) or t.error("set_property failed")
+        t.equal(level.value, 9)
+        let node = introspect(client, "org.example.Low", "/org/example/Low") or {
+            t.fatal("introspect failed")
+            return
+        }
+        var names: []str = []
+        for i in node.interfaces {
+            push(mut names, i.name)
+        }
+        t.contains_item(names, "org.example.Low")
+        ping(client, "org.example.Low") or t.error("ping failed")
+        t.equal(machine_id(client, "org.example.Low") or "", local_machine_id() or "none")
+        close_both(service, client)
+    })
+}
+
+fn emit(t: *testing.T, c: Connection, m: Message) {
+    let serial = send(c, m) catch {
+        e => {
+            t.error("send: {e}")
+            0
+        }
+    }
+}
+
+fn close_both(a: Connection, b: Connection) {
+    shutdown(a)
+    shutdown(b)
+}
+
+fn test_signals_travel_through_the_daemon(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        let emitter_handle = connect(t, d)
+        using emitter = adopt(emitter_handle)
+        let listener_handle = connect(t, d)
+        using listener = adopt(listener_handle)
+        let wanted = MatchRule { interface: "org.example.Sig", member: "Tick", path_namespace: "/org/example", args: [0: "keep"] }
+        let sub = subscribe(listener, wanted) or {
+            t.fatal("subscribe failed")
+            return
+        }
+        emit(t, emitter, signal("/org/example/a", "org.example.Sig", "Tick", [Value.String("drop")]))
+        emit(t, emitter, signal("/elsewhere", "org.example.Sig", "Tick", [Value.String("keep")]))
+        emit(t, emitter, signal("/org/example/a", "org.example.Sig", "Tock", [Value.String("keep")]))
+        emit(t, emitter, signal("/org/example/b", "org.example.Sig", "Tick", [Value.String("keep")]))
+        let received = <-sub.signals
+        match received {
+            some(m) => {
+                t.equal(m.path, "/org/example/b")
+                t.equal(m.sender, unique_name(emitter))
+            }
+            none => t.error("nothing arrived")
+        }
+        unsubscribe(listener, sub)
+    })
+}
+
+fn rule_candidates() -> []Message {
+    [
+        signal("/org/example/a", "org.example.Sig", "Tick", [Value.String("alpha"), Value.String("/aa/bb/cc")]),
+        signal("/org/example/a/b", "org.example.Sig", "Tick", [Value.String("beta"), Value.ObjectPath("/aa/bb")]),
+        signal("/org/exampl", "org.example.Sig", "Tick", [Value.String("alpha")]),
+        signal("/org/example", "org.example.Other", "Tick", [Value.String("org.example.Foo")]),
+        signal("/org/example/a", "org.example.Sig", "Tock", [Value.String("org.example.Foo.bar")]),
+        signal("/org/other", "org.example.Sig", "Tick", [Value.String("org.example.Foobar")]),
+        signal("/", "org.example.Sig", "Tick", []),
+        signal("/org/example/a", "org.example.Sig", "Tick", [Value.Int32(1), Value.String("/aa/")]),
+        signal("/org/example/a", "org.example.Sig", "Tick", [Value.String("alpha"), Value.String("/aa/bb/")]),
+        signal("/org/example/a", "org.example.Sig", "Tick", [Value.String(""), Value.String("/aa")]),
+    ]
+}
+
+fn rule_cases() -> []MatchRule {
+    [
+        MatchRule { kind: "signal" },
+        MatchRule { interface: "org.example.Sig" },
+        MatchRule { member: "Tick" },
+        MatchRule { path: "/org/example/a" },
+        MatchRule { path_namespace: "/org/example" },
+        MatchRule { path_namespace: "/" },
+        MatchRule { args: [0: "alpha"] },
+        MatchRule { args: [0: ""] },
+        MatchRule { args: [1: "/aa/bb/cc"] },
+        MatchRule { arg_paths: [1: "/aa/bb/"] },
+        MatchRule { arg_paths: [1: "/aa/bb/cc/dd"] },
+        MatchRule { arg_paths: [1: "/aa/"] },
+        MatchRule { arg_paths: [0: "/aa/"] },
+        MatchRule { arg0_namespace: "org.example.Foo" },
+        MatchRule { interface: "org.example.Sig", member: "Tick", path_namespace: "/org/example", args: [0: "alpha"] },
+    ]
+}
+
+fn delivered_to(t: *testing.T, d: Daemon, rule: MatchRule) -> []i64 {
+    let emitter_handle = connect(t, d)
+    using emitter = adopt(emitter_handle)
+    let listener_handle = connect(t, d)
+    using listener = adopt(listener_handle)
+    let candidates = rule_candidates()
+    let seen = chan[Message](64)
+    let barrier = MatchRule { interface: "org.example.Barrier" }
+    add_filter(listener, fn(m) {
+        if m.kind == MessageType.Signal && m.sender != "org.freedesktop.DBus" {
+            seen <- m
+        }
+        false
+    })
+    add_match(listener, rule) or t.fatal("add_match {rule_text(rule) or ""}")
+    add_match(listener, barrier) or t.fatal("add_match barrier")
+    var numbered = 0
+    for m in candidates {
+        var tagged = m
+        push(mut tagged.body, Value.UInt32(u32(numbered)))
+        emit(t, emitter, tagged)
+        numbered += 1
+    }
+    emit(t, emitter, signal("/", "org.example.Barrier", "Done", []))
+    var got: []i64 = []
+    for {
+        let next = <-seen
+        let m = match next {
+            some(found) => found
+            none => break
+        }
+        if m.interface == "org.example.Barrier" {
+            break
+        }
+        push(mut got, int_of(m.body[m.body.len - 1]) or -1)
+    }
+    shutdown(emitter)
+    shutdown(listener)
+    got
+}
+
+fn test_the_daemon_agrees_with_rule_matches(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        for rule in rule_cases() {
+            var expected: []i64 = []
+            var n = 0
+            for m in rule_candidates() {
+                var tagged = m
+                push(mut tagged.body, Value.UInt32(u32(n)))
+                if rule_matches(rule, tagged) {
+                    push(mut expected, n)
+                }
+                n += 1
+            }
+            let got = delivered_to(t, d, rule)
+            t.equal_slice(got, expected)
+        }
+    })
+}
+
+fn test_a_descriptor_crosses_the_daemon(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        let level = new(Level { value: 1 })
+        let service_handle = serve_low(t, d, level)
+        using service = adopt(service_handle)
+        let client_handle = connect(t, d)
+        using client = adopt(client_handle)
+        let ends = sys.pipe(false) or {
+            t.fatal("pipe failed")
+            return
+        }
+        sys.write_all(ends.second, bytes("through the daemon")) or t.error("write failed")
+        let reply = call(client, method_call("org.example.Low", "/org/example/Low", "org.example.Low", "ReadDescriptor", [Value.UnixFd(ends.first)])) or {
+            t.fatal("call failed")
+            return
+        }
+        t.equal(string_of(reply.body[0]) or "", "through the daemon")
+        sys.close_fd(ends.first)
+        sys.close_fd(ends.second)
+        close_both(service, client)
+    })
+}
+
+fn test_a_large_message_crosses_the_daemon(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        let level = new(Level { value: 1 })
+        let service_handle = serve_low(t, d, level)
+        using service = adopt(service_handle)
+        let client_handle = connect(t, d)
+        using client = adopt(client_handle)
+        let payload = io.buffer(4194304)
+        for i in 0..payload.len {
+            payload[i] = u8(i % 251)
+        }
+        let reply = call(client, method_call("org.example.Low", "/org/example/Low", "org.example.Low", "EchoBytes", [Value.Bytes(payload)])) or {
+            t.fatal("call failed")
+            return
+        }
+        let echoed = bytes_of(reply.body[0]) or []
+        t.equal(echoed.len, payload.len)
+        t.equal_slice(echoed, payload)
+        close_both(service, client)
+    })
+}
+
+fn test_dbus_send_calls_a_low_service(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        let level = new(Level { value: 7 })
+        let service_handle = serve_low(t, d, level)
+        using service = adopt(service_handle)
+        let echoed = run_tool(t, "dbus-send", ["--bus={d.address}", "--print-reply", "--dest=org.example.Low", "/org/example/Low", "org.example.Low.Echo", "string:hello"])
+        t.is_true(echoed.ok)
+        t.contains(echoed.out, "string \"echo: hello\"")
+        let added = run_tool(t, "dbus-send", ["--bus={d.address}", "--print-reply", "--dest=org.example.Low", "/org/example/Low", "org.example.Low.Add", "int32:40", "int32:2"])
+        t.contains(added.out, "int32 42")
+        let failed = run_tool(t, "dbus-send", ["--bus={d.address}", "--print-reply", "--dest=org.example.Low", "/org/example/Low", "org.example.Low.Explode"])
+        t.is_false(failed.ok)
+        t.contains(failed.err, "org.example.Low.Exploded")
+        t.contains(failed.err, "boom")
+        let volume = run_tool(t, "dbus-send", ["--bus={d.address}", "--print-reply", "--dest=org.example.Low", "/org/example/Low", "org.freedesktop.DBus.Properties.Get", "string:org.example.Low", "string:Volume"])
+        t.contains(volume.out, "int32 7")
+        shutdown(service)
+    })
+}
+
+fn test_busctl_calls_and_inspects_a_low_service(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        let level = new(Level { value: 7 })
+        let service_handle = serve_low(t, d, level)
+        using service = adopt(service_handle)
+        let echoed = run_tool(t, "busctl", ["--address={d.address}", "call", "org.example.Low", "/org/example/Low", "org.example.Low", "Echo", "s", "hello"])
+        t.is_true(echoed.ok)
+        t.contains(echoed.out, "s \"echo: hello\"")
+        let added = run_tool(t, "busctl", ["--address={d.address}", "call", "org.example.Low", "/org/example/Low", "org.example.Low", "Add", "ii", "40", "2"])
+        t.contains(added.out, "i 42")
+        let described = run_tool(t, "busctl", ["--address={d.address}", "call", "org.example.Low", "/org/example/Low", "org.example.Low", "Describe"])
+        t.contains(described.out, "a{{sv}} 2")
+        t.contains(described.out, "\"name\" s \"low\"")
+        let failed = run_tool(t, "busctl", ["--address={d.address}", "call", "org.example.Low", "/org/example/Low", "org.example.Low", "Explode"])
+        t.is_false(failed.ok)
+        t.contains(failed.err, "boom")
+        let volume = run_tool(t, "busctl", ["--address={d.address}", "get-property", "org.example.Low", "/org/example/Low", "org.example.Low", "Volume"])
+        t.contains(volume.out, "i 7")
+        let written = run_tool(t, "busctl", ["--address={d.address}", "set-property", "org.example.Low", "/org/example/Low", "org.example.Low", "Volume", "i", "12"])
+        t.is_true(written.ok)
+        t.equal(level.value, 12)
+        let introspected = run_tool(t, "busctl", ["--address={d.address}", "introspect", "--no-pager", "org.example.Low", "/org/example/Low"])
+        t.contains(introspected.out, ".Echo")
+        t.contains(introspected.out, ".Volume")
+        t.contains(introspected.out, "org.freedesktop.DBus.Properties")
+        let tree = run_tool(t, "busctl", ["--address={d.address}", "tree", "--no-pager", "org.example.Low"])
+        t.contains(tree.out, "/org/example/Low")
+        let pinged = run_tool(t, "busctl", ["--address={d.address}", "call", "org.example.Low", "/org/example/Low", "org.freedesktop.DBus.Peer", "Ping"])
+        t.is_true(pinged.ok)
+        shutdown(service)
+    })
+}
+
+fn test_gdbus_calls_and_introspects_a_low_service(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        let level = new(Level { value: 7 })
+        let service_handle = serve_low(t, d, level)
+        using service = adopt(service_handle)
+        let echoed = run_tool(t, "gdbus", ["call", "--address", d.address, "--dest", "org.example.Low", "--object-path", "/org/example/Low", "--method", "org.example.Low.Echo", "hello"])
+        t.is_true(echoed.ok)
+        t.contains(echoed.out, "('echo: hello',)")
+        let added = run_tool(t, "gdbus", ["call", "--address", d.address, "--dest", "org.example.Low", "--object-path", "/org/example/Low", "--method", "org.example.Low.Add", "40", "2"])
+        t.contains(added.out, "(42,)")
+        let described = run_tool(t, "gdbus", ["call", "--address", d.address, "--dest", "org.example.Low", "--object-path", "/org/example/Low", "--method", "org.example.Low.Describe"])
+        t.contains(described.out, "'name': <'low'>")
+        let failed = run_tool(t, "gdbus", ["call", "--address", d.address, "--dest", "org.example.Low", "--object-path", "/org/example/Low", "--method", "org.example.Low.Explode"])
+        t.is_false(failed.ok)
+        t.contains(failed.err, "GDBus.Error:org.example.Low.Exploded: boom")
+        let volume = run_tool(t, "gdbus", ["call", "--address", d.address, "--dest", "org.example.Low", "--object-path", "/org/example/Low", "--method", "org.freedesktop.DBus.Properties.Get", "org.example.Low", "Volume"])
+        t.contains(volume.out, "(<7>,)")
+        let introspected = run_tool(t, "gdbus", ["introspect", "--address", d.address, "--dest", "org.example.Low", "--object-path", "/org/example/Low"])
+        t.is_true(introspected.ok)
+        t.contains(introspected.out, "interface org.example.Low {{")
+        t.contains(introspected.out, "Echo(in  s text,")
+        t.contains(introspected.out, "out s reply);")
+        t.contains(introspected.out, "readwrite i Volume = 7;")
+        t.contains(introspected.out, "Changed(i level);")
+        shutdown(service)
+    })
+}
+
+fn python_ready(t: *testing.T, d: Daemon, script: str) -> *process.ChildHandle {
+    let found = process.find("python3") ?? ""
+    if found.len == 0 {
+        t.skip("python3 is not installed")
+    }
+    let probe = process.run(process.command("python3", ["-c", "import gi\ngi.require_version('Gio', '2.0')\nfrom gi.repository import Gio"]), []) catch {
+        e => {
+            t.skip("python3 cannot run: {e}")
+            return process.start_handle(process.command("true", [])) or panic("true")
+        }
+    }
+    if !process.success(probe.status) {
+        t.skip("python3 has no GLib bindings")
+    }
+    file.write_text(script, python_service()) or t.fatal("writing the service script")
+    var command = process.command("python3", [script, d.address])
+    command.stdout = process.Stdio.Piped
+    let handle = process.start_handle(command) catch {
+        e => {
+            t.fatal("starting python3: {e}")
+            return process.start_handle(process.command("true", [])) or panic("true")
+        }
+    }
+    let stream = piped_output(handle) or {
+        t.fatal("no output stream")
+        return handle
+    }
+    let ready = first_line(stream) or ""
+    t.equal(ready, "ready")
+    handle
+}
+
+fn test_a_low_client_calls_a_gio_service(t: *testing.T) {
+    with_daemon(t, fn(t, d) {
+        let script = "{d.dir}/service.py"
+        let handle = python_ready(t, d, script)
+        using py = process.adopt(handle)
+        let client_handle = connect(t, d)
+        using client = adopt(client_handle)
+        let ticks = subscribe(client, MatchRule { interface: "org.example.Py", member: "Tick" }) or {
+            t.fatal("subscribe failed")
+            return
+        }
+        let reply = call(client, method_call("org.example.Py", "/org/example/Py", "org.example.Py", "Echo", [Value.String("hello")])) or {
+            t.fatal("echo failed")
+            return
+        }
+        t.equal("{reply.body}", "{[Value.String("py: hello")]}")
+        let tick = <-ticks.signals
+        match tick {
+            some(m) => t.equal(int_of(m.body[0]) or -1, 7)
+            none => t.error("no tick")
+        }
+        let sum = call(client, method_call("org.example.Py", "/org/example/Py", "org.example.Py", "Sum", [Array("i", [Value.Int32(1), Value.Int32(2), Value.Int32(3)])])) or {
+            t.fatal("sum failed")
+            return
+        }
+        t.equal(int_of(sum.body[0]) or -1, 6)
+        let details = call(client, method_call("org.example.Py", "/org/example/Py", "org.example.Py", "Details", [])) or {
+            t.fatal("details failed")
+            return
+        }
+        let entries = dict_of(details.body[0]) or [:]
+        t.equal(string_of(entries["name"] ?? Value.Byte(0)) or "", "python")
+        t.equal(int_of(entries["count"] ?? Value.Byte(0)) or -1, 5)
+        let failed = call(client, method_call("org.example.Py", "/org/example/Py", "org.example.Py", "Fail", [])) catch {
+            e => {
+                match e {
+                    Remote(name, message) => {
+                        t.equal(name, "org.example.Py.Failed")
+                        t.equal(message, "python says no")
+                    }
+                    _ => t.error("wrong error {e}")
+                }
+                reply
+            }
+        }
+        let count = get_property(client, "org.example.Py", "/org/example/Py", "org.example.Py", "Count") or Value.Int32(-1)
+        t.equal(int_of(count) or -1, 5)
+        set_property(client, "org.example.Py", "/org/example/Py", "org.example.Py", "Label", Value.String("changed")) or t.error("set_property failed")
+        let label = get_property(client, "org.example.Py", "/org/example/Py", "org.example.Py", "Label") or Value.Int32(-1)
+        t.equal(string_of(label) or "", "changed")
+        let all = get_all(client, "org.example.Py", "/org/example/Py", "org.example.Py") or [:]
+        t.equal(all.len, 2)
+        let node = introspect(client, "org.example.Py", "/org/example/Py") or {
+            t.fatal("introspect failed")
+            return
+        }
+        var methods: []str = []
+        for i in node.interfaces {
+            if i.name == "org.example.Py" {
+                for m in i.methods {
+                    push(mut methods, m.name)
+                }
+            }
+        }
+        t.equal_slice(methods, ["Echo", "Sum", "Details", "Fail"])
+        ping(client, "org.example.Py") or t.error("ping failed")
+        t.equal(machine_id(client, "org.example.Py") or "", local_machine_id() or "none")
+        unsubscribe(client, ticks)
+        shutdown(client)
+    })
+}

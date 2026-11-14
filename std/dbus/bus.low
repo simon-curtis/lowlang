@@ -1,0 +1,231 @@
+import std/sync
+import std/text
+
+const bus_service = "org.freedesktop.DBus"
+const bus_object = "/org/freedesktop/DBus"
+const signal_queue = 256
+
+/// The flag of `request_name` that lets another connection take the name with `name_replace_existing`.
+pub const name_allow_replacement = 1
+
+/// The flag of `request_name` that takes the name from its owner when the owner allowed replacement.
+pub const name_replace_existing = 2
+
+/// The flag of `request_name` that fails instead of queueing when the name is taken.
+pub const name_do_not_queue = 4
+
+/// The answer of the bus to `request_name`.
+pub enum NameReply {
+    /// The connection owns the name.
+    PrimaryOwner = 1
+    /// The name is taken and the connection waits in its queue.
+    InQueue = 2
+    /// The name is taken and the connection is not queued.
+    Exists = 3
+    /// The connection already owned the name.
+    AlreadyOwner = 4
+}
+
+/// The answer of the bus to `release_name`.
+pub enum ReleaseReply {
+    /// The connection gave up the name.
+    Released = 1
+    /// Nobody owns the name.
+    NonExistent = 2
+    /// Another connection owns the name.
+    NotOwner = 3
+}
+
+/// A stream of the signals that match a rule, made by `subscribe_on`.
+pub struct Subscription {
+    /// Receives each matching signal in the order it arrived. It holds up to 256 queued signals; while it is full, reading from the connection waits. Read it together with `ended`.
+    pub signals: chan[Message]
+    ended: chan[bool]
+    rule: MatchRule
+    filter: i64
+    lock: sync.Mutex
+    finished: bool
+}
+
+fn bus_call(h: *ConnectionHandle, member: str, body: []Value) -> Message ! Error {
+    call_on(h, method_call(bus_service, bus_object, bus_service, member, body))?
+}
+
+fn single(reply: Message) -> Value ! Error {
+    if reply.body.len != 1 {
+        fail Malformed("the reply holds {reply.body.len} values, not one")
+    }
+    reply.body[0]
+}
+
+/// Asks the bus to give the connection behind `h` the well-known name `name`.
+///
+/// `flags` is a combination of `name_allow_replacement`, `name_replace_existing` and `name_do_not_queue`. Fails with `Name` when `name` is not a valid well-known bus name, and with the errors of `call_on` otherwise.
+pub fn request_name_on(h: *ConnectionHandle, name: str, flags: i64) -> NameReply ! Error {
+    if !valid_bus_name(name) || name[0] == ':' {
+        fail Name("invalid bus name {text.quote(name)}")
+    }
+    let reply = bus_call(h, "RequestName", [Value.String(name), Value.UInt32(u32(flags))])?
+    match int_of(single(reply)?)? {
+        1 => NameReply.PrimaryOwner
+        2 => NameReply.InQueue
+        3 => NameReply.Exists
+        4 => NameReply.AlreadyOwner
+        n => fail Malformed("RequestName returned {n}")
+    }
+}
+
+/// Asks the bus to give `c` the well-known name `name`.
+///
+/// Does the same as `request_name_on` on its handle.
+pub fn request_name(c: Connection, name: str, flags: i64) -> NameReply ! Error {
+    request_name_on(c.handle, name, flags)
+}
+
+/// Gives up the well-known name `name` owned by the connection behind `h`.
+///
+/// Fails with `Name` when `name` is not a valid bus name, and with the errors of `call_on` otherwise.
+pub fn release_name_on(h: *ConnectionHandle, name: str) -> ReleaseReply ! Error {
+    if !valid_bus_name(name) {
+        fail Name("invalid bus name {text.quote(name)}")
+    }
+    let reply = bus_call(h, "ReleaseName", [Value.String(name)])?
+    match int_of(single(reply)?)? {
+        1 => ReleaseReply.Released
+        2 => ReleaseReply.NonExistent
+        3 => ReleaseReply.NotOwner
+        n => fail Malformed("ReleaseName returned {n}")
+    }
+}
+
+/// Gives up the well-known name `name` owned by `c`.
+///
+/// Does the same as `release_name_on` on its handle.
+pub fn release_name(c: Connection, name: str) -> ReleaseReply ! Error {
+    release_name_on(c.handle, name)
+}
+
+/// Returns whether some connection owns the bus name `name`.
+pub fn name_has_owner_on(h: *ConnectionHandle, name: str) -> bool ! Error {
+    let reply = bus_call(h, "NameHasOwner", [Value.String(name)])?
+    bool_of(single(reply)?)?
+}
+
+/// Returns whether some connection owns the bus name `name`.
+///
+/// Does the same as `name_has_owner_on` on the handle of `c`.
+pub fn name_has_owner(c: Connection, name: str) -> bool ! Error {
+    name_has_owner_on(c.handle, name)
+}
+
+/// Asks the bus to route the messages that match `rule` to the connection behind `h`.
+///
+/// Fails as `rule_text` does for an invalid rule, and with the errors of `call_on` otherwise. A connection that is not on a bus has nobody to ask and fails with the error of the peer.
+pub fn add_match_on(h: *ConnectionHandle, rule: MatchRule) ! Error {
+    bus_call(h, "AddMatch", [Value.String(rule_text(rule)?)])?
+}
+
+/// Asks the bus to route the messages that match `rule` to `c`.
+///
+/// Does the same as `add_match_on` on its handle.
+pub fn add_match(c: Connection, rule: MatchRule) ! Error {
+    add_match_on(c.handle, rule)
+}
+
+/// Stops the bus routing the messages that match `rule` to the connection behind `h`.
+///
+/// `rule` must be one passed to `add_match_on`. Fails as `add_match_on` does.
+pub fn remove_match_on(h: *ConnectionHandle, rule: MatchRule) ! Error {
+    bus_call(h, "RemoveMatch", [Value.String(rule_text(rule)?)])?
+}
+
+/// Stops the bus routing the messages that match `rule` to `c`.
+///
+/// Does the same as `remove_match_on` on its handle.
+pub fn remove_match(c: Connection, rule: MatchRule) ! Error {
+    remove_match_on(c.handle, rule)
+}
+
+fn route_signal(s: *Subscription, m: Message) {
+    if m.kind != MessageType.Signal || !rule_matches(s.rule, m) {
+        return
+    }
+    select {
+        s.signals <- m => {}
+        <-s.ended => {}
+    }
+}
+
+fn watch(h: *ConnectionHandle, s: *Subscription) {
+    select {
+        <-ended_on(h) => {}
+        <-s.ended => {}
+    }
+    finish(s)
+}
+
+fn finish(s: *Subscription) -> bool {
+    sync.lock(s.lock)
+    let first = !s.finished
+    s.finished = true
+    sync.unlock(s.lock)
+    if first {
+        close(s.ended)
+    }
+    first
+}
+
+/// Adds a match rule on the bus for the signals that meet `rule` and returns a stream of them.
+///
+/// The `kind` of the rule is `signal` whatever it says. Every subscription sees every matching signal, so subscriptions do not take signals from each other. Fails as `add_match_on` does. End the stream with `unsubscribe_on` when nothing reads it.
+pub fn subscribe_on(h: *ConnectionHandle, rule: MatchRule) -> *Subscription ! Error {
+    var signal_rule = rule
+    signal_rule.kind = "signal"
+    let s = new(Subscription {
+        signals: chan[Message](signal_queue),
+        ended: chan[bool](),
+        rule: signal_rule,
+        filter: 0,
+        lock: sync.mutex(),
+        finished: false,
+    })
+    s.filter = add_filter_on(h, fn(m) {
+        route_signal(s, m)
+        false
+    })
+    add_match_on(h, signal_rule) catch {
+        e => {
+            remove_filter_on(h, s.filter)
+            fail e
+        }
+    }
+    spawn watch(h, s)
+    s
+}
+
+/// Adds a match rule on the bus of `c` and returns a stream of the signals that meet `rule`.
+///
+/// Does the same as `subscribe_on` on its handle.
+pub fn subscribe(c: Connection, rule: MatchRule) -> *Subscription ! Error {
+    subscribe_on(c.handle, rule)
+}
+
+/// Ends the subscription `s` made on the connection behind `h`: the match rule is removed from the bus and `ended` closes. Safe to call more than once.
+pub fn unsubscribe_on(h: *ConnectionHandle, s: *Subscription) {
+    remove_filter_on(h, s.filter)
+    if finish(s) {
+        remove_match_on(h, s.rule) or {}
+    }
+}
+
+/// Ends the subscription `s` made on `c`.
+///
+/// Does the same as `unsubscribe_on` on its handle.
+pub fn unsubscribe(c: Connection, s: *Subscription) {
+    unsubscribe_on(c.handle, s)
+}
+
+/// Returns a channel that is closed once `s` has ended, because it was unsubscribed or its connection closed.
+pub fn subscription_ended(s: *Subscription) -> chan[bool] {
+    s.ended
+}

@@ -1,0 +1,396 @@
+import std/cancel
+import std/dbus
+import std/file
+import std/io
+import std/net
+import std/os
+import std/sync
+import std/sys
+import std/text
+
+const guid = "00112233445566778899aabbccddeeff"
+
+struct Client {
+    name: str
+    handle: *dbus.ConnectionHandle
+    rules: []dbus.MatchRule
+}
+
+struct Bus {
+    lock: sync.Mutex
+    clients: []*Client
+    owners: [str: str]
+    next: i64
+}
+
+fn parse_rule(rule_text: str) -> dbus.MatchRule {
+    var r = dbus.MatchRule {}
+    var i = 0
+    for i < rule_text.len {
+        let equals = text.index_byte(rule_text[i..], '=') + i
+        let key = rule_text[i..equals]
+        var value: []u8 = []
+        i = equals + 2
+        for i < rule_text.len {
+            if rule_text[i] == '\'' {
+                if i + 3 < rule_text.len + 1 && rule_text[i..i + 4] == "'\\''" {
+                    push(mut value, '\'')
+                    i += 4
+                    continue
+                }
+                break
+            }
+            push(mut value, rule_text[i])
+            i += 1
+        }
+        i += 2
+        let v = str(value)
+        match key {
+            "type" => { r.kind = v }
+            "interface" => { r.interface = v }
+            "member" => { r.member = v }
+            "path" => { r.path = v }
+            "arg0" => { r.args[0] = v }
+            _ => {}
+        }
+    }
+    r
+}
+
+fn find_client(bus: *Bus, name: str) -> *Client? {
+    var target = name
+    if name[0] != ':' {
+        target = bus.owners[name] ?? ""
+    }
+    for c in bus.clients {
+        if c.name == target {
+            return c
+        }
+    }
+    none
+}
+
+fn close_fds(m: dbus.Message) {
+    for fd in m.fds {
+        sys.close_fd(fd)
+    }
+}
+
+fn deliver(h: *dbus.ConnectionHandle, m: dbus.Message) {
+    dbus.send_on(h, m) or return
+}
+
+fn bus_reply(client: *Client, call: dbus.Message, body: []dbus.Value) {
+    deliver(client.handle, dbus.method_return(call, body))
+}
+
+fn handle_bus_call(bus: *Bus, client: *Client, m: dbus.Message) {
+    sync.lock(bus.lock)
+    match m.member {
+        "Hello" => {
+            bus.next += 1
+            client.name = ":1.{bus.next}"
+            sync.unlock(bus.lock)
+            bus_reply(client, m, [dbus.Value.String(client.name)])
+        }
+        "RequestName" => {
+            let name = dbus.string_of(m.body[0]) or ""
+            let flags = dbus.int_of(m.body[1]) or 0
+            var answer = 1
+            match bus.owners[name] {
+                some(owner) => {
+                    if owner == client.name {
+                        answer = 4
+                    } else if flags & dbus.name_do_not_queue != 0 {
+                        answer = 3
+                    } else {
+                        answer = 2
+                    }
+                }
+                none => {
+                    bus.owners[name] = client.name
+                }
+            }
+            sync.unlock(bus.lock)
+            bus_reply(client, m, [dbus.Value.UInt32(u32(answer))])
+        }
+        "ReleaseName" => {
+            let name = dbus.string_of(m.body[0]) or ""
+            var answer = 2
+            match bus.owners[name] {
+                some(owner) => {
+                    if owner == client.name {
+                        delete(mut bus.owners, name)
+                        answer = 1
+                    } else {
+                        answer = 3
+                    }
+                }
+                none => {}
+            }
+            sync.unlock(bus.lock)
+            bus_reply(client, m, [dbus.Value.UInt32(u32(answer))])
+        }
+        "AddMatch" => {
+            push(mut client.rules, parse_rule(dbus.string_of(m.body[0]) or ""))
+            sync.unlock(bus.lock)
+            bus_reply(client, m, [])
+        }
+        "RemoveMatch" => {
+            var kept: []dbus.MatchRule = []
+            let removed = parse_rule(dbus.string_of(m.body[0]) or "")
+            var dropped = false
+            for r in client.rules {
+                if !dropped && "{r}" == "{removed}" {
+                    dropped = true
+                } else {
+                    push(mut kept, r)
+                }
+            }
+            client.rules = kept
+            sync.unlock(bus.lock)
+            bus_reply(client, m, [])
+        }
+        "NameHasOwner" => {
+            let name = dbus.string_of(m.body[0]) or ""
+            let has = (bus.owners[name] ?? "") != ""
+            sync.unlock(bus.lock)
+            bus_reply(client, m, [dbus.Value.Boolean(has)])
+        }
+        _ => {
+            sync.unlock(bus.lock)
+            deliver(client.handle, dbus.error_reply(m, "org.freedesktop.DBus.Error.UnknownMethod", m.member))
+        }
+    }
+}
+
+fn route(bus: *Bus, client: *Client, original: dbus.Message) -> bool {
+    var m = original
+    if m.destination == "org.freedesktop.DBus" {
+        handle_bus_call(bus, client, m)
+        close_fds(m)
+        return true
+    }
+    m.sender = client.name
+    if m.kind == dbus.MessageType.Signal && m.destination.len == 0 {
+        sync.lock(bus.lock)
+        var targets: []*Client = []
+        for c in bus.clients {
+            for r in c.rules {
+                if dbus.rule_matches(r, m) {
+                    push(mut targets, c)
+                    break
+                }
+            }
+        }
+        sync.unlock(bus.lock)
+        for c in targets {
+            deliver(c.handle, m)
+        }
+        close_fds(m)
+        return true
+    }
+    sync.lock(bus.lock)
+    let target = find_client(bus, m.destination)
+    sync.unlock(bus.lock)
+    match target {
+        some(c) => {
+            deliver(c.handle, m)
+        }
+        none => {
+            if m.kind == dbus.MessageType.MethodCall && m.flags & dbus.no_reply_expected == 0 {
+                deliver(client.handle, dbus.error_reply(m, "org.freedesktop.DBus.Error.ServiceUnknown", "{m.destination} is not on the bus"))
+            }
+        }
+    }
+    close_fds(m)
+    true
+}
+
+fn welcome(h: net.ConnHandle, bus: *Bus, auth: dbus.ServerAuth) {
+    let c = dbus.accept_over_handle(h, auth) or return
+    let client = new(Client { name: "", handle: c, rules: [] })
+    sync.lock(bus.lock)
+    push(mut bus.clients, client)
+    sync.unlock(bus.lock)
+    dbus.add_filter_on(c, fn(m) { route(bus, client, m) })
+}
+
+fn accept_loop(l: net.ListenerHandle, bus: *Bus, auth: dbus.ServerAuth) {
+    for {
+        let h = net.accept_handle(l) or break
+        spawn welcome(h, bus, auth)
+    }
+}
+
+fn show_error(e: dbus.Error) -> str {
+    match e {
+        Remote(name, message) => "{name}: {message}"
+        Auth(reason) => "auth: {reason}"
+        Address(reason) => "address: {reason}"
+        Closed => "closed"
+        _ => "{e}"
+    }
+}
+
+fn attempt(list: str) -> str {
+    let addresses = dbus.parse_addresses(list) catch {
+        e => return "parse {show_error(e)}"
+    }
+    using c = dbus.connect_addresses(addresses) catch {
+        e => return "error {show_error(e)}"
+    }
+    "connected as {dbus.unique_name(c)}"
+}
+
+fn receive_text(s: *dbus.Subscription) -> str {
+    select {
+        m = <-s.signals => {
+            match m {
+                some(signal) => "{signal.body}"
+                none => "closed"
+            }
+        }
+        <-dbus.subscription_ended(s) => "ended"
+        after(200) => "nothing"
+    }
+}
+
+fn greet(call: dbus.Call) -> []dbus.Value ! dbus.Error {
+    [dbus.Value.String("hello {dbus.string_of(call.message.body[0])?} from {call.message.sender}")]
+}
+
+fn descriptor_text(call: dbus.Call) -> []dbus.Value ! dbus.Error {
+    let buf = io.buffer(64)
+    let n = sys.read(call.message.fds[0], buf) catch {
+        e => fail dbus.Error.Io(e)
+    }
+    sys.close_fd(call.message.fds[0])
+    [dbus.Value.String("read {str(buf[..n])}")]
+}
+
+fn main() {
+    let dir = file.temp_dir("lowdbus") or panic("temp dir")
+    let path = "{dir}/bus socket,1"
+    let abstract_name = "lowdbus{os.pid()}"
+    let bus = new(Bus { lock: sync.mutex(), clients: [], owners: [:], next: 0 })
+
+    using var listener = net.listen_unix(path) or panic("listen")
+    let lh = net.detach_listener(mut listener)
+    spawn accept_loop(lh, bus, dbus.ServerAuth { guid })
+    using var hidden = net.listen_unix("@{abstract_name}") or panic("listen abstract")
+    let hh = net.detach_listener(mut hidden)
+    spawn accept_loop(hh, bus, dbus.ServerAuth { guid, uid: 999999, anonymous: true })
+    using var strict = net.listen_unix("@{abstract_name}s") or panic("listen strict")
+    let sh = net.detach_listener(mut strict)
+    spawn accept_loop(sh, bus, dbus.ServerAuth { guid, uid: 999999 })
+    using var runtime_listener = net.listen_unix("{dir}/bus") or panic("listen runtime")
+    let rh = net.detach_listener(mut runtime_listener)
+    spawn accept_loop(rh, bus, dbus.ServerAuth { guid })
+
+    let address = "unix:path={dbus.escape_address_value(path)},guid={guid}"
+    os.set_env("DBUS_SESSION_BUS_ADDRESS", address) or panic("env")
+    using a = dbus.connect_session() or panic("connect a")
+    using b = dbus.connect_session() or panic("connect b")
+    print("unique names {dbus.unique_name(a)} {dbus.unique_name(b)}")
+    print("fd passing {dbus.passes_fds(a)}, guid {dbus.server_guid(a) == guid}")
+
+    print("request {dbus.request_name(a, "org.example.Svc", 0) or panic("request")}")
+    print("request again {dbus.request_name(a, "org.example.Svc", 0) or panic("request")}")
+    print("request taken {dbus.request_name(b, "org.example.Svc", dbus.name_do_not_queue) or panic("request")}")
+    print("request queued {dbus.request_name(b, "org.example.Svc", 0) or panic("request")}")
+    print("has owner {dbus.name_has_owner(b, "org.example.Svc") or false} {dbus.name_has_owner(b, "org.example.Other") or true}")
+    print("release other {dbus.release_name(b, "org.example.Nope") or panic("release")}")
+    print("release not owner {dbus.release_name(b, "org.example.Svc") or panic("release")}")
+    let bad = dbus.request_name(a, "nodots", 0) catch {
+        e => {
+            print("bad name {show_error(e)}")
+            dbus.NameReply.Exists
+        }
+    }
+    let service = dbus.serve(a)
+    dbus.export(service, "/org/example/Svc", dbus.InterfaceSpec {
+        name: "org.example.Svc",
+        methods: [
+            dbus.MethodSpec { name: "Greet", in_signature: "s", out_signature: "s", handler: greet },
+            dbus.MethodSpec { name: "Descriptor", in_signature: "h", out_signature: "s", handler: descriptor_text },
+        ],
+    }) or panic("export")
+    let greeting = dbus.call(b, dbus.method_call("org.example.Svc", "/org/example/Svc", "org.example.Svc", "Greet", [dbus.Value.String("b")])) or panic("greet")
+    print(greeting.body)
+    let by_unique = dbus.call(b, dbus.method_call(dbus.unique_name(a), "/org/example/Svc", "org.example.Svc", "Greet", [dbus.Value.String("again")])) or panic("greet by unique name")
+    print(by_unique.body)
+    let nobody = dbus.call(b, dbus.method_call("org.example.Nobody", "/", "org.example.Svc", "Greet", [dbus.Value.String("x")])) catch {
+        e => {
+            print("unknown destination {show_error(e)}")
+            greeting
+        }
+    }
+    let ends = sys.pipe(false) or panic("pipe")
+    sys.write_all(ends.second, bytes("through the bus")) or panic("write")
+    let described = dbus.call(b, dbus.method_call("org.example.Svc", "/org/example/Svc", "org.example.Svc", "Descriptor", [dbus.Value.UnixFd(ends.first)])) or panic("descriptor")
+    print(described.body)
+    sys.close_fd(ends.first)
+    sys.close_fd(ends.second)
+
+    let rule = dbus.MatchRule { interface: "org.example.Svc", member: "Ping", args: [0: "it's"] }
+    print(dbus.rule_text(rule) or panic("rule text"))
+    let first = dbus.subscribe(b, rule) or panic("subscribe")
+    let second = dbus.subscribe(b, rule) or panic("subscribe")
+    dbus.send(a, dbus.signal("/org/example/Svc", "org.example.Svc", "Ping", [dbus.Value.String("other")])) or panic("send")
+    dbus.send(a, dbus.signal("/org/example/Svc", "org.example.Svc", "Ping", [dbus.Value.String("it's")])) or panic("send")
+    print("both receive {receive_text(first)} {receive_text(second)}")
+    dbus.unsubscribe(b, first)
+    dbus.unsubscribe(b, first)
+    dbus.send(a, dbus.signal("/org/example/Svc", "org.example.Svc", "Ping", [dbus.Value.String("it's")])) or panic("send")
+    print("after unsubscribe {receive_text(first)} {receive_text(second)}")
+    dbus.unsubscribe(b, second)
+
+    print("pending after release {dbus.release_name(a, "org.example.Svc") or panic("release")}")
+    print("name gone {dbus.name_has_owner(b, "org.example.Svc") or true}")
+
+    print("handle variants")
+    let ah = a.handle
+    let bh = b.handle
+    print("  unique names {dbus.unique_name_on(ah) == dbus.unique_name(a)} {dbus.unique_name_on(bh) == dbus.unique_name(b)}")
+    print("  request with flags {dbus.request_name_on(ah, "org.example.Handle", dbus.name_allow_replacement | dbus.name_replace_existing) or panic("request")}")
+    print("  has owner {dbus.name_has_owner_on(bh, "org.example.Handle") or false}")
+    let released = dbus.release_name_on(ah, "org.example.Handle") or panic("release")
+    print("  release {released == dbus.ReleaseReply.Released}")
+    print("  has owner after release {dbus.name_has_owner_on(bh, "org.example.Handle") or true}")
+    let loose = dbus.MatchRule { interface: "org.example.Loose" }
+    dbus.add_match(b, loose) or panic("add match")
+    dbus.remove_match(b, loose) or panic("remove match")
+    dbus.add_match_on(bh, loose) or panic("add match")
+    dbus.remove_match_on(bh, loose) or panic("remove match")
+    let third = dbus.subscribe_on(bh, rule) or panic("subscribe_on")
+    dbus.send(a, dbus.signal("/org/example/Svc", "org.example.Svc", "Ping", [dbus.Value.String("it's")])) or panic("send")
+    print("  subscribe_on {receive_text(third)}")
+    dbus.unsubscribe_on(bh, third)
+    print("  after unsubscribe_on {receive_text(third)}")
+
+    let listing = dbus.parse_addresses("unix:path=/nonexistent/socket;{address}") or panic("parse")
+    using fallback = dbus.connect_addresses(listing) or panic("connect addresses")
+    print("second address used {dbus.unique_name(fallback)}")
+    print("no socket {attempt("unix:path=/nonexistent/socket")}")
+    print("wrong guid {attempt("unix:path={dbus.escape_address_value(path)},guid=ffffffffffffffffffffffffffffffff")}")
+    print("anonymous fallback {attempt("unix:abstract={abstract_name}")}")
+    print("rejected {attempt("unix:abstract={abstract_name}s")}")
+    print("tcp {attempt("tcp:host=localhost,port=1")}")
+    print("two paths {attempt("unix:path=/a,abstract=b")}")
+
+    os.unset_env("DBUS_SESSION_BUS_ADDRESS") or panic("unset")
+    os.set_env("XDG_RUNTIME_DIR", dir) or panic("env")
+    using runtime = dbus.connect_session() or panic("runtime session")
+    print("session through XDG_RUNTIME_DIR {dbus.unique_name(runtime)}")
+    using explicit = dbus.connect_addresses(dbus.parse_addresses("unix:runtime=yes") or panic("parse")) or panic("runtime=yes")
+    print("runtime=yes {dbus.unique_name(explicit)}")
+    os.set_env("DBUS_SYSTEM_BUS_ADDRESS", address) or panic("env")
+    using system = dbus.connect_system() or panic("system")
+    print("system bus {dbus.unique_name(system)}")
+    net.close_listener_on(lh)
+    net.close_listener_on(hh)
+    net.close_listener_on(sh)
+    net.close_listener_on(rh)
+    file.remove_all(dir) or {}
+}
