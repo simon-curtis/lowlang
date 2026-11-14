@@ -1,0 +1,404 @@
+import ir
+
+enum Task {
+    Tree(node: i64)
+    Within(node: i64, at: i64)
+    Body(node: i64)
+    Branch(from: i64, to: i64)
+    Open(code: u8, frame: i64)
+    Else
+    Close
+    Table(node: i64)
+}
+
+struct Lowering {
+    g: *Generator
+    f: *ir.Func
+    c: *Code
+    dom: *ir.Dominators
+    locals: []i64
+    extra: []u8 = []
+    results: [i64: []*ir.Value] = [:]
+    merge: []bool = []
+    header: []bool = []
+    merges: [][]i64 = []
+    frames: []i64 = []
+    tasks: []Task = []
+    base: i64 = -1
+    scratch: i64 = -1
+    slot_offsets: []i64 = []
+    frame_bytes: i64 = 0
+}
+
+fn lower(g: *Generator, f: *ir.Func) -> Body ! Error {
+    let dom = ir.func_dominators(f)
+    var highest = 0
+    for b in f.blocks {
+        for v in b.values {
+            if v.id > highest {
+                highest = v.id
+            }
+        }
+    }
+    var locals: []i64 = []
+    for _ in 0..highest + 1 {
+        push(mut locals, -1)
+    }
+    let l = new(Lowering { g, f, c: new_code(), dom, locals })
+    l.index_results()
+    l.shape()?
+    l.extra = words(color_values(l))
+    l.prologue()
+    push(mut l.tasks, Task.Tree(0))
+    for l.tasks.len > 0 {
+        let task = l.tasks[l.tasks.len - 1]
+        truncate(mut l.tasks, l.tasks.len - 1)
+        l.run(task)?
+    }
+    l.c.op(op_unreachable)
+    let type = signature(g.m, words(f.param_words), words(ir.result_words(f)))
+    Body { type, locals: l.extra, code: l.c.finish() }
+}
+
+fn index_results(l: *Lowering) {
+    for b in l.f.blocks {
+        for v in b.values {
+            if v.op != OpResult {
+                continue
+            }
+            let call = v.args[0]
+            var list = l.results[call.id] ?? []
+            push(mut list, v)
+            l.results[call.id] = list
+        }
+    }
+}
+
+fn rpo(l: *Lowering, b: *ir.Block) -> i64 {
+    l.dom.index[b] ?? -1
+}
+
+fn dominates(l: *Lowering, a: i64, b: i64) -> bool {
+    var at = b
+    for at != a && at != 0 {
+        at = l.dom.idom[at]
+    }
+    at == a
+}
+
+fn shape(l: *Lowering) ! Error {
+    let n = l.dom.nodes.len
+    var forward: []i64 = []
+    for _ in 0..n {
+        push(mut forward, 0)
+        push(mut l.merge, false)
+        push(mut l.header, false)
+        push(mut l.merges, [])
+    }
+    for i, b in l.dom.nodes {
+        for s in b.succs {
+            if b.kind != Plain && s.values.len > 0 && s.values[0].op == OpPhi {
+                panic("wasm: b{s.id} has phis and a predecessor that branches")
+            }
+            let to = l.rpo(s)
+            if to > i {
+                forward[to] += 1
+                continue
+            }
+            if !l.dominates(to, i) {
+                fail Unsupported("irreducible control flow in {l.f.name}")
+            }
+            l.header[to] = true
+        }
+    }
+    for i in 0..n {
+        l.merge[i] = forward[i] >= 2
+    }
+    for i in 0..n {
+        var list: []i64 = []
+        for child in l.dom.children[i] {
+            if l.merge[child] {
+                push(mut list, child)
+            }
+        }
+        l.merges[i] = descending(list)
+    }
+}
+
+fn descending(list: []i64) -> []i64 {
+    var out = list
+    for i in 1..out.len {
+        var at = i
+        for at > 0 && out[at - 1] < out[at] {
+            let held = out[at]
+            out[at] = out[at - 1]
+            out[at - 1] = held
+            at -= 1
+        }
+    }
+    out
+}
+
+fn new_local(l: *Lowering) -> i64 {
+    let index = l.f.param_words + l.extra.len
+    push(mut l.extra, i64_type)
+    index
+}
+
+fn local_of(l: *Lowering, v: *ir.Value) -> i64 {
+    if v.op == OpParam {
+        return v.aux
+    }
+    let held = l.locals[v.id]
+    if held >= 0 {
+        return held
+    }
+    let index = l.new_local()
+    l.locals[v.id] = index
+    index
+}
+
+fn get(l: *Lowering, v: *ir.Value) {
+    l.c.local_get(l.local_of(v))
+}
+
+fn set(l: *Lowering, v: *ir.Value) {
+    l.c.local_set(l.local_of(v))
+}
+
+fn scratch_local(l: *Lowering) -> i64 {
+    if l.scratch < 0 {
+        l.scratch = l.new_local()
+    }
+    l.scratch
+}
+
+fn prologue(l: *Lowering) {
+    var offset = 0
+    for words_in_slot in l.f.slots {
+        push(mut l.slot_offsets, offset)
+        offset += 8 * words_in_slot
+    }
+    l.frame_bytes = align(offset, 16)
+    if l.frame_bytes == 0 {
+        return
+    }
+    l.base = l.new_local()
+    let c = l.c
+    c.global_get(sp_global)
+    c.i64_const(l.frame_bytes)
+    c.op(op_i64_sub)
+    c.local_tee(l.base)
+    c.global_get(floor_global)
+    c.op(op_i64_lt_u)
+    c.open(op_if)
+    c.call(l.g.helpers.panic_stack)
+    c.op(op_end)
+    c.local_get(l.base)
+    c.global_set(sp_global)
+    c.local_get(l.base)
+    c.address()
+    c.i32_const(0)
+    c.i32_const(l.frame_bytes)
+    c.memory_fill()
+}
+
+fn epilogue(l: *Lowering) {
+    if l.base < 0 {
+        return
+    }
+    l.c.local_get(l.base)
+    l.c.i64_const(l.frame_bytes)
+    l.c.op(op_i64_add)
+    l.c.global_set(sp_global)
+}
+
+fn push_tasks(l: *Lowering, list: []Task) {
+    var at = list.len - 1
+    for at >= 0 {
+        push(mut l.tasks, list[at])
+        at -= 1
+    }
+}
+
+fn run(l: *Lowering, task: Task) ! Error {
+    match task {
+        Tree(node) => l.tree(node)
+        Within(node, at) => l.within(node, at)
+        Body(node) => l.body(node)?
+        Branch(from, to) => l.branch(from, to)
+        Open(code, frame) => {
+            l.c.open(code)
+            push(mut l.frames, frame)
+        }
+        Else => l.c.op(op_else)
+        Close => {
+            l.c.op(op_end)
+            truncate(mut l.frames, l.frames.len - 1)
+        }
+        Table(node) => l.table(node)
+    }
+}
+
+fn tree(l: *Lowering, node: i64) {
+    if l.header[node] {
+        l.push_tasks([Task.Open(op_loop, node), Task.Within(node, 0), Task.Close])
+        return
+    }
+    push(mut l.tasks, Task.Within(node, 0))
+}
+
+fn within(l: *Lowering, node: i64, at: i64) {
+    let list = l.merges[node]
+    if at >= list.len {
+        push(mut l.tasks, Task.Body(node))
+        return
+    }
+    let next = list[at]
+    l.push_tasks([Task.Open(op_block, next), Task.Within(node, at + 1), Task.Close, Task.Tree(next)])
+}
+
+fn depth(l: *Lowering, target: i64) -> i64 {
+    var at = l.frames.len - 1
+    for at >= 0 {
+        if l.frames[at] == target {
+            return l.frames.len - 1 - at
+        }
+        at -= 1
+    }
+    panic("wasm: no enclosing frame for block {l.dom.nodes[target].id} in {l.f.name}")
+}
+
+fn branch(l: *Lowering, from: i64, to: i64) {
+    if to <= from || l.merge[to] {
+        l.c.br(l.depth(to))
+        return
+    }
+    push(mut l.tasks, Task.Tree(to))
+}
+
+fn body(l: *Lowering, node: i64) ! Error {
+    let b = l.dom.nodes[node]
+    for v in b.values {
+        l.value(v)?
+    }
+    match b.kind {
+        Plain => {
+            let next = b.succs[0]
+            l.phi_moves(b, next)
+            push(mut l.tasks, Task.Branch(node, l.rpo(next)))
+        }
+        If => {
+            l.get(b.control ?? panic("if without a control value"))
+            l.c.op(op_i64_eqz)
+            l.c.op(op_i32_eqz)
+            let then = l.rpo(b.succs[0])
+            let otherwise = l.rpo(b.succs[1])
+            l.push_tasks([Task.Open(op_if, -1), Task.Branch(node, then), Task.Else, Task.Branch(node, otherwise), Task.Close])
+        }
+        Switch => l.switch(node, b)
+        Ret => {
+            for r in b.results {
+                l.get(r)
+            }
+            l.epilogue()
+            l.c.op(op_return)
+        }
+        Unreachable => l.c.op(op_unreachable)
+    }
+}
+
+fn phi_moves(l: *Lowering, from: *ir.Block, to: *ir.Block) {
+    var at = -1
+    for i, p in to.preds {
+        if p == from {
+            at = i
+            break
+        }
+    }
+    var phis: []*ir.Value = []
+    for v in to.values {
+        if v.op != OpPhi {
+            break
+        }
+        push(mut phis, v)
+    }
+    if phis.len == 0 {
+        return
+    }
+    if at < 0 {
+        panic("wasm: block b{from.id} is not a predecessor of b{to.id}")
+    }
+    for p in phis {
+        l.get(p.args[at])
+    }
+    var i = phis.len - 1
+    for i >= 0 {
+        l.set(phis[i])
+        i -= 1
+    }
+}
+
+fn distinct_targets(b: *ir.Block) -> []*ir.Block {
+    var out: []*ir.Block = []
+    for s in b.succs {
+        var seen = false
+        for t in out {
+            if t == s {
+                seen = true
+            }
+        }
+        if !seen {
+            push(mut out, s)
+        }
+    }
+    out
+}
+
+fn switch(l: *Lowering, node: i64, b: *ir.Block) {
+    let targets = distinct_targets(b)
+    var list: []Task = []
+    for _ in targets {
+        push(mut list, Task.Open(op_block, -1))
+    }
+    push(mut list, Task.Table(node))
+    for t in targets {
+        push(mut list, Task.Close)
+        push(mut list, Task.Branch(node, l.rpo(t)))
+    }
+    l.push_tasks(list)
+}
+
+fn position(targets: []*ir.Block, b: *ir.Block) -> i64 {
+    for i, t in targets {
+        if t == b {
+            return i
+        }
+    }
+    panic("wasm: switch target outside its targets")
+}
+
+fn table(l: *Lowering, node: i64) {
+    let b = l.dom.nodes[node]
+    let t = b.table ?? panic("switch without a table")
+    let targets = distinct_targets(b)
+    let index = l.scratch_local()
+    let c = l.c
+    let count = t.cases.len
+    l.get(b.control ?? panic("switch without a control value"))
+    c.i64_const(t.low)
+    c.op(op_i64_sub)
+    c.local_tee(index)
+    c.i64_const(count)
+    c.local_get(index)
+    c.i64_const(count)
+    c.op(op_i64_lt_u)
+    c.op(op_select)
+    c.length()
+    c.op(op_br_table)
+    uleb(mut c.out, u64(count))
+    for k in t.cases {
+        uleb(mut c.out, u64(position(targets, b.succs[k])))
+    }
+    uleb(mut c.out, u64(position(targets, b.succs[0])))
+}
