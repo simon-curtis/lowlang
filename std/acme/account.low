@@ -1,0 +1,152 @@
+import std/crypto/jose
+import std/crypto/x509
+import std/json
+
+/// An external account binding (RFC 8555 section 7.3.4): the key identifier and the HMAC key a certificate authority gave out of band.
+pub struct Binding {
+    /// The key identifier, sent as the `kid` of the binding.
+    pub key_id: str
+    /// The MAC key as raw bytes. A key given as Base64url text must be decoded first. The binding is signed with HMAC SHA-256, so it needs at least 32 bytes.
+    pub mac_key: []u8
+}
+
+/// What `new_account` asks the server for.
+pub struct AccountRequest {
+    /// The contact URLs, such as `mailto:admin@example.com`. Empty by default.
+    pub contacts: []str = []
+    /// Whether the client agrees to the terms of service in `Directory.terms_of_service`. Defaults to `false`.
+    pub terms_agreed: bool = false
+    /// Whether to look the account up without creating it, as `find_account` does. Defaults to `false`.
+    pub only_return_existing: bool = false
+    /// The external account binding for a server that requires one, or `none`.
+    pub binding: Binding? = none
+}
+
+/// An account at an ACME server, together with the key that signs its requests.
+pub struct Account {
+    /// The account URL, which identifies the account in the `kid` of every signed request.
+    pub url: str
+    /// The account key. An RSA, P-256 or P-384 key signs with `RS256`, `ES256` or `ES384`, and an Ed25519 key with `EdDSA`.
+    pub key: x509.PrivateKey
+    /// The status the server reports: `valid`, `deactivated` or `revoked`.
+    pub status: str
+    /// The contact URLs the server holds.
+    pub contacts: []str
+    /// The URL of the account's orders list, or the empty string.
+    pub orders: str
+}
+
+fn account_of(url: str, key: x509.PrivateKey, v: json.Value) -> Account {
+    Account { url, key, status: json_text(v, "status"), contacts: text_list(v, "contact"), orders: json_text(v, "orders") }
+}
+
+fn account_signer(a: Account) -> Signer {
+    Signer { key: a.key, kid: a.url }
+}
+
+fn text_values(items: []str) -> []json.Value {
+    var out: []json.Value = []
+    for item in items {
+        push(mut out, json.text_value(item))
+    }
+    out
+}
+
+fn binding_value(c: *Client, key: x509.PrivateKey, binding: Binding) -> json.Value ! Error {
+    let jwk = public_jwk(key)
+    let payload = bytes(jose.jwk_json(jwk))
+    let protected = jose.Protected { alg: "HS256", kid: binding.key_id, url: c.directory.new_account }
+    let secret = jose.Key.Hmac(binding.mac_key)
+    let signed = jose.sign_flattened(protected, secret, payload) catch { e => fail crypto_failure(e) }
+    json.parse(bytes(signed)) catch { _ => fail Protocol("the external account binding is not JSON") }
+}
+
+fn account_request_value(c: *Client, key: x509.PrivateKey, request: AccountRequest) -> json.Value ! Error {
+    var members: []json.Member = []
+    if request.terms_agreed {
+        push(mut members, json.bool_member("termsOfServiceAgreed", true))
+    }
+    if request.contacts.len > 0 {
+        push(mut members, json.array_member("contact", text_values(request.contacts)))
+    }
+    if request.only_return_existing {
+        push(mut members, json.bool_member("onlyReturnExisting", true))
+    }
+    match request.binding {
+        some(b) => {
+            let bound = binding_value(c, key, b)?
+            push(mut members, json.member("externalAccountBinding", bound))
+        }
+        none => {}
+    }
+    json.object_value(members)
+}
+
+/// Registers `key` as an account at the server, or returns the account the server already holds for it.
+///
+/// The request is signed with `key` and carries its public key. A server that already has an account for `key` answers with its URL and `new_account` returns it. With `request.only_return_existing`, an unknown key fails with `Server` of kind `AccountDoesNotExist`. Other failures are `Http`, `Server`, `Protocol` and `Crypto`, for a key that cannot sign or a binding that cannot be built.
+pub fn new_account(c: *Client, key: x509.PrivateKey, request: AccountRequest) -> Account ! Error {
+    let payload = account_request_value(c, key, request)?
+    let signer = Signer { key, kid: "" }
+    let reply = post_json(c, c.directory.new_account, signer, payload)?
+    let url = location(reply)?
+    let body = parse_body(reply)?
+    account_of(url, key, body)
+}
+
+/// Returns the account the server holds for `key`, without creating one.
+///
+/// Fails with `Server` of kind `AccountDoesNotExist` when there is none.
+pub fn find_account(c: *Client, key: x509.PrivateKey) -> Account ! Error {
+    new_account(c, key, AccountRequest { only_return_existing: true })?
+}
+
+/// Fetches account `a` from the server and returns it as the server reports it now.
+pub fn refresh_account(c: *Client, a: Account) -> Account ! Error {
+    let signer = account_signer(a)
+    let reply = post_as_get(c, a.url, signer)?
+    let body = parse_body(reply)?
+    account_of(a.url, a.key, body)
+}
+
+/// Replaces the contacts of `a` with `contacts` and returns the account as the server reports it.
+pub fn update_account(c: *Client, a: Account, contacts: []str) -> Account ! Error {
+    let list = text_values(contacts)
+    let members: []json.Member = [json.array_member("contact", list)]
+    let payload = json.object_value(members)
+    let signer = account_signer(a)
+    let reply = post_json(c, a.url, signer, payload)?
+    let body = parse_body(reply)?
+    account_of(a.url, a.key, body)
+}
+
+/// Deactivates `a` (RFC 8555 section 7.3.6) and returns it with the status the server reports.
+///
+/// A deactivated account cannot be used again.
+pub fn deactivate_account(c: *Client, a: Account) -> Account ! Error {
+    let members: []json.Member = [json.text_member("status", "deactivated")]
+    let payload = json.object_value(members)
+    let signer = account_signer(a)
+    let reply = post_json(c, a.url, signer, payload)?
+    let body = parse_body(reply)?
+    account_of(a.url, a.key, body)
+}
+
+/// Replaces the key of `a` with `key` (RFC 8555 section 7.3.5) and returns the account holding the new key.
+///
+/// The request is signed by both keys: an inner object by the new key that names the account and the old key, inside an outer request by the old one. The old key stops working once the server accepts the change. Fails with `Server` when the server refuses the new key, for example with kind `BadPublicKey`, or when an account already uses it.
+pub fn change_key(c: *Client, a: Account, key: x509.PrivateKey) -> Account ! Error {
+    let old_jwk = jose.jwk_json(public_jwk(a.key))
+    let old_value = json.parse(bytes(old_jwk)) catch { _ => fail Protocol("the old key is not JSON") }
+    let members: []json.Member = [json.text_member("account", a.url), json.member("oldKey", old_value)]
+    let inner_payload = bytes(json.stringify(json.object_value(members), 0))
+    let url = c.directory.key_change
+    let embedded = public_jwk(key)
+    let protected = jose.Protected { alg: algorithm_of(key), url, jwk: some(embedded) }
+    let signing = signing_key(key)
+    let inner = jose.sign_flattened(protected, signing, inner_payload) catch { e => fail crypto_failure(e) }
+    let signer = account_signer(a)
+    let _ = post(c, url, signer, bytes(inner))?
+    let moved = Account { url: a.url, key, status: a.status, contacts: a.contacts, orders: a.orders }
+    refresh_account(c, moved)?
+}

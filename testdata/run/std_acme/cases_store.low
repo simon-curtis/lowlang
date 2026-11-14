@@ -1,0 +1,240 @@
+import std/acme
+import std/cancel
+import std/crypto/hash
+import std/crypto/x509
+import std/file
+import std/io
+import std/slices
+import std/sync
+import std/text
+
+fn read_text(store: acme.Store, name: str) -> str {
+    let data = store.read(name) catch { e => return io_text(e) }
+    "{data.len > 0}"
+}
+
+fn write_text(store: acme.Store, name: str, data: str) -> str {
+    store.write(name, bytes(data)) catch { e => return io_text(e) }
+    "written"
+}
+
+fn io_text(e: io.Error) -> str {
+    match e {
+        Invalid => "invalid"
+        Denied => "denied"
+        Refused => "refused"
+        NotFound => "not found"
+        _ => "other"
+    }
+}
+
+fn certificate_part(bundle: str) -> str {
+    let start = text.index(bundle, "-----BEGIN CERTIFICATE-----")
+    bundle[start..]
+}
+
+fn reload_cases(rig: Rig, plain: *acme.Client) ! io.Error {
+    rig.fake.cert_seconds = 7776000
+    let seen = new(Seen { lines: [] })
+    let store = acme.memory_store()
+    var config = config_for(rig, plain, [["reload.example.test"]], seen)
+    config.store = store
+    let first = make(config)?
+    show("reload first pass", pass(first))
+    show("  events", take(seen))
+    let accounts = rig.fake.accounts.len
+    let orders = rig.fake.orders.len
+    let planned = acme.status(first)[0]
+    show("  store", "account={read_text(store, "account.pem")} certificate={read_text(store, "reload.example.test.pem")}")
+    let second = make(config)?
+    let loaded = acme.status(second)[0]
+    show("restart", "issued={loaded.issued} same renew_at={yes(loaded.renew_at == planned.renew_at)} same not_after={yes(loaded.not_after == planned.not_after)}")
+    show("  served", served_text(second, "reload.example.test"))
+    show("  pass", pass(second))
+    show("  events", take(seen))
+    show("  account reused", yes(rig.fake.accounts.len == accounts))
+    show("  nothing ordered", yes(rig.fake.orders.len == orders))
+
+    let bundle = str(store.read("reload.example.test.pem")?)
+    let garbage = acme.memory_store()
+    show("write garbage", write_text(garbage, "reload.example.test.pem", "not a pem"))
+    var over_garbage = config
+    over_garbage.store = garbage
+    let ignored = make(over_garbage)?
+    show("garbage certificate", status_text(rig, ignored, 7776000))
+
+    let moved = acme.memory_store()
+    show("write for other names", write_text(moved, "other.example.test.pem", bundle))
+    var over_names = config_for(rig, plain, [["other.example.test"]], seen)
+    over_names.store = moved
+    let relabelled = make(over_names)?
+    show("certificate for other names", status_text(rig, relabelled, 7776000))
+
+    let stranger = x509.generate_private_key(x509.KeyType.P256)?
+    let stranger_pem = x509.private_key_pem(stranger)?
+    let swapped = acme.memory_store()
+    show("write with another key", write_text(swapped, "reload.example.test.pem", "{stranger_pem}{certificate_part(bundle)}"))
+    var over_key = config
+    over_key.store = swapped
+    let rekeyed = make(over_key)?
+    show("certificate of another key", status_text(rig, rekeyed, 7776000))
+
+    let before = rig.fake.accounts.len
+    let known = acme.memory_store()
+    let account_pem = x509.private_key_pem(x509.generate_private_key(x509.KeyType.P256)?)?
+    show("write unregistered account key", write_text(known, "account.pem", account_pem))
+    var over_account = config
+    over_account.store = known
+    let registered = make(over_account)?
+    show("account the server does not know", "created={yes(rig.fake.accounts.len == before + 1)} key kept={yes(hash.equal(known.read("account.pem")?, bytes(account_pem)))}")
+    show("  status", status_text(rig, registered, 7776000))
+    let again = make(over_account)?
+    show("  restart finds it", "created={yes(rig.fake.accounts.len == before + 1)} {status_text(rig, again, 7776000)}")
+}
+
+fn failing_cases(rig: Rig, plain: *acme.Client) ! io.Error {
+    let seen = new(Seen { lines: [] })
+    let junk = acme.memory_store()
+    show("write junk account key", write_text(junk, "account.pem", "junk"))
+    var over_junk = config_for(rig, plain, [["junk.example.test"]], seen)
+    over_junk.store = junk
+    show("manager with a junk account key", manager_text(over_junk))
+
+    let unreadable = acme.Store {
+        read: fn(name: str) -> []u8 ! io.Error { fail Denied },
+        write: fn(name: str, data: []u8) ! io.Error {},
+    }
+    var over_unreadable = config_for(rig, plain, [["unreadable.example.test"]], seen)
+    over_unreadable.store = unreadable
+    show("manager with an unreadable store", manager_text(over_unreadable))
+
+    let unwritable = acme.Store {
+        read: fn(name: str) -> []u8 ! io.Error { [] },
+        write: fn(name: str, data: []u8) ! io.Error { fail Denied },
+    }
+    var over_unwritable = config_for(rig, plain, [["unwritable.example.test"]], seen)
+    over_unwritable.store = unwritable
+    show("manager with an unwritable store", manager_text(over_unwritable))
+
+    let account_only = memory_account_store()
+    var over_certificate = config_for(rig, plain, [["kept.example.test"]], seen)
+    over_certificate.store = account_only
+    let m = make(over_certificate)?
+    show("certificate that cannot be saved", pass(m))
+    show("  events", take(seen))
+    show("  status", status_text(rig, m, 7776000))
+    show("  served", served_text(m, "kept.example.test"))
+
+    let empty_names = config_for(rig, plain, [[]], seen)
+    show("manager with an empty name list", manager_text(empty_names))
+}
+
+fn memory_account_store() -> acme.Store {
+    let inner = acme.memory_store()
+    acme.Store {
+        read: fn(name: str) -> []u8 ! io.Error { inner.read(name) },
+        write: fn(name: str, data: []u8) ! io.Error {
+            if name == "account.pem" {
+                inner.write(name, data)?
+                return
+            }
+            fail Denied
+        },
+    }
+}
+
+fn manager_text(config: acme.ManagerConfig) -> str {
+    acme.manager(config) catch { e => return acme.describe(e) }
+    "created"
+}
+
+fn directory_store_cases(rig: Rig, plain: *acme.Client) ! io.Error {
+    let root = file.temp_dir("acme-store")?
+    let dir = "{root}/keys"
+    let store = acme.directory_store(dir)
+    show("directory store read of a missing name", read_text(store, "missing.pem"))
+    show("directory store write", write_text(store, "a.pem", "first"))
+    show("  read", "{str(store.read("a.pem")?)}")
+    show("  replace", write_text(store, "a.pem", "second"))
+    show("  read", "{str(store.read("a.pem")?)}")
+    let info = file.stat("{dir}/a.pem")?
+    let folder = file.stat(dir)?
+    show("  modes", "file={yes(info.mode == 0o600)} directory={yes(folder.mode == 0o700)}")
+    var names = file.list(dir)?
+    slices.sort(mut names)
+    show("  files", text.join(names, ","))
+    for name in ["", ".", "..", "../x", "a/b", ".hidden", "a\\b"] {
+        show("directory store with the name \"{name}\"", "read={read_text(store, name)} write={write_text(store, name, "x")}")
+    }
+    file.chmod(dir, 0o500)?
+    show("directory store in a read-only directory", write_text(store, "b.pem", "x"))
+    file.chmod(dir, 0o700)?
+    names = file.list(dir)?
+    slices.sort(mut names)
+    show("  files", text.join(names, ","))
+
+    let seen = new(Seen { lines: [] })
+    let managed = "{root}/managed"
+    var config = config_for(rig, plain, [["dir.example.test"], ["*.dir.example.test"]], seen)
+    config.store = acme.directory_store(managed)
+    let first = make(config)?
+    show("directory manager first pass", pass(first))
+    show("  events", take(seen))
+    var files = file.list(managed)?
+    slices.sort(mut files)
+    show("  files", text.join(files, ","))
+    let key_file = file.stat("{managed}/account.pem")?
+    let cert_file = file.stat("{managed}/_.dir.example.test.pem")?
+    show("  modes", "account={yes(key_file.mode == 0o600)} certificate={yes(cert_file.mode == 0o600)}")
+    let orders = rig.fake.orders.len
+    let second = make(config)?
+    show("directory manager restart", "{pass(second)} {take(seen)}")
+    show("  nothing ordered", yes(rig.fake.orders.len == orders))
+    show("  served", served_text(second, "x.dir.example.test"))
+    file.remove_all(root)?
+}
+
+struct Slot {
+    manager: *acme.Manager?
+}
+
+fn slot_served(slot: *Slot) -> str {
+    let m = match slot.manager {
+        some(found) => found
+        none => return "no manager"
+    }
+    let der = served_der(m, "loop.example.test")
+    if der.len == 0 {
+        return "nothing"
+    }
+    let leaf = x509.parse(der) catch { _ => return "unparsable" }
+    "valid from +{leaf.not_before - 1900000000}s"
+}
+
+fn serving_cases(rig: Rig, plain: *acme.Client) ! io.Error {
+    rig.fake.cert_seconds = 1000
+    let seen = new(Seen { lines: [] })
+    let done = sync.wait_group()
+    sync.add(done, 1)
+    let token = cancel.token()
+    var config = config_for(rig, plain, [["loop.example.test"]], seen)
+    config.token = some(token)
+    let counter = new(Seen { lines: [] })
+    let slot = new(Slot { manager: none })
+    config.observer = some(fn(ev: acme.Event) {
+        push(mut counter.lines, "{event_text(ev)} (served then: {slot_served(slot)})")
+        if counter.lines.len == 2 {
+            cancel.cancel(token)
+            sync.done(done)
+        }
+    })
+    let m = make(config)?
+    slot.manager = some(m)
+    acme.start(m)
+    sync.wait(done)
+    acme.stop(m)
+    show("started loop", text.join(counter.lines, "; "))
+    show("  token cancelled", yes(cancel.cancelled(token)))
+    show("  served", served_text(m, "loop.example.test"))
+    rig.fake.cert_seconds = 7776000
+}

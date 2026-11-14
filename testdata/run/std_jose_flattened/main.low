@@ -1,0 +1,122 @@
+import std/crypto/jose
+import std/io
+import std/json
+import std/text
+
+fn vector(path: []str) -> json.Value {
+    var v = json.parse(bytes(embed("vectors.json"))) or return json.Value.Null
+    for name in path {
+        v = json.get(v, name) ?? json.Value.Null
+    }
+    v
+}
+
+fn member_text(path: []str) -> str {
+    match vector(path) {
+        Str(s) => s
+        _ => ""
+    }
+}
+
+fn key_of(path: []str) -> jose.Jwk {
+    let keys = jose.parse_jwks(bytes(json.stringify(vector(path), 0))) or []
+    keys[0]
+}
+
+fn check(label: str, ok: bool) {
+    let word = if ok { "ok" } else { "FAILED" }
+    print("{label}: {word}")
+}
+
+fn only(k: jose.Jwk) -> fn(jose.Protected) -> []jose.Jwk {
+    fn(h: jose.Protected) -> []jose.Jwk { [k] }
+}
+
+fn embedded(h: jose.Protected) -> []jose.Jwk {
+    match h.jwk {
+        some(k) => [k]
+        none => []
+    }
+}
+
+fn rejects(label: str, text: str, k: jose.Jwk, algorithms: []str) {
+    let payload = jose.verify_flattened(text, only(k), algorithms) catch {
+        _ => return check(label, true)
+    }
+    check(label, false)
+}
+
+fn run() ! io.Error {
+    let rfc7638 = key_of(["rfc7638"])
+    print("rfc 7638 3.1: {jose.thumbprint(rfc7638)}")
+    let rfc8037 = key_of(["rfc8037"])
+    print("rfc 8037 A.3: {jose.thumbprint(rfc8037)}")
+
+    let es = key_of(["es256", "jwk"])
+    let ed = key_of(["ed25519", "jwk"])
+    let rs = key_of(["rsa", "jwk"])
+    check("es256 thumbprint", jose.thumbprint(es) == member_text(["es256", "thumbprint"]))
+    check("ed25519 thumbprint", jose.thumbprint(ed) == member_text(["ed25519", "thumbprint"]))
+    check("rsa thumbprint", jose.thumbprint(rs) == member_text(["rsa", "thumbprint"]))
+
+    let rfc_text = jose.sign_flattened(jose.Protected { alg: "EdDSA" }, rfc8037.key, bytes("Example of Ed25519 signing"))?
+    let rfc_json = json.parse(bytes(rfc_text)) or json.Value.Null
+    let rfc_protected = json.text_of(rfc_json, "protected")
+    let rfc_payload = json.text_of(rfc_json, "payload")
+    let rfc_signature = json.text_of(rfc_json, "signature")
+    print("rfc 8037 A.4: {rfc_protected}.{rfc_payload}.{rfc_signature}")
+
+    let python_es_jwk = member_text(["es256", "jws_jwk"])
+    let verified = jose.verify_flattened(python_es_jwk, embedded, ["ES256"])?
+    print("python es256 with jwk: {verified.header.alg} nonce={verified.header.nonce} url={verified.header.url} payload={str(verified.payload)}")
+    check("embedded jwk thumbprint", match verified.header.jwk { some(k) => jose.thumbprint(k) == jose.thumbprint(es), none => false })
+
+    let python_es_kid = member_text(["es256", "jws_kid"])
+    let post_as_get = jose.verify_flattened(python_es_kid, only(es), ["ES256"])?
+    print("python es256 with kid: kid={post_as_get.header.kid} nonce={post_as_get.header.nonce} payload bytes={post_as_get.payload.len}")
+
+    let python_ed = member_text(["ed25519", "jws_kid"])
+    let signed_ed = jose.sign_flattened(jose.Protected { alg: "EdDSA", kid: "https://example.test/acct/2", nonce: "N3", url: "https://example.test/order" }, ed.key, bytes("{{\"identifiers\":[]}}"))?
+    check("ed25519 matches python", signed_ed == python_ed)
+    jose.verify_flattened(python_ed, only(ed), ["EdDSA"])?
+
+    let python_rs = member_text(["rsa", "jws_kid"])
+    let signed_rs = jose.sign_flattened(jose.Protected { alg: "RS256", kid: "https://example.test/acct/3", nonce: "N4", url: "https://example.test/order" }, rs.key, bytes("{{\"onlyReturnExisting\":true}}"))?
+    check("rs256 matches python", signed_rs == python_rs)
+
+    let own_es = jose.sign_flattened(jose.Protected { alg: "ES256", jwk: some(es), nonce: "N9", url: "https://example.test/new-acct" }, es.key, bytes("{{}}"))?
+    let own = jose.verify_flattened(own_es, embedded, ["ES256"])?
+    print("own es256 round trip: nonce={own.header.nonce} payload={str(own.payload)}")
+    let own_get = jose.sign_flattened(jose.Protected { alg: "ES256", kid: "k", nonce: "n", url: "u" }, es.key, [])?
+    let empty_member = text.contains(own_get, "\"payload\":\"\"")
+    print("empty payload member: {empty_member}")
+
+    rejects("wrong algorithm list", python_es_kid, es, ["EdDSA"])
+    rejects("wrong key", python_es_kid, ed, ["ES256"])
+    let tampered = text.replace(python_es_kid, "\"payload\":\"\"", "\"payload\":\"AA\"")
+    rejects("tampered payload", tampered, es, ["ES256"])
+    rejects("extra member", text.replace(python_es_kid, "\"protected\"", "\"header\":\"x\",\"protected\""), es, ["ES256"])
+    rejects("not json", "protected", es, ["ES256"])
+    rejects("compact token", "a.b.c", es, ["ES256"])
+    refused("unsupported algorithm", jose.Protected { alg: "none" }, es.key)
+    refused("mismatched key", jose.Protected { alg: "EdDSA" }, es.key)
+    refused("public key only", jose.Protected { alg: "ES256" }, public_only(es.key))
+}
+
+fn public_only(key: jose.Key) -> jose.Key {
+    match key {
+        Ec(curve, public, _) => jose.Key.Ec(curve, public, none)
+        _ => key
+    }
+}
+
+fn refused(label: str, p: jose.Protected, key: jose.Key) {
+    let signed = jose.sign_flattened(p, key, []) catch {
+        _ => ""
+    }
+    check("sign with {label} refused", signed.len == 0)
+}
+
+fn main() {
+    run() or print("failed")
+}

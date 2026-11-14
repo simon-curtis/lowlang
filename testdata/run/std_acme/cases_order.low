@@ -1,0 +1,136 @@
+import std/acme
+import std/cancel
+import std/crypto/hash
+import std/crypto/x509
+import std/http
+import std/io
+import std/net
+import std/text
+import std/time/clock
+import std/time/duration
+import std/time/timestamp
+
+fn fresh_account(c: *acme.Client) -> acme.Account ! io.Error {
+    let key = x509.generate_private_key(x509.KeyType.P256)?
+    acme.new_account(c, key, acme.AccountRequest { terms_agreed: true }) catch { _ => fail Refused }
+}
+
+fn identifiers_of(names: []str) -> []acme.Identifier {
+    var out: []acme.Identifier = []
+    for name in names {
+        push(mut out, acme.identifier(name))
+    }
+    out
+}
+
+fn leaf_text(chain: acme.Chain) -> str {
+    let leaf = x509.parse(chain.certificates[0]) catch { _ => return "unparsable" }
+    var names = leaf.dns_names
+    for ip in leaf.ip_addresses {
+        push(mut names, net.format_ip(ip))
+    }
+    "names=[{text.join(names, ",")}] days={(leaf.not_after - leaf.not_before) / 86400} aki={leaf.authority_key_id.len} chain={chain.certificates.len} alternates={chain.alternates.len}"
+}
+
+fn solvers_for(rig: Rig, methods: []str) -> acme.Solvers {
+    acme.Solvers { challenges: rig.solvers.challenges, dns: rig.solvers.dns, methods }
+}
+
+fn obtain_text(rig: Rig, c: *acme.Client, a: acme.Account, names: []str, methods: []str) -> str {
+    let key = x509.generate_private_key(x509.KeyType.P256) catch { _ => return "key failed" }
+    let request = acme.OrderRequest { identifiers: identifiers_of(names) }
+    let issued = acme.obtain(c, a, request, key, solvers_for(rig, methods)) catch { e => return acme.describe(e) }
+    "order {issued.order.status} {leaf_text(issued.chain)}"
+}
+
+fn log_since(f: *Fake, from: i64) -> str {
+    var lines: []str = []
+    for i in from..f.log.len {
+        push(mut lines, f.log[i])
+    }
+    text.join(lines, "; ")
+}
+
+fn sleeps_text(rig: Rig, from: i64) -> str {
+    let all = clock.sleeps(rig.clk)
+    var parts: []str = []
+    for i in from..all.len {
+        push(mut parts, "{duration.to_string(all[i])}")
+    }
+    text.join(parts, " ")
+}
+
+fn method_cases(rig: Rig, c: *acme.Client, a: acme.Account) {
+    for method in ["http-01", "dns-01", "tls-alpn-01"] {
+        let from = rig.fake.log.len
+        let result = obtain_text(rig, c, a, ["{method}.example.test"], [method])
+        show("obtain with {method}", result)
+        show("  server log", log_since(rig.fake, from))
+    }
+    let preference = rig.fake.log.len
+    show("obtain with the default preference", obtain_text(rig, c, a, ["default.example.test"], ["http-01", "tls-alpn-01", "dns-01"]))
+    show("  server log", log_since(rig.fake, preference))
+    show("dns records after the orders", "{rig.fake.records.len}")
+    show("tokens left in the responder", "{served_tokens(rig)}")
+}
+
+fn name_cases(rig: Rig, c: *acme.Client, a: acme.Account) {
+    var from = rig.fake.log.len
+    show("obtain for an IPv4 address with http-01", obtain_text(rig, c, a, ["127.0.0.1"], ["http-01"]))
+    show("  server log", log_since(rig.fake, from))
+    from = rig.fake.log.len
+    show("obtain for an IPv4 address with tls-alpn-01", obtain_text(rig, c, a, ["127.0.0.1"], ["tls-alpn-01"]))
+    show("  server log", log_since(rig.fake, from))
+    from = rig.fake.log.len
+    show("obtain for a wildcard and its base", obtain_text(rig, c, a, ["*.wild.example.test", "wild.example.test"], ["http-01", "dns-01"]))
+    show("  server log", log_since(rig.fake, from))
+    from = rig.fake.log.len
+    show("obtain for three names", obtain_text(rig, c, a, ["m1.example.test", "m2.example.test", "m3.example.test"], ["http-01", "tls-alpn-01"]))
+    show("  server log", log_since(rig.fake, from))
+    show("obtain for no names", obtain_text(rig, c, a, [], ["http-01"]))
+}
+
+fn polling_cases(rig: Rig, c: *acme.Client, a: acme.Account) {
+    rig.fake.authz_polls = 2
+    rig.fake.order_polls = 1
+    rig.fake.retry_after = "3"
+    var from = clock.sleeps(rig.clk).len
+    show("obtain with Retry-After seconds", obtain_text(rig, c, a, ["poll.example.test"], ["http-01"]))
+    show("  waits", sleeps_text(rig, from))
+    let now = timestamp.unix_seconds(clock.now(clock.clock(rig.clk)))
+    let at = timestamp.from_unix(now + 10) or return
+    rig.fake.retry_after = timestamp.to_http_date(at)
+    from = clock.sleeps(rig.clk).len
+    show("obtain with a Retry-After date", obtain_text(rig, c, a, ["date.example.test"], ["http-01"]))
+    show("  waits", sleeps_text(rig, from))
+    rig.fake.retry_after = ""
+    from = clock.sleeps(rig.clk).len
+    show("obtain with no Retry-After", obtain_text(rig, c, a, ["plain.example.test"], ["http-01"]))
+    show("  waits", sleeps_text(rig, from))
+    rig.fake.retry_after = "400"
+    from = clock.sleeps(rig.clk).len
+    show("obtain past the poll timeout", obtain_text(rig, c, a, ["slow.example.test"], ["http-01"]))
+    show("  waits", sleeps_text(rig, from))
+    rig.fake.retry_after = ""
+    rig.fake.authz_polls = 0
+    rig.fake.order_polls = 0
+}
+
+fn failure_cases(rig: Rig, c: *acme.Client, a: acme.Account) {
+    push(mut rig.fake.unauthorized, "bad.example.test")
+    show("obtain for a name the server cannot validate", obtain_text(rig, c, a, ["bad.example.test"], ["http-01"]))
+    show("obtain with one bad name of two", obtain_text(rig, c, a, ["good.example.test", "bad.example.test"], ["http-01"]))
+    show("tokens left after the failures", "{served_tokens(rig)}")
+    rig.fake.unauthorized = []
+    let challenges_only = acme.Solvers { challenges: rig.solvers.challenges, dns: none, methods: ["dns-01"] }
+    show("obtain with dns-01 and no dns solver", obtain_with(c, a, ["nodns.example.test"], challenges_only))
+    let without = acme.Solvers { challenges: none, dns: none }
+    show("obtain with no solvers", obtain_with(c, a, ["nosolver.example.test"], without))
+}
+
+fn obtain_with(c: *acme.Client, a: acme.Account, names: []str, solvers: acme.Solvers) -> str {
+    let key = x509.generate_private_key(x509.KeyType.P256) catch { _ => return "key failed" }
+    let request = acme.OrderRequest { identifiers: identifiers_of(names) }
+    let issued = acme.obtain(c, a, request, key, solvers) catch { e => return acme.describe(e) }
+    "order {issued.order.status}"
+}

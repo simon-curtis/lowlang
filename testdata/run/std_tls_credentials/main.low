@@ -1,0 +1,191 @@
+import std/crypto/x509
+import std/io
+import std/net
+import std/sync
+import std/text
+import std/tls
+
+struct Issuer {
+    key: x509.PrivateKey
+    certificate: x509.Certificate
+}
+
+struct Holder {
+    lock: sync.Mutex
+    current: tls.Credentials
+    hellos: []str
+    names: []str
+    forced: str
+}
+
+struct Target {
+    addr: net.Addr
+    roots: []x509.Certificate
+    version: i64
+    kind: str
+}
+
+fn issuer() -> Issuer ! io.Error {
+    let key = x509.generate_private_key(x509.KeyType.P256)?
+    let constraints = x509.Extension { id: "2.5.29.19", critical: true, value: [0x30, 0x03, 0x01, 0x01, 0xFF] }
+    let template = x509.Template {
+        serial: [1], subject: "Credentials CA", not_before: 1767225600, not_after: 4102444800, extensions: [constraints],
+    }
+    let der = x509.create_self_signed(template, key)?
+    let certificate = x509.parse(der)?
+    Issuer { key, certificate }
+}
+
+fn leaf(ca: Issuer, kind: x509.KeyType, name: str, serial: u8) -> tls.Credentials ! io.Error {
+    let key = x509.generate_private_key(kind)?
+    let template = x509.Template {
+        serial: [serial], subject: "leaf {serial}", not_before: 1767225600, not_after: 4102444800, dns_names: [name],
+    }
+    let public = x509.public_key_info(key)?
+    let der = x509.create_certificate(template, public, ca.key, ca.certificate.subject)?
+    tls.Credentials { certificates: [der], key: some(key) }
+}
+
+fn choose(holder: *Holder, info: tls.HelloInfo) -> tls.Credentials {
+    sync.lock(holder.lock)
+    let protocols = text.join(info.protocols, ",")
+    push(mut holder.hellos, "name={info.server_name} protocols=[{protocols}]")
+    var out = holder.current
+    out.protocol = holder.forced
+    let known = holder.names.len == 0 || holder.names[0] == info.server_name
+    sync.unlock(holder.lock)
+    if !known {
+        return tls.Credentials {}
+    }
+    out
+}
+
+fn replace(holder: *Holder, next: tls.Credentials) {
+    sync.lock(holder.lock)
+    holder.current = next
+    sync.unlock(holder.lock)
+}
+
+fn handle(h: net.ConnHandle, config: tls.Config) {
+    using c = net.adopt(h)
+    using t = tls.server(net.stream(c), config) or return
+    let s = tls.stream(t)
+    let line = io.read_line(io.reader(s)) or "?"
+    io.write_str(s, "{line} back\n") or {}
+    tls.close(t)
+}
+
+fn acceptor(l: net.ListenerHandle, config: tls.Config) {
+    for true {
+        let h = net.accept_handle(l) or return
+        spawn handle(h, config)
+    }
+}
+
+fn version_text(v: i64) -> str {
+    match v {
+        0x0304 => "1.3"
+        0x0303 => "1.2"
+        _ => "other"
+    }
+}
+
+fn client_config(target: Target, name: str, alpn: []str) -> tls.Config {
+    var config = tls.Config { server_name: name, roots: target.roots, alpn }
+    if target.version == 12 {
+        config.max_version = tls.tls12
+    } else {
+        config.min_version = tls.tls13
+    }
+    config
+}
+
+fn connect(target: Target, name: str, alpn: []str) -> str {
+    let config = client_config(target, name, alpn)
+    using c = net.connect(target.addr) or return "connect failed"
+    using t = tls.client(net.stream(c), config) catch {
+        Invalid => return "rejected"
+        Unsupported => return "unsupported"
+        Malformed => return "malformed"
+        _ => return "failed"
+    }
+    let s = tls.stream(t)
+    io.write_str(s, "hello\n") or return "write failed"
+    let reply = io.read_line(io.reader(s)) or "no reply"
+    let leaf = t.handle.peer_certificates[0]
+    tls.close(t)
+    let version = version_text(t.handle.version)
+    "{leaf.common_name} tls={version} alpn=[{t.handle.protocol}] [{reply}]"
+}
+
+fn show(label: str, target: Target, name: str, alpn: []str) {
+    let result = connect(target, name, alpn)
+    print("tls {target.version} {target.kind} {label}: {result}")
+}
+
+fn server_config(holder: *Holder) -> tls.Config {
+    let source = tls.CredentialSource { choose: fn(info: tls.HelloInfo) -> tls.Credentials { choose(holder, info) } }
+    tls.Config { credentials: some(source), alpn: ["h2", "http/1.1"] }
+}
+
+fn swapping(ca: Issuer, version: i64, kind: x509.KeyType, kind_name: str) ! io.Error {
+    let first = leaf(ca, kind, "swap.test", 11)?
+    let second = leaf(ca, kind, "swap.test", 12)?
+    let holder = new(Holder { lock: sync.mutex(), current: first, hellos: [], names: [], forced: "" })
+    using l = net.listen("127.0.0.1", 0)?
+    spawn acceptor(l.handle, server_config(holder))
+    let target = Target { addr: l.handle.addr, roots: [ca.certificate], version, kind: kind_name }
+    show("first", target, "swap.test", ["http/1.1"])
+    replace(holder, second)
+    show("swapped", target, "swap.test", ["http/1.1"])
+    replace(holder, first)
+    show("swapped back", target, "swap.test", ["h2"])
+    show("no alpn", target, "swap.test", [])
+    holder.forced = "acme-tls/1"
+    show("forced offered", target, "swap.test", ["acme-tls/1", "h2"])
+    show("forced not offered", target, "swap.test", ["h2"])
+    show("forced without alpn", target, "swap.test", [])
+    holder.forced = ""
+    holder.names = ["swap.test"]
+    show("unknown name", target, "other.test", [])
+    show("known name", target, "swap.test", [])
+    for h in holder.hellos {
+        print("tls {version} {kind_name} hello {h}")
+    }
+    net.close_listener(l)
+}
+
+fn refusal(ca: Issuer, label: str, source: tls.CredentialSource) ! io.Error {
+    let config = tls.Config { credentials: some(source) }
+    using l = net.listen("127.0.0.1", 0)?
+    spawn acceptor(l.handle, config)
+    let target = Target { addr: l.handle.addr, roots: [ca.certificate], version: 13, kind: "-" }
+    show(label, target, "swap.test", [])
+    net.close_listener(l)
+}
+
+fn static_fields(ca: Issuer) ! io.Error {
+    let credentials = leaf(ca, x509.KeyType.P256, "static.test", 21)?
+    let config = tls.Config { certificates: credentials.certificates, key: credentials.key }
+    using l = net.listen("127.0.0.1", 0)?
+    spawn acceptor(l.handle, config)
+    for version in [12, 13] {
+        let target = Target { addr: l.handle.addr, roots: [ca.certificate], version, kind: "p256" }
+        show("static fields", target, "static.test", [])
+    }
+    net.close_listener(l)
+}
+
+fn main() ! io.Error {
+    let ca = issuer()?
+    swapping(ca, 13, x509.KeyType.P256, "p256")?
+    swapping(ca, 12, x509.KeyType.P256, "p256")?
+    swapping(ca, 13, x509.KeyType.Ed25519, "ed25519")?
+    swapping(ca, 12, x509.KeyType.P384, "p384")?
+    let nothing = tls.CredentialSource { choose: fn(info: tls.HelloInfo) -> tls.Credentials { tls.Credentials {} } }
+    refusal(ca, "no credentials", nothing)?
+    let key = ca.key
+    let empty = tls.CredentialSource { choose: fn(info: tls.HelloInfo) -> tls.Credentials { tls.Credentials { key: some(key) } } }
+    refusal(ca, "empty chain", empty)?
+    static_fields(ca)?
+}

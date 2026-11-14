@@ -1,0 +1,228 @@
+import std/base64
+import std/crypto/x509
+import std/json
+import std/net
+import std/text
+import std/time/timestamp
+
+/// How `obtain` proves control of the names in an order.
+pub struct Solvers {
+    /// The responses that the HTTP-01 and TLS-ALPN-01 solvers put in place, which a server of the caller serves through `http01_handler` and `tls_alpn_source`. `none` disables both.
+    pub challenges: Challenges? = none
+    /// The DNS-01 solver, or `none` to disable it. It is the only way to prove a wildcard name.
+    pub dns: DnsRecords? = none
+    /// The challenge types to try, most preferred first. Defaults to `http-01`, `tls-alpn-01` and `dns-01`. A type is used only when the matching solver is set.
+    pub methods: []str = ["http-01", "tls-alpn-01", "dns-01"]
+}
+
+/// A certificate that `obtain` issued.
+pub struct Issued {
+    /// The finalized order.
+    pub order: Order
+    /// The downloaded chain, leaf first.
+    pub chain: Chain
+    /// The private key of the leaf certificate.
+    pub key: x509.PrivateKey
+}
+
+fn available(solvers: Solvers, kind: str) -> bool {
+    let served = match solvers.challenges {
+        some(_) => true
+        none => false
+    }
+    let published = match solvers.dns {
+        some(_) => true
+        none => false
+    }
+    match kind {
+        "http-01" => served
+        "tls-alpn-01" => served
+        "dns-01" => published
+        _ => false
+    }
+}
+
+fn pick(solvers: Solvers, authz: Authorization) -> Challenge? {
+    for kind in solvers.methods {
+        if !available(solvers, kind) || (authz.wildcard && kind != "dns-01") {
+            continue
+        }
+        for ch in authz.challenges {
+            if ch.kind == kind && ch.status == "pending" {
+                return ch
+            }
+        }
+    }
+    none
+}
+
+fn offered(authz: Authorization) -> str {
+    var kinds: []str = []
+    for ch in authz.challenges {
+        push(mut kinds, ch.kind)
+    }
+    text.join(kinds, ", ")
+}
+
+fn present(c: *Client, solvers: Solvers, authz: Authorization, ch: Challenge, authorization: str) ! Error {
+    match ch.kind {
+        "http-01" => {
+            let store = solvers.challenges ?? challenges()
+            put_token(store, ch.token, authorization)
+        }
+        "tls-alpn-01" => {
+            let store = solvers.challenges ?? challenges()
+            let now = timestamp.unix_seconds(c.options.clock.read())
+            let credentials = tls_alpn_credentials(authz.identifier, authorization, now)?
+            put_certificate(store, tls_alpn_server_name(authz.identifier), credentials)
+        }
+        _ => {
+            let records = match solvers.dns {
+                some(r) => r
+                none => fail Unsupported("no DNS solver")
+            }
+            let name = dns01_name(authz.identifier.value)
+            records.publish(name, dns01_value(authorization)) catch { e => fail Solver(e) }
+        }
+    }
+}
+
+fn withdraw(solvers: Solvers, authz: Authorization, ch: Challenge, authorization: str) {
+    match ch.kind {
+        "http-01" => {
+            match solvers.challenges {
+                some(store) => drop_token(store, ch.token)
+                none => {}
+            }
+        }
+        "tls-alpn-01" => {
+            match solvers.challenges {
+                some(store) => drop_certificate(store, tls_alpn_server_name(authz.identifier))
+                none => {}
+            }
+        }
+        _ => {
+            match solvers.dns {
+                some(records) => {
+                    let name = dns01_name(authz.identifier.value)
+                    records.remove(name, dns01_value(authorization)) catch { _ => {} }
+                }
+                none => {}
+            }
+        }
+    }
+}
+
+fn prove(c: *Client, a: Account, solvers: Solvers, authz: Authorization) ! Error {
+    let ch = match pick(solvers, authz) {
+        some(found) => found
+        none => fail Unsupported("no usable challenge for {authz.identifier.value}; the server offers {offered(authz)}")
+    }
+    let authorization = key_authorization(ch, a.key)
+    present(c, solvers, authz, ch, authorization) catch {
+        e => {
+            withdraw(solvers, authz, ch, authorization)
+            fail e
+        }
+    }
+    let _ = respond(c, a, ch) catch {
+        e => {
+            withdraw(solvers, authz, ch, authorization)
+            fail e
+        }
+    }
+    let _ = wait_authorization(c, a, authz.url) catch {
+        e => {
+            withdraw(solvers, authz, ch, authorization)
+            fail e
+        }
+    }
+    withdraw(solvers, authz, ch, authorization)
+}
+
+struct Names {
+    dns: []str
+    ips: [][]u8
+}
+
+fn request_names(request: OrderRequest) -> Names ! Error {
+    var dns: []str = []
+    var ips: [][]u8 = []
+    for i in request.identifiers {
+        if i.kind == "ip" {
+            let raw = net.parse_ip(i.value) catch { _ => fail Unsupported("{i.value} is not an IP address") }
+            push(mut ips, raw)
+        } else {
+            push(mut dns, i.value)
+        }
+    }
+    Names { dns, ips }
+}
+
+fn subject_for(names: Names) -> str {
+    if names.dns.len > 0 && names.dns[0].len <= 64 {
+        return names.dns[0]
+    }
+    ""
+}
+
+/// Returns the DER certification request for `request.identifiers` signed by `key`, as `obtain` sends it.
+///
+/// The subject is the first DNS name when it is at most 64 bytes, and empty otherwise; every name is in the subject alternative name.
+pub fn csr_for(request: OrderRequest, key: x509.PrivateKey) -> []u8 ! Error {
+    let names = request_names(request)?
+    x509.create_request(key, subject_for(names), names.dns, names.ips) catch { e => fail crypto_failure(e) }
+}
+
+/// Orders a certificate for `request.identifiers`, proves control of each name with `solvers` and returns the issued certificate.
+///
+/// `key` is the private key of the certificate, as `x509.generate_private_key` makes one; it is not the account key. For each authorization that is not already `valid` it picks the first of `solvers.methods` that the server offers and a solver exists for, puts the response in place, tells the server, waits for the validation and takes the response away again, also when the validation fails. It then finalizes with a request for `key`, waits for the order to become `valid` and downloads the chain.
+///
+/// Fails with `Unsupported` when no offered challenge has a solver, with `Rejected` or `OrderFailed` when the server refuses, with `Solver` when a DNS function fails, with `Timeout` when a wait exceeds `Options.poll_timeout` and with the other variants of `Error` for transport and protocol failures.
+pub fn obtain(c: *Client, a: Account, request: OrderRequest, key: x509.PrivateKey, solvers: Solvers) -> Issued ! Error {
+    let csr = csr_for(request, key)?
+    let placed = new_order(c, a, request)?
+    for url in placed.authorizations {
+        let authz = get_authorization(c, a, url)?
+        if authz.status != "valid" {
+            prove(c, a, solvers, authz)?
+        }
+    }
+    let ready = wait_order(c, a, placed.url, "ready")?
+    var current = ready
+    if ready.status != "valid" {
+        let sent = finalize(c, a, ready, csr)?
+        current = wait_order(c, a, sent.url, "valid")?
+    }
+    if current.certificate.len == 0 {
+        fail Protocol("the valid order has no certificate URL")
+    }
+    let chain = download_chain(c, a, current.certificate)?
+    Issued { order: current, chain, key }
+}
+
+/// Revokes `certificate`, a DER certificate, with a request signed by account `a` (RFC 8555 section 7.6).
+///
+/// `reason` is the RFC 5280 `CRLReason` code, or `-1` to send none. Fails with `Server` of kind `AlreadyRevoked`, `Unauthorized` or `BadRevocationReason` when the server refuses.
+pub fn revoke(c: *Client, a: Account, certificate: []u8, reason: i64) ! Error {
+    let signer = account_signer(a)
+    let payload = revocation_value(certificate, reason)
+    let _ = post_json(c, c.directory.revoke_cert, signer, payload)?
+}
+
+/// Revokes `certificate`, a DER certificate, with a request signed by the certificate's own private key `key`, which needs no account.
+///
+/// `reason` and the failures are as for `revoke`.
+pub fn revoke_with_key(c: *Client, key: x509.PrivateKey, certificate: []u8, reason: i64) ! Error {
+    let signer = Signer { key, kid: "" }
+    let payload = revocation_value(certificate, reason)
+    let _ = post_json(c, c.directory.revoke_cert, signer, payload)?
+}
+
+fn revocation_value(certificate: []u8, reason: i64) -> json.Value {
+    var members: []json.Member = [json.text_member("certificate", base64.encode_url(certificate))]
+    if reason >= 0 {
+        push(mut members, json.int_member("reason", reason))
+    }
+    json.object_value(members)
+}

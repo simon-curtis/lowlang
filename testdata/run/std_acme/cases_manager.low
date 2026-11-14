@@ -1,0 +1,258 @@
+import std/acme
+import std/crypto/hash
+import std/crypto/x509
+import std/io
+import std/retry
+import std/text
+import std/time/clock
+import std/time/duration
+import std/time/timestamp
+import std/tls
+
+struct Seen {
+    lines: []str
+}
+
+fn event_text(ev: acme.Event) -> str {
+    match ev {
+        Obtained(names, reason) => "obtained {text.join(names, "+")} {reason}"
+        Failed(names, error) => "failed {text.join(names, "+")}: {acme.describe(error)}"
+    }
+}
+
+fn recorder(seen: *Seen) -> fn(acme.Event) {
+    fn(ev: acme.Event) {
+        push(mut seen.lines, event_text(ev))
+    }
+}
+
+fn take(seen: *Seen) -> str {
+    let joined = text.join(seen.lines, "; ")
+    seen.lines = []
+    if joined.len == 0 { "no events" } else { joined }
+}
+
+fn unix(rig: Rig) -> i64 {
+    timestamp.unix_seconds(clock.now(clock.clock(rig.clk)))
+}
+
+fn config_for(rig: Rig, c: *acme.Client, names: [][]str, seen: *Seen) -> acme.ManagerConfig {
+    acme.ManagerConfig {
+        client: c,
+        store: acme.memory_store(),
+        names,
+        solvers: rig.solvers,
+        terms_agreed: true,
+        backoff: retry.Policy { attempts: 4, base: duration.seconds(1), max_delay: duration.minutes(5), jitter: retry.Jitter.None },
+        observer: some(recorder(seen)),
+    }
+}
+
+fn make(config: acme.ManagerConfig) -> *acme.Manager ! io.Error {
+    acme.manager(config) catch { _ => fail Refused }
+}
+
+fn pass(m: *acme.Manager) -> str {
+    let wait = acme.run_once(m)
+    "next in {duration.floor_seconds(wait)}s"
+}
+
+fn pass_seconds(rig: Rig, m: *acme.Manager, by: i64) -> str {
+    clock.advance(rig.clk, duration.seconds(by))
+    pass(m)
+}
+
+fn status_text(rig: Rig, m: *acme.Manager, lifetime: i64) -> str {
+    let now = unix(rig)
+    var parts: []str = []
+    for s in acme.status(m) {
+        let renew = if s.issued { "renew_after={s.renew_at - (s.not_after - lifetime)}s renew_in={s.renew_at - now}s" } else { "no certificate" }
+        let failure = if s.last_error.len > 0 { " error=\"{s.last_error}\"" } else { "" }
+        push(mut parts, "[{text.join(s.names, "+")}] issued={s.issued} {renew}{failure}")
+    }
+    text.join(parts, " ")
+}
+
+fn served_der(m: *acme.Manager, name: str) -> []u8 {
+    let creds = acme.source(m).choose(tls.HelloInfo { server_name: name, protocols: [] })
+    if creds.certificates.len == 0 {
+        return []
+    }
+    creds.certificates[0]
+}
+
+fn served_text(m: *acme.Manager, name: str) -> str {
+    let der = served_der(m, name)
+    if der.len == 0 {
+        return "refused"
+    }
+    let leaf = x509.parse(der) catch { _ => return "unparsable" }
+    "names=[{text.join(leaf.dns_names, ",")}] lifetime={leaf.not_after - leaf.not_before}s"
+}
+
+fn log_matching(f: *Fake, from: i64, needle: str) -> str {
+    var lines: []str = []
+    for i in from..f.log.len {
+        if text.contains(f.log[i], needle) {
+            push(mut lines, f.log[i])
+        }
+    }
+    text.join(lines, "; ")
+}
+
+fn scheduled_cases(rig: Rig, plain: *acme.Client) ! io.Error {
+    rig.fake.cert_seconds = 1000
+    let seen = new(Seen { lines: [] })
+    let m = make(config_for(rig, plain, [["sched.example.test"]], seen))?
+    show("manager before the first pass", status_text(rig, m, 1000))
+    show("  served", served_text(m, "sched.example.test"))
+    let from = rig.fake.log.len
+    show("first pass", pass(m))
+    show("  events", take(seen))
+    show("  status", status_text(rig, m, 1000))
+    show("  served", served_text(m, "sched.example.test"))
+    show("  order", log_matching(rig.fake, from, "replaces="))
+    let first = served_der(m, "sched.example.test")
+    show("second pass", pass(m))
+    show("  events", take(seen))
+    show("pass 600 seconds later", pass_seconds(rig, m, 600))
+    show("  events", take(seen))
+    show("  same certificate", yes(hash.equal(first, served_der(m, "sched.example.test"))))
+    let renewal = rig.fake.log.len
+    show("pass 100 seconds later", pass_seconds(rig, m, 100))
+    show("  events", take(seen))
+    show("  new certificate", yes(!hash.equal(first, served_der(m, "sched.example.test"))))
+    show("  order", log_matching(rig.fake, renewal, "replaces="))
+    show("  status", status_text(rig, m, 1000))
+}
+
+fn lookup_cases(rig: Rig, plain: *acme.Client) ! io.Error {
+    rig.fake.cert_seconds = 7776000
+    let seen = new(Seen { lines: [] })
+    let names = [["a.lookup.example.test", "b.lookup.example.test"], ["*.wild.example.test", "wild.example.test"]]
+    let m = make(config_for(rig, plain, names, seen))?
+    show("lookup before issuance", served_text(m, "a.lookup.example.test"))
+    show("lookup without a name before issuance", served_text(m, ""))
+    show("first pass", pass(m))
+    show("  events", take(seen))
+    for name in ["a.lookup.example.test", "B.LOOKUP.example.test", "wild.example.test", "x.wild.example.test", "X.Wild.Example.Test", "deep.x.wild.example.test", "", "unknown.example.test", "lookup.example.test"] {
+        show("lookup of \"{name}\"", served_text(m, name))
+    }
+    show("status", status_text(rig, m, 7776000))
+    let none = acme.ManagerConfig { client: plain, store: acme.memory_store(), names: [], solvers: rig.solvers, terms_agreed: true }
+    let empty = make(none)?
+    show("manager without names", "{pass(empty)} statuses={acme.status(empty).len}")
+}
+
+fn ari_cases(rig: Rig) ! io.Error {
+    rig.fake.ari = true
+    let aware = client_for(rig)?
+    rig.fake.cert_seconds = 1000
+    let seen = new(Seen { lines: [] })
+    let t0 = unix(rig)
+    rig.fake.window_start = t0 + 300
+    rig.fake.window_end = t0 + 300
+    rig.fake.ari_retry = 50
+    let m = make(config_for(rig, aware, [["ari.example.test"]], seen))?
+    show("ari first pass", pass(m))
+    show("  events", take(seen))
+    show("  status", status_text(rig, m, 1000))
+    show("ari pass 50 seconds later", pass_seconds(rig, m, 50))
+    show("  events", take(seen))
+    show("ari pass 249 seconds later", pass_seconds(rig, m, 249))
+    show("  events", take(seen))
+    let before = served_der(m, "ari.example.test")
+    let expected = acme.renewal_id(before) catch { _ => fail Refused }
+    let from = rig.fake.log.len
+    show("ari pass 1 second later", pass_seconds(rig, m, 1))
+    show("  events", take(seen))
+    show("  order replaces the old certificate", yes(text.contains(log_matching(rig.fake, from, "replaces="), "replaces={expected}")))
+    show("  window that ends before the new certificate is ignored", status_text(rig, m, 1000))
+
+    let t1 = unix(rig)
+    rig.fake.window_start = t1 + 5000
+    rig.fake.window_end = t1 + 5000
+    let steady = make(config_for(rig, aware, [["ari2.example.test"]], seen))?
+    show("second manager first pass", pass(steady))
+    let planned = acme.status(steady)[0].renew_at
+    show("  renew_in", "{planned - unix(rig)}s")
+    rig.fake.ari = false
+    show("pass after the server stopped answering", pass_seconds(rig, steady, 60))
+    show("  renew_at kept", yes(acme.status(steady)[0].renew_at == planned))
+    rig.fake.ari = true
+    let t2 = unix(rig)
+    rig.fake.window_start = t2 + 9000
+    rig.fake.window_end = t2 + 9000
+    show("pass 60 seconds after the window moved", pass_seconds(rig, steady, 60))
+    show("  renew_at unchanged", yes(acme.status(steady)[0].renew_at == planned))
+    show("pass 3600 seconds after the window moved", pass_seconds(rig, steady, 3600))
+    show("  renew_at moved to the new window", yes(acme.status(steady)[0].renew_at == t2 + 9000))
+    show("  events", take(seen))
+
+    rig.fake.ari = false
+    let blind = make(config_for(rig, aware, [["ari3.example.test"]], seen))?
+    show("manager that never got a window", pass(blind))
+    show("  status", status_text(rig, blind, 1000))
+    rig.fake.ari = true
+
+    var off = config_for(rig, aware, [["ari4.example.test"]], seen)
+    off.use_ari = false
+    let ignoring = make(off)?
+    show("manager with use_ari off", pass(ignoring))
+    show("  status", status_text(rig, ignoring, 1000))
+    rig.fake.ari = false
+    rig.fake.ari_retry = 0
+    show("  events", take(seen))
+}
+
+fn forced_cases(rig: Rig) ! io.Error {
+    rig.fake.ari = true
+    let aware = client_for(rig)?
+    rig.fake.cert_seconds = 100000
+    let seen = new(Seen { lines: [] })
+    let t0 = unix(rig)
+    rig.fake.window_start = t0 + 50000
+    rig.fake.window_end = t0 + 50000
+    rig.fake.ari_retry = 0
+    let m = make(config_for(rig, aware, [["forced.example.test"]], seen))?
+    show("forced first pass", pass(m))
+    show("  events", take(seen))
+    acme.renew_now(m)
+    show("renew_now then a pass", pass(m))
+    show("  events", take(seen))
+    clock.advance(rig.clk, duration.seconds(3600))
+    acme.renew_now(m)
+    show("renew_now when the window check is due", pass(m))
+    show("  events", take(seen))
+    show("  status", status_text(rig, m, 100000))
+    rig.fake.ari = false
+    rig.fake.cert_seconds = 7776000
+}
+
+fn manager_failure_cases(rig: Rig, plain: *acme.Client) ! io.Error {
+    rig.fake.cert_seconds = 7776000
+    let seen = new(Seen { lines: [] })
+    push(mut rig.fake.refused, "refused.example.test")
+    let m = make(config_for(rig, plain, [["refused.example.test"]], seen))?
+    let from = clock.sleeps(rig.clk).len
+    show("failing first pass", pass(m))
+    show("  events", take(seen))
+    show("  waits", sleeps_text(rig, from))
+    show("  status", status_text(rig, m, 7776000))
+    show("pass right after", pass(m))
+    show("  events", take(seen))
+    rig.fake.refused = []
+    show("pass while the pause lasts", pass_seconds(rig, m, 1800))
+    show("  events", take(seen))
+    show("pass when the pause is over", pass_seconds(rig, m, 1800))
+    show("  events", take(seen))
+    show("  status", status_text(rig, m, 7776000))
+    push(mut rig.fake.refused, "again.example.test")
+    let other = make(config_for(rig, plain, [["again.example.test"]], seen))?
+    show("pass of a second failing certificate", pass(other))
+    show("  events", take(seen))
+    acme.renew_now(other)
+    rig.fake.refused = []
+    show("renew_now clears the pause", pass(other))
+    show("  events", take(seen))
+}
