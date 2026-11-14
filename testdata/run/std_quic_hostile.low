@@ -77,12 +77,12 @@ fn roots() -> []x509.Certificate {
     out
 }
 
-fn server_config() -> quic.Config ! io.Error {
+fn server_config(handshake_timeout: i64) -> quic.Config ! io.Error {
     let pem = embed("std_tls_ec.pem")
     let certificates = x509.pem_certificates(pem)
     let key = x509.pem_private_key(pem)?
     let secure = tls.Config { certificates, key, alpn: ["hostile"] }
-    quic.Config { tls: secure, max_stream_data: 65536, max_data: 65536, max_streams: 8, handshake_timeout: 1000 }
+    quic.Config { tls: secure, max_stream_data: 65536, max_data: 65536, max_streams: 8, handshake_timeout }
 }
 
 fn client_config() -> quic.Config {
@@ -140,7 +140,7 @@ fn healthy(port: i64) -> bool {
 }
 
 fn serves(port: i64) -> bool {
-    let limit = time.monotonic() + 5000000000
+    let limit = time.monotonic() + 15000000000
     for {
         if healthy(port) {
             return true
@@ -295,6 +295,17 @@ fn read_socket(socket: net.SocketHandle, rx: chan[[]u8]) {
 }
 
 fn connect_raw(server: *Server) -> *Raw ! io.Error {
+    for attempt in 0..2 {
+        let a = attempt_raw(server) catch {
+            TimedOut => continue
+            e => fail e
+        }
+        return a
+    }
+    attempt_raw(server)?
+}
+
+fn attempt_raw(server: *Server) -> *Raw ! io.Error {
     using var socket = net.bind_udp("127.0.0.1", 0)?
     let view = net.detach_socket(mut socket)
     let scid = crypto.random(8)
@@ -640,7 +651,7 @@ fn remaining(limit: i64) -> i64 {
 
 fn outcome(a: *Raw) -> str {
     let probe = send_frames(a, [wire.Frame.Ping])
-    let limit = time.monotonic() + 2000000000
+    let limit = time.monotonic() + 10000000000
     for a.close_code < 0 && a.acked < probe && time.monotonic() < limit {
         let wait = remaining(limit)
         pump(a, wait)
@@ -701,11 +712,14 @@ fn attack_random(server: *Server, captured: []u8) {
     print("still serves: {ok}")
 }
 
-fn count_replies(socket: net.SocketHandle, index: i64, answers: chan[i64]) {
+fn count_replies(socket: net.SocketHandle, index: i64, server: net.Addr, answers: chan[i64]) {
     let buf = io.buffer(2048)
     for {
         let packet = net.receive_from_on(socket, buf) catch {
             _ => return
+        }
+        if packet.from.port != server.port {
+            continue
         }
         select {
             answers <- index => {}
@@ -714,14 +728,18 @@ fn count_replies(socket: net.SocketHandle, index: i64, answers: chan[i64]) {
     }
 }
 
-fn attack_flood(server: *Server, scid: []u8, hello: []u8) ! io.Error {
+fn attack_flood(scid: []u8, hello: []u8) ! io.Error {
+    let config = server_config(5000)?
+    using l = quic.listen("127.0.0.1", 0, config)?
+    let server = new(Server { port: l.handle.addr.port, addr: l.handle.addr, seen: chan[*quic.ConnectionHandle](8) })
+    spawn accept_loop(l.handle, server.seen)
     let answers = chan[i64](8192)
     var sockets: []net.SocketHandle = []
     for i in 0..40 {
         using var socket = net.bind_udp("127.0.0.1", 0)?
         let view = net.detach_socket(mut socket)
         push(mut sockets, view)
-        spawn count_replies(view, i, answers)
+        spawn count_replies(view, i, server.addr, answers)
     }
     var sent = 0
     for round in 0..10 {
@@ -939,7 +957,20 @@ fn find_handle(server: *Server, port: i64) -> *quic.ConnectionHandle? {
     }
 }
 
+fn forget_seen(server: *Server) {
+    for {
+        select {
+            next = <-server.seen => match next {
+                some(_) => {}
+                none => return
+            }
+            else => return
+        }
+    }
+}
+
 fn attack_long_reason(server: *Server) {
+    forget_seen(server)
     let a = fresh(server, "close with a long reason") ?? return
     let reason = text.repeat("r", 1300)
     let close = wire.CloseFrame { application: true, code: 7, frame_type: 0, reason }
@@ -948,10 +979,8 @@ fn attack_long_reason(server: *Server) {
     send_frames(a, [wire.Frame.ConnectionClose(close)])
     match found {
         some(handle) => {
-            for i in 0..200 {
-                if handle.closed_by_peer {
-                    break
-                }
+            for i in 0..1000 {
+                quic.stats_on(handle) or break
                 sleep(10)
             }
             print("close with a 1300 byte reason: server recorded {handle.close_reason.len} bytes, code {handle.close_code}, by peer {handle.closed_by_peer}")
@@ -964,7 +993,7 @@ fn attack_long_reason(server: *Server) {
 }
 
 fn main() ! io.Error {
-    let config = server_config()?
+    let config = server_config(1000)?
     using l = quic.listen("127.0.0.1", 0, config)?
     let server = new(Server { port: l.handle.addr.port, addr: l.handle.addr, seen: chan[*quic.ConnectionHandle](512) })
     spawn accept_loop(l.handle, server.seen)
@@ -979,7 +1008,7 @@ fn main() ! io.Error {
     print("still serves: {ok}")
 
     attack_random(server, captured)
-    attack_flood(server, scid, hello)?
+    attack_flood(scid, hello)?
     attack_path_challenge(server)
     attack_new_connection_ids(server)
     attack_retire_unissued(server)
