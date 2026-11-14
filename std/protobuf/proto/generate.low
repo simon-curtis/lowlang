@@ -1,0 +1,723 @@
+import std/builder
+import std/text
+import std/text/naming
+
+/// What `generate` needs besides the loaded files.
+pub struct Options {
+    /// The import path of the directory the generated files are written to, as another Low module would import it. A file `a/b.proto` becomes the module `<module>/a/b`, and a generated file that uses one of its types imports it under that path. Empty when the output directory is the project root.
+    pub module: str = ""
+}
+
+/// A generated Low source file.
+pub struct Output {
+    /// The path relative to the output directory: `a/b.proto` gives `a/b/b.low`.
+    pub path: str
+    /// The Low source text.
+    pub text: str
+}
+
+struct Names {
+    types: [str: str]
+    variants: [str: str]
+    oneofs: [str: str]
+}
+
+struct Emitter {
+    set: Set
+    file: *File
+    names: Names
+    edges: [str: []str]
+    out: builder.Builder
+    imports: [str: str]
+    aliases: [str: bool]
+    items: i64
+}
+
+/// The names `generate` never uses as a field or module name: the keywords of the language. A proto name that spells one gains a trailing `_`.
+pub fn keywords() -> []str {
+    [
+        "fn", "let", "var", "if", "else", "for", "break", "continue", "return", "true", "false", "enum", "match", "fail",
+        "catch", "or", "struct", "mut", "in", "import", "pub", "extern", "defer", "spawn", "select", "using", "drop", "const",
+    ]
+}
+
+/// Generates one Low module for each file of `set`, in the same order.
+///
+/// Every message becomes a `pub struct` and every enum and oneof a `pub enum`, all in one flat namespace per file, with the field metadata that `std/protobuf` reads written as field tags. A nested type is named after the messages around it, so `Outer.Inner` is `OuterInner`, and a oneof `choice` of a message `Scalars` is `ScalarsChoice`; two types that would share a name get a number after it. Field names stay as they are when they are already `snake_case` and go through `naming.snake` otherwise, and a keyword gains a trailing `_`. An enum value loses the enum's name as a prefix when what is left is a name, as in `COLOR_RED` in `Color`, and is then `PascalCase`.
+///
+/// A singular message field is optional. A message, or a oneof member, that takes part in a cycle of singular fields is held through `*T?`, so a recursive message needs no hand edit. A map field is `[K: V]` with the key and value encodings in its tag. A proto2 field with a `default` keeps the default as the struct field's default so the field does not record whether it was present. `packed` decides whether a repeated numeric field is packed, by the proto3 or proto2 rule of its file. `deprecated = true` becomes a `/// Deprecated.` line. A message with no fields becomes a struct with one `bool` field `empty` on field number `536870911`, because a Low struct needs a field. Services, extensions and other options are not generated.
+///
+/// Fails with `Invalid` for a default that does not fit its type or is infinite or `nan`, a required message field that is part of a cycle, and a name the output cannot spell.
+pub fn generate(set: Set, options: Options) -> []Output ! Error {
+    let names = gen_names(set)
+    let edges = gen_edges(set)
+    var outputs: []Output = []
+    for file in set.files {
+        let source = gen_file(set, file, options, names, edges)?
+        push(mut outputs, Output { path: gen_output_path(file.path), text: source })
+    }
+    outputs
+}
+
+fn gen_module_dir(path: str) -> str {
+    let stem = text.strip_suffix(path, ".proto") ?? path
+    var segments: []str = []
+    for part in text.split(stem, '/') {
+        if part == "" || part == "." || part == ".." {
+            continue
+        }
+        push(mut segments, gen_segment(part))
+    }
+    text.join(segments, "/")
+}
+
+fn gen_segment(part: str) -> str {
+    var out: []u8 = []
+    for i in 0..part.len {
+        let c = part[i]
+        let keep = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+        if keep {
+            push(mut out, c)
+        } else {
+            push(mut out, '_')
+        }
+    }
+    var name = str(out)
+    if name == "" || name[0] >= '0' && name[0] <= '9' {
+        name = "_{name}"
+    }
+    gen_escape_keyword(name)
+}
+
+fn gen_escape_keyword(name: str) -> str {
+    for keyword in keywords() {
+        if keyword == name {
+            return "{name}_"
+        }
+    }
+    name
+}
+
+fn gen_module_name(path: str) -> str {
+    let dir = gen_module_dir(path)
+    let at = text.last_index_byte(dir, '/')
+    dir[at + 1..]
+}
+
+fn gen_output_path(path: str) -> str {
+    let dir = gen_module_dir(path)
+    let name = gen_module_name(path)
+    "{dir}/{name}.low"
+}
+
+fn gen_import_path(options: Options, path: str) -> str {
+    let dir = gen_module_dir(path)
+    if options.module == "" {
+        return dir
+    }
+    if text.ends_with(options.module, "/") {
+        return "{options.module}{dir}"
+    }
+    "{options.module}/{dir}"
+}
+
+fn gen_is_snake(s: str) -> bool {
+    if s == "" || s[0] < 'a' || s[0] > 'z' {
+        return false
+    }
+    for i in 0..s.len {
+        let c = s[i]
+        if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
+            return false
+        }
+    }
+    true
+}
+
+fn gen_is_pascal(s: str) -> bool {
+    if s == "" || s[0] < 'A' || s[0] > 'Z' {
+        return false
+    }
+    for i in 0..s.len {
+        let c = s[i]
+        if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+            return false
+        }
+    }
+    true
+}
+
+fn gen_field_word(name: str) -> str {
+    var word = name
+    if !gen_is_snake(name) {
+        word = naming.snake(name)
+    }
+    if word == "" {
+        word = "field"
+    }
+    if word[0] >= '0' && word[0] <= '9' {
+        word = "f_{word}"
+    }
+    gen_escape_keyword(word)
+}
+
+fn gen_type_word(name: str) -> str {
+    var word = name
+    if !gen_is_pascal(name) {
+        word = naming.pascal(name)
+    }
+    if word == "" {
+        word = "Type"
+    }
+    if word[0] >= '0' && word[0] <= '9' {
+        word = "T{word}"
+    }
+    word
+}
+
+fn gen_unique(taken: [str: bool], base: str, separator: str) -> str {
+    var name = base
+    var n = 2
+    for check_seen(taken[name]) {
+        name = "{base}{separator}{n}"
+        n += 1
+    }
+    taken[name] = true
+    name
+}
+
+fn gen_collect_messages(m: *Message, mut out: []*Message) {
+    push(mut out, m)
+    for nested in m.messages {
+        gen_collect_messages(nested, mut out)
+    }
+}
+
+fn gen_messages(file: *File) -> []*Message {
+    var out: []*Message = []
+    for m in file.messages {
+        gen_collect_messages(m, mut out)
+    }
+    out
+}
+
+fn gen_enums(file: *File) -> []*Enum {
+    var out: []*Enum = []
+    for e in file.enums {
+        push(mut out, e)
+    }
+    for m in gen_messages(file) {
+        for e in m.enums {
+            push(mut out, e)
+        }
+    }
+    out
+}
+
+fn gen_relative(file: *File, full: str) -> str {
+    if file.package == "" {
+        return full[1..]
+    }
+    let prefix = ".{file.package}."
+    text.strip_prefix(full, prefix) ?? full
+}
+
+fn gen_type_name_of(file: *File, full: str) -> str {
+    var name = ""
+    for part in text.split(gen_relative(file, full), '.') {
+        name = "{name}{gen_type_word(part)}"
+    }
+    name
+}
+
+fn gen_names(set: Set) -> Names {
+    let names = Names { types: [:], variants: [:], oneofs: [:] }
+    for file in set.files {
+        var taken: [str: bool] = [:]
+        for m in gen_messages(file) {
+            names.types[m.full_name] = gen_unique(taken, gen_type_name_of(file, m.full_name), "")
+        }
+        for en in gen_enums(file) {
+            names.types[en.full_name] = gen_unique(taken, gen_type_name_of(file, en.full_name), "")
+            gen_name_variants(names, en)
+        }
+        for m in gen_messages(file) {
+            let owner = names.types[m.full_name] ?? m.name
+            for g in m.oneofs {
+                let name = gen_unique(taken, "{owner}{gen_type_word(g.name)}", "")
+                names.oneofs["{m.full_name}.{g.name}"] = name
+            }
+        }
+    }
+    names
+}
+
+fn gen_variant_word(name: str, number: i64) -> str {
+    let word = naming.pascal(name)
+    if word == "" || word[0] >= '0' && word[0] <= '9' {
+        return "Value{number}"
+    }
+    word
+}
+
+fn gen_name_variants(names: Names, en: *Enum) {
+    let prefix = "{naming.snake(en.name)}_"
+    var taken: [str: bool] = [:]
+    for v in en.values {
+        var word = gen_variant_word(v.name, v.number)
+        let rest = text.strip_prefix(naming.snake(v.name), prefix) ?? ""
+        if rest != "" && !(rest[0] >= '0' && rest[0] <= '9') {
+            word = gen_variant_word(rest, v.number)
+        }
+        let name = gen_unique(taken, word, "")
+        names.variants["{en.full_name}.{v.name}"] = name
+    }
+}
+
+fn gen_edges(set: Set) -> [str: []str] {
+    let edges: [str: []str] = [:]
+    for file in set.files {
+        for m in gen_messages(file) {
+            var targets: []str = []
+            for f in m.fields {
+                if f.label == Label.Repeated {
+                    continue
+                }
+                match f.type {
+                    Single(of) => match of {
+                        Message(full) => push(mut targets, full)
+                        _ => {}
+                    }
+                    Map(_, _) => {}
+                }
+            }
+            edges[m.full_name] = targets
+        }
+    }
+    edges
+}
+
+fn gen_reaches(edges: [str: []str], from: str, target: str) -> bool {
+    var seen: [str: bool] = [:]
+    var stack: []str = [from]
+    for stack.len > 0 {
+        let current = stack[stack.len - 1]
+        stack = stack[0..stack.len - 1]
+        if current == target {
+            return true
+        }
+        if check_seen(seen[current]) {
+            continue
+        }
+        seen[current] = true
+        let next = edges[current] ?? []
+        for n in next {
+            push(mut stack, n)
+        }
+    }
+    false
+}
+
+fn gen_file(set: Set, file: *File, options: Options, names: Names, edges: [str: []str]) -> str ! Error {
+    let e = new(Emitter { set, file, names, edges, out: builder.builder(), imports: [:], aliases: [:], items: 0 })
+    for en in gen_enums(file) {
+        gen_break(e)
+        gen_enum(e, en)
+    }
+    for m in gen_messages(file) {
+        gen_break(e)
+        gen_message(e, m)?
+    }
+    let body = builder.to_str(e.out)
+    var head = builder.builder()
+    for owner, alias in e.imports {
+        let path = gen_import_path(options, owner)
+        if alias == gen_module_name(owner) {
+            builder.write(mut head, "import {path}\n")
+        } else {
+            builder.write(mut head, "import {alias} = {path}\n")
+        }
+    }
+    let imports = builder.to_str(head)
+    if imports == "" {
+        return body
+    }
+    "{imports}\n{body}"
+}
+
+fn gen_break(e: *Emitter) {
+    if e.items > 0 {
+        builder.write_byte(mut e.out, '\n')
+    }
+    e.items += 1
+}
+
+fn gen_line(e: *Emitter, line: str) {
+    builder.write(mut e.out, line)
+    builder.write_byte(mut e.out, '\n')
+}
+
+fn gen_deprecated(options: []Option) -> bool {
+    for o in options {
+        if o.name == "deprecated" {
+            match o.value {
+                Bool(on) => return on
+                _ => return false
+            }
+        }
+    }
+    false
+}
+
+fn gen_alias(e: *Emitter, owner: str) -> str {
+    let known = e.imports[owner]
+    match known {
+        some(alias) => return alias
+        none => {}
+    }
+    let alias = gen_unique(e.aliases, gen_module_name(owner), "")
+    e.imports[owner] = alias
+    alias
+}
+
+fn gen_type_ref(e: *Emitter, full: str) -> str {
+    let name = e.names.types[full] ?? full
+    let owner = e.set.owners[full] ?? e.file.path
+    if owner == e.file.path {
+        return name
+    }
+    let alias = gen_alias(e, owner)
+    "{alias}.{name}"
+}
+
+fn gen_enum(e: *Emitter, en: *Enum) {
+    let name = e.names.types[en.full_name] ?? en.name
+    if gen_deprecated(en.options) {
+        gen_line(e, "/// Deprecated.")
+    }
+    gen_line(e, "pub enum {name} {{")
+    for v in en.values {
+        let variant = e.names.variants["{en.full_name}.{v.name}"] ?? v.name
+        if gen_deprecated(v.options) {
+            gen_line(e, "    /// Deprecated.")
+        }
+        gen_line(e, "    {variant} = {v.number}")
+    }
+    gen_line(e, "}}")
+}
+
+fn gen_scalar(s: Scalar) -> str {
+    match s {
+        Double => "f64"
+        Float => "f32"
+        Int32 => "i32"
+        Int64 => "i64"
+        Uint32 => "u32"
+        Uint64 => "u64"
+        Sint32 => "i32"
+        Sint64 => "i64"
+        Fixed32 => "u32"
+        Fixed64 => "u64"
+        Sfixed32 => "i32"
+        Sfixed64 => "i64"
+        Bool => "bool"
+        String => "str"
+        Bytes => "[]u8"
+    }
+}
+
+fn gen_encoding(s: Scalar) -> str {
+    match s {
+        Sint32 => "sint"
+        Sint64 => "sint"
+        Fixed32 => "fixed"
+        Fixed64 => "fixed"
+        Sfixed32 => "fixed"
+        Sfixed64 => "fixed"
+        _ => ""
+    }
+}
+
+fn gen_ref_encoding(ref: TypeRef) -> str {
+    match ref {
+        Builtin(kind) => gen_encoding(kind)
+        _ => ""
+    }
+}
+
+fn gen_packable(ref: TypeRef) -> bool {
+    match ref {
+        Builtin(kind) => match kind {
+            String => false
+            Bytes => false
+            _ => true
+        }
+        Enum(_) => true
+        _ => false
+    }
+}
+
+fn gen_ref_type(e: *Emitter, ref: TypeRef, boxed: bool) -> str {
+    match ref {
+        Builtin(kind) => gen_scalar(kind)
+        Message(full) => {
+            let name = gen_type_ref(e, full)
+            if boxed {
+                return "*{name}"
+            }
+            name
+        }
+        Enum(full) => gen_type_ref(e, full)
+        Named(name) => name
+    }
+}
+
+fn gen_option_bool(options: []Option, name: str) -> bool? {
+    for o in options {
+        if o.name == name {
+            match o.value {
+                Bool(on) => return on
+                _ => return none
+            }
+        }
+    }
+    none
+}
+
+fn gen_is_packed(e: *Emitter, f: *Field) -> bool {
+    let explicit = gen_option_bool(f.options, "packed")
+    match explicit {
+        some(on) => return on
+        none => {}
+    }
+    e.file.syntax == Syntax.Proto3
+}
+
+fn gen_boxed(e: *Emitter, owner: *Message, ref: TypeRef) -> bool {
+    match ref {
+        Message(full) => gen_reaches(e.edges, full, owner.full_name)
+        _ => false
+    }
+}
+
+fn gen_quote(s: str) -> str {
+    var out = builder.builder()
+    builder.write_byte(mut out, '"')
+    for i in 0..s.len {
+        let c = s[i]
+        match c {
+            '\n' => builder.write(mut out, "\\n")
+            '\t' => builder.write(mut out, "\\t")
+            '\r' => builder.write(mut out, "\\r")
+            0 => builder.write(mut out, "\\0")
+            '\\' => builder.write(mut out, "\\\\")
+            '"' => builder.write(mut out, "\\\"")
+            '{' => builder.write(mut out, "{{{{")
+            '}' => builder.write(mut out, "}}}}")
+            _ => builder.write_byte(mut out, c)
+        }
+    }
+    builder.write_byte(mut out, '"')
+    builder.to_str(out)
+}
+
+fn gen_float(value: f64, pos: Pos) -> str ! Error {
+    if value != value || value - value != 0.0 {
+        fail Error.Invalid(pos, "a default of inf or nan cannot be written")
+    }
+    let rendered = "{value}"
+    if text.contains(rendered, ".") || text.contains(rendered, "e") {
+        return rendered
+    }
+    "{rendered}.0"
+}
+
+fn gen_bytes_literal(value: str) -> str {
+    var out = builder.builder()
+    builder.write_byte(mut out, '[')
+    var first = true
+    for i in 0..value.len {
+        let c = value[i]
+        if !first {
+            builder.write(mut out, ", ")
+        }
+        first = false
+        builder.write(mut out, "{c}")
+    }
+    builder.write_byte(mut out, ']')
+    builder.to_str(out)
+}
+
+fn gen_default(e: *Emitter, f: *Field, of: TypeRef, value: Constant) -> str ! Error {
+    let mismatch = Error.Invalid(f.pos, "the default does not fit the type of {f.name}")
+    match of {
+        Builtin(kind) => match kind {
+            String => match value {
+                Text(s) => gen_quote(s)
+                _ => fail mismatch
+            }
+            Bytes => match value {
+                Text(s) => gen_bytes_literal(s)
+                _ => fail mismatch
+            }
+            Bool => match value {
+                Bool(on) => if on { "true" } else { "false" }
+                _ => fail mismatch
+            }
+            Double => gen_default_float(f, value, mismatch)?
+            Float => gen_default_float(f, value, mismatch)?
+            _ => match value {
+                Int(n) => "{n}"
+                Uint(n) => "{n}"
+                _ => fail mismatch
+            }
+        }
+        Enum(full) => match value {
+            Ident(name) => {
+                let variant = e.names.variants["{full}.{name}"] ?? fail mismatch
+                let type = gen_type_ref(e, full)
+                "{type}.{variant}"
+            }
+            _ => fail mismatch
+        }
+        _ => fail mismatch
+    }
+}
+
+fn gen_default_float(f: *Field, value: Constant, mismatch: Error) -> str ! Error {
+    match value {
+        Float(x) => gen_float(x, f.pos)?
+        Int(n) => gen_float(f64(n), f.pos)?
+        Uint(n) => gen_float(f64(n), f.pos)?
+        _ => fail mismatch
+    }
+}
+
+fn gen_message(e: *Emitter, m: *Message) ! Error {
+    let name = e.names.types[m.full_name] ?? m.name
+    if gen_deprecated(m.options) {
+        gen_line(e, "/// Deprecated.")
+    }
+    gen_line(e, "pub struct {name} {{")
+    if m.fields.len == 0 {
+        gen_line(e, "    pub empty: bool \"{max_field_number}\"")
+    }
+    var used: [str: bool] = [:]
+    var emitted: [str: bool] = [:]
+    for f in m.fields {
+        if f.oneof == "" {
+            gen_field(e, m, f, used)?
+            continue
+        }
+        if check_seen(emitted[f.oneof]) {
+            continue
+        }
+        emitted[f.oneof] = true
+        let type = e.names.oneofs["{m.full_name}.{f.oneof}"] ?? f.oneof
+        let field = gen_unique(used, gen_field_word(f.oneof), "_")
+        gen_line(e, "    pub {field}: {type}? \"oneof\"")
+    }
+    gen_line(e, "}}")
+    for g in m.oneofs {
+        gen_break(e)
+        gen_oneof(e, m, g)?
+    }
+}
+
+fn gen_field(e: *Emitter, m: *Message, f: *Field, used: [str: bool]) ! Error {
+    let name = gen_unique(used, gen_field_word(f.name), "_")
+    var tag = "{f.number}"
+    var type = ""
+    var default = ""
+    match f.type {
+        Map(key, value) => {
+            let key_encoding = gen_encoding(key)
+            if key_encoding != "" {
+                tag = "{tag},key={key_encoding}"
+            }
+            let value_encoding = gen_ref_encoding(value)
+            if value_encoding != "" {
+                tag = "{tag},value={value_encoding}"
+            }
+            let value_type = gen_ref_type(e, value, false)
+            type = "[{gen_scalar(key)}: {value_type}]"
+        }
+        Single(of) => {
+            let boxed = f.label != Label.Repeated && gen_boxed(e, m, of)
+            if boxed && f.label == Label.Required {
+                fail Error.Invalid(f.pos, "the required message field {f.name} is part of a cycle")
+            }
+            let base = gen_ref_type(e, of, boxed)
+            let encoding = gen_ref_encoding(of)
+            let is_message = match of {
+                Message(_) => true
+                _ => false
+            }
+            match f.label {
+                Repeated => {
+                    type = "[]{base}"
+                }
+                Optional => {
+                    type = "{base}?"
+                }
+                Required => {
+                    type = base
+                    tag = "{tag},required"
+                }
+                Implicit => {
+                    type = if is_message { "{base}?" } else { base }
+                }
+            }
+            if encoding != "" {
+                tag = "{tag},{encoding}"
+            }
+            if f.label == Label.Repeated && gen_packable(of) && !gen_is_packed(e, f) {
+                tag = "{tag},unpacked"
+            }
+            let given = f.default
+            match given {
+                some(value) => {
+                    let literal = gen_default(e, f, of, value)?
+                    default = " = {literal}"
+                    if f.label == Label.Optional {
+                        type = base
+                    }
+                }
+                none => {}
+            }
+        }
+    }
+    if gen_deprecated(f.options) {
+        gen_line(e, "    /// Deprecated.")
+    }
+    gen_line(e, "    pub {name}: {type} \"{tag}\"{default}")
+}
+
+fn gen_oneof(e: *Emitter, m: *Message, g: Oneof) ! Error {
+    let type = e.names.oneofs["{m.full_name}.{g.name}"] ?? g.name
+    gen_line(e, "pub enum {type} {{")
+    var used: [str: bool] = [:]
+    for f in m.fields {
+        if f.oneof != g.name {
+            continue
+        }
+        match f.type {
+            Single(of) => {
+                let boxed = gen_boxed(e, m, of)
+                let payload = gen_ref_type(e, of, boxed)
+                let encoding = gen_ref_encoding(of)
+                let variant = gen_unique(used, gen_type_word(f.name), "")
+                if gen_deprecated(f.options) {
+                    gen_line(e, "    /// Deprecated.")
+                }
+                if encoding == "" {
+                    gen_line(e, "    {variant}(value: {payload}) = {f.number}")
+                } else {
+                    gen_line(e, "    {variant}(value: {payload} \"{encoding}\") = {f.number}")
+                }
+            }
+            Map(_, _) => fail Error.Invalid(f.pos, "a oneof cannot hold a map field")
+        }
+    }
+    gen_line(e, "}}")
+}

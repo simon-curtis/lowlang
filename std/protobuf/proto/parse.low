@@ -1,0 +1,879 @@
+import std/text
+
+const max_nesting = 32
+
+struct Parser {
+    source: str
+    tokens: []Token
+    at: i64
+    syntax: Syntax
+    depth: i64
+}
+
+/// Parses the text of a `.proto` file into a `File`.
+///
+/// `path` names the file in errors and in `File.path`. The parser reads proto3 and proto2: `syntax`, `package`, `import` (with `public` and `weak`), `option`, `message`, nested messages and enums, `enum` with `allow_alias`, `oneof`, `map`, `repeated`, `optional` and `required`, `default` values, `reserved`, `extensions`, `extend`, `service` and `rpc` with `stream` on either side. Options are kept as they are written; only `default` and `json_name` are lifted into `Field`. Type names stay as written until `read_files` resolves them.
+///
+/// Fails with `Unexpected`, `Unterminated`, `InvalidEscape` or `InvalidNumber` for text that is not valid protobuf, with `InvalidSyntax` for an `edition`, with `Group` for a proto2 group, with `Proto3` for a proto2 construct in a proto3 file, with `FieldNumber`, `Duplicate` and `Reserved` for field numbers and names that break the rules, with `Invalid` for a bad map or oneof, and with `TooDeep` when messages nest more than 32 levels. It checks nothing that needs another file; `read_files` does.
+pub fn parse(path: str, source: str) -> *File ! Error {
+    let tokens = tokenize(path, source)?
+    let p = new(Parser { source, tokens, at: 0, syntax: Syntax.Proto2, depth: 0 })
+    let file = new(File { path, syntax: Syntax.Proto2 })
+    parse_syntax(p, file)?
+    for parse_tok(p).kind != TokenKind.End {
+        parse_top(p, file)?
+    }
+    check_file(file)?
+    file
+}
+
+fn parse_tok(p: *Parser) -> Token {
+    p.tokens[p.at]
+}
+
+fn parse_ahead(p: *Parser, n: i64) -> Token {
+    var i = p.at + n
+    if i >= p.tokens.len {
+        i = p.tokens.len - 1
+    }
+    p.tokens[i]
+}
+
+fn parse_next(p: *Parser) -> Token {
+    let t = p.tokens[p.at]
+    if t.kind != TokenKind.End {
+        p.at += 1
+    }
+    t
+}
+
+fn parse_found(t: Token) -> str {
+    match t.kind {
+        End => "end of file"
+        Str => text.quote(t.text)
+        _ => "'{t.text}'"
+    }
+}
+
+fn parse_unexpected(t: Token, expected: str) -> Error {
+    Error.Unexpected(t.pos, parse_found(t), expected)
+}
+
+fn parse_is_symbol(t: Token, symbol: str) -> bool {
+    t.kind == TokenKind.Symbol && t.text == symbol
+}
+
+fn parse_starts_type(t: Token) -> bool {
+    t.kind == TokenKind.Ident || parse_is_symbol(t, ".")
+}
+
+fn parse_at_option(p: *Parser) -> bool {
+    parse_is_word(parse_tok(p), "option") && (parse_ahead(p, 1).kind == TokenKind.Ident || parse_is_symbol(parse_ahead(p, 1), "("))
+}
+
+fn parse_is_word(t: Token, word: str) -> bool {
+    t.kind == TokenKind.Ident && t.text == word
+}
+
+fn parse_accept_symbol(p: *Parser, symbol: str) -> bool {
+    if parse_is_symbol(parse_tok(p), symbol) {
+        parse_next(p)
+        return true
+    }
+    false
+}
+
+fn parse_accept_word(p: *Parser, word: str) -> bool {
+    if parse_is_word(parse_tok(p), word) {
+        parse_next(p)
+        return true
+    }
+    false
+}
+
+fn parse_expect_symbol(p: *Parser, symbol: str) -> Token ! Error {
+    let t = parse_tok(p)
+    if !parse_is_symbol(t, symbol) {
+        fail parse_unexpected(t, "'{symbol}'")
+    }
+    parse_next(p)
+}
+
+fn parse_expect_word(p: *Parser, word: str) -> Token ! Error {
+    let t = parse_tok(p)
+    if !parse_is_word(t, word) {
+        fail parse_unexpected(t, "'{word}'")
+    }
+    parse_next(p)
+}
+
+fn parse_expect_ident(p: *Parser, what: str) -> Token ! Error {
+    let t = parse_tok(p)
+    if t.kind != TokenKind.Ident {
+        fail parse_unexpected(t, what)
+    }
+    parse_next(p)
+}
+
+fn parse_expect_string(p: *Parser) -> Token ! Error {
+    let t = parse_tok(p)
+    if t.kind != TokenKind.Str {
+        fail parse_unexpected(t, "a string")
+    }
+    var joined = parse_next(p)
+    for parse_tok(p).kind == TokenKind.Str {
+        let more = parse_next(p)
+        joined = Token { kind: TokenKind.Str, text: "{joined.text}{more.text}", pos: joined.pos, start: joined.start, end: more.end }
+    }
+    joined
+}
+
+fn parse_dotted(p: *Parser, what: str) -> str ! Error {
+    var name = parse_expect_ident(p, what)?.text
+    for parse_is_symbol(parse_tok(p), ".") && parse_ahead(p, 1).kind == TokenKind.Ident {
+        parse_next(p)
+        name = "{name}.{parse_next(p).text}"
+    }
+    name
+}
+
+fn parse_type_name(p: *Parser) -> str ! Error {
+    if parse_accept_symbol(p, ".") {
+        let rest = parse_dotted(p, "a type name")?
+        return ".{rest}"
+    }
+    parse_dotted(p, "a type name")?
+}
+
+fn parse_syntax(p: *Parser, file: *File) ! Error {
+    let t = parse_tok(p)
+    if parse_is_word(t, "edition") {
+        parse_next(p)
+        parse_expect_symbol(p, "=")?
+        let value = parse_expect_string(p)?
+        fail Error.InvalidSyntax(t.pos, "edition {text.quote(value.text)}")
+    }
+    if !parse_is_word(t, "syntax") {
+        return
+    }
+    parse_next(p)
+    parse_expect_symbol(p, "=")?
+    let value = parse_expect_string(p)?
+    parse_expect_symbol(p, ";")?
+    match value.text {
+        == "proto2" => { p.syntax = Syntax.Proto2 }
+        == "proto3" => { p.syntax = Syntax.Proto3 }
+        _ => fail Error.InvalidSyntax(value.pos, text.quote(value.text))
+    }
+    file.syntax = p.syntax
+}
+
+fn parse_top(p: *Parser, file: *File) ! Error {
+    let t = parse_tok(p)
+    if parse_accept_symbol(p, ";") {
+        return
+    }
+    if t.kind != TokenKind.Ident {
+        fail parse_unexpected(t, "a definition")
+    }
+    match t.text {
+        == "package" => {
+            parse_next(p)
+            if file.package != "" {
+                fail Error.Invalid(t.pos, "a file has one package statement")
+            }
+            file.package = parse_dotted(p, "a package name")?
+            parse_expect_symbol(p, ";")?
+        }
+        == "import" => parse_import(p, file)?
+        == "option" => {
+            parse_next(p)
+            let option = parse_option(p, t.pos)?
+            parse_expect_symbol(p, ";")?
+            push(mut file.options, option)
+        }
+        == "message" => {
+            let m = parse_message(p)?
+            push(mut file.messages, m)
+        }
+        == "enum" => {
+            let e = parse_enum(p)?
+            push(mut file.enums, e)
+        }
+        == "service" => {
+            let s = parse_service(p)?
+            push(mut file.services, s)
+        }
+        == "extend" => {
+            let x = parse_extend(p)?
+            push(mut file.extends, x)
+        }
+        _ => fail parse_unexpected(t, "a definition")
+    }
+}
+
+fn parse_import(p: *Parser, file: *File) ! Error {
+    let t = parse_next(p)
+    var public = false
+    var weak = false
+    if parse_accept_word(p, "public") {
+        public = true
+    } else if parse_accept_word(p, "weak") {
+        weak = true
+    }
+    let path = parse_expect_string(p)?
+    parse_expect_symbol(p, ";")?
+    push(mut file.imports, Import { path: path.text, public, weak, pos: t.pos })
+}
+
+fn parse_option_name(p: *Parser) -> str ! Error {
+    var name = ""
+    if parse_accept_symbol(p, "(") {
+        let inner = parse_type_name(p)?
+        parse_expect_symbol(p, ")")?
+        name = "({inner})"
+    } else {
+        name = parse_expect_ident(p, "an option name")?.text
+    }
+    for parse_accept_symbol(p, ".") {
+        if parse_accept_symbol(p, "(") {
+            let inner = parse_type_name(p)?
+            parse_expect_symbol(p, ")")?
+            name = "{name}.({inner})"
+        } else {
+            let part = parse_expect_ident(p, "an option name")?
+            name = "{name}.{part.text}"
+        }
+    }
+    name
+}
+
+fn parse_option(p: *Parser, pos: Pos) -> Option ! Error {
+    let name = parse_option_name(p)?
+    parse_expect_symbol(p, "=")?
+    let value = parse_constant(p)?
+    Option { name, value, pos }
+}
+
+fn parse_integer(t: Token) -> Constant ! Error {
+    var digits = t.text
+    var base = 10
+    if text.starts_with(digits, "0x") || text.starts_with(digits, "0X") {
+        digits = digits[2..]
+        base = 16
+    } else if digits.len > 1 && digits[0] == '0' {
+        digits = digits[1..]
+        base = 8
+    }
+    let value = text.parse_u64(digits, base) catch {
+        _ => fail Error.InvalidNumber(t.pos, t.text)
+    }
+    if value > 0x7FFFFFFFFFFFFFFF {
+        return Constant.Uint(value)
+    }
+    Constant.Int(i64(value))
+}
+
+fn parse_float(t: Token) -> f64 ! Error {
+    text.parse_float(t.text) catch {
+        _ => fail Error.InvalidNumber(t.pos, t.text)
+    }
+}
+
+fn parse_negated(c: Constant, t: Token) -> Constant ! Error {
+    match c {
+        Int(value) => Constant.Int(-value)
+        Uint(value) => {
+            if value > 0x8000000000000000 {
+                fail Error.InvalidNumber(t.pos, "-{t.text}")
+            }
+            Constant.Int(-i64(value - 1) - 1)
+        }
+        Float(value) => Constant.Float(-value)
+        _ => fail parse_unexpected(t, "a number")
+    }
+}
+
+fn parse_number(p: *Parser) -> Constant ! Error {
+    let t = parse_next(p)
+    match t.kind {
+        Int => parse_integer(t)?
+        Float => Constant.Float(parse_float(t)?)
+        Ident => match t.text {
+            == "inf" => Constant.Float(1.0 / 0.0)
+            == "nan" => Constant.Float(0.0 / 0.0)
+            _ => fail parse_unexpected(t, "a number")
+        }
+        _ => fail parse_unexpected(t, "a number")
+    }
+}
+
+fn parse_constant(p: *Parser) -> Constant ! Error {
+    let t = parse_tok(p)
+    match t.kind {
+        Str => Constant.Text(parse_expect_string(p)?.text)
+        Int => parse_number(p)?
+        Float => parse_number(p)?
+        Ident => {
+            if t.text == "true" || t.text == "false" {
+                parse_next(p)
+                return Constant.Bool(t.text == "true")
+            }
+            if t.text == "inf" || t.text == "nan" {
+                return parse_number(p)?
+            }
+            Constant.Ident(parse_dotted(p, "a constant")?)
+        }
+        Symbol => {
+            if parse_is_symbol(t, "-") || parse_is_symbol(t, "+") {
+                parse_next(p)
+                let number = parse_tok(p)
+                let value = parse_number(p)?
+                if t.text == "-" {
+                    return parse_negated(value, number)?
+                }
+                return value
+            }
+            if parse_is_symbol(t, "{{") {
+                return parse_aggregate(p)?
+            }
+            fail parse_unexpected(t, "a constant")
+        }
+        End => fail parse_unexpected(t, "a constant")
+    }
+}
+
+fn parse_aggregate(p: *Parser) -> Constant ! Error {
+    let open = parse_next(p)
+    var depth = 1
+    for depth > 0 {
+        let t = parse_next(p)
+        if t.kind == TokenKind.End {
+            fail Error.Unterminated(open.pos, "aggregate")
+        }
+        if parse_is_symbol(t, "{{") {
+            depth += 1
+        } else if parse_is_symbol(t, "}}") {
+            depth -= 1
+            if depth == 0 {
+                return Constant.Aggregate(text.trim(p.source[open.end..t.start]))
+            }
+        }
+    }
+    Constant.Aggregate("")
+}
+
+fn parse_field_options(p: *Parser, f: *Field) ! Error {
+    if !parse_accept_symbol(p, "[") {
+        return
+    }
+    for {
+        let t = parse_tok(p)
+        let option = parse_option(p, t.pos)?
+        match option.name {
+            == "default" => {
+                if p.syntax == Syntax.Proto3 {
+                    fail Error.Proto3(t.pos, "default values are not allowed")
+                }
+                f.default = option.value
+            }
+            == "json_name" => {
+                match option.value {
+                    Text(value) => { f.json_name = value }
+                    _ => fail Error.Invalid(t.pos, "json_name is a string")
+                }
+            }
+            _ => push(mut f.options, option)
+        }
+        if !parse_accept_symbol(p, ",") {
+            break
+        }
+    }
+    parse_expect_symbol(p, "]")?
+}
+
+fn parse_scalar(name: str) -> Scalar? {
+    match name {
+        "double" => Scalar.Double
+        "float" => Scalar.Float
+        "int32" => Scalar.Int32
+        "int64" => Scalar.Int64
+        "uint32" => Scalar.Uint32
+        "uint64" => Scalar.Uint64
+        "sint32" => Scalar.Sint32
+        "sint64" => Scalar.Sint64
+        "fixed32" => Scalar.Fixed32
+        "fixed64" => Scalar.Fixed64
+        "sfixed32" => Scalar.Sfixed32
+        "sfixed64" => Scalar.Sfixed64
+        "bool" => Scalar.Bool
+        "string" => Scalar.String
+        "bytes" => Scalar.Bytes
+        _ => none
+    }
+}
+
+fn parse_type_ref(p: *Parser) -> TypeRef ! Error {
+    let t = parse_tok(p)
+    if t.kind == TokenKind.Ident && !parse_is_symbol(parse_ahead(p, 1), ".") {
+        let kind = parse_scalar(t.text)
+        match kind {
+            some(scalar) => {
+                parse_next(p)
+                return TypeRef.Builtin(scalar)
+            }
+            none => {}
+        }
+    }
+    TypeRef.Named(parse_type_name(p)?)
+}
+
+fn parse_field_number(p: *Parser) -> i64 ! Error {
+    let t = parse_tok(p)
+    if t.kind != TokenKind.Int {
+        fail parse_unexpected(t, "a field number")
+    }
+    parse_next(p)
+    match parse_integer(t)? {
+        Int(value) => value
+        _ => fail Error.FieldNumber(t.pos, max_field_number + 1)
+    }
+}
+
+fn parse_label(p: *Parser, in_oneof: bool) -> Label ! Error {
+    let t = parse_tok(p)
+    var label = Label.Implicit
+    if parse_is_word(t, "optional") && parse_starts_type(parse_ahead(p, 1)) {
+        label = Label.Optional
+    } else if parse_is_word(t, "required") && parse_starts_type(parse_ahead(p, 1)) {
+        label = Label.Required
+    } else if parse_is_word(t, "repeated") && parse_starts_type(parse_ahead(p, 1)) {
+        label = Label.Repeated
+    } else {
+        return label
+    }
+    if in_oneof {
+        fail Error.Invalid(t.pos, "a oneof field has no label")
+    }
+    if label == Label.Required && p.syntax == Syntax.Proto3 {
+        fail Error.Proto3(t.pos, "required fields are not allowed")
+    }
+    parse_next(p)
+    label
+}
+
+fn parse_field(p: *Parser, oneof: str) -> *Field ! Error {
+    let start = parse_tok(p)
+    let label = parse_label(p, oneof != "")?
+    let type_token = parse_tok(p)
+    if parse_is_word(type_token, "group") && parse_ahead(p, 1).kind == TokenKind.Ident && parse_ahead(p, 2).text != "." {
+        fail Error.Group(type_token.pos)
+    }
+    if parse_is_word(type_token, "map") && parse_is_symbol(parse_ahead(p, 1), "<") {
+        if label != Label.Implicit {
+            fail Error.Invalid(start.pos, "a map field has no label")
+        }
+        if oneof != "" {
+            fail Error.Invalid(start.pos, "a oneof cannot hold a map field")
+        }
+        return parse_map_field(p)?
+    }
+    if label == Label.Implicit && oneof == "" && p.syntax == Syntax.Proto2 {
+        fail parse_unexpected(type_token, "a label")
+    }
+    let type = parse_type_ref(p)?
+    let name = parse_expect_ident(p, "a field name")?
+    parse_expect_symbol(p, "=")?
+    let number = parse_field_number(p)?
+    let f = new(Field { name: name.text, number, label, type: FieldType.Single(type), oneof, pos: start.pos })
+    parse_field_options(p, f)?
+    if parse_is_symbol(parse_tok(p), "{{") {
+        fail Error.Group(start.pos)
+    }
+    parse_expect_symbol(p, ";")?
+    f
+}
+
+fn parse_map_field(p: *Parser) -> *Field ! Error {
+    let start = parse_next(p)
+    parse_expect_symbol(p, "<")?
+    let key_token = parse_tok(p)
+    let key_type = parse_type_ref(p)?
+    var key = Scalar.String
+    match key_type {
+        Builtin(kind) => {
+            match kind {
+                Double => fail Error.Invalid(key_token.pos, "a map key is an integer type, bool or string")
+                Float => fail Error.Invalid(key_token.pos, "a map key is an integer type, bool or string")
+                Bytes => fail Error.Invalid(key_token.pos, "a map key is an integer type, bool or string")
+                _ => {}
+            }
+            key = kind
+        }
+        _ => fail Error.Invalid(key_token.pos, "a map key is an integer type, bool or string")
+    }
+    parse_expect_symbol(p, ",")?
+    let value = parse_type_ref(p)?
+    parse_expect_symbol(p, ">")?
+    let name = parse_expect_ident(p, "a field name")?
+    parse_expect_symbol(p, "=")?
+    let number = parse_field_number(p)?
+    let f = new(Field { name: name.text, number, label: Label.Repeated, type: FieldType.Map(key, value), pos: start.pos })
+    parse_field_options(p, f)?
+    parse_expect_symbol(p, ";")?
+    f
+}
+
+fn parse_range_bound(p: *Parser, max: i64) -> i64 ! Error {
+    let t = parse_tok(p)
+    if parse_accept_word(p, "max") {
+        return max
+    }
+    let negative = parse_accept_symbol(p, "-")
+    let digits = parse_tok(p)
+    if digits.kind != TokenKind.Int {
+        fail parse_unexpected(digits, "a number")
+    }
+    parse_next(p)
+    match parse_integer(digits)? {
+        Int(value) => if negative { -value } else { value }
+        _ => fail Error.InvalidNumber(t.pos, digits.text)
+    }
+}
+
+fn parse_ranges(p: *Parser, max: i64) -> []Range ! Error {
+    var ranges: []Range = []
+    for {
+        let first = parse_range_bound(p, max)?
+        var last = first
+        if parse_accept_word(p, "to") {
+            last = parse_range_bound(p, max)?
+        }
+        push(mut ranges, Range { first, last })
+        if !parse_accept_symbol(p, ",") {
+            break
+        }
+    }
+    ranges
+}
+
+fn parse_reserved(p: *Parser, max: i64) -> Reserved ! Error {
+    parse_next(p)
+    var reserved = Reserved {}
+    if parse_tok(p).kind == TokenKind.Str {
+        for {
+            let name = parse_expect_string(p)?
+            push(mut reserved.names, name.text)
+            if !parse_accept_symbol(p, ",") {
+                break
+            }
+        }
+    } else {
+        reserved.ranges = parse_ranges(p, max)?
+    }
+    parse_expect_symbol(p, ";")?
+    reserved
+}
+
+fn parse_merge_reserved(into: Reserved, more: Reserved) -> Reserved {
+    var merged = into
+    for r in more.ranges {
+        push(mut merged.ranges, r)
+    }
+    for name in more.names {
+        push(mut merged.names, name)
+    }
+    merged
+}
+
+fn parse_message(p: *Parser) -> *Message ! Error {
+    let keyword = parse_next(p)
+    let name = parse_expect_ident(p, "a message name")?
+    p.depth += 1
+    if p.depth > max_nesting {
+        fail Error.TooDeep(keyword.pos)
+    }
+    let m = new(Message { name: name.text, pos: keyword.pos })
+    parse_expect_symbol(p, "{{")?
+    for !parse_is_symbol(parse_tok(p), "}}") {
+        if parse_tok(p).kind == TokenKind.End {
+            fail parse_unexpected(parse_tok(p), "'}}'")
+        }
+        parse_message_item(p, m)?
+    }
+    parse_next(p)
+    p.depth -= 1
+    check_message(m)?
+    m
+}
+
+fn parse_message_item(p: *Parser, m: *Message) ! Error {
+    let t = parse_tok(p)
+    if parse_accept_symbol(p, ";") {
+        return
+    }
+    if t.kind != TokenKind.Ident && !parse_is_symbol(t, ".") {
+        fail parse_unexpected(t, "a field or definition")
+    }
+    let following = parse_ahead(p, 1)
+    let declares = parse_starts_type(following) || parse_is_symbol(following, "(") || t.text == "reserved" || t.text == "extensions"
+    if t.kind == TokenKind.Ident && declares {
+        match t.text {
+            == "message" => {
+                let nested = parse_message(p)?
+                push(mut m.messages, nested)
+                return
+            }
+            == "enum" => {
+                let nested = parse_enum(p)?
+                push(mut m.enums, nested)
+                return
+            }
+            == "extend" => {
+                let x = parse_extend(p)?
+                push(mut m.extends, x)
+                return
+            }
+            == "oneof" => {
+                parse_oneof(p, m)?
+                return
+            }
+            == "option" => {
+                parse_next(p)
+                let option = parse_option(p, t.pos)?
+                parse_expect_symbol(p, ";")?
+                push(mut m.options, option)
+                return
+            }
+            == "reserved" => {
+                let more = parse_reserved(p, max_field_number)?
+                m.reserved = parse_merge_reserved(m.reserved, more)
+                return
+            }
+            == "extensions" => {
+                parse_extensions(p, m)?
+                return
+            }
+            _ => {}
+        }
+    }
+    let f = parse_field(p, "")?
+    push(mut m.fields, f)
+}
+
+fn parse_extensions(p: *Parser, m: *Message) ! Error {
+    let t = parse_next(p)
+    if p.syntax == Syntax.Proto3 {
+        fail Error.Proto3(t.pos, "extension ranges are not allowed")
+    }
+    let ranges = parse_ranges(p, max_field_number)?
+    for r in ranges {
+        push(mut m.extensions, r)
+    }
+    if parse_accept_symbol(p, "[") {
+        for {
+            let at = parse_tok(p)
+            parse_option(p, at.pos)?
+            if !parse_accept_symbol(p, ",") {
+                break
+            }
+        }
+        parse_expect_symbol(p, "]")?
+    }
+    parse_expect_symbol(p, ";")?
+}
+
+fn parse_oneof(p: *Parser, m: *Message) ! Error {
+    let keyword = parse_next(p)
+    let name = parse_expect_ident(p, "a oneof name")?
+    let group = Oneof { name: name.text, pos: keyword.pos }
+    parse_expect_symbol(p, "{{")?
+    var members = 0
+    var options: []Option = []
+    for !parse_is_symbol(parse_tok(p), "}}") {
+        let t = parse_tok(p)
+        if t.kind == TokenKind.End {
+            fail parse_unexpected(t, "'}}'")
+        }
+        if parse_accept_symbol(p, ";") {
+            continue
+        }
+        if parse_is_word(t, "option") {
+            parse_next(p)
+            let option = parse_option(p, t.pos)?
+            parse_expect_symbol(p, ";")?
+            push(mut options, option)
+            continue
+        }
+        let f = parse_field(p, name.text)?
+        push(mut m.fields, f)
+        members += 1
+    }
+    parse_next(p)
+    if members == 0 {
+        fail Error.Invalid(keyword.pos, "a oneof needs at least one field")
+    }
+    push(mut m.oneofs, Oneof { name: group.name, options, pos: group.pos })
+}
+
+fn parse_extend(p: *Parser) -> *Extend ! Error {
+    let keyword = parse_next(p)
+    let target = parse_type_name(p)?
+    let x = new(Extend { target, pos: keyword.pos })
+    parse_expect_symbol(p, "{{")?
+    for !parse_is_symbol(parse_tok(p), "}}") {
+        if parse_tok(p).kind == TokenKind.End {
+            fail parse_unexpected(parse_tok(p), "'}}'")
+        }
+        if parse_accept_symbol(p, ";") {
+            continue
+        }
+        let f = parse_field(p, "")?
+        push(mut x.fields, f)
+    }
+    parse_next(p)
+    x
+}
+
+fn parse_enum(p: *Parser) -> *Enum ! Error {
+    let keyword = parse_next(p)
+    let name = parse_expect_ident(p, "an enum name")?
+    let e = new(Enum { name: name.text, pos: keyword.pos })
+    parse_expect_symbol(p, "{{")?
+    for !parse_is_symbol(parse_tok(p), "}}") {
+        let t = parse_tok(p)
+        if t.kind == TokenKind.End {
+            fail parse_unexpected(t, "'}}'")
+        }
+        if parse_accept_symbol(p, ";") {
+            continue
+        }
+        if parse_at_option(p) {
+            parse_next(p)
+            let option = parse_option(p, t.pos)?
+            parse_expect_symbol(p, ";")?
+            match option.value {
+                Bool(on) => if option.name == "allow_alias" { e.allow_alias = on }
+                _ => {}
+            }
+            push(mut e.options, option)
+            continue
+        }
+        if parse_is_word(t, "reserved") {
+            let more = parse_reserved(p, 2147483647)?
+            e.reserved = parse_merge_reserved(e.reserved, more)
+            continue
+        }
+        parse_enum_value(p, e)?
+    }
+    parse_next(p)
+    check_enum(p, e)?
+    e
+}
+
+fn parse_enum_value(p: *Parser, e: *Enum) ! Error {
+    let name = parse_expect_ident(p, "an enum value name")?
+    parse_expect_symbol(p, "=")?
+    let negative = parse_accept_symbol(p, "-")
+    let digits = parse_tok(p)
+    if digits.kind != TokenKind.Int {
+        fail parse_unexpected(digits, "a number")
+    }
+    parse_next(p)
+    var number: i64 = 0
+    match parse_integer(digits)? {
+        Int(value) => { number = if negative { -value } else { value } }
+        _ => fail Error.InvalidNumber(digits.pos, digits.text)
+    }
+    if number > 2147483647 || number < -2147483648 {
+        fail Error.InvalidNumber(digits.pos, digits.text)
+    }
+    var options: []Option = []
+    if parse_accept_symbol(p, "[") {
+        for {
+            let at = parse_tok(p)
+            let option = parse_option(p, at.pos)?
+            push(mut options, option)
+            if !parse_accept_symbol(p, ",") {
+                break
+            }
+        }
+        parse_expect_symbol(p, "]")?
+    }
+    parse_expect_symbol(p, ";")?
+    push(mut e.values, EnumValue { name: name.text, number, options, pos: name.pos })
+}
+
+fn parse_service(p: *Parser) -> *Service ! Error {
+    let keyword = parse_next(p)
+    let name = parse_expect_ident(p, "a service name")?
+    let s = new(Service { name: name.text, pos: keyword.pos })
+    parse_expect_symbol(p, "{{")?
+    for !parse_is_symbol(parse_tok(p), "}}") {
+        let t = parse_tok(p)
+        if t.kind == TokenKind.End {
+            fail parse_unexpected(t, "'}}'")
+        }
+        if parse_accept_symbol(p, ";") {
+            continue
+        }
+        if parse_is_word(t, "option") {
+            parse_next(p)
+            let option = parse_option(p, t.pos)?
+            parse_expect_symbol(p, ";")?
+            push(mut s.options, option)
+            continue
+        }
+        let m = parse_method(p)?
+        for existing in s.methods {
+            if existing.name == m.name {
+                fail Error.Duplicate(m.pos, "method", m.name)
+            }
+        }
+        push(mut s.methods, m)
+    }
+    parse_next(p)
+    s
+}
+
+fn parse_method(p: *Parser) -> Method ! Error {
+    let keyword = parse_expect_word(p, "rpc")?
+    let name = parse_expect_ident(p, "a method name")?
+    parse_expect_symbol(p, "(")?
+    let client = parse_stream_flag(p)
+    let input = parse_type_name(p)?
+    parse_expect_symbol(p, ")")?
+    parse_expect_word(p, "returns")?
+    parse_expect_symbol(p, "(")?
+    let server = parse_stream_flag(p)
+    let output = parse_type_name(p)?
+    parse_expect_symbol(p, ")")?
+    var options: []Option = []
+    if parse_accept_symbol(p, "{{") {
+        for !parse_is_symbol(parse_tok(p), "}}") {
+            let t = parse_tok(p)
+            if t.kind == TokenKind.End {
+                fail parse_unexpected(t, "'}}'")
+            }
+            if parse_accept_symbol(p, ";") {
+                continue
+            }
+            parse_expect_word(p, "option")?
+            let option = parse_option(p, t.pos)?
+            parse_expect_symbol(p, ";")?
+            push(mut options, option)
+        }
+        parse_next(p)
+    } else {
+        parse_expect_symbol(p, ";")?
+    }
+    Method { name: name.text, input, output, client_streaming: client, server_streaming: server, options, pos: keyword.pos }
+}
+
+fn parse_stream_flag(p: *Parser) -> bool {
+    if parse_is_word(parse_tok(p), "stream") && parse_starts_type(parse_ahead(p, 1)) {
+        parse_next(p)
+        return true
+    }
+    false
+}
