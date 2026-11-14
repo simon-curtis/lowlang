@@ -1,18 +1,118 @@
 import compiler
 import target
+import std/atomic
+import std/os
 import std/path
+import std/rand
+import std/sync
+import std/time
 
-fn test_command(module_path: str, flags: []str) ! Error {
+fn test_command(args: []str) ! Error {
+    let options = parse_test_options(args)?
+    let started = time.monotonic()
+    let platform = target.host()
+    let cwd = os.getcwd() catch {
+        e => fail Error.Failed("current directory: {e}")
+    }
+    let standard = compiler.std_test_modules(platform)
+    let selector = Selector { platform, cwd, standard }
+    let modules = select_modules(selector, options.paths)?
+    let reporter = Reporter { options, selector, total: new(Counts {}) }
+    if !options.list {
+        announce_shuffle(options)
+    }
     let dir = scratch_directory("low-test-")?
     defer remove_directory(dir)
-    let platform = target.host()
-    let profile = compiler.release(platform)
-    let unit = compiler.analyse_tests(module_path, profile) catch Compile
-    report(unit)
-    let binary = path.join([dir, target.executable(platform, "tests")])
-    compiler.build(unit, binary) catch Compile
-    let status = run_binary(binary, flags)?
+    let live = new(Live { lock: sync.mutex(), handles: [:], dir })
+    watch_interrupts(live)
+    let built = prepare_modules(selector, live, options, modules, dir)?
+    if options.list {
+        list_selected(reporter, built)?
+        return
+    }
+    run_selected(reporter, live, built, started)?
+}
+
+fn announce_shuffle(options: TestOptions) {
+    match options.shuffle {
+        some(seed) => write_all(1, bytes(shuffle_line(options, seed)))
+        none => {}
+    }
+}
+
+fn prepare_modules(s: Selector, live: *Live, options: TestOptions, modules: []Module, dir: str) -> []*Built ! Error {
+    var built: []*Built = []
+    for i, m in modules {
+        let binary = path.join([dir, target.executable(s.platform, "tests{i}")])
+        let prepared = prepare_module(s, live, options, m, binary)
+        if prepared.state == BuildState.Ready {
+            prepared.tests = chosen_tests(s, options, m, prepared.tests)?
+        }
+        push(mut built, prepared)
+    }
+    built
+}
+
+fn list_selected(r: Reporter, built: []*Built) ! Error {
+    var broken = false
+    for b in built {
+        write_all(1, bytes(listing_text(r, b)))
+        if b.state == BuildState.Broken {
+            broken = true
+        }
+    }
+    if broken {
+        fail Exit(2)
+    }
+}
+
+fn plan_pool(options: TestOptions, live: *Live, built: []*Built) -> *Pool {
+    var jobs: []*Job = []
+    for b in built {
+        for test in b.tests {
+            for _ in 0..options.count {
+                let job = new_job(b, test)
+                push(mut b.jobs, job)
+                push(mut jobs, job)
+            }
+        }
+    }
+    var order: []i64 = []
+    for i in 0..jobs.len {
+        push(mut order, i)
+    }
+    match options.shuffle {
+        some(seed) => {
+            var generator = rand.seeded(u64(seed))
+            rand.shuffle(mut generator, mut order)
+        }
+        none => {}
+    }
+    let next = atomic.int(0)
+    let stopped = atomic.boolean(false)
+    new(Pool { options, jobs, order, next, stopped, live })
+}
+
+fn run_selected(r: Reporter, live: *Live, built: []*Built, started: i64) ! Error {
+    let pool = plan_pool(r.options, live, built)
+    start_pool(pool)
+    for b in built {
+        report_module(r, b)
+    }
+    let elapsed_ns = time.monotonic() - started
+    write_all(1, bytes(summary_line(r, elapsed_ns)))
+    let status = exit_status(r.total)
     if status != 0 {
         fail Exit(status)
     }
+}
+
+fn exit_status(total: *Counts) -> i64 {
+    if total.build_failed > 0 {
+        return 2
+    }
+    if failures(total) > 0 || total.not_run > 0 {
+        return 1
+    }
+    0
 }
