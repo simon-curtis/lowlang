@@ -1,0 +1,500 @@
+import std/compress/bzip2
+import std/compress/deflate
+import std/compress/snappy
+import std/compress/xz
+import std/compress/zstd
+import std/crypto
+import std/hash
+import std/io
+import std/serde
+import std/text
+
+/// A block compression codec of an object container file.
+pub enum Codec {
+    /// `null`: blocks are stored as they are.
+    Null
+    /// `deflate`: each block is a raw DEFLATE stream.
+    Deflate
+    /// `snappy`: each block is a Snappy block followed by the big-endian CRC-32 of the uncompressed data.
+    Snappy
+    /// `zstandard`: each block is a Zstandard frame.
+    Zstandard
+    /// `bzip2`: each block is a bzip2 stream.
+    Bzip2
+    /// `xz`: each block is an xz stream.
+    Xz
+}
+
+/// Returns the name of `codec` as stored in the `avro.codec` metadata of a file.
+pub fn codec_name(codec: Codec) -> str {
+    match codec {
+        Null => "null"
+        Deflate => "deflate"
+        Snappy => "snappy"
+        Zstandard => "zstandard"
+        Bzip2 => "bzip2"
+        Xz => "xz"
+    }
+}
+
+fn codec_by_name(name: str) -> Codec ! Error {
+    match name {
+        == "null" => Codec.Null
+        == "deflate" => Codec.Deflate
+        == "snappy" => Codec.Snappy
+        == "zstandard" => Codec.Zstandard
+        == "bzip2" => Codec.Bzip2
+        == "xz" => Codec.Xz
+        _ => fail Codec(name)
+    }
+}
+
+fn magic() -> []u8 {
+    [0x4F, 0x62, 0x6A, 0x01]
+}
+
+fn compress_block(codec: Codec, level: i64, data: []u8) -> []u8 {
+    match codec {
+        Null => data
+        Deflate => deflate.compress(data, level)
+        Snappy => {
+            var out = snappy.compress_block(data)
+            io.put_be32(mut out, i64(hash.crc32(data)))
+            out
+        }
+        Zstandard => zstd.compress(data, if level < 0 { 3 } else { level })
+        Bzip2 => bzip2.compress(data, if level < 0 { 9 } else { level })
+        Xz => xz.compress(data, if level < 0 { 6 } else { level })
+    }
+}
+
+fn decompress_block(codec: Codec, data: []u8, limit: i64) -> []u8 ! Error {
+    match codec {
+        Null => {
+            if data.len > limit {
+                fail TooLarge(0)
+            }
+            data
+        }
+        Deflate => deflate.decompress(data, limit) catch Io
+        Snappy => {
+            if data.len < 4 {
+                fail Truncated(data.len)
+            }
+            let body = data[..data.len - 4]
+            let out = snappy.decompress_block(body, limit) catch Io
+            let expected = io.u32_be(data, data.len - 4)
+            if hash.crc32(out) != expected {
+                fail Checksum
+            }
+            out
+        }
+        Zstandard => zstd.decompress(data, limit) catch Io
+        Bzip2 => bzip2.decompress(data, limit) catch Io
+        Xz => xz.decompress(data, limit) catch Io
+    }
+}
+
+/// Settings for `file_writer`.
+pub struct WriterOptions {
+    /// The compression codec for each block. Defaults to `Null`.
+    pub codec: Codec = Codec.Null
+    /// The compression level passed to the codec, or `-1` for the codec's default. `Snappy` and `Null` have no level.
+    pub level: i64 = -1
+    /// A block is closed once its uncompressed data reaches this many bytes. Defaults to `16000`.
+    pub block_bytes: i64 = 16000
+    /// The 16 byte sync marker. An empty value takes random bytes from `std/crypto`; a fixed marker makes the file reproducible.
+    pub sync: []u8 = []
+    /// Extra metadata entries written to the header. Keys beginning with `avro.` are reserved and rejected.
+    pub metadata: [str: []u8] = [:]
+}
+
+/// Writes an object container file: the header when it is made, then blocks of values.
+///
+/// Used through a pointer made by `file_writer`. Not safe for concurrent use.
+pub struct FileWriter {
+    schema: *Schema
+    codec: Codec
+    level: i64
+    block_bytes: i64
+    sync: []u8
+    sink: fn([]u8) ! io.Error
+    pending: []u8
+    count: i64
+    records: i64
+}
+
+fn same_bytes(a: []u8, b: []u8) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i, x in a {
+        if x != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn header_bytes(schema: *Schema, codec: Codec, sync: []u8, metadata: [str: []u8]) -> []u8 ! Error {
+    var entries: [str: []u8] = [:]
+    entries["avro.schema"] = bytes(to_json(schema))
+    entries["avro.codec"] = bytes(codec_name(codec))
+    for key, value in metadata {
+        if text.starts_with(key, "avro.") {
+            fail Mismatch("the metadata key {key} is reserved")
+        }
+        entries[key] = value
+    }
+    var out: []u8 = []
+    io.append(mut out, magic())
+    put_long(mut out, entries.len)
+    for key, value in entries {
+        put_long(mut out, key.len)
+        text.append(mut out, key)
+        put_long(mut out, value.len)
+        io.append(mut out, value)
+    }
+    push(mut out, 0)
+    io.append(mut out, sync)
+    out
+}
+
+/// Starts an object container file for `schema` and writes its header to `sink`.
+///
+/// `sink` receives each chunk of the file in order; a chunk is not kept after the call. Fails with `Mismatch` when `options.sync` is neither empty nor 16 bytes or `options.metadata` has a key that begins with `avro.`, and with `Io` when `sink` fails.
+pub fn file_writer(schema: *Schema, sink: fn([]u8) ! io.Error, options: WriterOptions) -> *FileWriter ! Error {
+    if options.sync.len != 0 && options.sync.len != 16 {
+        fail Mismatch("a sync marker is 16 bytes, found {options.sync.len}")
+    }
+    var sync = options.sync
+    if sync.len == 0 {
+        sync = crypto.random(16)
+    }
+    let header = header_bytes(schema, options.codec, sync, options.metadata)?
+    sink(header) catch Io
+    let block_bytes = if options.block_bytes < 1 { 1 } else { options.block_bytes }
+    new(FileWriter {
+        schema,
+        codec: options.codec,
+        level: options.level,
+        block_bytes,
+        sync,
+        sink,
+        pending: [],
+        count: 0,
+        records: 0,
+    })
+}
+
+/// Returns the 16 byte sync marker of the file `w` writes.
+pub fn writer_sync(w: *FileWriter) -> []u8 {
+    w.sync
+}
+
+/// Returns how many values have been appended to `w`, whether or not their block is written yet.
+pub fn written(w: *FileWriter) -> i64 {
+    w.records
+}
+
+/// Appends `v` to the current block of `w`, as a datum of the file's schema.
+///
+/// The block is written, compressed with the file's codec, once its data reaches `WriterOptions.block_bytes`. Fails with `Mismatch` when `v` does not fit the schema, leaving the file as it was, and with `Io` when writing a block fails.
+pub fn append(w: *FileWriter, v: Value) ! Error {
+    let mark = w.pending.len
+    encode_into(mut w.pending, w.schema, v) catch {
+        e => {
+            truncate(mut w.pending, mark)
+            fail e
+        }
+    }
+    w.count += 1
+    w.records += 1
+    if w.pending.len >= w.block_bytes {
+        flush(w)?
+    }
+}
+
+/// Appends `v` to `w` after converting it to a datum of the file's schema through `std/serde`; see `to_value`.
+pub fn write_value[T](w: *FileWriter, v: T) ! Error {
+    let value = to_value(w.schema, v)?
+    append(w, value)?
+}
+
+/// Writes the values appended since the last block as one block, and does nothing when there are none.
+pub fn flush(w: *FileWriter) ! Error {
+    if w.count == 0 {
+        return
+    }
+    let packed = compress_block(w.codec, w.level, w.pending)
+    var out: []u8 = []
+    put_long(mut out, w.count)
+    put_long(mut out, packed.len)
+    io.append(mut out, packed)
+    io.append(mut out, w.sync)
+    w.sink(out) catch Io
+    w.pending = []
+    w.count = 0
+}
+
+/// Writes the last block of `w`. A file has no footer, so the writer is then complete.
+pub fn finish(w: *FileWriter) ! Error {
+    flush(w)?
+}
+
+/// Settings for `open`.
+pub struct ReaderOptions {
+    /// The schema that values are resolved to, or `none` to yield them as written. See `resolve`.
+    pub reader_schema: *Schema? = none
+    /// Limits for decoding each value.
+    pub limits: Options = Options {}
+    /// The largest block, compressed or decompressed, in bytes. Defaults to `67108864`.
+    pub max_block: i64 = 67108864
+}
+
+/// Reads an object container file block by block.
+///
+/// Made by `open` and used through a pointer. Not safe for concurrent use.
+pub struct FileReader {
+    /// The schema the file was written with, from its header.
+    pub schema: *Schema
+    /// The codec of the file's blocks.
+    pub codec: Codec
+    /// The file's metadata, including `avro.schema` and `avro.codec`.
+    pub metadata: [str: []u8]
+    /// The 16 byte sync marker.
+    pub sync: []u8
+    source: *io.Reader
+    options: ReaderOptions
+    block: []u8
+    cursor: i64
+    left: i64
+    finished: bool
+    offset: i64
+}
+
+fn read_error(e: io.Error, at: i64) -> Error {
+    match e {
+        Eof => Truncated(at)
+        _ => Io(e)
+    }
+}
+
+fn byte_in(fr: *FileReader) -> u8 ! Error {
+    let b = io.read_byte(fr.source) catch {
+        e => fail read_error(e, fr.offset)
+    }
+    fr.offset += 1
+    b
+}
+
+fn long_in(fr: *FileReader) -> i64 ! Error {
+    var v: u64 = 0
+    var shift: u64 = 0
+    let start = fr.offset
+    for {
+        let b = byte_in(fr)?
+        if shift == 63 && b > 1 {
+            fail Invalid(start, "a long does not fit 64 bits")
+        }
+        v |= u64(b & 0x7F) << shift
+        if b < 0x80 {
+            break
+        }
+        shift += 7
+    }
+    i64(v >> 1) ^ -i64(v & 1)
+}
+
+fn exact_in(fr: *FileReader, n: i64) -> []u8 ! Error {
+    let out = io.read_exact(fr.source, n) catch {
+        e => fail read_error(e, fr.offset)
+    }
+    fr.offset += n
+    out
+}
+
+fn length_in(fr: *FileReader, what: str) -> i64 ! Error {
+    let at = fr.offset
+    let n = long_in(fr)?
+    if n < 0 {
+        fail Invalid(at, "negative {what} length")
+    }
+    if n > fr.options.limits.max_length {
+        fail TooLarge(at)
+    }
+    n
+}
+
+fn read_metadata(fr: *FileReader) -> [str: []u8] ! Error {
+    var entries: [str: []u8] = [:]
+    var total = 0
+    for {
+        let at = fr.offset
+        var count = long_in(fr)?
+        if count == 0 {
+            break
+        }
+        if count < 0 {
+            if count == -9223372036854775807 - 1 {
+                fail Invalid(at, "block count out of range")
+            }
+            count = -count
+            long_in(fr)?
+        }
+        total += count
+        if total > fr.options.limits.max_items {
+            fail TooLarge(at)
+        }
+        for _ in 0..count {
+            let key_length = length_in(fr, "metadata key")?
+            let key = str(exact_in(fr, key_length)?)
+            let value_length = length_in(fr, "metadata value")?
+            entries[key] = exact_in(fr, value_length)?
+        }
+    }
+    entries
+}
+
+/// Opens the object container file that `source` reads and reads its header.
+///
+/// Reads the magic number, the metadata, the schema (`avro.schema`), the codec (`avro.codec`, `null` when absent) and the sync marker. Fails with `Invalid` when the magic number is wrong or the schema is missing, `Schema` when the schema does not parse, `Codec` for an unknown codec, `Truncated` when the header is cut short, and `Io` when `source` fails. With `ReaderOptions.reader_schema` the values `next` returns are resolved to it.
+pub fn open(source: *io.Reader, options: ReaderOptions) -> *FileReader ! Error {
+    let placeholder = new(Schema { kind: Kind.Null })
+    let fr = new(FileReader {
+        schema: placeholder,
+        codec: Codec.Null,
+        metadata: [:],
+        sync: [],
+        source,
+        options,
+        block: [],
+        cursor: 0,
+        left: 0,
+        finished: false,
+        offset: 0,
+    })
+    let head = exact_in(fr, 4)?
+    if !same_bytes(head, magic()) {
+        fail Invalid(0, "not an Avro object container file")
+    }
+    fr.metadata = read_metadata(fr)?
+    let schema_bytes = fr.metadata["avro.schema"] ?? fail Invalid(fr.offset, "the header has no avro.schema")
+    fr.schema = parse(str(schema_bytes))?
+    match fr.metadata["avro.codec"] {
+        some(name) => {
+            fr.codec = codec_by_name(str(name))?
+        }
+        none => {}
+    }
+    fr.sync = exact_in(fr, 16)?
+    fr
+}
+
+/// Opens the object container file held in `data`; see `open`.
+pub fn open_bytes(data: []u8, options: ReaderOptions) -> *FileReader ! Error {
+    open(io.bytes_reader(data), options)?
+}
+
+fn next_block(fr: *FileReader) -> bool ! Error {
+    let start = fr.offset
+    let first = io.read_byte(fr.source) catch {
+        Eof => {
+            fr.finished = true
+            return false
+        }
+        e => fail Io(e)
+    }
+    fr.offset += 1
+    var v: u64 = u64(first & 0x7F)
+    var shift: u64 = 7
+    var more = first >= 0x80
+    for more {
+        let b = byte_in(fr)?
+        if shift == 63 && b > 1 {
+            fail Invalid(start, "a long does not fit 64 bits")
+        }
+        v |= u64(b & 0x7F) << shift
+        shift += 7
+        more = b >= 0x80
+    }
+    let count = i64(v >> 1) ^ -i64(v & 1)
+    let size = long_in(fr)?
+    if count < 0 || size < 0 {
+        fail Invalid(start, "negative block count or size")
+    }
+    if size > fr.options.max_block {
+        fail TooLarge(start)
+    }
+    let packed = exact_in(fr, size)?
+    let marker = exact_in(fr, 16)?
+    if !same_bytes(marker, fr.sync) {
+        fail Invalid(fr.offset - 16, "the sync marker does not match the header's")
+    }
+    let block = decompress_block(fr.codec, packed, fr.options.max_block)?
+    let each = min_size(fr.schema)
+    if each > 0 && count > block.len / each {
+        fail Invalid(start, "a block of {count} values cannot fit {block.len} bytes")
+    }
+    if each == 0 && count > fr.options.limits.max_items {
+        fail TooLarge(start)
+    }
+    fr.block = block
+    fr.cursor = 0
+    fr.left = count
+    true
+}
+
+/// Returns the next value of the file, or `none` after the last.
+///
+/// Reads and decompresses the next block when the current one is used up, and checks its sync marker. Fails with the errors of `open` for the stream, `Invalid` for a block that is cut short, has data left over, or ends with the wrong sync marker, `Checksum` for a Snappy block whose CRC-32 is wrong, `TooLarge` for a block over `ReaderOptions.max_block`, and the errors of `decode_with` and `resolve` for a value.
+pub fn next(fr: *FileReader) -> Value? ! Error {
+    for fr.left == 0 {
+        if fr.finished {
+            return none
+        }
+        if fr.cursor != fr.block.len {
+            fail Invalid(fr.offset, "bytes are left over in a block")
+        }
+        if !next_block(fr)? {
+            return none
+        }
+    }
+    let item = decode_first(fr.schema, fr.block[fr.cursor..], fr.options.limits)?
+    fr.cursor += item.length
+    fr.left -= 1
+    match fr.options.reader_schema {
+        some(target) => resolve(fr.schema, target, item.value)?
+        none => item.value
+    }
+}
+
+/// Reads every remaining value of the file into a slice.
+pub fn read_all(fr: *FileReader) -> []Value ! Error {
+    var out: []Value = []
+    for {
+        match next(fr)? {
+            some(v) => push(mut out, v)
+            none => break
+        }
+    }
+    out
+}
+
+/// Reads every remaining value of the file into a slice of `T` through `std/serde`; see `from_value`.
+///
+/// A failure of the file itself becomes `serde.Error.Syntax` carrying its message.
+pub fn read_values[T](fr: *FileReader) -> []T ! serde.Error {
+    var out: []T = []
+    for {
+        let next_value = next(fr) catch {
+            TooLarge(_) => fail serde.Error.TooLarge
+            e => fail serde.Error.Syntax(fr.offset, message(e))
+        }
+        match next_value {
+            some(v) => push(mut out, from_value[T](v)?)
+            none => break
+        }
+    }
+    out
+}

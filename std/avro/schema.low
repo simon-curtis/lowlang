@@ -1,0 +1,857 @@
+import std/io
+import std/json
+import std/text
+
+/// The type of an Avro schema.
+pub enum Kind {
+    /// `null`.
+    Null
+    /// `boolean`.
+    Bool
+    /// `int`, a 32-bit signed integer.
+    Int
+    /// `long`, a 64-bit signed integer.
+    Long
+    /// `float`, a 32-bit IEEE 754 number.
+    Float
+    /// `double`, a 64-bit IEEE 754 number.
+    Double
+    /// `bytes`.
+    Bytes
+    /// `string`, UTF-8 text.
+    String
+    /// `record`, a named list of fields.
+    Record
+    /// `enum`, a named list of symbols.
+    Enum
+    /// `array`, whose elements have the schema `item`.
+    Array
+    /// `map` from strings to values of the schema `item`.
+    Map
+    /// `union` of the schemas in `branches`.
+    Union
+    /// `fixed`, a named byte string of `size` bytes.
+    Fixed
+}
+
+/// A logical type that annotates the schema it is on.
+pub enum Logical {
+    /// No logical type.
+    Plain
+    /// `decimal` on `bytes` or `fixed`, with a `precision` of digits and a `scale` of them after the point.
+    Decimal(precision: i64, scale: i64)
+    /// `uuid` on `string` or `fixed` of 16 bytes.
+    Uuid
+    /// `date` on `int`.
+    Date
+    /// `time-millis` on `int`.
+    TimeMillis
+    /// `time-micros` on `long`.
+    TimeMicros
+    /// `timestamp-millis` on `long`.
+    TimestampMillis
+    /// `timestamp-micros` on `long`.
+    TimestampMicros
+    /// `timestamp-nanos` on `long`.
+    TimestampNanos
+    /// `local-timestamp-millis` on `long`.
+    LocalTimestampMillis
+    /// `local-timestamp-micros` on `long`.
+    LocalTimestampMicros
+    /// `local-timestamp-nanos` on `long`.
+    LocalTimestampNanos
+    /// `duration` on `fixed` of 12 bytes.
+    Duration
+}
+
+/// An Avro schema.
+///
+/// A schema is used through a pointer, and a named type that is used again, or that contains itself, is the same pointer. Only the members for its `kind` are used; the others hold their defaults.
+pub struct Schema {
+    /// The type.
+    pub kind: Kind
+    /// The full name, `namespace.name`, of a record, enum or fixed; empty for other kinds.
+    pub name: str = ""
+    /// The full names this named type is also known by.
+    pub aliases: []str = []
+    /// The documentation string of a record or enum; empty when absent.
+    pub doc: str = ""
+    /// The logical type that annotates this schema.
+    pub logical: Logical = Plain
+    /// The fields of a record, in order.
+    pub fields: []Field = []
+    /// The symbols of an enum, in order.
+    pub symbols: []str = []
+    /// The symbol an enum reader substitutes for a symbol it does not have.
+    pub default_symbol: str? = none
+    /// The element schema of an array or the value schema of a map.
+    pub item: *Schema? = none
+    /// The branches of a union, in order.
+    pub branches: []*Schema = []
+    /// The length in bytes of a fixed.
+    pub size: i64 = 0
+}
+
+/// A field of a record schema.
+pub struct Field {
+    /// The field name.
+    pub name: str
+    /// The other names a reader's field is known by.
+    pub aliases: []str
+    /// The documentation string; empty when absent.
+    pub doc: str
+    /// The schema of the field's value.
+    pub schema: *Schema
+    /// The JSON default value, which a reader uses when the writer's record has no such field.
+    pub default: json.Value?
+}
+
+struct Check {
+    where: str
+    schema: *Schema
+    value: json.Value
+}
+
+struct Parser {
+    names: [str: *Schema]
+    checks: []Check
+}
+
+/// Returns the name `kind` has in schema JSON, such as `long` or `record`.
+fn kind_name(kind: Kind) -> str {
+    match kind {
+        Null => "null"
+        Bool => "boolean"
+        Int => "int"
+        Long => "long"
+        Float => "float"
+        Double => "double"
+        Bytes => "bytes"
+        String => "string"
+        Record => "record"
+        Enum => "enum"
+        Array => "array"
+        Map => "map"
+        Union => "union"
+        Fixed => "fixed"
+    }
+}
+
+fn primitive_kind(name: str) -> Kind? {
+    match name {
+        == "null" => Kind.Null
+        == "boolean" => Kind.Bool
+        == "int" => Kind.Int
+        == "long" => Kind.Long
+        == "float" => Kind.Float
+        == "double" => Kind.Double
+        == "bytes" => Kind.Bytes
+        == "string" => Kind.String
+        _ => none
+    }
+}
+
+/// Returns the part of the full name `name` after its last `.`.
+fn short_name(name: str) -> str {
+    let i = text.last_index_byte(name, '.')
+    if i < 0 {
+        return name
+    }
+    name[i + 1..]
+}
+
+/// Returns the part of the full name `name` before its last `.`, or an empty string when it has none.
+fn namespace_of(name: str) -> str {
+    let i = text.last_index_byte(name, '.')
+    if i < 0 {
+        return ""
+    }
+    name[..i]
+}
+
+fn valid_name(s: str) -> bool {
+    if s.len == 0 {
+        return false
+    }
+    for i, c in s {
+        let letter = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+        let digit = c >= '0' && c <= '9'
+        if !letter && !(digit && i > 0) {
+            return false
+        }
+    }
+    true
+}
+
+fn valid_full_name(s: str) -> bool {
+    for part in text.split(s, '.') {
+        if !valid_name(part) {
+            return false
+        }
+    }
+    true
+}
+
+fn qualify(name: str, namespace: str?, enclosing: str) -> str ! Error {
+    if !valid_full_name(name) {
+        fail Schema("{text.quote(name)} is not a valid name")
+    }
+    if text.index_byte(name, '.') >= 0 {
+        return name
+    }
+    let space = namespace ?? enclosing
+    if space.len == 0 {
+        return name
+    }
+    if !valid_full_name(space) {
+        fail Schema("{text.quote(space)} is not a valid namespace")
+    }
+    "{space}.{name}"
+}
+
+fn string_member(j: json.Value, name: str) -> str? ! Error {
+    match json.get(j, name) {
+        some(v) => {
+            match v {
+                Str(s) => s
+                Null => none
+                _ => fail Schema("{name} must be a string")
+            }
+        }
+        none => none
+    }
+}
+
+fn int_member(j: json.Value, name: str) -> i64? ! Error {
+    match json.get(j, name) {
+        some(v) => {
+            match v {
+                Int(n) => n
+                _ => fail Schema("{name} must be an integer")
+            }
+        }
+        none => none
+    }
+}
+
+fn string_list(j: json.Value, name: str) -> []str ! Error {
+    var out: []str = []
+    match json.get(j, name) {
+        some(v) => {
+            match v {
+                Array(items) => {
+                    for item in items {
+                        match item {
+                            Str(s) => push(mut out, s)
+                            _ => fail Schema("an alias must be a string")
+                        }
+                    }
+                }
+                _ => fail Schema("{name} must be an array")
+            }
+        }
+        none => {}
+    }
+    out
+}
+
+fn alias_list(j: json.Value, enclosing: str) -> []str ! Error {
+    var out: []str = []
+    for a in string_list(j, "aliases")? {
+        push(mut out, qualify(a, none, enclosing)?)
+    }
+    out
+}
+
+fn branch_key(s: *Schema) -> str {
+    match s.kind {
+        Record => s.name
+        Enum => s.name
+        Fixed => s.name
+        _ => kind_name(s.kind)
+    }
+}
+
+fn parse_union(p: *Parser, items: []json.Value, enclosing: str) -> *Schema ! Error {
+    var branches: []*Schema = []
+    var seen: [str: bool] = [:]
+    for item in items {
+        let branch = parse_node(p, item, enclosing)?
+        if branch.kind == Kind.Union {
+            fail Schema("a union cannot contain a union")
+        }
+        let key = branch_key(branch)
+        if seen[key] != none {
+            fail Schema("a union cannot contain {text.quote(key)} twice")
+        }
+        seen[key] = true
+        push(mut branches, branch)
+    }
+    new(Schema { kind: Kind.Union, branches })
+}
+
+fn max_precision(size: i64) -> i64 {
+    var limit = f64(1)
+    for _ in 0..8 * size - 1 {
+        limit = limit * 2.0
+    }
+    var digits = 0
+    for limit >= 10.0 {
+        limit = limit / 10.0
+        digits += 1
+    }
+    digits
+}
+
+fn logical_of(j: json.Value, s: *Schema) -> Logical {
+    let name = string_member(j, "logicalType") or return Plain
+    let tag = name ?? return Plain
+    match tag {
+        == "decimal" => {
+            if s.kind != Kind.Bytes && s.kind != Kind.Fixed {
+                return Plain
+            }
+            let precision = int_member(j, "precision") or return Plain
+            let given = precision ?? return Plain
+            let scale_member = int_member(j, "scale") or return Plain
+            let scale = scale_member ?? 0
+            if given <= 0 || scale < 0 || scale > given {
+                return Plain
+            }
+            if s.kind == Kind.Fixed && given > max_precision(s.size) {
+                return Plain
+            }
+            Logical.Decimal(given, scale)
+        }
+        == "uuid" => {
+            if s.kind == Kind.String || s.kind == Kind.Fixed && s.size == 16 {
+                Logical.Uuid
+            } else {
+                Plain
+            }
+        }
+        == "date" => on_kind(s, Kind.Int, Logical.Date)
+        == "time-millis" => on_kind(s, Kind.Int, Logical.TimeMillis)
+        == "time-micros" => on_kind(s, Kind.Long, Logical.TimeMicros)
+        == "timestamp-millis" => on_kind(s, Kind.Long, Logical.TimestampMillis)
+        == "timestamp-micros" => on_kind(s, Kind.Long, Logical.TimestampMicros)
+        == "timestamp-nanos" => on_kind(s, Kind.Long, Logical.TimestampNanos)
+        == "local-timestamp-millis" => on_kind(s, Kind.Long, Logical.LocalTimestampMillis)
+        == "local-timestamp-micros" => on_kind(s, Kind.Long, Logical.LocalTimestampMicros)
+        == "local-timestamp-nanos" => on_kind(s, Kind.Long, Logical.LocalTimestampNanos)
+        == "duration" => {
+            if s.kind == Kind.Fixed && s.size == 12 {
+                Logical.Duration
+            } else {
+                Plain
+            }
+        }
+        _ => Plain
+    }
+}
+
+fn on_kind(s: *Schema, kind: Kind, logical: Logical) -> Logical {
+    if s.kind == kind {
+        return logical
+    }
+    Plain
+}
+
+fn parse_fields(p: *Parser, s: *Schema, j: json.Value) ! Error {
+    let list = json.get(j, "fields") ?? fail Schema("record {s.name} has no fields")
+    var items: []json.Value = []
+    match list {
+        Array(a) => {
+            items = a
+        }
+        _ => fail Schema("fields of record {s.name} must be an array")
+    }
+    let enclosing = namespace_of(s.name)
+    var names: [str: bool] = [:]
+    var fields: []Field = []
+    for item in items {
+        let name = string_member(item, "name")? ?? fail Schema("a field of record {s.name} has no name")
+        if !valid_name(name) {
+            fail Schema("{text.quote(name)} is not a valid field name")
+        }
+        if names[name] != none {
+            fail Schema("record {s.name} has the field {name} twice")
+        }
+        names[name] = true
+        let type_json = json.get(item, "type") ?? fail Schema("field {name} has no type")
+        let schema = parse_node(p, type_json, enclosing)?
+        let aliases = string_list(item, "aliases")?
+        let doc = string_member(item, "doc")? ?? ""
+        let default = json.get(item, "default")
+        match default {
+            some(d) => push(mut p.checks, Check { where: "{s.name}.{name}", schema, value: d })
+            none => {}
+        }
+        push(mut fields, Field { name, aliases, doc, schema, default })
+    }
+    s.fields = fields
+}
+
+fn parse_named(p: *Parser, j: json.Value, kind: Kind, enclosing: str) -> *Schema ! Error {
+    let name = string_member(j, "name")? ?? fail Schema("a {kind_name(kind)} has no name")
+    let full = qualify(name, string_member(j, "namespace")?, enclosing)?
+    if primitive_kind(short_name(full)) != none && text.index_byte(full, '.') < 0 {
+        fail Schema("{full} is a primitive type name")
+    }
+    if p.names[full] != none {
+        fail Schema("{full} is defined twice")
+    }
+    let s = new(Schema { kind, name: full })
+    p.names[full] = s
+    s.aliases = alias_list(j, namespace_of(full))?
+    s.doc = string_member(j, "doc")? ?? ""
+    match kind {
+        Record => parse_fields(p, s, j)?
+        Enum => {
+            let list = json.get(j, "symbols") ?? fail Schema("enum {full} has no symbols")
+            var symbols: []str = []
+            var seen: [str: bool] = [:]
+            match list {
+                Array(items) => {
+                    for item in items {
+                        match item {
+                            Str(sym) => {
+                                if !valid_name(sym) {
+                                    fail Schema("{text.quote(sym)} is not a valid symbol")
+                                }
+                                if seen[sym] != none {
+                                    fail Schema("enum {full} has the symbol {sym} twice")
+                                }
+                                seen[sym] = true
+                                push(mut symbols, sym)
+                            }
+                            _ => fail Schema("a symbol must be a string")
+                        }
+                    }
+                }
+                _ => fail Schema("symbols of enum {full} must be an array")
+            }
+            s.symbols = symbols
+            let default_symbol = string_member(j, "default")?
+            match default_symbol {
+                some(d) => {
+                    if seen[d] == none {
+                        fail Schema("the default {d} is not a symbol of enum {full}")
+                    }
+                    s.default_symbol = d
+                }
+                none => {}
+            }
+        }
+        _ => {
+            let size = int_member(j, "size")? ?? fail Schema("fixed {full} has no size")
+            if size < 0 {
+                fail Schema("fixed {full} has a negative size")
+            }
+            s.size = size
+        }
+    }
+    s.logical = logical_of(j, s)
+    s
+}
+
+fn parse_node(p: *Parser, j: json.Value, enclosing: str) -> *Schema ! Error {
+    match j {
+        Str(name) => {
+            match primitive_kind(name) {
+                some(kind) => return new(Schema { kind })
+                none => {}
+            }
+            let full = qualify(name, none, enclosing)?
+            let found = p.names[full] ?? p.names[name]
+            match found {
+                some(s) => s
+                none => fail Schema("{text.quote(name)} is not a known type")
+            }
+        }
+        Array(items) => parse_union(p, items, enclosing)?
+        Object(_) => parse_object(p, j, enclosing)?
+        _ => fail Schema("a schema must be a string, an array or an object")
+    }
+}
+
+fn parse_object(p: *Parser, j: json.Value, enclosing: str) -> *Schema ! Error {
+    let type_json = json.get(j, "type") ?? fail Schema("an object schema has no type")
+    match type_json {
+        Str(name) => {
+            match name {
+                == "record" => parse_named(p, j, Kind.Record, enclosing)?
+                == "enum" => parse_named(p, j, Kind.Enum, enclosing)?
+                == "fixed" => parse_named(p, j, Kind.Fixed, enclosing)?
+                == "array" => {
+                    let items = json.get(j, "items") ?? fail Schema("an array has no items")
+                    let item = parse_node(p, items, enclosing)?
+                    new(Schema { kind: Kind.Array, item })
+                }
+                == "map" => {
+                    let values = json.get(j, "values") ?? fail Schema("a map has no values")
+                    let item = parse_node(p, values, enclosing)?
+                    new(Schema { kind: Kind.Map, item })
+                }
+                _ => {
+                    let s = parse_node(p, type_json, enclosing)?
+                    if primitive_kind(name) != none {
+                        s.logical = logical_of(j, s)
+                    }
+                    s
+                }
+            }
+        }
+        _ => parse_node(p, type_json, enclosing)?
+    }
+}
+
+fn kind_of_value(j: json.Value) -> str {
+    match j {
+        Null => "null"
+        Bool(_) => "boolean"
+        Int(_) => "integer"
+        Float(_) => "number"
+        Str(_) => "string"
+        Array(_) => "array"
+        Object(_) => "object"
+    }
+}
+
+/// Parses the schema JSON `source` into a `Schema`.
+///
+/// The schema may be a primitive name, a union array or a type object. Names are qualified by `namespace` attributes and the enclosing namespace, a name used before its definition fails, and a record may contain itself through a union, array or map. A logical type that does not fit the type it annotates is ignored, as the specification says. Defaults are checked against their field's schema. Custom properties and `order` are ignored. Fails with `Schema` for malformed JSON, an unknown or repeated name, a union with two branches of one type, or an invalid default.
+pub fn parse(source: str) -> *Schema ! Error {
+    let j = json.parse(bytes(source)) catch {
+        e => fail Schema("not JSON: {e}")
+    }
+    parse_json(j)?
+}
+
+/// Builds a `Schema` from the parsed JSON `j`; see `parse`.
+fn parse_json(j: json.Value) -> *Schema ! Error {
+    let p = new(Parser { names: [:], checks: [] })
+    let root = parse_node(p, j, "")?
+    for c in p.checks {
+        check_default(c)?
+    }
+    root
+}
+
+fn check_default(c: Check) ! Error {
+    json_value(c.schema, c.value, 0) catch {
+        Mismatch(m) => fail Schema("default of {c.where}: {m}")
+        e => fail Schema("default of {c.where}: {message(e)}")
+    }
+}
+
+fn decode_codepoint(s: str, at: i64) -> u32 {
+    let lead = s[at]
+    let n = text.lead_len(lead)
+    if n <= 1 {
+        return u32(lead)
+    }
+    var c = u32(lead) & (0xFF >> u32(n + 1))
+    for i in 1..n {
+        c = c << 6 | u32(s[at + i]) & 0x3F
+    }
+    c
+}
+
+fn latin1_bytes(s: str) -> []u8 ! Error {
+    var out: []u8 = []
+    var at = 0
+    for at < s.len {
+        let c = decode_codepoint(s, at)
+        if c > 255 {
+            fail Mismatch("a bytes default holds a character above U+00FF")
+        }
+        push(mut out, u8(c))
+        at += text.lead_len(s[at])
+    }
+    out
+}
+
+fn latin1_text(data: []u8) -> str {
+    var out: []u8 = []
+    for b in data {
+        text.append_char(mut out, u32(b))
+    }
+    str(out)
+}
+
+fn json_value(schema: *Schema, j: json.Value, depth: i64) -> Value ! Error {
+    if depth > 64 {
+        fail Mismatch("default nests too deeply")
+    }
+    let raw = json_raw(schema, j, depth)?
+    apply_logical(schema, raw)
+}
+
+fn json_raw(schema: *Schema, j: json.Value, depth: i64) -> Value ! Error {
+    match schema.kind {
+        Null => {
+            match j {
+                Null => Value.Null
+                _ => fail Mismatch("expected null, found {kind_of_value(j)}")
+            }
+        }
+        Bool => {
+            match j {
+                Bool(b) => Value.Bool(b)
+                _ => fail Mismatch("expected a boolean, found {kind_of_value(j)}")
+            }
+        }
+        Int => {
+            match j {
+                Int(n) => {
+                    if n < -2147483648 || n > 2147483647 {
+                        fail Mismatch("{n} does not fit an int")
+                    }
+                    Value.Int(n)
+                }
+                _ => fail Mismatch("expected an int, found {kind_of_value(j)}")
+            }
+        }
+        Long => {
+            match j {
+                Int(n) => Value.Int(n)
+                _ => fail Mismatch("expected a long, found {kind_of_value(j)}")
+            }
+        }
+        Float => json_number(j)?
+        Double => json_number(j)?
+        Bytes => {
+            match j {
+                Str(s) => Value.Bytes(latin1_bytes(s)?)
+                _ => fail Mismatch("expected a string of bytes, found {kind_of_value(j)}")
+            }
+        }
+        String => {
+            match j {
+                Str(s) => Value.Str(s)
+                _ => fail Mismatch("expected a string, found {kind_of_value(j)}")
+            }
+        }
+        Fixed => {
+            match j {
+                Str(s) => {
+                    let data = latin1_bytes(s)?
+                    if data.len != schema.size {
+                        fail Mismatch("expected {schema.size} bytes, found {data.len}")
+                    }
+                    Value.Bytes(data)
+                }
+                _ => fail Mismatch("expected a string of bytes, found {kind_of_value(j)}")
+            }
+        }
+        Enum => {
+            match j {
+                Str(sym) => {
+                    for i, s in schema.symbols {
+                        if s == sym {
+                            return Value.Enum(i, sym)
+                        }
+                    }
+                    fail Mismatch("{sym} is not a symbol of {schema.name}")
+                }
+                _ => fail Mismatch("expected an enum symbol, found {kind_of_value(j)}")
+            }
+        }
+        Array => {
+            match j {
+                Array(items) => {
+                    let item_schema = schema.item ?? fail Mismatch("array without items")
+                    var out: []Value = []
+                    for item in items {
+                        push(mut out, json_value(item_schema, item, depth + 1)?)
+                    }
+                    Value.Array(out)
+                }
+                _ => fail Mismatch("expected an array, found {kind_of_value(j)}")
+            }
+        }
+        Map => {
+            match j {
+                Object(members) => {
+                    let item_schema = schema.item ?? fail Mismatch("map without values")
+                    var out: []Entry = []
+                    for m in members {
+                        push(mut out, Entry { key: m.name, value: json_value(item_schema, m.value, depth + 1)? })
+                    }
+                    Value.Map(out)
+                }
+                _ => fail Mismatch("expected an object, found {kind_of_value(j)}")
+            }
+        }
+        Record => {
+            match j {
+                Object(_) => {
+                    var out: []Member = []
+                    for f in schema.fields {
+                        let given = json.get(j, f.name)
+                        let source = given ?? f.default ?? fail Mismatch("no value for field {f.name}")
+                        push(mut out, Member { name: f.name, value: json_value(f.schema, source, depth + 1)? })
+                    }
+                    Value.Record(out)
+                }
+                _ => fail Mismatch("expected an object, found {kind_of_value(j)}")
+            }
+        }
+        Union => {
+            if schema.branches.len == 0 {
+                fail Mismatch("a default for an empty union")
+            }
+            Value.Union(0, new(json_value(schema.branches[0], j, depth + 1)?))
+        }
+    }
+}
+
+fn json_number(j: json.Value) -> Value ! Error {
+    match j {
+        Int(n) => Value.Float(f64(n))
+        Float(x) => Value.Float(x)
+        _ => fail Mismatch("expected a number, found {kind_of_value(j)}")
+    }
+}
+
+/// Returns the value that the JSON `default` stands for under `schema`.
+///
+/// Follows the specification's table of default encodings: `bytes` and `fixed` from a string of code points up to U+00FF, a union from its first branch, a record from an object whose missing members use their own defaults. Fails with `Mismatch` when the JSON does not fit the schema.
+fn default_value(schema: *Schema, default: json.Value) -> Value ! Error {
+    json_value(schema, default, 0)
+}
+
+/// Returns `raw`, the value of the underlying type of `schema`, as the logical variant `schema.logical` names.
+///
+/// A schema without a logical type, and a value of another variant than the underlying type's, are returned unchanged. A union and a record are not descended into.
+fn apply_logical(schema: *Schema, raw: Value) -> Value {
+    match schema.logical {
+        Plain => raw
+        Decimal(_, scale) => {
+            match raw {
+                Bytes(data) => Value.Decimal(data, scale)
+                _ => raw
+            }
+        }
+        Uuid => {
+            match raw {
+                Str(s) => Value.Uuid(s)
+                Bytes(data) => Value.Uuid(uuid_text(data))
+                _ => raw
+            }
+        }
+        Date => {
+            match raw {
+                Int(n) => Value.Date(n)
+                _ => raw
+            }
+        }
+        TimeMillis => {
+            match raw {
+                Int(n) => Value.TimeMillis(n)
+                _ => raw
+            }
+        }
+        TimeMicros => {
+            match raw {
+                Int(n) => Value.TimeMicros(n)
+                _ => raw
+            }
+        }
+        TimestampMillis => {
+            match raw {
+                Int(n) => Value.TimestampMillis(n)
+                _ => raw
+            }
+        }
+        TimestampMicros => {
+            match raw {
+                Int(n) => Value.TimestampMicros(n)
+                _ => raw
+            }
+        }
+        TimestampNanos => {
+            match raw {
+                Int(n) => Value.TimestampNanos(n)
+                _ => raw
+            }
+        }
+        LocalTimestampMillis => {
+            match raw {
+                Int(n) => Value.LocalTimestampMillis(n)
+                _ => raw
+            }
+        }
+        LocalTimestampMicros => {
+            match raw {
+                Int(n) => Value.LocalTimestampMicros(n)
+                _ => raw
+            }
+        }
+        LocalTimestampNanos => {
+            match raw {
+                Int(n) => Value.LocalTimestampNanos(n)
+                _ => raw
+            }
+        }
+        Duration => {
+            match raw {
+                Bytes(data) => {
+                    if data.len == 12 {
+                        Value.Duration(le32(data, 0), le32(data, 4), le32(data, 8))
+                    } else {
+                        raw
+                    }
+                }
+                _ => raw
+            }
+        }
+    }
+}
+
+/// Returns the value of the underlying type of a logical `v`, or `v` itself for any other variant.
+///
+/// A decimal becomes its `Bytes`, a UUID its `Str`, a date, time or timestamp its `Int` and a duration its twelve `Bytes`.
+fn raw_value(v: Value) -> Value {
+    match v {
+        Decimal(data, _) => Value.Bytes(data)
+        Uuid(t) => Value.Str(t)
+        Date(n) => Value.Int(n)
+        TimeMillis(n) => Value.Int(n)
+        TimeMicros(n) => Value.Int(n)
+        TimestampMillis(n) => Value.Int(n)
+        TimestampMicros(n) => Value.Int(n)
+        TimestampNanos(n) => Value.Int(n)
+        LocalTimestampMillis(n) => Value.Int(n)
+        LocalTimestampMicros(n) => Value.Int(n)
+        LocalTimestampNanos(n) => Value.Int(n)
+        Duration(months, days, millis) => {
+            var out: []u8 = []
+            io.put_le32(mut out, months)
+            io.put_le32(mut out, days)
+            io.put_le32(mut out, millis)
+            Value.Bytes(out)
+        }
+        _ => v
+    }
+}
+
+fn le32(data: []u8, at: i64) -> i64 {
+    io.le32(data, at) & 0xFFFFFFFF
+}
+
+fn uuid_bytes(t: str) -> []u8 ! Error {
+    if t.len != 36 || t[8] != '-' || t[13] != '-' || t[18] != '-' || t[23] != '-' {
+        fail Mismatch("{text.quote(t)} is not a UUID")
+    }
+    let digits = "{t[0..8]}{t[9..13]}{t[14..18]}{t[19..23]}{t[24..36]}"
+    text.decode_hex(digits) catch {
+        _ => fail Mismatch("{text.quote(t)} is not a UUID")
+    }
+}
+
+fn uuid_text(data: []u8) -> str {
+    let hex = text.encode_hex(data)
+    "{hex[0..8]}-{hex[8..12]}-{hex[12..16]}-{hex[16..20]}-{hex[20..32]}"
+}

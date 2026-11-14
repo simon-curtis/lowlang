@@ -1,0 +1,256 @@
+import std/text
+import std/unicode
+
+/// Decodes `data`, which was written with the schema `writer`, as a datum of the schema `reader`, with default `Options`.
+///
+/// See `resolve` for the rules applied.
+pub fn decode_resolved(writer: *Schema, reader: *Schema, data: []u8) -> Value ! Error {
+    decode_resolved_with(writer, reader, data, Options {})
+}
+
+/// Decodes `data` with the schema `writer` and resolves the datum against the schema `reader`.
+///
+/// Fails like `decode_with` for malformed data and like `resolve` for a datum that the reader cannot take.
+pub fn decode_resolved_with(writer: *Schema, reader: *Schema, data: []u8, options: Options) -> Value ! Error {
+    let v = decode_with(writer, data, options)?
+    resolve(writer, reader, v)?
+}
+
+/// Converts the datum `v`, decoded with the schema `writer`, to a datum of the schema `reader`, by the specification's schema resolution.
+///
+/// - A reader's record takes each field from the writer's field of the same name, or of one of the reader field's aliases; a field the writer lacks takes the reader field's default, and a writer field the reader lacks is dropped. Record, enum and fixed names must match by their unqualified names or a reader alias.
+/// - An enum symbol the reader lacks becomes the reader's enum default.
+/// - `int` promotes to `long`, `float` and `double`, `long` to `float` and `double`, `float` to `double`, and `string` and `bytes` convert to each other.
+/// - A writer's union selects its branch by the value, which resolves against the reader's schema or, when that is a union, against the first reader branch with the same type, else the first it promotes to.
+/// - Arrays and maps resolve their elements.
+///
+/// Fails with `Resolution`, naming the path, when the datum has no counterpart in the reader's schema, including a union branch, enum symbol or field that cannot be matched.
+pub fn resolve(writer: *Schema, reader: *Schema, v: Value) -> Value ! Error {
+    convert(writer, reader, v, 0)?
+}
+
+fn names_match(w: *Schema, r: *Schema) -> bool {
+    let short = short_name(w.name)
+    if short == short_name(r.name) {
+        return true
+    }
+    for a in r.aliases {
+        if a == w.name || short_name(a) == short {
+            return true
+        }
+    }
+    false
+}
+
+fn promotes(from: Kind, to: Kind) -> bool {
+    match from {
+        Int => to == Kind.Long || to == Kind.Float || to == Kind.Double
+        Long => to == Kind.Float || to == Kind.Double
+        Float => to == Kind.Double
+        String => to == Kind.Bytes
+        Bytes => to == Kind.String
+        _ => false
+    }
+}
+
+fn is_named(kind: Kind) -> bool {
+    kind == Kind.Record || kind == Kind.Enum || kind == Kind.Fixed
+}
+
+fn best_branch(w: *Schema, r: *Schema) -> i64? {
+    for i, b in r.branches {
+        if b.kind == w.kind && (!is_named(w.kind) || names_match(w, b)) {
+            return i
+        }
+    }
+    for i, b in r.branches {
+        if promotes(w.kind, b.kind) {
+            return i
+        }
+    }
+    none
+}
+
+fn unresolved(w: *Schema, r: *Schema) -> Error {
+    Resolution("a {kind_name(w.kind)} written cannot be read as {kind_name(r.kind)}")
+}
+
+fn convert(w: *Schema, r: *Schema, v: Value, depth: i64) -> Value ! Error {
+    if depth > 1024 {
+        fail Resolution("the datum nests too deeply")
+    }
+    if w == r {
+        return v
+    }
+    if w.kind == Kind.Union {
+        match v {
+            Union(index, inner) => {
+                if index < 0 || index >= w.branches.len {
+                    fail Resolution("union index {index} is outside the writer's branches")
+                }
+                let branch = w.branches[index]
+                if r.kind != Kind.Union {
+                    return convert(branch, r, *inner, depth + 1)?
+                }
+                let target = best_branch(branch, r) ?? fail Resolution("no branch of the reader's union takes a {kind_name(branch.kind)}")
+                let converted = convert(branch, r.branches[target], *inner, depth + 1)?
+                return Value.Union(target, new(converted))
+            }
+            _ => fail Resolution("a union datum is not a union value")
+        }
+    }
+    if r.kind == Kind.Union {
+        let target = best_branch(w, r) ?? fail Resolution("no branch of the reader's union takes a {kind_name(w.kind)}")
+        let converted = convert(w, r.branches[target], v, depth + 1)?
+        return Value.Union(target, new(converted))
+    }
+    match w.kind {
+        Record => convert_record(w, r, v, depth)?
+        Enum => convert_enum(w, r, v)?
+        Fixed => {
+            if r.kind != Kind.Fixed || !names_match(w, r) || w.size != r.size {
+                fail unresolved(w, r)
+            }
+            apply_logical(r, raw_value(v))
+        }
+        Array => {
+            if r.kind != Kind.Array {
+                fail unresolved(w, r)
+            }
+            match v {
+                Array(items) => {
+                    var out: []Value = []
+                    for i, item in items {
+                        let converted = convert(w.item ?? w, r.item ?? r, item, depth + 1) catch {
+                            Resolution(m) => fail Resolution("[{i}]: {m}")
+                            e => fail e
+                        }
+                        push(mut out, converted)
+                    }
+                    Value.Array(out)
+                }
+                _ => fail unresolved(w, r)
+            }
+        }
+        Map => {
+            if r.kind != Kind.Map {
+                fail unresolved(w, r)
+            }
+            match v {
+                Map(entries) => {
+                    var out: []Entry = []
+                    for e in entries {
+                        let converted = convert(w.item ?? w, r.item ?? r, e.value, depth + 1) catch {
+                            Resolution(m) => fail Resolution("[{text.quote(e.key)}]: {m}")
+                            err => fail err
+                        }
+                        push(mut out, Entry { key: e.key, value: converted })
+                    }
+                    Value.Map(out)
+                }
+                _ => fail unresolved(w, r)
+            }
+        }
+        _ => convert_primitive(w, r, v)?
+    }
+}
+
+fn convert_primitive(w: *Schema, r: *Schema, v: Value) -> Value ! Error {
+    if w.kind != r.kind && !promotes(w.kind, r.kind) {
+        fail unresolved(w, r)
+    }
+    let raw = raw_value(v)
+    match raw {
+        Int(n) => {
+            match r.kind {
+                Float => apply_logical(r, Value.Float(f64(f32(n))))
+                Double => apply_logical(r, Value.Float(f64(n)))
+                _ => apply_logical(r, raw)
+            }
+        }
+        Bytes(data) => {
+            if r.kind == Kind.String {
+                let s = str(data)
+                if !unicode.utf8_valid(s) {
+                    fail Resolution("bytes read as a string are not UTF-8")
+                }
+                return apply_logical(r, Value.Str(s))
+            }
+            apply_logical(r, raw)
+        }
+        Str(s) => {
+            if r.kind == Kind.Bytes {
+                return apply_logical(r, Value.Bytes(bytes(s)))
+            }
+            apply_logical(r, raw)
+        }
+        _ => apply_logical(r, raw)
+    }
+}
+
+fn convert_enum(w: *Schema, r: *Schema, v: Value) -> Value ! Error {
+    if r.kind != Kind.Enum || !names_match(w, r) {
+        fail unresolved(w, r)
+    }
+    match v {
+        Enum(_, symbol) => {
+            for i, s in r.symbols {
+                if s == symbol {
+                    return Value.Enum(i, symbol)
+                }
+            }
+            let fallback = r.default_symbol ?? fail Resolution("the symbol {symbol} is not a symbol of {r.name}")
+            for i, s in r.symbols {
+                if s == fallback {
+                    return Value.Enum(i, fallback)
+                }
+            }
+            fail Resolution("the default {fallback} is not a symbol of {r.name}")
+        }
+        _ => fail unresolved(w, r)
+    }
+}
+
+fn writer_field(w: *Schema, rf: Field) -> i64? {
+    for i, f in w.fields {
+        if f.name == rf.name {
+            return i
+        }
+    }
+    for a in rf.aliases {
+        for i, f in w.fields {
+            if f.name == a {
+                return i
+            }
+        }
+    }
+    none
+}
+
+fn convert_record(w: *Schema, r: *Schema, v: Value, depth: i64) -> Value ! Error {
+    if r.kind != Kind.Record || !names_match(w, r) {
+        fail unresolved(w, r)
+    }
+    var members: []Member = []
+    match v {
+        Record(source) => {
+            for rf in r.fields {
+                match writer_field(w, rf) {
+                    some(i) => {
+                        let converted = convert(w.fields[i].schema, rf.schema, source[i].value, depth + 1) catch {
+                            Resolution(m) => fail Resolution("{rf.name}: {m}")
+                            e => fail e
+                        }
+                        push(mut members, Member { name: rf.name, value: converted })
+                    }
+                    none => {
+                        let d = rf.default ?? fail Resolution("the reader's field {rf.name} has no default and the writer's record lacks it")
+                        push(mut members, Member { name: rf.name, value: default_value(rf.schema, d)? })
+                    }
+                }
+            }
+        }
+        _ => fail unresolved(w, r)
+    }
+    Value.Record(members)
+}
