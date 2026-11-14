@@ -2,6 +2,7 @@ import std/io
 
 extern "kernel32" {
     fn CreatePipe(mut read_end: i64, mut write_end: i64, attributes: ptr, size: u32) -> i32
+    fn CreateNamedPipeW(name: ptr, open_mode: u32, pipe_mode: u32, instances: u32, out_size: u32, in_size: u32, timeout: u32, security: ptr) -> i64
     fn PeekNamedPipe(h: i64, buf: ptr, size: u32, read: ptr, mut available: u32, left: ptr) -> i32
     fn WaitForSingleObject(h: i64, millis: u32) -> u32
 }
@@ -15,9 +16,20 @@ extern "ws2_32" {
 const file_type_char: u32 = 2
 const file_type_pipe: u32 = 3
 const largest_transfer = 1073741824
+const pipe_inbound: u32 = 1
+const pipe_outbound: u32 = 2
+const first_pipe_instance: u32 = 0x80000
+const overlapped_file: u32 = 0x40000000
+const reject_remote_clients: u32 = 8
+const pipe_buffer: u32 = 65536
+const pipe_name_attempts = 8
+const operation_size = 32
+const operation_event = 24
+const error_pipe_busy = 231
+const error_cancelled = 995
 
 fn is_socket(fd: i64) -> bool {
-    event_of(fd) != 0
+    event_of(fd) != 0 && !is_overlapped(fd)
 }
 
 /// Closes the descriptor number `fd`.
@@ -25,6 +37,11 @@ fn is_socket(fd: i64) -> bool {
 /// A negative number stands for no descriptor and is ignored. Errors from the kernel are ignored, because nothing can be done about a descriptor that failed to close.
 pub fn close_fd(fd: i64) {
     if fd < 0 {
+        return
+    }
+    if is_overlapped(fd) {
+        CloseHandle(handle(fd))
+        CloseHandle(event_of(fd))
         return
     }
     if is_socket(fd) {
@@ -36,19 +53,70 @@ pub fn close_fd(fd: i64) {
     CloseHandle(fd)
 }
 
+fn interrupt(fd: i64) {
+    if fd >= 0 && is_overlapped(fd) {
+        CancelIoEx(handle(fd), null)
+    }
+}
+
 fn discard_input(s: i64) {
     let buf = io.buffer(4096)
     for win_recv(s, __slice_ptr(buf), i32(buf.len), 0) > 0 {}
 }
 
+fn clamped(n: i64) -> i64 {
+    if n < largest_transfer { n } else { largest_transfer }
+}
+
+fn transfer_failure(code: i64, reading: bool) -> i64 ! io.Error {
+    if reading && (code == 109 || code == 38) {
+        return 0
+    }
+    if code == error_cancelled {
+        fail NotConnected
+    }
+    fail win_error(code)
+}
+
+fn overlapped_transfer(fd: i64, buf: []u8, size: i64, reading: bool) -> i64 ! io.Error {
+    let h = handle(fd)
+    let event = event_of(fd)
+    let operation = io.buffer(operation_size)
+    io.set_le64(operation, operation_event, event)
+    let kept = pin(operation)
+    let data = pin(buf)
+    var done: u32 = 0
+    let started = if reading {
+        ReadFile(h, data, u32(size), mut done, kept)
+    } else {
+        WriteFile(h, data, u32(size), mut done, kept)
+    }
+    var code = GetLastError()
+    var ok = started != 0
+    if !ok && code == io_pending {
+        wait_readable(event)
+        ok = GetOverlappedResult(h, kept, mut done, 1) != 0
+        code = GetLastError()
+    }
+    unpin(data)
+    unpin(kept)
+    if !ok {
+        return transfer_failure(i64(code), reading)
+    }
+    i64(done)
+}
+
 /// Reads once from the descriptor number `fd` without waiting.
 ///
-/// Fails with `WouldBlock` when `fd` is non-blocking and has no data. An interrupted read is repeated.
+/// Fails with `WouldBlock` when `fd` is non-blocking and has no data. An interrupted read is repeated. On Windows a read from an overlapped pipe parks the green thread until it completes instead of failing with `WouldBlock`.
 pub fn try_read(fd: i64, buf: []u8) -> i64 ! io.Error {
     if buf.len == 0 {
         return 0
     }
-    let size = if buf.len < largest_transfer { buf.len } else { largest_transfer }
+    let size = clamped(buf.len)
+    if is_overlapped(fd) {
+        return overlapped_transfer(fd, buf, size, true)
+    }
     var done: u32 = 0
     if ReadFile(handle(fd), __slice_ptr(buf), u32(size), mut done, null) != 0 {
         return i64(done)
@@ -62,12 +130,15 @@ pub fn try_read(fd: i64, buf: []u8) -> i64 ! io.Error {
 
 /// Writes once to the descriptor number `fd` without waiting.
 ///
-/// Fails with `WouldBlock` when `fd` is non-blocking and cannot take output. An interrupted write is repeated.
+/// Fails with `WouldBlock` when `fd` is non-blocking and cannot take output. An interrupted write is repeated. On Windows a write to an overlapped pipe parks the green thread until it completes instead of failing with `WouldBlock`.
 pub fn try_write(fd: i64, data: []u8) -> i64 ! io.Error {
     if data.len == 0 {
         return 0
     }
-    let size = if data.len < largest_transfer { data.len } else { largest_transfer }
+    let size = clamped(data.len)
+    if is_overlapped(fd) {
+        return overlapped_transfer(fd, data, size, false)
+    }
     var done: u32 = 0
     checked(WriteFile(handle(fd), __slice_ptr(data), u32(size), mut done, null))?
     i64(done)
@@ -75,7 +146,7 @@ pub fn try_write(fd: i64, data: []u8) -> i64 ! io.Error {
 
 /// Makes the descriptor number `fd` non-blocking.
 ///
-/// On Windows only a socket becomes non-blocking; a pipe or file stays blocking, and a read from it holds an OS thread until it returns.
+/// On Windows only a socket becomes non-blocking; a pipe or file stays as it was made, and a pipe from `pipe(true)` or `pipe_for_child` is already overlapped.
 pub fn set_nonblocking(fd: i64) ! io.Error {
     if !is_socket(fd) {
         return
@@ -90,14 +161,97 @@ fn socket_nonblocking(s: i64) ! io.Error {
     }
 }
 
+fn pipe_name() -> str ! io.Error {
+    let bits = random_bytes(8)?
+    let id = io.le64(bits, 0) & 0x7FFFFFFFFFFFFFFF
+    "\\\\.\\pipe\\low.{GetCurrentProcessId()}.{id}"
+}
+
+fn named_pipe(server_reads: bool, client_overlapped: bool) -> Pair ! io.Error {
+    let server_mode = if server_reads { pipe_inbound } else { pipe_outbound }
+    let client_access = if server_reads { generic_write } else { generic_read }
+    let client_flags = if client_overlapped { overlapped_file } else { 0 }
+    for _ in 0..pipe_name_attempts {
+        let name = wide(pipe_name()?)
+        let server = CreateNamedPipeW(__slice_ptr(name), server_mode | overlapped_file | first_pipe_instance, reject_remote_clients, 1, pipe_buffer, pipe_buffer, 0, null)
+        if server == invalid_handle {
+            let code = i64(GetLastError())
+            if code == 5 || code == error_pipe_busy {
+                continue
+            }
+            fail win_error(code)
+        }
+        let client = CreateFileW(__slice_ptr(name), client_access, 0, null, 3, client_flags, 0)
+        if client == invalid_handle {
+            let e = last_error()
+            CloseHandle(server)
+            fail e
+        }
+        if server_reads {
+            return Pair { first: server, second: client }
+        }
+        return Pair { first: client, second: server }
+    }
+    fail Exists
+}
+
+fn overlapped_end(h: i64) -> i64 ! io.Error {
+    let event = opened(CreateEventW(null, 1, 0, null)) catch {
+        e => {
+            CloseHandle(h)
+            fail e
+        }
+    }
+    h | overlapped_tag | (event << 32)
+}
+
 /// Returns the read end and the write end of a new pipe, both closed on `exec`.
 ///
-/// On Linux the ends are non-blocking when `nonblocking` is `true` and blocking otherwise. On Windows they are always blocking.
+/// The ends are non-blocking when `nonblocking` is `true` and blocking otherwise. On Windows the non-blocking ends are overlapped handles that park the green thread on a read or write, and the blocking ones are anonymous pipe handles.
 pub fn pipe(nonblocking: bool) -> Pair ! io.Error {
+    if nonblocking {
+        let ends = named_pipe(true, true)?
+        let first = overlapped_end(ends.first) catch {
+            e => {
+                CloseHandle(ends.second)
+                fail e
+            }
+        }
+        let second = overlapped_end(ends.second) catch {
+            e => {
+                close_fd(first)
+                fail e
+            }
+        }
+        return Pair { first, second }
+    }
     var first: i64 = 0
     var second: i64 = 0
     checked(CreatePipe(mut first, mut second, null, 0))?
     Pair { first, second }
+}
+
+/// Returns a pipe for one standard stream of a child process: the end the parent keeps is non-blocking and the end the child receives is blocking.
+///
+/// The parent holds the write end, `second`, when `input` is `true`, and the read end, `first`, otherwise. Both ends are closed on `exec`.
+pub fn pipe_for_child(input: bool) -> Pair ! io.Error {
+    let ends = named_pipe(!input, false)?
+    if input {
+        let parent = overlapped_end(ends.second) catch {
+            e => {
+                CloseHandle(ends.first)
+                fail e
+            }
+        }
+        return Pair { first: ends.first, second: parent }
+    }
+    let parent = overlapped_end(ends.first) catch {
+        e => {
+            CloseHandle(ends.second)
+            fail e
+        }
+    }
+    Pair { first: parent, second: ends.second }
 }
 
 /// Returns whether the descriptor number `fd` has data to read or has reached end of input, without waiting.

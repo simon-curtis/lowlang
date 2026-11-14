@@ -17,6 +17,10 @@ extern "kernel32" {
     fn Process32NextW(snapshot: i64, entry: ptr) -> i32
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> i64
     fn TerminateProcess(process: i64, code: u32) -> i32
+    fn CreateJobObjectW(attributes: ptr, name: ptr) -> i64
+    fn AssignProcessToJobObject(job: i64, process: i64) -> i32
+    fn TerminateJobObject(job: i64, code: u32) -> i32
+    fn ResumeThread(thread: i64) -> u32
     fn GetExitCodeProcess(process: i64, mut code: u32) -> i32
     fn InitializeProcThreadAttributeList(list: ptr, count: u32, flags: u32, mut size: i64) -> i32
     fn UpdateProcThreadAttribute(list: ptr, flags: u32, attribute: i64, value: ptr, size: i64, previous: ptr, returned: ptr) -> i32
@@ -65,7 +69,7 @@ extern struct ProcessInformation {
 
 const infinite: u32 = 0xFFFFFFFF
 const terminated_code: u32 = 1
-const terminate_access: u32 = 0x1001
+const terminate_access: u32 = 0x101001
 
 fn memory(address: i64, size: i64) -> ptr {
     __slice_ptr(__str_raw(address, size))
@@ -326,6 +330,9 @@ pub fn handler_of(n: i64) -> i64 ! io.Error {
 }
 
 fn terminate(process: i64, signal: i64) ! io.Error {
+    if WaitForSingleObject(process, 0) == 0 {
+        fail NotFound
+    }
     if signal == 0 {
         return
     }
@@ -333,6 +340,8 @@ fn terminate(process: i64, signal: i64) ! io.Error {
 }
 
 /// Sends signal number `signal` to the process `pid`, or to the process group `-pid` when `pid` is negative.
+///
+/// On Windows it fails with `NotFound` when the process has exited, including while another handle keeps its process object open.
 pub fn kill(pid: i64, signal: i64) ! io.Error {
     let target = if pid < 0 { -pid } else { pid }
     let process = opened(OpenProcess(terminate_access, 0, u32(target)))?
@@ -343,6 +352,17 @@ pub fn kill(pid: i64, signal: i64) ! io.Error {
         }
     }
     CloseHandle(process)
+}
+
+/// Sends signal number `signal` to every process of the group that `fork_exec` started for the child `pid`.
+///
+/// On Linux that is the process group `pid` and `group` is not used. On Windows it is the job object `group`, which ends every process in it with status 1 for any signal other than `0`, and fails with `NotConnected` once `group` is closed.
+pub fn kill_group(group: FdHandle, pid: i64, signal: i64) ! io.Error {
+    if signal == 0 {
+        return
+    }
+    using lease = enter(group)?
+    checked(TerminateJobObject(group.fd, terminated_code))?
 }
 
 /// Sends signal number `signal` to the calling thread.
@@ -492,7 +512,7 @@ fn create_process(path: str, argv: []str, envp: []str, dir: str, group: bool, ha
         input: handles[0], output: handles[1], error: handles[2], attributes: __slice_ptr(list),
     }
     var info = ProcessInformation { process: 0, thread: 0, pid: 0, tid: 0 }
-    let flags: u32 = if group { 0x80600 } else { 0x80400 }
+    let flags: u32 = if group { 0x80604 } else { 0x80400 }
     let ok = CreateProcessW(__slice_ptr(application), __slice_ptr(command), null, null, 1, flags, __slice_ptr(environment), directory_ptr, mut startup, mut info)
     let code = GetLastError()
     DeleteProcThreadAttributeList(__slice_ptr(list))
@@ -500,13 +520,33 @@ fn create_process(path: str, argv: []str, envp: []str, dir: str, group: bool, ha
     if ok == 0 {
         fail win_error(i64(code))
     }
-    CloseHandle(info.thread)
     info
+}
+
+fn join_group(info: ProcessInformation) -> i64 ! io.Error {
+    let job = opened(CreateJobObjectW(null, null))?
+    if AssignProcessToJobObject(job, info.process) == 0 {
+        let e = last_error()
+        CloseHandle(job)
+        fail e
+    }
+    if ResumeThread(info.thread) == 0xFFFFFFFF {
+        let e = last_error()
+        CloseHandle(job)
+        fail e
+    }
+    job
+}
+
+fn abandon(info: ProcessInformation) {
+    TerminateProcess(info.process, terminated_code)
+    CloseHandle(info.process)
+    CloseHandle(info.thread)
 }
 
 /// Starts the program at `path` in a new process and returns once the program has been executed.
 ///
-/// `argv` is the whole argument vector, program name first, and `envp` is the complete environment as `name=value` entries. A `dir` that is not empty becomes the working directory of the child. With `group` the child starts its own process group. `stdin`, `stdout` and `stderr` are descriptors the child receives as standard streams, and a negative one leaves that stream as the parent's. On Linux the parent waits for the child to report on a pipe that closes when the program is executed, so the call parks the green thread until then.
+/// `argv` is the whole argument vector, program name first, and `envp` is the complete environment as `name=value` entries. A `dir` that is not empty becomes the working directory of the child. With `group` the child starts its own process group, which on Windows is a job object that holds the child and every process it starts, so the child starts suspended, joins the job and then runs; this needs Windows 8 or later when the parent is itself in a job. `stdin`, `stdout` and `stderr` are descriptors the child receives as standard streams, and a negative one leaves that stream as the parent's. On Linux the parent waits for the child to report on a pipe that closes when the program is executed, so the call parks the green thread until then.
 ///
 /// Fails with the system error when the pipe or the fork fails, and on Windows when the program cannot be started. On Linux an error of `chdir` or `execve` in the child comes back in `Spawned.failure`; on Windows `Spawned.failure` is always `none`.
 pub fn fork_exec(path: str, argv: []str, envp: []str, dir: str, group: bool, stdin: i64, stdout: i64, stderr: i64) -> Spawned ! io.Error {
@@ -527,5 +567,16 @@ pub fn fork_exec(path: str, argv: []str, envp: []str, dir: str, group: bool, std
         }
     }
     close_all(handles)
-    Spawned { pid: i64(info.pid), pidfd: wrap(info.process), failure: none }
+    var members = wrap(-1)
+    if group {
+        let job = join_group(info) catch {
+            e => {
+                abandon(info)
+                fail e
+            }
+        }
+        members = wrap(job)
+    }
+    CloseHandle(info.thread)
+    Spawned { pid: i64(info.pid), pidfd: wrap(info.process), group: members, failure: none }
 }
