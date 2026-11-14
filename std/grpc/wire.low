@@ -1,0 +1,198 @@
+import std/compress/deflate
+import std/io
+import std/text
+
+/// A message compression algorithm of `grpc-encoding`.
+pub enum Encoding {
+    /// No compression.
+    Identity
+    /// gzip (RFC 1952).
+    Gzip
+    /// zlib-wrapped deflate (RFC 1950), which gRPC calls `deflate`.
+    Deflate
+}
+
+/// Returns the name of `e` in `grpc-encoding`.
+pub fn encoding_name(e: Encoding) -> str {
+    match e {
+        Identity => "identity"
+        Gzip => "gzip"
+        Deflate => "deflate"
+    }
+}
+
+/// Returns the encoding called `name`, or `none` for a name this package does not implement.
+pub fn parse_encoding(name: str) -> Encoding? {
+    match text.lower(text.trim(name)) {
+        == "identity" => Encoding.Identity
+        == "gzip" => Encoding.Gzip
+        == "deflate" => Encoding.Deflate
+        _ => none
+    }
+}
+
+/// Returns the list this package accepts, as sent in `grpc-accept-encoding`: `identity,gzip,deflate`.
+pub fn accepted_encodings() -> str {
+    "identity,gzip,deflate"
+}
+
+/// Returns whether the comma-separated `list`, such as a `grpc-accept-encoding` value, names `e`. `identity` is always accepted.
+pub fn accepts(list: str, e: Encoding) -> bool {
+    if e == Encoding.Identity {
+        return true
+    }
+    let name = encoding_name(e)
+    for part in text.split(list, ',') {
+        if text.lower(text.trim(part)) == name {
+            return true
+        }
+    }
+    false
+}
+
+/// Returns the first encoding in the comma-separated `list` that this package implements, or `Identity` when none is.
+pub fn first_encoding(list: str) -> Encoding {
+    for part in text.split(list, ',') {
+        match parse_encoding(part) {
+            some(e) => return e
+            none => {}
+        }
+    }
+    Identity
+}
+
+fn compress_with(e: Encoding, data: []u8) -> []u8 {
+    match e {
+        Identity => data
+        Gzip => deflate.gzip_compress(data, 6)
+        Deflate => deflate.zlib_compress(data, 6)
+    }
+}
+
+fn decompress_with(e: Encoding, data: []u8, limit: i64) -> []u8 ! Error {
+    let out = match e {
+        Identity => return data
+        Gzip => deflate.gzip_decompress(data, limit)
+        Deflate => deflate.zlib_decompress(data, limit)
+    } catch {
+        TooLarge => fail error(ResourceExhausted, "decompressed message larger than max {limit}")
+        _ => fail error(Internal, "failed to decompress the message")
+    }
+    out
+}
+
+/// Returns the length-prefixed message that carries `data`: the compressed flag, the length as four big-endian bytes and the bytes.
+pub fn frame(data: []u8, compressed: bool) -> []u8 {
+    var out: []u8 = [if compressed { 1 } else { 0 }]
+    io.put_be32(mut out, data.len)
+    io.append(mut out, data)
+    out
+}
+
+/// Returns `data` compressed with `e` and framed, or framed as it is for `Identity`.
+pub fn encode_message_frame(data: []u8, e: Encoding) -> []u8 {
+    frame(compress_with(e, data), e != Encoding.Identity)
+}
+
+/// Splits a byte stream into length-prefixed messages as the bytes arrive in pieces of any size.
+///
+/// Each message is decompressed with the encoding the reader was made with. Its fields are private.
+pub struct MessageReader {
+    buffer: []u8
+    start: i64
+    encoding: Encoding
+    limit: i64
+}
+
+/// Returns a reader that fails with `ResourceExhausted` for a message, or a decompressed message, longer than `limit` bytes, and decompresses messages with the compressed flag using `encoding`.
+pub fn message_reader(limit: i64, encoding: Encoding) -> *MessageReader {
+    new(MessageReader { buffer: [], start: 0, encoding, limit })
+}
+
+/// Appends `data` to what `r` has received.
+pub fn feed(r: *MessageReader, data: []u8) {
+    if r.start > 0 && r.start == r.buffer.len {
+        r.buffer = []
+        r.start = 0
+    } else if r.start >= 65536 && r.start * 2 >= r.buffer.len {
+        var rest: []u8 = []
+        io.append(mut rest, r.buffer[r.start..])
+        r.buffer = rest
+        r.start = 0
+    }
+    io.append(mut r.buffer, data)
+}
+
+/// Returns the next complete message of `r`, or `none` when the bytes received do not hold one yet.
+///
+/// Fails with `Internal` for a compressed flag other than 0 and 1, for a compressed message when the encoding is `Identity` and for data that does not decompress, and with `ResourceExhausted` for a message longer than the limit.
+pub fn take(r: *MessageReader) -> []u8? ! Error {
+    let have = r.buffer.len - r.start
+    if have < 5 {
+        return none
+    }
+    let flag = r.buffer[r.start]
+    if flag > 1 {
+        fail error(Internal, "invalid compressed flag {flag}")
+    }
+    let length = io.be32(r.buffer, r.start + 1)
+    if length > r.limit {
+        fail error(ResourceExhausted, "received message larger than max ({length} vs. {r.limit})")
+    }
+    if have < 5 + length {
+        return none
+    }
+    let body = r.buffer[r.start + 5..r.start + 5 + length]
+    r.start += 5 + length
+    if flag == 0 {
+        return body
+    }
+    if r.encoding == Encoding.Identity {
+        fail error(Internal, "compressed message but no grpc-encoding was sent")
+    }
+    decompress_with(r.encoding, body, r.limit)?
+}
+
+/// Returns the number of received bytes that are not yet part of a message `take` returned.
+pub fn pending(r: *MessageReader) -> i64 {
+    r.buffer.len - r.start
+}
+
+/// Returns `grpc-timeout` text for `nanos`, using the finest unit that fits in eight digits and rounding up, or `none` when `nanos` is not positive.
+pub fn encode_timeout(nanos: i64) -> str? {
+    if nanos <= 0 {
+        return none
+    }
+    let units = ["n", "u", "m", "S", "M", "H"]
+    let sizes = [1, 1000, 1000000, 1000000000, 60000000000, 3600000000000]
+    for i in 0..units.len {
+        let n = (nanos + sizes[i] - 1) / sizes[i]
+        if n <= 99999999 {
+            return "{n}{units[i]}"
+        }
+    }
+    "99999999H"
+}
+
+/// Returns the nanoseconds of a `grpc-timeout` value: one to eight digits and a unit of `H`, `M`, `S`, `m`, `u` or `n`. Returns `none` for any other text.
+pub fn parse_timeout(value: str) -> i64? {
+    if value.len < 2 || value.len > 9 {
+        return none
+    }
+    let digits = value[..value.len - 1]
+    for i in 0..digits.len {
+        if digits[i] < '0' || digits[i] > '9' {
+            return none
+        }
+    }
+    let n = text.parse_uint(digits, 10) or return none
+    match value[value.len - 1] {
+        'H' => n * 3600000000000
+        'M' => n * 60000000000
+        'S' => n * 1000000000
+        'm' => n * 1000000
+        'u' => n * 1000
+        'n' => n
+        _ => none
+    }
+}

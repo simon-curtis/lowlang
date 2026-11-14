@@ -1,0 +1,156 @@
+import std/cancel
+import std/sync
+
+/// The serving state of a service in `grpc.health.v1`.
+pub enum ServingStatus {
+    /// The state is not known.
+    Unknown = 0
+    /// The service is serving.
+    Serving = 1
+    /// The service is not serving.
+    NotServing = 2
+    /// The service is not registered. Only `Watch` reports it.
+    ServiceUnknown = 3
+}
+
+/// The request of `grpc.health.v1.Health/Check` and `Watch`.
+pub struct HealthCheckRequest {
+    /// The service to ask about, or empty for the server as a whole.
+    pub service: str "1"
+}
+
+/// The response of `grpc.health.v1.Health/Check` and `Watch`.
+pub struct HealthCheckResponse {
+    /// The serving state.
+    pub status: ServingStatus "1"
+}
+
+struct Watch {
+    wake: chan[bool]
+}
+
+struct HealthState {
+    lock: sync.Mutex
+    statuses: [str: ServingStatus]
+    watches: [str: []*Watch]
+}
+
+/// The state of the services of a server, answering `grpc.health.v1.Health`.
+///
+/// Make one with `health`, set the state of each service with `set_health` and serve it with `register_health`.
+pub struct Health {
+    state: *HealthState
+}
+
+/// Returns a `Health` in which the server as a whole, the empty service name, is `Serving`.
+pub fn health() -> Health {
+    let state = new(HealthState { lock: sync.mutex(), statuses: [:], watches: [:] })
+    state.statuses[""] = Serving
+    Health { state }
+}
+
+/// Sets the state of `service`, the empty string for the server as a whole, and wakes the `Watch` calls waiting on it.
+pub fn set_health(h: Health, service: str, status: ServingStatus) {
+    let state = h.state
+    sync.lock(state.lock)
+    state.statuses[service] = status
+    let watching = state.watches[service] ?? []
+    sync.unlock(state.lock)
+    for w in watching {
+        select {
+            w.wake <- true => {}
+            else => {}
+        }
+    }
+}
+
+/// Sets every service, including the server as a whole, to `NotServing`, which a server does before it shuts down.
+pub fn set_all_not_serving(h: Health) {
+    let state = h.state
+    sync.lock(state.lock)
+    var names: []str = []
+    for name in state.statuses {
+        push(mut names, name)
+    }
+    sync.unlock(state.lock)
+    for name in names {
+        set_health(h, name, NotServing)
+    }
+}
+
+/// Returns the state of `service`, or `none` when it was never set.
+pub fn health_of(h: Health, service: str) -> ServingStatus? {
+    let state = h.state
+    sync.lock(state.lock)
+    let status = state.statuses[service]
+    sync.unlock(state.lock)
+    status
+}
+
+fn check(h: Health, ctx: *Context, req: HealthCheckRequest) -> HealthCheckResponse ! Error {
+    match health_of(h, req.service) {
+        some(status) => HealthCheckResponse { status }
+        none => fail error(NotFound, "unknown service {req.service}")
+    }
+}
+
+fn subscribe(h: Health, service: str) -> *Watch {
+    let w = new(Watch { wake: chan[bool](1) })
+    let state = h.state
+    sync.lock(state.lock)
+    var list = state.watches[service] ?? []
+    push(mut list, w)
+    state.watches[service] = list
+    sync.unlock(state.lock)
+    w
+}
+
+fn unsubscribe(h: Health, service: str, w: *Watch) {
+    let state = h.state
+    sync.lock(state.lock)
+    let list = state.watches[service] ?? []
+    var kept: []*Watch = []
+    for other in list {
+        if other != w {
+            push(mut kept, other)
+        }
+    }
+    state.watches[service] = kept
+    sync.unlock(state.lock)
+}
+
+fn watch(h: Health, ctx: *Context, req: HealthCheckRequest) ! Error {
+    let w = subscribe(h, req.service)
+    defer unsubscribe(h, req.service, w)
+    var last = ServingStatus.Unknown
+    var sent = false
+    for {
+        let now = health_of(h, req.service) ?? ServiceUnknown
+        if !sent || now != last {
+            write[HealthCheckResponse](ctx, HealthCheckResponse { status: now })?
+            last = now
+            sent = true
+        }
+        select {
+            <-w.wake => {}
+            <-cancel.done(ctx.token) => fail Failed(context_status(ctx))
+        }
+    }
+}
+
+/// Registers `grpc.health.v1.Health` on `s`: `Check` answers with the state of a service and fails with `NotFound` for one never set, and `Watch` streams the state, `ServiceUnknown` for one never set, now and on every change.
+pub fn register_health(s: *Server, h: Health) {
+    handle_unary[HealthCheckRequest, HealthCheckResponse](s, "/grpc.health.v1.Health/Check", fn(ctx: *Context, req: HealthCheckRequest) -> HealthCheckResponse ! Error { check(h, ctx, req)? })
+    handle_server_streaming[HealthCheckRequest](s, "/grpc.health.v1.Health/Watch", fn(ctx: *Context, req: HealthCheckRequest) ! Error { watch(h, ctx, req)? })
+}
+
+/// Asks the server behind `ch` for the state of `service`, the empty string for the server as a whole. Fails with `NotFound` when the server has not set it.
+pub fn check_health(ch: Channel, service: str, opts: CallOptions) -> ServingStatus ! Error {
+    let r = unary[HealthCheckRequest, HealthCheckResponse](ch, "/grpc.health.v1.Health/Check", HealthCheckRequest { service }, opts)?
+    r.value.status
+}
+
+/// Starts `grpc.health.v1.Health/Watch` for `service` and returns the stream, whose messages `receive[HealthCheckResponse]` reads: the state now and on each change.
+pub fn watch_health(ch: Channel, service: str, opts: CallOptions) -> *Stream ! Error {
+    server_streaming[HealthCheckRequest](ch, "/grpc.health.v1.Health/Watch", HealthCheckRequest { service }, opts)?
+}

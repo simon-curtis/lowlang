@@ -18,7 +18,19 @@ struct Exchange {
     queued: bool
     open: bool
     token: *cancel.Token?
+    inbox: chan[[]u8]?
+    waiting: [][]u8
+    duplex: bool
+    answered: bool
+    parked: chan[bool]?
 }
+
+struct Credit {
+    id: i64
+    n: i64
+}
+
+const high_water = 262144
 
 struct Peer {
     stream: io.Stream
@@ -36,10 +48,13 @@ struct Peer {
     outstanding: i64
     failure: i64
     code: i64
+    duplex: bool
+    draining: bool
+    credits: chan[Credit]
     complete: fn(*Peer, *Exchange) ! io.Error
 }
 
-fn new_peer(s: io.Stream, r: *io.Reader, complete: fn(*Peer, *Exchange) ! io.Error) -> *Peer {
+fn new_peer(s: io.Stream, r: *io.Reader, duplex: bool, complete: fn(*Peer, *Exchange) ! io.Error) -> *Peer {
     new(Peer {
         stream: s
         reader: r
@@ -56,6 +71,9 @@ fn new_peer(s: io.Stream, r: *io.Reader, complete: fn(*Peer, *Exchange) ! io.Err
         outstanding: 0
         failure: 0
         code: 0
+        duplex
+        draining: false
+        credits: chan[Credit](256)
         complete
     })
 }
@@ -75,6 +93,11 @@ fn new_exchange(p: *Peer, id: i64) -> *Exchange {
         queued: false
         open: false
         token: none
+        inbox: none
+        waiting: []
+        duplex: false
+        answered: false
+        parked: none
     })
     p.exchanges[id] = e
     e
@@ -82,17 +105,90 @@ fn new_exchange(p: *Peer, id: i64) -> *Exchange {
 
 fn abandon_all(p: *Peer) {
     for _, e in p.exchanges {
-        abandon(some(e))
+        abandon(p, some(e))
     }
 }
 
-fn abandon(e: *Exchange?) {
+fn abandon(p: *Peer, e: *Exchange?) {
     match e {
-        some(x) => match x.token {
-            some(t) => cancel.cancel(t)
-            none => {}
+        some(x) => {
+            match x.token {
+                some(t) => cancel.cancel(t)
+                none => {}
+            }
+            drain_exchange(p, x)
         }
         none => {}
+    }
+}
+
+fn notify_parked(e: *Exchange) {
+    match e.parked {
+        some(c) => {
+            notify(c)
+            e.parked = none
+        }
+        none => {}
+    }
+}
+
+fn drain_exchange(p: *Peer, e: *Exchange) {
+    notify_parked(e)
+    var lost = 0
+    for chunk in e.waiting {
+        lost += chunk.len
+    }
+    e.waiting = []
+    match e.inbox {
+        some(box) => {
+            for {
+                let more: []u8? = select {
+                    c = <-box => c
+                    else => none
+                }
+                match more {
+                    some(chunk) => { lost += chunk.len }
+                    none => break
+                }
+            }
+            close(box)
+            e.inbox = none
+        }
+        none => {}
+    }
+    if lost > 0 {
+        credit(p, 0, lost) or {}
+    }
+}
+
+fn feed(e: *Exchange) {
+    let box = match e.inbox {
+        some(b) => b
+        none => return
+    }
+    for e.waiting.len > 0 {
+        let taken = select {
+            box <- e.waiting[0] => true
+            else => false
+        }
+        if !taken {
+            return
+        }
+        e.waiting = e.waiting[1..]
+    }
+    if e.received {
+        close(box)
+        e.inbox = none
+    }
+}
+
+fn on_credit(p: *Peer, c: Credit) ! io.Error {
+    match p.exchanges[c.id] {
+        some(e) => {
+            feed(e)
+            credit(p, if e.received { 0 } else { e.id }, c.n)?
+        }
+        none => credit(p, 0, c.n)?
     }
 }
 
@@ -200,6 +296,10 @@ fn reset(p: *Peer, id: i64, code: i64) ! io.Error {
     var out: []u8 = []
     put_reset(mut out, id, code)
     io.write_all(p.stream, out)?
+    match p.exchanges[id] {
+        some(e) => drain_exchange(p, e)
+        none => {}
+    }
     delete(mut p.exchanges, id)
     p.dropped[id] = true
 }
@@ -315,12 +415,17 @@ fn finish_block(p: *Peer, e: *Exchange) ! io.Error {
             reset(p, e.id, error_protocol)?
             return
         }
-        if p.exchanges.len > 100 {
+        if p.exchanges.len > 100 || p.draining {
             reset(p, e.id, error_refused_stream)?
             return
         }
         e.fields = fields
         e.trailers = true
+        if p.duplex {
+            e.duplex = true
+            e.inbox = some(chan[[]u8](16))
+            p.complete(p, e)?
+        }
     }
     if e.ends {
         end_remote(p, e)?
@@ -329,6 +434,13 @@ fn finish_block(p: *Peer, e: *Exchange) ! io.Error {
 
 fn end_remote(p: *Peer, e: *Exchange) ! io.Error {
     e.received = true
+    if e.duplex {
+        feed(e)
+        if e.answered {
+            forget(p, e)
+        }
+        return
+    }
     let declared = header.get(e.fields, "content-length") ?? ""
     if declared.len > 0 && declared != "{e.body.len}" {
         reset(p, e.id, error_protocol)?
@@ -346,6 +458,21 @@ fn on_data(p: *Peer, f: Frame) ! io.Error {
         some(e) => {
             if e.received || !e.trailers {
                 fail protocol(p, error_stream_closed)
+            }
+            if e.duplex {
+                let last = f.flags & flag_end_stream != 0
+                let padding = f.payload.len - data.len
+                if padding > 0 {
+                    credit(p, if last { 0 } else { e.id }, padding)?
+                }
+                if data.len > 0 {
+                    push(mut e.waiting, data)
+                    feed(e)
+                }
+                if last {
+                    end_remote(p, e)?
+                }
+                return
             }
             if e.body.len + data.len > max_body {
                 reset(p, e.id, error_enhance_your_calm)?
@@ -399,7 +526,7 @@ fn on_frame(p: *Peer, f: Frame) ! io.Error {
         if f.payload.len != 4 {
             fail protocol(p, error_frame_size)
         }
-        abandon(p.exchanges[f.stream])
+        abandon(p, p.exchanges[f.stream])
         delete(mut p.exchanges, f.stream)
     } else if f.kind == frame_settings {
         on_settings(p, f)?
@@ -432,7 +559,7 @@ fn header_frames(p: *Peer, mut out: []u8, id: i64, fields: []header.Header, ends
 fn queue(p: *Peer, e: *Exchange, fields: []header.Header, body: []u8, trailers: []header.Header) ! io.Error {
     var out: []u8 = []
     header_frames(p, mut out, e.id, fields, body.len == 0 && trailers.len == 0 && !e.open)
-    if body.len == 0 && trailers.len > 0 {
+    if body.len == 0 && trailers.len > 0 && !e.open {
         header_frames(p, mut out, e.id, trailers, true)
     }
     io.write_all(p.stream, out)?
@@ -440,13 +567,23 @@ fn queue(p: *Peer, e: *Exchange, fields: []header.Header, body: []u8, trailers: 
     e.tail = trailers
     e.queued = true
     if body.len == 0 && !e.open {
-        sent(p, e)
+        sent(p, e)?
     }
 }
 
-fn sent(p: *Peer, e: *Exchange) {
+fn forget(p: *Peer, e: *Exchange) {
+    drain_exchange(p, e)
+    delete(mut p.exchanges, e.id)
+}
+
+fn sent(p: *Peer, e: *Exchange) ! io.Error {
+    e.answered = true
     if e.received {
-        delete(mut p.exchanges, e.id)
+        forget(p, e)
+        return
+    }
+    if e.duplex {
+        reset(p, e.id, 0)?
     }
 }
 
@@ -468,11 +605,14 @@ fn flush(p: *Peer) ! io.Error {
                 push(mut finished, e)
             }
         }
+        if e.out.len <= high_water {
+            notify_parked(e)
+        }
     }
     io.write_all(p.stream, out)?
     for e in finished {
         e.queued = false
-        sent(p, e)
+        sent(p, e)?
     }
 }
 
@@ -494,6 +634,8 @@ struct Reply {
     response: Response
     phase: ReplyPart = Whole
     chunk: []u8 = []
+    tail: []header.Header = []
+    acks: chan[bool]? = none
 }
 
 fn pump(p: *Peer, frames: chan[Frame]) {
@@ -528,12 +670,17 @@ fn respond(handler: fn(Request) -> Response, req: Request, id: i64, replies: cha
 fn relay(response: Response, chunks: chan[[]u8], req: Request, id: i64, replies: chan[Reply]) {
     replies <- Reply { id, method: req.method, response }
     let gone = cancel.done(req.token)
+    let acks = chan[bool](1)
     for {
         select {
             part = <-chunks => match part {
                 some(data) => {
                     select {
-                        replies <- Reply { id, method: req.method, response, phase: Chunk, chunk: data } => {}
+                        replies <- Reply { id, method: req.method, response, phase: Chunk, chunk: data, acks: some(acks) } => {}
+                        <-gone => break
+                    }
+                    select {
+                        <-acks => {}
                         <-gone => break
                     }
                 }
@@ -542,15 +689,38 @@ fn relay(response: Response, chunks: chan[[]u8], req: Request, id: i64, replies:
             <-gone => break
         }
     }
+    let tail = response.finish()
     cancel.cancel(req.token)
-    replies <- Reply { id, method: req.method, response, phase: End }
+    replies <- Reply { id, method: req.method, response, phase: End, tail }
 }
 
 fn take_chunk(p: *Peer, reply: Reply) {
-    match p.exchanges[reply.id] {
-        some(e) => io.append(mut e.out, reply.chunk)
-        none => {}
+    let acks = match reply.acks {
+        some(a) => a
+        none => return
     }
+    match p.exchanges[reply.id] {
+        some(e) => {
+            io.append(mut e.out, reply.chunk)
+            if e.out.len > high_water {
+                e.parked = some(acks)
+            } else {
+                notify(acks)
+            }
+        }
+        none => notify(acks)
+    }
+}
+
+fn trailer_fields(trailers: []header.Header) -> []header.Header {
+    var out: []header.Header = []
+    for h in trailers {
+        let name = text.lower(h.name)
+        if !connection_specific(name) && name.len > 0 && name[0] != ':' {
+            push(mut out, header.Header { name, value: h.value })
+        }
+    }
+    out
 }
 
 fn end_stream(p: *Peer, reply: Reply) ! io.Error {
@@ -560,14 +730,21 @@ fn end_stream(p: *Peer, reply: Reply) ! io.Error {
         none => return
     }
     e.open = false
+    for h in trailer_fields(reply.tail) {
+        push(mut e.tail, h)
+    }
     if e.out.len > 0 {
         return
     }
     var out: []u8 = []
-    put_frame(mut out, frame_data, flag_end_stream, e.id, [])
+    if e.tail.len > 0 {
+        header_frames(p, mut out, e.id, e.tail, true)
+    } else {
+        put_frame(mut out, frame_data, flag_end_stream, e.id, [])
+    }
     io.write_all(p.stream, out)?
     e.queued = false
-    sent(p, e)
+    sent(p, e)?
 }
 
 fn deliver(p: *Peer, reply: Reply) ! io.Error {
@@ -604,14 +781,7 @@ fn deliver(p: *Peer, reply: Reply) ! io.Error {
     if !header.has(resp.headers, "content-length") && !e.open {
         push(mut fields, header.Header { name: "content-length", value: "{body.len}" })
     }
-    var trailers: []header.Header = []
-    for h in resp.trailers {
-        let name = text.lower(h.name)
-        if !connection_specific(name) && name.len > 0 && name[0] != ':' {
-            push(mut trailers, header.Header { name, value: h.value })
-        }
-    }
-    queue(p, e, fields, body, trailers)?
+    queue(p, e, fields, body, trailer_fields(resp.trailers))?
 }
 
 fn on_input(p: *Peer, f: Frame?) -> bool ! io.Error {
@@ -629,7 +799,7 @@ fn on_input(p: *Peer, f: Frame?) -> bool ! io.Error {
     }
 }
 
-fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, handler: fn(Request) -> Response) ! io.Error {
+fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, mode: chan[bool]?, handler: fn(Request) -> Response) ! io.Error {
     let replies = chan[Reply](128)
     let complete = fn(p: *Peer, e: *Exchange) ! io.Error {
         var req = request_of(e.fields, e.body, Http2) or {
@@ -637,11 +807,32 @@ fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, handler: fn(Request) -> Re
             return
         }
         req.remote = remote
+        match e.inbox {
+            some(box) => {
+                let id = e.id
+                let gone = cancel.done(req.token)
+                req.upload = some(Upload {
+                    chunks: box
+                    credit: fn(n: i64) {
+                        select {
+                            p.credits <- Credit { id, n } => {}
+                            <-gone => {}
+                        }
+                    }
+                    token: req.token
+                })
+            }
+            none => {}
+        }
         p.outstanding += 1
         e.token = some(req.token)
         spawn respond(handler, req, e.id, replies)
     }
-    let p = new_peer(s, r, complete)
+    let p = new_peer(s, r, mode != none, complete)
+    var drain: chan[bool] = match mode {
+        some(c) => c
+        none => chan[bool]()
+    }
     defer abandon_all(p)
     var out: []u8 = []
     put_initial_settings(mut out, true)
@@ -651,10 +842,16 @@ fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, handler: fn(Request) -> Re
     var reading = true
     for reading || p.outstanding > 0 {
         flush(p)?
+        if p.draining && p.outstanding == 0 && p.exchanges.len == 0 {
+            return
+        }
         if !reading {
-            match <-replies {
-                some(reply) => deliver(p, reply)?
-                none => return
+            select {
+                reply = <-replies => match reply {
+                    some(x) => deliver(p, x)?
+                    none => return
+                }
+                <-p.credits => {}
             }
             continue
         }
@@ -668,6 +865,17 @@ fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, handler: fn(Request) -> Re
             reply = <-replies => match reply {
                 some(x) => deliver(p, x)?
                 none => {}
+            }
+            c = <-p.credits => match c {
+                some(x) => on_credit(p, x)?
+                none => {}
+            }
+            <-drain => {
+                p.draining = true
+                drain = chan[bool]()
+                var out: []u8 = []
+                put_goaway(mut out, p.last, 0)
+                io.write_all(p.stream, out)?
             }
         }
     }

@@ -1,0 +1,268 @@
+import std/cancel
+import std/grpc
+import std/header
+import std/http
+import std/io
+import std/net
+
+struct Blob {
+    data: []u8 "1"
+}
+
+struct Raw {
+    status: i64
+    head: []header.Header
+    data: []u8
+    trailers: []header.Header
+    ended: bool
+    events: str
+}
+
+fn zeros(n: i64) -> []u8 {
+    var out: []u8 = []
+    for _ in 0..n {
+        push(mut out, 0)
+    }
+    out
+}
+
+fn echo(ctx: *grpc.Context, req: Blob) -> Blob ! grpc.Error {
+    req
+}
+
+fn big(ctx: *grpc.Context, req: Blob) -> Blob ! grpc.Error {
+    Blob { data: zeros(5000) }
+}
+
+fn refuse(ctx: *grpc.Context, req: Blob) -> Blob ! grpc.Error {
+    var st = grpc.status(Aborted, "héllo\n100%")
+    st.details = [1, 2, 3]
+    fail grpc.Error.Failed(st)
+}
+
+fn oversize(ctx: *grpc.Context, req: Blob) -> Blob ! grpc.Error {
+    grpc.write[Blob](ctx, Blob { data: zeros(3000) })?
+    Blob { data: [] }
+}
+
+fn run(s: *grpc.Server, l: net.ListenerHandle) {
+    grpc.serve_on(s, l) or {}
+}
+
+fn field(h: []header.Header, name: str) -> str {
+    header.get(h, name) ?? "-"
+}
+
+fn raw_call(port: i64, path: str, extra: []header.Header, body: []u8) -> Raw {
+    let c = http.client().build()
+    let tok = cancel.token()
+    var headers: []header.Header = [header.Header { name: "te", value: "trailers" }]
+    if !header.has(extra, "content-type") {
+        push(mut headers, header.Header { name: "content-type", value: "application/grpc" })
+    }
+    for h in extra {
+        push(mut headers, h)
+    }
+    var r = Raw { status: 0, head: [], data: [], trailers: [], ended: false, events: "" }
+    let call = http.open_call(c, "POST", "http://127.0.0.1:{port}{path}", headers, 5000, tok) or {
+        r.events = "open failed"
+        return r
+    }
+    http.call_send(call, body, true) or {}
+    for {
+        let event = http.call_receive(call) or break
+        match event {
+            Head(status, h) => {
+                r.status = status
+                r.head = h
+                r.events = "{r.events}H"
+            }
+            Data(d) => {
+                io.append(mut r.data, d)
+                r.events = "{r.events}D"
+            }
+            Trailers(h) => {
+                r.trailers = h
+                r.events = "{r.events}T"
+            }
+            End => {
+                r.ended = true
+                r.events = "{r.events}E"
+                break
+            }
+            Reset(code) => {
+                r.events = "{r.events}R{code}"
+                break
+            }
+            Lost => {
+                r.events = "{r.events}L"
+                break
+            }
+        }
+    }
+    http.call_close(call, r.ended)
+    r
+}
+
+fn payload(data: []u8) -> []u8 {
+    grpc.frame(protobuf_blob(data), false)
+}
+
+fn protobuf_blob(data: []u8) -> []u8 {
+    var out: []u8 = [10]
+    var n = data.len
+    for n >= 128 {
+        push(mut out, u8(n % 128 + 128))
+        n = n / 128
+    }
+    push(mut out, u8(n))
+    io.append(mut out, data)
+    out
+}
+
+fn status_line(r: Raw) -> str {
+    let st = if r.trailers.len > 0 { field(r.trailers, "grpc-status") } else { field(r.head, "grpc-status") }
+    "events={r.events} status={st}"
+}
+
+fn register(s: *grpc.Server) {
+    grpc.handle_unary[Blob, Blob](s, "/t.T/Echo", echo)
+    grpc.handle_unary[Blob, Blob](s, "/t.T/Refuse", refuse)
+    grpc.handle_unary[Blob, Blob](s, "/t.T/Oversize", oversize)
+    grpc.handle_unary[Blob, Blob](s, "/t.T/Big", big)
+}
+
+fn negotiation(port: i64) {
+    let plain = raw_call(port, "/t.T/Echo", [], payload(bytes("plain")))
+    print("identity {status_line(plain)} encoding={field(plain.head, "grpc-encoding")} accept={field(plain.head, "grpc-accept-encoding")} type={field(plain.head, "content-type")} flag={plain.data[0]}")
+    let framed = grpc.encode_message_frame(protobuf_blob(zeros(400)), grpc.Encoding.Gzip)
+    let zipped = raw_call(port, "/t.T/Echo", [header.Header { name: "grpc-encoding", value: "gzip" }, header.Header { name: "grpc-accept-encoding", value: "gzip" }], framed)
+    let r = grpc.message_reader(100000, grpc.Encoding.Gzip)
+    grpc.feed(r, zipped.data)
+    let back = grpc.take(r) or {
+        print("gzip response did not decode")
+        return
+    }
+    print("gzip {status_line(zipped)} encoding={field(zipped.head, "grpc-encoding")} flag={zipped.data[0]} smaller={zipped.data.len < 400} length={(back ?? []).len}")
+    let refused = raw_call(port, "/t.T/Echo", [header.Header { name: "grpc-accept-encoding", value: "identity" }], framed)
+    print("flagged without encoding {status_line(refused)}")
+    let unknown = raw_call(port, "/t.T/Echo", [header.Header { name: "grpc-encoding", value: "br" }], payload(bytes("x")))
+    print("unknown {status_line(unknown)} accept={field(unknown.head, "grpc-accept-encoding")} message={field(unknown.head, "grpc-message")}")
+}
+
+fn headers_and_failures(port: i64) {
+    let fail_call = raw_call(port, "/t.T/Refuse", [], payload(bytes("x")))
+    print("trailers-only {status_line(fail_call)} http={fail_call.status} data={fail_call.data.len} message={field(fail_call.head, "grpc-message")} details={field(fail_call.head, "grpc-status-details-bin")}")
+    let unknown = raw_call(port, "/t.T/Nothing", [], payload(bytes("x")))
+    print("unknown method {status_line(unknown)} message={field(unknown.head, "grpc-message")}")
+    let ok = raw_call(port, "/t.T/Echo", [], payload(bytes("x")))
+    print("ok {status_line(ok)} data={ok.data.len}")
+    let bad_type = raw_call(port, "/t.T/Echo", [header.Header { name: "content-type", value: "text/plain" }], payload(bytes("x")))
+    print("bad type http={bad_type.status}")
+    let bad_timeout = raw_call(port, "/t.T/Echo", [header.Header { name: "grpc-timeout", value: "12" }], payload(bytes("x")))
+    print("bad timeout {status_line(bad_timeout)}")
+    let truncated = raw_call(port, "/t.T/Echo", [], [0, 0, 0, 0, 9, 1])
+    print("truncated {status_line(truncated)}")
+    let two = raw_call(port, "/t.T/Echo", [], payload(bytes("a")))
+    var both = payload(bytes("a"))
+    io.append(mut both, payload(bytes("b")))
+    let doubled = raw_call(port, "/t.T/Echo", [], both)
+    print("two requests {status_line(doubled)} {status_line(two)}")
+    let empty = raw_call(port, "/t.T/Echo", [], [])
+    print("no request {status_line(empty)}")
+}
+
+fn typed_failure(ch: grpc.Channel) {
+    let r = grpc.unary[Blob, Blob](ch, "/t.T/Refuse", Blob { data: [] }, grpc.CallOptions { retry: false }) catch {
+        e => {
+            let st = grpc.status_of(e)
+            print("typed {grpc.code_name(st.code)} {st.message.len} {st.message == "héllo\n100%"} details={st.details}")
+            return
+        }
+    }
+    print("typed unexpected success")
+}
+
+fn limits(port: i64) {
+    let ch = grpc.dial("127.0.0.1:{port}", grpc.ChannelOptions {}) or return
+    let r = grpc.unary[Blob, Blob](ch, "/t.T/Echo", Blob { data: zeros(2000) }, grpc.CallOptions {}) catch {
+        e => {
+            print("server receive limit {grpc.describe(e)}")
+            return
+        }
+    }
+    print("server receive limit unexpected success")
+}
+
+fn client_limits(port: i64) {
+    let small = grpc.dial("127.0.0.1:{port}", grpc.ChannelOptions { max_receive: 1000, max_send: 1500 }) or return
+    let r = grpc.unary[Blob, Blob](small, "/t.T/Big", Blob { data: [] }, grpc.CallOptions {}) catch {
+        e => {
+            print("client receive limit {grpc.describe(e)}")
+            let s = grpc.unary[Blob, Blob](small, "/t.T/Echo", Blob { data: zeros(2000) }, grpc.CallOptions {}) catch {
+                f => {
+                    print("client send limit {grpc.describe(f)}")
+                    return
+                }
+            }
+            print("client send limit unexpected success")
+            return
+        }
+    }
+    print("client receive limit unexpected success")
+}
+
+fn server_send_limit(port: i64) {
+    let ch = grpc.dial("127.0.0.1:{port}", grpc.ChannelOptions {}) or return
+    let r = grpc.unary[Blob, Blob](ch, "/t.T/Oversize", Blob { data: [] }, grpc.CallOptions {}) catch {
+        e => {
+            print("server send limit {grpc.describe(e)}")
+            return
+        }
+    }
+    print("server send limit unexpected success")
+}
+
+fn typed_compression(port: i64) {
+    let ch = grpc.dial("127.0.0.1:{port}", grpc.ChannelOptions {}) or return
+    for e in [grpc.Encoding.Identity, grpc.Encoding.Gzip, grpc.Encoding.Deflate] {
+        let r = grpc.unary[Blob, Blob](ch, "/t.T/Echo", Blob { data: zeros(900) }, grpc.CallOptions { compression: e }) catch {
+            err => {
+                print("typed compression {grpc.encoding_name(e)} failed {grpc.describe(err)}")
+                continue
+            }
+        }
+        print("typed compression {grpc.encoding_name(e)} echoed {r.value.data.len}")
+    }
+}
+
+fn main() {
+    using l = net.listen("127.0.0.1", 0) or {
+        print("listen failed")
+        return
+    }
+    let port = l.handle.addr.port
+    let s = grpc.server(grpc.ServerOptions { max_receive: 1000, max_send: 2500, compression: grpc.Encoding.Gzip })
+    register(s)
+    let open = grpc.server(grpc.ServerOptions { compression: grpc.Encoding.Gzip })
+    register(open)
+    using wide = net.listen("127.0.0.1", 0) or {
+        print("listen failed")
+        return
+    }
+    spawn run(s, l.handle)
+    spawn run(open, wide.handle)
+    let wide_port = wide.handle.addr.port
+    negotiation(wide_port)
+    headers_and_failures(wide_port)
+    let ch = grpc.dial("127.0.0.1:{wide_port}", grpc.ChannelOptions {}) or return
+    typed_failure(ch)
+    typed_compression(wide_port)
+    limits(port)
+    client_limits(wide_port)
+    server_send_limit(port)
+    grpc.close_channel(ch)
+    grpc.shutdown(s, 0)
+    grpc.shutdown(open, 0)
+    print("shut down")
+}

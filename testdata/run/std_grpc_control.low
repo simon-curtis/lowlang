@@ -1,0 +1,264 @@
+import std/cancel
+import std/grpc
+import std/header
+import std/http
+import std/net
+import std/sync
+import std/time
+import std/time/duration
+
+struct Say {
+    text: str "1"
+    n: i64 "2"
+}
+
+struct Counter {
+    n: i64
+}
+
+struct Seen {
+    expired: chan[str]
+    cancelled: chan[str]
+    attempts: sync.Mutex
+    count: *Counter
+}
+
+fn slow(seen: *Seen, ctx: *grpc.Context, req: Say) -> Say ! grpc.Error {
+    let waited = cancel.pause(ctx.token, 10000)
+    if !waited {
+        seen.expired <- "slow handler stopped, remaining {grpc.remaining(ctx) > 0}"
+    }
+    fail grpc.error(Cancelled, "stopped")
+}
+
+fn tick(seen: *Seen, ctx: *grpc.Context, req: Say) ! grpc.Error {
+    for i in 0..1000000 {
+        grpc.write[Say](ctx, Say { text: "tick", n: i }) catch {
+            e => {
+                seen.cancelled <- "tick handler ended with {grpc.code_name(grpc.status_of(e).code)}"
+                fail e
+            }
+        }
+        if !cancel.pause(ctx.token, 5) {
+            seen.cancelled <- "tick handler saw cancel"
+            fail grpc.error(Cancelled, "stopped")
+        }
+    }
+}
+
+fn inner(ctx: *grpc.Context, req: Say) -> Say ! grpc.Error {
+    let left = grpc.remaining(ctx)
+    Say { text: "inner", n: left }
+}
+
+fn outer(ch: *grpc.Channel, ctx: *grpc.Context, req: Say) -> Say ! grpc.Error {
+    let mine = grpc.remaining(ctx)
+    let r = grpc.unary[Say, Say](*ch, "/t.T/Inner", req, grpc.outgoing(ctx))?
+    Say { text: "outer", n: if r.value.n > 0 && r.value.n <= mine { 1 } else { 0 } }
+}
+
+fn flaky(seen: *Seen, ctx: *grpc.Context, req: Say) -> Say ! grpc.Error {
+    sync.lock(seen.attempts)
+    seen.count.n += 1
+    let n = seen.count.n
+    sync.unlock(seen.attempts)
+    if n < req.n {
+        fail grpc.error(Unavailable, "try {n}")
+    }
+    Say { text: "served on attempt {n}", n }
+}
+
+fn late_failure(ctx: *grpc.Context, req: Say) -> Say ! grpc.Error {
+    grpc.flush_headers(ctx)?
+    fail grpc.error(Unavailable, "after headers")
+}
+
+fn next_line(c: chan[str]) {
+    let line = (<-c) ?? "closed"
+    print("{line}")
+}
+
+fn run(s: *grpc.Server, l: net.ListenerHandle) {
+    grpc.serve_on(s, l) or {}
+}
+
+fn text_of(e: grpc.Error) -> str {
+    grpc.describe(e)
+}
+
+fn deadline_client(ch: grpc.Channel, seen: *Seen) {
+    let started = time.monotonic()
+    let r = grpc.unary[Say, Say](ch, "/t.T/Slow", Say { text: "", n: 0 }, grpc.CallOptions { timeout: 150 }) catch {
+        e => {
+            let took = (time.monotonic() - started) / 1000000
+            print("client deadline {text_of(e)} within {took >= 140 && took < 2000}")
+            next_line(seen.expired)
+            return
+        }
+    }
+    print("client deadline unexpected success")
+}
+
+fn deadline_server(port: i64) {
+    let c = http.client().build()
+    let tok = cancel.token()
+    let headers = [
+        header.Header { name: "content-type", value: "application/grpc" }
+        header.Header { name: "te", value: "trailers" }
+        header.Header { name: "grpc-timeout", value: "120m" }
+    ]
+    let call = http.open_call(c, "POST", "http://127.0.0.1:{port}/t.T/Slow", headers, 5000, tok) or {
+        print("open failed")
+        return
+    }
+    http.call_send(call, [0, 0, 0, 0, 0], true) or {
+        print("send failed")
+        return
+    }
+    var status = "none"
+    for {
+        let event = http.call_receive(call) or break
+        match event {
+            Trailers(h) => { status = header.get(h, "grpc-status") ?? "missing" }
+            Head(_, h) => {
+                if header.has(h, "grpc-status") {
+                    status = header.get(h, "grpc-status") ?? "missing"
+                }
+            }
+            End => break
+            _ => {}
+        }
+    }
+    http.call_close(call, true)
+    print("server deadline grpc-status {status}")
+}
+
+fn propagation(ch: grpc.Channel) {
+    let r = grpc.unary[Say, Say](ch, "/t.T/Outer", Say { text: "", n: 0 }, grpc.CallOptions { timeout: 4000 }) catch {
+        e => {
+            print("propagation failed {text_of(e)}")
+            return
+        }
+    }
+    print("propagation {r.value.text} inner remaining within outer {r.value.n == 1}")
+    let none = grpc.unary[Say, Say](ch, "/t.T/Inner", Say { text: "", n: 0 }, grpc.CallOptions {}) catch {
+        e => {
+            print("no deadline failed {text_of(e)}")
+            return
+        }
+    }
+    print("no deadline remaining {none.value.n}")
+}
+
+fn cancellation(ch: grpc.Channel, seen: *Seen) {
+    let st = grpc.server_streaming[Say](ch, "/t.T/Tick", Say { text: "", n: 0 }, grpc.CallOptions {}) catch {
+        e => {
+            print("open failed {text_of(e)}")
+            return
+        }
+    }
+    for i in 0..3 {
+        let m = grpc.receive[Say](st) catch {
+            e => {
+                print("receive failed {text_of(e)}")
+                return
+            }
+        }
+        match m {
+            some(v) => print("tick {v.n}")
+            none => print("ended early")
+        }
+    }
+    grpc.cancel_stream(st)
+    let after = grpc.receive[Say](st) catch {
+        e => {
+            print("after cancel {text_of(e)}")
+            grpc.close_stream(st)
+            next_line(seen.cancelled)
+            return
+        }
+    }
+    print("after cancel unexpected message")
+}
+
+fn token_cancellation(ch: grpc.Channel, seen: *Seen) {
+    let token = cancel.token()
+    let st = grpc.server_streaming[Say](ch, "/t.T/Tick", Say { text: "", n: 0 }, grpc.CallOptions { token: some(token) }) catch {
+        e => {
+            print("open failed {text_of(e)}")
+            return
+        }
+    }
+    let first = grpc.receive[Say](st) catch {
+        e => {
+            print("receive failed {text_of(e)}")
+            return
+        }
+    }
+    cancel.cancel(token)
+    for {
+        let m = grpc.receive[Say](st) catch {
+            e => {
+                print("token cancel {text_of(e)}")
+                break
+            }
+        }
+        match m {
+            some(_) => {}
+            none => {
+                print("token cancel ended without error")
+                break
+            }
+        }
+    }
+    grpc.close_stream(st)
+    next_line(seen.cancelled)
+}
+
+fn retries(ch: grpc.Channel, seen: *Seen) {
+    let r = grpc.unary[Say, Say](ch, "/t.T/Flaky", Say { text: "", n: 3 }, grpc.CallOptions {}) catch {
+        e => {
+            print("retry failed {text_of(e)}")
+            return
+        }
+    }
+    print("retry {r.value.text}")
+    let once = grpc.unary[Say, Say](ch, "/t.T/Late", Say { text: "", n: 0 }, grpc.CallOptions {}) catch {
+        e => {
+            print("no retry after headers {text_of(e)}")
+            return
+        }
+    }
+    print("late unexpected success")
+}
+
+fn main() {
+    using l = net.listen("127.0.0.1", 0) or {
+        print("listen failed")
+        return
+    }
+    let seen = new(Seen { expired: chan[str](4), cancelled: chan[str](4), attempts: sync.mutex(), count: new(Counter { n: 0 }) })
+    let s = grpc.server(grpc.ServerOptions {})
+    let ch = grpc.dial("127.0.0.1:{l.handle.addr.port}", grpc.ChannelOptions {}) or {
+        print("dial failed")
+        return
+    }
+    let shared = new(ch)
+    grpc.handle_unary[Say, Say](s, "/t.T/Slow", fn(ctx: *grpc.Context, req: Say) -> Say ! grpc.Error { slow(seen, ctx, req)? })
+    grpc.handle_server_streaming[Say](s, "/t.T/Tick", fn(ctx: *grpc.Context, req: Say) ! grpc.Error { tick(seen, ctx, req)? })
+    grpc.handle_unary[Say, Say](s, "/t.T/Inner", inner)
+    grpc.handle_unary[Say, Say](s, "/t.T/Outer", fn(ctx: *grpc.Context, req: Say) -> Say ! grpc.Error { outer(shared, ctx, req)? })
+    grpc.handle_unary[Say, Say](s, "/t.T/Flaky", fn(ctx: *grpc.Context, req: Say) -> Say ! grpc.Error { flaky(seen, ctx, req)? })
+    grpc.handle_unary[Say, Say](s, "/t.T/Late", late_failure)
+    spawn run(s, l.handle)
+    deadline_client(ch, seen)
+    deadline_server(l.handle.addr.port)
+    next_line(seen.expired)
+    propagation(ch)
+    cancellation(ch, seen)
+    token_cancellation(ch, seen)
+    retries(ch, seen)
+    grpc.close_channel(ch)
+    grpc.shutdown(s, 0)
+    print("shut down")
+}

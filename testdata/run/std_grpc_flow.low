@@ -1,0 +1,237 @@
+import std/atomic
+import std/grpc
+import std/net
+import std/sync
+import std/time
+import std/time/duration
+
+struct Blob {
+    data: []u8 "1"
+    n: i64 "2"
+}
+
+struct Counters {
+    written: atomic.Int
+    received: atomic.Int
+    stalled: atomic.Int
+}
+
+fn pattern(n: i64) -> []u8 {
+    var out: []u8 = []
+    for i in 0..n {
+        push(mut out, u8(i % 251))
+    }
+    out
+}
+
+fn checksum(data: []u8) -> i64 {
+    var sum = 0
+    for b in data {
+        sum = (sum * 31 + i64(b)) % 1000000007
+    }
+    sum
+}
+
+fn echo(ctx: *grpc.Context, req: Blob) -> Blob ! grpc.Error {
+    req
+}
+
+fn flood(counters: *Counters, ctx: *grpc.Context, req: Blob) ! grpc.Error {
+    let chunk = pattern(262144)
+    for i in 0..req.n {
+        grpc.write[Blob](ctx, Blob { data: chunk, n: i })?
+        counters.written.add_int(1)
+    }
+}
+
+fn drain(counters: *Counters, ctx: *grpc.Context) -> Blob ! grpc.Error {
+    time.sleep_for(duration.milliseconds(400))
+    var total = 0
+    for {
+        let next = grpc.read[Blob](ctx)?
+        match next {
+            some(m) => {
+                total += m.data.len
+                counters.received.add_int(1)
+            }
+            none => break
+        }
+    }
+    Blob { data: [], n: total }
+}
+
+fn hold(ctx: *grpc.Context, req: Blob) -> Blob ! grpc.Error {
+    time.sleep_for(duration.milliseconds(5))
+    Blob { data: [], n: req.n }
+}
+
+fn first_only(ctx: *grpc.Context, req: Blob) ! grpc.Error {
+    for i in 0..1000000 {
+        grpc.write[Blob](ctx, Blob { data: [1, 2, 3], n: i })?
+    }
+}
+
+fn run(s: *grpc.Server, l: net.ListenerHandle) {
+    grpc.serve_on(s, l) or {}
+}
+
+fn large_message(ch: grpc.Channel) {
+    let data = pattern(3145728)
+    let r = grpc.unary[Blob, Blob](ch, "/t.F/Echo", Blob { data, n: 7 }, grpc.CallOptions {}) catch {
+        e => {
+            print("large message failed {grpc.describe(e)}")
+            return
+        }
+    }
+    print("large message {r.value.data.len} checksum match {checksum(r.value.data) == checksum(data)} n={r.value.n}")
+}
+
+fn slow_reader(ch: grpc.Channel, counters: *Counters) {
+    let st = grpc.server_streaming[Blob](ch, "/t.F/Flood", Blob { data: [], n: 64 }, grpc.CallOptions {}) catch {
+        e => {
+            print("flood failed {grpc.describe(e)}")
+            return
+        }
+    }
+    let first = grpc.receive[Blob](st) catch {
+        e => {
+            print("flood receive failed {grpc.describe(e)}")
+            return
+        }
+    }
+    time.sleep_for(duration.milliseconds(500))
+    let ahead = counters.written.load_int()
+    print("server stopped ahead of a reader that read 1 of 64 messages of 256 KiB: written {ahead < 40}")
+    var total = 1
+    for {
+        let next = grpc.receive[Blob](st) catch {
+            e => {
+                print("flood receive failed {grpc.describe(e)}")
+                return
+            }
+        }
+        match next {
+            some(_) => { total += 1 }
+            none => break
+        }
+    }
+    grpc.close_stream(st)
+    print("flood delivered {total} messages, server wrote {counters.written.load_int()}")
+}
+
+fn slow_server(ch: grpc.Channel, counters: *Counters) {
+    let st = grpc.client_streaming(ch, "/t.F/Drain", grpc.CallOptions {}) catch {
+        e => {
+            print("drain failed {grpc.describe(e)}")
+            return
+        }
+    }
+    let sent = atomic.int(0)
+    let sender = new(Sender { st, sent, done: chan[bool](1) })
+    spawn push_all(sender)
+    time.sleep_for(duration.milliseconds(250))
+    let early = sent.load_int()
+    print("sender blocked while the server had not read: sent {early < 40}")
+    let finished = <-sender.done
+    let r = grpc.finish[Blob](st) catch {
+        e => {
+            print("drain finish failed {grpc.describe(e)}")
+            return
+        }
+    }
+    grpc.close_stream(st)
+    print("drain total {r.value.n} received {counters.received.load_int()}")
+}
+
+struct Sender {
+    st: *grpc.Stream
+    sent: atomic.Int
+    done: chan[bool]
+}
+
+fn push_all(s: *Sender) {
+    let chunk = pattern(262144)
+    for i in 0..64 {
+        grpc.send[Blob](s.st, Blob { data: chunk, n: i }) catch {
+            e => {
+                print("send failed {grpc.describe(e)}")
+                break
+            }
+        }
+        s.sent.add_int(1)
+    }
+    let closed = grpc.close_send(s.st) or false
+    s.done <- true
+}
+
+fn early_finish(ch: grpc.Channel) {
+    var failures = 0
+    for i in 0..300 {
+        let st = grpc.server_streaming[Blob](ch, "/t.F/Endless", Blob { data: [], n: 0 }, grpc.CallOptions {}) catch {
+            e => {
+                failures += 1
+                continue
+            }
+        }
+        let first = grpc.receive[Blob](st) catch {
+            e => {
+                failures += 1
+                grpc.close_stream(st)
+                continue
+            }
+        }
+        grpc.close_stream(st)
+    }
+    print("300 calls abandoned after the first message on one channel, failures {failures}")
+}
+
+fn burst(ch: grpc.Channel) {
+    let group = sync.wait_group()
+    let ok = atomic.int(0)
+    for i in 0..250 {
+        sync.add(group, 1)
+        spawn one_call(ch, i, ok, group)
+    }
+    sync.wait(group)
+    print("250 concurrent calls succeeded {ok.load_int()}")
+}
+
+fn one_call(ch: grpc.Channel, i: i64, ok: atomic.Int, group: sync.WaitGroup) {
+    let r = grpc.unary[Blob, Blob](ch, "/t.F/Hold", Blob { data: [], n: i }, grpc.CallOptions {}) catch {
+        e => {
+            sync.done(group)
+            return
+        }
+    }
+    if r.value.n == i {
+        ok.add_int(1)
+    }
+    sync.done(group)
+}
+
+fn main() {
+    using l = net.listen("127.0.0.1", 0) or {
+        print("listen failed")
+        return
+    }
+    let counters = new(Counters { written: atomic.int(0), received: atomic.int(0), stalled: atomic.int(0) })
+    let s = grpc.server(grpc.ServerOptions { max_receive: 8388608 })
+    grpc.handle_unary[Blob, Blob](s, "/t.F/Echo", echo)
+    grpc.handle_server_streaming[Blob](s, "/t.F/Flood", fn(ctx: *grpc.Context, req: Blob) ! grpc.Error { flood(counters, ctx, req)? })
+    grpc.handle_client_streaming[Blob](s, "/t.F/Drain", fn(ctx: *grpc.Context) -> Blob ! grpc.Error { drain(counters, ctx)? })
+    grpc.handle_unary[Blob, Blob](s, "/t.F/Hold", hold)
+    grpc.handle_server_streaming[Blob](s, "/t.F/Endless", first_only)
+    spawn run(s, l.handle)
+    let ch = grpc.dial("127.0.0.1:{l.handle.addr.port}", grpc.ChannelOptions { max_receive: 8388608 }) or {
+        print("dial failed")
+        return
+    }
+    large_message(ch)
+    slow_reader(ch, counters)
+    slow_server(ch, counters)
+    early_finish(ch)
+    burst(ch)
+    grpc.close_channel(ch)
+    grpc.shutdown(s, 0)
+    print("shut down")
+}

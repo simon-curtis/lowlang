@@ -39,17 +39,37 @@ pub fn serve_tls_on(l: net.ListenerHandle, config: tls.Config, handler: fn(Reque
     if secured.alpn.len == 0 {
         secured.alpn = ["h2", "http/1.1"]
     }
+    let plain: chan[bool]? = none
     for {
         let h = net.accept_handle(l)?
-        spawn serve_secure(h, secured, handler)
+        spawn serve_secure(h, secured, plain, handler)
     }
 }
 
-fn serve_secure(h: net.ConnHandle, config: tls.Config, handler: fn(Request) -> Response) {
+fn serve_secure(h: net.ConnHandle, config: tls.Config, duplex: chan[bool]?, handler: fn(Request) -> Response) {
     using c = net.adopt(h)
     net.set_nodelay(c, true) or {}
     using t = tls.server(net.stream(c), config) or return
-    serve_from(tls.stream(t), net.format_ip(c.handle.remote.ip), handler) or {}
+    serve_from(tls.stream(t), net.format_ip(c.handle.remote.ip), duplex, handler) or {}
+}
+
+/// Serves one accepted connection as `serve_conn_on` does, running the handler of each HTTP/2 request as soon as its headers arrive.
+///
+/// Closing `drain` makes the HTTP/2 connection stop taking requests: it sends `GOAWAY`, refuses streams opened afterwards, lets the requests in progress finish and then ends. `Request.upload` carries the body as it arrives and `Request.body` is empty. A handler may return a response whose `stream` and `finish` produce the body and trailers over time, and keeps receiving the request body meanwhile. A response sent in full before the peer has finished its request resets the stream with `NO_ERROR`. Requests over HTTP/1.1 are served as `serve_conn_on` serves them. Closes the connection when it ends.
+pub fn serve_duplex_conn_on(h: net.ConnHandle, drain: chan[bool], handler: fn(Request) -> Response) {
+    using c = net.adopt(h)
+    net.set_nodelay(c, true) or {}
+    serve_from(net.stream(c), net.format_ip(c.handle.remote.ip), some(drain), handler) or {}
+    net.close(c)
+}
+
+/// Serves one accepted connection over TLS as `serve_duplex_conn_on` does, with the handshake configured by `config`. When `config.alpn` is empty it is set to `h2`. A connection whose handshake fails is closed.
+pub fn serve_duplex_tls_conn_on(h: net.ConnHandle, config: tls.Config, drain: chan[bool], handler: fn(Request) -> Response) {
+    var secured = config
+    if secured.alpn.len == 0 {
+        secured.alpn = ["h2"]
+    }
+    serve_secure(h, secured, some(drain), handler)
 }
 
 /// Serves requests from one accepted connection until the connection ends, then closes it.
@@ -63,7 +83,7 @@ pub fn serve_conn_on(h: net.ConnHandle, handler: fn(Request) -> Response) {
 /// Serves requests from `c` as `serve_conn_on` does, and closes `c` when the connection ends.
 pub fn serve_conn(c: net.Conn, handler: fn(Request) -> Response) {
     net.set_nodelay(c, true) or {}
-    serve_from(net.stream(c), net.format_ip(c.handle.remote.ip), handler) or {}
+    serve_from(net.stream(c), net.format_ip(c.handle.remote.ip), none, handler) or {}
     net.close(c)
 }
 
@@ -75,7 +95,7 @@ fn reject(s: io.Stream, status: i64) ! io.Error {
 ///
 /// Blocks until then. `s` is not closed, and `Request.remote` is empty. Returns the error from a failed write; a read failure or end of input ends the loop and returns normally.
 pub fn serve_stream(s: io.Stream, handler: fn(Request) -> Response) ! io.Error {
-    serve_from(s, "", handler)?
+    serve_from(s, "", none, handler)?
 }
 
 /// Writes a `101 Switching Protocols` response with `headers` to the connection of `req` and returns the reader of that connection, for a handler to speak another protocol.
@@ -90,7 +110,7 @@ pub fn upgrade(req: Request, headers: []header.Header) -> *io.Reader ! io.Error 
     r
 }
 
-fn serve_from(s: io.Stream, remote: str, handler: fn(Request) -> Response) ! io.Error {
+fn serve_from(s: io.Stream, remote: str, duplex: chan[bool]?, handler: fn(Request) -> Response) ! io.Error {
     let r = io.reader(s)
     for {
         var line = io.read_line(r)?
@@ -99,7 +119,7 @@ fn serve_from(s: io.Stream, remote: str, handler: fn(Request) -> Response) ! io.
         }
         if line == preface_line {
             read_preface_rest(r)?
-            return serve_h2(s, r, remote, handler)
+            return serve_h2(s, r, remote, duplex, handler)
         }
         var req = read_request_rest(r, line) catch {
             Malformed => return reject(s, 400)

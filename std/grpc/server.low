@@ -1,0 +1,511 @@
+import std/base64
+import std/cancel
+import std/header
+import std/http
+import std/io
+import std/net
+import std/protobuf
+import std/sync
+import std/text
+import std/time
+import std/time/duration
+import std/tls
+
+/// Settings of a `Server`.
+pub struct ServerOptions {
+    /// The longest request message, after decompression, in bytes. A longer one fails the call with `ResourceExhausted`. Defaults to 4 MiB.
+    pub max_receive: i64 = 4194304
+    /// The longest response message in bytes. A longer one fails `write` with `ResourceExhausted`. Defaults to 2 GiB - 1.
+    pub max_send: i64 = 2147483647
+    /// The encoding of response messages when the client lists it in `grpc-accept-encoding`; otherwise, and by default, `Identity`. A handler overrides it per call with `set_compression`.
+    pub compression: Encoding = Identity
+    /// The TLS settings for `serve_tls`. `alpn` defaults to `h2`.
+    pub tls: tls.Config = tls.Config {}
+}
+
+struct Method {
+    run: fn(*Context) ! Error
+}
+
+struct Registry {
+    methods: [str: Method]
+    lock: sync.Mutex
+    listeners: []net.ListenerHandle
+    draining: bool
+}
+
+/// A gRPC server: a table of methods served over HTTP/2 connections it accepts.
+///
+/// Register methods with `handle_unary`, `handle_server_streaming`, `handle_client_streaming`, `handle_bidi_streaming` or `handle_bytes` and the generated `register_` functions before `serve`. A request for a path that is not registered ends with `Unimplemented`.
+pub struct Server {
+    options: ServerOptions
+    registry: *Registry
+    token: *cancel.Token
+    drain: chan[bool]
+    connections: sync.WaitGroup
+}
+
+/// The state of one call as a handler sees it: the request metadata, the deadline, and the request and response messages.
+///
+/// A handler reads request messages with `read` and writes response messages with `write`, from one green thread at a time for each direction. `response_headers` are sent with the first message or with `flush_headers`; `response_trailers` are sent with the status.
+pub struct Context {
+    /// The full method path, such as `/helloworld.Greeter/SayHello`.
+    pub method: str
+    /// The request metadata.
+    pub metadata: Metadata
+    /// The IP address of the client.
+    pub peer: str
+    /// A token that is cancelled when the client resets the call, the connection fails, the deadline passes or a forced shutdown ends the call. A handler that makes calls or waits passes it on, as `outgoing` does.
+    pub token: *cancel.Token
+    /// The metadata sent as response headers. Add to it before the first `write` or `flush_headers`.
+    pub response_headers: Metadata
+    /// The metadata sent as trailers with the status. A `Status` that a handler fails with adds its own `trailers`.
+    pub response_trailers: Metadata
+    deadline: i64
+    upload: http.Upload
+    reader: *MessageReader
+    max_send: i64
+    encoding: Encoding
+    accepted: str
+    out: chan[[]u8]
+    started: chan[bool]
+    finished: chan[bool]
+    headed: bool
+    input_ended: bool
+    expired: bool
+    forced: bool
+    complete: bool
+    final: Status
+}
+
+/// Returns a server that has no methods.
+pub fn server(options: ServerOptions) -> *Server {
+    new(Server {
+        options
+        registry: new(Registry { methods: [:], lock: sync.mutex(), listeners: [], draining: false })
+        token: cancel.token()
+        drain: chan[bool]()
+        connections: sync.wait_group()
+    })
+}
+
+/// Registers `run` for the path `method`, such as `/helloworld.Greeter/SayHello`, replacing any earlier one.
+///
+/// `run` reads messages with `read_bytes` and writes with `write_bytes`, and fails with the `Status` the call ends with; returning without failing ends it with `Ok`. It is the primitive the typed `handle_` functions and the generated registration functions are built on.
+pub fn handle_bytes(s: *Server, method: str, run: fn(*Context) ! Error) {
+    s.registry.methods[method] = Method { run }
+}
+
+fn single_request[Req](ctx: *Context) -> Req ! Error {
+    let first = read_bytes(ctx)?
+    let raw = match first {
+        some(m) => m
+        none => fail error(Internal, "the client sent no request message")
+    }
+    match read_bytes(ctx)? {
+        some(_) => fail error(Internal, "the client sent more than one request message")
+        none => {}
+    }
+    unmarshal[Req](raw)?
+}
+
+/// Registers a method with one request and one response: `handler` gets the request and returns the response or the `Status` to fail with.
+pub fn handle_unary[Req, Resp](s: *Server, method: str, handler: fn(*Context, Req) -> Resp ! Error) {
+    handle_bytes(s, method, fn(ctx: *Context) ! Error {
+        let request = single_request[Req](ctx)?
+        let response = handler(ctx, request)?
+        write[Resp](ctx, response)?
+    })
+}
+
+/// Registers a method with one request and a stream of responses: `handler` writes them with `write`.
+pub fn handle_server_streaming[Req](s: *Server, method: str, handler: fn(*Context, Req) ! Error) {
+    handle_bytes(s, method, fn(ctx: *Context) ! Error {
+        let request = single_request[Req](ctx)?
+        handler(ctx, request)?
+    })
+}
+
+/// Registers a method with a stream of requests and one response: `handler` reads the requests with `read` and returns the response.
+pub fn handle_client_streaming[Resp](s: *Server, method: str, handler: fn(*Context) -> Resp ! Error) {
+    handle_bytes(s, method, fn(ctx: *Context) ! Error {
+        let response = handler(ctx)?
+        write[Resp](ctx, response)?
+    })
+}
+
+/// Registers a method whose requests and responses are both streams: `handler` reads with `read` and writes with `write`, in any interleaving.
+pub fn handle_bidi_streaming(s: *Server, method: str, handler: fn(*Context) ! Error) {
+    handle_bytes(s, method, handler)
+}
+
+fn expiry_status() -> Status {
+    Status { code: DeadlineExceeded, message: "deadline exceeded" }
+}
+
+fn context_status(ctx: *Context) -> Status {
+    if ctx.expired {
+        return expiry_status()
+    }
+    if ctx.forced {
+        return Status { code: Unavailable, message: "server is shutting down" }
+    }
+    cancelled_status()
+}
+
+fn alive(ctx: *Context) ! Error {
+    if cancel.cancelled(ctx.token) {
+        fail Failed(context_status(ctx))
+    }
+}
+
+fn next_request(ctx: *Context) -> []u8? ! Error {
+    for {
+        match take(ctx.reader)? {
+            some(m) => return m
+            none => {}
+        }
+        if ctx.input_ended {
+            break
+        }
+        let chunk = http.receive_body_until(ctx.upload, ctx.token)
+        match chunk {
+            some(data) => feed(ctx.reader, data)
+            none => {
+                ctx.input_ended = true
+                alive(ctx)?
+            }
+        }
+    }
+    if pending(ctx.reader) > 0 {
+        fail error(Internal, "the request ended inside a message")
+    }
+    none
+}
+
+/// Returns the next request message of `ctx` as bytes, waiting for it, or `none` once the client has half-closed the call.
+///
+/// Fails with `Cancelled` or `DeadlineExceeded` when the call ended, with `ResourceExhausted` for a message over the receive limit and with `Internal` for malformed framing or data that does not decompress.
+pub fn read_bytes(ctx: *Context) -> []u8? ! Error {
+    next_request(ctx)?
+}
+
+/// Returns the next request message of `ctx` as a `T`, or `none` once the client has half-closed the call. Fails with `Internal` for a message that does not decode, and otherwise as `read_bytes` does.
+pub fn read[T](ctx: *Context) -> T? ! Error {
+    match next_request(ctx)? {
+        some(raw) => unmarshal[T](raw)?
+        none => none
+    }
+}
+
+/// Sends the response headers of `ctx` now instead of with the first message. They cannot change afterwards. Does nothing when they have been sent.
+pub fn flush_headers(ctx: *Context) ! Error {
+    alive(ctx)?
+    if !ctx.headed {
+        ctx.headed = true
+        notify(ctx.started)
+    }
+}
+
+/// Sends `data` as one response message, waiting while the client's flow-control window is full.
+///
+/// Fails with `ResourceExhausted` for a message over the send limit and with `Cancelled` or `DeadlineExceeded` once the call ended.
+pub fn write_bytes(ctx: *Context, data: []u8) ! Error {
+    if data.len > ctx.max_send {
+        fail error(ResourceExhausted, "message of {data.len} bytes is larger than the send limit {ctx.max_send}")
+    }
+    flush_headers(ctx)?
+    let framed = encode_message_frame(data, ctx.encoding)
+    select {
+        ctx.out <- framed => {}
+        <-cancel.done(ctx.token) => fail Failed(context_status(ctx))
+    }
+}
+
+/// Sends `message`, serialized with `std/protobuf`, as one response message. Fails as `write_bytes` does.
+pub fn write[T](ctx: *Context, message: T) ! Error {
+    write_bytes(ctx, protobuf.serialize(message))?
+}
+
+/// Sets the encoding of the response messages of `ctx` to `e` when the client lists it in `grpc-accept-encoding`, and returns whether it did. Call it before the first `write`; the encoding is announced in the response headers.
+pub fn set_compression(ctx: *Context, e: Encoding) -> bool {
+    if ctx.headed || !accepts(ctx.accepted, e) {
+        return false
+    }
+    ctx.encoding = e
+    true
+}
+
+/// Returns the milliseconds left of the deadline the client sent, at least 1, or `0` when the call has no deadline.
+pub fn remaining(ctx: *Context) -> i64 {
+    if ctx.deadline == 0 {
+        return 0
+    }
+    let left = (ctx.deadline - time.monotonic()) / 1000000
+    if left < 1 { 1 } else { left }
+}
+
+/// Returns the options for a call a handler makes while serving `ctx`: its deadline is what remains of the deadline of `ctx` and it is cancelled with `ctx`.
+pub fn outgoing(ctx: *Context) -> CallOptions {
+    CallOptions { timeout: remaining(ctx), token: some(ctx.token) }
+}
+
+fn content_type_ok(kind: str) -> bool {
+    if !text.starts_with(kind, "application/grpc") {
+        return false
+    }
+    let rest = kind["application/grpc".len..]
+    rest.len == 0 || rest[0] == '+' || rest[0] == ';'
+}
+
+fn status_fields(st: Status, extra: Metadata) -> []header.Header {
+    var out: []header.Header = [header.Header { name: "grpc-status", value: "{st.code.index}" }]
+    if st.message.len > 0 {
+        push(mut out, header.Header { name: "grpc-message", value: encode_message(st.message) })
+    }
+    if st.details.len > 0 {
+        push(mut out, header.Header { name: "grpc-status-details-bin", value: base64.encode_unpadded(st.details) })
+    }
+    for h in to_headers(extra) {
+        push(mut out, h)
+    }
+    for h in to_headers(st.trailers) {
+        push(mut out, h)
+    }
+    out
+}
+
+fn head_fields(ctx: *Context) -> []header.Header {
+    var out: []header.Header = [
+        header.Header { name: "content-type", value: "application/grpc" }
+        header.Header { name: "grpc-accept-encoding", value: accepted_encodings() }
+    ]
+    if ctx.encoding != Encoding.Identity {
+        push(mut out, header.Header { name: "grpc-encoding", value: encoding_name(ctx.encoding) })
+    }
+    for h in to_headers(ctx.response_headers) {
+        push(mut out, h)
+    }
+    out
+}
+
+fn only_status(st: Status, extra: Metadata) -> http.Response {
+    var fields: []header.Header = [
+        header.Header { name: "content-type", value: "application/grpc" }
+        header.Header { name: "grpc-accept-encoding", value: accepted_encodings() }
+    ]
+    for h in status_fields(st, extra) {
+        push(mut fields, h)
+    }
+    http.Response { status: 200, headers: fields, body: [] }
+}
+
+fn finish_fields(ctx: *Context) -> []header.Header {
+    let st = if ctx.complete { ctx.final } else { context_status(ctx) }
+    status_fields(st, ctx.response_trailers)
+}
+
+fn execute(s: *Server, ctx: *Context, run: fn(*Context) ! Error) {
+    using reg = cancel.on_cancel(s.token, fn() {
+        ctx.forced = true
+        cancel.cancel(ctx.token)
+    })
+    if ctx.deadline > 0 {
+        spawn watch_deadline(ctx)
+    }
+    var st = Status { code: Ok }
+    run(ctx) catch {
+        e => { st = status_of(e) }
+    }
+    if st.code == Cancelled && cancel.cancelled(ctx.token) && (ctx.expired || ctx.forced) {
+        st = context_status(ctx)
+    }
+    ctx.final = st
+    ctx.complete = true
+    cancel.cancel(ctx.token)
+    if ctx.headed {
+        close(ctx.out)
+    } else {
+        notify(ctx.finished)
+    }
+}
+
+fn watch_deadline(ctx: *Context) {
+    let millis = (ctx.deadline - time.monotonic() + 999999) / 1000000
+    if cancel.pause(ctx.token, millis) {
+        ctx.expired = true
+        cancel.cancel(ctx.token)
+    }
+}
+
+fn plain(status: i64) -> http.Response {
+    http.response(status, http.status_text(status))
+}
+
+fn dispatch(s: *Server, req: http.Request) -> http.Response {
+    if req.method != "POST" {
+        return plain(405)
+    }
+    let kind = header.get(req.headers, "content-type") ?? ""
+    if !content_type_ok(kind) {
+        return plain(415)
+    }
+    let upload = match req.upload {
+        some(u) => u
+        none => return plain(505)
+    }
+    let method = match s.registry.methods[req.path] {
+        some(m) => m
+        none => return only_status(Status { code: Unimplemented, message: "unknown method {req.path}" }, Metadata {})
+    }
+    var deadline = 0
+    match header.get(req.headers, "grpc-timeout") {
+        some(raw) => match parse_timeout(raw) {
+            some(nanos) => { deadline = time.monotonic() + nanos }
+            none => return only_status(Status { code: Internal, message: "malformed grpc-timeout {raw}" }, Metadata {})
+        }
+        none => {}
+    }
+    let name = header.get(req.headers, "grpc-encoding") ?? "identity"
+    let incoming = match parse_encoding(name) {
+        some(e) => e
+        none => {
+            let message = "decompression algorithm {name} not supported; supported: {accepted_encodings()}"
+            return only_status(Status { code: Unimplemented, message }, Metadata {})
+        }
+    }
+    let accepted = header.get(req.headers, "grpc-accept-encoding") ?? ""
+    let outgoing_encoding = if accepts(accepted, s.options.compression) { s.options.compression } else { Encoding.Identity }
+    let ctx = new(Context {
+        method: req.path
+        metadata: from_headers(req.headers)
+        peer: req.remote
+        token: cancel.child(req.token)
+        response_headers: Metadata {}
+        response_trailers: Metadata {}
+        deadline
+        upload
+        reader: message_reader(s.options.max_receive, incoming)
+        max_send: s.options.max_send
+        encoding: outgoing_encoding
+        accepted
+        out: chan[[]u8](1)
+        started: chan[bool](1)
+        finished: chan[bool](1)
+        headed: false
+        input_ended: false
+        expired: false
+        forced: false
+        complete: false
+        final: Status { code: Ok }
+    })
+    spawn execute(s, ctx, method.run)
+    let streaming = select {
+        <-ctx.started => true
+        <-ctx.finished => false
+    }
+    if !streaming {
+        return only_status(ctx.final, ctx.response_trailers)
+    }
+    http.Response { status: 200, headers: head_fields(ctx), body: [], stream: some(ctx.out), finish: fn() -> []header.Header { finish_fields(ctx) } }
+}
+
+fn notify(c: chan[bool]) {
+    select {
+        c <- true => {}
+        else => {}
+    }
+}
+
+fn serve_connection(s: *Server, h: net.ConnHandle, secure: bool) {
+    let handler = fn(req: http.Request) -> http.Response { dispatch(s, req) }
+    if secure {
+        http.serve_duplex_tls_conn_on(h, s.options.tls, s.drain, handler)
+    } else {
+        http.serve_duplex_conn_on(h, s.drain, handler)
+    }
+    sync.done(s.connections)
+}
+
+fn accepting(s: *Server, l: net.ListenerHandle, secure: bool) ! io.Error {
+    let r = s.registry
+    sync.lock(r.lock)
+    if r.draining {
+        sync.unlock(r.lock)
+        return
+    }
+    push(mut r.listeners, l)
+    sync.unlock(r.lock)
+    for {
+        let h = net.accept_handle(l) catch {
+            e => {
+                sync.lock(r.lock)
+                let stopping = r.draining
+                sync.unlock(r.lock)
+                if stopping {
+                    return
+                }
+                fail e
+            }
+        }
+        sync.add(s.connections, 1)
+        spawn serve_connection(s, h, secure)
+    }
+}
+
+/// Accepts connections from `l` and serves gRPC over HTTP/2 without TLS, with prior knowledge, on one green thread per connection.
+///
+/// Blocks until `shutdown` closes the listener and returns then, or until accepting fails and returns that error.
+pub fn serve(s: *Server, l: net.Listener) ! io.Error {
+    accepting(s, l.handle, false)?
+}
+
+/// Serves gRPC as `serve` does, accepting from a `ListenerHandle`.
+pub fn serve_on(s: *Server, l: net.ListenerHandle) ! io.Error {
+    accepting(s, l, false)?
+}
+
+/// Serves gRPC as `serve` does, terminating TLS on each connection with `ServerOptions.tls`, which must hold the certificates and key, and requiring HTTP/2 through ALPN.
+pub fn serve_tls(s: *Server, l: net.Listener) ! io.Error {
+    accepting(s, l.handle, true)?
+}
+
+/// Serves gRPC as `serve_tls` does, accepting from a `ListenerHandle`.
+pub fn serve_tls_on(s: *Server, l: net.ListenerHandle) ! io.Error {
+    accepting(s, l, true)?
+}
+
+fn await_connections(g: sync.WaitGroup, idle: chan[bool]) {
+    sync.wait(g)
+    notify(idle)
+}
+
+/// Stops the server gracefully: the listeners close, every connection sends `GOAWAY` and refuses new calls, and the calls in progress run to their end. Returns once every connection has ended.
+///
+/// When `grace` is more than zero and the calls are still running after that many milliseconds, they are cancelled and end with `Unavailable`, and the call returns once their connections ended. Call it from a green thread other than the ones serving.
+pub fn shutdown(s: *Server, grace: i64) {
+    let r = s.registry
+    sync.lock(r.lock)
+    let first = !r.draining
+    r.draining = true
+    let listeners = r.listeners
+    r.listeners = []
+    sync.unlock(r.lock)
+    if first {
+        for h in listeners {
+            net.close_listener_on(h)
+        }
+        close(s.drain)
+    }
+    let idle = chan[bool](1)
+    spawn await_connections(s.connections, idle)
+    if grace > 0 {
+        let timer = time.timer(duration.milliseconds(grace))
+        select {
+            <-idle => return
+            <-timer.fired => {}
+        }
+        cancel.cancel(s.token)
+    }
+    let ended = <-idle
+}
