@@ -1,0 +1,505 @@
+import std/slices
+import std/text
+import std/unicode
+
+const unset = 0
+const last_regular_primary = 0xFB3F0000
+
+struct Tailored {
+    tailoring: Tailoring
+    reorder: []str
+    backwards: i64
+    case_first: i64
+    shifted: i64
+    strength: i64
+}
+
+struct Reader {
+    runes: []u32
+    at: i64
+}
+
+struct Anchor {
+    prefix: []Ce
+    last: Ce
+    valid: bool
+    before: bool
+}
+
+struct Compiler {
+    tailoring: Tailoring
+    gaps: [str: []i64]
+    anchor: Anchor
+    reorder: []str
+    backwards: i64
+    case_first: i64
+    shifted: i64
+    strength: i64
+}
+
+fn decode(rules: str) -> []u32 {
+    var out: []u32 = []
+    var at = 0
+    for at < rules.len {
+        let r = unicode.decode_rune(rules, at)
+        push(mut out, r.code)
+        at += r.size
+    }
+    out
+}
+
+fn more(r: *Reader) -> bool {
+    r.at < r.runes.len
+}
+
+fn peek(r: *Reader) -> u32 {
+    if r.at < r.runes.len { r.runes[r.at] } else { 0 }
+}
+
+fn is_space(c: u32) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn skip_space(r: *Reader) {
+    for more(r) && is_space(peek(r)) {
+        r.at += 1
+    }
+}
+
+fn is_terminator(c: u32) -> bool {
+    is_space(c) || c == '<' || c == '=' || c == '&' || c == ';' || c == ',' || c == '/' || c == '|' || c == '['
+}
+
+fn hex_run(r: *Reader, width: i64) -> u32 {
+    var v: u32 = 0
+    var n = 0
+    for n < width && more(r) {
+        let c = peek(r)
+        var d: u32 = 99
+        if c >= '0' && c <= '9' {
+            d = c - '0'
+        } else if c >= 'a' && c <= 'f' {
+            d = c - 'a' + 10
+        } else if c >= 'A' && c <= 'F' {
+            d = c - 'A' + 10
+        }
+        if d == 99 {
+            break
+        }
+        v = v * 16 + d
+        r.at += 1
+        n += 1
+    }
+    v
+}
+
+fn read_escape(r: *Reader) -> u32 {
+    let c = peek(r)
+    r.at += 1
+    if c == 'u' {
+        return hex_run(r, 4)
+    }
+    if c == 'U' {
+        return hex_run(r, 8)
+    }
+    c
+}
+
+fn read_item(r: *Reader) -> []u32 {
+    var out: []u32 = []
+    var quoted = false
+    for more(r) {
+        let c = peek(r)
+        if quoted {
+            if c == '\\' {
+                r.at += 1
+                push(mut out, read_escape(r))
+                continue
+            }
+            r.at += 1
+            if c == '\'' {
+                if peek(r) == '\'' {
+                    r.at += 1
+                    push(mut out, '\'')
+                } else {
+                    quoted = false
+                }
+            } else {
+                push(mut out, c)
+            }
+            continue
+        }
+        if c == '\'' {
+            r.at += 1
+            if peek(r) == '\'' {
+                r.at += 1
+                push(mut out, '\'')
+            } else {
+                quoted = true
+            }
+            continue
+        }
+        if c == '\\' {
+            r.at += 1
+            push(mut out, read_escape(r))
+            continue
+        }
+        if is_terminator(c) {
+            break
+        }
+        push(mut out, c)
+        r.at += 1
+    }
+    out
+}
+
+fn read_bracket(r: *Reader) -> str {
+    var depth = 0
+    var out: []u32 = []
+    for more(r) {
+        let c = peek(r)
+        r.at += 1
+        if c == '[' {
+            depth += 1
+            if depth == 1 {
+                continue
+            }
+        }
+        if c == ']' {
+            depth -= 1
+            if depth == 0 {
+                break
+            }
+        }
+        push(mut out, c)
+    }
+    var s = ""
+    for c in out {
+        s = "{s}{text.from_char(c)}"
+    }
+    s
+}
+
+fn expand_ranges(items: []u32) -> [][]u32 {
+    var out: [][]u32 = []
+    var i = 0
+    for i < items.len {
+        if i + 2 < items.len && items[i + 1] == '-' {
+            var c = items[i]
+            for c <= items[i + 2] {
+                push(mut out, [c])
+                c += 1
+            }
+            i += 3
+            continue
+        }
+        push(mut out, [items[i]])
+        i += 1
+    }
+    out
+}
+
+fn gap_key(level: i64, p: i64, s: i64, base: i64) -> str {
+    if level == 1 {
+        return "1:{base}"
+    }
+    if level == 2 {
+        return "2:{p}:{base}"
+    }
+    "3:{p}:{s}:{base}"
+}
+
+fn place(c: *Compiler, level: i64, a: Ce, weight: i64, before: bool) -> i64 {
+    var base = weight >> 16
+    let anchored = weight & 0xFFFF
+    if before {
+        base -= 1
+    }
+    let key = gap_key(level, a.p, a.s, base)
+    var items: []i64 = []
+    match c.gaps[key] {
+        some(existing) => { items = existing }
+        none => {}
+    }
+    let id = items.len + 1
+    var at = 0
+    if before {
+        at = items.len
+    } else if anchored != 0 {
+        at = index_of_id(items, anchored) + 1
+    }
+    var grown: []i64 = []
+    for i in 0..items.len + 1 {
+        if i == at {
+            push(mut grown, id)
+        }
+        if i < items.len {
+            push(mut grown, items[i])
+        }
+    }
+    c.gaps[key] = grown
+    (base << 16) | id
+}
+
+fn index_of_id(items: []i64, id: i64) -> i64 {
+    for i, v in items {
+        if v == id {
+            return i
+        }
+    }
+    items.len - 1
+}
+
+fn related(c: *Compiler, level: i64, a: Ce, before: bool) -> Ce {
+    if level == 1 {
+        return Ce { p: place(c, 1, a, a.p, before), s: common_secondary, t: common_tertiary, variable: a.variable, upper: a.upper }
+    }
+    if level == 2 {
+        return Ce { p: a.p, s: place(c, 2, a, a.s, before), t: common_tertiary, variable: a.variable, upper: a.upper }
+    }
+    Ce { p: a.p, s: a.s, t: place(c, 3, a, a.t, before), variable: a.variable, upper: a.upper }
+}
+
+fn add_entry(c: *Compiler, cps: []u32, ces: []Ce) {
+    let key = rune_key(cps)
+    c.tailoring.entries[key] = ces
+    for k in 1..cps.len {
+        c.tailoring.prefixes[rune_key(cps[..k])] = true
+    }
+    if cps.len > c.tailoring.longest {
+        c.tailoring.longest = cps.len
+    }
+}
+
+fn ces_of(c: *Compiler, runes: []u32) -> []Ce {
+    elements(c.tailoring, false, decomposed(runes))
+}
+
+fn reset_anchor(c: *Compiler, r: *Reader) -> Anchor {
+    var before = false
+    var level = 1
+    let invalid = no_anchor()
+    skip_space(r)
+    if peek(r) == '[' {
+        let content = text.fields(read_bracket(r))
+        if content.len == 2 && content[0] == "before" {
+            before = true
+            level = text.parse_int(content[1]) or 1
+        } else if content.len == 2 && content[0] == "last" && content[1] == "regular" {
+            return Anchor { prefix: [], last: Ce { p: last_regular_primary, s: common_secondary, t: common_tertiary, variable: false, upper: false }, valid: true, before: false }
+        } else {
+            return invalid
+        }
+        skip_space(r)
+    }
+    let item = read_item(r)
+    if item.len == 0 {
+        return invalid
+    }
+    let ces = ces_of(c, item)
+    if ces.len == 0 {
+        return invalid
+    }
+    var anchor = Anchor { prefix: ces[..ces.len - 1], last: ces[ces.len - 1], valid: true, before: before }
+    if before {
+        anchor.last = related(c, level, anchor.last, true)
+    }
+    anchor
+}
+
+fn is_cased_upper(cp: u32) -> bool {
+    unicode.is_upper(cp) || unicode.is_title(cp)
+}
+
+fn apply_relation(c: *Compiler, level: i64, runes: []u32, expansion: []u32) {
+    let cps = decomposed(runes)
+    var adjusted = c.anchor.last
+    if level != 0 {
+        if c.anchor.before {
+            c.anchor.before = false
+        } else {
+            adjusted = related(c, level, c.anchor.last, false)
+        }
+    }
+    adjusted.upper = is_cased_upper(runes[0])
+    var ces: []Ce = slices.clone(c.anchor.prefix)
+    push(mut ces, adjusted)
+    for e in ces_of(c, expansion) {
+        push(mut ces, e)
+    }
+    add_entry(c, cps, ces)
+    c.anchor.last = adjusted
+}
+
+fn operator_level(r: *Reader) -> i64 {
+    let c = peek(r)
+    if c == '=' {
+        r.at += 1
+        return 0
+    }
+    if c == ';' {
+        r.at += 1
+        return 2
+    }
+    if c == ',' {
+        r.at += 1
+        return 3
+    }
+    var n = 0
+    for peek(r) == '<' {
+        r.at += 1
+        n += 1
+    }
+    if n > 3 { 0 } else { n }
+}
+
+fn relation(c: *Compiler, r: *Reader) {
+    let level = operator_level(r)
+    var starred = false
+    if peek(r) == '*' {
+        starred = true
+        r.at += 1
+    }
+    skip_space(r)
+    let item = read_item(r)
+    var expansion: []u32 = []
+    var supported = c.anchor.valid && item.len > 0
+    if peek(r) == '/' {
+        r.at += 1
+        expansion = read_item(r)
+    }
+    if peek(r) == '|' {
+        r.at += 1
+        read_item(r)
+        supported = false
+    }
+    if !supported {
+        return
+    }
+    if starred {
+        for one in expand_ranges(item) {
+            apply_relation(c, level, one, expansion)
+        }
+        return
+    }
+    apply_relation(c, level, item, expansion)
+}
+
+fn set_member(r: *Reader) -> u32 {
+    let c = peek(r)
+    r.at += 1
+    if c == '\\' {
+        return read_escape(r)
+    }
+    c
+}
+
+fn parse_set(inner: str) -> []u32 {
+    var out: []u32 = []
+    let r = new(Reader { runes: decode(inner), at: 0 })
+    for {
+        skip_space(r)
+        if !more(r) {
+            break
+        }
+        let low = set_member(r)
+        if peek(r) != '-' {
+            push(mut out, low)
+            continue
+        }
+        r.at += 1
+        let high = set_member(r)
+        var cp = low
+        for cp <= high && cp - low < 0x10000 {
+            push(mut out, cp)
+            cp += 1
+        }
+    }
+    out
+}
+
+fn setting(c: *Compiler, content: str) {
+    let f = text.fields(content)
+    if f.len < 2 {
+        return
+    }
+    if f[0] == "suppressContractions" {
+        let open = text.index(content, "[")
+        if open >= 0 {
+            for cp in parse_set(text.trim_suffix(content[open + 1..], "]")) {
+                c.tailoring.suppressed[rune_key([cp])] = true
+            }
+        }
+    } else if f[0] == "reorder" {
+        c.reorder = f[1..]
+    } else if f[0] == "backwards" {
+        c.backwards = 1
+    } else if f[0] == "caseFirst" {
+        c.case_first = if f[1] == "upper" { 2 } else if f[1] == "lower" { 3 } else { 1 }
+    } else if f[0] == "alternate" {
+        c.shifted = if f[1] == "shifted" { 1 } else { 2 }
+    } else if f[0] == "strength" {
+        c.strength = text.parse_int(f[1]) or unset
+    }
+}
+
+fn compile_rules(rules: str) -> Tailored {
+    let c = new(Compiler { tailoring: empty_tailoring(), gaps: [:], anchor: no_anchor(), reorder: [], backwards: unset, case_first: unset, shifted: unset, strength: unset })
+    let r = new(Reader { runes: decode(rules), at: 0 })
+    for {
+        skip_space(r)
+        if !more(r) {
+            break
+        }
+        let ch = peek(r)
+        if ch == '&' {
+            r.at += 1
+            c.anchor = reset_anchor(c, r)
+        } else if ch == '[' {
+            setting(c, read_bracket(r))
+        } else if ch == '<' || ch == '=' || ch == ';' || ch == ',' {
+            relation(c, r)
+        } else {
+            r.at += 1
+        }
+    }
+    finalise(c)
+    Tailored { tailoring: c.tailoring, reorder: c.reorder, backwards: c.backwards, case_first: c.case_first, shifted: c.shifted, strength: c.strength }
+}
+
+fn no_anchor() -> Anchor {
+    Anchor { prefix: [], last: Ce { p: 0, s: 0, t: 0, variable: false, upper: false }, valid: false, before: false }
+}
+
+fn rank_of(c: *Compiler, key: str, id: i64) -> i64 {
+    let items = c.gaps[key] ?? []
+    index_of_id(items, id) + 1
+}
+
+fn remapped(c: *Compiler, ce: Ce) -> Ce {
+    var p = ce.p
+    var s = ce.s
+    var t = ce.t
+    if (ce.p & 0xFFFF) != 0 {
+        p = ((ce.p >> 16) << 16) | rank_of(c, gap_key(1, 0, 0, ce.p >> 16), ce.p & 0xFFFF)
+    }
+    if (ce.s & 0xFFFF) != 0 {
+        s = ((ce.s >> 16) << 16) | rank_of(c, gap_key(2, ce.p, 0, ce.s >> 16), ce.s & 0xFFFF)
+    }
+    if (ce.t & 0xFFFF) != 0 {
+        t = ((ce.t >> 16) << 16) | rank_of(c, gap_key(3, ce.p, ce.s, ce.t >> 16), ce.t & 0xFFFF)
+    }
+    Ce { p, s, t, variable: ce.variable, upper: ce.upper }
+}
+
+fn finalise(c: *Compiler) {
+    let final_entries: [str: []Ce] = [:]
+    for key, ces in c.tailoring.entries {
+        var out: []Ce = []
+        for ce in ces {
+            push(mut out, remapped(c, ce))
+        }
+        final_entries[key] = out
+    }
+    c.tailoring.entries = final_entries
+}

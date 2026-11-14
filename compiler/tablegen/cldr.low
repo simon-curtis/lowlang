@@ -1,0 +1,171 @@
+import emit
+import std/file
+import std/slices
+import std/text
+
+struct LocaleFiles {
+    ids: []str
+    names: [str: str]
+}
+
+fn canonical_id(name: str) -> str {
+    var parts: []str = []
+    for p in text.split(tag_key(name), '-') {
+        let variant = p.len >= 5 || (p.len == 4 && p[0] >= '0' && p[0] <= '9')
+        push(mut parts, if variant { text.lower(p) } else { p })
+    }
+    text.join(parts, "-")
+}
+
+fn locale_files(common: str) -> LocaleFiles ! Error {
+    let dir = file.child_path(common, "main")
+    let entries = file.list(dir) catch {
+        e => fail Failed("open {dir}: {emit.io_message(e)}")
+    }
+    let names: [str: str] = [:]
+    var ids: []str = []
+    for entry in entries {
+        if !text.ends_with(entry, ".xml") {
+            continue
+        }
+        let stem = text.trim_suffix(entry, ".xml")
+        let id = canonical_id(stem)
+        names[id] = stem
+        push(mut ids, id)
+    }
+    slices.sort(mut ids)
+    LocaleFiles { ids, names }
+}
+
+fn function_suffix(id: str) -> str {
+    text.replace(id, "-", "_")
+}
+
+fn blob_for(common: str, stem: str, c: *Collector) -> []u8 ! Error {
+    let root = load_xml(file.child_path(common, "main/{stem}.xml"))?
+    collect_locale(c, root)
+    encode_blob(c)
+}
+
+fn parent_map(section: Section) -> [str: str] {
+    let parents: [str: str] = [:]
+    for line in text.lines(str(section.data)) {
+        let f = text.fields(line)
+        if f.len == 2 {
+            parents[f[0]] = f[1]
+        }
+    }
+    parents
+}
+
+fn parent_of(id: str, parents: [str: str]) -> str {
+    match parents[id] {
+        some(p) => return p
+        none => {}
+    }
+    let cut = text.last_cut(id, "-")
+    if cut.found {
+        return cut.before
+    }
+    "root"
+}
+
+fn chain_ids(id: str, parents: [str: str], present: [str: bool]) -> []str {
+    var chain: []str = []
+    var at = id
+    for at != "root" {
+        if present[at] ?? false {
+            push(mut chain, at)
+        }
+        at = parent_of(at, parents)
+    }
+    push(mut chain, "root")
+    chain
+}
+
+fn data_source(ids: []str, present: [str: bool], parents: [str: str]) -> str {
+    var out = emit.lines()
+    emit.line(mut out, "/// Returns the data of the locale `id`, or `none` when the data holds nothing for it.")
+    emit.line(mut out, "pub fn blob_by_id(id: str) -> str? {{")
+    emit.line(mut out, "    match id {{")
+    for id in ids {
+        if present[id] ?? false {
+            emit.line(mut out, "        {text.quote(id)} => some(blob_{function_suffix(id)}())")
+        }
+    }
+    emit.line(mut out, "        _ => none")
+    emit.line(mut out, "    }}")
+    emit.line(mut out, "}}")
+    for id in ids {
+        let suffix = function_suffix(id)
+        if present[id] ?? false {
+            emit.line(mut out, "")
+            emit.line(mut out, "/// Returns the data that the locale `{id}` holds itself.")
+            emit.line(mut out, "pub fn blob_{suffix}() -> str {{ embed({text.quote("bin/{id}.bin")}) }}")
+        }
+        var calls: []str = []
+        for link in chain_ids(id, parents, present) {
+            push(mut calls, "blob_{function_suffix(link)}()")
+        }
+        emit.line(mut out, "")
+        emit.line(mut out, "/// Returns the data of `{id}` and of every parent up to root, most specific first.")
+        emit.line(mut out, "pub fn chain_{suffix}() -> []str {{ [{text.join(calls, ", ")}] }}")
+    }
+    emit.string(out)
+}
+
+fn generate_cldr(common: str, dir: str) ! Error {
+    var sections: []Section = []
+    push(mut sections, likely_section(common)?)
+    push(mut sections, alias_section(common)?)
+    let parent_sec = parent_section(common)?
+    push(mut sections, parent_sec)
+    push(mut sections, week_section(common)?)
+    let numbering = numbering_section(common)?
+    push(mut sections, numbering)
+    let currency = currency_section(common)?
+    push(mut sections, currency)
+    push(mut sections, day_period_section(common)?)
+    for s in plural_sections(common)? {
+        push(mut sections, s)
+    }
+    let numbering_ids_list = numbering_ids(numbering)
+    var currency_codes: []str = []
+    for line in text.lines(str(currency.data)) {
+        push(mut currency_codes, text.fields(line)[0])
+    }
+    let specs = group_specs(numbering_ids_list.len, currency_codes.len)
+    let located = locale_files(common)?
+    let ids = located.ids
+    let present: [str: bool] = [:]
+    file.mkdir_all(file.child_path(dir, "bin")) catch {
+        e => fail Failed("mkdir {dir}/bin: {emit.io_message(e)}")
+    }
+    var total = 0
+    for id in ids {
+        let c = new(Collector { groups: [:], specs, numbering: numbering_ids_list, currencies: currency_codes })
+        let blob = blob_for(common, located.names[id] ?? id, c)?
+        if c.groups.len == 0 {
+            continue
+        }
+        present[id] = true
+        total += blob.len
+        push(mut sections, Section { name: "bin/{id}.bin", data: blob })
+    }
+    push(mut sections, Section { name: "locales.txt", data: bytes(sorted_lines(ids)) })
+    let layout = locale_layout_source(numbering_ids_list.len, currency_codes.len)
+    push(mut sections, Section { name: locale_layout_file, data: bytes(layout) })
+    let accessors = data_source(ids, present, parent_map(parent_sec))
+    push(mut sections, Section { name: "data.low", data: bytes(accessors) })
+    write_quiet(dir, sections)?
+    print("locales: {present.len} of {ids.len}, {total} bytes")
+}
+
+fn write_quiet(dir: str, sections: []Section) ! Error {
+    for s in sections {
+        let path = "{dir}/{s.name}"
+        file.write_file_mode(path, s.data, 0o644) catch {
+            e => fail Failed("open {path}: {emit.io_message(e)}")
+        }
+    }
+}
