@@ -1,0 +1,353 @@
+import std/crypto/hpke
+import std/crypto/x25519
+import std/slices
+import std/text
+
+struct Pair {
+    suite: hpke.Suite
+    keys: hpke.KeyPair
+}
+
+fn name(e: hpke.Error) -> str {
+    match e {
+        Invalid => "Invalid"
+        Unsupported => "Unsupported"
+        Encap => "Encap"
+        Decap => "Decap"
+        Open => "Open"
+        Limit => "Limit"
+    }
+}
+
+fn counted(from: i64, n: i64) -> []u8 {
+    var out: []u8 = []
+    for i in 0..n {
+        push(mut out, u8(from + i))
+    }
+    out
+}
+
+fn suite_of(kem: hpke.Kem, aead: hpke.AeadId) -> hpke.Suite {
+    hpke.Suite { kem, aead }
+}
+
+fn pair(kem: hpke.Kem, aead: hpke.AeadId) -> Pair {
+    let keys = hpke.derive_key_pair(kem, counted(1, 32)) or hpke.KeyPair { private: [], public: [] }
+    Pair { suite: suite_of(kem, aead), keys }
+}
+
+fn dh() -> Pair {
+    pair(hpke.Kem.DhkemX25519, hpke.AeadId.Aes256Gcm)
+}
+
+fn hybrid() -> Pair {
+    pair(hpke.Kem.Mlkem768X25519, hpke.AeadId.ChaCha20Poly1305)
+}
+
+fn info() -> []u8 {
+    bytes("errors")
+}
+
+fn status(label: str, result: str) {
+    print("{label}: {result}")
+}
+
+fn open_status(c: *hpke.Context, aad: []u8, ciphertext: []u8) -> str {
+    hpke.open(c, aad, ciphertext) catch {
+        e => return name(e)
+    }
+    "ok"
+}
+
+fn seal_status(c: *hpke.Context) -> str {
+    hpke.seal(c, [], bytes("x")) catch {
+        e => return name(e)
+    }
+    "ok"
+}
+
+fn export_status(c: *hpke.Context, length: i64) -> str {
+    let out = hpke.export(c, [], length) catch {
+        e => return name(e)
+    }
+    "{out.len}"
+}
+
+fn derive_status(kem: hpke.Kem, ikm: []u8) -> str {
+    hpke.derive_key_pair(kem, ikm) catch {
+        e => return name(e)
+    }
+    "ok"
+}
+
+fn setup_status(p: Pair, enc: []u8, private: []u8, credentials: hpke.Credentials) -> str {
+    hpke.setup_recipient(p.suite, enc, private, info(), credentials) catch {
+        e => return name(e)
+    }
+    "ok"
+}
+
+fn sender_status(p: Pair, public: []u8, credentials: hpke.Credentials) -> str {
+    hpke.setup_sender(p.suite, public, info(), credentials) catch {
+        e => return name(e)
+    }
+    "ok"
+}
+
+fn seeded_status(p: Pair, ikm_e: []u8) -> str {
+    hpke.setup_sender_seeded(p.suite, p.keys.public, info(), hpke.base(), ikm_e) catch {
+        e => return name(e)
+    }
+    "ok"
+}
+
+fn roundtrip(p: Pair, send: hpke.Credentials, receive: hpke.Credentials) -> str {
+    let aad = bytes("aad")
+    let pt = bytes("round trip")
+    let sealed = hpke.seal_single(p.suite, p.keys.public, info(), send, aad, pt) catch {
+        e => return "seal {name(e)}"
+    }
+    let opened = hpke.open_single(p.suite, sealed.enc, p.keys.private, info(), receive, aad, sealed.ciphertext) catch {
+        e => return "open {name(e)}"
+    }
+    if text.encode_hex(opened) == text.encode_hex(pt) { "ok" } else { "different plaintext" }
+}
+
+fn all_modes(p: Pair, label: str) {
+    let sender = hpke.derive_key_pair(p.suite.kem, counted(50, 32)) or hpke.KeyPair { private: [], public: [] }
+    let psk = counted(100, 32)
+    let psk_id = bytes("id")
+    status("{label} base", roundtrip(p, hpke.base(), hpke.base()))
+    status("{label} psk", roundtrip(p, hpke.psk(psk, psk_id), hpke.psk(psk, psk_id)))
+    if p.suite.kem == hpke.Kem.DhkemX25519 {
+        status("{label} auth", roundtrip(p, hpke.auth(sender.private), hpke.auth(sender.public)))
+        status("{label} auth-psk", roundtrip(p, hpke.auth_psk(sender.private, psk, psk_id), hpke.auth_psk(sender.public, psk, psk_id)))
+    }
+}
+
+fn sequence(p: Pair, label: str) {
+    let setup = hpke.setup_sender(p.suite, p.keys.public, info(), hpke.base()) or return
+    let receiver = hpke.setup_recipient(p.suite, setup.enc, p.keys.private, info(), hpke.base()) or return
+    let aad = bytes("aad")
+    let pt = bytes("message")
+    var cts: [][]u8 = []
+    for _ in 0..4 {
+        let ct = hpke.seal(setup.context, aad, pt) or return
+        push(mut cts, ct)
+    }
+    status("{label} repeated plaintext differs", if text.encode_hex(cts[0]) != text.encode_hex(cts[1]) { "yes" } else { "no" })
+    status("{label} ciphertext length", "{cts[0].len}")
+    status("{label} open out of order", open_status(receiver, aad, cts[1]))
+    let tampered = slices.clone(cts[0])
+    tampered[0] ^= 1
+    status("{label} open flipped bit", open_status(receiver, aad, tampered))
+    status("{label} open wrong aad", open_status(receiver, bytes("other"), cts[0]))
+    status("{label} open short", open_status(receiver, aad, cts[0][..15]))
+    var in_order = ""
+    for i in 0..4 {
+        let opened = hpke.open(receiver, aad, cts[i]) catch {
+            e => return status("{label} open in order", name(e))
+        }
+        in_order = "{in_order}{text.encode_hex(opened) == text.encode_hex(pt)} "
+    }
+    status("{label} open in order after failures", in_order)
+}
+
+fn roles(p: Pair, label: str) {
+    let setup = hpke.setup_sender(p.suite, p.keys.public, info(), hpke.base()) or return
+    let receiver = hpke.setup_recipient(p.suite, setup.enc, p.keys.private, info(), hpke.base()) or return
+    let sealed = hpke.seal(setup.context, [], bytes("x")) or return
+    status("{label} open on sender", open_status(setup.context, [], sealed))
+    status("{label} seal on recipient", seal_status(receiver))
+}
+
+fn exports(p: Pair, label: str) {
+    let setup = hpke.setup_sender(p.suite, p.keys.public, info(), hpke.base()) or return
+    let receiver = hpke.setup_recipient(p.suite, setup.enc, p.keys.private, info(), hpke.base()) or return
+    let a = hpke.export(setup.context, bytes("ctx"), 40) or return
+    let b = hpke.export(receiver, bytes("ctx"), 40) or return
+    let c = hpke.export(receiver, bytes("other"), 40) or return
+    status("{label} both sides export the same", if text.encode_hex(a) == text.encode_hex(b) { "yes" } else { "no" })
+    status("{label} other context differs", if text.encode_hex(a) != text.encode_hex(c) { "yes" } else { "no" })
+    status("{label} export 8160", export_status(receiver, 8160))
+    status("{label} export 0", export_status(receiver, 0))
+    status("{label} export 8161", export_status(receiver, 8161))
+    status("{label} export -1", export_status(receiver, -1))
+}
+
+fn export_only() {
+    let p = pair(hpke.Kem.DhkemX25519, hpke.AeadId.ExportOnly)
+    let setup = hpke.setup_sender(p.suite, p.keys.public, info(), hpke.base()) or return
+    let receiver = hpke.setup_recipient(p.suite, setup.enc, p.keys.private, info(), hpke.base()) or return
+    status("export-only seal", seal_status(setup.context))
+    status("export-only open", open_status(receiver, [], counted(0, 32)))
+    let a = hpke.export(setup.context, bytes("ctx"), 32) or return
+    let b = hpke.export(receiver, bytes("ctx"), 32) or return
+    status("export-only export agrees", if text.encode_hex(a) == text.encode_hex(b) { "yes" } else { "no" })
+}
+
+fn mismatches() {
+    let p = dh()
+    let psk = counted(100, 32)
+    let setup = hpke.setup_sender(p.suite, p.keys.public, info(), hpke.psk(psk, bytes("id"))) or return
+    let sealed = hpke.seal(setup.context, [], bytes("x")) or return
+    let attempts: []hpke.Credentials = [
+        hpke.psk(psk, bytes("id")),
+        hpke.psk(counted(101, 32), bytes("id")),
+        hpke.psk(psk, bytes("other")),
+        hpke.base(),
+    ]
+    var k = 0
+    for credentials in attempts {
+        let receiver = hpke.setup_recipient(p.suite, setup.enc, p.keys.private, info(), credentials) or return
+        status("psk mismatch {k}", open_status(receiver, [], sealed))
+        k += 1
+    }
+    let other = hpke.derive_key_pair(p.suite.kem, counted(7, 32)) or return
+    let wrong_key = hpke.setup_recipient(p.suite, setup.enc, other.private, info(), hpke.psk(psk, bytes("id"))) or return
+    status("wrong recipient key", open_status(wrong_key, [], sealed))
+    let wrong_info = hpke.setup_recipient(p.suite, setup.enc, p.keys.private, bytes("other"), hpke.psk(psk, bytes("id"))) or return
+    status("wrong info", open_status(wrong_info, [], sealed))
+}
+
+fn credentials_checks() {
+    let p = dh()
+    let h = hybrid()
+    let psk = counted(100, 32)
+    let sender = hpke.derive_key_pair(p.suite.kem, counted(50, 32)) or return
+    let valid = hpke.setup_sender(p.suite, p.keys.public, info(), hpke.base()) or return
+    status("psk without id, sender", sender_status(p, p.keys.public, hpke.psk(psk, [])))
+    status("id without psk, sender", sender_status(p, p.keys.public, hpke.psk([], bytes("id"))))
+    status("psk without id, recipient", setup_status(p, valid.enc, p.keys.private, hpke.psk(psk, [])))
+    status("id without psk, recipient", setup_status(p, valid.enc, p.keys.private, hpke.psk([], bytes("id"))))
+    status("short sender key", sender_status(p, p.keys.public, hpke.auth(counted(0, 31))))
+    status("short sender public key", setup_status(p, valid.enc, p.keys.private, hpke.auth(counted(0, 31))))
+    status("auth sender", sender_status(p, p.keys.public, hpke.auth(sender.private)))
+    status("empty psk and id is base", sender_status(p, p.keys.public, hpke.psk([], [])))
+    let hybrid_valid = hpke.setup_sender(h.suite, h.keys.public, info(), hpke.base()) or return
+    status("hybrid auth sender", sender_status(h, h.keys.public, hpke.auth(sender.private)))
+    status("hybrid auth-psk sender", sender_status(h, h.keys.public, hpke.auth_psk(sender.private, psk, bytes("id"))))
+    status("hybrid auth recipient", setup_status(h, hybrid_valid.enc, h.keys.private, hpke.auth(sender.public)))
+    status("hybrid auth-psk recipient", setup_status(h, hybrid_valid.enc, h.keys.private, hpke.auth_psk(sender.public, psk, bytes("id"))))
+    status("hybrid psk sender", sender_status(h, h.keys.public, hpke.psk(psk, bytes("id"))))
+}
+
+fn length_checks() {
+    let p = dh()
+    let h = hybrid()
+    let valid = hpke.setup_sender(p.suite, p.keys.public, info(), hpke.base()) or return
+    let hybrid_valid = hpke.setup_sender(h.suite, h.keys.public, info(), hpke.base()) or return
+    status("dhkem public key 31 bytes", sender_status(p, counted(0, 31), hpke.base()))
+    status("dhkem enc 31 bytes", setup_status(p, counted(0, 31), p.keys.private, hpke.base()))
+    status("dhkem private key 33 bytes", setup_status(p, valid.enc, counted(0, 33), hpke.base()))
+    status("dhkem ikm_e 31 bytes", seeded_status(p, counted(0, 31)))
+    status("dhkem ikm_e 64 bytes", seeded_status(p, counted(0, 64)))
+    status("hybrid public key 1184 bytes", sender_status(h, counted(0, 1184), hpke.base()))
+    status("hybrid enc 1088 bytes", setup_status(h, counted(0, 1088), h.keys.private, hpke.base()))
+    status("hybrid private key 31 bytes", setup_status(h, hybrid_valid.enc, counted(0, 31), hpke.base()))
+    status("hybrid ikm_e 32 bytes", seeded_status(h, counted(0, 32)))
+    status("hybrid ikm_e 65 bytes", seeded_status(h, counted(0, 65)))
+    status("hybrid ikm_e 64 bytes", seeded_status(h, counted(0, 64)))
+    status("dhkem derive 31 bytes", derive_status(hpke.Kem.DhkemX25519, counted(0, 31)))
+    status("dhkem derive 32 bytes", derive_status(hpke.Kem.DhkemX25519, counted(0, 32)))
+    status("hybrid derive 31 bytes", derive_status(hpke.Kem.Mlkem768X25519, counted(0, 31)))
+    status("hybrid derive 100 bytes", derive_status(hpke.Kem.Mlkem768X25519, counted(0, 100)))
+}
+
+fn zeros(n: i64) -> []u8 {
+    var out: []u8 = []
+    for _ in 0..n {
+        push(mut out, 0)
+    }
+    out
+}
+
+fn with_tail_zeroed(b: []u8) -> []u8 {
+    let out = slices.clone(b)
+    for i in b.len - 32..b.len {
+        out[i] = 0
+    }
+    out
+}
+
+fn low_order() {
+    let p = dh()
+    let h = hybrid()
+    let valid = hpke.setup_sender(p.suite, p.keys.public, info(), hpke.base()) or return
+    let hybrid_valid = hpke.setup_sender(h.suite, h.keys.public, info(), hpke.base()) or return
+    var one = zeros(32)
+    one[0] = 1
+    status("dhkem zero public key", sender_status(p, zeros(32), hpke.base()))
+    status("dhkem u=1 public key", sender_status(p, one, hpke.base()))
+    status("dhkem zero enc", setup_status(p, zeros(32), p.keys.private, hpke.base()))
+    status("dhkem u=1 enc", setup_status(p, one, p.keys.private, hpke.base()))
+    status("dhkem valid enc", setup_status(p, valid.enc, p.keys.private, hpke.base()))
+    status("hybrid zero x25519 public key", sender_status(h, with_tail_zeroed(h.keys.public), hpke.base()))
+    status("hybrid zero x25519 enc", setup_status(h, with_tail_zeroed(hybrid_valid.enc), h.keys.private, hpke.base()))
+    let corrupted = slices.clone(hybrid_valid.enc)
+    corrupted[0] ^= 1
+    let rejected = hpke.setup_recipient(h.suite, corrupted, h.keys.private, info(), hpke.base()) or return
+    status("hybrid corrupted ml-kem ciphertext", "setup ok, {open_status(rejected, [], counted(0, 32))}")
+}
+
+fn generated() {
+    let a = hpke.generate_key_pair(hpke.Kem.DhkemX25519)
+    let b = hpke.generate_key_pair(hpke.Kem.DhkemX25519)
+    status("dhkem generated sizes", "{a.private.len} {a.public.len}")
+    status("dhkem generated public matches x25519", if text.encode_hex(a.public) == text.encode_hex(x25519.public_key(a.private)) { "yes" } else { "no" })
+    status("dhkem generated keys differ", if text.encode_hex(a.private) != text.encode_hex(b.private) { "yes" } else { "no" })
+    let c = hpke.generate_key_pair(hpke.Kem.Mlkem768X25519)
+    let d = hpke.generate_key_pair(hpke.Kem.Mlkem768X25519)
+    status("hybrid generated sizes", "{c.private.len} {c.public.len}")
+    status("hybrid generated keys differ", if text.encode_hex(c.private) != text.encode_hex(d.private) { "yes" } else { "no" })
+    let p = Pair { suite: suite_of(hpke.Kem.Mlkem768X25519, hpke.AeadId.Aes256Gcm), keys: c }
+    status("hybrid generated roundtrip", roundtrip(p, hpke.base(), hpke.base()))
+    let q = Pair { suite: suite_of(hpke.Kem.DhkemX25519, hpke.AeadId.ChaCha20Poly1305), keys: a }
+    status("dhkem generated roundtrip", roundtrip(q, hpke.base(), hpke.base()))
+}
+
+fn serialization() {
+    let p = dh()
+    let h = hybrid()
+    let ok = hpke.serialize_public_key(p.suite.kem, p.keys.public) or return
+    status("dhkem serialize", if text.encode_hex(ok) == text.encode_hex(p.keys.public) { "identity" } else { "changed" })
+    let back = hpke.deserialize_public_key(h.suite.kem, h.keys.public) or return
+    status("hybrid deserialize", if text.encode_hex(back) == text.encode_hex(h.keys.public) { "identity" } else { "changed" })
+    let short = hpke.serialize_public_key(p.suite.kem, counted(0, 31)) catch {
+        e => return status("dhkem serialize 31 bytes", name(e))
+    }
+    status("dhkem serialize 31 bytes", "{short.len}")
+}
+
+fn deterministic() {
+    let p = dh()
+    let first = hpke.setup_sender_seeded(p.suite, p.keys.public, info(), hpke.base(), counted(0, 32)) or return
+    let second = hpke.setup_sender_seeded(p.suite, p.keys.public, info(), hpke.base(), counted(0, 32)) or return
+    let other = hpke.setup_sender_seeded(p.suite, p.keys.public, info(), hpke.base(), counted(1, 32)) or return
+    status("same ikm_e same enc", if text.encode_hex(first.enc) == text.encode_hex(second.enc) { "yes" } else { "no" })
+    status("other ikm_e other enc", if text.encode_hex(first.enc) != text.encode_hex(other.enc) { "yes" } else { "no" })
+    let a = hpke.seal(first.context, [], bytes("x")) or return
+    let b = hpke.seal(second.context, [], bytes("x")) or return
+    status("same ikm_e same ciphertext", if text.encode_hex(a) == text.encode_hex(b) { "yes" } else { "no" })
+}
+
+fn main() {
+    all_modes(dh(), "dhkem aes-256-gcm")
+    all_modes(pair(hpke.Kem.DhkemX25519, hpke.AeadId.ChaCha20Poly1305), "dhkem chacha20-poly1305")
+    all_modes(pair(hpke.Kem.Mlkem768X25519, hpke.AeadId.Aes256Gcm), "hybrid aes-256-gcm")
+    all_modes(hybrid(), "hybrid chacha20-poly1305")
+    sequence(dh(), "dhkem")
+    sequence(hybrid(), "hybrid")
+    roles(dh(), "dhkem")
+    roles(hybrid(), "hybrid")
+    exports(dh(), "dhkem")
+    exports(hybrid(), "hybrid")
+    export_only()
+    mismatches()
+    credentials_checks()
+    length_checks()
+    low_order()
+    generated()
+    serialization()
+    deterministic()
+}

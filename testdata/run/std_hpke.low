@@ -1,0 +1,803 @@
+import std/crypto/hash
+import std/crypto/hpke
+import std/text
+
+struct Seal {
+    seq: i64
+    aad: str
+    ct: str
+}
+
+struct Export {
+    context: str
+    length: i64
+    value: str
+    digest: str
+}
+
+struct Case {
+    label: str
+    kem: i64
+    aead: i64
+    info: str
+    ikm_r: str
+    sk_r: str
+    pk_r: str
+    ikm_e: str
+    enc: str
+    psk: str
+    psk_id: str
+    ikm_s: str
+    sk_s: str
+    pk_s: str
+    pt: str
+    count: i64
+    seals: []Seal
+    exports: []Export
+}
+
+fn hex(s: str) -> []u8 {
+    text.decode_hex(s) or []
+}
+
+fn same(a: []u8, s: str) -> bool {
+    text.encode_hex(a) == s
+}
+
+fn kem_of(id: i64) -> hpke.Kem {
+    match id {
+        0x20 => hpke.Kem.DhkemX25519
+        _ => hpke.Kem.Mlkem768X25519
+    }
+}
+
+fn aead_of(id: i64) -> hpke.AeadId {
+    match id {
+        2 => hpke.AeadId.Aes256Gcm
+        3 => hpke.AeadId.ChaCha20Poly1305
+        _ => hpke.AeadId.ExportOnly
+    }
+}
+
+fn report(c: Case, name: str, ok: bool) {
+    let verdict = if ok { "ok" } else { "FAIL" }
+    print("{c.label} {name}: {verdict}")
+}
+
+fn listed(c: Case, seq: i64) -> Seal? {
+    for s in c.seals {
+        if s.seq == seq {
+            return s
+        }
+    }
+    none
+}
+
+fn aad_of(c: Case, seq: i64) -> []u8 {
+    let s = listed(c, seq) ?? return bytes("Count-{seq}")
+    hex(s.aad)
+}
+
+fn export_ok(e: Export, got: []u8) -> bool {
+    if e.digest == "" {
+        return same(got, e.value)
+    }
+    let digest = hash.sum(hash.sha256(), got)
+    same(digest, e.digest)
+}
+
+fn check_seal(c: Case, seq: i64, ct: []u8) {
+    let published = listed(c, seq) ?? return
+    report(c, "seal {seq}", same(ct, published.ct))
+}
+
+fn ciphertext_of(c: Case, seq: i64, sealed: [][]u8) -> []u8 {
+    let published = listed(c, seq) ?? return sealed[seq]
+    hex(published.ct)
+}
+
+fn check_single(c: Case, suite: hpke.Suite, recipient: hpke.KeyPair, credentials: hpke.Credentials) ! hpke.Error {
+    let first = listed(c, 0) ?? return
+    let single = hpke.open_single(suite, hex(c.enc), recipient.private, hex(c.info), credentials, hex(first.aad), hex(first.ct))?
+    report(c, "open single", same(single, c.pt))
+}
+
+fn send(c: Case, suite: hpke.Suite, recipient: hpke.KeyPair, credentials: hpke.Credentials) -> [][]u8 ! hpke.Error {
+    let setup = hpke.setup_sender_seeded(suite, recipient.public, hex(c.info), credentials, hex(c.ikm_e))?
+    report(c, "sender enc", same(setup.enc, c.enc))
+    var sealed: [][]u8 = []
+    let pt = hex(c.pt)
+    for i in 0..c.count {
+        let ct = hpke.seal(setup.context, aad_of(c, i), pt)?
+        push(mut sealed, ct)
+        check_seal(c, i, ct)
+    }
+    var k = 0
+    for e in c.exports {
+        let got = hpke.export(setup.context, hex(e.context), e.length)?
+        report(c, "export {k} sender", export_ok(e, got))
+        k += 1
+    }
+    sealed
+}
+
+fn receive(c: Case, suite: hpke.Suite, recipient: hpke.KeyPair, credentials: hpke.Credentials, sealed: [][]u8) ! hpke.Error {
+    let enc = hex(c.enc)
+    let info = hex(c.info)
+    let context = hpke.setup_recipient(suite, enc, recipient.private, info, credentials)?
+    let pt = hex(c.pt)
+    var all = c.count > 0
+    for i in 0..c.count {
+        let ct = ciphertext_of(c, i, sealed)
+        let opened = hpke.open(context, aad_of(c, i), ct)?
+        all = all && same(opened, c.pt)
+    }
+    if c.count > 0 {
+        report(c, "open all", all)
+    }
+    check_single(c, suite, recipient, credentials)?
+    var k = 0
+    for e in c.exports {
+        let got = hpke.export(context, hex(e.context), e.length)?
+        report(c, "export {k} recipient", export_ok(e, got))
+        k += 1
+    }
+}
+
+fn run(c: Case) ! hpke.Error {
+    let suite = hpke.Suite { kem: kem_of(c.kem), aead: aead_of(c.aead) }
+    let recipient = hpke.derive_key_pair(suite.kem, hex(c.ikm_r))?
+    report(c, "derive recipient", same(recipient.private, c.sk_r) && same(recipient.public, c.pk_r))
+    var sender_private: []u8 = []
+    var sender_public: []u8 = []
+    if c.ikm_s != "" {
+        let sender = hpke.derive_key_pair(suite.kem, hex(c.ikm_s))?
+        sender_private = sender.private
+        sender_public = sender.public
+        report(c, "derive sender", same(sender.private, c.sk_s) && same(sender.public, c.pk_s))
+    }
+    let psk = hex(c.psk)
+    let psk_id = hex(c.psk_id)
+    var sealed: [][]u8 = []
+    if c.ikm_e != "" {
+        sealed = send(c, suite, recipient, hpke.auth_psk(sender_private, psk, psk_id))?
+    }
+    receive(c, suite, recipient, hpke.auth_psk(sender_public, psk, psk_id), sealed)?
+}
+
+fn main() {
+    for c in cases() {
+        run(c) catch {
+            _ => print("{c.label}: error")
+        }
+    }
+}
+
+fn cases() -> []Case {
+    [
+    Case {
+        label: "rfc9180 dhkem-x25519 aes-256-gcm base"
+        kem: 32
+        aead: 2
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "dac33b0e9db1b59dbbea58d59a14e7b5896e9bdf98fad6891e99d1686492b9ee"
+        sk_r: "497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d"
+        pk_r: "430f4b9859665145a6b1ba274024487bd66f03a2dd577d7753c68d7d7d00c00c"
+        ikm_e: "2cd7c601cefb3d42a62b04b7a9041494c06c7843818e0ce28a8f704ae7ab20f9"
+        enc: "6c93e09869df3402d7bf231bf540fadd35cd56be14f97178f0954db94b7fc256"
+        psk: ""
+        psk_id: ""
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: "4265617574792069732074727574682c20747275746820626561757479"
+        count: 257
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "e5d84cd531cfb583096e7cfa9641bd3079cf3a91cda813c52deb5f512be9931980a41de125a925cdad859d5b7a" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "2c43aff25343fdbff864506f0818b9d87df84ea01b1a2144d23b4d40c26bf655fdf197fe40297a8aebeed5cc2d" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "e0a8f2cf92ff61215edbb8c55dc31fe9e2eb42a5685867bb6854211542099f9e940c4b41c192bc390835b1a5f7" }
+            Seal { seq: 255, aad: "436f756e742d323535", ct: "f6ad1823eb0b932d04b6e23010eea64f1fe5edd0583dae5ba27ca6363f4ea104bd217331460ef4208040423641" }
+            Seal { seq: 256, aad: "436f756e742d323536", ct: "53624f4f9f173453b14e633b45390ff54cacaa4428d44baee1bff8133fab1ab3afe60f88e4634b525c54e92eda" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "ded6cffafaea6b812cbf3e241e88332adbc077aca81512914213810ee291770a", digest: "" }
+            Export { context: "00", length: 32, value: "04d3cb6cc116b28ffd22ad5bc276c60d31fec71ceb87ae24db811c64b7507339", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "7c5ded445732c14fe09727d29b4251c0fd38455fe8440571e687f0886aac94d2", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 aes-256-gcm psk"
+        kem: 32
+        aead: 2
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "f1c6eccfde050607555cae11893fcfe895f85eadc7c77c42c1544391d0cb7a20"
+        sk_r: "d99132243a09c24a7497f3da8608f0ba808c21a575d33679f4b24603e96d27ad"
+        pk_r: "62a61ceb338540516edde460e27923a8df6749bc38e27b1001cd5b8b9102e44c"
+        ikm_e: "82a09463e824b97331c06be1d3eebd9a3e023e08b9ed22bc6a4af2ff024817dd"
+        enc: "4f3e44d4dde1d0d12a724242df8cef0a68ea53617dab8a6aade4239d404a5154"
+        psk: "0247fd33b913760fa1fa51e1892d9f307fbe65eb171e8132c2af18555a738b82"
+        psk_id: "456e6e796e20447572696e206172616e204d6f726961"
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: "4265617574792069732074727574682c20747275746820626561757479"
+        count: 257
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "316d9b4214a33182212888e86f23005b0706c30db2b1052c4e28c2c100fcdb85cc934b0a64c8db0d7dd339b64c" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "d8d6bd66e6e43f33a40bbb3786cad58092b5c7c64fa4c596fbeea04334dd169d7a02a25556e95a0f9a043938f7" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "facb3855d62ed8e2fc1060aa8c88c295ca414e9d62347d5525c02917dd97842d9bc3058af20694992fc8c3205a" }
+            Seal { seq: 255, aad: "436f756e742d323535", ct: "9d518a05dc8cb22efca7cf8cf02a01ca724ce92bab3a084a93666bc15c226e3f913d57e75b686dd399069c229c" }
+            Seal { seq: 256, aad: "436f756e742d323536", ct: "13d9bb62272359bf8006e85d5a2b8bd5c0d8d9ca1f9f8b6ae704c1bc715254c14c78c01053ff7904c59eda9532" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "c2dccc00e2dda4c34a38e25a9ec1c0a43338b2d3c08ab7a870a978839d64af98", digest: "" }
+            Export { context: "00", length: 32, value: "b0eba64b7c69140740872216442aebbfbdbb3c5acfcd394d2272ae8b5694c1a9", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "83c8f8266bad56783567d44f9cd2a1c0070e1ea179d147e1424622037e7fb61c", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 aes-256-gcm auth"
+        kem: 32
+        aead: 2
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "f59761a1e479c2a291b91a5af2b35dd2cace1b2042b570f88a16b226f6f30774"
+        sk_r: "47f1eee3670dfaaf27c30a83d06ee9f257af174727c17b35328ef730dfc1cd81"
+        pk_r: "3668d659cec6f338f4f8dc6da6733118d2a633f186a3c1415c895111a8eb7c7d"
+        ikm_e: "734369ab3061f71ee85e090fae308553cac8e7b3fbd45b4ba83d05e0cd05b1c4"
+        enc: "9e59f4b1fa5c876f684765290c34e51145894cc4f244342b9fb1a4bdfd8bb426"
+        psk: ""
+        psk_id: ""
+        ikm_s: "87137373fe6b28a72534f38048b9467a614d3566fb3a16a50fcaf11c76051392"
+        sk_s: "98fdf9b9773578a79d4ba82fbe483c74cc2e3b8d9525d148a18969fd79a74876"
+        pk_s: "4a91c3d0893433f5e31a79fc520f885527a1bc60bf2b0c72693dd7f0b2e41a5a"
+        pt: "4265617574792069732074727574682c20747275746820626561757479"
+        count: 257
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "10b964283ac2cc0bdc4c85ab617291b446bf3832e9359b2c3a0facc50ea75a3c1afd08aeaacd6041d02eb560ec" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "83b24287a5ac672289ccebf5ec303d3c0a85bc60bb7a748014d85179b51c7552ca93a70817ee3140442f92e23b" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "f42d890891825c1a57dea5a66baf2c940126704682826bc7c5caee60ca71578d767db256b0c2a4051bef1236f7" }
+            Seal { seq: 255, aad: "436f756e742d323535", ct: "f2783a56b5f0cac017424bbe7d29dc9cc45ea7a6050ef83c3284f5ad7bc889aab2cb46e6916a683b17b903b63e" }
+            Seal { seq: 256, aad: "436f756e742d323536", ct: "16bc024eb0af9037260c822d45fa786e3c259aab1b7a4a196a72c3e794e78446440ba42b531da44d3d36d0a042" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "8890c5615e5d6b0e1b212e26d80a7e8c0d03e796377f09e9377aa0497ccf89c9", digest: "" }
+            Export { context: "00", length: 32, value: "51f60f1d4505688a1aca99c9b789e44f38a5bfa177a6b4660ff57114bf50c6be", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "25f7c731201fe73978b5c66405f17de3e59b7f1c4bbe21e9ff57541d152841ac", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 aes-256-gcm auth-psk"
+        kem: 32
+        aead: 2
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "cb00bcfe70c59318fffcba7e8c4ac10c0913e7ea68004b042fc12e27e205655e"
+        sk_r: "a494cc9d803df57792c866f6ab716ba8ce953236e3ec71914908cd80fb721c15"
+        pk_r: "49823d14040d46e3d405e21f421a810a4968a361bc96c5abcf2f36e66b15a36e"
+        ikm_e: "72f439eae7e59017d8b27ef1c19b178c1bbae606aed33a1c36e0bacf7dd3ffac"
+        enc: "d38af616e071a4e3717ad1575fc8df781c541b4d0cc02cdf98f2d156a9eda15f"
+        psk: "0247fd33b913760fa1fa51e1892d9f307fbe65eb171e8132c2af18555a738b82"
+        psk_id: "456e6e796e20447572696e206172616e204d6f726961"
+        ikm_s: "a2cd7374f8bbe45930099e921195dc51bae913c6a08e0dbd256b2b9ea3b20aec"
+        sk_s: "06d5b0b9a559a48588a2447b51f153ef5a03fae0c022c831e64ad85bb3d3ab41"
+        pk_s: "f94a4aad51983c18a48a960f2072c14818b9bf1eac2cc4575e32d8d029387a2e"
+        pt: "4265617574792069732074727574682c20747275746820626561757479"
+        count: 257
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "49d13e16bc1f0e45805ac211e0c2e6bf5d436ed00df5f02f16c4c8eaeda0418d3f614636e2f026949bbd6dd281" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "3179ce5b24375e75dee632b551fe2091ee399ea2102e7ecb95068ca423186c3eec89cae7c4c580f2a82e014dc0" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "9f5408fcac20278c45adf43ade2f0c73228320c4cf78e6354e92736fedd2970955e80402aaae1204309f7567f3" }
+            Seal { seq: 255, aad: "436f756e742d323535", ct: "82f0d22a5dbf45ee663d611f1bde8940ee2cbd02c384fcb159fd79b51aa5ab33b2b34f51e3acd9290a88cdd802" }
+            Seal { seq: 256, aad: "436f756e742d323536", ct: "111bc7955e6b95f96f39d8d8313dd070770af62b06362062d0d99eacb6f41aab1fd702ffec08d9e0e47466d81f" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "0404bb6afcf9f3a2f8b10e0d2077b7829b5b90d97f799a3ebdefa3772e53137a", digest: "" }
+            Export { context: "00", length: 32, value: "b27b4d9756004ad06b8b57e680df80097ea5600796c1bf9235b8c3d9a28515ae", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "d4a4033268f372ee2725be064512c4de92591f94740efdb1ed4be226c5d4e20f", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 chacha20-poly1305 base"
+        kem: 32
+        aead: 3
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "1ac01f181fdf9f352797655161c58b75c656a6cc2716dcb66372da835542e1df"
+        sk_r: "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb"
+        pk_r: "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a"
+        ikm_e: "909a9b35d3dc4713a5e72a4da274b55d3d3821a37e5d099e74a647db583a904b"
+        enc: "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a"
+        psk: ""
+        psk_id: ""
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: "4265617574792069732074727574682c20747275746820626561757479"
+        count: 257
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "6b53c051e4199c518de79594e1c4ab18b96f081549d45ce015be002090bb119e85285337cc95ba5f59992dc98c" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "71146bd6795ccc9c49ce25dda112a48f202ad220559502cef1f34271e0cb4b02b4f10ecac6f48c32f878fae86b" }
+            Seal { seq: 255, aad: "436f756e742d323535", ct: "18ab939d63ddec9f6ac2b60d61d36a7375d2070c9b683861110757062c52b8880a5f6b3936da9cd6c23ef2a95c" }
+            Seal { seq: 256, aad: "436f756e742d323536", ct: "7a4a13e9ef23978e2c520fd4d2e757514ae160cd0cd05e556ef692370ca53076214c0c40d4c728d6ed9e727a5b" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "4bbd6243b8bb54cec311fac9df81841b6fd61f56538a775e7c80a9f40160606e", digest: "" }
+            Export { context: "00", length: 32, value: "8c1df14732580e5501b00f82b10a1647b40713191b7c1240ac80e2b68808ba69", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "5acb09211139c43b3090489a9da433e8a30ee7188ba8b0a9a1ccf0c229283e53", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 chacha20-poly1305 psk"
+        kem: 32
+        aead: 3
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "26b923eade72941c8a85b09986cdfa3f1296852261adedc52d58d2930269812b"
+        sk_r: "77d114e0212be51cb1d76fa99dd41cfd4d0166b08caa09074430a6c59ef17879"
+        pk_r: "13640af826b722fc04feaa4de2f28fbd5ecc03623b317834e7ff4120dbe73062"
+        ikm_e: "35706a0b09fb26fb45c39c2f5079c709c7cf98e43afa973f14d88ece7e29c2e3"
+        enc: "2261299c3f40a9afc133b969a97f05e95be2c514e54f3de26cbe5644ac735b04"
+        psk: "0247fd33b913760fa1fa51e1892d9f307fbe65eb171e8132c2af18555a738b82"
+        psk_id: "456e6e796e20447572696e206172616e204d6f726961"
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: "4265617574792069732074727574682c20747275746820626561757479"
+        count: 257
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "4a177f9c0d6f15cfdf533fb65bf84aecdc6ab16b8b85b4cf65a370e07fc1d78d28fb073214525276f4a89608ff" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "5c3cabae2f0b3e124d8d864c116fd8f20f3f56fda988c3573b40b09997fd6c769e77c8eda6cda4f947f5b704a8" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "14958900b44bdae9cbe5a528bf933c5c990dbb8e282e6e495adf8205d19da9eb270e3a6f1e0613ab7e757962a4" }
+            Seal { seq: 255, aad: "436f756e742d323535", ct: "2414d0788e4bc39a59a26d7bd5d78e111c317d44c37bd5a4c2a1235f2ddc2085c487d406490e75210c958724a7" }
+            Seal { seq: 256, aad: "436f756e742d323536", ct: "c567ae1c3f0f75abe1dd9e4532b422600ed4a6e5b9484dafb1e43ab9f5fd662b28c00e2e81d3cde955dae7e218" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "813c1bfc516c99076ae0f466671f0ba5ff244a41699f7b2417e4c59d46d39f40", digest: "" }
+            Export { context: "00", length: 32, value: "2745cf3d5bb65c333658732954ee7af49eb895ce77f8022873a62a13c94cb4e1", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "ad40e3ae14f21c99bfdebc20ae14ab86f4ca2dc9a4799d200f43a25f99fa78ae", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 chacha20-poly1305 auth"
+        kem: 32
+        aead: 3
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "64835d5ee64aa7aad57c6f2e4f758f7696617f8829e70bc9ac7a5ef95d1c756c"
+        sk_r: "3ca22a6d1cda1bb9480949ec5329d3bf0b080ca4c45879c95eddb55c70b80b82"
+        pk_r: "1a478716d63cb2e16786ee93004486dc151e988b34b475043d3e0175bdb01c44"
+        ikm_e: "938d3daa5a8904540bc24f48ae90eed3f4f7f11839560597b55e7c9598c996c0"
+        enc: "f7674cc8cd7baa5872d1f33dbaffe3314239f6197ddf5ded1746760bfc847e0e"
+        psk: ""
+        psk_id: ""
+        ikm_s: "9d8f94537d5a3ddef71234c0baedfad4ca6861634d0b94c3007fed557ad17df6"
+        sk_s: "2def0cb58ffcf83d1062dd085c8aceca7f4c0c3fd05912d847b61f3e54121f05"
+        pk_s: "f0f4f9e96c54aeed3f323de8534fffd7e0577e4ce269896716bcb95643c8712b"
+        pt: "4265617574792069732074727574682c20747275746820626561757479"
+        count: 257
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "ab1a13c9d4f01a87ec3440dbd756e2677bd2ecf9df0ce7ed73869b98e00c09be111cb9fdf077347aeb88e61bdf" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "3265c7807ffff7fdace21659a2c6ccffee52a26d270c76468ed74202a65478bfaedfff9c2b7634e24f10b71016" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "3aadee86ad2a05081ea860033a9d09dbccb4acac2ded0891da40f51d4df19925f7a767b076a5cbc9355c8fd35e" }
+            Seal { seq: 255, aad: "436f756e742d323535", ct: "652e597ba20f3d9241cda61f33937298b1169e6adf72974bbe454297502eb4be132e1c5064702fc165c2ddbde8" }
+            Seal { seq: 256, aad: "436f756e742d323536", ct: "3be14e8b3bbd1028cf2b7d0a691dbbeff71321e7dec92d3c2cfb30a0994ab246af76168480285a60037b4ba13a" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "070cffafd89b67b7f0eeb800235303a223e6ff9d1e774dce8eac585c8688c872", digest: "" }
+            Export { context: "00", length: 32, value: "2852e728568d40ddb0edde284d36a4359c56558bb2fb8837cd3d92e46a3a14a8", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "1df39dc5dd60edcbf5f9ae804e15ada66e885b28ed7929116f768369a3f950ee", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 chacha20-poly1305 auth-psk"
+        kem: 32
+        aead: 3
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "f3304ddcf15848488271f12b75ecaf72301faabf6ad283654a14c398832eb184"
+        sk_r: "7b36a42822e75bf3362dfabbe474b3016236408becb83b859a6909e22803cb0c"
+        pk_r: "a5099431c35c491ec62ca91df1525d6349cb8aa170c51f9581f8627be6334851"
+        ikm_e: "49d6eac8c6c558c953a0a252929a818745bb08cd3d29e15f9f5db5eb2e7d4b84"
+        enc: "656a2e00dc9990fd189e6e473459392df556e9a2758754a09db3f51179a3fc02"
+        psk: "0247fd33b913760fa1fa51e1892d9f307fbe65eb171e8132c2af18555a738b82"
+        psk_id: "456e6e796e20447572696e206172616e204d6f726961"
+        ikm_s: "20ade1d5203de1aadfb261c4700b6432e260d0d317be6ebbb8d7fffb1f86ad9d"
+        sk_s: "90761c5b0a7ef0985ed66687ad708b921d9803d51637c8d1cb72d03ed0f64418"
+        pk_s: "3ac5bd4dd66ff9f2740bef0d6ccb66daa77bff7849d7895182b07fb74d087c45"
+        pt: "4265617574792069732074727574682c20747275746820626561757479"
+        count: 257
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "9aa52e29274fc6172e38a4461361d2342585d3aeec67fb3b721ecd63f059577c7fe886be0ede01456ebc67d597" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "59460bacdbe7a920ef2806a74937d5a691d6d5062d7daafcad7db7e4d8c649adffe575c1889c5c2e3a49af8e3e" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "5688ff6a03ba26ae936044a5c800f286fb5d1eccdd2a0f268f6ff9773b51169318d1a1466bb36263415071db00" }
+            Seal { seq: 255, aad: "436f756e742d323535", ct: "4d4c462f7b9b637eaf1f4e15e325b7bc629c0af6e3073422c86064cc3c98cff87300f054fd56dd57dc34358beb" }
+            Seal { seq: 256, aad: "436f756e742d323536", ct: "9b7f84224922d2a9edd7b2c2057f3bcf3a547f17570575e626202e593bfdd99e9878a1af9e41ded58c7fb77d2f" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "c23ebd4e7a0ad06a5dddf779f65004ce9481069ce0f0e6dd51a04539ddcbd5cd", digest: "" }
+            Export { context: "00", length: 32, value: "ed7ff5ca40a3d84561067ebc8e01702bc36cf1eb99d42a92004642b9dfaadd37", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "d3bae066aa8da27d527d85c040f7dd6ccb60221c902ee36a82f70bcd62a60ee4", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 export-only base"
+        kem: 32
+        aead: 65535
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "683ae0da1d22181e74ed2e503ebf82840deb1d5e872cade20f4b458d99783e31"
+        sk_r: "33d196c830a12f9ac65d6e565a590d80f04ee9b19c83c87f2c170d972a812848"
+        pk_r: "194141ca6c3c3beb4792cd97ba0ea1faff09d98435012345766ee33aae2d7664"
+        ikm_e: "55bc245ee4efda25d38f2d54d5bb6665291b99f8108a8c4b686c2b14893ea5d9"
+        enc: "e5e8f9bfff6c2f29791fc351d2c25ce1299aa5eaca78a757c0b4fb4bcd830918"
+        psk: ""
+        psk_id: ""
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: ""
+        count: 0
+        seals: []
+        exports: [
+            Export { context: "", length: 32, value: "7a36221bd56d50fb51ee65edfd98d06a23c4dc87085aa5866cb7087244bd2a36", digest: "" }
+            Export { context: "00", length: 32, value: "d5535b87099c6c3ce80dc112a2671c6ec8e811a2f284f948cec6dd1708ee33f0", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "ffaabc85a776136ca0c378e5d084c9140ab552b78f039d2e8775f26efff4c70e", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 export-only psk"
+        kem: 32
+        aead: 65535
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "5e0516b1b29c0e13386529da16525210c796f7d647c37eac118023a6aa9eb89a"
+        sk_r: "98f304d4ecb312689690b113973c61ffe0aa7c13f2fbe365e48f3ed09e5a6a0c"
+        pk_r: "d53af36ea5f58f8868bb4a1333ed4cc47e7a63b0040eb54c77b9c8ec456da824"
+        ikm_e: "c51211a8799f6b8a0021fcba673d9c4067a98ebc6794232e5b06cb9febcbbdf5"
+        enc: "d3805a97cbcd5f08babd21221d3e6b362a700572d14f9bbeb94ec078d051ae3d"
+        psk: "0247fd33b913760fa1fa51e1892d9f307fbe65eb171e8132c2af18555a738b82"
+        psk_id: "456e6e796e20447572696e206172616e204d6f726961"
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: ""
+        count: 0
+        seals: []
+        exports: [
+            Export { context: "", length: 32, value: "be6c76955334376aa23e936be013ba8bbae90ae74ed995c1c6157e6f08dd5316", digest: "" }
+            Export { context: "00", length: 32, value: "1721ed2aa852f84d44ad020c2e2be4e2e6375098bf48775a533505fd56a3f416", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "7c9d79876a288507b81a5a52365a7d39cc0fa3f07e34172984f96fec07c44cba", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 export-only auth"
+        kem: 32
+        aead: 65535
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "fc9407ae72ed614901ebf44257fb540f617284b5361cfecd620bafc4aba36f73"
+        sk_r: "ed88cda0e91ca5da64b6ad7fc34a10f096fa92f0b9ceff9d2c55124304ed8b4a"
+        pk_r: "ffd7ac24694cb17939d95feb7c4c6539bb31621deb9b96d715a64abdd9d14b10"
+        ikm_e: "43b078912a54b591a7b09b16ce89a1955a9dd60b29fb611e044260046e8b061b"
+        enc: "5ac1671a55c5c3875a8afe74664aa8bc68830be9ded0c5f633cd96400e8b5c05"
+        psk: ""
+        psk_id: ""
+        ikm_s: "2ff4c37a17b2e54046a076bf5fea9c3d59250d54d0dc8572bc5f7c046307040c"
+        sk_s: "c85f136e06d72d28314f0e34b10aadc8d297e9d71d45a5662c2b7c3b9f9f9405"
+        pk_s: "89eb1feae431159a5250c5186f72a15962c8d0debd20a8389d8b6e4996e14306"
+        pt: ""
+        count: 0
+        seals: []
+        exports: [
+            Export { context: "", length: 32, value: "83c1bac00a45ed4cb6bd8a6007d2ce4ec501f55e485c5642bd01bf6b6d7d6f0a", digest: "" }
+            Export { context: "00", length: 32, value: "08a1d1ad2af3ef5bc40232a64f920650eb9b1034fac3892f729f7949621bf06e", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "ff3b0e37a9954247fea53f251b799e2edd35aac7152c5795751a3da424feca73", digest: "" }
+        ]
+    },
+    Case {
+        label: "rfc9180 dhkem-x25519 export-only auth-psk"
+        kem: 32
+        aead: 65535
+        info: "4f6465206f6e2061204772656369616e2055726e"
+        ikm_r: "4dfde6fadfe5cb50fced4034e84e6d3a104aa4bf2971360032c1c0580e286663"
+        sk_r: "c4962a7f97d773a47bdf40db4b01dc6a56797c9e0deaab45f4ea3aa9b1d72904"
+        pk_r: "f47cd9d6993d2e2234eb122b425accfb486ee80f89607b087094e9f413253c2d"
+        ikm_e: "94efae91e96811a3a49fd1b20eb0344d68ead6ac01922c2360779aa172487f40"
+        enc: "81cbf4bd7eee97dd0b600252a1c964ea186846252abb340be47087cc78f3d87c"
+        psk: "0247fd33b913760fa1fa51e1892d9f307fbe65eb171e8132c2af18555a738b82"
+        psk_id: "456e6e796e20447572696e206172616e204d6f726961"
+        ikm_s: "26c12fef8d71d13bbbf08ce8157a283d5e67ecf0f345366b0e90341911110f1b"
+        sk_s: "6175b2830c5743dff5b7568a7e20edb1fe477fb0487ca21d6433365be90234d0"
+        pk_s: "29a5bf3867a6128bbdf8e070abe7fe70ca5e07b629eba5819af73810ee20112f"
+        pt: ""
+        count: 0
+        seals: []
+        exports: [
+            Export { context: "", length: 32, value: "dafd8beb94c5802535c22ff4c1af8946c98df2c417e187c6ccafe45335810b58", digest: "" }
+            Export { context: "00", length: 32, value: "7346bb0b56caf457bcc1aa63c1b97d9834644bdacac8f72dbbe3463e4e46b0dd", digest: "" }
+            Export { context: "54657374436f6e74657874", length: 32, value: "84f3466bd5a03bde6444324e63d7560e7ac790da4e5bbab01e7c4d575728c34a", digest: "" }
+        ]
+    },
+    Case {
+        label: "pq-05 mlkem768-x25519 chacha20-poly1305 base"
+        kem: 25722
+        aead: 3
+        info: "34663634363532303666366532303631323034373732363536333639363136653230353537323665"
+        ikm_r: "c8575d137deab99ac98fb0873048c83c3a1f47ef5b409f609c0ca652f58c83e0"
+        sk_r: "b6bfa0299b955e85224df2e468f29eeab377ff3b96d4462b39447a22d32b91be"
+        pk_r: "d3d102410970b8bab2984008669914490c95dea2c2ae331ca229aaf3609a6d5acbd60a9ecdd71cd462c08300c474e318b554675679b6d4e1bb1a76269a7a87e68335ba54593239290f35b65e5aa0d3352933339336e83260125e10ac21c97b40cff8385a18b2b7d62436377a13b00c27d22fea4176ff76ab80970ff0e26101c245b7c33dcaa420da8ab4df41b88985c6f3845e5a5364e7d7a74ae764c175bd462017cbbc5f684a7e4494391d050b83ba9ba66347774c707658c5cfe481a8c20efc670314d7569a4793625abfd6579435b31886f80924c88c9a4011a0c58b6fe85c5330ca27aa80ffcc58d3ac6a759897b44893bf8b520802b4d7d56bc24976ba32c070f0cc7fd88c19e958de0b8fe93a7669b5bb8cf80a88e6aa827924cb1659fe6177023611ddd30eb913ad8b2c08fc8209bb9719c61450518881ca5b12b8c73ba3c27824773b5ec6571df41b277555d9aa8f566444614a8473d3b1a5e997af066ae1f355338302952281c82ba94f50a22e9ba55a56193d1a3f4b5365f7eb2ca81cb4573c33d1d9861cac8d4cf327c0393ab0c0b02572bbc3821bedb45d40257e1f7643796786fcf50126eb136b35737794168a15643973639f6b6f3dd945d3ac6a5ab96e5d4b8fdcc54809053828610ee3a56bf4c84447147a9ca5745d5c05e3d9cfa659bb4c4c8f2e006826c27633a120c32151deaa2a98bc9578232b518604a5186fc7ac6a1e594b09106418eb1aa1ec6b44fabeae5105d75531b9279b07f6277ab297a5ea77d2383154bcb9db8a08fbb10522987d63c99958a774160333f5f208567a311464b59ebb8cc8375a1f02470de68bad55c8e5184c8c4a0dcd45bfb59995f4c48ecf947896126830818aca48c0749c057b6591d381922d8bb593e09d4bb7b6b046179c16a1d6b4149fb1cee31b6b9a015cca526cfac8bf060c699e751c9456c26d832d58926032bb78ffa44d0d024f7a417e1b452f1f779d49c86e0784ab97686acb025c90f9893cc13bfc9186f0e9946ba498eb15a6684828bc0ca91482ce91dc4c12d0ce4b936e2556aebdc48cede6adcc066e78895086b49316725d9a0987ca75a7e00b0bbe909397389fead7a8ff73bf94bb4272b27b9354bdbf3777a978024d074a45077ed0435b8b845e4481139b39ad1276973fd1cd8b1cc6e27b16998a7d6295c98347998d6669b15270dba7c098f16136015bd3b1c5897b1312f230e49bc07476cf4deb5bf0c971d5ac37f980283940c4e52999c549aed09681a7f350f5a1bb1dd5a3b8837a22d506eb2029146817ec955d9dbc2939514ecf468c4eeb85198230effac612fb73348b42bcb9b27d9816a16596fb3618e71bcc321a4523a66ca248ac032c06b9e24cb084c59bc489868639ae7533f8f03a4eeb56f8a3568f687f38f83fbe163673eb76275b79d7f32a9109c30eaa96a0f622503c0337801fd9b2007603ce73c0378b250c35b634b6c8ac2cec1fbb24561a7a7812e77b4844bf9c6a299b409303c85199ca5dc6eac4e4f85ff10a464d96c71382760af67fdf006c4eb6b627861d5bf1978588c02825ac70206274742af05a0dd136c2d465ac90b4293d05381d5911dcf48a878a6cf8d971d62c14700867e91dd050f85d68c32e227e5be68d3de029608179f6f83b95e5deb6263fc01c80641763ebe08e7add5686b0ed1d1e7053982aa616130939d0a09462df7dc74d05"
+        ikm_e: "c82228383c9fb887f7d8b332c28262024eda5b6b0ecd2325fe662daffc0594fad4990e7c8d13812137d06ba7017453de675ab0388d418853617f3ca58cc5daf3"
+        enc: "ab354dd589f74ee0eab7718a630cbec5df1d09058e177cd6dd141d883450ddd70c050d88bed3d07cce23415cab411108cc30906482a71adcb134a56e978a6152a8e063b24acd1534f264f10458152a9ed4f1f32b3d480c4f2453b7fdea7720146b3ee92cf8a13a4840076f68c911c65fa3db5053fb0aabf79e64cd5e7aa71b2b9641e713ec7df552e17d5020f8721ee449b42c888e2a3f87cfd96e3a98c3e7c4cd8f647f899570f596bf17d2b6fa2cad19706d9cc3cf09493e1c7ffa0eb2a4559ae1d940fdbef97bed383e6ccfdb448d9f1a81805166b32c2af2e16878c6dc46ab43323ed9c136b925239782e3c329c31a5cf2a80faf025a80766e244605c27afe4b624d9d8ca99b6ef5439ed1ad044b518c434385acd49f1369ded6624a2832a571ccdd70d08b3c04cb1cd3136166f9a485f536f69ec66f0293e840025ccaac42f8e5f7c9cb818076c272797047f5e50c1e9f1dab81cfb48fe4c4998b2427f009702b145f34ad8dbc3e7ad4e4023057ba31cd02c4c0545ebf71eb02533e8eaa2b2f2690ee1407bf1f66dc5f4d836c45b82f10b720df72d237488a9af1b6dfb4741fd613379c2e211e77f7fae6b3734ad81de2d452005334857c4a3cbc82afc7428fe510495969b296d24e1a7431f557d48578cf92ae86c0392f0ba73755a9e5465c8e3495e4cd2a82d463244341e39414e26c9b242f31d2cf0e46b2aeb11dd5e56ec44834350d151344229e410faff2b2ace5c9b3fa12571db1d28da2c7133492781dac41b7a7e2bac2260fd12f56939033587824c9dfb17d41b3bceea53763193abe0c7c184d5de161ef5312f31fab42478c9a193b868e4d29b2b7624f3ebe740f393d03d843cd5327286a579fd2a6e37aca5b64f9316115d612c7781e704ea7d182701c5019975cad14fbf4ab3904d4a35acaf0be32d716a1ef5d7188fc418ae9e60744325a3e8001655b756df94c24031c3ce32bd90c0ecdac52ca140fdad7f44d04bd0a7e2a726c54cf9793f8784a23296f65da3fd1cbc18300d503c5b27be99b9b0e32d20b3614dc8a999f30c2779dd7886cfd486dc1c93ebcf517b5210a4359d9fa1805381f0f2261ff47de01de555d98bc1a30dda557a83007b61636abaf9041f96890f0f565eefc45859fbcd32d91b203215541227a4fcc3d95be2ddb0702878caa20f2da62c4ff9fe33af591ba1ec241fbe2208e0480f8b1cca1679c096f8f5a02a33e9df445b3274ac112b43d51510135cd3f532a3379e90bb7f0cb43717e90555bb1a80924cc69577455687cceb9b1610c05839541e87ad83d79ef3ff24ace1934cfbe989691959d93ac48c716b672b370dd4c144ca1e32508707a6ef8aa29b55759b3d054c56bee1baa6f41b84b9fc3fd681a1a1528eac578141529836a29dda1501a49ba2455367256d2fe6f74ebb74ef9a49a94a4c6cd1dd09810f0e9bffa69dd8c94d226d0b2977b11a35382888961004a44c60fd602e9ff4271287e9240ba96146515b9db9da60375aeeafeac1eeb764faebacd197df27817c35fe4c5c802e43349d7bc95c8b40c001449d3251c1d92ff6d5c3b08c4b27c"
+        psk: ""
+        psk_id: ""
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: "34323635363137353734373932303639373332303734373237353734363832633230373437323735373436383230363236353631373537343739"
+        count: 10
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "a4ab74475a498ed725f685421f67c09a4783fe76f67bd251e1e73db8eb1452dfad4df3c6453f7edecc7bb055dde561e2efd54d73a3d4f1f2f02eac90ba1e9b84ded66d43aee6393524db" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "9a38169c711afe09f0e470779b137ab236a2559faf61d55e417eaf06d48fe62364643e95ca68382a281c04c67bd88f311939955a14f5f8c64344e4c103e1d94f3084f122671fc7c0cd7e" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "0f2a23afb6d94feccf5e151cc5cac46e686325dbf34def1394d157448c420376cee6d3c8aa4f3862edcc16fb4c3a9ef8a7ca1054d13fd9b1cfc4a5a47198ffb3b97372295c894dded976" }
+            Seal { seq: 3, aad: "436f756e742d33", ct: "e5bad2306fccb51b100ce45fba5f88947d7853d66478099011de84bd2a5b9de337efdf9c459da7edee76cd07db9b7cddbc9a512fa45ee8f121531660861818ddda7d9d2b53d3f257d36a" }
+            Seal { seq: 4, aad: "436f756e742d34", ct: "923c933cbdc5955d34bf6134f1ad5e3c36f2acc9d9fb41dd8b4e0eba2101a05ad5fe7a895e683176381b9baba7ced24498e87766a14fec8c256c7df2802371a5d29d2faf03d9b4bbcaa9" }
+            Seal { seq: 5, aad: "436f756e742d35", ct: "0dd329bc293f83ac756c3fd052c2e52a8082a0a41069764736319127fb222a644f6c28155bfab1bd7763d34ab09907ead4f497c9b14d729c75c8bb6f4acfdd596f39c2e9872557802821" }
+            Seal { seq: 6, aad: "436f756e742d36", ct: "ae092db4f524c459e04a2453c92b59edef2ed07d08138f3582e7cfcb735d23772aa223baad29cc2dfe2e6d2935d7c593828413eaabd7eb6cb2b20d6e9fb82ab521d25f80fb93190260cc" }
+            Seal { seq: 7, aad: "436f756e742d37", ct: "299434544769a352047b82f0f74cd7f832dbb47b8b3d8500476f95e07d13502e4b748296f19f51c4b35f4c8f80607d087f6e0632e68bad401e4153c95ceb380c9b6e1a50477069d68345" }
+            Seal { seq: 8, aad: "436f756e742d38", ct: "6f09ad8f28a51f7f3e34eb99ac25e9b1e4a09ca063babb7c462a7ac7f65310aa2d4a1eb3b629fba0606793c10a469af0b2407aac02e6073fa8b070d9aab532a8349f884fd97cc5041b2b" }
+            Seal { seq: 9, aad: "436f756e742d39", ct: "90eb1a4fc6e9f6b5cb142d60d905ad221135aab544c8a20484c249d5417bd2eb97c655ba8f15feda2adaab1a6bb5c06d0d7b17a6a6d298c9df95681d5ed131d7c703918397e302620c6a" }
+        ]
+        exports: [
+            Export { context: "70736575646f72616e646f6d30", length: 32, value: "14b64c194571a8e6fc16cb4d22754c79391081174b6001cd8050142f928defbb", digest: "" }
+            Export { context: "70736575646f72616e646f6d31", length: 32, value: "7152f82449d4cd8137afb9b514fab6791e0938ba7734cb62228b8385003f32a6", digest: "" }
+            Export { context: "70736575646f72616e646f6d32", length: 32, value: "e3759bd609d81501bdac23863795a37437e804dd3274f0ed3964f82e8a6f97e5", digest: "" }
+            Export { context: "70736575646f72616e646f6d33", length: 32, value: "3e9e46c25af47fe02c149de2d3d8300881bb59fdb5b07c6b46d001918945cffa", digest: "" }
+            Export { context: "70736575646f72616e646f6d34", length: 32, value: "0dc9bd0216b18caa75d0188cab85d7fdef4b405c340da75b50e052b889fb2f78", digest: "" }
+        ]
+    },
+    Case {
+        label: "extra dhkem-x25519 aes-256-gcm auth-psk"
+        kem: 32
+        aead: 2
+        info: ""
+        ikm_r: "8a0f16db98c7d66ee1bfff1434de9154d480fe9f0f61fca322be3321fd1d3efd"
+        sk_r: "77b91729ac78979da138c7315ee42d2175e92d970dc6cce6911b71b922e4b6ad"
+        pk_r: "2d39d741a3db4953d9392ff25fc1874c54f5c4d6064ee5bae2f4b33c6c63d903"
+        ikm_e: "d31838b4eed618382b718589489a11b935e05620f7ab6cc1c9edb34102b8e9be"
+        enc: "188f9411d43825d49f900c43aac9ba74eb14c77fa86550b9a226afdddbcfec1a"
+        psk: "93f23c730265c17d3bdee023b3a4d04c58e11bf317e7f8af8d854bd1d1182cc0"
+        psk_id: "70736b2d6964656e7469666965722d3035306236336364"
+        ikm_s: "860a1622bc0e8b242c43bd1042f6941faea0906b61f49ab2b43346a351122950"
+        sk_s: "dc5df885e4c38a376a7df46a2ae1140f7a4b4d71535954c2675a57eb7312de7a"
+        pk_s: "cbd6afd4e84ab5bd0bfab315f91da6095be816c085bd0eac00a06c248f968718"
+        pt: ""
+        count: 3
+        seals: [
+            Seal { seq: 0, aad: "", ct: "b50488787835a556d6cb38d293a385d1" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "69cbc86112a62cbdaa7a6d48e903b65d" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "7b8e6bec621a7529eab9ff53489dabb5" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "e90aa1f44d3215aeb2ac9f84f9c900d5289299c53ca62e10ed9b0c1dad316f81", digest: "" }
+            Export { context: "636f6e74657874", length: 17, value: "32f6ab6073ec3dc730e0ebd2596a080acf", digest: "" }
+            Export { context: "00000000000000000000000000000000000000000000000000000000000000000000000000000000", length: 33, value: "91b59484b17e28eaefd5205cbbffee3a1792c4f841614ad8b383380eac50b0d48d", digest: "" }
+            Export { context: "", length: 0, value: "", digest: "" }
+        ]
+    },
+    Case {
+        label: "extra dhkem-x25519 chacha20-poly1305 psk"
+        kem: 32
+        aead: 3
+        info: "23d0b006d6f8d8203b8f704e47344ab0a97dc4e91a66177458b565d2960a67b6660dc35849176d9eeb17d808c58c6e80ca970ec4429a645ddd8d8ee1c8ed6101e88fd7b5654dcc753a996edbb12df7cca723bb2fdd7c2215cc901d0793e9c79ae45501627c3db664091d8813cd3b260e8d278c4bc3d1999e963332e9e851cde1136de00f9fbdd0fe87657e667c6a581e44e627ff357889390ac6633989817dd880fa08722af899ad978272bdc021f5458d430366278029c1ccc1a463665c6b0d234826fce4d66d383441b8fa0e149dc1e5277553123339bd45a107c0e7be71293fb174adebf43d490311a9e3945de8494d5cf27ea0afdd21ca71cd97b8a75fb64badf055d1ad87073fbecf446e462683b127414817a95e70c82ac7e245be0c3aa89de693b54bf3be24641cff"
+        ikm_r: "78f46a19a9fad06bb45e8b1340fbad60dbddcb06701341389be1715e7d506b37"
+        sk_r: "27d678800fd65919fee6f2f2632f773a7a481c6e41d6d8edf2256f2080c18023"
+        pk_r: "1a2d2e1f7f438faae31bb64abf97378d692d2887deb621398412d45c04d88245"
+        ikm_e: "0eeb11761253cfbac476b1edfd559e0dc47f8bb50604865382e7b1df5706ab4d"
+        enc: "93ebec1ad7228e5b0a55cb7e1ff06f0378dc9dab050a0850db0a8518ba62d657"
+        psk: "b3a2cc61dcde7c17821199228f801d66fcc3b1178fe057db635167ca33d7181b"
+        psk_id: "70736b2d6964656e7469666965722d3361333366313736"
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: "af77d16881bfd3d4864cb5ffd654db227f1644c5ed714d6245d7ac1d25e4607f4a7ddd824778093d5f46c3106ab3643654997eea6081776e7b46ec884fbcd6bd9fd1c41f79e7aad69d1e77fc883e05c868aea2320d426182569c87bc31b0c6728685f414e1dada0113a406a04c3df714ba4a4953a798fea2710969a932ed4bfb09a6f76136692686fd93cf0fad84eab2f8e5e473c4fd570c7c37439d063deb4961eaaceeedd5468f7b33afe74e752ae8bedf52877c6eda9900c0ad0e398de08a7e6a49f042965b956569583e27d90a105041285aafbce3912bd41d395e83b6ede8a3f2b060fdfe07ecb2d68bf021184011b3037eec597bbb94068ade8767acc7bb84e3cc1d4ced58b831f20d89a0a37525a3f4295a8c6a1cdc5817916a911e8d07a17bee307fa06771481dd61597798faf76f6d730fd02d75bedfcfa86ce148eb5b17ac223d682f638e7913f8004218df674b04554bdf52e1380de5a9ad11fad65bdbcf749db47054a327632a472240d70f71fc147e591e5b3f6bd1e0fb1cde2472216ba53b5dd65f86b9dac234c6f4be9547c831e44eb64b7a07be44ee13ca12119fffda54a70cc260547004e7d8ba59e12761e369206ce582552cfc12c8ae7a8534c2da038850be562aa0478112c48fcac4826eb47af251b9b33adb3eec871808b0963d0792d4db589f86ee90de2e2e68ca4e346cc0a877379b75556e457dbb443205142b3df3bc906dfbec89730b66722c10f1c58c7df1e7f70a306246e0117579e92b9327a591c452b3a8a831198a2be7a8f8663e28f7aceadaabe02a43ac5a71424dfb5042c14303063671e812a33c7c762c240df7002f40b7d13b40cb3ea1da8f6414a3ba692e8a2ffe397b1e3f4b2f9946590b8aafe8ad56502fba272fc3d9dd33cd2c5d9e1fa3194eee1a29550e4e3e430ded838d784f0a85124d9383497e5a4893cdb158c029e5dbd8d47188d1d333cb6b327d4496a575f5914fc29fafc08c1d9fa78382079b1a8f3f2649fa86d8bde562c68621d3d5946e957cad8586ac627e41173cec0c46271bfdfdaaf277f4a85db88fd408eae1ca2d3670eab94ca41e09344ce4cdadb68db3dc282d0161de4fc05fcdbfacb931fbc182979defee7dcc798ac6cd2064671860372bc517bb71a5d6a4022f2fc855f2fe90a627f64d485f2f0cbc22a418d4e9d86df94c1717add7026891e64ab7dee3449ccbdc1746989933a8d79c5b2507e3650c154e27071914bd5cc3e18e4da7310e72ffdde22d167239945421e990a4017808fa8e7947ba08dae68ca7d1a17e555760086905b287df5832d1218e353a7f5790c0e71d837bcda272ebb89969e3dfdecdc741bc0206130f2619495b89662f7d033a70910bbf70b457831b7d227019100b576241548fd0812b306b1"
+        count: 4
+        seals: [
+            Seal { seq: 0, aad: "d5e217c26bfc06842c309e82e32d590d4b1ee31c7de3b82fe20748842dd3f094188fdc23d6dcff0f09d5f044dbf544d61b288f2dbe347c3a94204c35a205d032c13aeebb7384969f7c436124c4f4509ef9c71e1989f1995a4174d01e7b3fbdac2607f335c3bbf87c0911151c75257e851ecd142b98e787d5e7d1c67df8b666cc6585e4afdb01b2233143f51706037ebbc6a36f9ae9e2eb41b1a51b624dbc080d5f04f759699da93327a2dee4e891d2f6c7622f240513e7999a933705245e3c9299aee810ec53351c", ct: "747509afaaa014e1fa2e7fc3bb221547d8ccc1d72474fefeb8a44f944b200440f14dc60b6c4d7665b9eec2f608ac12caf59df1f75f4e996fc6806b86064b7e0ffda0bef0359730bc3d384f3b01be3d2e338afbe9a594975454d5b630ac92cb1058eda02e3dc58015e6e1e327f30657093d78f93a4c0d1c36a0accd93091f6e243e5a1de375fdd5a73cca0373f951d90240584d9d72ba061f6b8283e9c5d7e008f030e6c9fd32574f91d6aeb7fffb2d9f8f9a63b91dd76abf3815a656c538b88d5c3a180717ab9e28b288138e4e7edb7ee5b064194af5af3f8fed76e5e499c74fbe1f7ff7b322ae96d1e3b288ebb3f8e7439af84d5a93af8c4bb184487bd7e46c99c89a92c63a785671f50fa2b5237d2c276395a1ce49b0c068ec0c8f06de1604aab1dd71da3f0109d905c6b05089189c588676ef0b2c00d71293164e8fbb0e8eaa90ba355f31bdb24d3edd655dcb1c6118c4618cb9f74145e5bfedc31d1ff2726b47129e7f051992716a8c8794d7a703c53a2544d2d3ecd13406288a46177f2720a14ae28391a1aa2de855bb4c7ee146fc767b01d76e22d742ea12b2d1917f1553ca1a582dce8d13cfb128a1c36f9d8b6a2519ca9e1e67e5b627fb4c769c427650946db10eecd2e1a42b5924ced3526b1b000d909c6c1e276452622ba977a67e4a6f7b1ebceb373ddeac05a8121b41d9a2d68d602b8554c9b8f70e385a6a1652ea1cb92c9de1ef19450ecc74c9cc8f1d9188f92a9cde219e7e5a924ce5107ef3510b0dac7ec40233d1f72f48e26076d5f823c75cf2c6b2f305af7c3524eccc98ec11d75c560cbc35d7066465ebb41e4e5b797aa3c4b383d643c6a4fcb420b4f88c2a6241a6cd2f0e71e7735aa0b0d8735ff41b62e3ae8098d0ec91ed5880a8836e1839a2279d2d396b83a438cc6cb1038494e29767316487cf4e72bd27fe31b98f5c8340325df9ab1d03de75c9f465826e759260028ecfd787c97c18ed8deeee4e39ac974b12acd430aa5beefdbfe2185c4bb5503c6f71a10a8557a057d3bdac175ce5c2bfcd8b555af25dd991aaec2b91be5f6d08b62d62e35b043f516e4523b003001734024998e38f6a60265b9d201ba7c7ad914c4cf6920a374d9eae46135d16af4370c171399f6557d348e8e278413d99def4855d4cb18ead45dd2aeb4eea8545d759f8f6dbf4a876189ab9e236a7bc7e10d9672649ebb977d291a8765569c0c049ee1e96ba3fa3828b393d1efb16d7ce4c90ef0d54efe9b0beb1a43e7b7fc2a449f71b025e640ebba4cd69924600063d6922e67619a6b5e82c1df2de5624e6be40c74d0c56ed8cb1d89e00932bdc7c0573fba1b610e0a02ee3d6b8da8f843dba84f9510e9004c1550050fba9a1a4781bce34fcdb73a6fc8f08a00ef5ec5adaa350e15f7adfd7e1e3d857e6109c2cd3b1c021cd3d6c" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "f149710c140b6c476c87cd4853d1c49104dd90bb9373256d499bdf901e18e40413d55eff964d52a27dd861db74719525869703205f5a0d040811013c57e35e0926b075369918e14be6df9a956e6e88f665ae76c97beb81edda70925f8b082f403378b9be3dc5957ff7bc468acc407600409e8fb6923002ddde736abff48a7595b3d11cb0e31ed6d392e619eeb0669c9dec5e046638602fb04d41b888942d5b44a8c48479db3fda9be0acf2d2a83ecf070f1052e64676f10f0b7ae998112de555972a173ee77870e25f2195f0b3fabdeece908543f6cc011d2c2ba978fb04909bca11ebe9adda915e0e36102bd21903478554858b20d7f9cb8cdc33dec96ef82b8b6f771381ea9d4f50a7a1fdf36aeb42f077ec3adc540cc44668fbe6a3ad135a9ddb505e09194a5f2e468e6e324cdb49ec5408e6b0385352f934bd1411fd558abd9b8336a5097e005d3b0f5a5d3dd8efe3f97fe8ce93d41118e185e78f025b8019dfb64aa87dc85fb12ccac40efb58f425fe66b4f2a2fdc75f0a683231aaed462f5f853804f771ec7dafce135d9d5f58b1f2a5e193abb5b4d7affa242c2789eac9cdf33c0d923985a76f8b041f6d60cdd797f77ffa9cbd2af361bbbe8afd4555283e4ffe10f2dda451ae1e9e95f06234f6147c84e59ab55e81b293dd610fc7877e28b1c8c66b706ac8d1b538d95ac5eed9de1a917f67211e30925d27031d3034bd66957111aff12978d4cbd5906e39bdf03e47d3ca643fcb6b1aef9a829793430318dddf175b2a5348ab222a09da500efef3f1affc418cf98cb7f2aadca796871948ef731b0683484e1dbc7493167b35370215d15ece231d94f6784d48fe846a89955a19ec02746aafc1ed1a7495f4365cedae8d258bd1ee11665b7bf6bc49ef6ee1a774970805ccac5c2309cb804cc2d7b5f91b1e0927272e9b4495c23132ab0443afae028867b650d8c5d854936b220337dcbb9ce6f7149466bd66ac7e5fc0ee3f7343abefd31641b68bc215c78026c138408e2301eb8358058516c024a49caac3572a8260088ad087489fefc729ba9e2e3f7975af5f02f5cd600d963227e339051d15fab5d04c05a59b44c1df7b01916c203089e16f8caf8a34bb99dfa912f7a57e951dd4aca37bea708090af169ac464305938d47890a50f25afeaad9517aeefcaad7cc2e9f398c89f43b49b5b92c41fcf26a5ea1b5e1a4ec54e966596babfecbf0df7c385ef109764636a69be2e82ef00aa90b9d4fa2a9da9edc9c46a4dd438ef26b23344e38391c06042520a3af49a24f1b8ff4bee73f2adf23670fee28273556cec92cde9baa2478be0e08756d1e611906113c8a9cec6373d1a97d6d9b470f5e28819d8d0c89661f142b54be5221b62fc07bcd3806aab81cf789b7ea8c6762e656e73b64daacce0e5f088e9338b56cd91f3bf3ab5" }
+            Seal { seq: 3, aad: "44b76e96cede1682e8a40386a5dce41567ff9a7ecb5f669561a833aa1a5e4c62ccf310dff9954d162af892d9a78bf7b6e521f28dcbc429d562de2f4b61437a4b81", ct: "87d7ff7d3087ca759d49aa45f787df41bea137382f387f656b929db6e6edcbad804ec8485dba1051340b08c9cb4ab62e8fead21bc68b1db651bbfd4ef215f516bd4fcc3a56ece5e3908e7ca5facbaa86c6dcccfd18f62f13275dd074d7a8db30b84aa26c33752e25be9ed7e6cdeecd6b60cda5c5707fc70bfc49d44b3e2b6ba44c26abf572fbc754cd120b9c288da672e307adf6a35563dc08c1ab527702d57551ac8683f1d55cd2dbe71678320a72cbaf54c4b9212416cf90eee71fea21c4df2d685fa86736dcbef7028be5c24af3a73d2a8cc028d868c2bfeb126acd7fdb48989e5879b8aed411ed36ef74e71a8ddbceb20c8114d24e860f3117852e6ed91b87f7307ccb2fca85e49dcf46ec703e8b1f027e0bdd4337685f395d0da35875e592ee52dbd508b664e3b83dd1a608aded1e228915f1092f42847f1f5dc1bce7ddce007d6abff10064881674b5a9016dbd3de0652485b3b03eefe3b98ca6c5b89d70cea59301bcb6e306c85136fee99ffaba8cae1a69cc2f2cf82f4e027ab85b5ecd5cc77ec506af8a746618da0485547846d343a6c1582330744fdec719ff144699695205e6893c55ac6a32701766644a1226c5b8a27f82753ea5842aaabb2a2c0b518e6485652aca0bdd5f2f947c8723b64d175c2f2fe9f54d0ee66433c6b7ed93dbd60e668f789f1f03936b8d82491eb075b5d658bdf87179e62f6f5db1f5a3c9a4b2bc452e63f8b44e566a3ddbd9c2a7ab6fe9e951cc09f2f943d092cf88e81f5ed93f883b113f1b38a2cacfdae505475a80714a675991cd1fb3bcbb935a36076115df6aca41098e5edbb7df31f411156c92e3b10b781601db45c324fefcece04b995d3b18556c7ce9ce38d05e9dc2d8445e10791a5aa35effc8a4684573bc7d197e05f93ece5f4ecf5a6d79dcfc9484cfb77d45355678268eb4909ea03fbd3b7ba7f4e7a09826a6282f9ddcb810e3a47e3a5814fde5452cee9b492a197ccf14ab23cd91fa9910aefc12f9fa4ab82ef5b187f94f14c988c0ef10755f0413f5422167a17c26248783334090065a8337146f30a1e3de7d5e3b6202a20db4a7938d4159ce4a56c18f55bd6240422603e9fd2bfecbeaa5a78d412f00b6e465886f99604db2e3f2765dd3d5081628bde8a845efebb16c6e69785f8f3a38a9c718fb6558320f118feb9440156fc1438b6f98b62a09f89494a7b49164db9882cddef4dcf55d9768e34d704f9b0d3a1849f9f576a915d6d83e385537b231fd67b5071894df629d4a76ee9657f6caec1afce620ecfbebfdf06f96d22a7a5f866a60c9c2613977dbe7813b7ccbb2c1ffaea4740b5738f75ffa222cdf4308adb7ce082710d1560c18940eef2b988a1180ce17ed3f85fe867e06ebe72c3625f159c2a630921768500683869b69fee50723b209c0f6f4b0144b51db41e2" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "207e87523631e0c2b146e4eb56e17fd47009b123dfc5ed0b937a480857356d23", digest: "" }
+            Export { context: "636f6e74657874", length: 17, value: "1dc02ff049586e54f4ee7705314c9388cb", digest: "" }
+            Export { context: "00000000000000000000000000000000000000000000000000000000000000000000000000000000", length: 33, value: "56812624d8b83a0c7dcf09015ff56a64d5f87cb51fa98d49124bd2622b8d4d597a", digest: "" }
+            Export { context: "da9e270c95de79009c256e522d35b16e1079d0f9309a7a30795600b613574013204d28365f1c4d4bb488f75f4b984fbee07aa181a4cf25e73f0fc63ce84fb4881c5af108db59", length: 1000, value: "4ddb6463fceee65bec437527be358acf3357fc6ed99080e6253bee737e7ff41d1f5d6e51a844b76e1b0e00b772c1fdc158e0896a6759a2884b68aac2fbfd98e0e583e69b9fd6c4d04d2ffd2bcc9977b07137355645e44689d66574c910f0e59f73c086a4cf03033dbf2bdaa6f904bd4a85f88398789adcd8a187b8a6c4238eabcd9da4f55fc64e1eb20250ec1475b7faa481c6a48ec130f026d04b7296961ddee3acc00de344a10b6cc9408b26e81937a0ad9c9aa07f87e72f31790fbdaa0b3bd710a6f0e3d0f6b37af570032ecae21e39ae45cc471d7a1214fb7a7a763bc09284c397eaeb28f30576151f0c0165668a818480748d7fa37a0508922c7cde11a0b46ec70fdca42ba6c693acaf5c59997875455c3f3addb96b3ae715de728fa69473c506d31a364adf71966cd1dfcb1e6cf5facd759a3ede67a93732e477b228a68c0c846eb33dbf1af69b64ab29c8477170b18538a95566dcc695325a585a53e62064e6098f103fcd6481f021f87081ee71bda3ab10c3ee7571ca4a2f7fe67739549381b68ab6872e269e1b8bb43370ceb00fca4f46642c5f97c3c1679ef26e28c0da4b2044698064e4e387d866af95648c7528a492a6c1310aa7a5c34e5e44f2bed39d468316c2a695a78692d0f892586de48544c9bd85e6effa2947062a04bfe31bdbb8984644d8d1e6e7260c626858b8d88de58d18da5b6ccf31b88588ffc406f47f5413258d2757a56b2c02b955466cc91a89083ee7404597cd7ed30b1b9a2cd078a664319f17d429d9f9e4d493d8d0be5ef229a0414e3fa13b9d6c7fd252b6d2bec4006dd9d3756e993a41eeab43f133ea55073c809f7c2321c333fb3af3a08f9e8d4da266a11663f0d8d0406e67bad5edb02daae4f9d331ea55fb2295c9f5feaeb7b395d7ee6c8418b9271e4fe54da23fbbf5ebadbed0b8f1b48d22baf753b89172ab2bff7e640920cc921d9844dd2e62a9ab7e35e2aa7f6097a22c69168b8b11549a387b8fd03fc4f5484cbaaadfc8e3d3065cd1857f5e58503914d9be41f5279ed1076134b651b5e57fdcea9bb125edc09b38888cab812e425474abda1959eb55194c69a7b88c585f272048a5d124fe1b9e279a6b5b91fd289a9514d47139b45784c4352b54d3539025fafada5e4a3944af14265c23a507d6d5c6b2e9fe461ecb51b0a9209bd481cf22d921fda89af4413a2cec337191a5f1d3ac27ff8ad22ab520d981f847eb05833c72827d35ad797af080e16fa3b1f91d8fde5199c9148f2309ed678558a9d36a8fbff82ac18df933dde13fb7095f131aa9ea05356c24f46f602aab6d39c604aefb480952651ebc72dce1ce9559dd23a09aed3ca4000137fd227a67c28d942012a48e7a6d5b4cf39e746ee8b5d78e04018df66f57669d0eeb1f218cc4", digest: "" }
+        ]
+    },
+    Case {
+        label: "extra dhkem-x25519 export-only auth"
+        kem: 32
+        aead: 65535
+        info: "6578706f7274206f6e6c79"
+        ikm_r: "f7372e354e633f1c8805bb6fba75a555762861c11ad2a7f3c40e5be6e11fe4e8"
+        sk_r: "34aff5f3fbd70d4bf58d45990f13dc312c6fc3a0cde99e78f32f0f86a6f716c5"
+        pk_r: "2653366364b38e000f0948de0d4cfba5ea72a4178439ec3291e734f750c41511"
+        ikm_e: "e3eabb88923753ca47c793aab8a721866a6771c7ce541c94c90c564d80a258dc"
+        enc: "6f331760ca83ffb9f3099ca6b8027c18ecbcce129626572a414b37601eca8415"
+        psk: ""
+        psk_id: ""
+        ikm_s: "fe5bf49b5501c5b027d3d84b27b5dcbadbc227c4cc897e15e239c759c35c61d9"
+        sk_s: "71388a5ee18b1fb964d28be865ee338f2129627f88cad5b5461a37525616a8ab"
+        pk_s: "73cba21ccccdb4442c172a93ec0b5070b9fcca8df16905f6962cf8472528b70a"
+        pt: ""
+        count: 0
+        seals: []
+        exports: [
+            Export { context: "", length: 8160, value: "", digest: "bec44b4dcccf0dec5d1668617f0c300dfcd2bcba8e3318ab24a80d043ce255cd" }
+            Export { context: "6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161", length: 8160, value: "", digest: "3ebce4e06105bb0eb3bcb7d30eb259b4da9dc2665861c83785f06fc8559787ae" }
+            Export { context: "62", length: 255, value: "55d6ebeb05b2d2b9b542466da50b01b738ddfb35db5717622aa0947f231a6960ca81342c8727c30111790e9d3a7e888ef2dc1c6fd09699233207862e30aba42b69b81e7bf5bd855bed03f32d53a5d4982993a1565fab6ece85ccb5d5a8adc5b020045cc5777788ae089b28aba5b4af44c9eb5ae6b2e681348bdc3886be8b421a3ed485c1b3813609a889f62e530518954b20fdcb8b7c7905cac0eacdd7f640a484422caa6ef0aef9753df4940e3611814b8acb4a4c4398aa30de43ed60f82ca59cae1527dec8946600b680258c06c9bea528d5ea5b42c564c44c425c00ca5d5d1ab7c3b7018454797c1da530b32d2d087a99f28692e51b9736b5ed10d08834", digest: "" }
+            Export { context: "", length: 1, value: "83", digest: "" }
+        ]
+    },
+    Case {
+        label: "extra dhkem-x25519 aes-256-gcm auth"
+        kem: 32
+        aead: 2
+        info: "696e666f"
+        ikm_r: "7935abcd9dff7bb6470af936df1eee29e12e75fab709288a1abb619e4ff1f78a"
+        sk_r: "4d4dd6f07ab6dbe9b11f9dd25281c43b22d062e498c062a48f0a60a4e97a0027"
+        pk_r: "e5ebe4793ca5701aa654acada078fbc0e84a924f18b53639c913857ddb07ba34"
+        ikm_e: "876032617a6393bffd4adf4fdb79b148be82da76447ff3aefc2c5a9d9bdb6d11"
+        enc: "fd7fe5dc1cb8eb569c1af3d82a962f81f4d1047d7f913d3e96f7cb6957ced503"
+        psk: ""
+        psk_id: ""
+        ikm_s: "6b21bcba31c44de1c01bb9ed1ad18368928da93d7f0adc9ecb6c87ccf115d728"
+        sk_s: "eeee937d6792d174f7f1c91fb98beeeb12d34d245986a0a94da59b034bdbee49"
+        pk_s: "96eeab3b0f3a10106d98e5d7a7b0da07bb3f576ce58888bf359de350cc38d33e"
+        pt: "61757468656e746963617465642073656e646572"
+        count: 260
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "8c04db0c3fb7fcf1c37f9866ca8f07e0bf82e574ed93066a22c296eafbae6cc7d2f8c88d" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "5df7332f44e065d356bfd61a14258484a076774a1006c057b594912e431ab09a0fa2772a" }
+            Seal { seq: 255, aad: "436f756e742d323535", ct: "8bb025dc6e6e962285c6616b60aef0b774d86df48378635365ce2d937278fa2ece32a8b2" }
+            Seal { seq: 256, aad: "436f756e742d323536", ct: "4cfce0e972b030fcbf24f1c737d4342e8d2d6e824a18f808f92f3c2f9429497b5a7063cc" }
+            Seal { seq: 257, aad: "436f756e742d323537", ct: "38b014d9868f550adb667aca906fa9e636da6ad88f4ab220333247db743ed12061e14cbc" }
+            Seal { seq: 259, aad: "436f756e742d323539", ct: "b4a2fdf4ba42ae0aca344c0d6f289318b647b987d4b8c28f175965e9797d2ee9c8d3503e" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "d1bad9f86a57a70ee1ca068de52c7f047d2a141dcff7b066d197d825351e85a8", digest: "" }
+            Export { context: "636f6e74657874", length: 17, value: "27c22a778ea7356cf0ca2e8a5be771dfe5", digest: "" }
+            Export { context: "00000000000000000000000000000000000000000000000000000000000000000000000000000000", length: 33, value: "e2e27b298d4dbeb93bf9ba018b27b7995809bdcc2efc95ec1117fee8074d27b301", digest: "" }
+        ]
+    },
+    Case {
+        label: "extra mlkem768-x25519 aes-256-gcm psk"
+        kem: 25722
+        aead: 2
+        info: "34663634363532303666366532303631323034373732363536333639363136653230353537323665"
+        ikm_r: "c8575d137deab99ac98fb0873048c83c3a1f47ef5b409f609c0ca652f58c83e0"
+        sk_r: "b6bfa0299b955e85224df2e468f29eeab377ff3b96d4462b39447a22d32b91be"
+        pk_r: "d3d102410970b8bab2984008669914490c95dea2c2ae331ca229aaf3609a6d5acbd60a9ecdd71cd462c08300c474e318b554675679b6d4e1bb1a76269a7a87e68335ba54593239290f35b65e5aa0d3352933339336e83260125e10ac21c97b40cff8385a18b2b7d62436377a13b00c27d22fea4176ff76ab80970ff0e26101c245b7c33dcaa420da8ab4df41b88985c6f3845e5a5364e7d7a74ae764c175bd462017cbbc5f684a7e4494391d050b83ba9ba66347774c707658c5cfe481a8c20efc670314d7569a4793625abfd6579435b31886f80924c88c9a4011a0c58b6fe85c5330ca27aa80ffcc58d3ac6a759897b44893bf8b520802b4d7d56bc24976ba32c070f0cc7fd88c19e958de0b8fe93a7669b5bb8cf80a88e6aa827924cb1659fe6177023611ddd30eb913ad8b2c08fc8209bb9719c61450518881ca5b12b8c73ba3c27824773b5ec6571df41b277555d9aa8f566444614a8473d3b1a5e997af066ae1f355338302952281c82ba94f50a22e9ba55a56193d1a3f4b5365f7eb2ca81cb4573c33d1d9861cac8d4cf327c0393ab0c0b02572bbc3821bedb45d40257e1f7643796786fcf50126eb136b35737794168a15643973639f6b6f3dd945d3ac6a5ab96e5d4b8fdcc54809053828610ee3a56bf4c84447147a9ca5745d5c05e3d9cfa659bb4c4c8f2e006826c27633a120c32151deaa2a98bc9578232b518604a5186fc7ac6a1e594b09106418eb1aa1ec6b44fabeae5105d75531b9279b07f6277ab297a5ea77d2383154bcb9db8a08fbb10522987d63c99958a774160333f5f208567a311464b59ebb8cc8375a1f02470de68bad55c8e5184c8c4a0dcd45bfb59995f4c48ecf947896126830818aca48c0749c057b6591d381922d8bb593e09d4bb7b6b046179c16a1d6b4149fb1cee31b6b9a015cca526cfac8bf060c699e751c9456c26d832d58926032bb78ffa44d0d024f7a417e1b452f1f779d49c86e0784ab97686acb025c90f9893cc13bfc9186f0e9946ba498eb15a6684828bc0ca91482ce91dc4c12d0ce4b936e2556aebdc48cede6adcc066e78895086b49316725d9a0987ca75a7e00b0bbe909397389fead7a8ff73bf94bb4272b27b9354bdbf3777a978024d074a45077ed0435b8b845e4481139b39ad1276973fd1cd8b1cc6e27b16998a7d6295c98347998d6669b15270dba7c098f16136015bd3b1c5897b1312f230e49bc07476cf4deb5bf0c971d5ac37f980283940c4e52999c549aed09681a7f350f5a1bb1dd5a3b8837a22d506eb2029146817ec955d9dbc2939514ecf468c4eeb85198230effac612fb73348b42bcb9b27d9816a16596fb3618e71bcc321a4523a66ca248ac032c06b9e24cb084c59bc489868639ae7533f8f03a4eeb56f8a3568f687f38f83fbe163673eb76275b79d7f32a9109c30eaa96a0f622503c0337801fd9b2007603ce73c0378b250c35b634b6c8ac2cec1fbb24561a7a7812e77b4844bf9c6a299b409303c85199ca5dc6eac4e4f85ff10a464d96c71382760af67fdf006c4eb6b627861d5bf1978588c02825ac70206274742af05a0dd136c2d465ac90b4293d05381d5911dcf48a878a6cf8d971d62c14700867e91dd050f85d68c32e227e5be68d3de029608179f6f83b95e5deb6263fc01c80641763ebe08e7add5686b0ed1d1e7053982aa616130939d0a09462df7dc74d05"
+        ikm_e: "c82228383c9fb887f7d8b332c28262024eda5b6b0ecd2325fe662daffc0594fad4990e7c8d13812137d06ba7017453de675ab0388d418853617f3ca58cc5daf3"
+        enc: "ab354dd589f74ee0eab7718a630cbec5df1d09058e177cd6dd141d883450ddd70c050d88bed3d07cce23415cab411108cc30906482a71adcb134a56e978a6152a8e063b24acd1534f264f10458152a9ed4f1f32b3d480c4f2453b7fdea7720146b3ee92cf8a13a4840076f68c911c65fa3db5053fb0aabf79e64cd5e7aa71b2b9641e713ec7df552e17d5020f8721ee449b42c888e2a3f87cfd96e3a98c3e7c4cd8f647f899570f596bf17d2b6fa2cad19706d9cc3cf09493e1c7ffa0eb2a4559ae1d940fdbef97bed383e6ccfdb448d9f1a81805166b32c2af2e16878c6dc46ab43323ed9c136b925239782e3c329c31a5cf2a80faf025a80766e244605c27afe4b624d9d8ca99b6ef5439ed1ad044b518c434385acd49f1369ded6624a2832a571ccdd70d08b3c04cb1cd3136166f9a485f536f69ec66f0293e840025ccaac42f8e5f7c9cb818076c272797047f5e50c1e9f1dab81cfb48fe4c4998b2427f009702b145f34ad8dbc3e7ad4e4023057ba31cd02c4c0545ebf71eb02533e8eaa2b2f2690ee1407bf1f66dc5f4d836c45b82f10b720df72d237488a9af1b6dfb4741fd613379c2e211e77f7fae6b3734ad81de2d452005334857c4a3cbc82afc7428fe510495969b296d24e1a7431f557d48578cf92ae86c0392f0ba73755a9e5465c8e3495e4cd2a82d463244341e39414e26c9b242f31d2cf0e46b2aeb11dd5e56ec44834350d151344229e410faff2b2ace5c9b3fa12571db1d28da2c7133492781dac41b7a7e2bac2260fd12f56939033587824c9dfb17d41b3bceea53763193abe0c7c184d5de161ef5312f31fab42478c9a193b868e4d29b2b7624f3ebe740f393d03d843cd5327286a579fd2a6e37aca5b64f9316115d612c7781e704ea7d182701c5019975cad14fbf4ab3904d4a35acaf0be32d716a1ef5d7188fc418ae9e60744325a3e8001655b756df94c24031c3ce32bd90c0ecdac52ca140fdad7f44d04bd0a7e2a726c54cf9793f8784a23296f65da3fd1cbc18300d503c5b27be99b9b0e32d20b3614dc8a999f30c2779dd7886cfd486dc1c93ebcf517b5210a4359d9fa1805381f0f2261ff47de01de555d98bc1a30dda557a83007b61636abaf9041f96890f0f565eefc45859fbcd32d91b203215541227a4fcc3d95be2ddb0702878caa20f2da62c4ff9fe33af591ba1ec241fbe2208e0480f8b1cca1679c096f8f5a02a33e9df445b3274ac112b43d51510135cd3f532a3379e90bb7f0cb43717e90555bb1a80924cc69577455687cceb9b1610c05839541e87ad83d79ef3ff24ace1934cfbe989691959d93ac48c716b672b370dd4c144ca1e32508707a6ef8aa29b55759b3d054c56bee1baa6f41b84b9fc3fd681a1a1528eac578141529836a29dda1501a49ba2455367256d2fe6f74ebb74ef9a49a94a4c6cd1dd09810f0e9bffa69dd8c94d226d0b2977b11a35382888961004a44c60fd602e9ff4271287e9240ba96146515b9db9da60375aeeafeac1eeb764faebacd197df27817c35fe4c5c802e43349d7bc95c8b40c001449d3251c1d92ff6d5c3b08c4b27c"
+        psk: "c71089235d0c82f521d5532890c23952db601af62d7f3a712bd66315fe5571a0"
+        psk_id: "70736b2d6964656e7469666965722d6532373933366262"
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: "6879627269642070736b206d657373616765"
+        count: 3
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "9d45c63522bef7b2335c15d0e743fe8bfb8856f36baba9f1aa23f6ec9a5e30d140dc" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "2fabd69596e1d2a07fde396c37d0f9dc8df749f98ce3a37bf7602d06c2e996789dca" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "cee400b8c633f90749cb9646fcf3f05272b00efde231b92541f45e195def527f0c2a" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "b8f35de3306467bf58f624531f1a57a7fe91fe53a126bff9a1197350c3bbafed", digest: "" }
+            Export { context: "636f6e74657874", length: 17, value: "ff106486fc22c62968551c581fbb76da74", digest: "" }
+            Export { context: "00000000000000000000000000000000000000000000000000000000000000000000000000000000", length: 33, value: "f8ca4e3388361d6eac6c424bdbc1eaa7f0e54c5423bef97b3be5c4fb14439da36d", digest: "" }
+        ]
+    },
+    Case {
+        label: "extra mlkem768-x25519 chacha20-poly1305 base"
+        kem: 25722
+        aead: 3
+        info: "667265736820726563697069656e74206b6579"
+        ikm_r: "7b973ca7ef9ee0b2b45fe6e7e5fc21bc4b4bfa5ca5b36e48f7f3a46251e91e47"
+        sk_r: "5b65426669aa221941bfc5512a9e6978a5333f55dc6d74d11b93f309a0431da5"
+        pk_r: "4328ca817a68d4325894803ac3dc247b017cbd439a7c239e01f87486da74936c4625910521231570823a3299998f03b7a237a3551a21af874580e6b11dca8e5e6a7ce3c5bfac9ca55c18a40a0558a8c57fe818744bc4ca24689ac3fa276f48c536025aff93cb47a599591cb4f2045a61c65feca22079b90da2f976b6fb85c1d683686b6aa158be89b0a2afb63d54f3b09c359e7da69257c5c9146882b949ac0694c9490268fc41ae6a6936cea795ab89c01feca5ee600de0768cc2b043432112fa61399f851991f80aa2d881dd618bceb10894682ab8d80bded245def74662798714033b1e118a402937ae04168fe9a1d9859ab1b663d491973c2434c48a812409161057c35ad0837132b13245176a58b9df0b7441cbbd1ee8529701895d0c1bb261cd4ddbc03c769411e4a33d634513d924b339c4079c05de9b75d9830125c638985c70adcabeda01a5e30166b248c47c36c973479e86c81472d675a7d741eff043ccf565b2f7564f3b6e31f3868a0c4e99ac1a97b8a4f8096b17db577e5a556d9a9dee02935b2c568f4a5dc7096e06dcb845684c2ae0a9eba355aa5807d3d98c67b2c8f26245e309a0d4dc9faea68f6ef4235738768ef19da8767862e23a2a6ab3a0722cc3a8b71af0b94ae9b3abe03cc513860c123342619451f89613818ec8758c37289479171a1ba500d2b10880f6afe6165c8c615b2e1ac11ed377735456031927f38b14edecaf56671d964ac1e92c5792d01471419323f1cb1f2ab062da6d182ab3b901b5a027cab5c38923ca32b970151ec83dc3a5334e148e3ba639700c69682bcf13c87b00958e44908766d9768efc43f80cb8c9089afec7a3198494e2955a09dc1c7eb9cf38ca658a5592ba57a3f3334d6da16133a097bf1911ab81ac60e9a75b285bd9133b1ddc0f1f026ba2d3901e86ce0d440a83976b0c83776a0854c42c2718073019562bf0d326ec617739c76f948cbfc076709b89054dec62dcd5768bd55309809feadb40a9e019de34446eab609d01af48c6202db37a306ac22355c1ef8c11ca857983b33f100ac3377065a0772e8fe35997345aa69753daf935d2ac064dfa068ae7c38377619d9539426305f4b54f98b0063f55299222ae17b4744eeacf87bbb5bce58536640185d6093d32a106dc388f6843dec7745bf12c9355a1838115685616dd19062cb767cce7511b23400f3b7f8d30413c8a8f805467fc2b69bc5a2ce6a32d9d441f5beaa4bc746c8bf7990fb53ec68cca1af67a9922b838096ccc150b408735c94076671a9e38f59a14fb2d20a65213671ea863774d929ffbd85efe919e2f022039168eb9b35d8a222818843c92f5a755798f5a2839bd0117519834c416cf3301a7fe9392081606fc0451ffb57cdb629ebe410379f288e8f5b745b7b18abc29fe1ba65755981a5050b313053d176c469a808dcb8ba4346af6bb176f1b949c50cb8620548f3ca0ccb56073a40b7c238d30398e2f3c5195028086eb964f46c7543bcbef9a78e1f108b75aca111a8f481abd3f87b91140271139bf04201e00432f8cebaa66a0a0c1a01ede7966f2d82c2dfb2f9960a637134da8346b69666a462b7290d9c5667878c54941e040c58e640b87aaa13ff1273e6caaaf10f670f94c8c5f215cc6e664b2b25b1bf42e30f058b42598a6115575e5dda6dac1586c403bdbda3800a1cf442352bad9f48d04c029aaf52455"
+        ikm_e: ""
+        enc: "dde958ddccba696808d6a91c8997e0548e2aee923ec42ab64ee36c46ac036108606e0ad6147f5b5c80dc0ea8935c1b3237d701c10295afc2e3c531272f50f5035adf1a3f8f0c648cbc7ca0d5a42004f826753d6bb8f789489857d87084a900b466d24428bd143602235e47224715c6030cbfc0c242c61c8dae9cd9838878697f332fb85551bbdbcf56ae46960237e310730d72863e490d0a90327103ac93947f4758b163d8f31830bfe4792f44ac7697ce0ba08db2e2712333b4ff100ef6b1d50590102bc247f04ec7354e9dd34662d9752422bc762cbc24889bd06472faa05143ee51f96f7fb2aebffa776203b67934d97edb86b41e0aa91a8a43a116f1faa263bac1459c6cce35047e3962b92e4203c680798a0fb9503c16c39b065291f32dc0818a3b137425b3cf578e80d9ee95da1283ce352c73530e19ed18adb05da4dbc06425034d7a64baffaca8265bd3810fbdb5558fef76f14396df824a1df2d89aba63a52674166bf28ca5a44a1106eb390952896c5b6b328cc9681f03c0700c116aa5d3d91e61b180a3e36377c13bd31f8ec28dcec78db60b0a764e2c0510beec7593e05389cd842591fc51190a025e2a6dc8a9ea5346b197ef8e9b719f7a038ebd2c934b54ca348f37d78a18f42a2d9d8c8990914f1b74d1c118941a4f9b50949465b529782cac3ca6c2db4aec159a963d4f598ab183d3cb11a423dd52462614d21dd0d3d73c8efc3d9bcfbd7fd4d553e3154a243b95d36951c6157586a0e586013b1f82dec9f5ac6c28890e4f44ab7fe874ebec80d2a467ddcbcbb839827e1515f98c42a0f339f7ba8854d0f8b8482ebf0373fc8930a3ea50d3c5e10774b5e23cafce8cbb14e52201797f513d194013785cb5c6d577a56bbe06ca7485cf9b45ab615ed94382faef73f299fb4563db94759403ea9ff4156b30883454f4789c68430f3cf45e8e748feb612ce30973505e4a4ede7fa3c2b5394267c59d595dd2a559133fc905f421ee33295f20222b54215f07ff539cde33b3e3a85eb954b90f0a70dd554a202262a5f03a8b50e78fe72c69ef616092e0073109a247a3ea8a20d7b76734de425e185aae0011971e1b7f1ed54ec2b69f031141f3e019e03d1ef52b19b1d84b50146f2277a99b35d58b61b02971b282ec07e68b391d4e5865785b24e26a56861f65a39722f618283b839c4e475dd343acc7d0c3fd1b0a9eae690c897264295849e8455db834968d42b5ed9a315ea3c92b3eca830131e8ead69c211ad07624f791ffc9196efb2112453490565d8407ad58cb5961da860119a6d586c31a553d39215d9a49a9805fcbd72475e6e19e706aac014f7209c263b9da818aadc463112720d5ece8ee0b87c48681132632b245cff1c3d53a3f75ef83c5dbe1cbea790adc7359daeaa8cde88ef0335f9a8ac29c87a9fefa9ed3376c522583f41b2c3835c6f605ab79be33f5d1352687d0059e2430f6e65a8e5b192d0c189605bd17c8b35237c84ca5cb81fed299e9264b32b50b49adc992b87b228919ca33eede7fd18029f5ee9aaf0ec4d41bcf2f93a1f24a2fe3180e12fb782e314db0550522"
+        psk: ""
+        psk_id: ""
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: "6879627269642062617365206d657373616765"
+        count: 3
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "40723e649b39409307ad46b782f1e7ead8923b7b88b87f7010cea3038512a50046bd46" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "b10c4984c700f0419bfd9fd918f85bc87a0f5b40997bb163d057f368f544f027702764" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "b259969530afeabdf4179d2d40ffa7e54f5ea9a68e4c7b2afd1a1741474b0e41898e75" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "42c10c9c946bbc9122eb9a8d477392d9c1fa225649ef96a5edbfaf1ac5f02501", digest: "" }
+            Export { context: "636f6e74657874", length: 17, value: "dddf0b82047dbe1b43d67bef375b52439a", digest: "" }
+            Export { context: "00000000000000000000000000000000000000000000000000000000000000000000000000000000", length: 33, value: "0757dba5bcfd6d6e4b9fd2d8903fc5aef1883a3832e37295f3d10e661cef716ab4", digest: "" }
+        ]
+    },
+    Case {
+        label: "extra mlkem768-x25519 aes-256-gcm psk"
+        kem: 25722
+        aead: 2
+        info: ""
+        ikm_r: "3e733a7a58a4b0f1133a0c5ca95659ec25894423407ef2dfeedc12e29d9ff1f8"
+        sk_r: "a74a1198da4d50afae74c0f0061cb7deadc57637a92405794f600f8dd2d46696"
+        pk_r: "5b5c0002115c3ac7b625e96ee604104e590c55b9710e86434b237d585680dfd5861d5a680e4038a3ab80afe223dbb6457ddc178f6c56904515c65a6f012aa1ddf926098c0f29a39a135615d6d02bb3e9a3e96143ba54a1a06582b16415363c8c61104d9f014aa801376a3b27d4da47370848ffeb8a6a417cf130392451261fcc3c451766a9492d081405b4493715999c86692a88fb205cf91ad365c3821235fc30bd39f04853389717e87c1c9bb17bcc6c79774d057218290927531394e5c8c10819c384f80f1b0371dd41bed6891248e59646ca1e469aae7b175d7eb5bbced9638e93012811bc2d10be47b19bb27229a980c630847f7855104eb006df12ce48d64e7f9019ec871bdb390f74676c97799c36fca8b3e33f5168422ad272c25869983762ee493a9424a07f385ae0782fdb6451fa285f0c6b6762e49ebbc6231ca4abbb952d1814394ed8cf340cbdaf1344a947bbe7622afe2b48120452df456a22c2b2a6e971c76a2a803acb3e2c9e9523a97ec685efebb5a5b142ae8521bbc8aa812cb0f4d76c53f24407f1886a483e3491b924976b57c9acba577d24ca23cdd81be571551fda744f84c4ed34203b93cb3872b1cdaa36a0010e0d612023077519a00df318b8cae1400ba68de249b92941376ea24a95875781596b120028d9d51cc7c762339120443a0e67bbacecebc596a5bb5a323ccba3652aa03071882d3167535c53c1fa337fc88938c4f11f2f50c3070c5d33e9752a6c62d1b157bd653be6214d3dcc6dd79a0e768b991de1573fd333970171663563e96b5efaa09e967b5a7cbb3176981735db8163f5284e243d217ccda3c669e865509e267f7f7cb97ad347951c1b5bf2c090dc3fd0b5297e8c61c44b7d1a653a0b771b571b876380a921bbc02dc03844d5235eb55ffd5935eb4ccc6dac699e5b19a9a644694667c7ac3ce847cd37365612e3a9d6aa617e67c407975c421a93e59b531cdc4ca5665d1ab913b8f0069c0c54aae44285a75f070c5b8fda3b2503ae9ba7ad1e0081c5e605e59c8ff1e6039810af2c8a257c04c5b8227b847156caa63ae89647b2d946bea2c08ba03a5909b79cf234282531928778b9d7a5e36935dd94105627b0a025b6252bc64690871ffa621b381a92fa567ee4c46688af95ab8f6f37673eea7d4f9a15a8e732525c63cfb01b87670fcc4aaf35d6a54f658ce219b129189539021965420dccf511aff767d2991c7d17464a29cf0916a98782bef0346403dc720ee95ccb45308f9b6fb9d638dcc43a81e1c5c2f19644338987a85e935b3a12836a3ca43a83b7b2cc3c7ff76460d5b5239f0c44a14a39c20676406c361fb35a520b361f8c1af575b05a093f5bba32efd79cb0b835d34a30050a3f19e8525d971af772438af480019a241e9a93dcf9022c2b3bc1a86c4657c7863836636599fdcc8125e594e274b6d27b7e8351707d5b31bbdb0e30db24a6066c347067a5c1b7388c79e66c5181a3077a5020de810f5958a32dd9b2f0317d928395bd725a8ce13834318ef604b4229b5006f78aced0beeb594bee555dac5aa3894199ae294f8c20bfdd8c5bd44878255845d8164d1fc1561d904d0d8ccd11b0701f5bc176425c81c418d2d6b14a9eacc9c470988da8e45630bbb748d2449dd821b0baf0aa23235ec195cccc19eaeff9fb1cb030bddd3b31bc44f23af7a176fe1e7de396f424c49b2729989c1a"
+        ikm_e: ""
+        enc: "7896278423f27ae399e4f69c6b574ac973e249cd7582266815201bfe54fa0a2d75bbb2894a198240e6b8cf7b2a02a2bf507235c8e7bce6a1a06021147b7ae9f39f899af05a2b91defbd3a27b9ff1c50bb3a2c95f5a2cb2172b67393dee842ba03995f17d405559ac6ad442e135811c936b9bab40b9650da99494b562082666e7400bcf929af6afa35b919e6abf4270eead907cf9c2c2d0b1c4138e7dc4f380efc94b1e5fe2c4fa5c87cc93b29e0e8e786fecadf633ef29de58723375aa69e34a28d8ab61251b787c325c25a0a0646d298a0c580b43edbf6b9802c6dedfd4cb1d678f965e0991a9292966c173f34caaf318e8e79d5f1614a18f9696444f86109d481dc6c17f97225faabfe9dbb54515886b8125eb4b0c1847cf850d1c95da7ad6a74f203f74644540984743a229aefcf8e8bf6589ffa742dd8784391afdab98ef0995e2ceac418978869848c17171f280d4495a3266b4b4c23a5bee025ab1d222f6a915318c022a01b2a9317386e354181b3d22baac8af68c0e833d75de3eec2fb03277d371c56d78c097afc90987e088635faf808ffd10b8afb2173b6fc1a66b23f9b0ab55ecd2c39f74ca115ca544cb4b09776a95ea0d56dd84f67057b22ebfc81b838f4d690a12fcba1e3b51e19f9ff26ccc7d2f6b7fab1a3d323b1c406300914a9c6e8c88e19efd9f358e03efb257475cd753c4ad576cc203c42fb8943312264f89a104e357b008d3c5dbbaa16e7909b5df690790e779ba42e6762c8afc1141b25e3b236e3944a2d68d62ac6480dc6fdcb93de5f3da15af9244fb7b068f9298696f2b489d30316a72557169d73fb30803f84f1723eec37d53063b47c130016276a4d92175248a25f52c7135d1962ee215696a62352b0f488b0483281ed55d922e78b382185d13c8d6e55a51f37dc8ea0fb8b15d5bda77f25f748e5d112916e432d41aff47c77ea01a491f606d594ca7b246207df286c7d3c86a3696dacfb0ea6b314c736462fc985743e4a65329e67a34eebd1c37837f6588479c0e144e7f4b8f1dc274da84c1882f5078c4a55cd6b9212b21840da77e9f6df869b4e56363ce28868d0e9a589b50399cc2c6d6bd92a0b07e2c2ce015841ccbfc798a46fc2429e974abf1dfd159723f38eea2dfa73f2b5be2b13ee76caed579ceecea66122d5d044c770f1a0e1b7fb2ce587841918fd860c09223c11666ad091703ea7a0f8f9c0808c3faee6f64ed2358c7bfe5f103e914bc39e1fd6c3e54cfbf6459975fafd256c58dc4ae037c6664da5315b6e1db1955e058874285a69cc247ea27b2e5a4cbd2b2994e3b0ed6e3571d7da47fe6350b94b1a8ce6fe363e989dd6f856947a5ee55211e2ceaa9e567b035fe7f81f3e70e4dd198cf4fa08c57eb78268dc13ef2dbf91596994a669c1a4d9002b9136fb4bf8db0c51490f9cd14347420befd1a41262ab1309bf9987151191c9f8cb09228d79da4bb6a090634cc1a84715ebc6851e94d0896f2307348a7410c66b835d9159e92f84f0be16270b949f5f522ae032a3c181acaf77aa3206bc736b7a65eaaabe93dd2103066d0e3b863ea108a755f6e"
+        psk: "5120b2cf4af221930821e22e45f7057a1fe257433874071c3726597453becd25"
+        psk_id: "70736b2d6964656e7469666965722d3330346334623231"
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: "78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878"
+        count: 4
+        seals: [
+            Seal { seq: 0, aad: "", ct: "8eb94f571e6666e358c91101c91039c3f46b09c40b5b625228b40ce115a0816f65ace43034d7fba54c2295bc75fab849c76d6814e65b774c36bdf2c5373a844b9822b39cf6362bfd9f1dbafe7e999a9efc65040fd3dab838dd2339711fcac926c04ecb5b93bd31a9441bb526d775800687759d84" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "0cf0a7f95daf876fe55a7d6412c30befe3bae8243141a6e26793881a6116b56baedecea19750c2b4154500b1ff3064a373c5b4944904de9fe7f2003287b81f222098aa80ab2ecbbc6fb7de980fb9bcb2717c7f70b56b511d913802ff3a86998a68b01fd4466071e97eec77e02d9a8887e9ce02ea" }
+            Seal { seq: 2, aad: "436f756e742d32", ct: "c9654e9d9ad49ec626501657268ca5d92bf9eb931a8e4c005b0afb7cb02aca84df9e2d43f23f7e325d7e853087d2b51f6e3def674c3b9b31951f0fb090dfc280c8feff9aa10b7590e9702fdd0a7bf9bb0a22646bea8527a458456bf5be4bb6c5c886fbfb8d159ecb26c2b471bbeb1e6770d1b84a" }
+            Seal { seq: 3, aad: "436f756e742d33", ct: "4e22f0a5456acd4897c11b41d718fad8ec570cbd959a13a4d56da7f62674e6271292637ac9b78dd9ff78c07a68edbb495c9c82fc9cccfd3d23f50c95f25d57f292161a5ae892a11cfadc04a453820d6e9ad8ba6baece6372918ef75251c04f6fc1a6855432fcd8fd2e81b494eaac0ba3f7fddc7d" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "cc3c2be595e5f744c059aede0ea6d7187698c41067f484e05335c3867e984783", digest: "" }
+            Export { context: "636f6e74657874", length: 17, value: "16a1adb472d017b0d9a02d3bd62c19fec8", digest: "" }
+            Export { context: "00000000000000000000000000000000000000000000000000000000000000000000000000000000", length: 33, value: "b1044e354f21b69044e7f84270eefee2899c579cf032354c78dafc979fb74d872b", digest: "" }
+        ]
+    },
+    Case {
+        label: "extra mlkem768-x25519 chacha20-poly1305 zero x25519 ciphertext"
+        kem: 25722
+        aead: 3
+        info: "6c6f77206f72646572"
+        ikm_r: "7ce6fcd1e21acf84d225e532f0d5371d1c3ff253cad07a6643b2204a83c00661"
+        sk_r: "811dac8c25c7ab266e064b81003eb8f76dd51e77719c9a3d88e90877ef70d19d"
+        pk_r: "24d80514813da32b8df868170d2a6ca4380a188100e6c9c0a2a4c72e95c158f66a25f9b6f066b001448f18b65b4d560aa960917e2113d994c75d61150e1548431b57be245571ab7fc5b7a701f1ba69e02744860e7e3b84e9815f6cba5b22b2491ec8a6919a0f7d882a25b44479b07ef509ac3f4984ee36c693225d0d47b6203bbef12a9de5fccee3962aba2416e5673fdd102a36fcacf1da2d6e107c7c53c3673882b9104ea5119348220d70c01c2253392c592f876844ad9552ab1953cd25953e15aa80235095f04e51c67987fb2a3f0bc284c3cf7a2a0e17593cc4aa4e3418a991b48d11bc9a9528a77dc1b1dbea876c86c5f1336b58f756cb550895a944d2d57fe2818c9ccbc6c0c28772241985611bd4fb165f08079d4133550b3d43705628436ce38bce2987a75bc5b77f93b4cd45cda578c8fc361bb893cdd9607ce77c7960802d91e6cefc6093333a2b6cd65d94786281406f954c0949e206658c8650232e2d34cb4d70218ecc350ca51717fa4f4c3c698cc1531bda69ef392b87048682db9dfcfb3ae415c63c530326624baf4983155795363a4e949637f27b25907085e3541f36c24fda37ab6ff29d5dd608115abf35babeb85470a39507c4b9835b8684dd30a4b2b34348cb1504b77770bc89777c632d6891b8f3991bfc5147b250bb06521b2cba6dd5754ee12c0b0160bed12102e170d0e3252209a198aaaf05d4183ebcb0aef520cc2a7f6eacad230c41a48b88bc3839eea8aa04567322d594215b4d29875f360300c98a74a8546d24c20806143db15181df50a934f5b17956416033866597a8426c5433ebbb805b738c6c302270b7650bb3a4d38935735a8f212074106af141c50f798ec0043f551c9d877ccdc636ac55c84912e8a3e1a19f711774507253cbe650b9e83de18328fb8138e2094216286ae3d8c8e8d5b6a061426ab25c84fcae2326a943ec4bd7221a78582c96f25534e6b51b2ab6a979080597795c8c857bfca99358962ba248fc8c8a01e760bb5323a9ec3ead82317991cadc628e70247d0d4623ecc584d6a90fe919cb82db39821539db04591bc71303d90885574555550fa4ab58103ba36639be24797a718a8b52c6b17f24722b5ba15f7b74e64c9b0606988e141f227a67de8c686f63471f181995d642771414de608b7301835d50b7be5387615526a534250b3b4ac2baae6d438795633d9b634adac32f919063cce5c78c1c22e6ec8ae1721e89e251b770cf6de14434881450e55a42ac8436f90b4ef81795670c53c7b913f79c3ec36e2a939595346e5ec753a7da76891c8ea1c2848419a523337dd8a477aa9ac504628ba49bbd8b04802becb9979092e6f0ba8cfa2705d55b72a43aa5967b292354b4b5965fe74ccb11825151aedc57aec6276514fc2cd0035e7ee4ce322c771ccc3b140807d68c13d4da2a8063106e461b3c340d7f79783e2cb8338cbf5038019cc3bbd9a1a262224f81f86e5f87976df0443ff1901c9490ae174ef8fc740ba2140c8c58e894861d441b2bb1857a153d2ee82cecca04e5e8ca6824149ea3a93e9042862893f2438b8c87a2f6055770635ffd20494a5ac5d7c1502fd7b3244a853c1563d49b016258c629261f67689b1547b69fc67bc955776436823a9c5c5f044e1632d0906f84abbccd25e141905bc6d629729407b603b8b399488df5c3e96722750d746a2a167aa5990a346a6a5f"
+        ikm_e: ""
+        enc: "3479aff5dd778478ab290281e7771a18f6c59e7f84fb5dfce8811e2a65d3d73af0bacca95220ca0e048a835b2c34f224edb7bba14b44564adcf5e56af0a18ed69164eb62790993ae575b715967141505ba598cf52e60a33aeca1383610919d2acd1bd9bc0b97e9742183f5629197bf693a4ef2a65bfda61dcb04fd74d10a8be686ed140643aaa5c2aae26190cfe7815e6b485714326dd4fd00e6fda86d51dd820c9c3696ac080610f6199b2650668a9dc0e9cdcea099fa344e2ff796a06d525e7da533a911ba592f6216ce9ed215494876629fc5ba2947ebd66f4954977e1574253bfe13c3f3572b87268bb9128ec9a90aefaea928e152261efdb13abc04e8d149065a165feb155d7d4e9d6a731322a2b5e8d3d3f67e163bad865c93228b63538bd18c632472a72b94a1354f21b0a1c7b23a63e6f5855e5203a8966c383ca41a6011d0a1f72c358b5986e450203c0fcf1837356a854185541eb3362d6812deaba34aab704d94b2634b13244500fafebe29239eb1296c85689ae8a77b3057fc5d949d1a27216743e4936728ecb6b7d547d02f0e649b120e0faaea937d21e3271d74a7142337f8f01de9535022cf762b179e3a56998b761b5bc93e40b84bbf6cc7276bdfe133afe240f4fdf26aa63414561174e795dc6ca23e559765944e2bd35e51b1ab93e069ebcd1fbabc402e8fec6f409399c49776f57c4b7b7f2c98445c7afbf8d6e1617f323f45a97bc818c695b9b84d90da341802cc4c0bce6b7c86ea8b040bdcf996b1d18178b05b95fe5bf41063de9cc9507c43fe522386bfd8228f08e581f78e5c62b8230dff720cce56306982fe63d980ee2be94db672cb0fda5c59158e414984558c24c8ab037dcf58b64c08a8e68b56d5b12ddce1cc44a67d2bc5b4283b3e80a3326886f1874552b7f355952bb9ab15e079fe88ba27117567aa68c13a7abdcfdbd1c7361f30ae7ab26a33c953b2af3955287c9ec4c71a9bc58c0cf80972f3cefa4138849abe5dc0821444f41a61fadfcc440fd6589ccbabde746b542b314d0272155c8c1628a502c88a4729c5787b661ba642f04daa05392e58df16b4beca2fbe614918deb02e73d7311f516589b8341327cbfa9118bb7ba92bc760ed68c81871cc9713ef5e6e8a0065439a69566ff6b22978cad8c48a617a4ededfd2df383628a21cd3dc121025b16fc570da2e3d899534dde8bd5888377e727aa5769c13ef5113373784a7800a3edc24d2ea25782ea97f386e836d6bcca0924aecfbc07337e4163d7503f783cc713207bf2f7faf318e254e5596256e8339fa00a5fdd868bd2057c50db987319564a60064c6fa7123135a88d173da3eeaa0b1c860b497fc6222fef497a7a54f454d81c7878c7bb8019ce1dc30ceee24dbf08f7d451fd17afc6e11e8766e5430d76172f0bbe58516c9271b8786e7c4eab8b2654ef7e572fb9fc1c21cd25f5af3d352591cbd90424e4cf6b183435d0efbff37e38cb1438e9da8ece84bbeab364e30ba48a707e77ea72603d22fc503269570d5876b0000000000000000000000000000000000000000000000000000000000000000"
+        psk: ""
+        psk_id: ""
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: "7a65726f2073686172656420736563726574"
+        count: 2
+        seals: [
+            Seal { seq: 0, aad: "436f756e742d30", ct: "ebba391f6dbfbe6c91d648fd70628d64dd2f5c5da09d956c1a1e96afa5c7838aec6f" }
+            Seal { seq: 1, aad: "436f756e742d31", ct: "59725fb93152b98e1d07b9f62ab41e84c746b158720bb299c1eabb41ecdb6c8fda98" }
+        ]
+        exports: [
+            Export { context: "", length: 32, value: "1b8087a50509923e7938bef1b55b0ef9c34bf310834cb81c1d3cefb7cf20ae07", digest: "" }
+            Export { context: "636f6e74657874", length: 17, value: "e81fa44786e233bfbb6b7ca521542b1c26", digest: "" }
+            Export { context: "00000000000000000000000000000000000000000000000000000000000000000000000000000000", length: 33, value: "91998bc4cab2b04a050fe7e016736098b524aefc207d67c700ad75e71db6eaf77c", digest: "" }
+        ]
+    },
+    Case {
+        label: "extra mlkem768-x25519 export-only base"
+        kem: 25722
+        aead: 65535
+        info: "6578706f72746572"
+        ikm_r: "34fe1033965d4dbc69dc259655549948db689f9181e3ed28d47295e490218f05"
+        sk_r: "0c3cc302f5130861c54f964a5c838ab071385233602db6357b442959003b5246"
+        pk_r: "ffcb807e5574af30267e72b5f8467d6b1cb1e348cfd8407f4760afa4802a205a7b364cb34a285f20935f7cd32f1a73ad64546ab70a88e614a0c476298fa30502c9797349cc5b3132dd89635d621dc78915f8fc933e224f3b2337926335aa99aad00930b632bdfe240418e31a6368c0e3b529790c47f14acbb663be7b60235ae359ee6a02aa751708429c588b935ea606d5840975cac4d3031e27e96d4a97508af231983867f3e31a8c720d1885c6ea752b54088d0da4c87225360fe53652e389762b8a33d6b92d0a8264915693404f02f88f418c7b96ab800cb55df252af29e46f055c334a970c7bd337be2678c13b44b9892e7399444da1aa3cdcb0f0720f8ba3912d0aa568fa99e05896349b2fdbd9c49b33b0f2f16521c684c7b0c4b454aecb5ace06c8452dc07530e4746c107582125eeb48cbf06366ce4b1065f35e5237205430ad590c10c2c118ac53978d89bc89b44ea6394713fb7c1bcc9ea1272477e11d85571833e836af8cb6c69b84d6105e03f155a77a72dd191115693ff1572e934a2e93f53b3f4343fa94168961adb9b219a5a8c4f7445fe2054b3aecbbf8e6588f47032d66b7eb8ab99108677daabfd2352fc24cc9d355b241a6759121c3a4465482485af51535f0137705725ec5204ba882a2c830ae4198c3180c76e09441417b6bc52b99215b5474707237546def430add555934418ec1e9596e5b08b73415c6bac540f876f2751e3efa7d07f13fdba575df3b40e9ab7bd500126a05adaab97fb99b274fdc7f266b34b35b31fe71b16d23143eb20049055baa15540b97cd64f22436d9bc007a973aa3395ff10784820a649a26d13045bde721394a8c728748516a2780592f599852f7a749401b002434c1735059ed5a7b0ae4b937f37c743b3a97e2b56406829f3608400b4373714c44c480f18118ad805af30c3ccf5bb81295aedfa29a2f7c558e96cd734b9e0fd06818638d0e48060a7036f7466e82290761059c571aa4263b5edc18826889711605614d58303ac65b4f14bfa4332d765bac4fc34387f0c817fa75cbf3b9a303635adb0f65941696b1890524783dcc8025d2bbfeb9a3ed847b35661d7d67815c56004ed2280554880b5042323c84e84a76ea1126e1109d98872951c858daaac4e067c838b57d85e4cc4d18827e0805c0e05b001833f768a834217a46c210745ba076fcba646aaa7919b276f928a5f44fddd20807d6a7366443321a4ec0b633f625bafc89b9dae460e23275e28c5e716a73eb648aea415dfefa7f6d4c369e655291c098ba23b779dc6a44c572eb43708e897a5fdbba2c9a5606ea2663b45509171ae19c7810f9c613110e339cca1df3654642a90d9a04c23291527035c0e2844bf13328339672134648131823d1030b591b3892c9fb58058e8282544c3c86f239849cbcb67c51b67a4b7ef7779410747fd7c9ebe44c35c5ab4eeb641441cbf246c4687b152fc4232845326e4498ed27bc01c01f3d722c1b7a10061768e45b5d51f999687b4cf83565e3e18d954045451611a12065096a98783662d6436b832407b50a1075b305db94af81a15675737b83ccc41729b9908b22e8941ffb270881aa1148456277b84465f52d2fb992371364179d8affcc201fb596c94290bc8dfe6efa386189d7d25149a95e04e723f4d11adc7f179061a4cac6bc70e62b3312d87ff3dd5b4183b8ea07ecebe1511d238c34"
+        ikm_e: ""
+        enc: "4f53a04d7b343a5c81fbd38da72c97fc1bf80ee7e8a01e9f84b4868641b29fc7398368c134d3712cd4e8463e1af9338308a9343cc377bf747402d5fe5fa66c55955f44efe3dfb380f6037bed6f28a03ba71cfe736417f333b3e5f1a59cdc7a701f44ac1e94bd9a92fd4be3c2f2e86e094a742d5c8a5ecca1f8c28f30c9c12d1a1759747cd91f83a36ac2a94cf23fe9ec9fb4670c2aab364cb022205fd484fbbbfa87c3e6ad2797fb4c963662d0b4e06c9a67596fdd28b108a1fc5eabd2b7fbe99ab7fde346735f9279b18bd4b320007ff73c4319341333b04ec4d7f6d2c7a806ed58b2d7d6ad3cf658cf2f312868dc40a2857c7210c635236676575b686e423b9c88bd8866d29a036d1bdacdea1fee0c70b7f25d38beba69d3d0c80c2263c175d0cee641adafeacebea70d968a6ff6744c4ef80e5287215a1f9d80755401214e20ddec4438d205851ebc3e3d8bfca67ed6205ec2684e4bbc1efd14bf99e9440bed2ff856c663eabe7325194a6eaa07fa438e4575c1494147b345338eacbebb4bf1116363b3cac9c18831a837e3c54f122e5003fda5caf31a49f2046563929aad6c911b1377bd609860d230163e66cdde3b0a40f8237a30f0958f3f3e1979f0a8f0dc033cf999a5d2f5a09077e716470ef857f96d02b40a44d3f5c5b3ba7479a8c4c501943d051262cad65fa3237c55203b9a9ff57412f395adb8a72fc9badba0f80a701b3187c42cdfae1bd7d7ce0e1a17002367c51a9dc3012a915c88fd27b3af9f610abb43fe70b9eadb680d0b680529ff6df79cedc930886d2cb267e4f724b28f238cdd7b9a0d014278908c7776c2030fbe3fa1d2f9a9c0228be8d607e94d3c8c6fa41697bc02bad2993194232c9673651ca0382a662900e59064c630b5715c8cbe9c77feb54f81f2270bf1907f5d0f2cf8a1640448c0a72bef2ad3ee707d2537611957ada6af8c236a993eff5e9b5e26b03d805f51150575c5aed846f82c7a887eec1ff7ca865a54b014e26753f510a5f8c2eae300771da80da1a6067ea58c5172677997d6ed7bf5e51abd27fa03603f62e13df5bc4984bb95bcf177d5e8e3eca3de3269e9559652b02f808635e73f9a33b28320cea15a1d0998d4fdaa96c4e79318ca9c7c89eaf2cb238f1886c79a452797ebcb7b1d61d4d9d2df407181714f4f72cd0802c2582d8cacaec7545e50b7f8e008a8b05f504a7ff7ff6892c7b2c0d90b38c6f5a6ebf6b4357fa1a2e9f3d70362ee52f5a53a6a10dfcf1bcaabc637e1b48a71827d5fd88d97513820d68e5a5dd8164da17ee60e8dbddcd31a3b7d6fdf17d01e429e7eee38fc1d1b1faa9ee3fec250d013e18b01807e08267aa3f4c768f78591dda550a8a9a9f47bd13b742e0f485745338f50da4effe98253548d51f2d9abeff2acec1cb845728dd18bc5b4bf724aa799454e5c3cb916968c64bf0dae642ce6c9cae36a2bf2d23bc570dc0193d0bcdc3de361e1facca170a633310bcb3441e0dd93b940dbb31da76f75ed0c24abc17b8676ff07c74712da625a292ac26126dcdeed0b7191d162850e11080cb6350fdb0552f79999065d9a4d56"
+        psk: ""
+        psk_id: ""
+        ikm_s: ""
+        sk_s: ""
+        pk_s: ""
+        pt: ""
+        count: 0
+        seals: []
+        exports: [
+            Export { context: "", length: 32, value: "44d1fbade49f40d89864a4926a8b01f18d9ec5ed1f7f0d4a8b5f4ac3ed212394", digest: "" }
+            Export { context: "636f6e74657874", length: 17, value: "41083bb3f8de95d400eeaea721c39110a4", digest: "" }
+            Export { context: "00000000000000000000000000000000000000000000000000000000000000000000000000000000", length: 33, value: "111ec01ada606d7a82474089a965e449679a8be8a4dd1116c1970848ce288e5143", digest: "" }
+            Export { context: "", length: 8160, value: "", digest: "4413d92c50312ec40ce0b61a7d4500f6dbfacdae3d9ec04f5bab61fb6dd62865" }
+        ]
+    },
+    ]
+}
