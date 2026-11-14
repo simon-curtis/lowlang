@@ -1,0 +1,344 @@
+import ir
+import types
+
+struct Lanes {
+    count: i64
+    width: i64
+    bits: i64
+    signed: bool
+    float: bool
+    load: u8
+    store: u8
+}
+
+fn lanes_of(t: *types.Type) -> Lanes {
+    let elem = types.elem_of(t)
+    Lanes {
+        count: t.lanes
+        width: types.lane_bytes(t)
+        bits: elem.bits
+        signed: elem.signed
+        float: types.is_float(elem)
+        load: load_op(elem)
+        store: store_op(elem)
+    }
+}
+
+fn words_of(t: *types.Type) -> Lanes {
+    let count = types.vector_bytes(t) / 8
+    Lanes { count, width: 8, bits: 64, signed: false, float: false, load: op_i64_load, store: op_i64_store }
+}
+
+fn lane_shape(kind: ir.VectorOp, t: *types.Type) -> Lanes {
+    match kind {
+        VAnd => words_of(t)
+        VOr => words_of(t)
+        VXor => words_of(t)
+        VAndNot => words_of(t)
+        VNot => words_of(t)
+        VSelect => words_of(t)
+        _ => lanes_of(t)
+    }
+}
+
+fn sign_shift(s: Lanes) -> i64 {
+    if s.signed {
+        return 63
+    }
+    s.bits - 1
+}
+
+fn vector(l: *Lowering, v: *ir.Value) {
+    let t = types.must(v.type)
+    let kind = ir.vector_op(v.aux)
+    match kind {
+        VCopy => l.vector_copy(v, t)
+        VShuffle => l.vector_shuffle(v, t)
+        _ => {
+            let s = lane_shape(kind, t)
+            for k in 0..s.count {
+                l.vector_lane(v, kind, s, k)
+            }
+        }
+    }
+}
+
+fn vector_copy(l: *Lowering, v: *ir.Value, t: *types.Type) {
+    l.lane_address(v.args[0])
+    l.lane_address(v.args[1])
+    l.c.i32_const(types.vector_bytes(t))
+    l.c.memory_copy()
+}
+
+fn lane_address(l: *Lowering, a: *ir.Value) {
+    l.get(a)
+    l.c.address()
+}
+
+fn vector_lane(l: *Lowering, v: *ir.Value, kind: ir.VectorOp, s: Lanes, k: i64) {
+    l.lane_address(v.args[0])
+    l.lane_value(v, kind, s, k)
+    l.c.memory(s.store, k * s.width)
+}
+
+fn lane_load(l: *Lowering, a: *ir.Value, s: Lanes, k: i64) {
+    l.lane_address(a)
+    l.c.memory(s.load, k * s.width)
+}
+
+fn to_float(l: *Lowering, bits: i64) {
+    if bits == 32 {
+        l.c.op(op_i32_wrap_i64)
+        l.c.op(op_f32_reinterpret_i32)
+        return
+    }
+    l.c.op(op_f64_reinterpret_i64)
+}
+
+fn lane_operand(l: *Lowering, a: *ir.Value, s: Lanes, k: i64) {
+    l.lane_load(a, s, k)
+    if s.float {
+        l.to_float(s.bits)
+    }
+}
+
+fn lane_result(l: *Lowering, s: Lanes) {
+    if s.float {
+        l.pop_float(s.bits)
+    }
+}
+
+fn lane_value(l: *Lowering, v: *ir.Value, kind: ir.VectorOp, s: Lanes, k: i64) {
+    let c = l.c
+    match kind {
+        VAdd => l.lane_arithmetic(v, kind, s, k)
+        VSub => l.lane_arithmetic(v, kind, s, k)
+        VMul => l.lane_arithmetic(v, kind, s, k)
+        VDiv => l.lane_arithmetic(v, kind, s, k)
+        VAnd => l.lane_bitwise(v, op_i64_and, s, k)
+        VOr => l.lane_bitwise(v, op_i64_or, s, k)
+        VXor => l.lane_bitwise(v, op_i64_xor, s, k)
+        VAndNot => {
+            l.lane_load(v.args[1], s, k)
+            l.lane_load(v.args[2], s, k)
+            c.i64_const(-1)
+            c.op(op_i64_xor)
+            c.op(op_i64_and)
+        }
+        VMin => l.lane_pick(v, OpLt, s, k)
+        VMax => l.lane_pick(v, OpGt, s, k)
+        VEq => l.lane_compare(v, OpEq, s, k)
+        VNe => l.lane_compare(v, OpNe, s, k)
+        VLt => l.lane_compare(v, OpLt, s, k)
+        VLe => l.lane_compare(v, OpLe, s, k)
+        VGt => l.lane_compare(v, OpGt, s, k)
+        VGe => l.lane_compare(v, OpGe, s, k)
+        VShl => l.lane_shift(v, true, s, k)
+        VShr => l.lane_shift(v, false, s, k)
+        VNot => {
+            l.lane_load(v.args[1], s, k)
+            c.i64_const(-1)
+            c.op(op_i64_xor)
+        }
+        VNeg => l.lane_negate(v, s, k)
+        VSplat => l.get(v.args[1])
+        VSelect => l.lane_select(v, s, k)
+        _ => panic("wasm: vector {ir.vector_op_name(kind)} has no lane code")
+    }
+}
+
+fn float_arithmetic(kind: ir.VectorOp, bits: i64) -> u8 {
+    let single = bits == 32
+    match kind {
+        VAdd => if single { op_f32_add } else { op_f64_add }
+        VSub => if single { op_f32_sub } else { op_f64_sub }
+        VMul => if single { op_f32_mul } else { op_f64_mul }
+        _ => if single { op_f32_div } else { op_f64_div }
+    }
+}
+
+fn vector_arithmetic(kind: ir.VectorOp, s: Lanes) -> u8 {
+    if s.float {
+        return float_arithmetic(kind, s.bits)
+    }
+    match kind {
+        VAdd => op_i64_add
+        VSub => op_i64_sub
+        _ => op_i64_mul
+    }
+}
+
+fn lane_arithmetic(l: *Lowering, v: *ir.Value, kind: ir.VectorOp, s: Lanes, k: i64) {
+    l.lane_operand(v.args[1], s, k)
+    l.lane_operand(v.args[2], s, k)
+    l.c.op(vector_arithmetic(kind, s))
+    l.lane_result(s)
+}
+
+fn lane_bitwise(l: *Lowering, v: *ir.Value, code: u8, s: Lanes, k: i64) {
+    l.lane_load(v.args[1], s, k)
+    l.lane_load(v.args[2], s, k)
+    l.c.op(code)
+}
+
+fn lane_compare_code(kind: ir.Op, s: Lanes) -> u8 {
+    if s.float {
+        return float_compare(kind, s.bits)
+    }
+    integer_compare(kind, s.signed)
+}
+
+fn lane_pick(l: *Lowering, v: *ir.Value, kind: ir.Op, s: Lanes, k: i64) {
+    l.lane_operand(v.args[1], s, k)
+    l.lane_operand(v.args[2], s, k)
+    l.lane_operand(v.args[1], s, k)
+    l.lane_operand(v.args[2], s, k)
+    l.c.op(lane_compare_code(kind, s))
+    l.c.op(op_select)
+    l.lane_result(s)
+}
+
+fn lane_compare(l: *Lowering, v: *ir.Value, kind: ir.Op, s: Lanes, k: i64) {
+    l.c.i64_const(-1)
+    l.c.i64_const(0)
+    l.lane_operand(v.args[1], s, k)
+    l.lane_operand(v.args[2], s, k)
+    l.c.op(lane_compare_code(kind, s))
+    l.c.op(op_select)
+}
+
+fn lane_shift(l: *Lowering, v: *ir.Value, left: bool, s: Lanes, k: i64) {
+    let c = l.c
+    let count = v.args[2]
+    l.lane_load(v.args[1], s, k)
+    if s.bits == 8 || (s.bits == 64 && s.signed && !left) {
+        l.get(count)
+        if left {
+            c.op(op_i64_shl)
+        } else if s.signed {
+            c.op(op_i64_shr_s)
+        } else {
+            c.op(op_i64_shr_u)
+        }
+        return
+    }
+    if !left && s.signed {
+        l.get(count)
+        c.i64_const(s.bits - 1)
+        l.get(count)
+        c.i64_const(s.bits - 1)
+        c.op(op_i64_le_u)
+        c.op(op_select)
+        c.op(op_i64_shr_s)
+        return
+    }
+    l.get(count)
+    if left {
+        c.op(op_i64_shl)
+    } else {
+        c.op(op_i64_shr_u)
+    }
+    c.i64_const(0)
+    l.get(count)
+    c.i64_const(s.bits)
+    c.op(op_i64_lt_u)
+    c.op(op_select)
+}
+
+fn lane_negate(l: *Lowering, v: *ir.Value, s: Lanes, k: i64) {
+    if s.float {
+        l.lane_load(v.args[1], s, k)
+        l.c.i64_const(1 << (s.bits - 1))
+        l.c.op(op_i64_xor)
+        return
+    }
+    l.c.i64_const(0)
+    l.lane_load(v.args[1], s, k)
+    l.c.op(op_i64_sub)
+}
+
+fn lane_select(l: *Lowering, v: *ir.Value, s: Lanes, k: i64) {
+    let c = l.c
+    l.lane_load(v.args[2], s, k)
+    l.lane_load(v.args[1], s, k)
+    c.op(op_i64_and)
+    l.lane_load(v.args[3], s, k)
+    l.lane_load(v.args[1], s, k)
+    c.i64_const(-1)
+    c.op(op_i64_xor)
+    c.op(op_i64_and)
+    c.op(op_i64_or)
+}
+
+fn vector_locals(l: *Lowering, n: i64) -> []i64 {
+    for l.held.len < n {
+        let index = l.new_local()
+        push(mut l.held, index)
+    }
+    l.held
+}
+
+fn vector_shuffle(l: *Lowering, v: *ir.Value, t: *types.Type) {
+    let words = types.vector_bytes(t) / 8
+    let held = l.vector_locals(words)
+    for w in 0..words {
+        l.shuffle_word(v, w)
+        l.c.local_set(held[w])
+    }
+    for w in 0..words {
+        l.lane_address(v.args[0])
+        l.c.local_get(held[w])
+        l.c.memory(op_i64_store, 8 * w)
+    }
+}
+
+fn shuffle_word(l: *Lowering, v: *ir.Value, w: i64) {
+    for j in 0..8 {
+        l.shuffle_byte(v, 8 * w + j)
+        if j > 0 {
+            l.c.i64_const(8 * j)
+            l.c.op(op_i64_shl)
+            l.c.op(op_i64_or)
+        }
+    }
+}
+
+fn shuffle_index(l: *Lowering, v: *ir.Value, k: i64) {
+    l.lane_address(v.args[2])
+    l.c.memory(op_i64_load8_u, k)
+}
+
+fn shuffle_byte(l: *Lowering, v: *ir.Value, k: i64) {
+    let c = l.c
+    l.get(v.args[1])
+    c.i64_const(k & 16)
+    c.op(op_i64_add)
+    l.shuffle_index(v, k)
+    c.i64_const(15)
+    c.op(op_i64_and)
+    c.op(op_i64_add)
+    c.address()
+    c.memory(op_i64_load8_u, 0)
+    c.i64_const(0)
+    l.shuffle_index(v, k)
+    c.i64_const(128)
+    c.op(op_i64_and)
+    c.op(op_i64_eqz)
+    c.op(op_select)
+}
+
+fn vector_mask(l: *Lowering, v: *ir.Value) {
+    let source = types.must(v.from)
+    let s = lanes_of(source)
+    for k in 0..s.count {
+        l.lane_load(v.args[0], s, k)
+        l.c.i64_const(sign_shift(s))
+        l.c.op(op_i64_shr_u)
+        if k > 0 {
+            l.c.i64_const(k)
+            l.c.op(op_i64_shl)
+            l.c.op(op_i64_or)
+        }
+    }
+    l.set(v)
+}
