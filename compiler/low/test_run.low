@@ -1,0 +1,307 @@
+import std/atomic
+import std/io
+import std/os
+import std/os/signal
+import std/process
+import std/slices
+import std/sync
+import std/text
+import std/time
+
+const skipped_status = 3
+const interrupt_base = 128
+
+enum Verdict {
+    Passed
+    Failed
+    Skipped
+    Crashed
+    TimedOut
+    NotRun
+}
+
+struct Job {
+    built: *Built
+    name: str
+    file: str
+    line: i64
+    verdict: Verdict = Verdict.NotRun
+    detail: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    elapsed_ns: i64 = 0
+    began: i64 = 0
+    ended: i64 = 0
+    done: chan[bool]
+}
+
+struct Live {
+    lock: sync.Mutex
+    handles: [i64: *process.ChildHandle]
+    dir: str
+}
+
+struct Pool {
+    options: TestOptions
+    jobs: []*Job
+    order: []i64
+    next: atomic.Int
+    stopped: atomic.Bool
+    live: *Live
+}
+
+struct Collected {
+    data: []u8
+    done: chan[bool]
+}
+
+struct Ran {
+    exit: process.Exit
+    stdout: str
+    stderr: str
+    elapsed_ns: i64
+    timed_out: bool
+}
+
+fn new_job(built: *Built, listed: Listed) -> *Job {
+    new(Job { built, name: listed.name, file: listed.file, line: listed.line, done: chan[bool](1) })
+}
+
+fn child_flags(options: TestOptions) -> []str {
+    var flags = ["-timeout", "0"]
+    if options.run != "" {
+        push(mut flags, "-run")
+        push(mut flags, options.run)
+    }
+    if options.verbose {
+        push(mut flags, "-v")
+    }
+    if options.notime {
+        push(mut flags, "-notime")
+    }
+    if options.update {
+        push(mut flags, "-update")
+    }
+    flags
+}
+
+fn is_failure(v: Verdict) -> bool {
+    match v {
+        Failed => true
+        Crashed => true
+        TimedOut => true
+        _ => false
+    }
+}
+
+fn verdict_of_status(code: i64) -> Verdict {
+    match code {
+        0 => Verdict.Passed
+        1 => Verdict.Failed
+        skipped_status => Verdict.Skipped
+        _ => Verdict.Crashed
+    }
+}
+
+fn verdict_of(exit: process.Exit) -> Verdict {
+    match exit {
+        Exited(code) => verdict_of_status(code)
+        Signaled(_) => Verdict.Crashed
+    }
+}
+
+fn describe_exit(exit: process.Exit) -> str {
+    match exit {
+        Exited(code) => "exit status {code}"
+        Signaled(s) => "signal {signal.name(s)}"
+    }
+}
+
+fn track(live: *Live, handle: *process.ChildHandle) {
+    sync.lock(live.lock)
+    live.handles[handle.pid] = handle
+    sync.unlock(live.lock)
+}
+
+fn untrack(live: *Live, handle: *process.ChildHandle) {
+    sync.lock(live.lock)
+    delete(mut live.handles, handle.pid)
+    sync.unlock(live.lock)
+}
+
+fn kill_all(live: *Live) {
+    sync.lock(live.lock)
+    for _, handle in live.handles {
+        process.kill_on(handle, signal.Signal.Kill) or {}
+    }
+    sync.unlock(live.lock)
+}
+
+fn watch_interrupts(live: *Live) {
+    let signals = [signal.Signal.Interrupt, signal.Signal.Terminate]
+    let handle = signal.notify_handle(signals) or return
+    spawn stop_on_interrupt(live, handle)
+}
+
+fn stop_on_interrupt(live: *Live, handle: signal.WatchHandle) {
+    let received = signal.wait_for_on(handle) or return
+    kill_all(live)
+    remove_directory(live.dir)
+    os.exit(interrupt_base + signal.number(received))
+}
+
+fn piped(stream: io.Stream?) -> io.Stream ! io.Error {
+    match stream {
+        some(s) => s
+        none => fail Invalid
+    }
+}
+
+fn collect(stream: io.Stream, into: *Collected) {
+    let buffer = io.buffer(65536)
+    for {
+        let n = stream.read(buffer) or break
+        if n == 0 {
+            break
+        }
+        io.append(mut into.data, buffer[..n])
+    }
+    stream.close()
+    into.done <- true
+}
+
+fn await_exit(handle: *process.ChildHandle, exited: chan[bool]) {
+    process.wait_exit_on(handle) or {}
+    exited <- true
+}
+
+fn wait_for_exit(handle: *process.ChildHandle, timeout_ms: i64) -> bool {
+    let exited = chan[bool](1)
+    spawn await_exit(handle, exited)
+    if timeout_ms == 0 {
+        <-exited
+        return false
+    }
+    select {
+        <-exited => false
+        after(timeout_ms) => {
+            process.kill_on(handle, signal.Signal.Kill) or {}
+            <-exited
+            true
+        }
+    }
+}
+
+fn run_child(live: *Live, binary: str, dir: str, args: []str, timeout_ms: i64) -> Ran ! io.Error {
+    let command = process.Command {
+        program: binary
+        args
+        dir
+        stdin: process.Stdio.Null
+        stdout: process.Stdio.Piped
+        stderr: process.Stdio.Piped
+        group: true
+    }
+    let began = time.monotonic()
+    using child = process.start(command)?
+    let handle = child.handle
+    let stdout_stream = piped(handle.stdout)?
+    let stderr_stream = piped(handle.stderr)?
+    let out = new(Collected { data: [], done: chan[bool](1) })
+    let err = new(Collected { data: [], done: chan[bool](1) })
+    spawn collect(stdout_stream, out)
+    spawn collect(stderr_stream, err)
+    track(live, handle)
+    let timed_out = wait_for_exit(handle, timeout_ms)
+    let elapsed_ns = time.monotonic() - began
+    untrack(live, handle)
+    process.kill_on(handle, signal.Signal.Kill) or {}
+    <-out.done
+    <-err.done
+    let exit = process.wait(child)?
+    Ran { exit, stdout: str(out.data), stderr: str(err.data), elapsed_ns, timed_out }
+}
+
+fn run_job(pool: *Pool, job: *Job) {
+    let flags = child_flags(pool.options)
+    let args = slices.concat(["-one", job.name], flags)
+    let built = job.built
+    let timeout_ms = pool.options.timeout_ms
+    job.began = time.monotonic()
+    let ran = run_child(pool.live, built.binary, built.module.dir, args, timeout_ms) catch {
+        e => {
+            job.verdict = Verdict.Crashed
+            job.detail = "could not run: {e}"
+            return
+        }
+    }
+    job.ended = time.monotonic()
+    job.stdout = ran.stdout
+    job.stderr = ran.stderr
+    job.elapsed_ns = ran.elapsed_ns
+    if ran.timed_out {
+        job.verdict = Verdict.TimedOut
+        job.detail = "timed out after {timeout_ms}ms"
+        return
+    }
+    job.verdict = verdict_of(ran.exit)
+    job.detail = describe_exit(ran.exit)
+}
+
+fn work(pool: *Pool) {
+    for {
+        let at = atomic.add_int(pool.next, 1) - 1
+        if at >= pool.order.len {
+            break
+        }
+        let job = pool.jobs[pool.order[at]]
+        if pool.options.failfast && atomic.load_bool(pool.stopped) {
+            job.verdict = Verdict.NotRun
+        } else {
+            run_job(pool, job)
+            if pool.options.failfast && is_failure(job.verdict) {
+                atomic.store_bool(pool.stopped, true)
+            }
+        }
+        job.done <- true
+    }
+}
+
+fn start_pool(pool: *Pool) {
+    var workers = pool.options.jobs
+    if pool.jobs.len < workers {
+        workers = pool.jobs.len
+    }
+    for _ in 0..workers {
+        spawn work(pool)
+    }
+}
+
+fn list_module(live: *Live, built: *Built, timeout_ms: i64) -> []Listed ! Error {
+    let ran = run_child(live, built.binary, built.module.dir, ["-list"], timeout_ms) catch {
+        e => fail Error.Failed("list tests: {e}")
+    }
+    if ran.timed_out {
+        fail Error.Failed("list tests: timed out after {timeout_ms}ms")
+    }
+    if verdict_of(ran.exit) != Verdict.Passed {
+        let reason = describe_exit(ran.exit)
+        let output = text.trim(ran.stderr)
+        fail Error.Failed("list tests: {reason}\n{output}")
+    }
+    var listed: []Listed = []
+    for line in text.lines(ran.stdout) {
+        let found = parse_listing(line)?
+        push(mut listed, found)
+    }
+    listed
+}
+
+fn parse_listing(line: str) -> Listed ! Error {
+    let parts = text.split(line, '\t')
+    if parts.len != 3 {
+        fail Error.Failed("list tests: unexpected line {text.quote(line)}")
+    }
+    let number = text.parse_int(parts[2]) or fail Error.Failed("list tests: unexpected line {text.quote(line)}")
+    Listed { name: parts[0], file: parts[1], line: number }
+}
