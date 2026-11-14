@@ -5,7 +5,7 @@ Compiler for the Low language, written in Low. [docs/design.md](docs/design.md) 
 ## Layout
 
 - `compiler/` is the compiler. `compiler/low.mod` marks the project root, so `import lexer` loads `compiler/lexer/`. One directory is one module.
-- `std/` is the standard library, one directory per module, embedded in `low`. `compiler/compiler/prelude/prelude.low` is the runtime and generic map code compiled ahead of every program, and `compiler/amd64/runtime/*.asm` is the runtime assembly.
+- `std/` is the standard library, one directory per module, embedded in `low`. `compiler/compiler/prelude/prelude.low` is the runtime and generic map code compiled ahead of every program, `compiler/compiler/prelude/browser.low` is the allocator, collector and lock routines written in Low and joined to every program for a target without an operating system, and `compiler/amd64/runtime/*.asm` is the runtime assembly.
 - `testdata/` holds the fixture programs, `bench/` the benchmark programs, `docs/` the design reference and examples, `editors/` the editor grammars and `site/` the website.
 - `bootstrap.txt` names the release that builds the compiler and the SHA-256 of its Linux binary. `bootstrap.sh` downloads it, builds the compiler three times and checks the last two builds are byte-identical.
 

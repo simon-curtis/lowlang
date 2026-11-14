@@ -6,6 +6,9 @@ class Exit {
 
 const panicStatus = 2;
 const entropyChunk = 65536;
+const stressWords = 8192;
+const pageBits = 16;
+const addressablePages = 65536;
 const monotonicClock = 1;
 
 function round(x) {
@@ -48,6 +51,7 @@ function trapMessage(error) {
 
 export async function run(bytes, host) {
   let memory = null;
+  let pageLimit = addressablePages;
   const view = (ptr, len) => (len === 0 ? new Uint8Array(0) : new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0));
   const entropy = (data) => {
     for (let at = 0; at < data.length; at += entropyChunk) {
@@ -62,11 +66,16 @@ export async function run(bytes, host) {
       },
       clock: (id) => (id === monotonicClock ? host.monotonic() : host.wall()),
       entropy: (ptr, len) => entropy(view(ptr, len)),
+      gc_stress: () => (host.stress ? stressWords : 0),
+      page_limit: () => pageLimit,
     },
     m: math,
   };
   const { instance } = await WebAssembly.instantiate(bytes, imports);
   memory = instance.exports.memory;
+  if (host.maxPages !== undefined) {
+    pageLimit = Math.min(addressablePages, (memory.buffer.byteLength >>> pageBits) + host.maxPages);
+  }
   try {
     instance.exports._start();
     return 0;
@@ -86,7 +95,10 @@ async function runFile(path) {
   const crypto = await import("node:crypto");
   const bytes = fs.readFileSync(path);
   const pause = new Int32Array(new SharedArrayBuffer(4));
+  const limit = process.env.LOW_WASM_MAX_PAGES;
   return run(bytes, {
+    stress: process.env.LOW_GC === "stress",
+    maxPages: limit === undefined ? undefined : Number(limit),
     write: (fd, data) => {
       let at = 0;
       while (at < data.length) {
