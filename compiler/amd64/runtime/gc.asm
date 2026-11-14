@@ -502,6 +502,29 @@ rt_region_leave:
 	jz rt_alloc_unhold
 	ret
 
+	.globl rt_region_suspend
+rt_region_suspend:
+	TLS_GET rcx, TLS_G
+	mov rax, [rcx+G_REGION]
+	test rax, rax
+	jz 1f
+	mov qword ptr [rcx+G_REGION], 0
+	push rax
+	call rt_alloc_unhold
+	pop rax
+1:
+	ret
+
+	.globl rt_region_resume
+rt_region_resume:
+	test rdi, rdi
+	jz 1f
+	TLS_GET rax, TLS_G
+	mov [rax+G_REGION], rdi
+	jmp rt_alloc_hold
+1:
+	ret
+
 rt_alloc_hold:
 	TLS_GET rcx, TLS_M
 	mov rax, [rcx+M_ALLOC_END]
