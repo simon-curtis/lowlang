@@ -1,0 +1,142 @@
+import std/io
+import std/sys
+
+/// How a mapping may be accessed.
+pub enum MapMode {
+    /// Read only. Writing to the bytes panics with `invalid memory access`.
+    ReadOnly
+    /// Readable and writable. Writes reach the file and every other shared mapping of it.
+    Shared
+    /// Readable and writable. Writes are copy-on-write and never reach the file.
+    Private
+}
+
+/// What a program tells the system about how it will use a mapping.
+pub enum Advice {
+    /// No particular pattern.
+    Normal
+    /// Accesses are in no particular order.
+    Random
+    /// Accesses run from low offsets to high.
+    Sequential
+    /// The pages will be needed soon, so the system reads them ahead.
+    WillNeed
+    /// The pages will not be needed soon, so the system can drop them.
+    DontNeed
+}
+
+/// Whether `sync_map` waits for the write to finish.
+pub enum Flush {
+    /// Returns once the changed pages have been written to the file.
+    Wait
+    /// Starts the write of the changed pages and returns at once.
+    Queue
+}
+
+/// A region of memory that holds a file's bytes, or zeros when no file backs it, and unmaps itself when dropped.
+///
+/// `data` is the bytes: a slice over memory the operating system owns, so the collector neither scans nor moves it, and it stays valid for as long as the `Mapping` is held. Dropping the `Mapping`, or `unmap`, releases the memory, and a slice that was copied out of `data` and used afterwards reads or writes unmapped memory, which panics with `invalid memory access`. So does writing to a `ReadOnly` mapping. A `data` slice has no spare capacity, so `push` onto a copy reallocates on the heap and leaves the mapping alone. The mapping stays valid after the file is closed. A file that another process shortens while it is mapped faults the program on a read past the new end.
+pub struct Mapping {
+    /// The mapped bytes, whose length is the length that was asked for.
+    pub data: []u8
+    region: sys.MapView?
+    drop release(region)
+}
+
+fn release(region: sys.MapView?) {
+    let view = region ?? return
+    sys.unmap_view(view)
+}
+
+fn map_mode(mode: MapMode) -> sys.MapMode {
+    match mode {
+        ReadOnly => sys.MapMode.ReadOnly
+        Shared => sys.MapMode.Shared
+        Private => sys.MapMode.Private
+    }
+}
+
+fn empty_mapping() -> Mapping {
+    Mapping { data: [], region: none }
+}
+
+fn mapping_of(region: sys.MapView, skip: i64, length: i64) -> Mapping {
+    let base: ptr[u8] = ptr(region.address + skip)
+    Mapping { data: view(base, length), region }
+}
+
+/// Maps `length` bytes of the open file starting at `offset` and returns the mapping.
+///
+/// `offset` can be any non-negative position, and a `length` of `0` maps from `offset` to the end of the file. A mapping of zero bytes, such as of an empty file, has an empty `data` and nothing to release. The range must lie inside the file, so grow a file with `truncate` before mapping past its end; a range that does not fails with `Invalid`, as do a negative `offset` or `length`. A `Shared` mapping needs a file opened for reading and writing and fails with `Denied` for one that was not, and `ReadOnly` and `Private` need a file opened for reading. A file that is not a regular file, such as a pipe or a directory, fails with `Unsupported`, and one the address space cannot hold with `TooLarge`. Fails with `NotConnected` when the file has been closed.
+pub fn map(f: File, mode: MapMode, offset: i64, length: i64) -> Mapping ! io.Error {
+    if offset < 0 || length < 0 {
+        fail Invalid
+    }
+    using lease = sys.enter(f.handle.descriptor)?
+    let st = sys.fstat(f.handle.fd)?
+    if st.kind != sys.Kind.Regular {
+        fail Unsupported
+    }
+    if offset > st.size || length > st.size - offset {
+        fail Invalid
+    }
+    let wanted = if length == 0 { st.size - offset } else { length }
+    if wanted == 0 {
+        return empty_mapping()
+    }
+    let granularity = sys.map_granularity()
+    let start = offset - offset % granularity
+    let skip = offset - start
+    let region = sys.map_file(f.handle.fd, map_mode(mode), start, skip + wanted)?
+    mapping_of(region, skip, wanted)
+}
+
+/// Maps `length` bytes of zeroed memory that no file backs and returns the mapping.
+///
+/// A `length` of `0` gives an empty `data` and nothing to release. Fails with `Invalid` for a negative `length` and `TooLarge` when the address space cannot hold the region. `ReadOnly` gives a region of zeros that cannot be written.
+pub fn map_anonymous(mode: MapMode, length: i64) -> Mapping ! io.Error {
+    if length < 0 {
+        fail Invalid
+    }
+    if length == 0 {
+        return empty_mapping()
+    }
+    let region = sys.map_memory(map_mode(mode), length)?
+    mapping_of(region, 0, length)
+}
+
+/// Writes the pages of a `Shared` file mapping that changed to the file.
+///
+/// `Wait` returns once the data has been written, and `Queue` starts the write and returns, so the file's content is up to date only after the system finishes it. Other file reads see written data either way, because the page cache is shared. Does nothing for a mapping with no file, a `ReadOnly` mapping, a `Private` mapping, which never reaches the file, or an empty one.
+pub fn sync_map(m: Mapping, flush: Flush) ! io.Error {
+    let region = m.region ?? return
+    let how = match flush {
+        Wait => sys.MapSync.Wait
+        Queue => sys.MapSync.Queue
+    }
+    sys.sync_view(region, how)?
+}
+
+/// Tells the system how the program will use the mapping.
+///
+/// Advice only changes performance, except `DontNeed` on Linux, which makes a `Private` mapping lose its changes so that later reads return the file's bytes, or zeros when no file backs it, and leaves the content of a `Shared` mapping intact. On Windows `WillNeed` prefetches the pages and the other advice does nothing. Does nothing for an empty mapping.
+pub fn advise_map(m: Mapping, advice: Advice) ! io.Error {
+    let region = m.region ?? return
+    let hint = match advice {
+        Normal => sys.MapAdvice.Normal
+        Random => sys.MapAdvice.Random
+        Sequential => sys.MapAdvice.Sequential
+        WillNeed => sys.MapAdvice.WillNeed
+        DontNeed => sys.MapAdvice.DontNeed
+    }
+    sys.advise_view(region, hint)?
+}
+
+/// Releases the mapping now instead of when it is dropped.
+///
+/// Afterwards `data` is empty, and slices copied from it must not be used. Unmapping twice does nothing. Changes made through a `Shared` mapping stay in the file's pages, and `sync_map` before `unmap` makes them durable.
+pub fn unmap(mut m: Mapping) {
+    release(m.region)
+    m.region = none
+    m.data = []
+}
