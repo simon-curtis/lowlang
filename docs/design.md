@@ -2065,7 +2065,7 @@ Optimiser:
 - Literal hoisting:
   - A release build hoists a non-empty slice or map literal whose elements are all constants: integer, float, `bool` and `str` literals, negated numbers, `none`, enum variants without payload and non-C struct literals of constants.
   - The checker marks a literal read-only when it is the operand of an index, a `for` or `.len`, or is bound by a `let` whose every use is such an operand. An assignment, a `mut` argument or any other use anywhere in the target path of an element or field makes the binding non-read-only.
-  - Each hoisted literal owns a word of `rt_cells`. The code loads the word, and when it is 0 builds the literal as usual and stores the pointer, so the first evaluation builds it and a racing thread at most builds a second equal copy.
+  - Each hoisted literal owns a word of `rt_cells`. The code loads the word, and when it is 0 builds the literal as usual and stores the pointer, so the first evaluation builds it and a racing thread at most builds a second equal copy. The copy lives in the memory of the allocator current at that moment, so a first evaluation inside a `region` block leaves a pointer into freed memory in the cell.
   - A read-only literal uses the cell's pointer, as a slice of its length for a slice.
   - Any other use copies it: a slice with one grow call that moves the template's bytes, a map with the prelude's `__map_clone`, which copies the entry array and the index. A literal below the copy thresholds of the Slices and Maps sections is built each time in that case.
 - Block merging and jump threading:
@@ -2074,6 +2074,7 @@ Optimiser:
 
 ### Code generation
 
+- `generate` produces the functions in batches of 32 on one green thread per CPU. Unless the build is hot-reloadable, a batch runs inside a `region` block whose value is its functions' assembly text, data chunks and stack maps, so the allocation of instruction selection and register allocation is freed with the batch and does not count toward the collector's trigger. The parts merge in function order. A hot-reloadable build generates sequentially outside regions, because the function table keeps the symbol names it is given.
 - Phis and layout:
   - Critical edges are split and each phi becomes a parallel copy at the end of every predecessor, emitted with cycles broken through `r11`.
   - An argument whose live range ends at that copy prefers the phi's register, and the phi prefers the registers of its arguments, so a loop-carried value usually needs no move.
