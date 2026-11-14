@@ -1,0 +1,176 @@
+import std/io
+import std/math
+import std/slices
+
+/// Why an SNTP exchange failed.
+pub enum Error {
+    /// The reply is shorter than the 48 bytes of an NTP packet.
+    Short
+    /// The reply's mode is `value`, not 4 (server).
+    Mode(value: i64)
+    /// The reply's version is `value`, which is not 1 to 4.
+    Version(value: i64)
+    /// The reply's originate timestamp is not the transmit timestamp of the request, so it answers another request or is forged.
+    Originate
+    /// The server refused to serve the client. `code` is the kiss code of RFC 4330 section 8, such as `RATE` or `DENY`.
+    KissOfDeath(code: str)
+    /// The server's clock is not synchronised: the leap indicator is 3.
+    Unsynchronized
+    /// The reply's stratum is `value`, which is not 1 to 15.
+    Stratum(value: i64)
+    /// The reply's transmit timestamp is zero.
+    NoTransmit
+    /// The lookup, the socket or the wait failed. `cause` is `TimedOut` when no reply arrived in time and `Aborted` when the cancellation token fired.
+    Io(cause: io.Error)
+}
+
+/// An NTP timestamp: seconds and a binary fraction of a second, as the 64 bits that travel in a packet.
+pub struct Stamp {
+    /// The seconds, 0 to 4294967295. A value of 2^31 or more counts from 1900-01-01T00:00:00Z (era 0) and a smaller value from 2036-02-07T06:28:16Z (era 1).
+    pub seconds: i64
+    /// The fraction of a second in units of 2^-32 second, 0 to 4294967295.
+    pub fraction: i64
+}
+
+/// The fields of a server reply that passed `parse`, with the times in nanoseconds.
+pub struct Reply {
+    /// The leap indicator, 0 to 2: 0 no warning, 1 the last minute of the day has 61 seconds, 2 it has 59.
+    pub leap: i64
+    /// The version of the reply, 1 to 4.
+    pub version: i64
+    /// The stratum of the server, 1 to 15.
+    pub stratum: i64
+    /// The maximum interval between messages in log2 seconds, as a signed 8-bit integer.
+    pub poll: i64
+    /// The precision of the server's clock in log2 seconds, as a signed 8-bit integer.
+    pub precision: i64
+    /// The round-trip delay to the server's reference clock in nanoseconds, rounded to the nearest nanosecond.
+    pub root_delay: i64
+    /// The server's error relative to its reference clock in nanoseconds, rounded to the nearest nanosecond.
+    pub root_dispersion: i64
+    /// The 4 bytes of the reference identifier: an ASCII code for stratum 1, an IPv4 address or hash for higher strata.
+    pub reference_id: []u8
+    /// The server's transmit timestamp, nanoseconds since the Unix epoch.
+    pub time: i64
+    /// The server's clock minus the client's in nanoseconds, `((t2 - t1) + (t3 - t4)) / 2` truncated toward zero, where `t1` is the request's transmit time, `t2` the server's receive time, `t3` its transmit time and `t4` the arrival time. Add it to the client's clock to get the server's.
+    pub offset: i64
+    /// The round-trip delay in nanoseconds, `(t4 - t1) - (t3 - t2)`.
+    pub delay: i64
+}
+
+const packet_size = 48
+const era_zero_unix = 2208988800
+const era_size = 4294967296
+const half_era = 2147483648
+const nanos = 1000000000
+
+/// Returns the NTP timestamp for `unix_nanos`, nanoseconds since the Unix epoch.
+///
+/// The fraction is rounded to the nearest unit of 2^-32 second, so `to_unix_nanos` of the result is `unix_nanos` again. The seconds count from 1900 and wrap every 2^32 seconds, so times from 1968-01-20T03:14:08Z to 2104-02-26T09:42:23Z keep their meaning and others fall into that range.
+pub fn to_stamp(unix_nanos: i64) -> Stamp {
+    let whole = math.floor_div(unix_nanos, nanos)
+    let rest = unix_nanos - whole * nanos
+    let ticks = ((rest << 32) + nanos / 2) / nanos
+    Stamp { seconds: math.floor_mod(whole + era_zero_unix, era_size), fraction: ticks }
+}
+
+/// Returns the nanoseconds since the Unix epoch that `s` stands for, rounding the fraction to the nearest nanosecond.
+///
+/// A timestamp with the top bit of `seconds` set is in era 0 and one without it in era 1, as RFC 4330 section 3 prescribes, so the result is a time from 1968-01-20T03:14:08Z to 2104-02-26T09:42:23Z.
+pub fn to_unix_nanos(s: Stamp) -> i64 {
+    let whole = if s.seconds >= half_era { s.seconds - era_zero_unix } else { s.seconds + era_size - era_zero_unix }
+    whole * nanos + ((s.fraction * nanos + half_era) >> 32)
+}
+
+/// Returns the 48-byte client request of RFC 4330: version 4, mode 3 (client), and `transmit` as the transmit timestamp.
+pub fn request(transmit: Stamp) -> []u8 {
+    var out = io.buffer(packet_size)
+    out[0] = 0x23
+    io.set_be32(out, 40, transmit.seconds)
+    io.set_be32(out, 44, transmit.fraction)
+    out
+}
+
+fn stamp_at(b: []u8, at: i64) -> Stamp {
+    Stamp { seconds: io.be32(b, at), fraction: io.be32(b, at + 4) }
+}
+
+fn signed_byte(v: u8) -> i64 {
+    let n = i64(v)
+    if n >= 128 { n - 256 } else { n }
+}
+
+fn short_nanos(v: i64) -> i64 {
+    (v * nanos + 32768) >> 16
+}
+
+fn kiss_code(id: []u8) -> str {
+    var out: []u8 = []
+    for c in id {
+        if c == 0 {
+            break
+        }
+        push(mut out, if c >= 32 && c < 127 { c } else { '?' })
+    }
+    str(out)
+}
+
+fn stamp_zero(s: Stamp) -> bool {
+    s.seconds == 0 && s.fraction == 0
+}
+
+/// Checks the reply `packet` to the request that carried `sent` and returns its fields, with the offset and delay computed from `sent`, the packet's receive and transmit timestamps, and `received`, the clock reading in nanoseconds since the Unix epoch when it arrived.
+///
+/// Rejects, in this order, a packet shorter than 48 bytes (`Short`), a mode other than 4 (`Mode`), a version outside 1 to 4 (`Version`), an originate timestamp different from `sent` (`Originate`), stratum 0 (`KissOfDeath` with the reference identifier as the code), a leap indicator of 3 (`Unsynchronized`), a stratum above 15 (`Stratum`) and a zero transmit timestamp (`NoTransmit`). Bytes after the 48th, such as extension fields and a MAC, are ignored. The request's transmit time is `to_unix_nanos(sent)`.
+pub fn parse(packet: []u8, sent: Stamp, received: i64) -> Reply ! Error {
+    if packet.len < packet_size {
+        fail Short
+    }
+    let flags = i64(packet[0])
+    let leap = flags >> 6
+    let version = (flags >> 3) & 7
+    let mode = flags & 7
+    if mode != 4 {
+        fail Mode(mode)
+    }
+    if version < 1 || version > 4 {
+        fail Version(version)
+    }
+    let originate = stamp_at(packet, 24)
+    if originate.seconds != sent.seconds || originate.fraction != sent.fraction {
+        fail Originate
+    }
+    let stratum = i64(packet[1])
+    let reference_id = packet[12..16]
+    if stratum == 0 {
+        fail KissOfDeath(kiss_code(reference_id))
+    }
+    if leap == 3 {
+        fail Unsynchronized
+    }
+    if stratum > 15 {
+        fail Stratum(stratum)
+    }
+    let transmit = stamp_at(packet, 40)
+    if stamp_zero(transmit) {
+        fail NoTransmit
+    }
+    let t1 = to_unix_nanos(sent)
+    let t2 = to_unix_nanos(stamp_at(packet, 32))
+    let t3 = to_unix_nanos(transmit)
+    let delay_bits = io.be32(packet, 4)
+    let signed_delay = if delay_bits >= half_era { delay_bits - era_size } else { delay_bits }
+    Reply {
+        leap,
+        version,
+        stratum,
+        poll: signed_byte(packet[2]),
+        precision: signed_byte(packet[3]),
+        root_delay: short_nanos(signed_delay),
+        root_dispersion: short_nanos(io.be32(packet, 8)),
+        reference_id: slices.clone(reference_id),
+        time: t3,
+        offset: ((t2 - t1) + (t3 - received)) / 2,
+        delay: (received - t1) - (t3 - t2)
+    }
+}
