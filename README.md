@@ -103,6 +103,8 @@ npm install
 npm run build
 npm run dev
 python3 ../assets/brand/build.py
+npm install --prefix ../assets/brand/video
+npm run render --prefix ../assets/brand/video
 ```
 
 | Path | Holds |
@@ -110,7 +112,7 @@ python3 ../assets/brand/build.py
 | `site/gen/` | The generator, a Low module run with `low run site/gen` from the repository root. |
 | `site/content/` | The hand-written bodies of the landing page and `404.html`. |
 | `site/src/` | The stylesheet (Tailwind, in `style.css`), the scripts, the fonts and the inlined marks. |
-| `site/public/` | Files copied to the site root unchanged: icons, the web manifest, `install.sh`, `install.ps1`, `_headers` and `_redirects`. |
+| `site/public/` | Files copied to the site root unchanged: icons, the social image and video, the web manifest, `install.sh`, `install.ps1`, `_headers` and `_redirects`. |
 | `site/index.html`, `404.html`, `docs/`, `packages/`, `search.json` | The generator's output, ignored by git. |
 | `site/dist/` | The bundled site, ignored by git. |
 
@@ -129,6 +131,8 @@ The generator:
 Every page carries a search palette, opened from the masthead's `Search` button, Ctrl K, ⌘ K or `/`. `site/src/search.js` fetches the index in the background when the pointer or focus reaches the button, or when the palette opens, and groups matches by page. Every query word must match. A word matched whole or at its start counts more than one matched inside a word, and a match in a name or title counts more than one in a description, a signature or the text, which counts more the more often it occurs. A name that equals or starts with the query ranks above the rest, and a page ranks by its own score or its best item, whichever is higher.
 
 `build.py` regenerates the icons, social images and web manifest in `site/public/` and the mark in `site/src/` from the brand mark. It needs `rsvg-convert`, `magick` and Noto Sans.
+
+`assets/brand/video/` renders `site/public/og-video.mp4`, the 12.5-second 1200×630 video that the landing page plays in its "Inside the compiler" panel through `site/src/film.js`, which plays it while it is on screen and shows the controls instead when the reader prefers reduced motion. Every page but `404.html` names it in `og:video` with `og:type` `video.other`, which Discord needs before it plays a linked video, and `og-image.png` is the still for platforms that do not play it; X shows the still, since its player card needs an approved domain. `render.mjs` compiles `hello.low` with `low` and hands the scene its source, `low ir` output, `fn_main` from `low asm`, the binary's size and its first 48 bytes. `scene.js` is a three.js scene that follows a spark through the compiler's stages on that program: the tokens drop in as keys, assemble into the syntax tree, take their types, fold into the SSA, give way to the assembly, and the ELF header's bytes become cubes that build the mark from `site/src/mark.svg`, beside which the name, the lead's first sentence from `site/content/index.html` and the address from `site/gen/config.low` come in. The ink, paper and `on-ink` syntax colours come from `site/src/style.css` and the fonts from `site/src/fonts/`. Each frame is a function of its time alone. `render.mjs` serves the repository on loopback, opens the scene in headless Chromium with SwiftShader, draws each frame at twice the size and pipes it to `ffmpeg`, which scales it down and encodes H.264 tagged BT.709 with the index at the front. It uses the `low` that `LOW` names or the one on `PATH`, finds `chromium`, `chromium-browser`, `google-chrome-stable` or `google-chrome` on `PATH` unless `CHROMIUM` names a browser, and needs `ffmpeg`. `--draft` renders at the target size and 15 frames a second, `--crf` sets the quality (26 by default), `--still 1.5,6` writes those moments as PNG files instead of a video, and a path argument names the output file, which `--still` requires.
 
 ### Checked snippets
 
