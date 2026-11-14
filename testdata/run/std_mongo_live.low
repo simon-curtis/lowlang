@@ -1,0 +1,444 @@
+import std/bson
+import std/mongo
+import std/os
+import std/text
+import std/time
+
+fn check(label: str, got: str, want: str) {
+    if got != want {
+        print("FAIL {label}: got {got} want {want}")
+    }
+}
+
+fn show(e: mongo.Error) -> str {
+    match e {
+        Connect => "Connect"
+        Authentication => "Authentication"
+        Closed => "Closed"
+        Timeout => "Timeout"
+        Protocol => "Protocol"
+        Unsupported => "Unsupported"
+        Invalid(message) => "Invalid({message})"
+        Selection => "Selection"
+        Server(code, name, _, labels) => "Server({code}, {name}, {text.join(labels, "+")})"
+        Write(index, code, _) => "Write({index}, {code})"
+        WriteConcern(code, _) => "WriteConcern({code})"
+    }
+}
+
+fn attempt(work: fn() ! mongo.Error) -> str {
+    work() catch {
+        e => return show(e)
+    }
+    "ok"
+}
+
+fn names(docs: [][]bson.Field, field: str) -> str {
+    var out: []str = []
+    for d in docs {
+        push(mut out, mongo.get_text(d, field) ?? "?")
+    }
+    text.join(out, ",")
+}
+
+fn numbers(docs: [][]bson.Field, field: str) -> str {
+    var out: []str = []
+    for d in docs {
+        push(mut out, "{mongo.get_int(d, field) ?? -1}")
+    }
+    text.join(out, ",")
+}
+
+fn person(name: str, age: i64) -> []bson.Field {
+    [mongo.text_of("name", name), mongo.int_of("age", age)]
+}
+
+fn by(name: str) -> []bson.Field {
+    [mongo.text_of("name", name)]
+}
+
+fn set(field: str, value: i64) -> []bson.Field {
+    [mongo.document_of("$set", [mongo.int_of(field, value)])]
+}
+
+fn present(d: []bson.Field?) -> str {
+    match d {
+        some(_) => "true"
+        none => "false"
+    }
+}
+
+fn quiet() -> mongo.CallOptions {
+    mongo.CallOptions {}
+}
+
+fn crud(c: mongo.Collection) ! mongo.Error {
+    mongo.drop_collection(c, quiet())?
+    let inserted = mongo.insert_one(c, person("ada", 36), mongo.InsertOptions {})?
+    var id = "none"
+    match inserted.inserted_id {
+        ObjectId(b) => {
+            id = "oid{b.len}"
+        }
+        _ => {}
+    }
+    check("insert_one id", id, "oid12")
+    let duplicate = [bson.Field { name: "_id", value: inserted.inserted_id }, mongo.text_of("name", "dup")]
+    check("duplicate key", attempt(fn() ! mongo.Error { mongo.insert_one(c, duplicate, mongo.InsertOptions {})? }), "Write(0, 11000)")
+    let many = mongo.insert_many(c, [person("bob", 41), person("cy", 29), person("di", 52), person("ed", 33)], mongo.InsertOptions {})?
+    check("insert_many ids", "{many.inserted_ids.len}", "4")
+    check("count", "{mongo.count_documents(c, [], mongo.CountOptions {})?}", "5")
+    check("estimated", "{mongo.estimated_document_count(c, quiet())?}", "5")
+    let sorted = mongo.find(c, [], mongo.FindOptions { sort: [mongo.int_of("age", -1)], projection: [mongo.int_of("name", 1), mongo.int_of("_id", 0)] })?
+    check("sorted", names(mongo.all(sorted)?, "name"), "di,bob,ada,ed,cy")
+    let window = mongo.find(c, [], mongo.FindOptions { sort: [mongo.int_of("age", 1)], skip: 1, limit: 3 })?
+    check("skip limit", names(mongo.all(window)?, "name"), "ed,ada,bob")
+    let batches = mongo.find(c, [], mongo.FindOptions { sort: [mongo.int_of("age", 1)], batch_size: 2 })?
+    var seen: []str = []
+    for {
+        let d = mongo.next(batches)? ?? break
+        push(mut seen, mongo.get_text(d, "name") ?? "?")
+    }
+    check("getMore", text.join(seen, ","), "cy,ed,ada,bob,di")
+    let early = mongo.find(c, [], mongo.FindOptions { batch_size: 1 })?
+    let first = mongo.next(early)?
+    mongo.close_cursor(early)
+    check("early close", present(first), "true")
+    let one = mongo.find_one(c, by("cy"), mongo.FindOptions {})?
+    check("find_one", names([one ?? []], "name"), "cy")
+    let absent = mongo.find_one(c, by("nobody"), mongo.FindOptions {})?
+    check("find_one absent", present(absent), "false")
+    let updated = mongo.update_one(c, by("ada"), set("age", 37), mongo.UpdateOptions {})?
+    check("update_one", "{updated.matched}/{updated.modified}", "1/1")
+    let upsert = mongo.update_one(c, by("fay"), set("age", 20), mongo.UpdateOptions { upsert: true })?
+    var upsert_made = false
+    match upsert.upserted_id {
+        some(_) => {
+            upsert_made = true
+        }
+        none => {}
+    }
+    check("upsert", "{upsert.matched}/{upsert_made}", "0/true")
+    let all_older = mongo.update_many(c, [mongo.document_of("age", [mongo.int_of("$gte", 40)])], [mongo.document_of("$inc", [mongo.int_of("age", 1)])], mongo.UpdateOptions {})?
+    check("update_many", "{all_older.matched}/{all_older.modified}", "2/2")
+    let replaced = mongo.replace_one(c, by("cy"), person("cy", 30), mongo.UpdateOptions {})?
+    check("replace_one", "{replaced.matched}/{replaced.modified}", "1/1")
+    check("bad update", attempt(fn() ! mongo.Error { mongo.update_one(c, by("cy"), person("x", 1), mongo.UpdateOptions {})? }), "Invalid(an update document needs update operators such as $set; use replace_one to replace a document)")
+    let before = mongo.find_one_and_update(c, by("bob"), set("age", 50), mongo.FindAndModifyOptions {})?
+    check("find_one_and_update before", numbers([before ?? []], "age"), "42")
+    let after = mongo.find_one_and_update(c, by("bob"), set("age", 51), mongo.FindAndModifyOptions { return_after: true })?
+    check("find_one_and_update after", numbers([after ?? []], "age"), "51")
+    let swapped = mongo.find_one_and_replace(c, by("ed"), person("ed", 34), mongo.FindAndModifyOptions { return_after: true })?
+    check("find_one_and_replace", numbers([swapped ?? []], "age"), "34")
+    let gone = mongo.find_one_and_delete(c, by("fay"), mongo.FindAndModifyOptions {})?
+    check("find_one_and_delete", names([gone ?? []], "name"), "fay")
+    let ages = mongo.distinct(c, "name", [], quiet())?
+    check("distinct", "{ages.len}", "5")
+    let totals = mongo.aggregate(c, [[mongo.document_of("$group", [mongo.int_of("_id", 1), mongo.document_of("sum", [mongo.text_of("$sum", "$age")])])]], mongo.AggregateOptions {})?
+    check("aggregate", numbers(mongo.all(totals)?, "sum"), "{37 + 51 + 30 + 53 + 34}")
+    check("delete_one", "{mongo.delete_one(c, by("di"), mongo.DeleteOptions {})?}", "1")
+    check("delete_many", "{mongo.delete_many(c, [mongo.document_of("age", [mongo.int_of("$gt", 0)])], mongo.DeleteOptions {})?}", "4")
+}
+
+fn bulk(c: mongo.Collection) ! mongo.Error {
+    mongo.drop_collection(c, quiet())?
+    let r = mongo.bulk_write(c, [
+        mongo.WriteModel.InsertOne(person("a", 1))
+        mongo.WriteModel.InsertOne(person("b", 2))
+        mongo.WriteModel.UpdateOne(by("a"), set("age", 10), false)
+        mongo.WriteModel.UpdateOne(by("z"), set("age", 26), true)
+        mongo.WriteModel.ReplaceOne(by("b"), person("b", 20), false)
+        mongo.WriteModel.DeleteOne(by("a"))
+        mongo.WriteModel.UpdateMany([], set("flag", 1), false)
+    ], mongo.BulkOptions {})?
+    check("bulk totals", "{r.inserted}/{r.matched}/{r.modified}/{r.deleted}/{r.upserted.len}", "2/4/4/1/1")
+    check("bulk upsert index", "{r.upserted[0].index}", "3")
+    mongo.create_index(c, mongo.IndexModel { keys: [mongo.int_of("name", 1)], unique: true }, quiet())?
+    let failed = attempt(fn() ! mongo.Error {
+        mongo.bulk_write(c, [
+            mongo.WriteModel.InsertOne(person("q", 1))
+            mongo.WriteModel.InsertOne(person("b", 2))
+            mongo.WriteModel.InsertOne(person("r", 3))
+        ], mongo.BulkOptions {})?
+    })
+    check("bulk ordered failure", failed, "Write(1, 11000)")
+    check("bulk ordered stopped", "{mongo.count_documents(c, by("r"), mongo.CountOptions {})?}", "0")
+    let unordered = attempt(fn() ! mongo.Error {
+        mongo.bulk_write(c, [
+            mongo.WriteModel.InsertOne(person("s", 1))
+            mongo.WriteModel.InsertOne(person("b", 2))
+            mongo.WriteModel.InsertOne(person("t", 3))
+        ], mongo.BulkOptions { ordered: false })?
+    })
+    check("bulk unordered failure", unordered, "Write(1, 11000)")
+    check("bulk unordered went on", "{mongo.count_documents(c, by("t"), mongo.CountOptions {})?}", "1")
+    var listed: []str = []
+    let indexes = mongo.list_indexes(c, quiet())?
+    for spec in mongo.all(indexes)? {
+        push(mut listed, mongo.get_text(spec, "name") ?? "?")
+    }
+    check("indexes", text.join(listed, ","), "_id_,name_1")
+    mongo.drop_index(c, "name_1", quiet())?
+    check("drop_index", attempt(fn() ! mongo.Error { mongo.drop_index(c, "name_1", quiet())? }), "Server(27, IndexNotFound, )")
+    var big: [][]bson.Field = []
+    for i in 0..100500 {
+        push(mut big, [mongo.int_of("i", i)])
+    }
+    mongo.drop_collection(c, quiet())?
+    let many = mongo.insert_many(c, big, mongo.InsertOptions {})?
+    check("batched insert", "{many.inserted_ids.len}/{mongo.count_documents(c, [], mongo.CountOptions {})?}", "100500/100500")
+}
+
+fn wait_for_set(client: mongo.Client, members: i64) -> str {
+    var last = ""
+    for _ in 0..200 {
+        let found = mongo.servers(client)
+        var primaries = 0
+        var secondaries = 0
+        for _, kind in found {
+            if kind == "primary" {
+                primaries += 1
+            }
+            if kind == "secondary" {
+                secondaries += 1
+            }
+        }
+        last = "{primaries}p/{secondaries}s"
+        if primaries == 1 && secondaries == members - 1 {
+            return last
+        }
+        sleep(50)
+    }
+    last
+}
+
+fn hello_flag(db: mongo.Database, pref: mongo.ReadPreference, field: str) -> str ! mongo.Error {
+    let reply = mongo.run_command(db, [mongo.int_of("hello", 1)], mongo.CommandOptions { read_preference: pref })?
+    "{mongo.get_bool(reply, field) ?? false}"
+}
+
+fn preferences(client: mongo.Client, db: mongo.Database) ! mongo.Error {
+    let admin = mongo.database(client, "admin")
+    let secondary = mongo.ReadPreference { mode: mongo.ReadMode.Secondary }
+    check("secondary hello", hello_flag(admin, secondary, "secondary")?, "true")
+    check("primary hello", hello_flag(admin, mongo.ReadPreference {}, "isWritablePrimary")?, "true")
+    check("nearest hello", hello_flag(admin, mongo.ReadPreference { mode: mongo.ReadMode.Nearest }, "ok")?, "true")
+    check("secondaryPreferred hello", hello_flag(admin, mongo.ReadPreference { mode: mongo.ReadMode.SecondaryPreferred }, "secondary")?, "true")
+    check("primaryPreferred hello", hello_flag(admin, mongo.ReadPreference { mode: mongo.ReadMode.PrimaryPreferred }, "isWritablePrimary")?, "true")
+    let tagged = mongo.ReadPreference { mode: mongo.ReadMode.Secondary, tag_sets: [[mongo.Tag { name: "dc", value: "none" }], []] }
+    check("tag fallback", hello_flag(admin, tagged, "secondary")?, "true")
+    let c = mongo.collection(db, "causal")
+    mongo.drop_collection(c, quiet())?
+    var reader = c
+    reader.read_preference = secondary
+    reader.read_concern = "majority"
+    var writer = c
+    writer.write_concern = mongo.WriteConcern { w: "majority" }
+    let session = mongo.start_session(client)?
+    var misses = 0
+    for i in 0..30 {
+        mongo.insert_one(writer, [mongo.int_of("i", i)], mongo.InsertOptions { session: some(session) })?
+        let found = mongo.count_documents(reader, [mongo.int_of("i", i)], mongo.CountOptions { session: some(session) })?
+        if found != 1 {
+            misses += 1
+        }
+    }
+    check("causal consistency", "{misses}", "0")
+    check("operation time", "{mongo.operation_time(session) != 0}", "true")
+    mongo.end_session(session)
+}
+
+fn stranger(uri: str) -> str {
+    attempt(fn() ! mongo.Error {
+        using client = mongo.connect(uri)?
+        let db = mongo.database(client, "lowtest")
+        mongo.insert_one(mongo.collection(db, "stranger"), person("x", 1), mongo.InsertOptions {})?
+    })
+}
+
+fn transactions(client: mongo.Client, db: mongo.Database) ! mongo.Error {
+    let a = mongo.collection(db, "txn_a")
+    let b = mongo.collection(db, "txn_b")
+    mongo.drop_collection(a, quiet())?
+    mongo.drop_collection(b, quiet())?
+    mongo.create_collection(db, "txn_a", [], quiet())?
+    mongo.create_collection(db, "txn_b", [], quiet())?
+    let session = mongo.start_session(client)?
+    let opts = mongo.InsertOptions { session: some(session) }
+    let committed = attempt(fn() ! mongo.Error {
+        mongo.with_transaction(session, "snapshot", mongo.WriteConcern { w: "majority" }, fn() ! mongo.Error {
+            mongo.insert_one(a, person("in_a", 1), opts)?
+            mongo.insert_one(b, person("in_b", 2), opts)?
+            let own = mongo.count_documents(a, [], mongo.CountOptions { session: some(session) })?
+            if own != 1 {
+                fail mongo.Error.Invalid("transaction cannot see its own write")
+            }
+            let outside = mongo.count_documents(a, [], mongo.CountOptions {})?
+            if outside != 0 {
+                fail mongo.Error.Invalid("an uncommitted write is visible outside")
+            }
+        })?
+    })
+    check("with_transaction", committed, "ok")
+    check("committed visible", "{mongo.count_documents(a, [], mongo.CountOptions {})?}/{mongo.count_documents(b, [], mongo.CountOptions {})?}", "1/1")
+    let aborted = attempt(fn() ! mongo.Error {
+        mongo.with_transaction(session, "", mongo.WriteConcern {}, fn() ! mongo.Error {
+            mongo.insert_one(a, person("lost", 3), opts)?
+            fail mongo.Error.Invalid("stop")
+        })?
+    })
+    check("body failure", aborted, "Invalid(stop)")
+    check("aborted gone", "{mongo.count_documents(a, by("lost"), mongo.CountOptions {})?}", "0")
+    mongo.start_transaction(session, "", mongo.WriteConcern {})?
+    mongo.insert_one(a, person("manual", 4), opts)?
+    mongo.abort_transaction(session)?
+    check("manual abort", "{mongo.count_documents(a, by("manual"), mongo.CountOptions {})?}", "0")
+    check("commit without transaction", attempt(fn() ! mongo.Error { mongo.commit_transaction(session)? }), "Invalid(no transaction is running in this session)")
+    mongo.insert_one(a, person("shared", 5), mongo.InsertOptions {})?
+    let first = mongo.start_session(client)?
+    let second = mongo.start_session(client)?
+    mongo.start_transaction(first, "", mongo.WriteConcern {})?
+    mongo.update_one(a, by("shared"), set("age", 6), mongo.UpdateOptions { session: some(first) })?
+    mongo.start_transaction(second, "", mongo.WriteConcern {})?
+    let conflict = attempt(fn() ! mongo.Error { mongo.update_one(a, by("shared"), set("age", 7), mongo.UpdateOptions { session: some(second) })? })
+    check("write conflict", conflict, "Server(112, WriteConflict, TransientTransactionError)")
+    mongo.abort_transaction(second)?
+    mongo.commit_transaction(first)?
+    let shared = mongo.find_one(a, by("shared"), mongo.FindOptions {})?
+    check("conflict winner", numbers([shared ?? []], "age"), "6")
+    mongo.end_session(first)
+    mongo.end_session(second)
+    mongo.end_session(session)
+}
+
+fn failover(client: mongo.Client, db: mongo.Database) ! mongo.Error {
+    let c = mongo.collection(db, "failover")
+    mongo.drop_collection(c, quiet())?
+    let admin = mongo.database(client, "admin")
+    let step = attempt(fn() ! mongo.Error {
+        mongo.run_command(admin, [mongo.int_of("replSetStepDown", 4), mongo.bool_of("force", true)], mongo.CommandOptions {})?
+    })
+    check("step down", if step == "ok" || step == "Closed" { "ok" } else { step }, "ok")
+    for i in 0..5 {
+        mongo.insert_one(c, [mongo.int_of("i", i)], mongo.InsertOptions {})?
+    }
+    check("writes after step down", "{mongo.count_documents(c, [], mongo.CountOptions {})?}", "5")
+    check("topology after step down", wait_for_set(client, 3), "1p/2s")
+}
+
+fn run_replica(uri: str) ! mongo.Error {
+    using client = mongo.connect(uri)?
+    check("topology", wait_for_set(client, 3), "1p/2s")
+    let db = mongo.database(client, "lowtest")
+    let c = mongo.collection(db, "people")
+    crud(c)?
+    bulk(mongo.collection(db, "bulk"))?
+    preferences(client, db)?
+    transactions(client, db)?
+    failover(client, db)?
+    var secondary = ""
+    for address, kind in mongo.servers(client) {
+        if kind == "secondary" {
+            secondary = address
+        }
+    }
+    run_direct(secondary)?
+}
+
+fn run_compressed(uri: str) ! mongo.Error {
+    using client = mongo.connect("{uri}&compressors=zstd,zlib,snappy")?
+    let db = mongo.database(client, "lowtest")
+    crud(mongo.collection(db, "compressed"))?
+}
+
+fn run_direct(host: str) ! mongo.Error {
+    using client = mongo.connect("mongodb://{host}/?directConnection=true")?
+    let db = mongo.database(client, "lowtest")
+    let c = mongo.collection(db, "direct")
+    let write = attempt(fn() ! mongo.Error { mongo.insert_one(c, person("x", 1), mongo.InsertOptions {})? })
+    check("write on a secondary", write, "Server(10107, NotWritablePrimary, RetryableWriteError)")
+    let count = mongo.count_documents(c, [], mongo.CountOptions {})?
+    check("read on a secondary", "{count >= 0}", "true")
+}
+
+fn round_trip(c: mongo.Collection) ! mongo.Error {
+    mongo.drop_collection(c, quiet())?
+    mongo.insert_one(c, person("round", 1), mongo.InsertOptions {})?
+    let found = mongo.find_one(c, by("round"), mongo.FindOptions {})?
+    check("round trip", names([found ?? []], "name"), "round")
+}
+
+fn login(host: str, user: str, password: str, options: str) -> str {
+    attempt(fn() ! mongo.Error {
+        using client = mongo.connect("mongodb://{user}:{password}@{host}/lowtest?authSource=admin&{options}")?
+        let db = mongo.database(client, "lowtest")
+        round_trip(mongo.collection(db, "auth"))?
+    })
+}
+
+fn run_auth(host: str) {
+    check("root", login(host, "root", "rootpw", "directConnection=true"), "ok")
+    check("sha1 user", login(host, "sha1user", "pw1", "directConnection=true"), "ok")
+    check("sha256 user", login(host, "sha256user", "pw256", "directConnection=true"), "ok")
+    check("both sha1", login(host, "bothuser", "pwboth", "authMechanism=SCRAM-SHA-1"), "ok")
+    check("both sha256", login(host, "bothuser", "pwboth", "authMechanism=SCRAM-SHA-256"), "ok")
+    check("both compressed", login(host, "bothuser", "pwboth", "compressors=snappy,zlib,zstd"), "ok")
+    check("wrong password", login(host, "sha1user", "wrong", ""), "Authentication")
+    check("wrong sha256 password", login(host, "sha256user", "wrong", ""), "Authentication")
+    check("unknown user", login(host, "nobody", "pw", ""), "Authentication")
+    check("mechanism unavailable", login(host, "sha256user", "pw256", "authMechanism=SCRAM-SHA-1"), "Server(334, MechanismUnavailable, )")
+    check("unauthenticated", stranger("mongodb://{host}/?directConnection=true"), "Server(13, Unauthorized, )")
+    check("x509", login(host, "root", "rootpw", "authMechanism=MONGODB-X509"), "Unsupported")
+    let transaction = attempt(fn() ! mongo.Error {
+        using client = mongo.connect("mongodb://root:rootpw@{host}/?authSource=admin&directConnection=true")?
+        let session = mongo.start_session(client)?
+        mongo.start_transaction(session, "", mongo.WriteConcern {})?
+    })
+    check("transaction on a standalone", transaction, "Unsupported")
+}
+
+fn run_tls(host: str, ca: str) {
+    check("tls", attempt(fn() ! mongo.Error {
+        using client = mongo.connect("mongodb://{host}/?tls=true&tlsCAFile={ca}&directConnection=true")?
+        let db = mongo.database(client, "lowtest")
+        round_trip(mongo.collection(db, "tls"))?
+    }), "ok")
+    check("tls untrusted", attempt(fn() ! mongo.Error {
+        using client = mongo.connect("mongodb://{host}/?tls=true&directConnection=true&serverSelectionTimeoutMS=1500")?
+        let db = mongo.database(client, "lowtest")
+        round_trip(mongo.collection(db, "tls"))?
+    }), "Selection")
+    check("tls insecure", attempt(fn() ! mongo.Error {
+        using client = mongo.connect("mongodb://{host}/?tls=true&tlsInsecure=true&directConnection=true")?
+        let db = mongo.database(client, "lowtest")
+        round_trip(mongo.collection(db, "tls"))?
+    }), "ok")
+    check("plain against tls", attempt(fn() ! mongo.Error {
+        using client = mongo.connect("mongodb://{host}/?directConnection=true&serverSelectionTimeoutMS=1000")?
+        let db = mongo.database(client, "lowtest")
+        round_trip(mongo.collection(db, "tls"))?
+    }), "Selection")
+}
+
+fn main() {
+    let env = os.environment()
+    let replica = env["LOWLANG_MONGO_RS"] ?? ""
+    if replica.len > 0 {
+        run_replica(replica) catch {
+            e => print("FAIL replica set: {show(e)}")
+        }
+        run_compressed(replica) catch {
+            e => print("FAIL compressed replica set: {show(e)}")
+        }
+        check("selection timeout", stranger("mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=300&connectTimeoutMS=200"), "Selection")
+    }
+    let auth = env["LOWLANG_MONGO_AUTH"] ?? ""
+    if auth.len > 0 {
+        run_auth(auth)
+    }
+    let secure = env["LOWLANG_MONGO_TLS"] ?? ""
+    let ca = env["LOWLANG_MONGO_TLS_CA"] ?? ""
+    if secure.len > 0 && ca.len > 0 {
+        run_tls(secure, ca)
+    }
+}

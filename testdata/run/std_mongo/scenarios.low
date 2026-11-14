@@ -1,0 +1,292 @@
+import std/bson
+import std/io
+import std/mongo
+import std/net
+
+fn describe(e: mongo.Error) -> str {
+    match e {
+        Connect => "Connect"
+        Authentication => "Authentication"
+        Closed => "Closed"
+        Timeout => "Timeout"
+        Protocol => "Protocol"
+        Unsupported => "Unsupported"
+        Invalid(message) => "Invalid({message})"
+        Selection => "Selection"
+        Server(code, name, message, labels) => "Server({code}, {name}, {message}, {labels})"
+        Write(index, code, message) => "Write({index}, {code}, {message})"
+        WriteConcern(code, message) => "WriteConcern({code}, {message})"
+    }
+}
+
+fn templates() -> Templates {
+    Templates { standalone: standalone_hello, primary: primary_hello, secondary: secondary_hello }
+}
+
+fn boot(w: *World, t: Templates, remaining: i64, body: fn()) ! io.Error {
+    using l = net.listen("127.0.0.1", 0)?
+    let index = w.nodes.len
+    let address = "127.0.0.1:{l.handle.addr.port}"
+    push(mut w.nodes, new(Node { address, tags: [], script: [], at: 0, user: "", secret: "", connections: 0 }))
+    let listening = l.handle
+    spawn accept_loop(w, index, t, listening)
+    if remaining > 1 {
+        boot(w, t, remaining - 1, body)?
+    } else {
+        body()
+    }
+}
+
+fn finish(label: str, w: *World) {
+    for n in w.nodes {
+        if n.at < n.script.len {
+            note(w, "{n.address} left {n.script.len - n.at} scripted commands unused, next {n.script[n.at].command}")
+        }
+    }
+    for line in w.notes {
+        print("{label} note: {line}")
+    }
+    print("{label} sessions ended {w.ended}")
+}
+
+fn id_of(n: i64) -> []bson.Field {
+    [bson.Field { name: "_id", value: bson.Value.Int32(i32(n)) }]
+}
+
+fn person(n: i64, name: str, age: i64) -> []bson.Field {
+    mongo.with_fields(id_of(n), [mongo.text_of("name", name), mongo.int_of("age", age)])
+}
+
+fn show_documents(documents: [][]bson.Field) {
+    for d in documents {
+        print("  {bson.diagnostic(d)}")
+    }
+}
+
+fn crud(uri: str) ! mongo.Error {
+    using client = mongo.connect(uri)?
+    let db = mongo.database(client, "lowtest")
+    let c = mongo.collection(db, "cap")
+    mongo.drop_collection(c, mongo.CallOptions {})?
+    let one = mongo.insert_one(c, person(1, "ada", 36), mongo.InsertOptions {})?
+    print("insert_one {bson.diagnostic([bson.Field { name: "id", value: one.inserted_id }])}")
+    let many = mongo.insert_many(c, [person(2, "bob", 41), person(3, "cy", 29)], mongo.InsertOptions {})?
+    print("insert_many {many.inserted_ids.len}")
+    mongo.insert_one(c, mongo.with_fields(id_of(1), [mongo.text_of("name", "dup")]), mongo.InsertOptions {}) catch {
+        e => {
+            print("duplicate {describe(e)}")
+            mongo.InsertOneResult { inserted_id: bson.Value.Null }
+        }
+    }
+    let cursor = mongo.find(c, [], mongo.FindOptions { sort: [mongo.int_of("age", 1)], batch_size: 2 })?
+    print("find")
+    show_documents(mongo.all(cursor)?)
+    let early = mongo.find(c, [], mongo.FindOptions { batch_size: 1 })?
+    let first = mongo.next(early)?
+    print("first {bson.diagnostic(first ?? [])}")
+    mongo.close_cursor(early)
+    let updated = mongo.update_one(c, [mongo.text_of("name", "ada")], [mongo.document_of("$set", [mongo.int_of("age", 37)])], mongo.UpdateOptions {})?
+    print("update {updated.matched} {updated.modified}")
+    let changed = mongo.find_one_and_update(c, [mongo.text_of("name", "bob")], [mongo.document_of("$set", [mongo.int_of("age", 42)])], mongo.FindAndModifyOptions { return_after: true })?
+    print("find_one_and_update {bson.diagnostic(changed ?? [])}")
+    print("count {mongo.count_documents(c, [], mongo.CountOptions {})?}")
+    print("delete {mongo.delete_one(c, [mongo.text_of("name", "cy")], mongo.DeleteOptions {})?}")
+    let pong = mongo.run_command(db, [mongo.int_of("ping", 1)], mongo.CommandOptions {})?
+    print("ping {bson.diagnostic(pong)}")
+    mongo.insert_one(c, id_of(9), mongo.InsertOptions {})?
+    mongo.insert_one(c, id_of(9), mongo.InsertOptions {}) catch {
+        e => {
+            print("duplicate {describe(e)}")
+            mongo.InsertOneResult { inserted_id: bson.Value.Null }
+        }
+    }
+    mongo.run_command(db, [mongo.text_of("nosuchcommand", "x")], mongo.CommandOptions {}) catch {
+        e => {
+            print("unknown {describe(e)}")
+            []
+        }
+    }
+}
+
+fn standalone() ! io.Error {
+    let w = new_world(false)
+    boot(w, templates(), 1, fn() {
+        let n = w.nodes[0]
+        n.user = "root"
+        n.secret = "pencil"
+        n.script = [
+            expect_with("drop", standalone_drop, check_drop)
+            expect_with("insert", standalone_insert, check_insert_one)
+            expect_with("insert", standalone_insert_two, check_insert_two)
+            expect_with("insert", standalone_duplicate, check_second_insert)
+            expect_with("find", standalone_find, check_find)
+            expect_with("getMore", standalone_get_more, check_get_more)
+            expect("find", standalone_find_one)
+            expect_with("killCursors", standalone_kill, check_kill)
+            expect_with("update", standalone_update, check_update)
+            expect_with("findAndModify", standalone_find_and_modify, check_find_and_modify)
+            expect_with("aggregate", standalone_aggregate, check_aggregate)
+            expect_with("delete", standalone_delete, check_delete)
+            expect_with("ping", standalone_ping, check_ping)
+            expect_with("insert", standalone_insert, check_second_insert)
+            expect_with("insert", standalone_duplicate_nine, check_second_insert)
+            expect_with("nosuchcommand", standalone_unknown, check_unknown)
+        ]
+        crud("mongodb://root:pencil@{n.address}/lowtest?appName=lowfake") catch {
+            e => print("crud {describe(e)}")
+        }
+    })?
+    finish("standalone", w)
+}
+
+fn wrong_password() ! io.Error {
+    let w = new_world(false)
+    boot(w, templates(), 1, fn() {
+        let n = w.nodes[0]
+        n.user = "root"
+        n.secret = "pencil"
+        using client = mongo.connect("mongodb://root:eraser@{n.address}/lowtest?serverSelectionTimeoutMS=3000") catch {
+            e => {
+                print("wrong password connect {describe(e)}")
+                return
+            }
+        }
+        mongo.run_command(mongo.database(client, "lowtest"), [mongo.int_of("ping", 1)], mongo.CommandOptions {}) catch {
+            e => {
+                print("wrong password {describe(e)}")
+                return
+            }
+        }
+        print("wrong password accepted")
+    })?
+    finish("wrong password", w)
+}
+
+fn replicated(uri: str, w: *World) ! mongo.Error {
+    using client = mongo.connect(uri)?
+    let c = mongo.collection(mongo.database(client, "lowtest"), "cap")
+    let one = mongo.insert_one(c, person(7, "eve", 30), mongo.InsertOptions {})?
+    print("insert_one {bson.diagnostic([bson.Field { name: "id", value: one.inserted_id }])}")
+    let servers = mongo.servers(client)
+    print("new primary {servers[w.nodes[2].address] ?? "absent"}")
+    print("count {mongo.count_documents(c, [], mongo.CountOptions {})?}")
+}
+
+fn failover() ! io.Error {
+    let w = new_world(true)
+    boot(w, templates(), 3, fn() {
+        w.primary = 0
+        w.nodes[1].tags = [mongo.text_of("dc", "east")]
+        w.nodes[0].script = [expect_with("insert", secondary_not_primary, check_failover_write)]
+        w.nodes[2].script = [expect_with("insert", primary_insert, repeat_write)]
+        w.nodes[1].script = [expect_with("aggregate", secondary_aggregate, check_east_read)]
+        let uri = "mongodb://{w.nodes[1].address}/lowtest?replicaSet=rs0&readPreference=secondaryPreferred&readPreferenceTags=dc:east&heartbeatFrequencyMS=500&serverSelectionTimeoutMS=5000"
+        replicated(uri, w) catch {
+            e => print("failover {describe(e)}")
+        }
+    })?
+    finish("failover", w)
+}
+
+fn dropped_connection() ! io.Error {
+    let w = new_world(true)
+    boot(w, templates(), 1, fn() {
+        w.primary = 0
+        w.nodes[0].script = [expect_with("insert", "", remember_write), expect_with("insert", primary_insert, repeat_write)]
+        let uri = "mongodb://{w.nodes[0].address}/lowtest?replicaSet=rs0&heartbeatFrequencyMS=500&serverSelectionTimeoutMS=5000"
+        using client = mongo.connect(uri) catch {
+            e => {
+                print("dropped connect {describe(e)}")
+                return
+            }
+        }
+        let c = mongo.collection(mongo.database(client, "lowtest"), "cap")
+        mongo.insert_one(c, person(8, "fay", 22), mongo.InsertOptions {}) catch {
+            e => {
+                print("dropped {describe(e)}")
+                return
+            }
+        }
+        print("dropped connection retried")
+    })?
+    finish("dropped connection", w)
+}
+
+fn transactions(uri: str) ! mongo.Error {
+    using client = mongo.connect(uri)?
+    let c = mongo.collection(mongo.database(client, "lowtest"), "captxn")
+    mongo.insert_one(c, person(1, "ada", 36), mongo.InsertOptions {})?
+    let session = mongo.start_session(client)?
+    mongo.start_transaction(session, "", mongo.WriteConcern {})?
+    mongo.insert_one(c, id_of(2), mongo.InsertOptions { session: some(session) })?
+    mongo.commit_transaction(session)?
+    print("committed")
+    mongo.start_transaction(session, "", mongo.WriteConcern {})?
+    let first = mongo.update_one(c, [mongo.text_of("name", "ada")], [mongo.document_of("$set", [mongo.int_of("age", 1)])], mongo.UpdateOptions { session: some(session) })?
+    print("update {first.matched} {first.modified}")
+    let other = mongo.start_session(client)?
+    mongo.start_transaction(other, "", mongo.WriteConcern {})?
+    mongo.update_one(c, [mongo.text_of("name", "ada")], [mongo.document_of("$set", [mongo.int_of("age", 2)])], mongo.UpdateOptions { session: some(other) }) catch {
+        e => {
+            print("conflict {describe(e)} transient {mongo.has_label(e, "TransientTransactionError")}")
+            mongo.UpdateResult { matched: 0, modified: 0, upserted_id: none }
+        }
+    }
+    mongo.abort_transaction(other)?
+    mongo.abort_transaction(session)?
+    print("aborted")
+    mongo.end_session(session)
+    mongo.end_session(other)
+}
+
+fn transaction_commands() ! io.Error {
+    let w = new_world(true)
+    boot(w, templates(), 1, fn() {
+        w.primary = 0
+        w.nodes[0].script = [
+            expect_with("insert", primary_insert, remember_write)
+            expect_with("insert", primary_insert, check_transaction_insert)
+            expect_with("commitTransaction", primary_commit, check_commit)
+            expect_with("update", primary_update, check_second_transaction)
+            expect_with("update", primary_conflict, check_conflicting_transaction)
+            expect_with("abortTransaction", primary_abort, check_abort)
+        ]
+        transactions("mongodb://{w.nodes[0].address}/lowtest?directConnection=true") catch {
+            e => print("transactions {describe(e)}")
+        }
+    })?
+    finish("transactions", w)
+}
+
+fn direct_secondary() ! io.Error {
+    let w = new_world(true)
+    boot(w, templates(), 1, fn() {
+        w.nodes[0].script = [
+            expect_with("insert", secondary_not_primary, check_direct_write)
+            expect_with("insert", secondary_not_primary, check_direct_retry)
+            expect_with("aggregate", secondary_aggregate, check_direct_read)
+        ]
+        let uri = "mongodb://{w.nodes[0].address}/lowtest?directConnection=true&heartbeatFrequencyMS=500"
+        using client = mongo.connect(uri) catch {
+            e => {
+                print("direct connect {describe(e)}")
+                return
+            }
+        }
+        let c = mongo.collection(mongo.database(client, "lowtest"), "cap")
+        mongo.insert_one(c, person(1, "x", 1), mongo.InsertOptions {}) catch {
+            e => {
+                print("direct write {describe(e)}")
+                mongo.InsertOneResult { inserted_id: bson.Value.Null }
+            }
+        }
+        let counted = mongo.count_documents(c, [], mongo.CountOptions {}) catch {
+            e => {
+                print("direct read {describe(e)}")
+                -1
+            }
+        }
+        print("direct count {counted}")
+    })?
+    finish("direct secondary", w)
+}

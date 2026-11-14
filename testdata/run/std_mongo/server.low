@@ -1,0 +1,367 @@
+import std/base64
+import std/bson
+import std/crypto/hash
+import std/crypto/password
+import std/io
+import std/mongo
+import std/net
+import std/sync
+import std/text
+
+const salt_text = "lowfake-salt-16b"
+const iterations = 15000
+
+struct Sequence {
+    ident: str
+    documents: [][]bson.Field
+}
+
+struct Request {
+    id: i64
+    db: str
+    name: str
+    body: []bson.Field
+    sequences: []Sequence
+}
+
+struct Expect {
+    command: str
+    reply: str
+    on_request: fn(*World, Request)
+}
+
+struct Node {
+    address: str
+    tags: []bson.Field
+    script: []Expect
+    at: i64
+    user: str
+    secret: str
+    connections: i64
+}
+
+struct World {
+    lock: sync.Mutex
+    replica: bool
+    set_name: str
+    nodes: []*Node
+    primary: i64
+    election: i64
+    notes: []str
+    lsid: str
+    txn: i64
+    ended: i64
+}
+
+struct Conversation {
+    first_bare: str
+    server_first: str
+    combined: str
+}
+
+fn new_world(replica: bool) -> *World {
+    new(World { lock: sync.mutex(), replica, set_name: "rs0", nodes: [], primary: -1, election: 5, notes: [], lsid: "", txn: 0, ended: 0 })
+}
+
+fn note(w: *World, message: str) {
+    sync.lock(w.lock)
+    push(mut w.notes, message)
+    sync.unlock(w.lock)
+}
+
+fn nothing(w: *World, r: Request) {
+}
+
+fn expect(command: str, reply: str) -> Expect {
+    Expect { command, reply, on_request: nothing }
+}
+
+fn expect_with(command: str, reply: str, on_request: fn(*World, Request)) -> Expect {
+    Expect { command, reply, on_request }
+}
+
+fn present(fields: []bson.Field, name: str) -> bool {
+    match bson.get(fields, name) {
+        some(_) => true
+        none => false
+    }
+}
+
+fn hex_body(hex: str) -> []u8 {
+    text.decode_hex(hex) or io.buffer(0)
+}
+
+fn decode_doc(data: []u8) -> []bson.Field {
+    bson.decode(data) or []
+}
+
+fn encode_doc(fields: []bson.Field) -> []u8 {
+    bson.encode(fields) or io.buffer(0)
+}
+
+fn ok_with(extra: []bson.Field) -> []u8 {
+    encode_doc(mongo.with_fields(extra, [mongo.double_of("ok", 1.0)]))
+}
+
+fn set_field(fields: []bson.Field, name: str, value: bson.Value) -> []bson.Field {
+    var out: []bson.Field = []
+    var done = false
+    for f in fields {
+        if f.name == name {
+            push(mut out, bson.Field { name, value })
+            done = true
+        } else {
+            push(mut out, f)
+        }
+    }
+    if !done {
+        push(mut out, bson.Field { name, value })
+    }
+    out
+}
+
+fn election_id(n: i64) -> bson.Value {
+    var raw: []u8 = [0x7f, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, u8(n)]
+    bson.Value.ObjectId(raw)
+}
+
+fn hosts_of(w: *World) -> []str {
+    var out: []str = []
+    for n in w.nodes {
+        push(mut out, n.address)
+    }
+    out
+}
+
+fn hello_reply(w: *World, index: i64, req: Request, template: str) -> []u8 {
+    let n = w.nodes[index]
+    var fields = decode_doc(hex_body(template))
+    if w.replica {
+        let primary = index == w.primary
+        fields = set_field(fields, "hosts", mongo.texts_of("hosts", hosts_of(w)).value)
+        fields = set_field(fields, "setName", bson.Value.Str(w.set_name))
+        fields = set_field(fields, "isWritablePrimary", bson.Value.Bool(primary))
+        fields = set_field(fields, "secondary", bson.Value.Bool(!primary))
+        fields = set_field(fields, "me", bson.Value.Str(n.address))
+        if w.primary >= 0 {
+            fields = set_field(fields, "primary", bson.Value.Str(w.nodes[w.primary].address))
+        } else {
+            fields = mongo.without(fields, "primary")
+        }
+        if primary {
+            fields = set_field(fields, "electionId", election_id(w.election))
+        }
+        if n.tags.len > 0 {
+            fields = set_field(fields, "tags", bson.Value.Document(n.tags))
+        }
+    }
+    if n.user.len > 0 && present(req.body, "saslSupportedMechs") {
+        fields = set_field(fields, "saslSupportedMechs", mongo.texts_of("saslSupportedMechs", ["SCRAM-SHA-256"]).value)
+    }
+    encode_doc(fields)
+}
+
+fn read_request(r: *io.Reader) -> Request ! io.Error {
+    let head = io.read_exact(r, 16)?
+    let length = io.le32(head, 0)
+    let rest = io.read_exact(r, length - 16)?
+    let flags = io.le32(rest, 0)
+    var end = rest.len
+    if (flags & 1) != 0 {
+        end -= 4
+    }
+    var at = 4
+    var body: []bson.Field = []
+    var sequences: []Sequence = []
+    for at < end {
+        let kind = rest[at]
+        at += 1
+        let size = io.le32(rest, at)
+        if kind == 0 {
+            body = decode_doc(rest[at..at + size])
+            at += size
+        } else {
+            let section = rest[at + 4..at + size]
+            let zero = text.index_byte(str(section), 0)
+            let ident = str(section[..zero])
+            var documents: [][]bson.Field = []
+            var p = zero + 1
+            for p < section.len {
+                let n = io.le32(section, p)
+                push(mut documents, decode_doc(section[p..p + n]))
+                p += n
+            }
+            push(mut sequences, Sequence { ident, documents })
+            at += size
+        }
+    }
+    var name = ""
+    if body.len > 0 {
+        name = body[0].name
+    }
+    let db = mongo.get_text(body, "$db") ?? ""
+    Request { id: io.le32(head, 4), db, name, body, sequences }
+}
+
+fn frame_reply(to: i64, body: []u8) -> []u8 {
+    var b: []u8 = []
+    io.put_le32(mut b, 16 + 4 + 1 + body.len)
+    io.put_le32(mut b, 9000 + to)
+    io.put_le32(mut b, to)
+    io.put_le32(mut b, 2013)
+    io.put_le32(mut b, 0)
+    push(mut b, 0)
+    io.append(mut b, body)
+    b
+}
+
+fn failure(code: i64, name: str, message: str) -> []u8 {
+    encode_doc([mongo.double_of("ok", 0.0), mongo.text_of("errmsg", message), mongo.int_of("code", code), mongo.text_of("codeName", name)])
+}
+
+fn payload_of(req: Request) -> str {
+    let value = bson.get(req.body, "payload") ?? bson.Value.Null
+    match value {
+        Binary(subtype, data) => str(data)
+        _ => ""
+    }
+}
+
+fn sasl_start(n: *Node, req: Request, convo: *Conversation) -> []u8 {
+    let message = payload_of(req)
+    let bare = message[3..]
+    var client_nonce = ""
+    for part in text.split(bare, ',') {
+        if text.starts_with(part, "r=") {
+            client_nonce = part[2..]
+        }
+    }
+    convo.first_bare = bare
+    convo.combined = "{client_nonce}lowfakeservernonce"
+    convo.server_first = "r={convo.combined},s={base64.encode(bytes(salt_text))},i={iterations}"
+    ok_with([mongo.int_of("conversationId", 1), mongo.bool_of("done", false), mongo.binary_of("payload", 0, bytes(convo.server_first))])
+}
+
+fn proof_of(message: str) -> str {
+    for part in text.split(message, ',') {
+        if text.starts_with(part, "p=") {
+            return part[2..]
+        }
+    }
+    ""
+}
+
+fn sasl_continue(w: *World, n: *Node, req: Request, convo: *Conversation) -> []u8 {
+    let message = payload_of(req)
+    let a = hash.sha256()
+    let salted = password.pbkdf2(a, bytes(n.secret), bytes(salt_text), iterations, a.size)
+    let client_key = hash.hmac(a, salted, bytes("Client Key"))
+    let stored = hash.sum(a, client_key)
+    let server_key = hash.hmac(a, salted, bytes("Server Key"))
+    let without_proof = "c=biws,r={convo.combined}"
+    let auth = bytes("{convo.first_bare},{convo.server_first},{without_proof}")
+    let signature = hash.hmac(a, stored, auth)
+    let proof = base64.decode(proof_of(message)) or []
+    var recovered: []u8 = []
+    for i in 0..proof.len {
+        if i < signature.len {
+            push(mut recovered, proof[i] ^ signature[i])
+        }
+    }
+    let valid = recovered.len == a.size && hash.equal(hash.sum(a, recovered), stored) && text.starts_with(message, without_proof)
+    if !valid {
+        note(w, "proof rejected for {n.user}")
+        return failure(18, "AuthenticationFailed", "Authentication failed.")
+    }
+    note(w, "proof accepted for {n.user}")
+    let server_signature = hash.hmac(a, server_key, auth)
+    ok_with([mongo.int_of("conversationId", 1), mongo.bool_of("done", true), mongo.binary_of("payload", 0, bytes("v={base64.encode(server_signature)}"))])
+}
+
+fn next_expected(w: *World, n: *Node, req: Request) -> Expect? {
+    sync.lock(w.lock)
+    var found: Expect? = none
+    if n.at < n.script.len {
+        found = some(n.script[n.at])
+        n.at += 1
+    }
+    sync.unlock(w.lock)
+    found
+}
+
+fn answer(w: *World, index: i64, req: Request, convo: *Conversation, template: str) -> []u8? {
+    let n = w.nodes[index]
+    match req.name {
+        "hello" => return some(hello_reply(w, index, req, template))
+        "saslStart" => return some(sasl_start(n, req, convo))
+        "saslContinue" => return some(sasl_continue(w, n, req, convo))
+        "endSessions" => {
+            sync.lock(w.lock)
+            w.ended += 1
+            sync.unlock(w.lock)
+            return some(ok_with([]))
+        }
+        _ => {}
+    }
+    let next = next_expected(w, n, req)
+    match next {
+        none => {
+            note(w, "unscripted {req.name} on {n.address}")
+            return some(failure(1, "InternalError", "unscripted"))
+        }
+        some(e) => {
+            if e.command != req.name {
+                note(w, "{n.address} got {req.name} where {e.command} was due")
+            }
+            e.on_request(w, req)
+            if e.reply.len == 0 {
+                return none
+            }
+            return some(hex_body(e.reply))
+        }
+    }
+}
+
+struct Templates {
+    standalone: str
+    primary: str
+    secondary: str
+}
+
+fn template_for(w: *World, index: i64, t: Templates) -> str {
+    if !w.replica {
+        return t.standalone
+    }
+    if index == w.primary {
+        return t.primary
+    }
+    t.secondary
+}
+
+fn serve_connection(w: *World, index: i64, t: Templates, h: net.ConnHandle) {
+    using c = net.adopt(h)
+    let reader = io.reader(net.stream(c))
+    let convo = new(Conversation { first_bare: "", server_first: "", combined: "" })
+    for {
+        let req = read_request(reader) or return
+        sync.lock(w.lock)
+        let template = template_for(w, index, t)
+        sync.unlock(w.lock)
+        match answer(w, index, req, convo, template) {
+            none => return
+            some(body) => {
+                net.write_all(c, frame_reply(req.id, body)) or return
+            }
+        }
+    }
+}
+
+fn accept_loop(w: *World, index: i64, t: Templates, l: net.ListenerHandle) {
+    for {
+        let h = net.accept_handle(l) or return
+        sync.lock(w.lock)
+        w.nodes[index].connections += 1
+        sync.unlock(w.lock)
+        spawn serve_connection(w, index, t, h)
+    }
+}
