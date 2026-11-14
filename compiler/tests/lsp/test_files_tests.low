@@ -1,0 +1,279 @@
+import lsp
+import std/file
+import std/json
+import std/path
+import std/testing
+import std/text
+
+const root_source = "import shapes\n\nfn main() {{\n    print(shapes.area(2))\n}}\n"
+const util_source = "pub fn twice(n: i64) -> i64 {{\n    n * 2\n}}\n"
+const shapes_source = "import util\n\npub fn area(n: i64) -> i64 {{\n    util.twice(n)\n}}\n\nfn secret(n: i64) -> i64 {{\n    n + 1\n}}\n"
+const shapes_test_source = "import std/testing\nimport util\n\nfn test_secret(t: *testing.T) {{\n    let found = secret(2)\n    t.equal(found, 3)\n    t.equal(util.twice(2), 4)\n}}\n"
+const lone_source = "fn double(n: i64) -> i64 {{\n    n * 2\n}}\n\nfn main() {{\n    print(double(2))\n}}\n"
+const lone_test_source = "import std/testing\n\nfn test_double(t: *testing.T) {{\n    t.equal(double(2), 4)\n}}\n"
+const bad_signature = "\nfn test_x(n: i64) {{\n}}\n"
+
+struct Project {
+    root: str
+    shapes: Fixture
+    test: Fixture
+}
+
+fn write_source(t: *testing.T, file_path: str, src: str) -> Fixture {
+    file.mkdir_all(path.dir(file_path)) catch {
+        e => testing.must(t, e, {})
+    }
+    file.write_text(file_path, src) catch {
+        e => testing.must(t, e, {})
+    }
+    Fixture { path: file_path, uri: lsp.uri_of(file_path), src }
+}
+
+fn write_project(t: *testing.T) -> Project {
+    let root = scratch_dir(t)
+    write_source(t, path.join([root, "low.mod"]), "")
+    write_source(t, path.join([root, "main.low"]), root_source)
+    write_source(t, path.join([root, "util", "util.low"]), util_source)
+    let shapes = write_source(t, path.join([root, "shapes", "shapes.low"]), shapes_source)
+    let test = write_source(t, path.join([root, "shapes", "shapes_test.low"]), shapes_test_source)
+    Project { root, shapes, test }
+}
+
+fn drop_project(p: Project) {
+    drop_dir(p.root)
+}
+
+fn drop_dir(dir: str) {
+    file.remove_all(dir) catch {
+        _ => {}
+    }
+}
+
+fn no_generated(t: *testing.T, what: str, shown: str) {
+    let leaked = text.contains(shown, "__main") || text.contains(shown, "__tests")
+    testing.error_if(t, leaked, "{what} mentions a generated file: {shown}")
+}
+
+fn no_generated_diagnostics(t: *testing.T, c: *Client) {
+    for uri in c.diagnostics {
+        no_generated(t, "diagnostics", uri)
+    }
+}
+
+fn definition_in(t: *testing.T, c: *Client, f: Fixture, at: lsp.Position, dir: str, want: str) {
+    let loc = definition(c, f, at)
+    let target_path = path_of_location(loc)
+    let line = file_line(t, target_path, start_of(loc).line)
+    let ok = path.base(path.dir(target_path)) == dir && text.contains(line, want)
+    testing.error_if(t, !ok, "definition = {target_path}:{start_of(loc).line} {line}, want {want} in {dir}")
+    no_generated(t, "definition", json.stringify(loc, 0))
+}
+
+fn test_test_file_opens_without_diagnostics(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let p = write_project(t)
+    defer drop_project(p)
+    let opened = open(c, p.test, p.test.src)
+    testing.error_if(t, opened.len != 0, "diagnostics = {opened.len}, want none ({json.stringify(json.Value.Array(opened), 0)})")
+    no_generated_diagnostics(t, c)
+}
+
+fn test_test_file_hover_and_definition(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let p = write_project(t)
+    defer drop_project(p)
+    let opened = open(c, p.test, p.test.src)
+    testing.fatal_if(t, opened.len != 0, "diagnostics = {opened.len}")
+    let cases = [
+        HoverCase { at: fixture_at(t, p.test, "secret(2)", 0), want: "fn secret(n: i64) -> i64" }
+        HoverCase { at: fixture_at(t, p.test, "util.twice(2)", 5), want: "fn twice(n: i64) -> i64" }
+        HoverCase { at: fixture_at(t, p.test, "let found", 4), want: "let found: i64" }
+        HoverCase { at: fixture_at(t, p.test, "fn test_secret", 3), want: "fn test_secret(t: *std/testing.T)" }
+    ]
+    check_hovers(t, c, p.test, cases)
+    definition_in(t, c, p.test, fixture_at(t, p.test, "secret(2)", 0), "shapes", "fn secret")
+    definition_in(t, c, p.test, fixture_at(t, p.test, "util.twice(2)", 5), "util", "fn twice")
+    let local = definition(c, p.test, fixture_at(t, p.test, "t.equal(found", 8))
+    testing.error_if(t, json.text_of(local, "uri") != p.test.uri, "definition of found = {json.text_of(local, "uri")}")
+}
+
+fn test_test_file_references_rename_and_symbols(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let p = write_project(t)
+    defer drop_project(p)
+    open(c, p.test, p.test.src)
+    let found = references(c, p.test, fixture_at(t, p.test, "secret(2)", 0), true)
+    var files: [str: bool] = [:]
+    for loc in found {
+        files[path_of_location(loc)] = true
+    }
+    let in_both = files[p.shapes.path] != none && files[p.test.path] != none
+    testing.error_if(t, found.len != 2 || !in_both, "references of secret = {found.len} in {files.len} files")
+    no_generated(t, "references", json.stringify(json.Value.Array(found), 0))
+    let edited = renamed(c, p.test, fixture_at(t, p.test, "secret(2)", 0), "hidden")
+    let shapes_src = edited_text(edited, p.shapes.path)
+    let test_src = edited_text(edited, p.test.path)
+    let ok = text.contains(shapes_src, "fn hidden(") && text.contains(test_src, "hidden(2)")
+    testing.error_if(t, !ok, "rename of secret:\n{shapes_src}\n{test_src}")
+    let names = symbols(c, p.test)
+    var listed: []str = []
+    for s in names {
+        push(mut listed, json.text_of(s, "name"))
+    }
+    testing.error_if(t, listed.len != 1 || listed[0] != "test_secret", "symbols = {text.join(listed, ", ")}, want test_secret")
+    let workspace = workspace_symbols(c, "__tests")
+    testing.error_if(t, workspace.len != 0, "workspace symbols for __tests = {workspace.len}")
+    let found_in_module = workspace_symbols(c, "secret")
+    no_generated(t, "workspace symbols", json.stringify(json.Value.Array(found_in_module), 0))
+}
+
+fn test_test_file_inlay_hints(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let p = write_project(t)
+    defer drop_project(p)
+    open(c, p.test, p.test.src)
+    let hints = inlay_hints(c, p.test)
+    let label = hint_label(p.test, hints, "    let found = secret(2)")
+    testing.error_if(t, label != ": i64", "hint on let found = {label}, want : i64")
+}
+
+fn test_test_file_diagnostics(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let p = write_project(t)
+    defer drop_project(p)
+    open(c, p.shapes, p.shapes.src)
+    open(c, p.test, p.test.src)
+    let broken = "{p.test.src}{broken_tail}"
+    let got = change(c, p.test, broken)
+    testing.fatal_if(t, got.len != 1, "diagnostics = {got.len}, want one")
+    let want_line = text.count(p.test.src, "\n") + 2
+    let line = start_of(got[0]).line
+    testing.error_if(t, line != want_line, "diagnostic line = {line}, want {want_line} ({json.text_of(got[0], "message")})")
+    let fixed = change(c, p.test, p.test.src)
+    testing.error_if(t, fixed.len != 0, "diagnostics after fix = {fixed.len}, want none")
+    let signature_message = "test function test_x must be declared fn test_x(t: *testing.T)"
+    let wrong = change(c, p.test, "{p.test.src}{bad_signature}")
+    testing.fatal_if(t, wrong.len != 1, "diagnostics for the signature = {wrong.len}, want one")
+    let message = json.text_of(wrong[0], "message")
+    let signature_line = text.count(p.test.src, "\n") + 1
+    testing.error_if(t, !text.contains(message, signature_message), "message = {message}, want {signature_message}")
+    testing.error_if(t, start_of(wrong[0]).line != signature_line, "signature diagnostic line = {start_of(wrong[0]).line}, want {signature_line}")
+    let ordinary = items(c.diagnostics[p.shapes.uri] ?? json.Value.Null)
+    testing.error_if(t, ordinary.len != 0, "ordinary file diagnostics = {ordinary.len}, want none")
+    no_generated_diagnostics(t, c)
+}
+
+fn test_test_file_completion(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let p = write_project(t)
+    defer drop_project(p)
+    open(c, p.test, p.test.src)
+    let found = complete_typing(c, p.test, "t.equal(found, 3)", "    sec")
+    expect(t, found, ["secret", "found", "test_secret", "area"], ["__tests", "__main"])
+    let detail = detail_of(found, "secret")
+    testing.error_if(t, detail != "fn secret(n: i64) -> i64", "secret detail = {detail}")
+    let members = complete_typing(c, p.test, "t.equal(found, 3)", "    util.")
+    expect(t, members, ["twice"], ["secret", "__tests"])
+}
+
+fn test_test_file_follows_module_edits(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let p = write_project(t)
+    defer drop_project(p)
+    let opened = open(c, p.test, p.test.src)
+    testing.fatal_if(t, opened.len != 0, "diagnostics = {opened.len}")
+    open(c, p.shapes, p.shapes.src)
+    let renamed_src = text.replace(p.shapes.src, "fn secret(", "fn hidden(")
+    let before = published(c, p.test.uri)
+    change(c, p.shapes, renamed_src)
+    let broken = await(c, p.test.uri, before)
+    testing.fatal_if(t, broken.len != 1, "test file diagnostics after the module edit = {broken.len}, want one")
+    let want_line = fixture_at(t, p.test, "secret(2)", 0).line
+    testing.error_if(t, start_of(broken[0]).line != want_line, "diagnostic line = {start_of(broken[0]).line}, want {want_line}")
+    let again = published(c, p.test.uri)
+    change(c, p.shapes, p.shapes.src)
+    let fixed = await(c, p.test.uri, again)
+    testing.error_if(t, fixed.len != 0, "test file diagnostics after restoring the module = {fixed.len}, want none")
+}
+
+fn test_test_file_shows_an_error_of_the_module(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let p = write_project(t)
+    defer drop_project(p)
+    open(c, p.test, p.test.src)
+    open(c, p.shapes, p.shapes.src)
+    let before = published(c, p.test.uri)
+    change(c, p.shapes, "{p.shapes.src}{broken_tail}")
+    let got = await(c, p.test.uri, before)
+    testing.fatal_if(t, got.len != 1, "test file diagnostics = {got.len}, want one")
+    let message = json.text_of(got[0], "message")
+    let line = text.count(p.shapes.src, "\n") + 3
+    let prefix = "shapes.low:{line}:"
+    testing.error_if(t, !text.starts_with(message, prefix), "message = {message}, want it to start with {prefix}")
+    testing.error_if(t, start_of(got[0]).line != 0, "diagnostic line = {start_of(got[0]).line}, want 0")
+}
+
+fn test_test_file_builds_with_unsaved_text(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let p = write_project(t)
+    defer drop_project(p)
+    let unsaved = "{p.test.src}\nfn test_extra(t: *testing.T) {{\n    t.equal(secret(1), 2)\n}}\n"
+    let opened = open(c, p.test, unsaved)
+    testing.error_if(t, opened.len != 0, "diagnostics = {opened.len}, want none")
+    let at = lsp.Position { line: text.count(p.test.src, "\n") + 2, character: 12 }
+    let got = hover(c, p.test, at)
+    testing.error_if(t, !text.contains(got, "fn secret(n: i64) -> i64"), "hover in unsaved test = {got}")
+}
+
+fn test_test_file_closes_with_its_diagnostics(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let p = write_project(t)
+    defer drop_project(p)
+    open(c, p.test, p.test.src)
+    let broken = change(c, p.test, "{p.test.src}{broken_tail}")
+    testing.fatal_if(t, broken.len != 1, "diagnostics = {broken.len}, want one")
+    let before = published(c, p.test.uri)
+    close_document(c, p.test)
+    let closed = await(c, p.test.uri, before)
+    testing.error_if(t, closed.len != 0, "diagnostics after close = {closed.len}, want none")
+    let gone = hover(c, p.test, fixture_at(t, p.test, "secret(2)", 0))
+    testing.error_if(t, gone != "", "hover after close = {gone}, want none")
+}
+
+fn test_test_file_at_the_project_root(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let root = scratch_dir(t)
+    defer drop_dir(root)
+    write_source(t, path.join([root, "low.mod"]), "")
+    write_source(t, path.join([root, "lone.low"]), lone_source)
+    let f = write_source(t, path.join([root, "lone_test.low"]), lone_test_source)
+    let opened = open(c, f, f.src)
+    testing.fatal_if(t, opened.len != 0, "diagnostics = {opened.len}")
+    let got = hover(c, f, fixture_at(t, f, "double(2)", 0))
+    testing.error_if(t, !text.contains(got, "fn double(n: i64) -> i64"), "hover = {got}")
+    definition_in(t, c, f, fixture_at(t, f, "double(2)", 0), path.base(root), "fn double")
+}
+
+fn test_test_file_without_a_project(t: *testing.T) {
+    let c = start(t)
+    defer stop(c)
+    let root = scratch_dir(t)
+    defer drop_dir(root)
+    write_source(t, path.join([root, "lone.low"]), lone_source)
+    let f = write_source(t, path.join([root, "lone_test.low"]), lone_test_source)
+    let opened = open(c, f, f.src)
+    testing.fatal_if(t, opened.len != 0, "diagnostics = {opened.len}")
+    let got = hover(c, f, fixture_at(t, f, "double(2)", 0))
+    testing.error_if(t, !text.contains(got, "fn double(n: i64) -> i64"), "hover = {got}")
+}

@@ -1,0 +1,192 @@
+import ast
+import diag
+import target
+import std/builder
+import std/file
+import std/path
+import std/slices
+import std/text
+
+const testing_module = "std/testing"
+const test_prefix = "test_"
+const tested_root = "__root"
+const generated_entry = "__main.low"
+const generated_harness = "__tests.low"
+
+struct Tested {
+    name: str
+    dir: str
+    label: str
+}
+
+pub fn is_test_source(name: str, platform: target.OS) -> bool {
+    text.ends_with(name, ".low") && target.builds(platform, name) && target.is_test(name)
+}
+
+pub fn std_test_modules(platform: target.OS) -> []str {
+    let std = new_std()
+    var found: []str = []
+    for dir in std.dirs {
+        let entries = std.dirs[dir] ?? []
+        if holds_test_source(entries, platform) {
+            push(mut found, dir)
+        }
+    }
+    slices.sort(mut found)
+    found
+}
+
+fn holds_test_source(entries: []file.Entry, platform: target.OS) -> bool {
+    for entry in entries {
+        if !entry.dir && is_test_source(entry.name, platform) {
+            return true
+        }
+    }
+    false
+}
+
+pub fn load_tests(module_path: str, platform: target.OS, std: *Std, docs: *Overlay) -> *Loader ! Error {
+    let l = new(Loader { platform, std, docs })
+    let tested = locate(l, module_path)?
+    l.tested = tested
+    let entry_text = entry_source(tested.name)
+    let entry = generated(l, generated_entry, "", entry_text)?
+    open_module(l, "")
+    link_imports(l, entry, true)?
+    drain(l)?
+    l
+}
+
+fn locate(l: *Loader, module_path: str) -> Tested ! Error {
+    let cleaned = path.clean(module_path)
+    if is_std(cleaned) {
+        l.root = "."
+        return Tested { name: cleaned, dir: cleaned, label: cleaned }
+    }
+    let dir = absolute_path(cleaned)?
+    let info = overlay_stat(l.docs, dir) catch {
+        NotFound => fail Error.Failed("{cleaned}: no such directory")
+        e => fail failed("stat", cleaned, e)
+    }
+    if !info.dir {
+        fail Error.Failed("{cleaned}: not a directory")
+    }
+    l.root = root(l.docs, dir) ?? dir
+    if dir == l.root {
+        return Tested { name: tested_root, dir, label: cleaned }
+    }
+    let name = text.strip_prefix(dir, "{l.root}/") ?? fail Error.Failed("{cleaned}: outside the project root {l.root}")
+    Tested { name, dir, label: cleaned }
+}
+
+fn load_tested(l: *Loader, t: Tested) ! Error {
+    let tree = tree_of(l, t.name)
+    let listing = sources(tree, t.dir, l.platform, true)?
+    if listing.absent {
+        fail Error.Failed("{t.label}: no such module")
+    }
+    if listing.files.len == 0 {
+        fail Error.Failed("{t.label}: no .low files")
+    }
+    module(l, t.name, listing.files, true)?
+    let found = discover(l, t.name)?
+    let harness_text = harness_source(t.name, found)
+    let harness = generated(l, generated_harness, t.name, harness_text)?
+    link_imports(l, harness, false)?
+}
+
+fn generated(l: *Loader, file_name: str, module_name: str, src: str) -> *ast.File ! Error {
+    let f = parse_source(src, file_name, true)?
+    f.module = module_name
+    push(mut l.files, f)
+    f
+}
+
+fn discover(l: *Loader, module_name: str) -> []TestFunc ! Error {
+    var found: []TestFunc = []
+    for f in l.files {
+        if f.module == module_name && target.is_test(path.base(f.path)) {
+            collect_tests(f, module_name, mut found)?
+        }
+    }
+    found
+}
+
+struct TestFunc {
+    name: str
+    file: str
+    line: i64
+}
+
+fn collect_tests(f: *ast.File, module_name: str, mut found: []TestFunc) ! Error {
+    let alias = testing_alias(f, module_name)
+    for func in f.funcs {
+        if text.starts_with(func.name, test_prefix) {
+            if !is_test_function(func, alias) {
+                fail Error.Diag(diag.Error.At(func.pos, "test function {func.name} must be declared fn {func.name}(t: *testing.T)"))
+            }
+            push(mut found, TestFunc { name: func.name, file: f.path, line: func.pos.line })
+        }
+    }
+}
+
+fn testing_alias(f: *ast.File, module_name: str) -> str? {
+    if module_name == testing_module {
+        return ""
+    }
+    for imp in f.imports {
+        if imp.path == testing_module {
+            return imp.alias
+        }
+    }
+    none
+}
+
+fn is_test_function(func: *ast.Func, alias: str?) -> bool {
+    let wanted = alias ?? return false
+    if func.name.len == test_prefix.len || func.type_params.len > 0 || func.variadic || func.result != none || func.error != none {
+        return false
+    }
+    if func.params.len != 1 || func.params[0].mutable {
+        return false
+    }
+    let param = func.params[0].type_name ?? return false
+    let elem = param.elem ?? return false
+    param.is_pointer && !param.is_optional && !elem.is_pointer && !elem.is_optional && !elem.is_slice && !elem.is_map && !elem.is_func && elem.name == "T" && elem.module == wanted && elem.args.len == 0
+}
+
+fn entry_source(tested_name: str) -> str {
+    var b = builder.builder()
+    b.write("import __testing = {testing_module}\n")
+    b.write("import __tested = {tested_name}\n\n")
+    b.write("fn main() {{\n")
+    b.write("    __testing.run(__tested.__tests())\n")
+    b.write("}}\n")
+    b.to_str()
+}
+
+fn literal(s: str) -> str {
+    let quoted = diag.quote(s)
+    let opened = text.replace(quoted, "{{", "{{{{")
+    text.replace(opened, "}}", "}}}}")
+}
+
+fn harness_source(module_name: str, found: []TestFunc) -> str {
+    var qualifier = "__testing."
+    var b = builder.builder()
+    if module_name == testing_module {
+        qualifier = ""
+    } else {
+        b.write("import __testing = {testing_module}\n\n")
+    }
+    b.write("pub fn __tests() -> []{qualifier}Test {{\n")
+    b.write("    [\n")
+    for t in found {
+        let name = literal(t.name[test_prefix.len..])
+        let file = literal(t.file)
+        b.write("        {qualifier}Test {{ name: {name}, run: {t.name}, file: {file}, line: {t.line} }}\n")
+    }
+    b.write("    ]\n")
+    b.write("}}\n")
+    b.to_str()
+}
