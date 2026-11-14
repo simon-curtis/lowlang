@@ -1,0 +1,81 @@
+import std/file
+import std/io
+import std/net
+import std/process
+import std/testing
+
+const oracle_server = "/usr/lib/ssh/sftp-server"
+
+fn test_permission_bits_follow_the_requests(t: *testing.T) {
+    let root = file.temp_dir("sftp-modes") or panic("temp dir")
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_in(net.stream(ends.second), root)
+    using client = connect(net.stream(ends.first)) or panic("connect")
+    let c = client.handle
+    write_file(c, "created.txt", bytes("payload"), 0o640) or panic("write_file")
+    let created = stat(c, "created.txt") or panic("stat")
+    testing.error_if(t, (created.permissions ?? 0) & 0o777 != 0o640, "created with mode {created.permissions ?? 0}")
+    set_attrs(c, "created.txt", Attrs { permissions: 0o600 }) or panic("set_attrs")
+    let changed = stat(c, "created.txt") or panic("stat")
+    testing.error_if(t, (changed.permissions ?? 0) & 0o777 != 0o600, "setstat mode {changed.permissions ?? 0}")
+    using f = open_file(c, "created.txt", OpenFlags { read: true, write: true }, Attrs {}) or panic("open")
+    set_file_attrs(f, Attrs { permissions: 0o644 }) or panic("fsetstat")
+    let again = fstat(f) or panic("fstat")
+    testing.error_if(t, (again.permissions ?? 0) & 0o777 != 0o644, "fsetstat mode {again.permissions ?? 0}")
+    mkdir(c, "private", 0o700) or panic("mkdir")
+    let directory = stat(c, "private") or panic("stat")
+    testing.error_if(t, (directory.permissions ?? 0) & 0o777 != 0o700, "mkdir mode {directory.permissions ?? 0}")
+    file.remove_all(root) or panic("remove")
+}
+
+fn oracle_stream(child: process.Child) -> io.Stream {
+    let to_server = child.handle.stdin ?? panic("stdin")
+    let from_server = child.handle.stdout ?? panic("stdout")
+    io.Stream { read: from_server.read, write: to_server.write, close: fn() { to_server.close() } }
+}
+
+fn test_client_against_the_openssh_server(t: *testing.T) {
+    if !file.exists(oracle_server) {
+        testing.skip(t, "{oracle_server} is not installed")
+    }
+    let root = file.temp_dir("sftp-oracle") or panic("temp dir")
+    file.write_text("{root}/existing.txt", "from disk") or panic("seed")
+    file.mkdir("{root}/dir") or panic("seed dir")
+    file.write_text("{root}/dir/one", "1") or panic("seed one")
+    file.write_text("{root}/dir/two", "22") or panic("seed two")
+    let command = process.Command {
+        program: oracle_server
+        args: ["-d", root]
+        stdin: process.Stdio.Piped
+        stdout: process.Stdio.Piped
+        stderr: process.Stdio.Null
+    }
+    using child = process.start(command) or panic("start sftp-server")
+    using client = connect(oracle_stream(child)) or panic("connect")
+    let c = client.handle
+    for name in ["posix-rename@openssh.com", "statvfs@openssh.com", "hardlink@openssh.com", "fsync@openssh.com", "limits@openssh.com"] {
+        testing.error_if(t, !supports(c, name), "{name} must be announced by OpenSSH")
+    }
+    let existing = read_file(c, "existing.txt") or panic("read")
+    testing.error_if(t, str(existing) != "from disk", "read {str(existing)}")
+    let listed = list(c, "dir") or panic("list")
+    testing.error_if(t, names_of(listed) != "one,two,", "listing {names_of(listed)}")
+    let big = pattern(3 * 1024 * 1024 + 17, 11)
+    write_file(c, "big.bin", big, 0o644) or panic("write big")
+    let on_disk = file.read_file("{root}/big.bin") or panic("disk")
+    testing.error_if(t, !same(on_disk, big), "OpenSSH stored different bytes")
+    let back = read_file(c, "big.bin") or panic("read big")
+    testing.error_if(t, !same(back, big), "OpenSSH returned different bytes")
+    mkdir(c, "made", 0o755) or panic("mkdir")
+    rename(c, "existing.txt", "made/renamed.txt") or panic("rename")
+    symlink(c, "renamed.txt", "made/link") or panic("symlink")
+    let target = read_link(c, "made/link") or panic("read_link")
+    testing.error_if(t, target != "renamed.txt", "link target {target}")
+    posix_rename(c, "made/renamed.txt", "made/final.txt") or panic("posix_rename")
+    let vfs = statvfs(c, ".") or panic("statvfs")
+    testing.error_if(t, vfs.blocks <= 0, "statvfs blocks {vfs.blocks}")
+    let info = stat(c, "made/final.txt") or panic("stat")
+    testing.error_if(t, info.size != 9, "size {info.size ?? -1}")
+    expect_failure(t, "stat of a missing path", "NotFound", stat_failure(c, "gone"))
+    file.remove_all(root) or panic("remove")
+}

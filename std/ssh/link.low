@@ -1,0 +1,331 @@
+import std/crypto
+import std/io
+import std/ssh/key
+import std/ssh/wire
+import std/sync
+import std/text
+import std/time
+
+const msg_disconnect: u8 = 1
+const msg_ignore: u8 = 2
+const msg_unimplemented: u8 = 3
+const msg_debug: u8 = 4
+const msg_service_request: u8 = 5
+const msg_service_accept: u8 = 6
+const msg_ext_info: u8 = 7
+const msg_kexinit: u8 = 20
+const msg_newkeys: u8 = 21
+const msg_kex_reply: u8 = 31
+
+const version_line = "SSH-2.0-Low_1.0"
+const sequence_mask = 0xFFFFFFFF
+const max_version_line = 255
+const max_ignored_lines = 1024
+
+struct Setup {
+    client: bool
+    algorithms: Algorithms
+    signers: []key.Signer
+    verify: fn(key.PublicKey) -> bool
+    rekey_bytes: i64
+    rekey_millis: i64
+}
+
+struct Link {
+    stream: io.Stream
+    reader: *io.Reader
+    client: bool
+    algorithms: Algorithms
+    signers: []key.Signer
+    verify: fn(key.PublicKey) -> bool
+    rekey_bytes: i64
+    rekey_millis: i64
+    lock: sync.Mutex
+    outbound: *Protection
+    inbound: *Protection
+    out_seq: i64
+    in_seq: i64
+    strict: bool
+    ext_info: bool
+    first: bool
+    session_id: []u8
+    local_version: str
+    peer_version: str
+    holding: bool
+    held: [][]u8
+    local: Proposal
+    local_init: []u8
+    out_bytes: i64
+    in_bytes: i64
+    keyed_at: i64
+    peer_sig_algs: []str
+    exchanges: i64
+    failure: Error?
+}
+
+fn signer_names(s: key.Signer) -> []str {
+    var out: []str = []
+    for name in key.signature_algorithms(s.public.material) {
+        push(mut out, key.offered_name(s.public, name))
+    }
+    out
+}
+
+fn host_key_algorithms(signers: []key.Signer, wanted: []str) -> []str {
+    var out: []str = []
+    for s in signers {
+        for name in signer_names(s) {
+            let allowed = wanted.len == 0 || wire.has_name(wanted, name)
+            if allowed && !wire.has_name(out, name) {
+                push(mut out, name)
+            }
+        }
+    }
+    out
+}
+
+fn new_link(stream: io.Stream, setup: Setup) -> *Link {
+    var algorithms = setup.algorithms
+    if !setup.client {
+        algorithms.host_keys = host_key_algorithms(setup.signers, setup.algorithms.host_keys)
+    }
+    new(Link {
+        stream
+        reader: io.reader(stream)
+        client: setup.client
+        algorithms
+        signers: setup.signers
+        verify: setup.verify
+        rekey_bytes: setup.rekey_bytes
+        rekey_millis: setup.rekey_millis
+        lock: sync.mutex()
+        outbound: plain()
+        inbound: plain()
+        out_seq: 0
+        in_seq: 0
+        strict: false
+        ext_info: false
+        first: true
+        session_id: []
+        local_version: version_line
+        peer_version: ""
+        holding: false
+        held: []
+        local: proposal_for(algorithms, setup.client, true)
+        local_init: []
+        out_bytes: 0
+        in_bytes: 0
+        keyed_at: time.now_millis()
+        peer_sig_algs: []
+        exchanges: 0
+        failure: none
+    })
+}
+
+fn write_all(l: *Link, data: []u8) ! Error {
+    io.write_all(l.stream, data) catch Io
+}
+
+fn send_locked(l: *Link, payload: []u8) ! Error {
+    let packet = seal(l.outbound, l.out_seq, payload)?
+    write_all(l, packet)?
+    l.out_seq = (l.out_seq + 1) & sequence_mask
+    l.out_bytes += packet.len
+}
+
+fn send_direct(l: *Link, payload: []u8) ! Error {
+    sync.lock(l.lock)
+    defer sync.unlock(l.lock)
+    send_locked(l, payload)?
+}
+
+fn send(l: *Link, payload: []u8) ! Error {
+    sync.lock(l.lock)
+    defer sync.unlock(l.lock)
+    if l.holding {
+        push(mut l.held, payload)
+        return
+    }
+    send_locked(l, payload)?
+    if rekey_due(l) {
+        begin_kex_locked(l)?
+    }
+}
+
+fn rekey_due(l: *Link) -> bool {
+    if l.holding || l.first {
+        return false
+    }
+    l.out_bytes + l.in_bytes >= l.rekey_bytes || time.now_millis() - l.keyed_at >= l.rekey_millis
+}
+
+fn begin_kex_locked(l: *Link) ! Error {
+    if l.holding {
+        return
+    }
+    l.local = proposal_for(l.algorithms, l.client, l.first)
+    l.local_init = encode_proposal(l.local)
+    l.holding = true
+    send_locked(l, l.local_init)?
+}
+
+fn begin_kex(l: *Link) ! Error {
+    sync.lock(l.lock)
+    defer sync.unlock(l.lock)
+    begin_kex_locked(l)?
+}
+
+fn read_packet(l: *Link) -> []u8 ! Error {
+    let payload = open(l.inbound, l.in_seq, l.reader)?
+    l.in_seq = (l.in_seq + 1) & sequence_mask
+    l.in_bytes += payload.len
+    if payload.len == 0 {
+        fail Malformed
+    }
+    payload
+}
+
+fn disconnected(payload: []u8) -> Error {
+    let r = wire.reader(payload[1..])
+    let code = wire.read_u32(r) or return Malformed
+    let reason = wire.read_str(r) or return Malformed
+    Disconnected(code, reason)
+}
+
+fn exchange_versions(l: *Link) ! Error {
+    write_all(l, bytes("{l.local_version}\r\n"))?
+    var skipped = 0
+    for {
+        let line = io.read_line(l.reader) catch Io
+        if line.len > max_version_line {
+            fail BadVersion
+        }
+        if text.starts_with(line, "SSH-") {
+            if !text.starts_with(line, "SSH-2.0-") && !text.starts_with(line, "SSH-1.99-") {
+                fail BadVersion
+            }
+            l.peer_version = line
+            return
+        }
+        if !l.client {
+            fail BadVersion
+        }
+        skipped += 1
+        if skipped > max_ignored_lines {
+            fail BadVersion
+        }
+    }
+}
+
+fn kex_packet(l: *Link) -> []u8 ! Error {
+    for {
+        let p = read_packet(l)?
+        let kind = p[0]
+        if kind == msg_disconnect {
+            fail disconnected(p)
+        }
+        let transport = kind == msg_ignore || kind == msg_debug || kind == msg_unimplemented
+        if l.strict && l.first {
+            let allowed = kind == msg_newkeys || (kind >= 30 && kind <= 49)
+            if !allowed {
+                fail StrictKex
+            }
+        }
+        if transport {
+            continue
+        }
+        return p
+    }
+}
+
+fn pick_signer(l: *Link, algorithm: str) -> key.Signer ! Error {
+    for s in l.signers {
+        if wire.has_name(signer_names(s), algorithm) {
+            return s
+        }
+    }
+    fail Invalid
+}
+
+fn field_for(spec: KexSpec, r: *wire.Reader) -> []u8 ! Error {
+    match spec.kind {
+        Dh(_) => wire.read_mpint(r) catch Io
+        _ => wire.read_string(r) catch Io
+    }
+}
+
+fn reply_message(spec: KexSpec, host_blob: []u8, field: []u8, signature: []u8) -> []u8 {
+    var out: []u8 = [msg_kex_reply]
+    wire.put_string(mut out, host_blob)
+    put_field(spec, mut out, field)
+    wire.put_string(mut out, signature)
+    out
+}
+
+struct Exchanged {
+    h: []u8
+    k: []u8
+}
+
+fn client_exchange(l: *Link, n: Negotiated, peer_init: []u8) -> Exchanged ! Error {
+    let start = client_start(n.kex)?
+    send_direct(l, client_init_message(start))?
+    let reply = kex_packet(l)?
+    if reply[0] != msg_kex_reply {
+        fail Protocol
+    }
+    let r = wire.reader(reply[1..])
+    let host_blob = wire.read_string(r) catch Io
+    let field = field_for(n.kex, r)?
+    let signature = wire.read_string(r) catch Io
+    wire.finish(r) catch Io
+    let shared = client_finish(start, field)?
+    let transcript = Transcript {
+        client_version: l.local_version
+        server_version: l.peer_version
+        client_init: l.local_init
+        server_init: peer_init
+        host_key: host_blob
+    }
+    let h = exchange_hash(n.kex, transcript, start.field, field, shared.k)
+    let host = key.parse_blob(host_blob) catch Key
+    if !l.verify(host) {
+        fail HostKeyRejected
+    }
+    let signature_algorithm = key.signature_name(n.host_key)
+    if key.offered_name(host, signature_algorithm) != n.host_key || !key.verify(host, signature_algorithm, h, signature) {
+        fail BadSignature
+    }
+    Exchanged { h, k: shared.k }
+}
+
+fn server_exchange(l: *Link, n: Negotiated, peer_init: []u8) -> Exchanged ! Error {
+    let init = kex_packet(l)?
+    if init[0] != 30 {
+        fail Protocol
+    }
+    let r = wire.reader(init[1..])
+    let client_field = field_for(n.kex, r)?
+    wire.finish(r) catch Io
+    let responded = server_respond(n.kex, client_field)?
+    let signer = pick_signer(l, n.host_key)?
+    let transcript = Transcript {
+        client_version: l.peer_version
+        server_version: l.local_version
+        client_init: peer_init
+        server_init: l.local_init
+        host_key: signer.public.blob
+    }
+    let h = exchange_hash(n.kex, transcript, client_field, responded.field, responded.shared)
+    let signature = signer.sign(key.signature_name(n.host_key), h) catch Key
+    send_direct(l, reply_message(n.kex, signer.public.blob, responded.field, signature))?
+    Exchanged { h, k: responded.shared }
+}
+
+fn derived(n: Negotiated, x: Exchanged, session_id: []u8, letter: u8, length: i64) -> []u8 {
+    if length == 0 {
+        return []
+    }
+    derive(n.kex.hash, x.k, x.h, letter, session_id, length)
+}
+

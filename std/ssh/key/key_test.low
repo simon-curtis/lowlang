@@ -1,0 +1,169 @@
+import std/crypto
+import std/crypto/x509
+import std/file
+import std/slices
+import std/testing
+import std/text
+
+const vectors = "testdata/ssh"
+
+fn read_text(name: str) -> str {
+    file.read_text("{vectors}/{name}") catch { e => panic("read {name}: {e}") }
+}
+
+fn public_of_file(name: str) -> PublicKey {
+    let parsed = parse_line(read_text("{name}.pub")) or panic("parse {name}.pub")
+    parsed.key
+}
+
+fn expected_fingerprint(name: str) -> str {
+    let fields = text.fields(read_text("{name}.fingerprint"))
+    fields[1]
+}
+
+fn failure_name(e: Error) -> str {
+    match e {
+        Malformed => "Malformed"
+        Unsupported => "Unsupported"
+        Invalid => "Invalid"
+        Encrypted => "Encrypted"
+        WrongPassphrase => "WrongPassphrase"
+        Io(_) => "Io"
+        Untrusted => "Untrusted"
+        Expired => "Expired"
+        Principal => "Principal"
+    }
+}
+
+fn load_failure(name: str, passphrase: str) -> str {
+    let loaded = load_private_key("{vectors}/{name}", passphrase) catch { e => return failure_name(e) }
+    ""
+}
+
+fn line_failure(line: str) -> str {
+    let parsed = parse_line(line) catch { e => return failure_name(e) }
+    ""
+}
+
+fn check_failure(k: PublicKey, authorities: []PublicKey, principal: str, cert_type: i64, now: i64) -> str {
+    check_certificate(k, authorities, principal, cert_type, now) catch { e => return failure_name(e) }
+    ""
+}
+
+fn test_fingerprints_match_ssh_keygen(t: *testing.T) {
+    for name in ["ed25519", "ed25519_encrypted", "ecdsa256", "ecdsa384", "rsa2048", "rsa_encrypted", "ca", "host"] {
+        let k = public_of_file(name)
+        testing.error_if(t, fingerprint(k) != expected_fingerprint(name), "fingerprint of {name}")
+    }
+}
+
+fn test_format_line_round_trips(t: *testing.T) {
+    for name in ["ed25519", "ecdsa256", "ecdsa384", "rsa2048"] {
+        let line = read_text("{name}.pub")
+        let parsed = parse_line(line) or panic("parse")
+        let want = text.trim(line)
+        testing.error_if(t, format_line(parsed.key, parsed.comment) != want, "format of {name}")
+    }
+}
+
+fn sign_and_verify(t: *testing.T, name: str, algorithm: str, private: x509.PrivateKey) {
+    let public = public_of_file(name)
+    let derived = public_of(private) or panic("public_of")
+    testing.error_if(t, !equal(derived, public), "{name}: private key does not match its public key")
+    let data = bytes("signed by {name}")
+    let blob = sign(private, algorithm, data) or panic("sign")
+    testing.error_if(t, !verify(public, algorithm, data, blob), "{name}: signature must verify")
+    testing.error_if(t, verify(public, algorithm, bytes("other"), blob), "{name}: signature must not verify other data")
+}
+
+fn test_unencrypted_private_keys(t: *testing.T) {
+    let cases = [
+        ["ed25519", "ssh-ed25519"]
+        ["ecdsa256", "ecdsa-sha2-nistp256"]
+        ["ecdsa384", "ecdsa-sha2-nistp384"]
+        ["rsa2048", "rsa-sha2-256"]
+        ["rsa2048", "rsa-sha2-512"]
+        ["rsa_pem", "rsa-sha2-256"]
+        ["ecdsa_pem", "ecdsa-sha2-nistp256"]
+    ]
+    for c in cases {
+        let private = load_private_key("{vectors}/{c[0]}", "") or panic("load {c[0]}")
+        sign_and_verify(t, c[0], c[1], private)
+    }
+}
+
+fn test_encrypted_private_keys(t: *testing.T) {
+    for name in ["ed25519_encrypted", "rsa_encrypted"] {
+        let algorithm = if name == "rsa_encrypted" { "rsa-sha2-512" } else { "ssh-ed25519" }
+        let private = load_private_key("{vectors}/{name}", "correct horse") or panic("load {name}")
+        sign_and_verify(t, name, algorithm, private)
+        testing.error_if(t, load_failure(name, "wrong") != "WrongPassphrase", "{name}: wrong passphrase")
+        testing.error_if(t, load_failure(name, "") != "Encrypted", "{name}: no passphrase")
+    }
+}
+
+fn test_user_certificate(t: *testing.T) {
+    let k = public_of_file("ed25519-cert")
+    let ca = public_of_file("ca")
+    let c = match k.certificate {
+        some(c) => c
+        none => panic("no certificate")
+    }
+    testing.error_if(t, c.key_id != "user-cert-id", "key id")
+    testing.error_if(t, c.serial != 7, "serial")
+    testing.error_if(t, c.cert_type != user_certificate, "type")
+    testing.error_if(t, !slices.equal(c.principals, ["alice", "bob"]), "principals")
+    testing.error_if(t, c.valid_after != 1767225600, "valid after")
+    testing.error_if(t, c.valid_before != 2114294400, "valid before")
+    let plain = public_of_file("ed25519")
+    let same_material = match c.key.material {
+        Ed25519(a) => match plain.material {
+            Ed25519(b) => slices.equal(a, b)
+            _ => false
+        }
+        _ => false
+    }
+    testing.error_if(t, !same_material, "certified key material")
+    testing.error_if(t, !certificate_signed_by(k, ca), "signed by the CA")
+    testing.error_if(t, certificate_signed_by(k, public_of_file("ed25519")), "not signed by another key")
+    testing.error_if(t, c.critical_options.len != 1 || c.critical_options[0].name != "force-command", "critical options")
+    let now = 1800000000
+    testing.error_if(t, check_failure(k, [ca], "alice", user_certificate, now) != "", "valid certificate")
+    testing.error_if(t, check_failure(k, [ca], "carol", user_certificate, now) != "Principal", "principal")
+    testing.error_if(t, check_failure(k, [ca], "alice", host_certificate, now) != "Invalid", "type")
+    testing.error_if(t, check_failure(k, [public_of_file("host")], "alice", user_certificate, now) != "Untrusted", "authority")
+    testing.error_if(t, check_failure(k, [ca], "alice", user_certificate, 1700000000) != "Expired", "before the window")
+    testing.error_if(t, check_failure(k, [ca], "alice", user_certificate, 2200000000) != "Expired", "after the window")
+}
+
+fn test_host_certificate(t: *testing.T) {
+    let k = public_of_file("host-cert")
+    let ca = public_of_file("ca")
+    let now = 1800000000
+    testing.error_if(t, check_failure(k, [ca], "example.test", host_certificate, now) != "", "valid host certificate")
+    testing.error_if(t, check_failure(k, [ca], "other.test", host_certificate, now) != "Principal", "host principal")
+}
+
+fn test_expired_and_rsa_certificates(t: *testing.T) {
+    let ca = public_of_file("ca")
+    let expired = public_of_file("ecdsa256_expired-cert")
+    testing.error_if(t, check_failure(expired, [ca], "alice", user_certificate, 1800000000) != "Expired", "expired certificate")
+    let rsa_cert = public_of_file("rsa2048-cert")
+    testing.error_if(t, check_failure(rsa_cert, [ca], "alice", user_certificate, 1800000000) != "", "rsa certificate")
+    let plain = public_of_file("rsa2048")
+    testing.error_if(t, check_failure(plain, [ca], "alice", user_certificate, 1800000000) != "Invalid", "not a certificate")
+}
+
+fn test_certificate_tamper_detected(t: *testing.T) {
+    let parsed = parse_line(read_text("ed25519-cert.pub")) or panic("parse")
+    let blob = slices.clone(parsed.key.blob)
+    blob[blob.len / 2] ^= 1
+    let k = parse_blob(blob) catch { e => return }
+    testing.error_if(t, certificate_signed_by(k, public_of_file("ca")), "tampered certificate verified")
+}
+
+fn test_malformed_lines(t: *testing.T) {
+    for line in ["", "ssh-ed25519", "ssh-ed25519 !!!!", "ssh-rsa AAAA", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAA"] {
+        testing.error_if(t, line_failure(line) == "", "accepted {line}")
+    }
+}

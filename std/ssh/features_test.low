@@ -1,0 +1,422 @@
+import std/crypto/x509
+import std/io
+import std/net
+import std/slices
+import std/ssh/key
+import std/testing
+import std/time
+import std/time/duration
+
+fn connect_error(client_config: ClientConfig, server_config: ServerConfig) -> str {
+    using ends = net.socketpair() or panic("socketpair")
+    let report = chan[str](1)
+    spawn serve_report(net.stream(ends.second), server_config, report)
+    using conn = client(net.stream(ends.first), client_config) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn echo_roundtrip(t: *testing.T, name: str, client_config: ClientConfig, server_config: ServerConfig) {
+    testing.sub(t, name, fn(t) {
+        using ends = net.socketpair() or panic("socketpair")
+        let report = chan[str](1)
+        spawn serve_report(net.stream(ends.second), server_config, report)
+        using conn = client(net.stream(ends.first), client_config) or panic("client")
+        let result = exec(conn, "echo hello") or panic("exec")
+        testing.error_if(t, !slices.equal(result.stdout, bytes("hello\n")), "stdout")
+        testing.error_if(t, result.status.code != 0, "status")
+    })
+}
+
+fn test_every_host_key_algorithm(t: *testing.T) {
+    let cases = [
+        ["ed25519", "ssh-ed25519", "ssh-ed25519"]
+        ["ecdsa256", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp256"]
+        ["ecdsa384", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp384"]
+        ["rsa2048", "rsa-sha2-256", "ssh-rsa"]
+        ["rsa2048", "rsa-sha2-512", "ssh-rsa"]
+    ]
+    for c in cases {
+        let seen = chan[str](1)
+        let client_config = ClientConfig {
+            user: "alice"
+            verify_host_key: fn(k) {
+                seen <- k.kind
+                true
+            }
+            auth: [AuthMethod.Password("secret")]
+            algorithms: Algorithms { host_keys: [c[1]] }
+        }
+        echo_roundtrip(t, "{c[0]} {c[1]}", client_config, base_server([load_signer(c[0])], password_auth()))
+        let kind = <-seen
+        testing.error_if(t, (kind ?? "") != c[2], "host key kind")
+    }
+}
+
+fn test_server_offers_only_its_host_key_types(t: *testing.T) {
+    let client_config = ClientConfig {
+        user: "alice"
+        verify_host_key: accept_any_host_key()
+        auth: [AuthMethod.Password("secret")]
+        algorithms: Algorithms { host_keys: ["ecdsa-sha2-nistp256"] }
+    }
+    let failure = connect_error(client_config, base_server([load_signer("ed25519")], password_auth()))
+    testing.error_if(t, failure != "NoCommonAlgorithm", "got {failure}")
+}
+
+fn certificate_authority_entries() -> []key.KnownHost {
+    let ca = load_public("ca")
+    key.parse_known_hosts("@cert-authority *.test {key.format_line(ca, "")}\n") or panic("known hosts")
+}
+
+fn host_certificate_signer() -> key.Signer {
+    key.certified_signer(load_private("host"), load_public("host-cert")) or panic("certified signer")
+}
+
+fn test_host_certificate(t: *testing.T) {
+    let entries = certificate_authority_entries()
+    let client_config = ClientConfig {
+        user: "alice"
+        verify_host_key: key.known_hosts_verifier(entries, "example.test", 22)
+        auth: [AuthMethod.Password("secret")]
+        algorithms: Algorithms { host_keys: ["ssh-ed25519-cert-v01@openssh.com"] }
+    }
+    echo_roundtrip(t, "certificate for the host", client_config, base_server([host_certificate_signer()], password_auth()))
+    let wrong_host = ClientConfig {
+        user: "alice"
+        verify_host_key: key.known_hosts_verifier(entries, "other.test", 22)
+        auth: [AuthMethod.Password("secret")]
+        algorithms: Algorithms { host_keys: ["ssh-ed25519-cert-v01@openssh.com"] }
+    }
+    let failure = connect_error(wrong_host, base_server([host_certificate_signer()], password_auth()))
+    testing.error_if(t, failure != "HostKeyRejected", "certificate for another host: {failure}")
+}
+
+fn certificate_auth() -> ServerAuth {
+    let authorities = [load_public("ca")]
+    ServerAuth {
+        methods: ["publickey"]
+        public_key: fn(user, k) {
+            key.check_certificate(k, authorities, user, key.user_certificate, time.now()) catch {
+                e => return false
+            }
+            true
+        }
+    }
+}
+
+fn test_user_certificate(t: *testing.T) {
+    let signer = key.certified_signer(load_private("ed25519"), load_public("ed25519-cert")) or panic("certified signer")
+    echo_roundtrip(t, "principal listed", base_client([AuthMethod.PublicKey(signer)]), base_server([load_signer("ed25519")], certificate_auth()))
+    let carol = ClientConfig { user: "carol", verify_host_key: accept_any_host_key(), auth: [AuthMethod.PublicKey(signer)] }
+    let refused = connect_error(carol, base_server([load_signer("ed25519")], certificate_auth()))
+    testing.error_if(t, refused != "AuthFailed", "principal not listed: {refused}")
+    let plain = key.signer(load_private("ed25519")) or panic("signer")
+    let uncertified = connect_error(base_client([AuthMethod.PublicKey(plain)]), base_server([load_signer("ed25519")], certificate_auth()))
+    testing.error_if(t, uncertified != "AuthFailed", "key without certificate: {uncertified}")
+}
+
+fn test_host_key_rejected_and_bad_signature(t: *testing.T) {
+    let rejecting = ClientConfig { user: "alice", verify_host_key: fn(k) { false }, auth: [AuthMethod.Password("secret")] }
+    let rejected = connect_error(rejecting, base_server([load_signer("ed25519")], password_auth()))
+    testing.error_if(t, rejected != "HostKeyRejected", "got {rejected}")
+    let host = load_signer("ed25519")
+    let forged = key.Signer { public: host.public, sign: fn(algorithm, data) { host.sign(algorithm, bytes("not the exchange hash")) } }
+    let bad = connect_error(base_client([AuthMethod.Password("secret")]), base_server([forged], password_auth()))
+    testing.error_if(t, bad != "BadSignature", "got {bad}")
+    let other = load_signer("ecdsa256")
+    let swapped = key.Signer { public: other.public, sign: fn(algorithm, data) { host.sign(algorithm, data) } }
+    let mismatched = connect_error(base_client([AuthMethod.Password("secret")]), base_server([swapped], password_auth()))
+    testing.error_if(t, mismatched == "", "a signature by another key must not verify")
+}
+
+fn test_auth_methods(t: *testing.T) {
+    let hosts = [load_signer("ed25519")]
+    let open_door = ServerAuth { methods: ["none"] }
+    echo_roundtrip(t, "none", base_client([]), base_server(hosts, open_door))
+    let interactive = ServerAuth {
+        methods: ["keyboard-interactive"]
+        keyboard_interactive: fn(user, ask) {
+            let answers = ask("login", "enter the pin", [Prompt { text: "pin", echo: false }])
+            answers.len == 1 && answers[0] == "1234"
+        }
+    }
+    let right = AuthMethod.KeyboardInteractive(fn(name, instruction, prompts) { ["1234"] })
+    echo_roundtrip(t, "keyboard-interactive", base_client([right]), base_server(hosts, interactive))
+    let wrong = AuthMethod.KeyboardInteractive(fn(name, instruction, prompts) { ["0000"] })
+    testing.error_if(t, connect_error(base_client([wrong]), base_server(hosts, interactive)) != "AuthFailed", "wrong pin")
+    let user_key = load_public("ed25519")
+    let by_key = ServerAuth { methods: ["publickey"], public_key: fn(user, k) { key.equal(k, user_key) } }
+    let signer = load_signer("ed25519")
+    echo_roundtrip(t, "publickey", base_client([AuthMethod.PublicKey(signer)]), base_server(hosts, by_key))
+    let stranger = load_signer("ecdsa256")
+    testing.error_if(t, connect_error(base_client([AuthMethod.PublicKey(stranger)]), base_server(hosts, by_key)) != "AuthFailed", "unlisted key")
+}
+
+fn test_partial_success_and_method_order(t: *testing.T) {
+    let hosts = [load_signer("ed25519")]
+    let user_key = load_public("ed25519")
+    let both = ServerAuth {
+        methods: ["publickey", "password"]
+        required: ["publickey", "password"]
+        public_key: fn(user, k) { key.equal(k, user_key) }
+        password: fn(user, password) { password == "secret" }
+    }
+    let signer = load_signer("ed25519")
+    echo_roundtrip(t, "key then password", base_client([AuthMethod.PublicKey(signer), AuthMethod.Password("secret")]), base_server(hosts, both))
+    echo_roundtrip(t, "password then key", base_client([AuthMethod.Password("secret"), AuthMethod.PublicKey(signer)]), base_server(hosts, both))
+    let only_key = connect_error(base_client([AuthMethod.PublicKey(signer)]), base_server(hosts, both))
+    testing.error_if(t, only_key != "AuthFailed", "one method of two: {only_key}")
+    let retry = [AuthMethod.Password("wrong"), AuthMethod.Password("secret")]
+    echo_roundtrip(t, "retry after a failure", base_client(retry), base_server(hosts, password_auth()))
+}
+
+fn test_banner_and_attempt_limit(t: *testing.T) {
+    let hosts = [load_signer("ed25519")]
+    let greeting = chan[str](4)
+    let banner_client = ClientConfig {
+        user: "alice"
+        verify_host_key: accept_any_host_key()
+        auth: [AuthMethod.Password("secret")]
+        banner: fn(text) { greeting <- text }
+    }
+    let auth = ServerAuth { methods: ["password"], banner: "welcome", password: fn(user, password) { password == "secret" } }
+    echo_roundtrip(t, "banner", banner_client, base_server(hosts, auth))
+    let shown = <-greeting
+    testing.error_if(t, (shown ?? "") != "welcome", "banner text")
+    let limited = ServerAuth { methods: ["password"], max_attempts: 2, password: fn(user, password) { false } }
+    let guesses = [AuthMethod.Password("a"), AuthMethod.Password("b"), AuthMethod.Password("c")]
+    using ends = net.socketpair() or panic("socketpair")
+    let report = chan[str](1)
+    spawn serve_report(net.stream(ends.second), base_server(hosts, limited), report)
+    let outcome = connect_with(ends.first, base_client(guesses))
+    testing.error_if(t, outcome == "", "too many failures must end the connection")
+    let server_side = <-report
+    testing.error_if(t, (server_side ?? "") != "AuthFailed", "server reported")
+}
+
+fn connect_with(c: net.Conn, config: ClientConfig) -> str {
+    using conn = client(net.stream(c), config) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn open_command(conn: Connection, command: str) -> Channel {
+    using ch = open_session(conn) or panic("open session")
+    exec_on(ch.handle, command) or panic("exec")
+    ch
+}
+
+fn start_pair(client_config: ClientConfig, server_config: ServerConfig, ends: net.ConnPair) -> Connection {
+    let report = chan[str](1)
+    spawn serve_report(net.stream(ends.second), server_config, report)
+    client(net.stream(ends.first), client_config) or panic("client")
+}
+
+fn test_session_requests(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    using ch = open_session(conn) or panic("session")
+    pty_on(ch.handle, Pty { term: "xterm", columns: 80, rows: 24 }) or panic("pty")
+    env_on(ch.handle, "LANG", "C") or panic("env")
+    window_change_on(ch.handle, 100, 40, 0, 0) or panic("window change")
+    exec_on(ch.handle, "report") or panic("exec")
+    let out = read_all_on(ch.handle)
+    testing.error_if(t, !slices.equal(out, bytes("xterm 100x40 LANG=C;")), "report {str(out)}")
+    testing.error_if(t, wait_exit_on(ch.handle).code != 0, "exit status")
+}
+
+fn test_exit_signal(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    using ch = open_command(conn, "signal")
+    let status = wait_exit_on(ch.handle)
+    testing.error_if(t, status.signal != "KILL" || !status.exited, "signal {status.signal}")
+}
+
+fn test_half_close(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    using ch = open_command(conn, "upper")
+    write_on(ch.handle, bytes("hello world")) or panic("write")
+    close_write_on(ch.handle) or panic("close write")
+    let out = read_all_on(ch.handle)
+    testing.error_if(t, !slices.equal(out, bytes("HELLO WORLD")), "reply {str(out)}")
+    testing.error_if(t, wait_exit_on(ch.handle).code != 0, "exit status")
+}
+
+fn test_window_exhaustion_applies_backpressure(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    using ch = open_command(conn, "big")
+    time.sleep_for(duration.milliseconds(300))
+    let out = read_all_on(ch.handle)
+    testing.error_if(t, out.len != 48 * 65536, "length {out.len}")
+    var ordered = true
+    for i in 0..out.len {
+        if out[i] != u8((i % 65536) % 251) {
+            ordered = false
+            break
+        }
+    }
+    testing.error_if(t, !ordered, "content")
+}
+
+fn test_rekey_during_transfer(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    let client_config = ClientConfig {
+        user: "alice"
+        verify_host_key: accept_any_host_key()
+        auth: [AuthMethod.Password("secret")]
+        rekey_bytes: 400000
+    }
+    var server_config = base_server([load_signer("ed25519")], password_auth())
+    server_config.rekey_bytes = 400000
+    using conn = start_pair(client_config, server_config, ends)
+    let result = exec(conn, "big") or panic("exec")
+    testing.error_if(t, result.stdout.len != 48 * 65536, "length {result.stdout.len}")
+    testing.error_if(t, key_exchanges(conn.handle) < 4, "key exchanges {key_exchanges(conn.handle)}")
+    let again = exec(conn, "echo hello") or panic("exec after rekey")
+    testing.error_if(t, !slices.equal(again.stdout, bytes("hello\n")), "stdout after rekey")
+}
+
+fn test_rekey_requested_by_the_peer(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    var server_config = base_server([load_signer("ed25519")], password_auth())
+    server_config.rekey_bytes = 300000
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), server_config, ends)
+    let result = exec(conn, "big") or panic("exec")
+    testing.error_if(t, result.stdout.len != 48 * 65536, "length")
+    testing.error_if(t, key_exchanges(conn.handle) < 3, "client followed the server's rekeys: {key_exchanges(conn.handle)}")
+}
+
+fn echo_loop(listener: net.ListenerHandle) {
+    for {
+        let h = net.accept_handle(listener) catch {
+            e => return
+        }
+        spawn echo_one(h)
+    }
+}
+
+fn echo_one(h: net.ConnHandle) {
+    using c = net.adopt(h)
+    let buf = io.buffer(4096)
+    for {
+        let n = net.read_on(h, buf) catch {
+            e => return
+        }
+        if n == 0 {
+            return
+        }
+        net.write_all_on(h, buf[..n]) catch {
+            e => return
+        }
+    }
+}
+
+fn read_exact(c: net.Conn, count: i64) -> []u8 {
+    var got: []u8 = []
+    let buf = io.buffer(4096)
+    for got.len < count {
+        let n = net.read(c, buf) or panic("read")
+        if n == 0 {
+            break
+        }
+        io.append(mut got, buf[..n])
+    }
+    got
+}
+
+fn test_local_forwarding(t: *testing.T) {
+    using echo = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn echo_loop(echo.handle)
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    using forward = listen_local(conn, "127.0.0.1", 0, "127.0.0.1", echo.handle.addr.port) or panic("listen local")
+    using tcp = net.dial("127.0.0.1", forward.port) or panic("dial")
+    net.write_all(tcp, bytes("ping through the tunnel")) or panic("write")
+    let reply = read_exact(tcp, 23)
+    testing.error_if(t, !slices.equal(reply, bytes("ping through the tunnel")), "echo {str(reply)}")
+    net.shutdown_write(tcp) or panic("shutdown")
+    let rest = read_exact(tcp, 1)
+    testing.error_if(t, rest.len != 0, "the half-close must reach the target and come back as end of input")
+}
+
+fn test_remote_forwarding(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    let forward = listen_remote(conn, "127.0.0.1", 0) or panic("listen remote")
+    testing.error_if(t, forward.port == 0, "the server must report the port it chose")
+    using tcp = net.dial("127.0.0.1", forward.port) or panic("dial")
+    using accepted = accept_forward(forward) or panic("accept forward")
+    net.write_all(tcp, bytes("ping")) or panic("write")
+    let buf = io.buffer(16)
+    let n = read_on(accepted.channel.handle, buf) or panic("read")
+    testing.error_if(t, !slices.equal(buf[..n], bytes("ping")), "forwarded bytes")
+    write_on(accepted.channel.handle, bytes("pong")) or panic("channel write")
+    let back = read_exact(tcp, 4)
+    testing.error_if(t, !slices.equal(back, bytes("pong")), "reply")
+    cancel_forward(forward) or panic("cancel")
+    let closed = accept_failure(forward)
+    testing.error_if(t, closed != "Closed", "accept after cancel: {closed}")
+}
+
+fn accept_failure(forward: Forward) -> str {
+    using accepted = accept_forward(forward) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn test_keepalive_and_refused_channel(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    keepalive(conn) or panic("keepalive")
+    let refused = refusal(conn)
+    testing.error_if(t, refused != "ChannelRefused", "unknown channel type: {refused}")
+}
+
+fn refusal(conn: Connection) -> str {
+    using ch = direct_streamlocal(conn, "/nonexistent") catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn closer(h: *ConnectionHandle) {
+    time.sleep_for(duration.milliseconds(100))
+    disconnect_on(h)
+}
+
+fn test_dropped_connection_fails_pending_operations(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    using ch = open_command(conn, "upper")
+    spawn closer(conn.handle)
+    let buf = io.buffer(16)
+    let n = read_on(ch.handle, buf) catch {
+        e => 0
+    }
+    testing.error_if(t, n != 0, "a read on a dropped connection must end")
+    let failed = exec(conn, "echo hello") catch {
+        e => ExecResult { stdout: [], stderr: [], status: ExitStatus { exited: false, code: -1, signal: "" } }
+    }
+    testing.error_if(t, failed.status.code != -1, "exec on a dropped connection must fail")
+}
+
+fn test_exec_stderr_and_status(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    let failed = exec(conn, "fail") or panic("exec")
+    testing.error_if(t, !slices.equal(failed.stderr, bytes("boom")), "stderr")
+    testing.error_if(t, failed.status.code != 3 || !failed.status.exited, "exit code")
+    testing.error_if(t, failed.stdout.len != 0, "stdout")
+}
+
+fn test_wrong_password_is_refused(t: *testing.T) {
+    let refused = connect_error(base_client([AuthMethod.Password("wrong")]), base_server([load_signer("ed25519")], password_auth()))
+    testing.error_if(t, refused != "AuthFailed", "got {refused}")
+}

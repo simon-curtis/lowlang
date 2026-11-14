@@ -1,0 +1,161 @@
+import std/io
+import std/ssh/wire
+import std/sync
+import std/text
+import std/time
+
+fn mac_key_len(m: MacSpec?) -> i64 {
+    match m {
+        some(spec) => spec.key_len
+        none => 0
+    }
+}
+
+fn install_keys(l: *Link, n: Negotiated, x: Exchanged) -> *Protection ! Error {
+    let c = l.client
+    let id = l.session_id
+    let out_iv = derived(n, x, id, if c { 'A' } else { 'B' }, n.cipher_out.iv_len)
+    let in_iv = derived(n, x, id, if c { 'B' } else { 'A' }, n.cipher_in.iv_len)
+    let out_key = derived(n, x, id, if c { 'C' } else { 'D' }, n.cipher_out.key_len)
+    let in_key = derived(n, x, id, if c { 'D' } else { 'C' }, n.cipher_in.key_len)
+    let out_mac = derived(n, x, id, if c { 'E' } else { 'F' }, mac_key_len(n.mac_out))
+    let in_mac = derived(n, x, id, if c { 'F' } else { 'E' }, mac_key_len(n.mac_in))
+    let outbound = protection(n.cipher_out, n.mac_out, out_key, out_iv, out_mac)?
+    let inbound = protection(n.cipher_in, n.mac_in, in_key, in_iv, in_mac)?
+    sync.lock(l.lock)
+    defer sync.unlock(l.lock)
+    send_locked(l, [msg_newkeys])?
+    l.outbound = outbound
+    if l.strict {
+        l.out_seq = 0
+    }
+    l.out_bytes = 0
+    l.keyed_at = time.now_millis()
+    l.holding = false
+    let queued = l.held
+    l.held = []
+    for payload in queued {
+        send_locked(l, payload)?
+    }
+    inbound
+}
+
+fn send_ext_info(l: *Link) ! Error {
+    var out: []u8 = [msg_ext_info]
+    wire.put_u32(mut out, 1)
+    wire.put_str(mut out, "server-sig-algs")
+    wire.put_str(mut out, text.join(default_host_keys(), ","))
+    send_direct(l, out)?
+}
+
+fn complete_kex(l: *Link, n: Negotiated, x: Exchanged) ! Error {
+    if l.first {
+        l.session_id = x.h
+    }
+    let inbound = install_keys(l, n, x)?
+    let reply = kex_packet(l)?
+    if reply.len != 1 || reply[0] != msg_newkeys {
+        fail Protocol
+    }
+    l.inbound = inbound
+    if l.strict {
+        l.in_seq = 0
+    }
+    l.in_bytes = 0
+    l.exchanges += 1
+    let was_first = l.first
+    sync.lock(l.lock)
+    l.first = false
+    sync.unlock(l.lock)
+    if was_first && !l.client && l.ext_info {
+        send_ext_info(l)?
+    }
+}
+
+fn run_kex(l: *Link, peer_init: []u8) ! Error {
+    begin_kex(l)?
+    let peer = decode_proposal(peer_init)?
+    let n = negotiate(l.local, peer, l.client)?
+    if l.first {
+        l.strict = n.strict
+        l.ext_info = n.ext_info
+        if l.strict && l.in_seq != 1 {
+            fail StrictKex
+        }
+    }
+    if n.discard_next {
+        kex_packet(l)?
+    }
+    let x = if l.client { client_exchange(l, n, peer_init)? } else { server_exchange(l, n, peer_init)? }
+    complete_kex(l, n, x)?
+}
+
+fn handshake(l: *Link) ! Error {
+    exchange_versions(l)?
+    begin_kex(l)?
+    let init = read_packet(l)?
+    let kind = init[0]
+    if kind == msg_disconnect {
+        fail disconnected(init)
+    }
+    if kind != msg_kexinit {
+        fail StrictKex
+    }
+    run_kex(l, init)?
+}
+
+fn read_ext_info(l: *Link, payload: []u8) ! Error {
+    let r = wire.reader(payload[1..])
+    let count = wire.read_u32(r) catch Io
+    for i in 0..count {
+        let name = wire.read_str(r) catch Io
+        let value = wire.read_str(r) catch Io
+        if name == "server-sig-algs" {
+            l.peer_sig_algs = if value.len == 0 { [] } else { text.split(value, ',') }
+        }
+    }
+    wire.finish(r) catch Io
+}
+
+fn next_message(l: *Link) -> []u8 ! Error {
+    for {
+        let p = read_packet(l)?
+        let kind = p[0]
+        if kind == msg_disconnect {
+            fail disconnected(p)
+        }
+        if kind == msg_ignore || kind == msg_debug || kind == msg_unimplemented {
+            continue
+        }
+        if kind == msg_ext_info {
+            read_ext_info(l, p)?
+            continue
+        }
+        if kind == msg_kexinit {
+            run_kex(l, p)?
+            continue
+        }
+        if kind == msg_newkeys || (kind >= 30 && kind <= 49) {
+            fail Protocol
+        }
+        sync.lock(l.lock)
+        let due = rekey_due(l)
+        sync.unlock(l.lock)
+        if due {
+            begin_kex(l)?
+        }
+        return p
+    }
+}
+
+fn disconnect(l: *Link, code: i64, reason: str) {
+    var out: []u8 = [msg_disconnect]
+    wire.put_u32(mut out, code)
+    wire.put_str(mut out, reason)
+    wire.put_str(mut out, "")
+    send_direct(l, out) or {}
+}
+
+fn close_link(l: *Link) {
+    l.stream.close()
+}

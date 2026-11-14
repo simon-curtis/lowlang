@@ -1,0 +1,153 @@
+import std/crypto
+import std/crypto/x509
+import std/file
+import std/io
+import std/net
+import std/os
+import std/process
+import std/ssh
+import std/ssh/key
+import std/testing
+import std/time
+import std/time/duration
+
+const vectors = "testdata/ssh"
+
+fn load_public(name: str) -> key.PublicKey {
+    let line = file.read_text("{vectors}/{name}.pub") or panic("read {name}.pub")
+    let parsed = key.parse_line(line) or panic("parse {name}.pub")
+    parsed.key
+}
+
+fn agent_environment(socket: str) -> [str: str] {
+    ["SSH_AUTH_SOCK": socket, "PATH": os.env("PATH") ?? "/usr/bin:/bin"]
+}
+
+fn wait_for_socket(path: str) -> bool {
+    for attempt in 0..100 {
+        if file.exists(path) {
+            return true
+        }
+        time.sleep_for(duration.milliseconds(20))
+    }
+    false
+}
+
+fn add_key(socket: str, name: str) -> bool {
+    let command = process.Command {
+        program: "ssh-add"
+        args: ["{vectors}/{name}"]
+        env: agent_environment(socket)
+        stdin: process.Stdio.Null
+        stdout: process.Stdio.Null
+        stderr: process.Stdio.Null
+    }
+    let out = process.run(command, []) catch {
+        e => return false
+    }
+    process.success(out.status)
+}
+
+fn test_signs_through_a_real_ssh_agent(t: *testing.T) {
+    if process.find("ssh-agent") == none || process.find("ssh-add") == none {
+        testing.skip(t, "ssh-agent and ssh-add are not installed")
+    }
+    let dir = file.temp_dir("ssh-agent-test") or panic("temp dir")
+    let socket = "{dir}/agent.sock"
+    let daemon = process.Command {
+        program: "ssh-agent"
+        args: ["-D", "-a", socket]
+        env: agent_environment(socket)
+        stdin: process.Stdio.Null
+        stdout: process.Stdio.Null
+        stderr: process.Stdio.Null
+        group: true
+    }
+    using child = process.start(daemon) or panic("start ssh-agent")
+    testing.require(t, wait_for_socket(socket))
+    for name in ["ed25519", "ecdsa256", "rsa2048"] {
+        testing.require(t, add_key(socket, name))
+    }
+    using agent = connect(socket) or panic("connect")
+    let held = identities(agent) or panic("identities")
+    testing.error_if(t, held.len != 5, "ssh-add loads the three keys and the two certificates beside them, got {held.len}")
+    let expected = ["ed25519", "ecdsa256", "rsa2048", "ed25519-cert", "rsa2048-cert"]
+    for name in expected {
+        let want = load_public(name)
+        var found = false
+        for identity in held {
+            if key.equal(identity.key, want) {
+                found = true
+            }
+        }
+        testing.error_if(t, !found, "{name} is not listed")
+    }
+    let data = bytes("data to sign")
+    let algorithms = [["ed25519", "ssh-ed25519"], ["ecdsa256", "ecdsa-sha2-nistp256"], ["rsa2048", "rsa-sha2-256"], ["rsa2048", "rsa-sha2-512"]]
+    for c in algorithms {
+        let public = load_public(c[0])
+        let blob = sign(agent, public, c[1], data) or panic("sign {c[1]}")
+        testing.error_if(t, !key.verify(public, c[1], data, blob), "{c[1]} signature does not verify")
+    }
+    let certified = load_public("ed25519-cert")
+    let cert_blob = sign(agent, certified, "ssh-ed25519", data) or panic("sign with a certificate")
+    testing.error_if(t, !key.verify(certified, "ssh-ed25519", data, cert_blob), "certificate signature")
+    let stranger = load_public("ca")
+    let refused = sign(agent, stranger, "ssh-ed25519", data) catch {
+        e => bytes("refused")
+    }
+    testing.error_if(t, str(refused) != "refused", "an unknown key must be refused")
+    file.remove_all(dir) or panic("remove")
+}
+
+fn serve_authenticated(stream: io.Stream, config: ssh.ServerConfig, report: chan[bool]) {
+    using conn = ssh.serve_stream(stream, config) catch {
+        e => {
+            report <- false
+            return
+        }
+    }
+    report <- true
+    ssh.wait_on(conn.handle)
+}
+
+fn test_agent_signer_authenticates(t: *testing.T) {
+    if process.find("ssh-agent") == none || process.find("ssh-add") == none {
+        testing.skip(t, "ssh-agent and ssh-add are not installed")
+    }
+    let dir = file.temp_dir("ssh-agent-auth") or panic("temp dir")
+    let socket = "{dir}/agent.sock"
+    let daemon = process.Command {
+        program: "ssh-agent"
+        args: ["-D", "-a", socket]
+        env: agent_environment(socket)
+        stdin: process.Stdio.Null
+        stdout: process.Stdio.Null
+        stderr: process.Stdio.Null
+        group: true
+    }
+    using child = process.start(daemon) or panic("start ssh-agent")
+    testing.require(t, wait_for_socket(socket))
+    testing.require(t, add_key(socket, "ecdsa256"))
+    using agent = connect(socket) or panic("connect")
+    let held = signers(agent) or panic("signers")
+    testing.require(t, held.len == 1)
+    let authorized = load_public("ecdsa256")
+    let host = key.signer(x509.PrivateKey.Ed25519(crypto.random(32))) or panic("host key")
+    let server_config = ssh.ServerConfig {
+        host_keys: [host]
+        auth: ssh.ServerAuth { methods: ["publickey"], public_key: fn(user, k) { key.equal(k, authorized) } }
+    }
+    using ends = net.socketpair() or panic("socketpair")
+    let report = chan[bool](1)
+    spawn serve_authenticated(net.stream(ends.second), server_config, report)
+    let client_config = ssh.ClientConfig {
+        user: "alice"
+        verify_host_key: ssh.accept_any_host_key()
+        auth: [ssh.AuthMethod.PublicKey(held[0])]
+    }
+    using conn = ssh.client(net.stream(ends.first), client_config) or panic("client")
+    let served = <-report
+    testing.error_if(t, (served ?? false) != true, "the server must accept the agent's signature")
+    file.remove_all(dir) or panic("remove")
+}
