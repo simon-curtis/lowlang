@@ -5,6 +5,7 @@ class Exit {
 }
 
 const panicStatus = 2;
+const entropyChunk = 65536;
 const monotonicClock = 1;
 
 function round(x) {
@@ -48,6 +49,11 @@ function trapMessage(error) {
 export async function run(bytes, host) {
   let memory = null;
   const view = (ptr, len) => (len === 0 ? new Uint8Array(0) : new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0));
+  const entropy = (data) => {
+    for (let at = 0; at < data.length; at += entropyChunk) {
+      host.entropy(data.subarray(at, at + entropyChunk));
+    }
+  };
   const imports = {
     low: {
       write: (fd, ptr, len) => host.write(fd, view(ptr, len)),
@@ -55,7 +61,7 @@ export async function run(bytes, host) {
         throw new Exit(status);
       },
       clock: (id) => (id === monotonicClock ? host.monotonic() : host.wall()),
-      random: (ptr, len) => host.random(view(ptr, len)),
+      entropy: (ptr, len) => entropy(view(ptr, len)),
     },
     m: math,
   };
@@ -79,20 +85,24 @@ async function runFile(path) {
   const fs = await import("node:fs");
   const crypto = await import("node:crypto");
   const bytes = fs.readFileSync(path);
+  const pause = new Int32Array(new SharedArrayBuffer(4));
   return run(bytes, {
     write: (fd, data) => {
       let at = 0;
-      try {
-        while (at < data.length) {
+      while (at < data.length) {
+        try {
           at += fs.writeSync(fd, data, at, data.length - at);
+        } catch (error) {
+          if (error.code !== "EAGAIN") {
+            return;
+          }
+          Atomics.wait(pause, 0, 0, 1);
         }
-      } catch {
-        return;
       }
     },
     monotonic: () => process.hrtime.bigint(),
     wall: () => BigInt(Math.round((performance.timeOrigin + performance.now()) * 1000)) * 1000n,
-    random: (data) => crypto.getRandomValues(data),
+    entropy: (data) => crypto.getRandomValues(data),
   });
 }
 
