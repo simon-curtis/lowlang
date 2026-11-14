@@ -1,0 +1,549 @@
+import ir
+import types
+
+fn value(l: *Lowering, v: *ir.Value) ! Error {
+    match v.op {
+        OpConst => l.address_of(v, v.aux)
+        OpString => l.address_of(v, l.g.string_address(v.str))
+        OpEmbed => l.address_of(v, l.g.embed_address(v.str))
+        OpCell => l.address_of(v, l.g.cells + 8 * v.aux)
+        OpHashSeed => {
+            l.c.i32_const(l.g.seeds + 8 * v.aux - address_bias)
+            l.c.memory(op_i64_load, 0)
+            l.set(v)
+        }
+        OpParam => {}
+        OpPhi => {}
+        OpUndef => {}
+        OpResult => {}
+        OpAdd => l.arithmetic(v, op_i64_add, op_f64_add, op_f32_add)
+        OpSub => l.arithmetic(v, op_i64_sub, op_f64_sub, op_f32_sub)
+        OpMul => l.arithmetic(v, op_i64_mul, op_f64_mul, op_f32_mul)
+        OpAnd => l.binary(v, op_i64_and)
+        OpOr => l.binary(v, op_i64_or)
+        OpXor => l.binary(v, op_i64_xor)
+        OpDiv => l.divide(v)
+        OpRem => l.divide(v)
+        OpShl => l.shift(v)
+        OpShr => l.shift(v)
+        OpNeg => l.negate(v)
+        OpCompl => {
+            l.get(v.args[0])
+            l.c.i64_const(-1)
+            l.c.op(op_i64_xor)
+            l.normalize(v.type)
+            l.set(v)
+        }
+        OpNot => {
+            l.get(v.args[0])
+            l.c.i64_const(1)
+            l.c.op(op_i64_xor)
+            l.set(v)
+        }
+        OpMulHigh => {
+            l.get(v.args[0])
+            l.get(v.args[1])
+            var helper = l.g.helpers.mulhi_u
+            if signed_type(v.type) {
+                helper = l.g.helpers.mulhi_s
+            }
+            l.c.call(helper)
+            l.set(v)
+        }
+        OpTrailingZeros => {
+            l.get(v.args[0])
+            l.c.op(op_i64_ctz)
+            l.set(v)
+        }
+        OpConvert => l.convert(v)
+        OpSqrt => l.float_unary(v, op_f64_sqrt, op_f32_sqrt)
+        OpFloor => l.float_unary(v, op_f64_floor, op_f32_floor)
+        OpEq => l.compare(v)
+        OpNe => l.compare(v)
+        OpLt => l.compare(v)
+        OpLe => l.compare(v)
+        OpGt => l.compare(v)
+        OpGe => l.compare(v)
+        OpLoad => l.load_value(v)
+        OpStore => l.store_value(v)
+        OpCheck => {
+            l.get(v.args[0])
+            l.get(v.args[1])
+            l.c.op(op_i64_ge_u)
+            l.c.open(op_if)
+            l.c.call(l.g.helpers.panic_index)
+            l.c.op(op_end)
+        }
+        OpSlot => {
+            l.c.local_get(l.base)
+            l.c.i64_const(l.slot_offsets[v.aux])
+            l.c.op(op_i64_add)
+            l.set(v)
+        }
+        OpFuncAddr => l.func_addr(v)?
+        OpCall => l.call_value(v)
+        OpCCall => l.ccall(v)
+        OpRuntime => l.runtime(v)?
+        OpSyscall => fail Unsupported("system calls")
+        OpVector => fail Unsupported("vector operations")
+        OpVectorScalar => fail Unsupported("vector operations")
+    }
+}
+
+fn address_of(l: *Lowering, v: *ir.Value, n: i64) {
+    l.c.i64_const(n)
+    l.set(v)
+}
+
+fn is_float(t: *types.Type?) -> bool {
+    match t {
+        some(inner) => types.is_float(inner)
+        none => false
+    }
+}
+
+fn float_bits(t: *types.Type?) -> i64 {
+    match t {
+        some(inner) => inner.bits
+        none => 64
+    }
+}
+
+fn signed_type(t: *types.Type?) -> bool {
+    match t {
+        some(inner) => inner.signed
+        none => false
+    }
+}
+
+fn signed_compare(t: *types.Type?) -> bool {
+    match t {
+        some(inner) => !types.is_integer(inner) || inner.signed
+        none => true
+    }
+}
+
+fn push_float(l: *Lowering, v: *ir.Value, bits: i64) {
+    l.get(v)
+    if bits == 32 {
+        l.c.op(op_i32_wrap_i64)
+        l.c.op(op_f32_reinterpret_i32)
+        return
+    }
+    l.c.op(op_f64_reinterpret_i64)
+}
+
+fn pop_float(l: *Lowering, bits: i64) {
+    if bits == 32 {
+        l.c.op(op_i32_reinterpret_f32)
+        l.c.op(op_i64_extend_i32_u)
+        return
+    }
+    l.c.op(op_i64_reinterpret_f64)
+}
+
+fn normalize(l: *Lowering, t: *types.Type?) {
+    let ty = t ?? return
+    if ty.bits == 0 || ty.bits == 64 {
+        return
+    }
+    if types.is_integer(ty) && ty.signed {
+        match ty.bits {
+            8 => l.c.op(op_i64_extend8_s)
+            16 => l.c.op(op_i64_extend16_s)
+            _ => l.c.op(op_i64_extend32_s)
+        }
+        return
+    }
+    l.c.i64_const((1 << ty.bits) - 1)
+    l.c.op(op_i64_and)
+}
+
+fn binary(l: *Lowering, v: *ir.Value, code: u8) {
+    l.get(v.args[0])
+    l.get(v.args[1])
+    l.c.op(code)
+    l.set(v)
+}
+
+fn arithmetic(l: *Lowering, v: *ir.Value, integer: u8, double: u8, single: u8) {
+    if is_float(v.type) {
+        let bits = float_bits(v.type)
+        l.push_float(v.args[0], bits)
+        l.push_float(v.args[1], bits)
+        l.c.op(if bits == 32 { single } else { double })
+        l.pop_float(bits)
+        l.set(v)
+        return
+    }
+    l.get(v.args[0])
+    l.get(v.args[1])
+    l.c.op(integer)
+    l.normalize(v.type)
+    l.set(v)
+}
+
+fn constant_of(v: *ir.Value) -> i64? {
+    if v.op == OpConst {
+        return v.aux
+    }
+    none
+}
+
+fn divide(l: *Lowering, v: *ir.Value) {
+    if is_float(v.type) {
+        l.arithmetic(v, op_unreachable, op_f64_div, op_f32_div)
+        return
+    }
+    let c = l.c
+    let divisor = constant_of(v.args[1])
+    if divisor == none || divisor == 0 {
+        l.get(v.args[1])
+        c.op(op_i64_eqz)
+        c.open(op_if)
+        c.call(l.g.helpers.panic_divzero)
+        c.op(op_end)
+    }
+    let unsigned = v.type != none && !signed_type(v.type)
+    var direct = op_i64_div_s
+    if unsigned && v.op == OpDiv {
+        direct = op_i64_div_u
+    } else if unsigned {
+        direct = op_i64_rem_u
+    } else if v.op == OpRem {
+        direct = op_i64_rem_s
+    }
+    if unsigned || (divisor != none && divisor != -1) {
+        l.get(v.args[0])
+        l.get(v.args[1])
+        c.op(direct)
+        l.normalize(v.type)
+        l.set(v)
+        return
+    }
+    l.get(v.args[1])
+    c.i64_const(-1)
+    c.op(op_i64_eq)
+    c.open_typed(op_if, i64_type)
+    c.i64_const(0)
+    if v.op == OpDiv {
+        l.get(v.args[0])
+        c.op(op_i64_sub)
+    }
+    c.op(op_else)
+    l.get(v.args[0])
+    l.get(v.args[1])
+    c.op(direct)
+    c.op(op_end)
+    l.normalize(v.type)
+    l.set(v)
+}
+
+fn shift(l: *Lowering, v: *ir.Value) {
+    let c = l.c
+    let count = v.args[1]
+    if v.op == OpShr && signed_type(v.type) {
+        l.get(v.args[0])
+        l.get(count)
+        c.i64_const(63)
+        l.get(count)
+        c.i64_const(63)
+        c.op(op_i64_le_u)
+        c.op(op_select)
+        c.op(op_i64_shr_s)
+        l.set(v)
+        return
+    }
+    l.get(v.args[0])
+    l.get(count)
+    c.op(if v.op == OpShl { op_i64_shl } else { op_i64_shr_u })
+    c.i64_const(0)
+    l.get(count)
+    c.i64_const(63)
+    c.op(op_i64_le_u)
+    c.op(op_select)
+    if v.op == OpShl {
+        l.normalize(v.type)
+    }
+    l.set(v)
+}
+
+fn negate(l: *Lowering, v: *ir.Value) {
+    if is_float(v.type) {
+        let bits = float_bits(v.type)
+        l.push_float(v.args[0], bits)
+        l.c.op(if bits == 32 { op_f32_neg } else { op_f64_neg })
+        l.pop_float(bits)
+        l.set(v)
+        return
+    }
+    l.c.i64_const(0)
+    l.get(v.args[0])
+    l.c.op(op_i64_sub)
+    l.normalize(v.type)
+    l.set(v)
+}
+
+fn float_unary(l: *Lowering, v: *ir.Value, double: u8, single: u8) {
+    let bits = float_bits(v.type)
+    l.push_float(v.args[0], bits)
+    l.c.op(if bits == 32 { single } else { double })
+    l.pop_float(bits)
+    l.set(v)
+}
+
+fn integer_compare(op: ir.Op, signed: bool) -> u8 {
+    match op {
+        OpEq => op_i64_eq
+        OpNe => op_i64_ne
+        OpLt => if signed { op_i64_lt_s } else { op_i64_lt_u }
+        OpLe => if signed { op_i64_le_s } else { op_i64_le_u }
+        OpGt => if signed { op_i64_gt_s } else { op_i64_gt_u }
+        _ => if signed { op_i64_ge_s } else { op_i64_ge_u }
+    }
+}
+
+fn float_compare(op: ir.Op, bits: i64) -> u8 {
+    let single = bits == 32
+    match op {
+        OpEq => if single { op_f32_eq } else { op_f64_eq }
+        OpNe => if single { op_f32_ne } else { op_f64_ne }
+        OpLt => if single { op_f32_lt } else { op_f64_lt }
+        OpLe => if single { op_f32_le } else { op_f64_le }
+        OpGt => if single { op_f32_gt } else { op_f64_gt }
+        _ => if single { op_f32_ge } else { op_f64_ge }
+    }
+}
+
+fn compare(l: *Lowering, v: *ir.Value) {
+    if is_float(v.type) {
+        let bits = float_bits(v.type)
+        l.push_float(v.args[0], bits)
+        l.push_float(v.args[1], bits)
+        l.c.op(float_compare(v.op, bits))
+    } else {
+        l.get(v.args[0])
+        l.get(v.args[1])
+        l.c.op(integer_compare(v.op, signed_compare(v.type)))
+    }
+    l.c.op(op_i64_extend_i32_u)
+    l.set(v)
+}
+
+fn access(l: *Lowering, v: *ir.Value) -> i64 {
+    l.get(v.args[0])
+    if v.aux >= 0 && v.aux < (1 << 31) {
+        l.c.address()
+        return v.aux
+    }
+    l.c.i64_const(v.aux)
+    l.c.op(op_i64_add)
+    l.c.address()
+    0
+}
+
+fn load_op(t: *types.Type?) -> u8 {
+    let ty = t ?? return op_i64_load
+    let signed = types.is_integer(ty) && ty.signed
+    match ty.bits {
+        8 => if signed { op_i64_load8_s } else { op_i64_load8_u }
+        16 => if signed { op_i64_load16_s } else { op_i64_load16_u }
+        32 => if signed { op_i64_load32_s } else { op_i64_load32_u }
+        _ => op_i64_load
+    }
+}
+
+fn store_op(t: *types.Type?) -> u8 {
+    let ty = t ?? return op_i64_store
+    match ty.bits {
+        8 => op_i64_store8
+        16 => op_i64_store16
+        32 => op_i64_store32
+        _ => op_i64_store
+    }
+}
+
+fn load_value(l: *Lowering, v: *ir.Value) {
+    let offset = l.access(v)
+    l.c.memory(load_op(v.type), offset)
+    l.set(v)
+}
+
+fn store_value(l: *Lowering, v: *ir.Value) {
+    let offset = l.access(v)
+    l.get(v.args[1])
+    l.c.memory(store_op(v.type), offset)
+}
+
+fn widens(from: *types.Type, to: *types.Type) -> bool {
+    if !types.is_integer(from) || !types.is_integer(to) || to.bits == 0 || from.bits == 0 {
+        return false
+    }
+    if !from.signed && !to.signed {
+        return to.bits >= from.bits
+    }
+    if !from.signed {
+        return to.bits > from.bits
+    }
+    to.signed && to.bits >= from.bits
+}
+
+fn is_u64(t: *types.Type) -> bool {
+    types.is_integer(t) && t.bits == 64 && !t.signed
+}
+
+fn convert(l: *Lowering, v: *ir.Value) {
+    let from = types.must(v.from)
+    let to = types.must(v.type)
+    let c = l.c
+    let integers = types.is_integer(from) && types.is_integer(to)
+    if integers && widens(from, to) {
+        l.get(v.args[0])
+    } else if integers {
+        l.get(v.args[0])
+        l.normalize(v.type)
+    } else if types.is_integer(from) {
+        l.get(v.args[0])
+        let single = to.bits == 32
+        if is_u64(from) {
+            c.op(if single { op_f32_convert_i64_u } else { op_f64_convert_i64_u })
+        } else {
+            c.op(if single { op_f32_convert_i64_s } else { op_f64_convert_i64_s })
+        }
+        l.pop_float(to.bits)
+    } else if types.is_integer(to) {
+        l.push_float(v.args[0], from.bits)
+        if from.bits == 32 {
+            c.op(op_f64_promote_f32)
+        }
+        if is_u64(to) {
+            c.call(l.g.helpers.f2u)
+        } else {
+            c.call(l.g.helpers.f2i)
+            l.normalize(v.type)
+        }
+    } else if to.bits == 32 && from.bits != 32 {
+        l.push_float(v.args[0], from.bits)
+        c.op(op_f32_demote_f64)
+        l.pop_float(32)
+    } else if to.bits != 32 && from.bits == 32 {
+        l.push_float(v.args[0], 32)
+        c.op(op_f64_promote_f32)
+        l.pop_float(64)
+    } else {
+        l.get(v.args[0])
+    }
+    l.set(v)
+}
+
+fn func_addr(l: *Lowering, v: *ir.Value) ! Error {
+    if v.aux != ir.code_addr {
+        fail Unsupported("C callbacks and symbol addresses")
+    }
+    let target = v.target ?? panic("function address without a target")
+    l.c.i64_const(l.g.table_slot_of(target))
+    l.set(v)
+}
+
+fn take_results(l: *Lowering, call: *ir.Value, count: i64) {
+    var by_word: [i64: *ir.Value] = [:]
+    for r in l.results[call.id] ?? [] {
+        by_word[r.aux] = r
+    }
+    var k = count - 1
+    for k >= 0 {
+        match by_word[k] {
+            some(r) => l.set(r)
+            none => l.c.op(op_drop)
+        }
+        k -= 1
+    }
+}
+
+fn call_value(l: *Lowering, v: *ir.Value) {
+    let sig = ir.call_signature(v)
+    let count = ir.result_words(sig)
+    if !ir.is_indirect(v) {
+        let target = v.target ?? panic("direct call without a target")
+        if v.args.len != target.param_words {
+            panic("wasm: call to {target.name} passes {v.args.len} words for {target.param_words}")
+        }
+        for a in v.args {
+            l.get(a)
+        }
+        l.c.call(l.g.funcs[target] ?? panic("call to an unknown function {target.name}"))
+        l.take_results(v, count)
+        return
+    }
+    let params = v.args.len - 1
+    if params != sig.param_words {
+        panic("wasm: indirect call passes {params} words for {sig.param_words}")
+    }
+    for a in v.args[1..] {
+        l.get(a)
+    }
+    l.get(v.args[0])
+    l.c.length()
+    l.c.call_indirect(signature(l.g.m, words(params), words(count)))
+    l.take_results(v, count)
+}
+
+fn ccall(l: *Lowering, v: *ir.Value) {
+    let sig = v.sig ?? panic("ccall without a signature")
+    for a in v.args {
+        l.push_float(a, 64)
+    }
+    l.c.call(l.g.externs[sig.symbol] ?? panic("ccall to an unimported {sig.symbol}"))
+    l.pop_float(64)
+    l.take_results(v, 1)
+}
+
+fn runtime(l: *Lowering, v: *ir.Value) ! Error {
+    let entry = v.runtime ?? panic("runtime call without an entry")
+    let c = l.c
+    let h = l.g.helpers
+    match entry {
+        RtAlloc => l.helper_call(v, h.alloc, 1)
+        RtGrow => l.helper_call(v, h.grow, 1)
+        RtStrEq => l.helper_call(v, h.str_eq, 1)
+        RtPrintStr => l.helper_call(v, h.print_str, 0)
+        RtPanicMsg => l.helper_call(v, h.panic_msg, 0)
+        RtMemmove => l.helper_call(v, h.memmove, 0)
+        RtExp => {
+            l.push_float(v.args[0], 64)
+            c.call(l.g.host.exp)
+            l.pop_float(64)
+            l.take_results(v, 1)
+        }
+        RtClockNanos => {
+            l.get(v.args[0])
+            c.length()
+            c.call(l.g.host.clock)
+            l.take_results(v, 1)
+        }
+        RtPin => {}
+        RtUnpin => {}
+        RtRegionLeave => {}
+        RtRegionFree => {}
+        RtRegionResume => {}
+        RtRegionEnter => l.zero_result(v)
+        RtRegionSuspend => l.zero_result(v)
+        RtArgc => l.zero_result(v)
+        RtArgv => l.zero_result(v)
+        RtEnvv => l.zero_result(v)
+        _ => fail Unsupported("the {ir.runtime_symbol(entry)} runtime routine")
+    }
+}
+
+fn helper_call(l: *Lowering, v: *ir.Value, index: i64, count: i64) {
+    for a in v.args {
+        l.get(a)
+    }
+    l.c.call(index)
+    l.take_results(v, count)
+}
+
+fn zero_result(l: *Lowering, v: *ir.Value) {
+    l.c.i64_const(0)
+    l.take_results(v, 1)
+}

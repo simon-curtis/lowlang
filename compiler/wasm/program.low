@@ -1,0 +1,278 @@
+import diag
+import ir
+import types
+import std/slices
+import std/text
+
+pub enum Error {
+    Unsupported(what: str)
+}
+
+pub fn message(e: Error) -> str {
+    match e {
+        Unsupported(what) => "browser/wasm32: {what}"
+    }
+}
+
+pub fn host_script() -> str {
+    embed("host.mjs")
+}
+
+pub fn host_math() -> []str {
+    [
+        "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "pow", "exp", "log", "log2", "log10", "cbrt",
+        "hypot", "ceil", "round", "trunc", "fmod",
+    ]
+}
+
+const address_bias = 65536
+const seed_bytes = 16
+const stack_bytes = 8 << 20
+const heap_reserve = 1 << 20
+const sp_global = 0
+const heap_global = 1
+const floor_global = 2
+
+struct Host {
+    write: i64 = 0
+    exit: i64 = 0
+    clock: i64 = 0
+    random: i64 = 0
+    exp: i64 = 0
+}
+
+struct Helpers {
+    die: i64 = 0
+    panic_msg: i64 = 0
+    panic_index: i64 = 0
+    panic_divzero: i64 = 0
+    panic_oom: i64 = 0
+    panic_stack: i64 = 0
+    error: i64 = 0
+    print_str: i64 = 0
+    memmove: i64 = 0
+    alloc: i64 = 0
+    grow: i64 = 0
+    str_eq: i64 = 0
+    mulhi_u: i64 = 0
+    mulhi_s: i64 = 0
+    f2i: i64 = 0
+    f2u: i64 = 0
+}
+
+struct Generator {
+    m: *Module
+    prog: *ir.Program
+    embeds: [str: []u8]
+    funcs: [*ir.Func: i64] = [:]
+    slots: [*ir.Func: i64] = [:]
+    strings: [str: i64] = [:]
+    embedded: [str: i64] = [:]
+    externs: [str: i64] = [:]
+    host: Host = Host {}
+    helpers: Helpers = Helpers {}
+    seeds: i64 = address_bias
+    cells: i64 = address_bias + seed_bytes
+    data_base: i64 = 0
+}
+
+pub fn generate(prog: *ir.Program, embeds: [str: []u8]) -> []u8 ! Error {
+    let m = new_module()
+    let g = new(Generator { m, prog, embeds })
+    g.data_base = align(g.cells + 8 * prog.cells, 16)
+    m.data_offset = g.data_base - address_bias
+    g.import_host()?
+    g.define_helpers()
+    let first = next_func(m)
+    for i, f in prog.funcs {
+        g.funcs[f] = first + i
+    }
+    for f in prog.funcs {
+        let body = lower(g, f)?
+        define(m, body)
+    }
+    let start = g.define_start()?
+    export_function(m, "_start", start)
+    export_memory(m, "memory")
+    g.place_stack()
+    encode(m)
+}
+
+fn align(n: i64, to: i64) -> i64 {
+    (n + to - 1) / to * to
+}
+
+fn place_stack(g: *Generator) {
+    let top = align(g.data_base + g.m.data.len, 16) + stack_bytes
+    global(g.m, top)
+    global(g.m, top)
+    global(g.m, top - stack_bytes)
+    g.m.memory_bytes = top - address_bias + heap_reserve
+}
+
+fn library_of(prog: *ir.Program) -> [str: str] {
+    var out: [str: str] = [:]
+    for library in ir.libraries(prog) {
+        for symbol in prog.imports[library] ?? [] {
+            out[symbol] = library
+        }
+    }
+    out
+}
+
+fn import_host(g: *Generator) ! Error {
+    let m = g.m
+    g.host.write = import_func(m, "low", "write", signature(m, [i32_type, i32_type, i32_type], []))
+    g.host.exit = import_func(m, "low", "exit", signature(m, [i32_type], []))
+    g.host.clock = import_func(m, "low", "clock", signature(m, [i32_type], [i64_type]))
+    g.host.random = import_func(m, "low", "random", signature(m, [i32_type, i32_type], []))
+    let unary = signature(m, [f64_type], [f64_type])
+    g.host.exp = import_func(m, "m", "exp", unary)
+    let libraries = library_of(g.prog)
+    for f in g.prog.funcs {
+        for b in f.blocks {
+            for v in b.values {
+                if v.op == OpCCall {
+                    g.import_extern(v, libraries)?
+                }
+            }
+        }
+    }
+}
+
+fn import_extern(g: *Generator, v: *ir.Value, libraries: [str: str]) ! Error {
+    let sig = v.sig ?? panic("ccall without a signature")
+    if sig.symbol == "" {
+        fail Unsupported("the browser cannot call a C function pointer")
+    }
+    if g.externs[sig.symbol] != none {
+        return
+    }
+    let library = libraries[sig.symbol] ?? ""
+    if library != "m" {
+        fail Unsupported("the browser has no library {diag.quote(library)} for {sig.symbol}")
+    }
+    if !slices.contains(host_math(), sig.symbol) {
+        fail Unsupported("the browser host has no {sig.symbol} in library \"m\"")
+    }
+    var params: []u8 = []
+    for a in sig.args {
+        if !types.is_float(a) || a.bits != 64 {
+            fail Unsupported("{sig.symbol} takes a parameter that is not f64")
+        }
+        push(mut params, f64_type)
+    }
+    if !types.is_float(sig.ret) || sig.ret.bits != 64 {
+        fail Unsupported("{sig.symbol} does not return f64")
+    }
+    let type = signature(g.m, params, [f64_type])
+    g.externs[sig.symbol] = import_func(g.m, "m", sig.symbol, type)
+}
+
+fn string_address(g: *Generator, s: str) -> i64 {
+    match g.strings[s] {
+        some(address) => return address
+        none => {}
+    }
+    let address = g.data_base + g.m.data.len
+    text.append(mut g.m.data, s)
+    g.strings[s] = address
+    address
+}
+
+fn embed_address(g: *Generator, path: str) -> i64 {
+    match g.embedded[path] {
+        some(address) => return address
+        none => {}
+    }
+    for g.m.data.len % 16 != 0 {
+        push(mut g.m.data, 0)
+    }
+    let address = g.data_base + g.m.data.len
+    for byte in g.embeds[path] ?? panic("embed {path} has no data") {
+        push(mut g.m.data, byte)
+    }
+    g.embedded[path] = address
+    address
+}
+
+fn word_address(g: *Generator) -> i64 {
+    for g.m.data.len % 8 != 0 {
+        push(mut g.m.data, 0)
+    }
+    g.data_base + g.m.data.len
+}
+
+fn push_word(g: *Generator, n: i64) {
+    var rest = u64(n)
+    for _ in 0..8 {
+        push(mut g.m.data, u8(rest & 0xff))
+        rest = rest >> 8
+    }
+}
+
+fn table_slot_of(g: *Generator, f: *ir.Func) -> i64 {
+    match g.slots[f] {
+        some(slot) => return slot
+        none => {}
+    }
+    let index = g.funcs[f] ?? panic("function address of an unknown function")
+    let slot = table_slot(g.m, index)
+    g.slots[f] = slot
+    slot
+}
+
+fn define_start(g: *Generator) -> i64 ! Error {
+    let main = g.prog.main ?? panic("program without main")
+    let count = ir.result_words(main)
+    let c = new_code()
+    c.i32_const(g.seeds - address_bias)
+    c.i32_const(seed_bytes)
+    c.call(g.host.random)
+    c.i32_const(g.seeds + 8 - address_bias)
+    c.i32_const(g.seeds + 8 - address_bias)
+    c.memory(op_i64_load, 0)
+    c.i64_const(1)
+    c.op(op_i64_or)
+    c.memory(op_i64_store, 0)
+    c.call(g.funcs[main] ?? panic("main has no index"))
+    var at = count - 1
+    for at >= 0 {
+        c.local_set(at)
+        at -= 1
+    }
+    match g.prog.main_err {
+        some(err) => g.exit_on_error(c, err)
+        none => {}
+    }
+    let type = signature(g.m, [], [])
+    let body = Body { type, locals: words(count), code: c.finish() }
+    define(g.m, body)
+}
+
+fn exit_on_error(g: *Generator, c: *Code, err: *types.Type) {
+    var names: []i64 = []
+    for v in err.variants {
+        push(mut names, g.string_address(v.name))
+    }
+    let table = word_address(g)
+    for i, v in err.variants {
+        g.push_word(names[i])
+        g.push_word(v.name.len)
+    }
+    c.local_get(0)
+    c.op(op_i64_eqz)
+    c.op(op_i32_eqz)
+    c.open(op_if)
+    for field in [0, 8] {
+        c.local_get(1)
+        c.i64_const(16)
+        c.op(op_i64_mul)
+        c.i64_const(table + field)
+        c.op(op_i64_add)
+        c.address()
+        c.memory(op_i64_load, 0)
+    }
+    c.call(g.helpers.error)
+    c.op(op_end)
+}
