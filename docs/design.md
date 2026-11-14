@@ -4,8 +4,8 @@ Low compiles to static native binaries with no libc dependency, has a tracing ga
 
 | Command | Does |
 | --- | --- |
-| `low run` | Compiles and runs a file or a module directory. |
-| `low build` | Writes a native binary. `-o` names it and `-target` picks `linux/amd64` or `windows/amd64` and defaults to the host. |
+| `low run` | Compiles and runs a file or a module directory. `-target browser/wasm32` runs it as WebAssembly under `node`. |
+| `low build` | Writes a native binary, or a WebAssembly module for `browser/wasm32`. `-o` names it and `-target` picks `linux/amd64`, `windows/amd64` or `browser/wasm32` and defaults to the host. |
 | `low dev` | Runs the program and patches changed functions into it on save. Changing `main`, a type's layout or a function's signature restarts it. Needs a Linux host. |
 | `low ir` | Prints the optimised SSA form. |
 | `low asm` | Prints the generated assembly. |
@@ -1678,12 +1678,13 @@ The compiler is written in Low, in `compiler/`. Pipeline:
 | Check | `compiler/check` | types attached to the tree |
 | Build IR | `compiler/ir` | SSA form, one value per machine word |
 | Codegen | `compiler/amd64` | x86-64 GNU assembly |
+| Codegen | `compiler/wasm` | WebAssembly module, for `browser/wasm32` |
 | Assemble | `compiler/asm` | object: sections, symbols and fixups |
 | Link | `compiler/link` | ELF or PE executable |
 
 Building a program and running `low dev` need no external tool.
 
-- `low` builds and runs on Linux and on Windows. A target is an operating system and an architecture: `linux/amd64`, `windows/amd64` and `browser/wasm32`. The default target is the host; `-target` selects one. The native targets, the amd64 ones, are assembled and linked in process. `browser/wasm32` has no back end, so building for it fails.
+- `low` builds and runs on Linux and on Windows. A target is an operating system and an architecture: `linux/amd64`, `windows/amd64` and `browser/wasm32`. The default target is the host; `-target` selects one. The native targets, the amd64 ones, are assembled and linked in process. `browser/wasm32` goes from the SSA straight to a WebAssembly module, as `### WebAssembly` describes, and `low asm` rejects it.
 - On the Windows target, `std/sys` is built from its `_windows.low` files, which call kernel32, ws2_32, iphlpapi, shell32 and crypt32, so files, processes, sockets, DNS, terminals, the environment and the system root certificates work there. `__syscall` itself compiles to a call that panics with `system calls are not available on windows`.
   - A descriptor is a handle. Descriptors 0 to 2 name the standard handles. A socket's descriptor packs the socket in its low 32 bits and a manual-reset event in its high 32 bits. Sockets are overlapped and non-blocking. `wait_socket` issues an overlapped `IOCTL_AFD_POLL` request for the socket's read or write conditions with the descriptor's event, and parks on the event until the request completes, which is at once when the socket is already ready. `write_view` duplicates the socket with `WSADuplicateSocketW` and gives the copy its own event, so a reader and a writer of one connection wait on separate requests and events. `shutdown` cancels the socket's pending requests with `CancelIoEx`, which wakes the waiters on every descriptor of the socket. Closing the descriptor reads and discards unread input first, because Windows answers a close with unread input by a reset that discards data the peer has not yet read, then closes both.
   - Only sockets are non-blocking. A read from a pipe or file holds an OS thread until it returns; `wait_input` parks on a console handle until it is signalled and otherwise sleeps a millisecond between tries.
@@ -1692,7 +1693,7 @@ Building a program and running `low dev` need no external tool.
   - A refused connection to a loopback address fails at once rather than after the SYN retransmissions Windows would otherwise make.
   - Signals, inotify watches, pseudo-terminals, setting a terminal's size, `chown`, peer credentials, binding to a device and `SO_REUSEPORT` fail with `Unsupported`. User and group IDs are -1 and the umask is 0.
   - Returning from a C call can wait out a collection; the wait keeps the thread's last-error value, so `GetLastError` after an extern call reads that call's error.
-- The `low` command lives in `compiler/low`. `compiler.analyse` takes a path, a profile, an `Overlay` and an `ir.Runner` and returns a checked, lowered unit. `native.build` is the one build entry: it derives the `amd64.Platform` from the unit's target, generates the assembly for the unit, assembles it with the unit's embedded files, links it with the linker its target uses and writes the executable. `native.analyse` is `compiler.analyse` with the native overlay and runner, and `native.generate`, `native.patch` and `native.assembler` are the other entries of `compiler/native`. `low build`, `low run`, hot reload, the fuzz oracle and the Vulkan and Wayland generator tests all call them. Only the `dev` profile produces a hot-reloadable build.
+- The `low` command lives in `compiler/low`. `compiler.analyse` takes a path, a profile, an `Overlay` and an `ir.Runner` and returns a checked, lowered unit. `native.build` is the one build entry: for a native target it derives the `amd64.Platform` from the unit's target, generates the assembly for the unit, assembles it with the unit's embedded files, links it with the linker its target uses and writes the executable, and for `browser/wasm32` it writes the module `wasm.generate` returns. `native.analyse` is `compiler.analyse` with the native overlay and runner, and `native.generate`, `native.patch` and `native.assembler` are the other entries of `compiler/native`. `low build`, `low run`, hot reload, the fuzz oracle and the Vulkan and Wayland generator tests all call them. Only the `dev` profile produces a hot-reloadable build.
 - `low ir` prints the SSA form and `low asm` the generated assembly.
 - Compilation is deterministic: the same source and target always produce the same SSA form, assembly and binary. No pass depends on map iteration order; where order matters the compiler walks slices or stacks.
 - `parser.parse_source` is the one entry from source text to tree, for user files, the prelude, the standard library and generated code. The lexer lexes each interpolated `{}` expression into tokens when it lexes the string, and keeps the `,width:format` suffix as text that `ast.parse_spec` parses.
@@ -2180,6 +2181,17 @@ Calling convention:
 - The AVX2 version uses three-operand VEX instructions on `ymm` registers. A slot written once and read only by vector instructions later in the same block, with no call in between, is kept in `ymm8` to `ymm15` instead of memory. `vzeroupper` runs before every call and return of such a function.
 - The SSE2 version splits 256-bit operations into two 128-bit halves and keeps every vector in memory.
 - An operation without an instruction in the version being generated runs as a scalar loop over the lanes in a scratch area of the frame. These operations are `pshufb` on SSE2, 64-bit multiplication, minimum, maximum and comparison where unavailable, byte shifts and arithmetic 64-bit shifts. Unsigned comparisons flip the sign bit of both operands and compare signed.
+
+### WebAssembly
+
+- `compiler/wasm` turns each SSA function into a WebAssembly function whose parameters and results are its words as `i64`. Every SSA value is an `i64` local, and values whose live ranges do not overlap share one, coloured along the dominator tree.
+- Blocks nest as `block`, `loop` and `if` following the dominator tree, as in Ramsey's "Beyond Relooper", built with an explicit task stack. A back edge into a block that does not dominate its source is irreducible control flow and fails the build. Phi copies run at the end of the predecessor, which is always a jump because the IR splits every other edge into a block with phis. A switch is a `br_table`.
+- Results match the amd64 back end: narrow integers are sign-extended or masked, division by zero panics, a shift by more than 63 fills, and a float converted to an integer out of range or NaN gives the minimum `i64`.
+- There is one linear memory. A Low address is the WebAssembly address plus 64 KiB, so a null pointer and small offsets from it lie outside the memory and trap. From the bottom: the 16 bytes of hash seeds, the hoisted-literal cells, the strings and embedded files, an 8 MiB stack for frame slots that grows down from its top through the global `sp`, then the heap. A prologue that would move `sp` below the stack panics with `stack overflow`. The heap is a bump allocator that grows the memory with `memory.grow`; there is no collector, `pin` and `unpin` do nothing, and a `region` block allocates on the heap.
+- Allocation, growth, string equality, printing, panics, `memmove`, the high half of a 64-bit multiplication and the float-to-integer conversions are WebAssembly functions the generator writes into every module.
+- The module imports `low.write(fd, ptr, len)`, `low.exit(status)`, `low.clock(id)`, which returns nanoseconds as `i64` from the monotonic clock for id 1 and from the wall clock since the Unix epoch otherwise, and `low.random(ptr, len)`, plus `m.exp` and each `f64` function an `extern "m"` block declares, which must be one of the functions `wasm.host_math` lists and `host.mjs` provides. It exports `memory` and `_start`, which fills the hash seeds, calls `main` and exits with status 1 and `error: Variant` when `main` fails.
+- System calls, vector instructions, the runtime routines of threads, locks and the scheduler, C libraries other than `m` and calls through C function pointers fail the build with a `browser/wasm32:` message naming them.
+- `compiler/wasm/host.mjs` is the host. `run(bytes, host)` instantiates a module with the imports above, runs it and returns its exit status; a trap prints `panic: invalid memory access` or `panic: stack overflow` and returns 2. Run by `node` with a module path, it runs the module on a worker with a 256 MB stack. `low run -target browser/wasm32` writes the script beside the module and runs it that way, and `compiler/tests/wasm` builds run fixtures for the host and for the browser and checks both print the same and exit with the same status.
 
 ## Hot reload
 
