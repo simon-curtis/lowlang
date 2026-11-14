@@ -1,0 +1,218 @@
+import std/crypto/x509
+import std/io
+import std/net
+import std/tls
+
+enum Outcome {
+    Done(t: *tls.SessionHandle)
+    Failed(why: str)
+}
+
+struct Capture {
+    sent: []u8
+}
+
+struct Calls {
+    ocsp: i64
+    crl: i64
+}
+
+fn outcome(attempt: fn() -> *tls.SessionHandle ! io.Error) -> Outcome {
+    let t = attempt() catch {
+        Invalid => return Failed("invalid")
+        Unsupported => return Failed("unsupported")
+        Malformed => return Failed("malformed")
+        Refused => return Failed("refused")
+        Eof => return Failed("eof")
+        Reset => return Failed("reset")
+        BrokenPipe => return Failed("broken pipe")
+        _ => return Failed("other")
+    }
+    Done(t)
+}
+
+fn certificates(pem: str) -> []x509.Certificate {
+    var out: []x509.Certificate = []
+    for der in x509.pem_certificates(pem) {
+        push(mut out, x509.parse(der) or return out)
+    }
+    out
+}
+
+fn staple(label: str) -> []u8 {
+    let found = x509.pem_blocks(embed("ocsp.pem"), label)
+    if found.len != 1 {
+        return []
+    }
+    found[0]
+}
+
+fn serve(l: net.ListenerHandle, config: tls.Config, done: chan[str]) {
+    let h = net.accept_handle(l) or {
+        done <- "accept failed"
+        return
+    }
+    using c = net.adopt(h)
+    let wire = net.stream(c)
+    let view = match outcome(fn() -> *tls.SessionHandle ! io.Error { tls.server_handle(wire, config) }) {
+        Done(t) => t
+        Failed(why) => {
+            done <- "server failed ({why})"
+            return
+        }
+    }
+    using session = tls.Session { handle: view }
+    let s = tls.stream(session)
+    let line = io.read_line(io.reader(s)) or "?"
+    io.write_str(s, "{line} back\n") or {}
+    tls.close(session)
+    done <- "server ok"
+}
+
+fn recording(inner: io.Stream, capture: *Capture) -> io.Stream {
+    io.Stream {
+        read: inner.read,
+        write: fn(src: []u8) -> i64 ! io.Error {
+            let n = inner.write(src)?
+            for i in 0..n {
+                push(mut capture.sent, src[i])
+            }
+            n
+        },
+        close: inner.close,
+    }
+}
+
+fn exchange(pem: str, server: tls.Config, client: tls.Config, capture: *Capture) -> str ! io.Error {
+    var config = server
+    config.certificates = x509.pem_certificates(pem)
+    config.key = x509.pem_private_key(pem)?
+    using l = net.listen("127.0.0.1", 0)?
+    let done = chan[str](1)
+    spawn serve(l.handle, config, done)
+    using conn = net.connect(l.handle.addr)?
+    let raw = net.stream(conn)
+    let wire = recording(raw, capture)
+    let view = match outcome(fn() -> *tls.SessionHandle ! io.Error { tls.client_handle(wire, client) }) {
+        Done(found) => found
+        Failed(why) => {
+            net.close(conn)
+            let said = (<-done) ?? ""
+            net.close_listener(l)
+            return "client failed ({why}), {said}"
+        }
+    }
+    using t = tls.Session { handle: view }
+    let s = tls.stream(t)
+    io.write_str(s, "hello\n")?
+    let reply = io.read_line(io.reader(s))?
+    tls.close(t)
+    net.close_listener(l)
+    let said = (<-done) ?? ""
+    "client ok {text_version(view.version)} [{reply}], {said}"
+}
+
+fn text_version(v: i64) -> str {
+    match v {
+        0x0304 => "1.3"
+        0x0303 => "1.2"
+        _ => "other"
+    }
+}
+
+fn client_config(version: i64, mode: x509.RevocationMode, staples: [][]u8, fetcher: x509.Fetcher?) -> tls.Config {
+    var config = tls.Config { server_name: "localhost", roots: certificates(embed("ca.pem")) }
+    if version == 12 {
+        config.max_version = tls.tls12
+    } else {
+        config.min_version = tls.tls13
+    }
+    config.revocation = x509.Revocation { mode, staples, fetcher }
+    config
+}
+
+fn serving(staples: [][]u8) -> tls.Config {
+    tls.Config { staples }
+}
+
+fn counting(calls: *Calls) -> x509.Fetcher {
+    x509.Fetcher {
+        ocsp: fn(url: str, request: []u8) -> []u8 ! io.Error {
+            calls.ocsp += 1
+            if url == "http://ocsp.status.invalid/root" {
+                return staple("INTER")
+            }
+            fail NotFound
+        },
+        crl: fn(url: str) -> []u8 ! io.Error {
+            calls.crl += 1
+            fail NotFound
+        },
+    }
+}
+
+fn last_alert(sent: []u8) -> str {
+    var at = 0
+    var found = ""
+    for at + 5 <= sent.len {
+        let size = i64(sent[at + 3]) * 256 + i64(sent[at + 4])
+        if sent[at] == 21 && at + 7 <= sent.len && sent[at + 5] == 2 {
+            found = ", alert {sent[at + 6]}"
+        }
+        at += 5 + size
+    }
+    found
+}
+
+fn row(version: i64, label: str, pem: str, server: tls.Config, client: tls.Config) ! io.Error {
+    let capture = new(Capture { sent: [] })
+    let result = exchange(pem, server, client, capture)?
+    var alert = ""
+    if version == 12 {
+        alert = last_alert(capture.sent)
+    }
+    print("{label}: {result}{alert}")
+}
+
+fn version_rows(version: i64, name: str) ! io.Error {
+    let leaf = embed("leaf.pem")
+    let revoked = embed("leaf_revoked.pem")
+    let stapled = embed("leaf_staple.pem")
+    let off = x509.RevocationMode.Off
+    let soft = x509.RevocationMode.SoftFail
+    let hard = x509.RevocationMode.HardFail
+    let nofetch: x509.Fetcher? = none
+    let both = serving([staple("LEAF"), staple("INTER")])
+    let leaf_only = serving([staple("LEAF")])
+    print("TLS {name}")
+    row(version, "  off, server staples", leaf, both, client_config(version, off, [], nofetch))?
+    row(version, "  off, revoked staple", revoked, serving([staple("REVOKED")]), client_config(version, off, [], nofetch))?
+    row(version, "  soft, no staples", leaf, serving([]), client_config(version, soft, [], nofetch))?
+    row(version, "  hard, no staples", leaf, serving([]), client_config(version, hard, [], nofetch))?
+    row(version, "  soft, leaf and issuer staples", leaf, both, client_config(version, soft, [], nofetch))?
+    row(version, "  hard, leaf and issuer staples", leaf, both, client_config(version, hard, [], nofetch))?
+    row(version, "  hard, leaf staple only", leaf, leaf_only, client_config(version, hard, [], nofetch))?
+    row(version, "  hard, delegated responder", leaf, serving([staple("DELEGATED"), staple("INTER")]), client_config(version, hard, [], nofetch))?
+    row(version, "  soft, tampered staple", leaf, serving([staple("TAMPERED"), staple("INTER")]), client_config(version, soft, [], nofetch))?
+    row(version, "  hard, tampered staple", leaf, serving([staple("TAMPERED"), staple("INTER")]), client_config(version, hard, [], nofetch))?
+    row(version, "  soft, staple of another certificate", revoked, serving([staple("LEAF")]), client_config(version, soft, [], nofetch))?
+    row(version, "  soft, revoked staple", revoked, serving([staple("REVOKED")]), client_config(version, soft, [], nofetch))?
+    row(version, "  hard, revoked staple", revoked, serving([staple("REVOKED"), staple("INTER")]), client_config(version, hard, [], nofetch))?
+    row(version, "  off, must-staple certificate, no staple", stapled, serving([]), client_config(version, off, [], nofetch))?
+    row(version, "  soft, must-staple certificate, no staple", stapled, serving([]), client_config(version, soft, [], nofetch))?
+    row(version, "  soft, must-staple certificate, its staple", stapled, serving([staple("STAPLE")]), client_config(version, soft, [], nofetch))?
+    row(version, "  hard, must-staple certificate, both staples", stapled, serving([staple("STAPLE"), staple("INTER")]), client_config(version, hard, [], nofetch))?
+    row(version, "  soft, must-staple certificate, staple of another certificate", stapled, serving([staple("LEAF")]), client_config(version, soft, [], nofetch))?
+    let calls = new(Calls { ocsp: 0, crl: 0 })
+    row(version, "  hard, leaf staple and a fetcher for the issuer", leaf, leaf_only, client_config(version, hard, [], counting(calls)))?
+    print("    fetcher calls: ocsp={calls.ocsp} crl={calls.crl}")
+    let unused = new(Calls { ocsp: 0, crl: 0 })
+    row(version, "  hard, both staples and a fetcher", leaf, both, client_config(version, hard, [], counting(unused)))?
+    print("    fetcher calls: ocsp={unused.ocsp} crl={unused.crl}")
+    row(version, "  hard, client staples and no server staples", leaf, serving([]), client_config(version, hard, [staple("LEAF"), staple("INTER")], nofetch))?
+}
+
+fn main() ! io.Error {
+    version_rows(13, "1.3")?
+    version_rows(12, "1.2")?
+}

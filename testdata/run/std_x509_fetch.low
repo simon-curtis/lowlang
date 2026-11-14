@@ -1,0 +1,158 @@
+import std/crypto/x509/fetch
+import std/header
+import std/http
+import std/io
+import std/net
+
+struct Log {
+    lines: []str
+}
+
+fn ocsp_response() -> []u8 {
+    [0x30, 0x03, 0x0A, 0x01, 0x06]
+}
+
+fn shown(target: str) -> str {
+    if target.len > 12 {
+        return "{target[..12]}~{target.len}"
+    }
+    target
+}
+
+fn route(log: *Log, req: http.Request) -> http.Response {
+    let accept = header.get(req.headers, "accept") ?? "-"
+    let kind = header.get(req.headers, "content-type") ?? "-"
+    push(mut log.lines, "{req.method} {shown(req.target)} accept={accept} type={kind} body={req.body.len}")
+    if req.path == "/missing" {
+        return http.response(404, "missing")
+    }
+    if req.path == "/broken" {
+        return http.response(500, "broken")
+    }
+    if req.path == "/moved" {
+        return http.Response { status: 302, headers: [header.Header { name: "location", value: "/data" }], body: [] }
+    }
+    if req.path == "/data" {
+        return http.Response { status: 200, headers: [], body: [1, 2, 3, 4] }
+    }
+    if req.path.len >= 5 && req.path[..5] == "/ocsp" {
+        return http.Response { status: 200, headers: [], body: ocsp_response() }
+    }
+    http.response(404, "no route")
+}
+
+fn flush(log: *Log) {
+    for line in log.lines {
+        print("  server saw {line}")
+    }
+    log.lines = []
+}
+
+fn pattern(n: i64) -> []u8 {
+    let pieces: []u8 = [0xFB, 0xFF, 0xBF]
+    var out: []u8 = []
+    for i in 0..n {
+        push(mut out, pieces[i % 3])
+    }
+    out
+}
+
+fn expected_target(prefix: str) -> str {
+    var out = prefix
+    for _ in 0..46 {
+        out = "{out}%2B%2F"
+    }
+    "{out}%2Bw%3D%3D"
+}
+
+fn ocsp_case(log: *Log, c: *http.Client, label: str, url: str, request: []u8) {
+    let body = fetch.ocsp(c, url, request) catch {
+        e => {
+            print("{label}: {e}")
+            flush(log)
+            return
+        }
+    }
+    print("{label}: {body.len} bytes")
+    flush(log)
+}
+
+fn crl_case(log: *Log, c: *http.Client, label: str, url: str) {
+    let body = fetch.crl(c, url) catch {
+        e => {
+            print("{label}: {e}")
+            flush(log)
+            return
+        }
+    }
+    print("{label}: {body.len} bytes")
+    flush(log)
+}
+
+fn target_case(log: *Log, c: *http.Client, label: str, url: str, expected: str) {
+    let body = fetch.ocsp(c, url, pattern(70)) catch {
+        e => {
+            print("{label}: {e}")
+            flush(log)
+            return
+        }
+    }
+    var matched = false
+    for line in log.lines {
+        if line == "GET {shown(expected)} accept=application/ocsp-response type=- body=0" {
+            matched = true
+        }
+    }
+    print("{label}: {body.len} bytes, target as expected {matched}")
+    log.lines = []
+}
+
+fn refused_case(c: *http.Client) ! io.Error {
+    using closed = net.listen("127.0.0.1", 0)?
+    let port = closed.handle.addr.port
+    net.close_listener(closed)
+    let body = fetch.crl(c, "http://127.0.0.1:{port}/data") catch {
+        _ => {
+            print("closed port: failed")
+            return
+        }
+    }
+    print("closed port: {body.len} bytes")
+}
+
+fn main() ! io.Error {
+    let log = new(Log { lines: [] })
+    using l = net.listen("127.0.0.1", 0)?
+    let handler = fn(req: http.Request) -> http.Response { route(log, req) }
+    let listening = l.handle
+    spawn fn() { http.serve_on(listening, handler) or {} }()
+    let base = "http://127.0.0.1:{l.handle.addr.port}"
+    let c = fetch.client()
+
+    target_case(log, c, "70 byte request", "{base}/ocsp", expected_target("/ocsp/"))
+    target_case(log, c, "70 byte request, url ending in a slash", "{base}/ocsp/", expected_target("/ocsp/"))
+    ocsp_case(log, c, "254 byte request", "{base}/ocsp", pattern(254))
+    ocsp_case(log, c, "255 byte request", "{base}/ocsp", pattern(255))
+    ocsp_case(log, c, "1000 byte request", "{base}/ocsp", pattern(1000))
+    ocsp_case(log, c, "missing responder", "{base}/missing", pattern(70))
+    ocsp_case(log, c, "responder error", "{base}/broken", pattern(300))
+    crl_case(log, c, "crl", "{base}/data")
+    crl_case(log, c, "crl behind a redirect", "{base}/moved")
+    crl_case(log, c, "missing crl", "{base}/missing")
+    crl_case(log, c, "crl url with a scheme the client does not support", "ftp://127.0.0.1/list.crl")
+    let f = fetch.fetcher(c)
+    let through_ocsp = f.ocsp("{base}/ocsp", pattern(69)) or {
+        print("fetcher ocsp failed")
+        return
+    }
+    print("fetcher ocsp: {through_ocsp.len} bytes")
+    flush(log)
+    let through_crl = f.crl("{base}/data") or {
+        print("fetcher crl failed")
+        return
+    }
+    print("fetcher crl: {through_crl.len} bytes")
+    flush(log)
+    refused_case(c)?
+    net.close_listener(l)
+}
