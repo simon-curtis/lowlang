@@ -82,7 +82,7 @@ fn value(l: *Lowering, v: *ir.Value) ! Error {
         }
         OpFuncAddr => l.func_addr(v)?
         OpCall => l.call_value(v)
-        OpCCall => l.ccall(v)
+        OpCCall => l.ccall(v)?
         OpRuntime => l.runtime(v)?
         OpSyscall => fail Unsupported("system calls")
         OpVector => fail Unsupported("vector operations")
@@ -488,8 +488,81 @@ fn call_value(l: *Lowering, v: *ir.Value) {
     l.take_results(v, count)
 }
 
-fn ccall(l: *Lowering, v: *ir.Value) {
+fn intrinsic(l: *Lowering, v: *ir.Value, sig: *ir.CSig) ! Error {
+    let c = l.c
+    match sig.symbol {
+        "stack_pointer" => c.global_get(sp_global)
+        "stack_top" => c.global_get(top_global)
+        "heap_start" => c.global_get(heap_global)
+        "cells_start" => c.i64_const(l.g.cells)
+        "cells_end" => c.i64_const(l.g.cells + 8 * l.g.prog.cells)
+        "memory_end" => {
+            c.memory_size()
+            c.op(op_i64_extend_i32_u)
+            c.i64_const(page_shift)
+            c.op(op_i64_shl)
+            c.i64_const(address_bias)
+            c.op(op_i64_add)
+        }
+        "memory_grow" => l.grow_memory(v)
+        "stress_words" => {
+            c.call(l.g.host.gc_stress)
+            c.op(op_i64_extend_i32_u)
+        }
+        "fill" => {
+            l.get(v.args[0])
+            c.address()
+            l.get(v.args[1])
+            c.length()
+            l.get(v.args[2])
+            c.length()
+            c.memory_fill()
+            return
+        }
+        "copy" => {
+            l.get(v.args[0])
+            c.address()
+            l.get(v.args[1])
+            c.address()
+            l.get(v.args[2])
+            c.length()
+            c.memory_copy()
+            return
+        }
+        _ => fail Unsupported("the {sig.symbol} machine intrinsic")
+    }
+    l.take_results(v, 1)
+}
+
+fn grow_memory(l: *Lowering, v: *ir.Value) {
+    let c = l.c
+    let pages = l.scratch_local()
+    l.get(v.args[0])
+    c.local_set(pages)
+    c.memory_size()
+    c.op(op_i64_extend_i32_u)
+    c.local_get(pages)
+    c.op(op_i64_add)
+    c.call(l.g.host.page_limit)
+    c.op(op_i64_extend_i32_u)
+    c.op(op_i64_gt_u)
+    c.open_typed(op_if, i64_type)
+    c.i64_const(-1)
+    c.op(op_else)
+    c.local_get(pages)
+    c.length()
+    c.memory_grow()
+    c.op(op_i64_extend_i32_s)
+    c.op(op_end)
+}
+
+fn ccall(l: *Lowering, v: *ir.Value) ! Error {
     let sig = v.sig ?? panic("ccall without a signature")
+    let library = l.g.libraries[sig.symbol] ?? ""
+    if library == "wasm" {
+        l.intrinsic(v, sig)?
+        return
+    }
     for i, a in v.args {
         l.push_extern_arg(a, sig.args[i], sig.by_ref[i])
     }
@@ -524,8 +597,20 @@ fn runtime(l: *Lowering, v: *ir.Value) ! Error {
     let c = l.c
     let h = l.g.helpers
     match entry {
-        RtAlloc => l.helper_call(v, h.alloc, 1)
-        RtGrow => l.helper_call(v, h.grow, 1)
+        RtAlloc => l.runtime_call(v, entry)
+        RtGrow => l.runtime_call(v, entry)
+        RtPin => l.runtime_call(v, entry)
+        RtUnpin => l.runtime_call(v, entry)
+        RtLock => l.runtime_call(v, entry)
+        RtUnlock => l.runtime_call(v, entry)
+        RtCas => l.runtime_call(v, entry)
+        RtContext => l.runtime_call(v, entry)
+        RtSetContext => l.runtime_call(v, entry)
+        RtHasContext => l.runtime_call(v, entry)
+        RtLockThread => l.runtime_call(v, entry)
+        RtUnlockThread => l.runtime_call(v, entry)
+        RtLockAll => l.runtime_call(v, entry)
+        RtUnlockAll => l.runtime_call(v, entry)
         RtStrEq => l.helper_call(v, h.str_eq, 1)
         RtPrintStr => l.helper_call(v, h.print_str, 0)
         RtPanicMsg => l.helper_call(v, h.panic_msg, 0)
@@ -542,8 +627,6 @@ fn runtime(l: *Lowering, v: *ir.Value) ! Error {
             c.call(l.g.host.clock)
             l.take_results(v, 1)
         }
-        RtPin => {}
-        RtUnpin => {}
         RtRegionLeave => {}
         RtRegionFree => {}
         RtRegionResume => {}
@@ -554,6 +637,19 @@ fn runtime(l: *Lowering, v: *ir.Value) ! Error {
         RtEnvv => l.zero_result(v)
         _ => fail Unsupported("the {ir.runtime_symbol(entry)} runtime routine")
     }
+}
+
+fn runtime_call(l: *Lowering, v: *ir.Value, entry: ir.Runtime) {
+    let name = "__{ir.runtime_symbol(entry)}"
+    let target = l.g.runtime[name] ?? panic("wasm: the program has no {name}")
+    if v.args.len != target.param_words {
+        panic("wasm: {name} takes {target.param_words} words and the call passes {v.args.len}")
+    }
+    for a in v.args {
+        l.get(a)
+    }
+    l.c.call(l.g.funcs[target] ?? panic("wasm: {name} has no index"))
+    l.take_results(v, ir.result_words(target))
 }
 
 fn helper_call(l: *Lowering, v: *ir.Value, index: i64, count: i64) {
