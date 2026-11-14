@@ -16,11 +16,22 @@ export default defineConfig({
   root,
   publicDir: "public",
   plugins: [tailwindcss()],
+  server: {
+    fs: {
+      allow: [resolve(root, "..")],
+    },
+  },
+  worker: {
+    format: "es",
+    rollupOptions: {
+      external: [/^node:/],
+    },
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,
     rollupOptions: {
-      input: [".", "docs", "packages"].flatMap(pagesIn),
+      input: [".", "docs", "packages", "playground"].flatMap(pagesIn),
     },
   },
   run: {
@@ -30,9 +41,14 @@ export default defineConfig({
         cwd: "..",
         cache: false,
       },
+      playground: {
+        command: "low build compiler/playground -target browser/wasm32 -o site/public/playground.wasm",
+        cwd: "..",
+        cache: false,
+      },
       site: {
         command: "vp build",
-        dependsOn: ["generate"],
+        dependsOn: ["generate", "playground"],
         cache: false,
       },
     },
