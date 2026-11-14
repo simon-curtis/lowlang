@@ -1,0 +1,655 @@
+import std/cancel
+import std/io
+import std/net/dns
+import std/slices
+import std/sys
+import std/text
+import std/time
+
+const edns_payload = 1232
+const max_chain = 8
+const max_servers = 3
+const max_search = 6
+
+/// The settings of a DNS resolver.
+///
+/// `resolver_config` returns the defaults and `parse_resolv_conf` and `system_config` fill the fields from `resolv.conf` syntax and from the system.
+pub struct ResolverConfig {
+    /// The nameservers in the order they are asked, each with its port.
+    pub servers: []Addr
+    /// The domains appended to a name that is not fully qualified, in order.
+    pub search: []str
+    /// A name with at least this many dots is tried as written before the search list, and one with fewer after it.
+    pub ndots: i64
+    /// How long to wait for the reply of one query to one server, in milliseconds.
+    pub timeout: i64
+    /// How many times the whole server list is tried for one query.
+    pub attempts: i64
+    /// Whether each query starts at a randomly chosen server instead of the first.
+    pub rotate: bool
+    /// Whether queries carry an EDNS(0) OPT record that advertises a payload of 1232 bytes.
+    pub edns0: bool
+    /// Whether queries go over TCP and never over UDP.
+    pub use_tcp: bool
+}
+
+/// A DNS resolver: its configuration, the text of the hosts file, a cancellation token and the source of random numbers.
+///
+/// A `Resolver` holds no connection, so copies are independent and every query opens its own socket.
+pub struct Resolver {
+    /// The servers, search list and options.
+    pub config: ResolverConfig
+    /// The text of a hosts file that `resolve` consults before it asks a server, empty for none.
+    pub hosts: str
+    /// A token that aborts the lookup in progress with `Io(Aborted)` when it is cancelled, or `none`.
+    pub token: *cancel.Token?
+    /// Returns a random number from 0 to one less than its argument, which is positive; `lookup_srv` draws the weighted shuffle from it and `rotate` the first server.
+    pub pick: fn(i64) -> i64
+}
+
+/// Returns the default configuration: the nameserver `127.0.0.1` port 53, no search domains, `ndots` 1, a 5 second timeout, 2 attempts, EDNS(0) on, the first server first and UDP with a fall back to TCP.
+pub fn resolver_config() -> ResolverConfig {
+    ResolverConfig {
+        servers: [Addr { ip: [127, 0, 0, 1], port: 53 }]
+        search: []
+        ndots: 1
+        timeout: 5000
+        attempts: 2
+        rotate: false
+        edns0: true
+        use_tcp: false
+    }
+}
+
+fn dns_random(n: i64) -> i64 {
+    if n <= 1 {
+        return 0
+    }
+    let entropy = sys.random_bytes(8) or [0, 0, 0, 0, 0, 0, 0, 0]
+    (io.be64(entropy, 0) & 0x7FFFFFFFFFFFFFFF) % n
+}
+
+/// Returns a resolver that uses `config`, an empty hosts text, no token and random numbers from the system.
+pub fn resolver(config: ResolverConfig) -> Resolver {
+    Resolver { config, hosts: "", token: none, pick: dns_random }
+}
+
+/// Returns a resolver that uses `system_config()` and the text of the system's hosts file, `/etc/hosts` on Linux and `drivers\etc\hosts` under the system directory on Windows.
+pub fn system_resolver() -> Resolver {
+    Resolver { config: system_config(), hosts: read_hosts(), token: none, pick: dns_random }
+}
+
+fn dns_clamp(v: i64, low: i64, high: i64) -> i64 {
+    if v < low {
+        return low
+    }
+    if v > high {
+        return high
+    }
+    v
+}
+
+fn dns_option(mut c: ResolverConfig, word: str) {
+    if text.starts_with(word, "ndots:") {
+        let n = text.parse_int(word[6..]) or -1
+        if n >= 0 {
+            c.ndots = dns_clamp(n, 0, 15)
+        }
+    } else if text.starts_with(word, "timeout:") {
+        let n = text.parse_int(word[8..]) or -1
+        if n >= 0 {
+            c.timeout = dns_clamp(n, 1, 30) * 1000
+        }
+    } else if text.starts_with(word, "attempts:") {
+        let n = text.parse_int(word[9..]) or -1
+        if n >= 0 {
+            c.attempts = dns_clamp(n, 1, 5)
+        }
+    } else if word == "rotate" {
+        c.rotate = true
+    } else if word == "edns0" {
+        c.edns0 = true
+    } else if word == "use-vc" {
+        c.use_tcp = true
+    }
+}
+
+fn dns_domains(words: []str) -> []str {
+    var out: []str = []
+    for w in words {
+        if out.len < max_search {
+            push(mut out, w)
+        }
+    }
+    out
+}
+
+/// Parses the text of a `resolv.conf` file and the values of the `LOCALDOMAIN` and `RES_OPTIONS` environment variables into a configuration.
+///
+/// Starts from `resolver_config`. Lines starting with `#` or `;` are comments. `nameserver` adds an IPv4 or IPv6 address on port 53, at most 3, and ignores one that does not parse. `search` and `domain` set the search list, the last of them in the file winning, with at most 6 domains. `options` takes `ndots:n` (0 to 15), `timeout:n` (1 to 30 seconds), `attempts:n` (1 to 5), `rotate`, `edns0` and `use-vc`, and ignores the other words. A non-empty `localdomain` replaces the search list with its whitespace-separated domains, and the words of `options` are applied after those of the file. Without a `nameserver` line the server is `127.0.0.1`.
+pub fn parse_resolv_conf(conf: str, localdomain: str, options: str) -> ResolverConfig {
+    var c = resolver_config()
+    var servers: []Addr = []
+    for line in text.split(conf, '\n') {
+        let f = fields(line)
+        if f.len < 2 || text.starts_with(text.trim(line), ";") {
+            continue
+        }
+        if f[0] == "nameserver" {
+            let ip: []u8 = parse_ip(f[1]) or []
+            if ip.len > 0 && servers.len < max_servers {
+                push(mut servers, Addr { ip, port: 53 })
+            }
+        } else if f[0] == "search" {
+            c.search = dns_domains(f[1..])
+        } else if f[0] == "domain" {
+            c.search = dns_domains(f[1..2])
+        } else if f[0] == "options" {
+            for word in f[1..] {
+                dns_option(mut c, word)
+            }
+        }
+    }
+    let local = fields(localdomain)
+    if local.len > 0 {
+        c.search = dns_domains(local)
+    }
+    for word in fields(options) {
+        dns_option(mut c, word)
+    }
+    if servers.len > 0 {
+        c.servers = servers
+    }
+    c
+}
+
+fn dns_trim_dot(name: str) -> str {
+    if name.len > 1 && name[name.len - 1] == '.' {
+        return name[..name.len - 1]
+    }
+    name
+}
+
+fn dns_candidates(c: ResolverConfig, name: str) -> []str ! dns.Error {
+    if name.len == 0 {
+        fail Io(Invalid)
+    }
+    if name[name.len - 1] == '.' {
+        return [dns_trim_dot(name)]
+    }
+    var suffixed: []str = []
+    for domain in c.search {
+        let d = dns_trim_dot(domain)
+        if d.len > 0 && d != "." {
+            push(mut suffixed, "{name}.{d}")
+        }
+    }
+    if text.count(name, ".") >= c.ndots {
+        return slices.concat([name], suffixed)
+    }
+    slices.concat(suffixed, [name])
+}
+
+fn dns_aborted(r: Resolver) -> bool {
+    match r.token {
+        some(t) => cancel.cancelled(t)
+        none => false
+    }
+}
+
+fn dns_random_id() -> i64 ! io.Error {
+    io.be16(sys.random_bytes(2)?, 0)
+}
+
+fn dns_watch(r: Resolver, stop: fn()) -> cancel.RegistrationHandle? {
+    match r.token {
+        some(t) => some(cancel.on_cancel_handle(t, stop))
+        none => none
+    }
+}
+
+fn dns_unwatch(w: cancel.RegistrationHandle?) {
+    match w {
+        some(h) => cancel.release_on(h)
+        none => {}
+    }
+}
+
+fn dns_same_address(a: Addr, b: Addr) -> bool {
+    a.port == b.port && slices.equal(a.ip, b.ip)
+}
+
+fn dns_matches(reply: []u8, q: dns.Message) -> bool {
+    let head = dns.decode_head(reply) or return false
+    if !head.response || head.id != q.id || head.opcode != 0 || head.questions.len != 1 {
+        return false
+    }
+    let got = head.questions[0]
+    let asked = q.questions[0]
+    got.kind == asked.kind && got.class == asked.class && dns.same_name(got.name, asked.name)
+}
+
+fn dns_remaining(deadline: i64) -> i64 ! io.Error {
+    let left = (deadline - time.monotonic() + 999999) / 1000000
+    if left <= 0 {
+        fail TimedOut
+    }
+    left
+}
+
+fn dns_udp(r: Resolver, server: Addr, wire: []u8, q: dns.Message) -> []u8 ! io.Error {
+    using s = bind_udp(if v6(server.ip) { "::" } else { "" }, 0)?
+    let h = s.handle
+    let watch = dns_watch(r, fn() { close_socket_on(h) })
+    defer dns_unwatch(watch)
+    send_to(s, wire, server)?
+    let deadline = time.monotonic() + r.config.timeout * 1000000
+    let buf = io.buffer(4096)
+    for {
+        set_receive_timeout(s, dns_remaining(deadline)?)
+        let p = receive_from(s, buf)?
+        if !dns_same_address(p.from, server) {
+            continue
+        }
+        var reply: []u8 = []
+        io.append(mut reply, buf[..p.size])
+        if dns_matches(reply, q) {
+            return reply
+        }
+    }
+}
+
+fn dns_read_full(c: Conn, n: i64, deadline: i64) -> []u8 ! io.Error {
+    var out: []u8 = []
+    let buf = io.buffer(n)
+    for out.len < n {
+        set_read_timeout(c, dns_remaining(deadline)?)
+        let got = read(c, buf[..n - out.len])?
+        if got == 0 {
+            fail Eof
+        }
+        io.append(mut out, buf[..got])
+    }
+    out
+}
+
+fn dns_tcp(r: Resolver, server: Addr, wire: []u8, q: dns.Message) -> []u8 ! io.Error {
+    let deadline = time.monotonic() + r.config.timeout * 1000000
+    using c = connect_within(server, r.config.timeout)?
+    let h = c.handle
+    let watch = dns_watch(r, fn() { close_on(h) })
+    defer dns_unwatch(watch)
+    var frame: []u8 = []
+    io.put_be16(mut frame, wire.len)
+    io.append(mut frame, wire)
+    set_write_timeout(c, dns_remaining(deadline)?)
+    write_all(c, frame)?
+    let size = io.be16(dns_read_full(c, 2, deadline)?, 0)
+    let reply = dns_read_full(c, size, deadline)?
+    if !dns_matches(reply, q) {
+        fail Malformed
+    }
+    reply
+}
+
+fn dns_ask(r: Resolver, server: Addr, name: str, kind: i64, edns: bool) -> dns.Message ! dns.Error {
+    let id = dns_random_id() catch Io
+    let q = dns.query(id, name, kind, if edns { edns_payload } else { 0 })
+    let wire = dns.encode(q) catch Io
+    var reply: []u8 = []
+    if r.config.use_tcp {
+        reply = dns_tcp(r, server, wire, q) catch Io
+    } else {
+        reply = dns_udp(r, server, wire, q) catch Io
+        let head = dns.decode_head(reply) catch Io
+        if head.truncated {
+            reply = dns_tcp(r, server, wire, q) catch Io
+        }
+    }
+    dns.decode(reply) catch Io
+}
+
+fn dns_rcode_error(m: dns.Message) -> dns.Error {
+    match m.rcode {
+        dns.rcode_name => NoSuchName
+        dns.rcode_format => FormatError
+        dns.rcode_not_implemented => NotImplemented
+        dns.rcode_refused => Refused
+        _ => ServerFailure
+    }
+}
+
+fn dns_exchange(r: Resolver, name: str, kind: i64) -> dns.Message ! dns.Error {
+    let servers = r.config.servers
+    if servers.len == 0 {
+        fail Io(Unreachable)
+    }
+    let start = if r.config.rotate { r.pick(servers.len) } else { 0 }
+    var failure: dns.Error = Io(TimedOut)
+    for _ in 0..dns_clamp(r.config.attempts, 1, 16) {
+        for i in 0..servers.len {
+            if dns_aborted(r) {
+                fail Io(Aborted)
+            }
+            let server = servers[(start + i) % servers.len]
+            var edns = r.config.edns0
+            var reply: dns.Message? = none
+            for {
+                let got = dns_ask(r, server, name, kind, edns) catch {
+                    e => {
+                        failure = e
+                        break
+                    }
+                }
+                if got.rcode == dns.rcode_format && edns {
+                    edns = false
+                    failure = FormatError
+                    continue
+                }
+                reply = some(got)
+                break
+            }
+            match reply {
+                some(m) => {
+                    if m.rcode == dns.rcode_ok {
+                        return m
+                    }
+                    failure = dns_rcode_error(m)
+                    if m.rcode == dns.rcode_name && (m.authoritative || m.recursion_available) {
+                        fail NoSuchName
+                    }
+                }
+                none => {}
+            }
+        }
+    }
+    if dns_aborted(r) {
+        fail Io(Aborted)
+    }
+    fail failure
+}
+
+fn dns_owned(records: []dns.Record, owner: str, kind: i64) -> []dns.Record {
+    var out: []dns.Record = []
+    for rec in records {
+        if dns.kind(rec.data) == kind && dns.same_name(rec.name, owner) {
+            push(mut out, rec)
+        }
+    }
+    out
+}
+
+fn dns_alias(records: []dns.Record, owner: str) -> str? {
+    for rec in records {
+        match rec.data {
+            Cname(target) => {
+                if dns.same_name(rec.name, owner) {
+                    return target
+                }
+            }
+            _ => {}
+        }
+    }
+    none
+}
+
+fn dns_seen(names: []str, name: str) -> bool {
+    for n in names {
+        if dns.same_name(n, name) {
+            return true
+        }
+    }
+    false
+}
+
+fn dns_follow(r: Resolver, name: str, kind: i64) -> []dns.Record ! dns.Error {
+    var current = name
+    var seen: []str = [name]
+    for _ in 0..max_chain + 1 {
+        let reply = dns_exchange(r, current, kind)?
+        var target = current
+        for _ in 0..max_chain + 1 {
+            let hits = dns_owned(reply.answers, target, kind)
+            if hits.len > 0 {
+                return hits
+            }
+            match dns_alias(reply.answers, target) {
+                some(next) => {
+                    if dns_seen(seen, next) || seen.len > max_chain {
+                        fail Io(Malformed)
+                    }
+                    push(mut seen, next)
+                    target = next
+                }
+                none => break
+            }
+        }
+        if dns.same_name(target, current) {
+            fail NoData
+        }
+        current = target
+    }
+    fail Io(Malformed)
+}
+
+fn dns_rank(e: dns.Error) -> i64 {
+    match e {
+        NoSuchName => 0
+        NoData => 1
+        _ => 2
+    }
+}
+
+fn dns_search(r: Resolver, name: str, kind: i64) -> []dns.Record ! dns.Error {
+    var failure: dns.Error = NoSuchName
+    for candidate in dns_candidates(r.config, name)? {
+        let records = dns_follow(r, candidate, kind) catch {
+            e => {
+                if dns_aborted(r) {
+                    fail Io(Aborted)
+                }
+                if dns_rank(e) > dns_rank(failure) {
+                    failure = e
+                }
+                continue
+            }
+        }
+        return records
+    }
+    fail failure
+}
+
+fn dns_addresses(r: Resolver, name: str) -> [][]u8 ! dns.Error {
+    var failure: dns.Error = NoSuchName
+    for candidate in dns_candidates(r.config, name)? {
+        var found: [][]u8 = []
+        for kind in [dns.type_a, dns.type_aaaa] {
+            let records = dns_follow(r, candidate, kind) catch {
+                e => {
+                    if dns_aborted(r) {
+                        fail Io(Aborted)
+                    }
+                    if dns_rank(e) > dns_rank(failure) {
+                        failure = e
+                    }
+                    if dns_rank(e) != 1 {
+                        break
+                    }
+                    continue
+                }
+            }
+            for rec in records {
+                match rec.data {
+                    A(ip) => push(mut found, ip)
+                    Aaaa(ip) => push(mut found, ip)
+                    _ => {}
+                }
+            }
+        }
+        if found.len > 0 {
+            return found
+        }
+    }
+    fail failure
+}
+
+/// Returns the IP addresses of `host`, using `r`.
+///
+/// Tries `host` as an IP literal, then the entries of `r.hosts` matched without regard to case, then `localhost` as `127.0.0.1` and `::1`, and then DNS. For DNS the search list and `ndots` of `r.config` decide which names are tried and in what order; a trailing dot makes the name absolute. For each name it asks for the A and then the AAAA records, following `CNAME` records within a reply and across queries up to 8 links with loop detection, and stops at the first name that has an address. Each query goes to the servers in order, or from a random one with `rotate`, `attempts` times over, to a fresh UDP socket with a random source port and a random identifier. A reply counts only if it comes from the server's address and port and repeats the identifier, name, type and class of the question; others are ignored until the timeout. A truncated reply is asked again over TCP with a two-byte length prefix, and a server that answers an EDNS(0) query with `FORMERR` is asked again without it. A `NXDOMAIN` answer from an authoritative server or one that offers recursion ends the lookup of that name at once; any other error response tries the next server. Fails with `NoSuchName` or `NoData` for a name without addresses, with the server's error for a failed query and with `Io` for a timeout, a network failure, a malformed reply or `Aborted` when the token of `r` is cancelled. Parks the green thread during the network queries.
+pub fn resolve(r: Resolver, host: str) -> [][]u8 ! dns.Error {
+    let literal: []u8 = parse_ip(host) or []
+    if literal.len > 0 {
+        return [literal]
+    }
+    let listed = from_hosts(r.hosts, host)
+    if listed.len > 0 {
+        return listed
+    }
+    if text.equal_fold(host, "localhost") {
+        return loopback_addresses()
+    }
+    dns_addresses(r, host)
+}
+
+/// Returns the `MX` records of `name`, using `r`, ordered by ascending preference.
+///
+/// Queries as `resolve` does for DNS, including the search list, and keeps the order the server gave for equal preferences. Fails with `NoData` when the name has no `MX` record and otherwise as `resolve` does.
+pub fn lookup_mx(r: Resolver, name: str) -> []dns.Mx ! dns.Error {
+    var out: []dns.Mx = []
+    for rec in dns_search(r, name, dns.type_mx)? {
+        match rec.data {
+            MxData(mx) => push(mut out, mx)
+            _ => {}
+        }
+    }
+    dns.order_mx(out)
+}
+
+/// Returns the `TXT` records of `name`, using `r`, as one string per record with the record's character-strings joined.
+///
+/// Queries as `resolve` does for DNS, including the search list. Fails with `NoData` when the name has no `TXT` record and otherwise as `resolve` does.
+pub fn lookup_txt(r: Resolver, name: str) -> []str ! dns.Error {
+    var out: []str = []
+    for rec in dns_search(r, name, dns.type_txt)? {
+        match rec.data {
+            Txt(strings) => {
+                var joined: []u8 = []
+                for s in strings {
+                    io.append(mut joined, s)
+                }
+                push(mut out, str(joined))
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Returns the `SRV` records of the service at `name`, using `r`, ordered as RFC 2782 describes.
+///
+/// The queried name is `_service._proto.name`, or `name` itself when `service` and `proto` are both empty. Records are grouped by ascending priority and shuffled by weight within a group with `r.pick`, so the result differs from call to call unless `pick` is fixed. Queries as `resolve` does for DNS, including the search list. Fails with `NoData` when there is no `SRV` record and otherwise as `resolve` does.
+pub fn lookup_srv(r: Resolver, service: str, proto: str, name: str) -> []dns.Srv ! dns.Error {
+    let full = if service.len == 0 && proto.len == 0 { name } else { "_{service}._{proto}.{name}" }
+    var found: []dns.Srv = []
+    for rec in dns_search(r, full, dns.type_srv)? {
+        match rec.data {
+            SrvData(srv) => push(mut found, srv)
+            _ => {}
+        }
+    }
+    dns.order_srv(found, r.pick)
+}
+
+/// Returns the `CAA` records of `name`, using `r`, in the order the server gave them.
+///
+/// Asks for the records of `name` alone and does not climb to its parents as RFC 8659 section 3 does for issuance checks. Queries as `resolve` does for DNS, including the search list. Fails with `NoData` when the name has no `CAA` record and otherwise as `resolve` does.
+pub fn lookup_caa(r: Resolver, name: str) -> []dns.Caa ! dns.Error {
+    var out: []dns.Caa = []
+    for rec in dns_search(r, name, dns.type_caa)? {
+        match rec.data {
+            CaaData(caa) => push(mut out, caa)
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Returns the names the `PTR` records of the address `ip` point at, using `r`.
+///
+/// `ip` is 4 or 16 bytes; its `in-addr.arpa` or `ip6.arpa` name is queried as an absolute name. Fails with `Io(Invalid)` for another length, with `NoData` when there is no `PTR` record and otherwise as `resolve` does.
+pub fn lookup_ptr(r: Resolver, ip: []u8) -> []str ! dns.Error {
+    let name = dns.reverse_name(ip) catch Io
+    var out: []str = []
+    for rec in dns_follow(r, name, dns.type_ptr)? {
+        match rec.data {
+            Ptr(host) => push(mut out, host)
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Returns the canonical name of `name`, using `r`: the end of its chain of `CNAME` records.
+///
+/// Queries as `resolve` does for DNS, including the search list, and follows the chain across queries up to 8 links with loop detection. Fails with `NoData` when `name` has no `CNAME` record, and otherwise as `resolve` does.
+pub fn lookup_cname(r: Resolver, name: str) -> str ! dns.Error {
+    var failure: dns.Error = NoSuchName
+    for candidate in dns_candidates(r.config, name)? {
+        let canonical = dns_canonical(r, candidate) catch {
+            e => {
+                if dns_aborted(r) {
+                    fail Io(Aborted)
+                }
+                if dns_rank(e) > dns_rank(failure) {
+                    failure = e
+                }
+                continue
+            }
+        }
+        return canonical
+    }
+    fail failure
+}
+
+fn dns_canonical(r: Resolver, name: str) -> str ! dns.Error {
+    var current = name
+    var seen: []str = [name]
+    for _ in 0..max_chain + 1 {
+        let reply = dns_exchange(r, current, dns.type_cname)?
+        var moved = false
+        for _ in 0..max_chain + 1 {
+            match dns_alias(reply.answers, current) {
+                some(next) => {
+                    if dns_seen(seen, next) || seen.len > max_chain {
+                        fail Io(Malformed)
+                    }
+                    push(mut seen, next)
+                    current = next
+                    moved = true
+                }
+                none => break
+            }
+        }
+        if !moved {
+            if seen.len == 1 {
+                fail NoData
+            }
+            return current
+        }
+    }
+    fail Io(Malformed)
+}
+
+/// Returns the names of the `NS` records of `name`, using `r`.
+///
+/// Queries as `resolve` does for DNS, including the search list. Fails with `NoData` when the name has no `NS` record and otherwise as `resolve` does.
+pub fn lookup_ns(r: Resolver, name: str) -> []str ! dns.Error {
+    var out: []str = []
+    for rec in dns_search(r, name, dns.type_ns)? {
+        match rec.data {
+            Ns(host) => push(mut out, host)
+            _ => {}
+        }
+    }
+    out
+}
