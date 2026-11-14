@@ -1,0 +1,207 @@
+import std/io
+import std/os
+import std/process
+import std/slices
+import std/sys
+import std/time
+
+const megabyte = 1048576
+
+fn child(mode: str) ! io.Error {
+    match mode {
+        "echo" => {
+            let buf = io.buffer(65536)
+            for {
+                let n = sys.read(0, buf)?
+                if n == 0 {
+                    break
+                }
+                sys.write_all(1, buf[..n])?
+            }
+        }
+        "late" => {
+            sleep(200)
+            sys.write_all(1, bytes("bye\n"))?
+            os.exit(7)
+        }
+        "deaf" => {}
+        _ => sleep(60000)
+    }
+}
+
+fn pattern(size: i64) -> []u8 {
+    var out: []u8 = []
+    for i in 0..size {
+        push(mut out, u8(i * 7 % 251))
+    }
+    out
+}
+
+fn must(s: io.Stream?) -> io.Stream ! io.Error {
+    match s {
+        some(x) => x
+        none => fail NotConnected
+    }
+}
+
+fn pump(to: io.Stream, data: []u8, outcome: chan[str]) {
+    io.write_all(to, data) catch {
+        e => {
+            outcome <- "{e}"
+            return
+        }
+    }
+    to.close()
+    outcome <- "written"
+}
+
+fn concurrent(program: str) ! io.Error {
+    let data = pattern(megabyte)
+    using child = process.start(process.Command { program, args: ["echo"], stdin: Piped, stdout: Piped })?
+    let outcome = chan[str](1)
+    spawn pump(must(child.handle.stdin)?, data, outcome)
+    let echoed = io.read_all(must(child.handle.stdout)?)?
+    print("writer: {(<-outcome) ?? ""}")
+    print("echoed {echoed.len} bytes, intact: {slices.equal(echoed, data)}")
+    print("status: {process.success(process.wait(child)?)}")
+}
+
+fn through_run(program: str) ! io.Error {
+    let data = pattern(megabyte * 2)
+    let result = process.run(process.Command { program, args: ["echo"] }, data)?
+    print("run echoed {result.stdout.len} bytes, intact: {slices.equal(result.stdout, data)}")
+}
+
+fn parked_read(output: io.Stream, outcome: chan[str]) {
+    let n = output.read(io.buffer(16)) catch {
+        e => {
+            outcome <- "reader: {e}"
+            return
+        }
+    }
+    outcome <- "reader: read {n}"
+}
+
+fn close_during_read(program: str) ! io.Error {
+    using child = process.start(process.Command { program, args: ["sleep"], stdout: Piped })?
+    let output = must(child.handle.stdout)?
+    let outcome = chan[str](1)
+    let started = time.now_millis()
+    spawn parked_read(output, outcome)
+    sleep(100)
+    output.close()
+    print((<-outcome) ?? "")
+    print("reader released promptly: {time.now_millis() - started < 5000}")
+}
+
+fn parked_write(input: io.Stream, outcome: chan[str]) {
+    let data = pattern(4 * megabyte)
+    io.write_all(input, data) catch {
+        e => {
+            outcome <- "writer: {e}"
+            return
+        }
+    }
+    outcome <- "writer: finished"
+}
+
+fn close_during_write(program: str) ! io.Error {
+    using child = process.start(process.Command { program, args: ["sleep"], stdin: Piped })?
+    let input = must(child.handle.stdin)?
+    let outcome = chan[str](1)
+    let started = time.now_millis()
+    spawn parked_write(input, outcome)
+    sleep(100)
+    input.close()
+    print((<-outcome) ?? "")
+    print("writer released promptly: {time.now_millis() - started < 5000}")
+}
+
+fn collect(s: io.Stream, outcome: chan[str]) {
+    let data = io.read_all(s) catch {
+        e => {
+            outcome <- "{e}"
+            return
+        }
+    }
+    outcome <- "{data.len} bytes"
+}
+
+fn exit_with_reads_pending(program: str) ! io.Error {
+    using child = process.start(process.Command { program, args: ["late"], stdout: Piped, stderr: Piped })?
+    let out = chan[str](1)
+    let err = chan[str](1)
+    spawn collect(must(child.handle.stdout)?, out)
+    spawn collect(must(child.handle.stderr)?, err)
+    print("stdout: {(<-out) ?? ""}")
+    print("stderr: {(<-err) ?? ""}")
+    match process.wait(child)? {
+        Exited(code) => print("exit code {code}")
+        Signaled(_) => print("signaled")
+    }
+}
+
+fn write_to_exited(program: str) ! io.Error {
+    using child = process.start(process.Command { program, args: ["deaf"], stdin: Piped })?
+    process.wait(child)?
+    let input = must(child.handle.stdin)?
+    let data = pattern(megabyte)
+    io.write_all(input, data) catch {
+        BrokenPipe => {
+            print("write to exited child: BrokenPipe")
+            return
+        }
+        e => {
+            print("write to exited child: {e}")
+            return
+        }
+    }
+    print("write to exited child: accepted")
+}
+
+fn silent_exit(program: str) ! io.Error {
+    using child = process.start(process.Command { program, args: ["deaf"], stdout: Piped })?
+    let output = must(child.handle.stdout)?
+    print("read after exit: {output.read(io.buffer(16))?}")
+    print("again: {output.read(io.buffer(16))?}")
+}
+
+fn many_waits(program: str) ! io.Error {
+    let outcome = chan[bool](0)
+    var started: []*process.ChildHandle = []
+    for _ in 0..8 {
+        push(mut started, process.start_handle(process.Command { program, args: ["late"], stdout: Null })?)
+    }
+    for handle in started {
+        spawn wait_exit(handle, outcome)
+    }
+    var succeeded = 0
+    for _ in 0..8 {
+        if (<-outcome) ?? false {
+            succeeded += 1
+        }
+    }
+    print("waits completed: {succeeded}")
+}
+
+fn wait_exit(handle: *process.ChildHandle, outcome: chan[bool]) {
+    let status = process.wait_on(handle) or process.Exit.Exited(-1)
+    outcome <- (status == process.Exit.Exited(7))
+}
+
+fn main() ! io.Error {
+    let args = os.args()
+    if args.len > 1 {
+        child(args[1])?
+        return
+    }
+    let program = os.executable()?
+    concurrent(program)?
+    through_run(program)?
+    close_during_read(program)?
+    close_during_write(program)?
+    exit_with_reads_pending(program)?
+    write_to_exited(program)?
+    silent_exit(program)?
+    many_waits(program)?
+}
