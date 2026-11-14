@@ -5,6 +5,7 @@ Low compiles to static native binaries with no libc dependency, has a tracing ga
 | Command | Does |
 | --- | --- |
 | `low run` | Compiles and runs a file or a module directory. |
+| `low test` | Builds a module's tests into one program and runs it, passing the remaining flags to `std/testing`. |
 | `low build` | Writes a native binary. `-o` names it and `-target` picks `linux/amd64` or `windows/amd64` and defaults to the host. |
 | `low dev` | Runs the program and patches changed functions into it on save. Changing `main`, a type's layout or a function's signature restarts it. Needs a Linux host. |
 | `low ir` | Prints the optimised SSA form. |
@@ -953,6 +954,10 @@ fn main() {
 
 - A module is a directory. Every `.low` file in it shares one namespace, so files of a module need no imports between them.
 - A file whose name ends in `_linux.low` or `_windows.low` belongs to the module only when building for that operating system. The standard library uses this to give `std/sys` and the operating-system parts of `std/os`, `std/process`, `std/net` and `std/crypto/x509` one implementation per target; a test requires every target to declare the same public items with the same doc comments.
+- A file whose name, after removing `.low` or an operating system suffix, ends in `_test` is a test file: `split_test.low` and `split_test_linux.low`. A test file belongs to its module only in a test build of that module. Every other build leaves it out, so `low build`, `low run`, `low dev`, `low asm`, `low ir`, `low lint`, `low doc` and `low names`, and every module that a tested module imports, never read it.
+- A test is a top-level `fn test_<name>(t: *testing.T)` in a test file, where `testing` is the name the file imports `std/testing` under; inside `std/testing` it is `*T`. A `test_` function in a test file of any other shape, with other parameters, type parameters, a result or error type, or nothing after the prefix, is a compile error at the function. A `test_` function in any other file is an ordinary function. Tests run in the order of their file names, then of their declarations, and a test's name is its function name without `test_`.
+- `low test <dir>` builds one module's tests into a program and runs it with the rest of its arguments as `std/testing` flags. `low test std/<module>` tests a standard library module. The tested module keeps its own path, so a module that the test code imports is loaded once and a test reaches the module's private items. The project root loads as a module named `__root`, so its `main` is an ordinary function that tests can call.
+- The imports of test files and of the generated harness are left out of the import cycle check. A test file may import `std/testing` although `std/testing` imports the tested module, as `std/text` is tested, and a test file may import a module that imports the tested module.
 - A directory named `examples` inside a module holds that module's examples: each `.low` file in it is a whole program that imports the module, with its expected output in a `.out` file of the same name. An `examples` directory is never a module, and importing a path with an `examples` segment is an error.
 - The project root is the nearest directory, starting at the entry, that holds a `low.mod` file. Without one it is the entry's directory.
 - `import ui/text` loads `<root>/ui/text/`. A path starting with `std/` names a module of the standard library, which is compiled into `low`, so a project directory named `std` cannot be imported.
@@ -971,7 +976,7 @@ fn main() {
 - Types are written `geometry.Shape` and built with `geometry.Point { ... }`. A variant can be named `geometry.Shape.Dot` or, where the type is expected, `Dot`.
 - Declarations and struct fields are private to their module unless marked `pub`. A `pub` enum's variants are public.
 - A struct with private fields without defaults cannot be built with a literal outside its module.
-- An import cycle is an error, as is importing two modules under one name.
+- An import cycle is an error, except through the imports of test files, as is importing two modules under one name.
 
 ### Doc comments
 
@@ -1704,7 +1709,7 @@ Building a program and running `low dev` need no external tool.
 
 Modules:
 
-- `compiler/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles. One loader reads the program, its imports, `embed` files and the embedded standard library, which is the map `embed_dir("../../std")` returns. `compiler.Overlay` puts unsaved editor text over the disk for the language server, which shares the loader's `root` lookup and `parse_file`. `compiler/check` does no file IO.
+- `compiler/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles. It leaves out the test files of every module except the one `low test` tests. For that module, `compiler/compiler/tests.low` loads the tested module under its own name with its test files, finds the test functions, and parses two generated files as privileged source: `__tests.low`, added to the tested module, whose `__tests()` lists each test with its name, function, file and line, and `__main.low`, the only file of the entry module, whose `main` runs that list with `std/testing`. `low test` builds the program with the release profile into a temporary directory and runs it with the remaining arguments and inherited standard streams. One loader reads the program, its imports, `embed` files and the embedded standard library, which is the map `embed_dir("../../std")` returns. `compiler.Overlay` puts unsaved editor text over the disk for the language server, which shares the loader's `root` lookup and `parse_file`. `compiler/check` does no file IO.
 - Every file records its module path and every source position its file, so errors name the file they come from.
 - The checker keeps a scope of types and functions per module. The prelude belongs to the entry module, and its `__` names cannot clash with anything else. Every module sees the prelude's generic `__` functions and types, so `std/container/deque` is a wrapper over the prelude's `__Queue`, the ring buffer behind channel wait queues.
 - A function in module `ui/text` becomes the symbol `fn_ui.text.shout`. Types display with their module path, such as `geometry.Circle`.
@@ -2354,7 +2359,7 @@ Win32:
 
 ## Tests
 
-The tests are Low programs. `compiler/lowtest` is the fixture harness: `low build compiler/lowtest -o lowtest`, then `lowtest <low binary> [run|examples|fail|lint|windows]... [-filter text]` from the repository root checks any `low` binary against the sidecar files using only its command line. Each `compiler/tests/<name>` is a `std/testing` program for `compiler/<name>`, run with `low run compiler/tests/<name>`; `low` tests `compiler/low`, `editors` the editor grammars and `ui` the `std/ui` modules. A test that needs a tool outside `low` skips when the tool is missing. The `run` and `examples` suites skip on a Windows host and the `windows` suite skips on a Linux host, so the workflow runs `windows` and the Win32 tests on a Windows runner with a `low.exe` and `lowtest.exe` built for Windows. The `compiler/tests/asm` and `compiler/tests/link` oracle tests need the pinned binutils and LLVM below, which the workflow does not install, so they run by hand.
+The tests are Low programs. `compiler/lowtest` is the fixture harness: `low build compiler/lowtest -o lowtest`, then `lowtest <low binary> [run|examples|fail|lint|test|windows]... [-filter text]` from the repository root checks any `low` binary against the sidecar files using only its command line. Each `compiler/tests/<name>` is a `std/testing` program for `compiler/<name>`, run with `low run compiler/tests/<name>`; `low` tests `compiler/low`, `editors` the editor grammars and `ui` the `std/ui` modules. A test that needs a tool outside `low` skips when the tool is missing. The `run`, `examples` and `test` suites skip on a Windows host and the `windows` suite skips on a Linux host, so the workflow runs `windows` and the Win32 tests on a Windows runner with a `low.exe` and `lowtest.exe` built for Windows. The `compiler/tests/asm` and `compiler/tests/link` oracle tests need the pinned binutils and LLVM below, which the workflow does not install, so they run by hand.
 
 ### Fixtures
 
@@ -2371,6 +2376,11 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
 - `std/<module>/examples` holds the module's examples, with `.out` and, for an example with no Windows build, a `.tags` of `linux-only`. The runner does not check `simd` for them.
 - `testdata/fail` holds programs that must fail to compile with the message in `.err`, with file paths shown relative to the fixture.
 - `testdata/lint` holds programs whose `low lint` warnings must equal `.warn`, one per line with relative paths. A program without a `.warn` file has none.
+- `testdata/test` holds directories whose tests run with `low test`:
+  - `.module` names the module to test as a path inside the directory, for a project whose submodule is tested. Without it the directory itself is tested.
+  - `.args` lists extra flags for the test program, one per line, after `-notime`.
+  - `.out` and `.err` are the expected stdout and stderr, empty when absent, with file paths shown relative to the fixture.
+  - `.status` is the expected exit status, `0` when absent.
 - `bench/<name>/main.low` are the benchmark programs; the compile benchmark and the determinism test use them.
 
 ### Checks
@@ -2378,6 +2388,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
 - The `run` and `examples` suites compile every `testdata/run` program and std example for Linux, run it with a one-minute limit, compares stdout with `.out` and stderr with `.err`, and applies `.maxrss`, `.maxtime`, `.needed` and `.tags`. These suites skip on a Windows host.
 - The `windows` suite builds every `testdata/run` program and std example that has a Windows build, and every `testdata/windows` program, for Windows and compares the same way. It runs only on a Windows host.
 - The `fail` and `lint` suites check every `testdata/fail` and `testdata/lint` program against its sidecar.
+- The `test` suite runs `low test` on every `testdata/test` directory, compares stdout, stderr and the exit status with its sidecars, and skips on a Windows host. A test build cannot be expressed in a `testdata/fail` program, so the rejected test shapes are fixtures here. `testdata/run/test_files_left_out` holds a test file that does not compile, which shows that `low build` and `low run` leave test files out.
 - The time zone programs read zone rules from the embedded `std/time/tzdata`, because host databases differ by release and by build (Debian's includes `backzone`). They read the host database only for the behaviour of `zone.named` and `zone.local`, through zones whose rules every build agrees on.
 - The `std/cdp` programs print `launch failed` when no browser starts. CI turns off Ubuntu's AppArmor restriction on unprivileged user namespaces so Chromium can create its sandbox. CI reads the Chromium installation into the page cache before the tests, because the runner's Chromium is an unstripped snapshot build of over 500 MB and paging it in from a cold disk can outlast the launch timeout.
 - `compiler/tests/low` compiles each program twice in one process and requires identical SSA form and assembly: every `testdata/run` program for Linux release, every benchmark for Linux release, Linux dev and Windows, and every `testdata/windows` program for Windows.
