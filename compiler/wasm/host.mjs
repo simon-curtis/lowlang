@@ -10,6 +10,7 @@ const stressWords = 8192;
 const pageBits = 16;
 const addressablePages = 65536;
 const monotonicClock = 1;
+const noInput = -1;
 
 function round(x) {
   return x < 0 ? -Math.round(-x) : Math.round(x);
@@ -58,12 +59,15 @@ export async function run(bytes, host) {
       host.entropy(data.subarray(at, at + entropyChunk));
     }
   };
+  const exit = (status) => {
+    throw new Exit(status);
+  };
   const imports = {
     low: {
+      read: (fd, ptr, len) => (host.read ? host.read(fd, view(ptr, len)) : noInput),
       write: (fd, ptr, len) => host.write(fd, view(ptr, len)),
-      exit: (status) => {
-        throw new Exit(status);
-      },
+      exit,
+      halt: exit,
       clock: (id) => (id === monotonicClock ? host.monotonic() : host.wall()),
       entropy: (ptr, len) => entropy(view(ptr, len)),
       gc_stress: () => (host.stress ? stressWords : 0),
@@ -99,6 +103,21 @@ async function runFile(path) {
   return run(bytes, {
     stress: process.env.LOW_GC === "stress",
     maxPages: limit === undefined ? undefined : Number(limit),
+    read: (fd, data) => {
+      for (;;) {
+        try {
+          return fs.readSync(fd, data, 0, data.length, null);
+        } catch (error) {
+          if (error.code === "EOF") {
+            return 0;
+          }
+          if (error.code !== "EAGAIN") {
+            return noInput;
+          }
+          Atomics.wait(pause, 0, 0, 1);
+        }
+      }
+    },
     write: (fd, data) => {
       let at = 0;
       while (at < data.length) {

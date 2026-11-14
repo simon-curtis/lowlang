@@ -1,0 +1,210 @@
+import compiler
+import native
+import target
+import wasm
+import std/file
+import std/os
+import std/path
+import std/process
+import std/testing
+
+const playground_source = "compiler/playground"
+const stress_variable = "LOW_GC"
+const stress_value = "stress"
+const slow_timeout = 900000
+
+enum Problem {
+    Failed(msg: str)
+}
+
+fn describe(p: Problem) -> str {
+    match p {
+        Failed(msg) => msg
+    }
+}
+
+struct Ran {
+    status: i64
+    stdout: str
+    stderr: str
+}
+
+struct Case {
+    name: str
+    status: i64
+}
+
+struct Builds {
+    node: str
+    dir: str
+    native: str
+    module: str
+    script: str
+}
+
+fn cases() -> []Case {
+    [
+        Case { name: "fib", status: 0 }
+        Case { name: "long_chains", status: 0 }
+        Case { name: "gc", status: 0 }
+        Case { name: "simd_edges", status: 0 }
+        Case { name: "std_rand_more", status: 0 }
+        Case { name: "crypto_random_large", status: 0 }
+        Case { name: "dynamic_error", status: 1 }
+        Case { name: "std_file_temp", status: 1 }
+    ]
+}
+
+fn build_for(source: str, platform: target.OS, output: str) ! Problem {
+    let profile = compiler.release(platform)
+    let unit = native.analyse(source, profile) catch {
+        e => fail Failed(native.message(e))
+    }
+    native.build(unit, output) catch {
+        e => fail Failed(native.message(e))
+    }
+}
+
+fn execute(command: process.Command, input: []u8) -> Ran ! Problem {
+    let output = process.run(command, input) catch {
+        e => fail Failed("run {command.program}: {testing.format(e)}")
+    }
+    let status = match output.status {
+        Exited(code) => code
+        Signaled(_) => -1
+    }
+    Ran { status, stdout: str(output.stdout), stderr: str(output.stderr) }
+}
+
+fn browser_command(b: Builds, module: str) -> process.Command {
+    var command = process.command(b.node, [b.script, module])
+    var environment = os.environment()
+    environment[stress_variable] = stress_value
+    command.env = some(environment)
+    command
+}
+
+fn prepare(node: str, dir: str) -> Builds ! Problem {
+    let b = Builds {
+        node
+        dir
+        native: path.join([dir, target.executable(target.host(), "playground")])
+        module: path.join([dir, target.executable(target.OS.Browser, "playground")])
+        script: path.join([dir, "host.mjs"])
+    }
+    build_for(playground_source, target.host(), b.native)?
+    build_for(playground_source, target.OS.Browser, b.module)?
+    let host = wasm.host_script()
+    file.write_file(b.script, bytes(host)) catch {
+        e => fail Failed("write {b.script}: {testing.format(e)}")
+    }
+    b
+}
+
+fn read_source(name: str) -> []u8 ! Problem {
+    file.read_file("testdata/run/{name}.low") catch {
+        e => fail Failed("read {name}: {testing.format(e)}")
+    }
+}
+
+fn compare(t: *testing.T, b: Builds, c: Case) ! Problem {
+    let source = read_source(c.name)?
+    let native_command = process.command(b.native, [])
+    let want = execute(native_command, source)?
+    let browser = browser_command(b, b.module)
+    let got = execute(browser, source)?
+    t.equal(want.status, c.status)
+    t.equal(got.status, want.status)
+    t.equal(got.stderr, want.stderr)
+    t.equal(got.stdout == want.stdout, true)
+}
+
+fn run_output(b: Builds, name: str) -> Ran ! Problem {
+    let source = read_source(name)?
+    let browser = browser_command(b, b.module)
+    let compiled = execute(browser, source)?
+    if compiled.status != 0 {
+        fail Failed("compile {name}: {compiled.stderr}")
+    }
+    let module = path.join([b.dir, "{name}.wasm"])
+    file.write_file(module, bytes(compiled.stdout)) catch {
+        e => fail Failed("write {module}: {testing.format(e)}")
+    }
+    let command = browser_command(b, module)
+    execute(command, [])
+}
+
+fn with_builds(t: *testing.T, body: fn(*testing.T, Builds)) {
+    let node = match process.find("node") {
+        some(found) => found
+        none => {
+            t.skip("node is not on PATH")
+            return
+        }
+    }
+    let dir = file.temp_dir("low-playground-") catch {
+        e => {
+            t.error("create temporary directory: {testing.format(e)}")
+            return
+        }
+    }
+    let b = prepare(node, dir) catch {
+        e => {
+            file.remove_all(dir) or {}
+            t.error(describe(e))
+            return
+        }
+    }
+    body(t, b)
+    file.remove_all(dir) or {}
+}
+
+fn test_the_browser_build_compiles_as_the_native_build_does(t: *testing.T) {
+    with_builds(t, fn(t: *testing.T, b: Builds) {
+        t.table_of(cases(), fn(c: Case) -> str { c.name }, fn(t: *testing.T, c: Case) {
+            compare(t, b, c) catch {
+                e => t.error(describe(e))
+            }
+        })
+        check_run(t, b)
+    })
+}
+
+fn check_run(t: *testing.T, b: Builds) {
+    let ran = run_output(b, "fib") catch {
+        e => {
+            t.error(describe(e))
+            return
+        }
+    }
+    let want = file.read_text("testdata/run/fib.out") catch {
+        e => {
+            t.error("read the expected output: {testing.format(e)}")
+            return
+        }
+    }
+    t.equal(ran.stdout, want)
+    t.equal(ran.status, 0)
+}
+
+fn main() {
+    let tests = [
+        testing.Test { name: "the_browser_build_compiles_as_the_native_build_does", run: test_the_browser_build_compiles_as_the_native_build_does }
+    ]
+    let args = os.args()
+    var settings = testing.settings_from(args[1..]) catch {
+        e => {
+            print("flags: {e}")
+            os.exit(2)
+            testing.Settings {}
+        }
+    }
+    let defaults = testing.Settings {}
+    if settings.timeout_ms == defaults.timeout_ms {
+        settings.timeout_ms = slow_timeout
+    }
+    let failed = testing.run_with(tests, settings)
+    if failed > 0 {
+        os.exit(1)
+    }
+}
