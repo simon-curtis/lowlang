@@ -1,0 +1,291 @@
+import std/io
+import std/sql
+import std/sql/mysql
+import std/text
+
+struct Step {
+    client: bool
+    data: []u8
+}
+
+struct Fake {
+    steps: []Step
+    at: i64
+    queued: []u8
+    pending: []u8
+    problems: []str
+    closes: i64
+}
+
+fn describe(e: sql.Error) -> str {
+    match e {
+        Connect => "Connect"
+        Authentication => "Authentication"
+        Closed => "Closed"
+        Timeout => "Timeout"
+        Protocol => "Protocol"
+        Unsupported => "Unsupported"
+        Conversion => "Conversion"
+        Busy => "Busy"
+        Server(code, message) => "Server({code}, {message})"
+    }
+}
+
+fn show(v: sql.Value) -> str {
+    match v {
+        Null => "NULL"
+        Bool(b) => "Bool({b})"
+        Int(n) => "Int({n})"
+        Float(x) => "Float({x})"
+        Decimal(d) => "Decimal({d})"
+        Text(s) => "Text({s})"
+        Bytes(b) => "Bytes({text.encode_hex(b)})"
+        Uuid(b) => "Uuid({text.encode_hex(b)})"
+        Date(d) => "Date({d})"
+        Time(t) => "Time({t})"
+        Timestamp(t) => "Timestamp({t})"
+        TimestampTz(t) => "TimestampTz({t})"
+    }
+}
+
+fn steps_of(lines: []str) -> []Step {
+    var out: []Step = []
+    for line in lines {
+        let data = text.decode_hex(line[1..]) or io.buffer(0)
+        push(mut out, Step { client: line[0] == 'C', data })
+    }
+    out
+}
+
+fn fake_of(lines: []str) -> *Fake {
+    new(Fake { steps: steps_of(lines), at: 0, queued: [], pending: [], problems: [], closes: 0 })
+}
+
+fn problem(f: *Fake, message: str) {
+    push(mut f.problems, message)
+}
+
+fn refill(f: *Fake) {
+    for f.at < f.steps.len && !f.steps[f.at].client {
+        io.append(mut f.queued, f.steps[f.at].data)
+        f.at += 1
+    }
+}
+
+fn accept(f: *Fake, data: []u8) {
+    io.append(mut f.pending, data)
+    for f.pending.len > 0 {
+        if f.at >= f.steps.len || !f.steps[f.at].client {
+            problem(f, "unexpected client bytes {text.encode_hex(f.pending)}")
+            f.pending = []
+            return
+        }
+        let want = f.steps[f.at].data
+        if f.pending.len < want.len {
+            return
+        }
+        let got = f.pending[..want.len]
+        if text.encode_hex(got) != text.encode_hex(want) {
+            problem(f, "client packet {f.at} differs\n  got  {text.encode_hex(got)}\n  want {text.encode_hex(want)}")
+        }
+        f.pending = f.pending[want.len..]
+        f.at += 1
+    }
+}
+
+fn fake_stream(f: *Fake) -> io.Stream {
+    io.Stream {
+        read: fn(buf) -> i64 ! io.Error {
+            if f.queued.len == 0 {
+                refill(f)
+            }
+            if f.queued.len == 0 {
+                problem(f, "client read with nothing scripted at step {f.at}")
+                return 0
+            }
+            let n = io.copy(buf, f.queued)
+            f.queued = f.queued[n..]
+            n
+        }
+        write: fn(data) -> i64 ! io.Error {
+            accept(f, data)
+            data.len
+        }
+        close: fn() { f.closes += 1 }
+    }
+}
+
+fn report(label: str, f: *Fake) {
+    for p in f.problems {
+        print("{label}: {p}")
+    }
+    if f.at != f.steps.len || f.queued.len > 0 || f.pending.len > 0 {
+        print("{label}: stopped at step {f.at} of {f.steps.len}")
+    }
+    print("{label}: script played, closed {f.closes}")
+}
+
+fn rows_line(prefix: str, r: sql.Rows) {
+    for i, c in r.columns {
+        var cells: []str = []
+        for row in r.rows {
+            push(mut cells, show(row[i]))
+        }
+        print("{prefix} {c.name} {c.kind}: {text.join(cells, " ")}")
+    }
+}
+
+fn options(user: str, password: str) -> sql.Options {
+    sql.Options { host: "scripted", port: 3306, user, password, database: "lowtest", timeout: 2000 }
+}
+
+fn session(label: str, lines: []str, user: str, password: str, mariadb: bool) {
+    let f = fake_of(lines)
+    let st = mysql.state()
+    using c = mysql.connect_stream_with(fake_stream(f), options(user, password), mysql.Config { session: st }) catch {
+        e => {
+            print("{label}: connect {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    print("{label}: server {st.server} mariadb {st.mariadb} id {st.connection_id} schema {st.schema} dialect {c.handle.dialect.system}")
+    let a = c.handle.query("SELECT 1 AS a, 'x' AS b, NULL AS c, 1.5 AS d", []) catch {
+        e => {
+            print("{label}: text {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    rows_line("{label}: text", a)
+    let b = c.handle.query("SELECT ? AS n, ? AS s, ? AS z", [sql.Value.Int(5), sql.Value.Text("héllo"), sql.Value.Null]) catch {
+        e => {
+            print("{label}: binary {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    rows_line("{label}: binary", b)
+    c.handle.execute("SELECT * FROM nope", []) catch {
+        e => {
+            print("{label}: error {describe(e)}")
+            0
+        }
+    }
+    c.handle.execute("USE mysql", []) catch {
+        e => {
+            print("{label}: use {describe(e)}")
+            0
+        }
+    }
+    print("{label}: schema {st.schema}")
+    c.handle.begin() catch {
+        e => print("{label}: begin {describe(e)}")
+    }
+    print("{label}: in transaction {st.in_transaction}")
+    c.handle.commit() catch {
+        e => print("{label}: commit {describe(e)}")
+    }
+    print("{label}: in transaction {st.in_transaction}")
+    st.ping() catch {
+        e => print("{label}: ping {describe(e)}")
+    }
+    c.handle.close()
+    report(label, f)
+}
+
+const literals: str = "CAST(-9223372036854775808 AS SIGNED) AS i, CAST(18446744073709551615 AS UNSIGNED) AS u, CAST(-12345.6789 AS DECIMAL(20,4)) AS dc, CAST(-1.5e300 AS DOUBLE) AS d, CAST(0.1 AS FLOAT) AS f, 'héllo 😀' AS s, CAST('abc' AS BINARY) AS b, CAST('2024-02-29' AS DATE) AS dt, CAST('13:45:30.123456' AS TIME(6)) AS t, CAST('-838:59:59' AS TIME) AS tn, CAST('2024-02-29 13:45:30.5' AS DATETIME(6)) AS dtm, NULL AS n, b'101' AS bits, ST_GeomFromText('POINT(1 2)') AS g"
+fn table_row() -> []sql.Value {
+    [sql.Value.Int(-5), sql.Value.Int(250), sql.Value.Int(-300), sql.Value.Int(-70000), sql.Value.Int(2000000000), sql.Value.Decimal("18446744073709551615"),
+        sql.Value.Float(0.5), sql.Value.Float(-1e300), sql.Value.Decimal("12345678.90"), sql.Value.Text("héllo"), sql.Value.Bytes([0, 1, 255]),
+        sql.Value.Date(19782), sql.Value.Time(49530123000), sql.Value.Timestamp(1709214330500000), sql.Value.Timestamp(1709214330123456),
+        sql.Value.Int(5), sql.Value.Int(2024), sql.Value.Text("{{\"k\": 1}}"), sql.Value.Text("y"), sql.Value.Text("p,q"), sql.Value.Text("long"), sql.Value.Bool(true)]
+}
+
+fn types(label: str, lines: []str) {
+    let f = fake_of(lines)
+    using c = mysql.connect_stream(fake_stream(f), options("nat", "natpw")) catch {
+        e => {
+            print("{label}: connect {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    let db = c.handle
+    let a = db.query("SELECT {literals}", []) catch {
+        e => {
+            print("{label}: text {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    rows_line("{label}: text", a)
+    let b = db.query("SELECT {literals}, ? AS z", [sql.Value.Int(1)]) catch {
+        e => {
+            print("{label}: binary {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    rows_line("{label}: binary", b)
+    db.execute("CREATE TEMPORARY TABLE ty (a TINYINT, b TINYINT UNSIGNED, c SMALLINT, d MEDIUMINT, e INT, f BIGINT UNSIGNED, g FLOAT, h DOUBLE, i DECIMAL(10,2), j VARCHAR(10), k BLOB, l DATE, m TIME(3), n DATETIME(6), o TIMESTAMP(6) NULL, p BIT(10), q YEAR, r JSON, s ENUM('x','y'), t SET('p','q'), u TEXT, v BOOLEAN)", []) catch {
+        e => {
+            print("{label}: create {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    let inserted = db.execute("INSERT INTO ty VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", table_row()) catch {
+        e => {
+            print("{label}: insert {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    print("{label}: inserted {inserted}")
+    db.execute("INSERT INTO ty VALUES (NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)", []) catch {
+        e => {
+            print("{label}: insert nulls {describe(e)}")
+            0
+        }
+    }
+    let t = db.query("SELECT * FROM ty ORDER BY a DESC", []) catch {
+        e => {
+            print("{label}: table text {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    rows_line("{label}: table text", t)
+    let u = db.query("SELECT * FROM ty WHERE a IS NOT NULL OR ? = 1 ORDER BY a DESC", [sql.Value.Int(1)]) catch {
+        e => {
+            print("{label}: table binary {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    rows_line("{label}: table binary", u)
+    c.handle.close()
+    report(label, f)
+}
+
+fn main() {
+    session("mysql native", mysql_native(), "nat", "natpw", false)
+    session("mysql caching", mysql_caching(), "csh", "cshpw", false)
+    session("maria native", maria_native(), "nat", "natpw", true)
+    session("maria ed25519", maria_ed25519(), "ed", "edpw", true)
+    types("mysql types", mysql_types())
+    types("maria types", maria_types())
+    run_rounds(auth_rounds()) catch {
+        e => print("auth rounds: {e}")
+    }
+    run_rounds(command_rounds()) catch {
+        e => print("command rounds: {e}")
+    }
+    run_rounds(secure_rounds()) catch {
+        e => print("secure rounds: {e}")
+    }
+    run_rounds(timeout_rounds()) catch {
+        e => print("timeout rounds: {e}")
+    }
+}

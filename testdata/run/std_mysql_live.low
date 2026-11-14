@@ -1,0 +1,901 @@
+import std/crypto/x509
+import std/file
+import std/io
+import std/orm
+import std/os
+import std/sql
+import std/sql/migrate
+import std/sql/mysql
+import std/sql/pool
+import std/text
+import std/time
+import std/tls
+
+struct Target {
+    label: str
+    options: sql.Options
+    ca: str
+    logins: []sql.Options
+    mariadb: bool
+}
+
+struct Probe {
+    label: str
+    expression: str
+    kind: str
+    want: str
+}
+
+enum Role {
+    Admin
+    Member
+}
+
+struct Address {
+    city: str
+    zip: str
+}
+
+struct User {
+    id: i64
+    name: str
+    email: str?
+    age: i32
+    role: Role
+    address: Address?
+    tags: []str
+    active: bool = true
+}
+
+fn credentials(spec: str, database: str) -> sql.Options? {
+    let at = text.last_index_byte(spec, '@')
+    if at < 0 {
+        return none
+    }
+    let login = spec[..at]
+    let address = spec[at + 1..]
+    let colon = text.index_byte(login, ':')
+    let port_at = text.last_index_byte(address, ':')
+    if colon < 0 || port_at < 0 {
+        print("FAIL {spec} is not user:password@host:port")
+        return none
+    }
+    let port = text.parse_int(address[port_at + 1..]) or {
+        print("FAIL {spec} port")
+        return none
+    }
+    sql.Options { host: address[..port_at], port, user: login[..colon], password: login[colon + 1..], database, timeout: 5000 }
+}
+
+fn extra_logins(o: sql.Options, list: str) -> []sql.Options {
+    var out: []sql.Options = []
+    if list.len == 0 {
+        return out
+    }
+    for pair in text.split(list, ',') {
+        let colon = text.index_byte(pair, ':')
+        if colon > 0 {
+            var l = o
+            l.user = pair[..colon]
+            l.password = pair[colon + 1..]
+            push(mut out, l)
+        }
+    }
+    out
+}
+
+fn target(label: str, variable: str) -> Target? {
+    let env = os.environment()
+    let spec = env[variable] ?? ""
+    if spec.len == 0 {
+        return none
+    }
+    let parsed = credentials(spec, "lowtest")
+    let o = match parsed {
+        some(found) => found
+        none => return none
+    }
+    Target { label, options: o, ca: env["{variable}_CA"] ?? "", logins: extra_logins(o, env["{variable}_LOGINS"] ?? ""), mariadb: label == "mariadb" }
+}
+
+fn show(v: sql.Value) -> str {
+    match v {
+        Null => "NULL"
+        Bool(b) => "Bool({b})"
+        Int(n) => "Int({n})"
+        Float(x) => "Float({x})"
+        Decimal(d) => "Decimal({d})"
+        Text(s) => "Text({s})"
+        Bytes(b) => "Bytes({text.encode_hex(b)})"
+        Uuid(b) => "Uuid({text.encode_hex(b)})"
+        Date(d) => "Date({d})"
+        Time(t) => "Time({t})"
+        Timestamp(t) => "Timestamp({t})"
+        TimestampTz(t) => "TimestampTz({t})"
+    }
+}
+
+fn attempt(work: fn() ! sql.Error) -> str {
+    work() catch {
+        Connect => return "Connect"
+        Authentication => return "Authentication"
+        Closed => return "Closed"
+        Timeout => return "Timeout"
+        Protocol => return "Protocol"
+        Unsupported => return "Unsupported"
+        Conversion => return "Conversion"
+        Busy => return "Busy"
+        Server(code, message) => return "Server({code}, {message})"
+    }
+    "ok"
+}
+
+fn check(label: str, got: str, want: str) {
+    if got != want {
+        print("FAIL {label}: got {got} want {want}")
+    }
+}
+
+fn single(db: sql.ConnectionHandle, text: str, values: []sql.Value) -> sql.Value ! sql.Error {
+    let r = db.query(text, values)?
+    if r.rows.len != 1 || r.rows[0].len != 1 {
+        fail Protocol
+    }
+    r.rows[0][0]
+}
+
+fn probes() -> []Probe {
+    [
+        Probe { label: "tinyint", expression: "CAST(-128 AS SIGNED)", kind: "", want: "Int(-128)" },
+        Probe { label: "bigint", expression: "CAST(-9223372036854775808 AS SIGNED)", kind: "bigint", want: "Int(-9223372036854775808)" },
+        Probe { label: "unsigned", expression: "CAST(255 AS UNSIGNED)", kind: "", want: "" },
+        Probe { label: "unsigned max", expression: "CAST(18446744073709551615 AS UNSIGNED)", kind: "bigint unsigned", want: "Decimal(18446744073709551615)" },
+        Probe { label: "decimal", expression: "CAST(-12345.6789 AS DECIMAL(20,4))", kind: "decimal", want: "Decimal(-12345.6789)" },
+        Probe { label: "decimal literal", expression: "1.50", kind: "decimal", want: "Decimal(1.50)" },
+        Probe { label: "double", expression: "CAST(-1.5e300 AS DOUBLE)", kind: "double", want: "Float(-1.5e+300)" },
+        Probe { label: "float", expression: "CAST(0.1 AS FLOAT)", kind: "float", want: "Float(0.1)" },
+        Probe { label: "varchar", expression: "'héllo 😀'", kind: "varchar", want: "Text(héllo 😀)" },
+        Probe { label: "empty", expression: "''", kind: "varchar", want: "Text()" },
+        Probe { label: "binary", expression: "CAST('abc' AS BINARY)", kind: "varbinary", want: "Bytes(616263)" },
+        Probe { label: "hex", expression: "0x00FF10", kind: "varbinary", want: "Bytes(00ff10)" },
+        Probe { label: "date", expression: "CAST('2024-02-29' AS DATE)", kind: "date", want: "Date(19782)" },
+        Probe { label: "date min", expression: "CAST('0001-01-01' AS DATE)", kind: "date", want: "Date(-719162)" },
+        Probe { label: "date max", expression: "CAST('9999-12-31' AS DATE)", kind: "date", want: "Date(2932896)" },
+        Probe { label: "time", expression: "CAST('13:45:30.123456' AS TIME(6))", kind: "time", want: "Time(49530123456)" },
+        Probe { label: "time zero", expression: "CAST('00:00:00' AS TIME)", kind: "time", want: "Time(0)" },
+        Probe { label: "time negative", expression: "CAST('-838:59:59' AS TIME)", kind: "time", want: "Time(-3020399000000)" },
+        Probe { label: "time long", expression: "CAST('838:59:58.5' AS TIME(1))", kind: "time", want: "Time(3020398500000)" },
+        Probe { label: "datetime", expression: "CAST('2024-02-29 13:45:30.5' AS DATETIME(6))", kind: "datetime", want: "Timestamp(1709214330500000)" },
+        Probe { label: "datetime date", expression: "CAST('2024-02-29 00:00:00' AS DATETIME)", kind: "datetime", want: "Timestamp(1709164800000000)" },
+        Probe { label: "datetime epoch", expression: "CAST('1970-01-01 00:00:00' AS DATETIME(3))", kind: "datetime", want: "Timestamp(0)" },
+        Probe { label: "datetime before epoch", expression: "CAST('1969-12-31 23:59:59.999999' AS DATETIME(6))", kind: "datetime", want: "Timestamp(-1)" },
+        Probe { label: "datetime min", expression: "CAST('1000-01-01 00:00:00' AS DATETIME)", kind: "datetime", want: "Timestamp(-30610224000000000)" },
+        Probe { label: "bit", expression: "b'101'", kind: "varbinary", want: "Bytes(05)" },
+        Probe { label: "geometry", expression: "ST_GeomFromText('POINT(1 2)')", kind: "geometry", want: "Bytes(000000000101000000000000000000f03f0000000000000040)" },
+        Probe { label: "zero date", expression: "CAST('0000-00-00' AS DATE)", kind: "date", want: "NULL" },
+        Probe { label: "year", expression: "YEAR('2024-01-01')", kind: "", want: "Int(2024)" },
+        Probe { label: "null", expression: "NULL", kind: "null", want: "NULL" },
+        Probe { label: "boolean", expression: "TRUE", kind: "", want: "Int(1)" },
+        Probe { label: "long text", expression: "REPEAT('x', 70000)", kind: "", want: "" },
+    ]
+}
+
+fn decoding(db: sql.ConnectionHandle) ! sql.Error {
+    for p in probes() {
+        let text_rows = db.query("SELECT {p.expression} AS v", [])?
+        let binary_rows = db.query("SELECT {p.expression} AS v, ? AS z", [sql.Value.Int(1)])?
+        check("{p.label} name", text_rows.columns[0].name, "v")
+        if p.kind.len > 0 {
+            check("{p.label} text kind", text_rows.columns[0].kind, p.kind)
+            check("{p.label} binary kind", binary_rows.columns[0].kind, p.kind)
+        }
+        if p.want.len > 0 {
+            check("{p.label} text", show(text_rows.rows[0][0]), p.want)
+            check("{p.label} binary", show(binary_rows.rows[0][0]), p.want)
+        }
+        check("{p.label} agree", show(text_rows.rows[0][0]), show(binary_rows.rows[0][0]))
+    }
+    check("long text", show(single(db, "SELECT LENGTH(REPEAT('x', 70000))", [])?), "Int(70000)")
+}
+
+fn uuid_bytes() -> []u8 {
+    [0xa0, 0xee, 0xbc, 0x99, 0x9c, 0x0b, 0x4e, 0xf8, 0xbb, 0x6d, 0x6b, 0xb9, 0xbd, 0x38, 0x0a, 0x11]
+}
+
+fn parameters() -> []sql.Value {
+    [
+        sql.Value.Null,
+        sql.Value.Bool(true),
+        sql.Value.Bool(false),
+        sql.Value.Int(-9223372036854775807 - 1),
+        sql.Value.Int(9223372036854775807),
+        sql.Value.Float(-0.25),
+        sql.Value.Float(1e300),
+        sql.Value.Decimal("1.50"),
+        sql.Value.Decimal("-0.000120"),
+        sql.Value.Decimal("99999999999999999999999999999999999999"),
+        sql.Value.Text(""),
+        sql.Value.Text("héllo 😀"),
+        sql.Value.Bytes([]),
+        sql.Value.Bytes([0, 255, 16]),
+        sql.Value.Uuid(uuid_bytes()),
+        sql.Value.Date(-719162),
+        sql.Value.Date(2932896),
+        sql.Value.Date(-1),
+        sql.Value.Time(0),
+        sql.Value.Time(-1),
+        sql.Value.Time(86399999999),
+        sql.Value.Timestamp(-1),
+        sql.Value.Timestamp(951825600000001),
+        sql.Value.TimestampTz(1704164645123456),
+    ]
+}
+
+fn expected_echo(v: sql.Value) -> str {
+    match v {
+        Bool(b) => if b { "Int(1)" } else { "Int(0)" }
+        Uuid(raw) => "Text(a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11)"
+        Date(d) => "Text({date_text(d)})"
+        Time(t) => "Text({time_text(t)})"
+        Timestamp(t) => "Text({moment_text(t)})"
+        TimestampTz(t) => "Text({moment_text(t)})"
+        _ => show(v)
+    }
+}
+
+fn date_text(days: i64) -> str {
+    match days {
+        -719162 => "0001-01-01"
+        2932896 => "9999-12-31"
+        _ => "1969-12-31"
+    }
+}
+
+fn time_text(micros: i64) -> str {
+    match micros {
+        0 => "00:00:00"
+        -1 => "-00:00:00.000001"
+        _ => "23:59:59.999999"
+    }
+}
+
+fn moment_text(micros: i64) -> str {
+    match micros {
+        -1 => "1969-12-31 23:59:59.999999"
+        951825600000001 => "2000-02-29 12:00:00.000001"
+        _ => "2024-01-02 03:04:05.123456"
+    }
+}
+
+fn binding(db: sql.ConnectionHandle) ! sql.Error {
+    for i, v in parameters() {
+        let got = single(db, "SELECT CAST(? AS CHAR) AS c{i}", [v])?
+        let hex = single(db, "SELECT HEX(?) AS h{i}", [v])?
+        match v {
+            Float(x) => {}
+            Decimal(d) => check("echo {i}", show(got), "Text({d})")
+            Int(n) => check("echo {i}", show(got), "Text({n})")
+            Null => check("echo {i}", show(got), "NULL")
+            Bytes(b) => check("echo {i}", show(hex), "Text({text.upper(text.encode_hex(b))})")
+            Text(s) => check("echo {i}", show(got), show(v))
+            _ => {}
+        }
+    }
+    let several = db.query("SELECT ? + ? AS sum, ? AS t, CONCAT(?, ?) AS joined", [sql.Value.Int(2), sql.Value.Int(40), sql.Value.Text("a"), sql.Value.Text("a"), sql.Value.Int(1)])?
+    check("several", "{show(several.rows[0][0])} {show(several.rows[0][1])} {show(several.rows[0][2])}", "Int(42) Text(a) Text(a1)")
+    check("too few", attempt(fn() ! sql.Error { db.query("SELECT ?, ?", [sql.Value.Int(1)])? }), "Conversion")
+    check("nan", attempt(fn() ! sql.Error { db.query("SELECT ?", [sql.Value.Float(0.0 / 0.0)])? }), "Conversion")
+    check("infinity", attempt(fn() ! sql.Error { db.query("SELECT ?", [sql.Value.Float(1.0 / 0.0)])? }), "Conversion")
+    check("short uuid", attempt(fn() ! sql.Error { db.query("SELECT ?", [sql.Value.Uuid([1, 2])])? }), "Conversion")
+    check("date out of range", attempt(fn() ! sql.Error { db.query("SELECT ?", [sql.Value.Date(-800000)])? }), "Conversion")
+    check("time out of range", attempt(fn() ! sql.Error { db.query("SELECT ?", [sql.Value.Time(839 * 3600 * 1000000)])? }), "Conversion")
+    db.execute("DROP TABLE IF EXISTS typed", [])?
+    db.execute("CREATE TABLE typed (id INT, a TINYINT, b TINYINT UNSIGNED, c SMALLINT, d MEDIUMINT, e INT, f BIGINT UNSIGNED, g FLOAT, h DOUBLE, i DECIMAL(20, 6), j VARCHAR(50), k BLOB, l DATE, m TIME(3), n DATETIME(6), o TIMESTAMP(6) NULL, p BIT(10), q YEAR, r JSON, s ENUM('x', 'y'), t SET('p', 'q'), u TEXT, v CHAR(36), w BOOLEAN)", [])?
+    let row = [sql.Value.Int(1), sql.Value.Int(-5), sql.Value.Int(250), sql.Value.Int(-300), sql.Value.Int(-70000), sql.Value.Int(2000000000), sql.Value.Decimal("18446744073709551615"),
+        sql.Value.Float(0.5), sql.Value.Float(-1e300), sql.Value.Decimal("-12345678901234.123456"), sql.Value.Text("héllo"), sql.Value.Bytes([0, 1, 255]),
+        sql.Value.Date(19782), sql.Value.Time(49530123000), sql.Value.Timestamp(1709214330500000), sql.Value.Timestamp(1709214330123456),
+        sql.Value.Int(5), sql.Value.Int(2024), sql.Value.Text("{{\"k\": [1, 2]}}"), sql.Value.Text("y"), sql.Value.Text("p,q"), sql.Value.Text("ñ😀"),
+        sql.Value.Uuid(uuid_bytes()), sql.Value.Bool(true)]
+    check("typed insert", "{db.execute("INSERT INTO typed VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", row)?}", "1")
+    var nulls: []sql.Value = [sql.Value.Int(2)]
+    for _ in 1..24 {
+        push(mut nulls, sql.Value.Null)
+    }
+    db.execute("INSERT INTO typed VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", nulls)?
+    let want = "Int(1) Int(-5) Int(250) Int(-300) Int(-70000) Int(2000000000) Decimal(18446744073709551615) Float(0.5) Float(-1e+300) Decimal(-12345678901234.123456) Text(héllo) Bytes(0001ff) Date(19782) Time(49530123000) Timestamp(1709214330500000) TimestampTz(1709214330123456) Bytes(0005) Int(2024) Text({{\"k\": [1, 2]}}) Text(y) Text(p,q) Text(ñ😀) Text(a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11) Int(1)"
+    let text_back = db.query("SELECT * FROM typed ORDER BY id", [])?
+    let binary_back = db.query("SELECT * FROM typed WHERE id >= ? ORDER BY id", [sql.Value.Int(0)])?
+    for r in [text_back, binary_back] {
+        var got: []str = []
+        for v in r.rows[0] {
+            push(mut got, show(v))
+        }
+        check("typed row", text.join(got, " "), want)
+        var null_count = 0
+        for v in r.rows[1] {
+            if show(v) == "NULL" {
+                null_count += 1
+            }
+        }
+        check("typed nulls", "{null_count}", "23")
+    }
+    var wide: []str = []
+    for i in 0..70 {
+        push(mut wide, if i % 17 == 0 { "{i} AS c{i}" } else { "CAST(NULL AS SIGNED) AS c{i}" })
+    }
+    let sparse = db.query("SELECT {text.join(wide, ", ")} FROM typed WHERE id = ?", [sql.Value.Int(1)])?
+    var shown: []str = []
+    for v in sparse.rows[0] {
+        if show(v) != "NULL" {
+            push(mut shown, show(v))
+        }
+    }
+    check("sparse bitmap", text.join(shown, " "), "Int(0) Int(17) Int(34) Int(51) Int(68)")
+    db.execute("DROP TABLE typed", [])?
+}
+
+fn large(db: sql.ConnectionHandle) ! sql.Error {
+    var wide: []u8 = []
+    for i in 0..150000 {
+        text.append(mut wide, if i % 1000 == 0 { "€😀" } else { "ab" })
+    }
+    let long_text = str(wide)
+    let blob = io.buffer(3000000)
+    for i in 0..blob.len {
+        blob[i] = u8(i * 7 + i / 251)
+    }
+    db.execute("DROP TABLE IF EXISTS big", [])?
+    db.execute("CREATE TABLE big (t LONGTEXT, b LONGBLOB)", [])?
+    db.execute("INSERT INTO big VALUES (?, ?)", [sql.Value.Text(long_text), sql.Value.Bytes(blob)])?
+    let r = db.query("SELECT t, b, CHAR_LENGTH(t), LENGTH(b) FROM big", [])?
+    match r.rows[0][0] {
+        Text(s) => check("long text", if s == long_text { "same" } else { "differs {s.len}" }, "same")
+        _ => check("long text", show(r.rows[0][0]), "Text")
+    }
+    match r.rows[0][1] {
+        Bytes(b) => check("long blob", if b.len == blob.len && str(b) == str(blob) { "same" } else { "differs {b.len}" }, "same")
+        _ => check("long blob", "not bytes", "Bytes")
+    }
+    check("long text length", show(r.rows[0][2]), "Int(300000)")
+    check("long blob length", show(r.rows[0][3]), "Int(3000000)")
+    db.execute("DROP TABLE big", [])?
+    let huge = single(db, "SELECT REPEAT('é', 9000000)", [])?
+    match huge {
+        Text(s) => check("row over 16 MiB", "{s.len}", "18000000")
+        _ => check("row over 16 MiB", show(huge), "Text")
+    }
+    var literal: []u8 = []
+    text.append(mut literal, "SELECT LENGTH('")
+    for _ in 0..17000000 {
+        push(mut literal, 'a')
+    }
+    text.append(mut literal, "')")
+    check("statement over 16 MiB", show(single(db, str(literal), [])?), "Int(17000000)")
+    let mut_blob = io.buffer(17000000)
+    for i in 0..mut_blob.len {
+        mut_blob[i] = u8(i)
+    }
+    check("parameter over 16 MiB", show(single(db, "SELECT LENGTH(?)", [sql.Value.Bytes(mut_blob)])?), "Int(17000000)")
+}
+
+fn errors(db: sql.ConnectionHandle, o: sql.Options) ! sql.Error {
+    check("missing table", attempt(fn() ! sql.Error { db.query("SELECT * FROM nope", [])? }), "Server(42S02, Table 'lowtest.nope' doesn't exist (1146))")
+    check("usable after error", show(single(db, "SELECT 1", [])?), "Int(1)")
+    let syntax = attempt(fn() ! sql.Error { db.execute("SELEC 1", [])? })
+    check("syntax", if text.starts_with(syntax, "Server(42000, You have an error in your SQL syntax") { "ok" } else { syntax }, "ok")
+    check("prepared error", attempt(fn() ! sql.Error { db.query("SELECT * FROM nope WHERE a = ?", [sql.Value.Int(1)])? }), "Server(42S02, Table 'lowtest.nope' doesn't exist (1146))")
+    check("rows before error", attempt(fn() ! sql.Error { db.query("SELECT 1; SELECT * FROM nope", [])? }), "Server(42S02, Table 'lowtest.nope' doesn't exist (1146))")
+    check("usable after errors", show(single(db, "SELECT ?", [sql.Value.Text("still")])?), "Text(still)")
+    check("divide by zero", show(single(db, "SELECT 1 / 0", [])?), "NULL")
+    check("strict mode", attempt(fn() ! sql.Error { db.execute("SELECT CAST('x' AS SIGNED) + 1; SET sql_mode = 'STRICT_ALL_TABLES'; CREATE TEMPORARY TABLE strict_check (n TINYINT); INSERT INTO strict_check VALUES (1000)", [])? }), "Server(22003, Out of range value for column 'n' at row 1 (1264))")
+    var bad = o
+    bad.password = "wrong"
+    check("bad login", attempt(fn() ! sql.Error {
+        using c = mysql.connect(bad)?
+        c.handle.close()
+    }), "Authentication")
+    var missing = o
+    missing.database = "nope"
+    check("missing database", attempt(fn() ! sql.Error {
+        using c = mysql.connect(missing)?
+        c.handle.close()
+    }), "Server(42000, Unknown database 'nope' (1049))")
+    var refused = o
+    refused.port = 1
+    check("refused port", attempt(fn() ! sql.Error {
+        using c = mysql.connect(refused)?
+        c.handle.close()
+    }), "Connect")
+}
+
+fn counts(db: sql.ConnectionHandle) ! sql.Error {
+    db.execute("DROP TABLE IF EXISTS counts", [])?
+    db.execute("CREATE TABLE counts (n INT PRIMARY KEY AUTO_INCREMENT, v INT)", [])?
+    check("insert count", "{db.execute("INSERT INTO counts (v) VALUES (1), (2), (3)", [])?}", "3")
+    check("update count", "{db.execute("UPDATE counts SET v = v + 1 WHERE v > ?", [sql.Value.Int(1)])?}", "2")
+    check("unchanged update", "{db.execute("UPDATE counts SET v = 100 WHERE n = 1", [])?}", "1")
+    check("matched but unchanged", "{db.execute("UPDATE counts SET v = 100 WHERE n = 1", [])?}", "1")
+    check("batch count", "{db.execute("DELETE FROM counts; INSERT INTO counts (v) VALUES (9)", [])?}", "4")
+    check("select count", "{db.execute("SELECT * FROM counts", [])?}", "0")
+    let r = db.query("INSERT INTO counts (v) VALUES (11); SELECT v FROM counts ORDER BY v", [])?
+    check("last result set", "{r.columns[0].name} {r.rows.len}", "v 2")
+    let ids = db.query("SELECT LAST_INSERT_ID() AS id", [])?
+    check("last insert id", show(ids.rows[0][0]), "Decimal(5)")
+    db.execute("DROP TABLE counts", [])?
+}
+
+fn multiple(db: sql.ConnectionHandle) ! sql.Error {
+    db.execute("DROP PROCEDURE IF EXISTS sets", [])?
+    db.execute("CREATE PROCEDURE sets() BEGIN SELECT 1 AS a; SELECT 'x' AS b, 2 AS c; SELECT 3 AS d; END", [])?
+    let last = db.query("CALL sets()", [])?
+    check("procedure last set", "{last.columns[0].name} {show(last.rows[0][0])}", "d Int(3)")
+    var seen: []str = []
+    db.each("CALL sets()", [], fn(cols, values) -> bool {
+        push(mut seen, "{cols.len}:{show(values[0])}")
+        true
+    })?
+    check("procedure each", text.join(seen, " "), "1:Int(1) 2:Text(x) 1:Int(3)")
+    var prepared: []str = []
+    db.each("CALL sets()", [sql.Value.Int(1)], fn(cols, values) -> bool { true }) catch {
+        e => push(mut prepared, "err")
+    }
+    check("prepared procedure", "{prepared.len}", "1")
+    check("usable after sets", show(single(db, "SELECT 4", [])?), "Int(4)")
+    db.execute("DROP PROCEDURE sets", [])?
+}
+
+fn infile(db: sql.ConnectionHandle, dir: str) ! sql.Error {
+    db.execute("DROP TABLE IF EXISTS loaded", [])?
+    db.execute("CREATE TABLE loaded (a INT)", [])?
+    let refused = attempt(fn() ! sql.Error { db.execute("LOAD DATA LOCAL INFILE '{dir}/rows.txt' INTO TABLE loaded", [])? })
+    if refused != "Unsupported" && !text.starts_with(refused, "Server(") {
+        print("FAIL local infile: got {refused}")
+    }
+    check("usable after infile", show(single(db, "SELECT COUNT(*) FROM loaded", [])?), "Int(0)")
+    db.execute("DROP TABLE loaded", [])?
+}
+
+fn level(db: sql.ConnectionHandle) -> str ! sql.Error {
+    single(db, "SELECT COUNT(*) FROM tx", [])?
+    show(single(db, "SELECT trx_isolation_level FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID()", [])?)
+}
+
+fn transactions(db: sql.ConnectionHandle, st: *mysql.State) ! sql.Error {
+    db.execute("DROP TABLE IF EXISTS tx", [])?
+    db.execute("CREATE TABLE tx (n INT PRIMARY KEY) ENGINE=InnoDB", [])?
+    check("not in transaction", "{st.in_transaction}", "false")
+    db.begin()?
+    check("in transaction", "{st.in_transaction}", "true")
+    db.execute("INSERT INTO tx VALUES (?)", [sql.Value.Int(1)])?
+    db.rollback()?
+    check("rolled back", show(single(db, "SELECT COUNT(*) FROM tx", [])?), "Int(0)")
+    check("after rollback", "{st.in_transaction}", "false")
+    db.begin()?
+    db.execute("INSERT INTO tx VALUES (1)", [])?
+    db.commit()?
+    check("committed", show(single(db, "SELECT COUNT(*) FROM tx", [])?), "Int(1)")
+    db.begin()?
+    db.execute("INSERT INTO tx VALUES (2)", [])?
+    let duplicate = attempt(fn() ! sql.Error { db.execute("INSERT INTO tx VALUES (?)", [sql.Value.Int(2)])? })
+    check("duplicate", if text.starts_with(duplicate, "Server(23000, Duplicate entry '2' for key '") { "ok" } else { duplicate }, "ok")
+    db.commit()?
+    check("survived error", show(single(db, "SELECT COUNT(*) FROM tx", [])?), "Int(2)")
+    mysql.begin_with(db, mysql.Isolation.ReadCommitted, true)?
+    let read_only = attempt(fn() ! sql.Error { db.execute("INSERT INTO tx VALUES (50)", [])? })
+    check("read only", if text.starts_with(read_only, "Server(25006, Cannot execute statement in a READ ONLY transaction") { "ok" } else { read_only }, "ok")
+    db.rollback()?
+    db.begin()?
+    db.execute("INSERT INTO tx VALUES (10)", [])?
+    mysql.savepoint(db, "first")?
+    db.execute("INSERT INTO tx VALUES (11)", [])?
+    mysql.savepoint(db, "sec`ond")?
+    db.execute("INSERT INTO tx VALUES (12)", [])?
+    mysql.rollback_to(db, "sec`ond")?
+    check("rolled back to savepoint", show(single(db, "SELECT COUNT(*) FROM tx WHERE n >= 10", [])?), "Int(2)")
+    mysql.release(db, "sec`ond")?
+    check("released twice", attempt(fn() ! sql.Error { mysql.release(db, "sec`ond")? }), "Server(42000, SAVEPOINT sec`ond does not exist (1305))")
+    mysql.rollback_to(db, "first")?
+    check("rolled back to first", show(single(db, "SELECT COUNT(*) FROM tx WHERE n >= 10", [])?), "Int(1)")
+    db.commit()?
+    check("savepoint commit", show(single(db, "SELECT COUNT(*) FROM tx WHERE n >= 10", [])?), "Int(1)")
+    check("transaction state", "{st.in_transaction}", "false")
+    db.execute("DROP TABLE tx", [])?
+}
+
+fn digits(v: sql.Value) -> str {
+    match v {
+        Int(n) => "{n}"
+        Decimal(d) => d
+        _ => show(v)
+    }
+}
+
+fn visible(db: sql.ConnectionHandle) -> str ! sql.Error {
+    show(single(db, "SELECT COUNT(*) FROM tx WHERE n >= 100", [])?)
+}
+
+fn isolation(db: sql.ConnectionHandle, other: sql.ConnectionHandle) ! sql.Error {
+    db.execute("DROP TABLE IF EXISTS tx", [])?
+    db.execute("CREATE TABLE tx (n INT PRIMARY KEY) ENGINE=InnoDB", [])?
+    db.execute("INSERT INTO tx VALUES (1)", [])?
+    db.begin()?
+    visible(db)?
+    other.execute("INSERT INTO tx VALUES (100)", [])?
+    check("repeatable read", visible(db)?, "Int(0)")
+    db.rollback()?
+    other.execute("DELETE FROM tx WHERE n >= 100", [])?
+    mysql.begin_with(db, mysql.Isolation.RepeatableRead, false)?
+    visible(db)?
+    other.execute("INSERT INTO tx VALUES (100)", [])?
+    check("explicit repeatable read", visible(db)?, "Int(0)")
+    db.rollback()?
+    other.execute("DELETE FROM tx WHERE n >= 100", [])?
+    mysql.begin_with(db, mysql.Isolation.ReadCommitted, false)?
+    visible(db)?
+    other.execute("INSERT INTO tx VALUES (100)", [])?
+    check("read committed", visible(db)?, "Int(1)")
+    db.rollback()?
+    other.execute("DELETE FROM tx WHERE n >= 100", [])?
+    mysql.begin_with(db, mysql.Isolation.ReadUncommitted, false)?
+    visible(db)?
+    other.begin()?
+    other.execute("INSERT INTO tx VALUES (100)", [])?
+    check("read uncommitted", visible(db)?, "Int(1)")
+    other.rollback()?
+    db.rollback()?
+    other.execute("SET SESSION innodb_lock_wait_timeout = 1", [])?
+    mysql.begin_with(db, mysql.Isolation.Serializable, false)?
+    visible(db)?
+    let blocked = attempt(fn() ! sql.Error { other.execute("INSERT INTO tx VALUES (150)", [])? })
+    check("serializable", if text.starts_with(blocked, "Server(HY000, Lock wait timeout exceeded") { "ok" } else { blocked }, "ok")
+    db.rollback()?
+    other.execute("INSERT INTO tx VALUES (150)", [])?
+    db.begin()?
+    visible(db)?
+    check("default does not block", attempt(fn() ! sql.Error { other.execute("INSERT INTO tx VALUES (160)", [])? }), "ok")
+    db.rollback()?
+    db.execute("DROP TABLE tx", [])?
+}
+
+fn session(db: sql.ConnectionHandle, st: *mysql.State, mariadb: bool) ! sql.Error {
+    check("schema", st.schema, "lowtest")
+    db.execute("CREATE DATABASE IF NOT EXISTS lowtest_other", [])?
+    db.execute("USE lowtest_other", [])?
+    check("tracked schema", st.schema, "lowtest_other")
+    check("server schema", show(single(db, "SELECT DATABASE()", [])?), "Text(lowtest_other)")
+    db.execute("USE lowtest", [])?
+    check("schema restored", st.schema, "lowtest")
+    db.execute("DROP DATABASE lowtest_other", [])?
+    check("server flavour", "{st.mariadb}", "{mariadb}")
+    check("thread id", digits(single(db, "SELECT CONNECTION_ID()", [])?), "{st.connection_id}")
+    st.ping()?
+    db.execute("SET @kept = 5", [])?
+    st.reset()?
+    check("reset drops variables", show(single(db, "SELECT @kept", [])?), "NULL")
+    check("reset keeps utc", show(single(db, "SELECT @@session.time_zone", [])?), "Text(+00:00)")
+    check("usable after reset", show(single(db, "SELECT ?", [sql.Value.Int(7)])?), "Int(7)")
+    check("utc timestamps", show(single(db, "SELECT CAST(FROM_UNIXTIME(86400) AS DATETIME)", [])?), "Timestamp(86400000000)")
+}
+
+fn statements(db: sql.ConnectionHandle) ! sql.Error {
+    for i in 0..150 {
+        let got = single(db, "SELECT ? + {i} AS n{i}", [sql.Value.Int(1)])?
+        if show(got) != "Int({i + 1})" {
+            print("FAIL statement {i}: {show(got)}")
+        }
+    }
+    check("after eviction", show(single(db, "SELECT ? + 0 AS n0", [sql.Value.Int(41)])?), "Int(41)")
+    let held = db.query("SHOW SESSION STATUS LIKE 'Prepared_stmt_count'", [])?
+    check("statement cache bounded", if show(held.rows[0][1]) == "Text(64)" { "ok" } else { show(held.rows[0][1]) }, "ok")
+}
+
+fn streaming(db: sql.ConnectionHandle) ! sql.Error {
+    db.execute("DROP TABLE IF EXISTS seq", [])?
+    db.execute("CREATE TABLE seq (n INT PRIMARY KEY)", [])?
+    db.execute("INSERT INTO seq VALUES (1)", [])?
+    for _ in 0..16 {
+        db.execute("INSERT INTO seq SELECT n + (SELECT MAX(n) FROM (SELECT n FROM seq) AS m) FROM seq", [])?
+    }
+    var total = 0
+    var seen = 0
+    db.each("SELECT n FROM seq WHERE n <= 60000", [], fn(cols, values) -> bool {
+        match values[0] {
+            Int(n) => {
+                total += n
+            }
+            _ => {}
+        }
+        seen += 1
+        true
+    })?
+    check("streamed rows", "{seen} {total}", "60000 1800030000")
+    var first: []str = []
+    db.each("SELECT 1 AS a FROM seq", [], fn(cols, values) -> bool {
+        push(mut first, cols[0].name)
+        first.len < 5
+    })?
+    check("stopped early", "{first.len}", "5")
+    check("usable after stop", show(single(db, "SELECT 2", [])?), "Int(2)")
+    var inner = ""
+    db.each("SELECT 1 AS a UNION ALL SELECT 2", [], fn(cols, values) -> bool {
+        inner = attempt(fn() ! sql.Error { db.query("SELECT 1", [])? })
+        true
+    })?
+    check("busy", inner, "Busy")
+    check("each error", attempt(fn() ! sql.Error {
+        db.each("SELECT 1 AS a; SELECT * FROM nope", [], fn(cols, values) -> bool { true })?
+    }), "Server(42S02, Table 'lowtest.nope' doesn't exist (1146))")
+    check("usable after each error", show(single(db, "SELECT 3", [])?), "Int(3)")
+    db.execute("DROP TABLE seq", [])?
+}
+
+fn timeouts(o: sql.Options, watcher: sql.ConnectionHandle) ! sql.Error {
+    var quick = o
+    quick.timeout = 400
+    let quick_state = mysql.state()
+    using conn = mysql.connect_with(quick, mysql.Config { session: quick_state })?
+    let db = conn.handle
+    let started = time.monotonic()
+    check("timeout", attempt(fn() ! sql.Error { db.execute("SELECT SLEEP(5)", [])? }), "Timeout")
+    let elapsed = (time.monotonic() - started) / 1000000
+    check("timeout elapsed", if elapsed >= 400 && elapsed < 1500 { "ok" } else { "{elapsed}" }, "ok")
+    check("after timeout", attempt(fn() ! sql.Error { db.execute("SELECT 1", [])? }), "Closed")
+    conn.handle.close()
+    sleep(300)
+    let rows = watcher.query("SELECT COUNT(*) FROM information_schema.processlist WHERE id = {quick_state.connection_id} AND command = 'Query'", [])?
+    check("query killed", show(rows.rows[0][0]), "Int(0)")
+    using slow = mysql.connect(quick)?
+    var seen = 0
+    slow.handle.each("SELECT 1 AS n UNION ALL SELECT 2", [], fn(cols, values) -> bool {
+        sleep(500)
+        seen += 1
+        true
+    })?
+    check("slow visitor", "{seen}", "2")
+    slow.handle.close()
+}
+
+fn logins(t: Target) ! sql.Error {
+    for l in t.logins {
+        using c = mysql.connect(l) catch {
+            e => {
+                print("FAIL login {l.user}: {attempt(fn() ! sql.Error { fail e })}")
+                continue
+            }
+        }
+        let who = single(c.handle, "SELECT CURRENT_USER()", [])?
+        check("login {l.user}", show(who), "Text({l.user}@%)")
+        let again = single(c.handle, "SELECT ?", [sql.Value.Int(1)])?
+        check("login {l.user} query", show(again), "Int(1)")
+        c.handle.close()
+    }
+}
+
+fn secure(o: sql.Options, ca: str, logins: []sql.Options) ! sql.Error {
+    let pem = file.read_text(ca) or {
+        print("FAIL cannot read {ca}")
+        return
+    }
+    let root = x509.parse(x509.pem_certificates(pem)[0]) or {
+        print("FAIL cannot parse {ca}")
+        return
+    }
+    using conn = mysql.connect_tls(o, tls.Config { roots: [root] })?
+    let db = conn.handle
+    let r = db.query("SHOW SESSION STATUS LIKE 'Ssl_cipher'", [])?
+    check("encrypted", if show(r.rows[0][1]) != "Text()" { "yes" } else { "no" }, "yes")
+    var big: []u8 = []
+    for _ in 0..20000 {
+        text.append(mut big, "0123456789")
+    }
+    check("tls large", show(single(db, "SELECT CHAR_LENGTH(?)", [sql.Value.Text(str(big))])?), "Int(200000)")
+    conn.handle.close()
+    check("wrong host", attempt(fn() ! sql.Error {
+        using bad = mysql.connect_tls(sql.Options { host: "127.0.0.2", port: o.port, user: o.user, password: o.password }, tls.Config { roots: [root], server_name: "example.com" })?
+        bad.handle.close()
+    }), "Connect")
+    using unverified = mysql.connect_tls(o, tls.Config { verify: false })?
+    check("unverified", show(single(unverified.handle, "SELECT 5", [])?), "Int(5)")
+    unverified.handle.close()
+    for l in logins {
+        using c = mysql.connect_tls(l, tls.Config { verify: false }) catch {
+            e => {
+                print("FAIL tls login {l.user}: {attempt(fn() ! sql.Error { fail e })}")
+                continue
+            }
+        }
+        check("tls login {l.user}", show(single(c.handle, "SELECT ?", [sql.Value.Int(2)])?), "Int(2)")
+        c.handle.close()
+    }
+}
+
+fn relational(db: sql.ConnectionHandle) ! sql.Error {
+    let users = orm.table[User]("orm_users")
+    orm.drop_table(db, users)?
+    orm.create_table(db, users)?
+    let ada = User { id: 0, name: "Ada", email: none, age: 36, role: Admin, address: Address { city: "London", zip: "N1" }, tags: ["math", "engines"] }
+    let alan = User { id: 0, name: "Alan", email: "alan@example.com", age: 41, role: Member, address: none, tags: [] }
+    let kid = User { id: 0, name: "Kim", email: none, age: 9, role: Member, address: none, tags: ["lego"], active: false }
+    var ids: []str = []
+    for u in [ada, alan, kid] {
+        push(mut ids, show(orm.insert(db, users, u)?))
+    }
+    check("orm ids", text.join(ids, " "), "Int(1) Int(2) Int(3)")
+    let adults = orm.filter(orm.from(users), orm.ge(User.age, 18))
+    var names: []str = []
+    for u in orm.list(db, orm.order_by_desc(adults, User.name))? {
+        let city = match u.address {
+            some(a) => a.city
+            none => "-"
+        }
+        push(mut names, "{u.id}:{u.name}:{u.email ?? "-"}:{city}:{u.tags.len}:{u.active}")
+    }
+    check("orm list", text.join(names, " "), "2:Alan:alan@example.com:-:0:true 1:Ada:-:London:2:true")
+    check("orm count", "{orm.count(db, adults)?}", "2")
+    let paged = orm.list(db, orm.take(orm.skip(orm.order_by(orm.from(users), User.id), 1), 1))?
+    check("orm page", if paged.len == 1 { paged[0].name } else { "{paged.len}" }, "Alan")
+    let skipped = orm.list(db, orm.skip(orm.order_by(orm.from(users), User.id), 2))?
+    check("orm skip only", if skipped.len == 1 { skipped[0].name } else { "{skipped.len}" }, "Kim")
+    let found = orm.find(db, users, 3)?
+    match found {
+        some(u) => check("orm find", "{u.name} {u.active} {u.tags[0]}", "Kim false lego")
+        none => check("orm find", "none", "Kim")
+    }
+    var older = alan
+    older.id = 2
+    older.age = 42
+    check("orm update", "{orm.update(db, users, older)?}", "1")
+    check("orm updated", "{orm.count(db, orm.filter(orm.from(users), orm.eq(User.age, 42)))?}", "1")
+    check("orm like", "{orm.count(db, orm.filter(orm.from(users), orm.like(User.name, "A%")))?}", "2")
+    check("orm null", "{orm.count(db, orm.filter(orm.from(users), orm.is_null(User.email)))?}", "2")
+    check("orm one_of", "{orm.count(db, orm.filter(orm.from(users), orm.one_of(User.id, [1, 3])))?}", "2")
+    check("orm transaction", attempt(fn() ! sql.Error {
+        orm.transaction(db, fn() ! sql.Error {
+            orm.execute(db, "DELETE FROM `orm_users` WHERE id = ?", [sql.Value.Int(1)])?
+            orm.execute(db, "SELECT * FROM nope", [])?
+        })?
+    }), "Server(42S02, Table 'lowtest.nope' doesn't exist (1146))")
+    check("orm rolled back", "{orm.count(db, orm.from(users))?}", "3")
+    orm.transaction(db, fn() ! sql.Error {
+        orm.remove(db, users, older)?
+    })?
+    check("orm removed", "{orm.count(db, orm.from(users))?}", "2")
+    let raw: []User = orm.query(db, "SELECT * FROM `orm_users` WHERE age < ?", [sql.Value.Int(18)])?
+    check("orm raw", if raw.len == 1 { raw[0].name } else { "{raw.len}" }, "Kim")
+    check("orm deleted", "{orm.delete_matching(db, orm.filter(orm.from(users), orm.lt(User.age, 18)))?}", "1")
+    orm.drop_table(db, users)?
+}
+
+fn upserts(db: sql.ConnectionHandle) ! sql.Error {
+    db.execute("DROP TABLE IF EXISTS kv", [])?
+    db.execute("CREATE TABLE kv (k INT PRIMARY KEY, v VARCHAR(20))", [])?
+    let clause = sql.upsert_clause(db.dialect, ["k"], ["v"])
+    check("upsert insert", "{db.execute("INSERT INTO kv (k, v) VALUES (?, ?){clause}", [sql.Value.Int(1), sql.Value.Text("a")])?}", "1")
+    check("upsert update", "{db.execute("INSERT INTO kv (k, v) VALUES (?, ?){clause}", [sql.Value.Int(1), sql.Value.Text("b")])?}", "2")
+    check("upsert value", show(single(db, "SELECT v FROM kv WHERE k = 1", [])?), "Text(b)")
+    db.execute("DROP TABLE kv", [])?
+}
+
+fn returning(db: sql.ConnectionHandle) ! sql.Error {
+    db.execute("DROP TABLE IF EXISTS ret", [])?
+    db.execute("CREATE TABLE ret (id BIGINT AUTO_INCREMENT PRIMARY KEY, v INT)", [])?
+    let r = db.query("INSERT INTO ret (v) VALUES (?) RETURNING id, v", [sql.Value.Int(7)])?
+    check("returning", "{r.columns[0].name} {show(r.rows[0][0])} {show(r.rows[0][1])}", "id Int(1) Int(7)")
+    db.execute("DROP TABLE ret", [])?
+}
+
+fn migrated(h: sql.ConnectionHandle, plan: migrate.Plan) -> str {
+    migrate.up_on(h, plan) catch {
+        Locked => return "locked"
+        _ => return "failed"
+    }
+    "applied"
+}
+
+fn migrations(o: sql.Options, watcher: sql.ConnectionHandle) ! sql.Error {
+    watcher.execute("DROP TABLE IF EXISTS schema_migrations", [])?
+    watcher.execute("DROP TABLE IF EXISTS migrated", [])?
+    let plan = migrate.plan([
+        migrate.Migration { version: 1, name: "create", up: ["CREATE TABLE migrated (n INT)"], down: ["DROP TABLE migrated"] },
+        migrate.Migration { version: 2, name: "fill", up: ["INSERT INTO migrated VALUES (1)", "INSERT INTO migrated VALUES (2)"], down: [] },
+    ])
+    using c = mysql.connect(o)?
+    let ch = c.handle
+    let applied = migrate.up_on(ch, plan) catch {
+        e => {
+            print("FAIL migrate up")
+            return
+        }
+    }
+    check("migrate applied", "{applied.len}", "2")
+    check("migrated rows", show(single(watcher, "SELECT COUNT(*) FROM migrated", [])?), "Int(2)")
+    let again = migrate.up_on(ch, plan) catch {
+        e => {
+            print("FAIL migrate again")
+            return
+        }
+    }
+    check("migrate idempotent", "{again.len}", "0")
+    using other = mysql.connect(o)?
+    other.handle.query("SELECT GET_LOCK(SHA1('low.migrate:schema_migrations'), 0)", [])?
+    check("migrate locked", migrated(ch, plan), "locked")
+    other.handle.execute("DO RELEASE_LOCK(SHA1('low.migrate:schema_migrations'))", [])?
+    other.handle.close()
+    c.handle.close()
+    watcher.execute("DROP TABLE migrated", [])?
+    watcher.execute("DROP TABLE schema_migrations", [])?
+}
+
+fn pooled(o: sql.Options) ! sql.Error {
+    let p = pool.open(fn() -> sql.Connection ! sql.Error { mysql.connect(o) }, pool.Config { max: 3 })
+    var ids: []str = []
+    for _ in 0..5 {
+        pool.with(p, fn(h: sql.ConnectionHandle) ! sql.Error {
+            push(mut ids, show(single(h, "SELECT CONNECTION_ID()", [])?))
+        }) catch {
+            e => print("FAIL pool")
+        }
+    }
+    let stats = pool.stats(p)
+    check("pool reuse", "{stats.opened}", "1")
+    pool.shutdown(p)
+}
+
+fn step(label: str, work: fn() ! sql.Error) {
+    let outcome = attempt(work)
+    check(label, outcome, "ok")
+}
+
+fn live(t: Target, dir: str) ! sql.Error {
+    let st = mysql.state()
+    using conn = mysql.connect_with(t.options, mysql.Config { session: st })?
+    using second = mysql.connect(t.options)?
+    let db = conn.handle
+    let other = second.handle
+    check("dialect", db.dialect.system, t.label)
+    step("decoding", fn() ! sql.Error { decoding(db)? })
+    step("binding", fn() ! sql.Error { binding(db)? })
+    step("large", fn() ! sql.Error { large(db)? })
+    step("errors", fn() ! sql.Error { errors(db, t.options)? })
+    step("counts", fn() ! sql.Error { counts(db)? })
+    step("multiple", fn() ! sql.Error { multiple(db)? })
+    step("infile", fn() ! sql.Error { infile(db, dir)? })
+    step("transactions", fn() ! sql.Error { transactions(db, st)? })
+    step("isolation", fn() ! sql.Error { isolation(db, other)? })
+    step("session", fn() ! sql.Error { session(db, st, t.mariadb)? })
+    step("statements", fn() ! sql.Error { statements(db)? })
+    step("streaming", fn() ! sql.Error { streaming(db)? })
+    step("relational", fn() ! sql.Error { relational(db)? })
+    step("upserts", fn() ! sql.Error { upserts(db)? })
+    if t.mariadb {
+        step("returning", fn() ! sql.Error { returning(db)? })
+    }
+    step("migrations", fn() ! sql.Error { migrations(t.options, db)? })
+    step("pooled", fn() ! sql.Error { pooled(t.options)? })
+    step("timeouts", fn() ! sql.Error { timeouts(t.options, db)? })
+    step("logins", fn() ! sql.Error { logins(t)? })
+    if t.ca.len > 0 {
+        step("secure", fn() ! sql.Error { secure(t.options, t.ca, t.logins)? })
+    }
+    second.handle.close()
+    conn.handle.close()
+    check("closed", attempt(fn() ! sql.Error { db.execute("SELECT 1", [])? }), "Closed")
+    check("closed ping", attempt(st.ping), "Closed")
+}
+
+fn run(t: Target, dir: str) {
+    let outcome = attempt(fn() ! sql.Error { live(t, dir)? })
+    check("{t.label} live run", outcome, "ok")
+}
+
+fn main() {
+    let dir = os.environment()["LOWLANG_MYSQL_DIR"] ?? "/tmp"
+    match target("mysql", "LOWLANG_MYSQL") {
+        some(t) => run(t, dir)
+        none => {}
+    }
+    match target("mariadb", "LOWLANG_MARIADB") {
+        some(t) => run(t, dir)
+        none => {}
+    }
+}

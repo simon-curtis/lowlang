@@ -1,0 +1,521 @@
+import std/io
+import std/math
+import std/sql
+import std/sql/driver
+import std/text
+import std/time/date
+
+enum Kind {
+    Whole
+    Wide
+    Single
+    Double
+    Exact
+    Characters
+    Octets
+    Day
+    Clock
+    Moment
+    Stamp
+    Year
+    Bits
+    Uuid
+    Void
+}
+
+struct Field {
+    name: str
+    kind: Kind
+    unsigned: bool
+    width: i64
+    label: str
+}
+
+const flag_unsigned = 32
+const flag_enum = 256
+const flag_set = 2048
+
+fn integer_label(code: i64, unsigned: bool) -> str {
+    let base = match code {
+        1 => "tinyint"
+        2 => "smallint"
+        9 => "mediumint"
+        3 => "int"
+        _ => "bigint"
+    }
+    if unsigned { "{base} unsigned" } else { base }
+}
+
+fn blob_label(code: i64, binary: bool) -> str {
+    match code {
+        249 => if binary { "tinyblob" } else { "tinytext" }
+        250 => if binary { "mediumblob" } else { "mediumtext" }
+        251 => if binary { "longblob" } else { "longtext" }
+        _ => if binary { "blob" } else { "text" }
+    }
+}
+
+fn make(kind: Kind, unsigned: bool, width: i64, label: str) -> Field {
+    Field { name: "", kind, unsigned, width, label }
+}
+
+fn text_kind(binary: bool) -> Kind {
+    if binary { Kind.Octets } else { Kind.Characters }
+}
+
+fn string_label(code: i64, binary: bool) -> str {
+    match code {
+        254 => if binary { "binary" } else { "char" }
+        247 => "enum"
+        248 => "set"
+        _ => if binary { "varbinary" } else { "varchar" }
+    }
+}
+
+fn describe(code: i64, flags: i64, charset: i64, length: i64, extended: str) -> Field {
+    let unsigned = (flags & flag_unsigned) != 0
+    let binary = charset == charset_binary
+    if extended == "uuid" {
+        return make(Kind.Uuid, unsigned, 0, "uuid")
+    }
+    if extended == "inet4" || extended == "inet6" {
+        return make(Kind.Characters, unsigned, 0, extended)
+    }
+    if extended == "json" {
+        return make(Kind.Characters, unsigned, 0, "json")
+    }
+    match code {
+        1 => make(Kind.Whole, unsigned, 1, integer_label(code, unsigned))
+        2 => make(Kind.Whole, unsigned, 2, integer_label(code, unsigned))
+        3 => make(Kind.Whole, unsigned, 4, integer_label(code, unsigned))
+        9 => make(Kind.Whole, unsigned, 4, integer_label(code, unsigned))
+        8 => make(if unsigned { Kind.Wide } else { Kind.Whole }, unsigned, 8, integer_label(code, unsigned))
+        13 => make(Kind.Year, unsigned, 2, "year")
+        4 => make(Kind.Single, unsigned, 4, "float")
+        5 => make(Kind.Double, unsigned, 8, "double")
+        0 => make(Kind.Exact, unsigned, 0, "decimal")
+        246 => make(Kind.Exact, unsigned, 0, "decimal")
+        10 => make(Kind.Day, unsigned, 0, "date")
+        14 => make(Kind.Day, unsigned, 0, "date")
+        11 => make(Kind.Clock, unsigned, 0, "time")
+        19 => make(Kind.Clock, unsigned, 0, "time")
+        12 => make(Kind.Moment, unsigned, 0, "datetime")
+        18 => make(Kind.Moment, unsigned, 0, "datetime")
+        7 => make(Kind.Stamp, unsigned, 0, "timestamp")
+        17 => make(Kind.Stamp, unsigned, 0, "timestamp")
+        16 => make(Kind.Bits, unsigned, length, "bit")
+        245 => make(Kind.Characters, unsigned, 0, "json")
+        255 => make(Kind.Octets, unsigned, 0, "geometry")
+        6 => make(Kind.Void, unsigned, 0, "null")
+        249 => make(text_kind(binary), unsigned, 0, blob_label(code, binary))
+        250 => make(text_kind(binary), unsigned, 0, blob_label(code, binary))
+        251 => make(text_kind(binary), unsigned, 0, blob_label(code, binary))
+        252 => make(text_kind(binary), unsigned, 0, blob_label(code, binary))
+        _ => {
+            if (flags & flag_enum) != 0 {
+                return make(Kind.Characters, unsigned, 0, "enum")
+            }
+            if (flags & flag_set) != 0 {
+                return make(Kind.Characters, unsigned, 0, "set")
+            }
+            make(text_kind(binary), unsigned, 0, string_label(code, binary))
+        }
+    }
+}
+
+fn extended_name(mut p: Packet) -> str ! sql.Error {
+    var block = lenenc_block(mut p)?
+    var name = ""
+    for left(block) > 0 {
+        let kind = byte_of(mut block)?
+        let value = lenenc_text(mut block)?
+        if kind == 0 || (kind == 1 && value == "json") {
+            name = value
+        }
+    }
+    name
+}
+
+fn field_of(mut p: Packet, extended: bool) -> Field ! sql.Error {
+    lenenc_bytes(mut p)?
+    lenenc_bytes(mut p)?
+    lenenc_bytes(mut p)?
+    lenenc_bytes(mut p)?
+    let name = lenenc_text(mut p)?
+    lenenc_bytes(mut p)?
+    var type_name = ""
+    if extended {
+        type_name = extended_name(mut p)?
+    }
+    lenenc(mut p)?
+    let charset = int16(mut p)?
+    let length = int32(mut p)?
+    let code = i64(byte_of(mut p)?)
+    let flags = int16(mut p)?
+    var f = describe(code, flags, charset, length, type_name)
+    f.name = name
+    f
+}
+
+fn columns_of(fields: []Field) -> []sql.Column {
+    let columns: []sql.Column = __make(fields.len)
+    for i, f in fields {
+        columns[i] = sql.Column { name: f.name, kind: f.label }
+    }
+    columns
+}
+
+fn two(s: str, at: i64) -> i64 ! sql.Error {
+    if at + 2 > s.len {
+        fail Conversion
+    }
+    text.parse_int(s[at..at + 2]) or fail Conversion
+}
+
+fn fraction(s: str) -> i64 ! sql.Error {
+    if s.len == 0 {
+        return 0
+    }
+    if s[0] != '.' || s.len > 7 {
+        fail Conversion
+    }
+    var micros = text.parse_int(s[1..]) or fail Conversion
+    for _ in s.len - 1..6 {
+        micros *= 10
+    }
+    micros
+}
+
+fn text_days(s: str) -> i64? ! sql.Error {
+    if s.len != 10 || s[4] != '-' || s[7] != '-' {
+        fail Conversion
+    }
+    let year = text.parse_int(s[..4]) or fail Conversion
+    let month = two(s, 5)?
+    let day = two(s, 8)?
+    if year == 0 && month == 0 && day == 0 {
+        return none
+    }
+    let d = date.of(year, month, day) or fail Conversion
+    date.epoch_days(d)
+}
+
+fn text_clock(s: str) -> i64 ! sql.Error {
+    var body = s
+    var negative = false
+    if body.len > 0 && body[0] == '-' {
+        negative = true
+        body = body[1..]
+    }
+    let first = text.index_byte(body, ':')
+    if first < 1 || body.len < first + 6 || body[first + 3] != ':' {
+        fail Conversion
+    }
+    let hours = text.parse_int(body[..first]) or fail Conversion
+    let minutes = two(body, first + 1)?
+    let seconds = two(body, first + 4)?
+    let micros = fraction(body[first + 6..])?
+    let total = ((hours * 60 + minutes) * 60 + seconds) * 1000000 + micros
+    if negative { -total } else { total }
+}
+
+fn text_moment(s: str) -> i64? ! sql.Error {
+    if s.len < 19 || s[10] != ' ' {
+        fail Conversion
+    }
+    match text_days(s[..10])? {
+        some(days) => {
+            let clock = text_clock(s[11..])?
+            days * driver.micros_per_day + clock
+        }
+        none => none
+    }
+}
+
+fn integer_text(f: Field, s: str) -> sql.Value ! sql.Error {
+    let n = text.parse_int(s) or fail Conversion
+    sql.Value.Int(n)
+}
+
+fn bit_value(f: Field, raw: []u8) -> sql.Value {
+    if f.width == 1 && raw.len == 1 {
+        return sql.Value.Bool(raw[0] != 0)
+    }
+    sql.Value.Bytes(bytes(__str_view(raw)))
+}
+
+fn uuid_value(s: str) -> sql.Value ! sql.Error {
+    if s.len != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+        fail Conversion
+    }
+    let digits = "{s[..8]}{s[9..13]}{s[14..18]}{s[19..23]}{s[24..]}"
+    let raw = text.decode_hex(digits) or fail Conversion
+    sql.Value.Uuid(raw)
+}
+
+fn moment_value(f: Field, micros: i64?) -> sql.Value {
+    match micros {
+        some(m) => if f.kind == Kind.Stamp { sql.Value.TimestampTz(m) } else { sql.Value.Timestamp(m) }
+        none => sql.Value.Null
+    }
+}
+
+fn decode_text(f: Field, raw: []u8) -> sql.Value ! sql.Error {
+    let s = __str_view(raw)
+    match f.kind {
+        Whole => integer_text(f, s)?
+        Wide => sql.Value.Decimal(s)
+        Single => {
+            let x = text.parse_float(s) or fail Conversion
+            sql.Value.Float(x)
+        }
+        Double => {
+            let x = text.parse_float(s) or fail Conversion
+            sql.Value.Float(x)
+        }
+        Exact => sql.Value.Decimal(s)
+        Characters => sql.Value.Text(s)
+        Octets => sql.Value.Bytes(bytes(s))
+        Day => {
+            match text_days(s)? {
+                some(days) => sql.Value.Date(days)
+                none => sql.Value.Null
+            }
+        }
+        Clock => sql.Value.Time(text_clock(s)?)
+        Moment => moment_value(f, text_moment(s)?)
+        Stamp => moment_value(f, text_moment(s)?)
+        Year => integer_text(f, s)?
+        Bits => bit_value(f, raw)
+        Uuid => uuid_value(s)?
+        Void => sql.Value.Null
+    }
+}
+
+fn signed(raw: i64, width: i64, unsigned: bool) -> i64 {
+    if unsigned || width >= 8 {
+        return raw
+    }
+    let top = 1 << (8 * width - 1)
+    if raw >= top { raw - 2 * top } else { raw }
+}
+
+fn binary_text(mut p: Packet) -> str ! sql.Error {
+    lenenc_text(mut p)?
+}
+
+fn binary_days(mut p: Packet) -> i64? ! sql.Error {
+    let size = i64(byte_of(mut p)?)
+    if size == 0 {
+        return none
+    }
+    if size < 4 {
+        fail Protocol
+    }
+    let year = int16(mut p)?
+    let month = i64(byte_of(mut p)?)
+    let day = i64(byte_of(mut p)?)
+    take(mut p, size - 4)?
+    if year == 0 && month == 0 && day == 0 {
+        return none
+    }
+    let d = date.of(year, month, day) or fail Conversion
+    date.epoch_days(d)
+}
+
+fn binary_moment(mut p: Packet) -> i64? ! sql.Error {
+    let size = i64(byte_of(mut p)?)
+    if size == 0 {
+        return none
+    }
+    if size != 4 && size != 7 && size != 11 {
+        fail Protocol
+    }
+    let year = int16(mut p)?
+    let month = i64(byte_of(mut p)?)
+    let day = i64(byte_of(mut p)?)
+    var micros = 0
+    if size >= 7 {
+        let hours = i64(byte_of(mut p)?)
+        let minutes = i64(byte_of(mut p)?)
+        let seconds = i64(byte_of(mut p)?)
+        micros = ((hours * 60 + minutes) * 60 + seconds) * 1000000
+    }
+    if size == 11 {
+        micros += int32(mut p)?
+    }
+    if year == 0 && month == 0 && day == 0 {
+        return none
+    }
+    let d = date.of(year, month, day) or fail Conversion
+    date.epoch_days(d) * driver.micros_per_day + micros
+}
+
+fn binary_clock(mut p: Packet) -> i64 ! sql.Error {
+    let size = i64(byte_of(mut p)?)
+    if size == 0 {
+        return 0
+    }
+    if size != 8 && size != 12 {
+        fail Protocol
+    }
+    let negative = byte_of(mut p)? != 0
+    let days = int32(mut p)?
+    let hours = i64(byte_of(mut p)?)
+    let minutes = i64(byte_of(mut p)?)
+    let seconds = i64(byte_of(mut p)?)
+    var micros = 0
+    if size == 12 {
+        micros = int32(mut p)?
+    }
+    let total = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000000 + micros
+    if negative { -total } else { total }
+}
+
+fn single_value(bits: i64) -> sql.Value ! sql.Error {
+    let x = text.float32_from_bits(u32(bits))
+    let shortest = "{x}"
+    let widened = text.parse_float(shortest) or fail Conversion
+    sql.Value.Float(widened)
+}
+
+fn decode_binary(f: Field, mut p: Packet) -> sql.Value ! sql.Error {
+    match f.kind {
+        Whole => {
+            let raw = io.uint_le(take(mut p, f.width)?, 0, f.width)
+            sql.Value.Int(signed(i64(raw), f.width, f.unsigned))
+        }
+        Wide => {
+            let raw = io.u64_le(take(mut p, 8)?, 0)
+            sql.Value.Decimal("{raw}")
+        }
+        Single => single_value(int32(mut p)?)?
+        Double => sql.Value.Float(text.float_from_bits(u64(int64(mut p)?)))
+        Exact => sql.Value.Decimal(binary_text(mut p)?)
+        Characters => sql.Value.Text(binary_text(mut p)?)
+        Octets => {
+            let raw = lenenc_or_empty(mut p)?
+            sql.Value.Bytes(bytes(__str_view(raw)))
+        }
+        Day => {
+            match binary_days(mut p)? {
+                some(days) => sql.Value.Date(days)
+                none => sql.Value.Null
+            }
+        }
+        Clock => sql.Value.Time(binary_clock(mut p)?)
+        Moment => moment_value(f, binary_moment(mut p)?)
+        Stamp => moment_value(f, binary_moment(mut p)?)
+        Year => sql.Value.Int(int16(mut p)?)
+        Bits => {
+            let raw = lenenc_or_empty(mut p)?
+            bit_value(f, raw)
+        }
+        Uuid => uuid_value(binary_text(mut p)?)?
+        Void => sql.Value.Null
+    }
+}
+
+struct Parameter {
+    code: i64
+    unsigned: bool
+    body: []u8
+    null: bool
+}
+
+fn put_date(mut b: []u8, days: i64) ! sql.Error {
+    let d = date.from_epoch_days(days) or fail Conversion
+    let year = date.year(d)
+    if year < 0 {
+        fail Conversion
+    }
+    io.put_le16(mut b, year)
+    push(mut b, u8(date.month_number(d)))
+    push(mut b, u8(date.day(d)))
+}
+
+fn moment_body(micros: i64) -> []u8 ! sql.Error {
+    let days = math.floor_div(micros, driver.micros_per_day)
+    let within = micros - days * driver.micros_per_day
+    var b: []u8 = []
+    push(mut b, 11)
+    put_date(mut b, days)?
+    let seconds = within / 1000000
+    push(mut b, u8(seconds / 3600))
+    push(mut b, u8(seconds / 60 % 60))
+    push(mut b, u8(seconds % 60))
+    io.put_le32(mut b, within % 1000000)
+    b
+}
+
+fn clock_body(micros: i64) -> []u8 ! sql.Error {
+    let limit = 838 * 3600 * 1000000 + 3540 * 1000000 + 59 * 1000000 + 999999
+    if micros > limit || micros < -limit {
+        fail Conversion
+    }
+    let magnitude = if micros < 0 { -micros } else { micros }
+    let seconds = magnitude / 1000000
+    var b: []u8 = []
+    push(mut b, 12)
+    push(mut b, if micros < 0 { 1 } else { 0 })
+    io.put_le32(mut b, seconds / 86400)
+    push(mut b, u8(seconds / 3600 % 24))
+    push(mut b, u8(seconds / 60 % 60))
+    push(mut b, u8(seconds % 60))
+    io.put_le32(mut b, magnitude % 1000000)
+    b
+}
+
+fn uuid_text(raw: []u8) -> str ! sql.Error {
+    if raw.len != 16 {
+        fail Conversion
+    }
+    let h = text.encode_hex(raw)
+    "{h[..8]}-{h[8..12]}-{h[12..16]}-{h[16..20]}-{h[20..]}"
+}
+
+fn parameter(v: sql.Value) -> Parameter ! sql.Error {
+    var body: []u8 = []
+    match v {
+        Null => return Parameter { code: 6, unsigned: false, body, null: true }
+        Bool(b) => {
+            push(mut body, if b { 1 } else { 0 })
+            Parameter { code: 1, unsigned: false, body, null: false }
+        }
+        Int(n) => {
+            io.put_le64(mut body, n)
+            Parameter { code: 8, unsigned: false, body, null: false }
+        }
+        Float(x) => {
+            if x != x || x - x != 0.0 {
+                fail Conversion
+            }
+            io.put_le64(mut body, i64(text.float_bits(x)))
+            Parameter { code: 5, unsigned: false, body, null: false }
+        }
+        Decimal(d) => {
+            put_lenenc_text(mut body, d)
+            Parameter { code: 246, unsigned: false, body, null: false }
+        }
+        Text(s) => {
+            put_lenenc_text(mut body, s)
+            Parameter { code: 253, unsigned: false, body, null: false }
+        }
+        Bytes(data) => {
+            put_lenenc_bytes(mut body, data)
+            Parameter { code: 252, unsigned: false, body, null: false }
+        }
+        Uuid(raw) => {
+            put_lenenc_text(mut body, uuid_text(raw)?)
+            Parameter { code: 253, unsigned: false, body, null: false }
+        }
+        Date(days) => {
+            push(mut body, 4)
+            put_date(mut body, days)?
+            Parameter { code: 10, unsigned: false, body, null: false }
+        }
+        Time(micros) => Parameter { code: 11, unsigned: false, body: clock_body(micros)?, null: false }
+        Timestamp(micros) => Parameter { code: 12, unsigned: false, body: moment_body(micros)?, null: false }
+        TimestampTz(micros) => Parameter { code: 12, unsigned: false, body: moment_body(micros)?, null: false }
+    }
+}
