@@ -1,0 +1,430 @@
+import std/crypto/hash
+import std/ice
+import std/io
+import std/net
+import std/time
+
+/// One datagram that is not STUN, received from a known remote address: DTLS, RTP or RTCP (RFC 7983).
+pub struct Datagram {
+    /// The bytes of the datagram.
+    pub data: u8[]
+    /// The address it came from.
+    pub from: net.Addr
+}
+
+/// The local username fragment and password.
+pub struct Credentials {
+    /// The username fragment.
+    pub ufrag: str
+    /// The password.
+    pub pwd: str
+}
+
+/// The settings of `open`.
+pub struct Options {
+    /// The agent settings. `hosts` is set from the sockets that are bound.
+    pub config: ice.Config
+    /// The IP addresses to bind one UDP socket each on, in text form. When empty, the addresses of the host's interfaces are used.
+    pub bind: str[] = []
+    /// Whether the interface addresses include loopback addresses. Used only when `bind` is empty.
+    pub loopback: bool = false
+}
+
+struct Inbound {
+    local: net.Addr
+    from: net.Addr
+    data: u8[]
+}
+
+enum Command {
+    Gather
+    SetRemote(ufrag: str, pwd: str)
+    AddRemote(candidate: ice.Candidate)
+    EndRemote
+    RemoteLite(lite: bool)
+    Restart(reply: chan[Credentials])
+    GetCredentials(reply: chan[Credentials])
+    GetCandidates(reply: chan[ice.Candidate[]])
+    Send(data: u8[], reply: chan[io.Error?])
+    GetSelected(reply: chan[ice.Selection?])
+    GetState(reply: chan[ice.State])
+    Close
+}
+
+enum Step {
+    Command(command: Command)
+    Arrived(packet: Inbound)
+    Elapsed
+    Ended
+}
+
+struct Core {
+    agent: *ice.Agent
+    sockets: net.SocketHandle[]
+    bound: net.Addr[]
+    commands: chan[Command]
+    inbound: chan[Inbound]
+    incoming: chan[Datagram]
+    events: chan[ice.Event]
+    gone: chan[bool]
+}
+
+/// A session that can be copied into a green thread or a closure, and used with every function of this module.
+///
+/// `incoming` carries the datagrams that are not STUN, and `events` the agent's events. Both close when the session ends, and `events` must be read: the session drops an event when 256 wait.
+pub struct Handle {
+    /// The datagrams of known remote addresses that are not STUN.
+    pub incoming: chan[Datagram]
+    /// The agent's events.
+    pub events: chan[ice.Event]
+    core: *Core
+}
+
+/// An ICE agent with the UDP sockets and the green threads that drive it, and the owner that closes it when dropped.
+pub struct Session {
+    /// The copyable view that every function of the module takes.
+    pub handle: Handle
+    drop shutdown(handle.core)
+}
+
+fn clock() -> i64 {
+    time.monotonic() / 1000000
+}
+
+fn same_addr(a: net.Addr, b: net.Addr) -> bool {
+    a.port == b.port && hash.equal(a.ip, b.ip)
+}
+
+fn read_socket(h: net.SocketHandle, inbound: chan[Inbound]) {
+    let buf = io.buffer(65536)
+    for {
+        let packet = net.receive_from_on(h, buf) catch {
+            _ => break
+        }
+        let data = io.buffer(packet.size)
+        io.copy(data, buf[..packet.size])
+        select {
+            inbound <- Inbound { local: h.addr, from: packet.from, data } => {}
+            else => {}
+        }
+    }
+}
+
+fn bind_all(addresses: str[]) -> net.SocketHandle[] ! io.Error {
+    var handles: net.SocketHandle[] = []
+    var last = io.Error.AddrUnavailable
+    for text in addresses {
+        using var socket = net.bind_udp(text, 0) catch {
+            e => {
+                last = e
+                continue
+            }
+        }
+        let detached = net.detach_socket(mut socket)
+        handles.push(detached)
+    }
+    if handles.len == 0 {
+        fail last
+    }
+    handles
+}
+
+fn interface_texts(loopback: bool) -> str[] ! io.Error {
+    var out: str[] = []
+    for ip in ice.local_addresses(loopback)? {
+        let rendered = net.format_ip(ip)
+        out.push(rendered)
+    }
+    out
+}
+
+/// Binds the sockets, creates the agent and starts the green threads that read the sockets and run the agent.
+///
+/// Fails with the error of `ice.local_addresses` when `bind` is empty and the interfaces cannot be listed, and with the last bind error when no address could be bound. An address that cannot be bound is skipped when others can.
+pub fn open(options: Options) -> Session ! io.Error {
+    let texts = if options.bind.len > 0 { options.bind } else { interface_texts(options.loopback)? }
+    let sockets = bind_all(texts)?
+    var bound: net.Addr[] = []
+    for h in sockets {
+        bound.push(h.addr)
+    }
+    var config = options.config
+    config.hosts = bound
+    let core = new(Core {
+        agent: ice.agent(config)
+        sockets
+        bound
+        commands: chan[Command](64)
+        inbound: chan[Inbound](256)
+        incoming: chan[Datagram](256)
+        events: chan[ice.Event](256)
+        gone: chan[bool]()
+    })
+    for h in sockets {
+        spawn read_socket(h, core.inbound)
+    }
+    spawn run(core)
+    Session { handle: Handle { incoming: core.incoming, events: core.events, core } }
+}
+
+fn socket_for(c: *Core, local: net.Addr) -> net.SocketHandle? {
+    for h in c.sockets {
+        if same_addr(h.addr, local) {
+            return h
+        }
+    }
+    none
+}
+
+fn flush(c: *Core) {
+    for {
+        let t = ice.poll_transmit(c.agent) ?? break
+        match socket_for(c, t.local) {
+            some(h) => {
+                net.send_to_on(h, t.data, t.to) or 0
+            }
+            none => {}
+        }
+    }
+    for {
+        let e = ice.poll_event(c.agent) ?? break
+        select {
+            c.events <- e => {}
+            else => {}
+        }
+    }
+}
+
+fn dispatch(c: *Core, p: Inbound, now: i64) {
+    if p.data.len == 0 {
+        return
+    }
+    if p.data[0] < 4 {
+        ice.receive(c.agent, p.local, p.from, p.data, now)
+        return
+    }
+    if ice.knows_remote(c.agent, p.from) {
+        select {
+            c.incoming <- Datagram { data: p.data, from: p.from } => {}
+            else => {}
+        }
+    }
+}
+
+fn send_selected(c: *Core, data: u8[]) -> io.Error? {
+    let s = ice.selected(c.agent) ?? return io.Error.NotConnected
+    let h = socket_for(c, s.base) ?? return io.Error.NotConnected
+    net.send_to_on(h, data, s.remote.addr) catch {
+        e => return e
+    }
+    let sent_at = clock()
+    ice.note_sent(c.agent, sent_at)
+    none
+}
+
+fn handle(c: *Core, command: Command, now: i64) -> bool {
+    match command {
+        Gather => ice.gather(c.agent, now)
+        SetRemote(ufrag, pwd) => ice.set_remote_credentials(c.agent, ufrag, pwd, now)
+        AddRemote(candidate) => ice.add_remote_candidate(c.agent, candidate, now)
+        EndRemote => ice.end_of_remote_candidates(c.agent, now)
+        RemoteLite(lite) => ice.set_remote_lite(c.agent, lite)
+        Restart(reply) => {
+            ice.restart(c.agent, now)
+            reply <- Credentials { ufrag: c.agent.local_ufrag, pwd: c.agent.local_pwd }
+        }
+        GetCredentials(reply) => {
+            reply <- Credentials { ufrag: c.agent.local_ufrag, pwd: c.agent.local_pwd }
+        }
+        GetCandidates(reply) => {
+            reply <- ice.local_candidates(c.agent)
+        }
+        Send(data, reply) => {
+            reply <- send_selected(c, data)
+        }
+        GetSelected(reply) => {
+            reply <- ice.selected(c.agent)
+        }
+        GetState(reply) => {
+            reply <- c.agent.state
+        }
+        Close => return false
+    }
+    true
+}
+
+fn wait_for(c: *Core, now: i64) -> i64 {
+    let t = ice.next_timeout(c.agent)
+    if t < 0 {
+        return 60000
+    }
+    let left = t - now
+    if left < 1 { 1 } else { left }
+}
+
+fn run(c: *Core) {
+    for {
+        let now = clock()
+        let wait = wait_for(c, now)
+        let step = select {
+            command = <-c.commands => match command {
+                some(x) => Step.Command(x)
+                none => Step.Ended
+            }
+            packet = <-c.inbound => match packet {
+                some(x) => Step.Arrived(x)
+                none => Step.Ended
+            }
+            after(wait) => Step.Elapsed
+        }
+        var running = true
+        match step {
+            Command(command) => {
+                let at = clock()
+                running = handle(c, command, at)
+            }
+            Arrived(packet) => {
+                let at = clock()
+                dispatch(c, packet, at)
+            }
+            Elapsed => {}
+            Ended => {
+                running = false
+            }
+        }
+        if !running {
+            break
+        }
+        let at = clock()
+        ice.tick(c.agent, at)
+        flush(c)
+    }
+    ice.close(c.agent)
+    flush(c)
+    for h in c.sockets {
+        net.close_socket_on(h)
+    }
+    close(c.incoming)
+    close(c.events)
+    close(c.gone)
+}
+
+fn shutdown(c: *Core) {
+    select {
+        c.commands <- Command.Close => {}
+        <-c.gone => {}
+    }
+}
+
+fn ask[T](s: Handle, command: Command, reply: chan[T]) -> T ! io.Error {
+    select {
+        s.core.commands <- command => {}
+        <-s.core.gone => fail NotConnected
+    }
+    select {
+        answer = <-reply => match answer {
+            some(v) => v
+            none => fail NotConnected
+        }
+        <-s.core.gone => fail NotConnected
+    }
+}
+
+fn tell(s: Handle, command: Command) ! io.Error {
+    select {
+        s.core.commands <- command => {}
+        <-s.core.gone => fail NotConnected
+    }
+}
+
+/// Returns the local username fragment and password to put in the signalling.
+///
+/// Fails with `NotConnected` once the session has closed.
+pub fn credentials(s: Handle) -> Credentials ! io.Error {
+    let reply = chan[Credentials](1)
+    ask(s, Command.GetCredentials(reply), reply)?
+}
+
+/// Gathers the host candidates and asks the STUN servers for server-reflexive ones; each arrives as an `ice.Event.LocalCandidate` on `events`.
+///
+/// Fails with `NotConnected` once the session has closed.
+pub fn gather(s: Handle) ! io.Error {
+    tell(s, Command.Gather)?
+}
+
+/// Returns the local candidates gathered so far.
+///
+/// Fails with `NotConnected` once the session has closed.
+pub fn candidates(s: Handle) -> ice.Candidate[] ! io.Error {
+    let reply = chan[ice.Candidate[]](1)
+    ask(s, Command.GetCandidates(reply), reply)?
+}
+
+/// Sets the remote username fragment and password, which starts the checks.
+///
+/// Fails with `NotConnected` once the session has closed.
+pub fn set_remote_credentials(s: Handle, ufrag: str, pwd: str) ! io.Error {
+    tell(s, Command.SetRemote(ufrag, pwd))?
+}
+
+/// Adds a remote candidate, which can arrive at any time after the credentials.
+///
+/// Fails with `NotConnected` once the session has closed.
+pub fn add_remote_candidate(s: Handle, c: ice.Candidate) ! io.Error {
+    tell(s, Command.AddRemote(c))?
+}
+
+/// Tells the session the remote peer has no more candidates.
+///
+/// Fails with `NotConnected` once the session has closed.
+pub fn end_of_remote_candidates(s: Handle) ! io.Error {
+    tell(s, Command.EndRemote)?
+}
+
+/// Marks the remote peer as ICE-lite, which makes the session controlling.
+///
+/// Fails with `NotConnected` once the session has closed.
+pub fn set_remote_lite(s: Handle, lite: bool) ! io.Error {
+    tell(s, Command.RemoteLite(lite))?
+}
+
+/// Restarts ICE: new local credentials are returned, and the remote credentials and candidates are cleared. Call `gather` and `set_remote_credentials` afterwards.
+///
+/// Fails with `NotConnected` once the session has closed.
+pub fn restart(s: Handle) -> Credentials ! io.Error {
+    let reply = chan[Credentials](1)
+    ask(s, Command.Restart(reply), reply)?
+}
+
+/// Sends `data` on the selected pair.
+///
+/// Fails with `NotConnected` before a pair is selected and once the session has closed, and with the error of the socket otherwise.
+pub fn send(s: Handle, data: u8[]) ! io.Error {
+    let reply = chan[io.Error?](1)
+    let sent = ask(s, Command.Send(data, reply), reply)?
+    match sent {
+        some(e) => fail e
+        none => {}
+    }
+}
+
+/// Returns the selected pair, or `none` before one is nominated.
+///
+/// Fails with `NotConnected` once the session has closed.
+pub fn selected(s: Handle) -> ice.Selection? ! io.Error {
+    let reply = chan[ice.Selection?](1)
+    ask(s, Command.GetSelected(reply), reply)?
+}
+
+/// Returns the connection state.
+///
+/// Fails with `NotConnected` once the session has closed.
+pub fn state(s: Handle) -> ice.State ! io.Error {
+    let reply = chan[ice.State](1)
+    ask(s, Command.GetState(reply), reply)?
+}
+
+/// Closes the session: the agent stops, the sockets close and `incoming` and `events` close.
+pub fn close_session(s: Handle) {
+    shutdown(s.core)
+}

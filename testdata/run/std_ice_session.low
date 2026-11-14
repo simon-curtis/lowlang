@@ -1,0 +1,145 @@
+import std/ice
+import std/ice/session
+import std/io
+import std/net
+
+fn check(name: str, ok: bool) {
+    if ok {
+        print("{name}: ok")
+    } else {
+        print("{name}: FAIL")
+    }
+}
+
+fn next_event(h: session.Handle) -> ice.Event? {
+    select {
+        e = <-h.events => e
+        after(15000) => none
+    }
+}
+
+fn relay(from: session.Handle, to: session.Handle, completed: chan[bool]) {
+    for {
+        let e = next_event(from) ?? break
+        match e {
+            LocalCandidate(c) => {
+                session.add_remote_candidate(to, c) or break
+            }
+            GatheringComplete => {
+                session.end_of_remote_candidates(to) or break
+            }
+            StateChanged(s) => {
+                if s == ice.State.Completed {
+                    completed <- true
+                }
+            }
+            Selected(_, _) => {}
+        }
+    }
+}
+
+fn next_datagram(h: session.Handle) -> session.Datagram? {
+    select {
+        d = <-h.incoming => d
+        after(5000) => none
+    }
+}
+
+fn pair(bind: str[]) -> bool {
+    using a = session.open(session.Options { config: ice.Config { controlling: true }, bind }) or return false
+    using b = session.open(session.Options { config: ice.Config { controlling: false }, bind }) or return false
+    let ca = session.credentials(a.handle) or return false
+    let cb = session.credentials(b.handle) or return false
+    session.set_remote_credentials(a.handle, cb.ufrag, cb.pwd) or return false
+    session.set_remote_credentials(b.handle, ca.ufrag, ca.pwd) or return false
+    let done_a = chan[bool](1)
+    let done_b = chan[bool](1)
+    spawn relay(a.handle, b.handle, done_a)
+    spawn relay(b.handle, a.handle, done_b)
+    session.gather(a.handle) or return false
+    session.gather(b.handle) or return false
+    var connected = false
+    select {
+        <-done_a => {
+            select {
+                <-done_b => {
+                    connected = true
+                }
+                after(15000) => {}
+            }
+        }
+        after(15000) => {}
+    }
+    check("connects", connected)
+    if !connected {
+        return false
+    }
+    let sa = session.selected(a.handle) or return false
+    let sb = session.selected(b.handle) or return false
+    match sa {
+        some(x) => match sb {
+            some(y) => check("selected pairs mirror", net.format(x.remote.addr) == net.format(y.local.addr) && net.format(y.remote.addr) == net.format(x.local.addr))
+            none => check("selected pairs mirror", false)
+        }
+        none => check("selected pairs mirror", false)
+    }
+    let st = session.state(a.handle) or ice.State.Failed
+    check("state completed", st == ice.State.Completed)
+
+    session.send(a.handle, [0x16, 1, 2, 3]) or {
+        check("send", false)
+        return false
+    }
+    let first = next_datagram(b.handle)
+    match first {
+        some(d) => check("datagram arrives", d.data.len == 4 && d.data[0] == 0x16 && d.data[3] == 3)
+        none => check("datagram arrives", false)
+    }
+    session.send(b.handle, [0x80, 9, 8]) or {
+        check("send back", false)
+        return false
+    }
+    let back = next_datagram(a.handle)
+    match back {
+        some(d) => check("datagram returns", d.data.len == 3 && d.data[0] == 0x80)
+        none => check("datagram returns", false)
+    }
+
+    using stranger = net.bind_udp("127.0.0.1", 0) or return false
+    let target = session.candidates(b.handle) or return false
+    for c in target {
+        if c.addr.ip.len == 4 {
+            net.send_to(stranger, [0x17, 7, 7, 7], c.addr) or 0
+        }
+    }
+    session.send(a.handle, [0x16, 5]) or return false
+    let marker = next_datagram(b.handle)
+    match marker {
+        some(d) => check("unknown sender ignored", d.data.len == 2 && d.data[1] == 5)
+        none => check("unknown sender ignored", false)
+    }
+
+    session.close_session(a.handle)
+    var failed = false
+    session.send(a.handle, [0x16]) catch {
+        NotConnected => {
+            failed = true
+        }
+        _ => {}
+    }
+    check("send after close fails", failed)
+    true
+}
+
+fn unbindable() -> bool {
+    session.open(session.Options { config: ice.Config { controlling: true }, bind: ["203.0.113.77"] }) catch {
+        _ => return true
+    }
+    false
+}
+
+fn main() {
+    check("loopback pair", pair(["127.0.0.1"]))
+    check("dual stack pair", pair(["127.0.0.1", "::1"]))
+    check("unbindable address fails", unbindable())
+}

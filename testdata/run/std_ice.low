@@ -1,0 +1,552 @@
+import std/crypto/hash
+import std/ice
+import std/net
+import std/rand
+import std/slices
+import std/stun
+
+struct Peer {
+    agent: *ice.Agent
+    addr: net.Addr
+    public: net.Addr?
+    partner: i64
+    hidden: i64
+    muted: bool
+    requests: i64
+    indications: i64
+    selections: i64
+}
+
+struct Packet {
+    due: i64
+    target: i64
+    local: net.Addr
+    from: net.Addr
+    data: u8[]
+}
+
+struct Held {
+    to: *ice.Agent
+    candidate: ice.Candidate?
+}
+
+struct World {
+    peers: Peer[]
+    queue: Packet[]
+    rng: rand.Rng
+    loss: i64
+    duplicate: i64
+    now: i64
+    stun_addr: net.Addr
+    stun_config: stun.ServerConfig
+    hold: bool
+    held: Held[]
+}
+
+fn check(name: str, ok: bool) {
+    if ok {
+        print("{name}: ok")
+    } else {
+        print("{name}: FAIL")
+    }
+}
+
+fn address(text: str, port: i64) -> net.Addr {
+    net.Addr { ip: net.parse_ip(text) or [], port }
+}
+
+fn same(a: net.Addr, b: net.Addr) -> bool {
+    a.port == b.port && hash.equal(a.ip, b.ip)
+}
+
+fn world(seed: u64, loss: i64, duplicate: i64) -> *World {
+    new(World {
+        peers: []
+        queue: []
+        rng: rand.seeded(seed)
+        loss
+        duplicate
+        now: 0
+        stun_addr: address("198.51.100.1", 3478)
+        stun_config: stun.ServerConfig { software: "fixture" }
+        hold: false
+        held: []
+    })
+}
+
+fn add_peer(w: *World, config: ice.Config, public: net.Addr?) -> i64 {
+    let agent = ice.agent(config)
+    w.peers.push(Peer { agent, addr: config.hosts[0], public, partner: -1, hidden: 0, muted: false, requests: 0, indications: 0, selections: 0 })
+    w.peers.len - 1
+}
+
+fn pair_up(w: *World, a: i64, b: i64) {
+    w.peers[a].partner = b
+    w.peers[b].partner = a
+    let x = w.peers[a].agent
+    let y = w.peers[b].agent
+    ice.set_remote_credentials(x, y.local_ufrag, y.local_pwd, w.now)
+    ice.set_remote_credentials(y, x.local_ufrag, x.local_pwd, w.now)
+    ice.gather(x, w.now)
+    ice.gather(y, w.now)
+}
+
+fn source_of(p: Peer) -> net.Addr {
+    match p.public {
+        some(a) => a
+        none => p.addr
+    }
+}
+
+fn owner(w: *World, to: net.Addr) -> i64 {
+    for i, p in w.peers {
+        if same(source_of(p), to) {
+            return i
+        }
+    }
+    -1
+}
+
+fn enqueue(w: *World, target: i64, local: net.Addr, from: net.Addr, data: u8[]) {
+    if rand.below(mut w.rng, 100) < w.loss {
+        return
+    }
+    let copies = if rand.below(mut w.rng, 100) < w.duplicate { 2 } else { 1 }
+    for c in 0..copies {
+        let delay = 5 + rand.below(mut w.rng, 60)
+        w.queue.push(Packet { due: w.now + delay, target, local, from, data })
+    }
+}
+
+fn class_of(data: u8[]) -> i64 {
+    let m = stun.parse(data) catch {
+        _ => return -1
+    }
+    m.class.index
+}
+
+fn route(w: *World, from: i64, t: ice.Transmit) {
+    let sender = w.peers[from]
+    if sender.muted {
+        return
+    }
+    let seen = source_of(sender)
+    let class = class_of(t.data)
+    if class == stun.Class.Request.index && !same(t.to, w.stun_addr) {
+        w.peers[from].requests += 1
+    }
+    if class == stun.Class.Indication.index {
+        w.peers[from].indications += 1
+    }
+    if same(t.to, w.stun_addr) {
+        let answer = stun.respond(t.data, seen, w.stun_config)
+        match answer {
+            some(reply) => enqueue(w, from, t.local, w.stun_addr, reply)
+            none => {}
+        }
+        return
+    }
+    let target = owner(w, t.to)
+    if target >= 0 {
+        enqueue(w, target, w.peers[target].addr, seen, t.data)
+    }
+}
+
+fn forward(w: *World, from: i64, e: ice.Event) {
+    let sender = w.peers[from]
+    if sender.partner < 0 {
+        return
+    }
+    let other = w.peers[sender.partner].agent
+    match e {
+        LocalCandidate(c) => {
+            if sender.hidden == 0 || (sender.hidden == 1 && c.kind != ice.Kind.Host) {
+                deliver(w, Held { to: other, candidate: some(c) })
+            }
+        }
+        GatheringComplete => deliver(w, Held { to: other, candidate: none })
+        Selected(_, _) => {
+            w.peers[from].selections += 1
+        }
+        _ => {}
+    }
+}
+
+fn deliver(w: *World, h: Held) {
+    if w.hold {
+        w.held.push(h)
+        return
+    }
+    match h.candidate {
+        some(c) => ice.add_remote_candidate(h.to, c, w.now)
+        none => ice.end_of_remote_candidates(h.to, w.now)
+    }
+}
+
+fn release(w: *World) {
+    w.hold = false
+    let pending = w.held
+    w.held = []
+    for h in pending {
+        deliver(w, h)
+    }
+}
+
+fn step(w: *World) {
+    var later: Packet[] = []
+    for p in w.queue {
+        if p.due <= w.now {
+            ice.receive(w.peers[p.target].agent, p.local, p.from, p.data, w.now)
+        } else {
+            later.push(p)
+        }
+    }
+    w.queue = later
+    for i in 0..w.peers.len {
+        let agent = w.peers[i].agent
+        ice.tick(agent, w.now)
+        for {
+            let t = ice.poll_transmit(agent) ?? break
+            route(w, i, t)
+        }
+        for {
+            let e = ice.poll_event(agent) ?? break
+            forward(w, i, e)
+        }
+    }
+    w.now += 5
+}
+
+fn run_until(w: *World, limit: i64, done: fn(*World) -> bool) -> bool {
+    for w.now < limit {
+        step(w)
+        if done(w) {
+            return true
+        }
+    }
+    false
+}
+
+fn all_completed(w: *World) -> bool {
+    for p in w.peers {
+        if p.agent.state != ice.State.Completed {
+            return false
+        }
+    }
+    true
+}
+
+fn never(w: *World) -> bool {
+    false
+}
+
+fn host_config(controlling: bool, ip: str, port: i64) -> ice.Config {
+    ice.Config { controlling, hosts: [address(ip, port)], rto: 100, transmissions: 6 }
+}
+
+fn selected_pair(a: *ice.Agent) -> str {
+    match ice.selected(a) {
+        some(s) => "{net.format(s.local.addr)} -> {net.format(s.remote.addr)}"
+        none => "none"
+    }
+}
+
+fn parse_failure(line: str) -> bool {
+    ice.parse(line) catch {
+        _ => return true
+    }
+    false
+}
+
+fn priorities() {
+    check("priority host", ice.priority(ice.Kind.Host, 65535, 1) == 2130706431)
+    check("priority server reflexive", ice.priority(ice.Kind.ServerReflexive, 65535, 1) == 1694498815)
+    check("priority peer reflexive", ice.priority(ice.Kind.PeerReflexive, 65535, 1) == 1862270975)
+    check("priority relayed", ice.priority(ice.Kind.Relayed, 65535, 1) == 16777215)
+    check("priority component 2", ice.priority(ice.Kind.Host, 65535, 2) == 2130706430)
+    check("pair priority controlling larger", ice.pair_priority(2130706431, 1694498815) == 7277816997797167103)
+    check("pair priority controlling smaller", ice.pair_priority(1694498815, 2130706431) == 7277816997797167102)
+    check("pair priority peer reflexive", ice.pair_priority(1862270975, 2130706431) == 7998392938176446462)
+    check("local preference prefers IPv6", ice.local_preference(address("::1", 0).ip, 0) > ice.local_preference(address("127.0.0.1", 0).ip, 0))
+    check("local preference ranks in order", ice.local_preference(address("10.0.0.1", 0).ip, 0) > ice.local_preference(address("10.0.0.2", 0).ip, 1))
+    check("foundation host", ice.foundation(ice.Kind.Host, address("10.0.0.1", 0).ip, [], "udp") == "d56fa443")
+    check("foundation server reflexive", ice.foundation(ice.Kind.ServerReflexive, address("10.0.0.1", 0).ip, address("198.51.100.1", 0).ip, "udp") == "a043aa9b")
+    check("foundation differs by type", ice.foundation(ice.Kind.Host, address("10.0.0.1", 0).ip, [], "udp") != ice.foundation(ice.Kind.PeerReflexive, address("10.0.0.1", 0).ip, [], "udp"))
+}
+
+fn candidate_lines() {
+    let host = ice.parse("candidate:3 1 udp 2130706431 192.0.2.3 54400 typ host") or return
+    check("parse host", host.kind == ice.Kind.Host && host.priority == 2130706431 && host.addr.port == 54400 && net.format_ip(host.addr.ip) == "192.0.2.3" && host.foundation == "3")
+    let srflx = ice.parse("a=candidate:842163049 1 udp 1677729535 203.0.113.4 46154 typ srflx raddr 10.0.0.1 rport 8998 generation 0 ufrag EEtu network-cost 999") or return
+    check("parse srflx", srflx.kind == ice.Kind.ServerReflexive && srflx.addr.port == 46154)
+    match srflx.related {
+        some(r) => check("parse related", net.format(r) == "10.0.0.1:8998")
+        none => check("parse related", false)
+    }
+    check("format srflx", ice.format(srflx) == "candidate:842163049 1 udp 1677729535 203.0.113.4 46154 typ srflx raddr 10.0.0.1 rport 8998")
+    let six = ice.parse("candidate:1 1 UDP 2113937151 2001:db8::1 9 typ host") or return
+    check("parse IPv6", six.addr.ip.len == 16 && six.addr.port == 9)
+    check("format IPv6", ice.format(six) == "candidate:1 1 udp 2113937151 2001:db8::1 9 typ host")
+    let relay = ice.parse("candidate:5 1 udp 41885439 203.0.113.9 3478 typ relay raddr 203.0.113.4 rport 46154") or return
+    check("parse relay", relay.kind == ice.Kind.Relayed)
+    let peer = ice.parse("candidate:6 2 udp 1862270974 198.51.100.7 6000 typ prflx") or return
+    check("parse prflx component", peer.kind == ice.Kind.PeerReflexive && peer.component == 2)
+    check("reject tcp", parse_failure("candidate:1 1 tcp 2105524479 192.0.2.3 9 typ host tcptype active"))
+    check("reject mdns name", parse_failure("candidate:1 1 udp 2113937151 0f8e1c2b-a0f9-4d9c-9d3d-8d7a4e3a8e11.local 9 typ host"))
+    check("reject unknown type", parse_failure("candidate:1 1 udp 2113937151 192.0.2.3 9 typ nonsense"))
+    check("reject short line", parse_failure("candidate:1 1 udp 2113937151 192.0.2.3 9"))
+    check("reject bad port", parse_failure("candidate:1 1 udp 2113937151 192.0.2.3 70000 typ host"))
+    check("reject zero priority", parse_failure("candidate:1 1 udp 0 192.0.2.3 9 typ host"))
+    check("reject empty", parse_failure(""))
+}
+
+fn lossy_connection() {
+    let w = world(7, 30, 15)
+    let a = add_peer(w, host_config(true, "10.0.0.1", 5000), none)
+    let b = add_peer(w, host_config(false, "10.0.0.2", 6000), none)
+    pair_up(w, a, b)
+    check("lossy connects", run_until(w, 30000, all_completed))
+    check("lossy selects the same pair", selected_pair(w.peers[a].agent) == "10.0.0.1:5000 -> 10.0.0.2:6000" && selected_pair(w.peers[b].agent) == "10.0.0.2:6000 -> 10.0.0.1:5000")
+    check("lossy roles stay", w.peers[a].agent.controlling && !w.peers[b].agent.controlling)
+}
+
+fn role_conflict() {
+    let w = world(3, 0, 0)
+    var ca = host_config(true, "10.0.0.1", 5000)
+    ca.tie_breaker = 5
+    var cb = host_config(true, "10.0.0.2", 6000)
+    cb.tie_breaker = 10
+    let a = add_peer(w, ca, none)
+    let b = add_peer(w, cb, none)
+    pair_up(w, a, b)
+    check("role conflict connects", run_until(w, 20000, all_completed))
+    check("role conflict leaves one controlling", !w.peers[a].agent.controlling && w.peers[b].agent.controlling)
+}
+
+fn behind_nat(hidden: i64, nated_controlling: bool) -> *World {
+    let w = world(11, 10, 5)
+    var ca = host_config(nated_controlling, "192.168.1.2", 5000)
+    ca.stun_servers = [w.stun_addr]
+    let a = add_peer(w, ca, some(address("203.0.113.5", 41000)))
+    let b = add_peer(w, host_config(!nated_controlling, "198.51.100.7", 6000), none)
+    w.peers[a].hidden = hidden
+    pair_up(w, a, b)
+    w
+}
+
+fn nat_and_server_reflexive() {
+    let w = behind_nat(1, true)
+    check("server reflexive connects", run_until(w, 30000, all_completed))
+    check("server reflexive selects the mapped address", selected_pair(w.peers[1].agent) == "198.51.100.7:6000 -> 203.0.113.5:41000")
+    var found = false
+    for c in ice.local_candidates(w.peers[0].agent) {
+        if c.kind == ice.Kind.ServerReflexive && net.format(c.addr) == "203.0.113.5:41000" {
+            found = true
+        }
+    }
+    check("server reflexive gathered", found)
+    let silent = behind_nat(2, true)
+    check("peer reflexive connects", run_until(silent, 30000, all_completed))
+    check("peer reflexive selects the mapped address", selected_pair(silent.peers[1].agent) == "198.51.100.7:6000 -> 203.0.113.5:41000")
+}
+
+fn controlled_behind_nat() {
+    let learned = behind_nat(1, false)
+    check("controlled nat connects", run_until(learned, 30000, all_completed))
+    check("controlled nat selects the mapped address", selected_pair(learned.peers[1].agent) == "198.51.100.7:6000 -> 203.0.113.5:41000")
+    check("controlled nat selects on both sides", selected_pair(learned.peers[0].agent) == "203.0.113.5:41000 -> 198.51.100.7:6000")
+    let silent = behind_nat(2, false)
+    check("controlled peer reflexive connects", run_until(silent, 30000, all_completed))
+    check("controlled peer reflexive selects the mapped address", selected_pair(silent.peers[1].agent) == "198.51.100.7:6000 -> 203.0.113.5:41000")
+}
+
+fn failed_first(w: *World) -> bool {
+    w.peers[0].agent.state == ice.State.Failed
+}
+
+fn wrong_password() {
+    let w = world(5, 0, 0)
+    let a = add_peer(w, host_config(true, "10.0.0.1", 5000), none)
+    let b = add_peer(w, host_config(false, "10.0.0.2", 6000), none)
+    pair_up(w, a, b)
+    ice.set_remote_credentials(w.peers[a].agent, w.peers[b].agent.local_ufrag, "not-the-password-of-b-1", w.now)
+    check("wrong password fails the checker", run_until(w, 30000, failed_first))
+    check("wrong password selects nothing", selected_pair(w.peers[a].agent) == "none")
+}
+
+fn first_disconnected(w: *World) -> bool {
+    w.peers[0].agent.state == ice.State.Disconnected
+}
+
+fn consent_config(controlling: bool, ip: str, port: i64) -> ice.Config {
+    ice.Config { controlling, hosts: [address(ip, port)], rto: 100, transmissions: 4, consent_interval: 1000, disconnected_after: 3000, consent_timeout: 8000 }
+}
+
+fn consent_freshness() {
+    let w = world(9, 0, 0)
+    let a = add_peer(w, consent_config(true, "10.0.0.1", 5000), none)
+    let b = add_peer(w, consent_config(false, "10.0.0.2", 6000), none)
+    pair_up(w, a, b)
+    check("consent connects", run_until(w, 10000, all_completed))
+    check("consent stays fresh", !run_until(w, w.now + 20000, first_disconnected))
+    check("consent exchange continues", w.peers[a].requests > 4 && w.peers[b].requests > 4)
+    w.peers[b].muted = true
+    check("consent goes stale", run_until(w, w.now + 8000, first_disconnected))
+    w.peers[b].muted = false
+    check("consent recovers", run_until(w, w.now + 8000, all_completed))
+    w.peers[b].muted = true
+    check("consent expires", run_until(w, w.now + 20000, failed_first))
+}
+
+fn indication_count(w: *World) -> bool {
+    w.peers[0].indications >= 3 && w.peers[1].indications >= 3
+}
+
+fn keepalive_indications() {
+    let w = world(13, 0, 0)
+    var ca = host_config(true, "10.0.0.1", 5000)
+    ca.consent = false
+    ca.keepalive_interval = 500
+    var cb = host_config(false, "10.0.0.2", 6000)
+    cb.consent = false
+    cb.keepalive_interval = 500
+    let a = add_peer(w, ca, none)
+    let b = add_peer(w, cb, none)
+    pair_up(w, a, b)
+    check("keepalive connects", run_until(w, 10000, all_completed))
+    check("keepalive sends indications", run_until(w, w.now + 5000, indication_count))
+}
+
+fn lite_remote() {
+    let w = world(17, 20, 10)
+    var cb = host_config(false, "198.51.100.8", 6000)
+    cb.lite = true
+    let a = add_peer(w, host_config(true, "10.0.0.1", 5000), none)
+    let b = add_peer(w, cb, none)
+    ice.set_remote_lite(w.peers[a].agent, true)
+    pair_up(w, a, b)
+    check("lite connects", run_until(w, 30000, all_completed))
+    check("lite sends no checks", w.peers[b].requests == 0)
+    check("lite selects the pair", selected_pair(w.peers[b].agent) == "198.51.100.8:6000 -> 10.0.0.1:5000")
+    check("lite is controlled", !w.peers[b].agent.controlling && w.peers[a].agent.controlling)
+}
+
+fn lite_makes_controlling() {
+    let w = world(19, 0, 0)
+    let a = add_peer(w, host_config(false, "10.0.0.1", 5000), none)
+    ice.set_remote_lite(w.peers[a].agent, true)
+    check("remote lite forces controlling", w.peers[a].agent.controlling)
+}
+
+fn restarted(w: *World) -> bool {
+    w.peers[0].selections >= 2 && w.peers[1].selections >= 2
+}
+
+fn ice_restart() {
+    let w = world(23, 10, 5)
+    let a = add_peer(w, host_config(true, "10.0.0.1", 5000), none)
+    let b = add_peer(w, host_config(false, "10.0.0.2", 6000), none)
+    pair_up(w, a, b)
+    check("restart first connection", run_until(w, 20000, all_completed))
+    let before = w.peers[a].agent.local_ufrag
+    ice.restart(w.peers[a].agent, w.now)
+    ice.restart(w.peers[b].agent, w.now)
+    check("restart changes the credentials", w.peers[a].agent.local_ufrag != before)
+    pair_up(w, a, b)
+    check("restart renominates", run_until(w, w.now + 20000, restarted))
+    check("restart keeps the pair", selected_pair(w.peers[a].agent) == "10.0.0.1:5000 -> 10.0.0.2:6000")
+}
+
+fn trickle() {
+    let w = world(29, 10, 5)
+    w.hold = true
+    let a = add_peer(w, host_config(true, "10.0.0.1", 5000), none)
+    let b = add_peer(w, host_config(false, "10.0.0.2", 6000), none)
+    pair_up(w, a, b)
+    check("trickle waits without candidates", !run_until(w, 2000, all_completed))
+    check("trickle keeps checking", w.peers[a].agent.state == ice.State.Checking)
+    release(w)
+    check("trickle connects after candidates arrive", run_until(w, w.now + 20000, all_completed))
+}
+
+fn no_candidates() {
+    let w = world(31, 0, 0)
+    w.hold = true
+    var ca = host_config(true, "10.0.0.1", 5000)
+    ca.failure_timeout = 2000
+    let a = add_peer(w, ca, none)
+    let b = add_peer(w, host_config(false, "10.0.0.2", 6000), none)
+    pair_up(w, a, b)
+    check("no candidates times out", run_until(w, 10000, failed_first))
+}
+
+fn forged_request(user: str, key: u8[], extra: i64) -> u8[] {
+    var m = stun.message(stun.Class.Request, stun.binding)
+    if user.len > 0 {
+        stun.add_text(mut m, stun.attr_username, user)
+    }
+    stun.add_u32(mut m, stun.attr_priority, 1862270975)
+    stun.add_u64(mut m, stun.attr_ice_controlling, 77)
+    if extra > 0 {
+        stun.add(mut m, extra, [1, 2, 3, 4])
+    }
+    stun.seal(m, stun.Protection { key })
+}
+
+fn answer_code(a: *ice.Agent, data: u8[], from: net.Addr, local: net.Addr) -> i64 {
+    ice.receive(a, local, from, data, 100)
+    let t = ice.poll_transmit(a) ?? return -1
+    let m = stun.parse(t.data) catch {
+        _ => return -2
+    }
+    if m.class == stun.Class.Success {
+        return 200
+    }
+    let e = stun.error_code(m) ?? return -3
+    e.code
+}
+
+fn authenticity() {
+    let local = address("10.0.0.2", 6000)
+    let from = address("10.0.0.1", 5000)
+    let b = ice.agent(ice.Config { controlling: false, hosts: [local] })
+    ice.gather(b, 0)
+    ice.set_remote_credentials(b, "peer", "peerpasswordpeerpasswordx", 0)
+    let key = bytes(b.local_pwd)
+    let user = "{b.local_ufrag}:peer"
+    check("request accepted", answer_code(b, forged_request(user, key, 0), from, local) == 200)
+    check("request without username", answer_code(b, forged_request("", key, 0), from, local) == 400)
+    check("request with a wrong username", answer_code(b, forged_request("other:peer", key, 0), from, local) == 401)
+    check("request with a wrong key", answer_code(b, forged_request(user, bytes("not the key"), 0), from, local) == 401)
+    check("request with an unknown attribute", answer_code(b, forged_request(user, key, 0x7fff), from, local) == 420)
+    check("request with an optional unknown attribute", answer_code(b, forged_request(user, key, 0xc001), from, local) == 200)
+    var tampered = forged_request(user, key, 0)
+    tampered[tampered.len - 1] = tampered[tampered.len - 1] ^ 1
+    check("request with a bad fingerprint ignored", answer_code(b, tampered, from, local) == -1)
+    check("garbage ignored", answer_code(b, [1, 2, 3], from, local) == -1)
+    check("truncated ignored", answer_code(b, forged_request(user, key, 0)[..30], from, local) == -1)
+    var indication = stun.message(stun.Class.Indication, stun.binding)
+    check("indication ignored", answer_code(b, stun.encode(indication), from, local) == -1)
+    var stray = stun.message(stun.Class.Success, stun.binding)
+    stun.add_xor_address(mut stray, stun.attr_xor_mapped_address, from)
+    check("unmatched response ignored", answer_code(b, stun.seal(stray, stun.Protection { key }), from, local) == -1)
+    check("agent stays checking", b.state == ice.State.Checking)
+}
+
+fn main() {
+    priorities()
+    candidate_lines()
+    lossy_connection()
+    role_conflict()
+    nat_and_server_reflexive()
+    controlled_behind_nat()
+    wrong_password()
+    consent_freshness()
+    keepalive_indications()
+    lite_remote()
+    lite_makes_controlling()
+    ice_restart()
+    trickle()
+    no_candidates()
+    authenticity()
+}

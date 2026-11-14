@@ -1,0 +1,118 @@
+import std/io
+import std/net
+
+/// What a Binding server answers and whom it authenticates.
+pub struct ServerConfig {
+    /// The SOFTWARE attribute added to every response, none when empty.
+    pub software: str = ""
+    /// The short-term credentials: a USERNAME mapped to the key that protects messages for it.
+    pub keys: [str: u8[]] = [:]
+    /// Whether a request must carry a USERNAME in `keys` and a valid MESSAGE-INTEGRITY. A request that does not gets a 400 or 401 response.
+    pub authenticate: bool = false
+}
+
+fn known_attributes() -> i64[] {
+    [
+        attr_username
+        attr_message_integrity
+        attr_message_integrity_sha256
+        attr_priority
+        attr_use_candidate
+        attr_realm
+        attr_nonce
+        attr_software
+        attr_fingerprint
+        attr_ice_controlling
+        attr_ice_controlled
+    ]
+}
+
+fn failure(request: Message, c: ServerConfig, code: i64, reason: str) -> Message {
+    var m = Message { class: Class.Error, method: request.method, transaction: request.transaction }
+    add_error_code(mut m, code, reason)
+    if c.software.len > 0 {
+        add_text(mut m, attr_software, c.software)
+    }
+    m
+}
+
+fn credential_key(request: Message, c: ServerConfig) -> u8[]? ! io.Error {
+    if !c.authenticate {
+        return none
+    }
+    let user = match get_text(request, attr_username) {
+        some(u) => u
+        none => fail Malformed
+    }
+    let key = match c.keys[user] {
+        some(k) => k
+        none => fail Denied
+    }
+    check_integrity(request, key, Integrity.Sha1) catch {
+        NotFound => fail Malformed
+        _ => fail Denied
+    }
+    key
+}
+
+/// Answers one datagram that arrived at a Binding server from `from`, returning the datagram to send back, or `none` when no answer is due.
+///
+/// A datagram that is not a STUN message, an indication, a response and a message whose FINGERPRINT is present but wrong get no answer. A request for another method than Binding gets 400, one with an unknown attribute below `0x8000` gets 420 with UNKNOWN-ATTRIBUTES, and with `authenticate` set one without a known USERNAME and valid MESSAGE-INTEGRITY gets 400 or 401. A good request gets a success response with XOR-MAPPED-ADDRESS holding `from`, the SOFTWARE attribute when configured, and a FINGERPRINT; when authenticated the response also carries MESSAGE-INTEGRITY under the key of the request's user.
+pub fn respond(data: u8[], from: net.Addr, c: ServerConfig) -> u8[]? {
+    if !looks_like(data) {
+        return none
+    }
+    let request = parse(data) or return none
+    if request.class != Class.Request {
+        return none
+    }
+    check_fingerprint(request) catch {
+        NotFound => {}
+        _ => return none
+    }
+    if request.method != binding {
+        return seal(failure(request, c, 400, "Bad Request"), fingerprint_only())
+    }
+    let unknown = unknown_required(request, known_attributes())
+    if unknown.len > 0 {
+        var m = failure(request, c, 420, "Unknown Attribute")
+        add_unknown_attributes(mut m, unknown)
+        return seal(m, fingerprint_only())
+    }
+    let key = credential_key(request, c) catch {
+        Denied => return seal(failure(request, c, 401, "Unauthorized"), fingerprint_only())
+        _ => return seal(failure(request, c, 400, "Bad Request"), fingerprint_only())
+    }
+    var m = Message { class: Class.Success, method: binding, transaction: request.transaction }
+    add_xor_address(mut m, attr_xor_mapped_address, from)
+    if c.software.len > 0 {
+        add_text(mut m, attr_software, c.software)
+    }
+    match key {
+        some(k) => seal(m, Protection { key: k })
+        none => seal(m, fingerprint_only())
+    }
+}
+
+fn fingerprint_only() -> Protection {
+    Protection { key: [], sha1: false }
+}
+
+/// Answers Binding requests arriving on `s` until the socket closes.
+///
+/// Reads datagrams with `net.receive_from_on` and replies through `respond`. Run it with `spawn`; closing the socket ends the loop.
+pub fn serve(s: net.SocketHandle, c: ServerConfig) {
+    let buf = io.buffer(65536)
+    for {
+        let packet = net.receive_from_on(s, buf) catch {
+            _ => return
+        }
+        let reply = respond(buf[..packet.size], packet.from, c)
+        match reply {
+            some(out) => {
+                let sent = net.send_to_on(s, out, packet.from) or 0
+            }
+            none => {}
+        }
+    }
+}
