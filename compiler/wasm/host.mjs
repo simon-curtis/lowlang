@@ -11,6 +11,8 @@ const pageBits = 16;
 const addressablePages = 65536;
 const monotonicClock = 1;
 const noInput = -1;
+const lostStatus = "the program stopped without finishing";
+const noPromiseIntegration = "green threads need WebAssembly JavaScript Promise Integration";
 
 function round(x) {
   return x < 0 ? -Math.round(-x) : Math.round(x);
@@ -75,20 +77,111 @@ export async function run(bytes, host) {
     },
     m: math,
   };
-  const { instance } = await WebAssembly.instantiate(bytes, imports);
-  memory = instance.exports.memory;
-  if (host.maxPages !== undefined) {
-    pageLimit = Math.min(addressablePages, (memory.buffer.byteLength >>> pageBits) + host.maxPages);
-  }
-  try {
-    instance.exports._start();
-    return 0;
-  } catch (error) {
+  const module = await WebAssembly.compile(bytes);
+  const threaded = WebAssembly.Module.imports(module).some((entry) => entry.module === "low" && entry.name === "switch");
+  const report = (error) => {
     if (error instanceof Exit) {
       return error.status;
     }
     host.write(2, new TextEncoder().encode(`panic: ${trapMessage(error)}\n`));
     return panicStatus;
+  };
+  if (threaded && typeof WebAssembly.Suspending === "undefined") {
+    return report(new Error(noPromiseIntegration));
+  }
+  const scheduler = threaded ? new Scheduler() : null;
+  if (threaded) {
+    imports.low.switch = new WebAssembly.Suspending((from, to) => scheduler.switch(from >>> 0, to >>> 0));
+    imports.low.wait = new WebAssembly.Suspending((ms) => scheduler.wait(ms >>> 0));
+  }
+  const instance = await WebAssembly.instantiate(module, imports);
+  memory = instance.exports.memory;
+  if (host.maxPages !== undefined) {
+    pageLimit = Math.min(addressablePages, (memory.buffer.byteLength >>> pageBits) + host.maxPages);
+  }
+  if (!threaded) {
+    try {
+      instance.exports._start();
+      return 0;
+    } catch (error) {
+      return report(error);
+    }
+  }
+  const start = WebAssembly.promising(instance.exports._start);
+  const runThread = WebAssembly.promising(instance.exports.run_thread);
+  return scheduler.run(start, runThread, report);
+}
+
+class Scheduler {
+  constructor() {
+    this.resumers = new Map();
+    this.timeouts = new Set();
+    this.settled = false;
+    this.settle = null;
+    this.runThread = null;
+  }
+
+  switch(from, to) {
+    return new Promise((resolve) => {
+      this.resumers.set(from, resolve);
+      queueMicrotask(() => this.go(to));
+    });
+  }
+
+  wait(ms) {
+    return new Promise((resolve) => {
+      const id = setTimeout(() => {
+        this.timeouts.delete(id);
+        resolve();
+      }, ms);
+      this.timeouts.add(id);
+    });
+  }
+
+  go(thread) {
+    if (this.settled) {
+      return;
+    }
+    const resume = this.resumers.get(thread);
+    if (resume !== undefined) {
+      this.resumers.delete(thread);
+      resume();
+      return;
+    }
+    let running;
+    try {
+      running = this.runThread(BigInt(thread));
+    } catch (error) {
+      this.finish(error);
+      return;
+    }
+    running.then(
+      (next) => this.go(Number(BigInt.asUintN(32, next))),
+      (error) => this.finish(error),
+    );
+  }
+
+  finish(error) {
+    if (this.settled) {
+      return;
+    }
+    this.settled = true;
+    for (const id of this.timeouts) {
+      clearTimeout(id);
+    }
+    this.timeouts.clear();
+    this.settle(error);
+  }
+
+  run(start, runThread, report) {
+    this.runThread = runThread;
+    return new Promise((resolve) => {
+      this.settle = (error) => resolve(error === null ? 0 : report(error));
+      start().then(
+        () => this.finish(null),
+        (error) => this.finish(error),
+      );
+    });
   }
 }
 
@@ -143,16 +236,28 @@ async function main() {
     parentPort.postMessage(await runFile(workerData));
     return;
   }
+  if (typeof WebAssembly.Suspending === "undefined") {
+    (await import("node:v8")).setFlagsFromString("--experimental-wasm-jspi");
+  }
   const worker = new Worker(new URL(import.meta.url), {
     workerData: process.argv[2],
     resourceLimits: { stackSizeMb: workerStackMb },
   });
+  let reported = false;
   worker.on("message", (status) => {
+    reported = true;
     process.exitCode = status;
   });
   worker.on("error", (error) => {
+    reported = true;
     process.stderr.write(`panic: ${trapMessage(error)}\n`);
     process.exitCode = panicStatus;
+  });
+  worker.on("exit", () => {
+    if (!reported) {
+      process.stderr.write(`panic: ${lostStatus}\n`);
+      process.exitCode = panicStatus;
+    }
   });
 }
 
