@@ -52,7 +52,7 @@ function trapMessage(error) {
   return error.message;
 }
 
-export async function run(bytes, host) {
+export async function run(program, host) {
   let memory = null;
   let pageLimit = addressablePages;
   const view = (ptr, len) => (len === 0 ? new Uint8Array(0) : new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0));
@@ -77,7 +77,7 @@ export async function run(bytes, host) {
     },
     m: math,
   };
-  const module = await WebAssembly.compile(bytes);
+  const module = program instanceof WebAssembly.Module ? program : await WebAssembly.compile(program);
   const threaded = WebAssembly.Module.imports(module).some((entry) => entry.module === "low" && entry.name === "switch");
   const report = (error) => {
     if (error instanceof Exit) {

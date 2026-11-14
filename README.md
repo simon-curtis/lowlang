@@ -108,17 +108,18 @@ python3 ../assets/brand/build.py
 | Path | Holds |
 |---|---|
 | `site/gen/` | The generator, a Low module run with `low run site/gen` from the repository root. |
-| `site/content/` | The hand-written bodies of the landing page and `404.html`. |
-| `site/src/` | The stylesheet (Tailwind, in `style.css`), the scripts, the fonts and the inlined marks. |
+| `site/content/` | The hand-written bodies of the landing page, the playground page and `404.html`. |
+| `site/src/` | The stylesheet (Tailwind, in `style.css`), the scripts, the worker that runs programs, the fonts and the inlined marks. |
 | `site/public/` | Files copied to the site root unchanged: icons, the web manifest, `install.sh`, `install.ps1`, `_headers` and `_redirects`. |
-| `site/index.html`, `404.html`, `docs/`, `packages/`, `search.json` | The generator's output, ignored by git. |
+| `site/index.html`, `404.html`, `docs/`, `packages/`, `playground/`, `search.json` | The generator's output, ignored by git. |
+| `site/public/playground.wasm` | `compiler/playground` built for `browser/wasm32`, ignored by git. |
 | `site/dist/` | The bundled site, ignored by git. |
 
-`npm run build` runs the `site` task in `site/vite.config.ts`: `low run site/gen`, then `vp build`; the generator runs the `low` on `PATH`. `npm run dev` generates once and serves the pages, reloading styles and scripts as they change. `vp build` bundles every generated page and gives each stylesheet, script, font and the search index a content-hashed name under `assets/`; `site/public/_headers` lets browsers cache `assets/` without revalidating.
+`npm run build` runs the `site` task in `site/vite.config.ts`: `low run site/gen` and `low build compiler/playground -target browser/wasm32 -o site/public/playground.wasm`, then `vp build`. Both run the `low` on `PATH`, which is built from this tree (`low build compiler/low`) because the bootstrap release has no WebAssembly back end. `npm run dev` generates once, builds the playground module and serves the pages, reloading styles and scripts as they change. `vp build` bundles every generated page and gives each stylesheet, script, font and the search index a content-hashed name under `assets/`; `site/public/_headers` lets browsers cache `assets/` without revalidating.
 
 The generator:
 
-- runs `low doc std` once for the standard library and `low names` once per Low snippet, several at a time. `low names` type-checks the snippet and prints every name in it with its hover text, its doc comment, its definition and the first name that refers to the same definition, so the generator needs no language server;
+- runs `low doc std` once for the standard library, and `low names` and `low build -target browser/wasm32` once per Low snippet, several at a time. `low names` type-checks the snippet and prints every name in it with its hover text, its doc comment, its definition and the first name that refers to the same definition, so the generator needs no language server;
 - renders `site/content/index.html` and `404.html` into `site/index.html` and `site/404.html`, wrapping each in the head, masthead, footer and scripts from `site/gen/layout.low`; the footer links the commit `git rev-parse HEAD` names, so a deployed page shows the commit it was built from; `site/gen/pages.low` lists each page's title and description, and `{{origin}}` and `{{repository}}` in the content expand to the URLs in `site/gen/config.low`; `{{examples}}` expands to the programs under `docs/examples/`, found recursively in path order and grouped by folder: each group is an `<h3>` with the title and first paragraph of the folder's `README.md`, then one collapsible entry per program with its highlighted source and a link to the file on GitHub, and a table row in the README that links the program's file name supplies the entry's description; every program is type-checked with the other snippets, with an empty file standing in for each `embed("...")` path;
 - renders `docs/design.md` and `editors/README.md` into `site/docs/` with `std/markdown`, linking each code span that names a heading, such as `### Strings`, to that heading; a heading on the same page wins, and the build fails when the span names no heading or several;
 - renders `site/docs/roadmap.html`, the last docs page, from the issues of the repository in `site/gen/config.low` that carry the `roadmap` label (state open or closed, in ascending number order) and each issue's sub-issues, recursively, in sub-issue order. It fetches them from the GitHub REST API with `std/http`, sends `Authorization: Bearer $GITHUB_TOKEN` when `GITHUB_TOKEN` is set and makes anonymous requests otherwise, and fails the build on a network error or a response that is not 2xx. Anonymous requests share GitHub's low rate limit, so set `GITHUB_TOKEN` for repeated builds. Each issue becomes a list item that links its title to the issue, renders its body as markdown and marks a closed issue `Done`;
@@ -129,6 +130,14 @@ The generator:
 Every page carries a search palette, opened from the masthead's `Search` button, Ctrl K, ⌘ K or `/`. `site/src/search.js` fetches the index in the background when the pointer or focus reaches the button, or when the palette opens, and groups matches by page. Every query word must match. A word matched whole or at its start counts more than one matched inside a word, and a match in a name or title counts more than one in a description, a signature or the text, which counts more the more often it occurs. A name that equals or starts with the query ranks above the rest, and a page ranks by its own score or its best item, whichever is higher.
 
 `build.py` regenerates the icons, social images and web manifest in `site/public/` and the mark in `site/src/` from the brand mark. It needs `rsvg-convert`, `magick` and Noto Sans.
+
+### Running in the browser
+
+A snippet that has a `main` (declared, or made from its loose statements), embeds no file and builds for `browser/wasm32` is runnable: the generator wraps its block in `<div class="runnable" data-program="...">`, with the assembled program text, hidden lines included, in the attribute. A page with such a block loads `site/src/run.js`, which adds a Run button, a Stop button and an output pane to each. The generator prints the runnable count, and the counts of snippets without a `main` or with embedded files and of snippets the browser build rejects, such as those that import an operating system module.
+
+`site/src/run.js` fetches and compiles `playground.wasm` on the first Run, with `WebAssembly.compileStreaming`, and keeps the compiled module. Each Run starts a module Web Worker, `site/src/run-worker.js`, and posts it the module and the program. The worker runs the module with `run` from `compiler/wasm/host.mjs`, giving it the program on standard input, collects the WebAssembly module it writes to standard output and runs that with no standard input. Output of both stages, standard output and standard error in arrival order, goes back to the page, which shows it in the pane with standard error styled apart and a note for a non-zero exit status. Stop terminates the worker. Programs that use green threads need `WebAssembly.Suspending`, which Chrome and Edge have and Firefox has from 153; without it the run reports the panic `host.mjs` prints.
+
+`/playground/` is a page of `site/content/playground/index.html` with a `<textarea>` editor, Run, Stop, a Share button and the same pane. Tab inserts four spaces and Ctrl or ⌘ Enter runs. Share writes the program to the URL fragment as base64url of its `deflate-raw` compression (`CompressionStream`) and copies the address; opening an address with a fragment restores the program.
 
 ### Checked snippets
 
