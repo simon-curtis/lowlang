@@ -25,13 +25,13 @@ $ ./bootstrap.sh /tmp/low
 $ /tmp/low build compiler/low -o /tmp/low2
 $ /tmp/low2 build compiler/low -o /tmp/low3
 $ /tmp/low build compiler/lowtest -o /tmp/lowtest
-$ /tmp/lowtest /tmp/low2 run fail lint examples test
+$ /tmp/lowtest /tmp/low2 run fail lint examples test browser
 $ /tmp/low2 run compiler/tests/check
 $ /tmp/low2 test testdata/test/skip_quiet testdata/test/reads_file -v
 $ /tmp/low2 test std/...
 ```
 
-`bootstrap.sh` builds the compiler with the release in `bootstrap.txt` and writes the result to its first argument, `./low` by default. A rebuilt compiler builds itself to the same bytes, so `low2` and `low3` are identical. `lowtest <low binary> [run|examples|fail|lint|test|windows]... [-filter text]` checks any `low` binary against the sidecar files, using only its command line; `windows` runs only on a Windows host, with a `low.exe` and `lowtest.exe` built by `-target windows/amd64`. A `compiler/tests/<name>` program runs from the repository root. `low test <path>...` builds the `_test.low` files of each named module and runs every test in its own process; `std/...` tests every standard library module with a test file, using the standard library embedded in `low`, so rebuild `low` after editing `std/`. Run `low ir` and `low asm` on a program to read its SSA and assembly.
+`bootstrap.sh` builds the compiler with the release in `bootstrap.txt` and writes the result to its first argument, `./low` by default. A rebuilt compiler builds itself to the same bytes, so `low2` and `low3` are identical. `lowtest <low binary> [run|examples|fail|lint|test|windows|browser]... [-filter text]` checks any `low` binary against the sidecar files, using only its command line; `windows` runs only on a Windows host, with a `low.exe` and `lowtest.exe` built by `-target windows/amd64`. A `compiler/tests/<name>` program runs from the repository root. `low test <path>...` builds the `_test.low` files of each named module and runs every test in its own process; `std/...` tests every standard library module with a test file, using the standard library embedded in `low`, so rebuild `low` after editing `std/`. Run `low ir` and `low asm` on a program to read its SSA and assembly.
 
 Sweeps, snapshots and test runs write gigabytes. Where `/tmp` is a `tmpfs` it is held in memory, so keep that work on disk and point temporary files there: `TMPDIR=<disk dir>`. Run sweeps with at most 8 jobs at once.
 
