@@ -590,20 +590,6 @@ rt_wait_writable:
 	pop rbx
 	ret
 
-	.section .rodata
-	MSG_BEGIN rt_msg_syscall
-	.ascii "system calls are not available on windows"
-	MSG_END
-
-	.text
-rt_panic_syscall:
-	lea rdi, [rip+rt_msg_syscall]
-	jmp rt_panic
-
-	.globl rt_sysblock
-rt_sysblock:
-	jmp rt_panic_syscall
-
 rt_seed_init:
 	push rbp
 	mov rbp, rsp
