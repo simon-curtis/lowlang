@@ -148,6 +148,8 @@ rt_env_values:
 
 	.macro MARK_CANDIDATE
 	mov r8, [rip+rt_heap_start]
+	cmp rdi, r8
+	jb .Lmark_done_\@
 	lea rax, [r8+8]
 	cmp rdi, rax
 	jb .Lmark_search_\@
@@ -170,8 +172,15 @@ rt_env_values:
 	shr rcx, REGION_BITS
 	jnz .Lmark_done_\@
 	shr rax, REGION_SHIFT
-	mov rcx, [rip+rt_region_hits]
-	bts qword ptr [rcx], rax
+	mov rcx, rax
+	shr rcx, 6
+	mov rdx, [rip+rt_region_hits]
+	lea rdx, [rdx+8*rcx]
+	mov rcx, [rdx]
+	bt rcx, rax
+	jc .Lmark_done_\@
+	bts rcx, rax
+	mov [rdx], rcx
 	jmp .Lmark_done_\@
 .Lmark_search_\@:
 	call rt_find
@@ -1628,7 +1637,6 @@ rt_world_start:
 	ret
 
 rt_scan_range:
-
 	push rbx
 	push r12
 	mov rbx, rdi
@@ -1637,8 +1645,8 @@ rt_scan_range:
 	cmp rbx, r12
 	jae 2f
 	mov rdi, [rbx]
-	call rt_mark
 	add rbx, 8
+	MARK_CANDIDATE
 	jmp 1b
 2:
 	pop r12

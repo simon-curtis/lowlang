@@ -145,6 +145,22 @@ rt_region_commit:
 	ja rt_panic_oom
 	ret
 
+rt_region_stash:
+	push rdi
+	push rsi
+	mov rcx, rdx
+	sub rcx, rdi
+	add rcx, 7
+	shr rcx, 3
+	xor eax, eax
+	rep stosq
+	pop rsi
+	pop rdi
+	xor edx, edx
+	mov eax, 10
+	syscall
+	ret
+
 rt_region_decommit:
 	push rdi
 	push rsi

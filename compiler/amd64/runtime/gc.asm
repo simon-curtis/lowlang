@@ -40,6 +40,8 @@ rt_region_list:
 	.zero 8
 rt_region_count:
 	.zero 8
+rt_region_links:
+	.zero 8
 rt_rq:
 	.zero 8
 rt_rq_count:
@@ -159,6 +161,9 @@ rt_region_init:
 	mov rsi, 131072
 	call rt_mmap_stack
 	mov [rip+rt_region_hits], rax
+	mov rsi, 16*REGION_UNITS
+	call rt_mmap_stack
+	mov [rip+rt_region_links], rax
 	ret
 
 rt_region_hits_clear:
@@ -299,12 +304,60 @@ rt_region_fill:
 	pop rax
 	ret
 
+rt_region_keep_head:
+	TLS_GET rcx, TLS_M
+	cmp edi, REGION_FIRST
+	jne 1f
+	lea rcx, [rcx+M_KEEP_FIRST]
+	mov edx, REGION_KEEP_FIRST
+	ret
+1:
+	cmp edi, REGION_NEXT
+	jne 2f
+	lea rcx, [rcx+M_KEEP_NEXT]
+	mov edx, REGION_KEEP_NEXT
+	ret
+2:
+	xor ecx, ecx
+	ret
+
+rt_region_link:
+	mov rax, rdi
+	sub rax, [rip+rt_region_start]
+	shr rax, REGION_SHIFT
+	shl rax, 4
+	add rax, [rip+rt_region_links]
+	ret
+
+rt_region_unkeep:
+	call rt_region_keep_head
+	test rcx, rcx
+	jz 1f
+	mov rax, [rcx]
+	test rax, rax
+	jz 2f
+	push rax
+	mov rdi, rax
+	call rt_region_link
+	mov rdx, [rax]
+	mov [rcx], rdx
+	pop rax
+	ret
+1:
+	xor eax, eax
+2:
+	ret
+
 rt_region_chunk:
 	push rbx
 	push r12
 	push r13
 	mov ebx, edi
 	mov r12d, esi
+	call rt_region_unkeep
+	test rax, rax
+	jnz 4f
+	call rt_heap_acquire
 	xor r13d, r13d
 1:
 	mov esi, ebx
@@ -336,8 +389,10 @@ rt_region_chunk:
 	lea rdi, [rip+rt_msg_region_full]
 	jmp rt_panic
 3:
+	mov qword ptr [rip+rt_heap_lock], 0
 	shl rax, REGION_SHIFT
 	add rax, [rip+rt_region_start]
+4:
 	mov rdi, rax
 	mov ecx, ebx
 	mov esi, 65536
@@ -410,7 +465,6 @@ rt_region_take:
 	mov rbx, rcx
 	mov r12, rdx
 	mov r13, rsi
-	call rt_heap_acquire
 	cmp r12, REGION_LARGE
 	ja 5f
 	test r13, r13
@@ -420,7 +474,6 @@ rt_region_take:
 4:
 	REGION_REFILL R_NOSCAN_CHUNK, R_NOSCAN_BUMP, R_NOSCAN_END, 0
 8:
-	mov qword ptr [rip+rt_heap_lock], 0
 	mov rcx, rbx
 	mov rdx, r12
 	mov rsi, r13
@@ -456,7 +509,6 @@ rt_region_take:
 9:
 	mov [rdx], rcx
 	lea rax, [rdx+8]
-	mov qword ptr [rip+rt_heap_lock], 0
 	pop r13
 	pop r12
 	pop rbx
@@ -466,7 +518,6 @@ rt_region_take:
 rt_region_enter:
 	ENTER_RT
 	push rbx
-	call rt_heap_acquire
 	mov edi, REGION_FIRST
 	xor esi, esi
 	call rt_region_chunk
@@ -477,10 +528,7 @@ rt_region_enter:
 	mov [rbx+R_NOSCAN_BUMP], rcx
 	add rax, 65536
 	mov [rbx+R_NOSCAN_END], rax
-	TLS_GET rax, TLS_G
-	mov rcx, [rax+G_REGION]
-	mov [rbx+R_PARENT], rcx
-	mov [rax+G_REGION], rbx
+	call rt_heap_acquire
 	mov rcx, [rip+rt_region_count]
 	mov rdx, [rip+rt_region_list]
 	mov [rdx+8*rcx], rbx
@@ -488,6 +536,10 @@ rt_region_enter:
 	inc rcx
 	mov [rip+rt_region_count], rcx
 	mov qword ptr [rip+rt_heap_lock], 0
+	TLS_GET rax, TLS_G
+	mov rcx, [rax+G_REGION]
+	mov [rbx+R_PARENT], rcx
+	mov [rax+G_REGION], rbx
 	call rt_alloc_hold
 	mov rax, rbx
 	pop rbx
@@ -561,17 +613,26 @@ rt_region_free:
 	mov rsi, [rdx+8*rcx]
 	mov [rdx+8*rax], rsi
 	mov [rsi+R_INDEX], rax
-	mov r12, [rbx+R_CHUNKS]
+	mov qword ptr [rip+rt_heap_lock], 0
+	mov rax, [rbx+R_SCAN_CHUNK]
+	test rax, rax
+	jz 1f
+	mov rcx, [rbx+R_SCAN_BUMP]
+	mov [rax+CH_USED], rcx
 1:
+	mov rax, [rbx+R_NOSCAN_CHUNK]
+	mov rcx, [rbx+R_NOSCAN_BUMP]
+	mov [rax+CH_USED], rcx
+	mov r12, [rbx+R_CHUNKS]
+2:
 	test r12, r12
-	jz 2f
+	jz 3f
 	mov r13, [r12+CH_NEXT]
 	mov rdi, r12
 	call rt_region_release
 	mov r12, r13
-	jmp 1b
-2:
-	mov qword ptr [rip+rt_heap_lock], 0
+	jmp 2b
+3:
 	pop r13
 	pop r12
 	pop rbx
@@ -580,12 +641,44 @@ rt_region_free:
 rt_region_release:
 	push rbx
 	push r12
+	push r13
 	mov rbx, rdi
 	movzx r12d, byte ptr [rbx+CH_CLASS]
+	mov edi, r12d
+	call rt_region_keep_head
+	test rcx, rcx
+	jz 2f
+	mov r13, rcx
+	mov r8, [rcx]
+	xor r9d, r9d
+	test r8, r8
+	jz 1f
+	mov rdi, r8
+	call rt_region_link
+	mov r9, [rax+8]
+	cmp r9, rdx
+	jae 2f
+1:
+	mov rdi, rbx
+	call rt_region_link
+	mov [rax], r8
+	inc r9
+	mov [rax+8], r9
+	mov [r13], rbx
+	mov rdi, rbx
+	mov ecx, r12d
+	mov esi, 65536
+	shl rsi, cl
+	mov rdx, [rbx+CH_USED]
+	call rt_region_stash
+	jmp 3f
+2:
+	mov rdi, rbx
 	mov ecx, r12d
 	mov esi, 65536
 	shl rsi, cl
 	call rt_region_decommit
+	call rt_heap_acquire
 	mov rax, rbx
 	sub rax, [rip+rt_region_start]
 	shr rax, REGION_SHIFT
@@ -597,6 +690,9 @@ rt_region_release:
 	mov [rdx+8*rcx], rax
 	inc rcx
 	mov [rip+rt_rq_count], rcx
+	mov qword ptr [rip+rt_heap_lock], 0
+3:
+	pop r13
 	pop r12
 	pop rbx
 	ret
