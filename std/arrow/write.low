@@ -1,0 +1,373 @@
+import std/compress/lz4
+import std/compress/zstd
+import std/io
+import std/text
+
+/// How the writer compresses record batch buffers.
+pub enum Compression {
+    /// Buffers are stored as they are.
+    Uncompressed
+    /// Each buffer is one LZ4 frame.
+    Lz4
+    /// Each buffer is one Zstandard frame.
+    Zstd
+}
+
+/// Settings for `stream_writer` and `file_writer`.
+pub struct WriterOptions {
+    /// The buffer compression. Defaults to `Uncompressed`.
+    pub compression: Compression = Compression.Uncompressed
+    /// The compression level, clamped to the codec's range. Defaults to `3`.
+    pub level: i64 = 3
+    /// The alignment of metadata and of each buffer in a body, `8`, `16`, `32` or `64` bytes. Defaults to `8`.
+    pub alignment: i64 = 8
+}
+
+/// Writes the Arrow IPC stream or file format, one message at a time.
+pub struct Writer {
+    sink: fn([]u8) ! io.Error
+    options: WriterOptions
+    schema: Schema
+    file: bool
+    offset: i64
+    dictionaries: [i64: Array]
+    dictionary_blocks: []Block
+    batch_blocks: []Block
+    closed: bool
+}
+
+fn round_up(n: i64, alignment: i64) -> i64 {
+    (n + alignment - 1) / alignment * alignment
+}
+
+fn emit(w: *Writer, data: []u8) ! Error {
+    w.sink(data) catch Io
+    w.offset += data.len
+}
+
+fn codec_id(c: Compression) -> i64 {
+    match c {
+        Uncompressed => -1
+        Lz4 => 0
+        Zstd => 1
+    }
+}
+
+struct Encoder {
+    alignment: i64
+    compression: Compression
+    level: i64
+    body: []u8
+    meta: BatchMeta
+}
+
+fn compress_buffer(e: *Encoder, data: []u8) -> []u8 {
+    let packed = match e.compression {
+        Lz4 => lz4.compress(data, e.level)
+        _ => zstd.compress(data, e.level)
+    }
+    var out: []u8 = []
+    if packed.len >= data.len {
+        io.put_le64(mut out, -1)
+        io.append(mut out, data)
+    } else {
+        io.put_le64(mut out, data.len)
+        io.append(mut out, packed)
+    }
+    out
+}
+
+fn add_buffer(e: *Encoder, data: []u8) {
+    var payload = data
+    if e.compression != Compression.Uncompressed && data.len > 0 {
+        payload = compress_buffer(e, data)
+    }
+    for e.body.len % e.alignment != 0 {
+        push(mut e.body, 0)
+    }
+    push(mut e.meta.buffer_offsets, e.body.len)
+    push(mut e.meta.buffer_lengths, payload.len)
+    io.append(mut e.body, payload)
+}
+
+fn trimmed(data: []u8, n: i64) -> []u8 {
+    if data.len < n { data } else { data[..n] }
+}
+
+fn encode_array(e: *Encoder, a: Array) {
+    push(mut e.meta.node_lengths, a.length)
+    push(mut e.meta.node_nulls, a.null_count)
+    if has_validity(a.data_type) {
+        add_buffer(e, if a.null_count > 0 { trimmed(a.validity, bitmap_size(a.length)) } else { [] })
+    }
+    match a.data_type {
+        Null => {}
+        Bool => add_buffer(e, trimmed(a.buffers[0], bitmap_size(a.length)))
+        Utf8 => encode_bytes(e, a)
+        LargeUtf8 => encode_bytes(e, a)
+        Binary => encode_bytes(e, a)
+        LargeBinary => encode_bytes(e, a)
+        List(_) => encode_list(e, a)
+        LargeList(_) => encode_list(e, a)
+        Map(_, _) => encode_list(e, a)
+        FixedSizeList(_, _) => encode_array(e, a.children[0])
+        Struct(_) => {
+            for c in a.children {
+                encode_array(e, c)
+            }
+        }
+        Union(mode, _, _) => {
+            add_buffer(e, trimmed(a.buffers[0], a.length))
+            if mode == UnionMode.Dense {
+                add_buffer(e, trimmed(a.buffers[1], a.length * 4))
+            }
+            for c in a.children {
+                encode_array(e, c)
+            }
+        }
+        _ => add_buffer(e, trimmed(a.buffers[0], a.length * value_width(a.data_type)))
+    }
+}
+
+fn encode_bytes(e: *Encoder, a: Array) {
+    let w = offset_width(a.data_type)
+    add_buffer(e, trimmed(a.buffers[0], (a.length + 1) * w))
+    var end = 0
+    if a.length > 0 {
+        end = offset_at(a, a.length)
+    }
+    add_buffer(e, trimmed(a.buffers[1], end))
+}
+
+fn encode_list(e: *Encoder, a: Array) {
+    let w = offset_width(a.data_type)
+    add_buffer(e, trimmed(a.buffers[0], (a.length + 1) * w))
+    encode_array(e, a.children[0])
+}
+
+fn new_encoder(w: *Writer, length: i64) -> *Encoder {
+    let meta = BatchMeta { length, node_lengths: [], node_nulls: [], buffer_offsets: [], buffer_lengths: [], codec: codec_id(w.options.compression) }
+    new(Encoder { alignment: w.options.alignment, compression: w.options.compression, level: w.options.level, body: [], meta })
+}
+
+fn close_body(e: *Encoder) {
+    for e.body.len % e.alignment != 0 {
+        push(mut e.body, 0)
+    }
+}
+
+fn frame(w: *Writer, metadata: []u8, body: []u8) -> Block ! Error {
+    let start = w.offset
+    let total = round_up(8 + metadata.len, w.options.alignment)
+    var head = io.buffer(total)
+    io.set_le32(head, 0, 0xFFFFFFFF)
+    io.set_le32(head, 4, total - 8)
+    io.copy(head[8..], metadata)
+    emit(w, head)?
+    emit(w, body)?
+    Block { offset: start, metadata_length: total, body_length: body.len }
+}
+
+fn write_batch_message(w: *Writer, e: *Encoder) -> Block ! Error {
+    close_body(e)
+    let b = fb_new()
+    let header = write_batch_meta(b, e.meta)
+    let message = write_message(b, 3, header, e.body.len)
+    frame(w, message, e.body)?
+}
+
+fn write_dictionary_message(w: *Writer, id: i64, values: Array) ! Error {
+    let e = new_encoder(w, values.length)
+    encode_array(e, values)
+    close_body(e)
+    let b = fb_new()
+    let batch = write_batch_meta(b, e.meta)
+    let header = write_dictionary_header(b, id, batch, false)
+    let message = write_message(b, 2, header, e.body.len)
+    let block = frame(w, message, e.body)?
+    push(mut w.dictionary_blocks, block)
+}
+
+fn same_bytes(a: []u8, b: []u8) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn same_array(a: Array, b: Array) -> bool {
+    if type_name(a.data_type) != type_name(b.data_type) || a.length != b.length || a.null_count != b.null_count || !same_bytes(a.validity, b.validity) || a.buffers.len != b.buffers.len || a.children.len != b.children.len {
+        return false
+    }
+    for i in 0..a.buffers.len {
+        if !same_bytes(a.buffers[i], b.buffers[i]) {
+            return false
+        }
+    }
+    for i in 0..a.children.len {
+        if !same_array(a.children[i], b.children[i]) {
+            return false
+        }
+    }
+    match a.dictionary {
+        some(x) => {
+            match b.dictionary {
+                some(y) => return same_array(*x, *y)
+                none => return false
+            }
+        }
+        none => b.dictionary == none
+    }
+}
+
+fn emit_dictionaries(w: *Writer, a: Array) ! Error {
+    match a.data_type {
+        Dictionary(id, _, _, _) => {
+            let values = *(a.dictionary ?? fail Mismatch("a dictionary array has no dictionary"))
+            emit_dictionaries(w, values)?
+            let known = w.dictionaries[id]
+            match known {
+                some(before) => {
+                    if same_array(before, values) {
+                        return
+                    }
+                    if w.file {
+                        fail Mismatch("the file format cannot replace dictionary {id}")
+                    }
+                }
+                none => {}
+            }
+            write_dictionary_message(w, id, values)?
+            w.dictionaries[id] = values
+        }
+        _ => {
+            for c in a.children {
+                emit_dictionaries(w, c)?
+            }
+        }
+    }
+}
+
+fn start_writer(sink: fn([]u8) ! io.Error, schema: Schema, options: WriterOptions, file: bool) -> *Writer ! Error {
+    if options.alignment != 8 && options.alignment != 16 && options.alignment != 32 && options.alignment != 64 {
+        fail Mismatch("the alignment {options.alignment}")
+    }
+    var types: [i64: DataType] = [:]
+    for f in schema.fields {
+        check_type(f.data_type, 0)?
+        collect_dictionaries(f.data_type, mut types)?
+    }
+    let w = new(Writer { sink, options, schema, file, offset: 0, dictionaries: [:], dictionary_blocks: [], batch_blocks: [], closed: false })
+    if file {
+        var head: []u8 = []
+        text.append(mut head, "ARROW1")
+        push(mut head, 0)
+        push(mut head, 0)
+        emit(w, head)?
+    }
+    let b = fb_new()
+    let header = write_schema(b, schema)
+    let message = write_message(b, 1, header, 0)
+    frame(w, message, [])?
+    w
+}
+
+/// Starts an IPC stream for `schema` and writes its schema message to `sink`.
+///
+/// `sink` receives each piece of the stream in order and the piece is not kept after the call. Fails with `Mismatch` when `options.alignment` is not 8, 16, 32 or 64 or a type in `schema` is malformed, and with `Io` when `sink` fails.
+pub fn stream_writer(sink: fn([]u8) ! io.Error, schema: Schema, options: WriterOptions) -> *Writer ! Error {
+    start_writer(sink, schema, options, false)?
+}
+
+/// Starts an IPC file for `schema`: it writes the magic and the schema message to `sink`. `close` writes the footer.
+///
+/// The file format cannot replace a dictionary, so `write_batch` fails with `Mismatch` when a later batch carries different values for a dictionary id. Fails as `stream_writer` does.
+pub fn file_writer(sink: fn([]u8) ! io.Error, schema: Schema, options: WriterOptions) -> *Writer ! Error {
+    start_writer(sink, schema, options, true)?
+}
+
+/// Writes `batch`, preceded by a dictionary batch for each dictionary whose values the stream has not carried. A dictionary that was written before with different values is written again in full, as a replacement, in a stream.
+///
+/// Each column is checked with `validate` and must match its schema field's type name and the batch length. Fails with `Mismatch` for a batch that does not fit the schema or a closed writer, `Invalid` for a malformed column, and `Io` when the sink fails.
+pub fn write_batch(w: *Writer, batch: Batch) ! Error {
+    if w.closed {
+        fail Mismatch("the writer is closed")
+    }
+    if batch.columns.len != w.schema.fields.len {
+        fail Mismatch("{batch.columns.len} columns for a schema of {w.schema.fields.len}")
+    }
+    for i, col in batch.columns {
+        let f = w.schema.fields[i]
+        if type_name(col.data_type) != type_name(f.data_type) {
+            fail Mismatch("column {f.name} is {type_name(col.data_type)}, the schema says {type_name(f.data_type)}")
+        }
+        if col.length != batch.length {
+            fail Mismatch("column {f.name} has {col.length} values in a batch of {batch.length}")
+        }
+        validate(col)?
+    }
+    for col in batch.columns {
+        emit_dictionaries(w, col)?
+    }
+    let e = new_encoder(w, batch.length)
+    for col in batch.columns {
+        encode_array(e, col)
+    }
+    let block = write_batch_message(w, e)?
+    push(mut w.batch_blocks, block)
+}
+
+/// Ends the stream with its end-of-stream marker, or the file with the marker, the footer and the closing magic. The writer takes no more batches. Closing twice does nothing.
+pub fn close(w: *Writer) ! Error {
+    if w.closed {
+        return
+    }
+    var end: []u8 = []
+    io.put_le32(mut end, 0xFFFFFFFF)
+    io.put_le32(mut end, 0)
+    emit(w, end)?
+    if w.file {
+        let footer = write_footer(w.schema, w.dictionary_blocks, w.batch_blocks)
+        emit(w, footer)?
+        var tail: []u8 = []
+        io.put_le32(mut tail, footer.len)
+        text.append(mut tail, "ARROW1")
+        emit(w, tail)?
+    }
+    w.closed = true
+}
+
+/// Returns the number of bytes written so far.
+pub fn written(w: *Writer) -> i64 {
+    w.offset
+}
+
+fn write_all(w: *Writer, batches: []Batch) ! Error {
+    for b in batches {
+        write_batch(w, b)?
+    }
+    close(w)?
+}
+
+/// Returns the IPC stream of `batches` under `schema`.
+pub fn write_stream(schema: Schema, batches: []Batch, options: WriterOptions) -> []u8 ! Error {
+    var out: []u8 = []
+    let sink: fn([]u8) ! io.Error = fn(chunk) { io.append(mut out, chunk) }
+    let w = stream_writer(sink, schema, options)?
+    write_all(w, batches)?
+    out
+}
+
+/// Returns the IPC file of `batches` under `schema`.
+pub fn write_file(schema: Schema, batches: []Batch, options: WriterOptions) -> []u8 ! Error {
+    var out: []u8 = []
+    let sink: fn([]u8) ! io.Error = fn(chunk) { io.append(mut out, chunk) }
+    let w = file_writer(sink, schema, options)?
+    write_all(w, batches)?
+    out
+}

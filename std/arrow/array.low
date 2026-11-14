@@ -1,0 +1,692 @@
+import std/io
+import std/json
+import std/text
+import std/unicode
+
+const max_length: i64 = 2147483647
+
+fn is_null_type(t: DataType) -> bool {
+    match t {
+        Null => true
+        _ => false
+    }
+}
+
+/// Returns whether arrays of `t` carry a validity bitmap.
+pub fn has_validity(t: DataType) -> bool {
+    match t {
+        Null => false
+        Union(_, _, _) => false
+        _ => true
+    }
+}
+
+/// Returns how many value buffers an array of `t` holds in `Array.buffers`.
+pub fn buffer_count(t: DataType) -> i64 {
+    match t {
+        Null => 0
+        Utf8 => 2
+        LargeUtf8 => 2
+        Binary => 2
+        LargeBinary => 2
+        FixedSizeList(_, _) => 0
+        Struct(_) => 0
+        Union(mode, _, _) => if mode == UnionMode.Dense { 2 } else { 1 }
+        _ => 1
+    }
+}
+
+/// Returns how many bytes one value of the fixed-width type `t` takes, or `0` for a type that is not fixed-width or whose values are bits.
+pub fn value_width(t: DataType) -> i64 {
+    match t {
+        Int(bits, _) => bits / 8
+        Float(bits) => bits / 8
+        FixedSizeBinary(width) => width
+        Decimal(_, _) => 16
+        Date(unit) => if unit == DateUnit.Day { 4 } else { 8 }
+        Time(unit) => time_bits(unit) / 8
+        Timestamp(_, _) => 8
+        Duration(_) => 8
+        Interval(unit) => match unit {
+            YearMonth => 4
+            DayTime => 8
+            MonthDayNano => 16
+        }
+        Dictionary(_, index, _, _) => value_width(*index)
+        _ => 0
+    }
+}
+
+/// Returns whether value `i` of `a` is set in its validity bitmap, which is every value when the array has none and no value of a `Null` array.
+pub fn is_valid(a: Array, i: i64) -> bool {
+    if a.validity.len == 0 {
+        return !is_null_type(a.data_type)
+    }
+    (a.validity[i >> 3] >> u8(i & 7)) & 1 == 1
+}
+
+/// Returns whether value `i` of `a` is null.
+pub fn is_null(a: Array, i: i64) -> bool {
+    !is_valid(a, i)
+}
+
+fn bit_at(bits: []u8, i: i64) -> bool {
+    (bits[i >> 3] >> u8(i & 7)) & 1 == 1
+}
+
+fn bitmap_size(n: i64) -> i64 {
+    (n + 7) >> 3
+}
+
+fn count_set(bits: []u8, n: i64) -> i64 {
+    var set = 0
+    for i in 0..n {
+        if bit_at(bits, i) {
+            set += 1
+        }
+    }
+    set
+}
+
+fn sign_extend(v: i64, bits: i64) -> i64 {
+    let sign = i64(1) << (bits - 1)
+    if v & sign != 0 { v - (sign << 1) } else { v }
+}
+
+fn read_signed(data: []u8, at: i64, bytes: i64) -> i64 {
+    match bytes {
+        == 1 => sign_extend(i64(data[at]), 8)
+        == 2 => sign_extend(i64(io.u16_le(data, at)), 16)
+        == 4 => i64(i32(io.u32_le(data, at)))
+        _ => io.le64(data, at)
+    }
+}
+
+fn read_unsigned(data: []u8, at: i64, bytes: i64) -> u64 {
+    match bytes {
+        == 1 => u64(data[at])
+        == 2 => u64(io.u16_le(data, at))
+        == 4 => u64(io.u32_le(data, at))
+        _ => io.u64_le(data, at)
+    }
+}
+
+/// Returns the integer, date, time, timestamp or duration at `i` of a signed or temporal array.
+///
+/// An unsigned 64-bit value above `i64` reads as its two's complement; use `uint_at` for unsigned arrays. The caller checks `is_null` first.
+pub fn int_at(a: Array, i: i64) -> i64 {
+    let width = value_width(a.data_type)
+    read_signed(a.buffers[0], i * width, width)
+}
+
+/// Returns the unsigned integer at `i` of an unsigned integer array.
+pub fn uint_at(a: Array, i: i64) -> u64 {
+    let width = value_width(a.data_type)
+    read_unsigned(a.buffers[0], i * width, width)
+}
+
+/// Returns the bool at `i` of a `Bool` array.
+pub fn bool_at(a: Array, i: i64) -> bool {
+    bit_at(a.buffers[0], i)
+}
+
+fn half_to_float(h: i64) -> f64 {
+    let sign = (h >> 15) & 1
+    let exponent = (h >> 10) & 0x1F
+    let fraction = h & 0x3FF
+    let magnitude = match exponent {
+        == 0 => f64(fraction) * 5.960464477539063e-08
+        == 31 => text.float_from_bits(if fraction == 0 { 0x7FF0000000000000 } else { 0x7FF8000000000000 })
+        _ => (1.0 + f64(fraction) / 1024.0) * text.float_from_bits(u64(exponent - 15 + 1023) << 52)
+    }
+    if sign == 1 { -magnitude } else { magnitude }
+}
+
+fn float_to_half(x: f64) -> i64 {
+    let bits = text.float_bits(x)
+    let sign = i64(bits >> 63) << 15
+    let exponent = i64((bits >> 52) & 0x7FF)
+    let fraction = bits & 0xFFFFFFFFFFFFF
+    if exponent == 0x7FF {
+        return sign | 0x7C00 | (if fraction != 0 { 0x200 } else { 0 })
+    }
+    let unbiased = exponent - 1023
+    if unbiased > 15 {
+        return sign | 0x7C00
+    }
+    if unbiased >= -14 {
+        let mantissa = i64(fraction >> 42)
+        let rest = fraction & 0x3FFFFFFFFFF
+        var half = ((unbiased + 15) << 10) | mantissa
+        let halfway: u64 = 0x20000000000
+        if rest > halfway || (rest == halfway && (half & 1) == 1) {
+            half += 1
+        }
+        return sign | half
+    }
+    if unbiased < -25 {
+        return sign
+    }
+    let shift = u64(-14 - unbiased + 42)
+    let full = (fraction | 0x10000000000000) >> shift
+    let rest = (fraction | 0x10000000000000) & ((u64(1) << shift) - 1)
+    let halfway = u64(1) << (shift - 1)
+    var half = i64(full)
+    if rest > halfway || (rest == halfway && (half & 1) == 1) {
+        half += 1
+    }
+    sign | half
+}
+
+/// Returns the float at `i` of a `Float` array, widened to 64 bits.
+pub fn float_at(a: Array, i: i64) -> f64 {
+    let data = a.buffers[0]
+    match a.data_type {
+        Float(bits) => {
+            match bits {
+                == 16 => half_to_float(i64(io.u16_le(data, i * 2)))
+                == 32 => f64(text.float32_from_bits(io.u32_le(data, i * 4)))
+                _ => text.float_from_bits(io.u64_le(data, i * 8))
+            }
+        }
+        _ => 0.0
+    }
+}
+
+fn offset_width(t: DataType) -> i64 {
+    match t {
+        LargeUtf8 => 8
+        LargeBinary => 8
+        LargeList(_) => 8
+        _ => 4
+    }
+}
+
+fn offset_at(a: Array, i: i64) -> i64 {
+    let w = offset_width(a.data_type)
+    read_signed(a.buffers[0], i * w, w)
+}
+
+/// Returns the bytes at `i` of a `Binary`, `LargeBinary`, `Utf8`, `LargeUtf8`, `FixedSizeBinary` or `Decimal` array, sharing the buffer. A decimal's bytes are its 16-byte little-endian unscaled value, which `decimal_text` formats.
+pub fn bytes_at(a: Array, i: i64) -> []u8 {
+    match a.data_type {
+        FixedSizeBinary(width) => a.buffers[0][i * width..(i + 1) * width]
+        Decimal(_, _) => a.buffers[0][i * 16..(i + 1) * 16]
+        _ => a.buffers[1][offset_at(a, i)..offset_at(a, i + 1)]
+    }
+}
+
+/// Returns the text at `i` of a `Utf8` or `LargeUtf8` array, sharing the buffer.
+pub fn str_at(a: Array, i: i64) -> str {
+    str(bytes_at(a, i))
+}
+
+/// A half-open range of child positions.
+pub struct Range {
+    /// The first position.
+    pub start: i64
+    /// The position after the last.
+    pub end: i64
+}
+
+/// Returns the range of `a.children[0]` that holds the elements of the list at `i` of a `List`, `LargeList`, `Map` or `FixedSizeList` array.
+pub fn list_range(a: Array, i: i64) -> Range {
+    match a.data_type {
+        FixedSizeList(_, size) => Range { start: i * size, end: (i + 1) * size }
+        _ => Range { start: offset_at(a, i), end: offset_at(a, i + 1) }
+    }
+}
+
+/// Returns the type id of the union value at `i`.
+pub fn union_type_id(a: Array, i: i64) -> i64 {
+    read_signed(a.buffers[0], i, 1)
+}
+
+/// Returns the position in the child of the type id at `i` where the union value at `i` lives, and that child's index in `a.children`.
+pub fn union_slot(a: Array, i: i64) -> Range {
+    var child = 0
+    match a.data_type {
+        Union(mode, _, ids) => {
+            let id = union_type_id(a, i)
+            for k, candidate in ids {
+                if candidate == id {
+                    child = k
+                }
+            }
+            let position = if mode == UnionMode.Dense { read_signed(a.buffers[1], i * 4, 4) } else { i }
+            return Range { start: child, end: position }
+        }
+        _ => Range { start: 0, end: i }
+    }
+}
+
+/// Returns the index in `a.dictionary` that the dictionary array `a` holds at `i`.
+pub fn dictionary_index(a: Array, i: i64) -> i64 {
+    match a.data_type {
+        Dictionary(_, index, _, _) => {
+            match *index {
+                Int(bits, signed) => {
+                    if signed {
+                        read_signed(a.buffers[0], i * bits / 8, bits / 8)
+                    } else {
+                        i64(read_unsigned(a.buffers[0], i * bits / 8, bits / 8))
+                    }
+                }
+                _ => 0
+            }
+        }
+        _ => 0
+    }
+}
+
+fn float_hex(bits: u64) -> str {
+    var digits: []u8 = []
+    for i in 0..8 {
+        push(mut digits, u8((bits >> u64(56 - 8 * i)) & 0xFF))
+    }
+    text.encode_hex(digits)
+}
+
+/// Returns the decimal text of the 128-bit little-endian two's complement `unscaled` with `scale` digits after the point.
+pub fn decimal_text(unscaled: []u8, scale: i64) -> str {
+    var magnitude: []u8 = []
+    for i in 0..16 {
+        push(mut magnitude, unscaled[15 - i])
+    }
+    let negative = magnitude[0] >= 128
+    if negative {
+        var carry = 1
+        var k = 15
+        for k >= 0 {
+            let v = i64(~magnitude[k] & 0xFF) + carry
+            magnitude[k] = u8(v & 0xFF)
+            carry = v >> 8
+            k -= 1
+        }
+    }
+    var digits: []u8 = []
+    for {
+        var remainder = 0
+        var zero = true
+        for k in 0..16 {
+            let cur = remainder * 256 + i64(magnitude[k])
+            magnitude[k] = u8(cur / 10)
+            remainder = cur % 10
+            if magnitude[k] != 0 {
+                zero = false
+            }
+        }
+        push(mut digits, u8(48 + remainder))
+        if zero {
+            break
+        }
+    }
+    var out: []u8 = []
+    if negative {
+        push(mut out, '-')
+    }
+    let count = digits.len
+    if scale <= 0 {
+        var i = count - 1
+        for i >= 0 {
+            push(mut out, digits[i])
+            i -= 1
+        }
+        if !(count == 1 && digits[0] == '0') {
+            for _ in 0..-scale {
+                push(mut out, '0')
+            }
+        }
+    } else {
+        let width = if count > scale { count } else { scale + 1 }
+        var i = width - 1
+        for i >= 0 {
+            if i == scale - 1 {
+                push(mut out, '.')
+            }
+            push(mut out, if i < count { digits[i] } else { '0' })
+            i -= 1
+        }
+    }
+    str(out)
+}
+
+fn quote_text(s: str) -> str {
+    json.stringify(json.Value.Str(s), 0)
+}
+
+fn temporal_prefix(t: DataType) -> str {
+    match t {
+        Date(unit) => if unit == DateUnit.Day { "date32" } else { "date64" }
+        Time(unit) => if time_bits(unit) == 32 { "time32" } else { "time64" }
+        Timestamp(_, _) => "timestamp"
+        _ => "duration"
+    }
+}
+
+fn write_value(mut out: []u8, a: Array, i: i64) {
+    if is_null(a, i) {
+        text.append(mut out, "null")
+        return
+    }
+    match a.data_type {
+        Null => text.append(mut out, "null")
+        Bool => text.append(mut out, if bool_at(a, i) { "true" } else { "false" })
+        Int(_, signed) => {
+            if signed {
+                text.append(mut out, "{int_at(a, i)}")
+            } else {
+                text.append(mut out, "{uint_at(a, i)}")
+            }
+        }
+        Float(bits) => {
+            let x = float_at(a, i)
+            text.append(mut out, "f{float_hex(text.float_bits(x))}")
+        }
+        Utf8 => text.append(mut out, quote_text(str_at(a, i)))
+        LargeUtf8 => text.append(mut out, quote_text(str_at(a, i)))
+        Binary => text.append(mut out, "x\"{text.encode_hex(bytes_at(a, i))}\"")
+        LargeBinary => text.append(mut out, "x\"{text.encode_hex(bytes_at(a, i))}\"")
+        FixedSizeBinary(_) => text.append(mut out, "x\"{text.encode_hex(bytes_at(a, i))}\"")
+        Decimal(_, scale) => text.append(mut out, "decimal({decimal_text(a.buffers[0][i * 16..(i + 1) * 16], scale)})")
+        Date(_) => text.append(mut out, "{temporal_prefix(a.data_type)}:{int_at(a, i)}")
+        Time(_) => text.append(mut out, "{temporal_prefix(a.data_type)}:{int_at(a, i)}")
+        Timestamp(_, _) => text.append(mut out, "{temporal_prefix(a.data_type)}:{int_at(a, i)}")
+        Duration(_) => text.append(mut out, "{temporal_prefix(a.data_type)}:{int_at(a, i)}")
+        Interval(unit) => {
+            let data = a.buffers[0]
+            match unit {
+                YearMonth => text.append(mut out, "interval:{read_signed(data, i * 4, 4)}")
+                DayTime => text.append(mut out, "interval:{read_signed(data, i * 8, 4)},{read_signed(data, i * 8 + 4, 4)}")
+                MonthDayNano => text.append(mut out, "interval:{read_signed(data, i * 16, 4)},{read_signed(data, i * 16 + 4, 4)},{io.le64(data, i * 16 + 8)}")
+            }
+        }
+        List(_) => write_list(mut out, a, i)
+        LargeList(_) => write_list(mut out, a, i)
+        FixedSizeList(_, _) => write_list(mut out, a, i)
+        Map(_, _) => {
+            let r = list_range(a, i)
+            let entries = a.children[0]
+            text.append(mut out, "map[")
+            for k in r.start..r.end {
+                if k > r.start {
+                    text.append(mut out, ", ")
+                }
+                write_value(mut out, entries.children[0], k)
+                text.append(mut out, ": ")
+                write_value(mut out, entries.children[1], k)
+            }
+            push(mut out, ']')
+        }
+        Struct(fields) => {
+            push(mut out, '{')
+            for k, f in fields {
+                if k > 0 {
+                    text.append(mut out, ", ")
+                }
+                text.append(mut out, "{quote_text(f.name)}: ")
+                write_value(mut out, a.children[k], i)
+            }
+            push(mut out, '}')
+        }
+        Union(_, _, _) => {
+            let slot = union_slot(a, i)
+            text.append(mut out, "{union_type_id(a, i)}=")
+            write_value(mut out, a.children[slot.start], slot.end)
+        }
+        Dictionary(_, _, _, _) => {
+            let values = a.dictionary ?? return
+            write_value(mut out, *values, dictionary_index(a, i))
+        }
+    }
+}
+
+fn write_list(mut out: []u8, a: Array, i: i64) {
+    let r = list_range(a, i)
+    push(mut out, '[')
+    for k in r.start..r.end {
+        if k > r.start {
+            text.append(mut out, ", ")
+        }
+        write_value(mut out, a.children[0], k)
+    }
+    push(mut out, ']')
+}
+
+/// Returns the values of `a` on one line, for tests and logs.
+///
+/// A null is `null` and a boolean `true` or `false`; an integer is its digits and a float `f` and the 16 hexadecimal digits of its 64-bit IEEE 754 bits, so a half or single float shows its widened value. Text is a JSON string, bytes are `x"` and hexadecimal, a decimal is `decimal(` and its text, and a date, time, timestamp or duration is `date32`, `date64`, `time32`, `time64`, `timestamp` or `duration`, a colon and its integer. An interval is `interval:` and its parts, a list is `[a, b]`, a map `map[k: v, ...]`, a struct `{"name": v}`, a union `id=value` and a dictionary value the dictionary entry it selects. The values are in square brackets and separated by commas.
+pub fn diagnostic(a: Array) -> str {
+    var out: []u8 = []
+    push(mut out, '[')
+    for i in 0..a.length {
+        if i > 0 {
+            text.append(mut out, ", ")
+        }
+        write_value(mut out, a, i)
+    }
+    push(mut out, ']')
+    str(out)
+}
+
+fn index_in(data: []u8, at: i64, width: i64) -> i64 {
+    read_signed(data, at * width, width)
+}
+
+fn check_offsets(a: Array, what: str, limit: i64) ! Error {
+    let w = offset_width(a.data_type)
+    let offsets = a.buffers[0]
+    if a.length == 0 {
+        if offsets.len > 0 && offsets.len < w {
+            fail Invalid(-1, "{what} offsets are shorter than one offset")
+        }
+        return
+    }
+    if offsets.len < (a.length + 1) * w {
+        fail Invalid(-1, "{what} offsets hold {offsets.len} bytes for {a.length} values")
+    }
+    var last = index_in(offsets, 0, w)
+    if last < 0 {
+        fail Invalid(-1, "{what} has a negative first offset")
+    }
+    for i in 1..a.length + 1 {
+        let next = index_in(offsets, i, w)
+        if next < last {
+            fail Invalid(-1, "{what} offsets decrease at {i}")
+        }
+        last = next
+    }
+    if last > limit {
+        fail Invalid(-1, "{what} offsets reach {last} in {limit}")
+    }
+}
+
+fn check_fixed(a: Array, what: str) ! Error {
+    let width = value_width(a.data_type)
+    if a.buffers[0].len < a.length * width {
+        fail Invalid(-1, "{what} holds {a.buffers[0].len} bytes for {a.length} values")
+    }
+}
+
+/// Checks that `a`, and every array nested in it, is internally consistent.
+///
+/// The buffer count and sizes match the type and length, the null count equals the zero bits of the validity bitmap, offsets do not decrease and stay inside the data or child they index, text is UTF-8, child lengths agree with their parent, union type ids and offsets and dictionary indices select existing values. Fails with `Invalid` naming the problem.
+pub fn validate(a: Array) ! Error {
+    check_array(a, 0, true)?
+}
+
+fn check_array(a: Array, depth: i64, deep: bool) ! Error {
+    if depth > 64 {
+        fail TooLarge("array nesting")
+    }
+    let what = type_name(a.data_type)
+    if a.length < 0 {
+        fail Invalid(-1, "{what} has length {a.length}")
+    }
+    if a.length > max_length {
+        fail TooLarge("array length")
+    }
+    if a.null_count < 0 || a.null_count > a.length {
+        fail Invalid(-1, "{what} has {a.null_count} nulls in {a.length} values")
+    }
+    if is_null_type(a.data_type) {
+        if a.null_count != a.length || a.validity.len != 0 {
+            fail Invalid(-1, "null has {a.null_count} nulls in {a.length} values")
+        }
+    } else if has_validity(a.data_type) {
+        if a.validity.len == 0 {
+            if a.null_count != 0 {
+                fail Invalid(-1, "{what} has nulls and no validity bitmap")
+            }
+        } else {
+            if a.validity.len < bitmap_size(a.length) {
+                fail Invalid(-1, "{what} validity holds {a.validity.len} bytes for {a.length} values")
+            }
+            let set = count_set(a.validity, a.length)
+            if a.length - set != a.null_count {
+                fail Invalid(-1, "{what} reports {a.null_count} nulls and its bitmap has {a.length - set}")
+            }
+        }
+    } else if a.validity.len != 0 || a.null_count != 0 {
+        fail Invalid(-1, "{what} has a validity bitmap")
+    }
+    if a.buffers.len != buffer_count(a.data_type) {
+        fail Invalid(-1, "{what} has {a.buffers.len} buffers, expected {buffer_count(a.data_type)}")
+    }
+    match a.data_type {
+        Null => {}
+        Bool => {
+            if a.buffers[0].len < bitmap_size(a.length) {
+                fail Invalid(-1, "bool holds {a.buffers[0].len} bytes for {a.length} values")
+            }
+        }
+        Int(_, _) => check_fixed(a, what)?
+        Float(_) => check_fixed(a, what)?
+        FixedSizeBinary(_) => check_fixed(a, what)?
+        Decimal(_, _) => check_fixed(a, what)?
+        Date(_) => check_fixed(a, what)?
+        Time(_) => check_fixed(a, what)?
+        Timestamp(_, _) => check_fixed(a, what)?
+        Duration(_) => check_fixed(a, what)?
+        Interval(_) => check_fixed(a, what)?
+        Utf8 => check_text(a, what)?
+        LargeUtf8 => check_text(a, what)?
+        Binary => check_offsets(a, what, a.buffers[1].len)?
+        LargeBinary => check_offsets(a, what, a.buffers[1].len)?
+        List(item) => check_list(a, item.data_type, what, depth, deep)?
+        LargeList(item) => check_list(a, item.data_type, what, depth, deep)?
+        Map(entries, _) => check_list(a, entries.data_type, what, depth, deep)?
+        FixedSizeList(item, size) => {
+            if a.children.len != 1 {
+                fail Invalid(-1, "{what} has {a.children.len} children")
+            }
+            if a.children[0].length != a.length * size {
+                fail Invalid(-1, "{what} child has {a.children[0].length} values for {a.length} lists of {size}")
+            }
+            check_child(a.children[0], item.data_type, what, depth, deep)?
+        }
+        Struct(fields) => {
+            if a.children.len != fields.len {
+                fail Invalid(-1, "{what} has {a.children.len} children for {fields.len} fields")
+            }
+            for k, f in fields {
+                if a.children[k].length != a.length {
+                    fail Invalid(-1, "{what} field {f.name} has {a.children[k].length} values for {a.length} rows")
+                }
+                check_child(a.children[k], f.data_type, what, depth, deep)?
+            }
+        }
+        Union(mode, fields, ids) => check_union(a, mode, fields, ids, what, depth, deep)?
+        Dictionary(_, index, value, _) => check_dictionary(a, *index, *value, what, depth, deep)?
+    }
+}
+
+fn check_child(child: Array, expected: DataType, what: str, depth: i64, deep: bool) ! Error {
+    if type_name(child.data_type) != type_name(expected) {
+        fail Invalid(-1, "{what} child is {type_name(child.data_type)}, expected {type_name(expected)}")
+    }
+    check_array(child, depth + 1, deep)?
+}
+
+fn check_text(a: Array, what: str) ! Error {
+    check_offsets(a, what, a.buffers[1].len)?
+    if a.length > 0 {
+        let first = offset_at(a, 0)
+        let last = offset_at(a, a.length)
+        if !unicode.utf8_valid(str(a.buffers[1][first..last])) {
+            fail Invalid(-1, "{what} holds text that is not UTF-8")
+        }
+        for i in 0..a.length {
+            if !unicode.utf8_valid(str_at(a, i)) {
+                fail Invalid(-1, "{what} value {i} cuts a UTF-8 sequence")
+            }
+        }
+    }
+}
+
+fn check_list(a: Array, item: DataType, what: str, depth: i64, deep: bool) ! Error {
+    if a.children.len != 1 {
+        fail Invalid(-1, "{what} has {a.children.len} children")
+    }
+    check_offsets(a, what, a.children[0].length)?
+    check_child(a.children[0], item, what, depth, deep)?
+}
+
+fn check_union(a: Array, mode: UnionMode, fields: []Field, ids: []i64, what: str, depth: i64, deep: bool) ! Error {
+    if a.children.len != fields.len {
+        fail Invalid(-1, "{what} has {a.children.len} children for {fields.len} fields")
+    }
+    if a.buffers[0].len < a.length {
+        fail Invalid(-1, "{what} type ids hold {a.buffers[0].len} bytes for {a.length} values")
+    }
+    if mode == UnionMode.Dense && a.buffers[1].len < a.length * 4 {
+        fail Invalid(-1, "{what} offsets hold {a.buffers[1].len} bytes for {a.length} values")
+    }
+    for k, f in fields {
+        if mode == UnionMode.Sparse && a.children[k].length != a.length {
+            fail Invalid(-1, "{what} field {f.name} has {a.children[k].length} values for {a.length} slots")
+        }
+        check_child(a.children[k], f.data_type, what, depth, deep)?
+    }
+    for i in 0..a.length {
+        let id = union_type_id(a, i)
+        var found = false
+        for k, candidate in ids {
+            if candidate == id {
+                found = true
+                let position = if mode == UnionMode.Dense { read_signed(a.buffers[1], i * 4, 4) } else { i }
+                if position < 0 || position >= a.children[k].length {
+                    fail Invalid(-1, "{what} value {i} points at {position} in {a.children[k].length}")
+                }
+            }
+        }
+        if !found {
+            fail Invalid(-1, "{what} value {i} has the unknown type id {id}")
+        }
+    }
+}
+
+fn check_dictionary(a: Array, index: DataType, value: DataType, what: str, depth: i64, deep: bool) ! Error {
+    let values = a.dictionary ?? fail Invalid(-1, "{what} has no dictionary")
+    match index {
+        Int(bits, _) => {
+            if a.buffers[0].len < a.length * bits / 8 {
+                fail Invalid(-1, "{what} indices hold {a.buffers[0].len} bytes for {a.length} values")
+            }
+        }
+        _ => fail Invalid(-1, "{what} index is not an integer")
+    }
+    if deep {
+        check_child(*values, value, what, depth, deep)?
+    } else if type_name(values.data_type) != type_name(value) {
+        fail Invalid(-1, "{what} dictionary is {type_name(values.data_type)}, expected {type_name(value)}")
+    }
+    for i in 0..a.length {
+        if is_valid(a, i) {
+            let k = dictionary_index(a, i)
+            if k < 0 || k >= values.length {
+                fail Invalid(-1, "{what} value {i} selects {k} in a dictionary of {values.length}")
+            }
+        }
+    }
+}
