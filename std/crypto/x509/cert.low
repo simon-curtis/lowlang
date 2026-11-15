@@ -61,9 +61,23 @@ pub struct Certificate {
     pub key_usage: i64?
     /// The object identifiers, in dotted form, of the extended key usage extension. Empty when the extension is absent.
     pub ext_key_usage: []str
+    /// The key identifier of the subject key identifier extension, or an empty slice when the extension is absent.
+    pub subject_key_id: []u8
+    /// The `uniformResourceIdentifier` locations of the `id-ad-ocsp` entries of the authority information access extension (RFC 5280 section 4.2.2.1), in order. Empty when there are none.
+    pub ocsp_urls: []str
+    /// The `uniformResourceIdentifier` locations of the `id-ad-caIssuers` entries of the authority information access extension, in order. Empty when there are none.
+    pub issuer_urls: []str
+    /// The `uniformResourceIdentifier` names of the CRL distribution points extension (RFC 5280 section 4.2.1.13), in order. Empty when there are none.
+    ///
+    /// Only a distribution point with a `fullName` and neither a `reasons` nor a `cRLIssuer` field contributes: its list is the complete list of the issuer, which is what `crl_status` requires.
+    pub crl_urls: []str
+    /// Whether the certificate carries the `id-pkix-ocsp-nocheck` extension (RFC 6960 section 4.2.2.2.1), which tells a client not to look up the status of this responder certificate.
+    pub ocsp_no_check: bool
+    /// Whether the TLS feature extension (RFC 7633) lists `status_request`: the server must present a stapled OCSP response with this certificate.
+    pub must_staple: bool
     /// The object identifiers of critical extensions the parser does not interpret.
     ///
-    /// Basic constraints, key usage, extended key usage and subject alternative name are interpreted. `verify_chain` rejects a certificate that lists any other critical extension.
+    /// Basic constraints, key usage, extended key usage, subject alternative name, subject key identifier, authority information access, CRL distribution points, TLS feature and OCSP no check are interpreted. `verify_chain` rejects a certificate that lists any other critical extension.
     pub unhandled_critical: []str
 }
 
@@ -180,7 +194,90 @@ fn purposes(value: []u8) -> []str ! io.Error {
     out
 }
 
-fn extension(mut c: Certificate, d: *der.Der, mut seen: [str: bool]) ! io.Error {
+const ocsp_access = "1.3.6.1.5.5.7.48.1"
+const issuers_access = "1.3.6.1.5.5.7.48.2"
+
+fn uri_names(names: []u8) -> []str ! io.Error {
+    let d = der.reader(names)
+    var out: []str = []
+    for !der.done(d) {
+        let name = der.read(d)?
+        if name.tag == 0x86 {
+            push(mut out, __str_view(name.content))
+        }
+    }
+    out
+}
+
+fn authority_access(mut c: Certificate, value: []u8) ! io.Error {
+    let outer = der.whole(value, 0x30)?
+    let d = der.reader(outer.content)
+    for !der.done(d) {
+        let description = der.enter(d, 0x30)?
+        let method = der.expect(description, 0x06)?
+        let location = der.read(description)?
+        der.finish(description)?
+        let id = der.oid(method.content)?
+        if location.tag != 0x86 {
+            continue
+        }
+        let url = __str_view(location.content)
+        if id == ocsp_access {
+            push(mut c.ocsp_urls, url)
+        } else if id == issuers_access {
+            push(mut c.issuer_urls, url)
+        }
+    }
+}
+
+fn distribution_points(mut c: Certificate, value: []u8) ! io.Error {
+    let outer = der.whole(value, 0x30)?
+    let d = der.reader(outer.content)
+    for !der.done(d) {
+        let point = der.enter(d, 0x30)?
+        var urls: []str = []
+        var complete = true
+        for !der.done(point) {
+            let field = der.read(point)?
+            if field.tag != 0xA0 {
+                complete = false
+                continue
+            }
+            let wrapper = der.reader(field.content)
+            let choice = der.read(wrapper)?
+            der.finish(wrapper)?
+            if choice.tag == 0xA0 {
+                urls = uri_names(choice.content)?
+            }
+        }
+        if complete {
+            for url in urls {
+                push(mut c.crl_urls, url)
+            }
+        }
+    }
+}
+
+fn tls_features(value: []u8) -> bool ! io.Error {
+    let outer = der.whole(value, 0x30)?
+    let d = der.reader(outer.content)
+    var stapled = false
+    for !der.done(d) {
+        let feature = der.expect(d, 0x02)?
+        if der.small_int(feature.content)? == 5 {
+            stapled = true
+        }
+    }
+    stapled
+}
+
+struct RawExtension {
+    id: str
+    critical: bool
+    value: []u8
+}
+
+fn read_extension(d: *der.Der) -> RawExtension ! io.Error {
     let ext = der.enter(d, 0x30)?
     let id = der.expect(ext, 0x06)?
     let name = der.oid(id.content)?
@@ -191,11 +288,16 @@ fn extension(mut c: Certificate, d: *der.Der, mut seen: [str: bool]) ! io.Error 
     }
     let wrapped = der.expect(ext, 0x04)?
     der.finish(ext)?
+    RawExtension { id: name, critical, value: wrapped.content }
+}
+
+fn extension(mut c: Certificate, d: *der.Der, mut seen: [str: bool]) ! io.Error {
+    let ext = read_extension(d)?
+    let { id: name, critical, value } = ext
     if seen[name] != none {
         fail Malformed
     }
     seen[name] = true
-    let value = wrapped.content
     if name == "2.5.29.17" {
         alt_names(mut c, value)?
     } else if name == "2.5.29.19" {
@@ -205,6 +307,21 @@ fn extension(mut c: Certificate, d: *der.Der, mut seen: [str: bool]) ! io.Error 
         c.key_usage = der.named_bits(usage.content)?
     } else if name == "2.5.29.37" {
         c.ext_key_usage = purposes(value)?
+    } else if name == "2.5.29.14" {
+        let key_id = der.whole(value, 0x04)?
+        c.subject_key_id = key_id.content
+    } else if name == "1.3.6.1.5.5.7.1.1" {
+        authority_access(mut c, value)?
+    } else if name == "2.5.29.31" {
+        distribution_points(mut c, value)?
+    } else if name == "1.3.6.1.5.5.7.1.24" {
+        c.must_staple = tls_features(value)?
+    } else if name == "1.3.6.1.5.5.7.48.1.5" {
+        let null = der.whole(value, 0x05)?
+        if null.content.len != 0 {
+            fail Malformed
+        }
+        c.ocsp_no_check = true
     } else if critical {
         push(mut c.unhandled_critical, name)
     }
@@ -260,7 +377,8 @@ pub fn parse(encoded: []u8) -> Certificate ! io.Error {
         subject: subject.raw, common_name: subject_name, not_before: period[0], not_after: period[1],
         signature_algorithm: algorithm.oid, signature_parameters: algorithm.parameters, signature,
         public_key: key, dns_names: [], ip_addresses: [], ca: false, path_length: none,
-        key_usage: none, ext_key_usage: [], unhandled_critical: [],
+        key_usage: none, ext_key_usage: [], subject_key_id: [], ocsp_urls: [], issuer_urls: [], crl_urls: [],
+        ocsp_no_check: false, must_staple: false, unhandled_critical: [],
     }
     for tag in [0x81, 0x82] {
         if der.peek(t) == tag {

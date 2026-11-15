@@ -1,0 +1,407 @@
+import std/crypto/der
+import std/crypto/hash
+import std/io
+import std/slices
+
+/// The hash algorithm of the `CertID` that `ocsp_request` writes.
+pub enum CertIdHash {
+    /// SHA-1, the algorithm every responder accepts.
+    Sha1
+    /// SHA-256.
+    Sha256
+}
+
+/// The `responseStatus` of an OCSP response (RFC 6960 section 4.2.1).
+pub enum OcspStatus {
+    /// The response has a `BasicOCSPResponse`.
+    Successful
+    /// The request was not well formed.
+    MalformedRequest
+    /// The responder failed internally.
+    InternalError
+    /// The responder cannot answer now.
+    TryLater
+    /// The request must be signed.
+    SigRequired
+    /// The client is not allowed to ask this responder.
+    Unauthorized
+}
+
+/// The responder of a `OcspBasic`, as a name or a key hash.
+pub enum ResponderId {
+    /// The DER encoding of the responder's subject `Name`.
+    ByName(name: []u8)
+    /// The SHA-1 hash of the responder's public key, the contents of the `subjectPublicKey` bit string.
+    ByKey(key_hash: []u8)
+}
+
+/// One `SingleResponse` of an `OcspBasic`: the status of one certificate.
+pub struct OcspSingle {
+    /// The object identifier of the hash algorithm of the `CertID` in dotted form.
+    pub hash_algorithm: str
+    /// The hash of the DER encoding of the issuer name.
+    pub issuer_name_hash: []u8
+    /// The hash of the issuer's public key bits.
+    pub issuer_key_hash: []u8
+    /// The content bytes of the serial number integer of the certificate.
+    pub serial: []u8
+    /// What the responder says about the certificate.
+    pub status: Status
+    /// The time the status was known to be correct, in Unix seconds.
+    pub this_update: i64
+    /// The time by which newer information is available, or `none` when the response has no `nextUpdate`.
+    pub next_update: i64?
+}
+
+/// The `BasicOCSPResponse` of an OCSP response (RFC 6960 section 4.2.1).
+pub struct OcspBasic {
+    /// The DER encoding of the `tbsResponseData`, the bytes the responder signed.
+    pub tbs: []u8
+    /// The responder as it names itself.
+    pub responder: ResponderId
+    /// The time the response was signed, in Unix seconds.
+    pub produced_at: i64
+    /// The single responses, in order.
+    pub responses: []OcspSingle
+    /// The content bytes of the nonce extension, or an empty slice when the response has none.
+    pub nonce: []u8
+    /// The object identifier of the signature algorithm in dotted form.
+    pub signature_algorithm: str
+    /// The DER encoding of the signature algorithm parameters, or an empty slice when there are none.
+    pub signature_parameters: []u8
+    /// The signature bytes, with the bit string's unused-bits octet removed.
+    pub signature: []u8
+    /// The certificates the responder sent along, such as its own delegated signing certificate. They are slices of the input.
+    pub certificates: []Certificate
+}
+
+/// A parsed OCSP response.
+pub struct OcspResponse {
+    /// The status of the response as a whole.
+    pub status: OcspStatus
+    /// The signed answer, or `none` when `status` is not `Successful`.
+    pub basic: OcspBasic?
+}
+
+const ocsp_basic_type = "1.3.6.1.5.5.7.48.1.1"
+const ocsp_nonce = "1.3.6.1.5.5.7.48.1.2"
+const ocsp_signing = "1.3.6.1.5.5.7.3.9"
+
+fn cert_id_algorithm(name: str) -> hash.Algorithm? {
+    match name {
+        "1.3.14.3.2.26" => hash.sha1()
+        "2.16.840.1.101.3.4.2.1" => hash.sha256()
+        "2.16.840.1.101.3.4.2.2" => hash.sha384()
+        "2.16.840.1.101.3.4.2.3" => hash.sha512()
+        _ => none
+    }
+}
+
+fn algorithm_identifier(algorithm: CertIdHash) -> []u8 {
+    let oid: []u8 = match algorithm {
+        Sha1 => [0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A]
+        Sha256 => [0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]
+    }
+    der.sequence([oid, [0x05, 0x00]])
+}
+
+fn digest_of(algorithm: CertIdHash) -> hash.Algorithm {
+    match algorithm {
+        Sha1 => hash.sha1()
+        Sha256 => hash.sha256()
+    }
+}
+
+fn nonce_extension(nonce: []u8) -> []u8 {
+    let oid: []u8 = [0x06, 0x09, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02]
+    let value = der.encode(0x04, nonce)
+    let wrapped = der.encode(0x04, value)
+    let extension = der.sequence([oid, wrapped])
+    let list = der.sequence([extension])
+    der.encode(0xA2, list)
+}
+
+/// Returns the DER encoding of an unsigned OCSP request (RFC 6960 section 4.1) for the status of `subject`, which `issuer` issued.
+///
+/// The `CertID` carries `algorithm` over the issuer's name and key. A `nonce` of 1 to 32 bytes is added as the nonce extension (RFC 8954); an empty one adds none. Fails with `Invalid` when `nonce` is longer than 32 bytes or `issuer` is not the issuer of `subject`.
+pub fn ocsp_request(subject: Certificate, issuer: Certificate, algorithm: CertIdHash, nonce: []u8) -> []u8 ! io.Error {
+    if nonce.len > 32 || !hash.equal(subject.issuer, issuer.subject) {
+        fail Invalid
+    }
+    let digest = digest_of(algorithm)
+    let name_hash = der.encode(0x04, hash.sum(digest, issuer.subject))
+    let key_hash = der.encode(0x04, hash.sum(digest, issuer.public_key.key))
+    let serial = der.encode(0x02, subject.serial)
+    let id = der.sequence([algorithm_identifier(algorithm), name_hash, key_hash, serial])
+    let single = der.sequence([id])
+    let list = der.sequence([single])
+    var parts: [][]u8 = [list]
+    if nonce.len > 0 {
+        push(mut parts, nonce_extension(nonce))
+    }
+    let tbs = der.sequence(parts)
+    der.sequence([tbs])
+}
+
+fn single_extensions(d: *der.Der) ! io.Error {
+    let wrapper = der.enter(d, 0xA1)?
+    let list = der.enter(wrapper, 0x30)?
+    der.finish(wrapper)?
+    for !der.done(list) {
+        let ext = read_extension(list)?
+        if ext.critical {
+            fail Unsupported
+        }
+    }
+}
+
+fn single_status(e: der.Element) -> Status ! io.Error {
+    match e.tag {
+        0x80 => {
+            if e.content.len != 0 {
+                fail Malformed
+            }
+            Status.Good
+        }
+        0xA1 => {
+            let d = der.reader(e.content)
+            let date = der.read(d)?
+            let time = der.time(date)?
+            var reason = 0
+            if der.peek(d) == 0xA0 {
+                let wrapper = der.enter(d, 0xA0)?
+                let code = der.expect(wrapper, 0x0A)?
+                der.finish(wrapper)?
+                if code.content.len != 1 || code.content[0] > 10 || code.content[0] == 7 {
+                    fail Malformed
+                }
+                reason = i64(code.content[0])
+            }
+            der.finish(d)?
+            Status.Revoked(time, reason)
+        }
+        0x82 => {
+            if e.content.len != 0 {
+                fail Malformed
+            }
+            Status.Unknown
+        }
+        _ => fail Malformed
+    }
+}
+
+fn single_response(d: *der.Der) -> OcspSingle ! io.Error {
+    let s = der.enter(d, 0x30)?
+    let id = der.enter(s, 0x30)?
+    let algorithm = algorithm_id(id)?
+    let name_hash = der.expect(id, 0x04)?
+    let key_hash = der.expect(id, 0x04)?
+    let serial = der.expect(id, 0x02)?
+    der.finish(id)?
+    let state = der.read(s)?
+    let status = single_status(state)?
+    let start = der.read(s)?
+    let this_update = der.time(start)?
+    var next_update: i64? = none
+    if der.peek(s) == 0xA0 {
+        let wrapper = der.enter(s, 0xA0)?
+        let end = der.read(wrapper)?
+        der.finish(wrapper)?
+        next_update = der.time(end)?
+    }
+    if der.peek(s) == 0xA1 {
+        single_extensions(s)?
+    }
+    der.finish(s)?
+    OcspSingle {
+        hash_algorithm: algorithm.oid, issuer_name_hash: name_hash.content, issuer_key_hash: key_hash.content,
+        serial: serial.content, status, this_update, next_update,
+    }
+}
+
+fn response_nonce(d: *der.Der) -> []u8 ! io.Error {
+    let wrapper = der.enter(d, 0xA1)?
+    let list = der.enter(wrapper, 0x30)?
+    der.finish(wrapper)?
+    var nonce: []u8 = []
+    var seen = false
+    for !der.done(list) {
+        let ext = read_extension(list)?
+        if ext.id == ocsp_nonce {
+            if seen {
+                fail Malformed
+            }
+            seen = true
+            let value = der.whole(ext.value, 0x04)?
+            if value.content.len == 0 || value.content.len > 32 {
+                fail Malformed
+            }
+            nonce = value.content
+        } else if ext.critical {
+            fail Unsupported
+        }
+    }
+    nonce
+}
+
+fn responder_id(d: *der.Der) -> ResponderId ! io.Error {
+    match der.peek(d) {
+        0xA1 => {
+            let wrapper = der.enter(d, 0xA1)?
+            let name = der.expect(wrapper, 0x30)?
+            der.finish(wrapper)?
+            ResponderId.ByName(name.raw)
+        }
+        0xA2 => {
+            let wrapper = der.enter(d, 0xA2)?
+            let key = der.expect(wrapper, 0x04)?
+            der.finish(wrapper)?
+            ResponderId.ByKey(key.content)
+        }
+        _ => fail Malformed
+    }
+}
+
+fn basic_response(content: []u8) -> OcspBasic ! io.Error {
+    let outer = der.whole(content, 0x30)?
+    let body = der.reader(outer.content)
+    let tbs = der.expect(body, 0x30)?
+    let algorithm = algorithm_id(body)?
+    let signature_bits = der.expect(body, 0x03)?
+    var certificates: []Certificate = []
+    if der.peek(body) == 0xA0 {
+        let wrapper = der.enter(body, 0xA0)?
+        let list = der.enter(wrapper, 0x30)?
+        der.finish(wrapper)?
+        for !der.done(list) {
+            let encoded = der.read(list)?
+            let c = parse(encoded.raw)?
+            push(mut certificates, c)
+        }
+    }
+    der.finish(body)?
+    let signature = der.bits(signature_bits.content)?
+    let t = der.reader(tbs.content)
+    let responder = responder_id(t)?
+    let produced = der.read(t)?
+    let produced_at = der.time(produced)?
+    let list = der.enter(t, 0x30)?
+    var responses: []OcspSingle = []
+    for !der.done(list) {
+        push(mut responses, single_response(list)?)
+    }
+    var nonce: []u8 = []
+    if der.peek(t) == 0xA1 {
+        nonce = response_nonce(t)?
+    }
+    der.finish(t)?
+    OcspBasic {
+        tbs: tbs.raw, responder, produced_at, responses, nonce, signature_algorithm: algorithm.oid,
+        signature_parameters: algorithm.parameters, signature, certificates,
+    }
+}
+
+fn response_status(code: der.Element) -> OcspStatus ! io.Error {
+    if code.content.len != 1 {
+        fail Malformed
+    }
+    match code.content[0] {
+        0 => OcspStatus.Successful
+        1 => OcspStatus.MalformedRequest
+        2 => OcspStatus.InternalError
+        3 => OcspStatus.TryLater
+        5 => OcspStatus.SigRequired
+        6 => OcspStatus.Unauthorized
+        _ => fail Malformed
+    }
+}
+
+/// Parses a DER encoded OCSP response (RFC 6960 section 4.2.1).
+///
+/// A response whose status is not `Successful` has no `basic`. Parsing is strict DER and fails with `Malformed` for bad encodings, trailing bytes, an encoded default version, a repeated or ill-formed nonce, response bytes that are missing from a successful response or present in an unsuccessful one, and with `Unsupported` for a response type other than `id-pkix-ocsp-basic` or a critical extension, which no extension of RFC 6960 is. The signature is not verified; see `ocsp_status`.
+pub fn parse_ocsp(encoded: []u8) -> OcspResponse ! io.Error {
+    let outer = der.whole(encoded, 0x30)?
+    let d = der.reader(outer.content)
+    let code = der.expect(d, 0x0A)?
+    let status = response_status(code)?
+    if status != OcspStatus.Successful {
+        der.finish(d)?
+        return OcspResponse { status, basic: none }
+    }
+    let wrapper = der.enter(d, 0xA0)?
+    der.finish(d)?
+    let response_bytes = der.enter(wrapper, 0x30)?
+    der.finish(wrapper)?
+    let kind = der.expect(response_bytes, 0x06)?
+    let payload = der.expect(response_bytes, 0x04)?
+    der.finish(response_bytes)?
+    if der.oid(kind.content)? != ocsp_basic_type {
+        fail Unsupported
+    }
+    let basic = basic_response(payload.content)?
+    OcspResponse { status, basic }
+}
+
+fn names(id: ResponderId, c: Certificate) -> bool {
+    match id {
+        ByName(name) => hash.equal(name, c.subject)
+        ByKey(key_hash) => hash.equal(key_hash, hash.sum(hash.sha1(), c.public_key.key))
+    }
+}
+
+fn delegated(c: Certificate, issuer: Certificate, now: i64) -> bool {
+    hash.equal(c.issuer, issuer.subject) && current(c, now) && c.ext_key_usage.any(fn(purpose) purpose == ocsp_signing) && check_signature(issuer, c)
+}
+
+fn signed_response(basic: OcspBasic, responder: Certificate) -> bool {
+    signed_by(responder.public_key, basic.signature_algorithm, basic.signature_parameters, basic.tbs, basic.signature)
+}
+
+fn responder_verified(basic: OcspBasic, issuer: Certificate, now: i64) -> bool {
+    if names(basic.responder, issuer) {
+        return signed_response(basic, issuer)
+    }
+    for c in basic.certificates {
+        if names(basic.responder, c) && delegated(c, issuer, now) && signed_response(basic, c) {
+            return true
+        }
+    }
+    false
+}
+
+fn answers(single: OcspSingle, subject: Certificate, issuer: Certificate) -> bool {
+    let algorithm = match cert_id_algorithm(single.hash_algorithm) {
+        some(found) => found
+        none => return false
+    }
+    let name_hash = hash.sum(algorithm, issuer.subject)
+    let key_hash = hash.sum(algorithm, issuer.public_key.key)
+    hash.equal(single.serial, subject.serial) && hash.equal(single.issuer_name_hash, name_hash) && hash.equal(single.issuer_key_hash, key_hash)
+}
+
+fn fresh(single: OcspSingle, now: i64) -> bool {
+    let next = single.next_update ?? -1
+    single.this_update <= now + clock_skew && next >= 0 && now <= next + clock_skew
+}
+
+/// Returns the status of `subject`, which `issuer` issued, according to `response`.
+///
+/// The response must be `Successful`. Its responder must be `issuer` itself, named by name or by key hash, or a certificate in `OcspBasic.certificates` that `issuer` issued, that is valid at `now` with no unhandled critical extension and that has the extended key usage `id-kp-OCSPSigning`, and the signature must verify with that key under the algorithms of `check_signature`. The `CertID` of a single response is recomputed with the hash algorithm it names (SHA-1, SHA-256, SHA-384 or SHA-512) over the issuer's name and key and the serial number of `subject`. The single response must have a `thisUpdate` no later than `now` plus `clock_skew` and a `nextUpdate` no earlier than `now` minus `clock_skew`; a response without `nextUpdate` is not accepted. A non-empty `nonce` is the one sent with the request: a response that carries a different nonce is rejected, and one that carries none is accepted, since a responder that serves precomputed responses cannot echo it (RFC 8954 section 3.2). With an empty `nonce`, as for a stapled response, a nonce in the response is ignored. Returns the status of the first matching single response, and fails with `Invalid` when the response is unsuccessful, the responder is not verified, the nonce differs, or no single response matches `subject` and is current.
+pub fn ocsp_status(response: OcspResponse, subject: Certificate, issuer: Certificate, now: i64, nonce: []u8) -> Status ! io.Error {
+    let basic = match response.basic {
+        some(found) => found
+        none => fail Invalid
+    }
+    if !hash.equal(subject.issuer, issuer.subject) || !responder_verified(basic, issuer, now) {
+        fail Invalid
+    }
+    if nonce.len > 0 && basic.nonce.len > 0 && !hash.equal(basic.nonce, nonce) {
+        fail Invalid
+    }
+    for single in basic.responses {
+        if answers(single, subject, issuer) && fresh(single, now) {
+            return single.status
+        }
+    }
+    fail Invalid
+}

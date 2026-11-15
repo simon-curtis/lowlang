@@ -1,0 +1,164 @@
+import std/crypto
+import std/io
+
+/// The allowed difference in seconds between the clock of the caller and the clock of the signer of a CRL or an OCSP response, 300.
+///
+/// A list or response issued up to this long after `now` counts as issued, and one that expired up to this long before `now` counts as current.
+pub const clock_skew = 300
+
+/// The revocation status of one certificate.
+pub enum Status {
+    /// The issuer does not consider the certificate revoked.
+    Good
+    /// The certificate was revoked at `time` in Unix seconds, for `reason` (RFC 5280 section 5.3.1; `0` is unspecified).
+    Revoked(time: i64, reason: i64)
+    /// The responder does not know the certificate.
+    Unknown
+}
+
+/// How strictly `verify_chain` treats a certificate whose revocation status cannot be determined.
+pub enum RevocationMode {
+    /// No revocation check is made. A certificate with the TLS feature extension is not required to be stapled either.
+    Off
+    /// A certificate whose status cannot be determined is accepted. A revoked certificate is rejected, and so is a must-staple certificate without a valid good stapled response.
+    SoftFail
+    /// A certificate whose status cannot be determined is rejected, as is one that is revoked or must be stapled and is not.
+    HardFail
+}
+
+/// Fetches the revocation data of a certificate from the network.
+///
+/// Both functions are called with a URL taken from the certificate and return the DER bytes the server sent. `std/crypto/x509/fetch` has HTTP implementations; a test passes functions that return fixed data. A caller that wants to cache responses wraps them.
+pub struct Fetcher {
+    /// Returns the OCSP response to the DER `request` sent to the responder at `url`.
+    pub ocsp: fn(str, []u8) -> []u8 ! io.Error
+    /// Returns the CRL at `url`.
+    pub crl: fn(str) -> []u8 ! io.Error
+}
+
+/// The revocation check `verify_chain` makes.
+///
+/// The default is `Off`.
+pub struct Revocation {
+    /// What to do when the status of a certificate cannot be determined.
+    pub mode: RevocationMode = RevocationMode.Off
+    /// DER encoded OCSP responses the caller already has, such as the stapled responses of a TLS server. A response applies to the certificate its `CertID` names, whatever its position in the list.
+    pub staples: [][]u8 = []
+    /// Where to fetch the status of a certificate that no stapled response covers, or `none` to use the staples alone.
+    pub fetcher: Fetcher? = none
+}
+
+fn settled(status: Status) -> Status? {
+    match status {
+        Unknown => none
+        _ => status
+    }
+}
+
+fn stapled(r: Revocation, subject: Certificate, issuer: Certificate, now: i64) -> Status? {
+    for staple in r.staples {
+        let response = parse_ocsp(staple) or continue
+        let status = ocsp_status(response, subject, issuer, now, []) or continue
+        match settled(status) {
+            some(answer) => return answer
+            none => {}
+        }
+    }
+    none
+}
+
+fn fetched_ocsp(f: Fetcher, subject: Certificate, issuer: Certificate, now: i64) -> Status? {
+    for url in subject.ocsp_urls {
+        let nonce = crypto.random(16)
+        let request = ocsp_request(subject, issuer, CertIdHash.Sha1, nonce) or continue
+        let body = f.ocsp(url, request) or continue
+        let response = parse_ocsp(body) or continue
+        let status = ocsp_status(response, subject, issuer, now, nonce) or continue
+        match settled(status) {
+            some(answer) => return answer
+            none => {}
+        }
+    }
+    none
+}
+
+fn fetched_crl(f: Fetcher, subject: Certificate, issuer: Certificate, now: i64) -> Status? {
+    for url in subject.crl_urls {
+        let body = f.crl(url) or continue
+        let list = parse_crl(body) or continue
+        let status = crl_status(list, subject, issuer, now) or continue
+        return status
+    }
+    none
+}
+
+fn fetched(r: Revocation, subject: Certificate, issuer: Certificate, now: i64) -> Status? {
+    let f = match r.fetcher {
+        some(found) => found
+        none => return none
+    }
+    match fetched_ocsp(f, subject, issuer, now) {
+        some(answer) => return answer
+        none => {}
+    }
+    fetched_crl(f, subject, issuer, now)
+}
+
+fn is_good(status: Status?) -> bool {
+    match status {
+        some(known) => match known {
+            Good => true
+            _ => false
+        }
+        none => false
+    }
+}
+
+fn is_revoked(status: Status?) -> bool {
+    match status {
+        some(known) => match known {
+            Revoked(_, _) => true
+            _ => false
+        }
+        none => false
+    }
+}
+
+fn check_one(r: Revocation, subject: Certificate, issuer: Certificate, now: i64) ! io.Error {
+    let staple = stapled(r, subject, issuer, now)
+    if is_revoked(staple) {
+        fail Refused
+    }
+    if subject.must_staple && !is_good(staple) {
+        fail Invalid
+    }
+    var answer = staple
+    match staple {
+        some(_) => {}
+        none => {
+            answer = fetched(r, subject, issuer, now)
+        }
+    }
+    if is_revoked(answer) {
+        fail Refused
+    }
+    match answer {
+        some(_) => {}
+        none => {
+            if r.mode == RevocationMode.HardFail {
+                fail Invalid
+            }
+        }
+    }
+}
+
+fn check_revocation(path: []Certificate, r: Revocation, now: i64) ! io.Error {
+    if r.mode == RevocationMode.Off {
+        return
+    }
+    for i in 0..path.len - 1 {
+        if !path[i].ocsp_no_check {
+            check_one(r, path[i], path[i + 1], now)?
+        }
+    }
+}

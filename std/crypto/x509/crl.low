@@ -1,0 +1,288 @@
+import std/crypto/der
+import std/crypto/hash
+import std/io
+import std/slices
+
+/// One revoked certificate of a `Crl` (RFC 5280 section 5.1.2.6).
+pub struct RevokedEntry {
+    /// The content bytes of the serial number integer, comparable with `Certificate.serial`.
+    pub serial: []u8
+    /// The revocation date in Unix seconds.
+    pub time: i64
+    /// The reason code of RFC 5280 section 5.3.1 (`1` key compromise, `2` CA compromise, `3` affiliation changed, `4` superseded, `5` cessation of operation, `6` certificate hold, `9` privilege withdrawn, `10` AA compromise), or `0` (unspecified) when the entry has none.
+    pub reason: i64
+}
+
+/// A parsed certificate revocation list (RFC 5280 section 5).
+///
+/// `parse_crl` produces it and keeps slices of the input, so the DER buffer must stay alive and unmodified for as long as the list is used. The revoked entries stay encoded in the input: `crl_lookup` scans them for one serial number without building a value per entry.
+pub struct Crl {
+    /// The complete DER encoding of the list.
+    pub raw: []u8
+    /// The DER encoding of the `tbsCertList`, the bytes the issuer signed.
+    pub tbs: []u8
+    /// The version as encoded: `0` for v1 and `1` for v2.
+    pub version: i64
+    /// The DER encoding of the issuer `Name`, comparable byte for byte with the `subject` of the issuing certificate.
+    pub issuer: []u8
+    /// The issue time in Unix seconds.
+    pub this_update: i64
+    /// The time the next list is due in Unix seconds, or `none` when the list has no `nextUpdate`.
+    pub next_update: i64?
+    /// The object identifier of the signature algorithm in dotted form.
+    pub signature_algorithm: str
+    /// The DER encoding of the signature algorithm parameters, or an empty slice when there are none.
+    pub signature_parameters: []u8
+    /// The signature bytes, with the bit string's unused-bits octet removed.
+    pub signature: []u8
+    /// The content bytes of the CRL number extension, or an empty slice when it is absent.
+    pub number: []u8
+    /// The key identifier of the authority key identifier extension, or an empty slice when there is none.
+    pub authority_key_id: []u8
+    /// The `uniformResourceIdentifier` names of the `fullName` of the issuing distribution point extension. Empty when the extension or the name is absent.
+    pub distribution_points: []str
+    /// Whether the issuing distribution point lists only end entity certificates.
+    pub only_user_certs: bool
+    /// Whether the issuing distribution point lists only certificate authority certificates.
+    pub only_ca_certs: bool
+    /// The number of revoked entries.
+    pub count: i64
+    entries: []u8
+}
+
+fn reason_code(value: []u8) -> i64 ! io.Error {
+    let e = der.whole(value, 0x0A)?
+    if e.content.len != 1 || e.content[0] > 10 || e.content[0] == 7 {
+        fail Malformed
+    }
+    i64(e.content[0])
+}
+
+fn entry_of(content: []u8) -> RevokedEntry ! io.Error {
+    let d = der.reader(content)
+    let serial = der.expect(d, 0x02)?
+    if serial.content.len == 0 {
+        fail Malformed
+    }
+    let date = der.read(d)?
+    let time = der.time(date)?
+    var reason = 0
+    if !der.done(d) {
+        let list = der.enter(d, 0x30)?
+        der.finish(d)?
+        for !der.done(list) {
+            let ext = read_extension(list)?
+            if ext.id == "2.5.29.21" {
+                reason = reason_code(ext.value)?
+            } else if ext.critical {
+                fail Unsupported
+            }
+        }
+    }
+    RevokedEntry { serial: serial.content, time, reason }
+}
+
+fn authority_key(value: []u8) -> []u8 ! io.Error {
+    let outer = der.whole(value, 0x30)?
+    let d = der.reader(outer.content)
+    var key: []u8 = []
+    for !der.done(d) {
+        let field = der.read(d)?
+        if field.tag == 0x80 {
+            key = field.content
+        }
+    }
+    key
+}
+
+fn distribution_scope(mut crl: Crl, value: []u8) ! io.Error {
+    let outer = der.whole(value, 0x30)?
+    let d = der.reader(outer.content)
+    for !der.done(d) {
+        let field = der.read(d)?
+        match field.tag {
+            0xA0 => {
+                let wrapper = der.reader(field.content)
+                let choice = der.read(wrapper)?
+                der.finish(wrapper)?
+                if choice.tag != 0xA0 {
+                    fail Unsupported
+                }
+                crl.distribution_points = uri_names(choice.content)?
+            }
+            0x81 => {
+                crl.only_user_certs = der.boolean(field.content)?
+            }
+            0x82 => {
+                crl.only_ca_certs = der.boolean(field.content)?
+            }
+            0x83 => fail Unsupported
+            0x84 => {
+                if der.boolean(field.content)? {
+                    fail Unsupported
+                }
+            }
+            0x85 => {
+                if der.boolean(field.content)? {
+                    fail Unsupported
+                }
+            }
+            _ => fail Malformed
+        }
+    }
+    if crl.only_user_certs && crl.only_ca_certs {
+        fail Malformed
+    }
+}
+
+fn list_extensions(mut crl: Crl, d: *der.Der) ! io.Error {
+    var seen: [str: bool] = [:]
+    for !der.done(d) {
+        let ext = read_extension(d)?
+        if seen[ext.id] != none {
+            fail Malformed
+        }
+        seen[ext.id] = true
+        if ext.id == "2.5.29.35" {
+            crl.authority_key_id = authority_key(ext.value)?
+        } else if ext.id == "2.5.29.20" {
+            let number = der.whole(ext.value, 0x02)?
+            if number.content.len == 0 || number.content.len > 21 || number.content[0] >= 0x80 {
+                fail Malformed
+            }
+            crl.number = number.content
+        } else if ext.id == "2.5.29.28" {
+            distribution_scope(mut crl, ext.value)?
+        } else if ext.critical {
+            fail Unsupported
+        }
+    }
+}
+
+/// Parses a DER encoded certificate revocation list.
+///
+/// Parsing is strict DER and covers the whole list, including every revoked entry, so a list that parses can be scanned with `crl_lookup`. Fails with `Malformed` for bad encodings, trailing bytes, a signature algorithm that differs between the outer and the signed part, a repeated extension, or extensions in a v1 list, and with `Unsupported` for a version above v2, a critical extension or critical entry extension that is not interpreted (such as a delta CRL indicator or a certificate issuer), or an issuing distribution point that is indirect, limited to some reasons or limited to attribute certificates, all of which would make the list incomplete for the certificates it is used for. The signature is not verified; see `verify_crl`.
+pub fn parse_crl(encoded: []u8) -> Crl ! io.Error {
+    let outer = der.whole(encoded, 0x30)?
+    let body = der.reader(outer.content)
+    let tbs = der.expect(body, 0x30)?
+    let algorithm = algorithm_id(body)?
+    let signature_bits = der.expect(body, 0x03)?
+    der.finish(body)?
+    let t = der.reader(tbs.content)
+    var version = 0
+    if der.peek(t) == 0x02 {
+        let v = der.expect(t, 0x02)?
+        version = der.small_int(v.content)?
+        if version > 1 {
+            fail Unsupported
+        }
+        if version == 0 {
+            fail Malformed
+        }
+    }
+    let inner = algorithm_id(t)?
+    if !hash.equal(inner.raw, algorithm.raw) {
+        fail Malformed
+    }
+    let issuer = der.expect(t, 0x30)?
+    let issued = der.read(t)?
+    let this_update = der.time(issued)?
+    var next_update: i64? = none
+    if der.peek(t) == 0x17 || der.peek(t) == 0x18 {
+        let due = der.read(t)?
+        next_update = der.time(due)?
+    }
+    var entries: []u8 = []
+    var count = 0
+    if der.peek(t) == 0x30 {
+        let list = der.read(t)?
+        entries = list.content
+        let scan = der.reader(entries)
+        for !der.done(scan) {
+            let entry = der.expect(scan, 0x30)?
+            entry_of(entry.content)?
+            count += 1
+        }
+    }
+    let signature = der.bits(signature_bits.content)?
+    var crl = Crl {
+        raw: outer.raw, tbs: tbs.raw, version, issuer: issuer.raw, this_update, next_update,
+        signature_algorithm: algorithm.oid, signature_parameters: algorithm.parameters, signature,
+        number: [], authority_key_id: [], distribution_points: [], only_user_certs: false,
+        only_ca_certs: false, count, entries,
+    }
+    if der.peek(t) == 0xA0 {
+        if version != 1 {
+            fail Malformed
+        }
+        let wrapper = der.enter(t, 0xA0)?
+        let list = der.enter(wrapper, 0x30)?
+        der.finish(wrapper)?
+        list_extensions(mut crl, list)?
+    }
+    der.finish(t)?
+    crl
+}
+
+/// Returns the entry for `serial` in `crl`, or `none` when the list does not revoke it.
+///
+/// `serial` is the content of the serial number integer, as `Certificate.serial`. The entries are scanned in order and only the serial of each is compared, so the cost is one pass over the encoded list and nothing is allocated for the entries that do not match. Fails with `Malformed` when `crl` was not made by `parse_crl`.
+pub fn crl_lookup(crl: Crl, serial: []u8) -> RevokedEntry? ! io.Error {
+    let d = der.reader(crl.entries)
+    for !der.done(d) {
+        let entry = der.expect(d, 0x30)?
+        let fields = der.reader(entry.content)
+        let id = der.expect(fields, 0x02)?
+        if hash.equal(id.content, serial) {
+            return entry_of(entry.content)?
+        }
+    }
+    none
+}
+
+/// Checks that `crl` is current at `now` and was issued by `issuer`.
+///
+/// The issuer name of the list must equal the `subject` of `issuer`, `issuer` must allow `cRLSign` when it has a key usage extension, the authority key identifier of the list must equal the subject key identifier of `issuer` when both are present, and the signature must verify with the key of `issuer` under the algorithms of `check_signature`. `this_update` must not be later than `now` plus `clock_skew`, and `next_update` must exist and be no earlier than `now` minus `clock_skew`. Fails with `Invalid` when any of these does not hold.
+pub fn verify_crl(crl: Crl, issuer: Certificate, now: i64) ! io.Error {
+    let usage = issuer.key_usage ?? 64
+    if !hash.equal(crl.issuer, issuer.subject) || (usage & 64) == 0 {
+        fail Invalid
+    }
+    if crl.authority_key_id.len > 0 && issuer.subject_key_id.len > 0 && !hash.equal(crl.authority_key_id, issuer.subject_key_id) {
+        fail Invalid
+    }
+    let next = crl.next_update ?? -1
+    if crl.this_update > now + clock_skew || next < 0 || next + clock_skew < now {
+        fail Invalid
+    }
+    if !signed_by(issuer.public_key, crl.signature_algorithm, crl.signature_parameters, crl.tbs, crl.signature) {
+        fail Invalid
+    }
+}
+
+fn applies(crl: Crl, subject: Certificate) -> bool {
+    if crl.only_user_certs && subject.ca || crl.only_ca_certs && !subject.ca {
+        return false
+    }
+    crl.distribution_points.len == 0 || crl.distribution_points.any(fn(url) subject.crl_urls.any(fn(listed) listed == url))
+}
+
+/// Returns the revocation status of `subject` according to `crl`, which `issuer` issued.
+///
+/// The list is verified with `verify_crl`. It must be a list of the issuer of `subject` and cover it: an issuing distribution point that lists only end entity certificates does not cover a certificate authority and the other way round, and one with a distribution point name covers only a certificate whose `crl_urls` contain one of its names. The result is `Revoked` when the list has an entry for the serial number of `subject` dated no later than `now`, and `Good` otherwise; a list never answers `Unknown`. Fails with `Invalid` when the list is not usable for `subject`, and with the error of `crl_lookup`.
+pub fn crl_status(crl: Crl, subject: Certificate, issuer: Certificate, now: i64) -> Status ! io.Error {
+    verify_crl(crl, issuer, now)?
+    if !hash.equal(crl.issuer, subject.issuer) || !applies(crl, subject) {
+        fail Invalid
+    }
+    match crl_lookup(crl, subject.serial)? {
+        some(entry) => {
+            if entry.time <= now {
+                return Status.Revoked(entry.time, entry.reason)
+            }
+        }
+        none => {}
+    }
+    Status.Good
+}

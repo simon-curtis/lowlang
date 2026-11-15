@@ -1,0 +1,126 @@
+import std/base64
+import std/crypto/hash
+import std/crypto/x509
+import std/crypto/x509/fetch
+import std/header
+import std/http
+import std/io
+import std/net
+import std/text
+import std/uri
+
+const now = 1794700800
+
+struct Bundle {
+    pem: str
+    ca: x509.Certificate
+    inter: x509.Certificate
+    good: x509.Certificate
+    revoked: x509.Certificate
+}
+
+struct Answer {
+    label: str
+    subject: x509.Certificate
+}
+
+fn block(pem: str, label: str) -> []u8 ! io.Error {
+    let found = x509.pem_blocks(pem, label)
+    if found.len != 1 {
+        fail Malformed
+    }
+    found[0]
+}
+
+fn bundle(pem: str) -> Bundle ! io.Error {
+    let root = block(pem, "ROOT")?
+    let inter = block(pem, "INTER")?
+    let good = block(pem, "LEAF")?
+    let revoked = block(pem, "LEAF_REVOKED")?
+    Bundle {
+        pem,
+        ca: x509.parse(root)?,
+        inter: x509.parse(inter)?,
+        good: x509.parse(good)?,
+        revoked: x509.parse(revoked)?,
+    }
+}
+
+fn verdict(b: Bundle, leaf: x509.Certificate, revocation: x509.Revocation) -> str {
+    x509.verify_chain(leaf, [b.inter], [b.ca], "localhost", now, revocation) catch {
+        Refused => return "revoked"
+        Invalid => return "status not established"
+        _ => return "rejected"
+    }
+    "good"
+}
+
+fn staples(b: Bundle) {
+    let good = block(b.pem, "OCSP GOOD_DIRECT") or return
+    let inter = block(b.pem, "OCSP INTER_GOOD") or return
+    let revoked = block(b.pem, "OCSP REVOKED") or return
+    let accepting = x509.Revocation { mode: x509.RevocationMode.HardFail, staples: [good, inter] }
+    print("stapled, certificate and issuer answered: {verdict(b, b.good, accepting)}")
+    let partial = x509.Revocation { mode: x509.RevocationMode.HardFail, staples: [good] }
+    print("stapled, issuer unanswered, hard fail: {verdict(b, b.good, partial)}")
+    let lenient = x509.Revocation { mode: x509.RevocationMode.SoftFail, staples: [good] }
+    print("stapled, issuer unanswered, soft fail: {verdict(b, b.good, lenient)}")
+    let rejecting = x509.Revocation { mode: x509.RevocationMode.SoftFail, staples: [revoked] }
+    print("stapled revoked: {verdict(b, b.revoked, rejecting)}")
+}
+
+fn responder(b: Bundle, req: http.Request) -> http.Response {
+    let prefix = "/ocsp/"
+    if req.path.len > prefix.len && req.path[..prefix.len] == prefix {
+        let encoded = uri.unescape(req.path[prefix.len..]) ?? ""
+        let sent = base64.decode(encoded) or return http.response(400, "bad request")
+        let answers = [Answer { label: "GOOD_DIRECT", subject: b.good }, Answer { label: "REVOKED", subject: b.revoked }]
+        for answer in answers {
+            let expected = x509.ocsp_request(answer.subject, b.inter, x509.CertIdHash.Sha1, []) or continue
+            if hash.equal(sent, expected) {
+                let body = block(b.pem, "OCSP {answer.label}") or return http.response(500, "no response")
+                return http.Response { status: 200, headers: [header.Header { name: "content-type", value: "application/ocsp-response" }], body }
+            }
+        }
+        let inter = block(b.pem, "OCSP INTER_GOOD") or return http.response(500, "no response")
+        return http.Response { status: 200, headers: [header.Header { name: "content-type", value: "application/ocsp-response" }], body: inter }
+    }
+    if req.path == "/inter.crl" {
+        let body = block(b.pem, "CRL INTER") or return http.response(500, "no list")
+        return http.Response { status: 200, headers: [header.Header { name: "content-type", value: "application/pkix-crl" }], body }
+    }
+    http.response(404, "not found")
+}
+
+fn local_fetcher(c: *http.Client, base: str) -> x509.Fetcher {
+    x509.Fetcher {
+        ocsp: fn(url: str, request: []u8) -> []u8 ! io.Error { fetch.ocsp(c, "{base}/ocsp", request) },
+        crl: fn(url: str) -> []u8 ! io.Error {
+            let parts = text.split(url, 0x2F)
+            fetch.crl(c, "{base}/{parts[parts.len - 1]}")
+        },
+    }
+}
+
+fn fetched(b: Bundle, base: str) {
+    let c = fetch.client()
+    let revocation = x509.Revocation { mode: x509.RevocationMode.HardFail, fetcher: local_fetcher(c, base) }
+    print("fetched, certificate: {verdict(b, b.good, revocation)}")
+    print("fetched, revoked certificate: {verdict(b, b.revoked, revocation)}")
+    let off = x509.Revocation {}
+    print("no revocation check, revoked certificate: {verdict(b, b.revoked, off)}")
+}
+
+/// Checks revocation through stapled responses and through an OCSP responder and a CRL served over HTTP.
+///
+/// The responder is a loopback server, and the certificates name hosts that do not exist, so the fetcher sends every request to it.
+fn main() ! io.Error {
+    let b = bundle(embed("status.pem"))?
+    staples(b)
+    using l = net.listen("127.0.0.1", 0)?
+    let handler = fn(req: http.Request) -> http.Response { responder(b, req) }
+    let listening = l.handle
+    spawn fn() { http.serve_on(listening, handler) or {} }()
+    fetched(b, "http://127.0.0.1:{l.handle.addr.port}")
+    net.close_listener(l)
+}
