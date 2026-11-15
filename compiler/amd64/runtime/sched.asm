@@ -715,12 +715,13 @@ rt_steal:
 	mov r12, rdx
 	xor r14d, r14d
 2:
-	cmp r14, [rip+rt_nm]
+	mov rdx, [rip+rt_nm]
+	cmp r14, rdx
 	jae 7f
 	lea rax, [r12+r14]
-	cmp rax, [rip+rt_nm]
+	cmp rax, rdx
 	jb 3f
-	sub rax, [rip+rt_nm]
+	sub rax, rdx
 3:
 	lea rcx, [rip+rt_allm]
 	mov rdi, [rcx+8*rax]
