@@ -1,0 +1,816 @@
+import std/text
+
+/// The layout mode a document type declaration selects.
+pub enum QuirksMode {
+    /// Standards mode.
+    Standards
+    /// Limited-quirks mode, which differs from standards mode only in the layout of images in table cells.
+    LimitedQuirks
+    /// Quirks mode.
+    Quirks
+}
+
+/// A parse error the tree builder reported and recovered from.
+pub struct ParseError {
+    /// What the builder found wrong, such as `unexpected end tag`.
+    pub message: str
+}
+
+/// The result of parsing a document or a fragment.
+pub struct Parsed {
+    /// The document for `parse`, and a fragment holding the parsed nodes for `parse_fragment` and `parse_body`.
+    pub root: *Node
+    /// The tree construction errors in source order. Parsing never stops at an error.
+    pub errors: []ParseError
+    /// The mode the document type declaration selected; always `Standards` for a fragment.
+    pub quirks: QuirksMode
+}
+
+enum Mode {
+    Initial
+    BeforeHtml
+    BeforeHead
+    InHead
+    InHeadNoscript
+    AfterHead
+    InBody
+    Text
+    InTable
+    InTableText
+    InCaption
+    InColumnGroup
+    InTableBody
+    InRow
+    InCell
+    InTemplate
+    AfterBody
+    InFrameset
+    AfterFrameset
+    AfterAfterBody
+    AfterAfterFrameset
+}
+
+enum Scope {
+    Default
+    ListItem
+    Button
+    Table
+}
+
+struct Tag {
+    name: str
+    attributes: []Attribute
+    self_closing: bool
+}
+
+struct Place {
+    parent: *Node
+    before: *Node?
+}
+
+struct TextBuf {
+    node: *Node
+    bytes: []u8
+}
+
+struct NameSet {
+    node: *Node?
+    names: [str: bool]
+}
+
+struct Parser {
+    tk: *Tokenizer
+    document: *Node
+    mode: Mode
+    original: Mode
+    templates: []Mode
+    slots: []*Slot
+    free: []i64
+    top: i64
+    bottom: i64
+    depth: i64
+    chains: [str: i64]
+    unclosed: i64
+    templates_open: i64
+    entries: []*Entry
+    entry_free: []i64
+    list_head: i64
+    list_tail: i64
+    entry_chains: [str: i64]
+    segment: i64
+    segments: i64
+    noah: [str: []i64]
+    texts: []*TextBuf
+    rebuild: i64
+    max_depth: i64
+    root_names: *NameSet
+    body_names: *NameSet
+    again: bool
+    head: *Node?
+    form: *Node?
+    context: *Node?
+    frameset_ok: bool
+    foster: bool
+    quirks: QuirksMode
+    skip_lf: bool
+    table_text: []u8
+    errors: []ParseError
+}
+
+/// The element nesting depth `parse`, `parse_fragment` and `parse_body` allow, as Blink and WebKit do.
+pub const default_max_depth = 512
+
+/// Limits on one parse.
+pub struct ParseOptions {
+    /// The deepest element nesting the tree builder produces. While more than this many elements are open, a new element, comment or processing instruction becomes a child of the parent of the current node instead of a child of the current node, so every node past the limit is a child of the element at the limit. The stack of open elements is not limited, so end tags still match their start tags. Text nodes, nodes foster parented out of a table, `template` content and nodes moved by the adoption agency algorithm are placed as the standard says, so a text node can sit one level below the limit and misnested formatting markup can still build a deeper tree, as it does in browsers. A value of 0 or less removes the limit and gives the standard's tree for every input.
+    pub max_depth: i64
+}
+
+/// Returns the options `parse`, `parse_fragment` and `parse_body` use: `default_max_depth` as the depth limit.
+pub fn default_options() -> ParseOptions {
+    ParseOptions { max_depth: default_max_depth }
+}
+
+/// Parses `input` as a complete HTML document, following the WHATWG tree construction rules with scripting disabled.
+///
+/// Missing structure is supplied: every document has `html`, `head` and `body` elements unless it is a frameset. Misnested markup is repaired as a browser repairs it, and each recovery is listed in `errors`.
+///
+/// The time and memory are linear in the length of `input` for every input, and no element is nested deeper than `default_max_depth`. The linear bound relies on a budget for the elements the active formatting list rebuilds: an input that makes the standard's algorithm create more than four times its own length in elements gets no further rebuilds.
+pub fn parse(input: str) -> Parsed {
+    parse_with(input, default_options())
+}
+
+/// Parses `input` as `parse` does, with the limits in `options`.
+pub fn parse_with(input: str, options: ParseOptions) -> Parsed {
+    let p = new_parser(input, none, options)
+    run(p)
+    fill_selected_content(p.document)
+    p.document.data = Data.Document(p.quirks)
+    Parsed { root: p.document, errors: p.errors, quirks: p.quirks }
+}
+
+/// Parses `input` as the content of `context`, as `innerHTML` does.
+///
+/// `context` is an element such as one made by `create_element`; its name, namespace and attributes pick the tokenizer state and the insertion mode, and it is not modified. A node that is not an element is treated as a `body` element. The result's `root` is a fragment holding the parsed nodes. The depth and time bounds are those of `parse`.
+pub fn parse_fragment(context: *Node, input: str) -> Parsed {
+    parse_fragment_with(context, input, default_options())
+}
+
+/// Parses `input` as `parse_fragment` does, with the limits in `options`.
+pub fn parse_fragment_with(context: *Node, input: str, options: ParseOptions) -> Parsed {
+    let host = if is_element(context) { context } else { create_element(Namespace.Html, "body", []) }
+    let p = new_parser(input, host, options)
+    let root = create_element(Namespace.Html, "html", [])
+    link(p.document, root, none)
+    open_push(p, root)
+    if is_html(host, "template") {
+        push(mut p.templates, Mode.InTemplate)
+    }
+    reset_mode(p)
+    p.form = nearest_form(host)
+    start_fragment_tokenizer(p, host)
+    run(p)
+    let fragment = create_fragment()
+    for child in children(root) {
+        link(fragment, child, none)
+    }
+    fill_selected_content(fragment)
+    Parsed { root: fragment, errors: p.errors, quirks: QuirksMode.Standards }
+}
+
+/// Parses `input` as the content of a `body` element.
+pub fn parse_body(input: str) -> Parsed {
+    parse_fragment(create_element(Namespace.Html, "body", []), input)
+}
+
+fn new_parser(input: str, context: *Node?, options: ParseOptions) -> *Parser {
+    let tk = tokenizer(input)
+    tk.driven = true
+    new(Parser {
+        tk,
+        document: create_document(),
+        mode: Mode.Initial,
+        original: Mode.Initial,
+        templates: [],
+        slots: [],
+        free: [],
+        top: -1,
+        bottom: -1,
+        depth: 0,
+        chains: [:],
+        unclosed: 0,
+        templates_open: 0,
+        entries: [],
+        entry_free: [],
+        list_head: -1,
+        list_tail: -1,
+        entry_chains: [:],
+        segment: 0,
+        segments: 0,
+        noah: [:],
+        texts: [],
+        rebuild: 4 * tk.input.len + 1024,
+        max_depth: options.max_depth,
+        root_names: new(NameSet { node: none, names: [:] }),
+        body_names: new(NameSet { node: none, names: [:] }),
+        again: false,
+        head: none,
+        form: none,
+        context,
+        frameset_ok: true,
+        foster: false,
+        quirks: QuirksMode.Standards,
+        skip_lf: false,
+        table_text: [],
+        errors: []
+    })
+}
+
+fn nearest_form(n: *Node) -> *Node? {
+    var current: *Node? = n
+    for {
+        match current {
+            some(c) => {
+                if is_html(c, "form") {
+                    return c
+                }
+                current = c.parent
+            }
+            none => return none
+        }
+    }
+}
+
+fn start_fragment_tokenizer(p: *Parser, host: *Node) {
+    let e = element(host) ?? return
+    if e.namespace != Namespace.Html {
+        return
+    }
+    match e.name {
+        "title" => switch_state(p.tk, State.Escapable, "")
+        "textarea" => switch_state(p.tk, State.Escapable, "")
+        "style" => switch_state(p.tk, State.Raw, "")
+        "xmp" => switch_state(p.tk, State.Raw, "")
+        "iframe" => switch_state(p.tk, State.Raw, "")
+        "noembed" => switch_state(p.tk, State.Raw, "")
+        "noframes" => switch_state(p.tk, State.Raw, "")
+        "script" => switch_state(p.tk, State.Script, "")
+        "plaintext" => switch_state(p.tk, State.Plain, "")
+        _ => {}
+    }
+}
+
+fn run(p: *Parser) {
+    for {
+        let foreign = match adjusted_current(p) {
+            some(n) => !is_html_namespace(n)
+            none => false
+        }
+        p.tk.cdata = foreign
+        let token = next(p.tk)
+        let skipping = p.skip_lf
+        p.skip_lf = false
+        match token {
+            End => {
+                for {
+                    p.again = false
+                    dispatch(p, token)
+                    if !p.again {
+                        break
+                    }
+                }
+                flush_text(p)
+                return
+            }
+            Text(content) => {
+                if skipping && content.len > 0 && content[0] == '\n' {
+                    let rest = content[1..]
+                    if rest.len > 0 {
+                        dispatch(p, Token.Text(rest))
+                    }
+                } else {
+                    dispatch(p, token)
+                }
+            }
+            _ => dispatch(p, token)
+        }
+    }
+}
+
+fn report(p: *Parser, message: str) {
+    push(mut p.errors, ParseError { message })
+}
+
+fn is_html_namespace(n: *Node) -> bool {
+    match n.data {
+        Element(e) => e.namespace == Namespace.Html
+        _ => false
+    }
+}
+
+fn html_name(n: *Node) -> str {
+    match n.data {
+        Element(e) => if e.namespace == Namespace.Html { e.name } else { "" }
+        _ => ""
+    }
+}
+
+fn implied_end(name: str) -> bool {
+    match name {
+        "dd" => true
+        "dt" => true
+        "li" => true
+        "optgroup" => true
+        "option" => true
+        "p" => true
+        "rb" => true
+        "rp" => true
+        "rt" => true
+        "rtc" => true
+        _ => false
+    }
+}
+
+fn thorough_end(name: str) -> bool {
+    match name {
+        "caption" => true
+        "colgroup" => true
+        "tbody" => true
+        "td" => true
+        "tfoot" => true
+        "th" => true
+        "thead" => true
+        "tr" => true
+        _ => implied_end(name)
+    }
+}
+
+fn special_html(name: str) -> bool {
+    match name {
+        "address" => true
+        "applet" => true
+        "area" => true
+        "article" => true
+        "aside" => true
+        "base" => true
+        "basefont" => true
+        "bgsound" => true
+        "blockquote" => true
+        "body" => true
+        "br" => true
+        "button" => true
+        "caption" => true
+        "center" => true
+        "col" => true
+        "colgroup" => true
+        "dd" => true
+        "details" => true
+        "dir" => true
+        "div" => true
+        "dl" => true
+        "dt" => true
+        "embed" => true
+        "fieldset" => true
+        "figcaption" => true
+        "figure" => true
+        "footer" => true
+        "form" => true
+        "frame" => true
+        "frameset" => true
+        "h1" => true
+        "h2" => true
+        "h3" => true
+        "h4" => true
+        "h5" => true
+        "h6" => true
+        "head" => true
+        "header" => true
+        "hgroup" => true
+        "hr" => true
+        "html" => true
+        "iframe" => true
+        "img" => true
+        "input" => true
+        "keygen" => true
+        "li" => true
+        "link" => true
+        "listing" => true
+        "main" => true
+        "marquee" => true
+        "menu" => true
+        "meta" => true
+        "nav" => true
+        "noembed" => true
+        "noframes" => true
+        "noscript" => true
+        "object" => true
+        "ol" => true
+        "p" => true
+        "param" => true
+        "plaintext" => true
+        "pre" => true
+        "script" => true
+        "search" => true
+        "section" => true
+        "select" => true
+        "source" => true
+        "style" => true
+        "summary" => true
+        "table" => true
+        "tbody" => true
+        "td" => true
+        "template" => true
+        "textarea" => true
+        "tfoot" => true
+        "th" => true
+        "thead" => true
+        "title" => true
+        "tr" => true
+        "track" => true
+        "ul" => true
+        "wbr" => true
+        "xmp" => true
+        _ => false
+    }
+}
+
+fn special(n: *Node) -> bool {
+    match n.data {
+        Element(e) => {
+            match e.namespace {
+                Html => special_html(e.name)
+                MathMl => mathml_text_name(e.name) || e.name == "annotation-xml"
+                Svg => svg_integration_name(e.name)
+                _ => false
+            }
+        }
+        _ => false
+    }
+}
+
+fn mathml_text_name(name: str) -> bool {
+    name == "mi" || name == "mo" || name == "mn" || name == "ms" || name == "mtext"
+}
+
+fn svg_integration_name(name: str) -> bool {
+    name == "foreignObject" || name == "desc" || name == "title"
+}
+
+fn formatting_name(name: str) -> bool {
+    match name {
+        "a" => true
+        "b" => true
+        "big" => true
+        "code" => true
+        "em" => true
+        "font" => true
+        "i" => true
+        "nobr" => true
+        "s" => true
+        "small" => true
+        "strike" => true
+        "strong" => true
+        "tt" => true
+        "u" => true
+        _ => false
+    }
+}
+
+fn heading_name(name: str) -> bool {
+    name.len == 2 && name[0] == 'h' && name[1] >= '1' && name[1] <= '6'
+}
+
+fn html_boundary(name: str) -> bool {
+    match name {
+        "applet" => true
+        "caption" => true
+        "html" => true
+        "table" => true
+        "td" => true
+        "th" => true
+        "marquee" => true
+        "object" => true
+        "select" => true
+        "template" => true
+        _ => false
+    }
+}
+
+fn boundary(n: *Node, scope: Scope) -> bool {
+    let e = element(n) ?? return false
+    if scope == Scope.Table {
+        return e.namespace == Namespace.Html && (e.name == "html" || e.name == "table" || e.name == "template")
+    }
+    match e.namespace {
+        Html => {
+            if html_boundary(e.name) {
+                return true
+            }
+            if scope == Scope.ListItem {
+                return e.name == "ol" || e.name == "ul"
+            }
+            scope == Scope.Button && e.name == "button"
+        }
+        MathMl => mathml_text_name(e.name) || e.name == "annotation-xml"
+        Svg => svg_integration_name(e.name)
+        _ => false
+    }
+}
+
+fn close_p(p: *Parser) {
+    generate_implied(p, "p")
+    if !is_html(current(p), "p") {
+        report(p, "unclosed element before p")
+    }
+    pop_until(p, "p")
+}
+
+fn close_p_in_button_scope(p: *Parser) {
+    if has_scope(p, "p", Scope.Button) {
+        close_p(p)
+    }
+}
+
+fn make_attrs(attributes: []Attribute) -> []Attr {
+    var out: []Attr = []
+    for a in attributes {
+        push(mut out, Attr { namespace: none, prefix: "", name: a.name, value: a.value })
+    }
+    out
+}
+
+fn appropriate_place(p: *Parser, target: *Node?, clamp: bool) -> Place {
+    var node: *Node = target ?? current(p)
+    var before: *Node? = none
+    if p.foster && foster_target(node) {
+        let id = nearest_table_boundary(p)
+        if id < 0 {
+            return Place { parent: root_node(p), before: none }
+        }
+        let last = p.slots[id].node
+        if is_html(last, "template") {
+            node = last
+        } else if is_html(last, "table") {
+            match last.parent {
+                some(holder) => {
+                    node = holder
+                    before = last
+                }
+                none => {
+                    node = p.slots[p.slots[id].below].node
+                }
+            }
+        } else {
+            return Place { parent: root_node(p), before: none }
+        }
+    } else if clamp && p.max_depth > 0 && p.depth > p.max_depth {
+        match node.parent {
+            some(up) => {
+                node = up
+            }
+            none => {}
+        }
+    }
+    if is_html(node, "template") {
+        return Place { parent: template_contents(node) ?? node, before: none }
+    }
+    Place { parent: node, before }
+}
+
+fn nearest_table_boundary(p: *Parser) -> i64 {
+    if p.top < 0 {
+        return -1
+    }
+    p.slots[p.top].bt
+}
+
+fn foster_target(n: *Node) -> bool {
+    let name = html_name(n)
+    name == "table" || name == "tbody" || name == "tfoot" || name == "thead" || name == "tr"
+}
+
+fn insert_element(p: *Parser, name: str, attributes: []Attr, ns: Namespace) -> *Node {
+    let n = create_element(ns, name, attributes)
+    let place = appropriate_place(p, none, true)
+    link(place.parent, n, place.before)
+    open_push(p, n)
+    n
+}
+
+fn insert_html(p: *Parser, tag: Tag) -> *Node {
+    insert_element(p, tag.name, make_attrs(tag.attributes), Namespace.Html)
+}
+
+fn insert_plain(p: *Parser, name: str) -> *Node {
+    insert_element(p, name, [], Namespace.Html)
+}
+
+fn insert_text(p: *Parser, s: str) {
+    let place = appropriate_place(p, none, false)
+    insert_text_at(p, place, s)
+}
+
+fn insert_text_at(p: *Parser, place: Place, s: str) {
+    match place.parent.data {
+        Document => return
+        _ => {}
+    }
+    let previous = match place.before {
+        some(r) => r.previous
+        none => place.parent.last_child
+    }
+    match previous {
+        some(prev) => {
+            match prev.data {
+                Text(existing) => {
+                    append_text(p, prev, existing, s)
+                    return
+                }
+                _ => {}
+            }
+        }
+        none => {}
+    }
+    link(place.parent, create_text(s), place.before)
+}
+
+fn append_text(p: *Parser, node: *Node, existing: str, s: str) {
+    let m = node.mark
+    if m >= 0 && m < p.texts.len {
+        let buffer = p.texts[m]
+        if buffer.node == node {
+            text.append(mut buffer.bytes, s)
+            return
+        }
+    }
+    var bytes: []u8 = []
+    text.append(mut bytes, existing)
+    text.append(mut bytes, s)
+    node.mark = p.texts.len
+    push(mut p.texts, new(TextBuf { node, bytes }))
+}
+
+fn flush_text(p: *Parser) {
+    for buffer in p.texts {
+        buffer.node.data = Data.Text(__str_view(buffer.bytes))
+    }
+    truncate(mut p.texts, 0)
+}
+
+fn document_place(p: *Parser) -> Place {
+    Place { parent: p.document, before: none }
+}
+
+fn root_place(p: *Parser) -> Place {
+    Place { parent: root_node(p), before: none }
+}
+
+fn insert_comment(p: *Parser, data: str) {
+    let place = appropriate_place(p, none, true)
+    link(place.parent, create_comment(data), place.before)
+}
+
+fn insert_comment_at(place: Place, data: str) {
+    link(place.parent, create_comment(data), place.before)
+}
+
+fn insert_instruction(p: *Parser, target: str, data: str) {
+    let place = appropriate_place(p, none, true)
+    link(place.parent, create_instruction(target, data), place.before)
+}
+
+fn insert_instruction_at(place: Place, target: str, data: str) {
+    link(place.parent, create_instruction(target, data), place.before)
+}
+
+fn space_prefix(s: str) -> i64 {
+    var i = 0
+    for i < s.len && space(s[i]) {
+        i += 1
+    }
+    i
+}
+
+fn word_prefix(s: str) -> i64 {
+    var i = 0
+    for i < s.len && !space(s[i]) {
+        i += 1
+    }
+    i
+}
+
+fn null_prefix(s: str) -> i64 {
+    var i = 0
+    for i < s.len && s[i] == 0 {
+        i += 1
+    }
+    i
+}
+
+fn text_run(s: str) -> i64 {
+    var i = 0
+    for i < s.len && s[i] != 0 {
+        i += 1
+    }
+    i
+}
+
+fn all_space(s: str) -> bool {
+    space_prefix(s) == s.len
+}
+
+fn dispatch(p: *Parser, token: Token) {
+    if use_foreign(p, token) {
+        foreign(p, token)
+    } else {
+        html(p, token)
+    }
+}
+
+fn use_foreign(p: *Parser, token: Token) -> bool {
+    let node = adjusted_current(p) ?? return false
+    let e = element(node) ?? return false
+    if e.namespace == Namespace.Html {
+        return false
+    }
+    match token {
+        End => return false
+        _ => {}
+    }
+    if e.namespace == Namespace.MathMl && mathml_text_name(e.name) {
+        match token {
+            StartTag(name, _, _) => {
+                if name != "mglyph" && name != "malignmark" {
+                    return false
+                }
+            }
+            Text => return false
+            _ => {}
+        }
+    }
+    if e.namespace == Namespace.MathMl && e.name == "annotation-xml" {
+        match token {
+            StartTag(name, _, _) => {
+                if name == "svg" {
+                    return false
+                }
+            }
+            _ => {}
+        }
+    }
+    if html_integration_point(node) {
+        match token {
+            StartTag => return false
+            Text => return false
+            _ => {}
+        }
+    }
+    true
+}
+
+fn html_integration_point(n: *Node) -> bool {
+    let e = element(n) ?? return false
+    if e.namespace == Namespace.Svg {
+        return svg_integration_name(e.name)
+    }
+    if e.namespace != Namespace.MathMl || e.name != "annotation-xml" {
+        return false
+    }
+    for a in e.attributes {
+        if a.name == "encoding" && a.prefix == "" {
+            return text.equal_fold(a.value, "text/html") || text.equal_fold(a.value, "application/xhtml+xml")
+        }
+    }
+    false
+}
+
+fn text_integration_point(n: *Node) -> bool {
+    let e = element(n) ?? return false
+    e.namespace == Namespace.MathMl && mathml_text_name(e.name)
+}
+
+fn html(p: *Parser, token: Token) {
+    match p.mode {
+        Initial => initial(p, token)
+        BeforeHtml => before_html(p, token)
+        BeforeHead => before_head(p, token)
+        InHead => in_head(p, token)
+        InHeadNoscript => in_head_noscript(p, token)
+        AfterHead => after_head(p, token)
+        InBody => in_body(p, token)
+        Text => in_text(p, token)
+        InTable => in_table(p, token)
+        InTableText => in_table_text(p, token)
+        InCaption => in_caption(p, token)
+        InColumnGroup => in_column_group(p, token)
+        InTableBody => in_table_body(p, token)
+        InRow => in_row(p, token)
+        InCell => in_cell(p, token)
+        InTemplate => in_template(p, token)
+        AfterBody => after_body(p, token)
+        InFrameset => in_frameset(p, token)
+        AfterFrameset => after_frameset(p, token)
+        AfterAfterBody => after_after_body(p, token)
+        AfterAfterFrameset => after_after_frameset(p, token)
+    }
+}

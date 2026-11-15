@@ -13,7 +13,7 @@ pub struct Attribute {
 
 /// One lexical unit of an HTML document.
 ///
-/// The tokenizer does not build a tree and does not repair markup: it reports tags, text, comments and doctypes in source order.
+/// The tokenizer does not build a tree and does not repair markup: it reports tags, text, comments, processing instructions and doctypes in source order.
 pub enum Token {
     /// An opening tag. `name` is lowercased. `attributes` lists the attributes in source order; when a name repeats, the first occurrence is kept. `self_closing` is `true` when the tag ends in `/>`.
     ///
@@ -25,18 +25,21 @@ pub enum Token {
     ///
     /// A `<` that does not begin a tag, comment, declaration or processing instruction is part of the text.
     Text(content: str)
-    /// A comment. `content` excludes the delimiters. Processing instructions (`<?...>`), unknown declarations (`<!...>`) and malformed end tags (`</ ...>`) are reported as comments holding the text up to the next `>`.
+    /// A comment. `content` excludes the delimiters. Unknown declarations (`<!...>`), malformed end tags (`</ ...>`) and invalid processing instructions are reported as comments holding the text up to the next `>`.
     Comment(content: str)
-    /// A document type declaration. `name` is lowercased. `public_id` and `system_id` are `none` when absent.
-    Doctype(name: str, public_id: str?, system_id: str?)
+    /// A processing instruction `<?target data?>` or `<?target data>`. `target` starts with a letter or `_` and holds letters, digits, `-` and `_`; `data` is the text after the spaces that follow the target, without the closing `?` of `?>`. A `<?` that does not begin a valid target, and the targets `xml` and `xml-stylesheet` in any case, are reported as comments.
+    Instruction(target: str, data: str)
+    /// A document type declaration. `name` is lowercased and empty when the declaration has none. `public_id` and `system_id` are `none` when absent. `force_quirks` is `true` when the declaration is malformed or cut off by the end of the input.
+    Doctype(name: str, public_id: str?, system_id: str?, force_quirks: bool)
     /// The end of the input. Every call to `next` after the last token returns it again.
     End
 }
 
-enum Mode {
+enum State {
     Data
     Raw
     Escapable
+    Script
     Plain
 }
 
@@ -46,18 +49,17 @@ enum Mode {
 pub struct Tokenizer {
     input: str
     pos: i64
-    mode: Mode
+    mode: State
     closer: str
-}
-
-struct Identifier {
-    value: str?
-    next: i64
+    driven: bool
+    cdata: bool
 }
 
 /// Returns a tokenizer positioned at the start of `input`.
+///
+/// Carriage returns and carriage return and line feed pairs in `input` read as line feeds.
 pub fn tokenizer(input: str) -> *Tokenizer {
-    new(Tokenizer { input, pos: 0, mode: Data, closer: "" })
+    new(Tokenizer { input: normalize_newlines(input), pos: 0, mode: Data, closer: "", driven: false, cdata: false })
 }
 
 /// Returns the next token.
@@ -151,12 +153,58 @@ fn step(t: *Tokenizer) -> Token? {
         Data => data(t)
         Raw => raw_text(t, false)
         Escapable => raw_text(t, true)
+        Script => raw_text(t, false)
         Plain => {
             let content = t.input[t.pos..]
             t.pos = t.input.len
-            Token.Text(content)
+            Token.Text(replace_null(content))
         }
     }
+}
+
+fn normalize_newlines(s: str) -> str {
+    let first = simd.find_byte_str(s, 0, s.len, '\r')
+    if first < 0 {
+        return s
+    }
+    var out: []u8 = []
+    text.append(mut out, s[..first])
+    var i = first
+    for i < s.len {
+        let c = s[i]
+        if c == '\r' {
+            push(mut out, '\n')
+            if i + 1 < s.len && s[i + 1] == '\n' {
+                i += 1
+            }
+        } else {
+            push(mut out, c)
+        }
+        i += 1
+    }
+    __str_view(out)
+}
+
+fn replace_null(s: str) -> str {
+    let first = simd.find_byte_str(s, 0, s.len, 0)
+    if first < 0 {
+        return s
+    }
+    var out: []u8 = []
+    text.append(mut out, s[..first])
+    for i in first..s.len {
+        if s[i] == 0 {
+            text.append_char(mut out, 0xFFFD)
+        } else {
+            push(mut out, s[i])
+        }
+    }
+    __str_view(out)
+}
+
+fn switch_state(t: *Tokenizer, mode: State, closer: str) {
+    t.mode = mode
+    t.closer = closer
 }
 
 fn starts_markup(s: str, at: i64) -> bool {
@@ -208,7 +256,7 @@ fn closing(s: str, from: i64, name: str) -> i64 {
 }
 
 fn raw_text(t: *Tokenizer, escapable: bool) -> Token? {
-    let end = closing(t.input, t.pos, t.closer)
+    let end = if t.closer.len == 0 { t.input.len } else if t.mode == Script { script_end(t.input, t.pos, t.closer) } else { closing(t.input, t.pos, t.closer) }
     if end == t.pos {
         t.mode = Data
         return tag(t, end + 2, true)
@@ -216,9 +264,9 @@ fn raw_text(t: *Tokenizer, escapable: bool) -> Token? {
     let content = t.input[t.pos..end]
     t.pos = end
     if escapable {
-        return Token.Text(decode(content, false))
+        return Token.Text(replace_null(decode(content, false)))
     }
-    Token.Text(content)
+    Token.Text(replace_null(content))
 }
 
 fn markup(t: *Tokenizer) -> Token? {
@@ -236,7 +284,7 @@ fn markup(t: *Tokenizer) -> Token? {
         return bogus_comment(t, t.pos + 2)
     }
     match c {
-        '?' => bogus_comment(t, t.pos + 1)
+        '?' => instruction(t, t.pos + 2)
         '!' => declaration(t, t.pos + 2)
         _ => tag(t, t.pos + 1, false)
     }
@@ -248,8 +296,9 @@ fn tag(t: *Tokenizer, from: i64, end: bool) -> Token? {
     for i < s.len && !space(s[i]) && s[i] != '/' && s[i] != '>' {
         i += 1
     }
-    let name = text.lower(s[from..i])
+    let name = replace_null(text.lower(s[from..i]))
     var attributes: []Attribute = []
+    var seen: [str: bool]? = none
     var self_closing = false
     for {
         if i >= s.len {
@@ -270,22 +319,24 @@ fn tag(t: *Tokenizer, from: i64, end: bool) -> Token? {
             i += 1
             continue
         }
-        i = read_attribute(s, i, mut attributes)
+        i = read_attribute(s, i, mut attributes, mut seen)
     }
     t.pos = i
     if end {
         return Token.EndTag(name)
     }
-    enter(t, name)
+    if !t.driven {
+        enter(t, name)
+    }
     Token.StartTag(name, attributes, self_closing)
 }
 
-fn read_attribute(s: str, from: i64, mut attributes: []Attribute) -> i64 {
+fn read_attribute(s: str, from: i64, mut attributes: []Attribute, mut seen: [str: bool]?) -> i64 {
     var i = from + 1
     for i < s.len && !space(s[i]) && s[i] != '/' && s[i] != '>' && s[i] != '=' {
         i += 1
     }
-    let name = text.lower(s[from..i])
+    let name = replace_null(text.lower(s[from..i]))
     var at = skip_space(s, i)
     var value = ""
     if at < s.len && s[at] == '=' {
@@ -294,31 +345,59 @@ fn read_attribute(s: str, from: i64, mut attributes: []Attribute) -> i64 {
         if quoted {
             let close = simd.find_byte_str(s, at + 1, s.len, s[at])
             let end = if close < 0 { s.len } else { close }
-            value = decode(s[at + 1..end], true)
+            value = replace_null(decode(s[at + 1..end], true))
             at = end + 1
         } else {
             let start = at
             for at < s.len && !space(s[at]) && s[at] != '>' {
                 at += 1
             }
-            value = decode(s[start..at], true)
+            value = replace_null(decode(s[start..at], true))
         }
     }
-    if attribute(attributes, name) == none {
+    if !repeated(attributes, seen, name) {
         push(mut attributes, Attribute { name, value })
+        remember(attributes, mut seen)
     }
     at
 }
 
+fn repeated(attributes: []Attribute, seen: [str: bool]?, name: str) -> bool {
+    match seen {
+        some(names) => names[name] != none
+        none => attribute(attributes, name) != none
+    }
+}
+
+fn remember(attributes: []Attribute, mut seen: [str: bool]?) {
+    match seen {
+        some(names) => {
+            names[attributes[attributes.len - 1].name] = true
+        }
+        none => {
+            if attributes.len >= 8 {
+                var names: [str: bool] = [:]
+                for a in attributes {
+                    names[a.name] = true
+                }
+                seen = names
+            }
+        }
+    }
+}
+
 fn enter(t: *Tokenizer, name: str) {
-    if name == "script" || name == "style" || name == "xmp" || name == "iframe" || name == "noembed" || name == "noframes" {
-        t.mode = Raw
-        t.closer = name
-    } else if name == "title" || name == "textarea" {
-        t.mode = Escapable
-        t.closer = name
-    } else if name == "plaintext" {
-        t.mode = Plain
+    match name {
+        "script" => switch_state(t, Script, name)
+        "style" => switch_state(t, Raw, name)
+        "xmp" => switch_state(t, Raw, name)
+        "iframe" => switch_state(t, Raw, name)
+        "noembed" => switch_state(t, Raw, name)
+        "noframes" => switch_state(t, Raw, name)
+        "title" => switch_state(t, Escapable, name)
+        "textarea" => switch_state(t, Escapable, name)
+        "plaintext" => switch_state(t, Plain, "")
+        _ => {}
     }
 }
 
@@ -330,7 +409,63 @@ fn declaration(t: *Tokenizer, from: i64) -> Token? {
     if text.equal_fold(prefix(s, from, 7), "doctype") {
         return doctype(t, from + 7)
     }
+    if t.cdata && text.starts_with(s[from..], "[CDATA[") {
+        return cdata_section(t, from + 7)
+    }
     bogus_comment(t, from)
+}
+
+fn cdata_section(t: *Tokenizer, from: i64) -> Token? {
+    let s = t.input
+    let end = text.index(s[from..], "]]>")
+    if end < 0 {
+        t.pos = s.len
+        if from < s.len {
+            return Token.Text(s[from..])
+        }
+        return none
+    }
+    t.pos = from + end + 3
+    if end == 0 {
+        return none
+    }
+    Token.Text(s[from..from + end])
+}
+
+fn instruction(t: *Tokenizer, from: i64) -> Token? {
+    let s = t.input
+    if from >= s.len {
+        t.pos = s.len
+        return none
+    }
+    if !alpha(s[from]) && s[from] != '_' {
+        return bogus_comment(t, from - 1)
+    }
+    var i = from
+    for i < s.len && (alnum(s[i]) || s[i] == '-' || s[i] == '_') {
+        i += 1
+    }
+    if i >= s.len {
+        t.pos = s.len
+        return none
+    }
+    let target = s[from..i]
+    let ends = space(s[i]) || s[i] == '?' || s[i] == '>'
+    if !ends || text.equal_fold(target, "xml") || text.equal_fold(target, "xml-stylesheet") {
+        return bogus_comment(t, from - 1)
+    }
+    let start = skip_space(s, i)
+    let close = simd.find_byte_str(s, start, s.len, '>')
+    if close < 0 {
+        t.pos = s.len
+        return none
+    }
+    t.pos = close + 1
+    var data = s[start..close]
+    if data.len > 0 && data[data.len - 1] == '?' {
+        data = data[..data.len - 1]
+    }
+    Token.Instruction(target, data)
 }
 
 fn bogus_comment(t: *Tokenizer, from: i64) -> Token? {
@@ -338,10 +473,10 @@ fn bogus_comment(t: *Tokenizer, from: i64) -> Token? {
     let close = simd.find_byte_str(s, from, s.len, '>')
     if close < 0 {
         t.pos = s.len
-        return Token.Comment(s[from..])
+        return Token.Comment(replace_null(s[from..]))
     }
     t.pos = close + 1
-    Token.Comment(s[from..close])
+    Token.Comment(replace_null(s[from..close]))
 }
 
 fn comment(t: *Tokenizer, from: i64) -> Token? {
@@ -360,17 +495,17 @@ fn comment(t: *Tokenizer, from: i64) -> Token? {
         let dash = text.index(s[at..], "--")
         if dash < 0 {
             t.pos = s.len
-            return Token.Comment(unterminated_comment(s, from))
+            return Token.Comment(replace_null(unterminated_comment(s, from)))
         }
         let close = at + dash
         let tail = s[close + 2..]
         if text.starts_with(tail, ">") {
             t.pos = close + 3
-            return Token.Comment(s[from..close])
+            return Token.Comment(replace_null(s[from..close]))
         }
         if text.starts_with(tail, "!>") {
             t.pos = close + 4
-            return Token.Comment(s[from..close])
+            return Token.Comment(replace_null(s[from..close]))
         }
         at = close + 1
     }
@@ -384,48 +519,6 @@ fn unterminated_comment(s: str, from: i64) -> str {
         }
     }
     content
-}
-
-fn doctype(t: *Tokenizer, from: i64) -> Token? {
-    let s = t.input
-    var i = skip_space(s, from)
-    let start = i
-    for i < s.len && !space(s[i]) && s[i] != '>' {
-        i += 1
-    }
-    let name = text.lower(s[start..i])
-    i = skip_space(s, i)
-    var public_id: str? = none
-    var system_id: str? = none
-    let keyword = prefix(s, i, 6)
-    if text.equal_fold(keyword, "public") {
-        let public = identifier(s, skip_space(s, i + 6))
-        let system = identifier(s, skip_space(s, public.next))
-        public_id = public.value
-        system_id = system.value
-        i = system.next
-    } else if text.equal_fold(keyword, "system") {
-        let system = identifier(s, skip_space(s, i + 6))
-        system_id = system.value
-        i = system.next
-    }
-    let close = simd.find_byte_str(s, i, s.len, '>')
-    t.pos = if close < 0 { s.len } else { close + 1 }
-    Token.Doctype(name, public_id, system_id)
-}
-
-fn identifier(s: str, at: i64) -> Identifier {
-    if at >= s.len || (s[at] != '"' && s[at] != '\'') {
-        return Identifier { value: none, next: at }
-    }
-    let quote = s[at]
-    var i = at + 1
-    for i < s.len && s[i] != quote && s[i] != '>' {
-        i += 1
-    }
-    let value = s[at + 1..i]
-    let next = if i < s.len && s[i] == quote { i + 1 } else { i }
-    Identifier { value, next }
 }
 
 fn decode(s: str, in_attribute: bool) -> str {

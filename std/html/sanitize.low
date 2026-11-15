@@ -1,0 +1,413 @@
+import std/text
+
+const max_rounds = 5
+
+/// What the sanitizer lets through.
+///
+/// Elements, attributes and URL schemes are allow-lists written in lowercase: anything not named is removed. `default_policy` is a conservative starting point for untrusted prose.
+pub struct Policy {
+    /// The HTML elements that stay. An HTML element that is not listed is removed: with its content when it is in `drop_content`, otherwise only the element is removed and its children take its place.
+    pub elements: []str
+    /// The attributes allowed on every element that stays. The name of a namespaced attribute includes its prefix, as in `xlink:href`.
+    pub attributes: []str
+    /// The attributes allowed on one element, keyed by the element's name in lowercase, in addition to `attributes`. An entry applies to the element of that name in every namespace.
+    pub element_attributes: [str: []str]
+    /// The URL schemes allowed in `href`, `src`, `srcset`, `action`, `formaction`, `poster`, `cite`, `xlink:href` and the other attributes that hold a URL, without the colon.
+    pub url_schemes: []str
+    /// Whether a URL with no scheme, such as `/a`, `a/b`, `?q` or `#top`, is allowed.
+    pub relative_urls: bool
+    /// The elements removed together with their content when they are not allowed. Elements whose content is code or hidden text are always removed with it, whatever this lists.
+    pub drop_content: []str
+    /// The SVG elements that stay, by name as the parser spells it, such as `svg`, `path` and `linearGradient`. Every other SVG element is removed with its content. Scripting, styling, embedding and animation elements never stay.
+    pub svg_elements: []str
+    /// The MathML elements that stay. Every other MathML element is removed with its content. `annotation-xml` and `maction` never stay.
+    pub mathml_elements: []str
+}
+
+struct Rules {
+    elements: [str: bool]
+    global: [str: bool]
+    specific: [str: [str: bool]]
+    schemes: [str: bool]
+    relative: bool
+    discard: [str: bool]
+    svg: [str: bool]
+    mathml: [str: bool]
+}
+
+enum Verdict {
+    Keep
+    Remove
+    Unwrap
+}
+
+/// Returns a policy for untrusted prose: headings, paragraphs, lists, tables, quotations, inline text formatting, links and images, with `http`, `https` and `mailto` URLs and relative URLs, and no `id`, `name`, `style` or SVG and MathML.
+pub fn default_policy() -> Policy {
+    var element_attributes: [str: []str] = [:]
+    element_attributes["a"] = ["href", "hreflang", "rel"]
+    element_attributes["img"] = ["src", "srcset", "alt", "width", "height"]
+    element_attributes["ol"] = ["start", "type", "reversed"]
+    element_attributes["li"] = ["value"]
+    element_attributes["td"] = ["colspan", "rowspan", "headers"]
+    element_attributes["th"] = ["colspan", "rowspan", "headers", "scope", "abbr"]
+    element_attributes["col"] = ["span"]
+    element_attributes["colgroup"] = ["span"]
+    element_attributes["blockquote"] = ["cite"]
+    element_attributes["q"] = ["cite"]
+    element_attributes["del"] = ["cite", "datetime"]
+    element_attributes["ins"] = ["cite", "datetime"]
+    element_attributes["time"] = ["datetime"]
+    element_attributes["details"] = ["open"]
+    Policy {
+        elements: [
+            "a", "abbr", "address", "article", "aside", "b", "bdi", "bdo", "blockquote", "br", "caption", "cite", "code", "col", "colgroup",
+            "dd", "del", "details", "dfn", "div", "dl", "dt", "em", "figcaption", "figure", "footer", "h1", "h2", "h3", "h4", "h5", "h6",
+            "header", "hr", "i", "img", "ins", "kbd", "li", "main", "mark", "nav", "ol", "p", "pre", "q", "rp", "rt", "ruby", "s", "samp",
+            "section", "small", "span", "strong", "sub", "summary", "sup", "table", "tbody", "td", "tfoot", "th", "thead", "time", "tr",
+            "u", "ul", "var", "wbr"
+        ],
+        attributes: ["class", "dir", "lang", "title"],
+        element_attributes,
+        url_schemes: ["http", "https", "mailto"],
+        relative_urls: true,
+        drop_content: [
+            "script", "style", "noscript", "template", "iframe", "object", "embed", "applet", "noembed", "noframes", "plaintext", "xmp",
+            "title", "textarea", "select", "head", "frameset", "frame", "audio", "video", "canvas", "button", "dialog", "datalist"
+        ],
+        svg_elements: [],
+        mathml_elements: []
+    }
+}
+
+/// Parses `input` as the content of a `body` element, removes what `policy` does not allow and returns the serialization of what is left.
+///
+/// Comments, processing instructions and document type declarations are always removed, as are `script`, `style`, `noscript`, `template`, `iframe`, `object`, `embed`, `applet`, `noembed`, `noframes`, `plaintext`, `xmp`, `frame`, `frameset`, `base`, `link` and `meta` elements with their content, an attribute whose name starts with `on`, `srcdoc`, and any attribute that holds a URL whose scheme is not in `url_schemes`. A URL is read as a browser reads it: leading and trailing control characters and spaces and every tab and line break are ignored before the scheme is looked for, and every candidate of a `srcset` is checked.
+///
+/// The parser drops one line feed after the start tag of `pre`, `textarea` and `listing`, so the sanitizer writes a second one when the content of such an element begins with one; the text of the element is the same after the output is parsed.
+///
+/// The result is checked before it is returned: parsing it again and serializing the tree gives the same text, and the sanitizer removes nothing from that tree. When it does not, the sanitizer is run on the result again, and when it has not settled after five rounds it returns the empty string.
+pub fn sanitize(input: str, policy: Policy) -> str {
+    let rules = rules_for(policy)
+    var current = input
+    for _ in 0..max_rounds {
+        let parsed = parse_body(current)
+        clean_with(parsed.root, rules)
+        let out = reparsable_html(parsed.root)
+        let again = parse_body(out)
+        let reserialized = reparsable_html(again.root)
+        let changes = clean_with(again.root, rules)
+        if changes == 0 && reserialized == out {
+            return out
+        }
+        current = reparsable_html(again.root)
+    }
+    ""
+}
+
+/// Removes from the tree below `root` what `policy` does not allow, as `sanitize` does, and returns the number of nodes and attributes it removed or unwrapped.
+///
+/// `root` itself is kept and only its descendants are changed. A `template` element is removed; its content is never kept.
+pub fn clean(root: *Node, policy: Policy) -> i64 {
+    clean_with(root, rules_for(policy))
+}
+
+fn flags(names: []str) -> [str: bool] {
+    var out: [str: bool] = [:]
+    for n in names {
+        out[n] = true
+    }
+    out
+}
+
+fn rules_for(policy: Policy) -> Rules {
+    var specific: [str: [str: bool]] = [:]
+    for name, attributes in policy.element_attributes {
+        specific[text.lower(name)] = flags(attributes)
+    }
+    Rules {
+        elements: flags(policy.elements),
+        global: flags(policy.attributes),
+        specific,
+        schemes: flags(policy.url_schemes),
+        relative: policy.relative_urls,
+        discard: flags(policy.drop_content),
+        svg: flags(policy.svg_elements),
+        mathml: flags(policy.mathml_elements)
+    }
+}
+
+fn clean_with(root: *Node, rules: Rules) -> i64 {
+    var changes = 0
+    var work: []*Node = [root]
+    for work.len > 0 {
+        let parent = pop(mut work) ?? break
+        var current = parent.first_child
+        for {
+            let child = current ?? break
+            var next = child.next
+            match verdict(child, rules) {
+                Keep => {
+                    changes += filter_attributes(child, rules)
+                    push(mut work, child)
+                }
+                Remove => {
+                    remove(child)
+                    changes += 1
+                }
+                Unwrap => {
+                    let first = child.first_child
+                    for grand in children(child) {
+                        link(parent, grand, child)
+                    }
+                    remove(child)
+                    changes += 1
+                    next = first ?? next
+                }
+            }
+            current = next
+        }
+    }
+    changes
+}
+
+fn verdict(n: *Node, rules: Rules) -> Verdict {
+    match n.data {
+        Text => Verdict.Keep
+        Element(e) => element_verdict(e, rules)
+        _ => Verdict.Remove
+    }
+}
+
+fn element_verdict(e: *Element, rules: Rules) -> Verdict {
+    match e.namespace {
+        Html => html_verdict(e.name, rules)
+        Svg => if (rules.svg[e.name] ?? false) && !svg_denied(e.name) { Verdict.Keep } else { Verdict.Remove }
+        MathMl => if (rules.mathml[e.name] ?? false) && !mathml_denied(e.name) { Verdict.Keep } else { Verdict.Remove }
+        _ => Verdict.Remove
+    }
+}
+
+fn html_verdict(name: str, rules: Rules) -> Verdict {
+    if code_element(name) {
+        return Verdict.Remove
+    }
+    if rules.elements[name] ?? false {
+        return Verdict.Keep
+    }
+    if rules.discard[name] ?? false {
+        return Verdict.Remove
+    }
+    Verdict.Unwrap
+}
+
+fn code_element(name: str) -> bool {
+    match name {
+        "script" => true
+        "style" => true
+        "noscript" => true
+        "template" => true
+        "iframe" => true
+        "object" => true
+        "embed" => true
+        "applet" => true
+        "noembed" => true
+        "noframes" => true
+        "plaintext" => true
+        "xmp" => true
+        "frame" => true
+        "frameset" => true
+        "base" => true
+        "link" => true
+        "meta" => true
+        _ => false
+    }
+}
+
+fn svg_denied(name: str) -> bool {
+    match name {
+        "script" => true
+        "style" => true
+        "foreignObject" => true
+        "use" => true
+        "animate" => true
+        "animateMotion" => true
+        "animateTransform" => true
+        "animateColor" => true
+        "set" => true
+        "handler" => true
+        "listener" => true
+        "feImage" => true
+        "image" => true
+        "iframe" => true
+        _ => false
+    }
+}
+
+fn mathml_denied(name: str) -> bool {
+    match name {
+        "annotation-xml" => true
+        "maction" => true
+        "script" => true
+        "style" => true
+        _ => false
+    }
+}
+
+fn filter_attributes(n: *Node, rules: Rules) -> i64 {
+    let e = element(n) ?? return 0
+    var kept: []Attr = []
+    for a in e.attributes {
+        if attribute_allowed(e, a, rules) {
+            push(mut kept, a)
+        }
+    }
+    let removed = e.attributes.len - kept.len
+    if removed > 0 {
+        e.attributes = kept
+    }
+    removed
+}
+
+fn qualified(a: Attr) -> str {
+    let full = if a.prefix == "" { a.name } else { "{a.prefix}:{a.name}" }
+    text.lower(full)
+}
+
+fn attribute_allowed(e: *Element, a: Attr, rules: Rules) -> bool {
+    let key = qualified(a)
+    if text.starts_with(key, "on") || key == "srcdoc" {
+        return false
+    }
+    if !listed(e, key, rules) {
+        return false
+    }
+    match url_kind(key) {
+        Plain => true
+        Single => url_allowed(a.value, rules)
+        Candidates => candidates_allowed(a.value, rules)
+        Spaced => spaced_allowed(a.value, rules)
+    }
+}
+
+fn listed(e: *Element, key: str, rules: Rules) -> bool {
+    if rules.global[key] ?? false {
+        return true
+    }
+    let own = rules.specific[text.lower(e.name)] ?? return false
+    own[key] ?? false
+}
+
+enum UrlKind {
+    Plain
+    Single
+    Candidates
+    Spaced
+}
+
+fn url_kind(key: str) -> UrlKind {
+    match key {
+        "href" => UrlKind.Single
+        "src" => UrlKind.Single
+        "action" => UrlKind.Single
+        "formaction" => UrlKind.Single
+        "poster" => UrlKind.Single
+        "cite" => UrlKind.Single
+        "xlink:href" => UrlKind.Single
+        "background" => UrlKind.Single
+        "data" => UrlKind.Single
+        "longdesc" => UrlKind.Single
+        "manifest" => UrlKind.Single
+        "usemap" => UrlKind.Single
+        "codebase" => UrlKind.Single
+        "classid" => UrlKind.Single
+        "profile" => UrlKind.Single
+        "icon" => UrlKind.Single
+        "lowsrc" => UrlKind.Single
+        "dynsrc" => UrlKind.Single
+        "srcset" => UrlKind.Candidates
+        "imagesrcset" => UrlKind.Candidates
+        "ping" => UrlKind.Spaced
+        _ => UrlKind.Plain
+    }
+}
+
+fn url_allowed(value: str, rules: Rules) -> bool {
+    var url: []u8 = []
+    for i in 0..value.len {
+        let c = value[i]
+        if c != 9 && c != 10 && c != 13 {
+            push(mut url, c)
+        }
+    }
+    let joined = __str_view(url)
+    var first = 0
+    var last = joined.len
+    for first < last && joined[first] <= ' ' {
+        first += 1
+    }
+    for last > first && joined[last - 1] <= ' ' {
+        last -= 1
+    }
+    let cleaned = joined[first..last]
+    let end = scheme_end(cleaned)
+    if end < 0 {
+        return rules.relative
+    }
+    let scheme = text.lower(cleaned[..end])
+    rules.schemes[scheme] ?? false
+}
+
+fn scheme_end(url: str) -> i64 {
+    for i in 0..url.len {
+        let c = url[i]
+        if c == ':' {
+            return i
+        }
+        if c == '/' || c == '?' || c == '#' {
+            return -1
+        }
+    }
+    -1
+}
+
+fn candidates_allowed(value: str, rules: Rules) -> bool {
+    var at = 0
+    for at < value.len {
+        for at < value.len && (text.space(value[at]) || value[at] == ',') {
+            at += 1
+        }
+        let start = at
+        for at < value.len && !text.space(value[at]) {
+            at += 1
+        }
+        var end = at
+        for end > start && value[end - 1] == ',' {
+            end -= 1
+        }
+        if end > start && !url_allowed(value[start..end], rules) {
+            return false
+        }
+        if end == at {
+            var depth = 0
+            for at < value.len && !(value[at] == ',' && depth == 0) {
+                if value[at] == '(' {
+                    depth += 1
+                }
+                if value[at] == ')' && depth > 0 {
+                    depth -= 1
+                }
+                at += 1
+            }
+        }
+    }
+    true
+}
+
+fn spaced_allowed(value: str, rules: Rules) -> bool {
+    for part in text.fields(value) {
+        if !url_allowed(part, rules) {
+            return false
+        }
+    }
+    true
+}
