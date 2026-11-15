@@ -1,0 +1,302 @@
+import std/io
+import std/net
+import std/os
+import std/sys
+import std/text
+
+const read_chunk = 65536
+const max_line = 16384
+const auth_timeout = 25000
+
+/// How a server authenticates the client of a connection.
+pub struct ServerAuth {
+    /// The server guid sent with `OK`, 32 hexadecimal digits.
+    pub guid: str
+    /// The user id that EXTERNAL accepts, or `-1` for the effective user id of the process.
+    pub uid: i64 = -1
+    /// Whether ANONYMOUS is accepted.
+    pub anonymous: bool = false
+    /// Whether NEGOTIATE_UNIX_FD is agreed to.
+    pub unix_fds: bool = true
+}
+
+struct Link {
+    handle: net.ConnHandle
+    buffer: []u8
+    start: i64
+    fds: []i64
+    unix_fds: bool
+    guid: str
+}
+
+fn new_link(h: net.ConnHandle) -> *Link {
+    new(Link { handle: h, buffer: [], start: 0, fds: [], unix_fds: false, guid: "" })
+}
+
+fn read_failure(e: io.Error) -> Error {
+    match e {
+        NotConnected => Error.Closed
+        Eof => Error.Closed
+        BrokenPipe => Error.Closed
+        Reset => Error.Closed
+        _ => Error.Io(e)
+    }
+}
+
+fn send_bytes(l: *Link, data: []u8, fds: []i64) ! Error {
+    let first = net.write_with_fds_on(l.handle, data, fds) catch {
+        e => fail read_failure(e)
+    }
+    if first < data.len {
+        net.write_all_on(l.handle, data[first..]) catch {
+            e => fail read_failure(e)
+        }
+    }
+}
+
+fn send_text(l: *Link, s: str) ! Error {
+    send_bytes(l, bytes(s), [])?
+}
+
+fn fill(l: *Link) ! Error {
+    let chunk = io.buffer(read_chunk)
+    let r = net.read_with_fds_on(l.handle, chunk) catch {
+        e => fail read_failure(e)
+    }
+    for fd in r.fds {
+        push(mut l.fds, fd)
+    }
+    if r.size == 0 {
+        fail Closed
+    }
+    let kept = l.buffer.len - l.start
+    if l.start > 0 && kept < l.start {
+        let rest = io.buffer(kept)
+        io.copy(rest, l.buffer[l.start..])
+        l.buffer = rest
+        l.start = 0
+    }
+    io.append(mut l.buffer, chunk[..r.size])
+}
+
+fn ensure(l: *Link, n: i64) ! Error {
+    for l.buffer.len - l.start < n {
+        fill(l)?
+    }
+}
+
+fn close_all(fds: []i64) {
+    for fd in fds {
+        sys.close_fd(fd)
+    }
+}
+
+fn receive(l: *Link) -> Message ! Error {
+    ensure(l, 16)?
+    let total = message_length(l.buffer[l.start..l.start + 16])?
+    ensure(l, total)?
+    let data = l.buffer[l.start..l.start + total]
+    let count = message_fd_count(data)?
+    if count > l.fds.len {
+        fail Malformed("the message announces {count} file descriptors and {l.fds.len} arrived")
+    }
+    let taken = l.fds[..count]
+    l.fds = l.fds[count..]
+    l.start += total
+    if l.start == l.buffer.len {
+        l.buffer = []
+        l.start = 0
+    }
+    decode_message(data, taken) catch {
+        e => {
+            close_all(taken)
+            fail e
+        }
+    }
+}
+
+fn transmit(l: *Link, m: Message) ! Error {
+    let e = encode_message(m, ByteOrder.Little)?
+    if e.fds.len > 0 && !l.unix_fds {
+        fail Marshal("the peer did not agree to receive file descriptors")
+    }
+    send_bytes(l, e.data, e.fds)?
+}
+
+fn find_line_end(b: []u8, from: i64) -> i64 {
+    var i = from
+    for i + 1 < b.len {
+        if b[i] == '\r' && b[i + 1] == '\n' {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn read_line(l: *Link) -> str ! Error {
+    for {
+        let end = find_line_end(l.buffer, l.start)
+        if end >= 0 {
+            let line = str(l.buffer[l.start..end])
+            l.start = end + 2
+            return line
+        }
+        if l.buffer.len - l.start > max_line {
+            fail Auth("an authentication line is longer than {max_line} bytes")
+        }
+        fill(l) catch {
+            Closed => fail Auth("the peer closed the connection during authentication")
+            e => fail e
+        }
+    }
+}
+
+fn hex_text(s: str) -> str {
+    text.encode_hex(bytes(s))
+}
+
+fn decoded_text(hex: str) -> str ! Error {
+    let raw = text.decode_hex(hex) catch {
+        _ => fail Auth("invalid hexadecimal data {hex}")
+    }
+    str(raw)
+}
+
+fn first_word(line: str) -> str {
+    let space = text.index_byte(line, ' ')
+    if space < 0 {
+        return line
+    }
+    line[..space]
+}
+
+fn after_word(line: str) -> str {
+    let space = text.index_byte(line, ' ')
+    if space < 0 {
+        return ""
+    }
+    line[space + 1..]
+}
+
+fn client_handshake(h: net.ConnHandle, uid: i64, negotiate_fds: bool) -> *Link ! Error {
+    let l = new_link(h)
+    h.timeouts.read = auth_timeout
+    var opening: []u8 = [0]
+    io.append(mut opening, bytes("AUTH EXTERNAL {hex_text("{uid}")}\r\n"))
+    send_bytes(l, opening, [])?
+    var anonymous_tried = false
+    var authenticated = false
+    for !authenticated {
+        let line = read_line(l)?
+        match first_word(line) {
+            "OK" => {
+                l.guid = after_word(line)
+                authenticated = true
+            }
+            "DATA" => send_text(l, "DATA {hex_text("{uid}")}\r\n")?
+            "REJECTED" => {
+                if anonymous_tried || !text.contains(" {after_word(line)} ", " ANONYMOUS ") {
+                    fail Auth("the server rejected EXTERNAL and offers {after_word(line)}")
+                }
+                anonymous_tried = true
+                send_text(l, "AUTH ANONYMOUS {hex_text("low")}\r\n")?
+            }
+            _ => fail Auth("the server answered {text.quote(line)}")
+        }
+    }
+    if negotiate_fds {
+        send_text(l, "NEGOTIATE_UNIX_FD\r\n")?
+        let answer = read_line(l)?
+        l.unix_fds = first_word(answer) == "AGREE_UNIX_FD"
+    }
+    send_text(l, "BEGIN\r\n")?
+    h.timeouts.read = 0
+    l
+}
+
+fn identity_accepted(l: *Link, auth: ServerAuth, claimed: str) -> bool ! Error {
+    let credentials = net.peer_credentials_on(l.handle) catch {
+        e => fail read_failure(e)
+    }
+    let allowed = if auth.uid >= 0 { auth.uid } else { os.euid() }
+    claimed == "{allowed}" && credentials.uid == allowed
+}
+
+fn mechanisms(auth: ServerAuth) -> str {
+    if auth.anonymous {
+        return "EXTERNAL ANONYMOUS"
+    }
+    "EXTERNAL"
+}
+
+fn server_handshake(h: net.ConnHandle, auth: ServerAuth) -> *Link ! Error {
+    let l = new_link(h)
+    h.timeouts.read = auth_timeout
+    ensure(l, 1) catch {
+        Closed => fail Auth("the peer closed the connection during authentication")
+        e => fail e
+    }
+    if l.buffer[l.start] != 0 {
+        fail Auth("the connection does not start with a NUL byte")
+    }
+    l.start += 1
+    var authenticated = false
+    var awaiting_data = false
+    var finished = false
+    for !finished {
+        let line = read_line(l)?
+        let command = first_word(line)
+        let argument = after_word(line)
+        match command {
+            "AUTH" => {
+                awaiting_data = false
+                let mechanism = first_word(argument)
+                let initial = after_word(argument)
+                if mechanism == "EXTERNAL" && initial.len == 0 {
+                    awaiting_data = true
+                    send_text(l, "DATA\r\n")?
+                } else if mechanism == "EXTERNAL" && identity_accepted(l, auth, decoded_text(initial)?)? {
+                    authenticated = true
+                    send_text(l, "OK {auth.guid}\r\n")?
+                } else if mechanism == "ANONYMOUS" && auth.anonymous {
+                    authenticated = true
+                    send_text(l, "OK {auth.guid}\r\n")?
+                } else {
+                    send_text(l, "REJECTED {mechanisms(auth)}\r\n")?
+                }
+            }
+            "DATA" => {
+                if awaiting_data && identity_accepted(l, auth, decoded_text(argument)?)? {
+                    authenticated = true
+                    send_text(l, "OK {auth.guid}\r\n")?
+                } else {
+                    send_text(l, "REJECTED {mechanisms(auth)}\r\n")?
+                }
+                awaiting_data = false
+            }
+            "CANCEL" => {
+                authenticated = false
+                awaiting_data = false
+                send_text(l, "REJECTED {mechanisms(auth)}\r\n")?
+            }
+            "NEGOTIATE_UNIX_FD" => {
+                if authenticated && auth.unix_fds {
+                    l.unix_fds = true
+                    send_text(l, "AGREE_UNIX_FD\r\n")?
+                } else {
+                    send_text(l, "ERROR\r\n")?
+                }
+            }
+            "BEGIN" => {
+                if !authenticated {
+                    fail Auth("the client began before authenticating")
+                }
+                finished = true
+            }
+            _ => send_text(l, "ERROR\r\n")?
+        }
+    }
+    h.timeouts.read = 0
+    l
+}

@@ -1,0 +1,363 @@
+import std/cancel
+import std/dbus
+import std/io
+import std/net
+import std/sys
+
+struct State {
+    volume: i64
+    quiet_calls: i64
+}
+
+fn echo(call: dbus.Call) -> []dbus.Value ! dbus.Error {
+    [dbus.Value.String("echo: {dbus.string_of(call.message.body[0])?}")]
+}
+
+fn add(call: dbus.Call) -> []dbus.Value ! dbus.Error {
+    [dbus.Value.Int32(i32(dbus.int_of(call.message.body[0])? + dbus.int_of(call.message.body[1])?))]
+}
+
+fn explode(call: dbus.Call) -> []dbus.Value ! dbus.Error {
+    fail dbus.Error.Remote("org.example.Error.Exploded", "boom")
+}
+
+fn wrong_results(call: dbus.Call) -> []dbus.Value ! dbus.Error {
+    [dbus.Value.String("not a number")]
+}
+
+fn read_descriptor(call: dbus.Call) -> []dbus.Value ! dbus.Error {
+    let fd = dbus.fd_of(call.message.body[0])?
+    let received = call.message.fds.len
+    let buf = io.buffer(64)
+    let n = sys.read(call.message.fds[0], buf) catch {
+        e => fail dbus.Error.Io(e)
+    }
+    sys.close_fd(call.message.fds[0])
+    [dbus.Value.String("{received} descriptor, read {str(buf[..n])}")]
+}
+
+fn make_descriptor(call: dbus.Call) -> []dbus.Value ! dbus.Error {
+    let ends = sys.pipe(false) catch {
+        e => fail dbus.Error.Io(e)
+    }
+    sys.write_all(ends.second, bytes("from the service")) catch {
+        e => fail dbus.Error.Io(e)
+    }
+    sys.close_fd(ends.second)
+    [dbus.Value.UnixFd(ends.first)]
+}
+
+fn peer_spec(state: *State, release: chan[bool]) -> dbus.InterfaceSpec {
+    dbus.InterfaceSpec {
+        name: "org.example.Iface",
+        methods: [
+            dbus.MethodSpec { name: "Echo", in_signature: "s", out_signature: "s", in_names: ["text"], out_names: ["reply"], handler: echo },
+            dbus.MethodSpec { name: "Add", in_signature: "ii", out_signature: "i", handler: add },
+            dbus.MethodSpec { name: "Explode", handler: explode },
+            dbus.MethodSpec { name: "Wrong", out_signature: "i", handler: wrong_results },
+            dbus.MethodSpec { name: "ReadDescriptor", in_signature: "h", out_signature: "s", handler: read_descriptor },
+            dbus.MethodSpec { name: "MakeDescriptor", out_signature: "h", handler: make_descriptor },
+            dbus.MethodSpec {
+                name: "Hang",
+                handler: fn(call) -> []dbus.Value ! dbus.Error {
+                    let released = <-release
+                    []
+                },
+            },
+            dbus.MethodSpec {
+                name: "Quiet",
+                handler: fn(call) -> []dbus.Value ! dbus.Error {
+                    state.quiet_calls += 1
+                    []
+                },
+            },
+            dbus.MethodSpec {
+                name: "QuietCalls",
+                out_signature: "i",
+                handler: fn(call) -> []dbus.Value ! dbus.Error { [dbus.Value.Int32(i32(state.quiet_calls))] },
+            },
+        ],
+        properties: [
+            dbus.read_write_property("Volume", "i", fn() -> dbus.Value ! dbus.Error { dbus.Value.Int32(i32(state.volume)) }, fn(v) ! dbus.Error {
+                state.volume = dbus.int_of(v)?
+            }),
+            dbus.read_only_property("Name", "s", fn() -> dbus.Value ! dbus.Error { dbus.Value.String("speaker") }),
+            dbus.write_only_property("Secret", "s", fn(v) ! dbus.Error {}),
+        ],
+        signals: [dbus.SignalSpec { name: "Changed", signature: "i", names: ["level"] }],
+    }
+}
+
+fn serve(h: net.ConnHandle, state: *State, release: chan[bool], ready: chan[bool], trigger: chan[bool], done: chan[bool]) {
+    let auth = dbus.ServerAuth { guid: "0123456789abcdef0123456789abcdef" }
+    let c = dbus.accept_over_handle(h, auth) or {
+        close(ready)
+        close(done)
+        return
+    }
+    let s = dbus.serve_on(c)
+    dbus.export(s, "/org/example/Obj", peer_spec(state, release)) or panic("export")
+    dbus.export(s, "/org/example/Obj/Child", dbus.InterfaceSpec { name: "org.example.Child" }) or panic("export child")
+    ready <- true
+    for {
+        select {
+            <-trigger => {
+                dbus.send_on(c, dbus.signal("/org/example/Obj", "org.example.Iface", "Changed", [dbus.Value.Int32(99)])) or panic("signal")
+                dbus.emit_changed(s, "/org/example/Obj", "org.example.Iface", ["Volume"]) or panic("changed")
+            }
+            <-dbus.ended_on(c) => {
+                break
+            }
+        }
+    }
+    close(done)
+}
+
+fn show_error(e: dbus.Error) -> str {
+    match e {
+        Remote(name, message) => "{name}: {message}"
+        Timeout => "timeout"
+        Cancelled => "cancelled"
+        Closed => "closed"
+        _ => "{e}"
+    }
+}
+
+fn call_text(c: dbus.Connection, path: str, interface: str, member: str, body: []dbus.Value) -> str {
+    let reply = dbus.call(c, dbus.method_call("", path, interface, member, body)) catch {
+        e => return "error {show_error(e)}"
+    }
+    "ok {reply.body}"
+}
+
+fn property_text(c: dbus.Connection, interface: str, name: str) -> str {
+    let v = dbus.get_property(c, "", "/org/example/Obj", interface, name) catch {
+        e => return "error {show_error(e)}"
+    }
+    "ok {v}"
+}
+
+fn describe_node(n: dbus.NodeInfo) -> str {
+    var out = "node {n.name} children {n.nodes}"
+    for i in n.interfaces {
+        out = "{out}\n  {i.name}"
+        for m in i.methods {
+            var args: []str = []
+            for a in m.arguments {
+                push(mut args, "{a.direction} {a.signature} {a.name}")
+            }
+            out = "{out}\n    method {m.name} {args}"
+        }
+        for s in i.signals {
+            out = "{out}\n    signal {s.name} {s.arguments.len}"
+        }
+        for p in i.properties {
+            out = "{out}\n    property {p.name} {p.signature} {p.access}"
+        }
+    }
+    out
+}
+
+fn properties(c: dbus.Connection) {
+    print("get volume {property_text(c, "org.example.Iface", "Volume")}")
+    dbus.set_property(c, "", "/org/example/Obj", "org.example.Iface", "Volume", dbus.Value.Int32(11)) or print("set failed")
+    print("get volume {property_text(c, "org.example.Iface", "Volume")}")
+    print("get name {property_text(c, "org.example.Iface", "Name")}")
+    print("get secret {property_text(c, "org.example.Iface", "Secret")}")
+    print("get missing {property_text(c, "org.example.Iface", "Missing")}")
+    print("get unknown interface {property_text(c, "org.example.Other", "Volume")}")
+    print("get any interface {property_text(c, "", "Name")}")
+    let all = dbus.get_all(c, "", "/org/example/Obj", "org.example.Iface") or panic("get all")
+    print("get all {all}")
+    dbus.set_property(c, "", "/org/example/Obj", "org.example.Iface", "Name", dbus.Value.String("x")) catch {
+        e => print("set read-only {show_error(e)}")
+    }
+    dbus.set_property(c, "", "/org/example/Obj", "org.example.Iface", "Volume", dbus.Value.String("x")) catch {
+        e => print("set wrong type {show_error(e)}")
+    }
+    print("get all of nothing {call_text(c, "/org/example/Obj", "org.freedesktop.DBus.Properties", "GetAll", [dbus.Value.String("org.example.Nothing")])}")
+}
+
+fn introspection(c: dbus.Connection) {
+    let xml = dbus.introspect_xml(c, "", "/org/example/Obj/Child") or panic("introspect")
+    print(xml)
+    let node = dbus.introspect(c, "", "/org/example/Obj") or panic("introspect parsed")
+    print(describe_node(node))
+    let root = dbus.introspect(c, "", "/") or panic("introspect root")
+    print("root children {root.nodes} interfaces {root.interfaces.len}")
+    let again = dbus.parse_introspection(dbus.introspection_xml(node)) or panic("reparse")
+    print("round trip equal {describe_node(again) == describe_node(node)}")
+    print("missing {call_text(c, "/org/example/Nothing", "org.freedesktop.DBus.Introspectable", "Introspect", [])}")
+}
+
+fn peer_interface(c: dbus.Connection) {
+    dbus.ping(c, "") or print("ping failed")
+    let id = dbus.machine_id(c, "") or panic("machine id")
+    let local = dbus.local_machine_id() or panic("local machine id")
+    print("machine id {id.len} digits, equals the local one {id == local}")
+}
+
+fn descriptors(c: dbus.Connection) {
+    let ends = sys.pipe(false) or panic("pipe")
+    sys.write_all(ends.second, bytes("through a call")) or panic("write")
+    let reply = dbus.call(c, dbus.method_call("", "/org/example/Obj", "org.example.Iface", "ReadDescriptor", [dbus.Value.UnixFd(ends.first)])) or panic("read descriptor")
+    print(dbus.string_of(reply.body[0]) or "?")
+    sys.close_fd(ends.first)
+    sys.close_fd(ends.second)
+    let made = dbus.call(c, dbus.method_call("", "/org/example/Obj", "org.example.Iface", "MakeDescriptor", [])) or panic("make descriptor")
+    let fd = dbus.fd_of(made.body[0]) or -1
+    let buf = io.buffer(64)
+    let n = sys.read(fd, buf) or 0
+    print("received {made.fds.len} descriptor: {str(buf[..n])}")
+    sys.close_fd(fd)
+}
+
+fn waiting(c: dbus.Connection, release: chan[bool]) {
+    let hang = dbus.method_call("", "/org/example/Obj", "org.example.Iface", "Hang", [])
+    let timed = dbus.call_with(c, hang, dbus.CallOptions { timeout: 40 }) catch {
+        e => {
+            print("timed out call: {show_error(e)}")
+            dbus.Message { kind: dbus.MessageType.MethodReturn }
+        }
+    }
+    let token = cancel.token()
+    spawn cancel_soon(token)
+    let stopped = dbus.call_with(c, hang, dbus.CallOptions { timeout: 0, cancel: token }) catch {
+        e => {
+            print("cancelled call: {show_error(e)}")
+            dbus.Message { kind: dbus.MessageType.MethodReturn }
+        }
+    }
+    release <- true
+    release <- true
+    print("after the hangs {call_text(c, "/org/example/Obj", "org.example.Iface", "Echo", [dbus.Value.String("still here")])}")
+}
+
+fn cancel_soon(token: *cancel.Token) {
+    select {
+        after(30) => {}
+    }
+    cancel.cancel(token)
+}
+
+fn quiet(c: dbus.Connection) {
+    var m = dbus.method_call("", "/org/example/Obj", "org.example.Iface", "Quiet", [])
+    m.flags = dbus.no_reply_expected
+    dbus.send(c, m) or panic("quiet")
+    dbus.send(c, m) or panic("quiet")
+    var counted = 0
+    for counted < 2 {
+        let reply = dbus.call(c, dbus.method_call("", "/org/example/Obj", "org.example.Iface", "QuietCalls", [])) or panic("quiet calls")
+        counted = dbus.int_of(reply.body[0]) or -1
+    }
+    print("quiet calls {counted}")
+    let refused = dbus.call(c, m) catch {
+        e => {
+            print("call with no_reply_expected: {show_error(e)}")
+            m
+        }
+    }
+}
+
+fn concurrent(c: dbus.Connection) {
+    let results = chan[i64](8)
+    for i in 0..8 {
+        spawn add_in_background(c.handle, i, results)
+    }
+    var total = 0
+    for i in 0..8 {
+        total += (<-results) ?? 0
+    }
+    print("concurrent total {total}")
+}
+
+fn add_in_background(h: *dbus.ConnectionHandle, i: i64, results: chan[i64]) {
+    let reply = dbus.call_on(h, dbus.method_call("", "/org/example/Obj", "org.example.Iface", "Add", [dbus.Value.Int32(i32(i)), dbus.Value.Int32(100)])) or {
+        results <- -1
+        return
+    }
+    results <- dbus.int_of(reply.body[0]) or -1
+}
+
+fn signals(c: dbus.Connection, trigger: chan[bool]) {
+    let seen = chan[dbus.Message](4)
+    let id = dbus.add_filter(c, fn(m) {
+        if m.kind == dbus.MessageType.Signal {
+            seen <- m
+            return true
+        }
+        false
+    })
+    trigger <- true
+    let first = <-seen
+    let second = <-seen
+    match first {
+        some(m) => print("signal {m.interface}.{m.member} {m.body}")
+        none => {}
+    }
+    match second {
+        some(m) => {
+            let changed = dbus.properties_changed(m) or panic("properties changed")
+            print("changed {changed.interface} {changed.changed} {changed.invalidated}")
+        }
+        none => {}
+    }
+    dbus.remove_filter(c, id)
+}
+
+fn main() {
+    using var pair = net.socketpair() or panic("pair")
+    let first = net.detach(mut pair.first)
+    let second = net.detach(mut pair.second)
+    let state = new(State { volume: 7, quiet_calls: 0 })
+    let release = chan[bool](2)
+    let ready = chan[bool](1)
+    let trigger = chan[bool]()
+    let done = chan[bool]()
+    spawn serve(second, state, release, ready, trigger, done)
+    using c = dbus.connect_over(first, false) or panic("connect")
+    let served = <-ready
+
+    print(call_text(c, "/org/example/Obj", "org.example.Iface", "Echo", [dbus.Value.String("hi")]))
+    print(call_text(c, "/org/example/Obj", "org.example.Iface", "Add", [dbus.Value.Int32(2), dbus.Value.Int32(40)]))
+    print(call_text(c, "/org/example/Obj", "", "Add", [dbus.Value.Int32(1), dbus.Value.Int32(1)]))
+    print(call_text(c, "/org/example/Obj", "org.example.Iface", "Explode", []))
+    print(call_text(c, "/org/example/Obj", "org.example.Iface", "Wrong", []))
+    print(call_text(c, "/org/example/Obj", "org.example.Iface", "Echo", [dbus.Value.Int32(1)]))
+    print(call_text(c, "/org/example/Obj", "org.example.Iface", "Missing", []))
+    print(call_text(c, "/org/example/Obj", "org.example.Other", "Echo", []))
+    print(call_text(c, "/org/example/Nothing", "org.example.Iface", "Echo", []))
+    print(call_text(c, "/org/example/Obj", "org.freedesktop.DBus.Peer", "Ping", []))
+
+    properties(c)
+    introspection(c)
+    peer_interface(c)
+    descriptors(c)
+    waiting(c, release)
+    quiet(c)
+    concurrent(c)
+    signals(c, trigger)
+
+    spawn close_when_called(c.handle)
+    let lost = dbus.call(c, dbus.method_call("", "/org/example/Obj", "org.example.Iface", "Hang", [])) catch {
+        e => {
+            print("pending call on close: {show_error(e)}")
+            dbus.Message { kind: dbus.MessageType.MethodReturn }
+        }
+    }
+    <-done
+    print("service ended")
+    let after_close = dbus.send(c, dbus.method_call("", "/org/example/Obj", "org.example.Iface", "Echo", [dbus.Value.String("x")])) catch {
+        e => {
+            print("send after close: {show_error(e)}")
+            0
+        }
+    }
+}
+
+fn close_when_called(h: *dbus.ConnectionHandle) {
+    select {
+        after(40) => {}
+    }
+    dbus.shutdown_on(h)
+}

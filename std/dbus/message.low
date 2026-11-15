@@ -1,0 +1,397 @@
+import std/io
+import std/text
+
+/// The flag that tells the receiver of a method call not to send a reply.
+pub const no_reply_expected = 1
+
+/// The flag that stops the bus from starting a service to receive the message.
+pub const no_auto_start = 2
+
+/// The flag that lets the receiver of a method call ask the user to authorise it.
+pub const allow_interactive_authorization = 4
+
+const protocol_version: u8 = 1
+const fixed_header_length = 16
+
+/// The type of a message.
+pub enum MessageType {
+    /// A call of a method on an object, which a reply answers unless `no_reply_expected` is set.
+    MethodCall = 1
+    /// The successful reply to a method call. Its body holds the results.
+    MethodReturn = 2
+    /// The failed reply to a method call. Its `error_name` names the error and its body usually holds a message string.
+    ErrorReply = 3
+    /// A broadcast or directed notification from an object.
+    Signal = 4
+}
+
+/// A D-Bus message.
+///
+/// A header field that a message type does not use is empty, or `0` for `reply_serial`.
+pub struct Message {
+    /// The message type.
+    pub kind: MessageType
+    /// The flag bits `no_reply_expected`, `no_auto_start` and `allow_interactive_authorization`.
+    pub flags: i64 = 0
+    /// The serial number the sender gave the message, or `0` before `send` assigns one.
+    pub serial: i64 = 0
+    /// The object path. Required for a method call and a signal.
+    pub path: str = ""
+    /// The interface name. Required for a signal and optional for a method call.
+    pub interface: str = ""
+    /// The method or signal name. Required for a method call and a signal.
+    pub member: str = ""
+    /// The error name. Required for an error reply.
+    pub error_name: str = ""
+    /// The serial of the method call a reply answers. Required for a method return and an error reply.
+    pub reply_serial: i64 = 0
+    /// The bus name the message is for.
+    pub destination: str = ""
+    /// The unique name of the connection that sent the message, which the bus fills in.
+    pub sender: str = ""
+    /// The values of the body, whose signature is `values_signature(body)`.
+    pub body: []Value = []
+    /// The file descriptors that arrived with the message, which the `UnixFd` values of `body` refer to. The receiver owns them and closes each with `sys.close_fd`. Sending ignores it: the descriptors come from the `UnixFd` values.
+    pub fds: []i64 = []
+}
+
+fn field(code: i64, v: Value) -> Value {
+    Value.Struct([Value.Byte(u8(code)), variant(v)])
+}
+
+fn invalid_name(m: Message) -> str {
+    if m.path.len > 0 && !valid_object_path(m.path) {
+        return "invalid object path {text.quote(m.path)}"
+    }
+    if m.interface.len > 0 && !valid_interface(m.interface) {
+        return "invalid interface name {text.quote(m.interface)}"
+    }
+    if m.member.len > 0 && !valid_member(m.member) {
+        return "invalid member name {text.quote(m.member)}"
+    }
+    if m.error_name.len > 0 && !valid_error_name(m.error_name) {
+        return "invalid error name {text.quote(m.error_name)}"
+    }
+    if m.destination.len > 0 && !valid_bus_name(m.destination) {
+        return "invalid bus name {text.quote(m.destination)}"
+    }
+    if m.sender.len > 0 && !valid_bus_name(m.sender) {
+        return "invalid bus name {text.quote(m.sender)}"
+    }
+    ""
+}
+
+fn missing_field(m: Message) -> str {
+    match m.kind {
+        MethodCall => {
+            if m.path.len == 0 || m.member.len == 0 {
+                return "a method call needs a path and a member"
+            }
+        }
+        MethodReturn => {
+            if m.reply_serial <= 0 {
+                return "a method return needs a reply serial"
+            }
+        }
+        ErrorReply => {
+            if m.error_name.len == 0 || m.reply_serial <= 0 {
+                return "an error reply needs an error name and a reply serial"
+            }
+        }
+        Signal => {
+            if m.path.len == 0 || m.interface.len == 0 || m.member.len == 0 {
+                return "a signal needs a path, an interface and a member"
+            }
+        }
+    }
+    ""
+}
+
+fn header_fields(m: Message, signature: str, fd_count: i64) -> Value {
+    var fields: []Value = []
+    if m.path.len > 0 {
+        push(mut fields, field(1, Value.ObjectPath(m.path)))
+    }
+    if m.interface.len > 0 {
+        push(mut fields, field(2, Value.String(m.interface)))
+    }
+    if m.member.len > 0 {
+        push(mut fields, field(3, Value.String(m.member)))
+    }
+    if m.error_name.len > 0 {
+        push(mut fields, field(4, Value.String(m.error_name)))
+    }
+    if m.reply_serial > 0 {
+        push(mut fields, field(5, Value.UInt32(u32(m.reply_serial))))
+    }
+    if m.destination.len > 0 {
+        push(mut fields, field(6, Value.String(m.destination)))
+    }
+    if m.sender.len > 0 {
+        push(mut fields, field(7, Value.String(m.sender)))
+    }
+    if signature.len > 0 {
+        push(mut fields, field(8, Value.Signature(signature)))
+    }
+    if fd_count > 0 {
+        push(mut fields, field(9, Value.UInt32(u32(fd_count))))
+    }
+    Value.Array("(yv)", fields)
+}
+
+/// Marshals `m` into the bytes of a message in `order`, with the file descriptors that go with it.
+///
+/// The serial of `m` must be set. The descriptors are those of the `UnixFd` values of the body in index order. Fails with `Marshal` when a header field the type requires is missing or the serial is `0`, with `Name` for an invalid object path, interface, member, error or bus name, with the errors of `encode` for a body that cannot be marshalled, and with `TooLarge` for a message over 128 MiB.
+pub fn encode_message(m: Message, order: ByteOrder) -> Encoded ! Error {
+    if m.serial <= 0 {
+        fail Marshal("a message needs a serial")
+    }
+    let bad_name = invalid_name(m)
+    if bad_name.len > 0 {
+        fail Name(bad_name)
+    }
+    let missing = missing_field(m)
+    if missing.len > 0 {
+        fail Marshal(missing)
+    }
+    let body = encode(m.body, order)?
+    let signature = values_signature(m.body)?
+    let marker: u8 = if order == ByteOrder.Big { 'B' } else { 'l' }
+    let header = encode([
+        Value.Byte(marker),
+        Value.Byte(u8(m.kind.index)),
+        Value.Byte(u8(m.flags)),
+        Value.Byte(protocol_version),
+        Value.UInt32(u32(body.data.len)),
+        Value.UInt32(u32(m.serial)),
+        header_fields(m, signature, body.fds.len),
+    ], order)?
+    var out = header.data
+    for out.len % 8 != 0 {
+        push(mut out, 0)
+    }
+    if out.len + body.data.len > 134217728 {
+        fail TooLarge
+    }
+    io.append(mut out, body.data)
+    Encoded { data: out, fds: body.fds }
+}
+
+/// Returns the length in bytes of the message whose first 16 bytes are `prefix`.
+///
+/// The length covers the fixed header, the header fields with their padding and the body. Fails with `Malformed` when `prefix` is shorter than 16 bytes, starts with neither `l` nor `B`, or has a protocol version other than 1, and with `TooLarge` when the message or its header fields would exceed the limits of 128 MiB and 64 MiB.
+pub fn message_length(prefix: []u8) -> i64 ! Error {
+    if prefix.len < fixed_header_length {
+        fail Malformed("a message header is 16 bytes or more")
+    }
+    let big = order_of(prefix[0])? == ByteOrder.Big
+    if prefix[3] != protocol_version {
+        fail Malformed("unsupported protocol version {prefix[3]}")
+    }
+    let body = if big { io.be32(prefix, 4) } else { io.le32(prefix, 4) }
+    let fields = if big { io.be32(prefix, 12) } else { io.le32(prefix, 12) }
+    if fields > 67108864 {
+        fail TooLarge
+    }
+    let header = (fixed_header_length + fields + 7) & ~7
+    if header + body > 134217728 {
+        fail TooLarge
+    }
+    header + body
+}
+
+fn order_of(marker: u8) -> ByteOrder ! Error {
+    match marker {
+        'l' => ByteOrder.Little
+        'B' => ByteOrder.Big
+        _ => fail Malformed("a message starts with byte {marker}, not l or B")
+    }
+}
+
+struct Fields {
+    path: str
+    interface: str
+    member: str
+    error_name: str
+    reply_serial: i64
+    destination: str
+    sender: str
+    signature: str
+    unix_fds: i64
+    seen: [i64: bool]
+}
+
+fn read_fields(items: []Value) -> Fields ! Error {
+    var f = Fields { path: "", interface: "", member: "", error_name: "", reply_serial: 0, destination: "", sender: "", signature: "", unix_fds: 0, seen: [:] }
+    for item in items {
+        let pair = fields_of(item)?
+        let code = int_of(pair[0])?
+        let v = unwrap(pair[1])?
+        if code >= 1 && code <= 9 && f.seen[code] != none {
+            fail Malformed("header field {code} appears twice")
+        }
+        f.seen[code] = true
+        match code {
+            1 => { f.path = expect_object_path(v)? }
+            2 => { f.interface = expect_string(v)? }
+            3 => { f.member = expect_string(v)? }
+            4 => { f.error_name = expect_string(v)? }
+            5 => { f.reply_serial = expect_u32(v)? }
+            6 => { f.destination = expect_string(v)? }
+            7 => { f.sender = expect_string(v)? }
+            8 => { f.signature = expect_signature(v)? }
+            9 => { f.unix_fds = expect_u32(v)? }
+            _ => {}
+        }
+    }
+    f
+}
+
+fn expect_object_path(v: Value) -> str ! Error {
+    match v {
+        ObjectPath(s) => s
+        _ => fail Malformed("a header field has the wrong type")
+    }
+}
+
+fn expect_signature(v: Value) -> str ! Error {
+    match v {
+        Signature(s) => s
+        _ => fail Malformed("a header field has the wrong type")
+    }
+}
+
+fn expect_string(v: Value) -> str ! Error {
+    match v {
+        String(s) => s
+        _ => fail Malformed("a header field has the wrong type")
+    }
+}
+
+fn expect_u32(v: Value) -> i64 ! Error {
+    match v {
+        UInt32(n) => i64(n)
+        _ => fail Malformed("a header field has the wrong type")
+    }
+}
+
+struct Header {
+    order: ByteOrder
+    length: i64
+    values: []Value
+    fields: Fields
+}
+
+fn read_header(data: []u8) -> Header ! Error {
+    let total = message_length(data)?
+    if total != data.len {
+        fail Malformed("a message is {total} bytes, not {data.len}")
+    }
+    let order = order_of(data[0])?
+    let fields_length = if order == ByteOrder.Big { io.be32(data, 12) } else { io.le32(data, 12) }
+    let length = (fixed_header_length + fields_length + 7) & ~7
+    let types = parse_signature("yyyyuua(yv)")?
+    let decoder = new(Decoder { data: data[..length], at: 0, big: order == ByteOrder.Big, fds: [] })
+    let values = decode_values(decoder, types)?
+    skip_padding(decoder, 8)?
+    Header { order, length, values, fields: read_fields(array_of(values[6])?)? }
+}
+
+/// Returns how many file descriptors the complete message `data` carries, as its `UNIX_FDS` header field says.
+///
+/// `data` is exactly the bytes `message_length` reports. Fails as `decode_message` does for a bad header.
+pub fn message_fd_count(data: []u8) -> i64 ! Error {
+    read_header(data)?.fields.unix_fds
+}
+
+/// Unmarshals one complete message from `data`, with `fds` the file descriptors that arrived with it.
+///
+/// `data` is exactly the bytes `message_length` reports. Unknown header fields are ignored. The `UNIX_FDS` field is checked against `fds` and the descriptors are returned in `Message.fds`. Fails with `Malformed` for a bad byte order mark, protocol version, message type or header field, for padding that is not zero, for a missing required field, for a body that does not match its signature, for a name that is invalid, or for a length that disagrees with `data`, and with `TooLarge` for the limits `message_length` names.
+pub fn decode_message(data: []u8, fds: []i64) -> Message ! Error {
+    let parsed = read_header(data)?
+    let header = parsed.values
+    let fields = parsed.fields
+    let order = parsed.order
+    let header_length = parsed.length
+    let kind = match int_of(header[1])? {
+        1 => MessageType.MethodCall
+        2 => MessageType.MethodReturn
+        3 => MessageType.ErrorReply
+        4 => MessageType.Signal
+        _ => fail Malformed("unknown message type {int_of(header[1])?}")
+    }
+    if fields.unix_fds != fds.len {
+        fail Malformed("the header announces {fields.unix_fds} file descriptors and {fds.len} arrived")
+    }
+    let body_types = parse_signature(fields.signature)?
+    let body = decode(body_types, data[header_length..], fds, order)?
+    let m = Message {
+        kind,
+        flags: int_of(header[2])?,
+        serial: int_of(header[5])?,
+        path: fields.path,
+        interface: fields.interface,
+        member: fields.member,
+        error_name: fields.error_name,
+        reply_serial: fields.reply_serial,
+        destination: fields.destination,
+        sender: fields.sender,
+        body,
+        fds,
+    }
+    if m.serial == 0 {
+        fail Malformed("a message has serial 0")
+    }
+    let bad_name = invalid_name(m)
+    if bad_name.len > 0 {
+        fail Malformed(bad_name)
+    }
+    let missing = missing_field(m)
+    if missing.len > 0 {
+        fail Malformed(missing)
+    }
+    m
+}
+
+/// Returns a method call of `member` on the object `path` of the bus name `destination`.
+///
+/// `interface` may be empty. `body` holds the arguments. Set `flags` on the result for `no_reply_expected` and the other flags.
+pub fn method_call(destination: str, path: str, interface: str, member: str, body: []Value) -> Message {
+    Message { kind: MessageType.MethodCall, destination, path, interface, member, body }
+}
+
+/// Returns a signal `member` of `interface` emitted by the object `path`, addressed to every receiver that matches.
+///
+/// Set `destination` on the result to address one connection.
+pub fn signal(path: str, interface: str, member: str, body: []Value) -> Message {
+    Message { kind: MessageType.Signal, path, interface, member, body }
+}
+
+/// Returns the successful reply to `call`, carrying `body`.
+///
+/// The reply is addressed to the sender of `call` and answers its serial.
+pub fn method_return(call: Message, body: []Value) -> Message {
+    Message { kind: MessageType.MethodReturn, reply_serial: call.serial, destination: call.sender, body }
+}
+
+/// Returns the error reply to `call` with the error name `name` and the text `description`.
+///
+/// The body is the string `description`, or empty when `description` is empty. The reply is addressed to the sender of `call` and answers its serial.
+pub fn error_reply(call: Message, name: str, description: str) -> Message {
+    var body: []Value = []
+    if description.len > 0 {
+        push(mut body, Value.String(description))
+    }
+    Message { kind: MessageType.ErrorReply, error_name: name, reply_serial: call.serial, destination: call.sender, body }
+}
+
+/// Returns the `Remote` error that the error reply `m` stands for.
+///
+/// The message is the first body value when it is a string, and empty otherwise.
+pub fn remote_error(m: Message) -> Error {
+    var description = ""
+    if m.body.len > 0 {
+        description = string_of(m.body[0]) or ""
+    }
+    Error.Remote(m.error_name, description)
+}

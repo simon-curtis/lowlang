@@ -1,0 +1,512 @@
+import std/cancel
+import std/net
+import std/os
+import std/sync
+
+const default_timeout = 25000
+const bus_name = "org.freedesktop.DBus"
+const bus_path = "/org/freedesktop/DBus"
+
+/// How long and under which token a method call waits.
+pub struct CallOptions {
+    /// The longest the call waits for the reply, in milliseconds. `0` or less waits without a limit. The default is 25000, as in libdbus.
+    pub timeout: i64 = default_timeout
+    /// A token that stops the call when cancelled, failing it with `Cancelled`.
+    pub cancel: *cancel.Token? = none
+}
+
+/// A copyable view of a connection to a bus or a peer.
+///
+/// Every copy shares the connection. One green thread reads every incoming message, matches replies to the calls waiting for them and offers every message to the filters; any number of green threads may call and send at once. The view does not close the connection when released; `shutdown_on` does, and `Connection` does when dropped.
+pub struct ConnectionHandle {
+    link: *Link
+    writing: sync.Mutex
+    state: sync.Mutex
+    next_serial: i64
+    pending: [i64: chan[Message]]
+    filters: [i64: fn(Message) -> bool]
+    next_filter: i64
+    closed: bool
+    done: chan[bool]
+    reading: chan[bool]
+    started: bool
+    unique_name: str
+}
+
+/// The owner of a connection.
+///
+/// Dropping it closes the connection: pending calls fail with `Closed` and the reading green thread ends.
+pub struct Connection {
+    /// The copyable view of the connection.
+    pub handle: *ConnectionHandle
+    detached: bool = false
+    drop {
+        if !detached {
+            shutdown_on(handle)
+        }
+    }
+}
+
+/// Returns the `Connection` that owns the connection behind `h`, which closes it when dropped.
+pub fn adopt(h: *ConnectionHandle) -> Connection {
+    Connection { handle: h }
+}
+
+/// Stops `c` from closing the connection when dropped, and returns its view.
+///
+/// The caller must close the connection with `shutdown_on`.
+pub fn detach(mut c: Connection) -> *ConnectionHandle {
+    c.detached = true
+    c.handle
+}
+
+fn start(l: *Link) -> *ConnectionHandle {
+    let h = new(ConnectionHandle {
+        link: l,
+        writing: sync.mutex(),
+        state: sync.mutex(),
+        next_serial: 1,
+        pending: [:],
+        filters: [:],
+        next_filter: 1,
+        closed: false,
+        done: chan[bool](),
+        reading: chan[bool](),
+        started: false,
+        unique_name: "",
+    })
+    spawn pump(h)
+    h
+}
+
+fn pump(h: *ConnectionHandle) {
+    <-h.reading
+    for {
+        let m = receive(h.link) or break
+        dispatch(h, m)
+    }
+    net.close_on(h.link.handle)
+    shut(h)
+}
+
+/// Starts the reading green thread of the connection behind `h`, if it has not started.
+///
+/// A connection made by `connect_over`, `connect_over_handle` or one of the `connect_` functions reads from the start. A connection made by `accept_over` or `accept_over_handle` holds the incoming messages until `begin_on` or the first `add_filter_on`, so a server sets up its handlers before the first call can arrive. Calling it again does nothing.
+pub fn begin_on(h: *ConnectionHandle) {
+    sync.lock(h.state)
+    let first = !h.started
+    h.started = true
+    sync.unlock(h.state)
+    if first {
+        close(h.reading)
+    }
+}
+
+/// Starts the reading green thread of `c`.
+///
+/// Does the same as `begin_on` on its handle.
+pub fn begin(c: Connection) {
+    begin_on(c.handle)
+}
+
+fn filter_list(h: *ConnectionHandle) -> []fn(Message) -> bool {
+    sync.lock(h.state)
+    var list: []fn(Message) -> bool = []
+    for _, f in h.filters {
+        push(mut list, f)
+    }
+    sync.unlock(h.state)
+    list
+}
+
+fn dispatch(h: *ConnectionHandle, m: Message) {
+    for f in filter_list(h) {
+        if f(m) {
+            return
+        }
+    }
+    match m.kind {
+        MethodReturn => deliver(h, m)
+        ErrorReply => deliver(h, m)
+        MethodCall => refuse_call(h, m)
+        Signal => close_all(m.fds)
+    }
+}
+
+fn deliver(h: *ConnectionHandle, m: Message) {
+    sync.lock(h.state)
+    let waiter = h.pending[m.reply_serial]
+    delete(mut h.pending, m.reply_serial)
+    sync.unlock(h.state)
+    match waiter {
+        some(w) => {
+            w <- m
+        }
+        none => close_all(m.fds)
+    }
+}
+
+fn refuse_call(h: *ConnectionHandle, m: Message) {
+    close_all(m.fds)
+    if m.flags & no_reply_expected != 0 {
+        return
+    }
+    let reply = error_reply(m, "org.freedesktop.DBus.Error.UnknownMethod", "nothing handles {m.member}")
+    send_on(h, reply) or return
+}
+
+fn shut(h: *ConnectionHandle) {
+    sync.lock(h.state)
+    if h.closed {
+        sync.unlock(h.state)
+        return
+    }
+    h.closed = true
+    let waiting = h.pending
+    h.pending = [:]
+    sync.unlock(h.state)
+    begin_on(h)
+    for _, w in waiting {
+        close(w)
+    }
+    close(h.done)
+}
+
+/// Closes the connection behind `h`.
+///
+/// Pending calls fail with `Closed`, the reading green thread ends and later operations fail with `Closed`. Closing twice does nothing.
+pub fn shutdown_on(h: *ConnectionHandle) {
+    net.close_on(h.link.handle)
+    shut(h)
+}
+
+/// Closes `c`.
+///
+/// Does the same as `shutdown_on` on its handle.
+pub fn shutdown(c: Connection) {
+    shutdown_on(c.handle)
+}
+
+/// Returns a channel that is closed once the connection behind `h` has ended, whether closed locally or by the peer.
+pub fn ended_on(h: *ConnectionHandle) -> chan[bool] {
+    h.done
+}
+
+/// Returns a channel that is closed once `c` has ended.
+///
+/// Does the same as `ended_on` on its handle.
+pub fn ended(c: Connection) -> chan[bool] {
+    ended_on(c.handle)
+}
+
+/// Returns the unique name the bus gave the connection behind `h`, or an empty string for a connection without a bus.
+pub fn unique_name_on(h: *ConnectionHandle) -> str {
+    sync.lock(h.state)
+    let name = h.unique_name
+    sync.unlock(h.state)
+    name
+}
+
+/// Returns the unique name the bus gave `c`.
+///
+/// Does the same as `unique_name_on` on its handle.
+pub fn unique_name(c: Connection) -> str {
+    unique_name_on(c.handle)
+}
+
+/// Returns whether the peer of the connection behind `h` agreed to receive file descriptors.
+pub fn passes_fds_on(h: *ConnectionHandle) -> bool {
+    h.link.unix_fds
+}
+
+/// Returns whether the peer of `c` agreed to receive file descriptors.
+///
+/// Does the same as `passes_fds_on` on its handle.
+pub fn passes_fds(c: Connection) -> bool {
+    passes_fds_on(c.handle)
+}
+
+/// Returns the guid the server announced during authentication, which is empty for a connection the process accepted.
+pub fn server_guid_on(h: *ConnectionHandle) -> str {
+    h.link.guid
+}
+
+/// Returns the guid the server of `c` announced during authentication.
+///
+/// Does the same as `server_guid_on` on its handle.
+pub fn server_guid(c: Connection) -> str {
+    server_guid_on(c.handle)
+}
+
+/// Registers `f` to see every message the connection behind `h` receives, and returns its id for `remove_filter_on`.
+///
+/// Filters run in the order they were added on the reading green thread, before replies are matched to calls. A filter that returns `true` consumes the message and later filters and the default handling do not see it. A filter owns the file descriptors of a message it consumes. A filter must not block on the connection's own replies: start a green thread for work that calls.
+pub fn add_filter_on(h: *ConnectionHandle, f: fn(Message) -> bool) -> i64 {
+    sync.lock(h.state)
+    let id = h.next_filter
+    h.next_filter += 1
+    h.filters[id] = f
+    sync.unlock(h.state)
+    begin_on(h)
+    id
+}
+
+/// Registers `f` on `c`.
+///
+/// Does the same as `add_filter_on` on its handle.
+pub fn add_filter(c: Connection, f: fn(Message) -> bool) -> i64 {
+    add_filter_on(c.handle, f)
+}
+
+/// Removes the filter `id` from the connection behind `h`. An unknown id is ignored.
+pub fn remove_filter_on(h: *ConnectionHandle, id: i64) {
+    sync.lock(h.state)
+    delete(mut h.filters, id)
+    sync.unlock(h.state)
+}
+
+/// Removes the filter `id` from `c`.
+///
+/// Does the same as `remove_filter_on` on its handle.
+pub fn remove_filter(c: Connection, id: i64) {
+    remove_filter_on(c.handle, id)
+}
+
+fn register(h: *ConnectionHandle, m: Message, waiter: chan[Message]?) -> Message ! Error {
+    var out = m
+    sync.lock(h.writing)
+    sync.lock(h.state)
+    if h.closed {
+        sync.unlock(h.state)
+        sync.unlock(h.writing)
+        fail Closed
+    }
+    if out.serial == 0 {
+        out.serial = h.next_serial
+        h.next_serial += 1
+    }
+    match waiter {
+        some(w) => {
+            h.pending[out.serial] = w
+        }
+        none => {}
+    }
+    sync.unlock(h.state)
+    transmit(h.link, out) catch {
+        e => {
+            sync.unlock(h.writing)
+            forget(h, out.serial)
+            fail e
+        }
+    }
+    sync.unlock(h.writing)
+    out
+}
+
+fn forget(h: *ConnectionHandle, serial: i64) {
+    sync.lock(h.state)
+    delete(mut h.pending, serial)
+    sync.unlock(h.state)
+}
+
+/// Sends `m` on the connection behind `h` without waiting for a reply and returns the serial it was sent with.
+///
+/// A serial of `0` is replaced with the next one of the connection. Fails with `Closed` on a closed connection, with the errors of `encode_message` for a message that cannot be marshalled, and with `Marshal` for file descriptors when the peer did not agree to receive them. Safe to call from several green threads.
+pub fn send_on(h: *ConnectionHandle, m: Message) -> i64 ! Error {
+    register(h, m, none)?.serial
+}
+
+/// Sends `m` on `c` and returns its serial.
+///
+/// Does the same as `send_on` on its handle.
+pub fn send(c: Connection, m: Message) -> i64 ! Error {
+    send_on(c.handle, m)
+}
+
+/// Sends the method call `m` on the connection behind `h` and waits for the reply with the default `CallOptions`.
+///
+/// Does the same as `call_with_on` with `CallOptions {}`.
+pub fn call_on(h: *ConnectionHandle, m: Message) -> Message ! Error {
+    call_with_on(h, m, CallOptions {})
+}
+
+/// Sends the method call `m` on `c` and waits for the reply.
+///
+/// Does the same as `call_on` on its handle.
+pub fn call(c: Connection, m: Message) -> Message ! Error {
+    call_on(c.handle, m)
+}
+
+/// Sends the method call `m` on the connection behind `h` and returns the method return that answers it.
+///
+/// The reply is matched by serial, so any number of calls may wait at once. Fails with `Remote(name, message)` when the peer answers with an error, `Timeout` after `o.timeout`, `Cancelled` when `o.cancel` is cancelled, `Closed` when the connection closes first and `Marshal` when `m` is not a method call or has `no_reply_expected` set, besides the errors of `send_on`. A reply that arrives after a failure is discarded and its descriptors closed. The caller owns the descriptors of the reply.
+pub fn call_with_on(h: *ConnectionHandle, m: Message, o: CallOptions) -> Message ! Error {
+    if m.kind != MessageType.MethodCall {
+        fail Marshal("only a method call waits for a reply")
+    }
+    if m.flags & no_reply_expected != 0 {
+        fail Marshal("a call with no_reply_expected has no reply to wait for")
+    }
+    let w = chan[Message](1)
+    let sent = register(h, m, w)?
+    let stop = match o.cancel {
+        some(t) => cancel.done(t)
+        none => chan[bool]()
+    }
+    let reply = if o.timeout > 0 {
+        select {
+            r = <-w => r
+            <-stop => {
+                abandon(h, sent.serial, w)
+                fail Cancelled
+            }
+            after(o.timeout) => {
+                abandon(h, sent.serial, w)
+                fail Timeout
+            }
+        }
+    } else {
+        select {
+            r = <-w => r
+            <-stop => {
+                abandon(h, sent.serial, w)
+                fail Cancelled
+            }
+        }
+    }
+    match reply {
+        some(r) => {
+            if r.kind == MessageType.ErrorReply {
+                close_all(r.fds)
+                fail remote_error(r)
+            }
+            r
+        }
+        none => fail Closed
+    }
+}
+
+fn abandon(h: *ConnectionHandle, serial: i64, w: chan[Message]) {
+    forget(h, serial)
+    select {
+        late = <-w => {
+            match late {
+                some(m) => close_all(m.fds)
+                none => {}
+            }
+        }
+        else => {}
+    }
+}
+
+/// Sends the method call `m` on `c` and returns the method return that answers it, waiting as `o` says.
+///
+/// Does the same as `call_with_on` on its handle.
+pub fn call_with(c: Connection, m: Message, o: CallOptions) -> Message ! Error {
+    call_with_on(c.handle, m, o)
+}
+
+fn hello(h: *ConnectionHandle) ! Error {
+    let reply = call_on(h, method_call(bus_name, bus_path, bus_name, "Hello", []))?
+    if reply.body.len != 1 {
+        fail Malformed("Hello returned {reply.body.len} values")
+    }
+    let name = string_of(reply.body[0])?
+    sync.lock(h.state)
+    h.unique_name = name
+    sync.unlock(h.state)
+}
+
+/// Authenticates as a client over the connected socket `h` and returns the view of the connection, which owns the socket.
+///
+/// Sends EXTERNAL with the effective user id, falls back to ANONYMOUS when the server rejects it and asks for file descriptor passing. With `bus` set it also calls `Hello` and records the unique name, as a connection to a bus daemon needs; leave it unset for a direct connection to another process. Closes the socket when it fails, with `Auth` for a rejection or a protocol violation and `Io` or `Closed` for transport errors.
+pub fn connect_over_handle(h: net.ConnHandle, bus: bool) -> *ConnectionHandle ! Error {
+    let l = client_handshake(h, os.euid(), true) catch {
+        e => {
+            net.close_on(h)
+            fail e
+        }
+    }
+    using var c = adopt(start(l))
+    begin_on(c.handle)
+    if bus {
+        hello(c.handle)?
+    }
+    detach(mut c)
+}
+
+/// Authenticates as a client over the connected socket `h` and returns the connection.
+///
+/// Does the same as `connect_over_handle`.
+pub fn connect_over(h: net.ConnHandle, bus: bool) -> Connection ! Error {
+    adopt(connect_over_handle(h, bus)?)
+}
+
+/// Authenticates as a server over the accepted socket `h` and returns the view of the connection, which owns the socket.
+///
+/// Reads the client's SASL exchange as `auth` allows and answers it. Closes the socket when it fails, with `Auth` for a rejection or a protocol violation and `Io` or `Closed` for transport errors.
+pub fn accept_over_handle(h: net.ConnHandle, auth: ServerAuth) -> *ConnectionHandle ! Error {
+    let l = server_handshake(h, auth) catch {
+        e => {
+            net.close_on(h)
+            fail e
+        }
+    }
+    start(l)
+}
+
+/// Authenticates as a server over the accepted socket `h` and returns the connection.
+///
+/// Does the same as `accept_over_handle`.
+pub fn accept_over(h: net.ConnHandle, auth: ServerAuth) -> Connection ! Error {
+    adopt(accept_over_handle(h, auth)?)
+}
+
+fn dial(a: Address) -> net.ConnHandle ! Error {
+    let path = socket_path(a)?
+    using var conn = net.connect_unix(path) catch {
+        e => fail Error.Io(e)
+    }
+    net.detach(mut conn)
+}
+
+fn connect_address(a: Address) -> *ConnectionHandle ! Error {
+    let h = connect_over_handle(dial(a)?, true)?
+    let wanted = address_guid(a)
+    if wanted.len > 0 && wanted != server_guid_on(h) {
+        shutdown_on(h)
+        fail Auth("the server guid {server_guid_on(h)} is not {wanted}")
+    }
+    h
+}
+
+/// Connects to the first of `addresses` that accepts, authenticates and calls `Hello`.
+///
+/// Only `unix` addresses are supported. An address with a `guid` key must match the guid the server announces. Fails with the error of the last address tried.
+pub fn connect_addresses(addresses: []Address) -> Connection ! Error {
+    var last = Error.Address("no address to connect to")
+    for a in addresses {
+        let h = connect_address(a) catch {
+            e => {
+                last = e
+                continue
+            }
+        }
+        return adopt(h)
+    }
+    fail last
+}
+
+/// Connects to the session bus named by `session_addresses`.
+///
+/// Fails as `session_addresses` and `connect_addresses` do.
+pub fn connect_session() -> Connection ! Error {
+    connect_addresses(session_addresses()?)
+}
+
+/// Connects to the system bus named by `system_addresses`.
+///
+/// Fails as `system_addresses` and `connect_addresses` do.
+pub fn connect_system() -> Connection ! Error {
+    connect_addresses(system_addresses()?)
+}

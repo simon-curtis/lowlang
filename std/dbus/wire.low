@@ -1,0 +1,485 @@
+import std/io
+import std/text
+import std/unicode
+
+const max_array_bytes = 67108864
+const max_message_bytes = 134217728
+
+/// The byte order a message is marshalled in.
+pub enum ByteOrder {
+    /// Least significant byte first, marked `l` in the first byte of a message.
+    Little
+    /// Most significant byte first, marked `B` in the first byte of a message.
+    Big
+}
+
+/// Marshalled bytes and the file descriptors their `UnixFd` values refer to.
+pub struct Encoded {
+    /// The marshalled bytes, with alignment measured from their first byte.
+    pub data: []u8
+    /// The file descriptors in index order, to be sent with the message.
+    pub fds: []i64
+}
+
+struct Writer {
+    out: []u8
+    big: bool
+    fds: []i64
+}
+
+struct Decoder {
+    data: []u8
+    at: i64
+    big: bool
+    fds: []i64
+}
+
+fn pad(w: *Writer, n: i64) {
+    let rem = w.out.len % n
+    if rem != 0 {
+        for _ in 0..n - rem {
+            push(mut w.out, 0)
+        }
+    }
+}
+
+fn put16(w: *Writer, v: i64) {
+    if w.big {
+        io.put_be16(mut w.out, v)
+    } else {
+        io.put_le16(mut w.out, v)
+    }
+}
+
+fn put32(w: *Writer, v: i64) {
+    if w.big {
+        io.put_be32(mut w.out, v)
+    } else {
+        io.put_le32(mut w.out, v)
+    }
+}
+
+fn put64(w: *Writer, v: i64) {
+    if w.big {
+        io.put_be64(mut w.out, v)
+    } else {
+        io.put_le64(mut w.out, v)
+    }
+}
+
+fn put_text(w: *Writer, s: str, long: bool) {
+    if long {
+        pad(w, 4)
+        put32(w, s.len)
+    } else {
+        push(mut w.out, u8(s.len))
+    }
+    text.append(mut w.out, s)
+    push(mut w.out, 0)
+}
+
+fn plain_text(s: str) ! Error {
+    if text.index_byte(s, 0) >= 0 {
+        fail Marshal("a string holds a NUL byte")
+    }
+    if !unicode.utf8_valid(s) {
+        fail Marshal("a string is not valid UTF-8")
+    }
+}
+
+fn conforms(v: Value, t: Type) -> bool {
+    if value_code(v) != type_code(t) {
+        return false
+    }
+    match t {
+        Array(element) => conforms_array(v, *element)
+        Struct(fields) => conforms_struct(v, fields)
+        DictEntry(key, value) => conforms_entry(v, *key, *value)
+        _ => true
+    }
+}
+
+fn conforms_entry(v: Value, key: Type, value: Type) -> bool {
+    match v {
+        DictEntry(k, x) => conforms(*k, key) && conforms(*x, value)
+        _ => false
+    }
+}
+
+fn conforms_array(v: Value, element: Type) -> bool {
+    match v {
+        Bytes(_) => type_code(element) == 'y'
+        Array(signature, _) => signature == type_signature(element)
+        _ => false
+    }
+}
+
+fn conforms_struct(v: Value, fields: []Type) -> bool {
+    match v {
+        Struct(values) => {
+            if values.len != fields.len {
+                return false
+            }
+            for i, f in fields {
+                if !conforms(values[i], f) {
+                    return false
+                }
+            }
+            true
+        }
+        _ => false
+    }
+}
+
+fn check_depth(depth: i64) ! Error {
+    if depth > 64 {
+        fail Marshal("containers are nested more than 64 deep")
+    }
+}
+
+fn write_fd(w: *Writer, fd: i64) {
+    pad(w, 4)
+    for i, known in w.fds {
+        if known == fd {
+            put32(w, i)
+            return
+        }
+    }
+    put32(w, w.fds.len)
+    push(mut w.fds, fd)
+}
+
+fn write_array(w: *Writer, element: str, items: []Value, depth: i64) ! Error {
+    let element_type = parse_element(element)?
+    pad(w, 4)
+    let length_at = w.out.len
+    put32(w, 0)
+    pad(w, alignment(element_type))
+    let start = w.out.len
+    for item in items {
+        if !conforms(item, element_type) {
+            fail Marshal("an array item does not have the element type {element}")
+        }
+        match item {
+            DictEntry(key, value) => write_entry(w, *key, *value, depth + 1)?
+            _ => write_value(w, item, depth)?
+        }
+    }
+    patch_length(w, length_at, w.out.len - start)?
+}
+
+fn patch_length(w: *Writer, at: i64, length: i64) ! Error {
+    if length > max_array_bytes {
+        fail TooLarge
+    }
+    if w.big {
+        io.set_be32(w.out, at, length)
+    } else {
+        io.set_le32(w.out, at, length)
+    }
+}
+
+fn write_bytes(w: *Writer, data: []u8) ! Error {
+    if data.len > max_array_bytes {
+        fail TooLarge
+    }
+    pad(w, 4)
+    put32(w, data.len)
+    io.append(mut w.out, data)
+}
+
+fn write_integer(w: *Writer, v: Value) -> bool ! Error {
+    match v {
+        Byte(b) => push(mut w.out, b)
+        Boolean(b) => {
+            pad(w, 4)
+            put32(w, if b { 1 } else { 0 })
+        }
+        Int16(n) => {
+            if n < -32768 || n > 32767 {
+                fail Marshal("INT16 {n} is out of range")
+            }
+            pad(w, 2)
+            put16(w, n)
+        }
+        UInt16(n) => {
+            pad(w, 2)
+            put16(w, i64(n))
+        }
+        Int32(n) => {
+            pad(w, 4)
+            put32(w, i64(n))
+        }
+        UInt32(n) => {
+            pad(w, 4)
+            put32(w, i64(n))
+        }
+        Int64(n) => {
+            pad(w, 8)
+            put64(w, n)
+        }
+        UInt64(n) => {
+            pad(w, 8)
+            put64(w, i64(n))
+        }
+        Double(d) => {
+            pad(w, 8)
+            put64(w, i64(text.float_bits(d)))
+        }
+        _ => return false
+    }
+    true
+}
+
+fn write_entry(w: *Writer, key: Value, value: Value, depth: i64) ! Error {
+    check_depth(depth)?
+    pad(w, 8)
+    write_value(w, key, depth)?
+    write_value(w, value, depth)?
+}
+
+fn write_value(w: *Writer, v: Value, depth: i64) ! Error {
+    if write_integer(w, v)? {
+        return
+    }
+    match v {
+        String(s) => {
+            plain_text(s)?
+            put_text(w, s, true)
+        }
+        ObjectPath(s) => {
+            if !valid_object_path(s) {
+                fail Marshal("{text.quote(s)} is not a valid object path")
+            }
+            put_text(w, s, true)
+        }
+        Signature(s) => {
+            parse_signature(s) catch {
+                _ => fail Marshal("{text.quote(s)} is not a valid signature")
+            }
+            put_text(w, s, false)
+        }
+        UnixFd(fd) => write_fd(w, fd)
+        Bytes(data) => write_bytes(w, data)?
+        Array(element, items) => {
+            check_depth(depth + 1)?
+            write_array(w, element, items, depth + 1)?
+        }
+        Struct(fields) => {
+            check_depth(depth + 1)?
+            if fields.len == 0 {
+                fail Marshal("a struct needs at least one field")
+            }
+            pad(w, 8)
+            for f in fields {
+                write_value(w, f, depth + 1)?
+            }
+        }
+        DictEntry(_, _) => fail Marshal("a dict entry is only valid as an array element")
+        Variant(inner) => {
+            check_depth(depth + 1)?
+            put_text(w, signature_of(*inner)?, false)
+            write_value(w, *inner, depth + 1)?
+        }
+        _ => {}
+    }
+}
+
+/// Marshals `values` in `order`, with each value aligned relative to the first byte of the result.
+///
+/// The result is the body of a message whose signature is `values_signature(values)`, and `Encoded.fds` lists the descriptors of its `UnixFd` values in index order. Fails with `Marshal` for a string with a NUL or invalid UTF-8, an invalid object path or signature, an `Int16` out of range, an array item of the wrong type, an empty struct, a dict entry outside an array, or containers nested more than 64 deep; with `Signature` for an array element that is not one complete type; and with `TooLarge` for an array over 64 MiB or a result over 128 MiB.
+pub fn encode(values: []Value, order: ByteOrder) -> Encoded ! Error {
+    let w = new(Writer { out: [], big: order == ByteOrder.Big, fds: [] })
+    for v in values {
+        write_value(w, v, 0)?
+    }
+    if w.out.len > max_message_bytes {
+        fail TooLarge
+    }
+    Encoded { data: w.out, fds: w.fds }
+}
+
+fn need(d: *Decoder, n: i64) ! Error {
+    if n < 0 || d.at + n > d.data.len {
+        fail Malformed("the message ends inside a value")
+    }
+}
+
+fn skip_padding(d: *Decoder, n: i64) ! Error {
+    let rem = d.at % n
+    if rem == 0 {
+        return
+    }
+    let count = n - rem
+    need(d, count)?
+    for i in 0..count {
+        if d.data[d.at + i] != 0 {
+            fail Malformed("padding holds a non-zero byte")
+        }
+    }
+    d.at += count
+}
+
+fn get16(d: *Decoder) -> i64 ! Error {
+    skip_padding(d, 2)?
+    need(d, 2)?
+    let v = if d.big { io.be16(d.data, d.at) } else { io.le16(d.data, d.at) }
+    d.at += 2
+    v
+}
+
+fn get32(d: *Decoder) -> i64 ! Error {
+    skip_padding(d, 4)?
+    need(d, 4)?
+    let v = if d.big { io.be32(d.data, d.at) } else { io.le32(d.data, d.at) }
+    d.at += 4
+    v
+}
+
+fn get64(d: *Decoder) -> u64 ! Error {
+    skip_padding(d, 8)?
+    need(d, 8)?
+    let v = if d.big { io.u64_be(d.data, d.at) } else { io.u64_le(d.data, d.at) }
+    d.at += 8
+    v
+}
+
+fn get_text(d: *Decoder, long: bool) -> str ! Error {
+    var length = 0
+    if long {
+        length = get32(d)?
+    } else {
+        need(d, 1)?
+        length = i64(d.data[d.at])
+        d.at += 1
+    }
+    need(d, length + 1)?
+    if d.data[d.at + length] != 0 {
+        fail Malformed("a string is not terminated by a NUL byte")
+    }
+    let s = str(d.data[d.at..d.at + length])
+    d.at += length + 1
+    plain_text(s) catch {
+        _ => fail Malformed("a string holds a NUL byte or is not valid UTF-8")
+    }
+    s
+}
+
+fn read_array(d: *Decoder, element: Type, depth: i64) -> Value ! Error {
+    let length = get32(d)?
+    if length > max_array_bytes {
+        fail TooLarge
+    }
+    skip_padding(d, alignment(element))?
+    need(d, length)?
+    let end = d.at + length
+    if type_code(element) == 'y' {
+        let data = io.buffer(length)
+        io.copy(data, d.data[d.at..end])
+        d.at = end
+        return Value.Bytes(data)
+    }
+    var items: []Value = []
+    for d.at < end {
+        push(mut items, read_value(d, element, depth)?)
+    }
+    if d.at != end {
+        fail Malformed("an array element runs past the end of the array")
+    }
+    Value.Array(type_signature(element), items)
+}
+
+fn read_value(d: *Decoder, t: Type, depth: i64) -> Value ! Error {
+    if depth > 64 {
+        fail Malformed("containers are nested more than 64 deep")
+    }
+    match t {
+        Byte => {
+            need(d, 1)?
+            let b = d.data[d.at]
+            d.at += 1
+            Value.Byte(b)
+        }
+        Boolean => {
+            let n = get32(d)?
+            if n > 1 {
+                fail Malformed("a BOOLEAN is neither 0 nor 1")
+            }
+            Value.Boolean(n == 1)
+        }
+        Int16 => {
+            let n = get16(d)?
+            Value.Int16(if n >= 32768 { n - 65536 } else { n })
+        }
+        UInt16 => Value.UInt16(u16(get16(d)?))
+        Int32 => Value.Int32(i32(get32(d)?))
+        UInt32 => Value.UInt32(u32(get32(d)?))
+        Int64 => Value.Int64(i64(get64(d)?))
+        UInt64 => Value.UInt64(get64(d)?)
+        Double => Value.Double(text.float_from_bits(get64(d)?))
+        String => Value.String(get_text(d, true)?)
+        ObjectPath => {
+            let s = get_text(d, true)?
+            if !valid_object_path(s) {
+                fail Malformed("{text.quote(s)} is not a valid object path")
+            }
+            Value.ObjectPath(s)
+        }
+        Signature => {
+            let s = get_text(d, false)?
+            parse_signature(s) catch {
+                _ => fail Malformed("{text.quote(s)} is not a valid signature")
+            }
+            Value.Signature(s)
+        }
+        UnixFd => {
+            let index = get32(d)?
+            if index >= d.fds.len {
+                fail Malformed("file descriptor index {index} has no descriptor")
+            }
+            Value.UnixFd(d.fds[index])
+        }
+        Variant => {
+            let signature = get_text(d, false)?
+            let inner = parse_type(signature) catch {
+                _ => fail Malformed("{text.quote(signature)} is not a single complete type")
+            }
+            Value.Variant(new(read_value(d, inner, depth + 1)?))
+        }
+        Array(element) => read_array(d, *element, depth + 1)?
+        Struct(fields) => {
+            skip_padding(d, 8)?
+            var values: []Value = []
+            for f in fields {
+                push(mut values, read_value(d, f, depth + 1)?)
+            }
+            Value.Struct(values)
+        }
+        DictEntry(key, value) => {
+            skip_padding(d, 8)?
+            let k = read_value(d, *key, depth + 1)?
+            let v = read_value(d, *value, depth + 1)?
+            Value.DictEntry(new(k), new(v))
+        }
+    }
+}
+
+fn decode_values(d: *Decoder, types: []Type) -> []Value ! Error {
+    var values: []Value = []
+    for t in types {
+        push(mut values, read_value(d, t, 0)?)
+    }
+    values
+}
+
+/// Unmarshals `data` as the values of `types` in `order`, with alignment measured from the first byte of `data`.
+///
+/// `fds` are the descriptors that arrived with the data, which `UnixFd` values index. `data` must be consumed exactly. Fails with `Malformed` when the data ends early or has bytes left over, a BOOLEAN is not 0 or 1, padding is not zero, a string is not NUL-terminated or valid UTF-8, an object path or signature is invalid, a file descriptor index has no descriptor, an array element runs past its array, or containers are nested more than 64 deep; and with `TooLarge` for an array length over 64 MiB.
+pub fn decode(types: []Type, data: []u8, fds: []i64, order: ByteOrder) -> []Value ! Error {
+    let d = new(Decoder { data, at: 0, big: order == ByteOrder.Big, fds })
+    let values = decode_values(d, types)?
+    if d.at != data.len {
+        fail Malformed("{data.len - d.at} bytes follow the last value")
+    }
+    values
+}

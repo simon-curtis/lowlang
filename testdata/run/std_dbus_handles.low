@@ -1,0 +1,194 @@
+import std/dbus
+import std/net
+
+const guid = "0123456789abcdef0123456789abcdef"
+
+struct Settings {
+    level: i64
+}
+
+fn show_error(e: dbus.Error) -> str {
+    match e {
+        Remote(name, message) => "{name}: {message}"
+        _ => "{e}"
+    }
+}
+
+fn describe_argument(a: dbus.ArgumentInfo) -> str {
+    "{a.direction} {a.signature} {a.name}"
+}
+
+fn describe_method(m: dbus.MethodInfo) -> str {
+    var arguments: []str = []
+    for a in m.arguments {
+        push(mut arguments, describe_argument(a))
+    }
+    "method {m.name} {arguments}"
+}
+
+fn describe_signal(s: dbus.SignalInfo) -> str {
+    "signal {s.name} {s.arguments.len}"
+}
+
+fn describe_property(p: dbus.PropertyInfo) -> str {
+    "property {p.name} {p.signature} {p.access}"
+}
+
+fn describe_interface(i: dbus.InterfaceInfo) -> str {
+    var lines: []str = [i.name]
+    for m in i.methods {
+        push(mut lines, "  {describe_method(m)}")
+    }
+    for s in i.signals {
+        push(mut lines, "  {describe_signal(s)}")
+    }
+    for p in i.properties {
+        push(mut lines, "  {describe_property(p)}")
+    }
+    "{lines}"
+}
+
+fn level_property(settings: *Settings) -> dbus.PropertySpec {
+    dbus.read_write_property("Level", "i", fn() -> dbus.Value ! dbus.Error { dbus.Value.Int32(i32(settings.level)) }, fn(v) ! dbus.Error {
+        settings.level = dbus.int_of(v)?
+    })
+}
+
+fn accept_in_background(h: net.ConnHandle, accepted: chan[*dbus.ConnectionHandle]) {
+    let c = dbus.accept_over_handle(h, dbus.ServerAuth { guid }) or {
+        close(accepted)
+        return
+    }
+    accepted <- c
+}
+
+fn reply_after_begin(h: net.ConnHandle, done: chan[bool]) {
+    using c = dbus.accept_over(h, dbus.ServerAuth { guid }) or panic("accept")
+    dbus.begin(c)
+    let ended = <-dbus.ended(c)
+    done <- true
+}
+
+fn call_error(h: *dbus.ConnectionHandle, path: str, interface: str, member: str) -> str {
+    let reply = dbus.call_on(h, dbus.method_call("", path, interface, member, [])) catch {
+        e => return "error {show_error(e)}"
+    }
+    "ok {reply.body}"
+}
+
+fn unanswered_calls() {
+    using var pair = net.socketpair() or panic("pair")
+    let first = net.detach(mut pair.first)
+    let second = net.detach(mut pair.second)
+    let done = chan[bool](1)
+    spawn reply_after_begin(second, done)
+    using c = dbus.connect_over(first, false) or panic("connect")
+    print("unique name of a direct connection: {bracketed(dbus.unique_name(c))}")
+    print("unhandled call: {call_error(c.handle, "/x", "org.example.I", "Member")}")
+    let options = dbus.CallOptions { timeout: 5000 }
+    let reply = dbus.call_with_on(c.handle, dbus.method_call("", "/x", "org.example.I", "Member", []), options) catch {
+        e => {
+            print("call_with_on: {show_error(e)}")
+            dbus.Message { kind: dbus.MessageType.MethodReturn }
+        }
+    }
+    dbus.shutdown(c)
+    dbus.shutdown(c)
+    let finished = <-done
+    print("server saw the close")
+}
+
+fn bracketed(s: str) -> str {
+    "[{s}]"
+}
+
+fn main() {
+    unanswered_calls()
+
+    using var pair = net.socketpair() or panic("pair")
+    let first = net.detach(mut pair.first)
+    let second = net.detach(mut pair.second)
+    let accepted = chan[*dbus.ConnectionHandle](1)
+    spawn accept_in_background(second, accepted)
+    let view = dbus.connect_over_handle(first, false) or panic("connect")
+    using client = dbus.adopt(view)
+    let found = <-accepted
+    let server = match found {
+        some(h) => h
+        none => panic("accept")
+    }
+    print("same view {client.handle == view}")
+
+    let settings = new(Settings { level: 3 })
+    let service: *dbus.Service = dbus.serve_on(server)
+    let spec = dbus.InterfaceSpec {
+        name: "org.example.Settings",
+        methods: [dbus.MethodSpec { name: "Reset", handler: fn(call) -> []dbus.Value ! dbus.Error {
+            settings.level = 0
+            []
+        } }],
+        properties: [
+            level_property(settings),
+        ],
+        signals: [dbus.SignalSpec { name: "Reset", signature: "" }],
+    }
+    dbus.export(service, "/org/example/Settings", spec) or panic("export")
+    dbus.begin_on(server)
+    dbus.begin_on(server)
+
+    print("guid {dbus.server_guid_on(client.handle) == guid}, fds {dbus.passes_fds_on(client.handle)}, unique name {bracketed(dbus.unique_name_on(client.handle))}")
+    dbus.ping_on(client.handle, "") or print("ping failed")
+    let id = dbus.machine_id_on(client.handle, "") or panic("machine id")
+    print("machine id {id.len} digits")
+    let level = dbus.get_property_on(client.handle, "", "/org/example/Settings", "org.example.Settings", "Level") or panic("get")
+    print("level {level}")
+    dbus.set_property_on(client.handle, "", "/org/example/Settings", "org.example.Settings", "Level", dbus.Value.Int32(9)) or panic("set")
+    let all = dbus.get_all_on(client.handle, "", "/org/example/Settings", "org.example.Settings") or panic("get all")
+    print("all {all}")
+
+    let xml = dbus.introspect_xml_on(client.handle, "", "/org/example/Settings") or panic("introspect xml")
+    print("xml {xml.len > 0}")
+    let node = dbus.introspect_on(client.handle, "", "/org/example/Settings") or panic("introspect")
+    for i in node.interfaces {
+        print(describe_interface(i))
+    }
+
+    let seen = chan[dbus.Message](4)
+    let id_of_filter = dbus.add_filter_on(client.handle, fn(m) {
+        if m.kind == dbus.MessageType.Signal {
+            seen <- m
+            return true
+        }
+        false
+    })
+    let announcement = dbus.properties_changed_signal("/org/example/Settings", "org.example.Settings", ["Level": dbus.Value.Int32(1)], ["Other"])
+    print("announcement {announcement.interface}.{announcement.member} {announcement.body}")
+    dbus.send_on(server, announcement) or panic("send")
+    let arrived = <-seen
+    match arrived {
+        some(m) => {
+            let changed: dbus.PropertiesChanged = dbus.properties_changed(m) or panic("decode")
+            print("changed {changed.interface} {changed.changed} {changed.invalidated}")
+        }
+        none => print("nothing arrived")
+    }
+    dbus.remove_filter_on(client.handle, id_of_filter)
+    dbus.remove_filter_on(client.handle, id_of_filter)
+    dbus.send_on(server, announcement) or panic("send")
+    print("after remove_filter_on, call still works: {call_error(client.handle, "/org/example/Settings", "org.freedesktop.DBus.Peer", "Ping")}")
+
+    dbus.unexport(service, "/org/example/Settings")
+    dbus.unexport(service, "/org/example/Settings")
+    print("after unexport: {call_error(client.handle, "/org/example/Settings", "org.example.Settings", "Reset")}")
+    dbus.export(service, "/org/example/Settings", spec) or panic("export again")
+    print("exported again: {call_error(client.handle, "/org/example/Settings", "org.example.Settings", "Reset")}")
+    dbus.stop_service(service)
+    dbus.stop_service(service)
+    print("after stop_service: {call_error(client.handle, "/org/example/Settings", "org.example.Settings", "Reset")}")
+    print("level after reset {settings.level}")
+
+    dbus.shutdown_on(client.handle)
+    let ended = <-dbus.ended_on(server)
+    dbus.shutdown_on(server)
+    print("both ended")
+}
