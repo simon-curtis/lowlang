@@ -37,13 +37,28 @@ export async function activate(context: ExtensionContext): Promise<void> {
     await stop();
     await start();
   });
+  const toggleMain = commands.registerCommand('lowlang.toggleMain', async () => {
+    const editor = window.activeTextEditor;
+    if (!client || !editor || editor.document.languageId !== 'low') {
+      return;
+    }
+    try {
+      await client.sendRequest('workspace/executeCommand', {
+        command: 'low.toggleMain',
+        arguments: [editor.document.uri.toString()],
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      window.showErrorMessage(reason);
+    }
+  });
   const reconfigure = workspace.onDidChangeConfiguration(async (event) => {
     if (event.affectsConfiguration('lowlang.server.path')) {
       await stop();
       await start();
     }
   });
-  context.subscriptions.push(restart, reconfigure);
+  context.subscriptions.push(restart, toggleMain, reconfigure);
   await start();
 }
 

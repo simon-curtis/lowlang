@@ -17,4 +17,14 @@ else
   vim.bo.cindent = true
 end
 
-vim.b.undo_ftplugin = "setlocal commentstring< expandtab< shiftwidth< tabstop< indentexpr< cindent<"
+vim.api.nvim_buf_create_user_command(0, "LowToggleMain", function()
+  local client = vim.lsp.get_clients({ bufnr = 0, name = "low" })[1]
+  if not client then
+    vim.notify("low lsp is not attached", vim.log.levels.WARN)
+    return
+  end
+  local command = { title = "Toggle fn main", command = "low.toggleMain", arguments = { vim.uri_from_bufnr(0) } }
+  client:exec_cmd(command, { bufnr = 0 })
+end, { desc = "Move the top-level statements into fn main, or fn main to the top level" })
+
+vim.b.undo_ftplugin = "setlocal commentstring< expandtab< shiftwidth< tabstop< indentexpr< cindent< | delcommand -buffer LowToggleMain"
