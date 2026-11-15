@@ -1,0 +1,207 @@
+import std/crypto
+import std/crypto/hash
+import std/crypto/prehash
+import std/io
+
+/// An SLH-DSA parameter set (FIPS 205). The `s` sets give small signatures and slow signing, the `f` sets give fast signing and larger signatures.
+pub enum Level {
+    /// SLH-DSA-SHA2-128s: public key 32 bytes, private key 64 bytes, signature 7856 bytes.
+    Sha2_128s
+    /// SLH-DSA-SHA2-128f: public key 32 bytes, private key 64 bytes, signature 17088 bytes.
+    Sha2_128f
+    /// SLH-DSA-SHA2-192s: public key 48 bytes, private key 96 bytes, signature 16224 bytes.
+    Sha2_192s
+    /// SLH-DSA-SHA2-192f: public key 48 bytes, private key 96 bytes, signature 35664 bytes.
+    Sha2_192f
+    /// SLH-DSA-SHA2-256s: public key 64 bytes, private key 128 bytes, signature 29792 bytes.
+    Sha2_256s
+    /// SLH-DSA-SHA2-256f: public key 64 bytes, private key 128 bytes, signature 49856 bytes.
+    Sha2_256f
+    /// SLH-DSA-SHAKE-128s: public key 32 bytes, private key 64 bytes, signature 7856 bytes.
+    Shake_128s
+    /// SLH-DSA-SHAKE-128f: public key 32 bytes, private key 64 bytes, signature 17088 bytes.
+    Shake_128f
+    /// SLH-DSA-SHAKE-192s: public key 48 bytes, private key 96 bytes, signature 16224 bytes.
+    Shake_192s
+    /// SLH-DSA-SHAKE-192f: public key 48 bytes, private key 96 bytes, signature 35664 bytes.
+    Shake_192f
+    /// SLH-DSA-SHAKE-256s: public key 64 bytes, private key 128 bytes, signature 29792 bytes.
+    Shake_256s
+    /// SLH-DSA-SHAKE-256f: public key 64 bytes, private key 128 bytes, signature 49856 bytes.
+    Shake_256f
+}
+
+/// Where the `n`-byte value `opt_rand` of `slh_sign_internal` comes from, `n` being 16, 24 or 32 bytes for the 128, 192 and 256 sets.
+pub enum Randomness {
+    /// Hedged signing: `opt_rand` is drawn from `crypto.random`, so signing the same message twice gives two signatures.
+    Hedged
+    /// Deterministic signing: `opt_rand` is the public seed `PK.seed`, so the signature is a function of the key and the message.
+    Deterministic
+    /// `opt_rand` is the given `n` bytes. Intended for known-answer tests.
+    Given([]u8)
+}
+
+/// An SLH-DSA key pair in the byte encodings of FIPS 205.
+pub struct Keys {
+    /// The seed the key pair is derived from, `SK.seed`, `SK.prf` and `PK.seed` in that order, `3n` bytes.
+    pub seed: []u8
+    /// The public key, `PK.seed` followed by `PK.root`, `2n` bytes.
+    pub public: []u8
+    /// The private key, `SK.seed`, `SK.prf`, `PK.seed` and `PK.root` in that order, `4n` bytes.
+    pub private: []u8
+}
+
+fn resolve(r: Randomness, p: Params, pk_seed: []u8) -> []u8 ! io.Error {
+    match r {
+        Hedged => crypto.random(p.n)
+        Deterministic => pk_seed
+        Given(rnd) => {
+            if rnd.len != p.n {
+                fail Invalid
+            }
+            rnd
+        }
+    }
+}
+
+fn generate_internal(p: Params, seed: []u8) -> Keys {
+    let n = p.n
+    let sk_seed = seed[..n]
+    let pk_seed = seed[2 * n..3 * n]
+    let c = Context { p, s: new_suite(p, pk_seed), sk_seed }
+    let adrs = new_address()
+    set_layer(adrs, p.d - 1)
+    let root = xmss_node(c, 0, height(p), adrs)
+    Keys { seed: join([seed]), public: join([pk_seed, root]), private: join([seed, root]) }
+}
+
+fn sign_prime(p: Params, private: []u8, m: []u8, r: Randomness) -> []u8 ! io.Error {
+    let n = p.n
+    if private.len != private_len(p) {
+        fail Invalid
+    }
+    let sk_seed = private[..n]
+    let sk_prf = private[n..2 * n]
+    let pk_seed = private[2 * n..3 * n]
+    let pk_root = private[3 * n..4 * n]
+    let opt_rand = resolve(r, p, pk_seed)?
+    let c = Context { p, s: new_suite(p, pk_seed), sk_seed }
+    let randomizer = c.s.prf_msg(sk_prf, opt_rand, m)
+    let digest = c.s.h_msg(randomizer, pk_root, m)
+    let fors_end = fors_bytes(p)
+    let tree_end = fors_end + tree_bytes(p)
+    let md = digest[..fors_end]
+    let idx_tree = low_bits(to_int(digest[fors_end..tree_end]), p.h - height(p))
+    let idx_leaf = i64(low_bits(to_int(digest[tree_end..tree_end + leaf_bytes(p)]), height(p)))
+    let adrs = new_address()
+    set_tree(adrs, idx_tree)
+    set_type(adrs, kind_fors_tree)
+    set_keypair(adrs, idx_leaf)
+    let fors_sig = fors_sign(c, md, adrs)
+    let fors_pk = fors_pk_from_sig(c, fors_sig, md, adrs)
+    let ht_sig = ht_sign(c, fors_pk, idx_tree, idx_leaf)
+    join([randomizer, fors_sig, ht_sig])
+}
+
+fn verify_prime(p: Params, public: []u8, m: []u8, signature: []u8) -> bool {
+    let n = p.n
+    if public.len != public_len(p) || signature.len != signature_len(p) {
+        return false
+    }
+    let pk_seed = public[..n]
+    let pk_root = public[n..2 * n]
+    let c = Context { p, s: new_suite(p, pk_seed), sk_seed: [] }
+    let randomizer = signature[..n]
+    let fors_len = p.k * (1 + p.a) * n
+    let fors_sig = signature[n..n + fors_len]
+    let ht_sig = signature[n + fors_len..]
+    let digest = c.s.h_msg(randomizer, pk_root, m)
+    let fors_end = fors_bytes(p)
+    let tree_end = fors_end + tree_bytes(p)
+    let md = digest[..fors_end]
+    let idx_tree = low_bits(to_int(digest[fors_end..tree_end]), p.h - height(p))
+    let idx_leaf = i64(low_bits(to_int(digest[tree_end..tree_end + leaf_bytes(p)]), height(p)))
+    let adrs = new_address()
+    set_tree(adrs, idx_tree)
+    set_type(adrs, kind_fors_tree)
+    set_keypair(adrs, idx_leaf)
+    let fors_pk = fors_pk_from_sig(c, fors_sig, md, adrs)
+    ht_verify(c, fors_pk, ht_sig, idx_tree, idx_leaf, pk_root)
+}
+
+/// Returns the size of a public key for `level`: 32, 48 or 64 bytes.
+pub fn public_key_size(level: Level) -> i64 {
+    public_len(params(level))
+}
+
+/// Returns the size of a private key for `level`: 64, 96 or 128 bytes.
+pub fn private_key_size(level: Level) -> i64 {
+    private_len(params(level))
+}
+
+/// Returns the size of a signature for `level`, from 7856 bytes for the 128s sets to 49856 bytes for the 256f sets.
+pub fn signature_size(level: Level) -> i64 {
+    signature_len(params(level))
+}
+
+/// Returns the key pair derived from `seed`, `SK.seed`, `SK.prf` and `PK.seed` in that order (`slh_keygen_internal`, FIPS 205).
+///
+/// The same seed always gives the same `Keys`. Fails with `Invalid` when `seed` is not `3n` bytes, 48, 72 or 96 bytes for the 128, 192 and 256 sets.
+pub fn generate_seeded(level: Level, seed: []u8) -> Keys ! io.Error {
+    let p = params(level)
+    if seed.len != 3 * p.n {
+        fail Invalid
+    }
+    generate_internal(p, seed)
+}
+
+/// Returns a new key pair for `level`, with the seed drawn from `crypto.random` (`slh_keygen`, FIPS 205).
+pub fn generate(level: Level) -> Keys {
+    let p = params(level)
+    let seed = crypto.random(3 * p.n)
+    generate_internal(p, seed)
+}
+
+/// Signs `message` with `private` and the context string `context` (`slh_sign`, FIPS 205).
+///
+/// The result is `signature_size(level)` bytes. Fails with `Invalid` when `private` has the wrong length, when `context` is longer than 255 bytes or when `randomness` is `Given` with a value that is not `n` bytes. The secret seeds only ever enter hash inputs: signing branches on no secret value and indexes no table with one.
+pub fn sign(level: Level, private: []u8, message: []u8, context: []u8, randomness: Randomness) -> []u8 ! io.Error {
+    let m_prime = prehash.pure_message(message, context)?
+    sign_prime(params(level), private, m_prime, randomness)
+}
+
+/// Signs the digest of `message` under the hash `h` with the context string `context` (`hash_slh_sign`, FIPS 205).
+///
+/// The signed message is the context, the object identifier of `h` and the digest, so a pre-hash signature never verifies as a pure one. The errors are those of `sign`.
+pub fn sign_prehash(level: Level, private: []u8, message: []u8, context: []u8, h: prehash.Hash, randomness: Randomness) -> []u8 ! io.Error {
+    let m_prime = prehash.prehashed_message(message, context, h)?
+    sign_prime(params(level), private, m_prime, randomness)
+}
+
+/// Signs `m_prime` as it is, without the context and pre-hash framing (`slh_sign_internal`, FIPS 205).
+///
+/// Intended for known-answer tests; use `sign` otherwise. The errors are those of `sign` except the context.
+pub fn sign_internal(level: Level, private: []u8, m_prime: []u8, randomness: Randomness) -> []u8 ! io.Error {
+    sign_prime(params(level), private, m_prime, randomness)
+}
+
+/// Returns whether `signature` is a valid signature of `message` and `context` under `public` (`slh_verify`, FIPS 205).
+///
+/// Returns `false`, without failing, for a public key or signature of the wrong length, a context longer than 255 bytes and any signature whose recomputed hypertree root differs from the public root.
+pub fn verify(level: Level, public: []u8, message: []u8, context: []u8, signature: []u8) -> bool {
+    let m_prime = prehash.pure_message(message, context) or return false
+    verify_prime(params(level), public, m_prime, signature)
+}
+
+/// Returns whether `signature` is a valid pre-hash signature of `message` under the hash `h` and `context` (`hash_slh_verify`, FIPS 205).
+///
+/// The failure cases are those of `verify`.
+pub fn verify_prehash(level: Level, public: []u8, message: []u8, context: []u8, h: prehash.Hash, signature: []u8) -> bool {
+    let m_prime = prehash.prehashed_message(message, context, h) or return false
+    verify_prime(params(level), public, m_prime, signature)
+}
+
+/// Returns whether `signature` is valid for `m_prime` as it is, without the context and pre-hash framing (`slh_verify_internal`, FIPS 205).
+pub fn verify_internal(level: Level, public: []u8, m_prime: []u8, signature: []u8) -> bool {
+    verify_prime(params(level), public, m_prime, signature)
+}

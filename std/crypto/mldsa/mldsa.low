@@ -1,0 +1,482 @@
+import std/crypto
+import std/crypto/hash
+import std/crypto/prehash
+import std/io
+
+/// An ML-DSA parameter set (FIPS 204).
+pub enum Level {
+    /// ML-DSA-44: public key 1312 bytes, private key 2560 bytes, signature 2420 bytes.
+    Dsa44
+    /// ML-DSA-65: public key 1952 bytes, private key 4032 bytes, signature 3309 bytes.
+    Dsa65
+    /// ML-DSA-87: public key 2592 bytes, private key 4896 bytes, signature 4627 bytes.
+    Dsa87
+}
+
+/// Where the 32-byte value `rnd` of `ML-DSA.Sign_internal` comes from.
+pub enum Randomness {
+    /// Hedged signing: `rnd` is drawn from `crypto.random`, so signing the same message twice gives two signatures.
+    Hedged
+    /// Deterministic signing: `rnd` is 32 zero bytes, so the signature is a function of the key and the message.
+    Deterministic
+    /// `rnd` is the given 32 bytes. Intended for known-answer tests.
+    Given([]u8)
+}
+
+/// An ML-DSA key pair in the byte encodings of FIPS 204.
+pub struct Keys {
+    /// The 32-byte seed `xi` the key pair is derived from, the compact form of the private key.
+    pub seed: []u8
+    /// The public key, `pk`, 1312, 1952 or 2592 bytes for ML-DSA-44, -65 and -87.
+    pub public: []u8
+    /// The expanded private key, `sk`, 2560, 4032 or 4896 bytes for ML-DSA-44, -65 and -87.
+    ///
+    /// It carries `rho`, the signing key `K`, the hash `tr` of the public key and the encodings of `s1`, `s2` and `t0`.
+    pub private: []u8
+}
+
+struct Scheme {
+    k: i64
+    l: i64
+    eta: i64
+    tau: i64
+    beta: i64
+    gamma1: i64
+    z_bits: i64
+    gamma2: i64
+    omega: i64
+    c_tilde: i64
+    zetas: []i64
+}
+
+struct Signer {
+    s: Scheme
+    a: [][]i64
+    s1: [][]i64
+    s2: [][]i64
+    t0: [][]i64
+    mu: []u8
+    rho: []u8
+}
+
+fn scheme(level: Level) -> Scheme {
+    let zetas = zeta_table()
+    match level {
+        Dsa44 => Scheme { k: 4, l: 4, eta: 2, tau: 39, beta: 78, gamma1: 131072, z_bits: 18, gamma2: 95232, omega: 80, c_tilde: 32, zetas }
+        Dsa65 => Scheme { k: 6, l: 5, eta: 4, tau: 49, beta: 196, gamma1: 524288, z_bits: 20, gamma2: 261888, omega: 55, c_tilde: 48, zetas }
+        Dsa87 => Scheme { k: 8, l: 7, eta: 2, tau: 60, beta: 120, gamma1: 524288, z_bits: 20, gamma2: 261888, omega: 75, c_tilde: 64, zetas }
+    }
+}
+
+fn eta_bits(s: Scheme) -> i64 {
+    if s.eta == 2 { 3 } else { 4 }
+}
+
+fn w1_bits(s: Scheme) -> i64 {
+    if s.gamma2 == 261888 { 4 } else { 6 }
+}
+
+fn public_len(s: Scheme) -> i64 {
+    32 + 320 * s.k
+}
+
+fn private_len(s: Scheme) -> i64 {
+    128 + 32 * ((s.k + s.l) * eta_bits(s) + 13 * s.k)
+}
+
+fn signature_len(s: Scheme) -> i64 {
+    s.c_tilde + 32 * s.l * s.z_bits + s.omega + s.k
+}
+
+fn copy_poly(f: []i64) -> []i64 {
+    let g: []i64 = __make(256)
+    for i in 0..256 {
+        g[i] = f[i]
+    }
+    g
+}
+
+fn transformed(zetas: []i64, polys: [][]i64) -> [][]i64 {
+    var out: [][]i64 = []
+    for p in polys {
+        let c = copy_poly(p)
+        ntt(zetas, c)
+        push(mut out, c)
+    }
+    out
+}
+
+fn matrix_times(s: Scheme, a: [][]i64, v: [][]i64) -> [][]i64 {
+    var out: [][]i64 = []
+    for i in 0..s.k {
+        let acc: []i64 = __make(256)
+        for j in 0..s.l {
+            multiply_add(acc, a[i * s.l + j], v[j])
+        }
+        inverse_ntt(s.zetas, acc)
+        push(mut out, acc)
+    }
+    out
+}
+
+fn w1_encode(s: Scheme, w1: [][]i64) -> []u8 {
+    let d = w1_bits(s)
+    let out: []u8 = __make(32 * d * s.k)
+    for i in 0..s.k {
+        encode(out, 32 * d * i, w1[i], d)
+    }
+    out
+}
+
+fn generate_internal(s: Scheme, xi: []u8) -> Keys {
+    let h = xof256([xi, [u8(s.k), u8(s.l)]], 128)
+    let rho = h[..32]
+    let rho_prime = h[32..96]
+    let key = h[96..]
+    let a = expand_a(s.k, s.l, rho)
+    let secrets = expand_s(s.k, s.l, s.eta, rho_prime)
+    let t = matrix_times(s, a, transformed(s.zetas, secrets.s1))
+    let public: []u8 = __make(public_len(s))
+    let private: []u8 = __make(private_len(s))
+    __memmove(public, rho)
+    __memmove(private, rho)
+    __memmove(private[32..], key)
+    let eta_len = 32 * eta_bits(s)
+    let s1_at = 128
+    let s2_at = s1_at + eta_len * s.l
+    let t0_at = s2_at + eta_len * s.k
+    for i in 0..s.k {
+        let t1: []i64 = __make(256)
+        let t0: []i64 = __make(256)
+        for n in 0..256 {
+            let v = canonical(t[i][n] + secrets.s2[i][n])
+            let high = (v + 4095) >> 13
+            t1[n] = high
+            t0[n] = 4096 - (v - (high << 13))
+        }
+        encode(public, 32 + 320 * i, t1, 10)
+        encode(private, t0_at + 416 * i, t0, 13)
+        encode(private, s2_at + eta_len * i, subtract_from(s.eta, secrets.s2[i]), eta_bits(s))
+    }
+    for i in 0..s.l {
+        encode(private, s1_at + eta_len * i, subtract_from(s.eta, secrets.s1[i]), eta_bits(s))
+    }
+    let tr = xof256([public], 64)
+    __memmove(private[64..], tr)
+    let seed: []u8 = __make(32)
+    __memmove(seed, xi)
+    Keys { seed, public, private }
+}
+
+fn unpack_eta(s: Scheme, b: []u8, at: i64, mut bad: i64) -> []i64 {
+    let raw = decode(b, at, eta_bits(s))
+    let f: []i64 = __make(256)
+    for n in 0..256 {
+        bad |= (2 * s.eta - raw[n]) >> 63
+        f[n] = s.eta - raw[n]
+    }
+    f
+}
+
+fn open_signer(s: Scheme, private: []u8, mu: []u8, rnd: []u8) -> Signer ! io.Error {
+    let eta_len = 32 * eta_bits(s)
+    let s2_at = 128 + eta_len * s.l
+    let t0_at = s2_at + eta_len * s.k
+    var bad = 0
+    var s1: [][]i64 = []
+    var s2: [][]i64 = []
+    var t0: [][]i64 = []
+    for i in 0..s.l {
+        push(mut s1, unpack_eta(s, private, 128 + eta_len * i, mut bad))
+    }
+    for i in 0..s.k {
+        push(mut s2, unpack_eta(s, private, s2_at + eta_len * i, mut bad))
+        push(mut t0, subtract_from(4096, decode(private, t0_at + 416 * i, 13)))
+    }
+    if bad != 0 {
+        fail Invalid
+    }
+    let a = expand_a(s.k, s.l, private[..32])
+    Signer {
+        s,
+        a,
+        s1: transformed(s.zetas, s1),
+        s2: transformed(s.zetas, s2),
+        t0: transformed(s.zetas, t0),
+        mu,
+        rho: xof256([private[32..64], rnd, mu], 64),
+    }
+}
+
+fn attempt(g: Signer, kappa: i64) -> []u8? {
+    let s = g.s
+    let zetas = s.zetas
+    let y = expand_mask(s.l, s.gamma1, s.z_bits, g.rho, kappa)
+    let w = matrix_times(s, g.a, transformed(zetas, y))
+    var w1: [][]i64 = []
+    for i in 0..s.k {
+        let h: []i64 = __make(256)
+        for n in 0..256 {
+            w[i][n] = canonical(w[i][n])
+            h[n] = high_bits(s.gamma2, w[i][n])
+        }
+        push(mut w1, h)
+    }
+    let c_tilde = xof256([g.mu, w1_encode(s, w1)], s.c_tilde)
+    let c = sample_in_ball(c_tilde, s.tau)
+    ntt(zetas, c)
+    var reject = 0
+    var z: [][]i64 = []
+    for i in 0..s.l {
+        let cs1: []i64 = __make(256)
+        multiply_add(cs1, c, g.s1[i])
+        inverse_ntt(zetas, cs1)
+        for n in 0..256 {
+            cs1[n] = centered(y[i][n] + cs1[n])
+        }
+        reject |= exceeds(cs1, s.gamma1 - s.beta)
+        push(mut z, cs1)
+    }
+    var wcs2: [][]i64 = []
+    for i in 0..s.k {
+        let cs2: []i64 = __make(256)
+        multiply_add(cs2, c, g.s2[i])
+        inverse_ntt(zetas, cs2)
+        let low: []i64 = __make(256)
+        for n in 0..256 {
+            cs2[n] = canonical(w[i][n] - cs2[n])
+            low[n] = low_bits(s.gamma2, cs2[n])
+        }
+        reject |= exceeds(low, s.gamma2 - s.beta)
+        push(mut wcs2, cs2)
+    }
+    if reject != 0 {
+        return none
+    }
+    var hints: [][]i64 = []
+    var ones = 0
+    for i in 0..s.k {
+        let ct0: []i64 = __make(256)
+        multiply_add(ct0, c, g.t0[i])
+        inverse_ntt(zetas, ct0)
+        let h: []i64 = __make(256)
+        for n in 0..256 {
+            ct0[n] = centered(ct0[n])
+            h[n] = make_hint(s.gamma2, canonical(wcs2[i][n] + ct0[n]), wcs2[i][n])
+            ones += h[n]
+        }
+        reject |= exceeds(ct0, s.gamma2)
+        push(mut hints, h)
+    }
+    if reject != 0 || ones > s.omega {
+        return none
+    }
+    let out: []u8 = __make(signature_len(s))
+    __memmove(out, c_tilde)
+    for i in 0..s.l {
+        encode(out, s.c_tilde + 32 * s.z_bits * i, subtract_from(s.gamma1, z[i]), s.z_bits)
+    }
+    encode_hint(out, s.c_tilde + 32 * s.z_bits * s.l, s.omega, hints)
+    some(out)
+}
+
+fn sign_mu_internal(s: Scheme, private: []u8, mu: []u8, rnd: []u8) -> []u8 ! io.Error {
+    if private.len != private_len(s) || mu.len != 64 || rnd.len != 32 {
+        fail Invalid
+    }
+    let g = open_signer(s, private, mu, rnd)?
+    var kappa = 0
+    for {
+        let signature = attempt(g, kappa)
+        match signature {
+            some(out) => return out
+            none => {}
+        }
+        kappa += s.l
+    }
+}
+
+fn verify_mu_internal(s: Scheme, public: []u8, mu: []u8, signature: []u8) -> bool {
+    if public.len != public_len(s) || signature.len != signature_len(s) || mu.len != 64 {
+        return false
+    }
+    let hints_at = s.c_tilde + 32 * s.z_bits * s.l
+    let hints = match decode_hint(signature, hints_at, s.omega, s.k) {
+        some(h) => h
+        none => return false
+    }
+    var z: [][]i64 = []
+    for i in 0..s.l {
+        let f = subtract_from(s.gamma1, decode(signature, s.c_tilde + 32 * s.z_bits * i, s.z_bits))
+        if exceeds(f, s.gamma1 - s.beta) != 0 {
+            return false
+        }
+        push(mut z, f)
+    }
+    let zetas = s.zetas
+    let a = expand_a(s.k, s.l, public[..32])
+    let c = sample_in_ball(signature[..s.c_tilde], s.tau)
+    ntt(zetas, c)
+    let az = transformed(zetas, z)
+    var w1: [][]i64 = []
+    for i in 0..s.k {
+        let acc: []i64 = __make(256)
+        for j in 0..s.l {
+            multiply_add(acc, a[i * s.l + j], az[j])
+        }
+        let t1 = decode(public, 32 + 320 * i, 10)
+        for n in 0..256 {
+            t1[n] = t1[n] << 13
+        }
+        ntt(zetas, t1)
+        for n in 0..256 {
+            acc[n] -= mont(c[n] * t1[n])
+        }
+        inverse_ntt(zetas, acc)
+        let h: []i64 = __make(256)
+        for n in 0..256 {
+            h[n] = use_hint(s.gamma2, hints[i][n], canonical(acc[n]))
+        }
+        push(mut w1, h)
+    }
+    let c_tilde = xof256([mu, w1_encode(s, w1)], s.c_tilde)
+    hash.equal(c_tilde, signature[..s.c_tilde])
+}
+
+fn resolve(r: Randomness) -> []u8 ! io.Error {
+    match r {
+        Hedged => crypto.random(32)
+        Deterministic => {
+            let zero: []u8 = __make(32)
+            zero
+        }
+        Given(rnd) => {
+            if rnd.len != 32 {
+                fail Invalid
+            }
+            rnd
+        }
+    }
+}
+
+fn message_digest(public: []u8, m_prime: []u8) -> []u8 {
+    xof256([xof256([public], 64), m_prime], 64)
+}
+
+fn sign_prime(s: Scheme, private: []u8, m_prime: []u8, rnd: []u8) -> []u8 ! io.Error {
+    if private.len != private_len(s) {
+        fail Invalid
+    }
+    let mu = xof256([private[64..128], m_prime], 64)
+    sign_mu_internal(s, private, mu, rnd)
+}
+
+/// Returns the size of a public key for `level`: 1312, 1952 or 2592 bytes.
+pub fn public_key_size(level: Level) -> i64 {
+    public_len(scheme(level))
+}
+
+/// Returns the size of an expanded private key for `level`: 2560, 4032 or 4896 bytes.
+pub fn private_key_size(level: Level) -> i64 {
+    private_len(scheme(level))
+}
+
+/// Returns the size of a signature for `level`: 2420, 3309 or 4627 bytes.
+pub fn signature_size(level: Level) -> i64 {
+    signature_len(scheme(level))
+}
+
+/// Returns the key pair derived from the 32-byte `seed` (`ML-DSA.KeyGen_internal`, FIPS 204).
+///
+/// The seed is the compact private key: the same seed always gives the same `Keys`. Fails with `Invalid` when `seed` is not 32 bytes.
+pub fn generate_seeded(level: Level, seed: []u8) -> Keys ! io.Error {
+    if seed.len != 32 {
+        fail Invalid
+    }
+    generate_internal(scheme(level), seed)
+}
+
+/// Returns a new key pair for `level`, with the seed drawn from `crypto.random` (`ML-DSA.KeyGen`, FIPS 204).
+pub fn generate(level: Level) -> Keys {
+    let seed = crypto.random(32)
+    generate_internal(scheme(level), seed)
+}
+
+/// Signs `message` with the expanded private key `private` and the context string `context` (`ML-DSA.Sign`, FIPS 204).
+///
+/// The result is `signature_size(level)` bytes. Fails with `Invalid` when `private` has the wrong length, when one of its secret coefficients is out of range, when `context` is longer than 255 bytes or when `randomness` is `Given` with a value that is not 32 bytes. Nothing that depends on the private key is branched on or used as a table index; the number of rejection-sampling rounds is the only thing signing time reveals, as FIPS 204 permits.
+pub fn sign(level: Level, private: []u8, message: []u8, context: []u8, randomness: Randomness) -> []u8 ! io.Error {
+    let m_prime = prehash.pure_message(message, context)?
+    let rnd = resolve(randomness)?
+    sign_prime(scheme(level), private, m_prime, rnd)
+}
+
+/// Signs the digest of `message` under the hash `h` with the context string `context` (`HashML-DSA.Sign`, FIPS 204).
+///
+/// The signed message is the context, the object identifier of `h` and the digest, so a pre-hash signature never verifies as a pure one. The errors are those of `sign`.
+pub fn sign_prehash(level: Level, private: []u8, message: []u8, context: []u8, h: prehash.Hash, randomness: Randomness) -> []u8 ! io.Error {
+    let m_prime = prehash.prehashed_message(message, context, h)?
+    let rnd = resolve(randomness)?
+    sign_prime(scheme(level), private, m_prime, rnd)
+}
+
+/// Signs `m_prime` as it is, without the context and pre-hash framing (`ML-DSA.Sign_internal`, FIPS 204).
+///
+/// Intended for known-answer tests; use `sign` otherwise. The errors are those of `sign` except the context.
+pub fn sign_internal(level: Level, private: []u8, m_prime: []u8, randomness: Randomness) -> []u8 ! io.Error {
+    let rnd = resolve(randomness)?
+    sign_prime(scheme(level), private, m_prime, rnd)
+}
+
+/// Signs the 64-byte message representative `mu` that `message_representative` returned for the public key of `private` (external-mu signing, FIPS 204).
+///
+/// Fails with `Invalid` when `mu` is not 64 bytes, and with the errors of `sign` otherwise.
+pub fn sign_mu(level: Level, private: []u8, mu: []u8, randomness: Randomness) -> []u8 ! io.Error {
+    let rnd = resolve(randomness)?
+    sign_mu_internal(scheme(level), private, mu, rnd)
+}
+
+/// Returns the 64-byte message representative `mu` of `message` and `context` under `public`, the value `sign_mu` and `verify_mu` take (FIPS 204).
+///
+/// Fails with `Invalid` when `public` has the wrong length or `context` is longer than 255 bytes.
+pub fn message_representative(level: Level, public: []u8, message: []u8, context: []u8) -> []u8 ! io.Error {
+    let s = scheme(level)
+    if public.len != public_len(s) {
+        fail Invalid
+    }
+    let m_prime = prehash.pure_message(message, context)?
+    message_digest(public, m_prime)
+}
+
+/// Returns whether `signature` is a valid signature of `message` and `context` under `public` (`ML-DSA.Verify`, FIPS 204).
+///
+/// Returns `false`, without failing, for a public key or signature of the wrong length, a signature whose hint encoding is malformed (a count above the limit, indices out of order or non-zero padding), a response with a coefficient outside the bound, a context longer than 255 bytes and a mismatch of the recomputed challenge.
+pub fn verify(level: Level, public: []u8, message: []u8, context: []u8, signature: []u8) -> bool {
+    let m_prime = prehash.pure_message(message, context) or return false
+    verify_prime(scheme(level), public, m_prime, signature)
+}
+
+/// Returns whether `signature` is a valid HashML-DSA signature of `message` under the hash `h` and `context` (`HashML-DSA.Verify`, FIPS 204).
+///
+/// The failure cases are those of `verify`.
+pub fn verify_prehash(level: Level, public: []u8, message: []u8, context: []u8, h: prehash.Hash, signature: []u8) -> bool {
+    let m_prime = prehash.prehashed_message(message, context, h) or return false
+    verify_prime(scheme(level), public, m_prime, signature)
+}
+
+/// Returns whether `signature` is valid for `m_prime` as it is, without the context and pre-hash framing (`ML-DSA.Verify_internal`, FIPS 204).
+pub fn verify_internal(level: Level, public: []u8, m_prime: []u8, signature: []u8) -> bool {
+    verify_prime(scheme(level), public, m_prime, signature)
+}
+
+/// Returns whether `signature` is valid for the 64-byte message representative `mu` (external-mu verification, FIPS 204).
+pub fn verify_mu(level: Level, public: []u8, mu: []u8, signature: []u8) -> bool {
+    verify_mu_internal(scheme(level), public, mu, signature)
+}
+
+fn verify_prime(s: Scheme, public: []u8, m_prime: []u8, signature: []u8) -> bool {
+    if public.len != public_len(s) {
+        return false
+    }
+    verify_mu_internal(s, public, message_digest(public, m_prime), signature)
+}
