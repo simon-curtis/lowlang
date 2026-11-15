@@ -390,6 +390,10 @@ let copy = str(bytes(name))
 - `s.len` is the length in bytes, `s[i]` reads a byte as `u8`, and `s[a..b]` shares a byte range.
 - `for c in s` visits code points as `u32`; `for i, c in s` also binds each code point's byte offset. Invalid UTF-8 yields U+FFFD for one byte.
 - `"{expr}"` interpolates a value of any type; `{{` and `}}` are literal braces. `print(expr)` writes the same text followed by a newline.
+- String and character literals take the escapes `\n`, `\t`, `\r`, `\0`, `\\`, `\"` and `\'`, and three that name a value by its hex digits, which may be upper or lower case:
+  - `\xhh` is one byte. In a string it may make bytes that are not UTF-8, as `"\xff"` does; in a character literal it is the code point `0` to `0xff`.
+  - `\uhhhh` and `\Uhhhhhhhh` are one code point, written in a string as its UTF-8 bytes, so `"é"` is `"é"` and `"\U0001F600"` is `"😀"`. A surrogate (`D800` to `DFFF`) or a value above `10FFFF` is an error.
+  - Each takes exactly its number of digits. These are the spellings `text.unquote` reads and `std/regex` takes in a pattern, and `text.quote` writes `\xhh` for control characters and bytes that are not UTF-8.
 - `"{expr,width:format}"` aligns and formats the value, as in `"hello {name,13} your age is {age:##}"`, `"{price,10:f2}"`, `"{id:x8}"` and `"{n,-6}|"`. Both parts are optional, and `{x,}` and `{x:}` are errors.
   - The expression ends at the first `,` or `:` outside brackets, which is where the width starts; the width ends at the next `:` or at the closing brace; the format is all the text up to the closing brace, so it may contain `,` and `.`.
   - A width is a non-zero decimal integer with an optional `-` and optional surrounding spaces. A positive width right-aligns and a negative one left-aligns, padding with spaces to that many code points. A longer text is never cut. A width applies to every type, including `str` and the default text of a struct.
