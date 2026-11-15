@@ -97,7 +97,7 @@ The source at release N builds with release N-1, so the compiler uses a language
 
 ## Website
 
-`site/` is a static site. `site/gen` is a Low program that writes the pages, and Vite+ bundles them with their styles and scripts into `site/dist`, which is what Cloudflare Pages serves. The `test` workflow runs the fixtures and the `compiler/tests` programs on every push and pull request to `main`. The `site` workflow builds the site and deploys `site/dist` on every push to `main`, whether or not `test` passes. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
+`site/` is a static site. `site/gen` is a Low program that writes the pages, and Vite+ bundles them with their styles and scripts into `site/dist`, which is what Cloudflare Pages serves. The `test` workflow runs the fixtures, the `compiler/tests` programs, five minutes of `compiler/lowfuzz` seeded from the run id and a build of the site on every push and pull request to `main`; a failed fuzz run uploads the findings as the `lowfuzz-findings` artifact. The `fuzz` workflow runs `compiler/lowfuzz` for an hour every night, or for the `time` given to a manual run, and opens an issue labelled `fuzz` with the findings when it fails. The `checklist` workflow fails a pull request while its body has an unticked item, so the website items of `.github/pull_request_template.md` are ticked by hand before merge. The `site` workflow builds the site and deploys `site/dist` on every push to `main`, whether or not `test` passes. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
 
 ```sh
 cd site
