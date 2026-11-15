@@ -1,0 +1,234 @@
+import std/builder
+import std/text
+
+const idna_code_points = 0x110000
+const idna_mapping_start_offset = 0
+const idna_mapping_status_offset = idna_mapping_start_offset + word_size
+const idna_mapping_length_offset = idna_mapping_status_offset + 1
+const idna_mapping_pool_offset = idna_mapping_length_offset + 1
+const idna_mapping_record_size = idna_mapping_pool_offset + u16_width
+const idna_class_start_offset = 0
+const idna_class_value_offset = idna_class_start_offset + word_size
+const idna_class_record_size = idna_class_value_offset + u16_width
+const idna_bidi_shift = 0
+const idna_bidi_mask = 31
+const idna_joining_shift = 5
+const idna_joining_mask = 7
+const idna_mark_shift = 8
+
+pub const idna_layout_file = "idna_layout.low"
+
+pub fn idna_tables() -> []str {
+    ["idna_mapping.bin", "idna_pool.bin", "idna_classes.bin"]
+}
+
+fn idna_status_names() -> []str {
+    ["valid", "mapped", "deviation", "ignored", "disallowed"]
+}
+
+fn idna_bidi_names() -> []str {
+    [
+        "L", "R", "AL", "EN", "ES", "ET", "AN", "CS", "NSM", "BN", "B", "S"
+        "WS", "ON", "LRE", "LRO", "RLE", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"
+    ]
+}
+
+fn idna_joining_names() -> []str {
+    ["U", "C", "D", "L", "R", "T"]
+}
+
+fn idna_bidi_long_name(name: str) -> str {
+    match name {
+        "Left_To_Right" => "L"
+        "Right_To_Left" => "R"
+        "Arabic_Letter" => "AL"
+        "European_Terminator" => "ET"
+        _ => name
+    }
+}
+
+struct MappingRange {
+    first: i64
+    last: i64
+    status: i64
+    mapping: str
+}
+
+struct MappingState {
+    ranges: []MappingRange
+}
+
+fn generate_idna(dir: str, output: str) ! Error {
+    let ranges = idna_mapping_ranges("{dir}/IdnaMappingTable.txt")?
+    let classes = idna_class_values(dir)?
+    let pool = new(TextPool { data: [], offsets: [:] })
+    var records: []u8 = []
+    for r in ranges {
+        let encoded = pool_text(pool, r.mapping)?
+        append_u32(mut records, r.first)
+        push(mut records, u8(r.status))
+        push(mut records, u8(r.mapping.len))
+        append_u16(mut records, encoded)
+    }
+    var class_records: []u8 = []
+    var previous = -1
+    for c in 0..idna_code_points {
+        let value = i64(classes[c])
+        if value == previous {
+            continue
+        }
+        append_u32(mut class_records, c)
+        append_u16(mut class_records, value)
+        previous = value
+    }
+    var sections = named_sections(idna_tables(), [records, pool.data, class_records])
+    push(mut sections, Section { name: idna_layout_file, data: bytes(idna_layout_source()) })
+    write_sections(output, sections)?
+}
+
+struct TextPool {
+    data: []u8
+    offsets: [str: i64]
+}
+
+fn pool_text(p: *TextPool, value: str) -> i64 ! Error {
+    if value.len > 0xFF {
+        fail Failed("mapping of {value.len} bytes exceeds the table's limit")
+    }
+    match p.offsets[value] {
+        some(at) => {
+            return at
+        }
+        none => {}
+    }
+    let at = p.data.len
+    if at > 0xFFFF {
+        fail Failed("mapping pool overflows 16-bit offsets")
+    }
+    p.offsets[value] = at
+    text.append(mut p.data, value)
+    at
+}
+
+fn idna_mapping_ranges(path: str) -> []MappingRange ! Error {
+    let state = new(MappingState { ranges: [] })
+    each_line(path, fn(fields: []str) ! Error { read_mapping_line(state, fields)? })?
+    var merged: []MappingRange = []
+    var next = 0
+    for r in state.ranges {
+        if r.first != next {
+            fail Failed("IdnaMappingTable.txt: range starts at {r.first}, want {next}")
+        }
+        next = r.last + 1
+        if merged.len > 0 {
+            let tail = merged[merged.len - 1]
+            if tail.status == r.status && tail.mapping == r.mapping {
+                continue
+            }
+        }
+        push(mut merged, r)
+    }
+    if next != idna_code_points {
+        fail Failed("IdnaMappingTable.txt: ranges end at {next}, want {idna_code_points}")
+    }
+    merged
+}
+
+fn read_mapping_line(state: *MappingState, fields: []str) ! Error {
+    if fields.len < 2 {
+        fail Failed("short IdnaMappingTable line {fields}")
+    }
+    let cut = text.cut(fields[0], "..")
+    let first = parse_code(cut.before)?
+    let last = if cut.found { parse_code(cut.after)? } else { first }
+    let status = index_of(idna_status_names(), fields[1])?
+    var mapping = ""
+    if fields.len > 2 {
+        var out = builder.builder()
+        for c in parse_codes(fields[2])? {
+            builder.write_char(mut out, u32(c))
+        }
+        mapping = builder.to_str(out)
+    }
+    push(mut state.ranges, MappingRange { first, last, status, mapping })
+}
+
+fn idna_class_values(dir: str) -> []u32 ! Error {
+    var values: []u32 = []
+    for i in 0..idna_code_points {
+        push(mut values, 0)
+    }
+    read_bidi_classes("{dir}/DerivedBidiClass.txt", values)?
+    each_range("{dir}/DerivedJoiningType.txt", fn(first: i64, last: i64, fields: []str) ! Error {
+        let kind = index_of(idna_joining_names(), fields[0])?
+        set_class_field(values, first, last, idna_joining_mask, idna_joining_shift, kind)
+    })?
+    each_line("{dir}/UnicodeData.txt", fn(fields: []str) ! Error {
+        if fields.len > 2 && text.starts_with(fields[2], "M") {
+            let c = parse_code(fields[0])?
+            set_class_field(values, c, c, 1, idna_mark_shift, 1)
+        }
+    })?
+    values
+}
+
+fn set_class_field(values: []u32, first: i64, last: i64, mask: i64, shift: i64, value: i64) {
+    for c in first..last + 1 {
+        values[c] = u32(i64(values[c]) & ~(mask << shift) | value << shift)
+    }
+}
+
+fn read_bidi_classes(path: str, values: []u32) ! Error {
+    let data = read_source(path)?
+    let base = path_base(path)
+    for raw in text.lines(data) {
+        var line = raw
+        if text.starts_with(raw, "# @missing:") {
+            line = text.trim_prefix(raw, "# @missing:")
+        } else {
+            line = text.cut(raw, "#").before
+        }
+        if text.trim(line) == "" {
+            continue
+        }
+        let fields = text.split(line, ';')
+        if fields.len < 2 {
+            fail Failed("{base}: short line {text.quote(raw)}")
+        }
+        let range = text.trim(fields[0])
+        let name = idna_bidi_long_name(text.trim(text.cut(fields[1], "#").before))
+        let cut = text.cut(range, "..")
+        let first = parse_code(cut.before)?
+        let last = if cut.found { parse_code(cut.after)? } else { first }
+        let kind = index_of(idna_bidi_names(), name)?
+        set_class_field(values, first, last, idna_bidi_mask, idna_bidi_shift, kind)
+    }
+}
+
+pub fn idna_layout_source() -> str {
+    var constants = [
+        low_constant("mapping_record_size", idna_mapping_record_size, LowType.Int)
+        low_constant("mapping_start_offset", idna_mapping_start_offset, LowType.Int)
+        low_constant("mapping_status_offset", idna_mapping_status_offset, LowType.Int)
+        low_constant("mapping_length_offset", idna_mapping_length_offset, LowType.Int)
+        low_constant("mapping_pool_offset", idna_mapping_pool_offset, LowType.Int)
+        low_constant("class_record_size", idna_class_record_size, LowType.Int)
+        low_constant("class_start_offset", idna_class_start_offset, LowType.Int)
+        low_constant("class_value_offset", idna_class_value_offset, LowType.Int)
+        low_constant("bidi_shift", idna_bidi_shift, LowType.Int)
+        low_constant("bidi_mask", idna_bidi_mask, LowType.Int)
+        low_constant("joining_shift", idna_joining_shift, LowType.Int)
+        low_constant("joining_mask", idna_joining_mask, LowType.Int)
+        low_constant("mark_shift", idna_mark_shift, LowType.Int)
+    ]
+    for c in class_constants("status_", idna_status_names(), LowType.Int) {
+        push(mut constants, c)
+    }
+    for c in class_constants("bidi_", idna_bidi_names(), LowType.Int) {
+        push(mut constants, c)
+    }
+    for c in class_constants("joining_", idna_joining_names(), LowType.Int) {
+        push(mut constants, c)
+    }
+    layout_source(constants, idna_tables())
+}

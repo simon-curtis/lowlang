@@ -1,0 +1,462 @@
+import std/io
+import std/net/punycode
+import std/text
+import std/unicode
+
+/// The check of UTS #46 that a domain name failed.
+///
+/// Each variant is named for the check, and its comment gives the status code of the UTS #46 conformance file.
+pub enum Error {
+    /// `V1`: a label from Punycode is not in Unicode normalisation form C.
+    NotNormalized
+    /// `V2`: with `check_hyphens`, the third and fourth code points of a label are both `-`.
+    HyphensInThirdAndFourth
+    /// `V3`: with `check_hyphens`, a label begins or ends with `-`.
+    HyphenAtEdge
+    /// `V4`: without `check_hyphens`, a label begins with `xn--`.
+    AcePrefix
+    /// `V5`: a label from Punycode contains `.`.
+    ContainsDot
+    /// `V6`: a label begins with a combining mark.
+    LeadingMark
+    /// `V7`: a code point is disallowed, or is a status the processing does not allow in a label.
+    DisallowedCodePoint
+    /// `U1`: with `use_std3_ascii_rules`, an ASCII code point is not a lowercase letter, a digit or `-`.
+    AsciiRule
+    /// `P4`: a label that begins with `xn--` holds a non-ASCII code point, is not valid Punycode, or decodes to an empty or all-ASCII label.
+    InvalidPunycode
+    /// `B1`: in a bidirectional domain name, a label does not begin with a left-to-right or right-to-left letter.
+    BidiStart
+    /// `B2`: a right-to-left label holds a code point that RFC 5893 does not allow in one.
+    BidiRtlCharacter
+    /// `B3`: a right-to-left label does not end with a letter or number, apart from trailing nonspacing marks.
+    BidiRtlEnd
+    /// `B4`: a right-to-left label mixes European and Arabic-Indic digits.
+    BidiMixedDigits
+    /// `B5`: a left-to-right label holds a code point that RFC 5893 does not allow in one.
+    BidiLtrCharacter
+    /// `B6`: a left-to-right label does not end with a letter or European digit, apart from trailing nonspacing marks.
+    BidiLtrEnd
+    /// `C1`: a ZERO WIDTH NON-JOINER is not in a context RFC 5892 allows.
+    ZwnjContext
+    /// `C2`: a ZERO WIDTH JOINER does not follow a virama.
+    ZwjContext
+    /// `X4_2`: `to_unicode` found an empty label that is not the root label.
+    EmptyLabel
+    /// `A3`: a label could not be encoded as Punycode.
+    PunycodeEncoding
+    /// `A4_1`: with `verify_dns_length`, the name without a root dot is empty or longer than 253 bytes.
+    DomainLength
+    /// `A4_2`: with `verify_dns_length`, a label is empty or longer than 63 bytes.
+    LabelLength
+}
+
+/// The flags of UTS #46 processing.
+///
+/// The defaults are those of the conformance file, which enables every check and uses nontransitional processing. The WHATWG URL standard sets `check_hyphens`, `use_std3_ascii_rules` and `verify_dns_length` to `false`.
+pub struct Options {
+    /// Reject labels with `-` in the third and fourth positions, or at either end. Without it, reject labels that begin with `xn--`.
+    pub check_hyphens: bool = true
+    /// Apply the bidirectional rules of RFC 5893 to the labels of a name that has a right-to-left label.
+    pub check_bidi: bool = true
+    /// Apply the ContextJ rules of RFC 5892 to ZERO WIDTH NON-JOINER and ZERO WIDTH JOINER.
+    pub check_joiners: bool = true
+    /// Allow only `a-z`, `0-9` and `-` among the ASCII code points of a label.
+    pub use_std3_ascii_rules: bool = true
+    /// For `to_ascii`, require every label to be 1 to 63 bytes and the name 1 to 253 bytes without a root dot.
+    pub verify_dns_length: bool = true
+    /// Map the deviation characters `ß`, `ς`, ZERO WIDTH JOINER and ZERO WIDTH NON-JOINER as IDNA2003 did, and `ẞ` to `ss`.
+    pub transitional: bool = false
+}
+
+/// The result of `to_unicode`: the converted name, which is produced even when a check failed, and the first check that failed.
+pub struct Unicode {
+    /// The processed name, with the labels that begin with `xn--` decoded. Disallowed code points stay in it.
+    pub text: str
+    /// The first failed check, or `none` when the name is valid.
+    pub error: Error?
+}
+
+struct Entry {
+    status: i64
+    at: i64
+    length: i64
+}
+
+struct Label {
+    text: str
+    ace: bool
+    skipped: bool
+}
+
+struct Processed {
+    labels: []Label
+    error: Error?
+}
+
+fn record_index(table: str, record_size: i64, start_offset: i64, c: u32) -> i64 {
+    var low = 0
+    var high = table.len / record_size
+    for high - low > 1 {
+        let middle = (low + high) / 2
+        if io.u32_le_str(table, middle * record_size + start_offset) <= c {
+            low = middle
+        } else {
+            high = middle
+        }
+    }
+    low * record_size
+}
+
+fn entry(c: u32) -> Entry {
+    let table = idna_mapping_table()
+    let at = record_index(table, mapping_record_size, mapping_start_offset, c)
+    Entry {
+        status: i64(table[at + mapping_status_offset])
+        at: i64(io.u16_le_str(table, at + mapping_pool_offset))
+        length: i64(table[at + mapping_length_offset])
+    }
+}
+
+fn class_of(c: u32) -> i64 {
+    let table = idna_classes_table()
+    let at = record_index(table, class_record_size, class_start_offset, c)
+    i64(io.u16_le_str(table, at + class_value_offset))
+}
+
+fn bidi_of(class: i64) -> i64 {
+    class >> bidi_shift & bidi_mask
+}
+
+fn joining_of(class: i64) -> i64 {
+    class >> joining_shift & joining_mask
+}
+
+fn is_mark(class: i64) -> bool {
+    class >> mark_shift & 1 == 1
+}
+
+fn mapped(domain: str, transitional: bool) -> str {
+    var out: []u8 = []
+    let pool = idna_pool_table()
+    for c in domain {
+        let e = entry(c)
+        if e.status == status_ignored {
+            continue
+        }
+        let replaced = e.status == status_mapped || e.status == status_deviation && transitional
+        if !replaced {
+            text.append_char(mut out, c)
+        } else if transitional && c == 0x1E9E {
+            text.append(mut out, "ss")
+        } else {
+            text.append(mut out, pool[e.at..e.at + e.length])
+        }
+    }
+    __str_view(out)
+}
+
+fn note(p: *Processed, e: Error) {
+    if p.error == none {
+        p.error = e
+    }
+}
+
+fn decode_labels(p: *Processed, name: str) {
+    for part in text.split(name, '.') {
+        var label = Label { text: part, ace: false, skipped: false }
+        if text.starts_with(part, "xn--") {
+            decode_ace(p, mut label)
+        }
+        push(mut p.labels, label)
+    }
+}
+
+fn decode_ace(p: *Processed, mut label: Label) {
+    if !text.is_ascii(label.text) {
+        note(p, Error.InvalidPunycode)
+        label.skipped = true
+        return
+    }
+    let decoded = punycode.decode(label.text[4..]) catch {
+        e => {
+            note(p, Error.InvalidPunycode)
+            label.skipped = true
+            return
+        }
+    }
+    label.text = decoded
+    label.ace = true
+    if decoded == "" || text.is_ascii(decoded) {
+        note(p, Error.InvalidPunycode)
+    }
+}
+
+fn is_bidi_domain(labels: []Label) -> bool {
+    for label in labels {
+        if label.skipped {
+            continue
+        }
+        for c in label.text {
+            let bidi = bidi_of(class_of(c))
+            if bidi == bidi_r || bidi == bidi_al || bidi == bidi_an {
+                return true
+            }
+        }
+    }
+    false
+}
+
+fn code_points(s: str) -> []u32 {
+    var out: []u32 = []
+    for c in s {
+        push(mut out, c)
+    }
+    out
+}
+
+fn ldh(c: u32) -> bool {
+    c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-'
+}
+
+fn validate(label: Label, o: Options, bidi_domain: bool) -> Error? {
+    let cps = code_points(label.text)
+    if label.ace && unicode.nfc(label.text) != label.text {
+        return Error.NotNormalized
+    }
+    if o.check_hyphens {
+        if cps.len >= 4 && cps[2] == '-' && cps[3] == '-' {
+            return Error.HyphensInThirdAndFourth
+        }
+        if cps[0] == '-' || cps[cps.len - 1] == '-' {
+            return Error.HyphenAtEdge
+        }
+    } else if text.starts_with(label.text, "xn--") {
+        return Error.AcePrefix
+    }
+    if text.index_byte(label.text, '.') >= 0 {
+        return Error.ContainsDot
+    }
+    let classes = classes_of(cps)
+    if is_mark(classes[0]) {
+        return Error.LeadingMark
+    }
+    let invalid = invalid_code_point(cps, o, label.ace)
+    if invalid != none {
+        return invalid
+    }
+    if o.check_joiners {
+        let joiner = joiner_error(cps, classes)
+        if joiner != none {
+            return joiner
+        }
+    }
+    if o.check_bidi && bidi_domain {
+        return bidi_error(classes)
+    }
+    none
+}
+
+fn classes_of(cps: []u32) -> []i64 {
+    var out: []i64 = []
+    for c in cps {
+        push(mut out, class_of(c))
+    }
+    out
+}
+
+fn invalid_code_point(cps: []u32, o: Options, ace: bool) -> Error? {
+    let nontransitional = ace || !o.transitional
+    for c in cps {
+        if o.use_std3_ascii_rules && c < 0x80 && !ldh(c) {
+            return Error.AsciiRule
+        }
+        let status = entry(c).status
+        let allowed = status == status_valid || status == status_deviation && nontransitional
+        if !allowed {
+            return Error.DisallowedCodePoint
+        }
+    }
+    none
+}
+
+fn skip_joining(classes: []i64, from: i64, step: i64) -> i64 {
+    var i = from
+    for i >= 0 && i < classes.len && joining_of(classes[i]) == joining_t {
+        i += step
+    }
+    i
+}
+
+fn joining_at(classes: []i64, i: i64, first: i64, second: i64) -> bool {
+    if i < 0 || i >= classes.len {
+        return false
+    }
+    let kind = joining_of(classes[i])
+    kind == first || kind == second
+}
+
+fn after_virama(cps: []u32, i: i64) -> bool {
+    i > 0 && unicode.combining_class(cps[i - 1]) == 9
+}
+
+fn joiner_error(cps: []u32, classes: []i64) -> Error? {
+    for i, c in cps {
+        if c == 0x200D && !after_virama(cps, i) {
+            return Error.ZwjContext
+        }
+        if c != 0x200C || after_virama(cps, i) {
+            continue
+        }
+        let before = skip_joining(classes, i - 1, -1)
+        let after = skip_joining(classes, i + 1, 1)
+        if !joining_at(classes, before, joining_l, joining_d) || !joining_at(classes, after, joining_r, joining_d) {
+            return Error.ZwnjContext
+        }
+    }
+    none
+}
+
+fn rtl_allowed(bidi: i64) -> bool {
+    bidi == bidi_r || bidi == bidi_al || bidi == bidi_an || bidi == bidi_en || bidi == bidi_es || bidi == bidi_cs || bidi == bidi_et || bidi == bidi_on || bidi == bidi_bn || bidi == bidi_nsm
+}
+
+fn ltr_allowed(bidi: i64) -> bool {
+    bidi == bidi_l || bidi == bidi_en || bidi == bidi_es || bidi == bidi_cs || bidi == bidi_et || bidi == bidi_on || bidi == bidi_bn || bidi == bidi_nsm
+}
+
+fn last_before_marks(bidis: []i64) -> i64 {
+    var i = bidis.len - 1
+    for i > 0 && bidis[i] == bidi_nsm {
+        i -= 1
+    }
+    bidis[i]
+}
+
+fn bidi_error(classes: []i64) -> Error? {
+    var bidis: []i64 = []
+    for class in classes {
+        push(mut bidis, bidi_of(class))
+    }
+    if bidis[0] == bidi_r || bidis[0] == bidi_al {
+        return rtl_error(bidis)
+    }
+    if bidis[0] != bidi_l {
+        return Error.BidiStart
+    }
+    for bidi in bidis {
+        if !ltr_allowed(bidi) {
+            return Error.BidiLtrCharacter
+        }
+    }
+    let last = last_before_marks(bidis)
+    if last != bidi_l && last != bidi_en {
+        return Error.BidiLtrEnd
+    }
+    none
+}
+
+fn rtl_error(bidis: []i64) -> Error? {
+    var european = false
+    var arabic = false
+    for bidi in bidis {
+        if !rtl_allowed(bidi) {
+            return Error.BidiRtlCharacter
+        }
+        european = european || bidi == bidi_en
+        arabic = arabic || bidi == bidi_an
+    }
+    let last = last_before_marks(bidis)
+    if last != bidi_r && last != bidi_al && last != bidi_en && last != bidi_an {
+        return Error.BidiRtlEnd
+    }
+    if european && arabic {
+        return Error.BidiMixedDigits
+    }
+    none
+}
+
+fn process(domain: str, o: Options, report_empty: bool) -> *Processed {
+    let p = new(Processed { labels: [], error: none })
+    let normalized = unicode.nfc(mapped(domain, o.transitional))
+    decode_labels(p, normalized)
+    let bidi_domain = o.check_bidi && is_bidi_domain(p.labels)
+    for i, label in p.labels {
+        if label.text == "" {
+            let root = i == p.labels.len - 1 && p.labels.len > 1
+            if report_empty && !root {
+                note(p, Error.EmptyLabel)
+            }
+            continue
+        }
+        if label.skipped {
+            continue
+        }
+        match validate(label, o, bidi_domain) {
+            some(e) => note(p, e)
+            none => {}
+        }
+    }
+    p
+}
+
+fn joined(labels: []Label) -> str {
+    var parts: []str = []
+    for label in labels {
+        push(mut parts, label.text)
+    }
+    text.join(parts, ".")
+}
+
+/// Converts `domain` to Unicode as UTS #46 ToUnicode does: it maps and normalises the name, decodes each label that begins with `xn--`, and checks every label.
+///
+/// The text is always produced. `error` is the first failed check, or `none`. Disallowed code points are left in the text, and so are the labels whose Punycode is invalid. The label separators `.`, `U+3002`, `U+FF0E` and `U+FF61` all become `.`, and ASCII capitals become lowercase. A name with an empty label that is not the root label has `EmptyLabel`, and so has the empty name.
+pub fn to_unicode(domain: str, o: Options) -> Unicode {
+    let p = process(domain, o, true)
+    Unicode { text: joined(p.labels), error: p.error }
+}
+
+fn ace_label(label: str) -> str ! Error {
+    if text.is_ascii(label) {
+        return label
+    }
+    let encoded = punycode.encode(label) catch {
+        e => fail PunycodeEncoding
+    }
+    "xn--{encoded}"
+}
+
+fn dns_length_error(labels: []str) -> Error? {
+    for label in labels {
+        if label.len == 0 || label.len > 63 {
+            return Error.LabelLength
+        }
+    }
+    let length = text.join(labels, ".").len
+    if length < 1 || length > 253 {
+        return Error.DomainLength
+    }
+    none
+}
+
+/// Converts `domain` to ASCII as UTS #46 ToASCII does: it processes the name as `to_unicode` does, and writes each label that has a non-ASCII code point as `xn--` followed by its Punycode.
+///
+/// Fails with the first failed check. With `verify_dns_length`, an empty label, which includes the one after a root dot, fails with `LabelLength`, and a name longer than 253 bytes fails with `DomainLength`. The result is lowercase and has no non-ASCII bytes.
+pub fn to_ascii(domain: str, o: Options) -> str ! Error {
+    let p = process(domain, o, false)
+    match p.error {
+        some(e) => fail e
+        none => {}
+    }
+    var labels: []str = []
+    for label in p.labels {
+        push(mut labels, ace_label(label.text)?)
+    }
+    if o.verify_dns_length {
+        match dns_length_error(labels) {
+            some(e) => fail e
+            none => {}
+        }
+    }
+    text.join(labels, ".")
+}
