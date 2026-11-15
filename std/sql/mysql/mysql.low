@@ -1,0 +1,797 @@
+import std/io
+import std/net
+import std/sql
+import std/sql/driver
+import std/text
+import std/tls
+
+/// What the driver knows about one connection, kept current as the connection runs.
+///
+/// A `State` made by `state` is passed in `Config.session`; the connection fills it when the login succeeds and updates `schema` and `in_transaction` after every statement. `ping` and `reset` run on the connection as calls, so they fail with `sql.Error.Busy` while another call runs and `sql.Error.Closed` once the connection is closed.
+pub struct State {
+    /// The server's version string, such as `8.4.13` or `11.8.9-MariaDB-ubu2404`. Empty before the login.
+    pub server: str
+    /// Whether the server is MariaDB, which the greeting tells.
+    pub mariadb: bool
+    /// The server's thread id for the connection, the number `KILL QUERY` takes.
+    pub connection_id: i64
+    /// The current default schema, from the login and from the server's session tracking. Empty when none is selected.
+    pub schema: str
+    /// Whether a transaction is open, from the status flags of the last reply.
+    pub in_transaction: bool
+    /// Sends `COM_PING` and waits for the server's answer.
+    pub ping: fn() ! sql.Error
+    /// Sends `COM_RESET_CONNECTION`, which drops the session's variables, temporary tables, locks and prepared statements, then selects UTC again.
+    pub reset: fn() ! sql.Error
+}
+
+/// How `connect_with` reaches the server.
+pub struct Config {
+    /// The TLS settings. When set the connection upgrades to TLS before the login; an empty `server_name` is replaced with `sql.Options.host`. When absent the connection stays plain.
+    pub tls: tls.Config? = none
+    /// A state that the connection fills and keeps current. Absent by default.
+    pub session: *State? = none
+}
+
+struct Statement {
+    id: i64
+    parameters: i64
+}
+
+struct Conn {
+    stream: io.Stream
+    reader: *io.Reader
+    sequence: i64
+    capabilities: i64
+    extended: i64
+    thread: i64
+    status: i64
+    schema: str
+    version: str
+    mariadb: bool
+    secure: bool
+    statements: [str: Statement]
+    cancel: fn(i64)
+    session: *driver.Session
+    state: *State
+}
+
+const statement_capacity = 64
+const long_data_threshold = 1048576
+const long_data_chunk = 1048576
+
+fn closed_call() ! sql.Error {
+    fail Closed
+}
+
+/// Returns a `State` for a connection that is not open yet.
+pub fn state() -> *State {
+    new(State { server: "", mariadb: false, connection_id: 0, schema: "", in_transaction: false, ping: closed_call, reset: closed_call })
+}
+
+fn abandon(c: *Conn, timed_out: bool) -> sql.Error {
+    if !c.session.closed {
+        c.session.closed = true
+        if timed_out {
+            c.cancel(c.thread)
+        }
+        c.stream.close()
+    }
+    if timed_out { sql.Error.Timeout } else { sql.Error.Closed }
+}
+
+fn write_packet(c: *Conn, data: []u8) ! sql.Error {
+    io.write_all(c.stream, data) catch {
+        TimedOut => fail abandon(c, true)
+        _ => fail abandon(c, false)
+    }
+}
+
+fn send(c: *Conn, payload: []u8) ! sql.Error {
+    var at = 0
+    for {
+        var size = payload.len - at
+        if size > chunk {
+            size = chunk
+        }
+        var b: []u8 = []
+        io.put_le24(mut b, size)
+        push(mut b, u8(c.sequence))
+        c.sequence = (c.sequence + 1) & 255
+        io.append(mut b, payload[at..at + size])
+        write_packet(c, b)?
+        at += size
+        if size < chunk {
+            break
+        }
+    }
+}
+
+fn read_bytes(c: *Conn, n: i64) -> []u8 ! sql.Error {
+    io.read_exact(c.reader, n) catch {
+        TimedOut => fail abandon(c, true)
+        _ => fail abandon(c, false)
+    }
+}
+
+fn receive(c: *Conn) -> Packet ! sql.Error {
+    var body: []u8 = []
+    var first = true
+    for {
+        let header = read_bytes(c, 4)?
+        let size = io.le24(header, 0)
+        if i64(header[3]) != c.sequence {
+            abandon(c, false)
+            fail Protocol
+        }
+        c.sequence = (c.sequence + 1) & 255
+        let part = read_bytes(c, size)?
+        if first && size < chunk {
+            return Packet { body: part, at: 0 }
+        }
+        first = false
+        io.append(mut body, part)
+        if body.len > max_allowed {
+            abandon(c, false)
+            fail Protocol
+        }
+        if size < chunk {
+            break
+        }
+    }
+    Packet { body, at: 0 }
+}
+
+fn command(c: *Conn, payload: []u8) ! sql.Error {
+    c.sequence = 0
+    send(c, payload)?
+}
+
+fn publish(c: *Conn) {
+    c.state.schema = c.schema
+    c.state.in_transaction = (c.status & status_in_transaction) != 0
+}
+
+fn accept(c: *Conn, ok: Ok) {
+    c.status = ok.status
+    match ok.schema {
+        some(name) => {
+            c.schema = name
+        }
+        none => {}
+    }
+    publish(c)
+}
+
+fn failure(c: *Conn, mut p: Packet) -> sql.Error {
+    server_error(mut p, c.capabilities)
+}
+
+fn expect_ok(c: *Conn) -> Ok ! sql.Error {
+    var p = receive(c)?
+    if p.body.len == 0 {
+        abandon(c, false)
+        fail Protocol
+    }
+    if p.body[0] == 0xFF {
+        fail failure(c, mut p)
+    }
+    if p.body[0] != 0 {
+        abandon(c, false)
+        fail Protocol
+    }
+    let ok = ok_packet(mut p, c.capabilities)?
+    accept(c, ok)
+    ok
+}
+
+fn row_text(c: *Conn, mut p: Packet, fields: []Field) -> []sql.Value ! sql.Error {
+    let row: []sql.Value = __make(fields.len)
+    for i, f in fields {
+        match lenenc_bytes(mut p)? {
+            some(raw) => {
+                row[i] = decode_text(f, raw)?
+            }
+            none => {
+                row[i] = sql.Value.Null
+            }
+        }
+    }
+    row
+}
+
+fn row_binary(c: *Conn, mut p: Packet, fields: []Field) -> []sql.Value ! sql.Error {
+    take(mut p, 1)?
+    let bitmap = take(mut p, (fields.len + 9) / 8)?
+    let row: []sql.Value = __make(fields.len)
+    for i, f in fields {
+        let bit = i + 2
+        if (bitmap[bit / 8] >> u8(bit % 8) & 1) != 0 {
+            row[i] = sql.Value.Null
+        } else {
+            row[i] = decode_binary(f, mut p)?
+        }
+    }
+    row
+}
+
+fn column_definitions(c: *Conn, count: i64) -> []Field ! sql.Error {
+    let fields: []Field = __make(count)
+    let tracked = (c.extended & extended_metadata) != 0
+    for i in 0..count {
+        var p = receive(c)?
+        fields[i] = field_of(mut p, tracked)?
+    }
+    if (c.capabilities & deprecate_eof) == 0 {
+        receive(c)?
+    }
+    fields
+}
+
+fn refuse_local_file(c: *Conn) -> sql.Error {
+    send(c, []) or return sql.Error.Closed
+    receive(c) or return sql.Error.Closed
+    sql.Error.Unsupported
+}
+
+fn result_set(c: *Conn, mut first: Packet, binary: bool, describe: fn([]sql.Column), visit: fn([]sql.Column, []sql.Value) -> bool) -> Ok ! sql.Error {
+    let count = lenenc(mut first)?
+    if count < 1 {
+        abandon(c, false)
+        fail Protocol
+    }
+    let fields = column_definitions(c, count)?
+    let columns = columns_of(fields)
+    describe(columns)
+    var visiting = true
+    var failure_found: sql.Error? = none
+    for {
+        var p = receive(c)?
+        if p.body.len == 0 {
+            abandon(c, false)
+            fail Protocol
+        }
+        if p.body[0] == 0xFF {
+            fail failure(c, mut p)
+        }
+        if p.body[0] == 0xFE && p.body.len < chunk {
+            let ok = terminator(mut p, c.capabilities)?
+            accept(c, ok)
+            match failure_found {
+                some(e) => fail e
+                none => return ok
+            }
+        }
+        if !visiting {
+            continue
+        }
+        let row = if binary { row_binary(c, mut p, fields) } else { row_text(c, mut p, fields) } catch {
+            Conversion => {
+                failure_found = sql.Error.Conversion
+                visiting = false
+                continue
+            }
+            _ => {
+                abandon(c, false)
+                fail Protocol
+            }
+        }
+        if !visit(columns, row) {
+            visiting = false
+        }
+    }
+}
+
+fn results(c: *Conn, binary: bool, describe: fn([]sql.Column), visit: fn([]sql.Column, []sql.Value) -> bool) -> i64 ! sql.Error {
+    var affected = 0
+    for {
+        var p = receive(c)?
+        if p.body.len == 0 {
+            abandon(c, false)
+            fail Protocol
+        }
+        var ok = Ok { affected: 0, last_id: 0, status: 0, warnings: 0, schema: none }
+        let lead = p.body[0]
+        if lead == 0xFF {
+            fail failure(c, mut p)
+        } else if lead == 0 {
+            ok = ok_packet(mut p, c.capabilities)?
+            accept(c, ok)
+            affected += ok.affected
+        } else if lead == 0xFB {
+            fail refuse_local_file(c)
+        } else {
+            ok = result_set(c, mut p, binary, describe, visit)?
+        }
+        if (ok.status & status_more_results) == 0 {
+            return affected
+        }
+    }
+}
+
+fn evict(c: *Conn) ! sql.Error {
+    for old, s in c.statements {
+        command(c, command_id(command_close, s.id))?
+        delete(mut c.statements, old)
+        break
+    }
+}
+
+fn prepare(c: *Conn, sql_text: str) -> Statement ! sql.Error {
+    match c.statements[sql_text] {
+        some(s) => return s
+        none => {}
+    }
+    if c.statements.len >= statement_capacity {
+        evict(c)?
+    }
+    command(c, command_text(command_prepare, sql_text))?
+    var p = receive(c)?
+    if p.body.len == 0 {
+        abandon(c, false)
+        fail Protocol
+    }
+    if p.body[0] == 0xFF {
+        fail failure(c, mut p)
+    }
+    take(mut p, 1)?
+    let id = int32(mut p)?
+    let columns = int16(mut p)?
+    let parameters = int16(mut p)?
+    if parameters > 0 {
+        column_definitions(c, parameters)?
+    }
+    if columns > 0 {
+        column_definitions(c, columns)?
+    }
+    let s = Statement { id, parameters }
+    c.statements[sql_text] = s
+    s
+}
+
+fn long_data(v: sql.Value) -> []u8? {
+    match v {
+        Text(s) => if s.len >= long_data_threshold { bytes(s) } else { none }
+        Bytes(b) => if b.len >= long_data_threshold { b } else { none }
+        _ => none
+    }
+}
+
+fn send_long_data(c: *Conn, s: Statement, index: i64, data: []u8) ! sql.Error {
+    var at = 0
+    for at < data.len {
+        var size = data.len - at
+        if size > long_data_chunk {
+            size = long_data_chunk
+        }
+        var b: []u8 = []
+        push(mut b, u8(command_long_data))
+        io.put_le32(mut b, s.id)
+        io.put_le16(mut b, index)
+        io.append(mut b, data[at..at + size])
+        command(c, b)?
+        at += size
+    }
+}
+
+fn execute_payload(s: Statement, values: []sql.Value, longs: []bool) -> []u8 ! sql.Error {
+    var b: []u8 = []
+    push(mut b, u8(command_execute))
+    io.put_le32(mut b, s.id)
+    push(mut b, 0)
+    io.put_le32(mut b, 1)
+    if values.len == 0 {
+        return b
+    }
+    let bitmap: []u8 = __make((values.len + 7) / 8)
+    var types: []u8 = []
+    var data: []u8 = []
+    for i, v in values {
+        let p = parameter(v)?
+        push(mut types, u8(p.code))
+        push(mut types, if p.unsigned { 0x80 } else { 0 })
+        if p.null {
+            bitmap[i / 8] |= u8(1 << (i % 8))
+        } else if !longs[i] {
+            io.append(mut data, p.body)
+        }
+    }
+    io.append(mut b, bitmap)
+    push(mut b, 1)
+    io.append(mut b, types)
+    io.append(mut b, data)
+    b
+}
+
+fn reset_statement(c: *Conn, s: Statement) ! sql.Error {
+    command(c, command_id(command_reset_statement, s.id))?
+    expect_ok(c)?
+}
+
+fn run_prepared(c: *Conn, sql_text: str, values: []sql.Value, describe: fn([]sql.Column), visit: fn([]sql.Column, []sql.Value) -> bool) -> i64 ! sql.Error {
+    let s = prepare(c, sql_text)?
+    if s.parameters != values.len {
+        fail Conversion
+    }
+    let longs: []bool = __make(values.len)
+    var any_long = false
+    for i, v in values {
+        match long_data(v) {
+            some(data) => {
+                longs[i] = true
+                any_long = true
+                send_long_data(c, s, i, data)?
+            }
+            none => {}
+        }
+    }
+    let payload = execute_payload(s, values, longs)?
+    command(c, payload)?
+    results(c, true, describe, visit) catch {
+        e => {
+            match e {
+                Server(_, _) => {
+                    if any_long {
+                        reset_statement(c, s) or {}
+                    }
+                }
+                _ => {}
+            }
+            fail e
+        }
+    }
+}
+
+fn run(c: *Conn, sql_text: str, values: []sql.Value, describe: fn([]sql.Column), visit: fn([]sql.Column, []sql.Value) -> bool) -> i64 ! sql.Error {
+    if values.len == 0 {
+        command(c, command_text(command_query, sql_text))?
+        return results(c, false, describe, visit)
+    }
+    run_prepared(c, sql_text, values, describe, visit)
+}
+
+fn query(c: *Conn, sql_text: str, values: []sql.Value) -> sql.Rows ! sql.Error {
+    driver.collect(fn(describe, visit) ! sql.Error { run(c, sql_text, values, describe, visit)? })
+}
+
+fn execute(c: *Conn, sql_text: str, values: []sql.Value) -> i64 ! sql.Error {
+    run(c, sql_text, values, driver.ignore_columns, driver.ignore_row)
+}
+
+fn each(c: *Conn, sql_text: str, values: []sql.Value, visit: fn([]sql.Column, []sql.Value) -> bool) ! sql.Error {
+    run(c, sql_text, values, driver.ignore_columns, visit)?
+}
+
+fn ping(c: *Conn) ! sql.Error {
+    command(c, [u8(command_ping)])?
+    expect_ok(c)?
+}
+
+fn select_utc(c: *Conn) ! sql.Error {
+    execute(c, "SET time_zone = '+00:00'", [])?
+}
+
+fn reset(c: *Conn) ! sql.Error {
+    command(c, [u8(command_reset_connection)])?
+    expect_ok(c)?
+    c.statements = [:]
+    select_utc(c)?
+}
+
+fn fatal(e: sql.Error) -> bool {
+    match e {
+        Protocol => true
+        _ => false
+    }
+}
+
+fn terminate(c: *Conn) {
+    if c.session.closed {
+        return
+    }
+    c.session.closed = true
+    if !c.session.busy {
+        c.sequence = 0
+        send(c, [u8(command_quit)]) or {}
+    }
+    c.stream.close()
+}
+
+fn upgrade(c: *Conn, o: sql.Options, config: tls.Config, caps: i64) ! sql.Error {
+    var named = config
+    if named.server_name.len == 0 {
+        named.server_name = o.host
+    }
+    send(c, ssl_request(caps, c.extended))?
+    let session = tls.client_handle(c.stream, named) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    c.stream = tls.stream_on(session)
+    c.reader = io.reader(c.stream)
+    c.secure = true
+}
+
+fn authenticate(c: *Conn, o: sql.Options, g: Greeting) ! sql.Error {
+    var plugin = g.plugin
+    var nonce = g.nonce
+    let blank: []u8 = []
+    let initial = first_response(plugin, o.password, nonce, c.secure) catch {
+        Unsupported => blank
+        e => fail e
+    }
+    send(c, handshake_response(c.capabilities, c.extended, o, initial, plugin))?
+    for {
+        var p = receive(c)?
+        if p.body.len == 0 {
+            abandon(c, false)
+            fail Protocol
+        }
+        let lead = p.body[0]
+        if lead == 0 {
+            let ok = ok_packet(mut p, c.capabilities)?
+            accept(c, ok)
+            return
+        }
+        if lead == 0xFF {
+            let e = failure(c, mut p)
+            match e {
+                Server(code, _) => {
+                    if code == "28000" {
+                        fail Authentication
+                    }
+                }
+                _ => {}
+            }
+            fail e
+        }
+        if lead == 0xFE {
+            take(mut p, 1)?
+            plugin = cstring(mut p)?
+            var data = rest(mut p)
+            if data.len > 0 && data[data.len - 1] == 0 {
+                data = data[..data.len - 1]
+            }
+            nonce = data
+            if nonce.len < 20 && plugin != "mysql_clear_password" && plugin != "client_ed25519" {
+                fail Protocol
+            }
+            send(c, first_response(plugin, o.password, nonce, c.secure)?)?
+            continue
+        }
+        if lead != 1 {
+            abandon(c, false)
+            fail Protocol
+        }
+        take(mut p, 1)?
+        let more = rest(mut p)
+        if plugin == "client_ed25519" {
+            send(c, ed25519_signature(o.password, more))?
+        } else if plugin == "caching_sha2_password" && more.len == 1 && more[0] == 3 {
+            continue
+        } else if plugin == "caching_sha2_password" && more.len == 1 && more[0] == 4 {
+            if c.secure {
+                send(c, clear_password(o.password))?
+            } else {
+                send(c, [2])?
+                var key = receive(c)?
+                if key.body.len == 0 || key.body[0] != 1 {
+                    abandon(c, false)
+                    fail Protocol
+                }
+                take(mut key, 1)?
+                send(c, sealed_password(rest(mut key), o.password, nonce)?)?
+            }
+        } else if plugin == "sha256_password" {
+            send(c, sealed_password(more, o.password, nonce)?)?
+        } else {
+            abandon(c, false)
+            fail Protocol
+        }
+    }
+}
+
+fn negotiate(g: Greeting, o: sql.Options, secure: bool) -> i64 ! sql.Error {
+    var wanted = long_password | found_rows | long_flag | protocol_41 | transactions | secure_connection | multi_statements | multi_results | ps_multi_results | plugin_auth | connect_attrs | plugin_auth_lenenc_client_data | session_track | deprecate_eof
+    if o.database.len > 0 {
+        wanted |= connect_with_db
+    }
+    if secure {
+        wanted |= ssl
+    }
+    let caps = wanted & g.capabilities
+    if (caps & protocol_41) == 0 || (caps & plugin_auth) == 0 || (caps & secure_connection) == 0 {
+        fail Unsupported
+    }
+    if secure && (caps & ssl) == 0 {
+        fail Unsupported
+    }
+    caps
+}
+
+fn is_mariadb(g: Greeting) -> bool {
+    text.starts_with(g.version, "5.5.5-") || text.contains(g.version, "MariaDB")
+}
+
+fn login(c: *Conn, o: sql.Options, config: Config) ! sql.Error {
+    var p = receive(c)?
+    if p.body.len > 0 && p.body[0] == 0xFF {
+        fail failure(c, mut p)
+    }
+    let g = greeting(mut p)?
+    c.thread = g.thread
+    c.version = g.version
+    c.mariadb = is_mariadb(g)
+    c.status = g.status
+    if c.mariadb && (g.capabilities & 1) == 0 {
+        c.extended = g.extended & extended_metadata
+    }
+    let secure = match config.tls {
+        some(t) => true
+        none => false
+    }
+    c.capabilities = negotiate(g, o, secure)?
+    match config.tls {
+        some(t) => upgrade(c, o, t, c.capabilities)?
+        none => {}
+    }
+    if (c.capabilities & connect_with_db) != 0 {
+        c.schema = o.database
+    }
+    authenticate(c, o, g)?
+    select_utc(c)?
+    c.state.server = c.version
+    c.state.mariadb = c.mariadb
+    c.state.connection_id = c.thread
+    publish(c)
+}
+
+fn dialect(c: *Conn) -> sql.Dialect {
+    if c.mariadb { sql.mariadb() } else { sql.mysql() }
+}
+
+fn open(s: io.Stream, o: sql.Options, config: Config, cancel: fn(i64)) -> sql.Connection ! sql.Error {
+    let shared = match config.session {
+        some(st) => st
+        none => state()
+    }
+    let c = new(Conn {
+        stream: s
+        reader: io.reader(s)
+        sequence: 0
+        capabilities: 0
+        extended: 0
+        thread: 0
+        status: 0
+        schema: ""
+        version: ""
+        mariadb: false
+        secure: false
+        statements: [:]
+        cancel
+        session: driver.session()
+        state: shared
+    })
+    let abandoned = fn() { abandon(c, false) }
+    let closed = fn() { terminate(c) }
+    driver.establish(c.session, fatal, abandoned, closed, fn() ! sql.Error { login(c, o, config)? })?
+    shared.ping = fn() ! sql.Error {
+        driver.call(c.session, fatal, abandoned, fn() ! sql.Error { ping(c)? })?
+    }
+    shared.reset = fn() ! sql.Error {
+        driver.call(c.session, fatal, abandoned, fn() ! sql.Error { reset(c)? })?
+    }
+    let raw = sql.ConnectionHandle {
+        dialect: dialect(c)
+        query: fn(sql_text, values) -> sql.Rows ! sql.Error { query(c, sql_text, values) }
+        each: fn(sql_text, values, visit) ! sql.Error { each(c, sql_text, values, visit)? }
+        execute: fn(sql_text, values) -> i64 ! sql.Error { execute(c, sql_text, values) }
+        begin: fn() ! sql.Error { execute(c, "START TRANSACTION", [])? }
+        commit: fn() ! sql.Error { execute(c, "COMMIT", [])? }
+        rollback: fn() ! sql.Error { execute(c, "ROLLBACK", [])? }
+        close: closed
+    }
+    driver.connection(c.session, fatal, abandoned, "std/sql/mysql", o, raw)
+}
+
+fn dial(o: sql.Options) -> net.Conn ! sql.Error {
+    using conn = driver.dial(o, sql.mysql())?
+    net.set_read_timeout(conn, o.timeout)
+    net.set_write_timeout(conn, o.timeout)
+    conn
+}
+
+fn killer(o: sql.Options, config: Config) -> fn(i64) {
+    fn(thread: i64) {
+        using var conn = dial(o) or return
+        let handle = net.detach(mut conn)
+        let plain = Config { tls: config.tls, session: none }
+        using c = open(net.stream_on(handle), o, plain, fn(id: i64) {}) or return
+        c.handle.execute("KILL QUERY {thread}", []) or 0
+    }
+}
+
+/// Connects to a MySQL or MariaDB server over plain TCP, using `o.host` and `o.port` (`3306` by default), and authenticates as `o.user`, selecting `o.database` when it is not empty.
+///
+/// The server's greeting tells MySQL from MariaDB, and the connection carries the matching dialect, `sql.mysql()` or `sql.mariadb()`. The driver negotiates protocol 4.1 with `DEPRECATE_EOF`, session tracking and `utf8mb4`, and on MariaDB the extended column metadata. Authentication follows the plugin the server names: `mysql_native_password`, `caching_sha2_password`, `sha256_password`, MariaDB's `client_ed25519` and `mysql_clear_password`, which is refused on a connection that is not TLS. `caching_sha2_password` and `sha256_password` over a plain connection ask the server for its RSA public key and send the password encrypted with RSA-OAEP; over TLS they send it in the clear. After the login the connection selects the UTC time zone, so `TIMESTAMP` columns are UTC. A call that times out closes the connection after a `KILL QUERY` for its thread on a second connection. Returns `sql.Error.Connect` when the connection cannot be made, `sql.Error.Timeout` when it exceeds `o.timeout`, `sql.Error.Authentication` when the server rejects the login, `sql.Error.Unsupported` for an authentication plugin or capability the driver lacks and `sql.Error.Server` for any other error the server sends. Dropping the returned `sql.Connection` sends `COM_QUIT` and closes the socket.
+///
+/// ```low
+/// import std/sql
+///
+/// using c = mysql.connect(sql.Options { host: "db.internal", user: "app", password: "secret", database: "shop" }) or return
+/// let rows = c.handle.query("SELECT name FROM users WHERE age >= ?", [Int(18)]) or return
+/// ```
+pub fn connect(o: sql.Options) -> sql.Connection ! sql.Error {
+    connect_with(o, Config {})
+}
+
+/// Connects like `connect` and upgrades the connection to TLS with the `SSL` capability before the login. `config` sets the TLS options; an empty `server_name` is replaced with `o.host`.
+///
+/// Returns `sql.Error.Unsupported` when the server does not offer TLS. Otherwise fails like `connect`.
+pub fn connect_tls(o: sql.Options, config: tls.Config) -> sql.Connection ! sql.Error {
+    connect_with(o, Config { tls: config })
+}
+
+/// Connects like `connect`, with the TLS upgrade and the `State` that `config` asks for.
+pub fn connect_with(o: sql.Options, config: Config) -> sql.Connection ! sql.Error {
+    using var conn = dial(o)?
+    let handle = net.detach(mut conn)
+    open(net.stream_on(handle), o, config, killer(o, config))
+}
+
+/// Connects over a stream that is already connected, such as a Unix socket or a tunnel, and authenticates as `connect` does.
+///
+/// `o.host`, `o.port` and `o.timeout` are not used to dial, and the connection counts as not secure, so `mysql_clear_password` is refused. A timed out call closes the stream without the `KILL QUERY` that `connect` sends. Fails like `connect` after the dial.
+pub fn connect_stream(s: io.Stream, o: sql.Options) -> sql.Connection ! sql.Error {
+    connect_stream_with(s, o, Config {})
+}
+
+/// Connects over a stream like `connect_stream`, with the `State` that `config` asks for. `config.tls` is ignored: the stream is used as given.
+pub fn connect_stream_with(s: io.Stream, o: sql.Options, config: Config) -> sql.Connection ! sql.Error {
+    let plain = Config { session: config.session }
+    open(s, o, plain, fn(id: i64) {})
+}
+
+/// The isolation level of one transaction.
+pub enum Isolation {
+    /// A statement sees rows other transactions have not committed.
+    ReadUncommitted
+    /// Each statement sees the rows committed before it started.
+    ReadCommitted
+    /// Every statement sees the rows committed before the first read of the transaction.
+    RepeatableRead
+    /// The transaction behaves as if it ran alone, with plain reads taking shared locks.
+    Serializable
+}
+
+fn level_text(level: Isolation) -> str {
+    match level {
+        ReadUncommitted => "READ UNCOMMITTED"
+        ReadCommitted => "READ COMMITTED"
+        RepeatableRead => "REPEATABLE READ"
+        Serializable => "SERIALIZABLE"
+    }
+}
+
+/// Starts a transaction at `level` on `db`, read only when `read_only` is set, with `SET TRANSACTION` followed by `START TRANSACTION`. The level applies to this transaction only.
+///
+/// The transaction ends with `db.commit()` or `db.rollback()`. Returns `sql.Error.Server` when the server rejects either statement.
+pub fn begin_with(db: sql.ConnectionHandle, level: Isolation, read_only: bool) ! sql.Error {
+    db.execute("SET TRANSACTION ISOLATION LEVEL {level_text(level)}", [])?
+    db.execute(if read_only { "START TRANSACTION READ ONLY" } else { "START TRANSACTION" }, [])?
+}
+
+/// Creates the savepoint `name` in the open transaction of `db`. Returns `sql.Error.Server` when no savepoint can be made.
+pub fn savepoint(db: sql.ConnectionHandle, name: str) ! sql.Error {
+    db.execute("SAVEPOINT {sql.quote_identifier(db.dialect, name)}", [])?
+}
+
+/// Rolls the transaction of `db` back to the savepoint `name`, keeping the savepoint and dropping the ones made after it. Returns `sql.Error.Server` when the savepoint does not exist.
+pub fn rollback_to(db: sql.ConnectionHandle, name: str) ! sql.Error {
+    db.execute("ROLLBACK TO SAVEPOINT {sql.quote_identifier(db.dialect, name)}", [])?
+}
+
+/// Removes the savepoint `name` without undoing any work. Returns `sql.Error.Server` when the savepoint does not exist.
+pub fn release(db: sql.ConnectionHandle, name: str) ! sql.Error {
+    db.execute("RELEASE SAVEPOINT {sql.quote_identifier(db.dialect, name)}", [])?
+}

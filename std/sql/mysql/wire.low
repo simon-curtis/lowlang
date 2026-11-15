@@ -1,0 +1,324 @@
+import std/io
+import std/sql
+import std/text
+
+struct Packet {
+    body: []u8
+    at: i64
+}
+
+const chunk = 0xFFFFFF
+
+const long_password = 1
+const found_rows = 2
+const long_flag = 4
+const connect_with_db = 8
+const protocol_41 = 512
+const ssl = 2048
+const transactions = 8192
+const secure_connection = 32768
+const multi_statements = 1 << 16
+const multi_results = 1 << 17
+const ps_multi_results = 1 << 18
+const plugin_auth = 1 << 19
+const connect_attrs = 1 << 20
+const plugin_auth_lenenc_client_data = 1 << 21
+const session_track = 1 << 23
+const deprecate_eof = 1 << 24
+
+const extended_metadata = 8
+
+const status_in_transaction = 1
+const status_more_results = 8
+const status_session_state = 0x4000
+
+const command_quit = 1
+const command_query = 3
+const command_ping = 14
+const command_prepare = 22
+const command_execute = 23
+const command_long_data = 24
+const command_close = 25
+const command_reset_statement = 26
+const command_reset_connection = 31
+
+const charset_utf8mb4 = 45
+const charset_binary = 63
+
+const max_allowed = 0x40000000
+
+fn take(mut p: Packet, n: i64) -> []u8 ! sql.Error {
+    if n < 0 || p.body.len - p.at < n {
+        fail Protocol
+    }
+    let out = p.body[p.at..p.at + n]
+    p.at += n
+    out
+}
+
+fn byte_of(mut p: Packet) -> u8 ! sql.Error {
+    take(mut p, 1)?[0]
+}
+
+fn int16(mut p: Packet) -> i64 ! sql.Error {
+    io.le16(take(mut p, 2)?, 0)
+}
+
+fn int24(mut p: Packet) -> i64 ! sql.Error {
+    io.le24(take(mut p, 3)?, 0)
+}
+
+fn int32(mut p: Packet) -> i64 ! sql.Error {
+    io.le32(take(mut p, 4)?, 0)
+}
+
+fn int64(mut p: Packet) -> i64 ! sql.Error {
+    io.le64(take(mut p, 8)?, 0)
+}
+
+fn left(p: Packet) -> i64 {
+    p.body.len - p.at
+}
+
+fn rest(mut p: Packet) -> []u8 {
+    let out = p.body[p.at..]
+    p.at = p.body.len
+    out
+}
+
+fn cstring(mut p: Packet) -> str ! sql.Error {
+    for i in p.at..p.body.len {
+        if p.body[i] == 0 {
+            let s = __str_view(p.body[p.at..i])
+            p.at = i + 1
+            return s
+        }
+    }
+    fail Protocol
+}
+
+fn lenenc(mut p: Packet) -> i64 ! sql.Error {
+    let first = i64(byte_of(mut p)?)
+    if first < 251 {
+        return first
+    }
+    match first {
+        251 => -1
+        252 => int16(mut p)?
+        253 => int24(mut p)?
+        254 => {
+            let n = int64(mut p)?
+            if n < 0 {
+                fail Protocol
+            }
+            n
+        }
+        _ => fail Protocol
+    }
+}
+
+fn lenenc_bytes(mut p: Packet) -> []u8? ! sql.Error {
+    let n = lenenc(mut p)?
+    if n < 0 {
+        return none
+    }
+    take(mut p, n)?
+}
+
+fn lenenc_text(mut p: Packet) -> str ! sql.Error {
+    match lenenc_bytes(mut p)? {
+        some(b) => __str_view(b)
+        none => fail Protocol
+    }
+}
+
+fn lenenc_or_empty(mut p: Packet) -> []u8 ! sql.Error {
+    let empty: []u8 = []
+    lenenc_bytes(mut p)? ?? empty
+}
+
+fn lenenc_block(mut p: Packet) -> Packet ! sql.Error {
+    Packet { body: lenenc_or_empty(mut p)?, at: 0 }
+}
+
+fn put_lenenc(mut b: []u8, n: i64) {
+    if n < 251 {
+        push(mut b, u8(n))
+    } else if n < 65536 {
+        push(mut b, 252)
+        io.put_le16(mut b, n)
+    } else if n < 16777216 {
+        push(mut b, 253)
+        io.put_le24(mut b, n)
+    } else {
+        push(mut b, 254)
+        io.put_le64(mut b, n)
+    }
+}
+
+fn put_lenenc_bytes(mut b: []u8, data: []u8) {
+    put_lenenc(mut b, data.len)
+    io.append(mut b, data)
+}
+
+fn put_lenenc_text(mut b: []u8, s: str) {
+    put_lenenc(mut b, s.len)
+    text.append(mut b, s)
+}
+
+fn put_cstring(mut b: []u8, s: str) {
+    text.append(mut b, s)
+    push(mut b, 0)
+}
+
+struct Greeting {
+    version: str
+    thread: i64
+    nonce: []u8
+    capabilities: i64
+    extended: i64
+    charset: i64
+    status: i64
+    plugin: str
+}
+
+fn greeting(mut p: Packet) -> Greeting ! sql.Error {
+    let protocol = byte_of(mut p)?
+    if protocol != 10 {
+        fail Unsupported
+    }
+    let version = cstring(mut p)?
+    let thread = int32(mut p)?
+    var nonce: []u8 = []
+    io.append(mut nonce, take(mut p, 8)?)
+    take(mut p, 1)?
+    var capabilities = int16(mut p)?
+    let charset = i64(byte_of(mut p)?)
+    let status = int16(mut p)?
+    capabilities |= int16(mut p)? << 16
+    let nonce_length = i64(byte_of(mut p)?)
+    take(mut p, 6)?
+    let extended = int32(mut p)?
+    if (capabilities & secure_connection) != 0 {
+        var more = nonce_length - 8
+        if more < 13 {
+            more = 13
+        }
+        let tail = take(mut p, more)?
+        io.append(mut nonce, tail[..more - 1])
+    }
+    var plugin = ""
+    if (capabilities & plugin_auth) != 0 && left(p) > 0 {
+        plugin = cstring(mut p)?
+    }
+    Greeting { version, thread, nonce, capabilities, extended, charset, status, plugin }
+}
+
+fn ssl_request(capabilities: i64, extended: i64) -> []u8 {
+    var b: []u8 = []
+    io.put_le32(mut b, capabilities)
+    io.put_le32(mut b, max_allowed)
+    push(mut b, u8(charset_utf8mb4))
+    for _ in 0..19 {
+        push(mut b, 0)
+    }
+    io.put_le32(mut b, extended)
+    b
+}
+
+fn handshake_response(capabilities: i64, extended: i64, o: sql.Options, response: []u8, plugin: str) -> []u8 {
+    var b = ssl_request(capabilities, extended)
+    put_cstring(mut b, o.user)
+    put_lenenc_bytes(mut b, response)
+    if (capabilities & connect_with_db) != 0 {
+        put_cstring(mut b, o.database)
+    }
+    put_cstring(mut b, plugin)
+    if (capabilities & connect_attrs) != 0 {
+        var attrs: []u8 = []
+        put_lenenc_text(mut attrs, "_client_name")
+        put_lenenc_text(mut attrs, "lowlang")
+        if o.application.len > 0 {
+            put_lenenc_text(mut attrs, "program_name")
+            put_lenenc_text(mut attrs, o.application)
+        }
+        put_lenenc(mut b, attrs.len)
+        io.append(mut b, attrs)
+    }
+    b
+}
+
+fn command_text(code: i64, s: str) -> []u8 {
+    var b: []u8 = []
+    push(mut b, u8(code))
+    text.append(mut b, s)
+    b
+}
+
+fn command_id(code: i64, id: i64) -> []u8 {
+    var b: []u8 = []
+    push(mut b, u8(code))
+    io.put_le32(mut b, id)
+    b
+}
+
+struct Ok {
+    affected: i64
+    last_id: i64
+    status: i64
+    warnings: i64
+    schema: str?
+}
+
+fn session_changes(mut p: Packet, ok: *Ok) ! sql.Error {
+    for left(p) > 0 {
+        let kind = byte_of(mut p)?
+        var entry = lenenc_block(mut p)?
+        if kind == 1 {
+            let name = lenenc_block(mut entry)?
+            ok.schema = __str_view(name.body)
+        }
+    }
+}
+
+fn ok_packet(mut p: Packet, capabilities: i64) -> Ok ! sql.Error {
+    take(mut p, 1)?
+    let affected = lenenc(mut p)?
+    let last_id = lenenc(mut p)?
+    let ok = new(Ok { affected, last_id, status: 0, warnings: 0, schema: none })
+    if (capabilities & protocol_41) != 0 {
+        ok.status = int16(mut p)?
+        ok.warnings = int16(mut p)?
+    }
+    if left(p) > 0 && (capabilities & session_track) != 0 {
+        lenenc_bytes(mut p)?
+        if (ok.status & status_session_state) != 0 {
+            var state = lenenc_block(mut p)?
+            session_changes(mut state, ok)?
+        }
+    }
+    *ok
+}
+
+fn terminator(mut p: Packet, capabilities: i64) -> Ok ! sql.Error {
+    if (capabilities & deprecate_eof) != 0 {
+        return ok_packet(mut p, capabilities)?
+    }
+    take(mut p, 1)?
+    let warnings = int16(mut p)?
+    let status = int16(mut p)?
+    Ok { affected: 0, last_id: 0, status, warnings, schema: none }
+}
+
+fn server_error(mut p: Packet, capabilities: i64) -> sql.Error {
+    take(mut p, 1) or return sql.Error.Protocol
+    let number = int16(mut p) or return sql.Error.Protocol
+    var state = "HY000"
+    if (capabilities & protocol_41) != 0 && left(p) >= 6 && p.body[p.at] == '#' {
+        take(mut p, 1) or return sql.Error.Protocol
+        let code = take(mut p, 5) or return sql.Error.Protocol
+        state = __str_view(code)
+    }
+    let message = __str_view(rest(mut p))
+    sql.Error.Server(state, "{message} ({number})")
+}

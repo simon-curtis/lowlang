@@ -1,0 +1,857 @@
+import std/bson
+import std/sync
+import std/text
+import std/time
+import std/uuid
+
+const minute_nanos = 60000000000
+const session_batch = 10000
+
+struct ServerSession {
+    id: []u8
+    used: i64
+    txn: i64
+    dirty: bool
+}
+
+enum Phase {
+    Idle
+    Starting
+    Running
+    Committed
+    Aborted
+}
+
+/// A logical session: causal consistency, retryable writes and transactions. Made by `start_session`; every operation that takes it in its `session` option runs inside it. A session is used by one green thread at a time. Call `end_session` when finished with it.
+pub struct Session {
+    client: *ClientHandle
+    server: *ServerSession
+    causal: bool
+    operation_time: u64
+    phase: Phase
+    read_concern: str
+    write_concern: WriteConcern
+    read_preference: ReadPreference
+    implicit: bool
+    ended: bool
+}
+
+/// The state of a `Client` shared by its copies, its databases and its collections. Closing the owning `Client` closes it for all of them.
+pub struct ClientHandle {
+    topology: *Topology
+    options: Options
+    sessions: []*ServerSession
+    gate: sync.Mutex
+}
+
+/// A connection pool and topology monitor for a MongoDB deployment, from `connect` or `connect_with`.
+///
+/// Dropping a `Client` ends its sessions and closes its connections. `handle` is the shared state that `Database` and `Collection` hold.
+pub struct Client {
+    /// The shared state of the client.
+    pub handle: *ClientHandle
+    drop close_client_on(handle)
+}
+
+struct Op {
+    db: str
+    body: []bson.Field
+    sequences: []Sequence = []
+    write: bool = false
+    retry: bool = false
+    pref: ReadPreference = ReadPreference {}
+    read_concern: str = ""
+    reading: bool = false
+    session: *Session? = none
+    keep: bool = false
+    unacknowledged: bool = false
+}
+
+struct Reply {
+    fields: []bson.Field
+    session: *Session?
+    address: str
+}
+
+fn credential_of(o: Options) -> Credential? {
+    if o.username.len == 0 {
+        return none
+    }
+    var source = o.auth_source
+    if source.len == 0 {
+        source = if o.database.len > 0 { o.database } else { "admin" }
+    }
+    some(Credential { user: o.username, password: o.password, source, mechanism: o.auth_mechanism })
+}
+
+fn validate(o: Options) ! Error {
+    if o.hosts.len == 0 {
+        fail Invalid("at least one host is needed")
+    }
+    if o.direct && o.hosts.len != 1 {
+        fail Invalid("directConnection needs exactly one host")
+    }
+    let pref = o.read_preference
+    match pref.mode {
+        Primary => {
+            if pref.tag_sets.len > 0 || pref.max_staleness >= 0 {
+                fail Invalid("the primary read preference takes no tags and no staleness bound")
+            }
+        }
+        _ => {}
+    }
+    if pref.max_staleness >= 0 && pref.max_staleness < minimum_staleness {
+        fail Invalid("maxStalenessSeconds must be at least {minimum_staleness}")
+    }
+    if o.max_pool_size < 1 {
+        fail Invalid("maxPoolSize must be at least 1")
+    }
+    if o.heartbeat < 1 {
+        fail Invalid("heartbeatFrequencyMS must be positive")
+    }
+    for c in o.compressors {
+        if c != "zstd" && c != "zlib" && c != "snappy" {
+            fail Invalid("unknown compressor {c}")
+        }
+    }
+}
+
+/// Starts a client for the `mongodb://` connection string `connection`; see `options_from` for the syntax.
+///
+/// Returns once the servers are being monitored, without waiting for any of them: the first operation waits up to `server_selection_timeout` for a suitable server and fails with `Selection` when there is none. Fails with `Invalid` for a string or option that does not parse, and with `Unsupported` for `mongodb+srv://`.
+pub fn connect(connection: str) -> Client ! Error {
+    let o = options_from(connection)?
+    connect_with(o)
+}
+
+/// Starts a client for `o`. Fails with `Invalid` when the options contradict each other, such as `direct` with several hosts.
+pub fn connect_with(o: Options) -> Client ! Error {
+    validate(o)?
+    let settings = Settings {
+        app_name: o.app_name
+        credential: credential_of(o)
+        tls: o.tls
+        compressors: o.compressors
+        zlib_level: o.compression_level
+        connect_timeout: o.connect_timeout
+        socket_timeout: o.socket_timeout
+    }
+    let probe = Settings {
+        app_name: o.app_name
+        credential: none
+        tls: o.tls
+        compressors: []
+        zlib_level: o.compression_level
+        connect_timeout: o.connect_timeout
+        socket_timeout: o.connect_timeout
+    }
+    let topology = new_topology(o, settings, probe)
+    let h = new(ClientHandle { topology, options: o, sessions: [], gate: sync.mutex() })
+    Client { handle: h }
+}
+
+/// Ends the sessions of the client behind `h` and closes its connections. Every call after it fails with `Closed`. Dropping the `Client` does the same.
+pub fn close_client_on(h: *ClientHandle) {
+    if h.topology.closed {
+        return
+    }
+    end_pooled_sessions(h)
+    close_topology(h.topology)
+}
+
+/// Closes `c`; see `close_client_on`.
+pub fn close(c: Client) {
+    close_client_on(c.handle)
+}
+
+/// Returns the address of every server the client knows, in discovery order, with the kind it last reported: `standalone`, `mongos`, `primary`, `secondary`, `arbiter`, `other` or `unknown`.
+pub fn servers(c: Client) -> [str: str] {
+    servers_on(c.handle)
+}
+
+/// Returns the servers of the client behind `h`; see `servers`.
+pub fn servers_on(h: *ClientHandle) -> [str: str] {
+    let t = h.topology
+    var out: [str: str] = [:]
+    sync.lock(t.lock)
+    for address, s in t.servers {
+        out[address] = kind_name(s.kind)
+    }
+    sync.unlock(t.lock)
+    out
+}
+
+fn kind_name(k: Kind) -> str {
+    match k {
+        Unknown => "unknown"
+        Standalone => "standalone"
+        Mongos => "mongos"
+        Primary => "primary"
+        Secondary => "secondary"
+        Arbiter => "arbiter"
+        Other => "other"
+    }
+}
+
+/// Returns the name of the database the connection string named, or the empty string.
+pub fn default_database(c: Client) -> str {
+    c.handle.options.database
+}
+
+fn supports_sessions(s: *Server) -> bool {
+    s.hello.session_minutes > 0
+}
+
+fn supports_retry_writes(s: *Server) -> bool {
+    match s.kind {
+        Standalone => false
+        _ => s.hello.session_minutes > 0
+    }
+}
+
+fn fresh_server_session() -> *ServerSession {
+    let id = uuid.v4()
+    new(ServerSession { id: id.bytes, used: time.monotonic(), txn: 0, dirty: false })
+}
+
+fn acquire_server_session(h: *ClientHandle, minutes: i64) -> *ServerSession {
+    sync.lock(h.gate)
+    var found: *ServerSession? = none
+    let limit = (minutes - 1) * minute_nanos
+    for h.sessions.len > 0 {
+        let candidate = pop(mut h.sessions) ?? break
+        if time.monotonic() - candidate.used < limit {
+            found = some(candidate)
+            break
+        }
+    }
+    sync.unlock(h.gate)
+    match found {
+        some(s) => s
+        none => fresh_server_session()
+    }
+}
+
+fn release_server_session(h: *ClientHandle, s: *ServerSession) {
+    if s.dirty {
+        return
+    }
+    s.used = time.monotonic()
+    sync.lock(h.gate)
+    push(mut h.sessions, s)
+    sync.unlock(h.gate)
+}
+
+fn make_session(h: *ClientHandle, minutes: i64, implicit: bool, causal: bool) -> *Session {
+    new(Session {
+        client: h
+        server: acquire_server_session(h, minutes)
+        causal
+        operation_time: 0
+        phase: Phase.Idle
+        read_concern: ""
+        write_concern: WriteConcern {}
+        read_preference: ReadPreference {}
+        implicit
+        ended: false
+    })
+}
+
+/// Starts an explicit session. `causal` makes reads in it observe the writes made through it, and is on unless set otherwise. Fails with `Selection` when no server is found, and with `Unsupported` when the deployment does not support sessions.
+pub fn start_session(c: Client) -> *Session ! Error {
+    start_session_on(c.handle, true)
+}
+
+/// Starts an explicit session on the client behind `h`; see `start_session`. `causal` turns causal consistency on or off.
+pub fn start_session_on(h: *ClientHandle, causal: bool) -> *Session ! Error {
+    let s = choose(h.topology, ReadPreference { mode: ReadMode.PrimaryPreferred }, false, "")?
+    if !supports_sessions(s) {
+        fail Unsupported
+    }
+    make_session(h, s.hello.session_minutes, false, causal)
+}
+
+/// Ends `s`, returning its server session to the pool. A transaction still running is aborted. Does nothing when called again.
+pub fn end_session(s: *Session) {
+    if s.ended {
+        return
+    }
+    match s.phase {
+        Starting => {
+            s.phase = Phase.Aborted
+        }
+        Running => {
+            abort_transaction(s) catch {
+                e => {}
+            }
+        }
+        _ => {}
+    }
+    s.ended = true
+    release_server_session(s.client, s.server)
+}
+
+/// Returns the cluster time of the newest operation `s` has seen, as a BSON timestamp, or `0` when it has seen none.
+pub fn operation_time(s: *Session) -> u64 {
+    s.operation_time
+}
+
+fn end_pooled_sessions(h: *ClientHandle) {
+    sync.lock(h.gate)
+    let pooled = h.sessions
+    h.sessions = []
+    sync.unlock(h.gate)
+    if pooled.len == 0 {
+        return
+    }
+    let pref = ReadPreference { mode: ReadMode.PrimaryPreferred }
+    let picked = pick(h.topology, pref, false, "")
+    match picked {
+        some(s) => {
+            var at = 0
+            for at < pooled.len {
+                var stop = at + session_batch
+                if stop > pooled.len {
+                    stop = pooled.len
+                }
+                var ids: []bson.Value = []
+                for i in at..stop {
+                    push(mut ids, bson.Value.Document([binary_of("id", 4, pooled[i].id)]))
+                }
+                let body = [array_of("endSessions", ids)]
+                let op = Op { db: "admin", body, pref }
+                let sent = attempt(h, s, op, none, 0) catch {
+                    e => []
+                }
+                at = stop
+            }
+        }
+        none => {}
+    }
+}
+
+fn in_transaction(session: *Session?) -> bool {
+    match session {
+        some(s) => match s.phase {
+            Starting => true
+            Running => true
+            _ => false
+        }
+        none => false
+    }
+}
+
+fn network(e: Error) -> bool {
+    match e {
+        Connect => true
+        Closed => true
+        Timeout => true
+        _ => false
+    }
+}
+
+fn listed_code(code: i64) -> bool {
+    match code {
+        6 => true
+        7 => true
+        89 => true
+        91 => true
+        189 => true
+        262 => true
+        9001 => true
+        10107 => true
+        11600 => true
+        11602 => true
+        13435 => true
+        13436 => true
+        _ => false
+    }
+}
+
+fn state_change(code: i64) -> bool {
+    match code {
+        91 => true
+        189 => true
+        10107 => true
+        11600 => true
+        11602 => true
+        13435 => true
+        13436 => true
+        _ => false
+    }
+}
+
+fn retryable(e: Error, write: bool) -> bool {
+    match e {
+        Connect => true
+        Closed => true
+        Timeout => true
+        Server(code, _, _, labels) => {
+            if write {
+                for l in labels {
+                    if l == "RetryableWriteError" {
+                        return true
+                    }
+                }
+            }
+            listed_code(code)
+        }
+        _ => false
+    }
+}
+
+fn settle_failure(t: *Topology, s: *Server, c: *Conn, e: Error) {
+    match e {
+        Server(code, _, _, _) => {
+            checkin(t, s, c, true)
+            if state_change(code) {
+                server_failed(t, s, failure_text(e))
+            }
+        }
+        Invalid(_) => {
+            checkin(t, s, c, true)
+        }
+        Protocol => {
+            checkin(t, s, c, false)
+        }
+        _ => {
+            checkin(t, s, c, false)
+            server_failed(t, s, failure_text(e))
+        }
+    }
+}
+
+fn read_concern_fields(level: str, after: u64) -> []bson.Field {
+    var fields: []bson.Field = []
+    if level.len > 0 {
+        push(mut fields, text_of("level", level))
+    }
+    if after != 0 {
+        push(mut fields, bson.Field { name: "afterClusterTime", value: bson.Value.Timestamp(after) })
+    }
+    if fields.len == 0 {
+        return []
+    }
+    [document_of("readConcern", fields)]
+}
+
+fn session_fields(h: *ClientHandle, op: Op, session: *Session?, txn_number: i64) -> []bson.Field {
+    var extra: []bson.Field = []
+    match session {
+        some(s) => {
+            push(mut extra, document_of("lsid", [binary_of("id", 4, s.server.id)]))
+            var level = ""
+            var after: u64 = 0
+            var attach = false
+            match s.phase {
+                Starting => {
+                    level = s.read_concern
+                    attach = true
+                    push(mut extra, long_of("txnNumber", txn_number))
+                    push(mut extra, bool_of("autocommit", false))
+                    push(mut extra, bool_of("startTransaction", true))
+                }
+                Running => {
+                    push(mut extra, long_of("txnNumber", txn_number))
+                    push(mut extra, bool_of("autocommit", false))
+                }
+                _ => {
+                    if txn_number > 0 {
+                        push(mut extra, long_of("txnNumber", txn_number))
+                    }
+                    if op.reading {
+                        level = op.read_concern
+                        attach = true
+                    }
+                }
+            }
+            if attach {
+                if s.causal && s.operation_time != 0 {
+                    after = s.operation_time
+                }
+                for f in read_concern_fields(level, after) {
+                    push(mut extra, f)
+                }
+            }
+        }
+        none => {
+            if op.reading {
+                for f in read_concern_fields(op.read_concern, 0) {
+                    push(mut extra, f)
+                }
+            }
+        }
+    }
+    extra
+}
+
+fn decorate(h: *ClientHandle, s: *Server, op: Op, session: *Session?, txn_number: i64) -> []bson.Field {
+    let t = h.topology
+    var extra = session_fields(h, op, session, txn_number)
+    sync.lock(t.lock)
+    let cluster = t.cluster_time
+    let preference = preference_document(t, s, op.pref)
+    sync.unlock(t.lock)
+    if cluster.len > 0 {
+        push(mut extra, document_of("$clusterTime", cluster))
+    }
+    for f in preference {
+        push(mut extra, f)
+    }
+    with_fields(op.body, extra)
+}
+
+fn absorb(h: *ClientHandle, session: *Session?, reply: []bson.Field) {
+    let cluster = get_document(reply, "$clusterTime") ?? []
+    if cluster.len > 0 {
+        sync.lock(h.topology.lock)
+        gossip(h.topology, cluster)
+        sync.unlock(h.topology.lock)
+    }
+    match session {
+        some(s) => {
+            match bson.get(reply, "operationTime") {
+                some(v) => match v {
+                    Timestamp(n) => {
+                        if n > s.operation_time {
+                            s.operation_time = n
+                        }
+                    }
+                    _ => {}
+                }
+                none => {}
+            }
+            match s.phase {
+                Starting => {
+                    s.phase = Phase.Running
+                }
+                _ => {}
+            }
+        }
+        none => {}
+    }
+}
+
+fn attempt(h: *ClientHandle, s: *Server, op: Op, session: *Session?, txn_number: i64) -> []bson.Field ! Error {
+    let t = h.topology
+    let c = checkout(t, s)?
+    if op.unacknowledged {
+        let body = decorate(h, s, op, none, 0)
+        send_unacknowledged(c, op.db, body, op.sequences) catch {
+            e => {
+                settle_failure(t, s, c, e)
+                fail e
+            }
+        }
+        checkin(t, s, c, true)
+        return [int_of("ok", 1)]
+    }
+    let body = decorate(h, s, op, session, txn_number)
+    let reply = run(c, op.db, body, op.sequences) catch {
+        e => {
+            settle_failure(t, s, c, e)
+            fail e
+        }
+    }
+    checkin(t, s, c, true)
+    absorb(h, session, reply)
+    reply
+}
+
+fn retry_concern_error(reply: []bson.Field) -> bool {
+    let concern = get_document(reply, "writeConcernError") ?? []
+    if concern.len == 0 {
+        return false
+    }
+    for l in get_texts(reply, "errorLabels") {
+        if l == "RetryableWriteError" {
+            return true
+        }
+    }
+    false
+}
+
+fn next_txn(session: *Session?) -> i64 {
+    match session {
+        some(s) => {
+            s.server.txn += 1
+            s.server.txn
+        }
+        none => 0
+    }
+}
+
+fn run_attempts(h: *ClientHandle, op: Op, session: *Session?, first: *Server) -> Reply ! Error {
+    let t = h.topology
+    let transactional = in_transaction(session)
+    let has_session = match session {
+        some(_) => true
+        none => false
+    }
+    var can_retry = false
+    if op.retry && !transactional && !op.unacknowledged {
+        if op.write {
+            can_retry = h.options.retry_writes && has_session && supports_retry_writes(first)
+        } else {
+            can_retry = h.options.retry_reads
+        }
+    }
+    var txn_number = 0
+    if transactional {
+        txn_number = match session {
+            some(s) => s.server.txn
+            none => 0
+        }
+    } else if op.write && can_retry {
+        txn_number = next_txn(session)
+    }
+    var server = first
+    var retried = false
+    var original: Error? = none
+    for {
+        let reply = attempt(h, server, op, session, txn_number) catch {
+            e => {
+                if can_retry && !retried && retryable(e, op.write) {
+                    retried = true
+                    original = some(e)
+                    let again = choose(t, op.pref, op.write, server.address) catch {
+                        _ => fail e
+                    }
+                    server = again
+                    continue
+                }
+                fail e
+            }
+        }
+        if can_retry && !retried && retry_concern_error(reply) {
+            retried = true
+            let again = choose(t, op.pref, op.write, server.address) catch {
+                _ => return Reply { fields: reply, session: none, address: server.address }
+            }
+            server = again
+            continue
+        }
+        return Reply { fields: reply, session: none, address: server.address }
+    }
+    fail Selection
+}
+
+fn execute(h: *ClientHandle, request: Op) -> Reply ! Error {
+    let t = h.topology
+    var op = request
+    if in_transaction(op.session) {
+        op.pref = ReadPreference {}
+    }
+    let first = choose(t, op.pref, op.write, "")?
+    var session = op.session
+    var implicit = false
+    match session {
+        some(_) => {}
+        none => {
+            if !op.unacknowledged && supports_sessions(first) {
+                session = some(make_session(h, first.hello.session_minutes, true, false))
+                implicit = true
+            }
+        }
+    }
+    let reply = run_attempts(h, op, session, first) catch {
+        e => {
+            match session {
+                some(s) => {
+                    if network(e) {
+                        s.server.dirty = true
+                    }
+                    if implicit {
+                        end_session(s)
+                    }
+                }
+                none => {}
+            }
+            fail e
+        }
+    }
+    match session {
+        some(s) => {
+            if implicit {
+                if op.keep {
+                    return Reply { fields: reply.fields, session, address: reply.address }
+                }
+                end_session(s)
+            }
+        }
+        none => {}
+    }
+    reply
+}
+
+fn write_concern_fields(wc: WriteConcern) -> []bson.Field {
+    var fields: []bson.Field = []
+    if wc.w.len > 0 {
+        let count = text.parse_int(wc.w) catch {
+            _ => -1
+        }
+        if count >= 0 {
+            push(mut fields, int_of("w", count))
+        } else {
+            push(mut fields, text_of("w", wc.w))
+        }
+    }
+    match wc.journal {
+        some(j) => {
+            push(mut fields, bool_of("j", j))
+        }
+        none => {}
+    }
+    if wc.timeout > 0 {
+        push(mut fields, int_of("wtimeout", wc.timeout))
+    }
+    if fields.len == 0 {
+        return []
+    }
+    [document_of("writeConcern", fields)]
+}
+
+fn acknowledged(wc: WriteConcern) -> bool {
+    if wc.w != "0" {
+        return true
+    }
+    match wc.journal {
+        some(j) => j
+        none => false
+    }
+}
+
+/// Starts a transaction in `s`. Every operation that takes `s` runs in it until `commit_transaction` or `abort_transaction`. `read_concern` and `write_concern` apply to the transaction; the empty string and a default `WriteConcern` leave them to the server. Fails with `Invalid` when a transaction is already running, and with `Unsupported` on a deployment that is not a replica set or a sharded cluster.
+pub fn start_transaction(s: *Session, read_concern: str, write_concern: WriteConcern) ! Error {
+    if in_transaction(some(s)) {
+        fail Invalid("a transaction is already running in this session")
+    }
+    let server = choose(s.client.topology, ReadPreference {}, true, "")?
+    if !supports_retry_writes(server) {
+        fail Unsupported
+    }
+    s.server.txn += 1
+    s.phase = Phase.Starting
+    s.read_concern = read_concern
+    s.write_concern = write_concern
+}
+
+fn end_command(s: *Session, name: str, wc: WriteConcern) -> []bson.Field ! Error {
+    let body = with_fields([int_of(name, 1)], write_concern_fields(wc))
+    let op = Op { db: "admin", body, write: true, session: some(s) }
+    let reply = execute(s.client, op)?
+    reply.fields
+}
+
+/// Commits the transaction of `s`. A network failure or a retryable server error is retried once, and the commit then asks for a majority write concern. Fails with `Invalid` when no transaction is running. A failure carrying the label `UnknownTransactionCommitResult` leaves it unknown whether the transaction committed.
+pub fn commit_transaction(s: *Session) ! Error {
+    match s.phase {
+        Starting => {
+            s.phase = Phase.Committed
+            return
+        }
+        Running => {}
+        _ => fail Invalid("no transaction is running in this session")
+    }
+    var wc = s.write_concern
+    var attempts = 0
+    for {
+        attempts += 1
+        end_command(s, "commitTransaction", wc) catch {
+            e => {
+                if attempts == 1 && retryable(e, true) {
+                    wc = WriteConcern { w: "majority", journal: s.write_concern.journal, timeout: 10000 }
+                    if s.write_concern.timeout > 0 {
+                        wc.timeout = s.write_concern.timeout
+                    }
+                    continue
+                }
+                s.phase = Phase.Committed
+                fail e
+            }
+        }
+        s.phase = Phase.Committed
+        return
+    }
+}
+
+/// Aborts the transaction of `s`, discarding its writes. A failure is retried once and otherwise ignored by the server. Fails with `Invalid` when no transaction is running.
+pub fn abort_transaction(s: *Session) ! Error {
+    match s.phase {
+        Starting => {
+            s.phase = Phase.Aborted
+            return
+        }
+        Running => {}
+        _ => fail Invalid("no transaction is running in this session")
+    }
+    var attempts = 0
+    for {
+        attempts += 1
+        end_command(s, "abortTransaction", s.write_concern) catch {
+            e => {
+                if attempts == 1 && retryable(e, true) {
+                    continue
+                }
+                s.phase = Phase.Aborted
+                return
+            }
+        }
+        s.phase = Phase.Aborted
+        return
+    }
+}
+
+fn transient(e: Error) -> bool {
+    network(e) || has_label(e, "TransientTransactionError")
+}
+
+fn commit_with_retry(s: *Session, deadline: i64) -> bool ! Error {
+    for {
+        commit_transaction(s) catch {
+            e => {
+                let before = time.monotonic() < deadline
+                if before && has_label(e, "TransientTransactionError") {
+                    return true
+                }
+                let unknown = network(e) || has_label(e, "UnknownTransactionCommitResult")
+                if before && unknown {
+                    s.phase = Phase.Running
+                    continue
+                }
+                fail e
+            }
+        }
+        return false
+    }
+}
+
+/// Runs `body` inside a transaction of `s` and commits it. A failure of `body` or of the commit that carries the label `TransientTransactionError` or is a network failure reruns the whole of `body` in a new transaction, and a commit with an unknown result is retried, both for up to 120 seconds. Any other failure aborts the transaction and is returned. `body` must be safe to run more than once and must pass `s` to every operation it runs.
+pub fn with_transaction(s: *Session, read_concern: str, write_concern: WriteConcern, body: fn() ! Error) ! Error {
+    let deadline = time.monotonic() + 120 * 1000 * nanos_per_milli
+    for {
+        start_transaction(s, read_concern, write_concern)?
+        var failed: Error? = none
+        body() catch {
+            e => {
+                failed = some(e)
+            }
+        }
+        match failed {
+            some(e) => {
+                abort_transaction(s) catch {
+                    _ => {}
+                }
+                if transient(e) && time.monotonic() < deadline {
+                    continue
+                }
+                fail e
+            }
+            none => {}
+        }
+        let again = commit_with_retry(s, deadline)?
+        if !again {
+            return
+        }
+    }
+}

@@ -1,0 +1,166 @@
+import std/bson
+import std/sync
+import std/text
+
+/// The documents of a `find`, `aggregate` or `list_indexes` call, fetched from the server in batches as they are read.
+///
+/// A cursor is used by one green thread at a time and stays on the server that opened it. It closes itself when it runs out of documents; call `close_cursor` to stop early, or the server keeps it until it times out.
+pub struct Cursor {
+    client: *ClientHandle
+    database: str
+    collection: str
+    id: i64
+    batch: []bson.Value
+    at: i64
+    address: str
+    session: *Session?
+    batch_size: i64
+    max_time: i64
+    pref: ReadPreference
+    closed: bool
+}
+
+fn batch_of(cursor: []bson.Field, name: str) -> []bson.Value {
+    get_array(cursor, name) ?? []
+}
+
+fn cursor_from(h: *ClientHandle, reply: Reply, database: str, collection: str, batch_size: i64, max_time: i64, pref: ReadPreference) -> *Cursor ! Error {
+    let body = get_document(reply.fields, "cursor") ?? fail Protocol
+    let id = get_int(body, "id") ?? fail Protocol
+    var name = collection
+    let ns = get_text(body, "ns") ?? ""
+    let dot = text.index_byte(ns, '.')
+    if dot >= 0 && dot + 1 < ns.len {
+        name = ns[dot + 1..]
+    }
+    let cursor = new(Cursor {
+        client: h
+        database
+        collection: name
+        id
+        batch: batch_of(body, "firstBatch")
+        at: 0
+        address: reply.address
+        session: reply.session
+        batch_size
+        max_time
+        pref
+        closed: false
+    })
+    if id == 0 {
+        release_cursor_session(cursor)
+    }
+    cursor
+}
+
+fn release_cursor_session(c: *Cursor) {
+    match c.session {
+        some(s) => {
+            end_session(s)
+            c.session = none
+        }
+        none => {}
+    }
+}
+
+fn pinned(c: *Cursor) -> *Server ! Error {
+    let t = c.client.topology
+    sync.lock(t.lock)
+    let found = t.servers[c.address]
+    sync.unlock(t.lock)
+    match found {
+        some(s) => s
+        none => fail Selection
+    }
+}
+
+fn cursor_command(c: *Cursor, body: []bson.Field) -> []bson.Field ! Error {
+    let s = pinned(c)?
+    let op = Op { db: c.database, body, pref: c.pref }
+    var txn = 0
+    match c.session {
+        some(session) => {
+            if in_transaction(c.session) {
+                txn = session.server.txn
+            }
+        }
+        none => {}
+    }
+    attempt(c.client, s, op, c.session, txn) catch {
+        e => {
+            match c.session {
+                some(session) => {
+                    if network(e) {
+                        session.server.dirty = true
+                    }
+                }
+                none => {}
+            }
+            fail e
+        }
+    }
+}
+
+fn fetch(c: *Cursor) ! Error {
+    var body: []bson.Field = [long_of("getMore", c.id), text_of("collection", c.collection)]
+    if c.batch_size > 0 {
+        push(mut body, int_of("batchSize", c.batch_size))
+    }
+    if c.max_time > 0 {
+        push(mut body, int_of("maxTimeMS", c.max_time))
+    }
+    let reply = cursor_command(c, body)?
+    let cursor = get_document(reply, "cursor") ?? fail Protocol
+    c.batch = batch_of(cursor, "nextBatch")
+    c.at = 0
+    c.id = get_int(cursor, "id") ?? fail Protocol
+    if c.id == 0 {
+        release_cursor_session(c)
+    }
+}
+
+/// Returns the next document, fetching another batch when the current one is used up, or `none` when the cursor has no more. Fails with the error of the `getMore` command, such as `Server` with code `43` when the server dropped the cursor, and with `Selection` when the server that holds it is gone.
+pub fn next(c: *Cursor) -> []bson.Field? ! Error {
+    for {
+        if c.at < c.batch.len {
+            let v = c.batch[c.at]
+            c.at += 1
+            match v {
+                Document(d) => return some(d)
+                _ => fail Protocol
+            }
+        }
+        if c.id == 0 || c.closed {
+            return none
+        }
+        fetch(c)?
+    }
+    none
+}
+
+/// Reads every remaining document of `c` and closes it.
+pub fn all(c: *Cursor) -> [][]bson.Field ! Error {
+    var out: [][]bson.Field = []
+    for {
+        let d = next(c)? ?? break
+        push(mut out, d)
+    }
+    out
+}
+
+/// Closes `c`, telling the server to discard what is left of it. Does nothing when `c` is closed or used up.
+pub fn close_cursor(c: *Cursor) {
+    if c.closed {
+        return
+    }
+    c.closed = true
+    if c.id != 0 {
+        let body = [text_of("killCursors", c.collection), array_of("cursors", [bson.Value.Int64(c.id)])]
+        let sent = cursor_command(c, body) catch {
+            e => []
+        }
+        c.id = 0
+    }
+    c.batch = []
+    release_cursor_session(c)
+}

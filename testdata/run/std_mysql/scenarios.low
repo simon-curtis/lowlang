@@ -1,0 +1,271 @@
+import std/crypto/hash
+import std/crypto/rsa
+import std/crypto/x509
+import std/io
+import std/net
+import std/sql
+import std/sql/mysql
+import std/text
+import std/tls
+
+const native_one = "b32bb3a583e1340c0a1108d58b1be49781ad8c2f"
+const native_two = "45aa9c459279e114343ff71f11a7b36692e5280c"
+const sha2_one = "746ebe205d56a0707acb3e796e834e0dd7b1d61743b26bd5202c7a623230c7c9"
+
+struct Round {
+    label: str
+    script: fn(*Peer) ! io.Error
+    client: fn(net.Listener) -> str
+}
+
+fn nonce_one() -> []u8 {
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+}
+
+fn nonce_two() -> []u8 {
+    [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+}
+
+fn masked(password: str, nonce: []u8) -> str {
+    var plain = bytes(password)
+    push(mut plain, 0)
+    let out = io.buffer(plain.len)
+    for i in 0..plain.len {
+        out[i] = plain[i] ^ nonce[i % nonce.len]
+    }
+    text.encode_hex(out)
+}
+
+fn serve_rounds(h: net.ListenerHandle, report: chan[str], rounds: []Round) {
+    for r in rounds {
+        let accepted = net.accept_handle(h) or {
+            report <- "accept failed"
+            return
+        }
+        using conn = net.adopt(accepted)
+        let p = peer_on(net.stream(conn))
+        r.script(p) catch {
+            e => note(p, "server stopped {e}")
+        }
+        report <- text.join(p.notes, "; ")
+    }
+}
+
+fn endpoint(l: net.Listener, user: str, password: str, timeout: i64) -> sql.Options {
+    sql.Options { host: "127.0.0.1", port: l.handle.addr.port, user, password, database: "lowtest", timeout }
+}
+
+fn drain(p: *Peer) ! io.Error {
+    for {
+        let payload = command(p)?
+        match payload[0] {
+            1 => {
+                note(p, "quit")
+                return
+            }
+            _ => send(p, ok(0, 0, 2))?
+        }
+    }
+}
+
+fn sign_in(p: *Peer, version: str, plugin: str, nonce: []u8, capabilities: i64) -> Login ! io.Error {
+    greeting(p, version, 5, nonce, capabilities, plugin)?
+    let l = login_of(receive(p)?)
+    note(p, "{l.plugin} user {l.user} response {text.encode_hex(l.response)}")
+    l
+}
+
+fn private_key() -> rsa.PrivateKey ! io.Error {
+    let der = text.decode_hex(login_private_key()) or fail Malformed
+    rsa.parse_private(der)?
+}
+
+fn exchange_key(p: *Peer, nonce: []u8, password: str, requested: bool) ! io.Error {
+    if requested {
+        let asked = receive(p)?
+        note(p, "key request {text.encode_hex(asked)}")
+    }
+    var pem: []u8 = [1]
+    text.append(mut pem, login_public_key())
+    send(p, pem)?
+    let cipher = receive(p)?
+    let key = private_key()?
+    let empty: []u8 = []
+    let plain = rsa.decrypt_oaep(key, hash.sha1(), empty, cipher) or {
+        note(p, "decrypt failed")
+        return
+    }
+    note(p, "ciphertext {cipher.len} bytes, plain {text.encode_hex(plain)} {if text.encode_hex(plain) == masked(password, nonce) { "matches" } else { "differs" }}")
+}
+
+fn script_native(p: *Peer) ! io.Error {
+    let l = sign_in(p, "8.4.0", "mysql_native_password", nonce_one(), server_capabilities(false))?
+    note(p, "capabilities {text.hex(l.capabilities)} charset {l.charset} database {l.database}")
+    note(p, "response {if text.encode_hex(l.response) == native_one { "matches" } else { "differs" }}")
+    send(p, ok(0, 0, 2))?
+    drain(p)?
+}
+
+fn script_sha2(p: *Peer) ! io.Error {
+    let l = sign_in(p, "8.4.0", "caching_sha2_password", nonce_one(), server_capabilities(false))?
+    note(p, "response {if text.encode_hex(l.response) == sha2_one { "matches" } else { "differs" }}")
+    send(p, ok(0, 0, 2))?
+    drain(p)?
+}
+
+fn script_switch(p: *Peer) ! io.Error {
+    let l = sign_in(p, "8.4.0", "caching_sha2_password", nonce_one(), server_capabilities(false))?
+    var b: []u8 = [0xFE]
+    cstring(mut b, "mysql_native_password")
+    io.append(mut b, nonce_two())
+    push(mut b, 0)
+    send(p, b)?
+    let answer = receive(p)?
+    note(p, "switch answer {if text.encode_hex(answer) == native_two { "matches" } else { "differs" }}")
+    send(p, ok(0, 0, 2))?
+    drain(p)?
+}
+
+fn script_empty(p: *Peer) ! io.Error {
+    sign_in(p, "8.4.0", "mysql_native_password", nonce_one(), server_capabilities(false))?
+    send(p, ok(0, 0, 2))?
+    drain(p)?
+}
+
+fn script_clear_switch(p: *Peer) ! io.Error {
+    sign_in(p, "8.4.0", "mysql_native_password", nonce_one(), server_capabilities(false))?
+    var b: []u8 = [0xFE]
+    cstring(mut b, "mysql_clear_password")
+    send(p, b)?
+    let next = command(p) catch {
+        e => {
+            note(p, "client sent nothing more")
+            return
+        }
+    }
+    note(p, "client sent {text.encode_hex(next)}")
+}
+
+fn script_unknown_switch(p: *Peer) ! io.Error {
+    sign_in(p, "8.4.0", "mysql_native_password", nonce_one(), server_capabilities(false))?
+    var b: []u8 = [0xFE]
+    cstring(mut b, "authentication_ldap_sasl_client")
+    io.append(mut b, nonce_two())
+    send(p, b)?
+    let next = command(p) catch {
+        e => {
+            note(p, "client sent nothing more")
+            return
+        }
+    }
+    note(p, "client sent {text.encode_hex(next)}")
+}
+
+fn script_fast(p: *Peer) ! io.Error {
+    sign_in(p, "8.4.0", "caching_sha2_password", nonce_one(), server_capabilities(false))?
+    send(p, [1, 3])?
+    send(p, ok(0, 0, 2))?
+    drain(p)?
+}
+
+fn script_full(p: *Peer) ! io.Error {
+    sign_in(p, "8.4.0", "caching_sha2_password", nonce_one(), server_capabilities(false))?
+    send(p, [1, 4])?
+    exchange_key(p, nonce_one(), "secret", true)?
+    send(p, ok(0, 0, 2))?
+    drain(p)?
+}
+
+fn script_sha256(p: *Peer) ! io.Error {
+    sign_in(p, "8.0.36", "sha256_password", nonce_one(), server_capabilities(false))?
+    exchange_key(p, nonce_one(), "secret", false)?
+    send(p, ok(0, 0, 2))?
+    drain(p)?
+}
+
+fn script_sha256_empty(p: *Peer) ! io.Error {
+    sign_in(p, "8.0.36", "sha256_password", nonce_one(), server_capabilities(false))?
+    send(p, ok(0, 0, 2))?
+    drain(p)?
+}
+
+fn script_denied(p: *Peer) ! io.Error {
+    sign_in(p, "8.4.0", "mysql_native_password", nonce_one(), server_capabilities(false))?
+    send(p, failure(1045, "28000", "Access denied for user 'u'@'localhost' (using password: YES)"))?
+}
+
+fn script_unknown_database(p: *Peer) ! io.Error {
+    sign_in(p, "8.4.0", "mysql_native_password", nonce_one(), server_capabilities(false))?
+    send(p, failure(1049, "42000", "Unknown database 'lowtest'"))?
+}
+
+fn script_too_many(p: *Peer) ! io.Error {
+    p.sequence = 0
+    send(p, failure(1040, "", "Too many connections"))?
+}
+
+fn script_old_protocol(p: *Peer) ! io.Error {
+    var b: []u8 = [9]
+    cstring(mut b, "3.23.0")
+    p.sequence = 0
+    send(p, b)?
+}
+
+fn script_no_protocol_41(p: *Peer) ! io.Error {
+    greeting(p, "5.0.0", 5, nonce_one(), server_capabilities(false) & ~protocol_41, "mysql_native_password")?
+}
+
+fn script_hang_up(p: *Peer) ! io.Error {
+    greeting(p, "8.4.0", 5, nonce_one(), server_capabilities(false), "mysql_native_password")?
+}
+
+fn script_bad_sequence(p: *Peer) ! io.Error {
+    sign_in(p, "8.4.0", "mysql_native_password", nonce_one(), server_capabilities(false))?
+    p.sequence = 7
+    send(p, ok(0, 0, 2))?
+}
+
+fn auth_rounds() -> []Round {
+    [
+        plain("native", script_native, "secret"),
+        plain("caching_sha2", script_sha2, "secret"),
+        plain("auth switch", script_switch, "secret"),
+        plain("empty password", script_empty, ""),
+        plain("clear password switch on plain", script_clear_switch, "secret"),
+        plain("unknown plugin switch", script_unknown_switch, "secret"),
+        plain("fast path", script_fast, "secret"),
+        plain("caching_sha2 full over rsa", script_full, "secret"),
+        plain("sha256_password", script_sha256, "secret"),
+        plain("sha256_password empty", script_sha256_empty, ""),
+        plain("access denied", script_denied, "secret"),
+        plain("unknown database", script_unknown_database, "secret"),
+        plain("too many connections", script_too_many, "secret"),
+        plain("protocol 9", script_old_protocol, "secret"),
+        plain("no protocol 41", script_no_protocol_41, "secret"),
+        plain("hang up", script_hang_up, "secret"),
+        plain("bad sequence", script_bad_sequence, "secret"),
+    ]
+}
+
+fn plain(label: str, script: fn(*Peer) ! io.Error, password: str) -> Round {
+    Round { label, script, client: fn(l: net.Listener) -> str { login(l, password) } }
+}
+
+fn run_rounds(rounds: []Round) ! io.Error {
+    using l = net.listen("127.0.0.1", 0)?
+    let report = chan[str](rounds.len)
+    spawn serve_rounds(l.handle, report, rounds)
+    for r in rounds {
+        let outcome = r.client(l)
+        print("{r.label}: {outcome}")
+        print("  server: {(<-report) ?? "no report"}")
+    }
+}
+
+fn login(l: net.Listener, password: str) -> str {
+    using c = mysql.connect(endpoint(l, "u", password, 3000)) catch {
+        e => return describe(e)
+    }
+    c.handle.close()
+    "connected"
+}

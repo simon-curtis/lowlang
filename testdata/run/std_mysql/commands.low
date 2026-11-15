@@ -1,0 +1,230 @@
+import std/io
+import std/net
+import std/sql
+import std/sql/mysql
+import std/text
+
+fn welcome(p: *Peer) ! io.Error {
+    sign_in(p, "8.4.0", "mysql_native_password", nonce_one(), server_capabilities(false))?
+    send(p, ok(0, 0, 2))?
+}
+
+fn describe_text(sql_text: str) -> str {
+    if sql_text.len > 60 {
+        return "{sql_text[..20]}... {sql_text.len} bytes"
+    }
+    sql_text
+}
+
+fn result_header(p: *Peer, names: []str) ! io.Error {
+    var b: []u8 = []
+    lenenc(mut b, names.len)
+    send(p, b)?
+    for n in names {
+        send(p, column(n, 253, 0, 45))?
+    }
+}
+
+fn filler(n: i64) -> []u8 {
+    let b = io.buffer(n)
+    for i in 0..n {
+        b[i] = 'a'
+    }
+    b
+}
+
+fn wide_row(p: *Peer, size: i64) ! io.Error {
+    var b: []u8 = []
+    lenenc(mut b, size)
+    io.append(mut b, filler(size))
+    send(p, b)?
+}
+
+fn prepare_reply(p: *Peer, id: i64, parameters: i64) ! io.Error {
+    var b: []u8 = [0]
+    io.put_le32(mut b, id)
+    io.put_le16(mut b, 0)
+    io.put_le16(mut b, parameters)
+    push(mut b, 0)
+    io.put_le16(mut b, 0)
+    send(p, b)?
+    for _ in 0..parameters {
+        send(p, column("?", 253, 0, 45))?
+    }
+}
+
+fn query_reply(p: *Peer, sql_text: str) ! io.Error {
+    if text.starts_with(sql_text, "SET time_zone") {
+        note(p, "time zone")
+        send(p, ok(0, 0, 2))?
+    } else if text.starts_with(sql_text, "MULTI") {
+        result_header(p, ["a"])?
+        send(p, text_row(["one"]))?
+        send(p, terminator(status_more_results))?
+        send(p, ok(3, 0, status_more_results))?
+        result_header(p, ["b", "c"])?
+        send(p, text_row(["two", "three"]))?
+        send(p, terminator(2))?
+    } else if text.starts_with(sql_text, "LOAD") {
+        send(p, [0xFB, '/', 'e', 't', 'c'])?
+        let empty = receive(p)?
+        note(p, "after infile request client sent {empty.len} bytes")
+        send(p, ok(0, 0, 2))?
+    } else if text.starts_with(sql_text, "WIDE") {
+        result_header(p, ["w"])?
+        wide_row(p, 0xFFFFFB)?
+        wide_row(p, 0x1000000)?
+        wide_row(p, 0xFFFFFA)?
+        send(p, terminator(2))?
+    } else {
+        send(p, ok(1, 0, 2))?
+    }
+}
+
+fn serve_commands(p: *Peer) ! io.Error {
+    var prepared = 0
+    for {
+        let payload = command(p)?
+        match payload[0] {
+            1 => {
+                note(p, "quit")
+                return
+            }
+            3 => {
+                let sql_text = str(payload[1..])
+                note(p, "query {describe_text(sql_text)}")
+                query_reply(p, sql_text)?
+            }
+            14 => {
+                note(p, "ping")
+                send(p, ok(0, 0, 2))?
+            }
+            22 => {
+                let sql_text = str(payload[1..])
+                prepared += 1
+                let parameters = text.count(sql_text, "?")
+                if !text.starts_with(sql_text, "SELECT ?") {
+                    note(p, "prepare {prepared} {describe_text(sql_text)}")
+                }
+                prepare_reply(p, prepared, parameters)?
+            }
+            23 => {
+                if payload.len != 22 {
+                    note(p, "execute statement {io.le32(payload, 1)} {payload.len} bytes")
+                }
+                send(p, ok(1, 0, 2))?
+            }
+            24 => {
+                note(p, "long data statement {io.le32(payload, 1)} parameter {io.le16(payload, 5)} {payload.len - 7} bytes")
+            }
+            25 => note(p, "close statement {io.le32(payload, 1)}")
+            31 => {
+                note(p, "prepared {prepared} statements, reset connection")
+                send(p, ok(0, 0, 2))?
+            }
+            _ => {
+                note(p, "unexpected command {payload[0]}")
+                send(p, failure(1047, "08S01", "Unknown command"))?
+            }
+        }
+    }
+}
+
+fn script_commands(p: *Peer) ! io.Error {
+    welcome(p)?
+    serve_commands(p)?
+}
+
+fn rows_summary(r: sql.Rows) -> str {
+    var cells: []str = []
+    for row in r.rows {
+        for v in row {
+            match v {
+                Text(s) => push(mut cells, "text {s.len}")
+                _ => push(mut cells, "other")
+            }
+        }
+    }
+    text.join(cells, ", ")
+}
+
+fn commands_client(l: net.Listener) -> str {
+    let st = mysql.state()
+    using c = mysql.connect_with(endpoint(l, "u", "secret", 20000), mysql.Config { session: st }) catch {
+        e => return describe(e)
+    }
+    let db = c.handle
+    var lines: []str = []
+    let multi = db.query("MULTI", []) catch {
+        e => {
+            push(mut lines, "multi {describe(e)}")
+            sql.Rows { columns: [], rows: [] }
+        }
+    }
+    push(mut lines, "multi columns {multi.columns.len} rows {multi.rows.len}")
+    let infile = db.execute("LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE t", []) catch {
+        e => {
+            push(mut lines, "infile {describe(e)}")
+            -1
+        }
+    }
+    push(mut lines, "infile result {infile}")
+    let after = db.execute("UPDATE t SET a = 1", []) catch {
+        e => {
+            push(mut lines, "after infile {describe(e)}")
+            -1
+        }
+    }
+    push(mut lines, "after infile affected {after}")
+    st.ping() catch {
+        e => push(mut lines, "ping {describe(e)}")
+    }
+    let wide = db.query("WIDE", []) catch {
+        e => {
+            push(mut lines, "wide {describe(e)}")
+            sql.Rows { columns: [], rows: [] }
+        }
+    }
+    push(mut lines, "wide {rows_summary(wide)}")
+    let exact = text.repeat("a", 0xFFFFFE)
+    let sent = db.execute(exact, []) catch {
+        e => {
+            push(mut lines, "exact {describe(e)}")
+            -1
+        }
+    }
+    push(mut lines, "exact affected {sent}")
+    let over = text.repeat("a", 0xFFFFFF + 49)
+    let sent_over = db.execute(over, []) catch {
+        e => {
+            push(mut lines, "over {describe(e)}")
+            -1
+        }
+    }
+    push(mut lines, "over affected {sent_over}")
+    let big = io.buffer(2621440)
+    let stored = db.execute("INSERT INTO blobs VALUES (?)", [sql.Value.Bytes(big)]) catch {
+        e => {
+            push(mut lines, "long data {describe(e)}")
+            -1
+        }
+    }
+    push(mut lines, "long data affected {stored}")
+    for i in 0..66 {
+        db.execute("SELECT ? + {i}", [sql.Value.Int(i)]) catch {
+            e => {
+                push(mut lines, "statement {i} {describe(e)}")
+                0
+            }
+        }
+    }
+    st.reset() catch {
+        e => push(mut lines, "reset {describe(e)}")
+    }
+    c.handle.close()
+    text.join(lines, "\n    ")
+}
+
+fn command_rounds() -> []Round {
+    [Round { label: "commands", script: script_commands, client: commands_client }]
+}

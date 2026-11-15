@@ -1,0 +1,252 @@
+import std/io
+import std/text
+
+const chunk = 0xFFFFFF
+
+const long_password = 1
+const found_rows = 2
+const long_flag = 4
+const connect_with_db = 8
+const protocol_41 = 512
+const ssl = 2048
+const transactions = 8192
+const secure_connection = 32768
+const multi_statements = 1 << 16
+const multi_results = 1 << 17
+const ps_multi_results = 1 << 18
+const plugin_auth = 1 << 19
+const connect_attrs = 1 << 20
+const plugin_auth_lenenc_client_data = 1 << 21
+const session_track = 1 << 23
+const deprecate_eof = 1 << 24
+
+const status_in_transaction = 1
+const status_more_results = 8
+
+struct Peer {
+    stream: io.Stream
+    reader: *io.Reader
+    sequence: i64
+    notes: []str
+}
+
+struct Login {
+    capabilities: i64
+    charset: i64
+    user: str
+    response: []u8
+    database: str
+    plugin: str
+}
+
+fn peer_on(s: io.Stream) -> *Peer {
+    new(Peer { stream: s, reader: io.reader(s), sequence: 0, notes: [] })
+}
+
+fn note(p: *Peer, message: str) {
+    push(mut p.notes, message)
+}
+
+fn send(p: *Peer, payload: []u8) ! io.Error {
+    var at = 0
+    for {
+        var size = payload.len - at
+        if size > chunk {
+            size = chunk
+        }
+        var b: []u8 = []
+        io.put_le24(mut b, size)
+        push(mut b, u8(p.sequence))
+        p.sequence = (p.sequence + 1) & 255
+        io.append(mut b, payload[at..at + size])
+        io.write_all(p.stream, b)?
+        at += size
+        if size < chunk {
+            break
+        }
+    }
+}
+
+fn receive(p: *Peer) -> []u8 ! io.Error {
+    var body: []u8 = []
+    var first = true
+    for {
+        let header = io.read_exact(p.reader, 4)?
+        let size = io.le24(header, 0)
+        if i64(header[3]) != p.sequence {
+            note(p, "sequence {header[3]} where {p.sequence} was due")
+        }
+        p.sequence = (i64(header[3]) + 1) & 255
+        let part = io.read_exact(p.reader, size)?
+        if first && size < chunk {
+            return part
+        }
+        first = false
+        io.append(mut body, part)
+        if size < chunk {
+            break
+        }
+    }
+    body
+}
+
+fn command(p: *Peer) -> []u8 ! io.Error {
+    p.sequence = 0
+    receive(p)?
+}
+
+fn lenenc(mut b: []u8, n: i64) {
+    match n {
+        < 251 => push(mut b, u8(n))
+        < 65536 => {
+            push(mut b, 252)
+            io.put_le16(mut b, n)
+        }
+        < 16777216 => {
+            push(mut b, 253)
+            io.put_le24(mut b, n)
+        }
+        _ => {
+            push(mut b, 254)
+            io.put_le64(mut b, n)
+        }
+    }
+}
+
+fn lenenc_text(mut b: []u8, s: str) {
+    lenenc(mut b, s.len)
+    text.append(mut b, s)
+}
+
+fn cstring(mut b: []u8, s: str) {
+    text.append(mut b, s)
+    push(mut b, 0)
+}
+
+fn read_lenenc(b: []u8, at: i64) -> []i64 {
+    let first = i64(b[at])
+    match first {
+        < 251 => [first, at + 1]
+        252 => [io.le16(b, at + 1), at + 3]
+        253 => [io.le24(b, at + 1), at + 4]
+        _ => [io.le64(b, at + 1), at + 9]
+    }
+}
+
+fn server_capabilities(with_ssl: bool) -> i64 {
+    var caps = long_password | found_rows | long_flag | connect_with_db | protocol_41 | transactions | secure_connection | multi_statements | multi_results | ps_multi_results | plugin_auth | connect_attrs | plugin_auth_lenenc_client_data | session_track | deprecate_eof
+    if with_ssl {
+        caps |= ssl
+    }
+    caps
+}
+
+fn greeting(p: *Peer, version: str, thread: i64, nonce: []u8, capabilities: i64, plugin: str) ! io.Error {
+    var b: []u8 = []
+    push(mut b, 10)
+    cstring(mut b, version)
+    io.put_le32(mut b, thread)
+    io.append(mut b, nonce[..8])
+    push(mut b, 0)
+    io.put_le16(mut b, capabilities & 0xFFFF)
+    push(mut b, 45)
+    io.put_le16(mut b, 2)
+    io.put_le16(mut b, capabilities >> 16)
+    push(mut b, 21)
+    for _ in 0..10 {
+        push(mut b, 0)
+    }
+    io.append(mut b, nonce[8..20])
+    push(mut b, 0)
+    cstring(mut b, plugin)
+    p.sequence = 0
+    send(p, b)?
+}
+
+fn login_of(payload: []u8) -> Login {
+    let capabilities = io.le32(payload, 0)
+    let charset = i64(payload[8])
+    var at = 32
+    var end = at
+    for payload[end] != 0 {
+        end += 1
+    }
+    let user = str(payload[at..end])
+    at = end + 1
+    let sized = read_lenenc(payload, at)
+    let response = payload[sized[1]..sized[1] + sized[0]]
+    at = sized[1] + sized[0]
+    var database = ""
+    if (capabilities & connect_with_db) != 0 {
+        end = at
+        for payload[end] != 0 {
+            end += 1
+        }
+        database = str(payload[at..end])
+        at = end + 1
+    }
+    end = at
+    for payload[end] != 0 {
+        end += 1
+    }
+    Login { capabilities, charset, user, response, database, plugin: str(payload[at..end]) }
+}
+
+fn ok(affected: i64, last_id: i64, status: i64) -> []u8 {
+    var b: []u8 = []
+    push(mut b, 0)
+    lenenc(mut b, affected)
+    lenenc(mut b, last_id)
+    io.put_le16(mut b, status)
+    io.put_le16(mut b, 0)
+    lenenc(mut b, 0)
+    b
+}
+
+fn failure(code: i64, state: str, message: str) -> []u8 {
+    var b: []u8 = []
+    push(mut b, 0xFF)
+    io.put_le16(mut b, code)
+    if state.len > 0 {
+        push(mut b, '#')
+        text.append(mut b, state)
+    }
+    text.append(mut b, message)
+    b
+}
+
+fn terminator(status: i64) -> []u8 {
+    var b: []u8 = []
+    push(mut b, 0xFE)
+    lenenc(mut b, 0)
+    lenenc(mut b, 0)
+    io.put_le16(mut b, status)
+    io.put_le16(mut b, 0)
+    b
+}
+
+fn column(name: str, kind: i64, flags: i64, charset: i64) -> []u8 {
+    var b: []u8 = []
+    lenenc_text(mut b, "def")
+    lenenc_text(mut b, "lowtest")
+    lenenc_text(mut b, "t")
+    lenenc_text(mut b, "t")
+    lenenc_text(mut b, name)
+    lenenc_text(mut b, name)
+    push(mut b, 0x0c)
+    io.put_le16(mut b, charset)
+    io.put_le32(mut b, 255)
+    push(mut b, u8(kind))
+    io.put_le16(mut b, flags)
+    push(mut b, 0)
+    io.put_le16(mut b, 0)
+    b
+}
+
+fn text_row(cells: []str) -> []u8 {
+    var b: []u8 = []
+    for c in cells {
+        lenenc_text(mut b, c)
+    }
+    b
+}

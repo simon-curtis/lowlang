@@ -1,0 +1,127 @@
+import std/io
+import std/crypto
+import std/crypto/der
+import std/crypto/hash
+import std/crypto/limb
+
+const rsa_encryption = "1.2.840.113549.1.1.1"
+
+/// Parses a DER `SubjectPublicKeyInfo` (RFC 5280) holding an RSA key, the form of a `-----BEGIN PUBLIC KEY-----` PEM block.
+///
+/// The algorithm must be `rsaEncryption` and the key bits an `RSAPublicKey` as `parse_public` reads it. Fails with `Malformed` for DER that is not minimal, has trailing bytes or a bit string with unused bits, and with `Unsupported` for another algorithm or an unusable key.
+pub fn parse_public_key_info(encoded: []u8) -> PublicKey ! io.Error {
+    let outer = der.whole(encoded, 0x30)?
+    let r = der.reader(outer.content)
+    let algorithm = der.enter(r, 0x30)?
+    let oid = der.expect(algorithm, 0x06)?
+    if der.oid(oid.content)? != rsa_encryption {
+        fail Unsupported
+    }
+    let parameters = der.expect(algorithm, 0x05)?
+    if parameters.content.len != 0 {
+        fail Malformed
+    }
+    der.finish(algorithm)?
+    let key = der.expect(r, 0x03)?
+    der.finish(r)?
+    parse_public(der.bits(key.content)?)
+}
+
+fn oaep_encode(a: hash.Algorithm, label: []u8, message: []u8, seed: []u8, size: i64) -> []u8 {
+    let h = a.size
+    let db_len = size - h - 1
+    let db: []u8 = __make(db_len)
+    __memmove(db, hash.sum(a, label))
+    db[db_len - message.len - 1] = 0x01
+    __memmove(db[db_len - message.len..], message)
+    let db_mask = mgf1(a, seed, db_len)
+    for i in 0..db_len {
+        db[i] ^= db_mask[i]
+    }
+    let seed_mask = mgf1(a, db, h)
+    let em: []u8 = __make(size)
+    for i in 0..h {
+        em[1 + i] = seed[i] ^ seed_mask[i]
+    }
+    __memmove(em[1 + h..], db)
+    em
+}
+
+/// Encrypts `message` with RSAES-OAEP (RFC 8017 section 7.1) and returns a ciphertext as long as the modulus.
+///
+/// `a` is the hash of the padding and of MGF1, and `label` is the optional label bound to the ciphertext, usually empty. The seed is `a.size` random bytes from `crypto.random`, so encrypting the same message twice gives different ciphertexts.
+///
+/// Fails with `Unsupported` when the key is unusable and with `Invalid` when `message` is longer than the modulus length less `2 * a.size + 2`.
+pub fn encrypt_oaep(key: PublicKey, a: hash.Algorithm, label: []u8, message: []u8) -> []u8 ! io.Error {
+    if !usable(key) {
+        fail Unsupported
+    }
+    let size = key.n.len
+    if message.len > size - 2 * a.size - 2 {
+        fail Invalid
+    }
+    let em = oaep_encode(a, label, message, crypto.random(a.size), size)
+    let c = public_op(key, em)
+    if c.len == 0 {
+        fail Invalid
+    }
+    c
+}
+
+fn oaep_decode(a: hash.Algorithm, label: []u8, em: []u8) -> []u8? {
+    let h = a.size
+    let size = em.len
+    let db_len = size - h - 1
+    let masked_db = em[1 + h..]
+    let seed_mask = mgf1(a, masked_db, h)
+    let seed: []u8 = __make(h)
+    for i in 0..h {
+        seed[i] = em[1 + i] ^ seed_mask[i]
+    }
+    let db_mask = mgf1(a, seed, db_len)
+    let db: []u8 = __make(db_len)
+    for i in 0..db_len {
+        db[i] = masked_db[i] ^ db_mask[i]
+    }
+    var invalid = i64(em[0])
+    if !hash.equal(db[..h], hash.sum(a, label)) {
+        invalid |= 1
+    }
+    var looking = 1
+    var separator = 0
+    for i in h..db_len {
+        let b = i64(db[i])
+        let zero = ((b - 1) >> 63) & 1
+        let one = (((b ^ 1) - 1) >> 63) & 1
+        let hit = looking & one
+        separator += hit * (i + 1)
+        invalid |= looking & (1 - zero) & (1 - one)
+        looking &= 1 - one
+    }
+    invalid |= looking
+    if invalid != 0 {
+        return none
+    }
+    db[separator..]
+}
+
+/// Decrypts `ciphertext` with RSAES-OAEP (RFC 8017 section 7.1) and returns the message.
+///
+/// `a` and `label` must be those the sender used. The padding is checked without exiting early, and every failure of the padding gives the same error.
+///
+/// Fails with `Invalid` when `ciphertext` is not as long as the modulus or not below it, when the padding does not verify or when the modulus is shorter than `2 * a.size + 2`.
+pub fn decrypt_oaep(key: PrivateKey, a: hash.Algorithm, label: []u8, ciphertext: []u8) -> []u8 ! io.Error {
+    let size = key.n.len
+    let k = limb_count(key.n)
+    if ciphertext.len != size || size < 2 * a.size + 2 {
+        fail Invalid
+    }
+    if compare(limb.from_bytes(ciphertext, k), limb.from_bytes(key.n, k)) >= 0 {
+        fail Invalid
+    }
+    let em = private_op(key, ciphertext)
+    match oaep_decode(a, label, em) {
+        some(message) => message
+        none => fail Invalid
+    }
+}

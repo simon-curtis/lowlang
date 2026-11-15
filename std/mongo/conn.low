@@ -1,0 +1,520 @@
+import std/base64
+import std/bson
+import std/crypto
+import std/crypto/hash
+import std/crypto/md5
+import std/crypto/sasl
+import std/io
+import std/net
+import std/text
+import std/time
+import std/tls
+
+const driver_name = "lowlang"
+const driver_version = "1"
+const minimum_wire_version = 6
+
+struct Credential {
+    user: str
+    password: str
+    source: str
+    mechanism: str
+}
+
+struct Settings {
+    app_name: str
+    credential: Credential?
+    tls: tls.Config?
+    compressors: []str
+    zlib_level: i64
+    connect_timeout: i64
+    socket_timeout: i64
+}
+
+struct Hello {
+    writable: bool
+    secondary: bool
+    arbiter: bool
+    hidden: bool
+    mongos: bool
+    set_name: str
+    hosts: []str
+    passives: []str
+    arbiters: []str
+    primary: str
+    me: str
+    tags: []Tag
+    max_bson: i64
+    max_message: i64
+    max_batch: i64
+    session_minutes: i64
+    min_wire: i64
+    max_wire: i64
+    election_id: []u8
+    set_version: i64
+    topology_version: []bson.Field
+    compression: []str
+    mechanisms: []str
+    last_write: i64
+    cluster_time: []bson.Field
+}
+
+struct Conn {
+    stream: io.Stream
+    reader: *io.Reader
+    timeouts: *net.Timeouts
+    address: str
+    request_id: i64
+    hello: Hello
+    compressor: i64
+    zlib_level: i64
+    socket_timeout: i64
+    generation: i64
+    created: i64
+    used: i64
+    closed: bool
+    round_trip: i64
+}
+
+fn blank_hello() -> Hello {
+    Hello {
+        writable: false, secondary: false, arbiter: false, hidden: false, mongos: false, set_name: "", hosts: [], passives: [], arbiters: [],
+        primary: "", me: "", tags: [], max_bson: 16777216, max_message: 48000000, max_batch: 100000, session_minutes: 0, min_wire: 0, max_wire: 0,
+        election_id: [], set_version: 0, topology_version: [], compression: [], mechanisms: [], last_write: 0, cluster_time: []
+    }
+}
+
+fn tags_of(fields: []bson.Field) -> []Tag {
+    var out: []Tag = []
+    for f in fields {
+        match f.value {
+            Str(s) => push(mut out, Tag { name: f.name, value: s })
+            _ => {}
+        }
+    }
+    out
+}
+
+fn election_of(fields: []bson.Field) -> []u8 {
+    match bson.get(fields, "electionId") {
+        some(v) => match v {
+            ObjectId(b) => b
+            _ => []
+        }
+        none => []
+    }
+}
+
+fn parse_hello(reply: []bson.Field) -> Hello {
+    var h = blank_hello()
+    h.writable = get_bool(reply, "isWritablePrimary") ?? get_bool(reply, "ismaster") ?? false
+    h.secondary = get_bool(reply, "secondary") ?? false
+    h.arbiter = get_bool(reply, "arbiterOnly") ?? false
+    h.hidden = get_bool(reply, "hidden") ?? false
+    h.mongos = (get_text(reply, "msg") ?? "") == "isdbgrid"
+    h.set_name = get_text(reply, "setName") ?? ""
+    h.hosts = get_texts(reply, "hosts")
+    h.passives = get_texts(reply, "passives")
+    h.arbiters = get_texts(reply, "arbiters")
+    h.primary = get_text(reply, "primary") ?? ""
+    h.me = get_text(reply, "me") ?? ""
+    h.tags = tags_of(get_document(reply, "tags") ?? [])
+    h.max_bson = get_int(reply, "maxBsonObjectSize") ?? 16777216
+    h.max_message = get_int(reply, "maxMessageSizeBytes") ?? 48000000
+    h.max_batch = get_int(reply, "maxWriteBatchSize") ?? 100000
+    h.session_minutes = get_int(reply, "logicalSessionTimeoutMinutes") ?? 0
+    h.min_wire = get_int(reply, "minWireVersion") ?? 0
+    h.max_wire = get_int(reply, "maxWireVersion") ?? 0
+    h.election_id = election_of(reply)
+    h.set_version = get_int(reply, "setVersion") ?? 0
+    h.topology_version = get_document(reply, "topologyVersion") ?? []
+    h.compression = get_texts(reply, "compression")
+    h.mechanisms = get_texts(reply, "saslSupportedMechs")
+    let write = get_document(reply, "lastWrite") ?? []
+    match bson.get(write, "lastWriteDate") {
+        some(v) => match v {
+            DateTime(ms) => {
+                h.last_write = ms
+            }
+            _ => {}
+        }
+        none => {}
+    }
+    h.cluster_time = get_document(reply, "$clusterTime") ?? []
+    h
+}
+
+fn split_address(address: str) -> []str ! Error {
+    var host = address
+    var port = "27017"
+    if text.starts_with(address, "[") {
+        let close = text.index_byte(address, ']')
+        if close < 0 {
+            fail Invalid("malformed address {address}")
+        }
+        host = address[1..close]
+        if close + 1 < address.len {
+            if address[close + 1] != ':' {
+                fail Invalid("malformed address {address}")
+            }
+            port = address[close + 2..]
+        }
+    } else {
+        let colon = text.last_index_byte(address, ':')
+        if colon >= 0 {
+            host = address[..colon]
+            port = address[colon + 1..]
+        }
+    }
+    if host.len == 0 || port.len == 0 {
+        fail Invalid("malformed address {address}")
+    }
+    [host, port]
+}
+
+fn dial(address: str, s: Settings) -> net.Conn ! Error {
+    let parts = split_address(address)?
+    let port = text.parse_int(parts[1]) or fail Invalid("malformed port in {address}")
+    using conn = net.dial_within(parts[0], port, s.connect_timeout) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    conn
+}
+
+fn open_connection(address: str, s: Settings, generation: i64) -> *Conn ! Error {
+    let parts = split_address(address)?
+    using var conn = dial(address, s)?
+    conn.handle.timeouts.read = s.connect_timeout
+    conn.handle.timeouts.write = s.connect_timeout
+    var stream = net.stream(conn)
+    match s.tls {
+        some(config) => {
+            var named = config
+            if named.server_name.len == 0 {
+                named.server_name = parts[0]
+            }
+            let session = tls.client_handle(stream, named) catch {
+                TimedOut => fail Timeout
+                _ => fail Connect
+            }
+            stream = tls.stream_on(session)
+        }
+        none => {}
+    }
+    let wire = net.detach(mut conn)
+    let now = time.monotonic()
+    let c = new(Conn {
+        stream
+        reader: io.reader(stream)
+        timeouts: wire.timeouts
+        address
+        request_id: 0
+        hello: blank_hello()
+        compressor: 0
+        zlib_level: s.zlib_level
+        socket_timeout: s.socket_timeout
+        generation
+        created: now
+        used: now
+        closed: false
+        round_trip: 0
+    })
+    handshake(c, s) catch {
+        e => {
+            close_conn(c)
+            fail e
+        }
+    }
+    c.timeouts.read = s.socket_timeout
+    c.timeouts.write = s.socket_timeout
+    c
+}
+
+fn close_conn(c: *Conn) {
+    if c.closed {
+        return
+    }
+    c.closed = true
+    c.stream.close()
+}
+
+fn next_id(c: *Conn) -> i64 {
+    c.request_id = (c.request_id + 1) & 0x7FFFFFFF
+    c.request_id
+}
+
+fn never_compressed(name: str) -> bool {
+    match text.lower(name) {
+        "hello" => true
+        "ismaster" => true
+        "saslstart" => true
+        "saslcontinue" => true
+        "getnonce" => true
+        "authenticate" => true
+        "createuser" => true
+        "updateuser" => true
+        "copydbsaslstart" => true
+        "copydbgetnonce" => true
+        "copydb" => true
+        _ => false
+    }
+}
+
+fn send_message(c: *Conn, body: []u8, sequences: []Sequence, flags: i64, compress: bool) -> i64 ! Error {
+    let id = next_id(c)
+    let m = Message { request_id: id, response_to: 0, flags, body, sequences }
+    var frame = encode_message(m, false)
+    if compress && c.compressor != 0 {
+        frame = compress_frame(frame, c.compressor, c.zlib_level)
+    }
+    io.write_all(c.stream, frame) catch {
+        e => {
+            close_conn(c)
+            fail transport(e)
+        }
+    }
+    id
+}
+
+fn receive_message(c: *Conn) -> Message ! Error {
+    let frame = read_frame(c.reader) catch {
+        e => {
+            close_conn(c)
+            fail e
+        }
+    }
+    decode_message(frame) catch {
+        e => {
+            close_conn(c)
+            fail e
+        }
+    }
+}
+
+fn command_error(reply: []bson.Field) -> Error {
+    let code = get_int(reply, "code") ?? 0
+    let name = get_text(reply, "codeName") ?? ""
+    let message = get_text(reply, "errmsg") ?? ""
+    Error.Server(code, name, message, get_texts(reply, "errorLabels"))
+}
+
+fn succeeded(reply: []bson.Field) -> bool {
+    match bson.get(reply, "ok") {
+        some(v) => match number(v) {
+            some(n) => n == 1
+            none => false
+        }
+        none => false
+    }
+}
+
+fn decode_reply(body: []u8) -> []bson.Field ! Error {
+    bson.decode(body) catch {
+        e => fail invalid(e)
+    }
+}
+
+fn first_name(body: []bson.Field) -> str {
+    if body.len == 0 {
+        return ""
+    }
+    body[0].name
+}
+
+fn run(c: *Conn, db: str, body: []bson.Field, sequences: []Sequence) -> []bson.Field ! Error {
+    let name = first_name(body)
+    let full = with_fields(body, [text_of("$db", db)])
+    let encoded = bson.encode(full) catch {
+        e => fail invalid(e)
+    }
+    let started = time.monotonic()
+    send_message(c, encoded, sequences, 0, !never_compressed(name))?
+    let m = receive_message(c)?
+    c.used = time.monotonic()
+    c.round_trip = c.used - started
+    if (m.flags & flag_more_to_come) != 0 {
+        close_conn(c)
+        fail Protocol
+    }
+    let reply = decode_reply(m.body)?
+    if !succeeded(reply) {
+        fail command_error(reply)
+    }
+    reply
+}
+
+fn send_unacknowledged(c: *Conn, db: str, body: []bson.Field, sequences: []Sequence) ! Error {
+    let name = first_name(body)
+    let full = with_fields(body, [text_of("$db", db)])
+    let encoded = bson.encode(full) catch {
+        e => fail invalid(e)
+    }
+    send_message(c, encoded, sequences, flag_more_to_come, !never_compressed(name))?
+}
+
+fn hello_body(s: Settings) -> []bson.Field {
+    var driver: []bson.Field = [text_of("name", driver_name), text_of("version", driver_version)]
+    var client: []bson.Field = []
+    if s.app_name.len > 0 {
+        push(mut client, document_of("application", [text_of("name", s.app_name)]))
+    }
+    push(mut client, document_of("driver", driver))
+    push(mut client, document_of("os", [text_of("type", "Unknown")]))
+    push(mut client, text_of("platform", "lowlang"))
+    var body: []bson.Field = [int_of("hello", 1), bool_of("helloOk", true), document_of("client", client)]
+    if s.compressors.len > 0 {
+        push(mut body, texts_of("compression", s.compressors))
+    }
+    match s.credential {
+        some(cred) => {
+            if cred.mechanism.len == 0 && cred.user.len > 0 {
+                push(mut body, text_of("saslSupportedMechs", "{cred.source}.{cred.user}"))
+            }
+        }
+        none => {}
+    }
+    body
+}
+
+fn compressor_id(name: str) -> i64 {
+    match name {
+        "snappy" => compressor_snappy
+        "zlib" => compressor_zlib
+        "zstd" => compressor_zstd
+        _ => 0
+    }
+}
+
+fn chosen_compressor(offered: []str, wanted: []str) -> i64 {
+    for name in wanted {
+        for o in offered {
+            if o == name {
+                return compressor_id(name)
+            }
+        }
+    }
+    0
+}
+
+fn handshake(c: *Conn, s: Settings) ! Error {
+    let started = time.monotonic()
+    let reply = run(c, "admin", hello_body(s), [])?
+    c.round_trip = time.monotonic() - started
+    c.hello = parse_hello(reply)
+    if c.hello.max_wire < minimum_wire_version {
+        fail Unsupported
+    }
+    c.compressor = chosen_compressor(c.hello.compression, s.compressors)
+    match s.credential {
+        some(cred) => {
+            if cred.user.len > 0 || cred.mechanism.len > 0 {
+                authenticate(c, cred)?
+            }
+        }
+        none => {}
+    }
+}
+
+fn mechanism_for(cred: Credential, offered: []str) -> str ! Error {
+    if cred.mechanism.len > 0 {
+        return cred.mechanism
+    }
+    for m in offered {
+        if m == "SCRAM-SHA-256" {
+            return m
+        }
+    }
+    for m in offered {
+        if m == "SCRAM-SHA-1" {
+            return m
+        }
+    }
+    if offered.len == 0 {
+        return "SCRAM-SHA-256"
+    }
+    fail Unsupported
+}
+
+fn authenticate(c: *Conn, cred: Credential) ! Error {
+    let mechanism = mechanism_for(cred, c.hello.mechanisms)?
+    match mechanism {
+        "SCRAM-SHA-256" => scram(c, cred, mechanism, hash.sha256(), cred.password)?
+        "SCRAM-SHA-1" => scram(c, cred, mechanism, hash.sha1(), digest_password(cred))?
+        _ => fail Unsupported
+    }
+}
+
+fn digest_password(cred: Credential) -> str {
+    text.encode_hex(md5.sum(bytes("{cred.user}:mongo:{cred.password}")))
+}
+
+fn payload_of(reply: []bson.Field) -> str ! Error {
+    match bson.get(reply, "payload") {
+        some(v) => match v {
+            Binary(_, data) => return str(data)
+            Str(s) => return s
+            _ => fail Protocol
+        }
+        none => fail Protocol
+    }
+}
+
+fn conversation_of(reply: []bson.Field) -> i64 ! Error {
+    match get_int(reply, "conversationId") {
+        some(n) => n
+        none => fail Protocol
+    }
+}
+
+fn authentication_failure(e: Error) -> Error {
+    match e {
+        Server(code, _, _, _) => if code == 18 || code == 11 || code == 13 { Error.Authentication } else { e }
+        _ => e
+    }
+}
+
+fn sasl_start(c: *Conn, source: str, mechanism: str, first: str) -> []bson.Field ! Error {
+    let body = [
+        int_of("saslStart", 1),
+        text_of("mechanism", mechanism),
+        binary_of("payload", 0, bytes(first)),
+        document_of("options", [bool_of("skipEmptyExchange", true)]),
+    ]
+    run(c, source, body, []) catch {
+        e => fail authentication_failure(e)
+    }
+}
+
+fn sasl_continue(c: *Conn, source: str, id: i64, payload: str) -> []bson.Field ! Error {
+    let body = [int_of("saslContinue", 1), int_of("conversationId", id), binary_of("payload", 0, bytes(payload))]
+    run(c, source, body, []) catch {
+        e => fail authentication_failure(e)
+    }
+}
+
+fn scram(c: *Conn, cred: Credential, mechanism: str, a: hash.Algorithm, secret: str) ! Error {
+    if mechanism == "SCRAM-SHA-256" && !text.is_ascii(secret) {
+        fail Unsupported
+    }
+    let nonce = base64.encode(crypto.random(24))
+    let exchange = sasl.start(a, cred.user, secret, nonce)
+    let started = sasl_start(c, cred.source, mechanism, sasl.first(exchange))?
+    let id = conversation_of(started)?
+    let server_first = payload_of(started)?
+    let client_final = sasl.final(exchange, server_first) catch {
+        Unsupported => fail Unsupported
+        _ => fail Protocol
+    }
+    var step = sasl_continue(c, cred.source, id, client_final)?
+    let server_final = payload_of(step)?
+    sasl.verify(exchange, server_final) catch {
+        Rejected => fail Authentication
+        _ => fail Protocol
+    }
+    var done = get_bool(step, "done") ?? false
+    for !done {
+        step = sasl_continue(c, cred.source, id, "")?
+        done = get_bool(step, "done") ?? false
+    }
+}

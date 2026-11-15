@@ -1,0 +1,602 @@
+import std/bson
+import std/text
+
+const batch_margin = 16384
+const statement_overhead = 16
+
+/// Options of `insert_one` and `insert_many`.
+pub struct InsertOptions {
+    /// Whether `insert_many` stops at the first failing document. Unordered inserts try every document and report the first failure afterwards.
+    pub ordered: bool = true
+    /// Whether the server skips schema validation for the documents.
+    pub bypass_validation: bool = false
+    /// The session to run in, or `none` to use an implicit one.
+    pub session: *Session? = none
+}
+
+/// Options of `update_one`, `update_many` and `replace_one`.
+pub struct UpdateOptions {
+    /// Whether a filter that matches nothing inserts a document.
+    pub upsert: bool = false
+    /// The filters that name the `$[identifier]` elements an update changes.
+    pub array_filters: [][]bson.Field = []
+    /// The index to use: its name as a `Str` or its key pattern as a `Document`.
+    pub hint: bson.Value? = none
+    /// The collation document, or empty.
+    pub collation: []bson.Field = []
+    /// Whether the server skips schema validation for the change.
+    pub bypass_validation: bool = false
+    /// The session to run in, or `none` to use an implicit one.
+    pub session: *Session? = none
+}
+
+/// Options of `delete_one` and `delete_many`.
+pub struct DeleteOptions {
+    /// The index to use: its name as a `Str` or its key pattern as a `Document`.
+    pub hint: bson.Value? = none
+    /// The collation document, or empty.
+    pub collation: []bson.Field = []
+    /// The session to run in, or `none` to use an implicit one.
+    pub session: *Session? = none
+}
+
+/// Options of `find_one_and_delete`, `find_one_and_replace` and `find_one_and_update`.
+pub struct FindAndModifyOptions {
+    /// The fields to return, as `{ field: 1 }` or `{ field: 0 }`. Empty returns whole documents.
+    pub projection: []bson.Field = []
+    /// Which of several matches is changed, as in `FindOptions.sort`.
+    pub sort: []bson.Field = []
+    /// Whether a filter that matches nothing inserts a document.
+    pub upsert: bool = false
+    /// Whether to return the document as it is after the change rather than before it.
+    pub return_after: bool = false
+    /// The filters that name the `$[identifier]` elements an update changes.
+    pub array_filters: [][]bson.Field = []
+    /// The index to use: its name as a `Str` or its key pattern as a `Document`.
+    pub hint: bson.Value? = none
+    /// The collation document, or empty.
+    pub collation: []bson.Field = []
+    /// Whether the server skips schema validation for the change.
+    pub bypass_validation: bool = false
+    /// The most milliseconds the server works, or `0` for no limit.
+    pub max_time: i64 = 0
+    /// The session to run in, or `none` to use an implicit one.
+    pub session: *Session? = none
+}
+
+/// Options of `bulk_write`.
+pub struct BulkOptions {
+    /// Whether the operations run in the order given and stop at the first failure. Unordered operations are grouped by kind, may run in any order, and all run before the first failure is reported.
+    pub ordered: bool = true
+    /// Whether the server skips schema validation for the writes.
+    pub bypass_validation: bool = false
+    /// The session to run in, or `none` to use an implicit one.
+    pub session: *Session? = none
+}
+
+/// The id a write inserted for a document that matched nothing.
+pub struct Upsert {
+    /// The position of the operation in the call.
+    pub index: i64
+    /// The `_id` of the new document.
+    pub id: bson.Value
+}
+
+/// The result of `insert_one`.
+pub struct InsertOneResult {
+    /// The `_id` of the document: its own, or an `ObjectId` made for it. Absent from the server's view when the write was unacknowledged.
+    pub inserted_id: bson.Value
+}
+
+/// The result of `insert_many`.
+pub struct InsertManyResult {
+    /// The `_id` of each document in order, as for `InsertOneResult`.
+    pub inserted_ids: []bson.Value
+}
+
+/// The result of `update_one`, `update_many` and `replace_one`. Every count is `0` for an unacknowledged write.
+pub struct UpdateResult {
+    /// How many documents matched the filter.
+    pub matched: i64
+    /// How many of them the update changed.
+    pub modified: i64
+    /// The `_id` of the document an upsert inserted, or `none`.
+    pub upserted_id: bson.Value?
+}
+
+/// An operation of `bulk_write`.
+pub enum WriteModel {
+    /// Inserts `document`.
+    InsertOne(document: []bson.Field)
+    /// Applies the update operators in `update` to the first document that matches `filter`.
+    UpdateOne(filter: []bson.Field, update: []bson.Field, upsert: bool)
+    /// Applies the update operators in `update` to every document that matches `filter`.
+    UpdateMany(filter: []bson.Field, update: []bson.Field, upsert: bool)
+    /// Replaces the first document that matches `filter` with `replacement`.
+    ReplaceOne(filter: []bson.Field, replacement: []bson.Field, upsert: bool)
+    /// Deletes the first document that matches `filter`.
+    DeleteOne(filter: []bson.Field)
+    /// Deletes every document that matches `filter`.
+    DeleteMany(filter: []bson.Field)
+}
+
+/// The result of `bulk_write`. Every count is `0` for an unacknowledged write.
+pub struct BulkResult {
+    /// How many documents were inserted.
+    pub inserted: i64
+    /// How many documents the updates and replacements matched.
+    pub matched: i64
+    /// How many of them were changed.
+    pub modified: i64
+    /// How many documents were deleted.
+    pub deleted: i64
+    /// The documents the upserts inserted.
+    pub upserted: []Upsert
+}
+
+enum Verb {
+    Insert
+    Update
+    Delete
+}
+
+struct Statement {
+    verb: Verb
+    encoded: []u8
+    origin: i64
+    multi: bool
+}
+
+struct Tally {
+    inserted: i64
+    matched: i64
+    modified: i64
+    deleted: i64
+    upserted: []Upsert
+    failure: Error?
+}
+
+struct Limits {
+    document: i64
+    message: i64
+    batch: i64
+}
+
+fn verb_command(v: Verb) -> str {
+    match v {
+        Insert => "insert"
+        Update => "update"
+        Delete => "delete"
+    }
+}
+
+fn verb_sequence(v: Verb) -> str {
+    match v {
+        Insert => "documents"
+        Update => "updates"
+        Delete => "deletes"
+    }
+}
+
+fn write_limits(h: *ClientHandle) -> Limits ! Error {
+    let s = choose(h.topology, ReadPreference {}, true, "")?
+    Limits { document: s.hello.max_bson, message: s.hello.max_message, batch: s.hello.max_batch }
+}
+
+fn encoded(fields: []bson.Field) -> []u8 ! Error {
+    bson.encode(fields) catch {
+        e => fail invalid(e)
+    }
+}
+
+fn operators(fields: []bson.Field) -> bool {
+    if fields.len == 0 {
+        return false
+    }
+    text.starts_with(fields[0].name, "$")
+}
+
+fn check_update(update: []bson.Field) ! Error {
+    if !operators(update) {
+        fail Invalid("an update document needs update operators such as $set; use replace_one to replace a document")
+    }
+}
+
+fn check_replacement(replacement: []bson.Field) ! Error {
+    if operators(replacement) {
+        fail Invalid("a replacement document cannot hold update operators; use update_one to apply them")
+    }
+}
+
+struct Prepared {
+    fields: []bson.Field
+    id: bson.Value
+}
+
+fn with_id(document: []bson.Field) -> Prepared {
+    match bson.get(document, "_id") {
+        some(v) => Prepared { fields: document, id: v }
+        none => {
+            let id = bson.new_object_id()
+            Prepared { fields: with_fields([bson.Field { name: "_id", value: id }], document), id }
+        }
+    }
+}
+
+fn concern_of(c: Collection, session: *Session?) -> []bson.Field {
+    concern_fields(session, c.write_concern)
+}
+
+fn is_unacknowledged(c: Collection, session: *Session?) -> bool {
+    !acknowledged(c.write_concern) && !in_transaction(session)
+}
+
+fn check_write(reply: []bson.Field, origin: []i64) -> Error? {
+    let errors = get_documents(reply, "writeErrors")
+    if errors.len > 0 {
+        let e = errors[0]
+        var index = get_int(e, "index") ?? 0
+        if index >= 0 && index < origin.len {
+            index = origin[index]
+        }
+        return some(Error.Write(index, get_int(e, "code") ?? 0, get_text(e, "errmsg") ?? ""))
+    }
+    let concern = get_document(reply, "writeConcernError") ?? []
+    if concern.len > 0 {
+        return some(Error.WriteConcern(get_int(concern, "code") ?? 0, get_text(concern, "errmsg") ?? ""))
+    }
+    none
+}
+
+fn run_batches(c: Collection, statements: []Statement, ordered: bool, bypass: bool, session: *Session?, tally: *Tally) ! Error {
+    if statements.len == 0 {
+        return
+    }
+    let verb = statements[0].verb
+    let limits = write_limits(c.client)?
+    var retryable = true
+    for st in statements {
+        if st.multi {
+            retryable = false
+        }
+    }
+    let unacknowledged = is_unacknowledged(c, session)
+    var at = 0
+    for at < statements.len {
+        var documents: [][]u8 = []
+        var origin: []i64 = []
+        var used = 0
+        for at < statements.len && documents.len < limits.batch {
+            let st = statements[at]
+            if st.encoded.len > limits.document + batch_margin {
+                fail Invalid("a document is larger than the server's limit of {limits.document} bytes")
+            }
+            if documents.len > 0 && used + st.encoded.len + statement_overhead > limits.message - batch_margin {
+                break
+            }
+            push(mut documents, st.encoded)
+            push(mut origin, st.origin)
+            used += st.encoded.len + statement_overhead
+            at += 1
+        }
+        let body = joined([
+            [text_of(verb_command(verb), c.name), bool_of("ordered", ordered)]
+            concern_of(c, session)
+            flag_field("bypassDocumentValidation", bypass)
+        ])
+        let op = Op {
+            db: c.database
+            body
+            sequences: [Sequence { identifier: verb_sequence(verb), documents }]
+            write: true
+            retry: retryable
+            session
+            unacknowledged
+        }
+        let reply = execute(c.client, op)?
+        if unacknowledged {
+            continue
+        }
+        let n = get_int(reply.fields, "n") ?? 0
+        var upserted: []Upsert = []
+        for u in get_documents(reply.fields, "upserted") {
+            let index = get_int(u, "index") ?? 0
+            var id: bson.Value = bson.Value.Null
+            match bson.get(u, "_id") {
+                some(v) => {
+                    id = v
+                }
+                none => {}
+            }
+            var position = index
+            if index >= 0 && index < origin.len {
+                position = origin[index]
+            }
+            push(mut upserted, Upsert { index: position, id })
+        }
+        for u in upserted {
+            push(mut tally.upserted, u)
+        }
+        match verb {
+            Insert => {
+                tally.inserted += n
+            }
+            Update => {
+                tally.matched += n - upserted.len
+                tally.modified += get_int(reply.fields, "nModified") ?? 0
+            }
+            Delete => {
+                tally.deleted += n
+            }
+        }
+        let problem = check_write(reply.fields, origin)
+        match problem {
+            some(e) => {
+                match tally.failure {
+                    some(_) => {}
+                    none => {
+                        tally.failure = problem
+                    }
+                }
+                if ordered {
+                    return
+                }
+            }
+            none => {}
+        }
+    }
+}
+
+fn new_tally() -> *Tally {
+    new(Tally { inserted: 0, matched: 0, modified: 0, deleted: 0, upserted: [], failure: none })
+}
+
+fn conclude(tally: *Tally) ! Error {
+    match tally.failure {
+        some(e) => fail e
+        none => {}
+    }
+}
+
+fn update_statement(filter: []bson.Field, update: []bson.Field, multi: bool, o: UpdateOptions, origin: i64) -> Statement ! Error {
+    var fields: []bson.Field = [document_of("q", filter), document_of("u", update), bool_of("multi", multi), bool_of("upsert", o.upsert)]
+    if o.array_filters.len > 0 {
+        push(mut fields, documents_of("arrayFilters", o.array_filters))
+    }
+    for f in optional_field("hint", o.hint) {
+        push(mut fields, f)
+    }
+    for f in nonempty_field("collation", o.collation) {
+        push(mut fields, f)
+    }
+    Statement { verb: Verb.Update, encoded: encoded(fields)?, origin, multi }
+}
+
+fn delete_statement(filter: []bson.Field, multi: bool, o: DeleteOptions, origin: i64) -> Statement ! Error {
+    var limit = 1
+    if multi {
+        limit = 0
+    }
+    var fields: []bson.Field = [document_of("q", filter), int_of("limit", limit)]
+    for f in optional_field("hint", o.hint) {
+        push(mut fields, f)
+    }
+    for f in nonempty_field("collation", o.collation) {
+        push(mut fields, f)
+    }
+    Statement { verb: Verb.Delete, encoded: encoded(fields)?, origin, multi }
+}
+
+/// Inserts `document` into `c`, adding an `ObjectId` `_id` when it has none, and returns the `_id`.
+///
+/// A network failure or a retryable server error is retried once on a deployment that supports retryable writes. Fails with `Write` when the server rejects the document, such as code `11000` for a duplicate key, and with `WriteConcern` when the write was applied but the write concern of `c` was not met.
+pub fn insert_one(c: Collection, document: []bson.Field, o: InsertOptions) -> InsertOneResult ! Error {
+    let result = insert_many(c, [document], o)?
+    InsertOneResult { inserted_id: result.inserted_ids[0] }
+}
+
+/// Inserts `documents` into `c`, adding an `ObjectId` `_id` to those that have none, in as many batches as the server's limits need.
+///
+/// With `ordered` the first failing document stops the call; without it every document is tried. Either way the call fails with the first `Write` or `WriteConcern` error once it has finished, and the documents before it were inserted. Fails with `Invalid` for no documents.
+pub fn insert_many(c: Collection, documents: [][]bson.Field, o: InsertOptions) -> InsertManyResult ! Error {
+    if documents.len == 0 {
+        fail Invalid("no document to insert")
+    }
+    var statements: []Statement = []
+    var ids: []bson.Value = []
+    for d in documents {
+        let prepared = with_id(d)
+        let bytes = encoded(prepared.fields)?
+        push(mut statements, Statement { verb: Verb.Insert, encoded: bytes, origin: statements.len, multi: false })
+        push(mut ids, prepared.id)
+    }
+    let tally = new_tally()
+    run_batches(c, statements, o.ordered, o.bypass_validation, o.session, tally)?
+    conclude(tally)?
+    InsertManyResult { inserted_ids: ids }
+}
+
+fn update_result(tally: *Tally) -> UpdateResult {
+    var upserted: bson.Value? = none
+    if tally.upserted.len > 0 {
+        upserted = some(tally.upserted[0].id)
+    }
+    UpdateResult { matched: tally.matched, modified: tally.modified, upserted_id: upserted }
+}
+
+fn update_with(c: Collection, filter: []bson.Field, update: []bson.Field, multi: bool, o: UpdateOptions) -> UpdateResult ! Error {
+    let statement = update_statement(filter, update, multi, o, 0)?
+    let tally = new_tally()
+    run_batches(c, [statement], true, o.bypass_validation, o.session, tally)?
+    conclude(tally)?
+    update_result(tally)
+}
+
+/// Applies the update operators in `update`, such as `{ $set: { a: 1 } }`, to the first document of `c` that matches `filter`. Fails with `Invalid` when `update` holds no operators.
+pub fn update_one(c: Collection, filter: []bson.Field, update: []bson.Field, o: UpdateOptions) -> UpdateResult ! Error {
+    check_update(update)?
+    update_with(c, filter, update, false, o)?
+}
+
+/// Applies the update operators in `update` to every document of `c` that matches `filter`. Not retried after a failure, because a retry could apply it twice.
+pub fn update_many(c: Collection, filter: []bson.Field, update: []bson.Field, o: UpdateOptions) -> UpdateResult ! Error {
+    check_update(update)?
+    update_with(c, filter, update, true, o)?
+}
+
+/// Replaces the first document of `c` that matches `filter` with `replacement`, keeping its `_id`. Fails with `Invalid` when `replacement` holds update operators.
+pub fn replace_one(c: Collection, filter: []bson.Field, replacement: []bson.Field, o: UpdateOptions) -> UpdateResult ! Error {
+    check_replacement(replacement)?
+    update_with(c, filter, replacement, false, o)?
+}
+
+fn delete_with(c: Collection, filter: []bson.Field, multi: bool, o: DeleteOptions) -> i64 ! Error {
+    let statement = delete_statement(filter, multi, o, 0)?
+    let tally = new_tally()
+    run_batches(c, [statement], true, false, o.session, tally)?
+    conclude(tally)?
+    tally.deleted
+}
+
+/// Deletes the first document of `c` that matches `filter` and returns how many were deleted, `0` or `1`.
+pub fn delete_one(c: Collection, filter: []bson.Field, o: DeleteOptions) -> i64 ! Error {
+    delete_with(c, filter, false, o)?
+}
+
+/// Deletes every document of `c` that matches `filter` and returns how many were deleted. Not retried after a failure, because a retry could delete more.
+pub fn delete_many(c: Collection, filter: []bson.Field, o: DeleteOptions) -> i64 ! Error {
+    delete_with(c, filter, true, o)?
+}
+
+fn modify(c: Collection, filter: []bson.Field, change: []bson.Field, o: FindAndModifyOptions) -> []bson.Field? ! Error {
+    var body = joined([
+        [text_of("findAndModify", c.name), document_of("query", filter)]
+        change
+        nonempty_field("sort", o.sort)
+        nonempty_field("fields", o.projection)
+        flag_field("new", o.return_after)
+        flag_field("upsert", o.upsert)
+        optional_field("hint", o.hint)
+        nonempty_field("collation", o.collation)
+        flag_field("bypassDocumentValidation", o.bypass_validation)
+        positive_field("maxTimeMS", o.max_time)
+        concern_of(c, o.session)
+    ])
+    if o.array_filters.len > 0 {
+        body = with_fields(body, [documents_of("arrayFilters", o.array_filters)])
+    }
+    let op = Op { db: c.database, body, write: true, retry: true, session: o.session }
+    let reply = execute(c.client, op)?
+    match check_write(reply.fields, []) {
+        some(e) => fail e
+        none => {}
+    }
+    get_document(reply.fields, "value")
+}
+
+/// Deletes the first document of `c` that matches `filter` and returns it, or `none` when nothing matched.
+pub fn find_one_and_delete(c: Collection, filter: []bson.Field, o: FindAndModifyOptions) -> []bson.Field? ! Error {
+    modify(c, filter, [bool_of("remove", true)], o)?
+}
+
+/// Replaces the first document of `c` that matches `filter` with `replacement` and returns the old document, or the new one when `return_after` is set. `none` when nothing matched and `upsert` is not set.
+pub fn find_one_and_replace(c: Collection, filter: []bson.Field, replacement: []bson.Field, o: FindAndModifyOptions) -> []bson.Field? ! Error {
+    check_replacement(replacement)?
+    modify(c, filter, [document_of("update", replacement)], o)?
+}
+
+/// Applies the update operators in `update` to the first document of `c` that matches `filter` and returns the old document, or the new one when `return_after` is set.
+pub fn find_one_and_update(c: Collection, filter: []bson.Field, update: []bson.Field, o: FindAndModifyOptions) -> []bson.Field? ! Error {
+    check_update(update)?
+    modify(c, filter, [document_of("update", update)], o)?
+}
+
+fn statement_of(m: WriteModel, origin: i64) -> Statement ! Error {
+    match m {
+        InsertOne(document) => {
+            let prepared = with_id(document)
+            Statement { verb: Verb.Insert, encoded: encoded(prepared.fields)?, origin, multi: false }
+        }
+        UpdateOne(filter, update, upsert) => {
+            check_update(update)?
+            update_statement(filter, update, false, UpdateOptions { upsert }, origin)?
+        }
+        UpdateMany(filter, update, upsert) => {
+            check_update(update)?
+            update_statement(filter, update, true, UpdateOptions { upsert }, origin)?
+        }
+        ReplaceOne(filter, replacement, upsert) => {
+            check_replacement(replacement)?
+            update_statement(filter, replacement, false, UpdateOptions { upsert }, origin)?
+        }
+        DeleteOne(filter) => delete_statement(filter, false, DeleteOptions {}, origin)?
+        DeleteMany(filter) => delete_statement(filter, true, DeleteOptions {}, origin)?
+    }
+}
+
+fn same_verb(a: Verb, b: Verb) -> bool {
+    match a {
+        Insert => match b {
+            Insert => true
+            _ => false
+        }
+        Update => match b {
+            Update => true
+            _ => false
+        }
+        Delete => match b {
+            Delete => true
+            _ => false
+        }
+    }
+}
+
+fn run_ordered(c: Collection, statements: []Statement, o: BulkOptions, tally: *Tally) ! Error {
+    var run: []Statement = []
+    for st in statements {
+        if run.len > 0 && !same_verb(run[0].verb, st.verb) {
+            run_batches(c, run, true, o.bypass_validation, o.session, tally)?
+            match tally.failure {
+                some(_) => return
+                none => {}
+            }
+            run = []
+        }
+        push(mut run, st)
+    }
+    run_batches(c, run, true, o.bypass_validation, o.session, tally)?
+}
+
+fn run_unordered(c: Collection, statements: []Statement, o: BulkOptions, tally: *Tally) ! Error {
+    for verb in [Verb.Insert, Verb.Update, Verb.Delete] {
+        var run: []Statement = []
+        for st in statements {
+            if same_verb(st.verb, verb) {
+                push(mut run, st)
+            }
+        }
+        run_batches(c, run, false, o.bypass_validation, o.session, tally)?
+    }
+}
+
+/// Runs `models` on `c` in as few commands as the server's limits allow and returns the totals.
+///
+/// Ordered, the operations run as given, consecutive operations of one kind sharing a command, and the first failure stops the call. Unordered, they are grouped by kind. Either way the call fails with the first `Write` or `WriteConcern` error when it ends, with `index` the position in `models`; operations before it have been applied. Fails with `Invalid` for no operations, or for an update or replacement of the wrong form.
+pub fn bulk_write(c: Collection, models: []WriteModel, o: BulkOptions) -> BulkResult ! Error {
+    if models.len == 0 {
+        fail Invalid("no operation to run")
+    }
+    var statements: []Statement = []
+    for i, m in models {
+        let st = statement_of(m, i)?
+        push(mut statements, st)
+    }
+    let tally = new_tally()
+    if o.ordered {
+        run_ordered(c, statements, o, tally)?
+    } else {
+        run_unordered(c, statements, o, tally)?
+    }
+    conclude(tally)?
+    BulkResult { inserted: tally.inserted, matched: tally.matched, modified: tally.modified, deleted: tally.deleted, upserted: tally.upserted }
+}

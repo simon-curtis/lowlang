@@ -1,0 +1,801 @@
+import std/bson
+import std/sync
+import std/time
+
+enum Kind {
+    Unknown
+    Standalone
+    Mongos
+    Primary
+    Secondary
+    Arbiter
+    Other
+}
+
+enum Shape {
+    Unknown
+    Single
+    NoPrimary
+    WithPrimary
+    Sharded
+}
+
+struct Server {
+    address: str
+    kind: Kind
+    hello: Hello
+    round_trip: i64
+    updated: i64
+    failure: str
+    idle: []*Conn
+    in_use: i64
+    generation: i64
+    removed: bool
+    wake: bool
+    checked: i64
+}
+
+struct Topology {
+    lock: sync.Mutex
+    options: Options
+    settings: Settings
+    probe: Settings
+    servers: [str: *Server]
+    shape: Shape
+    set_name: str
+    set_version: i64
+    election_id: []u8
+    cluster_time: []bson.Field
+    closed: bool
+    rotor: i64
+}
+
+const minimum_heartbeat = 500
+const nanos_per_milli = 1000000
+const minimum_staleness = 90
+
+fn new_topology(o: Options, settings: Settings, probe: Settings) -> *Topology {
+    var shape = Shape.Unknown
+    if o.direct {
+        shape = Shape.Single
+    } else if o.replica_set.len > 0 {
+        shape = Shape.NoPrimary
+    }
+    let t = new(Topology {
+        lock: sync.mutex()
+        options: o
+        settings
+        probe
+        servers: [:]
+        shape
+        set_name: o.replica_set
+        set_version: 0
+        election_id: []
+        cluster_time: []
+        closed: false
+        rotor: 0
+    })
+    sync.lock(t.lock)
+    for host in o.hosts {
+        add_server(t, host)
+    }
+    sync.unlock(t.lock)
+    t
+}
+
+fn add_server(t: *Topology, address: str) {
+    match t.servers[address] {
+        some(_) => return
+        none => {}
+    }
+    let s = new(Server {
+        address
+        kind: Kind.Unknown
+        hello: blank_hello()
+        round_trip: -1
+        updated: 0
+        failure: ""
+        idle: []
+        in_use: 0
+        generation: 0
+        removed: false
+        wake: true
+        checked: 0
+    })
+    t.servers[address] = s
+    spawn watch(t, s)
+}
+
+fn close_idle(s: *Server) {
+    for c in s.idle {
+        close_conn(c)
+    }
+    s.idle = []
+}
+
+fn remove_server(t: *Topology, s: *Server) {
+    s.removed = true
+    s.kind = Kind.Unknown
+    delete(mut t.servers, s.address)
+    close_idle(s)
+    settle(t)
+}
+
+fn has_primary(t: *Topology) -> bool {
+    for _, s in t.servers {
+        if is_primary(s.kind) {
+            return true
+        }
+    }
+    false
+}
+
+fn is_primary(k: Kind) -> bool {
+    match k {
+        Primary => true
+        _ => false
+    }
+}
+
+fn settle(t: *Topology) {
+    match t.shape {
+        NoPrimary => {
+            if has_primary(t) {
+                t.shape = Shape.WithPrimary
+            }
+        }
+        WithPrimary => {
+            if !has_primary(t) {
+                t.shape = Shape.NoPrimary
+            }
+        }
+        _ => {}
+    }
+}
+
+fn classify(h: Hello) -> Kind {
+    if h.mongos {
+        return Kind.Mongos
+    }
+    if h.set_name.len == 0 {
+        if h.writable {
+            return Kind.Standalone
+        }
+        return Kind.Unknown
+    }
+    if h.writable {
+        return Kind.Primary
+    }
+    if h.secondary {
+        return Kind.Secondary
+    }
+    if h.arbiter {
+        return Kind.Arbiter
+    }
+    Kind.Other
+}
+
+fn election_newer(a: []u8, b: []u8) -> bool {
+    var i = 0
+    for i < a.len && i < b.len {
+        if a[i] != b[i] {
+            return a[i] > b[i]
+        }
+        i += 1
+    }
+    false
+}
+
+fn member_names(h: Hello) -> []str {
+    var names: []str = []
+    for host in h.hosts {
+        push(mut names, host)
+    }
+    for host in h.passives {
+        push(mut names, host)
+    }
+    for host in h.arbiters {
+        push(mut names, host)
+    }
+    names
+}
+
+fn discover(t: *Topology, names: []str) {
+    for name in names {
+        add_server(t, name)
+    }
+}
+
+fn prune(t: *Topology, names: []str) {
+    var stale: []*Server = []
+    for address, s in t.servers {
+        var listed = false
+        for name in names {
+            if name == address {
+                listed = true
+            }
+        }
+        if !listed {
+            push(mut stale, s)
+        }
+    }
+    for s in stale {
+        remove_server(t, s)
+    }
+}
+
+fn demote_other_primaries(t: *Topology, keep: *Server) {
+    for _, o in t.servers {
+        if o.address != keep.address && is_primary(o.kind) {
+            o.kind = Kind.Unknown
+            o.hello = blank_hello()
+        }
+    }
+}
+
+fn update_primary(t: *Topology, s: *Server, h: Hello) {
+    if h.set_version > 0 && h.election_id.len > 0 {
+        let older = t.set_version > h.set_version || (t.set_version == h.set_version && election_newer(t.election_id, h.election_id))
+        if older {
+            s.kind = Kind.Unknown
+            s.hello = blank_hello()
+            return
+        }
+        t.election_id = h.election_id
+    }
+    if h.set_version > t.set_version {
+        t.set_version = h.set_version
+    }
+    demote_other_primaries(t, s)
+    let names = member_names(h)
+    discover(t, names)
+    prune(t, names)
+}
+
+fn update_member(t: *Topology, s: *Server, h: Hello) {
+    let names = member_names(h)
+    discover(t, names)
+    if h.me.len > 0 && h.me != s.address {
+        remove_server(t, s)
+    }
+}
+
+fn update_replica(t: *Topology, s: *Server, h: Hello) {
+    if t.set_name.len == 0 {
+        t.set_name = h.set_name
+    }
+    if h.set_name != t.set_name {
+        remove_server(t, s)
+        return
+    }
+    match t.shape {
+        Unknown => {
+            t.shape = Shape.NoPrimary
+        }
+        _ => {}
+    }
+    if is_primary(s.kind) {
+        update_primary(t, s, h)
+    } else {
+        update_member(t, s, h)
+    }
+    settle(t)
+}
+
+fn timestamp_of(fields: []bson.Field) -> u64 {
+    match bson.get(fields, "clusterTime") {
+        some(v) => match v {
+            Timestamp(n) => n
+            _ => 0
+        }
+        none => 0
+    }
+}
+
+fn gossip(t: *Topology, cluster_time: []bson.Field) {
+    if cluster_time.len == 0 {
+        return
+    }
+    if timestamp_of(cluster_time) > timestamp_of(t.cluster_time) {
+        t.cluster_time = cluster_time
+    }
+}
+
+fn apply(t: *Topology, s: *Server, h: Hello, rtt: i64) {
+    if s.removed {
+        return
+    }
+    s.hello = h
+    s.failure = ""
+    s.updated = time.now_millis()
+    if s.round_trip < 0 {
+        s.round_trip = rtt
+    } else {
+        s.round_trip = (s.round_trip * 4 + rtt) / 5
+    }
+    s.kind = classify(h)
+    gossip(t, h.cluster_time)
+    match t.shape {
+        Single => return
+        _ => {}
+    }
+    match s.kind {
+        Unknown => {}
+        Standalone => {
+            let alone = t.options.hosts.len == 1 && t.set_name.len == 0
+            match t.shape {
+                Unknown => {
+                    if alone {
+                        t.shape = Shape.Single
+                    } else {
+                        remove_server(t, s)
+                    }
+                }
+                _ => {
+                    remove_server(t, s)
+                }
+            }
+        }
+        Mongos => {
+            match t.shape {
+                Unknown => {
+                    t.shape = Shape.Sharded
+                }
+                Sharded => {}
+                _ => {
+                    remove_server(t, s)
+                }
+            }
+        }
+        _ => {
+            match t.shape {
+                Sharded => {
+                    remove_server(t, s)
+                }
+                _ => {
+                    update_replica(t, s, h)
+                }
+            }
+        }
+    }
+}
+
+fn observe(t: *Topology, s: *Server, h: Hello, rtt: i64) {
+    sync.lock(t.lock)
+    apply(t, s, h, rtt)
+    sync.unlock(t.lock)
+}
+
+fn mark_unknown(t: *Topology, s: *Server, failure: str) {
+    s.kind = Kind.Unknown
+    s.hello = blank_hello()
+    s.failure = failure
+    s.generation += 1
+    s.wake = true
+    close_idle(s)
+    settle(t)
+}
+
+fn server_failed(t: *Topology, s: *Server, failure: str) {
+    sync.lock(t.lock)
+    mark_unknown(t, s, failure)
+    sync.unlock(t.lock)
+}
+
+fn finished(t: *Topology, s: *Server) -> bool {
+    t.closed || s.removed
+}
+
+fn watch(t: *Topology, s: *Server) {
+    var probe: *Conn? = none
+    var started = false
+    for !finished(t, s) {
+        let pause = if t.options.heartbeat < minimum_heartbeat { t.options.heartbeat } else { minimum_heartbeat }
+        let since = (time.monotonic() - s.checked) / nanos_per_milli
+        if !started || (s.wake && since >= pause) || since >= t.options.heartbeat {
+            started = true
+            s.wake = false
+            probe = check(t, s, probe)
+            s.checked = time.monotonic()
+        }
+        sleep(10)
+    }
+    match probe {
+        some(c) => close_conn(c)
+        none => {}
+    }
+}
+
+fn check(t: *Topology, s: *Server, probe: *Conn?) -> *Conn? {
+    match probe {
+        some(c) => {
+            let started = time.monotonic()
+            let reply = run(c, "admin", [int_of("hello", 1)], []) catch {
+                e => {
+                    close_conn(c)
+                    server_failed(t, s, failure_text(e))
+                    return none
+                }
+            }
+            observe(t, s, parse_hello(reply), time.monotonic() - started)
+            c
+        }
+        none => {
+            let c = open_connection(s.address, t.probe, 0) catch {
+                e => {
+                    server_failed(t, s, failure_text(e))
+                    return none
+                }
+            }
+            observe(t, s, c.hello, c.round_trip)
+            c
+        }
+    }
+}
+
+fn failure_text(e: Error) -> str {
+    match e {
+        Connect => "connection failed"
+        Authentication => "authentication failed"
+        Closed => "connection closed"
+        Timeout => "timed out"
+        Protocol => "protocol error"
+        Unsupported => "unsupported server"
+        Invalid(m) => m
+        Selection => "no suitable server"
+        Server(_, name, message, _) => "{name}: {message}"
+        Write(_, _, message) => message
+        WriteConcern(_, message) => message
+    }
+}
+
+fn tags_match(h: Hello, set: []Tag) -> bool {
+    for want in set {
+        var found = false
+        for have in h.tags {
+            if have.name == want.name && have.value == want.value {
+                found = true
+            }
+        }
+        if !found {
+            return false
+        }
+    }
+    true
+}
+
+fn tagged(servers: []*Server, pref: ReadPreference) -> []*Server {
+    if pref.tag_sets.len == 0 {
+        return servers
+    }
+    for set in pref.tag_sets {
+        var out: []*Server = []
+        for s in servers {
+            if tags_match(s.hello, set) {
+                push(mut out, s)
+            }
+        }
+        if out.len > 0 {
+            return out
+        }
+    }
+    []
+}
+
+fn staleness(t: *Topology, s: *Server, primary: *Server?, newest: i64) -> i64 {
+    match primary {
+        some(p) => (s.updated - s.hello.last_write) - (p.updated - p.hello.last_write) + t.options.heartbeat
+        none => newest - s.hello.last_write + t.options.heartbeat
+    }
+}
+
+fn fresh(t: *Topology, secondaries: []*Server, primaries: []*Server, pref: ReadPreference) -> []*Server {
+    if pref.max_staleness < 0 {
+        return secondaries
+    }
+    var newest = 0
+    for s in secondaries {
+        if s.hello.last_write > newest {
+            newest = s.hello.last_write
+        }
+    }
+    var primary: *Server? = none
+    if primaries.len > 0 {
+        primary = some(primaries[0])
+    }
+    var out: []*Server = []
+    for s in secondaries {
+        if staleness(t, s, primary, newest) <= pref.max_staleness * 1000 {
+            push(mut out, s)
+        }
+    }
+    out
+}
+
+fn of_kind(t: *Topology, want: Kind) -> []*Server {
+    var out: []*Server = []
+    for _, s in t.servers {
+        let same = match s.kind {
+            Primary => is_primary(want)
+            Secondary => match want {
+                Secondary => true
+                _ => false
+            }
+            _ => false
+        }
+        if same {
+            push(mut out, s)
+        }
+    }
+    out
+}
+
+fn known(t: *Topology) -> []*Server {
+    var out: []*Server = []
+    for _, s in t.servers {
+        match s.kind {
+            Unknown => {}
+            _ => {
+                push(mut out, s)
+            }
+        }
+    }
+    out
+}
+
+fn replica_candidates(t: *Topology, pref: ReadPreference, write: bool) -> []*Server {
+    let primaries = of_kind(t, Kind.Primary)
+    if write {
+        return primaries
+    }
+    let secondaries = tagged(fresh(t, of_kind(t, Kind.Secondary), primaries, pref), pref)
+    match pref.mode {
+        Primary => primaries
+        PrimaryPreferred => if primaries.len > 0 { primaries } else { secondaries }
+        Secondary => secondaries
+        SecondaryPreferred => if secondaries.len > 0 { secondaries } else { primaries }
+        Nearest => {
+            var all: []*Server = []
+            for s in primaries {
+                push(mut all, s)
+            }
+            for s in secondaries {
+                push(mut all, s)
+            }
+            tagged(all, pref)
+        }
+    }
+}
+
+fn candidates(t: *Topology, pref: ReadPreference, write: bool) -> []*Server {
+    match t.shape {
+        Unknown => []
+        Single => known(t)
+        Sharded => of_mongos(t)
+        _ => replica_candidates(t, pref, write)
+    }
+}
+
+fn of_mongos(t: *Topology) -> []*Server {
+    var out: []*Server = []
+    for _, s in t.servers {
+        match s.kind {
+            Mongos => {
+                push(mut out, s)
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn within_window(t: *Topology, servers: []*Server) -> []*Server {
+    if servers.len < 2 {
+        return servers
+    }
+    var nearest = servers[0].round_trip
+    for s in servers {
+        if s.round_trip < nearest {
+            nearest = s.round_trip
+        }
+    }
+    let limit = nearest + t.options.local_threshold * nanos_per_milli
+    var out: []*Server = []
+    for s in servers {
+        if s.round_trip <= limit {
+            push(mut out, s)
+        }
+    }
+    out
+}
+
+fn pick(t: *Topology, pref: ReadPreference, write: bool, avoid: str) -> *Server? {
+    sync.lock(t.lock)
+    var chosen: *Server? = none
+    if !t.closed {
+        var near = within_window(t, candidates(t, pref, write))
+        if avoid.len > 0 && near.len > 1 {
+            var others: []*Server = []
+            for s in near {
+                if s.address != avoid {
+                    push(mut others, s)
+                }
+            }
+            near = others
+        }
+        if near.len > 0 {
+            t.rotor += 1
+            chosen = some(near[t.rotor % near.len])
+        }
+    }
+    sync.unlock(t.lock)
+    chosen
+}
+
+fn wake_unknown(t: *Topology) {
+    sync.lock(t.lock)
+    for _, s in t.servers {
+        match s.kind {
+            Unknown => {
+                s.wake = true
+            }
+            _ => {}
+        }
+    }
+    sync.unlock(t.lock)
+}
+
+fn choose(t: *Topology, pref: ReadPreference, write: bool, avoid: str) -> *Server ! Error {
+    let deadline = time.monotonic() + t.options.server_selection_timeout * nanos_per_milli
+    for {
+        match pick(t, pref, write, avoid) {
+            some(s) => return s
+            none => {}
+        }
+        if t.closed {
+            fail Closed
+        }
+        if time.monotonic() >= deadline {
+            fail Selection
+        }
+        wake_unknown(t)
+        sleep(10)
+    }
+    fail Selection
+}
+
+fn preference_document(t: *Topology, s: *Server, pref: ReadPreference) -> []bson.Field {
+    let named = mode_name(pref.mode)
+    var wanted = false
+    match t.shape {
+        Single => {
+            match s.kind {
+                Mongos => {}
+                Standalone => {}
+                _ => {
+                    wanted = true
+                }
+            }
+        }
+        Sharded => {
+            match pref.mode {
+                Primary => {}
+                _ => {
+                    wanted = true
+                }
+            }
+        }
+        _ => {
+            match pref.mode {
+                Primary => {}
+                _ => {
+                    wanted = true
+                }
+            }
+        }
+    }
+    if !wanted {
+        return []
+    }
+    var mode = named
+    match t.shape {
+        Single => {
+            match pref.mode {
+                Primary => {
+                    mode = "primaryPreferred"
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    var fields: []bson.Field = [text_of("mode", mode)]
+    if pref.tag_sets.len > 0 {
+        var sets: [][]bson.Field = []
+        for set in pref.tag_sets {
+            var tags: []bson.Field = []
+            for tag in set {
+                push(mut tags, text_of(tag.name, tag.value))
+            }
+            push(mut sets, tags)
+        }
+        push(mut fields, documents_of("tags", sets))
+    }
+    if pref.max_staleness >= 0 {
+        push(mut fields, int_of("maxStalenessSeconds", pref.max_staleness))
+    }
+    [document_of("$readPreference", fields)]
+}
+
+fn checkout(t: *Topology, s: *Server) -> *Conn ! Error {
+    let wait = t.options.wait_queue_timeout
+    let deadline = time.monotonic() + wait * nanos_per_milli
+    for {
+        sync.lock(t.lock)
+        if t.closed {
+            sync.unlock(t.lock)
+            fail Closed
+        }
+        var ready: *Conn? = none
+        for s.idle.len > 0 {
+            let c = pop(mut s.idle) ?? break
+            if c.closed || c.generation != s.generation {
+                close_conn(c)
+            } else if t.options.max_idle_time > 0 && (time.monotonic() - c.used) / nanos_per_milli > t.options.max_idle_time {
+                close_conn(c)
+            } else {
+                ready = some(c)
+                break
+            }
+        }
+        match ready {
+            some(c) => {
+                s.in_use += 1
+                sync.unlock(t.lock)
+                return c
+            }
+            none => {}
+        }
+        if s.in_use < t.options.max_pool_size {
+            s.in_use += 1
+            let generation = s.generation
+            sync.unlock(t.lock)
+            let c = open_connection(s.address, t.settings, generation) catch {
+                e => {
+                    sync.lock(t.lock)
+                    s.in_use -= 1
+                    mark_unknown(t, s, failure_text(e))
+                    sync.unlock(t.lock)
+                    fail e
+                }
+            }
+            return c
+        }
+        sync.unlock(t.lock)
+        if wait > 0 && time.monotonic() >= deadline {
+            fail Timeout
+        }
+        sleep(1)
+    }
+    fail Timeout
+}
+
+fn checkin(t: *Topology, s: *Server, c: *Conn, healthy: bool) {
+    sync.lock(t.lock)
+    s.in_use -= 1
+    if healthy && !c.closed && !t.closed && !s.removed && c.generation == s.generation {
+        push(mut s.idle, c)
+    } else {
+        close_conn(c)
+    }
+    sync.unlock(t.lock)
+}
+
+fn close_topology(t: *Topology) {
+    sync.lock(t.lock)
+    t.closed = true
+    for _, s in t.servers {
+        close_idle(s)
+    }
+    sync.unlock(t.lock)
+}

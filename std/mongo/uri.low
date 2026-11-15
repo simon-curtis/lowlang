@@ -1,0 +1,285 @@
+import std/crypto/x509
+import std/file
+import std/text
+import std/tls
+import std/uri
+
+const default_port = 27017
+
+fn unescaped(s: str, what: str) -> str ! Error {
+    uri.unescape(s) ?? fail Invalid("bad percent-escape in the {what}")
+}
+
+fn number_of(name: str, value: str) -> i64 ! Error {
+    text.parse_int(value) or fail Invalid("{name} must be a whole number")
+}
+
+fn flag_of(name: str, value: str) -> bool ! Error {
+    match value {
+        "true" => true
+        "false" => false
+        _ => fail Invalid("{name} must be true or false")
+    }
+}
+
+fn read_mode(value: str) -> ReadMode ! Error {
+    match text.lower(value) {
+        "primary" => ReadMode.Primary
+        "primarypreferred" => ReadMode.PrimaryPreferred
+        "secondary" => ReadMode.Secondary
+        "secondarypreferred" => ReadMode.SecondaryPreferred
+        "nearest" => ReadMode.Nearest
+        _ => fail Invalid("unknown read preference {value}")
+    }
+}
+
+fn tag_set(value: str) -> []Tag ! Error {
+    var out: []Tag = []
+    if value.len == 0 {
+        return out
+    }
+    for pair in text.split(value, ',') {
+        let c = text.cut(pair, ":")
+        if !c.found {
+            fail Invalid("readPreferenceTags needs name:value pairs")
+        }
+        push(mut out, Tag { name: c.before, value: c.after })
+    }
+    out
+}
+
+fn with_port(host: str) -> str ! Error {
+    if host.len == 0 {
+        fail Invalid("the connection string has an empty host")
+    }
+    var port = ""
+    if text.starts_with(host, "[") {
+        let close = text.index_byte(host, ']')
+        if close < 0 {
+            fail Invalid("malformed host {host}")
+        }
+        if close + 1 < host.len {
+            if host[close + 1] != ':' {
+                fail Invalid("malformed host {host}")
+            }
+            port = host[close + 2..]
+        }
+        if port.len == 0 {
+            return "{host}:{default_port}"
+        }
+    } else {
+        let colon = text.last_index_byte(host, ':')
+        if colon < 0 {
+            return "{host}:{default_port}"
+        }
+        port = host[colon + 1..]
+        if colon == 0 {
+            fail Invalid("malformed host {host}")
+        }
+    }
+    let n = number_of("the port", port)?
+    if n < 1 || n > 65535 {
+        fail Invalid("the port of {host} is out of range")
+    }
+    host
+}
+
+struct Locator {
+    hosts: []str
+    database: str
+    username: str
+    password: str
+    query: str
+}
+
+fn locate(connection: str) -> Locator ! Error {
+    if text.starts_with(connection, "mongodb+srv://") {
+        fail Unsupported
+    }
+    if !text.starts_with(connection, "mongodb://") {
+        fail Invalid("a connection string starts with mongodb://")
+    }
+    let rest = connection[10..]
+    let q = text.cut(rest, "?")
+    let slash = text.cut(q.before, "/")
+    var authority = slash.before
+    var username = ""
+    var password = ""
+    let at = text.last_cut(authority, "@")
+    if at.found {
+        authority = at.after
+        let colon = text.cut(at.before, ":")
+        username = unescaped(colon.before, "user name")?
+        if colon.found {
+            password = unescaped(colon.after, "password")?
+        }
+        if username.len == 0 {
+            fail Invalid("the user name is empty")
+        }
+    }
+    var hosts: []str = []
+    for host in text.split(authority, ',') {
+        let h = with_port(host)?
+        push(mut hosts, h)
+    }
+    let database = unescaped(slash.after, "database name")?
+    Locator { hosts, database, username, password, query: q.after }
+}
+
+struct TlsChoice {
+    enabled: bool
+    insecure: bool
+    ca_file: str
+}
+
+fn certificate_roots(path: str) -> []x509.Certificate ! Error {
+    let pem = file.read_file(path) catch {
+        e => fail Invalid("cannot read tlsCAFile {path}")
+    }
+    var roots: []x509.Certificate = []
+    for der in x509.pem_certificates(str(pem)) {
+        let cert = x509.parse(der) catch {
+            e => fail Invalid("tlsCAFile {path} holds a certificate that cannot be read")
+        }
+        push(mut roots, cert)
+    }
+    if roots.len == 0 {
+        fail Invalid("tlsCAFile {path} holds no certificate")
+    }
+    roots
+}
+
+fn apply_option(o: *Options, choice: *TlsChoice, name: str, value: str) ! Error {
+    match text.lower(name) {
+        "replicaset" => {
+            o.replica_set = value
+        }
+        "tls" => {
+            choice.enabled = flag_of(name, value)?
+        }
+        "ssl" => {
+            choice.enabled = flag_of(name, value)?
+        }
+        "tlsinsecure" => {
+            choice.insecure = flag_of(name, value)?
+        }
+        "tlsallowinvalidcertificates" => {
+            choice.insecure = flag_of(name, value)?
+        }
+        "tlscafile" => {
+            choice.ca_file = value
+        }
+        "tlscertificatekeyfile" => fail Unsupported
+        "authsource" => {
+            o.auth_source = value
+        }
+        "authmechanism" => {
+            if value != "SCRAM-SHA-256" && value != "SCRAM-SHA-1" {
+                fail Unsupported
+            }
+            o.auth_mechanism = value
+        }
+        "appname" => {
+            o.app_name = value
+        }
+        "compressors" => {
+            o.compressors = []
+            for c in text.split(value, ',') {
+                if c != "zstd" && c != "zlib" && c != "snappy" {
+                    fail Invalid("unknown compressor {c}")
+                }
+                push(mut o.compressors, c)
+            }
+        }
+        "zlibcompressionlevel" => {
+            o.compression_level = number_of(name, value)?
+        }
+        "directconnection" => {
+            o.direct = flag_of(name, value)?
+        }
+        "connecttimeoutms" => {
+            o.connect_timeout = number_of(name, value)?
+        }
+        "sockettimeoutms" => {
+            o.socket_timeout = number_of(name, value)?
+        }
+        "serverselectiontimeoutms" => {
+            o.server_selection_timeout = number_of(name, value)?
+        }
+        "heartbeatfrequencyms" => {
+            o.heartbeat = number_of(name, value)?
+        }
+        "localthresholdms" => {
+            o.local_threshold = number_of(name, value)?
+        }
+        "maxpoolsize" => {
+            o.max_pool_size = number_of(name, value)?
+        }
+        "maxidletimems" => {
+            o.max_idle_time = number_of(name, value)?
+        }
+        "waitqueuetimeoutms" => {
+            o.wait_queue_timeout = number_of(name, value)?
+        }
+        "readpreference" => {
+            o.read_preference.mode = read_mode(value)?
+        }
+        "readpreferencetags" => {
+            let set = tag_set(value)?
+            push(mut o.read_preference.tag_sets, set)
+        }
+        "maxstalenessseconds" => {
+            o.read_preference.max_staleness = number_of(name, value)?
+        }
+        "readconcernlevel" => {
+            o.read_concern = value
+        }
+        "w" => {
+            o.write_concern.w = value
+        }
+        "wtimeoutms" => {
+            o.write_concern.timeout = number_of(name, value)?
+        }
+        "journal" => {
+            o.write_concern.journal = some(flag_of(name, value)?)
+        }
+        "retryreads" => {
+            o.retry_reads = flag_of(name, value)?
+        }
+        "retrywrites" => {
+            o.retry_writes = flag_of(name, value)?
+        }
+        _ => fail Invalid("unknown connection string option {name}")
+    }
+}
+
+/// Returns the `Options` a `mongodb://` connection string describes: `mongodb://[user[:password]@]host[:port][,host[:port]...][/[database][?option=value[&option=value...]]]`.
+///
+/// The user name, password and database are percent-decoded. The options are `replicaSet`, `tls`, `ssl`, `tlsInsecure`, `tlsAllowInvalidCertificates`, `tlsCAFile`, `authSource`, `authMechanism`, `appName`, `compressors`, `zlibCompressionLevel`, `directConnection`, `connectTimeoutMS`, `socketTimeoutMS`, `serverSelectionTimeoutMS`, `heartbeatFrequencyMS`, `localThresholdMS`, `maxPoolSize`, `maxIdleTimeMS`, `waitQueueTimeoutMS`, `readPreference`, `readPreferenceTags`, `maxStalenessSeconds`, `readConcernLevel`, `w`, `wtimeoutMS`, `journal`, `retryReads` and `retryWrites`, and their names are not case sensitive. Fails with `Invalid` for a string that does not parse or an option that is not listed, and with `Unsupported` for `mongodb+srv://`, which needs DNS SRV and TXT lookups, for `tlsCertificateKeyFile`, and for an authentication mechanism other than the two SCRAM ones.
+pub fn options_from(connection: str) -> Options ! Error {
+    let at = locate(connection)?
+    let o = new(Options { hosts: at.hosts, database: at.database, username: at.username, password: at.password })
+    let choice = new(TlsChoice { enabled: false, insecure: false, ca_file: "" })
+    if at.query.len > 0 {
+        for pair in text.split(at.query, '&') {
+            if pair.len == 0 {
+                continue
+            }
+            let c = text.cut(pair, "=")
+            if !c.found || c.before.len == 0 {
+                fail Invalid("the option {pair} needs a name and a value")
+            }
+            let value = unescaped(c.after, "option {c.before}")?
+            apply_option(o, choice, c.before, value)?
+        }
+    }
+    if choice.enabled {
+        var config = tls.Config {}
+        if choice.ca_file.len > 0 {
+            config.roots = certificate_roots(choice.ca_file)?
+        }
+        config.verify = !choice.insecure
+        o.tls = some(config)
+    }
+    *o
+}
