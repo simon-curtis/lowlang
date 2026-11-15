@@ -34,6 +34,7 @@ rt_hot_init:
 	lea rdi, [rip+rt_msg_hot]
 	jmp rt_panic
 
+	.globl rt_hot_handler
 rt_hot_handler:
 	mov rcx, [rip+rt_patch_count]
 	lea rsi, [rip+rt_patch_list]

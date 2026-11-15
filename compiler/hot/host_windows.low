@@ -1,13 +1,120 @@
-import std/process
+import amd64
+import std/cancel
+import std/io
 
-fn host_error() -> Error {
-    Error.Failed("hot reload requires a Linux host")
+extern "kernel32" {
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> i64
+    fn CloseHandle(handle: i64) -> i32
+    fn GetLastError() -> u32
+    fn CreateRemoteThread(process: i64, attributes: ptr, stack: i64, start: i64, parameter: i64, flags: u32, mut id: u32) -> i64
+    fn ReadProcessMemory(process: i64, address: i64, buf: ptr, size: i64, mut done: i64) -> i32
+    fn WriteProcessMemory(process: i64, address: i64, buf: ptr, size: i64, mut done: i64) -> i32
+    fn FlushInstructionCache(process: i64, address: i64, size: i64) -> i32
+    fn VirtualQueryEx(process: i64, address: i64, info: ptr, size: i64) -> i64
 }
 
-fn check_host() ! Error {
-    fail host_error()
+struct Memory {
+    process: i64
 }
 
-fn notify(handle: *process.ChildHandle) ! Error {
-    fail host_error()
+const binary_suffix = ".exe"
+const process_create_thread: u32 = 0x2
+const process_vm_operation: u32 = 0x8
+const process_vm_read: u32 = 0x10
+const process_vm_write: u32 = 0x20
+const process_query_information: u32 = 0x400
+const error_access_denied: u32 = 5
+const error_partial_copy: u32 = 299
+const memory_commit: i64 = 0x1000
+const basic_information_size = 48
+const basic_information_state = 32
+
+fn close_memory(m: Memory) {
+    CloseHandle(m.process)
+}
+
+fn failure() -> io.Error {
+    match GetLastError() {
+        error_access_denied => Denied
+        error_partial_copy => Eof
+        _ => Invalid
+    }
+}
+
+fn open_memory(s: *Session, child: *Child, token: *cancel.Token) -> Memory ! Error {
+    let pid = child.handle.pid
+    let access = process_create_thread | process_vm_operation | process_vm_read | process_vm_write | process_query_information
+    let process = OpenProcess(access, 0, u32(pid))
+    if process == 0 {
+        let code = GetLastError()
+        fail Failed("open process {pid}: error {code}")
+    }
+    let memory = Memory { process }
+    wait_for_hot_region(token, memory, s.base) catch {
+        e => {
+            close_memory(memory)
+            fail e
+        }
+    }
+    memory
+}
+
+fn write_memory(m: Memory, data: []u8, address: i64) ! io.Error {
+    var done: i64 = 0
+    let source = pin(data)
+    let written = WriteProcessMemory(m.process, address, source, data.len, mut done)
+    unpin(source)
+    if written == 0 {
+        fail failure()
+    }
+    if done != data.len {
+        fail Eof
+    }
+    if FlushInstructionCache(m.process, address, data.len) == 0 {
+        fail failure()
+    }
+}
+
+fn read_memory(m: Memory, data: []u8, address: i64) ! io.Error {
+    var done: i64 = 0
+    let target = pin(data)
+    let read = ReadProcessMemory(m.process, address, target, data.len, mut done)
+    unpin(target)
+    if read == 0 {
+        fail failure()
+    }
+    if done != data.len {
+        fail Eof
+    }
+}
+
+fn notify(s: *Session, child: *Child, memory: Memory) ! Error {
+    let built = s.built ?? panic("session without a build")
+    let handler = built.symbols[amd64.patch_handler_symbol] ?? -1
+    if handler < 0 {
+        fail Failed("program has no {amd64.patch_handler_symbol}")
+    }
+    var id: u32 = 0
+    let thread = CreateRemoteThread(memory.process, null, 0, handler, 0, 0, mut id)
+    if thread == 0 {
+        let code = GetLastError()
+        fail Failed("start the patch thread: error {code}")
+    }
+    CloseHandle(thread)
+}
+
+fn page_committed(memory: Memory, address: i64) -> bool {
+    let info = io.buffer(basic_information_size)
+    let at = pin(info)
+    let queried = VirtualQueryEx(memory.process, address, at, info.len)
+    unpin(at)
+    if queried == 0 {
+        return false
+    }
+    io.le32(info, basic_information_state) == memory_commit
+}
+
+fn wait_for_hot_region(token: *cancel.Token, memory: Memory, base: i64) ! Error {
+    let mapped = fn() -> bool ! Error { page_committed(memory, base) }
+    poll(token, mapped)?
 }

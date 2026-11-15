@@ -36,7 +36,7 @@ fn main() {
 
 ## Usage
 
-`low` is written in Low. Building it from source needs a Linux host with `curl` and `sha256sum`: `./bootstrap.sh` builds the compiler with a published release and writes it to `./low`, or to the path given as its first argument. Compiling, linking and `low dev` need only the `low` binary; `low dev` needs a Linux host.
+`low` is written in Low. Building it from source needs a Linux host with `curl` and `sha256sum`: `./bootstrap.sh` builds the compiler with a published release and writes it to `./low`, or to the path given as its first argument. Compiling, linking and `low dev` need only the `low` binary.
 
 ```sh
 ./bootstrap.sh

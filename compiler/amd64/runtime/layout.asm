@@ -175,9 +175,9 @@
 
 	.macro PROGRAM_BOOT
 	call rt_cpu_init
+	HOT_INIT
 	call rt_gc_init
 	call rt_sched_init
-	HOT_INIT
 	lea rdi, [rip+rt_program]
 	call rt_spawn_main
 	TLS_GET rax, TLS_M
