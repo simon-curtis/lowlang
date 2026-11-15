@@ -1,0 +1,307 @@
+import std/crypto/x509
+import std/dtls
+import std/io
+import std/rand
+import std/slices
+import std/tls
+
+struct Flying {
+    due: i64
+    to_server: bool
+    data: u8[]
+}
+
+struct Wire {
+    rng: rand.Rng
+    loss: i64
+    duplicate: i64
+    jitter: i64
+    queue: Flying[]
+    now: i64
+}
+
+fn check(name: str, ok: bool) {
+    if ok {
+        print("{name}: ok")
+    } else {
+        print("{name}: FAIL")
+    }
+}
+
+fn wire(seed: u64, loss: i64, duplicate: i64, jitter: i64) -> *Wire {
+    new(Wire { rng: rand.seeded(seed), loss, duplicate, jitter, queue: [], now: 0 })
+}
+
+fn inject(w: *Wire, to_server: bool, d: u8[]) {
+    if rand.below(mut w.rng, 100) < w.loss {
+        return
+    }
+    var copies = 1
+    if rand.below(mut w.rng, 100) < w.duplicate {
+        copies = 2
+    }
+    for _ in 0..copies {
+        let delay = 1 + rand.below(mut w.rng, w.jitter + 1)
+        w.queue.push(Flying { due: w.now + delay, to_server, data: d })
+    }
+}
+
+fn collect(w: *Wire, c: *dtls.Conn, to_server: bool) {
+    for {
+        let d = dtls.poll_transmit(c) ?? break
+        inject(w, to_server, d)
+    }
+}
+
+fn advance(w: *Wire, client: *dtls.Conn, server: *dtls.Conn) {
+    w.now += 5
+    collect(w, client, true)
+    collect(w, server, false)
+    var ready: Flying[] = []
+    var rest: Flying[] = []
+    for f in w.queue {
+        if f.due <= w.now {
+            ready.push(f)
+        } else {
+            rest.push(f)
+        }
+    }
+    w.queue = rest
+    for f in ready {
+        if f.to_server {
+            dtls.receive(server, f.data, w.now)
+        } else {
+            dtls.receive(client, f.data, w.now)
+        }
+    }
+    dtls.tick(client, w.now)
+    dtls.tick(server, w.now)
+}
+
+fn connected(a: *dtls.Conn, b: *dtls.Conn) -> bool {
+    dtls.state(a) == dtls.State.Connected && dtls.state(b) == dtls.State.Connected
+}
+
+fn run(w: *Wire, client: *dtls.Conn, server: *dtls.Conn, limit: i64) -> bool {
+    dtls.start(client, w.now)
+    for w.now < limit {
+        advance(w, client, server)
+        if connected(client, server) {
+            break
+        }
+    }
+    let ok = connected(client, server)
+    for _ in 0..40 {
+        advance(w, client, server)
+    }
+    ok
+}
+
+fn identity(name: str) -> dtls.Identity {
+    dtls.generate_identity(name, 1700000000, 4102444800) or return dtls.Identity { certificate: [], key: x509.PrivateKey.Ed25519([]) }
+}
+
+fn keys(c: *dtls.Conn) -> u8[] {
+    dtls.export_keying_material(c, "EXTRACTOR-dtls_srtp", 60) or []
+}
+
+fn deliver(from: *dtls.Conn, to: *dtls.Conn, text: str) -> str {
+    dtls.write(from, bytes(text)) or return "write failed"
+    let d = dtls.poll_transmit(from) ?? return "nothing sent"
+    dtls.receive(to, d, 0)
+    let got = dtls.read(to) ?? return "nothing read"
+    str(got)
+}
+
+fn malformed(value: str) -> bool {
+    dtls.parse_fingerprint(value) or return true
+    false
+}
+
+fn known_answers() {
+    let abc = bytes("abc")
+    let sha1 = dtls.fingerprint("SHA-1", abc) or return
+    check("sha-1 fingerprint", dtls.format_fingerprint(sha1) == "sha-1 A9:99:3E:36:47:06:81:6A:BA:3E:25:71:78:50:C2:6C:9C:D0:D8:9D")
+    let sha256 = dtls.fingerprint("sha-256", abc) or return
+    check("sha-256 fingerprint", dtls.format_fingerprint(sha256) == "sha-256 BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD")
+    let parsed = dtls.parse_fingerprint("SHA-256 ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad") or return
+    check("parse accepts lower case", slices.equal(parsed.digest, sha256.digest) && parsed.algorithm == "sha-256")
+    check("fingerprint matches", dtls.fingerprint_matches(parsed, abc))
+    check("fingerprint rejects other data", !dtls.fingerprint_matches(parsed, bytes("abd")))
+    var rejected = 0
+    for bad in ["", "sha-256", "sha-256 AA:BB", "md5 00:11", "sha-1 A9:99:3E:36:47:06:81:6A:BA:3E:25:71:78:50:C2:6C:9C:D0:D8", "sha-1 A9:99:3E:36:47:06:81:6A:BA:3E:25:71:78:50:C2:6C:9C:D0:D8:ZZ", "sha-1  A9"] {
+        if malformed(bad) {
+            rejected += 1
+        }
+    }
+    check("malformed fingerprints are rejected", rejected == 7)
+}
+
+fn identities() {
+    let id = identity("peer one")
+    let cert = x509.parse(id.certificate) or {
+        check("identity parses", false)
+        return
+    }
+    check("identity parses", cert.common_name == "peer one" && cert.not_before == 1700000000 && cert.not_after == 4102444800)
+    check("identity is self-signed", x509.check_signature(cert, cert))
+    let other = identity("peer one")
+    check("identities are distinct", !slices.equal(id.certificate, other.certificate))
+}
+
+fn suite_name(suite: i64) -> str {
+    match suite {
+        0xC02B => "ECDHE-ECDSA-AES128-GCM-SHA256"
+        0xC02C => "ECDHE-ECDSA-AES256-GCM-SHA384"
+        _ => "ECDHE-ECDSA-CHACHA20-POLY1305"
+    }
+}
+
+fn group_name(group: i64) -> str {
+    if group == tls.group_x25519 { "X25519" } else { "P-256" }
+}
+
+fn matrix() {
+    let ia = identity("a")
+    let ib = identity("b")
+    for suite in [0xC02B, 0xC02C, 0xCCA9] {
+        for group in [tls.group_x25519, tls.group_p256] {
+            let client = dtls.conn(dtls.Config { client: true, identity: ia, unverified: true, cipher_suites: [suite], groups: [group] })
+            let server = dtls.conn(dtls.Config { client: false, identity: ib, unverified: true, cipher_suites: [suite], groups: [group] })
+            let w = wire(1, 0, 0, 0)
+            let ok = run(w, client, server, 10000)
+            let agree = slices.equal(keys(client), keys(server)) && keys(client).len == 60
+            let one = deliver(client, server, "to the server") == "to the server"
+            let two = deliver(server, client, "to the client") == "to the client"
+            check("{suite_name(suite)} over {group_name(group)}", ok && dtls.cipher_suite(client) == suite && agree && one && two)
+        }
+    }
+}
+
+fn lossy() {
+    let ia = identity("a")
+    let ib = identity("b")
+    var done = 0
+    var total = 0
+    for seed in [1, 2, 3, 4, 5, 6, 7, 8] {
+        for loss in [10, 30] {
+            total += 1
+            let client = dtls.conn(dtls.Config { client: true, identity: ia, unverified: true, retransmit_initial: 50, retransmit_max: 400, handshake_timeout: 200000, mtu: 400 })
+            let server = dtls.conn(dtls.Config { client: false, identity: ib, unverified: true, retransmit_initial: 50, retransmit_max: 400, handshake_timeout: 200000, mtu: 400 })
+            let w = wire(u64(seed), loss, 25, 80)
+            if run(w, client, server, 150000) && slices.equal(keys(client), keys(server)) {
+                done += 1
+            }
+        }
+    }
+    check("handshakes through loss, duplication and reordering", done == total)
+}
+
+fn fingerprints() {
+    let ia = identity("a")
+    let ib = identity("b")
+    let ic = identity("c")
+    let fa = dtls.fingerprint("sha-256", ia.certificate) or return
+    let fb = dtls.fingerprint("sha-256", ib.certificate) or return
+    let fc = dtls.fingerprint("sha-256", ic.certificate) or return
+    let good_client = dtls.conn(dtls.Config { client: true, identity: ia, fingerprints: [fb] })
+    let good_server = dtls.conn(dtls.Config { client: false, identity: ib, fingerprints: [fa] })
+    check("matching fingerprints connect", run(wire(1, 0, 0, 0), good_client, good_server, 10000))
+    check("peer certificate is exposed", slices.equal(dtls.peer_certificate(good_client), ib.certificate))
+    let bad_client = dtls.conn(dtls.Config { client: true, identity: ia, fingerprints: [fc] })
+    let bad_server = dtls.conn(dtls.Config { client: false, identity: ib, fingerprints: [fa] })
+    let refused = !run(wire(1, 0, 0, 0), bad_client, bad_server, 10000)
+    check("client refuses a wrong fingerprint", refused && dtls.state(bad_client) == dtls.State.Failed)
+    let strict_client = dtls.conn(dtls.Config { client: true, identity: ia, fingerprints: [fb] })
+    let strict_server = dtls.conn(dtls.Config { client: false, identity: ib, fingerprints: [fc] })
+    let strict = !run(wire(1, 0, 0, 0), strict_client, strict_server, 10000)
+    check("server refuses a wrong fingerprint", strict && dtls.state(strict_server) == dtls.State.Failed && dtls.state(strict_client) != dtls.State.Connected)
+    let open_client = dtls.conn(dtls.Config { client: true, identity: ia })
+    let open_server = dtls.conn(dtls.Config { client: false, identity: ib, unverified: true })
+    check("no fingerprints and not unverified is refused", !run(wire(1, 0, 0, 0), open_client, open_server, 10000))
+}
+
+fn records() {
+    let ia = identity("a")
+    let ib = identity("b")
+    let client = dtls.conn(dtls.Config { client: true, identity: ia, unverified: true })
+    let server = dtls.conn(dtls.Config { client: false, identity: ib, unverified: true })
+    check("handshake for the record checks", run(wire(2, 0, 0, 0), client, server, 10000))
+
+    dtls.write(client, bytes("once")) or return
+    let d = dtls.poll_transmit(client) ?? return
+    dtls.receive(server, d, 0)
+    dtls.receive(server, d, 0)
+    let first = dtls.read(server) ?? []
+    let second = dtls.read(server)
+    var replayed = false
+    match second {
+        some(_) => {
+            replayed = true
+        }
+        none => {}
+    }
+    check("replayed record is delivered once", str(first) == "once" && !replayed)
+
+    dtls.write(client, bytes("tamper")) or return
+    let t = dtls.poll_transmit(client) ?? return
+    var bad = io.buffer(t.len)
+    io.copy(bad, t)
+    bad[t.len - 1] = bad[t.len - 1] ^ 1
+    dtls.receive(server, bad, 0)
+    dtls.receive(server, t[..t.len - 1], 0)
+    var accepted = false
+    match dtls.read(server) {
+        some(_) => {
+            accepted = true
+        }
+        none => {}
+    }
+    check("tampered and truncated records are dropped", !accepted && dtls.state(server) == dtls.State.Connected)
+    dtls.receive(server, t, 0)
+    check("the genuine record still arrives", str(dtls.read(server) ?? []) == "tamper")
+
+    var tooLarge = false
+    dtls.write(client, io.buffer(2000)) catch {
+        TooLarge => {
+            tooLarge = true
+        }
+        _ => {}
+    }
+    check("oversize message is refused", tooLarge)
+
+    dtls.close(client)
+    let alert = dtls.poll_transmit(client) ?? []
+    dtls.receive(server, alert, 0)
+    check("close_notify closes the peer", dtls.state(server) == dtls.State.Closed && dtls.state(client) == dtls.State.Closed)
+    var late = false
+    dtls.write(server, bytes("late")) catch {
+        _ => {
+            late = true
+        }
+    }
+    check("write after close fails", late)
+}
+
+fn srtp() {
+    let ia = identity("a")
+    let ib = identity("b")
+    let client = dtls.conn(dtls.Config { client: true, identity: ia, unverified: true, srtp_profiles: [dtls.srtp_aes128_cm_sha1_80, dtls.srtp_aead_aes_128_gcm] })
+    let server = dtls.conn(dtls.Config { client: false, identity: ib, unverified: true, srtp_profiles: [dtls.srtp_aead_aes_128_gcm] })
+    let ok = run(wire(3, 0, 0, 0), client, server, 10000)
+    check("use_srtp picks the shared profile", ok && dtls.srtp_profile(client) == dtls.srtp_aead_aes_128_gcm && dtls.srtp_profile(server) == dtls.srtp_aead_aes_128_gcm)
+    let plain_client = dtls.conn(dtls.Config { client: true, identity: ia, unverified: true })
+    let srtp_server = dtls.conn(dtls.Config { client: false, identity: ib, unverified: true, srtp_profiles: [dtls.srtp_aes128_cm_sha1_80] })
+    let plain = run(wire(3, 0, 0, 0), plain_client, srtp_server, 10000)
+    check("use_srtp is not forced on a client that did not offer it", plain && dtls.srtp_profile(plain_client) == 0)
+}
+
+fn main() {
+    known_answers()
+    identities()
+    matrix()
+    lossy()
+    fingerprints()
+    records()
+    srtp()
+}

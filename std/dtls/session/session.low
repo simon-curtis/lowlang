@@ -1,0 +1,285 @@
+import std/dtls
+import std/io
+import std/time
+
+/// The datagram path a session runs over: a function that sends one datagram and a channel the received datagrams arrive on.
+///
+/// The path can lose, reorder and duplicate datagrams. A send that fails is a lost datagram.
+pub struct Transport {
+    /// Sends one datagram to the peer.
+    pub send: fn(u8[])
+    /// The datagrams that arrive from the peer. A closed channel ends the session.
+    pub incoming: chan[u8[]]
+}
+
+/// What a connection knows about itself once it runs.
+pub struct Info {
+    /// The phase of the connection.
+    pub state: dtls.State
+    /// The DER certificate the peer authenticated with, empty before the handshake read it.
+    pub certificate: u8[]
+    /// The negotiated cipher suite code, 0 before the ServerHello.
+    pub cipher_suite: i64
+    /// The negotiated `use_srtp` profile, 0 when none.
+    pub srtp_profile: i64
+}
+
+struct Exported {
+    keys: u8[]
+    ok: bool
+}
+
+enum Command {
+    Send(data: u8[], reply: chan[io.Error?])
+    Export(label: str, length: i64, reply: chan[Exported])
+    Describe(reply: chan[Info])
+    Close
+}
+
+enum Step {
+    Command(command: Command)
+    Arrived(datagram: u8[])
+    Elapsed
+    Ended
+}
+
+struct Core {
+    conn: *dtls.Conn
+    transport: Transport
+    commands: chan[Command]
+    data: chan[u8[]]
+    events: chan[dtls.Event]
+    gone: chan[bool]
+}
+
+/// A session that can be copied into a green thread or a closure, and used with every function of this module.
+///
+/// `data` carries the application messages and `events` the connection's events. Both close when the session ends, and `events` must be read: the session drops an event when 64 wait.
+pub struct Handle {
+    /// The application messages the peer sent.
+    pub data: chan[u8[]]
+    /// The connection's events.
+    pub events: chan[dtls.Event]
+    core: *Core
+}
+
+/// A DTLS connection with the green thread that drives it, and the owner that closes it when dropped.
+pub struct Session {
+    /// The copyable view that every function of the module takes.
+    pub handle: Handle
+    drop shutdown(handle.core)
+}
+
+fn clock() -> i64 {
+    time.monotonic() / 1000000
+}
+
+/// Creates the connection and starts the green thread that runs it over `transport`.
+///
+/// A client sends its ClientHello at once. Read `events` for `Connected` or `Failed`, or call `wait_connected`.
+pub fn open(config: dtls.Config, transport: Transport) -> Session {
+    let core = new(Core {
+        conn: dtls.conn(config)
+        transport
+        commands: chan[Command](16)
+        data: chan[u8[]](256)
+        events: chan[dtls.Event](64)
+        gone: chan[bool]()
+    })
+    spawn run(core)
+    Session { handle: Handle { data: core.data, events: core.events, core } }
+}
+
+fn flush(c: *Core) {
+    for {
+        let d = dtls.poll_transmit(c.conn) ?? break
+        c.transport.send(d)
+    }
+    for {
+        let e = dtls.poll_event(c.conn) ?? break
+        select {
+            c.events <- e => {}
+            else => {}
+        }
+    }
+    for {
+        let d = dtls.read(c.conn) ?? break
+        select {
+            c.data <- d => {}
+            else => {}
+        }
+    }
+}
+
+fn describe(c: *Core) -> Info {
+    Info {
+        state: dtls.state(c.conn)
+        certificate: dtls.peer_certificate(c.conn)
+        cipher_suite: dtls.cipher_suite(c.conn)
+        srtp_profile: dtls.srtp_profile(c.conn)
+    }
+}
+
+fn handle(c: *Core, command: Command) -> bool {
+    match command {
+        Send(data, reply) => {
+            var failure: io.Error? = none
+            dtls.write(c.conn, data) catch {
+                e => {
+                    failure = e
+                }
+            }
+            reply <- failure
+        }
+        Export(label, length, reply) => {
+            let keys = dtls.export_keying_material(c.conn, label, length) catch {
+                _ => []
+            }
+            reply <- Exported { keys, ok: keys.len == length }
+        }
+        Describe(reply) => {
+            reply <- describe(c)
+        }
+        Close => return false
+    }
+    true
+}
+
+fn wait_for(c: *Core, now: i64) -> i64 {
+    let t = dtls.next_timeout(c.conn)
+    if t < 0 {
+        return 60000
+    }
+    let left = t - now
+    if left < 1 { 1 } else { left }
+}
+
+fn run(c: *Core) {
+    let first = clock()
+    dtls.start(c.conn, first)
+    flush(c)
+    for {
+        let now = clock()
+        let wait = wait_for(c, now)
+        let step = select {
+            command = <-c.commands => match command {
+                some(x) => Step.Command(x)
+                none => Step.Ended
+            }
+            datagram = <-c.transport.incoming => match datagram {
+                some(x) => Step.Arrived(x)
+                none => Step.Ended
+            }
+            after(wait) => Step.Elapsed
+        }
+        var running = true
+        match step {
+            Command(command) => {
+                running = handle(c, command)
+            }
+            Arrived(datagram) => {
+                let at = clock()
+                dtls.receive(c.conn, datagram, at)
+            }
+            Elapsed => {}
+            Ended => {
+                running = false
+            }
+        }
+        if !running {
+            break
+        }
+        let at = clock()
+        dtls.tick(c.conn, at)
+        flush(c)
+    }
+    dtls.close(c.conn)
+    flush(c)
+    close(c.data)
+    close(c.events)
+    close(c.gone)
+}
+
+fn shutdown(c: *Core) {
+    select {
+        c.commands <- Command.Close => {}
+        <-c.gone => {}
+    }
+}
+
+fn ask[T](s: Handle, command: Command, reply: chan[T]) -> T ! io.Error {
+    select {
+        s.core.commands <- command => {}
+        <-s.core.gone => fail NotConnected
+    }
+    select {
+        answer = <-reply => match answer {
+            some(v) => v
+            none => fail NotConnected
+        }
+        <-s.core.gone => fail NotConnected
+    }
+}
+
+/// Waits until the handshake finishes.
+///
+/// Fails with `Refused` when the handshake fails and with `NotConnected` when the session ends first. Events that arrive before the result are consumed.
+pub fn wait_connected(s: Handle) ! io.Error {
+    for {
+        let event = <-s.events
+        match event {
+            some(e) => match e {
+                Connected => return
+                Failed(_) => fail Refused
+                Closed => fail NotConnected
+            }
+            none => fail NotConnected
+        }
+    }
+}
+
+/// Sends `data` as one application message.
+///
+/// Fails with `NotConnected` before the handshake finishes and after the session ends, and with `TooLarge` when it does not fit one datagram.
+pub fn send(s: Handle, data: u8[]) ! io.Error {
+    let reply = chan[io.Error?](1)
+    let result = ask(s, Command.Send(data, reply), reply)?
+    match result {
+        some(e) => fail e
+        none => {}
+    }
+}
+
+/// Waits for the next application message.
+///
+/// Fails with `NotConnected` when the session ends.
+pub fn receive(s: Handle) -> u8[] ! io.Error {
+    let item = <-s.data
+    match item {
+        some(d) => d
+        none => fail NotConnected
+    }
+}
+
+/// Returns `length` bytes of keying material for `label` (RFC 5705), such as `"EXTRACTOR-dtls_srtp"`.
+///
+/// Fails with `NotConnected` before the handshake finishes.
+pub fn export_keying_material(s: Handle, label: str, length: i64) -> u8[] ! io.Error {
+    let reply = chan[Exported](1)
+    let result = ask(s, Command.Export(label, length, reply), reply)?
+    if !result.ok {
+        fail NotConnected
+    }
+    result.keys
+}
+
+/// Returns what the connection knows about itself.
+pub fn describe_session(s: Handle) -> Info ! io.Error {
+    let reply = chan[Info](1)
+    ask(s, Command.Describe(reply), reply)
+}
+
+/// Sends `close_notify` and ends the session.
+pub fn close_session(s: Handle) {
+    shutdown(s.core)
+}

@@ -1,0 +1,909 @@
+import std/crypto/hash
+import std/crypto/x509
+import std/io
+import std/rand
+import std/slices
+import std/testing
+import std/tls
+
+struct Flying {
+    due: i64
+    to_second: bool
+    data: u8[]
+}
+
+struct Wire {
+    rng: rand.Rng
+    loss: i64
+    duplicate: i64
+    jitter: i64
+    queue: Flying[]
+    now: i64
+    datagrams: i64
+    largest: i64
+    fragments: i64
+}
+
+struct Pair {
+    a: *Conn
+    b: *Conn
+}
+
+fn wire(seed: u64, loss: i64, duplicate: i64, jitter: i64) -> *Wire {
+    new(Wire { rng: rand.seeded(seed), loss, duplicate, jitter, queue: [], now: 0, datagrams: 0, largest: 0, fragments: 0 })
+}
+
+fn count_fragments(d: u8[]) -> i64 {
+    var n = 0
+    for r in split_records(d) {
+        if r.kind == type_handshake && r.epoch == 0 && r.body.len >= handshake_header && io.be24(r.body, 6) != 0 {
+            n += 1
+        }
+    }
+    n
+}
+
+fn inject(w: *Wire, to_second: bool, d: u8[]) {
+    w.datagrams += 1
+    if d.len > w.largest {
+        w.largest = d.len
+    }
+    w.fragments += count_fragments(d)
+    if rand.below(mut w.rng, 100) < w.loss {
+        return
+    }
+    var copies = 1
+    if rand.below(mut w.rng, 100) < w.duplicate {
+        copies = 2
+    }
+    for _ in 0..copies {
+        let delay = 1 + rand.below(mut w.rng, w.jitter + 1)
+        w.queue.push(Flying { due: w.now + delay, to_second, data: d })
+    }
+}
+
+fn collect(w: *Wire, c: *Conn, to_second: bool) {
+    for {
+        let d = poll_transmit(c) ?? break
+        inject(w, to_second, d)
+    }
+}
+
+fn advance(w: *Wire, p: Pair) {
+    w.now += 5
+    collect(w, p.a, true)
+    collect(w, p.b, false)
+    var ready: Flying[] = []
+    var rest: Flying[] = []
+    for f in w.queue {
+        if f.due <= w.now {
+            ready.push(f)
+        } else {
+            rest.push(f)
+        }
+    }
+    w.queue = rest
+    for f in ready {
+        if f.to_second {
+            receive(p.b, f.data, w.now)
+        } else {
+            receive(p.a, f.data, w.now)
+        }
+    }
+    tick(p.a, w.now)
+    tick(p.b, w.now)
+}
+
+fn both_connected(p: Pair) -> bool {
+    state(p.a) == State.Connected && state(p.b) == State.Connected
+}
+
+fn settle(w: *Wire, p: Pair, limit: i64) -> bool {
+    start(p.a, w.now)
+    for w.now < limit {
+        advance(w, p)
+        if both_connected(p) {
+            break
+        }
+    }
+    let ok = both_connected(p)
+    for _ in 0..40 {
+        advance(w, p)
+    }
+    ok
+}
+
+fn settle_clean(p: Pair) -> bool {
+    let w = wire(1, 0, 0, 0)
+    settle(w, p, 20000)
+}
+
+fn identity_for(t: *testing.T, name: str) -> Identity {
+    generate_identity(name, 1700000000, 4102444800) catch {
+        e => testing.must(t, e, Identity { certificate: [], key: x509.PrivateKey.Ed25519([]) })
+    }
+}
+
+fn pair_of(client: Config, server: Config) -> Pair {
+    Pair { a: conn(client), b: conn(server) }
+}
+
+fn open_pair(t: *testing.T) -> Pair {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    pair_of(Config { client: true, identity: ia, unverified: true, retransmit_initial: 100 }, Config { client: false, identity: ib, unverified: true, retransmit_initial: 100 })
+}
+
+fn connected_pair(t: *testing.T) -> Pair {
+    let p = open_pair(t)
+    t.require(settle_clean(p))
+    p
+}
+
+fn events_of(c: *Conn) -> Event[] {
+    var out: Event[] = []
+    for {
+        let e = poll_event(c) ?? break
+        out.push(e)
+    }
+    out
+}
+
+fn has_failed(events: Event[]) -> bool {
+    for e in events {
+        match e {
+            Failed(_) => return true
+            _ => {}
+        }
+    }
+    false
+}
+
+fn has_connected(events: Event[]) -> bool {
+    for e in events {
+        match e {
+            Connected => return true
+            _ => {}
+        }
+    }
+    false
+}
+
+fn has_closed(events: Event[]) -> bool {
+    for e in events {
+        match e {
+            Closed => return true
+            _ => {}
+        }
+    }
+    false
+}
+
+fn no_bytes() -> u8[] {
+    []
+}
+
+fn discard(c: *Conn) {
+    for {
+        let _ = poll_transmit(c) ?? break
+    }
+}
+
+fn write_error(c: *Conn, data: u8[]) -> io.Error? {
+    var failure: io.Error? = none
+    write(c, data) catch {
+        e => {
+            failure = e
+        }
+    }
+    failure
+}
+
+fn sends(t: *testing.T, c: *Conn, data: u8[]) -> u8[] {
+    let failure = write_error(c, data)
+    match failure {
+        some(_) => testing.fatal(t, "write failed")
+        none => {}
+    }
+    poll_transmit(c) ?? []
+}
+
+fn first_handshake_type(d: u8[]) -> i64 {
+    for r in split_records(d) {
+        if r.kind == type_handshake && r.epoch == 0 && r.body.len > 0 {
+            return i64(r.body[0])
+        }
+    }
+    -1
+}
+
+fn test_the_replay_window_accepts_each_number_once(t: *testing.T) {
+    let w = window()
+    t.is_true(fresh(w, 0))
+    mark(w, 0)
+    t.is_false(fresh(w, 0))
+    t.is_true(fresh(w, 5))
+    mark(w, 5)
+    t.is_true(fresh(w, 3))
+    mark(w, 3)
+    t.is_false(fresh(w, 3))
+    t.is_false(fresh(w, 5))
+    t.is_true(fresh(w, 4))
+}
+
+fn test_the_replay_window_rejects_numbers_older_than_64_behind_the_top(t: *testing.T) {
+    let w = window()
+    mark(w, 100)
+    t.is_false(fresh(w, 36))
+    t.is_true(fresh(w, 37))
+    mark(w, 37)
+    t.is_false(fresh(w, 37))
+    mark(w, 1000)
+    t.is_false(fresh(w, 100))
+    t.is_false(fresh(w, 1000))
+    t.is_true(fresh(w, 1001))
+}
+
+fn test_the_epoch_and_sequence_number_survive_the_record_header(t: *testing.T) {
+    let record = frame(type_handshake, 1, 0x0001_0000_0002, [1, 2, 3])
+    let parsed = split_records(record)
+    t.equal(parsed.len, 1)
+    t.equal(parsed[0].kind, type_handshake)
+    t.equal(parsed[0].epoch, 1)
+    t.equal(parsed[0].seq, 0x0001_0000_0002)
+    t.equal_slice(parsed[0].body, [1, 2, 3])
+}
+
+fn test_records_that_lie_about_their_length_are_not_split(t: *testing.T) {
+    var record = frame(type_application, 1, 7, [1, 2, 3, 4])
+    t.equal(split_records(record[..record.len - 1]).len, 0)
+    t.equal(split_records(record[..5]).len, 0)
+    var two: u8[] = []
+    io.append(mut two, record)
+    io.append(mut two, record)
+    t.equal(split_records(two).len, 2)
+    io.append(mut two, [22, 0xFE])
+    t.equal(split_records(two).len, 2)
+}
+
+fn test_a_client_and_a_server_complete_the_handshake(t: *testing.T) {
+    let p = open_pair(t)
+    t.is_true(settle_clean(p))
+    t.is_true(has_connected(events_of(p.a)))
+    t.is_true(has_connected(events_of(p.b)))
+    t.equal(cipher_suite(p.a), 0xC02B)
+    t.equal(cipher_suite(p.b), 0xC02B)
+    t.equal(srtp_profile(p.a), 0)
+}
+
+fn test_every_suite_and_group_completes_the_handshake(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    for suite in [0xC02B, 0xC02C, 0xCCA9] {
+        for group in [tls.group_x25519, tls.group_p256] {
+            let p = pair_of(Config { client: true, identity: ia, unverified: true, cipher_suites: [suite], groups: [group] }, Config { client: false, identity: ib, unverified: true, cipher_suites: [suite], groups: [group] })
+            t.is_true(settle_clean(p))
+            t.equal(cipher_suite(p.a), suite)
+            t.equal(cipher_suite(p.b), suite)
+            let ping = sends(t, p.a, bytes("ping"))
+            receive(p.b, ping, 0)
+            let got = read(p.b) ?? []
+            t.equal(str(got), "ping")
+            let pong = sends(t, p.b, bytes("pong"))
+            receive(p.a, pong, 0)
+            let back = read(p.a) ?? []
+            t.equal(str(back), "pong")
+        }
+    }
+}
+
+fn test_the_server_picks_the_first_suite_of_its_own_order_that_the_client_offers(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let p = pair_of(Config { client: true, identity: ia, unverified: true, cipher_suites: [0xC02B, 0xC02C] }, Config { client: false, identity: ib, unverified: true, cipher_suites: [0xC02C, 0xCCA9] })
+    t.is_true(settle_clean(p))
+    t.equal(cipher_suite(p.a), 0xC02C)
+}
+
+fn test_a_handshake_without_a_shared_suite_fails_with_an_alert(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let p = pair_of(Config { client: true, identity: ia, unverified: true, cipher_suites: [0xC02B] }, Config { client: false, identity: ib, unverified: true, cipher_suites: [0xCCA9] })
+    t.is_false(settle_clean(p))
+    t.equal(state(p.b), State.Failed)
+    t.equal(state(p.a), State.Failed)
+}
+
+fn test_a_handshake_without_a_shared_group_fails(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let p = pair_of(Config { client: true, identity: ia, unverified: true, groups: [tls.group_x25519] }, Config { client: false, identity: ib, unverified: true, groups: [tls.group_p256] })
+    t.is_false(settle_clean(p))
+    t.equal(state(p.b), State.Failed)
+}
+
+fn test_the_handshake_survives_loss_duplication_and_reordering(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    for seed in [1, 2, 3, 4, 5, 6] {
+        for loss in [0, 15, 30] {
+            let p = pair_of(Config { client: true, identity: ia, unverified: true, retransmit_initial: 50, retransmit_max: 400, handshake_timeout: 200000 }, Config { client: false, identity: ib, unverified: true, retransmit_initial: 50, retransmit_max: 400, handshake_timeout: 200000 })
+            let w = wire(u64(seed), loss, 30, 60)
+            t.is_true(settle(w, p, 150000))
+            t.equal(cipher_suite(p.a), cipher_suite(p.b))
+            let a_key = export_keying_material(p.a, "EXTRACTOR-dtls_srtp", 60) catch {
+                e => testing.unexpected(t, e, no_bytes())
+            }
+            let b_key = export_keying_material(p.b, "EXTRACTOR-dtls_srtp", 60) catch {
+                e => testing.unexpected(t, e, no_bytes())
+            }
+            t.equal_slice(a_key, b_key)
+            t.equal(a_key.len, 60)
+        }
+    }
+}
+
+fn test_a_handshake_split_into_small_datagrams_reassembles(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    for seed in [1, 2, 3] {
+        let p = pair_of(Config { client: true, identity: ia, unverified: true, mtu: 160, retransmit_initial: 50, retransmit_max: 400 }, Config { client: false, identity: ib, unverified: true, mtu: 160, retransmit_initial: 50, retransmit_max: 400 })
+        let w = wire(u64(seed), 10, 20, 40)
+        t.is_true(settle(w, p, 100000))
+        t.is_true(w.largest <= 160)
+        t.is_true(w.fragments > 0)
+    }
+}
+
+fn test_a_message_that_does_not_fit_the_mtu_is_refused(t: *testing.T) {
+    let p = connected_pair(t)
+    let failure = write_error(p.a, io.buffer(2000))
+    t.is_some(failure)
+    match failure {
+        some(e) => t.equal(e, io.Error.TooLarge)
+        none => {}
+    }
+    t.is_none(write_error(p.a, io.buffer(1000)))
+}
+
+fn test_writing_before_the_handshake_is_refused(t: *testing.T) {
+    let p = open_pair(t)
+    let failure = write_error(p.a, bytes("early"))
+    match failure {
+        some(e) => t.equal(e, io.Error.NotConnected)
+        none => t.error("write succeeded before the handshake")
+    }
+}
+
+fn test_a_replayed_record_is_delivered_once(t: *testing.T) {
+    let p = connected_pair(t)
+    let d = sends(t, p.a, bytes("once"))
+    receive(p.b, d, 0)
+    receive(p.b, d, 0)
+    receive(p.b, d, 0)
+    let first = read(p.b) ?? []
+    t.equal(str(first), "once")
+    t.is_none(read(p.b))
+}
+
+fn test_records_arrive_in_any_order_once_each(t: *testing.T) {
+    let p = connected_pair(t)
+    let one = sends(t, p.a, bytes("one"))
+    let two = sends(t, p.a, bytes("two"))
+    let three = sends(t, p.a, bytes("three"))
+    receive(p.b, three, 0)
+    receive(p.b, one, 0)
+    receive(p.b, two, 0)
+    receive(p.b, one, 0)
+    var got: str[] = []
+    for {
+        let d = read(p.b) ?? break
+        got.push(str(d))
+    }
+    t.equal_slice(got, ["three", "one", "two"])
+}
+
+fn test_a_record_older_than_the_window_is_dropped(t: *testing.T) {
+    let p = connected_pair(t)
+    let old = sends(t, p.a, bytes("old"))
+    var newest: u8[] = []
+    for _ in 0..70 {
+        newest = sends(t, p.a, bytes("new"))
+    }
+    receive(p.b, newest, 0)
+    receive(p.b, old, 0)
+    var texts: str[] = []
+    for {
+        let d = read(p.b) ?? break
+        texts.push(str(d))
+    }
+    t.equal_slice(texts, ["new"])
+}
+
+fn test_a_record_that_fails_authentication_is_dropped_without_an_alert(t: *testing.T) {
+    let p = connected_pair(t)
+    let d = sends(t, p.a, bytes("secret"))
+    for i in [d.len - 1, d.len - 20, 14, 12, 3] {
+        var bad = io.buffer(d.len)
+        io.copy(bad, d)
+        bad[i] = bad[i] ^ 1
+        receive(p.b, bad, 0)
+        t.is_none(read(p.b))
+        t.is_none(poll_transmit(p.b))
+        t.equal(state(p.b), State.Connected)
+    }
+    receive(p.b, d[..d.len - 1], 0)
+    t.is_none(read(p.b))
+    receive(p.b, d, 0)
+    let got = read(p.b) ?? []
+    t.equal(str(got), "secret")
+}
+
+fn test_a_flipped_record_does_not_advance_the_window(t: *testing.T) {
+    let p = connected_pair(t)
+    let d = sends(t, p.a, bytes("kept"))
+    var bad = io.buffer(d.len)
+    io.copy(bad, d)
+    bad[d.len - 1] = bad[d.len - 1] ^ 0x80
+    receive(p.b, bad, 0)
+    t.is_none(read(p.b))
+    receive(p.b, d, 0)
+    t.is_some(read(p.b))
+}
+
+fn test_garbage_datagrams_change_nothing(t: *testing.T) {
+    let p = connected_pair(t)
+    receive(p.b, [], 0)
+    receive(p.b, [1], 0)
+    receive(p.b, [22, 0xFE, 0xFD], 0)
+    receive(p.b, [23, 0xFE, 0xFD, 0, 1, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 1, 2, 3], 0)
+    receive(p.b, [99, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 9, 0, 2, 1, 2], 0)
+    var noise: u8[] = []
+    for i in 0..600 {
+        noise.push(u8((i * 37 + 11) & 255))
+    }
+    receive(p.b, noise, 0)
+    t.equal(state(p.b), State.Connected)
+    t.is_none(poll_transmit(p.b))
+    t.is_none(read(p.b))
+}
+
+fn test_a_server_keeps_no_state_for_garbage(t: *testing.T) {
+    let ib = identity_for(t, "beta")
+    let s = conn(Config { client: false, identity: ib, unverified: true })
+    var noise: u8[] = []
+    for i in 0..300 {
+        noise.push(u8((i * 91 + 5) & 255))
+    }
+    receive(s, noise, 0)
+    receive(s, frame(type_handshake, 0, 0, [1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2, 9, 9]), 0)
+    t.equal(state(s), State.Idle)
+    t.is_none(poll_transmit(s))
+    t.equal(s.assemblies.len, 0)
+}
+
+fn test_a_server_answers_a_hello_without_a_cookie_with_a_hello_verify_request_and_no_state(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let client = conn(Config { client: true, identity: ia, unverified: true })
+    let server = conn(Config { client: false, identity: ib, unverified: true })
+    start(client, 0)
+    let hello = poll_transmit(client) ?? []
+    t.equal(first_handshake_type(hello), msg_client_hello)
+    receive(server, hello, 0)
+    let reply = poll_transmit(server) ?? []
+    t.equal(first_handshake_type(reply), msg_hello_verify)
+    t.equal(state(server), State.Idle)
+    t.equal(server.assemblies.len, 0)
+    t.equal(server.transcript.len, 0)
+    t.is_false(server.timer)
+}
+
+fn test_a_server_without_cookies_answers_a_hello_with_a_server_hello(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let client = conn(Config { client: true, identity: ia, unverified: true })
+    let server = conn(Config { client: false, identity: ib, unverified: true, cookies: false })
+    start(client, 0)
+    let hello = poll_transmit(client) ?? []
+    receive(server, hello, 0)
+    let reply = poll_transmit(server) ?? []
+    t.equal(first_handshake_type(reply), msg_server_hello)
+    t.equal(state(server), State.Handshaking)
+}
+
+fn test_a_cookie_from_another_server_is_not_accepted(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let client = conn(Config { client: true, identity: ia, unverified: true })
+    let first = conn(Config { client: false, identity: ib, unverified: true })
+    let second = conn(Config { client: false, identity: ib, unverified: true })
+    start(client, 0)
+    let hello = poll_transmit(client) ?? []
+    receive(first, hello, 0)
+    let verify = poll_transmit(first) ?? []
+    receive(client, verify, 0)
+    let again = poll_transmit(client) ?? []
+    t.equal(first_handshake_type(again), msg_client_hello)
+    receive(second, again, 0)
+    let reply = poll_transmit(second) ?? []
+    t.equal(first_handshake_type(reply), msg_hello_verify)
+    t.equal(state(second), State.Idle)
+    receive(first, again, 0)
+    let accepted = poll_transmit(first) ?? []
+    t.equal(first_handshake_type(accepted), msg_server_hello)
+}
+
+fn test_a_peer_certificate_that_matches_the_fingerprint_is_accepted(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    for name in ["sha-1", "sha-256", "sha-384", "sha-512"] {
+        let of_a = fingerprint(name, ia.certificate) catch {
+            e => testing.must(t, e, Fingerprint { algorithm: "", digest: [] })
+        }
+        let of_b = fingerprint(name, ib.certificate) catch {
+            e => testing.must(t, e, Fingerprint { algorithm: "", digest: [] })
+        }
+        let p = pair_of(Config { client: true, identity: ia, fingerprints: [of_b] }, Config { client: false, identity: ib, fingerprints: [of_a] })
+        t.is_true(settle_clean(p))
+        t.equal_slice(peer_certificate(p.a), ib.certificate)
+        t.equal_slice(peer_certificate(p.b), ia.certificate)
+    }
+}
+
+fn test_a_peer_certificate_with_another_fingerprint_is_refused(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let other = identity_for(t, "gamma")
+    let of_a = fingerprint("sha-256", ia.certificate) catch {
+        e => testing.must(t, e, Fingerprint { algorithm: "", digest: [] })
+    }
+    let of_other = fingerprint("sha-256", other.certificate) catch {
+        e => testing.must(t, e, Fingerprint { algorithm: "", digest: [] })
+    }
+    let p = pair_of(Config { client: true, identity: ia, fingerprints: [of_other] }, Config { client: false, identity: ib, fingerprints: [of_a] })
+    t.is_false(settle_clean(p))
+    t.equal(state(p.a), State.Failed)
+    t.is_true(has_failed(events_of(p.a)))
+    t.is_false(state(p.b) == State.Connected)
+}
+
+fn test_a_server_refuses_a_client_certificate_with_another_fingerprint(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let other = identity_for(t, "gamma")
+    let of_b = fingerprint("sha-256", ib.certificate) catch {
+        e => testing.must(t, e, Fingerprint { algorithm: "", digest: [] })
+    }
+    let of_other = fingerprint("sha-256", other.certificate) catch {
+        e => testing.must(t, e, Fingerprint { algorithm: "", digest: [] })
+    }
+    let p = pair_of(Config { client: true, identity: ia, fingerprints: [of_b] }, Config { client: false, identity: ib, fingerprints: [of_other] })
+    t.is_false(settle_clean(p))
+    t.equal(state(p.b), State.Failed)
+    t.is_false(state(p.a) == State.Connected)
+}
+
+fn test_a_flipped_digest_bit_is_refused(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    var of_b = fingerprint("sha-256", ib.certificate) catch {
+        e => testing.must(t, e, Fingerprint { algorithm: "", digest: [] })
+    }
+    var digest = io.buffer(of_b.digest.len)
+    io.copy(digest, of_b.digest)
+    digest[31] = digest[31] ^ 1
+    of_b.digest = digest
+    let p = pair_of(Config { client: true, identity: ia, fingerprints: [of_b] }, Config { client: false, identity: ib, unverified: true })
+    t.is_false(settle_clean(p))
+    t.equal(state(p.a), State.Failed)
+}
+
+fn test_a_peer_without_fingerprints_is_refused_unless_unverified(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let p = pair_of(Config { client: true, identity: ia }, Config { client: false, identity: ib, unverified: true })
+    t.is_false(settle_clean(p))
+    t.equal(state(p.a), State.Failed)
+}
+
+fn test_use_srtp_picks_the_server_preference_among_the_offered_profiles(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let p = pair_of(Config { client: true, identity: ia, unverified: true, srtp_profiles: [srtp_aes128_cm_sha1_80, srtp_aead_aes_128_gcm] }, Config { client: false, identity: ib, unverified: true, srtp_profiles: [srtp_aead_aes_128_gcm, srtp_aes128_cm_sha1_80] })
+    t.is_true(settle_clean(p))
+    t.equal(srtp_profile(p.a), srtp_aead_aes_128_gcm)
+    t.equal(srtp_profile(p.b), srtp_aead_aes_128_gcm)
+}
+
+fn test_use_srtp_without_a_shared_profile_leaves_it_unnegotiated(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let cases = [[[1], [2]], [[1], []], [[], [1]], [[], []]]
+    for c in cases {
+        let p = pair_of(Config { client: true, identity: ia, unverified: true, srtp_profiles: c[0] }, Config { client: false, identity: ib, unverified: true, srtp_profiles: c[1] })
+        t.is_true(settle_clean(p))
+        t.equal(srtp_profile(p.a), 0)
+        t.equal(srtp_profile(p.b), 0)
+    }
+}
+
+fn test_the_exporter_agrees_and_separates_labels_contexts_and_lengths(t: *testing.T) {
+    let p = connected_pair(t)
+    let a = export_keying_material(p.a, "EXTRACTOR-dtls_srtp", 60) catch {
+        e => testing.must(t, e, no_bytes())
+    }
+    let b = export_keying_material(p.b, "EXTRACTOR-dtls_srtp", 60) catch {
+        e => testing.must(t, e, no_bytes())
+    }
+    t.equal_slice(a, b)
+    let other_label = export_keying_material(p.a, "EXTRACTOR-other", 60) catch {
+        e => testing.must(t, e, no_bytes())
+    }
+    t.is_false(slices.equal(a, other_label))
+    let ctx_a = export_keying_material_context(p.a, "EXTRACTOR-dtls_srtp", [1, 2, 3], 60) catch {
+        e => testing.must(t, e, no_bytes())
+    }
+    let ctx_b = export_keying_material_context(p.b, "EXTRACTOR-dtls_srtp", [1, 2, 3], 60) catch {
+        e => testing.must(t, e, no_bytes())
+    }
+    t.equal_slice(ctx_a, ctx_b)
+    t.is_false(slices.equal(a, ctx_a))
+    let short = export_keying_material(p.a, "EXTRACTOR-dtls_srtp", 16) catch {
+        e => testing.must(t, e, no_bytes())
+    }
+    t.equal_slice(short, a[..16])
+}
+
+fn test_the_exporter_fails_before_the_handshake_finishes(t: *testing.T) {
+    let p = open_pair(t)
+    var failed = false
+    let keys = export_keying_material(p.a, "EXTRACTOR-dtls_srtp", 60) catch {
+        _ => {
+            failed = true
+            no_bytes()
+        }
+    }
+    t.equal(keys.len, 0)
+    t.is_true(failed)
+}
+
+fn test_two_connections_export_different_keys(t: *testing.T) {
+    let first = connected_pair(t)
+    let second = connected_pair(t)
+    let a = export_keying_material(first.a, "EXTRACTOR-dtls_srtp", 60) catch {
+        e => testing.must(t, e, no_bytes())
+    }
+    let b = export_keying_material(second.a, "EXTRACTOR-dtls_srtp", 60) catch {
+        e => testing.must(t, e, no_bytes())
+    }
+    t.is_false(slices.equal(a, b))
+}
+
+fn test_close_notify_closes_the_peer_and_refuses_later_writes(t: *testing.T) {
+    let p = connected_pair(t)
+    close(p.a)
+    let alert = poll_transmit(p.a) ?? []
+    t.is_true(alert.len > 0)
+    receive(p.b, alert, 0)
+    t.equal(state(p.b), State.Closed)
+    t.is_true(has_closed(events_of(p.b)))
+    t.is_true(has_closed(events_of(p.a)))
+    t.is_some(write_error(p.a, bytes("late")))
+    t.is_some(write_error(p.b, bytes("late")))
+}
+
+fn test_renegotiation_is_refused_with_a_no_renegotiation_warning(t: *testing.T) {
+    let p = connected_pair(t)
+    let hello = unfragmented(msg_client_hello, 40, [3, 3, 0])
+    let record = seal_plain(p.a, type_handshake, 1, hello)
+    receive(p.b, record, 0)
+    t.equal(state(p.b), State.Connected)
+    let reply = poll_transmit(p.b) ?? []
+    let records = split_records(reply)
+    t.equal(records.len, 1)
+    t.equal(records[0].kind, type_alert)
+    let cipher = match p.a.read_cipher {
+        some(k) => k
+        none => return
+    }
+    let plain = open_record(cipher, type_alert, records[0].epoch, records[0].seq, records[0].body) catch {
+        e => testing.must(t, e, no_bytes())
+    }
+    t.equal_slice(plain, [1, u8(alert_no_renegotiation)])
+    receive(p.a, reply, 0)
+    t.equal(state(p.a), State.Connected)
+    t.equal(state(p.b), State.Connected)
+    let d = sends(t, p.a, bytes("still up"))
+    receive(p.b, d, 0)
+    t.is_some(read(p.b))
+}
+
+fn test_a_fatal_alert_fails_the_connection(t: *testing.T) {
+    let p = connected_pair(t)
+    let record = seal_plain(p.a, type_alert, 1, [2, u8(alert_handshake_failure)])
+    receive(p.b, record, 0)
+    t.equal(state(p.b), State.Failed)
+    t.is_true(has_failed(events_of(p.b)))
+}
+
+fn test_an_unfinished_handshake_retransmits_with_backoff_and_times_out(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let client = conn(Config { client: true, identity: ia, unverified: true, retransmit_initial: 1000, retransmit_max: 8000, handshake_timeout: 20000 })
+    start(client, 0)
+    t.equal(next_timeout(client), 1000)
+    let first = poll_transmit(client) ?? []
+    t.is_true(first.len > 0)
+    tick(client, 999)
+    t.is_none(poll_transmit(client))
+    tick(client, 1000)
+    t.is_some(poll_transmit(client))
+    t.equal(next_timeout(client), 3000)
+    tick(client, 3000)
+    t.equal(next_timeout(client), 7000)
+    tick(client, 7000)
+    t.equal(next_timeout(client), 15000)
+    tick(client, 15000)
+    t.equal(next_timeout(client), 23000)
+    discard(client)
+    tick(client, 23000)
+    t.equal(state(client), State.Failed)
+    t.is_true(has_failed(events_of(client)))
+    t.equal(next_timeout(client), -1)
+}
+
+fn test_a_lost_server_flight_is_recovered_by_the_client_retransmission(t: *testing.T) {
+    let p = open_pair(t)
+    start(p.a, 0)
+    let hello = poll_transmit(p.a) ?? []
+    receive(p.b, hello, 0)
+    let verify = poll_transmit(p.b) ?? []
+    receive(p.a, verify, 1)
+    let again = poll_transmit(p.a) ?? []
+    receive(p.b, again, 2)
+    discard(p.b)
+    tick(p.a, 3000)
+    let resent = poll_transmit(p.a) ?? []
+    receive(p.b, resent, 3000)
+    let flight = poll_transmit(p.b) ?? []
+    t.is_true(flight.len > 0)
+}
+
+fn test_the_client_does_not_answer_a_repeated_server_flight(t: *testing.T) {
+    let p = connected_pair(t)
+    t.is_true(both_connected(p))
+    let d = sends(t, p.b, bytes("x"))
+    receive(p.a, d, 0)
+    receive(p.a, d, 0)
+    t.is_none(poll_transmit(p.a))
+}
+
+fn test_a_lost_final_server_flight_is_replayed_when_the_client_retransmits(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let client = conn(Config { client: true, identity: ia, unverified: true, retransmit_initial: 100 })
+    let server = conn(Config { client: false, identity: ib, unverified: true })
+    start(client, 0)
+    for round in 0..20 {
+        for {
+            let d = poll_transmit(client) ?? break
+            receive(server, d, round)
+        }
+        let established = state(server) == State.Connected
+        for {
+            let d = poll_transmit(server) ?? break
+            if !established {
+                receive(client, d, round)
+            }
+        }
+        if established {
+            break
+        }
+    }
+    t.equal(state(server), State.Connected)
+    t.equal(state(client), State.Handshaking)
+    tick(client, 1000)
+    for {
+        let d = poll_transmit(client) ?? break
+        receive(server, d, 1000)
+    }
+    for {
+        let d = poll_transmit(server) ?? break
+        receive(client, d, 1000)
+    }
+    t.equal(state(client), State.Connected)
+    t.equal(state(server), State.Connected)
+}
+
+fn test_the_transcript_hash_binds_both_hellos(t: *testing.T) {
+    let p = connected_pair(t)
+    t.is_false(hash.equal(p.a.client_random, p.a.server_random))
+    t.equal_slice(p.a.client_random, p.b.client_random)
+    t.equal_slice(p.a.server_random, p.b.server_random)
+    t.equal_slice(p.a.master, p.b.master)
+    t.equal(p.a.master.len, 48)
+}
+
+fn test_the_master_secret_differs_between_connections(t: *testing.T) {
+    let first = connected_pair(t)
+    let second = connected_pair(t)
+    t.is_false(slices.equal(first.a.master, second.a.master))
+}
+
+fn test_a_plaintext_alert_does_not_end_an_established_connection(t: *testing.T) {
+    let p = connected_pair(t)
+    let fatal_alert = frame(type_alert, 0, 999, [2, u8(alert_handshake_failure)])
+    let close_alert = frame(type_alert, 0, 1000, [1, u8(alert_close_notify)])
+    receive(p.b, fatal_alert, 0)
+    receive(p.b, close_alert, 0)
+    receive(p.a, fatal_alert, 0)
+    receive(p.a, close_alert, 0)
+    t.equal(state(p.a), State.Connected)
+    t.equal(state(p.b), State.Connected)
+    let d = sends(t, p.a, bytes("alive"))
+    receive(p.b, d, 0)
+    t.is_some(read(p.b))
+}
+
+fn test_a_plaintext_alert_does_not_end_a_handshake_whose_keys_exist(t: *testing.T) {
+    let p = open_pair(t)
+    start(p.a, 0)
+    var rounds = 0
+    for rounds < 20 && !has_read_cipher(p.a) {
+        for {
+            let d = poll_transmit(p.a) ?? break
+            receive(p.b, d, rounds)
+        }
+        for {
+            let d = poll_transmit(p.b) ?? break
+            receive(p.a, d, rounds)
+        }
+        rounds += 1
+    }
+    let fatal_alert = frame(type_alert, 0, 5, [2, u8(alert_handshake_failure)])
+    receive(p.a, fatal_alert, rounds)
+    t.is_false(state(p.a) == State.Failed)
+}
+
+fn test_a_forged_epoch_0_record_with_a_huge_sequence_number_does_not_block_the_handshake(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let client = conn(Config { client: true, identity: ia, unverified: true })
+    let server = conn(Config { client: false, identity: ib, unverified: true })
+    let junk = frame(type_handshake, 0, 0xFFFF_FFFF_FFFF, [9, 9, 9])
+    receive(client, junk, 0)
+    receive(server, junk, 0)
+    let p = Pair { a: client, b: server }
+    t.is_true(settle_clean(p))
+}
+
+fn test_a_peer_that_presents_a_certificate_without_its_key_is_refused_by_the_client(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let other = identity_for(t, "gamma")
+    let impostor = Identity { certificate: ib.certificate, key: other.key }
+    let of_b = fingerprint("sha-256", ib.certificate) catch {
+        e => testing.must(t, e, Fingerprint { algorithm: "", digest: [] })
+    }
+    let client = Config { client: true, identity: ia, fingerprints: [of_b] }
+    let server = Config { client: false, identity: impostor, unverified: true }
+    let p = pair_of(client, server)
+    t.is_false(settle_clean(p))
+    t.equal(state(p.a), State.Failed)
+}
+
+fn test_a_peer_that_presents_a_certificate_without_its_key_is_refused_by_the_server(t: *testing.T) {
+    let ia = identity_for(t, "alpha")
+    let ib = identity_for(t, "beta")
+    let other = identity_for(t, "gamma")
+    let impostor = Identity { certificate: ia.certificate, key: other.key }
+    let of_a = fingerprint("sha-256", ia.certificate) catch {
+        e => testing.must(t, e, Fingerprint { algorithm: "", digest: [] })
+    }
+    let client = Config { client: true, identity: impostor, unverified: true }
+    let server = Config { client: false, identity: ib, fingerprints: [of_a] }
+    let p = pair_of(client, server)
+    t.is_false(settle_clean(p))
+    t.equal(state(p.b), State.Failed)
+    t.is_false(state(p.a) == State.Connected && state(p.b) == State.Connected)
+}
