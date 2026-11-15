@@ -1,0 +1,223 @@
+import std/crypto
+import std/crypto/aead
+import std/io
+
+const key_size = 32
+const block_size = 16
+const seed_size = 48
+const max_request = 65536
+const max_input = 4294967295
+const reseed_interval = 281474976710656
+
+/// The failure of a DRBG operation.
+pub enum Error {
+    /// The entropy input is shorter than the 32 bytes of the AES-256 security strength.
+    InvalidEntropy
+    /// The nonce is shorter than 16 bytes, half the security strength.
+    InvalidNonce
+    /// The inputs together are longer than the 2^32 - 1 bytes the derivation function can take.
+    InputTooLong
+    /// The number of bytes requested is negative.
+    InvalidLength
+    /// More than 65536 bytes (2^19 bits) were requested in one call.
+    RequestTooLarge
+    /// The generator has made 2^48 requests since it was seeded and must be reseeded before it generates again.
+    ReseedRequired
+    /// The generator was erased by `uninstantiate`.
+    Uninstantiated
+}
+
+/// An AES-256 CTR_DRBG with the derivation function (NIST SP 800-90A Rev. 1 section 10.2.1).
+///
+/// Made by `instantiate`. `generate` returns random bytes, `reseed` mixes in new entropy and `uninstantiate` erases the state. The generator is deterministic: the same entropy, nonce, personalization string and call sequence give the same output. It holds no entropy source of its own, so the caller supplies every entropy input.
+pub struct CtrDrbg {
+    key: []u8
+    v: []u8
+    counter: i64
+    live: bool
+}
+
+fn aes256(key: []u8) -> *aead.Aes {
+    aead.aes_key(key) catch {
+        e => panic("drbg: the AES key failed: {e}")
+    }
+}
+
+fn join(a: []u8, b: []u8, c: []u8) -> []u8 {
+    let out = io.buffer(a.len + b.len + c.len)
+    __memmove(out, a)
+    __memmove(out[a.len..], b)
+    __memmove(out[a.len + b.len..], c)
+    out
+}
+
+fn increment(v: []u8) {
+    var carry: u32 = 1
+    var i = v.len - 1
+    for i >= 0 {
+        let sum = u32(v[i]) + carry
+        v[i] = u8(sum)
+        carry = sum >> 8
+        i -= 1
+    }
+}
+
+fn bcc(k: *aead.Aes, data: []u8) -> []u8 {
+    let chain = io.buffer(block_size)
+    for at in 0..data.len / block_size {
+        for i in 0..block_size {
+            chain[i] ^= data[at * block_size + i]
+        }
+        aead.encrypt_block_into(k, chain, 0, chain, 0)
+    }
+    chain
+}
+
+fn derive(input: []u8) -> []u8 {
+    let body = 8 + input.len + 1
+    let padded = (body + block_size - 1) / block_size * block_size
+    let s = io.buffer(block_size + padded)
+    io.set_be32(s, block_size, input.len)
+    io.set_be32(s, block_size + 4, seed_size)
+    __memmove(s[block_size + 8..], input)
+    s[block_size + 8 + input.len] = 0x80
+    let fixed = io.buffer(key_size)
+    for i in 0..key_size {
+        fixed[i] = u8(i)
+    }
+    let bcc_key = aes256(fixed)
+    let temp = io.buffer(seed_size)
+    for i in 0..3 {
+        io.set_be32(s, 0, i)
+        let chain = bcc(bcc_key, s)
+        __memmove(temp[i * block_size..], chain)
+        crypto.wipe(chain)
+    }
+    let key = aes256(temp[..key_size])
+    let x = io.buffer(block_size)
+    __memmove(x, temp[key_size..])
+    let out = io.buffer(seed_size)
+    for i in 0..3 {
+        aead.encrypt_block_into(key, x, 0, x, 0)
+        __memmove(out[i * block_size..], x)
+    }
+    aead.aes_wipe(key)
+    aead.aes_wipe(bcc_key)
+    crypto.wipe(x)
+    crypto.wipe(temp)
+    crypto.wipe(fixed)
+    crypto.wipe(s)
+    out
+}
+
+fn update(d: *CtrDrbg, provided: []u8) {
+    let k = aes256(d.key)
+    let temp = io.buffer(seed_size)
+    for i in 0..3 {
+        increment(d.v)
+        aead.encrypt_block_into(k, d.v, 0, temp, i * block_size)
+    }
+    for i in 0..seed_size {
+        temp[i] ^= provided[i]
+    }
+    __memmove(d.key, temp[..key_size])
+    __memmove(d.v, temp[key_size..])
+    aead.aes_wipe(k)
+    crypto.wipe(temp)
+}
+
+/// Returns a generator instantiated from `entropy`, `nonce` and `personalization` (SP 800-90A section 10.2.1.3.2).
+///
+/// `entropy` must be at least 32 bytes of output from an entropy source, `nonce` at least 16 bytes that do not repeat, and `personalization` can be empty. Fails with `Error.InvalidEntropy`, `Error.InvalidNonce` or `Error.InputTooLong`.
+pub fn instantiate(entropy: []u8, nonce: []u8, personalization: []u8) -> *CtrDrbg ! Error {
+    if entropy.len < key_size {
+        fail Error.InvalidEntropy
+    }
+    if nonce.len < block_size {
+        fail Error.InvalidNonce
+    }
+    if entropy.len + nonce.len + personalization.len > max_input {
+        fail Error.InputTooLong
+    }
+    let material = join(entropy, nonce, personalization)
+    let seed = derive(material)
+    let d = new(CtrDrbg { key: io.buffer(key_size), v: io.buffer(block_size), counter: 1, live: true })
+    update(d, seed)
+    crypto.wipe(material)
+    crypto.wipe(seed)
+    d
+}
+
+/// Mixes `entropy` and `additional` into the state of `d` and restarts the reseed counter (SP 800-90A section 10.2.1.4.2).
+///
+/// `entropy` must be at least 32 bytes and `additional` can be empty. Fails with `Error.Uninstantiated` after `uninstantiate`, `Error.InvalidEntropy` or `Error.InputTooLong`.
+pub fn reseed(d: *CtrDrbg, entropy: []u8, additional: []u8) ! Error {
+    if !d.live {
+        fail Error.Uninstantiated
+    }
+    if entropy.len < key_size {
+        fail Error.InvalidEntropy
+    }
+    if entropy.len + additional.len > max_input {
+        fail Error.InputTooLong
+    }
+    let material = join(entropy, additional, [])
+    let seed = derive(material)
+    update(d, seed)
+    d.counter = 1
+    crypto.wipe(material)
+    crypto.wipe(seed)
+}
+
+/// Returns `n` random bytes from `d`, mixing `additional` into the state first when it is not empty (SP 800-90A section 10.2.1.5.2).
+///
+/// `n` is at most 65536, the 2^19 bits of one request. For prediction resistance there is no flag: call `reseed` with fresh entropy and the additional input, then `generate` with none. Fails with `Error.Uninstantiated` after `uninstantiate`, `Error.InvalidLength` for a negative `n`, `Error.RequestTooLarge` for an `n` over 65536, `Error.InputTooLong`, and `Error.ReseedRequired` once 2^48 requests have been made since the last `instantiate` or `reseed`.
+pub fn generate(d: *CtrDrbg, n: i64, additional: []u8) -> []u8 ! Error {
+    if !d.live {
+        fail Error.Uninstantiated
+    }
+    if n < 0 {
+        fail Error.InvalidLength
+    }
+    if n > max_request {
+        fail Error.RequestTooLarge
+    }
+    if additional.len > max_input {
+        fail Error.InputTooLong
+    }
+    if d.counter > reseed_interval {
+        fail Error.ReseedRequired
+    }
+    var provided = io.buffer(seed_size)
+    if additional.len > 0 {
+        provided = derive(additional)
+        update(d, provided)
+    }
+    let k = aes256(d.key)
+    let out = io.buffer(n)
+    let block = io.buffer(block_size)
+    var at = 0
+    for at < n {
+        increment(d.v)
+        aead.encrypt_block_into(k, d.v, 0, block, 0)
+        let m = if n - at < block_size { n - at } else { block_size }
+        __memmove(out[at..], block[..m])
+        at += block_size
+    }
+    update(d, provided)
+    d.counter += 1
+    aead.aes_wipe(k)
+    crypto.wipe(block)
+    crypto.wipe(provided)
+    out
+}
+
+/// Erases the key, the counter block and the request counter of `d` (SP 800-90A section 9.4).
+///
+/// `generate` and `reseed` then fail with `Error.Uninstantiated`. Every operation wipes its copies of the entropy and additional input, the derived seeds, the intermediate keys and the AES key schedules, so the key and the counter block of `d` are the only secrets the generator holds.
+pub fn uninstantiate(d: *CtrDrbg) {
+    crypto.wipe(d.key)
+    crypto.wipe(d.v)
+    d.counter = 0
+    d.live = false
+}
