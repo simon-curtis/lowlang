@@ -2,6 +2,7 @@ import amd64
 import compiler
 import ir
 import native
+import target
 import std/atomic
 import std/cancel
 import std/file
@@ -96,6 +97,7 @@ pub struct Session {
     signatures: [str: str] = [:]
     layout: str = ""
     libraries: []str = []
+    base: i64 = 0
     c_symbols: []str = []
     static_blocks: []str = []
     pub next: i64 = 0
@@ -103,7 +105,6 @@ pub struct Session {
 }
 
 pub fn new_session(source: str, stdout: Sink, stderr: Sink) -> *Session ! Error {
-    check_host()?
     let dir = file.temp_dir("low-dev-") catch {
         e => fail Failed("create temporary directory: {e}")
     }
@@ -248,7 +249,7 @@ fn watched(s: *Session) -> []str {
 }
 
 pub fn reload(s: *Session, token: *cancel.Token) ! Error {
-    let unit = native.analyse(s.path, compiler.dev()) catch {
+    let unit = native.analyse(s.path, compiler.dev(target.host())) catch {
         e => {
             log_line(s, native.message(e))
             return
@@ -370,7 +371,7 @@ fn changed_funcs(old: [str: str], current: [str: str]) -> []str {
 
 fn start(s: *Session, unit: *compiler.Unit, reason: str) ! Error {
     s.builds += 1
-    let name = "app{s.builds}"
+    let name = "app{s.builds}{binary_suffix}"
     let parts = [s.dir, name]
     let binary = path.join(parts)
     let built = native.build(unit, binary) catch Compile
@@ -385,6 +386,7 @@ fn start(s: *Session, unit: *compiler.Unit, reason: str) ! Error {
     s.libraries = ir.libraries(program)
     s.c_symbols = program.c_symbols
     s.static_blocks = program.static_blocks
+    s.base = amd64.hot_base(amd64.new_platform(unit.profile.platform))
     s.next = 0
     log_line(s, reason)
 }
@@ -394,6 +396,7 @@ fn start_child(s: *Session, binary: str) -> *Child ! Error {
     command.stdin = process.Stdio.Null
     command.stdout = stdio_of(s.stdout)
     command.stderr = stdio_of(s.stderr)
+    command.group = true
     let handle = process.start_handle(command) catch {
         e => fail Failed("start {binary}: {e}")
     }
@@ -446,9 +449,9 @@ fn stop(s: *Session) {
 fn patch(s: *Session, token: *cancel.Token, unit: *compiler.Unit, table: *amd64.FuncTable, changed: []str) ! Error {
     let suffix = "_r{s.builds}_{s.next}"
     let built = s.built ?? panic("session without a build")
-    let base = amd64.hot_base + s.next
+    let base = s.base + s.next
     let image = native.patch(built, unit, table, changed, suffix, base) catch Compile
-    let end = image.address + image.code.len - amd64.hot_base
+    let end = image.address + image.code.len - s.base
     if end > amd64.hot_size {
         fail Failed("hot code space exhausted")
     }
@@ -487,25 +490,20 @@ fn mailbox(s: *Session) -> Mailbox ! Error {
 fn apply(s: *Session, token: *cancel.Token, code: []u8, address: i64, entries: []u8, count: i64) ! Error {
     let box = mailbox(s)?
     let child = s.child ?? panic("session without a program")
-    let pid = child.handle.pid
-    wait_for_hot_region(token, pid)?
-    let memory_path = "/proc/{pid}/mem"
-    let opened = sys.open(memory_path, sys.Open.ReadWrite, 0) catch {
-        e => fail Failed("open {memory_path}: {e}")
-    }
-    using mem = sys.adopt(opened)
-    write_at(mem.handle, code, address) catch {
+    let memory = open_memory(s, child, token)?
+    defer close_memory(memory)
+    write_memory(memory, code, address) catch {
         e => fail Failed("writing code at 0x{text.hex(address)}: {e}")
     }
-    write_at(mem.handle, entries, box.list) catch {
+    write_memory(memory, entries, box.list) catch {
         e => fail Failed("writing patch list: {e}")
     }
     let total = le64_bytes(count)
-    write_at(mem.handle, total, box.count) catch {
+    write_memory(memory, total, box.count) catch {
         e => fail Failed("writing patch count: {e}")
     }
-    notify(child.handle)?
-    wait_for_zero(token, mem.handle, box.count) catch {
+    notify(s, child, memory)?
+    wait_for_zero(token, memory, box.count) catch {
         e => {
             await_exit(child, token) catch {
                 _ => fail Failed("waiting for the program to apply the patch: {message(e)}")
@@ -522,39 +520,15 @@ fn le64_bytes(n: i64) -> []u8 {
     out
 }
 
-fn write_at(mem: sys.FdHandle, data: []u8, address: i64) ! io.Error {
-    sys.seek(mem.fd, address, sys.Seek.FromStart)?
-    sys.write_all_on(mem, data)?
-}
-
-fn read_at(mem: sys.FdHandle, data: []u8, address: i64) ! io.Error {
-    sys.seek(mem.fd, address, sys.Seek.FromStart)?
-    let n = sys.read_on(mem, data)?
-    if n != data.len {
-        fail Eof
-    }
-}
-
 fn await_exit(c: *Child, token: *cancel.Token) ! Error {
     let exited_check = fn() -> bool ! Error { atomic.is_set(c.exited) }
     poll(token, exited_check)?
 }
 
-fn wait_for_hot_region(token: *cancel.Token, pid: i64) ! Error {
-    let region = "{text.hex(amd64.hot_base)}-"
-    let mapped = fn() -> bool ! Error {
-        let maps = file.read_text("/proc/{pid}/maps") catch {
-            e => fail Failed("read /proc/{pid}/maps: {e}")
-        }
-        text.contains(maps, region)
-    }
-    poll(token, mapped)?
-}
-
-fn wait_for_zero(token: *cancel.Token, mem: sys.FdHandle, address: i64) ! Error {
+fn wait_for_zero(token: *cancel.Token, memory: Memory, address: i64) ! Error {
     let word = io.buffer(8)
     let zero = fn() -> bool ! Error {
-        read_at(mem, word, address) catch {
+        read_memory(memory, word, address) catch {
             e => fail Failed("read patch count: {e}")
         }
         io.le64(word, 0) == 0
