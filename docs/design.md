@@ -1970,7 +1970,7 @@ The contracts between the stages have one owner each:
   - A thief takes half of the victim's queue into its own. It tries the victim's `runnext` only in the last of 4 rounds, and takes it at once when the victim is in a C call or stopped (asleep on a runtime lock or held by a collection), or when the running victim's `runnext` sequence has stayed unchanged for 2,000 timestamp-counter ticks.
   - At most half of the running threads spin looking for work. With nothing to do, a thread sleeps on a futex or becomes the single poller that blocks in `epoll_wait` until the next timer.
   - Every 32nd schedule on an OS thread moves `runnext` to the tail of its run queue and takes the queue's head, so green threads that keep readying each other cannot starve the rest of the queue.
-- A green thread reserves 1 MB of stack with a guard page below it. Pages are committed as they are touched, and finished green threads are reused. Its context is its saved registers on its own stack. A fault in the guard page panics with `stack overflow`; any other fault panics with `invalid memory access`.
+- A green thread reserves 1 MB of stack with a guard page below it. Pages are committed as they are touched, and finished green threads are reused. Its context is its saved registers on its own stack. A fault in the guard page panics with `stack overflow`; any other fault panics with `invalid memory access`, after a `fault:` line on stderr that gives the address accessed, the instruction's address, the stack pointer and the lowest address of the green thread's stack, each as 16 hexadecimal digits.
 - Per-thread state lives in a 24-byte `.tbss` block directly below the thread pointer: the thread record at `fs:-24`, the running green thread at `fs:-16` and the preemption flag at `fs:-8`. A static program sets `fs` with `arch_prctl` and `CLONE_SETTLS`; a dynamic program uses the block glibc allocates for every thread. Generated code uses the fixed offsets, so hot reload patches need no TLS relocations.
 - Preemption:
   - Every loop back-edge tests the preemption flag.
@@ -2663,7 +2663,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
 
 - `testdata/run` holds programs that run on Linux:
   - `.out` is the expected stdout, empty when absent.
-  - `.err` is the expected stderr. A program has one exactly when it exits with a panic status.
+  - `.err` is the expected stderr. A program has one exactly when it exits with a panic status. A `fault:` line is left out of the comparison and printed with the failure when the program fails.
   - `.maxrss` is a limit on peak memory in KB.
   - `.maxtime` is a limit on the wall-clock time of one run, as a duration such as `1s`. Only programs whose point is speed have one. A program with a `.maxtime` or `.maxrss` runs on its own, not alongside the others.
   - `.needed` lists the shared libraries the binary must link, one per line in sorted order. Without it the binary must be static with no interpreter. A program with one has no Windows build.

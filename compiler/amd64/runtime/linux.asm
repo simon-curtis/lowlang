@@ -471,6 +471,7 @@ rt_restorer:
 	syscall
 
 rt_fault:
+	mov r8, rdx
 	mov rax, [rsi+16]
 	mov rcx, qword ptr fs:[TLS_G]
 	test rcx, rcx
@@ -490,6 +491,16 @@ rt_fault:
 	lea rdi, [rip+rt_msg_region_freed]
 	jmp rt_panic
 2:
+	mov rdi, [rsi+16]
+	mov rsi, [r8+168]
+	mov rdx, [r8+160]
+	xor ecx, ecx
+	mov rax, qword ptr fs:[TLS_G]
+	test rax, rax
+	jz 3f
+	mov rcx, [rax+G_LO]
+3:
+	call rt_fault_report
 	lea rdi, [rip+rt_msg_fault]
 	jmp rt_panic
 
