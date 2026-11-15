@@ -10,7 +10,7 @@ Low compiles to static native binaries with no libc dependency, has a tracing ga
 | `low dev` | Runs the program and patches changed functions into it on save. Changing `main`, a type's layout or a function's signature restarts it. |
 | `low ir` | Prints the optimised SSA form. |
 | `low asm` | Prints the generated assembly. |
-| `low lint` | Type-checks the program and prints its warnings. |
+| `low lint` | Type-checks a program or a library module and prints its warnings. |
 | `low doc` | Prints the public API of every module under a directory as JSON. |
 | `low names` | Prints every name in a file as JSON, with its hover text, definition and reference group. |
 | `low lsp` | Starts the language server that the editor extensions use. |
@@ -1038,7 +1038,7 @@ fn main() {
 - The project root is the nearest directory, starting at the entry, that holds a `low.mod` file. Without one it is the entry's directory.
 - `import ui/text` loads `<root>/ui/text/`. A path starting with `std/` names a module of the standard library, which is compiled into `low`, so a project directory named `std` cannot be imported.
 - `low build dir` builds the directory as the entry module. `low build file.low` builds that one file as the entry module, without the other files beside it.
-- `low lint file.low` type-checks the program, prints warnings for the program's own modules (not the standard library), and exits with status 1 if there were any. `-target` picks the operating system whose files are checked and defaults to the host. `low build`, `low run`, `low asm` and `low ir` print the same warnings to stderr and continue. The language server reports them as warnings.
+- `low lint file.low` type-checks the program, or a library module whose entry directory has no `main`, prints warnings for the program's own modules (not the standard library), and exits with status 1 if there were any. `low build`, `low run`, `low dev`, `low asm` and `low ir` report `missing function main` for such a module. `-target` picks the operating system whose files are checked and defaults to the host. `low build`, `low run`, `low asm` and `low ir` print the same warnings to stderr and continue. The language server reports them as warnings.
   - `prefer-match` flags two shapes in which every condition compares one side-effect-free subject (a variable, field, index or dereference) with `==`, `!=`, `<`, `<=`, `>` or `>=` against an integer, character or string literal, a constant or an enum variant, with the constant on either side:
     - an `if` / `else if` / `else` chain with at least two conditions;
     - at least two consecutive guard clauses, `if` statements without `else` whose block is only `return value`, that end a function body before its tail value or final `return`. Earlier guards on another subject are left out.
@@ -2707,7 +2707,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
 - `testdata/windows` holds programs that only run on Windows, with `.out` and `.err`.
 - `std/<module>/examples` holds the module's examples, with `.out` and, for an example with no Windows build, a `.tags` of `linux-only`. The runner does not check `simd` for them.
 - `testdata/fail` holds programs that must fail to compile with the message in `.err`, with file paths shown relative to the fixture. `.target` names the target to build for, such as `browser/wasm32`, and is read by `fixture.read_target`; without it the program builds for `linux/amd64`.
-- `testdata/lint` holds programs whose `low lint` warnings must equal `.warn`, one per line with relative paths. A program without a `.warn` file has none.
+- `testdata/lint` holds programs and library modules without a `main` whose `low lint` warnings must equal `.warn`, one per line with relative paths. A program without a `.warn` file has none.
 - `testdata/test` holds directories whose tests run with `low test`:
   - `.module` names the path to test, joined to the directory's path from the repository root: a submodule of a project, `...` for every module below the directory, or `name_test.low:LINE`. Without it the directory itself is tested.
   - `.args` lists extra arguments for `low test`, one per line, after the path and `-notime`.
