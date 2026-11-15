@@ -1,0 +1,231 @@
+import std/arrow
+import digest = std/crypto/hash
+import std/file
+import std/io
+import std/text
+
+struct Source {
+    name: str
+    schema: arrow.Schema
+    batches: []arrow.Batch
+}
+
+struct Output {
+    name: str
+    data: []u8
+}
+
+struct Variant {
+    label: str
+    compression: arrow.Compression
+    alignment: i64
+}
+
+fn variants() -> []Variant {
+    [
+        Variant { label: "plain", compression: arrow.Compression.Uncompressed, alignment: 8 },
+        Variant { label: "lz4", compression: arrow.Compression.Lz4, alignment: 16 },
+        Variant { label: "zstd", compression: arrow.Compression.Zstd, alignment: 64 },
+    ]
+}
+
+fn read_source(label: str, fixture: str) -> Source ! arrow.Error {
+    let r = arrow.stream_bytes(find(fixture), arrow.ReaderOptions {})?
+    let batches = arrow.read_batches(r)?
+    Source { name: label, schema: arrow.stream_schema(r), batches }
+}
+
+fn sources() -> []Source ! arrow.Error {
+    let built = Source { name: "built", schema: built_schema(), batches: [built_batch()?] }
+    [
+        read_source("scalars", "scalars.arrows")?,
+        read_source("temporal", "temporal.arrows")?,
+        read_source("nested", "nested.arrows")?,
+        read_source("meta", "meta.arrows")?,
+        read_source("sweep", "sweep.arrows")?,
+        read_source("wide", "wide_lz4.arrows")?,
+        read_source("delta", "dict_delta.arrows")?,
+        read_source("empty", "nobatches.arrows")?,
+        built,
+    ]
+}
+
+fn fingerprint(schema: arrow.Schema, batches: []arrow.Batch) -> str {
+    var parts: []str = []
+    for f in schema.fields {
+        push(mut parts, "{f.name} {arrow.type_name(f.data_type)} {f.nullable}{meta_text(f.metadata)}")
+    }
+    push(mut parts, meta_text(schema.metadata))
+    for b in batches {
+        push(mut parts, "rows {b.length}")
+        for c in b.columns {
+            push(mut parts, arrow.diagnostic(c))
+        }
+    }
+    text.join(parts, "\n")
+}
+
+fn options_of(v: Variant) -> arrow.WriterOptions {
+    arrow.WriterOptions { compression: v.compression, alignment: v.alignment }
+}
+
+fn check_stream(name: str, data: []u8, s: Source) {
+    let r = arrow.stream_bytes(data, arrow.ReaderOptions {}) catch {
+        e => {
+            print("FAIL {name} stream {arrow.message(e)}")
+            return
+        }
+    }
+    let back = arrow.read_batches(r) catch {
+        e => {
+            print("FAIL {name} batches {arrow.message(e)}")
+            return
+        }
+    }
+    expect("{name} stream round trip", fingerprint(arrow.stream_schema(r), back) == fingerprint(s.schema, s.batches))
+}
+
+fn check_file(name: str, data: []u8, s: Source) {
+    let f = arrow.open_file_bytes(data, arrow.ReaderOptions {}) catch {
+        e => {
+            print("FAIL {name} file {arrow.message(e)}")
+            return
+        }
+    }
+    let back = arrow.read_file_batches(f) catch {
+        e => {
+            print("FAIL {name} batches {arrow.message(e)}")
+            return
+        }
+    }
+    expect("{name} file round trip", fingerprint(arrow.file_schema(f), back) == fingerprint(s.schema, s.batches))
+    expect("{name} batch count", arrow.batch_count(f) == s.batches.len)
+    for i in 0..arrow.batch_count(f) {
+        let one = arrow.read_batch(f, i) catch {
+            e => {
+                print("FAIL {name} batch {i} {arrow.message(e)}")
+                return
+            }
+        }
+        expect("{name} batch {i}", fingerprint(s.schema, [one]) == fingerprint(s.schema, [s.batches[i]]))
+    }
+}
+
+fn outputs() -> []Output ! arrow.Error {
+    var out: []Output = []
+    for s in sources()? {
+        for v in variants() {
+            let options = options_of(v)
+            let stream = arrow.write_stream(s.schema, s.batches, options)?
+            push(mut out, Output { name: "{s.name}_{v.label}.arrows", data: stream })
+            check_stream("{s.name}_{v.label}.arrows", stream, s)
+            if s.name == "delta" {
+                continue
+            }
+            let whole = arrow.write_file(s.schema, s.batches, options)?
+            push(mut out, Output { name: "{s.name}_{v.label}.arrow", data: whole })
+            check_file("{s.name}_{v.label}.arrow", whole, s)
+        }
+    }
+    out
+}
+
+fn writing() ! arrow.Error {
+    print("== writing")
+    for o in outputs()? {
+        let sum = digest.sum(digest.sha256(), o.data)
+        print("wrote {o.name} {o.data.len} {hex(sum)}")
+    }
+}
+
+fn discard(chunk: []u8) ! io.Error {
+}
+
+fn broken(chunk: []u8) ! io.Error {
+    fail io.Error.Eof
+}
+
+fn stream_writer_outcome(sink: fn([]u8) ! io.Error, schema: arrow.Schema, alignment: i64) -> str {
+    arrow.stream_writer(sink, schema, arrow.WriterOptions { alignment }) catch {
+        e => return kind(e)
+    }
+    "accepted"
+}
+
+fn file_writer_outcome(sink: fn([]u8) ! io.Error, schema: arrow.Schema, alignment: i64) -> str {
+    arrow.file_writer(sink, schema, arrow.WriterOptions { alignment }) catch {
+        e => return kind(e)
+    }
+    "accepted"
+}
+
+fn after_close_outcome(s: Source) -> str {
+    let w = arrow.stream_writer(discard, s.schema, arrow.WriterOptions {}) catch {
+        e => return kind(e)
+    }
+    arrow.close(w) catch {
+        e => return kind(e)
+    }
+    arrow.write_batch(w, s.batches[0]) catch {
+        e => return kind(e)
+    }
+    "accepted"
+}
+
+fn replacement_outcome(delta: Source) -> str {
+    let w = arrow.file_writer(discard, delta.schema, arrow.WriterOptions {}) catch {
+        e => return kind(e)
+    }
+    for b in delta.batches {
+        arrow.write_batch(w, b) catch {
+            e => return kind(e)
+        }
+    }
+    "accepted"
+}
+
+fn foreign_outcome(schema: Source, batch: Source) -> str {
+    let w = arrow.stream_writer(discard, schema.schema, arrow.WriterOptions {}) catch {
+        e => return kind(e)
+    }
+    arrow.write_batch(w, batch.batches[0]) catch {
+        e => return kind(e)
+    }
+    "accepted"
+}
+
+fn wrong_length_outcome(s: Source) -> str {
+    let w = arrow.stream_writer(discard, s.schema, arrow.WriterOptions {}) catch {
+        e => return kind(e)
+    }
+    let b = s.batches[0]
+    arrow.write_batch(w, arrow.Batch { schema: b.schema, length: b.length + 1, columns: b.columns }) catch {
+        e => return kind(e)
+    }
+    "accepted"
+}
+
+fn api_errors() ! arrow.Error {
+    let all = sources()?
+    let scalars = all[0]
+    let sweep = all[4]
+    let delta = all[6]
+    var sink_bytes: []u8 = []
+    let sink: fn([]u8) ! io.Error = fn(chunk) { io.append(mut sink_bytes, chunk) }
+    let w = arrow.stream_writer(sink, sweep.schema, arrow.WriterOptions {})?
+    expect("writer counts the schema message", arrow.written(w) == sink_bytes.len && sink_bytes.len > 0)
+    arrow.write_batch(w, sweep.batches[0])?
+    expect("writer counts bytes", arrow.written(w) == sink_bytes.len)
+    arrow.close(w)?
+    let closed = arrow.written(w)
+    arrow.close(w)?
+    expect("close twice writes nothing", arrow.written(w) == closed && closed == sink_bytes.len)
+    print("== writer errors")
+    print("write after close {after_close_outcome(sweep)}")
+    print("file replacing a dictionary {replacement_outcome(delta)}")
+    print("columns of another schema {foreign_outcome(sweep, scalars)}")
+    print("batch length {wrong_length_outcome(sweep)}")
+    print("alignment 12 {stream_writer_outcome(discard, sweep.schema, 12)}")
+    print("alignment 128 {file_writer_outcome(discard, sweep.schema, 128)}")
+    print("failing sink {stream_writer_outcome(broken, sweep.schema, 8)}")
+}

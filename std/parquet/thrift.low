@@ -1,0 +1,340 @@
+import std/io
+import std/text
+
+const max_depth = 32
+
+enum Thrift {
+    Bool(v: bool)
+    Byte(v: i64)
+    I16(v: i64)
+    I32(v: i64)
+    I64(v: i64)
+    Double(v: f64)
+    Binary(v: []u8)
+    List(items: []Thrift)
+    Struct(fields: []TField)
+}
+
+struct TField {
+    id: i64
+    value: Thrift
+}
+
+struct Source {
+    data: []u8
+    pos: i64
+    base: i64
+}
+
+fn source(data: []u8, base: i64) -> *Source {
+    new(Source { data, pos: 0, base })
+}
+
+fn at_of(s: *Source) -> i64 {
+    s.base + s.pos
+}
+
+fn take_byte(s: *Source) -> i64 ! Error {
+    if s.pos >= s.data.len {
+        fail Truncated(at_of(s))
+    }
+    let b = i64(s.data[s.pos])
+    s.pos += 1
+    b
+}
+
+fn take_varint(s: *Source) -> u64 ! Error {
+    var v: u64 = 0
+    var shift: u64 = 0
+    for {
+        let b = take_byte(s)?
+        v = v | (u64(b & 0x7F) << shift)
+        if b & 0x80 == 0 {
+            return v
+        }
+        shift += 7
+        if shift > 63 {
+            fail Invalid(at_of(s), "a varint is longer than 10 bytes")
+        }
+    }
+}
+
+fn zigzag(v: u64) -> i64 {
+    i64(v >> 1) ^ -i64(v & 1)
+}
+
+fn take_zigzag(s: *Source) -> i64 ! Error {
+    zigzag(take_varint(s)?)
+}
+
+fn take_bytes(s: *Source, n: i64) -> []u8 ! Error {
+    if n < 0 || n > s.data.len - s.pos {
+        fail Truncated(at_of(s))
+    }
+    let out = s.data[s.pos..s.pos + n]
+    s.pos += n
+    out
+}
+
+fn read_value(s: *Source, kind: i64, depth: i64) -> Thrift ! Error {
+    match kind {
+        == 1 => Thrift.Bool(true)
+        == 2 => Thrift.Bool(false)
+        == 3 => {
+            let b = take_byte(s)?
+            Thrift.Byte(if b >= 128 { b - 256 } else { b })
+        }
+        == 4 => Thrift.I16(take_zigzag(s)?)
+        == 5 => Thrift.I32(take_zigzag(s)?)
+        == 6 => Thrift.I64(take_zigzag(s)?)
+        == 7 => {
+            let raw = take_bytes(s, 8)?
+            Thrift.Double(text.float_from_bits(u64(io.le64(raw, 0))))
+        }
+        == 8 => {
+            let n = take_varint(s)?
+            if n > u64(s.data.len) {
+                fail Truncated(at_of(s))
+            }
+            Thrift.Binary(take_bytes(s, i64(n))?)
+        }
+        == 9 => read_list(s, depth)?
+        == 10 => read_list(s, depth)?
+        == 12 => Thrift.Struct(read_struct(s, depth + 1)?)
+        _ => fail Invalid(at_of(s), "a metadata field has the type {kind}")
+    }
+}
+
+fn read_list(s: *Source, depth: i64) -> Thrift ! Error {
+    if depth > max_depth {
+        fail TooLarge("metadata nesting")
+    }
+    let head = take_byte(s)?
+    var count = head >> 4
+    let element = head & 15
+    if count == 15 {
+        let n = take_varint(s)?
+        if n > u64(s.data.len) {
+            fail Truncated(at_of(s))
+        }
+        count = i64(n)
+    }
+    if count > s.data.len - s.pos {
+        fail Truncated(at_of(s))
+    }
+    var items: []Thrift = []
+    for _ in 0..count {
+        if element == 1 || element == 2 {
+            let b = take_byte(s)?
+            push(mut items, Thrift.Bool(b == 1))
+        } else {
+            let v = read_value(s, element, depth + 1)?
+            push(mut items, v)
+        }
+    }
+    Thrift.List(items)
+}
+
+fn read_struct(s: *Source, depth: i64) -> []TField ! Error {
+    if depth > max_depth {
+        fail TooLarge("metadata nesting")
+    }
+    var fields: []TField = []
+    var last = 0
+    for {
+        let head = take_byte(s)?
+        if head == 0 {
+            return fields
+        }
+        let kind = head & 15
+        let delta = head >> 4
+        var id = last + delta
+        if delta == 0 {
+            id = take_zigzag(s)?
+        }
+        last = id
+        let v = read_value(s, kind, depth)?
+        push(mut fields, TField { id, value: v })
+    }
+}
+
+fn parse_struct(data: []u8, base: i64) -> []TField ! Error {
+    let s = source(data, base)
+    read_struct(s, 0)?
+}
+
+fn find_field(fields: []TField, id: i64) -> Thrift? {
+    for f in fields {
+        if f.id == id {
+            return f.value
+        }
+    }
+    none
+}
+
+fn get_int(fields: []TField, id: i64, fallback: i64) -> i64 {
+    let v = find_field(fields, id) ?? return fallback
+    match v {
+        Byte(n) => n
+        I16(n) => n
+        I32(n) => n
+        I64(n) => n
+        _ => fallback
+    }
+}
+
+fn has_field(fields: []TField, id: i64) -> bool {
+    match find_field(fields, id) {
+        some(_) => true
+        none => false
+    }
+}
+
+fn get_bool(fields: []TField, id: i64, fallback: bool) -> bool {
+    let v = find_field(fields, id) ?? return fallback
+    match v {
+        Bool(b) => b
+        _ => fallback
+    }
+}
+
+fn get_bytes(fields: []TField, id: i64) -> []u8 {
+    let v = find_field(fields, id) ?? return []
+    match v {
+        Binary(b) => b
+        _ => []
+    }
+}
+
+fn get_text(fields: []TField, id: i64) -> str {
+    str(get_bytes(fields, id))
+}
+
+fn get_list(fields: []TField, id: i64) -> []Thrift {
+    let v = find_field(fields, id) ?? return []
+    match v {
+        List(items) => items
+        _ => []
+    }
+}
+
+fn get_struct(fields: []TField, id: i64) -> []TField {
+    let v = find_field(fields, id) ?? return []
+    match v {
+        Struct(f) => f
+        _ => []
+    }
+}
+
+fn as_struct(v: Thrift) -> []TField {
+    match v {
+        Struct(f) => f
+        _ => []
+    }
+}
+
+fn as_int(v: Thrift) -> i64 {
+    match v {
+        Byte(n) => n
+        I16(n) => n
+        I32(n) => n
+        I64(n) => n
+        _ => 0
+    }
+}
+
+fn as_text(v: Thrift) -> str {
+    match v {
+        Binary(b) => str(b)
+        _ => ""
+    }
+}
+
+fn put_varint(mut out: []u8, v: u64) {
+    var rest = v
+    for rest >= 128 {
+        push(mut out, u8(rest & 0x7F) | 0x80)
+        rest = rest >> 7
+    }
+    push(mut out, u8(rest))
+}
+
+fn put_zigzag(mut out: []u8, v: i64) {
+    put_varint(mut out, u64((v << 1) ^ (v >> 63)))
+}
+
+fn type_code(v: Thrift) -> i64 {
+    match v {
+        Bool(b) => if b { 1 } else { 2 }
+        Byte(_) => 3
+        I16(_) => 4
+        I32(_) => 5
+        I64(_) => 6
+        Double(_) => 7
+        Binary(_) => 8
+        List(_) => 9
+        Struct(_) => 12
+    }
+}
+
+fn write_value(mut out: []u8, v: Thrift) {
+    match v {
+        Bool(_) => {}
+        Byte(n) => push(mut out, u8(n))
+        I16(n) => put_zigzag(mut out, n)
+        I32(n) => put_zigzag(mut out, n)
+        I64(n) => put_zigzag(mut out, n)
+        Double(x) => io.put_le64(mut out, i64(text.float_bits(x)))
+        Binary(b) => {
+            put_varint(mut out, u64(b.len))
+            io.append(mut out, b)
+        }
+        List(items) => write_list(mut out, items)
+        Struct(fields) => write_struct(mut out, fields)
+    }
+}
+
+fn write_list(mut out: []u8, items: []Thrift) {
+    var element = 8
+    if items.len > 0 {
+        element = type_code(items[0])
+        if element == 2 {
+            element = 1
+        }
+    }
+    if items.len < 15 {
+        push(mut out, u8(items.len << 4 | element))
+    } else {
+        push(mut out, u8(0xF0 | element))
+        put_varint(mut out, u64(items.len))
+    }
+    for item in items {
+        match item {
+            Bool(b) => push(mut out, if b { 1 } else { 2 })
+            _ => write_value(mut out, item)
+        }
+    }
+}
+
+fn write_struct(mut out: []u8, fields: []TField) {
+    var last = 0
+    for f in fields {
+        let kind = type_code(f.value)
+        let delta = f.id - last
+        if delta > 0 && delta <= 15 {
+            push(mut out, u8(delta << 4 | kind))
+        } else {
+            push(mut out, u8(kind))
+            put_zigzag(mut out, f.id)
+        }
+        last = f.id
+        write_value(mut out, f.value)
+    }
+    push(mut out, 0)
+}
+
+fn encode_struct(fields: []TField) -> []u8 {
+    var out: []u8 = []
+    write_struct(mut out, fields)
+    out
+}

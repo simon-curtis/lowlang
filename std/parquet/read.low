@@ -1,0 +1,314 @@
+import std/arrow
+import std/file
+import std/io
+
+/// Limits and checks for reading a file.
+pub struct ReaderOptions {
+    /// Whether to check the CRC-32 of each page that has one. Defaults to `true`.
+    pub verify_checksums: bool = true
+    /// The largest footer to read, in bytes. Defaults to 64 MiB.
+    pub max_metadata: i64 = 67108864
+    /// The largest page, compressed or not, to read, in bytes. Defaults to 1 GiB.
+    pub max_page: i64 = 1073741824
+    /// The largest number of values, nulls included, in one column chunk. Defaults to 134,217,728.
+    pub max_values: i64 = 134217728
+}
+
+struct FileSource {
+    size: i64
+    read: fn(i64, i64) -> []u8 ! io.Error
+}
+
+/// A Parquet file opened for reading.
+///
+/// Reading takes the footer once and then reads each column chunk it needs, with one read of the chunk's byte range, so a file on disk is read through `seek` and `read` and a chunk that is not selected is never loaded.
+pub struct FileReader {
+    source: FileSource
+    options: ReaderOptions
+    metadata: Metadata
+    columns: []Column
+    plans: []Plan
+    schema: arrow.Schema
+    data_end: i64
+}
+
+fn read_source(s: FileSource, at: i64, n: i64) -> []u8 ! Error {
+    if at < 0 || n < 0 || at > s.size - n {
+        fail Truncated(s.size)
+    }
+    s.read(at, n) catch {
+        e => fail Io(e)
+    }
+}
+
+fn open_source(s: FileSource, options: ReaderOptions) -> *FileReader ! Error {
+    if s.size < 12 {
+        fail Truncated(s.size)
+    }
+    let head = read_source(s, 0, 4)?
+    let tail = read_source(s, s.size - 8, 8)?
+    let magic = str(tail[4..8])
+    if magic == "PARE" || str(head) == "PARE" {
+        fail Unsupported("an encrypted file")
+    }
+    if str(head) != "PAR1" || magic != "PAR1" {
+        fail Invalid(0, "the file is not a Parquet file: its magic is not PAR1")
+    }
+    let length = io.le32(tail, 0) & 0xFFFFFFFF
+    if length > options.max_metadata {
+        fail TooLarge("the footer")
+    }
+    if length > s.size - 12 {
+        fail Invalid(s.size - 8, "the footer is {length} bytes in a file of {s.size}")
+    }
+    let footer = read_source(s, s.size - 8 - length, length)?
+    let metadata = read_metadata(footer, s.size - 8 - length)?
+    let columns = leaf_columns(metadata.schema)
+    let plans = make_plans(metadata.schema)?
+    var fields: []arrow.Field = []
+    for p in plans {
+        push(mut fields, p.field)
+    }
+    var pairs: [str: str] = [:]
+    for k, v in metadata.key_value {
+        if k != "ARROW:schema" {
+            pairs[k] = v
+        }
+    }
+    check_groups(metadata, s.size)?
+    new(FileReader { source: s, options, metadata, columns, plans, schema: arrow.Schema { fields, metadata: pairs }, data_end: s.size - 8 - length })
+}
+
+fn check_groups(m: Metadata, size: i64) ! Error {
+    for g in m.row_groups {
+        if g.num_rows < 0 {
+            fail Invalid(-1, "a row group has {g.num_rows} rows")
+        }
+        for c in g.columns {
+            if c.total_compressed == 0 && c.num_values == 0 {
+                continue
+            }
+            let start = chunk_start(c)
+            if start < 4 || c.total_compressed < 0 || start > size - c.total_compressed {
+                fail Invalid(start, "a column chunk lies outside the file")
+            }
+        }
+    }
+}
+
+fn chunk_start(c: ColumnChunk) -> i64 {
+    if c.dictionary_page_offset > 0 && (c.data_page_offset <= 0 || c.dictionary_page_offset < c.data_page_offset) {
+        return c.dictionary_page_offset
+    }
+    c.data_page_offset
+}
+
+/// Opens the Parquet file held in `data`. Fails with `Truncated` for a file too short for its footer, `Invalid` when the magic, footer or schema is malformed, `TooLarge` past a limit in `options` and `Unsupported` for an encrypted file or a feature this module does not read.
+pub fn open_bytes(data: []u8, options: ReaderOptions) -> *FileReader ! Error {
+    let read: fn(i64, i64) -> []u8 ! io.Error = fn(at, n) { data[at..at + n] }
+    open_source(FileSource { size: data.len, read }, options)?
+}
+
+/// Opens the Parquet file at `path`, reading only the footer now. Each later read opens the file, seeks to the bytes of one column chunk and reads them, so the file is never loaded whole and no file stays open between reads.
+pub fn open(path: str, options: ReaderOptions) -> *FileReader ! Error {
+    let info = file.stat(path) catch {
+        e => fail Io(e)
+    }
+    let read: fn(i64, i64) -> []u8 ! io.Error = fn(at, n) {
+        using f = file.open(path)?
+        file.seek(f, at, file.Whence.Start)?
+        let buf = io.buffer(n)
+        var got = 0
+        for got < n {
+            let k = file.read(f, buf[got..])?
+            if k == 0 {
+                fail io.Error.Eof
+            }
+            got += k
+        }
+        buf
+    }
+    open_source(FileSource { size: info.size, read }, options)?
+}
+
+/// Returns the footer of the file: schema, row groups, column chunks, statistics and key and value metadata.
+pub fn metadata(f: *FileReader) -> Metadata {
+    f.metadata
+}
+
+/// Returns the leaf columns of the schema in file order.
+pub fn columns(f: *FileReader) -> []Column {
+    f.columns
+}
+
+/// Returns the Arrow schema of the file's top-level fields. Its metadata is the file's key and value metadata without `ARROW:schema`, and a field with a Parquet field id carries it as `PARQUET:field_id`.
+pub fn arrow_schema(f: *FileReader) -> arrow.Schema {
+    f.schema
+}
+
+/// Returns the number of row groups.
+pub fn row_group_count(f: *FileReader) -> i64 {
+    f.metadata.row_groups.len
+}
+
+fn selected(f: *FileReader, names: []str) -> []i64 ! Error {
+    var out: []i64 = []
+    if names.len == 0 {
+        for i in 0..f.plans.len {
+            push(mut out, i)
+        }
+        return out
+    }
+    for name in names {
+        var found = -1
+        for i, p in f.plans {
+            if p.field.name == name {
+                found = i
+            }
+        }
+        if found < 0 {
+            fail Mismatch("the file has no top-level field {name}")
+        }
+        push(mut out, found)
+    }
+    out
+}
+
+fn extended_end(f: *FileReader, start: i64) -> i64 {
+    var end = f.data_end
+    for g in f.metadata.row_groups {
+        for o in g.columns {
+            let s = chunk_start(o)
+            if s > start && s < end {
+                end = s
+            }
+        }
+    }
+    end
+}
+
+fn load_column(f: *FileReader, group: RowGroup, c: i64) -> ColumnData ! Error {
+    let chunk = group.columns[c]
+    if f.columns[c].max_rep == 0 && chunk.num_values != group.num_rows {
+        fail Invalid(-1, "column {f.columns[c].path[0]} holds {chunk.num_values} values for {group.num_rows} rows")
+    }
+    let start = chunk_start(chunk)
+    let bytes = read_source(f.source, start, chunk.total_compressed)?
+    decode_chunk(bytes, start, chunk, f.columns[c], f.options.verify_checksums, f.options.max_page, f.options.max_values) catch {
+        Truncated(_) => {
+            let more = read_source(f.source, start, extended_end(f, start) - start)?
+            decode_chunk(more, start, chunk, f.columns[c], f.options.verify_checksums, f.options.max_page, f.options.max_values)?
+        }
+        e => fail e
+    }
+}
+
+fn read_fields(f: *FileReader, index: i64, names: []str) -> arrow.Batch ! Error {
+    if index < 0 || index >= f.metadata.row_groups.len {
+        fail Mismatch("the file has {f.metadata.row_groups.len} row groups, not {index}")
+    }
+    let chosen = selected(f, names)?
+    let group = f.metadata.row_groups[index]
+    var cols: []ColumnData = []
+    var spans: []Spans = []
+    for c in 0..f.columns.len {
+        push(mut cols, ColumnData { def: [], rep: [], values: empty_values(Physical.Int32, 0), count: 0 })
+        push(mut spans, Spans { starts: [], ends: [] })
+    }
+    var fields: []arrow.Field = []
+    var arrays: []arrow.Array = []
+    for k in chosen {
+        let p = f.plans[k]
+        for c in p.first..p.first + p.count {
+            cols[c] = load_column(f, group, c)?
+            spans[c] = record_spans(cols[c])?
+            if spans[c].starts.len != group.num_rows {
+                fail Invalid(-1, "column {f.columns[c].path[0]} holds {spans[c].starts.len} rows, the row group says {group.num_rows}")
+            }
+        }
+        let a = assemble(p, spans, group.num_rows, cols, f.columns)?
+        arrow.validate(a) catch {
+            e => fail Invalid(-1, "column {p.field.name}: {arrow.message(e)}")
+        }
+        push(mut fields, p.field)
+        push(mut arrays, a)
+    }
+    arrow.Batch { schema: arrow.Schema { fields, metadata: f.schema.metadata }, length: group.num_rows, columns: arrays }
+}
+
+/// Reads row group `index` as an Arrow record batch. `fields` names the top-level fields to read, all of them when empty, and only the column chunks under those fields are read from the file.
+///
+/// Fails with `Mismatch` for an unknown row group or field, `Truncated` and `Invalid` for a damaged chunk or page, `Checksum` when a page's CRC-32 does not match, `TooLarge` past a limit and `Unsupported` for a codec, encoding or type this module does not read.
+pub fn read_row_group(f: *FileReader, index: i64, fields: []str) -> arrow.Batch ! Error {
+    read_fields(f, index, fields)?
+}
+
+/// Reads every row group, in order, as `read_row_group` does.
+pub fn read_batches(f: *FileReader, fields: []str) -> []arrow.Batch ! Error {
+    var out: []arrow.Batch = []
+    for i in 0..f.metadata.row_groups.len {
+        let b = read_fields(f, i, fields)?
+        push(mut out, b)
+    }
+    out
+}
+
+/// Reads the top-level field `name` of row group `index` as one Arrow array.
+pub fn read_column(f: *FileReader, index: i64, name: str) -> arrow.Array ! Error {
+    let b = read_fields(f, index, [name])?
+    b.columns[0]
+}
+
+/// Returns the row groups whose statistics for the integer column `column` (a top-level field, by name) may hold a value from `low` to `high` inclusive. A row group with no statistics for the column is always returned. Fails with `Mismatch` when the column is not an integer, date, time or timestamp column.
+pub fn select_row_groups(f: *FileReader, column: str, low: i64, high: i64) -> []i64 ! Error {
+    var index = -1
+    for c in f.columns {
+        if c.path.len == 1 && c.path[0] == column {
+            index = c.index
+        }
+    }
+    if index < 0 {
+        fail Mismatch("the file has no top-level column {column}")
+    }
+    let node = f.columns[index].node
+    if node.physical != Physical.Int32 && node.physical != Physical.Int64 {
+        fail Mismatch("column {column} is not an integer column")
+    }
+    var out: []i64 = []
+    for g, group in f.metadata.row_groups {
+        let s = group.columns[index].statistics
+        if !s.has_range {
+            push(mut out, g)
+            continue
+        }
+        let w = if node.physical == Physical.Int32 { 4 } else { 8 }
+        if s.min.len != w || s.max.len != w {
+            push(mut out, g)
+            continue
+        }
+        let lo = signed_stat(s.min, node)
+        let hi = signed_stat(s.max, node)
+        if hi < low || lo > high {
+            continue
+        }
+        push(mut out, g)
+    }
+    out
+}
+
+fn signed_stat(raw: []u8, node: Node) -> i64 {
+    let w = if node.physical == Physical.Int32 { 4 } else { 8 }
+    var unsigned = false
+    match node.logical {
+        Int(_, signed) => { unsigned = !signed }
+        _ => {}
+    }
+    if w == 4 {
+        let v = io.le32(raw, 0) & 0xFFFFFFFF
+        if unsigned || v < 2147483648 {
+            return v
+        }
+        return v - 4294967296
+    }
+    io.le64(raw, 0)
+}

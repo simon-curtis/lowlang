@@ -1,0 +1,215 @@
+import std/arrow
+import std/json
+import std/text
+
+fn value_at(a: arrow.Array, i: i64) -> Value ! Error {
+    if !arrow.is_valid(a, i) {
+        return Value.Null
+    }
+    match a.data_type {
+        Null => Value.Null
+        Bool => Value.Bool(arrow.bool_at(a, i))
+        Int(bits, signed) => {
+            if signed {
+                return Value.Int(arrow.int_at(a, i))
+            }
+            if bits == 64 {
+                return Value.Uint(arrow.uint_at(a, i))
+            }
+            Value.Int(i64(arrow.uint_at(a, i)))
+        }
+        Float(_) => Value.Float(arrow.float_at(a, i))
+        Utf8 => Value.Text(arrow.str_at(a, i))
+        LargeUtf8 => Value.Text(arrow.str_at(a, i))
+        Binary => Value.Bytes(arrow.bytes_at(a, i))
+        LargeBinary => Value.Bytes(arrow.bytes_at(a, i))
+        FixedSizeBinary(_) => Value.Bytes(arrow.bytes_at(a, i))
+        Decimal(_, scale) => Value.Decimal(arrow.decimal_text(arrow.bytes_at(a, i), scale))
+        Date(_) => Value.Int(arrow.int_at(a, i))
+        Time(_) => Value.Int(arrow.int_at(a, i))
+        Timestamp(_, _) => Value.Int(arrow.int_at(a, i))
+        Duration(_) => Value.Int(arrow.int_at(a, i))
+        List(_) => list_value(a, i)?
+        LargeList(_) => list_value(a, i)?
+        FixedSizeList(_, _) => list_value(a, i)?
+        Struct(_) => {
+            var fields: []Value = []
+            for child in a.children {
+                let v = value_at(child, i)?
+                push(mut fields, v)
+            }
+            Value.Struct(fields)
+        }
+        Map(_, _) => map_value(a, i)?
+        Dictionary(_, _, _, _) => {
+            let values = *(a.dictionary ?? fail Mismatch("a dictionary array has no dictionary"))
+            value_at(values, arrow.dictionary_index(a, i))?
+        }
+        Interval(_) => fail Unsupported("interval values in rows")
+        Union(_, _, _) => fail Unsupported("union values in rows")
+    }
+}
+
+fn list_value(a: arrow.Array, i: i64) -> Value ! Error {
+    let range = arrow.list_range(a, i)
+    var items: []Value = []
+    for p in range.start..range.end {
+        let v = value_at(a.children[0], p)?
+        push(mut items, v)
+    }
+    Value.List(items)
+}
+
+fn map_value(a: arrow.Array, i: i64) -> Value ! Error {
+    let range = arrow.list_range(a, i)
+    let entries = a.children[0]
+    var keys: []Value = []
+    var values: []Value = []
+    for p in range.start..range.end {
+        let k = value_at(entries.children[0], p)?
+        let v = value_at(entries.children[1], p)?
+        push(mut keys, k)
+        push(mut values, v)
+    }
+    Value.Map(keys, values)
+}
+
+/// Returns the rows of every row group as `Value`s, one per column of `fields` (every column when it is empty) in schema order. Dates, times, timestamps and durations are `Int` in their unit, decimals are `Decimal` text, lists are `List`, structs `Struct` in field order and maps `Map`.
+pub fn read_rows(f: *FileReader, fields: []str) -> [][]Value ! Error {
+    let batches = read_batches(f, fields)?
+    var rows: [][]Value = []
+    for b in batches {
+        for r in 0..b.length {
+            var row: []Value = []
+            for c in b.columns {
+                let v = value_at(c, r)?
+                push(mut row, v)
+            }
+            push(mut rows, row)
+        }
+    }
+    rows
+}
+
+fn append_integer(b: *arrow.Builder, x: i64) ! arrow.Error {
+    match arrow.builder_type(b) {
+        Int(_, signed) => {
+            if !signed && x >= 0 {
+                return arrow.append_uint(b, u64(x))
+            }
+            arrow.append_int(b, x)?
+        }
+        _ => arrow.append_int(b, x)?
+    }
+}
+
+fn append_value(b: *arrow.Builder, v: Value) ! arrow.Error {
+    match v {
+        Null => arrow.append_null(b)?
+        Bool(x) => arrow.append_bool(b, x)?
+        Int(x) => append_integer(b, x)?
+        Uint(x) => arrow.append_uint(b, x)?
+        Float(x) => arrow.append_float(b, x)?
+        Decimal(s) => arrow.append_decimal(b, s)?
+        Text(s) => arrow.append_str(b, s)?
+        Bytes(x) => arrow.append_bytes(b, x)?
+        List(items) => {
+            let kid = arrow.child(b, 0)?
+            for item in items {
+                append_value(kid, item)?
+            }
+            arrow.end_list(b)?
+        }
+        Struct(fields) => {
+            for k, x in fields {
+                let kid = arrow.child(b, k)?
+                append_value(kid, x)?
+            }
+            arrow.end_struct(b)?
+        }
+        Map(keys, values) => {
+            if keys.len != values.len {
+                fail arrow.Error.Mismatch("a map of {keys.len} keys and {values.len} values")
+            }
+            let entries = arrow.child(b, 0)?
+            let key = arrow.child(entries, 0)?
+            let value = arrow.child(entries, 1)?
+            for k, x in keys {
+                append_value(key, x)?
+                append_value(value, values[k])?
+                arrow.end_struct(entries)?
+            }
+            arrow.end_list(b)?
+        }
+    }
+}
+
+/// Returns the bytes of a Parquet file that holds `rows`, each of which has one `Value` per field of `schema`. A value is appended to its column the way `std/arrow` builders append it, so an integer `Value` fits any integer, date, time, timestamp or duration field, `Text` a text field, `List` a list field and so on; a value that does not fit fails with `Mismatch`.
+pub fn write_rows(schema: arrow.Schema, rows: [][]Value, options: WriterOptions) -> []u8 ! Error {
+    var builders: []*arrow.Builder = []
+    for f in schema.fields {
+        let b = arrow.builder(f.data_type) catch {
+            e => fail Mismatch(arrow.message(e))
+        }
+        push(mut builders, b)
+    }
+    for r, row in rows {
+        if row.len != schema.fields.len {
+            fail Mismatch("row {r} has {row.len} values for {schema.fields.len} fields")
+        }
+        for k, v in row {
+            append_value(builders[k], v) catch {
+                e => fail Mismatch("row {r}, field {schema.fields[k].name}: {arrow.message(e)}")
+            }
+        }
+    }
+    var columns: []arrow.Array = []
+    for b in builders {
+        let a = arrow.finish(b) catch {
+            e => fail Mismatch(arrow.message(e))
+        }
+        push(mut columns, a)
+    }
+    let batch = arrow.Batch { schema, length: rows.len, columns }
+    write_bytes(schema, [batch], options)?
+}
+
+fn float_digits(x: f64) -> str {
+    let bits = text.float_bits(x)
+    var raw: []u8 = []
+    for i in 0..8 {
+        push(mut raw, u8((bits >> u64(56 - 8 * i)) & 255))
+    }
+    text.encode_hex(raw)
+}
+
+/// Returns `v` on one line. `Null` is `null`, a boolean `true` or `false`, an integer its digits, a float `f` and the 16 hexadecimal digits of its 64-bit IEEE 754 bits, text a JSON string, bytes `x"` and hexadecimal, a decimal its text, a list `[a, b]`, a struct `{a, b}` and a map `map[k: v, ...]`.
+pub fn diagnostic(v: Value) -> str {
+    match v {
+        Null => "null"
+        Bool(x) => if x { "true" } else { "false" }
+        Int(x) => "{x}"
+        Uint(x) => "{x}"
+        Float(x) => "f{float_digits(x)}"
+        Decimal(s) => s
+        Text(s) => json.stringify(json.Value.Str(s), 0)
+        Bytes(x) => "x\"{text.encode_hex(x)}\""
+        List(items) => "[{joined(items)}]"
+        Struct(fields) => "{{{joined(fields)}}}"
+        Map(keys, values) => {
+            var parts: []str = []
+            for k, key in keys {
+                push(mut parts, "{diagnostic(key)}: {diagnostic(values[k])}")
+            }
+            "map[{text.join(parts, ", ")}]"
+        }
+    }
+}
+
+fn joined(items: []Value) -> str {
+    var parts: []str = []
+    for item in items {
+        push(mut parts, diagnostic(item))
+    }
+    text.join(parts, ", ")
+}

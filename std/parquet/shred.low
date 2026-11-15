@@ -1,0 +1,335 @@
+import std/arrow
+import std/io
+import std/text
+
+struct Sink {
+    def: []i64
+    rep: []i64
+    values: Values
+}
+
+struct Shredder {
+    sinks: []Sink
+}
+
+struct Slot {
+    array: arrow.Array
+    index: i64
+    valid: bool
+}
+
+fn value_type(t: arrow.DataType) -> arrow.DataType {
+    match t {
+        Dictionary(_, _, value, _) => value_type(*value)
+        _ => t
+    }
+}
+
+fn decimal_digits(bytes: i64) -> i64 {
+    match bytes {
+        == 1 => 2
+        == 2 => 4
+        == 3 => 6
+        == 4 => 9
+        == 5 => 11
+        == 6 => 14
+        == 7 => 16
+        == 8 => 18
+        == 9 => 21
+        == 10 => 23
+        == 11 => 26
+        == 12 => 28
+        == 13 => 31
+        == 14 => 33
+        == 15 => 35
+        _ => 38
+    }
+}
+
+fn decimal_width(precision: i64) -> i64 {
+    var n = 1
+    for decimal_digits(n) < precision {
+        n += 1
+    }
+    n
+}
+
+fn field_id_of(f: arrow.Field) -> i64 {
+    let text_id = f.metadata["PARQUET:field_id"] ?? ""
+    if text_id == "" {
+        return -1
+    }
+    text.parse_int(text_id) catch {
+        _ => -1
+    }
+}
+
+fn leaf_node(f: arrow.Field, t: arrow.DataType, def: i64, rep: i64) -> Node ! Error {
+    var n = Node { name: f.name, repetition: repetition_for(f), def_level: def, rep_level: rep, field_id: field_id_of(f) }
+    match t {
+        Null => {
+            if !f.nullable {
+                fail Mismatch("the non-nullable field {f.name} has the null type")
+            }
+            n.logical = Logical.Unknown
+        }
+        Bool => { n.physical = Physical.Boolean }
+        Int(bits, signed) => {
+            n.physical = if bits == 64 { Physical.Int64 } else { Physical.Int32 }
+            if bits < 32 || (bits == 32 && !signed) || (bits == 64 && !signed) {
+                n.logical = Logical.Int(bits, signed)
+            }
+        }
+        Float(bits) => match bits {
+            == 16 => {
+                n.physical = Physical.FixedLenByteArray
+                n.length = 2
+                n.logical = Logical.Float16
+            }
+            == 32 => { n.physical = Physical.Float }
+            _ => { n.physical = Physical.Double }
+        }
+        Utf8 => {
+            n.physical = Physical.ByteArray
+            n.logical = Logical.String
+        }
+        LargeUtf8 => {
+            n.physical = Physical.ByteArray
+            n.logical = Logical.String
+        }
+        Binary => { n.physical = Physical.ByteArray }
+        LargeBinary => { n.physical = Physical.ByteArray }
+        FixedSizeBinary(width) => {
+            if width <= 0 {
+                fail Mismatch("the field {f.name} has a fixed-size binary type of {width} bytes")
+            }
+            n.physical = Physical.FixedLenByteArray
+            n.length = width
+        }
+        Decimal(precision, scale) => {
+            n.physical = Physical.FixedLenByteArray
+            n.length = decimal_width(precision)
+            n.logical = Logical.Decimal(precision, scale)
+        }
+        Date(unit) => match unit {
+            Day => {
+                n.physical = Physical.Int32
+                n.logical = Logical.Date
+            }
+            Millisecond => fail Unsupported("the 64-bit date type in the field {f.name}")
+        }
+        Time(unit) => match unit {
+            Second => fail Unsupported("a time in seconds in the field {f.name}")
+            Millisecond => {
+                n.physical = Physical.Int32
+                n.logical = Logical.Time(unit, true)
+            }
+            _ => {
+                n.physical = Physical.Int64
+                n.logical = Logical.Time(unit, true)
+            }
+        }
+        Timestamp(unit, zone) => match unit {
+            Second => fail Unsupported("a timestamp in seconds in the field {f.name}")
+            _ => {
+                n.physical = Physical.Int64
+                n.logical = Logical.Timestamp(unit, zone.len > 0)
+            }
+        }
+        Duration(_) => fail Unsupported("the duration type in the field {f.name}")
+        Interval(_) => fail Unsupported("the interval type in the field {f.name}")
+        Union(_, _, _) => fail Unsupported("the union type in the field {f.name}")
+        _ => fail Mismatch("the field {f.name} has no leaf type")
+    }
+    n
+}
+
+fn repetition_for(f: arrow.Field) -> Repetition {
+    if f.nullable { Repetition.Optional } else { Repetition.Required }
+}
+
+fn optional_level(f: arrow.Field) -> i64 {
+    if f.nullable { 1 } else { 0 }
+}
+
+fn repeated_group(name: str, def: i64, rep: i64, children: []Node) -> Node {
+    Node { name, repetition: Repetition.Repeated, leaf: false, children, def_level: def, rep_level: rep }
+}
+
+fn list_node(f: arrow.Field, item: arrow.Field, def: i64, rep: i64) -> Node ! Error {
+    let element = build_node(item, def + 1, rep + 1)?
+    let group = repeated_group("list", def + 1, rep + 1, [element])
+    Node { name: f.name, repetition: repetition_for(f), leaf: false, shape: Shape.List, children: [group], def_level: def, rep_level: rep, field_id: field_id_of(f) }
+}
+
+fn map_node(f: arrow.Field, entries: arrow.Field, def: i64, rep: i64) -> Node ! Error {
+    match entries.data_type {
+        Struct(kv) => {
+            if kv.len != 2 {
+                fail Mismatch("the map field {f.name} has {kv.len} entry fields")
+            }
+            let key_field = arrow.Field { name: kv[0].name, data_type: kv[0].data_type, nullable: false, metadata: kv[0].metadata }
+            let key = build_node(key_field, def + 1, rep + 1)?
+            let value = build_node(kv[1], def + 1, rep + 1)?
+            let group = repeated_group("key_value", def + 1, rep + 1, [key, value])
+            Node { name: f.name, repetition: repetition_for(f), leaf: false, shape: Shape.Map, children: [group], def_level: def, rep_level: rep, field_id: field_id_of(f) }
+        }
+        _ => fail Mismatch("the map field {f.name} does not hold a struct of entries")
+    }
+}
+
+fn build_node(f: arrow.Field, parent_def: i64, rep: i64) -> Node ! Error {
+    let def = parent_def + optional_level(f)
+    match value_type(f.data_type) {
+        Struct(fields) => {
+            if fields.len == 0 {
+                fail Unsupported("the struct field {f.name} has no fields")
+            }
+            var children: []Node = []
+            for c in fields {
+                let child = build_node(c, def, rep)?
+                push(mut children, child)
+            }
+            Node { name: f.name, repetition: repetition_for(f), leaf: false, children, def_level: def, rep_level: rep, field_id: field_id_of(f) }
+        }
+        List(item) => list_node(f, *item, def, rep)?
+        LargeList(item) => list_node(f, *item, def, rep)?
+        FixedSizeList(item, _) => list_node(f, *item, def, rep)?
+        Map(entries, _) => map_node(f, *entries, def, rep)?
+        t => leaf_node(f, t, def, rep)?
+    }
+}
+
+fn leaves_under(n: Node) -> i64 {
+    if n.leaf {
+        return 1
+    }
+    var total = 0
+    for c in n.children {
+        total += leaves_under(c)
+    }
+    total
+}
+
+fn slot_of(a: arrow.Array, i: i64) -> Slot ! Error {
+    match a.data_type {
+        Dictionary(_, _, _, _) => {
+            let values = *(a.dictionary ?? fail Mismatch("a dictionary array has no dictionary"))
+            let at = arrow.dictionary_index(a, i)
+            let valid = arrow.is_valid(a, i) && at >= 0 && at < values.length && arrow.is_valid(values, at)
+            Slot { array: values, index: at, valid }
+        }
+        _ => Slot { array: a, index: i, valid: arrow.is_valid(a, i) }
+    }
+}
+
+fn little_bytes(v: i64, width: i64) -> []u8 {
+    var out: []u8 = []
+    for k in 0..width {
+        push(mut out, u8((v >> (8 * k)) & 0xFF))
+    }
+    out
+}
+
+fn value_bytes(n: Node, a: arrow.Array, i: i64) -> []u8 {
+    match a.data_type {
+        Bool => [if arrow.bool_at(a, i) { u8(1) } else { u8(0) }]
+        Int(bits, signed) => {
+            if bits == 64 {
+                return a.buffers[0][i * 8..i * 8 + 8]
+            }
+            let v = if signed { arrow.int_at(a, i) } else { i64(arrow.uint_at(a, i)) }
+            little_bytes(v, 4)
+        }
+        Utf8 => arrow.bytes_at(a, i)
+        LargeUtf8 => arrow.bytes_at(a, i)
+        Binary => arrow.bytes_at(a, i)
+        LargeBinary => arrow.bytes_at(a, i)
+        FixedSizeBinary(_) => arrow.bytes_at(a, i)
+        Decimal(_, _) => {
+            let little = arrow.bytes_at(a, i)
+            var out: []u8 = []
+            for k in 0..n.length {
+                push(mut out, little[n.length - 1 - k])
+            }
+            out
+        }
+        _ => {
+            let w = fixed_width(n.physical, n.length)
+            a.buffers[0][i * w..(i + 1) * w]
+        }
+    }
+}
+
+fn push_raw(mut v: Values, raw: []u8) {
+    v.count += 1
+    match v.physical {
+        ByteArray => {
+            io.append(mut v.data, raw)
+            push(mut v.offsets, v.data.len)
+        }
+        _ => io.append(mut v.fixed, raw)
+    }
+}
+
+fn emit_level(s: *Shredder, leaf: i64, rep: i64, def: i64) {
+    push(mut s.sinks[leaf].rep, rep)
+    push(mut s.sinks[leaf].def, def)
+}
+
+fn emit_nulls(s: *Shredder, n: Node, first: i64, rep: i64, def: i64) {
+    for k in 0..leaves_under(n) {
+        emit_level(s, first + k, rep, def)
+    }
+}
+
+fn emit(s: *Shredder, n: Node, a: arrow.Array, i: i64, first: i64, rep: i64, def: i64) ! Error {
+    let slot = slot_of(a, i)?
+    if !slot.valid {
+        if n.repetition == Repetition.Required {
+            fail Mismatch("a null in the non-nullable field {n.name}")
+        }
+        emit_nulls(s, n, first, rep, def)
+        return
+    }
+    let d = if n.repetition == Repetition.Optional { def + 1 } else { def }
+    if n.leaf {
+        let raw = value_bytes(n, slot.array, slot.index)
+        push_raw(mut s.sinks[first].values, raw)
+        emit_level(s, first, rep, d)
+        return
+    }
+    match n.shape {
+        Plain => {
+            var at = first
+            for k, child in n.children {
+                emit(s, child, slot.array.children[k], slot.index, at, rep, d)?
+                at += leaves_under(child)
+            }
+        }
+        List => emit_list(s, n, slot, first, rep, d)?
+        Map => emit_list(s, n, slot, first, rep, d)?
+    }
+}
+
+fn emit_list(s: *Shredder, n: Node, slot: Slot, first: i64, rep: i64, d: i64) ! Error {
+    let group = n.children[0]
+    let range = arrow.list_range(slot.array, slot.index)
+    if range.end == range.start {
+        emit_nulls(s, n, first, rep, d)
+        return
+    }
+    let child = slot.array.children[0]
+    for p in range.start..range.end {
+        let entry_rep = if p == range.start { rep } else { group.rep_level }
+        if n.shape == Shape.List {
+            emit(s, group.children[0], child, p, first, entry_rep, d + 1)?
+        } else {
+            var at = first
+            for k, member in group.children {
+                emit(s, member, child.children[k], p, at, entry_rep, d + 1)?
+                at += leaves_under(member)
+            }
+        }
+    }
+}

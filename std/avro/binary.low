@@ -1,0 +1,676 @@
+import std/compress/codec
+import std/io
+import std/text
+import std/unicode
+
+/// Limits for decoding, which bound memory and recursion before anything is allocated for the input's claims.
+pub struct Options {
+    /// The longest `string`, `bytes` or `fixed` the input may declare, in bytes. Defaults to `16777216`.
+    pub max_length: i64 = 16777216
+    /// The most elements one array or map may declare. Defaults to `16777216`.
+    pub max_items: i64 = 16777216
+    /// The deepest nesting of arrays, maps, unions and records accepted. Defaults to `256`.
+    pub max_depth: i64 = 256
+}
+
+/// A decoded value together with the number of bytes it occupied.
+struct Item {
+    /// The decoded value.
+    value: Value
+    /// The number of bytes of the input that the value used.
+    length: i64
+}
+
+struct Decoder {
+    data: []u8
+    pos: i64
+    options: Options
+    depth: i64
+}
+
+const min_long: i64 = -9223372036854775807 - 1
+
+/// Decodes `data`, which must hold exactly one datum of `schema`, with default `Options`.
+///
+/// Fails with `Invalid` when bytes follow the datum. See `decode_with`.
+pub fn decode(schema: *Schema, data: []u8) -> Value ! Error {
+    decode_with(schema, data, Options {})
+}
+
+/// Decodes `data`, which must hold exactly one datum of `schema`.
+///
+/// Fails with `Truncated` when the input ends early, `Invalid` for a malformed integer, a string that is not UTF-8, a union index or enum index out of range, a negative length, or bytes left over, and `TooLarge` when a length, count or depth exceeds `options`. Strings and byte strings are copied. A value with a logical type becomes the logical variant.
+pub fn decode_with(schema: *Schema, data: []u8, options: Options) -> Value ! Error {
+    let first = decode_first(schema, data, options)?
+    if first.length != data.len {
+        fail Invalid(first.length, "bytes follow the datum")
+    }
+    first.value
+}
+
+/// Decodes the datum of `schema` at the start of `data` and reports its size, ignoring any bytes after it.
+///
+/// Use it to read back-to-back data by advancing `data` by `Item.length`. Fails like `decode_with` except that it never reports leftover bytes.
+fn decode_first(schema: *Schema, data: []u8, options: Options) -> Item ! Error {
+    let d = new(Decoder { data, pos: 0, options, depth: 0 })
+    let value = datum(d, schema)?
+    Item { value, length: d.pos }
+}
+
+fn remaining(d: *Decoder) -> i64 {
+    d.data.len - d.pos
+}
+
+fn need(d: *Decoder, n: i64) ! Error {
+    if n > remaining(d) {
+        fail Truncated(d.data.len)
+    }
+}
+
+fn read_long(d: *Decoder) -> i64 ! Error {
+    var v: u64 = 0
+    var shift: u64 = 0
+    let start = d.pos
+    for {
+        if d.pos >= d.data.len {
+            fail Truncated(d.data.len)
+        }
+        let b = d.data[d.pos]
+        d.pos += 1
+        if shift == 63 && b > 1 {
+            fail Invalid(start, "a long does not fit 64 bits")
+        }
+        v |= u64(b & 0x7F) << shift
+        if b < 0x80 {
+            break
+        }
+        shift += 7
+    }
+    i64(v >> 1) ^ -i64(v & 1)
+}
+
+fn read_length(d: *Decoder, what: str) -> i64 ! Error {
+    let at = d.pos
+    let n = read_long(d)?
+    if n < 0 {
+        fail Invalid(at, "negative {what} length")
+    }
+    if n > d.options.max_length {
+        fail TooLarge(at)
+    }
+    need(d, n)?
+    n
+}
+
+fn read_bytes(d: *Decoder, what: str) -> []u8 ! Error {
+    let n = read_length(d, what)?
+    let out = io.buffer(n)
+    io.copy(out, d.data[d.pos..d.pos + n])
+    d.pos += n
+    out
+}
+
+fn read_string(d: *Decoder) -> str ! Error {
+    let at = d.pos
+    let n = read_length(d, "string")?
+    let s = str(d.data[d.pos..d.pos + n])
+    if !unicode.utf8_valid(s) {
+        fail Invalid(at, "string is not UTF-8")
+    }
+    d.pos += n
+    s
+}
+
+/// Returns the fewest bytes a datum of `schema` can occupy.
+///
+/// A datum of `null`, an empty record or a zero-size `fixed` is zero bytes; every other datum is at least one.
+fn min_size(schema: *Schema) -> i64 {
+    min_size_at(schema, 0)
+}
+
+fn min_size_at(schema: *Schema, depth: i64) -> i64 {
+    if depth > 16 {
+        return 1
+    }
+    match schema.kind {
+        Null => 0
+        Float => 4
+        Double => 8
+        Fixed => schema.size
+        Record => {
+            var total = 0
+            for f in schema.fields {
+                total += min_size_at(f.schema, depth + 1)
+            }
+            total
+        }
+        _ => 1
+    }
+}
+
+fn enter(d: *Decoder) ! Error {
+    d.depth += 1
+    if d.depth > d.options.max_depth {
+        fail TooLarge(d.pos)
+    }
+}
+
+fn block_count(d: *Decoder, item_size: i64, mut total: i64) -> i64 ! Error {
+    let at = d.pos
+    let n = read_long(d)?
+    if n == 0 {
+        return 0
+    }
+    if n == min_long {
+        fail Invalid(at, "block count out of range")
+    }
+    var count = n
+    if n < 0 {
+        count = -n
+        let size = read_long(d)?
+        if size < 0 {
+            fail Invalid(at, "negative block size")
+        }
+    }
+    if count > d.options.max_items - total {
+        fail TooLarge(at)
+    }
+    if item_size > 0 && count > remaining(d) / item_size {
+        fail Truncated(d.data.len)
+    }
+    total += count
+    count
+}
+
+fn datum(d: *Decoder, schema: *Schema) -> Value ! Error {
+    let raw = raw_datum(d, schema)?
+    apply_logical(schema, raw)
+}
+
+fn raw_datum(d: *Decoder, schema: *Schema) -> Value ! Error {
+    match schema.kind {
+        Null => Value.Null
+        Bool => {
+            need(d, 1)?
+            let b = d.data[d.pos]
+            if b > 1 {
+                fail Invalid(d.pos, "a boolean is neither 0 nor 1")
+            }
+            d.pos += 1
+            Value.Bool(b == 1)
+        }
+        Int => {
+            let at = d.pos
+            let n = read_long(d)?
+            if n < -2147483648 || n > 2147483647 {
+                fail Invalid(at, "an int does not fit 32 bits")
+            }
+            Value.Int(n)
+        }
+        Long => Value.Int(read_long(d)?)
+        Float => {
+            need(d, 4)?
+            let bits = io.u32_le(d.data, d.pos)
+            d.pos += 4
+            Value.Float(f64(text.float32_from_bits(bits)))
+        }
+        Double => {
+            need(d, 8)?
+            let bits = io.u64_le(d.data, d.pos)
+            d.pos += 8
+            Value.Float(text.float_from_bits(bits))
+        }
+        Bytes => Value.Bytes(read_bytes(d, "bytes")?)
+        String => Value.Str(read_string(d)?)
+        Fixed => {
+            need(d, schema.size)?
+            let out = io.buffer(schema.size)
+            io.copy(out, d.data[d.pos..d.pos + schema.size])
+            d.pos += schema.size
+            Value.Bytes(out)
+        }
+        Enum => {
+            let at = d.pos
+            let index = read_long(d)?
+            if index < 0 || index >= schema.symbols.len {
+                fail Invalid(at, "enum index {index} is outside the {schema.symbols.len} symbols of {schema.name}")
+            }
+            Value.Enum(index, schema.symbols[index])
+        }
+        Array => {
+            enter(d)?
+            let item = schema.item ?? schema
+            let size = min_size_at(item, 0)
+            var items: []Value = []
+            var total = 0
+            for {
+                let count = block_count(d, size, mut total)?
+                if count == 0 {
+                    break
+                }
+                for _ in 0..count {
+                    push(mut items, datum(d, item)?)
+                }
+            }
+            d.depth -= 1
+            Value.Array(items)
+        }
+        Map => {
+            enter(d)?
+            let item = schema.item ?? schema
+            var entries: []Entry = []
+            var total = 0
+            for {
+                let count = block_count(d, 1, mut total)?
+                if count == 0 {
+                    break
+                }
+                for _ in 0..count {
+                    let key = read_string(d)?
+                    push(mut entries, Entry { key, value: datum(d, item)? })
+                }
+            }
+            d.depth -= 1
+            Value.Map(entries)
+        }
+        Record => {
+            enter(d)?
+            var members: []Member = []
+            for f in schema.fields {
+                push(mut members, Member { name: f.name, value: datum(d, f.schema)? })
+            }
+            d.depth -= 1
+            Value.Record(members)
+        }
+        Union => {
+            enter(d)?
+            let at = d.pos
+            let index = read_long(d)?
+            if index < 0 || index >= schema.branches.len {
+                fail Invalid(at, "union index {index} is outside the {schema.branches.len} branches")
+            }
+            let inner = datum(d, schema.branches[index])?
+            d.depth -= 1
+            Value.Union(index, new(inner))
+        }
+    }
+}
+
+/// Returns the name of the kind of `v`, such as `string` or `record`, for error messages.
+fn value_kind(v: Value) -> str {
+    match v {
+        Null => "null"
+        Bool(_) => "boolean"
+        Int(_) => "integer"
+        Float(_) => "number"
+        Bytes(_) => "bytes"
+        Str(_) => "string"
+        Enum(_, _) => "enum"
+        Array(_) => "array"
+        Map(_) => "map"
+        Record(_) => "record"
+        Union(_, _) => "union"
+        Decimal(_, _) => "decimal"
+        Uuid(_) => "uuid"
+        Date(_) => "date"
+        TimeMillis(_) => "time-millis"
+        TimeMicros(_) => "time-micros"
+        TimestampMillis(_) => "timestamp-millis"
+        TimestampMicros(_) => "timestamp-micros"
+        TimestampNanos(_) => "timestamp-nanos"
+        LocalTimestampMillis(_) => "local-timestamp-millis"
+        LocalTimestampMicros(_) => "local-timestamp-micros"
+        LocalTimestampNanos(_) => "local-timestamp-nanos"
+        Duration(_, _, _) => "duration"
+    }
+}
+
+fn put_long(mut out: []u8, n: i64) {
+    codec.put_varint(mut out, u64(n << 1 ^ n >> 63))
+}
+
+fn put_string(mut out: []u8, s: str) ! Error {
+    if !unicode.utf8_valid(s) {
+        fail Mismatch("a string is not UTF-8")
+    }
+    put_long(mut out, s.len)
+    text.append(mut out, s)
+}
+
+fn expected(schema: *Schema, v: Value) -> Error {
+    Mismatch("expected {kind_name(schema.kind)}, found {value_kind(v)}")
+}
+
+/// Encodes `v` as one datum of `schema` and returns the bytes.
+///
+/// An `Int` fits `int` only within 32 bits, and also serves `float` and `double`. `Bytes` serves `bytes` and `fixed`, whose length it must match, and a logical variant serves the schema it belongs to; a `Decimal` must have the schema's scale. An enum is written from `Enum` or from the `Str` of a symbol. A record is written in the schema's field order from `Record` members found by name, and a missing member takes the field's default or fails. A union is written from `Union`, or from the first branch that accepts the bare value. Fails with `Mismatch`, naming the path, when a value does not fit.
+pub fn encode(schema: *Schema, v: Value) -> []u8 ! Error {
+    var out: []u8 = []
+    encode_into(mut out, schema, v)?
+    out
+}
+
+/// Appends the encoding of `v` as one datum of `schema` to `out`; see `encode`.
+fn encode_into(mut out: []u8, schema: *Schema, v: Value) ! Error {
+    let raw = raw_value(v)
+    match schema.kind {
+        Null => {
+            match raw {
+                Null => {}
+                _ => fail expected(schema, v)
+            }
+        }
+        Bool => {
+            match raw {
+                Bool(b) => push(mut out, if b { 1 } else { 0 })
+                _ => fail expected(schema, v)
+            }
+        }
+        Int => {
+            match raw {
+                Int(n) => {
+                    if n < -2147483648 || n > 2147483647 {
+                        fail Mismatch("{n} does not fit an int")
+                    }
+                    put_long(mut out, n)
+                }
+                _ => fail expected(schema, v)
+            }
+        }
+        Long => {
+            match raw {
+                Int(n) => put_long(mut out, n)
+                _ => fail expected(schema, v)
+            }
+        }
+        Float => {
+            match raw {
+                Float(x) => io.put_le32(mut out, i64(text.float32_bits(f32(x))))
+                Int(n) => io.put_le32(mut out, i64(text.float32_bits(f32(n))))
+                _ => fail expected(schema, v)
+            }
+        }
+        Double => {
+            match raw {
+                Float(x) => io.put_le64(mut out, i64(text.float_bits(x)))
+                Int(n) => io.put_le64(mut out, i64(text.float_bits(f64(n))))
+                _ => fail expected(schema, v)
+            }
+        }
+        Bytes => {
+            match raw {
+                Bytes(data) => {
+                    put_long(mut out, data.len)
+                    io.append(mut out, data)
+                }
+                _ => fail expected(schema, v)
+            }
+        }
+        String => {
+            match raw {
+                Str(s) => put_string(mut out, s)?
+                _ => fail expected(schema, v)
+            }
+        }
+        Fixed => {
+            match raw {
+                Bytes(data) => {
+                    if data.len != schema.size {
+                        fail Mismatch("{schema.name} holds {schema.size} bytes, found {data.len}")
+                    }
+                    io.append(mut out, data)
+                }
+                Str(t) => {
+                    if schema.logical != Logical.Uuid {
+                        fail expected(schema, v)
+                    }
+                    io.append(mut out, uuid_bytes(t)?)
+                }
+                _ => fail expected(schema, v)
+            }
+        }
+        Enum => encode_enum(mut out, schema, v)?
+        Array => {
+            match raw {
+                Array(items) => {
+                    let item = schema.item ?? schema
+                    if items.len > 0 {
+                        put_long(mut out, items.len)
+                        for i, x in items {
+                            encode_into(mut out, item, x) catch {
+                                Mismatch(m) => fail Mismatch("[{i}]: {m}")
+                                e => fail e
+                            }
+                        }
+                    }
+                    push(mut out, 0)
+                }
+                _ => fail expected(schema, v)
+            }
+        }
+        Map => {
+            match raw {
+                Map(entries) => {
+                    let item = schema.item ?? schema
+                    if entries.len > 0 {
+                        put_long(mut out, entries.len)
+                        for e in entries {
+                            put_string(mut out, e.key)?
+                            encode_into(mut out, item, e.value) catch {
+                                Mismatch(m) => fail Mismatch("[{text.quote(e.key)}]: {m}")
+                                err => fail err
+                            }
+                        }
+                    }
+                    push(mut out, 0)
+                }
+                _ => fail expected(schema, v)
+            }
+        }
+        Record => {
+            match raw {
+                Record(members) => encode_record(mut out, schema, members)?
+                _ => fail expected(schema, v)
+            }
+        }
+        Union => encode_union(mut out, schema, raw)?
+    }
+}
+
+fn encode_enum(mut out: []u8, schema: *Schema, v: Value) ! Error {
+    var symbol = ""
+    match v {
+        Enum(_, s) => {
+            symbol = s
+        }
+        Str(s) => {
+            symbol = s
+        }
+        _ => fail expected(schema, v)
+    }
+    for i, s in schema.symbols {
+        if s == symbol {
+            put_long(mut out, i)
+            return
+        }
+    }
+    fail Mismatch("{symbol} is not a symbol of {schema.name}")
+}
+
+fn member_named(members: []Member, name: str, hint: i64) -> Value? {
+    if hint < members.len && members[hint].name == name {
+        return members[hint].value
+    }
+    for m in members {
+        if m.name == name {
+            return m.value
+        }
+    }
+    none
+}
+
+fn encode_record(mut out: []u8, schema: *Schema, members: []Member) ! Error {
+    for i, f in schema.fields {
+        var value = Value.Null
+        match member_named(members, f.name, i) {
+            some(given) => {
+                value = given
+            }
+            none => {
+                match f.default {
+                    some(d) => {
+                        value = default_value(f.schema, d)?
+                    }
+                    none => fail Mismatch("{f.name}: the record has no member and the field has no default")
+                }
+            }
+        }
+        encode_into(mut out, f.schema, value) catch {
+            Mismatch(m) => fail Mismatch("{f.name}: {m}")
+            e => fail e
+        }
+    }
+}
+
+fn accepts(branch: *Schema, v: Value) -> bool {
+    let raw = raw_value(v)
+    match branch.kind {
+        Null => {
+            match raw {
+                Null => true
+                _ => false
+            }
+        }
+        Bool => {
+            match raw {
+                Bool(_) => true
+                _ => false
+            }
+        }
+        Int => {
+            match raw {
+                Int(n) => n >= -2147483648 && n <= 2147483647
+                _ => false
+            }
+        }
+        Long => {
+            match raw {
+                Int(_) => true
+                _ => false
+            }
+        }
+        Float => {
+            match raw {
+                Float(_) => true
+                _ => false
+            }
+        }
+        Double => {
+            match raw {
+                Float(_) => true
+                _ => false
+            }
+        }
+        Bytes => {
+            match raw {
+                Bytes(_) => true
+                _ => false
+            }
+        }
+        String => {
+            match raw {
+                Str(_) => true
+                _ => false
+            }
+        }
+        Fixed => {
+            match raw {
+                Bytes(data) => data.len == branch.size
+                _ => false
+            }
+        }
+        Enum => {
+            match v {
+                Enum(_, s) => has_symbol(branch, s)
+                Str(s) => has_symbol(branch, s)
+                _ => false
+            }
+        }
+        Array => {
+            match raw {
+                Array(_) => true
+                _ => false
+            }
+        }
+        Map => {
+            match raw {
+                Map(_) => true
+                _ => false
+            }
+        }
+        Record => {
+            match raw {
+                Record(members) => covers(branch, members)
+                _ => false
+            }
+        }
+        Union => false
+    }
+}
+
+fn has_symbol(schema: *Schema, symbol: str) -> bool {
+    for s in schema.symbols {
+        if s == symbol {
+            return true
+        }
+    }
+    false
+}
+
+fn covers(schema: *Schema, members: []Member) -> bool {
+    for m in members {
+        var known = false
+        for f in schema.fields {
+            if f.name == m.name {
+                known = true
+            }
+        }
+        if !known {
+            return false
+        }
+    }
+    for f in schema.fields {
+        match f.default {
+            some(_) => {}
+            none => {
+                match member_named(members, f.name, 0) {
+                    some(_) => {}
+                    none => return false
+                }
+            }
+        }
+    }
+    true
+}
+
+fn encode_union(mut out: []u8, schema: *Schema, v: Value) ! Error {
+    match v {
+        Union(index, inner) => {
+            if index < 0 || index >= schema.branches.len {
+                fail Mismatch("union index {index} is outside the {schema.branches.len} branches")
+            }
+            put_long(mut out, index)
+            encode_into(mut out, schema.branches[index], *inner)?
+            return
+        }
+        _ => {}
+    }
+    for i, branch in schema.branches {
+        if accepts(branch, v) {
+            put_long(mut out, i)
+            encode_into(mut out, branch, v)?
+            return
+        }
+    }
+    fail Mismatch("no branch of the union accepts a {value_kind(v)}")
+}

@@ -1,0 +1,487 @@
+import std/compress/lz4
+import std/compress/zstd
+import std/file
+import std/io
+
+/// Limits that bound what the reader allocates for untrusted input.
+pub struct ReaderOptions {
+    /// The largest message metadata, in bytes. Defaults to 16 MiB.
+    pub max_metadata: i64 = 16777216
+    /// The largest message body, and the most the buffers of one batch may decompress to, in bytes. Defaults to 1 GiB.
+    pub max_body: i64 = 1073741824
+}
+
+struct Decoder {
+    options: ReaderOptions
+    old_unions: bool
+    schema: Schema
+    types: [i64: DataType]
+    dictionaries: [i64: Array]
+}
+
+struct Message {
+    version: i64
+    header_type: i64
+    header: Table
+    body: []u8
+}
+
+struct Cursor {
+    decoder: *Decoder
+    meta: BatchMeta
+    body: []u8
+    node: i64
+    buffer: i64
+    budget: i64
+}
+
+fn collect_dictionaries(t: DataType, mut types: [i64: DataType]) ! Error {
+    match t {
+        Dictionary(id, _, value, _) => {
+            let known = types[id]
+            match known {
+                some(other) => {
+                    if type_name(other) != type_name(*value) {
+                        fail Invalid(-1, "dictionary {id} has two value types")
+                    }
+                }
+                none => {}
+            }
+            types[id] = *value
+            collect_dictionaries(*value, mut types)?
+        }
+        _ => {
+            for f in children_of(t) {
+                collect_dictionaries(f.data_type, mut types)?
+            }
+        }
+    }
+}
+
+fn make_decoder(schema: Schema, options: ReaderOptions, version: i64) -> *Decoder ! Error {
+    var types: [i64: DataType] = [:]
+    for f in schema.fields {
+        check_type(f.data_type, 0)?
+        collect_dictionaries(f.data_type, mut types)?
+    }
+    new(Decoder { options, old_unions: version < 4, schema, types, dictionaries: [:] })
+}
+
+fn parse_message(meta: []u8, body: []u8) -> Message ! Error {
+    let root = root_table(meta)?
+    let version = get_i16(root, 0, 0)?
+    if version < 3 {
+        fail Unsupported("metadata version {version + 1}")
+    }
+    let header_type = get_u8(root, 1, 0)?
+    let header = get_table(root, 2)? ?? fail Invalid(-1, "a message has no header")
+    Message { version, header_type, header, body }
+}
+
+fn message_body_length(meta: []u8) -> i64 ! Error {
+    let root = root_table(meta)?
+    let n = get_i64(root, 3, 0)?
+    if n < 0 {
+        fail Invalid(-1, "a message has the body length {n}")
+    }
+    n
+}
+
+fn signed32(v: i64) -> i64 {
+    if v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+/// Reads the Arrow IPC stream format one message at a time.
+pub struct StreamReader {
+    source: *io.Reader
+    decoder: *Decoder
+    offset: i64
+    finished: bool
+}
+
+fn stream_exact(r: *StreamReader, n: i64) -> []u8 ! Error {
+    var out: []u8 = []
+    var left = n
+    for left > 0 {
+        let step = if left > 65536 { 65536 } else { left }
+        let chunk = io.read_exact(r.source, step) catch {
+            Eof => fail Truncated(r.offset + out.len)
+            e => fail Io(e)
+        }
+        io.append(mut out, chunk)
+        left -= step
+    }
+    r.offset += n
+    out
+}
+
+fn stream_message(r: *StreamReader) -> Message? ! Error {
+    let first = io.buffer(4)
+    let got = io.read_up_to(r.source, first) catch {
+        e => fail Io(e)
+    }
+    if got == 0 {
+        r.finished = true
+        return none
+    }
+    if got < 4 {
+        fail Truncated(r.offset + got)
+    }
+    r.offset += 4
+    var length = signed32(io.le32(first, 0) & 0xFFFFFFFF)
+    if io.le32(first, 0) & 0xFFFFFFFF == 0xFFFFFFFF {
+        let second = stream_exact(r, 4)?
+        length = signed32(io.le32(second, 0) & 0xFFFFFFFF)
+    }
+    if length == 0 {
+        r.finished = true
+        return none
+    }
+    if length < 0 {
+        fail Invalid(r.offset - 4, "a message has the metadata length {length}")
+    }
+    if length > r.decoder.options.max_metadata {
+        fail TooLarge("message metadata")
+    }
+    let start = r.offset
+    let meta = stream_exact(r, length)?
+    let body_length = message_body_length(meta) catch {
+        Invalid(_, m) => fail Invalid(start, m)
+        e => fail e
+    }
+    if body_length > r.decoder.options.max_body {
+        fail TooLarge("message body")
+    }
+    let body = stream_exact(r, body_length)?
+    parse_message(meta, body) catch {
+        Invalid(_, m) => fail Invalid(start, m)
+        e => fail e
+    }
+}
+
+fn read_schema_message(m: Message) -> Schema ! Error {
+    if m.header_type != 1 {
+        fail Invalid(-1, "the first message is not a schema")
+    }
+    read_schema(m.header)?
+}
+
+/// Opens the IPC stream in `source` and reads its schema message. Fails with `Truncated` when the stream ends first, `Invalid` when the first message is not a schema or its metadata is malformed, `Unsupported` for a feature outside this module, `TooLarge` past a limit in `options`, and `Io` when `source` fails.
+pub fn stream_reader(source: *io.Reader, options: ReaderOptions) -> *StreamReader ! Error {
+    let placeholder = make_decoder(Schema { fields: [] }, options, 4)?
+    let r = new(StreamReader { source, decoder: placeholder, offset: 0, finished: false })
+    let first = stream_message(r)? ?? fail Truncated(0)
+    let schema = read_schema_message(first)?
+    r.decoder = make_decoder(schema, options, first.version)?
+    r
+}
+
+/// Opens the IPC stream held in `data`.
+pub fn stream_bytes(data: []u8, options: ReaderOptions) -> *StreamReader ! Error {
+    stream_reader(io.bytes_reader(data), options)?
+}
+
+/// Returns the schema of the stream.
+pub fn stream_schema(r: *StreamReader) -> Schema {
+    r.decoder.schema
+}
+
+/// Returns the next record batch, or `none` at the end of the stream.
+///
+/// Dictionary batches are applied as they are met. The end is the end-of-stream marker or the end of the input at a message boundary. A message cut short fails with `Truncated`; offsets and lengths that leave a buffer outside its body, sizes that do not fit the type and values that are not valid fail with `Invalid`; unsupported compression or types fail with `Unsupported`.
+pub fn next_batch(r: *StreamReader) -> Batch? ! Error {
+    for !r.finished {
+        let m = stream_message(r)? ?? return none
+        match m.header_type {
+            == 2 => apply_dictionary(r.decoder, m)?
+            == 3 => {
+                let b = decode_batch(r.decoder, m)?
+                return b
+            }
+            == 1 => fail Invalid(-1, "a second schema message")
+            _ => fail Unsupported("message type {m.header_type}")
+        }
+    }
+    none
+}
+
+/// Reads every remaining record batch of the stream.
+pub fn read_batches(r: *StreamReader) -> []Batch ! Error {
+    var out: []Batch = []
+    for {
+        let b = next_batch(r)? ?? break
+        push(mut out, b)
+    }
+    out
+}
+
+fn take_node(c: *Cursor) -> Range ! Error {
+    if c.node >= c.meta.node_lengths.len {
+        fail Invalid(-1, "the batch has too few field nodes")
+    }
+    let length = c.meta.node_lengths[c.node]
+    let nulls = c.meta.node_nulls[c.node]
+    c.node += 1
+    if length < 0 || length > max_length {
+        fail Invalid(-1, "a field node has length {length}")
+    }
+    if nulls < 0 || nulls > length {
+        fail Invalid(-1, "a field node has {nulls} nulls in {length} values")
+    }
+    Range { start: length, end: nulls }
+}
+
+fn decompress_buffer(c: *Cursor, raw: []u8) -> []u8 ! Error {
+    if raw.len == 0 {
+        return raw
+    }
+    if raw.len < 8 {
+        fail Invalid(-1, "a compressed buffer is shorter than its length prefix")
+    }
+    let size = io.le64(raw, 0)
+    if size == -1 {
+        return raw[8..]
+    }
+    if size < 0 || size > c.budget {
+        fail TooLarge("decompressed buffers")
+    }
+    c.budget -= size
+    let packed = raw[8..]
+    var out: []u8 = []
+    if c.meta.codec == 0 {
+        out = lz4.decompress(packed, size) catch Io
+    } else {
+        out = zstd.decompress(packed, size) catch Io
+    }
+    if out.len != size {
+        fail Invalid(-1, "a buffer decompressed to {out.len} bytes, not the {size} it declares")
+    }
+    out
+}
+
+fn take_buffer(c: *Cursor) -> []u8 ! Error {
+    if c.buffer >= c.meta.buffer_offsets.len {
+        fail Invalid(-1, "the batch has too few buffers")
+    }
+    let offset = c.meta.buffer_offsets[c.buffer]
+    let length = c.meta.buffer_lengths[c.buffer]
+    let index = c.buffer
+    c.buffer += 1
+    if offset < 0 || length < 0 || offset > c.body.len - length {
+        fail Invalid(-1, "buffer {index} lies outside the message body")
+    }
+    let raw = c.body[offset..offset + length]
+    if c.meta.codec < 0 {
+        return raw
+    }
+    decompress_buffer(c, raw)?
+}
+
+fn read_array(c: *Cursor, t: DataType, depth: i64) -> Array ! Error {
+    if depth > max_nesting {
+        fail TooLarge("array nesting")
+    }
+    let node = take_node(c)?
+    var validity: []u8 = []
+    if has_validity(t) {
+        let bits = take_buffer(c)?
+        if node.end > 0 {
+            validity = bits
+        }
+    }
+    var buffers: [][]u8 = []
+    for _ in 0..buffer_count(t) {
+        let b = take_buffer(c)?
+        push(mut buffers, b)
+    }
+    var children: []Array = []
+    var dictionary: *Array? = none
+    match t {
+        Union(_, _, _) => {
+            if c.decoder.old_unions {
+                fail Unsupported("the version 4 union layout")
+            }
+            for f in children_of(t) {
+                let child = read_array(c, f.data_type, depth + 1)?
+                push(mut children, child)
+            }
+        }
+        Dictionary(id, _, _, _) => {
+            let values = c.decoder.dictionaries[id] ?? fail Invalid(-1, "dictionary {id} is used before it is defined")
+            dictionary = new(values)
+        }
+        _ => {
+            for f in children_of(t) {
+                let child = read_array(c, f.data_type, depth + 1)?
+                push(mut children, child)
+            }
+        }
+    }
+    Array { data_type: t, length: node.start, null_count: node.end, validity, buffers, children, dictionary }
+}
+
+fn new_cursor(d: *Decoder, header: Table, body: []u8) -> *Cursor ! Error {
+    let meta = read_batch_meta(header)?
+    if meta.length > max_length {
+        fail TooLarge("record batch length")
+    }
+    new(Cursor { decoder: d, meta, body, node: 0, buffer: 0, budget: d.options.max_body })
+}
+
+fn finish_cursor(c: *Cursor) ! Error {
+    if c.node != c.meta.node_lengths.len || c.buffer != c.meta.buffer_offsets.len {
+        fail Invalid(-1, "the batch lists {c.meta.node_lengths.len} nodes and {c.meta.buffer_offsets.len} buffers but its schema uses {c.node} and {c.buffer}")
+    }
+}
+
+fn decode_batch(d: *Decoder, m: Message) -> Batch ! Error {
+    if m.header_type != 3 {
+        fail Invalid(-1, "the message is not a record batch")
+    }
+    let c = new_cursor(d, m.header, m.body)?
+    var columns: []Array = []
+    for f in d.schema.fields {
+        let a = read_array(c, f.data_type, 0)?
+        if a.length != c.meta.length {
+            fail Invalid(-1, "column {f.name} has {a.length} values in a batch of {c.meta.length}")
+        }
+        check_array(a, 0, false)?
+        push(mut columns, a)
+    }
+    finish_cursor(c)?
+    Batch { schema: d.schema, length: c.meta.length, columns }
+}
+
+fn apply_dictionary(d: *Decoder, m: Message) ! Error {
+    if m.header_type != 2 {
+        fail Invalid(-1, "the message is not a dictionary batch")
+    }
+    let id = get_i64(m.header, 0, 0)?
+    let data = get_table(m.header, 1)? ?? fail Invalid(-1, "a dictionary batch has no data")
+    let delta = get_bool(m.header, 2, false)?
+    let value_type = d.types[id] ?? fail Invalid(-1, "dictionary {id} is not in the schema")
+    let c = new_cursor(d, data, m.body)?
+    let values = read_array(c, value_type, 0)?
+    if values.length != c.meta.length {
+        fail Invalid(-1, "dictionary {id} has {values.length} values in a batch of {c.meta.length}")
+    }
+    finish_cursor(c)?
+    check_array(values, 0, true)?
+    if delta {
+        let before = d.dictionaries[id] ?? fail Invalid(-1, "dictionary {id} has a delta and no dictionary to extend")
+        let combined = concat(before, values)?
+        d.dictionaries[id] = combined
+    } else {
+        d.dictionaries[id] = values
+    }
+}
+
+fn block_message(data: []u8, block: Block, limit: i64) -> Message ! Error {
+    if block.offset < 8 || block.metadata_length < 8 || block.body_length < 0 || block.offset > data.len - block.metadata_length || block.body_length > data.len - block.offset - block.metadata_length {
+        fail Invalid(block.offset, "a block lies outside the file")
+    }
+    var prefix = 4
+    var length = signed32(io.le32(data, block.offset) & 0xFFFFFFFF)
+    if io.le32(data, block.offset) & 0xFFFFFFFF == 0xFFFFFFFF {
+        prefix = 8
+        length = signed32(io.le32(data, block.offset + 4) & 0xFFFFFFFF)
+    }
+    if length <= 0 || length > block.metadata_length - prefix || length > limit {
+        fail Invalid(block.offset, "a block has the metadata length {length}")
+    }
+    let start = block.offset + prefix
+    let meta = data[start..start + length]
+    let declared = message_body_length(meta) catch {
+        Invalid(_, m) => fail Invalid(block.offset, m)
+        e => fail e
+    }
+    if declared != block.body_length {
+        fail Invalid(block.offset, "a block's body length {block.body_length} differs from its message's {declared}")
+    }
+    let body_start = block.offset + block.metadata_length
+    parse_message(meta, data[body_start..body_start + block.body_length]) catch {
+        Invalid(_, m) => fail Invalid(block.offset, m)
+        e => fail e
+    }
+}
+
+/// Reads an Arrow IPC file with random access to its record batches.
+pub struct FileReader {
+    data: []u8
+    decoder: *Decoder
+    batches: []Block
+}
+
+fn magic_matches(data: []u8, at: i64) -> bool {
+    str(data[at..at + 6]) == "ARROW1"
+}
+
+/// Opens the IPC file held in `data`: it checks the magic, reads the footer and schema, and applies every dictionary batch. Fails with `Invalid` for a file that is not an Arrow file or whose footer or blocks are malformed, `Truncated` when it is shorter than a header and footer, and `Unsupported` and `TooLarge` as `next_batch` does.
+///
+/// A file may extend a dictionary with delta batches; all of them are applied before any batch is read, so a batch sees the dictionary's final values, which include the ones it was written with.
+pub fn open_file_bytes(data: []u8, options: ReaderOptions) -> *FileReader ! Error {
+    if data.len < 8 + 4 + 6 {
+        fail Truncated(data.len)
+    }
+    if !magic_matches(data, 0) || !magic_matches(data, data.len - 6) {
+        fail Invalid(0, "the data is not an Arrow IPC file")
+    }
+    let footer_length = signed32(io.le32(data, data.len - 10) & 0xFFFFFFFF)
+    if footer_length <= 0 || footer_length > data.len - 10 - 8 {
+        fail Invalid(data.len - 10, "the footer length is {footer_length}")
+    }
+    let footer = data[data.len - 10 - footer_length..data.len - 10]
+    let root = root_table(footer)?
+    let schema_table = get_table(root, 1)? ?? fail Invalid(-1, "the footer has no schema")
+    let schema = read_schema(schema_table)?
+    let dictionaries = read_blocks(root, 2)?
+    let batches = read_blocks(root, 3)?
+    let footer_version = get_i16(root, 0, 0)?
+    let decoder = make_decoder(schema, options, footer_version)?
+    for block in dictionaries {
+        let m = block_message(data, block, options.max_metadata)?
+        if m.body.len > options.max_body {
+            fail TooLarge("message body")
+        }
+        apply_dictionary(decoder, m)?
+    }
+    new(FileReader { data, decoder, batches })
+}
+
+/// Reads the IPC file at `path` into memory and opens it with `open_file_bytes`. Fails with `Io` when the file cannot be read.
+pub fn open_file(path: str, options: ReaderOptions) -> *FileReader ! Error {
+    let data = file.read_file(path) catch Io
+    open_file_bytes(data, options)?
+}
+
+/// Returns the schema of the file.
+pub fn file_schema(f: *FileReader) -> Schema {
+    f.decoder.schema
+}
+
+/// Returns the number of record batches in the file.
+pub fn batch_count(f: *FileReader) -> i64 {
+    f.batches.len
+}
+
+/// Reads record batch `i` of the file. Fails with `Mismatch` when `i` is out of range, and as `next_batch` does for the batch itself.
+pub fn read_batch(f: *FileReader, i: i64) -> Batch ! Error {
+    if i < 0 || i >= f.batches.len {
+        fail Mismatch("batch {i} of a file with {f.batches.len}")
+    }
+    let m = block_message(f.data, f.batches[i], f.decoder.options.max_metadata)?
+    if m.body.len > f.decoder.options.max_body {
+        fail TooLarge("message body")
+    }
+    decode_batch(f.decoder, m)?
+}
+
+/// Reads every record batch of the file in order.
+pub fn read_file_batches(f: *FileReader) -> []Batch ! Error {
+    var out: []Batch = []
+    for i in 0..f.batches.len {
+        let b = read_batch(f, i)?
+        push(mut out, b)
+    }
+    out
+}

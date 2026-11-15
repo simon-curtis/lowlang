@@ -1,0 +1,310 @@
+import std/arrow
+import std/io
+
+struct Spans {
+    starts: []i64
+    ends: []i64
+}
+
+fn def_at(d: ColumnData, pos: i64) -> i64 {
+    if d.def.len == 0 {
+        return 0
+    }
+    d.def[pos]
+}
+
+fn rep_at(d: ColumnData, pos: i64) -> i64 {
+    if d.rep.len == 0 {
+        return 0
+    }
+    d.rep[pos]
+}
+
+fn record_spans(d: ColumnData) -> Spans ! Error {
+    if d.count > 0 && rep_at(d, 0) != 0 {
+        fail Invalid(-1, "the repetition level at the start of a record is not 0")
+    }
+    var s = Spans { starts: [], ends: [] }
+    for p in 0..d.count {
+        if rep_at(d, p) == 0 {
+            if s.starts.len > 0 {
+                push(mut s.ends, p)
+            }
+            push(mut s.starts, p)
+        }
+    }
+    if s.starts.len > 0 {
+        push(mut s.ends, d.count)
+    }
+    s
+}
+
+fn bitmap_of(valid: []bool) -> []u8 {
+    var out: []u8 = []
+    for i, v in valid {
+        if i & 7 == 0 {
+            push(mut out, 0)
+        }
+        if v {
+            out[i >> 3] = out[i >> 3] | u8(1 << (i & 7))
+        }
+    }
+    out
+}
+
+fn count_nulls(valid: []bool) -> i64 {
+    var n = 0
+    for v in valid {
+        if !v {
+            n += 1
+        }
+    }
+    n
+}
+
+fn make_array(t: arrow.DataType, valid: []bool, buffers: [][]u8, children: []arrow.Array) -> arrow.Array {
+    let nulls = count_nulls(valid)
+    var validity: []u8 = []
+    if nulls > 0 {
+        validity = bitmap_of(valid)
+    }
+    arrow.Array { data_type: t, length: valid.len, null_count: nulls, validity, buffers, children, dictionary: none }
+}
+
+fn sign_extended(raw: []u8, big_endian: bool, negative_hint: bool) -> []u8 {
+    var out: []u8 = []
+    let n = raw.len
+    var negative = negative_hint
+    if big_endian && n > 0 {
+        negative = raw[0] >= 128
+    }
+    for i in 0..16 {
+        if i < n {
+            push(mut out, if big_endian { raw[n - 1 - i] } else { raw[i] })
+        } else {
+            push(mut out, if negative { 255 } else { 0 })
+        }
+    }
+    out
+}
+
+fn little_value(v: Values, k: i64) -> []u8 {
+    let w = fixed_width(v.physical, v.length)
+    v.fixed[k * w..(k + 1) * w]
+}
+
+fn int96_nanos(raw: []u8) -> i64 {
+    let nanos = io.le64(raw, 0)
+    let day = io.le32(raw, 8) & 0xFFFFFFFF
+    (day - 2440588) * 86400000000000 + nanos
+}
+
+fn fixed_array(t: arrow.DataType, valid: []bool, v: Values, width: i64) -> arrow.Array ! Error {
+    var data: []u8 = []
+    var k = 0
+    for ok in valid {
+        if !ok {
+            for _ in 0..width {
+                push(mut data, 0)
+            }
+            continue
+        }
+        match t {
+            Decimal(_, _) => {
+                match v.physical {
+                    ByteArray => {
+                        let raw = v.data[v.offsets[k]..v.offsets[k + 1]]
+                        if raw.len > 16 {
+                            fail Unsupported("a decimal of more than 16 bytes")
+                        }
+                        io.append(mut data, sign_extended(raw, true, false))
+                    }
+                    FixedLenByteArray => {
+                        let raw = little_value(v, k)
+                        if raw.len > 16 {
+                            fail Unsupported("a decimal of more than 16 bytes")
+                        }
+                        io.append(mut data, sign_extended(raw, true, false))
+                    }
+                    _ => {
+                        let raw = little_value(v, k)
+                        io.append(mut data, sign_extended(raw, false, raw[raw.len - 1] >= 128))
+                    }
+                }
+            }
+            Timestamp(_, _) => {
+                if v.physical == Physical.Int96 {
+                    io.put_le64(mut data, int96_nanos(little_value(v, k)))
+                } else {
+                    io.append(mut data, little_value(v, k))
+                }
+            }
+            Int(bits, _) => io.append(mut data, little_value(v, k)[..bits / 8])
+            _ => io.append(mut data, little_value(v, k))
+        }
+        k += 1
+    }
+    make_array(t, valid, [data], [])
+}
+
+fn bool_array(valid: []bool, v: Values) -> arrow.Array {
+    var bits: []u8 = []
+    var k = 0
+    var at = 0
+    for ok in valid {
+        if at & 7 == 0 {
+            push(mut bits, 0)
+        }
+        if ok {
+            if v.fixed[k] != 0 {
+                bits[at >> 3] = bits[at >> 3] | u8(1 << (at & 7))
+            }
+            k += 1
+        }
+        at += 1
+    }
+    make_array(arrow.DataType.Bool, valid, [bits], [])
+}
+
+fn binary_array(t: arrow.DataType, valid: []bool, v: Values) -> arrow.Array ! Error {
+    var offsets: []u8 = []
+    var data: []u8 = []
+    io.put_le32(mut offsets, 0)
+    var k = 0
+    for ok in valid {
+        if ok {
+            io.append(mut data, v.data[v.offsets[k]..v.offsets[k + 1]])
+            k += 1
+        }
+        if data.len > 2147483647 {
+            fail TooLarge("a binary column chunk of more than 2 GiB")
+        }
+        io.put_le32(mut offsets, data.len)
+    }
+    make_array(t, valid, [offsets, data], [])
+}
+
+fn fixed_binary_array(t: arrow.DataType, valid: []bool, v: Values, width: i64) -> arrow.Array {
+    var data: []u8 = []
+    var k = 0
+    for ok in valid {
+        if ok {
+            io.append(mut data, little_value(v, k))
+            k += 1
+        } else {
+            for _ in 0..width {
+                push(mut data, 0)
+            }
+        }
+    }
+    make_array(t, valid, [data], [])
+}
+
+fn leaf_array(p: Plan, spans: []Spans, n: i64, cols: []ColumnData, columns: []Column) -> arrow.Array ! Error {
+    let c = p.column
+    let max_def = columns[c].max_def
+    var valid: []bool = []
+    for i in 0..n {
+        push(mut valid, def_at(cols[c], spans[c].starts[i]) == max_def)
+    }
+    let v = cols[c].values
+    let t = p.field.data_type
+    match t {
+        Null => arrow.Array { data_type: t, length: n, null_count: n, validity: [], buffers: [], children: [], dictionary: none }
+        Bool => bool_array(valid, v)
+        Utf8 => binary_array(t, valid, v)?
+        Binary => binary_array(t, valid, v)?
+        FixedSizeBinary(w) => fixed_binary_array(t, valid, v, w)
+        Float(bits) => fixed_array(t, valid, v, bits / 8)?
+        Int(bits, _) => fixed_array(t, valid, v, bits / 8)?
+        Decimal(_, _) => fixed_array(t, valid, v, 16)?
+        _ => fixed_array(t, valid, v, arrow.value_width(t))?
+    }
+}
+
+fn offsets_bytes(offsets: []i64) -> []u8 {
+    var out: []u8 = []
+    for o in offsets {
+        io.put_le32(mut out, o)
+    }
+    out
+}
+
+fn list_array(p: Plan, spans: []Spans, n: i64, cols: []ColumnData, columns: []Column) -> arrow.Array ! Error {
+    let d = p.first
+    var valid: []bool = []
+    var offsets: []i64 = [0]
+    var inner: []Spans = []
+    for c in 0..spans.len {
+        push(mut inner, Spans { starts: [], ends: [] })
+    }
+    var total = 0
+    for i in 0..n {
+        let first = spans[d].starts[i]
+        let level = def_at(cols[d], first)
+        push(mut valid, level >= p.valid_def)
+        if level < p.valid_def || level < p.repeated_def {
+            push(mut offsets, total)
+            continue
+        }
+        var elements = -1
+        for c in p.first..p.first + p.count {
+            let s = spans[c].starts[i]
+            let e = spans[c].ends[i]
+            var start = s
+            var k = 0
+            for q in s + 1..e {
+                if rep_at(cols[c], q) <= p.rep {
+                    push(mut inner[c].starts, start)
+                    push(mut inner[c].ends, q)
+                    start = q
+                    k += 1
+                }
+            }
+            push(mut inner[c].starts, start)
+            push(mut inner[c].ends, e)
+            k += 1
+            if elements >= 0 && elements != k {
+                fail Invalid(-1, "the columns of {p.field.name} disagree on the length of a list")
+            }
+            elements = k
+        }
+        total += elements
+        push(mut offsets, total)
+    }
+    if total > 2147483647 {
+        fail TooLarge("a list column chunk of more than 2^31 elements")
+    }
+    var child: arrow.Array = arrow.Array { data_type: arrow.DataType.Null, length: 0, null_count: 0, validity: [], buffers: [], children: [], dictionary: none }
+    if p.kind == 3 {
+        let key = assemble(p.children[0], inner, total, cols, columns)?
+        let value = assemble(p.children[1], inner, total, cols, columns)?
+        let entry_type = arrow.children_of(p.field.data_type)[0].data_type
+        child = arrow.Array { data_type: entry_type, length: total, null_count: 0, validity: [], buffers: [], children: [key, value], dictionary: none }
+    } else {
+        child = assemble(p.children[0], inner, total, cols, columns)?
+    }
+    make_array(p.field.data_type, valid, [offsets_bytes(offsets)], [child])
+}
+
+fn struct_array(p: Plan, spans: []Spans, n: i64, cols: []ColumnData, columns: []Column) -> arrow.Array ! Error {
+    let d = p.first
+    var valid: []bool = []
+    for i in 0..n {
+        push(mut valid, def_at(cols[d], spans[d].starts[i]) >= p.valid_def)
+    }
+    var children: []arrow.Array = []
+    for c in p.children {
+        let a = assemble(c, spans, n, cols, columns)?
+        push(mut children, a)
+    }
+    make_array(p.field.data_type, valid, [], children)
+}
+
+fn assemble(p: Plan, spans: []Spans, n: i64, cols: []ColumnData, columns: []Column) -> arrow.Array ! Error {
+    match p.kind {
+        == 0 => leaf_array(p, spans, n, cols, columns)?
+        == 1 => struct_array(p, spans, n, cols, columns)?
+        _ => list_array(p, spans, n, cols, columns)?
+    }
+}

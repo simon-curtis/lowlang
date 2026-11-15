@@ -1,0 +1,686 @@
+import std/io
+import std/text
+import std/unicode
+
+fn check_fields(fields: []Field, depth: i64) ! Error {
+    for f in fields {
+        check_type(f.data_type, depth + 1)?
+    }
+}
+
+/// Checks that `t` is a well-formed type: widths and precisions are in range, a map has a key and a value, a union's type ids match its fields, and nesting stays within the limit. Fails with `Mismatch` or `TooLarge`.
+pub fn check_type(t: DataType, depth: i64) ! Error {
+    if depth > max_nesting {
+        fail TooLarge("type nesting")
+    }
+    match t {
+        Int(bits, _) => {
+            if bits != 8 && bits != 16 && bits != 32 && bits != 64 {
+                fail Mismatch("an integer of {bits} bits")
+            }
+        }
+        Float(bits) => {
+            if bits != 16 && bits != 32 && bits != 64 {
+                fail Mismatch("a float of {bits} bits")
+            }
+        }
+        FixedSizeBinary(width) => {
+            if width < 0 || width > 1073741824 {
+                fail Mismatch("a fixed-size binary of {width} bytes")
+            }
+        }
+        Decimal(precision, scale) => {
+            if precision < 1 || precision > 38 {
+                fail Mismatch("a decimal of precision {precision}")
+            }
+            if scale > precision {
+                fail Mismatch("a decimal of scale {scale} and precision {precision}")
+            }
+        }
+        List(item) => check_type(item.data_type, depth + 1)?
+        LargeList(item) => check_type(item.data_type, depth + 1)?
+        FixedSizeList(item, size) => {
+            if size < 0 || size > 1073741824 {
+                fail Mismatch("a fixed-size list of {size} elements")
+            }
+            check_type(item.data_type, depth + 1)?
+        }
+        Struct(fields) => check_fields(fields, depth)?
+        Map(entries, _) => {
+            match entries.data_type {
+                Struct(fields) => {
+                    if fields.len != 2 {
+                        fail Mismatch("a map entry struct with {fields.len} fields")
+                    }
+                    check_fields(fields, depth)?
+                }
+                _ => fail Mismatch("a map whose entries are {type_name(entries.data_type)}")
+            }
+        }
+        Union(_, fields, ids) => {
+            if ids.len != fields.len {
+                fail Mismatch("a union of {fields.len} fields and {ids.len} type ids")
+            }
+            var used: [i64: bool] = [:]
+            for id in ids {
+                if id < 0 || id > 127 {
+                    fail Mismatch("the union type id {id}")
+                }
+                if used[id] != none {
+                    fail Mismatch("the union type id {id} twice")
+                }
+                used[id] = true
+            }
+            check_fields(fields, depth)?
+        }
+        Dictionary(_, index, value, _) => {
+            match *index {
+                Int(_, _) => check_type(*index, depth + 1)?
+                _ => fail Mismatch("a dictionary index of {type_name(*index)}")
+            }
+            check_type(*value, depth + 1)?
+        }
+        _ => {}
+    }
+}
+
+/// Builds one array by appending values.
+///
+/// Create it with `builder`, append values with the `append_*` functions that suit the type, and take the array with `finish`. A list, map or fixed-size list takes its elements through `child` and is closed with `end_list`; a struct takes one value in each child and is closed with `end_struct`; a union takes each value through the child `append_union` returns. A dictionary builder interns text, bytes and integers into its values as they are appended, or takes an index into values appended through `child`.
+pub struct Builder {
+    data_type: DataType
+    length: i64 = 0
+    null_count: i64 = 0
+    validity: []u8 = []
+    values: []u8 = []
+    offsets: []u8 = []
+    type_ids: []u8 = []
+    children: []*Builder = []
+    seen: [str: i64] = [:]
+}
+
+/// Returns a builder for arrays of `t`. Fails with `Mismatch` when `t` is not a well-formed type.
+pub fn builder(t: DataType) -> *Builder ! Error {
+    check_type(t, 0)?
+    make_builder(t)
+}
+
+fn make_builder(t: DataType) -> *Builder {
+    var children: []*Builder = []
+    match t {
+        List(item) => push(mut children, make_builder(item.data_type))
+        LargeList(item) => push(mut children, make_builder(item.data_type))
+        FixedSizeList(item, _) => push(mut children, make_builder(item.data_type))
+        Map(entries, _) => push(mut children, make_builder(entries.data_type))
+        Struct(fields) => {
+            for f in fields {
+                push(mut children, make_builder(f.data_type))
+            }
+        }
+        Union(_, fields, _) => {
+            for f in fields {
+                push(mut children, make_builder(f.data_type))
+            }
+        }
+        Dictionary(_, _, value, _) => push(mut children, make_builder(*value))
+        _ => {}
+    }
+    var offsets: []u8 = []
+    for _ in 0..offset_bytes(t) {
+        push(mut offsets, 0)
+    }
+    new(Builder { data_type: t, children, offsets })
+}
+
+fn offset_bytes(t: DataType) -> i64 {
+    match t {
+        Utf8 => 4
+        LargeUtf8 => 8
+        Binary => 4
+        LargeBinary => 8
+        List(_) => 4
+        LargeList(_) => 8
+        Map(_, _) => 4
+        _ => 0
+    }
+}
+
+/// Returns the number of values appended so far.
+pub fn builder_length(b: *Builder) -> i64 {
+    b.length
+}
+
+/// Returns the type `b` builds.
+pub fn builder_type(b: *Builder) -> DataType {
+    b.data_type
+}
+
+/// Returns child `i` of the list, map, fixed-size list, struct, union or dictionary builder `b`: the elements of a list, the entries of a map, field `i` of a struct or union, the values of a dictionary.
+pub fn child(b: *Builder, i: i64) -> *Builder ! Error {
+    if i < 0 || i >= b.children.len {
+        fail Mismatch("{type_name(b.data_type)} has no child {i}")
+    }
+    b.children[i]
+}
+
+fn mark(b: *Builder, valid: bool) {
+    if has_validity(b.data_type) {
+        if b.length & 7 == 0 {
+            push(mut b.validity, 0)
+        }
+        if valid {
+            let at = b.length >> 3
+            b.validity[at] = b.validity[at] | u8(1 << (b.length & 7))
+        }
+    }
+    if !valid {
+        b.null_count += 1
+    }
+    b.length += 1
+}
+
+fn wrong(b: *Builder, what: str) -> Error {
+    Mismatch("{what} on a builder of {type_name(b.data_type)}")
+}
+
+fn put_zeros(b: *Builder, n: i64) {
+    for _ in 0..n {
+        push(mut b.values, 0)
+    }
+}
+
+fn put_offset(b: *Builder, v: i64) {
+    io.put_le(mut b.offsets, v, offset_bytes(b.data_type))
+}
+
+/// Appends a null to `b`. A struct, fixed-size list or union appends the null to its children too, a list repeats its last offset, and a dictionary stores index 0.
+pub fn append_null(b: *Builder) ! Error {
+    match b.data_type {
+        Null => {}
+        Bool => {
+            if b.length & 7 == 0 {
+                push(mut b.values, 0)
+            }
+        }
+        Utf8 => put_offset(b, b.values.len)
+        LargeUtf8 => put_offset(b, b.values.len)
+        Binary => put_offset(b, b.values.len)
+        LargeBinary => put_offset(b, b.values.len)
+        List(_) => put_offset(b, b.children[0].length)
+        LargeList(_) => put_offset(b, b.children[0].length)
+        Map(_, _) => put_offset(b, b.children[0].length)
+        FixedSizeList(_, size) => {
+            for _ in 0..size {
+                append_null(b.children[0])?
+            }
+        }
+        Struct(_) => {
+            for c in b.children {
+                append_null(c)?
+            }
+        }
+        Union(_, fields, ids) => {
+            if fields.len == 0 {
+                fail wrong(b, "append_null")
+            }
+            let slot = append_union(b, ids[0])?
+            append_null(slot)?
+            return
+        }
+        _ => put_zeros(b, value_width(b.data_type))
+    }
+    mark(b, false)
+}
+
+/// Appends `v` to a `Bool` builder.
+pub fn append_bool(b: *Builder, v: bool) ! Error {
+    match b.data_type {
+        Bool => {
+            if b.length & 7 == 0 {
+                push(mut b.values, 0)
+            }
+            if v {
+                let at = b.length >> 3
+                b.values[at] = b.values[at] | u8(1 << (b.length & 7))
+            }
+            mark(b, true)
+        }
+        _ => fail wrong(b, "append_bool")
+    }
+}
+
+fn signed_fits(v: i64, bits: i64) -> bool {
+    if bits >= 64 {
+        return true
+    }
+    let limit = i64(1) << (bits - 1)
+    v >= -limit && v < limit
+}
+
+fn unsigned_fits(v: u64, bits: i64) -> bool {
+    bits >= 64 || v < (u64(1) << u64(bits))
+}
+
+fn put_index(b: *Builder, index: i64) ! Error {
+    match b.data_type {
+        Dictionary(_, kind, _, _) => {
+            match *kind {
+                Int(bits, signed) => {
+                    let fits = if signed { signed_fits(index, bits) } else { index >= 0 && unsigned_fits(u64(index), bits) }
+                    if !fits {
+                        fail Mismatch("the dictionary index {index} does not fit {type_name(*kind)}")
+                    }
+                    io.put_le(mut b.values, index, bits / 8)
+                    mark(b, true)
+                }
+                _ => fail wrong(b, "append_index")
+            }
+        }
+        _ => fail wrong(b, "append_index")
+    }
+}
+
+/// Appends the index `i` into the dictionary values of a dictionary builder, which must already hold the value, appended through `child(b, 0)`.
+pub fn append_index(b: *Builder, i: i64) ! Error {
+    let values = child(b, 0)?
+    if i < 0 || i >= values.length {
+        fail Mismatch("the dictionary index {i} is outside {values.length} values")
+    }
+    put_index(b, i)?
+}
+
+fn intern(b: *Builder, key: str) -> i64 {
+    b.seen[key] ?? -1
+}
+
+/// Appends the signed integer, date, time, timestamp or duration `v`. Fails with `Mismatch` when `v` does not fit the type. A dictionary builder interns it in its values.
+pub fn append_int(b: *Builder, v: i64) ! Error {
+    match b.data_type {
+        Int(bits, signed) => {
+            if !signed {
+                fail wrong(b, "append_int")
+            }
+            if !signed_fits(v, bits) {
+                fail Mismatch("{v} does not fit {type_name(b.data_type)}")
+            }
+            io.put_le(mut b.values, v, bits / 8)
+            mark(b, true)
+        }
+        Date(unit) => {
+            let bits = if unit == DateUnit.Day { 32 } else { 64 }
+            if !signed_fits(v, bits) {
+                fail Mismatch("{v} does not fit {type_name(b.data_type)}")
+            }
+            io.put_le(mut b.values, v, bits / 8)
+            mark(b, true)
+        }
+        Time(unit) => {
+            let bits = time_bits(unit)
+            if !signed_fits(v, bits) {
+                fail Mismatch("{v} does not fit {type_name(b.data_type)}")
+            }
+            io.put_le(mut b.values, v, bits / 8)
+            mark(b, true)
+        }
+        Timestamp(_, _) => {
+            io.put_le(mut b.values, v, 8)
+            mark(b, true)
+        }
+        Duration(_) => {
+            io.put_le(mut b.values, v, 8)
+            mark(b, true)
+        }
+        Dictionary(_, _, _, _) => {
+            let values = child(b, 0)?
+            let key = "{v}"
+            let found = intern(b, key)
+            if found >= 0 {
+                put_index(b, found)?
+                return
+            }
+            let index = values.length
+            append_int(values, v)?
+            b.seen[key] = index
+            put_index(b, index)?
+        }
+        _ => fail wrong(b, "append_int")
+    }
+}
+
+/// Appends the unsigned integer `v` to an unsigned integer builder. Fails with `Mismatch` when `v` does not fit.
+pub fn append_uint(b: *Builder, v: u64) ! Error {
+    match b.data_type {
+        Int(bits, signed) => {
+            if signed || !unsigned_fits(v, bits) {
+                fail Mismatch("{v} does not fit {type_name(b.data_type)}")
+            }
+            io.put_le(mut b.values, i64(v), bits / 8)
+            mark(b, true)
+        }
+        _ => fail wrong(b, "append_uint")
+    }
+}
+
+/// Appends the float `x` to a `Float` builder, rounded to its width.
+pub fn append_float(b: *Builder, x: f64) ! Error {
+    match b.data_type {
+        Float(bits) => {
+            match bits {
+                == 16 => io.put_le(mut b.values, float_to_half(x), 2)
+                == 32 => io.put_le(mut b.values, i64(text.float32_bits(f32(x))), 4)
+                _ => io.put_le(mut b.values, i64(text.float_bits(x)), 8)
+            }
+            mark(b, true)
+        }
+        _ => fail wrong(b, "append_float")
+    }
+}
+
+fn push_bytes(b: *Builder, v: []u8) ! Error {
+    let end = b.values.len + v.len
+    if offset_bytes(b.data_type) == 4 && end > 2147483647 {
+        fail TooLarge("the values of a 32-bit offset array")
+    }
+    io.append(mut b.values, v)
+    put_offset(b, end)
+    mark(b, true)
+}
+
+/// Appends `v` to a `Binary`, `LargeBinary`, `Utf8`, `LargeUtf8` or `FixedSizeBinary` builder; fixed-size values must be exactly the width, and text must be UTF-8. A dictionary builder interns it in its values.
+pub fn append_bytes(b: *Builder, v: []u8) ! Error {
+    match b.data_type {
+        Binary => push_bytes(b, v)?
+        LargeBinary => push_bytes(b, v)?
+        Utf8 => append_str(b, str(v))?
+        LargeUtf8 => append_str(b, str(v))?
+        FixedSizeBinary(width) => {
+            if v.len != width {
+                fail Mismatch("{v.len} bytes for {type_name(b.data_type)}")
+            }
+            io.append(mut b.values, v)
+            mark(b, true)
+        }
+        Dictionary(_, _, _, _) => {
+            let values = child(b, 0)?
+            let key = str(v)
+            let found = intern(b, key)
+            if found >= 0 {
+                put_index(b, found)?
+                return
+            }
+            let index = values.length
+            append_bytes(values, v)?
+            b.seen[key] = index
+            put_index(b, index)?
+        }
+        _ => fail wrong(b, "append_bytes")
+    }
+}
+
+/// Appends the text `s` to a `Utf8` or `LargeUtf8` builder, or interns it in a dictionary builder over text. Binary builders take it as its bytes.
+pub fn append_str(b: *Builder, s: str) ! Error {
+    match b.data_type {
+        Utf8 => {
+            if !unicode.utf8_valid(s) {
+                fail Mismatch("text that is not UTF-8")
+            }
+            push_bytes(b, bytes(s))?
+        }
+        LargeUtf8 => {
+            if !unicode.utf8_valid(s) {
+                fail Mismatch("text that is not UTF-8")
+            }
+            push_bytes(b, bytes(s))?
+        }
+        Binary => push_bytes(b, bytes(s))?
+        LargeBinary => push_bytes(b, bytes(s))?
+        Dictionary(_, _, _, _) => {
+            let values = child(b, 0)?
+            let found = intern(b, s)
+            if found >= 0 {
+                put_index(b, found)?
+                return
+            }
+            let index = values.length
+            append_str(values, s)?
+            b.seen[s] = index
+            put_index(b, index)?
+        }
+        _ => fail wrong(b, "append_str")
+    }
+}
+
+fn decimal_bytes(s: str, precision: i64, scale: i64) -> []u8 ! Error {
+    if scale < 0 {
+        fail Mismatch("decimal text for the negative scale {scale}")
+    }
+    var negative = false
+    var at = 0
+    if s.len > 0 && (s[0] == '-' || s[0] == '+') {
+        negative = s[0] == '-'
+        at = 1
+    }
+    var digits: []u8 = []
+    var fraction = -1
+    for at < s.len {
+        let c = s[at]
+        if c == '.' {
+            if fraction >= 0 {
+                fail Mismatch("the decimal {text.quote(s)} has two points")
+            }
+            fraction = 0
+        } else if c >= '0' && c <= '9' {
+            push(mut digits, c - '0')
+            if fraction >= 0 {
+                fraction += 1
+            }
+        } else {
+            fail Mismatch("the decimal {text.quote(s)} has the character {text.quote(s[at..at + 1])}")
+        }
+        at += 1
+    }
+    if digits.len == 0 {
+        fail Mismatch("the decimal {text.quote(s)} has no digits")
+    }
+    let places = if fraction < 0 { 0 } else { fraction }
+    if places > scale {
+        fail Mismatch("the decimal {text.quote(s)} has more than {scale} fractional digits")
+    }
+    for _ in 0..scale - places {
+        push(mut digits, 0)
+    }
+    var first = 0
+    for first < digits.len - 1 && digits[first] == 0 {
+        first += 1
+    }
+    if digits.len - first > precision {
+        fail Mismatch("the decimal {text.quote(s)} has more than {precision} digits")
+    }
+    var out = io.buffer(16)
+    for k in first..digits.len {
+        var carry = i64(digits[k])
+        for j in 0..16 {
+            let v = i64(out[j]) * 10 + carry
+            out[j] = u8(v & 0xFF)
+            carry = v >> 8
+        }
+    }
+    if negative {
+        var carry = 1
+        for j in 0..16 {
+            let v = i64(~out[j] & 0xFF) + carry
+            out[j] = u8(v & 0xFF)
+            carry = v >> 8
+        }
+    }
+    out
+}
+
+/// Appends the decimal `s`, such as `-12.50`, to a `Decimal` builder. It may have no more fractional digits than the scale and no more digits than the precision.
+pub fn append_decimal(b: *Builder, s: str) ! Error {
+    match b.data_type {
+        Decimal(precision, scale) => {
+            let unscaled = decimal_bytes(s, precision, scale)?
+            io.append(mut b.values, unscaled)
+            mark(b, true)
+        }
+        _ => fail wrong(b, "append_decimal")
+    }
+}
+
+/// Appends an interval to an `Interval` builder. A `YearMonth` interval takes `months` only, a `DayTime` interval `days` and `millis`, a `MonthDayNano` interval all three, with `millis` read as nanoseconds. A part the unit does not hold must be `0`.
+pub fn append_interval(b: *Builder, months: i64, days: i64, time: i64) ! Error {
+    match b.data_type {
+        Interval(unit) => {
+            match unit {
+                YearMonth => {
+                    if days != 0 || time != 0 || !signed_fits(months, 32) {
+                        fail Mismatch("{months}, {days}, {time} for a month interval")
+                    }
+                    io.put_le(mut b.values, months, 4)
+                }
+                DayTime => {
+                    if months != 0 || !signed_fits(days, 32) || !signed_fits(time, 32) {
+                        fail Mismatch("{months}, {days}, {time} for a day-time interval")
+                    }
+                    io.put_le(mut b.values, days, 4)
+                    io.put_le(mut b.values, time, 4)
+                }
+                MonthDayNano => {
+                    if !signed_fits(months, 32) || !signed_fits(days, 32) {
+                        fail Mismatch("{months}, {days}, {time} for a month-day-nano interval")
+                    }
+                    io.put_le(mut b.values, months, 4)
+                    io.put_le(mut b.values, days, 4)
+                    io.put_le(mut b.values, time, 8)
+                }
+            }
+            mark(b, true)
+        }
+        _ => fail wrong(b, "append_interval")
+    }
+}
+
+/// Closes the list, large list, map or fixed-size list under construction after its elements have been appended to `child(b, 0)`. A fixed-size list needs exactly its size in elements.
+pub fn end_list(b: *Builder) ! Error {
+    let elements = child(b, 0)?
+    match b.data_type {
+        List(_) => put_offset(b, elements.length)
+        LargeList(_) => put_offset(b, elements.length)
+        Map(_, _) => put_offset(b, elements.length)
+        FixedSizeList(_, size) => {
+            if elements.length != (b.length + 1) * size {
+                fail Mismatch("{elements.length} elements after {b.length + 1} lists of {size}")
+            }
+        }
+        _ => fail wrong(b, "end_list")
+    }
+    if offset_bytes(b.data_type) == 4 && elements.length > 2147483647 {
+        fail TooLarge("the elements of a 32-bit offset list")
+    }
+    mark(b, true)
+}
+
+/// Closes the struct under construction after one value has been appended to every child.
+pub fn end_struct(b: *Builder) ! Error {
+    match b.data_type {
+        Struct(_) => {
+            for c in b.children {
+                if c.length != b.length + 1 {
+                    fail Mismatch("a struct child holds {c.length} values for {b.length + 1} rows")
+                }
+            }
+            mark(b, true)
+        }
+        _ => fail wrong(b, "end_struct")
+    }
+}
+
+/// Starts a union value with the type id `id` and returns the child builder to append it to. A sparse union appends a null to its other children.
+pub fn append_union(b: *Builder, id: i64) -> *Builder ! Error {
+    match b.data_type {
+        Union(mode, _, ids) => {
+            var selected = -1
+            for k, candidate in ids {
+                if candidate == id {
+                    selected = k
+                }
+            }
+            if selected < 0 {
+                fail Mismatch("the type id {id} is not in the union")
+            }
+            push(mut b.type_ids, u8(id))
+            if mode == UnionMode.Dense {
+                io.put_le(mut b.offsets, b.children[selected].length, 4)
+            } else {
+                for k, c in b.children {
+                    if k != selected {
+                        append_null(c)?
+                    }
+                }
+            }
+            mark(b, true)
+            b.children[selected]
+        }
+        _ => fail wrong(b, "append_union")
+    }
+}
+
+fn finish_array(b: *Builder) -> Array ! Error {
+    var children: []Array = []
+    for c in b.children {
+        let a = finish_array(c)?
+        push(mut children, a)
+    }
+    var buffers: [][]u8 = []
+    var dictionary: *Array? = none
+    match b.data_type {
+        Null => {}
+        Utf8 => {
+            push(mut buffers, b.offsets)
+            push(mut buffers, b.values)
+        }
+        LargeUtf8 => {
+            push(mut buffers, b.offsets)
+            push(mut buffers, b.values)
+        }
+        Binary => {
+            push(mut buffers, b.offsets)
+            push(mut buffers, b.values)
+        }
+        LargeBinary => {
+            push(mut buffers, b.offsets)
+            push(mut buffers, b.values)
+        }
+        List(_) => push(mut buffers, b.offsets)
+        LargeList(_) => push(mut buffers, b.offsets)
+        Map(_, _) => push(mut buffers, b.offsets)
+        FixedSizeList(_, _) => {}
+        Struct(_) => {}
+        Union(mode, _, _) => {
+            push(mut buffers, b.type_ids)
+            if mode == UnionMode.Dense {
+                push(mut buffers, b.offsets)
+            }
+        }
+        Dictionary(_, _, _, _) => {
+            push(mut buffers, b.values)
+            let values = children[0]
+            dictionary = new(values)
+            children = []
+        }
+        _ => push(mut buffers, b.values)
+    }
+    var validity: []u8 = []
+    if b.null_count > 0 && has_validity(b.data_type) {
+        validity = b.validity
+    }
+    Array { data_type: b.data_type, length: b.length, null_count: b.null_count, validity, buffers, children, dictionary }
+}
+
+/// Returns the array `b` built and checks it with `validate`. The array shares the builder's memory, so the builder is discarded after `finish`.
+pub fn finish(b: *Builder) -> Array ! Error {
+    let a = finish_array(b)?
+    validate(a)?
+    a
+}

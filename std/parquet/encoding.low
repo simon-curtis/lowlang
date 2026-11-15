@@ -1,0 +1,588 @@
+import std/io
+
+const max_page_values = 1 << 28
+
+struct Values {
+    physical: Physical
+    length: i64
+    count: i64
+    fixed: []u8
+    offsets: []i64
+    data: []u8
+}
+
+fn empty_values(p: Physical, length: i64) -> Values {
+    Values { physical: p, length, count: 0, fixed: [], offsets: [0], data: [] }
+}
+
+fn fixed_width(p: Physical, length: i64) -> i64 {
+    match p {
+        Boolean => 1
+        Int32 => 4
+        Int64 => 8
+        Int96 => 12
+        Float => 4
+        Double => 8
+        ByteArray => 0
+        FixedLenByteArray => length
+    }
+}
+
+fn plain_width(p: Physical, length: i64) -> i64 {
+    match p {
+        Boolean => 0
+        _ => fixed_width(p, length)
+    }
+}
+
+fn bit_width_of(n: i64) -> i64 {
+    var w = 0
+    var rest = n
+    for rest > 0 {
+        w += 1
+        rest = rest >> 1
+    }
+    w
+}
+
+fn mask_of(bw: i64) -> u64 {
+    if bw >= 64 {
+        return 0xFFFFFFFFFFFFFFFF
+    }
+    (u64(1) << u64(bw)) - 1
+}
+
+fn unpack(data: []u8, at: i64, bw: i64, n: i64, base: i64) -> []i64 ! Error {
+    let bytes_needed = (n * bw + 7) / 8
+    if at < 0 || bytes_needed > data.len - at {
+        fail Truncated(base + data.len)
+    }
+    var out: []i64 = []
+    if bw == 0 {
+        for _ in 0..n {
+            push(mut out, 0)
+        }
+        return out
+    }
+    if bw > 56 {
+        for i in 0..n {
+            var v: u64 = 0
+            for b in 0..bw {
+                let pos = i * bw + b
+                if (data[at + (pos >> 3)] >> u8(pos & 7)) & 1 == 1 {
+                    v = v | (u64(1) << u64(b))
+                }
+            }
+            push(mut out, i64(v))
+        }
+        return out
+    }
+    let mask = mask_of(bw)
+    var acc: u64 = 0
+    var bits = 0
+    var p = at
+    for _ in 0..n {
+        for bits < bw {
+            acc = acc | (u64(data[p]) << u64(bits))
+            p += 1
+            bits += 8
+        }
+        push(mut out, i64(acc & mask))
+        acc = acc >> u64(bw)
+        bits -= bw
+    }
+    out
+}
+
+fn pack(mut out: []u8, values: []i64, start: i64, n: i64, bw: i64) {
+    if bw == 0 {
+        return
+    }
+    if bw > 56 {
+        let total = (n * bw + 7) / 8
+        let first = out.len
+        for _ in 0..total {
+            push(mut out, 0)
+        }
+        for i in 0..n {
+            let v = u64(if start + i < values.len { values[start + i] } else { 0 })
+            for b in 0..bw {
+                if (v >> u64(b)) & 1 == 1 {
+                    let pos = i * bw + b
+                    out[first + (pos >> 3)] = out[first + (pos >> 3)] | u8(1 << (pos & 7))
+                }
+            }
+        }
+        return
+    }
+    let mask = mask_of(bw)
+    var acc: u64 = 0
+    var bits = 0
+    for i in 0..n {
+        let v = u64(if start + i < values.len { values[start + i] } else { 0 })
+        acc = acc | ((v & mask) << u64(bits))
+        bits += bw
+        for bits >= 8 {
+            push(mut out, u8(acc & 0xFF))
+            acc = acc >> 8
+            bits -= 8
+        }
+    }
+    if bits > 0 {
+        push(mut out, u8(acc & 0xFF))
+    }
+}
+
+fn read_hybrid(data: []u8, bw: i64, count: i64, base: i64) -> []i64 ! Error {
+    if count > max_page_values {
+        fail TooLarge("page values")
+    }
+    if bw < 0 || bw > 32 {
+        fail Invalid(base, "a bit width of {bw}")
+    }
+    var out: []i64 = []
+    var p = 0
+    for out.len < count {
+        if p >= data.len {
+            fail Truncated(base + data.len)
+        }
+        var header: u64 = 0
+        var shift: u64 = 0
+        for {
+            if p >= data.len {
+                fail Truncated(base + data.len)
+            }
+            let b = data[p]
+            p += 1
+            header = header | (u64(b & 0x7F) << shift)
+            if b & 0x80 == 0 {
+                break
+            }
+            shift += 7
+            if shift > 35 {
+                fail Invalid(base + p, "a run header is too long")
+            }
+        }
+        let run = i64(header >> 1)
+        if header & 1 == 0 {
+            let width = (bw + 7) / 8
+            if width > data.len - p {
+                fail Truncated(base + data.len)
+            }
+            var v = 0
+            for k in 0..width {
+                v = v | (i64(data[p + k]) << (8 * k))
+            }
+            p += width
+            let take = if run > count - out.len { count - out.len } else { run }
+            for _ in 0..take {
+                push(mut out, v)
+            }
+        } else {
+            let total = run * 8
+            let take = if total > count - out.len { count - out.len } else { total }
+            let chunk = unpack(data, p, bw, take, base)?
+            for c in chunk {
+                push(mut out, c)
+            }
+            p += total * bw / 8
+        }
+    }
+    out
+}
+
+fn write_hybrid(values: []i64, bw: i64) -> []u8 {
+    var out: []u8 = []
+    var i = 0
+    let n = values.len
+    for i < n {
+        var run = 1
+        for i + run < n && values[i + run] == values[i] {
+            run += 1
+        }
+        if run >= 8 {
+            put_header(mut out, run << 1)
+            for k in 0..(bw + 7) / 8 {
+                push(mut out, u8((values[i] >> (8 * k)) & 0xFF))
+            }
+            i += run
+        } else {
+            var end = i + 8
+            for end < n {
+                var ahead = 1
+                for end + ahead < n && ahead < 8 && values[end + ahead] == values[end] {
+                    ahead += 1
+                }
+                if ahead >= 8 {
+                    break
+                }
+                end += 8
+            }
+            if end > n {
+                end = n
+            }
+            let groups = (end - i + 7) / 8
+            put_header(mut out, groups << 1 | 1)
+            pack(mut out, values, i, groups * 8, bw)
+            i = end
+        }
+    }
+    out
+}
+
+fn put_header(mut out: []u8, v: i64) {
+    var rest = u64(v)
+    for rest >= 128 {
+        push(mut out, u8(rest & 0x7F) | 0x80)
+        rest = rest >> 7
+    }
+    push(mut out, u8(rest))
+}
+
+fn take_uvarint(data: []u8, mut p: i64, base: i64) -> u64 ! Error {
+    var v: u64 = 0
+    var shift: u64 = 0
+    for {
+        if p >= data.len {
+            fail Truncated(base + data.len)
+        }
+        let b = data[p]
+        p += 1
+        v = v | (u64(b & 0x7F) << shift)
+        if b & 0x80 == 0 {
+            return v
+        }
+        shift += 7
+        if shift > 63 {
+            fail Invalid(base + p, "a varint is longer than 10 bytes")
+        }
+    }
+}
+
+fn decode_plain(p: Physical, length: i64, data: []u8, count: i64, base: i64) -> Values ! Error {
+    if count < 0 || count > max_page_values {
+        fail TooLarge("page values")
+    }
+    var v = empty_values(p, length)
+    v.count = count
+    match p {
+        Boolean => {
+            if (count + 7) / 8 > data.len {
+                fail Truncated(base + data.len)
+            }
+            for i in 0..count {
+                push(mut v.fixed, (data[i >> 3] >> u8(i & 7)) & 1)
+            }
+            return v
+        }
+        ByteArray => {
+            var at = 0
+            for _ in 0..count {
+                if data.len - at < 4 {
+                    fail Truncated(base + data.len)
+                }
+                let n = io.le32(data, at) & 0xFFFFFFFF
+                at += 4
+                if n > data.len - at {
+                    fail Truncated(base + data.len)
+                }
+                io.append(mut v.data, data[at..at + n])
+                at += n
+                push(mut v.offsets, v.data.len)
+            }
+            return v
+        }
+        _ => {}
+    }
+    let w = fixed_width(p, length)
+    if w <= 0 && count > 0 {
+        fail Invalid(base, "a fixed-length column has no length")
+    }
+    if count > 0 && w > (data.len) / count {
+        fail Truncated(base + data.len)
+    }
+    io.append(mut v.fixed, data[..count * w])
+    v
+}
+
+fn encode_plain(v: Values) -> []u8 {
+    var out: []u8 = []
+    match v.physical {
+        Boolean => {
+            var acc = 0
+            for i in 0..v.count {
+                acc = acc | (i64(v.fixed[i] & 1) << (i & 7))
+                if i & 7 == 7 {
+                    push(mut out, u8(acc))
+                    acc = 0
+                }
+            }
+            if v.count & 7 != 0 {
+                push(mut out, u8(acc))
+            }
+        }
+        ByteArray => {
+            for i in 0..v.count {
+                io.put_le32(mut out, v.offsets[i + 1] - v.offsets[i])
+                io.append(mut out, v.data[v.offsets[i]..v.offsets[i + 1]])
+            }
+        }
+        _ => io.append(mut out, v.fixed)
+    }
+    out
+}
+
+struct Ints {
+    values: []i64
+    used: i64
+}
+
+fn zigzag_of(v: u64) -> i64 {
+    i64(v >> 1) ^ -i64(v & 1)
+}
+
+fn decode_delta(data: []u8, count: i64, base: i64) -> Ints ! Error {
+    if count < 0 || count > max_page_values {
+        fail TooLarge("page values")
+    }
+    var p = 0
+    let block = i64(take_uvarint(data, mut p, base)?)
+    let minis = i64(take_uvarint(data, mut p, base)?)
+    let total = i64(take_uvarint(data, mut p, base)?)
+    let first = zigzag_of(take_uvarint(data, mut p, base)?)
+    if block <= 0 || block % 128 != 0 || minis <= 0 || block % minis != 0 || (block / minis) % 32 != 0 {
+        fail Invalid(base, "a delta block of {block} values in {minis} miniblocks")
+    }
+    if total < count {
+        fail Invalid(base, "a delta header holds {total} values for a page of {count}")
+    }
+    var out: []i64 = []
+    if count == 0 {
+        return Ints { values: out, used: p }
+    }
+    push(mut out, first)
+    let per = block / minis
+    var last = first
+    for out.len < count {
+        let min_delta = zigzag_of(take_uvarint(data, mut p, base)?)
+        if minis > data.len - p {
+            fail Truncated(base + data.len)
+        }
+        let widths = data[p..p + minis]
+        p += minis
+        for m in 0..minis {
+            let remaining = count - out.len
+            if remaining <= 0 {
+                break
+            }
+            let bw = i64(widths[m])
+            if bw > 64 {
+                fail Invalid(base + p, "a miniblock bit width of {bw}")
+            }
+            let take = if remaining < per { remaining } else { per }
+            let deltas = unpack(data, p, bw, per, base)?
+            for k in 0..take {
+                last = last + min_delta + deltas[k]
+                push(mut out, last)
+            }
+            p += (per * bw + 7) / 8
+        }
+    }
+    Ints { values: out, used: p }
+}
+
+fn encode_delta(values: []i64, narrow: bool) -> []u8 {
+    var out: []u8 = []
+    let block = 128
+    let minis = 4
+    let per = 32
+    put_header(mut out, block)
+    put_header(mut out, minis)
+    put_header(mut out, values.len)
+    let first = if values.len > 0 { values[0] } else { 0 }
+    put_header(mut out, i64((u64(first) << 1) ^ u64(first >> 63)))
+    var deltas: []i64 = []
+    for i in 1..values.len {
+        let step = values[i] - values[i - 1]
+        push(mut deltas, if narrow { i64(i32(step)) } else { step })
+    }
+    var at = 0
+    for at < deltas.len {
+        let end = if at + block < deltas.len { at + block } else { deltas.len }
+        var min_delta = deltas[at]
+        for k in at..end {
+            if deltas[k] < min_delta {
+                min_delta = deltas[k]
+            }
+        }
+        put_header(mut out, i64((u64(min_delta) << 1) ^ u64(min_delta >> 63)))
+        var widths: []i64 = []
+        for m in 0..minis {
+            var most: u64 = 0
+            let lo = at + m * per
+            for k in lo..lo + per {
+                if k < end {
+                    let d = u64(deltas[k] - min_delta)
+                    if d > most {
+                        most = d
+                    }
+                }
+            }
+            var w = 0
+            var rest = most
+            for rest > 0 {
+                w += 1
+                rest = rest >> 1
+            }
+            push(mut widths, w)
+        }
+        for w in widths {
+            push(mut out, u8(w))
+        }
+        for m in 0..minis {
+            let lo = at + m * per
+            if lo >= end {
+                break
+            }
+            var adjusted: []i64 = []
+            for k in lo..lo + per {
+                push(mut adjusted, if k < end { deltas[k] - min_delta } else { 0 })
+            }
+            pack(mut out, adjusted, 0, per, widths[m])
+        }
+        at = end
+    }
+    out
+}
+
+fn decode_delta_length(data: []u8, count: i64, base: i64) -> Values ! Error {
+    let lengths = decode_delta(data, count, base)?
+    var v = empty_values(Physical.ByteArray, 0)
+    v.count = count
+    var at = lengths.used
+    for n in lengths.values {
+        if n < 0 || n > data.len - at {
+            fail Truncated(base + data.len)
+        }
+        io.append(mut v.data, data[at..at + n])
+        at += n
+        push(mut v.offsets, v.data.len)
+    }
+    v
+}
+
+fn decode_delta_byte_array(data: []u8, count: i64, base: i64) -> Values ! Error {
+    let prefixes = decode_delta(data, count, base)?
+    let suffixes = decode_delta_length(data[prefixes.used..], count, base + prefixes.used)?
+    var v = empty_values(Physical.ByteArray, 0)
+    v.count = count
+    var previous: []u8 = []
+    for i in 0..count {
+        let n = prefixes.values[i]
+        if n < 0 || n > previous.len {
+            fail Invalid(base, "a delta prefix of {n} bytes")
+        }
+        var value: []u8 = []
+        io.append(mut value, previous[..n])
+        io.append(mut value, suffixes.data[suffixes.offsets[i]..suffixes.offsets[i + 1]])
+        io.append(mut v.data, value)
+        push(mut v.offsets, v.data.len)
+        previous = value
+    }
+    v
+}
+
+fn encode_delta_length(v: Values) -> []u8 {
+    var lengths: []i64 = []
+    for i in 0..v.count {
+        push(mut lengths, v.offsets[i + 1] - v.offsets[i])
+    }
+    var out = encode_delta(lengths, false)
+    io.append(mut out, v.data)
+    out
+}
+
+fn encode_delta_byte_array(v: Values) -> []u8 {
+    var prefixes: []i64 = []
+    var tail = empty_values(Physical.ByteArray, 0)
+    var previous: []u8 = []
+    for i in 0..v.count {
+        let value = v.data[v.offsets[i]..v.offsets[i + 1]]
+        var common = 0
+        for common < previous.len && common < value.len && previous[common] == value[common] {
+            common += 1
+        }
+        push(mut prefixes, common)
+        io.append(mut tail.data, value[common..])
+        push(mut tail.offsets, tail.data.len)
+        tail.count += 1
+        previous = value
+    }
+    var out = encode_delta(prefixes, false)
+    io.append(mut out, encode_delta_length(tail))
+    out
+}
+
+fn decode_split(p: Physical, length: i64, data: []u8, count: i64, base: i64) -> Values ! Error {
+    let w = fixed_width(p, length)
+    if p == Physical.ByteArray || p == Physical.Boolean || w <= 0 {
+        fail Unsupported("BYTE_STREAM_SPLIT for this physical type")
+    }
+    if count < 0 || count > max_page_values {
+        fail TooLarge("page values")
+    }
+    if count > 0 && w > data.len / count {
+        fail Truncated(base + data.len)
+    }
+    var v = empty_values(p, length)
+    v.count = count
+    for i in 0..count {
+        for j in 0..w {
+            push(mut v.fixed, data[j * count + i])
+        }
+    }
+    v
+}
+
+fn encode_split(v: Values) -> []u8 {
+    let w = fixed_width(v.physical, v.length)
+    var out: []u8 = []
+    for j in 0..w {
+        for i in 0..v.count {
+            push(mut out, v.fixed[i * w + j])
+        }
+    }
+    out
+}
+
+fn gather(dict: Values, indices: []i64, base: i64) -> Values ! Error {
+    var v = empty_values(dict.physical, dict.length)
+    v.count = indices.len
+    if dict.physical == Physical.ByteArray {
+        for i in indices {
+            if i < 0 || i >= dict.count {
+                fail Invalid(base, "a dictionary index {i} past {dict.count} entries")
+            }
+            io.append(mut v.data, dict.data[dict.offsets[i]..dict.offsets[i + 1]])
+            push(mut v.offsets, v.data.len)
+        }
+        return v
+    }
+    let w = fixed_width(dict.physical, dict.length)
+    for i in indices {
+        if i < 0 || i >= dict.count {
+            fail Invalid(base, "a dictionary index {i} past {dict.count} entries")
+        }
+        io.append(mut v.fixed, dict.fixed[i * w..(i + 1) * w])
+    }
+    v
+}
+
+fn append_values(mut into: Values, more: Values) {
+    into.count += more.count
+    io.append(mut into.fixed, more.fixed)
+    for k in 1..more.offsets.len {
+        push(mut into.offsets, into.data.len + more.offsets[k] - more.offsets[0])
+    }
+    io.append(mut into.data, more.data)
+}

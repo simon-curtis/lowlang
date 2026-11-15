@@ -1,0 +1,183 @@
+import std/arrow
+import std/io
+import std/slices
+import std/text
+import std/parquet
+
+fn meta_text(m: [str: str]) -> str {
+    if m.len == 0 {
+        return ""
+    }
+    var keys: []str = []
+    for k in m {
+        push(mut keys, k)
+    }
+    slices.sort(mut keys)
+    var parts: []str = []
+    for k in keys {
+        push(mut parts, "{k}={m[k] ?? ""}")
+    }
+    " meta {text.join(parts, ",")}"
+}
+
+fn detail(t: arrow.DataType) -> str {
+    match t {
+        Map(_, sorted) => if sorted { " keys_sorted" } else { "" }
+        _ => ""
+    }
+}
+
+fn field_lines(f: arrow.Field, indent: i64, mut out: []str) {
+    let pad = text.repeat("  ", indent)
+    let required = if f.nullable { "nullable" } else { "required" }
+    push(mut out, "{pad}field {f.name}: {arrow.type_name(f.data_type)}{detail(f.data_type)} {required}{meta_text(f.metadata)}")
+    for child in arrow.children_of(f.data_type) {
+        field_lines(child, indent + 1, mut out)
+    }
+}
+
+fn schema_lines(s: arrow.Schema) -> []str {
+    var out: []str = ["schema{meta_text(s.metadata)}"]
+    for f in s.fields {
+        field_lines(f, 1, mut out)
+    }
+    out
+}
+
+fn batch_lines(b: arrow.Batch) -> []str {
+    var out: []str = ["batch rows {b.length}"]
+    for k, c in b.columns {
+        push(mut out, "  {b.schema.fields[k].name} {arrow.type_name(c.data_type)} {arrow.diagnostic(c)}")
+    }
+    out
+}
+
+fn codec_name(c: parquet.Codec) -> str {
+    match c {
+        Uncompressed => "uncompressed"
+        Snappy => "snappy"
+        Gzip => "gzip"
+        Lzo => "lzo"
+        Brotli => "brotli"
+        Lz4 => "lz4"
+        Zstd => "zstd"
+        Lz4Raw => "lz4_raw"
+    }
+}
+
+fn encoding_name(e: parquet.Encoding) -> str {
+    match e {
+        Plain => "PLAIN"
+        PlainDictionary => "PLAIN_DICTIONARY"
+        Rle => "RLE"
+        BitPacked => "BIT_PACKED"
+        DeltaBinaryPacked => "DELTA_BINARY_PACKED"
+        DeltaLengthByteArray => "DELTA_LENGTH_BYTE_ARRAY"
+        DeltaByteArray => "DELTA_BYTE_ARRAY"
+        RleDictionary => "RLE_DICTIONARY"
+        ByteStreamSplit => "BYTE_STREAM_SPLIT"
+    }
+}
+
+fn float_text(x: f64) -> str {
+    let bits = text.float_bits(x)
+    var raw: []u8 = []
+    for i in 0..8 {
+        push(mut raw, u8((bits >> u64(56 - 8 * i)) & 255))
+    }
+    "f{text.encode_hex(raw)}"
+}
+
+fn stat_plain(node: parquet.Node) -> bool {
+    match node.logical {
+        None => true
+        String => true
+        Int(_, _) => true
+        _ => false
+    }
+}
+
+fn unsigned_of(node: parquet.Node) -> bool {
+    match node.logical {
+        Int(_, signed) => !signed
+        _ => false
+    }
+}
+
+fn stat_text(node: parquet.Node, raw: []u8) -> str {
+    if !stat_plain(node) {
+        return "-"
+    }
+    match node.physical {
+        Boolean => if raw[0] != 0 { "true" } else { "false" }
+        Int32 => {
+            let v = io.le32(raw, 0)
+            if unsigned_of(node) || v < 2147483648 {
+                return "{v}"
+            }
+            "{v - 4294967296}"
+        }
+        Int64 => {
+            let v = io.le64(raw, 0)
+            if unsigned_of(node) {
+                return "{u64(v)}"
+            }
+            "{v}"
+        }
+        Float => float_text(f64(text.float32_from_bits(u32(io.le32(raw, 0)))))
+        Double => float_text(text.float_from_bits(u64(io.le64(raw, 0))))
+        ByteArray => match node.logical {
+            String => "\"{str(raw)}\""
+            _ => "x\"{text.encode_hex(raw)}\""
+        }
+        FixedLenByteArray => "x\"{text.encode_hex(raw)}\""
+        _ => "-"
+    }
+}
+
+fn chunk_line(c: parquet.ColumnChunk, col: parquet.Column, stats: bool) -> str {
+    var names: []str = []
+    for e in c.encodings {
+        push(mut names, encoding_name(e))
+    }
+    slices.sort(mut names)
+    let path = text.join(c.path, ".")
+    let head = "  chunk {path} {codec_name(c.codec)} [{text.join(names, ",")}] values {c.num_values}"
+    if !stats {
+        return head
+    }
+    let s = c.statistics
+    if s.null_count < 0 && !s.has_range {
+        return "{head} stats none"
+    }
+    if s.has_range {
+        return "{head} nulls {s.null_count} min {stat_text(col.node, s.min)} max {stat_text(col.node, s.max)}"
+    }
+    "{head} nulls {s.null_count} range none"
+}
+
+fn dump(name: str, data: []u8, stats: bool) -> []str ! parquet.Error {
+    let f = parquet.open_bytes(data, parquet.ReaderOptions {})?
+    let md = parquet.metadata(f)
+    var out: []str = ["file {name}"]
+    for line in schema_lines(parquet.arrow_schema(f)) {
+        push(mut out, line)
+    }
+    push(mut out, "rows {md.num_rows} groups {md.row_groups.len} created {md.created_by}")
+    var batches: []arrow.Batch = []
+    for g, rg in md.row_groups {
+        push(mut out, "group {g} rows {rg.num_rows}")
+        for c, chunk in rg.columns {
+            push(mut out, chunk_line(chunk, parquet.columns(f)[c], stats))
+        }
+        let b = parquet.read_row_group(f, g, [])?
+        push(mut batches, b)
+    }
+    push(mut out, "batches {batches.len}")
+    for b in batches {
+        for line in batch_lines(b) {
+            push(mut out, line)
+        }
+    }
+    out
+}
