@@ -1,0 +1,276 @@
+import std/crypto/zk/pairing
+
+struct Section {
+    kind: i64
+    start: i64
+    end: i64
+}
+
+fn read_u32(data: []u8, at: i64) -> i64 ! Error {
+    if at < 0 || at + 4 > data.len {
+        fail Truncated
+    }
+    var out = 0
+    for k in 0..4 {
+        out |= i64(data[at + k]) << (8 * k)
+    }
+    out
+}
+
+fn read_u64(data: []u8, at: i64) -> i64 ! Error {
+    if at < 0 || at + 8 > data.len {
+        fail Truncated
+    }
+    var out: u64 = 0
+    for k in 0..8 {
+        out |= u64(data[at + k]) << u64(8 * k)
+    }
+    if out > 0x7fffffffffffffff {
+        fail Unsupported
+    }
+    i64(out)
+}
+
+fn push_u32(mut out: []u8, value: i64) {
+    for k in 0..4 {
+        push(mut out, u8((value >> (8 * k)) & 255))
+    }
+}
+
+fn push_u64(mut out: []u8, value: i64) {
+    for k in 0..8 {
+        push(mut out, u8((value >> (8 * k)) & 255))
+    }
+}
+
+fn sections(data: []u8, magic: str, version: i64) -> []Section ! Error {
+    if data.len < 12 {
+        fail Truncated
+    }
+    let expected = bytes(magic)
+    for k in 0..4 {
+        if data[k] != expected[k] {
+            fail Magic
+        }
+    }
+    if read_u32(data, 4)? != version {
+        fail Unsupported
+    }
+    let count = read_u32(data, 8)?
+    var out: []Section = []
+    var at = 12
+    for _ in 0..count {
+        let kind = read_u32(data, at)?
+        let size = read_u64(data, at + 4)?
+        let start = at + 12
+        if size > data.len - start {
+            fail Truncated
+        }
+        push(mut out, Section { kind, start, end: start + size })
+        at = start + size
+    }
+    if at != data.len {
+        fail Truncated
+    }
+    out
+}
+
+fn find(list: []Section, kind: i64) -> Section ! Error {
+    for s in list {
+        if s.kind == kind {
+            return s
+        }
+    }
+    fail Malformed
+}
+
+fn field_element(c: *pairing.Curve, data: []u8, at: i64, size: i64) -> []u64 ! Error {
+    var big_endian: []u8 = []
+    var k = size - 1
+    for k >= 0 {
+        push(mut big_endian, data[at + k])
+        k -= 1
+    }
+    pairing.fr_from_bytes(c, big_endian) catch Point
+}
+
+fn check_prime(c: *pairing.Curve, data: []u8, at: i64, size: i64) ! Error {
+    let want = pairing.fr_modulus_bytes(c)
+    if size != want.len {
+        fail Prime
+    }
+    var k = 0
+    for k < size {
+        if data[at + k] != want[size - 1 - k] {
+            fail Prime
+        }
+        k += 1
+    }
+}
+
+fn linear_combination(c: *pairing.Curve, data: []u8, mut at: i64, size: i64, wires: i64) -> []Term ! Error {
+    let count = read_u32(data, at)?
+    at += 4
+    var out: []Term = []
+    for _ in 0..count {
+        let index = read_u32(data, at)?
+        if index >= wires {
+            fail Malformed
+        }
+        at += 4
+        if at + size > data.len {
+            fail Truncated
+        }
+        let coeff = field_element(c, data, at, size)?
+        at += size
+        push(mut out, Term { wire: index, coeff })
+    }
+    out
+}
+
+/// Returns the constraint system of the circom `.r1cs` file `data` (the iden3 binary format, version 1) for the curve `c`.
+///
+/// The file's prime must be the scalar field of `c`; a coefficient not below it fails with `Point(NotCanonical)`. Custom gate sections are not read: a file that declares custom gates fails with `Unsupported`. The wire order is circom's: the constant, the public outputs, the public inputs, the private inputs and the intermediate signals, so `public` is the number of outputs and public inputs.
+pub fn r1cs_from_bytes(c: *pairing.Curve, data: []u8) -> *R1cs ! Error {
+    let list = sections(data, "r1cs", 1)?
+    for s in list {
+        if s.kind == 4 || s.kind == 5 {
+            fail Unsupported
+        }
+    }
+    let header = find(list, 1)?
+    let constraints = find(list, 2)?
+    let size = read_u32(data, header.start)?
+    check_prime(c, data, header.start + 4, size)?
+    let base = header.start + 4 + size
+    let wires = read_u32(data, base)?
+    let outputs = read_u32(data, base + 4)?
+    let inputs = read_u32(data, base + 8)?
+    let count = read_u32(data, base + 24)?
+    if outputs + inputs + 1 > wires {
+        fail Malformed
+    }
+    let out = r1cs(c, outputs + inputs)
+    out.wires = wires
+    var at = constraints.start
+    for _ in 0..count {
+        let a = linear_combination(c, data, mut at, size, wires)?
+        let b = linear_combination(c, data, mut at, size, wires)?
+        let z = linear_combination(c, data, mut at, size, wires)?
+        enforce(out, a, b, z)
+    }
+    if at != constraints.end {
+        fail Truncated
+    }
+    out
+}
+
+/// Returns the witness of the circom `.wtns` file `data` (the iden3 binary format, version 2) for the curve `c`: the value of every wire, starting with the constant 1.
+///
+/// The file's prime must be the scalar field of `c`.
+pub fn witness_from_bytes(c: *pairing.Curve, data: []u8) -> [][]u64 ! Error {
+    let list = sections(data, "wtns", 2)?
+    let header = find(list, 1)?
+    let values = find(list, 2)?
+    let size = read_u32(data, header.start)?
+    check_prime(c, data, header.start + 4, size)?
+    let count = read_u32(data, header.start + 4 + size)?
+    if values.end - values.start != count * size {
+        fail Truncated
+    }
+    var out: [][]u64 = []
+    for k in 0..count {
+        push(mut out, field_element(c, data, values.start + k * size, size)?)
+    }
+    out
+}
+
+fn little_endian(data: []u8) -> []u8 {
+    var out: []u8 = []
+    var k = data.len - 1
+    for k >= 0 {
+        push(mut out, data[k])
+        k -= 1
+    }
+    out
+}
+
+fn append_linear_combination(c: *pairing.Curve, mut out: []u8, x: []Term) {
+    push_u32(mut out, x.len)
+    for t in x {
+        push_u32(mut out, t.wire)
+        for b in little_endian(pairing.fr_bytes(c, t.coeff)) {
+            push(mut out, b)
+        }
+    }
+}
+
+fn append_header(mut out: []u8, magic: str, version: i64, sections: i64) {
+    for b in bytes(magic) {
+        push(mut out, b)
+    }
+    push_u32(mut out, version)
+    push_u32(mut out, sections)
+}
+
+/// Returns the circom `.r1cs` file of `r`, with the sections for the header and the constraints and no wire map.
+pub fn r1cs_to_bytes(r: *R1cs) -> []u8 {
+    let c = r.curve
+    let prime = little_endian(pairing.fr_modulus_bytes(c))
+    var header: []u8 = []
+    push_u32(mut header, prime.len)
+    for b in prime {
+        push(mut header, b)
+    }
+    push_u32(mut header, r.wires)
+    push_u32(mut header, 0)
+    push_u32(mut header, r.public)
+    push_u32(mut header, r.wires - 1 - r.public)
+    push_u64(mut header, r.wires)
+    push_u32(mut header, r.constraints.len)
+    var body: []u8 = []
+    for k in r.constraints {
+        append_linear_combination(c, mut body, k.a)
+        append_linear_combination(c, mut body, k.b)
+        append_linear_combination(c, mut body, k.c)
+    }
+    var out: []u8 = []
+    append_header(mut out, "r1cs", 1, 2)
+    push_u32(mut out, 1)
+    push_u64(mut out, header.len)
+    for b in header {
+        push(mut out, b)
+    }
+    push_u32(mut out, 2)
+    push_u64(mut out, body.len)
+    for b in body {
+        push(mut out, b)
+    }
+    out
+}
+
+/// Returns the circom `.wtns` file of `witness`.
+pub fn witness_to_bytes(c: *pairing.Curve, witness: [][]u64) -> []u8 {
+    let prime = little_endian(pairing.fr_modulus_bytes(c))
+    var header: []u8 = []
+    push_u32(mut header, prime.len)
+    for b in prime {
+        push(mut header, b)
+    }
+    push_u32(mut header, witness.len)
+    var out: []u8 = []
+    append_header(mut out, "wtns", 2, 2)
+    push_u32(mut out, 1)
+    push_u64(mut out, header.len)
+    for b in header {
+        push(mut out, b)
+    }
+    push_u32(mut out, 2)
+    push_u64(mut out, witness.len * prime.len)
+    for w in witness {
+        for b in little_endian(pairing.fr_bytes(c, w)) {
+            push(mut out, b)
+        }
+    }
+    out
+}

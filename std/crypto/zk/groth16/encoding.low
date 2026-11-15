@@ -1,0 +1,358 @@
+import std/big
+import std/crypto/zk/pairing
+import std/json
+
+fn curve_name(c: *pairing.Curve) -> str {
+    match c.kind {
+        Bn254 => "bn128"
+        Bls12381 => "bls12381"
+    }
+}
+
+fn decimal(data: []u8) -> str {
+    big.to_str(big.from_bytes(data), 10)
+}
+
+fn from_decimal(text: str, size: i64) -> []u8 ! Error {
+    let n = big.parse(text, 10) catch { _ => fail Malformed }
+    if big.is_negative(n) {
+        fail Malformed
+    }
+    big.to_bytes_sized(n, size) catch { _ => fail Malformed }
+}
+
+fn string_at(v: json.Value, index: i64) -> str ! Error {
+    let item = json.at(v, index) ?? fail Malformed
+    match item {
+        Str(s) => s
+        _ => fail Malformed
+    }
+}
+
+fn member(v: json.Value, name: str) -> json.Value ! Error {
+    json.get(v, name) ?? fail Malformed
+}
+
+fn write_strings(w: *json.Writer, items: []str) {
+    json.start_array(w)
+    for item in items {
+        json.string_value(w, item)
+    }
+    json.end_array(w)
+}
+
+fn g1_strings(g: *pairing.Group, p: pairing.Point) -> []str {
+    if pairing.is_identity(p) {
+        return ["0", "1", "0"]
+    }
+    let data = pairing.encode_evm(g, p)
+    let w = data.len / 2
+    [decimal(data[..w]), decimal(data[w..]), "1"]
+}
+
+fn write_g1(w: *json.Writer, g: *pairing.Group, p: pairing.Point) {
+    write_strings(w, g1_strings(g, p))
+}
+
+fn imaginary_first(c: *pairing.Curve) -> bool {
+    match c.kind {
+        Bn254 => true
+        Bls12381 => false
+    }
+}
+
+fn write_g2(w: *json.Writer, g: *pairing.Group, p: pairing.Point) {
+    json.start_array(w)
+    if pairing.is_identity(p) {
+        write_strings(w, ["0", "0"])
+        write_strings(w, ["1", "0"])
+        write_strings(w, ["0", "0"])
+    } else {
+        let data = pairing.encode_evm(g, p)
+        let q = data.len / 4
+        let first = decimal(data[..q])
+        let second = decimal(data[q..2 * q])
+        let third = decimal(data[2 * q..3 * q])
+        let fourth = decimal(data[3 * q..])
+        if imaginary_first(g.curve) {
+            write_strings(w, [second, first])
+            write_strings(w, [fourth, third])
+        } else {
+            write_strings(w, [first, second])
+            write_strings(w, [third, fourth])
+        }
+        write_strings(w, ["1", "0"])
+    }
+    json.end_array(w)
+}
+
+fn read_g1(g: *pairing.Group, v: json.Value) -> pairing.Point ! Error {
+    let x = string_at(v, 0)?
+    let y = string_at(v, 1)?
+    let z = string_at(v, 2)?
+    if z == "0" {
+        if x != "0" || y != "1" {
+            fail Malformed
+        }
+        return pairing.identity(g)
+    }
+    if z != "1" {
+        fail Malformed
+    }
+    let size = pairing.evm_size(g) / 2
+    var data = from_decimal(x, size)?
+    for b in from_decimal(y, size)? {
+        push(mut data, b)
+    }
+    pairing.decode_evm(g, data) catch Point
+}
+
+fn read_g2(g: *pairing.Group, v: json.Value) -> pairing.Point ! Error {
+    let xv = json.at(v, 0) ?? fail Malformed
+    let yv = json.at(v, 1) ?? fail Malformed
+    let zv = json.at(v, 2) ?? fail Malformed
+    let z0 = string_at(zv, 0)?
+    let z1 = string_at(zv, 1)?
+    let x0 = string_at(xv, 0)?
+    let x1 = string_at(xv, 1)?
+    let y0 = string_at(yv, 0)?
+    let y1 = string_at(yv, 1)?
+    if z0 == "0" && z1 == "0" {
+        if x0 != "0" || x1 != "0" || y0 != "1" || y1 != "0" {
+            fail Malformed
+        }
+        return pairing.identity(g)
+    }
+    if z0 != "1" || z1 != "0" {
+        fail Malformed
+    }
+    let size = pairing.evm_size(g) / 4
+    var data: []u8 = []
+    let order = if imaginary_first(g.curve) { [x1, x0, y1, y0] } else { [x0, x1, y0, y1] }
+    for text in order {
+        for b in from_decimal(text, size)? {
+            push(mut data, b)
+        }
+    }
+    pairing.decode_evm(g, data) catch Point
+}
+
+fn read_json(text: str) -> json.Value ! Error {
+    json.parse(bytes(text)) catch { _ => fail Malformed }
+}
+
+fn check_header(c: *pairing.Curve, v: json.Value) ! Error {
+    let protocol = member(v, "protocol")?
+    let curve = member(v, "curve")?
+    match protocol {
+        Str(p) => {
+            if p != "groth16" {
+                fail Unsupported
+            }
+        }
+        _ => fail Malformed
+    }
+    match curve {
+        Str(name) => {
+            if name != curve_name(c) {
+                fail Prime
+            }
+        }
+        _ => fail Malformed
+    }
+}
+
+/// Returns the snarkjs JSON of `proof`: `pi_a`, `pi_b` and `pi_c` as decimal strings in projective form with `z = 1`, the `Fq2` coordinates of `pi_b` real part first, `protocol` `"groth16"` and `curve` `"bn128"` or `"bls12381"`.
+pub fn proof_to_json(c: *pairing.Curve, proof: Proof) -> str {
+    let g1 = pairing.g1(c)
+    let g2 = pairing.g2(c)
+    let w = json.writer(2)
+    json.start_object(w)
+    json.property(w, "pi_a")
+    write_g1(w, g1, proof.a)
+    json.property(w, "pi_b")
+    write_g2(w, g2, proof.b)
+    json.property(w, "pi_c")
+    write_g1(w, g1, proof.c)
+    json.property(w, "protocol")
+    json.string_value(w, "groth16")
+    json.property(w, "curve")
+    json.string_value(w, curve_name(c))
+    json.end_object(w)
+    json.written_text(w)
+}
+
+/// Returns the proof of the snarkjs JSON `text` for the curve `c`.
+///
+/// The points are checked to be on the curve and in the subgroup (`Point`), the protocol must be `"groth16"` (`Unsupported`) and the curve name must be that of `c` (`Prime`); a missing or mistyped member is `Malformed`.
+pub fn proof_from_json(c: *pairing.Curve, text: str) -> Proof ! Error {
+    let v = read_json(text)?
+    check_header(c, v)?
+    let g1 = pairing.g1(c)
+    let g2 = pairing.g2(c)
+    let a = read_g1(g1, member(v, "pi_a")?)?
+    let b = read_g2(g2, member(v, "pi_b")?)?
+    let z = read_g1(g1, member(v, "pi_c")?)?
+    Proof { a, b, c: z }
+}
+
+/// Returns the snarkjs JSON of the verifying key `key`, with `protocol`, `curve`, `nPublic`, `vk_alpha_1`, `vk_beta_2`, `vk_gamma_2`, `vk_delta_2` and `IC`. The `vk_alphabeta_12` member snarkjs adds is not written.
+pub fn verifying_key_to_json(key: VerifyingKey) -> str {
+    let c = key.curve
+    let g1 = pairing.g1(c)
+    let g2 = pairing.g2(c)
+    let w = json.writer(2)
+    json.start_object(w)
+    json.property(w, "protocol")
+    json.string_value(w, "groth16")
+    json.property(w, "curve")
+    json.string_value(w, curve_name(c))
+    json.property(w, "nPublic")
+    json.integer(w, key.ic.len - 1)
+    json.property(w, "vk_alpha_1")
+    write_g1(w, g1, key.alpha1)
+    json.property(w, "vk_beta_2")
+    write_g2(w, g2, key.beta2)
+    json.property(w, "vk_gamma_2")
+    write_g2(w, g2, key.gamma2)
+    json.property(w, "vk_delta_2")
+    write_g2(w, g2, key.delta2)
+    json.property(w, "IC")
+    json.start_array(w)
+    for p in key.ic {
+        write_g1(w, g1, p)
+    }
+    json.end_array(w)
+    json.end_object(w)
+    json.written_text(w)
+}
+
+/// Returns the verifying key of the snarkjs JSON `text` for the curve `c`, with the same checks as `proof_from_json`. `nPublic` must agree with the length of `IC`; `vk_alphabeta_12` is ignored.
+pub fn verifying_key_from_json(c: *pairing.Curve, text: str) -> VerifyingKey ! Error {
+    let v = read_json(text)?
+    check_header(c, v)?
+    let g1 = pairing.g1(c)
+    let g2 = pairing.g2(c)
+    let alpha1 = read_g1(g1, member(v, "vk_alpha_1")?)?
+    let beta2 = read_g2(g2, member(v, "vk_beta_2")?)?
+    let gamma2 = read_g2(g2, member(v, "vk_gamma_2")?)?
+    let delta2 = read_g2(g2, member(v, "vk_delta_2")?)?
+    var ic: []pairing.Point = []
+    let list = member(v, "IC")?
+    var index = 0
+    for {
+        let item = json.at(list, index) ?? break
+        push(mut ic, read_g1(g1, item)?)
+        index += 1
+    }
+    let declared = member(v, "nPublic")?
+    match declared {
+        Int(n) => {
+            if n + 1 != ic.len {
+                fail Malformed
+            }
+        }
+        _ => fail Malformed
+    }
+    VerifyingKey { curve: c, alpha1, beta2, gamma2, delta2, ic }
+}
+
+/// Returns the snarkjs JSON of the public inputs: an array of decimal strings.
+pub fn public_to_json(c: *pairing.Curve, public: [][]u64) -> str {
+    let w = json.writer(2)
+    json.start_array(w)
+    for value in public {
+        json.string_value(w, decimal(pairing.fr_bytes(c, value)))
+    }
+    json.end_array(w)
+    json.written_text(w)
+}
+
+/// Returns the public inputs of the snarkjs JSON array `text`. Each is a decimal string below `r`, else `Point(NotCanonical)`.
+pub fn public_from_json(c: *pairing.Curve, text: str) -> [][]u64 ! Error {
+    let v = read_json(text)?
+    var out: [][]u64 = []
+    var index = 0
+    for {
+        let item = json.at(v, index) ?? break
+        let digits = match item {
+            Str(s) => s
+            _ => fail Malformed
+        }
+        let data = from_decimal(digits, 32)?
+        push(mut out, pairing.fr_from_bytes(c, data) catch Point)
+        index += 1
+    }
+    out
+}
+
+/// Returns the proof as the Ethereum encodings of `A`, `B` and `C` one after another, `evm_size` bytes each: the layout the pairing precompile reads, and the calldata of a Solidity verifier with `B` imaginary part first.
+pub fn proof_to_bytes(c: *pairing.Curve, proof: Proof) -> []u8 {
+    let g1 = pairing.g1(c)
+    let g2 = pairing.g2(c)
+    var out = pairing.encode_evm(g1, proof.a)
+    for b in pairing.encode_evm(g2, proof.b) {
+        push(mut out, b)
+    }
+    for b in pairing.encode_evm(g1, proof.c) {
+        push(mut out, b)
+    }
+    out
+}
+
+/// Returns the proof of `data`, which must be exactly the three encodings of `proof_to_bytes`, with every point checked by `decode_evm`.
+pub fn proof_from_bytes(c: *pairing.Curve, data: []u8) -> Proof ! Error {
+    let g1 = pairing.g1(c)
+    let g2 = pairing.g2(c)
+    let one = pairing.evm_size(g1)
+    let two = pairing.evm_size(g2)
+    if data.len != 2 * one + two {
+        fail Truncated
+    }
+    let a = pairing.decode_evm(g1, data[..one]) catch Point
+    let b = pairing.decode_evm(g2, data[one..one + two]) catch Point
+    let z = pairing.decode_evm(g1, data[one + two..]) catch Point
+    Proof { a, b, c: z }
+}
+
+/// Returns the verifying key as the Ethereum encodings of `alpha`, `beta`, `gamma`, `delta` and then every element of `ic`.
+pub fn verifying_key_to_bytes(key: VerifyingKey) -> []u8 {
+    let c = key.curve
+    let g1 = pairing.g1(c)
+    let g2 = pairing.g2(c)
+    var out = pairing.encode_evm(g1, key.alpha1)
+    for p in [key.beta2, key.gamma2, key.delta2] {
+        for b in pairing.encode_evm(g2, p) {
+            push(mut out, b)
+        }
+    }
+    for p in key.ic {
+        for b in pairing.encode_evm(g1, p) {
+            push(mut out, b)
+        }
+    }
+    out
+}
+
+/// Returns the verifying key of `data`, which must be the encoding of `verifying_key_to_bytes` with at least one `ic` element, every point checked by `decode_evm`.
+pub fn verifying_key_from_bytes(c: *pairing.Curve, data: []u8) -> VerifyingKey ! Error {
+    let g1 = pairing.g1(c)
+    let g2 = pairing.g2(c)
+    let one = pairing.evm_size(g1)
+    let two = pairing.evm_size(g2)
+    let fixed = one + 3 * two
+    if data.len < fixed + one || (data.len - fixed) % one != 0 {
+        fail Truncated
+    }
+    let alpha1 = pairing.decode_evm(g1, data[..one]) catch Point
+    let beta2 = pairing.decode_evm(g2, data[one..one + two]) catch Point
+    let gamma2 = pairing.decode_evm(g2, data[one + two..one + 2 * two]) catch Point
+    let delta2 = pairing.decode_evm(g2, data[one + 2 * two..fixed]) catch Point
+    var ic: []pairing.Point = []
+    var at = fixed
+    for at < data.len {
+        push(mut ic, pairing.decode_evm(g1, data[at..at + one]) catch Point)
+        at += one
+    }
+    VerifyingKey { curve: c, alpha1, beta2, gamma2, delta2, ic }
+}

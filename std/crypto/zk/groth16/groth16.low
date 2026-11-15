@@ -1,0 +1,354 @@
+import std/crypto/zk/pairing
+
+/// The proving key of a circuit: the setup's group elements for the prover.
+pub struct ProvingKey {
+    /// The curve the key is for.
+    pub curve: *pairing.Curve
+    /// The number of public wires.
+    pub public: i64
+    /// The size of the evaluation domain, a power of two above the number of constraints plus the public wires.
+    pub size: i64
+    /// `alpha * G1`.
+    pub alpha1: pairing.Point
+    /// `beta * G1`.
+    pub beta1: pairing.Point
+    /// `delta * G1`.
+    pub delta1: pairing.Point
+    /// `beta * G2`.
+    pub beta2: pairing.Point
+    /// `delta * G2`.
+    pub delta2: pairing.Point
+    /// `A_i(tau) * G1` for every wire.
+    pub a: []pairing.Point
+    /// `B_i(tau) * G1` for every wire.
+    pub b1: []pairing.Point
+    /// `B_i(tau) * G2` for every wire.
+    pub b2: []pairing.Point
+    /// `(beta A_i(tau) + alpha B_i(tau) + C_i(tau)) / delta * G1` for every private wire.
+    pub k: []pairing.Point
+    /// `tau^i Z(tau) / delta * G1` for `i` below the domain size minus one.
+    pub h: []pairing.Point
+}
+
+/// The verifying key of a circuit.
+pub struct VerifyingKey {
+    /// The curve the key is for.
+    pub curve: *pairing.Curve
+    /// `alpha * G1`.
+    pub alpha1: pairing.Point
+    /// `beta * G2`.
+    pub beta2: pairing.Point
+    /// `gamma * G2`.
+    pub gamma2: pairing.Point
+    /// `delta * G2`.
+    pub delta2: pairing.Point
+    /// `(beta A_i(tau) + alpha B_i(tau) + C_i(tau)) / gamma * G1` for the constant wire and every public wire, in order.
+    pub ic: []pairing.Point
+}
+
+/// The two keys a setup produces.
+pub struct Keys {
+    /// The key for `prove`.
+    pub proving: ProvingKey
+    /// The key for `verify`.
+    pub verifying: VerifyingKey
+}
+
+/// A proof: `a` and `c` in `G1` and `b` in `G2`.
+pub struct Proof {
+    /// The element `A`.
+    pub a: pairing.Point
+    /// The element `B`.
+    pub b: pairing.Point
+    /// The element `C`.
+    pub c: pairing.Point
+}
+
+/// The secret values of a setup. Anyone who knows them can forge proofs for the circuit.
+pub struct Toxic {
+    /// The evaluation point `tau`, not a root of unity of the domain.
+    pub tau: []u64
+    /// The value `alpha`, not zero.
+    pub alpha: []u64
+    /// The value `beta`, not zero.
+    pub beta: []u64
+    /// The value `gamma`, not zero.
+    pub gamma: []u64
+    /// The value `delta`, not zero.
+    pub delta: []u64
+}
+
+fn bits_of(size: i64) -> i64 {
+    var log = 0
+    for (i64(1) << log) < size {
+        log += 1
+    }
+    log
+}
+
+fn domain_for(r: *R1cs) -> pairing.Domain ! Error {
+    let rows = r.constraints.len + r.public + 1
+    let size = i64(1) << bits_of(rows)
+    pairing.domain(r.curve, size) catch { _ => fail Size }
+}
+
+fn scalar_bytes(c: *pairing.Curve, a: []u64) -> []u8 {
+    pairing.fr_bytes(c, a)
+}
+
+fn multiple(g: *pairing.Group, a: []u64) -> pairing.Point {
+    pairing.scalar_mul(g, g.generator, scalar_bytes(g.curve, a))
+}
+
+fn nonzero_random(c: *pairing.Curve) -> []u64 {
+    var a = pairing.fr_random(c)
+    for pairing.fr_is_zero(a) {
+        a = pairing.fr_random(c)
+    }
+    a
+}
+
+/// Returns random values for `setup_with`.
+pub fn toxic_random(c: *pairing.Curve) -> Toxic {
+    Toxic { tau: nonzero_random(c), alpha: nonzero_random(c), beta: nonzero_random(c), gamma: nonzero_random(c), delta: nonzero_random(c) }
+}
+
+fn lagrange_at(c: *pairing.Curve, d: pairing.Domain, tau: []u64) -> [][]u64 ! Error {
+    let size = u64(d.size)
+    let vanishing = pairing.fr_sub(c, pairing.fr_pow(c, tau, [size]), pairing.fr_one(c))
+    if pairing.fr_is_zero(vanishing) {
+        fail Malformed
+    }
+    let common = pairing.fr_mul(c, vanishing, d.size_inverse)
+    var out: [][]u64 = []
+    var point = pairing.fr_one(c)
+    for _ in 0..d.size {
+        let gap = pairing.fr_sub(c, tau, point)
+        let weight = pairing.fr_mul(c, point, common)
+        push(mut out, pairing.fr_mul(c, weight, pairing.fr_inv(c, gap)))
+        point = pairing.fr_mul(c, point, d.omega)
+    }
+    out
+}
+
+struct Evaluations {
+    a: [][]u64
+    b: [][]u64
+    c: [][]u64
+}
+
+fn zeros(c: *pairing.Curve, count: i64) -> [][]u64 {
+    var out: [][]u64 = []
+    for _ in 0..count {
+        push(mut out, pairing.fr_zero(c))
+    }
+    out
+}
+
+fn accumulate(c: *pairing.Curve, into: [][]u64, x: []Term, weight: []u64) {
+    for t in x {
+        into[t.wire] = pairing.fr_add(c, into[t.wire], pairing.fr_mul(c, t.coeff, weight))
+    }
+}
+
+fn evaluations_at(r: *R1cs, lagrange: [][]u64) -> Evaluations {
+    let c = r.curve
+    let a = zeros(c, r.wires)
+    let b = zeros(c, r.wires)
+    let z = zeros(c, r.wires)
+    for j in 0..r.constraints.len {
+        let k = r.constraints[j]
+        accumulate(c, a, k.a, lagrange[j])
+        accumulate(c, b, k.b, lagrange[j])
+        accumulate(c, z, k.c, lagrange[j])
+    }
+    for i in 0..r.public + 1 {
+        let row = r.constraints.len + i
+        a[i] = pairing.fr_add(c, a[i], lagrange[row])
+    }
+    Evaluations { a, b, c: z }
+}
+
+/// Returns the proving and verifying keys of `r` for the secret values `toxic`.
+///
+/// Each key element is a multiple of a generator by a function of the secrets, computed with the constant-time `scalar_mul`. The secrets are the trapdoor of every proof of the circuit, and a single party that holds them can forge proofs, so a setup by one party is for tests and development only. Fails with `Size` when the circuit needs a larger domain than `Fr` has roots of unity for, and with `Malformed` when `tau` lies in the domain.
+pub fn setup_with(r: *R1cs, toxic: Toxic) -> Keys ! Error {
+    let c = r.curve
+    let d = domain_for(r)?
+    let g1 = pairing.g1(c)
+    let g2 = pairing.g2(c)
+    let lagrange = lagrange_at(c, d, toxic.tau)?
+    let e = evaluations_at(r, lagrange)
+    let gamma_inverse = pairing.fr_inv(c, toxic.gamma)
+    let delta_inverse = pairing.fr_inv(c, toxic.delta)
+    var a: []pairing.Point = []
+    var b1: []pairing.Point = []
+    var b2: []pairing.Point = []
+    var ic: []pairing.Point = []
+    var k: []pairing.Point = []
+    for i in 0..r.wires {
+        push(mut a, multiple(g1, e.a[i]))
+        push(mut b1, multiple(g1, e.b[i]))
+        push(mut b2, multiple(g2, e.b[i]))
+        let beta_a = pairing.fr_mul(c, toxic.beta, e.a[i])
+        let alpha_b = pairing.fr_mul(c, toxic.alpha, e.b[i])
+        let combined = pairing.fr_add(c, pairing.fr_add(c, beta_a, alpha_b), e.c[i])
+        if i <= r.public {
+            push(mut ic, multiple(g1, pairing.fr_mul(c, combined, gamma_inverse)))
+        } else {
+            push(mut k, multiple(g1, pairing.fr_mul(c, combined, delta_inverse)))
+        }
+    }
+    let vanishing = pairing.fr_sub(c, pairing.fr_pow(c, toxic.tau, [u64(d.size)]), pairing.fr_one(c))
+    var h: []pairing.Point = []
+    var power = pairing.fr_mul(c, vanishing, delta_inverse)
+    for _ in 0..d.size - 1 {
+        push(mut h, multiple(g1, power))
+        power = pairing.fr_mul(c, power, toxic.tau)
+    }
+    let proving = ProvingKey {
+        curve: c
+        public: r.public
+        size: d.size
+        alpha1: multiple(g1, toxic.alpha)
+        beta1: multiple(g1, toxic.beta)
+        delta1: multiple(g1, toxic.delta)
+        beta2: multiple(g2, toxic.beta)
+        delta2: multiple(g2, toxic.delta)
+        a
+        b1
+        b2
+        k
+        h
+    }
+    let verifying = VerifyingKey {
+        curve: c
+        alpha1: proving.alpha1
+        beta2: proving.beta2
+        gamma2: multiple(g2, toxic.gamma)
+        delta2: proving.delta2
+        ic
+    }
+    Keys { proving, verifying }
+}
+
+/// Returns the keys of `r` for fresh random secrets, with the same single-party caveat as `setup_with`.
+pub fn setup(r: *R1cs) -> Keys ! Error {
+    setup_with(r, toxic_random(r.curve))
+}
+
+fn rows_of(r: *R1cs, witness: [][]u64, pick: fn(Constraint) -> []Term, size: i64, public_rows: bool) -> [][]u64 {
+    let c = r.curve
+    var out = zeros(c, size)
+    for j in 0..r.constraints.len {
+        out[j] = evaluate(c, pick(r.constraints[j]), witness)
+    }
+    if public_rows {
+        for i in 0..r.public + 1 {
+            out[r.constraints.len + i] = witness[i]
+        }
+    }
+    out
+}
+
+fn pick_a(k: Constraint) -> []Term {
+    k.a
+}
+
+fn pick_b(k: Constraint) -> []Term {
+    k.b
+}
+
+fn pick_c(k: Constraint) -> []Term {
+    k.c
+}
+
+fn quotient(r: *R1cs, d: pairing.Domain, witness: [][]u64) -> [][]u64 ! Error {
+    let c = r.curve
+    let log = bits_of(d.size)
+    let shift = pairing.root_of_unity(c, log + 1) catch { _ => fail Size }
+    let a = pairing.ifft(d, rows_of(r, witness, pick_a, d.size, true))
+    let b = pairing.ifft(d, rows_of(r, witness, pick_b, d.size, false))
+    let z = pairing.ifft(d, rows_of(r, witness, pick_c, d.size, false))
+    let on_a = pairing.coset_fft(d, a, shift)
+    let on_b = pairing.coset_fft(d, b, shift)
+    let on_c = pairing.coset_fft(d, z, shift)
+    let vanishing = pairing.fr_sub(c, pairing.fr_pow(c, shift, [u64(d.size)]), pairing.fr_one(c))
+    let inverse = pairing.fr_inv(c, vanishing)
+    var values: [][]u64 = []
+    for j in 0..d.size {
+        let product = pairing.fr_mul(c, on_a[j], on_b[j])
+        let difference = pairing.fr_sub(c, product, on_c[j])
+        push(mut values, pairing.fr_mul(c, difference, inverse))
+    }
+    pairing.coset_ifft(d, values, shift)
+}
+
+fn byte_list(c: *pairing.Curve, values: [][]u64) -> [][]u8 {
+    var out: [][]u8 = []
+    for v in values {
+        push(mut out, scalar_bytes(c, v))
+    }
+    out
+}
+
+/// Returns a proof that `witness` satisfies `r`, for the proving key `key` and the blinding values `blind_a` and `blind_b`, which must be uniformly random and secret.
+///
+/// `witness` holds the value of every wire, the constant 1 first. The group operations on secrets use `scalar_mul` and the field operations are constant time, so the running time depends on the circuit and not on the witness or the blinding values. The check that the witness satisfies the constraints is not constant time and fails with `Unsatisfied`. Fails with `Size` when the key's domain does not fit the curve, and with `Inputs` when the key and the circuit disagree on the wire count.
+pub fn prove_with(key: ProvingKey, r: *R1cs, witness: [][]u64, blind_a: []u64, blind_b: []u64) -> Proof ! Error {
+    let c = r.curve
+    if key.a.len != r.wires || key.public != r.public {
+        fail Inputs
+    }
+    if !satisfied(r, witness) {
+        fail Unsatisfied
+    }
+    let d = pairing.domain(c, key.size) catch { _ => fail Size }
+    let h = quotient(r, d, witness)?
+    let g1 = pairing.g1(c)
+    let g2 = pairing.g2(c)
+    let all = byte_list(c, witness)
+    let private = byte_list(c, witness[r.public + 1..])
+    let quotient_bytes = byte_list(c, h[..key.size - 1])
+    let rb = scalar_bytes(c, blind_a)
+    let sb = scalar_bytes(c, blind_b)
+    let a_sum = pairing.msm_secret(g1, key.a, all)
+    let a = pairing.add(g1, pairing.add(g1, key.alpha1, a_sum), pairing.scalar_mul(g1, key.delta1, rb))
+    let b1_sum = pairing.msm_secret(g1, key.b1, all)
+    let b1 = pairing.add(g1, pairing.add(g1, key.beta1, b1_sum), pairing.scalar_mul(g1, key.delta1, sb))
+    let b2_sum = pairing.msm_secret(g2, key.b2, all)
+    let b = pairing.add(g2, pairing.add(g2, key.beta2, b2_sum), pairing.scalar_mul(g2, key.delta2, sb))
+    let k_sum = pairing.msm_secret(g1, key.k, private)
+    let h_sum = pairing.msm_secret(g1, key.h, quotient_bytes)
+    let rs = scalar_bytes(c, pairing.fr_mul(c, blind_a, blind_b))
+    let with_a = pairing.scalar_mul(g1, a, sb)
+    let with_b = pairing.scalar_mul(g1, b1, rb)
+    let blind = pairing.scalar_mul(g1, key.delta1, rs)
+    var sum = pairing.add(g1, k_sum, h_sum)
+    sum = pairing.add(g1, sum, with_a)
+    sum = pairing.add(g1, sum, with_b)
+    let z = pairing.sub(g1, sum, blind)
+    Proof { a, b, c: z }
+}
+
+/// Returns a proof that `witness` satisfies `r`, with random blinding values.
+pub fn prove(key: ProvingKey, r: *R1cs, witness: [][]u64) -> Proof ! Error {
+    let c = r.curve
+    prove_with(key, r, witness, pairing.fr_random(c), pairing.fr_random(c))
+}
+
+/// Returns whether `proof` proves, for the verifying key `key`, that the public wire values `public` (without the constant 1) are those of a satisfying witness.
+///
+/// It checks `e(A, B) = e(alpha, beta) e(L, gamma) e(C, delta)` with `L` the combination of `ic` by the inputs, as one product of four pairings. The points of the proof and the key must come from a decoder of `std/crypto/zk/pairing`, which has checked that they lie on the curve and in the subgroup. The running time depends on the inputs, which are public.
+pub fn verify(key: VerifyingKey, public: [][]u64, proof: Proof) -> bool {
+    let c = key.curve
+    if public.len + 1 != key.ic.len {
+        return false
+    }
+    let g1 = pairing.g1(c)
+    let scalars = byte_list(c, public)
+    let combination = pairing.msm(g1, key.ic[1..], scalars)
+    let l = pairing.add(g1, key.ic[0], combination)
+    let minus_a = pairing.negate(g1, proof.a)
+    pairing.pairing_check(c, [minus_a, key.alpha1, l, proof.c], [proof.b, key.beta2, key.gamma2, key.delta2])
+}
