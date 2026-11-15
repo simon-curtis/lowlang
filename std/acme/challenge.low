@@ -1,0 +1,214 @@
+import std/base64
+import std/crypto
+import std/crypto/hash
+import std/crypto/jose
+import std/crypto/x509
+import std/header
+import std/http
+import std/io
+import std/net
+import std/slices
+import std/sync
+import std/text
+import std/tls
+
+/// The ALPN protocol of a TLS-ALPN-01 validation connection (RFC 8737).
+pub const alpn_protocol = "acme-tls/1"
+
+/// The object identifier of the `id-pe-acmeIdentifier` extension in the TLS-ALPN-01 certificate (RFC 8737).
+pub const acme_identifier_oid = "1.3.6.1.5.5.7.1.31"
+
+struct ChallengeState {
+    lock: sync.Mutex
+    tokens: [str: str]
+    certificates: [str: tls.Credentials]
+}
+
+/// The responses a running server holds for the validations in progress: the key authorizations that HTTP-01 serves and the certificates that TLS-ALPN-01 presents.
+///
+/// A `Challenges` is a copyable handle on shared state guarded by a lock, so the server's green threads and the thread that solves challenges may use it at once.
+pub struct Challenges {
+    state: *ChallengeState
+}
+
+/// Returns an empty set of responses.
+pub fn challenges() -> Challenges {
+    Challenges { state: new(ChallengeState { lock: sync.mutex(), tokens: [:], certificates: [:] }) }
+}
+
+/// Starts serving `key_authorization` at `/.well-known/acme-challenge/<token>` through the handler of `http01_handler`.
+pub fn put_token(ch: Challenges, token: str, key_authorization: str) {
+    let s = ch.state
+    sync.lock(s.lock)
+    s.tokens[token] = key_authorization
+    sync.unlock(s.lock)
+}
+
+/// Stops serving `token`.
+pub fn drop_token(ch: Challenges, token: str) {
+    let s = ch.state
+    sync.lock(s.lock)
+    delete(mut s.tokens, token)
+    sync.unlock(s.lock)
+}
+
+/// Starts presenting `credentials` to TLS-ALPN-01 connections whose server name is `server_name`, through the source of `tls_alpn_source`.
+pub fn put_certificate(ch: Challenges, server_name: str, credentials: tls.Credentials) {
+    let s = ch.state
+    let name = text.lower(server_name)
+    sync.lock(s.lock)
+    s.certificates[name] = credentials
+    sync.unlock(s.lock)
+}
+
+/// Stops presenting a certificate for `server_name`.
+pub fn drop_certificate(ch: Challenges, server_name: str) {
+    let s = ch.state
+    let name = text.lower(server_name)
+    sync.lock(s.lock)
+    delete(mut s.certificates, name)
+    sync.unlock(s.lock)
+}
+
+fn token_response(ch: Challenges, token: str) -> str? {
+    let s = ch.state
+    sync.lock(s.lock)
+    let found = s.tokens[token]
+    sync.unlock(s.lock)
+    found
+}
+
+fn certificate_response(ch: Challenges, name: str) -> tls.Credentials? {
+    let s = ch.state
+    let key = text.lower(name)
+    sync.lock(s.lock)
+    let found = s.certificates[key]
+    sync.unlock(s.lock)
+    found
+}
+
+/// Returns the key authorization of `ch` for the account key `key`: the token, a dot and the Base64url SHA-256 JWK thumbprint of the key (RFC 8555 section 8.1).
+pub fn key_authorization(ch: Challenge, key: x509.PrivateKey) -> str {
+    let thumbprint = jose.thumbprint(public_jwk(key))
+    "{ch.token}.{thumbprint}"
+}
+
+/// Returns the TXT record name that DNS-01 validates for `domain`: `_acme-challenge.` before the domain, without a leading `*.` (RFC 8555 section 8.4).
+pub fn dns01_name(domain: str) -> str {
+    let base = text.trim_prefix(domain, "*.")
+    "_acme-challenge.{base}"
+}
+
+/// Returns the TXT record value that DNS-01 validates: the Base64url SHA-256 digest of `key_authorization` (RFC 8555 section 8.4).
+pub fn dns01_value(key_authorization: str) -> str {
+    let digest = hash.sum(hash.sha256(), bytes(key_authorization))
+    base64.encode_url(digest)
+}
+
+/// The path that HTTP-01 validation requests, `/.well-known/acme-challenge/` followed by `token`.
+pub fn http01_path(token: str) -> str {
+    "/.well-known/acme-challenge/{token}"
+}
+
+fn not_found(req: http.Request) -> http.Response {
+    http.response(404, "not found")
+}
+
+/// Returns a handler that answers HTTP-01 validation requests from `ch` and passes every other request to `next`.
+///
+/// A `GET` or `HEAD` of `/.well-known/acme-challenge/<token>` for a token in `ch` gets status 200 and the key authorization as `application/octet-stream`; an unknown token gets 404. Use it as the handler of `http.serve` on port 80, or wrap the handler of an application.
+pub fn http01_handler(ch: Challenges, next: fn(http.Request) -> http.Response) -> fn(http.Request) -> http.Response {
+    let prefix = "/.well-known/acme-challenge/"
+    fn(req: http.Request) -> http.Response {
+        if (req.method != "GET" && req.method != "HEAD") || !text.starts_with(req.path, prefix) {
+            return next(req)
+        }
+        let token = req.path[prefix.len..]
+        let found = token_response(ch, token)
+        match found {
+            some(body) => {
+                var resp = http.response(200, body)
+                resp.headers = [header.Header { name: "content-type", value: "application/octet-stream" }]
+                resp
+            }
+            none => http.response(404, "no such challenge")
+        }
+    }
+}
+
+/// Serves HTTP-01 validation requests from `ch` on the listener `l` and answers everything else with 404.
+///
+/// It blocks the green thread until the listener closes. Validation requests come to port 80 of the domain, so `l` must be bound there or reached through a port mapping.
+pub fn serve_http01(l: net.ListenerHandle, ch: Challenges) ! io.Error {
+    http.serve_on(l, http01_handler(ch, not_found))?
+}
+
+/// Returns a source that answers TLS-ALPN-01 validation connections from `ch` and passes every other handshake to `next`.
+///
+/// A ClientHello that offers `acme-tls/1` and names a server name that `put_certificate` holds a certificate for gets that certificate and the protocol `acme-tls/1`; every other ClientHello is answered by `next`. Set the result as `tls.Config.credentials`.
+pub fn tls_alpn_source(ch: Challenges, next: tls.CredentialSource) -> tls.CredentialSource {
+    tls.CredentialSource {
+        choose: fn(info: tls.HelloInfo) -> tls.Credentials {
+            if slices.contains(info.protocols, alpn_protocol) {
+                match certificate_response(ch, info.server_name) {
+                    some(found) => return found
+                    none => {}
+                }
+            }
+            next.choose(info)
+        },
+    }
+}
+
+/// Where a DNS-01 solver puts the TXT records: functions that create and delete the record `name` with `value`.
+///
+/// The module computes both strings; how they reach the DNS is up to the caller. `publish` returns when the record can be expected to be visible to the server's resolver, so it carries the propagation wait. Both fail with `io.Error`, which stops the order.
+pub struct DnsRecords {
+    /// Creates the TXT record `name` with the text `value`.
+    pub publish: fn(str, str) ! io.Error
+    /// Deletes the TXT record that `publish` created with the same `name` and `value`.
+    pub remove: fn(str, str) ! io.Error
+}
+
+/// Returns the SNI name a TLS-ALPN-01 validation uses for `i`: the domain for a `dns` identifier, the reverse mapping name (`in-addr.arpa` or `ip6.arpa`) for an `ip` one (RFC 8738 section 6).
+pub fn tls_alpn_server_name(i: Identifier) -> str {
+    if i.kind != "ip" {
+        return i.value
+    }
+    let raw = net.parse_ip(i.value) catch { _ => return i.value }
+    var parts: []str = []
+    if raw.len == 4 {
+        for at in 0..4 {
+            push(mut parts, text.radix(i64(raw[3 - at]), 10))
+        }
+        return "{text.join(parts, ".")}.in-addr.arpa"
+    }
+    for at in 0..raw.len {
+        let b = raw[raw.len - 1 - at]
+        push(mut parts, text.radix(i64(b & 15), 16))
+        push(mut parts, text.radix(i64(b >> 4), 16))
+    }
+    "{text.join(parts, ".")}.ip6.arpa"
+}
+
+/// Returns the self-signed certificate and key that answer a TLS-ALPN-01 challenge for `i` (RFC 8737), with `protocol` set to `acme-tls/1`.
+///
+/// The certificate names `i` in its subject alternative name, is valid from an hour before `now` (Unix seconds) for 7 days and carries the critical `id-pe-acmeIdentifier` extension with the SHA-256 digest of `key_authorization`. Its key is a new P-256 key. Fails with `Crypto` when the key or certificate cannot be made.
+pub fn tls_alpn_credentials(i: Identifier, key_authorization: str, now: i64) -> tls.Credentials ! Error {
+    let key = x509.generate_private_key(x509.KeyType.P256) catch { e => fail crypto_failure(e) }
+    let digest = hash.sum(hash.sha256(), bytes(key_authorization))
+    var value: []u8 = [0x04, u8(digest.len)]
+    io.append(mut value, digest)
+    let extension = x509.Extension { id: acme_identifier_oid, critical: true, value }
+    var serial = crypto.random(8)
+    serial[0] = (serial[0] & 0x7F) | 0x01
+    var template = x509.Template { serial, not_before: now - 3600, not_after: now + 7 * 86400, extensions: [extension] }
+    if i.kind == "ip" {
+        let raw = net.parse_ip(i.value) catch { _ => fail Unsupported("{i.value} is not an IP address") }
+        template.ip_addresses = [raw]
+    } else {
+        template.dns_names = [i.value]
+    }
+    let der = x509.create_self_signed(template, key) catch { e => fail crypto_failure(e) }
+    tls.Credentials { certificates: [der], key: some(key), protocol: alpn_protocol }
+}

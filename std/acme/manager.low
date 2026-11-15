@@ -1,0 +1,574 @@
+import std/cancel
+import std/crypto
+import std/crypto/der
+import std/crypto/ed25519
+import std/crypto/hash
+import std/crypto/x509
+import std/io
+import std/net
+import std/retry
+import std/sync
+import std/text
+import std/time/duration
+import std/time/timestamp
+import std/tls
+
+/// Something that happened to a managed certificate, passed to `ManagerConfig.observer`.
+pub enum Event {
+    /// A certificate for `names` was issued and is now served. `reason` is `initial` for a name that had none, `scheduled` for a renewal at the configured fraction of the lifetime, `suggested` for a renewal in the window the server suggested and `requested` for one that `renew_now` asked for.
+    Obtained(names: []str, reason: str)
+    /// Obtaining a certificate for `names` failed after every attempt of `ManagerConfig.backoff`. The manager tries again after `ManagerConfig.failure_pause`.
+    Failed(names: []str, error: Error)
+}
+
+/// How a renewal manager gets and keeps certificates.
+pub struct ManagerConfig {
+    /// The ACME client of the server to use.
+    pub client: *Client
+    /// Where the account key and the certificates are kept. They survive restarts only if the store does.
+    pub store: Store
+    /// The certificates to keep: each inner list is the names (DNS names or IP addresses, with `*.` for a wildcard) of one certificate. The first name picks the file name in the store.
+    pub names: [][]str
+    /// How to prove control of the names; see `Solvers`. Its `challenges` must be the ones the caller's servers answer from.
+    pub solvers: Solvers
+    /// The contact URLs for a new account, such as `mailto:admin@example.com`.
+    pub contacts: []str = []
+    /// Whether to agree to the terms of service when a new account is made. Defaults to `false`, which a server that has terms refuses.
+    pub terms_agreed: bool = false
+    /// The external account binding for a server that requires one, or `none`.
+    pub binding: Binding? = none
+    /// The kind of key for new accounts and certificates. Defaults to P-256.
+    pub key_type: x509.KeyType = x509.KeyType.P256
+    /// The fraction of a certificate's lifetime after which it is renewed when the server gives no renewal window. Defaults to two thirds, which leaves one third of the lifetime for retries.
+    pub renew_fraction: f64 = 0.6666667
+    /// Whether to follow the renewal windows the server suggests (RFC 9773) when its directory has `renewalInfo`. A failure to get a window, and a window that ends before the certificate's validity begins, fall back to `renew_fraction`. Defaults to `true`.
+    pub use_ari: bool = true
+    /// The longest the loop sleeps between looks at the certificates, and how often a renewal window is asked for again unless the server says otherwise. Defaults to one hour.
+    pub check_interval: duration.Duration = duration.hours(1)
+    /// How long the manager leaves a certificate alone after an issuance gave up. Defaults to one hour.
+    pub failure_pause: duration.Duration = duration.hours(1)
+    /// The backoff between attempts to obtain one certificate. The attempts wait on the clock of the client and stop with the token of the manager. Defaults to 4 attempts, 1 second doubling up to 5 minutes.
+    pub backoff: retry.Policy = retry.Policy { attempts: 4, base: duration.seconds(1), max_delay: duration.minutes(5) }
+    /// The certificate profile to ask for, or the empty string.
+    pub profile: str = ""
+    /// A token that stops the loop and every wait when cancelled, or `none` for one that only `stop` cancels. Give the same token as `Options.token` of the client to interrupt a call in progress as well.
+    pub token: *cancel.Token? = none
+    /// A function called for every `Event`, from the green thread of the loop, or `none`.
+    pub observer: fn(Event)? = none
+}
+
+/// The state of one managed certificate, as `status` reports it.
+pub struct Status {
+    /// The names of the certificate.
+    pub names: []str
+    /// Whether a certificate is held.
+    pub issued: bool
+    /// The end of the validity of the held certificate as Unix seconds, or `0`.
+    pub not_after: i64
+    /// When the manager will renew the held certificate as Unix seconds, or `0` when it holds none.
+    pub renew_at: i64
+    /// The description of the last failure to obtain it, or the empty string when the last try worked.
+    pub last_error: str
+}
+
+struct Entry {
+    names: []str
+    slug: str
+    credentials: tls.Credentials
+    not_before: i64
+    not_after: i64
+    renew_at: i64
+    suggested: bool
+    forced: bool
+    window_start: i64
+    next_check: i64
+    failed_until: i64
+    last_error: str
+}
+
+struct State {
+    lock: sync.Mutex
+    entries: []Entry
+    account: Account
+}
+
+/// Keeps certificates issued and renewed, made by `manager` and run by `start`.
+pub struct Manager {
+    config: ManagerConfig
+    state: *State
+    token: *cancel.Token
+}
+
+fn entry_slug(names: []str) -> str {
+    let joined = text.join(names, "+")
+    let starred = text.replace(joined, "*", "_")
+    text.replace(starred, ":", "_")
+}
+
+fn unix_now(config: ManagerConfig) -> i64 {
+    timestamp.unix_seconds(config.client.options.clock.read())
+}
+
+fn store_failure(e: io.Error) -> Error {
+    Error.Store(e)
+}
+
+fn existing_account(c: *Client, key: x509.PrivateKey) -> Account? ! Error {
+    let found = find_account(c, key) catch {
+        e => {
+            match e {
+                Server(problem) => {
+                    if problem.kind == ProblemKind.AccountDoesNotExist {
+                        return none
+                    }
+                    fail e
+                }
+                _ => fail e
+            }
+        }
+    }
+    some(found)
+}
+
+fn account_for(config: ManagerConfig) -> Account ! Error {
+    let saved = config.store.read("account.pem") catch { e => fail store_failure(e) }
+    var key: x509.PrivateKey? = none
+    if saved.len > 0 {
+        key = some(x509.pem_private_key(str(saved)) catch { e => fail crypto_failure(e) })
+    }
+    let known: Account? = match key {
+        some(k) => existing_account(config.client, k)?
+        none => none
+    }
+    match known {
+        some(a) => return a
+        none => {}
+    }
+    let fresh = match key {
+        some(k) => k
+        none => x509.generate_private_key(config.key_type) catch { e => fail crypto_failure(e) }
+    }
+    let request = AccountRequest { contacts: config.contacts, terms_agreed: config.terms_agreed, binding: config.binding }
+    let created = new_account(config.client, fresh, request)?
+    let pem = x509.private_key_pem(fresh) catch { e => fail crypto_failure(e) }
+    config.store.write("account.pem", bytes(pem)) catch { e => fail store_failure(e) }
+    created
+}
+
+fn covers(pattern: str, name: str) -> bool {
+    if text.equal_fold(pattern, name) {
+        return true
+    }
+    if !text.starts_with(pattern, "*.") {
+        return false
+    }
+    let dot = text.index_byte(name, '.')
+    dot > 0 && text.equal_fold(pattern[1..], name[dot..])
+}
+
+fn leaf_names_cover(leaf: x509.Certificate, names: []str) -> bool {
+    for name in names {
+        let id = identifier(name)
+        var found = false
+        if id.kind == "ip" {
+            let raw = net.parse_ip(id.value) catch { _ => return false }
+            for ip in leaf.ip_addresses {
+                if hash.equal(ip, raw) {
+                    found = true
+                }
+            }
+        } else {
+            for have in leaf.dns_names {
+                if text.equal_fold(have, name) {
+                    found = true
+                }
+            }
+        }
+        if !found {
+            return false
+        }
+    }
+    true
+}
+
+fn public_bytes(key: x509.PrivateKey) -> []u8 {
+    match key {
+        Rsa(k) => der.sequence([der.integer(k.n), der.integer(k.e)])
+        Ecdsa(k) => k.public
+        Ed25519(seed) => ed25519.public_key(seed)
+    }
+}
+
+fn key_matches(leaf: x509.Certificate, key: x509.PrivateKey) -> bool {
+    hash.equal(leaf.public_key.key, public_bytes(key))
+}
+
+fn empty_entry(names: []str) -> Entry {
+    Entry {
+        names,
+        slug: entry_slug(names),
+        credentials: tls.Credentials {},
+        not_before: 0,
+        not_after: 0,
+        renew_at: 0,
+        suggested: false,
+        forced: false,
+        window_start: 0,
+        next_check: 0,
+        failed_until: 0,
+        last_error: "",
+    }
+}
+
+fn holds(e: Entry) -> bool {
+    e.credentials.certificates.len > 0
+}
+
+fn stored_entry(config: ManagerConfig, names: []str) -> Entry ! Error {
+    let blank = empty_entry(names)
+    let saved = config.store.read("{blank.slug}.pem") catch { e => fail store_failure(e) }
+    if saved.len == 0 {
+        return blank
+    }
+    let pem = str(saved)
+    let key = x509.pem_private_key(pem) catch { _ => return blank }
+    let chain = x509.pem_certificates(pem)
+    if chain.len == 0 {
+        return blank
+    }
+    let leaf = x509.parse(chain[0]) catch { _ => return blank }
+    if !leaf_names_cover(leaf, names) || !key_matches(leaf, key) {
+        return blank
+    }
+    var out = blank
+    out.credentials = tls.Credentials { certificates: chain, key: some(key) }
+    out.not_before = leaf.not_before
+    out.not_after = leaf.not_after
+    out
+}
+
+/// Loads the account and the stored certificates and returns a manager that has not started.
+///
+/// The account key comes from `config.store`, or is generated and saved after the account is created. An account the server does not know is created with the key that the store holds. A stored certificate is used when its key and names match `config.names`; every other name starts without one. Fails with `Store` for a store that cannot be read or written, and with the failures of `new_account` and `find_account`.
+pub fn manager(config: ManagerConfig) -> *Manager ! Error {
+    let account = account_for(config)?
+    var entries: []Entry = []
+    for names in config.names {
+        if names.len == 0 {
+            fail Unsupported("a certificate needs at least one name")
+        }
+        push(mut entries, stored_entry(config, names)?)
+    }
+    let token = config.token ?? cancel.token()
+    let state = new(State { lock: sync.mutex(), entries, account })
+    let m = new(Manager { config, state, token })
+    let now = unix_now(config)
+    for i in 0..entries.len {
+        if holds(entries[i]) {
+            let planned = schedule(m, entries[i], now)
+            replace_entry(m, i, planned)
+        }
+    }
+    m
+}
+
+fn entry_at(m: *Manager, i: i64) -> Entry {
+    let s = m.state
+    sync.lock(s.lock)
+    let e = s.entries[i]
+    sync.unlock(s.lock)
+    e
+}
+
+fn replace_entry(m: *Manager, i: i64, e: Entry) {
+    let s = m.state
+    sync.lock(s.lock)
+    s.entries[i] = e
+    sync.unlock(s.lock)
+}
+
+fn random_between(low: i64, high: i64) -> i64 {
+    if high <= low {
+        return low
+    }
+    let raw = crypto.random(4)
+    let value = (i64(raw[0]) << 24) | (i64(raw[1]) << 16) | (i64(raw[2]) << 8) | i64(raw[3])
+    low + value % (high - low + 1)
+}
+
+fn suggested_window(m: *Manager, e: Entry) -> RenewalWindow? {
+    if !m.config.use_ari || m.config.client.directory.renewal_info.len == 0 {
+        return none
+    }
+    let window = renewal_info(m.config.client, e.credentials.certificates[0]) catch { _ => return none }
+    if window.end <= e.not_before {
+        return none
+    }
+    some(window)
+}
+
+fn schedule(m: *Manager, e: Entry, now: i64) -> Entry {
+    var out = e
+    let lifetime = e.not_after - e.not_before
+    let fraction = e.not_before + i64(f64(lifetime) * m.config.renew_fraction)
+    if !m.config.use_ari || m.config.client.directory.renewal_info.len == 0 {
+        out.renew_at = fraction
+        out.suggested = false
+        out.next_check = 0
+        return out
+    }
+    out.next_check = now + duration.floor_seconds(m.config.check_interval)
+    let window = match suggested_window(m, e) {
+        some(w) => w
+        none => {
+            if !e.suggested {
+                out.renew_at = fraction
+            }
+            return out
+        }
+    }
+    let pause = window.retry_after ?? m.config.check_interval
+    out.next_check = now + duration.floor_seconds(pause)
+    out.suggested = true
+    if e.window_start == window.start && e.renew_at >= window.start && e.renew_at <= window.end {
+        out.renew_at = e.renew_at
+    } else {
+        out.renew_at = random_between(window.start, window.end)
+    }
+    out.window_start = window.start
+    out
+}
+
+fn emit(m: *Manager, event: Event) {
+    match m.config.observer {
+        some(f) => f(event)
+        none => {}
+    }
+}
+
+fn save_bundle(m: *Manager, slug: str, key: x509.PrivateKey, chain: Chain) ! Error {
+    let pem = x509.private_key_pem(key) catch { e => fail crypto_failure(e) }
+    let bundle = "{pem}{chain.pem}"
+    m.config.store.write("{slug}.pem", bytes(bundle)) catch { e => fail store_failure(e) }
+}
+
+fn verified(issued: Issued, names: []str) -> x509.Certificate ! Error {
+    let leaf = x509.parse(issued.chain.certificates[0]) catch { e => fail crypto_failure(e) }
+    if !leaf_names_cover(leaf, names) {
+        fail Protocol("the issued certificate does not cover every requested name")
+    }
+    if !key_matches(leaf, issued.key) {
+        fail Protocol("the issued certificate is for another key")
+    }
+    leaf
+}
+
+fn identifiers_for(names: []str) -> []Identifier {
+    var out: []Identifier = []
+    for name in names {
+        push(mut out, identifier(name))
+    }
+    out
+}
+
+fn attempt_policy(m: *Manager) -> retry.Policy {
+    var p = m.config.backoff
+    p.clock = m.config.client.options.clock
+    p.token = some(m.token)
+    p
+}
+
+fn replacement_of(m: *Manager, e: Entry) -> str {
+    if m.config.client.directory.renewal_info.len == 0 || !holds(e) {
+        return ""
+    }
+    renewal_id(e.credentials.certificates[0]) catch { _ => return "" }
+}
+
+fn obtain_once(m: *Manager, account: Account, e: Entry, attempt: i64) -> retry.Step[Issued, Error] {
+    let config = m.config
+    let key = x509.generate_private_key(config.key_type) catch { c => return retry.Step.Fatal(crypto_failure(c)) }
+    var request = OrderRequest { identifiers: identifiers_for(e.names), profile: config.profile }
+    if attempt == 1 {
+        request.replaces = replacement_of(m, e)
+    }
+    let issued = obtain(config.client, account, request, key, config.solvers) catch {
+        err => {
+            match err {
+                Cancelled => return retry.Step.Fatal(err)
+                Unsupported(_) => return retry.Step.Fatal(err)
+                _ => return retry.Step.Retry(err)
+            }
+        }
+    }
+    retry.Step.Done(issued)
+}
+
+fn account_of_manager(m: *Manager) -> Account {
+    let s = m.state
+    sync.lock(s.lock)
+    let a = s.account
+    sync.unlock(s.lock)
+    a
+}
+
+fn renew_entry(m: *Manager, i: i64, e: Entry, now: i64) -> Entry {
+    let account = account_of_manager(m)
+    let reason = if !holds(e) { "initial" } else if e.forced { "requested" } else if e.suggested { "suggested" } else { "scheduled" }
+    let policy = attempt_policy(m)
+    let outcome = retry.run(policy, fn(attempt: i64) -> retry.Step[Issued, Error] { obtain_once(m, account, e, attempt) })
+    let done = finish(m, e, outcome, now) catch {
+        failure => {
+            var out = e
+            out.failed_until = now + duration.floor_seconds(m.config.failure_pause)
+            out.last_error = describe(failure)
+            replace_entry(m, i, out)
+            emit(m, Event.Failed(e.names, failure))
+            return out
+        }
+    }
+    replace_entry(m, i, done)
+    emit(m, Event.Obtained(e.names, reason))
+    done
+}
+
+fn finish(m: *Manager, e: Entry, outcome: retry.Outcome[Issued, Error], now: i64) -> Entry ! Error {
+    match outcome {
+        Value(issued) => accept(m, e, issued, now)
+        Failed(problem) => fail problem
+        GaveUp(problem, _) => fail problem
+        Stopped(_) => fail Error.Cancelled
+    }
+}
+
+fn accept(m: *Manager, e: Entry, issued: Issued, now: i64) -> Entry ! Error {
+    let leaf = verified(issued, e.names)?
+    save_bundle(m, e.slug, issued.key, issued.chain)?
+    var out = e
+    out.credentials = tls.Credentials { certificates: issued.chain.certificates, key: some(issued.key) }
+    out.not_before = leaf.not_before
+    out.not_after = leaf.not_after
+    out.failed_until = 0
+    out.last_error = ""
+    out.window_start = 0
+    out.suggested = false
+    out.forced = false
+    schedule(m, out, now)
+}
+
+fn wake_at(m: *Manager, e: Entry, now: i64) -> i64 {
+    if !holds(e) || e.failed_until > now {
+        return e.failed_until
+    }
+    if e.next_check > 0 && e.next_check < e.renew_at {
+        return e.next_check
+    }
+    e.renew_at
+}
+
+fn visit(m: *Manager, i: i64, now: i64) -> duration.Duration {
+    var e = entry_at(m, i)
+    let due = (!holds(e) || now >= e.renew_at) && now >= e.failed_until
+    if due {
+        e = renew_entry(m, i, e, now)
+    } else if holds(e) && e.next_check > 0 && now >= e.next_check {
+        e = schedule(m, e, now)
+        replace_entry(m, i, e)
+    }
+    let wake = wake_at(m, e, now)
+    duration.seconds(if wake > now { wake - now } else { 1 })
+}
+
+/// Looks at every managed certificate once, obtains or renews those that are due and returns how long until the next one needs attention, at most `ManagerConfig.check_interval`.
+///
+/// `start` calls it in a loop. Call it directly to drive the manager without a green thread, for example with a manual clock. A certificate that cannot be obtained is left alone for `ManagerConfig.failure_pause`.
+pub fn run_once(m: *Manager) -> duration.Duration {
+    let now = unix_now(m.config)
+    var next = m.config.check_interval
+    for i in 0..m.config.names.len {
+        let wait = visit(m, i, now)
+        next = duration.min(next, wait)
+    }
+    next
+}
+
+fn loop_run(m: *Manager) {
+    for !cancel.cancelled(m.token) {
+        let wait = run_once(m)
+        m.config.client.options.clock.sleep(some(m.token), wait)
+    }
+}
+
+/// Starts a green thread that obtains missing certificates, renews each one when it is due and keeps going until `stop` is called or the token is cancelled.
+pub fn start(m: *Manager) {
+    spawn loop_run(m)
+}
+
+/// Stops the loop of `start`: cancels its token, which ends the wait it is in and any issuance in progress that shares the token.
+pub fn stop(m: *Manager) {
+    cancel.cancel(m.token)
+}
+
+/// Marks every certificate as due, so that the next `run_once` or pass of the loop renews it now.
+pub fn renew_now(m: *Manager) {
+    let s = m.state
+    sync.lock(s.lock)
+    for i in 0..s.entries.len {
+        s.entries[i].renew_at = 0
+        s.entries[i].failed_until = 0
+        s.entries[i].forced = true
+    }
+    sync.unlock(s.lock)
+}
+
+/// Returns the state of every managed certificate, in the order of `ManagerConfig.names`.
+pub fn status(m: *Manager) -> []Status {
+    let s = m.state
+    sync.lock(s.lock)
+    var out: []Status = []
+    for e in s.entries {
+        push(mut out, Status {
+            names: e.names, issued: holds(e), not_after: e.not_after, renew_at: if holds(e) { e.renew_at } else { 0 }, last_error: e.last_error,
+        })
+    }
+    sync.unlock(s.lock)
+    out
+}
+
+fn credentials_by_name(m: *Manager, server_name: str) -> tls.Credentials {
+    let s = m.state
+    sync.lock(s.lock)
+    var found = tls.Credentials {}
+    for e in s.entries {
+        if !holds(e) {
+            continue
+        }
+        if server_name.len == 0 && !holds_any(found) {
+            found = e.credentials
+        }
+        for pattern in e.names {
+            if covers(pattern, server_name) {
+                found = e.credentials
+            }
+        }
+    }
+    sync.unlock(s.lock)
+    found
+}
+
+fn holds_any(c: tls.Credentials) -> bool {
+    c.certificates.len > 0
+}
+
+/// Returns a source of credentials for `tls.Config.credentials` that presents the current certificate of the managed name the client asks for.
+///
+/// A ClientHello without a server name gets the first certificate held. A name that no certificate covers, and every name while nothing has been obtained yet, refuses the handshake. When `ManagerConfig.solvers.challenges` is set the source also answers TLS-ALPN-01 validation connections, so a server that uses it needs no other setup for that challenge type. A certificate that is renewed is presented to the connections that start after the swap, and connections already established keep theirs.
+pub fn source(m: *Manager) -> tls.CredentialSource {
+    let served = tls.CredentialSource {
+        choose: fn(info: tls.HelloInfo) -> tls.Credentials { credentials_by_name(m, info.server_name) },
+    }
+    match m.config.solvers.challenges {
+        some(ch) => tls_alpn_source(ch, served)
+        none => served
+    }
+}

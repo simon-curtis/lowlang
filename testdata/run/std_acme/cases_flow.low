@@ -1,0 +1,251 @@
+import std/acme
+import std/cancel
+import std/crypto/hash
+import std/crypto/x509
+import std/http
+import std/io
+import std/net
+import std/text
+import std/time/clock
+import std/time/timestamp
+
+fn served_tokens(rig: Rig) -> i64 {
+    let client = http.client().build()
+    var served = 0
+    for i in 0..rig.fake.authzs.len {
+        let url = "http://127.0.0.1:{rig.fake.http_port}/.well-known/acme-challenge/token-{i}"
+        let resp = http.get(client, url) catch { _ => continue }
+        if resp.status == 200 {
+            served += 1
+        }
+    }
+    served
+}
+
+fn kinds_text(az: acme.Authorization) -> str {
+    var kinds: []str = []
+    for ch in az.challenges {
+        push(mut kinds, "{ch.kind}:{ch.status}")
+    }
+    text.join(kinds, ",")
+}
+
+fn problem_text(e: acme.Error) -> str {
+    match e {
+        Server(p) => {
+            var subs: []str = []
+            for s in p.subproblems {
+                push(mut subs, "{s.identifier_type}:{s.identifier}")
+            }
+            "kind={kind_name(p.kind)} status={p.status} subproblems=[{text.join(subs, ",")}]"
+        }
+        _ => acme.describe(e)
+    }
+}
+
+fn kind_name(k: acme.ProblemKind) -> str {
+    match k {
+        AccountDoesNotExist => "AccountDoesNotExist"
+        AlreadyReplaced => "AlreadyReplaced"
+        AlreadyRevoked => "AlreadyRevoked"
+        BadCsr => "BadCsr"
+        BadNonce => "BadNonce"
+        BadPublicKey => "BadPublicKey"
+        BadRevocationReason => "BadRevocationReason"
+        BadSignatureAlgorithm => "BadSignatureAlgorithm"
+        Caa => "Caa"
+        Compound => "Compound"
+        Connection => "Connection"
+        Dns => "Dns"
+        ExternalAccountRequired => "ExternalAccountRequired"
+        IncorrectResponse => "IncorrectResponse"
+        InvalidContact => "InvalidContact"
+        Malformed => "Malformed"
+        OrderNotReady => "OrderNotReady"
+        RateLimited => "RateLimited"
+        RejectedIdentifier => "RejectedIdentifier"
+        ServerInternal => "ServerInternal"
+        Tls => "Tls"
+        Unauthorized => "Unauthorized"
+        UnsupportedContact => "UnsupportedContact"
+        UnsupportedIdentifier => "UnsupportedIdentifier"
+        UserActionRequired => "UserActionRequired"
+        Other => "Other"
+    }
+}
+
+fn step_order(c: *acme.Client, a: acme.Account, request: acme.OrderRequest) -> acme.Order ! acme.Error {
+    acme.new_order(c, a, request)?
+}
+
+fn flow_cases(rig: Rig, c: *acme.Client, a: acme.Account) ! io.Error {
+    let key = x509.generate_private_key(x509.KeyType.P256)?
+    let request = acme.OrderRequest { identifiers: [acme.identifier("flow.example.test")], profile: "shortlived", replaces: "aki.serial" }
+    let order = acme.new_order(c, a, request) catch {
+        e => {
+            show("new order", acme.describe(e))
+            return
+        }
+    }
+    show("new order", "status={order.status} identifiers={order.identifiers.len} authorizations={order.authorizations.len} finalize={yes(text.starts_with(order.finalize, "{rig.base}/finalize/"))} certificate={order.certificate.len}")
+    show("  order request recorded", log_tail(rig.fake))
+    let again = acme.get_order(c, a, order.url) catch {
+        e => {
+            show("get order", acme.describe(e))
+            return
+        }
+    }
+    show("get order", "status={again.status} same url={yes(again.url == order.url)}")
+    let authz = acme.get_authorization(c, a, order.authorizations[0]) catch {
+        e => {
+            show("get authorization", acme.describe(e))
+            return
+        }
+    }
+    show("get authorization", "status={authz.status} identifier={authz.identifier.kind}:{authz.identifier.value} wildcard={authz.wildcard} challenges={kinds_text(authz)}")
+    let csr = acme.csr_for(request, key) catch { _ => fail Refused }
+    show("finalize before the order is ready", finalize_text(c, a, again, csr))
+    var chosen = authz.challenges[0]
+    for ch in authz.challenges {
+        if ch.kind == "http-01" {
+            chosen = ch
+        }
+    }
+    let authorization = acme.key_authorization(chosen, a.key)
+    acme.put_token(rig.challenges, chosen.token, authorization)
+    let responded = acme.respond(c, a, chosen) catch {
+        e => {
+            show("respond", acme.describe(e))
+            return
+        }
+    }
+    show("respond", "kind={responded.kind} status={responded.status}")
+    let valid = acme.wait_authorization(c, a, authz.url) catch {
+        e => {
+            show("wait authorization", acme.describe(e))
+            return
+        }
+    }
+    acme.drop_token(rig.challenges, chosen.token)
+    show("wait authorization", "status={valid.status} challenges={kinds_text(valid)}")
+    let ready = acme.wait_order(c, a, order.url, "ready") catch {
+        e => {
+            show("wait order ready", acme.describe(e))
+            return
+        }
+    }
+    show("wait order ready", ready.status)
+    let other = acme.OrderRequest { identifiers: [acme.identifier("other.example.test")] }
+    let wrong = acme.csr_for(other, key) catch { _ => fail Refused }
+    show("finalize with a request for other names", finalize_text(c, a, ready, wrong))
+    let sent = acme.finalize(c, a, ready, csr) catch {
+        e => {
+            show("finalize", acme.describe(e))
+            return
+        }
+    }
+    show("finalize", "status={sent.status} certificate={yes(sent.certificate.len > 0)}")
+    let done = acme.wait_order(c, a, order.url, "valid") catch {
+        e => {
+            show("wait order valid", acme.describe(e))
+            return
+        }
+    }
+    show("wait order valid", "status={done.status} certificate={yes(text.starts_with(done.certificate, "{rig.base}/cert/"))}")
+    let chain = acme.download_chain(c, a, done.certificate) catch {
+        e => {
+            show("download chain", acme.describe(e))
+            return
+        }
+    }
+    show("download chain", leaf_text(chain))
+    let alternate = acme.download_chain(c, a, chain.alternates[0]) catch {
+        e => {
+            show("download alternate chain", acme.describe(e))
+            return
+        }
+    }
+    show("download alternate chain", "{leaf_text(alternate)} same leaf={yes(hash.equal(chain.certificates[0], alternate.certificates[0]))} other issuer={yes(!hash.equal(chain.certificates[1], alternate.certificates[1]))}")
+    show("chain pem", "{yes(text.starts_with(chain.pem, "-----BEGIN CERTIFICATE-----"))} blocks={text.count(chain.pem, "BEGIN CERTIFICATE")}")
+}
+
+fn log_tail(f: *Fake) -> str {
+    f.log[f.log.len - 1]
+}
+
+fn finalize_text(c: *acme.Client, a: acme.Account, order: acme.Order, csr: []u8) -> str {
+    let r = acme.finalize(c, a, order, csr) catch { e => return problem_text(e) }
+    "status {r.status}"
+}
+
+fn refusal_cases(rig: Rig, c: *acme.Client, a: acme.Account) {
+    rig.fake.refused = ["refused.example.test", "also-refused.example.test"]
+    let request = acme.OrderRequest { identifiers: identifiers_of(["fine.example.test", "refused.example.test", "also-refused.example.test"]) }
+    let r = acme.new_order(c, a, request) catch {
+        e => {
+            show("order with refused names", problem_text(e))
+            rig.fake.refused = []
+            return
+        }
+    }
+    show("order with refused names", r.status)
+    rig.fake.refused = []
+}
+
+fn csr_cases(rig: Rig) ! io.Error {
+    let key = x509.generate_private_key(x509.KeyType.P384)?
+    let request = acme.OrderRequest { identifiers: identifiers_of(["csr.example.test", "*.csr.example.test", "192.0.2.7", "2001:db8::1"]) }
+    let der = acme.csr_for(request, key) catch {
+        e => {
+            show("csr_for", acme.describe(e))
+            return
+        }
+    }
+    let parsed = x509.parse_request(der) or fail Malformed
+    var ips: []str = []
+    for ip in parsed.ip_addresses {
+        push(mut ips, net.format_ip(ip))
+    }
+    show("csr_for", "subject={parsed.common_name} dns=[{text.join(parsed.dns_names, ",")}] ip=[{text.join(ips, ",")}] signature={yes(x509.check_request_signature(parsed))}")
+    let long = text.repeat("a", 70)
+    let big = acme.OrderRequest { identifiers: identifiers_of(["{long}.example.test"]) }
+    let second = acme.csr_for(big, key) catch { _ => fail Malformed }
+    let long_request = x509.parse_request(second) or fail Malformed
+    show("csr_for with a long name", "subject={long_request.common_name.len} dns={long_request.dns_names.len}")
+    let bad = acme.OrderRequest { identifiers: [acme.Identifier { kind: "ip", value: "not an address" }] }
+    show("csr_for with a bad address", csr_text(bad, key))
+}
+
+fn csr_text(request: acme.OrderRequest, key: x509.PrivateKey) -> str {
+    let der = acme.csr_for(request, key) catch { e => return acme.describe(e) }
+    "{der.len} bytes"
+}
+
+fn solver_cases(rig: Rig, c: *acme.Client, a: acme.Account) ! io.Error {
+    let failing = acme.DnsRecords {
+        publish: fn(name: str, value: str) ! io.Error { fail Refused },
+        remove: fn(name: str, value: str) ! io.Error {},
+    }
+    let solvers = acme.Solvers { challenges: none, dns: some(failing), methods: ["dns-01"] }
+    let key = x509.generate_private_key(x509.KeyType.P256)?
+    let request = acme.OrderRequest { identifiers: identifiers_of(["solver.example.test"]) }
+    let issued = acme.obtain(c, a, request, key, solvers) catch {
+        e => {
+            show("obtain with a failing dns function", acme.describe(e))
+            return
+        }
+    }
+    show("obtain with a failing dns function", issued.order.status)
+}
+
+fn cancel_cases(rig: Rig, c: *acme.Client) ! io.Error {
+    let token = cancel.token()
+    let http_client = http.client().with_roots(rig.roots).build()
+    let options = acme.Options { directory: "{rig.base}/dir", http: http_client, clock: clock.clock(rig.clk), token: some(token) }
+    let guarded = acme.connect(options) catch { _ => fail Refused }
+    let key = x509.generate_private_key(x509.KeyType.P256)?
+    show("new account before the token is cancelled", new_text(guarded, key, acme.AccountRequest { terms_agreed: true }))
+    cancel.cancel(token)
+    show("new account after the token is cancelled", new_text(guarded, key, acme.AccountRequest { terms_agreed: true }))
+    show("connect with a cancelled token", connect_text(options))
+}

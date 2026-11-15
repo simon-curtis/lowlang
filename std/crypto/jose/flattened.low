@@ -1,0 +1,147 @@
+import std/base64
+import std/io
+import std/json
+
+/// The protected header of a flattened JWS (RFC 7515 section 7.2.2).
+pub struct Protected {
+    /// The signature algorithm (`alg`), such as `ES256`.
+    pub alg: str
+    /// The key identifier (`kid`), written when not empty.
+    pub kid: str = ""
+    /// The anti-replay nonce (`nonce`, RFC 8555 section 6.5), written when not empty.
+    pub nonce: str = ""
+    /// The target URL (`url`, RFC 8555 section 6.4), written when not empty.
+    pub url: str = ""
+    /// The public key embedded as `jwk`, or `none` to write no `jwk` member. The member holds only the key material, without `use`, `kid` or `alg`.
+    pub jwk: Jwk? = none
+}
+
+/// A flattened JWS whose signature has been verified.
+pub struct Flattened {
+    /// The protected header as the signer wrote it.
+    pub header: Protected
+    /// The decoded payload, empty for a JWS whose `payload` member is the empty string.
+    pub payload: []u8
+}
+
+fn protected_value(p: Protected) -> json.Value {
+    var members: []json.Member = [json.text_member("alg", p.alg)]
+    match p.jwk {
+        some(k) => push(mut members, json.object_member("jwk", key_members(k)))
+        none => {}
+    }
+    if p.kid.len > 0 {
+        push(mut members, json.text_member("kid", p.kid))
+    }
+    if p.nonce.len > 0 {
+        push(mut members, json.text_member("nonce", p.nonce))
+    }
+    if p.url.len > 0 {
+        push(mut members, json.text_member("url", p.url))
+    }
+    json.object_value(members)
+}
+
+/// Returns the flattened JWS JSON serialization (RFC 7515 section 7.2.2) of `payload` signed with `key`.
+///
+/// The result is the JSON object `{"protected":...,"payload":...,"signature":...}` with each value Base64url without padding. The protected header holds `alg`, then `jwk`, `kid`, `nonce` and `url` for the members of `p` that are set. `payload` is signed as bytes, so an empty payload gives the empty `payload` string that ACME uses for a POST-as-GET request. The algorithms and signature formats are those of `sign`.
+///
+/// Fails with `Invalid` when `p.alg` is not supported, the key type does not suit it, the key has no private part, an HMAC secret is shorter than the hash output or an Ed25519 seed is not 32 bytes.
+pub fn sign_flattened(p: Protected, key: Key, payload: []u8) -> str ! io.Error {
+    let m = match method(p.alg) {
+        some(found) => found
+        none => fail Invalid
+    }
+    let header = base64.encode_url(bytes(json.stringify(protected_value(p), 0)))
+    let body = base64.encode_url(payload)
+    let signature = create(m, key, bytes("{header}.{body}"))?
+    let members: []json.Member = [
+        json.text_member("protected", header),
+        json.text_member("payload", body),
+        json.text_member("signature", base64.encode_url(signature)),
+    ]
+    json.stringify(json.object_value(members), 0)
+}
+
+fn flattened_text(v: json.Value, name: str) -> str ! io.Error {
+    match json.get(v, name) ?? json.Value.Null {
+        Str(s) => s
+        _ => fail Malformed
+    }
+}
+
+fn optional_text(v: json.Value, name: str) -> str ! io.Error {
+    match json.get(v, name) ?? json.Value.Null {
+        Str(s) => s
+        Null => ""
+        _ => fail Malformed
+    }
+}
+
+fn read_protected(header: json.Value) -> Protected ! io.Error {
+    var jwk: Jwk? = none
+    match json.get(header, "jwk") {
+        some(raw) => {
+            jwk = match parse_jwk(raw) {
+                some(k) => some(k)
+                none => fail Malformed
+            }
+        }
+        none => {}
+    }
+    Protected {
+        alg: flattened_text(header, "alg")?
+        kid: optional_text(header, "kid")?
+        nonce: optional_text(header, "nonce")?
+        url: optional_text(header, "url")?
+        jwk
+    }
+}
+
+/// Verifies the flattened JWS JSON `text` and returns its protected header and decoded payload.
+///
+/// `keys` receives the header and returns the keys that may have signed it, so the caller decides which keys a `kid` names and whether an embedded `jwk` is accepted. Only an `alg` named in `algorithms` is accepted. A key is tried when its `alg` is empty or equal to the header's and its type suits the algorithm; the first key whose signature verifies wins.
+///
+/// Fails with `Malformed` when `text` is not a JSON object with exactly the string members `protected`, `payload` and `signature` of a flattened serialization (a `header`, `signatures` or any other member is rejected), a Base64url part is invalid, the protected header is not a JSON object, repeats a member or has an `alg`, `kid`, `nonce` or `url` that is not a string or a `jwk` that cannot be read. Fails with `Invalid` when the header has a `crit` member, the algorithm is not allowed or supported, or no key verifies the signature.
+pub fn verify_flattened(text: str, keys: fn(Protected) -> []Jwk, algorithms: []str) -> Flattened ! io.Error {
+    let v = unique_object(bytes(text))?
+    let members = match v {
+        Object(list) => list
+        _ => fail Malformed
+    }
+    if members.len != 3 {
+        fail Malformed
+    }
+    let protected = flattened_text(v, "protected")?
+    let payload_text = flattened_text(v, "payload")?
+    let signature_text = flattened_text(v, "signature")?
+    let header_bytes = base64.decode_url(protected) or fail Malformed
+    let header_value = unique_object(header_bytes)?
+    match json.get(header_value, "crit") {
+        some(_) => fail Invalid
+        none => {}
+    }
+    let header = read_protected(header_value)?
+    var allowed = false
+    for a in algorithms {
+        if a == header.alg {
+            allowed = true
+        }
+    }
+    if !allowed {
+        fail Invalid
+    }
+    let m = match method(header.alg) {
+        some(found) => found
+        none => fail Invalid
+    }
+    let payload = base64.decode_url(payload_text) or fail Malformed
+    let signature = base64.decode_url(signature_text) or fail Malformed
+    let input = bytes("{protected}.{payload_text}")
+    for k in keys(header) {
+        if (k.alg.len == 0 || k.alg == header.alg) && check(m, k.key, input, signature) {
+            return Flattened { header, payload }
+        }
+    }
+    fail Invalid
+}

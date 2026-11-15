@@ -1,0 +1,101 @@
+import std/acme
+import std/crypto/x509
+import std/io
+import std/text
+import std/time/clock
+import std/time/duration
+import std/time/timestamp
+
+fn issue_one(rig: Rig, c: *acme.Client, a: acme.Account, name: str, kind: x509.KeyType) -> acme.Issued ! acme.Error {
+    let key = x509.generate_private_key(kind) catch { e => fail acme.Error.Crypto(e) }
+    let request = acme.OrderRequest { identifiers: identifiers_of([name]) }
+    acme.obtain(c, a, request, key, solvers_for(rig, ["http-01"]))?
+}
+
+fn revoke_text(c: *acme.Client, a: acme.Account, cert: []u8, reason: i64) -> str {
+    acme.revoke(c, a, cert, reason) catch { e => return problem_text(e) }
+    "revoked"
+}
+
+fn revoke_key_text(c: *acme.Client, key: x509.PrivateKey, cert: []u8, reason: i64) -> str {
+    acme.revoke_with_key(c, key, cert, reason) catch { e => return problem_text(e) }
+    "revoked"
+}
+
+fn revocation_cases(rig: Rig, c: *acme.Client, a: acme.Account) ! io.Error {
+    let first = issue_one(rig, c, a, "rev1.example.test", x509.KeyType.P256) catch { _ => fail Refused }
+    let cert = first.chain.certificates[0]
+    show("revoke by the account", revoke_text(c, a, cert, 1))
+    show("  server log", log_tail(rig.fake))
+    show("revoke again", revoke_text(c, a, cert, 1))
+    let second = issue_one(rig, c, a, "rev2.example.test", x509.KeyType.P256) catch { _ => fail Refused }
+    let other = fresh_account(c)?
+    show("revoke by another account", revoke_text(c, other, second.chain.certificates[0], 0))
+    let stranger = x509.generate_private_key(x509.KeyType.P256)?
+    show("revoke with another key", revoke_key_text(c, stranger, second.chain.certificates[0], -1))
+    show("revoke with the certificate key", revoke_key_text(c, second.key, second.chain.certificates[0], -1))
+    show("  server log", log_tail(rig.fake))
+    let third = issue_one(rig, c, a, "rev3.example.test", x509.KeyType.Ed25519) catch { _ => fail Refused }
+    show("revoke an Ed25519 certificate with its key", revoke_key_text(c, third.key, third.chain.certificates[0], 5))
+    show("  server log", log_tail(rig.fake))
+    let fourth = issue_one(rig, c, a, "rev4.example.test", x509.KeyType.P384) catch { _ => fail Refused }
+    show("revoke with a reason the server refuses", revoke_text(c, a, fourth.chain.certificates[0], 7))
+    show("revoke with no reason", revoke_text(c, a, fourth.chain.certificates[0], -1))
+    show("  server log", log_tail(rig.fake))
+    let foreign_key = x509.generate_private_key(x509.KeyType.P256)?
+    let template = x509.Template { serial: [9], subject: "foreign", not_before: 1767225600, not_after: 4102444800 }
+    let foreign = x509.create_self_signed(template, foreign_key)?
+    show("revoke a certificate the server did not issue", revoke_text(c, a, foreign, 0))
+}
+
+fn window_text(w: acme.RenewalWindow, now: i64) -> str {
+    let wait = match w.retry_after {
+        some(d) => "{duration.floor_seconds(d)}s"
+        none => "none"
+    }
+    "start=now+{w.start - now} end=now+{w.end - now} retry_after={wait} explanation={w.explanation_url.len}"
+}
+
+fn renewal_info_text(c: *acme.Client, cert: []u8, now: i64) -> str {
+    let w = acme.renewal_info(c, cert) catch { e => return problem_text(e) }
+    window_text(w, now)
+}
+
+fn renewal_cases(rig: Rig, plain: *acme.Client, a: acme.Account) ! io.Error {
+    let now = timestamp.unix_seconds(clock.now(clock.clock(rig.clk)))
+    rig.fake.ari = true
+    rig.fake.window_start = now + 1000
+    rig.fake.window_end = now + 2000
+    rig.fake.ari_retry = 7
+    let aware = client_for(rig)?
+    show("directory with renewalInfo", yes(text.ends_with(aware.directory.renewal_info, "/ari")))
+    let issued = issue_one(rig, aware, a, "ari.example.test", x509.KeyType.P256) catch { _ => fail Refused }
+    let cert = issued.chain.certificates[0]
+    show("renewal info", renewal_info_text(aware, cert, now))
+    let id = acme.renewal_id(cert) catch { _ => fail Refused }
+    let leaf = x509.parse(cert)?
+    let dotted = text.index_byte(id, '.') > 0
+    show("renewal id", "same as from parts={yes(id == acme.renewal_id_of(leaf.authority_key_id, leaf.serial))} dot={yes(dotted)} unpadded={yes(!text.contains(id, "="))}")
+    rig.fake.ari_retry = 0
+    show("renewal info without Retry-After", renewal_info_text(aware, cert, now))
+    show("renewal info for a client whose directory has none", renewal_info_text(plain, cert, now))
+    let foreign_key = x509.generate_private_key(x509.KeyType.P256)?
+    let template = x509.Template { serial: [9], subject: "foreign", not_before: 1767225600, not_after: 4102444800 }
+    let foreign = x509.create_self_signed(template, foreign_key)?
+    show("renewal info for a certificate without an authority key identifier", renewal_info_text(aware, foreign, now))
+    let unknown = acme.renewal_id_of([1, 2, 3], [4, 5])
+    show("renewal id of unknown parts", unknown)
+    let other_ca = x509.parse(first_foreign_with_authority(rig)?)?
+    show("renewal info for a certificate the server does not know", renewal_info_text(aware, other_ca.raw, now))
+    let rfc_aki: []u8 = [0x69, 0x88, 0x5B, 0x6B, 0x87, 0x46, 0x40, 0x41, 0xE1, 0xB3, 0x7B, 0x84, 0x7B, 0xA0, 0xAE, 0x2C, 0xDE, 0x01, 0xC8, 0xD4]
+    let rfc_serial: []u8 = [0x00, 0x87, 0x65, 0x43, 0x21]
+    show("RFC 9773 appendix A identifier", acme.renewal_id_of(rfc_aki, rfc_serial))
+    rig.fake.ari = false
+}
+
+fn first_foreign_with_authority(rig: Rig) -> []u8 ! io.Error {
+    let key = x509.generate_private_key(x509.KeyType.P256)?
+    let authority = x509.Extension { id: "2.5.29.35", critical: false, value: [0x30, 0x04, 0x80, 0x02, 0xAA, 0xBB] }
+    let template = x509.Template { serial: [9], subject: "foreign", not_before: 1767225600, not_after: 4102444800, extensions: [authority] }
+    x509.create_self_signed(template, key)?
+}

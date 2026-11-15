@@ -21,7 +21,26 @@ struct ClientHello {
     shares: []KeyShareEntry
     schemes: []i64
     protocols: []str
+    server_name: str
     status_request: bool
+}
+
+fn host_name(exts: []Extension) -> str ! io.Error {
+    let raw = match find(exts, 0) {
+        some(found) => found
+        none => return ""
+    }
+    let c = cursor(raw)
+    let list = cursor(vector16(c)?)
+    end(c)?
+    for left(list) > 0 {
+        let kind = u8_of(list)?
+        let name = vector16(list)?
+        if kind == 0 {
+            return str(name)
+        }
+    }
+    ""
 }
 
 fn asks_for_status(exts: []Extension) -> bool ! io.Error {
@@ -105,8 +124,12 @@ fn parse_client_hello(body: []u8) -> ClientHello ! io.Error {
         }
         none => {}
     }
+    let server_name = host_name(exts)?
     let status_request = asks_for_status(exts)?
-    ClientHello { hello_version, random, session_id, suites, compressions, exts, versions, groups, shares, schemes, protocols, status_request }
+    ClientHello {
+        hello_version, random, session_id, suites, compressions, exts, versions, groups, shares, schemes, protocols,
+        server_name, status_request,
+    }
 }
 
 fn server_hello(random: []u8, session_id: []u8, suite: Suite, group: i64, key: []u8, retry: bool) -> []u8 {
@@ -227,7 +250,7 @@ fn choose_version(config: Config, hello: ClientHello) -> i64 {
 
 /// Performs a TLS server handshake over `s` and returns the established session.
 ///
-/// Requires `config.certificates` and `config.key`. Accepts TLS 1.3 and TLS 1.2 within the version range of `config`. The cipher suite is the first in `config.cipher_suites` that the client also offers and that suits the key; the group is the first in `config.groups` the client supports, with a HelloRetryRequest when the client sent no share for it; the signature scheme must be one the client offers and the key allows (RSA keys sign with PSS in TLS 1.3). The first protocol in `config.alpn` that the client also offers is selected. Client certificates are not requested.
+/// Requires `config.certificates` and `config.key`, or `config.credentials` in their place. Accepts TLS 1.3 and TLS 1.2 within the version range of `config`. The cipher suite is the first in `config.cipher_suites` that the client also offers and that suits the key; the group is the first in `config.groups` the client supports, with a HelloRetryRequest when the client sent no share for it; the signature scheme must be one the client offers and the key allows (RSA keys sign with PSS in TLS 1.3). The first protocol in `config.alpn` that the client also offers is selected. Client certificates are not requested.
 ///
 /// Blocks the green thread until the handshake completes. Fails with `Invalid` when the key or certificates are missing or the version range is unusable, with `Unsupported` when no version, suite, group or scheme is shared and with `Malformed` or `Invalid` for protocol violations. A failed handshake does not close `s`. When it succeeds, closing or dropping the `Session` also closes `s`.
 pub fn server(s: io.Stream, config: Config) -> Session ! io.Error {
@@ -239,12 +262,11 @@ pub fn server(s: io.Stream, config: Config) -> Session ! io.Error {
 ///
 /// Behaves as `server`, but the result is not dropped automatically: the caller closes it with `close_on`. Use it to hand a session to a green thread.
 pub fn server_handle(s: io.Stream, config: Config) -> *SessionHandle ! io.Error {
-    let key = match config.key {
-        some(k) => k
-        none => fail Invalid
-    }
-    if config.certificates.len == 0 || !versions_valid(config) {
+    if !versions_valid(config) {
         fail Invalid
+    }
+    if !has_source(config) {
+        let _ = static_credentials(config)?
     }
     let c = channel(s)
     let m = expect_message(c, 1)?
@@ -256,12 +278,63 @@ pub fn server_handle(s: io.Stream, config: Config) -> *SessionHandle ! io.Error 
     if slices.contains(hello.suites, 0x5600) && version < config.max_version {
         fail refuse(c, 86)
     }
+    let resolved = present(c, config, hello)?
     c.version = version
     if version == 0x0303 {
-        return server12(c, config, key, hello, m.raw)
+        return server12(c, resolved.config, resolved.key, hello, m.raw)
     }
-    let done = server13(c, config, key, hello, m.raw)?
+    let done = server13(c, resolved.config, resolved.key, hello, m.raw)?
     session(c, done.protocol, done.group, done.suite, suite_code(done.suite), done.chain)
+}
+
+struct Chosen {
+    config: Config
+    key: x509.PrivateKey
+}
+
+fn has_source(config: Config) -> bool {
+    match config.credentials {
+        some(_) => true
+        none => false
+    }
+}
+
+fn static_credentials(config: Config) -> Chosen ! io.Error {
+    let key = match config.key {
+        some(k) => k
+        none => fail Invalid
+    }
+    if config.certificates.len == 0 {
+        fail Invalid
+    }
+    Chosen { config, key }
+}
+
+fn present(c: *Channel, config: Config, hello: ClientHello) -> Chosen ! io.Error {
+    let source = match config.credentials {
+        some(s) => s
+        none => return static_credentials(config)?
+    }
+    let info = HelloInfo { server_name: hello.server_name, protocols: hello.protocols }
+    let chosen = source.choose(info)
+    let key = match chosen.key {
+        some(k) => k
+        none => fail abort(c, 112, Invalid)
+    }
+    if chosen.certificates.len == 0 {
+        fail abort(c, 112, Invalid)
+    }
+    var out = config
+    out.certificates = chosen.certificates
+    out.key = some(key)
+    out.staples = chosen.staples
+    if chosen.protocol.len > 0 {
+        if !slices.contains(hello.protocols, chosen.protocol) {
+            fail refuse(c, 120)
+        }
+        out.alpn = [chosen.protocol]
+    }
+    Chosen { config: out, key }
 }
 
 fn check_quic_hello(c: *Channel, hello: ClientHello) ! io.Error {

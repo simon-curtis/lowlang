@@ -1,0 +1,380 @@
+import std/cancel
+import std/crypto/ecdsa
+import std/crypto/ed25519
+import std/crypto/jose
+import std/crypto/rsa
+import std/crypto/x509
+import std/header
+import std/http
+import std/io
+import std/json
+import std/sync
+import std/text
+import std/time/clock
+import std/time/duration
+import std/time/timestamp
+
+/// How a `Client` reaches its server and waits.
+pub struct Options {
+    /// The URL of the directory resource (RFC 8555 section 7.1.1), such as `https://acme-v02.api.letsencrypt.org/directory`. It must be `https`.
+    pub directory: str
+    /// The HTTP client every request goes through. Build it with `http.client()` and give it the roots that verify the server, for example with `with_roots`. ACME resources never redirect, so a client built with `with_redirects(0)` behaves the same.
+    pub http: *http.Client
+    /// The clock that reads the time for `Retry-After` dates and sleeps between polls. Defaults to the system clock; a `clock.manual` clock makes polling run without waiting.
+    pub clock: clock.Clock = clock.system()
+    /// A token that ends the call in progress with `Cancelled` and cuts every wait short when cancelled, or `none`.
+    pub token: *cancel.Token? = none
+    /// The wait between polls of an authorization or order when the server sends no `Retry-After`. Defaults to 2 seconds.
+    pub poll_interval: duration.Duration = duration.seconds(2)
+    /// The longest an authorization or order may take to leave `pending`, `ready` or `processing`. Defaults to 5 minutes.
+    pub poll_timeout: duration.Duration = duration.minutes(5)
+    /// How many times a request is repeated with a fresh nonce after the server answers `badNonce`. Defaults to 3.
+    pub nonce_retries: i64 = 3
+}
+
+/// The resources and metadata of an ACME server (RFC 8555 section 7.1.1), from its directory.
+pub struct Directory {
+    /// The `newNonce` URL.
+    pub new_nonce: str
+    /// The `newAccount` URL.
+    pub new_account: str
+    /// The `newOrder` URL.
+    pub new_order: str
+    /// The `revokeCert` URL.
+    pub revoke_cert: str
+    /// The `keyChange` URL.
+    pub key_change: str
+    /// The `renewalInfo` URL (RFC 9773), or the empty string when the server has none.
+    pub renewal_info: str
+    /// The `meta.termsOfService` URL, or the empty string.
+    pub terms_of_service: str
+    /// The `meta.website` URL, or the empty string.
+    pub website: str
+    /// The `meta.caaIdentities`, or an empty list.
+    pub caa_identities: []str
+    /// Whether `meta.externalAccountRequired` is true: an account needs a `Binding`.
+    pub external_account_required: bool
+    /// The names of the `meta.profiles` the server offers, or an empty list.
+    pub profiles: []str
+}
+
+struct Nonces {
+    lock: sync.Mutex
+    pool: []str
+    rejected: i64
+}
+
+/// A connection to one ACME server, made by `connect`.
+///
+/// It keeps the nonces the server issued, so any number of green threads may call functions with one `Client`.
+pub struct Client {
+    /// The options the client was made with.
+    pub options: Options
+    /// The directory the server returned.
+    pub directory: Directory
+    nonces: *Nonces
+}
+
+struct Signer {
+    key: x509.PrivateKey
+    kid: str
+}
+
+struct Reply {
+    status: i64
+    headers: []header.Header
+    body: []u8
+}
+
+fn http_failure(e: http.Error) -> Error {
+    Error.Http(e)
+}
+
+fn crypto_failure(e: io.Error) -> Error {
+    Error.Crypto(e)
+}
+
+fn cancelled(c: *Client) -> bool {
+    match c.options.token {
+        some(t) => cancel.cancelled(t)
+        none => false
+    }
+}
+
+fn check_cancelled(c: *Client) ! Error {
+    if cancelled(c) {
+        fail Cancelled
+    }
+}
+
+fn pause(c: *Client, wait: duration.Duration) ! Error {
+    check_cancelled(c)?
+    c.options.clock.sleep(c.options.token, wait)
+    check_cancelled(c)?
+}
+
+fn json_text(v: json.Value, name: str) -> str {
+    json.text_of(v, name)
+}
+
+fn text_list(v: json.Value, name: str) -> []str {
+    var out: []str = []
+    match json.field(v, name) {
+        Array(items) => {
+            for item in items {
+                match item {
+                    Str(s) => push(mut out, s)
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn is_success(status: i64) -> bool {
+    status >= 200 && status < 300
+}
+
+fn remember_nonce(c: *Client, headers: []header.Header) {
+    let fresh = header.get(headers, "replay-nonce") ?? ""
+    if fresh.len == 0 {
+        return
+    }
+    let n = c.nonces
+    sync.lock(n.lock)
+    push(mut n.pool, fresh)
+    sync.unlock(n.lock)
+}
+
+fn count_rejection(c: *Client) {
+    let n = c.nonces
+    sync.lock(n.lock)
+    n.rejected += 1
+    sync.unlock(n.lock)
+}
+
+/// Returns how many requests of `c` the server answered with `badNonce`, each of which the client repeated with a fresh nonce or, after `Options.nonce_retries` repeats, reported.
+pub fn rejected_nonces(c: *Client) -> i64 {
+    let n = c.nonces
+    sync.lock(n.lock)
+    let count = n.rejected
+    sync.unlock(n.lock)
+    count
+}
+
+fn pooled_nonce(c: *Client) -> str {
+    let n = c.nonces
+    sync.lock(n.lock)
+    var out = ""
+    if n.pool.len > 0 {
+        out = n.pool[n.pool.len - 1]
+        pop(mut n.pool)
+    }
+    sync.unlock(n.lock)
+    out
+}
+
+fn fresh_nonce(c: *Client) -> str ! Error {
+    check_cancelled(c)?
+    let resp = http.head(c.options.http, c.directory.new_nonce) catch { e => fail http_failure(e) }
+    let nonce = header.get(resp.headers, "replay-nonce") ?? ""
+    if nonce.len == 0 {
+        fail Protocol("the newNonce response has no Replay-Nonce header")
+    }
+    nonce
+}
+
+fn next_nonce(c: *Client) -> str ! Error {
+    let pooled = pooled_nonce(c)
+    if pooled.len > 0 {
+        return pooled
+    }
+    fresh_nonce(c)?
+}
+
+fn rsa_public(k: rsa.PrivateKey) -> rsa.PublicKey {
+    rsa.PublicKey { n: k.n, e: k.e }
+}
+
+fn signing_key(key: x509.PrivateKey) -> jose.Key {
+    match key {
+        Rsa(k) => jose.Key.Rsa(rsa_public(k), some(k))
+        Ecdsa(k) => jose.Key.Ec(k.curve, k.public, some(k.private))
+        Ed25519(seed) => jose.Key.Ed(ed25519.public_key(seed), some(seed))
+    }
+}
+
+fn public_jwk(key: x509.PrivateKey) -> jose.Jwk {
+    match key {
+        Rsa(k) => jose.Jwk { key: jose.Key.Rsa(rsa_public(k), none) }
+        Ecdsa(k) => jose.Jwk { key: jose.Key.Ec(k.curve, k.public, none) }
+        Ed25519(seed) => jose.Jwk { key: jose.Key.Ed(ed25519.public_key(seed), none) }
+    }
+}
+
+fn algorithm_of(key: x509.PrivateKey) -> str {
+    match key {
+        Rsa(_) => "RS256"
+        Ecdsa(k) => match k.curve {
+            P256 => "ES256"
+            P384 => "ES384"
+        }
+        Ed25519(_) => "EdDSA"
+    }
+}
+
+fn protected_for(signer: Signer, nonce: str, url: str) -> jose.Protected {
+    if signer.kid.len > 0 {
+        return jose.Protected { alg: algorithm_of(signer.key), kid: signer.kid, nonce, url }
+    }
+    jose.Protected { alg: algorithm_of(signer.key), nonce, url, jwk: some(public_jwk(signer.key)) }
+}
+
+fn sign_request(signer: Signer, nonce: str, url: str, payload: []u8) -> str ! Error {
+    let protected = protected_for(signer, nonce, url)
+    let key = signing_key(signer.key)
+    jose.sign_flattened(protected, key, payload) catch { e => fail crypto_failure(e) }
+}
+
+fn send_signed(c: *Client, url: str, body: str, accept: str) -> http.Response ! Error {
+    var request = http.request(c.options.http, "POST", url)
+    if accept.len > 0 {
+        request = http.with_header(request, "accept", accept)
+    }
+    let ready = http.with_body(request, bytes(body), "application/jose+json")
+    http.send(ready) catch { e => fail http_failure(e) }
+}
+
+fn bad_nonce_problem() -> Problem {
+    Problem { kind: ProblemKind.BadNonce, type_uri: "urn:ietf:params:acme:error:badNonce", detail: "", status: 400, instance: "", subproblems: [] }
+}
+
+fn post_accepting(c: *Client, url: str, signer: Signer, payload: []u8, accept: str) -> Reply ! Error {
+    var last = bad_nonce_problem()
+    for attempt in 0..c.options.nonce_retries + 1 {
+        check_cancelled(c)?
+        let nonce = next_nonce(c)?
+        let body = sign_request(signer, nonce, url, payload)?
+        let resp = send_signed(c, url, body, accept)?
+        remember_nonce(c, resp.headers)
+        if is_success(resp.status) {
+            return Reply { status: resp.status, headers: resp.headers, body: resp.body }
+        }
+        let problem = problem_from_response(resp.status, resp.body)
+        if problem.kind != ProblemKind.BadNonce {
+            fail Server(problem)
+        }
+        count_rejection(c)
+        last = problem
+    }
+    fail Server(last)
+}
+
+fn post(c: *Client, url: str, signer: Signer, payload: []u8) -> Reply ! Error {
+    post_accepting(c, url, signer, payload, "")?
+}
+
+fn post_json(c: *Client, url: str, signer: Signer, payload: json.Value) -> Reply ! Error {
+    let encoded = json.stringify(payload, 0)
+    post(c, url, signer, bytes(encoded))?
+}
+
+fn post_as_get(c: *Client, url: str, signer: Signer) -> Reply ! Error {
+    post(c, url, signer, [])?
+}
+
+fn parse_body(reply: Reply) -> json.Value ! Error {
+    json.parse(reply.body) catch { _ => fail Protocol("the response body is not JSON") }
+}
+
+fn directory_of(v: json.Value) -> Directory ! Error {
+    let meta = json.field(v, "meta")
+    var profiles: []str = []
+    match json.field(meta, "profiles") {
+        Object(members) => {
+            for m in members {
+                push(mut profiles, m.name)
+            }
+        }
+        _ => {}
+    }
+    let external = match json.field(meta, "externalAccountRequired") {
+        Bool(b) => b
+        _ => false
+    }
+    let d = Directory {
+        new_nonce: json_text(v, "newNonce"),
+        new_account: json_text(v, "newAccount"),
+        new_order: json_text(v, "newOrder"),
+        revoke_cert: json_text(v, "revokeCert"),
+        key_change: json_text(v, "keyChange"),
+        renewal_info: json_text(v, "renewalInfo"),
+        terms_of_service: json_text(meta, "termsOfService"),
+        website: json_text(meta, "website"),
+        caa_identities: text_list(meta, "caaIdentities"),
+        external_account_required: external,
+        profiles,
+    }
+    if d.new_nonce.len == 0 || d.new_account.len == 0 || d.new_order.len == 0 || d.revoke_cert.len == 0 || d.key_change.len == 0 {
+        fail Protocol("the directory lacks a required resource")
+    }
+    d
+}
+
+/// Fetches the directory of `options.directory` and returns a client for that server.
+///
+/// Fails with `Cancelled` when `options.token` is already cancelled, `Http` when the directory cannot be fetched, `Server` for an error status, and `Protocol` for a directory that is not JSON or lacks `newNonce`, `newAccount`, `newOrder`, `revokeCert` or `keyChange`. No nonce is fetched until the first signed request needs one.
+pub fn connect(options: Options) -> *Client ! Error {
+    if !text.starts_with(options.directory, "https://") {
+        fail Unsupported("the directory URL must be https")
+    }
+    match options.token {
+        some(t) => {
+            if cancel.cancelled(t) {
+                fail Cancelled
+            }
+        }
+        none => {}
+    }
+    let resp = http.get(options.http, options.directory) catch { e => fail http_failure(e) }
+    if !is_success(resp.status) {
+        fail Server(problem_from_response(resp.status, resp.body))
+    }
+    let parsed = json.parse(resp.body) catch { _ => fail Protocol("the directory is not JSON") }
+    let directory = directory_of(parsed)?
+    let nonces = new(Nonces { lock: sync.mutex(), pool: [], rejected: 0 })
+    new(Client { options, directory, nonces })
+}
+
+fn location(reply: Reply) -> str ! Error {
+    let url = header.get(reply.headers, "location") ?? ""
+    if url.len == 0 {
+        fail Protocol("the response has no Location header")
+    }
+    url
+}
+
+fn retry_after(c: *Client, headers: []header.Header) -> duration.Duration? {
+    let value = header.get(headers, "retry-after") ?? ""
+    if value.len == 0 {
+        return none
+    }
+    let seconds = text.parse_int(text.trim(value)) catch {
+        _ => {
+            let at = timestamp.parse_http_date(text.trim(value)) catch { _ => return none }
+            let wait = timestamp.until(c.options.clock.read(), at)
+            return if duration.is_negative(wait) { duration.zero() } else { wait }
+        }
+    }
+    if seconds < 0 {
+        return none
+    }
+    duration.seconds(seconds)
+}
+
+fn poll_wait(c: *Client, headers: []header.Header) -> duration.Duration {
+    let asked = retry_after(c, headers) ?? c.options.poll_interval
+    if duration.is_zero(asked) { duration.milliseconds(100) } else { asked }
+}

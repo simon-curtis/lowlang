@@ -1,0 +1,1036 @@
+import std/acme
+import std/base64
+import std/crypto/der
+import std/crypto/hash
+import std/crypto/jose
+import std/crypto/x509
+import std/header
+import std/http
+import std/io
+import std/json
+import std/net
+import std/slices
+import std/sync
+import std/text
+import std/time/clock
+import std/time/timestamp
+import std/tls
+
+struct Acct {
+    url: str
+    jwk: jose.Jwk
+    contacts: []str
+    status: str
+    binding: str
+}
+
+struct Az {
+    order: i64
+    kind: str
+    value: str
+    wildcard: bool
+    token: str
+    status: str
+    responded: str
+    outcome: str
+    detail: str
+    polls_left: i64
+}
+
+struct Ord {
+    account: i64
+    ids: []acme.Identifier
+    authz: []i64
+    status: str
+    cert: i64
+    polls_left: i64
+    replaces: str
+    profile: str
+    finalized: bool
+    csr: []u8
+}
+
+struct Cert {
+    der: []u8
+    order: i64
+    revoked: bool
+    reason: i64
+}
+
+struct Fake {
+    lock: sync.Mutex
+    plain: *http.Client
+    clock: clock.Clock
+    base: str
+    http_port: i64
+    tls_port: i64
+    accounts: []Acct
+    orders: []Ord
+    authzs: []Az
+    certs: []Cert
+    nonces: []str
+    nonce_count: i64
+    rejections_left: i64
+    posts: i64
+    ari: bool
+    eab_keys: [str: []u8]
+    eab_required: bool
+    unauthorized: []str
+    refused: []str
+    authz_polls: i64
+    order_polls: i64
+    retry_after: str
+    window_start: i64
+    window_end: i64
+    ari_retry: i64
+    cert_seconds: i64
+    records: [str: str]
+    log: []str
+    ca_key: x509.PrivateKey
+    ca_der: []u8
+    ca_subject: []u8
+    alt_der: []u8
+    aki: []u8
+}
+
+struct Call {
+    ok: bool
+    failure: http.Response
+    account: i64
+    protected: jose.Protected
+    payload: []u8
+}
+
+fn algorithms() -> []str {
+    ["ES256", "ES384", "RS256", "EdDSA"]
+}
+
+fn ca_certificate(subject: str, key: x509.PrivateKey) -> []u8 ! io.Error {
+    let constraints = x509.Extension { id: "2.5.29.19", critical: true, value: [0x30, 0x03, 0x01, 0x01, 0xFF] }
+    let template = x509.Template {
+        serial: [1], subject, not_before: 1767225600, not_after: 4102444800, extensions: [constraints],
+    }
+    x509.create_self_signed(template, key)?
+}
+
+fn fake(plain: *http.Client, clk: clock.Clock) -> *Fake ! io.Error {
+    let key = x509.generate_private_key(x509.KeyType.P256)?
+    let ca = ca_certificate("Fake ACME CA", key)?
+    let alt = ca_certificate("Fake ACME Alternate CA", key)?
+    let parsed = x509.parse(ca)?
+    let aki = hash.sum(hash.sha256(), parsed.public_key.key)[0..20]
+    let none_keys: [str: []u8] = [:]
+    let records: [str: str] = [:]
+    new(Fake {
+        lock: sync.mutex(), plain, clock: clk, base: "", http_port: 0, tls_port: 0, accounts: [], orders: [], authzs: [], certs: [],
+        nonces: [], nonce_count: 0, rejections_left: 0, posts: 0, ari: false, eab_keys: none_keys, eab_required: false,
+        unauthorized: [], refused: [], authz_polls: 0, order_polls: 0, retry_after: "", window_start: 0, window_end: 0, ari_retry: 0,
+        cert_seconds: 7776000, records: records, log: [], ca_key: key, ca_der: ca, ca_subject: parsed.subject, alt_der: alt, aki,
+    })
+}
+
+fn unix_now(f: *Fake) -> i64 {
+    timestamp.unix_seconds(f.clock.read())
+}
+
+fn fresh_nonce(f: *Fake) -> str {
+    f.nonce_count += 1
+    let n = "nonce-{f.nonce_count}"
+    push(mut f.nonces, n)
+    n
+}
+
+fn drop_text(items: []str, at: i64) -> []str {
+    var out: []str = []
+    for i in 0..items.len {
+        if i != at {
+            push(mut out, items[i])
+        }
+    }
+    out
+}
+
+fn take_nonce(f: *Fake, nonce: str) -> bool {
+    match slices.index(f.nonces, nonce) {
+        some(at) => {
+            f.nonces = drop_text(f.nonces, at)
+            true
+        }
+        none => false
+    }
+}
+
+fn json_reply(status: i64, v: json.Value) -> http.Response {
+    var r = http.response(status, json.stringify(v, 0))
+    header.set(mut r.headers, "content-type", "application/json")
+    r
+}
+
+fn problem(status: i64, kind: str, detail: str, subproblems: []json.Value) -> http.Response {
+    var members: []json.Member = [
+        json.text_member("type", "urn:ietf:params:acme:error:{kind}"), json.text_member("detail", detail), json.int_member("status", status),
+    ]
+    if subproblems.len > 0 {
+        push(mut members, json.array_member("subproblems", subproblems))
+    }
+    var r = http.response(status, json.stringify(json.object_value(members), 0))
+    header.set(mut r.headers, "content-type", "application/problem+json")
+    r
+}
+
+fn plain_problem(status: i64, kind: str, detail: str) -> http.Response {
+    problem(status, kind, detail, [])
+}
+
+fn log_event(f: *Fake, event: str) {
+    push(mut f.log, event)
+}
+
+fn authenticate(f: *Fake, req: http.Request) -> Call {
+    let full = "{f.base}{req.path}"
+    let blank = Call { ok: false, failure: http.response(200, ""), account: -1, protected: jose.Protected { alg: "" }, payload: [] }
+    let verified = jose.verify_flattened(str(req.body), fn(p: jose.Protected) -> []jose.Jwk {
+        if p.kid.len > 0 {
+            for a in f.accounts {
+                if a.url == p.kid {
+                    return [a.jwk]
+                }
+            }
+            return []
+        }
+        match p.jwk {
+            some(k) => [k]
+            none => []
+        }
+    }, algorithms()) catch {
+        _ => {
+            var out = blank
+            out.failure = plain_problem(400, "malformed", "the request is not a valid JWS")
+            return out
+        }
+    }
+    var out = blank
+    let head = verified.header
+    if head.url != full {
+        out.failure = plain_problem(400, "unauthorized", "the url header does not name the request URL")
+        return out
+    }
+    if (head.kid.len > 0) == has_jwk(head) {
+        out.failure = plain_problem(400, "malformed", "exactly one of kid and jwk is required")
+        return out
+    }
+    if !take_nonce(f, head.nonce) {
+        out.failure = plain_problem(400, "badNonce", "the nonce is not valid")
+        return out
+    }
+    if f.rejections_left > 0 {
+        f.rejections_left -= 1
+        out.failure = plain_problem(400, "badNonce", "scheduled rejection")
+        return out
+    }
+    out.protected = head
+    out.payload = verified.payload
+    if head.kid.len > 0 {
+        for i in 0..f.accounts.len {
+            if f.accounts[i].url == head.kid {
+                out.account = i
+            }
+        }
+        if f.accounts[out.account].status != "valid" {
+            out.failure = plain_problem(401, "unauthorized", "the account is {f.accounts[out.account].status}")
+            return out
+        }
+    }
+    out.ok = true
+    out
+}
+
+fn has_jwk(p: jose.Protected) -> bool {
+    match p.jwk {
+        some(_) => true
+        none => false
+    }
+}
+
+fn text_array(items: []str) -> []json.Value {
+    var out: []json.Value = []
+    for item in items {
+        push(mut out, json.text_value(item))
+    }
+    out
+}
+
+fn account_json(f: *Fake, i: i64) -> json.Value {
+    let a = f.accounts[i]
+    let members: []json.Member = [
+        json.text_member("status", a.status), json.array_member("contact", text_array(a.contacts)), json.text_member("orders", "{f.base}/orders/{i}"),
+    ]
+    json.object_value(members)
+}
+
+fn directory(f: *Fake) -> http.Response {
+    var members: []json.Member = [
+        json.text_member("newNonce", "{f.base}/nonce"), json.text_member("newAccount", "{f.base}/acct"),
+        json.text_member("newOrder", "{f.base}/order"), json.text_member("revokeCert", "{f.base}/revoke"),
+        json.text_member("keyChange", "{f.base}/rollover"),
+    ]
+    if f.ari {
+        push(mut members, json.text_member("renewalInfo", "{f.base}/ari"))
+    }
+    let profiles: []json.Member = [json.text_member("default", "the default profile"), json.text_member("shortlived", "a short lived profile")]
+    let meta: []json.Member = [
+        json.text_member("termsOfService", "https://example.test/terms"), json.text_member("website", "https://example.test/"),
+        json.array_member("caaIdentities", [json.text_value("example.test")]), json.bool_member("externalAccountRequired", f.eab_required),
+        json.object_member("profiles", profiles),
+    ]
+    push(mut members, json.object_member("meta", meta))
+    json_reply(200, json.object_value(members))
+}
+
+fn payload_json(call: Call) -> json.Value {
+    json.parse(call.payload) catch { _ => json.Value.Null }
+}
+
+fn binding_error(f: *Fake, key: jose.Jwk, payload: json.Value) -> str {
+    let binding = json.get(payload, "externalAccountBinding") ?? json.Value.Null
+    match binding {
+        Null => {
+            if f.eab_required {
+                return "externalAccountRequired"
+            }
+            return ""
+        }
+        _ => {}
+    }
+    var kid = ""
+    let verified = jose.verify_flattened(json.stringify(binding, 0), fn(p: jose.Protected) -> []jose.Jwk {
+        match f.eab_keys[p.kid] {
+            some(mac) => [jose.Jwk { key: jose.Key.Hmac(mac) }]
+            none => []
+        }
+    }, ["HS256"]) catch { _ => return "unauthorized" }
+    kid = verified.header.kid
+    if verified.header.url != "{f.base}/acct" || verified.header.nonce.len > 0 {
+        return "malformed"
+    }
+    if str(verified.payload) != jose.jwk_json(key) {
+        return "unauthorized"
+    }
+    kid
+}
+
+fn contacts_of(payload: json.Value) -> []str {
+    var out: []str = []
+    match json.field(payload, "contact") {
+        Array(items) => {
+            for item in items {
+                match item {
+                    Str(s) => push(mut out, s)
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn flag(payload: json.Value, name: str) -> bool {
+    match json.field(payload, name) {
+        Bool(b) => b
+        _ => false
+    }
+}
+
+fn new_account_handler(f: *Fake, call: Call) -> http.Response {
+    let key = match call.protected.jwk {
+        some(k) => k
+        none => return plain_problem(400, "malformed", "newAccount needs a jwk")
+    }
+    let payload = payload_json(call)
+    for i in 0..f.accounts.len {
+        if jose.thumbprint(f.accounts[i].jwk) == jose.thumbprint(key) {
+            var r = json_reply(200, account_json(f, i))
+            header.set(mut r.headers, "location", f.accounts[i].url)
+            return r
+        }
+    }
+    if flag(payload, "onlyReturnExisting") {
+        return plain_problem(400, "accountDoesNotExist", "no account for this key")
+    }
+    if !flag(payload, "termsOfServiceAgreed") {
+        return plain_problem(403, "userActionRequired", "agree to the terms of service")
+    }
+    let binding = binding_error(f, key, payload)
+    if binding == "externalAccountRequired" || binding == "unauthorized" || binding == "malformed" {
+        return plain_problem(403, binding, "the external account binding is not acceptable")
+    }
+    let url = "{f.base}/acct/{f.accounts.len}"
+    push(mut f.accounts, Acct { url, jwk: key, contacts: contacts_of(payload), status: "valid", binding })
+    log_event(f, "account {f.accounts.len - 1} created binding={binding}")
+    var r = json_reply(201, account_json(f, f.accounts.len - 1))
+    header.set(mut r.headers, "location", url)
+    r
+}
+
+fn account_handler(f: *Fake, call: Call, index: i64) -> http.Response {
+    if index != call.account {
+        return plain_problem(403, "unauthorized", "the account belongs to another key")
+    }
+    let payload = payload_json(call)
+    match json.get(payload, "contact") {
+        some(_) => {
+            f.accounts[index].contacts = contacts_of(payload)
+        }
+        none => {}
+    }
+    match json.field_text(payload, "status") {
+        some(s) => {
+            if s == "deactivated" {
+                f.accounts[index].status = "deactivated"
+                log_event(f, "account {index} deactivated")
+            }
+        }
+        none => {}
+    }
+    json_reply(200, account_json(f, index))
+}
+
+fn key_change_handler(f: *Fake, call: Call) -> http.Response {
+    let url = "{f.base}/rollover"
+    let inner = jose.verify_flattened(str(call.payload), fn(p: jose.Protected) -> []jose.Jwk {
+        match p.jwk {
+            some(k) => [k]
+            none => []
+        }
+    }, algorithms()) catch { _ => return plain_problem(400, "malformed", "the inner JWS is not valid") }
+    if inner.header.url != url || inner.header.nonce.len > 0 || inner.header.kid.len > 0 {
+        return plain_problem(400, "malformed", "the inner JWS headers are wrong")
+    }
+    let body = json.parse(inner.payload) catch { _ => return plain_problem(400, "malformed", "the inner payload is not JSON") }
+    let account = f.accounts[call.account]
+    if json.text_of(body, "account") != account.url {
+        return plain_problem(400, "malformed", "the inner payload names another account")
+    }
+    let old = json.field(body, "oldKey")
+    if json.stringify(old, 0) != jose.jwk_json(account.jwk) {
+        return plain_problem(400, "malformed", "the old key does not match")
+    }
+    let fresh = match inner.header.jwk {
+        some(k) => k
+        none => return plain_problem(400, "malformed", "no new key")
+    }
+    for i in 0..f.accounts.len {
+        if jose.thumbprint(f.accounts[i].jwk) == jose.thumbprint(fresh) {
+            return plain_problem(409, "malformed", "the new key belongs to an account")
+        }
+    }
+    f.accounts[call.account].jwk = fresh
+    log_event(f, "account {call.account} rolled over")
+    http.response(200, "")
+}
+
+fn index_after(path: str, prefix: str) -> i64 {
+    let rest = path[prefix.len..]
+    let slash = text.index_byte(rest, '/')
+    let digits = if slash < 0 { rest } else { rest[..slash] }
+    text.parse_int(digits) catch { _ => -1 }
+}
+
+fn token_for(f: *Fake) -> str {
+    "token-{f.authzs.len}"
+}
+
+fn identifier_list(payload: json.Value) -> []acme.Identifier {
+    var out: []acme.Identifier = []
+    match json.field(payload, "identifiers") {
+        Array(items) => {
+            for item in items {
+                push(mut out, acme.Identifier { kind: json.text_of(item, "type"), value: json.text_of(item, "value") })
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn new_order_handler(f: *Fake, call: Call) -> http.Response {
+    let payload = payload_json(call)
+    let ids = identifier_list(payload)
+    var subs: []json.Value = []
+    for id in ids {
+        if slices.contains(f.refused, id.value) {
+            let members: []json.Member = [
+                json.text_member("type", "urn:ietf:params:acme:error:rejectedIdentifier"),
+                json.text_member("detail", "{id.value} is not allowed"),
+                json.object_member("identifier", [json.text_member("type", id.kind), json.text_member("value", id.value)]),
+            ]
+            push(mut subs, json.object_value(members))
+        }
+    }
+    if subs.len > 0 {
+        return problem(400, "compound", "some identifiers were refused", subs)
+    }
+    if ids.len == 0 {
+        return plain_problem(400, "malformed", "no identifiers")
+    }
+    let order = f.orders.len
+    var authz: []i64 = []
+    for id in ids {
+        let wildcard = text.starts_with(id.value, "*.")
+        let value = if wildcard { id.value[2..] } else { id.value }
+        push(mut f.authzs, Az {
+            order, kind: id.kind, value, wildcard, token: token_for(f), status: "pending", responded: "", outcome: "", detail: "", polls_left: 0,
+        })
+        push(mut authz, f.authzs.len - 1)
+    }
+    let replaces = json.field_text(payload, "replaces") ?? ""
+    let profile = json.field_text(payload, "profile") ?? ""
+    push(mut f.orders, Ord { account: call.account, ids, authz, status: "pending", cert: -1, polls_left: 0, replaces, profile, finalized: false, csr: [] })
+    log_event(f, "order {order} replaces={replaces} profile={profile}")
+    var r = json_reply(201, order_json(f, order))
+    header.set(mut r.headers, "location", "{f.base}/order/{order}")
+    r
+}
+
+fn all_valid(f: *Fake, o: Ord) -> bool {
+    for a in o.authz {
+        if f.authzs[a].status != "valid" {
+            return false
+        }
+    }
+    true
+}
+
+fn any_invalid(f: *Fake, o: Ord) -> bool {
+    for a in o.authz {
+        if f.authzs[a].status == "invalid" {
+            return true
+        }
+    }
+    false
+}
+
+fn order_status(f: *Fake, index: i64) -> str {
+    let o = f.orders[index]
+    if o.cert >= 0 {
+        return "valid"
+    }
+    if o.finalized {
+        return "processing"
+    }
+    if any_invalid(f, o) {
+        return "invalid"
+    }
+    if all_valid(f, o) {
+        return "ready"
+    }
+    "pending"
+}
+
+fn order_json(f: *Fake, index: i64) -> json.Value {
+    let o = f.orders[index]
+    let status = order_status(f, index)
+    var ids: []json.Value = []
+    for id in o.ids {
+        push(mut ids, json.object_value([json.text_member("type", id.kind), json.text_member("value", id.value)]))
+    }
+    var urls: []str = []
+    for a in o.authz {
+        push(mut urls, "{f.base}/authz/{a}")
+    }
+    var members: []json.Member = [
+        json.text_member("status", status), json.text_member("expires", "2031-01-01T00:00:00Z"), json.array_member("identifiers", ids),
+        json.array_member("authorizations", text_array(urls)), json.text_member("finalize", "{f.base}/finalize/{index}"),
+    ]
+    if o.cert >= 0 {
+        push(mut members, json.text_member("certificate", "{f.base}/cert/{o.cert}"))
+    }
+    if status == "invalid" {
+        push(mut members, json.object_member("error", [
+            json.text_member("type", "urn:ietf:params:acme:error:unauthorized"), json.text_member("detail", "an authorization failed"),
+        ]))
+    }
+    if o.replaces.len > 0 {
+        push(mut members, json.text_member("replaces", o.replaces))
+    }
+    json.object_value(members)
+}
+
+fn kinds_for(a: Az) -> []str {
+    if a.wildcard {
+        return ["dns-01"]
+    }
+    if a.kind == "ip" {
+        return ["http-01", "tls-alpn-01"]
+    }
+    ["http-01", "dns-01", "tls-alpn-01"]
+}
+
+fn challenge_json(f: *Fake, index: i64, kind: str) -> json.Value {
+    let a = f.authzs[index]
+    var status = "pending"
+    if a.responded == kind {
+        status = if a.status == "pending" { "processing" } else { a.status }
+    }
+    var members: []json.Member = [
+        json.text_member("type", kind), json.text_member("url", "{f.base}/chall/{index}/{kind}"), json.text_member("token", a.token),
+        json.text_member("status", status),
+    ]
+    if a.responded == kind && a.status == "invalid" {
+        push(mut members, json.object_member("error", [
+            json.text_member("type", "urn:ietf:params:acme:error:unauthorized"), json.text_member("detail", a.detail), json.int_member("status", 403),
+        ]))
+    }
+    json.object_value(members)
+}
+
+fn authz_json(f: *Fake, index: i64) -> json.Value {
+    let a = f.authzs[index]
+    var list: []json.Value = []
+    for kind in kinds_for(a) {
+        push(mut list, challenge_json(f, index, kind))
+    }
+    var members: []json.Member = [
+        json.text_member("status", a.status), json.text_member("expires", "2031-01-01T00:00:00Z"),
+        json.object_member("identifier", [json.text_member("type", a.kind), json.text_member("value", a.value)]),
+        json.array_member("challenges", list),
+    ]
+    if a.wildcard {
+        push(mut members, json.bool_member("wildcard", true))
+    }
+    json.object_value(members)
+}
+
+fn with_retry(f: *Fake, r: http.Response) -> http.Response {
+    var out = r
+    if f.retry_after.len > 0 {
+        header.set(mut out.headers, "retry-after", f.retry_after)
+    }
+    out
+}
+
+fn order_handler(f: *Fake, call: Call, index: i64) -> http.Response {
+    if index < 0 || index >= f.orders.len || f.orders[index].account != call.account {
+        return plain_problem(404, "malformed", "no such order")
+    }
+    if f.orders[index].finalized && f.orders[index].cert < 0 {
+        if f.orders[index].polls_left > 0 {
+            f.orders[index].polls_left -= 1
+            return with_retry(f, json_reply(200, order_json(f, index)))
+        }
+        issue_certificate_for(f, index)
+    }
+    json_reply(200, order_json(f, index))
+}
+
+fn authz_handler(f: *Fake, call: Call, index: i64) -> http.Response {
+    if index < 0 || index >= f.authzs.len || f.orders[f.authzs[index].order].account != call.account {
+        return plain_problem(404, "malformed", "no such authorization")
+    }
+    if f.authzs[index].responded.len > 0 && f.authzs[index].status == "pending" {
+        if f.authzs[index].polls_left > 0 {
+            f.authzs[index].polls_left -= 1
+            return with_retry(f, json_reply(200, authz_json(f, index)))
+        }
+        f.authzs[index].status = f.authzs[index].outcome
+    }
+    json_reply(200, authz_json(f, index))
+}
+
+fn find_bytes(hay: []u8, needle: []u8) -> bool {
+    if needle.len == 0 || needle.len > hay.len {
+        return false
+    }
+    for at in 0..hay.len - needle.len + 1 {
+        var same = true
+        for i in 0..needle.len {
+            if hay[at + i] != needle[i] {
+                same = false
+                break
+            }
+        }
+        if same {
+            return true
+        }
+    }
+    false
+}
+
+fn key_authorization_of(f: *Fake, az: Az) -> str {
+    let owner = f.accounts[f.orders[az.order].account]
+    "{az.token}.{jose.thumbprint(owner.jwk)}"
+}
+
+fn http01_detail(f: *Fake, az: Az, ka: str) -> str {
+    let url = "http://127.0.0.1:{f.http_port}/.well-known/acme-challenge/{az.token}"
+    let resp = http.get(f.plain, url) catch { _ => return "the HTTP request failed" }
+    if resp.status != 200 {
+        return "the HTTP response was {resp.status}"
+    }
+    if str(resp.body) != ka {
+        return "the key authorization does not match"
+    }
+    ""
+}
+
+fn dns01_detail(f: *Fake, az: Az, ka: str) -> str {
+    let digest = hash.sum(hash.sha256(), bytes(ka))
+    let want = base64.encode_url(digest)
+    let have = f.records["_acme-challenge.{az.value}"] ?? ""
+    if have.len == 0 {
+        return "no TXT record"
+    }
+    if have != want {
+        return "the TXT record does not match"
+    }
+    ""
+}
+
+fn alpn_name(az: Az) -> str {
+    if az.kind == "ip" {
+        return acme.tls_alpn_server_name(acme.Identifier { kind: "ip", value: az.value })
+    }
+    az.value
+}
+
+fn tls_alpn_detail(f: *Fake, az: Az, ka: str) -> str {
+    let addr = net.Addr { ip: [127, 0, 0, 1], port: f.tls_port }
+    using c = net.connect(addr) or return "the connection failed"
+    let config = tls.Config { server_name: alpn_name(az), alpn: ["acme-tls/1"], verify: false }
+    using t = tls.client(net.stream(c), config) or return "the handshake failed"
+    let protocol = t.handle.protocol
+    if protocol != "acme-tls/1" {
+        tls.close(t)
+        return "the protocol is {protocol}"
+    }
+    let leaf = t.handle.peer_certificates[0]
+    tls.close(t)
+    let digest = hash.sum(hash.sha256(), bytes(ka))
+    let oid = der.object_identifier("1.3.6.1.5.5.7.1.31") or return "no OID"
+    var expected: []u8 = []
+    io.append(mut expected, oid)
+    io.append(mut expected, [0x01, 0x01, 0xFF])
+    io.append(mut expected, der.octet_string(der.octet_string(digest)))
+    if !find_bytes(leaf.raw, expected) {
+        return "the acmeIdentifier extension is missing or wrong"
+    }
+    if leaf.dns_names.len + leaf.ip_addresses.len != 1 {
+        return "the certificate must name one identifier"
+    }
+    ""
+}
+
+fn validation_detail(f: *Fake, index: i64, kind: str) -> str {
+    let az = f.authzs[index]
+    if slices.contains(f.unauthorized, az.value) {
+        return "the server could not validate {az.value}"
+    }
+    let ka = key_authorization_of(f, az)
+    match kind {
+        "http-01" => http01_detail(f, az, ka)
+        "dns-01" => dns01_detail(f, az, ka)
+        _ => tls_alpn_detail(f, az, ka)
+    }
+}
+
+fn challenge_handler(f: *Fake, call: Call, index: i64, kind: str) -> http.Response {
+    if index < 0 || index >= f.authzs.len || f.orders[f.authzs[index].order].account != call.account {
+        return plain_problem(404, "malformed", "no such challenge")
+    }
+    if !slices.contains(kinds_for(f.authzs[index]), kind) {
+        return plain_problem(404, "malformed", "no such challenge type")
+    }
+    if f.authzs[index].responded.len == 0 {
+        let detail = validation_detail(f, index, kind)
+        f.authzs[index].responded = kind
+        f.authzs[index].outcome = if detail.len == 0 { "valid" } else { "invalid" }
+        f.authzs[index].detail = detail
+        f.authzs[index].polls_left = f.authz_polls
+        log_event(f, "validated {kind} {f.authzs[index].value} -> {f.authzs[index].outcome}")
+    }
+    json_reply(200, challenge_json(f, index, kind))
+}
+
+fn request_spki(r: x509.Request) -> []u8 ! io.Error {
+    let d = der.reader(r.info)
+    let inner = der.enter(d, 0x30)?
+    let _ = der.read(inner)?
+    let _ = der.read(inner)?
+    let spki = der.read(inner)?
+    spki.raw
+}
+
+fn request_names(r: x509.Request) -> []str {
+    var out: []str = []
+    for name in r.dns_names {
+        push(mut out, name)
+    }
+    for ip in r.ip_addresses {
+        push(mut out, net.format_ip(ip))
+    }
+    out
+}
+
+fn same_names(ids: []acme.Identifier, names: []str) -> bool {
+    if ids.len != names.len {
+        return false
+    }
+    for id in ids {
+        if !slices.contains(names, id.value) {
+            return false
+        }
+    }
+    true
+}
+
+fn issue_leaf(f: *Fake, order: Ord, csr: x509.Request) -> []u8 ! io.Error {
+    let now = unix_now(f)
+    let spki = request_spki(csr)?
+    let key_id = der.encode(0x80, f.aki)
+    let authority = x509.Extension { id: "2.5.29.35", critical: false, value: der.sequence([key_id]) }
+    let serial: []u8 = [0x01, u8(f.certs.len + 1)]
+    let template = x509.Template {
+        serial, subject: "", not_before: now, not_after: now + f.cert_seconds, dns_names: csr.dns_names, ip_addresses: csr.ip_addresses,
+        extensions: [authority],
+    }
+    x509.create_certificate(template, spki, f.ca_key, f.ca_subject)?
+}
+
+fn issue_certificate_for(f: *Fake, index: i64) {
+    let order = f.orders[index]
+    let csr = x509.parse_request(order_csr(f, index)) or return
+    let leaf = issue_leaf(f, order, csr) or return
+    push(mut f.certs, Cert { der: leaf, order: index, revoked: false, reason: -1 })
+    f.orders[index].cert = f.certs.len - 1
+    log_event(f, "issued certificate {f.certs.len - 1} for order {index}")
+}
+
+fn order_csr(f: *Fake, index: i64) -> []u8 {
+    f.orders[index].csr
+}
+
+fn bad_csr(detail: str) -> http.Response {
+    plain_problem(400, "badCSR", detail)
+}
+
+fn finalize_handler(f: *Fake, call: Call, index: i64) -> http.Response {
+    if index < 0 || index >= f.orders.len || f.orders[index].account != call.account {
+        return plain_problem(404, "malformed", "no such order")
+    }
+    if order_status(f, index) != "ready" {
+        return plain_problem(403, "orderNotReady", "the order is not ready")
+    }
+    let payload = payload_json(call)
+    let text_csr = json.field_text(payload, "csr") ?? ""
+    let encoded = base64.decode_url(text_csr) catch { _ => return bad_csr("the CSR is not Base64url") }
+    let csr = x509.parse_request(encoded) catch { _ => return bad_csr("the CSR does not parse") }
+    if !x509.check_request_signature(csr) {
+        return bad_csr("the CSR signature is wrong")
+    }
+    if !same_names(f.orders[index].ids, request_names(csr)) {
+        return bad_csr("the CSR names differ from the order")
+    }
+    f.orders[index].csr = encoded
+    f.orders[index].finalized = true
+    f.orders[index].polls_left = f.order_polls
+    if f.order_polls == 0 {
+        issue_certificate_for(f, index)
+    }
+    with_retry(f, json_reply(200, order_json(f, index)))
+}
+
+fn certificate_handler(f: *Fake, call: Call, index: i64, alternate: bool, req: http.Request) -> http.Response {
+    if index < 0 || index >= f.certs.len || f.orders[f.certs[index].order].account != call.account {
+        return plain_problem(404, "malformed", "no such certificate")
+    }
+    let accept = header.get(req.headers, "accept") ?? ""
+    if !text.contains(accept, "application/pem-certificate-chain") {
+        return plain_problem(406, "malformed", "ask for application/pem-certificate-chain")
+    }
+    let issuer = if alternate { f.alt_der } else { f.ca_der }
+    let chain = "{x509.certificate_pem(f.certs[index].der)}{x509.certificate_pem(issuer)}"
+    var r = http.response(200, chain)
+    header.set(mut r.headers, "content-type", "application/pem-certificate-chain")
+    if !alternate {
+        header.add(mut r.headers, "link", "<{f.base}/cert/{index}/alt>;rel=\"alternate\"")
+        header.add(mut r.headers, "link", "<{f.base}/index>;rel=\"index\"")
+    }
+    r
+}
+
+fn key_matches_certificate(jwk: jose.Jwk, cert: x509.Certificate) -> bool {
+    match jwk.key {
+        Ec(_, public, _) => hash.equal(public, cert.public_key.key)
+        Ed(public, _) => hash.equal(public, cert.public_key.key)
+        _ => false
+    }
+}
+
+fn revoke_handler(f: *Fake, call: Call) -> http.Response {
+    let payload = payload_json(call)
+    let encoded = json.field_text(payload, "certificate") ?? ""
+    let raw = base64.decode_url(encoded) catch { _ => return plain_problem(400, "malformed", "the certificate is not Base64url") }
+    var found = -1
+    for i in 0..f.certs.len {
+        if hash.equal(f.certs[i].der, raw) {
+            found = i
+        }
+    }
+    if found < 0 {
+        return plain_problem(404, "malformed", "the certificate was not issued here")
+    }
+    let parsed = x509.parse(raw) catch { _ => return plain_problem(400, "malformed", "the certificate does not parse") }
+    if call.account >= 0 {
+        if f.orders[f.certs[found].order].account != call.account {
+            return plain_problem(403, "unauthorized", "the account did not order the certificate")
+        }
+    } else {
+        let allowed = match call.protected.jwk {
+            some(k) => key_matches_certificate(k, parsed)
+            none => false
+        }
+        if !allowed {
+            return plain_problem(403, "unauthorized", "the key is not the certificate key")
+        }
+    }
+    if f.certs[found].revoked {
+        return plain_problem(400, "alreadyRevoked", "the certificate is revoked")
+    }
+    let reason = json.field_int(payload, "reason") ?? -1
+    if reason == 7 || reason > 10 {
+        return plain_problem(400, "badRevocationReason", "the reason is not allowed")
+    }
+    f.certs[found].revoked = true
+    f.certs[found].reason = reason
+    log_event(f, "revoked certificate {found} reason={reason} by={if call.account >= 0 { "account" } else { "key" }}")
+    http.response(200, "")
+}
+
+fn ari_handler(f: *Fake, id: str) -> http.Response {
+    if !f.ari {
+        return plain_problem(404, "malformed", "no renewalInfo")
+    }
+    var known = false
+    for c in f.certs {
+        let have = acme.renewal_id(c.der) catch { _ => "" }
+        if have == id {
+            known = true
+        }
+    }
+    if !known {
+        return plain_problem(404, "malformed", "unknown certificate")
+    }
+    let start = timestamp.from_unix(f.window_start) or return plain_problem(500, "serverInternal", "time")
+    let end = timestamp.from_unix(f.window_end) or return plain_problem(500, "serverInternal", "time")
+    let window = json.object_member("suggestedWindow", [
+        json.text_member("start", timestamp.to_string(start)), json.text_member("end", timestamp.to_string(end)),
+    ])
+    var r = json_reply(200, json.object_value([window]))
+    if f.ari_retry > 0 {
+        header.set(mut r.headers, "retry-after", "{f.ari_retry}")
+    }
+    r
+}
+
+fn route_post(f: *Fake, req: http.Request) -> http.Response {
+    f.posts += 1
+    let call = authenticate(f, req)
+    if !call.ok {
+        return call.failure
+    }
+    let path = req.path
+    if path == "/acct" {
+        return new_account_handler(f, call)
+    }
+    if call.account < 0 && path != "/revoke" {
+        return plain_problem(400, "malformed", "this resource needs a kid")
+    }
+    if path == "/order" {
+        return new_order_handler(f, call)
+    }
+    if path == "/rollover" {
+        return key_change_handler(f, call)
+    }
+    if path == "/revoke" {
+        return revoke_handler(f, call)
+    }
+    if text.starts_with(path, "/acct/") {
+        return account_handler(f, call, index_after(path, "/acct/"))
+    }
+    if text.starts_with(path, "/order/") {
+        return order_handler(f, call, index_after(path, "/order/"))
+    }
+    if text.starts_with(path, "/finalize/") {
+        return finalize_handler(f, call, index_after(path, "/finalize/"))
+    }
+    if text.starts_with(path, "/authz/") {
+        return authz_handler(f, call, index_after(path, "/authz/"))
+    }
+    if text.starts_with(path, "/chall/") {
+        let rest = path[7..]
+        let slash = text.index_byte(rest, '/')
+        if slash < 0 {
+            return plain_problem(404, "malformed", "no such resource")
+        }
+        let index = text.parse_int(rest[..slash]) catch { _ => -1 }
+        return challenge_handler(f, call, index, rest[slash + 1..])
+    }
+    if text.starts_with(path, "/cert/") {
+        return certificate_handler(f, call, index_after(path, "/cert/"), text.ends_with(path, "/alt"), req)
+    }
+    plain_problem(404, "malformed", "no such resource")
+}
+
+fn route(f: *Fake, req: http.Request) -> http.Response {
+    if req.method == "GET" || req.method == "HEAD" {
+        if req.path == "/dir" {
+            return directory(f)
+        }
+        if req.path == "/nonce" {
+            return http.response(200, "")
+        }
+        if text.starts_with(req.path, "/ari/") {
+            return ari_handler(f, req.path[5..])
+        }
+        if text.starts_with(req.path, "/problem/") {
+            return plain_problem(400, req.path[9..], "detail of {req.path[9..]}")
+        }
+        if req.path == "/problem-other" {
+            let members: []json.Member = [
+                json.text_member("type", "https://example.test/problems/custom"), json.text_member("detail", "a custom problem"),
+                json.text_member("instance", "https://example.test/instances/1"),
+                json.array_member("subproblems", [json.object_value([
+                    json.text_member("type", "urn:ietf:params:acme:error:caa"), json.text_member("detail", "CAA forbids"),
+                    json.object_member("identifier", [json.text_member("type", "dns"), json.text_member("value", "caa.example.test")]),
+                ]), json.object_value([json.text_member("detail", "no type or identifier")])]),
+            ]
+            var r = http.response(429, json.stringify(json.object_value(members), 0))
+            header.set(mut r.headers, "content-type", "application/problem+json")
+            return r
+        }
+        if req.path == "/plain-error" {
+            return http.response(500, "boom")
+        }
+        if req.path == "/not-json" {
+            return http.response(200, "not json")
+        }
+        if req.path == "/partial-directory" {
+            return json_reply(200, json.object_value([json.text_member("newNonce", "x")]))
+        }
+        return plain_problem(404, "malformed", "no such resource")
+    }
+    if req.method != "POST" {
+        return plain_problem(405, "malformed", "method not allowed")
+    }
+    route_post(f, req)
+}
+
+fn handle_request(f: *Fake, req: http.Request) -> http.Response {
+    sync.lock(f.lock)
+    var resp = route(f, req)
+    header.set(mut resp.headers, "replay-nonce", fresh_nonce(f))
+    header.set(mut resp.headers, "cache-control", "no-store")
+    sync.unlock(f.lock)
+    resp
+}
