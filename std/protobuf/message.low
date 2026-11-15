@@ -1,0 +1,690 @@
+import std/io
+import std/serde
+import std/slices
+import std/text
+import std/unicode
+
+const max_depth = 100
+
+enum Style {
+    Plain
+    Sint
+    Fixed
+}
+
+struct Spec {
+    number: i64
+    style: Style
+    key: Style
+    value: Style
+    unpacked: bool
+    oneof: bool
+    required: bool
+}
+
+struct Walk {
+    stack: []serde.Schema
+}
+
+struct Occurrence {
+    at: i64
+    field: Field
+}
+
+struct Occurrences {
+    all: []Occurrence
+    by_number: [i64: []Occurrence]
+}
+
+/// Encodes `v` as a protobuf message through `std/serde`.
+///
+/// `T` is a struct whose fields carry their protobuf numbers in tags, `id: i32 "2"`, and whose tags can also name an encoding, `delta: i64 "3,sint"`. The tag is a comma separated list of:
+///
+/// - the field number, from `1` to `536870911`, which every struct field except a `oneof` needs;
+/// - `sint`, which writes a signed integer ZigZag encoded, and `fixed`, which writes an integer as `fixed32`, `fixed64`, `sfixed32` or `sfixed64` by its type;
+/// - `unpacked`, which writes a repeated scalar field as one field per element instead of packed;
+/// - `required`, which writes the field even when it holds the default value and makes decoding fail with `Missing` when it is absent;
+/// - `oneof`, which marks a field whose enum type holds the members of a protobuf `oneof`: each variant has one payload field and its `= n` index is the field number of the member;
+/// - `key=sint`, `key=fixed`, `value=sint` and `value=fixed`, which select the encoding of a map's keys or values.
+///
+/// An integer type takes the encoding of `int32`, `int64`, `uint32` or `uint64` by its width and sign, `f32` and `f64` become `float` and `double`, `bool`, `str` and `[]u8` become `bool`, `string` and `bytes`, a struct becomes an embedded message, an enum of variants without fields becomes a protobuf enum whose values are the variants' indexes, a slice becomes a repeated field, packed for scalars unless tagged `unpacked`, and a map becomes a map field. A field of optional type is written when it holds a value, however small; any other singular field is left out when it holds the default value, which is zero, `false`, empty, or the enum value `0`, unless the field declares a default of its own, `label: str "2" = "unset"`, in which case it is always written because the receiver would otherwise read the declared default, and an embedded message that is not optional is always written. A payload field of a `oneof` variant takes a tag without a number.
+///
+/// Panics when a tag is malformed, a field has no number or the type has no protobuf form.
+pub fn serialize[T](v: T) -> []u8 {
+    let root = serde.to_tree(v)
+    let schema = serde.schema[T]()
+    if schema.kind != serde.Kind.Struct {
+        panic("protobuf: serialize needs a struct, not {schema.kind}")
+    }
+    let w = new(Walk { stack: [] })
+    let e = encoder()
+    encode_message(w, e, schema, root.tree)
+    slices.clone(encoded(e))
+}
+
+/// Decodes a protobuf message into a `T` through `std/serde`.
+///
+/// `T` is tagged as `serialize` describes. A field absent from the input takes its default, which is its declared default when it has one, `none` for an optional field and zero, `false`, empty or the first enum value otherwise; only a `required` field fails with `Missing`. A singular field that occurs more than once takes the last value, except that occurrences of an embedded message are merged, and repeated fields collect every occurrence, packed or not. A `oneof` takes its last member. Unknown fields, fields whose wire type does not fit their type and enum values no variant has are skipped. Strings are checked for UTF-8. Fails with `Syntax` at the byte offset of a truncated or overlong varint, a length past the end of the input, field number `0`, wire type `6` or `7` and a group, or invalid UTF-8 in a string, with `TooDeep` when messages nest more than 100 levels, with `Mismatch` when `T` is not a struct, and with `Missing` and `Range` as `serde.read` describes.
+pub fn deserialize[T](data: []u8) -> T ! serde.Error {
+    let schema = serde.schema[T]()
+    if schema.kind != serde.Kind.Struct {
+        fail serde.Error.Mismatch("struct", 0)
+    }
+    let w = new(Walk { stack: [] })
+    let tree = decode_message(w, schema, data, 0)?
+    serde.read(serde.tree_reader(serde.Node { tree }, false))
+}
+
+fn resolve(w: *Walk, s: serde.Schema) -> serde.Schema {
+    if s.kind != serde.Kind.Ref {
+        return s
+    }
+    var i = w.stack.len - 1
+    for i >= 0 {
+        if w.stack[i].name == s.name {
+            return w.stack[i]
+        }
+        i -= 1
+    }
+    panic("protobuf: {s.name} refers to a type that is not open")
+}
+
+fn spec_word(owner: str, prop: serde.Property, mut spec: Spec, word: str) {
+    match word {
+        == "sint" => { spec.style = Style.Sint }
+        == "fixed" => { spec.style = Style.Fixed }
+        == "unpacked" => { spec.unpacked = true }
+        == "oneof" => { spec.oneof = true }
+        == "required" => { spec.required = true }
+        == "key=sint" => { spec.key = Style.Sint }
+        == "key=fixed" => { spec.key = Style.Fixed }
+        == "value=sint" => { spec.value = Style.Sint }
+        == "value=fixed" => { spec.value = Style.Fixed }
+        _ => {
+            let number = text.parse_int(word) catch {
+                _ => panic("protobuf: {owner}.{prop.name} has the tag word {word}")
+            }
+            if number < 1 || number > 536870911 {
+                panic("protobuf: {owner}.{prop.name} has the field number {number}")
+            }
+            spec.number = number
+        }
+    }
+}
+
+fn field_spec(owner: str, prop: serde.Property, number: i64) -> Spec {
+    var spec = Spec { number, style: Style.Plain, key: Style.Plain, value: Style.Plain, unpacked: false, oneof: false, required: false }
+    if prop.tag != "" {
+        for word in text.split(prop.tag, ',') {
+            spec_word(owner, prop, mut spec, word)
+        }
+    }
+    if spec.number == 0 && !spec.oneof {
+        panic("protobuf: {owner}.{prop.name} has no field number in its tag")
+    }
+    spec
+}
+
+fn packable(kind: serde.Kind) -> bool {
+    match kind {
+        Bool => true
+        Int => true
+        Uint => true
+        Float => true
+        Enum => true
+        _ => false
+    }
+}
+
+fn scalar_wire(s: serde.Schema, style: Style) -> Wire {
+    match s.kind {
+        Float => if s.bits == 32 { Wire.Fixed32 } else { Wire.Fixed64 }
+        Int => fixed_or_varint(s, style)
+        Uint => fixed_or_varint(s, style)
+        _ => Wire.Varint
+    }
+}
+
+fn fixed_or_varint(s: serde.Schema, style: Style) -> Wire {
+    match style {
+        Fixed => if s.bits == 32 { Wire.Fixed32 } else { Wire.Fixed64 }
+        _ => Wire.Varint
+    }
+}
+
+fn variant_index(s: serde.Schema, name: str) -> i64 {
+    for v in s.variants {
+        if v.name == name {
+            return v.index
+        }
+    }
+    panic("protobuf: {s.name} has no variant {name}")
+}
+
+fn variant_named(s: serde.Schema, index: i64) -> str? {
+    for v in s.variants {
+        if v.index == index {
+            return v.name
+        }
+    }
+    none
+}
+
+fn members_of(tree: serde.Tree) -> []serde.Member {
+    match tree {
+        Map(members) => members
+        _ => panic("protobuf: a value does not match its schema")
+    }
+}
+
+fn items_of(tree: serde.Tree) -> []serde.Node {
+    match tree {
+        Seq(items) => items
+        _ => panic("protobuf: a value does not match its schema")
+    }
+}
+
+fn text_of(tree: serde.Tree) -> str {
+    match tree {
+        Text(s) => s
+        _ => panic("protobuf: a value does not match its schema")
+    }
+}
+
+fn int_of(tree: serde.Tree) -> u64 {
+    match tree {
+        Int(n) => u64(n)
+        Uint(n) => n
+        _ => panic("protobuf: a value does not match its schema")
+    }
+}
+
+fn scalar_bits(s: serde.Schema, style: Style, value: serde.Tree) -> u64 {
+    match s.kind {
+        Bool => match value {
+            Bool(b) => if b { 1 } else { 0 }
+            _ => panic("protobuf: a value does not match its schema")
+        }
+        Int => match style {
+            Sint => zigzag(i64(int_of(value)))
+            _ => int_of(value)
+        }
+        Uint => int_of(value)
+        Float => match value {
+            Float(x) => if s.bits == 32 { u64(text.float32_bits(f32(x))) } else { text.float_bits(x) }
+            _ => panic("protobuf: a value does not match its schema")
+        }
+        _ => u64(variant_index(s, text_of(value)))
+    }
+}
+
+fn put_bits(e: *Encoder, wire: Wire, bits: u64) {
+    match wire {
+        Fixed32 => put_fixed32(e, u32(bits))
+        Fixed64 => put_fixed64(e, bits)
+        _ => put_varint(e, bits)
+    }
+}
+
+fn is_default(s: serde.Schema, value: serde.Tree) -> bool {
+    match value {
+        Bool(b) => !b
+        Int(n) => n == 0
+        Uint(n) => n == 0
+        Float(x) => if s.bits == 32 { text.float32_bits(f32(x)) == 0 } else { text.float_bits(x) == 0 }
+        Text(t) => match s.kind {
+            Enum => variant_index(s, t) == 0
+            _ => t.len == 0
+        }
+        Binary(data) => data.len == 0
+        _ => false
+    }
+}
+
+fn put_field(w: *Walk, e: *Encoder, number: i64, s: serde.Schema, style: Style, value: serde.Tree) {
+    match s.kind {
+        Struct => {
+            let mark = begin_message(e, number)
+            encode_message(w, e, s, value)
+            end_message(e, mark)
+        }
+        Text => write_string(e, number, text_of(value))
+        Binary => match value {
+            Binary(data) => write_bytes(e, number, data)
+            _ => panic("protobuf: a value does not match its schema")
+        }
+        _ => {
+            let wire = scalar_wire(s, style)
+            put_tag(e, number, wire)
+            put_bits(e, wire, scalar_bits(s, style, value))
+        }
+    }
+}
+
+fn encode_message(w: *Walk, e: *Encoder, s: serde.Schema, tree: serde.Tree) {
+    let members = members_of(tree)
+    push(mut w.stack, s)
+    for i, prop in s.fields {
+        encode_property(w, e, s.name, prop, members[i].value.tree)
+    }
+    truncate(mut w.stack, w.stack.len - 1)
+}
+
+fn encode_property(w: *Walk, e: *Encoder, owner: str, prop: serde.Property, value: serde.Tree) {
+    let spec = field_spec(owner, prop, 0)
+    let s = resolve(w, prop.schema)
+    if spec.oneof {
+        encode_oneof(w, e, s, value)
+        return
+    }
+    match s.kind {
+        Optional => match value {
+            Null => {}
+            _ => put_field(w, e, spec.number, resolve(w, s.items[0]), spec.style, value)
+        }
+        Seq => encode_repeated(w, e, spec, resolve(w, s.items[0]), items_of(value))
+        Map => encode_map(w, e, spec, s, members_of(value))
+        _ => {
+            let declared = !prop.required
+            if spec.required || declared || !is_default(s, value) {
+                put_field(w, e, spec.number, s, spec.style, value)
+            }
+        }
+    }
+}
+
+fn encode_repeated(w: *Walk, e: *Encoder, spec: Spec, elem: serde.Schema, items: []serde.Node) {
+    if items.len == 0 {
+        return
+    }
+    if packable(elem.kind) && !spec.unpacked {
+        let wire = scalar_wire(elem, spec.style)
+        let mark = begin_message(e, spec.number)
+        for item in items {
+            put_bits(e, wire, scalar_bits(elem, spec.style, item.tree))
+        }
+        end_message(e, mark)
+        return
+    }
+    for item in items {
+        put_field(w, e, spec.number, elem, spec.style, item.tree)
+    }
+}
+
+fn key_tree(s: serde.Schema, key: str) -> serde.Tree {
+    match s.kind {
+        Bool => serde.Tree.Bool(key == "true")
+        Int => serde.Tree.Int(text.parse_int(key) or panic("protobuf: map key {key} is not an integer"))
+        Uint => serde.unsigned_tree(text.parse_u64(key, 10) or panic("protobuf: map key {key} is not an unsigned integer"))
+        _ => serde.Tree.Text(key)
+    }
+}
+
+fn encode_map(w: *Walk, e: *Encoder, spec: Spec, s: serde.Schema, members: []serde.Member) {
+    let key_schema = resolve(w, s.items[0])
+    let value_schema = resolve(w, s.items[1])
+    for m in members {
+        let key = key_tree(key_schema, text_of(m.key.tree))
+        let mark = begin_message(e, spec.number)
+        put_field(w, e, 1, key_schema, spec.key, key)
+        put_field(w, e, 2, value_schema, spec.value, m.value.tree)
+        end_message(e, mark)
+    }
+}
+
+fn encode_oneof(w: *Walk, e: *Encoder, s: serde.Schema, value: serde.Tree) {
+    let group = if s.kind == serde.Kind.Optional { resolve(w, s.items[0]) } else { s }
+    match value {
+        Null => {}
+        Map(members) => {
+            let name = text_of(members[0].key.tree)
+            push(mut w.stack, group)
+            for v in group.variants {
+                if v.name == name {
+                    encode_member(w, e, group.name, v, members[0].value.tree)
+                }
+            }
+            truncate(mut w.stack, w.stack.len - 1)
+        }
+        _ => panic("protobuf: {s.name} is a oneof and every variant needs a payload")
+    }
+}
+
+fn encode_member(w: *Walk, e: *Encoder, owner: str, v: serde.Variant, payload: serde.Tree) {
+    if v.fields.len != 1 {
+        panic("protobuf: {owner}.{v.name} is a oneof member and needs one payload field")
+    }
+    let prop = v.fields[0]
+    let spec = field_spec(owner, prop, v.index)
+    let value = if v.labelled { members_of(payload)[0].value.tree } else { items_of(payload)[0].tree }
+    put_field(w, e, v.index, resolve(w, prop.schema), spec.style, value)
+}
+
+fn wire_failure(failure: io.Error, at: i64) -> serde.Error {
+    match failure {
+        Unsupported => serde.Error.Syntax(at, "protobuf groups are not supported")
+        _ => serde.Error.Syntax(at, "malformed protobuf")
+    }
+}
+
+fn collect(data: []u8, base: i64) -> Occurrences ! serde.Error {
+    let d = decoder(data)
+    var all: []Occurrence = []
+    var by_number: [i64: []Occurrence] = [:]
+    for {
+        let start = d.at
+        let next_field = next(d) catch {
+            failure => fail wire_failure(failure, base + start)
+        }
+        let f = next_field ?? break
+        let occurrence = Occurrence { at: base + d.at - f.data.len, field: f }
+        push(mut all, occurrence)
+        var list = by_number[f.number] ?? []
+        push(mut list, occurrence)
+        by_number[f.number] = list
+    }
+    Occurrences { all, by_number }
+}
+
+fn member(name: str, tree: serde.Tree) -> serde.Member {
+    serde.Member { key: serde.Node { tree: serde.Tree.Text(name) }, value: serde.Node { tree } }
+}
+
+fn decode_message(w: *Walk, s: serde.Schema, data: []u8, base: i64) -> serde.Tree ! serde.Error {
+    if w.stack.len >= max_depth {
+        fail serde.Error.TooDeep
+    }
+    let occurrences = collect(data, base)?
+    push(mut w.stack, s)
+    var members: []serde.Member = []
+    for prop in s.fields {
+        let spec = field_spec(s.name, prop, 0)
+        let found = decode_property(w, prop, spec, occurrences)?
+        match found {
+            some(tree) => push(mut members, member(prop.name, tree))
+            none => {}
+        }
+    }
+    truncate(mut w.stack, w.stack.len - 1)
+    serde.Tree.Map(members)
+}
+
+fn decode_property(w: *Walk, prop: serde.Property, spec: Spec, occurrences: Occurrences) -> serde.Tree? ! serde.Error {
+    let s = resolve(w, prop.schema)
+    if spec.oneof {
+        return decode_oneof(w, s, occurrences)?
+    }
+    let list = occurrences.by_number[spec.number] ?? []
+    let found = match s.kind {
+        Optional => decode_singular(w, resolve(w, s.items[0]), spec.style, list)?
+        Seq => decode_repeated(w, resolve(w, s.items[0]), spec, list)?
+        Map => decode_map(w, s, spec, list)?
+        _ => decode_singular(w, s, spec.style, list)?
+    }
+    match found {
+        some(tree) => some(tree)
+        none => absent(w, prop, spec, s)?
+    }
+}
+
+fn absent(w: *Walk, prop: serde.Property, spec: Spec, s: serde.Schema) -> serde.Tree? ! serde.Error {
+    if !prop.required || spec.required {
+        return none
+    }
+    zero_tree(w, prop.schema, s)?
+}
+
+fn zero_tree(w: *Walk, declared: serde.Schema, s: serde.Schema) -> serde.Tree? ! serde.Error {
+    match s.kind {
+        Bool => some(serde.Tree.Bool(false))
+        Int => some(serde.Tree.Int(0))
+        Uint => some(serde.Tree.Int(0))
+        Float => some(serde.Tree.Float(0.0))
+        Text => some(serde.Tree.Text(""))
+        Binary => some(serde.Tree.Binary([]))
+        Seq => some(serde.Tree.Seq([]))
+        Map => some(serde.Tree.Map([]))
+        Enum => zero_enum(s)
+        Struct => {
+            if declared.kind == serde.Kind.Ref {
+                return none
+            }
+            some(decode_message(w, s, [], 0)?)
+        }
+        _ => none
+    }
+}
+
+fn zero_enum(s: serde.Schema) -> serde.Tree? {
+    for v in s.variants {
+        if v.fields.len > 0 {
+            return none
+        }
+    }
+    let named = variant_named(s, 0)
+    match named {
+        some(name) => some(serde.Tree.Text(name))
+        none => if s.variants.len > 0 { some(serde.Tree.Text(s.variants[0].name)) } else { none }
+    }
+}
+
+fn unzigzag32(v: u64) -> i64 {
+    unzigzag(v & 0xFFFFFFFF)
+}
+
+fn scalar_tree(s: serde.Schema, style: Style, bits: u64) -> serde.Tree? {
+    match s.kind {
+        Bool => some(serde.Tree.Bool(bits != 0))
+        Int => some(serde.Tree.Int(signed_of(s, style, bits)))
+        Uint => some(unsigned_of(s, bits))
+        Float => some(serde.Tree.Float(if s.bits == 32 { f64(text.float32_from_bits(u32(bits))) } else { text.float_from_bits(bits) }))
+        _ => match variant_named(s, i64(i32(bits))) {
+            some(name) => some(serde.Tree.Text(name))
+            none => none
+        }
+    }
+}
+
+fn signed_of(s: serde.Schema, style: Style, bits: u64) -> i64 {
+    match style {
+        Sint => if s.bits == 32 { unzigzag32(bits) } else { unzigzag(bits) }
+        _ => if s.bits == 32 { i64(i32(bits)) } else { i64(bits) }
+    }
+}
+
+fn unsigned_of(s: serde.Schema, bits: u64) -> serde.Tree {
+    if s.bits == 32 {
+        return serde.Tree.Int(i64(u32(bits)))
+    }
+    serde.unsigned_tree(bits)
+}
+
+fn text_value(o: Occurrence) -> serde.Tree ! serde.Error {
+    let value = str(o.field.data)
+    if !unicode.utf8_valid(value) {
+        fail serde.Error.Syntax(o.at, "invalid UTF-8 in a string")
+    }
+    serde.Tree.Text(value)
+}
+
+fn element(w: *Walk, s: serde.Schema, o: Occurrence) -> serde.Tree ! serde.Error {
+    match s.kind {
+        Text => text_value(o)?
+        Binary => serde.Tree.Binary(slices.clone(o.field.data))
+        _ => decode_message(w, s, o.field.data, o.at)?
+    }
+}
+
+fn compatible(s: serde.Schema, style: Style, o: Occurrence) -> bool {
+    let wire = match s.kind {
+        Text => Wire.Bytes
+        Binary => Wire.Bytes
+        Struct => Wire.Bytes
+        _ => scalar_wire(s, style)
+    }
+    wire_code(o.field.wire) == wire_code(wire)
+}
+
+fn decode_singular(w: *Walk, s: serde.Schema, style: Style, list: []Occurrence) -> serde.Tree? ! serde.Error {
+    var last: Occurrence? = none
+    var merged: []u8 = []
+    var parts = 0
+    for o in list {
+        if !compatible(s, style, o) {
+            continue
+        }
+        last = o
+        if s.kind == serde.Kind.Struct {
+            parts += 1
+            merged = if parts == 1 { o.field.data } else { slices.concat(merged, o.field.data) }
+        }
+    }
+    let chosen = last ?? return none
+    match s.kind {
+        Struct => some(decode_message(w, s, merged, chosen.at)?)
+        Text => some(text_value(chosen)?)
+        Binary => some(element(w, s, chosen)?)
+        _ => scalar_tree(s, style, chosen.field.value)
+    }
+}
+
+fn unpack(elem: serde.Schema, style: Style, o: Occurrence, mut items: []serde.Node) ! serde.Error {
+    let wire = scalar_wire(elem, style)
+    let data = o.field.data
+    var at = 0
+    match wire {
+        Varint => {
+            for at < data.len {
+                let bits = read_varint(data, mut at) catch {
+                    failure => fail wire_failure(failure, o.at + at)
+                }
+                push_scalar(elem, style, bits, mut items)
+            }
+        }
+        _ => {
+            let width = if wire_code(wire) == wire_code(Wire.Fixed32) { 4 } else { 8 }
+            if data.len % width != 0 {
+                fail serde.Error.Syntax(o.at, "packed field length {data.len} is not a multiple of {width}")
+            }
+            for at < data.len {
+                push_scalar(elem, style, io.uint_le(data, at, width), mut items)
+                at += width
+            }
+        }
+    }
+}
+
+fn push_scalar(elem: serde.Schema, style: Style, bits: u64, mut items: []serde.Node) {
+    match scalar_tree(elem, style, bits) {
+        some(tree) => push(mut items, serde.Node { tree })
+        none => {}
+    }
+}
+
+fn decode_repeated(w: *Walk, elem: serde.Schema, spec: Spec, list: []Occurrence) -> serde.Tree? ! serde.Error {
+    if list.len == 0 {
+        return none
+    }
+    var items: []serde.Node = []
+    for o in list {
+        if !packable(elem.kind) {
+            if compatible(elem, spec.style, o) {
+                let tree = element(w, elem, o)?
+                push(mut items, serde.Node { tree })
+            }
+        } else if compatible(elem, spec.style, o) {
+            push_scalar(elem, spec.style, o.field.value, mut items)
+        } else if o.field.wire == Wire.Bytes {
+            unpack(elem, spec.style, o, mut items)?
+        }
+    }
+    some(serde.Tree.Seq(items))
+}
+
+fn decode_map(w: *Walk, s: serde.Schema, spec: Spec, list: []Occurrence) -> serde.Tree? ! serde.Error {
+    if list.len == 0 {
+        return none
+    }
+    let key_schema = resolve(w, s.items[0])
+    let value_schema = resolve(w, s.items[1])
+    var members: []serde.Member = []
+    var positions: [str: i64] = [:]
+    for o in list {
+        if o.field.wire != Wire.Bytes {
+            continue
+        }
+        let entry = collect(o.field.data, o.at)?
+        let key = decode_singular(w, key_schema, spec.key, entry.by_number[1] ?? [])?
+        let value = decode_singular(w, value_schema, spec.value, entry.by_number[2] ?? [])?
+        let key_value = key ?? zero_or_null(w, s.items[0], key_schema)?
+        let value_value = value ?? zero_or_null(w, s.items[1], value_schema)?
+        let text_key = serde.key_text(serde.Node { tree: key_value }, o.at)?
+        let entry_member = member(text_key, value_value)
+        match positions[text_key] {
+            some(i) => { members[i] = entry_member }
+            none => {
+                positions[text_key] = members.len
+                push(mut members, entry_member)
+            }
+        }
+    }
+    some(serde.Tree.Map(members))
+}
+
+fn zero_or_null(w: *Walk, declared: serde.Schema, s: serde.Schema) -> serde.Tree ! serde.Error {
+    zero_tree(w, declared, s)? ?? serde.Tree.Null
+}
+
+fn decode_oneof(w: *Walk, s: serde.Schema, occurrences: Occurrences) -> serde.Tree? ! serde.Error {
+    let group = if s.kind == serde.Kind.Optional { resolve(w, s.items[0]) } else { s }
+    var chosen: serde.Variant? = none
+    var list: []Occurrence = []
+    var i = occurrences.all.len - 1
+    for i >= 0 {
+        let o = occurrences.all[i]
+        i -= 1
+        let v = member_variant(group, o.field.number) ?? continue
+        let current = chosen ?? v
+        if current.index != v.index {
+            break
+        }
+        if v.fields.len != 1 {
+            panic("protobuf: {group.name}.{v.name} is a oneof member and needs one payload field")
+        }
+        let prop = v.fields[0]
+        let spec = field_spec(group.name, prop, v.index)
+        if !compatible(resolve(w, prop.schema), spec.style, o) {
+            continue
+        }
+        chosen = v
+        push(mut list, o)
+    }
+    let v = chosen ?? return none
+    var ordered: []Occurrence = []
+    var j = list.len - 1
+    for j >= 0 {
+        push(mut ordered, list[j])
+        j -= 1
+    }
+    push(mut w.stack, group)
+    let prop = v.fields[0]
+    let spec = field_spec(group.name, prop, v.index)
+    let decoded = decode_singular(w, resolve(w, prop.schema), spec.style, ordered)?
+    truncate(mut w.stack, w.stack.len - 1)
+    let payload = decoded ?? return none
+    let wrapped = if v.labelled {
+        serde.Tree.Map([member(prop.name, payload)])
+    } else {
+        serde.Tree.Seq([serde.Node { tree: payload }])
+    }
+    some(serde.Tree.Map([member(v.name, wrapped)]))
+}
+
+fn member_variant(group: serde.Schema, number: i64) -> serde.Variant? {
+    for v in group.variants {
+        if v.index == number {
+            return v
+        }
+    }
+    none
+}

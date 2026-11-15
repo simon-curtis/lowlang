@@ -1,0 +1,264 @@
+import std/io
+import std/text
+
+struct Loader {
+    roots: []str
+    read: fn(str) -> str ! io.Error
+    files: [str: *File]
+    visiting: [str: bool]
+    order: []*File
+}
+
+/// Loads the files named by `paths` and every file they import, and resolves each type name in them.
+///
+/// A path is looked up in each of `roots` in order, so `google/protobuf/timestamp.proto` is read as `<root>/google/protobuf/timestamp.proto`; the empty root reads the path as given. `read` returns the text of a file and fails with `io.Error.NotFound` when it does not exist, so the loader touches no file system of its own. The result lists the files in dependency order, each before the files that import it.
+///
+/// A type name is matched whole against the innermost enclosing message and then each enclosing scope outwards through the package, and a leading `.` names a full name. A file sees only its own definitions, its imports, and what those pass on with `import public`. Fails with `NotFound` when no root has an imported file, `Cycle` when files import each other, `Read` when a file cannot be read, `UnknownType` for a name no visible definition has, `Duplicate` for a full name defined twice, `Invalid` for a method whose request or response is not a message, and with whatever `parse` reports for a file.
+pub fn read_files(paths: []str, roots: []str, read: fn(str) -> str ! io.Error) -> Set ! Error {
+    let l = new(Loader { roots, read, files: [:], visiting: [:], order: [] })
+    for path in paths {
+        load_file(l, path)?
+    }
+    let set = Set { files: l.order, types: [:], owners: [:] }
+    for file in l.order {
+        load_register(set, file)?
+    }
+    for file in l.order {
+        let visible = load_visible(l.files, file)
+        load_resolve_file(set, visible, file)?
+    }
+    set
+}
+
+fn load_file(l: *Loader, path: str) ! Error {
+    if check_seen(l.files[path]) {
+        return
+    }
+    if check_seen(l.visiting[path]) {
+        fail Error.Cycle(path)
+    }
+    l.visiting[path] = true
+    let source = load_source(l, path)?
+    let file = parse(path, source)?
+    for i in file.imports {
+        load_file(l, i.path)?
+    }
+    l.files[path] = file
+    push(mut l.order, file)
+    delete(mut l.visiting, path)
+}
+
+fn load_join(root: str, path: str) -> str {
+    if root == "" {
+        return path
+    }
+    if text.ends_with(root, "/") {
+        return "{root}{path}"
+    }
+    "{root}/{path}"
+}
+
+fn load_source(l: *Loader, path: str) -> str ! Error {
+    for root in l.roots {
+        let candidate = load_join(root, path)
+        let found = load_attempt(l, candidate)?
+        match found {
+            some(source) => return source
+            none => {}
+        }
+    }
+    fail Error.NotFound(path)
+}
+
+fn load_attempt(l: *Loader, candidate: str) -> str? ! Error {
+    let source = l.read(candidate) catch {
+        NotFound => return none
+        e => fail Error.Read(candidate, e)
+    }
+    source
+}
+
+fn load_scope(file: *File) -> str {
+    if file.package == "" {
+        return ""
+    }
+    ".{file.package}"
+}
+
+fn load_define(set: Set, owner: str, full: str, pos: Pos, definition: Definition) ! Error {
+    if check_seen(set.owners[full]) {
+        fail Error.Duplicate(pos, "type", full)
+    }
+    set.types[full] = definition
+    set.owners[full] = owner
+}
+
+fn load_register(set: Set, file: *File) ! Error {
+    let scope = load_scope(file)
+    for m in file.messages {
+        load_register_message(set, file.path, scope, m)?
+    }
+    for e in file.enums {
+        load_register_enum(set, file.path, scope, e)?
+    }
+    for s in file.services {
+        s.full_name = "{scope}.{s.name}"
+    }
+}
+
+fn load_register_message(set: Set, owner: str, scope: str, m: *Message) ! Error {
+    m.full_name = "{scope}.{m.name}"
+    load_define(set, owner, m.full_name, m.pos, Definition.Message(m))?
+    for nested in m.messages {
+        load_register_message(set, owner, m.full_name, nested)?
+    }
+    for nested in m.enums {
+        load_register_enum(set, owner, m.full_name, nested)?
+    }
+}
+
+fn load_register_enum(set: Set, owner: str, scope: str, e: *Enum) ! Error {
+    e.full_name = "{scope}.{e.name}"
+    load_define(set, owner, e.full_name, e.pos, Definition.Enumeration(e))?
+}
+
+fn load_visible(files: [str: *File], file: *File) -> [str: bool] {
+    var seen: [str: bool] = [file.path: true]
+    for i in file.imports {
+        seen[i.path] = true
+        load_passed(files, i.path, seen)
+    }
+    seen
+}
+
+fn load_passed(files: [str: *File], path: str, seen: [str: bool]) {
+    let file = files[path] ?? return
+    for i in file.imports {
+        if i.public && !check_seen(seen[i.path]) {
+            seen[i.path] = true
+            load_passed(files, i.path, seen)
+        }
+    }
+}
+
+fn load_resolve_file(set: Set, visible: [str: bool], file: *File) ! Error {
+    let scope = load_scope(file)
+    for m in file.messages {
+        load_resolve_message(set, visible, m)?
+    }
+    for x in file.extends {
+        load_resolve_extend(set, visible, scope, x)?
+    }
+    for s in file.services {
+        for i in 0..s.methods.len {
+            let method = s.methods[i]
+            let input = load_resolve_method(set, visible, scope, method, method.input)?
+            let output = load_resolve_method(set, visible, scope, method, method.output)?
+            s.methods[i] = Method {
+                name: method.name,
+                input,
+                output,
+                client_streaming: method.client_streaming,
+                server_streaming: method.server_streaming,
+                options: method.options,
+                pos: method.pos,
+            }
+        }
+    }
+}
+
+fn load_resolve_method(set: Set, visible: [str: bool], scope: str, method: Method, name: str) -> str ! Error {
+    let resolved = load_resolve(set, visible, scope, name, method.pos)?
+    match resolved {
+        Message(full) => full
+        Enum(full) => fail Error.Invalid(method.pos, "{full} is an enum, not a message")
+        _ => fail Error.UnknownType(method.pos, name)
+    }
+}
+
+fn load_resolve_extend(set: Set, visible: [str: bool], scope: str, x: *Extend) ! Error {
+    let target = load_resolve(set, visible, scope, x.target, x.pos)?
+    match target {
+        Message(full) => { x.target = full }
+        _ => fail Error.Invalid(x.pos, "{x.target} is not a message")
+    }
+    for f in x.fields {
+        load_resolve_field(set, visible, scope, f)?
+    }
+}
+
+fn load_resolve_message(set: Set, visible: [str: bool], m: *Message) ! Error {
+    for f in m.fields {
+        load_resolve_field(set, visible, m.full_name, f)?
+    }
+    for x in m.extends {
+        load_resolve_extend(set, visible, m.full_name, x)?
+    }
+    for nested in m.messages {
+        load_resolve_message(set, visible, nested)?
+    }
+}
+
+fn load_resolve_field(set: Set, visible: [str: bool], scope: str, f: *Field) ! Error {
+    match f.type {
+        Single(of) => {
+            let resolved = load_resolve_ref(set, visible, scope, of, f.pos)?
+            f.type = FieldType.Single(resolved)
+        }
+        Map(key, value) => {
+            let resolved = load_resolve_ref(set, visible, scope, value, f.pos)?
+            f.type = FieldType.Map(key, resolved)
+        }
+    }
+}
+
+fn load_resolve_ref(set: Set, visible: [str: bool], scope: str, ref: TypeRef, pos: Pos) -> TypeRef ! Error {
+    match ref {
+        Named(name) => load_resolve_type(set, visible, scope, name, pos)?
+        _ => ref
+    }
+}
+
+fn load_resolve_type(set: Set, visible: [str: bool], scope: str, name: str, pos: Pos) -> TypeRef ! Error {
+    let resolved = load_resolve(set, visible, scope, name, pos)?
+    match resolved {
+        Named(_) => fail Error.UnknownType(pos, name)
+        _ => resolved
+    }
+}
+
+fn load_resolve(set: Set, visible: [str: bool], scope: str, name: str, pos: Pos) -> TypeRef ! Error {
+    if text.starts_with(name, ".") {
+        let absolute = load_lookup(set, visible, name)
+        match absolute {
+            some(ref) => return ref
+            none => fail Error.UnknownType(pos, name)
+        }
+    }
+    var inside = scope
+    for {
+        let found = load_lookup(set, visible, "{inside}.{name}")
+        match found {
+            some(ref) => return ref
+            none => {}
+        }
+        if inside == "" {
+            break
+        }
+        let cut = text.last_index_byte(inside, '.')
+        inside = inside[0..cut]
+    }
+    fail Error.UnknownType(pos, name)
+}
+
+fn load_lookup(set: Set, visible: [str: bool], full: str) -> TypeRef? {
+    let definition = set.types[full] ?? return none
+    let owner = set.owners[full] ?? return none
+    if !check_seen(visible[owner]) {
+        return none
+    }
+    match definition {
+        Message(_) => TypeRef.Message(full)
+        Enumeration(_) => TypeRef.Enum(full)
+    }
+}
