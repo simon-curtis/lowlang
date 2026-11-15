@@ -6,7 +6,7 @@ Low compiles to static native binaries with no libc dependency, has a tracing ga
 | --- | --- |
 | `low run` | Compiles and runs a file or a module directory. `-target browser/wasm32` runs it as WebAssembly under `node`. |
 | `low test` | Builds the tests of the named modules and runs each test in its own process, in parallel, with a timeout, filters and a text or JSON report. |
-| `low build` | Writes a native binary, or a WebAssembly module for `browser/wasm32`. `-o` names it and `-target` picks `linux/amd64`, `windows/amd64` or `browser/wasm32` and defaults to the host. |
+| `low build` | Writes a native binary, or a WebAssembly module for `browser/wasm32`. `-o` names it and `-target` picks `linux/amd64`, `windows/amd64` or `browser/wasm32` and defaults to the host. `-subsystem console|gui` picks the PE subsystem of a Windows executable and defaults to `console`; it is an error for another target. |
 | `low dev` | Runs the program and patches changed functions into it on save. Changing `main`, a type's layout or a function's signature restarts it. |
 | `low ir` | Prints the optimised SSA form. |
 | `low asm` | Prints the generated assembly. |
@@ -2058,7 +2058,8 @@ The in-process assembler and linker reproduce GNU `as` and `ld` and `clang` and 
   - The generated `_start` calls `__libc_start_main(main, argc, argv, 0, 0, rtld_fini, stack_end)` with no init or fini functions, which is all glibc needs: stdio buffers flush and `atexit` handlers run when the program exits. `atexit` and `at_quick_exit` exist only in `libc_nonshared.a`, so a program that declares them gets shims that tail-call `__cxa_atexit` and `__cxa_at_quick_exit`.
   - glibc's start-up code calls the generated C `main`, which does the same work as `_start`.
   - When Low's `main` returns, the program calls `exit(0)`, letting libc run its exit handlers. An error from `main` prints and exits with status 1.
-- A Windows program is assembled in process with the padding and jump sizes of `clang`, and linked by `link.PE` into a PE32+ console executable that starts at `start`. No import library is read.
+- A Windows program is assembled in process with the padding and jump sizes of `clang`, and linked by `link.PE` into a PE32+ executable that starts at `start`. No import library is read.
+  - The subsystem is `IMAGE_SUBSYSTEM_WINDOWS_CUI` unless `low build -subsystem gui` asks for `IMAGE_SUBSYSTEM_WINDOWS_GUI`, which opens no console window. Nothing else in the image differs. `print` writes through `GetStdHandle` and ignores a failed write, so a GUI program prints to a redirected standard output and discards the text when it has none.
   - The image is based at `0x140000000` with 4 KiB section alignment and 512-byte file alignment. It reserves 8 MB of stack and 1 MB of heap, and sets `DYNAMICBASE`, `HIGH_ENTROPY_VA` and `NX_COMPAT`.
   - Sections merge by the name before `$`, `.bss` joins `.data` after its initialised bytes, and `.idata` joins `.rdata`. The order is `.text`, `.rdata`, `.data`, the rest by name, then `.reloc`. Code padding is `int3`. `.rodata` is writable.
   - `.rdata` starts with a debug directory holding one `REPRO` entry. The header timestamp and that entry carry the low 32 bits of the XXH3-64 hash of the image taken with both zero, so a program always links to the same bytes.
