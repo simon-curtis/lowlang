@@ -78,6 +78,10 @@ rt_panic_prefix:
 	.ascii "panic: "
 rt_error_prefix:
 	.ascii "error: "
+rt_fault_line:
+	.ascii "fault: address 0x0000000000000000 pc 0x0000000000000000 sp 0x0000000000000000 stack 0x0000000000000000\n"
+rt_hex_digits:
+	.ascii "0123456789abcdef"
 	MSG_BEGIN rt_msg_divzero
 	.ascii "integer divide by zero"
 	MSG_END
@@ -537,6 +541,58 @@ rt_panic:
 	mov edx, 7
 	mov ecx, 2
 	jmp rt_die
+
+rt_fault_report:
+	push rbx
+	push r12
+	push r13
+	push r14
+	sub rsp, 104
+	mov rbx, rdi
+	mov r12, rsi
+	mov r13, rdx
+	mov r14, rcx
+	cld
+	lea rsi, [rip+rt_fault_line]
+	mov rdi, rsp
+	mov ecx, 103
+	rep movsb
+	lea rdi, [rsp+17]
+	mov rax, rbx
+	call rt_hex
+	lea rdi, [rsp+39]
+	mov rax, r12
+	call rt_hex
+	lea rdi, [rsp+61]
+	mov rax, r13
+	call rt_hex
+	lea rdi, [rsp+86]
+	mov rax, r14
+	call rt_hex
+	mov edi, 2
+	mov rsi, rsp
+	mov edx, 103
+	call rt_write
+	add rsp, 104
+	pop r14
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+rt_hex:
+	lea r8, [rip+rt_hex_digits]
+	mov ecx, 16
+1:
+	rol rax, 4
+	mov edx, eax
+	and edx, 15
+	movzx edx, byte ptr [r8+rdx]
+	mov byte ptr [rdi], dl
+	inc rdi
+	dec ecx
+	jnz 1b
+	ret
 
 rt_error:
 	lea rsi, [rip+rt_error_prefix]

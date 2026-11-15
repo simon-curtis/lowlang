@@ -442,7 +442,21 @@ rt_fault:
 	jnz 2f
 	lea r9, [rip+rt_msg_region_freed]
 2:
+	mov r11, [rcx]
 	mov rax, [rcx+8]
+	mov rdx, [r11+EXCEPTION_ADDRESS]
+	mov [rax+CONTEXT_RSI], rdx
+	mov rdx, [r11+EXCEPTION_PC]
+	mov [rax+CONTEXT_RDX], rdx
+	mov rdx, [rax+CONTEXT_RSP]
+	mov [rax+CONTEXT_RCX], rdx
+	xor edx, edx
+	mov r10, [r8+TLS_G]
+	test r10, r10
+	jz 4f
+	mov rdx, [r10+G_LO]
+4:
+	mov [rax+CONTEXT_R8], rdx
 	mov [rax+CONTEXT_RDI], r9
 	lea rdx, [rip+rt_fault_panic]
 	mov [rax+CONTEXT_RIP], rdx
@@ -459,6 +473,16 @@ rt_fault:
 rt_fault_panic:
 	TLS_GET rax, TLS_M
 	TEB_OS rax
+	lea rax, [rip+rt_msg_fault]
+	cmp rdi, rax
+	jne rt_panic
+	push rdi
+	mov rdi, rsi
+	mov rsi, rdx
+	mov rdx, rcx
+	mov rcx, r8
+	call rt_fault_report
+	pop rdi
 	jmp rt_panic
 
 rt_os_sysmon_start:
