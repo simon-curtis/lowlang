@@ -2513,7 +2513,7 @@ Mechanism:
 
 `std/ui` holds the modules that draw a window's user interface with Vulkan, on Wayland on Linux and on Win32 on Windows: windows and input, a flexbox layout engine, fonts and text, a scene of GPU primitives, and a renderer that draws a scene into an offscreen target or a window.
 
-### Modules
+### UI modules
 
 | Module | Contents |
 |---|---|
