@@ -1,0 +1,140 @@
+import std/io
+
+extern "kernel32" {
+    fn CreateFileMappingW(file: i64, security: ptr, protect: u32, size_high: u32, size_low: u32, name: ptr) -> i64
+    fn MapViewOfFile(mapping: i64, access: u32, offset_high: u32, offset_low: u32, length: i64) -> i64
+    fn UnmapViewOfFile(address: i64) -> i32
+    fn FlushViewOfFile(address: i64, length: i64) -> i32
+    fn PrefetchVirtualMemory(process: i64, count: i64, ranges: ptr, flags: u32) -> i32
+}
+
+const page_readonly: u32 = 2
+const page_readwrite: u32 = 4
+const page_writecopy: u32 = 8
+const map_copy: u32 = 1
+const map_write: u32 = 2
+const map_read: u32 = 4
+const allocation_granularity = 65536
+
+fn section_protection(mode: MapMode) -> u32 {
+    match mode {
+        ReadOnly => page_readonly
+        Shared => page_readwrite
+        Private => page_writecopy
+    }
+}
+
+fn view_access(mode: MapMode) -> u32 {
+    match mode {
+        ReadOnly => map_read
+        Shared => map_write
+        Private => map_copy
+    }
+}
+
+fn high_word(n: i64) -> u32 {
+    u32(n >> 32)
+}
+
+fn low_word(n: i64) -> u32 {
+    u32(n & 0xFFFFFFFF)
+}
+
+fn view_of(section: i64, mode: MapMode, offset: i64, length: i64, file: i64) -> MapView ! io.Error {
+    let address = MapViewOfFile(section, view_access(mode), high_word(offset), low_word(offset), length)
+    if address == 0 {
+        let failure = last_error()
+        if file >= 0 {
+            CloseHandle(file)
+        }
+        fail failure
+    }
+    MapView { address, span: length, file }
+}
+
+fn section_error(code: i64) -> io.Error {
+    match code {
+        8 => TooLarge
+        1455 => TooLarge
+        _ => win_error(code)
+    }
+}
+
+/// Returns the granularity that the offset given to `map_file` must be a multiple of.
+pub fn map_granularity() -> i64 {
+    allocation_granularity
+}
+
+fn backing_copy(h: i64, mode: MapMode) -> i64 ! io.Error {
+    if mode != MapMode.Shared {
+        return -1
+    }
+    var copy = 0
+    checked(DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), mut copy, 0, 0, 2))?
+    copy
+}
+
+/// Maps `length` bytes of the file behind `fd`, starting at `offset`, and returns the mapping.
+///
+/// `offset` must be a multiple of `map_granularity()`. The mapping stays valid after `fd` is closed. Fails with `Denied` when the file was not opened for what `mode` needs, `Invalid` for an `offset` that is not aligned or a `length` of zero, `Unsupported` for a descriptor that cannot be mapped, such as a pipe, and `TooLarge` when the address space is exhausted.
+pub fn map_file(fd: i64, mode: MapMode, offset: i64, length: i64) -> MapView ! io.Error {
+    if offset % allocation_granularity != 0 || length <= 0 {
+        fail Invalid
+    }
+    let h = handle(fd)
+    let section = CreateFileMappingW(h, null, section_protection(mode), 0, 0, null)
+    if section == 0 {
+        fail section_error(i64(GetLastError()))
+    }
+    defer CloseHandle(section)
+    let file = backing_copy(h, mode)?
+    view_of(section, mode, offset, length, file)?
+}
+
+/// Maps `length` bytes of zeroed memory that no file backs and returns the mapping.
+///
+/// Fails with `Invalid` for a `length` of zero and `TooLarge` when the address space is exhausted.
+pub fn map_memory(mode: MapMode, length: i64) -> MapView ! io.Error {
+    if length <= 0 {
+        fail Invalid
+    }
+    let section = CreateFileMappingW(invalid_handle, null, section_protection(mode), high_word(length), low_word(length), null)
+    if section == 0 {
+        fail section_error(i64(GetLastError()))
+    }
+    defer CloseHandle(section)
+    view_of(section, mode, 0, length, -1)?
+}
+
+/// Writes the pages of the view that changed to the file behind it.
+///
+/// `Wait` returns once the data is written and `Queue` starts the write. A view that no file backs has nothing to write.
+pub fn sync_view(v: MapView, how: MapSync) ! io.Error {
+    checked(FlushViewOfFile(v.address, 0))?
+    if how == MapSync.Wait && v.file >= 0 {
+        checked(FlushFileBuffers(v.file))?
+    }
+}
+
+/// Tells the system how the pages of the view will be used.
+///
+/// On Linux the advice goes to `madvise`, and `DontNeed` makes a `Private` view lose its changes, so that the next read returns the file's bytes or zeros, and leaves the content of a `Shared` view intact. On Windows `WillNeed` prefetches the pages and the other advice does nothing.
+pub fn advise_view(v: MapView, advice: MapAdvice) ! io.Error {
+    if advice != MapAdvice.WillNeed {
+        return
+    }
+    let range = io.buffer(16)
+    io.set_le64(range, 0, v.address)
+    io.set_le64(range, 8, v.span)
+    checked(PrefetchVirtualMemory(GetCurrentProcess(), 1, __slice_ptr(range), 0))?
+}
+
+/// Releases the view.
+///
+/// Slices over its bytes must not be used afterwards.
+pub fn unmap_view(v: MapView) {
+    UnmapViewOfFile(v.address)
+    if v.file >= 0 {
+        CloseHandle(v.file)
+    }
+}
