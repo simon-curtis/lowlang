@@ -1,0 +1,223 @@
+import std/io
+import std/log
+import std/net
+import std/os
+import std/sync
+import std/text
+import std/tls
+
+/// Where a `Syslog` sends its messages.
+pub enum Transport {
+    /// A Unix datagram socket such as `/dev/log`, one message per datagram.
+    UnixDatagram(path: str)
+    /// A Unix stream socket, each message framed by octet counting as RFC 6587 section 3.4.1 describes.
+    UnixStream(path: str)
+    /// UDP to `host` and `port`, one message per datagram (RFC 5426). `host` is resolved with `net.lookup` and its first address is used.
+    Udp(host: str, port: i64)
+    /// TCP to `host` and `port`, each message framed by octet counting (RFC 6587).
+    Tcp(host: str, port: i64)
+    /// TLS over TCP to `host` and `port`, each message framed by octet counting (RFC 5425). The configuration's `server_name` defaults to `host`.
+    Tls(host: str, port: i64, config: tls.Config)
+}
+
+/// The settings of a `Syslog`.
+pub struct Config {
+    /// Where messages go. Defaults to the datagram socket `/dev/log`.
+    pub transport: Transport = UnixDatagram("/dev/log")
+    /// The facility of every message. Defaults to `User`.
+    pub facility: Facility = User
+    /// The HOSTNAME field. Defaults to empty, which means the system's host name.
+    pub hostname: str = ""
+    /// The APP-NAME field. Defaults to empty, which is written as `-`.
+    pub app_name: str = ""
+    /// The PROCID field. Defaults to empty, which means the process id.
+    pub procid: str = ""
+    /// The MSGID field. Defaults to empty, which is written as `-`.
+    pub msgid: str = ""
+    /// The SD-ID of the element that carries a record's attributes. It needs an enterprise number, as in `name@32473`, because it is not registered with IANA. Defaults to `fields@32473`, whose number is the one RFC 5424 reserves for documentation.
+    pub sd_id: str = "fields@32473"
+    /// The longest a connect, a TLS handshake or a send waits, in milliseconds. Defaults to 5000; 0 or less means no limit.
+    pub timeout_ms: i64 = 5000
+}
+
+struct State {
+    config: Config
+    lock: sync.Mutex
+    link: io.Stream?
+    closed: bool
+}
+
+/// A destination for syslog messages that connects when it first sends and reconnects after a failed send.
+///
+/// Dropping it closes the connection. Every green thread may send through it; sends are serialised.
+pub struct Syslog {
+    state: *State
+    drop close_state(state)
+}
+
+/// Returns a `Syslog` for `config`, with the empty host name and process id of the config filled in.
+///
+/// Makes no connection. The first `send` connects, and so does the first one after a send fails.
+pub fn open(config: Config) -> Syslog {
+    var resolved = config
+    if resolved.hostname.len == 0 {
+        resolved.hostname = os.hostname() or "-"
+    }
+    if resolved.procid.len == 0 {
+        resolved.procid = "{os.pid()}"
+    }
+    Syslog { state: new(State { config: resolved, lock: sync.mutex(), link: none, closed: false }) }
+}
+
+fn datagram_link(h: net.SocketHandle, to: net.Addr) -> io.Stream {
+    io.Stream {
+        read: fn(buf) -> i64 ! io.Error { fail Unsupported }
+        write: fn(data) -> i64 ! io.Error { net.send_to_on(h, data, to)? }
+        close: fn() { net.close_socket_on(h) }
+    }
+}
+
+fn unix_datagram_link(path: str, timeout_ms: i64) -> io.Stream ! io.Error {
+    let to = net.unix_addr(path)?
+    using var s = net.unix_datagram()?
+    let h = net.detach_socket(mut s)
+    h.timeouts.write = timeout_ms
+    datagram_link(h, to)
+}
+
+fn udp_link(host: str, port: i64, timeout_ms: i64) -> io.Stream ! io.Error {
+    let addresses = net.lookup(host)?
+    let to = net.Addr { ip: addresses[0], port }
+    using var s = net.bind_udp(if net.v6(to.ip) { "::" } else { "" }, 0)?
+    let h = net.detach_socket(mut s)
+    h.timeouts.write = timeout_ms
+    datagram_link(h, to)
+}
+
+fn stream_link(c: net.ConnHandle, timeout_ms: i64) -> io.Stream {
+    c.timeouts.write = timeout_ms
+    net.stream_on(c)
+}
+
+fn secure_link(host: str, port: i64, config: tls.Config, timeout_ms: i64) -> io.Stream ! io.Error {
+    using var c = net.dial_within(host, port, timeout_ms)?
+    var named = config
+    if named.server_name.len == 0 {
+        named.server_name = host
+    }
+    c.handle.timeouts.read = timeout_ms
+    c.handle.timeouts.write = timeout_ms
+    let session = tls.client_handle(net.stream(c), named)?
+    net.detach(mut c)
+    tls.stream_on(session)
+}
+
+fn connect(config: Config) -> io.Stream ! io.Error {
+    let wait = config.timeout_ms
+    match config.transport {
+        UnixDatagram(path) => unix_datagram_link(path, wait)?
+        UnixStream(path) => {
+            using var c = net.connect_unix_within(path, wait)?
+            stream_link(net.detach(mut c), wait)
+        }
+        Udp(host, port) => udp_link(host, port, wait)?
+        Tcp(host, port) => {
+            using var c = net.dial_within(host, port, wait)?
+            stream_link(net.detach(mut c), wait)
+        }
+        Tls(host, port, tls_config) => secure_link(host, port, tls_config, wait)?
+    }
+}
+
+fn framed(config: Config) -> bool {
+    match config.transport {
+        UnixDatagram(_) => false
+        Udp(_, _) => false
+        UnixStream(_) => true
+        Tcp(_, _) => true
+        Tls(_, _, _) => true
+    }
+}
+
+/// Returns the bytes sent for the message text `body` on a stream transport: its length in decimal, a space and `body` (RFC 6587 section 3.4.1).
+pub fn octet_counted(body: []u8) -> []u8 {
+    var out: []u8 = []
+    text.append(mut out, "{body.len} ")
+    io.append(mut out, body)
+    out
+}
+
+fn drop_link(st: *State) {
+    match st.link {
+        some(l) => l.close()
+        none => {}
+    }
+    st.link = none
+}
+
+fn close_state(st: *State) {
+    sync.lock(st.lock)
+    st.closed = true
+    drop_link(st)
+    sync.unlock(st.lock)
+}
+
+fn link_of(st: *State) -> io.Stream ! io.Error {
+    match st.link {
+        some(l) => l
+        none => {
+            let l = connect(st.config)?
+            st.link = l
+            l
+        }
+    }
+}
+
+fn transmit(st: *State, body: []u8) ! io.Error {
+    if st.closed {
+        fail NotConnected
+    }
+    let wire = if framed(st.config) { octet_counted(body) } else { body }
+    let link = link_of(st)?
+    io.write_all(link, wire) catch {
+        e => {
+            drop_link(st)
+            fail e
+        }
+    }
+}
+
+fn send_body(st: *State, body: []u8) ! io.Error {
+    sync.lock(st.lock)
+    defer sync.unlock(st.lock)
+    transmit(st, body)?
+}
+
+/// Sends `m` as one syslog message.
+///
+/// Connects first when there is no connection. When the connect or the send fails, the connection is dropped, the error is returned and the message is lost; the next send connects again. Parks the green thread while connecting and sending, for at most `Config.timeout_ms` each. Fails with `NotConnected` after `close`.
+pub fn send(s: Syslog, m: Message) ! io.Error {
+    send_body(s.state, format(m))?
+}
+
+/// Sends the record `r` as one syslog message made by `message` and fails as `send` does.
+pub fn send_record(s: Syslog, r: log.Record) ! io.Error {
+    deliver(s.state, r)?
+}
+
+fn deliver(st: *State, r: log.Record) ! io.Error {
+    send_body(st, format(message(st.config, r)))?
+}
+
+/// Closes the connection and makes every later `send` fail with `NotConnected`.
+pub fn close(s: Syslog) {
+    close_state(s.state)
+}
+
+/// Returns a copy of the logger that sends each record to `s`, replacing any other sink.
+///
+/// The logger's `format` is not applied. A failed send goes to the logger's `on_error`. `s` must stay open as long as the logger is used.
+pub fn attach(l: log.Logger, s: Syslog) -> log.Logger {
+    let st = s.state
+    log.with_destination(l, fn(r: log.Record) ! io.Error { deliver(st, r)? })
+}

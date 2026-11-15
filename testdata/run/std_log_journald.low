@@ -1,0 +1,164 @@
+import std/file
+import std/io
+import std/log
+import std/log/journald
+import std/net
+import std/sys
+import std/text
+
+struct Collected {
+    items: []str
+}
+
+fn raw(bytes_of: []u8) -> str {
+    str(bytes_of)
+}
+
+fn expect(name: str, got: str, want: str) {
+    if got == want {
+        print("{name}: ok")
+    } else {
+        print("{name}: MISMATCH\n  got  {text.quote(got)}\n  want {text.quote(want)}")
+    }
+}
+
+fn blob_length_prefix() -> str {
+    var out: []u8 = []
+    push(mut out, 4)
+    for _ in 0..7 {
+        push(mut out, 0)
+    }
+    raw(out)
+}
+
+fn protocol_example() {
+    let fields = [
+        journald.Field { name: "PRIORITY", value: "3" },
+        journald.Field { name: "SYSLOG_FACILITY", value: "3" },
+        journald.Field { name: "CODE_FILE", value: "src/foobar.c" },
+        journald.Field { name: "CODE_LINE", value: "77" },
+        journald.Field { name: "BINARY_BLOB", value: "xx\nx" },
+        journald.Field { name: "CODE_FUNC", value: "some_func" },
+        journald.Field { name: "SYSLOG_IDENTIFIER", value: "footool" },
+        journald.Field { name: "MESSAGE", value: "Something happened." },
+    ]
+    let want = "PRIORITY=3\nSYSLOG_FACILITY=3\nCODE_FILE=src/foobar.c\nCODE_LINE=77\nBINARY_BLOB\n{blob_length_prefix()}xx\nx\nCODE_FUNC=some_func\nSYSLOG_IDENTIFIER=footool\nMESSAGE=Something happened.\n"
+    expect("native protocol example", raw(journald.encode(fields)), want)
+
+    let long = text.repeat("y", 300)
+    expect("length above 255", raw(journald.encode([journald.Field { name: "BLOB", value: "\n{long}" }])), "BLOB\n{le(301)}\n{long}\n")
+    expect("empty value", raw(journald.encode([journald.Field { name: "EMPTY", value: "" }])), "EMPTY=\n")
+    expect("equals sign in a value", raw(journald.encode([journald.Field { name: "V", value: "a=b" }])), "V=a=b\n")
+    expect("invalid names are left out", raw(journald.encode([
+        journald.Field { name: "", value: "1" },
+        journald.Field { name: "lower", value: "2" },
+        journald.Field { name: "_PRIVATE", value: "3" },
+        journald.Field { name: "1ST", value: "4" },
+        journald.Field { name: "A-B", value: "5" },
+        journald.Field { name: text.repeat("N", 65), value: "6" },
+        journald.Field { name: text.repeat("N", 64), value: "7" },
+        journald.Field { name: "OK_1", value: "8" },
+    ])), "{text.repeat("N", 64)}=7\nOK_1=8\n")
+}
+
+fn names() {
+    let samples = ["code_file", "user.id", "__x", "9lives", "a-b c", "message", "Priority", "", "---", "syslog_identifier", "ünï"]
+    var out = ""
+    for k in samples {
+        out = "{out}[{journald.field_name(k) ?? "none"}]"
+    }
+    expect("field names", out, "[CODE_FILE][USER_ID][X][LIVES][A_B_C][none][none][none][none][none][N__]")
+    expect("long field name", journald.field_name(text.repeat("k", 80)) ?? "none", text.repeat("K", 64))
+    var valid = ""
+    for n in ["A", "A_9", "_A", "9A", "a", "", text.repeat("A", 64), text.repeat("A", 65)] {
+        valid = "{valid}{journald.valid_name(n)} "
+    }
+    expect("valid names", valid, "true true false false false false true false ")
+    expect("priorities", "{journald.priority_of(Debug)}{journald.priority_of(Info)}{journald.priority_of(Warn)}{journald.priority_of(Error)}", "7643")
+}
+
+fn record(level: log.Level, message: str, prefix: str, attrs: []log.Attr) -> log.Record {
+    log.Record { level, message, prefix, attrs, time: none }
+}
+
+fn mapping() {
+    let attrs = [log.str_attr("code_file", "main.low"), log.int_attr("code_line", 12), log.float_attr("ratio", 0.5), log.bool_attr("ok", false), log.str_attr("message", "shadow")]
+    let got = raw(journald.encode(journald.fields("svc", record(Warn, "line one\nline two", "db", attrs))))
+    expect("record fields", got, "PRIORITY=4\nMESSAGE\n{le(21)}db: line one\nline two\nSYSLOG_IDENTIFIER=svc\nCODE_FILE=main.low\nCODE_LINE=12\nRATIO=0.5\nOK=false\n")
+    let bare = raw(journald.encode(journald.fields("", record(Error, "plain", "", []))))
+    expect("record without identifier", bare, "PRIORITY=3\nMESSAGE=plain\n")
+}
+
+fn le(n: i64) -> str {
+    var out: []u8 = []
+    io.put_le64(mut out, n)
+    raw(out)
+}
+
+fn receive_text(s: net.Socket) -> str {
+    let buf = io.buffer(65536)
+    let p = net.receive_from(s, buf) or return "receive failed"
+    raw(buf[..p.size])
+}
+
+fn base_logger(errors: *Collected) -> log.Logger {
+    log.with_error_handler(log.Logger { level: Debug, prefix: "svc", timestamps: true }, fn(e: io.Error) { push(mut errors.items, "{e}") })
+}
+
+fn delivery(dir: str) ! io.Error {
+    let path = "{dir}/journal.sock"
+    using server = net.bind_unix_datagram(path)?
+    net.set_receive_timeout(server, 2000)
+    let errors = new(Collected { items: [] })
+    using j = journald.open(journald.Config { path, identifier: "footool" })
+    let l = journald.attach(base_logger(errors), j)
+    log.info_with(l, "started", [log.int_attr("code_line", 77), log.str_attr("code_file", "src/foobar.c")])
+    expect("journal datagram", receive_text(server), "PRIORITY=6\nMESSAGE=svc: started\nSYSLOG_IDENTIFIER=footool\nCODE_LINE=77\nCODE_FILE=src/foobar.c\n")
+    log.error(l, "two\nlines")
+    expect("journal binary datagram", receive_text(server), "PRIORITY=3\nMESSAGE\n{le(14)}svc: two\nlines\nSYSLOG_IDENTIFIER=footool\n")
+    log.warn(log.with_level(l, Error), "below the level")
+    print("errors {errors.items.len}")
+
+    let big = text.repeat("x", 8388608)
+    journald.send(j, [journald.Field { name: "MESSAGE", value: big }, journald.Field { name: "PRIORITY", value: "5" }])?
+    let buf = io.buffer(16)
+    let p = net.receive_from_with_fd(server, buf)?
+    let fd = p.descriptor ?? -1
+    print("large entry: payload {p.size} bytes, descriptor passed {fd >= 0}")
+    sys.seek(fd, 0, sys.Seek.FromStart)?
+    let content = io.read_all(sys.stream(fd))?
+    let want = "MESSAGE={big}\nPRIORITY=5\n"
+    print("large entry content matches {raw(content) == want} length {content.len}")
+    sys.write_all(fd, bytes("more")) catch {
+        Denied => print("large entry file is sealed")
+        _ => print("large entry file is not sealed")
+    }
+    sys.close_fd(fd)
+}
+
+fn reconnect(dir: str) ! io.Error {
+    let path = "{dir}/late.sock"
+    let errors = new(Collected { items: [] })
+    using j = journald.open(journald.Config { path })
+    let l = journald.attach(base_logger(errors), j)
+    log.info(l, "lost")
+    print("errors while the socket is missing {errors.items}")
+    using server = net.bind_unix_datagram(path)?
+    net.set_receive_timeout(server, 2000)
+    log.info(l, "found")
+    expect("delivery once the socket exists", receive_text(server), "PRIORITY=6\nMESSAGE=svc: found\n")
+    print("errors after {errors.items.len}")
+    journald.close(j)
+    log.info(l, "after close")
+    print("errors after close {errors.items}")
+}
+
+fn main() ! io.Error {
+    protocol_example()
+    names()
+    mapping()
+    let dir = file.temp_dir("lowjournal")?
+    delivery(dir)?
+    reconnect(dir)?
+    file.remove_all(dir)?
+}

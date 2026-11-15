@@ -1,0 +1,131 @@
+import std/io
+import std/log
+import std/net
+import std/sync
+import std/sys
+
+/// The settings of a `Journal`.
+pub struct Config {
+    /// The journal's datagram socket. Defaults to `/run/systemd/journal/socket`.
+    pub path: str = "/run/systemd/journal/socket"
+    /// The `SYSLOG_IDENTIFIER` of every entry. Defaults to empty, which leaves the field out.
+    pub identifier: str = ""
+    /// The longest a send waits for room in the socket, in milliseconds. Defaults to 5000; 0 or less means no limit.
+    pub timeout_ms: i64 = 5000
+}
+
+struct State {
+    config: Config
+    lock: sync.Mutex
+    link: net.SocketHandle?
+    closed: bool
+}
+
+/// A destination for journal entries that opens its socket when it first sends and opens a new one after a failed send.
+///
+/// Dropping it closes the socket. Every green thread may send through it; sends are serialised.
+pub struct Journal {
+    state: *State
+    drop close_state(state)
+}
+
+/// Returns a `Journal` for `config`.
+///
+/// Makes no connection. The first `send` opens the socket, and so does the first one after a send fails.
+pub fn open(config: Config) -> Journal {
+    Journal { state: new(State { config, lock: sync.mutex(), link: none, closed: false }) }
+}
+
+fn drop_link(st: *State) {
+    match st.link {
+        some(h) => net.close_socket_on(h)
+        none => {}
+    }
+    st.link = none
+}
+
+fn close_state(st: *State) {
+    sync.lock(st.lock)
+    st.closed = true
+    drop_link(st)
+    sync.unlock(st.lock)
+}
+
+fn link_of(st: *State) -> net.SocketHandle ! io.Error {
+    match st.link {
+        some(h) => h
+        none => {
+            using var s = net.unix_datagram()?
+            let h = net.detach_socket(mut s)
+            h.timeouts.write = st.config.timeout_ms
+            st.link = h
+            h
+        }
+    }
+}
+
+fn send_memory_file(h: net.SocketHandle, to: net.Addr, payload: []u8) ! io.Error {
+    let fd = sys.memory_file("journal-entry")?
+    defer sys.close_fd(fd)
+    sys.write_all(fd, payload)?
+    sys.seal(fd)?
+    net.send_to_with_fd_on(h, [], to, fd)?
+}
+
+fn transmit(st: *State, payload: []u8) ! io.Error {
+    if st.closed {
+        fail NotConnected
+    }
+    let to = net.unix_addr(st.config.path)?
+    let h = link_of(st)?
+    net.send_to_on(h, payload, to) catch {
+        TooLarge => {
+            send_memory_file(h, to, payload) catch {
+                e => {
+                    drop_link(st)
+                    fail e
+                }
+            }
+            return
+        }
+        e => {
+            drop_link(st)
+            fail e
+        }
+    }
+}
+
+fn send_payload(st: *State, payload: []u8) ! io.Error {
+    sync.lock(st.lock)
+    defer sync.unlock(st.lock)
+    transmit(st, payload)?
+}
+
+/// Sends one journal entry made of `fields`, encoded by `encode`.
+///
+/// A datagram the socket cannot carry is sent as a sealed in-memory file passed with `SCM_RIGHTS`, as the journal's protocol describes. When the open or the send fails, the socket is dropped, the error is returned and the entry is lost; the next send opens a new socket. Parks the green thread while the socket is full, for at most `Config.timeout_ms`. Fails with `NotConnected` after `close`, and with `Unsupported` for a datagram that needs the in-memory file on Windows.
+pub fn send(j: Journal, fields: []Field) ! io.Error {
+    send_payload(j.state, encode(fields))?
+}
+
+/// Sends the record `r` as one journal entry with the fields `fields` makes of it, and fails as `send` does.
+pub fn send_record(j: Journal, r: log.Record) ! io.Error {
+    deliver(j.state, r)?
+}
+
+fn deliver(st: *State, r: log.Record) ! io.Error {
+    send_payload(st, encode(fields(st.config.identifier, r)))?
+}
+
+/// Closes the socket and makes every later `send` fail with `NotConnected`.
+pub fn close(j: Journal) {
+    close_state(j.state)
+}
+
+/// Returns a copy of the logger that sends each record to `j`, replacing any other sink.
+///
+/// The logger's `format` and timestamps are not used, because the journal stamps each entry. A failed send goes to the logger's `on_error`. `j` must stay open as long as the logger is used.
+pub fn attach(l: log.Logger, j: Journal) -> log.Logger {
+    let st = j.state
+    log.with_destination(l, fn(r: log.Record) ! io.Error { deliver(st, r)? })
+}

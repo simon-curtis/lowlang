@@ -1,0 +1,118 @@
+import std/cancel
+import std/io
+import std/net
+import std/slices
+import std/sys
+import std/time
+
+/// The settings of `query`.
+pub struct Options {
+    /// The server's UDP port. Defaults to 123.
+    pub port: i64 = 123
+    /// The longest the whole query may take, in milliseconds, across every address of the host. Defaults to 5000; 0 or less means no limit.
+    pub timeout_ms: i64 = 5000
+    /// Returns the current time in nanoseconds since the Unix epoch, read when the request is sent and when the reply arrives. Defaults to `time.now_nanos`.
+    pub clock: fn() -> i64 = fn() -> i64 { time.now_nanos() }
+    /// Cancels the query when cancelled, which fails it with `Io(Aborted)`. Defaults to none.
+    pub token: *cancel.Token? = none
+}
+
+fn expired(deadline: i64) -> bool {
+    deadline != 0 && deadline <= time.monotonic()
+}
+
+fn millis_left(deadline: i64) -> i64 {
+    if deadline == 0 {
+        return 0
+    }
+    let left = (deadline - time.monotonic() + 999999) / 1000000
+    if left < 1 { 1 } else { left }
+}
+
+fn request_stamp(t1: i64) -> Stamp ! io.Error {
+    let base = to_stamp(t1)
+    let random = sys.random_bytes(1)?
+    Stamp { seconds: base.seconds, fraction: (base.fraction & 0xFFFFFF00) | i64(random[0]) }
+}
+
+fn from_server(p: net.Packet, ip: []u8, port: i64) -> bool {
+    p.from.port == port && slices.equal(p.from.ip, ip)
+}
+
+fn wait_reply(s: net.Socket, ip: []u8, o: Options, deadline: i64, buf: []u8) -> i64 ! io.Error {
+    for {
+        if expired(deadline) {
+            fail TimedOut
+        }
+        net.set_receive_timeout(s, millis_left(deadline))
+        let p = net.receive_from(s, buf)?
+        if from_server(p, ip, o.port) {
+            return p.size
+        }
+    }
+}
+
+fn exchange(ip: []u8, o: Options, deadline: i64) -> Reply ! Error {
+    using s = net.bind_udp(if net.v6(ip) { "::" } else { "0.0.0.0" }, 0) catch {
+        e => fail Io(e)
+    }
+    let handle = s.handle
+    let token = o.token ?? cancel.token()
+    using watch = cancel.on_cancel(token, fn() { net.close_socket_on(handle) })
+    let to = net.Addr { ip, port: o.port }
+    round_trip(s, to, o, deadline) catch {
+        Io(e) => {
+            if cancel.cancelled(token) {
+                fail Io(Aborted)
+            }
+            fail Io(e)
+        }
+        e => fail e
+    }
+}
+
+fn round_trip(s: net.Socket, to: net.Addr, o: Options, deadline: i64) -> Reply ! Error {
+    let t1 = o.clock()
+    let sent = request_stamp(t1) catch {
+        e => fail Io(e)
+    }
+    let datagram = request(sent)
+    net.send_to(s, datagram, to) catch {
+        e => fail Io(e)
+    }
+    let buf = io.buffer(1024)
+    let size = wait_reply(s, to.ip, o, deadline, buf) catch {
+        e => fail Io(e)
+    }
+    let received = o.clock()
+    parse(buf[..size], sent, received)?
+}
+
+/// Asks the NTP server `host` for the time and returns its checked reply.
+///
+/// Resolves `host` with `net.lookup` and sends one request, as `request` builds it, to the first address from a new UDP socket, then to each further address when an attempt fails with `Io`; an error from `parse` ends the query at once. The transmit timestamp is the clock reading with its low 8 bits random, so a reply to another request is told apart, and the reply must come from the address asked. Datagrams from other sources are ignored. Parks the green thread while it waits, for at most `Options.timeout_ms` over all attempts, and fails with `Io(TimedOut)` when that passes. Cancelling `Options.token` closes the socket and fails with `Io(Aborted)`. The reply's `t1` is the transmit stamp, which differs from the clock reading by less than 60 ns because of the random bits, and its `t4` is the clock reading when the datagram arrives.
+pub fn query(host: str, o: Options) -> Reply ! Error {
+    let ips = net.lookup(host) catch {
+        e => fail Io(e)
+    }
+    let deadline = if o.timeout_ms > 0 { time.monotonic() + o.timeout_ms * 1000000 } else { 0 }
+    var last: io.Error = NotFound
+    for ip in ips {
+        if expired(deadline) {
+            break
+        }
+        let reply = exchange(ip, o, deadline) catch {
+            Io(e) => {
+                match e {
+                    Aborted => fail Io(Aborted)
+                    _ => {}
+                }
+                last = e
+                continue
+            }
+            e => fail e
+        }
+        return reply
+    }
+    fail Io(last)
+}
