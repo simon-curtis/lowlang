@@ -1,0 +1,151 @@
+import std/cancel
+import std/header
+import std/io
+import std/text
+
+/// One HTTP/2 stream opened by `open_call`, over which the request body is sent and the response is read independently.
+///
+/// Share it between a sending and a receiving green thread by pointer. Its fields are private.
+pub struct Call {
+    client: *Client
+    mux: *Mux
+    lane: *Lane
+    deadline: *Deadline
+    headed: bool
+    closed: bool
+}
+
+/// One event of the response to a `Call`.
+pub enum CallEvent {
+    /// The final response headers, without pseudo-headers.
+    Head(status: i64, headers: []header.Header)
+    /// A piece of the response body.
+    Data(data: []u8)
+    /// The trailing header fields, without pseudo-headers.
+    Trailers(headers: []header.Header)
+    /// The peer reset the stream with the HTTP/2 error `code`.
+    Reset(code: i64)
+    /// The connection ended before the stream did.
+    Lost
+    /// The peer ended the stream.
+    End
+}
+
+fn call_fields(u: Url, method: str, headers: []header.Header) -> []header.Header ! io.Error {
+    var fields: []header.Header = [
+        header.Header { name: ":method", value: method }
+        header.Header { name: ":scheme", value: u.scheme }
+        header.Header { name: ":authority", value: authority(u) }
+        header.Header { name: ":path", value: u.target }
+    ]
+    for h in headers {
+        let name = text.lower(h.name)
+        if !header.token(name) || !header.valid_value(h.value) {
+            fail Invalid
+        }
+        if connection_specific(name) || name == "host" || name == "te" && h.value != "trailers" {
+            continue
+        }
+        push(mut fields, header.Header { name, value: h.value })
+    }
+    fields
+}
+
+fn start_call(job: Job, u: Url, method: str, headers: []header.Header, a: *Attempt) -> *Call ! io.Error {
+    let c = job.client
+    let fields = call_fields(u, method, headers)?
+    let route = acquire(job, host_for(c, u), u, a)?
+    let m = match route {
+        Multiplexed(m) => m
+        Single(conn) => {
+            release(c, conn, false)
+            fail Unsupported
+        }
+        Quic(_) => fail Unsupported
+    }
+    a.used = some(m)
+    a.phase = Sending
+    reserve(m, job.deadline)?
+    let lane = new(Lane { id: 0, events: [], signal: chan[bool](1), space: chan[bool](1), window: 0, unacked: 0, ended: false, reset: false })
+    open_lane(m, lane, fields, false) catch {
+        e => {
+            finish_lane(m, lane, false)
+            fail e
+        }
+    }
+    new(Call { client: c, mux: m, lane, deadline: job.deadline, headed: false, closed: false })
+}
+
+/// Opens an HTTP/2 stream for a request with `method` to `url` and sends the request headers, without a body and without ending the stream.
+///
+/// `url` is `http`, spoken as HTTP/2 with prior knowledge, or `https`, which must negotiate `h2`. The connection is the client's pooled connection for the host, shared with its other requests, and a connection that turned out to be dead is replaced once. `headers` are sent as written, lowercased, except connection-specific ones and a `te` other than `trailers`. When `timeout` is more than zero the call fails once that many milliseconds pass, and cancelling `token` ends it at once; both make `call_send` and `call_receive` fail with `TimedOut`, and `call_close` then resets the stream with `CANCEL`. A stream waits for a slot when the connection is at the peer's stream limit.
+///
+/// Fails with `InvalidUrl` for a URL that does not parse or has another scheme, `Connect`, `Tls` and `Timeout` as `send` does, and `Protocol(Unsupported)` when the server does not speak HTTP/2.
+pub fn open_call(c: *Client, method: str, url: str, headers: []header.Header, timeout: i64, token: *cancel.Token) -> *Call ! Error {
+    let u = parse_url(url) or fail InvalidUrl(url)
+    if u.scheme != "http" && u.scheme != "https" {
+        fail InvalidUrl(url)
+    }
+    let d = arm(c.reaper, timeout, some(token))
+    let job = Job { client: c, deadline: d, connect_timeout: 0, version: Http2, prior_knowledge: true }
+    var fresh = false
+    var avoid: *Mux? = none
+    var retried = false
+    for {
+        let a = new_attempt(fresh, avoid, none, Direct)
+        let started = outcome(fn() -> *Call ! io.Error { start_call(job, u, method, headers, a) })
+        match started {
+            Done(call) => return call
+            Failed(e) => {
+                if a.used != none && !retried && !expired(d) && e != io.Error.Invalid {
+                    retried = true
+                    fresh = true
+                    avoid = a.used
+                    continue
+                }
+                disarm(c.reaper, d)
+                fail if expired(d) { Timeout } else { classify(e, a) }
+            }
+        }
+    }
+}
+
+/// Sends `data` as the body of `call`, waiting for flow-control window as needed, and ends the request when `last` is `true`.
+///
+/// Fails with `TimedOut` when the deadline passes or the token is cancelled, and with `Reset` when the peer reset the stream or the connection ended.
+pub fn call_send(call: *Call, data: []u8, last: bool) ! io.Error {
+    send_data(call.mux, call.lane, data, last, call.deadline)?
+}
+
+/// Returns the next event of the response to `call`, waiting for it.
+///
+/// Window for received data is returned to the peer as events are taken, so a caller that does not call this stalls the sender. Fails with `TimedOut` when the deadline passes or the token is cancelled.
+pub fn call_receive(call: *Call) -> CallEvent ! io.Error {
+    let ev = next_event(call.mux, call.lane, call.deadline)?
+    match ev.kind {
+        Head => {
+            if !call.headed && ev.status != 0 {
+                call.headed = true
+                return Head(ev.status, ev.headers)
+            }
+            Trailers(ev.headers)
+        }
+        Data => Data(ev.data)
+        End => {
+            call.lane.ended = true
+            End
+        }
+        Reset => Reset(ev.code)
+        Lost => Lost
+    }
+}
+
+/// Releases the stream of `call`: when `complete` is `false` and the peer has not ended it, the stream is reset with `CANCEL`. Call it once, after the last `call_send` and `call_receive`; later calls do nothing.
+pub fn call_close(call: *Call, complete: bool) {
+    if call.closed {
+        return
+    }
+    call.closed = true
+    finish_lane(call.mux, call.lane, complete)
+    disarm(call.client.reaper, call.deadline)
+}

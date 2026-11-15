@@ -1,0 +1,495 @@
+import std/base64
+import std/cancel
+import std/crypto/x509
+import std/header
+import std/http
+import std/io
+import std/protobuf
+import std/retry
+import std/text
+import std/time
+import std/time/duration
+import std/tls
+
+fn default_retry() -> retry.Policy {
+    var p = retry.policy()
+    p = retry.with_attempts(p, 3)
+    p = retry.with_base(p, duration.milliseconds(50))
+    retry.with_max_delay(p, duration.seconds(1))
+}
+
+/// Settings of a `Channel`.
+pub struct ChannelOptions {
+    /// The TLS settings for an `https` target. ALPN is always `h2`.
+    pub tls: tls.Config = tls.Config {}
+    /// Certificates trusted in addition to the system roots for an `https` target.
+    pub roots: []x509.Certificate = []
+    /// Whether to skip verifying the server certificate. Defaults to `false`.
+    pub insecure: bool = false
+    /// The `user-agent` sent with every call. Defaults to `grpc-low/1`.
+    pub user_agent: str = "grpc-low/1"
+    /// The longest message, after decompression, the channel accepts, in bytes. A longer one fails the call with `ResourceExhausted`. Defaults to 4 MiB.
+    pub max_receive: i64 = 4194304
+    /// The longest message a call may send, in bytes. A longer one fails with `ResourceExhausted` before anything is sent. Defaults to 2 GiB - 1.
+    pub max_send: i64 = 2147483647
+    /// How `unary` and `unary_bytes` retry a call that failed with `Unavailable` before any response header arrived. Defaults to three attempts with a 50 millisecond base delay, doubling up to one second, with full jitter.
+    pub retry: retry.Policy = default_retry()
+}
+
+/// A connection target and its settings, made by `dial`.
+///
+/// It shares one HTTP/2 connection per server between all calls and any number of green threads, and opens a new one when the server closes it. Copies share the connections.
+pub struct Channel {
+    base: str
+    client: *http.Client
+    options: ChannelOptions
+}
+
+/// Settings of one call.
+pub struct CallOptions {
+    /// The time the call may take in milliseconds, connecting and retries included, or `0` for no deadline. It is sent as `grpc-timeout`; a call still running when it passes fails with `DeadlineExceeded`.
+    pub timeout: i64 = 0
+    /// The request metadata, sent as headers.
+    pub metadata: Metadata = Metadata {}
+    /// The compression of the messages this call sends. Defaults to `Identity`.
+    pub compression: Encoding = Identity
+    /// A token whose cancellation ends the call with `Cancelled`, resetting the stream with `CANCEL`.
+    pub token: *cancel.Token? = none
+    /// Whether `unary` retries on `Unavailable` before any response header arrived, under the channel's retry policy. Defaults to `true`.
+    pub retry: bool = true
+}
+
+/// A successful response with the metadata that came with it.
+pub struct Reply[T] {
+    /// The response message.
+    pub value: T
+    /// The response headers as metadata.
+    pub headers: Metadata
+    /// The trailers as metadata.
+    pub trailers: Metadata
+}
+
+/// An open call whose messages are sent and received one at a time, made by `server_streaming`, `client_streaming` or `bidi_streaming`.
+///
+/// A sending and a receiving green thread may share it by pointer; two senders or two receivers may not. Release it with `close_stream`. Its fields are private.
+pub struct Stream {
+    call: *http.Call
+    token: *cancel.Token
+    encoding: Encoding
+    max_send: i64
+    reader: *MessageReader
+    headers: Metadata
+    trailers: Metadata
+    headed: bool
+    ended: bool
+    done: bool
+    outcome: Status?
+    closed: bool
+}
+
+fn target_base(target: str) -> str {
+    if text.starts_with(target, "http://") || text.starts_with(target, "https://") {
+        return if text.ends_with(target, "/") { target[..target.len - 1] } else { target }
+    }
+    "http://{target}"
+}
+
+/// Returns a channel to `target`: `host:port` or `http://host:port` for HTTP/2 without TLS, `https://host:port` for TLS.
+///
+/// Nothing is connected until the first call. Fails with `InvalidArgument` when `target` does not parse.
+pub fn dial(target: str, options: ChannelOptions) -> Channel ! Error {
+    let base = target_base(target)
+    http.parse_url(base) or fail error(InvalidArgument, "invalid target {target}")
+    var b = http.client()
+    b = http.with_tls(b, options.tls)
+    b = http.with_roots(b, options.roots)
+    if options.insecure {
+        b = http.with_insecure(b)
+    }
+    Channel { base, client: http.build(b), options }
+}
+
+/// Closes the idle connections of `ch`. Calls in progress finish, and a later call connects again.
+pub fn close_channel(ch: Channel) {
+    http.close_idle(ch.client)
+}
+
+fn cancelled_status() -> Status {
+    Status { code: Cancelled, message: "call cancelled" }
+}
+
+fn transport_status(e: http.Error) -> Status {
+    match e {
+        InvalidUrl(url) => Status { code: InvalidArgument, message: "invalid url {url}" }
+        Connect(c) => Status { code: Unavailable, message: "connection failed: {c}" }
+        Tls(c) => Status { code: Unavailable, message: "tls handshake failed: {c}" }
+        Timeout => Status { code: DeadlineExceeded, message: "deadline exceeded" }
+        TooManyRedirects(_) => Status { code: Internal, message: "unexpected redirect" }
+        Protocol(c) => Status { code: Unavailable, message: "the server does not speak HTTP/2: {c}" }
+        Decode(c) => Status { code: Internal, message: "decoding failed: {c}" }
+        Json(_) => Status { code: Internal, message: "decoding failed" }
+        Status(code) => Status { code: Unknown, message: "http status {code}" }
+        Io(c) => Status { code: Unavailable, message: "connection failed: {c}" }
+    }
+}
+
+fn io_status(e: io.Error) -> Status {
+    match e {
+        TimedOut => Status { code: DeadlineExceeded, message: "deadline exceeded" }
+        _ => Status { code: Unavailable, message: "connection failed: {e}" }
+    }
+}
+
+fn request_headers(ch: Channel, opts: CallOptions, timeout: i64) -> []header.Header {
+    var out: []header.Header = [
+        header.Header { name: "content-type", value: "application/grpc" }
+        header.Header { name: "te", value: "trailers" }
+        header.Header { name: "user-agent", value: ch.options.user_agent }
+    ]
+    match encode_timeout(timeout * 1000000) {
+        some(t) => push(mut out, header.Header { name: "grpc-timeout", value: t })
+        none => {}
+    }
+    if opts.compression != Encoding.Identity {
+        push(mut out, header.Header { name: "grpc-encoding", value: encoding_name(opts.compression) })
+    }
+    push(mut out, header.Header { name: "grpc-accept-encoding", value: accepted_encodings() })
+    for h in to_headers(opts.metadata) {
+        push(mut out, h)
+    }
+    out
+}
+
+fn open_with(ch: Channel, method: str, opts: CallOptions, timeout: i64, token: *cancel.Token) -> *Stream ! Error {
+    let url = "{ch.base}{method}"
+    let headers = request_headers(ch, opts, timeout)
+    let call = http.open_call(ch.client, "POST", url, headers, timeout, token) catch {
+        e => {
+            if cancel.cancelled(token) {
+                fail Failed(cancelled_status())
+            }
+            fail Failed(transport_status(e))
+        }
+    }
+    new(Stream {
+        call
+        token
+        encoding: opts.compression
+        max_send: ch.options.max_send
+        reader: message_reader(ch.options.max_receive, Identity)
+        headers: Metadata {}
+        trailers: Metadata {}
+        headed: false
+        ended: false
+        done: false
+        outcome: none
+        closed: false
+    })
+}
+
+fn call_token(opts: CallOptions) -> *cancel.Token {
+    match opts.token {
+        some(t) => cancel.child(t)
+        none => cancel.token()
+    }
+}
+
+fn open_stream(ch: Channel, method: str, opts: CallOptions) -> *Stream ! Error {
+    open_with(ch, method, opts, opts.timeout, call_token(opts))?
+}
+
+fn stop_status(s: *Stream, e: io.Error) -> Status {
+    if cancel.cancelled(s.token) {
+        return cancelled_status()
+    }
+    io_status(e)
+}
+
+fn conclude(s: *Stream, st: Status) {
+    if !s.done {
+        s.outcome = some(st)
+    }
+    s.done = true
+}
+
+fn parse_status(headers: []header.Header) -> Status {
+    let raw = text.trim(header.get(headers, "grpc-status") ?? "")
+    if raw.len == 0 {
+        return Status { code: Unknown, message: "missing grpc-status" }
+    }
+    let n = text.parse_uint(raw, 10) or return Status { code: Unknown, message: "invalid grpc-status {raw}" }
+    let encoded = text.trim(header.get(headers, "grpc-status-details-bin") ?? "")
+    var details: []u8 = []
+    if encoded.len > 0 {
+        details = base64.decode_with(encoded, base64.standard, base64.Padding.Optional) or []
+    }
+    Status {
+        code: code_of(n)
+        message: decode_message(header.get(headers, "grpc-message") ?? "")
+        details
+        trailers: from_headers(headers)
+    }
+}
+
+fn on_head(s: *Stream, status: i64, headers: []header.Header) {
+    s.headers = from_headers(headers)
+    if header.has(headers, "grpc-status") {
+        conclude(s, parse_status(headers))
+        s.trailers = s.headers
+        return
+    }
+    if status != 200 {
+        conclude(s, Status { code: code_of_http(status), message: "unexpected HTTP status code {status}", trailers: s.headers })
+        return
+    }
+    let kind = header.get(headers, "content-type") ?? ""
+    if !text.starts_with(kind, "application/grpc") {
+        conclude(s, Status { code: Unknown, message: "invalid content-type {kind}" })
+        return
+    }
+    s.headed = true
+    let name = header.get(headers, "grpc-encoding") ?? "identity"
+    match parse_encoding(name) {
+        some(e) => { s.reader.encoding = e }
+        none => conclude(s, Status { code: Internal, message: "the server compressed with unsupported encoding {name}" })
+    }
+}
+
+fn pump(s: *Stream) {
+    let event = http.call_receive(s.call) catch {
+        e => {
+            conclude(s, stop_status(s, e))
+            return
+        }
+    }
+    match event {
+        Head(status, headers) => on_head(s, status, headers)
+        Data(data) => feed(s.reader, data)
+        Trailers(headers) => {
+            let st = parse_status(headers)
+            s.trailers = st.trailers
+            conclude(s, st)
+        }
+        Reset(code) => conclude(s, status_of_reset(code))
+        Lost => conclude(s, Status { code: Unavailable, message: "connection closed" })
+        End => {
+            s.ended = true
+            conclude(s, Status { code: Unknown, message: "missing grpc-status" })
+        }
+    }
+}
+
+fn next_message(s: *Stream) -> []u8? ! Error {
+    for {
+        match take(s.reader)? {
+            some(m) => return m
+            none => {}
+        }
+        if s.done {
+            break
+        }
+        pump(s)
+    }
+    let st = s.outcome ?? Status { code: Unknown, message: "missing grpc-status" }
+    if st.code != Ok {
+        fail Failed(st)
+    }
+    if pending(s.reader) > 0 {
+        fail error(Internal, "the response ended inside a message")
+    }
+    none
+}
+
+fn write_message(s: *Stream, data: []u8, last: bool) -> bool ! Error {
+    if data.len > s.max_send {
+        fail error(ResourceExhausted, "message of {data.len} bytes is larger than the send limit {s.max_send}")
+    }
+    http.call_send(s.call, encode_message_frame(data, s.encoding), last) catch {
+        TimedOut => fail Failed(stop_status(s, TimedOut))
+        _ => return false
+    }
+    true
+}
+
+fn unmarshal[T](raw: []u8) -> T ! Error {
+    protobuf.deserialize[T](raw) or fail error(Internal, "cannot decode the {raw.len} byte message")
+}
+
+/// Sends `message`, serialized with `std/protobuf`, on `s` and returns `true`, or returns `false` when the server has already ended the stream, in which case `receive` or `finish` returns its status.
+///
+/// Waits while the peer's flow-control window is full, so a slow server slows the sender. Fails with `ResourceExhausted` for a message over the send limit and with `Cancelled` or `DeadlineExceeded` once the call is cancelled or its deadline passed.
+pub fn send[T](s: *Stream, message: T) -> bool ! Error {
+    write_message(s, protobuf.serialize(message), false)?
+}
+
+/// Sends `data` as one message as `send` does, without serializing it.
+pub fn send_bytes(s: *Stream, data: []u8) -> bool ! Error {
+    write_message(s, data, false)?
+}
+
+/// Ends the request of `s`: the client half-closes the stream, and the server sees the end of its input. Returns `false` when the server has already ended the stream.
+pub fn close_send(s: *Stream) -> bool ! Error {
+    http.call_send(s.call, [], true) catch {
+        TimedOut => fail Failed(stop_status(s, TimedOut))
+        _ => return false
+    }
+    true
+}
+
+/// Returns the next message of `s` as a `T`, waiting for it, or `none` once the call ended with `Ok`.
+///
+/// A call that ended with another status fails with it, after the messages that came before. Fails with `Internal` for a message that does not decode and with `ResourceExhausted` for one over the receive limit.
+pub fn receive[T](s: *Stream) -> T? ! Error {
+    match next_message(s)? {
+        some(raw) => unmarshal[T](raw)?
+        none => none
+    }
+}
+
+/// Returns the next message of `s` as bytes, as `receive` does.
+pub fn receive_bytes(s: *Stream) -> []u8? ! Error {
+    next_message(s)?
+}
+
+/// Returns the response headers of `s`, waiting until they arrive: for a Trailers-Only response, the metadata that came with the status. A call that fails before headers arrive fails with its status.
+pub fn stream_headers(s: *Stream) -> Metadata ! Error {
+    for !s.headed && !s.done {
+        pump(s)
+    }
+    if !s.headed {
+        let st = s.outcome ?? Status { code: Unknown, message: "missing grpc-status" }
+        if st.code != Ok {
+            fail Failed(st)
+        }
+    }
+    s.headers
+}
+
+/// Returns the trailers of `s`, which are complete once `receive` returned `none` or an error.
+pub fn stream_trailers(s: *Stream) -> Metadata {
+    s.trailers
+}
+
+/// Returns the status the call ended with, or `none` while it is running.
+pub fn stream_status(s: *Stream) -> Status? {
+    if s.done { s.outcome } else { none }
+}
+
+/// Reads the one message of a call that returns a single response, and its end, for `client_streaming`. Fails with `Internal` when the server sends no message or more than one.
+pub fn finish[T](s: *Stream) -> Reply[T] ! Error {
+    let raw = finish_bytes(s)?
+    Reply[T] { value: unmarshal[T](raw.value)?, headers: raw.headers, trailers: raw.trailers }
+}
+
+/// Reads the one message of `s` as bytes, as `finish` does.
+pub fn finish_bytes(s: *Stream) -> Reply[[]u8] ! Error {
+    let first = match next_message(s)? {
+        some(m) => m
+        none => fail error(Internal, "the server returned no response message")
+    }
+    match next_message(s)? {
+        some(_) => fail error(Internal, "the server returned more than one response message")
+        none => {}
+    }
+    Reply[[]u8] { value: first, headers: s.headers, trailers: s.trailers }
+}
+
+/// Cancels the call of `s`: the stream is reset with `CANCEL` and blocked `send` and `receive` calls fail with `Cancelled`.
+pub fn cancel_stream(s: *Stream) {
+    cancel.cancel(s.token)
+}
+
+/// Releases `s`. A stream the server has not ended is reset with `CANCEL`. Call it once, when no other green thread uses the stream.
+pub fn close_stream(s: *Stream) {
+    if s.closed {
+        return
+    }
+    s.closed = true
+    http.call_close(s.call, s.ended)
+    cancel.cancel(s.token)
+}
+
+/// Starts a call with one request and a stream of responses. The request is sent and the stream half-closed; read the responses with `receive` until it returns `none`, then `close_stream`.
+pub fn server_streaming[Req](ch: Channel, method: str, request: Req, opts: CallOptions) -> *Stream ! Error {
+    let s = open_stream(ch, method, opts)?
+    write_message(s, protobuf.serialize(request), true) catch {
+        e => {
+            close_stream(s)
+            fail e
+        }
+    }
+    s
+}
+
+/// Starts a call whose requests are sent one at a time with `send` and ended with `close_send`; read the single response with `finish`.
+pub fn client_streaming(ch: Channel, method: str, opts: CallOptions) -> *Stream ! Error {
+    open_stream(ch, method, opts)?
+}
+
+/// Starts a call whose requests and responses are both streams, sent and received independently.
+pub fn bidi_streaming(ch: Channel, method: str, opts: CallOptions) -> *Stream ! Error {
+    open_stream(ch, method, opts)?
+}
+
+fn remaining_ms(at: i64) -> i64 {
+    (at - time.monotonic()) / 1000000
+}
+
+fn exchange(ch: Channel, method: str, data: []u8, opts: CallOptions, timeout: i64, headed: *bool) -> Reply[[]u8] ! Error {
+    let s = open_with(ch, method, opts, timeout, call_token(opts))?
+    defer {
+        *headed = s.headed
+        close_stream(s)
+    }
+    write_message(s, data, true)?
+    finish_bytes(s)?
+}
+
+/// Makes a unary call with the request bytes `request` and returns the response bytes and metadata. `unary` is this with serialization.
+///
+/// A call that fails with `Unavailable` before any response header arrived, as a refused connection or a stream the server refused does, is made again under the channel's retry policy while the call's deadline allows; any other failure is returned as it is.
+pub fn unary_bytes(ch: Channel, method: str, request: []u8, opts: CallOptions) -> Reply[[]u8] ! Error {
+    if request.len > ch.options.max_send {
+        fail error(ResourceExhausted, "message of {request.len} bytes is larger than the send limit {ch.options.max_send}")
+    }
+    let deadline = if opts.timeout > 0 { time.monotonic() + opts.timeout * 1000000 } else { 0 }
+    var policy = if opts.retry { ch.options.retry } else { retry.with_attempts(ch.options.retry, 1) }
+    match opts.token {
+        some(t) => { policy = retry.with_cancel(policy, t) }
+        none => {}
+    }
+    let outcome = retry.run(policy, fn(attempt: i64) -> retry.Step[Reply[[]u8], Error] {
+        var timeout = 0
+        if deadline > 0 {
+            timeout = remaining_ms(deadline)
+            if timeout <= 0 {
+                return Fatal(error(DeadlineExceeded, "deadline exceeded"))
+            }
+        }
+        let headed = new(false)
+        let reply = exchange(ch, method, request, opts, timeout, headed) catch {
+            e => {
+                let st = status_of(e)
+                if st.code == Unavailable && !*headed {
+                    return Retry(e)
+                }
+                return Fatal(e)
+            }
+        }
+        Done(reply)
+    })
+    match outcome {
+        Value(reply) => reply
+        Failed(e) => fail e
+        GaveUp(e, _) => fail e
+        Stopped(_) => fail Failed(cancelled_status())
+    }
+}
+
+/// Makes a unary call: sends `request` serialized with `std/protobuf` to the method `method`, such as `/helloworld.Greeter/SayHello`, and returns the response as a `Resp` with its metadata.
+///
+/// Fails with the status of the call, `Internal` when the response does not decode and `ResourceExhausted` for a message over a size limit. Retries as `unary_bytes` does.
+pub fn unary[Req, Resp](ch: Channel, method: str, request: Req, opts: CallOptions) -> Reply[Resp] ! Error {
+    let raw = unary_bytes(ch, method, protobuf.serialize(request), opts)?
+    Reply[Resp] { value: unmarshal[Resp](raw.value)?, headers: raw.headers, trailers: raw.trailers }
+}

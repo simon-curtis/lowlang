@@ -1,5 +1,5 @@
-import std/base64
 import std/compress/deflate
+import std/grpc
 import std/header
 import std/http
 import std/io
@@ -55,12 +55,19 @@ pub fn endpoint_of(o: OtlpOptions) -> str {
     if grpc(o) { "http://localhost:4317" } else { "http://localhost:4318" }
 }
 
-fn signal_url(o: OtlpOptions, path: str, service: str) -> str {
-    if grpc(o) {
-        let target = if o.signal_endpoint.len > 0 { o.signal_endpoint } else { endpoint_of(o) }
-        let u = http.parse_url(target) or return target
-        return "{http.origin(u)}/opentelemetry.proto.collector.{service}/Export"
-    }
+enum Route {
+    Http(client: *http.Client, url: str)
+    Grpc(channel: grpc.Channel, method: str)
+    Broken
+}
+
+fn grpc_target(o: OtlpOptions) -> str {
+    let target = if o.signal_endpoint.len > 0 { o.signal_endpoint } else { endpoint_of(o) }
+    let u = http.parse_url(target) or return target
+    http.origin(u)
+}
+
+fn http_url(o: OtlpOptions, path: str) -> str {
     if o.signal_endpoint.len > 0 {
         return o.signal_endpoint
     }
@@ -69,15 +76,18 @@ fn signal_url(o: OtlpOptions, path: str, service: str) -> str {
     "{base}{path}"
 }
 
-fn exporter_client(o: OtlpOptions) -> *http.Client {
-    let base = http.client()
+fn route(o: OtlpOptions, path: str, service: str) -> Route {
+    if grpc(o) {
+        let channel = grpc.dial(grpc_target(o), grpc.ChannelOptions { user_agent: "OTel-OTLP-Exporter-Low" }) or return Route.Broken
+        return Route.Grpc(channel, "/opentelemetry.proto.collector.{service}/Export")
+    }
+    let client = http.client()
         .with_timeout(o.timeout)
         .with_retries(0)
         .with_decompression(false)
-    if grpc(o) {
-        return base.with_version(Http2).with_prior_knowledge(true).build()
-    }
-    base.with_version(Http1).build()
+        .with_version(Http1)
+        .build()
+    Route.Http(client, http_url(o, path))
 }
 
 fn post(client: *http.Client, url: str, headers: []header.Header, content_type: str, payload: []u8) -> http.Response? {
@@ -105,24 +115,6 @@ fn http_step(resp: http.Response) -> retry.Step[bool, i64] {
         return Fatal(resp.status)
     }
     waiting(resp.status, http.retry_after_ms(resp.headers))
-}
-
-fn grpc_frame(body: []u8, compressed: bool) -> []u8 {
-    let out: []u8 = __make(5 + body.len)
-    out[0] = if compressed { 1 } else { 0 }
-    out[1] = u8(body.len >> 24)
-    out[2] = u8(body.len >> 16)
-    out[3] = u8(body.len >> 8)
-    out[4] = u8(body.len)
-    __memmove(out[5..], body)
-    out
-}
-
-fn grpc_value(resp: http.Response, name: str) -> str? {
-    match header.get(resp.trailers, name) {
-        some(v) => some(v)
-        none => header.get(resp.headers, name)
-    }
 }
 
 fn duration_ms(data: []u8) -> i64 ! io.Error {
@@ -174,13 +166,11 @@ fn retry_info_delay(any: []u8) -> i64 ! io.Error {
     0
 }
 
-fn retry_delay(resp: http.Response) -> i64 {
-    let encoded = text.trim(grpc_value(resp, "grpc-status-details-bin") ?? "")
-    if encoded.len == 0 {
+fn retry_delay(details: []u8) -> i64 {
+    if details.len == 0 {
         return -1
     }
-    let status = base64.decode_with(encoded, base64.standard, base64.Padding.Optional) or return -1
-    let d = protobuf.decoder(status)
+    let d = protobuf.decoder(details)
     for {
         let f = d.next() or return -1
         let field = match f {
@@ -197,24 +187,27 @@ fn retry_delay(resp: http.Response) -> i64 {
     }
 }
 
-fn grpc_retryable(code: i64) -> bool {
-    code == 1 || code == 4 || code == 10 || code == 11 || code == 14 || code == 15
+fn grpc_retryable(code: grpc.Code) -> bool {
+    match code {
+        Cancelled => true
+        DeadlineExceeded => true
+        Aborted => true
+        OutOfRange => true
+        Unavailable => true
+        DataLoss => true
+        _ => false
+    }
 }
 
-fn grpc_step(resp: http.Response) -> retry.Step[bool, i64] {
-    if resp.status != 200 {
-        return http_step(resp)
+fn grpc_failure(st: grpc.Status) -> retry.Step[bool, i64] {
+    let code = st.code.index
+    let hinted = retry_delay(st.details)
+    if grpc_retryable(st.code) {
+        let wait = if hinted >= 0 { hinted } else { http.retry_after_ms(grpc.to_headers(st.trailers)) }
+        return waiting(code, wait)
     }
-    let code = text.parse_uint(text.trim(grpc_value(resp, "grpc-status") ?? ""), 10) or return Fatal(0)
-    if code == 0 {
-        return Done(true)
-    }
-    if grpc_retryable(code) {
-        return waiting(code, retry_delay(resp))
-    }
-    if code == 8 {
-        let delay = retry_delay(resp)
-        return if delay >= 0 { waiting(code, delay) } else { Fatal(code) }
+    if st.code == grpc.Code.ResourceExhausted && hinted >= 0 {
+        return waiting(code, hinted)
     }
     Fatal(code)
 }
@@ -227,31 +220,23 @@ fn exchange_policy(o: OtlpOptions) -> retry.Policy {
     retry.with_jitter(p, retry.Jitter.Equal)
 }
 
-fn send(client: *http.Client, o: OtlpOptions, url: str, body: []u8) -> bool {
+fn deliver(l: Route, o: OtlpOptions, body: []u8) -> bool {
+    match l {
+        Http(client, url) => send_http(client, o, url, body)
+        Grpc(channel, method) => send_grpc(channel, o, method, body)
+        Broken => false
+    }
+}
+
+fn send_http(client: *http.Client, o: OtlpOptions, url: str, body: []u8) -> bool {
     var headers: []header.Header = []
     for h in o.headers {
         push(mut headers, h)
     }
     header.set(mut headers, "user-agent", "OTel-OTLP-Exporter-Low")
-    let compressed = if o.gzip { deflate.gzip_compress(body, 6) } else { body }
-    var content_type = "application/x-protobuf"
-    var payload = compressed
-    match o.protocol {
-        Grpc => {
-            content_type = "application/grpc"
-            payload = grpc_frame(compressed, o.gzip)
-            header.set(mut headers, "te", "trailers")
-            header.set(mut headers, "grpc-timeout", "{o.timeout}m")
-            if o.gzip {
-                header.set(mut headers, "grpc-encoding", "gzip")
-            }
-        }
-        HttpJson => {
-            content_type = "application/json"
-        }
-        HttpProtobuf => {}
-    }
-    if o.gzip && !grpc(o) {
+    let payload = if o.gzip { deflate.gzip_compress(body, 6) } else { body }
+    let content_type = if json_protocol(o) { "application/json" } else { "application/x-protobuf" }
+    if o.gzip {
         header.set(mut headers, "content-encoding", "gzip")
     }
     let delivered = retry.run(exchange_policy(o), fn(attempt: i64) -> retry.Step[bool, i64] {
@@ -259,7 +244,7 @@ fn send(client: *http.Client, o: OtlpOptions, url: str, body: []u8) -> bool {
             some(r) => r
             none => return Retry(0)
         }
-        if grpc(o) { grpc_step(resp) } else { http_step(resp) }
+        http_step(resp)
     })
     match delivered {
         Value(_) => true
@@ -267,9 +252,32 @@ fn send(client: *http.Client, o: OtlpOptions, url: str, body: []u8) -> bool {
     }
 }
 
-fn retire(open: *bool, client: *http.Client) {
+fn send_grpc(channel: grpc.Channel, o: OtlpOptions, method: str, body: []u8) -> bool {
+    var metadata = grpc.Metadata {}
+    for h in o.headers {
+        grpc.add(mut metadata, h.name, h.value) or {}
+    }
+    let compression = if o.gzip { grpc.Encoding.Gzip } else { grpc.Encoding.Identity }
+    let opts = grpc.CallOptions { timeout: o.timeout, metadata, compression, retry: false }
+    let delivered = retry.run(exchange_policy(o), fn(attempt: i64) -> retry.Step[bool, i64] {
+        grpc.unary_bytes(channel, method, body, opts) catch {
+            e => return grpc_failure(grpc.status_of(e))
+        }
+        Done(true)
+    })
+    match delivered {
+        Value(_) => true
+        _ => false
+    }
+}
+
+fn retire(open: *bool, l: Route) {
     *open = false
-    http.close_idle(client)
+    match l {
+        Http(client, _) => http.close_idle(client)
+        Grpc(channel, _) => grpc.close_channel(channel)
+        Broken => {}
+    }
 }
 
 fn json_protocol(o: OtlpOptions) -> bool {
@@ -282,48 +290,45 @@ fn json_protocol(o: OtlpOptions) -> bool {
 /// Returns an exporter that sends spans to the collector.
 /// `export` returns `true` once the collector accepts a batch and `false` when it rejects it or every attempt fails; an empty batch returns `true` without a request, and after `shutdown` every call returns `false`. HTTP statuses 429, 502, 503 and 504, and a failed connection, are retried after the backoff or the server's `Retry-After`. Over gRPC, the status codes CANCELLED, DEADLINE_EXCEEDED, ABORTED, OUT_OF_RANGE, UNAVAILABLE and DATA_LOSS are retried and RESOURCE_EXHAUSTED is retried when the response carries a `RetryInfo` delay. The processors and metric readers call `export` with telemetry suppressed. `shutdown` closes idle connections.
 pub fn otlp_span_exporter(o: OtlpOptions) -> SpanExporter {
-    let url = signal_url(o, "/v1/traces", "trace.v1.TraceService")
+    let l = route(o, "/v1/traces", "trace.v1.TraceService")
     let open = new(true)
-    let client = exporter_client(o)
     SpanExporter {
         export: fn(spans) -> bool {
             if !*open || spans.len == 0 {
                 return *open
             }
-            send(client, o, url, encode_traces(spans, json_protocol(o)))
+            deliver(l, o, encode_traces(spans, json_protocol(o)))
         }
-        shutdown: fn() { retire(open, client) }
+        shutdown: fn() { retire(open, l) }
     }
 }
 
 /// Returns an exporter that sends metric batches to the collector. Delivery, retries and shutdown follow `otlp_span_exporter`; `export` returns `false` after `shutdown`.
 pub fn otlp_metric_exporter(o: OtlpOptions) -> MetricExporter {
-    let url = signal_url(o, "/v1/metrics", "metrics.v1.MetricsService")
+    let l = route(o, "/v1/metrics", "metrics.v1.MetricsService")
     let open = new(true)
-    let client = exporter_client(o)
     MetricExporter {
         export: fn(batch) -> bool {
             if !*open {
                 return false
             }
-            send(client, o, url, encode_metrics(batch, json_protocol(o)))
+            deliver(l, o, encode_metrics(batch, json_protocol(o)))
         }
-        shutdown: fn() { retire(open, client) }
+        shutdown: fn() { retire(open, l) }
     }
 }
 
 /// Returns an exporter that sends log records to the collector. Delivery, retries and shutdown follow `otlp_span_exporter`.
 pub fn otlp_log_exporter(o: OtlpOptions) -> LogExporter {
-    let url = signal_url(o, "/v1/logs", "logs.v1.LogsService")
+    let l = route(o, "/v1/logs", "logs.v1.LogsService")
     let open = new(true)
-    let client = exporter_client(o)
     LogExporter {
         export: fn(logs) -> bool {
             if !*open || logs.len == 0 {
                 return *open
             }
-            send(client, o, url, encode_logs(logs, json_protocol(o)))
+            deliver(l, o, encode_logs(logs, json_protocol(o)))
         }
-        shutdown: fn() { retire(open, client) }
+        shutdown: fn() { retire(open, l) }
     }
 }

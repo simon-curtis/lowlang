@@ -1,0 +1,165 @@
+import std/grpc
+import std/net
+
+struct Say {
+    text: str "1"
+    n: i64 "2"
+}
+
+fn echo(ctx: *grpc.Context, req: Say) -> Say ! grpc.Error {
+    let id = grpc.get(ctx.metadata, "x-id") ?? "none"
+    grpc.add(mut ctx.response_headers, "x-seen", id) or {}
+    grpc.add(mut ctx.response_trailers, "x-trail", "t-{id}") or {}
+    Say { text: "echo {req.text}", n: req.n + 1 }
+}
+
+fn count(ctx: *grpc.Context, req: Say) ! grpc.Error {
+    for i in 0..req.n {
+        grpc.write[Say](ctx, Say { text: "item", n: i })?
+    }
+}
+
+fn sum(ctx: *grpc.Context) -> Say ! grpc.Error {
+    var total = 0
+    var seen = 0
+    for {
+        let next = grpc.read[Say](ctx)?
+        match next {
+            some(m) => {
+                total += m.n
+                seen += 1
+            }
+            none => break
+        }
+    }
+    Say { text: "{seen} messages", n: total }
+}
+
+fn chat(ctx: *grpc.Context) ! grpc.Error {
+    for {
+        let next = grpc.read[Say](ctx)?
+        match next {
+            some(m) => grpc.write[Say](ctx, Say { text: "re {m.text}", n: m.n * 2 })?
+            none => break
+        }
+    }
+}
+
+fn fail_with(ctx: *grpc.Context, req: Say) -> Say ! grpc.Error {
+    var st = grpc.status(grpc.code_of(req.n), req.text)
+    grpc.add(mut st.trailers, "x-why", "asked") or {}
+    fail grpc.Error.Failed(st)
+}
+
+fn services() -> *grpc.Server {
+    let s = grpc.server(grpc.ServerOptions {})
+    grpc.handle_unary[Say, Say](s, "/t.T/Echo", echo)
+    grpc.handle_server_streaming[Say](s, "/t.T/Count", count)
+    grpc.handle_client_streaming[Say](s, "/t.T/Sum", sum)
+    grpc.handle_bidi_streaming(s, "/t.T/Chat", chat)
+    grpc.handle_unary[Say, Say](s, "/t.T/Fail", fail_with)
+    s
+}
+
+fn show(m: grpc.Metadata, key: str) -> str {
+    grpc.get(m, key) ?? "-"
+}
+
+fn unary_call(ch: grpc.Channel) ! grpc.Error {
+    var md = grpc.Metadata {}
+    grpc.add(mut md, "x-id", "42") or {}
+    let r = grpc.unary[Say, Say](ch, "/t.T/Echo", Say { text: "hi", n: 1 }, grpc.CallOptions { metadata: md })?
+    print("unary {r.value.text} {r.value.n} seen={show(r.headers, "x-seen")} trail={show(r.trailers, "x-trail")}")
+}
+
+fn server_stream(ch: grpc.Channel) ! grpc.Error {
+    let st = grpc.server_streaming[Say](ch, "/t.T/Count", Say { text: "", n: 3 }, grpc.CallOptions {})?
+    defer grpc.close_stream(st)
+    for {
+        let next = grpc.receive[Say](st)?
+        match next {
+            some(m) => print("stream {m.text} {m.n}")
+            none => break
+        }
+    }
+    match grpc.stream_status(st) {
+        some(final) => print("stream status {grpc.code_name(final.code)}")
+        none => print("stream still running")
+    }
+}
+
+fn client_stream(ch: grpc.Channel) ! grpc.Error {
+    let st = grpc.client_streaming(ch, "/t.T/Sum", grpc.CallOptions {})?
+    defer grpc.close_stream(st)
+    for i in 1..5 {
+        grpc.send[Say](st, Say { text: "", n: i })?
+    }
+    grpc.close_send(st)?
+    let r = grpc.finish[Say](st)?
+    print("client {r.value.text} total={r.value.n}")
+}
+
+fn bidi(ch: grpc.Channel) ! grpc.Error {
+    let st = grpc.bidi_streaming(ch, "/t.T/Chat", grpc.CallOptions {})?
+    defer grpc.close_stream(st)
+    for i in 0..3 {
+        grpc.send[Say](st, Say { text: "m{i}", n: i })?
+        let back = grpc.receive[Say](st)?
+        match back {
+            some(m) => print("bidi {m.text} {m.n}")
+            none => print("bidi ended early")
+        }
+    }
+    grpc.close_send(st)?
+    let end = grpc.receive[Say](st)?
+    print("bidi end {end == none}")
+}
+
+fn failures(ch: grpc.Channel) {
+    for n in 1..17 {
+        let r = grpc.unary[Say, Say](ch, "/t.T/Fail", Say { text: "no {n}", n }, grpc.CallOptions {}) catch {
+            e => {
+                let st = grpc.status_of(e)
+                print("fail {n} {grpc.code_name(st.code)} {st.message} why={show(st.trailers, "x-why")}")
+                continue
+            }
+        }
+        print("fail {n} unexpected success")
+    }
+}
+
+fn unknown(ch: grpc.Channel) {
+    let r = grpc.unary[Say, Say](ch, "/t.T/Missing", Say { text: "", n: 0 }, grpc.CallOptions {}) catch {
+        e => {
+            print("unknown {grpc.describe(e)}")
+            return
+        }
+    }
+    print("unknown unexpected success")
+}
+
+fn run(s: *grpc.Server, l: net.ListenerHandle) {
+    grpc.serve_on(s, l) or {}
+}
+
+fn main() {
+    using l = net.listen("127.0.0.1", 0) or {
+        print("listen failed")
+        return
+    }
+    let s = services()
+    spawn run(s, l.handle)
+    let ch = grpc.dial("127.0.0.1:{l.handle.addr.port}", grpc.ChannelOptions {}) or {
+        print("dial failed")
+        return
+    }
+    unary_call(ch) catch { e => print("unary failed {grpc.describe(e)}") }
+    server_stream(ch) catch { e => print("stream failed {grpc.describe(e)}") }
+    client_stream(ch) catch { e => print("client failed {grpc.describe(e)}") }
+    bidi(ch) catch { e => print("bidi failed {grpc.describe(e)}") }
+    failures(ch)
+    unknown(ch)
+    grpc.close_channel(ch)
+    grpc.shutdown(s, 0)
+    print("shut down")
+}

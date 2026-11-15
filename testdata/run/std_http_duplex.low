@@ -1,0 +1,270 @@
+import std/atomic
+import std/cancel
+import std/header
+import std/http
+import std/io
+import std/net
+import std/time
+import std/time/duration
+
+struct Probe {
+    uploaded: atomic.Int
+    resets: chan[bool]
+    gate: chan[bool]
+}
+
+fn pump(up: http.Upload, out: chan[[]u8]) {
+    for {
+        match http.receive_body(up) {
+            some(chunk) => { out <- chunk }
+            none => break
+        }
+    }
+    close(out)
+}
+
+fn count(probe: *Probe, up: http.Upload, token: *cancel.Token) {
+    let release = <-probe.gate
+    for {
+        match http.receive_body(up) {
+            some(chunk) => probe.uploaded.add_int(chunk.len)
+            none => break
+        }
+    }
+}
+
+fn handle(probe: *Probe, req: http.Request) -> http.Response {
+    let up = match req.upload {
+        some(u) => u
+        none => return http.response(500, "no upload")
+    }
+    if req.path == "/echo" {
+        let out = chan[[]u8]()
+        spawn pump(up, out)
+        return http.Response {
+            status: 200
+            headers: [header.Header { name: "content-type", value: "application/x-echo" }]
+            body: []
+            stream: some(out)
+            finish: fn() -> []header.Header { [header.Header { name: "x-done", value: "yes" }] }
+        }
+    }
+    if req.path == "/slow" {
+        spawn count(probe, up, req.token)
+        let out = chan[[]u8]()
+        spawn hold(probe, out, req.token)
+        return http.Response { status: 200, headers: [], body: [], stream: some(out) }
+    }
+    if req.path == "/early" {
+        return http.response(200, "early answer")
+    }
+    if req.path == "/watch" {
+        spawn watch(probe, req.token)
+        let out = chan[[]u8]()
+        spawn hold(probe, out, req.token)
+        return http.Response { status: 200, headers: [], body: [], stream: some(out) }
+    }
+    http.response(404, "")
+}
+
+fn hold(probe: *Probe, out: chan[[]u8], token: *cancel.Token) {
+    let ended = <-cancel.done(token)
+}
+
+fn watch(probe: *Probe, token: *cancel.Token) {
+    let gone = <-cancel.done(token)
+    probe.resets <- true
+}
+
+fn serve(l: net.ListenerHandle, probe: *Probe, drain: chan[bool]) {
+    for {
+        let h = net.accept_handle(l) or return
+        spawn http.serve_duplex_conn_on(h, drain, fn(req: http.Request) -> http.Response { handle(probe, req) })
+    }
+}
+
+fn open(c: *http.Client, port: i64, path: str, timeout: i64) -> *http.Call ! http.Error {
+    let url = "http://127.0.0.1:{port}{path}"
+    http.open_call(c, "POST", url, [header.Header { name: "content-type", value: "application/x-echo" }], timeout, cancel.token())?
+}
+
+fn echo(c: *http.Client, port: i64) {
+    let call = open(c, port, "/echo", 5000) or {
+        print("echo open failed")
+        return
+    }
+    http.call_send(call, bytes("one"), false) or {
+        print("echo send failed")
+        return
+    }
+    var phase = 0
+    for {
+        let ev = http.call_receive(call) or {
+            print("echo receive failed")
+            break
+        }
+        match ev {
+            Head(status, h) => print("echo head {status} {header.get(h, "content-type") ?? "-"}")
+            Data(d) => {
+                print("echo data {str(d)}")
+                if phase == 0 {
+                    phase = 1
+                    http.call_send(call, bytes("two"), true) or print("echo second send failed")
+                }
+            }
+            Trailers(h) => print("echo trailers {header.get(h, "x-done") ?? "-"}")
+            End => {
+                print("echo end")
+                break
+            }
+            Reset(code) => {
+                print("echo reset {code}")
+                break
+            }
+            Lost => {
+                print("echo lost")
+                break
+            }
+        }
+    }
+    http.call_close(call, true)
+}
+
+fn upload(c: *http.Client, port: i64, probe: *Probe) {
+    let call = open(c, port, "/slow", 10000) or {
+        print("upload open failed")
+        return
+    }
+    let sent = atomic.int(0)
+    let done = chan[bool](1)
+    spawn push_body(call, sent, done)
+    time.sleep_for(duration.milliseconds(400))
+    let early = sent.load_int()
+    print("upload held back by the window while the handler waits: sent less than 2 MiB {early < 2097152}")
+    probe.gate <- true
+    let finished = <-done
+    time.sleep_for(duration.milliseconds(100))
+    print("upload delivered {probe.uploaded.load_int()} of {sent.load_int()}")
+    http.call_close(call, false)
+}
+
+fn push_body(call: *http.Call, sent: atomic.Int, done: chan[bool]) {
+    var chunk: []u8 = []
+    for _ in 0..65536 {
+        push(mut chunk, 7)
+    }
+    for i in 0..48 {
+        http.call_send(call, chunk, i == 47) or break
+        sent.add_int(chunk.len)
+    }
+    done <- true
+}
+
+fn early_answer(c: *http.Client, port: i64) {
+    let call = open(c, port, "/early", 5000) or {
+        print("early open failed")
+        return
+    }
+    var events = ""
+    for {
+        let ev = http.call_receive(call) or break
+        match ev {
+            Head(status, _) => { events = "{events}H{status} " }
+            Data(d) => { events = "{events}D{str(d)} " }
+            Trailers(_) => { events = "{events}T " }
+            End => {
+                events = "{events}E"
+                break
+            }
+            Reset(code) => {
+                events = "{events}R{code}"
+                break
+            }
+            Lost => {
+                events = "{events}L"
+                break
+            }
+        }
+    }
+    print("early answer before the request ended: {events}")
+    http.call_close(call, true)
+}
+
+fn reset_seen(c: *http.Client, port: i64, probe: *Probe) {
+    let call = open(c, port, "/watch", 5000) or {
+        print("watch open failed")
+        return
+    }
+    let ev = http.call_receive(call) or {
+        print("watch receive failed")
+        return
+    }
+    match ev {
+        Head(status, _) => print("watch head {status}")
+        _ => print("watch unexpected event")
+    }
+    http.call_close(call, false)
+    let seen = (<-probe.resets) ?? false
+    print("handler saw the reset {seen}")
+}
+
+fn draining(c: *http.Client, port: i64, drain: chan[bool]) {
+    let call = open(c, port, "/echo", 5000) or {
+        print("drain open failed")
+        return
+    }
+    http.call_send(call, bytes("before"), false) or {
+        print("drain send failed")
+        return
+    }
+    let first = http.call_receive(call) or {
+        print("drain receive failed")
+        return
+    }
+    close(drain)
+    time.sleep_for(duration.milliseconds(100))
+    http.call_send(call, bytes("after goaway"), true) or print("send after goaway failed")
+    var data = ""
+    var tail = "none"
+    for {
+        let ev = http.call_receive(call) or break
+        match ev {
+            Data(d) => { data = "{data}{str(d)}|" }
+            Trailers(h) => { tail = header.get(h, "x-done") ?? "-" }
+            End => break
+            _ => {}
+        }
+    }
+    http.call_close(call, true)
+    print("in-flight call finished after GOAWAY: data={data} trailer={tail}")
+    let fresh = http.client().build()
+    let refused = open(fresh, port, "/echo", 1000) or {
+        print("new call after drain refused")
+        return
+    }
+    let ev = http.call_receive(refused) or {
+        print("new call after drain refused")
+        http.call_close(refused, false)
+        return
+    }
+    match ev {
+        Reset(code) => print("new call after drain refused")
+        _ => print("new call after drain accepted")
+    }
+    http.call_close(refused, false)
+}
+
+fn main() ! io.Error {
+    using l = net.listen("127.0.0.1", 0)?
+    let probe = new(Probe { uploaded: atomic.int(0), resets: chan[bool](1), gate: chan[bool](1) })
+    let drain = chan[bool]()
+    spawn serve(l.handle, probe, drain)
+    let port = l.handle.addr.port
+    let c = http.client().build()
+    echo(c, port)
+    upload(c, port, probe)
+    early_answer(c, port)
+    reset_seen(c, port, probe)
+    draining(c, port, drain)
+    net.close_listener(l)
+}

@@ -1,0 +1,159 @@
+import std/cancel
+import std/grpc
+import std/net
+import std/time
+import std/time/duration
+
+struct Say {
+    text: str "1"
+}
+
+struct Gate {
+    entered: chan[bool]
+    release: chan[bool]
+}
+
+fn block(gate: *Gate, ctx: *grpc.Context, req: Say) -> Say ! grpc.Error {
+    gate.entered <- true
+    select {
+        <-gate.release => {}
+        <-cancel.done(ctx.token) => fail grpc.error(Cancelled, "stopped")
+    }
+    Say { text: "finished {req.text}" }
+}
+
+fn run(s: *grpc.Server, l: net.ListenerHandle) {
+    grpc.serve_on(s, l) or {}
+}
+
+fn stop(s: *grpc.Server, grace: i64, done: chan[bool]) {
+    grpc.shutdown(s, grace)
+    done <- true
+}
+
+fn checks(ch: grpc.Channel, h: grpc.Health) {
+    for service in ["", "svc", "other"] {
+        let status = grpc.check_health(ch, service, grpc.CallOptions {}) catch {
+            e => {
+                print("check '{service}' {grpc.describe(e)}")
+                continue
+            }
+        }
+        print("check '{service}' {status}")
+    }
+    grpc.set_health(h, "svc", grpc.ServingStatus.Serving)
+    let now = grpc.check_health(ch, "svc", grpc.CallOptions {}) or grpc.ServingStatus.Unknown
+    print("check 'svc' after set {now}")
+}
+
+fn watching(ch: grpc.Channel, h: grpc.Health) {
+    let st = grpc.watch_health(ch, "late", grpc.CallOptions {}) catch {
+        e => {
+            print("watch failed {grpc.describe(e)}")
+            return
+        }
+    }
+    defer grpc.close_stream(st)
+    for step in 0..3 {
+        let m = grpc.receive[grpc.HealthCheckResponse](st) catch {
+            e => {
+                print("watch receive failed {grpc.describe(e)}")
+                return
+            }
+        }
+        match m {
+            some(r) => print("watch {r.status}")
+            none => print("watch ended")
+        }
+        if step == 0 {
+            grpc.set_health(h, "late", grpc.ServingStatus.Serving)
+        }
+        if step == 1 {
+            grpc.set_health(h, "late", grpc.ServingStatus.NotServing)
+        }
+    }
+    grpc.cancel_stream(st)
+    let after = grpc.receive[grpc.HealthCheckResponse](st) catch {
+        e => {
+            print("watch cancelled {grpc.describe(e)}")
+            return
+        }
+    }
+    print("watch after cancel unexpected message")
+}
+
+fn graceful(ch: grpc.Channel, s: *grpc.Server, gate: *Gate, port: i64) {
+    let result = chan[str](1)
+    spawn in_flight(ch, result)
+    let entered = <-gate.entered
+    let done = chan[bool](1)
+    spawn stop(s, 0, done)
+    time.sleep_for(duration.milliseconds(200))
+    let fresh = grpc.dial("127.0.0.1:{port}", grpc.ChannelOptions {}) or return
+    let refused = grpc.unary[Say, Say](fresh, "/t.H/Block", Say { text: "late" }, grpc.CallOptions { timeout: 2000 }) catch {
+        e => {
+            print("call during shutdown {grpc.code_name(grpc.status_of(e).code)}")
+            gate.release <- true
+            let outcome = (<-result) ?? "none"
+            print("in flight call {outcome}")
+            let stopped = <-done
+            print("shutdown returned")
+            return
+        }
+    }
+    print("call during shutdown unexpectedly succeeded")
+    gate.release <- true
+}
+
+fn in_flight(ch: grpc.Channel, result: chan[str]) {
+    let r = grpc.unary[Say, Say](ch, "/t.H/Block", Say { text: "early" }, grpc.CallOptions { retry: false }) catch {
+        e => {
+            result <- "failed {grpc.describe(e)}"
+            return
+        }
+    }
+    result <- r.value.text
+}
+
+fn forced(port: i64, gate: *Gate) {
+    let s = grpc.server(grpc.ServerOptions {})
+    grpc.handle_unary[Say, Say](s, "/t.H/Block", fn(ctx: *grpc.Context, req: Say) -> Say ! grpc.Error { block(gate, ctx, req)? })
+    using l = net.listen("127.0.0.1", 0) or {
+        print("listen failed")
+        return
+    }
+    spawn run(s, l.handle)
+    let ch = grpc.dial("127.0.0.1:{l.handle.addr.port}", grpc.ChannelOptions {}) or return
+    let result = chan[str](1)
+    spawn in_flight(ch, result)
+    let entered = <-gate.entered
+    grpc.shutdown(s, 150)
+    let outcome = (<-result) ?? "none"
+    print("forced shutdown {outcome}")
+    grpc.close_channel(ch)
+}
+
+fn main() {
+    using l = net.listen("127.0.0.1", 0) or {
+        print("listen failed")
+        return
+    }
+    let port = l.handle.addr.port
+    let gate = new(Gate { entered: chan[bool](4), release: chan[bool](4) })
+    let s = grpc.server(grpc.ServerOptions {})
+    let h = grpc.health()
+    grpc.set_health(h, "svc", grpc.ServingStatus.NotServing)
+    grpc.register_health(s, h)
+    grpc.handle_unary[Say, Say](s, "/t.H/Block", fn(ctx: *grpc.Context, req: Say) -> Say ! grpc.Error { block(gate, ctx, req)? })
+    spawn run(s, l.handle)
+    let ch = grpc.dial("127.0.0.1:{port}", grpc.ChannelOptions {}) or {
+        print("dial failed")
+        return
+    }
+    checks(ch, h)
+    watching(ch, h)
+    graceful(ch, s, gate, port)
+    grpc.close_channel(ch)
+    forced(port, gate)
+    print("done")
+}
