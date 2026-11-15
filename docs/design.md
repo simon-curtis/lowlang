@@ -650,7 +650,7 @@ let index = Colour.Red.index
   - A `switch` on a constant folds to its target.
 - An enum whose variants all have no payload is a single word. Otherwise an enum is a tag word followed by the largest variant's fields.
 - An enum cannot contain itself by value; it can hold a `*` pointer to its own type.
-- `==` and `!=` compare enums whose variant fields can all be compared: equal values have the same variant and equal fields. Optionals compare the same way, so `x == none` and `x == 5` work on an `i64?`.
+- `==` and `!=` compare enums whose variant fields can all be compared: equal values have the same variant and equal fields. Optionals compare the same way, so `x == none` and `x == 5` work on an `i64?`. `x == none` and `x != none` also work on every optional, whatever its payload, and test only whether a value is present; comparing two optionals still needs a payload that can be compared.
 
 ### Optionals
 
