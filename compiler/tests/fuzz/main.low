@@ -574,6 +574,170 @@ fn test_check_reports_runaway_program(t: *testing.T) {
     t.equal(findings[0].detail, "release: no exit within 200ms")
 }
 
+fn concurrent(seed: i64) -> *model.Program {
+    var cfg = gen.default_config()
+    cfg.concurrency = 100
+    let src = choice.from_seed(seed)
+    gen.generate(src, cfg)
+}
+
+fn scene_of(kind: model.SceneKind, id: i64, threads: i64, items: i64) -> *model.Scene {
+    new(model.Scene { kind, id, work: variable("x", model.Kind.I64), threads, items, capacity: 0, delay: 0 })
+}
+
+fn staged(scenes: []*model.Scene) -> *model.Program {
+    let st = new(model.Stage { scenes })
+    new(model.Program { funcs: [], main: [model.Stmt.Stage(st)] })
+}
+
+fn test_concurrent_programs_have_stages(t: *testing.T) {
+    var kinds: [str: bool] = [:]
+    for seed in 0..200 {
+        let program = concurrent(seed)
+        let stages = model.stages_in(program.main)
+        if stages.len == 0 {
+            t.fatal("seed {seed} has no stage")
+        }
+        for st in stages {
+            for s in st.scenes {
+                kinds[model.scene_name(s.kind)] = true
+            }
+        }
+        t.equal(model.to_string(concurrent(seed)), model.to_string(program))
+    }
+    t.equal(kinds.len, model.scene_kinds().len)
+    if model.stages_in(generated(1).main).len != 0 {
+        t.error("the default configuration generated a stage")
+    }
+}
+
+fn test_stage_prints_scene_values(t: *testing.T) {
+    let program = staged([scene_of(model.SceneKind.FanIn, 1, 2, 3), scene_of(model.SceneKind.Cancel, 2, 4, 3)])
+    let outcome = model.run(program, 2000000) catch {
+        e => {
+            t.fatal(model.failure_message(e))
+            return
+        }
+    }
+    t.equal(outcome.stdout, "15\n7\n")
+    t.equal(outcome.overflow, false)
+    let source = model.to_string(program)
+    for want in ["import std/cancel\n", "fn s1_work(x: i64) -> i64 {{\n    x\n}}", "spawn scene_run(s1, s1_out)", "print((<-s2_out) ?? 0)"] {
+        if !text.contains(source, want) {
+            t.error("source lacks {text.quote(want)}")
+        }
+    }
+}
+
+fn test_deep_stack_scene_may_overflow(t: *testing.T) {
+    var shallow = scene_of(model.SceneKind.DeepStack, 1, 1, 4)
+    var deep = scene_of(model.SceneKind.DeepStack, 1, 1, 20000)
+    deep.capacity = 3
+    let quiet = model.run(staged([shallow]), 2000000) or model.Outcome {}
+    let loud = model.run(staged([deep]), 2000000) or model.Outcome {}
+    t.equal(quiet.overflow, false)
+    t.equal(loud.overflow, true)
+}
+
+fn test_concurrent_programs_match_the_model(t: *testing.T) {
+    let conditions = oracle.parse_conditions("plain,stress+sse2+cpus2") or []
+    var r = runner()
+    r.conditions = conditions
+    r.repeats = 2
+    let ctx = cancel.token()
+    for seed in 1..4 {
+        let program = concurrent(seed)
+        let outcome = model.run(program, 2000000) or continue
+        let findings = oracle.check(r, ctx, model.to_string(program), outcome)
+        if findings.len != 0 {
+            t.error("seed {seed}: {findings[0].class}: {findings[0].detail}")
+        }
+    }
+}
+
+fn test_reduce_shrinks_scenes(t: *testing.T) {
+    let program = staged([scene_of(model.SceneKind.FanIn, 1, 8, 64), scene_of(model.SceneKind.Churn, 2, 40, 20)])
+    let keep = fn(ctx: *cancel.Token, p: *model.Program) -> bool { text.contains(model.to_string(p), "fn s2()") }
+    let ctx = cancel.token()
+    let reduced = reduce.reduce(reduce.new_reducer(keep, 2, 0), ctx, program)
+    let stages = model.stages_in(reduced.main)
+    if stages.len != 1 || stages[0].scenes.len != 1 {
+        t.fatal("reduced program keeps {stages.len} stages")
+    }
+    let s = stages[0].scenes[0]
+    t.equal(s.id, 2)
+    t.equal(s.threads, 1)
+    t.equal(s.items, 1)
+    t.equal(model.stages_in(program.main)[0].scenes.len, 2)
+}
+
+fn condition_failure(spec: str) -> str {
+    let parsed = oracle.parse_conditions(spec) catch {
+        e => return oracle.condition_message(e)
+    }
+    ""
+}
+
+fn test_parse_conditions(t: *testing.T) {
+    let got = oracle.parse_conditions("plain,stress+sse2+cpus3") catch {
+        e => {
+            t.fatal(oracle.condition_message(e))
+            return
+        }
+    }
+    t.equal(got.len, 2)
+    t.equal(got[0].stress || got[0].sse2 || got[0].cpus != 0, false)
+    t.equal(got[1].name, "stress+sse2+cpus3")
+    t.equal(got[1].stress && got[1].sse2, true)
+    t.equal(got[1].cpus, 3)
+    let message = condition_failure("plain,fast")
+    if !text.contains(message, "\"fast\"") {
+        t.error("message {text.quote(message)}")
+    }
+}
+
+fn faulting_stub(stderr: str) -> str {
+    "#!/bin/sh\nprintf '#!/bin/sh\\nprintf \"{stderr}\" >&2\\nexit 2\\n' > \"$4\"\nchmod +x \"$4\"\n"
+}
+
+fn test_check_reports_runtime_fault(t: *testing.T) {
+    let line = "fault: address 0x000000000000003a pc 0x000000000040224e sp 0x00007fd9ba9fffd8 stack 0x0000000000000000"
+    let stub = stub_runner(t, faulting_stub("panic: stack overflow{line}\\\\npanic: invalid memory access\\\\n"), 10000)
+    defer file.remove_all(path.dir(stub.executable)) or {}
+    let ctx = cancel.token()
+    let findings = oracle.check(stub, ctx, divide_program, model.Outcome {})
+    if findings.len != 2 || findings[0].class != oracle.class_fault {
+        t.fatal("findings {findings.len}")
+    }
+    t.equal(findings[0].detail, "release: panic: invalid memory access, on no green thread\n{line}")
+    t.equal(oracle.signature(findings[0]), "runtime-fault:release: panic: invalid memory access, on no green thread")
+}
+
+fn test_check_names_the_condition_of_a_fault(t: *testing.T) {
+    let line = "fault: address 0x00007fa7920ef310 pc 0x000000000041a445 sp 0x00007fa7920ef310 stack 0x00007fa7920f6000"
+    var stub = stub_runner(t, faulting_stub("{line}\\\\npanic: invalid memory access\\\\n"), 10000)
+    defer file.remove_all(path.dir(stub.executable)) or {}
+    stub.repeats = 3
+    let ctx = cancel.token()
+    let findings = oracle.check(stub, ctx, divide_program, model.Outcome {})
+    if findings.len != 2 {
+        t.fatal("findings {findings.len}")
+    }
+    t.equal(findings[1].detail, "dev: panic: invalid memory access, sp below the stack\n{line}\ncondition plain, run 0")
+}
+
+fn test_check_accepts_stack_overflow_where_the_model_allows_it(t: *testing.T) {
+    let stub = stub_runner(t, faulting_stub("panic: panic: stack overflowstack overflow\\\\n"), 10000)
+    defer file.remove_all(path.dir(stub.executable)) or {}
+    let ctx = cancel.token()
+    let allowed = oracle.check(stub, ctx, divide_program, model.Outcome { stdout: "1\n", overflow: true })
+    t.equal(allowed.len, 0)
+    let refused = oracle.check(stub, ctx, divide_program, model.Outcome { stdout: "1\n" })
+    if refused.len != 2 || refused[0].class != oracle.class_panic {
+        t.fatal("findings {refused.len}")
+    }
+}
+
 fn test_signature_ignores_numbers(t: *testing.T) {
     let a = oracle.Finding { class: oracle.class_reject, detail: "release: main.low:3:4: 300 overflows u8\nmore", source: "" }
     let b = oracle.Finding { class: oracle.class_reject, detail: "release: main.low:90:11: 7 overflows u8", source: "" }
@@ -713,6 +877,15 @@ fn main() {
         testing.Test { name: "check_reports_rejected_program", run: test_check_reports_rejected_program }
         testing.Test { name: "check_reports_compiler_crash", run: test_check_reports_compiler_crash }
         testing.Test { name: "check_reports_runaway_program", run: test_check_reports_runaway_program }
+        testing.Test { name: "concurrent_programs_have_stages", run: test_concurrent_programs_have_stages }
+        testing.Test { name: "stage_prints_scene_values", run: test_stage_prints_scene_values }
+        testing.Test { name: "deep_stack_scene_may_overflow", run: test_deep_stack_scene_may_overflow }
+        testing.Test { name: "concurrent_programs_match_the_model", run: test_concurrent_programs_match_the_model }
+        testing.Test { name: "reduce_shrinks_scenes", run: test_reduce_shrinks_scenes }
+        testing.Test { name: "parse_conditions", run: test_parse_conditions }
+        testing.Test { name: "check_reports_runtime_fault", run: test_check_reports_runtime_fault }
+        testing.Test { name: "check_names_the_condition_of_a_fault", run: test_check_names_the_condition_of_a_fault }
+        testing.Test { name: "check_accepts_stack_overflow_where_the_model_allows_it", run: test_check_accepts_stack_overflow_where_the_model_allows_it }
         testing.Test { name: "signature_ignores_numbers", run: test_signature_ignores_numbers }
         testing.Test { name: "write_produces_run_fixture", run: test_write_produces_run_fixture }
         testing.Test { name: "written_fixture_reads_back_through_the_runner_format", run: test_written_fixture_reads_back_through_the_runner_format }

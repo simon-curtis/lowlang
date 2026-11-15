@@ -7,6 +7,8 @@ import target
 import std/cancel
 import std/file
 import std/io
+import std/math
+import std/os
 import std/text
 
 pub const class_ice = "ice"
@@ -18,6 +20,8 @@ pub const class_generator = "generator"
 pub const class_reference = "reference-mismatch"
 pub const class_differential = "release-dev-mismatch"
 pub const class_browser = "browser-mismatch"
+pub const class_fault = "runtime-fault"
+pub const class_panic = "unexpected-panic"
 
 const exit_reject = 3
 const exit_link = 4
@@ -110,11 +114,70 @@ pub fn expected(o: model.Outcome) -> Result {
     Result { stdout: o.stdout, stderr: model.stderr(o), exit: model.exit_code(o) }
 }
 
+/// The environment one run of a compiled program gets.
+pub struct Condition {
+    pub name: str
+    /// Runs with `LOW_GC=stress`.
+    pub stress: bool = false
+    /// Runs with `LOW_SIMD=sse2`.
+    pub sse2: bool = false
+    /// Pins the run to this many CPUs with `taskset`, or leaves it unpinned when 0.
+    pub cpus: i64 = 0
+}
+
+pub enum ConditionError {
+    Unknown(word: str)
+}
+
+pub fn condition_message(e: ConditionError) -> str {
+    match e {
+        Unknown(word) => "unknown condition {text.quote(word)}: want plain, stress, sse2 or cpusN joined by +"
+    }
+}
+
+/// Parses a comma-separated list of conditions, each a `+`-joined set of `plain`, `stress`, `sse2` and `cpusN`.
+pub fn parse_conditions(spec: str) -> []Condition ! ConditionError {
+    var out: []Condition = []
+    for name in text.split(spec, ',') {
+        var c = Condition { name }
+        for word in text.split(name, '+') {
+            if word == "stress" {
+                c.stress = true
+            } else if word == "sse2" {
+                c.sse2 = true
+            } else if text.starts_with(word, "cpus") {
+                c.cpus = text.parse_int(word[4..]) catch {
+                    e => fail Unknown(word)
+                }
+            } else if word != "plain" {
+                fail Unknown(word)
+            }
+        }
+        push(mut out, c)
+    }
+    out
+}
+
 pub struct Runner {
     pub timeout_ms: i64
     pub executable: str
     pub node: str = ""
     pub host: str = ""
+    /// The conditions each native build runs under, in turn. Empty means one plain run.
+    pub conditions: []Condition = []
+    /// How many times each native build runs under every condition.
+    pub repeats: i64 = 1
+}
+
+fn conditions_of(r: Runner) -> []Condition {
+    if r.conditions.len == 0 {
+        return [Condition { name: "plain" }]
+    }
+    r.conditions
+}
+
+fn varied(r: Runner) -> bool {
+    r.conditions.len > 0 || r.repeats > 1
 }
 
 pub fn reproduces(r: Runner, wanted: str, budget: i64) -> fn(*cancel.Token, *model.Program) -> bool {
@@ -124,7 +187,16 @@ pub fn reproduces(r: Runner, wanted: str, budget: i64) -> fn(*cancel.Token, *mod
 fn reproduced(r: Runner, wanted: str, budget: i64, ctx: *cancel.Token, p: *model.Program) -> bool {
     let outcome = model.run(p, budget) or return false
     let source = model.to_string(p)
-    check(r, ctx, source, outcome).any(fn(f) signature(f) == wanted)
+    var modes: []Mode = []
+    for m in [Mode.Release, Mode.Dev] {
+        if text.contains(wanted, ":{mode_name(m)}: ") {
+            push(mut modes, m)
+        }
+    }
+    if modes.len == 0 {
+        modes = [Mode.Release, Mode.Dev]
+    }
+    check_modes(r, ctx, source, outcome, modes).any(fn(f) signature(f) == wanted)
 }
 
 enum Fault {
@@ -138,11 +210,14 @@ struct ModeResult {
 }
 
 pub fn check(r: Runner, ctx: *cancel.Token, source: str, expected_outcome: model.Outcome) -> []Finding {
-    let want = expected(expected_outcome)
+    check_modes(r, ctx, source, expected_outcome, [Mode.Release, Mode.Dev])
+}
+
+fn check_modes(r: Runner, ctx: *cancel.Token, source: str, expected_outcome: model.Outcome, modes: []Mode) -> []Finding {
     var findings: []Finding = []
     var ran: []ModeResult = []
-    for mode in [Mode.Release, Mode.Dev] {
-        let got = execute(r, ctx, source, mode) catch {
+    for mode in modes {
+        let got = exercise(r, ctx, source, mode, expected_outcome, mut findings) catch {
             fault => {
                 push(mut findings, failure(mode, fault, source))
                 continue
@@ -150,27 +225,160 @@ pub fn check(r: Runner, ctx: *cancel.Token, source: str, expected_outcome: model
         }
         push(mut ran, ModeResult { mode, result: got })
     }
-    if ran.len == 2 {
+    let faulted = findings.any(fn(f) f.class == class_fault || f.class == class_panic)
+    if ran.len == 2 && !expected_outcome.overflow && !faulted {
         let diff = describe(ran[0].result, ran[1].result)
         if diff != "" {
             push(mut findings, Finding { class: class_differential, detail: diff, source })
         }
     }
-    for m in ran {
-        let diff = describe(want, m.result)
-        if diff != "" {
-            let detail = "{mode_name(m.mode)}: {diff}"
-            push(mut findings, Finding { class: class_reference, detail, source })
-        }
-    }
-    if r.node != "" && ran.len > 0 && ran[0].mode == Mode.Release {
+    if r.node != "" && ran.len > 0 && ran[0].mode == Mode.Release && !expected_outcome.overflow && !expected_outcome.system {
         check_browser(r, ctx, source, ran[0].result, mut findings)
     }
     findings
 }
 
+struct Verdict {
+    class: str = ""
+    detail: str = ""
+}
+
+fn line_with(s: str, prefix: str) -> str {
+    for line in text.split(s, 10) {
+        if text.starts_with(line, prefix) {
+            return line
+        }
+    }
+    ""
+}
+
+const overflow_message = "stack overflow"
+const fault_message = "invalid memory access"
+
+fn overflowed(want: Result, got: Result) -> bool {
+    if got.exit != 2 || !text.starts_with(want.stdout, got.stdout) || !text.contains(got.stderr, overflow_message) {
+        return false
+    }
+    var rest = text.replace(got.stderr, "panic: ", "")
+    rest = text.replace(rest, overflow_message, "")
+    text.trim(rest) == ""
+}
+
+fn panic_summary(stderr: str) -> str {
+    for message in [fault_message, overflow_message] {
+        if text.contains(stderr, message) {
+            return "panic: {message}"
+        }
+    }
+    line_with(stderr, "panic: ")
+}
+
+fn hex_field(line: str, name: str) -> u64 {
+    let at = text.index(line, "{name} 0x")
+    if at < 0 {
+        return 0
+    }
+    var v: u64 = 0
+    for b in bytes(line[at + name.len + 3..]) {
+        let digit = text.hex_digit(b)
+        if digit < 0 {
+            break
+        }
+        v = v << 4 | u64(digit)
+    }
+    v
+}
+
+/// Says where a `fault:` line puts the stack pointer: on no green thread, below the green thread's stack, or inside it.
+fn fault_place(line: str) -> str {
+    if line == "" {
+        return ""
+    }
+    let stack = hex_field(line, "stack")
+    if stack == 0 {
+        return ", on no green thread"
+    }
+    if hex_field(line, "sp") < stack {
+        return ", sp below the stack"
+    }
+    ", on a green thread"
+}
+
+fn fault_line(stderr: str) -> str {
+    let at = text.index(stderr, "fault: address ")
+    if at < 0 {
+        return ""
+    }
+    let rest = stderr[at..]
+    let end = text.index(rest, "\n")
+    if end < 0 {
+        return rest
+    }
+    rest[..end]
+}
+
+fn judge(want: Result, got: Result, overflow: bool) -> Verdict {
+    let fault = fault_line(got.stderr)
+    let panic = panic_summary(got.stderr)
+    if got.signal != want.signal {
+        return Verdict { class: class_fault, detail: "{got.signal}{fault_place(fault)}\n{fault}" }
+    }
+    if fault != "" {
+        return Verdict { class: class_fault, detail: "{panic}{fault_place(fault)}\n{fault}" }
+    }
+    if overflow && overflowed(want, got) {
+        return Verdict {}
+    }
+    let diff = describe(want, got)
+    if diff == "" {
+        return Verdict {}
+    }
+    if panic != "" && got.stderr != want.stderr {
+        return Verdict { class: class_panic, detail: "{panic}\n{diff}" }
+    }
+    Verdict { class: class_reference, detail: diff }
+}
+
+fn located(r: Runner, detail: str, cond: Condition, index: i64) -> str {
+    if !varied(r) {
+        return detail
+    }
+    "{detail}\ncondition {cond.name}, run {index}"
+}
+
+fn exercise(r: Runner, ctx: *cancel.Token, source: str, mode: Mode, expected_outcome: model.Outcome, mut findings: []Finding) -> Result ! Fault {
+    let dir = file.temp_dir("lowfuzz-") catch {
+        e => fail Other("{e}")
+    }
+    defer file.remove_all(dir) or {}
+    let binary = file.child_path(dir, artifact_name(mode))
+    build(r, ctx, dir, binary, source, mode)?
+    let want = expected(expected_outcome)
+    let conditions = conditions_of(r)
+    var first = Result {}
+    for rep in 0..math.max(1, r.repeats) {
+        for at, cond in conditions {
+            let index = rep * conditions.len + at
+            let got = run(r, ctx, binary, mode, cond, index) catch {
+                Stage(class, detail) => fail Stage(class, located(r, detail, cond, index))
+                e => fail e
+            }
+            if index == 0 {
+                first = got
+            }
+            let verdict = judge(want, got, expected_outcome.overflow)
+            if verdict.class != "" {
+                let detail = located(r, "{mode_name(mode)}: {verdict.detail}", cond, index)
+                push(mut findings, Finding { class: verdict.class, detail, source })
+                return first
+            }
+        }
+    }
+    first
+}
+
 fn check_browser(r: Runner, ctx: *cancel.Token, source: str, release: Result, mut findings: []Finding) {
-    let got = execute(r, ctx, source, Mode.Browser) catch {
+    let got = browser_run(r, ctx, source) catch {
         fault => {
             push(mut findings, failure(Mode.Browser, fault, source))
             return
@@ -182,21 +390,21 @@ fn check_browser(r: Runner, ctx: *cancel.Token, source: str, release: Result, mu
     }
 }
 
+fn browser_run(r: Runner, ctx: *cancel.Token, source: str) -> Result ! Fault {
+    let dir = file.temp_dir("lowfuzz-") catch {
+        e => fail Other("{e}")
+    }
+    defer file.remove_all(dir) or {}
+    let binary = file.child_path(dir, artifact_name(Mode.Browser))
+    build(r, ctx, dir, binary, source, Mode.Browser)?
+    run(r, ctx, binary, Mode.Browser, Condition { name: "plain" }, 0)?
+}
+
 fn failure(mode: Mode, fault: Fault, source: str) -> Finding {
     match fault {
         Stage(class, detail) => Finding { class, detail: "{mode_name(mode)}: {detail}", source }
         Other(message) => Finding { class: class_harness, detail: "{mode_name(mode)}: {message}", source }
     }
-}
-
-fn execute(r: Runner, ctx: *cancel.Token, source: str, mode: Mode) -> Result ! Fault {
-    let dir = file.temp_dir("lowfuzz-") catch {
-        e => fail Other("{e}")
-    }
-    defer file.remove_all(dir) or {}
-    let binary = file.child_path(dir, artifact_name(mode))
-    build(r, ctx, dir, binary, source, mode)?
-    run(r, ctx, binary, mode)?
 }
 
 fn build(r: Runner, ctx: *cancel.Token, dir: str, binary: str, source: str, mode: Mode) ! Fault {
@@ -205,7 +413,7 @@ fn build(r: Runner, ctx: *cancel.Token, dir: str, binary: str, source: str, mode
         e => fail Other("{e}")
     }
     let args = ["__build", mode_name(mode), path, binary]
-    let done = capture(ctx, r.executable, args, build_limit_ms) catch {
+    let done = capture(ctx, r.executable, args, none, build_limit_ms) catch {
         e => fail Other("{e}")
     }
     check_ending(done.ending, "build: ", build_limit_ms)?
@@ -248,19 +456,46 @@ fn crash_detail(done: Captured) -> str {
     "exit {exit_status(done.exit)}"
 }
 
-fn run(r: Runner, ctx: *cancel.Token, binary: str, mode: Mode) -> Result ! Fault {
-    let done = capture_run(r, ctx, binary, mode) catch {
+fn run(r: Runner, ctx: *cancel.Token, binary: str, mode: Mode, cond: Condition, index: i64) -> Result ! Fault {
+    let done = capture_run(r, ctx, binary, mode, cond, index) catch {
         e => fail Other("{e}")
     }
     check_ending(done.ending, "", r.timeout_ms)?
     Result { stdout: done.stdout, stderr: done.stderr, exit: exit_status(done.exit), signal: signal_text(done.exit) }
 }
 
-fn capture_run(r: Runner, ctx: *cancel.Token, binary: str, mode: Mode) -> Captured ! io.Error {
-    match mode {
-        Browser => capture(ctx, r.node, [r.host, binary], r.timeout_ms)?
-        _ => capture(ctx, binary, [], r.timeout_ms)?
+fn capture_run(r: Runner, ctx: *cancel.Token, binary: str, mode: Mode, cond: Condition, index: i64) -> Captured ! io.Error {
+    if mode == Mode.Browser {
+        return capture(ctx, r.node, [r.host, binary], none, r.timeout_ms)
     }
+    let env = condition_env(cond)
+    if cond.cpus == 0 {
+        return capture(ctx, binary, [], env, r.timeout_ms)
+    }
+    let cpus = cpu_list(os.cpu_count(), cond.cpus, index)
+    capture(ctx, "taskset", ["-c", cpus, binary], env, r.timeout_ms)?
+}
+
+fn condition_env(cond: Condition) -> [str: str]? {
+    if !cond.stress && !cond.sse2 {
+        return none
+    }
+    var env = os.environment()
+    if cond.stress {
+        env["LOW_GC"] = "stress"
+    }
+    if cond.sse2 {
+        env["LOW_SIMD"] = "sse2"
+    }
+    env
+}
+
+fn cpu_list(total: i64, count: i64, index: i64) -> str {
+    var cpus: []str = []
+    for i in 0..math.min(count, total) {
+        push(mut cpus, "{(index * count + i) % total}")
+    }
+    text.join(cpus, ",")
 }
 
 pub fn build_main(args: []str) -> i64 {

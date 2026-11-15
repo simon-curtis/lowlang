@@ -1,0 +1,276 @@
+import std/slices
+
+pub enum SceneKind {
+    FanIn = 0
+    Pipeline = 1
+    SelectReady = 2
+    TimerRace = 3
+    CloseWake = 4
+    Cancel = 5
+    DeferBlocked = 6
+    Churn = 7
+    DeepStack = 8
+    Alloc = 9
+    PipeIO = 10
+    Mutex = 11
+    SelectMany = 12
+    Noise = 13
+    Sleepers = 14
+    Pinned = 15
+}
+
+pub fn scene_kinds() -> []SceneKind {
+    [
+        SceneKind.FanIn
+        SceneKind.Pipeline
+        SceneKind.SelectReady
+        SceneKind.TimerRace
+        SceneKind.CloseWake
+        SceneKind.Cancel
+        SceneKind.DeferBlocked
+        SceneKind.Churn
+        SceneKind.DeepStack
+        SceneKind.Alloc
+        SceneKind.PipeIO
+        SceneKind.Mutex
+        SceneKind.SelectMany
+        SceneKind.Noise
+        SceneKind.Sleepers
+        SceneKind.Pinned
+    ]
+}
+
+pub fn scene_name(k: SceneKind) -> str {
+    match k {
+        FanIn => "fan_in"
+        Pipeline => "pipeline"
+        SelectReady => "select_ready"
+        TimerRace => "timer_race"
+        CloseWake => "close_wake"
+        Cancel => "cancel"
+        DeferBlocked => "defer_blocked"
+        Churn => "churn"
+        DeepStack => "deep_stack"
+        Alloc => "alloc"
+        PipeIO => "pipe_io"
+        Mutex => "mutex"
+        SelectMany => "select_many"
+        Noise => "noise"
+        Sleepers => "sleepers"
+        Pinned => "pinned"
+    }
+}
+
+/// One concurrent scenario: green threads that call `work` and hand their results to the scene's function, whose value does not depend on the schedule.
+pub struct Scene {
+    pub kind: SceneKind
+    pub id: i64
+    pub work: Expr
+    pub threads: i64
+    pub items: i64
+    pub capacity: i64
+    pub delay: i64
+}
+
+/// Scenes that run at the same time, each on its own green thread when there are several, and print their values in order.
+pub struct Stage {
+    pub scenes: []*Scene
+}
+
+pub struct Span {
+    pub lo: i64
+    pub hi: i64
+}
+
+pub struct Limits {
+    pub threads: Span
+    pub items: Span
+    pub capacity: Span
+    pub delay: Span
+}
+
+fn span(lo: i64, hi: i64) -> Span {
+    Span { lo, hi }
+}
+
+pub fn scene_limits(k: SceneKind) -> Limits {
+    match k {
+        FanIn => Limits { threads: span(1, 8), items: span(1, 64), capacity: span(0, 4), delay: span(0, 0) }
+        Pipeline => Limits { threads: span(1, 6), items: span(1, 48), capacity: span(0, 3), delay: span(0, 0) }
+        SelectReady => Limits { threads: span(1, 6), items: span(1, 6), capacity: span(1, 4), delay: span(0, 3) }
+        TimerRace => Limits { threads: span(1, 24), items: span(0, 0), capacity: span(0, 3), delay: span(0, 3) }
+        CloseWake => Limits { threads: span(1, 32), items: span(0, 16), capacity: span(0, 3), delay: span(0, 2) }
+        Cancel => Limits { threads: span(1, 8), items: span(0, 48), capacity: span(0, 3), delay: span(0, 0) }
+        DeferBlocked => Limits { threads: span(1, 24), items: span(0, 12), capacity: span(0, 8), delay: span(0, 2) }
+        Churn => Limits { threads: span(1, 64), items: span(1, 24), capacity: span(0, 0), delay: span(0, 0) }
+        DeepStack => Limits { threads: span(1, 4), items: span(1, 20000), capacity: span(0, 3), delay: span(0, 0) }
+        Alloc => Limits { threads: span(1, 8), items: span(1, 300), capacity: span(0, 2), delay: span(0, 0) }
+        PipeIO => Limits { threads: span(1, 3), items: span(0, 150000), capacity: span(1, 4096), delay: span(0, 1) }
+        Mutex => Limits { threads: span(1, 8), items: span(1, 64), capacity: span(0, 0), delay: span(0, 0) }
+        SelectMany => Limits { threads: span(0, 32), items: span(1, 32), capacity: span(0, 2), delay: span(0, 0) }
+        Noise => Limits { threads: span(0, 2), items: span(0, 2), capacity: span(0, 1), delay: span(0, 1) }
+        Sleepers => Limits { threads: span(1, 48), items: span(1, 3), capacity: span(0, 2), delay: span(0, 2) }
+        Pinned => Limits { threads: span(1, 3), items: span(1, 12), capacity: span(0, 2), delay: span(0, 0) }
+    }
+}
+
+pub const stack_bytes = 1048576
+
+/// The stack one level of a `DeepStack` scene's recursion takes at least, in bytes, for a pad level.
+pub fn frame_floor(level: i64) -> i64 {
+    match level {
+        0 => 64
+        1 => 512
+        2 => 4096
+        _ => 32768
+    }
+}
+
+/// The stack one level of a `DeepStack` scene's recursion takes at most, in bytes, for a pad level.
+pub fn frame_ceiling(level: i64) -> i64 {
+    6 * frame_floor(level) + 512
+}
+
+/// Whether a scene's deepest green thread can exhaust its stack, so that `panic: stack overflow` is an accepted ending.
+pub fn may_overflow(s: *Scene) -> bool {
+    s.kind == SceneKind.DeepStack && (s.items + s.threads) * frame_ceiling(s.capacity) >= stack_bytes / 2
+}
+
+fn work(ip: *Interpreter, s: *Scene, x: u64) -> u64 ! Halt {
+    let f = new(Frame { vars: [:] })
+    f.vars["x"] = Value { bits: x }
+    let v = eval(ip, s.work, f)?
+    v.bits
+}
+
+fn work_sum(ip: *Interpreter, s: *Scene, count: i64) -> u64 ! Halt {
+    var sum: u64 = 0
+    for x in 0..count {
+        sum += work(ip, s, u64(x))?
+    }
+    sum
+}
+
+fn scene_value(ip: *Interpreter, s: *Scene) -> u64 ! Halt {
+    tick(ip)?
+    match s.kind {
+        FanIn => work_sum(ip, s, s.threads * s.items)?
+        Pipeline => pipeline_value(ip, s)?
+        SelectReady => select_ready_value(ip, s)?
+        TimerRace => work_sum(ip, s, s.threads)?
+        CloseWake => u64(s.items * (s.items - 1) / 2) + work_sum(ip, s, s.threads)?
+        Cancel => u64(s.threads) + work_sum(ip, s, s.items)?
+        DeferBlocked => u64(s.threads * (s.threads - 1) / 2) + work_sum(ip, s, s.threads)?
+        Churn => work_sum(ip, s, s.threads * s.items)?
+        DeepStack => deep_stack_value(ip, s)?
+        Alloc => alloc_value(ip, s)?
+        PipeIO => pipe_value(ip, s)?
+        Mutex => work_sum(ip, s, s.threads * s.items)?
+        SelectMany => work_sum(ip, s, 3 * s.items)? + work_sum(ip, s, s.threads)?
+        Noise => 0
+        Sleepers => work_sum(ip, s, s.threads)?
+        Pinned => work_sum(ip, s, s.threads * s.items)?
+    }
+}
+
+fn pipeline_value(ip: *Interpreter, s: *Scene) -> u64 ! Halt {
+    var acc: u64 = 0
+    for i in 0..s.items {
+        var v = u64(i)
+        for k in 0..s.threads {
+            v = work(ip, s, v)? + u64(k)
+        }
+        acc = acc * 31 + v
+    }
+    acc
+}
+
+fn select_ready_value(ip: *Interpreter, s: *Scene) -> u64 ! Halt {
+    var acc: u64 = 0
+    for i in 0..s.threads + s.items + s.capacity + s.delay {
+        var r: u64 = 0
+        if i < s.threads {
+            r = work(ip, s, u64(i))? * 4 + 1
+        } else if i < s.threads + s.items {
+            r = work(ip, s, u64(i - s.threads))? * 4 + 2
+        } else if i < s.threads + s.items + s.capacity {
+            r = 3
+        }
+        acc = acc * 31 + r
+    }
+    acc
+}
+
+fn deep_stack_value(ip: *Interpreter, s: *Scene) -> u64 ! Halt {
+    var sum: u64 = 0
+    var total: u64 = 0
+    for n in 1..s.items + s.threads {
+        sum += work(ip, s, u64(n))? + u64(n)
+        if n >= s.items {
+            total += sum
+        }
+    }
+    total
+}
+
+fn decimal_len(v: u64) -> u64 {
+    u64("{i64(v)}".len)
+}
+
+fn alloc_fill(ip: *Interpreter, s: *Scene, seed: i64) -> u64 ! Halt {
+    var firsts: []u64 = []
+    var names: [i64: u64] = [:]
+    var acc: u64 = 0
+    for i in 0..s.items {
+        let v = work(ip, s, u64(seed + i))?
+        push(mut firsts, v)
+        if firsts.len > 16 {
+            firsts = firsts[8..]
+        }
+        names[i % 29] = decimal_len(v)
+        acc += firsts[0] ^ (v + u64(i % 13))
+        acc += names[(i * 7) % 29] ?? 0
+    }
+    acc + u64(firsts.len) + decimal_len(acc)
+}
+
+fn alloc_value(ip: *Interpreter, s: *Scene) -> u64 ! Halt {
+    var sum: u64 = 0
+    for t in 0..s.threads {
+        sum += alloc_fill(ip, s, t * 1000)?
+    }
+    sum
+}
+
+fn pipe_value(ip: *Interpreter, s: *Scene) -> u64 ! Halt {
+    var table: []u64 = []
+    for x in 0..256 {
+        push(mut table, work(ip, s, u64(x))?)
+    }
+    var acc: u64 = 0
+    for i in 0..s.items {
+        acc = acc * 31 + ((table[i & 255] + u64(i)) & 255)
+    }
+    acc * u64(s.threads)
+}
+
+fn stage(ip: *Interpreter, st: *Stage) ! Halt {
+    for s in st.scenes {
+        let v = scene_value(ip, s)?
+        if may_overflow(s) {
+            ip.overflow = true
+        }
+        print_value(ip, Kind.I64, Value { bits: v })
+    }
+}
+
+fn uses_system(p: *Program) -> bool {
+    for st in stages_in(p.main) {
+        for s in st.scenes {
+            if scene_imports(s.kind).any(fn(path) path == "std/sys") {
+                return true
+            }
+        }
+    }
+    false
+}
