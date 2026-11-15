@@ -1,0 +1,214 @@
+import std/io
+import std/net
+import std/net/dns
+import std/text
+
+struct Reply {
+    bytes: []u8
+    via: i64
+}
+
+struct Server {
+    port: i64
+    udp: net.SocketHandle
+    tcp: net.ListenerHandle
+    side: net.SocketHandle
+    far: net.SocketHandle
+    log: []str
+    ids: []i64
+    ports: []i64
+    script: fn(dns.Message, bool) -> []Reply
+}
+
+fn type_name(kind: i64) -> str {
+    match kind {
+        dns.type_a => "A"
+        dns.type_aaaa => "AAAA"
+        dns.type_cname => "CNAME"
+        dns.type_ns => "NS"
+        dns.type_ptr => "PTR"
+        dns.type_mx => "MX"
+        dns.type_txt => "TXT"
+        dns.type_srv => "SRV"
+        dns.type_caa => "CAA"
+        _ => "TYPE{kind}"
+    }
+}
+
+fn note(s: *Server, q: dns.Message, transport: str) {
+    let ask = q.questions[0]
+    let edns = if dns.payload_size(q) > 0 { "edns{dns.payload_size(q)}" } else { "plain" }
+    push(mut s.log, "{transport} {ask.name} {type_name(ask.kind)} {edns}")
+}
+
+fn serve_udp(s: *Server) {
+    let buf = io.buffer(4096)
+    for {
+        let p = net.receive_from_on(s.udp, buf) or return
+        let q = dns.decode(buf[..p.size]) or continue
+        note(s, q, "udp")
+        push(mut s.ids, q.id)
+        push(mut s.ports, p.from.port)
+        for reply in s.script(q, false) {
+            let socket = match reply.via {
+                1 => s.side
+                2 => s.far
+                _ => s.udp
+            }
+            net.send_to_on(socket, reply.bytes, p.from) or 0
+        }
+    }
+}
+
+fn read_exact(c: net.Conn, n: i64) -> []u8 ! io.Error {
+    var out: []u8 = []
+    let buf = io.buffer(n)
+    for out.len < n {
+        let got = net.read(c, buf[..n - out.len])?
+        if got == 0 {
+            fail Eof
+        }
+        io.append(mut out, buf[..got])
+    }
+    out
+}
+
+fn tcp_session(s: *Server, h: net.ConnHandle) {
+    using c = net.adopt(h)
+    for {
+        let size = io.be16(read_exact(c, 2) or return, 0)
+        let body = read_exact(c, size) or return
+        let q = dns.decode(body) or return
+        note(s, q, "tcp")
+        for reply in s.script(q, true) {
+            var frame: []u8 = []
+            io.put_be16(mut frame, reply.bytes.len)
+            io.append(mut frame, reply.bytes)
+            net.write_all(c, frame) or return
+        }
+    }
+}
+
+fn serve_tcp(s: *Server) {
+    for {
+        let h = net.accept_handle(s.tcp) or return
+        spawn tcp_session(s, h)
+    }
+}
+
+fn free_port() -> i64 {
+    for _ in 0..50 {
+        using probe = net.listen("127.0.0.1", 0) or continue
+        using udp = net.bind_udp("127.0.0.1", probe.handle.addr.port) or continue
+        return probe.handle.addr.port
+    }
+    0
+}
+
+fn serving(script: fn(dns.Message, bool) -> []Reply, body: fn(*Server)) {
+    let port = free_port()
+    using udp = net.bind_udp("127.0.0.1", port) or return
+    using tcp = net.listen("127.0.0.1", port) or return
+    using side = net.bind_udp("127.0.0.1", 0) or return
+    using far = net.bind_udp("127.0.0.2", 0) or return
+    let s = new(Server { port, udp: udp.handle, tcp: tcp.handle, side: side.handle, far: far.handle, log: [], ids: [], ports: [], script })
+    spawn serve_udp(s)
+    spawn serve_tcp(s)
+    body(s)
+}
+
+fn silent_port() -> net.SocketHandle ! io.Error {
+    using var s = net.bind_udp("127.0.0.1", 0)?
+    net.detach_socket(mut s)
+}
+
+fn reply_to(q: dns.Message, rcode: i64, answers: []dns.Record) -> dns.Message {
+    var additional: []dns.Record = []
+    if dns.payload_size(q) > 0 {
+        push(mut additional, dns.Record { name: ".", class: 1232, ttl: 0, data: dns.Data.Opt([]) })
+    }
+    dns.Message {
+        id: q.id
+        response: true
+        opcode: 0
+        authoritative: false
+        truncated: false
+        recursion_desired: true
+        recursion_available: true
+        authentic: false
+        checking_disabled: false
+        rcode
+        questions: q.questions
+        answers
+        authority: []
+        additional
+    }
+}
+
+fn wire(m: dns.Message) -> []u8 {
+    dns.encode(m) or []
+}
+
+fn say(q: dns.Message, answers: []dns.Record) -> []Reply {
+    [Reply { bytes: wire(reply_to(q, 0, answers)), via: 0 }]
+}
+
+fn fail_with(q: dns.Message, rcode: i64) -> []Reply {
+    [Reply { bytes: wire(reply_to(q, rcode, [])), via: 0 }]
+}
+
+fn rec(name: str, data: dns.Data) -> dns.Record {
+    dns.Record { name, class: 1, ttl: 60, data }
+}
+
+fn a_data(a: i64, b: i64, c: i64, d: i64) -> dns.Data {
+    dns.Data.A([u8(a), u8(b), u8(c), u8(d)])
+}
+
+fn aaaa_data(last: i64) -> dns.Data {
+    var ip = io.buffer(16)
+    ip[0] = 0x20
+    ip[1] = 0x01
+    ip[2] = 0x0d
+    ip[3] = 0xb8
+    ip[15] = u8(last)
+    dns.Data.Aaaa(ip)
+}
+
+fn asked(q: dns.Message) -> str {
+    q.questions[0].name
+}
+
+fn kind_of(q: dns.Message) -> i64 {
+    q.questions[0].kind
+}
+
+fn config_for(port: i64) -> net.ResolverConfig {
+    var c = net.resolver_config()
+    c.servers = [net.Addr { ip: [127, 0, 0, 1], port }]
+    c.timeout = 400
+    c.attempts = 1
+    c
+}
+
+fn using_config(c: net.ResolverConfig) -> net.Resolver {
+    net.resolver(c)
+}
+
+fn render(ip: []u8) -> str {
+    net.format_ip(ip)
+}
+
+fn render_all(ips: [][]u8) -> str {
+    var out: []str = []
+    for ip in ips {
+        push(mut out, render(ip))
+    }
+    text.join(out, ",")
+}
+
+fn show_log(s: *Server) {
+    for line in s.log {
+        print("  {line}")
+    }
+}
