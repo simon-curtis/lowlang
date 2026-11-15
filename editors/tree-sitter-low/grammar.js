@@ -32,6 +32,7 @@ module.exports = grammar({
 
   conflicts: $ => [
     [$._expression, $._type_name],
+    [$._type, $.generic_type],
     [$._expression, $.scoped_type_identifier],
     [$.struct_literal],
     [$.call_expression],
@@ -206,11 +207,14 @@ module.exports = grammar({
       field('arguments', $.type_arguments),
     ),
 
-    type_arguments: $ => seq('[', commaSep($._type), ']'),
+    type_arguments: $ => seq('[', $._type, repeat(seq(',', $._type)), optional(','), ']'),
 
     pointer_type: $ => prec(2, seq('*', field('type', $._type))),
 
-    slice_type: $ => prec(2, seq('[', ']', field('element', $._type))),
+    slice_type: $ => choice(
+      prec(2, seq('[', ']', field('element', $._type))),
+      prec(1, seq(field('element', $._type), '[', ']')),
+    ),
 
     map_type: $ => seq('[', field('key', $._type), ':', field('value', $._type), ']'),
 
