@@ -1,0 +1,342 @@
+import std/crypto/hash
+import std/slices
+
+/// A ciphersuite of RFC 9497 section 4: a prime-order group and a hash.
+pub enum Suite {
+    /// `ristretto255-SHA512`: ristretto255 and SHA-512, with 32-byte elements and scalars and 64-byte outputs.
+    Ristretto255Sha512
+    /// `P256-SHA256`: P-256 and SHA-256, with 33-byte compressed elements, 32-byte scalars and 32-byte outputs.
+    P256Sha256
+}
+
+/// A protocol variant of RFC 9497 section 3.1.
+pub enum Mode {
+    /// The oblivious PRF, mode byte `0x00`.
+    Oprf = 0
+    /// The verifiable oblivious PRF, mode byte `0x01`: the server proves that it used the key whose public key the client holds.
+    Voprf = 1
+    /// The partially oblivious PRF, mode byte `0x02`: a verifiable PRF that also takes public input `info`.
+    Poprf = 2
+}
+
+/// The failures of the protocol functions.
+pub enum Error {
+    /// An input or `info` is `65535` bytes or longer, a batch is empty or longer than `65535` elements, a list of requests does not match the list of evaluated elements, a seed is not 32 bytes, a blind is zero, or an input hashes to the identity element.
+    InvalidInput
+    /// The tweaked private key of a POPRF evaluation is zero, which happens only for an `info` that hashes to the negation of the private key.
+    Inverse
+    /// The proof of the server does not verify.
+    Verify
+    /// An element, scalar or proof is not a canonical encoding of the suite, an element is the identity, or a private key is zero.
+    Deserialize
+    /// No nonzero key came from 256 attempts of `derive_key_pair`.
+    DeriveKeyPair
+}
+
+/// A private key and the matching public key, serialized as the suite does.
+pub struct KeyPair {
+    /// The private scalar: 32 little-endian bytes for ristretto255 and 32 big-endian bytes for P-256.
+    pub secret: []u8
+    /// The public element, `secret` times the generator: 32 bytes for ristretto255 and 33 compressed SEC1 bytes for P-256.
+    pub public: []u8
+}
+
+/// The client side of a protocol variant.
+pub struct Client {
+    /// The ciphersuite.
+    pub suite: Suite
+    /// The protocol variant.
+    pub mode: Mode
+    /// The public key of the server, which `Voprf` and `Poprf` use to verify proofs. `Oprf` ignores it.
+    pub public: []u8
+}
+
+/// The server side of a protocol variant.
+pub struct Server {
+    /// The ciphersuite.
+    pub suite: Suite
+    /// The protocol variant.
+    pub mode: Mode
+    /// The private key of the server, as `KeyPair.secret` holds it.
+    pub secret: []u8
+}
+
+/// What a client keeps between `blind` and `finalize`, with the element it sends to the server.
+pub struct Request {
+    /// The private input.
+    pub input: []u8
+    /// The blind scalar.
+    pub blind: []u8
+    /// The blinded element to send to the server.
+    pub element: []u8
+}
+
+/// The answer of a server: one evaluated element for each blinded element and, for `Voprf` and `Poprf`, one proof for all of them.
+pub struct Evaluation {
+    /// The evaluated elements, in the order of the blinded elements.
+    pub elements: [][]u8
+    /// The DLEQ proof, the challenge followed by the response as two serialized scalars, or empty for `Oprf`.
+    pub proof: []u8
+}
+
+/// Returns the length in bytes of a serialized element of `suite`.
+pub fn element_size(suite: Suite) -> i64 {
+    let g = group_of(suite)
+    g.element_size
+}
+
+/// Returns the length in bytes of a serialized scalar of `suite`.
+pub fn scalar_size(suite: Suite) -> i64 {
+    let g = group_of(suite)
+    g.scalar_size
+}
+
+/// Returns the length in bytes of the output of the PRF of `suite`, the digest length of its hash.
+pub fn output_size(suite: Suite) -> i64 {
+    let g = group_of(suite)
+    g.hash.size
+}
+
+/// Returns a random key pair for `suite`, a nonzero scalar from `crypto.random` and its public element.
+pub fn generate_key_pair(suite: Suite) -> KeyPair {
+    let g = group_of(suite)
+    let secret = g.random_scalar()
+    let public = g.base_mul(secret)
+    KeyPair { secret, public }
+}
+
+/// Returns the key pair that `DeriveKeyPair` of RFC 9497 section 3.2.1 gives for the 32-byte `seed` and the public `info` under `mode` and `suite`.
+///
+/// Fails with `InvalidInput` when `seed` is not 32 bytes or `info` is `65535` bytes or longer, and with `DeriveKeyPair` when 256 attempts give only zero.
+pub fn derive_key_pair(suite: Suite, mode: Mode, seed: []u8, info: []u8) -> KeyPair ! Error {
+    if seed.len != 32 || !fits(info) {
+        fail InvalidInput
+    }
+    let g = group_of(suite)
+    let context = context_string(suite, mode)
+    let dst = tagged("DeriveKeyPair", context)
+    let derive_input = slices.flatten([seed, frame(info)])
+    for counter in 0..256 {
+        let attempt: []u8 = [u8(counter)]
+        let candidate = slices.concat(derive_input, attempt)
+        let secret = g.hash_to_scalar(candidate, dst)
+        if !all_zero(secret) {
+            let public = g.base_mul(secret)
+            return KeyPair { secret, public }
+        }
+    }
+    fail DeriveKeyPair
+}
+
+/// Returns the public key of the private key `secret`, or fails with `Deserialize` when `secret` is not a canonical nonzero scalar of `suite`.
+pub fn public_key(suite: Suite, secret: []u8) -> []u8 ! Error {
+    let g = group_of(suite)
+    let key = private_scalar(g, secret)?
+    g.base_mul(key)
+}
+
+fn private_scalar(g: Group, secret: []u8) -> []u8 ! Error {
+    let key = g.scalar(secret)?
+    if all_zero(key) {
+        fail Deserialize
+    }
+    key
+}
+
+fn blind_scalar(g: Group, blind: []u8) -> []u8 ! Error {
+    let scalar = g.scalar(blind)?
+    if all_zero(scalar) {
+        fail InvalidInput
+    }
+    scalar
+}
+
+fn framed_info(info: []u8) -> []u8 {
+    slices.concat(bytes("Info"), frame(info))
+}
+
+fn info_scalar(g: Group, context: []u8, info: []u8) -> []u8 {
+    let dst = tagged("HashToScalar-", context)
+    g.hash_to_scalar(framed_info(info), dst)
+}
+
+fn tweaked_key(g: Group, context: []u8, public: []u8, info: []u8) -> []u8 ! Error {
+    let m = info_scalar(g, context, info)
+    let t = g.base_mul(m)
+    let key = g.element(public)?
+    let tweaked = g.add(t, key)?
+    if all_zero(tweaked) {
+        fail InvalidInput
+    }
+    tweaked
+}
+
+fn finalize_hash(g: Group, mode: Mode, input: []u8, info: []u8, unblinded: []u8) -> []u8 {
+    let transcript = match mode {
+        Poprf => slices.flatten([frame(input), frame(info), frame(unblinded), bytes("Finalize")])
+        Oprf => slices.flatten([frame(input), frame(unblinded), bytes("Finalize")])
+        Voprf => slices.flatten([frame(input), frame(unblinded), bytes("Finalize")])
+    }
+    hash.sum(g.hash, transcript)
+}
+
+/// Blinds `input` with a random blind, as `Blind` of RFC 9497 section 3.3 does, and returns the `Request` to keep and send.
+///
+/// `info` is the public input of `Poprf` and is ignored by the other modes. Fails as `blind_with` does.
+pub fn blind(c: Client, input: []u8, info: []u8) -> Request ! Error {
+    let g = group_of(c.suite)
+    let scalar = g.random_scalar()
+    blind_with(c, input, info, scalar)
+}
+
+/// Blinds `input` with the scalar `blind`, which gives the same `Request` as `blind` for that scalar.
+///
+/// Use it for known-answer tests; a blind must be random, secret and used once. Fails with `InvalidInput` when `input` or `info` is `65535` bytes or longer, when `blind` is zero, or when `input` hashes to the identity element or, for `Poprf`, the public key and `info` give the identity as the tweaked key. Fails with `Deserialize` when `blind` is not a canonical scalar or, for `Poprf`, `c.public` is not a valid public key.
+pub fn blind_with(c: Client, input: []u8, info: []u8, blind: []u8) -> Request ! Error {
+    if !fits(input) || !fits(info) {
+        fail InvalidInput
+    }
+    let g = group_of(c.suite)
+    let context = context_string(c.suite, c.mode)
+    let scalar = blind_scalar(g, blind)?
+    if c.mode == Mode.Poprf {
+        tweaked_key(g, context, c.public, info)?
+    }
+    let dst = tagged("HashToGroup-", context)
+    let hashed = g.hash_to_group(input, dst)
+    if all_zero(hashed) {
+        fail InvalidInput
+    }
+    let element = g.mul(hashed, scalar)?
+    Request { input, blind: scalar, element }
+}
+
+/// Evaluates each of the serialized blinded elements with the private key of `s`, as `BlindEvaluate` of RFC 9497 section 3.3 does, with a random proof scalar.
+///
+/// `info` is the public input of `Poprf` and is ignored by the other modes. Fails as `blind_evaluate_with` does.
+pub fn blind_evaluate(s: Server, blinded: [][]u8, info: []u8) -> Evaluation ! Error {
+    let g = group_of(s.suite)
+    let r = g.random_scalar()
+    blind_evaluate_with(s, blinded, info, r)
+}
+
+/// Evaluates the blinded elements with the proof scalar `r`, which gives the same `Evaluation` as `blind_evaluate` for that scalar.
+///
+/// All elements share one batched proof. Use it for known-answer tests; `r` must be random, secret and used once. Fails with `InvalidInput` when `blinded` is empty or has more than `65535` elements or `info` is `65535` bytes or longer, with `Deserialize` when the private key, `r` or an element is invalid, and with `Inverse` when a `Poprf` tweaked key is zero.
+pub fn blind_evaluate_with(s: Server, blinded: [][]u8, info: []u8, r: []u8) -> Evaluation ! Error {
+    if blinded.len == 0 || blinded.len > 65535 || !fits(info) {
+        fail InvalidInput
+    }
+    let g = group_of(s.suite)
+    let context = context_string(s.suite, s.mode)
+    let key = private_scalar(g, s.secret)?
+    for element in blinded {
+        g.element(element)?
+    }
+    let empty: []u8 = []
+    var elements: [][]u8 = []
+    if s.mode == Mode.Oprf {
+        for element in blinded {
+            let evaluated = g.mul(element, key)?
+            push(mut elements, evaluated)
+        }
+        return Evaluation { elements, proof: empty }
+    }
+    let proof_scalar = g.scalar(r)?
+    if s.mode == Mode.Voprf {
+        for element in blinded {
+            let evaluated = g.mul(element, key)?
+            push(mut elements, evaluated)
+        }
+        let public = g.base_mul(key)
+        let proof = generate_proof(g, context, key, g.generator, public, blinded, elements, proof_scalar)?
+        return Evaluation { elements, proof }
+    }
+    let m = info_scalar(g, context, info)
+    let tweaked_secret = g.scalar_add(key, m)
+    if all_zero(tweaked_secret) {
+        fail Inverse
+    }
+    let inverse = g.scalar_invert(tweaked_secret)
+    for element in blinded {
+        let evaluated = g.mul(element, inverse)?
+        push(mut elements, evaluated)
+    }
+    let tweaked_public = g.base_mul(tweaked_secret)
+    let proof = generate_proof(g, context, tweaked_secret, g.generator, tweaked_public, elements, blinded, proof_scalar)?
+    Evaluation { elements, proof }
+}
+
+/// Verifies the proof of `evaluation` and returns the PRF output for each request, as `Finalize` of RFC 9497 section 3.3 does.
+///
+/// `requests` are the values `blind` returned, in the order they were sent, and `evaluation` answers them. `info` is the public input of `Poprf` and is ignored by the other modes. Each output is `output_size(c.suite)` bytes. Fails with `InvalidInput` when `requests` is empty, or longer than `65535`, or not as long as `evaluation.elements`, or `info` or an input is `65535` bytes or longer, with `Deserialize` when an element, a blind or the proof is invalid, and with `Verify` when the proof does not verify.
+pub fn finalize(c: Client, requests: []Request, evaluation: Evaluation, info: []u8) -> [][]u8 ! Error {
+    if requests.len == 0 || requests.len > 65535 || requests.len != evaluation.elements.len || !fits(info) {
+        fail InvalidInput
+    }
+    let g = group_of(c.suite)
+    let context = context_string(c.suite, c.mode)
+    var blinded: [][]u8 = []
+    for request in requests {
+        if !fits(request.input) {
+            fail InvalidInput
+        }
+        let element = g.element(request.element)?
+        push(mut blinded, element)
+    }
+    for element in evaluation.elements {
+        g.element(element)?
+    }
+    if c.mode == Mode.Voprf {
+        let public = g.element(c.public)?
+        let verified = verify_proof(g, context, g.generator, public, blinded, evaluation.elements, evaluation.proof)?
+        if !verified {
+            fail Verify
+        }
+    }
+    if c.mode == Mode.Poprf {
+        let tweaked = tweaked_key(g, context, c.public, info)?
+        let verified = verify_proof(g, context, g.generator, tweaked, evaluation.elements, blinded, evaluation.proof)?
+        if !verified {
+            fail Verify
+        }
+    }
+    var outputs: [][]u8 = []
+    for i in 0..requests.len {
+        let request = requests[i]
+        let scalar = blind_scalar(g, request.blind)?
+        let inverse = g.scalar_invert(scalar)
+        let unblinded = g.mul(evaluation.elements[i], inverse)?
+        let output = finalize_hash(g, c.mode, request.input, info, unblinded)
+        push(mut outputs, output)
+    }
+    outputs
+}
+
+/// Returns the PRF output for `input` computed from the private key of `s` alone, as `Evaluate` of RFC 9497 section 3.3 does.
+///
+/// It gives the output that `blind`, `blind_evaluate` and `finalize` give for the same key, input and `info`. `info` is the public input of `Poprf` and is ignored by the other modes. Fails with `InvalidInput` when `input` or `info` is `65535` bytes or longer or `input` hashes to the identity element, with `Deserialize` when the private key is invalid, and with `Inverse` when a `Poprf` tweaked key is zero.
+pub fn evaluate(s: Server, input: []u8, info: []u8) -> []u8 ! Error {
+    if !fits(input) || !fits(info) {
+        fail InvalidInput
+    }
+    let g = group_of(s.suite)
+    let context = context_string(s.suite, s.mode)
+    let key = private_scalar(g, s.secret)?
+    let dst = tagged("HashToGroup-", context)
+    let hashed = g.hash_to_group(input, dst)
+    if all_zero(hashed) {
+        fail InvalidInput
+    }
+    var exponent = key
+    if s.mode == Mode.Poprf {
+        let m = info_scalar(g, context, info)
+        let tweaked_secret = g.scalar_add(key, m)
+        if all_zero(tweaked_secret) {
+            fail Inverse
+        }
+        exponent = g.scalar_invert(tweaked_secret)
+    }
+    let evaluated = g.mul(hashed, exponent)?
+    finalize_hash(g, s.mode, input, info, evaluated)
+}
