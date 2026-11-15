@@ -1,0 +1,277 @@
+import std/builder
+import std/locale/data
+import std/slices
+import std/text
+import std/unicode
+
+struct Tailoring {
+    entries: [str: []Ce]
+    prefixes: [str: bool]
+    suppressed: [str: bool]
+    longest: i64
+}
+
+struct Match {
+    ces: []Ce
+    flag: bool
+}
+
+fn empty_tailoring() -> Tailoring {
+    Tailoring { entries: [:], prefixes: [:], suppressed: [:], longest: 3 }
+}
+
+fn has_surrogate(cps: []u32) -> bool {
+    for c in cps {
+        if c >= 0xD800 && c <= 0xDFFF {
+            return true
+        }
+    }
+    false
+}
+
+fn rune_key(cps: []u32) -> str {
+    var out = builder.builder()
+    for c in cps {
+        builder.write(mut out, text.from_char(c))
+    }
+    builder.to_str(out)
+}
+
+fn is_suppressed(t: Tailoring, cps: []u32) -> bool {
+    cps.len > 1 && t.suppressed.len > 0 && (t.suppressed[rune_key(cps[..1])] ?? false)
+}
+
+fn root_match(t: Tailoring, cps: []u32) -> Match? {
+    if cps.len > 3 || is_suppressed(t, cps) {
+        return none
+    }
+    let table = data.collate_root_table()
+    let i = root_find(table, pack(cps))
+    if i < 0 {
+        return none
+    }
+    Match { ces: root_ces(table, i), flag: (root_flags(table, i) & 1) != 0 }
+}
+
+fn root_extends(t: Tailoring, cps: []u32) -> bool {
+    if cps.len > 3 || is_suppressed(t, cps) {
+        return false
+    }
+    let table = data.collate_root_table()
+    let i = root_find(table, pack(cps))
+    i >= 0 && (root_flags(table, i) & 1) != 0
+}
+
+fn overlay_extends(t: Tailoring, cps: []u32) -> bool {
+    if t.prefixes.len == 0 || has_surrogate(cps) {
+        return false
+    }
+    t.prefixes[rune_key(cps)] ?? false
+}
+
+fn lookup_exact(t: Tailoring, cps: []u32) -> Match? {
+    if t.entries.len > 0 && !has_surrogate(cps) {
+        let key = rune_key(cps)
+        match t.entries[key] {
+            some(ces) => return Match { ces, flag: (t.prefixes[key] ?? false) || root_extends(t, cps) }
+            none => {}
+        }
+    }
+    let found = root_match(t, cps) ?? return none
+    Match { ces: found.ces, flag: found.flag || overlay_extends(t, cps) }
+}
+
+fn lookup_single(t: Tailoring, cp: u32) -> Match {
+    let one = [cp]
+    match lookup_exact(t, one) {
+        some(m) => return m
+        none => {}
+    }
+    Match { ces: implicit_ces(i64(cp)), flag: overlay_extends(t, one) }
+}
+
+fn remove_at(r: *Runes, at: i64) {
+    var i = at
+    for i + 1 < r.items.len {
+        r.items[i] = r.items[i + 1]
+        i += 1
+    }
+    r.items = r.items[..r.items.len - 1]
+}
+
+struct Extended {
+    cps: []u32
+    ces: []Ce
+}
+
+fn extend_discontiguous(t: Tailoring, work: *Runes, start: i64, first: i64, cps: []u32, ces: []Ce) -> Extended {
+    var current = Extended { cps, ces }
+    var j = start + first
+    var skipped = 0
+    var extendable = true
+    for extendable && j < work.items.len {
+        let k = combining_class(work.items[j])
+        if k == 0 {
+            break
+        }
+        if k != skipped {
+            var candidate = slices.clone(current.cps)
+            push(mut candidate, work.items[j])
+            match lookup_exact(t, candidate) {
+                some(m) => {
+                    current = Extended { cps: candidate, ces: m.ces }
+                    extendable = m.flag
+                    remove_at(work, j)
+                    continue
+                }
+                none => {}
+            }
+        }
+        skipped = k
+        j += 1
+    }
+    current
+}
+
+struct Runes {
+    items: []u32
+}
+
+fn match_size(t: Tailoring, work: []u32, at: i64) -> i64 {
+    var len = t.longest
+    if at + len > work.len {
+        len = work.len - at
+    }
+    var size = len
+    for size >= 2 {
+        match lookup_exact(t, work[at..at + size]) {
+            some(_) => return size
+            none => {}
+        }
+        size -= 1
+    }
+    1
+}
+
+fn is_ascii_digit(c: u32) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn numeric_elements(t: Tailoring, work: []u32, at: i64, mut out: []Ce) -> i64 {
+    var end = at
+    for end < work.len && is_ascii_digit(work[end]) {
+        end += 1
+    }
+    var from = at
+    for from < end - 1 && work[from] == '0' {
+        from += 1
+    }
+    let zero = lookup_single(t, '0')
+    let count = end - from
+    push(mut out, Ce { p: zero.ces[0].p + count, s: common_secondary, t: common_tertiary, variable: false, upper: false })
+    for k in from..end {
+        let digit = lookup_single(t, work[k])
+        push(mut out, digit.ces[0])
+    }
+    end
+}
+
+fn decomposed(runes: []u32) -> []u32 {
+    var plain = true
+    for c in runes {
+        if c >= 0xC0 {
+            plain = false
+            break
+        }
+    }
+    if plain {
+        return runes
+    }
+    var out: []u32 = []
+    var segment = builder.builder()
+    var pending = false
+    for c in runes {
+        if c >= 0xD800 && c <= 0xDFFF {
+            if pending {
+                flush_segment(mut out, segment)
+                segment = builder.builder()
+                pending = false
+            }
+            push(mut out, c)
+            continue
+        }
+        builder.write(mut segment, text.from_char(c))
+        pending = true
+    }
+    if pending {
+        flush_segment(mut out, segment)
+    }
+    reordered(out)
+}
+
+fn flush_segment(mut out: []u32, segment: builder.Builder) {
+    let normal = unicode.nfd(builder.to_str(segment))
+    var at = 0
+    for at < normal.len {
+        let r = unicode.decode_rune(normal, at)
+        push(mut out, r.code)
+        at += r.size
+    }
+}
+
+fn reordered(runes: []u32) -> []u32 {
+    var out = slices.clone(runes)
+    var i = 1
+    for i < out.len {
+        let k = combining_class(out[i])
+        if k == 0 {
+            i += 1
+            continue
+        }
+        var j = i
+        for j > 0 && combining_class(out[j - 1]) > k {
+            let swap = out[j - 1]
+            out[j - 1] = out[j]
+            out[j] = swap
+            j -= 1
+        }
+        i += 1
+    }
+    out
+}
+
+fn elements(t: Tailoring, numeric: bool, normalized: []u32) -> []Ce {
+    var out: []Ce = []
+    let runes = new(Runes { items: slices.clone(normalized) })
+    var i = 0
+    for i < runes.items.len {
+        let cp = runes.items[i]
+        if numeric && is_ascii_digit(cp) {
+            i = numeric_elements(t, runes.items, i, mut out)
+            continue
+        }
+        let single = lookup_single(t, cp)
+        var size = 1
+        var cps = [cp]
+        var ces = single.ces
+        var flag = single.flag
+        if flag {
+            size = match_size(t, runes.items, i)
+            if size > 1 {
+                cps = runes.items[i..i + size]
+                let found = lookup_exact(t, cps) ?? single
+                ces = found.ces
+                flag = found.flag
+            }
+        }
+        if flag {
+            let extended = extend_discontiguous(t, runes, i, size, cps, ces)
+            ces = extended.ces
+        }
+        for ce in ces {
+            push(mut out, ce)
+        }
+        i += size
+    }
+    out
+}

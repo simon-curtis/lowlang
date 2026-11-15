@@ -1,0 +1,721 @@
+import std/builder
+import std/locale
+import std/locale/data
+import std/locale/decimal
+import std/locale/plural
+import std/text
+import std/unicode
+
+struct NumberSystem {
+    index: i64
+    digits: []str
+}
+
+struct Currency {
+    code: str
+    index: i64
+    digits: i64
+    rounding: i64
+    cash_digits: i64
+    cash_rounding: i64
+}
+
+struct Rounding {
+    significant: bool
+    compact: bool
+    minimum_fraction: i64
+    maximum_fraction: i64
+    minimum_significant: i64
+    maximum_significant: i64
+    increment: i64
+}
+
+struct Rendered {
+    integer: str
+    fraction: str
+    exponent: str
+    exponent_negative: bool
+    has_exponent: bool
+    special: str
+    bare: bool
+    category: plural.Category
+    zero: bool
+    affixes: Affixes?
+}
+
+fn system_of(id: str) -> NumberSystem? {
+    let row = locale.lookup(data.numsys_table(), id) ?? return none
+    let f = text.fields(row)
+    NumberSystem { index: text.parse_int(f[0]) or 0, digits: text.chars(f[1]) }
+}
+
+fn latn_system() -> NumberSystem {
+    system_of("latn") ?? NumberSystem { index: 0, digits: text.chars("0123456789") }
+}
+
+fn default_system(l: locale.Locale) -> NumberSystem {
+    let name = locale.entry(l, data.group_numbering, 0) ?? "latn"
+    system_of(name) ?? latn_system()
+}
+
+fn numbering_system(l: locale.Locale) -> NumberSystem {
+    var name = l.numbering
+    let default_name = locale.entry(l, data.group_numbering, 0) ?? "latn"
+    match name {
+        "native" => { name = locale.entry(l, data.group_numbering, 1) ?? default_name }
+        "traditional" => { name = locale.entry(l, data.group_numbering, 2) ?? default_name }
+        "finance" => { name = locale.entry(l, data.group_numbering, 3) ?? default_name }
+        "" => { name = default_name }
+        _ => {}
+    }
+    match system_of(name) {
+        some(s) => return s
+        none => {}
+    }
+    match system_of(default_name) {
+        some(s) => return s
+        none => latn_system()
+    }
+}
+
+fn symbol(l: locale.Locale, ns: NumberSystem, slot: i64, fallback: str) -> str {
+    match locale.entry(l, data.group_symbols + ns.index, slot) {
+        some(v) => return v
+        none => {}
+    }
+    locale.entry(l, data.group_symbols + latn_system().index, slot) ?? fallback
+}
+
+fn format_text(l: locale.Locale, ns: NumberSystem, slot: i64, fallback: str) -> str {
+    match locale.entry(l, data.group_formats + ns.index, slot) {
+        some(v) => return v
+        none => {}
+    }
+    locale.entry(l, data.group_formats + latn_system().index, slot) ?? fallback
+}
+
+fn accounting_text(l: locale.Locale, ns: NumberSystem) -> str {
+    match locale.entry(l, data.group_formats + ns.index, 3) {
+        some(v) => return v
+        none => {}
+    }
+    let arab = system_of("arab") ?? ns
+    if ns.index == arab.index {
+        match locale.entry(l, data.group_formats + ns.index, 2) {
+            some(v) => return v
+            none => {}
+        }
+    }
+    format_text(l, ns, 3, format_text(l, ns, 2, "¤#,##0.00"))
+}
+
+fn currency_of(code: str) -> Currency ! Error {
+    let row = locale.lookup(data.currency_table(), code) ?? fail UnknownCurrency(code)
+    let f = text.fields(row)
+    Currency {
+        code,
+        index: text.parse_int(f[0]) or 0,
+        digits: text.parse_int(f[1]) or 2,
+        rounding: text.parse_int(f[2]) or 0,
+        cash_digits: text.parse_int(f[3]) or 2,
+        cash_rounding: text.parse_int(f[4]) or 0
+    }
+}
+
+fn currency_entry(l: locale.Locale, c: Currency, slot: i64) -> str? {
+    locale.entry(l, data.group_currency + c.index, slot)
+}
+
+fn currency_text(l: locale.Locale, c: Currency, display: CurrencyDisplay) -> str {
+    match display {
+        Code => c.code
+        NarrowSymbol => currency_entry(l, c, 1) ?? currency_entry(l, c, 0) ?? c.code
+        _ => currency_entry(l, c, 0) ?? c.code
+    }
+}
+
+fn rounding_for(o: Options, cur: Currency?) -> Rounding ! Error {
+    var default_min = 0
+    var default_max = 3
+    var increment = o.rounding_increment
+    if o.style == Style.Percent {
+        default_max = 0
+    }
+    match cur {
+        some(c) => {
+            let cash = o.currency_usage == CurrencyUsage.Cash
+            default_min = if cash { c.cash_digits } else { c.digits }
+            default_max = default_min
+            let unit = if cash { c.cash_rounding } else { c.rounding }
+            if unit > 1 && increment <= 1 && o.minimum_fraction < 0 && o.maximum_fraction < 0 {
+                increment = unit
+            }
+        }
+        none => {}
+    }
+    var r = Rounding {
+        significant: false,
+        compact: false,
+        minimum_fraction: 0,
+        maximum_fraction: 0,
+        minimum_significant: 1,
+        maximum_significant: 21,
+        increment
+    }
+    if o.minimum_significant > 0 || o.maximum_significant > 0 {
+        r.significant = true
+        r.minimum_significant = if o.minimum_significant > 0 { o.minimum_significant } else { 1 }
+        r.maximum_significant = if o.maximum_significant > 0 { o.maximum_significant } else { 21 }
+        if r.minimum_significant > r.maximum_significant {
+            fail InvalidDigits
+        }
+        return r
+    }
+    if o.notation == Notation.Compact && o.minimum_fraction < 0 && o.maximum_fraction < 0 {
+        r.compact = true
+        return r
+    }
+    var min = o.minimum_fraction
+    var max = o.maximum_fraction
+    if min < 0 && max < 0 {
+        min = default_min
+        max = default_max
+    } else if min < 0 {
+        min = if default_min < max { default_min } else { max }
+    } else if max < 0 {
+        max = if default_max > min { default_max } else { min }
+    }
+    if min > max {
+        fail InvalidDigits
+    }
+    r.minimum_fraction = min
+    r.maximum_fraction = max
+    r
+}
+
+fn significant_count(d: decimal.Decimal) -> i64 {
+    d.digits.len
+}
+
+fn round_significant_fit(d: decimal.Decimal, r: Rounding, mode: decimal.Mode) -> decimal.Decimal {
+    if decimal.is_zero(d) {
+        return decimal.pad(decimal.round_places(d, 0, mode), r.minimum_significant - 1)
+    }
+    var out = decimal.round_significant(d, r.maximum_significant, mode)
+    for out.scale > 0 && significant_count(out) > r.minimum_significant && out.digits[out.digits.len - 1] == '0' {
+        out = decimal.strip_zeros(decimal.pad(out, out.scale - 1))
+    }
+    if significant_count(out) < r.minimum_significant {
+        out = decimal.pad(out, out.scale + r.minimum_significant - significant_count(out))
+    }
+    out
+}
+
+fn round_fraction_fit(d: decimal.Decimal, r: Rounding, mode: decimal.Mode) -> decimal.Decimal {
+    var out = if r.increment > 1 {
+        decimal.round_increment(d, r.maximum_fraction, r.increment, mode)
+    } else {
+        decimal.round_places(d, r.maximum_fraction, mode)
+    }
+    for out.scale > r.minimum_fraction && out.digits[out.digits.len - 1] == '0' && out.scale > 0 {
+        out = trim_one(out)
+    }
+    out
+}
+
+fn trim_one(d: decimal.Decimal) -> decimal.Decimal {
+    if d.digits == "0" {
+        var out = d
+        out.scale = d.scale - 1
+        return out
+    }
+    var out = d
+    out.digits = d.digits[..d.digits.len - 1]
+    out.scale = d.scale - 1
+    out
+}
+
+fn round_value(d: decimal.Decimal, r: Rounding, mode: decimal.Mode) -> decimal.Decimal {
+    if r.compact {
+        if decimal.integer_digits(d) >= 2 {
+            return round_fraction_fit(d, Rounding { significant: false, compact: false, minimum_fraction: 0, maximum_fraction: 0, minimum_significant: 1, maximum_significant: 2, increment: 1 }, mode)
+        }
+        return round_significant_fit(d, Rounding { significant: true, compact: false, minimum_fraction: 0, maximum_fraction: 0, minimum_significant: 1, maximum_significant: 2, increment: 1 }, mode)
+    }
+    if r.significant {
+        return round_significant_fit(d, r, mode)
+    }
+    round_fraction_fit(d, r, mode)
+}
+
+fn strip_if_integer(d: decimal.Decimal, o: Options) -> decimal.Decimal {
+    if o.trailing_zeros != TrailingZeros.StripIfInteger {
+        return d
+    }
+    let p = decimal.parts(d)
+    for c in p.fraction {
+        if c != '0' {
+            return d
+        }
+    }
+    decimal.round_places(d, 0, decimal.Mode.Trunc)
+}
+
+fn render_plain(d: decimal.Decimal, r: Rounding, o: Options, l: locale.Locale) -> Rendered {
+    let rounded = strip_if_integer(round_value(d, r, o.rounding_mode), o)
+    let p = decimal.parts(rounded)
+    Rendered {
+        integer: p.integer,
+        fraction: p.fraction,
+        exponent: "",
+        exponent_negative: false,
+        has_exponent: false,
+        special: "",
+        bare: false,
+        category: plural.cardinal(l, plural.operands(rounded, 0)),
+        zero: decimal.is_zero(rounded),
+        affixes: none
+    }
+}
+
+fn render_exponent(d: decimal.Decimal, r: Rounding, o: Options, l: locale.Locale) -> Rendered {
+    var exponent = decimal.magnitude(d)
+    let engineering = o.notation == Notation.Engineering
+    if engineering {
+        exponent = exponent - (((exponent % 3) + 3) % 3)
+    }
+    let limit = if engineering { 3 } else { 1 }
+    var rounded = round_value(decimal.shift(d, -exponent), r, o.rounding_mode)
+    if decimal.integer_digits(rounded) > limit && !decimal.is_zero(rounded) {
+        exponent += if engineering { 3 } else { 1 }
+        rounded = round_value(decimal.shift(d, -exponent), r, o.rounding_mode)
+    }
+    rounded = strip_if_integer(rounded, o)
+    let p = decimal.parts(rounded)
+    let magnitude = if exponent < 0 { -exponent } else { exponent }
+    Rendered {
+        integer: p.integer,
+        fraction: p.fraction,
+        exponent: "{magnitude}",
+        exponent_negative: exponent < 0,
+        has_exponent: true,
+        special: "",
+        bare: false,
+        category: plural.cardinal(l, plural.operands(rounded, 0)),
+        zero: decimal.is_zero(rounded),
+        affixes: none
+    }
+}
+
+fn zero_count(pattern: str) -> i64 {
+    var n = 0
+    var quoted = false
+    for c in pattern {
+        if c == '\'' {
+            quoted = !quoted
+        } else if c == ';' && !quoted {
+            break
+        } else if c == '0' && !quoted {
+            n += 1
+        }
+    }
+    n
+}
+
+fn compact_slot(k: i64, category: plural.Category) -> i64 {
+    let index = match category {
+        Zero => 0
+        One => 1
+        Two => 2
+        Few => 3
+        Many => 4
+        Other => 5
+    }
+    (k - 3) * 6 + index
+}
+
+fn compact_entry(l: locale.Locale, ns: NumberSystem, group: i64, k: i64, category: plural.Category) -> str? {
+    match locale.entry(l, group + ns.index, compact_slot(k, category)) {
+        some(v) => return v
+        none => {}
+    }
+    locale.entry(l, group + latn_system().index, compact_slot(k, category))
+}
+
+fn compact_pattern(l: locale.Locale, ns: NumberSystem, o: Options, k: i64, category: plural.Category) -> str? {
+    if o.style == Style.Currency {
+        return compact_entry(l, ns, data.group_compact_currency, k, category)
+    }
+    if o.compact_display == CompactDisplay.Long && has_long_compact(l, ns) {
+        return compact_entry(l, ns, data.group_compact_long, k, category)
+    }
+    compact_entry(l, ns, data.group_compact_short, k, category)
+}
+
+fn has_long_compact(l: locale.Locale, ns: NumberSystem) -> bool {
+    for k in 3..20 {
+        match compact_entry(l, ns, data.group_compact_long, k, plural.Category.Other) {
+            some(_) => return true
+            none => {}
+        }
+    }
+    false
+}
+
+fn affixes_of_compact(pattern: str) -> Affixes {
+    parse_pattern(pattern).affixes
+}
+
+fn highest_compact(l: locale.Locale, ns: NumberSystem, o: Options) -> i64 {
+    var top = 2
+    for k in 3..20 {
+        match compact_pattern(l, ns, o, k, plural.Category.Other) {
+            some(_) => { top = k }
+            none => {}
+        }
+    }
+    top
+}
+
+fn render_compact(d: decimal.Decimal, r: Rounding, o: Options, l: locale.Locale, ns: NumberSystem) -> Rendered {
+    if decimal.is_zero(d) {
+        return render_plain(d, r, o, l)
+    }
+    var value = d
+    var k = decimal.integer_digits(value) - 1
+    if k < 3 {
+        value = round_value(d, r, o.rounding_mode)
+        k = decimal.integer_digits(value) - 1
+        if k < 3 {
+            return render_plain(d, r, o, l)
+        }
+    }
+    let top = highest_compact(l, ns, o)
+    if k > top {
+        k = top
+    }
+    for attempt in 0..2 {
+        let other = compact_pattern(l, ns, o, k, plural.Category.Other) ?? ""
+        let z = zero_count(other)
+        if other == "" || z == 0 || other == "0" {
+            return render_plain(d, r, o, l)
+        }
+        let amount = k - z + 1
+        let rounded = strip_if_integer(round_value(decimal.shift(value, -amount), r, o.rounding_mode), o)
+        if decimal.integer_digits(rounded) > z && k < top {
+            k += 1
+            continue
+        }
+        let category = plural.cardinal(l, plural.operands(rounded, 0))
+        let chosen = compact_pattern(l, ns, o, k, category) ?? other
+        let p = decimal.parts(rounded)
+        let literal = zero_count(chosen) == 0
+        return Rendered {
+            integer: p.integer,
+            fraction: p.fraction,
+            exponent: "",
+            exponent_negative: false,
+            has_exponent: false,
+            special: "",
+            bare: literal,
+            category,
+            zero: decimal.is_zero(rounded),
+            affixes: affixes_of_compact(chosen)
+        }
+    }
+    render_plain(d, r, o, l)
+}
+
+fn translate(digits: str, ns: NumberSystem) -> str {
+    var out = builder.builder()
+    for c in digits {
+        let n = i64(c) - i64('0')
+        builder.write(mut out, ns.digits[n])
+    }
+    builder.to_str(out)
+}
+
+fn grouping_minimum(l: locale.Locale, o: Options) -> i64 {
+    match o.grouping {
+        Off => return 0
+        Always => return 1
+        Min2 => return 2
+        Auto => {}
+    }
+    if o.notation == Notation.Compact {
+        return 2
+    }
+    let value = locale.entry(l, data.group_numbering, 4) ?? "1"
+    text.parse_int(value) or 1
+}
+
+fn group_integer(integer: str, part: NumberPart, minimum: i64) -> []str {
+    var parts: []str = []
+    let primary = part.primary
+    if minimum == 0 || primary == 0 || integer.len < primary + minimum {
+        push(mut parts, integer)
+        return parts
+    }
+    let secondary = if part.secondary == 0 { primary } else { part.secondary }
+    var end = integer.len
+    var size = primary
+    for end > 0 {
+        let start = if end > size { end - size } else { 0 }
+        push(mut parts, integer[start..end])
+        end = start
+        size = secondary
+    }
+    var flipped: []str = []
+    var i = parts.len
+    for i > 0 {
+        i -= 1
+        push(mut flipped, parts[i])
+    }
+    flipped
+}
+
+struct Context {
+    l: locale.Locale
+    ns: NumberSystem
+    o: Options
+    currency: Currency?
+}
+
+fn number_body(ctx: Context, rendered: Rendered, part: NumberPart, currency_style: bool) -> str {
+    let l = ctx.l
+    let ns = ctx.ns
+    if rendered.special != "" {
+        return rendered.special
+    }
+    if rendered.bare {
+        return ""
+    }
+    var integer = rendered.integer
+    let wanted = if ctx.o.minimum_integer > part.minimum_integer { ctx.o.minimum_integer } else { part.minimum_integer }
+    if integer.len < wanted {
+        integer = "{text.repeat("0", wanted - integer.len)}{integer}"
+    }
+    let group_sep = if currency_style { symbol(l, ns, 13, symbol(l, ns, 1, ",")) } else { symbol(l, ns, 1, ",") }
+    let point = if currency_style { symbol(l, ns, 12, symbol(l, ns, 0, ".")) } else { symbol(l, ns, 0, ".") }
+    var out = builder.builder()
+    let groups = group_integer(integer, part, grouping_minimum(l, ctx.o))
+    for i, g in groups {
+        if i > 0 {
+            builder.write(mut out, group_sep)
+        }
+        builder.write(mut out, translate(g, ns))
+    }
+    if rendered.fraction != "" {
+        builder.write(mut out, point)
+        builder.write(mut out, translate(rendered.fraction, ns))
+    }
+    if rendered.has_exponent {
+        builder.write(mut out, symbol(l, ns, 6, "E"))
+        if rendered.exponent_negative {
+            builder.write(mut out, symbol(l, ns, 5, "-"))
+        }
+        builder.write(mut out, translate(rendered.exponent, ns))
+    }
+    builder.to_str(out)
+}
+
+fn is_digit_text(s: str, at_end: bool) -> bool {
+    if s == "" {
+        return false
+    }
+    let c = if at_end { last_char(s) } else { first_char(s) }
+    unicode.is_digit(c)
+}
+
+fn spacing_text(l: locale.Locale, side: i64) -> str {
+    locale.entry(l, data.group_numbering, 5 + side * 3 + 2) ?? text.from_char(0xA0)
+}
+
+fn join_currency(ctx: Context, prefix: Expanded, body: str, suffix: Expanded, currency: str) -> str {
+    var out = builder.builder()
+    builder.write(mut out, prefix.text)
+    if prefix.ends_with_currency && currency != "" && spacing_applies(last_char(currency)) && is_digit_text(body, false) {
+        builder.write(mut out, spacing_text(ctx.l, 1))
+    }
+    builder.write(mut out, body)
+    if suffix.starts_with_currency && currency != "" && spacing_applies(first_char(currency)) && is_digit_text(body, true) {
+        builder.write(mut out, spacing_text(ctx.l, 0))
+    }
+    builder.write(mut out, suffix.text)
+    builder.to_str(out)
+}
+
+enum Sign {
+    Unsigned
+    Minus
+    Plus
+}
+
+fn sign_of(o: Options, negative: bool, zero: bool) -> Sign {
+    match o.sign_display {
+        Auto => if negative { Sign.Minus } else { Sign.Unsigned }
+        Always => if negative { Sign.Minus } else { Sign.Plus }
+        Never => Sign.Unsigned
+        ExceptZero => if zero { Sign.Unsigned } else if negative { Sign.Minus } else { Sign.Plus }
+        Negative => if negative && !zero { Sign.Minus } else { Sign.Unsigned }
+    }
+}
+
+fn contains_minus(raw: str) -> bool {
+    text.contains(raw, "-")
+}
+
+fn pick_affixes(a: Affixes, sign: Sign, s: Substitutions) -> Sides {
+    match sign {
+        Unsigned => Sides { prefix: expand(a.positive_prefix, s), suffix: expand(a.positive_suffix, s) }
+        Minus => Sides { prefix: expand(a.negative_prefix, s), suffix: expand(a.negative_suffix, s) }
+        Plus => {
+            if contains_minus(a.negative_prefix) || contains_minus(a.negative_suffix) {
+                var p = s
+                p.minus = s.plus
+                Sides { prefix: expand(a.negative_prefix, p), suffix: expand(a.negative_suffix, p) }
+            } else {
+                Sides { prefix: expand("+{a.positive_prefix}", s), suffix: expand(a.positive_suffix, s) }
+            }
+        }
+    }
+}
+
+struct Sides {
+    prefix: Expanded
+    suffix: Expanded
+}
+
+fn style_pattern(ctx: Context) -> Pattern {
+    let o = ctx.o
+    var slot = 0
+    if o.style == Style.Percent {
+        slot = 1
+    } else if o.style == Style.Currency && o.currency_display != CurrencyDisplay.Name {
+        slot = 2
+        if o.currency_sign == CurrencySign.Accounting {
+            return parse_pattern(accounting_text(ctx.l, ctx.ns))
+        }
+    }
+    parse_pattern(format_text(ctx.l, ctx.ns, slot, "#,##0.###"))
+}
+
+fn long_name(ctx: Context, number: str, category: plural.Category) -> str {
+    let cur = ctx.currency ?? return number
+    let slot = 3 + category_slot(category)
+    let name = currency_entry(ctx.l, cur, slot) ?? currency_entry(ctx.l, cur, 2) ?? cur.code
+    let own = default_system(ctx.l)
+    let unit = locale.entry(ctx.l, data.group_formats + own.index, 4 + category_slot(category)) ?? locale.entry(ctx.l, data.group_formats + own.index, 9) ?? locale.entry(locale.root(), data.group_formats + latn_system().index, 9) ?? "{{0}} {{1}}"
+    text.replace(text.replace(unit, "{{0}}", number), "{{1}}", name)
+}
+
+fn category_slot(c: plural.Category) -> i64 {
+    match c {
+        Zero => 0
+        One => 1
+        Two => 2
+        Few => 3
+        Many => 4
+        Other => 5
+    }
+}
+
+fn special_text(ctx: Context, d: decimal.Decimal) -> str {
+    if d.kind == decimal.Kind.NotANumber {
+        return symbol(ctx.l, ctx.ns, 10, "NaN")
+    }
+    symbol(ctx.l, ctx.ns, 9, "∞")
+}
+
+fn render(ctx: Context, d: decimal.Decimal) -> Rendered ! Error {
+    let o = ctx.o
+    if d.kind != decimal.Kind.Finite {
+        var r = render_plain(decimal.zero(), rounding_for(o, ctx.currency)?, o, ctx.l)
+        r.special = special_text(ctx, d)
+        r.zero = false
+        return r
+    }
+    var value = d
+    if o.style == Style.Percent {
+        value = decimal.shift(value, 2)
+    }
+    let r = rounding_for(o, ctx.currency)?
+    match o.notation {
+        Scientific => render_exponent(value, r, o, ctx.l)
+        Engineering => render_exponent(value, r, o, ctx.l)
+        Compact => render_compact(value, r, o, ctx.l, ctx.ns)
+        Standard => render_plain(value, r, o, ctx.l)
+    }
+}
+
+/// Formats `d` for `l` as `o` says, with the digits, separators and patterns of the locale and its numbering system.
+///
+/// Fails with `MissingCurrency` or `UnknownCurrency` when the currency style has no valid code, and with `InvalidDigits` when the digit options contradict each other. A number that is infinite or not a number is written with the locale's symbol for it.
+pub fn format(l: locale.Locale, d: decimal.Decimal, o: Options) -> str ! Error {
+    var currency: Currency? = none
+    if o.style == Style.Currency {
+        if o.currency == "" {
+            fail MissingCurrency
+        }
+        currency = currency_of(text.upper(o.currency))?
+    }
+    let ns = numbering_system(l)
+    let ctx = Context { l, ns, o, currency }
+    let rendered = render(ctx, d)?
+    let pattern = style_pattern(ctx)
+    let negative = d.negative && d.kind != decimal.Kind.NotANumber
+    let sign = sign_of(o, negative, rendered.zero && rendered.special == "")
+    let affixes = rendered.affixes ?? pattern.affixes
+    let currency_string = match currency {
+        some(c) => currency_text(l, c, o.currency_display)
+        none => ""
+    }
+    let code_string = match currency {
+        some(c) => c.code
+        none => ""
+    }
+    let subs = Substitutions {
+        currency: currency_string,
+        code: code_string,
+        percent: symbol(l, ns, 3, "%"),
+        permille: symbol(l, ns, 8, "‰"),
+        minus: symbol(l, ns, 5, "-"),
+        plus: symbol(l, ns, 4, "+")
+    }
+    let sides = pick_affixes(affixes, sign, subs)
+    let body = number_body(ctx, rendered, pattern.number, o.style == Style.Currency)
+    if o.style == Style.Currency && o.currency_display == CurrencyDisplay.Name {
+        let joined = join_currency(ctx, sides.prefix, body, sides.suffix, "")
+        return long_name(ctx, joined, rendered.category)
+    }
+    join_currency(ctx, sides.prefix, body, sides.suffix, currency_string)
+}
+
+/// Formats the integer `n` as `format` does.
+pub fn format_int(l: locale.Locale, n: i64, o: Options) -> str ! Error {
+    format(l, decimal.from_int(n), o)
+}
+
+/// Formats the float `x` as `format` does, from its shortest decimal form.
+pub fn format_f64(l: locale.Locale, x: f64, o: Options) -> str ! Error {
+    format(l, decimal.from_f64(x), o)
+}
+
+/// Writes the ASCII digits in `digits` in the numbering system of `l`, leaving every other character as it is.
+pub fn localize_digits(l: locale.Locale, digits: str) -> str {
+    let ns = numbering_system(l)
+    var out = builder.builder()
+    for c in digits {
+        if c >= '0' && c <= '9' {
+            builder.write(mut out, ns.digits[i64(c) - i64('0')])
+        } else {
+            builder.write(mut out, text.from_char(c))
+        }
+    }
+    builder.to_str(out)
+}
+
+/// Returns the decimal separator of the numbering system of `l`.
+pub fn decimal_separator(l: locale.Locale) -> str {
+    symbol(l, numbering_system(l), 0, ".")
+}

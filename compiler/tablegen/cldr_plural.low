@@ -1,0 +1,299 @@
+import emit
+import std/builder
+import std/file
+import std/slices
+import std/text
+import std/xml
+
+const plural_category_names = "zero one two few many other"
+
+struct PluralGroup {
+    locales: []str
+    rules: []PluralRule
+}
+
+struct PluralRule {
+    category: i64
+    code: []u8
+}
+
+struct RangeTriple {
+    start: i64
+    end: i64
+    result: i64
+}
+
+struct RangeGroup {
+    locales: []str
+    triples: []RangeTriple
+}
+
+fn category_index(name: str) -> i64 ! Error {
+    let names = text.fields(plural_category_names)
+    for i, n in names {
+        if n == name {
+            return i
+        }
+    }
+    fail Failed("unknown plural category {text.quote(name)}")
+}
+
+fn plural_operand_index(name: str) -> i64 ! Error {
+    match name {
+        "n" => 0
+        "i" => 1
+        "v" => 2
+        "w" => 3
+        "f" => 4
+        "t" => 5
+        "c" => 6
+        "e" => 7
+        _ => fail Failed("unknown plural operand {text.quote(name)}")
+    }
+}
+
+struct RuleReader {
+    tokens: []str
+    at: i64
+}
+
+fn rule_tokens(source: str) -> []str {
+    var out: []str = []
+    var i = 0
+    for i < source.len {
+        let c = source[i]
+        if c == ' ' || c == '\t' || c == '\n' {
+            i += 1
+            continue
+        }
+        if c == '!' || c == '=' {
+            if c == '!' {
+                push(mut out, "!=")
+                i += 2
+            } else {
+                push(mut out, "=")
+                i += 1
+            }
+            continue
+        }
+        if c == '%' || c == ',' {
+            push(mut out, source[i..i + 1])
+            i += 1
+            continue
+        }
+        if c == '.' {
+            push(mut out, "..")
+            i += 2
+            continue
+        }
+        let start = i
+        for i < source.len && source[i] != ' ' && source[i] != '=' && source[i] != '!' && source[i] != '%' && source[i] != ',' && source[i] != '.' {
+            i += 1
+        }
+        push(mut out, source[start..i])
+    }
+    out
+}
+
+fn reader_peek(r: *RuleReader) -> str {
+    if r.at < r.tokens.len { r.tokens[r.at] } else { "" }
+}
+
+fn reader_take(r: *RuleReader) -> str {
+    let t = reader_peek(r)
+    r.at += 1
+    t
+}
+
+fn put_varint(mut out: []u8, v: i64) {
+    var rest = v
+    for rest >= 0x80 {
+        push(mut out, u8(rest & 0x7F) | 0x80)
+        rest = rest >> 7
+    }
+    push(mut out, u8(rest))
+}
+
+fn parse_value(r: *RuleReader) -> i64 ! Error {
+    let token = reader_take(r)
+    text.parse_int(token) or fail Failed("plural rule: bad number {text.quote(token)}")
+}
+
+fn compile_relation(r: *RuleReader, mut out: []u8) ! Error {
+    let operand = plural_operand_index(reader_take(r))?
+    var head = operand
+    var modulus = 0
+    if reader_peek(r) == "%" {
+        reader_take(r)
+        modulus = parse_value(r)?
+        head = head | 8
+    }
+    let op = reader_take(r)
+    if op == "!=" {
+        head = head | 16
+    } else if op != "=" {
+        fail Failed("plural rule: expected = or !=, found {text.quote(op)}")
+    }
+    push(mut out, u8(head))
+    if modulus != 0 {
+        put_varint(mut out, modulus)
+    }
+    var ranges: []i64 = []
+    for {
+        let lo = parse_value(r)?
+        var hi = lo
+        if reader_peek(r) == ".." {
+            reader_take(r)
+            hi = parse_value(r)?
+        }
+        push(mut ranges, lo)
+        push(mut ranges, hi)
+        if reader_peek(r) == "," {
+            reader_take(r)
+            continue
+        }
+        break
+    }
+    push(mut out, u8(ranges.len / 2))
+    for v in ranges {
+        put_varint(mut out, v)
+    }
+}
+
+fn compile_and(r: *RuleReader, mut out: []u8) ! Error {
+    var body: []u8 = []
+    var count = 0
+    for {
+        compile_relation(r, mut body)?
+        count += 1
+        if reader_peek(r) == "and" {
+            reader_take(r)
+            continue
+        }
+        break
+    }
+    push(mut out, u8(count))
+    for b in body {
+        push(mut out, b)
+    }
+}
+
+fn compile_condition(source: str) -> []u8 ! Error {
+    var out: []u8 = []
+    let trimmed = text.trim(source)
+    if trimmed == "" {
+        push(mut out, 0)
+        return out
+    }
+    let r = new(RuleReader { tokens: rule_tokens(trimmed), at: 0 })
+    var body: []u8 = []
+    var terms = 0
+    for {
+        compile_and(r, mut body)?
+        terms += 1
+        if reader_peek(r) == "or" {
+            reader_take(r)
+            continue
+        }
+        break
+    }
+    if r.at != r.tokens.len {
+        fail Failed("plural rule: trailing {text.quote(reader_peek(r))} in {text.quote(source)}")
+    }
+    push(mut out, u8(terms))
+    for b in body {
+        push(mut out, b)
+    }
+    out
+}
+
+fn read_plural_groups(path: str, kind: str) -> []PluralGroup ! Error {
+    let root = load_xml(path)?
+    var groups: []PluralGroup = []
+    for set in xml.children(root, "plurals") {
+        if (xml.attribute(set, "type") ?? "cardinal") != kind {
+            continue
+        }
+        for g in xml.children(set, "pluralRules") {
+            let locales = text.fields(tag_key(emit.attribute_text(g, "locales")))
+            var rules: []PluralRule = []
+            for rule in xml.children(g, "pluralRule") {
+                let category = category_index(emit.attribute_text(rule, "count"))?
+                let source = text.cut(xml.text(rule), "@").before
+                let code = compile_condition(source)?
+                push(mut rules, PluralRule { category, code })
+            }
+            push(mut groups, PluralGroup { locales, rules })
+        }
+    }
+    groups
+}
+
+fn pack_plural_groups(groups: []PluralGroup) -> []u8 {
+    var out: []u8 = []
+    for g in groups {
+        push(mut out, u8(g.locales.len))
+        for l in g.locales {
+            push(mut out, u8(l.len))
+            text.append(mut out, l)
+        }
+        push(mut out, u8(g.rules.len))
+        for rule in g.rules {
+            push(mut out, u8(rule.category))
+            put_varint(mut out, rule.code.len)
+            for b in rule.code {
+                push(mut out, b)
+            }
+        }
+    }
+    out
+}
+
+fn read_range_groups(path: str) -> []RangeGroup ! Error {
+    let root = load_xml(path)?
+    var groups: []RangeGroup = []
+    for set in xml.children(root, "plurals") {
+        for g in xml.children(set, "pluralRanges") {
+            let locales = text.fields(tag_key(emit.attribute_text(g, "locales")))
+            var triples: []RangeTriple = []
+            for t in xml.children(g, "pluralRange") {
+                let start = category_index(emit.attribute_text(t, "start"))?
+                let end = category_index(emit.attribute_text(t, "end"))?
+                let result = category_index(emit.attribute_text(t, "result"))?
+                push(mut triples, RangeTriple { start, end, result })
+            }
+            push(mut groups, RangeGroup { locales, triples })
+        }
+    }
+    groups
+}
+
+fn pack_range_groups(groups: []RangeGroup) -> []u8 {
+    var out: []u8 = []
+    for g in groups {
+        push(mut out, u8(g.locales.len))
+        for l in g.locales {
+            push(mut out, u8(l.len))
+            text.append(mut out, l)
+        }
+        push(mut out, u8(g.triples.len))
+        for t in g.triples {
+            push(mut out, u8(t.start))
+            push(mut out, u8(t.end))
+            push(mut out, u8(t.result))
+        }
+    }
+    out
+}
+
+fn plural_sections(common: str) -> []Section ! Error {
+    let dir = file.child_path(common, "supplemental")
+    let cardinal = read_plural_groups(file.child_path(dir, "plurals.xml"), "cardinal")?
+    let ordinal = read_plural_groups(file.child_path(dir, "ordinals.xml"), "ordinal")?
+    let ranges = read_range_groups(file.child_path(dir, "pluralRanges.xml"))?
+    [
+        Section { name: "plural_cardinal.bin", data: pack_plural_groups(cardinal) }
+        Section { name: "plural_ordinal.bin", data: pack_plural_groups(ordinal) }
+        Section { name: "plural_range.bin", data: pack_range_groups(ranges) }
+    ]
+}
