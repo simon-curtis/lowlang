@@ -1,0 +1,165 @@
+import std/crypto/x509
+import std/dtls
+import std/dtls/session
+import std/io
+import std/net
+import std/slices
+
+struct Route {
+    remote: net.Addr?
+}
+
+fn check(name: str, ok: bool) {
+    if ok {
+        print("{name}: ok")
+    } else {
+        print("{name}: FAIL")
+    }
+}
+
+fn pump(h: net.SocketHandle, incoming: chan[u8[]]) {
+    let buf = io.buffer(65536)
+    for {
+        let packet = net.receive_from_on(h, buf) catch {
+            _ => break
+        }
+        let data = io.buffer(packet.size)
+        io.copy(data, buf[..packet.size])
+        select {
+            incoming <- data => {}
+            else => {}
+        }
+    }
+}
+
+fn transport(h: net.SocketHandle, remote: net.Addr, incoming: chan[u8[]]) -> session.Transport {
+    session.Transport {
+        send: fn(d) {
+            net.send_to_on(h, d, remote) or 0
+        }
+        incoming
+    }
+}
+
+fn next_message(h: session.Handle) -> u8[]? {
+    select {
+        d = <-h.data => d
+        after(5000) => none
+    }
+}
+
+fn identity(name: str) -> dtls.Identity {
+    dtls.generate_identity(name, 1700000000, 4102444800) or return dtls.Identity { certificate: [], key: x509.PrivateKey.Ed25519([]) }
+}
+
+fn pair() -> bool {
+    let ia = identity("session a")
+    let ib = identity("session b")
+    let fa = dtls.fingerprint("sha-256", ia.certificate) or return false
+    let fb = dtls.fingerprint("sha-256", ib.certificate) or return false
+    using var socket_a = net.bind_udp("127.0.0.1", 0) or return false
+    using var socket_b = net.bind_udp("127.0.0.1", 0) or return false
+    let ha = net.detach_socket(mut socket_a)
+    let hb = net.detach_socket(mut socket_b)
+    let addr_a = ha.addr
+    let addr_b = hb.addr
+    let in_a = chan[u8[]](256)
+    let in_b = chan[u8[]](256)
+    spawn pump(ha, in_a)
+    spawn pump(hb, in_b)
+    let config_a = dtls.Config { client: true, identity: ia, fingerprints: [fb], srtp_profiles: [dtls.srtp_aes128_cm_sha1_80] }
+    let config_b = dtls.Config { client: false, identity: ib, fingerprints: [fa], srtp_profiles: [dtls.srtp_aes128_cm_sha1_80] }
+    using a = session.open(config_a, transport(ha, addr_b, in_a))
+    using b = session.open(config_b, transport(hb, addr_a, in_b))
+    session.wait_connected(a.handle) or {
+        check("client connects", false)
+        return false
+    }
+    session.wait_connected(b.handle) or {
+        check("server connects", false)
+        return false
+    }
+    check("both sides connect", true)
+    let info = session.describe_session(a.handle) or return false
+    check("describe reports the suite and profile", info.state == dtls.State.Connected && info.cipher_suite == 0xC02B && info.srtp_profile == dtls.srtp_aes128_cm_sha1_80)
+    check("describe reports the peer certificate", slices.equal(info.certificate, ib.certificate))
+
+    session.send(a.handle, bytes("hello b")) or return false
+    let got = next_message(b.handle) ?? []
+    check("message reaches the server", str(got) == "hello b")
+    session.send(b.handle, bytes("hello a")) or return false
+    let back = next_message(a.handle) ?? []
+    check("message reaches the client", str(back) == "hello a")
+
+    let ka = session.export_keying_material(a.handle, "EXTRACTOR-dtls_srtp", 60) or return false
+    let kb = session.export_keying_material(b.handle, "EXTRACTOR-dtls_srtp", 60) or return false
+    check("exported keys agree", slices.equal(ka, kb) && ka.len == 60)
+
+    var tooLarge = false
+    session.send(a.handle, io.buffer(5000)) catch {
+        TooLarge => {
+            tooLarge = true
+        }
+        _ => {}
+    }
+    check("oversize message is refused", tooLarge)
+
+    session.close_session(a.handle)
+    var closed = false
+    for {
+        let e = <-b.handle.events
+        match e {
+            some(event) => match event {
+                Closed => {
+                    closed = true
+                    break
+                }
+                _ => {}
+            }
+            none => break
+        }
+    }
+    check("close_notify reaches the peer", closed)
+    var late = false
+    session.send(a.handle, bytes("late")) catch {
+        _ => {
+            late = true
+        }
+    }
+    check("send after close fails", late)
+    true
+}
+
+fn refused() -> bool {
+    let ia = identity("session a")
+    let ib = identity("session b")
+    let other = identity("session c")
+    let fo = dtls.fingerprint("sha-256", other.certificate) or return false
+    let fa = dtls.fingerprint("sha-256", ia.certificate) or return false
+    using var socket_a = net.bind_udp("127.0.0.1", 0) or return false
+    using var socket_b = net.bind_udp("127.0.0.1", 0) or return false
+    let ha = net.detach_socket(mut socket_a)
+    let hb = net.detach_socket(mut socket_b)
+    let addr_a = ha.addr
+    let addr_b = hb.addr
+    let in_a = chan[u8[]](256)
+    let in_b = chan[u8[]](256)
+    spawn pump(ha, in_a)
+    spawn pump(hb, in_b)
+    using a = session.open(dtls.Config { client: true, identity: ia, fingerprints: [fo] }, transport(ha, addr_b, in_a))
+    using b = session.open(dtls.Config { client: false, identity: ib, fingerprints: [fa] }, transport(hb, addr_a, in_b))
+    var failed = false
+    session.wait_connected(a.handle) catch {
+        Refused => {
+            failed = true
+        }
+        _ => {}
+    }
+    check("wrong fingerprint is refused", failed)
+    true
+}
+
+fn main() {
+    check("loopback pair", pair())
+    check("refusal", refused())
+}
