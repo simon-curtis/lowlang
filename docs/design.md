@@ -179,6 +179,36 @@ let n = input |> parse()?
   - A `mut` first parameter receives `x` as `mut`, as with `x.f(args)`.
 - A line that starts with `|>` or `.` continues the expression on the line before it.
 
+### Top-level statements
+
+```low
+import std/text
+
+enum Problem {
+    Negative(i64)
+}
+
+fn checked(n: i64) -> i64 ! Problem {
+    if n < 0 { fail Problem.Negative(n) }
+    n
+}
+
+let words = ["low", "level"]
+for w in words {
+    print(w)
+}
+let n = checked(text.parse_int("12") or 0)?
+print(n)
+```
+
+- Statements may stand at the top level of a file, among its declarations. In source order they form the body of the program's `main`, which takes no parameters.
+- Only the entry module may have them, in one of its files, and that module cannot also declare `fn main`. Under `low test` the tested project root may have them too, and its tests can call that `main`.
+- A top-level `let` or `var` is a local of `main`, so the module's functions cannot see it. A value the functions share is a `const` or a function.
+- Each top-level statement ends at a newline. `fn` followed by `(` starts a closure expression and any other `fn` a declaration. `pub` and `///` apply only to declarations.
+- The first `?`, `fail` or `catch M` among the statements, outside closures, gives `main` its error type, and every later one must use the same enum. Without one, `main` returns nothing. That first `fail` or `catch M` has no error type to check against, so it names the enum: `fail Problem.Negative(n)`.
+- Neither the statements nor a drop or field default can call or name `main`.
+- A final expression statement is the tail of `main`, as in any block, and its value is discarded.
+
 ### Control flow
 
 <!-- prelude
@@ -726,7 +756,7 @@ fn main() ! ParseError {
 - Where an optional `T?` is expected, `or` and `catch { arms }` produce one, so the fallback or an arm may be `none`.
 - `fn f() ! E` fails or returns nothing.
 - A result cannot be discarded, bound or passed on without `?`, `catch` or `or`, except by returning it from a function with the same result type.
-- When `main` declares `! E` and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2, as does `panic(message)`.
+- When `main` declares `! E`, or top-level statements give it one, and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2, as does `panic(message)`.
 - A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
 
 ### Embedded data
@@ -1014,7 +1044,7 @@ fn main() {
   - `prefer-const` flags a function with no parameters or type parameters that returns a number, `bool` or `str`, is never used as a value, and whose body is one expression that a constant can hold: literals, constants, operators and numeric conversions. It suggests `const name: T = ...` with the `()` dropped where the function is called.
 - `low doc dir` prints, as JSON, every module under the directory with its imports, each with the name it is used through, and its public structs, enums, constants and functions, each with its declaration as written, its file and its line. A struct shows its public fields, and `...` stands for its private ones. A function whose first parameter is a public type of its module, or a pointer to one, names that type as its receiver. Each module lists its examples with their name, source and expected output. `low doc std` documents the standard library, and the website builds its package pages from it with `-target linux/amd64`. `-target` picks the operating system whose files are documented and defaults to the host.
 - `low names file.low` type-checks the program and prints, as one JSON array, every name the file mentions: its `line` and byte `column` (both from 1), its `name`, the `hover` text and `doc` the language server shows for it, its `definition` (`path`, `line`, `column`, and `local` when it is in the same file) and `first`, the array index of the first name that resolves to the same definition. Names with the same `first` are one reference group. A field written in shorthand, as `x` in `Point { x }`, groups with the field, and the group of the local it reads starts at the shorthand when that comes first. A key is absent when the name has no such fact. A program that does not check prints the error and exits with status 1. `-target` picks the operating system whose files are checked and defaults to the host. The website build highlights and links every snippet from it.
-- Imports come before declarations and apply to their file.
+- Imports come before declarations and top-level statements and apply to their file.
 - A module is used through its last path segment, `text.shout(...)`, or through a name given with `import t = ui/text`.
 - Types are written `geometry.Shape` and built with `geometry.Point { ... }`. A variant can be named `geometry.Shape.Dot` or, where the type is expected, `Dot`.
 - Declarations and struct fields are private to their module unless marked `pub`. A `pub` enum's variants are public.
@@ -1942,7 +1972,8 @@ Building a program and running `low dev` need no external tool.
 
 Modules:
 
-- `compiler/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles. It leaves out the test files of every module except the one `low test` tests. For that module, `compiler/compiler/tests.low` loads the tested module under its own name with its test files, finds the test functions, and parses two generated files as privileged source: `__tests.low`, added to the tested module, whose `__tests()` lists each test with its name, function, file and line, and `__main.low`, the only file of the entry module, whose `main` runs that list with `std/testing`; neither has a path, so the language server never lists them. `compiler.check_tests_in` checks that build for the language server. `low test` builds each module's program with the release profile into a temporary directory and runs the program once per test, as `### Modules` describes. `compiler/low/test*.low` is the command: `test_options` reads the flags, `test_select` expands the paths, `test_build` builds and lists a module and selects its tests, `test_run` supervises the child processes and `test_report` writes the text and JSON reports. `compiler.std_test_modules` lists the embedded standard library modules that have a test file. One loader reads the program, its imports, `embed` files and the embedded standard library, which is the map `embed_dir("../../std")` returns. Files outside the embedded library are read through a `compiler.Overlay`, which holds a `compiler.Disk` (a struct of function values that read a file, stat a path, list a directory and give the working directory, and say whether a path can start with a drive letter) and puts unsaved editor text over it for the language server, which shares the loader's `root` lookup and `parse_file`. `compiler/native` supplies the `Disk` over `std/file` and `std/sys`. `compiler/check` does no file IO.
+- `compiler/parser` gathers a file's top-level statements into a `main` marked `top_level`, which `ast.declared` leaves out, so the language server lists no symbol for it and the walkers visit only its body. `compiler/check` checks that `main` before every other function, sets its error type at the first `?`, `fail` or `catch M`, and until then rejects a use of it from the statements, a drop or a field default.
+- `compiler/compiler` finds the root, loads the entry module, then loads each imported directory once, breadth first, and rejects import cycles. It rejects top-level statements in any module but the entry module and the tested root, in two files of one module, and beside `fn main`. It leaves out the test files of every module except the one `low test` tests. For that module, `compiler/compiler/tests.low` loads the tested module under its own name with its test files, finds the test functions, and parses two generated files as privileged source: `__tests.low`, added to the tested module, whose `__tests()` lists each test with its name, function, file and line, and `__main.low`, the only file of the entry module, whose `main` runs that list with `std/testing`; neither has a path, so the language server never lists them. `compiler.check_tests_in` checks that build for the language server. `low test` builds each module's program with the release profile into a temporary directory and runs the program once per test, as `### Modules` describes. `compiler/low/test*.low` is the command: `test_options` reads the flags, `test_select` expands the paths, `test_build` builds and lists a module and selects its tests, `test_run` supervises the child processes and `test_report` writes the text and JSON reports. `compiler.std_test_modules` lists the embedded standard library modules that have a test file. One loader reads the program, its imports, `embed` files and the embedded standard library, which is the map `embed_dir("../../std")` returns. Files outside the embedded library are read through a `compiler.Overlay`, which holds a `compiler.Disk` (a struct of function values that read a file, stat a path, list a directory and give the working directory, and say whether a path can start with a drive letter) and puts unsaved editor text over it for the language server, which shares the loader's `root` lookup and `parse_file`. `compiler/native` supplies the `Disk` over `std/file` and `std/sys`. `compiler/check` does no file IO.
 - `compiler/compiler`, `compiler/ir` and the modules they import reach no operating system module: `std/sys`, `std/os`, `std/file`, `parallel`, `amd64`, `asm` and `link` stay out of their import closure, and a test in `compiler/tests/compiler` loads `compiler/compiler` and fails when one appears. The environment comes in as state. `ir.Runner` is a struct holding `each`, which runs a job for each index of a range; `ir.sequential` runs the indices in order, and `native.runner` runs them on one green thread per CPU. `ir.build` builds the reachable functions in rounds over a frontier, each round through the runner and into a result slice indexed by position, and merges the results in discovery order, so the SSA does not depend on the runner. `compiler/native` composes the runner, the `Disk`, the back end and the executable writer; the root programs (`compiler/low`, `compiler/hot`, the fuzz and generator programs and the tests) call it, and `compiler/lsp` takes its `Overlay` from the root that starts it. `native.Error` wraps `compiler.Error` and adds the back end, assembler and linker errors.
 - `compiler/playground` is the compiler built for `browser/wasm32`. It reads one program from standard input as `main.low` through a `Disk` that holds no files, builds it with `ir.sequential` and the release profile, and writes the module to standard output. Warnings and errors go to standard error as `low build` writes them, and an error exits with status 1. It carries the whole embedded library, so a program the browser cannot build is rejected with the same message as natively.
 - Every file records its module path and every source position its file, so errors name the file they come from.

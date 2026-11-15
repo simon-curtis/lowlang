@@ -147,7 +147,7 @@ A snippet that has a `main` (declared, or made from its loose statements), embed
 
 ### Checked snippets
 
-`low names` checks each Low snippet as a program: every `low` fence in the docs and in a std doc comment, and every `data-lang="low"` block in `site/content/`. Declarations stay at the top level and loose statements go inside `fn main()`, and `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. A std example that does not import its own module checks with that import added. The build lists every snippet that fails to check and then fails. It fails when a prefix in `site/gen/categories.low` names no module, and when a std module has no category.
+`low names` checks each Low snippet as a program: every `low` fence in the docs and in a std doc comment, and every `data-lang="low"` block in `site/content/`. Declarations and loose statements stay at the top level, where the statements form `main` as `### Top-level statements` describes; in a snippet that declares `fn main` the statements go inside `fn snippet()`. `///` lines stay with the declaration below them. A `...` standing for elided code checks as a diverging loop. A std example that does not import its own module checks with that import added. The build lists every snippet that fails to check and then fails. It fails when a prefix in `site/gen/categories.low` names no module, and when a std module has no category.
 
 HTML comments directly above a `low` fence in `docs/design.md` or `editors/README.md` supply context readers do not see. Blocks in `site/content/` do not read them.
 

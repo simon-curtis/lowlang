@@ -1,0 +1,603 @@
+import ast
+import compiler
+import diag
+import lexer
+import types
+import std/builder
+import std/text
+
+const rewrite_kind = "refactor.rewrite"
+const into_main_title = "Move the statements into fn main"
+const out_of_main_title = "Move fn main to the top level"
+
+pub const toggle_main_command = "low.toggleMain"
+
+struct Rewrite {
+    server: *Server
+    uri: str
+    file_path: str
+    file: *ast.File
+    text: Text
+    line: i64? = none
+}
+
+struct Item {
+    from: i64
+    to: i64
+    statement: bool
+}
+
+struct Extent {
+    start: i64
+    end: i64
+}
+
+struct Layout {
+    lines: []str
+    tokens: []lexer.Token
+    items: []Item
+}
+
+struct Scan {
+    first: ast.Node? = none
+    main: bool = false
+}
+
+fn toggled(s: *Server, uri: str) -> CodeAction? {
+    let file_path = path_of(uri)
+    let file = server_parsed(s, file_path) ?? return none
+    let r = Rewrite { server: s, uri, file_path, file, text: server_text(s, file_path) }
+    let src = text.join(r.text.lines, "\n")
+    let l = layout_of(src) ?? return none
+    let gathered = into_main(r, l)
+    match gathered {
+        some(action) => action
+        none => out_of_main(r, l)
+    }
+}
+
+fn rewrites(r: Rewrite) -> []CodeAction {
+    var actions: []CodeAction = []
+    let src = text.join(r.text.lines, "\n")
+    let l = layout_of(src) ?? return actions
+    let gathered = into_main(r, l)
+    match gathered {
+        some(action) => push(mut actions, action)
+        none => {}
+    }
+    let spread = out_of_main(r, l)
+    match spread {
+        some(action) => push(mut actions, action)
+        none => {}
+    }
+    actions
+}
+
+fn layout_of(src: str) -> Layout? {
+    let origin = diag.start("")
+    let tokens = lexer.lex(src, origin, false) catch {
+        _ => return none
+    }
+    var items: []Item = []
+    var from = -1
+    var depth = 0
+    var i = 0
+    for i < tokens.len && tokens[i].kind != lexer.Kind.EOF {
+        let kind = tokens[i].kind
+        if from < 0 && kind != lexer.Kind.Newline {
+            from = i
+        }
+        depth += nesting(kind)
+        if kind == lexer.Kind.Newline && depth == 0 && from >= 0 {
+            let found = item_of(tokens, from, i - 1)
+            push(mut items, found)
+            from = -1
+        }
+        i += 1
+    }
+    if from >= 0 {
+        let found = item_of(tokens, from, i - 1)
+        push(mut items, found)
+    }
+    Layout { lines: text.split(src, '\n'), tokens, items }
+}
+
+fn nesting(kind: lexer.Kind) -> i64 {
+    match kind {
+        LParen => 1
+        LBracket => 1
+        LBrace => 1
+        RParen => -1
+        RBracket => -1
+        RBrace => -1
+        _ => 0
+    }
+}
+
+fn item_of(tokens: []lexer.Token, from: i64, to: i64) -> Item {
+    Item { from, to, statement: !opens_declaration(tokens, from) }
+}
+
+fn opens_declaration(tokens: []lexer.Token, at: i64) -> bool {
+    match tokens[at].kind {
+        Fn => at + 1 < tokens.len && tokens[at + 1].kind != lexer.Kind.LParen
+        Pub => true
+        Enum => true
+        Struct => true
+        Const => true
+        Extern => true
+        Import => true
+        _ => false
+    }
+}
+
+fn first_line(l: Layout, it: Item) -> i64 {
+    l.tokens[it.from].pos.line - 1
+}
+
+fn last_line(l: Layout, it: Item) -> i64 {
+    l.tokens[it.to].pos.line - 1
+}
+
+fn extent(l: Layout, index: i64) -> Extent {
+    let it = l.items[index]
+    var floor = -1
+    if index > 0 {
+        floor = last_line(l, l.items[index - 1])
+    }
+    var start = first_line(l, it)
+    for start - 1 > floor && comment(l.lines[start - 1]) {
+        start -= 1
+    }
+    Extent { start, end: last_line(l, it) }
+}
+
+fn comment(line: str) -> bool {
+    let trimmed = text.trim(line)
+    text.starts_with(trimmed, "//")
+}
+
+fn blank(line: str) -> bool {
+    text.trim(line) == ""
+}
+
+fn statement_extents(l: Layout) -> []Extent {
+    var extents: []Extent = []
+    for i, it in l.items {
+        if it.statement {
+            let e = extent(l, i)
+            push(mut extents, e)
+        }
+    }
+    extents
+}
+
+fn covers(r: Rewrite, extents: []Extent) -> bool {
+    for e in extents {
+        if chosen(r, e.start, e.end) {
+            return true
+        }
+    }
+    false
+}
+
+fn chosen(r: Rewrite, from: i64, to: i64) -> bool {
+    let line = r.line ?? return true
+    line >= from && line <= to
+}
+
+fn file_indent(l: Layout) -> str {
+    for line in l.lines {
+        let lead = leading_space(line)
+        if lead.len > 0 && !blank(line) {
+            return lead
+        }
+    }
+    default_indent
+}
+
+fn declared_main(file: *ast.File) -> *ast.Func? {
+    for f in ast.declared_funcs(file) {
+        if f.name == "main" {
+            return f
+        }
+    }
+    none
+}
+
+fn into_main(r: Rewrite, l: Layout) -> CodeAction? {
+    let code = top_level_code(r.file) ?? return none
+    let body = code.body ?? return none
+    if declared_main(r.file) != none {
+        return none
+    }
+    let extents = statement_extents(l)
+    if extents.len != statement_count(body) || !covers(r, extents) {
+        return none
+    }
+    let error = main_error(r, body) ?? return none
+    let block = main_block(l, extents, error.name)
+    var out: []str = []
+    var after_imports = -1
+    let added = "import {error.module}"
+    if error.module != "" {
+        if r.file.imports.len == 0 {
+            push(mut out, added)
+            push(mut out, "")
+        } else {
+            after_imports = r.file.imports[r.file.imports.len - 1].pos.line - 1
+        }
+    }
+    var n = 0
+    var k = 0
+    for n < l.lines.len {
+        if k < extents.len && n == extents[k].start {
+            if k == 0 {
+                for moved in block {
+                    push(mut out, moved)
+                }
+            }
+            n = extents[k].end + 1
+            if k > 0 && (out.len == 0 || blank(out[out.len - 1])) {
+                n = past_blanks(l, n)
+            }
+            k += 1
+            continue
+        }
+        push(mut out, l.lines[n])
+        if n == after_imports {
+            push(mut out, added)
+        }
+        n += 1
+    }
+    let trimmed = single_final_blank(out)
+    rewrite_action(r, into_main_title, trimmed)
+}
+
+fn main_block(l: Layout, extents: []Extent, error: str) -> []str {
+    let unit = file_indent(l)
+    var clause = ""
+    if error != "" {
+        clause = " ! {error}"
+    }
+    var block: []str = ["fn main(){clause} {{"]
+    for k, e in extents {
+        if k > 0 && gap(l, extents[k - 1].end + 1, e.start) {
+            push(mut block, "")
+        }
+        for n in e.start..e.end + 1 {
+            let moved = indented(l.lines[n], unit)
+            push(mut block, moved)
+        }
+    }
+    push(mut block, "}}")
+    block
+}
+
+fn past_blanks(l: Layout, from: i64) -> i64 {
+    var n = from
+    for n < l.lines.len - 1 && blank(l.lines[n]) {
+        n += 1
+    }
+    n
+}
+
+fn single_final_blank(lines: []str) -> []str {
+    var out = lines
+    for out.len > 1 && blank(out[out.len - 1]) && blank(out[out.len - 2]) {
+        out = out[..out.len - 1]
+    }
+    out
+}
+
+fn statement_count(body: *ast.Block) -> i64 {
+    if body.tail == none {
+        return body.stmts.len
+    }
+    body.stmts.len + 1
+}
+
+fn gap(l: Layout, from: i64, to: i64) -> bool {
+    for n in from..to {
+        if blank(l.lines[n]) {
+            return true
+        }
+    }
+    false
+}
+
+fn indented(line: str, unit: str) -> str {
+    if blank(line) {
+        return ""
+    }
+    "{unit}{line}"
+}
+
+fn main_error(r: Rewrite, body: *ast.Block) -> Spelled? {
+    if adopting(body) == none {
+        return Spelled { name: "" }
+    }
+    let state = state_of(r.server, r.file_path)
+    let docs = state.docs ?? return none
+    let compiled = compiler.overlay_read(docs, r.file_path) or return none
+    let current = compiler.overlay_read(r.server.docs, r.file_path) or return none
+    if compiled != current {
+        return none
+    }
+    let checked = server_checked(r.server, r.file_path) ?? return none
+    let code = top_level_code(checked) ?? return none
+    let ret = code.ret_type ?? return none
+    if ret.kind != types.Kind.ResultKind {
+        return Spelled { name: "" }
+    }
+    let err = ret.err ?? return none
+    spell(r.file, err.name)
+}
+
+fn adopting(b: *ast.Block) -> ast.Node? {
+    let finder = new(Scan {})
+    let root = ast.Node.Expr(ast.Expr.Block(b))
+    ast.inspect(root, fn(n: ast.Node) -> bool { find_adopting(finder, n) })
+    finder.first
+}
+
+fn find_adopting(finder: *Scan, n: ast.Node) -> bool {
+    if finder.first != none {
+        return false
+    }
+    match n {
+        Expr(e) => {
+            match e {
+                Try(x) => {
+                    finder.first = n
+                }
+                Catch(x) => {
+                    if x.map != none {
+                        finder.first = n
+                    }
+                }
+                Closure(x) => return false
+                _ => {}
+            }
+        }
+        Stmt(s) => {
+            match s {
+                Fail(x) => {
+                    finder.first = n
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn names_main(b: *ast.Block) -> bool {
+    let finder = new(Scan {})
+    let root = ast.Node.Expr(ast.Expr.Block(b))
+    ast.inspect(root, fn(n: ast.Node) -> bool { find_main(finder, n) })
+    finder.main
+}
+
+fn find_main(finder: *Scan, n: ast.Node) -> bool {
+    match n {
+        Expr(e) => {
+            match e {
+                Ident(x) => {
+                    if x.name == "main" {
+                        finder.main = true
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    !finder.main
+}
+
+fn entry_module(r: Rewrite) -> bool {
+    let checked = server_checked(r.server, r.file_path) ?? return true
+    checked.module == "" || checked.module == compiler.tested_root
+}
+
+fn item_at(l: Layout, line: i64) -> i64 {
+    for i, it in l.items {
+        if line >= first_line(l, it) && line <= last_line(l, it) {
+            return i
+        }
+    }
+    -1
+}
+
+fn opening(l: Layout, it: Item) -> i64 {
+    for i in it.from..it.to + 1 {
+        if l.tokens[i].kind == lexer.Kind.LBrace {
+            return i
+        }
+    }
+    -1
+}
+
+struct Qualifier {
+    line: i64 = -1
+    col: i64 = 0
+    prefix: str = ""
+}
+
+fn qualifier(f: *ast.Func, body: *ast.Block) -> Qualifier {
+    if f.error == none {
+        return Qualifier {}
+    }
+    let first = adopting(body) ?? return Qualifier {}
+    let value = error_variant(first) ?? return Qualifier {}
+    let at = bare_variant(value) ?? return Qualifier {}
+    Qualifier { line: at.line - 1, col: at.col - 1, prefix: "{ast.type_text(f.error)}." }
+}
+
+fn error_variant(n: ast.Node) -> ast.Expr? {
+    match n {
+        Stmt(s) => {
+            match s {
+                Fail(x) => x.value
+                _ => none
+            }
+        }
+        Expr(e) => {
+            match e {
+                Catch(x) => {
+                    let mapper = x.map ?? return none
+                    mapper.callee
+                }
+                _ => none
+            }
+        }
+        _ => none
+    }
+}
+
+fn bare_variant(e: ast.Expr) -> diag.Pos? {
+    match e {
+        Ident(x) => if upper(x.name) { x.pos } else { none }
+        Call(x) => bare_variant(x.callee)
+        _ => none
+    }
+}
+
+fn upper(name: str) -> bool {
+    name.len > 0 && name[0] >= 'A' && name[0] <= 'Z'
+}
+
+fn qualified(line: str, n: i64, q: Qualifier) -> str {
+    if n != q.line || q.col > line.len {
+        return line
+    }
+    "{line[..q.col]}{q.prefix}{line[q.col..]}"
+}
+
+fn dedented(line: str, unit: str) -> str {
+    if blank(line) {
+        return ""
+    }
+    text.strip_prefix(line, unit) ?? line
+}
+
+fn undocumented(line: str) -> str {
+    let trimmed = text.trim(line)
+    if text.starts_with(trimmed, "///") {
+        return "//{trimmed[3..]}"
+    }
+    line
+}
+
+fn out_of_main(r: Rewrite, l: Layout) -> CodeAction? {
+    if top_level_code(r.file) != none {
+        return none
+    }
+    let f = declared_main(r.file) ?? return none
+    if f.params.len > 0 || f.type_params.len > 0 || f.result != none {
+        return none
+    }
+    let body = f.body ?? return none
+    if body.stmts.len == 0 && body.tail == none || names_main(body) || !entry_module(r) {
+        return none
+    }
+    let index = item_at(l, f.pos.line - 1)
+    if index < 0 {
+        return none
+    }
+    let it = l.items[index]
+    let header = first_line(l, it)
+    if !chosen(r, header, header) {
+        return none
+    }
+    let open = opening(l, it)
+    if open < 0 || l.tokens[it.to].kind != lexer.Kind.RBrace {
+        return none
+    }
+    let q = qualifier(f, body)
+    let inner = body_lines(l, open, it.to, q) ?? return none
+    let e = extent(l, index)
+    var out: []str = []
+    for n in 0..e.start {
+        push(mut out, l.lines[n])
+    }
+    for n in e.start..header {
+        let kept = undocumented(l.lines[n])
+        push(mut out, kept)
+    }
+    for line in inner {
+        push(mut out, line)
+    }
+    for n in e.end + 1..l.lines.len {
+        push(mut out, l.lines[n])
+    }
+    rewrite_action(r, out_of_main_title, out)
+}
+
+fn body_lines(l: Layout, open: i64, close: i64, q: Qualifier) -> []str? {
+    let first = l.tokens[open].pos.line - 1
+    let last = l.tokens[close].pos.line - 1
+    if first == last {
+        let line = qualified(l.lines[first], first, q)
+        var stop = l.tokens[close].pos.col - 1
+        if q.line == first && q.col < stop {
+            stop += q.prefix.len
+        }
+        let inner = text.trim(line[l.tokens[open].pos.col..stop])
+        return [inner]
+    }
+    if l.tokens[open + 1].pos.line - 1 == first || l.tokens[close - 1].pos.line - 1 == last {
+        return none
+    }
+    var unit = ""
+    for n in first + 1..last {
+        if !blank(l.lines[n]) {
+            unit = leading_space(l.lines[n])
+            break
+        }
+    }
+    var lines: []str = []
+    for n in first + 1..last {
+        let line = qualified(l.lines[n], n, q)
+        let moved = dedented(line, unit)
+        push(mut lines, moved)
+    }
+    lines
+}
+
+fn rewrite_action(r: Rewrite, title: str, out: []str) -> CodeAction {
+    let edit = line_edit(r.text, out)
+    let changes: [str: []TextEdit] = [r.uri: [edit]]
+    CodeAction { title, kind: rewrite_kind, edit: WorkspaceEdit { changes } }
+}
+
+fn line_edit(t: Text, out: []str) -> TextEdit {
+    let old = t.lines
+    var p = 0
+    for p < old.len && p < out.len && old[p] == out[p] {
+        p += 1
+    }
+    var q = 0
+    for q < old.len - p && q < out.len - p && old[old.len - 1 - q] == out[out.len - 1 - q] {
+        q += 1
+    }
+    let old_end = old.len - q
+    let replaced = out[p..out.len - q]
+    if old_end < old.len {
+        var b = builder.builder()
+        for line in replaced {
+            b.write("{line}\n")
+        }
+        let range = Range { start: Position { line: p }, end: Position { line: old_end } }
+        return TextEdit { range, new_text: b.to_str() }
+    }
+    let last = old.len - 1
+    let eol = Position { line: last, character: utf16_col(t, last, old[last].len) }
+    let joined = text.join(replaced, "\n")
+    if p < old.len {
+        return TextEdit { range: Range { start: Position { line: p }, end: eol }, new_text: joined }
+    }
+    TextEdit { range: Range { start: eol, end: eol }, new_text: "\n{joined}" }
+}

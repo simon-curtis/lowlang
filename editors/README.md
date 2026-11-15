@@ -1,8 +1,9 @@
 # Editor support
 
 - Zed and Neovim highlight with the `tree-sitter-low` grammar; VS Code uses the TextMate grammar in `vscode/syntaxes`.
-- All three start `low lsp`: diagnostics, hover, go-to-definition, references, rename, document and workspace symbols, completion, signature help, inlay hints for inferred types, and code actions on `?`. Rename and inlay hints answer only when the program compiles. In a `_test` file they analyse the test build of its module, so they reach the module's private functions and report its test signature errors.
+- All three start `low lsp`: diagnostics, hover, go-to-definition, references, rename, document and workspace symbols, completion, signature help, inlay hints for inferred types, and code actions on `?`, on statements outside a function and on `fn main`. Rename and inlay hints answer only when the program compiles. In a `_test` file they analyse the test build of its module, so they reach the module's private functions and report its test signature errors.
 - At a `?`, the code actions offer `Catch the error`, which rewrites it as `catch { e => ... }`, and `Ignore the error with or`, which rewrites it as `or ...`; in an editor that accepts snippet edits (Zed, VS Code), each leaves the cursor where the handler goes. When the check fails because the enclosing function declares no error type, they also offer `Add ! E to f`, which declares the operand's error type on that function and imports its module if needed.
+- On a statement outside a function, the code actions offer `Move the statements into fn main`, which gathers every top-level statement, with the comments above it, into `fn main` at the first statement and declares the error type the statements gave `main`, importing its module if needed; when that type comes from a check that has not finished on the current text, the action is left out. On the `fn main` line of a `main` that takes no parameters and returns nothing, in the entry module, they offer `Move fn main to the top level`, which puts its body where the declaration was, turns its `///` comment into `//` and names the error enum on a first `fail` that leaves it out. Both are `refactor.rewrite` actions. The server also runs them as the `low.toggleMain` command of `workspace/executeCommand`, whose one argument is the document URI: it applies whichever rewrite the file allows wherever the cursor is, and fails when neither applies.
 - `low run compiler/tests/editors` compares each list with the lexer and the checker and fails when one lacks or adds a name. The tree-sitter grammar and highlight query list keywords, contextual keywords, builtin functions, types and constants. The TextMate grammar lists those and the constraints. `site/gen/highlight.low` lists keywords, contextual keywords, types and constants.
 
 `low` must be on `PATH`:
@@ -33,7 +34,7 @@ npm run package
 code --install-extension lowlang-0.1.0.vsix
 ```
 
-The `lowlang.server.path` setting overrides the `low` binary. The `Low: Restart Language Server` command restarts it.
+The `lowlang.server.path` setting overrides the `low` binary. The `Low: Restart Language Server` command restarts it, and `Low: Toggle Top-Level Statements and fn main` runs `low.toggleMain` on the active file.
 
 ## Zed
 
@@ -49,4 +50,4 @@ Requires Neovim 0.11 or later. With lazy.nvim:
 
 Without a plugin manager, add `editors/nvim` to `runtimepath` and run `nvim -l editors/nvim/build.lua` once. The build compiles the parser to `editors/nvim/parser/low.so` with `cc`.
 
-The plugin enables the `low` language server unless `vim.g.low_lsp = false`. Indentation uses nvim-treesitter's `indentexpr` when nvim-treesitter is installed, and `cindent` otherwise.
+The plugin enables the `low` language server unless `vim.g.low_lsp = false`. Indentation uses nvim-treesitter's `indentexpr` when nvim-treesitter is installed, and `cindent` otherwise. `:LowToggleMain` runs `low.toggleMain` on the current buffer.

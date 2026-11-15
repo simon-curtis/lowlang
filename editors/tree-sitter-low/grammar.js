@@ -46,7 +46,8 @@ module.exports = grammar({
   rules: {
     source_file: $ => seq(
       repeat($.import_declaration),
-      repeat($._declaration),
+      repeat(choice($._declaration, seq($._statement, $._newline))),
+      optional($._statement),
     ),
 
     comment: _ => token(seq('//', /[^\n]*/)),
