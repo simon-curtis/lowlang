@@ -1,0 +1,228 @@
+import std/io
+import std/net
+import std/ssh/wire
+import std/sync
+
+const relay_buffer = 32768
+
+fn pump_in(tcp: net.ConnHandle, h: *ChannelHandle, done: chan[bool]) {
+    let buf = io.buffer(relay_buffer)
+    for {
+        let n = net.read_on(tcp, buf) catch {
+            e => break
+        }
+        if n == 0 {
+            break
+        }
+        write_on(h, buf[..n]) catch {
+            e => break
+        }
+    }
+    close_write_on(h) or {}
+    done <- true
+}
+
+fn peer_has_closed(h: *ChannelHandle) -> bool {
+    sync.lock(h.lock)
+    defer sync.unlock(h.lock)
+    h.peer_closed
+}
+
+/// Copies bytes between the TCP connection `tcp` and the channel `h` in both directions until both ends are done.
+///
+/// An end of input on one side becomes a half-close of the other: the channel gets `eof` when `tcp` reaches its end, and `tcp` has its sending side shut down when the channel's peer sends `eof`. When the channel's peer closes the channel the TCP connection is closed. The caller still owns `tcp` and the channel and closes them afterwards.
+pub fn relay(tcp: net.ConnHandle, h: *ChannelHandle) {
+    let done = chan[bool](1)
+    spawn pump_in(tcp, h, done)
+    let buf = io.buffer(relay_buffer)
+    for {
+        let n = read_on(h, buf) catch {
+            e => break
+        }
+        if n == 0 {
+            break
+        }
+        net.write_all_on(tcp, buf[..n]) catch {
+            e => break
+        }
+    }
+    if peer_has_closed(h) {
+        net.close_on(tcp)
+    } else {
+        net.shutdown_write_on(tcp) or {}
+    }
+    let finished = <-done
+}
+
+fn serve_connected(inc: Incoming, h: net.ConnHandle) {
+    using tcp = net.adopt(h)
+    using ch = accept(inc) or return
+    relay(tcp.handle, ch.handle)
+}
+
+/// Handles a `direct-tcpip` channel the client opened: connects to the target it names and relays between the two.
+///
+/// Meant to be called from `ServerConfig.channels`. Rejects the channel with `open_connect_failed` when the connection fails and with `open_administratively_prohibited` for a malformed request. It connects to any target, so a server that restricts forwarding checks `parse_direct_tcpip` first.
+pub fn serve_direct_tcpip(inc: Incoming) {
+    let target = parse_direct_tcpip(inc) catch {
+        e => {
+            reject(inc, open_administratively_prohibited, "malformed request")
+            return
+        }
+    }
+    let h = net.dial_handle(target.host, target.port) catch {
+        e => {
+            reject(inc, open_connect_failed, "connection failed")
+            return
+        }
+    }
+    serve_connected(inc, h)
+}
+
+/// Handles a `direct-streamlocal@openssh.com` channel the client opened: connects to the Unix socket it names and relays between the two.
+///
+/// Meant to be called from `ServerConfig.channels`. It connects to any path, so a server that restricts forwarding checks `parse_direct_streamlocal` first.
+pub fn serve_direct_streamlocal(inc: Incoming) {
+    let path = parse_direct_streamlocal(inc) catch {
+        e => {
+            reject(inc, open_administratively_prohibited, "malformed request")
+            return
+        }
+    }
+    let address = net.unix_addr(path) catch {
+        e => {
+            reject(inc, open_connect_failed, "connection failed")
+            return
+        }
+    }
+    using tcp = net.connect(address) catch {
+        e => {
+            reject(inc, open_connect_failed, "connection failed")
+            return
+        }
+    }
+    using ch = accept(inc) or return
+    relay(tcp.handle, ch.handle)
+}
+
+fn bind_address(host: str) -> str {
+    if host == "" || host == "*" || host == "localhost" {
+        return "127.0.0.1"
+    }
+    host
+}
+
+fn forwarded_one(c: *ConnectionHandle, h: net.ConnHandle, host: str, port: i64) {
+    using tcp = net.adopt(h)
+    var extra: []u8 = []
+    wire.put_str(mut extra, host)
+    wire.put_u32(mut extra, port)
+    wire.put_str(mut extra, net.format_ip(h.remote.ip))
+    wire.put_u32(mut extra, h.remote.port)
+    let opened = open_channel(c, "forwarded-tcpip", extra) catch {
+        e => return
+    }
+    using ch = Channel { handle: opened }
+    relay(tcp.handle, ch.handle)
+}
+
+fn accept_forwarded(c: *ConnectionHandle, listener: net.ListenerHandle, host: str, port: i64) {
+    for {
+        let h = net.accept_handle(listener) catch {
+            e => return
+        }
+        spawn forwarded_one(c, h, host, port)
+    }
+}
+
+fn start_forward(req: GlobalRequest) -> GlobalAnswer {
+    let address = parse_forward_request(req) catch {
+        e => return GlobalAnswer {}
+    }
+    using var socket = net.listen(bind_address(address.host), address.port) catch {
+        e => return GlobalAnswer {}
+    }
+    let listener = net.detach_listener(mut socket)
+    let bound = listener.addr.port
+    let c = req.conn
+    sync.lock(c.lock)
+    c.listeners[forward_key(address.host, bound)] = listener
+    sync.unlock(c.lock)
+    spawn accept_forwarded(c, listener, address.host, bound)
+    var data: []u8 = []
+    if address.port == 0 {
+        wire.put_u32(mut data, bound)
+    }
+    GlobalAnswer { ok: true, data }
+}
+
+fn stop_forward(req: GlobalRequest) -> GlobalAnswer {
+    let address = parse_forward_request(req) catch {
+        e => return GlobalAnswer {}
+    }
+    let c = req.conn
+    sync.lock(c.lock)
+    let found = c.listeners[forward_key(address.host, address.port)]
+    delete(mut c.listeners, forward_key(address.host, address.port))
+    sync.unlock(c.lock)
+    match found {
+        some(listener) => {
+            net.close_listener_on(listener)
+            GlobalAnswer { ok: true }
+        }
+        none => GlobalAnswer {}
+    }
+}
+
+/// Handles the global requests `tcpip-forward` and `cancel-tcpip-forward`: listens on the requested address and opens a `forwarded-tcpip` channel for each connection.
+///
+/// Meant to be used as `ServerConfig.global`. The names `""`, `*` and `localhost` listen on the loopback address only; any other host is bound as written. A port of 0 picks a free one and the reply reports it. Listeners close with the connection. Every other request fails.
+pub fn forward_global(req: GlobalRequest) -> GlobalAnswer {
+    if req.kind == "tcpip-forward" {
+        return start_forward(req)
+    }
+    if req.kind == "cancel-tcpip-forward" {
+        return stop_forward(req)
+    }
+    GlobalAnswer {}
+}
+
+/// A local listening socket whose connections are forwarded to a target the server connects to, made by `listen_local`.
+///
+/// Dropping it closes the socket. Connections already forwarded continue.
+pub struct LocalForward {
+    /// The address the socket listens on.
+    pub host: str
+    /// The port the socket listens on, which is the port the system chose when 0 was requested.
+    pub port: i64
+    handle: net.ListenerHandle
+    drop net.close_listener_on(handle)
+}
+
+fn local_one(c: *ConnectionHandle, h: net.ConnHandle, remote_host: str, remote_port: i64) {
+    using tcp = net.adopt(h)
+    let opened = open_direct_tcpip(c, remote_host, remote_port, net.format_ip(h.remote.ip), h.remote.port) catch {
+        e => return
+    }
+    using ch = Channel { handle: opened }
+    relay(tcp.handle, ch.handle)
+}
+
+fn accept_local(c: *ConnectionHandle, listener: net.ListenerHandle, remote_host: str, remote_port: i64) {
+    for {
+        let h = net.accept_handle(listener) catch {
+            e => return
+        }
+        spawn local_one(c, h, remote_host, remote_port)
+    }
+}
+
+/// Listens on `host` and `port` and forwards each connection to `remote_host` and `remote_port` through a `direct-tcpip` channel, as `ssh -L` does.
+///
+/// With port 0 the system picks a port, which the result reports. Fails with `Io` when the socket cannot be bound.
+pub fn listen_local(conn: Connection, host: str, port: i64, remote_host: str, remote_port: i64) -> LocalForward ! Error {
+    using var socket = net.listen(host, port) catch Io
+    let listener = net.detach_listener(mut socket)
+    spawn accept_local(conn.handle, listener, remote_host, remote_port)
+    LocalForward { host, port: listener.addr.port, handle: listener }
+}

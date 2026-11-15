@@ -1,0 +1,484 @@
+import std/crypto
+import std/crypto/x509
+import std/file
+import std/io
+import std/net
+import std/process
+import std/ssh
+import std/ssh/key
+import std/testing
+
+fn error_name(e: Error) -> str {
+    match e {
+        Io(cause) => "Io"
+        NotFound => "NotFound"
+        PermissionDenied => "PermissionDenied"
+        Failure(message) => "Failure"
+        BadMessage => "BadMessage"
+        Unsupported => "Unsupported"
+        Closed => "Closed"
+        Protocol => "Protocol"
+        Invalid => "Invalid"
+    }
+}
+
+fn pattern(n: i64, seed: i64) -> []u8 {
+    var out = io.buffer(n)
+    var state = seed * 2654435761 + 12345
+    for i in 0..n {
+        state = (state * 6364136223846793005 + 1442695040888963407) & 0x7FFFFFFFFFFFFFFF
+        out[i] = u8((state >> 33) & 0xFF)
+    }
+    out
+}
+
+fn same(a: []u8, b: []u8) -> bool {
+    str(a) == str(b)
+}
+
+fn serve_in(stream: io.Stream, root: str) {
+    serve(stream, root) or {}
+}
+
+fn expect_failure(t: *testing.T, what: str, wanted: str, failed: str) {
+    testing.error_if(t, failed != wanted, "{what}: wanted {wanted}, got {failed}")
+}
+
+fn open_failure(c: *Session, path: str, flags: OpenFlags) -> str {
+    using f = open_file(c, path, flags, Attrs {}) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn stat_failure(c: *Session, path: str) -> str {
+    let a = stat(c, path) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn read_failure(c: *Session, path: str) -> str {
+    let data = read_file(c, path) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn rmdir_failure(c: *Session, path: str) -> str {
+    rmdir(c, path) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn remove_failure(c: *Session, path: str) -> str {
+    remove(c, path) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn rename_failure(c: *Session, from: str, to: str) -> str {
+    rename(c, from, to) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn list_failure(c: *Session, path: str) -> str {
+    let entries = list(c, path) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn write_failure(c: *Session, path: str) -> str {
+    write_file(c, path, bytes("overwritten"), 0o644) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn names_of(entries: []Entry) -> str {
+    var out = ""
+    for e in entries {
+        out = "{out}{e.name},"
+    }
+    out
+}
+
+fn test_files_round_trip(t: *testing.T) {
+    let root = file.temp_dir("sftp-files") or panic("temp dir")
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_in(net.stream(ends.second), root)
+    using client = connect(net.stream(ends.first)) or panic("connect")
+    let c = client.handle
+    write_file(c, "hello.txt", bytes("hello world"), 0o640) or panic("write_file")
+    let back = read_file(c, "hello.txt") or panic("read_file")
+    testing.error_if(t, str(back) != "hello world", "read back {str(back)}")
+    let on_disk = file.read_text("{root}/hello.txt") or panic("disk")
+    testing.error_if(t, on_disk != "hello world", "server file holds {on_disk}")
+    let info = stat(c, "hello.txt") or panic("stat")
+    testing.error_if(t, info.size != 11, "size {info.size ?? -1}")
+    testing.error_if(t, !is_regular(info), "hello.txt must be a regular file")
+    file.remove_all(root) or panic("remove")
+}
+
+fn test_large_transfer_is_pipelined_and_exact(t: *testing.T) {
+    let root = file.temp_dir("sftp-large") or panic("temp dir")
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_in(net.stream(ends.second), root)
+    using client = connect(net.stream(ends.first)) or panic("connect")
+    let c = client.handle
+    let size = 5 * 1024 * 1024 + 123
+    let data = pattern(size, 7)
+    using out = open_file(c, "big.bin", OpenFlags { write: true, create: true, truncate: true }, Attrs { permissions: 0o644 }) or panic("open")
+    var at = 0
+    for at < size {
+        var end = at + 100000
+        if end > size {
+            end = size
+        }
+        write(out, data[at..end]) or panic("write")
+        at = end
+    }
+    close(out) or panic("close")
+    let stored = file.read_file("{root}/big.bin") or panic("disk read")
+    testing.error_if(t, stored.len != size, "stored {stored.len} bytes")
+    testing.error_if(t, !same(stored, data), "stored bytes differ")
+    using input = open_file(c, "big.bin", OpenFlags { read: true }, Attrs {}) or panic("open read")
+    var all: []u8 = []
+    let buf = io.buffer(70000)
+    for {
+        let n = read(input, buf) or panic("read")
+        if n == 0 {
+            break
+        }
+        io.append(mut all, buf[..n])
+    }
+    testing.error_if(t, !same(all, data), "sequential read differs ({all.len} bytes)")
+    let window = io.buffer(5000)
+    let n = read_at(input, 3000000, window) or panic("read_at")
+    testing.error_if(t, !same(window[..n], data[3000000..3000000 + n]), "random read differs")
+    seek(input, 4000000) or panic("seek")
+    let tail = io.buffer(1000)
+    let m = read(input, tail) or panic("read after seek")
+    testing.error_if(t, !same(tail[..m], data[4000000..4000000 + m]), "read after seek differs")
+    file.remove_all(root) or panic("remove")
+}
+
+fn test_stream_view_copies_files(t: *testing.T) {
+    let root = file.temp_dir("sftp-stream") or panic("temp dir")
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_in(net.stream(ends.second), root)
+    using client = connect(net.stream(ends.first)) or panic("connect")
+    let c = client.handle
+    let data = pattern(300000, 3)
+    using out = open_file(c, "copy.bin", OpenFlags { write: true, create: true, truncate: true }, Attrs {}) or panic("open")
+    let sink = stream(out)
+    io.write_all(sink, data) or panic("write_all")
+    close(out) or panic("close")
+    using input = open_file(c, "copy.bin", OpenFlags { read: true }, Attrs {}) or panic("open read")
+    let source = io.reader(stream(input))
+    let got = io.read_exact(source, data.len) or panic("read_exact")
+    testing.error_if(t, !same(got, data), "stream copy differs")
+    file.remove_all(root) or panic("remove")
+}
+
+fn test_directories_and_names(t: *testing.T) {
+    let root = file.temp_dir("sftp-dirs") or panic("temp dir")
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_in(net.stream(ends.second), root)
+    using client = connect(net.stream(ends.first)) or panic("connect")
+    let c = client.handle
+    mkdir(c, "sub", 0o755) or panic("mkdir")
+    write_file(c, "sub/b.txt", bytes("b"), 0o644) or panic("b")
+    write_file(c, "sub/a.txt", bytes("a"), 0o644) or panic("a")
+    write_file(c, "sub/c.txt", bytes("c"), 0o644) or panic("c")
+    let listed = list(c, "sub") or panic("list")
+    testing.error_if(t, names_of(listed) != "a.txt,b.txt,c.txt,", "listing {names_of(listed)}")
+    for e in listed {
+        testing.error_if(t, !is_regular(e.attrs), "{e.name} must be regular")
+    }
+    let top = list(c, ".") or panic("list root")
+    testing.error_if(t, names_of(top) != "sub,", "root listing {names_of(top)}")
+    testing.error_if(t, !is_dir(top[0].attrs), "sub must be a directory")
+    expect_failure(t, "rmdir of a full directory", "Failure", rmdir_failure(c, "sub"))
+    remove(c, "sub/a.txt") or panic("remove")
+    expect_failure(t, "stat of a removed file", "NotFound", stat_failure(c, "sub/a.txt"))
+    rename(c, "sub/b.txt", "sub/d.txt") or panic("rename")
+    expect_failure(t, "rename onto a file", "Failure", rename_failure(c, "sub/c.txt", "sub/d.txt"))
+    posix_rename(c, "sub/c.txt", "sub/d.txt") or panic("posix_rename")
+    let after = list(c, "sub") or panic("list")
+    testing.error_if(t, names_of(after) != "d.txt,", "listing {names_of(after)}")
+    let moved = read_file(c, "sub/d.txt") or panic("read")
+    testing.error_if(t, str(moved) != "c", "posix-rename kept {str(moved)}")
+    remove(c, "sub/d.txt") or panic("remove")
+    rmdir(c, "sub") or panic("rmdir")
+    mkdir(c, "plain", 0o755) or panic("mkdir plain")
+    expect_failure(t, "remove a directory", "Failure", remove_failure(c, "plain"))
+    expect_failure(t, "remove the root", "PermissionDenied", remove_failure(c, "."))
+    expect_failure(t, "stat a missing path", "NotFound", stat_failure(c, "nope"))
+    let canonical = real_path(c, "a/../b/./c") or panic("real_path")
+    testing.error_if(t, canonical != "/b/c", "real_path gave {canonical}")
+    let top_path = real_path(c, ".") or panic("real_path root")
+    testing.error_if(t, top_path != "/", "root real_path gave {top_path}")
+    file.remove_all(root) or panic("remove")
+}
+
+fn test_links_attributes_and_extensions(t: *testing.T) {
+    let root = file.temp_dir("sftp-links") or panic("temp dir")
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_in(net.stream(ends.second), root)
+    using client = connect(net.stream(ends.first)) or panic("connect")
+    let c = client.handle
+    for name in ["posix-rename@openssh.com", "statvfs@openssh.com", "fstatvfs@openssh.com", "hardlink@openssh.com", "fsync@openssh.com", "limits@openssh.com"] {
+        testing.error_if(t, !supports(c, name), "{name} must be announced")
+    }
+    testing.error_if(t, supports(c, "nonsense@example.com"), "unknown extension announced")
+    write_file(c, "target.txt", bytes("payload"), 0o644) or panic("write")
+    symlink(c, "target.txt", "link.txt") or panic("symlink")
+    let destination = read_link(c, "link.txt") or panic("read_link")
+    testing.error_if(t, destination != "target.txt", "link target {destination}")
+    let followed = stat(c, "link.txt") or panic("stat")
+    testing.error_if(t, !is_regular(followed), "stat follows the link")
+    let own = lstat(c, "link.txt") or panic("lstat")
+    testing.error_if(t, !is_symlink(own), "lstat reports the link")
+    let through = read_file(c, "link.txt") or panic("read through link")
+    testing.error_if(t, str(through) != "payload", "read through link: {str(through)}")
+    hardlink(c, "target.txt", "hard.txt") or panic("hardlink")
+    let hard = read_file(c, "hard.txt") or panic("read hard")
+    testing.error_if(t, str(hard) != "payload", "hard link content {str(hard)}")
+    set_attrs(c, "target.txt", Attrs { permissions: 0o600, size: 3, accessed: 1000000000, modified: 1000000500 }) or panic("set_attrs")
+    let changed = stat(c, "target.txt") or panic("stat")
+    testing.error_if(t, changed.size != 3, "truncated to {changed.size ?? -1}")
+    testing.error_if(t, changed.modified != 1000000500, "mtime {changed.modified ?? -1}")
+    using f = open_file(c, "target.txt", OpenFlags { read: true, write: true }, Attrs {}) or panic("open")
+    let opened = fstat(f) or panic("fstat")
+    testing.error_if(t, opened.size != 3, "fstat size {opened.size ?? -1}")
+    write_at(f, 3, bytes("tail")) or panic("write_at")
+    sync(f) or panic("fsync")
+    set_file_attrs(f, Attrs { accessed: 1000000600, modified: 1000000700 }) or panic("fsetstat")
+    let grown = fstat(f) or panic("fstat")
+    testing.error_if(t, grown.size != 7, "fstat after write {grown.size ?? -1}")
+    testing.error_if(t, grown.modified != 1000000700, "fsetstat mtime {grown.modified ?? -1}")
+    let vfs = statvfs(c, ".") or panic("statvfs")
+    testing.error_if(t, vfs.blocks <= 0 || vfs.block_size <= 0, "statvfs blocks {vfs.blocks}")
+    let limit = limits(c) or panic("limits")
+    testing.error_if(t, limit.read_length <= 0 || limit.write_length <= 0 || limit.packet_length <= 0, "limits {limit.packet_length} {limit.read_length} {limit.write_length}")
+    file.remove_all(root) or panic("remove")
+}
+
+fn test_open_flags(t: *testing.T) {
+    let root = file.temp_dir("sftp-flags") or panic("temp dir")
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_in(net.stream(ends.second), root)
+    using client = connect(net.stream(ends.first)) or panic("connect")
+    let c = client.handle
+    expect_failure(t, "open of a missing file", "NotFound", open_failure(c, "missing", OpenFlags { read: true }))
+    write_file(c, "f.txt", bytes("abcdef"), 0o644) or panic("write")
+    expect_failure(t, "exclusive create of an existing file", "Failure", open_failure(c, "f.txt", OpenFlags { write: true, create: true, exclusive: true }))
+    {
+        using f = open_file(c, "f.txt", OpenFlags { write: true, append: true }, Attrs {}) or panic("append")
+        write(f, bytes("XY")) or panic("append write")
+        close(f) or panic("close")
+    }
+    let appended = read_file(c, "f.txt") or panic("read")
+    testing.error_if(t, str(appended) != "abcdefXY", "append gave {str(appended)}")
+    {
+        using f = open_file(c, "f.txt", OpenFlags { write: true, truncate: true }, Attrs {}) or panic("truncate")
+        close(f) or panic("close")
+    }
+    let emptied = stat(c, "f.txt") or panic("stat")
+    testing.error_if(t, emptied.size != 0, "truncate left {emptied.size ?? -1}")
+    expect_failure(t, "read of a directory", "Failure", read_failure(c, "."))
+    file.remove_all(root) or panic("remove")
+}
+
+fn test_server_stays_inside_its_root(t: *testing.T) {
+    let parent = file.temp_dir("sftp-jail") or panic("temp dir")
+    let root = "{parent}/root"
+    file.mkdir(root) or panic("mkdir root")
+    file.write_text("{parent}/secret.txt", "outside") or panic("secret")
+    file.mkdir("{parent}/outside") or panic("outside dir")
+    file.write_text("{parent}/outside/data.txt", "outside data") or panic("outside data")
+    file.write_text("{root}/inside.txt", "inside") or panic("inside")
+    file.symlink("../secret.txt", "{root}/relative_escape") or panic("link 1")
+    file.symlink("{parent}/secret.txt", "{root}/absolute_escape") or panic("link 2")
+    file.symlink("{parent}/outside", "{root}/directory_escape") or panic("link 3")
+    file.symlink("../../../../../../etc/passwd", "{root}/deep_escape") or panic("link 4")
+    file.symlink("inside.txt", "{root}/local_link") or panic("link 5")
+    file.symlink("loop_b", "{root}/loop_a") or panic("loop a")
+    file.symlink("loop_a", "{root}/loop_b") or panic("loop b")
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_in(net.stream(ends.second), root)
+    using client = connect(net.stream(ends.first)) or panic("connect")
+    let c = client.handle
+    for path in ["../secret.txt", "/../secret.txt", "a/../../secret.txt", "relative_escape", "absolute_escape", "deep_escape", "directory_escape/data.txt", "../outside/data.txt"] {
+        expect_failure(t, "read of {path}", "NotFound", read_failure(c, path))
+    }
+    let local = read_file(c, "local_link") or panic("local link")
+    testing.error_if(t, str(local) != "inside", "link inside the root: {str(local)}")
+    let dotdot = read_file(c, "../../../inside.txt") or panic("dotdot")
+    testing.error_if(t, str(dotdot) != "inside", "dot-dot stops at the root: {str(dotdot)}")
+    expect_failure(t, "link loop", "Failure", read_failure(c, "loop_a"))
+    write_file(c, "../escaped.txt", bytes("kept inside"), 0o644) or panic("write dotdot")
+    testing.error_if(t, file.exists("{parent}/escaped.txt"), "a write through .. left the root")
+    testing.error_if(t, !file.exists("{root}/escaped.txt"), "the write must land inside the root")
+    expect_failure(t, "write through an absolute link", "NotFound", write_failure(c, "absolute_escape"))
+    let secret = file.read_text("{parent}/secret.txt") or panic("secret read")
+    testing.error_if(t, secret != "outside", "a symbolic link let a write reach outside: {secret}")
+    expect_failure(t, "listing through an escaping link", "NotFound", list_failure(c, "directory_escape"))
+    let canonical = real_path(c, "directory_escape/../x") or panic("real_path")
+    testing.error_if(t, canonical != "{link_target(parent)}/x", "an absolute link is read from the root: {canonical}")
+    expect_failure(t, "removing the root", "PermissionDenied", rmdir_failure(c, "/"))
+    remove(c, "../secret.txt") or {}
+    testing.error_if(t, !file.exists("{parent}/secret.txt"), "remove through .. reached outside")
+    file.remove_all(parent) or panic("remove")
+}
+
+fn read_worker(c: *Session, path: str, wanted: []u8, report: chan[bool]) {
+    let data = read_file(c, path) catch {
+        e => {
+            report <- false
+            return
+        }
+    }
+    report <- same(data, wanted)
+}
+
+fn test_requests_from_many_threads_share_one_client(t: *testing.T) {
+    let root = file.temp_dir("sftp-threads") or panic("temp dir")
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_in(net.stream(ends.second), root)
+    using client = connect(net.stream(ends.first)) or panic("connect")
+    let c = client.handle
+    let report = chan[bool](16)
+    var expected: [str: []u8] = [:]
+    for i in 0..8 {
+        let name = "file{i}.bin"
+        let data = pattern(200000 + i * 1000, i)
+        write_file(c, name, data, 0o644) or panic("write")
+        expected[name] = data
+    }
+    for name, data in expected {
+        spawn read_worker(c, name, data, report)
+    }
+    for i in 0..8 {
+        let ok = <-report
+        testing.error_if(t, (ok ?? false) != true, "a concurrent read returned the wrong data")
+    }
+    file.remove_all(root) or panic("remove")
+}
+
+fn test_server_going_away_fails_requests(t: *testing.T) {
+    let root = file.temp_dir("sftp-drop") or panic("temp dir")
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_in(net.stream(ends.second), root)
+    using client = connect(net.stream(ends.first)) or panic("connect")
+    let c = client.handle
+    write_file(c, "x", bytes("x"), 0o644) or panic("write")
+    net.close_on(ends.second.handle)
+    let failure = read_failure(c, "x")
+    testing.error_if(t, failure == "", "a read after the server went away must fail")
+    let again = read_failure(c, "x")
+    testing.error_if(t, again == "", "a later request must fail too")
+    file.remove_all(root) or panic("remove")
+}
+
+fn connect_failure(stream: io.Stream) -> str {
+    using client = connect(stream) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn test_malformed_version_is_refused(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    let hostile = net.stream(ends.second)
+    io.write_all(hostile, [0, 0, 0, 5, 2, 0, 0, 0, 2]) or panic("write")
+    let failure = connect_failure(net.stream(ends.first))
+    testing.error_if(t, failure != "Unsupported", "an old server must be refused, got {failure}")
+}
+
+fn test_oversized_packet_is_refused(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    let hostile = net.stream(ends.second)
+    io.write_all(hostile, [0x7f, 0xff, 0xff, 0xff, 2]) or panic("write")
+    let failure = connect_failure(net.stream(ends.first))
+    testing.error_if(t, failure != "Protocol", "an oversized packet must be refused, got {failure}")
+}
+
+fn test_subsystem_over_ssh(t: *testing.T) {
+    let root = file.temp_dir("sftp-ssh") or panic("temp dir")
+    file.write_text("{root}/hello.txt", "over ssh") or panic("seed")
+    let host = key.signer(x509.PrivateKey.Ed25519(crypto.random(32))) or panic("host key")
+    let server_config = ssh.ServerConfig {
+        host_keys: [host]
+        auth: ssh.ServerAuth { methods: ["password"], password: fn(user, password) { user == "alice" && password == "secret" } }
+        channels: handler(root)
+    }
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_ssh(net.stream(ends.second), server_config)
+    let client_config = ssh.ClientConfig {
+        user: "alice"
+        verify_host_key: ssh.accept_any_host_key()
+        auth: [ssh.AuthMethod.Password("secret")]
+    }
+    using conn = ssh.client(net.stream(ends.first), client_config) or panic("ssh client")
+    using client = open(conn) or panic("open sftp")
+    let c = client.handle
+    let data = read_file(c, "hello.txt") or panic("read")
+    testing.error_if(t, str(data) != "over ssh", "read {str(data)}")
+    let big = pattern(2 * 1024 * 1024, 5)
+    write_file(c, "up.bin", big, 0o644) or panic("write")
+    let stored = file.read_file("{root}/up.bin") or panic("disk")
+    testing.error_if(t, !same(stored, big), "upload differs")
+    let back = read_file(c, "up.bin") or panic("download")
+    testing.error_if(t, !same(back, big), "download differs")
+    expect_failure(t, "escape through ssh", "NotFound", read_failure(c, "../../etc/passwd"))
+    file.remove_all(root) or panic("remove")
+}
+
+fn serve_ssh(stream: io.Stream, config: ssh.ServerConfig) {
+    using conn = ssh.serve_stream(stream, config) catch {
+        e => return
+    }
+    ssh.wait_on(conn.handle)
+}
+
+fn subsystem_refused(conn: ssh.Connection, name: str) -> bool {
+    let opened = ssh.open_subsystem(conn, name) catch {
+        e => return true
+    }
+    false
+}
+
+fn tunnel_refused(conn: ssh.Connection) -> bool {
+    using opened = ssh.direct_tcpip(conn, "127.0.0.1", 9, "127.0.0.1", 1) catch {
+        e => return true
+    }
+    false
+}
+
+fn test_other_channels_and_subsystems_are_refused(t: *testing.T) {
+    let root = file.temp_dir("sftp-refuse") or panic("temp dir")
+    let host = key.signer(x509.PrivateKey.Ed25519(crypto.random(32))) or panic("host key")
+    let server_config = ssh.ServerConfig {
+        host_keys: [host]
+        auth: ssh.ServerAuth { methods: ["password"], password: fn(user, password) { true } }
+        channels: handler(root)
+    }
+    using ends = net.socketpair() or panic("socketpair")
+    spawn serve_ssh(net.stream(ends.second), server_config)
+    let client_config = ssh.ClientConfig {
+        user: "alice"
+        verify_host_key: ssh.accept_any_host_key()
+        auth: [ssh.AuthMethod.Password("x")]
+    }
+    using conn = ssh.client(net.stream(ends.first), client_config) or panic("ssh client")
+    testing.error_if(t, !subsystem_refused(conn, "shell"), "an unknown subsystem must be refused")
+    testing.error_if(t, !tunnel_refused(conn), "direct-tcpip must be refused by the sftp handler")
+    file.remove_all(root) or panic("remove")
+}

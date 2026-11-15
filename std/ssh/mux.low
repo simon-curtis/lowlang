@@ -1,0 +1,589 @@
+import std/io
+import std/net
+import std/ssh/wire
+import std/sync
+
+const msg_global_request: u8 = 80
+const msg_request_success: u8 = 81
+const msg_request_failure: u8 = 82
+const msg_channel_open: u8 = 90
+const msg_channel_open_confirmation: u8 = 91
+const msg_channel_open_failure: u8 = 92
+const msg_channel_window_adjust: u8 = 93
+const msg_channel_data: u8 = 94
+const msg_channel_extended_data: u8 = 95
+const msg_channel_eof: u8 = 96
+const msg_channel_close: u8 = 97
+const msg_channel_request: u8 = 98
+const msg_channel_success: u8 = 99
+const msg_channel_failure: u8 = 100
+
+const window_size = 2097152
+const max_channel_packet = 32768
+const max_channels = 1024
+const max_window = 4294967295
+
+/// The reason code of a refused channel open: the request is not permitted.
+pub const open_administratively_prohibited = 1
+
+/// The reason code of a refused channel open: the connection to the target failed.
+pub const open_connect_failed = 2
+
+/// The reason code of a refused channel open: the channel type is not known.
+pub const open_unknown_channel_type = 3
+
+/// The reason code of a refused channel open: the connection has no room for another channel.
+pub const open_resource_shortage = 4
+
+fn malformed(e: io.Error) -> Error {
+    Malformed
+}
+
+struct GlobalReply {
+    ok: bool
+    data: []u8
+}
+
+/// A request that applies to the whole connection, such as `tcpip-forward`.
+pub struct GlobalRequest {
+    /// The request name.
+    pub kind: str
+    /// Whether the peer waits for an answer.
+    pub want_reply: bool
+    /// The request-specific bytes after the want-reply flag.
+    pub data: []u8
+    /// The connection the request arrived on.
+    pub conn: *ConnectionHandle
+}
+
+/// The answer to a `GlobalRequest`: success with the bytes returned to the peer, or failure.
+pub struct GlobalAnswer {
+    /// Whether the request succeeded.
+    pub ok: bool = false
+    /// The request-specific bytes sent back with a success.
+    pub data: []u8 = []
+}
+
+/// A request on a channel, such as `exec`, `shell`, `pty-req` or `window-change`.
+pub struct ChannelRequest {
+    /// The request name.
+    pub kind: str
+    /// Whether the peer waits for an answer, which `answer` sends.
+    pub want_reply: bool
+    /// The request-specific bytes after the want-reply flag.
+    pub data: []u8
+}
+
+/// The shared state of a connection: its channels, the reader green thread's state and the outstanding global requests.
+///
+/// Copies are pointers to one state. `Connection` owns it and closes it when dropped.
+pub struct ConnectionHandle {
+    link: *Link
+    client: bool
+    lock: sync.Mutex
+    channels: [i64: *ChannelHandle]
+    next_id: i64
+    dead: bool
+    cause: Error?
+    done: chan[bool]
+    on_open: fn(Incoming)
+    on_global: fn(GlobalRequest) -> GlobalAnswer
+    replies: chan[GlobalReply]
+    forwards: [str: chan[Incoming]]
+    listeners: [str: net.ListenerHandle]
+    global_lock: sync.Mutex
+    /// The user name that authenticated.
+    pub user: str
+    /// The session identifier of RFC 4253 section 7.2.
+    pub session_id: []u8
+}
+
+/// The shared state of one channel.
+///
+/// Copies are pointers to one state. `Channel` owns it and closes the channel when dropped.
+pub struct ChannelHandle {
+    conn: *ConnectionHandle
+    /// The channel type: `session`, `direct-tcpip`, `forwarded-tcpip` or `direct-streamlocal@openssh.com`.
+    pub kind: str
+    local: i64
+    remote: i64
+    lock: sync.Mutex
+    readable: sync.Cond
+    writable: sync.Cond
+    data: []u8
+    ext: []u8
+    in_window: i64
+    unacked: i64
+    out_window: i64
+    out_max: i64
+    peer_eof: bool
+    peer_closed: bool
+    sent_eof: bool
+    sent_close: bool
+    torn: bool
+    done: chan[bool]
+    opening: chan[bool]
+    open_error: Error?
+    requests: chan[ChannelRequest]
+    replies: chan[bool]
+    request_lock: sync.Mutex
+    exit_status: i64
+    exit_signal: str
+    exited: bool
+}
+
+/// A channel the peer asks to open, passed to the connection's handler.
+///
+/// `accept` makes it a channel and `reject` refuses it. A handler that does neither leaves the peer waiting.
+pub struct Incoming {
+    /// The channel type.
+    pub kind: str
+    /// The type-specific bytes of the open message.
+    pub data: []u8
+    conn: *ConnectionHandle
+    chan: *ChannelHandle
+}
+
+fn new_channel(c: *ConnectionHandle, kind: str, local: i64, remote: i64, out_window: i64, out_max: i64) -> *ChannelHandle {
+    let lock = sync.mutex()
+    new(ChannelHandle {
+        conn: c
+        kind
+        local
+        remote
+        lock
+        readable: sync.cond(lock)
+        writable: sync.cond(lock)
+        data: []
+        ext: []
+        in_window: window_size
+        unacked: 0
+        out_window
+        out_max
+        peer_eof: false
+        peer_closed: false
+        sent_eof: false
+        sent_close: false
+        torn: false
+        done: chan[bool](1)
+        opening: chan[bool](1)
+        open_error: none
+        requests: chan[ChannelRequest](64)
+        replies: chan[bool](16)
+        request_lock: sync.mutex()
+        exit_status: 0
+        exit_signal: ""
+        exited: false
+    })
+}
+
+fn new_connection(l: *Link, client: bool, user: str, on_open: fn(Incoming), on_global: fn(GlobalRequest) -> GlobalAnswer) -> *ConnectionHandle {
+    new(ConnectionHandle {
+        link: l
+        client
+        lock: sync.mutex()
+        channels: [:]
+        next_id: 0
+        dead: false
+        cause: none
+        done: chan[bool](1)
+        on_open
+        on_global
+        replies: chan[GlobalReply](1)
+        forwards: [:]
+        listeners: [:]
+        global_lock: sync.mutex()
+        user
+        session_id: l.session_id
+    })
+}
+
+fn failure_of(c: *ConnectionHandle) -> Error {
+    sync.lock(c.lock)
+    defer sync.unlock(c.lock)
+    match c.cause {
+        some(e) => e
+        none => Closed
+    }
+}
+
+fn tear_down(ch: *ChannelHandle) {
+    sync.lock(ch.lock)
+    ch.peer_closed = true
+    ch.sent_close = true
+    sync.broadcast(ch.readable)
+    sync.broadcast(ch.writable)
+    let first = !ch.torn
+    ch.torn = true
+    sync.unlock(ch.lock)
+    if first {
+        close(ch.done)
+    }
+}
+
+fn kill(c: *ConnectionHandle, cause: Error) {
+    sync.lock(c.lock)
+    if c.dead {
+        sync.unlock(c.lock)
+        return
+    }
+    c.dead = true
+    c.cause = cause
+    var all: []*ChannelHandle = []
+    for id, ch in c.channels {
+        push(mut all, ch)
+    }
+    c.channels = [:]
+    var sockets: []net.ListenerHandle = []
+    for name, listener in c.listeners {
+        push(mut sockets, listener)
+    }
+    c.listeners = [:]
+    sync.unlock(c.lock)
+    close(c.done)
+    for listener in sockets {
+        net.close_listener_on(listener)
+    }
+    for ch in all {
+        tear_down(ch)
+    }
+    close_link(c.link)
+}
+
+fn send_message(c: *ConnectionHandle, payload: []u8) ! Error {
+    send(c.link, payload) catch {
+        e => {
+            kill(c, e)
+            fail e
+        }
+    }
+}
+
+fn find_channel(c: *ConnectionHandle, id: i64) -> *ChannelHandle ! Error {
+    sync.lock(c.lock)
+    defer sync.unlock(c.lock)
+    match c.channels[id] {
+        some(ch) => ch
+        none => fail Protocol
+    }
+}
+
+fn forget(c: *ConnectionHandle, ch: *ChannelHandle) {
+    sync.lock(c.lock)
+    delete(mut c.channels, ch.local)
+    sync.unlock(c.lock)
+}
+
+fn channel_message(kind: u8, remote: i64) -> []u8 {
+    var out: []u8 = [kind]
+    wire.put_u32(mut out, remote)
+    out
+}
+
+fn dispatch(c: *ConnectionHandle, msg: []u8) ! Error {
+    let kind = msg[0]
+    let r = wire.reader(msg[1..])
+    if kind == msg_global_request {
+        return on_global_request(c, r)
+    }
+    if kind == msg_request_success {
+        let rest = wire.rest(r)
+        select {
+            c.replies <- GlobalReply { ok: true, data: rest } => {}
+            else => {}
+        }
+        return
+    }
+    if kind == msg_request_failure {
+        select {
+            c.replies <- GlobalReply { ok: false, data: [] } => {}
+            else => {}
+        }
+        return
+    }
+    if kind == msg_channel_open {
+        return on_channel_open(c, r)
+    }
+    let id = wire.read_u32(r) catch malformed
+    let ch = find_channel(c, id)?
+    if kind == msg_channel_open_confirmation {
+        return on_confirmation(c, ch, r)
+    }
+    if kind == msg_channel_open_failure {
+        return on_open_failure(c, ch, r)
+    }
+    if kind == msg_channel_window_adjust {
+        let n = wire.read_u32(r) catch malformed
+        wire.finish(r) catch malformed
+        sync.lock(ch.lock)
+        ch.out_window = if ch.out_window + n > max_window { max_window } else { ch.out_window + n }
+        sync.broadcast(ch.writable)
+        sync.unlock(ch.lock)
+        return
+    }
+    if kind == msg_channel_data {
+        let payload = wire.read_string(r) catch malformed
+        wire.finish(r) catch malformed
+        return on_data(ch, payload, false)
+    }
+    if kind == msg_channel_extended_data {
+        let code = wire.read_u32(r) catch malformed
+        let payload = wire.read_string(r) catch malformed
+        wire.finish(r) catch malformed
+        if code != 1 {
+            fail Protocol
+        }
+        return on_data(ch, payload, true)
+    }
+    if kind == msg_channel_eof {
+        wire.finish(r) catch malformed
+        sync.lock(ch.lock)
+        ch.peer_eof = true
+        sync.broadcast(ch.readable)
+        sync.unlock(ch.lock)
+        return
+    }
+    if kind == msg_channel_close {
+        wire.finish(r) catch malformed
+        return on_close(c, ch)
+    }
+    if kind == msg_channel_request {
+        return on_channel_request(c, ch, r)
+    }
+    if kind == msg_channel_success || kind == msg_channel_failure {
+        wire.finish(r) catch malformed
+        select {
+            ch.replies <- kind == msg_channel_success => {}
+            else => {}
+        }
+        return
+    }
+    send_unimplemented(c.link)?
+}
+
+fn on_global_request(c: *ConnectionHandle, r: *wire.Reader) ! Error {
+    let kind = wire.read_str(r) catch malformed
+    let want_reply = wire.read_bool(r) catch malformed
+    let request = GlobalRequest { kind, want_reply, data: wire.rest(r), conn: c }
+    let answer = c.on_global(request)
+    if want_reply {
+        var out: []u8 = [if answer.ok { msg_request_success } else { msg_request_failure }]
+        if answer.ok {
+            io.append(mut out, answer.data)
+        }
+        send_message(c, out)?
+    }
+}
+
+fn on_channel_open(c: *ConnectionHandle, r: *wire.Reader) ! Error {
+    let kind = wire.read_str(r) catch malformed
+    let remote = wire.read_u32(r) catch malformed
+    let window = wire.read_u32(r) catch malformed
+    let max_packet = wire.read_u32(r) catch malformed
+    let data = wire.rest(r)
+    sync.lock(c.lock)
+    let full = c.channels.len >= max_channels
+    let id = c.next_id
+    c.next_id += 1
+    let ch = new_channel(c, kind, id, remote, window, if max_packet > max_channel_packet { max_channel_packet } else { max_packet })
+    if !full {
+        c.channels[id] = ch
+    }
+    sync.unlock(c.lock)
+    if full {
+        return send_open_failure(c, remote, open_resource_shortage, "too many channels")
+    }
+    spawn offer(c, Incoming { kind, data, conn: c, chan: ch })
+}
+
+fn offer(c: *ConnectionHandle, inc: Incoming) {
+    c.on_open(inc)
+}
+
+fn send_open_failure(c: *ConnectionHandle, remote: i64, code: i64, reason: str) ! Error {
+    var out = channel_message(msg_channel_open_failure, remote)
+    wire.put_u32(mut out, code)
+    wire.put_str(mut out, reason)
+    wire.put_str(mut out, "")
+    send_message(c, out)?
+}
+
+fn on_confirmation(c: *ConnectionHandle, ch: *ChannelHandle, r: *wire.Reader) ! Error {
+    let remote = wire.read_u32(r) catch malformed
+    let window = wire.read_u32(r) catch malformed
+    let max_packet = wire.read_u32(r) catch malformed
+    wire.finish(r) catch malformed
+    sync.lock(ch.lock)
+    ch.remote = remote
+    ch.out_window = window
+    ch.out_max = if max_packet > max_channel_packet { max_channel_packet } else { max_packet }
+    sync.unlock(ch.lock)
+    select {
+        ch.opening <- true => {}
+        else => {}
+    }
+}
+
+fn on_open_failure(c: *ConnectionHandle, ch: *ChannelHandle, r: *wire.Reader) ! Error {
+    let code = wire.read_u32(r) catch malformed
+    let reason = wire.read_str(r) catch malformed
+    sync.lock(ch.lock)
+    ch.open_error = ChannelRefused(code, reason)
+    sync.unlock(ch.lock)
+    forget(c, ch)
+    select {
+        ch.opening <- false => {}
+        else => {}
+    }
+}
+
+fn on_data(ch: *ChannelHandle, payload: []u8, extended: bool) ! Error {
+    sync.lock(ch.lock)
+    defer sync.unlock(ch.lock)
+    if payload.len > ch.in_window || ch.peer_eof || ch.peer_closed {
+        fail Protocol
+    }
+    ch.in_window -= payload.len
+    if extended {
+        io.append(mut ch.ext, payload)
+    } else {
+        io.append(mut ch.data, payload)
+    }
+    sync.broadcast(ch.readable)
+}
+
+fn on_close(c: *ConnectionHandle, ch: *ChannelHandle) ! Error {
+    sync.lock(ch.lock)
+    let must_reply = !ch.sent_close
+    ch.sent_close = true
+    ch.peer_closed = true
+    sync.broadcast(ch.readable)
+    sync.broadcast(ch.writable)
+    sync.unlock(ch.lock)
+    forget(c, ch)
+    if must_reply {
+        send_message(c, channel_message(msg_channel_close, ch.remote))?
+    }
+    tear_down(ch)
+}
+
+fn on_channel_request(c: *ConnectionHandle, ch: *ChannelHandle, r: *wire.Reader) ! Error {
+    let kind = wire.read_str(r) catch malformed
+    let want_reply = wire.read_bool(r) catch malformed
+    let data = wire.rest(r)
+    var handled = false
+    if kind == "exit-status" && data.len == 4 {
+        sync.lock(ch.lock)
+        ch.exit_status = io.be32(data, 0)
+        ch.exited = true
+        sync.unlock(ch.lock)
+        handled = true
+    }
+    if kind == "exit-signal" {
+        let sr = wire.reader(data)
+        let name = wire.read_str(sr) catch malformed
+        sync.lock(ch.lock)
+        ch.exit_signal = name
+        ch.exited = true
+        sync.unlock(ch.lock)
+        handled = true
+    }
+    if kind == "keepalive@openssh.com" {
+        handled = true
+    }
+    if handled {
+        if want_reply {
+            send_message(c, channel_message(msg_channel_success, ch.remote))?
+        }
+        return
+    }
+    if c.client {
+        if want_reply {
+            send_message(c, channel_message(msg_channel_failure, ch.remote))?
+        }
+        return
+    }
+    let queued = select {
+        ch.requests <- ChannelRequest { kind, want_reply, data } => true
+        else => false
+    }
+    if !queued && want_reply {
+        send_message(c, channel_message(msg_channel_failure, ch.remote))?
+    }
+}
+
+fn run_reader(c: *ConnectionHandle) {
+    for {
+        let msg = next_message(c.link) catch {
+            e => {
+                kill(c, e)
+                return
+            }
+        }
+        dispatch(c, msg) catch {
+            e => {
+                disconnect(c.link, disconnect_protocol_error, "protocol error")
+                kill(c, e)
+                return
+            }
+        }
+    }
+}
+
+fn send_unimplemented(l: *Link) ! Error {
+    var out: []u8 = [msg_unimplemented]
+    wire.put_u32(mut out, (l.in_seq - 1) & sequence_mask)
+    send(l, out)?
+}
+
+fn open_channel(c: *ConnectionHandle, kind: str, extra: []u8) -> *ChannelHandle ! Error {
+    sync.lock(c.lock)
+    if c.dead {
+        sync.unlock(c.lock)
+        fail failure_of(c)
+    }
+    let id = c.next_id
+    c.next_id += 1
+    let ch = new_channel(c, kind, id, 0, 0, 0)
+    c.channels[id] = ch
+    sync.unlock(c.lock)
+    var out: []u8 = [msg_channel_open]
+    wire.put_str(mut out, kind)
+    wire.put_u32(mut out, id)
+    wire.put_u32(mut out, window_size)
+    wire.put_u32(mut out, max_channel_packet)
+    io.append(mut out, extra)
+    send_message(c, out)?
+    let opened = select {
+        ok = <-ch.opening => ok ?? false
+        <-ch.done => false
+    }
+    if !opened {
+        sync.lock(ch.lock)
+        let refused = ch.open_error
+        sync.unlock(ch.lock)
+        forget(c, ch)
+        match refused {
+            some(e) => fail e
+            none => fail failure_of(c)
+        }
+    }
+    ch
+}
+
+fn global_request(c: *ConnectionHandle, kind: str, want_reply: bool, data: []u8) -> GlobalReply ! Error {
+    sync.lock(c.global_lock)
+    defer sync.unlock(c.global_lock)
+    var out: []u8 = [msg_global_request]
+    wire.put_str(mut out, kind)
+    wire.put_bool(mut out, want_reply)
+    io.append(mut out, data)
+    send_message(c, out)?
+    if !want_reply {
+        return GlobalReply { ok: true, data: [] }
+    }
+    select {
+        reply = <-c.replies => reply ?? fail failure_of(c)
+        <-c.done => fail failure_of(c)
+    }
+}

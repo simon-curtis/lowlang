@@ -1,0 +1,197 @@
+import std/base64
+import std/big
+import std/crypto/cipher
+import std/crypto/ecdsa
+import std/crypto/password
+import std/crypto/rsa
+import std/crypto/x509
+import std/file
+import std/io
+import std/slices
+import std/ssh/wire
+import std/text
+
+const openssh_magic = "openssh-key-v1"
+const openssh_begin = "-----BEGIN OPENSSH PRIVATE KEY-----"
+const openssh_end = "-----END OPENSSH PRIVATE KEY-----"
+
+struct KeyCipher {
+    key_len: i64
+    iv_len: i64
+    block: i64
+    cbc: bool
+}
+
+fn key_cipher(name: str) -> KeyCipher? {
+    match name {
+        "aes128-ctr" => KeyCipher { key_len: 16, iv_len: 16, block: 16, cbc: false }
+        "aes256-ctr" => KeyCipher { key_len: 32, iv_len: 16, block: 16, cbc: false }
+        "aes128-cbc" => KeyCipher { key_len: 16, iv_len: 16, block: 16, cbc: true }
+        "aes256-cbc" => KeyCipher { key_len: 32, iv_len: 16, block: 16, cbc: true }
+        _ => none
+    }
+}
+
+fn armored_body(data: []u8) -> []u8 ! Error {
+    let all = str(data)
+    let begin = text.index(all, openssh_begin)
+    let end = text.index(all, openssh_end)
+    if begin < 0 || end < begin {
+        fail Malformed
+    }
+    let body = all[begin + openssh_begin.len..end]
+    var compact = ""
+    for line in text.lines(body) {
+        compact = "{compact}{text.trim(line)}"
+    }
+    base64.decode(compact) or fail Malformed
+}
+
+fn decrypt_section(cipher_name: str, kdf: str, options: []u8, passphrase: str, encrypted: []u8) -> []u8 ! Error {
+    if cipher_name == "none" {
+        if kdf != "none" {
+            fail Malformed
+        }
+        return encrypted
+    }
+    let spec = match key_cipher(cipher_name) {
+        some(s) => s
+        none => fail Unsupported
+    }
+    if kdf != "bcrypt" {
+        fail Unsupported
+    }
+    if passphrase.len == 0 {
+        fail Encrypted
+    }
+    let r = wire.reader(options)
+    let salt = wire.read_string(r) catch bad
+    let rounds = wire.read_u32(r) catch bad
+    wire.finish(r) catch bad
+    if encrypted.len % spec.block != 0 || rounds < 1 {
+        fail Malformed
+    }
+    let material = password.bcrypt_pbkdf(bytes(passphrase), salt, rounds, spec.key_len + spec.iv_len) or fail Malformed
+    let aes = cipher.aes(material[..spec.key_len]) or fail Malformed
+    let iv = material[spec.key_len..]
+    if spec.cbc {
+        return cipher.cbc_decrypt(aes, iv, encrypted) or fail Malformed
+    }
+    cipher.ctr(aes, iv, encrypted) or fail Malformed
+}
+
+fn left_pad_to(magnitude: []u8, size: i64) -> []u8 ! Error {
+    if magnitude.len > size {
+        fail Malformed
+    }
+    let out = io.buffer(size)
+    io.copy(out[size - magnitude.len..], magnitude)
+    out
+}
+
+fn reduced(d: []u8, prime: []u8) -> []u8 ! Error {
+    let exponent = big.from_bytes(d)
+    let modulus = big.sub(big.from_bytes(prime), big.one())
+    let remainder = big.rem(exponent, modulus) or fail Malformed
+    big.to_bytes(remainder)
+}
+
+fn read_private(r: *wire.Reader, public: PublicKey) -> x509.PrivateKey ! Error {
+    let kind = wire.read_str(r) catch bad
+    if kind != public.kind {
+        fail Malformed
+    }
+    match public.material {
+        Ed25519(point) => {
+            let embedded = wire.read_string(r) catch bad
+            let pair = wire.read_string(r) catch bad
+            if pair.len != 64 || embedded.len != 32 {
+                fail Malformed
+            }
+            x509.PrivateKey.Ed25519(pair[..32])
+        }
+        Ecdsa(curve, point) => {
+            wire.read_str(r) catch bad
+            wire.read_string(r) catch bad
+            let scalar = wire.read_mpint(r) catch bad
+            let size = ecdsa.scalar_size(curve)
+            x509.PrivateKey.Ecdsa(ecdsa.Key { curve, private: left_pad_to(scalar, size)?, public: point })
+        }
+        Rsa(pub_key) => {
+            let n = wire.read_mpint(r) catch bad
+            let e = wire.read_mpint(r) catch bad
+            let d = wire.read_mpint(r) catch bad
+            let qinv = wire.read_mpint(r) catch bad
+            let p = wire.read_mpint(r) catch bad
+            let q = wire.read_mpint(r) catch bad
+            let private = rsa.PrivateKey {
+                n: rsa.integer(n)
+                e: rsa.integer(e)
+                d: rsa.integer(d)
+                p: rsa.integer(p)
+                q: rsa.integer(q)
+                dp: rsa.integer(reduced(d, p)?)
+                dq: rsa.integer(reduced(d, q)?)
+                qinv: rsa.integer(qinv)
+            }
+            x509.PrivateKey.Rsa(private)
+        }
+    }
+}
+
+fn parse_openssh(data: []u8, passphrase: str) -> x509.PrivateKey ! Error {
+    let raw = armored_body(data)?
+    let magic = bytes("{openssh_magic}\0")
+    if raw.len < magic.len || !slices.equal(raw[..magic.len], magic) {
+        fail Malformed
+    }
+    let r = wire.reader(raw[magic.len..])
+    let cipher_name = wire.read_str(r) catch bad
+    let kdf = wire.read_str(r) catch bad
+    let options = wire.read_string(r) catch bad
+    let count = wire.read_u32(r) catch bad
+    if count != 1 {
+        fail Unsupported
+    }
+    let blob = wire.read_string(r) catch bad
+    let encrypted = wire.read_string(r) catch bad
+    wire.finish(r) catch bad
+    let public = parse_blob(blob)?
+    let plain = decrypt_section(cipher_name, kdf, options, passphrase, encrypted)?
+    let pr = wire.reader(plain)
+    let check_a = wire.read_u32(pr) catch bad
+    let check_b = wire.read_u32(pr) catch bad
+    if check_a != check_b {
+        if cipher_name == "none" {
+            fail Malformed
+        }
+        fail WrongPassphrase
+    }
+    let private = read_private(pr, public)?
+    wire.read_string(pr) catch bad
+    let padding = wire.rest(pr)
+    for i in 0..padding.len {
+        if i64(padding[i]) != i + 1 {
+            fail Malformed
+        }
+    }
+    private
+}
+
+/// Parses a private key file.
+///
+/// Accepts the OpenSSH format (`-----BEGIN OPENSSH PRIVATE KEY-----`, the `openssh-key-v1` encoding) for Ed25519, ECDSA P-256 and P-384 and RSA keys, unencrypted or protected with `bcrypt` and `aes128-ctr`, `aes256-ctr`, `aes128-cbc` or `aes256-cbc`. Other PEM labels, unencrypted PKCS#8, SEC 1 and PKCS#1, go through `std/crypto/x509`.
+///
+/// Fails with `Encrypted` when the key is encrypted and `passphrase` is empty, `WrongPassphrase` when the passphrase does not decrypt it, `Unsupported` for a cipher, KDF or key type that is not handled, and `Malformed` for anything else wrong with the file.
+pub fn parse_private_key(data: []u8, passphrase: str) -> x509.PrivateKey ! Error {
+    if text.contains(str(data), openssh_begin) {
+        return parse_openssh(data, passphrase)
+    }
+    x509.pem_private_key(str(data)) catch bad
+}
+
+/// Reads and parses the private key file at `path`, as `parse_private_key` does.
+pub fn load_private_key(path: str, passphrase: str) -> x509.PrivateKey ! Error {
+    let data = file.read_file(path) catch Io
+    parse_private_key(data, passphrase)?
+}

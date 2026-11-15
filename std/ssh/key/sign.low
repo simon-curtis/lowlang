@@ -1,0 +1,205 @@
+import std/crypto/ecdsa
+import std/crypto/ed25519
+import std/crypto/hash
+import std/crypto/rsa
+import std/crypto/x509
+import std/io
+import std/ssh/wire
+
+/// A private key that signs for SSH: the public half and a function that signs data with a named signature algorithm and returns the signature blob.
+///
+/// A signer is either a key held in memory, from `signer`, or a key held by an agent, from `std/ssh/agent`.
+pub struct Signer {
+    /// The public key that verifies the signatures.
+    pub public: PublicKey
+    /// Signs the data with the signature algorithm named by the first argument, such as `rsa-sha2-256`, and returns the signature blob. Fails with `Unsupported` for an algorithm the key does not sign with.
+    pub sign: fn(str, []u8) -> []u8 ! Error
+}
+
+fn encode_material(m: Material) -> []u8 {
+    var out: []u8 = []
+    wire.put_str(mut out, kind_of(m))
+    match m {
+        Ed25519(public) => wire.put_string(mut out, public)
+        Ecdsa(curve, point) => {
+            wire.put_str(mut out, curve_name(curve))
+            wire.put_string(mut out, point)
+        }
+        Rsa(key) => {
+            wire.put_mpint(mut out, key.e)
+            wire.put_mpint(mut out, key.n)
+        }
+    }
+    out
+}
+
+/// Returns the public key for `m`, with its wire blob.
+pub fn public_key(m: Material) -> PublicKey {
+    PublicKey { kind: kind_of(m), material: m, blob: encode_material(m), certificate: none }
+}
+
+/// Returns the public half of `private`.
+///
+/// Fails with `Unsupported` for a key that SSH does not carry.
+pub fn public_of(private: x509.PrivateKey) -> PublicKey ! Error {
+    match private {
+        Ed25519(seed) => public_key(Material.Ed25519(ed25519.public_key(seed)))
+        Ecdsa(k) => public_key(Material.Ecdsa(k.curve, k.public))
+        Rsa(k) => public_key(Material.Rsa(rsa.public(k)))
+    }
+}
+
+/// Returns the signature algorithms that keys of `m` sign and verify with, in order of preference: `ssh-ed25519`, `ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, or `rsa-sha2-512` and `rsa-sha2-256` for RSA. `ssh-rsa` with SHA-1 is never listed.
+pub fn signature_algorithms(m: Material) -> []str {
+    match m {
+        Ed25519(_) => ["ssh-ed25519"]
+        Ecdsa(curve, _) => [ecdsa_kind(curve)]
+        Rsa(_) => ["rsa-sha2-512", "rsa-sha2-256"]
+    }
+}
+
+/// Returns the algorithm name a client puts in a `publickey` authentication request: `algorithm` for a plain key and its `-cert-v01@openssh.com` form for a certificate.
+pub fn offered_name(k: PublicKey, algorithm: str) -> str {
+    if is_certificate_kind(k.kind) {
+        return "{algorithm}{cert_suffix}"
+    }
+    algorithm
+}
+
+/// Returns the signature algorithm for an algorithm name from an authentication request: the name itself, or for a certificate name the algorithm without the `-cert-v01@openssh.com` suffix.
+pub fn signature_name(offered: str) -> str {
+    if is_certificate_kind(offered) {
+        return offered[..offered.len - cert_suffix.len]
+    }
+    offered
+}
+
+/// Returns a `Signer` that signs with `private` and presents the certificate `certificate`, for user authentication and as a server host key.
+///
+/// Fails with `Invalid` when `certificate` is not a certificate or certifies a different key than `private` holds.
+pub fn certified_signer(private: x509.PrivateKey, certificate: PublicKey) -> Signer ! Error {
+    if certificate.certificate == none {
+        fail Invalid
+    }
+    let own = public_of(private)?
+    if !hash.equal(encode_material(own.material), encode_material(certificate.material)) {
+        fail Invalid
+    }
+    Signer { public: certificate, sign: fn(algorithm, data) { sign(private, algorithm, data) } }
+}
+
+fn rsa_hash(algorithm: str) -> hash.Algorithm? {
+    match algorithm {
+        "rsa-sha2-256" => hash.sha256()
+        "rsa-sha2-512" => hash.sha512()
+        _ => none
+    }
+}
+
+fn ecdsa_hash(curve: ecdsa.Curve) -> hash.Algorithm {
+    match curve {
+        P256 => hash.sha256()
+        P384 => hash.sha384()
+    }
+}
+
+fn signature_blob(algorithm: str, body: []u8) -> []u8 {
+    var out: []u8 = []
+    wire.put_str(mut out, algorithm)
+    wire.put_string(mut out, body)
+    out
+}
+
+fn left_pad(magnitude: []u8, size: i64) -> []u8 {
+    let out = io.buffer(size)
+    if magnitude.len > size {
+        return out[..0]
+    }
+    io.copy(out[size - magnitude.len..], magnitude)
+    out
+}
+
+fn ecdsa_body(raw: []u8) -> []u8 {
+    let half = raw.len / 2
+    var out: []u8 = []
+    wire.put_mpint(mut out, raw[..half])
+    wire.put_mpint(mut out, raw[half..])
+    out
+}
+
+/// Signs `data` with `private` using the signature algorithm `algorithm` and returns the signature blob, a `string` algorithm name followed by a `string` signature (RFC 4253 section 6.6, RFC 5656 section 3.1.2, RFC 8332).
+///
+/// `algorithm` must be one of `signature_algorithms` for the key. Fails with `Unsupported` otherwise.
+pub fn sign(private: x509.PrivateKey, algorithm: str, data: []u8) -> []u8 ! Error {
+    match private {
+        Ed25519(seed) => {
+            if algorithm != "ssh-ed25519" {
+                fail Unsupported
+            }
+            signature_blob(algorithm, ed25519.sign(seed, data))
+        }
+        Ecdsa(k) => {
+            if algorithm != ecdsa_kind(k.curve) {
+                fail Unsupported
+            }
+            let digest = hash.sum(ecdsa_hash(k.curve), data)
+            let raw = ecdsa.sign_raw(k.curve, k.private, digest) catch io_failed
+            signature_blob(algorithm, ecdsa_body(raw))
+        }
+        Rsa(k) => {
+            let h = match rsa_hash(algorithm) {
+                some(a) => a
+                none => fail Unsupported
+            }
+            let digest = hash.sum(h, data)
+            let raw = rsa.sign_pkcs1v15(k, h, digest) catch io_failed
+            signature_blob(algorithm, raw)
+        }
+    }
+}
+
+fn io_failed(e: io.Error) -> Error {
+    Io(e)
+}
+
+/// Returns a `Signer` for the key held in memory.
+///
+/// Fails with `Unsupported` for a key SSH does not carry.
+pub fn signer(private: x509.PrivateKey) -> Signer ! Error {
+    let public = public_of(private)?
+    Signer { public, sign: fn(algorithm, data) { sign(private, algorithm, data) } }
+}
+
+/// Reports whether `signature`, a signature blob, is a valid signature of `data` by the key `k` made with `algorithm`.
+///
+/// The algorithm inside the blob must equal `algorithm` and be one of `signature_algorithms` for the key. Returns `false`, never an error, for a malformed blob or any mismatch. For a certificate it verifies against the certified key.
+pub fn verify(k: PublicKey, algorithm: str, data: []u8, signature: []u8) -> bool {
+    let r = wire.reader(signature)
+    let name = wire.read_str(r) or return false
+    let body = wire.read_string(r) or return false
+    wire.finish(r) or return false
+    if name != algorithm || !wire.has_name(signature_algorithms(k.material), algorithm) {
+        return false
+    }
+    match k.material {
+        Ed25519(public) => ed25519.verify(public, data, body)
+        Ecdsa(curve, point) => {
+            let size = ecdsa.scalar_size(curve)
+            let br = wire.reader(body)
+            let rr = wire.read_mpint(br) or return false
+            let ss = wire.read_mpint(br) or return false
+            wire.finish(br) or return false
+            if rr.len > size || ss.len > size {
+                return false
+            }
+            var raw: []u8 = []
+            io.append(mut raw, left_pad(rr, size))
+            io.append(mut raw, left_pad(ss, size))
+            ecdsa.verify_raw(curve, point, hash.sum(ecdsa_hash(curve), data), raw)
+        }
+        Rsa(key) => {
+            let h = rsa_hash(algorithm) ?? return false
+            rsa.verify_pkcs1v15(key, h, hash.sum(h, data), body)
+        }
+    }
+}

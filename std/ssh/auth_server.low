@@ -1,0 +1,223 @@
+import std/io
+import std/ssh/key
+import std/ssh/wire
+
+/// The authentication callbacks of a server.
+///
+/// A client that offers a method outside `methods` is refused. Every callback defaults to refusing, so only the methods a program implements succeed.
+pub struct ServerAuth {
+    /// The methods the server accepts, listed to clients that fail: `publickey`, `password` and `keyboard-interactive`.
+    pub methods: []str = ["publickey"]
+    /// Methods that must all succeed, in any order, before the login completes; after each success the server answers with partial success and the methods that remain. Empty means one success of a method in `methods` is enough. While the list is not empty the methods accepted, and the ones the server names to a client that fails, are the ones that remain.
+    pub required: []str = []
+    /// Decides a password attempt for the user.
+    pub password: fn(str, str) -> bool = fn(user, password) { false }
+    /// Decides whether the key may log in as the user. The server has already checked that the client holds the private key, so this callback checks authorization, as an `authorized_keys` lookup does. For a certificate the key is the certificate.
+    pub public_key: fn(str, key.PublicKey) -> bool = fn(user, k) { false }
+    /// Decides a keyboard-interactive attempt for the user. `ask` sends one round of prompts to the client and returns the answers, or an empty slice when the exchange failed.
+    pub keyboard_interactive: fn(str, fn(str, str, []Prompt) -> []str) -> bool = fn(user, ask) { false }
+    /// A message shown to the client before it authenticates. Nothing is sent when it is empty.
+    pub banner: str = ""
+    /// How many failed attempts end the connection. Queries for a key, `none` requests and refused methods that were never offered do not count.
+    pub max_attempts: i64 = 6
+}
+
+struct Interactive {
+    link: *Link
+    failed: bool
+}
+
+fn failure_message(methods: []str, partial: bool) -> []u8 {
+    var out: []u8 = [msg_userauth_failure]
+    wire.put_names(mut out, methods)
+    wire.put_bool(mut out, partial)
+    out
+}
+
+fn without(names: []str, name: str) -> []str {
+    var out: []str = []
+    for n in names {
+        if n != name {
+            push(mut out, n)
+        }
+    }
+    out
+}
+
+fn ask_round(state: *Interactive, name: str, instruction: str, prompts: []Prompt) -> []str {
+    if state.failed {
+        return []
+    }
+    var out: []u8 = [msg_userauth_info]
+    wire.put_str(mut out, name)
+    wire.put_str(mut out, instruction)
+    wire.put_str(mut out, "")
+    wire.put_u32(mut out, prompts.len)
+    for p in prompts {
+        wire.put_str(mut out, p.text)
+        wire.put_bool(mut out, p.echo)
+    }
+    send(state.link, out) catch {
+        e => {
+            state.failed = true
+            return []
+        }
+    }
+    let answer = next_message(state.link) catch {
+        e => {
+            state.failed = true
+            return []
+        }
+    }
+    let parsed = read_answers(answer, prompts.len) catch {
+        e => {
+            state.failed = true
+            return []
+        }
+    }
+    parsed
+}
+
+fn read_answers(payload: []u8, expected: i64) -> []str ! Error {
+    if payload[0] != msg_userauth_info_response {
+        fail Protocol
+    }
+    let r = wire.reader(payload[1..])
+    let count = wire.read_u32(r) catch malformed
+    if count != expected {
+        fail Malformed
+    }
+    var answers: []str = []
+    for i in 0..count {
+        push(mut answers, wire.read_str(r) catch malformed)
+    }
+    wire.finish(r) catch malformed
+    answers
+}
+
+struct Attempt {
+    ok: bool
+    counts: bool
+    replied: bool
+}
+
+fn attempt_password(a: ServerAuth, user: str, r: *wire.Reader) -> Attempt ! Error {
+    wire.read_bool(r) catch malformed
+    let password = wire.read_str(r) catch malformed
+    wire.finish(r) catch malformed
+    Attempt { ok: a.password(user, password), counts: true, replied: false }
+}
+
+fn attempt_public_key(l: *Link, a: ServerAuth, user: str, r: *wire.Reader) -> Attempt ! Error {
+    let signed = wire.read_bool(r) catch malformed
+    let algorithm = wire.read_str(r) catch malformed
+    let blob = wire.read_string(r) catch malformed
+    let parsed = key.parse_blob(blob) catch {
+        e => return Attempt { ok: false, counts: true, replied: false }
+    }
+    let base = key.signature_name(algorithm)
+    if !wire.has_name(key.signature_algorithms(parsed.material), base) || key.offered_name(parsed, base) != algorithm {
+        return Attempt { ok: false, counts: true, replied: false }
+    }
+    if !signed {
+        wire.finish(r) catch malformed
+        if !a.public_key(user, parsed) {
+            return Attempt { ok: false, counts: false, replied: false }
+        }
+        var out: []u8 = [msg_userauth_info]
+        wire.put_str(mut out, algorithm)
+        wire.put_string(mut out, blob)
+        send(l, out)?
+        return Attempt { ok: false, counts: false, replied: true }
+    }
+    let signature = wire.read_string(r) catch malformed
+    wire.finish(r) catch malformed
+    let data = authorization_data(l.session_id, user, algorithm, blob)
+    let valid = key.verify(parsed, base, data, signature)
+    Attempt { ok: valid && a.public_key(user, parsed), counts: true, replied: false }
+}
+
+fn attempt_interactive(l: *Link, a: ServerAuth, user: str, r: *wire.Reader) -> Attempt ! Error {
+    wire.read_str(r) catch malformed
+    wire.read_str(r) catch malformed
+    wire.finish(r) catch malformed
+    let state = new(Interactive { link: l, failed: false })
+    let ok = a.keyboard_interactive(user, fn(name, instruction, prompts) { ask_round(state, name, instruction, prompts) })
+    Attempt { ok: ok && !state.failed, counts: true, replied: false }
+}
+
+fn server_authenticate(l: *Link, a: ServerAuth) -> str ! Error {
+    let request = next_message(l)?
+    if request[0] != msg_service_request {
+        fail Protocol
+    }
+    let sr = wire.reader(request[1..])
+    let service = wire.read_str(sr) catch malformed
+    if service != service_userauth {
+        disconnect(l, disconnect_service_not_available, "service not available")
+        fail Protocol
+    }
+    send(l, service_message(msg_service_accept, service))?
+    if a.banner.len > 0 {
+        var out: []u8 = [msg_userauth_banner]
+        wire.put_str(mut out, a.banner)
+        wire.put_str(mut out, "")
+        send(l, out)?
+    }
+    var failures = 0
+    var remaining = a.required
+    var login = ""
+    for {
+        let msg = next_message(l)?
+        if msg[0] != msg_userauth_request {
+            fail Protocol
+        }
+        let r = wire.reader(msg[1..])
+        let user = wire.read_str(r) catch malformed
+        let target = wire.read_str(r) catch malformed
+        let method = wire.read_str(r) catch malformed
+        if login.len == 0 {
+            login = user
+        }
+        if user != login {
+            disconnect(l, disconnect_no_more_auth_methods, "user changed during authentication")
+            fail AuthFailed
+        }
+        let accepted = if a.required.len > 0 { remaining } else { a.methods }
+        var outcome = Attempt { ok: false, counts: method != "none", replied: false }
+        if target == service_connection && wire.has_name(accepted, method) {
+            if method == "none" {
+                outcome = Attempt { ok: true, counts: false, replied: false }
+            }
+            if method == "password" {
+                outcome = attempt_password(a, user, r)?
+            }
+            if method == "publickey" {
+                outcome = attempt_public_key(l, a, user, r)?
+            }
+            if method == "keyboard-interactive" {
+                outcome = attempt_interactive(l, a, user, r)?
+            }
+        }
+        if outcome.ok {
+            remaining = without(remaining, method)
+            if a.required.len == 0 || remaining.len == 0 {
+                send(l, [msg_userauth_success])?
+                return user
+            }
+            send(l, failure_message(remaining, true))?
+            continue
+        }
+        if outcome.replied {
+            continue
+        }
+        if outcome.counts {
+            failures += 1
+        }
+        if failures >= a.max_attempts {
+            disconnect(l, disconnect_no_more_auth_methods, "too many authentication failures")
+            fail AuthFailed
+        }
+        send(l, failure_message(accepted, false))?
+    }
+}

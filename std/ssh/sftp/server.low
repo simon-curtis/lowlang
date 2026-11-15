@@ -1,0 +1,748 @@
+import std/file
+import std/io
+import std/slices
+import std/ssh
+import std/ssh/wire
+import std/text
+
+const handle_limit = 256
+const link_limit = 40
+const read_limit = 65536
+const write_limit = 65536
+const batch_size = 64
+const block_bytes = 4096
+const prohibited = 1
+
+struct Open {
+    path: str
+    directory: bool
+    flags: OpenFlags
+    entries: []Entry
+    cursor: i64
+}
+
+struct Server {
+    root: str
+    handles: [str: *Open]
+    next: i64
+}
+
+struct Resolved {
+    host: str
+    virtual: str
+    root: bool
+}
+
+fn from_io(e: io.Error) -> Error {
+    match e {
+        io.Error.NotFound => NotFound
+        io.Error.Denied => PermissionDenied
+        io.Error.Exists => Failure("file exists")
+        io.Error.NotDir => Failure("not a directory")
+        io.Error.IsDir => Failure("is a directory")
+        io.Error.NotEmpty => Failure("directory not empty")
+        io.Error.NoSpace => Failure("no space left")
+        _ => Failure("operation failed")
+    }
+}
+
+fn status_of(e: Error) -> i64 {
+    match e {
+        NotFound => status_no_such_file
+        PermissionDenied => status_permission_denied
+        BadMessage => status_bad_message
+        Unsupported => status_op_unsupported
+        _ => status_failure
+    }
+}
+
+fn message_of(e: Error) -> str {
+    match e {
+        Failure(message) => message
+        _ => ""
+    }
+}
+
+fn split_path(p: str) -> []str {
+    var out: []str = []
+    for part in text.split(p, '/') {
+        if part.len > 0 && part != "." {
+            push(mut out, part)
+        }
+    }
+    out
+}
+
+fn host_of(root: str, parts: []str) -> str {
+    if parts.len == 0 {
+        return root
+    }
+    "{root}/{text.join(parts, "/")}"
+}
+
+fn resolve(root: str, path: str, follow_last: bool) -> Resolved ! Error {
+    var pending = split_path(client_path(path))
+    var done: []str = []
+    var links = 0
+    var i = 0
+    for i < pending.len {
+        let part = pending[i]
+        i += 1
+        if part == ".." {
+            if done.len > 0 {
+                done = done[..done.len - 1]
+            }
+            continue
+        }
+        if !valid_part(part) {
+            fail NotFound
+        }
+        if i == pending.len && !follow_last {
+            push(mut done, part)
+            continue
+        }
+        let candidate = "{host_of(root, done)}/{part}"
+        let info = file.lstat(candidate) catch {
+            io.Error.NotFound => {
+                push(mut done, part)
+                continue
+            }
+            e => fail from_io(e)
+        }
+        if !info.link {
+            push(mut done, part)
+            continue
+        }
+        links += 1
+        if links > link_limit {
+            fail Failure("too many symbolic links")
+        }
+        let target = link_target(file.readlink(candidate) catch from_io)
+        if text.starts_with(target, "/") {
+            done = []
+        }
+        var next = split_path(target)
+        for rest in pending[i..] {
+            push(mut next, rest)
+        }
+        pending = next
+        i = 0
+    }
+    Resolved { host: host_of(root, done), virtual: "/{text.join(done, "/")}", root: done.len == 0 }
+}
+
+fn not_root(r: Resolved) ! Error {
+    if r.root {
+        fail PermissionDenied
+    }
+}
+
+fn attrs_of(i: file.Info) -> Attrs {
+    var kind = 0
+    if i.dir {
+        kind = type_dir
+    } else if i.link {
+        kind = type_symlink
+    } else if i.regular {
+        kind = type_regular
+    }
+    Attrs { size: i.size, uid: i.uid, gid: i.gid, permissions: kind | i.mode, accessed: i.accessed, modified: i.modified }
+}
+
+fn mode_text(a: Attrs) -> str {
+    let mode = a.permissions ?? 0
+    var out = "-"
+    if is_dir(a) {
+        out = "d"
+    } else if is_symlink(a) {
+        out = "l"
+    }
+    let letters = "rwxrwxrwx"
+    var bits = ""
+    for i in 0..9 {
+        if mode & (0o400 >> i) != 0 {
+            bits = "{bits}{letters[i..i + 1]}"
+        } else {
+            bits = "{bits}-"
+        }
+    }
+    "{out}{bits}"
+}
+
+fn long_name(name: str, a: Attrs) -> str {
+    "{mode_text(a)} 1 {a.uid ?? 0} {a.gid ?? 0} {a.size ?? 0} {name}"
+}
+
+fn status_reply(id: i64, code: i64, message: str) -> []u8 {
+    var out: []u8 = [fxp_status]
+    wire.put_u32(mut out, id)
+    wire.put_u32(mut out, code)
+    wire.put_str(mut out, message)
+    wire.put_str(mut out, "")
+    out
+}
+
+fn typed_reply(kind: u8, id: i64) -> []u8 {
+    var out: []u8 = [kind]
+    wire.put_u32(mut out, id)
+    out
+}
+
+fn name_reply(id: i64, entries: []Entry) -> []u8 {
+    var out = typed_reply(fxp_name, id)
+    wire.put_u32(mut out, entries.len)
+    for e in entries {
+        wire.put_str(mut out, e.name)
+        wire.put_str(mut out, e.long_name)
+        put_attrs(mut out, e.attrs)
+    }
+    out
+}
+
+fn single_name(id: i64, name: str) -> []u8 {
+    name_reply(id, [Entry { name, long_name: name, attrs: Attrs {} }])
+}
+
+fn find(s: *Server, handle: []u8) -> *Open ! Error {
+    match s.handles[str(handle)] {
+        some(o) => o
+        none => fail Failure("invalid handle")
+    }
+}
+
+fn register(s: *Server, o: *Open) -> []u8 ! Error {
+    if s.handles.len >= handle_limit {
+        fail Failure("too many open handles")
+    }
+    let key = "{s.next}"
+    s.next += 1
+    s.handles[key] = o
+    bytes(key)
+}
+
+fn read_path(r: *wire.Reader) -> str ! Error {
+    wire.read_str(r) catch malformed
+}
+
+fn read_handle(r: *wire.Reader) -> []u8 ! Error {
+    wire.read_string(r) catch malformed
+}
+
+fn finish(r: *wire.Reader) ! Error {
+    wire.finish(r) catch malformed
+}
+
+fn prepare_file(path: str, flags: OpenFlags, attrs: Attrs) ! Error {
+    let found = file.exists(path)
+    if flags.create && flags.exclusive && found {
+        fail Failure("file exists")
+    }
+    if !found && !flags.create {
+        fail NotFound
+    }
+    if !found {
+        let mode = (attrs.permissions ?? 0o666) & 0o7777
+        file.write_file_mode(path, [], mode) catch from_io
+        return
+    }
+    let info = file.stat(path) catch from_io
+    if info.dir {
+        fail Failure("is a directory")
+    }
+    if flags.write {
+        using f = file.update(path) catch from_io
+        if flags.truncate {
+            file.truncate(f, 0) catch from_io
+        }
+        return
+    }
+    using f = file.open(path) catch from_io
+}
+
+fn op_open(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let path = read_path(r)?
+    let bits = wire.read_u32(r) catch malformed
+    let attrs = read_attrs(r)?
+    finish(r)?
+    let flags = flags_of(bits)
+    if !flags.read && !flags.write {
+        fail Failure("no access mode")
+    }
+    let target = resolve(s.root, path, true)?
+    prepare_file(target.host, flags, attrs)?
+    let open = new(Open { path: target.host, directory: false, flags, entries: [], cursor: 0 })
+    let handle = register(s, open)?
+    var out = typed_reply(fxp_handle, id)
+    wire.put_string(mut out, handle)
+    out
+}
+
+fn op_close(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let handle = read_handle(r)?
+    finish(r)?
+    find(s, handle)?
+    delete(mut s.handles, str(handle))
+    status_reply(id, status_ok, "")
+}
+
+fn op_read(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let handle = read_handle(r)?
+    let offset = wire.read_u64(r) catch malformed
+    let length = wire.read_u32(r) catch malformed
+    finish(r)?
+    let o = find(s, handle)?
+    if o.directory || !o.flags.read {
+        fail Failure("handle not open for reading")
+    }
+    var want = length
+    if want > read_limit {
+        want = read_limit
+    }
+    let buf = io.buffer(want)
+    using f = file.open(o.path) catch from_io
+    file.seek(f, i64(offset), file.Whence.Start) catch from_io
+    let n = file.read(f, buf) catch from_io
+    if n == 0 {
+        return status_reply(id, status_eof, "")
+    }
+    var out = typed_reply(fxp_data, id)
+    wire.put_string(mut out, buf[..n])
+    out
+}
+
+fn write_data(o: *Open, offset: i64, data: []u8) ! Error {
+    if o.flags.append {
+        using f = file.append(o.path) catch from_io
+        file.write_all(f, data) catch from_io
+        return
+    }
+    using f = file.update(o.path) catch from_io
+    file.seek(f, offset, file.Whence.Start) catch from_io
+    file.write_all(f, data) catch from_io
+}
+
+fn op_write(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let handle = read_handle(r)?
+    let offset = wire.read_u64(r) catch malformed
+    let data = wire.read_string(r) catch malformed
+    finish(r)?
+    let o = find(s, handle)?
+    if o.directory || !o.flags.write {
+        fail Failure("handle not open for writing")
+    }
+    write_data(o, i64(offset), data)?
+    status_reply(id, status_ok, "")
+}
+
+fn attrs_reply(id: i64, a: Attrs) -> []u8 {
+    var out = typed_reply(fxp_attrs, id)
+    put_attrs(mut out, a)
+    out
+}
+
+fn op_stat(s: *Server, id: i64, r: *wire.Reader, follow: bool) -> []u8 ! Error {
+    let path = read_path(r)?
+    finish(r)?
+    let target = resolve(s.root, path, follow)?
+    let info = file.lstat(target.host) catch from_io
+    attrs_reply(id, attrs_of(info))
+}
+
+fn op_fstat(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let handle = read_handle(r)?
+    finish(r)?
+    let o = find(s, handle)?
+    let info = file.stat(o.path) catch from_io
+    attrs_reply(id, attrs_of(info))
+}
+
+fn apply_attrs(path: str, a: Attrs) ! Error {
+    match a.size {
+        some(size) => {
+            using f = file.update(path) catch from_io
+            file.truncate(f, size) catch from_io
+        }
+        none => {}
+    }
+    match a.permissions {
+        some(mode) => file.chmod(path, mode & 0o7777) catch from_io
+        none => {}
+    }
+    if a.uid != none && a.gid != none {
+        file.chown(path, a.uid ?? 0, a.gid ?? 0) catch from_io
+    }
+    if a.accessed != none && a.modified != none {
+        file.set_times(path, a.accessed ?? 0, a.modified ?? 0) catch from_io
+    }
+}
+
+fn op_setstat(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let path = read_path(r)?
+    let attrs = read_attrs(r)?
+    finish(r)?
+    let target = resolve(s.root, path, true)?
+    apply_attrs(target.host, attrs)?
+    status_reply(id, status_ok, "")
+}
+
+fn op_fsetstat(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let handle = read_handle(r)?
+    let attrs = read_attrs(r)?
+    finish(r)?
+    let o = find(s, handle)?
+    apply_attrs(o.path, attrs)?
+    status_reply(id, status_ok, "")
+}
+
+fn snapshot(path: str) -> []Entry ! Error {
+    var names = file.list(path) catch from_io
+    slices.sort(mut names)
+    var out: []Entry = []
+    for name in names {
+        let info = file.lstat(file.child_path(path, name)) catch {
+            e => continue
+        }
+        let attrs = attrs_of(info)
+        push(mut out, Entry { name, long_name: long_name(name, attrs), attrs })
+    }
+    out
+}
+
+fn op_opendir(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let path = read_path(r)?
+    finish(r)?
+    let target = resolve(s.root, path, true)?
+    let info = file.stat(target.host) catch from_io
+    if !info.dir {
+        fail Failure("not a directory")
+    }
+    let entries = snapshot(target.host)?
+    let open = new(Open { path: target.host, directory: true, flags: OpenFlags { read: true }, entries, cursor: 0 })
+    let handle = register(s, open)?
+    var out = typed_reply(fxp_handle, id)
+    wire.put_string(mut out, handle)
+    out
+}
+
+fn op_readdir(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let handle = read_handle(r)?
+    finish(r)?
+    let o = find(s, handle)?
+    if !o.directory {
+        fail Failure("not a directory handle")
+    }
+    if o.cursor >= o.entries.len {
+        return status_reply(id, status_eof, "")
+    }
+    var end = o.cursor + batch_size
+    if end > o.entries.len {
+        end = o.entries.len
+    }
+    let batch = o.entries[o.cursor..end]
+    o.cursor = end
+    name_reply(id, batch)
+}
+
+fn op_remove(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let path = read_path(r)?
+    finish(r)?
+    let target = resolve(s.root, path, false)?
+    not_root(target)?
+    let info = file.lstat(target.host) catch from_io
+    if info.dir {
+        fail Failure("is a directory")
+    }
+    file.remove(target.host) catch from_io
+    status_reply(id, status_ok, "")
+}
+
+fn op_mkdir(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let path = read_path(r)?
+    let attrs = read_attrs(r)?
+    finish(r)?
+    let target = resolve(s.root, path, false)?
+    not_root(target)?
+    let mode = (attrs.permissions ?? 0o777) & 0o7777
+    file.mkdir_mode(target.host, mode) catch from_io
+    status_reply(id, status_ok, "")
+}
+
+fn op_rmdir(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let path = read_path(r)?
+    finish(r)?
+    let target = resolve(s.root, path, false)?
+    not_root(target)?
+    file.remove_dir(target.host) catch from_io
+    status_reply(id, status_ok, "")
+}
+
+fn op_realpath(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let path = read_path(r)?
+    finish(r)?
+    let target = resolve(s.root, path, true)?
+    single_name(id, target.virtual)
+}
+
+fn occupied(path: str) -> bool {
+    let info = file.lstat(path) catch {
+        e => return false
+    }
+    true
+}
+
+fn move_entry(s: *Server, id: i64, from: str, to: str, replace: bool) -> []u8 ! Error {
+    let source = resolve(s.root, from, false)?
+    let destination = resolve(s.root, to, false)?
+    not_root(source)?
+    not_root(destination)?
+    if !replace && occupied(destination.host) {
+        fail Failure("destination exists")
+    }
+    file.rename(source.host, destination.host) catch from_io
+    status_reply(id, status_ok, "")
+}
+
+fn op_rename(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let from = read_path(r)?
+    let to = read_path(r)?
+    finish(r)?
+    move_entry(s, id, from, to, false)?
+}
+
+fn inside_root(s: *Server, target: str) -> str {
+    let portable = client_path(target)
+    let root = client_path(s.root)
+    if text.starts_with(portable, "{root}/") {
+        return portable[root.len..]
+    }
+    portable
+}
+
+fn op_readlink(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let path = read_path(r)?
+    finish(r)?
+    let target = resolve(s.root, path, false)?
+    let link = file.readlink(target.host) catch from_io
+    single_name(id, inside_root(s, link))
+}
+
+fn op_symlink(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let target = read_path(r)?
+    let link = read_path(r)?
+    finish(r)?
+    let at = resolve(s.root, link, false)?
+    not_root(at)?
+    file.symlink(target, at.host) catch from_io
+    status_reply(id, status_ok, "")
+}
+
+fn put_vfs(id: i64, path: str) -> []u8 ! Error {
+    let usage = file.disk_usage(path) catch from_io
+    var out = typed_reply(fxp_extended_reply, id)
+    wire.put_u64(mut out, u64(block_bytes))
+    wire.put_u64(mut out, u64(block_bytes))
+    wire.put_u64(mut out, u64(usage.total / block_bytes))
+    wire.put_u64(mut out, u64(usage.free / block_bytes))
+    wire.put_u64(mut out, u64(usage.available / block_bytes))
+    wire.put_u64(mut out, u64(usage.files))
+    wire.put_u64(mut out, u64(usage.files_free))
+    wire.put_u64(mut out, u64(usage.files_free))
+    wire.put_u64(mut out, 0)
+    wire.put_u64(mut out, 0)
+    wire.put_u64(mut out, 255)
+    out
+}
+
+fn op_limits(id: i64) -> []u8 {
+    var out = typed_reply(fxp_extended_reply, id)
+    wire.put_u64(mut out, u64(max_packet))
+    wire.put_u64(mut out, u64(read_limit))
+    wire.put_u64(mut out, u64(write_limit))
+    wire.put_u64(mut out, u64(handle_limit))
+    out
+}
+
+fn op_fsync(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let handle = read_handle(r)?
+    finish(r)?
+    let o = find(s, handle)?
+    if o.flags.write {
+        using f = file.update(o.path) catch from_io
+        file.sync(f) catch from_io
+    } else {
+        using f = file.open(o.path) catch from_io
+        file.sync(f) catch from_io
+    }
+    status_reply(id, status_ok, "")
+}
+
+fn op_extended(s: *Server, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    let name = read_path(r)?
+    match name {
+        "posix-rename@openssh.com" => {
+            let from = read_path(r)?
+            let to = read_path(r)?
+            finish(r)?
+            move_entry(s, id, from, to, true)?
+        }
+        "hardlink@openssh.com" => {
+            let existing = read_path(r)?
+            let link = read_path(r)?
+            finish(r)?
+            let source = resolve(s.root, existing, false)?
+            let destination = resolve(s.root, link, false)?
+            not_root(source)?
+            not_root(destination)?
+            file.link(source.host, destination.host) catch from_io
+            status_reply(id, status_ok, "")
+        }
+        "statvfs@openssh.com" => {
+            let path = read_path(r)?
+            finish(r)?
+            let target = resolve(s.root, path, true)?
+            put_vfs(id, target.host)?
+        }
+        "fstatvfs@openssh.com" => {
+            let handle = read_handle(r)?
+            finish(r)?
+            let o = find(s, handle)?
+            put_vfs(id, o.path)?
+        }
+        "fsync@openssh.com" => op_fsync(s, id, r)?
+        "limits@openssh.com" => {
+            finish(r)?
+            op_limits(id)
+        }
+        _ => fail Unsupported
+    }
+}
+
+fn dispatch(s: *Server, kind: u8, id: i64, r: *wire.Reader) -> []u8 ! Error {
+    match kind {
+        fxp_open => op_open(s, id, r)?
+        fxp_close => op_close(s, id, r)?
+        fxp_read => op_read(s, id, r)?
+        fxp_write => op_write(s, id, r)?
+        fxp_lstat => op_stat(s, id, r, false)?
+        fxp_stat => op_stat(s, id, r, true)?
+        fxp_fstat => op_fstat(s, id, r)?
+        fxp_setstat => op_setstat(s, id, r)?
+        fxp_fsetstat => op_fsetstat(s, id, r)?
+        fxp_opendir => op_opendir(s, id, r)?
+        fxp_readdir => op_readdir(s, id, r)?
+        fxp_remove => op_remove(s, id, r)?
+        fxp_mkdir => op_mkdir(s, id, r)?
+        fxp_rmdir => op_rmdir(s, id, r)?
+        fxp_realpath => op_realpath(s, id, r)?
+        fxp_rename => op_rename(s, id, r)?
+        fxp_readlink => op_readlink(s, id, r)?
+        fxp_symlink => op_symlink(s, id, r)?
+        fxp_extended => op_extended(s, id, r)?
+        _ => fail Unsupported
+    }
+}
+
+fn version_reply() -> []u8 {
+    var out: []u8 = [fxp_version]
+    wire.put_u32(mut out, protocol_version)
+    let extensions = [
+        ["posix-rename@openssh.com", "1"]
+        ["statvfs@openssh.com", "2"]
+        ["fstatvfs@openssh.com", "2"]
+        ["hardlink@openssh.com", "1"]
+        ["fsync@openssh.com", "1"]
+        ["limits@openssh.com", "1"]
+    ]
+    for e in extensions {
+        wire.put_str(mut out, e[0])
+        wire.put_str(mut out, e[1])
+    }
+    out
+}
+
+fn ended(e: Error) -> bool {
+    match e {
+        Io(cause) => true
+        _ => false
+    }
+}
+
+fn answer(s: *Server, stream: io.Stream, packet: []u8) ! Error {
+    let r = wire.reader(packet[1..])
+    let id = wire.read_u32(r) catch malformed
+    let reply = dispatch(s, packet[0], id, r) catch {
+        e => status_reply(id, status_of(e), message_of(e))
+    }
+    io.write_all(stream, frame(reply)) catch Io
+}
+
+/// Serves SFTP version 3 over `stream`, confined to the directory `root`, until the client closes the stream.
+///
+/// Every path a client sends is resolved from `root`: `..` never leaves it and symbolic links are followed in the same way, with an absolute target taken relative to `root`, so a link cannot reach outside. The check and the operation are separate system calls, so another process that changes the tree under `root` concurrently is not guarded against. Returns normally when the client closes the stream, and fails with `Protocol` or `BadMessage` when it sends something that is not SFTP. Supports the extensions `posix-rename@openssh.com`, `statvfs@openssh.com`, `fstatvfs@openssh.com`, `hardlink@openssh.com`, `fsync@openssh.com` and `limits@openssh.com`.
+pub fn serve(stream: io.Stream, root: str) ! Error {
+    let real = file.realpath(root) catch from_io
+    let s = new(Server { root: real, handles: [:], next: 1 })
+    let reader = io.reader(stream)
+    let first = read_packet(reader) catch {
+        e => {
+            if ended(e) {
+                return
+            }
+            fail e
+        }
+    }
+    if first[0] != fxp_init {
+        fail Protocol
+    }
+    io.write_all(stream, frame(version_reply())) catch Io
+    for {
+        let packet = read_packet(reader) catch {
+            e => {
+                if ended(e) {
+                    return
+                }
+                fail e
+            }
+        }
+        answer(s, stream, packet)?
+    }
+}
+
+fn serve_channel(inc: ssh.Incoming, root: str) {
+    if inc.kind != "session" {
+        ssh.reject(inc, prohibited, "only session channels")
+        return
+    }
+    using ch = ssh.accept(inc) catch {
+        e => return
+    }
+    for {
+        let next = ssh.next_request_on(ch.handle)
+        let req = match next {
+            some(q) => q
+            none => return
+        }
+        if req.kind != "subsystem" {
+            ssh.answer_on(ch.handle, req, false) catch {
+                e => return
+            }
+            continue
+        }
+        let name = ssh.parse_subsystem(req) catch {
+            e => return
+        }
+        let wanted = name == "sftp"
+        ssh.answer_on(ch.handle, req, wanted) catch {
+            e => return
+        }
+        if wanted {
+            serve(ssh.stream_on(ch.handle), root) or {}
+            return
+        }
+    }
+}
+
+/// Returns a channel handler for `ServerConfig.channels` that serves the `sftp` subsystem of session channels from the directory `root` and refuses every other channel and request.
+pub fn handler(root: str) -> fn(ssh.Incoming) {
+    fn(inc) { serve_channel(inc, root) }
+}

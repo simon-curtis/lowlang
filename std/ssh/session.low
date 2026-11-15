@@ -1,0 +1,378 @@
+import std/io
+import std/ssh/wire
+import std/sync
+
+/// The terminal a `pty-req` asks for.
+pub struct Pty {
+    /// The terminal type, such as `xterm-256color`.
+    pub term: str
+    /// The width in characters.
+    pub columns: i64
+    /// The height in rows.
+    pub rows: i64
+    /// The width in pixels, or 0.
+    pub width_px: i64 = 0
+    /// The height in pixels, or 0.
+    pub height_px: i64 = 0
+    /// The encoded terminal modes of RFC 4254 section 8, or empty for none.
+    pub modes: []u8 = []
+}
+
+/// The target of a `direct-tcpip` channel: where the opener wants the server to connect, and where the connection came from.
+pub struct DirectTcpip {
+    /// The host to connect to.
+    pub host: str
+    /// The port to connect to.
+    pub port: i64
+    /// The address of the connection's origin.
+    pub origin_host: str
+    /// The port of the connection's origin.
+    pub origin_port: i64
+}
+
+/// A connection the server forwards to a client that asked for `tcpip-forward`.
+pub struct Forwarded {
+    /// The channel that carries the connection.
+    pub channel: Channel
+    /// The address of the connection's origin on the server.
+    pub origin_host: str
+    /// The port of the connection's origin on the server.
+    pub origin_port: i64
+}
+
+/// A remote forwarding the server listens for, made by `listen_remote`.
+pub struct Forward {
+    /// The address the server listens on.
+    pub host: str
+    /// The port the server listens on, which is the port the server chose when 0 was requested.
+    pub port: i64
+    conn: *ConnectionHandle
+    incoming: chan[Incoming]
+    stopped: chan[bool]
+}
+
+fn open_session_handle(c: *ConnectionHandle) -> Channel ! Error {
+    Channel { handle: open_channel(c, "session", [])? }
+}
+
+/// Opens a `session` channel.
+pub fn open_session(conn: Connection) -> Channel ! Error {
+    open_session_handle(conn.handle)?
+}
+
+fn open_direct_tcpip(c: *ConnectionHandle, host: str, port: i64, origin_host: str, origin_port: i64) -> *ChannelHandle ! Error {
+    var extra: []u8 = []
+    wire.put_str(mut extra, host)
+    wire.put_u32(mut extra, port)
+    wire.put_str(mut extra, origin_host)
+    wire.put_u32(mut extra, origin_port)
+    open_channel(c, "direct-tcpip", extra)?
+}
+
+/// Opens a `direct-tcpip` channel that the server connects to `host` and `port` (RFC 4254 section 7.2).
+///
+/// `origin_host` and `origin_port` describe where the forwarded connection came from, as the server logs them.
+pub fn direct_tcpip(conn: Connection, host: str, port: i64, origin_host: str, origin_port: i64) -> Channel ! Error {
+    Channel { handle: open_direct_tcpip(conn.handle, host, port, origin_host, origin_port)? }
+}
+
+/// Opens a `direct-streamlocal@openssh.com` channel that the server connects to the Unix socket at `path`.
+pub fn direct_streamlocal(conn: Connection, path: str) -> Channel ! Error {
+    var extra: []u8 = []
+    wire.put_str(mut extra, path)
+    wire.put_str(mut extra, "")
+    wire.put_u32(mut extra, 0)
+    Channel { handle: open_channel(conn.handle, "direct-streamlocal@openssh.com", extra)? }
+}
+
+fn expect_success(h: *ChannelHandle, kind: str, data: []u8) ! Error {
+    if !request_on(h, kind, true, data)? {
+        fail RequestRefused
+    }
+}
+
+/// Asks the server to run `command` on the session channel and fails with `RequestRefused` when it refuses.
+pub fn exec_on(h: *ChannelHandle, command: str) ! Error {
+    var data: []u8 = []
+    wire.put_str(mut data, command)
+    expect_success(h, "exec", data)?
+}
+
+/// Asks the server to start the user's shell on the session channel.
+pub fn shell_on(h: *ChannelHandle) ! Error {
+    expect_success(h, "shell", [])?
+}
+
+/// Asks the server to start the subsystem `name`, such as `sftp`, on the session channel.
+pub fn subsystem_on(h: *ChannelHandle, name: str) ! Error {
+    var data: []u8 = []
+    wire.put_str(mut data, name)
+    expect_success(h, "subsystem", data)?
+}
+
+/// Opens a `session` channel and starts the subsystem `name` on it, and returns the channel's view.
+///
+/// The caller owns the channel and closes it with `close_on`. Closes the channel itself when the server refuses the subsystem.
+pub fn open_subsystem(conn: Connection, name: str) -> *ChannelHandle ! Error {
+    let h = open_channel(conn.handle, "session", [])?
+    subsystem_on(h, name) catch {
+        e => {
+            close_on(h)
+            fail e
+        }
+    }
+    h
+}
+
+/// Asks the server for a pseudo-terminal for the session.
+pub fn pty_on(h: *ChannelHandle, pty: Pty) ! Error {
+    var data: []u8 = []
+    wire.put_str(mut data, pty.term)
+    wire.put_u32(mut data, pty.columns)
+    wire.put_u32(mut data, pty.rows)
+    wire.put_u32(mut data, pty.width_px)
+    wire.put_u32(mut data, pty.height_px)
+    wire.put_string(mut data, pty.modes)
+    expect_success(h, "pty-req", data)?
+}
+
+/// Asks the server to set the environment variable `name` for the session. A server may refuse, in which case this fails with `RequestRefused`.
+pub fn env_on(h: *ChannelHandle, name: str, value: str) ! Error {
+    var data: []u8 = []
+    wire.put_str(mut data, name)
+    wire.put_str(mut data, value)
+    expect_success(h, "env", data)?
+}
+
+/// Tells the server the terminal changed size. No answer is awaited.
+pub fn window_change_on(h: *ChannelHandle, columns: i64, rows: i64, width_px: i64, height_px: i64) ! Error {
+    var data: []u8 = []
+    wire.put_u32(mut data, columns)
+    wire.put_u32(mut data, rows)
+    wire.put_u32(mut data, width_px)
+    wire.put_u32(mut data, height_px)
+    request_on(h, "window-change", false, data)?
+}
+
+/// Sends the signal `name`, such as `TERM` or `INT`, to the session's process. No answer is awaited.
+pub fn signal_on(h: *ChannelHandle, name: str) ! Error {
+    var data: []u8 = []
+    wire.put_str(mut data, name)
+    request_on(h, "signal", false, data)?
+}
+
+/// Sends `exit-status` with `code`. A server calls it once the session's command has finished, before closing the channel.
+pub fn send_exit_status_on(h: *ChannelHandle, code: i64) ! Error {
+    var data: []u8 = []
+    wire.put_u32(mut data, code)
+    request_on(h, "exit-status", false, data)?
+}
+
+/// Sends `exit-signal` for a command killed by the signal `name`, without the `SIG` prefix.
+pub fn send_exit_signal_on(h: *ChannelHandle, name: str, core_dumped: bool, message: str) ! Error {
+    var data: []u8 = []
+    wire.put_str(mut data, name)
+    wire.put_bool(mut data, core_dumped)
+    wire.put_str(mut data, message)
+    wire.put_str(mut data, "")
+    request_on(h, "exit-signal", false, data)?
+}
+
+/// Returns the command of an `exec` request.
+pub fn parse_exec(req: ChannelRequest) -> str ! Error {
+    let r = wire.reader(req.data)
+    let command = wire.read_str(r) catch malformed
+    wire.finish(r) catch malformed
+    command
+}
+
+/// Returns the subsystem name of a `subsystem` request.
+pub fn parse_subsystem(req: ChannelRequest) -> str ! Error {
+    parse_exec(req)?
+}
+
+/// Returns the terminal of a `pty-req` request.
+pub fn parse_pty(req: ChannelRequest) -> Pty ! Error {
+    let r = wire.reader(req.data)
+    let term = wire.read_str(r) catch malformed
+    let columns = wire.read_u32(r) catch malformed
+    let rows = wire.read_u32(r) catch malformed
+    let width_px = wire.read_u32(r) catch malformed
+    let height_px = wire.read_u32(r) catch malformed
+    let modes = wire.read_string(r) catch malformed
+    wire.finish(r) catch malformed
+    Pty { term, columns, rows, width_px, height_px, modes }
+}
+
+/// The name and value of an `env` request.
+pub struct Env {
+    /// The variable name.
+    pub name: str
+    /// The variable value.
+    pub value: str
+}
+
+/// Returns the variable of an `env` request.
+pub fn parse_env(req: ChannelRequest) -> Env ! Error {
+    let r = wire.reader(req.data)
+    let name = wire.read_str(r) catch malformed
+    let value = wire.read_str(r) catch malformed
+    wire.finish(r) catch malformed
+    Env { name, value }
+}
+
+/// Returns the columns, rows, pixel width and pixel height of a `window-change` request, in that order.
+pub fn parse_window_change(req: ChannelRequest) -> []i64 ! Error {
+    let r = wire.reader(req.data)
+    let columns = wire.read_u32(r) catch malformed
+    let rows = wire.read_u32(r) catch malformed
+    let width_px = wire.read_u32(r) catch malformed
+    let height_px = wire.read_u32(r) catch malformed
+    wire.finish(r) catch malformed
+    [columns, rows, width_px, height_px]
+}
+
+/// Returns the signal name of a `signal` request.
+pub fn parse_signal(req: ChannelRequest) -> str ! Error {
+    parse_exec(req)?
+}
+
+/// Returns the target of a `direct-tcpip` open.
+pub fn parse_direct_tcpip(inc: Incoming) -> DirectTcpip ! Error {
+    let r = wire.reader(inc.data)
+    let host = wire.read_str(r) catch malformed
+    let port = wire.read_u32(r) catch malformed
+    let origin_host = wire.read_str(r) catch malformed
+    let origin_port = wire.read_u32(r) catch malformed
+    wire.finish(r) catch malformed
+    DirectTcpip { host, port, origin_host, origin_port }
+}
+
+/// Returns the socket path of a `direct-streamlocal@openssh.com` open.
+pub fn parse_direct_streamlocal(inc: Incoming) -> str ! Error {
+    let r = wire.reader(inc.data)
+    let path = wire.read_str(r) catch malformed
+    wire.read_str(r) catch malformed
+    wire.read_u32(r) catch malformed
+    wire.finish(r) catch malformed
+    path
+}
+
+/// Returns the address and port a `tcpip-forward` or `cancel-tcpip-forward` request names.
+pub fn parse_forward_request(req: GlobalRequest) -> Address ! Error {
+    let r = wire.reader(req.data)
+    let host = wire.read_str(r) catch malformed
+    let port = wire.read_u32(r) catch malformed
+    wire.finish(r) catch malformed
+    Address { host, port }
+}
+
+/// A host and port.
+pub struct Address {
+    /// The host name or address.
+    pub host: str
+    /// The port.
+    pub port: i64
+}
+
+fn forward_key(host: str, port: i64) -> str {
+    "{host}:{port}"
+}
+
+/// Asks the server to listen on `host` and `port` and forward each connection to this client (`tcpip-forward`).
+///
+/// With port 0 the server chooses one, which the result reports. Fails with `RequestRefused` when the server refuses.
+pub fn listen_remote(conn: Connection, host: str, port: i64) -> Forward ! Error {
+    var data: []u8 = []
+    wire.put_str(mut data, host)
+    wire.put_u32(mut data, port)
+    let incoming = chan[Incoming](16)
+    let c = conn.handle
+    sync.lock(c.lock)
+    c.forwards[forward_key(host, port)] = incoming
+    sync.unlock(c.lock)
+    let reply = global_request(c, "tcpip-forward", true, data)?
+    if !reply.ok {
+        sync.lock(c.lock)
+        delete(mut c.forwards, forward_key(host, port))
+        sync.unlock(c.lock)
+        fail RequestRefused
+    }
+    var bound = port
+    if port == 0 && reply.data.len == 4 {
+        bound = io.be32(reply.data, 0)
+        sync.lock(c.lock)
+        c.forwards[forward_key(host, bound)] = incoming
+        sync.unlock(c.lock)
+    }
+    Forward { host, port: bound, conn: c, incoming, stopped: chan[bool](1) }
+}
+
+/// Waits for the next connection the server forwards and returns it.
+///
+/// Fails with the connection's failure once it ends, and with `Closed` after `cancel_forward`.
+pub fn accept_forward(f: Forward) -> Forwarded ! Error {
+    let offered: Incoming? = select {
+        inc = <-f.incoming => inc
+        <-f.stopped => fail Closed
+        <-f.conn.done => none
+    }
+    let inc = match offered {
+        some(i) => i
+        none => fail failure_of(f.conn)
+    }
+    let r = wire.reader(inc.data)
+    wire.read_str(r) catch malformed
+    wire.read_u32(r) catch malformed
+    let origin_host = wire.read_str(r) catch malformed
+    let origin_port = wire.read_u32(r) catch malformed
+    Forwarded { channel: accept(inc)?, origin_host, origin_port }
+}
+
+/// Cancels the remote forwarding (`cancel-tcpip-forward`). Later `accept_forward` calls fail with `Closed`.
+pub fn cancel_forward(f: Forward) ! Error {
+    var data: []u8 = []
+    wire.put_str(mut data, f.host)
+    wire.put_u32(mut data, f.port)
+    sync.lock(f.conn.lock)
+    let registered = match f.conn.forwards[forward_key(f.host, f.port)] {
+        some(_) => true
+        none => false
+    }
+    delete(mut f.conn.forwards, forward_key(f.host, f.port))
+    sync.unlock(f.conn.lock)
+    if !registered {
+        return
+    }
+    close(f.stopped)
+    global_request(f.conn, "cancel-tcpip-forward", true, data)?
+}
+
+fn route_forwarded(inc: Incoming) {
+    let c = inc.conn
+    if inc.kind != "forwarded-tcpip" {
+        reject(inc, open_unknown_channel_type, "unknown channel type")
+        return
+    }
+    let r = wire.reader(inc.data)
+    let host = wire.read_str(r) or ""
+    let port = wire.read_u32(r) or 0
+    sync.lock(c.lock)
+    let target = c.forwards[forward_key(host, port)]
+    sync.unlock(c.lock)
+    let delivered = match target {
+        some(queue) => select {
+            queue <- inc => true
+            else => false
+        }
+        none => false
+    }
+    if !delivered {
+        reject(inc, open_administratively_prohibited, "no such forwarding")
+    }
+}
+
+/// Sends a `keepalive@openssh.com` global request and waits for the reply. Both success and failure replies show the peer is alive.
+pub fn keepalive(conn: Connection) ! Error {
+    global_request(conn.handle, "keepalive@openssh.com", true, [])?
+}

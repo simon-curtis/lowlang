@@ -1,0 +1,975 @@
+import std/io
+import std/ssh
+import std/ssh/wire
+import std/sync
+
+const read_ahead = 8
+const write_behind = 8
+const request_mask = 0xFFFFFFFF
+
+struct Reply {
+    kind: i64
+    body: []u8
+    failed: bool
+}
+
+struct Ahead {
+    offset: i64
+    length: i64
+    reply: chan[Reply]
+}
+
+/// The shared state of a client connection: the stream, the outstanding requests and what the server announced.
+pub struct Session {
+    stream: io.Stream
+    reader: *io.Reader
+    write_lock: sync.Mutex
+    lock: sync.Mutex
+    pending: [i64: chan[Reply]]
+    next_id: i64
+    dead: bool
+    cause: Error?
+    extensions: [str: str]
+    read_length: i64
+    write_length: i64
+}
+
+/// An SFTP client that closes its stream when dropped.
+///
+/// Every operation takes `handle`, the copyable view of the session, so green threads can share one client; their requests are pipelined on the one stream and an open `File` or `Dir` shares it. The views stay valid while this value lives.
+pub struct Client {
+    /// The copyable view of the session that the operations take.
+    pub handle: *Session
+    drop close_session(handle)
+}
+
+/// The file system capacity figures of the `statvfs@openssh.com` extension.
+pub struct StatVfs {
+    /// The file system block size.
+    pub block_size: i64
+    /// The fundamental block size.
+    pub fragment_size: i64
+    /// The number of blocks.
+    pub blocks: i64
+    /// The number of free blocks.
+    pub free_blocks: i64
+    /// The number of blocks free for an unprivileged user.
+    pub available_blocks: i64
+    /// The number of inodes.
+    pub files: i64
+    /// The number of free inodes.
+    pub free_files: i64
+    /// The number of inodes free for an unprivileged user.
+    pub available_files: i64
+    /// The file system identifier.
+    pub filesystem_id: i64
+    /// The mount flags; bit 0 is read-only and bit 1 is no-setuid.
+    pub flags: i64
+    /// The maximum length of a file name.
+    pub name_max: i64
+}
+
+/// The sizes the `limits@openssh.com` extension reports.
+pub struct Limits {
+    /// The largest packet the server accepts.
+    pub packet_length: i64
+    /// The largest read the server answers in one reply.
+    pub read_length: i64
+    /// The largest write the server accepts in one request.
+    pub write_length: i64
+    /// The most open handles; 0 means no limit.
+    pub open_handles: i64
+}
+
+fn close_session(s: *Session) {
+    kill(s, Closed)
+}
+
+fn to_io(e: Error) -> io.Error {
+    match e {
+        Io(cause) => cause
+        NotFound => io.Error.NotFound
+        PermissionDenied => io.Error.Denied
+        Closed => io.Error.BrokenPipe
+        _ => io.Error.Aborted
+    }
+}
+
+fn kill(s: *Session, cause: Error) {
+    sync.lock(s.lock)
+    if s.dead {
+        sync.unlock(s.lock)
+        return
+    }
+    s.dead = true
+    s.cause = cause
+    var waiting: []chan[Reply] = []
+    for id, reply in s.pending {
+        push(mut waiting, reply)
+    }
+    s.pending = [:]
+    sync.unlock(s.lock)
+    for reply in waiting {
+        reply <- Reply { kind: 0, body: [], failed: true }
+    }
+    s.stream.close()
+}
+
+fn failure_of(s: *Session) -> Error {
+    sync.lock(s.lock)
+    defer sync.unlock(s.lock)
+    match s.cause {
+        some(e) => e
+        none => Closed
+    }
+}
+
+fn deliver(s: *Session, id: i64, reply: Reply) ! Error {
+    sync.lock(s.lock)
+    let target = s.pending[id]
+    delete(mut s.pending, id)
+    sync.unlock(s.lock)
+    match target {
+        some(c) => {
+            c <- reply
+        }
+        none => fail Protocol
+    }
+}
+
+fn run_reader(s: *Session) {
+    for {
+        let p = read_packet(s.reader) catch {
+            e => {
+                kill(s, e)
+                return
+            }
+        }
+        let r = wire.reader(p[1..])
+        let id = wire.read_u32(r) catch {
+            e => {
+                kill(s, Protocol)
+                return
+            }
+        }
+        deliver(s, id, Reply { kind: i64(p[0]), body: wire.rest(r), failed: false }) catch {
+            e => {
+                kill(s, e)
+                return
+            }
+        }
+    }
+}
+
+fn transmit(s: *Session, kind: u8, payload: []u8) -> chan[Reply] ! Error {
+    sync.lock(s.lock)
+    if s.dead {
+        sync.unlock(s.lock)
+        fail failure_of(s)
+    }
+    let id = s.next_id & request_mask
+    s.next_id = id + 1
+    let reply = chan[Reply](1)
+    s.pending[id] = reply
+    sync.unlock(s.lock)
+    var packet: []u8 = [kind]
+    wire.put_u32(mut packet, id)
+    io.append(mut packet, payload)
+    let framed = frame(packet)
+    sync.lock(s.write_lock)
+    io.write_all(s.stream, framed) catch {
+        e => {
+            sync.unlock(s.write_lock)
+            kill(s, Io(e))
+            fail Io(e)
+        }
+    }
+    sync.unlock(s.write_lock)
+    reply
+}
+
+fn await(s: *Session, reply: chan[Reply]) -> Reply ! Error {
+    let got = <-reply
+    let r = got ?? Reply { kind: 0, body: [], failed: true }
+    if r.failed {
+        fail failure_of(s)
+    }
+    r
+}
+
+fn call(s: *Session, kind: u8, payload: []u8) -> Reply ! Error {
+    let reply = transmit(s, kind, payload)?
+    await(s, reply)?
+}
+
+fn read_status(r: Reply) -> StatusReply ! Error {
+    if r.kind != i64(fxp_status) {
+        fail Protocol
+    }
+    let body = wire.reader(r.body)
+    let code = wire.read_u32(body) catch malformed
+    var message = ""
+    if wire.left(body) > 0 {
+        message = wire.read_str(body) catch malformed
+    }
+    StatusReply { code, message }
+}
+
+struct StatusReply {
+    code: i64
+    message: str
+}
+
+fn expect_ok(r: Reply) ! Error {
+    let status = read_status(r)?
+    if status.code != status_ok {
+        fail status_error(status.code, status.message)
+    }
+}
+
+fn expect_handle(r: Reply) -> []u8 ! Error {
+    if r.kind == i64(fxp_status) {
+        let status = read_status(r)?
+        fail status_error(status.code, status.message)
+    }
+    if r.kind != i64(fxp_handle) {
+        fail Protocol
+    }
+    let body = wire.reader(r.body)
+    let handle = wire.read_string(body) catch malformed
+    wire.finish(body) catch malformed
+    handle
+}
+
+fn expect_attrs(r: Reply) -> Attrs ! Error {
+    if r.kind == i64(fxp_status) {
+        let status = read_status(r)?
+        fail status_error(status.code, status.message)
+    }
+    if r.kind != i64(fxp_attrs) {
+        fail Protocol
+    }
+    let body = wire.reader(r.body)
+    let a = read_attrs(body)?
+    wire.finish(body) catch malformed
+    a
+}
+
+fn expect_names(r: Reply) -> []Entry ! Error {
+    if r.kind != i64(fxp_name) {
+        fail Protocol
+    }
+    let body = wire.reader(r.body)
+    let count = wire.read_u32(body) catch malformed
+    if count > 65536 {
+        fail BadMessage
+    }
+    var out: []Entry = []
+    for i in 0..count {
+        let name = wire.read_str(body) catch malformed
+        let long_name = wire.read_str(body) catch malformed
+        let attrs = read_attrs(body)?
+        push(mut out, Entry { name, long_name, attrs })
+    }
+    wire.finish(body) catch malformed
+    out
+}
+
+fn path_payload(path: str) -> []u8 {
+    var out: []u8 = []
+    wire.put_str(mut out, path)
+    out
+}
+
+fn pair_payload(first: str, second: str) -> []u8 {
+    var out: []u8 = []
+    wire.put_str(mut out, first)
+    wire.put_str(mut out, second)
+    out
+}
+
+fn handle_payload(handle: []u8) -> []u8 {
+    var out: []u8 = []
+    wire.put_string(mut out, handle)
+    out
+}
+
+fn extension_payload(name: str, data: []u8) -> []u8 {
+    var out: []u8 = []
+    wire.put_str(mut out, name)
+    io.append(mut out, data)
+    out
+}
+
+fn announced(s: *Session, name: str) -> bool {
+    match s.extensions[name] {
+        some(_) => true
+        none => false
+    }
+}
+
+fn extended_reply(s: *Session, name: str, data: []u8) -> Reply ! Error {
+    if !announced(s, name) {
+        fail Unsupported
+    }
+    call(s, fxp_extended, extension_payload(name, data))?
+}
+
+fn session_of(stream: io.Stream) -> *Session {
+    new(Session {
+        stream
+        reader: io.reader(stream)
+        write_lock: sync.mutex()
+        lock: sync.mutex()
+        pending: [:]
+        next_id: 1
+        dead: false
+        cause: none
+        extensions: [:]
+        read_length: default_read_length
+        write_length: default_write_length
+    })
+}
+
+fn negotiate(s: *Session) ! Error {
+    var init: []u8 = [fxp_init]
+    wire.put_u32(mut init, protocol_version)
+    io.write_all(s.stream, frame(init)) catch Io
+    let reply = read_packet(s.reader)?
+    if reply[0] != fxp_version {
+        fail Protocol
+    }
+    let r = wire.reader(reply[1..])
+    let version = wire.read_u32(r) catch malformed
+    if version < protocol_version {
+        fail Unsupported
+    }
+    for wire.left(r) > 0 {
+        let name = wire.read_str(r) catch malformed
+        let data = wire.read_str(r) catch malformed
+        s.extensions[name] = data
+    }
+}
+
+fn adopt_limits(s: *Session) {
+    if !announced(s, "limits@openssh.com") {
+        return
+    }
+    let found = limits_of(s) catch {
+        e => return
+    }
+    if found.read_length > 0 {
+        s.read_length = min_of(found.read_length, max_chunk)
+    }
+    if found.write_length > 0 {
+        s.write_length = min_of(found.write_length, max_chunk)
+    }
+}
+
+const max_chunk = 65536
+
+fn min_of(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    b
+}
+
+fn limits_of(s: *Session) -> Limits ! Error {
+    let reply = extended_reply(s, "limits@openssh.com", [])?
+    if reply.kind != i64(fxp_extended_reply) {
+        fail Protocol
+    }
+    let r = wire.reader(reply.body)
+    let packet = wire.read_u64(r) catch malformed
+    let read = wire.read_u64(r) catch malformed
+    let write = wire.read_u64(r) catch malformed
+    let handles = wire.read_u64(r) catch malformed
+    Limits { packet_length: i64(packet), read_length: i64(read), write_length: i64(write), open_handles: i64(handles) }
+}
+
+/// Starts an SFTP session over `stream`, which carries the SFTP packets of a subsystem or of a program's standard streams.
+///
+/// Sends the version request and reads the server's version and extensions. The stream is closed when this fails and when the client is dropped. Fails with `Unsupported` for a server older than version 3.
+pub fn connect(stream: io.Stream) -> Client ! Error {
+    let s = session_of(stream)
+    negotiate(s) catch {
+        e => {
+            stream.close()
+            fail e
+        }
+    }
+    spawn run_reader(s)
+    adopt_limits(s)
+    Client { handle: s }
+}
+
+/// Opens the `sftp` subsystem on a new channel of the SSH connection `conn` and starts a session over it.
+///
+/// Closing the client closes the channel. Fails with the SSH error when the server refuses the subsystem.
+pub fn open(conn: ssh.Connection) -> Client ! Error {
+    let channel = ssh.open_subsystem(conn, "sftp") catch {
+        e => fail Io(io.Error.Refused)
+    }
+    connect(ssh.stream_on(channel))?
+}
+
+/// Returns whether the server announced the extension `name`, such as `posix-rename@openssh.com`.
+pub fn supports(c: *Session, name: str) -> bool {
+    announced(c, name)
+}
+
+/// Returns the sizes the server reports with `limits@openssh.com`. Fails with `Unsupported` when the server does not announce the extension.
+pub fn limits(c: *Session) -> Limits ! Error {
+    limits_of(c)?
+}
+
+/// Returns the attributes of `path`, following symbolic links.
+pub fn stat(c: *Session, path: str) -> Attrs ! Error {
+    expect_attrs(call(c, fxp_stat, path_payload(path))?)?
+}
+
+/// Returns the attributes of `path` without following a final symbolic link.
+pub fn lstat(c: *Session, path: str) -> Attrs ! Error {
+    expect_attrs(call(c, fxp_lstat, path_payload(path))?)?
+}
+
+fn attrs_payload(first: []u8, a: Attrs) -> []u8 {
+    var out: []u8 = []
+    io.append(mut out, first)
+    put_attrs(mut out, a)
+    out
+}
+
+/// Changes the attributes of `path` that are not `none` in `attrs`.
+///
+/// Ownership and times are sent only as pairs: set both `uid` and `gid`, or both `accessed` and `modified`.
+pub fn set_attrs(c: *Session, path: str, attrs: Attrs) ! Error {
+    expect_ok(call(c, fxp_setstat, attrs_payload(path_payload(path), attrs))?)?
+}
+
+/// Removes the file or symbolic link at `path`.
+pub fn remove(c: *Session, path: str) ! Error {
+    expect_ok(call(c, fxp_remove, path_payload(path))?)?
+}
+
+/// Creates the directory `path` with the permission bits `mode`.
+pub fn mkdir(c: *Session, path: str, mode: i64) ! Error {
+    expect_ok(call(c, fxp_mkdir, attrs_payload(path_payload(path), Attrs { permissions: mode }))?)?
+}
+
+/// Removes the empty directory `path`.
+pub fn rmdir(c: *Session, path: str) ! Error {
+    expect_ok(call(c, fxp_rmdir, path_payload(path))?)?
+}
+
+/// Returns the canonical absolute form of `path` on the server.
+pub fn real_path(c: *Session, path: str) -> str ! Error {
+    let entries = expect_names(call(c, fxp_realpath, path_payload(path))?)?
+    if entries.len != 1 {
+        fail Protocol
+    }
+    entries[0].name
+}
+
+/// Renames `from` to `to`. Fails with `Failure` when `to` exists on servers that do not replace it; `posix_rename` replaces.
+pub fn rename(c: *Session, from: str, to: str) ! Error {
+    expect_ok(call(c, fxp_rename, pair_payload(from, to))?)?
+}
+
+/// Returns the target of the symbolic link at `path`.
+pub fn read_link(c: *Session, path: str) -> str ! Error {
+    let entries = expect_names(call(c, fxp_readlink, path_payload(path))?)?
+    if entries.len != 1 {
+        fail Protocol
+    }
+    entries[0].name
+}
+
+/// Creates the symbolic link `link` that points to `target`.
+///
+/// Sends the arguments in the order OpenSSH's server reads them, target first, which is the order every deployed server uses.
+pub fn symlink(c: *Session, target: str, link: str) ! Error {
+    expect_ok(call(c, fxp_symlink, pair_payload(target, link))?)?
+}
+
+/// Renames `from` to `to`, replacing `to` as `rename(2)` does (`posix-rename@openssh.com`). Fails with `Unsupported` when the server lacks the extension.
+pub fn posix_rename(c: *Session, from: str, to: str) ! Error {
+    expect_ok(extended_reply(c, "posix-rename@openssh.com", pair_payload(from, to))?)?
+}
+
+/// Creates the hard link `link` to `existing` (`hardlink@openssh.com`). Fails with `Unsupported` when the server lacks the extension.
+pub fn hardlink(c: *Session, existing: str, link: str) ! Error {
+    expect_ok(extended_reply(c, "hardlink@openssh.com", pair_payload(existing, link))?)?
+}
+
+fn vfs_of(reply: Reply) -> StatVfs ! Error {
+    if reply.kind == i64(fxp_status) {
+        let status = read_status(reply)?
+        fail status_error(status.code, status.message)
+    }
+    if reply.kind != i64(fxp_extended_reply) {
+        fail Protocol
+    }
+    let r = wire.reader(reply.body)
+    var fields: []i64 = []
+    for i in 0..11 {
+        let v = wire.read_u64(r) catch malformed
+        push(mut fields, i64(v))
+    }
+    StatVfs {
+        block_size: fields[0]
+        fragment_size: fields[1]
+        blocks: fields[2]
+        free_blocks: fields[3]
+        available_blocks: fields[4]
+        files: fields[5]
+        free_files: fields[6]
+        available_files: fields[7]
+        filesystem_id: fields[8]
+        flags: fields[9]
+        name_max: fields[10]
+    }
+}
+
+/// Returns the capacity of the file system that holds `path` (`statvfs@openssh.com`). Fails with `Unsupported` when the server lacks the extension.
+pub fn statvfs(c: *Session, path: str) -> StatVfs ! Error {
+    vfs_of(extended_reply(c, "statvfs@openssh.com", path_payload(path))?)?
+}
+
+/// A directory open for listing that closes itself when dropped.
+pub struct Dir {
+    /// The copyable view of the open directory.
+    pub handle: *DirState
+    drop release_dir(handle)
+}
+
+/// The state of an open directory.
+pub struct DirState {
+    session: *Session
+    id: []u8
+    done: bool
+    closed: bool
+}
+
+fn discard_reply(s: *Session, reply: chan[Reply]) {
+    await(s, reply) catch {
+        e => return
+    }
+}
+
+fn discard_close(s: *Session, id: []u8) {
+    call(s, fxp_close, handle_payload(id)) catch {
+        e => return
+    }
+}
+
+fn release_dir(d: *DirState) {
+    if d.closed {
+        return
+    }
+    d.closed = true
+    discard_close(d.session, d.id)
+}
+
+/// Opens the directory `path` for listing.
+pub fn open_dir(c: *Session, path: str) -> Dir ! Error {
+    let id = expect_handle(call(c, fxp_opendir, path_payload(path))?)?
+    Dir { handle: new(DirState { session: c, id, done: false, closed: false }) }
+}
+
+/// Returns the next batch of entries of `d`, or an empty list at the end of the directory.
+///
+/// The entries `.` and `..` are left out.
+pub fn read_dir(d: Dir) -> []Entry ! Error {
+    let st = d.handle
+    if st.done {
+        return []
+    }
+    for {
+        let reply = call(st.session, fxp_readdir, handle_payload(st.id))?
+        if reply.kind == i64(fxp_status) {
+            let status = read_status(reply)?
+            if status.code == status_eof {
+                st.done = true
+                return []
+            }
+            fail status_error(status.code, status.message)
+        }
+        let entries = expect_names(reply)?
+        var shown: []Entry = []
+        for e in entries {
+            if e.name != "." && e.name != ".." {
+                push(mut shown, e)
+            }
+        }
+        if shown.len > 0 {
+            return shown
+        }
+    }
+    []
+}
+
+/// Returns every entry of the directory `path`, without `.` and `..`.
+pub fn list(c: *Session, path: str) -> []Entry ! Error {
+    using d = open_dir(c, path)?
+    var all: []Entry = []
+    for {
+        let batch = read_dir(d)?
+        if batch.len == 0 {
+            break
+        }
+        for e in batch {
+            push(mut all, e)
+        }
+    }
+    all
+}
+
+/// The state of an open remote file.
+pub struct FileState {
+    session: *Session
+    id: []u8
+    read_pos: i64
+    issue_pos: i64
+    ahead: []Ahead
+    carry: []u8
+    at_eof: bool
+    write_pos: i64
+    behind: []chan[Reply]
+    write_failure: Error?
+    closed: bool
+}
+
+/// An open remote file that closes itself when dropped.
+///
+/// `read` and `write` move through the file sequentially and pipeline their requests; `read_at` and `write_at` address any offset. One file is used by one green thread at a time.
+pub struct File {
+    /// The copyable view of the open file.
+    pub handle: *FileState
+    drop release_file(handle)
+}
+
+fn release_file(st: *FileState) {
+    if st.closed {
+        return
+    }
+    finish_writes(st) or {}
+    drop_ahead(st)
+    st.closed = true
+    discard_close(st.session, st.id)
+}
+
+/// Opens the file `path` as `flags` say, creating it with the attributes `attrs` when `flags.create` is set.
+pub fn open_file(c: *Session, path: str, flags: OpenFlags, attrs: Attrs) -> File ! Error {
+    var payload = path_payload(path)
+    wire.put_u32(mut payload, flag_bits(flags))
+    put_attrs(mut payload, attrs)
+    let id = expect_handle(call(c, fxp_open, payload)?)?
+    let state = new(FileState {
+        session: c
+        id
+        read_pos: 0
+        issue_pos: 0
+        ahead: []
+        carry: []
+        at_eof: false
+        write_pos: 0
+        behind: []
+        write_failure: none
+        closed: false
+    })
+    File { handle: state }
+}
+
+fn drop_ahead(st: *FileState) {
+    for pending in st.ahead {
+        discard_reply(st.session, pending.reply)
+    }
+    st.ahead = []
+    st.carry = []
+}
+
+fn read_request(st: *FileState, offset: i64, length: i64) -> chan[Reply] ! Error {
+    var payload = handle_payload(st.id)
+    wire.put_u64(mut payload, u64(offset))
+    wire.put_u32(mut payload, length)
+    transmit(st.session, fxp_read, payload)?
+}
+
+fn data_of(r: Reply) -> []u8 ! Error {
+    let body = wire.reader(r.body)
+    let data = wire.read_string(body) catch malformed
+    wire.finish(body) catch malformed
+    data
+}
+
+fn read_at_state(st: *FileState, offset: i64, buf: []u8) -> i64 ! Error {
+    var length = buf.len
+    if length > st.session.read_length {
+        length = st.session.read_length
+    }
+    if length == 0 {
+        return 0
+    }
+    let reply = await(st.session, read_request(st, offset, length)?)?
+    if reply.kind == i64(fxp_status) {
+        let status = read_status(reply)?
+        if status.code == status_eof {
+            return 0
+        }
+        fail status_error(status.code, status.message)
+    }
+    if reply.kind != i64(fxp_data) {
+        fail Protocol
+    }
+    let data = data_of(reply)?
+    if data.len > length {
+        fail Protocol
+    }
+    io.copy(buf, data)
+}
+
+/// Reads up to `buf.len` bytes of the file starting at `offset` and returns the count, or 0 at the end of the file. A single request is sent, so the count can be smaller than `buf.len` before the end.
+pub fn read_at(f: File, offset: i64, buf: []u8) -> i64 ! Error {
+    read_at_state(f.handle, offset, buf)?
+}
+
+fn fill_ahead(st: *FileState) ! Error {
+    for !st.at_eof && st.ahead.len < read_ahead {
+        let length = st.session.read_length
+        let reply = read_request(st, st.issue_pos, length)?
+        push(mut st.ahead, Ahead { offset: st.issue_pos, length, reply })
+        st.issue_pos += length
+    }
+}
+
+fn read_sequential(st: *FileState, buf: []u8) -> i64 ! Error {
+    if st.carry.len > 0 {
+        let n = io.copy(buf, st.carry)
+        st.carry = st.carry[n..]
+        st.read_pos += n
+        return n
+    }
+    if buf.len == 0 {
+        return 0
+    }
+    for {
+        if st.ahead.len == 0 && st.at_eof {
+            return 0
+        }
+        fill_ahead(st)?
+        let next = st.ahead[0]
+        st.ahead = st.ahead[1..]
+        let reply = await(st.session, next.reply)?
+        if reply.kind == i64(fxp_status) {
+            let status = read_status(reply)?
+            if status.code == status_eof {
+                st.at_eof = true
+                drop_ahead(st)
+                return 0
+            }
+            fail status_error(status.code, status.message)
+        }
+        if reply.kind != i64(fxp_data) {
+            fail Protocol
+        }
+        let data = data_of(reply)?
+        if data.len > next.length {
+            fail Protocol
+        }
+        if data.len < next.length {
+            drop_ahead(st)
+            st.issue_pos = next.offset + data.len
+        }
+        if data.len == 0 {
+            continue
+        }
+        let n = io.copy(buf, data)
+        st.carry = data[n..]
+        st.read_pos += n
+        return n
+    }
+    0
+}
+
+/// Reads up to `buf.len` bytes at the file's current position and returns the count, or 0 at the end of the file.
+///
+/// Up to eight reads are in flight ahead of the position, so a sequential read of a large file does not wait a round trip per block.
+pub fn read(f: File, buf: []u8) -> i64 ! Error {
+    read_sequential(f.handle, buf)?
+}
+
+fn write_request(st: *FileState, offset: i64, data: []u8) -> chan[Reply] ! Error {
+    var payload = handle_payload(st.id)
+    wire.put_u64(mut payload, u64(offset))
+    wire.put_string(mut payload, data)
+    transmit(st.session, fxp_write, payload)?
+}
+
+fn settle_one(st: *FileState) {
+    let oldest = st.behind[0]
+    st.behind = st.behind[1..]
+    let reply = await(st.session, oldest) catch {
+        e => {
+            if st.write_failure == none {
+                st.write_failure = e
+            }
+            return
+        }
+    }
+    expect_ok(reply) catch {
+        e => {
+            if st.write_failure == none {
+                st.write_failure = e
+            }
+        }
+    }
+}
+
+fn finish_writes(st: *FileState) ! Error {
+    for st.behind.len > 0 {
+        settle_one(st)
+    }
+    match st.write_failure {
+        some(e) => {
+            st.write_failure = none
+            fail e
+        }
+        none => {}
+    }
+}
+
+fn write_chunks(st: *FileState, offset: i64, data: []u8) ! Error {
+    var at = 0
+    var position = offset
+    for at < data.len {
+        var end = at + st.session.write_length
+        if end > data.len {
+            end = data.len
+        }
+        for st.behind.len >= write_behind {
+            settle_one(st)
+        }
+        match st.write_failure {
+            some(e) => {
+                st.write_failure = none
+                fail e
+            }
+            none => {}
+        }
+        let reply = write_request(st, position, data[at..end])?
+        push(mut st.behind, reply)
+        position += end - at
+        at = end
+    }
+}
+
+/// Writes `data` at the file's current position and moves the position.
+///
+/// Up to eight write requests are in flight. A failure of an earlier request is reported by a later `write`, `flush` or `close`.
+pub fn write(f: File, data: []u8) -> i64 ! Error {
+    let st = f.handle
+    write_chunks(st, st.write_pos, data)?
+    st.write_pos += data.len
+    data.len
+}
+
+/// Writes `data` at `offset` and waits until the server has acknowledged every chunk.
+pub fn write_at(f: File, offset: i64, data: []u8) ! Error {
+    let st = f.handle
+    write_chunks(st, offset, data)?
+    finish_writes(st)?
+}
+
+/// Waits until the server has acknowledged every write sent so far and returns the first failure among them.
+pub fn flush(f: File) ! Error {
+    finish_writes(f.handle)?
+}
+
+/// Moves the position of `read` and `write` to `offset` bytes from the start of the file.
+pub fn seek(f: File, offset: i64) ! Error {
+    let st = f.handle
+    if offset < 0 {
+        fail Invalid
+    }
+    finish_writes(st)?
+    drop_ahead(st)
+    st.at_eof = false
+    st.read_pos = offset
+    st.issue_pos = offset
+    st.write_pos = offset
+}
+
+/// Returns the attributes of the open file.
+pub fn fstat(f: File) -> Attrs ! Error {
+    expect_attrs(call(f.handle.session, fxp_fstat, handle_payload(f.handle.id))?)?
+}
+
+/// Changes the attributes of the open file that are not `none` in `attrs`.
+pub fn set_file_attrs(f: File, attrs: Attrs) ! Error {
+    expect_ok(call(f.handle.session, fxp_fsetstat, attrs_payload(handle_payload(f.handle.id), attrs))?)?
+}
+
+/// Makes the server write the file's data to stable storage (`fsync@openssh.com`). Fails with `Unsupported` when the server lacks the extension.
+pub fn sync(f: File) ! Error {
+    finish_writes(f.handle)?
+    expect_ok(extended_reply(f.handle.session, "fsync@openssh.com", handle_payload(f.handle.id))?)?
+}
+
+/// Waits for outstanding writes, then closes the file on the server. Fails with the first failure of a write or of the close itself.
+pub fn close(f: File) ! Error {
+    let st = f.handle
+    if st.closed {
+        return
+    }
+    var failure: Error? = none
+    finish_writes(st) catch {
+        e => {
+            failure = e
+        }
+    }
+    drop_ahead(st)
+    st.closed = true
+    expect_ok(call(st.session, fxp_close, handle_payload(st.id))?)?
+    match failure {
+        some(e) => fail e
+        none => {}
+    }
+}
+
+/// Returns the file as a `std/io` stream: `read` and `write` are the sequential operations and `close` closes the file, ignoring failures.
+pub fn stream(f: File) -> io.Stream {
+    let st = f.handle
+    io.Stream {
+        read: fn(buf) -> i64 ! io.Error { read_sequential(st, buf) catch to_io }
+        write: fn(data) -> i64 ! io.Error {
+            write_chunks(st, st.write_pos, data) catch to_io
+            st.write_pos += data.len
+            data.len
+        }
+        close: fn() { release_file(st) }
+    }
+}
+
+/// Reads the whole file at `path`.
+pub fn read_file(c: *Session, path: str) -> []u8 ! Error {
+    using f = open_file(c, path, OpenFlags { read: true }, Attrs {})?
+    var all: []u8 = []
+    let buf = io.buffer(65536)
+    for {
+        let n = read(f, buf)?
+        if n == 0 {
+            break
+        }
+        io.append(mut all, buf[..n])
+    }
+    all
+}
+
+/// Creates or truncates the file at `path` with the permission bits `mode` and writes `data` to it.
+pub fn write_file(c: *Session, path: str, data: []u8, mode: i64) ! Error {
+    using f = open_file(c, path, OpenFlags { write: true, create: true, truncate: true }, Attrs { permissions: mode })?
+    write(f, data)?
+    close(f)?
+}

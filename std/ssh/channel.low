@@ -1,0 +1,256 @@
+import std/io
+import std/ssh/wire
+import std/sync
+
+/// An open channel that closes itself when dropped.
+///
+/// Dropping it sends a close message. `handle` is the copyable view used by the `_on` operations and by `stream_on`.
+pub struct Channel {
+    /// The copyable view of this channel.
+    pub handle: *ChannelHandle
+    drop close_on(handle)
+}
+
+/// How a session ended: the exit status or the signal that killed the process.
+pub struct ExitStatus {
+    /// Whether the peer reported an `exit-status` or an `exit-signal` before the channel closed.
+    pub exited: bool
+    /// The exit status, or 0 when the process was killed by a signal or the peer reported nothing.
+    pub code: i64
+    /// The signal name without the `SIG` prefix, such as `KILL`, or the empty string.
+    pub signal: str
+}
+
+fn to_io(e: Error) -> io.Error {
+    match e {
+        Io(cause) => cause
+        Closed => io.Error.BrokenPipe
+        Disconnected(_, _) => io.Error.Reset
+        TimedOut => io.Error.TimedOut
+        _ => io.Error.Aborted
+    }
+}
+
+fn pending(h: *ChannelHandle, extended: bool) -> i64 {
+    if extended { h.ext.len } else { h.data.len }
+}
+
+struct Taken {
+    n: i64
+    adjust: i64
+}
+
+fn take(h: *ChannelHandle, buf: []u8, extended: bool) -> Taken {
+    sync.lock(h.lock)
+    defer sync.unlock(h.lock)
+    for pending(h, extended) == 0 && !h.peer_eof && !h.peer_closed {
+        sync.wait_cond(h.readable)
+    }
+    if pending(h, extended) == 0 {
+        return Taken { n: 0, adjust: 0 }
+    }
+    let source = if extended { h.ext } else { h.data }
+    let n = io.copy(buf, source)
+    if extended {
+        h.ext = source[n..]
+    } else {
+        h.data = source[n..]
+    }
+    h.unacked += n
+    var adjust = 0
+    if h.unacked >= window_size / 2 && !h.peer_closed && !h.sent_close {
+        adjust = h.unacked
+        h.in_window += adjust
+        h.unacked = 0
+    }
+    Taken { n, adjust }
+}
+
+fn read_from(h: *ChannelHandle, buf: []u8, extended: bool) -> i64 ! Error {
+    if buf.len == 0 {
+        return 0
+    }
+    let taken = take(h, buf, extended)
+    if taken.adjust > 0 {
+        var out = channel_message(msg_channel_window_adjust, h.remote)
+        wire.put_u32(mut out, taken.adjust)
+        send_message(h.conn, out)?
+    }
+    taken.n
+}
+
+/// Reads up to `buf.len` bytes of the channel's standard output into `buf` and returns the count, or `0` once the peer has sent EOF and everything is read.
+///
+/// Parks the green thread until data arrives. Consuming data returns window to the peer.
+pub fn read_on(h: *ChannelHandle, buf: []u8) -> i64 ! Error {
+    read_from(h, buf, false)
+}
+
+/// Reads up to `buf.len` bytes of the channel's extended data, the standard error of a session, as `read_on` does for standard output.
+pub fn read_stderr_on(h: *ChannelHandle, buf: []u8) -> i64 ! Error {
+    read_from(h, buf, true)
+}
+
+fn reserve(h: *ChannelHandle, want: i64) -> i64 ! Error {
+    sync.lock(h.lock)
+    defer sync.unlock(h.lock)
+    for h.out_window == 0 && !h.sent_close && !h.peer_closed {
+        sync.wait_cond(h.writable)
+    }
+    if h.sent_eof || h.sent_close || h.peer_closed {
+        fail failure_of(h.conn)
+    }
+    var n = want
+    if n > h.out_window {
+        n = h.out_window
+    }
+    if n > h.out_max {
+        n = h.out_max
+    }
+    if n < 1 {
+        n = 1
+    }
+    h.out_window -= n
+    n
+}
+
+fn write_to(h: *ChannelHandle, data: []u8, extended: bool) ! Error {
+    var sent = 0
+    for sent < data.len {
+        let n = reserve(h, data.len - sent)?
+        var out = channel_message(if extended { msg_channel_extended_data } else { msg_channel_data }, h.remote)
+        if extended {
+            wire.put_u32(mut out, 1)
+        }
+        wire.put_string(mut out, data[sent..sent + n])
+        send_message(h.conn, out)?
+        sent += n
+    }
+}
+
+/// Writes all of `data` to the peer as channel data, in packets no larger than the peer allows.
+///
+/// Parks the green thread while the peer's window is empty. Fails with `Closed`, or with the connection's failure, once the channel or connection is closed or EOF has been sent.
+pub fn write_on(h: *ChannelHandle, data: []u8) ! Error {
+    write_to(h, data, false)?
+}
+
+/// Writes all of `data` as extended data on stream 1, the standard error of a session, as `write_on` does for standard output.
+pub fn write_stderr_on(h: *ChannelHandle, data: []u8) ! Error {
+    write_to(h, data, true)?
+}
+
+/// Sends EOF: the peer reads end of input, and this side can still read.
+///
+/// Does nothing when EOF or close was already sent.
+pub fn close_write_on(h: *ChannelHandle) ! Error {
+    sync.lock(h.lock)
+    if h.sent_eof || h.sent_close {
+        sync.unlock(h.lock)
+        return
+    }
+    h.sent_eof = true
+    sync.unlock(h.lock)
+    send_message(h.conn, channel_message(msg_channel_eof, h.remote))?
+}
+
+/// Closes the channel: sends the close message and fails further writes. Reads return what is buffered and then `0`.
+///
+/// Idempotent. The channel leaves the connection's table when the peer's close arrives.
+pub fn close_on(h: *ChannelHandle) {
+    sync.lock(h.lock)
+    if h.sent_close {
+        sync.unlock(h.lock)
+        return
+    }
+    h.sent_close = true
+    let peer_done = h.peer_closed
+    sync.broadcast(h.writable)
+    sync.unlock(h.lock)
+    send_message(h.conn, channel_message(msg_channel_close, h.remote)) or {}
+    if peer_done {
+        forget(h.conn, h)
+    }
+}
+
+/// Returns the stream view of the channel: `read` is `read_on`, `write` is `write_on` and `close` is `close_on`.
+pub fn stream_on(h: *ChannelHandle) -> io.Stream {
+    io.Stream {
+        read: fn(buf) -> i64 ! io.Error { read_on(h, buf) catch to_io }
+        write: fn(buf) -> i64 ! io.Error {
+            write_on(h, buf) catch to_io
+            buf.len
+        }
+        close: fn() { close_on(h) }
+    }
+}
+
+/// Returns the stream view of `ch`, as `stream_on` does for its handle.
+pub fn stream(ch: Channel) -> io.Stream {
+    stream_on(ch.handle)
+}
+
+/// Sends a channel request and, when `want_reply` is set, waits for the peer's answer and returns whether it succeeded.
+///
+/// Returns `true` without waiting when `want_reply` is `false`. Requests of one channel are answered in order, so concurrent callers take turns.
+pub fn request_on(h: *ChannelHandle, kind: str, want_reply: bool, data: []u8) -> bool ! Error {
+    sync.lock(h.request_lock)
+    defer sync.unlock(h.request_lock)
+    var out = channel_message(msg_channel_request, h.remote)
+    wire.put_str(mut out, kind)
+    wire.put_bool(mut out, want_reply)
+    io.append(mut out, data)
+    send_message(h.conn, out)?
+    if !want_reply {
+        return true
+    }
+    select {
+        reply = <-h.replies => reply ?? fail failure_of(h.conn)
+        <-h.done => fail failure_of(h.conn)
+    }
+}
+
+/// Waits for the next request the peer sends on the channel and returns it, or `none` once the channel is closed and the queue is empty.
+///
+/// A server handler calls it in a loop and answers each request with `answer_on`. A client channel has no request queue: the client answers every request but `exit-status`, `exit-signal` and keepalives with failure.
+pub fn next_request_on(h: *ChannelHandle) -> ChannelRequest? {
+    select {
+        r = <-h.requests => r
+        <-h.done => none
+    }
+}
+
+/// Answers `req`: success when `ok` is set, failure otherwise. Sends nothing when the peer did not ask for a reply.
+pub fn answer_on(h: *ChannelHandle, req: ChannelRequest, ok: bool) ! Error {
+    if req.want_reply {
+        send_message(h.conn, channel_message(if ok { msg_channel_success } else { msg_channel_failure }, h.remote))?
+    }
+}
+
+/// Waits until the channel is closed by either side and returns how the session ended.
+pub fn wait_exit_on(h: *ChannelHandle) -> ExitStatus {
+    sync.lock(h.lock)
+    defer sync.unlock(h.lock)
+    for !h.peer_closed {
+        sync.wait_cond(h.readable)
+    }
+    ExitStatus { exited: h.exited, code: h.exit_status, signal: h.exit_signal }
+}
+
+/// Returns the channel `inc` describes and confirms it to the peer.
+///
+/// The returned channel closes itself when dropped.
+pub fn accept(inc: Incoming) -> Channel ! Error {
+    var out = channel_message(msg_channel_open_confirmation, inc.chan.remote)
+    wire.put_u32(mut out, inc.chan.local)
+    wire.put_u32(mut out, window_size)
+    wire.put_u32(mut out, max_channel_packet)
+    send_message(inc.conn, out)?
+    Channel { handle: inc.chan }
+}
+
+/// Refuses the channel `inc` describes with a reason code, such as `open_administratively_prohibited`, and a text.
+pub fn reject(inc: Incoming, code: i64, reason: str) {
+    forget(inc.conn, inc.chan)
+    send_open_failure(inc.conn, inc.chan.remote, code, reason) or {}
+}

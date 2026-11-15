@@ -1,0 +1,185 @@
+import std/crypto
+import std/crypto/x509
+import std/file
+import std/io
+import std/net
+import std/slices
+import std/ssh/key
+import std/testing
+import std/text
+import std/time
+import std/time/duration
+
+const vectors = "testdata/ssh"
+const certificate_window = 1800000000
+
+struct Recorded {
+    term: str
+    columns: i64
+    rows: i64
+    env: str
+}
+
+fn load_private(name: str) -> x509.PrivateKey {
+    key.load_private_key("{vectors}/{name}", "") or panic("load {name}")
+}
+
+fn load_public(name: str) -> key.PublicKey {
+    let line = file.read_text("{vectors}/{name}.pub") or panic("read {name}.pub")
+    let parsed = key.parse_line(line) or panic("parse {name}.pub")
+    parsed.key
+}
+
+fn load_signer(name: str) -> key.Signer {
+    key.signer(load_private(name)) or panic("signer {name}")
+}
+
+fn error_name(e: Error) -> str {
+    match e {
+        Io(_) => "Io"
+        Key(_) => "Key"
+        Malformed => "Malformed"
+        Protocol => "Protocol"
+        BadVersion => "BadVersion"
+        NoCommonAlgorithm(_) => "NoCommonAlgorithm"
+        KeyExchange => "KeyExchange"
+        HostKeyRejected => "HostKeyRejected"
+        BadSignature => "BadSignature"
+        MacFailed => "MacFailed"
+        TooLarge => "TooLarge"
+        StrictKex => "StrictKex"
+        Disconnected(_, _) => "Disconnected"
+        AuthFailed => "AuthFailed"
+        Closed => "Closed"
+        ChannelRefused(_, _) => "ChannelRefused"
+        RequestRefused => "RequestRefused"
+        Invalid => "Invalid"
+        Unsupported => "Unsupported"
+        TimedOut => "TimedOut"
+    }
+}
+
+fn handle_session(inc: Incoming) {
+    using ch = accept(inc) or return
+    var seen = Recorded { term: "", columns: 0, rows: 0, env: "" }
+    for {
+        let next = next_request_on(ch.handle)
+        let req = match next {
+            some(r) => r
+            none => return
+        }
+        if req.kind == "pty-req" {
+            let pty = parse_pty(req) or return
+            seen.term = pty.term
+            seen.columns = pty.columns
+            seen.rows = pty.rows
+            answer_on(ch.handle, req, true) or return
+            continue
+        }
+        if req.kind == "env" {
+            let e = parse_env(req) or return
+            seen.env = "{seen.env}{e.name}={e.value};"
+            answer_on(ch.handle, req, true) or return
+            continue
+        }
+        if req.kind == "window-change" {
+            let size = parse_window_change(req) or return
+            seen.columns = size[0]
+            seen.rows = size[1]
+            continue
+        }
+        if req.kind == "exec" {
+            let command = parse_exec(req) or return
+            answer_on(ch.handle, req, true) or return
+            run_command(ch.handle, command, seen)
+            return
+        }
+        answer_on(ch.handle, req, false) or return
+    }
+}
+
+fn read_all_on(h: *ChannelHandle) -> []u8 {
+    var all: []u8 = []
+    let buf = io.buffer(4096)
+    for {
+        let n = read_on(h, buf) catch {
+            e => return all
+        }
+        if n == 0 {
+            return all
+        }
+        io.append(mut all, buf[..n])
+    }
+    all
+}
+
+fn run_command(h: *ChannelHandle, command: str, seen: Recorded) {
+    if command == "echo hello" {
+        write_on(h, bytes("hello\n")) or return
+        send_exit_status_on(h, 0) or return
+    }
+    if command == "fail" {
+        write_stderr_on(h, bytes("boom")) or return
+        send_exit_status_on(h, 3) or return
+    }
+    if command == "big" {
+        let block = io.buffer(65536)
+        for i in 0..block.len {
+            block[i] = u8(i % 251)
+        }
+        for round in 0..48 {
+            write_on(h, block) or return
+        }
+        send_exit_status_on(h, 0) or return
+    }
+    if command == "upper" {
+        let input = read_all_on(h)
+        write_on(h, bytes(text.upper(str(input)))) or return
+        send_exit_status_on(h, 0) or return
+    }
+    if command == "signal" {
+        send_exit_signal_on(h, "KILL", false, "killed") or return
+    }
+    if command == "report" {
+        let report = "{seen.term} {seen.columns}x{seen.rows} {seen.env}"
+        write_on(h, bytes(report)) or return
+        send_exit_status_on(h, 0) or return
+    }
+    close_write_on(h) or return
+}
+
+fn handle_channel(inc: Incoming) {
+    if inc.kind == "session" {
+        handle_session(inc)
+        return
+    }
+    if inc.kind == "direct-tcpip" {
+        serve_direct_tcpip(inc)
+        return
+    }
+    reject(inc, open_unknown_channel_type, "unknown")
+}
+
+fn serve_report(stream: io.Stream, config: ServerConfig, report: chan[str]) {
+    using conn = serve_stream(stream, config) catch {
+        e => {
+            report <- error_name(e)
+            return
+        }
+    }
+    report <- ""
+    wait_on(conn.handle)
+}
+
+fn base_server(hosts: []key.Signer, auth: ServerAuth) -> ServerConfig {
+    ServerConfig { host_keys: hosts, auth, channels: handle_channel, global: forward_global }
+}
+
+fn password_auth() -> ServerAuth {
+    ServerAuth { methods: ["password"], password: fn(user, password) { user == "alice" && password == "secret" } }
+}
+
+fn base_client(auth: []AuthMethod) -> ClientConfig {
+    ClientConfig { user: "alice", verify_host_key: accept_any_host_key(), auth }
+}
+

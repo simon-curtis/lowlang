@@ -1,0 +1,256 @@
+import std/base64
+import std/crypto
+import std/crypto/hash
+import std/file
+import std/text
+import std/time
+
+/// How the host field of a `known_hosts` line applies to its key.
+pub enum Marker {
+    /// An ordinary line: the key is the host's key.
+    Plain
+    /// A `@cert-authority` line: the key signs host certificates for the matching hosts.
+    CertAuthority
+    /// A `@revoked` line: the key must never be accepted for the matching hosts.
+    Revoked
+}
+
+/// A line of a `known_hosts` file.
+pub struct KnownHost {
+    /// What the line says about its key.
+    pub marker: Marker
+    /// The host patterns of a plain line: names, `*` and `?` wildcards, and `!` negations. Empty for a hashed line.
+    pub patterns: []str
+    /// The salt of a hashed line, empty otherwise.
+    pub salt: []u8
+    /// The HMAC-SHA-1 of the host label under `salt` for a hashed line, empty otherwise.
+    pub hashed: []u8
+    /// The host key or certificate authority key.
+    pub key: PublicKey
+    /// The text after the key.
+    pub comment: str
+}
+
+/// The verdict of `check_host_key`.
+pub enum HostStatus {
+    /// The host key is listed for the host, or a listed authority signed its certificate.
+    Trusted
+    /// No line applies to the host with that key type.
+    Unknown
+    /// A line for the host lists a different key of the same type, or an authority's certificate does not hold.
+    Mismatch
+    /// A `@revoked` line lists the key.
+    Revoked
+}
+
+const hashed_prefix = "|1|"
+
+/// Returns the name a `known_hosts` line records for `host` and `port`: the host itself on port 22 and `[host]:port` on any other port.
+pub fn host_label(host: str, port: i64) -> str {
+    if port == 22 {
+        return text.lower(host)
+    }
+    "[{text.lower(host)}]:{port}"
+}
+
+fn hash_label(salt: []u8, label: str) -> []u8 {
+    hash.hmac(hash.sha1(), salt, bytes(label))
+}
+
+/// Returns the `|1|salt|hash` host field for `label` under `salt`, the form `ssh-keygen -H` writes.
+pub fn hash_host(label: str, salt: []u8) -> str {
+    let digest = hash_label(salt, label)
+    "{hashed_prefix}{base64.encode(salt)}|{base64.encode(digest)}"
+}
+
+fn parse_hashed(field: str) -> [][]u8 ! Error {
+    let parts = text.split(field[hashed_prefix.len..], '|')
+    if parts.len != 2 {
+        fail Malformed
+    }
+    let salt = base64.decode(parts[0]) or fail Malformed
+    let digest = base64.decode(parts[1]) or fail Malformed
+    if digest.len != 20 {
+        fail Malformed
+    }
+    [salt, digest]
+}
+
+/// Parses the text of a `known_hosts` file.
+///
+/// Blank lines and lines starting with `#` are skipped. A line is an optional `@cert-authority` or `@revoked` marker, a comma-separated host field or a `|1|` hashed host, a key type, a Base64 blob and an optional comment. A line with a key type that is not supported is skipped. Fails with `Malformed` for a line that cannot be parsed.
+pub fn parse_known_hosts(data: str) -> []KnownHost ! Error {
+    var out: []KnownHost = []
+    for raw in text.lines(data) {
+        let line = text.trim(raw)
+        if line.len == 0 || line[0] == '#' {
+            continue
+        }
+        var fields = text.fields(line)
+        var marker = Marker.Plain
+        if fields[0] == "@cert-authority" || fields[0] == "@revoked" {
+            marker = if fields[0] == "@revoked" { Marker.Revoked } else { Marker.CertAuthority }
+            fields = fields[1..]
+        } else if fields[0][0] == '@' {
+            fail Malformed
+        }
+        if fields.len < 3 {
+            fail Malformed
+        }
+        let kind = base_kind(fields[1])
+        if kind != "ssh-ed25519" && kind != "ssh-rsa" && kind != "ecdsa-sha2-nistp256" && kind != "ecdsa-sha2-nistp384" {
+            continue
+        }
+        let rest = text.join(fields[1..], " ")
+        let parsed = parse_line(rest)?
+        var patterns: []str = []
+        var salt: []u8 = []
+        var digest: []u8 = []
+        if text.starts_with(fields[0], hashed_prefix) {
+            let pair = parse_hashed(fields[0])?
+            salt = pair[0]
+            digest = pair[1]
+        } else {
+            patterns = text.split(text.lower(fields[0]), ',')
+        }
+        push(mut out, KnownHost { marker, patterns, salt, hashed: digest, key: parsed.key, comment: parsed.comment })
+    }
+    out
+}
+
+fn wildcard(pattern: str, name: str) -> bool {
+    var p = 0
+    var n = 0
+    var star = -1
+    var resume = 0
+    for n < name.len {
+        if p < pattern.len && pattern[p] == '*' {
+            star = p
+            resume = n
+            p += 1
+        } else if p < pattern.len && (pattern[p] == '?' || pattern[p] == name[n]) {
+            p += 1
+            n += 1
+        } else if star >= 0 {
+            resume += 1
+            n = resume
+            p = star + 1
+        } else {
+            return false
+        }
+    }
+    for p < pattern.len && pattern[p] == '*' {
+        p += 1
+    }
+    p == pattern.len
+}
+
+fn host_matches(entry: KnownHost, label: str) -> bool {
+    if entry.hashed.len > 0 {
+        return hash.equal(hash_label(entry.salt, label), entry.hashed)
+    }
+    var matched = false
+    for pattern in entry.patterns {
+        if pattern.len > 0 && pattern[0] == '!' {
+            if wildcard(pattern[1..], label) {
+                return false
+            }
+        } else if wildcard(pattern, label) {
+            matched = true
+        }
+    }
+    matched
+}
+
+fn authority_holds(entry: KnownHost, k: PublicKey, host: str, now: i64) -> bool {
+    check_certificate(k, [entry.key], host, host_certificate, now) catch { e => return false }
+    true
+}
+
+/// Decides whether `k` is the key of `host` on `port` under the lines `entries` at the Unix time `now`.
+///
+/// A host key that a matching `@revoked` line lists, or whose certificate authority such a line lists, is `Revoked`. A plain line for the host with the same key makes it `Trusted`. A certificate is `Trusted` when a matching `@cert-authority` line lists a key that signed it, it is a host certificate for `host` and `now` is in its validity window; if such a line matches but the certificate does not hold, the status is `Mismatch`. A plain line for the host with a different key of the same type gives `Mismatch`. Otherwise the status is `Unknown`.
+pub fn check_host_key(entries: []KnownHost, host: str, port: i64, k: PublicKey, now: i64) -> HostStatus {
+    let label = host_label(host, port)
+    let name = text.lower(host)
+    var changed = false
+    var trusted = false
+    for entry in entries {
+        if !host_matches(entry, label) {
+            continue
+        }
+        match entry.marker {
+            Revoked => {
+                let signer = match k.certificate {
+                    some(c) => c.signature_key
+                    none => k
+                }
+                if equal(entry.key, k) || equal(entry.key, signer) {
+                    return HostStatus.Revoked
+                }
+            }
+            CertAuthority => {
+                if k.certificate != none {
+                    if authority_holds(entry, k, name, now) {
+                        trusted = true
+                    } else {
+                        changed = true
+                    }
+                }
+            }
+            Plain => {
+                if equal(entry.key, k) {
+                    trusted = true
+                } else if base_kind(entry.key.kind) == base_kind(k.kind) {
+                    changed = true
+                }
+            }
+        }
+    }
+    if trusted {
+        return HostStatus.Trusted
+    }
+    if changed {
+        return HostStatus.Mismatch
+    }
+    HostStatus.Unknown
+}
+
+/// Returns the `known_hosts` line that lists `k` for `host` and `port`, hashed with `salt` when `salt` is not empty. It has no trailing newline.
+pub fn known_hosts_line(host: str, port: i64, k: PublicKey, salt: []u8) -> str {
+    let label = host_label(host, port)
+    let field = if salt.len == 0 { label } else { hash_host(label, salt) }
+    "{field} {format_line(k, "")}"
+}
+
+/// Returns a host key callback for `ClientConfig.verify_host_key` that accepts `host` on `port` only when `check_host_key` over `entries` says `Trusted`.
+pub fn known_hosts_verifier(entries: []KnownHost, host: str, port: i64) -> fn(PublicKey) -> bool {
+    fn(k) {
+        check_host_key(entries, host, port, k, time.now()) == HostStatus.Trusted
+    }
+}
+
+/// Returns a host key callback for `ClientConfig.verify_host_key` that trusts a host on first use.
+///
+/// The `known_hosts` file at `path` is read on each call. A key that is `Trusted` is accepted; an `Unknown` host's key is appended to the file as a new line and accepted; `Mismatch`, `Revoked` and any failure to read or write the file refuse the connection. A missing file counts as empty.
+pub fn trust_on_first_use(path: str, host: str, port: i64) -> fn(PublicKey) -> bool {
+    fn(k) {
+        var data = ""
+        if file.exists(path) {
+            data = file.read_text(path) catch { e => return false }
+        }
+        let entries = parse_known_hosts(data) catch { e => return false }
+        let status = check_host_key(entries, host, port, k, time.now())
+        if status == HostStatus.Trusted {
+            return true
+        }
+        if status != HostStatus.Unknown {
+            return false
+        }
+        let line = known_hosts_line(host, port, k, [])
+        let separator = if data.len > 0 && data[data.len - 1] != '\n' { "\n" } else { "" }
+        using out = file.append(path) catch { e => return false }
+        file.write_str(out, "{separator}{line}\n") catch { e => return false }
+        true
+    }
+}

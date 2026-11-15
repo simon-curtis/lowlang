@@ -1,0 +1,186 @@
+import std/io
+import std/net
+import std/os
+import std/ssh/key
+import std/ssh/wire
+import std/sync
+
+const msg_failure: u8 = 5
+const msg_success: u8 = 6
+const msg_request_identities: u8 = 11
+const msg_identities_answer: u8 = 12
+const msg_sign_request: u8 = 13
+const msg_sign_response: u8 = 14
+const flag_rsa_sha2_256 = 2
+const flag_rsa_sha2_512 = 4
+const max_message = 262144
+
+/// The failures of talking to an agent.
+pub enum Error {
+    /// The socket failed.
+    Io(cause: io.Error)
+    /// The agent sent a message that is not well formed.
+    Malformed
+    /// The agent refused the request.
+    Refused
+    /// `SSH_AUTH_SOCK` is not set.
+    NoAgent
+}
+
+/// A key an agent holds.
+pub struct Identity {
+    /// The public key, or the certificate when the agent holds one.
+    pub key: key.PublicKey
+    /// The comment the agent keeps with the key.
+    pub comment: str
+}
+
+/// The shared state of a connection to an agent. Requests are serialised, so copies can be used from several green threads.
+pub struct Session {
+    conn: net.ConnHandle
+    reader: *io.Reader
+    lock: sync.Mutex
+}
+
+/// A connection to an ssh-agent that closes itself when dropped.
+///
+/// `handle` is the copyable view the signers made by `signers` use, so they stay valid for as long as this value lives.
+pub struct Agent {
+    /// The copyable view of this connection.
+    pub handle: *Session
+    drop net.close_on(handle.conn)
+}
+
+fn io_failed(e: io.Error) -> Error {
+    Io(e)
+}
+
+fn wire_failed(e: io.Error) -> Error {
+    Malformed
+}
+
+/// Connects to the agent listening on the Unix socket at `path`.
+pub fn connect(path: str) -> Agent ! Error {
+    let address = net.unix_addr(path) catch io_failed
+    using var tcp = net.connect(address) catch io_failed
+    let h = net.detach(mut tcp)
+    let session = new(Session { conn: h, reader: io.reader(net.stream_on(h)), lock: sync.mutex() })
+    Agent { handle: session }
+}
+
+/// Connects to the agent named by the `SSH_AUTH_SOCK` environment variable. Fails with `NoAgent` when it is not set or empty.
+pub fn connect_env() -> Agent ! Error {
+    let path = os.env("SSH_AUTH_SOCK") ?? ""
+    if path.len == 0 {
+        fail NoAgent
+    }
+    connect(path)?
+}
+
+fn exchange(s: *Session, request: []u8) -> []u8 ! Error {
+    sync.lock(s.lock)
+    defer sync.unlock(s.lock)
+    var framed: []u8 = []
+    io.put_be32(mut framed, request.len)
+    io.append(mut framed, request)
+    net.write_all_on(s.conn, framed) catch io_failed
+    let header = io.read_exact(s.reader, 4) catch io_failed
+    let size = io.be32(header, 0)
+    if size < 1 || size > max_message {
+        fail Malformed
+    }
+    io.read_exact(s.reader, size) catch io_failed
+}
+
+fn read_identities(reply: []u8) -> []Identity ! Error {
+    if reply[0] == msg_failure {
+        fail Refused
+    }
+    if reply[0] != msg_identities_answer {
+        fail Malformed
+    }
+    let r = wire.reader(reply[1..])
+    let count = wire.read_u32(r) catch wire_failed
+    if count > 1024 {
+        fail Malformed
+    }
+    var out: []Identity = []
+    for i in 0..count {
+        let blob = wire.read_string(r) catch wire_failed
+        let comment = wire.read_str(r) catch wire_failed
+        let parsed = key.parse_blob(blob) catch {
+            e => continue
+        }
+        push(mut out, Identity { key: parsed, comment })
+    }
+    wire.finish(r) catch wire_failed
+    out
+}
+
+/// Returns the identities the agent holds.
+///
+/// Keys of a type this library does not handle, such as FIDO keys, are left out.
+pub fn identities(a: Agent) -> []Identity ! Error {
+    let reply = exchange(a.handle, [msg_request_identities])?
+    read_identities(reply)?
+}
+
+fn sign_flags(algorithm: str) -> i64 {
+    match algorithm {
+        "rsa-sha2-256" => flag_rsa_sha2_256
+        "rsa-sha2-512" => flag_rsa_sha2_512
+        _ => 0
+    }
+}
+
+fn sign_with(s: *Session, k: key.PublicKey, algorithm: str, data: []u8) -> []u8 ! Error {
+    var request: []u8 = [msg_sign_request]
+    wire.put_string(mut request, k.blob)
+    wire.put_string(mut request, data)
+    wire.put_u32(mut request, sign_flags(algorithm))
+    let reply = exchange(s, request)?
+    if reply[0] == msg_failure {
+        fail Refused
+    }
+    if reply[0] != msg_sign_response {
+        fail Malformed
+    }
+    let r = wire.reader(reply[1..])
+    let blob = wire.read_string(r) catch wire_failed
+    wire.finish(r) catch wire_failed
+    let inner = wire.reader(blob)
+    let name = wire.read_str(inner) catch wire_failed
+    if name != algorithm {
+        fail Malformed
+    }
+    blob
+}
+
+/// Asks the agent to sign `data` with the key `k` using the signature algorithm `algorithm`, such as `ssh-ed25519` or `rsa-sha2-256`, and returns the signature blob.
+///
+/// Fails with `Refused` when the agent does not hold the key or declines, and with `Malformed` when the signature names another algorithm than the one asked for.
+pub fn sign(a: Agent, k: key.PublicKey, algorithm: str, data: []u8) -> []u8 ! Error {
+    sign_with(a.handle, k, algorithm, data)?
+}
+
+fn agent_signer(s: *Session, k: key.PublicKey) -> key.Signer {
+    key.Signer {
+        public: k
+        sign: fn(algorithm, data) {
+            sign_with(s, k, algorithm, data) catch {
+                e => fail key.Error.Invalid
+            }
+        }
+    }
+}
+
+/// Returns a `key.Signer` for each identity the agent holds, ready for `AuthMethod.PublicKey`.
+///
+/// Each signer asks the agent to sign and holds no private key. It works while this `Agent` is alive.
+pub fn signers(a: Agent) -> []key.Signer ! Error {
+    var out: []key.Signer = []
+    for identity in identities(a)? {
+        push(mut out, agent_signer(a.handle, identity.key))
+    }
+    out
+}

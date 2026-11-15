@@ -1,0 +1,261 @@
+import std/crypto
+import std/crypto/ecdsa
+import std/crypto/hash
+import std/crypto/mlkem
+import std/crypto/rsa
+import std/crypto/x25519
+import std/io
+import std/ssh/wire
+import std/text
+
+enum KexKind {
+    Curve25519
+    Ecdh(curve: ecdsa.Curve)
+    Dh(bits: i64)
+    Hybrid
+}
+
+struct KexSpec {
+    name: str
+    kind: KexKind
+    hash: hash.Algorithm
+}
+
+fn kex_spec(name: str) -> KexSpec? {
+    match name {
+        "mlkem768x25519-sha256" => KexSpec { name, kind: KexKind.Hybrid, hash: hash.sha256() }
+        "curve25519-sha256" => KexSpec { name, kind: KexKind.Curve25519, hash: hash.sha256() }
+        "curve25519-sha256@libssh.org" => KexSpec { name, kind: KexKind.Curve25519, hash: hash.sha256() }
+        "ecdh-sha2-nistp256" => KexSpec { name, kind: KexKind.Ecdh(ecdsa.Curve.P256), hash: hash.sha256() }
+        "ecdh-sha2-nistp384" => KexSpec { name, kind: KexKind.Ecdh(ecdsa.Curve.P384), hash: hash.sha384() }
+        "diffie-hellman-group16-sha512" => KexSpec { name, kind: KexKind.Dh(4096), hash: hash.sha512() }
+        "diffie-hellman-group14-sha256" => KexSpec { name, kind: KexKind.Dh(2048), hash: hash.sha256() }
+        _ => none
+    }
+}
+
+const group14_prime = "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aacaa68ffffffffffffffff"
+
+const group16_prime = "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d788719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6287c59474e6bc05d99b2964fa090c3a2233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa993b4ea988d8fddc186ffb7dc90a6c08f4df435c934063199ffffffffffffffff"
+
+struct ClientKex {
+    spec: KexSpec
+    field: []u8
+    secret: []u8
+    kem_secret: []u8
+}
+
+struct ServerKex {
+    field: []u8
+    shared: []u8
+}
+
+struct Shared {
+    k: []u8
+}
+
+fn dh_prime(bits: i64) -> []u8 {
+    let hex = if bits == 4096 { group16_prime } else { group14_prime }
+    text.decode_hex(hex) or []
+}
+
+fn dh_exponent_len(bits: i64) -> i64 {
+    if bits == 4096 { 64 } else { 32 }
+}
+
+fn trimmed(x: []u8) -> []u8 {
+    var at = 0
+    for at < x.len && x[at] == 0 {
+        at += 1
+    }
+    x[at..]
+}
+
+fn compare_magnitude(a: []u8, b: []u8) -> i64 {
+    let x = trimmed(a)
+    let y = trimmed(b)
+    if x.len != y.len {
+        return if x.len < y.len { -1 } else { 1 }
+    }
+    for i in 0..x.len {
+        if x[i] != y[i] {
+            return if x[i] < y[i] { -1 } else { 1 }
+        }
+    }
+    0
+}
+
+fn dh_valid(public: []u8, prime: []u8) -> bool {
+    let top = io.buffer(prime.len)
+    io.copy(top, prime)
+    top[top.len - 1] -= 1
+    compare_magnitude(public, [1]) > 0 && compare_magnitude(public, top) < 0
+}
+
+fn mpint_bytes(magnitude: []u8) -> []u8 {
+    var out: []u8 = []
+    wire.put_mpint(mut out, magnitude)
+    out
+}
+
+fn string_bytes(data: []u8) -> []u8 {
+    var out: []u8 = []
+    wire.put_string(mut out, data)
+    out
+}
+
+fn client_start(spec: KexSpec) -> ClientKex ! Error {
+    match spec.kind {
+        Curve25519 => {
+            let secret = x25519.generate()
+            ClientKex { spec, field: x25519.public_key(secret), secret, kem_secret: [] }
+        }
+        Ecdh(curve) => {
+            let secret = ecdsa.generate(curve)
+            let field = ecdsa.public_key(curve, secret) catch Io
+            ClientKex { spec, field, secret, kem_secret: [] }
+        }
+        Dh(bits) => {
+            let prime = dh_prime(bits)
+            let secret = crypto.random(dh_exponent_len(bits))
+            let field = rsa.mod_pow([2], secret, prime) catch Io
+            ClientKex { spec, field: trimmed(field), secret, kem_secret: [] }
+        }
+        Hybrid => {
+            let keys = mlkem.generate(mlkem.Level.Kem768)
+            let secret = x25519.generate()
+            var field: []u8 = []
+            io.append(mut field, keys.encapsulation)
+            io.append(mut field, x25519.public_key(secret))
+            ClientKex { spec, field, secret, kem_secret: keys.decapsulation }
+        }
+    }
+}
+
+fn client_init_message(c: ClientKex) -> []u8 {
+    var out: []u8 = [30]
+    match c.spec.kind {
+        Dh(_) => wire.put_mpint(mut out, c.field)
+        _ => wire.put_string(mut out, c.field)
+    }
+    out
+}
+
+fn hybrid_secret(kem: []u8, classic: []u8, h: hash.Algorithm) -> []u8 {
+    var joined: []u8 = []
+    io.append(mut joined, kem)
+    io.append(mut joined, classic)
+    string_bytes(hash.sum(h, joined))
+}
+
+fn client_finish(c: ClientKex, server_field: []u8) -> Shared ! Error {
+    match c.spec.kind {
+        Curve25519 => {
+            let secret = x25519.shared(c.secret, server_field) or fail KeyExchange
+            Shared { k: mpint_bytes(secret) }
+        }
+        Ecdh(curve) => {
+            let secret = ecdsa.ecdh(curve, c.secret, server_field) or fail KeyExchange
+            Shared { k: mpint_bytes(secret) }
+        }
+        Dh(bits) => {
+            let prime = dh_prime(bits)
+            if !dh_valid(server_field, prime) {
+                fail KeyExchange
+            }
+            let secret = rsa.mod_pow(server_field, c.secret, prime) or fail KeyExchange
+            Shared { k: mpint_bytes(secret) }
+        }
+        Hybrid => {
+            if server_field.len != 1088 + 32 {
+                fail KeyExchange
+            }
+            let kem = mlkem.decapsulate(mlkem.Level.Kem768, c.kem_secret, server_field[..1088]) or fail KeyExchange
+            let classic = x25519.shared(c.secret, server_field[1088..]) or fail KeyExchange
+            Shared { k: hybrid_secret(kem, classic, c.spec.hash) }
+        }
+    }
+}
+
+fn server_respond(spec: KexSpec, client_field: []u8) -> ServerKex ! Error {
+    match spec.kind {
+        Curve25519 => {
+            let secret = x25519.generate()
+            let shared = x25519.shared(secret, client_field) or fail KeyExchange
+            ServerKex { field: x25519.public_key(secret), shared: mpint_bytes(shared) }
+        }
+        Ecdh(curve) => {
+            let secret = ecdsa.generate(curve)
+            let field = ecdsa.public_key(curve, secret) catch Io
+            let shared = ecdsa.ecdh(curve, secret, client_field) or fail KeyExchange
+            ServerKex { field, shared: mpint_bytes(shared) }
+        }
+        Dh(bits) => {
+            let prime = dh_prime(bits)
+            if !dh_valid(client_field, prime) {
+                fail KeyExchange
+            }
+            let secret = crypto.random(dh_exponent_len(bits))
+            let field = rsa.mod_pow([2], secret, prime) catch Io
+            let shared = rsa.mod_pow(client_field, secret, prime) or fail KeyExchange
+            ServerKex { field: trimmed(field), shared: mpint_bytes(shared) }
+        }
+        Hybrid => {
+            if client_field.len != 1184 + 32 {
+                fail KeyExchange
+            }
+            let encapsulated = mlkem.encapsulate(mlkem.Level.Kem768, client_field[..1184]) or fail KeyExchange
+            let secret = x25519.generate()
+            let classic = x25519.shared(secret, client_field[1184..]) or fail KeyExchange
+            var field: []u8 = []
+            io.append(mut field, encapsulated.ciphertext)
+            io.append(mut field, x25519.public_key(secret))
+            ServerKex { field, shared: hybrid_secret(encapsulated.shared, classic, spec.hash) }
+        }
+    }
+}
+
+struct Transcript {
+    client_version: str
+    server_version: str
+    client_init: []u8
+    server_init: []u8
+    host_key: []u8
+}
+
+fn put_field(spec: KexSpec, mut out: []u8, field: []u8) {
+    match spec.kind {
+        Dh(_) => wire.put_mpint(mut out, field)
+        _ => wire.put_string(mut out, field)
+    }
+}
+
+fn exchange_hash(spec: KexSpec, t: Transcript, client_field: []u8, server_field: []u8, k: []u8) -> []u8 {
+    var out: []u8 = []
+    wire.put_str(mut out, t.client_version)
+    wire.put_str(mut out, t.server_version)
+    wire.put_string(mut out, t.client_init)
+    wire.put_string(mut out, t.server_init)
+    wire.put_string(mut out, t.host_key)
+    put_field(spec, mut out, client_field)
+    put_field(spec, mut out, server_field)
+    io.append(mut out, k)
+    hash.sum(spec.hash, out)
+}
+
+fn derive(h: hash.Algorithm, k: []u8, exchange: []u8, letter: u8, session_id: []u8, length: i64) -> []u8 {
+    var seed: []u8 = []
+    io.append(mut seed, k)
+    io.append(mut seed, exchange)
+    push(mut seed, letter)
+    io.append(mut seed, session_id)
+    var out = hash.sum(h, seed)
+    for out.len < length {
+        var next: []u8 = []
+        io.append(mut next, k)
+        io.append(mut next, exchange)
+        io.append(mut next, out)
+        io.append(mut out, hash.sum(h, next))
+    }
+    out[..length]
+}

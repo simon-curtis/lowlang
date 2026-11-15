@@ -1,0 +1,161 @@
+import std/io
+import std/net
+import std/ssh/key
+import std/sync
+
+/// The settings of an SSH client.
+pub struct ClientConfig {
+    /// The user name to authenticate as.
+    pub user: str
+    /// Decides whether to trust the server's host key. Return `false` to refuse the connection. `known_hosts_verifier` and `accept_any_host_key` make common ones.
+    pub verify_host_key: fn(key.PublicKey) -> bool
+    /// The authentication methods, tried in order. An empty list tries `none` only.
+    pub auth: []AuthMethod = []
+    /// The algorithms offered, by kind; an empty list takes the module's default.
+    pub algorithms: Algorithms = Algorithms {}
+    /// The bytes sent and received under one set of keys that trigger a new key exchange. The default is 1 GiB.
+    pub rekey_bytes: i64 = 1073741824
+    /// The seconds under one set of keys that trigger a new key exchange. The default is one hour.
+    pub rekey_seconds: i64 = 3600
+    /// Receives the text of each authentication banner the server sends.
+    pub banner: fn(str) = fn(text) {}
+}
+
+/// An established SSH connection that closes itself when dropped.
+///
+/// Dropping it ends the connection, stops its reader and fails every pending request. `handle` is the copyable view used by the `_on` operations.
+pub struct Connection {
+    /// The copyable view of this connection.
+    pub handle: *ConnectionHandle
+    drop disconnect_on(handle)
+}
+
+/// The output of a command run by `exec`.
+pub struct ExecResult {
+    /// The standard output.
+    pub stdout: []u8
+    /// The standard error.
+    pub stderr: []u8
+    /// How the command ended.
+    pub status: ExitStatus
+}
+
+fn client_setup(config: ClientConfig) -> Setup {
+    Setup {
+        client: true
+        algorithms: config.algorithms
+        signers: []
+        verify: config.verify_host_key
+        rekey_bytes: config.rekey_bytes
+        rekey_millis: config.rekey_seconds * 1000
+    }
+}
+
+fn no_global(request: GlobalRequest) -> GlobalAnswer {
+    GlobalAnswer {}
+}
+
+/// Runs the SSH handshake and authentication over `stream` and returns the connection.
+///
+/// The stream is closed when this fails and when the connection ends. Fails with `HostKeyRejected` when the callback refuses the key, `BadSignature` when the host's signature does not verify, `NoCommonAlgorithm` when the sides share no algorithm of a kind, and `AuthFailed` when no method succeeds.
+pub fn client(stream: io.Stream, config: ClientConfig) -> Connection ! Error {
+    let l = new_link(stream, client_setup(config))
+    let methods = if config.auth.len == 0 { [AuthMethod.NoAuth] } else { config.auth }
+    handshake(l) catch {
+        e => {
+            close_link(l)
+            fail e
+        }
+    }
+    client_authenticate(l, config.user, methods, config.banner) catch {
+        e => {
+            disconnect(l, disconnect_by_application, "authentication failed")
+            close_link(l)
+            fail e
+        }
+    }
+    let c = new_connection(l, true, config.user, route_forwarded, no_global)
+    spawn run_reader(c)
+    Connection { handle: c }
+}
+
+/// Connects to `host` and `port` over TCP and runs `client` over the connection.
+pub fn dial(host: str, port: i64, config: ClientConfig) -> Connection ! Error {
+    using var tcp = net.dial(host, port) catch Io
+    let stream = net.stream(tcp)
+    using conn = client(stream, config)?
+    net.detach(mut tcp)
+    conn
+}
+
+/// Runs `client` over a channel of `jump`, so the connection reaches `host` and `port` through the server of `jump` (ProxyJump).
+///
+/// Ending the new connection closes the channel. `jump` stays open.
+pub fn dial_through(jump: Connection, host: str, port: i64, config: ClientConfig) -> Connection ! Error {
+    let h = open_direct_tcpip(jump.handle, host, port, "127.0.0.1", 0)?
+    using conn = client(stream_on(h), config)?
+    conn
+}
+
+/// Ends the connection: closes the transport, fails every pending operation and stops the reader. Idempotent.
+pub fn disconnect_on(h: *ConnectionHandle) {
+    if !is_dead(h) {
+        disconnect(h.link, disconnect_by_application, "bye")
+    }
+    kill(h, Closed)
+}
+
+/// Returns how many key exchanges the connection has completed, the first one included.
+pub fn key_exchanges(h: *ConnectionHandle) -> i64 {
+    h.link.exchanges
+}
+
+fn is_dead(h: *ConnectionHandle) -> bool {
+    sync.lock(h.lock)
+    defer sync.unlock(h.lock)
+    h.dead
+}
+
+/// Waits until the connection has ended and returns the reason.
+pub fn wait_on(h: *ConnectionHandle) -> Error {
+    let gone = <-h.done
+    failure_of(h)
+}
+
+fn drain(h: *ChannelHandle, extended: bool, out: chan[[]u8]) {
+    var collected: []u8 = []
+    let buf = io.buffer(32768)
+    for {
+        let n = read_from(h, buf, extended) catch {
+            e => {
+                break
+            }
+        }
+        if n == 0 {
+            break
+        }
+        io.append(mut collected, buf[..n])
+    }
+    out <- collected
+}
+
+/// Runs `command` on the server and returns its standard output, standard error and exit status.
+///
+/// Fails with `RequestRefused` when the server refuses the command.
+pub fn exec(conn: Connection, command: str) -> ExecResult ! Error {
+    using ch = open_session(conn)?
+    exec_on(ch.handle, command)?
+    close_write_on(ch.handle)?
+    let errors = chan[[]u8](1)
+    spawn drain(ch.handle, true, errors)
+    let outputs = chan[[]u8](1)
+    spawn drain(ch.handle, false, outputs)
+    let stdout = (<-outputs) ?? []
+    let stderr = (<-errors) ?? []
+    ExecResult { stdout, stderr, status: wait_exit_on(ch.handle) }
+}
+
+/// Returns a host key callback that accepts every key. It gives no protection against an active attacker; use it only where the network is trusted or the key is checked another way.
+pub fn accept_any_host_key() -> fn(key.PublicKey) -> bool {
+    fn(k) { true }
+}

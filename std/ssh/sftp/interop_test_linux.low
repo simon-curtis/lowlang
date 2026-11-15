@@ -1,0 +1,568 @@
+import std/crypto/hash
+import std/file
+import std/io
+import std/net
+import std/os
+import std/process
+import std/ssh
+import std/ssh/key
+import std/testing
+import std/text
+import std/time
+import std/time/duration
+
+const interop_vectors = "testdata/ssh"
+
+fn missing_tool(names: []str) -> str {
+    for name in names {
+        if process.find(name) == none {
+            return name
+        }
+    }
+    ""
+}
+
+fn run_tool(program: str, args: []str) -> process.Output {
+    var arguments: []str = ["60", program]
+    for a in args {
+        push(mut arguments, a)
+    }
+    let command = process.Command {
+        program: "timeout"
+        args: arguments
+        stdin: process.Stdio.Null
+        stdout: process.Stdio.Piped
+        stderr: process.Stdio.Piped
+    }
+    process.run(command, []) or panic("run {program}")
+}
+
+fn run_with_input(program: str, args: []str, input: []u8) -> process.Output {
+    var arguments: []str = ["60", program]
+    for a in args {
+        push(mut arguments, a)
+    }
+    let command = process.Command {
+        program: "timeout"
+        args: arguments
+        stdin: process.Stdio.Piped
+        stdout: process.Stdio.Piped
+        stderr: process.Stdio.Piped
+    }
+    process.run(command, input) or panic("run {program}")
+}
+
+fn generate_key(dir: str, name: str, kind: str) {
+    let out = run_tool("ssh-keygen", ["-q", "-t", kind, "-N", "", "-f", "{dir}/{name}"])
+    if !process.success(out.status) {
+        panic("ssh-keygen {kind}: {str(out.stderr)}")
+    }
+}
+
+fn load_authorized(dir: str) -> key.PublicKey {
+    let line = file.read_text("{dir}/id.pub") or panic("read id.pub")
+    let parsed = key.parse_line(line) or panic("parse id.pub")
+    parsed.key
+}
+
+fn interop_signer(name: str) -> key.Signer {
+    let private = key.load_private_key("{interop_vectors}/{name}", "") or panic("load {name}")
+    key.signer(private) or panic("signer {name}")
+}
+
+fn client_options(dir: str, port: i64) -> []str {
+    [
+        "-F", "/dev/null"
+        "-o", "StrictHostKeyChecking=no"
+        "-o", "UserKnownHostsFile=/dev/null"
+        "-o", "IdentitiesOnly=yes"
+        "-o", "BatchMode=yes"
+        "-o", "LogLevel=ERROR"
+        "-i", "{dir}/id"
+        "-p", "{port}"
+    ]
+}
+
+fn exec_session(inc: ssh.Incoming, root: str) {
+    using ch = ssh.accept(inc) catch {
+        e => return
+    }
+    for {
+        let next = ssh.next_request_on(ch.handle)
+        let req = match next {
+            some(q) => q
+            none => return
+        }
+        if req.kind == "subsystem" {
+            let name = ssh.parse_subsystem(req) catch {
+                e => return
+            }
+            ssh.answer_on(ch.handle, req, name == "sftp") catch {
+                e => return
+            }
+            if name == "sftp" {
+                serve(ssh.stream_on(ch.handle), root) or {}
+                return
+            }
+            continue
+        }
+        if req.kind != "exec" {
+            ssh.answer_on(ch.handle, req, false) catch {
+                e => return
+            }
+            continue
+        }
+        let command = ssh.parse_exec(req) catch {
+            e => return
+        }
+        ssh.answer_on(ch.handle, req, true) catch {
+            e => return
+        }
+        if command == "echo hello" {
+            ssh.write_on(ch.handle, bytes("hello\n")) or return
+            ssh.send_exit_status_on(ch.handle, 0) or return
+        }
+        if command == "fail" {
+            ssh.write_stderr_on(ch.handle, bytes("boom")) or return
+            ssh.send_exit_status_on(ch.handle, 3) or return
+        }
+        ssh.close_write_on(ch.handle) or return
+        return
+    }
+}
+
+fn channels_for(root: str) -> fn(ssh.Incoming) {
+    fn(inc) {
+        if inc.kind == "session" {
+            exec_session(inc, root)
+            return
+        }
+        if inc.kind == "direct-tcpip" {
+            ssh.serve_direct_tcpip(inc)
+            return
+        }
+        ssh.reject(inc, 3, "unknown channel type")
+    }
+}
+
+fn low_server_config(authorized: key.PublicKey, root: str) -> ssh.ServerConfig {
+    ssh.ServerConfig {
+        host_keys: [interop_signer("ed25519"), interop_signer("ecdsa256"), interop_signer("rsa2048")]
+        auth: ssh.ServerAuth { methods: ["publickey"], public_key: fn(user, k) { key.equal(k, authorized) } }
+        channels: channels_for(root)
+    }
+}
+
+fn echo_connections(h: net.ListenerHandle) {
+    for {
+        let accepted = net.accept_handle(h) catch {
+            e => return
+        }
+        spawn echo_one(accepted)
+    }
+}
+
+fn echo_one(h: net.ConnHandle) {
+    using tcp = net.adopt(h)
+    let buf = io.buffer(4096)
+    for {
+        let n = net.read_on(h, buf) catch {
+            e => return
+        }
+        if n == 0 {
+            return
+        }
+        net.write_all_on(h, buf[..n]) catch {
+            e => return
+        }
+    }
+}
+
+fn exit_code(e: process.Exit) -> i64 {
+    match e {
+        Exited(code) => code
+        Signaled(signal) => -1
+    }
+}
+
+fn ssh_case(t: *testing.T, dir: str, port: i64, extra: []str, command: str, wanted_out: str, wanted_err: str, wanted_code: i64) {
+    var args = client_options(dir, port)
+    for a in extra {
+        push(mut args, a)
+    }
+    push(mut args, "u@127.0.0.1")
+    push(mut args, command)
+    let out = run_tool("ssh", args)
+    let code = exit_code(out.status)
+    testing.error_if(t, str(out.stdout) != wanted_out, "stdout {str(out.stdout)}, stderr {str(out.stderr)}")
+    testing.error_if(t, code != wanted_code, "exit {code}")
+    if wanted_err.len > 0 {
+        testing.error_if(t, !contains(str(out.stderr), wanted_err), "stderr {str(out.stderr)}")
+    }
+}
+
+fn contains(s: str, part: str) -> bool {
+    if part.len > s.len {
+        return false
+    }
+    for i in 0..s.len - part.len + 1 {
+        if s[i..i + part.len] == part {
+            return true
+        }
+    }
+    false
+}
+
+fn test_openssh_client_against_the_low_server(t: *testing.T) {
+    let absent = missing_tool(["ssh", "ssh-keygen", "timeout"])
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    let dir = file.temp_dir("interop-server") or panic("temp dir")
+    let root = "{dir}/root"
+    file.mkdir(root) or panic("mkdir")
+    generate_key(dir, "id", "ed25519")
+    let authorized = load_authorized(dir)
+    using listener = net.listen("127.0.0.1", 0) or panic("listen")
+    let port = listener.handle.addr.port
+    spawn ssh.serve_on(listener.handle, low_server_config(authorized, root))
+    let cases: [][]str = [
+        ["-o", "Ciphers=chacha20-poly1305@openssh.com"]
+        ["-o", "Ciphers=aes128-gcm@openssh.com"]
+        ["-o", "Ciphers=aes256-gcm@openssh.com"]
+        ["-o", "Ciphers=aes128-ctr", "-o", "MACs=hmac-sha2-256-etm@openssh.com"]
+        ["-o", "Ciphers=aes256-ctr", "-o", "MACs=hmac-sha2-512-etm@openssh.com"]
+        ["-o", "KexAlgorithms=mlkem768x25519-sha256"]
+        ["-o", "KexAlgorithms=curve25519-sha256"]
+        ["-o", "KexAlgorithms=ecdh-sha2-nistp256"]
+        ["-o", "KexAlgorithms=ecdh-sha2-nistp384"]
+        ["-o", "KexAlgorithms=diffie-hellman-group14-sha256"]
+        ["-o", "KexAlgorithms=diffie-hellman-group16-sha512"]
+        ["-o", "HostKeyAlgorithms=ssh-ed25519"]
+        ["-o", "HostKeyAlgorithms=ecdsa-sha2-nistp256"]
+        ["-o", "HostKeyAlgorithms=rsa-sha2-256"]
+        ["-o", "HostKeyAlgorithms=rsa-sha2-512"]
+    ]
+    for extra in cases {
+        let name = "{extra[1]}"
+        testing.sub(t, name, fn(t) {
+            ssh_case(t, dir, port, extra, "echo hello", "hello\n", "", 0)
+        })
+    }
+    testing.sub(t, "exit status and stderr", fn(t) {
+        ssh_case(t, dir, port, [], "fail", "", "boom", 3)
+    })
+    file.remove_all(dir) or panic("remove")
+}
+
+fn test_openssh_forwards_through_the_low_server(t: *testing.T) {
+    let absent = missing_tool(["ssh", "ssh-keygen", "timeout"])
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    let dir = file.temp_dir("interop-forward") or panic("temp dir")
+    generate_key(dir, "id", "ed25519")
+    let authorized = load_authorized(dir)
+    using echo = net.listen("127.0.0.1", 0) or panic("echo listen")
+    spawn echo_connections(echo.handle)
+    using listener = net.listen("127.0.0.1", 0) or panic("listen")
+    let port = listener.handle.addr.port
+    spawn ssh.serve_on(listener.handle, low_server_config(authorized, dir))
+    var args = client_options(dir, port)
+    push(mut args, "-W")
+    push(mut args, "127.0.0.1:{echo.handle.addr.port}")
+    push(mut args, "u@127.0.0.1")
+    let payload = bytes("ping through the tunnel")
+    let out = run_with_input("ssh", args, payload)
+    testing.error_if(t, str(out.stdout) != "ping through the tunnel", "echoed {str(out.stdout)}, stderr {str(out.stderr)}")
+    file.remove_all(dir) or panic("remove")
+}
+
+fn sftp_options(dir: str, port: i64) -> []str {
+    [
+        "-F", "/dev/null"
+        "-o", "StrictHostKeyChecking=no"
+        "-o", "UserKnownHostsFile=/dev/null"
+        "-o", "IdentitiesOnly=yes"
+        "-o", "BatchMode=yes"
+        "-o", "LogLevel=ERROR"
+        "-i", "{dir}/id"
+        "-P", "{port}"
+    ]
+}
+
+fn test_openssh_sftp_and_scp_against_the_low_server(t: *testing.T) {
+    let absent = missing_tool(["sftp", "scp", "ssh-keygen", "timeout"])
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    let dir = file.temp_dir("interop-sftp") or panic("temp dir")
+    let root = "{dir}/root"
+    let local = "{dir}/local"
+    file.mkdir(root) or panic("mkdir root")
+    file.mkdir(local) or panic("mkdir local")
+    generate_key(dir, "id", "ed25519")
+    let authorized = load_authorized(dir)
+    using listener = net.listen("127.0.0.1", 0) or panic("listen")
+    let port = listener.handle.addr.port
+    spawn ssh.serve_on(listener.handle, low_server_config(authorized, root))
+    let big = pattern(6 * 1024 * 1024 + 99, 21)
+    file.write_file("{local}/big.bin", big) or panic("write local")
+    file.write_text("{local}/small.txt", "small file") or panic("write small")
+    let lines = ["put {local}/big.bin /big.bin", "put {local}/small.txt /small.txt", "mkdir /sub", "rename /small.txt /sub/renamed.txt", "symlink /sub/renamed.txt /sub/link", "get /big.bin {local}/big.copy", "ls -l /sub", "rm /sub/link"]
+    let batch = "{text.join(lines, "\n")}\n"
+    file.write_text("{dir}/batch", batch) or panic("batch")
+    var args = sftp_options(dir, port)
+    for a in ["-b", "{dir}/batch", "u@127.0.0.1"] {
+        push(mut args, a)
+    }
+    let out = run_tool("sftp", args)
+    testing.require(t, process.success(out.status))
+    let stored = file.read_file("{root}/big.bin") or panic("stored")
+    testing.error_if(t, !same(stored, big), "sftp put stored different bytes")
+    let copy = file.read_file("{local}/big.copy") or panic("copy")
+    testing.error_if(t, !same(copy, big), "sftp get returned different bytes")
+    let renamed = file.read_text("{root}/sub/renamed.txt") or panic("renamed")
+    testing.error_if(t, renamed != "small file", "rename kept {renamed}")
+    testing.error_if(t, file.exists("{root}/sub/link"), "rm must remove the link")
+    testing.error_if(t, !contains(str(out.stdout), "renamed.txt"), "ls output {str(out.stdout)}")
+    var copy_args = sftp_options(dir, port)
+    for a in ["{local}/big.bin", "u@127.0.0.1:/scp_up.bin"] {
+        push(mut copy_args, a)
+    }
+    let uploaded = run_tool("scp", copy_args)
+    testing.require(t, process.success(uploaded.status))
+    let scp_stored = file.read_file("{root}/scp_up.bin") or panic("scp stored")
+    testing.error_if(t, !same(scp_stored, big), "scp upload stored different bytes")
+    var down_args = sftp_options(dir, port)
+    for a in ["u@127.0.0.1:/scp_up.bin", "{local}/scp_down.bin"] {
+        push(mut down_args, a)
+    }
+    let downloaded = run_tool("scp", down_args)
+    testing.require(t, process.success(downloaded.status))
+    let scp_copy = file.read_file("{local}/scp_down.bin") or panic("scp copy")
+    testing.error_if(t, !same(scp_copy, big), "scp download returned different bytes")
+    file.remove_all(dir) or panic("remove")
+}
+
+fn free_port() -> i64 {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    l.handle.addr.port
+}
+
+fn port_open(port: i64) -> bool {
+    using tcp = net.dial("127.0.0.1", port) catch {
+        e => return false
+    }
+    true
+}
+
+fn write_sshd_config(dir: str, port: i64) -> str {
+    let path = "{dir}/sshd_config"
+    var text = "Port {port}\nListenAddress 127.0.0.1\n"
+    for name in ["host_ed25519", "host_ecdsa", "host_rsa"] {
+        text = "{text}HostKey {dir}/{name}\n"
+    }
+    text = "{text}PidFile {dir}/sshd.pid\n"
+    text = "{text}AuthorizedKeysFile {dir}/id.pub\n"
+    text = "{text}PubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nStrictModes no\n"
+    text = "{text}AllowTcpForwarding yes\nLogLevel ERROR\nSubsystem sftp /usr/lib/ssh/sftp-server\n"
+    text = "{text}KexAlgorithms +diffie-hellman-group14-sha256,diffie-hellman-group16-sha512\n"
+    file.write_text(path, text) or panic("sshd_config")
+    path
+}
+
+fn start_sshd(dir: str, port: i64) -> process.Command {
+    generate_key(dir, "host_ed25519", "ed25519")
+    generate_key(dir, "host_ecdsa", "ecdsa")
+    generate_key(dir, "host_rsa", "rsa")
+    generate_key(dir, "id", "ed25519")
+    let config = write_sshd_config(dir, port)
+    process.Command {
+        program: process.find("sshd") ?? "sshd"
+        args: ["-D", "-e", "-f", config]
+        stdin: process.Stdio.Null
+        stdout: process.Stdio.Null
+        stderr: process.Stdio.Null
+    }
+}
+
+fn wait_for_port(port: i64) -> bool {
+    for attempt in 0..100 {
+        if port_open(port) {
+            return true
+        }
+        time.sleep_for(duration.milliseconds(50))
+    }
+    false
+}
+
+fn low_client_config(dir: str, algorithms: ssh.Algorithms) -> ssh.ClientConfig {
+    let private = key.load_private_key("{dir}/id", "") or panic("load id")
+    let signer = key.signer(private) or panic("signer")
+    ssh.ClientConfig {
+        user: os.env("USER") ?? "u"
+        verify_host_key: ssh.accept_any_host_key()
+        auth: [ssh.AuthMethod.PublicKey(signer)]
+        algorithms
+    }
+}
+
+fn exec_reports(dir: str, port: i64, algorithms: ssh.Algorithms) -> str {
+    let config = low_client_config(dir, algorithms)
+    using conn = ssh.dial("127.0.0.1", port, config) catch {
+        e => return "dial failed"
+    }
+    let result = ssh.exec(conn, "echo out; echo err >&2; exit 5") catch {
+        e => return "exec failed"
+    }
+    "{str(result.stdout)}|{str(result.stderr)}|{result.status.code}"
+}
+
+fn test_low_client_against_openssh_sshd(t: *testing.T) {
+    let absent = missing_tool(["sshd", "ssh-keygen", "sh"])
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    let dir = file.temp_dir("interop-sshd") or panic("temp dir")
+    let port = free_port()
+    let command = start_sshd(dir, port)
+    using daemon = process.start(command) or panic("start sshd")
+    testing.require(t, wait_for_port(port))
+    let kexes = ["mlkem768x25519-sha256", "curve25519-sha256", "curve25519-sha256@libssh.org", "ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "diffie-hellman-group14-sha256", "diffie-hellman-group16-sha512"]
+    for name in kexes {
+        testing.sub(t, name, fn(t) {
+            let got = exec_reports(dir, port, ssh.Algorithms { kex: [name] })
+            testing.error_if(t, got != "out\n|err\n|5", "got {got}")
+        })
+    }
+    for name in ["chacha20-poly1305@openssh.com", "aes128-gcm@openssh.com", "aes256-gcm@openssh.com", "aes128-ctr", "aes256-ctr"] {
+        testing.sub(t, name, fn(t) {
+            let got = exec_reports(dir, port, ssh.Algorithms { ciphers: [name] })
+            testing.error_if(t, got != "out\n|err\n|5", "got {got}")
+        })
+    }
+    for name in ["hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com"] {
+        testing.sub(t, name, fn(t) {
+            let got = exec_reports(dir, port, ssh.Algorithms { ciphers: ["aes256-ctr"], macs: [name] })
+            testing.error_if(t, got != "out\n|err\n|5", "got {got}")
+        })
+    }
+    for name in ["ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-256", "rsa-sha2-512"] {
+        testing.sub(t, name, fn(t) {
+            let got = exec_reports(dir, port, ssh.Algorithms { host_keys: [name] })
+            testing.error_if(t, got != "out\n|err\n|5", "got {got}")
+        })
+    }
+    file.remove_all(dir) or panic("remove")
+}
+
+fn host_key_of(dir: str, name: str) -> key.PublicKey {
+    let line = file.read_text("{dir}/{name}.pub") or panic("read {name}.pub")
+    let parsed = key.parse_line(line) or panic("parse {name}.pub")
+    parsed.key
+}
+
+fn dial_refused(port: i64, config: ssh.ClientConfig) -> bool {
+    using conn = ssh.dial("127.0.0.1", port, config) catch {
+        e => return true
+    }
+    false
+}
+
+fn test_low_client_checks_the_openssh_host_key(t: *testing.T) {
+    let absent = missing_tool(["sshd", "ssh-keygen", "sh"])
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    let dir = file.temp_dir("interop-hostkey") or panic("temp dir")
+    let port = free_port()
+    let command = start_sshd(dir, port)
+    using daemon = process.start(command) or panic("start sshd")
+    testing.require(t, wait_for_port(port))
+    let expected = host_key_of(dir, "host_ed25519")
+    var config = low_client_config(dir, ssh.Algorithms { host_keys: ["ssh-ed25519"] })
+    config.verify_host_key = fn(k) { key.equal(k, expected) }
+    using accepted = ssh.dial("127.0.0.1", port, config) or panic("the genuine host key must be accepted")
+    let impostor = host_key_of(dir, "host_ecdsa")
+    config.verify_host_key = fn(k) { key.equal(k, impostor) }
+    testing.error_if(t, !dial_refused(port, config), "a different host key must be refused")
+    file.remove_all(dir) or panic("remove")
+}
+
+fn test_low_client_transfers_files_through_openssh_sftp(t: *testing.T) {
+    let absent = missing_tool(["sshd", "ssh-keygen", "sh", "sha256sum"])
+    if absent.len > 0 || !file.exists("/usr/lib/ssh/sftp-server") {
+        testing.skip(t, "sshd, ssh-keygen, sha256sum or sftp-server is not installed")
+    }
+    let dir = file.temp_dir("interop-transfer") or panic("temp dir")
+    let port = free_port()
+    let command = start_sshd(dir, port)
+    using daemon = process.start(command) or panic("start sshd")
+    testing.require(t, wait_for_port(port))
+    using conn = ssh.dial("127.0.0.1", port, low_client_config(dir, ssh.Algorithms {})) or panic("dial")
+    using client = open(conn) or panic("open sftp")
+    let c = client.handle
+    let big = pattern(8 * 1024 * 1024 + 7, 33)
+    write_file(c, "{dir}/upload.bin", big, 0o644) or panic("upload")
+    let sum = run_tool("sha256sum", ["{dir}/upload.bin"])
+    let line = str(sum.stdout)
+    let want = text.encode_hex(hash.sum(hash.sha256(), big))
+    testing.error_if(t, !contains(line, want), "sha256sum {line} against {want}")
+    let back = read_file(c, "{dir}/upload.bin") or panic("download")
+    testing.error_if(t, !same(back, big), "download differs")
+    let on_disk = stat(c, "{dir}/upload.bin") or panic("stat")
+    testing.error_if(t, on_disk.size != big.len, "size {on_disk.size ?? -1}")
+    mkdir(c, "{dir}/made", 0o755) or panic("mkdir")
+    symlink(c, "{dir}/upload.bin", "{dir}/made/link") or panic("symlink")
+    let target = read_link(c, "{dir}/made/link") or panic("read_link")
+    testing.error_if(t, target != "{dir}/upload.bin", "link {target}")
+    let listed = list(c, "{dir}/made") or panic("list")
+    testing.error_if(t, names_of(listed) != "link,", "listing {names_of(listed)}")
+    let vfs = statvfs(c, dir) or panic("statvfs")
+    testing.error_if(t, vfs.blocks <= 0, "statvfs {vfs.blocks}")
+    file.remove_all(dir) or panic("remove")
+}
+
+fn test_low_client_forwards_through_openssh_sshd(t: *testing.T) {
+    let absent = missing_tool(["sshd", "ssh-keygen", "sh"])
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    let dir = file.temp_dir("interop-local-forward") or panic("temp dir")
+    let port = free_port()
+    let command = start_sshd(dir, port)
+    using daemon = process.start(command) or panic("start sshd")
+    testing.require(t, wait_for_port(port))
+    using echo = net.listen("127.0.0.1", 0) or panic("echo listen")
+    spawn echo_connections(echo.handle)
+    using conn = ssh.dial("127.0.0.1", port, low_client_config(dir, ssh.Algorithms {})) or panic("dial")
+    using forward = ssh.listen_local(conn, "127.0.0.1", 0, "127.0.0.1", echo.handle.addr.port) or panic("listen_local")
+    using tcp = net.dial("127.0.0.1", forward.port) or panic("dial forward")
+    let sock = io.reader(net.stream(tcp))
+    let message = pattern(300000, 4)
+    io.write_all(net.stream(tcp), message) or panic("write")
+    let echoed = io.read_exact(sock, message.len) or panic("read")
+    testing.error_if(t, !same(echoed, message), "forwarded bytes differ")
+    file.remove_all(dir) or panic("remove")
+}
+
+fn test_low_client_reaches_a_low_server_through_openssh(t: *testing.T) {
+    let absent = missing_tool(["sshd", "ssh-keygen", "sh"])
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    let dir = file.temp_dir("interop-jump") or panic("temp dir")
+    let port = free_port()
+    let command = start_sshd(dir, port)
+    using daemon = process.start(command) or panic("start sshd")
+    testing.require(t, wait_for_port(port))
+    let authorized = load_authorized(dir)
+    using target = net.listen("127.0.0.1", 0) or panic("target listen")
+    spawn ssh.serve_on(target.handle, low_server_config(authorized, dir))
+    using jump = ssh.dial("127.0.0.1", port, low_client_config(dir, ssh.Algorithms {})) or panic("dial jump")
+    using inner = ssh.dial_through(jump, "127.0.0.1", target.handle.addr.port, low_client_config(dir, ssh.Algorithms {})) or panic("dial through")
+    let result = ssh.exec(inner, "echo hello") or panic("exec")
+    testing.error_if(t, str(result.stdout) != "hello\n", "stdout {str(result.stdout)}")
+    file.remove_all(dir) or panic("remove")
+}

@@ -1,0 +1,251 @@
+import std/io
+import std/ssh/key
+import std/ssh/wire
+
+const msg_userauth_request: u8 = 50
+const msg_userauth_failure: u8 = 51
+const msg_userauth_success: u8 = 52
+const msg_userauth_banner: u8 = 53
+const msg_userauth_info: u8 = 60
+const msg_userauth_info_response: u8 = 61
+
+const service_userauth = "ssh-userauth"
+const service_connection = "ssh-connection"
+
+/// A prompt of keyboard-interactive authentication (RFC 4256).
+pub struct Prompt {
+    /// The text to show the user.
+    pub text: str
+    /// Whether the answer may be echoed while typed.
+    pub echo: bool
+}
+
+/// A way for a client to prove its identity. A client tries its methods in the order given.
+pub enum AuthMethod {
+    /// The `none` method, which a server refuses but answers with the methods it accepts. It succeeds only on a server that lets everyone in.
+    NoAuth
+    /// A password.
+    Password(password: str)
+    /// A public key. The server is asked whether it accepts the key before the signature is made.
+    PublicKey(signer: key.Signer)
+    /// Keyboard-interactive: `respond` receives the name, the instruction and the prompts of each round and returns one answer per prompt.
+    KeyboardInteractive(respond: fn(str, str, []Prompt) -> []str)
+}
+
+fn method_name(m: AuthMethod) -> str {
+    match m {
+        NoAuth => "none"
+        Password(_) => "password"
+        PublicKey(_) => "publickey"
+        KeyboardInteractive(_) => "keyboard-interactive"
+    }
+}
+
+fn request_head(user: str, method: str) -> []u8 {
+    var out: []u8 = [msg_userauth_request]
+    wire.put_str(mut out, user)
+    wire.put_str(mut out, service_connection)
+    wire.put_str(mut out, method)
+    out
+}
+
+fn service_message(kind: u8, name: str) -> []u8 {
+    var out: []u8 = [kind]
+    wire.put_str(mut out, name)
+    out
+}
+
+fn read_banner(payload: []u8, banner: fn(str)) ! Error {
+    let r = wire.reader(payload[1..])
+    let text = wire.read_str(r) catch malformed
+    banner(text)
+}
+
+fn read_outcome(l: *Link, banner: fn(str)) -> []u8 ! Error {
+    for {
+        let p = next_message(l)?
+        if p[0] == msg_userauth_banner {
+            read_banner(p, banner)?
+            continue
+        }
+        if p[0] == msg_userauth_success || p[0] == msg_userauth_failure || p[0] == msg_userauth_info {
+            return p
+        }
+        fail Protocol
+    }
+}
+
+struct AuthState {
+    allowed: []str
+    known: bool
+}
+
+fn record_failure(state: *AuthState, payload: []u8) ! Error {
+    let r = wire.reader(payload[1..])
+    state.allowed = wire.read_names(r) catch malformed
+    wire.read_bool(r) catch malformed
+    wire.finish(r) catch malformed
+    state.known = true
+}
+
+fn authorization_data(session_id: []u8, user: str, algorithm: str, blob: []u8) -> []u8 {
+    var out: []u8 = []
+    wire.put_string(mut out, session_id)
+    push(mut out, msg_userauth_request)
+    wire.put_str(mut out, user)
+    wire.put_str(mut out, service_connection)
+    wire.put_str(mut out, "publickey")
+    wire.put_bool(mut out, true)
+    wire.put_str(mut out, algorithm)
+    wire.put_string(mut out, blob)
+    out
+}
+
+fn key_algorithms(l: *Link, signer: key.Signer) -> []str {
+    let all = key.signature_algorithms(signer.public.material)
+    var offered: []str = []
+    for name in all {
+        if wire.has_name(l.peer_sig_algs, name) {
+            push(mut offered, name)
+        }
+    }
+    if offered.len == 0 { all } else { offered }
+}
+
+fn try_public_key(l: *Link, user: str, signer: key.Signer, banner: fn(str), state: *AuthState) -> bool ! Error {
+    for algorithm in key_algorithms(l, signer) {
+        let wire_algorithm = key.offered_name(signer.public, algorithm)
+        var query = request_head(user, "publickey")
+        wire.put_bool(mut query, false)
+        wire.put_str(mut query, wire_algorithm)
+        wire.put_string(mut query, signer.public.blob)
+        send(l, query)?
+        let answer = read_outcome(l, banner)?
+        if answer[0] == msg_userauth_success {
+            return true
+        }
+        if answer[0] != msg_userauth_info {
+            record_failure(state, answer)?
+            continue
+        }
+        let data = authorization_data(l.session_id, user, wire_algorithm, signer.public.blob)
+        let signature = signer.sign(algorithm, data) catch Key
+        var request = request_head(user, "publickey")
+        wire.put_bool(mut request, true)
+        wire.put_str(mut request, wire_algorithm)
+        wire.put_string(mut request, signer.public.blob)
+        wire.put_string(mut request, signature)
+        send(l, request)?
+        let result = read_outcome(l, banner)?
+        if result[0] == msg_userauth_success {
+            return true
+        }
+        if result[0] == msg_userauth_failure {
+            record_failure(state, result)?
+        }
+    }
+    false
+}
+
+fn try_password(l: *Link, user: str, password: str, banner: fn(str), state: *AuthState) -> bool ! Error {
+    var request = request_head(user, "password")
+    wire.put_bool(mut request, false)
+    wire.put_str(mut request, password)
+    send(l, request)?
+    let result = read_outcome(l, banner)?
+    if result[0] == msg_userauth_success {
+        return true
+    }
+    if result[0] == msg_userauth_failure {
+        record_failure(state, result)?
+    }
+    false
+}
+
+fn read_prompts(payload: []u8) -> InfoRequest ! Error {
+    let r = wire.reader(payload[1..])
+    let name = wire.read_str(r) catch malformed
+    let instruction = wire.read_str(r) catch malformed
+    wire.read_str(r) catch malformed
+    let count = wire.read_u32(r) catch malformed
+    if count > 64 {
+        fail Malformed
+    }
+    var prompts: []Prompt = []
+    for i in 0..count {
+        let text = wire.read_str(r) catch malformed
+        let echo = wire.read_bool(r) catch malformed
+        push(mut prompts, Prompt { text, echo })
+    }
+    wire.finish(r) catch malformed
+    InfoRequest { name, instruction, prompts }
+}
+
+struct InfoRequest {
+    name: str
+    instruction: str
+    prompts: []Prompt
+}
+
+fn try_interactive(l: *Link, user: str, respond: fn(str, str, []Prompt) -> []str, banner: fn(str), state: *AuthState) -> bool ! Error {
+    var request = request_head(user, "keyboard-interactive")
+    wire.put_str(mut request, "")
+    wire.put_str(mut request, "")
+    send(l, request)?
+    for {
+        let result = read_outcome(l, banner)?
+        if result[0] == msg_userauth_success {
+            return true
+        }
+        if result[0] == msg_userauth_failure {
+            record_failure(state, result)?
+            return false
+        }
+        let info = read_prompts(result)?
+        let answers = respond(info.name, info.instruction, info.prompts)
+        if answers.len != info.prompts.len {
+            fail Invalid
+        }
+        var response: []u8 = [msg_userauth_info_response]
+        wire.put_u32(mut response, answers.len)
+        for a in answers {
+            wire.put_str(mut response, a)
+        }
+        send(l, response)?
+    }
+}
+
+fn try_method(l: *Link, user: str, m: AuthMethod, banner: fn(str), state: *AuthState) -> bool ! Error {
+    match m {
+        NoAuth => {
+            send(l, request_head(user, "none"))?
+            let result = read_outcome(l, banner)?
+            if result[0] == msg_userauth_success {
+                return true
+            }
+            record_failure(state, result)?
+            false
+        }
+        Password(password) => try_password(l, user, password, banner, state)?
+        PublicKey(signer) => try_public_key(l, user, signer, banner, state)?
+        KeyboardInteractive(respond) => try_interactive(l, user, respond, banner, state)?
+    }
+}
+
+fn client_authenticate(l: *Link, user: str, methods: []AuthMethod, banner: fn(str)) ! Error {
+    send(l, service_message(msg_service_request, service_userauth))?
+    let accepted = next_message(l)?
+    if accepted[0] != msg_service_accept {
+        fail Protocol
+    }
+    let state = new(AuthState { allowed: [], known: false })
+    for m in methods {
+        if state.known && !wire.has_name(state.allowed, method_name(m)) {
+            continue
+        }
+        if try_method(l, user, m, banner, state)? {
+            return
+        }
+    }
+    fail AuthFailed
+}
