@@ -1,0 +1,472 @@
+import std/arrow
+import std/file
+import std/hash
+import std/io
+import std/text
+
+/// Choices for writing a file.
+pub struct WriterOptions {
+    /// The codec of every page. Defaults to `Snappy`; `Lz4` and `Lzo` are not written.
+    pub compression: Codec = Codec.Snappy
+    /// The compression level of the codecs that have one: 1 to 9 for gzip, 0 to 11 for Brotli and the Zstandard and LZ4 levels otherwise. Defaults to 3.
+    pub level: i64 = 3
+    /// Whether to dictionary encode the columns that have no encoding of their own. A chunk whose dictionary would exceed `dictionary_page_size` is written with `Plain`. Defaults to `true`.
+    pub dictionary: bool = true
+    /// The largest dictionary page, in bytes, before a chunk is written without a dictionary. Defaults to 1 MiB.
+    pub dictionary_page_size: i64 = 1048576
+    /// The data page format, 1 or 2. Defaults to 1.
+    pub page_version: i64 = 1
+    /// The size, in bytes, at which a data page is closed at the next row. Defaults to 1 MiB.
+    pub page_size: i64 = 1048576
+    /// The number of rows of a row group. Defaults to 1,048,576.
+    pub row_group_rows: i64 = 1048576
+    /// Whether to write the minimum, maximum and null count of each column chunk. Defaults to `true`.
+    pub statistics: bool = true
+    /// Whether to write the CRC-32 of each page. Defaults to `false`.
+    pub checksums: bool = false
+    /// The encoding of a column, by its path joined with dots. `Plain`, `Rle` (booleans), `DeltaBinaryPacked` (integers), `DeltaLengthByteArray` and `DeltaByteArray` (byte arrays), `ByteStreamSplit` (floats, integers and fixed-length byte arrays) and `RleDictionary` are written.
+    pub encodings: [str: Encoding] = [:]
+}
+
+struct Dict {
+    values: Values
+    indices: []i64
+}
+
+struct ChunkPlan {
+    encoding: Encoding
+    use_dict: bool
+    dict: Dict
+}
+
+struct Piece {
+    entry_start: i64
+    entry_end: i64
+    value_start: i64
+    value_end: i64
+}
+
+struct Written {
+    uncompressed: i64
+    compressed: i64
+}
+
+fn new_sinks(cols: []Column) -> []Sink {
+    var sinks: []Sink = []
+    for c in cols {
+        push(mut sinks, Sink { def: [], rep: [], values: empty_values(c.node.physical, c.node.length) })
+    }
+    sinks
+}
+
+fn build_dict(v: Values) -> Dict {
+    var seen: [str: i64] = [:]
+    var dict = empty_values(v.physical, v.length)
+    var indices: []i64 = []
+    for k in 0..v.count {
+        let raw = raw_at(v, k)
+        let key = str(raw)
+        let found = seen[key] ?? -1
+        if found >= 0 {
+            push(mut indices, found)
+        } else {
+            seen[key] = dict.count
+            push(mut indices, dict.count)
+            push_raw(mut dict, raw)
+        }
+    }
+    Dict { values: dict, indices }
+}
+
+fn slice_values(v: Values, a: i64, b: i64) -> Values {
+    var out = empty_values(v.physical, v.length)
+    out.count = b - a
+    if v.physical == Physical.ByteArray {
+        for k in a..b {
+            io.append(mut out.data, v.data[v.offsets[k]..v.offsets[k + 1]])
+            push(mut out.offsets, out.data.len)
+        }
+        return out
+    }
+    let w = fixed_width(v.physical, v.length)
+    out.fixed = v.fixed[a * w..b * w]
+    out
+}
+
+fn check_encoding(p: Physical, e: Encoding, name: str) ! Error {
+    var ok = false
+    match e {
+        Plain => { ok = true }
+        Rle => { ok = p == Physical.Boolean }
+        DeltaBinaryPacked => { ok = p == Physical.Int32 || p == Physical.Int64 }
+        DeltaLengthByteArray => { ok = p == Physical.ByteArray }
+        DeltaByteArray => { ok = p == Physical.ByteArray }
+        ByteStreamSplit => { ok = p != Physical.Boolean && p != Physical.ByteArray && p != Physical.Int96 }
+        RleDictionary => { ok = p != Physical.Boolean }
+        PlainDictionary => fail Unsupported("writing the PLAIN_DICTIONARY encoding")
+        BitPacked => fail Unsupported("writing the BIT_PACKED encoding")
+    }
+    if !ok {
+        fail Mismatch("the encoding does not apply to the physical type of the column {name}")
+    }
+}
+
+fn plan_chunk(col: Column, sink: Sink, o: WriterOptions) -> ChunkPlan ! Error {
+    let name = text.join(col.path, ".")
+    let forced = o.encodings[name]
+    var plan = ChunkPlan { encoding: Encoding.Plain, use_dict: false, dict: Dict { values: empty_values(col.node.physical, col.node.length), indices: [] } }
+    if forced != none {
+        let e = forced ?? Encoding.Plain
+        check_encoding(col.node.physical, e, name)?
+        if e != Encoding.RleDictionary {
+            plan.encoding = e
+            return plan
+        }
+        plan.use_dict = true
+        plan.encoding = Encoding.RleDictionary
+        plan.dict = build_dict(sink.values)
+        return plan
+    }
+    if !o.dictionary || col.node.physical == Physical.Boolean || col.node.physical == Physical.Int96 || sink.values.count == 0 {
+        return plan
+    }
+    let dict = build_dict(sink.values)
+    if encode_plain(dict.values).len > o.dictionary_page_size {
+        return plan
+    }
+    plan.use_dict = true
+    plan.encoding = Encoding.RleDictionary
+    plan.dict = dict
+    plan
+}
+
+fn value_size(v: Values, k: i64) -> i64 {
+    match v.physical {
+        ByteArray => 4 + v.offsets[k + 1] - v.offsets[k]
+        _ => fixed_width(v.physical, v.length)
+    }
+}
+
+fn plan_pages(col: Column, sink: Sink, page_size: i64) -> []Piece {
+    var pieces: []Piece = []
+    var start = 0
+    var start_value = 0
+    var value = 0
+    var size = 0
+    for e in 0..sink.def.len {
+        if (col.max_rep == 0 || sink.rep[e] == 0) && e > start && size >= page_size {
+            push(mut pieces, Piece { entry_start: start, entry_end: e, value_start: start_value, value_end: value })
+            start = e
+            start_value = value
+            size = 0
+        }
+        size += 2
+        if sink.def[e] == col.max_def {
+            size += value_size(sink.values, value)
+            value += 1
+        }
+    }
+    if sink.def.len > start {
+        push(mut pieces, Piece { entry_start: start, entry_end: sink.def.len, value_start: start_value, value_end: value })
+    }
+    pieces
+}
+
+fn level_bytes(levels: []i64, piece: Piece, max: i64, prefixed: bool) -> []u8 {
+    if max == 0 {
+        return []
+    }
+    let body = write_hybrid(levels[piece.entry_start..piece.entry_end], bit_width_of(max))
+    if !prefixed {
+        return body
+    }
+    var out: []u8 = []
+    io.put_le32(mut out, body.len)
+    io.append(mut out, body)
+    out
+}
+
+fn ints_of(v: Values) -> []i64 {
+    var out: []i64 = []
+    for k in 0..v.count {
+        let raw = raw_at(v, k)
+        push(mut out, signed_word(raw, if v.physical == Physical.Int32 { 4 } else { 8 }))
+    }
+    out
+}
+
+fn value_bytes_for(plan: ChunkPlan, v: Values, piece: Piece) -> []u8 {
+    if plan.use_dict {
+        let width = bit_width_of(plan.dict.values.count - 1)
+        let bw = if width < 1 { 1 } else { width }
+        var out: []u8 = [u8(bw)]
+        io.append(mut out, write_hybrid(plan.dict.indices[piece.value_start..piece.value_end], bw))
+        return out
+    }
+    let part = slice_values(v, piece.value_start, piece.value_end)
+    match plan.encoding {
+        Rle => {
+            var bits: []i64 = []
+            for k in 0..part.count {
+                push(mut bits, i64(part.fixed[k]))
+            }
+            let body = write_hybrid(bits, 1)
+            var out: []u8 = []
+            io.put_le32(mut out, body.len)
+            io.append(mut out, body)
+            out
+        }
+        DeltaBinaryPacked => encode_delta(ints_of(part), part.physical == Physical.Int32)
+        DeltaLengthByteArray => encode_delta_length(part)
+        DeltaByteArray => encode_delta_byte_array(part)
+        ByteStreamSplit => encode_split(part)
+        _ => encode_plain(part)
+    }
+}
+
+fn crc_of(body: []u8) -> i64 {
+    i64(hash.crc32(body))
+}
+
+fn blank_header(kind: i64) -> PageHeader {
+    PageHeader {
+        kind
+        uncompressed: 0
+        compressed: 0
+        crc: 0
+        has_crc: false
+        num_values: 0
+        num_nulls: 0
+        num_rows: 0
+        encoding: Encoding.Plain
+        def_encoding: Encoding.Rle
+        rep_encoding: Encoding.Rle
+        def_length: 0
+        rep_length: 0
+        is_compressed: true
+        size: 0
+    }
+}
+
+fn emit_page(mut out: []u8, header: PageHeader, body: []u8, o: WriterOptions) -> Written {
+    var h = header
+    h.compressed = body.len
+    h.has_crc = o.checksums
+    h.crc = if o.checksums { crc_of(body) } else { 0 }
+    let head = write_page_header(h)
+    io.append(mut out, head)
+    io.append(mut out, body)
+    Written { uncompressed: head.len + h.uncompressed, compressed: head.len + body.len }
+}
+
+fn count_records(col: Column, sink: Sink, piece: Piece) -> i64 {
+    if col.max_rep == 0 {
+        return piece.entry_end - piece.entry_start
+    }
+    var n = 0
+    for e in piece.entry_start..piece.entry_end {
+        if sink.rep[e] == 0 {
+            n += 1
+        }
+    }
+    n
+}
+
+fn data_page(mut out: []u8, col: Column, sink: Sink, plan: ChunkPlan, piece: Piece, o: WriterOptions) -> Written ! Error {
+    var h = blank_header(if o.page_version == 2 { 3 } else { 0 })
+    h.num_values = piece.entry_end - piece.entry_start
+    h.encoding = plan.encoding
+    let values = value_bytes_for(plan, sink.values, piece)
+    if o.page_version == 2 {
+        let rep = level_bytes(sink.rep, piece, col.max_rep, false)
+        let def = level_bytes(sink.def, piece, col.max_def, false)
+        let shrunk = if o.compression == Codec.Uncompressed { values } else { compress(o.compression, values, o.level)? }
+        var body: []u8 = []
+        io.append(mut body, rep)
+        io.append(mut body, def)
+        io.append(mut body, shrunk)
+        h.num_nulls = h.num_values - (piece.value_end - piece.value_start)
+        h.num_rows = count_records(col, sink, piece)
+        h.rep_length = rep.len
+        h.def_length = def.len
+        h.is_compressed = o.compression != Codec.Uncompressed
+        h.uncompressed = rep.len + def.len + values.len
+        return emit_page(mut out, h, body, o)
+    }
+    var payload: []u8 = []
+    io.append(mut payload, level_bytes(sink.rep, piece, col.max_rep, true))
+    io.append(mut payload, level_bytes(sink.def, piece, col.max_def, true))
+    io.append(mut payload, values)
+    h.uncompressed = payload.len
+    let body = compress(o.compression, payload, o.level)?
+    emit_page(mut out, h, body, o)
+}
+
+fn dictionary_page(mut out: []u8, plan: ChunkPlan, o: WriterOptions) -> Written ! Error {
+    var h = blank_header(2)
+    h.num_values = plan.dict.values.count
+    h.encoding = Encoding.Plain
+    let raw = encode_plain(plan.dict.values)
+    h.uncompressed = raw.len
+    let body = compress(o.compression, raw, o.level)?
+    emit_page(mut out, h, body, o)
+}
+
+fn null_entries(col: Column, sink: Sink) -> i64 {
+    var n = 0
+    for d in sink.def {
+        if d < col.max_def {
+            n += 1
+        }
+    }
+    n
+}
+
+fn chunk_encodings(col: Column, plan: ChunkPlan, o: WriterOptions) -> []Encoding {
+    var out: []Encoding = []
+    if plan.use_dict || plan.encoding == Encoding.Plain {
+        push(mut out, Encoding.Plain)
+    }
+    if col.max_def > 0 || col.max_rep > 0 || plan.encoding == Encoding.Rle {
+        push(mut out, Encoding.Rle)
+    }
+    if plan.encoding != Encoding.Plain && plan.encoding != Encoding.Rle {
+        push(mut out, plan.encoding)
+    }
+    out
+}
+
+fn write_chunk(mut out: []u8, col: Column, sink: Sink, o: WriterOptions) -> ColumnChunk ! Error {
+    let plan = plan_chunk(col, sink, o)?
+    var chunk = ColumnChunk {
+        path: col.path
+        physical: col.node.physical
+        codec: o.compression
+        encodings: chunk_encodings(col, plan, o)
+        num_values: sink.def.len
+        total_compressed: 0
+        total_uncompressed: 0
+        data_page_offset: 0
+    }
+    if plan.use_dict {
+        chunk.dictionary_page_offset = out.len
+        let w = dictionary_page(mut out, plan, o)?
+        chunk.total_compressed += w.compressed
+        chunk.total_uncompressed += w.uncompressed
+    }
+    chunk.data_page_offset = out.len
+    for piece in plan_pages(col, sink, o.page_size) {
+        let w = data_page(mut out, col, sink, plan, piece, o)?
+        chunk.total_compressed += w.compressed
+        chunk.total_uncompressed += w.uncompressed
+    }
+    if o.statistics {
+        chunk.statistics = column_statistics(col.node, sink.values, null_entries(col, sink))
+    }
+    chunk
+}
+
+fn flush_group(mut out: []u8, s: *Shredder, cols: []Column, rows: i64, o: WriterOptions) -> RowGroup ! Error {
+    var group = RowGroup { num_rows: rows, total_byte_size: 0, columns: [] }
+    for k, c in cols {
+        let chunk = write_chunk(mut out, c, s.sinks[k], o)?
+        group.total_byte_size += chunk.total_uncompressed
+        push(mut group.columns, chunk)
+    }
+    s.sinks = new_sinks(cols)
+    group
+}
+
+fn check_options(o: WriterOptions) ! Error {
+    if o.page_version != 1 && o.page_version != 2 {
+        fail Mismatch("the data page version {o.page_version}")
+    }
+    if o.row_group_rows <= 0 || o.page_size <= 0 || o.dictionary_page_size <= 0 {
+        fail Mismatch("a row group, page or dictionary size that is not positive")
+    }
+    match o.compression {
+        Lz4 => fail Unsupported("writing the Hadoop LZ4 codec")
+        Lzo => fail Unsupported("writing the LZO codec")
+        _ => {}
+    }
+}
+
+fn check_batch(schema: arrow.Schema, b: arrow.Batch) ! Error {
+    if b.columns.len != schema.fields.len {
+        fail Mismatch("a batch of {b.columns.len} columns for a schema of {schema.fields.len} fields")
+    }
+    for k, f in schema.fields {
+        let c = b.columns[k]
+        if arrow.type_name(c.data_type) != arrow.type_name(f.data_type) || c.length != b.length {
+            fail Mismatch("the column {f.name} does not match its field")
+        }
+        arrow.validate(c) catch {
+            e => fail Mismatch("the column {f.name} is invalid: {arrow.message(e)}")
+        }
+    }
+}
+
+fn shred_row(s: *Shredder, nodes: []Node, b: arrow.Batch, i: i64) ! Error {
+    var first = 0
+    for k, n in nodes {
+        emit(s, n, b.columns[k], i, first, 0, 0)?
+        first += leaves_under(n)
+    }
+}
+
+fn footer_of(schema: Schema, groups: []RowGroup, rows: i64, key_value: [str: str]) -> []u8 {
+    let m = Metadata { version: 2, schema, num_rows: rows, row_groups: groups, key_value, created_by: "low std/parquet" }
+    write_metadata(m)
+}
+
+/// Returns the bytes of a Parquet file that holds the rows of `batches`, whose columns match the fields of `schema`. Nullable fields write optional columns and non-nullable fields required ones, and the metadata of `schema` becomes the key and value metadata of the file.
+///
+/// Arrow types map to Parquet types as follows: integers of 8 and 16 bits to `INT32` with an `Int` annotation, 32 and 64-bit signed integers to `INT32` and `INT64`, unsigned 32 and 64-bit integers to those with an `Int` annotation, floats to `Float`, `Double` and a two-byte `Float16`, text to `String`, binary to `ByteArray`, fixed-size binary to `FixedLenByteArray`, decimals to the shortest `FixedLenByteArray` that holds their precision, `Date32` to `Date`, `Time32` in milliseconds and `Time64` to `Time`, timestamps to `Timestamp` (adjusted to UTC when the type has a time zone), lists, large lists and fixed-size lists to the three-level `List` form, maps to `Map`, structs to groups, dictionary arrays to the type of their values and the null type to a column of the `Unknown` type. The `PARQUET:field_id` metadata of a field becomes the field id. Dates in milliseconds, times and timestamps in seconds, durations, intervals and unions fail with `Unsupported`, a null in a non-nullable field with `Mismatch`.
+pub fn write_bytes(schema: arrow.Schema, batches: []arrow.Batch, options: WriterOptions) -> []u8 ! Error {
+    check_options(options)?
+    var nodes: []Node = []
+    for f in schema.fields {
+        let n = build_node(f, 0, 0)?
+        push(mut nodes, n)
+    }
+    if nodes.len == 0 {
+        fail Mismatch("a schema without fields")
+    }
+    let parquet_schema = Schema { fields: nodes }
+    let cols = leaf_columns(parquet_schema)
+    let s = new(Shredder { sinks: new_sinks(cols) })
+    var out = bytes("PAR1")
+    var groups: []RowGroup = []
+    var total = 0
+    var in_group = 0
+    for b in batches {
+        check_batch(schema, b)?
+        for i in 0..b.length {
+            shred_row(s, nodes, b, i)?
+            in_group += 1
+            total += 1
+            if in_group == options.row_group_rows {
+                let g = flush_group(mut out, s, cols, in_group, options)?
+                push(mut groups, g)
+                in_group = 0
+            }
+        }
+    }
+    if in_group > 0 {
+        let g = flush_group(mut out, s, cols, in_group, options)?
+        push(mut groups, g)
+    }
+    let footer = footer_of(parquet_schema, groups, total, schema.metadata)
+    io.append(mut out, footer)
+    io.put_le32(mut out, footer.len)
+    io.append(mut out, bytes("PAR1"))
+    out
+}
+
+/// Writes the file `write_bytes` describes to `path`.
+pub fn write(path: str, schema: arrow.Schema, batches: []arrow.Batch, options: WriterOptions) ! Error {
+    let data = write_bytes(schema, batches, options)?
+    file.write_file(path, data) catch {
+        e => fail Io(e)
+    }
+}

@@ -1,0 +1,334 @@
+import std/compress/brotli
+import std/compress/deflate
+import std/compress/lz4
+import std/compress/snappy
+import std/compress/zstd
+import std/hash
+import std/io
+import std/math
+
+struct ColumnData {
+    def: []i64
+    rep: []i64
+    values: Values
+    count: i64
+}
+
+fn decompress(c: Codec, data: []u8, size: i64, base: i64) -> []u8 ! Error {
+    if size < 0 {
+        fail Invalid(base, "a page of {size} bytes")
+    }
+    if size == 0 && data.len == 0 {
+        return []
+    }
+    var out: []u8 = []
+    match c {
+        Uncompressed => { out = data }
+        Snappy => {
+            out = snappy.decompress_block(data, size) catch {
+                _ => fail Invalid(base, "a snappy page does not decompress")
+            }
+        }
+        Gzip => {
+            out = deflate.gzip_decompress(data, size) catch {
+                _ => fail Invalid(base, "a gzip page does not decompress")
+            }
+        }
+        Zstd => {
+            out = zstd.decompress(data, size) catch {
+                _ => fail Invalid(base, "a zstd page does not decompress")
+            }
+        }
+        Brotli => {
+            out = brotli.decompress(data, size) catch {
+                _ => fail Invalid(base, "a brotli page does not decompress")
+            }
+        }
+        Lz4Raw => {
+            out = lz4.block_decompress(data, size, size) catch {
+                _ => fail Invalid(base, "an lz4 page does not decompress")
+            }
+        }
+        Lz4 => { out = hadoop_lz4(data, size, base)? }
+        Lzo => fail Unsupported("the LZO codec")
+    }
+    if out.len != size {
+        fail Invalid(base, "a page decompresses to {out.len} bytes, its header says {size}")
+    }
+    out
+}
+
+fn hadoop_blocks(data: []u8, size: i64) -> []u8 ! io.Error {
+    var out: []u8 = []
+    var at = 0
+    for at < data.len {
+        if data.len - at < 8 {
+            fail io.Error.Eof
+        }
+        let raw = io.be32(data, at)
+        let packed = io.be32(data, at + 4)
+        at += 8
+        if packed > data.len - at || raw > size - out.len {
+            fail io.Error.Eof
+        }
+        let block = lz4.block_decompress(data[at..at + packed], raw, raw)?
+        io.append(mut out, block)
+        at += packed
+    }
+    out
+}
+
+fn hadoop_lz4(data: []u8, size: i64, base: i64) -> []u8 ! Error {
+    let framed = hadoop_blocks(data, size) catch {
+        _ => []
+    }
+    if framed.len == size {
+        return framed
+    }
+    lz4.block_decompress(data, size, size) catch {
+        _ => fail Invalid(base, "an lz4 page does not decompress")
+    }
+}
+
+fn compress(c: Codec, data: []u8, level: i64) -> []u8 ! Error {
+    match c {
+        Uncompressed => data
+        Snappy => snappy.compress_block(data)
+        Gzip => deflate.gzip_compress(data, math.clamp(level, 1, 9))
+        Zstd => zstd.compress(data, level)
+        Brotli => brotli.compress(data, math.clamp(level, 0, 11))
+        Lz4Raw => lz4.block_compress(data, level)
+        Lz4 => fail Unsupported("the Hadoop LZ4 codec")
+        Lzo => fail Unsupported("the LZO codec")
+    }
+}
+
+fn read_levels(data: []u8, at: i64, max: i64, count: i64, prefixed: bool, length: i64, base: i64) -> Ints ! Error {
+    if max == 0 {
+        return Ints { values: [], used: 0 }
+    }
+    var start = at
+    var n = length
+    if prefixed {
+        if data.len - at < 4 {
+            fail Truncated(base + data.len)
+        }
+        n = io.le32(data, at) & 0xFFFFFFFF
+        start += 4
+    }
+    if n < 0 || n > data.len - start {
+        fail Truncated(base + data.len)
+    }
+    let levels = read_hybrid(data[start..start + n], bit_width_of(max), count, base + start)?
+    for l in levels {
+        if l > max {
+            fail Invalid(base + start, "a level {l} above the maximum {max}")
+        }
+    }
+    Ints { values: levels, used: start + n - at }
+}
+
+fn ints_to_values(p: Physical, ints: []i64) -> Values ! Error {
+    var v = empty_values(p, 0)
+    v.count = ints.len
+    match p {
+        Int32 => {
+            for i in ints {
+                io.put_le32(mut v.fixed, i & 0xFFFFFFFF)
+            }
+        }
+        Int64 => {
+            for i in ints {
+                io.put_le64(mut v.fixed, i)
+            }
+        }
+        _ => fail Invalid(-1, "delta encoding of a non-integer column")
+    }
+    v
+}
+
+fn bytes_to_fixed(v: Values, length: i64) -> Values ! Error {
+    var out = empty_values(Physical.FixedLenByteArray, length)
+    out.count = v.count
+    for i in 0..v.count {
+        if v.offsets[i + 1] - v.offsets[i] != length {
+            fail Invalid(-1, "a value of {v.offsets[i + 1] - v.offsets[i]} bytes in a column of {length}")
+        }
+    }
+    out.fixed = v.data
+    out
+}
+
+fn decode_values(e: Encoding, col: Column, dict: Values, has_dict: bool, data: []u8, count: i64, base: i64) -> Values ! Error {
+    let p = col.node.physical
+    match e {
+        Plain => decode_plain(p, col.node.length, data, count, base)?
+        PlainDictionary => decode_indices(dict, has_dict, data, count, base)?
+        RleDictionary => decode_indices(dict, has_dict, data, count, base)?
+        Rle => {
+            if p != Physical.Boolean {
+                fail Invalid(base, "RLE values in a column that is not boolean")
+            }
+            if data.len < 4 && count > 0 {
+                fail Truncated(base + data.len)
+            }
+            var v = empty_values(p, 0)
+            v.count = count
+            if count == 0 {
+                return v
+            }
+            let n = io.le32(data, 0) & 0xFFFFFFFF
+            if n > data.len - 4 {
+                fail Truncated(base + data.len)
+            }
+            let bits = read_hybrid(data[4..4 + n], 1, count, base + 4)?
+            for b in bits {
+                push(mut v.fixed, u8(b))
+            }
+            v
+        }
+        DeltaBinaryPacked => {
+            let ints = decode_delta(data, count, base)?
+            ints_to_values(p, ints.values)?
+        }
+        DeltaLengthByteArray => {
+            let v = decode_delta_length(data, count, base)?
+            if p == Physical.FixedLenByteArray {
+                return bytes_to_fixed(v, col.node.length)?
+            }
+            v
+        }
+        DeltaByteArray => {
+            let v = decode_delta_byte_array(data, count, base)?
+            if p == Physical.FixedLenByteArray {
+                return bytes_to_fixed(v, col.node.length)?
+            }
+            v
+        }
+        ByteStreamSplit => decode_split(p, col.node.length, data, count, base)?
+        BitPacked => fail Unsupported("the BIT_PACKED encoding")
+    }
+}
+
+fn decode_indices(dict: Values, has_dict: bool, data: []u8, count: i64, base: i64) -> Values ! Error {
+    if !has_dict {
+        fail Invalid(base, "a dictionary encoded page before any dictionary page")
+    }
+    if count == 0 {
+        return empty_values(dict.physical, dict.length)
+    }
+    if data.len < 1 {
+        fail Truncated(base)
+    }
+    let indices = read_hybrid(data[1..], i64(data[0]), count, base + 1)?
+    gather(dict, indices, base)?
+}
+
+fn count_present(def: []i64, max: i64, total: i64) -> i64 {
+    if max == 0 {
+        return total
+    }
+    var n = 0
+    for d in def {
+        if d == max {
+            n += 1
+        }
+    }
+    n
+}
+
+fn pad_levels(mut levels: []i64, count: i64) {
+    for _ in levels.len..count {
+        push(mut levels, 0)
+    }
+}
+
+fn decode_chunk(data: []u8, base: i64, chunk: ColumnChunk, col: Column, verify: bool, max_page: i64, max_values: i64) -> ColumnData ! Error {
+    if chunk.num_values < 0 || chunk.num_values > max_values {
+        fail TooLarge("a column chunk of {chunk.num_values} values")
+    }
+    var out = ColumnData { def: [], rep: [], values: empty_values(col.node.physical, col.node.length), count: 0 }
+    var dict = empty_values(col.node.physical, col.node.length)
+    var has_dict = false
+    var pos = 0
+    for out.count < chunk.num_values {
+        if pos >= data.len {
+            fail Truncated(base + data.len)
+        }
+        let h = read_page_header(data[pos..], base + pos)?
+        let header_at = base + pos
+        pos += h.size
+        if h.compressed > data.len - pos {
+            fail Truncated(base + data.len)
+        }
+        if h.num_values < 0 || h.num_values > chunk.num_values - out.count {
+            fail Invalid(header_at, "a page of {h.num_values} values in a chunk of {chunk.num_values}")
+        }
+        if h.uncompressed > max_page {
+            fail TooLarge("a page of {h.uncompressed} bytes")
+        }
+        let payload = data[pos..pos + h.compressed]
+        if verify && h.has_crc && i64(hash.crc32(payload)) != h.crc {
+            fail Checksum(header_at)
+        }
+        pos += h.compressed
+        match h.kind {
+            == 1 => {}
+            == 2 => {
+                let body = decompress(chunk.codec, payload, h.uncompressed, header_at)?
+                if col.node.physical != Physical.ByteArray && col.node.physical != Physical.Boolean && body.len != h.num_values * fixed_width(col.node.physical, col.node.length) {
+                    fail Invalid(header_at, "a dictionary page of {body.len} bytes for {h.num_values} fixed-width values")
+                }
+                dict = decode_plain(col.node.physical, col.node.length, body, h.num_values, header_at)?
+                has_dict = true
+            }
+            == 0 => {
+                let body = decompress(chunk.codec, payload, h.uncompressed, header_at)?
+                let rep = read_levels(body, 0, col.max_rep, h.num_values, true, 0, header_at)?
+                let def = read_levels(body, rep.used, col.max_def, h.num_values, true, 0, header_at)?
+                let rest = body[rep.used + def.used..]
+                let present = count_present(def.values, col.max_def, h.num_values)
+                let v = decode_values(h.encoding, col, dict, has_dict, rest, present, header_at)?
+                take_page(mut out, h.num_values, rep.values, def.values, v)
+            }
+            == 3 => {
+                let levels = h.rep_length + h.def_length
+                if h.rep_length < 0 || h.def_length < 0 || levels > payload.len || levels > h.uncompressed {
+                    fail Invalid(header_at, "a page's level lengths exceed the page")
+                }
+                let rep = read_levels(payload, 0, col.max_rep, h.num_values, false, h.rep_length, header_at)?
+                let def = read_levels(payload, h.rep_length, col.max_def, h.num_values, false, h.def_length, header_at)?
+                var rest = payload[levels..]
+                if h.is_compressed && chunk.codec != Codec.Uncompressed {
+                    rest = decompress(chunk.codec, rest, h.uncompressed - levels, header_at)?
+                }
+                let present = count_present(def.values, col.max_def, h.num_values)
+                let v = decode_values(h.encoding, col, dict, has_dict, rest, present, header_at)?
+                take_page(mut out, h.num_values, rep.values, def.values, v)
+            }
+            _ => fail Invalid(header_at, "the page type {h.kind} is not defined")
+        }
+    }
+    out
+}
+
+fn take_page(mut out: ColumnData, count: i64, rep: []i64, def: []i64, v: Values) {
+    var r = rep
+    var d = def
+    pad_levels(mut r, count)
+    pad_levels(mut d, count)
+    if rep.len > 0 || out.rep.len > 0 {
+        append_levels(mut out.rep, r)
+    }
+    if def.len > 0 || out.def.len > 0 {
+        append_levels(mut out.def, d)
+    }
+    append_values(mut out.values, v)
+    out.count += count
+}
+
+fn append_levels(mut into: []i64, more: []i64) {
+    for l in more {
+        push(mut into, l)
+    }
+}

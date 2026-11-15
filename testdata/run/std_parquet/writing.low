@@ -1,0 +1,194 @@
+import std/arrow
+import digest = std/crypto/hash
+import std/file
+import std/os
+import std/parquet
+import std/path
+import std/text
+
+struct Source {
+    name: str
+    fixture: str
+    schema: arrow.Schema
+    batches: []arrow.Batch
+}
+
+struct Variant {
+    label: str
+    options: parquet.WriterOptions
+    flat_only: bool
+    one_group: bool
+}
+
+struct Output {
+    name: str
+    data: []u8
+}
+
+fn delta_encodings() -> [str: parquet.Encoding] {
+    var m: [str: parquet.Encoding] = [:]
+    for name in ["i32", "i64", "i8", "i16", "u8", "u16", "u32", "u64", "d32", "t32", "t64", "ts_ms", "ts_us", "ts_ns", "req"] {
+        m[name] = parquet.Encoding.DeltaBinaryPacked
+    }
+    m["s"] = parquet.Encoding.DeltaLengthByteArray
+    m["bin"] = parquet.Encoding.DeltaLengthByteArray
+    m["s_unique"] = parquet.Encoding.DeltaByteArray
+    m["req_s"] = parquet.Encoding.DeltaByteArray
+    m["b"] = parquet.Encoding.Rle
+    m
+}
+
+fn split_encodings() -> [str: parquet.Encoding] {
+    var m: [str: parquet.Encoding] = [:]
+    for name in ["f32", "f64", "i32", "i64", "fixed", "dec10", "f16"] {
+        m[name] = parquet.Encoding.ByteStreamSplit
+    }
+    m
+}
+
+fn variants() -> []Variant {
+    [
+        Variant { label: "default", options: parquet.WriterOptions {}, flat_only: false, one_group: true },
+        Variant { label: "plain", options: parquet.WriterOptions { compression: parquet.Codec.Uncompressed, dictionary: false }, flat_only: false, one_group: true },
+        Variant { label: "v2_zstd_crc", options: parquet.WriterOptions { compression: parquet.Codec.Zstd, page_version: 2, checksums: true }, flat_only: false, one_group: true },
+        Variant { label: "gzip", options: parquet.WriterOptions { compression: parquet.Codec.Gzip, level: 6 }, flat_only: false, one_group: true },
+        Variant { label: "brotli_v2", options: parquet.WriterOptions { compression: parquet.Codec.Brotli, level: 5, page_version: 2 }, flat_only: false, one_group: true },
+        Variant { label: "lz4_v2", options: parquet.WriterOptions { compression: parquet.Codec.Lz4Raw, page_version: 2 }, flat_only: false, one_group: true },
+        Variant { label: "pages_v1", options: parquet.WriterOptions { page_size: 96 }, flat_only: false, one_group: true },
+        Variant { label: "pages_v2", options: parquet.WriterOptions { compression: parquet.Codec.Zstd, page_version: 2, page_size: 96, checksums: true }, flat_only: false, one_group: true },
+        Variant { label: "groups", options: parquet.WriterOptions { row_group_rows: 8 }, flat_only: false, one_group: false },
+        Variant { label: "groups_v2", options: parquet.WriterOptions { row_group_rows: 5, page_version: 2, page_size: 96 }, flat_only: false, one_group: false },
+        Variant { label: "dict_limit", options: parquet.WriterOptions { compression: parquet.Codec.Uncompressed, dictionary_page_size: 40, page_size: 96 }, flat_only: false, one_group: true },
+        Variant { label: "nostats", options: parquet.WriterOptions { statistics: false }, flat_only: false, one_group: true },
+        Variant { label: "delta_v1", options: parquet.WriterOptions { compression: parquet.Codec.Uncompressed, dictionary: false, encodings: delta_encodings() }, flat_only: true, one_group: true },
+        Variant { label: "delta_v2", options: parquet.WriterOptions { page_version: 2, encodings: delta_encodings() }, flat_only: true, one_group: true },
+        Variant { label: "delta_pages", options: parquet.WriterOptions { compression: parquet.Codec.Uncompressed, page_version: 2, page_size: 96, encodings: delta_encodings() }, flat_only: true, one_group: true },
+        Variant { label: "split", options: parquet.WriterOptions { compression: parquet.Codec.Uncompressed, encodings: split_encodings() }, flat_only: true, one_group: true },
+        Variant { label: "split_pages", options: parquet.WriterOptions { compression: parquet.Codec.Zstd, page_size: 96, encodings: split_encodings() }, flat_only: true, one_group: true },
+    ]
+}
+
+fn read_source(label: str, fixture: str) -> Source ! parquet.Error {
+    let f = parquet.open_bytes(find(fixture), parquet.ReaderOptions {})?
+    let batches = parquet.read_batches(f, [])?
+    Source { name: label, fixture, schema: parquet.arrow_schema(f), batches }
+}
+
+fn sources() -> []Source ! parquet.Error {
+    let built = built_batch() catch {
+        e => fail parquet.Error.Mismatch(arrow.message(e))
+    }
+    [
+        read_source("flat", "flat_v1_dict")?,
+        read_source("nested", "nested_v1_snappy")?,
+        Source { name: "built", fixture: "", schema: built.schema, batches: [built] },
+    ]
+}
+
+fn fingerprint(schema: arrow.Schema, batches: []arrow.Batch) -> str {
+    var parts: []str = [meta_text(schema.metadata)]
+    for f in schema.fields {
+        push(mut parts, "{f.name} {arrow.type_name(f.data_type)} {f.nullable}{meta_text(f.metadata)}")
+    }
+    for b in batches {
+        push(mut parts, "rows {b.length}")
+        for c in b.columns {
+            push(mut parts, arrow.diagnostic(c))
+        }
+    }
+    text.join(parts, "\n")
+}
+
+fn total_rows(batches: []arrow.Batch) -> i64 {
+    var n = 0
+    for b in batches {
+        n += b.length
+    }
+    n
+}
+
+fn check_written(label: str, data: []u8, s: Source, one_group: bool) {
+    let f = parquet.open_bytes(data, parquet.ReaderOptions {}) catch {
+        e => {
+            print("FAIL {label} open {parquet.message(e)}")
+            return
+        }
+    }
+    let back = parquet.read_batches(f, []) catch {
+        e => {
+            print("FAIL {label} read {parquet.message(e)}")
+            return
+        }
+    }
+    if total_rows(back) != total_rows(s.batches) {
+        print("FAIL {label} rows")
+    }
+    if !one_group {
+        return
+    }
+    if s.name == "built" {
+        return
+    }
+    if fingerprint(parquet.arrow_schema(f), back) != fingerprint(s.schema, s.batches) {
+        print("FAIL {label} round trip")
+    }
+}
+
+fn rows_text(rows: [][]parquet.Value) -> str {
+    var lines: []str = []
+    for row in rows {
+        push(mut lines, row_text(row))
+    }
+    text.join(lines, "\n")
+}
+
+fn rows_output(s: Source) -> Output ! parquet.Error {
+    let f = parquet.open_bytes(find(s.fixture), parquet.ReaderOptions {})?
+    let rows = parquet.read_rows(f, [])?
+    let data = parquet.write_rows(s.schema, rows, parquet.WriterOptions {})?
+    let back = parquet.open_bytes(data, parquet.ReaderOptions {})?
+    let again = parquet.read_rows(back, [])?
+    if rows_text(rows) != rows_text(again) {
+        print("FAIL {s.name} rows round trip")
+    }
+    check_written("{s.name}_rows.parquet", data, s, true)
+    Output { name: "{s.name}_rows.parquet", data }
+}
+
+fn outputs() -> []Output ! parquet.Error {
+    var out: []Output = []
+    for s in sources()? {
+        for v in variants() {
+            if v.flat_only && s.name != "flat" {
+                continue
+            }
+            let name = "{s.name}_{v.label}.parquet"
+            let data = parquet.write_bytes(s.schema, s.batches, v.options)?
+            check_written(name, data, s, v.one_group)
+            push(mut out, Output { name, data })
+        }
+        if s.name != "built" {
+            let rows = rows_output(s)?
+            push(mut out, rows)
+        }
+    }
+    out
+}
+
+fn written_dir() -> str {
+    os.env("PARQUET_WRITTEN") ?? ""
+}
+
+fn writing() ! parquet.Error {
+    print("== writing")
+    let dir = written_dir()
+    for o in outputs()? {
+        let sum = digest.sum(digest.sha256(), o.data)
+        print("wrote {o.name} {o.data.len} {text.encode_hex(sum)}")
+        if dir != "" {
+            file.write_file(path.join([dir, o.name]), o.data) catch {
+                e => fail parquet.Error.Io(e)
+            }
+        }
+    }
+}

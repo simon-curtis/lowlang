@@ -1,0 +1,261 @@
+import std/arrow
+
+struct Counter {
+    next: i64
+}
+
+struct Plan {
+    kind: i64
+    field: arrow.Field
+    column: i64
+    first: i64
+    count: i64
+    valid_def: i64
+    repeated_def: i64
+    rep: i64
+    children: []Plan
+}
+
+fn leaf_columns(schema: Schema) -> []Column {
+    var out: []Column = []
+    for n in schema.fields {
+        collect_columns(n, [], mut out)
+    }
+    out
+}
+
+fn collect_columns(n: Node, prefix: []str, mut out: []Column) {
+    var path: []str = []
+    for p in prefix {
+        push(mut path, p)
+    }
+    push(mut path, n.name)
+    if n.leaf {
+        push(mut out, Column { index: out.len, path, node: n, max_def: n.def_level, max_rep: n.rep_level })
+        return
+    }
+    for c in n.children {
+        collect_columns(c, path, mut out)
+    }
+}
+
+fn leaf_type(n: Node) -> arrow.DataType ! Error {
+    match n.logical {
+        Int(bits, signed) => {
+            if n.physical == Physical.Int32 && bits <= 32 || n.physical == Physical.Int64 && bits == 64 {
+                return arrow.DataType.Int(bits, signed)
+            }
+            fail Invalid(-1, "{n.name}: an integer of {bits} bits does not fit its physical type")
+        }
+        Unknown => return arrow.DataType.Null
+        Date => {
+            if n.physical != Physical.Int32 {
+                fail Invalid(-1, "{n.name}: a date is not an INT32")
+            }
+            return arrow.DataType.Date(arrow.DateUnit.Day)
+        }
+        Time(unit, _) => {
+            let wide = unit == arrow.TimeUnit.Microsecond || unit == arrow.TimeUnit.Nanosecond
+            if wide && n.physical != Physical.Int64 || !wide && n.physical != Physical.Int32 {
+                fail Invalid(-1, "{n.name}: a time of {arrow.unit_name(unit)} has the wrong physical type")
+            }
+            return arrow.DataType.Time(unit)
+        }
+        Timestamp(unit, utc) => {
+            if n.physical != Physical.Int64 {
+                fail Invalid(-1, "{n.name}: a timestamp is not an INT64")
+            }
+            return arrow.DataType.Timestamp(unit, if utc { "UTC" } else { "" })
+        }
+        Decimal(precision, scale) => {
+            if precision > 38 {
+                fail Unsupported("a decimal of {precision} digits")
+            }
+            if precision < 1 || scale < 0 || scale > precision {
+                fail Invalid(-1, "{n.name}: decimal({precision}, {scale})")
+            }
+            return arrow.DataType.Decimal(precision, scale)
+        }
+        Uuid => {
+            if n.physical == Physical.FixedLenByteArray && n.length == 16 {
+                return arrow.DataType.FixedSizeBinary(16)
+            }
+        }
+        Float16 => {
+            if n.physical != Physical.FixedLenByteArray || n.length != 2 {
+                fail Invalid(-1, "{n.name}: a float16 is not 2 bytes")
+            }
+            return arrow.DataType.Float(16)
+        }
+        String => {
+            if n.physical == Physical.ByteArray {
+                return arrow.DataType.Utf8
+            }
+        }
+        Enum => {
+            if n.physical == Physical.ByteArray {
+                return arrow.DataType.Utf8
+            }
+        }
+        Json => {
+            if n.physical == Physical.ByteArray {
+                return arrow.DataType.Utf8
+            }
+        }
+        _ => {}
+    }
+    match n.physical {
+        Boolean => arrow.DataType.Bool
+        Int32 => arrow.DataType.Int(32, true)
+        Int64 => arrow.DataType.Int(64, true)
+        Int96 => arrow.DataType.Timestamp(arrow.TimeUnit.Nanosecond, "")
+        Float => arrow.DataType.Float(32)
+        Double => arrow.DataType.Float(64)
+        ByteArray => arrow.DataType.Binary
+        FixedLenByteArray => {
+            if n.length <= 0 {
+                fail Invalid(-1, "{n.name}: a fixed-length column without a length")
+            }
+            arrow.DataType.FixedSizeBinary(n.length)
+        }
+    }
+}
+
+fn plan_field(n: Node, nullable: bool, t: arrow.DataType) -> arrow.Field {
+    var metadata: [str: str] = [:]
+    if n.field_id >= 0 {
+        metadata["PARQUET:field_id"] = "{n.field_id}"
+    }
+    arrow.Field { name: n.name, data_type: t, nullable, metadata }
+}
+
+fn plan_leaf(n: Node, next: *Counter, nullable: bool) -> Plan ! Error {
+    let t = leaf_type(n)?
+    let column = next.next
+    next.next += 1
+    Plan { kind: 0, field: plan_field(n, nullable, t), column, first: column, count: 1, valid_def: n.def_level, repeated_def: 0, rep: 0, children: [] }
+}
+
+fn plan_struct(n: Node, fields: []Node, next: *Counter, nullable: bool) -> Plan ! Error {
+    let first = next.next
+    var children: []Plan = []
+    var types: []arrow.Field = []
+    for c in fields {
+        let p = plan_of(c, next, n.def_level)?
+        push(mut children, p)
+        push(mut types, p.field)
+    }
+    Plan { kind: 1, field: plan_field(n, nullable, arrow.DataType.Struct(types)), column: -1, first, count: next.next - first, valid_def: n.def_level, repeated_def: 0, rep: 0, children }
+}
+
+fn plan_element(n: Node, next: *Counter) -> Plan ! Error {
+    plan_single(n, next, false)?
+}
+
+fn list_element(l: Node, repeated: Node, next: *Counter) -> Plan ! Error {
+    if repeated.leaf || repeated.children.len != 1 || repeated.name == "array" || repeated.name == "{l.name}_tuple" {
+        return plan_element(repeated, next)?
+    }
+    plan_of_element(repeated.children[0], next, repeated.def_level)?
+}
+
+fn plan_list(n: Node, next: *Counter, nullable: bool) -> Plan ! Error {
+    if n.children.len != 1 || n.children[0].repetition != Repetition.Repeated {
+        fail Invalid(-1, "{n.name}: a list group needs one repeated child")
+    }
+    let repeated = n.children[0]
+    let first = next.next
+    let element = list_element(n, repeated, next)?
+    let list_type = arrow.DataType.List(new(element.field))
+    Plan {
+        kind: 2
+        field: plan_field(n, nullable, list_type)
+        column: -1
+        first
+        count: next.next - first
+        valid_def: n.def_level
+        repeated_def: repeated.def_level
+        rep: repeated.rep_level
+        children: [element]
+    }
+}
+
+fn plan_of_element(n: Node, next: *Counter, parent_def: i64) -> Plan ! Error {
+    if n.repetition == Repetition.Repeated {
+        return plan_repeated(n, next, parent_def)?
+    }
+    plan_single(n, next, n.repetition == Repetition.Optional)?
+}
+
+fn plan_map(n: Node, next: *Counter, nullable: bool) -> Plan ! Error {
+    if n.children.len == 1 && !n.children[0].leaf && n.children[0].children.len == 1 {
+        return plan_list(n, next, nullable)?
+    }
+    if n.children.len != 1 || n.children[0].repetition != Repetition.Repeated || n.children[0].leaf || n.children[0].children.len != 2 {
+        fail Invalid(-1, "{n.name}: a map group needs one repeated group of a key and a value")
+    }
+    let entries = n.children[0]
+    if entries.children[0].repetition != Repetition.Required {
+        fail Invalid(-1, "{n.name}: map keys must be required")
+    }
+    let first = next.next
+    let key = plan_of(entries.children[0], next, entries.def_level)?
+    let value = plan_of(entries.children[1], next, entries.def_level)?
+    let entry_type = arrow.DataType.Struct([key.field, value.field])
+    let entry_field = arrow.Field { name: "entries", data_type: entry_type, nullable: false, metadata: [:] }
+    Plan {
+        kind: 3
+        field: plan_field(n, nullable, arrow.DataType.Map(new(entry_field), false))
+        column: -1
+        first
+        count: next.next - first
+        valid_def: n.def_level
+        repeated_def: entries.def_level
+        rep: entries.rep_level
+        children: [key, value]
+    }
+}
+
+fn plan_repeated(n: Node, next: *Counter, parent_def: i64) -> Plan ! Error {
+    let first = next.next
+    let element = plan_single(n, next, false)?
+    Plan {
+        kind: 2
+        field: plan_field(n, false, arrow.DataType.List(new(element.field)))
+        column: -1
+        first
+        count: next.next - first
+        valid_def: parent_def
+        repeated_def: n.def_level
+        rep: n.rep_level
+        children: [element]
+    }
+}
+
+fn plan_single(n: Node, next: *Counter, nullable: bool) -> Plan ! Error {
+    if n.leaf {
+        return plan_leaf(n, next, nullable)?
+    }
+    match n.shape {
+        List => plan_list(n, next, nullable)?
+        Map => plan_map(n, next, nullable)?
+        Plain => plan_struct(n, n.children, next, nullable)?
+    }
+}
+
+fn plan_of(n: Node, next: *Counter, parent_def: i64) -> Plan ! Error {
+    if n.repetition == Repetition.Repeated {
+        return plan_repeated(n, next, parent_def)?
+    }
+    plan_single(n, next, n.repetition == Repetition.Optional)?
+}
+
+fn make_plans(schema: Schema) -> []Plan ! Error {
+    let next = new(Counter { next: 0 })
+    var plans: []Plan = []
+    for n in schema.fields {
+        let p = plan_of(n, next, 0)?
+        push(mut plans, p)
+    }
+    plans
+}
