@@ -2568,8 +2568,8 @@ Mechanism:
 
 ### Generators
 
-- `compiler/wlgen/protocols` holds the Wayland protocol XML, `wayland.xml` and `xdg-shell.xml`. `low run compiler/wlgen -o std/ui/platform/wayland_linux.low compiler/wlgen/protocols/wayland.xml compiler/wlgen/protocols/xdg-shell.xml` generates the Wayland bindings.
-  - Every interface given in one run shares an `Interfaces` record of `wl_interface` tables that `interfaces()` builds in C memory. The record keeps every block it allocates, listener copies included, and `release_interfaces(ifs)` frees them once the connection is closed. A reference to an interface that no given protocol declares is an error.
+- `compiler/wlgen/protocols` holds the Wayland protocol XML: `wayland.xml`, `xdg-shell.xml`, `cursor-shape-v1.xml` and `text-input-unstable-v3.xml`. `low run compiler/wlgen -o std/ui/platform/wayland_linux.low compiler/wlgen/protocols/wayland.xml compiler/wlgen/protocols/xdg-shell.xml compiler/wlgen/protocols/cursor-shape-v1.xml compiler/wlgen/protocols/text-input-unstable-v3.xml` generates the Wayland bindings.
+  - Every interface given in one run shares an `Interfaces` record of `wl_interface` tables that `interfaces()` builds in C memory. The record keeps every block it allocates, listener copies included, and `release_interfaces(ifs)` frees them once the connection is closed. An interface that a request or event creates must be declared by a given protocol, or generation fails. An object argument of an undeclared interface, such as the `zwp_tablet_tool_v2` that `cursor-shape-v1.xml` names, gets a null entry in its message type table.
   - A request becomes `interface_request(...)` over `wl_proxy_marshal_flags`, taking the `Interfaces` record when it creates an object of a known interface. `wl_registry_bind` takes the interface table and version.
   - Destructor requests pass `WL_MARSHAL_FLAG_DESTROY`, and an interface without a `destroy` request gets one that calls `wl_proxy_destroy`.
   - Objects are `ptr`, strings `ptr[u8]`, `fixed` an `i32`.
