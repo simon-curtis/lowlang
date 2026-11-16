@@ -2646,13 +2646,15 @@ Win32:
 
 ### Layout
 
-- A `layout.Tree` holds nodes in a slice; `node(mut t, style, children)` and `leaf(mut t, style, measure)` add one and return its index, and `compute(mut t, root, available)` places every node. `rect(t, node)` is its border box in logical pixels relative to the window and `content(t, node)` its content box.
+- A `layout.Tree` holds nodes in a slice; `node(mut t, style, children)` and `leaf(mut t, style, measure)` add one and return its index, and `compute(mut t, root, available)` places every node, or `compute_at(mut t, root, origin, available)` in a region whose top left is `origin`. `rect(t, node)` is its border box in logical pixels relative to the window and `content(t, node)` its content box.
 - A `Style` has:
   - `display` (`Flex`, or `None` for a node that takes no space), `position` (`Relative`, or `Absolute` with an `Inset` of one `Dimension` per side);
   - `direction` (`Row` or `Column`), `justify` (`Start`, `End`, `Center`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly`), `align_items` (`Start`, `End`, `Center`, `Stretch`) and `align_self` (those or `Auto`, which follows `align_items`);
   - `grow`, `shrink` and `basis`; `width`, `height` and their minimums and maximums as `Auto`, `Px(f32)` or `Percent(f32)`, where `Percent(50.0)` is half of the parent's inner size, or of its padding box for an absolute node;
-  - `margin`, `padding` and `border` edges in pixels, and `gap` between children.
-- Sizes, minimums, maximums and `basis` are border-box lengths, and a box is never smaller than its padding and border. An `Auto` minimum is zero.
+  - `margin`, `padding` and `border` edges in pixels, and `gap` between children;
+  - `overflow_x` and `overflow_y`, each `Visible`, `Hidden` or `Scroll`.
+- Sizes, minimums, maximums and `basis` are border-box lengths, and a box is never smaller than its padding and border.
+- An `Auto` minimum along the parent's main axis is the automatic minimum of a flex item: the smaller of its specified size and its content's narrowest size, never above its maximum, and zero when the node's overflow on that axis is `Hidden` or `Scroll`. The narrowest width of a leaf is its measure function's answer for a width of `0.0`, of a container the sum or maximum of its children's, and its narrowest height is its height at the width it is laid out at. An `Auto` minimum on the cross axis is zero.
 - The algorithm is CSS flexbox for a single line:
   1. Each child's flex basis is its `basis`, else its main size, else its content size: the measure function's answer for a leaf, the sum or maximum of its children for a container.
   2. Free space is distributed by `grow` when positive and taken by `shrink` weighted by basis when negative, freezing children that hit their minimum or maximum and repeating until none does.
@@ -2680,7 +2682,7 @@ Win32:
 
 `std/ui` builds an interface from values and draws it with the modules above; a program imports `std/ui` and nothing else for a window.
 
-- An `Element` is a box or a text run: `div()` and `text(s)` make one and each builder returns a changed copy, so an element is built by chaining and `children()` takes a trailing block of elements. The builders are `row`, `column`, `gap`, `padding`, `padding_xy`, `margin`, `size`, `width`, `height`, `grow`, `items_start`, `items_center`, `items_end`, `justify_center`, `justify_end`, `justify_between`, `background`, `border`, `rounded`, `shadow`, `text_color`, `text_size`, `id`, `child` and `children`. They set a `layout.Style` and a `Visual`, the colours, corners, shadows and text style, which are what `layout` and `scene` take.
+- An `Element` is a box or a text run: `div()` and `text(s)` make one and each builder returns a changed copy, so an element is built by chaining and `children()` takes a trailing block of elements. The builders are `row`, `column`, `gap`, `padding`, `padding_xy`, `margin`, `size`, `width`, `height`, `grow`, `shrink`, `overflow_hidden`, `overflow_x_hidden`, `overflow_y_hidden`, `overflow_scroll`, `overflow_x_scroll`, `overflow_y_scroll`, `items_start`, `items_center`, `items_end`, `justify_center`, `justify_end`, `justify_between`, `background`, `border`, `rounded`, `shadow`, `text_color`, `text_size`, `id`, `child` and `children`. They set a `layout.Style` and a `Visual`, the colours, corners, shadows and text style, which are what `layout` and `scene` take.
 - `text_color` and `text_size` are inherited by an element's children; a text run is black at 16 logical pixels until one is set.
 - A `Signal[T]` is a value that belongs to a `Context`. `signal(cx, v)` makes one, `get(s)` reads it, `set(s, v)` and `update(s, f)` change it and mark the context's frame as due. Copies of a signal share the value. The tree is a function of its signals, so a program holds its state in signals and returns a new tree from the function it gives `run`.
 - A `Context` owns the signals' state, the text system and what the pointer and the keyboard are on. It is a handle: copies share the state. `headless(background)` makes one with no window, `frame(cx, render, size, scale)` returns the scene of the tree that `render` returns, and `dispatch(cx, event)` applies a `platform.Event`, so a program or a test drives an interface with no window and no GPU, and `draw(cx, g, t, scene)` draws that scene into an offscreen target. `frame_due`, `closed` and `quit` report and end the loop.
@@ -2697,6 +2699,14 @@ Hit testing and focus:
 - A press focuses the innermost `focusable` element under the pointer, or its nearest focusable ancestor, and a press on none removes focus. `set_focus(cx, key)`, `blur(cx)` and `focused(cx)` change and read it. Tab and Shift+Tab move focus to the next and previous `focusable` element in tree order, wrapping at the ends, or to the first and last when none is focused.
 - `on_key(e, f)` runs `f` for each key press, repeat and release while `e` or an element inside it is focused. A key goes to the focused element and then outward until a handler returns `true`; Tab and Enter and Space act only when no handler took the key. Enter and Space click the focused element when it has a click handler.
 - `dispatch` tests against the hitboxes of the last frame, so the pointer is compared with what was drawn.
+
+Scrolling and clipping:
+
+- `overflow_hidden`, `overflow_x_hidden` and `overflow_y_hidden` clip an element's children to its padding box on the axes named. `overflow_scroll`, `overflow_x_scroll` and `overflow_y_scroll` clip them and scroll them with the wheel. A scrolling element has a hitbox and so a key; give it an `id` to keep its offset when the tree moves it.
+- Children that would not fit a scrolling element's main axis give up space like any flex item, down to their automatic minimum, so a child that must keep its size in a scrolling column or row takes `shrink(0.0)`.
+- The scroll range of an axis is how far the children's far edge lies beyond the padding box's inner edge, never below zero. The offset is kept per key, shifts the children and their hitboxes, and is clamped to the range by each frame; `scroll_to(cx, key, point)` sets it and `scroll_offset(cx, key)` reads it.
+- A clip applies to painting and to hit testing, so a child scrolled out of view is not hovered, pressed or scrolled. The hitbox of a clipped element is its rectangle intersected with its ancestors' clips.
+- A `Scrolled` event goes to the hitboxes under the pointer from the innermost outward. Each runs its `on_scroll_wheel` handler with a `ScrollEvent` of the pointer position and the distances, and the first scrolling element that moves stops the event; one already at the end of its range passes it on.
 
 ### UI tests
 
