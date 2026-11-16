@@ -77,6 +77,30 @@ class Output {
         this.#element.scrollTop = this.#element.scrollHeight;
     }
 
+    link(pattern, make) {
+        this.#last = null;
+        for (const element of this.#element.querySelectorAll(`.${classes[stderrFd]}`)) {
+            this.#linkElement(element, pattern, make);
+        }
+    }
+
+    #linkElement(element, pattern, make) {
+        const text = element.textContent;
+        const matches = [...text.matchAll(pattern)];
+        if (matches.length === 0) {
+            return;
+        }
+        const parts = [];
+        let from = 0;
+        for (const match of matches) {
+            const before = text.slice(from, match.index);
+            parts.push(before, make(match));
+            from = match.index + match[0].length;
+        }
+        parts.push(text.slice(from));
+        element.replaceChildren(...parts);
+    }
+
     #append(fd, text) {
         this.#length += text.length;
         if (fd !== noteFd && this.#last?.fd === fd) {
@@ -95,12 +119,13 @@ class Output {
         while (this.#length > outputLimit && this.#element.firstChild !== null) {
             const first = this.#element.firstChild;
             const node = first.firstChild;
+            const size = first.textContent.length;
             const excess = this.#length - outputLimit;
-            if (node.length > excess) {
+            if (size > excess && node === first.lastChild && node instanceof Text) {
                 node.deleteData(0, excess);
                 this.#length -= excess;
             } else {
-                this.#length -= node.length;
+                this.#length -= size;
                 if (this.#last?.element === first) {
                     this.#last = null;
                 }
@@ -221,13 +246,16 @@ export class Session {
     }
 }
 
-export function bind({ run, stop, status, output, source }) {
+export function bind({ run, stop, status, output, source, onidle }) {
     const printer = new Output(output);
     const session = new Session(printer, (state) => {
         const idle = state === "idle";
         run.disabled = !idle;
         stop.hidden = idle;
         status.textContent = labels[state];
+        if (idle) {
+            onidle?.(printer);
+        }
     });
     run.addEventListener("click", () => {
         output.hidden = false;

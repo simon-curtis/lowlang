@@ -1,7 +1,11 @@
+import { Editor } from "./editor.js";
+import { Highlighter } from "./highlight.js";
+import { Keys } from "./keys.js";
+import { Program } from "./program.js";
 import { bind } from "./run.js";
 
-const indent = "    ";
 const copiedFor = 2500;
+const sourceLocation = /main\.low:(\d+):(\d+)/g;
 
 const editor = document.getElementById("source");
 const run = document.querySelector("[data-run]");
@@ -10,48 +14,12 @@ const share = document.querySelector("[data-share]");
 const status = document.querySelector(".run-status");
 const notice = document.querySelector(".share-status");
 const output = document.querySelector(".run-output");
-const example = editor.value;
+const keyBar = document.querySelector(".key-bar");
+const coarse = matchMedia("(pointer: coarse)");
+const editing = new Editor(editor, () => coarse.matches);
+const program = new Program(editor, editor.value);
+const highlighter = new Highlighter(editor, document.querySelector(".playground-paint"));
 let noticeTimer;
-
-function toBase64Url(bytes) {
-    let binary = "";
-    for (let at = 0; at < bytes.length; at += 8192) {
-        const slice = bytes.subarray(at, at + 8192);
-        binary += String.fromCharCode(...slice);
-    }
-    const encoded = btoa(binary);
-    return encoded.replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-}
-
-function fromBase64Url(text) {
-    const standard = text.replaceAll("-", "+").replaceAll("_", "/");
-    const padded = standard.padEnd(Math.ceil(standard.length / 4) * 4, "=");
-    const binary = atob(padded);
-    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-
-async function transform(bytes, stream) {
-    const source = new Blob([bytes]).stream();
-    const transformed = source.pipeThrough(stream);
-    const buffer = await new Response(transformed).arrayBuffer();
-    return new Uint8Array(buffer);
-}
-
-async function encode(text) {
-    const encoder = new TextEncoder();
-    const bytes = encoder.encode(text);
-    const compression = new CompressionStream("deflate-raw");
-    const compressed = await transform(bytes, compression);
-    return toBase64Url(compressed);
-}
-
-async function decode(fragment) {
-    const compressed = fromBase64Url(fragment);
-    const decompression = new DecompressionStream("deflate-raw");
-    const bytes = await transform(compressed, decompression);
-    const decoder = new TextDecoder();
-    return decoder.decode(bytes);
-}
 
 function announce(message) {
     clearTimeout(noticeTimer);
@@ -62,48 +30,90 @@ function announce(message) {
 }
 
 async function restore() {
-    const fragment = location.hash.slice(1);
-    if (fragment === "") {
-        editor.value = example;
-        return;
-    }
-    try {
-        editor.value = await decode(fragment);
-    } catch {
-        editor.value = example;
+    const restored = await program.restore();
+    editing.reset();
+    highlighter.paint();
+    if (!restored) {
         announce("The link does not hold a program.");
     }
 }
 
 async function publish() {
-    const fragment = await encode(editor.value);
-    history.replaceState(null, "", `#${fragment}`);
     try {
-        await navigator.clipboard.writeText(location.href);
+        await program.share();
+    } catch {
+        announce("Sharing needs a newer browser.");
+        return;
+    }
+    const url = location.href;
+    if (coarse.matches && typeof navigator.share === "function") {
+        try {
+            await navigator.share({ url });
+            return;
+        } catch (error) {
+            if (error.name === "AbortError") {
+                return;
+            }
+        }
+    }
+    try {
+        await navigator.clipboard.writeText(url);
         announce("Link copied.");
     } catch {
         announce("The link is in the address bar.");
     }
 }
 
-function insertIndent() {
-    if (!document.execCommand("insertText", false, indent)) {
-        editor.setRangeText(indent, editor.selectionStart, editor.selectionEnd, "end");
+function locationButton([text, line, column]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "run-location";
+    button.dataset.line = line;
+    button.dataset.column = column;
+    button.ariaLabel = `Go to line ${line}, column ${column}`;
+    button.textContent = text;
+    return button;
+}
+
+function showOutput() {
+    if (!output.hidden) {
+        output.scrollIntoView({ block: "nearest" });
     }
 }
 
-bind({ run, stop, status, output, source: () => editor.value });
+function finished(printer) {
+    printer.link(sourceLocation, locationButton);
+    showOutput();
+}
+
+bind({ run, stop, status, output, source: () => editor.value, onidle: finished });
+new Keys(keyBar, editor, editing, { run, coarse });
 
 editor.addEventListener("keydown", (event) => {
-    const plain = !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey;
-    if (event.key === "Tab" && plain) {
-        event.preventDefault();
-        insertIndent();
-    } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
         event.preventDefault();
         run.click();
     }
 });
+editor.addEventListener("input", () => program.edited());
+run.addEventListener("click", () => {
+    if (coarse.matches) {
+        editor.blur();
+    }
+    requestAnimationFrame(showOutput);
+});
+output.addEventListener("click", (event) => {
+    const target = event.target.closest(".run-location");
+    if (target !== null) {
+        editing.goTo(Number(target.dataset.line), Number(target.dataset.column));
+    }
+});
 share.addEventListener("click", publish);
 addEventListener("hashchange", restore);
+addEventListener("pagehide", () => program.flush());
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+        program.flush();
+    }
+});
 await restore();

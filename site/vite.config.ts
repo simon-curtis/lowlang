@@ -46,9 +46,14 @@ export default defineConfig({
         cwd: "..",
         cache: false,
       },
+      highlight: {
+        command: "node check/highlight.mjs",
+        dependsOn: ["generate"],
+        cache: false,
+      },
       site: {
         command: "vp build",
-        dependsOn: ["generate", "playground"],
+        dependsOn: ["generate", "highlight", "playground"],
         cache: false,
       },
     },
