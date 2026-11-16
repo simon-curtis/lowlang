@@ -1,5 +1,9 @@
 layout(push_constant) uniform Viewport {
     vec2 size;
+    vec4 gamma_ratios;
+    float grayscale_enhanced_contrast;
+    float subpixel_enhanced_contrast;
+    uint is_bgr;
 } viewport;
 
 vec2 unit_corner(int index) {
