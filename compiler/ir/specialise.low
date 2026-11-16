@@ -7,20 +7,21 @@ pub const max_clone_source_cost = 150
 pub const max_cloned_program_cost = 4000
 
 pub struct CallSite {
-    pub call: *Value
     pub caller: *Func
+    pub call: i64
 }
 
 pub struct Specialiser {
     pub program: *Program
-    pub u: *types.Universe
+    pub rw: Reworker
+    pub runner: Runner
     pub cloned: i64 = 0
     pub clones_of: [*Func: i64] = [:]
     pub named: [str: i64] = [:]
 }
 
-pub fn specialise_constant_arguments(p: *Program, u: *types.Universe) {
-    let s = new(Specialiser { program: p, u })
+pub fn specialise_constant_arguments(p: *Program, rw: Reworker, runner: Runner) {
+    let s = new(Specialiser { program: p, rw, runner })
     for _ in 0..max_specialisation_rounds {
         let constants = specialise_constants(s)
         let clones = clone_for_functions(s)
@@ -68,11 +69,17 @@ fn eligible(s: *Specialiser, g: *Func, sites: []CallSite) -> bool {
 }
 
 fn simplify_all(s: *Specialiser, changed: [*Func: bool]) {
+    var funcs: []*Func = []
     for f in s.program.funcs {
         if changed[f] ?? false {
-            simplify(s.u, f)
+            funcs.push(f)
         }
     }
+    let rw = s.rw
+    let each = s.runner.each
+    each(funcs.len, fn(i: i64) {
+        rw.simplify_body(funcs[i])
+    })
 }
 
 pub struct DirectCalls {
@@ -83,11 +90,12 @@ pub struct DirectCalls {
 fn direct_calls(p: *Program) -> *DirectCalls {
     let calls = new(DirectCalls {})
     for f in p.funcs {
-        for v in direct_targets(f) {
-            let target = v.target ?? continue
+        for at in flat_targets(f) {
+            let v = f.body.values[at]
+            let target = p.all[v.target]
             if v.op == OpCall {
                 var list = calls.sites[target] ?? []
-                list.push(CallSite { call: v, caller: f })
+                list.push(CallSite { caller: f, call: at })
                 calls.sites[target] = list
             } else {
                 calls.escaping[target] = true
@@ -97,16 +105,20 @@ fn direct_calls(p: *Program) -> *DirectCalls {
     calls
 }
 
-fn code_env_pair(params: []*Value, i: i64) -> bool {
-    params[i + 1].aux == params[i].aux + 1
+fn param_aux(g: *Func, param: i64) -> i64 {
+    g.body.values[param].aux
+}
+
+fn code_env_pair(g: *Func, params: []i64, i: i64) -> bool {
+    g.param_aux(params[i + 1]) == g.param_aux(params[i]) + 1
 }
 
 fn specialise_params(g: *Func, sites: []CallSite) -> []i64 {
     var dropped: []i64 = []
-    var consumed: *Value? = none
-    let params = parameters(g)
+    var consumed = -1
+    let params = flat_params(g)
     for i in 0..params.len - 1 {
-        if !code_env_pair(params, i) {
+        if !code_env_pair(g, params, i) {
             continue
         }
         let param = params[i]
@@ -114,26 +126,26 @@ fn specialise_params(g: *Func, sites: []CallSite) -> []i64 {
         if consumed == param {
             continue
         }
-        let code = agreed_constant(g, param, sites, is_function) ?? continue
-        let capture = agreed_constant(g, env, sites, is_constant) ?? continue
-        dropped.push(param.aux)
-        dropped.push(env.aux)
-        become_copy_of(param, code)
-        become_copy_of(env, capture)
+        let code = agreed_constant(g, g.param_aux(param), sites, is_function) ?? continue
+        let capture = agreed_constant(g, g.param_aux(env), sites, is_constant) ?? continue
+        dropped.push(g.param_aux(param))
+        dropped.push(g.param_aux(env))
+        become_copy_of(g, param, code)
+        become_copy_of(g, env, capture)
         consumed = env
     }
     dropped
 }
 
 pub struct Agreement {
-    pub param: *Value
-    pub constant: *Value
+    pub param: i64
+    pub constant: Ref
 }
 
 fn specialise_integers(s: *Specialiser, g: *Func, sites: []CallSite) -> []i64 {
     var agreed: []Agreement = []
-    for param in parameters(g) {
-        match agreed_constant(g, param, sites, is_integer) {
+    for param in flat_params(g) {
+        match agreed_constant(g, g.param_aux(param), sites, is_integer) {
             some(constant) => { agreed.push(Agreement { param, constant }) }
             none => {}
         }
@@ -143,13 +155,13 @@ fn specialise_integers(s: *Specialiser, g: *Func, sites: []CallSite) -> []i64 {
     }
     var dropped: []i64 = []
     for a in agreed {
-        dropped.push(a.param.aux)
-        become_copy_of(a.param, a.constant)
+        dropped.push(g.param_aux(a.param))
+        become_copy_of(g, a.param, a.constant)
     }
     dropped
 }
 
-pub fn is_integer(v: *Value) -> bool {
+pub fn is_integer(v: FlatValue) -> bool {
     v.op == OpConst && v.float_bits == 0
 }
 
@@ -180,21 +192,34 @@ fn smaller_than(s: Shape, other: Shape) -> bool {
 }
 
 fn unlocks_folding(s: *Specialiser, g: *Func, agreed: []Agreement) -> bool {
-    let baseline = clone_func(g)
-    simplify(s.u, baseline.func)
-    let trial = clone_func(g)
+    region { s.folds(g, agreed) }
+}
+
+fn folds(s: *Specialiser, g: *Func, agreed: []Agreement) -> bool {
+    let baseline = s.rw.local_copy(g)
+    simplify(s.rw.u, baseline.func)
+    let trial = s.rw.local_copy(g)
     for a in agreed {
-        let substituted = clone_of(trial, a.param)
-        become_copy_of(substituted, a.constant)
+        s.substitute(trial.values[a.param], a.constant)
     }
-    simplify(s.u, trial.func)
+    simplify(s.rw.u, trial.func)
     let before = shape_of(baseline.func)
     let after = shape_of(trial.func)
     smaller_than(after, before)
 }
 
-pub fn clone_of(c: *FuncClone, v: *Value) -> *Value {
-    c.values[v] ?? panic("v{v.id} was not cloned")
+fn substitute(s: *Specialiser, v: *Value, constant: Ref) {
+    let c = value_of(constant)
+    v.op = c.op
+    v.aux = c.aux
+    v.target = none
+    if c.target >= 0 {
+        v.target = s.program.all[c.target]
+    }
+    v.str = str(constant.func.body.bytes[c.str.start..c.str.start + c.str.len])
+    v.float_bits = c.float_bits
+    v.type = s.rw.u.type_of_id(c.type)
+    v.scalar = c.scalar
 }
 
 pub fn simplify(u: *types.Universe, f: *Func) {
@@ -203,11 +228,11 @@ pub fn simplify(u: *types.Universe, f: *Func) {
 }
 
 fn drop_parameters(g: *Func, sites: []CallSite, dropped: []i64) {
-    for param in parameters(g) {
-        param.aux -= count_below(dropped, param.aux)
+    for param in flat_params(g) {
+        g.body.values[param].aux -= count_below(dropped, g.param_aux(param))
     }
     for site in sites {
-        site.call.args = without_words(site.call.args, dropped)
+        drop_words(site.caller, site.call, dropped)
     }
     g.param_words -= dropped.len
 }
@@ -222,41 +247,34 @@ fn count_below(words: []i64, limit: i64) -> i64 {
     n
 }
 
-fn without_words(args: []*Value, dropped: []i64) -> []*Value {
-    var kept: []*Value = []
-    for i, a in args {
+fn drop_words(f: *Func, call: i64, dropped: []i64) {
+    let args = f.body.values[call].args
+    var kept = 0
+    for i in 0..args.len {
         if !slices.contains(dropped, i) {
-            kept.push(a)
+            f.body.ints[args.start + kept] = f.body.ints[args.start + i]
+            kept += 1
         }
     }
-    kept
+    f.body.values[call].args = Span { start: args.start, len: kept }
 }
 
-pub fn parameters(g: *Func) -> []*Value {
-    var params: []*Value = []
-    for v in g.blocks[0].values {
-        if v.op == OpParam {
-            params.push(v)
-        }
-    }
-    params
-}
-
-pub fn agreed_constant(owner: *Func?, param: *Value, sites: []CallSite, accept: fn(*Value) -> bool) -> *Value? {
-    var agreed: *Value? = none
+pub fn agreed_constant(owner: *Func?, word: i64, sites: []CallSite, accept: fn(FlatValue) -> bool) -> Ref? {
+    var agreed: Ref? = none
     for site in sites {
-        if param.aux >= site.call.args.len {
+        if word >= site.caller.body.values[site.call].args.len {
             return none
         }
-        let arg = site.call.args[param.aux]
+        let arg = arg_ref(site.caller, site.call, word)
+        let value = value_of(arg)
         let own_call = match owner {
             some(o) => o == site.caller
             none => false
         }
-        if own_call && arg.op == OpParam && arg.aux == param.aux {
+        if own_call && value.op == OpParam && value.aux == word {
             continue
         }
-        if !accept(arg) {
+        if !accept(value) {
             return none
         }
         match agreed {
@@ -271,24 +289,28 @@ pub fn agreed_constant(owner: *Func?, param: *Value, sites: []CallSite, accept: 
     agreed
 }
 
-pub fn is_function(v: *Value) -> bool {
-    v.op == OpFuncAddr && v.target != none && v.aux == code_addr
+pub fn is_function(v: FlatValue) -> bool {
+    v.op == OpFuncAddr && v.target >= 0 && v.aux == code_addr
 }
 
-pub fn is_constant(v: *Value) -> bool {
+pub fn is_constant(v: FlatValue) -> bool {
     v.op == OpConst
 }
 
-fn same_constant(a: *Value, b: *Value) -> bool {
-    a.op == b.op && a.aux == b.aux && a.target == b.target && a.float_bits == b.float_bits && a.str == b.str
+fn same_constant(a: Ref, b: Ref) -> bool {
+    let x = value_of(a)
+    let y = value_of(b)
+    x.op == y.op && x.aux == y.aux && x.target == y.target && x.float_bits == y.float_bits && same_text(a.func, x.str, b.func, y.str)
 }
 
-pub fn become_copy_of(v: *Value, constant: *Value) {
-    v.op = constant.op
-    v.aux = constant.aux
-    v.target = constant.target
-    v.str = constant.str
-    v.float_bits = constant.float_bits
-    v.type = constant.type
-    v.scalar = constant.scalar
+pub fn become_copy_of(g: *Func, at: i64, constant: Ref) {
+    let c = value_of(constant)
+    let text = copy_text(g, constant.func, c.str)
+    g.body.values[at].op = c.op
+    g.body.values[at].aux = c.aux
+    g.body.values[at].target = c.target
+    g.body.values[at].str = text
+    g.body.values[at].float_bits = c.float_bits
+    g.body.values[at].type = c.type
+    g.body.values[at].scalar = c.scalar
 }
