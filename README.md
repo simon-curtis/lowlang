@@ -54,7 +54,7 @@ fn main() {
 ```
 
 - `low` runs on Linux and on Windows. The target defaults to the host; `-target linux/amd64` or `-target windows/amd64` selects one.
-- A directory is a module. `import ui/text` loads `ui/text/` under the project root, marked by a `low.mod` file.
+- A directory is a module. `import ui/text` loads `ui/text/` under the project root, marked by a `build.low` file that names the project's dependencies. `docs/design.md` `### Projects` describes it.
 - The standard library imports as `std/...`.
 - `low test [path]...` builds the tests of each module, the `_test.low` files, and runs each test in its own process with a timeout; `app/...` names every module below `app/`. `docs/design.md` `### Modules` lists the flags.
 - `low dev` runs the program and patches changed functions into it on every save, keeping its state.

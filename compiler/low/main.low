@@ -1,4 +1,5 @@
 import compiler
+import fetch
 import ir
 import lint
 import lsp
@@ -18,6 +19,7 @@ enum Error {
     Compile(native.Error)
     Front(compiler.Error)
     Target(target.ParseError)
+    Fetch(fetch.Error)
     Failed(msg: str)
     Exit(code: i64)
 }
@@ -25,15 +27,17 @@ enum Error {
 struct Options {
     output: str = ""
     platform: target.OS
+    optimise: bool = true
 }
 
 fn usage() -> str {
     let choices = target.choices()
     var b = builder.builder()
     b.write("usage:\n")
-    b.write("  low build <file.low> [-o output] [-target {choices}]\n")
-    b.write("  low run <file.low> [-target {target.string(target.host())}|{target.string(target.OS.Browser)}]\n")
+    b.write("  low build <file.low> [-o output] [-target {choices}] [-c release|debug]\n")
+    b.write("  low run <file.low> [-target {target.string(target.host())}|{target.string(target.OS.Browser)}] [-c release|debug] [-- args...]\n")
     b.write("  low test [dir|dir/...|std/module|std/...|file_test.low:line]... [-run text] [-skip text] [-list] [-v] [-notime] [-count n] [-shuffle seed] [-failfast] [-json] [-timeout ms] [-jobs n] [-update]\n")
+    b.write("  low update [dir]\n")
     b.write("  low asm <file.low> [-target {choices}]\n")
     b.write("  low ir <file.low> [-target {choices}]\n")
     b.write("  low lint <file.low> [-target {choices}]\n")
@@ -68,6 +72,7 @@ fn describe(e: Error) -> str {
         Compile(inner) => native.message(inner)
         Front(inner) => compiler.message(inner)
         Target(inner) => target.message(inner)
+        Fetch(inner) => fetch.message(inner)
         Failed(msg) => msg
         Exit(code) => "exit status {code}"
     }
@@ -87,6 +92,10 @@ fn run(args: []str) ! Error {
         lsp.serve_stdio(docs) catch {
             e => fail Error.Failed(lsp.serve_message(e))
         }
+        return
+    }
+    if args.len >= 1 && args[0] == "update" {
+        update_command(args[1..])?
         return
     }
     if args.len == 1 && args[0] == "version" {
@@ -121,8 +130,9 @@ fn run(args: []str) ! Error {
         return
     }
     if cmd == "run" {
-        let opts = parse_options(args[2..], false)?
-        build_and_run(source, opts.platform)?
+        let split = split_arguments(args[2..])
+        let opts = parse_options(split.options, false)?
+        build_and_run(source, opts, split.program)?
         return
     }
     if cmd == "dev" {
@@ -133,6 +143,20 @@ fn run(args: []str) ! Error {
         return
     }
     fail Usage
+}
+
+struct RunArguments {
+    options: []str
+    program: []str
+}
+
+fn split_arguments(args: []str) -> RunArguments {
+    for i in 0..args.len {
+        if args[i] == "--" {
+            return RunArguments { options: args[..i], program: args[i + 1..] }
+        }
+    }
+    RunArguments { options: args, program: [] }
 }
 
 fn parse_options(args: []str, output: bool) -> Options ! Error {
@@ -146,6 +170,8 @@ fn parse_options(args: []str, output: bool) -> Options ! Error {
             opts.output = rest[1]
         } else if rest[0] == "-target" {
             opts.platform = target.parse(rest[1]) catch Target
+        } else if rest[0] == "-c" {
+            opts.optimise = configuration(rest[1])?
         } else {
             fail Usage
         }
@@ -171,15 +197,27 @@ fn report(unit: *compiler.Unit) {
     write_all(2, b.to_bytes())
 }
 
-fn analyse(source: str, platform: target.OS) -> *compiler.Unit ! Error {
-    let profile = compiler.release(platform)
+fn configuration(name: str) -> bool ! Error {
+    match name {
+        "release" => true
+        "debug" => false
+        _ => fail Failed("unknown configuration {name}; use release or debug")
+    }
+}
+
+fn analyse(source: str, opts: Options) -> *compiler.Unit ! Error {
+    let profile = compiler.Profile { platform: opts.platform, optimise: opts.optimise }
     let unit = native.analyse(source, profile) catch Compile
     report(unit)
     unit
 }
 
 fn compile_command(cmd: str, source: str, opts: Options) ! Error {
-    let unit = analyse(source, opts.platform)?
+    if cmd == "build" {
+        build_command(source, opts)?
+        return
+    }
+    let unit = analyse(source, opts)?
     if cmd == "ir" {
         let program = unit.program ?? panic("unit without a program")
         var out = builder.builder()
@@ -192,13 +230,19 @@ fn compile_command(cmd: str, source: str, opts: Options) ! Error {
     if cmd == "asm" {
         let generated = native.generate(unit) catch Compile
         write_all(1, bytes(generated.asm))
-        return
     }
+}
+
+fn build_command(source: str, opts: Options) ! Error {
     var output = opts.output
     if output == "" {
         output = default_output(source, opts.platform)
     }
+    let hooks = project_hooks(source)?
+    hooks.before()?
+    let unit = analyse(source, opts)?
     native.build(unit, output) catch Compile
+    hooks.after()?
 }
 
 fn default_output(source: str, platform: target.OS) -> str {
@@ -206,14 +250,14 @@ fn default_output(source: str, platform: target.OS) -> str {
     target.executable(platform, name)
 }
 
-fn build_and_run(source: str, platform: target.OS) ! Error {
+fn build_and_run(source: str, opts: Options, program_args: []str) ! Error {
     let host = target.host()
-    if platform != host && target.native(platform) {
-        fail Failed("cannot run {target.string(platform)} programs on {target.string(host)}")
+    if opts.platform != host && target.native(opts.platform) {
+        fail Failed("cannot run {target.string(opts.platform)} programs on {target.string(host)}")
     }
     let dir = scratch_directory("low-run-")?
     defer remove_directory(dir)
-    let status = run_built(dir, source, platform)?
+    let status = run_built(dir, source, opts, program_args)?
     if status != 0 {
         fail Exit(status)
     }
@@ -231,11 +275,14 @@ fn remove_directory(dir: str) {
     }
 }
 
-fn run_built(dir: str, source: str, platform: target.OS) -> i64 ! Error {
-    let binary = path.join([dir, target.executable(platform, "main")])
-    let unit = analyse(source, platform)?
+fn run_built(dir: str, source: str, opts: Options, program_args: []str) -> i64 ! Error {
+    let binary = path.join([dir, target.executable(opts.platform, "main")])
+    let hooks = project_hooks(source)?
+    hooks.before()?
+    let unit = analyse(source, opts)?
     native.build(unit, binary) catch Compile
-    let command = runner(dir, binary, platform)?
+    hooks.after()?
+    let command = runner(dir, binary, opts.platform, program_args)?
     using child = process.start(command) catch {
         e => fail Failed("start {command.program}: {e}")
     }
@@ -248,14 +295,18 @@ fn run_built(dir: str, source: str, platform: target.OS) -> i64 ! Error {
     }
 }
 
-fn runner(dir: str, binary: str, platform: target.OS) -> process.Command ! Error {
+fn runner(dir: str, binary: str, platform: target.OS, program_args: []str) -> process.Command ! Error {
     if target.native(platform) {
-        return process.command(binary, [])
+        return process.command(binary, program_args)
     }
     let script = path.join([dir, "host.mjs"])
     let source = wasm.host_script()
     file.write_file(script, bytes(source)) catch {
         e => fail Failed("write {script}: {e}")
     }
-    process.command("node", [script, binary])
+    var node_args = [script, binary]
+    for arg in program_args {
+        node_args.push(arg)
+    }
+    process.command("node", node_args)
 }
