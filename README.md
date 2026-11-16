@@ -73,7 +73,7 @@ Each `bench/<name>/` holds one program as `main.low` and, for most, `main.ts`. T
 | Benchmark | Exercises |
 |---|---|
 | fib | recursive calls |
-| sieve | `[]u8` indexing |
+| sieve | `u8[]` indexing |
 | nbody | `f64` arithmetic on a slice of structs |
 | mandelbrot | `f64` loops |
 | binarytrees | allocation and collection |

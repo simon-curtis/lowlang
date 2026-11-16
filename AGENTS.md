@@ -40,6 +40,7 @@ Source at release N compiles with release N-1, so the compiler cannot use a lang
 
 ## Language notes for compiler code
 
+- Code under `compiler/` spells a slice `[]T`, because the release in `bootstrap.txt` reads only that form; everything else spells it `T[]`. Both call slice and map builtins as methods: `xs.push(v)`, `m.delete(k)`.
 - Low has no module-level variables. A table is a function that returns it, or a `match`.
 - There is one function namespace per module, and `l.peek(0)` calls `peek(l, 0)`. Two functions with one name on different receivers need different names.
 - State a function mutates is a struct built with `new` and passed as `*T`.
