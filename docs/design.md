@@ -2703,22 +2703,25 @@ Win32:
 
 ### Layout
 
-- A `layout.Tree` holds nodes in a slice; `node(mut t, style, children)` and `leaf(mut t, style, measure)` add one and return its index, and `compute(mut t, root, available)` places every node, or `compute_at(mut t, root, origin, available)` in a region whose top left is `origin`. `rect(t, node)` is its border box in logical pixels relative to the window and `content(t, node)` its content box.
+- A `layout.Tree` is made by `tree(scale)` for a display of `scale` device pixels per logical pixel and holds nodes in a slice; `node(mut t, style, children)` and `leaf(mut t, style, measure)` add one and return its index, and `compute(mut t, root, window)` places every node in a window of `window` logical pixels. `rect(t, node)` is its border box in logical pixels relative to the window and `content(t, node)` its content box.
+- The engine is the flexbox algorithm of taffy 0.15 with the pixel snapping of gpui-fast 0.1.12 (`taffy.rs` in that crate):
+  - A node's authored lengths (sizes, minimums, maximums, `basis`, margins, insets, padding, gaps) are multiplied by the scale and rounded to whole device pixels, a tie toward zero. A border width is `0` when zero and otherwise at least one device pixel. A percentage is kept as a fraction.
+  - A leaf's measure function is called with logical widths and its answer is multiplied by the scale and rounded up to whole device pixels.
+  - The tree is laid out in device pixels. Each node's border box has its origin and far corner, summed unrounded from the root, rounded to whole device pixels with a tie toward zero, and `rect` divides them by the scale, so edges that meet in the window round alike.
+  - A root with an `Auto` width or height is as large as the window on that axis, rounded as a length is; where the window is `unbounded` it is as large as its content.
 - A `Style` has:
   - `display` (`Flex`, or `None` for a node that takes no space), `position` (`Relative`, or `Absolute` with an `Inset` of one `Dimension` per side);
-  - `direction` (`Row` or `Column`), `justify` (`Start`, `End`, `Center`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly`), `align_items` (`Start`, `End`, `Center`, `Stretch`) and `align_self` (those or `Auto`, which follows `align_items`);
+  - `direction` (`Row` or `Column`), `wrap` (`Single` or `Multi`), `justify` (`Start`, `End`, `Center`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly`), `align_items` (`Start`, `End`, `Center`, `Stretch`), `align_content` (`Start`, `End`, `Center`, `Stretch`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly`) and `align_self` (those or `Auto`, which follows `align_items`);
   - `grow`, `shrink` and `basis`; `width`, `height` and their minimums and maximums as `Auto`, `Px(f32)` or `Percent(f32)`, where `Percent(50.0)` is half of the parent's inner size, or of its padding box for an absolute node;
-  - `margin`, `padding` and `border` edges in pixels, and `gap` between children;
+  - `margin` as a `Margin` of one `Dimension` per side, where `Auto` absorbs free space and a negative length pulls the node over its neighbours; `padding` and `border` edges in pixels; `column_gap` and `row_gap`;
   - `overflow_x` and `overflow_y`, each `Visible`, `Hidden` or `Scroll`.
 - Sizes, minimums, maximums and `basis` are border-box lengths, and a box is never smaller than its padding and border.
 - An `Auto` minimum along the parent's main axis is the automatic minimum of a flex item: the smaller of its specified size and its content's narrowest size, never above its maximum, and zero when the node's overflow on that axis is `Hidden` or `Scroll`. The narrowest width of a leaf is its measure function's answer for a width of `0.0`, of a container the sum or maximum of its children's, and its narrowest height is its height at the width it is laid out at. An `Auto` minimum on the cross axis is zero.
-- The algorithm is CSS flexbox for a single line:
-  1. Each child's flex basis is its `basis`, else its main size, else its content size: the measure function's answer for a leaf, the sum or maximum of its children for a container.
-  2. Free space is distributed by `grow` when positive and taken by `shrink` weighted by basis when negative, freezing children that hit their minimum or maximum and repeating until none does.
-  3. A child's cross size is its own, or the container's inner cross size when it stretches.
-  4. `justify` places children on the main axis and `align` on the cross axis. Auto margins are not supported.
-  5. Absolute children are placed against the padding box by their insets and do not take part in the flow. One with no inset on an axis is placed on it by the parent's `justify` or `align_items`.
+- The algorithm follows the CSS flexbox steps as taffy 0.15 orders them, including lines, `align_content`, auto margins, relative insets and the cache of measured sizes. It leaves out block and grid display, right-to-left and reversed directions, `wrap-reverse`, baseline alignment, `align-content: balance`, aspect ratios, sizing keywords and scrollbar gutters.
+- Absolute children are placed against the padding box of their parent by their insets and do not take part in the flow. One with no inset on an axis is placed on it by the parent's `justify` or `align_items`. Every node is a containing block, so an absolute child is laid out by its immediate parent.
 - A leaf's measure function takes the width available to it, `unbounded` when unconstrained (`is_bounded` tells them apart), and returns its size.
+- A node with `display: None` and every node under it get an empty rectangle at the top left of the node's parent.
+- `testdata/ui_layout/` holds trees and the rectangles taffy 0.15 gives them under gpui-fast's rounding at scales 1, 1.25, 1.5 and 1.75 in a 640 by 480 window; `std/ui/layout/oracle_test.low` lays out each tree with `layout` and requires every rectangle to equal the stored one. A tree with a reversed wrapping container is left out. `testdata/ui_layout/README.md` describes the file format.
 
 ### Text
 
