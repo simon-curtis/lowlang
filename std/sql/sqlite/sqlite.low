@@ -29,6 +29,7 @@ extern "sqlite3" {
     fn sqlite3_column_text(stmt: ptr, at: i32) -> ptr[u8]
     fn sqlite3_column_blob(stmt: ptr, at: i32) -> ptr[u8]
     fn sqlite3_column_bytes(stmt: ptr, at: i32) -> i32
+    fn sqlite3_interrupt(db: ptr)
     fn sqlite3_changes64(db: ptr) -> i64
     fn sqlite3_last_insert_rowid(db: ptr) -> i64
     fn sqlite3_backup_init(dest: ptr, dest_name: ptr[u8], source: ptr, source_name: ptr[u8]) -> ptr
@@ -85,10 +86,13 @@ fn failure(db: ptr, code: i32) -> sql.Error {
     if primary == 5 || primary == 6 {
         return Busy
     }
-    if db == null {
-        return Server("{code}", "cannot open database")
+    if primary == 9 {
+        return Cancelled
     }
-    Server("{sqlite3_extended_errcode(db)}", str(sqlite3_errmsg(db)))
+    if db == null {
+        return sql.server_error("{code}", "cannot open database")
+    }
+    sql.server_error("{sqlite3_extended_errcode(db)}", str(sqlite3_errmsg(db)))
 }
 
 fn check(h: *DatabaseHandle, code: i32) ! sql.Error {
@@ -267,60 +271,87 @@ fn row(stmt: ptr, width: i64) -> sql.Value[] {
     out
 }
 
-fn walk(h: *DatabaseHandle, text: str, values: sql.Value[], visit: fn(sql.Column[], sql.Value[]) -> bool) ! sql.Error {
+fn walk(h: *DatabaseHandle, text: str, values: sql.Value[], receive: fn(sql.Event) -> bool) ! sql.Error {
     let stmt = statement(h, text, values)?
     let cols = columns(stmt)
+    var found = 0
+    if cols.len > 0 {
+        let described = sql.Event.Columns(cols)
+        if !receive(described) {
+            sqlite3_reset(stmt)
+            return
+        }
+    }
     for {
         let code = sqlite3_step(stmt)
         if code == 101 {
             sqlite3_reset(stmt)
-            return
+            break
         }
         if code != 100 {
             sqlite3_reset(stmt)
             fail failure(h.db, code)
         }
-        if !visit(cols, row(stmt, cols.len)) {
+        let values_found = sql.Event.Row(row(stmt, cols.len))
+        found += 1
+        if !receive(values_found) {
             sqlite3_reset(stmt)
             return
         }
     }
+    let count = if cols.len > 0 { found } else { sqlite3_changes64(h.db) }
+    let done = sql.Event.Done(count)
+    receive(done)
 }
 
 /// Runs one statement with `values` bound to its `?` or `?N` parameters and calls `visit` with the columns and the row for each row it returns. `visit` returns `false` to stop early.
 ///
-/// Returns `sql.Error.Conversion` when `values` does not match the statement's parameter count, `sql.Error.Closed` when the database is closed, `sql.Error.Busy` when it is locked and `sql.Error.Server` for any other failure. Rows hold `Null`, `Int`, `Float`, `Text` or `Bytes` values.
+/// Returns `sql.Error.Conversion` when `values` does not match the statement's parameter count, `sql.Error.Closed` when the database is closed, `sql.Error.Busy` when it is locked, `sql.Error.Cancelled` when `cancel` interrupts it and `sql.Error.Server` for any other failure. Rows hold `Null`, `Int`, `Float`, `Text` or `Bytes` values.
 pub fn each(d: Database, text: str, values: sql.Value[], visit: fn(sql.Column[], sql.Value[]) -> bool) ! sql.Error {
-    walk(d.handle, text, values, visit)?
+    walk(d.handle, text, values, driver.rows(visit))?
 }
 
 fn query_on(h: *DatabaseHandle, text: str, values: sql.Value[]) -> sql.Rows ! sql.Error {
-    var result = sql.Rows { columns: [], rows: [] }
-    let collect = fn(cols: sql.Column[], found: sql.Value[]) -> bool {
-        result.columns = cols
-        result.rows.push(found)
-        true
-    }
-    walk(h, text, values, collect)?
-    if result.rows.len == 0 {
-        let stmt = statement(h, text, values)?
-        result.columns = columns(stmt)
-        sqlite3_reset(stmt)
-    }
-    result
+    driver.collect(fn(receive) ! sql.Error { walk(h, text, values, receive)? })
 }
 
-/// Runs one statement with `values` bound to its parameters and returns all rows. A statement that returns no rows still reports its columns, with each column's declared type as `kind`.
+/// Runs one statement with `values` bound to its parameters and returns all rows. A statement that returns no rows still reports its columns, with each column's declared type as `kind`. `count` is the number of rows returned.
 ///
 /// Fails like `each`.
 pub fn query(d: Database, text: str, values: sql.Value[]) -> sql.Rows ! sql.Error {
     query_on(d.handle, text, values)
 }
 
+fn stream_on(h: *DatabaseHandle, text: str, values: sql.Value[], receive: fn(sql.Event) -> bool) ! sql.Error {
+    walk(h, text, values, receive)?
+}
+
+/// Runs one statement with `values` bound to its parameters and passes `receive` its result as events: `Columns` and one `Row` per row for a statement with columns, then `Done` with the number of rows it returned, or with the number of rows `sqlite3_changes` reports for a statement without columns. `receive` returns `false` to stop early, which sends no `Done`.
+///
+/// Like `query`, it runs only the first statement of `text`; use `exec` for a script. Fails like `each`.
+pub fn stream(d: Database, text: str, values: sql.Value[], receive: fn(sql.Event) -> bool) ! sql.Error {
+    stream_on(d.handle, text, values, receive)?
+}
+
 fn execute_on(h: *DatabaseHandle, text: str, values: sql.Value[]) -> i64 ! sql.Error {
-    walk(h, text, values, driver.ignore_row)?
+    walk(h, text, values, driver.ignore_event)?
     sqlite3_changes64(h.db)
 }
+
+fn interrupt_on(h: *DatabaseHandle) {
+    if h.open {
+        sqlite3_interrupt(h.db)
+    }
+}
+
+/// Interrupts the statements running on the database with `sqlite3_interrupt`, from any green thread, so that each fails with `sql.Error.Cancelled` and the database stays usable. It does nothing when no statement runs or the database is closed.
+///
+/// SQLite rolls back an open transaction whose `INSERT`, `UPDATE` or `DELETE` it interrupts.
+pub fn cancel(d: Database) {
+    interrupt_on(d.handle)
+}
+
+fn ignore_notices(receive: fn(sql.Notice)) {}
 
 /// Runs one statement with `values` bound to its parameters and returns the number of rows changed by the database's most recent `INSERT`, `UPDATE` or `DELETE`. Any rows the statement returns are discarded.
 ///
@@ -385,8 +416,11 @@ fn connection_handle(h: *DatabaseHandle, close: fn()) -> sql.ConnectionHandle {
     let raw = sql.ConnectionHandle {
         dialect: sql.sqlite()
         query: fn(text, values) -> sql.Rows ! sql.Error { query_on(h, text, values) }
-        each: fn(text, values, visit) ! sql.Error { walk(h, text, values, visit)? }
+        each: fn(text, values, visit) ! sql.Error { walk(h, text, values, driver.rows(visit))? }
+        stream: fn(text, values, receive) ! sql.Error { stream_on(h, text, values, receive)? }
         execute: fn(text, values) -> i64 ! sql.Error { execute_on(h, text, values) }
+        cancel: fn() { interrupt_on(h) }
+        on_notice: ignore_notices
         begin: fn() ! sql.Error { exec_on(h, "BEGIN")? }
         commit: fn() ! sql.Error { exec_on(h, "COMMIT")? }
         rollback: fn() ! sql.Error { exec_on(h, "ROLLBACK")? }
@@ -396,13 +430,15 @@ fn connection_handle(h: *DatabaseHandle, close: fn()) -> sql.ConnectionHandle {
 }
 
 /// Returns the database as an `sql.Connection` whose `close` does nothing, so the `Database` stays responsible for closing it.
+///
+/// Its `stream` runs one statement as `stream` does and its `cancel` interrupts the database as `cancel` does. SQLite sends no notices, so the function passed to its `on_notice` is never called.
 pub fn connection(d: Database) -> sql.Connection {
     sql.adopt(connection_handle(d.handle, fn() {}))
 }
 
 /// Opens the file named by `o.database` with the default `Config` and returns it as an `sql.Connection` whose `close` closes the database. The other fields of `o` are ignored.
 ///
-/// Fails like `open`.
+/// Its `stream`, `cancel` and `on_notice` behave as those of `connection`. Fails like `open`.
 pub fn connect(o: sql.Options) -> sql.Connection ! sql.Error {
     let h = open_handle(o.database, Config {})?
     sql.adopt(connection_handle(h, fn() { close_on(h) }))

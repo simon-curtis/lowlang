@@ -118,6 +118,61 @@ fn server_error(mut b: u8[], kind: u8, code: str, text: str) {
     message(mut b, kind, body)
 }
 
+fn diagnostic(mut b: u8[], kind: u8, fields: str[]) {
+    var body: u8[] = []
+    var i = 0
+    for i < fields.len {
+        body.push(fields[i][0])
+        put_cstring(mut body, fields[i + 1])
+        i += 2
+    }
+    body.push(0)
+    message(mut b, kind, body)
+}
+
+fn notification(mut b: u8[], process: i64, channel: str, payload: str) {
+    var body: u8[] = []
+    io.put_be32(mut body, process)
+    put_cstring(mut body, channel)
+    put_cstring(mut body, payload)
+    message(mut b, 'A', body)
+}
+
+struct Parts {
+    pieces: u8[][]
+    next: i64
+    used: i64
+    output: u8[]
+    before: fn(i64)
+}
+
+fn parts_stream(p: *Parts) -> io.Stream {
+    io.Stream {
+        read: fn(buf) -> i64 ! io.Error {
+            if p.next >= p.pieces.len {
+                0
+            } else {
+                let i = p.next
+                if p.used == 0 {
+                    p.before(i)
+                }
+                let n = io.copy(buf, p.pieces[i][p.used..])
+                p.used += n
+                if p.used == p.pieces[i].len {
+                    p.next += 1
+                    p.used = 0
+                }
+                n
+            }
+        }
+        write: fn(data) -> i64 ! io.Error {
+            io.append(mut p.output, data)
+            data.len
+        }
+        close: fn() {}
+    }
+}
+
 fn escaped(data: u8[]) -> str {
     var out: u8[] = []
     for c in data {
@@ -168,7 +223,14 @@ fn attempt(work: fn() ! sql.Error) -> str {
         Unsupported => return "Unsupported"
         Conversion => return "Conversion"
         Busy => return "Busy"
-        Server(code, message) => return "Server({code}, {message})"
+        Cancelled => return "Cancelled"
+        Server(errors) => {
+            var parts: str[] = []
+            for d in errors {
+                parts.push("{d.code}, {d.message}")
+            }
+            return "Server({text.join(parts, "; ")})"
+        }
     }
     "ok"
 }
@@ -429,10 +491,213 @@ fn handshakes() {
     handshake("unknown message", unknown)
 }
 
+fn greeting() -> u8[] {
+    var b: u8[] = []
+    auth(mut b, 0, [])
+    message(mut b, 'K', [0, 0, 0, 42, 0, 0, 0, 7])
+    ready(mut b, 'I')
+    b
+}
+
+fn level_name(l: sql.Level) -> str {
+    match l {
+        Info => "Info"
+        Warning => "Warning"
+        Failure => "Failure"
+        Fatal => "Fatal"
+    }
+}
+
+fn show_diagnostic(d: sql.Diagnostic) -> str {
+    "{level_name(d.level)} severity={d.severity} code={d.code} message={d.message}"
+}
+
+fn show_fields(d: sql.Diagnostic) {
+    print("  detail={d.detail} hint={d.hint} position={d.position} context={d.context}")
+    print("  internal_query={d.internal_query} internal_position={d.internal_position}")
+    print("  schema={d.schema} table={d.table} column={d.column} data_type={d.data_type} constraint={d.constraint}")
+    print("  file={d.file} line={d.file_line} routine={d.routine}")
+}
+
+fn show_notice(n: sql.Notice) {
+    match n {
+        Message(d) => print("notice {show_diagnostic(d)}")
+        Notification(channel, payload, process) => print("notification {channel} {payload} {process}")
+    }
+}
+
+fn names(columns: sql.Column[]) -> str {
+    var parts: str[] = []
+    for c in columns {
+        parts.push(c.name)
+    }
+    text.join(parts, ",")
+}
+
+fn show_event(e: sql.Event) -> bool {
+    match e {
+        Columns(columns) => print("columns {names(columns)}")
+        Row(values) => print("row {show(values[0])}")
+        Done(count) => print("done {count}")
+    }
+    true
+}
+
+fn inspect(label: str, work: fn() ! sql.Error) {
+    work() catch {
+        Server(errors) => {
+            for d in errors {
+                print("{label} {show_diagnostic(d)}")
+                show_fields(d)
+            }
+            return
+        }
+        _ => {
+            print("{label} not a server error")
+            return
+        }
+    }
+    print("{label} ok")
+}
+
+fn three_statements(mut b: u8[]) {
+    columns(mut b, ["first"], [23])
+    data_row(mut b, ["1"])
+    complete(mut b, "SELECT 1")
+    columns(mut b, ["second", "third"], [23, 23])
+    data_row(mut b, ["2", "3"])
+    data_row(mut b, ["4", "5"])
+    complete(mut b, "SELECT 2")
+    complete(mut b, "UPDATE 7")
+    ready(mut b, 'I')
+}
+
+fn events_script() -> u8[] {
+    var b = greeting()
+    columns(mut b, ["g"], [23])
+    data_row(mut b, ["1"])
+    diagnostic(mut b, 'N', ["S", "NOTICE", "V", "NOTICE", "C", "00000", "M", "between rows", "D", "detail of notice"])
+    notification(mut b, 4242, "jobs", "payload one")
+    data_row(mut b, ["2"])
+    complete(mut b, "SELECT 2")
+    ready(mut b, 'I')
+
+    diagnostic(mut b, 'N', ["S", "WARNUNG", "V", "WARNING", "C", "01000", "M", "careful"])
+    diagnostic(mut b, 'E', ["S", "FEHLER", "V", "ERROR", "C", "23505", "M", "duplicate key value violates unique constraint \"t_pkey\"",
+        "D", "Key (id)=(1) already exists.", "H", "Use another key.", "P", "15", "p", "3", "q", "SELECT 1", "W", "SQL statement \"x\"",
+        "s", "public", "t", "t", "c", "id", "d", "int4", "n", "t_pkey", "F", "nbtinsert.c", "L", "666", "R", "_bt_check_unique"])
+    ready(mut b, 'I')
+
+    for _ in 0..2 {
+        diagnostic(mut b, 'E', ["S", "ERROR", "C", "42P01", "M", "first failure"])
+        diagnostic(mut b, 'E', ["S", "ERROR", "V", "ERROR", "C", "22012", "M", "second failure"])
+        ready(mut b, 'I')
+    }
+
+    for _ in 0..3 {
+        three_statements(mut b)
+    }
+
+    empty(mut b, '1')
+    empty(mut b, '2')
+    columns(mut b, ["g"], [23])
+    data_row(mut b, ["1"])
+    data_row(mut b, ["2"])
+    complete(mut b, "SELECT 2")
+    ready(mut b, 'I')
+
+    empty(mut b, '1')
+    empty(mut b, '2')
+    columns(mut b, ["g"], [23])
+    data_row(mut b, ["1"])
+    data_row(mut b, ["2"])
+    complete(mut b, "SELECT 2")
+    ready(mut b, 'I')
+
+    empty(mut b, '1')
+    empty(mut b, '2')
+    columns(mut b, ["g"], [23])
+    data_row(mut b, ["1"])
+    data_row(mut b, ["2"])
+    empty(mut b, 's')
+    ready(mut b, 'I')
+
+    complete(mut b, "SELECT 1")
+    ready(mut b, 'I')
+
+    diagnostic(mut b, 'E', ["S", "FATAL", "V", "FATAL", "C", "57P01", "M", "terminating connection due to administrator command"])
+    b
+}
+
+fn events() ! sql.Error {
+    let f = new(Fake { input: events_script(), at: 0, output: [], closes: 0 })
+    using conn = postgres.connect_stream(fake_stream(f), sql.Options { user: "alice" })?
+    let db = conn.handle
+    db.on_notice(show_notice)
+    db.stream("SELECT g FROM s", [], show_event)?
+    inspect("insert", fn() ! sql.Error { db.execute("INSERT INTO t VALUES (1)", [])? })
+    inspect("double", fn() ! sql.Error { db.execute("SELECT 1/0; SELECT x", [])? })
+    print("two errors {attempt(fn() ! sql.Error { db.execute("SELECT 1/0; SELECT x", [])? })}")
+    db.stream("SELECT 1 AS first; SELECT 2 AS second, 3 AS third; UPDATE t SET x = 1", [], show_event)?
+    let sets = sql.query_all(db, "SELECT 1 AS first; SELECT 2 AS second, 3 AS third; UPDATE t SET x = 1", [])?
+    for set in sets {
+        print("set {names(set.columns)} rows {set.rows.len} count {set.count}")
+    }
+    let last = db.query("SELECT 1 AS first; SELECT 2 AS second, 3 AS third; UPDATE t SET x = 1", [])?
+    print("last {names(last.columns)} rows {last.rows.len} count {last.count}")
+    let every = fn(cols: sql.Column[], values: sql.Value[]) -> bool {
+        print("each {show(values[0])}")
+        true
+    }
+    let first_only = fn(cols: sql.Column[], values: sql.Value[]) -> bool {
+        print("stop at {show(values[0])}")
+        false
+    }
+    let cancelling = fn(cols: sql.Column[], values: sql.Value[]) -> bool {
+        db.cancel()
+        true
+    }
+    print("each {attempt(fn() ! sql.Error { db.each("SELECT g FROM s", [], every)? })}")
+    print("each early stop {attempt(fn() ! sql.Error { db.each("SELECT g FROM s", [], first_only)? })}")
+    print("cancel in each {attempt(fn() ! sql.Error { db.each("SELECT g FROM s", [], cancelling)? })}")
+    print("after cancel {db.execute("SELECT 1", [])?}")
+    print("fatal {attempt(fn() ! sql.Error { db.execute("SELECT 1", [])? })}")
+    print("after fatal {attempt(fn() ! sql.Error { db.execute("SELECT 1", [])? })}")
+    print("closes {f.closes}")
+    transcript(f.output)
+}
+
+fn cancellation() ! sql.Error {
+    var interrupted: u8[] = []
+    diagnostic(mut interrupted, 'E', ["S", "ERROR", "V", "ERROR", "C", "57014", "M", "canceling statement due to user request"])
+    ready(mut interrupted, 'I')
+    var answer: u8[] = []
+    columns(mut answer, ["one"], [23])
+    data_row(mut answer, ["1"])
+    complete(mut answer, "SELECT 1")
+    ready(mut answer, 'I')
+    let p = new(Parts { pieces: [greeting(), interrupted, answer, answer], next: 0, used: 0, output: [], before: fn(i: i64) {} })
+    using conn = postgres.connect_stream(parts_stream(p), sql.Options { user: "alice" })?
+    let db = conn.handle
+    db.on_notice(show_notice)
+    p.before = fn(i: i64) {
+        if i == 1 || i == 3 {
+            db.cancel()
+        }
+    }
+    print("cancelled {attempt(fn() ! sql.Error { db.query("SELECT pg_sleep(10)", [])? })}")
+    db.cancel()
+    print("idle cancel {show(db.query("SELECT 1", [])?.rows[0][0])}")
+    print("late cancel {show(db.query("SELECT 1", [])?.rows[0][0])}")
+    transcript(p.output)
+}
+
 fn main() ! sql.Error {
     scram_vector()
     session()?
     cleartext()?
     closing()?
     handshakes()
+    events()?
+    cancellation()?
 }

@@ -1,0 +1,421 @@
+import std/io
+import std/net
+import std/sql
+import std/sql/mysql
+import std/text
+
+const multi = "SELECT 'one'; SELECT 'two', 'three'; UPDATE t SET a = 1"
+const sleeper = "SELECT SLEEP(100)"
+
+struct Script {
+    lines: str[]
+    sequence: i64
+    hooks: i64[]
+}
+
+struct Canceller {
+    cancel: fn()
+}
+
+fn script() -> *Script {
+    let login = mysql_native()
+    var lines: str[] = []
+    for i in 0..7 {
+        lines.push(login[i])
+    }
+    new(Script { lines, sequence: 0, hooks: [] })
+}
+
+fn frame(sequence: i64, payload: u8[]) -> str {
+    var b: u8[] = []
+    io.put_le24(mut b, payload.len)
+    b.push(u8(sequence))
+    io.append(mut b, payload)
+    text.encode_hex(b)
+}
+
+fn expect(s: *Script, payload: u8[]) {
+    s.lines.push("C{frame(0, payload)}")
+    s.sequence = 1
+}
+
+fn answer(s: *Script, payload: u8[]) {
+    s.lines.push("S{frame(s.sequence, payload)}")
+    s.sequence += 1
+}
+
+fn interrupt_before_next_answer(s: *Script) {
+    s.hooks.push(s.lines.len)
+}
+
+fn query_command(sql_text: str) -> u8[] {
+    var b: u8[] = [3]
+    text.append(mut b, sql_text)
+    b
+}
+
+fn prepare_command(sql_text: str) -> u8[] {
+    var b: u8[] = [22]
+    text.append(mut b, sql_text)
+    b
+}
+
+fn execute_command(id: i64, value: i64) -> u8[] {
+    var b: u8[] = [23]
+    io.put_le32(mut b, id)
+    b.push(0)
+    io.put_le32(mut b, 1)
+    b.push(0)
+    b.push(1)
+    b.push(8)
+    b.push(0)
+    io.put_le64(mut b, value)
+    b
+}
+
+fn prepare_answer(s: *Script, id: i64, parameters: i64) {
+    var b: u8[] = [0]
+    io.put_le32(mut b, id)
+    io.put_le16(mut b, 0)
+    io.put_le16(mut b, parameters)
+    b.push(0)
+    io.put_le16(mut b, 0)
+    answer(s, b)
+    for _ in 0..parameters {
+        answer(s, column("?", 253, 0, 45))
+    }
+}
+
+fn text_sets(s: *Script) {
+    answer(s, [1])
+    answer(s, column("a", 253, 0, 45))
+    answer(s, text_row(["one"]))
+    answer(s, terminator(status_more_results))
+    answer(s, [2])
+    answer(s, column("b", 253, 0, 45))
+    answer(s, column("c", 253, 0, 45))
+    answer(s, text_row(["two", "three"]))
+    answer(s, terminator(status_more_results))
+    answer(s, ok(4, 0, 2))
+}
+
+fn binary_sets(s: *Script) {
+    var number: u8[] = [0, 0]
+    io.put_le64(mut number, 7)
+    var word: u8[] = [0, 0]
+    lenenc_text(mut word, "x")
+    answer(s, [1])
+    answer(s, column("n", 8, 0, 63))
+    answer(s, number)
+    answer(s, terminator(status_more_results))
+    answer(s, [1])
+    answer(s, column("t", 253, 0, 45))
+    answer(s, word)
+    answer(s, terminator(2))
+}
+
+fn event_line(e: sql.Event) -> str {
+    match e {
+        Columns(columns) => {
+            var names: str[] = []
+            for c in columns {
+                names.push(c.name)
+            }
+            "columns {text.join(names, ",")}"
+        }
+        Row(values) => {
+            var cells: str[] = []
+            for v in values {
+                cells.push(show(v))
+            }
+            "row {text.join(cells, ",")}"
+        }
+        Done(count) => "done {count}"
+    }
+}
+
+fn print_events(label: str) -> fn(sql.Event) -> bool {
+    fn(e: sql.Event) -> bool {
+        print("{label}: {event_line(e)}")
+        true
+    }
+}
+
+fn stop_after_first_row(label: str) -> fn(sql.Event) -> bool {
+    fn(e: sql.Event) -> bool {
+        print("{label}: {event_line(e)}")
+        match e {
+            Row(_) => false
+            _ => true
+        }
+    }
+}
+
+fn print_sets(label: str, sets: sql.Rows[]) {
+    for i, r in sets {
+        var names: str[] = []
+        for c in r.columns {
+            names.push(c.name)
+        }
+        print("{label}: set {i} columns {text.join(names, ",")} rows {r.rows.len} count {r.count}")
+    }
+    print("{label}: {sets.len} sets")
+}
+
+fn open_script(f: *Fake) -> sql.Connection ! sql.Error {
+    mysql.connect_stream(fake_stream(f), options("nat", "natpw"))?
+}
+
+fn streams() {
+    let label = "streams"
+    let s = script()
+    for _ in 0..4 {
+        expect(s, query_command(multi))
+        text_sets(s)
+    }
+    expect(s, query_command("DO 1"))
+    answer(s, ok(0, 0, 2))
+    expect(s, prepare_command("CALL pair(?)"))
+    prepare_answer(s, 1, 1)
+    expect(s, execute_command(1, 7))
+    binary_sets(s)
+    expect(s, query_command("DO 1"))
+    answer(s, ok(0, 0, 2))
+    s.lines.push("C0100000001")
+    let f = fake_of(s.lines)
+    using c = open_script(f) catch {
+        e => {
+            print("{label}: connect {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    let db = c.handle
+    db.stream(multi, [], print_events("{label}: text")) catch {
+        e => print("{label}: text {describe(e)}")
+    }
+    let sets = sql.query_all(db, multi, []) catch {
+        e => {
+            print("{label}: query_all {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    print_sets("{label}: query_all", sets)
+    let last = db.query(multi, []) catch {
+        e => {
+            print("{label}: query {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    rows_line("{label}: query last", last)
+    print("{label}: query count {last.count}")
+    db.stream(multi, [], stop_after_first_row("{label}: stopped")) catch {
+        e => print("{label}: stopped {describe(e)}")
+    }
+    let after_stop = db.execute("DO 1", []) catch {
+        e => {
+            print("{label}: after stop {describe(e)}")
+            -1
+        }
+    }
+    print("{label}: after stop affected {after_stop}")
+    db.stream("CALL pair(?)", [sql.Value.Int(7)], print_events("{label}: binary")) catch {
+        e => print("{label}: binary {describe(e)}")
+    }
+    let again = db.execute("DO 1", []) catch {
+        e => {
+            print("{label}: again {describe(e)}")
+            -1
+        }
+    }
+    print("{label}: again affected {again}")
+    db.close()
+    report(label, f)
+}
+
+fn notice_line(n: sql.Notice) -> str {
+    match n {
+        Message(d) => "notice {d.code} {d.message}"
+        Notification(channel, payload, process) => "notification {channel} {payload} {process}"
+    }
+}
+
+fn cancellation() {
+    let label = "cancel"
+    let s = script()
+    expect(s, prepare_command("SELECT ?"))
+    interrupt_before_next_answer(s)
+    prepare_answer(s, 1, 1)
+    expect(s, query_command("DO 1"))
+    answer(s, ok(0, 0, 2))
+    expect(s, query_command(sleeper))
+    interrupt_before_next_answer(s)
+    answer(s, failure(1317, "70100", "Query execution was interrupted"))
+    expect(s, query_command("DO 1"))
+    answer(s, ok(0, 0, 2))
+    expect(s, query_command(sleeper))
+    answer(s, failure(1317, "70100", "Query execution was interrupted"))
+    expect(s, query_command("DO 1"))
+    answer(s, ok(0, 0, 2))
+    s.lines.push("C0100000001")
+    let f = fake_of(s.lines)
+    let canceller = new(Canceller { cancel: nothing })
+    using c = open_script(f) catch {
+        e => {
+            print("{label}: connect {describe(e)}")
+            report(label, f)
+            return
+        }
+    }
+    let db = c.handle
+    canceller.cancel = db.cancel
+    db.on_notice(fn(n: sql.Notice) {
+        print("{label}: {notice_line(n)}")
+    })
+    f.hook_at = s.hooks[0]
+    f.hook = fn() { canceller.cancel() }
+    let before = db.execute("SELECT ?", [sql.Value.Int(7)]) catch {
+        e => {
+            print("{label}: before send {describe(e)}")
+            -1
+        }
+    }
+    print("{label}: before send affected {before}")
+    let usable = db.execute("DO 1", []) catch {
+        e => {
+            print("{label}: after before send {describe(e)}")
+            -1
+        }
+    }
+    print("{label}: after before send affected {usable}")
+    f.hook_at = s.hooks[1]
+    let interrupted = db.execute(sleeper, []) catch {
+        e => {
+            print("{label}: interrupted {describe(e)}")
+            -1
+        }
+    }
+    print("{label}: interrupted affected {interrupted}")
+    let resumed = db.execute("DO 1", []) catch {
+        e => {
+            print("{label}: after interrupted {describe(e)}")
+            -1
+        }
+    }
+    print("{label}: after interrupted affected {resumed}")
+    let uncancelled = db.execute(sleeper, []) catch {
+        e => {
+            print("{label}: not cancelled {describe(e)}")
+            -1
+        }
+    }
+    print("{label}: not cancelled affected {uncancelled}")
+    let last = db.execute("DO 1", []) catch {
+        e => {
+            print("{label}: last {describe(e)}")
+            -1
+        }
+    }
+    print("{label}: last affected {last}")
+    db.close()
+    report(label, f)
+}
+
+fn serve_interrupted(accepted: net.ConnHandle, started: chan[bool], gate: chan[bool], report: chan[str]) {
+    using conn = net.adopt(accepted)
+    let p = peer_on(net.stream(conn))
+    let script = fn() ! io.Error {
+        welcome(p)?
+        command(p)?
+        send(p, ok(0, 0, 2))?
+        let q = command(p)?
+        note(p, "query {str(q[1..])}")
+        started <- true
+        let released = <-gate
+        send(p, failure(1317, "70100", "Query execution was interrupted"))?
+        drain(p)?
+    }
+    script() catch {
+        e => note(p, "server stopped {e}")
+    }
+    report <- text.join(p.notes, "; ")
+}
+
+fn serve_killer(accepted: net.ConnHandle, gate: chan[bool], report: chan[str]) {
+    using conn = net.adopt(accepted)
+    let p = peer_on(net.stream(conn))
+    let script = fn() ! io.Error {
+        welcome(p)?
+        command(p)?
+        send(p, ok(0, 0, 2))?
+        let q = command(p)?
+        note(p, "query {str(q[1..])}")
+        send(p, ok(0, 0, 2))?
+        gate <- true
+        drain(p)?
+    }
+    script() catch {
+        e => note(p, "server stopped {e}")
+    }
+    report <- text.join(p.notes, "; ")
+}
+
+fn serve_pair(h: net.ListenerHandle, started: chan[bool], gate: chan[bool], main_report: chan[str], kill_report: chan[str]) {
+    let first = net.accept_handle(h) or {
+        main_report <- "accept failed"
+        return
+    }
+    spawn serve_interrupted(first, started, gate, main_report)
+    let second = net.accept_handle(h) or {
+        kill_report <- "accept failed"
+        return
+    }
+    spawn serve_killer(second, gate, kill_report)
+}
+
+fn cancel_when_started(db: sql.ConnectionHandle, started: chan[bool]) {
+    let go = <-started
+    db.cancel()
+}
+
+fn killed_query() {
+    let label = "kill"
+    using l = net.listen("127.0.0.1", 0) catch {
+        e => {
+            print("{label}: listen failed")
+            return
+        }
+    }
+    let started = chan[bool](1)
+    let gate = chan[bool](1)
+    let main_report = chan[str](1)
+    let kill_report = chan[str](1)
+    spawn serve_pair(l.handle, started, gate, main_report, kill_report)
+    using c = mysql.connect(endpoint(l, "u", "secret", 5000)) catch {
+        e => {
+            print("{label}: connect {describe(e)}")
+            return
+        }
+    }
+    let db = c.handle
+    spawn cancel_when_started(db, started)
+    let interrupted = db.execute(sleeper, []) catch {
+        e => {
+            print("{label}: call {describe(e)}")
+            -1
+        }
+    }
+    print("{label}: call affected {interrupted}")
+    let resumed = db.execute("DO 1", []) catch {
+        e => {
+            print("{label}: after {describe(e)}")
+            -1
+        }
+    }
+    print("{label}: after affected {resumed}")
+    db.close()
+    print("{label}: server {(<-main_report) ?? "no report"}")
+    print("{label}: killer {(<-kill_report) ?? "no report"}")
+}
