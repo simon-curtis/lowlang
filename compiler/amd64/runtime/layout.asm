@@ -34,6 +34,7 @@
 	.set M_ALLOC_HELD, 232
 	.set M_KEEP_FIRST, 240
 	.set M_KEEP_NEXT, 248
+	.set M_GCSEQ, 2400
 	.set ALLOC_SMALL, 255
 	.set ALLOC_BUFFER, 16384
 	.set RELEASE_MIN, 131072
@@ -66,6 +67,40 @@
 	.set TICK_SWEPT, 3
 	.set TICK_RESUMED, 4
 	.set STRESS_WORDS, 8192
+
+	.set GCW_MARK, 1
+	.set GCW_SWEEP, 2
+	.set MAXW, 16
+	.set W_SHIFT, 31
+	.set W_STRIDE, 2147483648
+	.set W_LO, 0
+	.set W_END, 8
+	.set W_COMMIT, 16
+	.set W_LIVE, 24
+	.set W_BASE, 32
+	.set W_RING, 64
+	.set W_STACK, 4096
+	.set W_GROW, 16777216
+	.set W_CREEP, 4194304
+	.set POOL_BATCH, 16384
+	.set POOL_TAKE, 512
+	.set HUNGRY_MIN, 16
+	.set GCW_SPIN, 4096
+	.set PAR_MIN, 1048576
+	.set ROOT_BATCH, 8
+	.set SWEEP_WORDS, 8192
+	.set SWEEP_SHIFT, 13
+	.set SWEEP_MAX, 4096
+	.set BS_BINS, 0
+	.set BS_TAILS, 2048
+	.set BS_BITS, 4096
+	.set BS_SMALL, 4128
+	.set BS_SMALL_TAILS, 4640
+	.set BS_SIZE, 5152
+	.set D_FIRST, 5152
+	.set D_MARKED, 5160
+	.set D_TRAIL, 5168
+	.set D_SIZE, 5176
 
 	.set RUNNING, 1
 	.set IDLE, 2

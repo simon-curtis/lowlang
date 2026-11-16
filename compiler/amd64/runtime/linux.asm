@@ -137,6 +137,9 @@ rt_mmap:
 	ja rt_panic_oom
 	ret
 
+rt_mark_commit:
+	ret
+
 rt_region_commit:
 	mov edx, 3
 	mov eax, 10
