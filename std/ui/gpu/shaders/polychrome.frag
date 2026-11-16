@@ -1,0 +1,25 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "polychrome.glsl"
+
+layout(set = 0, binding = 1) uniform sampler2D atlas;
+
+layout(location = 0) flat in int sprite_index;
+layout(location = 1) in vec2 pixel;
+layout(location = 2) in vec2 uv;
+layout(location = 0) out vec4 color;
+
+const vec3 grayscale_factors = vec3(0.2126, 0.7152, 0.0722);
+
+void main() {
+    PolychromeSprite sprite = polychrome_sprites[sprite_index];
+    vec4 sampled = texture(atlas, uv);
+    float distance = quad_sdf(gl_FragCoord.xy, sprite.bounds, sprite.corner_radii);
+    vec4 shaded = sampled;
+    if (sprite.effects.x != 0.0) {
+        shaded = vec4(vec3(dot(sampled.rgb, grayscale_factors)), sampled.a);
+    }
+    shaded.a *= sprite.effects.y * clamp(0.5 - distance, 0.0, 1.0) * clip_alpha(pixel, sprite.clip);
+    color = shaded;
+}
