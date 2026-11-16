@@ -168,7 +168,7 @@ let n = input |> parse()?
   - A `mut` parameter cannot be captured.
   - A variable that is never assigned after its binding, never passed as `mut` and never modified by `push`, `pop`, `truncate` or `delete` cannot be told apart from a copy, so the closure holds its value directly.
 - `x.f(args)` calls `f(x, args)`, so calls chain left to right: `"ab".repeat(3).first()`.
-  - `f` is any function callable by its plain name: a function in the current module, a function value in scope, a generic function or a builtin.
+  - `f` is any function callable by its plain name: a function in the current module, a function value in scope, a generic function or a builtin. A local variable or parameter named `f` that is not a function value is skipped, so `fn sized(width: f32) -> Box { box().width(width) }` calls the function `width`.
   - When no such name exists and `x` is a struct or enum, or a pointer to one, from another module, `f` is that module's public function: `url.authority()` calls `http.authority(url)`.
   - Otherwise `f` is the public function of that name, in an imported module, whose first parameter accepts `x`, with a generic first parameter's constraints met by `x`'s type: `words.map(fn(w) w.len).sum()` calls `slices.sum(slices.map(words, ...))`, and `"banana".count("an")` calls `text.count`. When more than one imported module has such a function, the call is an error naming them.
   - A struct field of function type named `f` takes precedence, so `op.apply(v)` calls the stored function.
