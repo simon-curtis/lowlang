@@ -2686,16 +2686,17 @@ Win32:
 - Colours are sRGB-encoded and blended in that space with premultiplied-free `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` blending.
 - C structures that Vulkan reads through a pointer are pinned heap values kept by a droppable `Pins` list for the duration of the call or the frame.
 - The shaders:
-  - Quads have per-corner radii and per-edge border widths. The fragment shader computes the signed distance to the outer and inner rounded rectangles and covers one pixel of anti-aliasing.
-  - Shadows are a rounded rectangle blurred by a Gaussian of the given sigma, integrated in closed form along x and sampled four times along y, and drawn over the rectangle grown by three sigma.
+  - Quads have per-corner radii and per-edge border widths. The fragment shader reads the pixel centre from `gl_FragCoord`, returns the background where no border or corner reaches it, and otherwise computes the signed distance to the outer edge and an approximate one to the inner edge, a circle where the two border widths of a corner agree and a quarter ellipse where they differ. It blends the border colour over the background with the straight-alpha `over` operator, mixes by the inner distance, and multiplies the alpha by the outer distance covering one pixel of anti-aliasing.
+  - Shadows are a rounded rectangle blurred by a Gaussian of the given sigma, integrated in closed form along x with a polynomial approximation of the error function and sampled four times along y, and drawn over the rectangle grown by three sigma. A shadow without blur is the rounded rectangle's signed distance covering one pixel.
   - Sprites sample the `R8` atlas as coverage for a monochrome glyph tinted with the sprite's colour.
   - Every instance carries a clip rectangle, and fragments outside it are discarded by alpha.
 
 ### Scene
 
-- A `Scene` holds `Quad`, `Shadow` and `Sprite` instances in device pixels, each with its clip rectangle and its draw order, a counter that increases with every primitive pushed.
+- A `Scene` holds `Quad`, `Shadow` and `Sprite` instances in device pixels, each with its clip rectangle and its draw order.
 - `push_clip` and `pop_clip` keep a stack of clip rectangles; each primitive takes the intersection of the stack.
-- `batches` walks the three lists, each already in draw order, and merges them into runs of one kind, so primitives of different kinds that overlap draw in the order they were pushed.
+- A primitive's draw order is one more than the greatest draw order among the earlier primitives whose bounds, cut to the clip, it overlaps, or 1 when it overlaps none; a primitive whose cut bounds are empty is dropped. Touching edges do not overlap. A shadow's bounds are those before blurring. A grid of 64-pixel cells holds the placed bounds, so a push tests only the primitives in the cells it covers.
+- Each list is kept sorted by draw order, a primitive going after those of equal draw order. `batches` merges the three lists into runs of one kind, taking at each step the lowest draw order and, among equal ones, shadows before quads before sprites.
 
 ### Layout
 
@@ -2742,6 +2743,7 @@ Win32:
 - `open(Options) -> App ! Error` opens a window, a `Gpu` that draws into it and a `Context` whose waker is the window's, and `run(app, render) ! Error` loops until the window is closed: it waits for events, dispatches them, and when a frame is due builds the tree, lays it out, paints it and presents it. `app.cx` is the context, so `app.cx.signal(0)` makes a signal before `run`. `Options` has a title, a size and a background.
 - `handle(cx)` returns a copyable `Handle`, and `post(h, f)` queues a closure that runs on the context's green thread before the next frame and wakes the window, so another green thread changes signals through it.
 - A frame runs in order: the posted closures, `render`, building a layout tree from the elements (a text run is a leaf whose measure wraps the text), `layout.compute`, recording the hitboxes, hit testing, then painting. Painting pushes, per element in tree order, its shadows, its quad and its text sprites, so a child draws over its parent. An element with `display: None` and its children take no space and draw nothing.
+- Painting turns logical rectangles into device pixels with `geometry.snap`, `geometry.cover` and `geometry.snap_stroke`. A quad has each edge rounded to the nearest device pixel, a tie going toward zero, and each border width rounded the same way but never under one device pixel unless it is zero; corner radii are only scaled. A shadow takes the smallest device-pixel rectangle that holds its box moved by its offset and grown by its spread, keeps the element's corner radii, and reads `blur` as the standard deviation of the Gaussian. A clip is the smallest device-pixel rectangle that holds its box.
 
 Hit testing and focus:
 
