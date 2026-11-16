@@ -1,3 +1,4 @@
+import asm
 import diag
 import ir
 import parallel
@@ -44,6 +45,8 @@ struct Generator {
     jumps: []JumpTable = []
     tier: Tier = Baseline
     cache: *VectorCache? = none
+    owner: str = ""
+    data_tail: bool = false
 }
 
 struct DataChunk {
@@ -115,6 +118,54 @@ fn write_symbols(mut out: builder.Builder, symbols: []Define) {
     }
 }
 
+pub fn environment(prog: *ir.Program, platform: Platform, table: *FuncTable?) -> str {
+    let dynamic = platform_dynamic(platform, prog)
+    var out = builder.builder()
+    out.write("\t.intel_syntax noprefix\n")
+    write_symbols(mut out, [Define { name: "RT_DYNAMIC", value: bit(dynamic) }])
+    out.write(hot_init_macro(table != none))
+    out.write(layout_asm())
+    out.write(platform_header(platform))
+    out.to_str()
+}
+
+fn runtime_text(platform: Platform) -> str {
+    var out = builder.builder()
+    out.write(platform_runtime(platform))
+    out.write(scheduler_asm())
+    out.write(runtime_asm())
+    out.write(collector_asm())
+    out.to_str()
+}
+
+fn write_data(g: *Generator, prog: *ir.Program, mut out: builder.Builder) {
+    write_cells(mut out, prog.cells)
+    write_static_blocks(mut out, prog.static_blocks)
+    match g.table {
+        some(t) => t.write_runtime(g.platform, mut out)
+        none => {}
+    }
+    platform_imports(g.platform, mut out, prog)
+    out.write("\n\t.section .rodata\n")
+    out.write(data_text(g.chunks))
+    out.write("\n\t.text\n")
+}
+
+fn write_tail(g: *Generator, prog: *ir.Program) {
+    g.start(prog)
+    if g.table != none {
+        g.trampolines(prog.c_symbols)
+    }
+    for f in prog.funcs {
+        if f.callback {
+            g.thunk(f)
+        }
+    }
+    if platform_dynamic(g.platform, prog) {
+        platform_shims(g.platform, g, prog.c_symbols)
+    }
+}
+
 pub fn generate(prog: *ir.Program, platform: Platform, table: *FuncTable?, release: bool) -> Output {
     let g = new_generator(platform, table, "")
     let parts = generate_parts(prog.funcs, platform, table, release)
@@ -127,50 +178,66 @@ pub fn generate(prog: *ir.Program, platform: Platform, table: *FuncTable?, relea
         }
         body.write(part.text)
         g.adopt(part)
+        g.adopt_maps(part)
     }
-    g.start(prog)
-    if table != none {
-        g.trampolines(prog.c_symbols)
-    }
-    for f in prog.funcs {
-        if f.callback {
-            g.thunk(f)
-        }
-    }
-    let dynamic = platform_dynamic(platform, prog)
-    if dynamic {
-        platform_shims(platform, g, prog.c_symbols)
-    }
+    write_tail(g, prog)
     var out = builder.builder()
-    out.write("\t.intel_syntax noprefix\n")
-    write_symbols(mut out, [Define { name: "RT_DYNAMIC", value: bit(dynamic) }])
-    out.write(hot_init_macro(table != none))
-    out.write(layout_asm())
-    out.write(platform_header(platform))
-    out.write(platform_runtime(platform))
-    out.write(scheduler_asm())
-    out.write(runtime_asm())
-    out.write(collector_asm())
+    out.write(environment(prog, platform, table))
+    out.write(runtime_text(platform))
     g.write_maps(mut out)
-    write_cells(mut out, prog.cells)
-    write_static_blocks(mut out, prog.static_blocks)
-    match table {
-        some(t) => t.write_runtime(platform, mut out)
-        none => {}
-    }
-    platform_imports(platform, mut out, prog)
-    out.write("\n\t.section .rodata\n")
-    out.write(data_text(g.chunks))
-    out.write("\n\t.text\n")
+    g.write_data(prog, mut out)
     out.write(body.to_str())
     out.write(g.text.to_str())
     Output { asm: out.to_str(), funcs }
+}
+
+pub fn generate_pieces(prog: *ir.Program, platform: Platform, env: *asm.Env) -> []asm.Piece ! asm.Error {
+    let g = new_generator(platform, none, "")
+    let parts = generate_parts(prog.funcs, platform, none, true)
+    let assembled = assemble_parts(parts, env)
+    var blocks: []asm.Chunk = []
+    var refs: []MapRef = []
+    for i, f in prog.funcs {
+        let result = assembled[i]
+        match result.failure {
+            some(e) => fail e
+            none => {}
+        }
+        let block = result.chunk
+        blocks.push(block)
+        g.adopt(parts[i])
+        let owner = symbol(f.name, "")
+        for k, m in parts[i].maps {
+            refs.push(MapRef { symbol: owner, at: block.marks[k], map: m })
+        }
+    }
+    write_tail(g, prog)
+    for m in g.maps {
+        refs.push(MapRef { symbol: m.label, at: 0, map: m })
+    }
+    var head = builder.builder()
+    head.write(environment(prog, platform, none))
+    head.write(runtime_text(platform))
+    var data = builder.builder()
+    g.write_data(prog, mut data)
+    var pieces: []asm.Piece = [asm.Piece.Text(head.to_str()), asm.Piece.Block(maps_chunk(refs)), asm.Piece.Text(data.to_str())]
+    for block in blocks {
+        pieces.push(asm.Piece.Block(block))
+    }
+    pieces.push(asm.Piece.Text(g.text.to_str()))
+    pieces
 }
 
 struct Part {
     text: str = ""
     chunks: []DataChunk = []
     maps: []StackMap = []
+    data_tail: bool = false
+}
+
+struct Assembled {
+    chunk: asm.Chunk = asm.Chunk {}
+    failure: asm.Error? = none
 }
 
 fn generate_parts(funcs: []*ir.Func, platform: Platform, table: *FuncTable?, release: bool) -> []Part {
@@ -192,6 +259,34 @@ fn generate_parts(funcs: []*ir.Func, platform: Platform, table: *FuncTable?, rel
     parts
 }
 
+fn assemble_parts(parts: []Part, env: *asm.Env) -> []Assembled {
+    var tails: []bool = []
+    var assembled: []Assembled = []
+    for part in parts {
+        tails.push(part.data_tail)
+        assembled.push(Assembled {})
+    }
+    parallel.each(parts.len, fn(i: i64) {
+        let after_data = i > 0 && tails[i - 1]
+        assembled[i] = region { assemble_part(env, parts[i], after_data) }
+    })
+    for i in 0..parts.len {
+        parts[i].text = ""
+    }
+    assembled
+}
+
+fn assemble_part(env: *asm.Env, part: Part, after_data: bool) -> Assembled {
+    var wanted: []str = []
+    for m in part.maps {
+        wanted.push(m.label)
+    }
+    let chunk = asm.assemble_chunk(env, part.text, wanted, after_data) catch {
+        e => return Assembled { failure: e }
+    }
+    Assembled { chunk }
+}
+
 fn drop_blocks(f: *ir.Func, release: bool) {
     if release {
         f.blocks = []
@@ -201,7 +296,7 @@ fn drop_blocks(f: *ir.Func, release: bool) {
 fn emit_part(f: *ir.Func, platform: Platform, table: *FuncTable?) -> Part {
     let g = new_generator(platform, table, "")
     g.function(f)
-    Part { text: g.text.to_str(), chunks: g.chunks, maps: g.maps }
+    Part { text: g.text.to_str(), chunks: g.chunks, maps: g.maps, data_tail: g.data_tail }
 }
 
 fn adopt(g: *Generator, part: Part) {
@@ -212,6 +307,9 @@ fn adopt(g: *Generator, part: Part) {
             g.chunks.push(c)
         }
     }
+}
+
+fn adopt_maps(g: *Generator, part: Part) {
     for m in part.maps {
         g.maps.push(m)
     }
@@ -244,7 +342,26 @@ fn mangle(name: str) -> str {
 
 fn emit(g: *Generator, line: str) {
     g.previous = Moved {}
+    if g.leaves_function(line) {
+        g.text.write("\t{{disp32}} {line}\n")
+        return
+    }
     g.text.write("\t{line}\n")
+}
+
+fn leaves_function(g: *Generator, line: str) -> bool {
+    if line.len < 4 || line[0] != 'j' {
+        return false
+    }
+    let space = text.index_byte(line, ' ')
+    if space < 0 {
+        return false
+    }
+    let target = line[space + 1..]
+    if !text.starts_with(target, "rt_") && !text.starts_with(target, "fn_") {
+        return false
+    }
+    g.owner == "" || !text.starts_with(target, g.owner)
 }
 
 fn align(g: *Generator, power: i64) {
@@ -271,6 +388,7 @@ fn call_target(g: *Generator, f: *ir.Func) -> str {
 fn start(g: *Generator, prog: *ir.Program) {
     g.scope = ".entry"
     g.labels = 0
+    g.align(function_alignment)
     g.emit("PROGRAM_ENTRY {platform_entry(g.platform)}")
     g.program(prog)
 }
@@ -401,6 +519,7 @@ fn message_label(g: *Generator, s: str) -> str {
 
 fn function(g: *Generator, f: *ir.Func) {
     let sym = symbol(f.name, g.suffix)
+    g.owner = "{sym}."
     if !uses_vectors(f) {
         g.tier = Baseline
         g.body(f, sym, mangle(f.name), false)
