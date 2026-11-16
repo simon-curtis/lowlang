@@ -698,6 +698,7 @@ struct Node {
   - `when` is a contextual keyword: it is an ordinary identifier everywhere except directly after an expression on the same line.
 - `match` unwraps an optional with `some(v)` and `none` arms and must cover both.
 - `?` after a type binds to everything before it: `*Node?` is an optional pointer, `i64[]?` an optional slice and `*Node[]?` an optional slice of pointers.
+- Parentheses group a type: `(fn() -> i64)[]` is a slice of functions, `*(i64[])` a pointer to a slice and `(str?)?` an optional optional. `str??` means the same as `(str?)?`; at the end of a line, where `??` would continue the expression, it is an error and the parenthesised form is needed.
 - An optional is an enum with `none` as tag 0 and `some` as tag 1, so it takes one word more than its value.
 
 ### Errors
