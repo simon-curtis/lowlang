@@ -17,6 +17,6 @@ A tree is a `TREE <name>` line followed by one line per node in depth-first orde
 | `ox`, `oy` | `visible`, `hidden` or `scroll` |
 | `pos` | `abs` |
 | `display` | `none` |
-| `leaf` | `<word widths separated by ;>\|<line height>`: a leaf whose words wrap at the available width with a space of 4 |
+| `leaf` | `<word widths separated by ;>\|<line height>`: a leaf whose words wrap at a known or definite width, never when asked for its narrowest or widest size, with a space of 4 |
 
 A golden file has a `RESULT <name> <scale>` line per tree and then `<index> <x> <y> <width> <height>` per node in the tree's order, in logical pixels.
