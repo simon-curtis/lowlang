@@ -2546,12 +2546,13 @@ Mechanism:
 
 ## UI
 
-`std/ui` holds the modules that draw a window's user interface with Vulkan, on Wayland on Linux and on Win32 on Windows: windows and input, a flexbox layout engine, fonts and text, a scene of GPU primitives, and a renderer that draws a scene into an offscreen target or a window.
+`std/ui` holds the modules that draw a window's user interface with Vulkan, on Wayland on Linux and on Win32 on Windows: windows and input, a flexbox layout engine, fonts and text, a scene of GPU primitives, a renderer that draws a scene into an offscreen target or a window, and on top of them an element tree with signals, hit testing and focus that a program runs as an application.
 
 ### UI modules
 
 | Module | Contents |
 |---|---|
+| `std/ui` | `Element` and its builders, `Signal`, `Context`, `App` and `run`. |
 | `std/ui/geometry` | `Point`, `Size`, `Rect`, `Edges`, `Corners` and `Color`, all in `f32`. |
 | `std/ui/layout` | The flexbox engine over a tree of styled nodes. |
 | `std/ui/font` | TrueType parsing, glyph outlines, the rasteriser and the embedded fallback font. |
@@ -2560,7 +2561,7 @@ Mechanism:
 | `std/ui/gpu` | The Vulkan renderer, its shaders, offscreen targets and swapchains, and the generated Vulkan bindings. |
 | `std/ui/platform` | Windows, input events and the waiting loop: Wayland, xkbcommon and the generated Wayland bindings on Linux, user32 and kernel32 on Windows. |
 
-- `std/ui/geometry`, `std/ui/layout`, `std/ui/font`, `std/ui/text` and `std/ui/scene` only compute, so they run on both targets with no library.
+- `std/ui/geometry`, `std/ui/layout`, `std/ui/font`, `std/ui/text`, `std/ui/scene` and, apart from `open` and `run`, `std/ui` only compute, so they run on both targets with no library.
 - `std/ui/gpu` and `std/ui/platform` hold one file per target for what differs, `surface_linux.low` and `surface_windows.low`, `wayland_linux.low` and `win32_windows.low`, behind one API (see Modules under Syntax).
 - The generated bindings are private to the module that uses them. `std/ui/gpu/vulkan.low` holds the types and constants, and `vulkan_linux.low` and `vulkan_windows.low` the commands, linked from `libvulkan.so` and `vulkan-1.dll`. `std/ui/platform/wayland_linux.low` holds the Wayland bindings.
 - A Linux program that opens a window links `libvulkan.so.1`, `libwayland-client.so.0`, `libxkbcommon.so.0` and libc. A Windows one imports `vulkan-1.dll`, `user32.dll` and `kernel32.dll`.
@@ -2675,11 +2676,34 @@ Win32:
 - `paint(mut sys, mut scene, layout, origin, color, scale)` pushes one sprite per visible glyph. Glyph origins are snapped to whole device pixels.
 - The atlas is a 1024 by 1024 `R8` image packed in shelves. A glyph is rasterised at its pixel size, rounded to 1/64 pixel, the first time it is drawn, with a one-pixel border. A glyph that does not fit is left out, and so is every glyph after it in the frame; `end_frame` then clears the atlas so the next frame packs its own text.
 
+### Elements
+
+`std/ui` builds an interface from values and draws it with the modules above; a program imports `std/ui` and nothing else for a window.
+
+- An `Element` is a box or a text run: `div()` and `text(s)` make one and each builder returns a changed copy, so an element is built by chaining and `children()` takes a trailing block of elements. The builders are `row`, `column`, `gap`, `padding`, `padding_xy`, `margin`, `size`, `width`, `height`, `grow`, `items_start`, `items_center`, `items_end`, `justify_center`, `justify_end`, `justify_between`, `background`, `border`, `rounded`, `shadow`, `text_color`, `text_size`, `id`, `child` and `children`. They set a `layout.Style` and a `Visual`, the colours, corners, shadows and text style, which are what `layout` and `scene` take.
+- `text_color` and `text_size` are inherited by an element's children; a text run is black at 16 logical pixels until one is set.
+- A `Signal[T]` is a value that belongs to a `Context`. `signal(cx, v)` makes one, `get(s)` reads it, `set(s, v)` and `update(s, f)` change it and mark the context's frame as due. Copies of a signal share the value. The tree is a function of its signals, so a program holds its state in signals and returns a new tree from the function it gives `run`.
+- A `Context` owns the signals' state, the text system and what the pointer and the keyboard are on. It is a handle: copies share the state. `headless(background)` makes one with no window, `frame(cx, render, size, scale)` returns the scene of the tree that `render` returns, and `dispatch(cx, event)` applies a `platform.Event`, so a program or a test drives an interface with no window and no GPU, and `draw(cx, g, t, scene)` draws that scene into an offscreen target. `frame_due`, `closed` and `quit` report and end the loop.
+- `open(Options) -> App ! Error` opens a window, a `Gpu` that draws into it and a `Context` whose waker is the window's, and `run(app, render) ! Error` loops until the window is closed: it waits for events, dispatches them, and when a frame is due builds the tree, lays it out, paints it and presents it. `app.cx` is the context, so `app.cx.signal(0)` makes a signal before `run`. `Options` has a title, a size and a background.
+- `handle(cx)` returns a copyable `Handle`, and `post(h, f)` queues a closure that runs on the context's green thread before the next frame and wakes the window, so another green thread changes signals through it.
+- A frame runs in order: the posted closures, `render`, building a layout tree from the elements (a text run is a leaf whose measure wraps the text), `layout.compute`, recording the hitboxes, hit testing, then painting. Painting pushes, per element in tree order, its shadows, its quad and its text sprites, so a child draws over its parent. An element with `display: None` and its children take no space and draw nothing.
+
+Hit testing and focus:
+
+- An element has a hitbox when it has a click or key handler, a `hover`, `active` or `focus` style, or is `focusable`. A frame records one per such element, the rectangle of its border box in logical pixels, in tree order, and keeps for each the hitbox of the nearest ancestor that has one.
+- An element's key is its `id` when it has one, else its position in the tree, such as `"0/2/1"`. Focus, and the press a click needs, are kept by key from one frame to the next, so an element keeps focus when the tree moves it only if it has an id.
+- The pointer is over every hitbox that contains it, so the elements of a nested path are all hovered. `hover(e, f)` restyles `e` with `f` while the pointer is over it or over an element inside it, `active(e, f)` from a press of the primary button over it until the release, and `focus(e, f)` while it is focused; the conditions apply in the order the builders were called. A change of what is hovered or focused makes a frame due.
+- `on_click(e, f)` runs `f` when the primary button is pressed and released over `e`. A click goes to the innermost element with a click handler that both the press and the release were over, and to no other. A press elsewhere, a release elsewhere and any other button give no click.
+- A press focuses the innermost `focusable` element under the pointer, or its nearest focusable ancestor, and a press on none removes focus. `set_focus(cx, key)`, `blur(cx)` and `focused(cx)` change and read it. Tab and Shift+Tab move focus to the next and previous `focusable` element in tree order, wrapping at the ends, or to the first and last when none is focused.
+- `on_key(e, f)` runs `f` for each key press, repeat and release while `e` or an element inside it is focused. A key goes to the focused element and then outward until a handler returns `true`; Tab and Enter and Space act only when no handler took the key. Enter and Space click the focused element when it has a click handler.
+- `dispatch` tests against the hitboxes of the last frame, so the pointer is compared with what was drawn.
+
 ### UI tests
 
 - `std/ui/geometry`, `std/ui/layout`, `std/ui/font`, `std/ui/text` and `std/ui/scene` are tested by `testdata/run/ui_*` programs, which need no library and so run on Linux and, through the `windows` suite, on Windows. They check layouts against hand-computed rectangles, glyph metrics and rasterised coverage of the fallback font, line breaking, atlas packing and scene batching.
+- `std/ui/*_test.low` runs with `low test std/ui` and drives a `Context` with no window and no GPU: it checks the scene a frame returns against hand-computed rectangles and colours, and dispatches pointer and key events to check hover, click, focus and key bubbling.
 - `compiler/tests/ui` builds Low programs that import the `std/ui` modules and runs them:
-  - offscreen renders of every primitive kind, clipping, draw order, frames in flight, instance buffer growth and atlas updates, compared by pixels; they skip without libvulkan or a Vulkan 1.3 device;
+  - offscreen renders of every primitive kind, clipping, draw order, frames in flight, instance buffer growth and atlas updates, compared by pixels, and an element tree driven through hover, press, focus and click; they build for the host, so they run on Linux and on Windows, and skip without libvulkan or a Vulkan 1.3 device;
   - the Wayland listener callbacks and key translation, driven directly by a program built from the platform's sources; key translation skips without libxkbcommon;
   - a Wayland window that opens, opens again after closing, and presents frames through `open_for` and `present`; these skip without a running compositor;
   - on a Windows host, the Win32 platform run with posted and sent messages standing in for input, on windows disabled so the desktop's own pointer does not reach them: opening, pairs of windows, pointer, keys, resizing and waking.
