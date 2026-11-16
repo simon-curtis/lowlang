@@ -25,6 +25,7 @@ struct Conn {
     logged_in: bool
     challenged: bool
     challenge: u8[]
+    server_text: bool
     session: *driver.Session
 }
 
@@ -223,7 +224,7 @@ fn metadata(c: *Conn, x: *Exchange) ! sql.Error {
                 us_varchar(c)?
             }
         }
-        columns[i] = sql.Column { name: b_varchar(c)?, kind: t.name }
+        columns[i] = column_of(b_varchar(c)?, t)
         types[i] = t
     }
     x.columns = columns
@@ -236,7 +237,7 @@ fn decoded(c: *Conn, x: *Exchange, t: Type) -> sql.Value ! sql.Error {
         return sql.Value.Null
     }
     match raw {
-        some(data) => convert(t, data) catch {
+        some(data) => convert(t, data, c.server_text) catch {
             Conversion => {
                 if x.failure == none {
                     x.failure = sql.Error.Conversion
@@ -277,8 +278,11 @@ fn done(c: *Conn, x: *Exchange, kind: u8, receive: fn(sql.Event) -> bool) ! sql.
     if kind == 0xFE {
         return
     }
-    let rows = if status & 0x10 != 0 { count } else { 0 }
-    x.count += rows
+    let counted = status & 0x10 != 0
+    let rows: i64? = if counted { count } else { none }
+    if counted {
+        x.count += count
+    }
     emit(c, x, receive, sql.Event.Done(rows))?
 }
 
@@ -294,6 +298,14 @@ fn server_message(c: *Conn, x: *Exchange, failed: bool) ! sql.Error {
     driver.report(c.session, d)
 }
 
+fn env_value(body: u8[]) -> str ! sql.Error {
+    let size = i64(body[1])
+    if 2 + 2 * size > body.len {
+        fail Protocol
+    }
+    from_utf16(body[2..2 + 2 * size])
+}
+
 fn env_change(c: *Conn) ! sql.Error {
     let body = take(c, u16_of(c)?)?
     if body.len < 2 {
@@ -302,14 +314,13 @@ fn env_change(c: *Conn) ! sql.Error {
     let kind = body[0]
     let size = i64(body[1])
     if kind == 4 {
-        if 2 + 2 * size > body.len {
-            fail Protocol
-        }
-        let value = text.parse_int(from_utf16(body[2..2 + 2 * size])) or fail Protocol
+        let value = text.parse_int(env_value(body)?) or fail Protocol
         if value < 512 || value > 32767 {
             fail Protocol
         }
         c.packet_size = value
+    } else if kind == 1 || kind == 2 {
+        driver.setting(c.session, if kind == 1 { "database" } else { "language" }, env_value(body)?)
     } else if kind == 8 {
         if size != 8 || body.len < 10 {
             fail Protocol
@@ -500,9 +511,10 @@ fn secure(c: *Conn, o: sql.Options, config: tls.Config) ! sql.Error {
     c.reader = io.reader(s)
 }
 
-fn login(c: *Conn, o: sql.Options, integrated: bool) ! sql.Error {
+fn login(c: *Conn, o: sql.Options, config: Config) ! sql.Error {
+    let integrated = config.integrated
     if !integrated {
-        send_message(c, packet_login, login_message(o, o.host, false, []))?
+        send_message(c, packet_login, login_message(o, o.host, false, config.read_only, []))?
         drive(c, driver.ignore_event)?
         return
     }
@@ -510,7 +522,7 @@ fn login(c: *Conn, o: sql.Options, integrated: bool) ! sql.Error {
     let auth = sspi_begin("MSSQLSvc/{o.host}:{port}")?
     defer sspi_end(auth)
     let first = sspi_token(auth, [])?
-    send_message(c, packet_login, login_message(o, o.host, true, first))?
+    send_message(c, packet_login, login_message(o, o.host, true, config.read_only, first))?
     drive(c, driver.ignore_event)?
     for !c.logged_in && c.challenged {
         let answer = sspi_token(auth, c.challenge)?
@@ -544,7 +556,7 @@ fn establish(c: *Conn, o: sql.Options, config: Config) ! sql.Error {
             }
         }
     }
-    login(c, o, config.integrated)?
+    login(c, o, config)?
     if !c.logged_in {
         fail Authentication
     }
@@ -569,6 +581,7 @@ fn open(s: io.Stream, o: sql.Options, config: Config) -> sql.Connection ! sql.Er
         logged_in: false
         challenged: false
         challenge: []
+        server_text: o.server_text
         session: driver.session()
     })
     if c.timeout > 0 {
@@ -606,6 +619,8 @@ pub struct Config {
     pub tls: tls.Config? = none
     /// Whether to log in with Windows integrated authentication, which sends the current Windows identity through SSPI with the `Negotiate` package and ignores `sql.Options.user` and `sql.Options.password`. Available on Windows only; elsewhere the login fails with `sql.Error.Unsupported`. The service name is `MSSQLSvc/<host>:<port>`.
     pub integrated: bool = false
+    /// Whether the login asks for read-only application intent, the `ApplicationIntent=ReadOnly` of other drivers: LOGIN7 sets the `fReadOnlyIntent` type flag, so an availability group listener may route the connection to a readable secondary replica. Without a listener the server ignores it.
+    pub read_only: bool = false
 }
 
 /// Connects to a SQL Server over plain TCP, using `o.host` and `o.port` (`1433` by default), and logs in as `o.user` to `o.database`.

@@ -1,8 +1,10 @@
 import std/charset
 import std/io
+import std/math
 import std/sql
 import std/sql/driver
 import std/text
+import std/time/date
 
 enum Shape {
     Fixed
@@ -461,6 +463,93 @@ fn stamp_value(t: Type, raw: u8[]) -> i64 ! sql.Error {
     day_value(raw, clock) * driver.micros_per_day + clock_micros(raw, 0, clock, t.scale)
 }
 
+fn declared_length(t: Type) -> i64 {
+    if t.shape == Long || t.id == 0xF1 || t.shape == Partial && t.size == 0xFFFF {
+        return -1
+    }
+    if t.id == 0xA5 || t.id == 0xAD || t.id == 0xA7 || t.id == 0xAF {
+        return t.size
+    }
+    if t.id == 0xE7 || t.id == 0xEF {
+        return t.size / 2
+    }
+    0
+}
+
+fn column_of(name: str, t: Type) -> sql.Column {
+    sql.Column { name, kind: t.name, precision: t.precision, scale: t.scale, length: declared_length(t) }
+}
+
+fn put_clock_text(mut out: u8[], seconds: i64, fraction: i64, scale: i64) {
+    put_digits(mut out, u64(seconds / 3600), 2)
+    out.push(':')
+    put_digits(mut out, u64(seconds / 60 % 60), 2)
+    out.push(':')
+    put_digits(mut out, u64(seconds % 60), 2)
+    if scale > 0 {
+        out.push('.')
+        put_digits(mut out, u64(fraction), scale)
+    }
+}
+
+fn put_day_text(mut out: u8[], days: i64) ! sql.Error {
+    let d = date.from_epoch_days(days) or fail Protocol
+    put_digits(mut out, u64(date.year(d)), 4)
+    out.push('-')
+    put_digits(mut out, u64(date.month_number(d)), 2)
+    out.push('-')
+    put_digits(mut out, u64(date.day(d)), 2)
+}
+
+fn put_offset_text(mut out: u8[], minutes: i64) {
+    let magnitude = if minutes < 0 { 0 - minutes } else { minutes }
+    out.push(if minutes < 0 { '-' } else { '+' })
+    put_digits(mut out, u64(magnitude / 60), 2)
+    out.push(':')
+    put_digits(mut out, u64(magnitude % 60), 2)
+}
+
+fn exact_text(t: Type, raw: u8[]) -> str ! sql.Error {
+    let clock = clock_size(t.scale)
+    let expected = match t.kind {
+        Clock => clock
+        Stamp => clock + 3
+        _ => clock + 5
+    }
+    if raw.len != expected {
+        fail Protocol
+    }
+    var per_second = 1
+    for _ in 0..t.scale {
+        per_second *= 10
+    }
+    let units = unsigned(raw, 0, clock)
+    var seconds = units / per_second
+    let fraction = units % per_second
+    var out: u8[] = []
+    if t.kind == Clock {
+        put_clock_text(mut out, seconds, fraction, t.scale)
+        return __str_view(out)
+    }
+    var days = day_value(raw, clock)
+    var offset = 0
+    if t.kind == StampZone {
+        offset = signed(raw[clock + 3..])?
+        seconds += offset * 60
+        let shift = math.floor_div(seconds, 86400)
+        days += shift
+        seconds -= shift * 86400
+    }
+    put_day_text(mut out, days)?
+    out.push(' ')
+    put_clock_text(mut out, seconds, fraction, t.scale)
+    if t.kind == StampZone {
+        out.push(' ')
+        put_offset_text(mut out, offset)
+    }
+    __str_view(out)
+}
+
 fn moment_value(raw: u8[]) -> i64 ! sql.Error {
     if raw.len == 4 {
         let days = unsigned(raw, 0, 2) + days_1900
@@ -510,7 +599,7 @@ fn text_value(t: Type, raw: u8[]) -> str ! sql.Error {
     }
 }
 
-fn variant_value(raw: u8[]) -> sql.Value ! sql.Error {
+fn variant_value(raw: u8[], exact: bool) -> sql.Value ! sql.Error {
     if raw.len < 2 {
         fail Protocol
     }
@@ -522,14 +611,14 @@ fn variant_value(raw: u8[]) -> sql.Value ! sql.Error {
     let props = raw[2..2 + extra]
     let data = raw[2 + extra..]
     match fixed_type(id) {
-        some(t) => return convert(t, data)
+        some(t) => return convert(t, data, exact)
         none => {}
     }
     if id == 0x24 || id == 0x26 || id == 0x68 || id == 0x6D || id == 0x6E || id == 0x6F {
-        return convert(type_of(id, Byte, data.len, sized_name(id, data.len)?), data)
+        return convert(type_of(id, Byte, data.len, sized_name(id, data.len)?), data, exact)
     }
     if id == 0x28 {
-        return convert(type_of(id, Byte, 3, "date"), data)
+        return convert(type_of(id, Byte, 3, "date"), data, exact)
     }
     if props.len < 1 {
         fail Protocol
@@ -551,7 +640,7 @@ fn variant_value(raw: u8[]) -> sql.Value ! sql.Error {
                 fail Protocol
             }
         }
-        return convert(t, data)
+        return convert(t, data, exact)
     }
     if id == 0xA5 || id == 0xAD {
         return sql.Value.Bytes(data)
@@ -567,7 +656,10 @@ fn variant_value(raw: u8[]) -> sql.Value ! sql.Error {
     fail Unsupported
 }
 
-fn convert(t: Type, raw: u8[]) -> sql.Value ! sql.Error {
+fn convert(t: Type, raw: u8[], exact: bool) -> sql.Value ! sql.Error {
+    if exact && (t.kind == Clock || t.kind == Stamp || t.kind == StampZone) {
+        return sql.Value.Text(exact_text(t, raw)?)
+    }
     match t.kind {
         Integer => {
             if raw.len == 1 {
@@ -611,7 +703,7 @@ fn convert(t: Type, raw: u8[]) -> sql.Value ! sql.Error {
         Stamp => sql.Value.Timestamp(stamp_value(t, raw)?)
         StampZone => sql.Value.TimestampTz(stamp_value(t, raw)?)
         Textual => sql.Value.Text(text_value(t, raw)?)
-        Variant => variant_value(raw)?
+        Variant => variant_value(raw, exact)?
         Binary => sql.Value.Bytes(raw)
     }
 }
