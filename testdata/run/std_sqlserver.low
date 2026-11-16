@@ -11,6 +11,8 @@ struct Fake {
     closes: i64
     stall: bool
     gate: chan[bool]
+    reached: chan[bool]
+    on_attention: u8[]
 }
 
 struct Column {
@@ -20,13 +22,14 @@ struct Column {
 }
 
 fn fake(input: u8[]) -> *Fake {
-    new(Fake { input, at: 0, output: [], closed: false, closes: 0, stall: false, gate: chan[bool]() })
+    new(Fake { input, at: 0, output: [], closed: false, closes: 0, stall: false, gate: chan[bool](4), reached: chan[bool](4), on_attention: [] })
 }
 
 fn fake_stream(f: *Fake) -> io.Stream {
     io.Stream {
         read: fn(buf) -> i64 ! io.Error {
             if f.stall && f.at == f.input.len && !f.closed {
+                f.reached <- true
                 <-f.gate
             }
             let n = io.copy(buf, f.input[f.at..])
@@ -38,6 +41,11 @@ fn fake_stream(f: *Fake) -> io.Stream {
                 fail BrokenPipe
             }
             io.append(mut f.output, data)
+            if data.len > 0 && data[0] == 0x06 && f.on_attention.len > 0 {
+                io.append(mut f.input, f.on_attention)
+                f.on_attention = []
+                f.gate <- true
+            }
             data.len
         }
         close: fn() {
@@ -122,18 +130,22 @@ fn env_change(mut b: u8[], body: u8[]) {
     io.append(mut b, body)
 }
 
-fn server_message(mut b: u8[], kind: u8, number: i64, class: i64, text: str) {
+fn diagnostic_token(mut b: u8[], kind: u8, number: i64, state: i64, class: i64, text: str, server: str, procedure: str, line: i64) {
     var body: u8[] = []
     le(mut body, number, 4)
-    body.push(1)
+    body.push(u8(state))
     body.push(u8(class))
     us_varchar(mut body, text)
-    b_varchar(mut body, "db1")
-    b_varchar(mut body, "")
-    le(mut body, 1, 4)
+    b_varchar(mut body, server)
+    b_varchar(mut body, procedure)
+    le(mut body, line, 4)
     b.push(kind)
     le(mut b, body.len, 2)
     io.append(mut b, body)
+}
+
+fn server_message(mut b: u8[], kind: u8, number: i64, class: i64, text: str) {
+    diagnostic_token(mut b, kind, number, 1, class, text, "db1", "", 1)
 }
 
 fn login_reply(mut b: u8[]) {
@@ -335,9 +347,31 @@ fn attempt(work: fn() ! sql.Error) -> str {
         Unsupported => return "Unsupported"
         Conversion => return "Conversion"
         Busy => return "Busy"
-        Server(code, message) => return "Server({code}, {message})"
+        Cancelled => return "Cancelled"
+        Server(errors) => return "Server({server_text(errors)})"
     }
     "ok"
+}
+
+fn server_text(errors: sql.Diagnostic[]) -> str {
+    var parts: str[] = []
+    for d in errors {
+        parts.push("{d.code}, {d.message}")
+    }
+    text.join(parts, " + ")
+}
+
+fn level_name(l: sql.Level) -> str {
+    match l {
+        Info => "Info"
+        Warning => "Warning"
+        Failure => "Failure"
+        Fatal => "Fatal"
+    }
+}
+
+fn describe(d: sql.Diagnostic) -> str {
+    "{level_name(d.level)} {d.code} class={d.class} state={d.state} server={d.server} procedure={d.procedure} line={d.line} {d.message}"
 }
 
 fn utf16_text(data: u8[]) -> str {
@@ -525,9 +559,9 @@ fn script() -> u8[] {
     message(mut b, t)
 
     t = []
-    server_message(mut t, 0xAB, 0, 0, "just a notice")
-    server_message(mut t, 0xAA, 208, 16, "Invalid object name 'nope'.")
-    server_message(mut t, 0xAA, 8180, 16, "Statement(s) could not be prepared.")
+    diagnostic_token(mut t, 0xAB, 0, 1, 0, "just a notice", "db1", "", 1)
+    diagnostic_token(mut t, 0xAA, 208, 1, 16, "Invalid object name 'nope'.", "db1", "", 2)
+    diagnostic_token(mut t, 0xAA, 8180, 2, 16, "Statement(s) could not be prepared.", "db2", "load_nope", 7)
     done(mut t, 0xFD, 0x02, 0)
     message(mut b, t)
 
@@ -602,6 +636,27 @@ fn script() -> u8[] {
     done(mut t, 0xFD, 0x10, 1)
     message(mut b, t)
 
+    for _ in 0..3 {
+        t = []
+        metadata(mut t, int_column("first"))
+        int_row(mut t, 1)
+        done(mut t, 0xFD, 0x11, 1)
+        diagnostic_token(mut t, 0xAB, 0, 1, 0, "between", "db1", "", 1)
+        metadata(mut t, [Column { name: "second", info: [0x7F], value: [] }, Column { name: "third", info: [0x7F], value: [] }])
+        int_row(mut t, 2)
+        le(mut t, 3, 8)
+        done(mut t, 0xFD, 0x11, 1)
+        message(mut b, t)
+    }
+
+    t = []
+    metadata(mut t, int_column("one"))
+    int_row(mut t, 1)
+    done(mut t, 0xFD, 0x11, 1)
+    diagnostic_token(mut t, 0xAA, 208, 1, 16, "Invalid object name 'missing'.", "db1", "", 2)
+    done(mut t, 0xFD, 0x02, 0)
+    message(mut b, t)
+
     t = []
     server_message(mut t, 0xAA, 50000, 20, "fatal")
     done(mut t, 0xFD, 0x102, 0)
@@ -639,7 +694,31 @@ fn session() ! sql.Error {
     for i, c in n.columns {
         print("{c.name} {c.kind} {show(n.rows[0][i])}")
     }
-    print("missing table {attempt(fn() ! sql.Error { db.execute("SELECT * FROM nope", [])? })}")
+    var notes: str[] = []
+    db.on_notice(fn(n: sql.Notice) {
+        match n {
+            Message(d) => notes.push(describe(d))
+            Notification(channel, payload, process) => notes.push("notification {channel}")
+        }
+    })
+    var failed: sql.Diagnostic[] = []
+    let missing = attempt(fn() ! sql.Error {
+        db.execute("SELECT * FROM nope", []) catch {
+            Server(errors) => {
+                failed = errors
+                fail Server(errors)
+            }
+            e => fail e
+        }
+    })
+    print("missing table {missing}")
+    for note in notes {
+        print("notice {note}")
+    }
+    for d in failed {
+        print("error {describe(d)}")
+    }
+    notes = []
     print("counted {db.execute("UPDATE t SET x = 1", [])?}")
     db.begin()?
     db.execute("INSERT INTO t VALUES (@p1)", [sql.Value.Int(1)])?
@@ -659,9 +738,76 @@ fn session() ! sql.Error {
     print("nested call {inner}")
     print("unassigned greek byte {attempt(fn() ! sql.Error { db.query("SELECT r", [])? })}")
     print("two {show(db.query("SELECT 2", [])?.rows[0][0])}")
+    events(db)?
     print("fatal {attempt(fn() ! sql.Error { db.execute("RAISERROR('fatal', 20, 1) WITH LOG", [])? })}")
     print("after fatal {attempt(fn() ! sql.Error { db.execute("SELECT 1", [])? })}")
     transcript(f.output)
+}
+
+fn event_text(e: sql.Event) -> str {
+    match e {
+        Columns(cols) => {
+            var names: str[] = []
+            for c in cols {
+                names.push(c.name)
+            }
+            "columns({text.join(names, ",")})"
+        }
+        Row(values) => {
+            var cells: str[] = []
+            for v in values {
+                cells.push(show(v))
+            }
+            "row({text.join(cells, ",")})"
+        }
+        Done(count) => "done({count})"
+    }
+}
+
+fn set_text(r: sql.Rows) -> str {
+    var names: str[] = []
+    for c in r.columns {
+        names.push(c.name)
+    }
+    var rows: str[] = []
+    for row in r.rows {
+        var cells: str[] = []
+        for v in row {
+            cells.push(show(v))
+        }
+        rows.push(text.join(cells, ","))
+    }
+    "[{text.join(names, ",")}] rows=[{text.join(rows, ";")}] count={r.count}"
+}
+
+fn events(db: sql.ConnectionHandle) ! sql.Error {
+    var seen: str[] = []
+    db.on_notice(fn(n: sql.Notice) {
+        match n {
+            Message(d) => seen.push("notice({d.message})")
+            Notification(channel, payload, process) => {}
+        }
+    })
+    db.stream("SELECT 1 AS first; PRINT 'between'; SELECT 2 AS second, 3 AS third", [], fn(e) -> bool {
+        seen.push(event_text(e))
+        true
+    })?
+    print("stream {text.join(seen, " ")}")
+    let sets = sql.query_all(db, "SELECT 1 AS first; PRINT 'between'; SELECT 2 AS second, 3 AS third", [])?
+    for r in sets {
+        print("set {set_text(r)}")
+    }
+    let last = db.query("SELECT 1 AS first; PRINT 'between'; SELECT 2 AS second, 3 AS third", [])?
+    print("last {set_text(last)}")
+    seen = []
+    let outcome = attempt(fn() ! sql.Error {
+        db.stream("SELECT 1 AS one\nSELECT * FROM missing", [], fn(e) -> bool {
+            seen.push(event_text(e))
+            true
+        })?
+    })
+    print("stream before error {text.join(seen, " ")} then {outcome}")
+    db.on_notice(fn(n: sql.Notice) {})
 }
 
 fn large() ! sql.Error {
@@ -795,6 +941,89 @@ fn timeout() ! sql.Error {
     print("timeout packets {text.join(kinds, " ")}")
 }
 
+fn fragment(mut b: u8[], payload: u8[]) {
+    b.push(0x04)
+    b.push(0)
+    io.put_be16(mut b, payload.len + 8)
+    io.append(mut b, [0, 0, 1, 0])
+    io.append(mut b, payload)
+}
+
+fn cancel_when(db: sql.ConnectionHandle, reached: chan[bool]) {
+    <-reached
+    db.cancel()
+}
+
+fn cancelling_script(rows: bool) -> u8[] {
+    var b: u8[] = []
+    prelogin_reply(mut b, 2)
+    login_reply(mut b)
+    var t: u8[] = []
+    metadata(mut t, int_column("g"))
+    int_row(mut t, 1)
+    int_row(mut t, 2)
+    if rows {
+        let first = t.len
+        int_row(mut t, 3)
+        done(mut t, 0xFD, 0x20, 0)
+        message_cut(mut b, t, [first])
+    } else {
+        fragment(mut b, t)
+    }
+    b
+}
+
+fn after_cancel() -> u8[] {
+    var b: u8[] = []
+    var t: u8[] = []
+    metadata(mut t, int_column("one"))
+    int_row(mut t, 1)
+    done(mut t, 0xFD, 0x10, 1)
+    message(mut b, t)
+    b
+}
+
+fn cancelling() ! sql.Error {
+    let in_callback = fake(cancelling_script(true))
+    io.append(mut in_callback.input, after_cancel())
+    using first = sqlserver.connect_stream(fake_stream(in_callback), sql.Options { user: "u", password: "p", timeout: 0 })?
+    let one = first.handle
+    var seen: str[] = []
+    let result = attempt(fn() ! sql.Error {
+        one.each("SELECT g FROM s", [], fn(cols, values) -> bool {
+            seen.push(show(values[0]))
+            one.cancel()
+            true
+        })?
+    })
+    print("cancelled in callback {result}, rows seen {text.join(seen, " ")}")
+    print("after cancel {show(one.query("SELECT 1", [])?.rows[0][0])}")
+    one.cancel()
+    transcript(in_callback.output)
+
+    let blocked = fake(cancelling_script(false))
+    blocked.stall = true
+    var acknowledgement: u8[] = []
+    var t: u8[] = []
+    done(mut t, 0xFD, 0x20, 0)
+    message(mut acknowledgement, t)
+    io.append(mut acknowledgement, after_cancel())
+    blocked.on_attention = acknowledgement
+    using second = sqlserver.connect_stream(fake_stream(blocked), sql.Options { user: "u", password: "p", timeout: 0 })?
+    let two = second.handle
+    spawn cancel_when(two, blocked.reached)
+    seen = []
+    let across = attempt(fn() ! sql.Error {
+        two.each("SELECT g FROM s", [], fn(cols, values) -> bool {
+            seen.push(show(values[0]))
+            true
+        })?
+    })
+    print("cancelled from another thread {across}, rows seen {text.join(seen, " ")}")
+    print("after cancel {show(two.query("SELECT 1", [])?.rows[0][0])}")
+    transcript(blocked.output)
+}
+
 fn closing_script() -> u8[] {
     var b: u8[] = []
     prelogin_reply(mut b, 0)
@@ -835,5 +1064,6 @@ fn main() ! sql.Error {
     large()?
     handshakes()
     timeout()?
+    cancelling()?
     closing()?
 }

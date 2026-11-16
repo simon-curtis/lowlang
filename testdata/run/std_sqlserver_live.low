@@ -92,9 +92,122 @@ fn attempt(work: fn() ! sql.Error) -> str {
         Unsupported => return "Unsupported"
         Conversion => return "Conversion"
         Busy => return "Busy"
-        Server(code, message) => return "Server({code}, {message})"
+        Cancelled => return "Cancelled"
+        Server(errors) => return "Server({server_text(errors)})"
     }
     "ok"
+}
+
+fn server_text(errors: sql.Diagnostic[]) -> str {
+    var parts: str[] = []
+    for d in errors {
+        parts.push("{d.code}, {d.message}")
+    }
+    text.join(parts, " + ")
+}
+
+fn level_name(l: sql.Level) -> str {
+    match l {
+        Info => "Info"
+        Warning => "Warning"
+        Failure => "Failure"
+        Fatal => "Fatal"
+    }
+}
+
+fn describe(d: sql.Diagnostic) -> str {
+    "{level_name(d.level)} {d.code} class={d.class} state={d.state} line={d.line} {d.message}"
+}
+
+fn event_text(e: sql.Event) -> str {
+    match e {
+        Columns(cols) => {
+            var names: str[] = []
+            for c in cols {
+                names.push(c.name)
+            }
+            "columns({text.join(names, ",")})"
+        }
+        Row(values) => {
+            var cells: str[] = []
+            for v in values {
+                cells.push(show(v))
+            }
+            "row({text.join(cells, ",")})"
+        }
+        Done(count) => "done({count})"
+    }
+}
+
+fn cancel_later(db: sql.ConnectionHandle, millis: i64) {
+    sleep(millis)
+    db.cancel()
+}
+
+fn failures(work: fn() ! sql.Error) -> sql.Diagnostic[] {
+    work() catch {
+        Server(all) => return all
+        _ => return []
+    }
+    []
+}
+
+fn diagnostics(db: sql.ConnectionHandle) ! sql.Error {
+    var notices: str[] = []
+    db.on_notice(fn(n: sql.Notice) {
+        match n {
+            Message(d) => notices.push(describe(d))
+            Notification(channel, payload, process) => notices.push(channel)
+        }
+    })
+    db.execute("PRINT 'hello'", [])?
+    db.execute("RAISERROR('careful', 10, 3)", [])?
+    check("notices", text.join(notices, "|"), "Info 0 class=0 state=1 line=1 hello|Info 50000 class=0 state=3 line=1 careful")
+    db.on_notice(fn(n: sql.Notice) {})
+
+    let errors = failures(fn() ! sql.Error {
+        db.execute("SELECT 1;\nRAISERROR('first', 16, 1);\nRAISERROR('second', 16, 2)", [])?
+    })
+    check("several errors", server_text(errors), "50000, first + 50000, second")
+    check("error fields", "{errors.len} {errors[0].class} {errors[0].state} {errors[0].line} {errors[1].state} {errors[1].line}", "2 16 1 2 2 3")
+    check("usable after several errors", show(single(db, "SELECT 4", [])?), "Int(4)")
+
+    var events: str[] = []
+    db.stream("SELECT 1 AS a; SELECT 2 AS b, 3 AS c", [], fn(e) -> bool {
+        events.push(event_text(e))
+        true
+    })?
+    check("stream", text.join(events, " "), "columns(a) row(Int(1)) done(1) columns(b,c) row(Int(2),Int(3)) done(1)")
+
+    let sets = db.query_all("SELECT 1 AS a; SELECT 2 AS b, 3 AS c", [])?
+    check("sets", "{sets.len} {sets[0].rows.len} {sets[1].columns.len}", "2 1 2")
+    check("last set", show(db.query("SELECT 1 AS a; SELECT 2 AS b", [])?.rows[0][0]), "Int(2)")
+    check("usable after sets", show(single(db, "SELECT 5", [])?), "Int(5)")
+}
+
+fn cancelling(o: sql.Options) ! sql.Error {
+    using conn = sqlserver.connect(o)?
+    let db = conn.handle
+    spawn cancel_later(db, 300)
+    let started = time.monotonic()
+    check("cancel waitfor", attempt(fn() ! sql.Error { db.execute("WAITFOR DELAY '00:00:10'", [])? }), "Cancelled")
+    let elapsed = (time.monotonic() - started) / 1000000
+    check("cancel elapsed", if elapsed >= 250 && elapsed < 3000 { "ok" } else { "{elapsed}" }, "ok")
+    check("usable after cancel", show(single(db, "SELECT 6", [])?), "Int(6)")
+    db.cancel()
+    check("idle cancel is ignored", show(single(db, "SELECT 7", [])?), "Int(7)")
+
+    var seen = 0
+    check("cancel in callback", attempt(fn() ! sql.Error {
+        db.each("SELECT TOP (200000) a.object_id FROM sys.all_columns a CROSS JOIN sys.all_columns b", [], fn(cols, values) -> bool {
+            seen += 1
+            db.cancel()
+            true
+        })?
+    }), "Cancelled")
+    check("callback stops at the cancelled row", "{seen}", "1")
+    check("usable after callback cancel", show(single(db, "SELECT 8", [])?), "Int(8)")
+    conn.handle.close()
 }
 
 fn check(label: str, got: str, want: str) {
@@ -348,14 +461,15 @@ fn errors(db: sql.ConnectionHandle, o: sql.Options) ! sql.Error {
     check("missing database", attempt(fn() ! sql.Error {
         using bad = sqlserver.connect(sql.Options { host: o.host, port: o.port, user: o.user, password: o.password, database: "nope" })?
         bad.handle.close()
-    }), "Server(4060, Cannot open database \"nope\" requested by the login. The login failed.)")
+    }), "Server(4060, Cannot open database \"nope\" requested by the login. The login failed. + 18456, Login failed for user '{o.user}'.)")
     check("refused port", attempt(fn() ! sql.Error {
         using bad = sqlserver.connect(sql.Options { host: "127.0.0.1", port: 1, user: o.user, password: o.password })?
         bad.handle.close()
     }), "Connect")
     using fatal = sqlserver.connect(o)?
     let victim = fatal.handle
-    check("fatal", attempt(fn() ! sql.Error { victim.execute("RAISERROR('fatal', 20, 1) WITH LOG", [])? }), "Server(50000, fatal)")
+    let fatals = failures(fn() ! sql.Error { victim.execute("RAISERROR('fatal', 20, 1) WITH LOG", [])? })
+    check("fatal", if fatals.len == 0 { "none" } else { "{level_name(fatals[0].level)} {fatals[0].code} {fatals[0].message}" }, "Fatal 50000 fatal")
     check("after fatal", attempt(fn() ! sql.Error { victim.execute("SELECT 1", [])? }), "Closed")
     fatal.handle.close()
 }
@@ -561,10 +675,12 @@ fn live(t: Target) ! sql.Error {
     counts(db)?
     transactions(db)?
     streaming(db)?
+    diagnostics(db)?
     relational(db)?
     conn.handle.close()
     check("closed", attempt(fn() ! sql.Error { db.execute("SELECT 1", [])? }), "Closed")
     timeouts(t.options)?
+    cancelling(t.options)?
     if t.ca.len > 0 {
         secure(t.options, t.ca)?
     }

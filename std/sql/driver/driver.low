@@ -2,44 +2,84 @@ import std/net
 import std/otel
 import std/sql
 
-/// The state of one driver connection that every call checks: whether a call is running and whether the connection is closed.
+/// The state of one driver connection that every call checks: whether a call is running, whether it was cancelled, whether the connection is closed, and where its notices go.
 pub struct Session {
     /// Whether a call is running on the connection.
     pub busy: bool
+    /// Whether `cancel` was called during the running call. Cleared when the next call starts.
+    pub cancelled: bool
     /// Whether the connection is closed.
     pub closed: bool
+    /// The function that receives the connection's notices.
+    pub notice: fn(sql.Notice)
 }
 
-/// Returns a session for a connection that is open and idle.
+/// Returns a session for a connection that is open and idle, whose notices are discarded.
 pub fn session() -> *Session {
-    new(Session { busy: false, closed: false })
+    new(Session { busy: false, cancelled: false, closed: false, notice: ignore_notice })
+}
+
+/// A notice function that discards the notice.
+pub fn ignore_notice(n: sql.Notice) {}
+
+/// Returns the `on_notice` function for a session, which replaces the function that receives its notices.
+pub fn listener(s: *Session) -> fn(fn(sql.Notice)) {
+    fn(receive: fn(sql.Notice)) {
+        s.notice = receive
+    }
+}
+
+/// Passes a diagnostic the server sent to the session's notice function.
+pub fn report(s: *Session, d: sql.Diagnostic) {
+    s.notice(sql.Notice.Message(d))
 }
 
 /// The number of microseconds in a day, the unit of `sql.Value.Time`, `Timestamp` and `TimestampTz`.
 pub const micros_per_day = 86400000000
 
-/// A column callback that ignores the columns.
-pub fn ignore_columns(columns: sql.Column[]) {}
-
-/// A row callback that ignores the row and continues.
-pub fn ignore_row(columns: sql.Column[], row: sql.Value[]) -> bool {
+/// An event callback that ignores the event and continues.
+pub fn ignore_event(e: sql.Event) -> bool {
     true
 }
 
-/// Runs `run` with a column callback and a row callback that buffer the result, and returns it.
-///
-/// A second column callback call, as for a later result set, discards the rows buffered so far.
-pub fn collect(run: fn(fn(sql.Column[]), fn(sql.Column[], sql.Value[]) -> bool) ! sql.Error) -> sql.Rows ! sql.Error {
+/// Returns an event callback that passes each row with its columns to `visit` and stops when `visit` returns `false`.
+pub fn rows(visit: fn(sql.Column[], sql.Value[]) -> bool) -> fn(sql.Event) -> bool {
     var columns: sql.Column[] = []
-    var rows: sql.Value[][] = []
-    run(fn(described) {
-        columns = described
-        rows = []
-    }, fn(cols, row) -> bool {
-        rows.push(row)
+    fn(e: sql.Event) -> bool {
+        match e {
+            Columns(described) => {
+                columns = described
+                true
+            }
+            Row(values) => visit(columns, values)
+            Done(_) => true
+        }
+    }
+}
+
+/// Runs `run` with an event callback that buffers the result, and returns the last result set with the count of the statement that ended it.
+///
+/// A call that returns no result set gives no columns, no rows and a count of `0`.
+pub fn collect(run: fn(fn(sql.Event) -> bool) ! sql.Error) -> sql.Rows ! sql.Error {
+    var result = sql.Rows { columns: [], rows: [] }
+    var open = false
+    run(fn(e) -> bool {
+        match e {
+            Columns(described) => {
+                result = sql.Rows { columns: described, rows: [] }
+                open = true
+            }
+            Row(values) => result.rows.push(values)
+            Done(count) => {
+                if open {
+                    result.count = count
+                    open = false
+                }
+            }
+        }
         true
     })?
-    sql.Rows { columns, rows }
+    result
 }
 
 fn port_of(o: sql.Options, d: sql.Dialect) -> i64 {
@@ -63,6 +103,7 @@ fn guarded[T](s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), work: fn
     if s.busy {
         fail Busy
     }
+    s.cancelled = false
     s.busy = true
     defer s.busy = false
     work() catch {
@@ -99,6 +140,14 @@ pub fn establish(s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), termi
     }
 }
 
+fn cancel_running(s: *Session, interrupt: fn()) {
+    if s.closed || !s.busy || s.cancelled {
+        return
+    }
+    s.cancelled = true
+    interrupt()
+}
+
 fn guard(s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), raw: sql.ConnectionHandle) -> sql.ConnectionHandle {
     var guard_handle = raw
     guard_handle.query = fn(text, values) -> sql.Rows ! sql.Error {
@@ -106,6 +155,9 @@ fn guard(s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), raw: sql.Conn
     }
     guard_handle.each = fn(text, values, visit) ! sql.Error {
         guarded_unit(s, fatal, abandon, fn() ! sql.Error { raw.each(text, values, visit)? })?
+    }
+    guard_handle.stream = fn(text, values, receive) ! sql.Error {
+        guarded_unit(s, fatal, abandon, fn() ! sql.Error { raw.stream(text, values, receive)? })?
     }
     guard_handle.execute = fn(text, values) -> i64 ! sql.Error {
         guarded(s, fatal, abandon, fn() -> i64 ! sql.Error { raw.execute(text, values) })
@@ -119,10 +171,13 @@ fn guard(s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), raw: sql.Conn
     guard_handle.rollback = fn() ! sql.Error {
         guarded_unit(s, fatal, abandon, fn() ! sql.Error { raw.rollback()? })?
     }
+    guard_handle.cancel = fn() {
+        cancel_running(s, raw.cancel)
+    }
     guard_handle
 }
 
-/// Returns `raw` with every `query`, `each` and `execute` recorded as an OpenTelemetry database call under `scope`, tagged with the database `o.database`, the server `o.host` and the server's port, `o.port` or the dialect's default when `o.port` is `0`.
+/// Returns `raw` with every `query`, `each`, `stream` and `execute` recorded as an OpenTelemetry database call under `scope`, tagged with the database `o.database`, the server `o.host` and the server's port, `o.port` or the dialect's default when `o.port` is `0`.
 ///
 /// Every driver applies it once to the handle it returns, so a connection from any driver is traced the same way.
 pub fn traced(raw: sql.ConnectionHandle, scope: str, o: sql.Options) -> sql.ConnectionHandle {
@@ -130,6 +185,8 @@ pub fn traced(raw: sql.ConnectionHandle, scope: str, o: sql.Options) -> sql.Conn
 }
 
 /// Returns the owning `sql.Connection` for a driver's `raw` handle: guarded by the session, traced under `scope` and closed when dropped.
+///
+/// The guarded `cancel` calls `raw.cancel` only while a call runs and only once per call, after setting `Session.cancelled`, so a driver's `cancel` acts on a running call.
 pub fn connection(s: *Session, fatal: fn(sql.Error) -> bool, abandon: fn(), scope: str, o: sql.Options, raw: sql.ConnectionHandle) -> sql.Connection {
     let guarded_handle = guard(s, fatal, abandon, raw)
     let handle = traced(guarded_handle, scope, o)

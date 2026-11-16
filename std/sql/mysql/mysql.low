@@ -2,6 +2,7 @@ import std/io
 import std/net
 import std/sql
 import std/sql/driver
+import std/sync
 import std/text
 import std/tls
 
@@ -52,10 +53,13 @@ struct Conn {
     secure: bool
     statements: [str: Statement]
     cancel: fn(i64)
+    guard: sync.Mutex
+    requested: bool
     session: *driver.Session
     state: *State
 }
 
+const query_interrupted = 1317
 const statement_capacity = 64
 const long_data_threshold = 1048576
 const long_data_chunk = 1048576
@@ -164,7 +168,20 @@ fn accept(c: *Conn, ok: Ok) {
 }
 
 fn failure(c: *Conn, mut p: Packet) -> sql.Error {
-    server_error(mut p, c.capabilities)
+    let packet = server_error(mut p, c.capabilities) catch {
+        e => return e
+    }
+    driver.report(c.session, packet.diagnostic)
+    if packet.number == query_interrupted && c.session.cancelled {
+        return sql.Error.Cancelled
+    }
+    sql.Error.Server([packet.diagnostic])
+}
+
+fn request(c: *Conn) ! sql.Error {
+    if c.session.cancelled {
+        fail Cancelled
+    }
 }
 
 fn expect_ok(c: *Conn) -> Ok ! sql.Error {
@@ -234,7 +251,7 @@ fn refuse_local_file(c: *Conn) -> sql.Error {
     sql.Error.Unsupported
 }
 
-fn result_set(c: *Conn, mut first: Packet, binary: bool, describe: fn(sql.Column[]), visit: fn(sql.Column[], sql.Value[]) -> bool) -> Ok ! sql.Error {
+fn result_set(c: *Conn, mut first: Packet, binary: bool, emit: fn(sql.Event) -> bool) -> Ok ! sql.Error {
     let count = lenenc(mut first)?
     if count < 1 {
         abandon(c, false)
@@ -242,8 +259,9 @@ fn result_set(c: *Conn, mut first: Packet, binary: bool, describe: fn(sql.Column
     }
     let fields = column_definitions(c, count)?
     let columns = columns_of(fields)
-    describe(columns)
-    var visiting = true
+    let described = sql.Event.Columns(columns)
+    var visiting = emit(described)
+    var returned = 0
     var failure_found: sql.Error? = none
     for {
         var p = receive(c)?
@@ -259,9 +277,13 @@ fn result_set(c: *Conn, mut first: Packet, binary: bool, describe: fn(sql.Column
             accept(c, ok)
             match failure_found {
                 some(e) => fail e
-                none => return ok
+                none => {}
             }
+            let done = sql.Event.Done(returned)
+            emit(done)
+            return ok
         }
+        returned += 1
         if !visiting {
             continue
         }
@@ -276,13 +298,14 @@ fn result_set(c: *Conn, mut first: Packet, binary: bool, describe: fn(sql.Column
                 fail Protocol
             }
         }
-        if !visit(columns, row) {
+        let found = sql.Event.Row(row)
+        if !emit(found) {
             visiting = false
         }
     }
 }
 
-fn results(c: *Conn, binary: bool, describe: fn(sql.Column[]), visit: fn(sql.Column[], sql.Value[]) -> bool) -> i64 ! sql.Error {
+fn results(c: *Conn, binary: bool, emit: fn(sql.Event) -> bool) -> i64 ! sql.Error {
     var affected = 0
     for {
         var p = receive(c)?
@@ -298,10 +321,12 @@ fn results(c: *Conn, binary: bool, describe: fn(sql.Column[]), visit: fn(sql.Col
             ok = ok_packet(mut p, c.capabilities)?
             accept(c, ok)
             affected += ok.affected
+            let done = sql.Event.Done(ok.affected)
+            emit(done)
         } else if lead == 0xFB {
             fail refuse_local_file(c)
         } else {
-            ok = result_set(c, mut p, binary, describe, visit)?
+            ok = result_set(c, mut p, binary, emit)?
         }
         if (ok.status & status_more_results) == 0 {
             return affected
@@ -325,6 +350,7 @@ fn prepare(c: *Conn, sql_text: str) -> Statement ! sql.Error {
     if c.statements.len >= statement_capacity {
         evict(c)?
     }
+    request(c)?
     command(c, command_text(command_prepare, sql_text))?
     var p = receive(c)?
     if p.body.len == 0 {
@@ -408,11 +434,18 @@ fn reset_statement(c: *Conn, s: Statement) ! sql.Error {
     expect_ok(c)?
 }
 
-fn run_prepared(c: *Conn, sql_text: str, values: sql.Value[], describe: fn(sql.Column[]), visit: fn(sql.Column[], sql.Value[]) -> bool) -> i64 ! sql.Error {
+fn clear_long_data(c: *Conn, s: Statement, any_long: bool) {
+    if any_long {
+        reset_statement(c, s) or {}
+    }
+}
+
+fn run_prepared(c: *Conn, sql_text: str, values: sql.Value[], emit: fn(sql.Event) -> bool) -> i64 ! sql.Error {
     let s = prepare(c, sql_text)?
     if s.parameters != values.len {
         fail Conversion
     }
+    request(c)?
     let longs: bool[] = __make(values.len)
     var any_long = false
     for i, v in values {
@@ -426,15 +459,12 @@ fn run_prepared(c: *Conn, sql_text: str, values: sql.Value[], describe: fn(sql.C
         }
     }
     let payload = execute_payload(s, values, longs)?
-    command(c, payload)?
-    results(c, true, describe, visit) catch {
+    transmit(c, payload)?
+    results(c, true, emit) catch {
         e => {
             match e {
-                Server(_, _) => {
-                    if any_long {
-                        reset_statement(c, s) or {}
-                    }
-                }
+                Server(_) => clear_long_data(c, s, any_long)
+                Cancelled => clear_long_data(c, s, any_long)
                 _ => {}
             }
             fail e
@@ -442,24 +472,65 @@ fn run_prepared(c: *Conn, sql_text: str, values: sql.Value[], describe: fn(sql.C
     }
 }
 
-fn run(c: *Conn, sql_text: str, values: sql.Value[], describe: fn(sql.Column[]), visit: fn(sql.Column[], sql.Value[]) -> bool) -> i64 ! sql.Error {
-    if values.len == 0 {
-        command(c, command_text(command_query, sql_text))?
-        return results(c, false, describe, visit)
+fn run(c: *Conn, sql_text: str, values: sql.Value[], emit: fn(sql.Event) -> bool) -> i64 ! sql.Error {
+    var stopped = false
+    let until_stopped = fn(e: sql.Event) -> bool {
+        if stopped {
+            return false
+        }
+        let more = emit(e)
+        if !more {
+            stopped = true
+        }
+        more
     }
-    run_prepared(c, sql_text, values, describe, visit)
+    defer settle(c)
+    if values.len == 0 {
+        transmit(c, command_text(command_query, sql_text))?
+        return results(c, false, until_stopped)
+    }
+    run_prepared(c, sql_text, values, until_stopped)
+}
+
+fn transmit(c: *Conn, payload: u8[]) ! sql.Error {
+    sync.lock(c.guard)
+    defer sync.unlock(c.guard)
+    request(c)?
+    command(c, payload)?
+    c.requested = true
+}
+
+fn settle(c: *Conn) {
+    sync.lock(c.guard)
+    defer sync.unlock(c.guard)
+    c.requested = false
 }
 
 fn query(c: *Conn, sql_text: str, values: sql.Value[]) -> sql.Rows ! sql.Error {
-    driver.collect(fn(describe, visit) ! sql.Error { run(c, sql_text, values, describe, visit)? })
+    driver.collect(fn(emit) ! sql.Error { run(c, sql_text, values, emit)? })
 }
 
 fn execute(c: *Conn, sql_text: str, values: sql.Value[]) -> i64 ! sql.Error {
-    run(c, sql_text, values, driver.ignore_columns, driver.ignore_row)
+    run(c, sql_text, values, driver.ignore_event)
 }
 
 fn each(c: *Conn, sql_text: str, values: sql.Value[], visit: fn(sql.Column[], sql.Value[]) -> bool) ! sql.Error {
-    run(c, sql_text, values, driver.ignore_columns, visit)?
+    run(c, sql_text, values, driver.rows(visit))?
+}
+
+fn stream(c: *Conn, sql_text: str, values: sql.Value[], emit: fn(sql.Event) -> bool) ! sql.Error {
+    run(c, sql_text, values, emit)?
+}
+
+fn interrupt(c: *Conn) {
+    sync.lock(c.guard)
+    defer sync.unlock(c.guard)
+    if !c.requested {
+        return
+    }
+    let kill = c.cancel
+    let thread = c.thread
+    spawn kill(thread)
 }
 
 fn ping(c: *Conn) ! sql.Error {
@@ -536,8 +607,8 @@ fn authenticate(c: *Conn, o: sql.Options, g: Greeting) ! sql.Error {
         if lead == 0xFF {
             let e = failure(c, mut p)
             match e {
-                Server(code, _) => {
-                    if code == "28000" {
+                Server(errors) => {
+                    if errors[0].code == "28000" {
                         fail Authentication
                     }
                 }
@@ -669,6 +740,8 @@ fn open(s: io.Stream, o: sql.Options, config: Config, cancel: fn(i64)) -> sql.Co
         secure: false
         statements: [:]
         cancel
+        guard: sync.mutex()
+        requested: false
         session: driver.session()
         state: shared
     })
@@ -685,7 +758,10 @@ fn open(s: io.Stream, o: sql.Options, config: Config, cancel: fn(i64)) -> sql.Co
         dialect: dialect(c)
         query: fn(sql_text, values) -> sql.Rows ! sql.Error { query(c, sql_text, values) }
         each: fn(sql_text, values, visit) ! sql.Error { each(c, sql_text, values, visit)? }
+        stream: fn(sql_text, values, emit) ! sql.Error { stream(c, sql_text, values, emit)? }
         execute: fn(sql_text, values) -> i64 ! sql.Error { execute(c, sql_text, values) }
+        cancel: fn() { interrupt(c) }
+        on_notice: driver.listener(c.session)
         begin: fn() ! sql.Error { execute(c, "START TRANSACTION", [])? }
         commit: fn() ! sql.Error { execute(c, "COMMIT", [])? }
         rollback: fn() ! sql.Error { execute(c, "ROLLBACK", [])? }
@@ -715,6 +791,8 @@ fn killer(o: sql.Options, config: Config) -> fn(i64) {
 ///
 /// The server's greeting tells MySQL from MariaDB, and the connection carries the matching dialect, `sql.mysql()` or `sql.mariadb()`. The driver negotiates protocol 4.1 with `DEPRECATE_EOF`, session tracking and `utf8mb4`, and on MariaDB the extended column metadata. Authentication follows the plugin the server names: `mysql_native_password`, `caching_sha2_password`, `sha256_password`, MariaDB's `client_ed25519` and `mysql_clear_password`, which is refused on a connection that is not TLS. `caching_sha2_password` and `sha256_password` over a plain connection ask the server for its RSA public key and send the password encrypted with RSA-OAEP; over TLS they send it in the clear. After the login the connection selects the UTC time zone, so `TIMESTAMP` columns are UTC. A call that times out closes the connection after a `KILL QUERY` for its thread on a second connection. Returns `sql.Error.Connect` when the connection cannot be made, `sql.Error.Timeout` when it exceeds `o.timeout`, `sql.Error.Authentication` when the server rejects the login, `sql.Error.Unsupported` for an authentication plugin or capability the driver lacks and `sql.Error.Server` for any other error the server sends. Dropping the returned `sql.Connection` sends `COM_QUIT` and closes the socket.
 ///
+/// `query` returns the last result set of a text with several statements or of a statement with several results, and `stream` reports every result set in order, in the text and in the binary protocol: `Columns`, the `Row`s, then `Done` with the number of rows. A statement without a result set reports only `Done`, with its affected rows. Every ERR packet is a `sql.Diagnostic` of level `Failure` whose `code` is the SQLSTATE; it goes to the `on_notice` function and to the call's `sql.Error.Server`. MySQL sends no warnings, so `on_notice` receives only those errors. `cancel` fails a call that has not sent its statement with `sql.Error.Cancelled`; once the statement is sent it starts `KILL QUERY` for the connection's thread on a second connection in a new green thread, and a call the server ends with error 1317 after `cancel` fails with `sql.Error.Cancelled`. The connection stays usable.
+///
 /// ```low
 /// import std/sql
 ///
@@ -741,7 +819,7 @@ pub fn connect_with(o: sql.Options, config: Config) -> sql.Connection ! sql.Erro
 
 /// Connects over a stream that is already connected, such as a Unix socket or a tunnel, and authenticates as `connect` does.
 ///
-/// `o.host`, `o.port` and `o.timeout` are not used to dial, and the connection counts as not secure, so `mysql_clear_password` is refused. A timed out call closes the stream without the `KILL QUERY` that `connect` sends. Fails like `connect` after the dial.
+/// `o.host`, `o.port` and `o.timeout` are not used to dial, and the connection counts as not secure, so `mysql_clear_password` is refused. A timed out call closes the stream without the `KILL QUERY` that `connect` sends, and `cancel` does not interrupt a call that has sent its request. Fails like `connect` after the dial.
 pub fn connect_stream(s: io.Stream, o: sql.Options) -> sql.Connection ! sql.Error {
     connect_stream_with(s, o, Config {})
 }

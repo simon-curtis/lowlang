@@ -16,6 +16,7 @@ struct Conn {
     process: i64
     secret: u8[]
     cancel: fn(i64, u8[])
+    requested: bool
     types: [i64: TypeInfo]
     statements: [str: str]
     seen: [str: bool]
@@ -86,6 +87,7 @@ fn ready(c: *Conn, mut m: Message) ! sql.Error {
     }
     c.status = status
     c.parsing = ""
+    c.requested = false
 }
 
 fn background(c: *Conn, mut m: Message) -> bool ! sql.Error {
@@ -93,13 +95,26 @@ fn background(c: *Conn, mut m: Message) -> bool ! sql.Error {
         parameter_status(c, mut m)?
         return true
     }
-    m.kind == 'N' || m.kind == 'A'
+    if m.kind == 'N' {
+        let d = diagnostic(mut m, sql.Level.Info)?
+        driver.report(c.session, d)
+        return true
+    }
+    if m.kind == 'A' {
+        let process = int32(mut m)?
+        let channel = cstring(mut m)?
+        let payload = cstring(mut m)?
+        c.session.notice(sql.Notice.Notification(channel, payload, process))
+        return true
+    }
+    false
 }
 
 struct Exchange {
     batch: i64
     columns: sql.Column[]
     kinds: Kind[]
+    errors: sql.Diagnostic[]
     failure: sql.Error?
     stopped: bool
     synced: bool
@@ -165,7 +180,7 @@ fn more(c: *Conn, x: *Exchange) ! sql.Error {
     send(c, b)?
 }
 
-fn on_row(c: *Conn, mut m: Message, x: *Exchange, visit: fn(sql.Column[], sql.Value[]) -> bool) ! sql.Error {
+fn on_row(c: *Conn, mut m: Message, x: *Exchange, sink: fn(sql.Event) -> bool) ! sql.Error {
     if x.stopped {
         return
     }
@@ -177,23 +192,21 @@ fn on_row(c: *Conn, mut m: Message, x: *Exchange, visit: fn(sql.Column[], sql.Va
         }
         _ => fail Protocol
     }
-    if !visit(x.columns, row) {
+    if !sink(sql.Event.Row(row)) {
         x.stopped = true
     }
 }
 
 fn on_error(c: *Conn, mut m: Message, x: *Exchange) ! sql.Error {
-    let n = notice(mut m)?
-    let e = server_error(n)
-    if n.severity == "FATAL" || n.severity == "PANIC" {
+    let d = diagnostic(mut m, sql.Level.Failure)?
+    driver.report(c.session, d)
+    x.errors.push(d)
+    if d.level == sql.Level.Fatal {
         abandon(c, false)
-        fail e
+        fail sql.Error.Server(x.errors)
     }
-    if n.code == "26000" {
+    if d.code == "26000" {
         c.statements = [:]
-    }
-    if x.failure == none {
-        x.failure = e
     }
     x.stopped = true
     sync(c, x)?
@@ -205,33 +218,74 @@ fn on_copy_in(c: *Conn) ! sql.Error {
     send(c, b)?
 }
 
-fn drive(c: *Conn, batch: i64, describe: fn(sql.Column[]), visit: fn(sql.Column[], sql.Value[]) -> bool) -> i64 ! sql.Error {
-    let x = new(Exchange { batch, columns: [], kinds: [], failure: none, stopped: false, synced: batch == 0, count: 0 })
+fn on_columns(c: *Conn, mut m: Message, x: *Exchange, sink: fn(sql.Event) -> bool) ! sql.Error {
+    columns_of(c, mut m, x)?
+    if !x.stopped && !sink(sql.Event.Columns(x.columns)) {
+        x.stopped = true
+    }
+}
+
+fn on_complete(c: *Conn, mut m: Message, x: *Exchange, sink: fn(sql.Event) -> bool) ! sql.Error {
+    let count = command_count(cstring(mut m)?)
+    x.count += count
+    if !x.stopped && !sink(sql.Event.Done(count)) {
+        x.stopped = true
+    }
+    sync(c, x)?
+}
+
+fn on_suspended(c: *Conn, x: *Exchange) ! sql.Error {
+    if x.stopped {
+        sync(c, x)?
+    } else if c.session.cancelled {
+        x.failure = sql.Error.Cancelled
+        x.stopped = true
+        sync(c, x)?
+    } else {
+        more(c, x)?
+    }
+}
+
+fn interrupted(errors: sql.Diagnostic[]) -> bool {
+    for d in errors {
+        if d.code == "57014" {
+            return true
+        }
+    }
+    false
+}
+
+fn outcome(c: *Conn, x: *Exchange) -> i64 ! sql.Error {
+    if x.errors.len > 0 {
+        if c.session.cancelled && interrupted(x.errors) {
+            fail Cancelled
+        }
+        fail sql.Error.Server(x.errors)
+    }
+    match x.failure {
+        some(e) => fail e
+        none => x.count
+    }
+}
+
+fn drive(c: *Conn, batch: i64, sink: fn(sql.Event) -> bool) -> i64 ! sql.Error {
+    let x = new(Exchange { batch, columns: [], kinds: [], errors: [], failure: none, stopped: false, synced: batch == 0, count: 0 })
     for {
         var m = receive(c)?
         let k = m.kind
         if k == 'Z' {
             ready(c, mut m)?
-            match x.failure {
-                some(e) => fail e
-                none => return x.count
-            }
+            return outcome(c, x)?
         } else if k == 'D' {
-            on_row(c, mut m, x, visit)?
+            on_row(c, mut m, x, sink)?
         } else if k == 'T' {
-            columns_of(c, mut m, x)?
-            describe(x.columns)
+            on_columns(c, mut m, x, sink)?
         } else if k == 'C' {
-            x.count += command_count(cstring(mut m)?)
-            sync(c, x)?
+            on_complete(c, mut m, x, sink)?
         } else if k == 'E' {
             on_error(c, mut m, x)?
         } else if k == 's' {
-            if x.stopped {
-                sync(c, x)?
-            } else {
-                more(c, x)?
-            }
+            on_suspended(c, x)?
         } else if k == 'I' {
             sync(c, x)?
         } else if k == '1' {
@@ -254,11 +308,19 @@ fn checked(sql_text: str) ! sql.Error {
     }
 }
 
+fn dispatch(c: *Conn, data: u8[]) ! sql.Error {
+    if c.session.cancelled {
+        fail Cancelled
+    }
+    c.requested = true
+    send(c, data)?
+}
+
 fn simple(c: *Conn, sql_text: str) ! sql.Error {
     checked(sql_text)?
     var b: u8[] = []
     put_query(mut b, sql_text)
-    send(c, b)?
+    dispatch(c, b)?
 }
 
 fn statement_key(sql_text: str, oids: i64[]) -> str {
@@ -312,7 +374,7 @@ fn extended(c: *Conn, sql_text: str, values: sql.Value[], batch: i64) ! sql.Erro
     put_describe_portal(mut b)
     put_execute(mut b, batch)
     put_empty(mut b, if batch == 0 { 'S' } else { 'H' })
-    send(c, b)?
+    dispatch(c, b)?
 }
 
 fn start(c: *Conn, sql_text: str, values: sql.Value[]) ! sql.Error {
@@ -325,23 +387,28 @@ fn start(c: *Conn, sql_text: str, values: sql.Value[]) ! sql.Error {
 
 fn query(c: *Conn, sql_text: str, values: sql.Value[]) -> sql.Rows ! sql.Error {
     start(c, sql_text, values)?
-    driver.collect(fn(describe, visit) ! sql.Error { drive(c, 0, describe, visit)? })
+    driver.collect(fn(sink) ! sql.Error { drive(c, 0, sink)? })
 }
 
 fn execute(c: *Conn, sql_text: str, values: sql.Value[]) -> i64 ! sql.Error {
     start(c, sql_text, values)?
-    drive(c, 0, driver.ignore_columns, driver.ignore_row)
+    drive(c, 0, driver.ignore_event)
 }
 
 fn each(c: *Conn, sql_text: str, values: sql.Value[], visit: fn(sql.Column[], sql.Value[]) -> bool) ! sql.Error {
     extended(c, sql_text, values, each_batch)?
-    drive(c, each_batch, driver.ignore_columns, visit)?
+    drive(c, each_batch, driver.rows(visit))?
+}
+
+fn stream(c: *Conn, sql_text: str, values: sql.Value[], sink: fn(sql.Event) -> bool) ! sql.Error {
+    start(c, sql_text, values)?
+    drive(c, 0, sink)?
 }
 
 fn commit(c: *Conn) ! sql.Error {
     if c.status == 'E' {
         execute(c, "ROLLBACK", [])?
-        fail sql.Error.Server("25P02", "current transaction is aborted; rolled back instead of committed")
+        fail sql.server_error("25P02", "current transaction is aborted; rolled back instead of committed")
     }
     execute(c, "COMMIT", [])?
 }
@@ -420,7 +487,9 @@ fn authenticate(c: *Conn, o: sql.Options) ! sql.Error {
                 _ => fail Unsupported
             }
         } else if m.kind == 'E' {
-            fail server_error(notice(mut m)?)
+            let d = diagnostic(mut m, sql.Level.Failure)?
+            driver.report(c.session, d)
+            fail sql.Error.Server([d])
         } else if m.kind == 'K' {
             c.process = int32(mut m)?
             c.secret = rest(mut m)
@@ -433,6 +502,12 @@ fn authenticate(c: *Conn, o: sql.Options) ! sql.Error {
     }
 }
 
+fn interrupt(c: *Conn) {
+    if c.requested {
+        c.cancel(c.process, c.secret)
+    }
+}
+
 fn open(s: io.Stream, o: sql.Options, cancel: fn(i64, u8[])) -> sql.Connection ! sql.Error {
     let c = new(Conn {
         stream: s
@@ -442,6 +517,7 @@ fn open(s: io.Stream, o: sql.Options, cancel: fn(i64, u8[])) -> sql.Connection !
         process: 0
         secret: []
         cancel
+        requested: false
         types: type_table()
         statements: [:]
         seen: [:]
@@ -457,10 +533,13 @@ fn open(s: io.Stream, o: sql.Options, cancel: fn(i64, u8[])) -> sql.Connection !
         dialect: sql.postgres()
         query: fn(sql_text, values) -> sql.Rows ! sql.Error { query(c, sql_text, values) }
         each: fn(sql_text, values, visit) ! sql.Error { each(c, sql_text, values, visit)? }
+        stream: fn(sql_text, values, sink) ! sql.Error { stream(c, sql_text, values, sink)? }
         execute: fn(sql_text, values) -> i64 ! sql.Error { execute(c, sql_text, values) }
         begin: fn() ! sql.Error { execute(c, "BEGIN", [])? }
         commit: fn() ! sql.Error { commit(c)? }
         rollback: fn() ! sql.Error { execute(c, "ROLLBACK", [])? }
+        cancel: fn() { interrupt(c) }
+        on_notice: driver.listener(c.session)
         close: closed
     }
     driver.connection(c.session, fatal, abandoned, "std/sql/postgres", o, raw)
@@ -482,7 +561,7 @@ fn canceller(o: sql.Options) -> fn(i64, u8[]) {
 
 /// Connects to a PostgreSQL server over plain TCP, using `o.host` and `o.port` (`5432` by default), and authenticates as `o.user` to `o.database`.
 ///
-/// A call that times out closes the connection and sends a cancel request to the server over a new connection. Passwords are sent in cleartext, as an MD5 hash or through SCRAM-SHA-256, as the server requests. Returns `sql.Error.Connect` when the connection cannot be made, `sql.Error.Timeout` when it exceeds `o.timeout`, `sql.Error.Authentication` when the login fails, `sql.Error.Unsupported` for an authentication method the driver lacks and `sql.Error.Server` when the server rejects the startup. Dropping the returned `sql.Connection` closes the socket.
+/// `cancel` and a call that times out send a cancel request to the server over a new connection; a timeout then closes the connection and `cancel` leaves it usable. A call stopped by `cancel` fails with `sql.Error.Cancelled`. Every notice, warning, error and notification the server sends reaches the function set with `on_notice`. Passwords are sent in cleartext, as an MD5 hash or through SCRAM-SHA-256, as the server requests. Returns `sql.Error.Connect` when the connection cannot be made, `sql.Error.Timeout` when it exceeds `o.timeout`, `sql.Error.Authentication` when the login fails, `sql.Error.Unsupported` for an authentication method the driver lacks and `sql.Error.Server` when the server rejects the startup. Dropping the returned `sql.Connection` closes the socket.
 ///
 /// ```low
 /// import std/sql
@@ -498,14 +577,14 @@ pub fn connect(o: sql.Options) -> sql.Connection ! sql.Error {
 
 /// Connects over a stream that is already connected, such as a Unix socket or a tunnel, and authenticates as `connect` does.
 ///
-/// `o.host`, `o.port` and `o.timeout` are not used to dial. A timed out call closes the stream without sending the cancel request that `connect` sends. Fails like `connect` after the dial.
+/// `o.host`, `o.port` and `o.timeout` are not used to dial. The stream has no cancel channel to the server, so a timed out call closes the stream and `cancel` does not interrupt the server: a call fails with `sql.Error.Cancelled` only when `cancel` ran before the request was sent, between the batches of `each`, or when the server stops the statement with SQLSTATE `57014` after `cancel`. Fails like `connect` after the dial.
 pub fn connect_stream(s: io.Stream, o: sql.Options) -> sql.Connection ! sql.Error {
     open(s, o, fn(process: i64, secret: u8[]) {})
 }
 
 /// Connects to a PostgreSQL server and upgrades the connection to TLS with the `SSLRequest` exchange before authenticating. `config` sets the TLS options; an empty `server_name` is replaced with `o.host`.
 ///
-/// Returns `sql.Error.Unsupported` when the server answers that it does not do TLS and `sql.Error.Protocol` for any other answer. Otherwise fails like `connect`.
+/// Returns `sql.Error.Unsupported` when the server answers that it does not do TLS and `sql.Error.Protocol` for any other answer. Timeouts and `cancel` act as in `connect`, with the cancel request sent over a new plain TCP connection. Otherwise fails like `connect`.
 pub fn connect_tls(o: sql.Options, config: tls.Config) -> sql.Connection ! sql.Error {
     using var conn = dial(o)?
     let answer: u8[] = __make(1)
