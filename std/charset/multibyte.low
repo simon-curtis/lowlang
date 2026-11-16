@@ -1,0 +1,492 @@
+import std/io
+import std/text
+
+enum Multi {
+    ShiftJis
+    EucKr
+    Big5
+    Gb18030
+    Gbk
+}
+
+struct Table {
+    data: str
+    count: i64
+    width: i64
+}
+
+struct Step {
+    len: i64
+    c: u32
+    extra: u32
+    valid: bool
+}
+
+struct Span {
+    start: i64
+    end: i64
+}
+
+const header_size = 8
+const shift_jis_eudc_first = 8836
+const shift_jis_eudc_last = 10715
+const shift_jis_excluded_first = 8272
+const shift_jis_excluded_last = 8835
+const big5_encoder_first = 5024
+const gb18030_ranges_gap_first = 39420
+const gb18030_ranges_gap_end = 189000
+const gb18030_ranges_last = 1237575
+const gb18030_ranges_e7c7 = 7457
+
+fn index_data(multi: Multi) -> str {
+    match multi {
+        ShiftJis => embed("jis0208.bin")
+        EucKr => embed("euc-kr.bin")
+        Big5 => embed("big5.bin")
+        Gb18030 => embed("gb18030.bin")
+        Gbk => embed("gb18030.bin")
+    }
+}
+
+fn table_of(multi: Multi) -> Table {
+    let data = index_data(multi)
+    Table { data, count: i64(io.u32_le_str(data, 0)), width: i64(io.u32_le_str(data, 4)) }
+}
+
+fn code_at(t: Table, pointer: i64) -> u32 {
+    if pointer < 0 || pointer >= t.count {
+        return 0
+    }
+    let at = header_size + pointer * t.width
+    if t.width == 4 { io.u32_le_str(t.data, at) } else { u32(io.u16_le_str(t.data, at)) }
+}
+
+fn reverse_base(t: Table) -> i64 {
+    header_size + t.count * t.width
+}
+
+fn reverse_at(t: Table, i: i64) -> i64 {
+    i64(io.u16_le_str(t.data, t.reverse_base() + i * 2))
+}
+
+fn reverse_code(t: Table, i: i64) -> u32 {
+    t.code_at(t.reverse_at(i))
+}
+
+fn lower_bound(t: Table, c: u32) -> i64 {
+    var low = 0
+    var high = (t.data.len - t.reverse_base()) / 2
+    for low < high {
+        let middle = (low + high) / 2
+        if t.reverse_code(middle) < c {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    low
+}
+
+fn pointers_of(t: Table, c: u32) -> Span {
+    let start = t.lower_bound(c)
+    let entries = (t.data.len - t.reverse_base()) / 2
+    var end = start
+    for end < entries && t.reverse_code(end) == c {
+        end += 1
+    }
+    Span { start, end }
+}
+
+fn first_pointer(t: Table, c: u32) -> i64 {
+    let span = t.pointers_of(c)
+    if span.start == span.end { -1 } else { t.reverse_at(span.start) }
+}
+
+fn shift_jis_pointer(t: Table, c: u32) -> i64 {
+    let span = t.pointers_of(c)
+    for i in span.start..span.end {
+        let pointer = t.reverse_at(i)
+        if pointer < shift_jis_excluded_first || pointer > shift_jis_excluded_last {
+            return pointer
+        }
+    }
+    -1
+}
+
+fn big5_prefers_last(c: u32) -> bool {
+    c == 0x2550 || c == 0x255E || c == 0x2561 || c == 0x256A || c == 0x5341 || c == 0x5345
+}
+
+fn big5_pointer(t: Table, c: u32) -> i64 {
+    let span = t.pointers_of(c)
+    var found = -1
+    for i in span.start..span.end {
+        let pointer = t.reverse_at(i)
+        if pointer >= big5_encoder_first {
+            if !big5_prefers_last(c) {
+                return pointer
+            }
+            found = pointer
+        }
+    }
+    found
+}
+
+fn ranges_data() -> str {
+    embed("gb18030-ranges.bin")
+}
+
+fn ranges_pointer_at(i: i64) -> i64 {
+    i64(io.u32_le_str(ranges_data(), i * 8))
+}
+
+fn ranges_code_at(i: i64) -> i64 {
+    i64(io.u32_le_str(ranges_data(), i * 8 + 4))
+}
+
+fn ranges_last_at_most(value: i64, key: fn(i64) -> i64) -> i64 {
+    var low = 0
+    var high = ranges_data().len / 8
+    for low < high {
+        let middle = (low + high) / 2
+        if key(middle) <= value {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    low - 1
+}
+
+fn ranges_code_point(pointer: i64) -> u32 {
+    if pointer >= gb18030_ranges_gap_first && pointer < gb18030_ranges_gap_end || pointer > gb18030_ranges_last {
+        return 0
+    }
+    if pointer == gb18030_ranges_e7c7 {
+        return 0xE7C7
+    }
+    let i = ranges_last_at_most(pointer, ranges_pointer_at)
+    u32(ranges_code_at(i) + pointer - ranges_pointer_at(i))
+}
+
+fn ranges_pointer(c: u32) -> i64 {
+    if c == 0xE7C7 {
+        return gb18030_ranges_e7c7
+    }
+    let i = ranges_last_at_most(i64(c), ranges_code_at)
+    ranges_pointer_at(i) + i64(c) - ranges_code_at(i)
+}
+
+fn decoded(len: i64, c: u32) -> Step {
+    Step { len, c, extra: 0, valid: true }
+}
+
+fn invalid(len: i64) -> Step {
+    Step { len, c: 0, extra: 0, valid: false }
+}
+
+fn retry_len(trail: u8) -> i64 {
+    if trail < 0x80 { 1 } else { 2 }
+}
+
+fn in_range(b: u8, first: u8, last: u8) -> bool {
+    b >= first && b <= last
+}
+
+fn shift_jis_step(t: Table, data: u8[], i: i64) -> Step {
+    let lead = data[i]
+    if lead <= 0x80 {
+        return decoded(1, u32(lead))
+    }
+    if in_range(lead, 0xA1, 0xDF) {
+        return decoded(1, 0xFF61 - 0xA1 + u32(lead))
+    }
+    if !in_range(lead, 0x81, 0x9F) && !in_range(lead, 0xE0, 0xFC) || i + 1 >= data.len {
+        return invalid(1)
+    }
+    let trail = data[i + 1]
+    if in_range(trail, 0x40, 0x7E) || in_range(trail, 0x80, 0xFC) {
+        let offset = if trail < 0x7F { 0x40 } else { 0x41 }
+        let lead_offset = if lead < 0xA0 { 0x81 } else { 0xC1 }
+        let pointer = (i64(lead) - lead_offset) * 188 + i64(trail) - offset
+        if pointer >= shift_jis_eudc_first && pointer <= shift_jis_eudc_last {
+            return decoded(2, u32(0xE000 - shift_jis_eudc_first + pointer))
+        }
+        let c = t.code_at(pointer)
+        if c != 0 {
+            return decoded(2, c)
+        }
+    }
+    invalid(retry_len(trail))
+}
+
+fn euc_kr_step(t: Table, data: u8[], i: i64) -> Step {
+    let lead = data[i]
+    if lead < 0x80 {
+        return decoded(1, u32(lead))
+    }
+    if !in_range(lead, 0x81, 0xFE) || i + 1 >= data.len {
+        return invalid(1)
+    }
+    let trail = data[i + 1]
+    if in_range(trail, 0x41, 0xFE) {
+        let c = t.code_at((i64(lead) - 0x81) * 190 + i64(trail) - 0x41)
+        if c != 0 {
+            return decoded(2, c)
+        }
+    }
+    invalid(retry_len(trail))
+}
+
+fn big5_pair(pointer: i64) -> Step? {
+    match pointer {
+        1133 => Step { len: 2, c: 0xCA, extra: 0x304, valid: true }
+        1135 => Step { len: 2, c: 0xCA, extra: 0x30C, valid: true }
+        1164 => Step { len: 2, c: 0xEA, extra: 0x304, valid: true }
+        1166 => Step { len: 2, c: 0xEA, extra: 0x30C, valid: true }
+        _ => none
+    }
+}
+
+fn big5_step(t: Table, data: u8[], i: i64) -> Step {
+    let lead = data[i]
+    if lead < 0x80 {
+        return decoded(1, u32(lead))
+    }
+    if !in_range(lead, 0x81, 0xFE) || i + 1 >= data.len {
+        return invalid(1)
+    }
+    let trail = data[i + 1]
+    if in_range(trail, 0x40, 0x7E) || in_range(trail, 0xA1, 0xFE) {
+        let offset = if trail < 0x7F { 0x40 } else { 0x62 }
+        let pointer = (i64(lead) - 0x81) * 157 + i64(trail) - offset
+        match big5_pair(pointer) {
+            some(pair) => return pair
+            none => {}
+        }
+        let c = t.code_at(pointer)
+        if c != 0 {
+            return decoded(2, c)
+        }
+    }
+    invalid(retry_len(trail))
+}
+
+fn gb18030_four_step(data: u8[], i: i64) -> Step {
+    if i + 2 >= data.len {
+        return invalid(data.len - i)
+    }
+    let third = data[i + 2]
+    if !in_range(third, 0x81, 0xFE) {
+        return invalid(1)
+    }
+    if i + 3 >= data.len {
+        return invalid(data.len - i)
+    }
+    let fourth = data[i + 3]
+    if !in_range(fourth, 0x30, 0x39) {
+        return invalid(1)
+    }
+    let pointer = (i64(data[i]) - 0x81) * 12600 + (i64(data[i + 1]) - 0x30) * 1260 + (i64(third) - 0x81) * 10 + i64(fourth) - 0x30
+    let c = ranges_code_point(pointer)
+    if c == 0 { invalid(4) } else { decoded(4, c) }
+}
+
+fn gb18030_step(t: Table, data: u8[], i: i64) -> Step {
+    let lead = data[i]
+    if lead < 0x80 {
+        return decoded(1, u32(lead))
+    }
+    if lead == 0x80 {
+        return decoded(1, 0x20AC)
+    }
+    if lead == 0xFF || i + 1 >= data.len {
+        return invalid(1)
+    }
+    let trail = data[i + 1]
+    if in_range(trail, 0x30, 0x39) {
+        return gb18030_four_step(data, i)
+    }
+    if in_range(trail, 0x40, 0x7E) || in_range(trail, 0x80, 0xFE) {
+        let offset = if trail < 0x7F { 0x40 } else { 0x41 }
+        let c = t.code_at((i64(lead) - 0x81) * 190 + i64(trail) - offset)
+        if c != 0 {
+            return decoded(2, c)
+        }
+    }
+    invalid(retry_len(trail))
+}
+
+fn multi_step(multi: Multi, t: Table, data: u8[], i: i64) -> Step {
+    match multi {
+        ShiftJis => shift_jis_step(t, data, i)
+        EucKr => euc_kr_step(t, data, i)
+        Big5 => big5_step(t, data, i)
+        Gb18030 => gb18030_step(t, data, i)
+        Gbk => gb18030_step(t, data, i)
+    }
+}
+
+fn decode_multi(multi: Multi, data: u8[], strict: bool) -> str ! Error {
+    let t = table_of(multi)
+    var out: u8[] = []
+    var i = 0
+    for i < data.len {
+        let step = multi_step(multi, t, data, i)
+        if step.valid {
+            text.append_char(mut out, step.c)
+            if step.extra != 0 {
+                text.append_char(mut out, step.extra)
+            }
+        } else if strict {
+            fail Malformed(i)
+        } else {
+            text.append_char(mut out, 0xFFFD)
+        }
+        i += step.len
+    }
+    __str_view(out)
+}
+
+fn push_pair(mut out: u8[], lead: i64, trail: i64) -> bool {
+    out.push(u8(lead))
+    out.push(u8(trail))
+    true
+}
+
+fn encode_shift_jis(t: Table, mut out: u8[], c: u32) -> bool {
+    if c <= 0x80 {
+        out.push(u8(c))
+        return true
+    }
+    if c == 0xA5 {
+        out.push(0x5C)
+        return true
+    }
+    if c == 0x203E {
+        out.push(0x7E)
+        return true
+    }
+    if c >= 0xFF61 && c <= 0xFF9F {
+        out.push(u8(c - 0xFF61 + 0xA1))
+        return true
+    }
+    let wanted = if c == 0x2212 { u32(0xFF0D) } else { c }
+    let pointer = t.shift_jis_pointer(wanted)
+    if pointer < 0 {
+        return false
+    }
+    let lead = pointer / 188
+    let lead_offset = if lead < 0x1F { 0x81 } else { 0xC1 }
+    let trail = pointer % 188
+    let offset = if trail < 0x3F { 0x40 } else { 0x41 }
+    push_pair(mut out, lead + lead_offset, trail + offset)
+}
+
+fn encode_euc_kr(t: Table, mut out: u8[], c: u32) -> bool {
+    if c < 0x80 {
+        out.push(u8(c))
+        return true
+    }
+    let pointer = t.first_pointer(c)
+    if pointer < 0 {
+        return false
+    }
+    push_pair(mut out, pointer / 190 + 0x81, pointer % 190 + 0x41)
+}
+
+fn encode_big5(t: Table, mut out: u8[], c: u32) -> bool {
+    if c < 0x80 {
+        out.push(u8(c))
+        return true
+    }
+    let pointer = t.big5_pointer(c)
+    if pointer < 0 {
+        return false
+    }
+    let trail = pointer % 157
+    let offset = if trail < 0x3F { 0x40 } else { 0x62 }
+    push_pair(mut out, pointer / 157 + 0x81, trail + offset)
+}
+
+fn gb18030_private_use(c: u32) -> i64 {
+    match c {
+        0xE78D => 0xA6D9
+        0xE78E => 0xA6DA
+        0xE78F => 0xA6DB
+        0xE790 => 0xA6DC
+        0xE791 => 0xA6DD
+        0xE792 => 0xA6DE
+        0xE793 => 0xA6DF
+        0xE794 => 0xA6EC
+        0xE795 => 0xA6ED
+        0xE796 => 0xA6F3
+        0xE81E => 0xFE59
+        0xE826 => 0xFE61
+        0xE82B => 0xFE66
+        0xE82C => 0xFE67
+        0xE832 => 0xFE6D
+        0xE843 => 0xFE7E
+        0xE854 => 0xFE90
+        0xE864 => 0xFEA0
+        _ => -1
+    }
+}
+
+fn encode_gb18030(t: Table, mut out: u8[], c: u32, gbk: bool) -> bool {
+    if c < 0x80 {
+        out.push(u8(c))
+        return true
+    }
+    if c == 0xE5E5 {
+        return false
+    }
+    if gbk && c == 0x20AC {
+        out.push(0x80)
+        return true
+    }
+    let private_use = gb18030_private_use(c)
+    if private_use >= 0 {
+        return push_pair(mut out, private_use >> 8, private_use & 0xFF)
+    }
+    let pointer = t.first_pointer(c)
+    if pointer >= 0 {
+        let trail = pointer % 190
+        let offset = if trail < 0x3F { 0x40 } else { 0x41 }
+        return push_pair(mut out, pointer / 190 + 0x81, trail + offset)
+    }
+    if gbk {
+        return false
+    }
+    var rest = ranges_pointer(c)
+    out.push(u8(rest / 12600 + 0x81))
+    rest %= 12600
+    out.push(u8(rest / 1260 + 0x30))
+    rest %= 1260
+    push_pair(mut out, rest / 10 + 0x81, rest % 10 + 0x30)
+}
+
+fn encode_multi_char(multi: Multi, t: Table, mut out: u8[], c: u32) -> bool {
+    match multi {
+        ShiftJis => encode_shift_jis(t, mut out, c)
+        EucKr => encode_euc_kr(t, mut out, c)
+        Big5 => encode_big5(t, mut out, c)
+        Gb18030 => encode_gb18030(t, mut out, c, false)
+        Gbk => encode_gb18030(t, mut out, c, true)
+    }
+}
+
+fn encode_multi(multi: Multi, s: str, replacement: str, strict: bool) -> u8[] ! Error {
+    let t = table_of(multi)
+    var out: u8[] = []
+    for i, c in s {
+        if encode_multi_char(multi, t, mut out, c) {
+            continue
+        }
+        if strict {
+            fail Unmappable(i, c)
+        }
+        text.append(mut out, replacement)
+    }
+    out
+}
