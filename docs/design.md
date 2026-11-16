@@ -2695,7 +2695,7 @@ Win32:
 
 - A `Scene` holds `Quad`, `Shadow` and `Sprite` instances in device pixels, each with its clip rectangle and its draw order.
 - `push_clip` and `pop_clip` keep a stack of clip rectangles; each primitive takes the intersection of the stack.
-- A primitive's draw order is one more than the greatest draw order among the earlier primitives whose bounds, cut to the clip, it overlaps, or 1 when it overlaps none; a primitive whose cut bounds are empty is dropped. Touching edges do not overlap. A shadow's bounds are those before blurring. A grid of 64-pixel cells holds the placed bounds, so a push tests only the primitives in the cells it covers.
+- A primitive's draw order is one more than the greatest draw order among the earlier primitives whose bounds, cut to the clip, it overlaps, or 1 when it overlaps none; a primitive whose cut bounds are empty is dropped. Touching edges do not overlap. A shadow's bounds are those before blurring. A grid of 64-pixel cells holds the placed bounds, so a push tests only the primitives in the cells it covers. A quad with a transparent background is split into the four strips around its interior (the quad inset by one pixel and by the larger of each border width and corner radius, taking the larger of the two bands that leave the corners out), and each strip is placed on its own, so a primitive pushed inside the border draws below it; a quad whose interior is empty stays whole.
 - Each list is kept sorted by draw order, a primitive going after those of equal draw order. `batches` merges the three lists into runs of one kind, taking at each step the lowest draw order and, among equal ones, shadows before quads before sprites.
 
 ### Layout
