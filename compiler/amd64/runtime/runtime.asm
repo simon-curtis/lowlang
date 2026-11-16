@@ -114,8 +114,6 @@ rt_mark_bits:
 	.zero 8
 rt_mark_base:
 	.zero 8
-rt_mark_ring:
-	.zero 256
 rt_live_words:
 	.zero 8
 rt_alloc_since:
@@ -124,16 +122,20 @@ rt_gc_threshold:
 	.zero 8
 rt_dirty:
 	.zero 8
-rt_bin_bits:
-	.zero 32
 rt_bins:
 	.zero 2048
+rt_bin_tails:
+	.zero 2048
+rt_bin_bits:
+	.zero 32
+rt_free_small:
+	.zero 512
+rt_small_tails:
+	.zero 512
 rt_pin_count:
 	.zero 8
 rt_pins:
 	.zero 524288
-rt_free_small:
-	.zero 512
 	.globl rt_hash_seed
 rt_hash_seed:
 	.zero 16
@@ -143,10 +145,56 @@ rt_arg_values:
 	.zero 8
 rt_env_values:
 	.zero 8
+rt_gcw_phase:
+	.zero 8
+rt_gcw_id:
+	.zero 8
+rt_gcw_active:
+	.zero 8
+rt_gcw_ticket:
+	.zero 8
+rt_gcw_limit:
+	.zero 8
+rt_gcw_joined:
+	.zero 8
+rt_gcw_gindex:
+	.zero 8
+rt_gcw_rindex:
+	.zero 8
+rt_gcw_sweep_next:
+	.zero 8
+rt_gcw_sweep_count:
+	.zero 8
+rt_gcw_sweep_desc:
+	.zero 8
+rt_gcw_pool:
+	.zero 8
+rt_gcw_pool_commit:
+	.zero 8
+rt_gcw_commit:
+	.zero 8*MAXW
+	.zero 64
+rt_gcw_lock:
+	.zero 8
+rt_gcw_count:
+	.zero 8
+rt_gcw_busy:
+	.zero 8
+rt_gcw_done:
+	.zero 8
+	.zero 64
+rt_gcw_idle:
+	.zero 8
+	.zero 64
+rt_gcw_wake:
+	.zero 8
+rt_gcw_sleepers:
+	.zero 8
+	.zero 64
 
 	.text
 
-	.macro MARK_CANDIDATE
+	.macro MARK_CANDIDATE solo
 	mov r8, [rip+rt_heap_start]
 	cmp rdi, r8
 	jb .Lmark_done_\@
@@ -179,8 +227,13 @@ rt_env_values:
 	mov rcx, [rdx]
 	bt rcx, rax
 	jc .Lmark_done_\@
+.if \solo
 	bts rcx, rax
 	mov [rdx], rcx
+.else
+	and eax, 63
+	lock bts qword ptr [rdx], rax
+.endif
 	jmp .Lmark_done_\@
 .Lmark_search_\@:
 	call rt_find
@@ -201,11 +254,17 @@ rt_env_values:
 	mov rsi, [rcx]
 	test sil, 2
 	jnz .Lmark_done_\@
+.if \solo
 	bts rdx, rax
 	mov [r9], rdx
+.else
+	and eax, 63
+	lock bts qword ptr [r9], rax
+	jc .Lmark_done_\@
+.endif
 	mov r10, rsi
 	shr r10, 3
-	add [rip+rt_live_words], r10
+	add [rbp+W_LIVE], r10
 	test sil, 4
 	jnz .Lmark_done_\@
 	mov [r15], rcx
@@ -535,9 +594,16 @@ rt_gc_init:
 	mov rsi, 65536
 	call rt_mmap
 	mov [rip+rt_summary2], rax
-	mov rsi, 8589934592
+	mov rsi, (MAXW+1)*W_STRIDE
 	call rt_mmap_sparse
 	mov [rip+rt_mark_base], rax
+	mov rcx, MAXW*W_STRIDE
+	add rax, rcx
+	mov [rip+rt_gcw_pool], rax
+	mov [rip+rt_gcw_pool_commit], rax
+	mov rsi, SWEEP_MAX*8192
+	call rt_mmap_sparse
+	mov [rip+rt_gcw_sweep_desc], rax
 	mov rsi, 524288
 	call rt_mmap
 	mov [rip+rt_dirty], rax
@@ -624,6 +690,7 @@ rt_clear_summaries:
 	ret
 
 rt_free_chunk:
+	lea r11, [rip+rt_bins]
 	call rt_link_chunk
 	jmp rt_set_start
 
@@ -668,19 +735,26 @@ rt_link_chunk:
 2:
 	call rt_bin_of
 	add rax, r10
-	lea rcx, [rip+rt_bins]
+	mov rcx, r11
 	mov rdx, [rcx+8*rax]
 	mov [rdi+8], rdx
 	mov [rcx+8*rax], rdi
-	lea rcx, [rip+rt_bin_bits]
+	test rdx, rdx
+	jnz 3f
+	mov [rcx+BS_TAILS+8*rax], rdi
+3:
+	lea rcx, [r11+BS_BITS]
 	bts qword ptr [rcx], rax
 	ret
 4:
-	lea rcx, [rip+rt_free_small]
-	lea rcx, [rcx+8*rsi]
+	lea rcx, [r11+BS_SMALL+8*rsi]
 	mov rax, [rcx]
 	mov [rdi+8], rax
 	mov [rcx], rdi
+	test rax, rax
+	jnz 5f
+	mov [rcx+BS_SMALL_TAILS-BS_SMALL], rdi
+5:
 	ret
 
 rt_bin_of:
@@ -1385,7 +1459,7 @@ rt_find:
 	ret
 
 rt_mark:
-	MARK_CANDIDATE
+	MARK_CANDIDATE 0
 	ret
 
 rt_gc:
@@ -1394,6 +1468,7 @@ rt_gc:
 	push r13
 	push r14
 	push r15
+	push rbp
 	mov edi, TICK_ENTER
 	call rt_gc_stamp
 	TLS_GET rax, TLS_G
@@ -1402,9 +1477,8 @@ rt_gc:
 	mov edi, TICK_STOPPED
 	call rt_gc_stamp
 	call rt_alloc_retire_all
-	mov qword ptr [rip+rt_live_words], 0
 	call rt_region_hits_clear
-	mov r15, [rip+rt_mark_base]
+	call rt_gcw_start_mark
 	lea rdi, [rip+rt_pins]
 	mov rsi, [rip+rt_pin_count]
 	lea rsi, [rdi+8*rsi]
@@ -1412,65 +1486,15 @@ rt_gc:
 	lea rdi, [rip+rt_cells]
 	lea rsi, [rip+rt_cells_end]
 	call rt_scan_range
-	call rt_scan_regions
-	xor r12d, r12d
-1:
-	cmp r12, [rip+rt_ngs]
-	jae 5f
-	mov rax, [rip+rt_allgs]
-	mov rdi, [rax+8*r12]
-	inc r12
-	mov rax, [rdi+G_STATUS]
-	cmp rax, G_RUNNABLE
-	jb 1b
-	cmp rax, G_WAITING
-	ja 1b
-	call rt_scan_g
-	jmp 1b
-5:
-	xor ebx, ebx
-6:
-	cmp r15, [rip+rt_mark_base]
-	jbe 9f
-	sub r15, 8
-	mov r12, [r15]
-	mov r13, [r12]
-	shr r13, 3
-	mov r14d, 1
-7:
-	cmp r14, r13
-	jae 6b
-	mov rdi, [r12+8*r14]
-	inc r14
-	cmp rdi, [rip+rt_heap_start]
-	jb 7b
-	prefetcht0 [rdi-8]
-	mov rax, rbx
-	and eax, 31
-	lea rcx, [rip+rt_mark_ring]
-	mov rdx, [rcx+8*rax]
-	mov [rcx+8*rax], rdi
-	mov rdi, rdx
-	inc rbx
-	test rdi, rdi
-	jz 7b
-	MARK_CANDIDATE
-	jmp 7b
-9:
-	xor r13d, r13d
-10:
-	lea rcx, [rip+rt_mark_ring]
-	mov rdi, [rcx+8*r13]
-	mov qword ptr [rcx+8*r13], 0
-	inc r13
-	test rdi, rdi
-	jz 11f
-	MARK_CANDIDATE
-11:
-	cmp r13, 32
-	jb 10b
-	cmp r15, [rip+rt_mark_base]
-	ja 6b
+	call rt_gcw_roots
+	cmp qword ptr [rip+rt_gcw_limit], 1
+	jbe 13f
+	call rt_mark_loop
+	jmp 14f
+13:
+	call rt_mark_solo
+14:
+	call rt_gcw_end_mark
 	mov edi, TICK_MARKED
 	call rt_gc_stamp
 	call rt_region_reclaim
@@ -1486,9 +1510,545 @@ rt_gc:
 	call rt_gc_stats_collect
 	call rt_gc_trace_print
 12:
+	pop rbp
 	pop r15
 	pop r14
 	pop r13
+	pop r12
+	pop rbx
+	ret
+
+rt_gcw_start_mark:
+	xor eax, eax
+	mov [rip+rt_gcw_gindex], rax
+	mov [rip+rt_gcw_rindex], rax
+	mov [rip+rt_gcw_lock], rax
+	mov [rip+rt_gcw_count], rax
+	mov [rip+rt_gcw_done], rax
+	mov [rip+rt_gcw_idle], rax
+	mov qword ptr [rip+rt_gcw_busy], 1
+	mov qword ptr [rip+rt_gcw_ticket], 1
+	mov eax, MAXW
+	mov rcx, [rip+rt_ncpu]
+	test rcx, rcx
+	jz 1f
+	cmp rax, rcx
+	cmova rax, rcx
+1:
+	mov rcx, [rip+rt_nm]
+	cmp rax, rcx
+	cmova rax, rcx
+	mov ecx, 1
+	test rax, rax
+	cmovz rax, rcx
+	cmp qword ptr [rip+rt_live_words], PAR_MIN
+	cmovb rax, rcx
+	mov [rip+rt_gcw_limit], rax
+	xor edi, edi
+	call rt_gcw_enter
+	cmp qword ptr [rip+rt_gcw_limit], 1
+	jbe 2f
+	mov edi, GCW_MARK
+	call rt_gcw_publish
+2:
+	ret
+
+rt_gcw_publish:
+	push rbx
+	push r12
+	mov r12, rdi
+	inc qword ptr [rip+rt_gcw_id]
+	mov [rip+rt_gcw_phase], rdi
+	lock inc dword ptr [rip+rt_stop]
+	lea rdi, [rip+rt_stop]
+	mov esi, 0x7fffffff
+	call rt_futex_wake
+	cmp r12, GCW_MARK
+	jne 3f
+	TLS_GET r12, TLS_M
+	xor ebx, ebx
+1:
+	cmp rbx, [rip+rt_nm]
+	jae 3f
+	lea rax, [rip+rt_allm]
+	mov rdi, [rax+8*rbx]
+	inc rbx
+	cmp rdi, r12
+	je 1b
+	mov rax, [rdi+M_STATE]
+	and eax, 7
+	cmp eax, IDLE
+	jne 1b
+	add rdi, M_PARK
+	mov esi, 1
+	call rt_futex_wake
+	jmp 1b
+3:
+	pop r12
+	pop rbx
+	ret
+
+rt_gcw_finish:
+	xor eax, eax
+	xchg [rip+rt_gcw_phase], rax
+1:
+	cmp qword ptr [rip+rt_gcw_active], 0
+	je 2f
+	pause
+	jmp 1b
+2:
+	ret
+
+rt_gcw_end_mark:
+	call rt_gcw_finish
+	mov rcx, [rip+rt_gcw_ticket]
+	mov [rip+rt_gcw_joined], rcx
+	xor eax, eax
+	xor edx, edx
+	mov r8, [rip+rt_mark_base]
+1:
+	cmp rdx, rcx
+	jae 2f
+	mov rsi, rdx
+	shl rsi, W_SHIFT
+	add rax, [r8+rsi+W_LIVE]
+	inc rdx
+	jmp 1b
+2:
+	mov [rip+rt_live_words], rax
+	ret
+
+rt_gcw_enter:
+	mov rbp, rdi
+	shl rbp, W_SHIFT
+	add rbp, [rip+rt_mark_base]
+	lea rcx, [rip+rt_gcw_commit]
+	mov rax, [rcx+8*rdi]
+	test rax, rax
+	jnz 1f
+	push rdi
+	push rcx
+	mov rdi, rbp
+	mov esi, W_STACK+W_GROW
+	call rt_mark_commit
+	pop rcx
+	pop rdi
+	lea rax, [rbp+W_STACK+W_GROW]
+	mov [rcx+8*rdi], rax
+1:
+	mov [rbp+W_COMMIT], rax
+	lea rax, [rbp+W_STACK]
+	mov [rbp+W_BASE], rax
+	mov [rbp+W_LO], rax
+	mov r15, rax
+	mov rax, W_STRIDE
+	add rax, rbp
+	mov [rbp+W_END], rax
+	mov qword ptr [rbp+W_LIVE], 0
+	lea rdi, [rbp+W_RING]
+	mov ecx, 32
+	xor eax, eax
+	rep stosq
+	ret
+
+rt_mark_grow:
+	cmp rax, [rbp+W_END]
+	ja rt_panic_oom
+	mov rdi, [rbp+W_COMMIT]
+	lea rsi, [rax+W_GROW]
+	mov rdx, [rbp+W_END]
+	cmp rsi, rdx
+	cmova rsi, rdx
+	mov [rbp+W_COMMIT], rsi
+	mov rax, rbp
+	sub rax, [rip+rt_mark_base]
+	shr rax, W_SHIFT
+	lea rcx, [rip+rt_gcw_commit]
+	mov [rcx+8*rax], rsi
+	sub rsi, rdi
+	jmp rt_mark_commit
+
+rt_gcw_pool_grow:
+	mov rax, [rip+rt_gcw_pool]
+	mov rcx, W_STRIDE
+	add rax, rcx
+	cmp rdi, rax
+	ja rt_panic_oom
+	mov rdi, [rip+rt_gcw_pool_commit]
+	lea rsi, [rdi+W_GROW]
+	cmp rsi, rax
+	cmova rsi, rax
+	mov [rip+rt_gcw_pool_commit], rsi
+	sub rsi, rdi
+	jmp rt_mark_commit
+
+rt_gcw_lock_acquire:
+1:
+	mov eax, 1
+	xchg [rip+rt_gcw_lock], rax
+	test rax, rax
+	jz 3f
+2:
+	pause
+	cmp qword ptr [rip+rt_gcw_lock], 0
+	jne 2b
+	jmp 1b
+3:
+	ret
+
+rt_gcw_take_locked:
+	mov rdx, [rip+rt_gcw_count]
+	mov ecx, POOL_TAKE
+	cmp rdx, rcx
+	cmovb rcx, rdx
+	sub rdx, rcx
+	mov [rip+rt_gcw_count], rdx
+	mov rsi, [rip+rt_gcw_pool]
+	lea rsi, [rsi+8*rdx]
+	mov rdi, [rbp+W_BASE]
+	mov [rbp+W_LO], rdi
+	lea r15, [rdi+8*rcx]
+	shl rcx, 3
+	rep movsb
+	ret
+
+rt_gcw_acquire:
+	call rt_gcw_lock_acquire
+	cmp qword ptr [rip+rt_gcw_count], 0
+	je 1f
+	call rt_gcw_take_locked
+	mov qword ptr [rip+rt_gcw_lock], 0
+	mov eax, 1
+	ret
+1:
+	dec qword ptr [rip+rt_gcw_busy]
+	inc qword ptr [rip+rt_gcw_idle]
+	cmp qword ptr [rip+rt_gcw_busy], 0
+	jne 2f
+	mov qword ptr [rip+rt_gcw_done], 1
+	mov qword ptr [rip+rt_gcw_lock], 0
+	call rt_gcw_signal
+	xor eax, eax
+	ret
+2:
+	mov qword ptr [rip+rt_gcw_lock], 0
+	xor eax, eax
+	ret
+
+rt_gcw_resume:
+	call rt_gcw_lock_acquire
+	cmp qword ptr [rip+rt_gcw_count], 0
+	je 1f
+	call rt_gcw_take_locked
+	inc qword ptr [rip+rt_gcw_busy]
+	dec qword ptr [rip+rt_gcw_idle]
+	mov qword ptr [rip+rt_gcw_lock], 0
+	mov eax, 1
+	ret
+1:
+	mov qword ptr [rip+rt_gcw_lock], 0
+	xor eax, eax
+	ret
+
+rt_gcw_join_busy:
+	call rt_gcw_lock_acquire
+	xor eax, eax
+	cmp qword ptr [rip+rt_gcw_done], 0
+	jne 1f
+	inc qword ptr [rip+rt_gcw_busy]
+	mov eax, 1
+1:
+	mov qword ptr [rip+rt_gcw_lock], 0
+	ret
+
+rt_gcw_donate:
+	push rbx
+	mov rbx, r15
+	sub rbx, [rbp+W_LO]
+	shr rbx, 4
+	mov eax, POOL_BATCH
+	cmp rbx, rax
+	cmova rbx, rax
+	call rt_gcw_lock_acquire
+	mov rax, [rip+rt_gcw_count]
+	mov rsi, [rip+rt_gcw_pool]
+	lea rdi, [rsi+8*rax]
+	lea rdi, [rdi+8*rbx]
+	cmp rdi, [rip+rt_gcw_pool_commit]
+	jbe 1f
+	call rt_gcw_pool_grow
+1:
+	mov rax, [rip+rt_gcw_count]
+	mov rsi, [rip+rt_gcw_pool]
+	lea rdi, [rsi+8*rax]
+	mov rsi, [rbp+W_LO]
+	lea rcx, [8*rbx]
+	rep movsb
+	add rax, rbx
+	mov [rip+rt_gcw_count], rax
+	mov qword ptr [rip+rt_gcw_lock], 0
+	call rt_gcw_signal
+	lea rax, [8*rbx]
+	add [rbp+W_LO], rax
+	mov rax, [rbp+W_LO]
+	sub rax, [rbp+W_BASE]
+	cmp rax, W_CREEP
+	jb 2f
+	mov rdx, r15
+	sub rdx, [rbp+W_LO]
+	cmp rax, rdx
+	jb 2f
+	mov rsi, [rbp+W_LO]
+	mov rdi, [rbp+W_BASE]
+	mov rcx, rdx
+	rep movsb
+	mov rax, [rbp+W_BASE]
+	mov [rbp+W_LO], rax
+	add rax, rdx
+	mov r15, rax
+2:
+	pop rbx
+	ret
+
+	.macro MARK_DRAIN solo
+	push rbx
+	push r12
+	push r13
+	push r14
+	xor ebx, ebx
+6:
+	cmp r15, [rbp+W_LO]
+	jbe 9f
+.if \solo
+.else
+	cmp qword ptr [rip+rt_gcw_idle], 0
+	jne 20f
+.endif
+21:
+	sub r15, 8
+	mov r12, [r15]
+	mov r13, [r12]
+	shr r13, 3
+	lea rax, [r15+8*r13+512]
+	cmp rax, [rbp+W_COMMIT]
+	ja 22f
+23:
+	mov r14d, 1
+7:
+	cmp r14, r13
+	jae 6b
+	mov rdi, [r12+8*r14]
+	inc r14
+	cmp rdi, [rip+rt_heap_start]
+	jb 7b
+	prefetcht0 [rdi-8]
+	mov rax, rbx
+	and eax, 31
+	lea rcx, [rbp+W_RING]
+	mov rdx, [rcx+8*rax]
+	mov [rcx+8*rax], rdi
+	mov rdi, rdx
+	inc rbx
+	test rdi, rdi
+	jz 7b
+	MARK_CANDIDATE \solo
+	jmp 7b
+.if \solo
+.else
+20:
+	cmp qword ptr [rip+rt_gcw_count], 0
+	jne 21b
+	mov rax, r15
+	sub rax, [rbp+W_LO]
+	cmp rax, 8*HUNGRY_MIN
+	jb 21b
+	call rt_gcw_donate
+	jmp 6b
+.endif
+22:
+	call rt_mark_grow
+	jmp 23b
+9:
+	xor r13d, r13d
+10:
+	lea rcx, [rbp+W_RING]
+	mov rdi, [rcx+8*r13]
+	mov qword ptr [rcx+8*r13], 0
+	inc r13
+	test rdi, rdi
+	jz 11f
+	MARK_CANDIDATE \solo
+11:
+	cmp r13, 32
+	jb 10b
+	cmp r15, [rbp+W_LO]
+	ja 6b
+.if \solo
+.else
+	call rt_gcw_acquire
+	test eax, eax
+	jnz 6b
+	xor r12d, r12d
+31:
+	cmp qword ptr [rip+rt_gcw_done], 0
+	jne 40f
+	cmp qword ptr [rip+rt_gcw_count], 0
+	je 32f
+	call rt_gcw_resume
+	test eax, eax
+	jnz 6b
+32:
+	inc r12d
+	cmp r12d, GCW_SPIN
+	jae 33f
+	pause
+	jmp 31b
+33:
+	call rt_gcw_sleep
+	xor r12d, r12d
+	jmp 31b
+.endif
+40:
+	pop r14
+	pop r13
+	pop r12
+	pop rbx
+	ret
+	.endm
+
+rt_mark_loop:
+	MARK_DRAIN 0
+
+rt_mark_solo:
+	MARK_DRAIN 1
+
+rt_gcw_sleep:
+	lock inc qword ptr [rip+rt_gcw_sleepers]
+	mov esi, [rip+rt_gcw_wake]
+	cmp qword ptr [rip+rt_gcw_done], 0
+	jne 1f
+	cmp qword ptr [rip+rt_gcw_count], 0
+	jne 1f
+	lea rdi, [rip+rt_gcw_wake]
+	call rt_futex_wait
+1:
+	lock dec qword ptr [rip+rt_gcw_sleepers]
+	ret
+
+rt_gcw_signal:
+	lock inc dword ptr [rip+rt_gcw_wake]
+	cmp qword ptr [rip+rt_gcw_sleepers], 0
+	je 1f
+	lea rdi, [rip+rt_gcw_wake]
+	mov esi, 0x7fffffff
+	call rt_futex_wake
+1:
+	ret
+
+rt_gcw_roots:
+	push rbx
+	push r12
+1:
+	mov rax, [rip+rt_gcw_gindex]
+	cmp rax, [rip+rt_ngs]
+	jae 4f
+	lea rcx, [rax+ROOT_BATCH]
+	lock cmpxchg [rip+rt_gcw_gindex], rcx
+	jne 1b
+	mov rbx, rax
+	lea r12, [rax+ROOT_BATCH]
+	mov rcx, [rip+rt_ngs]
+	cmp r12, rcx
+	cmova r12, rcx
+2:
+	cmp rbx, r12
+	jae 1b
+	mov rax, [rip+rt_allgs]
+	mov rdi, [rax+8*rbx]
+	inc rbx
+	mov rax, [rdi+G_STATUS]
+	cmp rax, G_RUNNABLE
+	jb 2b
+	cmp rax, G_WAITING
+	ja 2b
+	call rt_scan_g
+	jmp 2b
+4:
+	mov rax, [rip+rt_gcw_rindex]
+	cmp rax, [rip+rt_region_count]
+	jae 6f
+	lea rcx, [rax+1]
+	lock cmpxchg [rip+rt_gcw_rindex], rcx
+	jne 4b
+	mov rdx, [rip+rt_region_list]
+	mov rdi, [rdx+8*rax]
+	call rt_scan_region
+	jmp 4b
+6:
+	pop r12
+	pop rbx
+	ret
+
+rt_gcw_join:
+	SAVE_ALL
+	lock inc qword ptr [rip+rt_gcw_active]
+	mov r12, [rip+rt_gcw_phase]
+	mov r13, [rip+rt_gcw_id]
+	test r12, r12
+	jz 9f
+	TLS_GET r14, TLS_M
+	cmp r13, [r14+M_GCSEQ]
+	je 9f
+	cmp [rip+rt_gcw_phase], r12
+	jne 9f
+	cmp [rip+rt_gcw_id], r13
+	jne 9f
+	mov [r14+M_GCSEQ], r13
+	cmp r12, GCW_SWEEP
+	je 7f
+1:
+	mov rax, [rip+rt_gcw_ticket]
+	cmp rax, [rip+rt_gcw_limit]
+	jae 9f
+	lea rcx, [rax+1]
+	lock cmpxchg [rip+rt_gcw_ticket], rcx
+	jne 1b
+	mov rdi, rax
+	call rt_gcw_enter
+	call rt_gcw_join_busy
+	test eax, eax
+	jz 9f
+	call rt_gcw_roots
+	call rt_mark_loop
+	jmp 9f
+7:
+	call rt_sweep_worker
+9:
+	lock dec qword ptr [rip+rt_gcw_active]
+	RESTORE_ALL
+	ret
+
+rt_scan_region:
+	push rbx
+	push r12
+	mov r12, rdi
+	mov rbx, [r12+R_CHUNKS]
+2:
+	test rbx, rbx
+	jz 5f
+	test byte ptr [rbx+CH_KIND], 1
+	jz 4f
+	lea rdi, [rbx+CH_SIZE]
+	mov rsi, [rbx+CH_USED]
+	cmp rbx, [r12+R_SCAN_CHUNK]
+	jne 3f
+	mov rsi, [r12+R_SCAN_BUMP]
+3:
+	call rt_scan_range
+4:
+	mov rbx, [rbx+CH_NEXT]
+	jmp 2b
+5:
 	pop r12
 	pop rbx
 	ret
@@ -1500,6 +2060,11 @@ rt_scan_g:
 	push r14
 	push qword ptr [rdi+G_HI]
 	mov rbx, rdi
+	lea rax, [r15+2097152]
+	cmp rax, [rbp+W_COMMIT]
+	jbe 9f
+	call rt_mark_grow
+9:
 	mov rdi, [rbx+G_CTX]
 	call rt_mark
 	cmp qword ptr [rbx+G_PC], 0
@@ -1641,12 +2206,17 @@ rt_scan_range:
 	push r12
 	mov rbx, rdi
 	mov r12, rsi
+	lea rax, [r15+r12]
+	sub rax, rbx
+	cmp rax, [rbp+W_COMMIT]
+	jbe 1f
+	call rt_mark_grow
 1:
 	cmp rbx, r12
 	jae 2f
 	mov rdi, [rbx]
 	add rbx, 8
-	MARK_CANDIDATE
+	MARK_CANDIDATE 0
 	jmp 1b
 2:
 	pop r12
@@ -1681,21 +2251,85 @@ rt_lookup_map:
 	ret
 
 rt_sweep:
-	lea rdi, [rip+rt_free_small]
-	mov ecx, 64
+	push rbx
+	push r12
+	lea rdi, [rip+rt_bins]
+	mov ecx, BS_SIZE/8
 	xor eax, eax
 	rep stosq
-	lea rdi, [rip+rt_bin_bits]
-	mov ecx, 260
-	rep stosq
+	mov rax, [rip+rt_heap_bump]
+	sub rax, [rip+rt_heap_start]
+	add rax, 511
+	shr rax, 9
+	add rax, SWEEP_WORDS-1
+	shr rax, SWEEP_SHIFT
+	mov [rip+rt_gcw_sweep_count], rax
+	mov qword ptr [rip+rt_gcw_sweep_next], 0
+	test rax, rax
+	jz 1f
+	mov rdi, [rip+rt_gcw_sweep_desc]
+	mov rsi, rax
+	shl rsi, 13
+	call rt_mark_commit
+	cmp qword ptr [rip+rt_gcw_sweep_count], 1
+	jbe 1f
+	cmp qword ptr [rip+rt_gcw_limit], 1
+	jbe 1f
+	mov edi, GCW_SWEEP
+	call rt_gcw_publish
+1:
+	call rt_sweep_worker
+	call rt_gcw_finish
+	call rt_sweep_combine
+	mov rax, [rip+rt_live_words]
+	call rt_gc_set_threshold
+	mov qword ptr [rip+rt_alloc_since], 0
+	pop r12
+	pop rbx
+	ret
+
+rt_sweep_worker:
+	push rbx
+1:
+	mov rax, [rip+rt_gcw_sweep_next]
+	cmp rax, [rip+rt_gcw_sweep_count]
+	jae 2f
+	lea rcx, [rax+1]
+	lock cmpxchg [rip+rt_gcw_sweep_next], rcx
+	jne 1b
+	mov rdi, rax
+	call rt_sweep_range
+	jmp 1b
+2:
+	pop rbx
+	ret
+
+rt_sweep_range:
+	push rbx
+	push r12
+	push r13
+	push r14
+	push r15
 	push rbp
-	xor r13d, r13d
-	xor r14d, r14d
+	mov r14, rdi
+	shl r14, SWEEP_SHIFT
+	lea rax, [r14+SWEEP_WORDS]
+	push rax
+	mov r15, rdi
+	shl r15, 13
+	add r15, [rip+rt_gcw_sweep_desc]
+	mov rdi, r15
+	mov ecx, D_SIZE/8
+	xor eax, eax
+	rep stosq
+	mov r13, -1
 1:
 	mov rdi, r14
 	call rt_next_word
 	cmp rax, -1
 	je 5f
+	cmp rax, [rsp]
+	jae 5f
 	mov r14, rax
 	mov rax, [rip+rt_bitmap]
 	mov rdx, [rax+8*r14]
@@ -1706,7 +2340,22 @@ rt_sweep:
 	not r12
 	and r12, rdx
 	mov rbp, -1
+	cmp r13, -1
+	jne 2f
+	cmp qword ptr [r15+D_FIRST], 0
+	jne 2f
+	bsf rcx, rdx
+	bt r12, rcx
+	jnc 2f
+	mov rax, r14
+	shl rax, 6
+	add rax, rcx
+	mov rcx, [rip+rt_heap_start]
+	lea rax, [rcx+8*rax]
+	mov [r15+D_FIRST], rax
 2:
+	cmp r13, -1
+	je 8f
 	test r13, r13
 	jnz 4f
 	mov rax, r12
@@ -1739,7 +2388,24 @@ rt_sweep:
 	mov rdi, r13
 	sub rsi, r13
 	shr rsi, 3
+	mov r11, r15
 	call rt_link_chunk
+	xor r13d, r13d
+	jmp 2b
+8:
+	mov rax, rbx
+	and rax, rbp
+	jz 7f
+	bsf rcx, rax
+	mov rdx, -2
+	shl rdx, cl
+	and rbp, rdx
+	mov rdx, r14
+	shl rdx, 6
+	add rdx, rcx
+	mov rsi, [rip+rt_heap_start]
+	lea rsi, [rsi+8*rdx]
+	mov [r15+D_MARKED], rsi
 	xor r13d, r13d
 	jmp 2b
 7:
@@ -1751,23 +2417,110 @@ rt_sweep:
 	mov rax, [rip+rt_bitmap]
 	mov [rax+8*r14], rbx
 	test rbx, rbx
-	jnz 8f
+	jnz 9f
 	mov rdx, r14
 	call rt_clear_summaries
-8:
+9:
 	inc r14
 	jmp 1b
 5:
-	test r13, r13
-	jz 3f
-	mov [rip+rt_heap_bump], r13
-	mov rdi, r13
-	call rt_clear_start
+	cmp r13, 0
+	jle 3f
+	mov [r15+D_TRAIL], r13
 3:
+	add rsp, 8
 	pop rbp
-	mov rax, [rip+rt_live_words]
-	call rt_gc_set_threshold
-	mov qword ptr [rip+rt_alloc_since], 0
+	pop r15
+	pop r14
+	pop r13
+	pop r12
+	pop rbx
+	ret
+
+rt_sweep_combine:
+	push rbx
+	push r12
+	push r13
+	push r14
+	xor ebx, ebx
+	xor r12d, r12d
+1:
+	cmp rbx, [rip+rt_gcw_sweep_count]
+	jae 9f
+	mov r13, rbx
+	shl r13, 13
+	add r13, [rip+rt_gcw_sweep_desc]
+	mov r14, [r13+D_MARKED]
+	test r14, r14
+	jz 4f
+	mov rdi, r12
+	test rdi, rdi
+	jnz 2f
+	mov rdi, [r13+D_FIRST]
+	test rdi, rdi
+	jz 3f
+	call rt_set_start
+2:
+	mov rsi, r14
+	sub rsi, rdi
+	shr rsi, 3
+	lea r11, [rip+rt_bins]
+	call rt_link_chunk
+3:
+	mov r12, [r13+D_TRAIL]
+	jmp 5f
+4:
+	test r12, r12
+	jnz 5f
+	mov r12, [r13+D_FIRST]
+	test r12, r12
+	jz 5f
+	mov rdi, r12
+	call rt_set_start
+5:
+	xor ecx, ecx
+6:
+	mov rax, [r13+BS_BINS+8*rcx]
+	test rax, rax
+	jz 7f
+	mov rdx, [r13+BS_TAILS+8*rcx]
+	lea rsi, [rip+rt_bins]
+	mov rdi, [rsi+8*rcx]
+	mov [rdx+8], rdi
+	mov [rsi+8*rcx], rax
+	lea rsi, [rip+rt_bin_bits]
+	bts qword ptr [rsi], rcx
+7:
+	inc ecx
+	cmp ecx, 256
+	jb 6b
+	xor ecx, ecx
+8:
+	mov rax, [r13+BS_SMALL+8*rcx]
+	test rax, rax
+	jz 10f
+	mov rdx, [r13+BS_SMALL_TAILS+8*rcx]
+	lea rsi, [rip+rt_free_small]
+	mov rdi, [rsi+8*rcx]
+	mov [rdx+8], rdi
+	mov [rsi+8*rcx], rax
+10:
+	inc ecx
+	cmp ecx, 64
+	jb 8b
+	inc rbx
+	jmp 1b
+9:
+	test r12, r12
+	jz 11f
+	mov [rip+rt_heap_bump], r12
+	mov rdi, r12
+	call rt_clear_start
+11:
+	pop r14
+	pop r13
+	pop r12
+	pop rbx
 	ret
 
 	.section .rodata

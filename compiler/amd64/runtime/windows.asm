@@ -160,6 +160,11 @@ rt_commit:
 	jz rt_panic_oom
 	ret
 
+rt_mark_commit:
+	mov rcx, rdi
+	mov rdx, rsi
+	jmp rt_commit
+
 rt_region_commit:
 	mov rcx, rdi
 	mov rdx, rsi
@@ -235,14 +240,6 @@ rt_heap_commit:
 	sub rdx, r12
 	shr rdx, 15
 	add rdx, 8
-	call rt_commit
-	mov rcx, r12
-	sub rcx, rbx
-	shr rcx, 1
-	add rcx, [rip+rt_mark_base]
-	mov rdx, r13
-	sub rdx, r12
-	shr rdx, 1
 	call rt_commit
 	mov [rip+rt_heap_committed], r13
 	pop r13

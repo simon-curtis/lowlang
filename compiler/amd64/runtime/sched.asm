@@ -96,10 +96,20 @@ rt_spin_unlock:
 rt_gc_wait:
 	push rdi
 1:
-	cmp dword ptr [rip+rt_stop], 0
-	je 2f
+	mov eax, [rip+rt_stop]
+	test eax, eax
+	jz 2f
+	cmp qword ptr [rip+rt_gcw_phase], 0
+	je 3f
+	TLS_GET rcx, TLS_M
+	mov rdx, [rip+rt_gcw_id]
+	cmp rdx, [rcx+M_GCSEQ]
+	je 3f
+	call rt_gcw_join
+	jmp 1b
+3:
 	lea rdi, [rip+rt_stop]
-	mov esi, 1
+	mov esi, eax
 	call rt_futex_wait
 	jmp 1b
 2:
@@ -1324,6 +1334,11 @@ rt_schedule:
 7:
 	cmp qword ptr [rbx+M_PARK], 0
 	jne 1b
+	cmp dword ptr [rip+rt_stop], 0
+	je 8f
+	call rt_gc_wait
+	jmp 7b
+8:
 	lea rdi, [rbx+M_PARK]
 	xor esi, esi
 	call rt_futex_wait

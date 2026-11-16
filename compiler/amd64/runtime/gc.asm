@@ -13,6 +13,7 @@ rt_trace_labels:
 	.asciz " heap_kb="
 	.asciz " slow_allocs="
 	.asciz " refills="
+	.asciz " workers="
 
 	.bss
 	.p2align 3
@@ -25,7 +26,7 @@ rt_gc_count:
 rt_gc_ticks:
 	.zero 8*5
 rt_trace_values:
-	.zero 8*7
+	.zero 8*8
 rt_stat_slow:
 	.zero 8
 rt_stat_refills:
@@ -252,39 +253,6 @@ rt_region_reclaim:
 5:
 	mov [rip+rt_rq_count], r12
 	pop r14
-	pop r13
-	pop r12
-	pop rbx
-	ret
-
-rt_scan_regions:
-	push rbx
-	push r12
-	push r13
-	xor ebx, ebx
-1:
-	cmp rbx, [rip+rt_region_count]
-	jae 5f
-	mov rax, [rip+rt_region_list]
-	mov r12, [rax+8*rbx]
-	inc rbx
-	mov r13, [r12+R_CHUNKS]
-2:
-	test r13, r13
-	jz 1b
-	test byte ptr [r13+CH_KIND], 1
-	jz 4f
-	lea rdi, [r13+CH_SIZE]
-	mov rsi, [r13+CH_USED]
-	cmp r13, [r12+R_SCAN_CHUNK]
-	jne 3f
-	mov rsi, [r12+R_SCAN_BUMP]
-3:
-	call rt_scan_range
-4:
-	mov r13, [r13+CH_NEXT]
-	jmp 2b
-5:
 	pop r13
 	pop r12
 	pop rbx
@@ -733,7 +701,7 @@ rt_spawn_region:
 rt_gc_trace_print:
 	push rbx
 	push r12
-	sub rsp, 256
+	sub rsp, 384
 	lea rcx, [rip+rt_gc_ticks]
 	lea rdx, [rip+rt_trace_values]
 	mov rax, [rcx+8*TICK_RESUMED]
@@ -765,6 +733,8 @@ rt_gc_trace_print:
 	sub rax, [rip+rt_heap_start]
 	shr rax, 10
 	mov [rdx+32], rax
+	mov rax, [rip+rt_gcw_joined]
+	mov [rdx+56], rax
 	mov rdi, rsp
 	lea rsi, [rip+rt_trace_head]
 	call rt_append_str
@@ -783,7 +753,7 @@ rt_gc_trace_print:
 	call rt_append_u64
 	pop rcx
 	inc ecx
-	cmp ecx, 7
+	cmp ecx, 8
 	jb 2b
 	mov byte ptr [rdi], 10
 	inc rdi
@@ -792,7 +762,7 @@ rt_gc_trace_print:
 	sub rdx, rsi
 	mov edi, 2
 	call rt_write
-	add rsp, 256
+	add rsp, 384
 	pop r12
 	pop rbx
 	ret
