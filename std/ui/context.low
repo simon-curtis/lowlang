@@ -49,8 +49,16 @@ struct State {
     focus: str = ""
     scroll: [str: geometry.Point] = [:]
     window_focused: bool = false
+    fields: [str: *FieldState] = [:]
+    drag: str = ""
+    caret: platform.Caret? = none
+    applied_caret: platform.Caret? = none
+    applied_cursor: platform.Cursor = platform.Cursor.Arrow
+    memory: str? = none
     posts: chan[fn()]
     wake: fn()
+    copy: fn(str)
+    paste: fn() -> str?
 }
 
 /// The state of one user interface apart from its window: the signals' owner, the text system, and what the pointer and the keyboard are on.
@@ -72,8 +80,47 @@ fn default_text_style() -> TextStyle {
 
 /// Returns a context with no window whose frames clear to `background`.
 pub fn headless(background: geometry.Color) -> Context {
-    let state = new(State { text: uitext.default_system(), background, posts: chan[fn()](1024), wake: fn() {} })
+    let state = new(State {
+        text: uitext.default_system()
+        background
+        posts: chan[fn()](1024)
+        wake: fn() {}
+        copy: fn(s: str) {}
+        paste: fn() -> str? { none }
+    })
+    state.copy = fn(s: str) { state.memory = s }
+    state.paste = fn() -> str? { state.memory }
     Context { state }
+}
+
+/// Returns the text on the clipboard, the system's when the context has a window, or `none` when it holds no text.
+pub fn clipboard(cx: Context) -> str? {
+    cx.state.paste()
+}
+
+/// Puts `s` on the clipboard, the system's when the context has a window.
+pub fn set_clipboard(cx: Context, s: str) {
+    cx.state.copy(s)
+}
+
+/// Returns the shape the pointer should have: that of the innermost element under it that sets a `cursor`, or the arrow.
+pub fn pointer_cursor(cx: Context) -> platform.Cursor {
+    let st = cx.state
+    var i = topmost(st)
+    for i >= 0 {
+        let h = st.hitboxes[i]
+        match h.element.cursor {
+            some(shape) => return shape
+            none => {}
+        }
+        i = h.parent
+    }
+    platform.Cursor.Arrow
+}
+
+/// Returns where the text caret of the focused field is as of the last frame, for an input method to place its candidate window beside, or `none` when no field is focused.
+pub fn text_input(cx: Context) -> platform.Caret? {
+    cx.state.caret
 }
 
 /// Returns `true` while a frame is due: after a signal changed, a closure was posted, the window changed size, or the element under the pointer or the focused element changed.
@@ -160,6 +207,7 @@ pub fn frame(cx: Context, render: fn() -> Element, size: geometry.Size, scale: f
     let device_height = i64(floor(size.height * scale + 0.5))
     var sc = scene.empty(device_width, device_height, st.background)
     st.painted = 0
+    st.caret = none
     paint(st, t, mut sc, laid, whole, default_text_style(), scale)
     sc
 }
@@ -180,7 +228,7 @@ fn clips(s: layout.Style) -> bool {
 }
 
 fn interactive(e: Element) -> bool {
-    e.focusable || e.listeners.len > 0 || e.conditionals.len > 0 || scrolls(e.style)
+    e.focusable || e.listeners.len > 0 || e.conditionals.len > 0 || scrolls(e.style) || e.cursor != none
 }
 
 fn larger(a: f32, b: f32) -> f32 {
@@ -201,6 +249,12 @@ fn build(st: *State, mut t: layout.Tree, e: Element, ts: TextStyle) -> Laid {
         let content = e.content
         let size = own.size
         let measure = fn(w: f32) -> geometry.Size { uitext.measure(mut st.text, content, size, w) }
+        return Laid { node: layout.leaf(mut t, e.style, measure), element: e, children: [] }
+    }
+    if is_field(e) {
+        let content = e.content
+        let size = own.size
+        let measure = fn(w: f32) -> geometry.Size { uitext.measure(mut st.text, content, size, layout.unbounded) }
         return Laid { node: layout.leaf(mut t, e.style, measure), element: e, children: [] }
     }
     var kids: Laid[] = []
@@ -228,7 +282,7 @@ fn prepaint(st: *State, t: layout.Tree, laid: Laid, key_path: str, w: Walk) {
         inner.parent = st.hitboxes.len - 1
         inner.shift = geometry.point(w.shift.x - offset.x, w.shift.y - offset.y)
     }
-    if is_text(e) {
+    if is_text(e) || is_field(e) {
         return
     }
     if clips(e.style) {
@@ -295,8 +349,9 @@ fn paint(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, w: Walk, t
     }
     var visual = e.visual
     var inner = w
+    var at = -1
     if interactive(e) {
-        let at = st.painted
+        at = st.painted
         st.painted += 1
         visual = styled(st, at, e)
         let offset = st.hitboxes[at].offset
@@ -309,6 +364,11 @@ fn paint(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, w: Walk, t
         let content = geometry.offset(layout.content(t, laid.node), w.shift.x, w.shift.y)
         let lines = uitext.wrap(mut st.text, e.content, own.size, content.width)
         uitext.paint(mut st.text, mut sc, lines, geometry.point(content.x, content.y), own.color, scale)
+        return
+    }
+    if is_field(e) {
+        let content = geometry.offset(layout.content(t, laid.node), w.shift.x, w.shift.y)
+        paint_field(st, mut sc, e, at, content, own, scale)
         return
     }
     let clipping = clips(e.style)
@@ -454,6 +514,8 @@ pub fn dispatch(cx: Context, event: platform.Event) {
         }
         Scrolled(dx, dy) => scroll_wheel(st, dx, dy)
         Key(k) => key(st, k)
+        Preedit(s, range) => field_preedit(st, s, range)
+        Commit(s) => field_commit(st, s)
         FocusChanged(focused) => {
             st.window_focused = focused
         }
@@ -466,6 +528,7 @@ fn move_pointer(st: *State, x: f32, y: f32) {
     st.pointer = geometry.point(x, y)
     st.pointer_inside = true
     refresh_hover(st)
+    field_drag(st)
 }
 
 fn mouse_down(st: *State, button: platform.Button) {
@@ -481,6 +544,7 @@ fn mouse_down(st: *State, button: platform.Button) {
     }
     st.dirty = true
     focus_under_pointer(st)
+    field_press(st)
 }
 
 fn focus_under_pointer(st: *State) {
@@ -500,6 +564,7 @@ fn mouse_up(st: *State, button: platform.Button) {
         return
     }
     st.held = none
+    st.drag = ""
     let pressed = st.pressed
     st.pressed = [:]
     st.dirty = true
@@ -571,9 +636,14 @@ fn scroll_by(st: *State, at: i64, dx: f32, dy: f32) -> bool {
 
 fn key(st: *State, k: platform.KeyEvent) {
     var at = find(st, st.focus)
+    var innermost = true
     var handled = false
     for at >= 0 && !handled {
         handled = run_keys(st.hitboxes[at].element, k)
+        if !handled && innermost {
+            handled = field_key(st, at, k)
+        }
+        innermost = false
         at = st.hitboxes[at].parent
     }
     if handled || !k.pressed {
