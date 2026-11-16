@@ -2561,8 +2561,8 @@ Mechanism:
 | `std/ui/gpu` | The Vulkan renderer, its shaders, offscreen targets and swapchains, and the generated Vulkan bindings. |
 | `std/ui/platform` | Windows, input events and the waiting loop: Wayland, xkbcommon and the generated Wayland bindings on Linux, user32 and kernel32 on Windows. |
 
-- `std/ui/geometry`, `std/ui/layout`, `std/ui/font`, `std/ui/text`, `std/ui/scene` and, apart from `open` and `run`, `std/ui` only compute, so they run on both targets with no library.
-- `std/ui/gpu` and `std/ui/platform` hold one file per target for what differs, `surface_linux.low` and `surface_windows.low`, `wayland_linux.low` and `win32_windows.low`, behind one API (see Modules under Syntax).
+- `std/ui/geometry`, `std/ui/layout`, `std/ui/font`, `std/ui/text`, `std/ui/scene` and, apart from `open` and `run`, `std/ui` only compute, so they run on Linux and Windows with no library. All of them but `std/ui` also build for `browser/wasm32`.
+- `std/ui/gpu` and `std/ui/platform` hold one file per target for what differs, `surface_linux.low` and `surface_windows.low`, `wayland_linux.low` and `win32_windows.low`, behind one API (see Modules under Syntax). `std/ui/platform/window_browser.low` imports `std/sys`, so the loader rejects a `browser/wasm32` build of `std/ui/platform` and of every module that imports it, `std/ui` among them, before checking it.
 - The generated bindings are private to the module that uses them. `std/ui/gpu/vulkan.low` holds the types and constants, and `vulkan_linux.low` and `vulkan_windows.low` the commands, linked from `libvulkan.so` and `vulkan-1.dll`. `std/ui/platform/wayland_linux.low` holds the Wayland bindings.
 - A Linux program that opens a window links `libvulkan.so.1`, `libwayland-client.so.0`, `libxkbcommon.so.0` and libc. A Windows one imports `vulkan-1.dll`, `user32.dll` and `kernel32.dll`.
 
