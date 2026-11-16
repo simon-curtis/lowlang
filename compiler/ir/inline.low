@@ -22,17 +22,96 @@ pub struct Inliner {
     pub u: *types.Universe
     pub recursive: [*Func: bool] = [:]
     pub summaries: [*Func: CalleeSummary] = [:]
+    pub level: [*Func: i64] = [:]
     pub budget: i64
     pub reserve: i64
 }
 
-pub fn inline_calls(p: *Program, u: *types.Universe) {
+pub fn inline_calls(p: *Program, u: *types.Universe, runner: Runner) {
     let budget = program_budget(p)
     let inl = new(Inliner { program: p, u, budget, reserve: budget / loop_reserve_share })
-    let order = call_order(inl)
-    for f in order {
-        inline_into(inl, f)
+    for depth, level in call_levels(inl) {
+        inline_level(inl, level, depth, runner)
     }
+}
+
+struct Pass {
+    func: *Func
+    grown: i64 = 0
+    found: []InlineCandidate = []
+    admitted: []InlineCandidate = []
+}
+
+fn inline_level(inl: *Inliner, level: []*Func, depth: i64, runner: Runner) {
+    var passes: []*Pass = []
+    for f in level {
+        passes.push(new(Pass { func: f }))
+    }
+    let each = runner.each
+    for _ in 0..max_inline_rounds {
+        for pass in passes {
+            inl.summarise_callees(pass.func, depth)
+        }
+        each(passes.len, fn(i: i64) {
+            let pass = passes[i]
+            pass.found = candidates(inl, pass.func)
+        })
+        var expanding: []*Pass = []
+        for pass in passes {
+            inl.admit(pass)
+            if pass.admitted.len > 0 {
+                expanding.push(pass)
+            }
+        }
+        if expanding.len == 0 {
+            return
+        }
+        each(expanding.len, fn(i: i64) {
+            inl.expand_pass(expanding[i])
+        })
+        passes = expanding
+    }
+}
+
+fn summarise_callees(inl: *Inliner, f: *Func, depth: i64) {
+    for v in direct_targets(f) {
+        let target = v.target ?? continue
+        if v.op != OpCall || target == f {
+            continue
+        }
+        let below = inl.level[target] ?? depth
+        if below < depth {
+            summarise(inl, target)
+        }
+    }
+}
+
+fn admit(inl: *Inliner, pass: *Pass) {
+    var admitted: []InlineCandidate = []
+    for c in pass.found {
+        let free = c.cost <= free_inline_cost
+        if !free && !admits(inl, c, pass.grown) {
+            continue
+        }
+        admitted.push(c)
+        if !free {
+            pass.grown += c.cost
+            inl.budget -= c.cost
+        }
+    }
+    pass.admitted = admitted
+}
+
+fn expand_pass(inl: *Inliner, pass: *Pass) {
+    let f = pass.func
+    let results = results_of(f, pass.found)
+    for c in pass.admitted {
+        let target = c.call.target ?? panic("inline candidate without a target")
+        let site = new_inline_site(inl.u, f, c.call, target)
+        let words = results[c.call] ?? panic("inline candidate without results")
+        expand(site, words)
+    }
+    simplify(inl.u, f)
 }
 
 fn program_budget(p: *Program) -> i64 {
@@ -72,11 +151,12 @@ pub struct CallGraph {
     pub on_stack: [*Func: bool] = [:]
     pub stack: []*Func = []
     pub next: i64 = 0
-    pub order: []*Func = []
+    pub levels: [][]*Func = []
+    pub level: [*Func: i64] = [:]
     pub recursive: [*Func: bool] = [:]
 }
 
-fn call_order(inl: *Inliner) -> []*Func {
+fn call_levels(inl: *Inliner) -> [][]*Func {
     let g = new(CallGraph {})
     for f in inl.program.funcs {
         if g.index[f] == none {
@@ -84,7 +164,8 @@ fn call_order(inl: *Inliner) -> []*Func {
         }
     }
     inl.recursive = g.recursive
-    g.order
+    inl.level = g.level
+    g.levels
 }
 
 fn connect_graph(g: *CallGraph, f: *Func) {
@@ -130,8 +211,23 @@ fn pop_component(g: *CallGraph, root: *Func) {
             g.recursive[m] = true
         }
     }
+    var depth = 0
     for m in members {
-        g.order.push(m)
+        for c in direct_callees(m) {
+            match g.level[c] {
+                some(l) => { depth = math.max(depth, l + 1) }
+                none => {}
+            }
+        }
+    }
+    for m in members {
+        g.level[m] = depth
+    }
+    for g.levels.len <= depth {
+        g.levels.push([])
+    }
+    for m in members {
+        g.levels[depth].push(m)
     }
 }
 
@@ -187,49 +283,6 @@ pub struct InlineCandidate {
     pub cost: i64
 }
 
-fn inline_into(inl: *Inliner, f: *Func) {
-    var grown = 0
-    for _ in 0..max_inline_rounds {
-        let expanded = expand_round(inl, f, grown)
-        if !expanded.expanded {
-            return
-        }
-        grown = expanded.grown
-        simplify(inl.u, f)
-    }
-}
-
-struct Expansion {
-    expanded: bool
-    grown: i64
-}
-
-fn expand_round(inl: *Inliner, f: *Func, start: i64) -> Expansion {
-    let found = candidates(inl, f)
-    if found.len == 0 {
-        return Expansion { expanded: false, grown: start }
-    }
-    let results = results_of(f, found)
-    var grown = start
-    var expanded = false
-    for c in found {
-        let free = c.cost <= free_inline_cost
-        if !free && !admits(inl, c, grown) {
-            continue
-        }
-        let target = c.call.target ?? panic("inline candidate without a target")
-        let site = new_inline_site(inl.u, f, c.call, target)
-        let words = results[c.call] ?? panic("inline candidate without results")
-        expand(site, words)
-        expanded = true
-        if !free {
-            grown += c.cost
-            inl.budget -= c.cost
-        }
-    }
-    Expansion { expanded, grown }
-}
-
 fn admits(inl: *Inliner, c: InlineCandidate, grown: i64) -> bool {
     var available = inl.budget
     if c.depth == 0 {
@@ -248,7 +301,7 @@ fn candidates(inl: *Inliner, f: *Func) -> []InlineCandidate {
             if v.op != OpCall || target == f {
                 continue
             }
-            let summary = summarise(inl, target)
+            let summary = inl.summaries[target] ?? continue
             if !summary.eligible || v.args.len != target.param_words {
                 continue
             }

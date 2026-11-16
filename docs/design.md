@@ -2153,7 +2153,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
   - A second bitmap of the same shape holds the mark bit of each object. It is zero outside a collection.
   - The start bitmap, the mark bitmap, the first summary bitmap and the mark stack are touched sparsely or in small steps, so they are excluded from transparent huge pages on Linux; one touched byte would otherwise make a 2 MB page resident.
 - Allocation buffers:
-  - Each OS thread allocates objects of up to 255 words from its own buffer of up to 4096 words without taking the heap lock: it bumps a pointer, writes the header and sets the object's start bit.
+  - Each OS thread allocates objects of up to 255 words from its own buffer of up to 16384 words without taking the heap lock: it bumps a pointer, writes the header and sets the object's start bit.
   - Only the start-bitmap words at the buffer's unaligned edges are set atomically, with `lock or`; the other words are updated with a plain `or`. The summary bits are tested first and set atomically only when clear, and each thread remembers the last bitmap word whose summary bits it set, so allocation skips the summary update while it stays in that word. The memory is reset whenever the thread takes a new buffer.
   - A thread whose buffer is full takes the heap lock and refills it from, in order: the smallest free chunk large enough in the size-class bins below, the exact-size free lists from the largest down, then the end of the heap. It zeroes the buffer's dirty pages in one pass after releasing the lock.
   - A collection turns every thread's unused buffer tail into a free chunk before marking, and an allocation that would leave a single word in a buffer takes that word too, so the sweep finds a header at every object boundary.
@@ -2364,7 +2364,7 @@ Optimiser:
     - A function gets at most 4 clones, and clones add at most 4000 values to the program.
   - The same conditions let an integer parameter that receives one and the same constant from every direct call site become that constant, but only when it pays: the function is simplified as a copy with the constants substituted and as a copy without, and the substitution is kept when the copy with it has fewer checks, blocks or values besides constants and parameters.
 - Inlining:
-  - Release builds inline direct calls bottom-up over the strongly connected components of the call graph.
+  - Release builds inline direct calls bottom-up over the strongly connected components of the call graph, one level at a time: a component's level is one more than the highest level among the components it calls. The functions of a level find their sites and expand them in parallel; the program budget is charged between those steps in the level's discovery order, so the output does not depend on scheduling.
   - A callee is eligible when it:
     - is not part of a cycle;
     - is not a callback;
