@@ -1,0 +1,217 @@
+import ast
+import diag
+import std/path
+import std/semver
+import std/text
+
+pub const manifest_file = "build.low"
+const manifest_module = "std/build"
+
+pub struct Hook {
+    pub program: str
+    pub args: []str
+    pub pos: diag.Pos
+}
+
+pub struct Dependency {
+    pub source: str
+    pub range: str = ""
+    pub local: bool = false
+    pub pos: diag.Pos
+}
+
+pub struct Manifest {
+    pub path: str
+    pub title: str = ""
+    pub version: str = ""
+    pub deps: []Dependency = []
+    pub pre_build: []Hook = []
+    pub post_build: []Hook = []
+}
+
+struct Reading {
+    file: *ast.File
+    alias: str
+    manifest: *Manifest
+    named: [str: bool] = [:]
+}
+
+pub const fetched = ".low/deps"
+
+pub fn fetched_dir(root: str, source: str) -> str {
+    path.join([root, fetched, source])
+}
+
+pub fn local_dir(from: str, source: str) -> str {
+    let dir = path.clean(path.join([from, source]))
+    if path.base(dir) == manifest_file {
+        return path.dir(dir)
+    }
+    dir
+}
+
+pub fn project_manifest(docs: *Overlay, root: str) -> *Manifest? ! Error {
+    let file_path = path.join([root, manifest_file])
+    if !overlay_exists(docs, file_path) {
+        return none
+    }
+    read_manifest(docs, file_path)?
+}
+
+pub fn read_manifest(docs: *Overlay, file_path: str) -> *Manifest ! Error {
+    let f = parse_file(docs, file_path)?
+    manifest_of(f)?
+}
+
+pub fn manifest_of(f: *ast.File) -> *Manifest ! Error {
+    let alias = manifest_alias(f)?
+    no_declarations(f)?
+    let r = new(Reading { file: f, alias, manifest: new(Manifest { path: f.path }) })
+    for func in f.funcs {
+        r.statements(func)?
+    }
+    r.manifest
+}
+
+fn manifest_alias(f: *ast.File) -> str ! Error {
+    var alias = ""
+    for imp in f.imports {
+        if imp.path != manifest_module {
+            fail refused(imp.pos, "a build.low imports only {manifest_module}, not {imp.path}")
+        }
+        alias = imp.alias
+    }
+    alias
+}
+
+fn no_declarations(f: *ast.File) ! Error {
+    for x in f.externs {
+        fail declared_in_manifest(x.pos)
+    }
+    for e in f.enums {
+        fail declared_in_manifest(e.pos)
+    }
+    for s in f.structs {
+        fail declared_in_manifest(s.pos)
+    }
+    for c in f.consts {
+        fail declared_in_manifest(c.pos)
+    }
+    for func in f.funcs {
+        if !func.top_level {
+            fail declared_in_manifest(func.pos)
+        }
+    }
+}
+
+fn declared_in_manifest(pos: diag.Pos) -> Error {
+    refused(pos, "a build.low holds only calls to {manifest_module}")
+}
+
+fn refused(pos: diag.Pos, msg: str) -> Error {
+    Error.Diag(diag.Error.At(pos, msg))
+}
+
+fn statements(r: *Reading, func: *ast.Func) ! Error {
+    let body = func.body ?? return
+    for s in body.stmts {
+        match s {
+            ExprStmt(e) => r.declaration(e.x, ast.stmt_position(s))?
+            _ => fail declared_in_manifest(ast.stmt_position(s))
+        }
+    }
+    match body.tail {
+        some(e) => r.declaration(e, ast.position(e))?
+        none => {}
+    }
+}
+
+fn declaration(r: *Reading, e: ast.Expr, at: diag.Pos) ! Error {
+    let call = match e {
+        Call(c) => c
+        _ => fail declared_in_manifest(at)
+    }
+    let name = r.declared_name(call) ?? fail declared_in_manifest(call.pos)
+    match name {
+        "title" => {
+            r.once(call, name)?
+            r.manifest.title = r.string_arg(call, name, 0, 1)?
+        }
+        "version" => {
+            r.once(call, name)?
+            let number = r.string_arg(call, name, 0, 1)?
+            semver.parse(number) or fail refused(call.pos, "{number} is not a semantic version such as 1.2.3")
+            r.manifest.version = number
+        }
+        "dep" => {
+            let source = r.string_arg(call, name, 0, 2)?
+            let range = r.string_arg(call, name, 1, 2)?
+            parse_range(range) ?? fail refused(call.pos, "{range} is not a version range; write ^1.2, ~1.2.3, =1.2.3 or 1.2")
+            r.manifest.deps.push(Dependency { source, range, pos: call.pos })
+        }
+        "local" => {
+            let dir = r.string_arg(call, name, 0, 1)?
+            r.manifest.deps.push(Dependency { source: dir, local: true, pos: call.pos })
+        }
+        "pre_build" => r.manifest.pre_build.push(r.hook(call, name)?)
+        "post_build" => r.manifest.post_build.push(r.hook(call, name)?)
+        _ => fail refused(call.pos, "{manifest_module} has no declaration {name}")
+    }
+}
+
+fn declared_name(r: *Reading, call: *ast.Call) -> str? {
+    let sel = match call.callee {
+        Selector(s) => s
+        _ => return none
+    }
+    match sel.x {
+        Ident(id) => {
+            if id.name != r.alias || r.alias == "" {
+                return none
+            }
+        }
+        _ => return none
+    }
+    sel.name
+}
+
+fn once(r: *Reading, call: *ast.Call, name: str) ! Error {
+    if r.named[name] != none {
+        fail refused(call.pos, "{name} is already declared")
+    }
+    r.named[name] = true
+}
+
+fn arity(call: *ast.Call, name: str, want: i64) ! Error {
+    if call.args.len != want {
+        fail refused(call.pos, "{name} takes {want} arguments, found {call.args.len}")
+    }
+}
+
+fn string_arg(r: *Reading, call: *ast.Call, name: str, at: i64, count: i64) -> str ! Error {
+    arity(call, name, count)?
+    string_literal(call.args[at])?
+}
+
+fn string_literal(e: ast.Expr) -> str ! Error {
+    match e {
+        StrLit(s) => s.value
+        _ => fail refused(ast.position(e), "a build.low argument is a string literal")
+    }
+}
+
+fn hook(r: *Reading, call: *ast.Call, name: str) -> Hook ! Error {
+    let program = r.string_arg(call, name, 0, 2)?
+    let list = match call.args[1] {
+        SliceLit(s) => s
+        other => fail refused(ast.position(other), "the arguments of {name} are a slice of string literals")
+    }
+    var args: []str = []
+    for elem in list.elems {
+        args.push(string_literal(elem)?)
+    }
+    if text.trim(program) == "" {
+        fail refused(call.pos, "{name} names no program")
+    }
+    Hook { program, args, pos: call.pos }
+}
