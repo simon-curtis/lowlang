@@ -241,6 +241,7 @@ pub struct Loader {
     projects: [str: *Project] = [:]
     owners: [str: *Project] = [:]
     dirs: [str: str] = [:]
+    prepared: [str: Parsed] = [:]
 }
 
 pub fn load_modules(entry_path: str, platform: target.OS, std: *Std, docs: *Overlay) -> *Loader ! Error {
@@ -269,7 +270,12 @@ pub fn load_modules(entry_path: str, platform: target.OS, std: *Std, docs: *Over
 
 fn drain(l: *Loader) ! Error {
     var head = 0
+    var ready = 0
     for head < l.pending.len {
+        if head == ready {
+            l.prefetch(head)
+            ready = l.pending.len
+        }
         let next = l.pending[head]
         head += 1
         imported(l, next)?
@@ -325,18 +331,108 @@ fn imported(l: *Loader, e: Edge) ! Error {
         }
         none => {}
     }
-    let source = tree_of(l, e.to)
-    var dir = e.to
-    var place = "the standard library"
-    if !source.privileged {
-        dir = l.dirs[e.to] ?? path.join([l.root, e.to])
-        place = dir
-    }
-    let listing = sources(source, dir, l.platform, false)?
+    let at = place_of(l, e.to)
+    let listing = sources(at.source, at.dir, l.platform, false)?
     if listing.absent || listing.files.len == 0 {
-        fail Error.Diag(diag.Error.At(e.pos, "cannot find module {e.to} in {place}"))
+        fail Error.Diag(diag.Error.At(e.pos, "cannot find module {e.to} in {at.label}"))
     }
     module(l, e.to, listing.files, false)?
+}
+
+struct Place {
+    source: Tree
+    dir: str
+    label: str
+}
+
+fn place_of(l: *Loader, name: str) -> Place {
+    let source = tree_of(l, name)
+    if source.privileged {
+        return Place { source, dir: name, label: "the standard library" }
+    }
+    let dir = l.dirs[name] ?? path.join([l.root, name])
+    Place { source, dir, label: dir }
+}
+
+fn is_tested(l: *Loader, name: str) -> bool {
+    match l.tested {
+        some(t) => t.name == name
+        none => false
+    }
+}
+
+struct Parsed {
+    file: *ast.File? = none
+    error: Error? = none
+}
+
+struct Unparsed {
+    name: str
+    src: str
+    privileged: bool
+}
+
+fn prefetch(l: *Loader, from: i64) {
+    var wanted: []Unparsed = []
+    var seen: [str: bool] = [:]
+    for e in l.pending[from..] {
+        if l.loaded[e.to] != none || seen[e.to] != none || l.is_tested(e.to) {
+            continue
+        }
+        seen[e.to] = true
+        let at = place_of(l, e.to)
+        let listing = sources(at.source, at.dir, l.platform, false) or continue
+        l.gather(at.source, listing.files, mut wanted)
+    }
+    l.parse_all(wanted)
+}
+
+fn prepare_sources(l: *Loader, source: Tree, files: []str) {
+    var wanted: []Unparsed = []
+    l.gather(source, files, mut wanted)
+    l.parse_all(wanted)
+}
+
+fn gather(l: *Loader, source: Tree, files: []str, mut wanted: []Unparsed) {
+    for name in files {
+        if l.prepared[name] != none {
+            continue
+        }
+        let src = read_source(source, name) or continue
+        wanted.push(Unparsed { name, src, privileged: source.privileged })
+    }
+}
+
+fn parse_all(l: *Loader, wanted: []Unparsed) {
+    var results: []Parsed = []
+    for _ in wanted {
+        results.push(Parsed {})
+    }
+    let each = l.docs.jobs.each
+    each(wanted.len, fn(i: i64) {
+        results[i] = parse_unparsed(wanted[i])
+    })
+    for i, w in wanted {
+        l.prepared[w.name] = results[i]
+    }
+}
+
+fn parse_unparsed(w: Unparsed) -> Parsed {
+    let f = parse_source(w.src, w.name, w.privileged) catch {
+        e => return Parsed { error: e }
+    }
+    f.path = w.name
+    Parsed { file: f }
+}
+
+fn parse_prepared(l: *Loader, source: Tree, name: str) -> *ast.File ! Error {
+    let ready = l.prepared[name] ?? return parse(source, name)?
+    l.prepared.delete(name)
+    match ready.error {
+        some(e) => fail e
+        none => {}
+    }
+    ready.file ?? panic("a prepared source has no file")
 }
 
 fn import_chain(l: *Loader, e: Edge) -> str {
@@ -380,9 +476,10 @@ fn open_module(l: *Loader, name: str) {
 fn module(l: *Loader, name: str, files: []str, tests: bool) ! Error {
     open_module(l, name)
     let source = tree_of(l, name)
+    l.prepare_sources(source, files)
     var parsed: []*ast.File = []
     for file_name in files {
-        let f = parse(source, file_name)?
+        let f = l.parse_prepared(source, file_name)?
         f.module = name
         check_externs(l, f, source.privileged)?
         l.files.push(f)
