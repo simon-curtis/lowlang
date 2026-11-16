@@ -1,0 +1,205 @@
+import std/ui/geometry
+import std/ui/layout
+import std/ui/platform
+import std/ui/scene
+import uitext = std/ui/text
+
+struct Laid {
+    node: i64
+    element: Element
+    children: Laid[]
+}
+
+struct TextStyle {
+    color: geometry.Color
+    size: f32
+}
+
+struct State {
+    text: uitext.System
+    background: geometry.Color
+    dirty: bool = true
+    closed: bool = false
+    width: f32 = 0.0
+    height: f32 = 0.0
+    scale: f32 = 1.0
+    posts: chan[fn()]
+    waker: platform.Waker? = none
+}
+
+/// The state of one user interface apart from its window: the signals' owner and the text system.
+///
+/// A context is a handle: copies share the state. `frame` and `dispatch` drive it without a window or a GPU, as `run` drives it with them.
+pub struct Context {
+    state: *State
+}
+
+/// A copyable handle that runs closures on a context's green thread from any other.
+pub struct Handle {
+    posts: chan[fn()]
+    waker: platform.Waker?
+}
+
+fn default_text_style() -> TextStyle {
+    TextStyle { color: geometry.rgb(0x000000), size: 16.0 }
+}
+
+/// Returns a context with no window whose frames clear to `background`.
+pub fn headless(background: geometry.Color) -> Context {
+    let state = new(State { text: uitext.default_system(), background, posts: chan[fn()](1024) })
+    Context { state }
+}
+
+/// Returns `true` while a frame is due: after a signal changed, a closure was posted or the window changed size.
+pub fn frame_due(cx: Context) -> bool {
+    cx.state.dirty
+}
+
+/// Returns `true` once a `CloseRequested` event has been dispatched or `quit` called.
+pub fn closed(cx: Context) -> bool {
+    cx.state.closed
+}
+
+/// Ends `run` after the events it is dispatching.
+pub fn quit(cx: Context) {
+    cx.state.closed = true
+}
+
+/// Returns a handle that posts closures to `cx`.
+pub fn handle(cx: Context) -> Handle {
+    Handle { posts: cx.state.posts, waker: cx.state.waker }
+}
+
+/// Queues `f` to run on the context's green thread before its next frame, and wakes the window waiting for events.
+pub fn post(h: Handle, f: fn()) {
+    h.posts <- f
+    match h.waker {
+        some(k) => platform.wake(k)
+        none => {}
+    }
+}
+
+fn drain(st: *State) {
+    for {
+        let posted = select {
+            v = <-st.posts => v ?? return
+            else => return
+        }
+        posted()
+        st.dirty = true
+    }
+}
+
+/// Builds the tree `render` returns, lays it out in a window of `size` logical pixels and paints it into a scene of `scale` device pixels per logical pixel.
+pub fn frame(cx: Context, render: fn() -> Element, size: geometry.Size, scale: f32) -> scene.Scene {
+    let st = cx.state
+    uitext.end_frame(mut st.text)
+    drain(st)
+    st.dirty = false
+    let root = render()
+    var t = layout.tree()
+    let laid = build(st, mut t, root, default_text_style())
+    layout.compute(mut t, laid.node, size)
+    let device_width = i64(floor(size.width * scale + 0.5))
+    let device_height = i64(floor(size.height * scale + 0.5))
+    var sc = scene.empty(device_width, device_height, st.background)
+    paint(st, t, mut sc, laid, default_text_style(), scale)
+    sc
+}
+
+fn is_text(e: Element) -> bool {
+    match e.kind {
+        Text => true
+        _ => false
+    }
+}
+
+fn inherit(ts: TextStyle, v: Visual) -> TextStyle {
+    TextStyle { color: v.text_color ?? ts.color, size: v.text_size ?? ts.size }
+}
+
+fn build(st: *State, mut t: layout.Tree, e: Element, ts: TextStyle) -> Laid {
+    let own = inherit(ts, e.visual)
+    if is_text(e) {
+        let content = e.content
+        let size = own.size
+        let measure = fn(w: f32) -> geometry.Size { uitext.measure(mut st.text, content, size, w) }
+        return Laid { node: layout.leaf(mut t, e.style, measure), element: e, children: [] }
+    }
+    var kids: Laid[] = []
+    var nodes: i64[] = []
+    for c in e.children {
+        let k = build(st, mut t, c, own)
+        nodes.push(k.node)
+        kids.push(k)
+    }
+    Laid { node: layout.node(mut t, e.style, nodes), element: e, children: kids }
+}
+
+fn paint(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, ts: TextStyle, scale: f32) {
+    let e = laid.element
+    if e.style.display == None {
+        return
+    }
+    let own = inherit(ts, e.visual)
+    let r = layout.rect(t, laid.node)
+    paint_box(mut sc, r, e.style.border, e.visual, scale)
+    if is_text(e) {
+        let content = layout.content(t, laid.node)
+        let lines = uitext.wrap(mut st.text, e.content, own.size, content.width)
+        uitext.paint(mut st.text, mut sc, lines, geometry.point(content.x, content.y), own.color, scale)
+        return
+    }
+    for c in laid.children {
+        paint(st, t, mut sc, c, own, scale)
+    }
+}
+
+fn paint_box(mut sc: scene.Scene, r: geometry.Rect, border: geometry.Edges, v: Visual, scale: f32) {
+    for s in v.shadows {
+        let grown = geometry.outset(geometry.offset(r, s.x, s.y), geometry.edges(s.spread))
+        let radii = geometry.Corners {
+            top_left: v.corners.top_left + s.spread
+            top_right: v.corners.top_right + s.spread
+            bottom_right: v.corners.bottom_right + s.spread
+            bottom_left: v.corners.bottom_left + s.spread
+        }
+        let shadow = scene.Shadow {
+            bounds: geometry.scale(grown, scale)
+            color: s.color
+            corner_radii: geometry.scale_corners(radii, scale)
+            sigma: s.blur * scale / 2.0
+        }
+        scene.push_shadow(mut sc, shadow)
+    }
+    let bordered = border.top > 0.0 || border.right > 0.0 || border.bottom > 0.0 || border.left > 0.0
+    if v.background.a <= 0.0 && !(bordered && v.border_color.a > 0.0) {
+        return
+    }
+    let quad = scene.Quad {
+        bounds: geometry.scale(r, scale)
+        background: v.background
+        border_color: v.border_color
+        corner_radii: geometry.scale_corners(v.corners, scale)
+        border_widths: geometry.scale_edges(border, scale)
+    }
+    scene.push_quad(mut sc, quad)
+}
+
+/// Applies `event` to `cx`: records the size and scale of the window and the close request.
+pub fn dispatch(cx: Context, event: platform.Event) {
+    let st = cx.state
+    match event {
+        Resized(width, height, scale) => {
+            st.width = f32(width)
+            st.height = f32(height)
+            st.scale = f32(scale)
+            st.dirty = true
+        }
+        CloseRequested => {
+            st.closed = true
+        }
+        Woken => drain(st)
+        _ => {}
+    }
+}
