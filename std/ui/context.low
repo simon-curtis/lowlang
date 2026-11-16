@@ -4,6 +4,13 @@ import std/ui/platform
 import std/ui/scene
 import uitext = std/ui/text
 
+struct Hitbox {
+    bounds: geometry.Rect
+    key: str
+    parent: i64
+    element: Element
+}
+
 struct Laid {
     node: i64
     element: Element
@@ -15,6 +22,11 @@ struct TextStyle {
     size: f32
 }
 
+struct Walk {
+    parent: i64
+    clip: geometry.Rect
+}
+
 struct State {
     text: uitext.System
     background: geometry.Color
@@ -23,11 +35,21 @@ struct State {
     width: f32 = 0.0
     height: f32 = 0.0
     scale: f32 = 1.0
+    hitboxes: Hitbox[] = []
+    hits: bool[] = []
+    painted: i64 = 0
+    pointer: geometry.Point = geometry.Point {}
+    pointer_inside: bool = false
+    hovered: str = ""
+    pressed: [str: bool] = [:]
+    held: platform.Button? = none
+    focus: str = ""
+    window_focused: bool = false
     posts: chan[fn()]
     waker: platform.Waker? = none
 }
 
-/// The state of one user interface apart from its window: the signals' owner and the text system.
+/// The state of one user interface apart from its window: the signals' owner, the text system, and what the pointer and the keyboard are on.
 ///
 /// A context is a handle: copies share the state. `frame` and `dispatch` drive it without a window or a GPU, as `run` drives it with them.
 pub struct Context {
@@ -50,7 +72,7 @@ pub fn headless(background: geometry.Color) -> Context {
     Context { state }
 }
 
-/// Returns `true` while a frame is due: after a signal changed, a closure was posted or the window changed size.
+/// Returns `true` while a frame is due: after a signal changed, a closure was posted, the window changed size, or the element under the pointer or the focused element changed.
 pub fn frame_due(cx: Context) -> bool {
     cx.state.dirty
 }
@@ -63,6 +85,21 @@ pub fn closed(cx: Context) -> bool {
 /// Ends `run` after the events it is dispatching.
 pub fn quit(cx: Context) {
     cx.state.closed = true
+}
+
+/// Returns the key of the focused element, its id or its position in the tree, or `""` when none is focused.
+pub fn focused(cx: Context) -> str {
+    cx.state.focus
+}
+
+/// Focuses the element with the key `key`, an id or a position such as `"0/1"`, or none when `key` is empty. The element takes focus whether or not it is `focusable`.
+pub fn set_focus(cx: Context, key: str) {
+    move_focus(cx.state, key)
+}
+
+/// Removes focus from the focused element.
+pub fn blur(cx: Context) {
+    move_focus(cx.state, "")
 }
 
 /// Returns a handle that posts closures to `cx`.
@@ -91,6 +128,8 @@ fn drain(st: *State) {
 }
 
 /// Builds the tree `render` returns, lays it out in a window of `size` logical pixels and paints it into a scene of `scale` device pixels per logical pixel.
+///
+/// The hitboxes of the painted elements replace those of the last frame, so `dispatch` finds the elements this frame drew.
 pub fn frame(cx: Context, render: fn() -> Element, size: geometry.Size, scale: f32) -> scene.Scene {
     let st = cx.state
     uitext.end_frame(mut st.text)
@@ -100,9 +139,15 @@ pub fn frame(cx: Context, render: fn() -> Element, size: geometry.Size, scale: f
     var t = layout.tree()
     let laid = build(st, mut t, root, default_text_style())
     layout.compute(mut t, laid.node, size)
+    let whole = Walk { parent: -1, clip: geometry.rect(0.0, 0.0, size.width, size.height) }
+    st.hitboxes = []
+    prepaint(st, t, laid, "0", whole)
+    st.hits = hit_test(st)
+    st.hovered = hovered_keys(st)
     let device_width = i64(floor(size.width * scale + 0.5))
     let device_height = i64(floor(size.height * scale + 0.5))
     var sc = scene.empty(device_width, device_height, st.background)
+    st.painted = 0
     paint(st, t, mut sc, laid, default_text_style(), scale)
     sc
 }
@@ -112,6 +157,10 @@ fn is_text(e: Element) -> bool {
         Text => true
         _ => false
     }
+}
+
+fn interactive(e: Element) -> bool {
+    e.focusable || e.listeners.len > 0 || e.conditionals.len > 0
 }
 
 fn inherit(ts: TextStyle, v: Visual) -> TextStyle {
@@ -136,14 +185,40 @@ fn build(st: *State, mut t: layout.Tree, e: Element, ts: TextStyle) -> Laid {
     Laid { node: layout.node(mut t, e.style, nodes), element: e, children: kids }
 }
 
+fn prepaint(st: *State, t: layout.Tree, laid: Laid, key_path: str, w: Walk) {
+    let e = laid.element
+    if e.style.display == None {
+        return
+    }
+    let key = if e.id != "" { e.id } else { key_path }
+    var inner = w
+    if interactive(e) {
+        let rect = layout.rect(t, laid.node)
+        st.hitboxes.push(Hitbox { bounds: geometry.intersect(rect, w.clip), key, parent: w.parent, element: e })
+        inner.parent = st.hitboxes.len - 1
+    }
+    if is_text(e) {
+        return
+    }
+    for i, c in laid.children {
+        prepaint(st, t, c, "{key}/{i}", inner)
+    }
+}
+
 fn paint(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, ts: TextStyle, scale: f32) {
     let e = laid.element
     if e.style.display == None {
         return
     }
-    let own = inherit(ts, e.visual)
+    var visual = e.visual
+    if interactive(e) {
+        let at = st.painted
+        st.painted += 1
+        visual = styled(st, at, e)
+    }
+    let own = inherit(ts, visual)
     let r = layout.rect(t, laid.node)
-    paint_box(mut sc, r, e.style.border, e.visual, scale)
+    paint_box(mut sc, r, e.style.border, visual, scale)
     if is_text(e) {
         let content = layout.content(t, laid.node)
         let lines = uitext.wrap(mut st.text, e.content, own.size, content.width)
@@ -152,6 +227,24 @@ fn paint(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, ts: TextSt
     }
     for c in laid.children {
         paint(st, t, mut sc, c, own, scale)
+    }
+}
+
+fn styled(st: *State, at: i64, e: Element) -> Visual {
+    var out = e.visual
+    for c in e.conditionals {
+        if holds(st, at, c.when) {
+            out = c.change(out)
+        }
+    }
+    out
+}
+
+fn holds(st: *State, at: i64, c: Condition) -> bool {
+    match c {
+        Hovered => st.hits[at]
+        Active => st.held == platform.Button.Left && (st.pressed[st.hitboxes[at].key] ?? false)
+        Focused => st.focus != "" && st.hitboxes[at].key == st.focus
     }
 }
 
@@ -186,7 +279,60 @@ fn paint_box(mut sc: scene.Scene, r: geometry.Rect, border: geometry.Edges, v: V
     scene.push_quad(mut sc, quad)
 }
 
-/// Applies `event` to `cx`: records the size and scale of the window and the close request.
+fn hit_test(st: *State) -> bool[] {
+    var hits: bool[] = []
+    for h in st.hitboxes {
+        hits.push(st.pointer_inside && geometry.contains(h.bounds, st.pointer))
+    }
+    hits
+}
+
+fn hovered_keys(st: *State) -> str {
+    var keys = ""
+    for i, h in st.hitboxes {
+        if st.hits[i] {
+            keys += "{h.key}\n"
+        }
+    }
+    keys
+}
+
+fn find(st: *State, key: str) -> i64 {
+    for i, h in st.hitboxes {
+        if h.key == key {
+            return i
+        }
+    }
+    -1
+}
+
+fn topmost(st: *State) -> i64 {
+    var i = st.hitboxes.len - 1
+    for i >= 0 && !st.hits[i] {
+        i -= 1
+    }
+    i
+}
+
+fn refresh_hover(st: *State) {
+    st.hits = hit_test(st)
+    let keys = hovered_keys(st)
+    if keys != st.hovered {
+        st.hovered = keys
+        st.dirty = true
+    }
+}
+
+fn move_focus(st: *State, key: str) {
+    if key != st.focus {
+        st.focus = key
+        st.dirty = true
+    }
+}
+
+/// Applies `event` to `cx`: records the size and scale, moves the pointer, runs the handlers of the elements of the last frame and moves focus.
+///
+/// The elements are those of the last `frame`, so a pointer position is tested against what was drawn.
 pub fn dispatch(cx: Context, event: platform.Event) {
     let st = cx.state
     match event {
@@ -199,7 +345,164 @@ pub fn dispatch(cx: Context, event: platform.Event) {
         CloseRequested => {
             st.closed = true
         }
+        PointerMoved(x, y) => move_pointer(st, x, y)
+        PointerLeft => {
+            st.pointer_inside = false
+            refresh_hover(st)
+        }
+        PointerDown(button, x, y) => {
+            move_pointer(st, x, y)
+            mouse_down(st, button)
+        }
+        PointerUp(button, x, y) => {
+            move_pointer(st, x, y)
+            mouse_up(st, button)
+        }
+        Key(k) => key(st, k)
+        FocusChanged(focused) => {
+            st.window_focused = focused
+        }
         Woken => drain(st)
         _ => {}
     }
+}
+
+fn move_pointer(st: *State, x: f32, y: f32) {
+    st.pointer = geometry.point(x, y)
+    st.pointer_inside = true
+    refresh_hover(st)
+}
+
+fn mouse_down(st: *State, button: platform.Button) {
+    if button != platform.Button.Left {
+        return
+    }
+    st.held = button
+    st.pressed = [:]
+    for i, h in st.hitboxes {
+        if st.hits[i] {
+            st.pressed[h.key] = true
+        }
+    }
+    st.dirty = true
+    focus_under_pointer(st)
+}
+
+fn focus_under_pointer(st: *State) {
+    var i = topmost(st)
+    for i >= 0 {
+        if st.hitboxes[i].element.focusable {
+            move_focus(st, st.hitboxes[i].key)
+            return
+        }
+        i = st.hitboxes[i].parent
+    }
+    move_focus(st, "")
+}
+
+fn mouse_up(st: *State, button: platform.Button) {
+    if button != platform.Button.Left || st.held == none {
+        return
+    }
+    st.held = none
+    let pressed = st.pressed
+    st.pressed = [:]
+    st.dirty = true
+    var i = topmost(st)
+    for i >= 0 {
+        let h = st.hitboxes[i]
+        if pressed[h.key] ?? false {
+            if run_click(h.element) {
+                return
+            }
+        }
+        i = h.parent
+    }
+}
+
+fn run_click(e: Element) -> bool {
+    for l in e.listeners {
+        match l {
+            Click(f) => {
+                f()
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn key(st: *State, k: platform.KeyEvent) {
+    var at = find(st, st.focus)
+    var handled = false
+    for at >= 0 && !handled {
+        handled = run_keys(st.hitboxes[at].element, k)
+        at = st.hitboxes[at].parent
+    }
+    if handled || !k.pressed {
+        return
+    }
+    if is_named(k.key, platform.NamedKey.Tab) {
+        cycle_focus(st, !k.modifiers.shift)
+    } else if activates(k.key) {
+        let focused = find(st, st.focus)
+        if focused >= 0 {
+            run_click(st.hitboxes[focused].element)
+        }
+    }
+}
+
+fn run_keys(e: Element, k: platform.KeyEvent) -> bool {
+    for l in e.listeners {
+        match l {
+            Key(f) => {
+                if f(k) {
+                    return true
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_named(k: platform.Key, n: platform.NamedKey) -> bool {
+    match k {
+        Named(named) => named == n
+        Character(_) => false
+    }
+}
+
+fn activates(k: platform.Key) -> bool {
+    match k {
+        Named(named) => named == platform.NamedKey.Enter
+        Character(text) => text == " "
+    }
+}
+
+fn cycle_focus(st: *State, forward: bool) {
+    var order: i64[] = []
+    for i, h in st.hitboxes {
+        if h.element.focusable {
+            order.push(i)
+        }
+    }
+    if order.len == 0 {
+        return
+    }
+    let current = find(st, st.focus)
+    var position = -1
+    for n, i in order {
+        if i == current {
+            position = n
+        }
+    }
+    var next = 0
+    if position < 0 {
+        next = if forward { 0 } else { order.len - 1 }
+    } else {
+        next = if forward { (position + 1) % order.len } else { (position + order.len - 1) % order.len }
+    }
+    move_focus(st, st.hitboxes[order[next]].key)
 }
