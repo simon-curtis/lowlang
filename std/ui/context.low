@@ -1,0 +1,714 @@
+import std/ui/geometry
+import std/ui/layout
+import std/ui/platform
+import std/ui/scene
+import uitext = std/ui/text
+
+struct Hitbox {
+    bounds: geometry.Rect
+    key: str
+    parent: i64
+    element: Element
+    offset: geometry.Point
+    scroll_max: geometry.Point
+}
+
+struct Laid {
+    node: i64
+    element: Element
+    children: Laid[]
+}
+
+struct TextStyle {
+    color: geometry.Color
+    size: f32
+}
+
+struct Walk {
+    parent: i64
+    clip: geometry.Rect
+    shift: geometry.Point
+}
+
+struct State {
+    text: uitext.System
+    background: geometry.Color
+    dirty: bool = true
+    closed: bool = false
+    width: f32 = 0.0
+    height: f32 = 0.0
+    scale: f32 = 1.0
+    hitboxes: Hitbox[] = []
+    hits: bool[] = []
+    painted: i64 = 0
+    pointer: geometry.Point = geometry.Point {}
+    pointer_inside: bool = false
+    hovered: str = ""
+    pressed: [str: bool] = [:]
+    held: platform.Button? = none
+    focus: str = ""
+    scroll: [str: geometry.Point] = [:]
+    window_focused: bool = false
+    fields: [str: *FieldState] = [:]
+    drag: str = ""
+    caret: platform.Caret? = none
+    applied_caret: platform.Caret? = none
+    applied_cursor: platform.Cursor = platform.Cursor.Arrow
+    memory: str? = none
+    posts: chan[fn()]
+    wake: fn()
+    copy: fn(str)
+    paste: fn() -> str?
+}
+
+/// The state of one user interface apart from its window: the signals' owner, the text system, and what the pointer and the keyboard are on.
+///
+/// A context is a handle: copies share the state. `frame` and `dispatch` drive it without a window or a GPU, as `run` drives it with them.
+pub struct Context {
+    state: *State
+}
+
+/// A copyable handle that runs closures on a context's green thread from any other.
+pub struct Handle {
+    posts: chan[fn()]
+    wake: fn()
+}
+
+fn default_text_style() -> TextStyle {
+    TextStyle { color: geometry.rgb(0x000000), size: 16.0 }
+}
+
+/// Returns a context with no window whose frames clear to `background`.
+pub fn headless(background: geometry.Color) -> Context {
+    let state = new(State {
+        text: uitext.default_system()
+        background
+        posts: chan[fn()](1024)
+        wake: fn() {}
+        copy: fn(s: str) {}
+        paste: fn() -> str? { none }
+    })
+    state.copy = fn(s: str) { state.memory = s }
+    state.paste = fn() -> str? { state.memory }
+    Context { state }
+}
+
+/// Returns the text on the clipboard, the system's when the context has a window, or `none` when it holds no text.
+pub fn clipboard(cx: Context) -> str? {
+    cx.state.paste()
+}
+
+/// Puts `s` on the clipboard, the system's when the context has a window.
+pub fn set_clipboard(cx: Context, s: str) {
+    cx.state.copy(s)
+}
+
+/// Returns the shape the pointer should have: that of the innermost element under it that sets a `cursor`, or the arrow.
+pub fn pointer_cursor(cx: Context) -> platform.Cursor {
+    let st = cx.state
+    var i = topmost(st)
+    for i >= 0 {
+        let h = st.hitboxes[i]
+        match h.element.cursor {
+            some(shape) => return shape
+            none => {}
+        }
+        i = h.parent
+    }
+    platform.Cursor.Arrow
+}
+
+/// Returns where the text caret of the focused field is as of the last frame, for an input method to place its candidate window beside, or `none` when no field is focused.
+pub fn text_input(cx: Context) -> platform.Caret? {
+    cx.state.caret
+}
+
+/// Returns `true` while a frame is due: after a signal changed, a closure was posted, the window changed size, or the element under the pointer or the focused element changed.
+pub fn frame_due(cx: Context) -> bool {
+    cx.state.dirty
+}
+
+/// Returns `true` once a `CloseRequested` event has been dispatched or `quit` called.
+pub fn closed(cx: Context) -> bool {
+    cx.state.closed
+}
+
+/// Ends `run` after the events it is dispatching.
+pub fn quit(cx: Context) {
+    cx.state.closed = true
+}
+
+/// Returns the key of the focused element, its id or its position in the tree, or `""` when none is focused.
+pub fn focused(cx: Context) -> str {
+    cx.state.focus
+}
+
+/// Focuses the element with the key `key`, an id or a position such as `"0/1"`, or none when `key` is empty. The element takes focus whether or not it is `focusable`.
+pub fn set_focus(cx: Context, key: str) {
+    move_focus(cx.state, key)
+}
+
+/// Removes focus from the focused element.
+pub fn blur(cx: Context) {
+    move_focus(cx.state, "")
+}
+
+/// Returns how far the scrolling element whose key is `key` is scrolled, in logical pixels from its start.
+pub fn scroll_offset(cx: Context, key: str) -> geometry.Point {
+    cx.state.scroll[key] ?? geometry.Point {}
+}
+
+/// Scrolls the element whose key is `key` to `offset`, which the next frame keeps within the element's content.
+pub fn scroll_to(cx: Context, key: str, offset: geometry.Point) {
+    cx.state.scroll[key] = offset
+    cx.state.dirty = true
+}
+
+/// Returns a handle that posts closures to `cx`.
+pub fn handle(cx: Context) -> Handle {
+    Handle { posts: cx.state.posts, wake: cx.state.wake }
+}
+
+/// Queues `f` to run on the context's green thread before its next frame, and wakes the window waiting for events.
+pub fn post(h: Handle, f: fn()) {
+    h.posts <- f
+    h.wake()
+}
+
+fn drain(st: *State) {
+    for {
+        let posted = select {
+            v = <-st.posts => v ?? return
+            else => return
+        }
+        posted()
+        st.dirty = true
+    }
+}
+
+/// Builds the tree `render` returns, lays it out in a window of `size` logical pixels and paints it into a scene of `scale` device pixels per logical pixel.
+///
+/// The hitboxes of the painted elements replace those of the last frame, so `dispatch` finds the elements this frame drew.
+pub fn frame(cx: Context, render: fn() -> Element, size: geometry.Size, scale: f32) -> scene.Scene {
+    let st = cx.state
+    uitext.end_frame(mut st.text)
+    drain(st)
+    st.dirty = false
+    let root = render()
+    var t = layout.tree()
+    let laid = build(st, mut t, root, default_text_style())
+    layout.compute(mut t, laid.node, size)
+    let whole = Walk { parent: -1, clip: geometry.rect(0.0, 0.0, size.width, size.height), shift: geometry.Point {} }
+    st.hitboxes = []
+    prepaint(st, t, laid, "0", whole)
+    st.hits = hit_test(st)
+    st.hovered = hovered_keys(st)
+    let device_width = i64(floor(size.width * scale + 0.5))
+    let device_height = i64(floor(size.height * scale + 0.5))
+    var sc = scene.empty(device_width, device_height, st.background)
+    st.painted = 0
+    st.caret = none
+    paint(st, t, mut sc, laid, whole, default_text_style(), scale)
+    sc
+}
+
+fn is_text(e: Element) -> bool {
+    match e.kind {
+        Text => true
+        _ => false
+    }
+}
+
+fn scrolls(s: layout.Style) -> bool {
+    s.overflow_x == Scroll || s.overflow_y == Scroll
+}
+
+fn clips(s: layout.Style) -> bool {
+    s.overflow_x != Visible || s.overflow_y != Visible
+}
+
+fn interactive(e: Element) -> bool {
+    e.focusable || e.listeners.len > 0 || e.conditionals.len > 0 || scrolls(e.style) || e.cursor != none
+}
+
+fn larger(a: f32, b: f32) -> f32 {
+    if a > b { a } else { b }
+}
+
+fn within(v: f32, low: f32, high: f32) -> f32 {
+    if v < low { low } else if v > high { high } else { v }
+}
+
+fn inherit(ts: TextStyle, v: Visual) -> TextStyle {
+    TextStyle { color: v.text_color ?? ts.color, size: v.text_size ?? ts.size }
+}
+
+fn build(st: *State, mut t: layout.Tree, e: Element, ts: TextStyle) -> Laid {
+    let own = inherit(ts, e.visual)
+    if is_text(e) {
+        let content = e.content
+        let size = own.size
+        let measure = fn(w: f32) -> geometry.Size { uitext.measure(mut st.text, content, size, w) }
+        return Laid { node: layout.leaf(mut t, e.style, measure), element: e, children: [] }
+    }
+    if is_field(e) {
+        let content = e.content
+        let size = own.size
+        let measure = fn(w: f32) -> geometry.Size { uitext.measure(mut st.text, content, size, layout.unbounded) }
+        return Laid { node: layout.leaf(mut t, e.style, measure), element: e, children: [] }
+    }
+    var kids: Laid[] = []
+    var nodes: i64[] = []
+    for c in e.children {
+        let k = build(st, mut t, c, own)
+        nodes.push(k.node)
+        kids.push(k)
+    }
+    Laid { node: layout.node(mut t, e.style, nodes), element: e, children: kids }
+}
+
+fn prepaint(st: *State, t: layout.Tree, laid: Laid, key_path: str, w: Walk) {
+    let e = laid.element
+    if e.style.display == None {
+        return
+    }
+    let key = if e.id != "" { e.id } else { key_path }
+    let rect = geometry.offset(layout.rect(t, laid.node), w.shift.x, w.shift.y)
+    var inner = w
+    if interactive(e) {
+        let range = scroll_range(t, laid)
+        let offset = settled_offset(st, key, e.style, range)
+        st.hitboxes.push(Hitbox { bounds: geometry.intersect(rect, w.clip), key, parent: w.parent, element: e, offset, scroll_max: range })
+        inner.parent = st.hitboxes.len - 1
+        inner.shift = geometry.point(w.shift.x - offset.x, w.shift.y - offset.y)
+    }
+    if is_text(e) || is_field(e) {
+        return
+    }
+    if clips(e.style) {
+        inner.clip = geometry.intersect(w.clip, clip_bounds(geometry.inset(rect, e.style.border), e.style))
+    }
+    for i, c in laid.children {
+        prepaint(st, t, c, "{key}/{i}", inner)
+    }
+}
+
+fn scroll_range(t: layout.Tree, laid: Laid) -> geometry.Point {
+    let s = laid.element.style
+    if !scrolls(s) {
+        return geometry.Point {}
+    }
+    let r = layout.rect(t, laid.node)
+    var right = r.x
+    var bottom = r.y
+    for k in laid.children {
+        let c = layout.rect(t, k.node)
+        if c.width > 0.0 || c.height > 0.0 {
+            right = larger(right, c.x + c.width)
+            bottom = larger(bottom, c.y + c.height)
+        }
+    }
+    let inner_right = r.x + r.width - s.border.right - s.padding.right
+    let inner_bottom = r.y + r.height - s.border.bottom - s.padding.bottom
+    let x = if s.overflow_x == Scroll { larger(right - inner_right, 0.0) } else { 0.0 }
+    let y = if s.overflow_y == Scroll { larger(bottom - inner_bottom, 0.0) } else { 0.0 }
+    geometry.point(x, y)
+}
+
+fn settled_offset(st: *State, key: str, s: layout.Style, max: geometry.Point) -> geometry.Point {
+    if !scrolls(s) {
+        return geometry.Point {}
+    }
+    let wanted = st.scroll[key] ?? geometry.Point {}
+    let settled = geometry.point(within(wanted.x, 0.0, max.x), within(wanted.y, 0.0, max.y))
+    if settled.x != wanted.x || settled.y != wanted.y {
+        st.scroll[key] = settled
+        st.dirty = true
+    }
+    settled
+}
+
+fn clip_bounds(padding_box: geometry.Rect, s: layout.Style) -> geometry.Rect {
+    let far: f32 = 1.0e9
+    var out = padding_box
+    if s.overflow_x == Visible {
+        out.x = -far
+        out.width = 2.0 * far
+    }
+    if s.overflow_y == Visible {
+        out.y = -far
+        out.height = 2.0 * far
+    }
+    out
+}
+
+fn paint(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, w: Walk, ts: TextStyle, scale: f32) {
+    let e = laid.element
+    if e.style.display == None {
+        return
+    }
+    var visual = e.visual
+    var inner = w
+    var at = -1
+    if interactive(e) {
+        at = st.painted
+        st.painted += 1
+        visual = styled(st, at, e)
+        let offset = st.hitboxes[at].offset
+        inner.shift = geometry.point(w.shift.x - offset.x, w.shift.y - offset.y)
+    }
+    let own = inherit(ts, visual)
+    let r = geometry.offset(layout.rect(t, laid.node), w.shift.x, w.shift.y)
+    paint_box(mut sc, r, e.style.border, visual, scale)
+    if is_text(e) {
+        let content = geometry.offset(layout.content(t, laid.node), w.shift.x, w.shift.y)
+        let lines = uitext.wrap(mut st.text, e.content, own.size, content.width)
+        uitext.paint(mut st.text, mut sc, lines, geometry.point(content.x, content.y), own.color, scale)
+        return
+    }
+    if is_field(e) {
+        let content = geometry.offset(layout.content(t, laid.node), w.shift.x, w.shift.y)
+        paint_field(st, mut sc, e, at, content, own, scale)
+        return
+    }
+    let clipping = clips(e.style)
+    if clipping {
+        let bounds = clip_bounds(geometry.inset(r, e.style.border), e.style)
+        scene.push_clip(mut sc, geometry.scale(bounds, scale))
+    }
+    for c in laid.children {
+        paint(st, t, mut sc, c, inner, own, scale)
+    }
+    if clipping {
+        scene.pop_clip(mut sc)
+    }
+}
+
+fn styled(st: *State, at: i64, e: Element) -> Visual {
+    var out = e.visual
+    for c in e.conditionals {
+        if holds(st, at, c.when) {
+            out = c.change(out)
+        }
+    }
+    out
+}
+
+fn holds(st: *State, at: i64, c: Condition) -> bool {
+    match c {
+        Hovered => st.hits[at]
+        Active => st.held == platform.Button.Left && (st.pressed[st.hitboxes[at].key] ?? false)
+        Focused => st.focus != "" && st.hitboxes[at].key == st.focus
+    }
+}
+
+fn paint_box(mut sc: scene.Scene, r: geometry.Rect, border: geometry.Edges, v: Visual, scale: f32) {
+    for s in v.shadows {
+        let grown = geometry.outset(geometry.offset(r, s.x, s.y), geometry.edges(s.spread))
+        let radii = geometry.Corners {
+            top_left: v.corners.top_left + s.spread
+            top_right: v.corners.top_right + s.spread
+            bottom_right: v.corners.bottom_right + s.spread
+            bottom_left: v.corners.bottom_left + s.spread
+        }
+        let shadow = scene.Shadow {
+            bounds: geometry.scale(grown, scale)
+            color: s.color
+            corner_radii: geometry.scale_corners(radii, scale)
+            sigma: s.blur * scale / 2.0
+        }
+        scene.push_shadow(mut sc, shadow)
+    }
+    let bordered = border.top > 0.0 || border.right > 0.0 || border.bottom > 0.0 || border.left > 0.0
+    if v.background.a <= 0.0 && !(bordered && v.border_color.a > 0.0) {
+        return
+    }
+    let quad = scene.Quad {
+        bounds: geometry.scale(r, scale)
+        background: v.background
+        border_color: v.border_color
+        corner_radii: geometry.scale_corners(v.corners, scale)
+        border_widths: geometry.scale_edges(border, scale)
+    }
+    scene.push_quad(mut sc, quad)
+}
+
+fn hit_test(st: *State) -> bool[] {
+    var hits: bool[] = []
+    for h in st.hitboxes {
+        hits.push(st.pointer_inside && geometry.contains(h.bounds, st.pointer))
+    }
+    hits
+}
+
+fn hovered_keys(st: *State) -> str {
+    var keys = ""
+    for i, h in st.hitboxes {
+        if st.hits[i] {
+            keys += "{h.key}\n"
+        }
+    }
+    keys
+}
+
+fn find(st: *State, key: str) -> i64 {
+    for i, h in st.hitboxes {
+        if h.key == key {
+            return i
+        }
+    }
+    -1
+}
+
+fn topmost(st: *State) -> i64 {
+    var i = st.hitboxes.len - 1
+    for i >= 0 && !st.hits[i] {
+        i -= 1
+    }
+    i
+}
+
+fn refresh_hover(st: *State) {
+    st.hits = hit_test(st)
+    let keys = hovered_keys(st)
+    if keys != st.hovered {
+        st.hovered = keys
+        st.dirty = true
+    }
+}
+
+fn move_focus(st: *State, key: str) {
+    if key != st.focus {
+        st.focus = key
+        st.dirty = true
+    }
+}
+
+/// Applies `event` to `cx`: records the size and scale, moves the pointer, runs the handlers of the elements of the last frame and moves focus.
+///
+/// The elements are those of the last `frame`, so a pointer position is tested against what was drawn.
+pub fn dispatch(cx: Context, event: platform.Event) {
+    let st = cx.state
+    match event {
+        Resized(width, height, scale) => {
+            st.width = f32(width)
+            st.height = f32(height)
+            st.scale = f32(scale)
+            st.dirty = true
+        }
+        CloseRequested => {
+            st.closed = true
+        }
+        PointerMoved(x, y) => move_pointer(st, x, y)
+        PointerLeft => {
+            st.pointer_inside = false
+            refresh_hover(st)
+        }
+        PointerDown(button, x, y) => {
+            move_pointer(st, x, y)
+            mouse_down(st, button)
+        }
+        PointerUp(button, x, y) => {
+            move_pointer(st, x, y)
+            mouse_up(st, button)
+        }
+        Scrolled(dx, dy) => scroll_wheel(st, dx, dy)
+        Key(k) => key(st, k)
+        Preedit(s, range) => field_preedit(st, s, range)
+        Commit(s) => field_commit(st, s)
+        FocusChanged(focused) => {
+            st.window_focused = focused
+        }
+        Woken => drain(st)
+        _ => {}
+    }
+}
+
+fn move_pointer(st: *State, x: f32, y: f32) {
+    st.pointer = geometry.point(x, y)
+    st.pointer_inside = true
+    refresh_hover(st)
+    field_drag(st)
+}
+
+fn mouse_down(st: *State, button: platform.Button) {
+    if button != platform.Button.Left {
+        return
+    }
+    st.held = button
+    st.pressed = [:]
+    for i, h in st.hitboxes {
+        if st.hits[i] {
+            st.pressed[h.key] = true
+        }
+    }
+    st.dirty = true
+    focus_under_pointer(st)
+    field_press(st)
+}
+
+fn focus_under_pointer(st: *State) {
+    var i = topmost(st)
+    for i >= 0 {
+        if st.hitboxes[i].element.focusable {
+            move_focus(st, st.hitboxes[i].key)
+            return
+        }
+        i = st.hitboxes[i].parent
+    }
+    move_focus(st, "")
+}
+
+fn mouse_up(st: *State, button: platform.Button) {
+    if button != platform.Button.Left || st.held == none {
+        return
+    }
+    st.held = none
+    st.drag = ""
+    let pressed = st.pressed
+    st.pressed = [:]
+    st.dirty = true
+    var i = topmost(st)
+    for i >= 0 {
+        let h = st.hitboxes[i]
+        if pressed[h.key] ?? false {
+            if run_click(h.element) {
+                return
+            }
+        }
+        i = h.parent
+    }
+}
+
+fn run_click(e: Element) -> bool {
+    for l in e.listeners {
+        match l {
+            Click(f) => {
+                f()
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn scroll_wheel(st: *State, dx: f32, dy: f32) {
+    let event = ScrollEvent { position: st.pointer, dx, dy }
+    var i = topmost(st)
+    for i >= 0 {
+        if st.hits[i] {
+            let h = st.hitboxes[i]
+            run_scrolls(h.element, event)
+            if scroll_by(st, i, dx, dy) {
+                return
+            }
+        }
+        i -= 1
+    }
+}
+
+fn run_scrolls(e: Element, event: ScrollEvent) {
+    for l in e.listeners {
+        match l {
+            Scroll(f) => f(event)
+            _ => {}
+        }
+    }
+}
+
+fn scroll_by(st: *State, at: i64, dx: f32, dy: f32) -> bool {
+    let h = st.hitboxes[at]
+    if !scrolls(h.element.style) {
+        return false
+    }
+    let x = within(h.offset.x + dx, 0.0, h.scroll_max.x)
+    let y = within(h.offset.y + dy, 0.0, h.scroll_max.y)
+    if x == h.offset.x && y == h.offset.y {
+        return false
+    }
+    let moved = geometry.point(x, y)
+    st.hitboxes[at].offset = moved
+    st.scroll[h.key] = moved
+    st.dirty = true
+    true
+}
+
+fn key(st: *State, k: platform.KeyEvent) {
+    var at = find(st, st.focus)
+    var innermost = true
+    var handled = false
+    for at >= 0 && !handled {
+        handled = run_keys(st.hitboxes[at].element, k)
+        if !handled && innermost {
+            handled = field_key(st, at, k)
+        }
+        innermost = false
+        at = st.hitboxes[at].parent
+    }
+    if handled || !k.pressed {
+        return
+    }
+    if is_named(k.key, platform.NamedKey.Tab) {
+        cycle_focus(st, !k.modifiers.shift)
+    } else if activates(k.key) {
+        let focused = find(st, st.focus)
+        if focused >= 0 {
+            run_click(st.hitboxes[focused].element)
+        }
+    }
+}
+
+fn run_keys(e: Element, k: platform.KeyEvent) -> bool {
+    for l in e.listeners {
+        match l {
+            Key(f) => {
+                if f(k) {
+                    return true
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_named(k: platform.Key, n: platform.NamedKey) -> bool {
+    match k {
+        Named(named) => named == n
+        Character(_) => false
+    }
+}
+
+fn activates(k: platform.Key) -> bool {
+    match k {
+        Named(named) => named == platform.NamedKey.Enter
+        Character(text) => text == " "
+    }
+}
+
+fn cycle_focus(st: *State, forward: bool) {
+    var order: i64[] = []
+    for i, h in st.hitboxes {
+        if h.element.focusable {
+            order.push(i)
+        }
+    }
+    if order.len == 0 {
+        return
+    }
+    let current = find(st, st.focus)
+    var position = -1
+    for n, i in order {
+        if i == current {
+            position = n
+        }
+    }
+    var next = 0
+    if position < 0 {
+        next = if forward { 0 } else { order.len - 1 }
+    } else {
+        next = if forward { (position + 1) % order.len } else { (position + order.len - 1) % order.len }
+    }
+    move_focus(st, st.hitboxes[order[next]].key)
+}
