@@ -1,5 +1,5 @@
 return {
   cmd = { "low", "lsp" },
   filetypes = { "low" },
-  root_markers = { "low.mod", ".git" },
+  root_markers = { "build.low", "low.mod", ".git" },
 }
