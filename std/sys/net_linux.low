@@ -407,6 +407,159 @@ pub fn interface_index(name: str) -> i64 ! io.Error {
     io.le32(request, 16)
 }
 
+const netlink_header = 16
+const netlink_buffer = 65536
+const netlink_new_link = 16
+const netlink_get_link = 18
+const netlink_new_address = 20
+const netlink_get_address = 22
+const netlink_error = 2
+const netlink_done = 3
+const netlink_dump_request = 0x301
+const link_name_attribute = 3
+const address_attribute = 1
+const local_attribute = 2
+const link_attributes_at = 32
+const address_attributes_at = 24
+
+fn netlink_request(kind: i64) -> u8[] {
+    var request: u8[] = []
+    io.put_le32(mut request, 20)
+    io.put_le16(mut request, kind)
+    io.put_le16(mut request, netlink_dump_request)
+    io.put_le32(mut request, 1)
+    io.put_le32(mut request, 0)
+    io.put_le32(mut request, 0)
+    request
+}
+
+fn netlink_receive(fd: i64, buf: u8[]) -> i64 ! io.Error {
+    for {
+        let r = __syscall(45, fd, __slice_ptr(buf), buf.len, 0, 0, 0)
+        if r != -4 {
+            let n = io.syscall_result(r)?
+            if n == 0 {
+                fail NotConnected
+            }
+            return n
+        }
+    }
+}
+
+fn netlink_dump(fd: i64, kind: i64) -> u8[][] ! io.Error {
+    let request = netlink_request(kind)
+    io.syscall_result(__syscall(44, fd, __slice_ptr(request), request.len, 0, 0, 0))?
+    let buf = io.buffer(netlink_buffer)
+    var messages: u8[][] = []
+    for {
+        let n = netlink_receive(fd, buf)?
+        var at = 0
+        for at + netlink_header <= n {
+            let size = io.le32(buf, at)
+            if size < netlink_header || at + size > n {
+                fail Invalid
+            }
+            let message_type = io.le16(buf, at + 4)
+            if message_type == netlink_done {
+                return messages
+            }
+            if message_type == netlink_error {
+                let code = io.le32(buf, at + netlink_header)
+                if code != 0 {
+                    io.syscall_result(code - 4294967296)?
+                }
+            }
+            let message = io.buffer(size)
+            io.copy(message, buf[at..at + size])
+            messages.push(message)
+            at += (size + 3) / 4 * 4
+        }
+    }
+}
+
+fn netlink_attribute(message: u8[], from: i64, wanted: i64) -> u8[] {
+    var at = from
+    for at + 4 <= message.len {
+        let size = io.le16(message, at)
+        if size < 4 || at + size > message.len {
+            break
+        }
+        if (io.le16(message, at + 2) & 0x3fff) == wanted {
+            return message[at + 4..at + size]
+        }
+        at += (size + 3) / 4 * 4
+    }
+    []
+}
+
+fn link_name(message: u8[]) -> str {
+    let raw = netlink_attribute(message, link_attributes_at, link_name_attribute)
+    var end = raw.len
+    for end > 0 && raw[end - 1] == 0 {
+        end -= 1
+    }
+    str(raw[..end])
+}
+
+fn message_address(message: u8[]) -> InterfaceAddress {
+    let family = i64(message[16])
+    let want = match family {
+        2 => 4
+        10 => 16
+        _ => 0
+    }
+    var ip = netlink_attribute(message, address_attributes_at, local_attribute)
+    if ip.len != want {
+        ip = netlink_attribute(message, address_attributes_at, address_attribute)
+    }
+    if ip.len != want {
+        ip = []
+    }
+    InterfaceAddress { ip, prefix: i64(message[17]) }
+}
+
+fn addresses_of(messages: u8[][], index: i64) -> InterfaceAddress[] {
+    var found: InterfaceAddress[] = []
+    for message in messages {
+        if io.le16(message, 4) != netlink_new_address || io.le32(message, 20) != index {
+            continue
+        }
+        let address = message_address(message)
+        if address.ip.len > 0 {
+            found.push(address)
+        }
+    }
+    found
+}
+
+/// Returns the network interfaces of this machine with their addresses.
+///
+/// On Linux it asks rtnetlink for the links and addresses; an address with a peer, as on a point-to-point link, is reported as the local address. On Windows it reads `GetAdaptersAddresses` for the adapters and their unicast addresses. Blocks the OS thread while it reads the system's tables.
+pub fn interfaces() -> Interface[] ! io.Error {
+    let socket_fd = io.syscall_result(__syscall(41, 16, 0x80003, 0))?
+    using netlink = own(socket_fd)
+    let links = netlink_dump(netlink.handle.fd, netlink_get_link)?
+    let addresses = netlink_dump(netlink.handle.fd, netlink_get_address)?
+    var found: Interface[] = []
+    for message in links {
+        if io.le16(message, 4) != netlink_new_link {
+            continue
+        }
+        let index = io.le32(message, 20)
+        let flags = io.le32(message, 24)
+        let entry = Interface {
+            name: link_name(message)
+            index
+            up: (flags & 0x1) != 0
+            loopback: (flags & 0x8) != 0
+            multicast: (flags & 0x1000) != 0
+            addresses: addresses_of(addresses, index)
+        }
+        found.push(entry)
+    }
+    found
+}
+
 /// Joins or leaves the multicast `group` on the UDP socket `fd`.
 ///
 /// `group` is 4 bytes for IPv4 or 16 for IPv6. `index` is the interface index, or `0` to let the system choose.
