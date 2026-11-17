@@ -1,0 +1,998 @@
+import std/crypto
+import std/io
+import std/net
+import std/sync
+import std/text
+import std/tls
+
+/// Connection settings for `connect`, `connect_tls` and `connect_stream`.
+///
+/// Every field has a default, so `Options {}` connects to a local server without authentication.
+pub struct Options {
+    /// The server host name or IP literal. Defaults to `"127.0.0.1"`. It is also the TLS server name when `tls_config` has none.
+    pub host: str = "127.0.0.1"
+    /// The server TCP port. Defaults to `4222`.
+    pub port: i64 = 4222
+    /// The connection name the server shows in its monitoring. Empty by default.
+    pub name: str = ""
+    /// The authentication token sent as `auth_token`. Empty, the default, sends none.
+    pub token: str = ""
+    /// The user name sent as `user`. Empty, the default, sends no user and no password.
+    pub username: str = ""
+    /// The password sent as `pass` with `username`.
+    pub password: str = ""
+    /// The NKey seed that signs the server's nonce. Empty, the default, sends no NKey. A seed makes the connection fail with `Auth` when the server sends no nonce, and with `BadSeed` when it cannot be decoded.
+    pub nkey_seed: str = ""
+    /// Whether the server sends this connection the messages it publishes itself. Defaults to `true`.
+    pub echo: bool = true
+    /// The TLS settings used when the server's `INFO` requires TLS. When `server_name` is empty, `host` is used. Defaults to `tls.Config {}`, which verifies against the system roots.
+    pub tls_config: tls.Config = tls.Config {}
+    /// Fails the connection with `Tls` when the server does not require TLS, instead of sending credentials in clear text. Defaults to `false`.
+    pub require_tls: bool = false
+    /// The read and write time limit in milliseconds for connecting, for the TLS handshake and for every write afterwards. `0`, the default, waits indefinitely.
+    ///
+    /// After the handshake reads are not limited, because a subscription waits for messages for as long as it likes. A stalled server is found by the pings of `ping_interval`.
+    pub timeout: i64 = 0
+    /// The time limit in milliseconds for establishing the TCP connection, which fails with `Timeout` when exceeded. `0`, the default, leaves the limit to `std/net`. Not used by `connect_stream`.
+    pub connect_timeout: i64 = 0
+    /// The time in milliseconds between the pings the client sends. `0` sends none. Defaults to `120000`.
+    pub ping_interval: i64 = 120000
+    /// The number of pings that may go unanswered. The connection fails with `Timeout` when another interval passes with that many outstanding, even while a write is blocked. Must be at least `1` when `ping_interval` is above `0`, or connecting fails with `Argument`. Defaults to `2`.
+    pub max_pings: i64 = 2
+    /// The capacity of the `messages` channel of each `Subscription`. A message that arrives while it is full is dropped and counted by `dropped`. Defaults to `256`.
+    pub buffer: i64 = 256
+    /// The bounds applied when decoding what the server sends. Defaults to `Limits {}`.
+    pub limits: Limits = Limits {}
+}
+
+/// Modifiers for `publish_with`.
+pub struct PublishOptions {
+    /// The subject the receiver should answer to. Empty, the default, sends none.
+    pub reply: str = ""
+    /// The headers to send. Empty, the default, sends a plain `PUB`.
+    pub headers: Header[] = []
+}
+
+struct SubState {
+    sid: i64
+    subject: str
+    messages: chan[Message]
+    max: i64
+    received: i64
+    dropped: i64
+}
+
+struct Waiter {
+    done: chan[bool]
+}
+
+/// A copyable reference to the state of one server connection.
+///
+/// Copies refer to the same connection. Writes are serialised by an internal lock and one green thread reads the connection, so green threads may share it. `detach` returns one from a `Client`, `adopt` turns it back into a `Client`, and the `_on` functions take it directly.
+pub struct ClientHandle {
+    stream: io.Stream
+    reader: *io.Reader
+    wgate: sync.Mutex
+    sgate: sync.Mutex
+    igate: sync.Mutex
+    limits: Limits
+    stop: chan[bool]
+    buffer: i64
+    closed: bool
+    draining: bool
+    failure: Error?
+    info: ServerInfo
+    subs: [i64: *SubState]
+    next_sid: i64
+    waiters: Waiter[]
+    pings_out: i64
+    inbox_prefix: str
+    inbox_sid: i64
+    replies: [str: chan[Message]]
+    next_token: i64
+    /// Receives the text of every `-ERR` the server sends, such as a permissions violation, and a note for each message whose header block is malformed or that is dropped by a full subscription. The connection survives those two. It is closed when the connection ends, and a text that arrives while it is full is dropped. Its capacity is `16`.
+    pub errors: chan[str]
+}
+
+/// An owned connection to a NATS server, from `connect`, `connect_tls` or `connect_stream`.
+///
+/// Dropping a `Client` closes the connection, unless `detach` released it first.
+pub struct Client {
+    /// The shared state of the connection, for the `_on` functions.
+    pub handle: *ClientHandle
+    detached: bool = false
+    drop {
+        if !detached {
+            close_client_on(handle)
+        }
+    }
+}
+
+/// A running subscription, from `subscribe` or `queue_subscribe`.
+///
+/// A green thread of the client reads the connection and sends each matching message to `messages` without waiting: a message that arrives while the channel is full is dropped and counted by `dropped`, so a consumer that falls behind never stops the connection. `messages` is closed when the subscription ends: after `unsubscribe`, when the count of `unsubscribe_after` is reached, after `drain` and when the connection closes. Messages already in the channel can still be received.
+pub struct Subscription {
+    /// Receives the messages in the order the server sent them. It is closed when the subscription ends.
+    pub messages: chan[Message]
+    /// The subject the subscription was made with, wildcards included.
+    pub subject: str
+    /// The queue group, empty for a subscription that is not in one.
+    pub queue: str
+    handle: *ClientHandle
+    state: *SubState
+}
+
+/// Wraps a connection handle in a `Client` that owns it.
+///
+/// Dropping the returned client closes the connection. Pairs with `detach`.
+pub fn adopt(h: *ClientHandle) -> Client {
+    Client { handle: h }
+}
+
+/// Releases the client's ownership of its connection and returns the `ClientHandle`.
+///
+/// Dropping `c` afterwards does not close the connection; close it with `close_client_on` or take it back with `adopt`. Use it to share the connection between green threads.
+pub fn detach(mut c: Client) -> *ClientHandle {
+    c.detached = true
+    c.handle
+}
+
+fn apply_timeout(t: *net.Timeouts, millis: i64) {
+    t.read = millis
+    t.write = millis
+}
+
+fn dial(o: Options) -> net.Conn ! Error {
+    using conn = net.dial_within(o.host, o.port, o.connect_timeout) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    conn
+}
+
+fn named(o: Options, config: tls.Config) -> tls.Config {
+    var out = config
+    if out.server_name.len == 0 {
+        out.server_name = o.host
+    }
+    out
+}
+
+/// Opens a TCP connection to `o.host` and `o.port` and performs the handshake.
+///
+/// Reads the server's `INFO`, upgrades the connection to TLS with `o.tls_config` when the server requires it, sends `CONNECT` with the credentials of `o` and a `PING`, and waits for the `PONG`. Fails with `Argument` when `o.ping_interval` is above `0` and `o.max_pings` is below `1`, `Connect` when the server cannot be reached, `Timeout` when `o.connect_timeout` or `o.timeout` expires, `Auth` when the server rejects the credentials or `o.nkey_seed` cannot be used, `Tls` when the TLS handshake fails or `o.require_tls` is set and the server does not require TLS, `Server` when the server answers with another `-ERR`, `Protocol` or `TooLarge` when it sends something that is not NATS, and `BadSeed` when `o.nkey_seed` is malformed. The connection is closed when the handshake fails.
+pub fn connect(o: Options) -> Client ! Error {
+    check_pings(o)?
+    using var conn = dial(o)?
+    let wire = net.detach(mut conn)
+    apply_timeout(wire.timeouts, o.timeout)
+    establish(net.stream_on(wire), wire.timeouts, o, false)
+}
+
+/// Opens a TCP connection and performs the TLS handshake before the server sends `INFO`, for a server that runs with `handshake_first`.
+///
+/// `config` is used instead of `o.tls_config`; when its `server_name` is empty, `o.host` is used. Behaves as `connect` otherwise, and a failed TLS handshake fails with `Tls`, or `Timeout` when it times out.
+pub fn connect_tls(o: Options, config: tls.Config) -> Client ! Error {
+    check_pings(o)?
+    using var conn = dial(o)?
+    apply_timeout(conn.handle.timeouts, o.timeout)
+    let session = tls.client_handle(net.stream(conn), named(o, config)) catch {
+        TimedOut => fail Timeout
+        _ => fail Tls
+    }
+    let wire = net.detach(mut conn)
+    establish(tls.stream_on(session), wire.timeouts, o, true)
+}
+
+/// Performs the handshake over an existing `io.Stream` instead of dialling.
+///
+/// The stream must be plain: when the server's `INFO` requires TLS, the client upgrades the stream with `o.tls_config`, so a stream that is already encrypted fails that handshake. Use `connect_tls` for a server that expects TLS before `INFO`. `o.host` is used only as the TLS server name, and `o.port`, `o.timeout` and `o.connect_timeout` are not used, because the stream carries no time limits. Closing the client closes the stream. Fails as `connect` does from the handshake onwards, and with `Argument` for the same options.
+pub fn connect_stream(s: io.Stream, o: Options) -> Client ! Error {
+    check_pings(o) catch {
+        e => {
+            s.close()
+            fail e
+        }
+    }
+    establish(s, new(net.Timeouts { read: 0, write: 0 }), o, false)
+}
+
+fn check_pings(o: Options) ! Error {
+    if o.ping_interval > 0 && o.max_pings < 1 {
+        fail Argument
+    }
+}
+
+fn establish(raw: io.Stream, timeouts: *net.Timeouts, o: Options, secured: bool) -> Client ! Error {
+    let h = negotiate(raw, timeouts, o, secured) catch {
+        e => {
+            raw.close()
+            fail e
+        }
+    }
+    Client { handle: h }
+}
+
+fn negotiate(raw: io.Stream, timeouts: *net.Timeouts, o: Options, secured: bool) -> *ClientHandle ! Error {
+    var stream = raw
+    var reader = io.reader(raw)
+    let info = read_info(reader, o.limits)?
+    var encrypted = secured
+    if !secured && (info.tls_required || o.require_tls) {
+        if !info.tls_required {
+            fail Tls
+        }
+        if io.buffered(reader) > 0 {
+            fail Protocol
+        }
+        let session = tls.client_handle(raw, named(o, o.tls_config)) catch {
+            TimedOut => fail Timeout
+            _ => fail Tls
+        }
+        stream = tls.stream_on(session)
+        reader = io.reader(stream)
+        encrypted = true
+    }
+    let h = new(ClientHandle {
+        stream
+        reader
+        wgate: sync.mutex()
+        sgate: sync.mutex()
+        igate: sync.mutex()
+        limits: o.limits
+        stop: chan[bool]()
+        buffer: o.buffer
+        closed: false
+        draining: false
+        failure: none
+        info
+        subs: [:]
+        next_sid: 0
+        waiters: []
+        pings_out: 0
+        inbox_prefix: ""
+        inbox_sid: 0
+        replies: [:]
+        next_token: 0
+        errors: chan[str](16)
+    })
+    handshake(h, o, encrypted)?
+    timeouts.read = 0
+    spawn pump(h)
+    if o.ping_interval > 0 {
+        spawn keepalive(h, o.ping_interval, o.max_pings)
+    }
+    h
+}
+
+fn read_info(r: *io.Reader, limits: Limits) -> ServerInfo ! Error {
+    let op = read_op(r, limits)?
+    match op {
+        Info(info) => info
+        Rejected(t) => fail rejected(t)
+        _ => fail Protocol
+    }
+}
+
+fn rejected(message: str) -> Error {
+    let lower = text.lower(message)
+    if text.contains(lower, "authorization") || text.contains(lower, "authentication") {
+        return Auth(message)
+    }
+    Server(message)
+}
+
+fn handshake(h: *ClientHandle, o: Options, encrypted: bool) ! Error {
+    var hello = Connect {
+        name: o.name
+        token: o.token
+        user: o.username
+        password: o.password
+        nkey: ""
+        signature: ""
+        echo: o.echo
+        headers: h.info.headers
+        tls_required: encrypted
+    }
+    if o.nkey_seed.len > 0 {
+        if h.info.nonce.len == 0 {
+            fail Auth("the server sent no nonce to sign")
+        }
+        hello.nkey = public_nkey(o.nkey_seed)?
+        hello.signature = sign_nonce(o.nkey_seed, h.info.nonce)?
+    }
+    io.write_all(h.stream, encode_connect(hello)) catch {
+        e => fail transport(e)
+    }
+    for {
+        let op = read_op(h.reader, h.limits)?
+        match op {
+            Pong => {
+                return
+            }
+            Rejected(t) => fail rejected(t)
+            Info(info) => {
+                h.info = info
+            }
+            Ping => {
+                io.write_all(h.stream, bytes("PONG\r\n")) catch {
+                    e => fail transport(e)
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Returns what the server announced in its `INFO` line, as last updated by the server.
+pub fn server_info(c: Client) -> ServerInfo {
+    server_info_on(c.handle)
+}
+
+/// Returns the server's `INFO` on the connection behind `h`. See `server_info`.
+pub fn server_info_on(h: *ClientHandle) -> ServerInfo {
+    sync.lock(h.sgate)
+    let info = h.info
+    sync.unlock(h.sgate)
+    info
+}
+
+/// Closes the connection.
+///
+/// Closing twice is harmless. Later operations fail with `Closed`, and the `messages` channel of every subscription and the `errors` channel are closed.
+pub fn close_client(c: Client) {
+    close_client_on(c.handle)
+}
+
+/// Closes the connection behind `h`. Closing twice is harmless. See `close_client`.
+pub fn close_client_on(h: *ClientHandle) {
+    shut(h, none)
+}
+
+fn shut(h: *ClientHandle, cause: Error?) {
+    sync.lock(h.sgate)
+    if h.closed {
+        sync.unlock(h.sgate)
+        return
+    }
+    h.closed = true
+    h.failure = cause
+    let subs = h.subs
+    let waiters = h.waiters
+    let replies = h.replies
+    h.subs = [:]
+    h.waiters = []
+    h.replies = [:]
+    close(h.stop)
+    for sid, s in subs {
+        close(s.messages)
+    }
+    for w in waiters {
+        close(w.done)
+    }
+    for token, reply in replies {
+        close(reply)
+    }
+    close(h.errors)
+    sync.unlock(h.sgate)
+    h.stream.close()
+}
+
+fn closed_error(h: *ClientHandle) -> Error {
+    sync.lock(h.sgate)
+    let cause = h.failure ?? Closed
+    sync.unlock(h.sgate)
+    cause
+}
+
+fn abandon(h: *ClientHandle, e: Error) -> Error {
+    shut(h, some(e))
+    closed_error(h)
+}
+
+fn write_frame(h: *ClientHandle, frame: u8[]) ! Error {
+    io.write_all(h.stream, frame) catch {
+        e => fail abandon(h, transport(e))
+    }
+}
+
+fn send(h: *ClientHandle, frame: u8[]) ! Error {
+    sync.lock(h.wgate)
+    defer sync.unlock(h.wgate)
+    if is_closed(h) {
+        fail closed_error(h)
+    }
+    write_frame(h, frame)?
+}
+
+fn is_closed(h: *ClientHandle) -> bool {
+    sync.lock(h.sgate)
+    let closed = h.closed
+    sync.unlock(h.sgate)
+    closed
+}
+
+fn note_error(h: *ClientHandle, message: str) {
+    select {
+        h.errors <- message => {}
+        else => {}
+    }
+}
+
+fn recoverable(message: str) -> bool {
+    let lower = text.lower(message)
+    text.starts_with(lower, "permissions violation") || lower == "invalid subject" || lower == "maximum subscriptions exceeded"
+}
+
+fn pump(h: *ClientHandle) {
+    for {
+        let op = read_op(h.reader, h.limits) catch {
+            e => {
+                shut(h, some(e))
+                return
+            }
+        }
+        if !dispatch(h, op) {
+            return
+        }
+    }
+}
+
+fn dispatch(h: *ClientHandle, op: Op) -> bool {
+    match op {
+        Msg(sid, message, damaged) => {
+            deliver(h, sid, message, damaged)
+            true
+        }
+        Ping => {
+            send(h, bytes("PONG\r\n")) catch {
+                e => return false
+            }
+            true
+        }
+        Pong => {
+            settle(h)
+            true
+        }
+        Info(info) => {
+            sync.lock(h.sgate)
+            h.info = info
+            sync.unlock(h.sgate)
+            true
+        }
+        Accepted => true
+        Rejected(t) => refuse(h, t)
+    }
+}
+
+fn refuse(h: *ClientHandle, message: str) -> bool {
+    sync.lock(h.sgate)
+    if !h.closed {
+        note_error(h, message)
+    }
+    sync.unlock(h.sgate)
+    if recoverable(message) {
+        return true
+    }
+    shut(h, some(rejected(message)))
+    false
+}
+
+fn settle(h: *ClientHandle) {
+    sync.lock(h.sgate)
+    if h.waiters.len == 0 {
+        sync.unlock(h.sgate)
+        return
+    }
+    let w = h.waiters[0]
+    h.waiters = h.waiters[1..]
+    if h.pings_out > 0 {
+        h.pings_out -= 1
+    }
+    w.done <- true
+    sync.unlock(h.sgate)
+}
+
+fn deliver(h: *ClientHandle, sid: i64, m: Message, damaged: bool) {
+    sync.lock(h.sgate)
+    if h.closed {
+        sync.unlock(h.sgate)
+        return
+    }
+    if damaged {
+        note_error(h, "malformed headers on {m.subject}")
+    }
+    if h.inbox_sid != 0 && sid == h.inbox_sid {
+        route_reply(h, m)
+        sync.unlock(h.sgate)
+        return
+    }
+    match h.subs[sid] {
+        some(s) => offer(h, s, m)
+        none => {}
+    }
+    sync.unlock(h.sgate)
+}
+
+fn route_reply(h: *ClientHandle, m: Message) {
+    let at = text.last_index_byte(m.subject, '.')
+    if at < 0 {
+        return
+    }
+    match h.replies[m.subject[at + 1..]] {
+        some(done) => {
+            select {
+                done <- m => {}
+                else => {}
+            }
+        }
+        none => {}
+    }
+}
+
+fn offer(h: *ClientHandle, s: *SubState, m: Message) {
+    s.received += 1
+    select {
+        s.messages <- m => {}
+        else => {
+            s.dropped += 1
+            note_error(h, "slow consumer on {s.subject}")
+        }
+    }
+    if s.max > 0 && s.received >= s.max {
+        h.subs.delete(s.sid)
+        close(s.messages)
+    }
+}
+
+fn keepalive(h: *ClientHandle, interval: i64, max: i64) {
+    for {
+        var stopped = false
+        select {
+            <-h.stop => {
+                stopped = true
+            }
+            after(interval) => {}
+        }
+        if stopped {
+            return
+        }
+        if outstanding(h) >= max {
+            shut(h, some(Timeout))
+            return
+        }
+        enroll(h) catch {
+            e => return
+        }
+        spawn probe(h)
+    }
+}
+
+fn probe(h: *ClientHandle) {
+    sync.lock(h.wgate)
+    defer sync.unlock(h.wgate)
+    write_frame(h, bytes("PING\r\n")) catch {
+        e => return
+    }
+}
+
+fn outstanding(h: *ClientHandle) -> i64 {
+    sync.lock(h.sgate)
+    let n = h.pings_out
+    sync.unlock(h.sgate)
+    n
+}
+
+fn enroll(h: *ClientHandle) -> chan[bool] ! Error {
+    let done = chan[bool](1)
+    sync.lock(h.sgate)
+    if h.closed {
+        let cause = h.failure ?? Closed
+        sync.unlock(h.sgate)
+        fail cause
+    }
+    h.waiters.push(Waiter { done })
+    h.pings_out += 1
+    sync.unlock(h.sgate)
+    done
+}
+
+fn ping(h: *ClientHandle) -> chan[bool] ! Error {
+    sync.lock(h.wgate)
+    defer sync.unlock(h.wgate)
+    let done = enroll(h)?
+    write_frame(h, bytes("PING\r\n"))?
+    done
+}
+
+fn publish_frame(h: *ClientHandle, subject: str, reply: str, headers: Header[], payload: u8[]) ! Error {
+    if !valid_literal_subject(subject) {
+        fail BadSubject
+    }
+    if reply.len > 0 && !valid_literal_subject(reply) {
+        fail BadSubject
+    }
+    let info = server_info_on(h)
+    if headers.len == 0 {
+        if payload.len > info.max_payload {
+            fail MaxPayload
+        }
+        send(h, encode_pub(subject, reply, payload))?
+        return
+    }
+    if !headers_ok(headers) {
+        fail BadHeader
+    }
+    if !info.headers {
+        fail Unsupported
+    }
+    let block = encode_headers(headers)
+    if block.len + payload.len > info.max_payload {
+        fail MaxPayload
+    }
+    send(h, encode_hpub(subject, reply, block, payload))?
+}
+
+/// Publishes `payload` to `subject`.
+///
+/// The call returns once the message is written to the connection; use `flush` to know the server has read it. Fails with `BadSubject` when `subject` has a wildcard or is not valid, `MaxPayload` when the payload is larger than `ServerInfo.max_payload`, `Closed` after the client is closed, and with `Timeout` or `Closed` when the write fails, which also closes the client.
+pub fn publish(c: Client, subject: str, payload: u8[]) ! Error {
+    publish_on(c.handle, subject, payload)?
+}
+
+/// Publishes on the connection behind `h`. See `publish`.
+pub fn publish_on(h: *ClientHandle, subject: str, payload: u8[]) ! Error {
+    publish_frame(h, subject, "", [], payload)?
+}
+
+/// Publishes `payload` to `subject` with the reply subject and headers of `o`.
+///
+/// A message with headers is sent as `HPUB`, whose block starts with `NATS/1.0`, and the headers count towards `max_payload` with the payload. Fails as `publish` does, and with `BadSubject` when `o.reply` is not a valid subject, `BadHeader` when a header name is empty or holds whitespace or `:`, or a value holds a line break, and `Unsupported` when `o.headers` is not empty and the server does not support headers.
+pub fn publish_with(c: Client, subject: str, payload: u8[], o: PublishOptions) ! Error {
+    publish_with_on(c.handle, subject, payload, o)?
+}
+
+/// Publishes with options on the connection behind `h`. See `publish_with`.
+pub fn publish_with_on(h: *ClientHandle, subject: str, payload: u8[], o: PublishOptions) ! Error {
+    publish_frame(h, subject, o.reply, o.headers, payload)?
+}
+
+fn start_subscription(h: *ClientHandle, subject: str, queue: str) -> Subscription ! Error {
+    if !valid_subject(subject) {
+        fail BadSubject
+    }
+    if queue.len > 0 && !valid_queue(queue) {
+        fail BadSubject
+    }
+    let messages = chan[Message](h.buffer)
+    sync.lock(h.sgate)
+    if h.closed {
+        let cause = h.failure ?? Closed
+        sync.unlock(h.sgate)
+        fail cause
+    }
+    if h.draining {
+        sync.unlock(h.sgate)
+        fail Draining
+    }
+    h.next_sid += 1
+    let sid = h.next_sid
+    let state = new(SubState { sid, subject, messages, max: 0, received: 0, dropped: 0 })
+    h.subs[sid] = state
+    sync.unlock(h.sgate)
+    send(h, encode_sub(subject, queue, sid)) catch {
+        e => {
+            forget(h, sid)
+            fail e
+        }
+    }
+    Subscription { messages, subject, queue, handle: h, state }
+}
+
+fn forget(h: *ClientHandle, sid: i64) {
+    sync.lock(h.sgate)
+    match h.subs[sid] {
+        some(s) => {
+            h.subs.delete(sid)
+            close(s.messages)
+        }
+        none => {}
+    }
+    sync.unlock(h.sgate)
+}
+
+/// Subscribes to `subject`, which may hold the wildcards `*` and `>`, and returns the running `Subscription`.
+///
+/// The server may deliver messages as soon as the call returns. Fails with `BadSubject` when `subject` is not valid, `Draining` while the client drains and `Closed` after it is closed.
+///
+/// ```low
+/// import std/nats
+///
+/// fn print_orders(c: nats.Client) ! nats.Error {
+///     let sub = nats.subscribe(c, "orders.*")?
+///     for {
+///         let m = <-sub.messages ?? break
+///         print("{m.subject}: {str(m.payload)}")
+///     }
+/// }
+/// ```
+pub fn subscribe(c: Client, subject: str) -> Subscription ! Error {
+    subscribe_on(c.handle, subject)
+}
+
+/// Subscribes on the connection behind `h`. See `subscribe`.
+pub fn subscribe_on(h: *ClientHandle, subject: str) -> Subscription ! Error {
+    start_subscription(h, subject, "")
+}
+
+/// Subscribes to `subject` as a member of the queue group `queue`.
+///
+/// The server delivers each message to one member of the group. Fails as `subscribe` does, and with `BadSubject` when `queue` is empty or holds whitespace.
+pub fn queue_subscribe(c: Client, subject: str, queue: str) -> Subscription ! Error {
+    queue_subscribe_on(c.handle, subject, queue)
+}
+
+/// Subscribes to a queue group on the connection behind `h`. See `queue_subscribe`.
+pub fn queue_subscribe_on(h: *ClientHandle, subject: str, queue: str) -> Subscription ! Error {
+    if !valid_queue(queue) {
+        fail BadSubject
+    }
+    start_subscription(h, subject, queue)
+}
+
+/// Ends the subscription.
+///
+/// Sends `UNSUB` and closes `s.messages` at once, so messages still in flight are discarded and those already in the channel can still be received. Ending a subscription twice, or one that has reached its count, does nothing. Fails when the connection is closed, with the error that closed it, which is `Closed` when the client closed it.
+pub fn unsubscribe(s: Subscription) ! Error {
+    let h = s.handle
+    sync.lock(h.sgate)
+    if h.closed {
+        let cause = h.failure ?? Closed
+        sync.unlock(h.sgate)
+        fail cause
+    }
+    var live = false
+    match h.subs[s.state.sid] {
+        some(found) => {
+            h.subs.delete(found.sid)
+            close(found.messages)
+            live = true
+        }
+        none => {}
+    }
+    sync.unlock(h.sgate)
+    if live {
+        send(h, encode_unsub(s.state.sid, 0))?
+    }
+}
+
+/// Ends the subscription after `max` messages have arrived in total.
+///
+/// Sends `UNSUB` with the count. `s.messages` is closed when the `max`th message has been delivered, or at once when that many have already arrived. Messages dropped because the channel was full count. Fails with `Argument` when `max` is below `1`, and when the connection is closed with the error that closed it, which is `Closed` when the client closed it.
+pub fn unsubscribe_after(s: Subscription, max: i64) ! Error {
+    if max < 1 {
+        fail Argument
+    }
+    let h = s.handle
+    sync.lock(h.sgate)
+    if h.closed {
+        let cause = h.failure ?? Closed
+        sync.unlock(h.sgate)
+        fail cause
+    }
+    var live = false
+    match h.subs[s.state.sid] {
+        some(found) => {
+            found.max = max
+            live = true
+            if found.received >= max {
+                h.subs.delete(found.sid)
+                close(found.messages)
+            }
+        }
+        none => {}
+    }
+    sync.unlock(h.sgate)
+    if live {
+        send(h, encode_unsub(s.state.sid, max))?
+    }
+}
+
+/// Returns how many messages arrived for `s` while its `messages` channel was full and were dropped.
+pub fn dropped(s: Subscription) -> i64 {
+    sync.lock(s.handle.sgate)
+    let n = s.state.dropped
+    sync.unlock(s.handle.sgate)
+    n
+}
+
+fn ensure_inbox(h: *ClientHandle) -> str ! Error {
+    sync.lock(h.igate)
+    defer sync.unlock(h.igate)
+    sync.lock(h.sgate)
+    if h.closed {
+        let cause = h.failure ?? Closed
+        sync.unlock(h.sgate)
+        fail cause
+    }
+    if h.draining {
+        sync.unlock(h.sgate)
+        fail Draining
+    }
+    if h.inbox_sid != 0 {
+        let prefix = h.inbox_prefix
+        sync.unlock(h.sgate)
+        return prefix
+    }
+    sync.unlock(h.sgate)
+    let prefix = "_INBOX.{text.encode_hex(crypto.random(12))}"
+    sync.lock(h.sgate)
+    h.next_sid += 1
+    let sid = h.next_sid
+    sync.unlock(h.sgate)
+    send(h, encode_sub("{prefix}.*", "", sid))?
+    sync.lock(h.sgate)
+    h.inbox_prefix = prefix
+    h.inbox_sid = sid
+    sync.unlock(h.sgate)
+    prefix
+}
+
+fn register_reply(h: *ClientHandle, done: chan[Message]) -> str ! Error {
+    sync.lock(h.sgate)
+    defer sync.unlock(h.sgate)
+    if h.closed {
+        fail h.failure ?? Closed
+    }
+    h.next_token += 1
+    let token = text.hex(h.next_token)
+    h.replies[token] = done
+    token
+}
+
+fn unregister_reply(h: *ClientHandle, token: str) {
+    sync.lock(h.sgate)
+    h.replies.delete(token)
+    sync.unlock(h.sgate)
+}
+
+fn await_reply(h: *ClientHandle, done: chan[Message], timeout: i64) -> Message ! Error {
+    var got: Message? = none
+    var expired = false
+    if timeout > 0 {
+        select {
+            m = <-done => {
+                got = m
+            }
+            after(timeout) => {
+                expired = true
+            }
+        }
+    } else {
+        got = <-done
+    }
+    if expired {
+        fail Timeout
+    }
+    match got {
+        some(m) => {
+            if m.status == 503 && m.payload.len == 0 {
+                fail NoResponders
+            }
+            m
+        }
+        none => fail closed_error(h)
+    }
+}
+
+/// Publishes `payload` to `subject` and returns the first reply.
+///
+/// The client keeps one wildcard subscription on a random `_INBOX.<id>.*` subject for all its requests and makes the reply subject of each request from it. `timeout` is in milliseconds, and `0` or less waits indefinitely. Fails with `NoResponders` when the server reports that nothing subscribes to `subject`, `Timeout` when no reply arrives in time, `Draining` while the client drains, `Closed` when the connection ends first, and as `publish` does.
+pub fn request(c: Client, subject: str, payload: u8[], timeout: i64) -> Message ! Error {
+    request_on(c.handle, subject, payload, timeout)
+}
+
+/// Sends a request on the connection behind `h`. See `request`.
+pub fn request_on(h: *ClientHandle, subject: str, payload: u8[], timeout: i64) -> Message ! Error {
+    request_with_on(h, subject, [], payload, timeout)
+}
+
+/// Sends a request that carries `headers`. Fails as `request` and `publish_with` do.
+pub fn request_with(c: Client, subject: str, headers: Header[], payload: u8[], timeout: i64) -> Message ! Error {
+    request_with_on(c.handle, subject, headers, payload, timeout)
+}
+
+/// Sends a request that carries `headers` on the connection behind `h`. See `request_with`.
+pub fn request_with_on(h: *ClientHandle, subject: str, headers: Header[], payload: u8[], timeout: i64) -> Message ! Error {
+    let prefix = ensure_inbox(h)?
+    let done = chan[Message](1)
+    let token = register_reply(h, done)?
+    publish_frame(h, subject, "{prefix}.{token}", headers, payload) catch {
+        e => {
+            unregister_reply(h, token)
+            fail e
+        }
+    }
+    let reply = await_reply(h, done, timeout) catch {
+        e => {
+            unregister_reply(h, token)
+            fail e
+        }
+    }
+    unregister_reply(h, token)
+    reply
+}
+
+fn await_pong(h: *ClientHandle, done: chan[bool], timeout: i64) ! Error {
+    var expired = false
+    var got: bool? = none
+    if timeout > 0 {
+        select {
+            v = <-done => {
+                got = v
+            }
+            after(timeout) => {
+                expired = true
+            }
+        }
+    } else {
+        got = <-done
+    }
+    if expired {
+        fail Timeout
+    }
+    match got {
+        some(v) => {}
+        none => fail closed_error(h)
+    }
+}
+
+/// Sends a `PING` and returns when the server answers with `PONG`.
+///
+/// The server handles what the connection sent before the `PING` first, so a returned `flush` means every earlier publish and subscription has been processed and every message the server sent in reply to them has been delivered to its channel. `timeout` is in milliseconds, and `0` or less waits indefinitely. Fails with `Timeout` when the `PONG` does not arrive in time and `Closed` when the connection ends first.
+pub fn flush(c: Client, timeout: i64) ! Error {
+    flush_on(c.handle, timeout)?
+}
+
+/// Flushes the connection behind `h`. See `flush`.
+pub fn flush_on(h: *ClientHandle, timeout: i64) ! Error {
+    let done = ping(h)?
+    await_pong(h, done, timeout)?
+}
+
+/// Ends every subscription, flushes the messages already on their way into their channels, and closes the connection.
+///
+/// Sends `UNSUB` for each subscription, flushes so every message the server sent before it has reached its channel, except that a message that arrives while its channel is full is dropped and counted by `dropped` as at any other time, then closes the connection, which closes each `messages` channel after the messages it holds. New subscriptions and requests fail with `Draining` meanwhile, and publishing stays possible until the flush has finished. The connection is closed when the call returns, so a consumer reading the rest of its channel cannot publish. `timeout` is in milliseconds as for `flush`. Fails with `Draining` when a drain is already running, with the error that closed the connection when it is closed, which is `Closed` when the client closed it, and with `Timeout` when the flush does not finish in time, in which case the connection is closed as well.
+pub fn drain(c: Client, timeout: i64) ! Error {
+    drain_on(c.handle, timeout)?
+}
+
+/// Drains the connection behind `h`. See `drain`.
+pub fn drain_on(h: *ClientHandle, timeout: i64) ! Error {
+    sync.lock(h.sgate)
+    if h.closed {
+        let cause = h.failure ?? Closed
+        sync.unlock(h.sgate)
+        fail cause
+    }
+    if h.draining {
+        sync.unlock(h.sgate)
+        fail Draining
+    }
+    h.draining = true
+    var sids: i64[] = []
+    for sid, s in h.subs {
+        sids.push(sid)
+    }
+    sync.unlock(h.sgate)
+    for sid in sids {
+        send(h, encode_unsub(sid, 0))?
+    }
+    flush_on(h, timeout) catch {
+        e => {
+            shut(h, none)
+            fail e
+        }
+    }
+    shut(h, none)
+}

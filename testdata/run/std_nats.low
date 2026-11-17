@@ -1,0 +1,1390 @@
+import std/base32
+import std/base64
+import std/crypto/ed25519
+import std/crypto/x509
+import std/io
+import std/json
+import std/nats
+import std/net
+import std/sync
+import std/text
+import std/tls
+
+const server_nonce = "n0nce-for-the-fixture"
+
+struct Settings {
+    mode: str
+    token: str
+    user: str
+    password: str
+    nkey: str
+    nonce: bool
+    max_payload: i64
+    headers: bool
+    silent: bool
+    refuse: bool
+}
+
+struct Sub {
+    sid: i64
+    subject: str
+    queue: str
+    max: i64
+    delivered: i64
+}
+
+struct Session {
+    id: i64
+    echo: bool
+    headers: bool
+    no_responders: bool
+    subs: [i64: *Sub]
+    outbox: chan[str]
+}
+
+struct Target {
+    session: *Session
+    sub: *Sub
+}
+
+struct Store {
+    gate: sync.Mutex
+    sessions: [i64: *Session]
+    next_id: i64
+    rotation: [str: i64]
+    connects: str[]
+    pings: i64
+    pongs: i64
+    ended: chan[str]
+    settings: Settings
+    config: tls.Config
+    port: i64
+}
+
+fn open_settings() -> Settings {
+    Settings {
+        mode: "plain"
+        token: ""
+        user: ""
+        password: ""
+        nkey: ""
+        nonce: true
+        max_payload: 1048576
+        headers: true
+        silent: false
+        refuse: false
+    }
+}
+
+fn new_store(settings: Settings, port: i64) -> *Store {
+    let config = if settings.mode == "plain" { tls.Config {} } else { server_config() }
+    new(Store {
+        gate: sync.mutex()
+        sessions: [:]
+        next_id: 0
+        rotation: [:]
+        connects: []
+        pings: 0
+        pongs: 0
+        ended: chan[str](32)
+        settings
+        config
+        port
+    })
+}
+
+fn server_config() -> tls.Config {
+    let pem = embed("std_tls_ec.pem")
+    let key = x509.pem_private_key(pem) or return tls.Config {}
+    tls.Config { certificates: x509.pem_certificates(pem), key }
+}
+
+fn roots() -> x509.Certificate[] {
+    var out: x509.Certificate[] = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        out.push(x509.parse(der) or return out)
+    }
+    out
+}
+
+fn has_credentials(c: Settings) -> bool {
+    c.token.len > 0 || c.user.len > 0 || c.nkey.len > 0
+}
+
+fn info_text(st: *Store, max_payload: i64) -> str {
+    let cfg = st.settings
+    var members = [
+        json.text_member("server_id", "FAKESERVER")
+        json.text_member("server_name", "fake")
+        json.text_member("version", "2.10.0")
+        json.text_member("host", "127.0.0.1")
+        json.int_member("port", st.port)
+        json.int_member("proto", 1)
+        json.bool_member("headers", cfg.headers)
+        json.int_member("max_payload", max_payload)
+        json.bool_member("auth_required", has_credentials(cfg))
+        json.bool_member("tls_required", cfg.mode == "upgrade")
+    ]
+    if cfg.nkey.len > 0 && cfg.nonce {
+        members.push(json.text_member("nonce", server_nonce))
+    }
+    "INFO {json.stringify(json.object_value(members), 0)}\r\n"
+}
+
+fn enqueue(s: *Session, frame: str) {
+    select {
+        s.outbox <- frame => {}
+        else => {}
+    }
+}
+
+fn number(s: str) -> i64 {
+    text.parse_int(s) or 0
+}
+
+fn flag(v: json.Value, name: str) -> bool {
+    match json.field(v, name) {
+        Bool(b) => b
+        _ => false
+    }
+}
+
+fn matches(pattern: str, subject: str) -> bool {
+    let p = text.split(pattern, '.')
+    let s = text.split(subject, '.')
+    for i, token in p {
+        if token == ">" {
+            return s.len > i
+        }
+        if i >= s.len {
+            return false
+        }
+        if token != "*" && token != s[i] {
+            return false
+        }
+    }
+    p.len == s.len
+}
+
+fn nkey_ok(st: *Store, v: json.Value) -> bool {
+    let claimed = json.text_of(v, "nkey")
+    if claimed != st.settings.nkey {
+        return false
+    }
+    let raw = base32.decode(claimed) or return false
+    if raw.len != 35 {
+        return false
+    }
+    let signature = base64.decode_url(json.text_of(v, "sig")) or return false
+    ed25519.verify(raw[1..33], bytes(server_nonce), signature)
+}
+
+fn authorized(st: *Store, v: json.Value) -> bool {
+    let cfg = st.settings
+    if cfg.token.len > 0 && json.text_of(v, "auth_token") != cfg.token {
+        return false
+    }
+    if cfg.user.len > 0 && (json.text_of(v, "user") != cfg.user || json.text_of(v, "pass") != cfg.password) {
+        return false
+    }
+    if cfg.nkey.len > 0 {
+        return nkey_ok(st, v)
+    }
+    true
+}
+
+fn deliver(t: Target, subject: str, reply: str, block: str, payload: str) {
+    let sub = t.sub
+    sub.delivered += 1
+    let tail = if reply.len > 0 { "{reply} " } else { "" }
+    let frame = if block.len == 0 {
+        "MSG {subject} {sub.sid} {tail}{payload.len}\r\n{payload}\r\n"
+    } else {
+        "HMSG {subject} {sub.sid} {tail}{block.len} {block.len + payload.len}\r\n{block}{payload}\r\n"
+    }
+    enqueue(t.session, frame)
+    if sub.max > 0 && sub.delivered >= sub.max {
+        t.session.subs.delete(sub.sid)
+    }
+}
+
+fn route(st: *Store, from: *Session, subject: str, reply: str, block: str, payload: str) -> i64 {
+    var chosen: Target[] = []
+    var groups: [str: Target[]] = [:]
+    for id, s in st.sessions {
+        if s.id == from.id && !s.echo {
+            continue
+        }
+        for sid, sub in s.subs {
+            if !matches(sub.subject, subject) {
+                continue
+            }
+            if sub.queue.len == 0 {
+                chosen.push(Target { session: s, sub })
+            } else {
+                var members = groups[sub.queue] ?? []
+                members.push(Target { session: s, sub })
+                groups[sub.queue] = members
+            }
+        }
+    }
+    for queue, members in groups {
+        let turn = st.rotation[queue] ?? 0
+        st.rotation[queue] = turn + 1
+        chosen.push(members[turn % members.len])
+    }
+    for t in chosen {
+        deliver(t, subject, reply, block, payload)
+    }
+    chosen.len
+}
+
+fn answer_no_responders(st: *Store, s: *Session, reply: str) {
+    sync.lock(st.gate)
+    for sid, sub in s.subs {
+        if matches(sub.subject, reply) {
+            enqueue(s, "HMSG {reply} {sub.sid} 16 16\r\nNATS/1.0 503\r\n\r\n\r\n")
+        }
+    }
+    sync.unlock(st.gate)
+}
+
+fn send_damaged(st: *Store, s: *Session, subject: str) {
+    sync.lock(st.gate)
+    for sid, sub in s.subs {
+        if matches(sub.subject, subject) {
+            enqueue(s, "HMSG {subject} {sub.sid} 6 8\r\nHTTP/1hi\r\n")
+        }
+    }
+    sync.unlock(st.gate)
+}
+
+fn cmd_connect(st: *Store, s: *Session, line: str) -> bool {
+    let body = line[8..]
+    let v = json.parse(bytes(body)) or {
+        enqueue(s, "-ERR 'Invalid Connect'\r\n")
+        return false
+    }
+    sync.lock(st.gate)
+    st.connects.push(body)
+    let allowed = authorized(st, v)
+    sync.unlock(st.gate)
+    if !allowed {
+        enqueue(s, "-ERR 'Authorization Violation'\r\n")
+        return false
+    }
+    if flag(v, "no_responders") && !st.settings.headers {
+        enqueue(s, "-ERR 'no responders requires headers support'\r\n")
+        return false
+    }
+    s.echo = flag(v, "echo")
+    s.headers = flag(v, "headers")
+    s.no_responders = flag(v, "no_responders")
+    true
+}
+
+fn cmd_publish(st: *Store, s: *Session, r: *io.Reader, parts: str[], headed: bool) -> bool {
+    let counts = if headed { 2 } else { 1 }
+    if parts.len != 2 + counts && parts.len != 3 + counts {
+        return false
+    }
+    let subject = parts[1]
+    let reply = if parts.len == 3 + counts { parts[2] } else { "" }
+    let hlen = if headed { number(parts[parts.len - 2]) } else { 0 }
+    let total = number(parts[parts.len - 1])
+    if total > st.settings.max_payload {
+        enqueue(s, "-ERR 'Maximum Payload Violation'\r\n")
+        return false
+    }
+    let body = io.read_exact(r, total + 2) or return false
+    let block = str(body[..hlen])
+    let payload = str(body[hlen..total])
+    if subject == "fault.perm" {
+        enqueue(s, "-ERR 'Permissions Violation for Publish to \"fault.perm\"'\r\n")
+        return true
+    }
+    if subject == "fault.fatal" {
+        enqueue(s, "-ERR 'Stale Connection'\r\n")
+        return false
+    }
+    if subject == "fault.ping" {
+        enqueue(s, "PING\r\n")
+        return true
+    }
+    if subject == "fault.info" {
+        enqueue(s, info_text(st, 2048))
+        return true
+    }
+    if subject == "fault.damaged" {
+        send_damaged(st, s, "damaged.headers")
+        return true
+    }
+    sync.lock(st.gate)
+    let delivered = route(st, s, subject, reply, block, payload)
+    sync.unlock(st.gate)
+    if delivered == 0 && reply.len > 0 && s.no_responders && s.headers {
+        answer_no_responders(st, s, reply)
+    }
+    true
+}
+
+fn cmd_subscribe(st: *Store, s: *Session, parts: str[]) -> bool {
+    if parts.len != 3 && parts.len != 4 {
+        return false
+    }
+    let queue = if parts.len == 4 { parts[2] } else { "" }
+    let sid = number(parts[parts.len - 1])
+    sync.lock(st.gate)
+    s.subs[sid] = new(Sub { sid, subject: parts[1], queue, max: 0, delivered: 0 })
+    sync.unlock(st.gate)
+    true
+}
+
+fn cmd_unsubscribe(st: *Store, s: *Session, parts: str[]) -> bool {
+    if parts.len != 2 && parts.len != 3 {
+        return false
+    }
+    let sid = number(parts[1])
+    let max = if parts.len == 3 { number(parts[2]) } else { 0 }
+    sync.lock(st.gate)
+    match s.subs[sid] {
+        some(sub) => {
+            sub.max = max
+            if max == 0 || sub.delivered >= max {
+                s.subs.delete(sid)
+            }
+        }
+        none => {}
+    }
+    sync.unlock(st.gate)
+    true
+}
+
+fn cmd_ping(st: *Store, s: *Session) {
+    sync.lock(st.gate)
+    st.pings += 1
+    let quiet = st.settings.silent && st.pings > 1
+    sync.unlock(st.gate)
+    if !quiet {
+        enqueue(s, "PONG\r\n")
+    }
+}
+
+fn cmd_pong(st: *Store) {
+    sync.lock(st.gate)
+    st.pongs += 1
+    sync.unlock(st.gate)
+}
+
+fn handle_line(st: *Store, s: *Session, r: *io.Reader, line: str) -> bool {
+    let parts = text.fields(line)
+    if parts.len == 0 {
+        return true
+    }
+    let verb = text.upper(parts[0])
+    if verb == "CONNECT" {
+        return cmd_connect(st, s, line)
+    }
+    if verb == "PUB" {
+        return cmd_publish(st, s, r, parts, false)
+    }
+    if verb == "HPUB" {
+        return cmd_publish(st, s, r, parts, true)
+    }
+    if verb == "SUB" {
+        return cmd_subscribe(st, s, parts)
+    }
+    if verb == "UNSUB" {
+        return cmd_unsubscribe(st, s, parts)
+    }
+    if verb == "PING" {
+        cmd_ping(st, s)
+        return true
+    }
+    if verb == "PONG" {
+        cmd_pong(st)
+        return true
+    }
+    enqueue(s, "-ERR 'Unknown Protocol Operation'\r\n")
+    false
+}
+
+fn serve_requests(st: *Store, s: *Session, r: *io.Reader) {
+    for {
+        let line = io.read_line(r) or return
+        if !handle_line(st, s, r, line) {
+            return
+        }
+    }
+}
+
+fn write_frames(stream: io.Stream, s: *Session, done: chan[bool]) {
+    for {
+        let frame = <-s.outbox ?? break
+        io.write_str(stream, frame) or break
+    }
+    close(done)
+}
+
+fn new_session(st: *Store) -> *Session {
+    sync.lock(st.gate)
+    st.next_id += 1
+    let s = new(Session { id: st.next_id, echo: true, headers: false, no_responders: false, subs: [:], outbox: chan[str](4096) })
+    st.sessions[s.id] = s
+    sync.unlock(st.gate)
+    s
+}
+
+fn finish(st: *Store, s: *Session) {
+    sync.lock(st.gate)
+    st.sessions.delete(s.id)
+    close(s.outbox)
+    sync.unlock(st.gate)
+}
+
+fn run_session(st: *Store, stream: io.Stream, announce: bool) {
+    let s = new_session(st)
+    if announce {
+        io.write_str(stream, info_text(st, st.settings.max_payload)) or {
+            finish(st, s)
+            return
+        }
+    }
+    let done = chan[bool]()
+    spawn write_frames(stream, s, done)
+    if st.settings.refuse {
+        enqueue(s, "-ERR 'Maximum Connections Exceeded'\r\n")
+    } else {
+        serve_requests(st, s, io.reader(stream))
+    }
+    finish(st, s)
+    <-done
+    st.ended <- "session {s.id} ended"
+}
+
+fn serve(l: net.ListenerHandle, st: *Store) {
+    for {
+        let h = net.accept_handle(l) or return
+        spawn connection(h, st)
+    }
+}
+
+fn connection(h: net.ConnHandle, st: *Store) {
+    using c = net.adopt(h)
+    let plain = net.stream(c)
+    if st.settings.mode == "first" {
+        using t = tls.server(plain, st.config) or return
+        run_session(st, tls.stream(t), true)
+        return
+    }
+    if st.settings.mode == "upgrade" {
+        io.write_str(plain, info_text(st, st.settings.max_payload)) or return
+        using t = tls.server(plain, st.config) or return
+        run_session(st, tls.stream(t), false)
+        return
+    }
+    run_session(st, plain, true)
+}
+
+fn describe(e: nats.Error) -> str {
+    match e {
+        Connect => "Connect"
+        Closed => "Closed"
+        Timeout => "Timeout"
+        Protocol => "Protocol"
+        TooLarge => "TooLarge"
+        Tls => "Tls"
+        Unsupported => "Unsupported"
+        Auth(m) => "Auth({m})"
+        Server(m) => "Server({m})"
+        NoResponders => "NoResponders"
+        BadSubject => "BadSubject"
+        BadHeader => "BadHeader"
+        MaxPayload => "MaxPayload"
+        Draining => "Draining"
+        Argument => "Argument"
+        BadSeed => "BadSeed"
+    }
+}
+
+fn outcome(body: fn() ! nats.Error) -> str {
+    body() catch {
+        e => return describe(e)
+    }
+    "ok"
+}
+
+fn options(st: *Store) -> nats.Options {
+    nats.Options { port: st.port, timeout: 3000, name: "fixture" }
+}
+
+fn hdr(name: str, value: str) -> nats.Header {
+    nats.Header { name, value }
+}
+
+fn headers_text(m: nats.Message) -> str {
+    var parts: str[] = []
+    for h in m.headers {
+        parts.push("{h.name}={h.value}")
+    }
+    text.join(parts, ",")
+}
+
+fn show(m: nats.Message) -> str {
+    "{m.subject} reply={text.quote(m.reply)} status={m.status} headers=[{headers_text(m)}] payload={text.quote(str(m.payload))}"
+}
+
+fn payloads(ms: nats.Message[]) -> str {
+    var parts: str[] = []
+    for m in ms {
+        parts.push(str(m.payload))
+    }
+    text.join(parts, ", ")
+}
+
+fn pending(s: nats.Subscription) -> nats.Message[] {
+    var out: nats.Message[] = []
+    for {
+        var next: nats.Message? = none
+        select {
+            m = <-s.messages => {
+                next = m
+            }
+            else => {}
+        }
+        let msg = next ?? break
+        out.push(msg)
+    }
+    out
+}
+
+fn state_of(s: nats.Subscription) -> str {
+    var out = "open"
+    select {
+        m = <-s.messages => {
+            out = if m == none { "closed" } else { "message" }
+        }
+        else => {}
+    }
+    out
+}
+
+fn pending_errors(h: *nats.ClientHandle) -> str[] {
+    var out: str[] = []
+    for {
+        var next: str? = none
+        select {
+            e = <-h.errors => {
+                next = e
+            }
+            else => {}
+        }
+        let message = next ?? break
+        out.push(message)
+    }
+    out
+}
+
+fn subscription_count(st: *Store) -> i64 {
+    sync.lock(st.gate)
+    var n = 0
+    for id, s in st.sessions {
+        n += s.subs.len
+    }
+    sync.unlock(st.gate)
+    n
+}
+
+fn server_counts(st: *Store) -> str {
+    sync.lock(st.gate)
+    let counts = "pings {st.pings} pongs {st.pongs}"
+    sync.unlock(st.gate)
+    counts
+}
+
+fn show_connect(st: *Store, at: i64) {
+    sync.lock(st.gate)
+    let raw = st.connects[at]
+    sync.unlock(st.gate)
+    let v = json.parse(bytes(raw)) or {
+        print("connect {at}: unreadable")
+        return
+    }
+    let line = [
+        "name={json.text_of(v, "name")}"
+        "lang={json.text_of(v, "lang")}"
+        "version={json.text_of(v, "version")}"
+        "protocol={json.int_of(v, "protocol")}"
+        "verbose={flag(v, "verbose")}"
+        "pedantic={flag(v, "pedantic")}"
+        "headers={flag(v, "headers")}"
+        "no_responders={flag(v, "no_responders")}"
+        "echo={flag(v, "echo")}"
+        "tls_required={flag(v, "tls_required")}"
+    ]
+    print("connect {at}: {text.join(line, " ")}")
+    let credentials = [
+        "token={json.field_text(v, "auth_token") ?? "-"}"
+        "user={json.field_text(v, "user") ?? "-"}"
+        "pass={json.field_text(v, "pass") ?? "-"}"
+        "nkey={json.field_text(v, "nkey") ?? "-"}"
+        "sig={(json.field_text(v, "sig") ?? "").len}"
+    ]
+    print("connect {at} credentials: {text.join(credentials, " ")}")
+}
+
+fn handshake(st: *Store) ! nats.Error {
+    using c = nats.connect(options(st))?
+    let info = c.server_info()
+    print("info: id {info.server_id} name {info.server_name} version {info.version} host {info.host} proto {info.protocol}")
+    print("info: headers {info.headers} auth {info.auth_required} tls {info.tls_required} max_payload {info.max_payload}")
+    c.flush(3000)?
+    show_connect(st, 0)
+    using quiet = nats.connect(nats.Options { port: st.port, timeout: 3000, echo: false })?
+    quiet.flush(3000)?
+    show_connect(st, 1)
+}
+
+fn pubsub(st: *Store) ! nats.Error {
+    using a = nats.connect(options(st))?
+    using b = nats.connect(options(st))?
+    let single = a.subscribe("greet.*")?
+    let deep = a.subscribe("orders.>")?
+    print("subscribed: {single.subject} queue {text.quote(single.queue)}, {deep.subject}")
+    a.flush(3000)?
+    b.publish("greet.world", bytes("hello"))?
+    b.publish("greet.a.b", bytes("too deep"))?
+    b.publish("orders.eu.1", bytes(""))?
+    b.publish("orders.us", bytes("line1\r\nline2\r\n"))?
+    b.publish_with("greet.you", bytes("with reply"), nats.PublishOptions { reply: "answers.here" })?
+    b.publish("nobody.listens", bytes("x"))?
+    b.flush(3000)?
+    a.flush(3000)?
+    for m in pending(single) {
+        print("greet: {show(m)}")
+    }
+    for m in pending(deep) {
+        print("orders: {show(m)}")
+    }
+    print("subscription state: {state_of(single)}")
+}
+
+fn echoing(st: *Store) ! nats.Error {
+    using loud = nats.connect(options(st))?
+    var quiet_options = options(st)
+    quiet_options.echo = false
+    using quiet = nats.connect(quiet_options)?
+    let heard = loud.subscribe("echo.x")?
+    let muted = quiet.subscribe("echo.x")?
+    loud.flush(3000)?
+    quiet.flush(3000)?
+    loud.publish("echo.x", bytes("one"))?
+    loud.flush(3000)?
+    quiet.publish("echo.x", bytes("two"))?
+    quiet.flush(3000)?
+    loud.flush(3000)?
+    quiet.flush(3000)?
+    print("echo on hears: {payloads(pending(heard))}")
+    print("echo off hears: {payloads(pending(muted))}")
+}
+
+fn headers(st: *Store) ! nats.Error {
+    using a = nats.connect(options(st))?
+    using b = nats.connect(options(st))?
+    let s = a.subscribe("h.>")?
+    a.flush(3000)?
+    let sent = [hdr("Trace", "abc"), hdr("Tag", "one"), hdr("Tag", "two")]
+    b.publish_with("h.full", bytes("body"), nats.PublishOptions { headers: sent })?
+    b.publish_with("h.empty", bytes(""), nats.PublishOptions { headers: [hdr("Only", "header")], reply: "r.1" })?
+    b.publish_with("h.plain", bytes("none"), nats.PublishOptions {})?
+    b.publish_with("h.blank", bytes("v"), nats.PublishOptions { headers: [hdr("Blank", "")] })?
+    b.flush(3000)?
+    a.flush(3000)?
+    let got = pending(s)
+    for m in got {
+        print("{show(m)}")
+    }
+    print("lookup: {nats.header(got[0], "trace") ?? "none"} {nats.header(got[0], "TAG") ?? "none"} {nats.header(got[0], "missing") ?? "none"}")
+}
+
+fn queues(st: *Store) ! nats.Error {
+    using publisher = nats.connect(options(st))?
+    using w1 = nats.connect(options(st))?
+    using w2 = nats.connect(options(st))?
+    using w3 = nats.connect(options(st))?
+    let q1 = w1.queue_subscribe("jobs", "workers")?
+    let q2 = w2.queue_subscribe("jobs", "workers")?
+    let q3 = w3.queue_subscribe("jobs", "workers")?
+    let watcher = w1.subscribe("jobs")?
+    print("queue of member: {q1.queue}")
+    w1.flush(3000)?
+    w2.flush(3000)?
+    w3.flush(3000)?
+    for i in 0..6 {
+        publisher.publish("jobs", bytes("job {i}"))?
+    }
+    publisher.flush(3000)?
+    w1.flush(3000)?
+    w2.flush(3000)?
+    w3.flush(3000)?
+    print("member 1: {payloads(pending(q1))}")
+    print("member 2: {payloads(pending(q2))}")
+    print("member 3: {payloads(pending(q3))}")
+    print("plain subscriber: {payloads(pending(watcher))}")
+}
+
+fn unsubscribing(st: *Store) ! nats.Error {
+    using a = nats.connect(options(st))?
+    using b = nats.connect(options(st))?
+    let limited = a.subscribe("limited")?
+    nats.unsubscribe_after(limited, 2)?
+    let once = a.subscribe("once")?
+    nats.unsubscribe(once)?
+    nats.unsubscribe(once)?
+    print("count below one: {outcome(fn() ! nats.Error { nats.unsubscribe_after(limited, 0)? })}")
+    a.flush(3000)?
+    for i in 0..4 {
+        b.publish("limited", bytes("m{i}"))?
+    }
+    b.publish("once", bytes("late"))?
+    b.flush(3000)?
+    a.flush(3000)?
+    print("limited got: {payloads(pending(limited))}")
+    print("limited state: {state_of(limited)}")
+    print("once state: {state_of(once)}")
+    print("server subscriptions: {subscription_count(st)}")
+}
+
+fn respond(h: *nats.ClientHandle, s: nats.Subscription) {
+    for {
+        let m = <-s.messages ?? break
+        let seen = nats.header(m, "X-Echo") ?? "no"
+        let o = nats.PublishOptions { headers: [hdr("Seen", seen)] }
+        nats.publish_with_on(h, m.reply, bytes(text.upper(str(m.payload))), o) or break
+    }
+}
+
+fn ask(h: *nats.ClientHandle, done: chan[i64]) {
+    var answered = 0
+    for i in 0..10 {
+        let r = nats.request_on(h, "svc.upper", bytes("n{i}"), 3000) or break
+        if str(r.payload) == "N{i}" {
+            answered += 1
+        }
+    }
+    done <- answered
+}
+
+fn requests(st: *Store) ! nats.Error {
+    using svc = nats.connect(options(st))?
+    using c = nats.connect(options(st))?
+    let h = c.handle
+    let upper = svc.subscribe("svc.upper")?
+    let silent = svc.subscribe("svc.silent")?
+    spawn respond(svc.handle, upper)
+    svc.flush(3000)?
+    let first = c.request("svc.upper", bytes("ping"), 3000)?
+    print("request: status {first.status} payload {text.quote(str(first.payload))} headers [{headers_text(first)}]")
+    for word in ["a", "b", "c"] {
+        let r = c.request("svc.upper", bytes(word), 3000)?
+        print("request {word}: {str(r.payload)}")
+    }
+    let echoed = c.request_with("svc.upper", [hdr("X-Echo", "yes")], bytes("hdr"), 3000)?
+    print("request with headers: {str(echoed.payload)} [{headers_text(echoed)}]")
+    print("no answer: {outcome(fn() ! nats.Error { nats.request_on(h, "svc.silent", bytes("x"), 100)? })}")
+    print("no responders: {outcome(fn() ! nats.Error { nats.request_on(h, "svc.nobody", bytes("x"), 3000)? })}")
+    print("bad subject: {outcome(fn() ! nats.Error { nats.request_on(h, "svc bad", bytes("x"), 3000)? })}")
+    print("late request still works: {str(c.request("svc.upper", bytes("again"), 3000)?.payload)}")
+    let shared = c.handle
+    let done = chan[i64](4)
+    for _ in 0..4 {
+        spawn ask(shared, done)
+    }
+    var total = 0
+    for _ in 0..4 {
+        total += (<-done) ?? 0
+    }
+    print("concurrent requests answered: {total}")
+    print("server subscriptions: {subscription_count(st)}")
+    print("silent subscription: {silent.subject}")
+}
+
+fn limits(st: *Store) ! nats.Error {
+    using c = nats.connect(options(st))?
+    let h = c.handle
+    print("max_payload {c.server_info().max_payload}")
+    print("publish 1024: {outcome(fn() ! nats.Error { nats.publish_on(h, "m.big", bytes(text.repeat("x", 1024)))? })}")
+    print("publish 1025: {outcome(fn() ! nats.Error { nats.publish_on(h, "m.big", bytes(text.repeat("x", 1025)))? })}")
+    let one = nats.PublishOptions { headers: [hdr("K", "v")] }
+    print("headers and 1006: {outcome(fn() ! nats.Error { nats.publish_with_on(h, "m.big", bytes(text.repeat("x", 1006)), one)? })}")
+    print("headers and 1007: {outcome(fn() ! nats.Error { nats.publish_with_on(h, "m.big", bytes(text.repeat("x", 1007)), one)? })}")
+    for subject in ["a b", "a..b", ".a", "a.", "", "a.*", "a.>", "a\tb", "a.b\n"] {
+        print("publish {text.quote(subject)}: {outcome(fn() ! nats.Error { nats.publish_on(h, subject, bytes("x"))? })}")
+    }
+    print("reply a b: {outcome(fn() ! nats.Error { nats.publish_with_on(h, "a", bytes("x"), nats.PublishOptions { reply: "a b" })? })}")
+    print("reply wildcard: {outcome(fn() ! nats.Error { nats.publish_with_on(h, "a", bytes("x"), nats.PublishOptions { reply: "a.*" })? })}")
+    for subject in ["a..b", "a.>.b", "a b", "", "a.*.c", "a.>", ">", "*", "a.b*", "a.**"] {
+        print("subscribe {text.quote(subject)}: {outcome(fn() ! nats.Error { nats.subscribe_on(h, subject)? })}")
+    }
+    print("queue empty: {outcome(fn() ! nats.Error { nats.queue_subscribe_on(h, "a", "")? })}")
+    print("queue with space: {outcome(fn() ! nats.Error { nats.queue_subscribe_on(h, "a", "b c")? })}")
+    for bad in [hdr("", "v"), hdr("a:b", "v"), hdr("a b", "v"), hdr("ok", "line\nbreak"), hdr("ok", "line\rbreak"), hdr("ok", "fine")] {
+        print("header {text.quote(bad.name)}={text.quote(bad.value)}: {outcome(fn() ! nats.Error { nats.publish_with_on(h, "m.h", bytes("x"), nats.PublishOptions { headers: [bad] })? })}")
+    }
+    c.flush(3000)?
+    print("server errors: {pending_errors(c.handle).len}")
+}
+
+fn no_headers(st: *Store) ! nats.Error {
+    using c = nats.connect(options(st))?
+    let h = c.handle
+    print("headers announced: {c.server_info().headers}")
+    print("with headers: {outcome(fn() ! nats.Error { nats.publish_with_on(h, "x", bytes("y"), nats.PublishOptions { headers: [hdr("a", "b")] })? })}")
+    print("without headers: {outcome(fn() ! nats.Error { nats.publish_with_on(h, "x", bytes("y"), nats.PublishOptions { reply: "r" })? })}")
+    c.flush(3000)?
+    show_connect(st, 0)
+}
+
+fn damaged_headers(st: *Store) ! nats.Error {
+    using c = nats.connect(options(st))?
+    let h = c.handle
+    let s = c.subscribe("damaged.>")?
+    c.flush(3000)?
+    c.publish("fault.damaged", bytes("x"))?
+    c.publish("damaged.after", bytes("next"))?
+    c.flush(3000)?
+    for m in pending(s) {
+        print("damaged: {show(m)}")
+    }
+    print("errors: {pending_errors(h)}")
+    print("still connected: {outcome(fn() ! nats.Error { nats.flush_on(h, 3000)? })}")
+    print("subscription state: {state_of(s)}")
+}
+
+fn client_limits(st: *Store) ! nats.Error {
+    using sender = nats.connect(options(st))?
+    var small = options(st)
+    small.limits = nats.Limits { payload: 64 }
+    using c = nats.connect(small)?
+    let h = c.handle
+    let big = c.subscribe("big")?
+    c.flush(3000)?
+    sender.publish("big", bytes(text.repeat("x", 200)))?
+    sender.flush(3000)?
+    print("payload over limit: {outcome(fn() ! nats.Error { nats.flush_on(h, 3000)? })}")
+    print("after: {outcome(fn() ! nats.Error { nats.publish_on(h, "big", bytes("x"))? })}")
+    print("subscription state: {state_of(big)}")
+    var short = options(st)
+    short.limits = nats.Limits { control_line: 24 }
+    using d = nats.connect(short)?
+    let hd = d.handle
+    let long = d.subscribe("a.very.long.subject.name.that.overflows")?
+    d.flush(3000)?
+    sender.publish("a.very.long.subject.name.that.overflows", bytes("x"))?
+    sender.flush(3000)?
+    print("control line over limit: {outcome(fn() ! nats.Error { nats.flush_on(hd, 3000)? })}")
+    print("subscription state: {state_of(long)}")
+}
+
+fn server_errors(st: *Store) ! nats.Error {
+    using c = nats.connect(options(st))?
+    let h = c.handle
+    c.publish("fault.perm", bytes("x"))?
+    c.flush(3000)?
+    print("recoverable: {pending_errors(c.handle)}")
+    c.publish("still.open", bytes("x"))?
+    print("flush after recoverable: {outcome(fn() ! nats.Error { nats.flush_on(h, 3000)? })}")
+    c.publish("fault.fatal", bytes("x"))?
+    let first = <-c.handle.errors ?? "closed first"
+    let second = <-c.handle.errors
+    print("fatal: {first}, channel {if second == none { "closed" } else { "open" }}")
+    print("publish after fatal: {outcome(fn() ! nats.Error { nats.publish_on(h, "x", bytes("y"))? })}")
+    print("flush after fatal: {outcome(fn() ! nats.Error { nats.flush_on(h, 3000)? })}")
+    print("subscribe after fatal: {outcome(fn() ! nats.Error { nats.subscribe_on(h, "x")? })}")
+}
+
+fn slow_consumer(st: *Store) ! nats.Error {
+    using sender = nats.connect(options(st))?
+    var o = options(st)
+    o.buffer = 2
+    using c = nats.connect(o)?
+    let s = c.subscribe("slow.x")?
+    c.flush(3000)?
+    for i in 0..6 {
+        sender.publish("slow.x", bytes("m{i}"))?
+    }
+    sender.flush(3000)?
+    c.flush(3000)?
+    print("kept: {payloads(pending(s))}")
+    print("dropped: {nats.dropped(s)}")
+    print("errors: {pending_errors(c.handle)}")
+    c.publish("fault.info", bytes("x"))?
+    c.flush(3000)?
+    print("max_payload after INFO update: {c.server_info().max_payload}")
+}
+
+fn server_ping(st: *Store) ! nats.Error {
+    using c = nats.connect(options(st))?
+    c.publish("fault.ping", bytes("x"))?
+    c.flush(3000)?
+    c.flush(3000)?
+    print("server counts: {server_counts(st)}")
+}
+
+fn wait_for_pings(st: *Store, at_least: i64) -> bool {
+    for _ in 0..500 {
+        sync.lock(st.gate)
+        let n = st.pings
+        sync.unlock(st.gate)
+        if n >= at_least {
+            return true
+        }
+        sleep(10)
+    }
+    false
+}
+
+fn keepalive(st: *Store) ! nats.Error {
+    var o = options(st)
+    o.ping_interval = 20
+    o.max_pings = 1000
+    using c = nats.connect(o)?
+    let h = c.handle
+    print("pings sent on their own: {wait_for_pings(st, 4)}")
+    print("still usable: {outcome(fn() ! nats.Error { nats.flush_on(h, 3000)? })}")
+    var invalid = options(st)
+    invalid.ping_interval = 20
+    invalid.max_pings = 0
+    print("max_pings 0: {try_connect(invalid)}")
+    invalid.max_pings = -1
+    print("max_pings -1: {try_connect(invalid)}")
+    invalid.max_pings = 1
+    print("max_pings 1: {try_connect(invalid)}")
+    invalid.ping_interval = 0
+    invalid.max_pings = 0
+    print("no pings, max_pings 0: {try_connect(invalid)}")
+}
+
+fn stalled(st: *Store) ! nats.Error {
+    var o = options(st)
+    o.ping_interval = 30
+    o.max_pings = 2
+    using c = nats.connect(o)?
+    let h = c.handle
+    let s = c.subscribe("never")?
+    var ended = "still open"
+    select {
+        m = <-s.messages => {
+            ended = "subscription closed"
+        }
+        after(5000) => {
+            ended = "gave up"
+        }
+    }
+    print("stalled server: {ended}")
+    print("publish after: {outcome(fn() ! nats.Error { nats.publish_on(h, "x", bytes("y"))? })}")
+    print("server saw the pings: {wait_for_pings(st, 3)}")
+    print("server counts: {server_counts(st)}")
+}
+
+fn count_publishes(h: *nats.ClientHandle, done: chan[i64]) {
+    var made = 0
+    for i in 0..25 {
+        nats.publish_on(h, "shared.x", bytes("w{i}")) or break
+        made += 1
+    }
+    done <- made
+}
+
+fn ownership(st: *Store) ! nats.Error {
+    using c = nats.connect(options(st))?
+    let view = c.handle
+    let s = c.subscribe("owned")?
+    c.publish("owned", bytes("v"))?
+    c.flush(3000)?
+    nats.close_client(c)
+    nats.close_client(c)
+    nats.close_client_on(view)
+    var owner_publish = "ok"
+    c.publish("a", bytes("b")) catch {
+        e => {
+            owner_publish = describe(e)
+        }
+    }
+    print("owner publish: {owner_publish}")
+    print("view publish: {outcome(fn() ! nats.Error { nats.publish_on(view, "a", bytes("b"))? })}")
+    print("view subscribe: {outcome(fn() ! nats.Error { nats.subscribe_on(view, "a")? })}")
+    var owner_flush = "ok"
+    c.flush(3000) catch {
+        e => {
+            owner_flush = describe(e)
+        }
+    }
+    print("owner flush: {owner_flush}")
+    print("view flush: {outcome(fn() ! nats.Error { nats.flush_on(view, 3000)? })}")
+    print("view request: {outcome(fn() ! nats.Error { nats.request_on(view, "a", bytes("b"), 100)? })}")
+    print("unsubscribe: {outcome(fn() ! nats.Error { nats.unsubscribe(s)? })}")
+    print("drain: {outcome(fn() ! nats.Error { nats.drain_on(view, 3000)? })}")
+    print("kept message: {payloads(pending(s))}, subscription {state_of(s)}")
+    print("errors channel: {if (<-view.errors) == none { "closed" } else { "open" }}")
+    print("ended: {(<-st.ended) ?? "?"}")
+
+    using d = nats.connect(options(st))?
+    using e = nats.connect(options(st))?
+    let shared = d.handle
+    let sink = e.subscribe("shared.x")?
+    e.flush(3000)?
+    let done = chan[i64](8)
+    for _ in 0..8 {
+        spawn count_publishes(shared, done)
+    }
+    var total = 0
+    for _ in 0..8 {
+        total += (<-done) ?? 0
+    }
+    d.flush(3000)?
+    e.flush(3000)?
+    print("workers {total}, received {pending(sink).len}")
+
+    using var moved = nats.connect(options(st))?
+    let kept = nats.detach(mut moved)
+    using again = nats.adopt(kept)
+    let h = again.handle
+    print("adopted: {outcome(fn() ! nats.Error { nats.publish_on(h, "adopted", bytes("x"))? })}")
+}
+
+fn leave(st: *Store) ! nats.Error {
+    using c = nats.connect(options(st))?
+    c.publish("scoped", bytes("1"))?
+}
+
+fn detached_survives(st: *Store) ! nats.Error {
+    using var c = nats.connect(options(st))?
+    let kept = nats.detach(mut c)
+    print("detached: {outcome(fn() ! nats.Error { nats.publish_on(kept, "x", bytes("y"))? })}")
+    nats.close_client_on(kept)
+    print("closed through the view: {outcome(fn() ! nats.Error { nats.publish_on(kept, "x", bytes("y"))? })}")
+}
+
+fn draining(st: *Store) ! nats.Error {
+    using worker = nats.connect(options(st))?
+    let h = worker.handle
+    using sender = nats.connect(options(st))?
+    let s = worker.subscribe("drain.x")?
+    let other = worker.subscribe("drain.y")?
+    worker.flush(3000)?
+    for i in 0..5 {
+        sender.publish("drain.x", bytes("d{i}"))?
+    }
+    sender.publish("drain.y", bytes("y0"))?
+    sender.flush(3000)?
+    print("drain: {outcome(fn() ! nats.Error { nats.drain_on(h, 3000)? })}")
+    print("received: {payloads(pending(s))}; {payloads(pending(other))}")
+    print("states: {state_of(s)}, {state_of(other)}")
+    print("publish after drain: {outcome(fn() ! nats.Error { nats.publish_on(h, "x", bytes("y"))? })}")
+    print("drain twice: {outcome(fn() ! nats.Error { nats.drain_on(h, 3000)? })}")
+    print("ended: {(<-st.ended) ?? "?"}")
+    print("server subscriptions: {subscription_count(st)}")
+}
+
+fn try_connect(o: nats.Options) -> str {
+    using c = nats.connect(o) catch {
+        e => return describe(e)
+    }
+    "connected"
+}
+
+const seed_a: str = "SUAJ2YNRTXX72WTAXKCEV5ES5QWMIRCJYVUXWMTJDFYDXLADDSXH6YALCA"
+
+const seed_b: str = "SUAEZTIITMUP7FW2TW3MGRXMCFHA6W4KGGPTLK5GETNIZ5XNJ64KN63OVI"
+
+fn token_auth(st: *Store) ! nats.Error {
+    var o = options(st)
+    print("no credentials: {try_connect(o)}")
+    o.token = "wrong"
+    print("wrong token: {try_connect(o)}")
+    o.token = "s3cret"
+    print("right token: {try_connect(o)}")
+    var user = options(st)
+    user.username = "s3cret"
+    user.password = "x"
+    print("user instead of token: {try_connect(user)}")
+    show_connect(st, 2)
+    using c = nats.connect(o)?
+    print("auth_required: {c.server_info().auth_required}")
+}
+
+fn password_auth(st: *Store) ! nats.Error {
+    var o = options(st)
+    print("no credentials: {try_connect(o)}")
+    o.username = "alice"
+    o.password = "wrong"
+    print("wrong password: {try_connect(o)}")
+    o.username = "bob"
+    o.password = "s3cret"
+    print("wrong user: {try_connect(o)}")
+    o.username = "alice"
+    o.password = "s3cret"
+    print("right credentials: {try_connect(o)}")
+    show_connect(st, 3)
+}
+
+fn nkey_auth(st: *Store) ! nats.Error {
+    var o = options(st)
+    print("no seed: {try_connect(o)}")
+    o.nkey_seed = seed_b
+    print("other seed: {try_connect(o)}")
+    o.nkey_seed = "SUAJ2YNRTYX72WTAXKCEV5ES5QWMIRCJYVUXWMTJDFYDXLADDSXH6YALCA"
+    print("damaged seed: {try_connect(o)}")
+    o.nkey_seed = seed_a
+    print("right seed: {try_connect(o)}")
+    show_connect(st, 2)
+}
+
+fn nkey_without_nonce(st: *Store) ! nats.Error {
+    var o = options(st)
+    o.nkey_seed = seed_a
+    print("no nonce announced: {try_connect(o)}")
+}
+
+fn refused_server(st: *Store) ! nats.Error {
+    print("server full: {try_connect(options(st))}")
+}
+
+fn free_port() -> i64 {
+    using l = net.listen("127.0.0.1", 0) or return 0
+    l.handle.addr.port
+}
+
+fn refused() {
+    let port = free_port()
+    print("nothing listening: {try_connect(nats.Options { port, connect_timeout: 1000 })}")
+}
+
+struct Script {
+    data: u8[]
+    at: i64
+}
+
+fn scripted(reply: str) -> io.Stream {
+    let state = new(Script { data: bytes(reply), at: 0 })
+    io.Stream {
+        read: fn(buf) {
+            let left = state.data.len - state.at
+            if left == 0 {
+                return 0
+            }
+            let n = if left < buf.len { left } else { buf.len }
+            let k = io.copy(buf[..n], state.data[state.at..state.at + n])
+            state.at += k
+            k
+        }
+        write: fn(data) { data.len }
+        close: fn() {}
+    }
+}
+
+struct Stall {
+    script: u8[]
+    at: i64
+    armed: bool
+    closed: bool
+    gate: chan[bool]
+}
+
+fn stalling(state: *Stall) -> io.Stream {
+    io.Stream {
+        read: fn(buf) {
+            let left = state.script.len - state.at
+            if left == 0 {
+                <-state.gate
+                return 0
+            }
+            let n = if left < buf.len { left } else { buf.len }
+            let k = io.copy(buf[..n], state.script[state.at..state.at + n])
+            state.at += k
+            k
+        }
+        write: fn(data) {
+            if state.armed {
+                <-state.gate
+                fail io.Error.BrokenPipe
+            }
+            data.len
+        }
+        close: fn() {
+            if !state.closed {
+                state.closed = true
+                close(state.gate)
+            }
+        }
+    }
+}
+
+fn blocked_publish(h: *nats.ClientHandle, done: chan[str]) {
+    done <- outcome(fn() ! nats.Error { nats.publish_on(h, "stalled.x", bytes("y"))? })
+}
+
+fn stalled_write() {
+    let info = "INFO {{\"server_id\":\"x\",\"max_payload\":1024}}\r\nPONG\r\n"
+    let state = new(Stall { script: bytes(info), at: 0, armed: false, closed: false, gate: chan[bool]() })
+    using c = nats.connect_stream(stalling(state), nats.Options { ping_interval: 30, max_pings: 2 }) catch {
+        e => {
+            print("stalled write: {describe(e)}")
+            return
+        }
+    }
+    state.armed = true
+    let done = chan[str](1)
+    spawn blocked_publish(c.handle, done)
+    var result = "still blocked"
+    select {
+        r = <-done => {
+            result = r ?? "none"
+        }
+        after(5000) => {
+            result = "gave up"
+        }
+    }
+    print("publish blocked on a stalled peer: {result}")
+    print("stream closed: {state.closed}")
+}
+
+fn faulty(label: str, reply: str) {
+    using client = nats.connect_stream(scripted(reply), nats.Options {}) catch {
+        e => {
+            print("{label}: {describe(e)}")
+            return
+        }
+    }
+    print("{label}: connected")
+}
+
+fn malformed_servers() {
+    let info = "INFO {{\"server_id\":\"x\",\"max_payload\":1024}}\r\n"
+    faulty("garbage", "GARBAGE\r\n")
+    faulty("bad json", "INFO {{not json}}\r\n")
+    faulty("no PONG", info)
+    faulty("rejected", "{info}-ERR 'Authorization Violation'\r\n")
+    faulty("rejected text", "{info}-ERR 'Maximum Connections Exceeded'\r\n")
+    faulty("accepted", "{info}+OK\r\nPONG\r\n")
+    faulty("full before INFO", "-ERR 'Maximum Connections Exceeded'\r\n")
+    faulty("pinged first", "{info}PING\r\nPONG\r\n")
+    faulty("bad length", "{info}MSG a 1 notanumber\r\n")
+}
+
+fn encrypted(st: *Store) ! nats.Error {
+    var o = options(st)
+    o.tls_config = tls.Config { server_name: "localhost", roots: roots() }
+    using c = nats.connect(o)?
+    print("upgraded: tls_required {c.server_info().tls_required}")
+    let s = c.subscribe("secure.x")?
+    c.flush(3000)?
+    c.publish("secure.x", bytes("over tls"))?
+    c.flush(3000)?
+    print("received: {payloads(pending(s))}")
+    show_connect(st, 0)
+    var wrong = options(st)
+    wrong.tls_config = tls.Config { server_name: "other.example", roots: roots() }
+    print("wrong server name: {try_connect(wrong)}")
+    var untrusted = options(st)
+    untrusted.tls_config = tls.Config { server_name: "localhost" }
+    print("untrusted certificate: {try_connect(untrusted)}")
+}
+
+fn plain_with_tls_required(st: *Store) ! nats.Error {
+    var o = options(st)
+    o.require_tls = true
+    print("plain server, TLS required: {try_connect(o)}")
+    print("plain server: {try_connect(options(st))}")
+}
+
+fn handshake_first(st: *Store) ! nats.Error {
+    let config = tls.Config { server_name: "localhost", roots: roots() }
+    using c = nats.connect_tls(options(st), config)?
+    let s = c.subscribe("first.x")?
+    c.flush(3000)?
+    c.publish("first.x", bytes("handshake first"))?
+    c.flush(3000)?
+    print("received: {payloads(pending(s))}")
+    print("info after TLS: {c.server_info().server_id}")
+    show_connect(st, 0)
+    let wrong = tls.Config { server_name: "other.example", roots: roots() }
+    using failed = nats.connect_tls(options(st), wrong) catch {
+        e => {
+            print("wrong server name: {describe(e)}")
+            return
+        }
+    }
+    print("wrong server name accepted")
+}
+
+fn with_server(label: str, settings: Settings, body: fn(*Store) ! nats.Error) {
+    using l = net.listen("127.0.0.1", 0) or {
+        print("{label}: listen failed")
+        return
+    }
+    let st = new_store(settings, l.handle.addr.port)
+    spawn serve(l.handle, st)
+    body(st) catch {
+        e => print("{label} failed: {describe(e)}")
+    }
+}
+
+fn main() {
+    let plain = open_settings()
+    with_server("handshake", plain, handshake)
+    with_server("pubsub", plain, pubsub)
+    with_server("echo", plain, echoing)
+    with_server("headers", plain, headers)
+    with_server("queues", plain, queues)
+    with_server("unsubscribe", plain, unsubscribing)
+    with_server("requests", plain, requests)
+    var small = open_settings()
+    small.max_payload = 1024
+    with_server("limits", small, limits)
+    var bare = open_settings()
+    bare.headers = false
+    with_server("no headers", bare, no_headers)
+    with_server("client limits", plain, client_limits)
+    with_server("server errors", plain, server_errors)
+    with_server("slow consumer", plain, slow_consumer)
+    with_server("server ping", plain, server_ping)
+    with_server("keepalive", plain, keepalive)
+    var quiet = open_settings()
+    quiet.silent = true
+    with_server("stalled", quiet, stalled)
+    stalled_write()
+    with_server("damaged headers", plain, damaged_headers)
+    with_server("ownership", plain, ownership)
+    with_server("scoped", plain, fn(st) ! nats.Error {
+        leave(st)?
+        print("scoped: {(<-st.ended) ?? "?"}")
+    })
+    with_server("detached", plain, detached_survives)
+    with_server("draining", plain, draining)
+    var tokened = open_settings()
+    tokened.token = "s3cret"
+    with_server("token", tokened, token_auth)
+    var passworded = open_settings()
+    passworded.user = "alice"
+    passworded.password = "s3cret"
+    with_server("password", passworded, password_auth)
+    var keyed = open_settings()
+    keyed.nkey = nats.public_nkey(seed_a) or ""
+    with_server("nkey", keyed, nkey_auth)
+    keyed.nonce = false
+    with_server("nkey without nonce", keyed, nkey_without_nonce)
+    var full = open_settings()
+    full.refuse = true
+    with_server("full", full, refused_server)
+    refused()
+    malformed_servers()
+    var upgraded = open_settings()
+    upgraded.mode = "upgrade"
+    with_server("tls upgrade", upgraded, encrypted)
+    with_server("plain", plain, plain_with_tls_required)
+    var first = open_settings()
+    first.mode = "first"
+    with_server("tls first", first, handshake_first)
+}
