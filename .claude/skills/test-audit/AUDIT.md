@@ -6,7 +6,7 @@ Prune low-value tests in coherent batches, one owner per batch. Judge each test 
 
 For each candidate, read:
 
-- the whole test;
+- the whole test, and every program that reads it by name (`rg -w <name> compiler site`). A `compiler/tests` program that drives a fixture differently from `lowtest`, such as with a held-open stdin, is the keeper of what the fixture alone cannot show;
 - the production owner and its callers;
 - sibling fixtures and tests that might also cover the contract;
 - the `## Tests` entry that describes it;
