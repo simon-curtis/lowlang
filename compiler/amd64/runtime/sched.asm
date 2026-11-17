@@ -718,19 +718,20 @@ rt_steal:
 	push r14
 	xor r13d, r13d
 1:
+	mov rbx, [rip+rt_nm]
 	rdtsc
 	mov eax, eax
 	xor edx, edx
-	div qword ptr [rip+rt_nm]
+	div rbx
 	mov r12, rdx
 	xor r14d, r14d
 2:
-	cmp r14, [rip+rt_nm]
+	cmp r14, rbx
 	jae 7f
 	lea rax, [r12+r14]
-	cmp rax, [rip+rt_nm]
+	cmp rax, rbx
 	jb 3f
-	sub rax, [rip+rt_nm]
+	sub rax, rbx
 3:
 	lea rcx, [rip+rt_allm]
 	mov rdi, [rcx+8*rax]
