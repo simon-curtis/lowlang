@@ -1,0 +1,730 @@
+import std/io
+import std/text
+
+const max_length = 268435455
+const chunk = 65536
+
+/// A variable byte integer read from a buffer.
+pub struct Varint {
+    /// The decoded value, from `0` to `268435455`.
+    pub value: i64
+    /// The number of bytes it occupied, from `1` to `4`.
+    pub size: i64
+}
+
+/// Appends `n` to `out` as a variable byte integer of one to four bytes.
+///
+/// Fails with `TooLarge` when `n` is negative or above `268435455`.
+pub fn put_variable(mut out: u8[], n: i64) ! Error {
+    if n < 0 || n > max_length {
+        fail TooLarge
+    }
+    var rest = n
+    for {
+        var b = u8(rest & 0x7F)
+        rest = rest >> 7
+        if rest > 0 {
+            b = b | 0x80
+        }
+        out.push(b)
+        if rest == 0 {
+            break
+        }
+    }
+}
+
+/// Reads the variable byte integer that starts at `at` in `data`.
+///
+/// Fails with `Malformed` when `data` ends inside the integer, when it uses more than four bytes, or when it is not in the shortest form.
+pub fn read_variable(data: u8[], at: i64) -> Varint ! Error {
+    var value = 0
+    var size = 0
+    for size < 4 {
+        if at + size >= data.len {
+            fail Malformed
+        }
+        let b = i64(data[at + size])
+        value += (b & 0x7F) << (7 * size)
+        size += 1
+        if b & 0x80 == 0 {
+            if size > 1 && b == 0 {
+                fail Malformed
+            }
+            return Varint { value, size }
+        }
+    }
+    fail Malformed
+}
+
+fn put_string(mut out: u8[], s: str) ! Error {
+    if !valid_string(s) {
+        fail InvalidString
+    }
+    io.put_be16(mut out, s.len)
+    text.append(mut out, s)
+}
+
+fn put_binary(mut out: u8[], b: u8[]) ! Error {
+    if b.len > 65535 {
+        fail TooLarge
+    }
+    io.put_be16(mut out, b.len)
+    io.append(mut out, b)
+}
+
+fn put_topic(mut out: u8[], topic: str) ! Error {
+    if !valid_topic_name(topic) {
+        fail InvalidTopic
+    }
+    put_string(mut out, topic)?
+}
+
+fn frame(kind: i64, flags: i64, body: u8[]) -> u8[] ! Error {
+    var out: u8[] = []
+    out.push(u8(kind << 4 | flags))
+    put_variable(mut out, body.len)?
+    io.append(mut out, body)
+    out
+}
+
+fn check_id(id: i64) ! Error {
+    if id < 1 || id > 65535 {
+        fail Invalid
+    }
+}
+
+fn check_qos(qos: i64) ! Error {
+    if qos < 0 || qos > 2 {
+        fail Invalid
+    }
+}
+
+fn encode_connect(c: Connect) -> u8[] ! Error {
+    let v5 = c.version == Version.V5
+    if c.keep_alive < 0 || c.keep_alive > 65535 {
+        fail Invalid
+    }
+    var body: u8[] = []
+    put_string(mut body, "MQTT")?
+    body.push(u8(c.version.index))
+    var flags = 0
+    if c.clean_start {
+        flags = flags | 0x02
+    }
+    match c.will {
+        some(w) => {
+            check_qos(w.qos)?
+            flags = flags | 0x04 | (w.qos << 3)
+            if w.retain {
+                flags = flags | 0x20
+            }
+        }
+        none => {}
+    }
+    match c.username {
+        some(u) => { flags = flags | 0x80 }
+        none => {}
+    }
+    match c.password {
+        some(pw) => {
+            if !v5 && c.username == none {
+                fail Invalid
+            }
+            flags = flags | 0x40
+        }
+        none => {}
+    }
+    body.push(u8(flags))
+    io.put_be16(mut body, c.keep_alive)
+    if v5 {
+        put_properties(mut body, c.properties, k_connect)?
+    }
+    put_string(mut body, c.client_id)?
+    match c.will {
+        some(w) => {
+            if v5 {
+                put_properties(mut body, w.properties, k_will)?
+            }
+            put_topic(mut body, w.topic)?
+            put_binary(mut body, w.payload)?
+        }
+        none => {}
+    }
+    match c.username {
+        some(u) => { put_string(mut body, u)? }
+        none => {}
+    }
+    match c.password {
+        some(pw) => { put_binary(mut body, pw)? }
+        none => {}
+    }
+    frame(k_connect, 0, body)?
+}
+
+fn encode_connack(c: Connack, v: Version) -> u8[] ! Error {
+    var body: u8[] = []
+    body.push(if c.session_present { 1 } else { 0 })
+    body.push(u8(c.code))
+    if v == Version.V5 {
+        put_properties(mut body, c.properties, k_connack)?
+    }
+    frame(k_connack, 0, body)?
+}
+
+fn encode_publish(m: Publish, v: Version) -> u8[] ! Error {
+    check_qos(m.qos)?
+    if m.qos == 0 && m.dup {
+        fail Invalid
+    }
+    var body: u8[] = []
+    let aliased = v == Version.V5 && m.topic.len == 0 && m.properties.topic_alias != none
+    if aliased {
+        put_string(mut body, "")?
+    } else {
+        put_topic(mut body, m.topic)?
+    }
+    if m.qos > 0 {
+        check_id(m.id)?
+        io.put_be16(mut body, m.id)
+    }
+    if v == Version.V5 {
+        put_properties(mut body, m.properties, k_publish)?
+    }
+    io.append(mut body, m.payload)
+    var flags = m.qos << 1
+    if m.dup {
+        flags = flags | 8
+    }
+    if m.retain {
+        flags = flags | 1
+    }
+    frame(k_publish, flags, body)?
+}
+
+fn encode_ack(kind: i64, a: Ack, v: Version) -> u8[] ! Error {
+    check_id(a.id)?
+    var body: u8[] = []
+    io.put_be16(mut body, a.id)
+    if v == Version.V5 {
+        let props = property_bytes(a.properties, kind)?
+        if a.code != 0 || props.len > 0 {
+            body.push(u8(a.code))
+        }
+        if props.len > 0 {
+            put_variable(mut body, props.len)?
+            io.append(mut body, props)
+        }
+    }
+    let flags = if kind == k_pubrel { 2 } else { 0 }
+    frame(kind, flags, body)?
+}
+
+fn subscription_options(f: Filter, v: Version) -> u8 ! Error {
+    check_qos(f.qos)?
+    if v == Version.V311 {
+        return u8(f.qos)
+    }
+    if f.retain_handling < 0 || f.retain_handling > 2 {
+        fail Invalid
+    }
+    if f.no_local && text.starts_with(f.filter, "$share/") {
+        fail Invalid
+    }
+    var o = f.qos | (f.retain_handling << 4)
+    if f.no_local {
+        o = o | 4
+    }
+    if f.retain_as_published {
+        o = o | 8
+    }
+    u8(o)
+}
+
+fn encode_subscribe(s: Subscribe, v: Version) -> u8[] ! Error {
+    check_id(s.id)?
+    if s.filters.len == 0 {
+        fail Invalid
+    }
+    var body: u8[] = []
+    io.put_be16(mut body, s.id)
+    if v == Version.V5 {
+        put_properties(mut body, s.properties, k_subscribe)?
+    }
+    for f in s.filters {
+        if !valid_filter(f.filter) {
+            fail InvalidTopic
+        }
+        put_string(mut body, f.filter)?
+        let options = subscription_options(f, v)?
+        body.push(options)
+    }
+    frame(k_subscribe, 2, body)?
+}
+
+fn encode_suback(s: Suback, v: Version) -> u8[] ! Error {
+    check_id(s.id)?
+    var body: u8[] = []
+    io.put_be16(mut body, s.id)
+    if v == Version.V5 {
+        put_properties(mut body, s.properties, k_suback)?
+    }
+    for code in s.codes {
+        body.push(u8(code))
+    }
+    frame(k_suback, 0, body)?
+}
+
+fn encode_unsubscribe(u: Unsubscribe, v: Version) -> u8[] ! Error {
+    check_id(u.id)?
+    if u.filters.len == 0 {
+        fail Invalid
+    }
+    var body: u8[] = []
+    io.put_be16(mut body, u.id)
+    if v == Version.V5 {
+        put_properties(mut body, u.properties, k_unsubscribe)?
+    }
+    for f in u.filters {
+        if !valid_filter(f) {
+            fail InvalidTopic
+        }
+        put_string(mut body, f)?
+    }
+    frame(k_unsubscribe, 2, body)?
+}
+
+fn encode_unsuback(u: Unsuback, v: Version) -> u8[] ! Error {
+    check_id(u.id)?
+    var body: u8[] = []
+    io.put_be16(mut body, u.id)
+    if v == Version.V5 {
+        put_properties(mut body, u.properties, k_unsuback)?
+        for code in u.codes {
+            body.push(u8(code))
+        }
+    }
+    frame(k_unsuback, 0, body)?
+}
+
+fn encode_closing(kind: i64, code: i64, properties: Properties, v: Version) -> u8[] ! Error {
+    var body: u8[] = []
+    if v == Version.V5 {
+        let props = property_bytes(properties, kind)?
+        if code != 0 || props.len > 0 {
+            body.push(u8(code))
+            put_variable(mut body, props.len)?
+            io.append(mut body, props)
+        }
+    }
+    frame(kind, 0, body)?
+}
+
+/// Encodes `p` as the bytes of one MQTT packet for protocol version `v`.
+///
+/// For a CONNECT, the version is the packet's own and `v` is not used. MQTT 3.1.1 leaves out the properties, the reason codes of acknowledgements and the codes of an UNSUBACK. In MQTT 5 an acknowledgement, a DISCONNECT and an AUTH with reason code `0` and no properties use the short form.
+///
+/// Fails with `InvalidString` or `InvalidTopic` for a string or topic that is not valid, `Invalid` for a QoS above 2, a packet identifier outside `1` to `65535`, an empty filter list, `no_local` on a shared subscription or a number that does not fit its property, `Protocol` for a property the packet type does not allow or repeats where it may not, `Unsupported` for an AUTH in MQTT 3.1.1, and `TooLarge` for a packet over 268435455 bytes or a binary field over 65535 bytes.
+pub fn encode(p: Packet, v: Version) -> u8[] ! Error {
+    match p {
+        Connect(c) => encode_connect(c)
+        Connack(c) => encode_connack(c, v)
+        Publish(m) => encode_publish(m, v)
+        Puback(a) => encode_ack(k_puback, a, v)
+        Pubrec(a) => encode_ack(k_pubrec, a, v)
+        Pubrel(a) => encode_ack(k_pubrel, a, v)
+        Pubcomp(a) => encode_ack(k_pubcomp, a, v)
+        Subscribe(s) => encode_subscribe(s, v)
+        Suback(s) => encode_suback(s, v)
+        Unsubscribe(u) => encode_unsubscribe(u, v)
+        Unsuback(u) => encode_unsuback(u, v)
+        Pingreq => frame(12, 0, [])
+        Pingresp => frame(13, 0, [])
+        Disconnect(d) => encode_closing(k_disconnect, d.code, d.properties, v)
+        Auth(a) => {
+            if v == Version.V311 {
+                fail Unsupported
+            }
+            encode_closing(k_auth, a.code, a.properties, v)
+        }
+    }
+}
+
+fn transport(e: io.Error) -> Error {
+    match e {
+        TimedOut => Timeout
+        _ => Closed
+    }
+}
+
+fn expect_flags(flags: i64, want: i64) ! Error {
+    if flags != want {
+        fail Malformed
+    }
+}
+
+fn expect_end(c: *Cursor) ! Error {
+    if left(c) != 0 {
+        fail Malformed
+    }
+}
+
+fn take_id(c: *Cursor) -> i64 ! Error {
+    let id = take_u16(c)?
+    if id == 0 {
+        fail Malformed
+    }
+    id
+}
+
+fn decode_connect(c: *Cursor) -> Connect ! Error {
+    let name = take_string(c)?
+    if name == "MQIsdp" {
+        fail Unsupported
+    }
+    if name != "MQTT" {
+        fail Malformed
+    }
+    let level = take_u8(c)?
+    var version = Version.V311
+    if level == 5 {
+        version = Version.V5
+    } else if level != 4 {
+        fail Unsupported
+    }
+    let flags = take_u8(c)?
+    if flags & 1 != 0 {
+        fail Malformed
+    }
+    let will_qos = (flags >> 3) & 3
+    let will_flag = flags & 0x04 != 0
+    if will_qos == 3 || (!will_flag && (will_qos != 0 || flags & 0x20 != 0)) {
+        fail Malformed
+    }
+    let has_user = flags & 0x80 != 0
+    let has_password = flags & 0x40 != 0
+    if version == Version.V311 && has_password && !has_user {
+        fail Malformed
+    }
+    let keep_alive = take_u16(c)?
+    var properties = Properties {}
+    if version == Version.V5 {
+        properties = read_properties(c, k_connect)?
+    }
+    let client_id = take_string(c)?
+    var will: Will? = none
+    if will_flag {
+        var will_properties = Properties {}
+        if version == Version.V5 {
+            will_properties = read_properties(c, k_will)?
+        }
+        let topic = take_string(c)?
+        if !valid_topic_name(topic) {
+            fail Malformed
+        }
+        let payload = take_binary(c)?
+        will = Will { topic, payload, qos: will_qos, retain: flags & 0x20 != 0, properties: will_properties }
+    }
+    var username: str? = none
+    if has_user {
+        username = take_string(c)?
+    }
+    var password: u8[]? = none
+    if has_password {
+        password = take_binary(c)?
+    }
+    expect_end(c)?
+    Connect { version, client_id, clean_start: flags & 0x02 != 0, keep_alive, username, password, will, properties }
+}
+
+fn decode_connack(c: *Cursor, v: Version) -> Connack ! Error {
+    let flags = take_u8(c)?
+    if flags > 1 {
+        fail Malformed
+    }
+    let code = take_u8(c)?
+    var properties = Properties {}
+    if v == Version.V5 {
+        if left(c) == 0 && code == 1 {
+            fail Unsupported
+        }
+        properties = read_properties(c, k_connack)?
+    }
+    expect_end(c)?
+    Connack { session_present: flags == 1, code, properties }
+}
+
+fn decode_publish(c: *Cursor, flags: i64, v: Version) -> Publish ! Error {
+    let qos = (flags >> 1) & 3
+    let dup = flags & 8 != 0
+    if qos == 3 || (qos == 0 && dup) {
+        fail Malformed
+    }
+    let topic = take_string(c)?
+    var id = 0
+    if qos > 0 {
+        id = take_id(c)?
+    }
+    var properties = Properties {}
+    if v == Version.V5 {
+        properties = read_properties(c, k_publish)?
+    }
+    let aliased = topic.len == 0 && properties.topic_alias != none
+    if !aliased && !valid_topic_name(topic) {
+        fail Malformed
+    }
+    let payload = take(c, left(c))?
+    Publish { topic, payload, qos, retain: flags & 1 != 0, dup, id, properties }
+}
+
+fn decode_ack(c: *Cursor, kind: i64, v: Version) -> Ack ! Error {
+    let id = take_id(c)?
+    var code = 0
+    var properties = Properties {}
+    if v == Version.V5 && left(c) > 0 {
+        code = take_u8(c)?
+        if left(c) > 0 {
+            properties = read_properties(c, kind)?
+        }
+    }
+    expect_end(c)?
+    Ack { id, code, properties }
+}
+
+fn decode_subscribe(c: *Cursor, v: Version) -> Subscribe ! Error {
+    let id = take_id(c)?
+    var properties = Properties {}
+    if v == Version.V5 {
+        properties = read_properties(c, k_subscribe)?
+    }
+    var filters: Filter[] = []
+    for left(c) > 0 {
+        let filter = take_string(c)?
+        if !valid_filter(filter) {
+            fail Malformed
+        }
+        let o = take_u8(c)?
+        let qos = o & 3
+        let handling = (o >> 4) & 3
+        if qos == 3 || handling == 3 || o & 0xC0 != 0 || (v == Version.V311 && o > 2) {
+            fail Malformed
+        }
+        filters.push(Filter { filter, qos, no_local: o & 4 != 0, retain_as_published: o & 8 != 0, retain_handling: handling })
+    }
+    if filters.len == 0 {
+        fail Malformed
+    }
+    Subscribe { id, filters, properties }
+}
+
+fn decode_suback(c: *Cursor, v: Version) -> Suback ! Error {
+    let id = take_id(c)?
+    var properties = Properties {}
+    if v == Version.V5 {
+        properties = read_properties(c, k_suback)?
+    }
+    var codes: i64[] = []
+    for left(c) > 0 {
+        let code = take_u8(c)?
+        codes.push(code)
+    }
+    if codes.len == 0 {
+        fail Malformed
+    }
+    Suback { id, codes, properties }
+}
+
+fn decode_unsubscribe(c: *Cursor, v: Version) -> Unsubscribe ! Error {
+    let id = take_id(c)?
+    var properties = Properties {}
+    if v == Version.V5 {
+        properties = read_properties(c, k_unsubscribe)?
+    }
+    var filters: str[] = []
+    for left(c) > 0 {
+        let filter = take_string(c)?
+        if !valid_filter(filter) {
+            fail Malformed
+        }
+        filters.push(filter)
+    }
+    if filters.len == 0 {
+        fail Malformed
+    }
+    Unsubscribe { id, filters, properties }
+}
+
+fn decode_unsuback(c: *Cursor, v: Version) -> Unsuback ! Error {
+    let id = take_id(c)?
+    var properties = Properties {}
+    var codes: i64[] = []
+    if v == Version.V5 {
+        properties = read_properties(c, k_unsuback)?
+        for left(c) > 0 {
+            let code = take_u8(c)?
+            codes.push(code)
+        }
+        if codes.len == 0 {
+            fail Malformed
+        }
+    }
+    expect_end(c)?
+    Unsuback { id, codes, properties }
+}
+
+fn decode_closing(c: *Cursor, kind: i64, v: Version) -> Disconnect ! Error {
+    var code = 0
+    var properties = Properties {}
+    if v == Version.V5 && left(c) > 0 {
+        code = take_u8(c)?
+        if left(c) > 0 {
+            properties = read_properties(c, kind)?
+        }
+    }
+    expect_end(c)?
+    Disconnect { code, properties }
+}
+
+fn decode_body(kind: i64, flags: i64, body: u8[], v: Version) -> Packet ! Error {
+    let c = cursor(body)
+    match kind {
+        3 => {
+            let m = decode_publish(c, flags, v)?
+            Packet.Publish(m)
+        }
+        1 => {
+            expect_flags(flags, 0)?
+            let m = decode_connect(c)?
+            Packet.Connect(m)
+        }
+        2 => {
+            expect_flags(flags, 0)?
+            let m = decode_connack(c, v)?
+            Packet.Connack(m)
+        }
+        4 => {
+            expect_flags(flags, 0)?
+            let a = decode_ack(c, k_puback, v)?
+            Packet.Puback(a)
+        }
+        5 => {
+            expect_flags(flags, 0)?
+            let a = decode_ack(c, k_pubrec, v)?
+            Packet.Pubrec(a)
+        }
+        6 => {
+            expect_flags(flags, 2)?
+            let a = decode_ack(c, k_pubrel, v)?
+            Packet.Pubrel(a)
+        }
+        7 => {
+            expect_flags(flags, 0)?
+            let a = decode_ack(c, k_pubcomp, v)?
+            Packet.Pubcomp(a)
+        }
+        8 => {
+            expect_flags(flags, 2)?
+            let s = decode_subscribe(c, v)?
+            Packet.Subscribe(s)
+        }
+        9 => {
+            expect_flags(flags, 0)?
+            let s = decode_suback(c, v)?
+            Packet.Suback(s)
+        }
+        10 => {
+            expect_flags(flags, 2)?
+            let u = decode_unsubscribe(c, v)?
+            Packet.Unsubscribe(u)
+        }
+        11 => {
+            expect_flags(flags, 0)?
+            let u = decode_unsuback(c, v)?
+            Packet.Unsuback(u)
+        }
+        12 => {
+            expect_flags(flags, 0)?
+            expect_end(c)?
+            Packet.Pingreq
+        }
+        13 => {
+            expect_flags(flags, 0)?
+            expect_end(c)?
+            Packet.Pingresp
+        }
+        14 => {
+            expect_flags(flags, 0)?
+            let d = decode_closing(c, k_disconnect, v)?
+            Packet.Disconnect(d)
+        }
+        15 => {
+            expect_flags(flags, 0)?
+            if v == Version.V311 {
+                fail Malformed
+            }
+            let d = decode_closing(c, k_auth, v)?
+            Packet.Auth(Auth { code: d.code, properties: d.properties })
+        }
+        _ => fail Malformed
+    }
+}
+
+fn read_body(r: *io.Reader, n: i64) -> u8[] ! Error {
+    if n <= chunk {
+        return io.read_exact(r, n) catch transport
+    }
+    var out: u8[] = []
+    var remaining = n
+    for remaining > 0 {
+        let step = if remaining > chunk { chunk } else { remaining }
+        let part = io.read_exact(r, step) catch transport
+        io.append(mut out, part)
+        remaining -= step
+    }
+    out
+}
+
+/// Reads one packet from `r`, blocking until it is complete.
+///
+/// `v` is the version of the connection and selects the layout of every packet except CONNECT, which carries its own. A `limit` above `0` is the largest packet in bytes, counting the fixed header; a longer packet fails with `TooLarge` before its body is read or allocated. `0` allows the protocol maximum of 268435455 bytes.
+///
+/// Fails with `Closed` at the end of the input or on a read failure, `Timeout` when a read times out, `Malformed` for bytes that are not a valid packet of that version, and `Unsupported` for a CONNECT of another protocol name or level and for the two byte CONNACK with code `1` that an MQTT 3.1.1 broker answers an MQTT 5 CONNECT with.
+pub fn read_packet(r: *io.Reader, v: Version, limit: i64) -> Packet ! Error {
+    let first = i64(io.read_byte(r) catch transport)
+    var length = 0
+    var size = 0
+    var finished = false
+    for !finished {
+        if size == 4 {
+            fail Malformed
+        }
+        let b = i64(io.read_byte(r) catch transport)
+        length += (b & 0x7F) << (7 * size)
+        size += 1
+        if b & 0x80 == 0 {
+            if size > 1 && b == 0 {
+                fail Malformed
+            }
+            finished = true
+        }
+    }
+    if limit > 0 && 1 + size + length > limit {
+        fail TooLarge
+    }
+    let body = read_body(r, length)?
+    decode_body(first >> 4, first & 0x0F, body, v)
+}
+
+/// Decodes exactly one packet from `data`.
+///
+/// `v` is the version of the connection, as for `read_packet`. Fails with `Malformed` when `data` is cut short, when bytes follow the packet, or for any of the reasons `read_packet` gives.
+pub fn decode(data: u8[], v: Version) -> Packet ! Error {
+    let r = io.bytes_reader(data)
+    let p = read_packet(r, v, 0) catch {
+        Closed => fail Malformed
+        e => fail e
+    }
+    if io.buffered(r) > 0 {
+        fail Malformed
+    }
+    p
+}
