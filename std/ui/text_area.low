@@ -1,0 +1,666 @@
+import std/ui/geometry
+import std/ui/layout
+import std/ui/platform
+import std/ui/scene
+import std/unicode
+import uitext = std/ui/text
+
+const area_group_ms = 300
+const area_history_limit = 1000
+const kind_other = 0
+const kind_typing = 1
+const kind_backspace = 2
+const kind_delete = 3
+
+/// A place in a document: a line and a byte offset into that line, both counted from zero.
+pub struct TextPosition {
+    /// The line, `0` for the first.
+    pub line: i64 = 0
+    /// The byte offset into the line's text, `0` before its first byte and the line's length after its last.
+    pub column: i64 = 0
+}
+
+/// A replacement of the text from `start` up to `end` with `text`, which a text area asks its `LineSource` to apply.
+pub struct TextEdit {
+    /// The first position the edit covers.
+    pub start: TextPosition
+    /// The position after the last one the edit covers; equal to `start` for an insertion.
+    pub end: TextPosition
+    /// The replacement. Line breaks in it are `\n`, and an empty `text` is a deletion.
+    pub text: str
+}
+
+/// A stretch of one line drawn in its own colour or weight.
+pub struct TextRun {
+    /// The offset of the first byte of the run in the line.
+    pub start: i64
+    /// The offset after the last byte of the run.
+    pub end: i64
+    /// The colour of the run's text, or `none` for the text colour of the element.
+    pub color: geometry.Color? = none
+    /// The weight of the run's face, `400` regular and `700` bold, or `none` for the element's weight.
+    pub weight: i64? = none
+}
+
+/// The document a text area shows and edits, as functions the application provides.
+///
+/// The application owns the document. A text area reads it through `line_count` and `line_text` and changes it only by calling `edit`, so the functions must read the live document and not a snapshot taken when the element was built: keys, clicks and an input method's text reach the area between frames. `line_text` returns a line without its line break, so a line holds no `\n`.
+pub struct LineSource {
+    /// Returns the number of lines. A document always has at least one line, so a count below one is read as one empty line.
+    pub line_count: fn() -> i64
+    /// Returns the text of line `i`, counted from zero and below `line_count`.
+    pub line_text: fn(i64) -> str
+    /// Applies the `TextEdit` it is given: the text from `start` up to `end` becomes `text` and nothing else in the document changes. The area works out where its caret goes from the edit and keeps the removed text for undo, then reads the document back. When the document differs from what the edit describes, as when the application ignores or alters the edit, the area drops its undo and redo history and keeps its caret within the text the document holds.
+    pub edit: fn(TextEdit)
+    /// Returns the styled runs of line `i`, in order and not overlapping, or none for a line drawn plain.
+    pub line_runs: fn(i64) -> TextRun[]
+    /// Returns the colour behind the whole of line `i`, or `none` for no decoration.
+    pub line_fill: fn(i64) -> geometry.Color?
+}
+
+/// The two ends of a selection: where it was started and where its caret is, either first.
+pub struct TextSelection {
+    /// The end the selection was started from.
+    pub anchor: TextPosition = TextPosition {}
+    /// The end that moves, where typing goes.
+    pub caret: TextPosition = TextPosition {}
+}
+
+struct AreaChange {
+    start: TextPosition
+    removed: str
+    inserted: str
+}
+
+struct AreaGroup {
+    changes: AreaChange[]
+    kind: i64
+    before: TextSelection
+    after: TextSelection
+}
+
+struct AreaState {
+    caret: TextPosition = TextPosition {}
+    anchor: TextPosition = TextPosition {}
+    preferred: f32? = none
+    first: i64 = 0
+    shift: f32 = 0.0
+    scroll_x: f32 = 0.0
+    widest: f32 = 0.0
+    reveal: bool = false
+    undo: AreaGroup[] = []
+    redo: AreaGroup[] = []
+    open: bool = false
+    edited_ms: i64 = 0
+    preedit: str = ""
+    preedit_cursor: platform.TextRange? = none
+    content: geometry.Rect = geometry.Rect {}
+    line_height: f32 = 0.0
+    page: i64 = 1
+    style: uitext.Style = uitext.Style {}
+}
+
+struct AreaPiece {
+    start: i64
+    end: i64
+    layout: uitext.Layout
+    x: f32
+    color: geometry.Color?
+}
+
+struct AreaShaped {
+    text: str
+    pieces: AreaPiece[]
+    width: f32
+}
+
+struct AreaRow {
+    line: i64
+    text: str
+    shaped: AreaShaped
+    top: f32
+}
+
+struct BindingSpec {
+    keys: str
+    action: str
+}
+
+/// Returns a source over `line_count` and `line_text` that applies edits with `edit`, with no styled runs and no line decorations. Set `line_runs` and `line_fill` on the result to add them.
+pub fn line_source(line_count: fn() -> i64, line_text: fn(i64) -> str, edit: fn(TextEdit)) -> LineSource {
+    LineSource {
+        line_count
+        line_text
+        edit
+        line_runs: fn(i: i64) -> TextRun[] { [] }
+        line_fill: fn(i: i64) -> geometry.Color? { none }
+    }
+}
+
+/// Returns a multi-line text editor over `source`, 300 by 200 logical pixels, that takes focus when clicked and shows the text cursor.
+///
+/// The element is a leaf in the key context `TextArea`. It draws only the lines in view, at a fixed line height, and asks `source` for no others, so a document of a million lines costs the same as one of fifty. The caret, the selection, the preferred column of vertical moves, the scroll position and the undo history are kept per key, so give the element an `id` to keep them where the tree moves it. The editing keys are actions: the bindings in `text_area_bindings` dispatch the actions named there to the focused area, whose built-in handlers run after the `capture_action` handlers of the elements around it and after the area's own `on_action` handlers, and stop the action, so an element around the area intercepts an editing action with `capture_action`. Typed text and an input method's text are inserted at the caret. The area does not change the document itself: it calls `source.edit`, and the application's document is what the next frame reads.
+pub fn text_area(source: LineSource) -> Element {
+    let context = parse_key_context("TextArea") catch {
+        err => panic("text_area: cannot read the key context")
+    }
+    var out = Element { kind: TextArea, focusable: true, lines: source }
+    out.cursor = platform.Cursor.Text
+    out.style.width = Px(300.0)
+    out.style.height = Px(200.0)
+    out.key_context = context
+    out
+}
+
+fn binding_specs() -> BindingSpec[] {
+    [
+        BindingSpec { keys: "left", action: "text_area.left" },
+        BindingSpec { keys: "right", action: "text_area.right" },
+        BindingSpec { keys: "up", action: "text_area.up" },
+        BindingSpec { keys: "down", action: "text_area.down" },
+        BindingSpec { keys: "shift-left", action: "text_area.select_left" },
+        BindingSpec { keys: "shift-right", action: "text_area.select_right" },
+        BindingSpec { keys: "shift-up", action: "text_area.select_up" },
+        BindingSpec { keys: "shift-down", action: "text_area.select_down" },
+        BindingSpec { keys: "ctrl-left", action: "text_area.word_left" },
+        BindingSpec { keys: "ctrl-right", action: "text_area.word_right" },
+        BindingSpec { keys: "ctrl-shift-left", action: "text_area.select_word_left" },
+        BindingSpec { keys: "ctrl-shift-right", action: "text_area.select_word_right" },
+        BindingSpec { keys: "home", action: "text_area.line_start" },
+        BindingSpec { keys: "end", action: "text_area.line_end" },
+        BindingSpec { keys: "shift-home", action: "text_area.select_line_start" },
+        BindingSpec { keys: "shift-end", action: "text_area.select_line_end" },
+        BindingSpec { keys: "ctrl-home", action: "text_area.document_start" },
+        BindingSpec { keys: "ctrl-end", action: "text_area.document_end" },
+        BindingSpec { keys: "ctrl-shift-home", action: "text_area.select_document_start" },
+        BindingSpec { keys: "ctrl-shift-end", action: "text_area.select_document_end" },
+        BindingSpec { keys: "pageup", action: "text_area.page_up" },
+        BindingSpec { keys: "pagedown", action: "text_area.page_down" },
+        BindingSpec { keys: "shift-pageup", action: "text_area.select_page_up" },
+        BindingSpec { keys: "shift-pagedown", action: "text_area.select_page_down" },
+        BindingSpec { keys: "backspace", action: "text_area.backspace" },
+        BindingSpec { keys: "shift-backspace", action: "text_area.backspace" },
+        BindingSpec { keys: "delete", action: "text_area.delete" },
+        BindingSpec { keys: "ctrl-backspace", action: "text_area.delete_word_left" },
+        BindingSpec { keys: "ctrl-delete", action: "text_area.delete_word_right" },
+        BindingSpec { keys: "enter", action: "text_area.new_line" },
+        BindingSpec { keys: "shift-enter", action: "text_area.new_line" },
+        BindingSpec { keys: "tab", action: "text_area.tab" },
+        BindingSpec { keys: "ctrl-a", action: "text_area.select_all" },
+        BindingSpec { keys: "ctrl-c", action: "text_area.copy" },
+        BindingSpec { keys: "ctrl-x", action: "text_area.cut" },
+        BindingSpec { keys: "ctrl-v", action: "text_area.paste" },
+        BindingSpec { keys: "ctrl-z", action: "text_area.undo" },
+        BindingSpec { keys: "ctrl-y", action: "text_area.redo" },
+        BindingSpec { keys: "ctrl-shift-z", action: "text_area.redo" },
+    ]
+}
+
+/// Returns the default key bindings of a text area, in the context `TextArea`, for the application to pass to `bind_keys`, as gpui's `examples/input.rs` binds its text input's actions.
+///
+/// The actions are `text_area.left`, `right`, `up` and `down` and their `select_` forms, `word_left` and `word_right` and their `select_` forms, `line_start` and `line_end` (Home and End), `document_start` and `document_end` (Control with Home and End), `page_up` and `page_down` and their `select_` forms, `backspace`, `delete`, `delete_word_left`, `delete_word_right`, `new_line`, `tab`, `select_all`, `copy`, `cut`, `paste`, `undo` and `redo`. Bind other keystrokes to them, or bind keystrokes to the empty action to unbind them: with `tab` unbound, Tab moves focus on from the area instead of inserting a tab, and Shift+Tab, which is not bound, moves it back.
+pub fn text_area_bindings() -> KeyBinding[] {
+    var out: KeyBinding[] = []
+    for s in binding_specs() {
+        let b = key_binding(s.keys, s.action, "TextArea") catch {
+            err => panic("text_area_bindings: cannot read {s.keys}")
+        }
+        out.push(b)
+    }
+    out
+}
+
+fn area_action_names() -> str[] {
+    var names: str[] = []
+    for s in binding_specs() {
+        if !listed(names, s.action) {
+            names.push(s.action)
+        }
+    }
+    names
+}
+
+fn is_text_area(e: Element) -> bool {
+    match e.kind {
+        TextArea => true
+        _ => false
+    }
+}
+
+fn area_state(st: *State, name: str) -> *AreaState {
+    match st.areas[name] {
+        some(existing) => return existing
+        none => {}
+    }
+    let created = new(AreaState {})
+    st.areas[name] = created
+    created
+}
+
+/// Returns the selection of the text area whose key is `key`, its `id` or its position in the tree, as of the last event.
+pub fn text_area_selection(cx: Context, key: str) -> TextSelection {
+    let a = area_state(cx.state, key)
+    TextSelection { anchor: a.anchor, caret: a.caret }
+}
+
+/// Selects from `anchor` to `caret` in the text area whose key is `key` and scrolls it to show the caret in the next frame. Positions outside the document are moved to the nearest grapheme boundary inside it.
+pub fn set_text_area_selection(cx: Context, key: str, anchor: TextPosition, caret: TextPosition) {
+    let a = area_state(cx.state, key)
+    a.anchor = anchor
+    a.caret = caret
+    let at = find(cx.state, key)
+    if at >= 0 {
+        area_sync(a, area_source(cx.state.hitboxes[at].element))
+    }
+    a.open = false
+    a.preferred = none
+    a.reveal = true
+    cx.state.dirty = true
+}
+
+/// Returns the first line the text area whose key is `key` shows, which may be only partly in view.
+pub fn text_area_top_line(cx: Context, key: str) -> i64 {
+    area_state(cx.state, key).first
+}
+
+/// Scrolls the text area whose key is `key` so that line `line` is its first line in view, as far as the end of the document allows.
+pub fn scroll_text_area_to_line(cx: Context, key: str, line: i64) {
+    let a = area_state(cx.state, key)
+    a.first = if line < 0 { 0 } else { line }
+    a.shift = 0.0
+    cx.state.dirty = true
+}
+
+fn area_source(e: Element) -> LineSource {
+    match e.lines {
+        some(s) => s
+        none => line_source(fn() -> i64 { 1 }, fn(i: i64) -> str { "" }, fn(x: TextEdit) {})
+    }
+}
+
+fn area_count(src: LineSource) -> i64 {
+    let n = src.line_count()
+    if n < 1 { 1 } else { n }
+}
+
+fn area_pos(line: i64, column: i64) -> TextPosition {
+    TextPosition { line, column }
+}
+
+fn area_before(a: TextPosition, b: TextPosition) -> bool {
+    a.line < b.line || (a.line == b.line && a.column < b.column)
+}
+
+fn area_same(a: TextPosition, b: TextPosition) -> bool {
+    a.line == b.line && a.column == b.column
+}
+
+fn area_start(a: *AreaState) -> TextPosition {
+    if area_before(a.caret, a.anchor) { a.caret } else { a.anchor }
+}
+
+fn area_stop(a: *AreaState) -> TextPosition {
+    if area_before(a.caret, a.anchor) { a.anchor } else { a.caret }
+}
+
+fn area_selecting(a: *AreaState) -> bool {
+    !area_same(a.caret, a.anchor)
+}
+
+fn area_settle(a: *AreaState, count: i64) {
+    a.caret.line = clamped(a.caret.line, count - 1)
+    a.anchor.line = clamped(a.anchor.line, count - 1)
+    a.first = clamped(a.first, count - 1)
+}
+
+fn area_snap(text: str, column: i64) -> i64 {
+    if column <= 0 {
+        return 0
+    }
+    if column >= text.len {
+        return text.len
+    }
+    var start = 0
+    for start < text.len {
+        let stop = unicode.grapheme_end(text, start)
+        if stop > column {
+            return start
+        }
+        start = stop
+    }
+    text.len
+}
+
+fn area_fit(src: LineSource, count: i64, p: TextPosition) -> TextPosition {
+    let line = clamped(p.line, count - 1)
+    if p.column <= 0 {
+        return area_pos(line, 0)
+    }
+    area_pos(line, area_snap(src.line_text(line), p.column))
+}
+
+fn area_sync(a: *AreaState, src: LineSource) {
+    let count = area_count(src)
+    let caret = area_fit(src, count, a.caret)
+    var anchor = caret
+    if !area_same(a.anchor, a.caret) {
+        anchor = area_fit(src, count, a.anchor)
+    }
+    a.caret = caret
+    a.anchor = anchor
+    a.first = clamped(a.first, count - 1)
+}
+
+fn area_page_rows(height: f32, line_height: f32) -> i64 {
+    if line_height <= 0.0 {
+        return 1
+    }
+    let whole = i64(floor(height / line_height))
+    if whole < 1 { 1 } else { whole }
+}
+
+fn area_clamp_scroll(a: *AreaState, count: i64) {
+    let lh = a.line_height
+    if lh <= 0.0 {
+        return
+    }
+    var first = a.first
+    var shift = a.shift
+    if first < 0 {
+        first = 0
+        shift = 0.0
+    }
+    let height = a.content.height
+    let whole = i64(floor(height / lh))
+    let rest = height - f32(whole) * lh
+    var last_first = count - whole
+    var last_shift: f32 = 0.0
+    if rest > 0.001 {
+        last_first = count - whole - 1
+        last_shift = lh - rest
+    }
+    if last_first < 0 {
+        last_first = 0
+        last_shift = 0.0
+    }
+    if first > last_first || (first == last_first && shift > last_shift) {
+        first = last_first
+        shift = last_shift
+    }
+    a.first = first
+    a.shift = shift
+}
+
+fn area_scroll_by(a: *AreaState, count: i64, dy: f32) {
+    let lh = a.line_height
+    if lh <= 0.0 {
+        return
+    }
+    let moved = a.shift + dy
+    let whole = i64(floor(moved / lh))
+    a.first += whole
+    a.shift = moved - f32(whole) * lh
+    area_clamp_scroll(a, count)
+}
+
+fn area_reveal_line(a: *AreaState, line: i64, count: i64) {
+    let lh = a.line_height
+    if lh <= 0.0 {
+        return
+    }
+    if line < a.first || (line == a.first && a.shift > 0.0) {
+        a.first = line
+        a.shift = 0.0
+        return
+    }
+    let height = a.content.height
+    let bottom = f32(line - a.first + 1) * lh - a.shift
+    if bottom <= height + 0.001 {
+        return
+    }
+    let whole = i64(floor(height / lh))
+    let rest = height - f32(whole) * lh
+    var above = whole - 1
+    var shift: f32 = 0.0
+    if rest > 0.001 {
+        above = whole
+        shift = lh - rest
+    }
+    if above < 0 {
+        above = 0
+        shift = 0.0
+    }
+    var first = line - above
+    if first < 0 {
+        first = 0
+        shift = 0.0
+    }
+    a.first = first
+    a.shift = shift
+    area_clamp_scroll(a, count)
+}
+
+fn area_piece(st: *State, mut sh: AreaShaped, style: uitext.Style, start: i64, stop: i64, color: geometry.Color?) {
+    let l = uitext.wrap(mut st.text, area_untabbed(sh.text[start..stop]), style, layout.unbounded)
+    sh.pieces.push(AreaPiece { start, end: stop, layout: l, x: sh.width, color })
+    sh.width += l.lines[0].end
+}
+
+fn area_shape(st: *State, style: uitext.Style, text: str, runs: TextRun[]) -> AreaShaped {
+    var out = AreaShaped { text, pieces: [], width: 0.0 }
+    var at = 0
+    for r in runs {
+        let stop = clamped(r.end, text.len)
+        let start = if r.start < at { at } else { clamped(r.start, text.len) }
+        if stop <= start {
+            continue
+        }
+        if start > at {
+            area_piece(st, mut out, style, at, start, none)
+        }
+        var own = style
+        own.weight = r.weight ?? style.weight
+        area_piece(st, mut out, own, start, stop, r.color)
+        at = stop
+    }
+    if at < text.len || out.pieces.len == 0 {
+        area_piece(st, mut out, style, at, text.len, none)
+    }
+    out
+}
+
+fn area_x(sh: AreaShaped, at: i64) -> f32 {
+    for i, p in sh.pieces {
+        if at < p.end || i == sh.pieces.len - 1 {
+            let inner = if at < p.start { p.start } else if at > p.end { p.end } else { at }
+            return p.x + glyph_x(p.layout, runes(sh.text[p.start..inner]))
+        }
+    }
+    0.0
+}
+
+fn area_column_at(sh: AreaShaped, local: f32) -> i64 {
+    var best = 0
+    var best_gap = gap_between(local, 0.0)
+    for p in sh.pieces {
+        var at = p.start
+        var index = 0
+        for at < p.end {
+            var stop = unicode.grapheme_end(sh.text, at)
+            if stop > p.end {
+                stop = p.end
+            }
+            index += runes(sh.text[at..stop])
+            at = stop
+            let gap = gap_between(local, p.x + glyph_x(p.layout, index))
+            if gap < best_gap {
+                best_gap = gap
+                best = at
+            }
+        }
+    }
+    best
+}
+
+fn area_row_text(a: *AreaState, text: str, composing: bool, line: i64) -> str {
+    if !composing || line != a.caret.line {
+        return text
+    }
+    let col = clamped(a.caret.column, text.len)
+    "{text[..col]}{a.preedit}{text[col..]}"
+}
+
+fn area_rows(st: *State, a: *AreaState, src: LineSource, count: i64, composing: bool) -> AreaRow[] {
+    var out: AreaRow[] = []
+    let lh = a.line_height
+    if lh <= 0.0 {
+        return out
+    }
+    let reach = (a.content.height + a.shift) / lh
+    let whole = i64(floor(reach))
+    let last = if f32(whole) < reach { whole } else { whole - 1 }
+    var k = 0
+    for k <= last {
+        let line = a.first + k
+        if line >= count {
+            break
+        }
+        let stored = src.line_text(line)
+        let text = area_row_text(a, stored, composing, line)
+        var runs: TextRun[] = []
+        if !(composing && line == a.caret.line) {
+            runs = src.line_runs(line)
+        }
+        let shaped = area_shape(st, a.style, text, runs)
+        out.push(AreaRow { line, text, shaped, top: a.content.y + f32(k) * lh - a.shift })
+        k += 1
+    }
+    out
+}
+
+fn area_selection_rect(a: *AreaState, r: AreaRow, origin: f32, space: f32) -> geometry.Rect? {
+    let lo = area_start(a)
+    let hi = area_stop(a)
+    if r.line < lo.line || r.line > hi.line {
+        return none
+    }
+    let from = if r.line == lo.line { clamped(lo.column, r.text.len) } else { 0 }
+    let to = if r.line == hi.line { clamped(hi.column, r.text.len) } else { r.text.len }
+    let left = origin + area_x(r.shaped, from)
+    var right = origin + area_x(r.shaped, to)
+    if r.line < hi.line {
+        right += space
+    }
+    if right <= left {
+        return none
+    }
+    geometry.rect(left, r.top, right - left, a.line_height)
+}
+
+fn paint_text_area(st: *State, mut sc: scene.Scene, e: Element, at: i64, content: geometry.Rect, own: TextStyle, scale: f32) {
+    let name = st.hitboxes[at].key
+    let a = area_state(st, name)
+    let src = area_source(e)
+    let count = area_count(src)
+    let lh = own.text.line_height
+    a.style = own.text
+    a.content = content
+    a.line_height = lh
+    a.page = area_page_rows(content.height, lh)
+    area_settle(a, count)
+    area_clamp_scroll(a, count)
+    if a.reveal {
+        area_reveal_line(a, a.caret.line, count)
+    }
+    let live = name == st.focus
+    let composing = live && a.preedit.len > 0
+    let rows = area_rows(st, a, src, count, composing)
+    var widest: f32 = 0.0
+    for r in rows {
+        if r.shaped.width > widest {
+            widest = r.shaped.width
+        }
+    }
+    a.widest = widest
+    var caret_row = -1
+    for k, r in rows {
+        if r.line == a.caret.line {
+            caret_row = k
+        }
+    }
+    var caret_x: f32 = 0.0
+    if caret_row >= 0 {
+        let r = rows[caret_row]
+        var caret_at = clamped(a.caret.column, r.text.len)
+        if composing {
+            let col = clamped(a.caret.column, r.text.len - a.preedit.len)
+            caret_at = col + a.preedit.len
+            let inside = a.preedit_cursor
+            if inside != none {
+                let range = inside ?? platform.TextRange { start: 0, end: 0 }
+                caret_at = col + clamped(range.end, a.preedit.len)
+            }
+        }
+        caret_x = area_x(r.shaped, caret_at)
+    }
+    let room = content.width - 1.0
+    let total = larger(widest, caret_x)
+    var scroll = a.scroll_x
+    if scroll > total - room {
+        scroll = total - room
+    }
+    if scroll < 0.0 {
+        scroll = 0.0
+    }
+    if a.reveal && caret_row >= 0 {
+        if caret_x - scroll > room {
+            scroll = caret_x - room
+        }
+        if caret_x < scroll {
+            scroll = caret_x
+        }
+    }
+    a.scroll_x = scroll
+    a.reveal = false
+    let origin = content.x - scroll
+    let space = uitext.measure(mut st.text, " ", a.style, layout.unbounded).width
+    let ink = faded(own.color, own.opacity)
+    scene.push_clip(mut sc, geometry.cover(content, scale))
+    for r in rows {
+        let fill = src.line_fill(r.line)
+        match fill {
+            some(c) => solid(mut sc, geometry.rect(content.x, r.top, content.width, lh), faded(c, own.opacity), scale)
+            none => {}
+        }
+        if live && !composing {
+            let band = area_selection_rect(a, r, origin, space)
+            match band {
+                some(rect) => solid(mut sc, rect, faded(selection_color(), own.opacity), scale)
+                none => {}
+            }
+        }
+        for p in r.shaped.pieces {
+            let tint = faded(p.color ?? own.color, own.opacity)
+            uitext.paint(mut st.text, mut sc, p.layout, geometry.point(origin + p.x, r.top), tint, scale)
+        }
+    }
+    if caret_row >= 0 {
+        let r = rows[caret_row]
+        if composing {
+            let col = clamped(a.caret.column, r.text.len - a.preedit.len)
+            let left = origin + area_x(r.shaped, col)
+            let right = origin + area_x(r.shaped, col + a.preedit.len)
+            solid(mut sc, geometry.rect(left, r.top + lh - 1.0, right - left, 1.0), ink, scale)
+        }
+        if live {
+            let x = snapped(origin + caret_x, scale)
+            solid(mut sc, geometry.rect(x, r.top, 1.0, lh), ink, scale)
+            let across = origin + caret_x >= content.x && origin + caret_x < content.x + content.width
+            let down = r.top + lh > content.y && r.top < content.y + content.height
+            if across && down {
+                st.caret = platform.Caret { x: i64(floor(origin + caret_x)), y: i64(floor(r.top)), width: 0, height: i64(floor(lh + 0.999)) }
+            }
+        }
+    }
+    scene.pop_clip(mut sc)
+}

@@ -1,0 +1,611 @@
+import std/builder
+import std/ui/platform
+
+fn area_clean(s: str, newlines: bool) -> str {
+    var out = builder.builder()
+    var i = 0
+    for i < s.len {
+        let b = s[i]
+        if b == '\r' {
+            if newlines {
+                builder.write_byte(mut out, '\n')
+            }
+            if i + 1 < s.len && s[i + 1] == '\n' {
+                i += 1
+            }
+        } else if b == '\n' {
+            if newlines {
+                builder.write_byte(mut out, '\n')
+            }
+        } else if b == '\t' || (b >= 32 && b != 127) {
+            builder.write_byte(mut out, b)
+        }
+        i += 1
+    }
+    builder.to_str(out)
+}
+
+fn area_untabbed(s: str) -> str {
+    var found = false
+    for i in 0..s.len {
+        if s[i] == '\t' {
+            found = true
+        }
+    }
+    if !found {
+        return s
+    }
+    var out = builder.builder()
+    for i in 0..s.len {
+        let b = s[i]
+        builder.write_byte(mut out, if b == '\t' { ' ' } else { b })
+    }
+    builder.to_str(out)
+}
+
+fn area_text_between(src: LineSource, from: TextPosition, to: TextPosition) -> str {
+    let first = src.line_text(from.line)
+    if from.line == to.line {
+        return first[clamped(from.column, first.len)..clamped(to.column, first.len)]
+    }
+    var out = builder.builder()
+    builder.write(mut out, first[clamped(from.column, first.len)..])
+    var i = from.line + 1
+    for i < to.line {
+        let middle = src.line_text(i)
+        builder.write(mut out, "\n")
+        builder.write(mut out, middle)
+        i += 1
+    }
+    let last = src.line_text(to.line)
+    builder.write(mut out, "\n")
+    builder.write(mut out, last[..clamped(to.column, last.len)])
+    builder.to_str(out)
+}
+
+fn area_advance(from: TextPosition, s: str) -> TextPosition {
+    var breaks = 0
+    var last = -1
+    for i in 0..s.len {
+        if s[i] == '\n' {
+            breaks += 1
+            last = i
+        }
+    }
+    if breaks == 0 {
+        return area_pos(from.line, from.column + s.len)
+    }
+    area_pos(from.line + breaks, s.len - last - 1)
+}
+
+fn area_shape_line(st: *State, a: *AreaState, src: LineSource, line: i64, text: str) -> AreaShaped {
+    let runs = src.line_runs(line)
+    area_shape(st, a.style, text, runs)
+}
+
+fn area_move(st: *State, a: *AreaState, to: TextPosition, extend: bool) {
+    a.caret = to
+    if !extend {
+        a.anchor = to
+    }
+    a.open = false
+    a.reveal = true
+    a.preferred = none
+    st.dirty = true
+}
+
+fn area_record(st: *State, a: *AreaState, c: AreaChange, kind: i64, before: TextSelection, had: bool) {
+    let now = st.clock()
+    let after = TextSelection { anchor: a.anchor, caret: a.caret }
+    let last = a.undo.len - 1
+    if a.open && !had && kind != kind_other && last >= 0 && a.undo[last].kind == kind && now - a.edited_ms <= area_group_ms {
+        var g = a.undo[last]
+        g.changes.push(c)
+        g.after = after
+        a.undo[last] = g
+    } else {
+        a.undo.push(AreaGroup { changes: [c], kind, before, after })
+        if a.undo.len > area_history_limit {
+            a.undo = a.undo[1..]
+        }
+    }
+    a.open = true
+    a.edited_ms = now
+}
+
+fn area_inside(src: LineSource, count: i64, p: TextPosition) -> bool {
+    if p.line < 0 || p.line >= count || p.column < 0 {
+        return false
+    }
+    p.column <= src.line_text(p.line).len
+}
+
+fn area_apply(src: LineSource, request: TextEdit) -> bool {
+    let count = area_count(src)
+    let from = request.start
+    let to = request.end
+    if area_before(to, from) || !area_inside(src, count, from) || !area_inside(src, count, to) {
+        return false
+    }
+    let head = src.line_text(from.line)[..from.column]
+    let tail = src.line_text(to.line)[to.column..]
+    src.edit(request)
+    let landed = area_advance(from, request.text)
+    let expected = count - (to.line - from.line) + (landed.line - from.line)
+    let now = area_count(src)
+    if now != expected || landed.line >= now {
+        return false
+    }
+    let first = src.line_text(from.line)
+    if first.len < from.column || first[..from.column] != head {
+        return false
+    }
+    if area_text_between(src, from, landed) != request.text {
+        return false
+    }
+    let last = src.line_text(landed.line)
+    last.len >= landed.column && last[landed.column..] == tail
+}
+
+fn area_abandon_history(a: *AreaState) {
+    a.undo = []
+    a.redo = []
+    a.open = false
+}
+
+fn area_replace(st: *State, a: *AreaState, e: Element, from: TextPosition, to: TextPosition, s: str, kind: i64) {
+    let src = area_source(e)
+    let removed = area_text_between(src, from, to)
+    if removed.len == 0 && s.len == 0 {
+        return
+    }
+    let had = area_selecting(a)
+    let before = TextSelection { anchor: a.anchor, caret: a.caret }
+    let request = TextEdit { start: from, end: to, text: s }
+    if !area_apply(src, request) {
+        area_abandon_history(a)
+        area_sync(a, src)
+        a.preferred = none
+        a.preedit = ""
+        a.preedit_cursor = none
+        a.reveal = true
+        st.dirty = true
+        return
+    }
+    let landed = area_advance(from, s)
+    a.caret = landed
+    a.anchor = landed
+    a.preferred = none
+    a.preedit = ""
+    a.preedit_cursor = none
+    a.reveal = true
+    st.dirty = true
+    let change = AreaChange { start: from, removed, inserted: s }
+    area_record(st, a, change, kind, before, had)
+    a.redo = []
+}
+
+fn area_replace_selection(st: *State, a: *AreaState, e: Element, s: str, kind: i64) {
+    area_replace(st, a, e, area_start(a), area_stop(a), s, kind)
+}
+
+fn area_type(st: *State, e: Element, a: *AreaState, s: str) -> bool {
+    let clean = area_clean(s, false)
+    if clean.len == 0 {
+        return false
+    }
+    area_sync(a, area_source(e))
+    area_replace_selection(st, a, e, clean, kind_typing)
+    true
+}
+
+fn area_key(st: *State, at: i64, k: platform.KeyEvent) -> bool {
+    let h = st.hitboxes[at]
+    if !is_text_area(h.element) || !k.pressed {
+        return false
+    }
+    match k.key {
+        Named(_) => false
+        Character(_) => {
+            let shortcut = (k.modifiers.control || k.modifiers.super) && !k.modifiers.alt
+            if shortcut {
+                return false
+            }
+            area_type(st, h.element, area_state(st, h.key), k.text)
+        }
+    }
+}
+
+fn area_horizontal(st: *State, a: *AreaState, e: Element, forward: bool, by_word: bool, extend: bool) {
+    if !extend && area_selecting(a) {
+        let edge = if forward { area_stop(a) } else { area_start(a) }
+        area_move(st, a, edge, false)
+        return
+    }
+    let src = area_source(e)
+    let count = area_count(src)
+    let here = a.caret
+    let text = src.line_text(here.line)
+    let col = clamped(here.column, text.len)
+    var to = here
+    if forward {
+        if col < text.len {
+            let next = if by_word { next_word(text, col) } else { next_grapheme(text, col) }
+            to = area_pos(here.line, next)
+        } else if here.line + 1 < count {
+            to = area_pos(here.line + 1, 0)
+        }
+    } else if col > 0 {
+        let previous = if by_word { previous_word(text, col) } else { previous_grapheme(text, col) }
+        to = area_pos(here.line, previous)
+    } else if here.line > 0 {
+        let above = src.line_text(here.line - 1)
+        to = area_pos(here.line - 1, above.len)
+    }
+    area_move(st, a, to, extend)
+}
+
+fn area_vertical(st: *State, a: *AreaState, e: Element, delta: i64, extend: bool) {
+    let src = area_source(e)
+    let count = area_count(src)
+    var x: f32 = 0.0
+    match a.preferred {
+        some(p) => {
+            x = p
+        }
+        none => {
+            let text = src.line_text(a.caret.line)
+            let shaped = area_shape_line(st, a, src, a.caret.line, text)
+            x = area_x(shaped, clamped(a.caret.column, text.len))
+        }
+    }
+    let line = a.caret.line + delta
+    var to = a.caret
+    if line < 0 {
+        to = area_pos(0, 0)
+    } else if line >= count {
+        let last = src.line_text(count - 1)
+        to = area_pos(count - 1, last.len)
+    } else {
+        let text = src.line_text(line)
+        let shaped = area_shape_line(st, a, src, line, text)
+        to = area_pos(line, area_column_at(shaped, x))
+    }
+    area_move(st, a, to, extend)
+    a.preferred = x
+}
+
+fn area_page(st: *State, a: *AreaState, e: Element, down: bool, extend: bool) {
+    let count = area_count(area_source(e))
+    let n = if a.page > 1 { a.page - 1 } else { 1 }
+    let delta = if down { n } else { -n }
+    a.first += delta
+    area_clamp_scroll(a, count)
+    area_vertical(st, a, e, delta, extend)
+}
+
+fn area_line_edge(st: *State, a: *AreaState, e: Element, end: bool, extend: bool) {
+    var column = 0
+    if end {
+        let text = area_source(e).line_text(a.caret.line)
+        column = text.len
+    }
+    area_move(st, a, area_pos(a.caret.line, column), extend)
+}
+
+fn area_document_edge(st: *State, a: *AreaState, e: Element, end: bool, extend: bool) {
+    var to = area_pos(0, 0)
+    if end {
+        let src = area_source(e)
+        let count = area_count(src)
+        let last = src.line_text(count - 1)
+        to = area_pos(count - 1, last.len)
+    }
+    area_move(st, a, to, extend)
+}
+
+fn area_select_all(st: *State, a: *AreaState, e: Element) {
+    let src = area_source(e)
+    let count = area_count(src)
+    let last = src.line_text(count - 1)
+    a.anchor = area_pos(0, 0)
+    area_move(st, a, area_pos(count - 1, last.len), true)
+}
+
+fn area_backspace(st: *State, a: *AreaState, e: Element, by_word: bool) {
+    if area_selecting(a) {
+        area_replace_selection(st, a, e, "", kind_other)
+        return
+    }
+    let src = area_source(e)
+    let here = a.caret
+    let text = src.line_text(here.line)
+    let col = clamped(here.column, text.len)
+    if col > 0 {
+        let lo = if by_word { previous_word(text, col) } else { previous_grapheme(text, col) }
+        area_replace(st, a, e, area_pos(here.line, lo), area_pos(here.line, col), "", kind_backspace)
+    } else if here.line > 0 {
+        let above = src.line_text(here.line - 1)
+        area_replace(st, a, e, area_pos(here.line - 1, above.len), area_pos(here.line, 0), "", kind_backspace)
+    }
+}
+
+fn area_delete(st: *State, a: *AreaState, e: Element, by_word: bool) {
+    if area_selecting(a) {
+        area_replace_selection(st, a, e, "", kind_other)
+        return
+    }
+    let src = area_source(e)
+    let count = area_count(src)
+    let here = a.caret
+    let text = src.line_text(here.line)
+    let col = clamped(here.column, text.len)
+    if col < text.len {
+        let hi = if by_word { next_word(text, col) } else { next_grapheme(text, col) }
+        area_replace(st, a, e, area_pos(here.line, col), area_pos(here.line, hi), "", kind_delete)
+    } else if here.line + 1 < count {
+        area_replace(st, a, e, area_pos(here.line, col), area_pos(here.line + 1, 0), "", kind_delete)
+    }
+}
+
+fn area_copy(st: *State, a: *AreaState, e: Element) {
+    if !area_selecting(a) {
+        return
+    }
+    let text = area_text_between(area_source(e), area_start(a), area_stop(a))
+    st.copy(text)
+}
+
+fn area_cut(st: *State, a: *AreaState, e: Element) {
+    area_copy(st, a, e)
+    if area_selecting(a) {
+        area_replace_selection(st, a, e, "", kind_other)
+    }
+}
+
+fn area_paste(st: *State, a: *AreaState, e: Element) {
+    let got = st.paste() ?? return
+    let clean = area_clean(got, true)
+    if clean.len > 0 {
+        area_replace_selection(st, a, e, clean, kind_other)
+    }
+}
+
+fn area_reset_view(st: *State, a: *AreaState) {
+    a.preedit = ""
+    a.preedit_cursor = none
+    a.open = false
+    a.reveal = true
+    a.preferred = none
+    st.dirty = true
+}
+
+fn area_undo(st: *State, a: *AreaState, e: Element) {
+    if a.undo.len == 0 {
+        return
+    }
+    let src = area_source(e)
+    let g = a.undo[a.undo.len - 1]
+    a.undo = a.undo[0..a.undo.len - 1]
+    var i = g.changes.len - 1
+    for i >= 0 {
+        let c = g.changes[i]
+        let request = TextEdit { start: c.start, end: area_advance(c.start, c.inserted), text: c.removed }
+        if !area_apply(src, request) {
+            area_abandon_history(a)
+            area_reset_view(st, a)
+            area_sync(a, src)
+            return
+        }
+        i -= 1
+    }
+    a.anchor = g.before.anchor
+    a.caret = g.before.caret
+    a.redo.push(g)
+    area_reset_view(st, a)
+    area_sync(a, src)
+}
+
+fn area_redo(st: *State, a: *AreaState, e: Element) {
+    if a.redo.len == 0 {
+        return
+    }
+    let src = area_source(e)
+    let g = a.redo[a.redo.len - 1]
+    a.redo = a.redo[0..a.redo.len - 1]
+    for c in g.changes {
+        let request = TextEdit { start: c.start, end: area_advance(c.start, c.removed), text: c.inserted }
+        if !area_apply(src, request) {
+            area_abandon_history(a)
+            area_reset_view(st, a)
+            area_sync(a, src)
+            return
+        }
+    }
+    a.anchor = g.after.anchor
+    a.caret = g.after.caret
+    a.undo.push(g)
+    area_reset_view(st, a)
+    area_sync(a, src)
+}
+
+fn area_action(st: *State, at: i64, name: str) -> bool {
+    let h = st.hitboxes[at]
+    if !is_text_area(h.element) {
+        return false
+    }
+    let e = h.element
+    let a = area_state(st, h.key)
+    area_sync(a, area_source(e))
+    match name {
+        "text_area.left" => area_horizontal(st, a, e, false, false, false)
+        "text_area.right" => area_horizontal(st, a, e, true, false, false)
+        "text_area.select_left" => area_horizontal(st, a, e, false, false, true)
+        "text_area.select_right" => area_horizontal(st, a, e, true, false, true)
+        "text_area.word_left" => area_horizontal(st, a, e, false, true, false)
+        "text_area.word_right" => area_horizontal(st, a, e, true, true, false)
+        "text_area.select_word_left" => area_horizontal(st, a, e, false, true, true)
+        "text_area.select_word_right" => area_horizontal(st, a, e, true, true, true)
+        "text_area.up" => area_vertical(st, a, e, -1, false)
+        "text_area.down" => area_vertical(st, a, e, 1, false)
+        "text_area.select_up" => area_vertical(st, a, e, -1, true)
+        "text_area.select_down" => area_vertical(st, a, e, 1, true)
+        "text_area.line_start" => area_line_edge(st, a, e, false, false)
+        "text_area.line_end" => area_line_edge(st, a, e, true, false)
+        "text_area.select_line_start" => area_line_edge(st, a, e, false, true)
+        "text_area.select_line_end" => area_line_edge(st, a, e, true, true)
+        "text_area.document_start" => area_document_edge(st, a, e, false, false)
+        "text_area.document_end" => area_document_edge(st, a, e, true, false)
+        "text_area.select_document_start" => area_document_edge(st, a, e, false, true)
+        "text_area.select_document_end" => area_document_edge(st, a, e, true, true)
+        "text_area.page_up" => area_page(st, a, e, false, false)
+        "text_area.page_down" => area_page(st, a, e, true, false)
+        "text_area.select_page_up" => area_page(st, a, e, false, true)
+        "text_area.select_page_down" => area_page(st, a, e, true, true)
+        "text_area.backspace" => area_backspace(st, a, e, false)
+        "text_area.delete_word_left" => area_backspace(st, a, e, true)
+        "text_area.delete" => area_delete(st, a, e, false)
+        "text_area.delete_word_right" => area_delete(st, a, e, true)
+        "text_area.new_line" => area_replace_selection(st, a, e, "\n", kind_other)
+        "text_area.tab" => area_replace_selection(st, a, e, "\t", kind_typing)
+        "text_area.select_all" => area_select_all(st, a, e)
+        "text_area.copy" => area_copy(st, a, e)
+        "text_area.cut" => area_cut(st, a, e)
+        "text_area.paste" => area_paste(st, a, e)
+        "text_area.undo" => area_undo(st, a, e)
+        "text_area.redo" => area_redo(st, a, e)
+        _ => return false
+    }
+    true
+}
+
+fn focused_area(st: *State) -> i64 {
+    let at = find(st, st.focus)
+    if at >= 0 && is_text_area(st.hitboxes[at].element) { at } else { -1 }
+}
+
+fn area_preedit(st: *State, s: str, range: platform.TextRange?) {
+    let at = focused_area(st)
+    if at < 0 {
+        return
+    }
+    let h = st.hitboxes[at]
+    let a = area_state(st, h.key)
+    let clean = area_clean(s, false)
+    area_sync(a, area_source(h.element))
+    if clean.len > 0 && area_selecting(a) {
+        area_replace_selection(st, a, h.element, "", kind_other)
+    }
+    a.preedit = clean
+    a.preedit_cursor = if clean.len == s.len { range } else { none }
+    a.reveal = true
+    st.dirty = true
+}
+
+fn area_commit(st: *State, s: str) {
+    let at = focused_area(st)
+    if at < 0 {
+        return
+    }
+    let h = st.hitboxes[at]
+    let a = area_state(st, h.key)
+    area_sync(a, area_source(h.element))
+    let clean = area_clean(s, true)
+    area_replace_selection(st, a, h.element, clean, kind_other)
+    a.preedit = ""
+    a.preedit_cursor = none
+}
+
+fn area_point(st: *State, a: *AreaState, src: LineSource, x: f32, y: f32) -> TextPosition {
+    let lh = a.line_height
+    if lh <= 0.0 {
+        return area_pos(0, 0)
+    }
+    let count = area_count(src)
+    if y < a.content.y {
+        return area_pos(0, 0)
+    }
+    let row = i64(floor((y - a.content.y + a.shift) / lh))
+    let beyond = y > a.content.y + a.content.height || a.first + row >= count
+    if beyond {
+        let last = src.line_text(count - 1)
+        return area_pos(count - 1, last.len)
+    }
+    let line = a.first + row
+    let text = src.line_text(line)
+    let shaped = area_shape_line(st, a, src, line, text)
+    area_pos(line, area_column_at(shaped, x - a.content.x + a.scroll_x))
+}
+
+fn area_press(st: *State, clicks: i64) {
+    let at = topmost(st)
+    if at < 0 || !is_text_area(st.hitboxes[at].element) {
+        return
+    }
+    let h = st.hitboxes[at]
+    let a = area_state(st, h.key)
+    let src = area_source(h.element)
+    let count = area_count(src)
+    area_sync(a, src)
+    let to = area_point(st, a, src, st.pointer.x, st.pointer.y)
+    if clicks >= 3 {
+        let text = src.line_text(to.line)
+        a.anchor = area_pos(to.line, 0)
+        a.caret = if to.line + 1 < count { area_pos(to.line + 1, 0) } else { area_pos(to.line, text.len) }
+    } else if clicks == 2 {
+        let text = src.line_text(to.line)
+        a.anchor = area_pos(to.line, word_start(text, to.column))
+        a.caret = area_pos(to.line, word_stop(text, to.column))
+    } else if st.modifiers.shift {
+        a.caret = to
+    } else {
+        a.caret = to
+        a.anchor = to
+    }
+    a.open = false
+    a.reveal = true
+    a.preferred = none
+    st.area_drag = if clicks == 1 { h.key } else { "" }
+    st.dirty = true
+}
+
+fn area_drag_move(st: *State) {
+    if st.area_drag.len == 0 {
+        return
+    }
+    if st.held == none {
+        st.area_drag = ""
+        return
+    }
+    let at = find(st, st.area_drag)
+    if at < 0 {
+        return
+    }
+    let a = area_state(st, st.area_drag)
+    let src = area_source(st.hitboxes[at].element)
+    area_sync(a, src)
+    a.caret = area_point(st, a, src, st.pointer.x, st.pointer.y)
+    a.reveal = true
+    a.preferred = none
+    st.dirty = true
+}
+
+fn area_wheel(st: *State, at: i64, dx: f32, dy: f32) -> bool {
+    let h = st.hitboxes[at]
+    if !is_text_area(h.element) {
+        return false
+    }
+    let a = area_state(st, h.key)
+    let count = area_count(area_source(h.element))
+    let first = a.first
+    let shift = a.shift
+    let across = a.scroll_x
+    area_scroll_by(a, count, dy)
+    let reach = larger(a.widest - (a.content.width - 1.0), 0.0)
+    a.scroll_x = within(a.scroll_x + dx, 0.0, reach)
+    if a.first == first && a.shift == shift && a.scroll_x == across {
+        return false
+    }
+    st.dirty = true
+    true
+}
