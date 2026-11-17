@@ -1,13 +1,15 @@
 import compiler
 import diag
+import std/archive/tar
+import std/base64
+import std/builder
+import std/crypto/hash
 import std/file
 import std/path
 import std/process
 import std/semver
 import std/slices
 import std/text
-
-pub const lock_file = "build.lock"
 
 pub enum Error {
     Manifest(compiler.Error)
@@ -19,12 +21,6 @@ pub fn message(e: Error) -> str {
         Manifest(inner) => compiler.message(inner)
         Failed(msg) => msg
     }
-}
-
-pub struct Locked {
-    pub source: str
-    pub version: str
-    pub commit: str
 }
 
 struct Tag {
@@ -41,26 +37,27 @@ struct Want {
 struct Resolution {
     docs: *compiler.Overlay
     root: str
+    cache: str
     update: bool
-    locked: [str: Locked]
-    chosen: [str: Locked] = [:]
+    locked: [str: compiler.Locked]
+    chosen: [str: compiler.Locked] = [:]
     wants: [str: []Want] = [:]
     tags: [str: []Tag] = [:]
     walked: [str: bool] = [:]
 }
 
+/// Resolves the version-control dependencies of the project at `root` and of every dependency, places each chosen commit in the module cache of `docs` and writes `build.lock` when the resolution changes. With `update`, each source moves to the newest version its ranges accept.
 pub fn sync(docs: *compiler.Overlay, root: str, update: bool) ! Error {
     let manifest = compiler.project_manifest(docs, root) catch Manifest
     let m = manifest ?? return
-    let lock_path = path.join([root, lock_file])
-    let locked = read_lock(lock_path)?
-    let r = new(Resolution { docs, root, update, locked })
+    let locked = compiler.read_lock(docs, root) catch Manifest
+    let r = new(Resolution { docs, root, cache: docs.disk.cache, update, locked })
     r.walked[root] = true
     r.walk(root, m)?
     let entries = r.entries()
     let previous = r.locked_entries()
     if update || !same_entries(entries, previous) {
-        write_lock(lock_path, entries)?
+        write_lock(root, entries)?
     }
 }
 
@@ -70,11 +67,24 @@ fn walk(r: *Resolution, dir: str, m: *compiler.Manifest) ! Error {
             r.local(compiler.local_dir(dir, d.source))?
             continue
         }
+        check_source(d)?
         let range = compiler.parse_range(d.range) ?? fail Failed("{diag.text(d.pos)}: {d.range} is not a version range")
         var held = r.wants[d.source] ?? []
         held.push(Want { range, pos: d.pos })
         r.wants[d.source] = held
         r.choose(d.source)?
+    }
+}
+
+fn check_source(d: compiler.Dependency) ! Error {
+    var valid = d.source != "" && !text.contains(d.source, "\\") && !text.contains(d.source, ":") && !text.contains(d.source, "@")
+    for part in text.split(d.source, '/') {
+        if part == "" || part == "." || part == ".." {
+            valid = false
+        }
+    }
+    if !valid {
+        fail Failed("{diag.text(d.pos)}: {d.source} is not a repository path such as github.com/acme/ui")
     }
 }
 
@@ -98,15 +108,15 @@ fn choose(r: *Resolution, source: str) ! Error {
         }
         none => {}
     }
-    r.chosen[source] = picked
-    let dir = compiler.fetched_dir(r.root, source)
-    checkout(source, dir, picked.commit)?
+    let placed = r.place(picked)?
+    r.chosen[source] = placed
+    let dir = compiler.cached_dir(r.cache, source, placed.commit)
     let manifest = compiler.project_manifest(r.docs, dir) catch Manifest
     let m = manifest ?? return
     r.walk(dir, m)?
 }
 
-fn pick(r: *Resolution, source: str) -> Locked ! Error {
+fn pick(r: *Resolution, source: str) -> compiler.Locked ! Error {
     let wants = r.wants[source] ?? []
     if !r.update {
         match r.locked[source] {
@@ -121,7 +131,7 @@ fn pick(r: *Resolution, source: str) -> Locked ! Error {
     let tags = r.tags_of(source)?
     for tag in tags {
         if satisfies(wants, tag.name) {
-            return Locked { source, version: tag.name, commit: tag.commit }
+            return compiler.Locked { source, version: tag.name, commit: tag.commit, hash: "" }
         }
     }
     var ranges: []str = []
@@ -146,10 +156,20 @@ fn tags_of(r: *Resolution, source: str) -> []Tag ! Error {
         some(known) => return known
         none => {}
     }
-    let listed = git(["ls-remote", "--tags", url_of(source)], "")?
+    let listed = git(["ls-remote", "--tags", url_of(source)])?
     let found = parse_tags(listed)
+    r.unmoved(source, found)?
     r.tags[source] = found
     found
+}
+
+fn unmoved(r: *Resolution, source: str, found: []Tag) ! Error {
+    let held = r.locked[source] ?? return
+    for tag in found {
+        if tag.name == held.version && tag.commit != held.commit {
+            fail Failed("{source}: tag {tag.name} moved from {held.commit} to {tag.commit}; a published version never changes")
+        }
+    }
 }
 
 fn parse_tags(listed: str) -> []Tag {
@@ -181,25 +201,129 @@ fn url_of(source: str) -> str {
     "https://{source}"
 }
 
-fn checkout(source: str, dir: str, commit: str) ! Error {
-    if file.is_dir(dir) {
-        let head = git(["-C", dir, "rev-parse", "HEAD"], "")?
-        if text.trim(head) == commit {
-            return
-        }
-        git(["-C", dir, "fetch", "--quiet", "--tags", "origin"], "")?
-    } else {
-        file.mkdir_all(path.dir(dir)) catch {
-            e => fail Failed("create {path.dir(dir)}: {e}")
-        }
-        git(["clone", "--quiet", "--no-checkout", url_of(source), dir], "")?
+fn place(r: *Resolution, picked: compiler.Locked) -> compiler.Locked ! Error {
+    if r.cache == "" {
+        fail Failed("{picked.source}: there is no module cache; set LOW_CACHE to a directory")
     }
-    git(["-C", dir, "checkout", "--quiet", "--detach", commit], "")?
+    let tree = compiler.cached_dir(r.cache, picked.source, picked.commit)
+    let expected = r.expected_hash(picked)
+    var tree_hash = expected
+    if !file.is_dir(tree) {
+        tree_hash = materialise(r.cache, picked, expected)?
+    } else if expected == "" {
+        tree_hash = hash_tree(tree)?
+    }
+    compiler.Locked { source: picked.source, version: picked.version, commit: picked.commit, hash: tree_hash }
 }
 
-fn git(args: []str, input: str) -> str ! Error {
+fn expected_hash(r: *Resolution, picked: compiler.Locked) -> str {
+    let held = r.locked[picked.source] ?? return ""
+    if held.commit != picked.commit {
+        return ""
+    }
+    held.hash
+}
+
+fn materialise(cache: str, picked: compiler.Locked, expected: str) -> str ! Error {
+    let mirror = ensure_mirror(cache, picked.source, picked.commit)?
+    let tree = compiler.cached_dir(cache, picked.source, picked.commit)
+    let parent = path.dir(tree)
+    make_dir(parent)?
+    let archived = run_git(["-c", "core.autocrlf=false", "-c", "core.eol=lf", "--git-dir", mirror, "archive", "--format=tar", picked.commit])?
+    let staging = staging_dir(parent, "{path.base(tree)}.tmp-*")?
+    defer file.remove_all(staging) or {}
+    tar.extract(archived.stdout, staging) catch {
+        e => fail Failed("extract {picked.source} {picked.version}: {e}")
+    }
+    let actual = hash_tree(staging)?
+    if expected != "" && actual != expected {
+        fail Failed("{picked.source} {picked.version}: build.lock holds {expected} but the fetched tree hashes to {actual}")
+    }
+    adopt(staging, tree)?
+    actual
+}
+
+fn ensure_mirror(cache: str, source: str, commit: str) -> str ! Error {
+    let mirror = path.join([cache, "git", source])
+    if file.is_dir(mirror) {
+        let present = git_succeeds(["--git-dir", mirror, "cat-file", "-e", "{commit}^{{commit}}"])?
+        if !present {
+            git(["--git-dir", mirror, "fetch", "--quiet", "origin"])?
+        }
+        return mirror
+    }
+    let parent = path.dir(mirror)
+    make_dir(parent)?
+    let staging = staging_dir(parent, "{path.base(mirror)}.tmp-*")?
+    defer file.remove_all(staging) or {}
+    git(["clone", "--quiet", "--mirror", url_of(source), staging])?
+    adopt(staging, mirror)?
+    mirror
+}
+
+fn make_dir(dir: str) ! Error {
+    file.mkdir_all(dir) catch {
+        e => fail Failed("create {dir}: {e}")
+    }
+}
+
+fn staging_dir(parent: str, pattern: str) -> str ! Error {
+    file.temp_dir_pattern(parent, pattern) catch {
+        e => fail Failed("create a directory in {parent}: {e}")
+    }
+}
+
+fn adopt(staging: str, target: str) ! Error {
+    file.rename(staging, target) catch {
+        e => {
+            if !file.is_dir(target) {
+                fail Failed("move {staging} to {target}: {e}")
+            }
+        }
+    }
+}
+
+fn hash_tree(dir: str) -> str ! Error {
+    var names: []str = []
+    list_files(dir, "", mut names)?
+    slices.sort(mut names)
+    var summary = builder.builder()
+    for name in names {
+        let location = "{dir}/{name}"
+        let data = file.read_file(location) catch {
+            e => fail Failed("read {location}: {e}")
+        }
+        let sum = hash.sum(hash.sha256(), data)
+        builder.write(mut summary, "{text.encode_hex(sum)}  {name}\n")
+    }
+    let total = hash.sum(hash.sha256(), builder.to_bytes(summary))
+    "h1:{base64.encode(total)}"
+}
+
+fn list_files(root: str, inside: str, mut names: []str) ! Error {
+    var dir = root
+    if inside != "" {
+        dir = "{root}/{inside}"
+    }
+    let listing = file.read_dir_info(dir) catch {
+        e => fail Failed("list {dir}: {e}")
+    }
+    for entry in listing {
+        var found = entry.name
+        if inside != "" {
+            found = "{inside}/{entry.name}"
+        }
+        if entry.dir {
+            list_files(root, found, mut names)?
+        } else if entry.regular {
+            names.push(found)
+        }
+    }
+}
+
+fn run_git(args: []str) -> process.Output ! Error {
     let command = process.command("git", args)
-    let out = process.run(command, bytes(input)) catch {
+    let out = process.run(command, []) catch {
         e => fail Failed("git: {e}")
     }
     let printed = text.join(args, " ")
@@ -212,67 +336,56 @@ fn git(args: []str, input: str) -> str ! Error {
         }
         Signaled(_) => fail Failed("git {printed} was ended by a signal")
     }
+    out
+}
+
+fn git(args: []str) -> str ! Error {
+    let out = run_git(args)?
     str(out.stdout)
 }
 
-fn entries(r: *Resolution) -> []Locked {
-    var out: []Locked = []
+fn git_succeeds(args: []str) -> bool ! Error {
+    let command = process.command("git", args)
+    let out = process.run(command, []) catch {
+        e => fail Failed("git: {e}")
+    }
+    process.success(out.status)
+}
+
+fn entries(r: *Resolution) -> []compiler.Locked {
+    var out: []compiler.Locked = []
     for _, held in r.chosen {
         out.push(held)
     }
-    slices.sort_by(mut out, fn(a: Locked, b: Locked) -> bool { a.source < b.source })
+    slices.sort_by(mut out, fn(a: compiler.Locked, b: compiler.Locked) -> bool { a.source < b.source })
     out
 }
 
-fn locked_entries(r: *Resolution) -> []Locked {
-    var out: []Locked = []
+fn locked_entries(r: *Resolution) -> []compiler.Locked {
+    var out: []compiler.Locked = []
     for _, held in r.locked {
         out.push(held)
     }
-    slices.sort_by(mut out, fn(a: Locked, b: Locked) -> bool { a.source < b.source })
+    slices.sort_by(mut out, fn(a: compiler.Locked, b: compiler.Locked) -> bool { a.source < b.source })
     out
 }
 
-fn same_entries(a: []Locked, b: []Locked) -> bool {
+fn same_entries(a: []compiler.Locked, b: []compiler.Locked) -> bool {
     if a.len != b.len {
         return false
     }
     for i, e in a {
         let other = b[i]
-        if e.source != other.source || e.version != other.version || e.commit != other.commit {
+        if e.source != other.source || e.version != other.version || e.commit != other.commit || e.hash != other.hash {
             return false
         }
     }
     true
 }
 
-fn read_lock(lock_path: str) -> [str: Locked] ! Error {
-    var held: [str: Locked] = [:]
-    if !file.exists(lock_path) {
-        return held
-    }
-    let content = file.read_text(lock_path) catch {
-        e => fail Failed("read {lock_path}: {e}")
-    }
-    for i, line in text.lines(content) {
-        let fields = text.fields(line)
-        if fields.len == 0 {
-            continue
-        }
-        if fields.len != 3 {
-            fail Failed("{lock_path}:{i + 1}: expected source, version and commit")
-        }
-        held[fields[0]] = Locked { source: fields[0], version: fields[1], commit: fields[2] }
-    }
-    held
-}
-
-fn write_lock(lock_path: str, entries: []Locked) ! Error {
-    var lines: []str = []
-    for e in entries {
-        lines.push("{e.source} {e.version} {e.commit}\n")
-    }
-    let content = text.join(lines, "")
+fn write_lock(root: str, entries: []compiler.Locked) ! Error {
+    let lock_path = path.join([root, compiler.lock_file])
+    let content = compiler.format_lock(entries)
     file.write_text(lock_path, content) catch {
         e => fail Failed("write {lock_path}: {e}")
     }
