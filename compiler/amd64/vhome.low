@@ -1,0 +1,532 @@
+import ir
+import types
+import std/slices
+
+fn vector_operand(op: ir.VectorOp, k: i64) -> bool {
+    match op {
+        VSplat => k == 0
+        VShl => k < 2
+        VShr => k < 2
+        _ => true
+    }
+}
+
+fn address_operand(v: *ir.Value, k: i64) -> bool {
+    if v.op == OpVectorScalar {
+        return k == 0
+    }
+    vector_operand(ir.vector_op(v.aux), k)
+}
+
+struct SlotScan {
+    users: [*ir.Value: []*ir.Value] = [:]
+    escaping: [*ir.Value: bool] = [:]
+    denied: [i64: bool] = [:]
+    widths: [i64: i64] = [:]
+}
+
+fn home_slots(f: *ir.Func) -> [i64: bool] {
+    let s = new(SlotScan {})
+    s.index_users(f)
+    for b in f.blocks {
+        for v in b.values {
+            if v.op == OpSlot {
+                s.scan(v)
+            }
+        }
+    }
+    var registers: [i64: bool] = [:]
+    for slot in s.widths {
+        let width = s.widths[slot] ?? 0
+        if !(s.denied[slot] ?? false) && width == 8 * f.slots[slot] {
+            registers[slot] = true
+        }
+    }
+    registers
+}
+
+fn index_users(s: *SlotScan, f: *ir.Func) {
+    for b in f.blocks {
+        for v in b.values {
+            for a in v.args {
+                var list = s.users[a] ?? []
+                list.push(v)
+                s.users[a] = list
+            }
+        }
+        match b.control {
+            some(c) => {
+                s.escaping[c] = true
+            }
+            none => {}
+        }
+        for r in b.results {
+            s.escaping[r] = true
+        }
+    }
+}
+
+fn scan(s: *SlotScan, slot: *ir.Value) {
+    if s.escaping[slot] ?? false {
+        s.denied[slot.aux] = true
+        return
+    }
+    for user in s.users[slot] ?? [] {
+        if !s.permits(slot, user) {
+            s.denied[slot.aux] = true
+            return
+        }
+    }
+}
+
+fn permits(s: *SlotScan, slot: *ir.Value, user: *ir.Value) -> bool {
+    match user.op {
+        OpVector => return s.vector_use(slot, user)
+        OpVectorScalar => return s.vector_use(slot, user)
+        OpAdd => return s.lane_address(slot, user)
+        _ => {}
+    }
+    addresses(user, slot)
+}
+
+fn vector_use(s: *SlotScan, slot: *ir.Value, user: *ir.Value) -> bool {
+    var t = user.type
+    if user.op == OpVectorScalar {
+        t = user.from
+    }
+    let width = types.vector_bytes(types.must(t))
+    for k, a in user.args {
+        if a != slot {
+            continue
+        }
+        if !address_operand(user, k) {
+            return false
+        }
+        let known = s.widths[slot.aux] ?? 0
+        if known != 0 && known != width {
+            return false
+        }
+        s.widths[slot.aux] = width
+    }
+    true
+}
+
+fn lane_address(s: *SlotScan, slot: *ir.Value, add: *ir.Value) -> bool {
+    if add.args.len != 2 || (s.escaping[add] ?? false) {
+        return false
+    }
+    var other = add.args[0]
+    if other == slot {
+        other = add.args[1]
+    }
+    if other == slot || other.op == OpSlot {
+        return false
+    }
+    for user in s.users[add] ?? [] {
+        if !addresses(user, add) {
+            return false
+        }
+    }
+    true
+}
+
+fn addresses(user: *ir.Value, address: *ir.Value) -> bool {
+    match user.op {
+        OpLoad => return user.args[0] == address
+        OpStore => return user.args[0] == address && user.args[1] != address
+        _ => {}
+    }
+    false
+}
+
+fn operand(l: *Lowering, v: *ir.Value, k: i64) -> *Vreg {
+    let arg = v.args[k]
+    if arg.op == OpSlot && ir.is_vector_op(v.op) && (l.registers[arg.aux] ?? false) && address_operand(v, k) {
+        return l.home_for(arg)
+    }
+    l.vreg(arg)
+}
+
+fn home_for(l: *Lowering, slot: *ir.Value) -> *Vreg {
+    match l.homes[slot.aux] {
+        some(found) => return found
+        none => {}
+    }
+    let r = l.func.new_vreg()
+    r.scalar = true
+    r.home = slot
+    r.wide = l.slots[slot.aux] == vector_slot_bytes / 8
+    l.homes[slot.aux] = r
+    l.ordered.push(r)
+    r
+}
+
+fn home_words(r: *Vreg) -> i64 {
+    if r.wide {
+        return vector_slot_bytes / 8
+    }
+    vector_slot_bytes / 16
+}
+
+fn copies_between_homes(ins: *Instr) -> bool {
+    ins.op == OpVector && ir.vector_op(ins.value.aux) == VCopy && ins.args[0].home != none && ins.args[1].home != none
+}
+
+fn clobbers_vectors(ins: *Instr) -> bool {
+    if ins.op == OpSyscall {
+        return !ins.inline_syscall()
+    }
+    ins.is_call()
+}
+
+enum AccessKind {
+    ReadsRegister
+    WritesRegister
+    ReadsHome
+    StoresPartial
+    StoresFull
+}
+
+fn reads(k: AccessKind) -> bool {
+    k == ReadsRegister || k == ReadsHome || k == StoresPartial
+}
+
+fn writes(k: AccessKind) -> bool {
+    k == WritesRegister || k == StoresPartial || k == StoresFull
+}
+
+struct Access {
+    index: i64
+    kind: AccessKind
+}
+
+enum HomeState {
+    InRegister
+    InBoth
+    InHome
+}
+
+struct BlockLive {
+    used: []bool
+    defined: []bool
+    live_in: []bool
+    live_out: []bool
+    full: [*Instr: bool] = [:]
+}
+
+struct StoreRun {
+    covered: u64 = 0
+    stores: []*Instr = []
+}
+
+struct WordStore {
+    index: i64
+    word: i64
+}
+
+struct Transfers {
+    homes: []*Vreg
+    slots: [i64: *Vreg]
+    index: [*Vreg: i64] = [:]
+}
+
+fn insert_transfers(l: *Lowering) {
+    if l.ordered.len == 0 {
+        return
+    }
+    let t = new(Transfers { homes: l.ordered, slots: l.homes })
+    for i, h in t.homes {
+        t.index[h] = i
+    }
+    t.place_transfers(l.func)
+}
+
+fn place_transfers(t: *Transfers, f: *Mfunc) {
+    var live: [*Mblock: *BlockLive] = [:]
+    for mb in f.blocks {
+        live[mb] = t.summarise(mb)
+    }
+    t.settle_homes(f, live)
+    for mb in f.blocks {
+        t.rewrite(mb, live[mb] ?? panic("block without home liveness"))
+    }
+}
+
+fn slot_index(t: *Transfers, address: *ir.Value) -> i64? {
+    var base = address
+    if address.op == OpAdd {
+        let at = slices.find_index(address.args, fn(a: *ir.Value) -> bool { a.op == OpSlot }) ?? return none
+        base = address.args[at]
+    }
+    if base.op != OpSlot {
+        return none
+    }
+    let home = t.slots[base.aux] ?? return none
+    t.index[home]
+}
+
+fn accesses(t: *Transfers, ins: *Instr, full: [*Instr: bool]) -> []Access {
+    match ins.op {
+        OpVector => return t.vector_accesses(ins)
+        OpVectorScalar => return t.vector_accesses(ins)
+        OpLoad => {
+            match t.slot_index(ins.value.args[0]) {
+                some(i) => return [Access { index: i, kind: ReadsHome }]
+                none => {}
+            }
+        }
+        OpStore => {
+            match t.slot_index(ins.value.args[0]) {
+                some(i) => {
+                    if full[ins] ?? false {
+                        return [Access { index: i, kind: StoresFull }]
+                    }
+                    return [Access { index: i, kind: StoresPartial }]
+                }
+                none => {}
+            }
+        }
+        _ => {}
+    }
+    []
+}
+
+fn vector_accesses(t: *Transfers, ins: *Instr) -> []Access {
+    var found: []Access = []
+    var first = 0
+    if ins.op == OpVector {
+        first = 1
+    }
+    for k in first..ins.args.len {
+        let a = ins.args[k]
+        if a.home != none {
+            found.push(Access { index: t.index[a] ?? 0, kind: ReadsRegister })
+        }
+    }
+    if ins.op == OpVector && ins.args[0].home != none {
+        found.push(Access { index: t.index[ins.args[0]] ?? 0, kind: WritesRegister })
+    }
+    found
+}
+
+fn word_store(t: *Transfers, ins: *Instr) -> WordStore? {
+    if ins.op != OpStore || ins.value.type != none || ins.value.args[0].op != OpSlot {
+        return none
+    }
+    let home = t.slots[ins.value.args[0].aux] ?? return none
+    let offset = ins.value.aux
+    if offset < 0 || offset % 8 != 0 || offset / 8 >= home.home_words() {
+        return none
+    }
+    WordStore { index: t.index[home] ?? 0, word: offset / 8 }
+}
+
+fn full_stores(t: *Transfers, mb: *Mblock) -> [*Instr: bool] {
+    var full: [*Instr: bool] = [:]
+    var runs: [i64: *StoreRun] = [:]
+    for ins in mb.instrs {
+        if ins.clobbers_vectors() {
+            runs = [:]
+            continue
+        }
+        match t.word_store(ins) {
+            some(w) => {
+                t.extend(mut runs, w, ins, mut full)
+                continue
+            }
+            none => {}
+        }
+        for a in t.accesses(ins, [:]) {
+            runs.delete(a.index)
+        }
+    }
+    full
+}
+
+fn extend(t: *Transfers, mut runs: [i64: *StoreRun], w: WordStore, ins: *Instr, mut full: [*Instr: bool]) {
+    let run = runs[w.index] ?? new(StoreRun {})
+    runs[w.index] = run
+    let one: u64 = 1
+    run.covered = run.covered | (one << u64(w.word))
+    run.stores.push(ins)
+    let complete = (one << u64(t.homes[w.index].home_words())) - 1
+    if run.covered != complete {
+        return
+    }
+    for s in run.stores {
+        full[s] = true
+    }
+    runs.delete(w.index)
+}
+
+fn flags(n: i64) -> []bool {
+    var out: []bool = []
+    for _ in 0..n {
+        out.push(false)
+    }
+    out
+}
+
+fn summarise(t: *Transfers, mb: *Mblock) -> *BlockLive {
+    let n = t.homes.len
+    let b = new(BlockLive { used: flags(n), defined: flags(n), live_in: flags(n), live_out: flags(n) })
+    b.full = t.full_stores(mb)
+    for ins in mb.instrs {
+        for a in t.accesses(ins, b.full) {
+            if a.kind.reads() && !b.defined[a.index] {
+                b.used[a.index] = true
+            }
+            if a.kind.writes() {
+                b.defined[a.index] = true
+            }
+        }
+    }
+    b
+}
+
+fn settle_homes(t: *Transfers, f: *Mfunc, live: [*Mblock: *BlockLive]) {
+    var changed = true
+    for changed {
+        changed = false
+        var i = f.blocks.len - 1
+        for i >= 0 {
+            let mb = f.blocks[i]
+            let b = live[mb] ?? panic("block without home liveness")
+            for k in 0..t.homes.len {
+                var out = false
+                for s in mb.succs {
+                    let next = live[s] ?? continue
+                    if next.live_in[k] {
+                        out = true
+                    }
+                }
+                let entering = b.used[k] || (out && !b.defined[k])
+                if out != b.live_out[k] || entering != b.live_in[k] {
+                    b.live_out[k] = out
+                    b.live_in[k] = entering
+                    changed = true
+                }
+            }
+            i -= 1
+        }
+    }
+}
+
+struct BlockWalk {
+    t: *Transfers
+    live: *BlockLive
+    after: [*Instr: []bool] = [:]
+    state: []HomeState = []
+    out: []*Instr = []
+}
+
+fn rewrite(t: *Transfers, mb: *Mblock, live: *BlockLive) {
+    let w = new(BlockWalk { t, live })
+    for _ in 0..t.homes.len {
+        w.state.push(InRegister)
+    }
+    w.after = t.live_after_clobbers(mb, live)
+    for ins in mb.instrs {
+        w.visit(ins)
+    }
+    w.close()
+    mb.instrs = w.out
+}
+
+fn live_after_clobbers(t: *Transfers, mb: *Mblock, live: *BlockLive) -> [*Instr: []bool] {
+    var after: [*Instr: []bool] = [:]
+    var current = slices.clone(live.live_out)
+    var i = mb.instrs.len - 1
+    for i >= 0 {
+        let ins = mb.instrs[i]
+        if ins.clobbers_vectors() {
+            after[ins] = slices.clone(current)
+        }
+        let found = t.accesses(ins, live.full)
+        for a in found {
+            if a.kind.writes() {
+                current[a.index] = false
+            }
+        }
+        for a in found {
+            if a.kind.reads() {
+                current[a.index] = true
+            }
+        }
+        i -= 1
+    }
+    after
+}
+
+fn visit(w: *BlockWalk, ins: *Instr) {
+    match w.after[ins] {
+        some(live) => w.park(live)
+        none => {
+            for a in w.t.accesses(ins, w.live.full) {
+                w.apply(a)
+            }
+        }
+    }
+    w.out.push(ins)
+}
+
+fn apply(w: *BlockWalk, a: Access) {
+    match a.kind {
+        ReadsRegister => {
+            if w.state[a.index] == InHome {
+                w.insert_fill(a.index)
+            }
+        }
+        WritesRegister => {
+            w.state[a.index] = InRegister
+        }
+        ReadsHome => {
+            if w.state[a.index] == InRegister {
+                w.insert_spill(a.index)
+            }
+        }
+        StoresPartial => {
+            if w.state[a.index] == InRegister {
+                w.insert_spill(a.index)
+            }
+            w.state[a.index] = InHome
+        }
+        StoresFull => {
+            w.state[a.index] = InHome
+        }
+    }
+}
+
+fn park(w: *BlockWalk, live: []bool) {
+    for i, held in live {
+        if !held {
+            continue
+        }
+        if w.state[i] == InRegister {
+            w.insert_spill(i)
+        }
+        w.state[i] = InHome
+    }
+}
+
+fn close(w: *BlockWalk) {
+    for i, held in w.live.live_out {
+        if held && w.state[i] == InHome {
+            w.insert_fill(i)
+        }
+    }
+}
+
+fn insert_spill(w: *BlockWalk, i: i64) {
+    let home = w.t.homes[i]
+    let slot = home.home ?? panic("home without a slot")
+    w.out.push(new(Instr { op: OpUndef, transfer: Spill, args: [home], value: slot }))
+    w.state[i] = InBoth
+}
+
+fn insert_fill(w: *BlockWalk, i: i64) {
+    let home = w.t.homes[i]
+    let slot = home.home ?? panic("home without a slot")
+    w.out.push(new(Instr { op: OpUndef, transfer: Fill, dst: home, value: slot }))
+    w.state[i] = InBoth
+}
