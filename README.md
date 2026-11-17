@@ -6,7 +6,7 @@
 
 A compiled language with Go's speed and footprint, plus enums, typed errors and expression-oriented syntax.
 
-[![test](https://github.com/simon-curtis/lowlang/actions/workflows/test.yml/badge.svg)](https://github.com/simon-curtis/lowlang/actions/workflows/test.yml)
+[![build](https://github.com/simon-curtis/lowlang/actions/workflows/build.yml/badge.svg)](https://github.com/simon-curtis/lowlang/actions/workflows/build.yml)
 [![release](https://img.shields.io/github/v/release/simon-curtis/lowlang?color=111111)](https://github.com/simon-curtis/lowlang/releases/latest)
 [![license](https://img.shields.io/github/license/simon-curtis/lowlang?color=111111)](LICENSE)
 
