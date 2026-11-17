@@ -36,7 +36,7 @@ $ /tmp/low2 test std/...
 
 Sweeps, snapshots and test runs write gigabytes. Where `/tmp` is a `tmpfs` it is held in memory, so keep that work on disk and point temporary files there: `TMPDIR=<disk dir>`. Run sweeps with at most 8 jobs at once.
 
-Source at release N compiles with release N-1, so the compiler cannot use a language feature until the release after it ships. After a release is published, `bootstrap.txt` moves to it.
+Source at release N compiles with release N-1, so the compiler cannot use a language feature until the release after it ships. Each green `build` on `main` that changes `compiler/` outside its tool and test directories, or `std/`, cuts a patch release (`.github/workflows/patch.yml`), and the `release` workflow commits `bootstrap.txt` to `main` with it.
 
 ## Language notes for compiler code
 
