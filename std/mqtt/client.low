@@ -1,0 +1,1483 @@
+import std/atomic
+import std/io
+import std/net
+import std/sync
+import std/time
+import std/tls
+
+const default_receive_maximum = 65535
+const goodbye_wait = 1000
+
+/// Settings for `connect`, `connect_tls` and `connect_stream`.
+///
+/// Every field has a default, so `Options {}` connects to a local broker over MQTT 5 with a clean session and a keep alive of 60 seconds.
+pub struct Options {
+    /// The broker host name or IP literal. Defaults to `"127.0.0.1"`. `connect_tls` also uses it as the TLS server name when the config has none.
+    pub host: str = "127.0.0.1"
+    /// The broker TCP port. Defaults to `1883`.
+    pub port: i64 = 1883
+    /// The protocol version, `Version.V5` by default.
+    pub version: Version = Version.V5
+    /// The client identifier. Empty asks the broker to assign one, which `ClientHandle.client_id` then holds. MQTT 3.1.1 allows an empty identifier only with `clean_start`.
+    pub client_id: str = ""
+    /// Clean start in MQTT 5, clean session in MQTT 3.1.1. `true` by default. `reconnect` resumes the session only when it outlives the connection: in MQTT 3.1.1 when this is `false`, in MQTT 5 when the session expiry is above `0`. Otherwise `reconnect` connects clean.
+    pub clean_start: bool = true
+    /// The keep alive in seconds, `60` by default. `0` turns the keep alive off. In MQTT 5 a broker may replace it. A broker that stops reading or does not answer a PINGREQ in time ends the connection with `Timeout`.
+    pub keep_alive: i64 = 60
+    /// The user name, or `none`.
+    pub username: str? = none
+    /// The password, or `none`.
+    pub password: u8[]? = none
+    /// The will message the broker publishes when the connection ends without a DISCONNECT, or `none`.
+    pub will: Will? = none
+    /// MQTT 5: the session expiry interval in seconds sent in CONNECT. `0`, the default, sends none.
+    pub session_expiry: i64 = 0
+    /// MQTT 5: the most unacknowledged QoS 1 and 2 messages the broker may send at once, sent in CONNECT and enforced. `0`, the default, leaves the limit at 65535.
+    pub receive_maximum: i64 = 0
+    /// The largest packet in bytes the client accepts, sent in CONNECT in MQTT 5 and enforced in both versions. A longer packet ends the connection with `TooLarge`. `0`, the default, accepts the protocol maximum.
+    pub max_packet_size: i64 = 0
+    /// MQTT 5: the highest topic alias the broker may use to send to the client, sent in CONNECT and enforced. `0`, the default, accepts none.
+    pub topic_alias_maximum: i64 = 0
+    /// MQTT 5: whether `publish` replaces the topic of a repeated topic with a topic alias, within the broker's topic alias maximum. `false` by default.
+    pub use_topic_aliases: bool = false
+    /// The remaining CONNECT properties of MQTT 5, such as user properties, `auth_method` and `request_response_information`. The fields above take precedence over the matching properties.
+    pub properties: Properties = Properties {}
+    /// MQTT 5 enhanced authentication: called with each AUTH packet the broker sends and returns the AUTH packet to answer with. Fails with `Protocol` by default, so set it together with `properties.auth_method`.
+    pub authenticate: fn(Auth) -> Auth ! Error = refuse_auth
+    /// The time limit in milliseconds to wait for a free slot under the broker's receive maximum, a SUBACK, an UNSUBACK or the acknowledgement of a publish, which fails with `Timeout`. It is also the limit for each write on a connection made by `connect` or `connect_tls`, and a write that exceeds it ends the connection. `0`, the default, waits indefinitely, and the keep alive still ends a connection whose broker stopped reading. A publish that times out stays queued and keeps its slot until the broker acknowledges it or the connection ends, because the broker still counts it as unacknowledged.
+    pub timeout: i64 = 0
+    /// The time limit in milliseconds for establishing the connection as a whole: dialling, the TLS handshake and receiving CONNACK. It fails with `Timeout`. `0`, the default, sets no limit.
+    pub connect_timeout: i64 = 0
+    /// The time in milliseconds to wait for PINGRESP after a PINGREQ before the connection fails with `Timeout`. `0`, the default, waits for one keep alive interval. The wait does not run out while the connection is held back by a full `messages` channel.
+    pub ping_timeout: i64 = 0
+    /// The capacity of the `messages` channel. Defaults to `256`. While the channel is full the connection stops reading, so acknowledgements, PINGRESP and every other packet wait until the consumer catches up. A program that publishes at QoS 1 or 2 to a subscription of its own must keep draining `messages`, or the acknowledgements of those publishes are never read.
+    pub buffer: i64 = 256
+}
+
+/// Settings for one `publish`.
+pub struct PublishOptions {
+    /// The QoS, `0` to `2`. `0` by default.
+    pub qos: i64 = 0
+    /// Whether the broker keeps the message as the retained message of the topic.
+    pub retain: bool = false
+    /// The MQTT 5 properties: `payload_format`, `message_expiry`, `content_type`, `response_topic`, `correlation_data` and `user_properties`. Ignored in MQTT 3.1.1. A `topic_alias` is rejected with `Invalid`, because the client assigns aliases itself when `Options.use_topic_aliases` is set.
+    pub properties: Properties = Properties {}
+}
+
+/// Settings for `subscribe_with`.
+pub struct SubscribeOptions {
+    /// MQTT 5: the subscription identifier sent with the subscription, which the broker returns in `Message.properties.subscription_ids`. `0`, the default, sends none.
+    pub identifier: i64 = 0
+    /// MQTT 5: user properties sent with the SUBSCRIBE.
+    pub user_properties: UserProperty[] = []
+}
+
+/// A message received from the broker, delivered on `messages`.
+pub struct Message {
+    /// The topic name. A topic alias is already resolved.
+    pub topic: str
+    /// The payload.
+    pub payload: u8[]
+    /// The QoS the broker delivered the message at.
+    pub qos: i64
+    /// Whether the message is retained: sent from the retained store, or kept as published when the subscription asked for it.
+    pub retain: bool
+    /// Whether the broker is resending the message.
+    pub dup: bool
+    /// The MQTT 5 properties, including `subscription_ids`, `content_type`, `response_topic`, `correlation_data`, `message_expiry` and `user_properties`. `topic_alias` is cleared.
+    pub properties: Properties
+}
+
+/// The outcome of a publish the broker acknowledged.
+pub struct Receipt {
+    /// The reason code of the final acknowledgement: `0` for success or `0x10` when no subscriber matched. MQTT 3.1.1 and QoS 0 give `0`.
+    pub code: i64
+    /// The properties of the final acknowledgement.
+    pub properties: Properties = Properties {}
+}
+
+enum Kind {
+    Publishing
+    Subscribing
+    Unsubscribing
+}
+
+enum Completion {
+    Acked(packet: Packet)
+    Lost
+    Dropped
+    Failed(error: Error)
+}
+
+struct Wire {
+    stream: io.Stream
+    abort: fn()
+}
+
+struct Deadline {
+    gate: sync.Mutex
+    settled: chan[bool]
+    fired: bool
+    done: bool
+}
+
+struct Pending {
+    id: i64
+    kind: Kind
+    qos: i64
+    stage: i64
+    packet: Packet
+    done: chan[Completion]
+}
+
+struct Link {
+    stream: io.Stream
+    reader: *io.Reader
+    stop: chan[bool]
+    ended: chan[bool]
+    slots: chan[bool]
+    pong: chan[bool]
+    abort: fn()
+    shutdown: sync.Once
+    alive: bool
+    down: bool
+    max_packet: i64
+    max_qos: i64
+    retain_ok: bool
+    alias_limit: i64
+    out_aliases: [str: i64]
+    in_aliases: [i64: str]
+    keep_alive: i64
+    last_sent: atomic.Int
+    delivering: atomic.Bool
+    cause: Error?
+    reject: i64
+}
+
+struct Outgoing {
+    data: u8[]
+    bind: i64
+}
+
+/// A copyable reference to the state of one broker connection.
+///
+/// Copies refer to the same connection. Calls on it are safe from several green threads. `detach` returns one from a `Client`, `adopt` turns it back into a `Client`, and the `_on` functions take it directly.
+///
+/// `messages` and `disconnected` stay open across `reconnect` and are closed by `close_client`.
+pub struct ClientHandle {
+    /// Receives each message published to a subscription, in the order the broker sent them. It has the capacity of `Options.buffer` and is closed when the client is closed, which ends a `for` loop over it. While it is full the connection stops reading, so a program that publishes at QoS 1 or 2 to its own subscription must keep draining it, or the acknowledgements of those publishes are never read.
+    pub messages: chan[Message]
+    /// Receives the reason the connection ended, without blocking the client: an error from the broker such as `Disconnected` or `TooLarge`, or `Timeout` when PINGRESP did not arrive, or `Closed` when the connection dropped. It holds one value and is closed when the client is closed. An end caused by `close_client` sends nothing.
+    pub disconnected: chan[Error]
+    /// The client identifier in use: `Options.client_id`, or the one the broker assigned.
+    pub client_id: str
+    /// Whether the broker kept a session for the latest connection.
+    pub session_present: bool
+    /// The properties of the latest CONNACK: the broker's limits and capabilities.
+    pub server: Properties
+    options: Options
+    redial: fn(i64) -> Wire ! Error
+    gate: sync.Mutex
+    wire: sync.Mutex
+    link: *Link
+    pending: [i64: *Pending]
+    received: [i64: bool]
+    next_id: i64
+    closed: bool
+    dialing: bool
+}
+
+/// An owned connection to an MQTT broker, from `connect`, `connect_tls` or `connect_stream`.
+///
+/// Dropping a `Client` closes the connection, unless `detach` released it first.
+pub struct Client {
+    /// The shared state of the connection, for the `_on` functions.
+    pub handle: *ClientHandle
+    /// The `messages` channel of the handle.
+    pub messages: chan[Message]
+    /// The `disconnected` channel of the handle.
+    pub disconnected: chan[Error]
+    detached: bool = false
+    drop {
+        if !detached {
+            close_client_on(handle)
+        }
+    }
+}
+
+/// A publish that was sent and may still await its acknowledgement, from `publish_async`.
+pub struct Publication {
+    handle: *ClientHandle
+    entry: *Pending?
+}
+
+fn refuse_auth(a: Auth) -> Auth ! Error {
+    fail Protocol
+}
+
+fn now_ms() -> i64 {
+    time.monotonic() / 1000000
+}
+
+fn owner(h: *ClientHandle) -> Client {
+    Client { handle: h, messages: h.messages, disconnected: h.disconnected }
+}
+
+/// Wraps a connection handle in a `Client` that owns it.
+///
+/// Dropping the returned client closes the connection. Pairs with `detach`.
+pub fn adopt(h: *ClientHandle) -> Client {
+    owner(h)
+}
+
+/// Releases the client's ownership of its connection and returns the `ClientHandle`.
+///
+/// Dropping `c` afterwards does not close the connection; close it with `close_client_on` or take it back with `adopt`. Use it to share the connection between green threads.
+pub fn detach(mut c: Client) -> *ClientHandle {
+    c.detached = true
+    c.handle
+}
+
+fn dead_link() -> *Link {
+    let stop = chan[bool]()
+    close(stop)
+    let ended = chan[bool]()
+    close(ended)
+    let reader = io.bytes_reader(io.buffer(0))
+    new(Link {
+        stream: io.reader_stream(reader)
+        reader
+        stop
+        ended
+        slots: chan[bool](1)
+        pong: chan[bool](1)
+        abort: fn() {}
+        shutdown: sync.once()
+        alive: false
+        down: true
+        max_packet: 0
+        max_qos: 2
+        retain_ok: true
+        alias_limit: 0
+        out_aliases: [:]
+        in_aliases: [:]
+        keep_alive: 0
+        last_sent: atomic.int(0)
+        delivering: atomic.boolean(false)
+        cause: none
+        reject: 0
+    })
+}
+
+fn retire(l: *Link) {
+    sync.run(l.shutdown, fn() {
+        close(l.stop)
+        l.abort()
+    })
+}
+
+fn link_error(e: Error) -> bool {
+    match e {
+        Closed => true
+        Timeout => true
+        _ => false
+    }
+}
+
+fn spare(limit: i64, started: i64) -> i64 ! Error {
+    if limit <= 0 {
+        return 0
+    }
+    let left = limit - (now_ms() - started)
+    if left <= 0 {
+        fail Timeout
+    }
+    left
+}
+
+fn arm(abort: fn(), millis: i64) -> *Deadline {
+    let d = new(Deadline { gate: sync.mutex(), settled: chan[bool](), fired: false, done: false })
+    if millis > 0 {
+        spawn watch(abort, d, millis)
+    }
+    d
+}
+
+fn watch(abort: fn(), d: *Deadline, millis: i64) {
+    select {
+        <-d.settled => {}
+        after(millis) => {
+            if claim_expiry(d) {
+                abort()
+            }
+        }
+    }
+}
+
+fn claim_expiry(d: *Deadline) -> bool {
+    sync.lock(d.gate)
+    defer sync.unlock(d.gate)
+    if d.done {
+        return false
+    }
+    d.fired = true
+    true
+}
+
+fn disarm(d: *Deadline) -> bool {
+    sync.lock(d.gate)
+    let intact = !d.fired
+    if intact {
+        d.done = true
+    }
+    sync.unlock(d.gate)
+    close(d.settled)
+    intact
+}
+
+fn dial_conn(o: Options, budget: i64) -> net.Conn ! Error {
+    using conn = net.dial_within(o.host, o.port, budget) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    net.set_write_timeout(conn, o.timeout)
+    conn
+}
+
+fn dial_plain(o: Options, budget: i64) -> Wire ! Error {
+    using var conn = dial_conn(o, budget)?
+    let handle = net.detach(mut conn)
+    Wire { stream: net.stream_on(handle), abort: fn() { net.close_on(handle) } }
+}
+
+fn dial_tls(o: Options, config: tls.Config, budget: i64) -> Wire ! Error {
+    let started = now_ms()
+    using var conn = dial_conn(o, budget)?
+    let left = spare(budget, started)?
+    var named = config
+    if named.server_name.len == 0 {
+        named.server_name = o.host
+    }
+    let handle = conn.handle
+    let abort = fn() { net.close_on(handle) }
+    let d = arm(abort, left)
+    let session = tls.client_handle(net.stream(conn), named) catch {
+        e => {
+            if !disarm(d) {
+                fail Timeout
+            }
+            match e {
+                TimedOut => fail Timeout
+                _ => fail Connect
+            }
+        }
+    }
+    if !disarm(d) {
+        fail Timeout
+    }
+    net.detach(mut conn)
+    Wire { stream: tls.stream_on(session), abort }
+}
+
+fn check_options(o: Options) ! Error {
+    if o.version == Version.V311 && o.client_id.len == 0 && !o.clean_start {
+        fail Invalid
+    }
+    if o.keep_alive < 0 || o.keep_alive > 65535 || o.buffer < 0 {
+        fail Invalid
+    }
+}
+
+fn open_client(o: Options, redial: fn(i64) -> Wire ! Error) -> Client ! Error {
+    check_options(o)?
+    let h = new(ClientHandle {
+        messages: chan[Message](o.buffer)
+        disconnected: chan[Error](1)
+        client_id: o.client_id
+        session_present: false
+        server: Properties {}
+        options: o
+        redial
+        gate: sync.mutex()
+        wire: sync.mutex()
+        link: dead_link()
+        pending: [:]
+        received: [:]
+        next_id: 0
+        closed: false
+        dialing: false
+    })
+    establish(h, false)?
+    owner(h)
+}
+
+/// Opens a TCP connection to `o.host` and `o.port` and performs the MQTT handshake.
+///
+/// Fails with `Connect` when the broker cannot be reached, `Timeout` when `o.connect_timeout` expires, `Refused(code)` when CONNACK carries a failure code, `Unsupported` when the broker answers with another protocol level, or `Malformed`, `Protocol` and `TooLarge` when the reply is not a valid CONNACK. The connection is closed when the handshake fails.
+pub fn connect(o: Options) -> Client ! Error {
+    open_client(o, fn(budget: i64) -> Wire ! Error { dial_plain(o, budget) })
+}
+
+/// Opens a TCP connection and performs the MQTT handshake over TLS configured by `config`.
+///
+/// When `config.server_name` is empty, `o.host` is used. Behaves as `connect`, and a failed TLS handshake fails with `Connect`, or `Timeout` when it times out. `reconnect` dials TLS again.
+pub fn connect_tls(o: Options, config: tls.Config) -> Client ! Error {
+    open_client(o, fn(budget: i64) -> Wire ! Error { dial_tls(o, config, budget) })
+}
+
+/// Performs the MQTT handshake over an existing `io.Stream` instead of dialling.
+///
+/// `o.host` and `o.port` are not used, `o.connect_timeout` limits the wait for CONNACK, and `o.timeout` does not limit writes because the stream carries no time limits. Closing the client closes the stream. `reconnect` fails with `Connect` because there is nothing to dial. Fails as `connect` does from the handshake onwards.
+pub fn connect_stream(s: io.Stream, o: Options) -> Client ! Error {
+    let unused = chan[bool](1)
+    unused <- true
+    let wire = Wire { stream: s, abort: fn() { s.close() } }
+    open_client(o, fn(budget: i64) -> Wire ! Error { take_wire(unused, wire) })
+}
+
+fn take_wire(unused: chan[bool], wire: Wire) -> Wire ! Error {
+    select {
+        <-unused => {
+            return wire
+        }
+        else => {
+            fail Connect
+        }
+    }
+}
+
+fn connect_properties(o: Options) -> Properties {
+    var p = o.properties
+    if o.session_expiry > 0 {
+        p.session_expiry = o.session_expiry
+    }
+    if o.receive_maximum > 0 {
+        p.receive_maximum = o.receive_maximum
+    }
+    if o.max_packet_size > 0 {
+        p.maximum_packet_size = o.max_packet_size
+    }
+    if o.topic_alias_maximum > 0 {
+        p.topic_alias_maximum = o.topic_alias_maximum
+    }
+    p
+}
+
+fn keeps_session(o: Options) -> bool {
+    if o.version == Version.V5 {
+        return (connect_properties(o).session_expiry ?? 0) > 0
+    }
+    !o.clean_start
+}
+
+fn connect_packet(h: *ClientHandle, reconnecting: bool) -> Connect {
+    let o = h.options
+    Connect {
+        version: o.version
+        client_id: h.client_id
+        clean_start: if reconnecting { !keeps_session(o) } else { o.clean_start }
+        keep_alive: o.keep_alive
+        username: o.username
+        password: o.password
+        will: o.will
+        properties: connect_properties(o)
+    }
+}
+
+fn handshake(h: *ClientHandle, stream: io.Stream, reader: *io.Reader, hello: Connect) -> Connack ! Error {
+    let o = h.options
+    let data = encode(Packet.Connect(hello), o.version)?
+    io.write_all(stream, data) catch {
+        e => fail transport(e)
+    }
+    for {
+        let p = read_packet(reader, o.version, o.max_packet_size)?
+        match p {
+            Connack(c) => return c
+            Auth(a) => {
+                let auth = o.authenticate
+                let reply = auth(a)?
+                let answer = encode(Packet.Auth(reply), o.version)?
+                io.write_all(stream, answer) catch {
+                    e => fail transport(e)
+                }
+            }
+            _ => fail Protocol
+        }
+    }
+}
+
+fn negotiate(h: *ClientHandle, wire: Wire, reader: *io.Reader, hello: Connect, left: i64) -> Connack ! Error {
+    let d = arm(wire.abort, left)
+    let c = handshake(h, wire.stream, reader, hello) catch {
+        e => {
+            if !disarm(d) {
+                fail Timeout
+            }
+            fail e
+        }
+    }
+    if !disarm(d) {
+        fail Timeout
+    }
+    c
+}
+
+fn open_link(h: *ClientHandle, wire: Wire, reader: *io.Reader, c: Connack) -> *Link {
+    let p = c.properties
+    var keep = h.options.keep_alive
+    if h.options.version == Version.V5 {
+        keep = p.server_keep_alive ?? keep
+    }
+    new(Link {
+        stream: wire.stream
+        reader
+        stop: chan[bool]()
+        ended: chan[bool]()
+        slots: chan[bool](p.receive_maximum ?? default_receive_maximum)
+        pong: chan[bool](1)
+        abort: wire.abort
+        shutdown: sync.once()
+        alive: false
+        down: false
+        max_packet: p.maximum_packet_size ?? 0
+        max_qos: p.maximum_qos ?? 2
+        retain_ok: p.retain_available ?? true
+        alias_limit: p.topic_alias_maximum ?? 0
+        out_aliases: [:]
+        in_aliases: [:]
+        keep_alive: keep
+        last_sent: atomic.int(now_ms())
+        delivering: atomic.boolean(false)
+        cause: none
+        reject: 0
+    })
+}
+
+fn install(h: *ClientHandle, l: *Link, c: Connack) -> bool {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    if h.closed {
+        return false
+    }
+    h.link = l
+    h.session_present = c.session_present
+    h.server = c.properties
+    h.client_id = c.properties.assigned_client_id ?? h.client_id
+    true
+}
+
+fn go_live(h: *ClientHandle, l: *Link) -> bool {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    h.dialing = false
+    if l.down || h.closed {
+        return false
+    }
+    l.alive = true
+    true
+}
+
+fn establish(h: *ClientHandle, reconnecting: bool) ! Error {
+    let limit = h.options.connect_timeout
+    let started = now_ms()
+    let wire = h.redial(limit)?
+    let left = spare(limit, started) catch {
+        e => {
+            wire.abort()
+            fail e
+        }
+    }
+    let reader = io.reader(wire.stream)
+    let hello = connect_packet(h, reconnecting)
+    let c = negotiate(h, wire, reader, hello, left) catch {
+        e => {
+            wire.abort()
+            fail e
+        }
+    }
+    if c.code != 0 {
+        wire.abort()
+        fail Refused(c.code)
+    }
+    let l = open_link(h, wire, reader, c)
+    if !install(h, l, c) {
+        retire(l)
+        fail Closed
+    }
+    spawn pump(h, l)
+    if l.keep_alive > 0 {
+        spawn keepalive(h, l)
+    }
+    if reconnecting {
+        resend(h, l, keeps_session(h.options))
+    }
+    if !go_live(h, l) {
+        fail Closed
+    }
+}
+
+/// Re-establishes the connection after it ended, resuming the session when it outlives the connection.
+///
+/// A session outlives the connection in MQTT 3.1.1 when `Options.clean_start` is `false`, and in MQTT 5 when the session expiry is above `0`. Then CONNECT asks for the kept session and each QoS 1 and QoS 2 PUBLISH the broker had not acknowledged is resent with the dup flag, with PUBREL for a QoS 2 message the broker had already received. A message that cannot be sent again completes with its own error and the rest are still resent. Otherwise CONNECT is clean. When the broker reports no session, every unacknowledged message completes with `SessionLost` and what the broker held for incoming QoS 2 messages is forgotten. `messages` and `disconnected` stay the same channels. Topic aliases start again.
+///
+/// The connection accepts no calls until the resend is done. Fails with `Connected` while the connection is up, `Closed` after `close_client` or when the connection ends again before it is ready, `Connect` for a client made by `connect_stream`, `Invalid` when MQTT 3.1.1 has no client identifier, and as `connect` does from the handshake onwards.
+pub fn reconnect(c: Client) ! Error {
+    reconnect_on(c.handle)
+}
+
+/// Re-establishes the connection behind `h`. See `reconnect`.
+pub fn reconnect_on(h: *ClientHandle) ! Error {
+    let old = begin_reconnect(h)?
+    let finished = <-old.ended
+    establish(h, true) catch {
+        e => {
+            end_reconnect(h)
+            fail e
+        }
+    }
+}
+
+fn begin_reconnect(h: *ClientHandle) -> *Link ! Error {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    if h.closed {
+        fail Closed
+    }
+    if h.link.alive || h.dialing {
+        fail Connected
+    }
+    if h.client_id.len == 0 {
+        fail Invalid
+    }
+    h.dialing = true
+    h.link
+}
+
+fn end_reconnect(h: *ClientHandle) {
+    sync.lock(h.gate)
+    h.dialing = false
+    sync.unlock(h.gate)
+}
+
+fn current(h: *ClientHandle) -> *Link {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    h.link
+}
+
+fn live(h: *ClientHandle) -> *Link ! Error {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    if h.closed || !h.link.alive {
+        fail Closed
+    }
+    h.link
+}
+
+fn entry_of(h: *ClientHandle, id: i64) -> *Pending? {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    h.pending[id]
+}
+
+fn queued_ids(h: *ClientHandle) -> i64[] {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    var ids: i64[] = []
+    for id in h.pending {
+        ids.push(id)
+    }
+    ids
+}
+
+fn resend(h: *ClientHandle, l: *Link, resumed: bool) {
+    if !resumed || !h.session_present {
+        sweep(h, Completion.Lost)
+        forget_received(h)
+        return
+    }
+    for id in queued_ids(h) {
+        match entry_of(h, id) {
+            some(e) => {
+                if !resend_entry(h, l, e) {
+                    return
+                }
+            }
+            none => {}
+        }
+    }
+}
+
+fn resend_entry(h: *ClientHandle, l: *Link, e: *Pending) -> bool {
+    acquire_slot(l, 0) or {
+        return false
+    }
+    resend_packet(h, l, e) catch {
+        err => {
+            if link_error(err) {
+                return false
+            }
+            abandon(h, l, e, err)
+        }
+    }
+    true
+}
+
+fn resend_packet(h: *ClientHandle, l: *Link, e: *Pending) ! Error {
+    if e.stage == 1 {
+        transmit_packet(h, l, Packet.Pubrel(Ack { id: e.id }))?
+        return
+    }
+    match e.packet {
+        Publish(p) => {
+            var again = p
+            again.dup = true
+            transmit(h, l, again)?
+        }
+        _ => {}
+    }
+}
+
+fn abandon(h: *ClientHandle, l: *Link, e: *Pending, err: Error) {
+    var claimed = false
+    sync.lock(h.gate)
+    match h.pending[e.id] {
+        some(held) => {
+            if held == e {
+                h.pending.delete(e.id)
+                claimed = true
+            }
+        }
+        none => {}
+    }
+    sync.unlock(h.gate)
+    release_slot(l)
+    if claimed {
+        finish(e, Completion.Failed(err))
+    }
+}
+
+fn forget_received(h: *ClientHandle) {
+    sync.lock(h.gate)
+    h.received = [:]
+    sync.unlock(h.gate)
+}
+
+fn finish(e: *Pending, c: Completion) {
+    e.done <- c
+    close(e.done)
+}
+
+fn sweep(h: *ClientHandle, c: Completion) {
+    sync.lock(h.gate)
+    var all: *Pending[] = []
+    for id, e in h.pending {
+        all.push(e)
+    }
+    h.pending = [:]
+    sync.unlock(h.gate)
+    for e in all {
+        finish(e, c)
+    }
+}
+
+fn sweep_waiters(h: *ClientHandle) {
+    sync.lock(h.gate)
+    var waiters: *Pending[] = []
+    for id, e in h.pending {
+        match e.kind {
+            Publishing => {}
+            _ => waiters.push(e)
+        }
+    }
+    for e in waiters {
+        h.pending.delete(e.id)
+    }
+    sync.unlock(h.gate)
+    for e in waiters {
+        finish(e, Completion.Dropped)
+    }
+}
+
+/// Closes the connection.
+///
+/// Sends DISCONNECT, which discards the will, ends the connection and closes `messages` and `disconnected`. The DISCONNECT is given up after one second when a write on the connection is stuck, and the connection ends regardless. Later calls fail with `Closed`, and a call waiting for an acknowledgement returns `Closed`. Closing twice is harmless, and so is dropping a `Client` afterwards.
+pub fn close_client(c: Client) {
+    close_client_on(c.handle)
+}
+
+/// Closes the connection behind `h`. Closing twice is harmless. See `close_client`.
+pub fn close_client_on(h: *ClientHandle) {
+    sync.lock(h.gate)
+    if h.closed {
+        sync.unlock(h.gate)
+        return
+    }
+    h.closed = true
+    let l = h.link
+    let up = l.alive
+    sync.unlock(h.gate)
+    if up {
+        goodbye(h, l, Packet.Disconnect(Disconnect {}))
+    }
+    retire(l)
+    let finished = <-l.ended
+    sweep(h, Completion.Dropped)
+    close(h.messages)
+    close(h.disconnected)
+}
+
+fn write_packet(h: *ClientHandle, l: *Link, p: Packet, sent: chan[bool]) {
+    transmit_packet(h, l, p) or {}
+    sent <- true
+}
+
+fn goodbye(h: *ClientHandle, l: *Link, p: Packet) {
+    let sent = chan[bool](1)
+    spawn write_packet(h, l, p, sent)
+    select {
+        <-sent => {}
+        after(goodbye_wait) => {}
+    }
+}
+
+fn acquire_slot(l: *Link, wait: i64) ! Error {
+    if wait > 0 {
+        select {
+            l.slots <- true => {}
+            <-l.stop => {
+                fail Closed
+            }
+            after(wait) => {
+                fail Timeout
+            }
+        }
+        return
+    }
+    select {
+        l.slots <- true => {}
+        <-l.stop => {
+            fail Closed
+        }
+    }
+}
+
+fn release_slot(l: *Link) {
+    select {
+        <-l.slots => {}
+        else => {}
+    }
+}
+
+fn check_size(l: *Link, data: u8[]) ! Error {
+    if l.max_packet > 0 && data.len > l.max_packet {
+        fail TooLarge
+    }
+}
+
+fn write_frame(l: *Link, data: u8[]) ! Error {
+    io.write_all(l.stream, data) catch {
+        e => {
+            retire(l)
+            fail transport(e)
+        }
+    }
+    l.last_sent.store_int(now_ms())
+}
+
+fn outgoing_publish(h: *ClientHandle, l: *Link, p: Publish) -> Outgoing ! Error {
+    var out = p
+    var bind = 0
+    let aliasing = h.options.version == Version.V5 && h.options.use_topic_aliases && l.alias_limit > 0
+    if aliasing {
+        match l.out_aliases[p.topic] {
+            some(a) => {
+                out.topic = ""
+                out.properties.topic_alias = a
+            }
+            none => {
+                if l.out_aliases.len < l.alias_limit {
+                    bind = l.out_aliases.len + 1
+                    out.properties.topic_alias = bind
+                }
+            }
+        }
+    }
+    let data = encode(Packet.Publish(out), h.options.version)?
+    check_size(l, data)?
+    Outgoing { data, bind }
+}
+
+fn transmit(h: *ClientHandle, l: *Link, p: Publish) ! Error {
+    sync.lock(h.wire)
+    defer sync.unlock(h.wire)
+    let framed = outgoing_publish(h, l, p)?
+    write_frame(l, framed.data)?
+    if framed.bind > 0 {
+        l.out_aliases[p.topic] = framed.bind
+    }
+}
+
+fn transmit_packet(h: *ClientHandle, l: *Link, p: Packet) ! Error {
+    sync.lock(h.wire)
+    defer sync.unlock(h.wire)
+    let data = encode(p, h.options.version)?
+    check_size(l, data)?
+    write_frame(l, data)?
+}
+
+fn fail_link(h: *ClientHandle, l: *Link, e: Error) {
+    sync.lock(h.gate)
+    match l.cause {
+        some(first) => {}
+        none => {
+            l.cause = e
+        }
+    }
+    sync.unlock(h.gate)
+    retire(l)
+}
+
+fn keepalive(h: *ClientHandle, l: *Link) {
+    let period = l.keep_alive * 1000
+    let limit = if h.options.ping_timeout > 0 { h.options.ping_timeout } else { period }
+    for {
+        let wait = period - (now_ms() - l.last_sent.load_int())
+        if wait > 0 {
+            select {
+                <-l.stop => {
+                    return
+                }
+                after(wait) => {}
+            }
+            continue
+        }
+        select {
+            <-l.pong => {}
+            else => {}
+        }
+        spawn write_packet(h, l, Packet.Pingreq, chan[bool](1))
+        var waiting = true
+        for waiting {
+            select {
+                <-l.pong => {
+                    waiting = false
+                }
+                <-l.stop => {
+                    return
+                }
+                after(limit) => {
+                    if !l.delivering.load_bool() {
+                        fail_link(h, l, Error.Timeout)
+                        return
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn code_for(e: Error, reject: i64) -> i64 {
+    match e {
+        Malformed => 0x81
+        Protocol => if reject > 0 { reject } else { 0x82 }
+        TooLarge => 0x95
+        _ => 0
+    }
+}
+
+fn farewell(h: *ClientHandle, l: *Link, e: Error) {
+    if h.options.version != Version.V5 {
+        return
+    }
+    let code = code_for(e, l.reject)
+    if code > 0 {
+        goodbye(h, l, Packet.Disconnect(Disconnect { code }))
+    }
+}
+
+fn pump(h: *ClientHandle, l: *Link) {
+    var cause = Error.Closed
+    for {
+        let p = read_packet(l.reader, h.options.version, h.options.max_packet_size) catch {
+            e => {
+                cause = e
+                break
+            }
+        }
+        dispatch(h, l, p) catch {
+            e => {
+                cause = e
+                break
+            }
+        }
+    }
+    lost(h, l, cause)
+}
+
+fn lost(h: *ClientHandle, l: *Link, cause: Error) {
+    var reason = cause
+    sync.lock(h.gate)
+    match l.cause {
+        some(c) => {
+            reason = c
+        }
+        none => {}
+    }
+    let closing = h.closed
+    l.alive = false
+    l.down = true
+    sync.unlock(h.gate)
+    if !closing {
+        farewell(h, l, reason)
+    }
+    retire(l)
+    sweep_waiters(h)
+    if !closing {
+        select {
+            h.disconnected <- reason => {}
+            else => {}
+        }
+    }
+    close(l.ended)
+}
+
+fn deliver(h: *ClientHandle, l: *Link, m: Message) ! Error {
+    l.delivering.store_bool(true)
+    defer l.delivering.store_bool(false)
+    select {
+        h.messages <- m => {}
+        <-l.stop => {
+            fail Closed
+        }
+    }
+}
+
+fn resolve(h: *ClientHandle, l: *Link, p: Publish) -> Message ! Error {
+    var topic = p.topic
+    var props = p.properties
+    match props.topic_alias {
+        some(a) => {
+            if a > h.options.topic_alias_maximum {
+                l.reject = 0x94
+                fail Protocol
+            }
+            if topic.len > 0 {
+                l.in_aliases[a] = topic
+            } else {
+                match l.in_aliases[a] {
+                    some(known) => {
+                        topic = known
+                    }
+                    none => {
+                        l.reject = 0x94
+                        fail Protocol
+                    }
+                }
+            }
+            props.topic_alias = none
+        }
+        none => {
+            if topic.len == 0 {
+                fail Protocol
+            }
+        }
+    }
+    Message { topic, payload: p.payload, qos: p.qos, retain: p.retain, dup: p.dup, properties: props }
+}
+
+fn receive_limit(h: *ClientHandle) -> i64 {
+    if h.options.receive_maximum > 0 {
+        return h.options.receive_maximum
+    }
+    default_receive_maximum
+}
+
+fn on_publish(h: *ClientHandle, l: *Link, p: Publish) ! Error {
+    let m = resolve(h, l, p)?
+    match p.qos {
+        0 => deliver(h, l, m)?
+        1 => {
+            deliver(h, l, m)?
+            transmit_packet(h, l, Packet.Puback(Ack { id: p.id }))?
+        }
+        _ => {
+            sync.lock(h.gate)
+            let known = h.received[p.id] ?? false
+            let full = !known && h.received.len >= receive_limit(h)
+            sync.unlock(h.gate)
+            if full {
+                l.reject = 0x93
+                fail Protocol
+            }
+            if !known {
+                deliver(h, l, m)?
+                sync.lock(h.gate)
+                h.received[p.id] = true
+                sync.unlock(h.gate)
+            }
+            transmit_packet(h, l, Packet.Pubrec(Ack { id: p.id }))?
+        }
+    }
+}
+
+fn settle(h: *ClientHandle, l: *Link, id: i64, kind: Kind, qos: i64, c: Completion) {
+    var claimed: *Pending? = none
+    sync.lock(h.gate)
+    match h.pending[id] {
+        some(e) => {
+            if e.kind == kind && e.qos == qos {
+                claimed = e
+                h.pending.delete(id)
+            }
+        }
+        none => {}
+    }
+    sync.unlock(h.gate)
+    match claimed {
+        some(e) => {
+            if kind == Kind.Publishing {
+                release_slot(l)
+            }
+            finish(e, c)
+        }
+        none => {}
+    }
+}
+
+fn on_pubrec(h: *ClientHandle, l: *Link, a: Ack) ! Error {
+    var found = false
+    var rejected = false
+    sync.lock(h.gate)
+    match h.pending[a.id] {
+        some(e) => {
+            if e.kind == Kind.Publishing && e.qos == 2 {
+                found = true
+                if a.code >= 0x80 {
+                    rejected = true
+                } else {
+                    e.stage = 1
+                }
+            }
+        }
+        none => {}
+    }
+    sync.unlock(h.gate)
+    if rejected {
+        settle(h, l, a.id, Kind.Publishing, 2, Completion.Acked(Packet.Pubrec(a)))
+        return
+    }
+    let code = if found || h.options.version == Version.V311 { 0 } else { 0x92 }
+    transmit_packet(h, l, Packet.Pubrel(Ack { id: a.id, code }))?
+}
+
+fn on_pubrel(h: *ClientHandle, l: *Link, a: Ack) ! Error {
+    sync.lock(h.gate)
+    let known = h.received[a.id] ?? false
+    if known {
+        h.received.delete(a.id)
+    }
+    sync.unlock(h.gate)
+    let code = if known || h.options.version == Version.V311 { 0 } else { 0x92 }
+    transmit_packet(h, l, Packet.Pubcomp(Ack { id: a.id, code }))?
+}
+
+fn on_pubcomp(h: *ClientHandle, l: *Link, a: Ack, p: Packet) ! Error {
+    match entry_of(h, a.id) {
+        some(e) => {
+            if e.kind == Kind.Publishing && e.qos == 2 && e.stage != 1 {
+                fail Protocol
+            }
+        }
+        none => {}
+    }
+    settle(h, l, a.id, Kind.Publishing, 2, Completion.Acked(p))
+}
+
+fn filter_count(e: *Pending) -> i64 {
+    match e.packet {
+        Subscribe(s) => s.filters.len
+        Unsubscribe(u) => u.filters.len
+        _ => 0
+    }
+}
+
+fn on_suback(h: *ClientHandle, l: *Link, s: Suback, p: Packet) ! Error {
+    match entry_of(h, s.id) {
+        some(e) => {
+            if e.kind == Kind.Subscribing && s.codes.len != filter_count(e) {
+                fail Protocol
+            }
+        }
+        none => {}
+    }
+    settle(h, l, s.id, Kind.Subscribing, 0, Completion.Acked(p))
+}
+
+fn on_unsuback(h: *ClientHandle, l: *Link, u: Unsuback, p: Packet) ! Error {
+    match entry_of(h, u.id) {
+        some(e) => {
+            if e.kind == Kind.Unsubscribing && h.options.version == Version.V5 && u.codes.len != filter_count(e) {
+                fail Protocol
+            }
+        }
+        none => {}
+    }
+    settle(h, l, u.id, Kind.Unsubscribing, 0, Completion.Acked(p))
+}
+
+fn dispatch(h: *ClientHandle, l: *Link, p: Packet) ! Error {
+    match p {
+        Publish(m) => on_publish(h, l, m)?
+        Puback(a) => settle(h, l, a.id, Kind.Publishing, 1, Completion.Acked(p))
+        Pubrec(a) => on_pubrec(h, l, a)?
+        Pubrel(a) => on_pubrel(h, l, a)?
+        Pubcomp(a) => on_pubcomp(h, l, a, p)?
+        Suback(s) => on_suback(h, l, s, p)?
+        Unsuback(u) => on_unsuback(h, l, u, p)?
+        Pingresp => {
+            select {
+                l.pong <- true => {}
+                else => {}
+            }
+        }
+        Disconnect(d) => fail Disconnected(d.code, d.properties.reason_string ?? "")
+        Auth(a) => {
+            let auth = h.options.authenticate
+            let reply = auth(a)?
+            transmit_packet(h, l, Packet.Auth(reply))?
+        }
+        _ => fail Protocol
+    }
+}
+
+fn allocate(h: *ClientHandle, kind: Kind, qos: i64) -> *Pending ! Error {
+    sync.lock(h.gate)
+    defer sync.unlock(h.gate)
+    for _ in 0..65535 {
+        h.next_id = h.next_id % 65535 + 1
+        match h.pending[h.next_id] {
+            some(taken) => {}
+            none => {
+                let e = new(Pending { id: h.next_id, kind, qos, stage: 0, packet: Packet.Pingreq, done: chan[Completion](1) })
+                h.pending[h.next_id] = e
+                return e
+            }
+        }
+    }
+    fail Exhausted
+}
+
+fn discard(h: *ClientHandle, e: *Pending) {
+    sync.lock(h.gate)
+    h.pending.delete(e.id)
+    sync.unlock(h.gate)
+}
+
+fn drained(done: chan[Completion]) -> Completion? {
+    select {
+        r = <-done => r
+        else => none
+    }
+}
+
+fn await(h: *ClientHandle, l: *Link, done: chan[Completion]) -> Completion ! Error {
+    var got: Completion? = none
+    let wait = h.options.timeout
+    if wait > 0 {
+        select {
+            r = <-done => {
+                got = r
+            }
+            <-l.ended => {
+                got = drained(done)
+            }
+            after(wait) => {
+                fail Timeout
+            }
+        }
+    } else {
+        select {
+            r = <-done => {
+                got = r
+            }
+            <-l.ended => {
+                got = drained(done)
+            }
+        }
+    }
+    match got {
+        some(c) => c
+        none => fail Closed
+    }
+}
+
+fn completed(c: Completion) -> Packet ! Error {
+    match c {
+        Acked(p) => p
+        Lost => fail SessionLost
+        Dropped => fail Closed
+        Failed(e) => fail e
+    }
+}
+
+fn receipt_of(p: Packet) -> Receipt ! Error {
+    match p {
+        Puback(a) => acknowledged(a)
+        Pubrec(a) => acknowledged(a)
+        Pubcomp(a) => acknowledged(a)
+        _ => fail Protocol
+    }
+}
+
+fn acknowledged(a: Ack) -> Receipt ! Error {
+    if a.code >= 0x80 {
+        fail Rejected(a.code)
+    }
+    Receipt { code: a.code, properties: a.properties }
+}
+
+/// Sends a PUBLISH and waits for the broker to acknowledge it.
+///
+/// QoS 0 returns once the packet is written. QoS 1 waits for PUBACK and QoS 2 for the PUBREC, PUBREL and PUBCOMP exchange. Fails with `InvalidTopic` for a topic that is not a topic name, `Invalid` for a QoS above `2`, `Unsupported` for a QoS or retain the broker does not offer, `TooLarge` when the packet exceeds the broker's maximum packet size, `Exhausted` when every packet identifier is in use, `Rejected(code)` when the broker refuses the message, `Timeout` when `Options.timeout` expires while waiting for a free slot, for a write or for the acknowledgement, `SessionLost` after a `reconnect` found no session to resume, and `Closed` when the connection is closed or ends. A QoS 1 or 2 message that ends with `Closed` or `Timeout` stays queued and `reconnect` resends it, so wait for it again with `publish_async` and `wait_publication` when it matters. A queued message holds its receive-maximum slot until the broker acknowledges it or the connection ends.
+pub fn publish(c: Client, topic: str, payload: u8[], o: PublishOptions) -> Receipt ! Error {
+    publish_on(c.handle, topic, payload, o)
+}
+
+/// Sends a PUBLISH on the connection behind `h` and waits for the acknowledgement. See `publish`.
+pub fn publish_on(h: *ClientHandle, topic: str, payload: u8[], o: PublishOptions) -> Receipt ! Error {
+    let sent = publish_async_on(h, topic, payload, o)?
+    wait_publication(sent)
+}
+
+/// Sends a PUBLISH and returns without waiting for the acknowledgement.
+///
+/// Fails as `publish` does before the acknowledgement. Pass the result to `wait_publication`. A QoS 0 publication is complete once this returns.
+pub fn publish_async(c: Client, topic: str, payload: u8[], o: PublishOptions) -> Publication ! Error {
+    publish_async_on(c.handle, topic, payload, o)
+}
+
+/// Sends a PUBLISH on the connection behind `h` without waiting. See `publish_async`.
+pub fn publish_async_on(h: *ClientHandle, topic: str, payload: u8[], o: PublishOptions) -> Publication ! Error {
+    if o.qos < 0 || o.qos > 2 {
+        fail Invalid
+    }
+    if !valid_topic_name(topic) {
+        fail InvalidTopic
+    }
+    if o.properties.topic_alias != none {
+        fail Invalid
+    }
+    let l = live(h)?
+    if o.qos > l.max_qos || (o.retain && !l.retain_ok) {
+        fail Unsupported
+    }
+    var p = Publish { topic, payload, qos: o.qos, retain: o.retain, properties: o.properties }
+    if o.qos == 0 {
+        transmit(h, l, p)?
+        return Publication { handle: h, entry: none }
+    }
+    acquire_slot(l, h.options.timeout)?
+    let e = allocate(h, Kind.Publishing, o.qos) catch {
+        err => {
+            release_slot(l)
+            fail err
+        }
+    }
+    p.id = e.id
+    e.packet = Packet.Publish(p)
+    transmit(h, l, p) catch {
+        err => {
+            if !link_error(err) {
+                discard(h, e)
+                release_slot(l)
+            }
+            fail err
+        }
+    }
+    Publication { handle: h, entry: e }
+}
+
+/// Waits for the acknowledgement of a publication from `publish_async`.
+///
+/// Fails as `publish` does after the send. Waiting again after `Closed` or `Timeout`, once `reconnect` has resent the message, waits on the new connection.
+pub fn wait_publication(p: Publication) -> Receipt ! Error {
+    match p.entry {
+        some(e) => await_receipt(p.handle, e)?
+        none => Receipt { code: 0 }
+    }
+}
+
+fn await_receipt(h: *ClientHandle, e: *Pending) -> Receipt ! Error {
+    let l = current(h)
+    let c = await(h, l, e.done)?
+    let packet = completed(c)?
+    receipt_of(packet)
+}
+
+fn exchange(h: *ClientHandle, kind: Kind, build: fn(i64) -> Packet) -> Packet ! Error {
+    let l = live(h)?
+    let e = allocate(h, kind, 0)?
+    let request = build(e.id)
+    e.packet = request
+    transmit_packet(h, l, request) catch {
+        err => {
+            discard(h, e)
+            fail err
+        }
+    }
+    let c = await(h, l, e.done) catch {
+        err => {
+            discard(h, e)
+            fail err
+        }
+    }
+    completed(c)?
+}
+
+/// Subscribes to `filters` and waits for SUBACK.
+///
+/// Returns the SUBACK: `codes` holds one code for each filter, the granted QoS `0` to `2` or a failure of `0x80` and above, which is reported there and not raised. Fails with `InvalidTopic`, `Invalid` for an empty list, a bad QoS or `no_local` on a shared subscription, `Exhausted`, `Timeout` and `Closed` as `publish` does, and `Protocol` when the SUBACK does not carry one code for each filter. A subscribe cut off by the end of the connection returns `Closed`.
+pub fn subscribe(c: Client, filters: Filter[]) -> Suback ! Error {
+    subscribe_with_on(c.handle, filters, SubscribeOptions {})
+}
+
+/// Subscribes on the connection behind `h`. See `subscribe`.
+pub fn subscribe_on(h: *ClientHandle, filters: Filter[]) -> Suback ! Error {
+    subscribe_with_on(h, filters, SubscribeOptions {})
+}
+
+/// Subscribes to `filters` with a subscription identifier and user properties and waits for SUBACK. See `subscribe`.
+pub fn subscribe_with(c: Client, filters: Filter[], o: SubscribeOptions) -> Suback ! Error {
+    subscribe_with_on(c.handle, filters, o)
+}
+
+/// Subscribes on the connection behind `h` with options. See `subscribe_with`.
+pub fn subscribe_with_on(h: *ClientHandle, filters: Filter[], o: SubscribeOptions) -> Suback ! Error {
+    var properties = Properties { user_properties: o.user_properties }
+    if o.identifier > 0 {
+        properties.subscription_ids = [o.identifier]
+    }
+    let reply = exchange(h, Kind.Subscribing, fn(id) { Packet.Subscribe(Subscribe { id, filters, properties }) })?
+    match reply {
+        Suback(s) => s
+        _ => fail Protocol
+    }
+}
+
+/// Removes the subscriptions to `filters` and waits for UNSUBACK.
+///
+/// Returns the UNSUBACK: `codes` holds `0` or `0x11` for each filter in MQTT 5 and is empty in MQTT 3.1.1. Fails as `subscribe` does.
+pub fn unsubscribe(c: Client, filters: str[]) -> Unsuback ! Error {
+    unsubscribe_on(c.handle, filters)
+}
+
+/// Removes subscriptions on the connection behind `h`. See `unsubscribe`.
+pub fn unsubscribe_on(h: *ClientHandle, filters: str[]) -> Unsuback ! Error {
+    let reply = exchange(h, Kind.Unsubscribing, fn(id) { Packet.Unsubscribe(Unsubscribe { id, filters }) })?
+    match reply {
+        Unsuback(u) => u
+        _ => fail Protocol
+    }
+}

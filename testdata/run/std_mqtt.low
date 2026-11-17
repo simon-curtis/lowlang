@@ -1,0 +1,1532 @@
+import std/crypto/x509
+import std/io
+import std/mqtt
+import std/net
+import std/sync
+import std/text
+import std/tls
+
+enum Mode {
+    Normal
+    Silent
+    Half
+    Hold
+    Stall
+}
+
+struct Settings {
+    reject: i64
+    username: str
+    password: str
+    server: mqtt.Properties
+    auth_method: str
+    mute_pings: bool
+    only_v311: bool
+}
+
+struct Peer {
+    stream: io.Stream
+    wire: sync.Mutex
+    version: mqtt.Version
+    alias_in: [i64: str]
+    alias_out: [str: i64]
+    alias_limit: i64
+    next_out: i64
+}
+
+struct Session {
+    id: str
+    persistent: bool
+    peer: *Peer?
+    subs: [str: mqtt.Filter]
+    ids: [str: i64]
+    held: [i64: bool]
+    events: chan[str]
+    stall: chan[bool]
+    mode: Mode
+    will: mqtt.Will?
+    inflight: i64
+    peak: i64
+    violations: i64
+}
+
+struct Broker {
+    gate: sync.Mutex
+    sessions: [str: *Session]
+    retained: [str: mqtt.Publish]
+    settings: Settings
+    names: i64
+}
+
+struct Target {
+    session: *Session
+    peer: *Peer
+    qos: i64
+    ids: i64[]
+    keep: bool
+}
+
+fn open_settings() -> Settings {
+    Settings { reject: 0, username: "", password: "", server: mqtt.Properties {}, auth_method: "", mute_pings: false, only_v311: false }
+}
+
+fn version_name(v: mqtt.Version) -> str {
+    if v == mqtt.Version.V5 {
+        return "5"
+    }
+    "3.1.1"
+}
+
+fn describe(e: mqtt.Error) -> str {
+    match e {
+        Connect => "Connect"
+        Closed => "Closed"
+        Timeout => "Timeout"
+        Malformed => "Malformed"
+        Protocol => "Protocol"
+        TooLarge => "TooLarge"
+        InvalidTopic => "InvalidTopic"
+        InvalidString => "InvalidString"
+        Invalid => "Invalid"
+        Unsupported => "Unsupported"
+        Refused(code) => "Refused({code})"
+        Rejected(code) => "Rejected({code})"
+        Disconnected(code, reason) => "Disconnected({code}, {reason})"
+        SessionLost => "SessionLost"
+        Exhausted => "Exhausted"
+        Connected => "Connected"
+    }
+}
+
+fn numbers(items: i64[]) -> str {
+    var out: str[] = []
+    for n in items {
+        out.push("{n}")
+    }
+    text.join(out, ",")
+}
+
+fn emit(p: *Peer, packet: mqtt.Packet) {
+    sync.lock(p.wire)
+    defer sync.unlock(p.wire)
+    let data = mqtt.encode(packet, p.version) or {
+        return
+    }
+    io.write_all(p.stream, data) or {}
+}
+
+fn note(s: *Session, line: str) {
+    select {
+        s.events <- line => {}
+        else => {}
+    }
+}
+
+fn snapshot(b: *Broker) -> Settings {
+    sync.lock(b.gate)
+    defer sync.unlock(b.gate)
+    b.settings
+}
+
+fn mode_of(b: *Broker, s: *Session) -> Mode {
+    sync.lock(b.gate)
+    defer sync.unlock(b.gate)
+    s.mode
+}
+
+fn new_session(name: str, persistent: bool) -> *Session {
+    new(Session {
+        id: name
+        persistent
+        peer: none
+        subs: [:]
+        ids: [:]
+        held: [:]
+        events: chan[str](1024)
+        stall: chan[bool]()
+        mode: Mode.Normal
+        will: none
+        inflight: 0
+        peak: 0
+        violations: 0
+    })
+}
+
+fn has_subscription(s: *Session, filter: str) -> bool {
+    match s.subs[filter] {
+        some(f) => true
+        none => false
+    }
+}
+
+fn lower(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    b
+}
+
+fn deliver_to(p: *Peer, m: mqtt.Publish) {
+    sync.lock(p.wire)
+    defer sync.unlock(p.wire)
+    var out = m
+    if out.qos > 0 {
+        p.next_out += 1
+        out.id = p.next_out
+    }
+    if p.version == mqtt.Version.V5 && p.alias_limit > 0 {
+        match p.alias_out[m.topic] {
+            some(a) => {
+                out.topic = ""
+                out.properties.topic_alias = a
+            }
+            none => {
+                if p.alias_out.len < p.alias_limit {
+                    let a = p.alias_out.len + 1
+                    p.alias_out[m.topic] = a
+                    out.properties.topic_alias = a
+                }
+            }
+        }
+    }
+    let data = mqtt.encode(mqtt.Packet.Publish(out), p.version) or {
+        return
+    }
+    io.write_all(p.stream, data) or {}
+}
+
+fn aim(s: *Session, p: *Peer, from: *Session?, topic: str) -> Target? {
+    var hit = false
+    var best = 0
+    var ids: i64[] = []
+    var keep = false
+    for pattern, f in s.subs {
+        if !mqtt.matches(f.filter, topic) {
+            continue
+        }
+        var own = false
+        match from {
+            some(origin) => {
+                own = origin == s
+            }
+            none => {}
+        }
+        if f.no_local && own {
+            continue
+        }
+        hit = true
+        best = lower(2, if f.qos > best { f.qos } else { best })
+        keep = keep || f.retain_as_published
+        match s.ids[f.filter] {
+            some(n) => ids.push(n)
+            none => {}
+        }
+    }
+    if !hit {
+        return none
+    }
+    Target { session: s, peer: p, qos: best, ids, keep }
+}
+
+fn targets_of(b: *Broker, from: *Session?, topic: str) -> Target[] {
+    var found: Target[] = []
+    sync.lock(b.gate)
+    for name, s in b.sessions {
+        match s.peer {
+            some(p) => {
+                match aim(s, p, from, topic) {
+                    some(t) => found.push(t)
+                    none => {}
+                }
+            }
+            none => {}
+        }
+    }
+    sync.unlock(b.gate)
+    found
+}
+
+fn route(b: *Broker, from: *Session?, topic: str, m: mqtt.Publish) {
+    var stored = m
+    stored.topic = topic
+    stored.properties.topic_alias = none
+    stored.dup = false
+    if m.retain {
+        sync.lock(b.gate)
+        if m.payload.len == 0 {
+            b.retained.delete(topic)
+        } else {
+            b.retained[topic] = stored
+        }
+        sync.unlock(b.gate)
+    }
+    for t in targets_of(b, from, topic) {
+        var out = stored
+        out.qos = lower(m.qos, t.qos)
+        out.retain = t.keep && m.retain
+        out.properties.subscription_ids = t.ids
+        deliver_to(t.peer, out)
+    }
+}
+
+fn send_retained(b: *Broker, p: *Peer, f: mqtt.Filter, ids: i64[]) {
+    var found: mqtt.Publish[] = []
+    sync.lock(b.gate)
+    for topic, r in b.retained {
+        if mqtt.matches(f.filter, topic) {
+            found.push(r)
+        }
+    }
+    sync.unlock(b.gate)
+    for r in found {
+        var out = r
+        out.qos = lower(r.qos, f.qos)
+        out.retain = true
+        out.properties.subscription_ids = ids
+        deliver_to(p, out)
+    }
+}
+
+fn on_subscribe(b: *Broker, s: *Session, p: *Peer, req: mqtt.Subscribe) {
+    let cap = snapshot(b).server.maximum_qos ?? 2
+    var codes: i64[] = []
+    var fresh: bool[] = []
+    var names: str[] = []
+    sync.lock(b.gate)
+    for f in req.filters {
+        fresh.push(!has_subscription(s, f.filter))
+        var granted = f
+        granted.qos = lower(f.qos, cap)
+        s.subs[f.filter] = granted
+        codes.push(granted.qos)
+        names.push("{f.filter}@{granted.qos}")
+        if req.properties.subscription_ids.len > 0 {
+            s.ids[f.filter] = req.properties.subscription_ids[0]
+        }
+    }
+    sync.unlock(b.gate)
+    note(s, "subscribe {text.join(names, " ")}")
+    for i, f in req.filters {
+        let again = p.version == mqtt.Version.V5 && f.retain_handling == 1 && !fresh[i]
+        let never = p.version == mqtt.Version.V5 && f.retain_handling == 2
+        if !again && !never {
+            send_retained(b, p, f, req.properties.subscription_ids)
+        }
+    }
+    emit(p, mqtt.Packet.Suback(mqtt.Suback { id: req.id, codes }))
+}
+
+fn on_unsubscribe(b: *Broker, s: *Session, p: *Peer, req: mqtt.Unsubscribe) {
+    var codes: i64[] = []
+    sync.lock(b.gate)
+    for filter in req.filters {
+        if has_subscription(s, filter) {
+            s.subs.delete(filter)
+            s.ids.delete(filter)
+            codes.push(0)
+        } else {
+            codes.push(0x11)
+        }
+    }
+    sync.unlock(b.gate)
+    note(s, "unsubscribe {text.join(req.filters, " ")}")
+    emit(p, mqtt.Packet.Unsuback(mqtt.Unsuback { id: req.id, codes }))
+}
+
+fn on_publish(b: *Broker, s: *Session, p: *Peer, m: mqtt.Publish) {
+    var topic = m.topic
+    let alias = m.properties.topic_alias ?? 0
+    if alias > 0 {
+        if topic.len > 0 {
+            p.alias_in[alias] = topic
+        } else {
+            topic = p.alias_in[alias] ?? ""
+        }
+    }
+    let mode = mode_of(b, s)
+    note(s, "publish [{m.topic}] alias={alias} qos={m.qos} id={m.id} dup={m.dup} retain={m.retain} bytes={m.payload.len}")
+    if mode == Mode.Stall {
+        note(s, "stalled")
+        <-s.stall
+        return
+    }
+    if m.qos == 0 {
+        route(b, s, topic, m)
+        return
+    }
+    if mode == Mode.Silent {
+        return
+    }
+    if m.qos == 1 {
+        route(b, s, topic, m)
+        if mode == Mode.Hold {
+            hold(b, s)
+            return
+        }
+        emit(p, mqtt.Packet.Puback(mqtt.Ack { id: m.id }))
+        return
+    }
+    sync.lock(b.gate)
+    let known = s.held[m.id] ?? false
+    s.held[m.id] = true
+    sync.unlock(b.gate)
+    if !known {
+        route(b, s, topic, m)
+    }
+    emit(p, mqtt.Packet.Pubrec(mqtt.Ack { id: m.id }))
+}
+
+fn hold(b: *Broker, s: *Session) {
+    let limit = snapshot(b).server.receive_maximum ?? 65535
+    sync.lock(b.gate)
+    s.inflight += 1
+    if s.inflight > s.peak {
+        s.peak = s.inflight
+    }
+    if s.inflight > limit {
+        s.violations += 1
+    }
+    sync.unlock(b.gate)
+}
+
+fn on_release(b: *Broker, s: *Session, p: *Peer, a: mqtt.Ack) {
+    let half = mode_of(b, s) == Mode.Half
+    note(s, "pubrel id={a.id}")
+    if half {
+        return
+    }
+    sync.lock(b.gate)
+    let known = s.held[a.id] ?? false
+    s.held.delete(a.id)
+    sync.unlock(b.gate)
+    var code = 0
+    if !known && p.version == mqtt.Version.V5 {
+        code = 0x92
+    }
+    emit(p, mqtt.Packet.Pubcomp(mqtt.Ack { id: a.id, code }))
+}
+
+fn text_of(data: u8[]?) -> str {
+    let d: u8[] = data ?? []
+    str(d)
+}
+
+fn converse(b: *Broker, s: *Session, p: *Peer, r: *io.Reader) -> bool {
+    for {
+        let packet = mqtt.read_packet(r, p.version, 0) catch {
+            e => return false
+        }
+        match packet {
+            Publish(m) => on_publish(b, s, p, m)
+            Pubrec(a) => {
+                if mode_of(b, s) != Mode.Silent {
+                    emit(p, mqtt.Packet.Pubrel(mqtt.Ack { id: a.id }))
+                }
+            }
+            Pubrel(a) => on_release(b, s, p, a)
+            Subscribe(req) => {
+                if mode_of(b, s) == Mode.Silent {
+                    note(s, "subscribe unanswered")
+                } else {
+                    on_subscribe(b, s, p, req)
+                }
+            }
+            Unsubscribe(req) => {
+                if mode_of(b, s) == Mode.Silent {
+                    note(s, "unsubscribe unanswered")
+                } else {
+                    on_unsubscribe(b, s, p, req)
+                }
+            }
+            Pingreq => {
+                note(s, "ping")
+                if !snapshot(b).mute_pings {
+                    emit(p, mqtt.Packet.Pingresp)
+                }
+            }
+            Disconnect(d) => {
+                note(s, "disconnect code={d.code}")
+                return d.code == 0
+            }
+            Auth(a) => note(s, "auth code={a.code} data={text_of(a.properties.auth_data)}")
+            _ => {}
+        }
+    }
+}
+
+fn finished(b: *Broker, s: *Session, p: *Peer, discarded: bool) {
+    var will: mqtt.Will? = none
+    sync.lock(b.gate)
+    var current = false
+    match s.peer {
+        some(c) => {
+            current = c == p
+        }
+        none => {}
+    }
+    if current {
+        s.peer = none
+        will = s.will
+        s.will = none
+        if !s.persistent {
+            match b.sessions[s.id] {
+                some(registered) => {
+                    if registered == s {
+                        b.sessions.delete(s.id)
+                    }
+                }
+                none => {}
+            }
+        }
+    }
+    sync.unlock(b.gate)
+    note(s, "ended clean={discarded}")
+    p.stream.close()
+    match will {
+        some(w) => {
+            if !discarded {
+                let m = mqtt.Publish { topic: w.topic, payload: w.payload, qos: w.qos, retain: w.retain, properties: w.properties }
+                route(b, none, w.topic, m)
+            }
+        }
+        none => {}
+    }
+}
+
+fn negotiate_auth(p: *Peer, r: *io.Reader, method: str) -> i64 {
+    let challenge = mqtt.Properties { auth_method: method, auth_data: bytes("challenge") }
+    emit(p, mqtt.Packet.Auth(mqtt.Auth { code: 0x18, properties: challenge }))
+    let reply = mqtt.read_packet(r, p.version, 0) catch {
+        e => return 0x87
+    }
+    match reply {
+        Auth(a) => {
+            if text_of(a.properties.auth_data) == "response:challenge" {
+                return 0
+            }
+            return 0x87
+        }
+        _ => return 0x87
+    }
+}
+
+fn refusal(b: *Broker, p: *Peer, r: *io.Reader, c: mqtt.Connect, cfg: Settings) -> i64 {
+    let v5 = c.version == mqtt.Version.V5
+    if cfg.reject != 0 {
+        return cfg.reject
+    }
+    if cfg.username.len > 0 {
+        let pw: u8[] = c.password ?? []
+        if (c.username ?? "") != cfg.username || str(pw) != cfg.password {
+            return if v5 { 0x86 } else { 4 }
+        }
+    }
+    if v5 && cfg.auth_method.len > 0 && (c.properties.auth_method ?? "") == cfg.auth_method {
+        return negotiate_auth(p, r, cfg.auth_method)
+    }
+    0
+}
+
+fn admit(b: *Broker, stream: io.Stream, r: *io.Reader, c: mqtt.Connect) {
+    let cfg = snapshot(b)
+    if c.version == mqtt.Version.V5 && cfg.only_v311 {
+        let unacceptable: u8[] = [0x20, 0x02, 0x00, 0x01]
+        io.write_all(stream, unacceptable) or {}
+        stream.close()
+        return
+    }
+    var props = cfg.server
+    var name = c.client_id
+    sync.lock(b.gate)
+    if name.len == 0 {
+        b.names += 1
+        name = "auto-{b.names}"
+        if c.version == mqtt.Version.V5 {
+            props.assigned_client_id = name
+        }
+    }
+    sync.unlock(b.gate)
+    let p = new(Peer {
+        stream
+        wire: sync.mutex()
+        version: c.version
+        alias_in: [:]
+        alias_out: [:]
+        alias_limit: c.properties.topic_alias_maximum ?? 0
+        next_out: 0
+    })
+    let refused = refusal(b, p, r, c, cfg)
+    if refused != 0 {
+        emit(p, mqtt.Packet.Connack(mqtt.Connack { code: refused }))
+        stream.close()
+        return
+    }
+    if cfg.auth_method.len > 0 {
+        props.auth_method = cfg.auth_method
+    }
+    let expiry = c.properties.session_expiry ?? 0
+    let persistent = if c.version == mqtt.Version.V5 { expiry > 0 } else { !c.clean_start }
+    var existing: *Session? = none
+    sync.lock(b.gate)
+    if !c.clean_start {
+        existing = b.sessions[name]
+    }
+    var present = false
+    var s = new_session(name, persistent)
+    match existing {
+        some(old) => {
+            s = old
+            present = true
+        }
+        none => {}
+    }
+    s.peer = p
+    s.will = c.will
+    s.persistent = persistent
+    b.sessions[name] = s
+    sync.unlock(b.gate)
+    note(s, "connected version={version_name(c.version)} clean={c.clean_start} present={present}")
+    emit(p, mqtt.Packet.Connack(mqtt.Connack { session_present: present, properties: props }))
+    let discarded = converse(b, s, p, r)
+    finished(b, s, p, discarded)
+}
+
+fn serve_stream(b: *Broker, stream: io.Stream) {
+    let r = io.reader(stream)
+    let first = mqtt.read_packet(r, mqtt.Version.V5, 0) catch {
+        e => {
+            stream.close()
+            return
+        }
+    }
+    match first {
+        Connect(c) => admit(b, stream, r, c)
+        _ => stream.close()
+    }
+}
+
+fn serve(l: net.ListenerHandle, b: *Broker) {
+    for {
+        let h = net.accept_handle(l) or return
+        spawn plain(h, b)
+    }
+}
+
+fn plain(h: net.ConnHandle, b: *Broker) {
+    using c = net.adopt(h)
+    serve_stream(b, net.stream(c))
+}
+
+fn serve_tls(l: net.ListenerHandle, b: *Broker, config: tls.Config) {
+    for {
+        let h = net.accept_handle(l) or return
+        spawn encrypted(h, b, config)
+    }
+}
+
+fn encrypted(h: net.ConnHandle, b: *Broker, config: tls.Config) {
+    using c = net.adopt(h)
+    using t = tls.server(net.stream(c), config) or return
+    serve_stream(b, tls.stream(t))
+}
+
+fn session_of(b: *Broker, id: str) -> *Session {
+    sync.lock(b.gate)
+    defer sync.unlock(b.gate)
+    match b.sessions[id] {
+        some(s) => s
+        none => panic("no session {id}")
+    }
+}
+
+fn peer_of(b: *Broker, s: *Session) -> *Peer {
+    sync.lock(b.gate)
+    defer sync.unlock(b.gate)
+    match s.peer {
+        some(p) => p
+        none => panic("no connection for {s.id}")
+    }
+}
+
+fn set_mode(b: *Broker, s: *Session, mode: Mode) {
+    sync.lock(b.gate)
+    s.mode = mode
+    sync.unlock(b.gate)
+}
+
+fn configure(b: *Broker, settings: Settings) {
+    sync.lock(b.gate)
+    b.settings = settings
+    sync.unlock(b.gate)
+}
+
+fn kill(b: *Broker, s: *Session) {
+    peer_of(b, s).stream.close()
+}
+
+fn inject(b: *Broker, s: *Session, packet: mqtt.Packet) {
+    emit(peer_of(b, s), packet)
+}
+
+fn acknowledge(b: *Broker, s: *Session, id: i64) {
+    sync.lock(b.gate)
+    s.inflight -= 1
+    sync.unlock(b.gate)
+    emit(peer_of(b, s), mqtt.Packet.Puback(mqtt.Ack { id }))
+}
+
+fn wait_for(s: *Session, prefix: str) -> str {
+    for {
+        select {
+            line = <-s.events => {
+                let e = line ?? "events closed"
+                if text.starts_with(e, prefix) {
+                    return e
+                }
+            }
+            after(5000) => {
+                return "timeout waiting for {prefix}"
+            }
+        }
+    }
+}
+
+fn recv(ch: chan[mqtt.Message]) -> mqtt.Message? {
+    select {
+        m = <-ch => m
+        after(5000) => none
+    }
+}
+
+fn show(m: mqtt.Message?) -> str {
+    match m {
+        some(x) => "{x.topic} [{str(x.payload)}] qos={x.qos} retain={x.retain}"
+        none => "none"
+    }
+}
+
+fn failure(ch: chan[mqtt.Error]) -> str {
+    var e: mqtt.Error? = none
+    select {
+        v = <-ch => {
+            e = v
+        }
+        after(5000) => {}
+    }
+    match e {
+        some(x) => describe(x)
+        none => "none"
+    }
+}
+
+fn options(port: i64, id: str, v: mqtt.Version) -> mqtt.Options {
+    mqtt.Options { port, client_id: id, version: v }
+}
+
+fn connected(o: mqtt.Options) -> mqtt.Client {
+    mqtt.connect(o) catch {
+        e => panic("connect failed: {describe(e)}")
+    }
+}
+
+fn dial_error(o: mqtt.Options) -> str {
+    using c = mqtt.connect(o) catch {
+        e => return describe(e)
+    }
+    "connected"
+}
+
+fn send(c: mqtt.Client, topic: str, body: str, qos: i64) -> mqtt.Receipt {
+    mqtt.publish(c, topic, bytes(body), mqtt.PublishOptions { qos }) catch {
+        e => panic("publish failed: {describe(e)}")
+    }
+}
+
+fn waited(p: mqtt.Publication) -> str {
+    let r = mqtt.wait_publication(p) catch {
+        e => return describe(e)
+    }
+    "code={r.code}"
+}
+
+fn start(c: mqtt.Client, topic: str, body: str, qos: i64) -> mqtt.Publication {
+    mqtt.publish_async(c, topic, bytes(body), mqtt.PublishOptions { qos }) catch {
+        e => panic("publish failed: {describe(e)}")
+    }
+}
+
+fn attempt(c: mqtt.Client, topic: str, body: str, qos: i64) -> str {
+    let r = mqtt.publish(c, topic, bytes(body), mqtt.PublishOptions { qos }) catch {
+        e => return describe(e)
+    }
+    "code={r.code}"
+}
+
+fn keep(c: mqtt.Client, topic: str, body: str, qos: i64) {
+    mqtt.publish(c, topic, bytes(body), mqtt.PublishOptions { qos, retain: true }) catch {
+        e => panic("publish failed: {describe(e)}")
+    }
+}
+
+fn state(ch: chan[mqtt.Message]) -> str {
+    select {
+        m = <-ch => {
+            match m {
+                some(x) => "message"
+                none => "closed"
+            }
+        }
+        else => "open"
+    }
+}
+
+fn identifiers(m: mqtt.Message?) -> str {
+    match m {
+        some(x) => "{x.topic} ids=[{numbers(x.properties.subscription_ids)}]"
+        none => "none"
+    }
+}
+
+fn subscribed(c: mqtt.Client, filters: mqtt.Filter[]) -> mqtt.Suback {
+    mqtt.subscribe(c, filters) catch {
+        e => panic("subscribe failed: {describe(e)}")
+    }
+}
+
+fn identified(c: mqtt.Client, filters: mqtt.Filter[], identifier: i64) -> mqtt.Suback {
+    mqtt.subscribe_with(c, filters, mqtt.SubscribeOptions { identifier }) catch {
+        e => panic("subscribe failed: {describe(e)}")
+    }
+}
+
+fn filter(pattern: str, qos: i64) -> mqtt.Filter {
+    mqtt.Filter { filter: pattern, qos }
+}
+
+fn basic(b: *Broker, port: i64, v: mqtt.Version) {
+    let tag = version_name(v)
+    print("== basic {tag}")
+    using sub = connected(options(port, "basic-sub-{tag}", v))
+    using source = connected(options(port, "basic-source-{tag}", v))
+    let granted = subscribed(sub, [filter("basic/+", 2), filter("down/#", 1), filter("mark/#", 0)])
+    print("suback {numbers(granted.codes)}")
+    for q in 0..3 {
+        let r = send(source, "basic/{q}", "message {q}", q)
+        print("publish qos={q} code={r.code}")
+        print("received {show(recv(sub.messages))}")
+    }
+    send(source, "down/a", "downgraded", 2)
+    print("received {show(recv(sub.messages))}")
+    let removed = mqtt.unsubscribe(sub, ["basic/+", "never/subscribed"]) catch {
+        e => panic("unsubscribe failed: {describe(e)}")
+    }
+    print("unsuback {numbers(removed.codes)}")
+    send(source, "basic/9", "after unsubscribe", 1)
+    send(source, "down/z", "marker", 1)
+    print("received {show(recv(sub.messages))}")
+    print("publish to a wildcard {attempt(source, "basic/+", "x", 0)}")
+    print("publish with qos 3 {attempt(source, "basic/x", "x", 3)}")
+    print("subscribe to a bad filter {bad_filter(sub)}")
+}
+
+fn bad_filter(c: mqtt.Client) -> str {
+    let r = mqtt.subscribe(c, [filter("a/#/b", 0)]) catch {
+        e => return describe(e)
+    }
+    "codes {numbers(r.codes)}"
+}
+
+fn retained(b: *Broker, port: i64, v: mqtt.Version) {
+    let tag = version_name(v)
+    print("== retained {tag}")
+    using source = connected(options(port, "ret-source-{tag}", v))
+    using live = connected(options(port, "ret-live-{tag}", v))
+    subscribed(live, [filter("ret-{tag}/#", 1)])
+    keep(source, "ret-{tag}/b", "two", 0)
+    keep(source, "ret-{tag}/a", "one", 1)
+    keep(source, "ret-{tag}/b", "", 1)
+    print("live {show(recv(live.messages))}")
+    print("live {show(recv(live.messages))}")
+    print("live {show(recv(live.messages))}")
+    using late = connected(options(port, "ret-late-{tag}", v))
+    subscribed(late, [filter("ret-{tag}/#", 1)])
+    print("late {show(recv(late.messages))}")
+    send(source, "ret-{tag}/z", "live message", 1)
+    print("late {show(recv(late.messages))}")
+}
+
+fn subscription_options(b: *Broker, port: i64) {
+    print("== subscription options")
+    using source = connected(options(port, "opt-source", mqtt.Version.V5))
+    using kept = connected(options(port, "opt-rap", mqtt.Version.V5))
+    using plain = connected(options(port, "opt-plain", mqtt.Version.V5))
+    subscribed(kept, [mqtt.Filter { filter: "opt/t", qos: 1, retain_as_published: true }])
+    subscribed(plain, [filter("opt/t", 1)])
+    keep(source, "opt/t", "retained", 1)
+    keep(source, "opt/n", "kept", 1)
+    print("retain as published {show(recv(kept.messages))}")
+    print("without it {show(recv(plain.messages))}")
+    using handling = connected(options(port, "opt-handling", mqtt.Version.V5))
+    subscribed(handling, [mqtt.Filter { filter: "opt/t", qos: 1, retain_handling: 2 }, filter("opt/m", 1)])
+    send(source, "opt/m", "marker one", 1)
+    print("never {show(recv(handling.messages))}")
+    subscribed(handling, [mqtt.Filter { filter: "opt/n", qos: 1, retain_handling: 1 }])
+    print("new subscription {show(recv(handling.messages))}")
+    subscribed(handling, [mqtt.Filter { filter: "opt/n", qos: 1, retain_handling: 1 }])
+    send(source, "opt/m", "marker two", 1)
+    print("existing subscription {show(recv(handling.messages))}")
+    using echo = connected(options(port, "opt-echo", mqtt.Version.V5))
+    using other = connected(options(port, "opt-other", mqtt.Version.V5))
+    subscribed(echo, [mqtt.Filter { filter: "opt/echo", qos: 0, no_local: true }])
+    subscribed(other, [filter("opt/echo", 0)])
+    send(echo, "opt/echo", "from echo", 1)
+    send(other, "opt/echo", "from other", 1)
+    print("other {show(recv(other.messages))}")
+    print("other {show(recv(other.messages))}")
+    print("echo {show(recv(echo.messages))}")
+    using ids = connected(options(port, "opt-ids", mqtt.Version.V5))
+    identified(ids, [filter("id/#", 1)], 7)
+    identified(ids, [filter("id/x/#", 1)], 9)
+    send(source, "id/x/y", "both", 1)
+    send(source, "id/other", "one", 1)
+    print("{identifiers(recv(ids.messages))}")
+    print("{identifiers(recv(ids.messages))}")
+}
+
+fn wills(b: *Broker, port: i64, v: mqtt.Version) {
+    let tag = version_name(v)
+    print("== wills {tag}")
+    using watch = connected(options(port, "will-watch-{tag}", v))
+    subscribed(watch, [filter("will/#", 1)])
+    var o = options(port, "will-owner-{tag}", v)
+    o.will = mqtt.Will { topic: "will/owner", payload: bytes("gone"), qos: 1 }
+    using owner = connected(o)
+    let s = session_of(b, "will-owner-{tag}")
+    kill(b, s)
+    print("owner {failure(owner.disconnected)}")
+    print("will {show(recv(watch.messages))}")
+    print(wait_for(s, "ended"))
+    var q = options(port, "will-quiet-{tag}", v)
+    q.will = mqtt.Will { topic: "will/quiet", payload: bytes("never") }
+    using quiet = connected(q)
+    let t = session_of(b, "will-quiet-{tag}")
+    mqtt.close_client(quiet)
+    print(wait_for(t, "ended"))
+    using marker = connected(options(port, "will-marker-{tag}", v))
+    send(marker, "will/marker", "marker", 1)
+    print("after a clean close {show(recv(watch.messages))}")
+}
+
+fn resume(b: *Broker, port: i64, v: mqtt.Version) {
+    let tag = version_name(v)
+    print("== resume {tag}")
+    using watch = connected(options(port, "res-watch-{tag}", v))
+    subscribed(watch, [filter("res/#", 2)])
+    var o = options(port, "res-{tag}", v)
+    o.clean_start = false
+    o.session_expiry = 600
+    using c = connected(o)
+    let s = session_of(b, "res-{tag}")
+    print("present {c.handle.session_present}")
+    set_mode(b, s, Mode.Silent)
+    let first = start(c, "res/1", "one", 1)
+    print(wait_for(s, "publish"))
+    set_mode(b, s, Mode.Half)
+    let second = start(c, "res/2", "two", 2)
+    print(wait_for(s, "publish"))
+    print(wait_for(s, "pubrel"))
+    print("watch {show(recv(watch.messages))}")
+    set_mode(b, s, Mode.Silent)
+    let third = start(c, "res/3", "three", 2)
+    print(wait_for(s, "publish"))
+    kill(b, s)
+    print("ended {failure(c.disconnected)}")
+    print("first {waited(first)}")
+    print("publish while down {attempt(c, "res/4", "x", 1)}")
+    set_mode(b, s, Mode.Normal)
+    mqtt.reconnect(c) catch {
+        e => panic("reconnect failed: {describe(e)}")
+    }
+    print("present {c.handle.session_present}")
+    print(wait_for(s, "publish"))
+    print(wait_for(s, "pubrel"))
+    print(wait_for(s, "publish"))
+    print(wait_for(s, "pubrel"))
+    print("first {waited(first)}")
+    print("second {waited(second)}")
+    print("third {waited(third)}")
+    print("watch {show(recv(watch.messages))}")
+    print("watch {show(recv(watch.messages))}")
+    print("connected again {attempt(c, "res/5", "five", 2)}")
+    print("watch {show(recv(watch.messages))}")
+    var lost = options(port, "res-lost-{tag}", v)
+    lost.clean_start = false
+    lost.session_expiry = 600
+    using d = connected(lost)
+    let ls = session_of(b, "res-lost-{tag}")
+    set_mode(b, ls, Mode.Silent)
+    let stranded = start(d, "res/lost", "x", 1)
+    print(wait_for(ls, "publish"))
+    kill(b, ls)
+    print("ended {failure(d.disconnected)}")
+    sync.lock(b.gate)
+    b.sessions.delete("res-lost-{tag}")
+    sync.unlock(b.gate)
+    mqtt.reconnect(d) catch {
+        e => panic("reconnect failed: {describe(e)}")
+    }
+    print("present {d.handle.session_present}")
+    print("stranded {waited(stranded)}")
+}
+
+fn aliases(b: *Broker, port: i64) {
+    print("== aliases")
+    var cfg = open_settings()
+    cfg.server = mqtt.Properties { topic_alias_maximum: 2 }
+    configure(b, cfg)
+    var so = options(port, "alias-sub", mqtt.Version.V5)
+    so.topic_alias_maximum = 2
+    using sub = connected(so)
+    subscribed(sub, [filter("al/#", 1)])
+    var po = options(port, "alias-source", mqtt.Version.V5)
+    po.use_topic_aliases = true
+    using source = connected(po)
+    configure(b, open_settings())
+    let s = session_of(b, "alias-source")
+    for topic in ["al/one", "al/one", "al/two", "al/three", "al/one", "al/two"] {
+        send(source, topic, "x", 1)
+        print(wait_for(s, "publish"))
+        print("received {show(recv(sub.messages))}")
+    }
+    let t = session_of(b, "alias-sub")
+    inject(b, t, mqtt.Packet.Publish(mqtt.Publish { topic: "x", properties: mqtt.Properties { topic_alias: 5 } }))
+    print("alias above the limit {failure(sub.disconnected)}")
+    print(wait_for(t, "disconnect"))
+}
+
+fn server_disconnect(b: *Broker, port: i64) {
+    print("== server disconnect")
+    using c = connected(options(port, "srv-disc", mqtt.Version.V5))
+    let s = session_of(b, "srv-disc")
+    let reason = mqtt.Properties { reason_string: "maintenance" }
+    inject(b, s, mqtt.Packet.Disconnect(mqtt.Disconnect { code: 0x8B, properties: reason }))
+    print("ended {failure(c.disconnected)}")
+    print("messages {state(c.messages)}")
+    print("publish {attempt(c, "srv/a", "x", 1)}")
+    mqtt.reconnect(c) catch {
+        e => panic("reconnect failed: {describe(e)}")
+    }
+    print("publish after reconnect {attempt(c, "srv/a", "x", 1)}")
+}
+
+fn refusals(b: *Broker, port: i64) ! io.Error {
+    print("== refusals")
+    for v in [mqtt.Version.V311, mqtt.Version.V5] {
+        let tag = version_name(v)
+        var cfg = open_settings()
+        cfg.reject = if v == mqtt.Version.V5 { 0x87 } else { 5 }
+        configure(b, cfg)
+        print("{tag} refused {dial_error(options(port, "refused-{tag}", v))}")
+        var guarded = open_settings()
+        guarded.username = "user"
+        guarded.password = "secret"
+        configure(b, guarded)
+        print("{tag} anonymous {dial_error(options(port, "anon-{tag}", v))}")
+        var wrong = options(port, "wrong-{tag}", v)
+        wrong.username = "user"
+        wrong.password = bytes("guess")
+        print("{tag} wrong password {dial_error(wrong)}")
+        var right = options(port, "right-{tag}", v)
+        right.username = "user"
+        right.password = bytes("secret")
+        print("{tag} right password {dial_error(right)}")
+    }
+    configure(b, open_settings())
+    using gone = net.listen("127.0.0.1", 0)?
+    let closed_port = gone.handle.addr.port
+    net.close_listener(gone)
+    print("no broker {dial_error(options(closed_port, "nobody", mqtt.Version.V5))}")
+}
+
+fn packets(b: *Broker, port: i64, v: mqtt.Version) {
+    let tag = version_name(v)
+    print("== packet size {tag}")
+    var so = options(port, "big-sub-{tag}", v)
+    so.max_packet_size = 64
+    using sub = connected(so)
+    subscribed(sub, [filter("big/#", 0)])
+    using source = connected(options(port, "big-source-{tag}", v))
+    let s = session_of(b, "big-sub-{tag}")
+    send(source, "big/a", text.repeat("x", 200), 0)
+    print("subscriber {failure(sub.disconnected)}")
+    if v == mqtt.Version.V5 {
+        print(wait_for(s, "disconnect"))
+    }
+    print(wait_for(s, "ended"))
+    if v == mqtt.Version.V5 {
+        var cfg = open_settings()
+        cfg.server = mqtt.Properties { maximum_packet_size: 100 }
+        configure(b, cfg)
+        using limited = connected(options(port, "big-limited", v))
+        configure(b, open_settings())
+        print("oversized {attempt(limited, "big/b", text.repeat("y", 200), 1)}")
+        print("small {attempt(limited, "big/b", "y", 1)}")
+    }
+}
+
+fn burst(h: *mqtt.ClientHandle, done: chan[str]) {
+    var sent: mqtt.Publication[] = []
+    for n in 1..6 {
+        let p = mqtt.publish_async_on(h, "flow/{n}", bytes("m{n}"), mqtt.PublishOptions { qos: 1 }) catch {
+            e => {
+                done <- "send failed {describe(e)}"
+                return
+            }
+        }
+        sent.push(p)
+    }
+    var codes: str[] = []
+    for p in sent {
+        codes.push(waited(p))
+    }
+    done <- text.join(codes, " ")
+}
+
+fn flow_control(b: *Broker, port: i64) {
+    print("== receive maximum")
+    var cfg = open_settings()
+    cfg.server = mqtt.Properties { receive_maximum: 2 }
+    configure(b, cfg)
+    using source = connected(options(port, "flow", mqtt.Version.V5))
+    let s = session_of(b, "flow")
+    set_mode(b, s, Mode.Hold)
+    let done = chan[str](1)
+    spawn burst(source.handle, done)
+    print(wait_for(s, "publish"))
+    print(wait_for(s, "publish"))
+    for n in 1..6 {
+        acknowledge(b, s, n)
+        if n <= 3 {
+            print(wait_for(s, "publish"))
+        }
+    }
+    print("burst {(<-done) ?? "closed"}")
+    print("peak {s.peak} violations {s.violations}")
+    configure(b, open_settings())
+    var o = options(port, "flow-rx", mqtt.Version.V5)
+    o.receive_maximum = 1
+    using c = connected(o)
+    let t = session_of(b, "flow-rx")
+    set_mode(b, t, Mode.Silent)
+    inject(b, t, mqtt.Packet.Publish(mqtt.Publish { topic: "rx/1", payload: bytes("a"), qos: 2, id: 1 }))
+    inject(b, t, mqtt.Packet.Publish(mqtt.Publish { topic: "rx/2", payload: bytes("b"), qos: 2, id: 2 }))
+    print("received {show(recv(c.messages))}")
+    print("ended {failure(c.disconnected)}")
+    print(wait_for(t, "disconnect"))
+}
+
+fn enhanced(b: *Broker, port: i64) {
+    print("== enhanced authentication")
+    var cfg = open_settings()
+    cfg.auth_method = "TOKEN"
+    configure(b, cfg)
+    var o = options(port, "auth-ok", mqtt.Version.V5)
+    o.properties = mqtt.Properties { auth_method: "TOKEN", auth_data: bytes("hello") }
+    o.authenticate = fn(a: mqtt.Auth) -> mqtt.Auth ! mqtt.Error {
+        let answer = mqtt.Properties { auth_method: "TOKEN", auth_data: bytes("response:{text_of(a.properties.auth_data)}") }
+        mqtt.Auth { code: 0x18, properties: answer }
+    }
+    using c = connected(o)
+    print("method {c.handle.server.auth_method ?? ""}")
+    let s = session_of(b, "auth-ok")
+    let again = mqtt.Properties { auth_method: "TOKEN", auth_data: bytes("again") }
+    inject(b, s, mqtt.Packet.Auth(mqtt.Auth { code: 0x18, properties: again }))
+    print(wait_for(s, "auth"))
+    var bad = options(port, "auth-bad", mqtt.Version.V5)
+    bad.properties = mqtt.Properties { auth_method: "TOKEN" }
+    bad.authenticate = fn(a: mqtt.Auth) -> mqtt.Auth ! mqtt.Error {
+        mqtt.Auth { code: 0x18, properties: mqtt.Properties { auth_method: "TOKEN", auth_data: bytes("nope") } }
+    }
+    print("wrong answer {dial_error(bad)}")
+    var silent = options(port, "auth-none", mqtt.Version.V5)
+    silent.properties = mqtt.Properties { auth_method: "TOKEN" }
+    print("no callback {dial_error(silent)}")
+    configure(b, open_settings())
+}
+
+fn keepalive(b: *Broker, port: i64) {
+    print("== keep alive")
+    var o = options(port, "ping-ok", mqtt.Version.V311)
+    o.keep_alive = 1
+    using alive = connected(o)
+    let s = session_of(b, "ping-ok")
+    print(wait_for(s, "ping"))
+    print("still connected {failure_open(alive.disconnected)}")
+    var cfg = open_settings()
+    cfg.mute_pings = true
+    configure(b, cfg)
+    var m = options(port, "ping-lost", mqtt.Version.V311)
+    m.keep_alive = 1
+    m.ping_timeout = 200
+    using lost = connected(m)
+    print("ended {failure(lost.disconnected)}")
+    configure(b, open_settings())
+}
+
+fn failure_open(ch: chan[mqtt.Error]) -> str {
+    select {
+        e = <-ch => "ended"
+        else => "open"
+    }
+}
+
+fn closing(b: *Broker, port: i64) {
+    print("== closing")
+    using c = connected(options(port, "closing", mqtt.Version.V5))
+    mqtt.close_client(c)
+    mqtt.close_client(c)
+    print("publish {attempt(c, "close/a", "x", 1)}")
+    print("messages {state(c.messages)}")
+    print("disconnected {failure(c.disconnected)}")
+    print("reconnect {reconnect_error(c)}")
+    using var owned = connected(options(port, "closing-view", mqtt.Version.V5))
+    let h = mqtt.detach(mut owned)
+    mqtt.close_client_on(h)
+    mqtt.close_client_on(h)
+    using again = mqtt.adopt(h)
+    print("adopted {attempt(again, "close/a", "x", 0)}")
+    mqtt.close_client(again)
+}
+
+fn reconnect_error(c: mqtt.Client) -> str {
+    mqtt.reconnect(c) catch {
+        e => return describe(e)
+    }
+    "reconnected"
+}
+
+fn publish_error(c: mqtt.Client, o: mqtt.PublishOptions) -> str {
+    mqtt.publish(c, "check/a", bytes("x"), o) catch {
+        e => return describe(e)
+    }
+    "published"
+}
+
+fn subscribe_error(c: mqtt.Client, filters: mqtt.Filter[]) -> str {
+    mqtt.subscribe(c, filters) catch {
+        e => return describe(e)
+    }
+    "subscribed"
+}
+
+fn argument_checks(b: *Broker, port: i64) {
+    print("== argument checks")
+    using c = connected(options(port, "checks", mqtt.Version.V5))
+    var aliased = mqtt.PublishOptions {}
+    aliased.properties = mqtt.Properties { topic_alias: 3 }
+    print("publish with a topic alias {publish_error(c, aliased)}")
+    print("no local on a shared filter {subscribe_error(c, [mqtt.Filter { filter: "$share/g/a", no_local: true }])}")
+}
+
+fn old_broker(b: *Broker, port: i64) {
+    print("== broker without MQTT 5")
+    var cfg = open_settings()
+    cfg.only_v311 = true
+    configure(b, cfg)
+    print("5 {dial_error(options(port, "old-5", mqtt.Version.V5))}")
+    print("3.1.1 {dial_error(options(port, "old-3", mqtt.Version.V311))}")
+    configure(b, open_settings())
+}
+
+fn streams(b: *Broker, port: i64) ! io.Error {
+    print("== connect_stream")
+    using conn = net.dial("127.0.0.1", port)?
+    using c = mqtt.connect_stream(net.stream(conn), options(port, "stream", mqtt.Version.V5)) catch {
+        e => panic("connect failed: {describe(e)}")
+    }
+    let s = session_of(b, "stream")
+    print("publish {attempt(c, "stream/a", "x", 1)}")
+    kill(b, s)
+    print("ended {failure(c.disconnected)}")
+    print("reconnect {reconnect_error(c)}")
+}
+
+fn cut_subscribe(h: *mqtt.ClientHandle, done: chan[str]) {
+    mqtt.subscribe_on(h, [filter("cut/a", 1)]) catch {
+        e => {
+            done <- describe(e)
+            return
+        }
+    }
+    done <- "answered"
+}
+
+fn cut_unsubscribe(h: *mqtt.ClientHandle, done: chan[str]) {
+    mqtt.unsubscribe_on(h, ["cut/a"]) catch {
+        e => {
+            done <- describe(e)
+            return
+        }
+    }
+    done <- "answered"
+}
+
+fn connection_lost(b: *Broker, port: i64) {
+    print("== connection lost while waiting")
+    using c = connected(options(port, "cut", mqtt.Version.V5))
+    let s = session_of(b, "cut")
+    set_mode(b, s, Mode.Silent)
+    let subscribing = chan[str](1)
+    let unsubscribing = chan[str](1)
+    spawn cut_subscribe(c.handle, subscribing)
+    print(wait_for(s, "subscribe"))
+    spawn cut_unsubscribe(c.handle, unsubscribing)
+    print(wait_for(s, "unsubscribe"))
+    kill(b, s)
+    print("subscribe {(<-subscribing) ?? "none"}")
+    print("unsubscribe {(<-unsubscribing) ?? "none"}")
+    print("ended {failure(c.disconnected)}")
+}
+
+fn publish_timeout(b: *Broker, port: i64) {
+    print("== publish timeout")
+    var cfg = open_settings()
+    cfg.server = mqtt.Properties { receive_maximum: 1 }
+    configure(b, cfg)
+    var o = options(port, "unanswered", mqtt.Version.V5)
+    o.timeout = 300
+    using c = connected(o)
+    configure(b, open_settings())
+    let s = session_of(b, "unanswered")
+    set_mode(b, s, Mode.Silent)
+    print("first {attempt(c, "pt/1", "a", 1)}")
+    print(wait_for(s, "publish"))
+    print("second {attempt(c, "pt/2", "b", 1)}")
+    set_mode(b, s, Mode.Normal)
+    acknowledge(b, s, 1)
+    print("third {attempt(c, "pt/3", "c", 1)}")
+    print(wait_for(s, "publish"))
+}
+
+fn cut_two(h: *mqtt.ClientHandle, done: chan[str]) {
+    mqtt.subscribe_on(h, [filter("two/a", 1), filter("two/b", 1)]) catch {
+        e => {
+            done <- describe(e)
+            return
+        }
+    }
+    done <- "answered"
+}
+
+fn broken_acknowledgements(b: *Broker, port: i64) {
+    print("== broken acknowledgements")
+    using c = connected(options(port, "order", mqtt.Version.V5))
+    let s = session_of(b, "order")
+    set_mode(b, s, Mode.Silent)
+    let first = start(c, "ord/1", "x", 2)
+    print(wait_for(s, "publish"))
+    inject(b, s, mqtt.Packet.Pubcomp(mqtt.Ack { id: 1 }))
+    print("ended {failure(c.disconnected)}")
+    print(wait_for(s, "disconnect"))
+    print("publication {waited(first)}")
+    using d = connected(options(port, "counts", mqtt.Version.V5))
+    let t = session_of(b, "counts")
+    set_mode(b, t, Mode.Silent)
+    let done = chan[str](1)
+    spawn cut_two(d.handle, done)
+    print(wait_for(t, "subscribe"))
+    inject(b, t, mqtt.Packet.Suback(mqtt.Suback { id: 1, codes: [0] }))
+    print("ended {failure(d.disconnected)}")
+    print("subscribe {(<-done) ?? "none"}")
+}
+
+fn clean_reconnect(b: *Broker, port: i64, o: mqtt.Options, label: str) {
+    print("== reconnect without a kept session {label}")
+    using c = connected(o)
+    let s = session_of(b, o.client_id)
+    set_mode(b, s, Mode.Silent)
+    let stranded = start(c, "clean/1", "x", 1)
+    print(wait_for(s, "publish"))
+    kill(b, s)
+    print("ended {failure(c.disconnected)}")
+    mqtt.reconnect(c) catch {
+        e => panic("reconnect failed: {describe(e)}")
+    }
+    let again = session_of(b, o.client_id)
+    print(wait_for(again, "connected"))
+    print("stranded {waited(stranded)}")
+}
+
+fn oversized_resend(b: *Broker, port: i64) {
+    print("== resend of an oversized message")
+    var o = options(port, "resend", mqtt.Version.V5)
+    o.clean_start = false
+    o.session_expiry = 600
+    using c = connected(o)
+    let s = session_of(b, "resend")
+    set_mode(b, s, Mode.Silent)
+    let big = start(c, "big/a", text.repeat("y", 200), 1)
+    print(wait_for(s, "publish"))
+    let small = start(c, "big/b", "z", 1)
+    print(wait_for(s, "publish"))
+    kill(b, s)
+    print("ended {failure(c.disconnected)}")
+    set_mode(b, s, Mode.Normal)
+    var cfg = open_settings()
+    cfg.server = mqtt.Properties { maximum_packet_size: 100 }
+    configure(b, cfg)
+    mqtt.reconnect(c) catch {
+        e => panic("reconnect failed: {describe(e)}")
+    }
+    configure(b, open_settings())
+    print("big {waited(big)}")
+    print("small {waited(small)}")
+    print(wait_for(s, "publish"))
+}
+
+fn slow_consumer(b: *Broker, port: i64) {
+    print("== slow consumer")
+    var o = options(port, "slow-reader", mqtt.Version.V5)
+    o.keep_alive = 1
+    o.ping_timeout = 300
+    o.buffer = 1
+    using c = connected(o)
+    subscribed(c, [filter("slow/#", 0)])
+    using source = connected(options(port, "slow-source", mqtt.Version.V5))
+    for n in 1..4 {
+        send(source, "slow/{n}", "m{n}", 0)
+    }
+    sleep(2500)
+    print("not draining {failure_open(c.disconnected)}")
+    for n in 1..4 {
+        print("received {show(recv(c.messages))}")
+    }
+    print("drained {failure_open(c.disconnected)}")
+}
+
+fn blocked_writer(h: *mqtt.ClientHandle, progress: chan[bool], done: chan[str]) {
+    let payload = bytes(text.repeat("x", 1048576))
+    for {
+        mqtt.publish_on(h, "stall/data", payload, mqtt.PublishOptions {}) catch {
+            e => {
+                done <- describe(e)
+                return
+            }
+        }
+        select {
+            progress <- true => {}
+            else => {}
+        }
+    }
+}
+
+fn quiet(progress: chan[bool]) {
+    var active = true
+    for active {
+        select {
+            <-progress => {}
+            after(400) => {
+                active = false
+            }
+        }
+    }
+}
+
+fn stalled_broker(b: *Broker, port: i64) {
+    print("== broker that stops reading")
+    var o = options(port, "stall-ping", mqtt.Version.V5)
+    o.keep_alive = 1
+    o.ping_timeout = 300
+    using c = connected(o)
+    let s = session_of(b, "stall-ping")
+    set_mode(b, s, Mode.Stall)
+    let progress = chan[bool](1)
+    let done = chan[str](1)
+    spawn blocked_writer(c.handle, progress, done)
+    print(wait_for(s, "stalled"))
+    quiet(progress)
+    print("ended {failure(c.disconnected)}")
+    print("writer {(<-done) ?? "none"}")
+    close(s.stall)
+    using d = connected(options(port, "stall-close", mqtt.Version.V5))
+    let t = session_of(b, "stall-close")
+    set_mode(b, t, Mode.Stall)
+    let more = chan[bool](1)
+    let finished = chan[str](1)
+    spawn blocked_writer(d.handle, more, finished)
+    print(wait_for(t, "stalled"))
+    quiet(more)
+    mqtt.close_client(d)
+    print("close returned")
+    print("writer {(<-finished) ?? "none"}")
+    close(t.stall)
+}
+
+fn roots() -> x509.Certificate[] {
+    var out: x509.Certificate[] = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        out.push(x509.parse(der) or return out)
+    }
+    out
+}
+
+fn encrypted_scenario(port: i64) {
+    print("== tls")
+    let trusted = tls.Config { server_name: "localhost", roots: roots() }
+    using c = mqtt.connect_tls(options(port, "tls-client", mqtt.Version.V5), trusted) catch {
+        e => panic("tls connect failed: {describe(e)}")
+    }
+    subscribed(c, [filter("tls/#", 1)])
+    send(c, "tls/a", "secure", 1)
+    print("received {show(recv(c.messages))}")
+    let wrong = tls.Config { server_name: "other.example", roots: roots() }
+    print("wrong server name {tls_error(options(port, "tls-wrong", mqtt.Version.V5), wrong)}")
+}
+
+fn tls_error(o: mqtt.Options, config: tls.Config) -> str {
+    using c = mqtt.connect_tls(o, config) catch {
+        e => return describe(e)
+    }
+    "connected"
+}
+
+fn main() ! io.Error {
+    let b = new(Broker { gate: sync.mutex(), sessions: [:], retained: [:], settings: open_settings(), names: 0 })
+    using plain = net.listen("127.0.0.1", 0)?
+    spawn serve(plain.handle, b)
+    let pem = embed("std_tls_ec.pem")
+    let config = tls.Config { certificates: x509.pem_certificates(pem), key: x509.pem_private_key(pem)? }
+    using secure = net.listen("127.0.0.1", 0)?
+    spawn serve_tls(secure.handle, b, config)
+    let port = plain.handle.addr.port
+    for v in [mqtt.Version.V311, mqtt.Version.V5] {
+        basic(b, port, v)
+        retained(b, port, v)
+        wills(b, port, v)
+        resume(b, port, v)
+        packets(b, port, v)
+    }
+    subscription_options(b, port)
+    aliases(b, port)
+    server_disconnect(b, port)
+    refusals(b, port)?
+    flow_control(b, port)
+    enhanced(b, port)
+    keepalive(b, port)
+    closing(b, port)
+    argument_checks(b, port)
+    old_broker(b, port)
+    streams(b, port)?
+    connection_lost(b, port)
+    publish_timeout(b, port)
+    broken_acknowledgements(b, port)
+    clean_reconnect(b, port, options(port, "clean-3", mqtt.Version.V311), "3.1.1")
+    clean_reconnect(b, port, options(port, "clean-5", mqtt.Version.V5), "5")
+    var unexpired = options(port, "clean-5-kept", mqtt.Version.V5)
+    unexpired.clean_start = false
+    clean_reconnect(b, port, unexpired, "5 without expiry")
+    oversized_resend(b, port)
+    slow_consumer(b, port)
+    stalled_broker(b, port)
+    encrypted_scenario(secure.handle.addr.port)
+}
