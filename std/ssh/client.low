@@ -2,6 +2,7 @@ import std/io
 import std/net
 import std/ssh/key
 import std/sync
+import std/time
 
 /// The settings of an SSH client.
 pub struct ClientConfig {
@@ -19,6 +20,8 @@ pub struct ClientConfig {
     pub rekey_seconds: i64 = 3600
     /// Receives the text of each authentication banner the server sends.
     pub banner: fn(str) = fn(text) {}
+    /// The milliseconds `dial` and `client` allow for the connection to be established, from the TCP connect through authentication. A connection that is not established by then is closed and the call fails with `Handshake` holding `TimedOut`. The limit ends once the connection is established. 0 or less means no limit, which is the default.
+    pub handshake_timeout: i64 = 0
 }
 
 /// An established SSH connection that closes itself when dropped.
@@ -55,35 +58,104 @@ fn no_global(request: GlobalRequest) -> GlobalAnswer {
     GlobalAnswer {}
 }
 
-/// Runs the SSH handshake and authentication over `stream` and returns the connection.
-///
-/// The stream is closed when this fails and when the connection ends. Fails with `HostKeyRejected` when the callback refuses the key, `BadSignature` when the host's signature does not verify, `NoCommonAlgorithm` when the sides share no algorithm of a kind, and `AuthFailed` when no method succeeds.
-pub fn client(stream: io.Stream, config: ClientConfig) -> Connection ! Error {
+struct Watchdog {
+    stop: chan[bool]
+    result: chan[bool]
+}
+
+fn watch(stream: io.Stream, millis: i64, w: Watchdog) {
+    let expired = select {
+        <-w.stop => false
+        after(millis) => true
+    }
+    if expired {
+        stream.close()
+    }
+    w.result <- expired
+}
+
+fn arm(stream: io.Stream, millis: i64) -> Watchdog {
+    let w = Watchdog { stop: chan[bool](), result: chan[bool](1) }
+    if millis > 0 {
+        spawn watch(stream, millis, w)
+    } else {
+        w.result <- false
+    }
+    w
+}
+
+fn disarm(w: Watchdog) -> bool {
+    close(w.stop)
+    (<-w.result) ?? false
+}
+
+fn in_phase(e: Error, phase: Phase, expired: bool) -> Error {
+    if expired {
+        return Handshake(phase, io.Error.TimedOut)
+    }
+    match e {
+        Io(cause) => Handshake(phase, cause)
+        _ => e
+    }
+}
+
+fn abandon(l: *Link, w: Watchdog, e: Error, phase: Phase) -> Error {
+    let expired = disarm(w)
+    close_link(l)
+    in_phase(e, phase, expired)
+}
+
+fn client_within(stream: io.Stream, config: ClientConfig, millis: i64) -> Connection ! Error {
     let l = new_link(stream, client_setup(config))
     let methods = if config.auth.len == 0 { [AuthMethod.NoAuth] } else { config.auth }
-    handshake(l) catch {
-        e => {
-            close_link(l)
-            fail e
-        }
+    let w = arm(stream, millis)
+    exchange_versions(l) catch {
+        e => fail abandon(l, w, e, Phase.VersionExchange)
+    }
+    exchange_keys(l) catch {
+        e => fail abandon(l, w, e, Phase.KeyExchange)
     }
     client_authenticate(l, config.user, methods, config.banner) catch {
         e => {
             disconnect(l, disconnect_by_application, "authentication failed")
-            close_link(l)
-            fail e
+            fail abandon(l, w, e, Phase.Authentication)
         }
+    }
+    if disarm(w) {
+        close_link(l)
+        fail Handshake(Phase.Authentication, io.Error.TimedOut)
     }
     let c = new_connection(l, true, config.user, route_forwarded, no_global)
     spawn run_reader(c)
     Connection { handle: c }
 }
 
+/// Runs the SSH handshake and authentication over `stream` and returns the connection.
+///
+/// The stream is closed when this fails and when the connection ends. Fails with `HostKeyRejected` when the callback refuses the key, `BadSignature` when the host's signature does not verify, `NoCommonAlgorithm` when the sides share no algorithm of a kind, `AuthFailed` when no method succeeds and `BadVersion` when the peer's identification is not SSH 2.0. A stream that fails or ends first gives `Handshake` with the `Phase` it was in, and `config.handshake_timeout` passing gives `Handshake` with `TimedOut`. The timeout closes `stream`, so the stream must wake a read parked on it when closed.
+pub fn client(stream: io.Stream, config: ClientConfig) -> Connection ! Error {
+    client_within(stream, config, config.handshake_timeout)?
+}
+
+fn remaining(timeout: i64, started: i64) -> i64 {
+    if timeout <= 0 {
+        return 0
+    }
+    let left = timeout - (time.monotonic() - started) / 1000000
+    if left > 0 { left } else { 1 }
+}
+
 /// Connects to `host` and `port` over TCP and runs `client` over the connection.
+///
+/// `config.handshake_timeout` bounds the connect and the handshake together. A connect that fails or runs out of time gives `Handshake` with `Phase.Connect`.
 pub fn dial(host: str, port: i64, config: ClientConfig) -> Connection ! Error {
-    using var tcp = net.dial(host, port) catch Io
+    let started = time.monotonic()
+    using var tcp = net.dial_within(host, port, config.handshake_timeout) catch {
+        e => fail Handshake(Phase.Connect, e)
+    }
     let stream = net.stream(tcp)
-    using conn = client(stream, config)?
+    let left = remaining(config.handshake_timeout, started)
+    using conn = client_within(stream, config, left)?
     net.detach(mut tcp)
     conn
 }
