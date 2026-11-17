@@ -9,8 +9,6 @@ enum Tier {
 const vector_slot_bytes = 32
 const vector_scratch_slots = 3
 const vector_scratch_words = vector_scratch_slots * vector_slot_bytes / 8 + 1
-const vector_registers = 16
-const vector_work_registers = 8
 
 fn uses_vectors(f: *ir.Func) -> bool {
     for b in f.blocks {
@@ -212,14 +210,8 @@ fn vector(g: *Generator, fr: *Frame, ins: *Instr) {
         return
     }
     match op {
-        VCopy => {
-            g.source(fr, ins, 1, l, 0)
-            g.vector_result(fr, ins, l, 0)
-        }
-        VSplat => {
-            g.splat(fr, ins, l)
-            g.vector_result(fr, ins, l, 0)
-        }
+        VCopy => g.copy_vector(fr, ins, l)
+        VSplat => g.splat_vector(fr, ins, l)
         VSelect => {
             g.source(fr, ins, 1, l, 0)
             g.source(fr, ins, 2, l, 2)
@@ -240,6 +232,9 @@ fn vector(g: *Generator, fr: *Frame, ins: *Instr) {
         VShl => g.vector_shift(fr, ins, l, op, t)
         VShr => g.vector_shift(fr, ins, l, op, t)
         _ => {
+            if g.direct(fr, ins, l) {
+                return
+            }
             g.source(fr, ins, 1, l, 0)
             g.source(fr, ins, 2, l, 2)
             if native(op, t, g.tier) {
@@ -250,7 +245,6 @@ fn vector(g: *Generator, fr: *Frame, ins: *Instr) {
             g.vector_result(fr, ins, l, 0)
         }
     }
-    g.release(ins)
 }
 
 fn vector_shift(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes, op: ir.VectorOp, t: *types.Type) {
@@ -264,12 +258,22 @@ fn vector_shift(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes, op: ir.VectorO
     g.vector_result(fr, ins, l, 0)
 }
 
-fn splat(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes) {
+fn splat_vector(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes) {
+    let held = ins.args[0].vector_register()
+    if g.tier == Avx2 && held >= 0 {
+        g.splat(fr, ins, l, held)
+        return
+    }
+    g.splat(fr, ins, l, 0)
+    g.vector_result(fr, ins, l, 0)
+}
+
+fn splat(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes, dst: i64) {
     g.move("rax", fr.loc(ins.args[1]))
     let bits = types.elem_of(l.t).bits
     if g.tier == Avx2 {
         g.emit("vmovq xmm0, rax")
-        g.emit("vpbroadcast{int_suffix(l.t)} {l.lane_reg(0, 0)}, xmm0")
+        g.emit("vpbroadcast{int_suffix(l.t)} {l.lane_reg(dst, 0)}, xmm0")
         return
     }
     g.emit("movq xmm0, rax")
@@ -355,17 +359,14 @@ fn arithmetic_name(op: ir.VectorOp) -> str {
 }
 
 fn binary_regs(g: *Generator, l: Lanes, op: ir.VectorOp) {
-    let t = l.t
-    let elem = types.elem_of(t)
-    let float = types.is_float(elem)
-    let s = int_suffix(t)
+    let float = types.is_float(types.elem_of(l.t))
     match op {
-        VAdd => g.arithmetic_regs(l, op, float, s)
-        VSub => g.arithmetic_regs(l, op, float, s)
-        VMul => g.arithmetic_regs(l, op, float, s)
-        VDiv => g.arithmetic_regs(l, op, float, s)
-        VMin => g.arithmetic_regs(l, op, float, s)
-        VMax => g.arithmetic_regs(l, op, float, s)
+        VAdd => g.op2(l, arithmetic_mnemonic(op, l.t), 0, 2)
+        VSub => g.op2(l, arithmetic_mnemonic(op, l.t), 0, 2)
+        VMul => g.op2(l, arithmetic_mnemonic(op, l.t), 0, 2)
+        VDiv => g.op2(l, arithmetic_mnemonic(op, l.t), 0, 2)
+        VMin => g.op2(l, arithmetic_mnemonic(op, l.t), 0, 2)
+        VMax => g.op2(l, arithmetic_mnemonic(op, l.t), 0, 2)
         VAnd => g.op2(l, "pand", 0, 2)
         VOr => g.op2(l, "por", 0, 2)
         VXor => g.op2(l, "pxor", 0, 2)
@@ -384,21 +385,24 @@ fn binary_regs(g: *Generator, l: Lanes, op: ir.VectorOp) {
     }
 }
 
-fn arithmetic_regs(g: *Generator, l: Lanes, op: ir.VectorOp, float: bool, s: str) {
+fn arithmetic_mnemonic(op: ir.VectorOp, t: *types.Type) -> str {
     let name = arithmetic_name(op)
-    if float {
-        g.op2(l, "{name}{float_suffix(l.t)}", 0, 2)
-    } else if op == VMul {
-        g.op2(l, "pmull{s}", 0, 2)
-    } else if op == VMin || op == VMax {
+    let elem = types.elem_of(t)
+    if types.is_float(elem) {
+        return "{name}{float_suffix(t)}"
+    }
+    let s = int_suffix(t)
+    if op == VMul {
+        return "pmull{s}"
+    }
+    if op == VMin || op == VMax {
         var sign = "u"
-        if types.elem_of(l.t).signed {
+        if elem.signed {
             sign = "s"
         }
-        g.op2(l, "p{name}{sign}{s}", 0, 2)
-    } else {
-        g.op2(l, "p{name}{s}", 0, 2)
+        return "p{name}{sign}{s}"
     }
+    "p{name}{s}"
 }
 
 fn compare_regs(g: *Generator, l: Lanes, op: ir.VectorOp, float: bool) {
@@ -477,20 +481,28 @@ fn compare_int(g: *Generator, l: Lanes, op: ir.VectorOp) {
 
 fn vector_mask(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes) {
     let bits = types.elem_of(l.t).bits
-    g.source(fr, ins, 0, l, 0)
-    g.release(ins)
+    let src = g.mask_source(fr, ins, l)
     match bits {
-        8 => g.mask_halves(l, "pmovmskb", 16)
-        16 => g.mask_words(l)
-        32 => g.mask_halves(l, "movmskps", 4)
-        _ => g.mask_halves(l, "movmskpd", 2)
+        8 => g.mask_halves(l, "pmovmskb", 16, src)
+        16 => g.mask_words(l, src)
+        32 => g.mask_halves(l, "movmskps", 4, src)
+        _ => g.mask_halves(l, "movmskpd", 2, src)
     }
     g.move(fr.loc(dest(ins)), "rax")
 }
 
-fn mask_halves(g: *Generator, l: Lanes, mnemonic: str, per_half: i64) {
+fn mask_source(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes) -> i64 {
+    let held = ins.args[0].vector_register()
+    if held >= 0 {
+        return held
+    }
+    g.source(fr, ins, 0, l, 0)
+    0
+}
+
+fn mask_halves(g: *Generator, l: Lanes, mnemonic: str, per_half: i64, src: i64) {
     if g.tier == Avx2 {
-        g.emit("v{mnemonic} eax, {l.lane_reg(0, 0)}")
+        g.emit("v{mnemonic} eax, {l.lane_reg(src, 0)}")
         return
     }
     g.emit("{mnemonic} eax, xmm0")
@@ -501,13 +513,13 @@ fn mask_halves(g: *Generator, l: Lanes, mnemonic: str, per_half: i64) {
     }
 }
 
-fn mask_words(g: *Generator, l: Lanes) {
+fn mask_words(g: *Generator, l: Lanes, src: i64) {
     if g.tier == Avx2 && l.wide {
-        g.emit("vextracti128 xmm1, ymm0, 1")
-        g.emit("vpacksswb xmm0, xmm0, xmm1")
+        g.emit("vextracti128 xmm1, ymm{src}, 1")
+        g.emit("vpacksswb xmm0, xmm{src}, xmm1")
         g.emit("vpmovmskb eax, xmm0")
     } else if g.tier == Avx2 {
-        g.emit("vpacksswb xmm0, xmm0, xmm0")
+        g.emit("vpacksswb xmm0, xmm{src}, xmm{src}")
         g.emit("vpmovmskb eax, xmm0")
         g.emit("and eax, 255")
     } else if l.halves == 2 {
@@ -636,4 +648,182 @@ fn leave_vectors(g: *Generator) {
     if g.tier == Avx2 {
         g.emit("vzeroupper")
     }
+}
+
+fn vector_register(r: *Vreg) -> i64 {
+    if r.home == none || r.reg == "" {
+        return -1
+    }
+    var n = 0
+    for at in 3..r.reg.len {
+        n = n * 10 + i64(r.reg[at] - 48)
+    }
+    n
+}
+
+fn home_register(r: *Vreg, index: i64) -> str {
+    if r.wide {
+        return "ymm{index}"
+    }
+    "xmm{index}"
+}
+
+fn home_width(r: *Vreg) -> str {
+    if r.wide {
+        return "ymmword"
+    }
+    "xmmword"
+}
+
+fn home_at(fr: *Frame, r: *Vreg) -> Maddr {
+    let origin = r.home ?? panic("home without a slot")
+    Maddr { base: "rbp", disp: fr.slot(origin.aux) }
+}
+
+fn spill_home(g: *Generator, fr: *Frame, r: *Vreg) {
+    let index = r.vector_register()
+    if index < 0 {
+        return
+    }
+    g.emit("vmovdqu {r.home_width()} ptr {fr.home_at(r).at_offset(0)}, {r.home_register(index)}")
+}
+
+fn fill_home(g: *Generator, fr: *Frame, r: *Vreg) {
+    let index = r.vector_register()
+    if index < 0 {
+        return
+    }
+    g.emit("vmovdqu {r.home_register(index)}, {r.home_width()} ptr {fr.home_at(r).at_offset(0)}")
+}
+
+fn transfer_home(g: *Generator, fr: *Frame, ins: *Instr) {
+    match ins.transfer {
+        Spill => g.spill_home(fr, ins.args[0])
+        Fill => g.fill_home(fr, dest(ins))
+        Keep => {}
+    }
+}
+
+fn spill_homes(g: *Generator, fr: *Frame, held: []*Vreg) {
+    for r in held {
+        g.spill_home(fr, r)
+    }
+}
+
+fn fill_homes(g: *Generator, fr: *Frame, held: []*Vreg) {
+    for r in held {
+        g.fill_home(fr, r)
+    }
+}
+
+fn held_homes(fr: *Frame, mb: *Mblock) -> []*Vreg {
+    var held: []*Vreg = []
+    for r in fr.func.vregs {
+        if r.home != none && r.reg != "" && has_bit(mb.live_out, r.id) {
+            held.push(r)
+        }
+    }
+    held
+}
+
+fn source(g: *Generator, fr: *Frame, ins: *Instr, k: i64, l: Lanes, base: i64) {
+    let held = ins.args[k].vector_register()
+    if held >= 0 {
+        g.copy_regs(l, base, held)
+        return
+    }
+    g.load_vector(l, base, g.vector_address(fr, ins, k))
+}
+
+fn vector_result(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes, base: i64) {
+    let held = ins.args[0].vector_register()
+    if held >= 0 {
+        g.copy_regs(l, held, base)
+        return
+    }
+    g.store_vector(l, base, g.vector_address(fr, ins, 0))
+}
+
+fn copy_vector(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes) {
+    let dst = ins.args[0].vector_register()
+    let src = ins.args[1].vector_register()
+    if dst >= 0 && src >= 0 {
+        if dst != src {
+            g.copy_regs(l, dst, src)
+        }
+    } else if dst >= 0 {
+        g.load_vector(l, dst, g.vector_address(fr, ins, 1))
+    } else if src >= 0 {
+        g.store_vector(l, src, g.vector_address(fr, ins, 0))
+    } else {
+        g.source(fr, ins, 1, l, 0)
+        g.vector_result(fr, ins, l, 0)
+    }
+}
+
+fn direct_mnemonic(op: ir.VectorOp, t: *types.Type) -> str {
+    if !native(op, t, Avx2) {
+        return ""
+    }
+    let float = types.is_float(types.elem_of(t))
+    match op {
+        VAdd => arithmetic_mnemonic(op, t)
+        VSub => arithmetic_mnemonic(op, t)
+        VMul => arithmetic_mnemonic(op, t)
+        VMin => arithmetic_mnemonic(op, t)
+        VMax => arithmetic_mnemonic(op, t)
+        VDiv => only_if(float, arithmetic_mnemonic(op, t))
+        VAnd => "pand"
+        VOr => "por"
+        VXor => "pxor"
+        VShuffle => "pshufb"
+        VEq => only_if(!float, "pcmpeq{int_suffix(t)}")
+        _ => ""
+    }
+}
+
+fn only_if(on: bool, mnemonic: str) -> str {
+    if on {
+        return mnemonic
+    }
+    ""
+}
+
+fn direct(g: *Generator, fr: *Frame, ins: *Instr, l: Lanes) -> bool {
+    if g.tier != Avx2 {
+        return false
+    }
+    let mnemonic = direct_mnemonic(ir.vector_op(ins.value.aux), l.t)
+    if mnemonic == "" {
+        return false
+    }
+    let first = g.register_lanes(fr, ins, 1, l)
+    let second = g.memory_lanes(fr, ins, 2, l)
+    var target = ins.args[0].vector_register()
+    let held = target >= 0
+    if !held {
+        target = 0
+    }
+    g.emit("v{mnemonic} {l.lane_reg(target, 0)}, {first}, {second}")
+    if !held {
+        g.store_vector(l, 0, g.vector_address(fr, ins, 0))
+    }
+    true
+}
+
+fn register_lanes(g: *Generator, fr: *Frame, ins: *Instr, k: i64, l: Lanes) -> str {
+    let held = ins.args[k].vector_register()
+    if held >= 0 {
+        return l.lane_reg(held, 0)
+    }
+    g.load_vector(l, 0, g.vector_address(fr, ins, k))
+    l.lane_reg(0, 0)
+}
+
+fn memory_lanes(g: *Generator, fr: *Frame, ins: *Instr, k: i64, l: Lanes) -> str {
+    let held = ins.args[k].vector_register()
+    if held >= 0 {
+        return l.lane_reg(held, 0)
+    }
+    "{g.mem_width(l)} ptr {g.vector_address(fr, ins, k).at_offset(0)}"
 }
