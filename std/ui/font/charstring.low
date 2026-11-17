@@ -1,0 +1,598 @@
+struct Machine {
+    data: str
+    stack: f64[]
+    sp: i64
+    store: f64[]
+    globals: Index
+    locals: Index
+    affine: Affine
+    x: f64
+    y: f64
+    contours: Contour[]
+    points: Point[]
+    open: bool
+    stems: i64
+    have_width: bool
+    ended: bool
+    ops: i64
+}
+
+const max_stack = 48
+const max_subr_depth = 10
+const max_operations = 200000
+const store_size = 32
+const max_magnitude: f64 = 100000000.0
+
+fn cff_contours(f: Font, c: Cff, glyph: i64) -> Contour[]? {
+    if glyph < 0 || glyph >= f.glyph_count {
+        return none
+    }
+    let fd = font_dict_of(f, c, glyph)
+    if fd >= c.privates.len {
+        return none
+    }
+    let private = c.privates[fd]
+    let m = new(Machine {
+        data: f.data
+        stack: __make(max_stack)
+        sp: 0
+        store: __make(store_size)
+        globals: c.global_subrs
+        locals: private.subrs
+        affine: private.matrix
+        x: 0.0
+        y: 0.0
+        contours: []
+        points: []
+        open: false
+        stems: 0
+        have_width: false
+        ended: false
+        ops: max_operations
+    })
+    let span = index_span(f.data, c.char_strings, glyph)
+    if !run(m, span.start, span.end, 0) || !m.ended {
+        return none
+    }
+    m.contours
+}
+
+fn subr_bias(count: i64) -> i64 {
+    if count < 1240 {
+        107
+    } else if count < 33900 {
+        1131
+    } else {
+        32768
+    }
+}
+
+fn run(m: *Machine, start: i64, end: i64, depth: i64) -> bool {
+    var pos = start
+    for pos < end && !m.ended {
+        m.ops -= 1
+        if m.ops < 0 {
+            return false
+        }
+        let b = byte(m.data, pos)
+        pos += 1
+        if b == 28 || b >= 32 {
+            let n = read_number(m.data, pos, b)
+            pos = n.next
+            if pos > end || !push_value(m, n.value) {
+                return false
+            }
+        } else if b == 12 {
+            if pos >= end || !escaped(m, byte(m.data, pos)) {
+                return false
+            }
+            pos += 1
+        } else if b == 19 || b == 20 {
+            if !hint_arguments(m) {
+                return false
+            }
+            pos += (m.stems + 7) / 8
+            if pos > end {
+                return false
+            }
+        } else if b == 10 || b == 29 {
+            if !call(m, b == 29, depth) {
+                return false
+            }
+        } else if b == 11 {
+            return true
+        } else if b == 14 {
+            if !end_char(m) {
+                return false
+            }
+        } else if !path_operator(m, b) {
+            return false
+        }
+    }
+    true
+}
+
+fn read_number(d: str, pos: i64, b: i64) -> Operand {
+    if b == 28 {
+        Operand { value: f64(be16_signed(d, pos)), next: pos + 2 }
+    } else if b <= 246 {
+        Operand { value: f64(b - 139), next: pos }
+    } else if b <= 250 {
+        Operand { value: f64((b - 247) * 256 + byte(d, pos) + 108), next: pos + 1 }
+    } else if b <= 254 {
+        Operand { value: f64(-(b - 251) * 256 - byte(d, pos) - 108), next: pos + 1 }
+    } else {
+        let v = be32(d, pos)
+        Operand { value: f64(if v >= 2147483648 { v - 4294967296 } else { v }) / 65536.0, next: pos + 4 }
+    }
+}
+
+fn push_value(m: *Machine, v: f64) -> bool {
+    if m.sp >= max_stack || !(v > -max_magnitude && v < max_magnitude) {
+        return false
+    }
+    m.stack[m.sp] = v
+    m.sp += 1
+    true
+}
+
+fn pop_value(m: *Machine) -> f64 {
+    m.sp -= 1
+    m.stack[m.sp]
+}
+
+fn call(m: *Machine, global: bool, depth: i64) -> bool {
+    if m.sp < 1 || depth >= max_subr_depth {
+        return false
+    }
+    let table = if global { m.globals } else { m.locals }
+    let index = i64(pop_value(m)) + subr_bias(table.count)
+    if index < 0 || index >= table.count {
+        return false
+    }
+    let span = index_span(m.data, table, index)
+    run(m, span.start, span.end, depth + 1)
+}
+
+fn take_width(m: *Machine, extra: bool) -> bool {
+    if m.have_width {
+        return !extra
+    }
+    m.have_width = true
+    if extra {
+        for i in 1..m.sp {
+            m.stack[i - 1] = m.stack[i]
+        }
+        m.sp -= 1
+    }
+    true
+}
+
+fn hint_arguments(m: *Machine) -> bool {
+    if !take_width(m, m.sp % 2 == 1) {
+        return false
+    }
+    m.stems += m.sp / 2
+    m.sp = 0
+    true
+}
+
+fn end_char(m: *Machine) -> bool {
+    if m.sp > 1 || !take_width(m, m.sp == 1) {
+        return false
+    }
+    close_contour(m)
+    m.ended = true
+    m.sp = 0
+    true
+}
+
+fn close_contour(m: *Machine) {
+    if m.points.len >= 2 {
+        m.contours.push(Contour { points: m.points, cubic: true })
+    }
+    m.points = []
+    m.open = false
+}
+
+fn emit(m: *Machine, on_curve: bool) {
+    let a = m.affine
+    m.points.push(Point { x: f32(a.a * m.x + a.c * m.y + a.e), y: f32(a.b * m.x + a.d * m.y + a.f), on_curve })
+}
+
+fn move_to(m: *Machine, dx: f64, dy: f64) {
+    close_contour(m)
+    m.x += dx
+    m.y += dy
+    m.open = true
+    emit(m, true)
+}
+
+fn line_to(m: *Machine, dx: f64, dy: f64) {
+    m.x += dx
+    m.y += dy
+    emit(m, true)
+}
+
+fn curve_to(m: *Machine, dx1: f64, dy1: f64, dx2: f64, dy2: f64, dx3: f64, dy3: f64) {
+    m.x += dx1
+    m.y += dy1
+    emit(m, false)
+    m.x += dx2
+    m.y += dy2
+    emit(m, false)
+    m.x += dx3
+    m.y += dy3
+    emit(m, true)
+}
+
+fn move_operator(m: *Machine, op: i64) -> bool {
+    let arguments = if op == 21 { 2 } else { 1 }
+    if !take_width(m, m.sp == arguments + 1) || m.sp != arguments {
+        return false
+    }
+    if op == 21 {
+        move_to(m, m.stack[0], m.stack[1])
+    } else if op == 22 {
+        move_to(m, m.stack[0], 0.0)
+    } else {
+        move_to(m, 0.0, m.stack[0])
+    }
+    m.sp = 0
+    true
+}
+
+fn path_operator(m: *Machine, op: i64) -> bool {
+    if op == 1 || op == 3 || op == 18 || op == 23 {
+        return hint_arguments(m)
+    }
+    if op == 21 || op == 22 || op == 4 {
+        return move_operator(m, op)
+    }
+    if !m.open {
+        return false
+    }
+    let ok = match op {
+        5 => lines(m)
+        6 => alternate_lines(m, true)
+        7 => alternate_lines(m, false)
+        8 => curves(m)
+        24 => curves_then_line(m)
+        25 => lines_then_curve(m)
+        26 => vv_curves(m)
+        27 => hh_curves(m)
+        30 => alternate_curves(m, false)
+        31 => alternate_curves(m, true)
+        _ => false
+    }
+    m.sp = 0
+    ok
+}
+
+fn lines(m: *Machine) -> bool {
+    if m.sp < 2 || m.sp % 2 != 0 {
+        return false
+    }
+    for i in 0..m.sp / 2 {
+        line_to(m, m.stack[2 * i], m.stack[2 * i + 1])
+    }
+    true
+}
+
+fn alternate_lines(m: *Machine, horizontal: bool) -> bool {
+    if m.sp < 1 {
+        return false
+    }
+    var h = horizontal
+    for i in 0..m.sp {
+        if h {
+            line_to(m, m.stack[i], 0.0)
+        } else {
+            line_to(m, 0.0, m.stack[i])
+        }
+        h = !h
+    }
+    true
+}
+
+fn curves(m: *Machine) -> bool {
+    if m.sp < 6 || m.sp % 6 != 0 {
+        return false
+    }
+    for i in 0..m.sp / 6 {
+        curve_from(m, 6 * i)
+    }
+    true
+}
+
+fn curve_from(m: *Machine, i: i64) {
+    curve_to(m, m.stack[i], m.stack[i + 1], m.stack[i + 2], m.stack[i + 3], m.stack[i + 4], m.stack[i + 5])
+}
+
+fn curves_then_line(m: *Machine) -> bool {
+    if m.sp < 8 || m.sp % 6 != 2 {
+        return false
+    }
+    for i in 0..(m.sp - 2) / 6 {
+        curve_from(m, 6 * i)
+    }
+    line_to(m, m.stack[m.sp - 2], m.stack[m.sp - 1])
+    true
+}
+
+fn lines_then_curve(m: *Machine) -> bool {
+    if m.sp < 8 || m.sp % 2 != 0 {
+        return false
+    }
+    for i in 0..(m.sp - 6) / 2 {
+        line_to(m, m.stack[2 * i], m.stack[2 * i + 1])
+    }
+    curve_from(m, m.sp - 6)
+    true
+}
+
+fn hh_curves(m: *Machine) -> bool {
+    if m.sp < 4 || m.sp % 4 > 1 {
+        return false
+    }
+    var i = m.sp % 4
+    var dy1 = if i == 1 { m.stack[0] } else { 0.0 }
+    for i < m.sp {
+        curve_to(m, m.stack[i], dy1, m.stack[i + 1], m.stack[i + 2], m.stack[i + 3], 0.0)
+        dy1 = 0.0
+        i += 4
+    }
+    true
+}
+
+fn vv_curves(m: *Machine) -> bool {
+    if m.sp < 4 || m.sp % 4 > 1 {
+        return false
+    }
+    var i = m.sp % 4
+    var dx1 = if i == 1 { m.stack[0] } else { 0.0 }
+    for i < m.sp {
+        curve_to(m, dx1, m.stack[i], m.stack[i + 1], m.stack[i + 2], 0.0, m.stack[i + 3])
+        dx1 = 0.0
+        i += 4
+    }
+    true
+}
+
+fn alternate_curves(m: *Machine, horizontal: bool) -> bool {
+    if m.sp < 4 || m.sp % 4 > 1 {
+        return false
+    }
+    var h = horizontal
+    var i = 0
+    for i + 4 <= m.sp {
+        let extra = if m.sp - i == 5 { m.stack[i + 4] } else { 0.0 }
+        if h {
+            curve_to(m, m.stack[i], 0.0, m.stack[i + 1], m.stack[i + 2], extra, m.stack[i + 3])
+        } else {
+            curve_to(m, 0.0, m.stack[i], m.stack[i + 1], m.stack[i + 2], m.stack[i + 3], extra)
+        }
+        h = !h
+        i += 4
+    }
+    true
+}
+
+fn escaped(m: *Machine, op: i64) -> bool {
+    if op >= 34 && op <= 37 {
+        if !m.open {
+            return false
+        }
+        let ok = flex(m, op)
+        m.sp = 0
+        return ok
+    }
+    match op {
+        0 => {
+            m.sp = 0
+            true
+        }
+        3 => binary(m, op)
+        4 => binary(m, op)
+        10 => binary(m, op)
+        11 => binary(m, op)
+        12 => binary(m, op)
+        15 => binary(m, op)
+        24 => binary(m, op)
+        5 => unary(m, op)
+        9 => unary(m, op)
+        14 => unary(m, op)
+        26 => unary(m, op)
+        18 => {
+            if m.sp < 1 {
+                return false
+            }
+            m.sp -= 1
+            true
+        }
+        20 => put(m)
+        21 => get(m)
+        22 => if_else(m)
+        23 => push_value(m, 1.0)
+        27 => duplicate(m)
+        28 => exchange(m)
+        29 => index_copy(m)
+        30 => roll(m)
+        _ => false
+    }
+}
+
+fn flex(m: *Machine, op: i64) -> bool {
+    let s = m.stack
+    if op == 35 && m.sp == 13 {
+        curve_from(m, 0)
+        curve_from(m, 6)
+    } else if op == 34 && m.sp == 7 {
+        curve_to(m, s[0], 0.0, s[1], s[2], s[3], 0.0)
+        curve_to(m, s[4], 0.0, s[5], -s[2], s[6], 0.0)
+    } else if op == 36 && m.sp == 9 {
+        curve_to(m, s[0], s[1], s[2], s[3], s[4], 0.0)
+        curve_to(m, s[5], 0.0, s[6], s[7], s[8], -(s[1] + s[3] + s[7]))
+    } else if op == 37 && m.sp == 11 {
+        let dx = s[0] + s[2] + s[4] + s[6] + s[8]
+        let dy = s[1] + s[3] + s[5] + s[7] + s[9]
+        curve_from(m, 0)
+        if abs_value(dx) > abs_value(dy) {
+            curve_to(m, s[6], s[7], s[8], s[9], s[10], -dy)
+        } else {
+            curve_to(m, s[6], s[7], s[8], s[9], -dx, s[10])
+        }
+    } else {
+        return false
+    }
+    true
+}
+
+fn abs_value(v: f64) -> f64 {
+    if v < 0.0 {
+        -v
+    } else {
+        v
+    }
+}
+
+fn truth(v: bool) -> f64 {
+    if v {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn binary(m: *Machine, op: i64) -> bool {
+    if m.sp < 2 {
+        return false
+    }
+    let b = pop_value(m)
+    let a = pop_value(m)
+    let r = match op {
+        3 => truth(a != 0.0 && b != 0.0)
+        4 => truth(a != 0.0 || b != 0.0)
+        10 => a + b
+        11 => a - b
+        15 => truth(a == b)
+        24 => a * b
+        _ => {
+            if b == 0.0 {
+                return false
+            }
+            a / b
+        }
+    }
+    push_value(m, r)
+}
+
+fn unary(m: *Machine, op: i64) -> bool {
+    if m.sp < 1 {
+        return false
+    }
+    let a = pop_value(m)
+    let r = match op {
+        5 => truth(a == 0.0)
+        9 => abs_value(a)
+        14 => -a
+        _ => {
+            if a < 0.0 {
+                return false
+            }
+            sqrt(a)
+        }
+    }
+    push_value(m, r)
+}
+
+fn put(m: *Machine) -> bool {
+    if m.sp < 2 {
+        return false
+    }
+    let i = pop_value(m)
+    let v = pop_value(m)
+    if !(i >= 0.0 && i < f64(store_size)) {
+        return false
+    }
+    m.store[i64(i)] = v
+    true
+}
+
+fn get(m: *Machine) -> bool {
+    if m.sp < 1 {
+        return false
+    }
+    let i = pop_value(m)
+    if !(i >= 0.0 && i < f64(store_size)) {
+        return false
+    }
+    push_value(m, m.store[i64(i)])
+}
+
+fn if_else(m: *Machine) -> bool {
+    if m.sp < 4 {
+        return false
+    }
+    let v2 = pop_value(m)
+    let v1 = pop_value(m)
+    let s2 = pop_value(m)
+    let s1 = pop_value(m)
+    push_value(m, if v1 <= v2 { s1 } else { s2 })
+}
+
+fn duplicate(m: *Machine) -> bool {
+    if m.sp < 1 {
+        return false
+    }
+    push_value(m, m.stack[m.sp - 1])
+}
+
+fn exchange(m: *Machine) -> bool {
+    if m.sp < 2 {
+        return false
+    }
+    let top = m.stack[m.sp - 1]
+    m.stack[m.sp - 1] = m.stack[m.sp - 2]
+    m.stack[m.sp - 2] = top
+    true
+}
+
+fn index_copy(m: *Machine) -> bool {
+    if m.sp < 1 {
+        return false
+    }
+    let i = pop_value(m)
+    let depth = if i < 0.0 { 0 } else { i64(i) }
+    if m.sp < 1 || !(i < f64(m.sp)) {
+        return false
+    }
+    push_value(m, m.stack[m.sp - 1 - depth])
+}
+
+fn roll(m: *Machine) -> bool {
+    if m.sp < 2 {
+        return false
+    }
+    let shift = pop_value(m)
+    let count = pop_value(m)
+    if !(count >= 0.0 && count <= f64(m.sp)) || !(shift > -f64(max_stack) * 1000.0 && shift < f64(max_stack) * 1000.0) {
+        return false
+    }
+    let n = i64(count)
+    if n == 0 {
+        return true
+    }
+    var j = i64(shift) % n
+    if j < 0 {
+        j += n
+    }
+    var rolled: f64[] = []
+    for i in 0..n {
+        rolled.push(m.stack[m.sp - n + (i + n - j) % n])
+    }
+    for i in 0..n {
+        m.stack[m.sp - n + i] = rolled[i]
+    }
+    true
+}
