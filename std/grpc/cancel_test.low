@@ -1,0 +1,136 @@
+import std/cancel
+import std/net
+import std/testing
+import std/time
+import std/time/duration
+
+struct Tick {
+    n: i64 "1"
+}
+
+struct Rig {
+    server: *Server
+    channel: Channel
+}
+
+fn ticks(saw: chan[bool], ctx: *Context, req: Tick) ! Error {
+    for i in 0..3 {
+        write[Tick](ctx, Tick { n: i }) catch {
+            e => {
+                saw <- status_of(e).code == Code.Cancelled
+                fail e
+            }
+        }
+    }
+    let stopped = select {
+        <-cancel.done(ctx.token) => true
+        after(5000) => false
+    }
+    saw <- stopped
+    fail error(Cancelled, "stopped")
+}
+
+fn hold(saw: chan[bool], ctx: *Context) ! Error {
+    for {
+        let m = read[Tick](ctx) catch {
+            e => {
+                saw <- status_of(e).code == Code.Cancelled
+                fail e
+            }
+        }
+        if m == none {
+            saw <- false
+            return
+        }
+    }
+}
+
+fn echo(ctx: *Context, req: Tick) -> Tick ! Error {
+    req
+}
+
+fn serving(s: *Server, l: net.ListenerHandle) {
+    serve_on(s, l) or {}
+}
+
+fn rig(l: net.ListenerHandle, saw: chan[bool]) -> Rig {
+    let s = server(ServerOptions {})
+    handle_server_streaming[Tick](s, "/t.T/Tick", fn(ctx: *Context, req: Tick) ! Error { ticks(saw, ctx, req)? })
+    handle_bidi_streaming(s, "/t.T/Hold", fn(ctx: *Context) ! Error { hold(saw, ctx)? })
+    handle_unary[Tick, Tick](s, "/t.T/Echo", echo)
+    spawn serving(s, l)
+    let ch = dial("127.0.0.1:{l.addr.port}", ChannelOptions {}) or panic("dial")
+    Rig { server: s, channel: ch }
+}
+
+fn stop(r: Rig) {
+    close_channel(r.channel)
+    shutdown(r.server, 0)
+}
+
+fn received_code(st: *Stream) -> Code {
+    let m = receive[Tick](st) catch {
+        e => return status_of(e).code
+    }
+    Ok
+}
+
+fn sent_code(st: *Stream) -> Code {
+    let sent = send[Tick](st, Tick { n: 1 }) catch {
+        e => return status_of(e).code
+    }
+    Ok
+}
+
+fn handler_saw(saw: chan[bool]) -> bool {
+    (<-saw) ?? false
+}
+
+fn test_receive_after_cancel_fails_and_the_server_sees_the_reset(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    let saw = chan[bool](2)
+    let r = rig(l.handle, saw)
+    let st = server_streaming[Tick](r.channel, "/t.T/Tick", Tick { n: 0 }, CallOptions {}) or panic("open")
+    let first = receive[Tick](st) or panic("first receive")
+    testing.fatal_if(t, first == none, "the stream ended before its first message")
+    time.sleep_for(duration.milliseconds(100))
+    cancel_stream(st)
+    testing.error_if(t, received_code(st) != Code.Cancelled, "a receive after cancel_stream did not fail with CANCELLED")
+    testing.error_if(t, received_code(st) != Code.Cancelled, "a second receive after cancel_stream did not fail with CANCELLED")
+    testing.error_if(t, !handler_saw(saw), "the handler did not see the cancel before close_stream")
+    close_stream(st)
+    let next = server_streaming[Tick](r.channel, "/t.T/Tick", Tick { n: 0 }, CallOptions {}) or panic("open again")
+    testing.error_if(t, received_code(next) != Code.Ok, "the channel failed after a cancelled call")
+    close_stream(next)
+    testing.error_if(t, !handler_saw(saw), "the handler did not see close_stream")
+    stop(r)
+}
+
+fn test_token_cancel_resets_the_stream_without_close_stream(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    let saw = chan[bool](1)
+    let r = rig(l.handle, saw)
+    let token = cancel.token()
+    let st = server_streaming[Tick](r.channel, "/t.T/Tick", Tick { n: 0 }, CallOptions { token: some(token) }) or panic("open")
+    testing.fatal_if(t, received_code(st) != Code.Ok, "the first receive failed")
+    cancel.cancel(token)
+    testing.error_if(t, !handler_saw(saw), "the handler did not see the token cancel")
+    testing.error_if(t, received_code(st) != Code.Cancelled, "a receive after the token cancel did not fail with CANCELLED")
+    close_stream(st)
+    stop(r)
+}
+
+fn test_send_after_cancel_fails_and_the_channel_still_serves(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    let saw = chan[bool](1)
+    let r = rig(l.handle, saw)
+    let st = bidi_streaming(r.channel, "/t.T/Hold", CallOptions {}) or panic("open")
+    testing.fatal_if(t, sent_code(st) != Code.Ok, "the first send failed")
+    cancel_stream(st)
+    testing.error_if(t, sent_code(st) != Code.Cancelled, "a send after cancel_stream did not fail with CANCELLED")
+    testing.error_if(t, !handler_saw(saw), "the handler did not see the cancel")
+    close_stream(st)
+    let reply = unary[Tick, Tick](r.channel, "/t.T/Echo", Tick { n: 7 }, CallOptions {}) or panic("unary after cancel")
+    testing.error_if(t, reply.value.n != 7, "the unary call after a cancelled stream returned the wrong message")
+    stop(r)
+}

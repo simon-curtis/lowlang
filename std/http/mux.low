@@ -28,6 +28,7 @@ struct Lane {
     unacked: i64
     ended: bool
     reset: bool
+    cancelled: bool
 }
 
 struct Mux {
@@ -169,6 +170,10 @@ fn open_lane(m: *Mux, lane: *Lane, fields: header.Header[], ends: bool) ! io.Err
 fn take_window(m: *Mux, lane: *Lane, want: i64, d: *Deadline) -> i64 ! io.Error {
     for {
         m.lock <- true
+        if lane.cancelled {
+            <-m.lock
+            fail TimedOut
+        }
         if m.closed || lane.reset {
             <-m.lock
             fail Reset
@@ -190,7 +195,7 @@ fn send_data(m: *Mux, lane: *Lane, data: u8[], last: bool, d: *Deadline) ! io.Er
         if last {
             var out: u8[] = []
             put_frame(mut out, frame_data, flag_end_stream, lane.id, [])
-            mux_write(m, out)?
+            lane_write(m, lane, out, 0)?
         }
         return
     }
@@ -199,14 +204,55 @@ fn send_data(m: *Mux, lane: *Lane, data: u8[], last: bool, d: *Deadline) ! io.Er
         let n = take_window(m, lane, rest.len, d)?
         var out: u8[] = []
         put_frame(mut out, frame_data, if last && n == rest.len { flag_end_stream } else { 0 }, lane.id, rest[..n])
-        mux_write(m, out)?
+        lane_write(m, lane, out, n)?
         rest = rest[n..]
     }
+}
+
+fn lane_write(m: *Mux, lane: *Lane, out: u8[], taken: i64) ! io.Error {
+    m.write_lock <- true
+    defer <-m.write_lock
+    m.lock <- true
+    let stopped = lane.cancelled
+    var signals: chan[bool][] = []
+    if stopped && taken > 0 {
+        m.window += taken
+        for _, other in m.lanes {
+            signals.push(other.space)
+        }
+    }
+    <-m.lock
+    if stopped {
+        wake_all(signals)
+        fail TimedOut
+    }
+    io.write_all(m.wire.stream, out)?
+}
+
+fn cancel_lane(m: *Mux, lane: *Lane) {
+    m.lock <- true
+    let live = lane.id > 0 && !m.closed && !lane.cancelled && !lane.ended && !lane.reset && m.lanes[lane.id] != none
+    lane.cancelled = true
+    <-m.lock
+    if live {
+        spawn write_cancel(m, lane.id)
+    }
+    wake_lane(lane)
+}
+
+fn write_cancel(m: *Mux, id: i64) {
+    var out: u8[] = []
+    put_reset(mut out, id, error_cancel)
+    mux_write(m, out) or {}
 }
 
 fn next_event(m: *Mux, lane: *Lane, d: *Deadline) -> Event ! io.Error {
     for {
         m.lock <- true
+        if lane.cancelled {
+            <-m.lock
+            fail TimedOut
+        }
         if lane.events.len > 0 {
             let ev = lane.events[0]
             lane.events = if lane.events.len == 1 { [] } else { lane.events[1..] }
@@ -250,13 +296,14 @@ fn finish_lane(m: *Mux, lane: *Lane, complete: bool) {
     m.idle_since = now_ms()
     let finished = m.draining && m.active == 0
     let lost = m.closed
+    let resets = lane.id > 0 && !complete && !lane.ended && !lane.reset && !lane.cancelled
     <-m.lock
     wake_all(waiters)
     if lost {
         return
     }
     var out: u8[] = []
-    if lane.id > 0 && !complete && !lane.ended && !lane.reset {
+    if resets {
         put_reset(mut out, lane.id, error_cancel)
     }
     if out.len > 0 {
