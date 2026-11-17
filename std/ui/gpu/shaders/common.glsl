@@ -1,5 +1,9 @@
 layout(push_constant) uniform Viewport {
     vec2 size;
+    vec4 gamma_ratios;
+    float grayscale_enhanced_contrast;
+    float subpixel_enhanced_contrast;
+    uint is_bgr;
 } viewport;
 
 vec2 unit_corner(int index) {
@@ -21,9 +25,22 @@ float pick_corner(vec2 offset, vec4 radii) {
     return offset.y < 0.0 ? radii.y : radii.z;
 }
 
-float rounded_distance(vec2 point, vec2 center, vec2 half_size, float radius) {
-    vec2 corner = abs(point - center) - half_size + radius;
-    return length(max(corner, 0.0)) + min(max(corner.x, corner.y), 0.0) - radius;
+float quad_sdf_impl(vec2 corner_center_to_point, float corner_radius) {
+    if (corner_radius == 0.0) {
+        return max(corner_center_to_point.x, corner_center_to_point.y);
+    }
+    float signed_distance_to_inset_quad =
+        length(max(vec2(0.0), corner_center_to_point)) +
+        min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
+    return signed_distance_to_inset_quad - corner_radius;
+}
+
+float quad_sdf(vec2 point, vec4 bounds, vec4 radii) {
+    vec2 half_size = bounds.zw / 2.0;
+    vec2 center_to_point = point - (bounds.xy + half_size);
+    float corner_radius = pick_corner(center_to_point, radii);
+    vec2 corner_center_to_point = abs(center_to_point) - half_size + corner_radius;
+    return quad_sdf_impl(corner_center_to_point, corner_radius);
 }
 
 float clip_alpha(vec2 point, vec4 clip) {

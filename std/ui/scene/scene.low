@@ -1,3 +1,4 @@
+import std/math
 import std/ui/geometry
 
 /// A rounded rectangle with a fill and a border, as the quad shader reads it.
@@ -45,6 +46,55 @@ pub extern struct Sprite {
     pub tile: geometry.Rect = geometry.Rect {}
 }
 
+/// A glyph drawn from the atlas as red, green and blue stripe coverage over what is already on the target, as the subpixel sprite shader reads it.
+pub extern struct SubpixelSprite {
+    /// Where the glyph lands, in device pixels.
+    pub bounds: geometry.Rect
+    /// The visible area. `push_subpixel_sprite` replaces it with the scene's current clip.
+    pub clip: geometry.Rect = geometry.Rect {}
+    /// The tint; the atlas gives the coverage of each stripe.
+    pub color: geometry.Color = geometry.Color {}
+    /// The glyph's place in the atlas, as fractions of the atlas size.
+    pub tile: geometry.Rect = geometry.Rect {}
+}
+
+/// An image drawn from the atlas in its own colours, as the polychrome sprite shader reads it.
+pub extern struct PolychromeSprite {
+    /// Where the image lands, in device pixels.
+    pub bounds: geometry.Rect
+    /// The visible area. `push_polychrome_sprite` replaces it with the scene's current clip.
+    pub clip: geometry.Rect = geometry.Rect {}
+    /// The image's place in the atlas, as fractions of the atlas size.
+    pub tile: geometry.Rect = geometry.Rect {}
+    /// The radius of each corner of `bounds`; the image is cut away outside the rounded rectangle.
+    pub corner_radii: geometry.Corners = geometry.Corners {}
+    /// `1` to replace the colour with its luminance, else `0`.
+    pub grayscale: f32 = 0.0
+    /// The factor the image's alpha is multiplied by.
+    pub opacity: f32 = 1.0
+    spare_0: f32 = 0.0
+    spare_1: f32 = 0.0
+}
+
+/// How the sprite shaders turn the atlas's coverage into blending weights: the four coefficients of the gamma correction, the contrast boost for grey and for subpixel text, and whether the stripes run blue first. All zero leaves the coverage as the atlas holds it.
+pub extern struct TextParams {
+    /// The first gamma coefficient.
+    pub gamma_0: f32 = 0.0
+    /// The second gamma coefficient.
+    pub gamma_1: f32 = 0.0
+    /// The third gamma coefficient.
+    pub gamma_2: f32 = 0.0
+    /// The fourth gamma coefficient.
+    pub gamma_3: f32 = 0.0
+    /// The contrast boost for grey coverage.
+    pub grayscale_contrast: f32 = 0.0
+    /// The contrast boost for subpixel coverage.
+    pub subpixel_contrast: f32 = 0.0
+    /// `1` when the stripes run blue first, else `0`.
+    pub bgr: u32 = 0
+    spare: u32 = 0
+}
+
 /// The kind of primitive a `Batch` draws.
 pub enum Kind {
     /// Entries of `Scene.quads`.
@@ -53,6 +103,10 @@ pub enum Kind {
     Shadows
     /// Entries of `Scene.sprites`.
     Sprites
+    /// Entries of `Scene.subpixel_sprites`.
+    SubpixelSprites
+    /// Entries of `Scene.polychrome_sprites`.
+    PolychromeSprites
 }
 
 /// A run of consecutive primitives of one kind, drawn with one call.
@@ -65,7 +119,9 @@ pub struct Batch {
     pub count: i64
 }
 
-/// The primitives of one frame in device pixels, in the order they were pushed.
+/// The primitives of one frame in device pixels.
+///
+/// A primitive's draw order is one more than the greatest among the earlier primitives whose visible bounds it overlaps, or 1 when it overlaps none. Primitives of one draw order draw shadows first, then quads, then sprites, then subpixel sprites, then polychrome sprites, each kind in the order pushed. A shadow's bounds are those before blurring, so a blur reaches over an earlier primitive of the same draw order without covering it.
 pub struct Scene {
     /// The width of the target in device pixels.
     pub width: i64
@@ -79,16 +135,89 @@ pub struct Scene {
     pub shadows: Shadow[] = []
     /// The sprites in draw order.
     pub sprites: Sprite[] = []
+    /// The subpixel sprites in draw order.
+    pub subpixel_sprites: SubpixelSprite[] = []
+    /// The polychrome sprites in draw order.
+    pub polychrome_sprites: PolychromeSprite[] = []
+    /// What the sprite shaders do to the atlas's coverage.
+    pub text: TextParams = TextParams {}
     quad_order: i64[] = []
     shadow_order: i64[] = []
     sprite_order: i64[] = []
+    subpixel_order: i64[] = []
+    polychrome_order: i64[] = []
     clips: geometry.Rect[] = []
-    pushed: i64 = 0
+    placed: geometry.Rect[] = []
+    placed_order: i64[] = []
+    cells: i64[][] = []
+    columns: i64 = 1
+    rows: i64 = 1
 }
+
+const cell_size: f32 = 64.0
 
 /// Returns an empty scene for a target of `width` by `height` device pixels, cleared to `background`, whose clip is the whole target.
 pub fn empty(width: i64, height: i64, background: geometry.Color) -> Scene {
-    Scene { width, height, background, clips: [geometry.rect(0.0, 0.0, f32(width), f32(height))] }
+    let columns = larger_count((width + 63) / 64)
+    let rows = larger_count((height + 63) / 64)
+    var cells: i64[][] = []
+    for i in 0..columns * rows {
+        cells.push([])
+    }
+    Scene { width, height, background, clips: [geometry.rect(0.0, 0.0, f32(width), f32(height))], cells, columns, rows }
+}
+
+fn larger_count(n: i64) -> i64 {
+    if n < 1 {
+        return 1
+    }
+    n
+}
+
+fn cell_index(count: i64, v: f32) -> i64 {
+    let c = i64(floor(v / cell_size))
+    if c < 0 {
+        return 0
+    }
+    if c >= count {
+        return count - 1
+    }
+    c
+}
+
+fn overlaps(a: geometry.Rect, b: geometry.Rect) -> bool {
+    a.x < geometry.right(b) && geometry.right(a) > b.x && a.y < geometry.bottom(b) && geometry.bottom(a) > b.y
+}
+
+fn place(mut s: Scene, bounds: geometry.Rect) -> i64 {
+    let visible = geometry.intersect(bounds, clip(s))
+    if geometry.is_empty(visible) {
+        return 0
+    }
+    let first_column = cell_index(s.columns, visible.x)
+    let last_column = cell_index(s.columns, geometry.right(visible))
+    let first_row = cell_index(s.rows, visible.y)
+    let last_row = cell_index(s.rows, geometry.bottom(visible))
+    var highest = 0
+    for row in first_row..last_row + 1 {
+        for column in first_column..last_column + 1 {
+            for leaf in s.cells[row * s.columns + column] {
+                if s.placed_order[leaf] > highest && overlaps(visible, s.placed[leaf]) {
+                    highest = s.placed_order[leaf]
+                }
+            }
+        }
+    }
+    let order = highest + 1
+    let leaf = s.placed.len
+    s.placed.push(visible)
+    s.placed_order.push(order)
+    for row in first_row..last_row + 1 {
+        for column in first_column..last_column + 1 {
+            s.cells[row * s.columns + column].push(leaf)
+        }
+    }
+    order
 }
 
 /// Returns the rectangle primitives are currently clipped to: the intersection of every clip pushed and not popped, and the target.
@@ -109,34 +238,139 @@ pub fn pop_clip(mut s: Scene) {
     }
 }
 
-/// Adds `q` above everything pushed so far, clipped to the current clip.
+fn border_interior(q: Quad) -> geometry.Rect {
+    let radii = q.corner_radii
+    let widths = q.border_widths
+    let radius_top = math.max(radii.top_left, radii.top_right)
+    let radius_right = math.max(radii.top_right, radii.bottom_right)
+    let radius_bottom = math.max(radii.bottom_left, radii.bottom_right)
+    let radius_left = math.max(radii.top_left, radii.bottom_left)
+    let near_x = q.bounds.x + 1.0
+    let near_y = q.bounds.y + 1.0
+    let far_x = geometry.right(q.bounds) - 1.0
+    let far_y = geometry.bottom(q.bounds) - 1.0
+    let horizontal_top = math.max(widths.top, radius_top)
+    let horizontal_bottom = math.max(widths.bottom, radius_bottom)
+    let vertical_left = math.max(widths.left, radius_left)
+    let vertical_right = math.max(widths.right, radius_right)
+    let horizontal = geometry.Rect {
+        x: near_x + widths.left
+        y: near_y + horizontal_top
+        width: far_x - widths.right - near_x - widths.left
+        height: far_y - horizontal_bottom - near_y - horizontal_top
+    }
+    let vertical = geometry.Rect {
+        x: near_x + vertical_left
+        y: near_y + widths.top
+        width: far_x - vertical_right - near_x - vertical_left
+        height: far_y - widths.bottom - near_y - widths.top
+    }
+    if area(horizontal) >= area(vertical) { horizontal } else { vertical }
+}
+
+fn area(r: geometry.Rect) -> f32 {
+    math.max(r.width, 0.0) * math.max(r.height, 0.0)
+}
+
+/// Adds `q` above everything pushed so far, clipped to the current clip. A quad with no background is split into four strips around its interior, and each strip is placed on its own, so a primitive inside the border does not sit above it.
 pub fn push_quad(mut s: Scene, q: Quad) {
+    if q.background.a > 0.0 {
+        push_whole_quad(mut s, q)
+        return
+    }
+    let inner = border_interior(q)
+    if inner.width <= 0.0 || inner.height <= 0.0 {
+        push_whole_quad(mut s, q)
+        return
+    }
+    let outer = q.bounds
+    let inner_right = inner.x + inner.width
+    let inner_bottom = inner.y + inner.height
+    let strips = [
+        geometry.Rect { x: outer.x, y: outer.y, width: outer.width, height: inner.y - outer.y }
+        geometry.Rect { x: outer.x, y: inner_bottom, width: outer.width, height: geometry.bottom(outer) - inner_bottom }
+        geometry.Rect { x: outer.x, y: inner.y, width: inner.x - outer.x, height: inner.height }
+        geometry.Rect { x: inner_right, y: inner.y, width: geometry.right(outer) - inner_right, height: inner.height }
+    ]
+    for strip in strips {
+        push_clip(mut s, strip)
+        push_whole_quad(mut s, q)
+        pop_clip(mut s)
+    }
+}
+
+fn push_whole_quad(mut s: Scene, q: Quad) {
+    let order = place(mut s, q.bounds)
+    if order == 0 {
+        return
+    }
     var clipped = q
     clipped.clip = clip(s)
-    s.quads.push(clipped)
-    s.quad_order.push(s.pushed)
-    s.pushed += 1
+    insert(mut s.quads, mut s.quad_order, clipped, order)
+}
+
+fn insert[T](mut items: T[], mut orders: i64[], item: T, order: i64) {
+    items.push(item)
+    orders.push(order)
+    var i = items.len - 1
+    for i > 0 && orders[i - 1] > order {
+        items[i] = items[i - 1]
+        orders[i] = orders[i - 1]
+        i -= 1
+    }
+    items[i] = item
+    orders[i] = order
 }
 
 /// Adds `sh` above everything pushed so far, clipped to the current clip.
 pub fn push_shadow(mut s: Scene, sh: Shadow) {
+    let order = place(mut s, sh.bounds)
+    if order == 0 {
+        return
+    }
     var clipped = sh
     clipped.clip = clip(s)
-    s.shadows.push(clipped)
-    s.shadow_order.push(s.pushed)
-    s.pushed += 1
+    insert(mut s.shadows, mut s.shadow_order, clipped, order)
 }
 
 /// Adds `sp` above everything pushed so far, clipped to the current clip.
 pub fn push_sprite(mut s: Scene, sp: Sprite) {
+    let order = place(mut s, sp.bounds)
+    if order == 0 {
+        return
+    }
     var clipped = sp
     clipped.clip = clip(s)
-    s.sprites.push(clipped)
-    s.sprite_order.push(s.pushed)
-    s.pushed += 1
+    insert(mut s.sprites, mut s.sprite_order, clipped, order)
 }
 
-/// Returns the runs to draw, in order, so that primitives of every kind draw in the order they were pushed.
+/// Adds `sp` above everything pushed so far, clipped to the current clip.
+pub fn push_subpixel_sprite(mut s: Scene, sp: SubpixelSprite) {
+    let order = place(mut s, sp.bounds)
+    if order == 0 {
+        return
+    }
+    var clipped = sp
+    clipped.clip = clip(s)
+    insert(mut s.subpixel_sprites, mut s.subpixel_order, clipped, order)
+}
+
+/// Adds `sp` above everything pushed so far, clipped to the current clip.
+pub fn push_polychrome_sprite(mut s: Scene, sp: PolychromeSprite) {
+    let order = place(mut s, sp.bounds)
+    if order == 0 {
+        return
+    }
+    var clipped = sp
+    clipped.clip = clip(s)
+    insert(mut s.polychrome_sprites, mut s.polychrome_order, clipped, order)
+}
+
+fn next_order(orders: i64[], at: i64, none: i64) -> i64 {
+    if at < orders.len { orders[at] } else { none }
+}
+
+/// Returns the runs to draw, in order of draw order and, within one, shadows then quads then sprites then subpixel sprites then polychrome sprites.
 ///
 /// Consecutive primitives of one kind share a run, so a scene of quads under text is two batches however many of each it holds.
 pub fn batches(s: Scene) -> Batch[] {
@@ -144,19 +378,30 @@ pub fn batches(s: Scene) -> Batch[] {
     var q = 0
     var sh = 0
     var sp = 0
-    for q < s.quads.len || sh < s.shadows.len || sp < s.sprites.len {
-        let qo = if q < s.quads.len { s.quad_order[q] } else { s.pushed }
-        let sho = if sh < s.shadows.len { s.shadow_order[sh] } else { s.pushed }
-        let spo = if sp < s.sprites.len { s.sprite_order[sp] } else { s.pushed }
-        if qo < sho && qo < spo {
-            out.extend_run(Quads, q)
-            q += 1
-        } else if sho < spo {
+    var sx = 0
+    var pc = 0
+    let none = s.placed.len + 1
+    for q < s.quads.len || sh < s.shadows.len || sp < s.sprites.len || sx < s.subpixel_sprites.len || pc < s.polychrome_sprites.len {
+        let sho = next_order(s.shadow_order, sh, none)
+        let qo = next_order(s.quad_order, q, none)
+        let spo = next_order(s.sprite_order, sp, none)
+        let sxo = next_order(s.subpixel_order, sx, none)
+        let pco = next_order(s.polychrome_order, pc, none)
+        if sho <= qo && sho <= spo && sho <= sxo && sho <= pco {
             out.extend_run(Shadows, sh)
             sh += 1
-        } else {
+        } else if qo <= spo && qo <= sxo && qo <= pco {
+            out.extend_run(Quads, q)
+            q += 1
+        } else if spo <= sxo && spo <= pco {
             out.extend_run(Sprites, sp)
             sp += 1
+        } else if sxo <= pco {
+            out.extend_run(SubpixelSprites, sx)
+            sx += 1
+        } else {
+            out.extend_run(PolychromeSprites, pc)
+            pc += 1
         }
     }
     out
@@ -170,11 +415,11 @@ fn extend_run(mut out: Batch[], kind: Kind, index: i64) {
     out.push(Batch { kind, first: index, count: 1 })
 }
 
-/// A square single-channel image of glyph coverage that sprites sample, with the band of rows changed since the GPU last copied it.
+/// A square image that sprites sample, with the band of rows changed since the GPU last copied it. A pixel is four bytes: sprites read the first as coverage, and subpixel sprites read the first three as the red, green and blue stripe coverage.
 pub struct Atlas {
     /// The width and height in pixels.
     pub size: i64
-    /// One coverage byte per pixel, rows from the top.
+    /// Four bytes per pixel, rows from the top.
     pub pixels: u8[]
     /// The first row changed since `clean`, or `size` when none has.
     pub dirty_top: i64
@@ -184,18 +429,48 @@ pub struct Atlas {
 
 /// Returns a clear atlas of `size` by `size` pixels, all of it marked changed.
 pub fn atlas(size: i64) -> Atlas {
-    Atlas { size, pixels: __make(size * size), dirty_top: 0, dirty_bottom: size }
+    Atlas { size, pixels: __make(size * size * 4), dirty_top: 0, dirty_bottom: size }
 }
 
-/// Copies `coverage`, `width` by `height` bytes in rows, into the atlas with its top-left pixel at `x`, `y`, and marks those rows changed.
+/// Copies `coverage`, `width` by `height` bytes in rows, into the atlas with its top-left pixel at `x`, `y`, and marks those rows changed. Only the first byte of each pixel is written.
 pub fn write(mut a: Atlas, x: i64, y: i64, width: i64, height: i64, coverage: u8[]) {
     for row in 0..height {
         let from = row * width
-        let to = (y + row) * a.size + x
+        let to = ((y + row) * a.size + x) * 4
         for col in 0..width {
-            a.pixels[to + col] = coverage[from + col]
+            a.pixels[to + col * 4] = coverage[from + col]
         }
     }
+    mark_rows(mut a, y, height)
+}
+
+/// Copies `stripes`, `width` by `height` pixels of red, green and blue coverage bytes in rows, into the atlas with its top-left pixel at `x`, `y`, and marks those rows changed. The first three bytes of each pixel are written.
+pub fn write_stripes(mut a: Atlas, x: i64, y: i64, width: i64, height: i64, stripes: u8[]) {
+    for row in 0..height {
+        let from = row * width * 3
+        let to = ((y + row) * a.size + x) * 4
+        for col in 0..width {
+            a.pixels[to + col * 4] = stripes[from + col * 3]
+            a.pixels[to + col * 4 + 1] = stripes[from + col * 3 + 1]
+            a.pixels[to + col * 4 + 2] = stripes[from + col * 3 + 2]
+        }
+    }
+    mark_rows(mut a, y, height)
+}
+
+/// Copies `colors`, `width` by `height` pixels of red, green, blue and alpha bytes in rows, into the atlas with its top-left pixel at `x`, `y`, and marks those rows changed.
+pub fn write_colors(mut a: Atlas, x: i64, y: i64, width: i64, height: i64, colors: u8[]) {
+    for row in 0..height {
+        let from = row * width * 4
+        let to = ((y + row) * a.size + x) * 4
+        for col in 0..width * 4 {
+            a.pixels[to + col] = colors[from + col]
+        }
+    }
+    mark_rows(mut a, y, height)
+}
+
+fn mark_rows(mut a: Atlas, y: i64, height: i64) {
     if y < a.dirty_top {
         a.dirty_top = y
     }

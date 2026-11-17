@@ -1,0 +1,624 @@
+import std/ui/geometry
+
+enum StrokeError {
+    Unstrokable
+}
+
+enum StrokeCap {
+    Butt
+    Round
+    Square
+}
+
+enum StrokeJoin {
+    Miter
+    MiterClip
+    Round
+    Bevel
+}
+
+enum StrokeAngle {
+    Nearly180
+    Sharp
+    Shallow
+    NearlyLine
+}
+
+enum StrokeSeg {
+    Move(to: geometry.Point)
+    Line(to: geometry.Point)
+    Quad(control: geometry.Point, to: geometry.Point)
+    Cubic(c1: geometry.Point, c2: geometry.Point, to: geometry.Point)
+    Close
+}
+
+struct StrokeIter {
+    verbs: Verb[]
+    points: geometry.Point[]
+    verb_index: i64
+    points_index: i64
+    last_move_to: geometry.Point
+    last_point: geometry.Point
+}
+
+struct StrokeNormals {
+    ok: bool
+    normal: geometry.Point
+    unit: geometry.Point
+}
+
+struct StrokeState {
+    radius: f32
+    inv_miter_limit: f32
+    res_scale: f32
+    inv_res_scale: f32
+    inv_res_scale_squared: f32
+    first_normal: geometry.Point
+    prev_normal: geometry.Point
+    first_unit_normal: geometry.Point
+    prev_unit_normal: geometry.Point
+    first_pt: geometry.Point
+    prev_pt: geometry.Point
+    first_outer_pt: geometry.Point
+    first_outer_index: i64
+    segment_count: i64
+    prev_is_line: bool
+    cap: StrokeCap
+    join: StrokeJoin
+    inner: *PbBuilder
+    outer: *PbBuilder
+    cusper: *PbBuilder
+    stroke_type: StrokeType
+    recursion_depth: i64
+    found_tangents: bool
+    join_completed: bool
+    it: StrokeIter
+}
+
+fn stroke(p: Path, width: f32, res_scale: f32) -> Path ! StrokeError {
+    stroke_run(p, width, 4.0, StrokeCap.Round, StrokeJoin.Round, res_scale)?
+}
+
+fn stroke_iter_new(p: Path) -> StrokeIter {
+    StrokeIter { verbs: p.verbs, points: p.points, verb_index: 0, points_index: 0, last_move_to: geo_zero(), last_point: geo_zero() }
+}
+
+fn stroke_iter_next(mut it: StrokeIter) -> StrokeSeg? {
+    if it.verb_index >= it.verbs.len {
+        return none
+    }
+    let verb = it.verbs[it.verb_index]
+    it.verb_index += 1
+    match verb {
+        Move => {
+            it.points_index += 1
+            it.last_move_to = it.points[it.points_index - 1]
+            it.last_point = it.last_move_to
+            return StrokeSeg.Move(it.last_move_to)
+        }
+        Line => {
+            it.points_index += 1
+            it.last_point = it.points[it.points_index - 1]
+            return StrokeSeg.Line(it.last_point)
+        }
+        Quad => {
+            it.points_index += 2
+            it.last_point = it.points[it.points_index - 1]
+            return StrokeSeg.Quad(it.points[it.points_index - 2], it.last_point)
+        }
+        Cubic => {
+            it.points_index += 3
+            it.last_point = it.points[it.points_index - 1]
+            return StrokeSeg.Cubic(it.points[it.points_index - 3], it.points[it.points_index - 2], it.last_point)
+        }
+        Close => {
+            var seg = StrokeSeg.Close
+            if !geo_pt_eq(it.last_point, it.last_move_to) {
+                it.verb_index -= 1
+                seg = StrokeSeg.Line(it.last_move_to)
+            }
+            it.last_point = it.last_move_to
+            return seg
+        }
+    }
+}
+
+fn stroke_has_valid_tangent(from: StrokeIter) -> bool {
+    var it = from
+    for {
+        let seg = stroke_iter_next(mut it) ?? break
+        match seg {
+            Move => return false
+            Line(to) => {
+                if geo_pt_eq(it.last_point, to) {
+                    continue
+                }
+                return true
+            }
+            Quad(control, to) => {
+                if geo_pt_eq(it.last_point, control) && geo_pt_eq(it.last_point, to) {
+                    continue
+                }
+                return true
+            }
+            Cubic(c1, c2, to) => {
+                if geo_pt_eq(it.last_point, c1) && geo_pt_eq(it.last_point, c2) && geo_pt_eq(it.last_point, to) {
+                    continue
+                }
+                return true
+            }
+            Close => return false
+        }
+    }
+    false
+}
+
+fn stroke_run(p: Path, width: f32, miter_limit: f32, cap: StrokeCap, join: StrokeJoin, res_scale: f32) -> Path ! StrokeError {
+    if !(width > 0.0) || !geo_finite(width) {
+        fail StrokeError.Unstrokable
+    }
+    var join_kind = join
+    var inv_miter_limit: f32 = 0.0
+    if join == StrokeJoin.Miter {
+        if miter_limit <= 1.0 {
+            join_kind = StrokeJoin.Bevel
+        } else {
+            inv_miter_limit = geo_invert(miter_limit)
+        }
+    }
+    if join == StrokeJoin.MiterClip {
+        inv_miter_limit = geo_invert(miter_limit)
+    }
+    let inv_res_scale = geo_invert(res_scale * 4.0)
+    let z = geo_zero()
+    let s = new(StrokeState {
+        radius: geo_half(width)
+        inv_miter_limit
+        res_scale
+        inv_res_scale
+        inv_res_scale_squared: geo_sqr(inv_res_scale)
+        first_normal: z
+        prev_normal: z
+        first_unit_normal: z
+        prev_unit_normal: z
+        first_pt: z
+        prev_pt: z
+        first_outer_pt: z
+        first_outer_index: 0
+        segment_count: -1
+        prev_is_line: false
+        cap
+        join: join_kind
+        inner: pb_new()
+        outer: pb_new()
+        cusper: pb_new()
+        stroke_type: StrokeType.Outer
+        recursion_depth: 0
+        found_tangents: false
+        join_completed: false
+        it: stroke_iter_new(p)
+    })
+    var last_segment_is_line = false
+    for {
+        let seg = stroke_iter_next(mut s.it) ?? break
+        match seg {
+            Move(to) => stroke_move_to(s, to)
+            Line(to) => {
+                stroke_line_to(s, to, true)
+                last_segment_is_line = true
+            }
+            Quad(control, to) => {
+                stroke_quad_to(s, control, to)
+                last_segment_is_line = false
+            }
+            Cubic(c1, c2, to) => {
+                stroke_cubic_to(s, c1, c2, to)
+                last_segment_is_line = false
+            }
+            Close => {
+                if s.cap != StrokeCap.Butt {
+                    if s.segment_count == 0 {
+                        stroke_line_to(s, s.first_pt, false)
+                        last_segment_is_line = true
+                        continue
+                    }
+                    if stroke_contour_empty(s) {
+                        last_segment_is_line = true
+                        continue
+                    }
+                }
+                stroke_finish_contour(s, true, last_segment_is_line)
+            }
+        }
+    }
+    stroke_finish_contour(s, false, last_segment_is_line)
+    pb_finish(s.outer)?
+}
+
+fn stroke_contour_empty(s: *StrokeState) -> bool {
+    pb_is_zero_length_since(s.inner, 0) && pb_is_zero_length_since(s.outer, s.first_outer_index)
+}
+
+fn stroke_move_to(s: *StrokeState, p: geometry.Point) {
+    if s.segment_count > 0 {
+        stroke_finish_contour(s, false, false)
+    }
+    s.segment_count = 0
+    s.first_pt = p
+    s.prev_pt = p
+    s.join_completed = false
+}
+
+fn stroke_line_to(s: *StrokeState, p: geometry.Point, use_iter: bool) {
+    let teeny_line = geo_equals_within(s.prev_pt, p, geo_nearly_zero * s.inv_res_scale)
+    if s.cap == StrokeCap.Butt && teeny_line {
+        return
+    }
+    if teeny_line && (s.join_completed || (use_iter && stroke_has_valid_tangent(s.it))) {
+        return
+    }
+    let n = stroke_pre_join_to(s, p, true)
+    if !n.ok {
+        return
+    }
+    pb_line_to(s.outer, p.x + n.normal.x, p.y + n.normal.y)
+    pb_line_to(s.inner, p.x - n.normal.x, p.y - n.normal.y)
+    stroke_post_join_to(s, p, n.normal, n.unit)
+}
+
+fn stroke_line_to_round(s: *StrokeState, p: geometry.Point) {
+    let saved = s.join
+    s.join = StrokeJoin.Round
+    stroke_line_to(s, p, false)
+    s.join = saved
+}
+
+fn stroke_quad_to(s: *StrokeState, p1: geometry.Point, p2: geometry.Point) {
+    let quad = GeoQuad { p0: s.prev_pt, p1, p2 }
+    let reduction = stroke_check_quad_linear(quad)
+    if reduction.kind == StrokeReduction.Dot {
+        stroke_line_to(s, p2, false)
+        return
+    }
+    if reduction.kind == StrokeReduction.Line {
+        stroke_line_to(s, p2, false)
+        return
+    }
+    if reduction.kind == StrokeReduction.Degenerate {
+        stroke_line_to(s, reduction.point, false)
+        stroke_line_to_round(s, p2)
+        return
+    }
+    let ab = stroke_pre_join_to(s, p1, false)
+    if !ab.ok {
+        stroke_line_to(s, p2, false)
+        return
+    }
+    let qp = stroke_quad_new()
+    stroke_init_quad(s, StrokeType.Outer, 0.0, 1.0, qp)
+    stroke_quad_stroke(s, quad, qp)
+    stroke_init_quad(s, StrokeType.Inner, 0.0, 1.0, qp)
+    stroke_quad_stroke(s, quad, qp)
+    var bc = stroke_set_normals(quad.p1, quad.p2, s.res_scale, s.radius)
+    if !bc.ok {
+        bc = ab
+    }
+    stroke_post_join_to(s, p2, bc.normal, bc.unit)
+}
+
+fn stroke_cubic_to(s: *StrokeState, pt1: geometry.Point, pt2: geometry.Point, pt3: geometry.Point) {
+    let cubic = GeoCubic { p0: s.prev_pt, p1: pt1, p2: pt2, p3: pt3 }
+    let reduction = stroke_check_cubic_linear(cubic)
+    if reduction.kind == StrokeReduction.Dot {
+        stroke_line_to(s, pt3, false)
+        return
+    }
+    if reduction.kind == StrokeReduction.Line {
+        stroke_line_to(s, pt3, false)
+        return
+    }
+    let kind_index = reduction.kind.index
+    if kind_index >= StrokeReduction.Degenerate.index && kind_index <= StrokeReduction.Degenerate3.index {
+        stroke_line_to(s, reduction.points[0], false)
+        let saved = s.join
+        s.join = StrokeJoin.Round
+        if kind_index >= StrokeReduction.Degenerate2.index {
+            stroke_line_to(s, reduction.points[1], false)
+        }
+        if kind_index == StrokeReduction.Degenerate3.index {
+            stroke_line_to(s, reduction.points[2], false)
+        }
+        stroke_line_to(s, pt3, false)
+        s.join = saved
+        return
+    }
+    let ab = stroke_pre_join_to(s, reduction.tangent_pt, false)
+    if !ab.ok {
+        stroke_line_to(s, pt3, false)
+        return
+    }
+    let t_values = geo_find_cubic_inflections(cubic)
+    var last_t: f32 = 0.0
+    for index in 0..(t_values.len + 1) {
+        let next_t = if index < t_values.len { t_values[index] } else { 1.0 }
+        let qp = stroke_quad_new()
+        stroke_init_quad(s, StrokeType.Outer, last_t, next_t, qp)
+        stroke_cubic_stroke(s, cubic, qp)
+        stroke_init_quad(s, StrokeType.Inner, last_t, next_t, qp)
+        stroke_cubic_stroke(s, cubic, qp)
+        last_t = next_t
+    }
+    match geo_find_cubic_cusp(cubic) {
+        some(cusp) => {
+            let cusp_loc = geo_eval_cubic_pos_at(cubic, cusp)
+            pb_push_circle(s.cusper, cusp_loc.x, cusp_loc.y, s.radius)
+        }
+        none => {}
+    }
+    let cd = stroke_set_cubic_end_normal(s, cubic, ab.normal, ab.unit)
+    stroke_post_join_to(s, pt3, cd.normal, cd.unit)
+}
+
+fn stroke_finish_contour(s: *StrokeState, close: bool, curr_is_line: bool) {
+    if s.segment_count > 0 {
+        if close {
+            stroke_join(s, s.prev_unit_normal, s.prev_pt, s.first_unit_normal, s.prev_is_line, curr_is_line)
+            pb_close(s.outer)
+            let pt = pb_last_point(s.inner)
+            pb_move_to(s.outer, pt.x, pt.y)
+            pb_reverse_path_to(s.outer, s.inner)
+            pb_close(s.outer)
+        } else {
+            let pt = pb_last_point(s.inner)
+            stroke_cap_to(s, s.prev_pt, s.prev_normal, pt, curr_is_line, s.outer)
+            pb_reverse_path_to(s.outer, s.inner)
+            stroke_cap_to(s, s.first_pt, geo_neg(s.first_normal), s.first_outer_pt, s.prev_is_line, s.outer)
+            pb_close(s.outer)
+        }
+        if !pb_is_empty(s.cusper) {
+            pb_push_builder(s.outer, s.cusper)
+            pb_clear(s.cusper)
+        }
+    }
+    pb_clear(s.inner)
+    s.segment_count = -1
+    s.first_outer_index = s.outer.points.len
+}
+
+fn stroke_set_normals(before: geometry.Point, after: geometry.Point, scale: f32, radius: f32) -> StrokeNormals {
+    let unit = geo_set_length((after.x - before.x) * scale, (after.y - before.y) * scale, 1.0)
+    if !unit.ok {
+        return StrokeNormals { ok: false, normal: geo_zero(), unit: geo_zero() }
+    }
+    let rotated = geo_rotate_ccw(unit.pt)
+    StrokeNormals { ok: true, normal: geo_scaled(rotated, radius), unit: rotated }
+}
+
+fn stroke_set_normals2(vec: geometry.Point, radius: f32) -> StrokeNormals {
+    let unit = geo_set_length(vec.x, vec.y, 1.0)
+    if !unit.ok {
+        return StrokeNormals { ok: false, normal: geo_zero(), unit: geo_zero() }
+    }
+    let rotated = geo_rotate_ccw(unit.pt)
+    StrokeNormals { ok: true, normal: geo_scaled(rotated, radius), unit: rotated }
+}
+
+fn stroke_pre_join_to(s: *StrokeState, p: geometry.Point, curr_is_line: bool) -> StrokeNormals {
+    let prev_x = s.prev_pt.x
+    let prev_y = s.prev_pt.y
+    var n = stroke_set_normals(s.prev_pt, p, s.res_scale, s.radius)
+    if !n.ok {
+        if s.cap == StrokeCap.Butt {
+            return n
+        }
+        n = StrokeNormals { ok: true, normal: geo_pt(s.radius, 0.0), unit: geo_pt(1.0, 0.0) }
+    }
+    if s.segment_count == 0 {
+        s.first_normal = n.normal
+        s.first_unit_normal = n.unit
+        s.first_outer_pt = geo_pt(prev_x + n.normal.x, prev_y + n.normal.y)
+        pb_move_to(s.outer, s.first_outer_pt.x, s.first_outer_pt.y)
+        pb_move_to(s.inner, prev_x - n.normal.x, prev_y - n.normal.y)
+    } else {
+        stroke_join(s, s.prev_unit_normal, s.prev_pt, n.unit, s.prev_is_line, curr_is_line)
+    }
+    s.prev_is_line = curr_is_line
+    n
+}
+
+fn stroke_post_join_to(s: *StrokeState, p: geometry.Point, normal: geometry.Point, unit_normal: geometry.Point) {
+    s.join_completed = true
+    s.prev_pt = p
+    s.prev_unit_normal = unit_normal
+    s.prev_normal = normal
+    s.segment_count += 1
+}
+
+fn stroke_cap_to(s: *StrokeState, pivot: geometry.Point, normal: geometry.Point, stop: geometry.Point, has_other: bool, path: *PbBuilder) {
+    match s.cap {
+        Butt => pb_line_to(path, stop.x, stop.y)
+        Round => stroke_round_capper(pivot, normal, stop, path)
+        Square => stroke_square_capper(pivot, normal, stop, has_other, path)
+    }
+}
+
+fn stroke_round_capper(pivot: geometry.Point, normal: geometry.Point, stop: geometry.Point, path: *PbBuilder) {
+    let parallel = geo_rotate_cw(normal)
+    let projected_center = geo_add(pivot, parallel)
+    pb_conic_points_to(path, geo_add(projected_center, normal), projected_center, geo_root_2_over_2)
+    pb_conic_points_to(path, geo_sub(projected_center, normal), stop, geo_root_2_over_2)
+}
+
+fn stroke_square_capper(pivot: geometry.Point, normal: geometry.Point, stop: geometry.Point, has_other: bool, path: *PbBuilder) {
+    let parallel = geo_rotate_cw(normal)
+    if has_other {
+        pb_set_last_point(path, geo_pt(pivot.x + normal.x + parallel.x, pivot.y + normal.y + parallel.y))
+        pb_line_to(path, pivot.x - normal.x + parallel.x, pivot.y - normal.y + parallel.y)
+    } else {
+        pb_line_to(path, pivot.x + normal.x + parallel.x, pivot.y + normal.y + parallel.y)
+        pb_line_to(path, pivot.x - normal.x + parallel.x, pivot.y - normal.y + parallel.y)
+        pb_line_to(path, stop.x, stop.y)
+    }
+}
+
+fn stroke_is_clockwise(before: geometry.Point, after: geometry.Point) -> bool {
+    before.x * after.y > before.y * after.x
+}
+
+fn stroke_dot_to_angle(dot: f32) -> StrokeAngle {
+    if dot >= 0.0 {
+        if geo_is_nearly_zero(1.0 - dot) {
+            return StrokeAngle.NearlyLine
+        }
+        return StrokeAngle.Shallow
+    }
+    if geo_is_nearly_zero(1.0 + dot) {
+        return StrokeAngle.Nearly180
+    }
+    StrokeAngle.Sharp
+}
+
+fn stroke_handle_inner_join(inner: *PbBuilder, pivot: geometry.Point, after: geometry.Point) {
+    pb_line_to(inner, pivot.x, pivot.y)
+    pb_line_to(inner, pivot.x - after.x, pivot.y - after.y)
+}
+
+fn stroke_join(s: *StrokeState, before_unit: geometry.Point, pivot: geometry.Point, after_unit: geometry.Point, prev_is_line: bool, curr_is_line: bool) {
+    match s.join {
+        Miter => stroke_miter_joiner(s, before_unit, pivot, after_unit, false, prev_is_line, curr_is_line)
+        MiterClip => stroke_miter_joiner(s, before_unit, pivot, after_unit, true, prev_is_line, curr_is_line)
+        Round => stroke_round_joiner(s, before_unit, pivot, after_unit)
+        Bevel => stroke_bevel_joiner(s, before_unit, pivot, after_unit)
+    }
+}
+
+fn stroke_bevel_joiner(s: *StrokeState, before_unit: geometry.Point, pivot: geometry.Point, after_unit: geometry.Point) {
+    var outer = s.outer
+    var inner = s.inner
+    var after = geo_scaled(after_unit, s.radius)
+    if !stroke_is_clockwise(before_unit, after_unit) {
+        let swap = outer
+        outer = inner
+        inner = swap
+        after = geo_neg(after)
+    }
+    pb_line_to(outer, pivot.x + after.x, pivot.y + after.y)
+    stroke_handle_inner_join(inner, pivot, after)
+}
+
+fn stroke_round_joiner(s: *StrokeState, before_unit: geometry.Point, pivot: geometry.Point, after_unit: geometry.Point) {
+    let dot_prod = geo_dot(before_unit, after_unit)
+    if stroke_dot_to_angle(dot_prod) == StrokeAngle.NearlyLine {
+        return
+    }
+    var before = before_unit
+    var after = after_unit
+    var ccw = false
+    var outer = s.outer
+    var inner = s.inner
+    if !stroke_is_clockwise(before, after) {
+        let swap = outer
+        outer = inner
+        inner = swap
+        before = geo_neg(before)
+        after = geo_neg(after)
+        ccw = true
+    }
+    let ts = geo_ts_row(s.radius, 0.0, 0.0, s.radius, pivot.x, pivot.y)
+    let conics = geo_build_unit_arc(before, after, ccw, ts)
+    if conics.len > 0 {
+        for conic in conics {
+            pb_conic_points_to(outer, conic.p1, conic.p2, conic.weight)
+        }
+        after = geo_scaled(after, s.radius)
+        stroke_handle_inner_join(inner, pivot, after)
+    }
+}
+
+fn stroke_blunt_or_clipped(s: *StrokeState, outer: *PbBuilder, inner: *PbBuilder, pivot: geometry.Point, prev_is_line: bool, curr_is_line: bool, before_in: geometry.Point, mid_in: geometry.Point, after_in: geometry.Point, miter_clip: bool) {
+    let radius = s.radius
+    var before = before_in
+    let after = geo_scaled(after_in, radius)
+    if miter_clip {
+        let mid = geo_set_length(mid_in.x, mid_in.y, 1.0).pt
+        let cos_beta = geo_dot(before, mid)
+        let sin_beta = geo_cross(before, mid)
+        let x = if geo_abs(sin_beta) <= geo_nearly_zero { 1.0 / s.inv_miter_limit } else { ((1.0 / s.inv_miter_limit) - cos_beta) / sin_beta }
+        before = geo_scaled(before, radius)
+        let before_tangent = geo_rotate_cw(before)
+        let after_tangent = geo_rotate_ccw(after)
+        let c1 = geo_add(geo_add(pivot, before), geo_scaled(before_tangent, x))
+        let c2 = geo_add(geo_add(pivot, after), geo_scaled(after_tangent, x))
+        if prev_is_line {
+            pb_set_last_point(outer, c1)
+        } else {
+            pb_line_to(outer, c1.x, c1.y)
+        }
+        pb_line_to(outer, c2.x, c2.y)
+    }
+    if !curr_is_line {
+        pb_line_to(outer, pivot.x + after.x, pivot.y + after.y)
+    }
+    stroke_handle_inner_join(inner, pivot, after)
+}
+
+fn stroke_do_miter(s: *StrokeState, outer: *PbBuilder, inner: *PbBuilder, pivot: geometry.Point, prev_is_line: bool, curr_is_line: bool, mid: geometry.Point, after_in: geometry.Point) {
+    let after = geo_scaled(after_in, s.radius)
+    if prev_is_line {
+        pb_set_last_point(outer, geo_pt(pivot.x + mid.x, pivot.y + mid.y))
+    } else {
+        pb_line_to(outer, pivot.x + mid.x, pivot.y + mid.y)
+    }
+    if !curr_is_line {
+        pb_line_to(outer, pivot.x + after.x, pivot.y + after.y)
+    }
+    stroke_handle_inner_join(inner, pivot, after)
+}
+
+fn stroke_miter_joiner(s: *StrokeState, before_unit: geometry.Point, pivot: geometry.Point, after_unit: geometry.Point, miter_clip: bool, prev_is_line: bool, curr_in: bool) {
+    var curr_is_line = curr_in
+    var outer = s.outer
+    var inner = s.inner
+    let dot_prod = geo_dot(before_unit, after_unit)
+    let angle = stroke_dot_to_angle(dot_prod)
+    var before = before_unit
+    var after = after_unit
+    var mid = geo_zero()
+    if angle == StrokeAngle.NearlyLine {
+        return
+    }
+    if angle == StrokeAngle.Nearly180 {
+        mid = geo_scaled(geo_sub(after, before), s.radius / 2.0)
+        stroke_blunt_or_clipped(s, outer, inner, pivot, prev_is_line, false, before, mid, after, miter_clip)
+        return
+    }
+    let ccw = !stroke_is_clockwise(before, after)
+    if ccw {
+        let swap = outer
+        outer = inner
+        inner = swap
+        before = geo_neg(before)
+        after = geo_neg(after)
+    }
+    if dot_prod == 0.0 && s.inv_miter_limit <= geo_root_2_over_2 {
+        mid = geo_scaled(geo_add(before, after), s.radius)
+        stroke_do_miter(s, outer, inner, pivot, prev_is_line, curr_is_line, mid, after)
+        return
+    }
+    if angle == StrokeAngle.Sharp {
+        mid = geo_pt(after.y - before.y, before.x - after.x)
+        if ccw {
+            mid = geo_neg(mid)
+        }
+    } else {
+        mid = geo_pt(before.x + after.x, before.y + after.y)
+    }
+    let sin_half_angle = sqrt(geo_half(1.0 + dot_prod))
+    if sin_half_angle < s.inv_miter_limit {
+        curr_is_line = false
+        stroke_blunt_or_clipped(s, outer, inner, pivot, prev_is_line, curr_is_line, before, mid, after, miter_clip)
+        return
+    }
+    mid = geo_set_length(mid.x, mid.y, s.radius / sin_half_angle).pt
+    stroke_do_miter(s, outer, inner, pivot, prev_is_line, curr_is_line, mid, after)
+}

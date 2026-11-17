@@ -1,0 +1,673 @@
+import std/xml
+import strs = std/text
+import std/ui/geometry
+
+/// Why an SVG document could not be loaded.
+pub enum Error {
+    /// The source is not a well-formed SVG document, or one of its attributes or paths is malformed. `message` says what.
+    Malformed(message: str)
+    /// The source uses something this renderer does not draw, such as a `transform`, a stroke cap or join other than round, or an element it does not know. `feature` names it.
+    Unsupported(feature: str)
+}
+
+/// Returns a one-line description of `e`.
+pub fn describe(e: Error) -> str {
+    match e {
+        Malformed(message) => "malformed svg: {message}"
+        Unsupported(feature) => "unsupported svg feature: {feature}"
+    }
+}
+
+struct Shape {
+    path: Path
+    width: f32
+    stroked: bool
+    filled: bool
+}
+
+struct Paint {
+    stroke: bool = false
+    fill: bool = true
+    width: f32 = 1.0
+    round_cap: bool = false
+    round_join: bool = false
+}
+
+/// A parsed SVG icon made of strokes and fills, ready to rasterise at any size.
+pub struct Icon {
+    /// The width of the document in its own units.
+    pub width: f32
+    /// The height of the document in its own units.
+    pub height: f32
+    view_x: f32
+    view_y: f32
+    view_width: f32
+    view_height: f32
+    shapes: Shape[]
+}
+
+/// A coverage mask: one byte per pixel, row by row from the top left.
+pub struct Mask {
+    /// The width in pixels.
+    pub width: i64
+    /// The height in pixels.
+    pub height: i64
+    /// The coverage of each pixel, `0` to `255`.
+    pub coverage: u8[]
+}
+
+struct Scan {
+    s: str
+    at: i64
+}
+
+enum Reflect {
+    Plain
+    Cubic
+    Quad
+}
+
+struct Pen {
+    x: f64
+    y: f64
+    start_x: f64
+    start_y: f64
+    control_x: f64
+    control_y: f64
+    reflect: Reflect
+    closed: bool
+}
+
+fn is_digit(c: u8) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn is_space(c: u8) -> bool {
+    c == ' ' || c == ',' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn skip(sc: *Scan) {
+    for sc.at < sc.s.len && is_space(sc.s[sc.at]) {
+        sc.at += 1
+    }
+}
+
+fn convert(token: str) -> f64 ! Error {
+    strs.parse_float(token) catch {
+        e => fail Malformed("number {token}")
+    }
+}
+
+fn digits_from(s: str, from: i64) -> i64 {
+    var at = from
+    for at < s.len && is_digit(s[at]) {
+        at += 1
+    }
+    at
+}
+
+fn number(sc: *Scan) -> f64 ! Error {
+    skip(sc)
+    let s = sc.s
+    var at = sc.at
+    var sign = ""
+    if at < s.len && (s[at] == '-' || s[at] == '+') {
+        if s[at] == '-' {
+            sign = "-"
+        }
+        at += 1
+    }
+    let whole_end = digits_from(s, at)
+    let whole = s[at..whole_end]
+    at = whole_end
+    var fraction = ""
+    if at < s.len && s[at] == '.' {
+        let fraction_end = digits_from(s, at + 1)
+        fraction = s[at + 1..fraction_end]
+        at = fraction_end
+    }
+    if whole.len == 0 && fraction.len == 0 {
+        fail Malformed("expected a number at {sc.at} in {s}")
+    }
+    var exponent = ""
+    if at < s.len && (s[at] == 'e' || s[at] == 'E') {
+        var probe = at + 1
+        var exponent_sign = ""
+        if probe < s.len && (s[probe] == '-' || s[probe] == '+') {
+            if s[probe] == '-' {
+                exponent_sign = "-"
+            }
+            probe += 1
+        }
+        let exponent_end = digits_from(s, probe)
+        if exponent_end > probe {
+            exponent = "e{exponent_sign}{s[probe..exponent_end]}"
+            at = exponent_end
+        }
+    }
+    let lead = if whole.len == 0 { "0" } else { whole }
+    let tail = if fraction.len == 0 { "0" } else { fraction }
+    sc.at = at
+    convert("{sign}{lead}.{tail}{exponent}")?
+}
+
+fn flag(sc: *Scan) -> bool ! Error {
+    skip(sc)
+    if sc.at >= sc.s.len || (sc.s[sc.at] != '0' && sc.s[sc.at] != '1') {
+        fail Malformed("expected an arc flag at {sc.at} in {sc.s}")
+    }
+    let on = sc.s[sc.at] == '1'
+    sc.at += 1
+    on
+}
+
+fn is_letter(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+fn arc_into(b: *PbBuilder, from: ArcPoint, to: ArcPoint, rx: f64, ry: f64, degrees: f64, large: bool, sweep: bool) {
+    match arc_cubics(from, to, rx, ry, degrees, large, sweep) {
+        some(cubics) => {
+            for i in 0..cubics.len / 6 {
+                let at = i * 6
+                pb_cubic_to(b, f32(cubics[at]), f32(cubics[at + 1]), f32(cubics[at + 2]), f32(cubics[at + 3]), f32(cubics[at + 4]), f32(cubics[at + 5]))
+            }
+        }
+        none => pb_line_to(b, f32(to.x), f32(to.y))
+    }
+}
+
+fn arc_from_last(b: *PbBuilder, rx: f32, ry: f32, large: bool, sweep: bool, x: f32, y: f32) {
+    if b.points.len == 0 {
+        return
+    }
+    let last = pb_last_point(b)
+    arc_into(b, ArcPoint { x: f64(last.x), y: f64(last.y) }, ArcPoint { x: f64(x), y: f64(y) }, f64(rx), f64(ry), 0.0, large, sweep)
+}
+
+fn settle(pen: *Pen, x: f64, y: f64) {
+    pen.x = x
+    pen.y = y
+    pen.closed = false
+}
+
+fn path_data(d: str, b: *PbBuilder) ! Error {
+    let sc = new(Scan { s: d, at: 0 })
+    let pen = new(Pen { x: 0.0, y: 0.0, start_x: 0.0, start_y: 0.0, control_x: 0.0, control_y: 0.0, reflect: Reflect.Plain, closed: false })
+    var command: u8 = ' '
+    for {
+        skip(sc)
+        if sc.at >= d.len {
+            break
+        }
+        if is_letter(d[sc.at]) {
+            command = d[sc.at]
+            sc.at += 1
+        } else if command == ' ' {
+            fail Malformed("path data must start with a command: {d}")
+        } else if command == 'M' {
+            command = 'L'
+        } else if command == 'm' {
+            command = 'l'
+        } else if command == 'Z' || command == 'z' {
+            fail Malformed("a number follows a close in {d}")
+        }
+        let relative = command >= 'a'
+        var upper = command
+        if relative {
+            upper = command - 32
+        }
+        if upper == 'Z' {
+            if !pen.closed {
+                pb_close(b)
+            }
+            pen.x = pen.start_x
+            pen.y = pen.start_y
+            pen.closed = true
+            pen.reflect = Reflect.Plain
+            continue
+        }
+        let base_x = if relative { pen.x } else { 0.0 }
+        let base_y = if relative { pen.y } else { 0.0 }
+        if upper == 'M' {
+            var x = number(sc)?
+            var y = number(sc)?
+            if relative {
+                if pen.closed {
+                    x += pen.start_x
+                    y += pen.start_y
+                } else {
+                    x += pen.x
+                    y += pen.y
+                }
+            }
+            pb_move_to(b, f32(x), f32(y))
+            settle(pen, x, y)
+            pen.start_x = x
+            pen.start_y = y
+            pen.reflect = Reflect.Plain
+            continue
+        }
+        if pen.closed {
+            pb_move_to(b, f32(pen.start_x), f32(pen.start_y))
+        }
+        if upper == 'L' {
+            let x = base_x + number(sc)?
+            let y = base_y + number(sc)?
+            pb_line_to(b, f32(x), f32(y))
+            settle(pen, x, y)
+            pen.reflect = Reflect.Plain
+        } else if upper == 'H' {
+            let x = base_x + number(sc)?
+            pb_line_to(b, f32(x), f32(pen.y))
+            settle(pen, x, pen.y)
+            pen.reflect = Reflect.Plain
+        } else if upper == 'V' {
+            let y = base_y + number(sc)?
+            pb_line_to(b, f32(pen.x), f32(y))
+            settle(pen, pen.x, y)
+            pen.reflect = Reflect.Plain
+        } else if upper == 'C' {
+            let x1 = base_x + number(sc)?
+            let y1 = base_y + number(sc)?
+            let x2 = base_x + number(sc)?
+            let y2 = base_y + number(sc)?
+            let x = base_x + number(sc)?
+            let y = base_y + number(sc)?
+            pb_cubic_to(b, f32(x1), f32(y1), f32(x2), f32(y2), f32(x), f32(y))
+            settle(pen, x, y)
+            pen.control_x = x2
+            pen.control_y = y2
+            pen.reflect = Reflect.Cubic
+        } else if upper == 'S' {
+            var x1 = pen.x
+            var y1 = pen.y
+            if pen.reflect == Reflect.Cubic {
+                x1 = pen.x * 2.0 - pen.control_x
+                y1 = pen.y * 2.0 - pen.control_y
+            }
+            let x2 = base_x + number(sc)?
+            let y2 = base_y + number(sc)?
+            let x = base_x + number(sc)?
+            let y = base_y + number(sc)?
+            pb_cubic_to(b, f32(x1), f32(y1), f32(x2), f32(y2), f32(x), f32(y))
+            settle(pen, x, y)
+            pen.control_x = x2
+            pen.control_y = y2
+            pen.reflect = Reflect.Cubic
+        } else if upper == 'Q' {
+            let x1 = base_x + number(sc)?
+            let y1 = base_y + number(sc)?
+            let x = base_x + number(sc)?
+            let y = base_y + number(sc)?
+            pb_quad_to(b, f32(x1), f32(y1), f32(x), f32(y))
+            settle(pen, x, y)
+            pen.control_x = x1
+            pen.control_y = y1
+            pen.reflect = Reflect.Quad
+        } else if upper == 'T' {
+            var x1 = pen.x
+            var y1 = pen.y
+            if pen.reflect == Reflect.Quad {
+                x1 = pen.x * 2.0 - pen.control_x
+                y1 = pen.y * 2.0 - pen.control_y
+            }
+            let x = base_x + number(sc)?
+            let y = base_y + number(sc)?
+            pb_quad_to(b, f32(x1), f32(y1), f32(x), f32(y))
+            settle(pen, x, y)
+            pen.control_x = x1
+            pen.control_y = y1
+            pen.reflect = Reflect.Quad
+        } else if upper == 'A' {
+            let rx = number(sc)?
+            let ry = number(sc)?
+            let degrees = number(sc)?
+            let large = flag(sc)?
+            let sweep = flag(sc)?
+            let x = base_x + number(sc)?
+            let y = base_y + number(sc)?
+            arc_into(b, ArcPoint { x: pen.x, y: pen.y }, ArcPoint { x, y }, rx, ry, degrees, large, sweep)
+            settle(pen, x, y)
+            pen.reflect = Reflect.Plain
+        } else {
+            fail Malformed("unknown path command {upper} in {d}")
+        }
+    }
+}
+
+fn length_of(e: *xml.Element, name: str, fallback: f32) -> f32 ! Error {
+    let text = xml.attribute(e, name) ?? return fallback
+    let sc = new(Scan { s: text, at: 0 })
+    f32(number(sc)?)
+}
+
+fn optional_length(e: *xml.Element, name: str) -> f32? ! Error {
+    let text = xml.attribute(e, name) ?? return none
+    let sc = new(Scan { s: text, at: 0 })
+    let value = f32(number(sc)?)
+    if value < 0.0 {
+        return none
+    }
+    value
+}
+
+fn radii_of(e: *xml.Element) -> geometry.Point ! Error {
+    let rx = optional_length(e, "rx")?
+    let ry = optional_length(e, "ry")?
+    match rx {
+        some(x) => {
+            match ry {
+                some(y) => geometry.Point { x, y }
+                none => geometry.Point { x, y: x }
+            }
+        }
+        none => {
+            match ry {
+                some(y) => geometry.Point { x: y, y }
+                none => geometry.Point { x: 0.0, y: 0.0 }
+            }
+        }
+    }
+}
+
+fn rectangle(e: *xml.Element, b: *PbBuilder) ! Error {
+    let x = length_of(e, "x", 0.0)?
+    let y = length_of(e, "y", 0.0)?
+    let w = length_of(e, "width", 0.0)?
+    let h = length_of(e, "height", 0.0)?
+    if !(w > 0.0) || !(h > 0.0) {
+        return
+    }
+    let radii = radii_of(e)?
+    var rx = radii.x
+    var ry = radii.y
+    if rx > w / 2.0 {
+        rx = w / 2.0
+    }
+    if ry > h / 2.0 {
+        ry = h / 2.0
+    }
+    if rx == 0.0 {
+        pb_move_to(b, x, y)
+        pb_line_to(b, x + w, y)
+        pb_line_to(b, x + w, y + h)
+        pb_line_to(b, x, y + h)
+        pb_close(b)
+        return
+    }
+    pb_move_to(b, x + rx, y)
+    pb_line_to(b, x + w - rx, y)
+    arc_from_last(b, rx, ry, false, true, x + w, y + ry)
+    pb_line_to(b, x + w, y + h - ry)
+    arc_from_last(b, rx, ry, false, true, x + w - rx, y + h)
+    pb_line_to(b, x + rx, y + h)
+    arc_from_last(b, rx, ry, false, true, x, y + h - ry)
+    pb_line_to(b, x, y + ry)
+    arc_from_last(b, rx, ry, false, true, x + rx, y)
+    pb_close(b)
+}
+
+fn ellipse(b: *PbBuilder, cx: f32, cy: f32, rx: f32, ry: f32) {
+    if !(rx > 0.0) || !(ry > 0.0) {
+        return
+    }
+    pb_move_to(b, cx + rx, cy)
+    arc_from_last(b, rx, ry, false, true, cx, cy + ry)
+    arc_from_last(b, rx, ry, false, true, cx - rx, cy)
+    arc_from_last(b, rx, ry, false, true, cx, cy - ry)
+    arc_from_last(b, rx, ry, false, true, cx + rx, cy)
+    pb_close(b)
+}
+
+fn points_into(e: *xml.Element, closed: bool, b: *PbBuilder) ! Error {
+    let text = xml.attribute(e, "points") ?? return
+    let sc = new(Scan { s: text, at: 0 })
+    var count = 0
+    for {
+        skip(sc)
+        if sc.at >= text.len {
+            break
+        }
+        let x = f32(number(sc)?)
+        let y = f32(number(sc)?)
+        if count == 0 {
+            pb_move_to(b, x, y)
+        } else {
+            pb_line_to(b, x, y)
+        }
+        count += 1
+    }
+    if count < 2 {
+        pb_clear(b)
+        return
+    }
+    if closed {
+        pb_close(b)
+    }
+}
+
+fn rounded(e: *xml.Element, name: str) -> bool? {
+    let value = xml.attribute(e, name) ?? return none
+    value == "round"
+}
+
+fn restyle(e: *xml.Element, outer: Paint) -> Paint ! Error {
+    var p = outer
+    match xml.attribute(e, "transform") {
+        some(_) => fail Unsupported("transform")
+        none => {}
+    }
+    match xml.attribute(e, "fill-rule") {
+        some(v) => {
+            if v == "evenodd" {
+                fail Unsupported("fill-rule evenodd")
+            }
+        }
+        none => {}
+    }
+    match xml.attribute(e, "stroke") {
+        some(v) => {
+            p.stroke = v != "none"
+        }
+        none => {}
+    }
+    match xml.attribute(e, "fill") {
+        some(v) => {
+            p.fill = v != "none"
+        }
+        none => {}
+    }
+    match xml.attribute(e, "stroke-width") {
+        some(v) => {
+            p.width = f32(convert(strs.trim(v))?)
+        }
+        none => {}
+    }
+    match rounded(e, "stroke-linecap") {
+        some(v) => {
+            p.round_cap = v
+        }
+        none => {}
+    }
+    match rounded(e, "stroke-linejoin") {
+        some(v) => {
+            p.round_join = v
+        }
+        none => {}
+    }
+    p
+}
+
+fn collect(e: *xml.Element, outer: Paint, mut shapes: Shape[]) ! Error {
+    let paint = restyle(e, outer)?
+    let name = e.name.local
+    if name == "svg" || name == "g" {
+        for child in xml.children(e, "*") {
+            collect(child, paint, mut shapes)?
+        }
+        return
+    }
+    if name == "title" || name == "desc" {
+        return
+    }
+    let b = pb_new()
+    if name == "path" {
+        path_data(xml.attribute(e, "d") ?? "", b)?
+    } else if name == "line" {
+        pb_move_to(b, length_of(e, "x1", 0.0)?, length_of(e, "y1", 0.0)?)
+        pb_line_to(b, length_of(e, "x2", 0.0)?, length_of(e, "y2", 0.0)?)
+    } else if name == "polyline" {
+        points_into(e, false, b)?
+    } else if name == "polygon" {
+        points_into(e, true, b)?
+    } else if name == "rect" {
+        rectangle(e, b)?
+    } else if name == "circle" {
+        let r = length_of(e, "r", 0.0)?
+        ellipse(b, length_of(e, "cx", 0.0)?, length_of(e, "cy", 0.0)?, r, r)
+    } else if name == "ellipse" {
+        let radii = radii_of(e)?
+        ellipse(b, length_of(e, "cx", 0.0)?, length_of(e, "cy", 0.0)?, radii.x, radii.y)
+    } else {
+        fail Unsupported("element {name}")
+    }
+    if paint.stroke && (!paint.round_cap || !paint.round_join) {
+        fail Unsupported("a stroke whose cap and join are not both round")
+    }
+    let path = pb_finish(b) catch { failure => return }
+    shapes.push(Shape { path, width: paint.width, stroked: paint.stroke && paint.width > 0.0, filled: paint.fill })
+}
+
+fn size_of(e: *xml.Element, name: str, fallback: f32) -> f32 ! Error {
+    let text = xml.attribute(e, name) ?? return fallback
+    let sc = new(Scan { s: text, at: 0 })
+    f32(number(sc)?)
+}
+
+/// Parses `source`, an SVG document of paths, lines, polylines, polygons, rectangles, circles and ellipses, filled and stroked with round caps and joins.
+///
+/// Attributes `stroke`, `fill`, `stroke-width`, `stroke-linecap` and `stroke-linejoin` are inherited down `g` elements. Shapes are built the way `usvg` builds them: path data is read in double precision as absolute coordinates, elliptical arcs become cubic curves by `kurbo`'s method with a tolerance of `0.1`, quadratic curves stay quadratic, and an element with no drawable geometry is dropped. A fill is painted by the non-zero rule, in whatever colour it names, because only coverage is kept.
+pub fn parse(source: str) -> Icon ! Error {
+    let root = xml.parse(bytes(source)) catch {
+        e => fail Malformed("not xml")
+    }
+    if root.name.local != "svg" {
+        fail Malformed("the root element is {root.name.local}, not svg")
+    }
+    var view_x: f32 = 0.0
+    var view_y: f32 = 0.0
+    var view_width: f32 = 0.0
+    var view_height: f32 = 0.0
+    match xml.attribute(root, "viewBox") {
+        some(box) => {
+            let sc = new(Scan { s: box, at: 0 })
+            view_x = f32(number(sc)?)
+            view_y = f32(number(sc)?)
+            view_width = f32(number(sc)?)
+            view_height = f32(number(sc)?)
+        }
+        none => {}
+    }
+    let width = size_of(root, "width", view_width)?
+    let height = size_of(root, "height", view_height)?
+    if width <= 0.0 || height <= 0.0 {
+        fail Malformed("the document has no size")
+    }
+    if view_width <= 0.0 || view_height <= 0.0 {
+        view_width = width
+        view_height = height
+    }
+    var shapes: Shape[] = []
+    collect(root, Paint {}, mut shapes)?
+    Icon { width, height, view_x, view_y, view_width, view_height, shapes }
+}
+
+struct Frame {
+    sx: f32
+    sy: f32
+    tx: f32
+    ty: f32
+}
+
+fn frame_for(icon: Icon, sx: f32, sy: f32) -> Frame {
+    let fit_x = icon.width / icon.view_width
+    let fit_y = icon.height / icon.view_height
+    let fit = if fit_x < fit_y { fit_x } else { fit_y }
+    let shift_x = (icon.width - icon.view_width * fit) / 2.0 - icon.view_x * fit
+    let shift_y = (icon.height - icon.view_height * fit) / 2.0 - icon.view_y * fit
+    Frame { sx: sx * fit, sy: sy * fit, tx: sx * shift_x, ty: sy * shift_y }
+}
+
+fn resolution_scale(f: Frame) -> f32 {
+    let sx = sqrt(f.sx * f.sx)
+    let sy = sqrt(f.sy * f.sy)
+    let scale = if sx > sy { sx } else { sy }
+    if scale > 0.0 && scale < 3.4028235e38 {
+        return scale
+    }
+    1.0
+}
+
+fn apply(f: Frame, p: Path) -> Path {
+    var points: geometry.Point[] = []
+    for q in p.points {
+        points.push(geometry.Point { x: q.x * f.sx + f.tx, y: q.y * f.sy + f.ty })
+    }
+    Path { verbs: p.verbs, points }
+}
+
+fn has_area(p: Path) -> bool {
+    var left = p.points[0].x
+    var top = p.points[0].y
+    var right = left
+    var bottom = top
+    for q in p.points {
+        if q.x < left {
+            left = q.x
+        }
+        if q.x > right {
+            right = q.x
+        }
+        if q.y < top {
+            top = q.y
+        }
+        if q.y > bottom {
+            bottom = q.y
+        }
+    }
+    right - left != 0.0 && bottom - top != 0.0
+}
+
+fn paint_shape(s: Shape, f: Frame, width: i64, height: i64, mut coverage: u8[]) {
+    if s.filled && has_area(s.path) {
+        fill_path(apply(f, s.path), width, height, mut coverage)
+    }
+    if s.stroked {
+        let outline = stroke(s.path, s.width, resolution_scale(f)) catch { e => return }
+        fill_path(apply(f, outline), width, height, mut coverage)
+    }
+}
+
+/// Rasterises `icon` into a mask `width` pixels across, the height following from the document's proportions.
+///
+/// The size and scale are computed in single precision as gpui computes them for `resvg`, and each shape is filled and then stroked, in document order, onto one coverage buffer by ports of tiny-skia's anti-aliased path filler and path stroker, so the mask is the alpha channel `resvg` renders. A stroke is always drawn as a filled outline, including one a pixel wide or thinner, where tiny-skia draws a modulated hairline.
+pub fn render(icon: Icon, width: i64) -> Mask {
+    let scale = f32(width) / icon.width
+    let wide = icon.width * scale
+    let high = icon.height * scale
+    let w = i64(wide)
+    let h = i64(high)
+    if w <= 0 || h <= 0 {
+        return Mask { width: 0, height: 0, coverage: [] }
+    }
+    let f = frame_for(icon, wide / icon.width, high / icon.height)
+    var coverage: u8[] = []
+    for _ in 0..w * h {
+        coverage.push(0)
+    }
+    for s in icon.shapes {
+        paint_shape(s, f, w, h, mut coverage)
+    }
+    Mask { width: w, height: h, coverage }
+}
