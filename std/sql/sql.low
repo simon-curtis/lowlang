@@ -46,8 +46,97 @@ pub enum Error {
     Conversion
     /// The connection is in use by another call, or the SQLite database is locked.
     Busy
-    /// The server reported an error. `code` is the SQLSTATE on PostgreSQL, MySQL and MariaDB, the error number on SQL Server and the extended result code on SQLite; `message` is the server's text.
-    Server(code: str, message: str)
+    /// The call was stopped by the connection's `cancel`. The connection stays usable.
+    Cancelled
+    /// The server reported one or more errors. `errors` holds every error the call received, in the order the server sent them, and is never empty.
+    Server(errors: Diagnostic[])
+}
+
+/// Returns a `Server` error holding one `Failure` diagnostic with `code` and `message`.
+pub fn server_error(code: str, message: str) -> Error {
+    Error.Server([Diagnostic { level: Level.Failure, code, message }])
+}
+
+/// How serious a `Diagnostic` is.
+pub enum Level {
+    /// An informational message: SQL Server `PRINT` and severity 10 and below, PostgreSQL `DEBUG`, `LOG`, `INFO` and `NOTICE`.
+    Info
+    /// A warning: PostgreSQL `WARNING`.
+    Warning
+    /// An error that fails the statement and leaves the connection usable: SQL Server severity 11 to 19, PostgreSQL `ERROR`, and every MySQL, MariaDB and SQLite error.
+    Failure
+    /// An error that ends the session: SQL Server severity 20 and above, PostgreSQL `FATAL` and `PANIC`.
+    Fatal
+}
+
+/// A message from the server: an error, a warning or an informational message.
+///
+/// `level`, `code` and `message` are set on every database. The other fields hold what the protocol provides and stay empty or `0` otherwise.
+pub struct Diagnostic {
+    /// How serious the message is.
+    pub level: Level
+    /// The SQLSTATE on PostgreSQL, MySQL and MariaDB, the message number on SQL Server and the extended result code on SQLite.
+    pub code: str
+    /// The server's text.
+    pub message: str
+    /// The server's own name for the severity: PostgreSQL's non-localised severity, such as `NOTICE` or `ERROR`. Empty on the other databases.
+    pub severity: str = ""
+    /// The SQL Server severity class, from `0` to `25`.
+    pub class: i64 = 0
+    /// The SQL Server error state.
+    pub state: i64 = 0
+    /// The name of the SQL Server that sent the message.
+    pub server: str = ""
+    /// The SQL Server stored procedure or remote procedure call that raised the message.
+    pub procedure: str = ""
+    /// The line in the SQL Server batch or procedure that raised the message, counted from `1`.
+    pub line: i64 = 0
+    /// The PostgreSQL character position in the statement text where the error was found, counted from `1`.
+    pub position: i64 = 0
+    /// The PostgreSQL secondary message.
+    pub detail: str = ""
+    /// The PostgreSQL suggestion for fixing the problem.
+    pub hint: str = ""
+    /// The PostgreSQL call stack where the message was raised, one entry per line.
+    pub context: str = ""
+    /// The text of an internally generated PostgreSQL command, such as a PL/pgSQL statement, that failed.
+    pub internal_query: str = ""
+    /// The position in `internal_query` where the error was found, counted from `1`.
+    pub internal_position: i64 = 0
+    /// The PostgreSQL schema of the object the error concerns.
+    pub schema: str = ""
+    /// The PostgreSQL table the error concerns.
+    pub table: str = ""
+    /// The PostgreSQL column the error concerns.
+    pub column: str = ""
+    /// The PostgreSQL data type the error concerns.
+    pub data_type: str = ""
+    /// The PostgreSQL constraint the error concerns.
+    pub constraint: str = ""
+    /// The PostgreSQL source file that raised the message.
+    pub file: str = ""
+    /// The line in `file` that raised the message.
+    pub file_line: i64 = 0
+    /// The PostgreSQL source routine that raised the message.
+    pub routine: str = ""
+}
+
+/// Something the server sent that is not part of a result: a diagnostic or a notification.
+pub enum Notice {
+    /// A diagnostic the server sent during a call. Errors arrive here as well as in the call's `Error.Server`.
+    Message(diagnostic: Diagnostic)
+    /// A PostgreSQL `NOTIFY` on a channel the session listens to: the channel, the payload and the process id of the sending session.
+    Notification(channel: str, payload: str, process: i64)
+}
+
+/// One step of a statement's results, as `ConnectionHandle.stream` reports them.
+pub enum Event {
+    /// A result set starts with these columns. Each later `Row` belongs to it.
+    Columns(columns: Column[])
+    /// A row of the current result set, with one `Value` per column.
+    Row(values: Value[])
+    /// A statement finished. `count` is the number of rows the server reported it returned or affected, `0` when it reported none.
+    Done(count: i64)
 }
 
 /// A column of a result set.
@@ -64,6 +153,8 @@ pub struct Rows {
     pub columns: Column[]
     /// The rows in the order the database returned them; each row has one `Value` per column.
     pub rows: Value[][]
+    /// The number of rows the server reported for the statement that produced the result, `0` when it reported none.
+    pub count: i64 = 0
 }
 
 /// A copyable view of a database connection, made of closures.
@@ -76,8 +167,18 @@ pub struct ConnectionHandle {
     pub query: fn(str, Value[]) -> Rows ! Error
     /// Runs the statement with the parameters and calls the callback for each row in turn, with the columns and the row. The callback returns `false` to stop early.
     pub each: fn(str, Value[], fn(Column[], Value[]) -> bool) ! Error
+    /// Runs the statements with the parameters and calls the callback with every result set, row and statement end in the order the server sent them. The callback returns `false` to stop early.
+    ///
+    /// Without parameters, the text may hold several statements on SQL Server, PostgreSQL and MySQL. Result sets that completed before a server error have reached the callback by the time the call fails.
+    pub stream: fn(str, Value[], fn(Event) -> bool) ! Error
     /// Runs the statement with the parameters, discards any rows and returns the number of rows affected.
     pub execute: fn(str, Value[]) -> i64 ! Error
+    /// Stops the call running on the connection, from any green thread, and does nothing when no call runs.
+    ///
+    /// The call fails with `Error.Cancelled` and the connection stays usable. A call the server finishes before the request reaches it returns its result.
+    pub cancel: fn()
+    /// Sets the function that receives the connection's notices, replacing the previous one. It runs on the green thread of the call that reads the notice, in the order the server sent it relative to the rows, and must not make a call on the connection.
+    pub on_notice: fn(fn(Notice))
     /// Starts a transaction.
     pub begin: fn() ! Error
     /// Commits the current transaction.
@@ -102,6 +203,40 @@ pub struct Connection {
 /// Returns a `Connection` that owns the connection behind the handle, so that dropping it calls the handle's `close`.
 pub fn adopt(h: ConnectionHandle) -> Connection {
     Connection { handle: h }
+}
+
+/// Runs the statements with the parameters through `h.stream` and returns every result set in order, each with the count the server reported for it.
+///
+/// A statement that returns no result set adds nothing. A call that fails returns only the error; `stream` delivers the result sets that completed before it.
+pub fn query_all(h: ConnectionHandle, text: str, values: Value[]) -> Rows[] ! Error {
+    var sets: Rows[] = []
+    var open = false
+    var columns: Column[] = []
+    var rows: Value[][] = []
+    h.stream(text, values, fn(e) -> bool {
+        match e {
+            Columns(described) => {
+                if open {
+                    sets.push(Rows { columns, rows })
+                }
+                open = true
+                columns = described
+                rows = []
+            }
+            Row(values) => rows.push(values)
+            Done(count) => {
+                if open {
+                    sets.push(Rows { columns, rows, count })
+                    open = false
+                }
+            }
+        }
+        true
+    })?
+    if open {
+        sets.push(Rows { columns, rows })
+    }
+    sets
 }
 
 /// Rolls back the current transaction of `h` after `cause` and returns the error to report.

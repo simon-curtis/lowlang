@@ -2,6 +2,7 @@ import std/io
 import std/net
 import std/sql
 import std/sql/driver
+import std/sync
 import std/text
 import std/time
 import std/tls
@@ -18,8 +19,12 @@ struct Conn {
     reading: bool
     read_started: i64
     timed_out: bool
+    guard: sync.Mutex
+    sent: bool
     attention: bool
     logged_in: bool
+    challenged: bool
+    challenge: u8[]
     session: *driver.Session
 }
 
@@ -45,6 +50,42 @@ fn send_message(c: *Conn, kind: u8, payload: u8[]) ! sql.Error {
     for p in packets(kind, payload, c.packet_size) {
         send(c, p)?
     }
+}
+
+fn transmit(c: *Conn, kind: u8, payload: u8[]) ! sql.Error {
+    sync.lock(c.guard)
+    defer sync.unlock(c.guard)
+    if c.session.cancelled {
+        fail Cancelled
+    }
+    send_message(c, kind, payload)?
+    c.sent = true
+}
+
+fn interrupt(c: *Conn) {
+    sync.lock(c.guard)
+    defer sync.unlock(c.guard)
+    if !c.sent || c.attention || c.session.closed {
+        return
+    }
+    c.attention = true
+    send_message(c, packet_attention, []) or {}
+}
+
+fn acknowledge(c: *Conn) {
+    sync.lock(c.guard)
+    defer sync.unlock(c.guard)
+    c.attention = false
+}
+
+fn finished(c: *Conn) -> bool {
+    sync.lock(c.guard)
+    defer sync.unlock(c.guard)
+    if c.attention {
+        return false
+    }
+    c.sent = false
+    true
 }
 
 fn read_packet(c: *Conn) -> u8[] ! io.Error {
@@ -134,9 +175,11 @@ fn rest_of_message(c: *Conn) -> u8[] ! sql.Error {
 struct Exchange {
     columns: sql.Column[]
     types: Type[]
+    errors: sql.Diagnostic[]
     failure: sql.Error?
     fatal: bool
     stopped: bool
+    acknowledged: bool
     count: i64
 }
 
@@ -145,9 +188,20 @@ fn stop(c: *Conn, x: *Exchange) ! sql.Error {
         return
     }
     x.stopped = true
-    if !c.last {
+    sync.lock(c.guard)
+    defer sync.unlock(c.guard)
+    if !c.last && !c.attention {
         c.attention = true
         send_message(c, packet_attention, [])?
+    }
+}
+
+fn emit(c: *Conn, x: *Exchange, receive: fn(sql.Event) -> bool, e: sql.Event) ! sql.Error {
+    if x.stopped || c.attention {
+        return
+    }
+    if !receive(e) {
+        stop(c, x)?
     }
 }
 
@@ -197,7 +251,7 @@ fn decoded(c: *Conn, x: *Exchange, t: Type) -> sql.Value ! sql.Error {
     }
 }
 
-fn row(c: *Conn, x: *Exchange, compressed: bool, visit: fn(sql.Column[], sql.Value[]) -> bool) ! sql.Error {
+fn row(c: *Conn, x: *Exchange, compressed: bool, receive: fn(sql.Event) -> bool) ! sql.Error {
     let n = x.types.len
     let bitmap: u8[] = if compressed { take(c, (n + 7) / 8)? } else { [] }
     let values: sql.Value[] = __make(n)
@@ -208,40 +262,36 @@ fn row(c: *Conn, x: *Exchange, compressed: bool, visit: fn(sql.Column[], sql.Val
             values[i] = decoded(c, x, t)?
         }
     }
-    if !x.stopped && !visit(x.columns, values) {
-        stop(c, x)?
-    }
+    emit(c, x, receive, sql.Event.Row(values))?
 }
 
-fn done(c: *Conn, x: *Exchange, kind: u8) ! sql.Error {
+fn done(c: *Conn, x: *Exchange, kind: u8, receive: fn(sql.Event) -> bool) ! sql.Error {
     let status = u16_of(c)?
     take(c, 2)?
     let count = u64_of(c)?
     if status & 0x20 != 0 {
-        c.attention = false
+        acknowledge(c)
+        x.acknowledged = true
+        return
     }
-    if status & 0x10 != 0 && kind != 0xFE {
-        x.count += count
+    if kind == 0xFE {
+        return
     }
+    let rows = if status & 0x10 != 0 { count } else { 0 }
+    x.count += rows
+    emit(c, x, receive, sql.Event.Done(rows))?
 }
 
-fn server_error(c: *Conn, x: *Exchange) ! sql.Error {
+fn server_message(c: *Conn, x: *Exchange, failed: bool) ! sql.Error {
     let body = take(c, u16_of(c)?)?
-    if body.len < 8 {
-        fail Protocol
+    let d = diagnostic(body)?
+    if failed {
+        if d.class >= 20 {
+            x.fatal = true
+        }
+        x.errors.push(d)
     }
-    let number = i64(i32(io.le32(body, 0)))
-    let class = body[5]
-    let size = 2 * io.le16(body, 6)
-    if 8 + size > body.len {
-        fail Protocol
-    }
-    if class >= 20 {
-        x.fatal = true
-    }
-    if x.failure == none {
-        x.failure = sql.Error.Server("{number}", from_utf16(body[8..8 + size]))
-    }
+    driver.report(c.session, d)
 }
 
 fn env_change(c: *Conn) ! sql.Error {
@@ -289,23 +339,26 @@ fn feature_ack(c: *Conn) ! sql.Error {
     }
 }
 
-fn token(c: *Conn, x: *Exchange, describe: fn(sql.Column[]), visit: fn(sql.Column[], sql.Value[]) -> bool) ! sql.Error {
+fn token(c: *Conn, x: *Exchange, receive: fn(sql.Event) -> bool) ! sql.Error {
     let kind = byte_of(c)?
     if kind == 0xD1 || kind == 0xD2 {
-        row(c, x, kind == 0xD2, visit)?
+        row(c, x, kind == 0xD2, receive)?
     } else if kind == 0xFD || kind == 0xFE || kind == 0xFF {
-        done(c, x, kind)?
+        done(c, x, kind, receive)?
     } else if kind == 0x81 {
         metadata(c, x)?
-        describe(x.columns)
-    } else if kind == 0xAA {
-        server_error(c, x)?
+        emit(c, x, receive, sql.Event.Columns(x.columns))?
+    } else if kind == 0xAA || kind == 0xAB {
+        server_message(c, x, kind == 0xAA)?
     } else if kind == 0xE3 {
         env_change(c)?
     } else if kind == 0xAD {
         take(c, u16_of(c)?)?
         c.logged_in = true
-    } else if kind == 0xAB || kind == 0xA9 || kind == 0xA4 || kind == 0xA5 || kind == 0xED {
+    } else if kind == 0xED {
+        c.challenge = take(c, u16_of(c)?)?
+        c.challenged = true
+    } else if kind == 0xA9 || kind == 0xA4 || kind == 0xA5 {
         take(c, u16_of(c)?)?
     } else if kind == 0x79 {
         take(c, 4)?
@@ -320,20 +373,28 @@ fn token(c: *Conn, x: *Exchange, describe: fn(sql.Column[]), visit: fn(sql.Colum
     }
 }
 
-fn drive(c: *Conn, describe: fn(sql.Column[]), visit: fn(sql.Column[], sql.Value[]) -> bool) -> i64 ! sql.Error {
-    let x = new(Exchange { columns: [], types: [], failure: none, fatal: false, stopped: false, count: 0 })
+fn drive(c: *Conn, receive: fn(sql.Event) -> bool) -> i64 ! sql.Error {
+    let x = new(Exchange { columns: [], types: [], errors: [], failure: none, fatal: false, stopped: false, acknowledged: false, count: 0 })
     next_packet(c)?
     for {
         if c.at < c.payload.len {
-            token(c, x, describe, visit)?
-        } else if !c.last || c.attention {
+            token(c, x, receive)?
+        } else if !c.last {
             next_packet(c)?
-        } else {
+        } else if finished(c) {
             break
+        } else {
+            next_packet(c)?
         }
     }
     if x.fatal {
         abandon(c)
+    }
+    if x.acknowledged && c.session.cancelled {
+        fail Cancelled
+    }
+    if x.errors.len > 0 {
+        fail Server(x.errors)
     }
     match x.failure {
         some(e) => fail e
@@ -343,31 +404,36 @@ fn drive(c: *Conn, describe: fn(sql.Column[]), visit: fn(sql.Column[], sql.Value
 
 fn request(c: *Conn, sql_text: str, values: sql.Value[]) ! sql.Error {
     if values.len == 0 {
-        send_message(c, packet_batch, batch_message(sql_text, c.transaction))?
+        transmit(c, packet_batch, batch_message(sql_text, c.transaction))?
         return
     }
     let message = rpc_message(sql_text, values, c.transaction)?
-    send_message(c, packet_rpc, message)?
+    transmit(c, packet_rpc, message)?
 }
 
 fn query(c: *Conn, sql_text: str, values: sql.Value[]) -> sql.Rows ! sql.Error {
     request(c, sql_text, values)?
-    driver.collect(fn(describe, visit) ! sql.Error { drive(c, describe, visit)? })
+    driver.collect(fn(receive) ! sql.Error { drive(c, receive)? })
 }
 
 fn execute(c: *Conn, sql_text: str, values: sql.Value[]) -> i64 ! sql.Error {
     request(c, sql_text, values)?
-    drive(c, driver.ignore_columns, driver.ignore_row)
+    drive(c, driver.ignore_event)
 }
 
 fn each(c: *Conn, sql_text: str, values: sql.Value[], visit: fn(sql.Column[], sql.Value[]) -> bool) ! sql.Error {
     request(c, sql_text, values)?
-    drive(c, driver.ignore_columns, visit)?
+    drive(c, driver.rows(visit))?
+}
+
+fn stream(c: *Conn, sql_text: str, values: sql.Value[], receive: fn(sql.Event) -> bool) ! sql.Error {
+    request(c, sql_text, values)?
+    drive(c, receive)?
 }
 
 fn transact(c: *Conn, message: u8[]) ! sql.Error {
-    send_message(c, packet_transaction, message)?
-    drive(c, driver.ignore_columns, driver.ignore_row)?
+    transmit(c, packet_transaction, message)?
+    drive(c, driver.ignore_event)?
 }
 
 fn fatal(e: sql.Error) -> bool {
@@ -388,8 +454,10 @@ fn terminate(c: *Conn) {
 
 fn expire(c: *Conn) {
     c.timed_out = true
+    sync.lock(c.guard)
     io.write_all(c.stream, packet(packet_attention, [], true, 1)) or {}
     c.stream.close()
+    sync.unlock(c.guard)
 }
 
 fn watch(c: *Conn) {
@@ -432,8 +500,30 @@ fn secure(c: *Conn, o: sql.Options, config: tls.Config) ! sql.Error {
     c.reader = io.reader(s)
 }
 
-fn establish(c: *Conn, o: sql.Options, config: tls.Config?) ! sql.Error {
-    let offer = match config {
+fn login(c: *Conn, o: sql.Options, integrated: bool) ! sql.Error {
+    if !integrated {
+        send_message(c, packet_login, login_message(o, o.host, false, []))?
+        drive(c, driver.ignore_event)?
+        return
+    }
+    let port = if o.port == 0 { 1433 } else { o.port }
+    let auth = sspi_begin("MSSQLSvc/{o.host}:{port}")?
+    defer sspi_end(auth)
+    let first = sspi_token(auth, [])?
+    send_message(c, packet_login, login_message(o, o.host, true, first))?
+    drive(c, driver.ignore_event)?
+    for !c.logged_in && c.challenged {
+        let answer = sspi_token(auth, c.challenge)?
+        c.challenged = false
+        if answer.len > 0 {
+            send_message(c, packet_sspi, answer)?
+        }
+        drive(c, driver.ignore_event)?
+    }
+}
+
+fn establish(c: *Conn, o: sql.Options, config: Config) ! sql.Error {
+    let offer = match config.tls {
         some(_) => encrypt_on
         none => encrypt_not_supported
     }
@@ -441,7 +531,7 @@ fn establish(c: *Conn, o: sql.Options, config: tls.Config?) ! sql.Error {
     next_packet(c)?
     let answer = prelogin_encryption(rest_of_message(c)?)?
     let encrypted = answer == encrypt_on || answer == encrypt_required
-    match config {
+    match config.tls {
         some(settings) => {
             if !encrypted {
                 fail Unsupported
@@ -454,14 +544,13 @@ fn establish(c: *Conn, o: sql.Options, config: tls.Config?) ! sql.Error {
             }
         }
     }
-    send_message(c, packet_login, login_message(o, o.host))?
-    drive(c, driver.ignore_columns, driver.ignore_row)?
+    login(c, o, config.integrated)?
     if !c.logged_in {
         fail Authentication
     }
 }
 
-fn open(s: io.Stream, o: sql.Options, config: tls.Config?) -> sql.Connection ! sql.Error {
+fn open(s: io.Stream, o: sql.Options, config: Config) -> sql.Connection ! sql.Error {
     let c = new(Conn {
         stream: s
         reader: io.reader(s)
@@ -474,8 +563,12 @@ fn open(s: io.Stream, o: sql.Options, config: tls.Config?) -> sql.Connection ! s
         reading: false
         read_started: 0
         timed_out: false
+        guard: sync.mutex()
+        sent: false
         attention: false
         logged_in: false
+        challenged: false
+        challenge: []
         session: driver.session()
     })
     if c.timeout > 0 {
@@ -488,7 +581,10 @@ fn open(s: io.Stream, o: sql.Options, config: tls.Config?) -> sql.Connection ! s
         dialect: sql.sqlserver()
         query: fn(sql_text, values) -> sql.Rows ! sql.Error { query(c, sql_text, values) }
         each: fn(sql_text, values, visit) ! sql.Error { each(c, sql_text, values, visit)? }
+        stream: fn(sql_text, values, receive) ! sql.Error { stream(c, sql_text, values, receive)? }
         execute: fn(sql_text, values) -> i64 ! sql.Error { execute(c, sql_text, values) }
+        cancel: fn() { interrupt(c) }
+        on_notice: driver.listener(c.session)
         begin: fn() ! sql.Error { transact(c, begin_message(c.transaction))? }
         commit: fn() ! sql.Error { transact(c, end_message(7, c.transaction))? }
         rollback: fn() ! sql.Error { transact(c, end_message(8, c.transaction))? }
@@ -504,9 +600,19 @@ fn dial(o: sql.Options) -> net.Conn ! sql.Error {
     conn
 }
 
+/// How `connect_with` reaches the server and logs in.
+pub struct Config {
+    /// The TLS settings. When set the connection negotiates TLS during the pre-login exchange; an empty `server_name` is replaced with the host of `sql.Options.host` without its instance name. When absent the connection stays plain.
+    pub tls: tls.Config? = none
+    /// Whether to log in with Windows integrated authentication, which sends the current Windows identity through SSPI with the `Negotiate` package and ignores `sql.Options.user` and `sql.Options.password`. Available on Windows only; elsewhere the login fails with `sql.Error.Unsupported`. The service name is `MSSQLSvc/<host>:<port>`.
+    pub integrated: bool = false
+}
+
 /// Connects to a SQL Server over plain TCP, using `o.host` and `o.port` (`1433` by default), and logs in as `o.user` to `o.database`.
 ///
-/// Returns `sql.Error.Connect` when the connection cannot be made, `sql.Error.Timeout` when it exceeds `o.timeout`, `sql.Error.Authentication` when the login fails and `sql.Error.Unsupported` when the server requires encryption, which needs `connect_tls`. Dropping the returned `sql.Connection` closes the socket.
+/// `o.host` may name an instance, as in `db.internal\SQLEXPRESS`. When it does and `o.port` is `0`, the driver asks the SQL Server Browser service on UDP port `1434` of the host for the instance's TCP port, within `o.timeout`. When `o.port` is set it is used and the browser is not asked. `.` and `(local)` name `localhost`.
+///
+/// Returns `sql.Error.Connect` when the connection cannot be made or the browser knows no TCP port for the instance, `sql.Error.Timeout` when connecting or the browser exceeds `o.timeout`, `sql.Error.Authentication` when the login fails and `sql.Error.Unsupported` when the server requires encryption, which needs `connect_tls`. Dropping the returned `sql.Connection` closes the socket.
 ///
 /// ```low
 /// import std/sql
@@ -515,23 +621,29 @@ fn dial(o: sql.Options) -> net.Conn ! sql.Error {
 /// let rows = c.handle.query("SELECT name FROM users WHERE age >= @p1", [Int(18)]) or return
 /// ```
 pub fn connect(o: sql.Options) -> sql.Connection ! sql.Error {
-    using var conn = dial(o)?
-    let handle = net.detach(mut conn)
-    open(net.stream_on(handle), o, none)
+    connect_with(o, Config {})
 }
 
 /// Connects over a stream that is already connected, without TLS, and logs in as `connect` does.
 ///
-/// Fails like `connect` after the dial.
+/// An instance name in `o.host` is dropped and not looked up. Fails like `connect` after the dial.
 pub fn connect_stream(s: io.Stream, o: sql.Options) -> sql.Connection ! sql.Error {
-    open(s, o, none)
+    open(s, named(o), Config {})
 }
 
 /// Connects to a SQL Server and negotiates TLS during the TDS pre-login exchange using `config`, then logs in.
 ///
 /// Returns `sql.Error.Unsupported` when the server does not offer encryption. Otherwise fails like `connect`.
 pub fn connect_tls(o: sql.Options, config: tls.Config) -> sql.Connection ! sql.Error {
-    using var conn = dial(o)?
+    connect_with(o, Config { tls: config })
+}
+
+/// Connects like `connect`, with the TLS settings and the login method that `config` asks for.
+///
+/// Fails like `connect`, and with `sql.Error.Unsupported` when `config.integrated` is set on a target other than Windows.
+pub fn connect_with(o: sql.Options, config: Config) -> sql.Connection ! sql.Error {
+    let target = located(o)?
+    using var conn = dial(target)?
     let handle = net.detach(mut conn)
-    open(net.stream_on(handle), o, config)
+    open(net.stream_on(handle), target, config)
 }
