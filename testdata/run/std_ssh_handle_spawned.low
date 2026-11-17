@@ -1,0 +1,101 @@
+import std/crypto
+import std/crypto/x509
+import std/io
+import std/net
+import std/ssh
+import std/ssh/key
+
+const clients = 6
+
+fn echo_connection(h: net.ConnHandle) {
+    using c = net.adopt(h)
+    let buf = io.buffer(4096)
+    for {
+        let n = net.read_on(h, buf) catch {
+            e => return
+        }
+        if n == 0 {
+            return
+        }
+        net.write_all_on(h, buf[..n]) catch {
+            e => return
+        }
+    }
+}
+
+fn echo_loop(listener: net.ListenerHandle) {
+    for {
+        let h = net.accept_handle(listener) catch {
+            e => return
+        }
+        spawn echo_connection(h)
+    }
+}
+
+fn handle_channel(inc: ssh.Incoming) {
+    if inc.kind == "direct-tcpip" {
+        ssh.serve_direct_tcpip(inc)
+        return
+    }
+    ssh.reject(inc, ssh.open_unknown_channel_type, "only direct-tcpip")
+}
+
+fn server_config() -> ssh.ServerConfig {
+    let host = key.signer(x509.PrivateKey.Ed25519(crypto.random(32))) or panic("host key")
+    let auth = ssh.ServerAuth { methods: ["password"], password: fn(user, password) { user == "alice" && password == "secret" } }
+    ssh.ServerConfig { host_keys: [host], auth, channels: handle_channel }
+}
+
+fn round_trip(c: *ssh.ConnectionHandle, port: i64, index: i64) -> str {
+    let message = bytes("client {index} through the shared connection")
+    using ch = ssh.direct_tcpip_on(c, "127.0.0.1", port, "127.0.0.1", 50000 + index) catch {
+        e => return "open failed"
+    }
+    ssh.write_on(ch.handle, message) catch {
+        e => return "write failed"
+    }
+    var got: u8[] = []
+    let buf = io.buffer(256)
+    for got.len < message.len {
+        let n = ssh.read_on(ch.handle, buf) catch {
+            e => return "read failed"
+        }
+        if n == 0 {
+            break
+        }
+        io.append(mut got, buf[..n])
+    }
+    str(got)
+}
+
+fn serve_client(c: *ssh.ConnectionHandle, port: i64, index: i64, out: chan[str]) {
+    ssh.keepalive_on(c) or {
+        out <- "keepalive failed"
+        return
+    }
+    out <- round_trip(c, port, index)
+}
+
+fn main() {
+    using echo = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn echo_loop(echo.handle)
+    using listener = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn ssh.serve_on(listener.handle, server_config())
+    let config = ssh.ClientConfig { user: "alice", verify_host_key: ssh.accept_any_host_key(), auth: [ssh.AuthMethod.Password("secret")] }
+    using conn = ssh.dial("127.0.0.1", listener.handle.addr.port, config) or panic("dial")
+    var queues: chan[str][] = []
+    for index in 0..clients {
+        let out = chan[str](1)
+        queues.push(out)
+        spawn serve_client(conn.handle, echo.handle.addr.port, index, out)
+    }
+    for index in 0..clients {
+        let line = (<-queues[index]) ?? "no result"
+        print(line)
+    }
+    let handle = conn.handle
+    ssh.disconnect_on(handle)
+    ssh.keepalive_on(handle) catch {
+        e => print("keepalive after disconnect fails")
+    }
+}

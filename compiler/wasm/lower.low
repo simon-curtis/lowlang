@@ -35,6 +35,12 @@ struct Lowering {
     poll_roots: [i64: []i64] = [:]
     root_offsets: []i64 = []
     saved_params: []i64 = []
+    boxed_params: bool = false
+    boxed_results: bool = false
+    wasm_params: i64 = 0
+    param_base: i64 = 0
+    out_offset: i64 = 0
+    out_bytes: i64 = 0
 }
 
 fn lower(g: *Generator, f: *ir.Func) -> Body ! Error {
@@ -53,9 +59,10 @@ fn lower(g: *Generator, f: *ir.Func) -> Body ! Error {
     }
     let l = new(Lowering { g, f, c: new_code(), dom, locals })
     l.polls = g.threads && !text.starts_with(f.name, ir.runtime_prefix)
+    l.plan_abi()
     l.index_results()
     l.shape()?
-    l.extra = words(color_values(l))
+    l.extra = words(l.copied_param_words() + color_values(l))
     l.prologue()
     l.tasks.push(Task.Tree(0))
     for l.tasks.len > 0 {
@@ -64,8 +71,66 @@ fn lower(g: *Generator, f: *ir.Func) -> Body ! Error {
         l.run(task)?
     }
     l.c.op(op_unreachable)
-    let type = signature(g.m, words(f.param_words), words(ir.result_words(f)))
+    let type = function_type(g.m, f.param_words, ir.result_words(f))
     Body { type, locals: l.extra, code: l.c.finish() }
+}
+
+fn plan_abi(l: *Lowering) {
+    var lead = 0
+    l.boxed_results = is_wide(ir.result_words(l.f))
+    if l.boxed_results {
+        lead = 1
+    }
+    l.boxed_params = is_wide(l.f.param_words)
+    if l.boxed_params {
+        l.wasm_params = lead + 1
+        l.param_base = lead + 1
+    } else {
+        l.wasm_params = lead + l.f.param_words
+        l.param_base = lead
+    }
+    for b in l.f.blocks {
+        for v in b.values {
+            if v.op != OpCall {
+                continue
+            }
+            l.out_bytes = max_of(l.out_bytes, 8 * passed_words(v))
+        }
+    }
+}
+
+fn max_of(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    b
+}
+
+fn copied_param_words(l: *Lowering) -> i64 {
+    if l.boxed_params {
+        return l.f.param_words
+    }
+    0
+}
+
+fn first_local(l: *Lowering) -> i64 {
+    l.param_base + l.f.param_words
+}
+
+fn passed_words(call: *ir.Value) -> i64 {
+    let sig = ir.call_signature(call)
+    var count = 0
+    if is_wide(ir.result_words(sig)) {
+        count = ir.result_words(sig)
+    }
+    var params = call.args.len
+    if ir.is_indirect(call) {
+        params -= 1
+    }
+    if is_wide(params) && params > count {
+        count = params
+    }
+    count
 }
 
 fn index_results(l: *Lowering) {
@@ -140,14 +205,14 @@ fn descending(list: []i64) -> []i64 {
 }
 
 fn new_local(l: *Lowering) -> i64 {
-    let index = l.f.param_words + l.extra.len
+    let index = l.wasm_params + l.extra.len
     l.extra.push(i64_type)
     index
 }
 
 fn local_of(l: *Lowering, v: *ir.Value) -> i64 {
     if v.op == OpParam {
-        return v.aux
+        return l.param_base + v.aux
     }
     let held = l.locals[v.id]
     if held >= 0 {
@@ -173,12 +238,33 @@ fn scratch_local(l: *Lowering) -> i64 {
     l.scratch
 }
 
+fn load_params(l: *Lowering) {
+    var seen: [i64: bool] = [:]
+    for b in l.f.blocks {
+        for v in b.values {
+            if v.op != OpParam || seen[v.aux] != none {
+                continue
+            }
+            seen[v.aux] = true
+            l.c.local_get(l.wasm_params - 1)
+            l.c.address()
+            l.c.memory(op_i64_load, 8 * v.aux)
+            l.set(v)
+        }
+    }
+}
+
 fn prologue(l: *Lowering) {
+    if l.boxed_params {
+        l.load_params()
+    }
     var offset = 0
     for words_in_slot in l.f.slots {
         l.slot_offsets.push(offset)
         offset += 8 * words_in_slot
     }
+    l.out_offset = offset
+    offset += l.out_bytes
     if l.roots.len > 0 || l.poll_roots.len > 0 {
         offset = l.place_roots(offset)
     }
@@ -211,15 +297,16 @@ fn prologue(l: *Lowering) {
 
 fn place_roots(l: *Lowering, start: i64) -> i64 {
     var offset = start
-    for _ in 0..l.f.param_words + l.extra.len {
+    for _ in 0..l.wasm_params + l.extra.len {
         l.root_offsets.push(-1)
     }
     for node, b in l.dom.nodes {
         for v in b.values {
-            if v.op == OpParam && !v.scalar && l.root_offsets[v.aux] < 0 {
-                l.root_offsets[v.aux] = offset
+            if v.op == OpParam && !v.scalar && l.root_offsets[l.local_of(v)] < 0 {
+                let local = l.local_of(v)
+                l.root_offsets[local] = offset
                 offset += 8
-                l.saved_params.push(v.aux)
+                l.saved_params.push(local)
             }
             for local in l.roots[v.id] ?? [] {
                 offset = l.place_root(local, offset)
@@ -351,15 +438,26 @@ fn body(l: *Lowering, node: i64) ! Error {
             l.push_tasks([Task.Open(op_if, -1), Task.Branch(node, then), Task.Else, Task.Branch(node, otherwise), Task.Close])
         }
         Switch => l.switch(node, b)
-        Ret => {
-            for r in b.results {
-                l.get(r)
-            }
-            l.epilogue()
-            l.c.op(op_return)
-        }
+        Ret => l.return_results(b)
         Unreachable => l.c.op(op_unreachable)
     }
+}
+
+fn return_results(l: *Lowering, b: *ir.Block) {
+    if l.boxed_results {
+        for i, r in b.results {
+            l.c.local_get(0)
+            l.c.address()
+            l.get(r)
+            l.c.memory(op_i64_store, 8 * i)
+        }
+    } else {
+        for r in b.results {
+            l.get(r)
+        }
+    }
+    l.epilogue()
+    l.c.op(op_return)
 }
 
 fn poll(l: *Lowering, node: i64) {

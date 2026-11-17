@@ -3,6 +3,9 @@
 	.zero 24
 
 	.section .rodata
+	MSG_BEGIN rt_msg_stack_guard
+	.ascii "stack guard page: out of memory"
+	MSG_END
 rt_sysmon_sleep:
 	.quad 0
 	.quad 10000000
@@ -320,8 +323,13 @@ rt_os_stack:
 	xor edx, edx
 	mov eax, 10
 	syscall
+	test rax, rax
+	jnz 1f
 	pop rax
 	ret
+1:
+	lea rdi, [rip+rt_msg_stack_guard]
+	jmp rt_panic
 
 .if RT_DYNAMIC
 .else
