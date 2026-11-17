@@ -1,0 +1,288 @@
+import std/slices
+import std/ui/platform
+
+const chord_timeout_ms = 1000
+
+/// Returns `e` adding the key context `context` to key dispatch, as gpui's `key_context` does (`elements/div.rs:658`). The context is identifiers and `key = value` pairs separated by spaces, such as `"Editor mode = full"`; a binding's predicate is tested against the contexts of the focused element and the elements around it. Panics when `context` cannot be read, which `key_binding` reports as an error.
+pub fn key_context(e: Element, context: str) -> Element {
+    let parsed = parse_key_context(context) catch {
+        err => panic("key_context: cannot read {context}")
+    }
+    var out = e
+    out.key_context = parsed
+    out
+}
+
+/// Returns `e` running `f` when the action `name` is dispatched while it or an element inside it is focused, as gpui's `on_action` does (`elements/div.rs:854`). Handlers run from the focused element outward and the first stops the action, unless it calls `propagate`.
+pub fn on_action(e: Element, name: str, f: fn()) -> Element {
+    listen(e, Action(name, f))
+}
+
+/// Returns `e` running `f` when the action `name` is dispatched while it or an element inside it is focused, before any `on_action` handler, as gpui's `capture_action` does (`elements/div.rs:842`). Capture handlers run from the outermost element inward and let the action continue unless one calls `stop_propagation`.
+pub fn capture_action(e: Element, name: str, f: fn()) -> Element {
+    listen(e, CaptureAction(name, f))
+}
+
+/// Lets the action being dispatched continue to the handlers of elements further out, as gpui's `propagate` does (`app.rs:1720`). An `on_action` handler stops the action unless it calls this.
+pub fn propagate(cx: Context) {
+    cx.state.stopped = false
+}
+
+/// Adds `bindings` to the context's keymap, as gpui's `bind_keys` does (`app.rs:1677`). Where two bindings match the same keystrokes, the one whose predicate matches deeper in the focused element's contexts wins, then the one added later.
+pub fn bind_keys(cx: Context, bindings: KeyBinding[]) {
+    for b in bindings {
+        cx.state.keymap.push(b)
+    }
+}
+
+/// Removes every binding from the context's keymap, as gpui's `clear_key_bindings` does.
+pub fn clear_key_bindings(cx: Context) {
+    cx.state.keymap = []
+    drop_pending_keys(cx.state)
+}
+
+/// Dispatches the action `name` to the focused element and the elements around it, or to the root when none is focused, as gpui's `Window::dispatch_action` does. Returns whether a handler stopped it.
+pub fn dispatch_action(cx: Context, name: str) -> bool {
+    let path = dispatch_path(cx.state, cx.state.focus)
+    run_action(cx.state, path, name)
+}
+
+/// Returns whether an element on the focused element's dispatch path handles the action `name`, as gpui's `is_action_available` does. A menu greys out the items whose action this returns `false` for.
+pub fn is_action_available(cx: Context, name: str) -> bool {
+    let path = dispatch_path(cx.state, cx.state.focus)
+    for at in path {
+        if handles(cx.state.hitboxes[at].element, name) {
+            return true
+        }
+    }
+    false
+}
+
+/// Returns the names of the actions the elements on the focused element's dispatch path handle, sorted, as gpui's `available_actions` does.
+pub fn available_actions(cx: Context) -> str[] {
+    var names: str[] = []
+    let path = dispatch_path(cx.state, cx.state.focus)
+    for at in path {
+        for l in cx.state.hitboxes[at].element.listeners {
+            let name = action_name(l)
+            if name != "" && !listed(names, name) {
+                names.push(name)
+            }
+        }
+    }
+    slices.sort(mut names)
+    names
+}
+
+/// Returns the bindings that dispatch `name` from the focused element, in the order they were added, leaving out those a later or deeper binding of the same keystrokes takes over, as gpui's `bindings_for_action` does. The last is the one to show.
+pub fn bindings_for_action(cx: Context, name: str) -> KeyBinding[] {
+    bindings_for_action_in(cx, name, cx.state.focus)
+}
+
+/// Returns the bindings that would dispatch `name` if the element whose key is `key` were focused, as gpui's `bindings_for_action_in` does, so a menu can show the shortcuts of the element focused before it opened.
+pub fn bindings_for_action_in(cx: Context, name: str, key: str) -> KeyBinding[] {
+    let path = dispatch_path(cx.state, key)
+    let contexts = context_stack(cx.state, path)
+    bindings_for(cx.state.keymap, name, contexts)
+}
+
+/// Returns the keystrokes of the binding to show for `name` from the focused element, such as `"ctrl-k ctrl-o"`, or `name` when no binding dispatches it, as gpui's `keystroke_text_for` does.
+pub fn keystroke_text_for(cx: Context, name: str) -> str {
+    let found = bindings_for_action(cx, name)
+    if found.len == 0 {
+        return name
+    }
+    binding_text(found[found.len - 1])
+}
+
+/// Returns the keystrokes typed so far of a chord that is waiting for its next keystroke, as gpui's `pending_input_keystrokes` does, or none. A chord waits one second for its next keystroke.
+pub fn pending_keystrokes(cx: Context) -> Keystroke[] {
+    var out: Keystroke[] = []
+    for k in cx.state.pending_keys {
+        out.push(typed_stroke(k))
+    }
+    out
+}
+
+fn listed(names: str[], name: str) -> bool {
+    for n in names {
+        if n == name {
+            return true
+        }
+    }
+    false
+}
+
+fn action_name(l: Listener) -> str {
+    match l {
+        Action(name, f) => name
+        CaptureAction(name, f) => name
+        _ => ""
+    }
+}
+
+fn handles(e: Element, name: str) -> bool {
+    for l in e.listeners {
+        if action_name(l) == name {
+            return true
+        }
+    }
+    false
+}
+
+fn dispatch_path(st: *State, key: str) -> i64[] {
+    var at = find(st, key)
+    if at < 0 {
+        at = st.root_hitbox
+    }
+    var reversed: i64[] = []
+    for at >= 0 {
+        reversed.push(at)
+        at = st.hitboxes[at].parent
+    }
+    var path: i64[] = []
+    var i = reversed.len - 1
+    for i >= 0 {
+        path.push(reversed[i])
+        i -= 1
+    }
+    path
+}
+
+fn context_stack(st: *State, path: i64[]) -> KeyContext[] {
+    var out: KeyContext[] = []
+    for at in path {
+        match st.hitboxes[at].element.key_context {
+            some(c) => out.push(c)
+            none => {}
+        }
+    }
+    out
+}
+
+fn run_action(st: *State, path: i64[], name: str) -> bool {
+    for at in path {
+        for l in st.hitboxes[at].element.listeners {
+            match l {
+                CaptureAction(n, f) => {
+                    if n == name {
+                        st.stopped = false
+                        f()
+                        if st.stopped {
+                            return true
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    var i = path.len - 1
+    for i >= 0 {
+        for l in st.hitboxes[path[i]].element.listeners {
+            match l {
+                Action(n, f) => {
+                    if n == name {
+                        st.stopped = true
+                        f()
+                        if st.stopped {
+                            return true
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        i -= 1
+    }
+    false
+}
+
+fn run_bindings(st: *State, path: i64[], bindings: KeyBinding[]) -> bool {
+    for b in bindings {
+        if run_action(st, path, b.action) {
+            return true
+        }
+    }
+    false
+}
+
+fn drop_pending_keys(st: *State) {
+    if st.pending_keys.len > 0 {
+        st.pending_keys = []
+        st.dirty = true
+    }
+    if st.pending_timer != 0 {
+        cancel_timer(st, st.pending_timer)
+        st.pending_timer = 0
+    }
+}
+
+fn press_key(st: *State, k: platform.KeyEvent) {
+    let path = dispatch_path(st, st.focus)
+    let contexts = context_stack(st, path)
+    var input: platform.KeyEvent[] = []
+    if st.pending_focus == st.focus {
+        input = st.pending_keys[0..]
+    }
+    drop_pending_keys(st)
+    input.push(k)
+    for {
+        let found = bindings_for_input(st.keymap, input, contexts)
+        if found.pending {
+            hold_keys(st, input)
+            return
+        }
+        if found.bindings.len > 0 {
+            if !run_bindings(st, path, found.bindings) {
+                deliver_key(st, k)
+            }
+            return
+        }
+        if input.len == 1 {
+            deliver_key(st, k)
+            return
+        }
+        let earlier = input[0..input.len - 1]
+        var rest = replay_prefix(st, path, contexts, earlier)
+        rest.push(k)
+        input = rest
+    }
+}
+
+fn hold_keys(st: *State, input: platform.KeyEvent[]) {
+    st.pending_keys = input
+    st.pending_focus = st.focus
+    st.pending_timer = schedule(st, chord_timeout_ms, fn() { flush_pending_keys(st) })
+    st.dirty = true
+}
+
+fn flush_pending_keys(st: *State) {
+    st.pending_timer = 0
+    var input = st.pending_keys
+    st.pending_keys = []
+    if st.pending_focus != st.focus {
+        return
+    }
+    let path = dispatch_path(st, st.focus)
+    let contexts = context_stack(st, path)
+    for input.len > 0 {
+        input = replay_prefix(st, path, contexts, input)
+    }
+}
+
+fn replay_prefix(st: *State, path: i64[], contexts: KeyContext[], input: platform.KeyEvent[]) -> platform.KeyEvent[] {
+    var last = input.len - 1
+    for last >= 0 {
+        let found = bindings_for_input(st.keymap, input[0..last + 1], contexts)
+        if found.bindings.len > 0 {
+            if !run_bindings(st, path, found.bindings) {
+                deliver_key(st, input[last])
+            }
+            return input[last + 1..]
+        }
+        last -= 1
+    }
+    deliver_key(st, input[0])
+    input[1..]
+}

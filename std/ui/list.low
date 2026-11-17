@@ -1,0 +1,713 @@
+import std/ui/geometry
+import std/ui/layout
+import std/ui/scene
+
+/// Where `scroll_to_item` puts the item it scrolls to, as gpui's `ScrollStrategy` does (`uniform_list.rs:84-95`).
+pub enum ScrollStrategy {
+    /// The item's top edge is at the top of the list.
+    Top
+    /// The item is in the middle of the list, or as near as the ends of the content allow.
+    Center
+    /// The item's bottom edge is at the bottom of the list, or as near as the ends of the content allow.
+    Bottom
+}
+
+/// A half-open range of item indices: `start` is the first item and `end` is one past the last.
+pub struct ItemRange {
+    /// The first index in the range.
+    pub start: i64 = 0
+    /// One past the last index in the range.
+    pub end: i64 = 0
+}
+
+struct PendingScroll {
+    index: i64
+    strategy: ScrollStrategy
+    skip: i64
+    strict: bool
+}
+
+struct UniformScroll {
+    owner: *State
+    pending: PendingScroll? = none
+    item_height: f32 = 0.0
+    viewport_height: f32 = 0.0
+    content_height: f32 = 0.0
+    offset: f32 = 0.0
+    range: ItemRange = ItemRange {}
+}
+
+/// A handle on the scroll position of a `uniform_list`, as gpui's `UniformListScrollHandle` is.
+///
+/// Copies of a handle share its state. Make one with `uniform_list_scroll_handle`, keep it with the application's state and pass it to each frame's list with `track_scroll`.
+pub struct UniformListScrollHandle {
+    state: *UniformScroll
+}
+
+enum Rows {
+    Uniform(count: i64, render: fn(i64, i64) -> Element[], handle: UniformListScrollHandle?)
+    Variable(state: ListState, render: fn(i64) -> Element)
+}
+
+struct VirtualRow {
+    tree: layout.Tree
+    laid: Laid
+    walk: Walk
+}
+
+struct RowLayout {
+    index: i64
+    tree: layout.Tree
+    laid: Laid
+    height: f32
+}
+
+fn is_virtual(e: Element) -> bool {
+    match e.kind {
+        Virtual => true
+        _ => false
+    }
+}
+
+fn bigger64(a: f64, b: f64) -> f64 {
+    if a > b { a } else { b }
+}
+
+fn lesser64(a: f64, b: f64) -> f64 {
+    if a < b { a } else { b }
+}
+
+fn limit64(v: f64, hi: f64) -> f64 {
+    bigger64(lesser64(bigger64(v, 0.0), hi), 0.0)
+}
+
+fn lesser_count(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+fn lay_out_row(st: *State, e: Element, width: f32, height: f32, text: TextStyle, scale: f32) -> RowLayout {
+    var rt = layout.tree(scale)
+    let laid = build(st, mut rt, e, text)
+    layout.compute(mut rt, laid.node, geometry.size(width, height))
+    let r = layout.rect(rt, laid.node)
+    RowLayout { index: 0, tree: rt, laid, height: f32(bigger64(f64(r.y + r.height), 0.0)) }
+}
+
+fn prepaint_row(st: *State, row: RowLayout, key: str, w: Walk) -> VirtualRow {
+    prepaint(st, row.tree, row.laid, "{key}/{row.index}", w)
+    VirtualRow { tree: row.tree, laid: row.laid, walk: w }
+}
+
+fn prepaint_virtual(st: *State, t: layout.Tree, laid: Laid, key: str, rect: geometry.Rect, w: Walk) {
+    let e = laid.element
+    let own = inherit(w.text, e.visual)
+    let content = geometry.offset(layout.content(t, laid.node), w.shift.x, w.shift.y)
+    let clip = geometry.intersect(w.clip, content)
+    let rows = e.rows ?? return
+    match rows {
+        Uniform(count, render, handle) => prepaint_uniform(st, laid, key, rect, content, clip, own, w, count, render, handle)
+        Variable(state, render) => prepaint_variable(st, laid, key, rect, content, clip, own, w, state, render)
+    }
+}
+
+fn paint_rows(st: *State, mut sc: scene.Scene, list_at: i64, content: geometry.Rect, text: TextStyle, scale: f32) {
+    let rows = st.virtuals[list_at] ?? []
+    scene.push_clip(mut sc, geometry.cover(content, scale))
+    for r in rows {
+        paint(st, r.tree, mut sc, r.laid, r.walk, text, scale)
+    }
+    scene.pop_clip(mut sc)
+}
+
+/// Returns a list of `count` items of one height that renders only the items in view.
+///
+/// `render` takes the first index and one past the last index of a range of items and returns one element for each, in order. A frame asks for item 0 alone, which is laid out as wide as the list's content box and gives the height of every item, as gpui's `measure_item` does (`uniform_list.rs:650-672`), and then for the range of items the list's content box shows. Each item is laid out as its own root, as wide as the content box and as high as an item, and is clipped to the list, hit tested and painted like any child. An item without an `id` has the key `"<key of the list>/<index>"`, so its hover, press and focus state stay with it as it scrolls.
+///
+/// The list is an element that scrolls up and down like `overflow_y_scroll`: its offset is kept under `id` in the context, so `scroll_offset` and `scroll_to` move it, and its scroll range is `count` item heights less the height of the content box. It has no size of its own, so give it one with `height`, `flex_1` or the like. `id` is the list's key.
+pub fn uniform_list(id: str, count: i64, render: fn(i64, i64) -> Element[]) -> Element {
+    var out = Element { kind: Virtual, id }
+    out.style.overflow_y = Scroll
+    out.rows = Rows.Uniform(count, render, none)
+    out
+}
+
+/// Returns a handle for `uniform_list`s of `cx`, whose scroll position `scroll_to_item` moves.
+pub fn uniform_list_scroll_handle(cx: Context) -> UniformListScrollHandle {
+    UniformListScrollHandle { state: new(UniformScroll { owner: cx.state }) }
+}
+
+/// Returns `e`, a `uniform_list`, reporting its scroll position to `h` and taking `h`'s scroll requests, as gpui's `UniformList::track_scroll` does (`uniform_list.rs:675`).
+pub fn track_scroll(e: Element, h: UniformListScrollHandle) -> Element {
+    var out = e
+    let rows = e.rows ?? return out
+    match rows {
+        Uniform(count, render, _) => {
+            out.rows = Rows.Uniform(count, render, h)
+        }
+        Variable(_, _) => {}
+    }
+    out
+}
+
+fn request_scroll(h: UniformListScrollHandle, index: i64, strategy: ScrollStrategy, skip: i64, strict: bool) {
+    h.state.pending = PendingScroll { index, strategy, skip, strict }
+    h.state.owner.dirty = true
+}
+
+/// Scrolls the list `h` tracks at the next frame so that item `index` is in view, placed by `strategy` unless it is fully in view already, as gpui's `scroll_to_item` does (`uniform_list.rs:146`).
+pub fn scroll_to_item(h: UniformListScrollHandle, index: i64, strategy: ScrollStrategy) {
+    request_scroll(h, index, strategy, 0, false)
+}
+
+/// Scrolls the list `h` tracks at the next frame so that item `index` is at the place `strategy` names, even when it is in view already, as gpui's `scroll_to_item_strict` does (`uniform_list.rs:159`).
+pub fn scroll_to_item_strict(h: UniformListScrollHandle, index: i64, strategy: ScrollStrategy) {
+    request_scroll(h, index, strategy, 0, true)
+}
+
+/// As `scroll_to_item`, with the viewport shortened by `skip` items from the edge `strategy` measures from: the top for `Top` and `Center`, the bottom for `Bottom` (`uniform_list.rs:178`).
+pub fn scroll_to_item_with_offset(h: UniformListScrollHandle, index: i64, strategy: ScrollStrategy, skip: i64) {
+    request_scroll(h, index, strategy, skip, false)
+}
+
+/// As `scroll_to_item_strict`, with the viewport shortened by `skip` items as `scroll_to_item_with_offset` does (`uniform_list.rs:197`).
+pub fn scroll_to_item_strict_with_offset(h: UniformListScrollHandle, index: i64, strategy: ScrollStrategy, skip: i64) {
+    request_scroll(h, index, strategy, skip, true)
+}
+
+/// Returns the index of the item at the top of the list `h` tracks: the item of a pending `scroll_to_item`, else the item at the offset of the last frame (`uniform_list.rs:218`).
+pub fn logical_scroll_top_index(h: UniformListScrollHandle) -> i64 {
+    let s = h.state
+    match s.pending {
+        some(p) => return p.index
+        none => {}
+    }
+    if s.item_height <= 0.0 {
+        return 0
+    }
+    i64(floor(f64(s.offset) / f64(s.item_height)))
+}
+
+/// Returns `true` when the list `h` tracks had more items than fit in its content box at the last frame (`uniform_list.rs:227`).
+pub fn is_scrollable(h: UniformListScrollHandle) -> bool {
+    h.state.content_height > h.state.viewport_height
+}
+
+/// Returns the range of items the list `h` tracks asked `render` for at the last frame.
+pub fn visible_range(h: UniformListScrollHandle) -> ItemRange {
+    h.state.range
+}
+
+/// Returns the height of one item of the list `h` tracks at the last frame, in logical pixels.
+pub fn item_height(h: UniformListScrollHandle) -> f32 {
+    h.state.item_height
+}
+
+fn measure_uniform(st: *State, render: fn(i64, i64) -> Element[], count: i64, width: f32, text: TextStyle, scale: f32) -> f32 {
+    if count <= 0 {
+        return 0.0
+    }
+    let items = render(0, 1)
+    if items.len == 0 {
+        return 0.0
+    }
+    let row = lay_out_row(st, items[0], width, layout.unbounded, text, scale)
+    row.height
+}
+
+fn pending_offset(p: PendingScroll, current: f64, item_height: f64, viewport: f64, total: f64) -> f64 {
+    let top = f64(p.index) * item_height
+    let bottom = top + item_height
+    let skip = f64(p.skip) * item_height
+    let above = top < current + skip
+    let below = bottom > current + viewport
+    if !p.strict && !above && !below {
+        return current
+    }
+    let far = total - viewport
+    match p.strategy {
+        Top => limit64(top - skip, far)
+        Center => {
+            let viewport_center = skip + (viewport - skip) / 2.0
+            limit64(top + item_height / 2.0 - viewport_center, far)
+        }
+        Bottom => limit64(bottom - viewport + skip, far)
+    }
+}
+
+fn prepaint_uniform(st: *State, laid: Laid, key: str, rect: geometry.Rect, content: geometry.Rect, clip: geometry.Rect, own: TextStyle, w: Walk, count: i64, render: fn(i64, i64) -> Element[], handle: UniformListScrollHandle?) {
+    let e = laid.element
+    let item = measure_uniform(st, render, count, content.width, own, w.scale)
+    let item_height = f64(item)
+    let viewport = f64(content.height)
+    let total = f64(count) * item_height
+    let max_y = bigger64(total - viewport, 0.0)
+    let range = geometry.point(0.0, f32(max_y))
+    var offset = st.scroll[key] ?? geometry.Point {}
+    match handle {
+        some(h) => {
+            match h.state.pending {
+                some(p) => {
+                    if count > 0 {
+                        let current = limit64(f64(offset.y), max_y)
+                        let wanted = f32(pending_offset(p, current, item_height, viewport, total))
+                        st.scroll[key] = geometry.point(0.0, wanted)
+                    }
+                }
+                none => {}
+            }
+            h.state.pending = none
+        }
+        none => {}
+    }
+    if count > 0 {
+        offset = settled_offset(st, key, e.style, range)
+    }
+    st.hitboxes.push(Hitbox { bounds: geometry.intersect(rect, w.clip), key, parent: w.parent, element: e, offset, scroll_max: range, rect })
+    let parent = st.hitboxes.len - 1
+    var first = 0
+    var last = 0
+    if count > 0 && item_height > 0.0 {
+        first = i64(floor(f64(offset.y) / item_height))
+        last = lesser_count(i64(-floor(-(f64(offset.y) + viewport) / item_height)), count)
+    }
+    match handle {
+        some(h) => {
+            h.state.item_height = item
+            h.state.viewport_height = content.height
+            h.state.content_height = f32(total)
+            h.state.offset = offset.y
+            h.state.range = ItemRange { start: first, end: last }
+        }
+        none => {}
+    }
+    var placed: VirtualRow[] = []
+    if last > first {
+        let items = render(first, last)
+        let shown = lesser_count(items.len, last - first)
+        for k in 0..shown {
+            let ix = first + k
+            let top = f32(f64(content.y) + f64(ix) * item_height - f64(offset.y))
+            let at = Walk { parent, clip, shift: geometry.point(content.x, top), text: own, scale: w.scale }
+            var row = lay_out_row(st, items[k], content.width, item, own, w.scale)
+            row.index = ix
+            placed.push(prepaint_row(st, row, key, at))
+        }
+    }
+    st.virtuals[parent] = placed
+}
+
+/// Whether a `list` starts at its first item or rests on its last.
+pub enum ListAlignment {
+    /// The list starts at its first item and scrolls from top to bottom, like most lists.
+    Top
+    /// The list rests on its last item and scrolls from bottom to top, like a chat log; a list shorter than its viewport sits at the bottom of it.
+    Bottom
+}
+
+/// A place in a `list`: an item and how many logical pixels of it are above the top edge of the viewport.
+pub struct ListOffset {
+    /// The index of the item.
+    pub item_ix: i64 = 0
+    /// How far below the item's top the viewport's top edge is, in logical pixels.
+    pub offset_in_item: f32 = 0.0
+}
+
+struct ListInner {
+    owner: *State
+    heights: f32[]
+    sums: f64[]
+    top: ListOffset? = none
+    resolved: ListOffset = ListOffset {}
+    alignment: ListAlignment
+    overdraw: f32
+    dropping: bool = false
+    width: f32 = -1.0
+    height: f32 = 0.0
+    bounds: geometry.Rect = geometry.Rect {}
+}
+
+/// The state of a `list`, which the application keeps and passes to every frame's `list`, as gpui's `ListState` is.
+///
+/// It holds the item count, the height of each item that has been laid out, and the scroll position as an item and an offset into it, so the position stays on its item when the heights of items above it change. A state is a handle: copies share it. The heights of items that have not been laid out count as zero. Make one with `list_state`.
+pub struct ListState {
+    inner: *ListInner
+}
+
+struct ItemAt {
+    index: i64
+    rest: f64
+}
+
+struct Arranged {
+    rows: RowLayout[]
+    top: ListOffset
+}
+
+fn lowbit(i: i64) -> i64 {
+    i & -i
+}
+
+fn unmeasured_heights(n: i64) -> f32[] {
+    var out: f32[] = []
+    for _ in 0..n {
+        out.push(-1.0)
+    }
+    out
+}
+
+fn rebuild_sums(l: *ListInner) {
+    let n = l.heights.len
+    var sums: f64[] = []
+    sums.push(0.0)
+    for i in 0..n {
+        let h = l.heights[i]
+        var counted = 0.0
+        if h > 0.0 {
+            counted = f64(h)
+        }
+        sums.push(counted)
+    }
+    let end = n + 1
+    for i in 1..end {
+        let up = i + lowbit(i)
+        if up <= n {
+            sums[up] += sums[i]
+        }
+    }
+    l.sums = sums
+}
+
+fn height_before(l: *ListInner, ix: i64) -> f64 {
+    var i = lesser_count(ix, l.heights.len)
+    var total = 0.0
+    for i > 0 {
+        total += l.sums[i]
+        i -= lowbit(i)
+    }
+    total
+}
+
+fn find_item(l: *ListInner, y: f64, strict: bool) -> ItemAt {
+    let n = l.heights.len
+    var step = 1
+    for step * 2 <= n {
+        step *= 2
+    }
+    var pos = 0
+    var rest = y
+    for step > 0 {
+        let next = pos + step
+        if next <= n {
+            let s = l.sums[next]
+            if s < rest || (!strict && s == rest) {
+                pos = next
+                rest -= s
+            }
+        }
+        step /= 2
+    }
+    ItemAt { index: pos, rest }
+}
+
+fn set_height(l: *ListInner, ix: i64, h: f32) {
+    let old = l.heights[ix]
+    var was = 0.0
+    if old > 0.0 {
+        was = f64(old)
+    }
+    l.heights[ix] = h
+    let delta = f64(h) - was
+    var i = ix + 1
+    for i <= l.heights.len {
+        l.sums[i] += delta
+        i += lowbit(i)
+    }
+}
+
+fn logical_top(l: *ListInner) -> ListOffset {
+    match l.top {
+        some(t) => t
+        none => match l.alignment {
+            Top => ListOffset {}
+            Bottom => ListOffset { item_ix: l.heights.len, offset_in_item: 0.0 }
+        }
+    }
+}
+
+fn bigger_count(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+fn replace_items(l: *ListInner, start_at: i64, end_at: i64, count_new: i64) {
+    let n = l.heights.len
+    let start = lesser_count(bigger_count(start_at, 0), n)
+    let end = lesser_count(bigger_count(end_at, start), n)
+    let count = bigger_count(count_new, 0)
+    var next: f32[] = []
+    for i in 0..start {
+        next.push(l.heights[i])
+    }
+    for _ in 0..count {
+        next.push(-1.0)
+    }
+    for i in end..n {
+        next.push(l.heights[i])
+    }
+    l.heights = next
+    match l.top {
+        some(t) => {
+            var moved = t
+            if t.item_ix >= start && t.item_ix < end {
+                moved = ListOffset { item_ix: start, offset_in_item: 0.0 }
+            } else if end <= t.item_ix {
+                moved.item_ix = t.item_ix - (end - start) + count
+            }
+            l.top = moved
+        }
+        none => {}
+    }
+    rebuild_sums(l)
+    l.owner.dirty = true
+}
+
+/// Returns a state for a `list` of `count` items.
+///
+/// `overdraw` is how far past each edge of the viewport, in logical pixels, items are laid out and measured though not drawn, so that the scroll range and the positions of items just out of view are known before they scroll in (`list.rs:216`).
+pub fn list_state(cx: Context, count: i64, alignment: ListAlignment, overdraw: f32) -> ListState {
+    let n = bigger_count(count, 0)
+    let inner = new(ListInner { owner: cx.state, heights: unmeasured_heights(n), sums: [], alignment, overdraw })
+    rebuild_sums(inner)
+    ListState { inner }
+}
+
+/// Returns the number of items in `s`.
+pub fn item_count(s: ListState) -> i64 {
+    s.inner.heights.len
+}
+
+/// Makes `s` hold `count` items none of which has been laid out and puts it at its starting position, as gpui's `ListState::reset` does (`list.rs:244`). Wheel events are dropped until the next frame has laid the items out.
+pub fn list_reset(s: ListState, count: i64) {
+    let l = s.inner
+    l.dropping = true
+    l.top = none
+    replace_items(l, 0, l.heights.len, count)
+}
+
+/// Replaces the items `start` to `end`, not including `end`, with `count` items that have not been laid out, as gpui's `ListState::splice` does (`list.rs:264`). The scroll position follows its item: one inside the range moves to the start of it, and one after it moves with the items after.
+pub fn list_splice(s: ListState, start: i64, end: i64, count: i64) {
+    replace_items(s.inner, start, end, count)
+}
+
+/// Returns the position the next frame starts from: the scroll position the application set or the wheel moved to, or the start of a `Top` list and the end of a `Bottom` one when neither has (`list.rs:318`).
+pub fn logical_scroll_top(s: ListState) -> ListOffset {
+    logical_top(s.inner)
+}
+
+/// Scrolls `s` down by `distance` logical pixels, or up when it is negative, never above the first item (`list.rs:323`). The next frame keeps the position within the items.
+pub fn list_scroll_by(s: ListState, distance: f32) {
+    if distance == 0.0 {
+        return
+    }
+    let l = s.inner
+    let current = logical_top(l)
+    let from = height_before(l, current.item_ix) + f64(current.offset_in_item)
+    let wanted = bigger64(from + f64(distance), 0.0)
+    let at = find_item(l, wanted, false)
+    l.top = ListOffset { item_ix: at.index, offset_in_item: f32(at.rest) }
+    l.owner.dirty = true
+}
+
+/// Scrolls `s` to `offset`, an item past the end meaning the end (`list.rs:348`). The next frame keeps the position within the items.
+pub fn list_scroll_to(s: ListState, offset: ListOffset) {
+    let l = s.inner
+    var place = offset
+    if place.item_ix >= l.heights.len {
+        place = ListOffset { item_ix: l.heights.len, offset_in_item: 0.0 }
+    } else if place.item_ix < 0 {
+        place = ListOffset {}
+    }
+    l.top = place
+    l.owner.dirty = true
+}
+
+/// Scrolls `s` the least that puts item `index` fully in view: item `index` becomes the top item when it is above the viewport, and the viewport's bottom edge is put at the item's when it is below (`list.rs:360`). Items that have not been laid out count as zero high, so it is exact for an item that has been laid out.
+pub fn scroll_to_reveal_item(s: ListState, index: i64) {
+    let l = s.inner
+    var top = logical_top(l)
+    if index <= top.item_ix {
+        top = ListOffset { item_ix: index, offset_in_item: 0.0 }
+    } else {
+        let bottom = height_before(l, index + 1)
+        let goal = bigger64(bottom - f64(l.height), 0.0)
+        let at = find_item(l, goal, true)
+        if at.index >= top.item_ix {
+            top = ListOffset { item_ix: at.index, offset_in_item: f32(at.rest) }
+        }
+    }
+    l.top = top
+    l.owner.dirty = true
+}
+
+/// Returns where item `index` was drawn at the last frame, in logical pixels from the top left of the window, or `none` when it is above the viewport or has not been laid out. The position is the one the last frame resolved, so a scroll requested since then does not move it; gpui's `bounds_for_item` (`list.rs:393`) computes it from the logical scroll top instead.
+pub fn bounds_for_item(s: ListState, index: i64) -> geometry.Rect? {
+    let l = s.inner
+    let top = l.resolved
+    if index < top.item_ix || index >= l.heights.len || l.heights[index] < 0.0 {
+        return none
+    }
+    let scrolled = height_before(l, top.item_ix) + f64(top.offset_in_item)
+    let y = f64(l.bounds.y) + height_before(l, index) - scrolled
+    geometry.Rect { x: l.bounds.x, y: f32(y), width: l.bounds.width, height: l.heights[index] }
+}
+
+/// Returns a list of the items of `s`, each the element `render` returns for its index, laid out one above the next at the list's content width and as high as it is.
+///
+/// Only the items in view are drawn, and only those and the `overdraw` of `s` past the viewport's edges are laid out: an item that has been laid out keeps its height in `s` until `list_reset` or `list_splice` drops it. The scroll position is an item and an offset into it, which the wheel moves and `list_scroll_to`, `list_scroll_by` and `scroll_to_reveal_item` set. Each item is laid out as its own root, a root with no size set as wide as the content box and as high as its content. An item without an `id` has the key `"<key of the list>/<index>"`. The list is an element that clips and scrolls like `overflow_y_scroll`, and has no size of its own: give it one with `height`, `flex_1` or the like.
+pub fn list(state: ListState, render: fn(i64) -> Element) -> Element {
+    var out = Element { kind: Virtual }
+    out.style.overflow_y = Scroll
+    out.rows = Rows.Variable(state, render)
+    out
+}
+
+fn lay_out_item(st: *State, l: *ListInner, render: fn(i64) -> Element, ix: i64, width: f32, text: TextStyle, scale: f32) -> RowLayout {
+    let e = render(ix)
+    var row = lay_out_row(st, e, width, layout.unbounded, text, scale)
+    row.index = ix
+    set_height(l, ix, row.height)
+    row
+}
+
+fn arrange(st: *State, l: *ListInner, render: fn(i64) -> Element, width: f32, viewport: f32, text: TextStyle, scale: f32) -> Arranged {
+    let count = l.heights.len
+    let wanted = logical_top(l)
+    var scroll_top = ListOffset { item_ix: lesser_count(wanted.item_ix, count), offset_in_item: wanted.offset_in_item }
+    var rendered: f32 = 0.0
+    var after: RowLayout[] = []
+    var before: RowLayout[] = []
+    var ix = scroll_top.item_ix
+    for ix < count {
+        let visible = rendered - scroll_top.offset_in_item
+        if visible >= viewport + l.overdraw {
+            break
+        }
+        var h = l.heights[ix]
+        if visible < viewport || h < 0.0 {
+            let row = lay_out_item(st, l, render, ix, width, text, scale)
+            h = row.height
+            if visible < viewport {
+                after.push(row)
+            }
+        }
+        rendered += h
+        ix += 1
+    }
+    var cursor = scroll_top.item_ix
+    if rendered - scroll_top.offset_in_item < viewport {
+        for rendered < viewport && cursor > 0 {
+            cursor -= 1
+            let row = lay_out_item(st, l, render, cursor, width, text, scale)
+            rendered += row.height
+            before.push(row)
+        }
+        scroll_top = ListOffset { item_ix: cursor, offset_in_item: rendered - viewport }
+        match l.alignment {
+            Top => {
+                if scroll_top.offset_in_item < 0.0 {
+                    scroll_top.offset_in_item = 0.0
+                }
+                l.top = scroll_top
+            }
+            Bottom => {
+                l.top = none
+            }
+        }
+    }
+    var leading = scroll_top.offset_in_item
+    var above = cursor
+    for leading < l.overdraw && above > 0 {
+        above -= 1
+        var h = l.heights[above]
+        if h < 0.0 {
+            let row = lay_out_item(st, l, render, above, width, text, scale)
+            h = row.height
+        }
+        leading += h
+    }
+    var rows: RowLayout[] = []
+    var k = before.len
+    for k > 0 {
+        k -= 1
+        rows.push(before[k])
+    }
+    for row in after {
+        rows.push(row)
+    }
+    Arranged { rows, top: scroll_top }
+}
+
+fn prepaint_variable(st: *State, laid: Laid, key: str, rect: geometry.Rect, content: geometry.Rect, clip: geometry.Rect, own: TextStyle, w: Walk, state: ListState, render: fn(i64) -> Element) {
+    let e = laid.element
+    let l = state.inner
+    l.dropping = false
+    if l.width != content.width {
+        l.heights = unmeasured_heights(l.heights.len)
+        rebuild_sums(l)
+    }
+    let arranged = arrange(st, l, render, content.width, content.height, own, w.scale)
+    let top = arranged.top
+    l.resolved = top
+    l.width = content.width
+    l.height = content.height
+    l.bounds = content
+    let total = height_before(l, l.heights.len)
+    let max_y = bigger64(total - f64(content.height), 0.0)
+    let at_top = height_before(l, top.item_ix) + f64(top.offset_in_item)
+    let range = geometry.point(0.0, f32(max_y))
+    let offset = geometry.point(0.0, f32(at_top))
+    st.hitboxes.push(Hitbox { bounds: geometry.intersect(rect, w.clip), key, parent: w.parent, element: e, offset, scroll_max: range, rect })
+    let parent = st.hitboxes.len - 1
+    var placed: VirtualRow[] = []
+    if content.height > 0.0 {
+        var y = content.y - top.offset_in_item
+        for row in arranged.rows {
+            let at = Walk { parent, clip, shift: geometry.point(content.x, y), text: own, scale: w.scale }
+            placed.push(prepaint_row(st, row, key, at))
+            y += row.height
+        }
+    }
+    st.virtuals[parent] = placed
+}
+
+fn variable_list(e: Element) -> ListState? {
+    let rows = e.rows ?? return none
+    match rows {
+        Variable(state, _) => some(state)
+        Uniform(_, _, _) => none
+    }
+}
+
+fn wheel_list(state: ListState, dy: f32) -> bool {
+    let l = state.inner
+    if l.dropping {
+        return false
+    }
+    let top = l.resolved
+    let current = height_before(l, top.item_ix) + f64(top.offset_in_item)
+    let total = height_before(l, l.heights.len)
+    let max_y = bigger64(total - f64(l.height), 0.0)
+    let next = limit64(current + f64(dy), max_y)
+    if next == limit64(current, max_y) {
+        return false
+    }
+    let at = find_item(l, next, false)
+    let moved = ListOffset { item_ix: at.index, offset_in_item: f32(at.rest) }
+    l.resolved = moved
+    if l.alignment == ListAlignment.Bottom && next == max_y {
+        l.top = none
+    } else {
+        l.top = moved
+    }
+    l.owner.dirty = true
+    true
+}
