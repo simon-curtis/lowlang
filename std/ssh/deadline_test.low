@@ -1,0 +1,148 @@
+import std/io
+import std/net
+import std/slices
+import std/ssh/key
+import std/testing
+import std/time
+import std/time/duration
+
+const deadline_millis = 300
+const slow_millis = 5000
+
+fn phase_name(p: Phase) -> str {
+    match p {
+        Connect => "Connect"
+        VersionExchange => "VersionExchange"
+        KeyExchange => "KeyExchange"
+        Authentication => "Authentication"
+    }
+}
+
+fn cause_name(c: io.Error) -> str {
+    match c {
+        TimedOut => "TimedOut"
+        Refused => "Refused"
+        _ => "other"
+    }
+}
+
+fn describe(e: Error) -> str {
+    match e {
+        Handshake(phase, cause) => "{phase_name(phase)} {cause_name(cause)}"
+        _ => error_name(e)
+    }
+}
+
+fn timed_client(auth: AuthMethod[]) -> ClientConfig {
+    ClientConfig { user: "alice", verify_host_key: accept_any_host_key(), auth, handshake_timeout: deadline_millis }
+}
+
+fn dial_failure(port: i64, config: ClientConfig) -> str {
+    using conn = dial("127.0.0.1", port, config) catch {
+        e => return describe(e)
+    }
+    ""
+}
+
+fn client_failure(config: ClientConfig, ends: net.ConnPair) -> str {
+    using conn = client(net.stream(ends.first), config) catch {
+        e => return describe(e)
+    }
+    ""
+}
+
+fn hold_silent(listener: net.ListenerHandle, release: chan[bool]) {
+    let h = net.accept_handle(listener) catch {
+        e => return
+    }
+    using c = net.adopt(h)
+    let released = <-release
+}
+
+fn elapsed_millis(started: i64) -> i64 {
+    (time.monotonic() - started) / 1000000
+}
+
+fn test_silent_listener_fails_in_the_version_exchange(t: *testing.T) {
+    using listener = net.listen("127.0.0.1", 0) or panic("listen")
+    let release = chan[bool]()
+    defer close(release)
+    spawn hold_silent(listener.handle, release)
+    let started = time.monotonic()
+    let failure = dial_failure(listener.handle.addr.port, timed_client([AuthMethod.Password("secret")]))
+    let elapsed = elapsed_millis(started)
+    testing.error_if(t, failure != "VersionExchange TimedOut", "got {failure}")
+    testing.error_if(t, elapsed < deadline_millis - 50, "returned after {elapsed} ms")
+    testing.error_if(t, elapsed > slow_millis, "returned after {elapsed} ms")
+}
+
+fn test_client_over_a_silent_stream_times_out(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    let started = time.monotonic()
+    let failure = client_failure(timed_client([AuthMethod.Password("secret")]), ends)
+    let elapsed = elapsed_millis(started)
+    testing.error_if(t, failure != "VersionExchange TimedOut", "got {failure}")
+    testing.error_if(t, elapsed < deadline_millis - 50, "returned after {elapsed} ms")
+    testing.error_if(t, elapsed > slow_millis, "returned after {elapsed} ms")
+}
+
+fn test_peer_that_stops_after_its_version_fails_in_the_key_exchange(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    io.write_all(net.stream(ends.second), bytes("SSH-2.0-silent\r\n")) or panic("write")
+    let failure = client_failure(timed_client([AuthMethod.Password("secret")]), ends)
+    testing.error_if(t, failure != "KeyExchange TimedOut", "got {failure}")
+}
+
+fn test_server_that_never_answers_authentication_times_out(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    let auth = ServerAuth {
+        methods: ["password"]
+        password: fn(user, password) {
+            time.sleep_for(duration.milliseconds(1500))
+            true
+        }
+    }
+    let report = chan[str](1)
+    spawn serve_report(net.stream(ends.second), base_server([load_signer("ed25519")], auth), report)
+    let failure = client_failure(timed_client([AuthMethod.Password("secret")]), ends)
+    testing.error_if(t, failure != "Authentication TimedOut", "got {failure}")
+}
+
+fn closed_port() -> i64 {
+    using listener = net.listen("127.0.0.1", 0) or panic("listen")
+    listener.handle.addr.port
+}
+
+fn test_refused_connection_fails_in_connect(t: *testing.T) {
+    let port = closed_port()
+    let failure = dial_failure(port, timed_client([AuthMethod.Password("secret")]))
+    testing.error_if(t, failure != "Connect Refused", "got {failure}")
+}
+
+fn test_rejected_host_key_is_not_a_handshake_failure(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    let report = chan[str](1)
+    spawn serve_report(net.stream(ends.second), base_server([load_signer("ed25519")], password_auth()), report)
+    var rejecting = timed_client([AuthMethod.Password("secret")])
+    rejecting.verify_host_key = fn(k) { false }
+    let rejected = client_failure(rejecting, ends)
+    testing.error_if(t, rejected != "HostKeyRejected", "got {rejected}")
+}
+
+fn test_wrong_password_is_not_a_handshake_failure(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    let report = chan[str](1)
+    spawn serve_report(net.stream(ends.second), base_server([load_signer("ed25519")], password_auth()), report)
+    let wrong = client_failure(timed_client([AuthMethod.Password("wrong")]), ends)
+    testing.error_if(t, wrong != "AuthFailed", "got {wrong}")
+}
+
+fn test_connection_outlives_the_handshake_timeout(t: *testing.T) {
+    using listener = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serve_on(listener.handle, base_server([load_signer("ed25519")], password_auth()))
+    using conn = dial("127.0.0.1", listener.handle.addr.port, timed_client([AuthMethod.Password("secret")])) or panic("dial")
+    time.sleep_for(duration.milliseconds(deadline_millis * 2))
+    let result = exec(conn, "echo hello") or panic("exec")
+    testing.error_if(t, !slices.equal(result.stdout, bytes("hello\n")), "stdout")
+    testing.error_if(t, result.status.code != 0, "status")
+}
