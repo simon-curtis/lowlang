@@ -1,0 +1,147 @@
+import std/io
+import std/net
+import std/slices
+import std/testing
+
+const workers = 8
+
+fn payload_for(index: i64) -> u8[] {
+    var out: u8[] = []
+    for round in 0..(index + 1) * 700 {
+        out.push(u8((index * 31 + round) % 251))
+    }
+    out
+}
+
+fn read_count_on(h: *ChannelHandle, count: i64) -> u8[] ! Error {
+    var got: u8[] = []
+    let buf = io.buffer(4096)
+    for got.len < count {
+        let n = read_on(h, buf)?
+        if n == 0 {
+            break
+        }
+        io.append(mut got, buf[..n])
+    }
+    got
+}
+
+fn echo_once(h: *ConnectionHandle, port: i64, index: i64) -> str {
+    let payload = payload_for(index)
+    using ch = direct_tcpip_on(h, "127.0.0.1", port, "127.0.0.1", 40000 + index) catch {
+        e => return "open {error_name(e)}"
+    }
+    write_on(ch.handle, payload) catch {
+        e => return "write {error_name(e)}"
+    }
+    let got = read_count_on(ch.handle, payload.len) catch {
+        e => return "read {error_name(e)}"
+    }
+    if !slices.equal(got, payload) {
+        return "worker {index} read {got.len} bytes that differ"
+    }
+    ""
+}
+
+fn echo_worker(h: *ConnectionHandle, port: i64, index: i64, out: chan[str]) {
+    out <- echo_once(h, port, index)
+}
+
+fn keepalive_worker(h: *ConnectionHandle, out: chan[str]) {
+    keepalive_on(h) catch {
+        e => {
+            out <- error_name(e)
+            return
+        }
+    }
+    out <- ""
+}
+
+fn session_worker(h: *ConnectionHandle, out: chan[str]) {
+    using ch = open_session_on(h) catch {
+        e => {
+            out <- error_name(e)
+            return
+        }
+    }
+    exec_on(ch.handle, "echo hello") catch {
+        e => {
+            out <- error_name(e)
+            return
+        }
+    }
+    let got = read_count_on(ch.handle, 6) catch {
+        e => {
+            out <- error_name(e)
+            return
+        }
+    }
+    out <- if slices.equal(got, bytes("hello\n")) { "" } else { "got {str(got)}" }
+}
+
+fn expect_all_empty(t: *testing.T, results: chan[str], count: i64, what: str) {
+    for i in 0..count {
+        let result = (<-results) ?? "channel closed"
+        testing.error_if(t, result != "", "{what}: {result}")
+    }
+}
+
+fn test_handle_opens_direct_tcpip_channels_from_many_threads(t: *testing.T) {
+    using echo = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn echo_loop(echo.handle)
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    let results = chan[str](workers)
+    for index in 0..workers {
+        spawn echo_worker(conn.handle, echo.handle.addr.port, index, results)
+    }
+    expect_all_empty(t, results, workers, "echo")
+}
+
+fn test_handle_serves_keepalives_and_sessions_from_other_threads(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    let results = chan[str](workers * 2)
+    for index in 0..workers {
+        spawn keepalive_worker(conn.handle, results)
+        spawn session_worker(conn.handle, results)
+    }
+    expect_all_empty(t, results, workers * 2, "mixed")
+}
+
+fn ended_handle() -> *ConnectionHandle {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = start_pair(base_client([AuthMethod.Password("secret")]), base_server([load_signer("ed25519")], password_auth()), ends)
+    conn.handle
+}
+
+fn open_failure(h: *ConnectionHandle) -> str {
+    using ch = direct_tcpip_on(h, "127.0.0.1", 9, "127.0.0.1", 1) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn session_failure(h: *ConnectionHandle) -> str {
+    using ch = open_session_on(h) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn keepalive_failure(h: *ConnectionHandle) -> str {
+    keepalive_on(h) catch {
+        e => return error_name(e)
+    }
+    ""
+}
+
+fn test_handle_fails_after_the_connection_is_dropped(t: *testing.T) {
+    let h = ended_handle()
+    let opened = open_failure(h)
+    testing.error_if(t, opened == "", "direct-tcpip on a dropped connection must fail")
+    let session = session_failure(h)
+    testing.error_if(t, session == "", "session on a dropped connection must fail")
+    let alive = keepalive_failure(h)
+    testing.error_if(t, alive == "", "keepalive on a dropped connection must fail")
+}

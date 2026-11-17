@@ -1,0 +1,476 @@
+import std/io
+import std/json
+import std/text
+
+/// The error type of the nats module, returned by connecting, publishing, subscribing and decoding.
+pub enum Error {
+    /// The server could not be reached.
+    Connect
+    /// The client is closed or the connection ended.
+    Closed
+    /// A connect, handshake, flush or request exceeded its time limit, or the server stopped answering `PING`.
+    Timeout
+    /// The peer sent bytes that are not valid NATS protocol.
+    Protocol
+    /// A control line or payload exceeded a bound in `Limits`.
+    TooLarge
+    /// The TLS handshake failed, or `Options.require_tls` is set and the server does not offer TLS.
+    Tls
+    /// The call needs a feature the server did not announce, such as headers.
+    Unsupported
+    /// The server rejected the credentials, or the credentials cannot be used. `message` is the server's text or a description.
+    Auth(message: str)
+    /// The server sent `-ERR`. `message` is the server's text without its quotes.
+    Server(message: str)
+    /// A request found no subscriber: the server answered with status `503`.
+    NoResponders
+    /// A subject, reply subject or queue group name is not valid.
+    BadSubject
+    /// A header name or value is not valid.
+    BadHeader
+    /// The payload with its headers is larger than the server's `max_payload`.
+    MaxPayload
+    /// The client is draining and accepts no new subscriptions or requests.
+    Draining
+    /// An argument is out of range, such as a message count below `1`.
+    Argument
+    /// The NKey seed is not a valid encoded seed.
+    BadSeed
+}
+
+/// Bounds that stop a corrupt or hostile server from forcing large allocations while decoding.
+///
+/// Defaults are `Limits {}`.
+pub struct Limits {
+    /// The longest control line in bytes, other than `INFO`, whose line is bounded by the 16 KiB reader buffer. A longer line fails with `TooLarge`. Defaults to `4096`.
+    pub control_line: i64 = 4096
+    /// The largest message body in bytes, headers included. A larger one fails with `TooLarge`. Defaults to 64 MiB.
+    pub payload: i64 = 67108864
+}
+
+/// A header name and one of its values.
+pub struct Header {
+    /// The header name.
+    pub name: str
+    /// The header value.
+    pub value: str
+}
+
+/// A message delivered to a subscription or returned by `request`.
+pub struct Message {
+    /// The subject the message was published to.
+    pub subject: str
+    /// The reply subject, empty when the publisher gave none.
+    pub reply: str
+    /// The headers in the order sent, one entry per value. Empty when the message has no header block or when its header block is malformed, which is reported on `ClientHandle.errors`. The status and description are `0` and empty then too.
+    pub headers: Header[]
+    /// The status of the inline status line of the header block, such as `503` or `100`. `0` when there is none.
+    pub status: i64
+    /// The text after the status on the inline status line. Empty when there is none.
+    pub description: str
+    /// The message body.
+    pub payload: u8[]
+}
+
+/// What the server announced in its `INFO` line.
+pub struct ServerInfo {
+    /// The unique identifier of the server.
+    pub server_id: str
+    /// The configured name of the server.
+    pub server_name: str
+    /// The server version.
+    pub version: str
+    /// The host the server advertises.
+    pub host: str
+    /// The port the server advertises.
+    pub port: i64
+    /// The protocol version of the server.
+    pub protocol: i64
+    /// The largest message body the server accepts, headers included. Defaults to 1 MiB when the server announced none.
+    pub max_payload: i64
+    /// Whether the server supports headers.
+    pub headers: bool
+    /// Whether the server requires credentials.
+    pub auth_required: bool
+    /// Whether the server requires the connection to be upgraded to TLS.
+    pub tls_required: bool
+    nonce: str
+}
+
+enum Op {
+    Info(info: ServerInfo)
+    Msg(sid: i64, message: Message, damaged: bool)
+    Ping
+    Pong
+    Accepted
+    Rejected(text: str)
+}
+
+struct HeaderBlock {
+    status: i64
+    description: str
+    headers: Header[]
+}
+
+struct Connect {
+    name: str
+    token: str
+    user: str
+    password: str
+    nkey: str
+    signature: str
+    echo: bool
+    headers: bool
+    tls_required: bool
+}
+
+const client_version: str = "0.1.0"
+
+fn transport(e: io.Error) -> Error {
+    match e {
+        TimedOut => Timeout
+        TooLarge => TooLarge
+        Malformed => Protocol
+        _ => Closed
+    }
+}
+
+fn number(s: str) -> i64 ! Error {
+    text.parse_int(s) or fail Protocol
+}
+
+fn is_blank(c: u8) -> bool {
+    c <= ' ' || c == 127
+}
+
+fn token_ok(token: str, wildcards: bool, last: bool) -> bool {
+    if token.len == 0 {
+        return false
+    }
+    if token == "*" {
+        return wildcards
+    }
+    if token == ">" {
+        return wildcards && last
+    }
+    true
+}
+
+fn subject_ok(subject: str, wildcards: bool) -> bool {
+    if subject.len == 0 {
+        return false
+    }
+    for i in 0..subject.len {
+        if is_blank(subject[i]) {
+            return false
+        }
+    }
+    let tokens = text.split(subject, '.')
+    for i, token in tokens {
+        if !token_ok(token, wildcards, i == tokens.len - 1) {
+            return false
+        }
+    }
+    true
+}
+
+/// Returns whether `subject` is valid in a subscription.
+///
+/// A subject is dot-separated tokens. A token is not empty and holds no whitespace or control characters. A token that is exactly `*` matches one token and a final token that is exactly `>` matches the rest.
+pub fn valid_subject(subject: str) -> bool {
+    subject_ok(subject, true)
+}
+
+/// Returns whether `subject` can be published to or used as a reply subject.
+///
+/// It follows the rules of `valid_subject` and holds no `*` or `>` token.
+pub fn valid_literal_subject(subject: str) -> bool {
+    subject_ok(subject, false)
+}
+
+fn valid_queue(queue: str) -> bool {
+    if queue.len == 0 {
+        return false
+    }
+    for i in 0..queue.len {
+        if is_blank(queue[i]) {
+            return false
+        }
+    }
+    true
+}
+
+fn valid_header(h: Header) -> bool {
+    if h.name.len == 0 {
+        return false
+    }
+    for i in 0..h.name.len {
+        if is_blank(h.name[i]) || h.name[i] == ':' {
+            return false
+        }
+    }
+    for i in 0..h.value.len {
+        let c = h.value[i]
+        if c == '\r' || c == '\n' || c == 0 {
+            return false
+        }
+    }
+    true
+}
+
+fn headers_ok(headers: Header[]) -> bool {
+    for h in headers {
+        if !valid_header(h) {
+            return false
+        }
+    }
+    true
+}
+
+/// Returns the first value of the header `name` of `m`, compared without regard to ASCII case, or `none` when the message has no such header.
+pub fn header(m: Message, name: str) -> str? {
+    for h in m.headers {
+        if text.equal_fold(h.name, name) {
+            return h.value
+        }
+    }
+    none
+}
+
+fn encode_headers(headers: Header[]) -> u8[] {
+    var out: u8[] = []
+    text.append(mut out, "NATS/1.0\r\n")
+    for h in headers {
+        text.append(mut out, "{h.name}: {h.value}\r\n")
+    }
+    text.append(mut out, "\r\n")
+    out
+}
+
+fn encode_pub(subject: str, reply: str, payload: u8[]) -> u8[] {
+    var out: u8[] = []
+    if reply.len > 0 {
+        text.append(mut out, "PUB {subject} {reply} {payload.len}\r\n")
+    } else {
+        text.append(mut out, "PUB {subject} {payload.len}\r\n")
+    }
+    io.append(mut out, payload)
+    text.append(mut out, "\r\n")
+    out
+}
+
+fn encode_hpub(subject: str, reply: str, block: u8[], payload: u8[]) -> u8[] {
+    let total = block.len + payload.len
+    var out: u8[] = []
+    if reply.len > 0 {
+        text.append(mut out, "HPUB {subject} {reply} {block.len} {total}\r\n")
+    } else {
+        text.append(mut out, "HPUB {subject} {block.len} {total}\r\n")
+    }
+    io.append(mut out, block)
+    io.append(mut out, payload)
+    text.append(mut out, "\r\n")
+    out
+}
+
+fn encode_sub(subject: str, queue: str, sid: i64) -> u8[] {
+    if queue.len > 0 {
+        return bytes("SUB {subject} {queue} {sid}\r\n")
+    }
+    bytes("SUB {subject} {sid}\r\n")
+}
+
+fn encode_unsub(sid: i64, max: i64) -> u8[] {
+    if max > 0 {
+        return bytes("UNSUB {sid} {max}\r\n")
+    }
+    bytes("UNSUB {sid}\r\n")
+}
+
+fn encode_connect(c: Connect) -> u8[] {
+    var members = [
+        json.bool_member("verbose", false)
+        json.bool_member("pedantic", false)
+        json.bool_member("tls_required", c.tls_required)
+        json.text_member("name", c.name)
+        json.text_member("lang", "low")
+        json.text_member("version", client_version)
+        json.int_member("protocol", 1)
+        json.bool_member("echo", c.echo)
+        json.bool_member("headers", c.headers)
+        json.bool_member("no_responders", c.headers)
+    ]
+    if c.token.len > 0 {
+        members.push(json.text_member("auth_token", c.token))
+    }
+    if c.user.len > 0 {
+        members.push(json.text_member("user", c.user))
+        members.push(json.text_member("pass", c.password))
+    }
+    if c.nkey.len > 0 {
+        members.push(json.text_member("nkey", c.nkey))
+        members.push(json.text_member("sig", c.signature))
+    }
+    let body = json.stringify(json.object_value(members), 0)
+    bytes("CONNECT {body}\r\nPING\r\n")
+}
+
+fn bool_of(v: json.Value, name: str) -> bool {
+    match json.field(v, name) {
+        Bool(b) => b
+        _ => false
+    }
+}
+
+fn parse_info(body: str) -> ServerInfo ! Error {
+    let v = json.parse(bytes(body)) or fail Protocol
+    let announced = json.int_of(v, "max_payload")
+    let max_payload = if announced > 0 { announced } else { 1048576 }
+    ServerInfo {
+        server_id: json.text_of(v, "server_id")
+        server_name: json.text_of(v, "server_name")
+        version: json.text_of(v, "version")
+        host: json.text_of(v, "host")
+        port: json.int_of(v, "port")
+        protocol: json.int_of(v, "proto")
+        max_payload
+        headers: bool_of(v, "headers")
+        auth_required: bool_of(v, "auth_required")
+        tls_required: bool_of(v, "tls_required")
+        nonce: json.text_of(v, "nonce")
+    }
+}
+
+fn empty_block() -> HeaderBlock {
+    HeaderBlock { status: 0, description: "", headers: [] }
+}
+
+fn parse_header_block(block: str) -> HeaderBlock ! Error {
+    let lines = text.split_str(block, "\r\n")
+    if lines.len < 3 || lines[lines.len - 1].len != 0 || lines[lines.len - 2].len != 0 {
+        fail Protocol
+    }
+    let first = lines[0]
+    if !text.starts_with(first, "NATS/1.0") {
+        fail Protocol
+    }
+    var status = 0
+    var description = ""
+    let rest = text.trim(first[8..])
+    if rest.len > 0 {
+        let cut = text.cut(rest, " ")
+        status = number(cut.before)?
+        description = text.trim(cut.after)
+    }
+    var headers: Header[] = []
+    for line in lines[1..lines.len - 2] {
+        let at = text.index_byte(line, ':')
+        if at < 1 {
+            fail Protocol
+        }
+        headers.push(Header { name: line[..at], value: text.trim(line[at + 1..]) })
+    }
+    HeaderBlock { status, description, headers }
+}
+
+fn read_bytes(r: *io.Reader, n: i64) -> u8[] ! Error {
+    io.read_exact(r, n) catch transport
+}
+
+fn read_body(r: *io.Reader, n: i64) -> u8[] ! Error {
+    var data: u8[] = []
+    if n <= 65536 {
+        data = read_bytes(r, n)?
+    } else {
+        var rest = n
+        for rest > 0 {
+            let part = if rest > 65536 { 65536 } else { rest }
+            io.append(mut data, read_bytes(r, part)?)
+            rest -= part
+        }
+    }
+    let end = read_bytes(r, 2)?
+    if end[0] != '\r' || end[1] != '\n' {
+        fail Protocol
+    }
+    data
+}
+
+fn read_msg(r: *io.Reader, limits: Limits, args: str[], headers: bool) -> Op ! Error {
+    let fixed = if headers { 4 } else { 3 }
+    if args.len != fixed && args.len != fixed + 1 {
+        fail Protocol
+    }
+    let subject = args[0]
+    let sid = number(args[1])?
+    var reply = ""
+    var at = 2
+    if args.len == fixed + 1 {
+        reply = args[2]
+        at = 3
+    }
+    var header_len = 0
+    var total = number(args[at])?
+    if headers {
+        header_len = total
+        total = number(args[at + 1])?
+        if header_len < 0 || header_len > total {
+            fail Protocol
+        }
+    }
+    if total < 0 {
+        fail Protocol
+    }
+    if total > limits.payload {
+        fail TooLarge
+    }
+    let data = read_body(r, total)?
+    var damaged = false
+    var block = empty_block()
+    if headers {
+        block = parse_header_block(str(data[..header_len])) catch {
+            e => {
+                damaged = true
+                empty_block()
+            }
+        }
+    }
+    let message = Message {
+        subject
+        reply
+        headers: block.headers
+        status: block.status
+        description: block.description
+        payload: data[header_len..]
+    }
+    Msg(sid, message, damaged)
+}
+
+fn unquote(s: str) -> str {
+    let t = text.trim(s)
+    if t.len >= 2 && t[0] == '\'' && t[t.len - 1] == '\'' {
+        return t[1..t.len - 1]
+    }
+    t
+}
+
+fn read_op(r: *io.Reader, limits: Limits) -> Op ! Error {
+    let line = io.read_line(r) catch transport
+    let cut = text.cut(line, " ")
+    let name = text.upper(cut.before)
+    if name == "INFO" {
+        return Info(parse_info(cut.after)?)
+    }
+    if line.len > limits.control_line {
+        fail TooLarge
+    }
+    match name {
+        == "MSG" => read_msg(r, limits, text.fields(cut.after), false)?
+        == "HMSG" => read_msg(r, limits, text.fields(cut.after), true)?
+        == "PING" => Ping
+        == "PONG" => Pong
+        == "+OK" => Accepted
+        == "-ERR" => Rejected(unquote(cut.after))
+        _ => fail Protocol
+    }
+}

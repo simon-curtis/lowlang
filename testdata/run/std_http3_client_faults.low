@@ -3,6 +3,7 @@ import std/header
 import std/http
 import std/http/qpack
 import std/io
+import std/net
 import std/quic
 import std/quic/wire
 import std/sync
@@ -14,7 +15,20 @@ struct State {
     connections: i64
     resets: i64
     refusals: i64
-    code: i64
+    accepted_from: i64[]
+    heard_from: i64[]
+    withheld: chan[bool]
+    pushed_from: i64
+    push_closed: chan[i64]
+}
+
+struct Relay {
+    socket: net.SocketHandle
+    server: net.Addr
+    lock: sync.Mutex
+    holding: bool
+    held: u8[][]
+    client: net.Addr?
 }
 
 fn roots() -> x509.Certificate[] {
@@ -25,9 +39,10 @@ fn roots() -> x509.Certificate[] {
     out
 }
 
-fn count_connection(s: *State) {
+fn count_connection(s: *State, port: i64) {
     sync.lock(s.lock)
     s.connections += 1
+    s.accepted_from.push(port)
     sync.unlock(s.lock)
 }
 
@@ -48,6 +63,36 @@ fn first_time(s: *State, which: str) -> bool {
 fn connections(s: *State) -> i64 {
     sync.lock(s.lock)
     let n = s.connections
+    sync.unlock(s.lock)
+    n
+}
+
+fn hear(s: *State, port: i64) {
+    sync.lock(s.lock)
+    s.heard_from.push(port)
+    sync.unlock(s.lock)
+}
+
+fn matching(ports: i64[], port: i64) -> i64 {
+    var n = 0
+    for p in ports {
+        if p == port {
+            n += 1
+        }
+    }
+    n
+}
+
+fn accepted_from(s: *State, port: i64) -> i64 {
+    sync.lock(s.lock)
+    let n = matching(s.accepted_from, port)
+    sync.unlock(s.lock)
+    n
+}
+
+fn heard_from(s: *State, port: i64) -> i64 {
+    sync.lock(s.lock)
+    let n = matching(s.heard_from, port)
     sync.unlock(s.lock)
     n
 }
@@ -176,8 +221,14 @@ fn respond(h: *quic.ConnectionHandle, control: quic.Stream, s: quic.Stream, stat
             sleep(100)
             answer(s, ok_with("last on this connection"))
         }
-        "/push" => push_stream(h)
-        "/silent" => sleep(500)
+        "/push" => {
+            mark_push(state, h.remote.port)
+            push_stream(h)
+        }
+        "/silent" => {
+            hear(state, h.remote.port)
+            <-state.withheld
+        }
         _ => answer(s, ok_with("plain"))
     }
 }
@@ -203,17 +254,30 @@ fn raw_connection(h: *quic.ConnectionHandle, state: *State) {
     note_close(state, h)
 }
 
-fn note_close(state: *State, h: *quic.ConnectionHandle) {
+fn mark_push(state: *State, port: i64) {
     sync.lock(state.lock)
-    state.code = h.close_code
+    state.pushed_from = port
     sync.unlock(state.lock)
 }
 
-fn last_code(state: *State) -> str {
+fn note_close(state: *State, h: *quic.ConnectionHandle) {
     sync.lock(state.lock)
-    let code = state.code
+    let pushed = state.pushed_from == h.remote.port
     sync.unlock(state.lock)
-    "0x{hex(code)}"
+    if pushed {
+        select {
+            state.push_closed <- h.close_code => {}
+            else => {}
+        }
+    }
+}
+
+fn push_close_code(state: *State) -> str {
+    let code = <-state.push_closed
+    match code {
+        some(c) => "0x{hex(c)}"
+        none => "none"
+    }
 }
 
 fn hex(n: i64) -> str {
@@ -233,7 +297,7 @@ fn hex(n: i64) -> str {
 fn raw_serve(l: *quic.ListenerHandle, state: *State) {
     for {
         let h = quic.accept_handle(l) or return
-        count_connection(state)
+        count_connection(state, h.remote.port)
         spawn raw_connection(h, state)
     }
 }
@@ -275,6 +339,93 @@ fn within(label: str, limit: i64, op: fn() -> http.Response ! http.Error) {
     print("{label}: {text} within limit={millis < limit}")
 }
 
+fn send_quietly(r: *Relay, data: u8[], to: net.Addr) {
+    net.send_to_on(r.socket, data, to) catch {
+        _ => 0
+    }
+}
+
+fn to_client(r: *Relay, data: u8[]) {
+    let short = data.len > 0 && (data[0] & 0x80) == 0
+    sync.lock(r.lock)
+    if r.holding && short {
+        r.held.push(data)
+    } else {
+        match r.client {
+            some(address) => send_quietly(r, data, address)
+            none => {}
+        }
+    }
+    sync.unlock(r.lock)
+}
+
+fn to_server(r: *Relay, data: u8[], from: net.Addr) {
+    sync.lock(r.lock)
+    r.client = some(from)
+    sync.unlock(r.lock)
+    send_quietly(r, data, r.server)
+}
+
+fn relay_loop(r: *Relay) {
+    let buf = io.buffer(2048)
+    for {
+        let packet = net.receive_from_on(r.socket, buf) catch {
+            _ => return
+        }
+        let data = io.buffer(packet.size)
+        io.copy(data, buf[..packet.size])
+        if packet.from.port == r.server.port {
+            to_client(r, data)
+        } else {
+            to_server(r, data, packet.from)
+        }
+    }
+}
+
+fn release_held(r: *Relay) {
+    sync.lock(r.lock)
+    r.holding = false
+    match r.client {
+        some(address) => {
+            for data in r.held {
+                send_quietly(r, data, address)
+            }
+        }
+        none => {}
+    }
+    r.held = []
+    sync.unlock(r.lock)
+}
+
+fn late_attempt(server: net.Addr, state: *State) -> str? {
+    using var socket = net.bind_udp("127.0.0.1", 0) or return none
+    let view = net.detach_socket(mut socket)
+    defer net.close_socket_on(view)
+    let relay = new(Relay { socket: view, server, lock: sync.mutex(), holding: true, held: [], client: none })
+    spawn relay_loop(relay)
+    let port = view.addr.port
+    let c = fresh_client(port)
+    let first = result(fn() -> http.Response ! http.Error { c.request("GET", "/silent").with_timeout(1000).send() })
+    let reached = heard_from(state, port) > 0
+    sleep(500)
+    release_held(relay)
+    if !reached {
+        return none
+    }
+    let second = result(fn() -> http.Response ! http.Error { c.get("/plain") })
+    some("{first}, then {second}, connections: {accepted_from(state, port)}")
+}
+
+fn late_confirmation(server: net.Addr, state: *State) -> str {
+    for _ in 0..3 {
+        match late_attempt(server, state) {
+            some(text) => return text
+            none => {}
+        }
+    }
+    "the request never reached the server"
+}
+
 fn narrow_checks(narrow: *quic.ListenerHandle) {
     let port = narrow.addr.port
     let timed = fresh_client(port)
@@ -289,7 +440,7 @@ fn main() ! http.Error {
     let key = x509.pem_private_key(pem) or fail Tls(Invalid)
     let config = quic.Config { tls: tls.Config { certificates: x509.pem_certificates(pem), key, alpn: ["h3"] } }
     using l = quic.listen("127.0.0.1", 0, config) or fail Connect(Refused)
-    let state = new(State { lock: sync.mutex(), connections: 0, resets: 0, refusals: 0, code: 0 })
+    let state = new(State { lock: sync.mutex(), connections: 0, resets: 0, refusals: 0, accepted_from: [], heard_from: [], withheld: chan[bool](), pushed_from: 0, push_closed: chan[i64](1) })
     spawn raw_serve(l.handle, state)
     let port = l.handle.addr.port
 
@@ -304,6 +455,7 @@ fn main() ! http.Error {
     print("connections after malformed responses: {connections(state)}")
 
     let timed = fresh_client(port)
+    show("before timeout", timed, "/plain")
     print("timeout: {result(fn() -> http.Response ! http.Error { timed.request("GET", "/silent").with_timeout(100).send() })}")
     show("after timeout", timed, "/plain")
     print("connections after timeout: {connections(state)}")
@@ -324,8 +476,7 @@ fn main() ! http.Error {
 
     let pushed = fresh_client(port)
     show("push stream", pushed, "/push")
-    sleep(200)
-    print("push close code: {last_code(state)}")
+    print("push close code: {push_close_code(state)}")
 
     let early = fresh_client(port)
     show("data before headers", early, "/early-data")
@@ -335,4 +486,7 @@ fn main() ! http.Error {
     using stingy = quic.listen("127.0.0.1", 0, few) or fail Connect(Refused)
     spawn raw_serve(stingy.handle, state)
     narrow_checks(stingy.handle)
+
+    print("handshake confirmed after the deadline: {late_confirmation(l.handle.addr, state)}")
+    close(state.withheld)
 }
