@@ -1,0 +1,406 @@
+struct Index {
+    at: i64
+    count: i64
+    off_size: i64
+    base: i64
+    end: i64
+}
+
+struct Affine {
+    a: f64
+    b: f64
+    c: f64
+    d: f64
+    e: f64
+    f: f64
+}
+
+struct Private {
+    subrs: Index
+    matrix: Affine
+}
+
+struct Cff {
+    char_strings: Index
+    global_subrs: Index
+    privates: Private[]
+    select_format: i64
+    select_at: i64
+}
+
+struct Dict {
+    char_strings: i64 = 0
+    private_size: i64 = 0
+    private_at: i64 = 0
+    subrs: i64 = 0
+    fd_array: i64 = 0
+    fd_select: i64 = 0
+    ros: bool = false
+    charstring_type: f64 = 2.0
+    matrix: f64[] = []
+}
+
+struct Operand {
+    value: f64
+    next: i64
+}
+
+const max_dict_operands = 48
+const max_matrix_scale: f64 = 1024.0
+const no_select = -1
+
+fn be_n(d: str, at: i64, size: i64) -> i64 {
+    var v = 0
+    for i in 0..size {
+        v = v << 8 | byte(d, at + i)
+    }
+    v
+}
+
+fn index_offset(d: str, ix: Index, i: i64) -> i64 {
+    be_n(d, ix.at + 3 + ix.off_size * i, ix.off_size)
+}
+
+fn index_span(d: str, ix: Index, i: i64) -> Span {
+    Span { start: ix.base + index_offset(d, ix, i), end: ix.base + index_offset(d, ix, i + 1) }
+}
+
+fn empty_index(at: i64) -> Index {
+    Index { at, count: 0, off_size: 0, base: at + 2, end: at + 2 }
+}
+
+fn read_index(d: str, at: i64, limit: i64) -> Index ! Error {
+    if at < 0 || at + 2 > limit {
+        fail Malformed("CFF ")
+    }
+    let count = be16(d, at)
+    if count == 0 {
+        return empty_index(at)
+    }
+    let off_size = byte(d, at + 2)
+    if off_size < 1 || off_size > 4 || at + 3 + off_size * (count + 1) > limit {
+        fail Malformed("CFF ")
+    }
+    let base = at + 3 + off_size * (count + 1) - 1
+    let ix = Index { at, count, off_size, base, end: 0 }
+    var previous = 1
+    for i in 0..count + 1 {
+        let offset = index_offset(d, ix, i)
+        if offset < previous || (i == 0 && offset != 1) || base + offset > limit {
+            fail Malformed("CFF ")
+        }
+        previous = offset
+    }
+    Index { at, count, off_size, base, end: base + previous }
+}
+
+fn read_operand(d: str, pos: i64, end: i64) -> Operand ! Error {
+    let b = byte(d, pos)
+    if b == 28 && pos + 3 <= end {
+        Operand { value: f64(be16_signed(d, pos + 1)), next: pos + 3 }
+    } else if b == 29 && pos + 5 <= end {
+        let v = be32(d, pos + 1)
+        Operand { value: f64(if v >= 2147483648 { v - 4294967296 } else { v }), next: pos + 5 }
+    } else if b == 30 {
+        read_real(d, pos + 1, end)?
+    } else if b >= 32 && b <= 246 {
+        Operand { value: f64(b - 139), next: pos + 1 }
+    } else if b >= 247 && b <= 250 && pos + 2 <= end {
+        Operand { value: f64((b - 247) * 256 + byte(d, pos + 1) + 108), next: pos + 2 }
+    } else if b >= 251 && b <= 254 && pos + 2 <= end {
+        Operand { value: f64(-(b - 251) * 256 - byte(d, pos + 1) - 108), next: pos + 2 }
+    } else {
+        fail Malformed("CFF ")
+    }
+}
+
+fn read_real(d: str, start: i64, end: i64) -> Operand ! Error {
+    var mantissa: f64 = 0.0
+    var scale = 0
+    var exponent = 0
+    var negative = false
+    var negative_exponent = false
+    var in_fraction = false
+    var in_exponent = false
+    var pos = start
+    for pos < end {
+        let b = byte(d, pos)
+        pos += 1
+        for half in 0..2 {
+            let nibble = if half == 0 { b >> 4 } else { b & 15 }
+            if nibble <= 9 {
+                if in_exponent {
+                    exponent = exponent * 10 + nibble
+                    if exponent > 400 {
+                        fail Malformed("CFF ")
+                    }
+                } else {
+                    mantissa = mantissa * 10.0 + f64(nibble)
+                    if in_fraction {
+                        scale += 1
+                    }
+                }
+            } else if nibble == 10 && !in_fraction && !in_exponent {
+                in_fraction = true
+            } else if nibble == 11 && !in_exponent {
+                in_exponent = true
+            } else if nibble == 12 && !in_exponent {
+                in_exponent = true
+                negative_exponent = true
+            } else if nibble == 14 && mantissa == 0.0 && scale == 0 && !in_exponent {
+                negative = true
+            } else if nibble == 15 {
+                let power = (if negative_exponent { -exponent } else { exponent }) - scale
+                let value = if power < 0 { mantissa / pow10(-power) } else { mantissa * pow10(power) }
+                return Operand { value: if negative { -value } else { value }, next: pos }
+            } else {
+                fail Malformed("CFF ")
+            }
+        }
+    }
+    fail Malformed("CFF ")
+}
+
+fn pow10(n: i64) -> f64 {
+    var v: f64 = 1.0
+    for _ in 0..n {
+        v *= 10.0
+    }
+    v
+}
+
+fn read_dict(d: str, span: Span) -> Dict ! Error {
+    var out = Dict {}
+    var operands: f64[] = []
+    var pos = span.start
+    for pos < span.end {
+        let b = byte(d, pos)
+        if b > 21 {
+            let operand = read_operand(d, pos, span.end)?
+            if operands.len >= max_dict_operands {
+                fail Malformed("CFF ")
+            }
+            operands.push(operand.value)
+            pos = operand.next
+            continue
+        }
+        pos += 1
+        var op = b
+        if b == 12 {
+            if pos >= span.end {
+                fail Malformed("CFF ")
+            }
+            op = 1200 + byte(d, pos)
+            pos += 1
+        }
+        apply_operator(mut out, op, operands)?
+        operands = []
+    }
+    if operands.len > 0 {
+        fail Malformed("CFF ")
+    }
+    out
+}
+
+fn apply_operator(mut out: Dict, op: i64, operands: f64[]) ! Error {
+    match op {
+        17 => {
+            out.char_strings = single_offset(operands)?
+        }
+        19 => {
+            out.subrs = single_offset(operands)?
+        }
+        18 => {
+            if operands.len != 2 || !(operands[0] >= 0.0 && operands[0] <= 1073741824.0) || !(operands[1] >= 0.0 && operands[1] <= 1073741824.0) {
+                fail Malformed("CFF ")
+            }
+            out.private_size = i64(operands[0])
+            out.private_at = i64(operands[1])
+        }
+        1206 => {
+            out.charstring_type = single_value(operands)?
+        }
+        1207 => {
+            if operands.len != 6 {
+                fail Malformed("CFF ")
+            }
+            out.matrix = operands
+        }
+        1230 => {
+            if operands.len != 3 {
+                fail Malformed("CFF ")
+            }
+            out.ros = true
+        }
+        1236 => {
+            out.fd_array = single_offset(operands)?
+        }
+        1237 => {
+            out.fd_select = single_offset(operands)?
+        }
+        _ => {}
+    }
+}
+
+fn single_value(operands: f64[]) -> f64 ! Error {
+    if operands.len != 1 {
+        fail Malformed("CFF ")
+    }
+    operands[0]
+}
+
+fn single_offset(operands: f64[]) -> i64 ! Error {
+    let v = single_value(operands)?
+    if !(v >= 1.0 && v <= 1073741824.0) {
+        fail Malformed("CFF ")
+    }
+    i64(v)
+}
+
+fn read_cff(data: str, table: Table, glyph_count: i64, units: i64) -> Cff ! Error {
+    let at = table.offset
+    let end = table.offset + table.length
+    if table.length < 4 || byte(data, at) != 1 || byte(data, at + 2) < 4 || at + byte(data, at + 2) > end {
+        fail Malformed("CFF ")
+    }
+    let names = read_index(data, at + byte(data, at + 2), end)?
+    let tops = read_index(data, names.end, end)?
+    if tops.count != 1 {
+        fail Malformed("CFF ")
+    }
+    let strings = read_index(data, tops.end, end)?
+    let globals = read_index(data, strings.end, end)?
+    let top = read_dict(data, index_span(data, tops, 0))?
+    if top.charstring_type != 2.0 || top.char_strings == 0 {
+        fail Malformed("CFF ")
+    }
+    let char_strings = read_index(data, at + top.char_strings, end)?
+    if char_strings.count != glyph_count {
+        fail Malformed("CFF ")
+    }
+    var privates: Private[] = []
+    var select_format = no_select
+    var select_at = 0
+    if top.ros {
+        if top.fd_array == 0 || top.fd_select == 0 {
+            fail Malformed("CFF ")
+        }
+        let fonts = read_index(data, at + top.fd_array, end)?
+        if fonts.count == 0 || fonts.count > 256 {
+            fail Malformed("CFF ")
+        }
+        for i in 0..fonts.count {
+            let font_dict = read_dict(data, index_span(data, fonts, i))?
+            privates.push(read_private(data, at, end, font_dict, top.matrix, units)?)
+        }
+        select_at = at + top.fd_select
+        select_format = check_select(data, select_at, end, glyph_count, fonts.count)?
+    } else {
+        privates.push(read_private(data, at, end, top, [], units)?)
+    }
+    Cff { char_strings, global_subrs: globals, privates, select_format, select_at }
+}
+
+fn read_private(data: str, at: i64, end: i64, owner: Dict, outer: f64[], units: i64) -> Private ! Error {
+    let matrix = font_matrix(outer, owner.matrix, units)?
+    if owner.private_size == 0 {
+        return Private { subrs: empty_index(at), matrix }
+    }
+    let private_at = at + owner.private_at
+    if owner.private_at == 0 || private_at + owner.private_size > end {
+        fail Malformed("CFF ")
+    }
+    let private = read_dict(data, Span { start: private_at, end: private_at + owner.private_size })?
+    if private.subrs == 0 {
+        return Private { subrs: empty_index(at), matrix }
+    }
+    let subrs = read_index(data, private_at + private.subrs, end)?
+    Private { subrs, matrix }
+}
+
+fn font_matrix(outer: f64[], inner: f64[], units: i64) -> Affine ! Error {
+    var m: f64[] = [0.001, 0.0, 0.0, 0.001, 0.0, 0.0]
+    if outer.len == 6 && inner.len == 6 {
+        m = [
+            inner[0] * outer[0] + inner[1] * outer[2]
+            inner[0] * outer[1] + inner[1] * outer[3]
+            inner[2] * outer[0] + inner[3] * outer[2]
+            inner[2] * outer[1] + inner[3] * outer[3]
+            inner[4] * outer[0] + inner[5] * outer[2] + outer[4]
+            inner[4] * outer[1] + inner[5] * outer[3] + outer[5]
+        ]
+    } else if outer.len == 6 {
+        m = outer
+    } else if inner.len == 6 {
+        m = inner
+    }
+    var v: f64[] = []
+    for x in m {
+        let scaled = snapped(x * f64(units))
+        if !(scaled > -max_matrix_scale && scaled < max_matrix_scale) {
+            fail Malformed("CFF ")
+        }
+        v.push(scaled)
+    }
+    Affine { a: v[0], b: v[1], c: v[2], d: v[3], e: v[4], f: v[5] }
+}
+
+fn snapped(v: f64) -> f64 {
+    let whole = floor(v + 0.5)
+    if v - whole < 0.000001 && whole - v < 0.000001 {
+        whole
+    } else {
+        v
+    }
+}
+
+fn check_select(data: str, at: i64, end: i64, glyph_count: i64, fonts: i64) -> i64 ! Error {
+    let format = byte(data, at)
+    if format == 0 {
+        if at + 1 + glyph_count > end {
+            fail Malformed("CFF ")
+        }
+        for g in 0..glyph_count {
+            if byte(data, at + 1 + g) >= fonts {
+                fail Malformed("CFF ")
+            }
+        }
+        return 0
+    }
+    if format != 3 {
+        fail Malformed("CFF ")
+    }
+    let ranges = be16(data, at + 1)
+    if ranges < 1 || at + 3 + 3 * ranges + 2 > end || be16(data, at + 3) != 0 || be16(data, at + 3 + 3 * ranges) != glyph_count {
+        fail Malformed("CFF ")
+    }
+    var previous = -1
+    for i in 0..ranges {
+        let first = be16(data, at + 3 + 3 * i)
+        if first <= previous || first >= glyph_count || byte(data, at + 5 + 3 * i) >= fonts {
+            fail Malformed("CFF ")
+        }
+        previous = first
+    }
+    3
+}
+
+fn font_dict_of(f: Font, c: Cff, glyph: i64) -> i64 {
+    if c.select_format == 0 {
+        return byte(f.data, c.select_at + 1 + glyph)
+    }
+    if c.select_format != 3 {
+        return 0
+    }
+    var lo = 0
+    var hi = be16(f.data, c.select_at + 1)
+    for lo + 1 < hi {
+        let mid = (lo + hi) / 2
+        if be16(f.data, c.select_at + 3 + 3 * mid) <= glyph {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    byte(f.data, c.select_at + 5 + 3 * lo)
+}
