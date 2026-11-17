@@ -1,0 +1,192 @@
+import std/crypto
+import std/crypto/x509
+import std/io
+import std/os
+import std/process
+import std/ssh/agent
+import std/ssh/key
+import std/ssh/wire
+import std/sys
+
+extern "kernel32" {
+    fn CreateNamedPipeA(name: ptr[u8], open_mode: u32, pipe_mode: u32, instances: u32, out_size: u32, in_size: u32, timeout: u32, security: ptr) -> i64
+    fn ConnectNamedPipe(h: i64, overlapped: ptr) -> i32
+    fn DisconnectNamedPipe(h: i64) -> i32
+}
+
+const connections = 2
+const duplex: u32 = 3
+const reject_remote_clients: u32 = 8
+const pipe_buffer: u32 = 65536
+
+fn fixed_signer() -> key.Signer ! key.Error {
+    var seed: u8[] = []
+    for i in 0..32 {
+        seed.push(u8(i * 5 + 1))
+    }
+    key.signer(x509.PrivateKey.Ed25519(seed))?
+}
+
+fn identities_answer(signer: key.Signer) -> u8[] {
+    var out: u8[] = [12]
+    wire.put_u32(mut out, 1)
+    wire.put_string(mut out, signer.public.blob)
+    wire.put_str(mut out, "fixture")
+    out
+}
+
+fn sign_answer(signer: key.Signer, request: u8[]) -> u8[] {
+    let r = wire.reader(request[1..])
+    let blob = wire.read_string(r) catch {
+        e => return [5]
+    }
+    let data = wire.read_string(r) catch {
+        e => return [5]
+    }
+    if str(blob) != str(signer.public.blob) {
+        return [5]
+    }
+    let signature = signer.sign("ssh-ed25519", data) catch {
+        e => return [5]
+    }
+    var out: u8[] = [14]
+    wire.put_string(mut out, signature)
+    out
+}
+
+fn answer(signer: key.Signer, request: u8[]) -> u8[] {
+    match request[0] {
+        11 => identities_answer(signer)
+        13 => sign_answer(signer, request)
+        _ => [5]
+    }
+}
+
+fn serve_connection(h: i64, signer: key.Signer) {
+    let reader = io.reader(sys.stream(h))
+    for {
+        let header = io.read_exact(reader, 4) catch {
+            e => return
+        }
+        let request = io.read_exact(reader, io.be32(header, 0)) catch {
+            e => return
+        }
+        let reply = answer(signer, request)
+        var framed: u8[] = []
+        io.put_be32(mut framed, reply.len)
+        io.append(mut framed, reply)
+        sys.write_all(h, framed) catch {
+            e => return
+        }
+    }
+}
+
+fn serve(name: str) ! key.Error {
+    let signer = fixed_signer()?
+    let h = CreateNamedPipeA(cstr(name), duplex, reject_remote_clients, 1, pipe_buffer, pipe_buffer, 0, null)
+    if h == -1 {
+        return
+    }
+    sys.write_all(1, bytes("ready\n")) or return
+    for _ in 0..connections {
+        ConnectNamedPipe(h, null)
+        serve_connection(h, signer)
+        DisconnectNamedPipe(h)
+    }
+}
+
+fn must_line(s: io.Stream?) -> str ! io.Error {
+    match s {
+        some(x) => io.read_line(io.reader(x))?
+        none => fail NotConnected
+    }
+}
+
+fn sign_one(signer: key.Signer, data: u8[], report: chan[bool]) {
+    let blob = signer.sign("ssh-ed25519", data) catch {
+        e => {
+            report <- false
+            return
+        }
+    }
+    report <- key.verify(signer.public, "ssh-ed25519", data, blob)
+}
+
+fn exercise(path: str) ! agent.Error {
+    using a = agent.connect(path)?
+    let held = agent.identities(a)?
+    let expected = fixed_signer() catch {
+        e => fail agent.Error.Malformed
+    }
+    print("identities: {held.len}, comment {held[0].comment}, key matches: {key.equal(held[0].key, expected.public)}")
+
+    let data = bytes("data to sign")
+    let blob = agent.sign(a, held[0].key, "ssh-ed25519", data)?
+    let verifies = key.verify(held[0].key, "ssh-ed25519", data, blob)
+    print("signature verifies: {verifies}")
+
+    let signers = agent.signers(a)?
+    let report = chan[bool](8)
+    for _ in 0..8 {
+        spawn sign_one(signers[0], data, report)
+    }
+    var verified = 0
+    for _ in 0..8 {
+        if (<-report) ?? false {
+            verified += 1
+        }
+    }
+    print("concurrent signatures verified: {verified}")
+
+    let stranger = key.signer(x509.PrivateKey.Ed25519(crypto.random(32))) catch {
+        e => fail agent.Error.Malformed
+    }
+    let refused = agent.sign(a, stranger.public, "ssh-ed25519", data) catch {
+        agent.Error.Refused => bytes("refused")
+        e => fail e
+    }
+    print("unknown key: {str(refused)}")
+}
+
+fn through_environment(path: str) ! agent.Error {
+    os.set_env("SSH_AUTH_SOCK", path) catch {
+        e => fail agent.Error.NoAgent
+    }
+    using a = agent.connect_env()?
+    let held = agent.identities(a)?
+    print("connect_env identities: {held.len}")
+}
+
+fn missing(path: str) {
+    using a = agent.connect(path) catch {
+        e => {
+            print("missing pipe: {e}")
+            return
+        }
+    }
+    print("missing pipe: connected")
+}
+
+fn main() ! agent.Error {
+    let args = os.args()
+    if args.len > 2 {
+        serve(args[2]) catch {
+            e => return
+        }
+        return
+    }
+    let name = "\\\\.\\pipe\\low-ssh-agent-fixture.{os.pid()}"
+    let program = os.executable() catch {
+        e => fail agent.Error.NoAgent
+    }
+    using child = process.start(process.Command { program, args: ["serve", name], stdout: Piped }) catch {
+        e => fail agent.Error.Io(e)
+    }
+    let ready = must_line(child.handle.stdout) catch {
+        e => fail agent.Error.Io(e)
+    }
+    print("server {ready}")
+    exercise(name)?
+    through_environment(name)?
+    missing("\\\\.\\pipe\\low-ssh-agent-fixture.absent.{os.pid()}")
+}
