@@ -11,6 +11,7 @@ struct Hitbox {
     element: Element
     offset: geometry.Point
     scroll_max: geometry.Point
+    rect: geometry.Rect
 }
 
 struct Laid {
@@ -46,6 +47,17 @@ struct State {
     rem: f32 = 16.0
     hitboxes: Hitbox[] = []
     hits: bool[] = []
+    inside: bool[] = []
+    wheel: bool[] = []
+    viewport: geometry.Rect = geometry.Rect {}
+    rects: [str: geometry.Rect] = [:]
+    last_rects: [str: geometry.Rect] = [:]
+    deferred: DeferredDraw[] = []
+    anchor_shifts: geometry.Point[] = []
+    anchors_painted: i64 = 0
+    layers: Layer[] = []
+    layer_draws: LayerDraw[] = []
+    tip: TooltipState = TooltipState {}
     painted: i64 = 0
     pointer: geometry.Point = geometry.Point {}
     pointer_inside: bool = false
@@ -157,7 +169,7 @@ pub fn pointer_cursor(cx: Context) -> platform.Cursor {
             some(shape) => return shape
             none => {}
         }
-        i = h.parent
+        i = ancestor_hit(st, h.parent)
     }
     platform.Cursor.Arrow
 }
@@ -258,19 +270,31 @@ pub fn frame(cx: Context, render: fn() -> Element, size: geometry.Size, scale: f
     var t = layout.tree(scale)
     let laid = build(st, mut t, root, default_text_style(st))
     layout.compute(mut t, laid.node, size)
-    let whole = Walk { parent: -1, clip: geometry.rect(0.0, 0.0, size.width, size.height), shift: geometry.Point {} }
+    st.viewport = geometry.rect(0.0, 0.0, size.width, size.height)
+    let whole = Walk { parent: -1, clip: st.viewport, shift: geometry.Point {} }
     st.hitboxes = []
     st.root_hitbox = -1
+    st.last_rects = st.rects
+    st.rects = [:]
+    st.anchor_shifts = []
+    st.deferred = []
     prepaint(st, t, laid, "0", whole)
-    st.hits = hit_test(st)
+    prepaint_deferred(st)
+    prepaint_layers(st, scale)
+    prepaint_tooltip(st, scale)
+    hit_test(st)
     st.hovered = hovered_keys(st)
     let device_width = i64(floor(size.width * scale + 0.5))
     let device_height = i64(floor(size.height * scale + 0.5))
     var sc = scene.empty(device_width, device_height, st.background)
     sc.text = uitext.params(st.text)
     st.painted = 0
+    st.anchors_painted = 0
     st.caret = none
     paint(st, t, mut sc, laid, whole, default_text_style(st), scale)
+    paint_deferred(st, mut sc, scale)
+    paint_layers(st, mut sc, scale)
+    paint_tooltip(st, mut sc, scale)
     sc
 }
 
@@ -329,7 +353,7 @@ fn clips(s: layout.Style) -> bool {
 }
 
 fn interactive(e: Element) -> bool {
-    e.focusable || e.listeners.len > 0 || e.conditionals.len > 0 || scrolls(e.style) || e.cursor != none || e.key_context != none
+    e.focusable || e.listeners.len > 0 || e.conditionals.len > 0 || scrolls(e.style) || e.cursor != none || e.key_context != none || e.behavior != Normal
 }
 
 fn larger(a: f32, b: f32) -> f32 {
@@ -383,28 +407,45 @@ fn build(st: *State, mut t: layout.Tree, e: Element, ts: TextStyle) -> Laid {
 }
 
 fn prepaint(st: *State, t: layout.Tree, laid: Laid, key_path: str, w: Walk) {
+    if laid.element.deferred {
+        let walk = Walk { parent: w.parent, clip: st.viewport, shift: w.shift }
+        defer_draw(st, DeferredDraw { tree: t, laid, key_path, walk, text: default_text_style(st), priority: laid.element.priority })
+        return
+    }
+    prepaint_element(st, t, laid, key_path, w)
+}
+
+fn prepaint_element(st: *State, t: layout.Tree, laid: Laid, key_path: str, w: Walk) {
     let e = laid.element
     if e.style.display == None {
         return
     }
     let key = if e.id != "" { e.id } else { key_path }
     let rect = geometry.offset(layout.rect(t, laid.node), w.shift.x, w.shift.y)
+    if e.id != "" || interactive(e) {
+        st.rects[key] = rect
+    }
     var inner = w
     if interactive(e) {
         let range = scroll_range(t, laid)
-        let offset = settled_offset(st, key, e.style, range)
-        st.hitboxes.push(Hitbox { bounds: geometry.intersect(rect, w.clip), key, parent: w.parent, element: e, offset, scroll_max: range })
+        let scrolled = settled_offset(st, key, e.style, range)
+        st.hitboxes.push(Hitbox { bounds: geometry.intersect(rect, w.clip), key, parent: w.parent, element: e, offset: scrolled, scroll_max: range, rect })
         inner.parent = st.hitboxes.len - 1
         if w.parent < 0 && key_path == "0" {
             st.root_hitbox = inner.parent
         }
-        inner.shift = geometry.point(w.shift.x - offset.x, w.shift.y - offset.y)
+        inner.shift = geometry.point(w.shift.x - scrolled.x, w.shift.y - scrolled.y)
     }
     if is_text(e) || is_field(e) {
         return
     }
     if clips(e.style) {
         inner.clip = geometry.intersect(w.clip, clip_bounds(geometry.inset(rect, e.style.border), e.style))
+    }
+    if is_anchored(e) {
+        let moved = anchored_shift(st, t, laid, anchoring_of(e), inner)
+        st.anchor_shifts.push(moved)
+        inner.shift = geometry.point(inner.shift.x + moved.x, inner.shift.y + moved.y)
     }
     for i, c in laid.children {
         prepaint(st, t, c, "{key}/{i}", inner)
@@ -461,6 +502,14 @@ fn clip_bounds(padding_box: geometry.Rect, s: layout.Style) -> geometry.Rect {
 }
 
 fn paint(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, w: Walk, ts: TextStyle, scale: f32) {
+    if laid.element.deferred {
+        defer_draw(st, DeferredDraw { tree: t, laid, key_path: "", walk: w, text: ts, priority: laid.element.priority })
+        return
+    }
+    paint_element(st, t, mut sc, laid, w, ts, scale)
+}
+
+fn paint_element(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, w: Walk, ts: TextStyle, scale: f32) {
     let e = laid.element
     if e.style.display == None {
         return
@@ -497,6 +546,11 @@ fn paint(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, w: Walk, t
         if clipping {
             let bounds = clip_bounds(geometry.inset(r, e.style.border), e.style)
             scene.push_clip(mut sc, geometry.cover(bounds, scale))
+        }
+        if is_anchored(e) {
+            let moved = st.anchor_shifts[st.anchors_painted]
+            st.anchors_painted += 1
+            inner.shift = geometry.point(inner.shift.x + moved.x, inner.shift.y + moved.y)
         }
         for c in laid.children {
             paint(st, t, mut sc, c, inner, own, scale)
@@ -565,12 +619,42 @@ fn paint_border(mut sc: scene.Scene, r: geometry.Rect, border: geometry.Edges, v
     scene.push_quad(mut sc, quad)
 }
 
-fn hit_test(st: *State) -> bool[] {
+fn hit_test(st: *State) {
+    var inside: bool[] = []
     var hits: bool[] = []
+    var wheel: bool[] = []
     for h in st.hitboxes {
-        hits.push(st.pointer_inside && geometry.contains(h.bounds, st.pointer))
+        inside.push(st.pointer_inside && geometry.contains(h.bounds, st.pointer))
+        hits.push(false)
+        wheel.push(false)
     }
-    hits
+    var hover_blocked = false
+    var i = st.hitboxes.len - 1
+    for i >= 0 {
+        if inside[i] {
+            wheel[i] = true
+            hits[i] = !hover_blocked
+            let b = st.hitboxes[i].element.behavior
+            if b == BlockMouseExceptScroll {
+                hover_blocked = true
+            }
+            if b == BlockMouse {
+                i = 0
+            }
+        }
+        i -= 1
+    }
+    st.inside = inside
+    st.hits = hits
+    st.wheel = wheel
+}
+
+fn ancestor_hit(st: *State, at: i64) -> i64 {
+    var i = at
+    for i >= 0 && !st.hits[i] {
+        i = st.hitboxes[i].parent
+    }
+    i
 }
 
 fn hovered_keys(st: *State) -> str {
@@ -601,7 +685,7 @@ fn topmost(st: *State) -> i64 {
 }
 
 fn refresh_hover(st: *State) {
-    st.hits = hit_test(st)
+    hit_test(st)
     let keys = hovered_keys(st)
     if keys != st.hovered {
         st.hovered = keys
@@ -636,6 +720,7 @@ pub fn dispatch(cx: Context, event: platform.Event) {
         PointerLeft => {
             st.pointer_inside = false
             refresh_hover(st)
+            tooltip_check(st)
         }
         PointerDown(b) => {
             st.modifiers = b.modifiers
@@ -674,10 +759,13 @@ fn pointer_moved(st: *State, x: f32, y: f32) {
     move_pointer(st, x, y)
     if moved {
         mouse_move(st)
+        tooltip_moved(st)
     }
 }
 
 fn mouse_down(st: *State, b: platform.ButtonEvent) {
+    tooltip_pressed(st)
+    close_outside(st)
     hold_button(st, b.button)
     let event = MouseDownEvent { button: b.button, position: st.pointer, modifiers: b.modifiers, click_count: b.clicks }
     if b.button == platform.Button.Left {
@@ -693,18 +781,26 @@ fn mouse_down(st: *State, b: platform.ButtonEvent) {
         field_press(st, b.clicks)
     }
     run_mouse_down(st, event)
+    if b.button == platform.Button.Right {
+        open_context_menu(st)
+    }
 }
 
 fn focus_under_pointer(st: *State) {
+    let root = trap(st)
     var i = topmost(st)
     for i >= 0 {
         if st.hitboxes[i].element.focusable {
-            move_focus(st, st.hitboxes[i].key)
+            if within_trap(st, i, root) {
+                move_focus(st, st.hitboxes[i].key)
+            }
             return
         }
-        i = st.hitboxes[i].parent
+        i = ancestor_hit(st, st.hitboxes[i].parent)
     }
-    move_focus(st, "")
+    if root < 0 {
+        move_focus(st, "")
+    }
 }
 
 fn mouse_up(st: *State, b: platform.ButtonEvent) {
@@ -724,32 +820,37 @@ fn mouse_up(st: *State, b: platform.ButtonEvent) {
     for i >= 0 {
         let h = st.hitboxes[i]
         if pressed[h.key] ?? false {
-            if run_click(h.element, click) {
+            if run_click(st, i, click) {
                 return
             }
         }
-        i = h.parent
+        i = ancestor_hit(st, h.parent)
     }
 }
 
-fn run_click(e: Element, click: ClickEvent) -> bool {
-    for l in e.listeners {
+fn run_click(st: *State, at: i64, click: ClickEvent) -> bool {
+    for l in st.hitboxes[at].element.listeners {
         match l {
             Click(f) => {
                 f(click)
                 return true
             }
-            _ => {}
+            _ => {
+                if run_trigger(st, at, l) {
+                    return true
+                }
+            }
         }
     }
     false
 }
 
 fn scroll_wheel(st: *State, dx: f32, dy: f32) {
+    tooltip_pressed(st)
     let event = ScrollEvent { position: st.pointer, dx, dy }
-    var i = topmost(st)
+    var i = st.hitboxes.len - 1
     for i >= 0 {
-        if st.hits[i] {
+        if st.wheel[i] {
             let h = st.hitboxes[i]
             run_scrolls(h.element, event)
             if scroll_by(st, i, dx, dy) {
@@ -787,6 +888,9 @@ fn scroll_by(st: *State, at: i64, dx: f32, dy: f32) -> bool {
 }
 
 fn key(st: *State, k: platform.KeyEvent) {
+    if k.pressed && layer_key(st, k) {
+        return
+    }
     if k.pressed {
         press_key(st, k)
     } else {
@@ -816,7 +920,7 @@ fn deliver_key(st: *State, k: platform.KeyEvent) {
         if focused >= 0 {
             let bounds = st.hitboxes[focused].bounds
             let click = ClickEvent { position: geometry.point(bounds.x, bounds.y + bounds.height), keyboard: true }
-            run_click(st.hitboxes[focused].element, click)
+            run_click(st, focused, click)
         }
     }
 }
@@ -850,9 +954,10 @@ fn activates(k: platform.Key) -> bool {
 }
 
 fn cycle_focus(st: *State, forward: bool) {
+    let root = trap(st)
     var order: i64[] = []
     for i, h in st.hitboxes {
-        if h.element.focusable {
+        if h.element.focusable && within_trap(st, i, root) {
             order.push(i)
         }
     }
