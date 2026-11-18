@@ -6,7 +6,7 @@ import std/time/datetime
 
 /// A zip writer made by `writer` or `stream_writer`.
 ///
-/// Each entry is written as `add` is called, compressed in memory, and `finish` writes the central directory. Entries are written without data descriptors.
+/// `add` writes an entry from data held in memory, compressing it whole with its local header carrying the CRC-32 and sizes. `begin_entry` writes an entry in pieces, with a data descriptor after the data. `finish` writes the central directory.
 pub struct Writer {
     sink: io.Stream?
     data: u8[]
@@ -15,6 +15,20 @@ pub struct Writer {
     written: i64
     force64: bool
     closed: bool
+    streaming: bool
+}
+
+/// An entry being written in pieces, made by `begin_entry`.
+///
+/// `write_entry` adds data and `end_entry` completes the entry. The writer keeps the compressor's state, a running CRC-32 and the byte counts, never the entry's data.
+pub struct EntryWriter {
+    writer: *Writer
+    head: Prepared
+    mtime: i64
+    offset: i64
+    encoder: *deflate.Encoder?
+    crc: *hash.Crc32
+    done: bool
 }
 
 struct Prepared {
@@ -23,24 +37,28 @@ struct Prepared {
     method: i64
     crc: i64
     size: i64
+    packed: i64
     flags: i64
     mode: i64
     external: i64
+    wide: bool
 }
 
 /// Returns a `Writer` that collects the archive in memory; `output` returns the bytes.
 pub fn writer() -> *Writer {
-    new(Writer { sink: none, data: [], central: [], count: 0, written: 0, force64: false, closed: false })
+    new(Writer { sink: none, data: [], central: [], count: 0, written: 0, force64: false, closed: false, streaming: false })
 }
 
 /// Returns a `Writer` that writes the archive to `sink`.
 ///
 /// The writer does not close `sink`, and `output` stays empty.
 pub fn stream_writer(sink: io.Stream) -> *Writer {
-    new(Writer { sink, data: [], central: [], count: 0, written: 0, force64: false, closed: false })
+    new(Writer { sink, data: [], central: [], count: 0, written: 0, force64: false, closed: false, streaming: false })
 }
 
-/// Makes the writer use zip64 records for every entry added after the call and for the end of the archive, even when no size or count needs them.
+/// Makes the writer use zip64 records for every entry added or begun after the call and for the end of the archive, even when no size or count needs them.
+///
+/// An entry from `begin_entry` takes sizes of 4 GiB or more only when the call precedes it.
 pub fn force_zip64(w: *Writer) {
     w.force64 = true
 }
@@ -90,7 +108,7 @@ fn timestamp_extra(mtime: i64) -> u8[] {
 }
 
 fn validate(w: *Writer, e: Entry) ! io.Error {
-    if w.closed || e.name.len == 0 || e.name.len > saturated16 || text.index_byte(e.name, 0) >= 0 {
+    if w.closed || w.streaming || e.name.len == 0 || e.name.len > saturated16 || text.index_byte(e.name, 0) >= 0 {
         fail Invalid
     }
 }
@@ -113,17 +131,17 @@ struct Packed {
     method: i64
 }
 
-fn prepare(e: Entry, data: u8[]) -> Prepared {
+fn prepare(e: Entry, data: u8[], force: bool) -> Prepared {
     let perm = e.mode & 0o7777
     match e.kind {
         Dir => {
             let name = if text.ends_with(e.name, "/") { e.name } else { "{e.name}/" }
-            Prepared { name, body: [], method: 0, crc: 0, size: 0, flags: flags_of(name), mode: 0o40000 | perm, external: 0x10 }
+            Prepared { name, body: [], method: 0, crc: 0, size: 0, packed: 0, flags: flags_of(name), mode: 0o40000 | perm, external: 0x10, wide: force }
         }
-        Symlink => Prepared { name: e.name, body: data, method: 0, crc: i64(hash.crc32(data)), size: data.len, flags: flags_of(e.name), mode: 0o120000 | perm, external: 0 }
+        Symlink => Prepared { name: e.name, body: data, method: 0, crc: i64(hash.crc32(data)), size: data.len, packed: data.len, flags: flags_of(e.name), mode: 0o120000 | perm, external: 0, wide: force || data.len >= saturated32 }
         File => {
             let packed = compress(data, e.method)
-            Prepared { name: e.name, body: packed.body, method: packed.method, crc: i64(hash.crc32(data)), size: data.len, flags: flags_of(e.name), mode: 0o100000 | perm, external: 0 }
+            Prepared { name: e.name, body: packed.body, method: packed.method, crc: i64(hash.crc32(data)), size: data.len, packed: packed.body.len, flags: flags_of(e.name), mode: 0o100000 | perm, external: 0, wide: force || data.len >= saturated32 || packed.body.len >= saturated32 }
         }
     }
 }
@@ -132,26 +150,25 @@ fn flags_of(name: str) -> i64 {
     if text.is_ascii(name) { 0 } else { 0x800 }
 }
 
-fn local_header(w: *Writer, p: Prepared, mtime: i64) -> u8[] {
-    let wide = w.force64 || p.size >= saturated32 || p.body.len >= saturated32
+fn local_header(p: Prepared, mtime: i64) -> u8[] {
     var extra: u8[] = []
-    if wide {
+    if p.wide {
         io.put_le16(mut extra, 1)
         io.put_le16(mut extra, 16)
         io.put_le64(mut extra, p.size)
-        io.put_le64(mut extra, p.body.len)
+        io.put_le64(mut extra, p.packed)
     }
     io.append(mut extra, timestamp_extra(mtime))
     var out: u8[] = []
     io.put_le32(mut out, local_signature)
-    io.put_le16(mut out, if wide { 45 } else { 20 })
+    io.put_le16(mut out, if p.wide { 45 } else { 20 })
     io.put_le16(mut out, p.flags)
     io.put_le16(mut out, p.method)
     io.put_le16(mut out, dos_clock(mtime))
     io.put_le16(mut out, dos_date(mtime))
     io.put_le32(mut out, p.crc)
-    io.put_le32(mut out, if wide { saturated32 } else { p.body.len })
-    io.put_le32(mut out, if wide { saturated32 } else { p.size })
+    io.put_le32(mut out, if p.wide { saturated32 } else { p.packed })
+    io.put_le32(mut out, if p.wide { saturated32 } else { p.size })
     io.put_le16(mut out, p.name.len)
     io.put_le16(mut out, extra.len)
     text.append(mut out, p.name)
@@ -160,7 +177,7 @@ fn local_header(w: *Writer, p: Prepared, mtime: i64) -> u8[] {
 }
 
 fn add_central(w: *Writer, p: Prepared, mtime: i64, offset: i64) {
-    let sizes_wide = w.force64 || p.size >= saturated32 || p.body.len >= saturated32
+    let sizes_wide = p.wide
     let offset_wide = w.force64 || offset >= saturated32
     var extra: u8[] = []
     if sizes_wide || offset_wide {
@@ -168,7 +185,7 @@ fn add_central(w: *Writer, p: Prepared, mtime: i64, offset: i64) {
         io.put_le16(mut extra, (if sizes_wide { 16 } else { 0 }) + (if offset_wide { 8 } else { 0 }))
         if sizes_wide {
             io.put_le64(mut extra, p.size)
-            io.put_le64(mut extra, p.body.len)
+            io.put_le64(mut extra, p.packed)
         }
         if offset_wide {
             io.put_le64(mut extra, offset)
@@ -184,7 +201,7 @@ fn add_central(w: *Writer, p: Prepared, mtime: i64, offset: i64) {
     io.put_le16(mut record, dos_clock(mtime))
     io.put_le16(mut record, dos_date(mtime))
     io.put_le32(mut record, p.crc)
-    io.put_le32(mut record, if sizes_wide { saturated32 } else { p.body.len })
+    io.put_le32(mut record, if sizes_wide { saturated32 } else { p.packed })
     io.put_le32(mut record, if sizes_wide { saturated32 } else { p.size })
     io.put_le16(mut record, p.name.len)
     io.put_le16(mut record, extra.len)
@@ -203,14 +220,114 @@ fn add_central(w: *Writer, p: Prepared, mtime: i64, offset: i64) {
 ///
 /// A `File` is compressed per `e.method`. A `Symlink` stores `data` as the link target. A `Dir` stores no data and gets a trailing `/` when it lacks one. The type and the low 12 bits of `e.mode` are recorded as Unix attributes, `e.mtime` as an MS-DOS timestamp and as an extended timestamp when it is between `0` and `0xFFFFFFFF`, and a non-ASCII name sets the UTF-8 flag. Sizes or offsets of `0xFFFFFFFF` or more are written as zip64 extra fields.
 ///
-/// Fails with `Invalid` after `finish`, for an empty name, a name longer than 65535 bytes and a name with a NUL byte, and with the error of the sink.
+/// Fails with `Invalid` after `finish`, while an entry from `begin_entry` is open, for an empty name, a name longer than 65535 bytes and a name with a NUL byte, and with the error of the sink.
 pub fn add(w: *Writer, e: Entry, data: u8[]) ! io.Error {
     validate(w, e)?
-    let p = prepare(e, data)
+    let p = prepare(e, data, w.force64)
     let offset = w.written
-    emit(w, local_header(w, p, e.mtime))?
+    emit(w, local_header(p, e.mtime))?
     emit(w, p.body)?
     add_central(w, p, e.mtime, offset)
+}
+
+/// Starts the file entry `e` and returns the `EntryWriter` that takes its data in pieces.
+///
+/// The local header is written at once with general purpose flag bit 3 set and the CRC-32 and sizes zero; `end_entry` writes them in a data descriptor after the data and in the central directory. `e.method` is `Deflate` for streaming raw deflate at level 6, and any other method stores the data as it arrives. Unlike `add`, a `Deflate` entry is never stored when deflate does not shrink it. The name, mode, modification time and UTF-8 flag are recorded as `add` records them.
+///
+/// The data descriptor cannot be widened later, so its sizes are 8 bytes and the local header carries a zip64 extra field only when the writer is forced with `force_zip64` before this call. Otherwise `write_entry` fails with `TooLarge` when the compressed or the uncompressed size reaches `0xFFFFFFFF`; call `force_zip64` first for an entry that can reach 4 GiB.
+///
+/// Only a `File` streams: a `Dir` or a `Symlink` fails with `Invalid`, as does a call after `finish`, while another entry is open, for an empty name, a name longer than 65535 bytes and a name with a NUL byte. It also fails with the error of the sink. While the entry is open, `add`, `add_file`, `add_dir`, `add_symlink`, `begin_entry` and `finish` fail with `Invalid`.
+pub fn begin_entry(w: *Writer, e: Entry) -> *EntryWriter ! io.Error {
+    validate(w, e)?
+    match e.kind {
+        File => {}
+        _ => fail Invalid
+    }
+    var head = prepare(e, [], w.force64)
+    head.flags = head.flags | 8
+    head.method = match e.method {
+        Deflate => 8
+        _ => 0
+    }
+    let offset = w.written
+    emit(w, local_header(head, e.mtime))?
+    w.streaming = true
+    let ew = new(EntryWriter { writer: w, head, mtime: e.mtime, offset, encoder: none, crc: hash.crc32_new(), done: false })
+    if head.method == 8 {
+        ew.encoder = deflate.encoder(Raw, 6, fn(chunk) { put_packed(ew, chunk) })
+    }
+    ew
+}
+
+fn put_packed(ew: *EntryWriter, chunk: u8[]) ! io.Error {
+    if !ew.head.wide && ew.head.packed + chunk.len >= saturated32 {
+        fail TooLarge
+    }
+    emit(ew.writer, chunk)?
+    ew.head.packed += chunk.len
+}
+
+fn put_piece(ew: *EntryWriter, chunk: u8[]) ! io.Error {
+    if !ew.head.wide && ew.head.size + chunk.len >= saturated32 {
+        fail TooLarge
+    }
+    hash.crc32_update(ew.crc, chunk)
+    ew.head.size += chunk.len
+    match ew.encoder {
+        some(enc) => deflate.encode(enc, chunk)?
+        none => put_packed(ew, chunk)?
+    }
+}
+
+/// Adds `chunk` to the entry, compressing it or storing it and passing the result on to the archive's output before the call returns, apart from what the compressor buffers.
+///
+/// The chunk is not kept. Fails with `Invalid` after `end_entry` or after an earlier failure of this entry, with `TooLarge` when the entry reaches `0xFFFFFFFF` bytes compressed or uncompressed and the writer was not forced to zip64 before `begin_entry`, and with the error of the sink. After a failure the entry is abandoned: it is not recorded, and `add` and `finish` on the writer fail with `Invalid`.
+pub fn write_entry(ew: *EntryWriter, chunk: u8[]) ! io.Error {
+    if ew.done {
+        fail Invalid
+    }
+    put_piece(ew, chunk) catch {
+        e => {
+            ew.done = true
+            fail e
+        }
+    }
+}
+
+fn descriptor(ew: *EntryWriter) -> u8[] {
+    var out: u8[] = []
+    io.put_le32(mut out, 0x08074b50)
+    io.put_le32(mut out, ew.head.crc)
+    if ew.head.wide {
+        io.put_le64(mut out, ew.head.packed)
+        io.put_le64(mut out, ew.head.size)
+    } else {
+        io.put_le32(mut out, ew.head.packed)
+        io.put_le32(mut out, ew.head.size)
+    }
+    out
+}
+
+fn close_entry(ew: *EntryWriter) ! io.Error {
+    match ew.encoder {
+        some(enc) => deflate.finish(enc)?
+        none => {}
+    }
+    ew.head.crc = i64(hash.crc32_sum(ew.crc))
+    emit(ew.writer, descriptor(ew))?
+}
+
+/// Finishes the entry: completes the compressed data, writes the data descriptor with the CRC-32 and the compressed and uncompressed sizes, and records the entry in the central directory.
+///
+/// Fails with `Invalid` when the entry is already ended or abandoned, and with the error of the sink, which abandons the entry as `write_entry` does. After a successful call the writer accepts another entry or `finish`.
+pub fn end_entry(ew: *EntryWriter) ! io.Error {
+    if ew.done {
+        fail Invalid
+    }
+    ew.done = true
+    close_entry(ew)?
+    add_central(ew.writer, ew.head, ew.mtime, ew.offset)
+    ew.writer.streaming = false
 }
 
 /// Writes a regular file `name` with `data` compressed with `method`, with mode `0o644` and a modification time of `0`.
@@ -230,10 +347,13 @@ pub fn add_symlink(w: *Writer, name: str, target: str) ! io.Error {
 
 /// Writes the central directory and the end of central directory record.
 ///
-/// zip64 end records are added when the writer is forced, when the entry count reaches `0xFFFF` or when the directory size or offset reaches `0xFFFFFFFF`. A second call does nothing. After `finish`, `add` fails with `Invalid`.
+/// zip64 end records are added when the writer is forced, when the entry count reaches `0xFFFF` or when the directory size or offset reaches `0xFFFFFFFF`. A second call does nothing. After `finish`, `add` and `begin_entry` fail with `Invalid`, and `finish` itself fails with `Invalid` while an entry from `begin_entry` is open.
 pub fn finish(w: *Writer) ! io.Error {
     if w.closed {
         return
+    }
+    if w.streaming {
+        fail Invalid
     }
     w.closed = true
     let offset = w.written

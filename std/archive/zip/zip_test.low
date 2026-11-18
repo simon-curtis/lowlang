@@ -1,0 +1,332 @@
+import std/archive/zip
+import std/hash
+import std/io
+import std/testing
+import std/text
+
+struct Sink {
+    seen: u8[]
+}
+
+fn error_name(e: io.Error) -> str {
+    match e {
+        Invalid => "Invalid"
+        _ => "other"
+    }
+}
+
+fn sample(n: i64, seed: i64) -> u8[] {
+    var out = io.buffer(n)
+    var x = seed
+    for i in 0..n {
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        out[i] = if (i / 64) % 3 == 0 { u8((x >> 16) & 255) } else { u8(97 + (i % 26)) }
+    }
+    out
+}
+
+fn no_archive() -> zip.Archive {
+    zip.Archive { data: [], limits: zip.Limits {}, entries: [], comment: "" }
+}
+
+fn no_bytes() -> u8[] {
+    []
+}
+
+fn no_flags() -> str[] {
+    []
+}
+
+fn missing() -> zip.Entry {
+    zip.Entry { name: "" }
+}
+
+fn stream_in(ew: *zip.EntryWriter, data: u8[], piece: i64) ! io.Error {
+    var at = 0
+    for at < data.len {
+        let stop = if at + piece < data.len { at + piece } else { data.len }
+        ew.write_entry(data[at..stop])?
+        at = stop
+    }
+}
+
+fn build_mixed(deflated: u8[], stored: u8[]) -> u8[] ! io.Error {
+    let w = zip.writer()
+    w.add_file("first.txt", bytes("added before"), Deflate)?
+    let a = w.begin_entry(zip.Entry { name: "streamed/deflated.bin", mtime: 1700000000, mode: 0o600 })?
+    stream_in(a, deflated, 37)?
+    a.end_entry()?
+    let b = w.begin_entry(zip.Entry { name: "streamed/stored.bin", method: Stored })?
+    stream_in(b, stored, 1000)?
+    b.end_entry()?
+    w.add_dir("dir")?
+    w.add_file("dir/last.txt", bytes("added after"), Stored)?
+    w.finish()?
+    w.output()
+}
+
+fn test_streamed_entries_read_back_next_to_added_ones(t: *testing.T) {
+    let deflated = sample(100000, 1)
+    let stored = sample(30000, 2)
+    let out = build_mixed(deflated, stored) catch { e => testing.must(t, e, no_bytes()) }
+    let a = zip.open(out) catch { e => testing.must(t, e, no_archive()) }
+    t.equal(a.entries.len, 5)
+    t.equal_slice(a.read_entry("streamed/deflated.bin") catch { e => testing.must(t, e, no_bytes()) }, deflated)
+    t.equal_slice(a.read_entry("streamed/stored.bin") catch { e => testing.must(t, e, no_bytes()) }, stored)
+    t.equal_slice(a.read_entry("first.txt") catch { e => testing.must(t, e, no_bytes()) }, bytes("added before"))
+    t.equal_slice(a.read_entry("dir/last.txt") catch { e => testing.must(t, e, no_bytes()) }, bytes("added after"))
+    let d = a.find("streamed/deflated.bin") ?? missing()
+    t.equal(d.flags & 8, 8)
+    t.equal(d.size, deflated.len)
+    t.is_true(d.compressed < deflated.len)
+    t.equal(d.mode, 0o600)
+    t.equal(d.mtime, 1700000000)
+    let s = a.find("streamed/stored.bin") ?? missing()
+    t.equal(s.flags & 8, 8)
+    t.equal(s.compressed, stored.len)
+    let plain = a.find("first.txt") ?? missing()
+    t.equal(plain.flags & 8, 0)
+}
+
+fn build_empty() -> u8[] ! io.Error {
+    let w = zip.writer()
+    let a = w.begin_entry(zip.Entry { name: "empty-deflated" })?
+    a.end_entry()?
+    let b = w.begin_entry(zip.Entry { name: "empty-stored", method: Stored })?
+    b.write_entry(no_bytes())?
+    b.end_entry()?
+    w.finish()?
+    w.output()
+}
+
+fn test_an_empty_streamed_entry_reads_back_empty(t: *testing.T) {
+    let out = build_empty() catch { e => testing.must(t, e, no_bytes()) }
+    let a = zip.open(out) catch { e => testing.must(t, e, no_archive()) }
+    t.equal(a.entries.len, 2)
+    t.equal(a.read_entry("empty-deflated") catch { e => testing.must(t, e, bytes("x")) }.len, 0)
+    t.equal(a.read_entry("empty-stored") catch { e => testing.must(t, e, bytes("x")) }.len, 0)
+}
+
+fn build_wide(data: u8[]) -> u8[] ! io.Error {
+    let w = zip.writer()
+    w.force_zip64()
+    let a = w.begin_entry(zip.Entry { name: "wide.bin" })?
+    stream_in(a, data, 4096)?
+    a.end_entry()?
+    let b = w.begin_entry(zip.Entry { name: "wide-stored.bin", method: Stored })?
+    stream_in(b, data, 4096)?
+    b.end_entry()?
+    w.finish()?
+    w.output()
+}
+
+fn test_a_forced_zip64_streamed_entry_reads_back(t: *testing.T) {
+    let data = sample(50000, 3)
+    let out = build_wide(data) catch { e => testing.must(t, e, no_bytes()) }
+    t.equal(io.le16(out, 4), 45)
+    t.equal(io.le32(out, 18), 0xFFFFFFFF)
+    t.equal(io.le32(out, 22), 0xFFFFFFFF)
+    let a = zip.open(out) catch { e => testing.must(t, e, no_archive()) }
+    t.equal(a.entries.len, 2)
+    t.equal_slice(a.read_entry("wide.bin") catch { e => testing.must(t, e, no_bytes()) }, data)
+    t.equal_slice(a.read_entry("wide-stored.bin") catch { e => testing.must(t, e, no_bytes()) }, data)
+    let e = a.find("wide.bin") ?? missing()
+    t.equal(e.size, data.len)
+    t.equal(e.flags & 8, 8)
+    t.equal(io.le32(out, e.offset + 18), 0xFFFFFFFF)
+    t.is_true(io.le16(out, e.offset + 28) >= 20)
+    let at = e.offset + 30 + io.le16(out, e.offset + 26) + io.le16(out, e.offset + 28) + e.compressed
+    t.equal(io.le32(out, at), 0x08074b50)
+    t.equal(io.le32(out, at + 4), e.crc)
+    t.equal(io.le64(out, at + 8), e.compressed)
+    t.equal(io.le64(out, at + 16), e.size)
+    t.equal(io.le32(out, at + 24), 0x04034b50)
+}
+
+fn build_narrow() -> u8[] ! io.Error {
+    let w = zip.writer()
+    let ew = w.begin_entry(zip.Entry { name: "a", method: Stored })?
+    ew.write_entry(bytes("abc"))?
+    ew.end_entry()?
+    w.finish()?
+    w.output()
+}
+
+fn test_a_narrow_streamed_entry_has_a_four_byte_descriptor(t: *testing.T) {
+    let out = build_narrow() catch { e => testing.must(t, e, no_bytes()) }
+    t.equal(io.le16(out, 4), 20)
+    t.equal(io.le16(out, 6) & 8, 8)
+    t.equal(io.le32(out, 14), 0)
+    t.equal(io.le32(out, 18), 0)
+    t.equal(io.le32(out, 22), 0)
+    let at = 30 + io.le16(out, 26) + io.le16(out, 28) + 3
+    t.equal(io.le32(out, at), 0x08074b50)
+    t.equal(io.le32(out, at + 4), i64(hash.crc32(bytes("abc"))))
+    t.equal(io.le32(out, at + 8), 3)
+    t.equal(io.le32(out, at + 12), 3)
+    t.equal(io.le32(out, at + 16), 0x02014b50)
+}
+
+fn begin_outcome(w: *zip.Writer, e: zip.Entry) -> str {
+    let _ = w.begin_entry(e) catch {
+        err => return error_name(err)
+    }
+    "ok"
+}
+
+fn add_outcome(w: *zip.Writer) -> str {
+    w.add_file("other", bytes("x"), Stored) catch {
+        err => return error_name(err)
+    }
+    "ok"
+}
+
+fn dir_outcome(w: *zip.Writer) -> str {
+    w.add_dir("other") catch {
+        err => return error_name(err)
+    }
+    "ok"
+}
+
+fn symlink_outcome(w: *zip.Writer) -> str {
+    w.add_symlink("other", "target") catch {
+        err => return error_name(err)
+    }
+    "ok"
+}
+
+fn finish_outcome(w: *zip.Writer) -> str {
+    w.finish() catch {
+        err => return error_name(err)
+    }
+    "ok"
+}
+
+fn write_outcome(ew: *zip.EntryWriter) -> str {
+    ew.write_entry(bytes("x")) catch {
+        err => return error_name(err)
+    }
+    "ok"
+}
+
+fn end_outcome(ew: *zip.EntryWriter) -> str {
+    ew.end_entry() catch {
+        err => return error_name(err)
+    }
+    "ok"
+}
+
+fn while_open() -> str[] {
+    let w = zip.writer()
+    let ew = w.begin_entry(zip.Entry { name: "open" }) catch {
+        e => return [error_name(e)]
+    }
+    let during = [add_outcome(w), dir_outcome(w), symlink_outcome(w), begin_outcome(w, zip.Entry { name: "second" }), finish_outcome(w)]
+    let ended = end_outcome(ew)
+    let after = [add_outcome(w), finish_outcome(w), begin_outcome(w, zip.Entry { name: "late" })]
+    [during[0], during[1], during[2], during[3], during[4], ended, after[0], after[1], after[2]]
+}
+
+fn test_an_open_entry_blocks_every_other_write(t: *testing.T) {
+    t.equal_slice(while_open(), ["Invalid", "Invalid", "Invalid", "Invalid", "Invalid", "ok", "ok", "ok", "Invalid"])
+}
+
+fn after_end() -> str[] {
+    let w = zip.writer()
+    let ew = w.begin_entry(zip.Entry { name: "done" }) catch {
+        e => return [error_name(e)]
+    }
+    let first = end_outcome(ew)
+    [first, write_outcome(ew), end_outcome(ew)]
+}
+
+fn test_an_ended_entry_rejects_more_calls(t: *testing.T) {
+    t.equal_slice(after_end(), ["ok", "Invalid", "Invalid"])
+}
+
+fn test_only_a_file_entry_streams(t: *testing.T) {
+    let w = zip.writer()
+    t.equal(begin_outcome(w, zip.Entry { name: "d", kind: Dir }), "Invalid")
+    t.equal(begin_outcome(w, zip.Entry { name: "l", kind: Symlink }), "Invalid")
+    t.equal(begin_outcome(w, zip.Entry { name: "" }), "Invalid")
+    t.equal(add_outcome(w), "ok")
+    t.equal(finish_outcome(w), "ok")
+    t.equal(begin_outcome(w, zip.Entry { name: "after-finish" }), "Invalid")
+}
+
+fn recording(sink: *Sink) -> io.Stream {
+    io.Stream {
+        read: fn(buf) -> i64 ! io.Error { fail Unsupported }
+        write: fn(data) -> i64 ! io.Error {
+            io.append(mut sink.seen, data)
+            data.len
+        }
+        close: fn() {}
+    }
+}
+
+fn stream_to_sink(sink: *Sink, deflated: u8[], stored: u8[]) -> str[] ! io.Error {
+    let w = zip.stream_writer(recording(sink))
+    let a = w.begin_entry(zip.Entry { name: "stored.bin", method: Stored })?
+    let after_header = sink.seen.len
+    stream_in(a, stored, 4096)?
+    let stored_before_end = sink.seen.len - after_header
+    a.end_entry()?
+    let b = w.begin_entry(zip.Entry { name: "deflated.bin" })?
+    let deflated_start = sink.seen.len
+    stream_in(b, deflated, 4096)?
+    let deflated_before_end = sink.seen.len - deflated_start
+    b.end_entry()?
+    w.finish()?
+    ["{stored_before_end == stored.len}", "{deflated_before_end > 20000}", "{w.output().len}"]
+}
+
+fn test_a_stream_writer_receives_entry_bytes_before_the_entry_ends(t: *testing.T) {
+    let stored = sample(50000, 4)
+    let deflated = sample(400000, 5)
+    let sink = new(Sink { seen: [] })
+    let seen = stream_to_sink(sink, deflated, stored) catch { e => testing.must(t, e, no_flags()) }
+    t.equal_slice(seen, ["true", "true", "0"])
+    let a = zip.open(sink.seen) catch { e => testing.must(t, e, no_archive()) }
+    t.equal_slice(a.read_entry("stored.bin") catch { e => testing.must(t, e, no_bytes()) }, stored)
+    t.equal_slice(a.read_entry("deflated.bin") catch { e => testing.must(t, e, no_bytes()) }, deflated)
+}
+
+struct Budget {
+    left: i64
+}
+
+fn limited(budget: *Budget) -> io.Stream {
+    io.Stream {
+        read: fn(buf) -> i64 ! io.Error { fail Unsupported }
+        write: fn(data) -> i64 ! io.Error {
+            if budget.left < data.len {
+                fail NoSpace
+            }
+            budget.left -= data.len
+            data.len
+        }
+        close: fn() {}
+    }
+}
+
+fn abandoned() -> str[] {
+    let budget = new(Budget { left: 100 })
+    let w = zip.stream_writer(limited(budget))
+    let ew = w.begin_entry(zip.Entry { name: "x", method: Stored }) catch {
+        e => return [error_name(e)]
+    }
+    let failed = write_outcome_of(ew, bytes(text.repeat("y", 200)))
+    [failed, write_outcome(ew), end_outcome(ew), add_outcome(w), finish_outcome(w)]
+}
+
+fn write_outcome_of(ew: *zip.EntryWriter, chunk: u8[]) -> str {
+    ew.write_entry(chunk) catch {
+        err => return error_name(err)
+    }
+    "ok"
+}
+
+fn test_a_failed_write_abandons_the_entry(t: *testing.T) {
+    t.equal_slice(abandoned(), ["other", "Invalid", "Invalid", "Invalid", "Invalid"])
+}
