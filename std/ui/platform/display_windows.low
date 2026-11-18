@@ -1,0 +1,223 @@
+import std/sync
+
+const hwnd_message: i64 = -3
+
+/// The connection to the windowing system that a program's windows share. It holds the thread lock, the window classes, the process's DPI awareness, the OLE initialisation and the message-only window that `waker_of` wakes, and it is available on Windows only.
+///
+/// Release every `Window` opened with `open_in` before the display that holds it.
+pub struct Display {
+    /// The copyable view of the display.
+    pub handle: DisplayHandle
+    drop close_display_on(handle)
+}
+
+/// A copyable view of a `Display`, for code that cannot hold the owner, such as a closure, a slice or a pointer.
+///
+/// Every copy shares the display and its closed state. Once the display is released, `open_in_on` and `wait_on` fail with `Unsupported` and a waker from `waker_of_on` does nothing.
+pub struct DisplayHandle {
+    state: *DisplayState
+}
+
+struct DisplayState {
+    instance: ptr
+    hwnd: ptr = null
+    anchor: ptr = null
+    waker: *WakerState
+    windows: *WindowState[] = []
+    wakes: i64 = 0
+    ole: bool = false
+    closed: bool = false
+}
+
+/// Opens a connection to the windowing system and locks the calling green thread to its OS thread until the display is released. Every window opened in the display must be used from this green thread.
+pub fn open_display() -> Display ! Error {
+    let state = connect_display()?
+    Display { handle: DisplayHandle { state } }
+}
+
+/// Opens a window in `d` with the title and logical content size of `o`, and returns once it can be drawn into. Releasing the window leaves `d` open.
+pub fn open_in(d: Display, o: Options) -> Window ! Error {
+    open_in_on(d.handle, o)?
+}
+
+/// Opens a window in the display that `h` views, as `open_in` does. It fails with `Unsupported` once the display is released.
+pub fn open_in_on(h: DisplayHandle, o: Options) -> Window ! Error {
+    live_display(h.state)?
+    let state = open_window_in(h.state, o)?
+    Window { state }
+}
+
+/// Waits until a window of `d` has events for `next`, a waker made by `waker_of` fires, or `timeout_ms` milliseconds pass. A negative timeout waits without limit. The call takes no event out of any window and ends the wait of every wake that arrived before it returns.
+pub fn wait(d: Display, timeout_ms: i64) ! Error {
+    wait_on(d.handle, timeout_ms)?
+}
+
+/// Waits on the display that `h` views, as `wait` does. It fails with `Unsupported` once the display is released.
+pub fn wait_on(h: DisplayHandle, timeout_ms: i64) ! Error {
+    live_display(h.state)?
+    wait_display(h.state, timeout_ms)?
+}
+
+/// Returns a `Waker` that ends `wait` on `d` from any green thread, whether or not any window is open. It gives no `Woken` event to a window.
+pub fn waker_of(d: Display) -> Waker {
+    waker_of_on(d.handle)
+}
+
+/// Returns the `Waker` of the display that `h` views, as `waker_of` does.
+pub fn waker_of_on(h: DisplayHandle) -> Waker {
+    Waker { state: h.state.waker }
+}
+
+fn live_display(d: *DisplayState) ! Error {
+    if d.closed {
+        fail Unsupported("the display has closed")
+    }
+}
+
+fn connect_display() -> *DisplayState ! Error {
+    sync.lock_thread()
+    let d = new(DisplayState {
+        instance: GetModuleHandleW(null)
+        waker: new(WakerState { hwnd: null })
+    })
+    build_display(d) catch {
+        e => {
+            close_display(d)
+            fail e
+        }
+    }
+    d
+}
+
+fn build_display(d: *DisplayState) ! Error {
+    if GetProcessWindowStation() == null {
+        fail NoDisplay("no window station")
+    }
+    SetProcessDpiAwarenessContext(dpi_awareness_per_monitor_v2)
+    register_class(d.instance, display_class_name(), display_proc)?
+    d.ole = OleInitialize(null) >= 0
+    let slot: *DisplayState[] = [d]
+    d.anchor = pin(slot)
+    create_display_window(d)?
+}
+
+fn display_class_name() -> u8[] {
+    wide("LowDisplay")
+}
+
+fn register_class(instance: ptr, name: u8[], procedure: extern fn(ptr, u32, i64, i64) -> i64) ! Error {
+    var class = WndClassEx {
+        procedure
+        instance
+        cursor: LoadCursorW(null, idc_arrow)
+        class_name: __slice_ptr(name)
+    }
+    if RegisterClassExW(mut class) == 0 {
+        let code = GetLastError()
+        if code != error_class_exists {
+            fail creation_error("RegisterClassExW", code)
+        }
+    }
+}
+
+fn create_display_window(d: *DisplayState) ! Error {
+    let name = display_class_name()
+    let parent: ptr = ptr(hwnd_message)
+    let hwnd = CreateWindowExW(0, __slice_ptr(name), null, 0, 0, 0, 0, 0, parent, null, d.instance, d.anchor)
+    if hwnd == null {
+        fail creation_error("CreateWindowExW", GetLastError())
+    }
+    d.hwnd = hwnd
+    d.waker.hwnd = hwnd
+}
+
+fn display_proc(hwnd: ptr, msg: u32, wparam: i64, lparam: i64) -> i64 {
+    if msg == wm_nccreate {
+        return adopt(hwnd, msg, wparam, lparam)
+    }
+    let anchor = GetWindowLongPtrW(hwnd, gwlp_userdata)
+    if anchor == null {
+        return DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+    let slot: ptr[*DisplayState] = anchor
+    let d = load(slot)
+    if msg == wm_ncdestroy {
+        d.hwnd = null
+        d.waker.hwnd = null
+        SetWindowLongPtrW(hwnd, gwlp_userdata, null)
+        return DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+    if msg == wm_app {
+        d.wakes = d.wakes + 1
+        return 0
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn close_display_on(h: DisplayHandle) {
+    close_display(h.state)
+}
+
+fn close_display(d: *DisplayState) {
+    if d.closed {
+        return
+    }
+    d.closed = true
+    d.waker.hwnd = null
+    var destroyed = true
+    if d.hwnd != null {
+        destroyed = DestroyWindow(d.hwnd) != 0
+        d.hwnd = null
+    }
+    let window_class = class_name()
+    UnregisterClassW(__slice_ptr(window_class), d.instance)
+    let waker_class = display_class_name()
+    UnregisterClassW(__slice_ptr(waker_class), d.instance)
+    if destroyed && d.anchor != null {
+        unpin(d.anchor)
+        d.anchor = null
+    }
+    if d.ole {
+        OleUninitialize()
+        d.ole = false
+    }
+    sync.unlock_thread()
+}
+
+fn forget_window(d: *DisplayState, s: *WindowState) {
+    var kept: *WindowState[] = []
+    for w in d.windows {
+        if w != s {
+            kept.push(w)
+        }
+    }
+    d.windows = kept
+}
+
+fn display_ready(d: *DisplayState) -> bool {
+    if d.wakes > 0 {
+        return true
+    }
+    for w in d.windows {
+        if w.events.len > 0 || w.fault != none {
+            return true
+        }
+    }
+    false
+}
+
+fn wait_display(d: *DisplayState, timeout_ms: i64) ! Error {
+    let started = GetTickCount64()
+    pump(d)
+    for !display_ready(d) {
+        let remaining = remaining_ms(started, timeout_ms)
+        if remaining == 0 {
+            break
+        }
+        if wait_for_input(remaining)? {
+            break
+        }
+        pump(d)
+    }
+    d.wakes = 0
+}
