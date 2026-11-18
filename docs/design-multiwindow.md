@@ -1,6 +1,6 @@
 # Several windows in one process
 
-Status: design. Pull request 1 of section 6 is implemented in `std/ui`.
+Status: design. Pull request 1 of section 6 is implemented in `std/ui`, and pull request 2 in `std/ui/gpu`.
 
 ## Goal
 
@@ -209,7 +209,7 @@ Opening needs no step of its own, because `open_window` is synchronous.
 ```low
 pub fn open_device(first: Surface) -> Device ! Error
 pub fn presenter(d: Device, s: Surface) -> Presenter ! Error
-pub fn present_to(d: Device, p: Presenter, s: scene.Scene, mut atlas: scene.Atlas) ! Error
+pub fn present_to(p: Presenter, s: scene.Scene, mut atlas: scene.Atlas) ! Error
 ```
 
 `open_for` and `present` keep their signatures. They become a `Gpu` that holds one `Device` and one `Presenter`.
@@ -219,7 +219,7 @@ Decisions:
 - **One device for every window.** The device is chosen against the first surface (`std/ui/gpu/device.low:72-89`). `presenter` checks each later surface with `vkGetPhysicalDeviceSurfaceSupportKHR` on the chosen family (`std/ui/gpu/device.low:91-95`) and fails with `gpu.Error.NoDevice` when the family cannot present to it, since no device the application holds qualifies for that surface. A device that cannot present to every monitor's window is rare. Section 7 lists it as a risk, not a design driver.
 - **The frame ring stays shared.** Presents run one after another on one thread. A frame slot holds a command buffer, a fence and an `acquired` semaphore, none of which depend on a swapchain. `wait_frame` (`std/ui/gpu/gpu.low:184-193`) makes a slot safe to reuse whichever window used it last. The `finished` semaphores belong to each swapchain image and move with the `Presenter`. `frames_in_flight` (`std/ui/gpu/gpu.low:38`) may need to rise to 3 if profiling shows the CPU waiting on fences with three windows due at once.
 - **One atlas texture.** `ensure_atlas` rewrites the atlas binding of every frame's descriptor sets (`std/ui/gpu/atlas.low:22-26`). Because the ring is shared, that keeps covering every window. The atlas band upload (`std/ui/gpu/swapchain.low:47-55`) runs in whichever window presents first after a change. The upload is recorded into that frame's command buffer, and every later submit on the one queue sees the new rows.
-- **Presenter teardown.** A `Presenter` must be destroyed before its platform window (`std/ui/gpu/swapchain.low:21`). Ring frames that presented to it may still be in flight, so closing a window waits on the fence of every submitted ring frame (`wait_frame`), then destroys the swapchain and the `VkSurfaceKHR`, and then releases the platform window. Closing is rare, so waiting on the ring costs little. `vkDeviceWaitIdle` would do the same job with a coarser wait.
+- **Presenter teardown.** A `Presenter` must be released before its platform window (`std/ui/gpu/swapchain.low:21`). The `Device` keeps its live presenters and targets, so releasing it first destroys their swapchains, surfaces and images, and a later `Presenter` or `Target` release does nothing. Ring frames that presented to it may still be in flight, so closing a window waits on the fence of every submitted ring frame (`wait_frame`), then destroys the swapchain and the `VkSurfaceKHR`, and then releases the platform window. Closing is rare, so waiting on the ring costs little. `vkDeviceWaitIdle` would do the same job with a coarser wait.
 - **Pipelines by format.** Two windows whose swapchains choose the same surface format share pipelines. A different format adds an entry (`std/ui/gpu/gpu.low:172-182`).
 
 ### Text and images
@@ -310,8 +310,9 @@ Each pull request builds, passes `low test std/ui`, `low test std/ui/platform`, 
    - a post drained by window A makes window B due.
 2. **Split the GPU into `Device` and `Presenter`** (`std/ui/gpu`). `open_for` and `present` become wrappers. Tests:
    - existing render fixtures pass unchanged;
-   - a new `compiler/tests/ui` fixture `win32_twopresent` opens two platform windows, makes one `Device` and two `Presenter`s, presents different scenes to each, and checks the atlas uploaded through the first window is sampled correctly in the second (offscreen readback through `gpu.read` on a `Target`, `std/ui/gpu/target.low:77`);
-   - `wayland_twopresent` does the same where a compositor runs.
+   - `std/ui/gpu/device_test.low` makes one `Device` and two `Presenter`s on two windows: each presenter has its own swapchain at its own window's size, presents alternate between the windows, an atlas uploaded through either window is sampled correctly by the other (offscreen readback on a `Target` of the same `Device`), a `Target` from another device is rejected with `WrongDevice`, a `Device` released before its presenters and targets leaves their release harmless, and a draw that fails after the image is acquired leaves the frame slot reusable;
+   - a new `compiler/tests/ui` fixture `win32_twopresent` opens two platform windows, makes one `Device` and two `Presenter`s, presents different scenes to each, and checks each window's own pixels with `PrintWindow` after each window uploads the atlas, after forty alternating presents and after the first presenter is released;
+   - `wayland_twopresent` runs the same presents where a compositor runs, and checks that they succeed, since a Wayland window's pixels cannot be read back.
 3. **Add the Win32 `Display` and `wait`** (`std/ui/platform`, Windows). The lock, class, DPI awareness, OLE and the message-only waker move into it. `platform.open` wraps it. `WM_NCDESTROY` clears `hwnd`. Tests:
    - `win32_pair` passes unchanged;
    - a new `win32_wait` fixture: a message posted to the second window ends `wait` on the display, and a wake still arrives after the window that created the waker has closed;
@@ -326,7 +327,7 @@ Each pull request builds, passes `low test std/ui`, `low test std/ui/platform`, 
    - existing `wayland_*` fixtures pass;
    - `wayland_pair`: two windows on one connection, each configured, with keyboard `enter` routed by surface;
    - `wayland_parent`: a window opened with an owner sends `set_parent`, checked against `WAYLAND_DEBUG=1` output.
-6. **Add `ui.open_window` with platform windows, and the multi-window `run`** (`std/ui`). This includes per-window reveal deadlines, per-window failure, close ordering and the `closed` callbacks. Tests:
+6. **Add `ui.open_window` with platform windows, and the multi-window `run`** (`std/ui`). This includes per-window reveal deadlines, per-window failure, close ordering and the `closed` callbacks. It also introduces copyable `DeviceHandle` and `PresenterHandle` views of the GPU types with an idempotent close; the `_on` forms of `target`, `render` and `read` take those views, and `supports_subpixel` gains a `Device` form. Tests:
    - `ui_test` and `reveal_test` pass unchanged;
    - a `win32_apptool` fixture: a click in the main window opens a tool window, which is cloaked after `open_window` and uncloaked after its first frame;
    - a signal set in the tool window changes the main window's next frame;
