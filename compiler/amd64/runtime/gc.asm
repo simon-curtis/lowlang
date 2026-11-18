@@ -324,7 +324,11 @@ rt_region_chunk:
 	mov r12d, esi
 	call rt_region_unkeep
 	test rax, rax
+.if RT_REGION_GUARD
 	jnz 4f
+.else
+	jnz 5f
+.endif
 	call rt_heap_acquire
 	xor r13d, r13d
 1:
@@ -368,6 +372,7 @@ rt_region_chunk:
 	push rdi
 	call rt_region_commit
 	pop rax
+5:
 	mov byte ptr [rax+CH_CLASS], bl
 	mov byte ptr [rax+CH_KIND], r12b
 	pop r13
@@ -638,7 +643,16 @@ rt_region_release:
 	mov esi, 65536
 	shl rsi, cl
 	mov rdx, [rbx+CH_USED]
+.if RT_REGION_GUARD
 	call rt_region_stash
+.else
+	mov rcx, rdx
+	sub rcx, rdi
+	add rcx, 7
+	shr rcx, 3
+	xor eax, eax
+	rep stosq
+.endif
 	jmp 3f
 2:
 	mov rdi, rbx
