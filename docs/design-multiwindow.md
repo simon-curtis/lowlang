@@ -1,6 +1,6 @@
 # Several windows in one process
 
-Status: design. Pull request 1 of section 6 is implemented in `std/ui`, pull request 2 in `std/ui/gpu` and pull requests 3 and 4 in `std/ui/platform`.
+Status: design. Pull request 1 of section 6 is implemented in `std/ui`, pull request 2 in `std/ui/gpu` and pull requests 3 and 4 in `std/ui/platform`, and pull request 6 in `std/ui` and `std/ui/gpu` for Windows. On Wayland `open_window` fails with `Unsupported` until pull request 5.
 
 ## Goal
 

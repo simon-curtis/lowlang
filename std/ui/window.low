@@ -1,9 +1,10 @@
 import std/ui/geometry
+import std/ui/gpu
 import std/ui/platform
 
 /// What `open_window` needs to make a window beside the application's others.
 ///
-/// A context made by `headless` has no system window, so it keeps only `background`, `owner` and `closed`.
+/// A context made by `headless` has no system window, so it keeps only `background`, `owner` and `closed`. The Wayland backend ignores `placement` and `taskbar`, as `platform.Options` says.
 pub struct WindowOptions {
     /// The window title.
     pub title: str = "Low"
@@ -25,7 +26,7 @@ pub struct WindowOptions {
     pub placement: Placement = Placement.CentreOnOwner
     /// `true` gives the window its own taskbar button, even when it has an owner.
     pub taskbar: bool = true
-    /// `false` shows the window without activating it. See `platform.Options.activate`.
+    /// `false` shows the window without activating it, so it takes neither the keyboard focus nor the foreground from the program the user is working in. See `platform.Options.activate`.
     pub activate: bool = true
     /// Runs on the UI green thread once the window has closed, with why it closed.
     pub closed: fn(CloseReason) = ignore_closed
@@ -51,10 +52,27 @@ pub enum Placement {
 
 fn ignore_closed(why: CloseReason) {}
 
+fn blank_view() -> Element {
+    div()
+}
+
+struct Seat {
+    window: platform.WindowHandle
+    presenter: gpu.PresenterHandle
+}
+
+struct Opened {
+    state: *State
+    seat: Seat? = none
+}
+
 struct WindowSlot {
     state: *State
     owner: Window?
     closed: fn(CloseReason)
+    render: fn() -> Element
+    seat: Seat? = none
+    deadline: i64 = 0
     open: bool = true
 }
 
@@ -63,8 +81,10 @@ pub struct Window {
     slot: *WindowSlot
 }
 
-fn register(sh: *Shared, st: *State, owner: Window?, closed: fn(CloseReason)) -> Window {
-    let w = Window { slot: new(WindowSlot { state: st, owner, closed }) }
+fn register(sh: *Shared, opened: Opened, owner: Window?, closed: fn(CloseReason), render: fn() -> Element) -> Window {
+    let st = opened.state
+    let deadline = sh.clock() + reveal_deadline_ms
+    let w = Window { slot: new(WindowSlot { state: st, owner, closed, render, seat: opened.seat, deadline }) }
     st.window = w
     sh.windows.push(w)
     w
@@ -93,7 +113,9 @@ fn request_close(st: *State) {
 
 /// Opens a window in the application that `cx` belongs to, and returns once it exists. The window shares the application's signals, keymap, clipboard, posts and clock, and takes the rem size of `cx`.
 ///
-/// A window of a context made by `headless` has no system window: drive it with `frame` and `dispatch` on `window_context(w)`, and `frame` takes the render function, so `render` is not used. It fails with `Platform(Unsupported(detail))` when `cx` belongs to a context that `open` made, when `o.owner` has closed or belongs to another application, and when it is called while a frame is being built, since the functions that build a frame have no side effects.
+/// In an application that `open` made, the window is a system window that `render` builds the tree of, which `run` draws and presents. It stays invisible until its first frame is presented, or until 500 milliseconds after it opened or `run` started, whichever is later, and it fails with the error that opening the system window or its swapchain returns. The Wayland backend opens one window only, so there it fails with `Platform(Unsupported(detail))`.
+///
+/// A window of a context made by `headless` has no system window: drive it with `frame` and `dispatch` on `window_context(w)`, and `frame` takes the render function, so `render` is not used. In every context it fails with `Platform(Unsupported(detail))` when `o.owner` has closed or belongs to another application, and when it is called while a frame is being built, since the functions that build a frame have no side effects.
 pub fn open_window(cx: Context, o: WindowOptions, render: fn() -> Element) -> Window ! Error {
     let sh = cx.state.shared
     if sh.rendering {
@@ -110,9 +132,9 @@ pub fn open_window(cx: Context, o: WindowOptions, render: fn() -> Element) -> Wi
         }
         none => {}
     }
-    let st = sh.open(sh, o)?
-    st.rem = cx.state.rem
-    register(sh, st, o.owner, o.closed)
+    let opened = sh.open(sh, o)?
+    opened.state.rem = cx.state.rem
+    register(sh, opened, o.owner, o.closed, render)
 }
 
 fn owned_by(w: Window, owner: Window) -> bool {
@@ -135,8 +157,12 @@ fn closing_order(sh: *Shared, w: Window) -> Window[] {
     order
 }
 
-/// Closes `w` and every window it owns, owned windows first, then runs each one's `closed` callback. Closing a window that is already closed does nothing, and so does a call made while a frame is being built. The context of a closed window stays valid and draws nothing.
+/// Closes `w` and every window it owns, owned windows first, then runs each one's `closed` callback with `Requested`. Closing a window that is already closed does nothing, and so does a call made while a frame is being built. The system windows go before any callback runs. The context of a closed window stays valid and draws nothing.
 pub fn close_window(w: Window) {
+    close_with(w, CloseReason.Requested)
+}
+
+fn close_with(w: Window, why: CloseReason) {
     let sh = w.slot.state.shared
     if !w.slot.open || sh.rendering {
         return
@@ -154,7 +180,55 @@ pub fn close_window(w: Window) {
     }
     sh.windows = remaining
     for c in order {
-        c.slot.closed(CloseReason.Requested)
+        release_seat(c.slot)
+    }
+    for c in order {
+        let reason = if same_window(c, w) { why } else { CloseReason.Requested }
+        c.slot.closed(reason)
+    }
+}
+
+fn release_seat(slot: *WindowSlot) {
+    match slot.seat {
+        some(seat) => {
+            gpu.close_presenter_on(seat.presenter)
+            platform.close_on(seat.window)
+            slot.seat = none
+        }
+        none => {}
+    }
+}
+
+fn open_windows(sh: *Shared) -> Window[] {
+    var open: Window[] = []
+    for w in sh.windows {
+        if w.slot.open {
+            open.push(w)
+        }
+    }
+    open
+}
+
+fn is_main(w: Window) -> bool {
+    match w.slot.state.shared.main {
+        some(main) => same_window(w, main)
+        none => false
+    }
+}
+
+fn close_tools(sh: *Shared) {
+    for w in open_windows(sh) {
+        if !is_main(w) {
+            close_window(w)
+        }
+    }
+}
+
+fn close_all(sh: *Shared) {
+    close_tools(sh)
+    match sh.main {
+        some(main) => close_window(main)
+        none => {}
     }
 }
 
