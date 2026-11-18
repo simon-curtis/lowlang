@@ -48,11 +48,13 @@ struct Walk {
 }
 
 struct State {
-    text: uitext.System
+    shared: *Shared
+    window: Window? = none
     background: geometry.Color
     dirty: bool = true
     closed: bool = false
     revealed: bool = false
+    rendered_generation: i64 = 0
     width: f32 = 0.0
     height: f32 = 0.0
     scale: f32 = 1.0
@@ -94,26 +96,36 @@ struct State {
     caret: platform.Caret? = none
     applied_caret: platform.Caret? = none
     applied_cursor: platform.Cursor = platform.Cursor.Arrow
-    memory: str? = none
     maximized: bool = false
     minimize: fn()
     zoom: fn()
     root_hitbox: i64 = -1
-    keymap: KeyBinding[] = []
     pending_keys: platform.KeyEvent[] = []
     pending_focus: str = ""
     pending_timer: i64 = 0
-    manual_ms: i64 = 0
     timers: Timer[] = []
     next_timer: i64 = 0
-    clock: fn() -> i64
-    posts: chan[fn()]
-    wake: fn()
-    copy: fn(str)
-    paste: fn() -> str?
 }
 
-/// The state of one user interface apart from its window: the signals' owner, the text system, and what the pointer and the keyboard are on.
+struct Shared {
+    text: uitext.System
+    keymap: KeyBinding[] = []
+    generation: i64 = 0
+    posts: chan[fn()]
+    wake: fn()
+    clock: fn() -> i64
+    manual_ms: i64 = 0
+    copy: fn(str)
+    paste: fn() -> str?
+    memory: str? = none
+    quit: bool = false
+    rendering: bool = false
+    windows: Window[] = []
+    main: Window? = none
+    open: fn(*Shared, WindowOptions) -> *State ! Error
+}
+
+/// The user interface of one window: what the pointer and the keyboard are on, and the frames built for it. The signals, the text system, the keymap, the clipboard and the posted closures belong to the application, and every window's context reaches the same ones.
 ///
 /// A context is a handle: copies share the state. `frame` and `dispatch` drive it without a window or a GPU, as `run` drives it with them.
 pub struct Context {
@@ -140,51 +152,65 @@ fn drawn(st: *State, ts: TextStyle) -> TextStyle {
 }
 
 fn measured(st: *State, content: str, style: uitext.Style, width: f32) -> geometry.Size {
-    let m = uitext.measure(mut st.text, content, style, width)
+    let m = uitext.measure(mut st.shared.text, content, style, width)
     geometry.size(-floor(-m.width), m.height)
 }
 
-/// Returns a context with no window whose frames clear to `background`.
-pub fn headless(background: geometry.Color) -> Context {
+fn new_state(sh: *Shared, background: geometry.Color) -> *State {
     let state = new(State {
-        text: uitext.default_system()
+        shared: sh
         background
-        posts: chan[fn()](1024)
         minimize: fn() {}
         zoom: fn() {}
-        wake: fn() {}
-        copy: fn(s: str) {}
-        paste: fn() -> str? { none }
-        clock: fn() -> i64 { 0 }
     })
     state.zoom = fn() {
         state.maximized = !state.maximized
         state.dirty = true
     }
-    state.clock = fn() -> i64 { state.manual_ms }
-    state.copy = fn(s: str) { state.memory = s }
-    state.paste = fn() -> str? { state.memory }
-    Context { state }
+    state
+}
+
+fn open_headless(sh: *Shared, o: WindowOptions) -> *State ! Error {
+    new_state(sh, o.background)
+}
+
+/// Returns a context with no window whose frames clear to `background`. It holds its own signals, keymap, posts and clock, so separate calls stay isolated.
+pub fn headless(background: geometry.Color) -> Context {
+    let sh = new(Shared {
+        text: uitext.default_system()
+        posts: chan[fn()](1024)
+        wake: fn() {}
+        copy: fn(s: str) {}
+        paste: fn() -> str? { none }
+        clock: fn() -> i64 { 0 }
+        open: open_headless
+    })
+    sh.clock = fn() -> i64 { sh.manual_ms }
+    sh.copy = fn(s: str) { sh.memory = s }
+    sh.paste = fn() -> str? { sh.memory }
+    let st = new_state(sh, background)
+    sh.main = register(sh, st, none, ignore_closed)
+    Context { state: st }
 }
 
 /// Adds the font file in `data` to the context's installed fonts, and returns whether it could: a text whose `font_family` the font holds is drawn with it. A headless context draws with built-in fonts and returns `false`.
 pub fn add_font(cx: Context, data: str) -> bool {
-    uitext.add_font(mut cx.state.text, data)
+    uitext.add_font(mut cx.state.shared.text, data)
 }
 
 /// Keeps `rgba`, `width` by `height` pixels of red, green, blue and alpha bytes in rows with each colour already multiplied by its alpha, in the context, and returns the picture for `image`, or `none` when `rgba` is not `width * height * 4` bytes or a size is below one.
 pub fn add_image(cx: Context, width: i64, height: i64, rgba: u8[]) -> uitext.Image? {
-    uitext.add_image(mut cx.state.text, width, height, rgba)
+    uitext.add_image(mut cx.state.shared.text, width, height, rgba)
 }
 
 /// Returns the text on the clipboard, the system's when the context has a window, or `none` when it holds no text.
 pub fn clipboard(cx: Context) -> str? {
-    cx.state.paste()
+    cx.state.shared.paste()
 }
 
 /// Puts `s` on the clipboard, the system's when the context has a window.
 pub fn set_clipboard(cx: Context, s: str) {
-    cx.state.copy(s)
+    cx.state.shared.copy(s)
 }
 
 /// Returns the shape the pointer should have: that of the innermost element under it that sets a `cursor`, or the arrow. While a drag started by `on_drag` is active it is the `cursor` of the element that started it, or the arrow when that sets none, whatever is under the pointer, as gpui gives every element the drag's cursor style (`elements/div.rs:2538`).
@@ -256,17 +282,21 @@ pub fn text_input(cx: Context) -> platform.Caret? {
 
 /// Returns `true` while a frame is due: after a signal changed, a closure was posted, the window changed size, or the element under the pointer or the focused element changed.
 pub fn frame_due(cx: Context) -> bool {
-    cx.state.dirty
+    due(cx.state)
 }
 
-/// Returns `true` once a `CloseRequested` event has been dispatched or `quit` called.
+fn due(st: *State) -> bool {
+    st.dirty || st.rendered_generation != st.shared.generation
+}
+
+/// Returns `true` once a `CloseRequested` event has been dispatched to the window or `quit` called.
 pub fn closed(cx: Context) -> bool {
-    cx.state.closed
+    cx.state.closed || cx.state.shared.quit
 }
 
-/// Ends `run` after the events it is dispatching.
+/// Ends `run` after the events it is dispatching, whichever window `cx` belongs to.
 pub fn quit(cx: Context) {
-    cx.state.closed = true
+    cx.state.shared.quit = true
 }
 
 /// Returns the key of the focused element, its id or its position in the tree, or `""` when none is focused.
@@ -313,7 +343,11 @@ pub fn rems(cx: Context, count: f32) -> f32 {
 
 /// Returns a handle that posts closures to `cx`.
 pub fn handle(cx: Context) -> Handle {
-    Handle { posts: cx.state.posts, wake: cx.state.wake }
+    shared_handle(cx.state.shared)
+}
+
+fn shared_handle(sh: *Shared) -> Handle {
+    Handle { posts: sh.posts, wake: sh.wake }
 }
 
 /// Queues `f` to run on the context's green thread before its next frame, and wakes the window waiting for events.
@@ -322,14 +356,14 @@ pub fn post(h: Handle, f: fn()) {
     h.wake()
 }
 
-fn drain(st: *State) {
+fn drain(sh: *Shared) {
     for {
         let posted = select {
-            v = <-st.posts => v ?? return
+            v = <-sh.posts => v ?? return
             else => return
         }
         posted()
-        st.dirty = true
+        sh.generation += 1
     }
 }
 
@@ -338,9 +372,13 @@ fn drain(st: *State) {
 /// The hitboxes of the painted elements replace those of the last frame, so `dispatch` finds the elements this frame drew.
 pub fn frame(cx: Context, render: fn() -> Element, size: geometry.Size, scale: f32) -> scene.Scene {
     let st = cx.state
-    uitext.end_frame(mut st.text)
-    drain(st)
+    let sh = st.shared
+    uitext.end_frame(mut sh.text)
+    drain(sh)
     st.dirty = false
+    st.rendered_generation = sh.generation
+    let was_rendering = sh.rendering
+    sh.rendering = true
     let root = render()
     var t = layout.tree(scale)
     let laid = build(st, mut t, root, default_text_style(st))
@@ -364,7 +402,7 @@ pub fn frame(cx: Context, render: fn() -> Element, size: geometry.Size, scale: f
     let device_width = i64(floor(size.width * scale + 0.5))
     let device_height = i64(floor(size.height * scale + 0.5))
     var sc = scene.empty(device_width, device_height, st.background)
-    sc.text = uitext.params(st.text)
+    sc.text = uitext.params(st.shared.text)
     st.painted = 0
     st.anchors_painted = 0
     st.caret = none
@@ -374,6 +412,7 @@ pub fn frame(cx: Context, render: fn() -> Element, size: geometry.Size, scale: f
     paint_tooltip(st, mut sc, scale)
     paint_drag(st, mut sc, scale)
     hit_test(st)
+    sh.rendering = was_rendering
     sc
 }
 
@@ -663,8 +702,8 @@ fn paint_drawn(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, w: W
     paint_background(mut sc, r, visual, own.opacity, scale)
     if is_text(e) {
         let content = geometry.offset(layout.content(t, laid.node), w.shift.x, w.shift.y)
-        let lines = uitext.wrap(mut st.text, e.content, drawn(st, own).text, content.width)
-        uitext.paint(mut st.text, mut sc, lines, geometry.point(content.x, content.y), faded(own.color, own.opacity), scale)
+        let lines = uitext.wrap(mut st.shared.text, e.content, drawn(st, own).text, content.width)
+        uitext.paint(mut st.shared.text, mut sc, lines, geometry.point(content.x, content.y), faded(own.color, own.opacity), scale)
     } else if is_field(e) {
         let content = geometry.offset(layout.content(t, laid.node), w.shift.x, w.shift.y)
         paint_field(st, mut sc, e, at, content, drawn(st, own), scale)
@@ -672,10 +711,10 @@ fn paint_drawn(st: *State, t: layout.Tree, mut sc: scene.Scene, laid: Laid, w: W
         let content = geometry.offset(layout.content(t, laid.node), w.shift.x, w.shift.y)
         paint_text_area(st, mut sc, e, at, content, drawn(st, own), scale)
     } else if is_icon(e) {
-        uitext.paint_icon(mut st.text, mut sc, e.content, r, faded(own.color, own.opacity), scale)
+        uitext.paint_icon(mut st.shared.text, mut sc, e.content, r, faded(own.color, own.opacity), scale)
     } else if is_picture(e) {
         match e.picture {
-            some(p) => uitext.paint_image(mut st.text, mut sc, p, e.fit, r, visual.corners, e.gray, own.opacity, scale)
+            some(p) => uitext.paint_image(mut st.shared.text, mut sc, p, e.fit, r, visual.corners, e.gray, own.opacity, scale)
             none => {}
         }
     } else {
@@ -863,9 +902,7 @@ pub fn dispatch(cx: Context, event: platform.Event) {
             st.scale = scale
             st.dirty = true
         }
-        CloseRequested => {
-            st.closed = true
-        }
+        CloseRequested => request_close(st)
         PointerMoved(x, y) => pointer_moved(st, x, y)
         PointerLeft => pointer_left(st)
         PointerDown(b) => {
@@ -900,7 +937,7 @@ pub fn dispatch(cx: Context, event: platform.Event) {
         FocusChanged(focused) => {
             st.window_focused = focused
         }
-        Woken => drain(st)
+        Woken => drain(st.shared)
         FileDragEntered(x, y, paths) => file_drag_entered(st, x, y, paths)
         FileDragMoved(x, y) => file_drag_moved(st, x, y)
         FileDropped(x, y) => file_dropped(st, x, y)
