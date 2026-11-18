@@ -22,6 +22,21 @@ function basicWidth(source, at) {
     return unitWidth(source, at) === 2 ? 0 : 1;
 }
 
+const hexDigit = /[0-9A-Fa-f]/;
+const escapeDigits = { x: 2, u: 4, U: 8 };
+
+function escapeTail(source, at) {
+    const letter = source[at];
+    if (letter === "u" && source[at + 1] === "{") {
+        let cursor = at + 2;
+        while (cursor < source.length && hexDigit.test(source[cursor])) {
+            cursor += 1;
+        }
+        return cursor > at + 2 && source[cursor] === "}" ? cursor + 1 - (at + 1) : 0;
+    }
+    return escapeDigits[letter] ?? 0;
+}
+
 function stringEnd(source, at) {
     let cursor = at + 1;
     while (cursor < source.length) {
@@ -55,7 +70,7 @@ function characterWidth(source, at) {
             return 0;
         }
         const escaped = basicWidth(source, at + 1);
-        return escaped === 0 ? 0 : 1 + escaped;
+        return escaped === 0 ? 0 : 1 + escaped + escapeTail(source, at + 1);
     }
     if (character === "'" || character === "\n") {
         return 0;
