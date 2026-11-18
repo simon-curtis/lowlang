@@ -16,7 +16,7 @@ Low compiles to static native binaries with no libc dependency, has a tracing ga
 | `low doc` | Prints the public API of every module under a directory as JSON. |
 | `low names` | Prints every name in a file as JSON, with its hover text, definition and reference group. |
 | `low lsp` | Starts the language server that the editor extensions use. |
-| `low version` | Prints the release, or `dev` for a build from source. |
+| `low version` | Prints the release, or for a build from source `dev+` and the first 12 digits of the commit `std/buildinfo` reports, then ` ~ ` and the build time in UTC as `YYYY/MM/DD HH:MM`: `dev+0e21bead73d7 ~ 2026/11/18 16:01`. A build outside a git checkout prints `dev`. |
 
 A directory is a module. A `build.low` file marks the project root and names its dependencies, and `import ui/text` loads `ui/text/` under it. The standard library is imported as `std/...`, and the editor extensions need `low` on `PATH`.
 

@@ -33,6 +33,8 @@ download() {
 }
 
 root=$(cd "$(dirname "$0")" && pwd)
+: "${SOURCE_DATE_EPOCH:=$(date +%s)}"
+export SOURCE_DATE_EPOCH
 case ${1:-./low} in
     /*) output=${1:-./low} ;;
     *) output=$PWD/${1:-./low} ;;
