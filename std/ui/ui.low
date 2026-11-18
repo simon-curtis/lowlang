@@ -36,38 +36,46 @@ pub enum Error {
     Gpu(gpu.Error)
 }
 
-/// A window, the GPU that draws into it and the context of its user interface.
+/// The application's windows, the GPU that draws into them and the context of the user interface.
 ///
-/// Releasing an `App` releases the GPU, then the window.
+/// Releasing an `App` closes every window it still has, further windows before the main one and owned windows before their owners, then releases the GPU and the connection to the windowing system.
 pub struct App {
-    gpu: gpu.Gpu
-    window: platform.Window
     /// The context the application's signals and frames belong to.
     pub cx: Context
+    device: gpu.Device
+    connection: Connection
+    drop close_all(cx.state.shared)
 }
 
 const reveal_deadline_ms = 500
 
-/// Opens a window with `o`'s title and size and a GPU that draws into it. The window stays invisible until `run` presents its first frame, so the system never shows it before a frame has been queued for it.
+/// Opens a window with `o`'s title and size and a GPU that draws into it. The window stays invisible until `run` presents its first frame, so the system never shows it before a frame has been queued for it. `open_window` opens further windows in the same application.
 pub fn open(o: Options) -> App ! Error {
+    using connection = connect() catch Platform
     let titlebar = platform.TitlebarOptions { appears_transparent: o.titlebar.appears_transparent }
-    using window = platform.open(platform.Options { title: o.title, width: o.width, height: o.height, titlebar, hidden: true, activate: o.activate }) catch Platform
-    let native = platform.native(window)
-    using g = gpu.open_for(gpu.Surface { display: native.display, window: native.window }) catch Gpu
+    let first_options = platform.Options { title: o.title, width: o.width, height: o.height, titlebar, hidden: true, activate: o.activate }
+    using var window = open_first(connection, first_options) catch Platform
+    let first = window.handle
+    let surface = surface_of(first)
+    using device = gpu.open_device(surface) catch Gpu
+    let view = device.handle
+    using var presenter = gpu.presenter_on(view, surface) catch Gpu
+    let link = link_of(connection, first)
     let cx = headless(o.background)
     let st = cx.state
     let sh = st.shared
-    sh.open = open_unsupported
-    uitext.use_system_fonts(mut sh.text, gpu.supports_subpixel(g) && dwrite.subpixel_enabled())
-    let waker = platform.waker(window)
+    let main = main_window(cx)
+    let seat = Seat { window: platform.detach(mut window), presenter: gpu.detach_presenter(mut presenter) }
+    main.slot.seat = some(seat)
+    sh.open = fn(shared: *Shared, w: WindowOptions) -> Opened ! Error { open_beside_window(shared, link, view, w)? }
+    uitext.use_system_fonts(mut sh.text, gpu.supports_subpixel_on(view) && dwrite.subpixel_enabled())
+    let waker = waker_of_link(link)
     sh.wake = fn() { platform.wake(waker) }
-    let controls = platform.controls(window)
-    st.minimize = fn() { platform.minimize(controls) }
-    st.zoom = fn() { platform.toggle_maximize(controls) }
-    let area_at = fn(x: f32, y: f32) -> platform.WindowControlArea? { window_control_area_at(cx, x, y) }
-    platform.set_hit_test(window, area_at)
+    sh.wait = fn(timeout_ms: i64) ! platform.Error { wait_link(link, timeout_ms)? }
+    sh.events = fn(w: platform.WindowHandle) -> platform.Event[] ! platform.Error { events_link(link, w)? }
+    bind_window(cx, first)
     sh.clock = fn() -> i64 { time.monotonic() / 1000000 }
-    let clip = platform.clipboard(window)
+    let clip = platform.clipboard_on(first)
     sh.copy = fn(s: str) {
         sh.memory = s
         platform.write_clipboard(clip, s) or {}
@@ -77,11 +85,63 @@ pub fn open(o: Options) -> App ! Error {
             e => sh.memory
         }
     }
-    App { gpu: g, window, cx }
+    App { cx, device, connection }
 }
 
-fn open_unsupported(sh: *Shared, o: WindowOptions) -> *State ! Error {
-    fail Platform(platform.Error.Unsupported("this application opens no further windows"))
+fn surface_of(w: platform.WindowHandle) -> gpu.Surface {
+    let native = platform.native_on(w)
+    gpu.Surface { display: native.display, window: native.window }
+}
+
+fn bind_window(cx: Context, handle: platform.WindowHandle) {
+    let st = cx.state
+    let controls = platform.controls_on(handle)
+    st.minimize = fn() { platform.minimize(controls) }
+    st.zoom = fn() { platform.toggle_maximize(controls) }
+    let area_at = fn(x: f32, y: f32) -> platform.WindowControlArea? { window_control_area_at(cx, x, y) }
+    platform.set_hit_test_on(handle, area_at)
+}
+
+fn platform_placement(p: Placement) -> platform.Placement {
+    match p {
+        System => platform.Placement.System
+        CentreOnOwner => platform.Placement.CentreOnOwner
+        CentreOnScreen => platform.Placement.CentreOnScreen
+    }
+}
+
+fn owner_handle(o: WindowOptions) -> platform.WindowHandle? {
+    let owner = o.owner ?? return none
+    let seat = owner.slot.seat ?? return none
+    some(seat.window)
+}
+
+fn platform_options(o: WindowOptions) -> platform.Options {
+    platform.Options {
+        title: o.title
+        width: o.width
+        height: o.height
+        titlebar: platform.TitlebarOptions { appears_transparent: o.titlebar.appears_transparent }
+        hidden: true
+        min_width: o.min_width
+        min_height: o.min_height
+        owner: owner_handle(o)
+        placement: platform_placement(o.placement)
+        activate: o.activate
+        taskbar: o.taskbar
+    }
+}
+
+fn open_beside_window(sh: *Shared, link: Link, device: gpu.DeviceHandle, o: WindowOptions) -> Opened ! Error {
+    let options = platform_options(o)
+    using var window = open_beside(link, options) catch Platform
+    let handle = window.handle
+    let surface = surface_of(handle)
+    using var presenter = gpu.presenter_on(device, surface) catch Gpu
+    let st = new_state(sh, o.background)
+    bind_window(Context { state: st }, handle)
+    let seat = Seat { window: platform.detach(mut window), presenter: gpu.detach_presenter(mut presenter) }
+    Opened { state: st, seat: some(seat) }
 }
 
 fn same_caret(a: platform.Caret?, b: platform.Caret?) -> bool {
@@ -93,24 +153,27 @@ fn same_caret(a: platform.Caret?, b: platform.Caret?) -> bool {
     x.x == y.x && x.y == y.y && x.width == y.width && x.height == y.height
 }
 
-fn sync_window(app: App) {
-    let st = app.cx.state
+fn sync_window(w: Window) {
+    let seat = w.slot.seat ?? return
+    let cx = window_context(w)
+    let st = cx.state
     if !same_caret(st.caret, st.applied_caret) {
-        platform.set_text_input(app.window, st.caret)
+        platform.set_text_input_on(seat.window, st.caret)
         st.applied_caret = st.caret
     }
-    let shape = pointer_cursor(app.cx)
+    let shape = pointer_cursor(cx)
     if shape != st.applied_cursor {
-        platform.set_cursor(app.window, shape)
+        platform.set_cursor_on(seat.window, shape)
         st.applied_cursor = shape
     }
 }
 
-fn reveal(app: App) {
-    let st = app.cx.state
+fn reveal(w: Window) {
+    let st = w.slot.state
+    let seat = w.slot.seat ?? return
     if !st.revealed {
         st.revealed = true
-        platform.show(app.window)
+        platform.show_on(seat.window)
     }
 }
 
@@ -123,31 +186,105 @@ fn reveal_wait(st: *State, wait: i64, deadline: i64) -> i64 {
     if wait < 0 || remaining < wait { remaining } else { wait }
 }
 
-/// Runs the window until it is closed: waits for events, dispatches them, and when a frame is due builds the tree `render` returns, lays it out, paints it and presents it.
-///
-/// The window becomes visible once the first `present` returns without error, even when that call had nothing to present because the swapchain has no area. A window with no frame to draw, such as one with no area, becomes visible 500 milliseconds after `run` starts, so it never stays hidden. A first `present` that fails ends `run` with the error and leaves the window hidden.
-pub fn run(app: App, render: fn() -> Element) ! Error {
-    let st = app.cx.state
-    let deadline = now_ms(st) + reveal_deadline_ms
-    for !closed(app.cx) {
+fn shortest(a: i64, b: i64) -> i64 {
+    if a < 0 {
+        return b
+    }
+    if b < 0 {
+        return a
+    }
+    if a < b { a } else { b }
+}
+
+fn wait_for(windows: Window[]) -> i64 {
+    var wait: i64 = -1
+    for w in windows {
+        let st = w.slot.state
         let drawable = due(st) && st.width > 0.0 && st.height > 0.0
-        let wait = if drawable { 0 } else { reveal_wait(st, wait_ms(st), deadline) }
-        let events = platform.next(app.window, wait) catch Platform
-        for e in events {
-            dispatch(app.cx, e)
+        let each = if drawable { 0 } else { reveal_wait(st, wait_ms(st), w.slot.deadline) }
+        wait = shortest(wait, each)
+    }
+    wait
+}
+
+fn fail_window(w: Window, e: Error) ! Error {
+    if is_main(w) {
+        fail e
+    }
+    close_with(w, CloseReason.Failed(e))
+}
+
+fn receive(sh: *Shared, w: Window) ! Error {
+    let seat = w.slot.seat ?? return
+    let events = sh.events(seat.window) catch Platform
+    let cx = window_context(w)
+    for e in events {
+        dispatch(cx, e)
+    }
+}
+
+fn present_window(sh: *Shared, w: Window) ! Error {
+    let slot = w.slot
+    let st = slot.state
+    let seat = slot.seat ?? return
+    let cx = window_context(w)
+    if !due(st) || closed(cx) || st.width <= 0.0 || st.height <= 0.0 {
+        return
+    }
+    let size = geometry.size(st.width, st.height)
+    let sc = frame(cx, slot.render, size, st.scale)
+    gpu.present_to_on(seat.presenter, sc, mut sh.text.atlas) catch Gpu
+    reveal(w)
+}
+
+fn serve(sh: *Shared, w: Window) ! Error {
+    if !w.slot.open {
+        return
+    }
+    present_window(sh, w) catch {
+        e => {
+            fail_window(w, e)?
+            return
         }
-        drain(st.shared)
-        fire_timers(st)
-        if due(st) && !closed(app.cx) && st.width > 0.0 && st.height > 0.0 {
-            let size = geometry.size(st.width, st.height)
-            let sc = frame(app.cx, render, size, st.scale)
-            gpu.present(app.gpu, sc, mut st.shared.text.atlas) catch Gpu
-            reveal(app)
+    }
+    if now_ms(w.slot.state) >= w.slot.deadline {
+        reveal(w)
+    }
+    sync_window(w)
+}
+
+/// Runs the application until its main window is closed or `quit` is called: waits for events, dispatches them to the window they are for, and when a window has a frame due builds the tree its render function returns, lays it out, paints it and presents it. `render` builds the main window's tree; `open_window` gives each further window its own.
+///
+/// A window becomes visible once its first `present` returns without error, even when that call had nothing to present because the swapchain has no area. A window with no frame to draw, such as one with no area, becomes visible 500 milliseconds after it opened or after `run` started, whichever is later, so it never stays hidden. A first `present` that fails on the main window ends `run` with the error and leaves the window hidden. On a further window it closes that window and passes the error to its `closed` callback as `Failed`, and the other windows keep running; so does an error that servicing its events returns. A `CloseRequested` event closes a further window, as `close_window` does, and ends `run` on the main window. Before `run` returns, whether by closing or by error, it closes every further window, owned windows before their owners, and runs each one's `closed` callback.
+pub fn run(app: App, render: fn() -> Element) ! Error {
+    let cx = app.cx
+    let sh = cx.state.shared
+    let main = main_window(cx)
+    main.slot.render = render
+    let started = now_ms(cx.state)
+    for w in open_windows(sh) {
+        w.slot.deadline = started + reveal_deadline_ms
+    }
+    defer close_tools(sh)
+    for !closed(cx) {
+        let windows = open_windows(sh)
+        sh.wait(wait_for(windows)) catch Platform
+        for w in windows {
+            if w.slot.open {
+                receive(sh, w) catch {
+                    e => fail_window(w, e)?
+                }
+            }
         }
-        if now_ms(st) >= deadline {
-            reveal(app)
+        drain(sh)
+        for w in windows {
+            if w.slot.open {
+                fire_timers(w.slot.state)
+            }
         }
-        sync_window(app)
+        for w in windows {
+            serve(sh, w)?
+        }
     }
 }
 

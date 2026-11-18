@@ -1,0 +1,205 @@
+import std/ui
+import std/ui/geometry
+import std/ui/platform
+
+extern "user32" {
+    fn FindWindowW(class: ptr, title: ptr) -> ptr
+    fn PostMessageW(hwnd: ptr, message: u32, wparam: i64, lparam: i64) -> i32
+    fn IsWindow(hwnd: ptr) -> i32
+    fn EnableWindow(hwnd: ptr, enable: i32) -> i32
+    fn GetDpiForWindow(hwnd: ptr) -> u32
+}
+
+extern "dwmapi" {
+    fn DwmGetWindowAttribute(hwnd: ptr, attribute: u32, mut value: i32, size: u32) -> i32
+}
+
+extern "kernel32" {
+    fn GetCurrentProcessId() -> u32
+}
+
+const dwmwa_cloaked: u32 = 14
+const wm_close: u32 = 0x10
+const wm_lbuttondown: u32 = 0x201
+const wm_lbuttonup: u32 = 0x202
+const patient_ms = 10000
+const frame_ms = 450
+const step_ms = 10
+
+struct Seen {
+    main: ptr = null
+    tool: ptr = null
+    main_renders: i64 = 0
+    main_count: i64 = -1
+    tool_renders: i64 = 0
+    opened: i64 = 0
+    closed: i64 = 0
+    closed_while_main_exists: bool = false
+    returned: bool = false
+}
+
+fn wide(s: str) -> []u8 {
+    var out: []u8 = []
+    for b in bytes(s) {
+        out.push(b)
+        out.push(0)
+    }
+    out.push(0)
+    out.push(0)
+    out
+}
+
+fn find_window(title: str) -> ptr {
+    let name = wide(title)
+    let at: ptr[u8] = pin(name)
+    let hwnd = FindWindowW(null, at)
+    unpin(at)
+    hwnd
+}
+
+fn cloak_state(hwnd: ptr) -> i64 {
+    var state: i32 = -1
+    if DwmGetWindowAttribute(hwnd, dwmwa_cloaked, mut state, 4) < 0 {
+        return -1
+    }
+    i64(state)
+}
+
+fn pixels(hwnd: ptr, logical: i64) -> i64 {
+    (logical * i64(GetDpiForWindow(hwnd)) + 48) / 96
+}
+
+fn client_point(hwnd: ptr, x: i64, y: i64) -> i64 {
+    ((pixels(hwnd, y) & 0xFFFF) << 16) | (pixels(hwnd, x) & 0xFFFF)
+}
+
+fn click(hwnd: ptr, x: i64, y: i64) {
+    let at = client_point(hwnd, x, y)
+    PostMessageW(hwnd, wm_lbuttondown, 1, at)
+    PostMessageW(hwnd, wm_lbuttonup, 0, at)
+}
+
+fn until(limit_ms: i64, ready: fn() -> bool) -> bool {
+    for waited in 0..limit_ms / step_ms {
+        if ready() {
+            return true
+        }
+        sleep(step_ms)
+    }
+    ready()
+}
+
+fn why_text(why: ui.CloseReason) -> str {
+    match why {
+        Requested => "requested"
+        Failed(e) => "failed"
+    }
+}
+
+fn main_view(seen: *Seen, count: ui.Signal[i64], open: fn()) -> ui.Element {
+    seen.main_renders += 1
+    seen.main_count = ui.get(count)
+    let opener = fn(e: ui.ClickEvent) { open() }
+    ui.div().size(320.0, 200.0).children() {
+        ui.div().size(100.0, 40.0).on_click(opener).child(ui.text("open")),
+        ui.text("count {ui.get(count)}"),
+    }
+}
+
+fn tool_view(seen: *Seen, count: ui.Signal[i64]) -> ui.Element {
+    seen.tool_renders += 1
+    let counted = fn(e: ui.ClickEvent) { ui.update(count, fn(n: i64) -> i64 { n + 1 }) }
+    ui.div().size(240.0, 160.0).on_click(counted).child(ui.text("tool"))
+}
+
+fn open_tool(cx: ui.Context, seen: *Seen, count: ui.Signal[i64], pid: u32) {
+    seen.opened += 1
+    let title = "apptool tool {seen.opened} {pid}"
+    let on_closed = fn(why: ui.CloseReason) {
+        let number = seen.closed + 1
+        let main_exists = IsWindow(seen.main) != 0
+        print("tool {number} closed: {why_text(why)}, main window exists {main_exists}")
+        seen.closed_while_main_exists = main_exists
+        seen.closed = number
+    }
+    let view = fn() -> ui.Element { tool_view(seen, count) }
+    let options = ui.WindowOptions { title, width: 240, height: 160, activate: false, closed: on_closed }
+    let w = ui.open_window(cx, options, view) catch {
+        e => {
+            print("open_window failed")
+            return
+        }
+    }
+    let hwnd = find_window(title)
+    EnableWindow(hwnd, 0)
+    print("tool {seen.opened} after open_window: cloaked {cloak_state(hwnd)}")
+    seen.tool = hwnd
+}
+
+fn drive(seen: *Seen) {
+    let started = until(patient_ms, fn() -> bool { seen.main_renders > 0 && cloak_state(seen.main) == 0 })
+    print("the main window drew its first frame {started}")
+    click(seen.main, 20, 20)
+    let opened = until(patient_ms, fn() -> bool { seen.opened == 1 && seen.tool != null })
+    print("a click in the main window opened a tool window {opened}")
+    let first_tool = seen.tool
+    let drawn = until(frame_ms, fn() -> bool { cloak_state(first_tool) == 0 })
+    print("tool 1 after its first frame: cloaked {cloak_state(first_tool)} {drawn && seen.tool_renders > 0}")
+    click(first_tool, 20, 20)
+    let shown = until(patient_ms, fn() -> bool { seen.main_count == 1 })
+    print("a signal set in the tool window changed the main window's next frame {shown}")
+    PostMessageW(first_tool, wm_close, 0, 0)
+    let closed = until(patient_ms, fn() -> bool { seen.closed == 1 })
+    print("WM_CLOSE to the tool window ran closed {closed}")
+    print("the tool window is gone {IsWindow(first_tool) == 0}")
+    print("the main window is still open {IsWindow(seen.main) != 0}")
+    click(seen.main, 20, 20)
+    let again = until(patient_ms, fn() -> bool { seen.opened == 2 && seen.tool != first_tool })
+    print("the main window kept running and opened a tool window again {again}")
+    PostMessageW(seen.main, wm_close, 0, 0)
+}
+
+fn once() ! ui.Error {
+    let pid = GetCurrentProcessId()
+    let title = "apptool main {pid}"
+    using app = ui.open(ui.Options { title, width: 320, height: 200, activate: false })?
+    let cx = app.cx
+    let seen = new(Seen {})
+    let count = ui.signal(cx, 0)
+    seen.main = find_window(title)
+    EnableWindow(seen.main, 0)
+    let open = fn() { open_tool(cx, seen, count, pid) }
+    let view = fn() -> ui.Element { main_view(seen, count, open) }
+    spawn drive(seen)
+    ui.run(app, view)?
+    seen.returned = true
+    print("run ended after tool 2 closed first {seen.closed == 2 && seen.closed_while_main_exists}")
+    print("tool 2 is gone {IsWindow(seen.tool) == 0}")
+}
+
+fn main() ! ui.Error {
+    once() catch {
+        Platform(error) => {
+            match error {
+                NoDisplay(detail) => {
+                    print("no display")
+                    return
+                }
+                e => fail ui.Error.Platform(e)
+            }
+        }
+        Gpu(error) => {
+            match error {
+                NoDevice => {
+                    print("skip no Vulkan 1.3 device that presents to a window")
+                    return
+                }
+                Vulkan(call, result) => {
+                    print("skip Vulkan {call} returned {result}, so no window can be drawn")
+                    return
+                }
+                e => fail ui.Error.Gpu(e)
+            }
+        }
+    }
+}
