@@ -2975,7 +2975,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - stored function values, closures and callbacks running patched code;
   - instances of an edited generic function patched;
   - restarts on layout, signature and capture changes.
-- `compiler/lowfuzz` generates well-typed, terminating programs from a choice stream (`compiler/fuzz/gen`), predicts their output with a reference interpreter (`compiler/fuzz/model`), builds each with the release profile and the dev profile, the same optimisation and hot-reload code generation as `low build` and `low dev`, runs both, and reports any of these (`compiler/fuzz/oracle`):
+- `compiler/lowfuzz` generates well-typed, terminating programs from a choice stream (`compiler/fuzz/gen`), predicts their output with a reference interpreter (`compiler/fuzz/model`), builds each for the host with the release profile and with the dev profile, the same optimisation and hot-reload code generation as `low build` and `low dev`, or on Windows, where `dev` is unavailable, with the unoptimised profile of `-c debug`, runs both, and reports any of these (`compiler/fuzz/oracle`):
   - compiler panic;
   - rejected program;
   - link failure;
