@@ -10,10 +10,8 @@ struct Frame {
     staging: Buffer = Buffer {}
 }
 
-struct State {
-    device: Device = Device {}
-    surface: VkSurfaceKHR = VkSurfaceKHR {}
-    swapchain: Swapchain = Swapchain {}
+struct DeviceState {
+    device: Handles = Handles {}
     command_pool: VkCommandPool = VkCommandPool {}
     set_layout: VkDescriptorSetLayout = VkDescriptorSetLayout {}
     pipeline_layout: VkPipelineLayout = VkPipelineLayout {}
@@ -25,14 +23,43 @@ struct State {
     atlas_ready: bool = false
     frames: *Frame[] = []
     next_frame: i64 = 0
+    presenters: *PresenterState[] = []
+    targets: *TargetState[] = []
 }
 
-/// A Vulkan 1.3 instance and device with the pipelines, glyph atlas texture and frame resources that draw a `scene.Scene`.
+struct PresenterState {
+    device: *DeviceState
+    surface: VkSurfaceKHR = VkSurfaceKHR {}
+    swapchain: Swapchain = Swapchain {}
+}
+
+struct GpuState {
+    device: *DeviceState
+    presenter: *PresenterState
+}
+
+/// A Vulkan 1.3 instance and device with the pipelines, glyph atlas texture and frame resources that draw a `scene.Scene`, shared by every window of a program.
 ///
-/// Releasing a `Gpu` waits for the device to go idle and destroys everything it created. Every `Target` made from it must be released first, which `using` does when the targets are bound after the `Gpu`.
+/// A `Device` draws into any number of `Presenter`s and `Target`s. It keeps one atlas texture that mirrors the `scene.Atlas` it was last given, so a `Device` draws with one atlas. Releasing it waits for the device to go idle, destroys the swapchain and surface of every `Presenter` and the image of every `Target` still alive, and then everything it created, so release order between a `Device` and its `Presenter`s and `Target`s does not matter. A `Presenter` or `Target` released afterwards does nothing, and `present_to` with a `Presenter` fails with `NoDevice`.
+pub struct Device {
+    state: *DeviceState
+    drop destroy_device_state(state)
+}
+
+/// The swapchain that draws a `Device`'s scenes into one window.
+///
+/// A `Presenter` owns the Vulkan surface it makes from the window's handles, so it must be released before its window: a window released first leaves the surface pointing at a destroyed native window. A window takes one `Presenter`: on Windows the `present_to` of a second one fails with `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` while the first has a swapchain. Releasing it waits for the device to go idle and destroys the swapchain and the surface, and does nothing when the `Device` was released first.
+pub struct Presenter {
+    state: *PresenterState
+    drop destroy_presenter_state(state)
+}
+
+/// A `Device` with one `Presenter`, for a program with one window or none.
+///
+/// Releasing a `Gpu` waits for the device to go idle and destroys the presenter and then everything the device created, including every `Target` still alive.
 pub struct Gpu {
-    state: *State
-    drop destroy_state(state)
+    state: *GpuState
+    drop destroy_gpu(state)
 }
 
 const frames_in_flight = 2
@@ -50,36 +77,66 @@ fn slot(kind: scene.Kind) -> i64 {
 
 /// Reports whether the device can blend each colour channel by its own coverage, which subpixel text needs.
 pub fn supports_subpixel(g: Gpu) -> bool {
-    g.state.dual_source
+    g.state.device.dual_source
 }
 
 /// Opens the first Vulkan 1.3 device that offers dynamic rendering, synchronization2 and a graphics queue, for drawing into offscreen targets.
 ///
 /// Fails with `NoDevice` when none does, and with `Vulkan` when a call fails.
 pub fn open() -> Gpu ! Error {
-    let state = new(State {})
+    let device = new(DeviceState {})
+    let presenter = new_presenter(device)
+    let state = new(GpuState { device, presenter })
     using g = Gpu { state }
-    build_state(state, [], [], none)?
+    build_device(device, [], [], none)?
     g
+}
+
+/// Opens the first Vulkan 1.3 device that offers dynamic rendering, synchronization2 and the swapchain extension, and has a graphics queue that can present to `first`, for drawing into any number of windows with `presenter` and `present_to`.
+///
+/// The device is chosen against `first` only. `first` is not kept, so the window need not outlive the `Device`; each window that draws needs its own `presenter`. Offscreen targets work on it as on one from `open`. Fails with `NoDevice` when no device qualifies, and with `Vulkan` when a call fails, including `VK_ERROR_EXTENSION_NOT_PRESENT` when the instance lacks the windowing extension.
+pub fn open_device(first: Surface) -> Device ! Error {
+    let state = new(DeviceState {})
+    using d = Device { state }
+    build_device(state, window_instance_extensions(), window_device_extensions(), some(first))?
+    d
+}
+
+/// Makes the swapchain that draws `d`'s scenes into the window `s`.
+///
+/// The `Presenter` owns the Vulkan surface it makes from `s`, so the window must outlive it: release the `Presenter` before its window. A window takes one `Presenter`. Fails with `NoDevice` when the queue family `d` was opened with cannot present to `s`, and with `Vulkan` when a call fails.
+pub fn presenter(d: Device, s: Surface) -> Presenter ! Error {
+    let state = new_presenter(d.state)
+    using p = Presenter { state }
+    build_presenter(state, s)?
+    p
+}
+
+fn new_presenter(device: *DeviceState) -> *PresenterState {
+    let state = new(PresenterState { device })
+    device.presenters.push(state)
+    state
 }
 
 /// Returns the name of the physical device `g` draws on.
 pub fn adapter(g: Gpu) -> str {
     var props = VkPhysicalDeviceProperties {}
-    vkGetPhysicalDeviceProperties(g.state.device.physical, mut props)
+    vkGetPhysicalDeviceProperties(g.state.device.device.physical, mut props)
     VkPhysicalDeviceProperties_deviceName(props)
 }
 
-fn build_state(s: *State, instance_extensions: str[], device_extensions: str[], window: Surface?) ! Error {
+fn window_instance_extensions() -> str[] {
+    ["VK_KHR_surface", surface_extension]
+}
+
+fn window_device_extensions() -> str[] {
+    ["VK_KHR_swapchain"]
+}
+
+fn build_device(s: *DeviceState, instance_extensions: str[], device_extensions: str[], window: Surface?) ! Error {
     using var pins = new_pins()
     s.device.instance = create_instance(mut pins, instance_extensions)?
-    match window {
-        some(w) => {
-            s.surface = create_surface(s.device.instance, w)?
-        }
-        none => {}
-    }
-    let chosen = choose_device(s.device.instance, device_extensions, s.surface)?
+    let chosen = choose_for(s.device.instance, device_extensions, window)?
     s.device.physical = chosen.physical
     s.device.family = chosen.family
     s.dual_source = chosen.dual_source
@@ -98,12 +155,37 @@ fn build_state(s: *State, instance_extensions: str[], device_extensions: str[], 
     }
 }
 
-fn create_command_pool(s: *State) ! Error {
+fn choose_for(instance: VkInstance, extensions: str[], window: Surface?) -> Chosen ! Error {
+    match window {
+        some(w) => {
+            let probe = create_surface(instance, w)?
+            let chosen = choose_device(instance, extensions, probe) catch {
+                e => {
+                    vkDestroySurfaceKHR(instance, probe, null)
+                    fail e
+                }
+            }
+            vkDestroySurfaceKHR(instance, probe, null)
+            chosen
+        }
+        none => choose_device(instance, extensions, VkSurfaceKHR {})?
+    }
+}
+
+fn build_presenter(p: *PresenterState, s: Surface) ! Error {
+    let handles = p.device.device
+    p.surface = create_surface(handles.instance, s)?
+    if !can_present(handles.physical, handles.family, p.surface)? {
+        fail NoDevice
+    }
+}
+
+fn create_command_pool(s: *DeviceState) ! Error {
     var info = VkCommandPoolCreateInfo { flags: VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, queueFamilyIndex: s.device.family }
     check(vkCreateCommandPool(s.device.handle, mut info, null, mut s.command_pool), "vkCreateCommandPool")?
 }
 
-fn create_descriptor_pool(s: *State) ! Error {
+fn create_descriptor_pool(s: *DeviceState) ! Error {
     using var pins = new_pins()
     let sets = frames_in_flight * kinds
     let storage = VkDescriptorPoolSize { type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount: u32(sets) }
@@ -114,7 +196,7 @@ fn create_descriptor_pool(s: *State) ! Error {
     check(vkCreateDescriptorPool(s.device.handle, mut info, null, mut s.descriptor_pool), "vkCreateDescriptorPool")?
 }
 
-fn build_frame(s: *State, f: *Frame) ! Error {
+fn build_frame(s: *DeviceState, f: *Frame) ! Error {
     using var pins = new_pins()
     var buffer_info = VkCommandBufferAllocateInfo { commandPool: s.command_pool, level: VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount: 1 }
     let command_buffers: VkCommandBuffer[] = __make(1)
@@ -139,7 +221,7 @@ fn build_frame(s: *State, f: *Frame) ! Error {
     }
 }
 
-fn write_instances_binding(d: Device, set: VkDescriptorSet, b: Buffer) {
+fn write_instances_binding(d: Handles, set: VkDescriptorSet, b: Buffer) {
     using var pins = new_pins()
     let info = VkDescriptorBufferInfo { buffer: b.handle, offset: 0, range: b.size }
     let infos = pins.hold(info)
@@ -154,7 +236,7 @@ fn write_instances_binding(d: Device, set: VkDescriptorSet, b: Buffer) {
     vkUpdateDescriptorSets(d.handle, 1, writes, 0, null)
 }
 
-fn write_atlas_binding(d: Device, set: VkDescriptorSet, sampler: VkSampler, atlas: Image) {
+fn write_atlas_binding(d: Handles, set: VkDescriptorSet, sampler: VkSampler, atlas: Image) {
     using var pins = new_pins()
     let info = VkDescriptorImageInfo { sampler, imageView: atlas.view, imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }
     let infos = pins.hold(info)
@@ -169,7 +251,7 @@ fn write_atlas_binding(d: Device, set: VkDescriptorSet, sampler: VkSampler, atla
     vkUpdateDescriptorSets(d.handle, 1, writes, 0, null)
 }
 
-fn pipelines_for(s: *State, format: i32) -> Pipelines ! Error {
+fn pipelines_for(s: *DeviceState, format: i32) -> Pipelines ! Error {
     let existing = s.pipelines[format]
     match existing {
         some(p) => p
@@ -181,7 +263,7 @@ fn pipelines_for(s: *State, format: i32) -> Pipelines ! Error {
     }
 }
 
-fn wait_frame(d: Device, f: *Frame) ! Error {
+fn wait_frame(d: Handles, f: *Frame) ! Error {
     if !f.submitted {
         return
     }
@@ -192,24 +274,57 @@ fn wait_frame(d: Device, f: *Frame) ! Error {
     f.submitted = false
 }
 
-fn destroy_state(s: *State) {
+fn destroy_gpu(g: *GpuState) {
+    destroy_presenter_state(g.presenter)
+    destroy_device_state(g.device)
+}
+
+fn destroy_presenter_state(p: *PresenterState) {
+    let device = p.device
+    let handles = device.device
+    if handles.handle.handle != null {
+        vkDeviceWaitIdle(handles.handle)
+        free_presenter(handles, p)
+    }
+    var kept: *PresenterState[] = []
+    for other in device.presenters {
+        if other != p {
+            kept.push(other)
+        }
+    }
+    device.presenters = kept
+}
+
+fn free_presenter(d: Handles, p: *PresenterState) {
+    destroy_swapchain(d, p.swapchain)
+    p.swapchain = Swapchain {}
+    if p.surface.handle != 0 {
+        vkDestroySurfaceKHR(d.instance, p.surface, null)
+        p.surface = VkSurfaceKHR {}
+    }
+}
+
+fn destroy_device_state(s: *DeviceState) {
     let d = s.device
     if d.handle.handle != null {
         vkDeviceWaitIdle(d.handle)
+        for t in s.targets {
+            free_target(d, t)
+        }
+        for p in s.presenters {
+            free_presenter(d, p)
+        }
         destroy_device_objects(s)
         vkDestroyDevice(d.handle, null)
     }
     if d.instance.handle != null {
-        if s.surface.handle != 0 {
-            vkDestroySurfaceKHR(d.instance, s.surface, null)
-        }
         vkDestroyInstance(d.instance, null)
     }
+    s.device = Handles {}
 }
 
-fn destroy_device_objects(s: *State) {
+fn destroy_device_objects(s: *DeviceState) {
     let d = s.device
-    destroy_swapchain(d, s.swapchain)
     for f in s.frames {
         vkDestroySemaphore(d.handle, f.acquired, null)
         for b in f.instances {
@@ -228,4 +343,3 @@ fn destroy_device_objects(s: *State) {
     vkDestroyDescriptorSetLayout(d.handle, s.set_layout, null)
     vkDestroyCommandPool(d.handle, s.command_pool, null)
 }
-
