@@ -20,7 +20,7 @@ struct Conn {
     requested: bool
     types: [i64: TypeInfo]
     statements: [str: str]
-    seen: [str: bool]
+    seen: [str: i64[]]
     parsing: str
     parsing_name: str
     counter: i64
@@ -117,6 +117,7 @@ struct Exchange {
     columns: sql.Column[]
     kinds: Kind[]
     parameters: str[]
+    inferred: i64[]
     errors: sql.Diagnostic[]
     failure: sql.Error?
     stopped: bool
@@ -159,10 +160,14 @@ fn type_name(c: *Conn, oid: i64) -> str {
 fn parameters_of(c: *Conn, mut m: Message, x: *Exchange) ! sql.Error {
     let n = int16(mut m)?
     let names: str[] = __make(n)
+    let oids: i64[] = __make(n)
     for i in 0..n {
-        names[i] = type_name(c, i64(u32(int32(mut m)?)))
+        let oid = i64(u32(int32(mut m)?))
+        oids[i] = oid
+        names[i] = type_name(c, oid)
     }
     x.parameters = names
+    x.inferred = oids
 }
 
 fn row_of(c: *Conn, mut m: Message, x: *Exchange) -> sql.Value[] ! sql.Error {
@@ -297,7 +302,7 @@ fn outcome(c: *Conn, x: *Exchange) -> i64 ! sql.Error {
 }
 
 fn new_exchange(batch: i64) -> *Exchange {
-    new(Exchange { batch, columns: [], kinds: [], parameters: [], errors: [], failure: none, stopped: false, synced: batch == 0, count: 0 })
+    new(Exchange { batch, columns: [], kinds: [], parameters: [], inferred: [], errors: [], failure: none, stopped: false, synced: batch == 0, count: 0 })
 }
 
 fn drive(c: *Conn, batch: i64, sink: fn(sql.Event) -> bool) -> i64 ! sql.Error {
@@ -370,19 +375,68 @@ fn statement_key(sql_text: str, oids: i64[]) -> str {
     __str_view(key)
 }
 
-fn prepare(c: *Conn, mut b: u8[], sql_text: str, oids: i64[]) -> str {
+struct Declared {
+    oids: i64[]
+    reparse: bool
+}
+
+fn typed(oids: i64[]) -> bool {
+    for oid in oids {
+        if oid != 0 {
+            return true
+        }
+    }
+    false
+}
+
+fn infer(c: *Conn, sql_text: str, oids: i64[]) -> Declared ! sql.Error {
+    let open: i64[] = __make(oids.len)
+    var b: u8[] = []
+    put_parse(mut b, "", sql_text, open)
+    put_describe_statement(mut b, "")
+    put_empty(mut b, 'S')
+    dispatch(c, b)?
+    let x = new_exchange(0)
+    x.run(c, driver.ignore_event)?
+    let declared: i64[] = __make(oids.len)
+    var reparse = false
+    for i, oid in oids {
+        if oid == 0 || i >= x.inferred.len {
+            continue
+        }
+        let found = x.inferred[i]
+        if found == text_oid || found == unknown_oid {
+            declared[i] = oid
+            reparse = true
+        }
+    }
+    Declared { oids: declared, reparse }
+}
+
+fn parse_unnamed(c: *Conn, mut b: u8[], key: str, sql_text: str, oids: i64[]) -> str ! sql.Error {
+    if c.seen.len >= seen_capacity {
+        c.seen = [:]
+    }
+    var declared = Declared { oids, reparse: true }
+    if typed(oids) {
+        declared = infer(c, sql_text, oids)?
+    }
+    c.seen[key] = declared.oids
+    if declared.reparse {
+        put_parse(mut b, "", sql_text, declared.oids)
+    }
+    ""
+}
+
+fn prepare(c: *Conn, mut b: u8[], sql_text: str, oids: i64[]) -> str ! sql.Error {
     let key = statement_key(sql_text, oids)
     match c.statements[key] {
         some(name) => return name
         none => {}
     }
-    if c.seen[key] == none {
-        if c.seen.len >= seen_capacity {
-            c.seen = [:]
-        }
-        c.seen[key] = true
-        put_parse(mut b, "", sql_text, oids)
-        return ""
+    let declared = match c.seen[key] {
+        some(known) => known
+        none => return parse_unnamed(c, mut b, key, sql_text, oids)?
     }
     if c.statements.len >= statement_capacity {
         for old, name in c.statements {
@@ -393,7 +447,7 @@ fn prepare(c: *Conn, mut b: u8[], sql_text: str, oids: i64[]) -> str {
     }
     c.counter += 1
     let name = "lowlang_{c.counter}"
-    put_parse(mut b, name, sql_text, oids)
+    put_parse(mut b, name, sql_text, declared)
     c.parsing = key
     c.parsing_name = name
     name
@@ -406,7 +460,7 @@ fn extended(c: *Conn, sql_text: str, values: sql.Value[], batch: i64) ! sql.Erro
     }
     let p = parameters(values)?
     var b: u8[] = []
-    let name = prepare(c, mut b, sql_text, p.oids)
+    let name = prepare(c, mut b, sql_text, p.oids)?
     put_bind(mut b, name, p)
     put_describe_portal(mut b)
     put_execute(mut b, batch)
@@ -617,6 +671,8 @@ fn canceller(o: sql.Options) -> fn(i64, u8[]) {
 }
 
 /// Connects to a PostgreSQL server over plain TCP, using `o.host` and `o.port` (`5432` by default), and authenticates as `o.user` to `o.database`.
+///
+/// A `Null` or `Text` parameter is left to the server to type. Any other `sql.Value` is declared as the server infers it from the statement, so `Int(21)` binds into the `int4` of `twice($1)`; where the server infers only `text` or `unknown`, as in `SELECT $1`, it is declared as its own type (`Int` as `int8`, `Float` as `float8`). The first call of a statement with such a parameter pays one extra round trip to learn the types; later calls reuse them and the prepared statement cache. Values are sent as text, so the server parses them into the type it chose.
 ///
 /// `cancel` and a call that times out send a cancel request to the server over a new connection; a timeout then closes the connection and `cancel` leaves it usable. A call stopped by `cancel` fails with `sql.Error.Cancelled`. Every notice, warning, error and notification the server sends reaches the function set with `on_notice`. Passwords are sent in cleartext, as an MD5 hash or through SCRAM-SHA-256, as the server requests. Returns `sql.Error.Connect` when the connection cannot be made, `sql.Error.Timeout` when it exceeds `o.timeout`, `sql.Error.Authentication` when the login fails, `sql.Error.Unsupported` for an authentication method the driver lacks and `sql.Error.Server` when the server rejects the startup. Dropping the returned `sql.Connection` closes the socket.
 ///
