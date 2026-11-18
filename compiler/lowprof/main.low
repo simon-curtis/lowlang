@@ -1,0 +1,313 @@
+import emit
+import std/builder
+import std/file
+import std/flag
+import std/io
+import std/os
+import std/process
+import std/slices
+import std/text
+
+enum Error {
+    Misuse(message: str)
+    Failed(message: str)
+}
+
+struct Sample {
+    weight: i64
+    frames: []i64
+}
+
+struct Recording {
+    samples: []Sample
+    process_cycles: i64
+    threads: i64
+}
+
+struct Config {
+    map: str
+    interval_ms: i64
+    depth: i64
+    top: i64
+    folded: str
+    command: []str
+}
+
+struct Tally {
+    name: str
+    cycles: i64
+}
+
+fn flag_specs() -> []flag.Spec {
+    [
+        flag.Spec { name: "map", help: "the symbol map that low build -map wrote for the program" }
+        flag.Spec { name: "interval", help: "milliseconds between samples", fallback: "1" }
+        flag.Spec { name: "depth", help: "most callers recorded per sample", fallback: "64" }
+        flag.Spec { name: "top", help: "functions listed in each table", fallback: "40" }
+        flag.Spec { name: "folded", help: "a file to write the folded stacks to, one per line with its cycles" }
+    ]
+}
+
+fn usage_text() -> str {
+    let program = os.args()[0]
+    "usage: {program} -map file [flags] -- program [args...]\n{flag.usage(flag_specs())}"
+}
+
+fn main() {
+    run_command(os.args()[1..]) catch {
+        Misuse(message) => {
+            emit.eprint(message)
+            os.exit(2)
+        }
+        Failed(message) => {
+            emit.eprint("lowprof: {message}")
+            os.exit(1)
+        }
+    }
+}
+
+fn run_command(arguments: []str) ! Error {
+    let config = parse_config(arguments)?
+    let image = read_image(config.command[0])?
+    let symbols = load_symbols(config.map, image)?
+    let c = process.command(config.command[0], config.command[1..])
+    let handle = process.start_handle(c) catch {
+        e => fail Failed("{c.program}: {emit.io_message(e)}")
+    }
+    using child = process.adopt(handle)
+    let recording = record(handle.pid, config.interval_ms, config.depth, image.code)?
+    let exit = process.wait(child) catch {
+        e => fail Failed("{c.program}: {emit.io_message(e)}")
+    }
+    if !process.success(exit) {
+        emit.eprint("lowprof: {c.program} failed; the profile covers the run up to its exit")
+    }
+    report(recording, symbols, config.top)
+    if config.folded != "" {
+        write_folded(recording, symbols, config.folded)?
+    }
+}
+
+fn parse_config(arguments: []str) -> Config ! Error {
+    let parsed = flag.parse(flag_specs(), arguments) catch {
+        _ => fail Misuse(usage_text())
+    }
+    let interval_ms = flag.number(parsed, "interval") catch {
+        _ => fail Misuse(usage_text())
+    }
+    let depth = flag.number(parsed, "depth") catch {
+        _ => fail Misuse(usage_text())
+    }
+    let top = flag.number(parsed, "top") catch {
+        _ => fail Misuse(usage_text())
+    }
+    let map = flag.get(parsed, "map")
+    if map == "" || parsed.rest.len == 0 || interval_ms < 1 || depth < 0 || top < 1 {
+        fail Misuse(usage_text())
+    }
+    Config { map, interval_ms, depth, top, folded: flag.get(parsed, "folded"), command: parsed.rest }
+}
+
+struct Span {
+    start: i64
+    end: i64
+}
+
+struct Image {
+    base: i64
+    size: i64
+    code: Span
+}
+
+const section_header_size = 40
+const executable_section = 0x20000000
+
+fn read_image(program: str) -> Image ! Error {
+    let bytes = file.read_file(program) catch {
+        e => fail Failed("{program}: {emit.io_message(e)}")
+    }
+    if bytes.len < 64 || bytes[0] != 'M' || bytes[1] != 'Z' {
+        fail Failed("{program} is not a Windows executable")
+    }
+    let header = io.le32(bytes, 0x3C)
+    let optional = header + 24
+    if optional + 64 > bytes.len || io.le32(bytes, header) != 0x4550 {
+        fail Failed("{program} has no PE header")
+    }
+    let sections = io.le16(bytes, header + 6)
+    let table = optional + io.le16(bytes, header + 20)
+    if table + sections * section_header_size > bytes.len {
+        fail Failed("{program} has a truncated section table")
+    }
+    let size = io.le32(bytes, optional + 56)
+    var code = Span { start: size, end: 0 }
+    for i in 0..sections {
+        let at = table + i * section_header_size
+        if io.le32(bytes, at + 36) & executable_section == 0 {
+            continue
+        }
+        let start = io.le32(bytes, at + 12)
+        let end = start + io.le32(bytes, at + 8)
+        if start < code.start {
+            code.start = start
+        }
+        if end > code.end {
+            code.end = end
+        }
+    }
+    if code.end == 0 {
+        fail Failed("{program} has no executable section")
+    }
+    Image { base: io.le64(bytes, optional + 24), size, code }
+}
+
+struct Symbols {
+    starts: []i64
+    names: []str
+    size: i64
+}
+
+fn load_symbols(path: str, image: Image) -> Symbols ! Error {
+    let content = file.read_text(path) catch {
+        e => fail Failed("{path}: {emit.io_message(e)}")
+    }
+    var starts: []i64 = []
+    var names: []str = []
+    for line in text.split(content, '\n') {
+        let space = text.index_byte(line, ' ')
+        if space <= 0 {
+            continue
+        }
+        let address = text.parse_radix(line[..space], 16) catch {
+            _ => fail Failed("{path}: {line} does not start with a hexadecimal address")
+        }
+        let rva = address - image.base
+        if rva < 0 || rva >= image.size {
+            continue
+        }
+        starts.push(rva)
+        names.push(line[space + 1..])
+    }
+    if starts.len == 0 {
+        fail Failed("{path} names no symbol inside the image")
+    }
+    Symbols { starts, names, size: image.size }
+}
+
+fn name_at(s: Symbols, rva: i64) -> str {
+    if rva < 0 || rva >= s.size {
+        return "[outside the image]"
+    }
+    var lo = 0
+    var hi = s.starts.len
+    for lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if s.starts[mid] <= rva {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo == 0 {
+        return "[image header]"
+    }
+    s.names[lo - 1]
+}
+
+fn category(name: str) -> str {
+    if text.starts_with(name, "[") {
+        return "system"
+    }
+    if text.starts_with(name, "fn___") {
+        return "prelude"
+    }
+    if text.starts_with(name, "fn_std.") {
+        return "std"
+    }
+    if text.starts_with(name, "fn_") {
+        return "program"
+    }
+    "runtime"
+}
+
+fn add(mut tallies: [str: i64], name: str, cycles: i64) {
+    tallies[name] = (tallies[name] ?? 0) + cycles
+}
+
+fn ranked(tallies: [str: i64]) -> []Tally {
+    var out: []Tally = []
+    for name, cycles in tallies {
+        out.push(Tally { name, cycles })
+    }
+    slices.sort_by(mut out, fn(x, y) x.cycles > y.cycles || x.cycles == y.cycles && x.name < y.name)
+    out
+}
+
+fn report(r: Recording, s: Symbols, top: i64) {
+    var sampled = 0
+    var own: [str: i64] = [:]
+    var within: [str: i64] = [:]
+    var kinds: [str: i64] = [:]
+    for sample in r.samples {
+        sampled += sample.weight
+        let leaf = name_at(s, sample.frames[0])
+        add(mut own, leaf, sample.weight)
+        add(mut kinds, category(leaf), sample.weight)
+        var seen: [str: bool] = [:]
+        for rva in sample.frames {
+            let name = name_at(s, rva)
+            if seen[name] == none {
+                seen[name] = true
+                add(mut within, name, sample.weight)
+            }
+        }
+    }
+    var out = builder.builder()
+    out.write("process cycles {giga(r.process_cycles)} G, sampled {giga(sampled)} G ({share(sampled, r.process_cycles)}), {r.samples.len} samples over {r.threads} threads\n\n")
+    out.write("category    cycles G   share\n")
+    for t in ranked(kinds) {
+        out.write("{text.pad_right(t.name, 10, ' ')}{text.pad_left(giga(t.cycles), 10, ' ')}{text.pad_left(share(t.cycles, sampled), 8, ' ')}\n")
+    }
+    write_table(mut out, "self", ranked(own), sampled, top)
+    write_table(mut out, "inclusive", ranked(within), sampled, top)
+    print(out.to_str())
+}
+
+fn write_table(mut out: builder.Builder, title: str, tallies: []Tally, sampled: i64, top: i64) {
+    out.write("\n{title}\n")
+    let count = if tallies.len < top { tallies.len } else { top }
+    for t in tallies[..count] {
+        out.write("{text.pad_left(share(t.cycles, sampled), 8, ' ')}{text.pad_left(giga(t.cycles), 10, ' ')}  {t.name}\n")
+    }
+}
+
+fn giga(cycles: i64) -> str {
+    text.fixed(f64(cycles) / 1000000000.0, 3)
+}
+
+fn share(part: i64, whole: i64) -> str {
+    if whole == 0 {
+        return "-"
+    }
+    "{text.fixed(f64(part) * 100.0 / f64(whole), 1)}%"
+}
+
+fn write_folded(r: Recording, s: Symbols, path: str) ! Error {
+    var stacks: [str: i64] = [:]
+    for sample in r.samples {
+        var names: []str = []
+        var i = sample.frames.len - 1
+        for i >= 0 {
+            names.push(name_at(s, sample.frames[i]))
+            i -= 1
+        }
+        add(mut stacks, text.join(names, ";"), sample.weight)
+    }
+    var out = builder.builder()
+    for stack, cycles in stacks {
+        out.write("{stack} {cycles}\n")
+    }
+    file.write_file(path, out.to_bytes()) catch {
+        e => fail Failed("{path}: {emit.io_message(e)}")
+    }
+}

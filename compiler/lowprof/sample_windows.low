@@ -1,0 +1,271 @@
+import std/io
+
+extern "kernel32" {
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> i64
+    fn OpenThread(access: u32, inherit: i32, tid: u32) -> i64
+    fn CloseHandle(handle: i64) -> i32
+    fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> i64
+    fn Thread32First(snapshot: i64, mut entry: ThreadEntry) -> i32
+    fn Thread32Next(snapshot: i64, mut entry: ThreadEntry) -> i32
+    fn SuspendThread(thread: i64) -> u32
+    fn ResumeThread(thread: i64) -> u32
+    fn GetThreadContext(thread: i64, context: i64) -> i32
+    fn QueryThreadCycleTime(thread: i64, mut cycles: u64) -> i32
+    fn QueryProcessCycleTime(process: i64, mut cycles: u64) -> i32
+    fn ReadProcessMemory(process: i64, address: i64, buffer: ptr, size: i64, done: i64) -> i32
+    fn K32EnumProcessModules(process: i64, mut module: i64, size: u32, mut needed: u32) -> i32
+    fn VirtualAlloc(address: ptr, size: i64, kind: u32, protect: u32) -> ptr[u8]
+    fn VirtualFree(address: ptr, size: i64, kind: u32) -> i32
+    fn WaitForSingleObject(handle: i64, milliseconds: u32) -> u32
+    fn Sleep(milliseconds: u32)
+}
+
+extern "winmm" {
+    fn timeBeginPeriod(period: u32) -> u32
+    fn timeEndPeriod(period: u32) -> u32
+}
+
+extern struct ThreadEntry {
+    size: u32
+    usage: u32
+    thread: u32
+    owner: u32
+    base_priority: i32
+    delta_priority: i32
+    flags: u32
+}
+
+const process_access: u32 = 0x100410
+const thread_access: u32 = 0x4A
+const snapshot_threads: u32 = 4
+const thread_entry_size: u32 = 28
+const invalid_handle = -1
+const suspend_failed: u32 = 0xFFFFFFFF
+const wait_signalled: u32 = 0
+const context_size = 1232
+const frame_offset = 2048
+const page_size = 8192
+const commit_reserve: u32 = 0x3000
+const read_write: u32 = 4
+const release: u32 = 0x8000
+const context_flags = 0x100003
+const flags_offset = 0x30
+const rsp_offset = 0x98
+const rbp_offset = 0xA0
+const rip_offset = 0xF8
+const refresh_ticks = 5
+const scan_bytes = 4096
+const scan_block = 512
+const stack_reach = 0x100000
+
+struct Tracked {
+    handle: i64
+    cycles: i64
+}
+
+struct Sampler {
+    process: i64
+    pid: i64
+    base: i64
+    code: Span
+    depth: i64
+    memory: ptr[u8]
+    context: []u8
+    frame: []u8
+    readable: i64
+    threads: [i64: *Tracked]
+    samples: []Sample
+}
+
+fn record(pid: i64, interval_ms: i64, depth: i64, code: Span) -> Recording ! Error {
+    let process = OpenProcess(process_access, 0, u32(pid))
+    if process == 0 {
+        fail Failed("cannot open process {pid}")
+    }
+    let memory = VirtualAlloc(null, page_size, commit_reserve, read_write)
+    if memory == null {
+        CloseHandle(process)
+        fail Failed("cannot allocate the thread context")
+    }
+    let frame_at: ptr[u8] = ptr(i64(memory) + frame_offset)
+    let s = new(Sampler { process, pid, base: 0, code, depth, memory, context: view(memory, context_size), frame: view(frame_at, scan_bytes), readable: 0, threads: [:], samples: [] })
+    timeBeginPeriod(1)
+    var tick = 0
+    for {
+        if s.base == 0 {
+            s.base = module_base(process)
+        }
+        if tick % refresh_ticks == 0 {
+            s.refresh_threads()
+        }
+        if s.base != 0 {
+            s.sample_threads()
+        }
+        if WaitForSingleObject(process, 0) == wait_signalled {
+            break
+        }
+        Sleep(u32(interval_ms))
+        tick += 1
+    }
+    timeEndPeriod(1)
+    var total: u64 = 0
+    QueryProcessCycleTime(process, mut total)
+    for _, t in s.threads {
+        CloseHandle(t.handle)
+    }
+    CloseHandle(process)
+    VirtualFree(memory, 0, release)
+    Recording { samples: s.samples, process_cycles: i64(total), threads: s.threads.len }
+}
+
+fn module_base(process: i64) -> i64 {
+    var module = 0
+    var needed: u32 = 0
+    if K32EnumProcessModules(process, mut module, 8, mut needed) == 0 {
+        return 0
+    }
+    module
+}
+
+fn refresh_threads(s: *Sampler) {
+    let snapshot = CreateToolhelp32Snapshot(snapshot_threads, 0)
+    if snapshot == invalid_handle {
+        return
+    }
+    var entry = ThreadEntry { size: thread_entry_size, usage: 0, thread: 0, owner: 0, base_priority: 0, delta_priority: 0, flags: 0 }
+    var more = Thread32First(snapshot, mut entry) != 0
+    for more {
+        if i64(entry.owner) == s.pid {
+            s.track(i64(entry.thread))
+        }
+        entry.size = thread_entry_size
+        more = Thread32Next(snapshot, mut entry) != 0
+    }
+    CloseHandle(snapshot)
+}
+
+fn track(s: *Sampler, id: i64) {
+    if s.threads[id] != none {
+        return
+    }
+    let handle = OpenThread(thread_access, 0, u32(id))
+    if handle == 0 {
+        return
+    }
+    var cycles: u64 = 0
+    QueryThreadCycleTime(handle, mut cycles)
+    s.threads[id] = new(Tracked { handle, cycles: i64(cycles) })
+}
+
+fn sample_threads(s: *Sampler) {
+    for _, t in s.threads {
+        s.sample_thread(t)
+    }
+}
+
+fn sample_thread(s: *Sampler, t: *Tracked) {
+    var now: u64 = 0
+    if QueryThreadCycleTime(t.handle, mut now) == 0 {
+        return
+    }
+    let weight = i64(now) - t.cycles
+    if weight <= 0 {
+        return
+    }
+    t.cycles = i64(now)
+    if SuspendThread(t.handle) == suspend_failed {
+        return
+    }
+    let frames = s.capture(t.handle)
+    ResumeThread(t.handle)
+    if frames.len > 0 {
+        s.samples.push(Sample { weight, frames })
+    }
+}
+
+struct Found {
+    at: i64
+    ret: i64
+}
+
+fn capture(s: *Sampler, thread: i64) -> []i64 {
+    io.set_le32(s.context, flags_offset, context_flags)
+    if GetThreadContext(thread, i64(s.memory)) == 0 {
+        return []
+    }
+    let rip = io.le64(s.context, rip_offset)
+    var rbp = io.le64(s.context, rbp_offset)
+    let rsp = io.le64(s.context, rsp_offset)
+    var frames: []i64 = [rip - s.base]
+    if !s.in_code(rip) {
+        let found = s.scan(rsp)
+        if found.ret == 0 {
+            return frames
+        }
+        frames.push(found.ret - 1 - s.base)
+        rbp = s.frame_above(rsp, found.at)
+    }
+    for frames.len <= s.depth {
+        if rbp < rsp || rbp % 8 != 0 {
+            break
+        }
+        if ReadProcessMemory(s.process, rbp, ptr(i64(s.memory) + frame_offset), 16, 0) == 0 {
+            break
+        }
+        let next = io.le64(s.frame, 0)
+        let ret = io.le64(s.frame, 8)
+        if !s.in_code(ret) {
+            break
+        }
+        frames.push(ret - 1 - s.base)
+        if next <= rbp {
+            break
+        }
+        rbp = next
+    }
+    frames
+}
+
+fn in_code(s: *Sampler, address: i64) -> bool {
+    let rva = address - s.base
+    rva >= s.code.start && rva < s.code.end
+}
+
+fn read_stack(s: *Sampler, rsp: i64) {
+    s.readable = 0
+    for s.readable < scan_bytes {
+        let into = ptr(i64(s.memory) + frame_offset + s.readable)
+        if ReadProcessMemory(s.process, rsp + s.readable, into, scan_block, 0) == 0 {
+            return
+        }
+        s.readable += scan_block
+    }
+}
+
+fn scan(s: *Sampler, rsp: i64) -> Found {
+    s.read_stack(rsp)
+    var at = 0
+    for at < s.readable {
+        let word = io.le64(s.frame, at)
+        if s.in_code(word) {
+            return Found { at, ret: word }
+        }
+        at += 8
+    }
+    Found { at: 0, ret: 0 }
+}
+
+fn frame_above(s: *Sampler, rsp: i64, from: i64) -> i64 {
+    var at = from + 8
+    for at + 16 <= s.readable {
+        let saved = io.le64(s.frame, at)
+        let ret = io.le64(s.frame, at + 8)
+        let here = rsp + at
+        let outermost = saved == 0 || saved > here && saved < here + stack_reach
+        if outermost && s.in_code(ret) {
+            return here
+        }
+        at += 8
+    }
+    0
+}

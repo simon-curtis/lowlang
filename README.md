@@ -96,6 +96,16 @@ Each `bench/<name>/` holds one program as `main.low` and, for most, `main.ts`. T
 
 `{exe}` in the command becomes the `-a` or `-b` program and `{side}` becomes `a` or `b`. `-same`, relative to `-dir`, deletes both files before the first run and fails unless both sides wrote identical files, checked after the `-warmup` runs and after the last timed run. The timed runs alternate `ab` and `ba`, and each run's process is measured on its own: wall time, CPU time, cycles from `QueryProcessCycleTime` and peak private memory. For each metric the report gives the median and spread of each side, the median of the paired `b/a` ratios and its 95% bootstrap interval; the verdict names a difference only when the interval excludes 1. `-affinity` restricts every run to a hexadecimal CPU mask.
 
+`compiler/lowprof` samples a Windows program and reports where its cycles go:
+
+```sh
+./low build compiler/lowprof -o lowprof.exe
+./low build compiler/low -o low-mapped.exe -map low.map
+./lowprof.exe -map low.map -folded stacks.txt -- ./low-mapped.exe build ../app
+```
+
+Every `-interval` milliseconds it suspends each thread of the program that used cycles since the last sample, reads its instruction pointer and walks its `rbp` chain, and weights the sample by the thread's cycles from `QueryThreadCycleTime`. A thread stopped outside the image, in Windows code, is attributed to the first return address into the image found on its stack and the frame record above it. The report gives the process's cycles and the share sampled, the cycles by category (`runtime` for the assembly runtime, `prelude`, `std`, `program` and `system` for code outside the image), and the functions with the most cycles of their own and the most cycles including callees. `-folded` writes each stack root first with its cycles, the input of flame graph tools.
+
 ## Releases
 
 The `patch` workflow runs after each green `build` on `main` and, when a commit since the last tag changes `compiler/` outside its tool and test directories, or `std/`, calls the `release` workflow with the next patch version. Pushing a `v*` tag, for a minor or major version, runs it too. The `release` workflow builds `low` for `linux/amd64` and `windows/amd64` and publishes them as a GitHub release, `low-linux-amd64` and `low-windows-amd64.exe`. The workflow writes the tag into `compiler/low/version.txt` before it builds, so each binary prints the tag from `low version`; a build from source prints `dev`. `site/public/install.sh` and `site/public/install.ps1`, served by the website, download the latest release.
