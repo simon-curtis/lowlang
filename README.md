@@ -87,6 +87,15 @@ Each `bench/<name>/` holds one program as `main.low` and, for most, `main.ts`. T
 | jsonpar | JSON parsing and tree walking |
 | channels | unbuffered ping-pong and a buffered worker pool |
 
+`compiler/abbench` compares two programs running the same command on Windows, such as two compilers building one project:
+
+```sh
+./low build compiler/abbench -o abbench.exe
+./abbench.exe -a old.exe -b new.exe -runs 15 -dir ../app -same out-{side}.exe -- {exe} build src/app -o out-{side}.exe
+```
+
+`{exe}` in the command becomes the `-a` or `-b` program and `{side}` becomes `a` or `b`. `-same`, relative to `-dir`, deletes both files before the first run and fails unless both sides wrote identical files, checked after the `-warmup` runs and after the last timed run. The timed runs alternate `ab` and `ba`, and each run's process is measured on its own: wall time, CPU time, cycles from `QueryProcessCycleTime` and peak private memory. For each metric the report gives the median and spread of each side, the median of the paired `b/a` ratios and its 95% bootstrap interval; the verdict names a difference only when the interval excludes 1. `-affinity` restricts every run to a hexadecimal CPU mask.
+
 ## Releases
 
 The `patch` workflow runs after each green `build` on `main` and, when a commit since the last tag changes `compiler/` outside its tool and test directories, or `std/`, calls the `release` workflow with the next patch version. Pushing a `v*` tag, for a minor or major version, runs it too. The `release` workflow builds `low` for `linux/amd64` and `windows/amd64` and publishes them as a GitHub release, `low-linux-amd64` and `low-windows-amd64.exe`. The workflow writes the tag into `compiler/low/version.txt` before it builds, so each binary prints the tag from `low version`; a build from source prints `dev`. `site/public/install.sh` and `site/public/install.ps1`, served by the website, download the latest release.
