@@ -336,11 +336,15 @@ rt_mstart:
 
 rt_os_init:
 	OS_ENTER
-	lea rcx, [rsp+48]
-	WIN GetSystemInfo
-	mov eax, dword ptr [rsp+80]
+	mov rcx, -1
+	lea rdx, [rsp+48]
+	lea r8, [rsp+56]
+	WIN GetProcessAffinityMask
 	test eax, eax
+	jz 3f
+	popcnt rax, [rsp+48]
 	jnz 1f
+3:
 	mov eax, 1
 1:
 	mov [rip+rt_ncpu], rax
