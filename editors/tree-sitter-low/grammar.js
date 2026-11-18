@@ -366,7 +366,7 @@ module.exports = grammar({
       /[0-9][0-9_]*[eE][+-]?[0-9_]+/,
     )),
 
-    escape_sequence: _ => token.immediate(/\\[ntr0\\"']/),
+    escape_sequence: _ => token.immediate(/\\([ntr0\\"']|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|u\{[0-9a-fA-F]{1,6}\})/),
 
     char: $ => seq(
       '\'',
