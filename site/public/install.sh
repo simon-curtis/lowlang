@@ -10,7 +10,7 @@ Linux/x86_64 | Linux/amd64) ;;
 	;;
 esac
 
-dir="${LOW_INSTALL:-$HOME/.local/bin}"
+dir="${LOW_BIN:-$HOME/.local/bin}"
 mkdir -p "$dir"
 download="$(mktemp "$dir/.low.XXXXXX")"
 trap 'rm -f "$download"' EXIT

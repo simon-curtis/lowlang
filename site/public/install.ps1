@@ -4,7 +4,7 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     throw 'low runs on 64-bit Windows'
 }
 
-$dir = if ($env:LOW_INSTALL) { $env:LOW_INSTALL } else { Join-Path $env:LOCALAPPDATA 'Programs\low' }
+$dir = if ($env:LOW_BIN) { $env:LOW_BIN } else { Join-Path $env:USERPROFILE '.low\bin' }
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $target = Join-Path $dir 'low.exe'
 $download = "$target.download"
