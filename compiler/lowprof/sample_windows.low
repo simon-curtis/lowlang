@@ -1,16 +1,13 @@
 import std/io
+import std/time
 
 extern "kernel32" {
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> i64
     fn OpenThread(access: u32, inherit: i32, tid: u32) -> i64
     fn CloseHandle(handle: i64) -> i32
-    fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> i64
-    fn Thread32First(snapshot: i64, mut entry: ThreadEntry) -> i32
-    fn Thread32Next(snapshot: i64, mut entry: ThreadEntry) -> i32
     fn SuspendThread(thread: i64) -> u32
     fn ResumeThread(thread: i64) -> u32
     fn GetThreadContext(thread: i64, context: i64) -> i32
-    fn QueryThreadCycleTime(thread: i64, mut cycles: u64) -> i32
     fn QueryProcessCycleTime(process: i64, mut cycles: u64) -> i32
     fn ReadProcessMemory(process: i64, address: i64, buffer: ptr, size: i64, done: i64) -> i32
     fn K32EnumProcessModules(process: i64, mut module: i64, size: u32, mut needed: u32) -> i32
@@ -20,26 +17,17 @@ extern "kernel32" {
     fn Sleep(milliseconds: u32)
 }
 
+extern "ntdll" {
+    fn NtQuerySystemInformation(class: u32, buffer: ptr, length: u32, mut returned: u32) -> i32
+}
+
 extern "winmm" {
     fn timeBeginPeriod(period: u32) -> u32
     fn timeEndPeriod(period: u32) -> u32
 }
 
-extern struct ThreadEntry {
-    size: u32
-    usage: u32
-    thread: u32
-    owner: u32
-    base_priority: i32
-    delta_priority: i32
-    flags: u32
-}
-
 const process_access: u32 = 0x100410
 const thread_access: u32 = 0x4A
-const snapshot_threads: u32 = 4
-const thread_entry_size: u32 = 28
-const invalid_handle = -1
 const suspend_failed: u32 = 0xFFFFFFFF
 const wait_signalled: u32 = 0
 const context_size = 1232
@@ -53,15 +41,18 @@ const flags_offset = 0x30
 const rsp_offset = 0x98
 const rbp_offset = 0xA0
 const rip_offset = 0xF8
-const refresh_ticks = 5
 const scan_bytes = 4096
 const scan_block = 512
 const stack_reach = 0x100000
-
-struct Tracked {
-    handle: i64
-    cycles: i64
-}
+const process_information: u32 = 5
+const length_mismatch: i32 = -1073741820
+const process_entry_size = 0x100
+const process_id_offset = 0x50
+const thread_entry_size = 0x50
+const thread_id_offset = 0x30
+const thread_state_offset = 0x44
+const thread_running = 2
+const first_query_size = 0x200000
 
 struct Sampler {
     process: i64
@@ -73,7 +64,10 @@ struct Sampler {
     context: []u8
     frame: []u8
     readable: i64
-    threads: [i64: *Tracked]
+    query: ptr[u8]
+    query_size: i64
+    running: []i64
+    threads: [i64: i64]
     samples: []Sample
 }
 
@@ -88,34 +82,50 @@ fn record(pid: i64, interval_ms: i64, depth: i64, code: Span) -> Recording ! Err
         fail Failed("cannot allocate the thread context")
     }
     let frame_at: ptr[u8] = ptr(i64(memory) + frame_offset)
-    let s = new(Sampler { process, pid, base: 0, code, depth, memory, context: view(memory, context_size), frame: view(frame_at, scan_bytes), readable: 0, threads: [:], samples: [] })
+    let s = new(Sampler { process, pid, base: 0, code, depth, memory, context: view(memory, context_size), frame: view(frame_at, scan_bytes), readable: 0, query: null, query_size: 0, running: [], threads: [:], samples: [] })
     timeBeginPeriod(1)
-    var tick = 0
+    var last = time.monotonic()
     for {
         if s.base == 0 {
             s.base = module_base(process)
         }
-        if tick % refresh_ticks == 0 {
-            s.refresh_threads()
+        let now = time.monotonic()
+        if s.find_running() && s.base != 0 {
+            s.sample_running(now - last)
         }
-        if s.base != 0 {
-            s.sample_threads()
-        }
+        last = now
         if WaitForSingleObject(process, 0) == wait_signalled {
             break
         }
         Sleep(u32(interval_ms))
-        tick += 1
     }
     timeEndPeriod(1)
     var total: u64 = 0
     QueryProcessCycleTime(process, mut total)
-    for _, t in s.threads {
-        CloseHandle(t.handle)
+    for _, handle in s.threads {
+        CloseHandle(handle)
     }
     CloseHandle(process)
     VirtualFree(memory, 0, release)
+    if s.query != null {
+        VirtualFree(s.query, 0, release)
+    }
+    s.to_cycles(i64(total))
     Recording { samples: s.samples, process_cycles: i64(total), threads: s.threads.len }
+}
+
+fn to_cycles(s: *Sampler, total: i64) {
+    var observed = 0
+    for sample in s.samples {
+        observed += sample.weight
+    }
+    if observed == 0 {
+        return
+    }
+    let scale = f64(total) / f64(observed)
+    for i in 0..s.samples.len {
+        s.samples[i].weight = i64(f64(s.samples[i].weight) * scale)
+    }
 }
 
 fn module_base(process: i64) -> i64 {
@@ -127,21 +137,61 @@ fn module_base(process: i64) -> i64 {
     module
 }
 
-fn refresh_threads(s: *Sampler) {
-    let snapshot = CreateToolhelp32Snapshot(snapshot_threads, 0)
-    if snapshot == invalid_handle {
-        return
-    }
-    var entry = ThreadEntry { size: thread_entry_size, usage: 0, thread: 0, owner: 0, base_priority: 0, delta_priority: 0, flags: 0 }
-    var more = Thread32First(snapshot, mut entry) != 0
-    for more {
-        if i64(entry.owner) == s.pid {
-            s.track(i64(entry.thread))
+fn query_processes(s: *Sampler) -> []u8 {
+    for {
+        if s.query == null {
+            let size = if s.query_size == 0 { first_query_size } else { s.query_size }
+            s.query = VirtualAlloc(null, size, commit_reserve, read_write)
+            if s.query == null {
+                return []
+            }
+            s.query_size = size
         }
-        entry.size = thread_entry_size
-        more = Thread32Next(snapshot, mut entry) != 0
+        var returned: u32 = 0
+        let status = NtQuerySystemInformation(process_information, s.query, u32(s.query_size), mut returned)
+        if status == 0 {
+            return view(s.query, i64(returned))
+        }
+        if status != length_mismatch {
+            return []
+        }
+        VirtualFree(s.query, 0, release)
+        s.query = null
+        s.query_size = (i64(returned) + first_query_size) * 2
     }
-    CloseHandle(snapshot)
+}
+
+fn find_running(s: *Sampler) -> bool {
+    s.running = []
+    let table = s.query_processes()
+    var at = 0
+    for at + process_entry_size <= table.len {
+        if io.le64(table, at + process_id_offset) == s.pid {
+            s.read_threads(table, at)
+            return true
+        }
+        let next = io.le32(table, at)
+        if next == 0 {
+            break
+        }
+        at += next
+    }
+    false
+}
+
+fn read_threads(s: *Sampler, table: []u8, entry: i64) {
+    let count = io.le32(table, entry + 4)
+    for i in 0..count {
+        let at = entry + process_entry_size + i * thread_entry_size
+        if at + thread_entry_size > table.len {
+            return
+        }
+        let id = io.le64(table, at + thread_id_offset)
+        s.track(id)
+        if io.le32(table, at + thread_state_offset) == thread_running {
+            s.running.push(id)
+        }
+    }
 }
 
 fn track(s: *Sampler, id: i64) {
@@ -149,35 +199,26 @@ fn track(s: *Sampler, id: i64) {
         return
     }
     let handle = OpenThread(thread_access, 0, u32(id))
-    if handle == 0 {
-        return
-    }
-    var cycles: u64 = 0
-    QueryThreadCycleTime(handle, mut cycles)
-    s.threads[id] = new(Tracked { handle, cycles: i64(cycles) })
-}
-
-fn sample_threads(s: *Sampler) {
-    for _, t in s.threads {
-        s.sample_thread(t)
+    if handle != 0 {
+        s.threads[id] = handle
     }
 }
 
-fn sample_thread(s: *Sampler, t: *Tracked) {
-    var now: u64 = 0
-    if QueryThreadCycleTime(t.handle, mut now) == 0 {
+fn sample_running(s: *Sampler, weight: i64) {
+    for id in s.running {
+        let handle = s.threads[id] ?? 0
+        if handle != 0 {
+            s.sample_thread(handle, weight)
+        }
+    }
+}
+
+fn sample_thread(s: *Sampler, handle: i64, weight: i64) {
+    if SuspendThread(handle) == suspend_failed {
         return
     }
-    let weight = i64(now) - t.cycles
-    if weight <= 0 {
-        return
-    }
-    t.cycles = i64(now)
-    if SuspendThread(t.handle) == suspend_failed {
-        return
-    }
-    let frames = s.capture(t.handle)
-    ResumeThread(t.handle)
+    let frames = s.capture(handle)
+    ResumeThread(handle)
     if frames.len > 0 {
         s.samples.push(Sample { weight, frames })
     }
