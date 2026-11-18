@@ -394,6 +394,7 @@ rt_region_chunk:
 	push rdi
 	call rt_region_commit
 	pop rax
+	mov [rax+CH_DIRTY], rax
 5:
 	mov byte ptr [rax+CH_CLASS], bl
 	mov byte ptr [rax+CH_KIND], r12b
@@ -421,12 +422,48 @@ rt_region_chunk:
 	mov [rbx+\chunk], rax
 	lea rcx, [rax+CH_SIZE]
 	mov [rbx+\bump], rcx
-	movzx ecx, byte ptr [rax+CH_CLASS]
-	mov edx, 65536
-	shl rdx, cl
-	add rdx, rax
-	mov [rbx+\limit], rdx
+	mov [rbx+\limit], rcx
 	.endm
+
+rt_region_advance:
+	mov r8, [rdi]
+	test r8, r8
+	jz 9f
+	movzx ecx, byte ptr [r8+CH_CLASS]
+	mov r9d, 65536
+	shl r9, cl
+	add r9, r8
+	mov rax, [rdi+8]
+	add rax, r12
+	cmp rax, r9
+	ja 9f
+	mov rdx, [rdi+16]
+	lea rsi, [rdx+REGION_ZERO_STEP]
+	cmp rsi, rax
+	cmovb rsi, rax
+	cmp rsi, r9
+	cmova rsi, r9
+	mov r10, [r8+CH_DIRTY]
+	mov rcx, r10
+	cmp rcx, rsi
+	cmova rcx, rsi
+	sub rcx, rdx
+	jbe 1f
+	mov r11, rdi
+	mov rdi, rdx
+	shr rcx, 3
+	xor eax, eax
+	rep stosq
+	mov rdi, r11
+1:
+	cmp rsi, r10
+	cmovae rsi, r9
+	mov [rdi+16], rsi
+	mov eax, 1
+	ret
+9:
+	xor eax, eax
+	ret
 
 rt_region_alloc:
 	mov rcx, [rax+G_REGION]
@@ -464,9 +501,17 @@ rt_region_take:
 	ja 5f
 	test r13, r13
 	jz 4f
+	lea rdi, [rbx+R_SCAN_CHUNK]
+	call rt_region_advance
+	test eax, eax
+	jnz 8f
 	REGION_REFILL R_SCAN_CHUNK, R_SCAN_BUMP, R_SCAN_END, 1
 	jmp 8f
 4:
+	lea rdi, [rbx+R_NOSCAN_CHUNK]
+	call rt_region_advance
+	test eax, eax
+	jnz 8f
 	REGION_REFILL R_NOSCAN_CHUNK, R_NOSCAN_BUMP, R_NOSCAN_END, 0
 8:
 	mov rcx, rbx
@@ -497,6 +542,17 @@ rt_region_take:
 	lea rdx, [rax+CH_SIZE]
 	lea rcx, [rdx+r12]
 	mov [rax+CH_USED], rcx
+	mov r8, [rax+CH_DIRTY]
+	cmp r8, rcx
+	cmova r8, rcx
+	sub r8, rdx
+	jbe 4f
+	mov rdi, rdx
+	mov rcx, r8
+	shr rcx, 3
+	xor eax, eax
+	rep stosq
+4:
 	mov rcx, r12
 	test r13, r13
 	jnz 9f
@@ -521,8 +577,12 @@ rt_region_enter:
 	mov [rbx+R_NOSCAN_CHUNK], rax
 	lea rcx, [rbx+R_SIZE]
 	mov [rbx+R_NOSCAN_BUMP], rcx
-	add rax, 65536
-	mov [rbx+R_NOSCAN_END], rax
+	mov [rbx+R_NOSCAN_END], rcx
+	xor ecx, ecx
+	mov [rax+CH_NEXT], rcx
+	mov [rbx+R_SCAN_CHUNK], rcx
+	mov [rbx+R_SCAN_BUMP], rcx
+	mov [rbx+R_SCAN_END], rcx
 	call rt_heap_acquire
 	mov rcx, [rip+rt_region_count]
 	mov rdx, [rip+rt_region_list]
@@ -638,6 +698,11 @@ rt_region_release:
 	push r12
 	push r13
 	mov rbx, rdi
+	mov rax, [rbx+CH_USED]
+	cmp rax, [rbx+CH_DIRTY]
+	jbe 6f
+	mov [rbx+CH_DIRTY], rax
+6:
 	movzx r12d, byte ptr [rbx+CH_CLASS]
 	mov edi, r12d
 	call rt_region_keep_head
@@ -660,20 +725,13 @@ rt_region_release:
 	inc r9
 	mov [rax+8], r9
 	mov [r13], rbx
+.if RT_REGION_GUARD
 	mov rdi, rbx
 	mov ecx, r12d
 	mov esi, 65536
 	shl rsi, cl
 	mov rdx, [rbx+CH_USED]
-.if RT_REGION_GUARD
 	call rt_region_stash
-.else
-	mov rcx, rdx
-	sub rcx, rdi
-	add rcx, 7
-	shr rcx, 3
-	xor eax, eax
-	rep stosq
 .endif
 	jmp 3f
 2:
@@ -681,13 +739,6 @@ rt_region_release:
 .else
 	cmp r12d, REGION_NEXT
 	ja 5f
-	mov rdi, rbx
-	mov rcx, [rbx+CH_USED]
-	sub rcx, rdi
-	add rcx, 7
-	shr rcx, 3
-	xor eax, eax
-	rep stosq
 	mov ecx, r12d
 	mov r13d, 65536
 	shl r13, cl
