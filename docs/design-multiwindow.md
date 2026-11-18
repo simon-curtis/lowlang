@@ -1,6 +1,6 @@
 # Several windows in one process
 
-Status: design. Pull request 1 of section 6 is implemented in `std/ui`, and pull request 2 in `std/ui/gpu`.
+Status: design. Pull request 1 of section 6 is implemented in `std/ui`, pull request 2 in `std/ui/gpu` and pull request 3 in `std/ui/platform`.
 
 ## Goal
 
@@ -145,25 +145,35 @@ All windows run on one UI green thread, which is locked to one OS thread. There 
 
 ```low
 /// The connection to the windowing system that a program's windows share.
-pub struct Display { state: *DisplayState  drop close_display(state) }
+pub struct Display { pub handle: DisplayHandle  drop close_display_on(handle) }
+
+/// A copyable view of a `Display`.
+pub struct DisplayHandle { state: *DisplayState }
 
 pub fn open_display() -> Display ! Error
 pub fn open_in(d: Display, o: Options) -> Window ! Error
+pub fn open_in_on(h: DisplayHandle, o: Options) -> Window ! Error
 /// Waits until a window of `d` has events, a waker fires or `timeout_ms` passes.
 pub fn wait(d: Display, timeout_ms: i64) ! Error
+pub fn wait_on(h: DisplayHandle, timeout_ms: i64) ! Error
 pub fn waker_of(d: Display) -> Waker
+pub fn waker_of_on(h: DisplayHandle) -> Waker
 ```
+
+Until pull request 5 gives Wayland a shared connection, `Display`, `DisplayHandle` and these functions are declared in `std/ui/platform/display_windows.low`, so they exist on Windows only and Linux keeps `platform.open` alone.
+
+A droppable value cannot be held by a closure, a slice or a pointer, and `Display` and `Window` are droppable. The platform therefore follows the pattern of `std/file` and `std/net`: the owner is droppable and has a public copyable `handle`, and each operation has an `_on` form that takes the handle. Pull request 6 keeps `DisplayHandle` in the shared state that `Shared.open` and its closure reach, and keeps the owning `Display` where `ui.run` binds it. Releasing the display marks its state closed, so `open_in_on` and `wait_on` on any copy of the handle fail with `Unsupported`, and a waker taken from it does nothing. The matching `WindowHandle` for windows arrives with pull request 4, and the platform views of both handles land in pull requests 3 and 4, the GPU views in pull request 6.
 
 The names avoid the private `connect` in `std/ui/platform/window_linux.low:123`, because a module has one function namespace. `platform.Options` gains `owner: Window?`, `min_width`, `min_height`, `placement` and `taskbar`. `platform.open(o)` stays: it opens a `Display`, opens one window in it, and gives the window ownership of that display, so `Window`'s drop closes both as it does today (`std/ui/platform/platform.low:262-265`).
 
-- **Win32.** `DisplayState` holds the `lock_thread` call, the class registration, `SetProcessDpiAwarenessContext`, `OleInitialize`, and a message-only window (`HWND_MESSAGE`) that wakers post `WM_APP` to. Today these happen per window (`std/ui/platform/window_windows.low:43`, `65-66`, `236-237`, `242`; `std/ui/platform/drop_windows.low:56-77`, `104-121`). The thread is unlocked once, when the display closes. `platform.open` makes one display per call, so `win32_pair` runs two displays on one thread. Low has no module-level variables to count them, so each display's close attempts `UnregisterClassW` and ignores the failure while another display's windows still use the class, as `close_window` does for each window today (`std/ui/platform/window_windows.low:236-237`).
+- **Win32.** `DisplayState` holds the `lock_thread` call, the class registrations, `SetProcessDpiAwarenessContext`, `OleInitialize`, the list of the display's windows, and a message-only window (`HWND_MESSAGE`) that wakers post `WM_APP` to. The message-only window has its own class, `LowDisplay`, and procedure, because `LowWindow`'s procedure reads a `*WindowState` from `GWLP_USERDATA`. `LowDisplay` is registered when the display opens, and `LowWindow` before each window's `CreateWindowExW`, so a display whose windows were all released, or that has none yet, never depends on another display's registration. The thread is unlocked once, when the display closes. `platform.open` makes one display per call, so `win32_pair` runs two displays on one thread, and a program can hold several displays. Low has no module-level variables to count them, so each display's close attempts `UnregisterClassW` for both classes and ignores the failure while a window of the class exists: `UnregisterClassW` fails only then, and an open display with no window does not count, which is why `LowWindow` is registered again at the next window and not once for the display.
 - **Wayland.** `DisplayState` holds the `wl_display`, registry, globals, seat, pointer, keyboard, xkb state, key repeat, data device, text input and cursor-shape device, and the single pump green thread (`std/ui/platform/window_linux.low:21-82`). A `Window` holds its `wl_surface`, `xdg_surface`, `xdg_toplevel`, size, scale, configure state and event queue.
 
 ### Message pump and wait
 
 `ui.run` makes one call to `platform.wait(display, timeout)`, then `platform.next(w, 0)` for each window.
 
-- **Win32.** `wait` runs `pump` once, which fills every window's queue. It returns if any queue is non-empty. Otherwise it waits in `MsgWaitForMultipleObjectsEx` (`std/ui/platform/window_windows.low:169-179`), which already wakes for input to any window on the thread. `next(w, 0)` then only takes `w`'s queue. The `pending_key` reset in `pump` (`:194`) moves into the display, because `WM_CHAR` pairs with the key press of whichever window received it.
+- **Win32.** `wait` runs `pump` once, which fills every window's queue. It returns if any queue is non-empty. Otherwise it waits in `MsgWaitForMultipleObjectsEx` (`std/ui/platform/window_windows.low:169-179`), which already wakes for input to any window on the thread. `next(w, 0)` then only takes `w`'s queue. `pending_key` stays on each window, because it indexes that window's queue and `WM_CHAR` pairs with the key press of the window that received it; the pump (`:194`) clears it for every window of the display.
 - **Wayland.** `wait` dispatches the shared connection, then selects on the pump's ready channel, the display waker and the timeout, the next key repeat or the idle limit, as `wait_input` does for one window (`std/ui/platform/window_linux.low:254-290`).
 - The loop computes the timeout as the minimum over windows of the next timer, the next reveal deadline, and zero when any window is due (`std/ui/ui.low:125-126`, `std/ui/clock.low:52-64`).
 
@@ -256,7 +266,7 @@ Decisions:
 
 ### Win32
 
-- **Class registration.** The `Display` registers `LowWindow` once (`std/ui/platform/window_windows.low:81-95`). A second `Display` in the same process gets `ERROR_CLASS_ALREADY_EXISTS`, which `register_class` already accepts. Unregistering follows the threading section: it is attempted at each display's close, and the attempt fails harmlessly while windows of the class remain.
+- **Class registration.** Each window registers `LowWindow` before `CreateWindowExW`, and the `Display` registers `LowDisplay` when it opens. A class that exists already gives `ERROR_CLASS_ALREADY_EXISTS`, which `register_class` accepts. Unregistering follows the threading section: it is attempted at each display's close, and the attempt fails harmlessly while windows of the class remain. Releasing one display therefore never leaves another display unable to open a window, whichever order the displays and `platform.open` windows are released in.
 - **Window procedure.** Each window keeps its `*WindowState` behind `GWLP_USERDATA`, set in `WM_NCCREATE` (`std/ui/platform/messages_windows.low:6-31`). Its click counter, capture, caret, IME, cursor, drop target and hit test are already per window (`std/ui/platform/window_windows.low:7-40`).
 - **Owner.** `CreateWindowExW` passes the owner's `hwnd` as `hWndParent` with `WS_OVERLAPPEDWINDOW`. Today it passes `null` (`std/ui/platform/window_windows.low:101`). That makes an owned top-level window, not a child, which stays above its owner and minimises with it.
 - **Taskbar.** An owned window has no taskbar button unless it has `WS_EX_APPWINDOW`. `taskbar: true` sets `WS_EX_APPWINDOW`. `taskbar: false` on an unowned window sets `WS_EX_TOOLWINDOW`, which also gives a smaller caption and keeps the window out of Alt+Tab. The option's documentation says so.
@@ -315,8 +325,9 @@ Each pull request builds, passes `low test std/ui`, `low test std/ui/platform`, 
    - `wayland_twopresent` runs the same presents where a compositor runs, and checks that they succeed, since a Wayland window's pixels cannot be read back.
 3. **Add the Win32 `Display` and `wait`** (`std/ui/platform`, Windows). The lock, class, DPI awareness, OLE and the message-only waker move into it. `platform.open` wraps it. `WM_NCDESTROY` clears `hwnd`. Tests:
    - `win32_pair` passes unchanged;
-   - a new `win32_wait` fixture: a message posted to the second window ends `wait` on the display, and a wake still arrives after the window that created the waker has closed;
-   - `win32_classonce`: two windows close in either order, and the class stays registered until the display closes.
+   - a new `win32_wait` fixture: a message posted to the second window ends `wait` on the display, one wait takes all the wakes that arrived, a wake from another green thread ends a blocked `wait`, a wake still ends `wait` after a window has closed and with none open, `wait` runs to its timeout less one clock tick, and key events for two windows of a display keep their text apart, while a `WM_CHAR` that arrives in a later pump than its key press is dropped;
+   - `win32_classonce`: two windows close in either order, the window class stays registered while the display lives, two displays open at once can each open windows after the other is released, and a `platform.open` window released while a display is held leaves the display able to open windows;
+   - `win32_handles`: a `DisplayHandle` held by a closure opens a window and ends a `wait_on` through `waker_of_on`, and after the display is released `open_in_on` and `wait_on` fail with `Unsupported` and a wake does nothing.
 4. **Add the Win32 window options**: owner, taskbar, min size, placement and `set_title`. Tests in a `win32_owned` fixture:
    - `GetWindow(GW_OWNER)` returns the owner;
    - `WS_EX_APPWINDOW` is set for `taskbar: true`;
