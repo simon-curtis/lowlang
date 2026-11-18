@@ -1,0 +1,395 @@
+import parallel
+import std/builder
+
+const columns = 100
+const serial_job = -1
+const megabyte = 1048576
+
+pub struct Span {
+    pub lane: i64
+    pub stage: i64
+    pub start: i64
+    pub end: i64
+    pub job: i64
+}
+
+struct Totals {
+    wall: i64 = 0
+    serial: i64 = 0
+    fanouts: i64 = 0
+    jobs: i64 = 0
+    work: i64 = 0
+    longest: i64 = 0
+    capacity: i64 = 0
+    busy: i64 = 0
+    cpu: i64 = 0
+    kernel: i64 = 0
+    peak: i64 = 0
+}
+
+pub fn stage_end(t: *parallel.Trace, k: i64) -> i64 {
+    if k + 1 < t.stages.len {
+        return t.stages[k + 1].start
+    }
+    t.end
+}
+
+pub fn spans(t: *parallel.Trace) -> []Span {
+    var out: []Span = []
+    for k in 0..t.stages.len {
+        var cursor = t.stages[k].start
+        for f in t.fanouts {
+            if f.stage != k {
+                continue
+            }
+            if f.start > cursor {
+                out.push(Span { lane: 0, stage: k, start: cursor, end: f.start, job: serial_job })
+            }
+            cursor = f.end
+        }
+        let end = stage_end(t, k)
+        if end > cursor {
+            out.push(Span { lane: 0, stage: k, start: cursor, end, job: serial_job })
+        }
+    }
+    for f in t.fanouts {
+        for i, j in f.jobs {
+            out.push(Span { lane: j.lane, stage: f.stage, start: j.start, end: j.end, job: i })
+        }
+    }
+    out
+}
+
+pub fn lanes(all: []Span) -> i64 {
+    var n = 1
+    for s in all {
+        if s.lane + 1 > n {
+            n = s.lane + 1
+        }
+    }
+    n
+}
+
+fn totals(t: *parallel.Trace, all: []Span) -> []Totals {
+    var per: []Totals = []
+    for k in 0..t.stages.len {
+        let start = t.stages[k].start
+        let end = stage_end(t, k)
+        let before = usage_at(t, start)
+        let after = usage_at(t, end)
+        per.push(Totals { wall: end - start, cpu: after.cpu - before.cpu, kernel: after.kernel - before.kernel, peak: peak_between(t, start, end) })
+    }
+    for s in all {
+        let length = s.end - s.start
+        per[s.stage].work += length
+        if s.job == serial_job {
+            per[s.stage].serial += length
+            continue
+        }
+        per[s.stage].jobs += 1
+        per[s.stage].busy += length
+        if length > per[s.stage].longest {
+            per[s.stage].longest = length
+        }
+    }
+    for f in t.fanouts {
+        per[f.stage].fanouts += 1
+        per[f.stage].capacity += (f.end - f.start) * f.lanes
+    }
+    per
+}
+
+fn sum(per: []Totals) -> Totals {
+    var all = Totals {}
+    for p in per {
+        all.wall += p.wall
+        all.serial += p.serial
+        all.fanouts += p.fanouts
+        all.jobs += p.jobs
+        all.work += p.work
+        all.capacity += p.capacity
+        all.busy += p.busy
+        all.cpu += p.cpu
+        all.kernel += p.kernel
+        if p.longest > all.longest {
+            all.longest = p.longest
+        }
+        if p.peak > all.peak {
+            all.peak = p.peak
+        }
+    }
+    all
+}
+
+fn ms(ns: i64) -> f64 {
+    f64(ns) / 1000000.0
+}
+
+fn ratio(a: i64, b: i64) -> f64 {
+    if b == 0 {
+        return 0.0
+    }
+    f64(a) / f64(b)
+}
+
+fn letter(k: i64) -> str {
+    let letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if k < 0 || k >= letters.len {
+        return "?"
+    }
+    letters[k..k + 1]
+}
+
+pub fn summary(t: *parallel.Trace) -> str {
+    let all = spans(t)
+    let per = totals(t, all)
+    var b = builder.builder()
+    b.write("   stage            wall ms  serial ms  fan-outs    jobs  longest ms   lanes   cores  kernel %  fan-out %  peak MB\n")
+    for k, p in per {
+        if p.wall == 0 && p.fanouts == 0 {
+            continue
+        }
+        b.write(row(letter(k), t.stages[k].name, p))
+    }
+    b.write(row(" ", "total", sum(per)))
+    b.write("\n")
+    write_matrix(mut b, t, all)
+    b.to_str()
+}
+
+fn row(key: str, name: str, p: Totals) -> str {
+    let lanes = ratio(p.work, p.wall)
+    let cores = ratio(p.cpu, p.wall)
+    let kernel = 100.0 * ratio(p.kernel, p.cpu)
+    let fanout = 100.0 * ratio(p.busy, p.capacity)
+    let peak = p.peak / megabyte
+    "{key,2} {name,-14} {ms(p.wall),9:f1} {ms(p.serial),10:f1} {p.fanouts,9} {p.jobs,7} {ms(p.longest),11:f1} {lanes,7:f2} {cores,7:f2} {kernel,9:f1} {fanout,10:f1} {peak,8}\n"
+}
+
+fn usage_at(t: *parallel.Trace, at: i64) -> parallel.Usage {
+    let samples = t.samples
+    if samples.len == 0 {
+        return parallel.Usage {}
+    }
+    if at <= samples[0].at {
+        return samples[0].usage
+    }
+    for i in 1..samples.len {
+        let later = samples[i]
+        if at <= later.at {
+            return between(samples[i - 1], later, at)
+        }
+    }
+    samples[samples.len - 1].usage
+}
+
+fn between(earlier: parallel.Sample, later: parallel.Sample, at: i64) -> parallel.Usage {
+    let span = later.at - earlier.at
+    if span <= 0 {
+        return later.usage
+    }
+    let share = f64(at - earlier.at) / f64(span)
+    let cpu = earlier.usage.cpu + i64(share * f64(later.usage.cpu - earlier.usage.cpu))
+    let kernel = earlier.usage.kernel + i64(share * f64(later.usage.kernel - earlier.usage.kernel))
+    parallel.Usage { cpu, kernel, private: earlier.usage.private, resident: earlier.usage.resident }
+}
+
+fn peak_between(t: *parallel.Trace, start: i64, end: i64) -> i64 {
+    var peak = usage_at(t, start).private
+    for s in t.samples {
+        if s.at > start && s.at <= end && s.usage.private > peak {
+            peak = s.usage.private
+        }
+    }
+    peak
+}
+
+fn write_matrix(mut b: builder.Builder, t: *parallel.Trace, all: []Span) {
+    var total = t.end - t.start
+    if total <= 0 {
+        total = 1
+    }
+    let count = lanes(all)
+    var busy: [][]i64 = []
+    for _ in 0..count {
+        var cells: []i64 = []
+        for _ in 0..columns {
+            cells.push(0)
+        }
+        busy.push(cells)
+    }
+    for s in all {
+        add_busy(busy[s.lane], s.start - t.start, s.end - t.start, total)
+    }
+    b.write("stage |")
+    for c in 0..columns {
+        let middle = t.start + (2 * c + 1) * total / (2 * columns)
+        b.write(letter(stage_at(t, middle)))
+    }
+    b.write("|\n")
+    for lane in 0..count {
+        if lane == 0 {
+            b.write("main  |")
+        } else {
+            b.write("{lane,5} |")
+        }
+        for c in 0..columns {
+            let width = bucket_start(c + 1, total) - bucket_start(c, total)
+            b.write(shade(busy[lane][c], width))
+        }
+        b.write("|\n")
+    }
+    write_usage_rows(mut b, t, total)
+    let end = "{ms(total):f1} ms"
+    b.write("      0 ms")
+    b.write_repeat(" ", columns + 2 - 4 - end.len)
+    b.write("{end}\n")
+}
+
+fn write_usage_rows(mut b: builder.Builder, t: *parallel.Trace, total: i64) {
+    let overall = peak_between(t, t.start, t.end)
+    b.write("cpu   |")
+    for c in 0..columns {
+        let from = t.start + bucket_start(c, total)
+        let to = t.start + bucket_start(c + 1, total)
+        let used = usage_at(t, to).cpu - usage_at(t, from).cpu
+        b.write(shade(used, (to - from) * t.cpus))
+    }
+    b.write("|\n")
+    b.write("memory|")
+    for c in 0..columns {
+        let from = t.start + bucket_start(c, total)
+        let to = t.start + bucket_start(c + 1, total)
+        b.write(shade(peak_between(t, from, to), overall))
+    }
+    b.write("|\n")
+}
+
+fn stage_at(t: *parallel.Trace, at: i64) -> i64 {
+    var found = 0
+    for k, s in t.stages {
+        if s.start <= at {
+            found = k
+        }
+    }
+    found
+}
+
+fn bucket_start(c: i64, total: i64) -> i64 {
+    c * total / columns
+}
+
+fn add_busy(cells: []i64, start: i64, end: i64, total: i64) {
+    if end <= start {
+        return
+    }
+    var first = start * columns / total
+    var last = (end - 1) * columns / total
+    if first < 0 {
+        first = 0
+    }
+    if last >= columns {
+        last = columns - 1
+    }
+    for c in first..last + 1 {
+        var lo = bucket_start(c, total)
+        var hi = bucket_start(c + 1, total)
+        if start > lo {
+            lo = start
+        }
+        if end < hi {
+            hi = end
+        }
+        if hi > lo {
+            cells[c] += hi - lo
+        }
+    }
+}
+
+fn shade(busy: i64, width: i64) -> str {
+    if busy <= 0 || width <= 0 {
+        return " "
+    }
+    let fraction = ratio(busy, width)
+    if fraction <= 0.25 {
+        return "░"
+    }
+    if fraction <= 0.5 {
+        return "▒"
+    }
+    if fraction <= 0.75 {
+        return "▓"
+    }
+    "█"
+}
+
+pub fn chrome(t: *parallel.Trace) -> str {
+    let all = spans(t)
+    let count = lanes(all)
+    var events: []str = []
+    events.push(meta(0, "process_name", "low"))
+    events.push(meta(0, "thread_name", "stages"))
+    events.push(meta(1, "thread_name", "main"))
+    for lane in 1..count {
+        events.push(meta(lane + 1, "thread_name", "lane {lane}"))
+    }
+    for tid in 0..count + 1 {
+        events.push("{{\"ph\":\"M\",\"pid\":1,\"tid\":{tid},\"name\":\"thread_sort_index\",\"args\":{{\"sort_index\":{tid}}}}}")
+    }
+    for k, s in t.stages {
+        let end = stage_end(t, k)
+        if end > s.start {
+            events.push(complete(t, 0, s.name, "stage", s.start, end, ""))
+        }
+    }
+    for f in t.fanouts {
+        let name = t.stages[f.stage].name
+        events.push(complete(t, 1, "{name} fan-out", "fanout", f.start, f.end, "\"jobs\":{f.jobs.len},\"lanes\":{f.lanes}"))
+    }
+    for s in all {
+        let name = t.stages[s.stage].name
+        if s.job == serial_job {
+            events.push(complete(t, 1, name, "serial", s.start, s.end, ""))
+        } else {
+            events.push(complete(t, s.lane + 1, name, "job", s.start, s.end, "\"job\":{s.job}"))
+        }
+    }
+    for i in 1..t.samples.len {
+        events.push(cpu_counter(t, t.samples[i - 1], t.samples[i]))
+        events.push(memory_counter(t, t.samples[i]))
+    }
+    var b = builder.builder()
+    b.write("{{\"displayTimeUnit\":\"ms\",\"otherData\":{{\"cpus\":{t.cpus}}},\"traceEvents\":[\n")
+    b.write_join(events, ",\n")
+    b.write("\n]}}\n")
+    b.to_str()
+}
+
+fn meta(tid: i64, kind: str, name: str) -> str {
+    "{{\"ph\":\"M\",\"pid\":1,\"tid\":{tid},\"name\":\"{kind}\",\"args\":{{\"name\":\"{name}\"}}}}"
+}
+
+fn complete(t: *parallel.Trace, tid: i64, name: str, category: str, start: i64, end: i64, args: str) -> str {
+    let ts = micros(start - t.start)
+    let dur = micros(end - start)
+    "{{\"ph\":\"X\",\"pid\":1,\"tid\":{tid},\"name\":\"{name}\",\"cat\":\"{category}\",\"ts\":{ts},\"dur\":{dur},\"args\":{{{args}}}}}"
+}
+
+fn cpu_counter(t: *parallel.Trace, earlier: parallel.Sample, later: parallel.Sample) -> str {
+    let span = later.at - earlier.at
+    let ts = micros(earlier.at - t.start)
+    let user = ratio(later.usage.cpu - earlier.usage.cpu - (later.usage.kernel - earlier.usage.kernel), span)
+    let kernel = ratio(later.usage.kernel - earlier.usage.kernel, span)
+    "{{\"ph\":\"C\",\"pid\":1,\"name\":\"cores\",\"ts\":{ts},\"args\":{{\"user\":{user:f2},\"kernel\":{kernel:f2}}}}}"
+}
+
+fn memory_counter(t: *parallel.Trace, s: parallel.Sample) -> str {
+    let ts = micros(s.at - t.start)
+    let private = s.usage.private / megabyte
+    let resident = s.usage.resident / megabyte
+    "{{\"ph\":\"C\",\"pid\":1,\"name\":\"memory MB\",\"ts\":{ts},\"args\":{{\"private\":{private},\"resident\":{resident}}}}}"
+}
+
+fn micros(ns: i64) -> str {
+    "{ns / 1000}.{ns % 1000:000}"
+}

@@ -4,7 +4,9 @@ import ir
 import lint
 import lsp
 import native
+import parallel
 import target
+import timeline
 import wasm
 import std/builder
 import std/file
@@ -29,19 +31,25 @@ struct Options {
     platform: target.OS
     optimise: bool = true
     gui: bool = false
+    trace: str = ""
+}
+
+struct Tracing {
+    jobs: ir.Runner
+    finish: fn() ! Error
 }
 
 fn usage() -> str {
     let choices = target.choices()
     var b = builder.builder()
     b.write("usage:\n")
-    b.write("  low build [-o output] [-target {choices}] [-subsystem console|gui] [-c release|debug] [file.low|dir]\n")
-    b.write("  low run [-target {target.string(target.host())}|{target.string(target.OS.Browser)}] [-c release|debug] <file.low|dir> [args...]\n")
+    b.write("  low build [-o output] [-target {choices}] [-subsystem console|gui] [-c release|debug] [-trace file.json] [file.low|dir]\n")
+    b.write("  low run [-target {target.string(target.host())}|{target.string(target.OS.Browser)}] [-c release|debug] [-trace file.json] <file.low|dir> [args...]\n")
     b.write("  low test [dir|dir/...|std/module|std/...|file_test.low:line]... [-run text] [-skip text] [-list] [-v] [-notime] [-count n] [-shuffle seed] [-failfast] [-json] [-timeout ms] [-jobs n] [-update]\n")
     b.write("  low install [-c release|debug] [file.low|dir]...\n")
     b.write("  low update [dir]\n")
-    b.write("  low asm <file.low> [-target {choices}]\n")
-    b.write("  low ir <file.low> [-target {choices}]\n")
+    b.write("  low asm <file.low> [-target {choices}] [-trace file.json]\n")
+    b.write("  low ir <file.low> [-target {choices}] [-trace file.json]\n")
     b.write("  low lint <file.low> [-target {choices}]\n")
     b.write("  low doc <dir|std> [-target {choices}]\n")
     b.write("  low names <file.low> [-target {choices}]\n")
@@ -118,13 +126,13 @@ fn run(args: []str) ! Error {
         if targets.paths.len > 1 {
             fail Failed("low build takes one program; low install takes several")
         }
-        let opts = parse_options(targets.options, true)?
+        let opts = parse_options(targets.options, true, true)?
         build_command(targets.paths[0], opts)?
         return
     }
     if args.len >= 1 && args[0] == "run" {
         let split = split_arguments(args[1..]) ?? fail Usage
-        let opts = parse_options(split.options, false)?
+        let opts = parse_options(split.options, false, true)?
         build_and_run(split.source, opts, split.program)?
         return
     }
@@ -134,12 +142,12 @@ fn run(args: []str) ! Error {
     let cmd = args[0]
     let source = args[1]
     if cmd == "asm" || cmd == "ir" {
-        let opts = parse_options(args[2..], false)?
+        let opts = parse_options(args[2..], false, true)?
         compile_command(cmd, source, opts)?
         return
     }
     if cmd == "lint" || cmd == "doc" || cmd == "names" {
-        let opts = parse_options(args[2..], false)?
+        let opts = parse_options(args[2..], false, false)?
         if cmd == "lint" {
             lint_command(source, opts.platform)?
             return
@@ -178,7 +186,7 @@ fn split_arguments(args: []str) -> RunArguments? {
     RunArguments { options: args[..i], source: args[i], program: args[i + 1..] }
 }
 
-fn parse_options(args: []str, build: bool) -> Options ! Error {
+fn parse_options(args: []str, build: bool, compiles: bool) -> Options ! Error {
     var opts = Options { platform: target.host() }
     var subsystem = ""
     var rest = args
@@ -194,6 +202,8 @@ fn parse_options(args: []str, build: bool) -> Options ! Error {
             opts.platform = target.parse(rest[1]) catch Target
         } else if rest[0] == "-c" {
             opts.optimise = configuration(rest[1])?
+        } else if rest[0] == "-trace" && compiles {
+            opts.trace = rest[1]
         } else {
             fail Usage
         }
@@ -241,18 +251,48 @@ fn configuration(name: str) -> bool ! Error {
     }
 }
 
-fn analyse(source: str, opts: Options) -> *compiler.Unit ! Error {
+fn tracing(path: str) -> Tracing {
+    if path == "" {
+        return Tracing { jobs: native.runner(), finish: untraced }
+    }
+    let trace = parallel.new_trace()
+    let finish = fn() ! Error {
+        write_trace(trace, path)?
+    }
+    Tracing { jobs: native.traced(trace), finish }
+}
+
+fn untraced() ! Error {}
+
+fn write_trace(trace: *parallel.Trace, path: str) ! Error {
+    parallel.finish(trace)
+    let json = timeline.chrome(trace)
+    file.write_file(path, bytes(json)) catch {
+        e => fail Failed("write {path}: {e}")
+    }
+    let summary = timeline.summary(trace)
+    write_all(2, bytes(summary))
+}
+
+fn analyse(source: str, opts: Options, jobs: ir.Runner) -> *compiler.Unit ! Error {
     let profile = compiler.Profile { platform: opts.platform, optimise: opts.optimise, gui: opts.gui }
-    let unit = native.analyse_flat(source, profile) catch Compile
+    let unit = native.analyse_flat(source, profile, jobs) catch Compile
     report(unit)
     unit
 }
 
 fn compile_command(cmd: str, source: str, opts: Options) ! Error {
-    let unit = analyse(source, opts)?
+    let traced = tracing(opts.trace)
+    inspect_command(cmd, source, opts, traced.jobs)?
+    let finish = traced.finish
+    finish()?
+}
+
+fn inspect_command(cmd: str, source: str, opts: Options, jobs: ir.Runner) ! Error {
+    let unit = analyse(source, opts, jobs)?
     if cmd == "ir" {
         let program = unit.program ?? panic("unit without a program")
-        ir.materialise(program, native.runner())
+        ir.materialise(program, jobs)
         var out = builder.builder()
         for f in program.funcs {
             ir.write_func(mut out, f)
@@ -278,7 +318,11 @@ fn build_command(source: str, opts: Options) ! Error {
         let name = program_name(source, opts.platform)?
         output = file.child_path(output, name)
     }
-    build_programs([Build { program: source, output }], opts)?
+    let traced = tracing(opts.trace)
+    let builds = [Build { program: source, output }]
+    build_programs(builds, opts, traced.jobs)?
+    let finish = traced.finish
+    finish()?
 }
 
 fn default_output(source: str, platform: target.OS) -> str {
@@ -313,7 +357,11 @@ fn remove_directory(dir: str) {
 
 fn run_built(dir: str, source: str, opts: Options, program_args: []str) -> i64 ! Error {
     let binary = path.join([dir, target.executable(opts.platform, "main")])
-    build_programs([Build { program: source, output: binary }], opts)?
+    let traced = tracing(opts.trace)
+    let builds = [Build { program: source, output: binary }]
+    build_programs(builds, opts, traced.jobs)?
+    let finish = traced.finish
+    finish()?
     let command = runner(dir, binary, opts.platform, program_args)?
     using child = process.start(command) catch {
         e => fail Failed("start {command.program}: {e}")
