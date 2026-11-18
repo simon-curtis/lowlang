@@ -36,6 +36,11 @@ struct WindowState {
     files: bool = false
     cloaked: bool = false
     withheld: bool = false
+    ex_style: u32 = 0
+    min_width: i64 = 0
+    min_height: i64 = 0
+    show_command: i32 = sw_show
+    released: bool = false
 }
 
 fn open_window(o: Options) -> *WindowState ! Error {
@@ -51,6 +56,8 @@ fn open_window(o: Options) -> *WindowState ! Error {
 }
 
 fn open_window_in(d: *DisplayState, o: Options) -> *WindowState ! Error {
+    let owner = owner_handle(d, o)?
+    let reference = reference_window(d, o.placement, owner)
     let s = new(WindowState {
         instance: d.instance
         display: d
@@ -58,9 +65,13 @@ fn open_window_in(d: *DisplayState, o: Options) -> *WindowState ! Error {
         bare: o.titlebar.appears_transparent
         win11: windows_build() >= win11_build
         hit_test: no_control
+        ex_style: ex_style_of(o, owner != null)
+        min_width: o.min_width
+        min_height: o.min_height
+        show_command: show_command_of(o)
     })
     d.windows.push(s)
-    build_window(s, o) catch {
+    build_window(s, o, owner, reference) catch {
         e => {
             close_window(s)
             fail e
@@ -69,12 +80,12 @@ fn open_window_in(d: *DisplayState, o: Options) -> *WindowState ! Error {
     s
 }
 
-fn build_window(s: *WindowState, o: Options) ! Error {
+fn build_window(s: *WindowState, o: Options, owner: ptr, reference: ptr) ! Error {
     let slot: *WindowState[] = [s]
     s.anchor = pin(slot)
-    create_window(s, o)?
+    create_window(s, o, owner, reference)?
     register_drops(s)
-    fit_window(s, o)?
+    fit_window(s, o, reference)?
     s.events.truncate(0)
     s.width = 0.0
     s.height = 0.0
@@ -84,12 +95,24 @@ fn build_window(s: *WindowState, o: Options) ! Error {
     pending_fault(s)?
 }
 
-fn create_window(s: *WindowState, o: Options) ! Error {
+fn create_window(s: *WindowState, o: Options, owner: ptr, reference: ptr) ! Error {
     let name = class_name()
     register_class(s.instance, name, window_proc)?
     let title = wide(o.title)
-    let use = cw_usedefault
-    let hwnd = CreateWindowExW(0, __slice_ptr(name), __slice_ptr(title), ws_overlappedwindow, use, use, use, use, null, null, s.instance, s.anchor)
+    var x = cw_usedefault
+    var y = cw_usedefault
+    var width = cw_usedefault
+    var height = cw_usedefault
+    match planned_rect(s, o, reference) {
+        some(r) => {
+            x = r.left
+            y = r.top
+            width = r.right - r.left
+            height = r.bottom - r.top
+        }
+        none => {}
+    }
+    let hwnd = CreateWindowExW(s.ex_style, __slice_ptr(name), __slice_ptr(title), ws_overlappedwindow, x, y, width, height, owner, null, s.instance, s.anchor)
     if hwnd == null {
         fail creation_error("CreateWindowExW", GetLastError())
     }
@@ -98,28 +121,49 @@ fn create_window(s: *WindowState, o: Options) ! Error {
     ImmAssociateContextEx(hwnd, null, 0)
 }
 
-fn fit_window(s: *WindowState, o: Options) ! Error {
+fn fit_window(s: *WindowState, o: Options, reference: ptr) ! Error {
     let dpi = GetDpiForWindow(s.hwnd)
     if dpi == 0 {
         fail call_failed("GetDpiForWindow")
     }
     s.scale = scale_of(i64(dpi))
-    var outer = Rect { right: i32(floor(f32(o.width) * s.scale + 0.5)), bottom: i32(floor(f32(o.height) * s.scale + 0.5)) }
-    var flags = swp_nomove | swp_nozorder | swp_noactivate
+    let content = content_size(o)
+    let outer = outer_rect(s, i64(content.x), i64(content.y), dpi)?
+    let width = outer.right - outer.left
+    let height = outer.bottom - outer.top
+    var flags = swp_nozorder | swp_noactivate
     if s.bare {
-        let insets = frame_insets(s, s.hwnd, false)
-        outer.right = outer.right + insets.left + insets.right
-        outer.bottom = outer.bottom + insets.top + insets.bottom
         flags = flags | swp_framechanged
-    } else {
-        if AdjustWindowRectExForDpi(mut outer, ws_overlappedwindow, 0, 0, dpi) == 0 {
-            fail call_failed("AdjustWindowRectExForDpi")
+    }
+    var left: i32 = 0
+    var top: i32 = 0
+    match centred_at(o.placement, reference, i64(width), i64(height)) {
+        some(at) => {
+            left = at.x
+            top = at.y
+        }
+        none => {
+            flags = flags | swp_nomove
         }
     }
-    if SetWindowPos(s.hwnd, null, 0, 0, outer.right - outer.left, outer.bottom - outer.top, flags) == 0 {
+    if SetWindowPos(s.hwnd, null, left, top, width, height, flags) == 0 {
         fail call_failed("SetWindowPos")
     }
 }
+
+fn outer_rect(s: *WindowState, width: i64, height: i64, dpi: u32) -> Rect ! Error {
+    let scale = scale_of(i64(dpi))
+    var outer = Rect { right: i32(floor(f32(width) * scale + 0.5)), bottom: i32(floor(f32(height) * scale + 0.5)) }
+    if s.bare {
+        let insets = frame_insets_at(s.win11, dpi, false)
+        outer.right = outer.right + insets.left + insets.right
+        outer.bottom = outer.bottom + insets.top + insets.bottom
+    } else if AdjustWindowRectExForDpi(mut outer, ws_overlappedwindow, 0, s.ex_style, dpi) == 0 {
+        fail call_failed("AdjustWindowRectExForDpi")
+    }
+    outer
+}
+
 
 fn scale_of(dpi: i64) -> f32 {
     if dpi <= 0 {
@@ -132,6 +176,9 @@ fn next_events(s: *WindowState, timeout_ms: i64) -> Event[] ! Error {
     let started = GetTickCount64()
     pump_for(s)?
     for s.events.len == 0 {
+        if s.hwnd == null {
+            fail Unsupported("the window has closed")
+        }
         let remaining = remaining_ms(started, timeout_ms)
         if remaining == 0 {
             break
@@ -222,7 +269,22 @@ fn window_native(s: *WindowState) -> Native {
     Native { display: s.instance, window: s.hwnd }
 }
 
+fn window_closed(s: *WindowState) -> bool {
+    s.released
+}
+
+fn window_destroyed(s: *WindowState) {
+    revoke_drops(s)
+    if !s.released {
+        s.events.push(CloseRequested)
+    }
+}
+
 fn close_window(s: *WindowState) {
+    if s.released {
+        return
+    }
+    s.released = true
     s.waker.hwnd = null
     revoke_drops(s)
     var destroyed = true
