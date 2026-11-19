@@ -2406,7 +2406,7 @@ Optimiser:
   - A caller inlines up to four rounds. Each round takes its sites inside the deepest loops first, then the smaller callees, then the earlier values; splits the call's block; clones the callee's blocks with parameters bound to the arguments; forwards a single return's values or joins several returns in phis; and simplifies the caller. Calls that an inlined body or a devirtualised call exposes are inlined in the next round.
   - Loop back edges keep their marks, and checks and divisions keep their panics.
   - Dev builds do not inline, specialise or hoist literals, so hot reload patches see every function and every literal's data.
-  - A `compiler.Profile` chooses the target, whether the IR is optimised and whether code generation is hot-reloadable. `release(target)` optimises and generates plain code. `dev` skips the optimiser, generates `fn_table` code and is Linux-only.
+  - A `compiler.Profile` chooses the target, whether the IR is optimised and whether code generation is hot-reloadable. `release(target)` optimises and generates plain code. `dev` skips the optimiser and generates `fn_table` code.
 - Literal hoisting:
   - A release build hoists a non-empty slice or map literal whose elements are all constants: integer, float, `bool` and `str` literals, negated numbers, `none`, enum variants without payload and non-C struct literals of constants.
   - The checker marks a literal read-only when it is the operand of an index, a `for` or `.len`, or is bound by a `let` whose every use is such an operand. An assignment, a `mut` argument or any other use anywhere in the target path of an element or field makes the binding non-read-only.
@@ -2992,7 +2992,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - a program with more functions than the smallest `fn_table`;
   - instances of an edited generic function patched;
   - restarts on layout, signature and capture changes.
-- `compiler/lowfuzz` generates well-typed, terminating programs from a choice stream (`compiler/fuzz/gen`), predicts their output with a reference interpreter (`compiler/fuzz/model`), builds each for the host with the release profile and with the dev profile, the same optimisation and hot-reload code generation as `low build` and `low dev`, or on Windows, where `dev` is unavailable, with the unoptimised profile of `-c debug`, runs both, and reports any of these (`compiler/fuzz/oracle`):
+- `compiler/lowfuzz` generates well-typed, terminating programs from a choice stream (`compiler/fuzz/gen`), predicts their output with a reference interpreter (`compiler/fuzz/model`), builds each for the host with the release profile and with the dev profile, the same optimisation and hot-reload code generation as `low build` and `low dev`, runs both, and reports any of these (`compiler/fuzz/oracle`):
   - compiler panic;
   - rejected program;
   - link failure;
