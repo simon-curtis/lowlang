@@ -1,3 +1,4 @@
+import std/builder
 import std/ui/geometry
 import std/ui/layout
 import std/ui/platform
@@ -11,6 +12,11 @@ const kind_other = 0
 const kind_typing = 1
 const kind_backspace = 2
 const kind_delete = 3
+const tab_code: u32 = 9
+const space_code: u32 = 32
+const no_break_space: u32 = 160
+const line_separator: u32 = 8232
+const paragraph_separator: u32 = 8233
 
 /// A place in a document: a line and a byte offset into that line, both counted from zero.
 pub struct TextPosition {
@@ -98,6 +104,7 @@ struct AreaState {
     line_height: f32 = 0.0
     page: i64 = 1
     style: uitext.Style = uitext.Style {}
+    tab_size: i64 = 1
 }
 
 struct AreaPiece {
@@ -106,12 +113,27 @@ struct AreaPiece {
     layout: uitext.Layout
     x: f32
     color: geometry.Color?
+    cell: i64
 }
 
 struct AreaShaped {
     text: str
     pieces: AreaPiece[]
     width: f32
+    tab: i64
+    cells: i64
+}
+
+struct BlankMarks {
+    color: geometry.Color
+    caret_line: geometry.Color
+}
+
+struct AreaMarks {
+    dot: uitext.Layout
+    arrow: uitext.Layout
+    color: geometry.Color
+    caret_line: geometry.Color
 }
 
 struct AreaRow {
@@ -139,7 +161,7 @@ pub fn line_source(line_count: fn() -> i64, line_text: fn(i64) -> str, edit: fn(
 
 /// Returns a multi-line text editor over `source`, 300 by 200 logical pixels, that takes focus when clicked and shows the text cursor.
 ///
-/// The element is a leaf in the key context `TextArea`. It draws only the lines in view, at a fixed line height, and asks `source` for no others, so a document of a million lines costs the same as one of fifty. The caret, the selection, the preferred column of vertical moves, the scroll position and the undo history are kept per key, so give the element an `id` to keep them where the tree moves it. The editing keys are actions: the bindings in `text_area_bindings` dispatch the actions named there to the focused area, whose built-in handlers run after the `capture_action` handlers of the elements around it and after the area's own `on_action` handlers, and stop the action, so an element around the area intercepts an editing action with `capture_action`. Typed text and an input method's text are inserted at the caret. The area does not change the document itself: it calls `source.edit`, and the application's document is what the next frame reads. With `read_only` it shows the document and keeps selection, copy, caret movement and scrolling, but never calls `source.edit` and opens no input method composition.
+/// The element is a leaf in the key context `TextArea`. It draws only the lines in view, at a fixed line height, and asks `source` for no others, so a document of a million lines costs the same as one of fifty. The caret, the selection, the preferred column of vertical moves, the scroll position and the undo history are kept per key, so give the element an `id` to keep them where the tree moves it. The editing keys are actions: the bindings in `text_area_bindings` dispatch the actions named there to the focused area, whose built-in handlers run after the `capture_action` handlers of the elements around it and after the area's own `on_action` handlers, and stop the action, so an element around the area intercepts an editing action with `capture_action`. Typed text and an input method's text are inserted at the caret. The area does not change the document itself: it calls `source.edit`, and the application's document is what the next frame reads. With `read_only` it shows the document and keeps selection, copy, caret movement and scrolling, but never calls `source.edit` and opens no input method composition. `tab_size` gives a tab its width and `blank_marks` draws spaces and tabs.
 pub fn text_area(source: LineSource) -> Element {
     let context = parse_key_context("TextArea") catch {
         err => panic("text_area: cannot read the key context")
@@ -149,6 +171,20 @@ pub fn text_area(source: LineSource) -> Element {
     out.style.width = Px(300.0)
     out.style.height = Px(200.0)
     out.key_context = context
+    out
+}
+
+/// Returns `e`, a `text_area`, advancing each tab character to the next multiple of `n` columns, counted in characters from the start of the line with earlier tabs expanded, so a tab at column 5 in a size of 4 ends at column 8. A size below `1` is read as `1`, which is also the default and draws a tab one column wide, as a space. Shaping, the caret, clicks and drags, selection rectangles and the preferred column of Up and Down all place a column the same way, and the text, `copy` and the edit offsets are unchanged. A tab's span is one position for the caret and a click inside it lands on the nearer edge. On any other element it has no effect.
+pub fn tab_size(e: Element, n: i64) -> Element {
+    var out = e
+    out.tab_size = if n < 1 { 1 } else { n }
+    out
+}
+
+/// Returns `e`, a `text_area`, drawing `·` over each space and `→` at the first column of each tab, in `color`, or in `caret_line` on the line that holds the caret. A no-break space and the other spaces of the Unicode `White_Space` property that are not line breaks get a `·` too. The marks are drawing only: the text, `copy`, the columns and the widths are unchanged, a `·` is centred in its blank's cell and a `→` starts at the left of the tab's first column. Only the lines in view are marked. On any other element it has no effect.
+pub fn blank_marks(e: Element, color: geometry.Color, caret_line: geometry.Color) -> Element {
+    var out = e
+    out.blank_marks = BlankMarks { color, caret_line }
     out
 }
 
@@ -460,14 +496,56 @@ fn area_reveal_line(a: *AreaState, line: i64, count: i64) {
     area_clamp_scroll(a, count)
 }
 
-fn area_piece(st: *State, mut sh: AreaShaped, style: uitext.Style, start: i64, stop: i64, color: geometry.Color?) {
-    let l = uitext.wrap(mut st.shared.text, area_untabbed(sh.text[start..stop]), style, layout.unbounded)
-    sh.pieces.push(AreaPiece { start, end: stop, layout: l, x: sh.width, color })
-    sh.width += l.lines[0].end
+fn area_cells(s: str, from: i64, size: i64) -> i64 {
+    var at = from
+    for c in s {
+        if c == tab_code {
+            at += size - at % size
+        } else {
+            at += 1
+        }
+    }
+    at
 }
 
-fn area_shape(st: *State, style: uitext.Style, text: str, runs: TextRun[]) -> AreaShaped {
-    var out = AreaShaped { text, pieces: [], width: 0.0 }
+fn area_expand(s: str, from: i64, size: i64) -> str {
+    var found = false
+    for i in 0..s.len {
+        if s[i] == '\t' {
+            found = true
+        }
+    }
+    if !found {
+        return s
+    }
+    var out = builder.builder()
+    var at = from
+    for c in s {
+        if c == tab_code {
+            let width = size - at % size
+            for _ in 0..width {
+                builder.write_byte(mut out, ' ')
+            }
+            at += width
+        } else {
+            builder.write_char(mut out, c)
+            at += 1
+        }
+    }
+    builder.to_str(out)
+}
+
+fn area_piece(st: *State, mut sh: AreaShaped, style: uitext.Style, start: i64, stop: i64, color: geometry.Color?) {
+    let part = sh.text[start..stop]
+    let expanded = area_expand(part, sh.cells, sh.tab)
+    let l = uitext.wrap(mut st.shared.text, expanded, style, layout.unbounded)
+    sh.pieces.push(AreaPiece { start, end: stop, layout: l, x: sh.width, color, cell: sh.cells })
+    sh.width += l.lines[0].end
+    sh.cells = area_cells(part, sh.cells, sh.tab)
+}
+
+fn area_shape(st: *State, style: uitext.Style, tab: i64, text: str, runs: TextRun[]) -> AreaShaped {
+    var out = AreaShaped { text, pieces: [], width: 0.0, tab, cells: 0 }
     var at = 0
     for r in runs {
         let stop = clamped(r.end, text.len)
@@ -493,7 +571,8 @@ fn area_x(sh: AreaShaped, at: i64) -> f32 {
     for i, p in sh.pieces {
         if at < p.end || i == sh.pieces.len - 1 {
             let inner = if at < p.start { p.start } else if at > p.end { p.end } else { at }
-            return p.x + glyph_x(p.layout, runes(sh.text[p.start..inner]))
+            let cell = area_cells(sh.text[p.start..inner], p.cell, sh.tab) - p.cell
+            return p.x + glyph_x(p.layout, cell)
         }
     }
     0.0
@@ -504,15 +583,15 @@ fn area_column_at(sh: AreaShaped, local: f32) -> i64 {
     var best_gap = gap_between(local, 0.0)
     for p in sh.pieces {
         var at = p.start
-        var index = 0
+        var cell = p.cell
         for at < p.end {
             var stop = unicode.grapheme_end(sh.text, at)
             if stop > p.end {
                 stop = p.end
             }
-            index += runes(sh.text[at..stop])
+            cell = area_cells(sh.text[at..stop], cell, sh.tab)
             at = stop
-            let gap = gap_between(local, p.x + glyph_x(p.layout, index))
+            let gap = gap_between(local, p.x + glyph_x(p.layout, cell - p.cell))
             if gap < best_gap {
                 best_gap = gap
                 best = at
@@ -551,7 +630,7 @@ fn area_rows(st: *State, a: *AreaState, src: LineSource, count: i64, composing: 
         if !(composing && line == a.caret.line) {
             runs = src.line_runs(line)
         }
-        let shaped = area_shape(st, a.style, text, runs)
+        let shaped = area_shape(st, a.style, a.tab_size, text, runs)
         out.push(AreaRow { line, text, shaped, top: a.content.y + f32(k) * lh - a.shift })
         k += 1
     }
@@ -577,6 +656,54 @@ fn area_selection_rect(a: *AreaState, r: AreaRow, origin: f32, space: f32) -> ge
     geometry.rect(left, r.top, right - left, a.line_height)
 }
 
+fn area_blank(c: u32) -> bool {
+    if c == space_code {
+        return true
+    }
+    if c < no_break_space || c == line_separator || c == paragraph_separator {
+        return false
+    }
+    unicode.is_space(c)
+}
+
+fn area_marks(st: *State, a: *AreaState, spec: BlankMarks) -> AreaMarks {
+    let dot = uitext.wrap(mut st.shared.text, "·", a.style, layout.unbounded)
+    let arrow = uitext.wrap(mut st.shared.text, "→", a.style, layout.unbounded)
+    AreaMarks { dot, arrow, color: spec.color, caret_line: spec.caret_line }
+}
+
+fn area_mark_cell(st: *State, mut sc: scene.Scene, r: AreaRow, m: AreaMarks, p: AreaPiece, cell: i64, tab: bool, origin: f32, bounds: geometry.Rect, tint: geometry.Color, scale: f32) {
+    let left = origin + p.x + glyph_x(p.layout, cell - p.cell)
+    let right = origin + p.x + glyph_x(p.layout, cell + 1 - p.cell)
+    if right < bounds.x || left > bounds.x + bounds.width {
+        return
+    }
+    let mark = if tab { m.arrow } else { m.dot }
+    var x = left
+    if !tab {
+        x = left + (right - left - mark.lines[0].end) / 2.0
+    }
+    uitext.paint(mut st.shared.text, mut sc, mark, geometry.point(x, r.top), tint, scale)
+}
+
+fn paint_row_marks(st: *State, mut sc: scene.Scene, r: AreaRow, m: AreaMarks, caret_line: bool, origin: f32, bounds: geometry.Rect, opacity: f32, scale: f32) {
+    let tint = faded(if caret_line { m.caret_line } else { m.color }, opacity)
+    for p in r.shaped.pieces {
+        var cell = p.cell
+        for c in r.text[p.start..p.end] {
+            if c == tab_code {
+                area_mark_cell(st, mut sc, r, m, p, cell, true, origin, bounds, tint, scale)
+                cell += r.shaped.tab - cell % r.shaped.tab
+            } else {
+                if area_blank(c) {
+                    area_mark_cell(st, mut sc, r, m, p, cell, false, origin, bounds, tint, scale)
+                }
+                cell += 1
+            }
+        }
+    }
+}
+
 fn paint_text_area(st: *State, mut sc: scene.Scene, e: Element, at: i64, content: geometry.Rect, own: TextStyle, scale: f32) {
     let name = st.hitboxes[at].key
     let a = area_state(st, name)
@@ -584,6 +711,7 @@ fn paint_text_area(st: *State, mut sc: scene.Scene, e: Element, at: i64, content
     let count = area_count(src)
     let lh = own.text.line_height
     a.style = own.text
+    a.tab_size = e.tab_size
     a.content = content
     a.line_height = lh
     a.page = area_page_rows(content.height, lh)
@@ -649,6 +777,13 @@ fn paint_text_area(st: *State, mut sc: scene.Scene, e: Element, at: i64, content
     let origin = content.x - scroll
     let space = uitext.measure(mut st.shared.text, " ", a.style, layout.unbounded).width
     let ink = faded(own.color, own.opacity)
+    var marks: AreaMarks? = none
+    match e.blank_marks {
+        some(spec) => {
+            marks = area_marks(st, a, spec)
+        }
+        none => {}
+    }
     scene.push_clip(mut sc, geometry.cover(content, scale))
     for r in rows {
         let fill = src.line_fill(r.line)
@@ -666,6 +801,10 @@ fn paint_text_area(st: *State, mut sc: scene.Scene, e: Element, at: i64, content
         for p in r.shaped.pieces {
             let tint = faded(p.color ?? own.color, own.opacity)
             uitext.paint(mut st.shared.text, mut sc, p.layout, geometry.point(origin + p.x, r.top), tint, scale)
+        }
+        match marks {
+            some(m) => paint_row_marks(st, mut sc, r, m, r.line == a.caret.line, origin, content, own.opacity, scale)
+            none => {}
         }
     }
     if caret_row >= 0 {
