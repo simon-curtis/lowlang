@@ -51,6 +51,8 @@ pub struct WindowOptions {
     pub taskbar: bool = true
     /// `false` shows the window without activating it, so it takes neither the keyboard focus nor the foreground from the program the user is working in. `platform.Options.activate` has the same field; `ui.Options` and this struct carry it through.
     pub activate: bool = true
+    /// The colour of the window's one-pixel border, and `none` keeps the system's. Its alpha is ignored. See `platform.Options.border`.
+    pub border: geometry.Color? = none
     /// Runs on the UI green thread once the window has closed, with why it closed.
     pub closed: fn(CloseReason) = fn(why: CloseReason) {}
 }
