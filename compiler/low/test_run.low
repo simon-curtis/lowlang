@@ -2,6 +2,7 @@ import std/atomic
 import std/io
 import std/os
 import std/os/signal
+import std/path
 import std/process
 import std/slices
 import std/sync
@@ -25,6 +26,7 @@ struct Job {
     name: str
     file: str
     line: i64
+    index: i64
     verdict: Verdict = Verdict.NotRun
     detail: str = ""
     stdout: str = ""
@@ -32,6 +34,7 @@ struct Job {
     elapsed_ns: i64 = 0
     began: i64 = 0
     ended: i64 = 0
+    cached: bool = false
     done: chan[bool]
 }
 
@@ -63,8 +66,8 @@ struct Ran {
     timed_out: bool
 }
 
-fn new_job(built: *Built, listed: Listed) -> *Job {
-    new(Job { built, name: listed.name, file: listed.file, line: listed.line, done: chan[bool](1) })
+fn new_job(built: *Built, listed: Listed, index: i64) -> *Job {
+    new(Job { built, name: listed.name, file: listed.file, line: listed.line, index, done: chan[bool](1) })
 }
 
 fn child_flags(options: TestOptions) -> []str {
@@ -224,10 +227,37 @@ fn run_child(live: *Live, binary: str, dir: str, args: []str, timeout_ms: i64) -
 
 fn run_job(pool: *Pool, job: *Job) {
     let flags = child_flags(pool.options)
-    let args = slices.concat(["-one", job.name], flags)
+    job.began = time.monotonic()
+    match job.built.cache {
+        some(cache) => run_remembered(pool, job, cache, flags)
+        none => {
+            let args = slices.concat(["-one", job.name], flags)
+            run_process(pool, job, args)
+        }
+    }
+}
+
+fn run_remembered(pool: *Pool, job: *Job, cache: *Cache, flags: []str) {
+    let key = job_key(cache, job, flags, pool.options.timeout_ms)
+    match cache_lookup(cache, key) {
+        some(stored) => {
+            replay(job, stored)
+            return
+        }
+        none => {}
+    }
+    let log_name = "inputs{job.index}"
+    let log = path.join([cache.scratch, log_name])
+    let base = slices.concat(["-one", job.name], flags)
+    let args = slices.concat(base, ["-inputs", log])
+    let started = time.now_nanos()
+    run_process(pool, job, args)
+    cache_finish(cache, job, key, log, started)
+}
+
+fn run_process(pool: *Pool, job: *Job, args: []str) {
     let built = job.built
     let timeout_ms = pool.options.timeout_ms
-    job.began = time.monotonic()
     let ran = run_child(pool.live, built.binary, built.module.dir, args, timeout_ms) catch {
         e => {
             job.verdict = Verdict.Crashed
@@ -278,6 +308,17 @@ fn start_pool(pool: *Pool) {
 }
 
 fn list_module(live: *Live, built: *Built, timeout_ms: i64) -> []Listed ! Error {
+    match remembered_listing(built) {
+        some(listed) => return listed
+        none => {}
+    }
+    let output = list_output(live, built, timeout_ms)?
+    let listed = parse_listings(output)?
+    remember_listing(built, output)
+    listed
+}
+
+fn list_output(live: *Live, built: *Built, timeout_ms: i64) -> str ! Error {
     let ran = run_child(live, built.binary, built.module.dir, ["-list"], timeout_ms) catch {
         e => fail Error.Failed("list tests: {e}")
     }
@@ -289,8 +330,12 @@ fn list_module(live: *Live, built: *Built, timeout_ms: i64) -> []Listed ! Error 
         let output = text.trim(ran.stderr)
         fail Error.Failed("list tests: {reason}\n{output}")
     }
+    ran.stdout
+}
+
+fn parse_listings(output: str) -> []Listed ! Error {
     var listed: []Listed = []
-    for line in text.lines(ran.stdout) {
+    for line in text.lines(output) {
         let found = parse_listing(line)?
         listed.push(found)
     }
