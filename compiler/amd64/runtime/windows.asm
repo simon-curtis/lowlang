@@ -15,6 +15,10 @@ rt_poll_event:
 	.zero 8
 rt_poll_lock:
 	.zero 8
+rt_poll_timer:
+	.zero 8
+rt_nap_timer:
+	.zero 8
 rt_ready_list:
 	.zero 8
 
@@ -431,6 +435,8 @@ rt_fault_panic:
 
 rt_os_sysmon_start:
 	OS_ENTER
+	call rt_os_timer_create
+	mov [rip+rt_nap_timer], rax
 	xor ecx, ecx
 	mov edx, 65536
 	lea r8, [rip+rt_sysmon]
@@ -448,9 +454,49 @@ rt_os_sysmon_start:
 
 rt_os_nap:
 	OS_ENTER
+	mov rcx, [rip+rt_nap_timer]
+	test rcx, rcx
+	jz 1f
+	mov edx, 10
+	call rt_os_timer_arm
+	test eax, eax
+	jz 1f
+	mov rcx, [rip+rt_nap_timer]
+	mov edx, INFINITE
+	WIN WaitForSingleObject
+	jmp 2f
+1:
 	mov ecx, 10
 	WIN Sleep
+2:
 	OS_LEAVE
+	ret
+
+rt_os_timer_create:
+	sub rsp, 40
+	xor ecx, ecx
+	xor edx, edx
+	mov r8d, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+	mov r9d, TIMER_ALL_ACCESS
+	WIN CreateWaitableTimerExW
+	add rsp, 40
+	ret
+
+rt_os_timer_arm:
+	push rbp
+	mov rbp, rsp
+	and rsp, -16
+	sub rsp, 64
+	imul rdx, rdx, -10000
+	mov [rsp+48], rdx
+	lea rdx, [rsp+48]
+	xor r8d, r8d
+	xor r9d, r9d
+	mov qword ptr [rsp+32], 0
+	mov qword ptr [rsp+40], 0
+	WIN SetWaitableTimer
+	mov rsp, rbp
+	pop rbp
 	ret
 
 rt_qpc_nanos:
@@ -478,6 +524,8 @@ rt_poll_init:
 	cmp qword ptr [rip+rt_poll_event], 0
 	jne 2f
 	OS_ENTER
+	call rt_os_timer_create
+	mov [rip+rt_poll_timer], rax
 	xor ecx, ecx
 	xor edx, edx
 	xor r8d, r8d
@@ -513,9 +561,29 @@ rt_netpoll:
 	push rbp
 	mov rbp, rsp
 	and rsp, -16
-	sub rsp, 32
+	sub rsp, 48
 	test rdi, rdi
 	jz 2f
+	cmp rdi, -1
+	je 5f
+	mov rcx, [rip+rt_poll_timer]
+	test rcx, rcx
+	jz 5f
+	mov rdx, rdi
+	call rt_os_timer_arm
+	test eax, eax
+	jz 5f
+	mov rax, [rip+rt_poll_event]
+	mov [rsp+32], rax
+	mov rax, [rip+rt_poll_timer]
+	mov [rsp+40], rax
+	mov ecx, 2
+	lea rdx, [rsp+32]
+	xor r8d, r8d
+	mov r9d, INFINITE
+	WIN WaitForMultipleObjects
+	jmp 2f
+5:
 	mov rcx, [rip+rt_poll_event]
 	mov edx, edi
 	WIN WaitForSingleObject

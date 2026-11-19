@@ -2081,6 +2081,7 @@ The contracts between the stages have one owner each:
   - The monitor counts in-call threads that have not scheduled since its previous visit, and `wakep` does not count them against the CPU limit, so work queued behind one finds a running thread.
   - A green thread blocked in `read` on a pipe therefore does not delay a collection started by another.
 - Timers are a locked array of deadlines. `sleep` and `select`'s `after` arms add to it, and the poller wakes through an eventfd when an earlier timer arrives. Descriptors are registered with `EPOLLONESHOT`.
+- On Windows the poller waits on an event and on a high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1803) set to the earliest deadline, and the monitor thread waits on a second such timer, so a deadline lands within about a millisecond rather than on the 15.6 ms system tick. Where the timer cannot be created, the poller waits on the event with a millisecond timeout and the monitor calls `Sleep`, both of which round up to the tick.
 - Channels and `select` are generic prelude code over `__Chan[T]`: a lock word, a ring buffer and ring queues of waiters that keep their capacity.
   - A waiter is claimed with compare-and-swap before it is woken, so a `select` waiting on several channels and timers fires exactly once. Queued entries whose waiter has been claimed are skipped and dropped lazily.
   - An operation that completes at once allocates nothing. A buffered send or receive that needs no waiter runs inline in `__chan_send` and `__chan_recv`.
