@@ -2041,7 +2041,7 @@ Modules:
 
 The runtime is `runtime.asm`, `sched.asm` and `gc.asm`, which are shared by every target, plus `linux.asm` or `windows.asm` for the target OS. It is emitted with every program. A Linux program talks to the kernel through raw syscalls and ends the process with `exit_group`, so every thread stops; a dynamically linked Linux program ends with `exit`. A Windows program calls kernel32 through the `WIN` macro and ends with `ExitProcess`.
 
-The runtime's data layout, thread-local access and Windows stack-bounds switching are defined once, in `layout.asm` and the target's `linux_header.asm` or `windows_header.asm`, as constants and macros such as `G_SCANLO`, `TLS_GET`, `TEB_ENTER_OS` and `MSG_BEGIN`. Generated code and patches use those names and macros, and `generate` and `generate_patch` both prepend the headers. The code generator passes `RT_DYNAMIC` and the hot-reload constants (`HOT_BASE`, `HOT_SIZE`, `PATCH_BYTES`, `PATCH_ENTRY`, `PATCH_SIGNAL`) to the assembly as `.set` lines, and defines `HOT_INIT` as the call to `rt_hot_init` in a hot build and as nothing otherwise. The Windows import table lists every function the Windows runtime calls through `WIN`, taken from `windows.asm`, plus the program's `extern` imports.
+The runtime's data layout, thread-local access and Windows stack-bounds switching are defined once, in `layout.asm` and the target's `linux_header.asm` or `windows_header.asm`, as constants and macros such as `G_SCANLO`, `TLS_GET`, `TEB_ENTER_OS` and `MSG_BEGIN`. Generated code and patches use those names and macros, and `generate` and `generate_patch` both prepend the headers. The code generator passes `RT_DYNAMIC` and the hot-reload constants (`HOT_BASE`, `HOT_SIZE`, `PATCH_BYTES`, `PATCH_ENTRY`, `PATCH_SIGNAL`) to the assembly as `.set` lines, defines `HOT_INIT` as the call to `rt_hot_init` in a hot build and as nothing otherwise, and defines `VALUE_CODE dst, word` as the load of a function value's code address, which is the word itself in a plain build and the `fn_table` entry it points to in a hot build. `rt_spawn` reads the function it starts through it. The Windows import table lists every function the Windows runtime calls through `WIN`, taken from `windows.asm`, plus the program's `extern` imports.
 
 The contracts between the stages have one owner each:
 
@@ -2597,14 +2597,15 @@ Calling convention:
   - a struct or enum layout;
   - an existing function's signature;
   - a closure's captured variables;
-  - `main`.
+  - `main`;
+  - more functions than `fn_table` has entries.
 
   A running frame of old code may still call any function, so it must keep the old calling convention and data layout. `main` never returns to pick up new code.
 - Otherwise every function whose generated assembly differs from the running version is recompiled, including callers whose code changed only because a callee did, every instance of an edited generic function, and new functions. Heap, stack, open regions and all live values are kept.
 
 Mechanism:
 
-- Dev builds call every function through `fn_table`, a writable table of 4096 code addresses, with `call [rip+fn_table+8*i]`. Release builds call directly.
+- Dev builds call every function through `fn_table`, a writable table of code addresses, sized at build to the first power of two that is at least 4096 and at least twice the number of functions, with `call [rip+fn_table+8*i]`. Release builds call directly.
 - In dev builds a function value's code word is the address of its `fn_table` entry and calls through it use `call [r10]`, so a stored function value or closure runs the newest code. Callback thunks call through the table too.
 - `compiler/amd64` owns this protocol: `generate` with a `FuncTable` and `generate_patch`, the `fn_table` size, the patch signal and entry size, the mailbox and handler symbol names, and `hot_base`, `hot_size` and `hot_runtime` for each `amd64.Platform`.
 - At start, before the collector reserves the heap, the dev runtime reserves a 64 MB read-execute region, close enough to the binary for 32-bit relative references. On Linux it installs a `SIGUSR1` handler and maps the region at `0x40000000`. On Windows `rt_hot_init` calls `VirtualAlloc` for the region at `0x180000000` and panics when the address is taken. A dev build for Windows is linked by `link.pe_fixed` at the image base `0x140000000` with relocations stripped and no `DYNAMIC_BASE`, so the image and the region stay a fixed distance apart.
@@ -2986,7 +2987,8 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - functions added;
   - compile errors leaving the program running;
   - heap data surviving a reload while the collector runs;
-  - stored function values, closures and callbacks running patched code;
+  - stored function values, closures, callbacks and spawned threads running patched code;
+  - a program with more functions than the smallest `fn_table`;
   - instances of an edited generic function patched;
   - restarts on layout, signature and capture changes.
 - `compiler/lowfuzz` generates well-typed, terminating programs from a choice stream (`compiler/fuzz/gen`), predicts their output with a reference interpreter (`compiler/fuzz/model`), builds each for the host with the release profile and with the dev profile, the same optimisation and hot-reload code generation as `low build` and `low dev`, or on Windows, where `dev` is unavailable, with the unoptimised profile of `-c debug`, runs both, and reports any of these (`compiler/fuzz/oracle`):

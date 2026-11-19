@@ -982,7 +982,7 @@ rt_spawn_start:
 	push rbx
 	push r12
 	push r13
-	mov r12, rdi
+	VALUE_CODE r12, rdi
 	mov r13, rsi
 	call rt_galloc
 	mov rbx, rax
