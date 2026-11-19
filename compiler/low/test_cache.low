@@ -1,0 +1,449 @@
+import compiler
+import std/builder
+import std/crypto/hash
+import std/file
+import std/io
+import std/json
+import std/os
+import std/path
+import std/slices
+import std/text
+import std/time
+
+const cache_format = "low-test-cache 1"
+const settle_seconds = 2
+const nanos_per_second = 1000000000
+const environment_prefix = "LOW_"
+const environment_skipped = "LOW_CACHE"
+
+struct Cache {
+    disk: compiler.Disk
+    root: str
+    scratch: str
+    cwd: str
+    environment: str
+}
+
+struct Input {
+    op: str
+    name: str
+    fingerprint: str = ""
+}
+
+struct Record {
+    event: Input
+    rest: str
+}
+
+struct Stored {
+    stdout: str
+    stderr: str
+    elapsed_ns: i64
+    inputs: []Input
+}
+
+fn open_cache(options: TestOptions, disk: compiler.Disk, scratch: str, cwd: str) -> *Cache? {
+    if options.nocache || options.update || options.count > 1 || disk.cache == "" {
+        return none
+    }
+    let root = path.join([disk.cache, "test"])
+    let held = compiler.path_key(disk.drives, scratch)
+    let environment = low_environment()
+    new(Cache { disk, root, scratch: held, cwd, environment })
+}
+
+fn low_environment() -> str {
+    let variables = os.environment()
+    var names: []str = []
+    for name, _ in variables {
+        if text.starts_with(name, environment_prefix) && name != environment_skipped {
+            names.push(name)
+        }
+    }
+    slices.sort(mut names)
+    var b = builder.builder()
+    for name in names {
+        let value = variables[name] ?? ""
+        b.write("{name}={value}\0")
+    }
+    b.to_str()
+}
+
+fn sha256_hex(data: []u8) -> str {
+    let sum = hash.sum(hash.sha256(), data)
+    text.encode_hex(sum)
+}
+
+fn key_of(parts: []str) -> str {
+    let joined = text.join(parts, "\n")
+    sha256_hex(bytes(joined))
+}
+
+fn digest_binary(location: str) -> str {
+    let data = file.read_file(location) or return ""
+    sha256_hex(data)
+}
+
+fn attach_cache(built: *Built, cache: *Cache?) {
+    let held = cache ?? return
+    let digest = digest_binary(built.binary)
+    if digest == "" {
+        return
+    }
+    built.digest = digest
+    built.cache = held
+}
+
+fn cache_workdir(cache: *Cache, built: *Built) -> str {
+    if built.module.dir == "" {
+        return cache.cwd
+    }
+    built.module.dir
+}
+
+fn entry_path(cache: *Cache, key: str) -> str {
+    let shard = key[..2]
+    let parts = [cache.root, shard, key]
+    path.join(parts)
+}
+
+fn read_entry(cache: *Cache, key: str) -> str? {
+    let location = entry_path(cache, key)
+    let data = file.read_file(location) or return none
+    str(data)
+}
+
+fn write_entry(cache: *Cache, key: str, body: str) {
+    let location = entry_path(cache, key)
+    write_atomic(location, body) or {}
+}
+
+fn write_atomic(location: str, body: str) ! io.Error {
+    let parent = path.dir(location)
+    file.mkdir_all(parent)?
+    let pattern = "{path.base(location)}.tmp-*"
+    using staged = file.temp_file(parent, pattern)?
+    file.write_str(staged.file, body)?
+    file.close(staged.file)
+    file.rename(staged.path, location)?
+}
+
+fn list_key(digest: str) -> str {
+    let parts = [cache_format, "list", digest]
+    key_of(parts)
+}
+
+fn remembered_listing(built: *Built) -> []Listed? {
+    let cache = built.cache ?? return none
+    let key = list_key(built.digest)
+    let output = read_entry(cache, key) ?? return none
+    parse_listings(output) or return none
+}
+
+fn remember_listing(built: *Built, output: str) {
+    let cache = built.cache ?? return
+    let key = list_key(built.digest)
+    write_entry(cache, key, output)
+}
+
+fn job_key(cache: *Cache, job: *Job, flags: []str, timeout_ms: i64) -> str {
+    let built = job.built
+    let workdir = cache_workdir(cache, built)
+    let joined = text.join(flags, "\0")
+    let timeout = "{timeout_ms}"
+    let parts = [cache_format, built.digest, job.name, workdir, joined, timeout, cache.environment]
+    key_of(parts)
+}
+
+fn cache_lookup(cache: *Cache, key: str) -> Stored? {
+    let body = read_entry(cache, key) ?? return none
+    let stored = parse_entry(bytes(body)) ?? return none
+    if !inputs_unchanged(stored.inputs) {
+        return none
+    }
+    stored
+}
+
+fn parse_entry(data: []u8) -> Stored? {
+    let doc = json.parse(data) or return none
+    let stdout = json.field_text(doc, "stdout") ?? return none
+    let stderr = json.field_text(doc, "stderr") ?? return none
+    let elapsed_ns = json.field_int(doc, "elapsed_ns") ?? return none
+    let listed = json.field(doc, "inputs")
+    let inputs = parse_inputs(listed) ?? return none
+    Stored { stdout, stderr, elapsed_ns, inputs }
+}
+
+fn parse_inputs(listed: json.Value) -> []Input? {
+    match listed {
+        Array(items) => {
+            var inputs: []Input = []
+            for item in items {
+                let input = parse_input(item) ?? return none
+                inputs.push(input)
+            }
+            inputs
+        }
+        _ => none
+    }
+}
+
+fn parse_input(item: json.Value) -> Input? {
+    let op = json.field_text(item, "op") ?? return none
+    let name = json.field_text(item, "name") ?? return none
+    let fingerprint = json.field_text(item, "fingerprint") ?? return none
+    Input { op, name, fingerprint }
+}
+
+fn entry_text(job: *Job, inputs: []Input) -> str {
+    let w = json.writer(0)
+    json.start_object(w)
+    json_text(w, "stdout", job.stdout)
+    json_text(w, "stderr", job.stderr)
+    json_number(w, "elapsed_ns", job.elapsed_ns)
+    json.property(w, "inputs")
+    json.start_array(w)
+    for input in inputs {
+        json_input(w, input)
+    }
+    json.end_array(w)
+    json.end_object(w)
+    json.written_text(w)
+}
+
+fn json_input(w: *json.Writer, input: Input) {
+    json.start_object(w)
+    json_text(w, "op", input.op)
+    json_text(w, "name", input.name)
+    json_text(w, "fingerprint", input.fingerprint)
+    json.end_object(w)
+}
+
+fn replay(job: *Job, stored: Stored) {
+    job.verdict = Verdict.Passed
+    job.detail = "cached"
+    job.stdout = stored.stdout
+    job.stderr = stored.stderr
+    job.elapsed_ns = stored.elapsed_ns
+    job.cached = true
+    job.ended = time.monotonic()
+}
+
+fn cache_finish(cache: *Cache, job: *Job, key: str, log: str, started: i64) {
+    if job.verdict == Verdict.Passed {
+        store_job(cache, job, key, log, started)
+    }
+    file.remove(log) or {}
+}
+
+fn store_job(cache: *Cache, job: *Job, key: str, log: str, started: i64) {
+    let data = file.read_file(log) or return
+    let inputs = collect_inputs(cache, job.built, str(data), started) ?? return
+    let body = entry_text(job, inputs)
+    write_entry(cache, key, body)
+}
+
+fn is_path_op(op: str) -> bool {
+    op == "open" || op == "stat" || op == "list" || op == "readlink"
+}
+
+fn is_known_op(op: str) -> bool {
+    is_path_op(op) || is_unrepeatable(op) || op == "getenv" || op == "environ"
+}
+
+fn is_unrepeatable(op: str) -> bool {
+    op == "exec" || op == "chdir" || op == "redirect"
+}
+
+fn parse_record(log: str) -> Record? {
+    let head = text.cut(log, " ")
+    if !head.found || !is_known_op(head.before) {
+        return none
+    }
+    let sized = text.cut(head.after, " ")
+    if !sized.found {
+        return none
+    }
+    let length = text.parse_int(sized.before) or return none
+    let body = sized.after
+    if length < 0 || length >= body.len || body[length] != '\n' {
+        return none
+    }
+    let event = Input { op: head.before, name: body[..length] }
+    Record { event, rest: body[length + 1..] }
+}
+
+fn parse_events(log: str) -> []Input? {
+    var events: []Input = []
+    var rest = log
+    for rest.len > 0 {
+        let record = parse_record(rest) ?? return none
+        events.push(record.event)
+        rest = record.rest
+    }
+    events
+}
+
+fn resolve_event(cache: *Cache, workdir: str, event: Input) -> Input {
+    if !is_path_op(event.op) || event.name == "" {
+        return event
+    }
+    let absolute = compiler.absolute(cache.disk, workdir, event.name)
+    Input { op: event.op, name: absolute }
+}
+
+fn in_scratch(cache: *Cache, event: Input) -> bool {
+    if !is_path_op(event.op) {
+        return false
+    }
+    event.name == cache.scratch || text.starts_with(event.name, "{cache.scratch}/")
+}
+
+fn collect_inputs(cache: *Cache, built: *Built, log: str, started_ns: i64) -> []Input? {
+    let events = parse_events(log) ?? return none
+    let workdir = cache_workdir(cache, built)
+    let started = started_ns / nanos_per_second
+    var seen: [str: bool] = [:]
+    var inputs: []Input = []
+    for event in events {
+        if is_unrepeatable(event.op) {
+            return none
+        }
+        let resolved = resolve_event(cache, workdir, event)
+        if in_scratch(cache, resolved) {
+            continue
+        }
+        let identity = "{resolved.op}\0{resolved.name}"
+        if seen[identity] != none {
+            continue
+        }
+        seen[identity] = true
+        let observed = observe(resolved, started) ?? return none
+        inputs.push(observed)
+    }
+    inputs
+}
+
+fn observe(input: Input, started: i64) -> Input? {
+    let fingerprint = fingerprint_of(input.op, input.name)
+    if !settled(input, started) {
+        return none
+    }
+    Input { op: input.op, name: input.name, fingerprint }
+}
+
+fn settled(input: Input, started: i64) -> bool {
+    if input.op != "open" && input.op != "list" {
+        return true
+    }
+    let info = file.stat(input.name) or return true
+    if !info.regular && !info.dir {
+        return true
+    }
+    info.modified + settle_seconds <= started
+}
+
+fn inputs_unchanged(inputs: []Input) -> bool {
+    for input in inputs {
+        let now = fingerprint_of(input.op, input.name)
+        if now != input.fingerprint {
+            return false
+        }
+    }
+    true
+}
+
+fn fingerprint_of(op: str, name: str) -> str {
+    match op {
+        "open" => open_print(name)
+        "stat" => stat_print(name)
+        "list" => list_print(name)
+        "readlink" => link_print(name)
+        "getenv" => env_print(name)
+        "environ" => environ_print()
+        _ => "unknown"
+    }
+}
+
+fn missing_print(e: io.Error) -> str {
+    match e {
+        NotFound => "absent"
+        _ => "error {e}"
+    }
+}
+
+fn open_print(name: str) -> str {
+    let info = file.stat(name) catch {
+        e => return missing_print(e)
+    }
+    if info.dir {
+        return dir_print(name)
+    }
+    if info.regular {
+        return content_print(name)
+    }
+    "other"
+}
+
+fn dir_print(name: str) -> str {
+    let names = sorted_names(name) catch {
+        e => return missing_print(e)
+    }
+    "dir\0{names}"
+}
+
+fn content_print(name: str) -> str {
+    let data = file.read_file(name) catch {
+        e => return missing_print(e)
+    }
+    "file {sha256_hex(data)}"
+}
+
+fn sorted_names(name: str) -> str ! io.Error {
+    var names = file.list(name)?
+    slices.sort(mut names)
+    text.join(names, "\0")
+}
+
+fn stat_print(name: str) -> str {
+    let info = file.stat(name) catch {
+        e => return missing_print(e)
+    }
+    if info.dir {
+        return "dir"
+    }
+    if info.regular {
+        return "file {info.size}"
+    }
+    "other"
+}
+
+fn list_print(name: str) -> str {
+    let names = sorted_names(name) catch {
+        e => return missing_print(e)
+    }
+    "entries\0{names}"
+}
+
+fn link_print(name: str) -> str {
+    let target = file.readlink(name) catch {
+        e => return missing_print(e)
+    }
+    "link {target}"
+}
+
+fn env_print(name: str) -> str {
+    let value = os.env(name) ?? return "unset"
+    "set {value}"
+}
+
+fn environ_print() -> str {
+    let variables = os.environment()
+    var lines: []str = []
+    for name, value in variables {
+        lines.push("{name}={value}")
+    }
+    slices.sort(mut lines)
+    let joined = text.join(lines, "\0")
+    sha256_hex(bytes(joined))
+}
