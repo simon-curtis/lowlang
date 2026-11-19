@@ -2409,7 +2409,9 @@ Optimiser:
   - Any other use copies it: a slice with one grow call that moves the template's bytes, a map with the prelude's `__map_clone`, which copies the entry array and the index. A literal below the copy thresholds of the Slices and Maps sections is built each time in that case.
 - Block merging and jump threading:
   - A block that ends in a jump to a block with no other predecessor and no phis is merged into it.
-  - A block that holds a phi and at most one more value and branches on that phi, or on its negation, is skipped by a predecessor that passes a constant: the predecessor jumps to the successor the constant selects.
+  - A block that branches on a phi, or on its negation, and holds nothing else but constants that only feed its successors' phis, is skipped by a predecessor that passes a constant: the predecessor jumps to the successor the constant selects, and takes a copy of each constant that successor's phis read from the block. Blocks are visited successors first, so a chain of such blocks is threaded in one pass.
+  - The phi that joins `a && b` takes `false` from the edge where `a` is false, and the phi that joins `a || b` takes `true` from the edge where `a` is true, so a condition built from them threads into branches on its operands.
+  - The backend threads a block the same way when a predecessor copies a constant, or a value its own predecessor branched on, into the register the block branches on.
 
 ### Code generation
 
