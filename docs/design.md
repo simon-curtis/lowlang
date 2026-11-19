@@ -2402,7 +2402,7 @@ Optimiser:
     - has at most one loop and an entry block no jump returns to;
     - uses no vector instruction.
   - Frame slots, `ccall`s and runtime calls are cloned with the body, and the callee's slots are appended to the caller's.
-  - A callee of at most 6 values is free. Any other site is charged to the caller, which grows by at most 240 values, and to the program, whose budget is a fifth of its value count before inlining, at least 6000 and at most 40000. The last quarter of the program budget is kept for call sites inside loops.
+  - A callee of at most 14 values is free. Any other site is charged to the caller, which grows by at most 240 values, and to the program, whose budget is a fifth of its value count before inlining, at least 6000 and at most 40000. The last quarter of the program budget is kept for call sites inside loops.
   - A caller inlines up to four rounds. Each round takes its sites inside the deepest loops first, then the smaller callees, then the earlier values; splits the call's block; clones the callee's blocks with parameters bound to the arguments; forwards a single return's values or joins several returns in phis; and simplifies the caller. Calls that an inlined body or a devirtualised call exposes are inlined in the next round.
   - Loop back edges keep their marks, and checks and divisions keep their panics.
   - Dev builds do not inline, specialise or hoist literals, so hot reload patches see every function and every literal's data.
