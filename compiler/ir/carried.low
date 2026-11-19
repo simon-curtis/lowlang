@@ -1,0 +1,258 @@
+import std/slices
+
+struct Tracker {
+    func: *Func
+    entry: [i64: *Value] = [:]
+    last: [i64: *Value] = [:]
+    phis: []*Value = []
+}
+
+pub fn carry_loop_fields(s: *Ssa) -> bool {
+    if !s.func.blocks.any(fn(b) b.poll) {
+        return false
+    }
+    let doms = func_dominators(s.func)
+    var changed = false
+    for l in find_loops(doms) {
+        if l.preheader != none && carry_loop(s, l) {
+            changed = true
+        }
+    }
+    if changed {
+        for b in s.func.blocks {
+            resolve_block(s, b)
+        }
+    }
+    changed
+}
+
+fn carry_loop(s: *Ssa, l: *Loop) -> bool {
+    var base: *Value? = none
+    var stores: []*Value = []
+    for b in l.order {
+        for v in b.values {
+            if v.forward != none || v.op == OpLoad || !writes_memory(v.op) {
+                continue
+            }
+            if v.op != OpStore || v.args.len != 2 || v.mem != 0 {
+                return false
+            }
+            let addr = resolve(v.args[0])
+            if base != none && base != addr {
+                return false
+            }
+            base = addr
+            stores.push(v)
+        }
+    }
+    match base {
+        some(known) => {
+            if !invariant(l, known) {
+                return false
+            }
+        }
+        none => {}
+    }
+    let candidates = header_candidates(l, base, stores)
+    for probe in candidates {
+        carry_field(s, l, probe, stores)
+    }
+    candidates.len > 0
+}
+
+fn header_candidates(l: *Loop, base: *Value?, stores: []*Value) -> []*Value {
+    var found: []*Value = []
+    for v in l.header.values {
+        if v.forward != none {
+            continue
+        }
+        if v.op != OpLoad {
+            if traps_before(v.op) {
+                break
+            }
+            continue
+        }
+        if v.mem & mem_trap != 0 {
+            break
+        }
+        if !full_word_load(v) {
+            continue
+        }
+        let addr = resolve(v.args[0])
+        if !invariant(l, addr) || (base != none && base != addr) || !clear_of_stores(v, stores) {
+            continue
+        }
+        if !found.any(fn(f) same_location(f, v)) {
+            found.push(v)
+        }
+    }
+    found
+}
+
+fn traps_before(op: Op) -> bool {
+    match op {
+        OpCheck => true
+        OpDiv => true
+        OpRem => true
+        OpConvert => true
+        OpStore => false
+        _ => writes_memory(op)
+    }
+}
+
+fn full_word_load(v: *Value) -> bool {
+    v.op == OpLoad && v.args.len == 1 && v.mem & mem_trap == 0 && v.type == none
+}
+
+fn clear_of_stores(v: *Value, stores: []*Value) -> bool {
+    for st in stores {
+        let d = st.aux - v.aux
+        if d > -8 && d < 8 && (d != 0 || st.type != none) {
+            return false
+        }
+    }
+    true
+}
+
+fn same_location(a: *Value, b: *Value) -> bool {
+    a.aux == b.aux && resolve(a.args[0]) == resolve(b.args[0])
+}
+
+fn stores_location(v: *Value, probe: *Value) -> bool {
+    v.forward == none && v.op == OpStore && same_location(v, probe)
+}
+
+fn reads_location(v: *Value, probe: *Value) -> bool {
+    v.forward == none && full_word_load(v) && same_location(v, probe)
+}
+
+fn carry_field(s: *Ssa, l: *Loop, probe: *Value, stores: []*Value) {
+    let pre = preheader_of(l)
+    let addr = resolve(probe.args[0])
+    let initial = new_value(s.func, pre, OpLoad, [addr])
+    initial.aux = probe.aux
+    initial.scalar = probe.scalar
+    initial.float_bits = probe.float_bits
+    pre.values.push(initial)
+    if !stores.any(fn(st) st.aux == probe.aux) {
+        replace_loads(l, probe, initial)
+        return
+    }
+    let t = new(Tracker { func: s.func })
+    for b in l.order {
+        for v in b.values {
+            if stores_location(v, probe) {
+                t.last[b.id] = resolve(v.args[1])
+            }
+        }
+    }
+    let header = l.header
+    let phi = new_value(s.func, header, OpPhi, [])
+    t.entry[header.id] = phi
+    t.phis.push(phi)
+    for p in header.preds {
+        if p == pre {
+            phi.args.push(initial)
+        } else {
+            phi.args.push(t.carried_at_end(p))
+        }
+    }
+    for b in l.order {
+        t.rewrite_carried(b, probe)
+    }
+    t.insert_carried_phis()
+}
+
+fn replace_loads(l: *Loop, probe: *Value, initial: *Value) {
+    for b in l.order {
+        for v in b.values {
+            if reads_location(v, probe) && interchangeable(v, initial) {
+                v.forward = initial
+            }
+        }
+    }
+}
+
+fn rewrite_carried(t: *Tracker, b: *Block, probe: *Value) {
+    var current: *Value? = none
+    for v in b.values {
+        if stores_location(v, probe) {
+            current = resolve(v.args[1])
+            continue
+        }
+        if !reads_location(v, probe) {
+            continue
+        }
+        let known = current ?? t.carried_at_entry(b)
+        current = known
+        var model = known
+        if known.op == OpPhi {
+            model = probe
+        }
+        if interchangeable(v, model) {
+            v.forward = known
+        }
+    }
+}
+
+fn carried_at_end(t: *Tracker, b: *Block) -> *Value {
+    match t.last[b.id] {
+        some(v) => resolve(v)
+        none => t.carried_at_entry(b)
+    }
+}
+
+fn carried_at_entry(t: *Tracker, start: *Block) -> *Value {
+    var chain: []i64 = []
+    var b = start
+    var found: *Value? = none
+    for found == none {
+        match t.entry[b.id] {
+            some(v) => { found = resolve(v) }
+            none => {}
+        }
+        if found != none {
+            break
+        }
+        chain.push(b.id)
+        if b.preds.len != 1 {
+            found = t.carried_join(b)
+            break
+        }
+        let pred = b.preds[0]
+        match t.last[pred.id] {
+            some(v) => { found = resolve(v) }
+            none => { b = pred }
+        }
+    }
+    let result = found ?? panic("ir: carried field without a value")
+    for id in chain {
+        t.entry[id] = result
+    }
+    result
+}
+
+fn carried_join(t: *Tracker, b: *Block) -> *Value {
+    let node = new_value(t.func, b, OpPhi, [])
+    t.entry[b.id] = node
+    t.phis.push(node)
+    for p in b.preds {
+        let arg = t.carried_at_end(p)
+        node.args.push(arg)
+    }
+    let found = sole_operand(node)
+    if !found.ok {
+        return node
+    }
+    let same = found.value ?? panic("ir: carried field joins only itself")
+    node.forward = same
+    same
+}
+
+fn insert_carried_phis(t: *Tracker) {
+    for node in t.phis {
+        if node.forward == none {
+            node.block.values = slices.concat([node], node.block.values)
+        }
+    }
+}
