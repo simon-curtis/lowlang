@@ -12,6 +12,9 @@ const kind_other = 0
 const kind_typing = 1
 const kind_backspace = 2
 const kind_delete = 3
+const area_drag_caret = 0
+const area_drag_add = 1
+const area_drag_rect = 2
 const tab_code: u32 = 9
 const space_code: u32 = 32
 const no_break_space: u32 = 160
@@ -58,6 +61,8 @@ pub struct LineSource {
     pub line_text: fn(i64) -> str
     /// Applies the `TextEdit` it is given: the text from `start` up to `end` becomes `text` and nothing else in the document changes. The area works out where its caret goes from the edit and keeps the removed text for undo, then reads the document back. When the document differs from what the edit describes, as when the application ignores or alters the edit, the area drops its undo and redo history and keeps its caret within the text the document holds.
     pub edit: fn(TextEdit)
+    /// Applies the edits of one step made with more than one selection, called instead of `edit` for that step. The edits come last position first, by `start` and then by `end`, and every position in them is taken from the document as it was before the step, so applying them in the order given keeps each position valid. No two edits overlap, and an insertion at the start of a deletion comes after it. The area reads the document back after the call as it does after `edit`. Undo and redo apply their changes one at a time through `edit`. When it is `none` the area calls `edit` once for each of the edits, in the same order.
+    pub edit_all: fn(TextEdit[])? = none
     /// Returns the styled runs of line `i`, in order and not overlapping, or none for a line drawn plain.
     pub line_runs: fn(i64) -> TextRun[]
     /// Returns the colour behind the whole of line `i`, or `none` for no decoration.
@@ -82,12 +87,27 @@ struct AreaGroup {
     changes: AreaChange[]
     kind: i64
     before: TextSelection
+    before_more: TextSelection[]
     after: TextSelection
+    after_more: TextSelection[]
+}
+
+struct AreaSel {
+    anchor: TextPosition = TextPosition {}
+    caret: TextPosition = TextPosition {}
+    x: f32 = -1.0
+    newest: bool = false
 }
 
 struct AreaState {
     caret: TextPosition = TextPosition {}
     anchor: TextPosition = TextPosition {}
+    more: AreaSel[] = []
+    newest: i64 = -1
+    drag_mode: i64 = 0
+    drag_base: AreaSel[] = []
+    drag_from: TextPosition = TextPosition {}
+    drag_x: f32 = 0.0
     preferred: f32? = none
     first: i64 = 0
     shift: f32 = 0.0
@@ -154,6 +174,7 @@ pub fn line_source(line_count: fn() -> i64, line_text: fn(i64) -> str, edit: fn(
         line_count
         line_text
         edit
+        edit_all: none
         line_runs: fn(i: i64) -> TextRun[] { [] }
         line_fill: fn(i: i64) -> geometry.Color? { none }
     }
@@ -229,12 +250,19 @@ fn binding_specs() -> BindingSpec[] {
         BindingSpec { keys: "ctrl-z", action: "text_area.undo" },
         BindingSpec { keys: "ctrl-y", action: "text_area.redo" },
         BindingSpec { keys: "ctrl-shift-z", action: "text_area.redo" },
+        BindingSpec { keys: "ctrl-alt-up", action: "text_area.add_cursor_above" },
+        BindingSpec { keys: "ctrl-alt-down", action: "text_area.add_cursor_below" },
+        BindingSpec { keys: "ctrl-d", action: "text_area.select_next_occurrence" },
+        BindingSpec { keys: "ctrl-shift-d", action: "text_area.select_all_occurrences" },
+        BindingSpec { keys: "escape", action: "text_area.collapse_selections" },
     ]
 }
 
 /// Returns the default key bindings of a text area, in the context `TextArea`, for the application to pass to `bind_keys`, as gpui's `examples/input.rs` binds its text input's actions.
 ///
-/// The actions are `text_area.left`, `right`, `up` and `down` and their `select_` forms, `word_left` and `word_right` and their `select_` forms, `line_start` and `line_end` (Home and End), `document_start` and `document_end` (Control with Home and End), `page_up` and `page_down` and their `select_` forms, `backspace`, `delete`, `delete_word_left`, `delete_word_right`, `new_line`, `tab`, `select_all`, `copy`, `cut`, `paste`, `undo` and `redo`. Bind other keystrokes to them, or bind keystrokes to the empty action to unbind them: with `tab` unbound, Tab moves focus on from the area instead of inserting a tab, and Shift+Tab, which is not bound, moves it back. A `read_only` area handles none of `backspace`, `delete`, `delete_word_left`, `delete_word_right`, `new_line`, `tab`, `cut`, `paste`, `undo` and `redo`, so those keys fall through and Tab moves focus on.
+/// The actions are `text_area.left`, `right`, `up` and `down` and their `select_` forms, `word_left` and `word_right` and their `select_` forms, `line_start` and `line_end` (Home and End), `document_start` and `document_end` (Control with Home and End), `page_up` and `page_down` and their `select_` forms, `backspace`, `delete`, `delete_word_left`, `delete_word_right`, `new_line`, `tab`, `select_all`, `copy`, `cut`, `paste`, `undo` and `redo`.
+    ///
+    /// Several selections come from `add_cursor_above` and `add_cursor_below` (Control and Alt with Up and Down), which add a caret on the line above or below each selection's caret, `select_next_occurrence` (Control with D), which selects the word at the caret when the primary selection is empty and otherwise adds the next occurrence of the text of the newest selection, and `select_all_occurrences` (Control and Shift with D). `collapse_selections` (Escape) drops every selection but the primary one and does nothing, so that Escape reaches the elements around the area, when there is only one. Bind other keystrokes to them, or bind keystrokes to the empty action to unbind them: with `tab` unbound, Tab moves focus on from the area instead of inserting a tab, and Shift+Tab, which is not bound, moves it back. A `read_only` area handles none of `backspace`, `delete`, `delete_word_left`, `delete_word_right`, `new_line`, `tab`, `cut`, `paste`, `undo` and `redo`, so those keys fall through and Tab moves focus on.
 pub fn text_area_bindings() -> KeyBinding[] {
     var out: KeyBinding[] = []
     for s in binding_specs() {
@@ -293,17 +321,49 @@ fn area_state(st: *State, name: str) -> *AreaState {
     created
 }
 
-/// Returns the selection of the text area whose key is `key`, its `id` or its position in the tree, as of the last event.
+/// Returns the primary selection of the text area whose key is `key`, its `id` or its position in the tree, as of the last event: the first of `text_area_selections`.
 pub fn text_area_selection(cx: Context, key: str) -> TextSelection {
     let a = area_state(cx.state, key)
     TextSelection { anchor: a.anchor, caret: a.caret }
 }
 
-/// Selects from `anchor` to `caret` in the text area whose key is `key` and scrolls it to show the caret in the next frame. Positions outside the document are moved to the nearest grapheme boundary inside it.
+/// Returns every selection of the text area whose key is `key`, in document order and not overlapping, as of the last event. The first is the primary one that scrolling, the input method and `text_area_selection` follow. An area with one selection returns a slice of one.
+pub fn text_area_selections(cx: Context, key: str) -> TextSelection[] {
+    let a = area_state(cx.state, key)
+    var out: TextSelection[] = [TextSelection { anchor: a.anchor, caret: a.caret }]
+    for s in a.more {
+        out.push(TextSelection { anchor: s.anchor, caret: s.caret })
+    }
+    out
+}
+
+/// Selects from `anchor` to `caret` in the text area whose key is `key`, dropping any other selection, and scrolls it to show the caret in the next frame. Positions outside the document are moved to the nearest grapheme boundary inside it.
 pub fn set_text_area_selection(cx: Context, key: str, anchor: TextPosition, caret: TextPosition) {
     let a = area_state(cx.state, key)
     a.anchor = anchor
     a.caret = caret
+    area_one(a)
+    let at = find(cx.state, key)
+    if at >= 0 {
+        area_sync(a, area_source(cx.state.hitboxes[at].element))
+    }
+    a.open = false
+    a.preferred = none
+    a.reveal = true
+    cx.state.dirty = true
+}
+
+/// Replaces the selections of the text area whose key is `key` with `selections` and scrolls it to show the first in the next frame. Positions outside the document are moved to the nearest grapheme boundary inside it, selections that overlap, or whose carets meet, are merged, and the result is kept in document order, so the first of `text_area_selections` afterwards is the one that starts first. An empty slice changes nothing.
+pub fn set_text_area_selections(cx: Context, key: str, selections: TextSelection[]) {
+    if selections.len == 0 {
+        return
+    }
+    let a = area_state(cx.state, key)
+    var list: AreaSel[] = []
+    for s in selections {
+        list.push(AreaSel { anchor: s.anchor, caret: s.caret })
+    }
+    area_install(a, list)
     let at = find(cx.state, key)
     if at >= 0 {
         area_sync(a, area_source(cx.state.hitboxes[at].element))
@@ -405,6 +465,9 @@ fn area_sync(a: *AreaState, src: LineSource) {
     a.caret = caret
     a.anchor = anchor
     a.first = clamped(a.first, count - 1)
+    if a.more.len > 0 {
+        area_fit_all(a, src, count)
+    }
 }
 
 fn area_page_rows(height: f32, line_height: f32) -> i64 {
@@ -637,9 +700,7 @@ fn area_rows(st: *State, a: *AreaState, src: LineSource, count: i64, composing: 
     out
 }
 
-fn area_selection_rect(a: *AreaState, r: AreaRow, origin: f32, space: f32) -> geometry.Rect? {
-    let lo = area_start(a)
-    let hi = area_stop(a)
+fn area_selection_rect(lo: TextPosition, hi: TextPosition, line_height: f32, r: AreaRow, origin: f32, space: f32) -> geometry.Rect? {
     if r.line < lo.line || r.line > hi.line {
         return none
     }
@@ -653,7 +714,7 @@ fn area_selection_rect(a: *AreaState, r: AreaRow, origin: f32, space: f32) -> ge
     if right <= left {
         return none
     }
-    geometry.rect(left, r.top, right - left, a.line_height)
+    geometry.rect(left, r.top, right - left, line_height)
 }
 
 fn area_blank(c: u32) -> bool {
@@ -716,6 +777,9 @@ fn paint_text_area(st: *State, mut sc: scene.Scene, e: Element, at: i64, content
     a.line_height = lh
     a.page = area_page_rows(content.height, lh)
     area_settle(a, count)
+    if a.more.len > 0 && span_stop(a.more[a.more.len - 1]).line >= count {
+        area_sync(a, src)
+    }
     area_clamp_scroll(a, count)
     if a.reveal {
         area_reveal_line(a, a.caret.line, count)
@@ -792,11 +856,7 @@ fn paint_text_area(st: *State, mut sc: scene.Scene, e: Element, at: i64, content
             none => {}
         }
         if live && !composing {
-            let band = area_selection_rect(a, r, origin, space)
-            match band {
-                some(rect) => solid(mut sc, rect, faded(selection_color(), own.opacity), scale)
-                none => {}
-            }
+            paint_bands(mut sc, a, r, origin, space, faded(selection_color(), own.opacity), scale)
         }
         for p in r.shaped.pieces {
             let tint = faded(p.color ?? own.color, own.opacity)
@@ -824,6 +884,9 @@ fn paint_text_area(st: *State, mut sc: scene.Scene, e: Element, at: i64, content
                 st.caret = platform.Caret { x: i64(floor(origin + caret_x)), y: i64(floor(r.top)), width: 0, height: i64(floor(lh + 0.999)) }
             }
         }
+    }
+    if live && a.more.len > 0 {
+        paint_more_carets(mut sc, a, rows, origin, ink, scale)
     }
     scene.pop_clip(mut sc)
 }
