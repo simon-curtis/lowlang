@@ -1,0 +1,272 @@
+import std/crypto/fhe/ring
+
+/// The ring of a ring learning-with-errors scheme: the ciphertext primes `q_0..q_L`, one special prime `P` that key switching works over, and the error distribution. BFV and CKKS each build one.
+///
+/// Level `l` of a ciphertext means it has residues for `q_0..q_l`.
+pub struct Context {
+    /// The number of coefficients, a power of two.
+    pub degree: i64
+    /// The ciphertext primes.
+    pub q: *ring.Basis
+    /// The ciphertext primes followed by the special prime.
+    pub full: *ring.Basis
+    /// The standard deviation of the error.
+    pub sigma: f64
+    levels: *ring.Basis[]
+}
+
+/// A secret key: a ternary polynomial `s`.
+pub struct SecretKey {
+    coefficients: i64[]
+    s: ring.Poly
+}
+
+/// A pair of polynomials `(c0, c1)` held as transforms, whose phase `c0 + c1 * s` is small or carries a message.
+pub struct Pair {
+    /// The part that is not multiplied by the secret.
+    pub c0: ring.Poly
+    /// The part multiplied by the secret.
+    pub c1: ring.Poly
+}
+
+/// A key that turns a polynomial multiplied by one secret `s'` into a pair that decrypts under the secret key, the hybrid key switching of Gentry, Halevi and Smart with one special prime and one digit per ciphertext prime.
+///
+/// Digit `i` is `(-a_i * s + e_i + P * g_i * s', a_i)` over `Q * P`, where `g_i` is `1` modulo `q_i` and `0` modulo every other ciphertext prime.
+pub struct SwitchingKey {
+    b: ring.Poly[]
+    a: ring.Poly[]
+}
+
+/// The keys of one instance: the secret, the public key that encrypts and the key that relinearizes a product.
+pub struct Keys {
+    /// The secret key.
+    pub secret: *SecretKey
+    /// The public key.
+    pub public: Pair
+    /// The switching key from `s^2` to `s`.
+    pub relinearization: SwitchingKey
+}
+
+/// The switching keys for a set of Galois elements, each moving a ciphertext under `s(X^g)` back under `s(X)`.
+pub struct GaloisKeys {
+    elements: i64[]
+    keys: SwitchingKey[]
+}
+
+/// Returns the context for the ciphertext primes `q_primes`, the special prime `special` and polynomials of degree `degree`, with errors of standard deviation `sigma`.
+///
+/// The special prime must be at least as large as every ciphertext prime, so the error that key switching adds stays below the error of a fresh encryption. Panics when it is smaller.
+pub fn context(q_primes: u64[], special: u64, degree: i64, sigma: f64) -> *Context {
+    for p in q_primes {
+        if p > special {
+            panic("rlwe.context: the special prime {special} is smaller than {p}")
+        }
+    }
+    let q = ring.basis(q_primes, degree)
+    let p = ring.basis([special], degree)
+    let full = ring.join(q, p)
+    var levels: *ring.Basis[] = []
+    for l in 0..q_primes.len {
+        levels.push(ring.join(ring.slice(q, 0, l + 1), p))
+    }
+    new(Context { degree, q, full, sigma, levels })
+}
+
+/// Returns the highest level, one below the number of ciphertext primes.
+pub fn top(ctx: *Context) -> i64 {
+    ctx.q.moduli.len - 1
+}
+
+fn special_index(ctx: *Context) -> i64 {
+    ctx.q.moduli.len
+}
+
+fn at_level(ctx: *Context, p: ring.Poly, level: i64) -> ring.Poly {
+    var residues: u64[][] = []
+    for i in 0..level + 1 {
+        residues.push(p.residues[i])
+    }
+    residues.push(p.residues[special_index(ctx)])
+    ring.Poly { residues }
+}
+
+/// Returns the transforms of `p`, a polynomial with small signed coefficients, over the primes of `b`.
+pub fn small(b: *ring.Basis, coefficients: i64[]) -> ring.Poly {
+    let p = ring.from_signed(b, coefficients)
+    ring.to_transform(b, p)
+    p
+}
+
+/// Returns a fresh secret key with uniform ternary coefficients drawn from `s`.
+pub fn secret_key(ctx: *Context, s: *ring.Stream) -> *SecretKey {
+    let coefficients = ring.ternary(s, ctx.degree)
+    new(SecretKey { coefficients, s: small(ctx.full, coefficients) })
+}
+
+/// Returns the transforms of the secret over the first `level + 1` ciphertext primes.
+pub fn secret_at(ctx: *Context, sk: *SecretKey, level: i64) -> ring.Poly {
+    ring.Poly { residues: sk.s.residues[..level + 1] }
+}
+
+fn encrypt_zero_under(ctx: *Context, sk: *SecretKey, b: *ring.Basis, s: *ring.Stream) -> Pair {
+    let a = ring.uniform(s, b)
+    let e = small(b, ring.gaussian(s, ctx.degree, ctx.sigma))
+    let secret = ring.Poly { residues: sk.s.residues[..b.moduli.len] }
+    let c0 = ring.sub(b, e, ring.mul(b, a, secret))
+    Pair { c0, c1: a }
+}
+
+/// Returns the public key: an encryption of zero under `sk` over all primes, the special one included.
+pub fn public_key(ctx: *Context, sk: *SecretKey, s: *ring.Stream) -> Pair {
+    encrypt_zero_under(ctx, sk, ctx.full, s)
+}
+
+/// Returns a fresh encryption of zero at the top level under the public key `pk`.
+///
+/// It is `(b * u + e0, a * u + e1)` over all primes, for a ternary `u` and Gaussian errors, divided by the special prime with rounding, as Microsoft SEAL encrypts: the division shrinks the error to the rounding error, about the norm of the secret.
+pub fn encrypt_zero(ctx: *Context, pk: Pair, s: *ring.Stream) -> Pair {
+    let b = ctx.full
+    let u = small(b, ring.ternary(s, ctx.degree))
+    let e0 = small(b, ring.gaussian(s, ctx.degree, ctx.sigma))
+    let e1 = small(b, ring.gaussian(s, ctx.degree, ctx.sigma))
+    let c0 = ring.mul(b, pk.c0, u)
+    ring.add_into(b, c0, e0)
+    let c1 = ring.mul(b, pk.c1, u)
+    ring.add_into(b, c1, e1)
+    Pair { c0: ring.divide_round_last_transform(b, c0), c1: ring.divide_round_last_transform(b, c1) }
+}
+
+/// Returns the switching key from the secret whose transforms over all primes, the special one included, are `target`, to `sk`.
+pub fn switching_key(ctx: *Context, sk: *SecretKey, target: ring.Poly, s: *ring.Stream) -> SwitchingKey {
+    var bs: ring.Poly[] = []
+    var as: ring.Poly[] = []
+    let special = ctx.full.moduli[special_index(ctx)].value
+    for i in 0..ctx.q.moduli.len {
+        let zero = encrypt_zero_under(ctx, sk, ctx.full, s)
+        let m = ctx.q.moduli[i]
+        let factor = ring.reduce(m, special)
+        let factor_shoup = ring.shoup(m, factor)
+        let row = zero.c0.residues[i]
+        let t = target.residues[i]
+        for j in 0..ctx.degree {
+            row[j] = ring.add_mod(m, row[j], ring.mul_shoup(m, t[j], factor, factor_shoup))
+        }
+        bs.push(zero.c0)
+        as.push(zero.c1)
+    }
+    SwitchingKey { b: bs, a: as }
+}
+
+/// Returns the key that relinearizes a product: the switching key from `s^2` to `s`.
+pub fn relinearization_key(ctx: *Context, sk: *SecretKey, s: *ring.Stream) -> SwitchingKey {
+    switching_key(ctx, sk, ring.mul(ctx.full, sk.s, sk.s), s)
+}
+
+/// Returns fresh keys drawn from `s`: a ternary secret, the public key and the relinearization key.
+pub fn generate(ctx: *Context, s: *ring.Stream) -> Keys {
+    let secret = secret_key(ctx, s)
+    Keys { secret, public: public_key(ctx, secret, s), relinearization: relinearization_key(ctx, secret, s) }
+}
+
+/// Returns the Galois keys for rotating the slots by each of `steps` and, when `conjugate` is set, for `X -> X^-1`, each the switching key from `s(X^g)` to `s(X)`.
+pub fn galois_keys(ctx: *Context, sk: *SecretKey, steps: i64[], conjugate: bool, s: *ring.Stream) -> GaloisKeys {
+    var elements: i64[] = []
+    for step in steps {
+        elements.push(rotation_element(ctx.degree, step))
+    }
+    if conjugate {
+        elements.push(conjugation_element(ctx.degree))
+    }
+    var keys: SwitchingKey[] = []
+    for g in elements {
+        let image = ring.automorphism(ctx.full, ring.from_signed(ctx.full, sk.coefficients), g)
+        ring.to_transform(ctx.full, image)
+        keys.push(switching_key(ctx, sk, image, s))
+    }
+    GaloisKeys { elements, keys }
+}
+
+/// Returns the key for the Galois element `g`, or `none` when `keys` has none.
+pub fn galois_key(keys: GaloisKeys, g: i64) -> SwitchingKey? {
+    for i in 0..keys.elements.len {
+        if keys.elements[i] == g {
+            return keys.keys[i]
+        }
+    }
+    none
+}
+
+/// Returns the Galois element `3^step` modulo `2 * degree` that rotates the `degree / 2` slots of a batched or canonically embedded plaintext `step` places left; a negative `step` rotates right.
+pub fn rotation_element(degree: i64, step: i64) -> i64 {
+    let half = degree / 2
+    let m = 2 * degree
+    let k = (step % half + half) % half
+    var g = 1
+    for _ in 0..k {
+        g = g * 3 % m
+    }
+    g
+}
+
+/// Returns the Galois element `2 * degree - 1`, `X -> X^-1`, which swaps the two rows of a BFV batch and conjugates the slots of CKKS.
+pub fn conjugation_element(degree: i64) -> i64 {
+    2 * degree - 1
+}
+
+/// Returns a pair at level `level` whose phase is `d * s' + e` for the coefficients `d` at that level, `key` switching from `s'`, and `e` a small error.
+///
+/// Each residue of `d` is one digit. The digits are lifted to the level's primes and the special prime, multiplied by the key, summed and divided by the special prime with rounding.
+pub fn switch_key(ctx: *Context, key: SwitchingKey, d: ring.Poly, level: i64) -> Pair {
+    let b = ctx.levels[level]
+    let acc0 = ring.zero(b)
+    let acc1 = ring.zero(b)
+    for i in 0..level + 1 {
+        let digit = d.residues[i]
+        let lifted = ring.zero(b)
+        for j in 0..b.moduli.len {
+            let m = b.moduli[j]
+            let r = lifted.residues[j]
+            for c in 0..ctx.degree {
+                r[c] = ring.reduce(m, digit[c])
+            }
+        }
+        ring.to_transform(b, lifted)
+        ring.mul_add_into(b, acc0, lifted, at_level(ctx, key.b[i], level))
+        ring.mul_add_into(b, acc1, lifted, at_level(ctx, key.a[i], level))
+    }
+    Pair { c0: ring.divide_round_last_transform(b, acc0), c1: ring.divide_round_last_transform(b, acc1) }
+}
+
+/// Returns the pair `(c0, c1)` that decrypts as the three transforms `c0 + c1 * s + c2 * s^2` at level `level` do, switching `c2` with the relinearization key.
+pub fn relinearize(ctx: *Context, key: SwitchingKey, c0: ring.Poly, c1: ring.Poly, c2: ring.Poly, level: i64) -> Pair {
+    let d = ring.clone(c2)
+    ring.from_transform(ctx.q, d)
+    let switched = switch_key(ctx, key, d, level)
+    Pair { c0: ring.add(ctx.q, c0, switched.c0), c1: ring.add(ctx.q, c1, switched.c1) }
+}
+
+/// Returns the pair that decrypts under `s` to the image under `X -> X^g` of what the transforms `c` at level `level` decrypt to, `key` being the Galois key for `g`.
+pub fn apply_galois(ctx: *Context, key: SwitchingKey, c: Pair, g: i64, level: i64) -> Pair {
+    let table = ring.automorphism_table(ctx.degree, g)
+    let c0 = ring.permute(ctx.q, c.c0, table)
+    let c1 = ring.permute(ctx.q, c.c1, table)
+    ring.from_transform(ctx.q, c1)
+    let switched = switch_key(ctx, key, c1, level)
+    Pair { c0: ring.add(ctx.q, c0, switched.c0), c1: switched.c1 }
+}
+
+/// Returns the coefficients of the phase `parts[0] + parts[1] * s + parts[2] * s^2 + ...` of a ciphertext whose parts are transforms at one level.
+pub fn phase(ctx: *Context, sk: *SecretKey, parts: ring.Poly[]) -> ring.Poly {
+    let level = parts[0].residues.len - 1
+    let b = ctx.q
+    let s = secret_at(ctx, sk, level)
+    var acc = ring.clone(parts[parts.len - 1])
+    var i = parts.len - 2
+    for i >= 0 {
+        acc = ring.mul(b, acc, s)
+        ring.add_into(b, acc, parts[i])
+        i -= 1
+    }
+    ring.from_transform(b, acc)
+    acc
+}
