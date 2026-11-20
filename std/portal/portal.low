@@ -1,0 +1,157 @@
+import std/cancel
+import std/dbus
+import std/sync
+import std/text
+
+const portal_name = "org.freedesktop.portal.Desktop"
+const portal_path = "/org/freedesktop/portal/desktop"
+const request_interface = "org.freedesktop.portal.Request"
+const request_root = "/org/freedesktop/portal/desktop/request"
+const default_timeout_ms = 25000
+
+struct Tokens {
+    lock: sync.Mutex
+    next: i64
+}
+
+/// A connection to the XDG desktop portal service on the session bus.
+///
+/// Every operation parks the calling green thread until the portal answers, so several may run at once on one `Portal`. A request that waits on the user takes a `*cancel.Token` and stops with `Cancelled` when it is cancelled.
+pub struct Portal {
+    /// The copyable view of the session bus connection.
+    pub handle: *dbus.ConnectionHandle
+    /// The longest a call that does not wait on the user waits for its reply, in milliseconds.
+    pub timeout_ms: i64
+    owned: bool
+    tokens: *Tokens
+    drop {
+        if owned {
+            dbus.shutdown_on(handle)
+        }
+    }
+}
+
+/// How a request that waits on the user ended.
+pub struct Response {
+    /// The portal's response code: `0` when the user acted, `1` when the user closed the dialog and `2` when the request failed for another reason.
+    pub code: i64
+    /// The results of the request, unwrapped from their variants.
+    pub results: [str: dbus.Value]
+}
+
+fn new_tokens() -> *Tokens {
+    new(Tokens { lock: sync.mutex(), next: 0 })
+}
+
+fn connected(timeout_ms: i64) -> Portal ! dbus.Error {
+    using var bus = dbus.connect_session()?
+    Portal { handle: dbus.detach(mut bus), timeout_ms, owned: true, tokens: new_tokens() }
+}
+
+/// Connects to the session bus and returns a `Portal` that owns the connection.
+///
+/// The connection closes when the `Portal` is dropped. Fails as `dbus.connect_session` does.
+pub fn connect() -> Portal ! dbus.Error {
+    connected(default_timeout_ms)?
+}
+
+/// Connects like `connect`, with calls that do not wait on the user giving up after `timeout_ms` milliseconds.
+pub fn connect_within(timeout_ms: i64) -> Portal ! dbus.Error {
+    connected(timeout_ms)?
+}
+
+/// Returns a `Portal` that uses the connection behind `h` and leaves it open when released.
+pub fn over(h: *dbus.ConnectionHandle) -> Portal {
+    Portal { handle: h, timeout_ms: default_timeout_ms, owned: false, tokens: new_tokens() }
+}
+
+/// Returns the object path the portal gives the request that the connection named `sender` made with the handle token `token`.
+///
+/// The sender's leading colon is dropped and each dot becomes an underscore, as the portal specification says.
+pub fn request_path(sender: str, token: str) -> str {
+    let name = text.replace(text.trim_prefix(sender, ":"), ".", "_")
+    "{request_root}/{name}/{token}"
+}
+
+fn next_token(p: Portal) -> str {
+    sync.lock(p.tokens.lock)
+    p.tokens.next += 1
+    let n = p.tokens.next
+    sync.unlock(p.tokens.lock)
+    "low{n}"
+}
+
+struct Waiting {
+    subscription: *dbus.Subscription
+}
+
+fn watch_request(h: *dbus.ConnectionHandle, path: str) -> *dbus.Subscription ! dbus.Error {
+    dbus.subscribe_on(h, dbus.MatchRule { path, interface: request_interface, member: "Response" })?
+}
+
+fn parse_response(m: dbus.Message) -> Response ! dbus.Error {
+    if m.body.len != 2 {
+        fail dbus.Error.Malformed("a Response carries {m.body.len} values, not two")
+    }
+    Response { code: dbus.int_of(m.body[0])?, results: dbus.dict_of(m.body[1])? }
+}
+
+fn close_request(h: *dbus.ConnectionHandle, path: str) {
+    let close = dbus.Message { kind: dbus.MessageType.MethodCall, flags: dbus.no_reply_expected, destination: portal_name, path, interface: request_interface, member: "Close" }
+    dbus.send_on(h, close) or 0
+}
+
+/// Sends the portal method call `ask`, which carries the handle token `token` in its options, and waits for the `Response` signal of the request it starts.
+///
+/// The signal is subscribed to before the call, so a fast portal cannot be missed. When `stop` is cancelled the request is closed with `Request.Close` and the call fails with `Cancelled`. Fails with `Remote` when the portal rejects the call and with `Closed` when the connection closes first.
+pub fn request(p: Portal, ask: dbus.Message, token: str, stop: *cancel.Token?) -> Response ! dbus.Error {
+    let h = p.handle
+    let path = request_path(dbus.unique_name_on(h), token)
+    let waiting = new(Waiting { subscription: watch_request(h, path)? })
+    let response = answer(p, waiting, ask, path, stop) catch {
+        e => {
+            dbus.unsubscribe_on(h, waiting.subscription)
+            fail e
+        }
+    }
+    dbus.unsubscribe_on(h, waiting.subscription)
+    response
+}
+
+fn answer(p: Portal, waiting: *Waiting, ask: dbus.Message, expected: str, stop: *cancel.Token?) -> Response ! dbus.Error {
+    let h = p.handle
+    let reply = dbus.call_with_on(h, ask, dbus.CallOptions { timeout: p.timeout_ms, cancel: stop })?
+    if reply.body.len != 1 {
+        fail dbus.Error.Malformed("the portal returned {reply.body.len} values for a request, not one handle")
+    }
+    let path = dbus.string_of(reply.body[0])?
+    if path != expected {
+        dbus.unsubscribe_on(h, waiting.subscription)
+        waiting.subscription = watch_request(h, path)?
+    }
+    let cancelled = match stop {
+        some(t) => cancel.done(t)
+        none => chan[bool]()
+    }
+    select {
+        m = <-waiting.subscription.signals => {
+            match m {
+                some(signal) => parse_response(signal)?
+                none => fail dbus.Error.Closed
+            }
+        }
+        <-cancelled => {
+            close_request(h, path)
+            fail dbus.Error.Cancelled
+        }
+        <-dbus.subscription_ended(waiting.subscription) => fail dbus.Error.Closed
+    }
+}
+
+fn fresh_token(p: Portal, chosen: str) -> str {
+    if chosen.len > 0 { chosen } else { next_token(p) }
+}
+
+fn refused(r: Response) -> dbus.Error {
+    dbus.Error.Remote("org.freedesktop.portal.Error.Failed", "the request ended with response code {r.code}")
+}
