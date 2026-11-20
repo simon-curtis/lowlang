@@ -1,4 +1,6 @@
+import std/crypto
 import std/crypto/sha3
+import std/io
 
 /// A Falcon parameter set.
 pub enum Level {
@@ -8,17 +10,66 @@ pub enum Level {
     Falcon1024
 }
 
+/// Where the SHAKE256 stream that signing draws its 40-byte nonce and its sampler seeds from comes from.
+pub enum Randomness {
+    /// The stream is seeded with 48 bytes from `crypto.random`, so signing the same message twice gives two signatures.
+    Hedged
+    /// The stream is seeded with the given 48 bytes. Intended for known-answer tests: reusing a seed for two messages reuses the nonce.
+    Given(u8[])
+}
+
 struct Shape {
     log_n: i64
     padded: i64
     bound: i64
+    fg_bits: i64
+    sigma_min: f64
+    inv_sigma: f64
 }
 
 fn shape(level: Level) -> Shape {
     match level {
-        Falcon512 => Shape { log_n: 9, padded: 666, bound: 34034726 }
-        Falcon1024 => Shape { log_n: 10, padded: 1280, bound: 70265242 }
+        Falcon512 => Shape { log_n: 9, padded: 666, bound: 34034726, fg_bits: 6, sigma_min: 1.2778336969128337, inv_sigma: 0.0060336696681577238 }
+        Falcon1024 => Shape { log_n: 10, padded: 1280, bound: 70265242, fg_bits: 5, sigma_min: 1.2982803343442919, inv_sigma: 0.0059386453095331164 }
     }
+}
+
+fn private_len(s: Shape) -> i64 {
+    1 + (2 * s.fg_bits + 8) << s.log_n >> 3
+}
+
+fn decode_private(s: Shape, private: u8[]) -> Basis ! io.Error {
+    if private.len != private_len(s) || private[0] != u8(0x50 + s.log_n) {
+        fail Invalid
+    }
+    let n = 1 << s.log_n
+    let fg_len = s.fg_bits << s.log_n >> 3
+    let f = decode_trim(private, 1, n, s.fg_bits) ?? fail Invalid
+    let g = decode_trim(private, 1 + fg_len, n, s.fg_bits) ?? fail Invalid
+    let big_f = decode_trim(private, 1 + 2 * fg_len, n, 8) ?? fail Invalid
+    let big_g = complete_private(f, g, big_f) ?? fail Invalid
+    Basis { f, g, big_f, big_g }
+}
+
+fn framed(s: Shape, nonce: u8[], body: u8[], length: i64) -> u8[] {
+    let out: u8[] = __make(length)
+    out[0] = u8(0x30 + s.log_n)
+    __memmove(out[1..], nonce)
+    __memmove(out[41..], body)
+    out
+}
+
+fn seeded(randomness: Randomness) -> *sha3.Shake ! io.Error {
+    let seed = match randomness {
+        Hedged => crypto.random(48)
+        Given(bytes) => bytes
+    }
+    if seed.len != 48 {
+        fail Invalid
+    }
+    let rng = sha3.shake256()
+    sha3.absorb(rng, seed)
+    rng
 }
 
 fn hash_to_point(nonce: u8[], message: u8[], n: i64) -> i64[] {
@@ -70,6 +121,46 @@ pub fn public_key_size(level: Level) -> i64 {
 /// Returns the size of a padded signature for `level`: 666 or 1280 bytes.
 pub fn signature_size(level: Level) -> i64 {
     shape(level).padded
+}
+
+/// Returns the size of a private key for `level`: 1281 or 2305 bytes.
+pub fn private_key_size(level: Level) -> i64 {
+    private_len(shape(level))
+}
+
+/// Signs `message` with `private` and returns a padded signature of `signature_size(level)` bytes (round-3 specification, version 1.2).
+///
+/// The private key is the header byte `0x59` or `0x5a` followed by `f` and `g` in 6-bit (Falcon-512) or 5-bit (Falcon-1024) coefficients and `F` in 8-bit coefficients, the encoding of the NIST known-answer files; `G` is recomputed from them. The signature is the header byte `0x39` or `0x3a`, the 40-byte nonce and the compressed `s2`, padded with zero bytes; when the compressed `s2` does not fit, signing samples again with the same nonce, as the reference implementation does. Fails with `Invalid` for a private key of the wrong length or header, a coefficient outside its range, an `f` that is not invertible modulo 12289 or a `G` outside -127..127, and for `Given` randomness that is not 48 bytes.
+///
+/// Signing follows the reference implementation's constant-time discipline: the secret basis enters only native `f64` additions, subtractions, multiplications, divisions and square roots, integer arithmetic without secret branches or secret table indices, and modular arithmetic by the constant 12289, which compiles to multiplications. The base sampler compares every row of its table, and the rejection steps branch only on uniformly random bytes. Division and square root on `f64` take data-dependent time on some older x86 processors, as in the reference implementation.
+pub fn sign(level: Level, private: u8[], message: u8[], randomness: Randomness) -> u8[] ! io.Error {
+    let s = shape(level)
+    let key = decode_private(s, private)?
+    let rng = seeded(randomness)?
+    let nonce = sha3.squeeze(rng, 40)
+    let hm = hash_to_point(nonce, message, 1 << s.log_n)
+    for true {
+        let body = encode_compressed(sign_vector(s, key, hm, rng)) ?? continue
+        if 41 + body.len <= s.padded {
+            return framed(s, nonce, body, s.padded)
+        }
+    }
+    []
+}
+
+/// Signs `message` with `private` as the NIST round-3 API does and returns the signature at its natural length.
+///
+/// The nonce is the 40 bytes of `nonce` and the sampler is seeded from SHAKE256 of the 48 bytes of `seed`, the two values the known-answer harness draws from its generator, in that order, after the 48 bytes of the key-generation seed. The result is the header byte `0x39` or `0x3a`, the nonce and the compressed `s2`, which `verify` accepts as it is; the NIST wrapper writes the same compressed `s2` after the header byte `0x29` or `0x2a`. Intended for known-answer tests; use `sign` otherwise. Fails with `Invalid` for the private keys `sign` rejects, a nonce that is not 40 bytes, a seed that is not 48 bytes and an `s2` with a coefficient beyond 2047, which the compressed encoding cannot hold and for which the reference implementation fails too.
+pub fn sign_internal(level: Level, private: u8[], message: u8[], nonce: u8[], seed: u8[]) -> u8[] ! io.Error {
+    let s = shape(level)
+    let key = decode_private(s, private)?
+    if nonce.len != 40 {
+        fail Invalid
+    }
+    let rng = seeded(Given(seed))?
+    let hm = hash_to_point(nonce, message, 1 << s.log_n)
+    let body = encode_compressed(sign_vector(s, key, hm, rng)) ?? fail Invalid
+    framed(s, nonce, body, 41 + body.len)
 }
 
 /// Returns whether `signature` is a valid Falcon signature of `message` under `public` (round-3 specification, version 1.2).
