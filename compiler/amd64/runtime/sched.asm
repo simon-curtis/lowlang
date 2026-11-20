@@ -893,22 +893,7 @@ rt_wakep_locked:
 	pop rbx
 	ret
 1:
-	xor ecx, ecx
-	xor edx, edx
-2:
-	cmp rcx, [rip+rt_nm]
-	jae 3f
-	lea rax, [rip+rt_allm]
-	mov rax, [rax+8*rcx]
-	mov rax, [rax+M_STATE]
-	and eax, 7
-	cmp eax, INC
-	je 4f
-	inc rdx
-4:
-	inc rcx
-	jmp 2b
-3:
+	call rt_m_awake
 	cmp rdx, [rip+rt_ncpu]
 	jae 5f
 	cmp qword ptr [rip+rt_nm], MAXM
@@ -924,6 +909,25 @@ rt_wakep_locked:
 	call rt_poll_wake
 6:
 	pop rbx
+	ret
+
+rt_m_awake:
+	xor ecx, ecx
+	xor edx, edx
+1:
+	cmp rcx, [rip+rt_nm]
+	jae 3f
+	lea rax, [rip+rt_allm]
+	mov rax, [rax+8*rcx]
+	mov rax, [rax+M_STATE]
+	and eax, 7
+	cmp eax, INC
+	je 2f
+	inc rdx
+2:
+	inc rcx
+	jmp 1b
+3:
 	ret
 
 rt_tcb_init:
