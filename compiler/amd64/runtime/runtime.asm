@@ -1504,6 +1504,7 @@ rt_gc:
 	call rt_world_start
 	mov edi, TICK_RESUMED
 	call rt_gc_stamp
+	call rt_gcw_recruit
 	inc qword ptr [rip+rt_gc_count]
 	cmp byte ptr [rip+rt_gc_trace], 0
 	je 12f
@@ -1551,6 +1552,33 @@ rt_gcw_start_mark:
 	mov edi, GCW_MARK
 	call rt_gcw_publish
 2:
+	ret
+
+rt_gcw_recruit:
+	cmp qword ptr [rip+rt_live_words], PAR_MIN
+	jb 3f
+	mov rax, [rip+rt_ncpu]
+	cmp rax, 1
+	jbe 3f
+	push rbx
+	mov ebx, MAXW
+	cmp rbx, rax
+	cmova rbx, rax
+1:
+	lea rdi, [rip+rt_sched_lock]
+	call rt_spin_lock
+	call rt_m_awake
+	cmp rdx, rbx
+	jae 2f
+	cmp rcx, MAXM
+	jae 2f
+	call rt_newm
+	jmp 1b
+2:
+	lea rdi, [rip+rt_sched_lock]
+	call rt_spin_unlock
+	pop rbx
+3:
 	ret
 
 rt_gcw_publish:
