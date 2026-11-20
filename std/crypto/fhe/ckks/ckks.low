@@ -1,0 +1,210 @@
+import std/big
+import std/crypto/fhe/ring
+import std/crypto/fhe/rlwe
+
+/// The parameters of a CKKS instance.
+pub struct Parameters {
+    /// The number of coefficients, a power of two from 1024 to 32768; there are half as many slots.
+    pub degree: i64
+    /// The bit size of the default scale `2^scale_bits` that `encode` multiplies values by, below the first prime size.
+    pub scale_bits: i64
+    /// The bit size of each ciphertext prime, at most 60. The first holds the result at the lowest level; each later one is divided out by one `rescale` and is usually `scale_bits` long.
+    pub prime_bits: i64[]
+    /// The bit size of the special prime that key switching works over, at least the largest ciphertext prime size.
+    pub special_bits: i64
+    /// The security level the product of all primes must meet.
+    pub security: rlwe.Security
+}
+
+/// The error type of the `ckks` functions.
+pub enum Error {
+    /// The degree is not a power of two the security standard lists.
+    Degree
+    /// A prime size is outside 20 to 60 bits, or the special prime is smaller than a ciphertext prime.
+    PrimeSize
+    /// The primes have `bits` bits together, more than the `limit` the security level allows.
+    ModulusTooLarge(bits: i64, limit: i64)
+    /// The default scale is not below the first prime.
+    Scale
+    /// More values than slots were given.
+    TooManyValues
+    /// A scaled value does not fit below the primes of the level it is encoded at.
+    ValueTooLarge
+    /// The scale of a product would not fit below the primes of its level.
+    ScaleOutOfBounds
+    /// The operands have different scales.
+    ScaleMismatch
+    /// The ciphertext is at the lowest level and cannot be rescaled.
+    LowestLevel
+    /// The operands are at different levels or have the wrong number of parts.
+    Mismatch
+    /// The Galois keys have no key for the rotation asked for.
+    MissingGaloisKey
+}
+
+/// A plaintext: the transforms of an encoded polynomial at one level, and the scale its values were multiplied by.
+pub struct Plaintext {
+    /// The transforms, with residues for the primes of its level.
+    pub poly: ring.Poly
+    /// The scale.
+    pub scale: f64
+}
+
+/// A ciphertext: two parts, or three before relinearization, held as transforms at one level, and the scale of the values it encrypts.
+pub struct Ciphertext {
+    /// The parts, each with residues for the primes of its level.
+    pub parts: ring.Poly[]
+    /// The scale.
+    pub scale: f64
+}
+
+/// A CKKS instance built from `Parameters`: the primes, the encoder and the basis of every level.
+pub struct Context {
+    /// The parameters it was built from.
+    pub parameters: Parameters
+    /// The ring and key-switching context it shares with the other schemes.
+    pub rlwe: *rlwe.Context
+    encoder: *Encoder
+    levels: *ring.Basis[]
+}
+
+const sigma = 3.19
+const ln2 = 0.6931471805599453
+
+/// Returns the default parameters: degree 8192, scale `2^40`, ciphertext primes of 60, 40 and 40 bits and a 60-bit special prime, 200 bits in all, below the limit of 218 for 128-bit security. They are the parameters of Microsoft SEAL's `ckks_basics` example and allow two rescaled products.
+pub fn default_parameters() -> Parameters {
+    Parameters { degree: 8192, scale_bits: 40, prime_bits: [60, 40, 40], special_bits: 60, security: Classical128 }
+}
+
+fn validate(p: Parameters) ! Error {
+    let limit = rlwe.max_modulus_bits(p.degree, p.security)
+    if limit == 0 {
+        fail Error.Degree
+    }
+    if p.prime_bits.len == 0 || p.special_bits > 60 {
+        fail Error.PrimeSize
+    }
+    var total = p.special_bits
+    for size in p.prime_bits {
+        if size < 20 || size > 60 || size > p.special_bits {
+            fail Error.PrimeSize
+        }
+        total += size
+    }
+    if total > limit {
+        fail Error.ModulusTooLarge(total, limit)
+    }
+    if p.scale_bits < 1 || p.scale_bits >= p.prime_bits[0] {
+        fail Error.Scale
+    }
+}
+
+/// Returns the instance for `p`, or the error that says why the parameters are not allowed.
+pub fn context(p: Parameters) -> *Context ! Error {
+    validate(p)?
+    var all_bits = p.prime_bits
+    all_bits.push(p.special_bits)
+    let primes = rlwe.chain_primes(all_bits, p.degree)
+    let r = rlwe.context(primes[..p.prime_bits.len], primes[p.prime_bits.len], p.degree, sigma)
+    var levels: *ring.Basis[] = []
+    for l in 0..p.prime_bits.len {
+        levels.push(ring.slice(r.q, 0, l + 1))
+    }
+    new(Context { parameters: p, rlwe: r, encoder: encoder(p.degree), levels })
+}
+
+/// Returns fresh keys drawn from `s`: a ternary secret, the public key and the relinearization key.
+pub fn generate(ctx: *Context, s: *ring.Stream) -> rlwe.Keys {
+    rlwe.generate(ctx.rlwe, s)
+}
+
+/// Returns the Galois keys for rotating the slots by each of `steps` and, when `conjugate` is set, for conjugating them.
+pub fn galois_keys(ctx: *Context, secret: *rlwe.SecretKey, steps: i64[], conjugate: bool, s: *ring.Stream) -> rlwe.GaloisKeys {
+    rlwe.galois_keys(ctx.rlwe, secret, steps, conjugate, s)
+}
+
+/// Returns the number of slots, half the degree.
+pub fn slot_count(ctx: *Context) -> i64 {
+    ctx.parameters.degree / 2
+}
+
+/// Returns the highest level, one below the number of ciphertext primes.
+pub fn top(ctx: *Context) -> i64 {
+    rlwe.top(ctx.rlwe)
+}
+
+/// Returns the plaintext of `values` at the top level and the default scale, the rest of the slots zero.
+pub fn encode(ctx: *Context, values: Complex[]) -> Plaintext ! Error {
+    encode_at(ctx, values, default_scale(ctx), top(ctx))
+}
+
+/// Returns the default scale, `2^scale_bits`.
+pub fn default_scale(ctx: *Context) -> f64 {
+    f64(u64(1) << u64(ctx.parameters.scale_bits))
+}
+
+/// Returns the plaintext of `values` at level `level`, each multiplied by `scale`.
+///
+/// The polynomial is the inverse of the canonical embedding: slot `i` is its value at `zeta^(3^i)`, with `zeta = exp(i * pi / N)`, and the remaining roots carry the conjugates, so its coefficients are real and are rounded to integers. The slot order is that of Microsoft SEAL's `CKKSEncoder`, so the same values and scale give the same plaintext, and the scaled coefficients must stay below `2^62` and a quarter of the level's modulus.
+pub fn encode_at(ctx: *Context, values: Complex[], scale: f64, level: i64) -> Plaintext ! Error {
+    if level < 0 || level > top(ctx) {
+        fail Error.Mismatch
+    }
+    let b = ctx.levels[level]
+    let room = ring.bit_count(b) - 2
+    let limit = f64(u64(1) << u64(if room < 62 { room } else { 62 }))
+    let poly = ring.from_signed(b, coefficients_of(ctx.encoder, values, scale, limit)?)
+    ring.to_transform(b, poly)
+    Plaintext { poly, scale }
+}
+
+/// Returns the values in the slots of `p`: its coefficients, centred modulo the primes of its level and divided by its scale, through the canonical embedding.
+pub fn decode(ctx: *Context, p: Plaintext) -> Complex[] {
+    let b = ctx.levels[p.poly.residues.len - 1]
+    let coefficients = ring.clone(p.poly)
+    ring.from_transform(b, coefficients)
+    var scaled_down: f64[] = []
+    for v in ring.compose(b, coefficients) {
+        scaled_down.push(big.to_f64(v) / p.scale)
+    }
+    values_of(ctx.encoder, scaled_down)
+}
+
+/// Returns a fresh encryption of `p` under the public key, at the level of `p`.
+pub fn encrypt(ctx: *Context, public: rlwe.Pair, p: Plaintext, s: *ring.Stream) -> Ciphertext {
+    let zero = rlwe.encrypt_zero(ctx.rlwe, public, s)
+    let count = p.poly.residues.len
+    let c0 = ring.Poly { residues: zero.c0.residues[..count] }
+    let c1 = ring.Poly { residues: zero.c1.residues[..count] }
+    ring.add_into(ctx.levels[count - 1], c0, p.poly)
+    Ciphertext { parts: [c0, c1], scale: p.scale }
+}
+
+/// Returns the level of `c`: one below its number of primes.
+pub fn level(c: Ciphertext) -> i64 {
+    c.parts[0].residues.len - 1
+}
+
+/// Returns the plaintext `c` decrypts to under `secret`: the phase `c0 + c1 * s + ...`, which is the encoded values plus a small error, at the scale of `c`.
+pub fn decrypt(ctx: *Context, secret: *rlwe.SecretKey, c: Ciphertext) -> Plaintext {
+    let poly = rlwe.phase(ctx.rlwe, secret, c.parts)
+    ring.to_transform(ctx.levels[level(c)], poly)
+    Plaintext { poly, scale: c.scale }
+}
+
+/// Returns how many bits of `got` agree with `want`: `-log2` of the largest distance between `want[i]` and `got[i]`, at most 64. `got` must have at least as many values as `want`.
+pub fn precision(want: Complex[], got: Complex[]) -> f64 {
+    var largest = 0.0
+    for i in 0..want.len {
+        let d = minus(want[i], got[i])
+        let distance = sqrt(d.re * d.re + d.im * d.im)
+        if distance > largest {
+            largest = distance
+        }
+    }
+    let floor_error = 1.0 / 18446744073709551616.0
+    if largest <= floor_error {
+        return 64.0
+    }
+    -ring.ln(largest) / ln2
+}

@@ -1,0 +1,155 @@
+import std/crypto/fhe/ring
+import std/crypto/fhe/rlwe
+
+fn same_scale(a: f64, b: f64) -> bool {
+    let d = if a > b { a - b } else { b - a }
+    d <= a / 1099511627776.0
+}
+
+fn same_shape(a: Ciphertext, b: Ciphertext) ! Error {
+    if a.parts.len != b.parts.len || level(a) != level(b) {
+        fail Error.Mismatch
+    }
+    if !same_scale(a.scale, b.scale) {
+        fail Error.ScaleMismatch
+    }
+}
+
+fn plain_fits(a: Ciphertext, p: Plaintext) ! Error {
+    if p.poly.residues.len != level(a) + 1 {
+        fail Error.Mismatch
+    }
+}
+
+fn product_scale(ctx: *Context, level_now: i64, a: f64, b: f64) -> f64 ! Error {
+    let scale = a * b
+    if ring.ln(scale) / ln2 + 1.0 >= f64(ring.bit_count(ctx.levels[level_now])) {
+        fail Error.ScaleOutOfBounds
+    }
+    scale
+}
+
+/// Returns an encryption of the sums of the slots of `a` and `b`, which must be at one level, with one scale and the same number of parts.
+pub fn add(ctx: *Context, a: Ciphertext, b: Ciphertext) -> Ciphertext ! Error {
+    same_shape(a, b)?
+    var parts: ring.Poly[] = []
+    for i in 0..a.parts.len {
+        parts.push(ring.add(ctx.rlwe.q, a.parts[i], b.parts[i]))
+    }
+    Ciphertext { parts, scale: a.scale }
+}
+
+/// Returns an encryption of the differences of the slots of `a` and `b`, which must be at one level, with one scale and the same number of parts.
+pub fn sub(ctx: *Context, a: Ciphertext, b: Ciphertext) -> Ciphertext ! Error {
+    same_shape(a, b)?
+    var parts: ring.Poly[] = []
+    for i in 0..a.parts.len {
+        parts.push(ring.sub(ctx.rlwe.q, a.parts[i], b.parts[i]))
+    }
+    Ciphertext { parts, scale: a.scale }
+}
+
+/// Returns an encryption of the negated slots of `a`.
+pub fn negate(ctx: *Context, a: Ciphertext) -> Ciphertext {
+    var parts: ring.Poly[] = []
+    for p in a.parts {
+        parts.push(ring.negate(ctx.rlwe.q, p))
+    }
+    Ciphertext { parts, scale: a.scale }
+}
+
+/// Returns an encryption of the slots of `a` plus those of `p`, which must be at the level and scale of `a`.
+pub fn add_plain(ctx: *Context, a: Ciphertext, p: Plaintext) -> Ciphertext ! Error {
+    plain_fits(a, p)?
+    if !same_scale(a.scale, p.scale) {
+        fail Error.ScaleMismatch
+    }
+    var parts: ring.Poly[] = [ring.add(ctx.rlwe.q, a.parts[0], p.poly)]
+    for i in 1..a.parts.len {
+        parts.push(a.parts[i])
+    }
+    Ciphertext { parts, scale: a.scale }
+}
+
+/// Returns an encryption of the slots of `a` times those of `p`, which must be at the level of `a`, at the product of their scales.
+pub fn multiply_plain(ctx: *Context, a: Ciphertext, p: Plaintext) -> Ciphertext ! Error {
+    plain_fits(a, p)?
+    let scale = product_scale(ctx, level(a), a.scale, p.scale)?
+    var parts: ring.Poly[] = []
+    for part in a.parts {
+        parts.push(ring.mul(ctx.rlwe.q, part, p.poly))
+    }
+    Ciphertext { parts, scale }
+}
+
+/// Returns an encryption of the products of the slots of `a` and `b`, two ciphertexts of two parts at one level, as three parts that decrypt under `1, s, s^2`, at the product of their scales.
+///
+/// The tensor product is taken on the transforms over the primes of the level; `relinearize` brings the result back to two parts and `rescale` divides the scale back down.
+pub fn multiply(ctx: *Context, a: Ciphertext, b: Ciphertext) -> Ciphertext ! Error {
+    if a.parts.len != 2 || b.parts.len != 2 || level(a) != level(b) {
+        fail Error.Mismatch
+    }
+    let scale = product_scale(ctx, level(a), a.scale, b.scale)?
+    let q = ctx.rlwe.q
+    let d1 = ring.mul(q, a.parts[0], b.parts[1])
+    ring.mul_add_into(q, d1, a.parts[1], b.parts[0])
+    Ciphertext { parts: [ring.mul(q, a.parts[0], b.parts[0]), d1, ring.mul(q, a.parts[1], b.parts[1])], scale }
+}
+
+/// Returns `c`, a ciphertext of three parts, as two parts that decrypt to the same values, using the relinearization key.
+pub fn relinearize(ctx: *Context, key: rlwe.SwitchingKey, c: Ciphertext) -> Ciphertext ! Error {
+    if c.parts.len != 3 {
+        fail Error.Mismatch
+    }
+    let pair = rlwe.relinearize(ctx.rlwe, key, c.parts[0], c.parts[1], c.parts[2], level(c))
+    Ciphertext { parts: [pair.c0, pair.c1], scale: c.scale }
+}
+
+/// Returns `multiply`, `relinearize` and `rescale` in turn: the product at the next level down, at about the scale of the operands when the primes are about that scale.
+pub fn multiply_rescale(ctx: *Context, key: rlwe.SwitchingKey, a: Ciphertext, b: Ciphertext) -> Ciphertext ! Error {
+    rescale(ctx, relinearize(ctx, key, multiply(ctx, a, b)?)?)
+}
+
+/// Returns `c` at the next level down, each part divided by the last prime `q` with rounding and the scale divided by `q`, which removes the extra scale a product carries along with most of its error.
+pub fn rescale(ctx: *Context, c: Ciphertext) -> Ciphertext ! Error {
+    if level(c) == 0 {
+        fail Error.LowestLevel
+    }
+    let last = ctx.rlwe.q.moduli[level(c)].value
+    var parts: ring.Poly[] = []
+    for p in c.parts {
+        parts.push(ring.divide_round_last_transform(ctx.rlwe.q, p))
+    }
+    Ciphertext { parts, scale: c.scale / f64(last) }
+}
+
+/// Returns `c` at the lower level `target` with its scale unchanged, by dropping the residues of the primes above it, so it can meet a ciphertext that has been rescaled.
+pub fn drop_to(c: Ciphertext, target: i64) -> Ciphertext ! Error {
+    if target < 0 || target > level(c) {
+        fail Error.Mismatch
+    }
+    var parts: ring.Poly[] = []
+    for p in c.parts {
+        parts.push(ring.Poly { residues: p.residues[..target + 1] })
+    }
+    Ciphertext { parts, scale: c.scale }
+}
+
+fn apply_galois(ctx: *Context, keys: rlwe.GaloisKeys, c: Ciphertext, g: i64) -> Ciphertext ! Error {
+    if c.parts.len != 2 {
+        fail Error.Mismatch
+    }
+    let key = rlwe.galois_key(keys, g) ?? fail Error.MissingGaloisKey
+    let pair = rlwe.apply_galois(ctx.rlwe, key, rlwe.Pair { c0: c.parts[0], c1: c.parts[1] }, g, level(c))
+    Ciphertext { parts: [pair.c0, pair.c1], scale: c.scale }
+}
+
+/// Returns `c` with its slots rotated `steps` places left, or right for a negative `steps`: slot `i` of the result holds slot `i + steps` of `c`. The Galois keys must include `steps`.
+pub fn rotate(ctx: *Context, keys: rlwe.GaloisKeys, c: Ciphertext, steps: i64) -> Ciphertext ! Error {
+    apply_galois(ctx, keys, c, rlwe.rotation_element(ctx.parameters.degree, steps))
+}
+
+/// Returns `c` with every slot replaced by its complex conjugate. The Galois keys must have been made with `conjugate`.
+pub fn conjugate(ctx: *Context, keys: rlwe.GaloisKeys, c: Ciphertext) -> Ciphertext ! Error {
+    apply_galois(ctx, keys, c, rlwe.conjugation_element(ctx.parameters.degree))
+}
