@@ -1,0 +1,364 @@
+/// A value computed from signals and other memos, which keeps its last result until something it read changes.
+///
+/// A memo is a handle: copies share it. Reading it with `read` brings it up to date first, and a reader that is itself tracked, an effect, a memo or a tracked frame, depends on the memo rather than on what the memo read. When a memo computes a value equal to the one it holds, nothing that read it runs again.
+pub struct Memo[T: Eq] {
+    cell: *MemoCell[T]
+}
+
+struct MemoCell[T: Eq] {
+    value: T
+    node: *Node
+}
+
+/// An effect: a function that runs once when made and again each time a signal or memo it read changes.
+///
+/// An effect is a handle: copies share it. It belongs to its owner, the effect, memo or frame that was running when it was made, or else the window of the context it was made with; it ends when its owner runs again or ends, when its window closes, or when `dispose` ends it.
+pub struct Effect {
+    node: *Node
+}
+
+enum Mark {
+    Clean = 0
+    Check = 1
+    Dirty = 2
+}
+
+struct Node {
+    graph: *Graph
+    run: fn()
+    notify: fn()
+    sources: *Node[] = []
+    observers: *Node[] = []
+    owned: *Node[] = []
+    cleanups: fn()[] = []
+    owner: *Node? = none
+    depth: i64 = 0
+    serial: i64 = 0
+    mark: Mark = Mark.Clean
+    eager: bool = false
+    queued: bool = false
+    changed: bool = false
+    disposed: bool = false
+}
+
+struct Graph {
+    observer: *Node? = none
+    owner: *Node? = none
+    queue: *Node[] = []
+    made: i64 = 0
+    batches: i64 = 0
+    flushing: bool = false
+}
+
+fn new_graph() -> *Graph {
+    new(Graph {})
+}
+
+fn new_node(g: *Graph) -> *Node {
+    new(Node { graph: g, run: no_run, notify: no_run })
+}
+
+fn owned_node(g: *Graph, fallback: *Node) -> *Node {
+    let owner = g.owner ?? fallback
+    g.made += 1
+    let n = new(Node { graph: g, run: no_run, notify: no_run, owner: some(owner), depth: owner.depth + 1, serial: g.made })
+    owner.owned.push(n)
+    n
+}
+
+fn track(n: *Node) {
+    let o = n.graph.observer ?? return
+    if o.disposed {
+        return
+    }
+    for s in o.sources {
+        if s == n {
+            return
+        }
+    }
+    o.sources.push(n)
+    n.observers.push(o)
+}
+
+fn changed_source(n: *Node) {
+    for o in n.observers {
+        stale(o, Mark.Dirty)
+    }
+    flush(n.graph)
+}
+
+fn stale(n: *Node, mark: Mark) {
+    if n.mark.index >= mark.index || n.disposed {
+        return
+    }
+    let was_clean = n.mark == Mark.Clean
+    n.mark = mark
+    if was_clean {
+        if n.eager && !n.queued {
+            n.queued = true
+            n.graph.queue.push(n)
+        }
+        for o in n.observers {
+            stale(o, Mark.Check)
+        }
+    }
+}
+
+fn up_to_date(n: *Node) {
+    if n.disposed {
+        return
+    }
+    if n.mark == Mark.Check {
+        for s in n.sources {
+            up_to_date(s)
+            if n.mark == Mark.Dirty {
+                break
+            }
+        }
+    }
+    if n.mark == Mark.Dirty {
+        rerun(n)
+    }
+    n.mark = Mark.Clean
+}
+
+fn rerun(n: *Node) {
+    reset_node(n)
+    let g = n.graph
+    let observer = g.observer
+    let owner = g.owner
+    g.observer = some(n)
+    g.owner = some(n)
+    n.changed = false
+    n.run()
+    g.observer = observer
+    g.owner = owner
+    n.mark = Mark.Clean
+    if n.changed {
+        for o in n.observers {
+            o.mark = Mark.Dirty
+        }
+    }
+}
+
+fn reset_node(n: *Node) {
+    let owned = n.owned
+    n.owned = []
+    for c in owned {
+        end_node(c)
+    }
+    let cleanups = n.cleanups
+    n.cleanups = []
+    for f in cleanups {
+        f()
+    }
+    for s in n.sources {
+        s.observers = without_node(s.observers, n)
+    }
+    n.sources = []
+}
+
+fn without_node(nodes: *Node[], n: *Node) -> *Node[] {
+    var kept: *Node[] = []
+    for other in nodes {
+        if other != n {
+            kept.push(other)
+        }
+    }
+    kept
+}
+
+fn end_node(n: *Node) {
+    if n.disposed {
+        return
+    }
+    n.disposed = true
+    n.mark = Mark.Clean
+    reset_node(n)
+    n.observers = []
+    match n.owner {
+        some(owner) => {
+            owner.owned = without_node(owner.owned, n)
+        }
+        none => {}
+    }
+}
+
+fn flush(g: *Graph) {
+    if g.flushing || g.batches > 0 {
+        return
+    }
+    g.flushing = true
+    for g.queue.len > 0 {
+        let n = take_shallowest(g)
+        n.queued = false
+        if !n.disposed {
+            settle_eager(n)
+        }
+    }
+    g.flushing = false
+}
+
+fn take_shallowest(g: *Graph) -> *Node {
+    var best = 0
+    for i, n in g.queue {
+        if runs_before(n, g.queue[best]) {
+            best = i
+        }
+    }
+    let n = g.queue[best]
+    var rest: *Node[] = []
+    for i, other in g.queue {
+        if i != best {
+            rest.push(other)
+        }
+    }
+    g.queue = rest
+    n
+}
+
+fn runs_before(a: *Node, b: *Node) -> bool {
+    a.depth < b.depth || a.depth == b.depth && a.serial < b.serial
+}
+
+fn settle_eager(n: *Node) {
+    if n.mark == Mark.Check {
+        for s in n.sources {
+            up_to_date(s)
+            if n.mark == Mark.Dirty {
+                break
+            }
+        }
+    }
+    if n.mark != Mark.Dirty {
+        n.mark = Mark.Clean
+        return
+    }
+    n.notify()
+}
+
+/// Returns a memo of `f`, computed now and again whenever a signal or memo it read changes and the memo is read. It belongs to its owner as an `Effect` does, and once its owner ends it keeps its last value.
+pub fn memo[T: Eq](cx: Context, f: fn() -> T) -> Memo[T] {
+    let n = owned_node(cx.state.shared.graph, cx.state.root)
+    let cell = new(MemoCell { value: within(n, f), node: n })
+    n.run = fn() {
+        let next = f()
+        if next != cell.value {
+            cell.value = next
+            n.changed = true
+        }
+    }
+    Memo { cell }
+}
+
+fn within[T](n: *Node, f: fn() -> T) -> T {
+    let g = n.graph
+    let observer = g.observer
+    let owner = g.owner
+    g.observer = some(n)
+    g.owner = some(n)
+    let v = f()
+    g.observer = observer
+    g.owner = owner
+    v
+}
+
+fn run_untracked[T](g: *Graph, f: fn() -> T) -> T {
+    let observer = g.observer
+    g.observer = none
+    let v = f()
+    g.observer = observer
+    v
+}
+
+/// Returns the value of `m`, computing it first when something it read has changed, and makes the running effect, memo or tracked frame depend on `m`.
+pub fn read[T: Eq](m: Memo[T]) -> T {
+    let n = m.cell.node
+    if !n.disposed {
+        up_to_date(n)
+        track(n)
+    }
+    m.cell.value
+}
+
+/// Runs `f` now, and again each time a signal or memo it read changes, after every memo it reads is up to date. Effects made inside `f` and the cleanups `on_cleanup` registers end before each new run. Effects that one change makes due run after it, outer effects before the effects they made, and otherwise in the order they were made.
+pub fn effect(cx: Context, f: fn()) -> Effect {
+    let g = cx.state.shared.graph
+    let n = owned_node(g, cx.state.root)
+    n.eager = true
+    n.run = f
+    n.notify = fn() { rerun(n) }
+    batched(g, fn() { rerun(n) })
+    Effect { node: n }
+}
+
+/// Ends `e`: it does not run again, the effects it made end, and its cleanups run. Ending an effect that has ended does nothing.
+pub fn dispose(e: Effect) {
+    end_node(e.node)
+}
+
+/// Runs `f` before the running effect or memo runs again or ends. Outside any, it runs `f` when the window of `cx` closes.
+pub fn on_cleanup(cx: Context, f: fn()) {
+    let g = cx.state.shared.graph
+    let n = g.owner ?? cx.state.root
+    n.cleanups.push(f)
+}
+
+/// Returns what `f` returns, without making the running effect, memo or tracked frame depend on what `f` reads.
+pub fn untracked[T](cx: Context, f: fn() -> T) -> T {
+    run_untracked(cx.state.shared.graph, f)
+}
+
+/// Runs `f`, and the effects that its changes make due once it returns, so an effect that reads two signals `f` sets runs once.
+pub fn batch(cx: Context, f: fn()) {
+    batched(cx.state.shared.graph, f)
+}
+
+fn batched(g: *Graph, f: fn()) {
+    g.batches += 1
+    f()
+    g.batches -= 1
+    flush(g)
+}
+
+/// Makes a frame of the window of `cx` due only when a signal or memo the last frame read has changed, or the window's own state has: its size, the pointer, the focus, a scroll, a timer, an animation or a call that changes every window, such as `set_menu_style`. A signal the window did not read and a posted closure that sets no signal it read leave its frames not due. With `false`, the default, every change to any signal and every posted closure makes a frame due in every window, so state kept outside signals is drawn as well.
+pub fn set_tracked_frames(cx: Context, tracked: bool) {
+    cx.state.tracked = tracked
+    cx.state.dirty = true
+}
+
+fn begin_frame(st: *State) -> FrameScope {
+    let g = st.shared.graph
+    let n = st.frame_node
+    reset_node(n)
+    n.mark = Mark.Clean
+    let scope = FrameScope { observer: g.observer, owner: g.owner }
+    g.observer = some(n)
+    g.owner = some(n)
+    scope
+}
+
+struct FrameScope {
+    observer: *Node?
+    owner: *Node?
+}
+
+fn end_frame(st: *State, scope: FrameScope) {
+    let g = st.shared.graph
+    g.observer = scope.observer
+    g.owner = scope.owner
+}
+
+fn frame_node_for(st: *State) -> *Node {
+    let n = new(Node { graph: st.shared.graph, run: no_run, notify: no_run, owner: some(st.root), depth: 1, eager: true })
+    n.notify = fn() {
+        n.mark = Mark.Clean
+        st.dirty = true
+    }
+    n
+}
+
+fn close_reactive(st: *State) {
+    end_node(st.frame_node)
+    end_node(st.root)
+}
