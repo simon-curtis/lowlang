@@ -1,0 +1,213 @@
+import std/file
+import std/process
+import std/slices
+import std/testing
+import strs = std/text
+import std/ui/font
+
+struct Tree {
+    root: str
+    env: Environment
+}
+
+fn conf(body: str) -> str {
+    "<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n<fontconfig>\n{body}\n</fontconfig>\n"
+}
+
+fn write(path: str, text: str) {
+    let dir = path[..strs.last_index(path, "/")]
+    file.mkdir_all(dir) or panic("mkdir {dir}")
+    file.write_text(path, text) or panic("write {path}")
+}
+
+fn tree(t: *testing.T, name: str) -> Tree {
+    let root = file.temp_dir("fontconfig-{name}") or panic("temp dir")
+    let env = Environment {
+        config_file: "{root}/etc/fonts.conf"
+        home: "{root}/home"
+        config_home: "{root}/home/.config"
+        data_home: "{root}/home/.local/share"
+        data_dirs: ["{root}/share"]
+        cache_home: "{root}/home/.cache"
+        working_dir: "{root}/work"
+    }
+    Tree { root, env }
+}
+
+fn test_config_follows_includes_in_order(t: *testing.T) {
+    let tr = tree(t, "includes")
+    let r = tr.root
+    write("{r}/etc/fonts.conf", conf("<dir>/usr/share/fonts-a</dir>\n<include ignore_missing=\"yes\">conf.d</include>\n<include ignore_missing=\"yes\" prefix=\"xdg\">fontconfig/fonts.conf</include>\n<include ignore_missing=\"yes\">missing.conf</include>\n<alias><family>sans-serif</family><prefer><family>Main</family></prefer></alias>"))
+    write("{r}/etc/conf.d/20-second.conf", conf("<alias><family>sans-serif</family><prefer><family>Twenty</family></prefer></alias>"))
+    write("{r}/etc/conf.d/10-first.conf", conf("<alias><family>sans-serif</family><prefer><family>Ten</family></prefer></alias>\n<dir prefix=\"relative\">fonts-rel</dir>"))
+    write("{r}/etc/conf.d/README.conf", conf("<alias><family>sans-serif</family><prefer><family>Ignored</family></prefer></alias>"))
+    write("{r}/etc/conf.d/30-notxml.conf", "this is not XML")
+    write("{r}/elsewhere/40-linked.conf", conf("<dir>~/my-fonts</dir>\n<dir>relative-to-cwd</dir>\n<include>10-first.conf</include>"))
+    file.symlink("{r}/elsewhere/40-linked.conf", "{r}/etc/conf.d/40-linked.conf") or panic("symlink")
+    write("{r}/home/.config/fontconfig/fonts.conf", conf("<dir prefix=\"xdg\">fonts</dir>\n<alias><family>sans-serif</family><prefer><family>User</family></prefer></alias>"))
+    let c = read_config(tr.env)
+    t.equal_slice(c.files, [
+        "{r}/etc/fonts.conf"
+        "{r}/etc/conf.d/10-first.conf"
+        "{r}/etc/conf.d/20-second.conf"
+        "{r}/etc/conf.d/40-linked.conf"
+        "{r}/home/.config/fontconfig/fonts.conf"
+    ])
+    t.equal_slice(c.dirs, [
+        "/usr/share/fonts-a"
+        "{r}/etc/conf.d/fonts-rel"
+        "{r}/home/my-fonts"
+        "{r}/work/relative-to-cwd"
+        "{r}/home/.local/share/fonts"
+        "{r}/share/fonts"
+    ])
+    var preferred: str[] = []
+    for a in c.aliases {
+        preferred.push(a.prefer[0])
+    }
+    t.equal_slice(preferred, ["Ten", "Twenty", "User", "Main"])
+    file.remove_all(r) or {}
+}
+
+fn test_a_missing_config_still_scans_the_xdg_font_dirs(t: *testing.T) {
+    let tr = tree(t, "missing")
+    let c = read_config(tr.env)
+    t.equal(c.files.len, 0)
+    t.equal_slice(c.dirs, ["{tr.root}/home/.local/share/fonts", "{tr.root}/share/fonts"])
+    file.remove_all(tr.root) or {}
+}
+
+fn install(tr: Tree) {
+    let r = tr.root
+    write("{r}/etc/fonts.conf", conf("<dir>{r}/fonts</dir>\n<dir>{r}/linked</dir>\n<alias><family>sans-serif</family><prefer><family>Fixture Sans</family></prefer></alias>"))
+    write("{r}/fonts/sans/FixtureSans-Regular.ttf", fixture_font(Spec { family: "Fixture Sans" }))
+    write("{r}/fonts/sans/FixtureSans-Italic.TTF", fixture_font(Spec { family: "Fixture Sans", style: "Italic", selection: 1 }))
+    write("{r}/fonts/cjk/Han.ttc", collection([fixture_font(Spec { family: "Han JP", code_points: [0x4e00] }), fixture_font(Spec { family: "Han KR", code_points: [0x4e00, 0xac00] })]))
+    write("{r}/fonts/Pictures.ttf", bitmap_only_font("Pictures"))
+    write("{r}/fonts/notes.txt", "not a font")
+    write("{r}/fonts/broken.otf", "OTTO but truncated")
+    write("{r}/elsewhere/Mono.otf", fixture_font(Spec { family: "Fixture Mono" }))
+    file.symlink("{r}/elsewhere", "{r}/linked") or panic("symlink")
+    file.symlink("{r}/fonts", "{r}/fonts/sans/loop") or panic("symlink")
+}
+
+fn face_names(ix: Index) -> str[] {
+    var out: str[] = []
+    for face in ix.faces {
+        out.push("{face.families[0]} {face.style} {face.index}")
+    }
+    out
+}
+
+fn test_open_reads_every_font_in_the_configured_dirs(t: *testing.T) {
+    let tr = tree(t, "open")
+    install(tr)
+    let ix = open(tr.env)
+    t.equal_slice(face_names(ix), ["Han JP Regular 0", "Han KR Regular 1", "Fixture Sans Italic 0", "Fixture Sans Regular 0", "Fixture Mono Regular 0"])
+    let sans = find(ix, "sans-serif", 400, 2) ?? return t.error("sans-serif finds nothing")
+    t.equal(sans.style, "Italic")
+    t.is_true(strs.ends_with(sans.path, "/fonts/sans/FixtureSans-Italic.TTF"))
+    let hangul = fallback(ix, "sans-serif", 400, 0, 0xac00) ?? return t.error("no face for U+AC00")
+    t.equal(hangul.families[0], "Han KR")
+    let f = read_face(hangul) or return t.error("Han KR does not parse")
+    t.equal(font.glyph_index(f, 0xac00), 1)
+    file.remove_all(tr.root) or {}
+}
+
+fn touch(path: str, seconds: i64) {
+    file.set_times(path, seconds, seconds) or panic("set_times {path}")
+}
+
+fn test_the_cache_answers_until_a_directory_changes(t: *testing.T) {
+    let tr = tree(t, "cache")
+    install(tr)
+    let r = tr.root
+    let sans = "{r}/fonts/sans"
+    touch(sans, 1000000)
+    let first = open(tr.env)
+    t.is_true(file.exists("{r}/home/.cache/low/fontconfig.cache"))
+    let again = open(tr.env)
+    t.equal_slice(face_names(again), face_names(first))
+    let cached = fallback(again, "", 400, 0, 0xac00) ?? return t.error("the cache lost the coverage")
+    t.equal(cached.families[0], "Han KR")
+
+    write("{sans}/FixtureSans-Regular.ttf", fixture_font(Spec { family: "Fixture Sans", style: "Book" }))
+    touch(sans, 1000000)
+    let stale = open(tr.env)
+    t.equal(chosen(stale, "Fixture Sans", 400, 0), "Fixture Sans Regular")
+
+    touch(sans, 1000001)
+    let fresh = open(tr.env)
+    t.equal(chosen(fresh, "Fixture Sans", 400, 0), "Fixture Sans Book")
+
+    write("{sans}/FixtureSans-Regular.ttf", fixture_font(Spec { family: "Fixture Sans", style: "Medium" }))
+    touch(sans, 1000001)
+    t.equal(chosen(open(tr.env), "Fixture Sans", 400, 0), "Fixture Sans Book")
+    file.remove_all(r) or {}
+}
+
+fn test_a_damaged_cache_is_read_again_from_disk(t: *testing.T) {
+    let tr = tree(t, "damaged")
+    install(tr)
+    let sans = "{tr.root}/fonts/sans"
+    let cache = "{tr.root}/home/.cache/low/fontconfig.cache"
+    touch(sans, 1000000)
+    open(tr.env)
+    let valid = file.read_text(cache) or panic("no cache")
+    write("{sans}/FixtureSans-Regular.ttf", fixture_font(Spec { family: "Fixture Sans", style: "Book" }))
+    touch(sans, 1000000)
+    for text in [strs.replace(valid, "low-fontconfig 1", "low-fontconfig 0"), "{valid}F\tbroken\n", "{valid}D\t/nowhere\tsoon\n", "low-fontconfig 1\nS\t/orphan\n{valid[17..]}"] {
+        file.write_text(cache, text) or panic("write cache")
+        t.equal(chosen(open(tr.env), "Fixture Sans", 400, 0), "Fixture Sans Book")
+    }
+    file.remove_all(tr.root) or {}
+}
+
+fn test_added_faces_come_before_installed_ones(t: *testing.T) {
+    let tr = tree(t, "added")
+    install(tr)
+    var ix = open(tr.env)
+    add(mut ix, fixture_font(Spec { family: "Fixture Sans", style: "Added" }))
+    t.equal(chosen(ix, "Fixture Sans", 400, 0), "Fixture Sans Added")
+    t.equal(chosen(ix, "Fixture Sans", 400, 2), "Fixture Sans Added")
+    file.remove_all(tr.root) or {}
+}
+
+fn fc_match(pattern: str) -> str? {
+    let out = process.run(process.command("fc-match", ["-f", "%{{family[0]}}", pattern]), []) catch {
+        e => return none
+    }
+    if !process.success(out.status) {
+        return none
+    }
+    str(out.stdout)
+}
+
+fn test_the_installed_fonts_match_fc_match(t: *testing.T) {
+    var env = environment() ?? return t.skip("no fontconfig environment")
+    if process.find("fc-match") == none || !file.exists(env.config_file) {
+        return t.skip("fontconfig is not installed")
+    }
+    let cache = file.temp_dir("fontconfig-live") or panic("temp dir")
+    env.cache_home = cache
+    let ix = open(env)
+    file.remove_all(cache) or {}
+    if ix.faces.len == 0 {
+        return t.skip("no installed fonts")
+    }
+    for family in ["sans-serif", "serif", "monospace"] {
+        let want = fc_match(family) ?? continue
+        if position(families(ix, family), want) == none {
+            continue
+        }
+        let face = find(ix, family, 400, 0) ?? return t.error("{family} finds nothing; fc-match finds {want}")
+        t.is_true(slices.contains(face.families, want))
+    }
+    for face in ix.faces {
+        if strs.ends_with(face.path, ".ttc") && face.index > 0 {
+            let f = read_face(face) or return t.error("{face.path} index {face.index} does not parse")
+            t.is_true(f.glyph_count > 0)
+            return
+        }
+    }
+}

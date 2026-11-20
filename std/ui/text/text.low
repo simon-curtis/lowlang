@@ -1,6 +1,7 @@
 import strs = std/text
 import std/ui/dwrite
 import std/ui/font
+import std/ui/fontconfig
 import std/ui/geometry
 import std/ui/scene
 import std/ui/svg
@@ -111,7 +112,7 @@ pub struct Stroke {
 pub struct Style {
     /// The em size in logical pixels.
     pub size: f32 = 16.0
-    /// The installed font family to draw with, or empty for the system's default family. A system that draws with its built-in fonts ignores it.
+    /// The installed font family to draw with, or empty for the system's default family. A system that draws with its built-in fonts ignores it, and on Linux a family that names no installed face draws with the built-in fonts.
     pub family: str = ""
     /// The weight of the face: `400` is regular and `700` bold. The installed face nearest the weight draws the text.
     pub weight: i64 = 400
@@ -155,6 +156,21 @@ struct Shaped {
     glyph: i64
 }
 
+struct Loaded {
+    font: font.Font
+    slanted: bool
+}
+
+struct Installed {
+    env: fontconfig.Environment
+    index: fontconfig.Index
+    scanned: bool
+    added: str[]
+    loaded: [str: i64]
+    primaries: [str: i64]
+    fallbacks: [str: i64]
+}
+
 struct Native {
     fonts: *dwrite.Fonts
     rendering: dwrite.Rendering
@@ -177,7 +193,8 @@ struct Origin {
 
 /// The fonts, the glyph atlas and the caches that text drawing keeps between calls.
 pub struct System {
-    fonts: font.Font[]
+    fonts: Loaded[]
+    builtin: i64
     /// The atlas the sprites that `paint` pushes sample, for the renderer to upload.
     pub atlas: scene.Atlas
     limit: i64
@@ -188,6 +205,7 @@ pub struct System {
     tiles: [i64: Tile]
     layouts: [str: Layout]
     native: *Native? = none
+    installed: *Installed? = none
     masks: [str: Tile]
     images: [i64: Picture] = [:]
     image_tiles: [i64: ImageTile] = [:]
@@ -208,6 +226,8 @@ struct Flow {
     last: Shaped
     lines: Line[]
     widest: f32
+    chain: i64[]
+    style: Style
 }
 
 /// Returns a system that draws with `fonts` in order of preference, or with `font.fallback()` when `fonts` is empty, and a glyph atlas of 1024 pixels square that doubles, up to 4096 pixels, when a frame fills it or a picture needs more room.
@@ -227,15 +247,21 @@ pub fn system_with_atlas(fonts: font.Font[], size: i64) -> System {
 
 fn sized_system(fonts: font.Font[], size: i64, limit: i64) -> System {
     let chosen = if fonts.len == 0 { [font.fallback()] } else { fonts }
-    System { fonts: chosen, atlas: scene.atlas(size), limit, shelves: [], next_shelf: 0, full: false, tiles: [:], layouts: [:], masks: [:] }
+    var loaded: Loaded[] = []
+    for f in chosen {
+        loaded.push(Loaded { font: f, slanted: false })
+    }
+    System { fonts: loaded, builtin: loaded.len, atlas: scene.atlas(size), limit, shelves: [], next_shelf: 0, full: false, tiles: [:], layouts: [:], masks: [:] }
 }
 
 /// Switches `sys` to the system's installed fonts, shaped and rasterised by the system's text renderer, and returns whether it could.
 ///
 /// `subpixel` asks for glyphs with one coverage value per colour stripe of a pixel; the renderer must be able to blend them. A system that could not switch keeps drawing with its built-in fonts. The default family, Inter Variable, is added from the font embedded in the standard library, so it is drawn whether or not it is installed. A layout whose family or weight no installed font matches is drawn with the default family, and with the built-in fonts when even that is missing.
+///
+/// On Linux the system keeps drawing with the built-in fonts and the built-in rasteriser, and adds the installed faces that `std/ui/fontconfig` finds through the environment `fontconfig.environment` gives: a layout whose family names an installed face is drawn with it, and a code point no font of the layout has is drawn with the installed face `fontconfig.fallback` picks. The installed faces are read on the first layout that needs one, not here. `subpixel` is ignored, because the built-in rasteriser gives grey coverage.
 pub fn use_system_fonts(mut sys: System, subpixel: bool) -> bool {
     let fonts = dwrite.open() catch {
-        e => return false
+        e => return use_installed_fonts(mut sys)
     }
     let rendering = dwrite.rendering(fonts) catch {
         e => return false
@@ -244,6 +270,12 @@ pub fn use_system_fonts(mut sys: System, subpixel: bool) -> bool {
         e => {}
     }
     sys.native = new(Native { fonts, rendering, subpixel, spaces: [:], shaped: [:] })
+    true
+}
+
+fn use_installed_fonts(mut sys: System) -> bool {
+    let env = fontconfig.environment() ?? return false
+    sys.installed = new(Installed { env, index: fontconfig.empty(), scanned: false, added: [], loaded: [:], primaries: [:], fallbacks: [:] })
     true
 }
 
@@ -262,10 +294,22 @@ pub fn set_subpixel(mut sys: System, subpixel: bool) {
 ///
 /// A layout whose family the font holds is drawn with it in preference to an installed family of the same name, so a font is added before the first layout in its family. A system with the built-in fonts, and data that is not a font, return `false`.
 pub fn add_font(mut sys: System, data: str) -> bool {
-    let native = sys.native ?? return false
-    dwrite.add_font(native.fonts, data) catch {
-        e => return false
+    match sys.native {
+        some(native) => {
+            dwrite.add_font(native.fonts, data) catch {
+                e => return false
+            }
+            return true
+        }
+        none => {}
     }
+    let installed = sys.installed ?? return false
+    if fontconfig.add(mut installed.index, data) == 0 {
+        return false
+    }
+    installed.added.push(data)
+    installed.primaries = [:]
+    installed.fallbacks = [:]
     true
 }
 
@@ -340,7 +384,7 @@ pub fn wrap(mut sys: System, s: str, style: Style, width: f32) -> Layout {
         some(cached_layout) => return cached_layout
         none => {}
     }
-    let built = lay_out(sys, s, style, width)
+    let built = lay_out(mut sys, s, style, width)
     sys.layouts[key] = built
     built
 }
@@ -408,7 +452,7 @@ fn line_start(l: Layout, line: Line, left: f32) -> f32 {
     left
 }
 
-fn lay_out(sys: System, s: str, style: Style, width: f32) -> Layout {
+fn lay_out(mut sys: System, s: str, style: Style, width: f32) -> Layout {
     let breaking = if style.wrap { width } else { infinite }
     match sys.native {
         some(native) => {
@@ -419,19 +463,119 @@ fn lay_out(sys: System, s: str, style: Style, width: f32) -> Layout {
         }
         none => {}
     }
-    var l = lay_out_embedded(sys, s, style.size, style.line_height, breaking)
+    let chain = font_chain(mut sys, style)
+    var l = lay_out_embedded(mut sys, s, style, chain, breaking)
     l.space = width
     l.align = style.align
     l.font_style = style.font_style
     l.decoration = style.decoration
     if style.decoration != Decoration.None {
-        l.stroke = embedded_stroke(sys.fonts[0], style)
+        l.stroke = embedded_stroke(sys.fonts[chain[0]].font, style)
     }
     l
 }
 
-fn lay_out_embedded(sys: System, s: str, size: f32, line_height: f32, width: f32) -> Layout {
-    let first = sys.fonts[0]
+fn builtin_chain(sys: System) -> i64[] {
+    var chain: i64[] = []
+    for i in 0..sys.builtin {
+        chain.push(i)
+    }
+    chain
+}
+
+fn font_chain(mut sys: System, style: Style) -> i64[] {
+    let builtin = builtin_chain(sys)
+    if style.family == "" {
+        return builtin
+    }
+    let installed = sys.installed ?? return builtin
+    let primary = installed_primary(mut sys, installed, style)
+    if primary < 0 {
+        return builtin
+    }
+    var chain = [primary]
+    for i in builtin {
+        chain.push(i)
+    }
+    chain
+}
+
+fn slant_of(style: Style) -> i64 {
+    style.font_style.index
+}
+
+fn scan_installed(installed: *Installed) {
+    if installed.scanned {
+        return
+    }
+    installed.scanned = true
+    installed.index = fontconfig.open(installed.env)
+    for data in installed.added {
+        fontconfig.add(mut installed.index, data)
+    }
+}
+
+fn installed_primary(mut sys: System, installed: *Installed, style: Style) -> i64 {
+    let key = "{style.family}|{style.weight}|{slant_of(style)}"
+    match installed.primaries[key] {
+        some(known) => return known
+        none => {}
+    }
+    var found = fontconfig.find(installed.index, style.family, style.weight, slant_of(style))
+    if found == none && !installed.scanned {
+        scan_installed(installed)
+        found = fontconfig.find(installed.index, style.family, style.weight, slant_of(style))
+    }
+    let position = match found {
+        some(face) => load_installed(mut sys, installed, face)
+        none => -1
+    }
+    installed.primaries[key] = position
+    position
+}
+
+fn installed_fallback(mut sys: System, installed: *Installed, style: Style, c: u32) -> i64 {
+    if c < 0x20 || (c >= 0x7f && c < 0xa0) {
+        return -1
+    }
+    let key = "{style.family}|{style.weight}|{slant_of(style)}|{c}"
+    match installed.fallbacks[key] {
+        some(known) => return known
+        none => {}
+    }
+    scan_installed(installed)
+    let family = if style.family == "" { "sans-serif" } else { style.family }
+    let position = match fontconfig.fallback(installed.index, family, style.weight, slant_of(style), c) {
+        some(face) => load_installed(mut sys, installed, face)
+        none => -1
+    }
+    installed.fallbacks[key] = position
+    position
+}
+
+fn load_installed(mut sys: System, installed: *Installed, face: fontconfig.Face) -> i64 {
+    let key = "{face.path}|{face.index}|{face.instance}|{face.families[0]}|{face.style}"
+    match installed.loaded[key] {
+        some(known) => return known
+        none => {}
+    }
+    var position = -1
+    let f = fontconfig.read_face(face) catch {
+        e => {
+            installed.loaded[key] = position
+            return position
+        }
+    }
+    position = sys.fonts.len
+    sys.fonts.push(Loaded { font: f, slanted: face.slant != 0 })
+    installed.loaded[key] = position
+    position
+}
+
+fn lay_out_embedded(mut sys: System, s: str, style: Style, chain: i64[], width: f32) -> Layout {
+    let size = style.size
+    let line_height = style.line_height
+    let first = sys.fonts[chain[0]].font
     let k = font.scale(first, size)
     let natural = f32(first.ascent - first.descent + first.line_gap) * k
     let height = if line_height > 0.0 { line_height } else { natural }
@@ -450,12 +594,14 @@ fn lay_out_embedded(sys: System, s: str, size: f32, line_height: f32, width: f32
         last: Shaped { font: -1, glyph: 0 }
         lines: []
         widest: 0.0
+        chain
+        style
     }
     for c in s {
         if c == '\n' {
             finish_line(mut flow)
         } else if c != '\r' {
-            let shaped = shape(sys, c)
+            let shaped = shape(mut sys, flow, c)
             place(sys, mut flow, c == ' ', shaped)
         }
     }
@@ -828,18 +974,25 @@ fn cut(items: Piece[], from: i64, to: i64) -> Line {
     Line { glyphs, y: 0.0, width: ink, end: items[to - 1].end - origin }
 }
 
-fn shape(sys: System, c: u32) -> Shaped {
-    for i, f in sys.fonts {
-        let g = font.glyph_index(f, c)
+fn shape(mut sys: System, flow: Flow, c: u32) -> Shaped {
+    for i in flow.chain {
+        let g = font.glyph_index(sys.fonts[i].font, c)
         if g != 0 {
             return Shaped { font: i, glyph: g }
         }
     }
-    Shaped { font: 0, glyph: 0 }
+    let missing = Shaped { font: flow.chain[0], glyph: 0 }
+    let installed = sys.installed ?? return missing
+    let position = installed_fallback(mut sys, installed, flow.style, c)
+    if position < 0 {
+        return missing
+    }
+    let g = font.glyph_index(sys.fonts[position].font, c)
+    if g == 0 { missing } else { Shaped { font: position, glyph: g } }
 }
 
 fn place(sys: System, mut flow: Flow, is_space: bool, shaped: Shaped) {
-    let f = sys.fonts[shaped.font]
+    let f = sys.fonts[shaped.font].font
     let advance = f32(font.advance(f, shaped.glyph)) * font.scale(f, flow.size)
     if is_space {
         add(mut flow, sys, shaped, advance)
@@ -866,7 +1019,7 @@ fn place(sys: System, mut flow: Flow, is_space: bool, shaped: Shaped) {
 
 fn pen_for(sys: System, flow: Flow, shaped: Shaped) -> f32 {
     if flow.last.font == shaped.font {
-        let f = sys.fonts[shaped.font]
+        let f = sys.fonts[shaped.font].font
         flow.pen + f32(font.kern(f, flow.last.glyph, shaped.glyph)) * font.scale(f, flow.size)
     } else {
         flow.pen
@@ -927,7 +1080,8 @@ fn tile_key(g: Placed, size_64: i64, slanted: bool) -> i64 {
 
 fn glyph_tile(mut sys: System, g: Placed, pixel_size: f32, font_style: FontStyle) -> Tile? {
     let size_64 = i64(pixel_size * 64.0 + 0.5)
-    let slanted = font_style != FontStyle.Normal
+    let loaded = sys.fonts[g.font]
+    let slanted = font_style != FontStyle.Normal && !loaded.slanted
     let key = tile_key(g, size_64, slanted)
     match sys.tiles[key] {
         some(known) => return known
@@ -937,7 +1091,7 @@ fn glyph_tile(mut sys: System, g: Placed, pixel_size: f32, font_style: FontStyle
         return none
     }
     let slant = if slanted { synthetic_slant } else { 0.0 }
-    let bitmap = font.rasterize_slanted(sys.fonts[g.font], g.glyph, f32(size_64) / 64.0, slant)
+    let bitmap = font.rasterize_slanted(loaded.font, g.glyph, f32(size_64) / 64.0, slant)
     if bitmap.width == 0 {
         return remember_blank(mut sys, key)
     }
