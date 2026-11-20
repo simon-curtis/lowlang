@@ -1,0 +1,253 @@
+import std/dbus
+import std/sync
+
+const registry_name = "org.a11y.atspi.Registry"
+/// The object path of the application object.
+pub const root_path = "/org/a11y/atspi/accessible/root"
+/// The object path of the window object.
+pub const window_path = "/org/a11y/atspi/accessible/window"
+const element_prefix = "/org/a11y/atspi/accessible/e"
+const null_path = "/org/a11y/atspi/null"
+const call_timeout_ms = 2000
+
+/// An AT-SPI role, with the number `org.a11y.atspi.Accessible.GetRole` reports.
+pub enum Role {
+    /// A check box.
+    CheckBox = 7
+    /// A dialog.
+    Dialog = 16
+    /// A top-level window.
+    Frame = 23
+    /// A picture.
+    Image = 27
+    /// A run of static text.
+    Label = 29
+    /// A list.
+    List = 31
+    /// One item of a list.
+    ListItem = 32
+    /// A menu.
+    Menu = 33
+    /// One command of a menu.
+    MenuItem = 35
+    /// One tab of a tab list.
+    PageTab = 37
+    /// A container that has no other role.
+    Panel = 39
+    /// A push button.
+    Button = 43
+    /// A single-line text entry.
+    Entry = 79
+    /// The application.
+    Application = 75
+    /// A heading.
+    Heading = 83
+    /// A link.
+    Link = 88
+}
+
+/// One accessible element, as the application describes it. Bounds are in the window's coordinates.
+pub struct Node {
+    /// Identifies the element from one update to the next, so a node that keeps its key keeps its object path.
+    pub key: str
+    /// The name assistive technology reads.
+    pub name: str = ""
+    /// The element's role.
+    pub role: Role = Role.Panel
+    /// The left edge.
+    pub x: f64 = 0.0
+    /// The top edge.
+    pub y: f64 = 0.0
+    /// The width.
+    pub width: f64 = 0.0
+    /// The height.
+    pub height: f64 = 0.0
+    /// Whether the element is on screen and not covered.
+    pub visible: bool = true
+    /// Whether the element has the keyboard focus.
+    pub focused: bool = false
+    /// Whether the element can take the keyboard focus, which `GrabFocus` then asks for.
+    pub focusable: bool = false
+    /// Whether the element can be activated, which gives it the `Action` interface and its one `click` action.
+    pub actionable: bool = false
+    /// Whether the element's text can be edited, which marks it editable and single-line.
+    pub editable: bool = false
+    /// The text the `Text` interface serves, or `none` for an element that has no `Text` interface.
+    pub text: str? = none
+}
+
+/// A request an assistive technology made that only the application's own thread may carry out.
+pub enum Action {
+    /// Activate the element that has this key.
+    Click(key: str)
+    /// Give the element that has this key the keyboard focus.
+    Focus(key: str)
+}
+
+struct State {
+    handle: *dbus.ConnectionHandle
+    service: *dbus.Service
+    lock: sync.Mutex
+    name: str
+    application: str
+    title: str
+    active: bool
+    nodes: Node[]
+    numbers: [str: i64]
+    next_number: i64
+    requests: Action[]
+    notify: fn()
+    desktop_name: str
+    desktop_path: str
+    identifier: i64
+}
+
+/// The accessible tree of one application, exported on a D-Bus connection to the accessibility bus.
+///
+/// The tree is an application object, one window object and one flat list of the window's elements. A `Bridge` is a handle that copies share; `close` ends the connection a `connect` made.
+pub struct Bridge {
+    state: *State
+    owned: bool
+}
+
+/// Closes the connection of a `Bridge` that `connect` made, which withdraws the application from the registry. A `Bridge` that `serve` made leaves its connection to its owner, so `close` does nothing.
+pub fn close(b: Bridge) {
+    if b.owned {
+        dbus.shutdown_on(b.state.handle)
+    }
+}
+
+/// Returns the address of the accessibility bus, which `org.a11y.Bus.GetAddress` on the session bus names.
+///
+/// Fails with the error of the session connection, `Remote` when no `org.a11y.Bus` runs, and `Timeout` after two seconds.
+pub fn bus_address() -> str ! dbus.Error {
+    using bus = dbus.connect_session()?
+    let ask = dbus.method_call("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress", [])
+    let reply = dbus.call_with(bus, ask, dbus.CallOptions { timeout: call_timeout_ms })?
+    if reply.body.len != 1 {
+        fail dbus.Error.Malformed("GetAddress returned {reply.body.len} values")
+    }
+    dbus.string_of(reply.body[0])?
+}
+
+fn new_state(h: *dbus.ConnectionHandle, application: str, notify: fn()) -> *State {
+    new(State {
+        handle: h,
+        service: dbus.serve_on(h),
+        lock: sync.mutex(),
+        name: dbus.unique_name_on(h),
+        application,
+        title: "",
+        active: false,
+        nodes: [],
+        numbers: [:],
+        next_number: 0,
+        requests: [],
+        notify,
+        desktop_name: "",
+        desktop_path: "",
+        identifier: 0,
+    })
+}
+
+/// Exports the application and window objects on the connection behind `h` and returns the `Bridge`, which leaves `h` open when closed.
+///
+/// `notify` runs on a green thread of the connection each time an assistive technology queues an `Action`; it is how the application's own thread learns to call `take_actions`. Fails with `Name` or `Marshal` when an object cannot be exported, which a fresh service does not do.
+pub fn serve(h: *dbus.ConnectionHandle, application: str, notify: fn()) -> Bridge ! dbus.Error {
+    let st = new_state(h, application, notify)
+    export_application(st)?
+    Bridge { state: st, owned: false }
+}
+
+fn connect_to(address: str, application: str, notify: fn(), join: bool) -> Bridge ! dbus.Error {
+    using var bus = dbus.connect_addresses(dbus.parse_addresses(address)?)?
+    let st = new_state(bus.handle, application, notify)
+    export_application(st)?
+    if join {
+        join_registry(st)?
+    }
+    dbus.detach(mut bus)
+    Bridge { state: st, owned: true }
+}
+
+/// Connects to the accessibility bus that `bus_address` names, exports the application and window objects and registers the application with the registry, and returns the `Bridge`, which `close` ends.
+///
+/// Fails as `bus_address`, `dbus.connect_addresses`, `serve` and `register` do.
+pub fn connect(application: str, notify: fn()) -> Bridge ! dbus.Error {
+    connect_to(bus_address()?, application, notify, true)?
+}
+
+/// Registers the application with the accessibility registry, which lists it among the desktop's applications, by calling `org.a11y.atspi.Socket.Embed` with the application object.
+///
+/// The registry's answer becomes the `Parent` of the application object. Fails with `Remote` when no registry runs on the connection, with `Timeout` after two seconds and with `Malformed` for an answer that is not an object reference.
+pub fn register(b: Bridge) ! dbus.Error {
+    join_registry(b.state)?
+}
+
+fn join_registry(st: *State) ! dbus.Error {
+    let ask = dbus.method_call(registry_name, root_path, "org.a11y.atspi.Socket", "Embed", [reference(st, root_path)])
+    let reply = dbus.call_with_on(st.handle, ask, dbus.CallOptions { timeout: call_timeout_ms })?
+    if reply.body.len != 1 {
+        fail dbus.Error.Malformed("Embed returned {reply.body.len} values")
+    }
+    let fields = dbus.fields_of(reply.body[0])?
+    if fields.len != 2 {
+        fail dbus.Error.Malformed("Embed returned a reference of {fields.len} fields")
+    }
+    sync.lock(st.lock)
+    st.desktop_name = dbus.string_of(fields[0])?
+    st.desktop_path = dbus.string_of(fields[1])?
+    sync.unlock(st.lock)
+}
+
+/// Returns the unique name of the connection the tree is exported on, which is the first half of every object reference.
+pub fn bus_name(b: Bridge) -> str {
+    b.state.name
+}
+
+/// Returns the object path of the element `key` has, or an empty string when the last `update` did not list it.
+pub fn element_path(b: Bridge, key: str) -> str {
+    sync.lock(b.state.lock)
+    let found = b.state.numbers[key]
+    let listed = index_of(b.state, key) >= 0
+    sync.unlock(b.state.lock)
+    match found {
+        some(n) => if listed { "{element_prefix}{n}" } else { "" }
+        none => ""
+    }
+}
+
+/// Removes and returns the actions assistive technology has asked for since the last call, oldest first.
+///
+/// Call it from the application's own thread, as the one place that may change the interface.
+pub fn take_actions(b: Bridge) -> Action[] {
+    sync.lock(b.state.lock)
+    let taken = b.state.requests
+    b.state.requests = []
+    sync.unlock(b.state.lock)
+    taken
+}
+
+fn queue(st: *State, a: Action) {
+    sync.lock(st.lock)
+    st.requests.push(a)
+    sync.unlock(st.lock)
+    st.notify()
+}
+
+fn index_of(st: *State, key: str) -> i64 {
+    for i, n in st.nodes {
+        if n.key == key {
+            return i
+        }
+    }
+    -1
+}
+
+fn reference(st: *State, path: str) -> dbus.Value {
+    dbus.Value.Struct([dbus.Value.String(st.name), dbus.Value.ObjectPath(path)])
+}
+
+fn null_reference() -> dbus.Value {
+    dbus.Value.Struct([dbus.Value.String(""), dbus.Value.ObjectPath(null_path)])
+}
