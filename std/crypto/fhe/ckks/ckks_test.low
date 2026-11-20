@@ -68,10 +68,18 @@ fn opened(ctx: *Context, keys: rlwe.Keys, c: Ciphertext) -> Complex[] {
     decode(ctx, decrypt(ctx, keys.secret, c))
 }
 
-fn squares(values: Complex[]) -> Complex[] {
+fn each(a: Complex[], b: Complex[], op: fn(Complex, Complex) -> Complex) -> Complex[] {
+    var out: Complex[] = []
+    for i in 0..a.len {
+        out.push(op(a[i], b[i]))
+    }
+    out
+}
+
+fn conjugates(values: Complex[]) -> Complex[] {
     var out: Complex[] = []
     for v in values {
-        out.push(times(v, v))
+        out.push(conjugated(v))
     }
     out
 }
@@ -84,13 +92,68 @@ fn rotated(values: Complex[], steps: i64) -> Complex[] {
     out
 }
 
-fn fresh_error_bound(ctx: *Context) -> f64 {
-    let n = f64(ctx.parameters.degree)
-    12.0 * sqrt(n * (n / 18.0 + 1.0 / 6.0)) / default_scale(ctx)
-}
-
 fn bits_of(error: f64) -> f64 {
     -ring.ln(error) / ln2
+}
+
+fn largest(values: Complex[]) -> f64 {
+    var out = 0.0
+    for v in values {
+        let m = sqrt(v.re * v.re + v.im * v.im)
+        if m > out {
+            out = m
+        }
+    }
+    out
+}
+
+fn rms_fresh(ctx: *Context) -> f64 {
+    let n = f64(ctx.parameters.degree)
+    sqrt(n * (n / 18.0 + 1.0 / 6.0))
+}
+
+const seal_sigma = 3.19
+
+fn rms_switch(ctx: *Context) -> f64 {
+    let n = f64(ctx.parameters.degree)
+    let special = ctx.rlwe.full.moduli[ctx.rlwe.full.moduli.len - 1].value
+    var digits = 0.0
+    for m in ctx.rlwe.q.moduli {
+        let ratio = f64(m.value) / f64(special)
+        digits += ratio * ratio
+    }
+    sqrt(n * n / 12.0 * seal_sigma * seal_sigma * digits)
+}
+
+fn product_error(ctx: *Context, a: f64, a_error: f64, b: f64, b_error: f64, scale: f64) -> f64 {
+    a * b_error + b * a_error + rms_fresh(ctx) / scale
+}
+
+fn holds(t: *testing.T, label: str, want: Complex[], got: Complex[], rms_error: f64) -> f64 {
+    let bits = precision(want, got)
+    let bound = bits_of(12.0 * rms_error)
+    t.error_if(bits < bound, "{label}: {bits} bits, below the bound of {bound}")
+    bits
+}
+
+fn near(t: *testing.T, label: str, bits: f64, seal: f64) {
+    t.error_if(bits < seal - 1.0 || bits > seal + 1.0, "{label}: {bits} bits, more than 1 from SEAL's {seal}")
+}
+
+fn refusal(attempt: fn() -> Ciphertext ! Error) -> str {
+    let c = attempt() catch {
+        e => return "{e}"
+    }
+    "accepted at level {level(c)}"
+}
+
+fn product_of(t: *testing.T, ctx: *Context, keys: rlwe.Keys, a: Ciphertext, b: Ciphertext) -> Ciphertext {
+    multiply_rescale(ctx, keys.relinearization, a, b) catch {
+        e => {
+            t.fatal("multiply: {e}")
+            a
+        }
+    }
 }
 
 fn test_encoding_matches_seal(t: *testing.T) {
@@ -119,4 +182,182 @@ fn test_encoding_matches_seal(t: *testing.T) {
     let px = encoded(t, ctx, x)
     t.equal(hex_digest(px.poly.residues), "355280f42dea48b1f943479b4823babb40c547955520573c2b4d641425186ca1")
     t.is_true(precision(x, decode(ctx, px)) >= 32.7)
+}
+
+fn test_precision_meets_the_bounds_and_seal(t: *testing.T) {
+    let ctx = built(t, default_parameters())
+    let s = fixed(1)
+    let keys = generate(ctx, s)
+    let galois = galois_keys(ctx, keys.secret, [1, -3], true, s)
+    let x = reference_values(slot_count(ctx))
+    let scale = default_scale(ctx)
+    let c = encrypt(ctx, keys.public, encoded(t, ctx, x), s)
+    let top_value = largest(x)
+    let fresh = rms_fresh(ctx) / scale
+    near(t, "fresh", holds(t, "fresh", x, opened(ctx, keys, c), fresh), 26.58)
+
+    let square = product_of(t, ctx, keys, c, c)
+    let x2 = each(x, x, times)
+    let square_error = product_error(ctx, top_value, fresh, top_value, fresh, square.scale)
+    near(t, "square", holds(t, "square", x2, opened(ctx, keys, square), square_error), 25.56)
+    let fourth = product_of(t, ctx, keys, square, square)
+    let fourth_error = product_error(ctx, largest(x2), square_error, largest(x2), square_error, fourth.scale)
+    near(t, "fourth power", holds(t, "fourth power", each(x2, x2, times), opened(ctx, keys, fourth), fourth_error), 23.70)
+    t.equal(level(fourth), 0)
+
+    let switched = (2.0 * rms_fresh(ctx) + rms_switch(ctx)) / scale
+    let seal_rotations: f64[] = [19.89, 19.87, 19.23]
+    let moved = [
+        rotate(ctx, galois, c, 1) catch { _ => c },
+        rotate(ctx, galois, c, -3) catch { _ => c },
+        conjugate(ctx, galois, c) catch { _ => c },
+    ]
+    let wants = [rotated(x, 1), rotated(x, -3), conjugates(x)]
+    for i in 0..moved.len {
+        let bits = holds(t, "rotation {i}", wants[i], opened(ctx, keys, moved[i]), switched)
+        t.error_if(bits < seal_rotations[i] + 4.0, "rotation {i}: {bits} bits, not 4 above SEAL's {seal_rotations[i]}")
+    }
+}
+
+fn test_arithmetic_at_every_level(t: *testing.T) {
+    let ctx = built(t, default_parameters())
+    let s = fixed(2)
+    let keys = generate(ctx, s)
+    let galois = galois_keys(ctx, keys.secret, [5], false, s)
+    let n = slot_count(ctx)
+    let x = random_values(s, n)
+    let y = random_values(s, n)
+    let scale = default_scale(ctx)
+    let fresh = rms_fresh(ctx) / scale
+    let bound = largest(x) + largest(y)
+    let cx = encrypt(ctx, keys.public, encoded(t, ctx, x), s)
+    let cy = encrypt(ctx, keys.public, encoded(t, ctx, y), s)
+    for l in [2, 1, 0] {
+        let ax = drop_to(cx, l) catch { _ => cx }
+        let ay = drop_to(cy, l) catch { _ => cy }
+        t.equal(level(ax), l)
+        let py = encode_at(ctx, y, scale, l) catch {
+            e => return t.fatal("encode_at {l}: {e}")
+        }
+        let sum = each(x, y, plus)
+        holds(t, "add at {l}", sum, opened(ctx, keys, add(ctx, ax, ay) catch { _ => ax }), 2.0 * fresh)
+        holds(t, "sub at {l}", each(x, y, minus), opened(ctx, keys, sub(ctx, ax, ay) catch { _ => ax }), 2.0 * fresh)
+        holds(t, "negate at {l}", each(x, x, fn(a: Complex, _: Complex) -> Complex { scaled(a, -1.0) }), opened(ctx, keys, negate(ctx, ax)), fresh)
+        holds(t, "add_plain at {l}", sum, opened(ctx, keys, add_plain(ctx, ax, py) catch { _ => ax }), fresh)
+        holds(t, "rotate at {l}", rotated(x, 5), opened(ctx, keys, rotate(ctx, galois, ax, 5) catch { _ => ax }), (2.0 * rms_fresh(ctx) + rms_switch(ctx)) / scale)
+        if l == 0 {
+            t.equal(refusal(fn() -> Ciphertext ! Error { multiply_plain(ctx, ax, py) }), "ScaleOutOfBounds")
+            t.equal(refusal(fn() -> Ciphertext ! Error { multiply(ctx, ax, ay) }), "ScaleOutOfBounds")
+            continue
+        }
+        let product = multiply_plain(ctx, ax, py) catch {
+            e => return t.fatal("multiply_plain at {l}: {e}")
+        }
+        let lowered = rescale(ctx, product) catch {
+            e => return t.fatal("rescale at {l}: {e}")
+        }
+        t.equal(level(lowered), l - 1)
+        holds(t, "multiply_plain at {l}", each(x, y, times), opened(ctx, keys, lowered), product_error(ctx, bound, 0.0, bound, fresh, lowered.scale))
+    }
+}
+
+fn test_three_part_products_decrypt_until_relinearized(t: *testing.T) {
+    let ctx = built(t, default_parameters())
+    let s = fixed(3)
+    let keys = generate(ctx, s)
+    let other = generate(ctx, s)
+    let x = random_values(s, slot_count(ctx))
+    let y = random_values(s, slot_count(ctx))
+    let fresh = rms_fresh(ctx) / default_scale(ctx)
+    let cx = encrypt(ctx, keys.public, encoded(t, ctx, x), s)
+    let cy = encrypt(ctx, keys.public, encoded(t, ctx, y), s)
+    let three = multiply(ctx, cx, cy) catch {
+        e => return t.fatal("multiply: {e}")
+    }
+    t.equal(three.parts.len, 3)
+    let xy = each(x, y, times)
+    let error = product_error(ctx, largest(x), fresh, largest(y), fresh, three.scale)
+    holds(t, "three parts", xy, opened(ctx, keys, three), error)
+    let doubled = add(ctx, three, three) catch {
+        e => return t.fatal("add: {e}")
+    }
+    holds(t, "three parts doubled", each(xy, xy, plus), opened(ctx, keys, doubled), 2.0 * error)
+    let two = relinearize(ctx, keys.relinearization, three) catch {
+        e => return t.fatal("relinearize: {e}")
+    }
+    t.equal(two.parts.len, 2)
+    holds(t, "relinearized", xy, opened(ctx, keys, two), error + (2.0 * rms_fresh(ctx) + rms_switch(ctx)) / three.scale)
+    let wrong_key = relinearize(ctx, other.relinearization, three) catch {
+        e => return t.fatal("relinearize: {e}")
+    }
+    t.is_true(precision(xy, opened(ctx, keys, wrong_key)) < 1.0)
+    t.is_true(precision(x, opened(ctx, other, cx)) < 1.0)
+}
+
+fn test_misuse_is_refused(t: *testing.T) {
+    let ctx = built(t, default_parameters())
+    let s = fixed(4)
+    let keys = generate(ctx, s)
+    let galois = galois_keys(ctx, keys.secret, [1], false, s)
+    let x = random_values(s, 16)
+    let px = encoded(t, ctx, x)
+    let c = encrypt(ctx, keys.public, px, s)
+    let square = product_of(t, ctx, keys, c, c)
+    let fourth = product_of(t, ctx, keys, square, square)
+    let three = multiply(ctx, c, c) catch {
+        e => return t.fatal("multiply: {e}")
+    }
+    t.equal(refusal(fn() -> Ciphertext ! Error { rescale(ctx, fourth) }), "LowestLevel")
+    t.equal(refusal(fn() -> Ciphertext ! Error { add(ctx, square, drop_to(c, 1)?) }), "ScaleMismatch")
+    t.equal(refusal(fn() -> Ciphertext ! Error { add_plain(ctx, square, encode_at(ctx, x, default_scale(ctx), 1)?) }), "ScaleMismatch")
+    t.equal(refusal(fn() -> Ciphertext ! Error { add(ctx, square, c) }), "Mismatch")
+    t.equal(refusal(fn() -> Ciphertext ! Error { add(ctx, three, c) }), "Mismatch")
+    t.equal(refusal(fn() -> Ciphertext ! Error { add_plain(ctx, square, px) }), "Mismatch")
+    t.equal(refusal(fn() -> Ciphertext ! Error { multiply(ctx, three, c) }), "Mismatch")
+    t.equal(refusal(fn() -> Ciphertext ! Error { relinearize(ctx, keys.relinearization, c) }), "Mismatch")
+    t.equal(refusal(fn() -> Ciphertext ! Error { rotate(ctx, galois, three, 1) }), "Mismatch")
+    t.equal(refusal(fn() -> Ciphertext ! Error { drop_to(c, 3) }), "Mismatch")
+    t.equal(refusal(fn() -> Ciphertext ! Error { rotate(ctx, galois, c, 2) }), "MissingGaloisKey")
+    t.equal(refusal(fn() -> Ciphertext ! Error { conjugate(ctx, galois, c) }), "MissingGaloisKey")
+    t.equal(refusal(fn() -> Ciphertext ! Error { rotate(ctx, galois, c, 1) }), "accepted at level 2")
+}
+
+fn plain_refusal(attempt: fn() -> Plaintext ! Error) -> str {
+    let p = attempt() catch {
+        e => return "{e}"
+    }
+    "accepted with {p.poly.residues.len} primes"
+}
+
+fn context_refusal(p: Parameters) -> str {
+    let ctx = context(p) catch {
+        e => return "{e}"
+    }
+    "built with {ctx.rlwe.full.moduli.len} primes"
+}
+
+fn constant(value: f64, count: i64) -> Complex[] {
+    var out: Complex[] = []
+    for _ in 0..count {
+        out.push(Complex { re: value, im: 0.0 })
+    }
+    out
+}
+
+fn test_values_and_parameters_outside_the_limits_are_refused(t: *testing.T) {
+    let ctx = built(t, default_parameters())
+    let million = constant(1.0e6, slot_count(ctx))
+    t.equal(plain_refusal(fn() -> Plaintext ! Error { encode(ctx, reference_values(slot_count(ctx) + 1)) }), "TooManyValues")
+    t.equal(plain_refusal(fn() -> Plaintext ! Error { encode(ctx, [Complex { re: 1.0e12, im: 0.0 }]) }), "ValueTooLarge")
+    t.equal(plain_refusal(fn() -> Plaintext ! Error { encode_at(ctx, million, default_scale(ctx), 0) }), "ValueTooLarge")
+    t.equal(plain_refusal(fn() -> Plaintext ! Error { encode_at(ctx, million, default_scale(ctx), 1) }), "accepted with 2 primes")
+    t.equal(plain_refusal(fn() -> Plaintext ! Error { encode_at(ctx, [], default_scale(ctx), 3) }), "Mismatch")
+    t.equal(context_refusal(Parameters { degree: 3000, scale_bits: 40, prime_bits: [60, 40], special_bits: 60, security: Classical128 }), "Degree")
+    t.equal(context_refusal(Parameters { degree: 8192, scale_bits: 40, prime_bits: [60, 40], special_bits: 61, security: Classical128 }), "PrimeSize")
+    t.equal(context_refusal(Parameters { degree: 8192, scale_bits: 15, prime_bits: [60, 19], special_bits: 60, security: Classical128 }), "PrimeSize")
+    t.equal(context_refusal(Parameters { degree: 8192, scale_bits: 40, prime_bits: [60, 40], special_bits: 50, security: Classical128 }), "PrimeSize")
+    t.equal(context_refusal(Parameters { degree: 8192, scale_bits: 40, prime_bits: [], special_bits: 60, security: Classical128 }), "PrimeSize")
+    t.equal(context_refusal(Parameters { degree: 8192, scale_bits: 40, prime_bits: [60, 40, 40], special_bits: 60, security: Classical192 }), "ModulusTooLarge{{bits: 200, limit: 152}}")
+    t.equal(context_refusal(Parameters { degree: 8192, scale_bits: 40, prime_bits: [59, 40, 40, 20], special_bits: 60, security: Classical128 }), "ModulusTooLarge{{bits: 219, limit: 218}}")
+    t.equal(context_refusal(Parameters { degree: 8192, scale_bits: 60, prime_bits: [60, 40], special_bits: 60, security: Classical128 }), "Scale")
 }
