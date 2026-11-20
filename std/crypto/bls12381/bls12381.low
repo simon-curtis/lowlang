@@ -1,0 +1,234 @@
+import std/crypto/limb
+import std/crypto/nistec
+import std/crypto/pairing
+
+/// The ways an encoded point of BLS12-381 is rejected.
+pub enum Error {
+    /// The input has the wrong number of bytes.
+    Length
+    /// The flag bits contradict the length or the point at infinity carries other bits.
+    Flags
+    /// A coordinate is not below the field prime.
+    Coordinate
+    /// The coordinates are not a point of the curve, or no point has the compressed `x`.
+    NotOnCurve
+    /// The point is not in the subgroup of order `r`.
+    NotInSubgroup
+}
+
+const compression: u8 = 0x80
+const infinity_flag: u8 = 0x40
+const sort_flag: u8 = 0x20
+
+fn fp_from(c: *pairing.Curve, data: u8[]) -> u64[] ! Error {
+    let raw = limb.from_bytes(data, c.l)
+    if !nistec.below(raw, c.fp.m) {
+        fail Coordinate
+    }
+    let out = nistec.element(c.fp)
+    nistec.to_mont(c.fp, out, raw)
+    out
+}
+
+fn fp_bytes(c: *pairing.Curve, a: u64[]) -> u8[] {
+    let plain = nistec.element(c.fp)
+    nistec.from_mont(c.fp, plain, a)
+    nistec.encode(plain)
+}
+
+fn coordinate_from(c: *pairing.Curve, data: u8[], degree: i64) -> u64[] ! Error {
+    if degree == 1 {
+        return fp_from(c, data)
+    }
+    let out: u64[] = __make(2 * c.l)
+    __memmove(out[c.l..], fp_from(c, data[..48])?)
+    __memmove(out, fp_from(c, data[48..96])?)
+    out
+}
+
+fn coordinate_bytes(c: *pairing.Curve, a: u64[]) -> u8[] {
+    if a.len == c.l {
+        return fp_bytes(c, a)
+    }
+    let out: u8[] = __make(96)
+    __memmove(out, fp_bytes(c, a[c.l..]))
+    __memmove(out[48..], fp_bytes(c, a[..c.l]))
+    out
+}
+
+fn larger_half(c: *pairing.Curve, a: u64[]) -> bool {
+    let plain = nistec.element(c.fp)
+    nistec.from_mont(c.fp, plain, a)
+    let doubled = nistec.element(c.fp)
+    let carry = limb.add(doubled, plain, plain)
+    carry == 1 || !nistec.below(doubled, c.fp.m)
+}
+
+fn lexicographically_largest(c: *pairing.Curve, y: u64[]) -> bool {
+    if y.len == c.l {
+        return larger_half(c, y)
+    }
+    let imaginary = y[c.l..]
+    if limb.is_zero(imaginary) {
+        return larger_half(c, y[..c.l])
+    }
+    larger_half(c, imaginary)
+}
+
+fn fp_sqrt(c: *pairing.Curve, a: u64[]) -> u64[]? {
+    let root = nistec.element(c.fp)
+    nistec.power(c.fp, root, a, nistec.sqrt_exponent(c.fp))
+    let check = nistec.element(c.fp)
+    nistec.mul(c.fp, check, root, root)
+    root when limb.equal(check, a)
+}
+
+fn fp2_sqrt(c: *pairing.Curve, a: u64[]) -> u64[]? {
+    let l = c.l
+    let quarter = nistec.sqrt_exponent(c.fp)
+    quarter[0] -= 1
+    let a1: u64[] = __make(2 * l)
+    pairing.field_power(c, a1, a, quarter)
+    let alpha: u64[] = __make(2 * l)
+    pairing.field_square(c, alpha, a1)
+    pairing.field_mul(c, alpha, alpha, a)
+    let x0: u64[] = __make(2 * l)
+    pairing.field_mul(c, x0, a1, a)
+    let minus_one: u64[] = __make(2 * l)
+    __memmove(minus_one, c.fp.one)
+    pairing.field_neg(c, minus_one, minus_one)
+    let root: u64[] = __make(2 * l)
+    if limb.equal(alpha, minus_one) {
+        let zero = nistec.element(c.fp)
+        nistec.sub(c.fp, root[..l], zero, x0[l..])
+        __memmove(root[l..], x0[..l])
+    } else {
+        let exponent = half_of(c.fp.m)
+        let b: u64[] = __make(2 * l)
+        __memmove(b, alpha)
+        nistec.add(c.fp, b[..l], b[..l], c.fp.one)
+        pairing.field_power(c, b, b, exponent)
+        pairing.field_mul(c, root, b, x0)
+    }
+    let check: u64[] = __make(2 * l)
+    pairing.field_square(c, check, root)
+    root when limb.equal(check, a)
+}
+
+fn half_of(m: u64[]) -> u64[] {
+    let out: u64[] = __make(m.len)
+    for i in 0..m.len {
+        let high = if i + 1 < m.len { m[i + 1] << 63 } else { 0 }
+        out[i] = m[i] >> 1 | high
+    }
+    out
+}
+
+fn rest_zero(data: u8[]) -> bool {
+    var acc: u8 = data[0] & 0x1f
+    for i in 1..data.len {
+        acc |= data[i]
+    }
+    acc == 0
+}
+
+fn decode(c: *pairing.Curve, data: u8[], width: i64) -> pairing.Point ! Error {
+    let compressed = data.len == width
+    if !compressed && data.len != 2 * width {
+        fail Length
+    }
+    let flags = data[0]
+    let degree = if width == 48 { 1 } else { 2 }
+    if ((flags & compression) != 0) != compressed {
+        fail Flags
+    }
+    if (flags & infinity_flag) != 0 {
+        if (flags & sort_flag) != 0 || !rest_zero(data) {
+            fail Flags
+        }
+        return if degree == 1 { pairing.g1_infinity(c) } else { pairing.g2_infinity(c) }
+    }
+    if !compressed && (flags & sort_flag) != 0 {
+        fail Flags
+    }
+    let x_bytes: u8[] = __make(width)
+    __memmove(x_bytes, data[..width])
+    x_bytes[0] &= 0x1f
+    let x = coordinate_from(c, x_bytes, degree)?
+    let y = if compressed { recover_y(c, x, (flags & sort_flag) != 0)? } else { coordinate_from(c, data[width..], degree)? }
+    let p = pairing.from_affine(c, x, y)
+    if !pairing.on_curve(c, p) {
+        fail NotOnCurve
+    }
+    if !pairing.in_subgroup(c, p) {
+        fail NotInSubgroup
+    }
+    p
+}
+
+fn recover_y(c: *pairing.Curve, x: u64[], largest: bool) -> u64[] ! Error {
+    let rhs: u64[] = __make(x.len)
+    pairing.field_square(c, rhs, x)
+    pairing.field_mul(c, rhs, rhs, x)
+    let b = if x.len == c.l { c.b } else { c.b2 }
+    pairing.field_add(c, rhs, rhs, b)
+    let found = if x.len == c.l { fp_sqrt(c, rhs) } else { fp2_sqrt(c, rhs) }
+    let y = found ?? fail NotOnCurve
+    if lexicographically_largest(c, y) != largest {
+        pairing.field_neg(c, y, y)
+    }
+    y
+}
+
+fn encode(c: *pairing.Curve, p: pairing.Point, width: i64, compressed: bool) -> u8[] {
+    let size = if compressed { width } else { 2 * width }
+    let out: u8[] = __make(size)
+    let flag: u8 = if compressed { compression } else { 0 }
+    if pairing.is_infinity(p) {
+        out[0] = flag | infinity_flag
+        return out
+    }
+    let a = pairing.affine(c, p) ?? return out
+    __memmove(out, coordinate_bytes(c, a.x))
+    if compressed {
+        if lexicographically_largest(c, a.y) {
+            out[0] |= sort_flag
+        }
+    } else {
+        __memmove(out[width..], coordinate_bytes(c, a.y))
+    }
+    out[0] |= flag
+    out
+}
+
+/// Returns the point of `G1` in the zkcrypto and IETF pairing-friendly-curves encoding `data`: 48 bytes holding `x` with the flags in the top three bits of the first byte (compression, infinity, and whether `y` is the larger of `y` and `-y`), or 96 bytes holding `x || y` with only the infinity flag allowed.
+///
+/// Fails with `Length` for another size, `Flags` for flags that contradict the size or an infinity encoding with other bits set, `Coordinate` when `x` or `y` is not below the field prime, `NotOnCurve` when no point has those coordinates, and `NotInSubgroup` when the point is not in the subgroup of order `r`. Decoding is for public data: its running time depends on the point.
+pub fn decode_g1(c: *pairing.Curve, data: u8[]) -> pairing.Point ! Error {
+    decode(c, data, 48)
+}
+
+/// Returns the point of `G2` in the zkcrypto encoding `data`: 96 bytes holding `x` or 192 bytes holding `x || y`, each element `c0 + c1 u` of `Fp2` written as `c1 || c0`, with the flags of `decode_g1` on the first byte.
+pub fn decode_g2(c: *pairing.Curve, data: u8[]) -> pairing.Point ! Error {
+    decode(c, data, 96)
+}
+
+/// Returns the 48-byte compressed encoding of a point of `G1` that `decode_g1` reads.
+pub fn compress_g1(c: *pairing.Curve, p: pairing.Point) -> u8[] {
+    encode(c, p, 48, true)
+}
+
+/// Returns the 96-byte uncompressed encoding of a point of `G1` that `decode_g1` reads.
+pub fn serialize_g1(c: *pairing.Curve, p: pairing.Point) -> u8[] {
+    encode(c, p, 48, false)
+}
+
+/// Returns the 96-byte compressed encoding of a point of `G2` that `decode_g2` reads.
+pub fn compress_g2(c: *pairing.Curve, p: pairing.Point) -> u8[] {
+    encode(c, p, 96, true)
+}
+
+/// Returns the 192-byte uncompressed encoding of a point of `G2` that `decode_g2` reads.
+pub fn serialize_g2(c: *pairing.Curve, p: pairing.Point) -> u8[] {
+    encode(c, p, 96, false)
+}

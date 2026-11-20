@@ -1,0 +1,286 @@
+import std/big
+import std/crypto/limb
+import std/crypto/nistec
+
+/// The family of a pairing-friendly curve, which sets the loop of the Miller algorithm.
+enum Family {
+    /// A Barreto-Naehrig curve: the loop runs over `6x + 2` and ends with two lines through Frobenius images of `Q`.
+    Bn
+    /// A Barreto-Lynn-Scott curve of embedding degree 12: the loop runs over `|x|`, and the final exponent is `3 (p^12 - 1) / r`.
+    Bls12
+}
+
+/// How the curve `G2` lives on a sextic twist over `Fp2`.
+enum Twist {
+    /// A divisive twist `y^2 = x^3 + b / xi`, untwisted by `(x w^2, y w^3)`.
+    D
+    /// A multiplicative twist `y^2 = x^3 + b xi`, untwisted by `(x / w^2, y / w^3)`.
+    M
+}
+
+/// The constants that define a pairing-friendly curve `y^2 = x^3 + b` with embedding degree 12, in lower-case big-endian hexadecimal whose length is a multiple of 16.
+struct Params {
+    /// The field prime.
+    p: str
+    /// The prime order of `G1`, `G2` and `GT`.
+    r: str
+    /// The absolute value of the curve parameter `x`.
+    x: u64
+    /// Whether `x` is negative.
+    negative: bool
+    /// The family, which sets the Miller loop.
+    family: Family
+    /// The kind of sextic twist that carries `G2`.
+    twist: Twist
+    /// The integer `k` of the non-residue `xi = k + u` of `Fp6 = Fp2[v] / (v^3 - xi)`.
+    xi: u64
+    /// The coefficient `b` of `G1`.
+    b: u64
+    /// The `x` coordinate of the generator of `G1`.
+    g1x: str
+    /// The `y` coordinate of the generator of `G1`.
+    g1y: str
+    /// The `x` coordinate of the generator of `G2`, real part.
+    g2x0: str
+    /// The `x` coordinate of the generator of `G2`, imaginary part.
+    g2x1: str
+    /// The `y` coordinate of the generator of `G2`, real part.
+    g2y0: str
+    /// The `y` coordinate of the generator of `G2`, imaginary part.
+    g2y1: str
+}
+
+/// A point in Jacobian coordinates `(X : Y : Z)`, with `x = X / Z^2` and `y = Y / Z^3`. The point at infinity has `Z = 0`.
+///
+/// A point of `G1` has coordinates in `Fp`, `l` limbs each; a point of `G2` has coordinates in `Fp2`, `2 l` limbs each, real part first. Every coordinate is in Montgomery form.
+pub struct Point {
+    /// The `X` coordinate.
+    pub x: u64[]
+    /// The `Y` coordinate.
+    pub y: u64[]
+    /// The `Z` coordinate.
+    pub z: u64[]
+}
+
+/// A pairing-friendly curve with embedding degree 12: the field `Fp`, the tower `Fp2 = Fp[u] / (u^2 + 1)`, `Fp6 = Fp2[v] / (v^3 - xi)`, `Fp12 = Fp6[w] / (w^2 - v)`, the groups `G1` over `Fp` and `G2` over `Fp2`, the scalar field and the optimal ate pairing.
+///
+/// Elements are limb slices in Montgomery form: `l` limbs for `Fp`, `2 l` for `Fp2` (`c0 + c1 u`), `6 l` for `Fp6` (`b0 + b1 v + b2 v^2`) and `12 l` for `Fp12` (`c0 + c1 w`), lower coefficients first. A `Curve` holds scratch space and is not safe for concurrent use; make one per green thread.
+pub struct Curve {
+    /// The base field.
+    pub fp: *nistec.Field
+    /// The scalar field, modulo the group order `r`.
+    pub fr: *nistec.Field
+    /// The number of 64-bit limbs of an element of `Fp`.
+    pub l: i64
+    /// The generator of `G1`.
+    pub g1: Point
+    /// The generator of `G2`.
+    pub g2: Point
+    /// The coefficient `b` of `G1` in Montgomery form.
+    pub b: u64[]
+    /// The coefficient of the twist that carries `G2`, in `Fp2`.
+    pub b2: u64[]
+    family: Family
+    twist: Twist
+    negative: bool
+    xi0: u64[]
+    half: u64[]
+    gamma: u64[]
+    digits: i64[]
+    hard: u64[]
+    stack: u64[]
+    top: i64
+}
+
+fn from_hex(s: str) -> big.Int {
+    big.parse(s, 16) or big.zero()
+}
+
+fn limbs_of(a: big.Int, l: i64) -> u64[] {
+    limb.from_bytes(big.to_bytes(a), l)
+}
+
+fn montgomery(f: *nistec.Field, hex: str) -> u64[] {
+    let out = nistec.element(f)
+    nistec.to_mont(f, out, nistec.hex_limbs(hex))
+    out
+}
+
+fn small(f: *nistec.Field, value: u64) -> u64[] {
+    let plain = nistec.element(f)
+    plain[0] = value
+    let out = nistec.element(f)
+    nistec.to_mont(f, out, plain)
+    out
+}
+
+fn naf(n: big.Int) -> i64[] {
+    var digits: i64[] = []
+    var rest = n
+    let four = big.from_u64(4)
+    for !big.is_zero(rest) {
+        var d: i64 = 0
+        if big.is_odd(rest) {
+            let low = big.to_i64(big.rem(rest, four) or big.zero()) or 0
+            d = 2 - low
+            rest = big.sub(rest, big.from_i64(d))
+        }
+        digits.push(d)
+        rest = big.shr(rest, 1)
+    }
+    reversed(digits)
+}
+
+fn binary(n: u64) -> i64[] {
+    var digits: i64[] = []
+    var rest = n
+    for rest != 0 {
+        digits.push(i64(rest & 1))
+        rest = rest >> 1
+    }
+    reversed(digits)
+}
+
+fn reversed(xs: i64[]) -> i64[] {
+    var out: i64[] = []
+    var i = xs.len - 1
+    for i >= 0 {
+        out.push(xs[i])
+        i -= 1
+    }
+    out
+}
+
+fn loop_digits(params: Params) -> i64[] {
+    match params.family {
+        Bn => naf(big.add(big.mul(big.from_u64(params.x), big.from_u64(6)), big.from_u64(2)))
+        Bls12 => binary(params.x)
+    }
+}
+
+fn hard_exponent(family: Family, p: big.Int, r: big.Int) -> u64[] {
+    let p2 = big.mul(p, p)
+    let p4 = big.mul(p2, p2)
+    let phi = big.add(big.sub(p4, p2), big.one())
+    let multiple = match family {
+        Bn => big.one()
+        Bls12 => big.from_u64(3)
+    }
+    let h = big.quo(big.mul(phi, multiple), r) or big.zero()
+    limbs_of(h, (big.bit_len(h) + 63) / 64)
+}
+
+fn curve(params: Params) -> *Curve {
+    let fp = nistec.field(nistec.hex_limbs(params.p))
+    let fr = nistec.field(nistec.hex_limbs(params.r))
+    let l = fp.m.len
+    let p = from_hex(params.p)
+    let r = from_hex(params.r)
+    let c = new(Curve {
+        fp
+        fr
+        l
+        g1: Point { x: montgomery(fp, params.g1x), y: montgomery(fp, params.g1y), z: small(fp, 1) }
+        g2: Point { x: __make(2 * l), y: __make(2 * l), z: __make(2 * l) }
+        b: small(fp, params.b)
+        b2: __make(2 * l)
+        family: params.family
+        twist: params.twist
+        negative: params.negative
+        xi0: small(fp, params.xi)
+        half: halved(fp)
+        gamma: __make(12 * l)
+        digits: loop_digits(params)
+        hard: hard_exponent(params.family, p, r)
+        stack: __make(512 * l)
+        top: 0
+    })
+    __memmove(c.g2.x[..l], montgomery(fp, params.g2x0))
+    __memmove(c.g2.x[l..], montgomery(fp, params.g2x1))
+    __memmove(c.g2.y[..l], montgomery(fp, params.g2y0))
+    __memmove(c.g2.y[l..], montgomery(fp, params.g2y1))
+    __memmove(c.g2.z[..l], fp.one)
+    let xi = xi_element(c)
+    let b = fp2_of(c, c.b)
+    match params.twist {
+        D => {
+            let inverse: u64[] = __make(2 * l)
+            fp2_inverse(c, inverse, xi)
+            fp2_mul(c, c.b2, b, inverse)
+        }
+        M => fp2_mul(c, c.b2, b, xi)
+    }
+    let sixth = big.quo(big.sub(p, big.one()), big.from_u64(6)) or big.zero()
+    let gamma1: u64[] = __make(2 * l)
+    fp2_power(c, gamma1, xi, limbs_of(sixth, l))
+    __memmove(c.gamma[..l], fp.one)
+    for i in 1..6 {
+        fp2_mul(c, c.gamma[2 * l * i..2 * l * (i + 1)], c.gamma[2 * l * (i - 1)..2 * l * i], gamma1)
+    }
+    c
+}
+
+fn halved(fp: *nistec.Field) -> u64[] {
+    let out = small(fp, 2)
+    nistec.invert(fp, out, out)
+    out
+}
+
+fn xi_element(c: *Curve) -> u64[] {
+    let out: u64[] = __make(2 * c.l)
+    __memmove(out[..c.l], c.xi0)
+    __memmove(out[c.l..], c.fp.one)
+    out
+}
+
+fn fp2_of(c: *Curve, a: u64[]) -> u64[] {
+    let out: u64[] = __make(2 * c.l)
+    __memmove(out[..c.l], a)
+    out
+}
+
+fn take(c: *Curve, n: i64) -> u64[] {
+    let start = c.top
+    c.top += n
+    c.stack[start..c.top]
+}
+
+/// Returns BN254, the Barreto-Naehrig curve `y^2 = x^3 + 3` of EIP-196 and EIP-197 (also called alt_bn128 or bn256), with `x = 4965661367192848881`, `xi = 9 + u` and `G2` on the twist `y^2 = x^3 + 3 / xi`.
+pub fn bn254() -> *Curve {
+    curve(Params {
+        p: "30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47"
+        r: "30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001"
+        x: 4965661367192848881
+        negative: false
+        family: Bn
+        twist: D
+        xi: 9
+        b: 3
+        g1x: "0000000000000000000000000000000000000000000000000000000000000001"
+        g1y: "0000000000000000000000000000000000000000000000000000000000000002"
+        g2x0: "1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed"
+        g2x1: "198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2"
+        g2y0: "12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa"
+        g2y1: "090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b"
+    })
+}
+
+/// Returns BLS12-381, the curve `y^2 = x^3 + 4` with `x = -0xd201000000010000`, `xi = 1 + u` and `G2` on the twist `y^2 = x^3 + 4 (1 + u)`, with the generators of the IETF pairing-friendly curves draft and zkcrypto.
+pub fn bls12_381() -> *Curve {
+    curve(Params {
+        p: "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab"
+        r: "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001"
+        x: 0xd201000000010000
+        negative: true
+        family: Bls12
+        twist: M
+        xi: 1
+        b: 4
+        g1x: "17f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb"
+        g1y: "08b3f481e3aaa0f1a09e30ed741d8ae4fcf5e095d5d00af600db18cb2c04b3edd03cc744a2888ae40caa232946c5e7e1"
+        g2x0: "024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb8"
+        g2x1: "13e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e"
+        g2y0: "0ce5d527727d6e118cc9cdc6da2e351aadfd9baa8cbdd3a76d429a695160d12c923ac9cc3baca289e193548608b82801"
+        g2y1: "0606c4a02ea734cc32acd2b02bc28b99cb3e287e85a763af267492ab572e99ab3f370d275cec1da1aaa9075ff05f79be"
+    })
+}
