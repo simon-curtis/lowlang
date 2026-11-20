@@ -1,0 +1,261 @@
+import std/io
+import std/net
+import std/sync
+import std/tls
+
+const api_produce = 0
+const api_fetch = 1
+const api_list_offsets = 2
+const api_metadata = 3
+const api_offset_commit = 8
+const api_offset_fetch = 9
+const api_find_coordinator = 10
+const api_join_group = 11
+const api_heartbeat = 12
+const api_leave_group = 13
+const api_sync_group = 14
+const api_sasl_handshake = 17
+const api_versions = 18
+const api_create_topics = 19
+const api_delete_topics = 20
+const api_sasl_authenticate = 36
+
+const v_produce = 9
+const v_fetch = 12
+const v_list_offsets = 6
+const v_metadata = 9
+const v_offset_commit = 8
+const v_offset_fetch = 6
+const v_find_coordinator = 3
+const v_join_group = 6
+const v_heartbeat = 4
+const v_leave_group = 4
+const v_sync_group = 4
+const v_sasl_handshake = 1
+const v_versions = 3
+const v_create_topics = 5
+const v_delete_topics = 4
+const v_sasl_authenticate = 2
+
+struct ApiRange {
+    min: i64
+    max: i64
+}
+
+struct Conn {
+    stream: io.Stream
+    reader: *io.Reader
+    timeouts: *net.Timeouts
+    gate: sync.Mutex
+    client_id: str
+    timeout: i64
+    max_response: i64
+    next_id: i64
+    ranges: [i64: ApiRange]
+    closed: bool
+}
+
+fn pinned_versions() -> [i64: i64] {
+    [
+        api_produce: v_produce
+        api_fetch: v_fetch
+        api_list_offsets: v_list_offsets
+        api_metadata: v_metadata
+        api_offset_commit: v_offset_commit
+        api_offset_fetch: v_offset_fetch
+        api_find_coordinator: v_find_coordinator
+        api_join_group: v_join_group
+        api_heartbeat: v_heartbeat
+        api_leave_group: v_leave_group
+        api_sync_group: v_sync_group
+        api_create_topics: v_create_topics
+        api_delete_topics: v_delete_topics
+    ]
+}
+
+fn io_failure(e: io.Error) -> Error {
+    match e {
+        TimedOut => Timeout
+        TooLarge => TooLarge
+        _ => Closed
+    }
+}
+
+fn dial(o: Options, host: str, port: i64) -> net.Conn ! Error {
+    using conn = net.dial_within(host, port, o.connect_timeout) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    conn
+}
+
+fn named(host: str, config: tls.Config) -> tls.Config {
+    var out = config
+    if out.server_name.len == 0 {
+        out.server_name = host
+    }
+    out
+}
+
+fn open(o: Options, host: str, port: i64) -> *Conn ! Error {
+    using var raw = dial(o, host, port)?
+    raw.handle.timeouts.read = o.timeout
+    raw.handle.timeouts.write = o.timeout
+    var stream = net.stream(raw)
+    match o.tls {
+        some(config) => {
+            let session = tls.client_handle(stream, named(host, config)) catch {
+                TimedOut => fail Timeout
+                _ => fail Tls
+            }
+            stream = tls.stream_on(session)
+        }
+        none => {}
+    }
+    let wire = net.detach(mut raw)
+    let c = new(Conn {
+        stream
+        reader: io.reader(stream)
+        timeouts: wire.timeouts
+        gate: sync.mutex()
+        client_id: o.client_id
+        timeout: o.timeout
+        max_response: o.max_response
+        next_id: 1
+        ranges: [:]
+        closed: false
+    })
+    prepare(c, o) catch {
+        e => {
+            close_conn(c)
+            fail e
+        }
+    }
+    c
+}
+
+fn prepare(c: *Conn, o: Options) ! Error {
+    learn_versions(c)?
+    match o.sasl {
+        some(mechanism) => authenticate(c, mechanism)?
+        none => {}
+    }
+}
+
+fn close_conn(c: *Conn) {
+    c.closed = true
+    c.stream.close()
+}
+
+fn write_request(c: *Conn, api: i64, version: i64, request_flexible: bool, body: u8[]) -> i64 ! Error {
+    if c.closed {
+        fail Closed
+    }
+    c.timeouts.write = c.timeout
+    let id = c.next_id
+    c.next_id = (c.next_id + 1) & 0x7FFFFFFF
+    var header: u8[] = []
+    put_i16(mut header, api)
+    put_i16(mut header, version)
+    put_i32(mut header, id)
+    put_nullable_string(mut header, some(c.client_id))
+    if request_flexible {
+        put_tags(mut header)
+    }
+    var frame: u8[] = []
+    put_i32(mut frame, header.len + body.len)
+    io.append(mut frame, header)
+    io.append(mut frame, body)
+    io.write_all(c.stream, frame) catch {
+        e => {
+            close_conn(c)
+            fail io_failure(e)
+        }
+    }
+    id
+}
+
+fn send_only(c: *Conn, api: i64, version: i64, flexible: bool, body: u8[]) ! Error {
+    sync.lock(c.gate)
+    defer sync.unlock(c.gate)
+    write_request(c, api, version, flexible, body)?
+}
+
+fn exchange(c: *Conn, api: i64, version: i64, request_flexible: bool, response_flexible: bool, body: u8[], wait: i64) -> *Cursor ! Error {
+    sync.lock(c.gate)
+    defer sync.unlock(c.gate)
+    let id = write_request(c, api, version, request_flexible, body)?
+    c.timeouts.read = wait
+    let response = read_response(c) catch {
+        e => {
+            close_conn(c)
+            fail e
+        }
+    }
+    let cur = cursor(response)
+    let got = take_i32(cur)?
+    if got != id {
+        close_conn(c)
+        fail Protocol
+    }
+    if response_flexible {
+        skip_tags(cur)?
+    }
+    cur
+}
+
+fn read_response(c: *Conn) -> u8[] ! Error {
+    let size = io.be32(io.read_exact(c.reader, 4) catch { e => fail io_failure(e) }, 0)
+    if size < 4 || size > c.max_response {
+        fail TooLarge
+    }
+    io.read_exact(c.reader, size) catch { e => fail io_failure(e) }
+}
+
+fn call(c: *Conn, api: i64, version: i64, flexible: bool, body: u8[], wait: i64) -> *Cursor ! Error {
+    exchange(c, api, version, flexible, flexible, body, wait)
+}
+
+fn learn_versions(c: *Conn) ! Error {
+    var body: u8[] = []
+    put_compact_string(mut body, "low")
+    put_compact_string(mut body, "0")
+    put_tags(mut body)
+    let cur = exchange(c, api_versions, v_versions, true, false, body, c.timeout)?
+    let code = take_i16(cur)?
+    if code == 35 {
+        fail Unsupported
+    }
+    check(code)?
+    let n = take_compact_count(cur)?
+    for i in 0..n {
+        let api = take_i16(cur)?
+        let low = take_i16(cur)?
+        let high = take_i16(cur)?
+        skip_tags(cur)?
+        c.ranges[api] = ApiRange { min: low, max: high }
+    }
+    take_i32(cur)?
+    skip_tags(cur)?
+    let wanted = pinned_versions()
+    for api, version in wanted {
+        supports(c, api, version)?
+    }
+}
+
+fn supports(c: *Conn, api: i64, version: i64) ! Error {
+    match c.ranges[api] {
+        some(range) => {
+            if version < range.min || version > range.max {
+                fail Unsupported
+            }
+        }
+        none => fail Unsupported
+    }
+}
+
+fn check(code: i64) ! Error {
+    if code != 0 {
+        fail broker_error(code)
+    }
+}
