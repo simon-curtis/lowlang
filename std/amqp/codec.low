@@ -1,0 +1,514 @@
+import std/io
+import std/text
+
+const max_depth = 16
+const chunk = 65536
+
+/// The frame type of a method frame.
+pub const frame_method: i64 = 1
+/// The frame type of a content header frame.
+pub const frame_header: i64 = 2
+/// The frame type of a content body frame.
+pub const frame_body: i64 = 3
+/// The frame type of a heartbeat frame.
+pub const frame_heartbeat: i64 = 8
+
+/// The class identifier of the `basic` class, which carries message content.
+pub const class_basic: i64 = 60
+
+/// A value in a field table or array.
+///
+/// Decoding folds every integer width into `Int` and `f` and `d` into `Float`, and encoding writes `Int` as a signed 32-bit integer when it fits and as a signed 64-bit integer otherwise, which is what RabbitMQ and other brokers accept for numeric arguments.
+pub enum Value {
+    /// The absent value, tag `V`.
+    Void
+    /// A boolean, tag `t`.
+    Bool(value: bool)
+    /// An integer of any width: the tags `b`, `B`, `s`, `U`, `u`, `I`, `i`, `l` and `L` decode to it.
+    Int(value: i64)
+    /// A 32-bit or 64-bit floating-point number, tags `f` and `d`. Encoding writes tag `d`.
+    Float(value: f64)
+    /// A decimal, tag `D`: `value` divided by ten to the power `scale`.
+    Decimal(scale: i64, value: i64)
+    /// A long string, tag `S`.
+    Str(value: str)
+    /// A byte array, tag `x`.
+    Bytes(value: u8[])
+    /// An array of values, tag `A`.
+    Array(items: Value[])
+    /// A timestamp in seconds since the Unix epoch, tag `T`.
+    Time(seconds: i64)
+    /// A nested field table, tag `F`.
+    Table(fields: Field[])
+}
+
+/// A named value of a field table.
+pub struct Field {
+    /// The field name, at most 255 bytes.
+    pub name: str
+    /// The field value.
+    pub value: Value
+}
+
+/// The properties of a message, carried in the content header of the `basic` class.
+///
+/// A property is absent when it is empty or `0`: an empty string, an empty `headers`, or a `delivery_mode`, `priority` or `timestamp` of `0`. Decoding gives an absent property and one sent empty the same value.
+pub struct Properties {
+    /// The MIME type of the body.
+    pub content_type: str = ""
+    /// The content encoding of the body, such as `gzip`.
+    pub content_encoding: str = ""
+    /// Application headers.
+    pub headers: Field[] = []
+    /// `1` for a transient message and `2` for a persistent one.
+    pub delivery_mode: i64 = 0
+    /// The priority from `0` to `9`.
+    pub priority: i64 = 0
+    /// The identifier that ties a reply to its request.
+    pub correlation_id: str = ""
+    /// The queue a reply goes to.
+    pub reply_to: str = ""
+    /// The message time to live in milliseconds, written as text.
+    pub expiration: str = ""
+    /// The application message identifier.
+    pub message_id: str = ""
+    /// The message creation time in seconds since the Unix epoch.
+    pub timestamp: i64 = 0
+    /// The application message type.
+    pub kind: str = ""
+    /// The user the publisher authenticated as, which RabbitMQ verifies.
+    pub user_id: str = ""
+    /// The identifier of the publishing application.
+    pub app_id: str = ""
+}
+
+/// One AMQP frame: a type, a channel number and the payload between the header and the end marker.
+pub struct Frame {
+    /// One of `frame_method`, `frame_header`, `frame_body` and `frame_heartbeat`.
+    pub kind: i64
+    /// The channel number, `0` for the connection.
+    pub channel: i64
+    /// The payload of the frame.
+    pub payload: u8[]
+}
+
+/// The class, body size and properties of a decoded content header.
+pub struct Header {
+    /// The class identifier, `60` for `basic`.
+    pub class_id: i64
+    /// The size in bytes of the body that follows.
+    pub size: i64
+    /// The properties of the message.
+    pub properties: Properties
+}
+
+struct Cursor {
+    data: u8[]
+    at: i64
+}
+
+fn cursor(data: u8[]) -> *Cursor {
+    new(Cursor { data, at: 0 })
+}
+
+fn left(c: *Cursor) -> i64 {
+    c.data.len - c.at
+}
+
+fn transport(e: io.Error) -> Error {
+    match e {
+        TimedOut => Timeout
+        TooLarge => TooLarge
+        Malformed => Malformed
+        _ => Closed
+    }
+}
+
+fn take(c: *Cursor, n: i64) -> u8[] ! Error {
+    if n < 0 || n > left(c) {
+        fail Malformed
+    }
+    let part = c.data[c.at..c.at + n]
+    c.at += n
+    part
+}
+
+fn take_u8(c: *Cursor) -> i64 ! Error {
+    let part = take(c, 1)?
+    i64(part[0])
+}
+
+fn take_u16(c: *Cursor) -> i64 ! Error {
+    let part = take(c, 2)?
+    io.be16(part, 0)
+}
+
+fn take_u32(c: *Cursor) -> i64 ! Error {
+    let part = take(c, 4)?
+    io.be32(part, 0)
+}
+
+fn take_i32(c: *Cursor) -> i64 ! Error {
+    let v = take_u32(c)?
+    if v >= 2147483648 {
+        return v - 4294967296
+    }
+    v
+}
+
+fn take_i64(c: *Cursor) -> i64 ! Error {
+    let part = take(c, 8)?
+    io.be64(part, 0)
+}
+
+fn take_short_string(c: *Cursor) -> str ! Error {
+    let n = take_u8(c)?
+    let part = take(c, n)?
+    str(part)
+}
+
+fn take_long_bytes(c: *Cursor) -> u8[] ! Error {
+    let n = take_u32(c)?
+    take(c, n)?
+}
+
+fn take_long_string(c: *Cursor) -> str ! Error {
+    let part = take_long_bytes(c)?
+    str(part)
+}
+
+fn take_signed16(c: *Cursor) -> i64 ! Error {
+    let v = take_u16(c)?
+    if v >= 32768 {
+        return v - 65536
+    }
+    v
+}
+
+fn take_value(c: *Cursor, depth: i64) -> Value ! Error {
+    if depth > max_depth {
+        fail Malformed
+    }
+    let tag = take_u8(c)?
+    match tag {
+        't' => {
+            let b = take_u8(c)?
+            Value.Bool(b != 0)
+        }
+        'b' => {
+            let b = take_u8(c)?
+            Value.Int(if b >= 128 { b - 256 } else { b })
+        }
+        'B' => Value.Int(take_u8(c)?)
+        's' => Value.Int(take_signed16(c)?)
+        'U' => Value.Int(take_signed16(c)?)
+        'u' => Value.Int(take_u16(c)?)
+        'I' => Value.Int(take_i32(c)?)
+        'i' => Value.Int(take_u32(c)?)
+        'l' => Value.Int(take_i64(c)?)
+        'L' => Value.Int(take_i64(c)?)
+        'f' => {
+            let bits = take_u32(c)?
+            Value.Float(f64(text.float32_from_bits(u32(bits))))
+        }
+        'd' => {
+            let bits = take_i64(c)?
+            Value.Float(text.float_from_bits(u64(bits)))
+        }
+        'D' => {
+            let scale = take_u8(c)?
+            let v = take_i32(c)?
+            Value.Decimal(scale, v)
+        }
+        'S' => Value.Str(take_long_string(c)?)
+        'x' => Value.Bytes(take_long_bytes(c)?)
+        'A' => {
+            let n = take_u32(c)?
+            let inner = cursor(take(c, n)?)
+            var items: Value[] = []
+            for left(inner) > 0 {
+                items.push(take_value(inner, depth + 1)?)
+            }
+            Value.Array(items)
+        }
+        'T' => Value.Time(take_i64(c)?)
+        'F' => Value.Table(take_table(c, depth + 1)?)
+        'V' => Value.Void
+        _ => fail Malformed
+    }
+}
+
+fn take_table(c: *Cursor, depth: i64) -> Field[] ! Error {
+    let n = take_u32(c)?
+    let inner = cursor(take(c, n)?)
+    var fields: Field[] = []
+    for left(inner) > 0 {
+        let name = take_short_string(inner)?
+        let value = take_value(inner, depth)?
+        fields.push(Field { name, value })
+    }
+    fields
+}
+
+/// Decodes `data` as the body of a field table, the fields without the 32-bit length that precedes them on the wire.
+///
+/// Fails with `Malformed` when a name or value is cut short, a tag is unknown, or tables and arrays nest deeper than 16 levels.
+pub fn decode_fields(data: u8[]) -> Field[] ! Error {
+    let c = cursor(data)
+    var fields: Field[] = []
+    for left(c) > 0 {
+        let name = take_short_string(c)?
+        let value = take_value(c, 0)?
+        fields.push(Field { name, value })
+    }
+    fields
+}
+
+fn put_short_string(mut out: u8[], s: str) ! Error {
+    if s.len > 255 {
+        fail TooLarge
+    }
+    out.push(u8(s.len))
+    text.append(mut out, s)
+}
+
+fn put_long_bytes(mut out: u8[], b: u8[]) {
+    io.put_be32(mut out, b.len)
+    io.append(mut out, b)
+}
+
+fn put_long_string(mut out: u8[], s: str) {
+    io.put_be32(mut out, s.len)
+    text.append(mut out, s)
+}
+
+fn put_value(mut out: u8[], v: Value) ! Error {
+    match v {
+        Void => out.push('V')
+        Bool(b) => {
+            out.push('t')
+            out.push(if b { 1 } else { 0 })
+        }
+        Int(n) => {
+            if n >= -2147483648 && n <= 2147483647 {
+                out.push('I')
+                io.put_be32(mut out, n)
+            } else {
+                out.push('l')
+                io.put_be64(mut out, n)
+            }
+        }
+        Float(f) => {
+            out.push('d')
+            io.put_be64(mut out, i64(text.float_bits(f)))
+        }
+        Decimal(scale, n) => {
+            if scale < 0 || scale > 255 || n < -2147483648 || n > 2147483647 {
+                fail Malformed
+            }
+            out.push('D')
+            out.push(u8(scale))
+            io.put_be32(mut out, n)
+        }
+        Str(s) => {
+            out.push('S')
+            put_long_string(mut out, s)
+        }
+        Bytes(b) => {
+            out.push('x')
+            put_long_bytes(mut out, b)
+        }
+        Array(items) => {
+            out.push('A')
+            var inner: u8[] = []
+            for item in items {
+                put_value(mut inner, item)?
+            }
+            put_long_bytes(mut out, inner)
+        }
+        Time(s) => {
+            out.push('T')
+            io.put_be64(mut out, s)
+        }
+        Table(fields) => {
+            out.push('F')
+            put_table(mut out, fields)?
+        }
+    }
+}
+
+/// Returns `fields` as the body of a field table: each name as a short string followed by its tagged value, without a length prefix.
+///
+/// Fails with `TooLarge` for a name over 255 bytes and `Malformed` for a decimal that does not fit.
+pub fn encode_fields(fields: Field[]) -> u8[] ! Error {
+    var out: u8[] = []
+    for f in fields {
+        put_short_string(mut out, f.name)?
+        put_value(mut out, f.value)?
+    }
+    out
+}
+
+fn put_table(mut out: u8[], fields: Field[]) ! Error {
+    put_long_bytes(mut out, encode_fields(fields)?)
+}
+
+/// Returns the value of the field of `fields` named `name`, or `none`.
+pub fn find(fields: Field[], name: str) -> Value? {
+    for f in fields {
+        if f.name == name {
+            return some(f.value)
+        }
+    }
+    none
+}
+
+fn property_flags(p: Properties) -> i64 {
+    var flags = 0
+    if p.content_type.len > 0 { flags = flags | 0x8000 }
+    if p.content_encoding.len > 0 { flags = flags | 0x4000 }
+    if p.headers.len > 0 { flags = flags | 0x2000 }
+    if p.delivery_mode != 0 { flags = flags | 0x1000 }
+    if p.priority != 0 { flags = flags | 0x0800 }
+    if p.correlation_id.len > 0 { flags = flags | 0x0400 }
+    if p.reply_to.len > 0 { flags = flags | 0x0200 }
+    if p.expiration.len > 0 { flags = flags | 0x0100 }
+    if p.message_id.len > 0 { flags = flags | 0x0080 }
+    if p.timestamp != 0 { flags = flags | 0x0040 }
+    if p.kind.len > 0 { flags = flags | 0x0020 }
+    if p.user_id.len > 0 { flags = flags | 0x0010 }
+    if p.app_id.len > 0 { flags = flags | 0x0008 }
+    flags
+}
+
+fn put_optional(mut out: u8[], s: str) ! Error {
+    if s.len > 0 {
+        put_short_string(mut out, s)?
+    }
+}
+
+/// Returns the payload of a content header frame for a message of `size` bytes in the class `class_id`, with the properties `p`.
+///
+/// Fails with `Argument` for a `delivery_mode`, `priority` or `timestamp` outside its range and with `TooLarge` for a string property over 255 bytes.
+pub fn encode_header(class_id: i64, size: i64, p: Properties) -> u8[] ! Error {
+    if p.delivery_mode < 0 || p.delivery_mode > 255 || p.priority < 0 || p.priority > 255 || p.timestamp < 0 {
+        fail Argument
+    }
+    var out: u8[] = []
+    io.put_be16(mut out, class_id)
+    io.put_be16(mut out, 0)
+    io.put_be64(mut out, size)
+    io.put_be16(mut out, property_flags(p))
+    put_optional(mut out, p.content_type)?
+    put_optional(mut out, p.content_encoding)?
+    if p.headers.len > 0 {
+        put_table(mut out, p.headers)?
+    }
+    if p.delivery_mode != 0 {
+        out.push(u8(p.delivery_mode))
+    }
+    if p.priority != 0 {
+        out.push(u8(p.priority))
+    }
+    put_optional(mut out, p.correlation_id)?
+    put_optional(mut out, p.reply_to)?
+    put_optional(mut out, p.expiration)?
+    put_optional(mut out, p.message_id)?
+    if p.timestamp != 0 {
+        io.put_be64(mut out, p.timestamp)
+    }
+    put_optional(mut out, p.kind)?
+    put_optional(mut out, p.user_id)?
+    put_optional(mut out, p.app_id)?
+    out
+}
+
+fn has(flags: i64, bit: i64) -> bool {
+    flags & bit != 0
+}
+
+/// Decodes the payload of a content header frame.
+///
+/// Fails with `Malformed` when the payload is cut short, has bytes left over, sets the continuation flag, has a weight other than `0` or a body size that is negative.
+pub fn decode_header(payload: u8[]) -> Header ! Error {
+    let c = cursor(payload)
+    let class_id = take_u16(c)?
+    if take_u16(c)? != 0 {
+        fail Malformed
+    }
+    let size = take_i64(c)?
+    if size < 0 {
+        fail Malformed
+    }
+    let flags = take_u16(c)?
+    if has(flags, 1) {
+        fail Malformed
+    }
+    var p = Properties {}
+    if has(flags, 0x8000) { p.content_type = take_short_string(c)? }
+    if has(flags, 0x4000) { p.content_encoding = take_short_string(c)? }
+    if has(flags, 0x2000) { p.headers = take_table(c, 0)? }
+    if has(flags, 0x1000) { p.delivery_mode = take_u8(c)? }
+    if has(flags, 0x0800) { p.priority = take_u8(c)? }
+    if has(flags, 0x0400) { p.correlation_id = take_short_string(c)? }
+    if has(flags, 0x0200) { p.reply_to = take_short_string(c)? }
+    if has(flags, 0x0100) { p.expiration = take_short_string(c)? }
+    if has(flags, 0x0080) { p.message_id = take_short_string(c)? }
+    if has(flags, 0x0040) { p.timestamp = take_i64(c)? }
+    if has(flags, 0x0020) { p.kind = take_short_string(c)? }
+    if has(flags, 0x0010) { p.user_id = take_short_string(c)? }
+    if has(flags, 0x0008) { p.app_id = take_short_string(c)? }
+    if has(flags, 0x0004) { take_short_string(c)? }
+    if left(c) > 0 {
+        fail Malformed
+    }
+    Header { class_id, size, properties: p }
+}
+
+/// Returns `f` as bytes: the type, the channel, the payload size, the payload and the end marker `0xCE`.
+pub fn encode_frame(f: Frame) -> u8[] {
+    var out: u8[] = []
+    out.push(u8(f.kind))
+    io.put_be16(mut out, f.channel)
+    io.put_be32(mut out, f.payload.len)
+    io.append(mut out, f.payload)
+    out.push(0xCE)
+    out
+}
+
+fn read_payload(r: *io.Reader, n: i64) -> u8[] ! Error {
+    if n <= chunk {
+        return io.read_exact(r, n) catch transport
+    }
+    var out: u8[] = []
+    var remaining = n
+    for remaining > 0 {
+        let step = if remaining > chunk { chunk } else { remaining }
+        let part = io.read_exact(r, step) catch transport
+        io.append(mut out, part)
+        remaining -= step
+    }
+    out
+}
+
+/// Reads one frame from `r`, blocking until it is complete.
+///
+/// A `limit` above `0` is the largest frame in bytes, counting the seven byte header and the end marker; a longer frame fails with `TooLarge` before its payload is read. Fails with `Closed` at the end of the input or on a read failure, `Timeout` when a read times out, and `Malformed` for a frame type other than `1`, `2`, `3` and `8` or a missing end marker.
+pub fn read_frame(r: *io.Reader, limit: i64) -> Frame ! Error {
+    let head = io.read_exact(r, 7) catch transport
+    let kind = i64(head[0])
+    if kind != frame_method && kind != frame_header && kind != frame_body && kind != frame_heartbeat {
+        fail Malformed
+    }
+    let channel = io.be16(head, 1)
+    let size = io.be32(head, 3)
+    if limit > 0 && size + 8 > limit {
+        fail TooLarge
+    }
+    let payload = read_payload(r, size)?
+    let end = io.read_byte(r) catch transport
+    if end != 0xCE {
+        fail Malformed
+    }
+    Frame { kind, channel, payload }
+}
