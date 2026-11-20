@@ -2,6 +2,19 @@ import std/io
 import std/sys
 import std/text
 
+extern "user32" {
+    fn FindWindowA(class: ptr, title: ptr) -> i64
+    fn SendMessageTimeoutW(window: i64, message: u32, wparam: i64, lparam: ptr, flags: u32, timeout: u32, mut result: i64) -> i64
+}
+
+extern "kernel32" {
+    fn CreateFileMappingA(file: i64, security: ptr, protect: u32, size_high: u32, size_low: u32, name: ptr) -> i64
+    fn MapViewOfFile(mapping: i64, access: u32, offset_high: u32, offset_low: u32, length: i64) -> i64
+    fn UnmapViewOfFile(address: i64) -> i32
+    fn CloseHandle(handle: i64) -> i32
+    fn RtlMoveMemory(destination: ptr, source: ptr, size: i64)
+}
+
 const pipe_prefix = "\\\\.\\pipe\\"
 const openssh_pipe = "\\\\.\\pipe\\openssh-ssh-agent"
 
@@ -19,4 +32,95 @@ fn dial(path: str) -> io.Stream ! Error {
 
 fn default_path() -> str {
     openssh_pipe
+}
+
+const pageant_class = "Pageant"
+const pageant_copy_data = 0x804e50ba
+const wm_copydata: u32 = 0x4A
+const abort_if_hung: u32 = 2
+const reply_timeout_ms: u32 = 60000
+const mapping_size = 262144
+const page_readwrite: u32 = 4
+const map_write: u32 = 2
+const invalid_handle = -1
+
+fn pageant_window() -> i64 {
+    FindWindowA(cstr(pageant_class), cstr(pageant_class))
+}
+
+fn mapping_name() -> str ! io.Error {
+    let random = sys.random_bytes(8)?
+    var name = "PageantRequest"
+    for b in random {
+        name = "{name}{i64(b) / 16:x}{i64(b) % 16:x}"
+    }
+    name
+}
+
+fn announce(window: i64, name: str) ! io.Error {
+    let text = io.buffer(name.len + 1)
+    __memmove(text, name)
+    let kept_text = pin(text)
+    let data = io.buffer(24)
+    io.set_le64(data, 0, pageant_copy_data)
+    io.set_le32(data, 8, text.len)
+    io.set_le64(data, 16, i64(kept_text))
+    let kept_data = pin(data)
+    var result = 0
+    let sent = SendMessageTimeoutW(window, wm_copydata, 0, kept_data, abort_if_hung, reply_timeout_ms, mut result)
+    unpin(kept_data)
+    unpin(kept_text)
+    if sent == 0 {
+        fail TimedOut
+    }
+    if result == 0 {
+        fail Denied
+    }
+}
+
+fn pageant_transact(frame: u8[]) -> u8[] ! io.Error {
+    if frame.len > mapping_size {
+        fail TooLarge
+    }
+    let window = pageant_window()
+    if window == 0 {
+        fail NotConnected
+    }
+    let name = mapping_name()?
+    let mapping = CreateFileMappingA(invalid_handle, null, page_readwrite, 0, u32(mapping_size), cstr(name))
+    if mapping == 0 {
+        fail Denied
+    }
+    defer CloseHandle(mapping)
+    let view = MapViewOfFile(mapping, map_write, 0, 0, mapping_size)
+    if view == 0 {
+        fail Denied
+    }
+    defer UnmapViewOfFile(view)
+    RtlMoveMemory(__slice_ptr(__str_raw(view, frame.len)), __slice_ptr(frame), frame.len)
+    announce(window, name)?
+    let header = io.buffer(4)
+    RtlMoveMemory(__slice_ptr(header), __slice_ptr(__str_raw(view, 4)), 4)
+    let size = io.be32(header, 0)
+    if size < 1 || size > max_message || size + 4 > mapping_size {
+        fail Invalid
+    }
+    let reply = io.buffer(size + 4)
+    RtlMoveMemory(__slice_ptr(reply), __slice_ptr(__str_raw(view, size + 4)), size + 4)
+    reply
+}
+
+fn dial_pageant() -> io.Stream ! Error {
+    if pageant_window() == 0 {
+        fail NoAgent
+    }
+    pageant_stream(pageant_transact)
+}
+
+fn connect_fallback(failure: Error) -> Agent ! Error {
+    connect(openssh_pipe) catch {
+        e => connect_pageant() catch {
+            p => fail failure
+        }
+    }
 }
