@@ -70,7 +70,7 @@ Read `## Compiler`. `compiler/ir` builds SSA, `compiler/amd64` emits assembly, `
 
 ## Standard library
 
-Read `## Standard library`. Modules live in `std/<name>/`, written in Low, with runnable programs that show how to use the module in `examples/`. Unit tests live in `std/<module>/*_test.low` and run with `low test std/<module>`. `compiler/compiler/prelude/prelude.low` carries the runtime and the generic map code.
+Read `## Standard library`. Modules live in `std/<name>/`, written in Low, with runnable programs that show how to use the module in `examples/`. Unit tests live in `std/<module>/*_test.low` and run with `low test std/<module>`. `compiler/compiler/prelude/prelude.low` carries the runtime and the generic map code. `compiler/lint/std_index.low` lists the public functions the `use-std` lint compares against; after changing a public std function, run `tablegen stdindex std compiler/lint` (built from `compiler/tablegen`) and `low run compiler/tests/tablegen`, which fails while the index is stale.
 
 ## Tests
 

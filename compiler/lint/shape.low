@@ -1,0 +1,206 @@
+import ast
+import diag
+import lexer
+import std/text
+
+pub struct Shape {
+    pub params: []str
+    pub result: str
+    pub body: str
+}
+
+struct Encoder {
+    params: []str
+    bound: [str: str] = [:]
+    subject: str = ""
+    decisions: i64 = 0
+}
+
+pub fn shape_of(f: *ast.Func) -> Shape? {
+    if f.external != none || f.error != none || f.result == none || f.params.len == 0 {
+        return none
+    }
+    let body = f.body ?? return none
+    var names: []str = []
+    var types: []str = []
+    for p in f.params {
+        if p.mutable {
+            return none
+        }
+        names.push(p.name)
+        types.push(type_pattern(f, p.type_name))
+    }
+    let e = new(Encoder { params: names })
+    let encoded = e.shape_block(body) ?? return none
+    if e.decisions == 0 {
+        return none
+    }
+    Shape { params: types, result: type_pattern(f, f.result), body: encoded }
+}
+
+fn type_pattern(f: *ast.Func, t: *ast.TypeName?) -> str {
+    let written = ast.type_text(t)
+    for i, p in f.type_params {
+        if p.name == written {
+            return "T{i}"
+        }
+    }
+    written
+}
+
+fn shape_block(e: *Encoder, b: *ast.Block) -> str? {
+    var end = b.stmts.len
+    var last: ast.Expr? = b.tail
+    if last == none {
+        if end == 0 {
+            return none
+        }
+        last = returned(b.stmts[end - 1])
+        end -= 1
+    }
+    let tail = last ?? return none
+    var parts: []str = []
+    for i in 0..end {
+        let link = guard(b.stmts[i]) ?? return none
+        let result = returned(link.then.stmts[0]) ?? return none
+        let decided = e.shape_decision(link.cond, result) ?? return none
+        parts.push(decided)
+    }
+    let fallback = e.shape_value(tail) ?? return none
+    parts.push(fallback)
+    text.join(parts, " ; ")
+}
+
+fn returned(s: ast.Stmt) -> ast.Expr? {
+    match s {
+        Return(r) => r.value
+        _ => none
+    }
+}
+
+fn shape_value(e: *Encoder, x: ast.Expr) -> str? {
+    match x {
+        If(i) => e.shape_if(i)
+        Match(m) => e.shape_match(m)
+        Block(b) => e.shape_block(b)
+        _ => e.shape_expr(x)
+    }
+}
+
+fn shape_decision(e: *Encoder, cond: ast.Expr, result: ast.Expr) -> str? {
+    let test = e.shape_expr(cond) ?? return none
+    let outcome = e.shape_value(result) ?? return none
+    e.decisions += 1
+    "{test} ? {outcome}"
+}
+
+fn shape_if(e: *Encoder, head: *ast.If) -> str? {
+    var parts: []str = []
+    var cur = head
+    for {
+        let decided = e.shape_decision(cur.cond, ast.Expr.Block(cur.then)) ?? return none
+        parts.push(decided)
+        let otherwise = cur.otherwise ?? return none
+        match otherwise {
+            If(next) => {
+                cur = next
+            }
+            _ => {
+                let rest = e.shape_value(otherwise) ?? return none
+                parts.push(rest)
+                return text.join(parts, " ; ")
+            }
+        }
+    }
+}
+
+fn shape_match(e: *Encoder, m: *ast.Match) -> str? {
+    let subject = e.shape_expr(m.x) ?? return none
+    var parts: []str = []
+    for arm in m.arms {
+        let p = arm.pattern
+        match p.test {
+            some(test) => {
+                e.subject = subject
+                let decided = e.shape_decision(test, arm.body) ?? return none
+                parts.push(decided)
+                continue
+            }
+            none => {}
+        }
+        if !catch_all(p) {
+            return none
+        }
+        let outer = e.bound[p.name]
+        e.bound[p.name] = subject
+        let rest = e.shape_value(arm.body) ?? return none
+        match outer {
+            some(s) => {
+                e.bound[p.name] = s
+            }
+            none => e.bound.delete(p.name)
+        }
+        parts.push(rest)
+        return text.join(parts, " ; ")
+    }
+    none
+}
+
+fn catch_all(p: *ast.Pattern) -> bool {
+    if p.variant != none || p.bindings.len > 0 {
+        return false
+    }
+    p.name == "_" || p.local != none
+}
+
+fn shape_expr(e: *Encoder, x: ast.Expr) -> str? {
+    match x {
+        IntLit(n) => "{n.value}"
+        FloatLit(n) => "{n.value}f"
+        StrLit(n) => diag.quote(n.value)
+        BoolLit(n) => "{n.value}"
+        Ident(n) => e.shape_name(n)
+        Subject(_) => e.subject
+        Unary(n) => {
+            let operand = e.shape_expr(n.x) ?? return none
+            "({lexer.kind_text(n.op)}{operand})"
+        }
+        Binary(n) => e.shape_binary(n)
+        _ => none
+    }
+}
+
+fn shape_name(e: *Encoder, n: *ast.Ident) -> str? {
+    if n.variant != none || n.constant != none || n.null {
+        return none
+    }
+    match e.bound[n.name] {
+        some(s) => return s
+        none => {}
+    }
+    for i, p in e.params {
+        if p == n.name {
+            return "x{i}"
+        }
+    }
+    none
+}
+
+fn shape_binary(e: *Encoder, n: *ast.Binary) -> str? {
+    let x = e.shape_expr(n.x) ?? return none
+    let y = e.shape_expr(n.y) ?? return none
+    match n.op {
+        Gt => "({y} < {x})"
+        GtEq => "({y} <= {x})"
+        Eq => symmetric(x, "==", y)
+        NotEq => symmetric(x, "!=", y)
+        _ => "({x} {lexer.kind_text(n.op)} {y})"
+    }
+}
+
+fn symmetric(x: str, op: str, y: str) -> str {
+    if y < x {
+        return "({y} {op} {x})"
+    }
+    "({x} {op} {y})"
+}
