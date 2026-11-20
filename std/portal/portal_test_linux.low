@@ -1,0 +1,250 @@
+import std/cancel
+import std/dbus
+import std/file
+import std/io
+import std/os
+import std/process
+import std/sync
+import std/testing
+import std/text
+import std/time
+import std/time/duration
+
+struct Daemon {
+    address: str
+    handle: *process.ChildHandle
+}
+
+struct Fake {
+    lock: sync.Mutex
+    closed: chan[bool]
+    tokens: str[]
+}
+
+fn bus_config(dir: str) -> str {
+    "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n<busconfig>\n  <type>session</type>\n  <listen>unix:path={dir}/bus</listen>\n  <auth>EXTERNAL</auth>\n  <policy context=\"default\">\n    <allow send_destination=\"*\" eavesdrop=\"true\"/>\n    <allow eavesdrop=\"true\"/>\n    <allow own=\"*\"/>\n  </policy>\n</busconfig>\n"
+}
+
+fn first_line(s: io.Stream) -> str ! io.Error {
+    var collected: u8[] = []
+    let buf = io.buffer(512)
+    for {
+        let n = s.read(buf)?
+        if n == 0 {
+            break
+        }
+        io.append(mut collected, buf[..n])
+        if text.index_byte(str(collected), '\n') >= 0 {
+            break
+        }
+    }
+    text.trim(str(collected))
+}
+
+fn start_daemon(dir: str) -> Daemon ! io.Error {
+    let config = "{dir}/bus.conf"
+    file.write_text(config, bus_config(dir))?
+    var command = process.command("dbus-daemon", ["--config-file={config}", "--nofork", "--nopidfile", "--print-address=1"])
+    command.stdout = process.Stdio.Piped
+    let handle = process.start_handle(command)?
+    let stdout = match handle.stdout {
+        some(s) => s
+        none => fail Invalid
+    }
+    let address = first_line(stdout)?
+    if address.len == 0 {
+        fail Invalid
+    }
+    Daemon { address, handle }
+}
+
+fn with_daemon(t: *testing.T, body: fn(*testing.T, Daemon)) {
+    if (process.find("dbus-daemon") ?? "").len == 0 {
+        t.skip("dbus-daemon is not installed")
+    }
+    let dir = file.temp_dir("lowportal") catch {
+        e => {
+            t.error("temporary directory: {e}")
+            return
+        }
+    }
+    let daemon = start_daemon(dir) catch {
+        e => {
+            t.error("starting dbus-daemon: {e}")
+            file.remove_all(dir) or {}
+            return
+        }
+    }
+    using child = process.adopt(daemon.handle)
+    body(t, daemon)
+    file.remove_all(dir) or {}
+}
+
+fn connect_to(t: *testing.T, d: Daemon) -> *dbus.ConnectionHandle {
+    let addresses = dbus.parse_addresses(d.address) catch {
+        e => {
+            t.fatal("address {d.address}: {e}")
+            panic("unreachable")
+        }
+    }
+    using var c = dbus.connect_addresses(addresses) catch {
+        e => {
+            t.fatal("connect: {e}")
+            panic("unreachable")
+        }
+    }
+    dbus.detach(mut c)
+}
+
+fn respond_after(connection: *dbus.ConnectionHandle, path: str, code: i64, results: [str: dbus.Value]) {
+    time.sleep_for(duration.milliseconds(20))
+    let signal = dbus.signal(path, "org.freedesktop.portal.Request", "Response", [dbus.Value.UInt32(u32(code)), dbus.dict(results)])
+    dbus.send_on(connection, signal) or 0
+}
+
+fn answer_open(fake: *Fake, service: *dbus.Service, c: dbus.Call) -> dbus.Value[] ! dbus.Error {
+    let m = c.message
+    let options = dbus.dict_of(m.body[2])?
+    let token = dbus.string_of(options["handle_token"] ?? dbus.Value.String(""))?
+    sync.lock(fake.lock)
+    fake.tokens.push(token)
+    sync.unlock(fake.lock)
+    let path = request_path(m.sender, token)
+    let close = dbus.InterfaceSpec {
+        name: "org.freedesktop.portal.Request",
+        methods: [dbus.MethodSpec { name: "Close", handler: fn(call: dbus.Call) -> dbus.Value[] ! dbus.Error {
+            fake.closed <- true
+            []
+        } }],
+        signals: [dbus.SignalSpec { name: "Response", signature: "ua{{sv}}" }],
+    }
+    dbus.export(service, path, close)?
+    let title = dbus.string_of(m.body[1])?
+    let nothing: [str: dbus.Value] = [:]
+    match title {
+        "accept" => { spawn respond_after(c.connection, path, 0, ["uris": dbus.strings(["file:///tmp/a.png", "file:///tmp/b.png"])]) }
+        "dismiss" => { spawn respond_after(c.connection, path, 1, nothing) }
+        "fail" => { spawn respond_after(c.connection, path, 2, nothing) }
+        _ => {}
+    }
+    [dbus.Value.ObjectPath(path)]
+}
+
+fn serve_portal(t: *testing.T, d: Daemon, fake: *Fake) -> *dbus.ConnectionHandle {
+    let h = connect_to(t, d)
+    let owner = dbus.request_name_on(h, "org.freedesktop.portal.Desktop", 0) catch {
+        e => {
+            t.fatal("request_name: {e}")
+            return h
+        }
+    }
+    t.equal(owner, dbus.NameReply.PrimaryOwner)
+    let service = dbus.serve_on(h)
+    let spec = dbus.InterfaceSpec {
+        name: "org.freedesktop.portal.FileChooser",
+        methods: [dbus.MethodSpec { name: "OpenFile", in_signature: "ssa{{sv}}", out_signature: "o", handler: fn(c: dbus.Call) -> dbus.Value[] ! dbus.Error {
+            answer_open(fake, service, c)?
+        } }],
+    }
+    dbus.export(service, "/org/freedesktop/portal/desktop", spec) catch {
+        e => t.fatal("export: {e}")
+    }
+    h
+}
+
+fn with_fake_portal(t: *testing.T, body: fn(*testing.T, Portal, *Fake)) {
+    with_daemon(t, fn(t, d) {
+        let fake = new(Fake { lock: sync.mutex(), closed: chan[bool](1), tokens: [] })
+        let server = serve_portal(t, d, fake)
+        let client = connect_to(t, d)
+        using p = over(client)
+        body(t, p, fake)
+        dbus.shutdown_on(client)
+        dbus.shutdown_on(server)
+    })
+}
+
+fn chosen(t: *testing.T, p: Portal, title: str) -> Selection? {
+    open_file(p, FileDialog { title }) catch {
+        e => {
+            t.fatal("open_file {title}: {e}")
+            return none
+        }
+    }
+}
+
+fn test_a_chosen_file_arrives_in_the_response_signal(t: *testing.T) {
+    with_fake_portal(t, fn(t, p, fake) {
+        let selection = chosen(t, p, "accept") ?? Selection { uris: [], filter: none }
+        testing.equal_slice(t, selection.uris, ["file:///tmp/a.png", "file:///tmp/b.png"])
+        testing.equal(t, fake.tokens.len, 1)
+    })
+}
+
+fn test_each_request_takes_its_own_handle_token(t: *testing.T) {
+    with_fake_portal(t, fn(t, p, fake) {
+        chosen(t, p, "accept")
+        chosen(t, p, "accept")
+        testing.equal(t, fake.tokens.len, 2)
+        testing.not_equal(t, fake.tokens[0], fake.tokens[1])
+    })
+}
+
+fn test_a_dismissed_dialog_gives_none(t: *testing.T) {
+    with_fake_portal(t, fn(t, p, fake) {
+        testing.is_true(t, chosen(t, p, "dismiss") == none)
+    })
+}
+
+fn test_a_failed_request_is_a_remote_error(t: *testing.T) {
+    with_fake_portal(t, fn(t, p, fake) {
+        open_file(p, FileDialog { title: "fail" }) catch {
+            e => {
+                testing.equal(t, e, dbus.Error.Remote("org.freedesktop.portal.Error.Failed", "the request ended with response code 2"))
+                return
+            }
+        }
+        t.error("a failed request succeeded")
+    })
+}
+
+fn cancel_soon(token: *cancel.Token) {
+    time.sleep_for(duration.milliseconds(50))
+    cancel.cancel(token)
+}
+
+fn test_cancelling_a_waiting_request_closes_it(t: *testing.T) {
+    with_fake_portal(t, fn(t, p, fake) {
+        let token = cancel.token()
+        spawn cancel_soon(token)
+        open_file(p, FileDialog { title: "hang", cancel: some(token) }) catch {
+            e => {
+                testing.equal(t, e, dbus.Error.Cancelled)
+                let closed = <-fake.closed
+                testing.is_true(t, closed != none)
+                return
+            }
+        }
+        t.error("a cancelled request succeeded")
+    })
+}
+
+fn test_the_session_portal_reports_a_colour_scheme(t: *testing.T) {
+    using p = connect_within(2000) catch {
+        e => {
+            t.skip("no session bus: {e}")
+            return
+        }
+    }
+    let owned = dbus.name_has_owner_on(p.handle, "org.freedesktop.portal.Desktop") or false
+    if !owned {
+        t.skip("no desktop portal runs on the session bus")
+    }
+    let scheme = color_scheme(p) catch {
+        e => {
+            t.fatal("color_scheme: {e}")
+            return
+        }
+    }
+    testing.is_true(t, scheme == ColorScheme.NoPreference || scheme == ColorScheme.Dark || scheme == ColorScheme.Light)
+}
