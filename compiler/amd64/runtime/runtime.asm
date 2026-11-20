@@ -1519,6 +1519,7 @@ rt_gc:
 	ret
 
 rt_gcw_start_mark:
+	call rt_gcw_grow
 	xor eax, eax
 	mov [rip+rt_gcw_gindex], rax
 	mov [rip+rt_gcw_rindex], rax
