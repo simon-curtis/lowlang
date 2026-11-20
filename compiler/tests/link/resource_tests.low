@@ -1,0 +1,476 @@
+import asm
+import link
+import oracletool
+import resource
+import std/io
+import std/slices
+import std/testing
+import std/text
+import std/unicode
+import std/unicode/utf16
+
+const resource_icon = 3
+const resource_group_icon = 14
+const resource_version = 16
+const resource_manifest = 24
+const resource_language = 0x0409
+const subdirectory_bit = 0x80000000
+const png_signature_low = 0x474e5089
+const png_signature_high = 0x0a1a0a0d
+
+const manifest_text = "<assembly manifestVersion=\"1.0\"/>"
+
+struct Leaf {
+    kind: i64
+    name: i64
+    language: i64
+    data: []u8
+}
+
+struct VersionNode {
+    key: str
+    kind: i64
+    value_length: i64
+    value: []u8
+    children: []VersionNode
+    length: i64
+}
+
+struct GroupEntry {
+    width: i64
+    height: i64
+    colors: i64
+    planes: i64
+    bits: i64
+    size: i64
+    id: i64
+}
+
+struct IconRejection {
+    name: str
+    icon: []u8
+    want: str
+}
+
+fn dib_image(side: i64, bits: i64) -> []u8 {
+    var out: []u8 = []
+    io.put_le(mut out, 40, 4)
+    io.put_le(mut out, side, 4)
+    io.put_le(mut out, side * 2, 4)
+    io.put_le(mut out, 1, 2)
+    io.put_le(mut out, bits, 2)
+    for _ in 0..24 {
+        out.push(0)
+    }
+    for i in 0..side * side * 4 {
+        out.push(u8(i))
+    }
+    out
+}
+
+fn png_image(side: i64, depth: i64, color_type: i64) -> []u8 {
+    var out: []u8 = []
+    io.put_le(mut out, png_signature_low, 4)
+    io.put_le(mut out, png_signature_high, 4)
+    io.put_be32(mut out, 13)
+    out.push(u8('I'))
+    out.push(u8('H'))
+    out.push(u8('D'))
+    out.push(u8('R'))
+    io.put_be32(mut out, side)
+    io.put_be32(mut out, side)
+    out.push(u8(depth))
+    out.push(u8(color_type))
+    for _ in 0..8 {
+        out.push(0)
+    }
+    out
+}
+
+fn icon_file(images: [][]u8) -> []u8 {
+    var out: []u8 = []
+    io.put_le(mut out, 0, 2)
+    io.put_le(mut out, 1, 2)
+    io.put_le(mut out, images.len, 2)
+    var offset = 6 + images.len * 16
+    for image in images {
+        for _ in 0..2 {
+            out.push(0)
+        }
+        io.put_le(mut out, 0, 1)
+        io.put_le(mut out, 0, 1)
+        io.put_le(mut out, 1, 2)
+        io.put_le(mut out, 32, 2)
+        io.put_le(mut out, image.len, 4)
+        io.put_le(mut out, offset, 4)
+        offset += image.len
+    }
+    for image in images {
+        io.append(mut out, image)
+    }
+    out
+}
+
+fn sample_images() -> [][]u8 {
+    [dib_image(16, 32), dib_image(32, 32), png_image(48, 8, 6), png_image(256, 8, 2)]
+}
+
+fn sample_resources() -> resource.Resources {
+    resource.Resources {
+        icon: icon_file(sample_images())
+        manifest: bytes(manifest_text)
+        version: "1.4.0"
+        info: [
+            resource.FileInfo { key: "CompanyName", value: "Example Ltd" }
+            resource.FileInfo { key: "ProductName", value: "Éditeur" }
+        ]
+    }
+}
+
+fn link_with(t: *testing.T, options: PeOptions, resources: resource.Resources) -> LinkedPe {
+    let obj = pe_object(options)
+    let image = link.pe(obj, false, resources) catch {
+        e => {
+            t.fatal("link: {link.message(e)}")
+            return LinkedPe { image: [], file: oracletool.PeFile {} }
+        }
+    }
+    let file = oracletool.read_pe(image) catch {
+        e => {
+            t.fatal("parse image: {oracletool.message(e)}")
+            return LinkedPe { image, file: oracletool.PeFile {} }
+        }
+    }
+    LinkedPe { image, file }
+}
+
+fn section_leaves(t: *testing.T, linked: LinkedPe, s: oracletool.PeSection) -> []Leaf {
+    let data = oracletool.pe_data(linked.file, s) catch {
+        e => {
+            t.fatal("read {s.name}: {oracletool.message(e)}")
+            return []
+        }
+    }
+    read_leaves(t, data, s.virtual_address)
+}
+
+fn linked_leaves(t: *testing.T, linked: LinkedPe) -> []Leaf {
+    section_leaves(t, linked, pe_section_of(t, linked.file, ".rsrc"))
+}
+
+struct TableEntry {
+    id: i64
+    target: i64
+}
+
+fn table_entries(data: []u8, at: i64) -> []TableEntry {
+    let count = io.le16(data, at + 12) + io.le16(data, at + 14)
+    var entries: []TableEntry = []
+    for i in 0..count {
+        let entry = at + 16 + i * 8
+        entries.push(TableEntry { id: io.le32(data, entry), target: io.le32(data, entry + 4) })
+    }
+    entries
+}
+
+fn read_leaves(t: *testing.T, data: []u8, base: i64) -> []Leaf {
+    var leaves: []Leaf = []
+    var last_kind = -1
+    for kind in table_entries(data, 0) {
+        if kind.id <= last_kind || kind.target & subdirectory_bit == 0 {
+            t.error("type entry {kind.id} is out of order or not a directory")
+        }
+        last_kind = kind.id
+        for name in table_entries(data, kind.target & ~subdirectory_bit) {
+            for language in table_entries(data, name.target & ~subdirectory_bit) {
+                if language.target & subdirectory_bit != 0 {
+                    t.error("language entry {language.id} is a directory")
+                    continue
+                }
+                let rva = io.le32(data, language.target)
+                let size = io.le32(data, language.target + 4)
+                let start = rva - base
+                if start < 0 || start + size > data.len {
+                    t.fatal("resource {kind.id}/{name.id} lies outside the section")
+                    return leaves
+                }
+                leaves.push(Leaf { kind: kind.id, name: name.id, language: language.id, data: data[start..start + size] })
+            }
+        }
+    }
+    leaves
+}
+
+fn leaf_of(t: *testing.T, leaves: []Leaf, kind: i64, name: i64) -> Leaf {
+    for l in leaves {
+        if l.kind == kind && l.name == name {
+            return l
+        }
+    }
+    t.fatal("no resource {kind}/{name}")
+    Leaf { kind, name, language: 0, data: [] }
+}
+
+fn expect_text(t: *testing.T, what: str, got: str, want: str) {
+    if got != want {
+        t.error("{what}: got {text.quote(got)}, want {text.quote(want)}")
+    }
+}
+
+fn align4(n: i64) -> i64 {
+    (n + 3) & ~3
+}
+
+fn read_node(data: []u8, at: i64) -> VersionNode {
+    let length = io.le16(data, at)
+    let value_length = io.le16(data, at + 2)
+    let kind = io.le16(data, at + 4)
+    var end_of_key = at + 6
+    for io.le16(data, end_of_key) != 0 {
+        end_of_key += 2
+    }
+    let key = utf16.decode_bytes(data[at + 6..end_of_key], unicode.Order.Little) or ""
+    let value_at = align4(end_of_key + 2 - at) + at
+    var value_size = value_length
+    if kind == 1 {
+        value_size = value_length * 2
+    }
+    var children: []VersionNode = []
+    var next = align4(value_at + value_size - at) + at
+    for next < at + length {
+        let child = read_node(data, next)
+        children.push(child)
+        next = align4(next + child.length - at) + at
+    }
+    VersionNode { key, kind, value_length, value: data[value_at..value_at + value_size], children, length }
+}
+
+fn child_named(t: *testing.T, node: VersionNode, key: str) -> VersionNode {
+    for c in node.children {
+        if c.key == key {
+            return c
+        }
+    }
+    t.fatal("{node.key} has no {key}")
+    node
+}
+
+fn version_strings(t: *testing.T, root: VersionNode) -> [str: str] {
+    var strings: [str: str] = [:]
+    let table = child_named(t, child_named(t, root, "StringFileInfo"), "040904B0")
+    for s in table.children {
+        let value = utf16.decode_bytes(s.value, unicode.Order.Little) or ""
+        strings[s.key] = text.trim_suffix(value, "\0")
+    }
+    strings
+}
+
+fn version_root(t: *testing.T, data: []u8) -> VersionNode {
+    let root = read_node(data, 0)
+    expect_equal(t, "version length", root.length, data.len)
+    expect_text(t, "version key", root.key, "VS_VERSION_INFO")
+    expect_equal(t, "fixed info size", root.value_length, 52)
+    root
+}
+
+fn fixed_version(root: VersionNode, at: i64) -> []i64 {
+    let v = root.value
+    [io.le32(v, at) >> 16, io.le32(v, at) & 0xFFFF, io.le32(v, at + 4) >> 16, io.le32(v, at + 4) & 0xFFFF]
+}
+
+fn expect_version(t: *testing.T, name: str, got: []i64, want: []i64) {
+    if !slices.equal(got, want) {
+        t.error("{name} {got}, want {want}")
+    }
+}
+
+fn test_resources_absent_without_declarations(t: *testing.T) {
+    let linked = link_with(t, PeOptions {}, resource.Resources {})
+    if oracletool.pe_section(linked.file, ".rsrc") != none {
+        t.error("an image without resources has a .rsrc section")
+    }
+    let header = pe_header_of(t, linked.file)
+    let directory = header.directories[oracletool.pe_dir_resource]
+    expect_equal(t, "resource directory", directory.virtual_address + directory.size, 0)
+}
+
+fn test_resources_tree_and_directory(t: *testing.T) {
+    let resources = sample_resources()
+    let linked = link_with(t, PeOptions {}, resources)
+    let file = linked.file
+    let section = pe_section_of(t, file, ".rsrc")
+    let header = pe_header_of(t, file)
+    let directory = header.directories[oracletool.pe_dir_resource]
+    if directory.virtual_address != section.virtual_address || directory.size != section.virtual_size {
+        t.error("resource directory 0x{directory.virtual_address:x}+{directory.size}, section 0x{section.virtual_address:x}+{section.virtual_size}")
+    }
+    expect_equal(t, ".rsrc characteristics", section.characteristics, 0x40000040)
+    check_section_chain(t, file)
+    let last = file.sections[file.sections.len - 1]
+    expect_equal(t, "size of image", header.size_of_image, round_up_page(last.virtual_address + last.virtual_size))
+    let leaves = section_leaves(t, linked, section)
+    if leaves.len == 0 {
+        return
+    }
+    var order: []i64 = []
+    for l in leaves {
+        order.push(l.kind)
+        expect_equal(t, "language of {l.kind}/{l.name}", l.language, resource_language)
+    }
+    testing.equal_slice(t, order, [resource_icon, resource_icon, resource_icon, resource_icon, resource_group_icon, resource_version, resource_manifest])
+    let images = sample_images()
+    for i, image in images {
+        let leaf = leaf_of(t, leaves, resource_icon, i + 1)
+        if !slices.equal(leaf.data, image) {
+            t.error("icon {i + 1} differs from the image in the file")
+        }
+    }
+    let manifest = leaf_of(t, leaves, resource_manifest, 1)
+    if str(manifest.data) != manifest_text {
+        t.error("manifest bytes differ: {str(manifest.data)}")
+    }
+}
+
+fn test_resources_group_icon(t: *testing.T) {
+    let linked = link_with(t, PeOptions {}, sample_resources())
+    let leaves = linked_leaves(t, linked)
+    let group = leaf_of(t, leaves, resource_group_icon, 1).data
+    expect_equal(t, "group reserved", io.le16(group, 0), 0)
+    expect_equal(t, "group type", io.le16(group, 2), 1)
+    let images = sample_images()
+    expect_equal(t, "group count", io.le16(group, 4), images.len)
+    expect_equal(t, "group size", group.len, 6 + images.len * 14)
+    let sides = [16, 32, 48, 256]
+    let bits = [32, 32, 32, 24]
+    for i in 0..images.len {
+        let at = 6 + i * 14
+        let entry = GroupEntry {
+            width: i64(group[at])
+            height: i64(group[at + 1])
+            colors: i64(group[at + 2])
+            planes: io.le16(group, at + 4)
+            bits: io.le16(group, at + 6)
+            size: io.le32(group, at + 8)
+            id: io.le16(group, at + 12)
+        }
+        let side = sides[i] % 256
+        let want = GroupEntry { width: side, height: side, colors: 0, planes: 1, bits: bits[i], size: images[i].len, id: i + 1 }
+        if entry != want {
+            t.error("group entry {i + 1} is {entry}, want {want}")
+        }
+    }
+}
+
+fn test_resources_version_info(t: *testing.T) {
+    let linked = link_with(t, PeOptions {}, sample_resources())
+    let leaves = linked_leaves(t, linked)
+    let root = version_root(t, leaf_of(t, leaves, resource_version, 1).data)
+    expect_equal(t, "signature", io.le32(root.value, 0), 0xFEEF04BD)
+    expect_equal(t, "structure version", io.le32(root.value, 4), 0x10000)
+    expect_version(t, "file version", fixed_version(root, 8), [1, 4, 0, 0])
+    expect_version(t, "product version", fixed_version(root, 16), [1, 4, 0, 0])
+    expect_equal(t, "flags mask", io.le32(root.value, 24), 0x3F)
+    expect_equal(t, "operating system", io.le32(root.value, 32), 0x40004)
+    expect_equal(t, "file type", io.le32(root.value, 36), 1)
+    let strings = version_strings(t, root)
+    expect_text(t, "FileVersion", strings["FileVersion"] ?? "", "1.4.0.0")
+    expect_text(t, "ProductVersion", strings["ProductVersion"] ?? "", "1.4.0.0")
+    expect_text(t, "CompanyName", strings["CompanyName"] ?? "", "Example Ltd")
+    expect_text(t, "ProductName", strings["ProductName"] ?? "", "Éditeur")
+    let translation = child_named(t, child_named(t, root, "VarFileInfo"), "Translation")
+    expect_equal(t, "translation", io.le32(translation.value, 0), 0x04B00409)
+}
+
+fn test_resources_file_info_replaces_versions(t: *testing.T) {
+    let resources = resource.Resources {
+        version: "2.0.1"
+        info: [
+            resource.FileInfo { key: "FileVersion", value: "7.8.9.10" }
+            resource.FileInfo { key: "Comments", value: "first" }
+            resource.FileInfo { key: "Comments", value: "second" }
+        ]
+    }
+    let linked = link_with(t, PeOptions {}, resources)
+    let leaves = linked_leaves(t, linked)
+    if leaves.len != 1 {
+        t.fatal("{leaves.len} resources, want only the version")
+        return
+    }
+    let root = version_root(t, leaves[0].data)
+    let strings = version_strings(t, root)
+    expect_text(t, "FileVersion", strings["FileVersion"] ?? "", "7.8.9.10")
+    expect_text(t, "ProductVersion", strings["ProductVersion"] ?? "", "2.0.1.0")
+    expect_text(t, "Comments", strings["Comments"] ?? "", "second")
+    expect_version(t, "file version", fixed_version(root, 8), [7, 8, 9, 10])
+    expect_version(t, "product version", fixed_version(root, 16), [2, 0, 1, 0])
+}
+
+fn test_resources_manifest_alone(t: *testing.T) {
+    let linked = link_with(t, PeOptions {}, resource.Resources { manifest: bytes(manifest_text) })
+    let leaves = linked_leaves(t, linked)
+    if leaves.len != 1 || leaves[0].kind != resource_manifest || leaves[0].name != 1 {
+        t.error("{leaves.len} resources, want the manifest 24/1")
+    }
+}
+
+fn test_resources_precede_relocations(t: *testing.T) {
+    let options = PeOptions { data_fixups: [fixup(0, asm.abs64, "text_label", 0)] }
+    let linked = link_with(t, options, sample_resources())
+    if !expect_sections(t, linked.file, [".text", ".rdata", ".data", ".rodata", ".rsrc", ".reloc"]) {
+        return
+    }
+    check_section_chain(t, linked.file)
+    let header = pe_header_of(t, linked.file)
+    let reloc = pe_section_of(t, linked.file, ".reloc")
+    let directory = header.directories[oracletool.pe_dir_base_reloc]
+    expect_equal(t, "relocation directory", directory.virtual_address, reloc.virtual_address)
+}
+
+fn test_resources_deterministic(t: *testing.T) {
+    let first = link_with(t, PeOptions {}, sample_resources())
+    let second = link_with(t, PeOptions {}, sample_resources())
+    if !slices.equal(first.image, second.image) {
+        t.error("linking the same resources twice gives different images")
+    }
+    let other = link_with(t, PeOptions {}, resource.Resources { manifest: bytes(manifest_text) })
+    if slices.equal(first.image, other.image) {
+        t.error("different resources give the same image")
+    }
+}
+
+fn icon_rejections() -> []IconRejection {
+    var cursor = icon_file([dib_image(16, 32)])
+    cursor[2] = 2
+    var outside = icon_file([dib_image(16, 32)])
+    outside[6 + 12] = 0xFF
+    let cut = icon_file([dib_image(16, 32)])
+    let huge = icon_file([dib_image(300, 32)])
+    let unknown = icon_file([io.buffer(64)])
+    [
+        IconRejection { name: "short", icon: [0, 0, 1], want: "link: icon: the file is shorter than an icon header" }
+        IconRejection { name: "cursor", icon: cursor, want: "link: icon: the file is not an .ico file" }
+        IconRejection { name: "empty", icon: [0, 0, 1, 0, 0, 0], want: "link: icon: the file holds no images" }
+        IconRejection { name: "directory", icon: cut[..10], want: "link: icon: the directory is cut short" }
+        IconRejection { name: "outside", icon: outside, want: "link: icon: image 1 lies outside the file" }
+        IconRejection { name: "unknown", icon: unknown, want: "link: icon: image 1 is neither a PNG nor a BMP with a 40 byte header" }
+        IconRejection { name: "too large", icon: huge, want: "link: icon: image 1 is 300 by 300, and an icon image is 1 to 256 pixels on each side" }
+        IconRejection { name: "png colour type", icon: icon_file([png_image(16, 8, 5)]), want: "link: icon: image 1 has an unknown PNG colour type" }
+    ]
+}
+
+fn resource_error(resources: resource.Resources) -> str {
+    link.pe(pe_object(PeOptions {}), false, resources) catch {
+        e => return link.message(e)
+    }
+    ""
+}
+
+fn test_resources_reject_bad_icons(t: *testing.T) {
+    for c in icon_rejections() {
+        expect_text(t, c.name, resource_error(resource.Resources { icon: c.icon }), c.want)
+    }
+}
+
+fn test_resources_reject_bad_version(t: *testing.T) {
+    expect_text(t, "version", resource_error(resource.Resources { version: "1.4" }), "link: version \"1.4\" is not a semantic version")
+}
