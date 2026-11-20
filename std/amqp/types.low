@@ -1,0 +1,261 @@
+import std/io
+import std/sync
+import std/tls
+
+/// How the client authenticates in `connect`.
+pub enum Mechanism {
+    /// `PLAIN`: the user name and password in one response.
+    Plain
+    /// `AMQPLAIN`: the user name and password as a field table, which RabbitMQ also accepts.
+    AmqPlain
+    /// `EXTERNAL`: the identity comes from the TLS client certificate; the user name and password are not sent.
+    External
+}
+
+/// Connection settings for `connect`, `connect_tls` and `connect_stream`.
+///
+/// Every field has a default, so `Options {}` connects to a local RabbitMQ as `guest`.
+pub struct Options {
+    /// The broker host name or IP literal. Defaults to `"127.0.0.1"`. It is also the TLS server name when `tls_config` has none.
+    pub host: str = "127.0.0.1"
+    /// The broker TCP port. Defaults to `5672`, and `5671` is the usual port for TLS.
+    pub port: i64 = 5672
+    /// The user name. Defaults to `"guest"`.
+    pub username: str = "guest"
+    /// The password. Defaults to `"guest"`.
+    pub password: str = "guest"
+    /// The virtual host to open. Defaults to `"/"`.
+    pub virtual_host: str = "/"
+    /// The authentication mechanism. Defaults to `Mechanism.Plain`. Connecting fails with `Unsupported` when the broker does not offer it.
+    pub mechanism: Mechanism = Mechanism.Plain
+    /// The connection name the broker shows in its management interface. Empty, the default, sends none.
+    pub name: str = ""
+    /// Further client properties sent in `connection.start-ok`, after the ones the client sets itself.
+    pub properties: Field[] = []
+    /// The heartbeat interval in seconds the client proposes, the smaller nonzero of it and the broker's being used. `0` disables heartbeats. Defaults to `60`.
+    pub heartbeat: i64 = 60
+    /// The largest frame in bytes the client proposes, from `4096`; the smaller nonzero of it and the broker's is used. Defaults to `131072`.
+    pub frame_max: i64 = 131072
+    /// The most channels the client proposes; the smaller nonzero of it and the broker's is used. Defaults to `2047`.
+    pub channel_max: i64 = 2047
+    /// The TLS settings used by `connect_tls`. When `server_name` is empty, `host` is used. Defaults to `tls.Config {}`, which verifies against the system roots.
+    pub tls_config: tls.Config = tls.Config {}
+    /// The read and write time limit in milliseconds for connecting, for the TLS handshake and for every write afterwards. `0`, the default, waits indefinitely. After the handshake reads are not limited, because a consumer waits for messages for as long as it likes; a stalled broker is found by the heartbeats.
+    pub timeout: i64 = 0
+    /// The time limit in milliseconds for establishing the TCP connection, which fails with `Timeout` when exceeded. `0`, the default, leaves the limit to `std/net`. Not used by `connect_stream`.
+    pub connect_timeout: i64 = 0
+    /// The time in milliseconds a call waits for the broker's reply, which fails the channel with `Timeout` when exceeded and asks the broker to close it; the channel number is not reused until the broker has answered. `0` waits indefinitely. Defaults to `30000`.
+    pub call_timeout: i64 = 30000
+    /// The capacity of the `deliveries` channel of each `Consumer`. While it is full the connection stops reading, so a consumer that falls behind holds back the broker through TCP and, with `qos`, the prefetch window. Defaults to `256`.
+    pub buffer: i64 = 256
+    /// The largest message body in bytes the client accepts from the broker or sends. A larger body fails with `TooLarge`. Defaults to 128 MiB.
+    pub max_message: i64 = 134217728
+}
+
+/// A connection event the broker reports.
+pub enum Notice {
+    /// RabbitMQ stopped reading publishes, for example because of a memory or disk alarm; `reason` is its text.
+    Blocked(reason: str)
+    /// RabbitMQ reads publishes again.
+    Unblocked
+}
+
+enum Reply {
+    Answer(method: Method)
+    Got(delivery: Delivery)
+}
+
+struct Link {
+    stream: io.Stream
+    reader: *io.Reader
+    wgate: sync.Mutex
+    sgate: sync.Mutex
+    stop: chan[bool]
+    frame_max: i64
+    channel_max: i64
+    heartbeat: i64
+    max_message: i64
+    call_timeout: i64
+    buffer: i64
+    closed: bool
+    failure: Error?
+    channels: [i64: *ChanState]
+    last_read: i64
+    last_write: i64
+    delivering: bool
+    blocked: str?
+    notices: chan[Notice]
+    server: Field[]
+}
+
+struct Pending {
+    method: Method
+    properties: Properties
+    size: i64
+    body: u8[]
+    headed: bool
+}
+
+struct Confirm {
+    done: chan[bool]
+    resolved: bool
+}
+
+struct ConsumerState {
+    tag: str
+    no_ack: bool
+    cancelling: bool
+    quit: chan[bool]
+    deliveries: chan[Delivery]
+}
+
+struct ChanState {
+    id: i64
+    link: *Link
+    cgate: sync.Mutex
+    replies: chan[Reply]
+    consumers: [str: *ConsumerState]
+    confirms: [i64: *Confirm]
+    next_seq: i64
+    confirming: bool
+    pending: *Pending?
+    returns: chan[Return]
+    closed: bool
+    ended: bool
+    failure: Error?
+    active: bool
+}
+
+/// An owned connection to an AMQP 0-9-1 broker, from `connect`, `connect_tls` or `connect_stream`.
+///
+/// Dropping a `Connection` closes it as `close_connection` does. Channels opened from it stay valid until it closes.
+pub struct Connection {
+    /// Receives `Blocked` and `Unblocked` when RabbitMQ sends `connection.blocked` and `connection.unblocked`. It is closed when the connection ends, and a notice that arrives while it is full is dropped. Its capacity is `16`.
+    pub notices: chan[Notice]
+    link: *Link
+    drop {
+        shut(link, none)
+    }
+}
+
+/// A channel on a connection, from `open_channel`.
+///
+/// Copies refer to the same channel. Green threads may share it: calls on one channel run one after another, publishes are written whole, and a delivery is settled from any thread. A channel closes through `close_channel`, when the broker closes it, or when its connection ends.
+pub struct Channel {
+    /// The channel number.
+    pub id: i64
+    /// Receives each message the broker returns because it is unroutable, from a publish with `mandatory`. It is closed when the channel ends, and a return that arrives while it is full is dropped. Its capacity is `16`.
+    pub returns: chan[Return]
+    state: *ChanState
+}
+
+/// A message the broker returned with `basic.return`.
+pub struct Return {
+    /// The reply code, `312` for `NO_ROUTE` and `313` for `NO_CONSUMERS`.
+    pub code: i64
+    /// The reply text.
+    pub text: str
+    /// The exchange the message was published to.
+    pub exchange: str
+    /// The routing key the message was published with.
+    pub routing_key: str
+    /// The properties of the message.
+    pub properties: Properties
+    /// The body of the message.
+    pub body: u8[]
+}
+
+/// A message delivered by `consume` or returned by `get`.
+pub struct Delivery {
+    /// The consumer the message was delivered to. Empty for a message from `get`.
+    pub consumer_tag: str
+    /// The tag that `ack`, `nack` and `reject` settle the message by, unique on its channel.
+    pub delivery_tag: i64
+    /// Whether the broker delivered the message before.
+    pub redelivered: bool
+    /// The exchange the message was published to.
+    pub exchange: str
+    /// The routing key the message was published with.
+    pub routing_key: str
+    /// The properties of the message.
+    pub properties: Properties
+    /// The body of the message.
+    pub body: u8[]
+    /// For a message from `get`, how many messages remain in the queue; `0` for a delivery from `consume`.
+    pub remaining: i64
+    channel: *ChanState
+}
+
+/// A running consumer, from `consume`.
+///
+/// The client's reading green thread sends each message to `deliveries` and waits while the channel is full, which holds back every channel of the connection; a consumer that needs the connection to keep moving while it works sets `qos` and settles messages promptly, or hands them to workers.
+pub struct Consumer {
+    /// The consumer tag.
+    pub tag: str
+    /// Receives the messages in the order the broker sent them. It is closed when the consumer ends: after `cancel`, when the broker cancels it, and when the channel or connection closes. Messages already in the channel can still be received.
+    pub deliveries: chan[Delivery]
+    channel: *ChanState
+    state: *ConsumerState
+}
+
+/// The result of `declare_queue`.
+pub struct QueueInfo {
+    /// The queue name, which is the broker's choice when the declare gave an empty name.
+    pub name: str
+    /// The number of messages ready in the queue.
+    pub messages: i64
+    /// The number of consumers of the queue.
+    pub consumers: i64
+}
+
+/// Modifiers for `declare_exchange`.
+pub struct ExchangeOptions {
+    /// Whether the exchange survives a broker restart.
+    pub durable: bool = false
+    /// Whether the broker deletes the exchange when its last binding goes.
+    pub auto_delete: bool = false
+    /// Whether publishers cannot publish to the exchange directly.
+    pub internal: bool = false
+    /// Whether to only check that the exchange exists: the declare fails with `ChannelClosed` code `404` when it does not.
+    pub passive: bool = false
+    /// Extension arguments, such as `alternate-exchange`.
+    pub arguments: Field[] = []
+}
+
+/// Modifiers for `declare_queue`.
+pub struct QueueOptions {
+    /// Whether the queue survives a broker restart.
+    pub durable: bool = false
+    /// Whether only this connection may use the queue, which the broker deletes when the connection closes.
+    pub exclusive: bool = false
+    /// Whether the broker deletes the queue when its last consumer goes.
+    pub auto_delete: bool = false
+    /// Whether to only check that the queue exists: the declare fails with `ChannelClosed` code `404` when it does not.
+    pub passive: bool = false
+    /// Extension arguments, such as `x-message-ttl`, `x-max-length` and `x-queue-type`.
+    pub arguments: Field[] = []
+}
+
+/// Modifiers for `publish`.
+pub struct PublishOptions {
+    /// The message properties.
+    pub properties: Properties = Properties {}
+    /// Whether the broker returns the message on `Channel.returns` when no queue takes it.
+    pub mandatory: bool = false
+    /// Whether the broker returns the message when no consumer can take it at once. RabbitMQ 3 and later refuse it.
+    pub immediate: bool = false
+}
+
+/// Modifiers for `consume`.
+pub struct ConsumeOptions {
+    /// The consumer tag. Empty, the default, makes the client choose a random one.
+    pub tag: str = ""
+    /// Whether the broker counts a message settled when it sends it, so no `ack` is needed.
+    pub no_ack: bool = false
+    /// Whether this is the only consumer of the queue.
+    pub exclusive: bool = false
+    /// Whether the broker withholds the messages this connection published, which RabbitMQ does not support.
+    pub no_local: bool = false
+    /// Extension arguments, such as `x-priority`.
+    pub arguments: Field[] = []
+}

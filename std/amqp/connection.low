@@ -1,0 +1,451 @@
+import std/crypto
+import std/io
+import std/net
+import std/sync
+import std/text
+import std/time
+import std/tls
+
+const handshake_limit = 1048576
+const closing_wait = 2000
+
+fn now_ms() -> i64 {
+    time.monotonic() / 1000000
+}
+
+fn apply_timeout(t: *net.Timeouts, millis: i64) {
+    t.read = millis
+    t.write = millis
+}
+
+fn dial(o: Options) -> net.Conn ! Error {
+    using conn = net.dial_within(o.host, o.port, o.connect_timeout) catch {
+        TimedOut => fail Timeout
+        _ => fail Connect
+    }
+    conn
+}
+
+fn named(o: Options, config: tls.Config) -> tls.Config {
+    var out = config
+    if out.server_name.len == 0 {
+        out.server_name = o.host
+    }
+    out
+}
+
+fn check_options(o: Options) ! Error {
+    if o.frame_max != 0 && o.frame_max < 4096 {
+        fail Argument
+    }
+    if o.frame_max > 4294967295 || o.channel_max < 0 || o.channel_max > 65535 || o.heartbeat < 0 || o.heartbeat > 65535 || o.buffer < 1 {
+        fail Argument
+    }
+}
+
+/// Opens a TCP connection to `o.host` and `o.port` and performs the AMQP handshake.
+///
+/// Sends the protocol header, authenticates with `o.mechanism`, agrees the channel, frame and heartbeat limits with the broker and opens `o.virtual_host`. Fails with `Argument` for an option out of range, `Connect` when the broker cannot be reached, `Timeout` when `o.connect_timeout` or `o.timeout` expires, `Auth` when the broker refuses the credentials, `Unsupported` when it does not offer `o.mechanism`, `ConnectionClosed` when it closes the connection for another reason, such as a virtual host that does not exist, and `Protocol` when it speaks another protocol version or something that is not AMQP. The connection is closed when the handshake fails.
+pub fn connect(o: Options) -> Connection ! Error {
+    check_options(o)?
+    using var conn = dial(o)?
+    let wire = net.detach(mut conn)
+    apply_timeout(wire.timeouts, o.timeout)
+    establish(net.stream_on(wire), wire.timeouts, o)
+}
+
+/// Opens a TCP connection, performs the TLS handshake with `config` and then the AMQP handshake, for the `amqps` port.
+///
+/// When `config.server_name` is empty, `o.host` is used. Behaves as `connect` otherwise, and a failed TLS handshake fails with `Tls`, or `Timeout` when it times out.
+pub fn connect_tls(o: Options, config: tls.Config) -> Connection ! Error {
+    check_options(o)?
+    using var conn = dial(o)?
+    apply_timeout(conn.handle.timeouts, o.timeout)
+    let session = tls.client_handle(net.stream(conn), named(o, config)) catch {
+        TimedOut => fail Timeout
+        _ => fail Tls
+    }
+    let wire = net.detach(mut conn)
+    establish(tls.stream_on(session), wire.timeouts, o)
+}
+
+/// Performs the AMQP handshake over an existing `io.Stream` instead of dialling.
+///
+/// `o.host`, `o.port`, `o.timeout` and `o.connect_timeout` are not used, because the stream carries no time limits. Closing the connection closes the stream. Fails as `connect` does from the handshake onwards, and with `Argument` for the same options.
+pub fn connect_stream(s: io.Stream, o: Options) -> Connection ! Error {
+    check_options(o) catch {
+        e => {
+            s.close()
+            fail e
+        }
+    }
+    establish(s, new(net.Timeouts { read: 0, write: 0 }), o)
+}
+
+fn establish(stream: io.Stream, timeouts: *net.Timeouts, o: Options) -> Connection ! Error {
+    let l = negotiate(stream, timeouts, o) catch {
+        e => {
+            stream.close()
+            fail e
+        }
+    }
+    Connection { notices: l.notices, link: l }
+}
+
+fn negotiate(stream: io.Stream, timeouts: *net.Timeouts, o: Options) -> *Link ! Error {
+    let l = new(Link {
+        stream
+        reader: io.reader(stream)
+        wgate: sync.mutex()
+        sgate: sync.mutex()
+        stop: chan[bool]()
+        frame_max: handshake_limit
+        channel_max: 0
+        heartbeat: 0
+        max_message: o.max_message
+        call_timeout: o.call_timeout
+        buffer: o.buffer
+        closed: false
+        failure: none
+        channels: [:]
+        last_read: now_ms()
+        last_write: now_ms()
+        delivering: false
+        blocked: none
+        notices: chan[Notice](16)
+        server: []
+    })
+    handshake(l, o)?
+    timeouts.read = 0
+    spawn pump(l)
+    if l.heartbeat > 0 {
+        spawn beat(l)
+    }
+    l
+}
+
+fn refused(code: i64, reply: str) -> Error {
+    if code == 403 {
+        return Auth(reply)
+    }
+    ConnectionClosed(code, reply)
+}
+
+fn read_method0(l: *Link) -> Method ! Error {
+    for {
+        let f = read_frame(l.reader, l.frame_max) catch {
+            Malformed => fail Protocol
+            e => fail e
+        }
+        if f.kind == frame_heartbeat {
+            continue
+        }
+        if f.kind != frame_method || f.channel != 0 {
+            fail Protocol
+        }
+        let m = decode_method(f.payload)?
+        match m {
+            ConnectionClose(code, reply, class_id, method_id) => {
+                send(l, method_frame(0, Method.ConnectionCloseOk)?) catch {
+                    e => {}
+                }
+                fail refused(code, reply)
+            }
+            _ => {
+                return m
+            }
+        }
+    }
+}
+
+fn method_frame(channel: i64, m: Method) -> u8[] ! Error {
+    let payload = encode_method(m)?
+    encode_frame(Frame { kind: frame_method, channel, payload })
+}
+
+fn mechanism_name(m: Mechanism) -> str {
+    match m {
+        Plain => "PLAIN"
+        AmqPlain => "AMQPLAIN"
+        External => "EXTERNAL"
+    }
+}
+
+fn response_for(o: Options) -> u8[] ! Error {
+    match o.mechanism {
+        Plain => {
+            var out: u8[] = [0]
+            text.append(mut out, o.username)
+            out.push(0)
+            text.append(mut out, o.password)
+            out
+        }
+        AmqPlain => encode_fields([Field { name: "LOGIN", value: Value.Str(o.username) }, Field { name: "PASSWORD", value: Value.Str(o.password) }])?
+        External => []
+    }
+}
+
+fn client_properties(o: Options) -> Field[] {
+    let capabilities = [
+        Field { name: "publisher_confirms", value: Value.Bool(true) }
+        Field { name: "exchange_exchange_bindings", value: Value.Bool(true) }
+        Field { name: "basic.nack", value: Value.Bool(true) }
+        Field { name: "consumer_cancel_notify", value: Value.Bool(true) }
+        Field { name: "connection.blocked", value: Value.Bool(true) }
+        Field { name: "authentication_failure_close", value: Value.Bool(true) }
+    ]
+    var out = [
+        Field { name: "product", value: Value.Str("Low std/amqp") }
+        Field { name: "platform", value: Value.Str("Low") }
+        Field { name: "capabilities", value: Value.Table(capabilities) }
+    ]
+    if o.name.len > 0 {
+        out.push(Field { name: "connection_name", value: Value.Str(o.name) })
+    }
+    for f in o.properties {
+        out.push(f)
+    }
+    out
+}
+
+fn offers(mechanisms: str, want: str) -> bool {
+    for m in text.fields(mechanisms) {
+        if m == want {
+            return true
+        }
+    }
+    false
+}
+
+fn handshake(l: *Link, o: Options) ! Error {
+    send(l, bytes("AMQP\x00\x00\x09\x01"))?
+    let start = read_method0(l)?
+    match start {
+        ConnectionStart(major, minor, properties, mechanisms, locales) => {
+            if major != 0 || minor != 9 {
+                fail Protocol
+            }
+            l.server = properties
+            if !offers(mechanisms, mechanism_name(o.mechanism)) {
+                fail Unsupported
+            }
+        }
+        _ => fail Protocol
+    }
+    let hello = Method.ConnectionStartOk(client_properties(o), mechanism_name(o.mechanism), response_for(o)?, "en_US")
+    send(l, method_frame(0, hello)?)?
+    for {
+        let m = read_method0(l)?
+        match m {
+            ConnectionSecure(challenge) => fail Auth("the broker sent an authentication challenge")
+            ConnectionTune(channel_max, frame_max, heartbeat) => {
+                open_virtual_host(l, o, channel_max, frame_max, heartbeat)?
+                return
+            }
+            _ => fail Protocol
+        }
+    }
+}
+
+fn agreed(mine: i64, theirs: i64) -> i64 {
+    if mine == 0 {
+        return theirs
+    }
+    if theirs == 0 || mine < theirs {
+        return mine
+    }
+    theirs
+}
+
+fn open_virtual_host(l: *Link, o: Options, channel_max: i64, frame_max: i64, heartbeat: i64) ! Error {
+    var channels = agreed(o.channel_max, channel_max)
+    if channels == 0 {
+        channels = 65535
+    }
+    var frames = agreed(o.frame_max, frame_max)
+    if frames == 0 {
+        frames = 131072
+    }
+    if frames < 4096 {
+        fail Protocol
+    }
+    let beat = if o.heartbeat == 0 { 0 } else { agreed(o.heartbeat, heartbeat) }
+    let ok = Method.ConnectionTuneOk(channels, frames, beat)
+    send(l, method_frame(0, ok)?)?
+    send(l, method_frame(0, Method.ConnectionOpen(o.virtual_host))?)?
+    let opened = read_method0(l)?
+    match opened {
+        ConnectionOpenOk => {}
+        _ => fail Protocol
+    }
+    l.channel_max = channels
+    l.frame_max = frames
+    l.heartbeat = beat
+}
+
+/// Returns the properties the broker sent in `connection.start`, such as `product`, `version` and `capabilities`.
+pub fn server_properties(c: Connection) -> Field[] {
+    c.link.server
+}
+
+/// Returns the reason RabbitMQ gave in its last `connection.blocked` while the connection is blocked, and `none` otherwise.
+pub fn blocked(c: Connection) -> str? {
+    sync.lock(c.link.sgate)
+    let reason = c.link.blocked
+    sync.unlock(c.link.sgate)
+    reason
+}
+
+/// Returns how many channels the connection may have open at once, as agreed with the broker.
+pub fn channel_limit(c: Connection) -> i64 {
+    c.link.channel_max
+}
+
+/// Returns the largest frame in bytes the connection uses, as agreed with the broker.
+pub fn frame_limit(c: Connection) -> i64 {
+    c.link.frame_max
+}
+
+/// Returns the heartbeat interval in seconds, as agreed with the broker, `0` when there is none.
+pub fn heartbeat_interval(c: Connection) -> i64 {
+    c.link.heartbeat
+}
+
+/// Closes the connection.
+///
+/// Sends `connection.close` and waits up to two seconds for the broker's answer, which also ends every channel, then closes the socket. Closing twice is harmless. Later calls fail with `Closed`, and the `deliveries` channel of every consumer, the `returns` channel of every channel and `notices` are closed.
+pub fn close_connection(c: Connection) {
+    close_link(c.link)
+}
+
+fn close_link(l: *Link) {
+    if is_closed(l) {
+        return
+    }
+    let goodbye = method_frame(0, Method.ConnectionClose(200, "", 0, 0)) catch {
+        e => {
+            shut(l, none)
+            return
+        }
+    }
+    send(l, goodbye) catch {
+        e => {
+            shut(l, none)
+            return
+        }
+    }
+    select {
+        <-l.stop => {}
+        after(closing_wait) => {}
+    }
+    shut(l, none)
+}
+
+fn shut(l: *Link, cause: Error?) {
+    sync.lock(l.sgate)
+    if l.closed {
+        sync.unlock(l.sgate)
+        return
+    }
+    l.closed = true
+    l.failure = cause
+    close(l.stop)
+    for id, c in l.channels {
+        fail_channel(c, cause ?? Closed)
+    }
+    sync.unlock(l.sgate)
+    l.stream.close()
+}
+
+fn fail_channel(c: *ChanState, cause: Error) {
+    if c.closed {
+        return
+    }
+    c.closed = true
+    c.failure = some(cause)
+    close(c.replies)
+    for seq, pending in c.confirms {
+        close(pending.done)
+    }
+}
+
+fn is_closed(l: *Link) -> bool {
+    sync.lock(l.sgate)
+    let closed = l.closed
+    sync.unlock(l.sgate)
+    closed
+}
+
+fn closed_error(l: *Link) -> Error {
+    sync.lock(l.sgate)
+    let cause = l.failure ?? Closed
+    sync.unlock(l.sgate)
+    cause
+}
+
+fn abandon(l: *Link, e: Error) -> Error {
+    shut(l, some(e))
+    closed_error(l)
+}
+
+fn write_frame(l: *Link, data: u8[]) ! Error {
+    io.write_all(l.stream, data) catch {
+        e => fail abandon(l, transport(e))
+    }
+    l.last_write = now_ms()
+}
+
+fn send(l: *Link, data: u8[]) ! Error {
+    sync.lock(l.wgate)
+    defer sync.unlock(l.wgate)
+    if is_closed(l) {
+        fail closed_error(l)
+    }
+    write_frame(l, data)?
+}
+
+fn silent_for(l: *Link, limit: i64) -> bool {
+    sync.lock(l.sgate)
+    let silent = !l.delivering && now_ms() - l.last_read > limit
+    sync.unlock(l.sgate)
+    silent
+}
+
+fn beat(l: *Link) {
+    let interval = l.heartbeat * 1000
+    for {
+        var stopped = false
+        select {
+            <-l.stop => {
+                stopped = true
+            }
+            after(interval / 2) => {}
+        }
+        if stopped {
+            return
+        }
+        if silent_for(l, interval * 2) {
+            shut(l, some(Timeout))
+            return
+        }
+        spawn pulse(l)
+    }
+}
+
+fn pulse(l: *Link) {
+    if !sync.try_lock(l.wgate) {
+        return
+    }
+    defer sync.unlock(l.wgate)
+    if is_closed(l) || now_ms() - l.last_write < l.heartbeat * 500 {
+        return
+    }
+    let frame = encode_frame(Frame { kind: frame_heartbeat, channel: 0, payload: [] })
+    write_frame(l, frame) catch {
+        e => return
+    }
+}
+
+fn random_tag() -> str {
+    "low.{text.encode_hex(crypto.random(8))}"
+}

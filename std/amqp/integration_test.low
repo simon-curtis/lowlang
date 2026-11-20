@@ -1,0 +1,873 @@
+import std/crypto
+import std/os
+import std/testing
+import std/text
+
+/// These tests run against a real broker. `LOW_AMQP_ADDR` names it as `host:port`, and `LOW_AMQP_USER` and `LOW_AMQP_PASSWORD` give the credentials, `guest` by default. Without `LOW_AMQP_ADDR` every test is skipped. They need RabbitMQ 3 or later; `rabbitmq:3-management` fits.
+fn broker(t: *testing.T) -> Options {
+    let addr = os.env("LOW_AMQP_ADDR") ?? ""
+    if addr.len == 0 {
+        testing.skip(t, "LOW_AMQP_ADDR is not set")
+    }
+    let at = text.last_index_byte(addr, ':')
+    var o = Options { call_timeout: 10000 }
+    if at < 0 {
+        o.host = addr
+    } else {
+        o.host = addr[..at]
+        o.port = text.parse_int(addr[at + 1..]) or 5672
+    }
+    o.username = os.env("LOW_AMQP_USER") ?? "guest"
+    o.password = os.env("LOW_AMQP_PASSWORD") ?? "guest"
+    o
+}
+
+fn unique(prefix: str) -> str {
+    "low.test.{prefix}.{text.encode_hex(crypto.random(6))}"
+}
+
+fn connected(t: *testing.T) -> Connection {
+    connect(broker(t)) catch {
+        e => {
+            t.fatal("connect failed: {e}")
+            panic("unreachable")
+        }
+    }
+}
+
+fn opened(t: *testing.T, c: Connection) -> Channel {
+    open_channel(c) catch {
+        e => {
+            t.fatal("open_channel failed: {e}")
+            panic("unreachable")
+        }
+    }
+}
+
+fn next(cn: Consumer, millis: i64) -> Delivery? {
+    var got: Delivery? = none
+    select {
+        d = <-cn.deliveries => {
+            got = d
+        }
+        after(millis) => {}
+    }
+    got
+}
+
+fn expect_next(t: *testing.T, cn: Consumer) -> Delivery {
+    let d = next(cn, 5000) ?? panic("no delivery in 5 seconds")
+    d
+}
+
+fn declared(t: *testing.T, ch: Channel, o: QueueOptions) -> QueueInfo {
+    declare_queue(ch, "", o) catch {
+        e => {
+            t.fatal("declare_queue failed: {e}")
+            panic("unreachable")
+        }
+    }
+}
+
+fn error_text(e: Error) -> str {
+    match e {
+        ChannelClosed(code, reply) => "channel {code}"
+        ConnectionClosed(code, reply) => "connection {code}"
+        Auth(message) => "auth"
+        Closed => "closed"
+        Timeout => "timeout"
+        Protocol => "protocol"
+        Connect => "connect"
+        Argument => "argument"
+        Nacked => "nacked"
+        TooLarge => "toolarge"
+        Unsupported => "unsupported"
+        Malformed => "malformed"
+        Tls => "tls"
+        Exhausted => "exhausted"
+    }
+}
+
+fn test_connect_reports_the_broker(t: *testing.T) {
+    using c = connected(t)
+    let product = find(server_properties(c), "product") ?? Value.Void
+    match product {
+        Str(name) => t.equal(name, "RabbitMQ")
+        _ => t.error("the broker sent no product")
+    }
+    t.is_true(frame_limit(c) >= 4096)
+    t.is_true(channel_limit(c) > 0)
+    t.equal(heartbeat_interval(c) > 0, true)
+    t.is_none(blocked(c))
+}
+
+fn test_publish_consume_ack(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    let cn = consume(ch, q.name, ConsumeOptions {}) catch {
+        e => panic("consume failed: {e}")
+    }
+    for i in 0..5 {
+        publish(ch, "", q.name, bytes("message {i}"), PublishOptions {}) or panic("publish failed")
+    }
+    for i in 0..5 {
+        let d = expect_next(t, cn)
+        t.equal(str(d.body), "message {i}")
+        t.equal(d.routing_key, q.name)
+        t.equal(d.exchange, "")
+        t.equal(d.consumer_tag, cn.tag)
+        t.is_false(d.redelivered)
+        ack(d) or panic("ack failed")
+    }
+    cancel(cn) or panic("cancel failed")
+    t.is_none(<-cn.deliveries)
+    close_channel(ch) or panic("close_channel failed")
+}
+
+fn test_properties_and_headers_survive(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    let sent = Properties {
+        content_type: "application/json"
+        content_encoding: "identity"
+        headers: [
+            Field { name: "text", value: Value.Str("v") }
+            Field { name: "small", value: Value.Int(7) }
+            Field { name: "big", value: Value.Int(5000000000) }
+            Field { name: "flag", value: Value.Bool(true) }
+            Field { name: "nested", value: Value.Table([Field { name: "list", value: Value.Array([Value.Int(1), Value.Str("two")]) }]) }
+            Field { name: "ratio", value: Value.Float(0.25) }
+            Field { name: "when", value: Value.Time(1700000000) }
+        ]
+        delivery_mode: 2
+        priority: 4
+        correlation_id: "corr-1"
+        reply_to: "reply.queue"
+        expiration: "60000"
+        message_id: "msg-1"
+        timestamp: 1700000001
+        kind: "order.created"
+        user_id: o_user(t)
+        app_id: "low-test"
+    }
+    publish(ch, "", q.name, bytes("{{\"a\":1}}"), PublishOptions { properties: sent }) or panic("publish failed")
+    let d = get(ch, q.name, true) catch {
+        e => panic("get failed: {error_text(e)}")
+    }
+    let m = d ?? panic("the queue is empty")
+    t.equal(str(m.body), "{{\"a\":1}}")
+    t.equal(m.properties.content_type, "application/json")
+    t.equal(m.properties.content_encoding, "identity")
+    t.equal(m.properties.delivery_mode, 2)
+    t.equal(m.properties.priority, 4)
+    t.equal(m.properties.correlation_id, "corr-1")
+    t.equal(m.properties.reply_to, "reply.queue")
+    t.equal(m.properties.expiration, "60000")
+    t.equal(m.properties.message_id, "msg-1")
+    t.equal(m.properties.timestamp, 1700000001)
+    t.equal(m.properties.kind, "order.created")
+    t.equal(m.properties.user_id, o_user(t))
+    t.equal(m.properties.app_id, "low-test")
+    var seen: [str: str] = [:]
+    for f in m.properties.headers {
+        seen[f.name] = show_value(f.value)
+    }
+    t.equal(seen["text"] ?? "", "v")
+    t.equal(seen["small"] ?? "", "7")
+    t.equal(seen["big"] ?? "", "5000000000")
+    t.equal(seen["flag"] ?? "", "true")
+    t.equal(seen["nested"] ?? "", "{{list=[1,two]}}")
+    t.equal(seen["ratio"] ?? "", "0.25")
+    t.equal(seen["when"] ?? "", "@1700000000")
+}
+
+fn o_user(t: *testing.T) -> str {
+    broker(t).username
+}
+
+fn show_value(v: Value) -> str {
+    match v {
+        Void => "void"
+        Bool(b) => "{b}"
+        Int(n) => "{n}"
+        Float(f) => "{f}"
+        Decimal(scale, n) => "{n}e-{scale}"
+        Str(s) => s
+        Bytes(b) => "bytes"
+        Array(items) => {
+            var parts: str[] = []
+            for item in items {
+                parts.push(show_value(item))
+            }
+            "[{text.join(parts, ",")}]"
+        }
+        Time(s) => "@{s}"
+        Table(fields) => {
+            var parts: str[] = []
+            for f in fields {
+                parts.push("{f.name}={show_value(f.value)}")
+            }
+            "{{{text.join(parts, ",")}}}"
+        }
+    }
+}
+
+fn settled_messages(ch: Channel, queue: str, want: i64) -> i64 {
+    var seen = 0
+    for i in 0..100 {
+        let info = declare_queue(ch, queue, QueueOptions { exclusive: true, passive: true }) or panic("declare failed")
+        seen = info.messages
+        if seen == want {
+            break
+        }
+        select {
+            <-chan[bool](1) => {}
+            after(20) => {}
+        }
+    }
+    seen
+}
+
+fn test_get_reports_remaining_and_empty(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    t.is_none(get(ch, q.name, true) or panic("get failed"))
+    for i in 0..3 {
+        publish(ch, "", q.name, bytes("m{i}"), PublishOptions {}) or panic("publish failed")
+    }
+    t.equal(settled_messages(ch, q.name, 3), 3)
+    let first = get(ch, q.name, false) or panic("get failed")
+    let m = first ?? panic("empty")
+    t.equal(str(m.body), "m0")
+    t.equal(m.remaining, 2)
+    t.equal(m.consumer_tag, "")
+    ack(m) or panic("ack failed")
+    t.equal(purge_queue(ch, q.name) or panic("purge failed"), 2)
+    t.equal(delete_queue(ch, q.name, false, false) or panic("delete failed"), 0)
+}
+
+fn test_publisher_confirms(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    t.equal(publish(ch, "", q.name, bytes("before"), PublishOptions {}) or panic("publish failed"), 0)
+    confirm_mode(ch) or panic("confirm_mode failed")
+    let a = publish(ch, "", q.name, bytes("a"), PublishOptions {}) or panic("publish failed")
+    let b = publish(ch, "", q.name, bytes("b"), PublishOptions {}) or panic("publish failed")
+    t.equal(a, 1)
+    t.equal(b, 2)
+    t.is_true(wait_confirm(ch, b, 5000) or panic("wait_confirm failed"))
+    t.is_true(wait_confirm(ch, a, 5000) or panic("wait_confirm failed"))
+    publish_confirmed(ch, "", q.name, bytes("c"), PublishOptions {}, 5000) or panic("publish_confirmed failed")
+    for i in 0..50 {
+        publish(ch, "", q.name, bytes("bulk"), PublishOptions {}) or panic("publish failed")
+    }
+    t.is_true(wait_confirms(ch, 5000) or panic("wait_confirms failed"))
+    wait_confirm(ch, 1, 100) catch {
+        e => {
+            t.equal(error_text(e), "argument")
+            return
+        }
+    }
+    t.error("a claimed confirm was claimed again")
+}
+
+fn test_confirms_across_channels_are_independent(t: *testing.T) {
+    using c = connected(t)
+    let one = opened(t, c)
+    let two = opened(t, c)
+    let q = declared(t, one, QueueOptions { exclusive: true })
+    confirm_mode(one) or panic("confirm_mode failed")
+    t.equal(publish(one, "", q.name, bytes("x"), PublishOptions {}) or panic("publish failed"), 1)
+    t.equal(publish(two, "", q.name, bytes("y"), PublishOptions {}) or panic("publish failed"), 0)
+    t.is_true(wait_confirms(one, 5000) or panic("wait_confirms failed"))
+}
+
+fn test_mandatory_publish_is_returned(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let x = unique("direct")
+    declare_exchange(ch, x, "direct", ExchangeOptions { auto_delete: true }) or panic("declare failed")
+    confirm_mode(ch) or panic("confirm_mode failed")
+    let seq = publish(ch, x, "nowhere", bytes("lost"), PublishOptions { mandatory: true }) or panic("publish failed")
+    t.is_true(wait_confirm(ch, seq, 5000) or panic("wait_confirm failed"))
+    let r = next_return(ch) ?? panic("the message was not returned")
+    t.equal(r.code, 312)
+    t.equal(r.exchange, x)
+    t.equal(r.routing_key, "nowhere")
+    t.equal(str(r.body), "lost")
+    delete_exchange(ch, x, false) or panic("delete failed")
+}
+
+fn next_return(ch: Channel) -> Return? {
+    var got: Return? = none
+    select {
+        r = <-ch.returns => {
+            got = r
+        }
+        after(5000) => {}
+    }
+    got
+}
+
+fn test_qos_limits_unacknowledged(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    qos(ch, 2, 0, false) or panic("qos failed")
+    let cn = consume(ch, q.name, ConsumeOptions {}) or panic("consume failed")
+    for i in 0..5 {
+        publish(ch, "", q.name, bytes("m{i}"), PublishOptions {}) or panic("publish failed")
+    }
+    let a = expect_next(t, cn)
+    let b = expect_next(t, cn)
+    t.is_none(next(cn, 300))
+    ack(a) or panic("ack failed")
+    let third = expect_next(t, cn)
+    t.equal(str(third.body), "m2")
+    t.is_none(next(cn, 300))
+    ack_through(third) or panic("ack_through failed")
+    let fourth = expect_next(t, cn)
+    let fifth = expect_next(t, cn)
+    t.equal(str(fourth.body), "m3")
+    t.equal(str(fifth.body), "m4")
+    ack(b) or {}
+}
+
+fn test_nack_and_reject_requeue(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    publish(ch, "", q.name, bytes("again"), PublishOptions {}) or panic("publish failed")
+    let cn = consume(ch, q.name, ConsumeOptions {}) or panic("consume failed")
+    let first = expect_next(t, cn)
+    t.is_false(first.redelivered)
+    nack(first, true) or panic("nack failed")
+    let second = expect_next(t, cn)
+    t.is_true(second.redelivered)
+    reject(second, true) or panic("reject failed")
+    let third = expect_next(t, cn)
+    t.is_true(third.redelivered)
+    reject(third, false) or panic("reject failed")
+    t.is_none(next(cn, 300))
+    let info = declare_queue(ch, q.name, QueueOptions { exclusive: true, passive: true }) or panic("declare failed")
+    t.equal(info.messages, 0)
+}
+
+fn test_nack_through_requeues_a_batch(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    let cn = consume(ch, q.name, ConsumeOptions {}) or panic("consume failed")
+    for i in 0..3 {
+        publish(ch, "", q.name, bytes("m{i}"), PublishOptions {}) or panic("publish failed")
+    }
+    expect_next(t, cn)
+    expect_next(t, cn)
+    let last = expect_next(t, cn)
+    nack_through(last, false) or panic("nack_through failed")
+    t.is_none(next(cn, 300))
+}
+
+fn test_missing_exchange_closes_the_channel_only(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let other = opened(t, c)
+    publish(ch, unique("missing"), "k", bytes("x"), PublishOptions {}) or panic("publish failed")
+    var closed = false
+    for i in 0..50 {
+        declare_queue(ch, "", QueueOptions { exclusive: true }) catch {
+            e => {
+                t.equal(error_text(e), "channel 404")
+                closed = true
+                break
+            }
+        }
+    }
+    t.is_true(closed)
+    let q = declared(t, other, QueueOptions { exclusive: true })
+    t.is_true(q.name.len > 0)
+    declare_queue(ch, "", QueueOptions {}) catch {
+        e => {
+            t.equal(error_text(e), "channel 404")
+            return
+        }
+    }
+    t.error("a closed channel accepted a call")
+}
+
+fn test_passive_declare_of_a_missing_queue(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    declare_queue(ch, unique("absent"), QueueOptions { passive: true }) catch {
+        e => {
+            t.equal(error_text(e), "channel 404")
+            return
+        }
+    }
+    t.error("the broker declared a passive queue that does not exist")
+}
+
+fn test_redeclare_with_other_settings_fails(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let name = unique("settings")
+    declare_queue(ch, name, QueueOptions { auto_delete: true, durable: false }) or panic("declare failed")
+    let other = opened(t, c)
+    declare_queue(other, name, QueueOptions { durable: true }) catch {
+        e => {
+            t.equal(error_text(e), "channel 406")
+            delete_queue(ch, name, false, false) or 0
+            return
+        }
+    }
+    t.error("the broker accepted a conflicting declare")
+}
+
+fn test_large_bodies_span_frames(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    let sizes = [0, 1, frame_limit(c) - 9, frame_limit(c) - 8, frame_limit(c) - 7, 3 * frame_limit(c), 1048576 + 17]
+    for size in sizes {
+        var body: u8[] = []
+        for i in 0..size {
+            body.push(u8((i * 7 + 3) % 251))
+        }
+        publish(ch, "", q.name, body, PublishOptions {}) or panic("publish failed")
+        let got = get(ch, q.name, true) or panic("get failed")
+        let m = got ?? panic("the message is missing")
+        t.equal(m.body.len, size)
+        t.equal_slice(m.body, body)
+    }
+}
+
+fn test_bad_password_is_an_auth_error(t: *testing.T) {
+    var o = broker(t)
+    o.password = "not-the-password"
+    connect(o) catch {
+        e => {
+            t.equal(error_text(e), "auth")
+            return
+        }
+    }
+    t.error("connected with a wrong password")
+}
+
+fn test_amqplain_authenticates(t: *testing.T) {
+    var o = broker(t)
+    o.mechanism = Mechanism.AmqPlain
+    using c = connect(o) catch {
+        e => {
+            t.fatal("connect failed: {error_text(e)}")
+            panic("unreachable")
+        }
+    }
+    let ch = opened(t, c)
+    t.is_true(ch.id > 0)
+}
+
+fn test_missing_virtual_host_is_refused(t: *testing.T) {
+    var o = broker(t)
+    o.virtual_host = unique("vhost")
+    connect(o) catch {
+        e => {
+            t.is_true(error_text(e) == "connection 530" || error_text(e) == "auth")
+            return
+        }
+    }
+    t.error("opened a virtual host that does not exist")
+}
+
+fn test_external_is_not_offered(t: *testing.T) {
+    var o = broker(t)
+    o.mechanism = Mechanism.External
+    connect(o) catch {
+        e => {
+            t.equal(error_text(e), "unsupported")
+            return
+        }
+    }
+    t.error("connected with EXTERNAL")
+}
+
+fn test_refused_port(t: *testing.T) {
+    var o = broker(t)
+    o.port = 1
+    connect(o) catch {
+        e => {
+            t.equal(error_text(e), "connect")
+            return
+        }
+    }
+    t.error("connected to a closed port")
+}
+
+fn test_heartbeats_keep_an_idle_connection_alive(t: *testing.T) {
+    var o = broker(t)
+    o.heartbeat = 1
+    using c = connect(o) catch {
+        e => panic("connect failed")
+    }
+    t.equal(heartbeat_interval(c), 1)
+    let ch = opened(t, c)
+    select {
+        <-chan[bool](1) => {}
+        after(3500) => {}
+    }
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    t.is_true(q.name.len > 0)
+}
+
+fn test_deleting_a_queue_cancels_its_consumer(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let other = opened(t, c)
+    let name = unique("doomed")
+    declare_queue(ch, name, QueueOptions { auto_delete: false }) or panic("declare failed")
+    let cn = consume(ch, name, ConsumeOptions {}) or panic("consume failed")
+    delete_queue(other, name, false, false) or panic("delete failed")
+    let closed = <-cn.deliveries
+    t.is_none(closed)
+    close_channel(ch) or panic("close_channel failed")
+}
+
+fn test_closing_the_channel_returns_unacknowledged_messages(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let name = unique("unacked")
+    declare_queue(ch, name, QueueOptions {}) or panic("declare failed")
+    publish(ch, "", name, bytes("keep"), PublishOptions {}) or panic("publish failed")
+    let cn = consume(ch, name, ConsumeOptions {}) or panic("consume failed")
+    expect_next(t, cn)
+    close_channel(ch) or panic("close_channel failed")
+    t.is_none(<-cn.deliveries)
+    let again = opened(t, c)
+    let m = get(again, name, true) or panic("get failed")
+    let d = m ?? panic("the message was lost")
+    t.equal(str(d.body), "keep")
+    t.is_true(d.redelivered)
+    close_channel(ch) or panic("closing twice failed")
+    delete_queue(again, name, false, false) or 0
+}
+
+fn test_exchange_bindings_route(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let upstream = unique("up")
+    let downstream = unique("down")
+    declare_exchange(ch, upstream, "topic", ExchangeOptions { auto_delete: true }) or panic("declare failed")
+    declare_exchange(ch, downstream, "fanout", ExchangeOptions { auto_delete: true }) or panic("declare failed")
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    bind_queue(ch, q.name, downstream, "", []) or panic("bind failed")
+    bind_exchange(ch, downstream, upstream, "orders.#", []) or panic("bind_exchange failed")
+    publish(ch, upstream, "orders.eu.created", bytes("routed"), PublishOptions {}) or panic("publish failed")
+    publish(ch, upstream, "invoices.eu", bytes("dropped"), PublishOptions {}) or panic("publish failed")
+    var got: Delivery? = none
+    for i in 0..50 {
+        got = get(ch, q.name, true) or panic("get failed")
+        if got != none {
+            break
+        }
+        select {
+            <-chan[bool](1) => {}
+            after(50) => {}
+        }
+    }
+    let d = got ?? panic("nothing was routed")
+    t.equal(str(d.body), "routed")
+    t.equal(d.exchange, upstream)
+    t.is_none(get(ch, q.name, true) or panic("get failed"))
+    unbind_exchange(ch, downstream, upstream, "orders.#", []) or panic("unbind_exchange failed")
+    unbind_queue(ch, q.name, downstream, "", []) or panic("unbind failed")
+    delete_exchange(ch, upstream, false) or panic("delete failed")
+}
+
+fn test_topic_routing_with_binding_arguments(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let x = unique("headers")
+    declare_exchange(ch, x, "headers", ExchangeOptions { auto_delete: true }) or panic("declare failed")
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    let match_all = [Field { name: "x-match", value: Value.Str("all") }, Field { name: "region", value: Value.Str("eu") }]
+    bind_queue(ch, q.name, x, "", match_all) or panic("bind failed")
+    let eu = PublishOptions { properties: Properties { headers: [Field { name: "region", value: Value.Str("eu") }] } }
+    let us = PublishOptions { properties: Properties { headers: [Field { name: "region", value: Value.Str("us") }] } }
+    publish(ch, x, "", bytes("eu"), eu) or panic("publish failed")
+    publish(ch, x, "", bytes("us"), us) or panic("publish failed")
+    var got: Delivery? = none
+    for i in 0..50 {
+        got = get(ch, q.name, true) or panic("get failed")
+        if got != none {
+            break
+        }
+        select {
+            <-chan[bool](1) => {}
+            after(50) => {}
+        }
+    }
+    let d = got ?? panic("nothing was routed")
+    t.equal(str(d.body), "eu")
+    t.is_none(get(ch, q.name, true) or panic("get failed"))
+}
+
+fn test_transactions(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    tx_select(ch) or panic("tx_select failed")
+    publish(ch, "", q.name, bytes("rolled back"), PublishOptions {}) or panic("publish failed")
+    tx_rollback(ch) or panic("tx_rollback failed")
+    publish(ch, "", q.name, bytes("committed"), PublishOptions {}) or panic("publish failed")
+    tx_commit(ch) or panic("tx_commit failed")
+    let m = get(ch, q.name, true) or panic("get failed")
+    let d = m ?? panic("the committed message is missing")
+    t.equal(str(d.body), "committed")
+    t.is_none(get(ch, q.name, true) or panic("get failed"))
+}
+
+fn test_recover_redelivers(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    publish(ch, "", q.name, bytes("once"), PublishOptions {}) or panic("publish failed")
+    let m = get(ch, q.name, false) or panic("get failed")
+    let first = m ?? panic("empty")
+    t.is_false(first.redelivered)
+    recover(ch, true) or panic("recover failed")
+    var again: Delivery? = none
+    for i in 0..50 {
+        again = get(ch, q.name, true) or panic("get failed")
+        if again != none {
+            break
+        }
+        select {
+            <-chan[bool](1) => {}
+            after(50) => {}
+        }
+    }
+    let d = again ?? panic("the message was not redelivered")
+    t.is_true(d.redelivered)
+}
+
+fn publisher(ch: Channel, queue: str, count: i64, done: chan[bool]) {
+    for i in 0..count {
+        publish(ch, "", queue, bytes("m"), PublishOptions {}) or break
+    }
+    wait_confirms(ch, 10000) or false
+    done <- true
+}
+
+fn test_concurrent_publishers_on_separate_channels(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    let workers = 4
+    let each = 250
+    let done = chan[bool](workers)
+    for w in 0..workers {
+        let mine = opened(t, c)
+        confirm_mode(mine) or panic("confirm_mode failed")
+        spawn publisher(mine, q.name, each, done)
+    }
+    let cn = consume(ch, q.name, ConsumeOptions { no_ack: true }) or panic("consume failed")
+    var received = 0
+    for received < workers * each {
+        let d = next(cn, 5000) ?? break
+        received += 1
+    }
+    t.equal(received, workers * each)
+    for w in 0..workers {
+        <-done
+    }
+}
+
+fn test_concurrent_publishers_share_one_channel(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    confirm_mode(ch) or panic("confirm_mode failed")
+    let workers = 4
+    let done = chan[bool](workers)
+    for w in 0..workers {
+        spawn shared_publisher(ch, q.name, 100, done)
+    }
+    for w in 0..workers {
+        <-done
+    }
+    t.is_true(wait_confirms(ch, 10000) or panic("wait_confirms failed"))
+    t.equal(delete_queue(ch, q.name, false, false) or panic("delete failed"), 400)
+}
+
+fn shared_publisher(ch: Channel, queue: str, count: i64, done: chan[bool]) {
+    for i in 0..count {
+        publish(ch, "", queue, bytes("m{i}"), PublishOptions {}) or break
+    }
+    done <- true
+}
+
+fn test_a_slow_consumer_holds_back_the_reader_without_loss(t: *testing.T) {
+    var o = broker(t)
+    o.buffer = 2
+    using c = connect(o) catch {
+        e => panic("connect failed")
+    }
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    for i in 0..200 {
+        publish(ch, "", q.name, bytes("{i}"), PublishOptions {}) or panic("publish failed")
+    }
+    let cn = consume(ch, q.name, ConsumeOptions { no_ack: true }) or panic("consume failed")
+    select {
+        <-chan[bool](1) => {}
+        after(300) => {}
+    }
+    for i in 0..200 {
+        let d = next(cn, 5000) ?? panic("the delivery {i} did not arrive")
+        t.equal(str(d.body), "{i}")
+    }
+}
+
+fn test_cancel_while_the_buffer_is_full(t: *testing.T) {
+    var o = broker(t)
+    o.buffer = 1
+    using c = connect(o) catch {
+        e => panic("connect failed")
+    }
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    for i in 0..20 {
+        publish(ch, "", q.name, bytes("{i}"), PublishOptions {}) or panic("publish failed")
+    }
+    let cn = consume(ch, q.name, ConsumeOptions {}) or panic("consume failed")
+    select {
+        <-chan[bool](1) => {}
+        after(300) => {}
+    }
+    cancel(cn) or panic("cancel failed")
+    let info = declare_queue(ch, q.name, QueueOptions { exclusive: true, passive: true }) or panic("declare failed")
+    t.is_true(info.messages >= 18)
+}
+
+fn open_failure(c: Connection) -> Error? {
+    open_channel(c) catch {
+        e => return some(e)
+    }
+    none
+}
+
+fn test_a_timed_out_call_keeps_the_connection_usable(t: *testing.T) {
+    var o = broker(t)
+    o.buffer = 1
+    o.call_timeout = 300
+    using c = connect(o) catch {
+        e => panic("connect failed")
+    }
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    for i in 0..20 {
+        publish(ch, "", q.name, bytes("{i}"), PublishOptions {}) or panic("publish failed")
+    }
+    let cn = consume(ch, q.name, ConsumeOptions {}) or panic("consume failed")
+    select {
+        <-chan[bool](1) => {}
+        after(300) => {}
+    }
+    let failure = open_failure(c)
+    match failure {
+        some(e) => match e {
+            Timeout => {}
+            _ => t.fatal("open_channel failed with {e}")
+        }
+        none => t.fatal("open_channel succeeded while the consumer was full")
+    }
+    cancel(cn) or panic("cancel failed")
+    for i in 0..3 {
+        let again = opened(t, c)
+        let info = declare_queue(again, q.name, QueueOptions { exclusive: true, passive: true }) or panic("declare on the new channel failed")
+        t.is_true(info.messages >= 18)
+        close_channel(again) or panic("close_channel failed")
+    }
+    t.is_true(blocked(c) == none)
+}
+
+fn test_consumer_tags_are_unique_per_channel(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    let first = consume(ch, q.name, ConsumeOptions { tag: "twice" }) or panic("consume failed")
+    consume(ch, q.name, ConsumeOptions { tag: "twice" }) catch {
+        e => {
+            t.equal(error_text(e), "argument")
+            cancel(first) or panic("cancel failed")
+            return
+        }
+    }
+    t.error("two consumers shared a tag")
+}
+
+fn test_exclusive_consumer_is_refused_a_second(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let other = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    consume(ch, q.name, ConsumeOptions { exclusive: true }) or panic("consume failed")
+    consume(other, q.name, ConsumeOptions {}) catch {
+        e => {
+            t.equal(error_text(e), "channel 403")
+            return
+        }
+    }
+    t.error("a second consumer joined an exclusive one")
+}
+
+fn test_channel_numbers_are_reused(t: *testing.T) {
+    using c = connected(t)
+    let one = opened(t, c)
+    let two = opened(t, c)
+    t.equal(two.id, one.id + 1)
+    close_channel(one) or panic("close_channel failed")
+    let three = opened(t, c)
+    t.equal(three.id, one.id)
+}
+
+fn test_closing_the_connection_ends_everything(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    let cn = consume(ch, q.name, ConsumeOptions {}) or panic("consume failed")
+    close_connection(c)
+    t.is_none(<-cn.deliveries)
+    t.is_none(<-c.notices)
+    publish(ch, "", q.name, bytes("late"), PublishOptions {}) catch {
+        e => {
+            t.equal(error_text(e), "closed")
+            close_connection(c)
+            return
+        }
+    }
+    t.error("published on a closed connection")
+}
+
+fn test_broker_closing_a_channel_ends_its_consumers(t: *testing.T) {
+    using c = connected(t)
+    let ch = opened(t, c)
+    let other = opened(t, c)
+    let q = declared(t, ch, QueueOptions { exclusive: true })
+    let cn = consume(ch, q.name, ConsumeOptions {}) or panic("consume failed")
+    let unknown = Delivery { consumer_tag: "", delivery_tag: 99, redelivered: false, exchange: "", routing_key: "", properties: Properties {}, body: [], remaining: 0, channel: ch.state }
+    ack(unknown) or panic("ack failed")
+    t.is_none(<-cn.deliveries)
+    declare_queue(ch, "", QueueOptions {}) catch {
+        e => {
+            t.equal(error_text(e), "channel 406")
+            let ok = declared(t, other, QueueOptions { exclusive: true })
+            t.is_true(ok.name.len > 0)
+            return
+        }
+    }
+    t.error("the broker accepted an acknowledgement for an unknown delivery tag")
+}
