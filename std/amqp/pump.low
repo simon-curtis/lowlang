@@ -1,0 +1,400 @@
+import std/io
+import std/sync
+
+fn pump(l: *Link) {
+    read_loop(l)
+    shut(l, none)
+    release(l)
+}
+
+fn read_loop(l: *Link) {
+    for {
+        let f = read_frame(l.reader, l.frame_max) catch {
+            e => {
+                shut(l, some(e))
+                return
+            }
+        }
+        sync.lock(l.sgate)
+        l.last_read = now_ms()
+        sync.unlock(l.sgate)
+        if !route(l, f) {
+            return
+        }
+    }
+}
+
+fn release(l: *Link) {
+    sync.lock(l.sgate)
+    var open: *ChanState[] = []
+    for id, c in l.channels {
+        open.push(c)
+    }
+    l.channels = [:]
+    sync.unlock(l.sgate)
+    for c in open {
+        end_channel(c)
+    }
+    close(l.notices)
+}
+
+fn end_channel(c: *ChanState) {
+    sync.lock(c.link.sgate)
+    let first = !c.ended
+    c.ended = true
+    sync.unlock(c.link.sgate)
+    if !first {
+        return
+    }
+    for cs in take_consumers(c) {
+        close(cs.deliveries)
+    }
+    close(c.returns)
+}
+
+fn take_consumers(c: *ChanState) -> *ConsumerState[] {
+    sync.lock(c.link.sgate)
+    var out: *ConsumerState[] = []
+    for tag, cs in c.consumers {
+        out.push(cs)
+    }
+    c.consumers = [:]
+    sync.unlock(c.link.sgate)
+    out
+}
+
+fn route(l: *Link, f: Frame) -> bool {
+    if f.kind == frame_heartbeat {
+        return true
+    }
+    if f.channel == 0 {
+        return connection_frame(l, f)
+    }
+    sync.lock(l.sgate)
+    let found = l.channels[f.channel]
+    sync.unlock(l.sgate)
+    match found {
+        some(c) => channel_frame(l, c, f)
+        none => true
+    }
+}
+
+fn protocol_error(l: *Link) -> bool {
+    shut(l, some(Protocol))
+    false
+}
+
+fn connection_frame(l: *Link, f: Frame) -> bool {
+    if f.kind != frame_method {
+        return protocol_error(l)
+    }
+    let m = decode_method(f.payload) catch {
+        e => {
+            shut(l, some(e))
+            return false
+        }
+    }
+    match m {
+        ConnectionClose(code, reply, class_id, method_id) => {
+            let ok = method_frame(0, Method.ConnectionCloseOk) or []
+            send(l, ok) or {}
+            shut(l, some(ConnectionClosed(code, reply)))
+            false
+        }
+        ConnectionCloseOk => {
+            shut(l, none)
+            false
+        }
+        ConnectionBlocked(reason) => {
+            sync.lock(l.sgate)
+            l.blocked = some(reason)
+            sync.unlock(l.sgate)
+            notify(l, Notice.Blocked(reason))
+            true
+        }
+        ConnectionUnblocked => {
+            sync.lock(l.sgate)
+            l.blocked = none
+            sync.unlock(l.sgate)
+            notify(l, Notice.Unblocked)
+            true
+        }
+        _ => protocol_error(l)
+    }
+}
+
+fn notify(l: *Link, n: Notice) {
+    select {
+        l.notices <- n => {}
+        else => {}
+    }
+}
+
+fn channel_frame(l: *Link, c: *ChanState, f: Frame) -> bool {
+    if f.kind == frame_method {
+        let m = decode_method(f.payload) catch {
+            e => {
+                shut(l, some(e))
+                return false
+            }
+        }
+        return on_method(l, c, m)
+    }
+    if f.kind == frame_header {
+        return on_header(l, c, f.payload)
+    }
+    on_body(l, c, f.payload)
+}
+
+fn on_method(l: *Link, c: *ChanState, m: Method) -> bool {
+    match m {
+        BasicDeliver(tag, delivery_tag, redelivered, exchange, key) => begin_content(l, c, m)
+        BasicReturn(code, reply, exchange, key) => begin_content(l, c, m)
+        BasicGetOk(delivery_tag, redelivered, exchange, key, remaining) => begin_content(l, c, m)
+        BasicAck(tag, multiple) => {
+            resolve(c, tag, multiple, true)
+            true
+        }
+        BasicNack(tag, multiple, requeue) => {
+            resolve(c, tag, multiple, false)
+            true
+        }
+        BasicCancel(tag, no_wait) => cancelled_by_broker(l, c, tag, no_wait)
+        BasicCancelOk(tag) => {
+            drop_consumer(c, tag)
+            reply(c, Reply.Answer(m))
+            true
+        }
+        ChannelFlow(active) => {
+            sync.lock(l.sgate)
+            c.active = active
+            sync.unlock(l.sgate)
+            send_method(c, Method.ChannelFlowOk(active)) or {}
+            true
+        }
+        ChannelClose(code, text, class_id, method_id) => {
+            send_method(c, Method.ChannelCloseOk) or {}
+            retire(l, c, ChannelClosed(code, text))
+            true
+        }
+        ChannelCloseOk => {
+            reply(c, Reply.Answer(m))
+            retire(l, c, Closed)
+            true
+        }
+        _ => {
+            reply(c, Reply.Answer(m))
+            true
+        }
+    }
+}
+
+fn reply(c: *ChanState, r: Reply) {
+    sync.lock(c.link.sgate)
+    if !c.closed {
+        select {
+            c.replies <- r => {}
+            else => {}
+        }
+    }
+    sync.unlock(c.link.sgate)
+}
+
+fn retire(l: *Link, c: *ChanState, cause: Error) {
+    sync.lock(l.sgate)
+    fail_channel(c, cause)
+    let present = l.channels[c.id] != none
+    l.channels.delete(c.id)
+    sync.unlock(l.sgate)
+    if present {
+        end_channel(c)
+    }
+}
+
+fn expire_channel(l: *Link, c: *ChanState, cause: Error) {
+    sync.lock(l.sgate)
+    let open = !c.closed && l.channels[c.id] != none
+    fail_channel(c, cause)
+    sync.unlock(l.sgate)
+    end_channel(c)
+    if !open {
+        return
+    }
+    let close_frame = method_frame(c.id, Method.ChannelClose(200, "", 0, 0)) or return
+    send(l, close_frame) or {}
+}
+
+fn drop_consumer(c: *ChanState, tag: str) {
+    match take_consumer(c, tag) {
+        some(cs) => close(cs.deliveries)
+        none => {}
+    }
+}
+
+fn take_consumer(c: *ChanState, tag: str) -> *ConsumerState? {
+    sync.lock(c.link.sgate)
+    let found = c.consumers[tag]
+    c.consumers.delete(tag)
+    sync.unlock(c.link.sgate)
+    found
+}
+
+fn cancelled_by_broker(l: *Link, c: *ChanState, tag: str, no_wait: bool) -> bool {
+    drop_consumer(c, tag)
+    if !no_wait {
+        send_method(c, Method.BasicCancelOk(tag)) or {}
+    }
+    true
+}
+
+fn resolve(c: *ChanState, tag: i64, multiple: bool, acked: bool) {
+    sync.lock(c.link.sgate)
+    if !c.closed {
+        for seq, pending in c.confirms {
+            if !pending.resolved && (seq == tag || (multiple && seq < tag)) {
+                pending.resolved = true
+                select {
+                    pending.done <- acked => {}
+                    else => {}
+                }
+            }
+        }
+    }
+    sync.unlock(c.link.sgate)
+}
+
+fn begin_content(l: *Link, c: *ChanState, m: Method) -> bool {
+    if c.pending != none {
+        return protocol_error(l)
+    }
+    c.pending = some(new(Pending { method: m, properties: Properties {}, size: 0, body: [], headed: false }))
+    true
+}
+
+fn on_header(l: *Link, c: *ChanState, payload: u8[]) -> bool {
+    let p = c.pending ?? return protocol_error(l)
+    if p.headed {
+        return protocol_error(l)
+    }
+    let h = decode_header(payload) catch {
+        e => {
+            shut(l, some(e))
+            return false
+        }
+    }
+    if h.size > l.max_message {
+        shut(l, some(TooLarge))
+        return false
+    }
+    p.properties = h.properties
+    p.size = h.size
+    p.headed = true
+    if p.size == 0 {
+        return finish(l, c, p)
+    }
+    true
+}
+
+fn on_body(l: *Link, c: *ChanState, payload: u8[]) -> bool {
+    let p = c.pending ?? return protocol_error(l)
+    if !p.headed || p.body.len + payload.len > p.size {
+        return protocol_error(l)
+    }
+    io.append(mut p.body, payload)
+    if p.body.len == p.size {
+        return finish(l, c, p)
+    }
+    true
+}
+
+fn finish(l: *Link, c: *ChanState, p: *Pending) -> bool {
+    c.pending = none
+    match p.method {
+        BasicDeliver(tag, delivery_tag, redelivered, exchange, key) => {
+            let d = Delivery {
+                consumer_tag: tag
+                delivery_tag
+                redelivered
+                exchange
+                routing_key: key
+                properties: p.properties
+                body: p.body
+                remaining: 0
+                channel: c
+            }
+            offer(l, c, d)
+        }
+        BasicGetOk(delivery_tag, redelivered, exchange, key, remaining) => {
+            let d = Delivery {
+                consumer_tag: ""
+                delivery_tag
+                redelivered
+                exchange
+                routing_key: key
+                properties: p.properties
+                body: p.body
+                remaining
+                channel: c
+            }
+            reply(c, Reply.Got(d))
+            true
+        }
+        BasicReturn(code, text, exchange, key) => {
+            let r = Return { code, text, exchange, routing_key: key, properties: p.properties, body: p.body }
+            select {
+                c.returns <- r => {}
+                else => {}
+            }
+            true
+        }
+        _ => protocol_error(l)
+    }
+}
+
+fn offer(l: *Link, c: *ChanState, d: Delivery) -> bool {
+    sync.lock(l.sgate)
+    let found = c.consumers[d.consumer_tag]
+    sync.unlock(l.sgate)
+    let cs = found ?? return true
+    if cs.cancelling {
+        return decline(c, cs, d)
+    }
+    sync.lock(l.sgate)
+    l.delivering = true
+    sync.unlock(l.sgate)
+    var stopped = false
+    var declined = false
+    select {
+        cs.deliveries <- d => {}
+        <-cs.quit => {
+            declined = true
+        }
+        <-l.stop => {
+            stopped = true
+        }
+    }
+    sync.lock(l.sgate)
+    l.delivering = false
+    l.last_read = now_ms()
+    sync.unlock(l.sgate)
+    if declined {
+        return decline(c, cs, d)
+    }
+    !stopped
+}
+
+fn decline(c: *ChanState, cs: *ConsumerState, d: Delivery) -> bool {
+    if !cs.no_ack {
+        send_method(c, Method.BasicNack(d.delivery_tag, false, true)) or {}
+    }
+    true
+}
+
+fn stop_consumer(c: *ChanState, cs: *ConsumerState) {
+    sync.lock(c.link.sgate)
+    if !cs.cancelling {
+        cs.cancelling = true
+        close(cs.quit)
+    }
+    sync.unlock(c.link.sgate)
+}
