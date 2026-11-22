@@ -1498,6 +1498,7 @@ rt_gc:
 	mov edi, TICK_MARKED
 	call rt_gc_stamp
 	call rt_region_reclaim
+	call rt_region_pending_queue
 	call rt_sweep
 	mov edi, TICK_SWEPT
 	call rt_gc_stamp

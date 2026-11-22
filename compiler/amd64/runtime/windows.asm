@@ -268,6 +268,17 @@ rt_futex_wait:
 	OS_LEAVE
 	ret
 
+rt_futex_wait_idle:
+	OS_ENTER
+	mov [rsp+48], esi
+	mov rcx, rdi
+	lea rdx, [rsp+48]
+	mov r8d, 4
+	mov r9d, REGION_KEEP_IDLE_NS/1000000
+	WIN WaitOnAddress
+	OS_LEAVE
+	ret
+
 rt_futex_wake:
 	OS_ENTER
 	mov rcx, rdi

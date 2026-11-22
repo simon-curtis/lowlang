@@ -307,6 +307,19 @@ rt_futex_wait:
 	syscall
 	ret
 
+rt_futex_wait_idle:
+	mov eax, REGION_KEEP_IDLE_NS
+	push rax
+	xor eax, eax
+	push rax
+	mov r10, rsp
+	mov eax, 202
+	mov rdx, rsi
+	mov esi, 128
+	syscall
+	add rsp, 16
+	ret
+
 rt_futex_wake:
 	mov eax, 202
 	mov rdx, rsi

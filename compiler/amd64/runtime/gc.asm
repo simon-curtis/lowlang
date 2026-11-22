@@ -49,6 +49,8 @@ rt_rq_count:
 	.zero 8
 rt_rp:
 	.zero 8
+rt_region_pending:
+	.zero 8
 rt_rp_count:
 	.zero 8*21
 
@@ -314,6 +316,78 @@ rt_region_unkeep:
 1:
 	xor eax, eax
 2:
+	ret
+
+rt_region_keep_idle:
+	push r13
+	push r14
+	push rbp
+	lea r13, [rbx+M_KEEP_FIRST]
+	mov r14d, REGION_FIRST
+	call rt_region_keep_drop
+	lea r13, [rbx+M_KEEP_NEXT]
+	mov r14d, REGION_NEXT
+	call rt_region_keep_drop
+	pop rbp
+	pop r14
+	pop r13
+	ret
+
+rt_region_keep_drop:
+	mov rbp, [r13]
+	test rbp, rbp
+	jz 1f
+	mov rdi, rbp
+	call rt_region_link
+	mov rdx, [rax]
+	mov [r13], rdx
+	mov rdi, rbp
+	mov ecx, r14d
+	mov esi, 65536
+	shl rsi, cl
+	call rt_region_decommit
+	mov rdi, rbp
+	call rt_region_link
+	mov [rax+8], r14
+	mov rcx, rax
+	mov rax, [rip+rt_region_pending]
+2:
+	mov [rcx], rax
+	lock cmpxchg [rip+rt_region_pending], rbp
+	jne 2b
+	jmp rt_region_keep_drop
+1:
+	ret
+
+rt_region_pending_queue:
+	xor eax, eax
+	xchg [rip+rt_region_pending], rax
+1:
+	test rax, rax
+	jz 2f
+	mov r8, rax
+	mov rdi, r8
+	call rt_region_link
+	mov r9, [rax]
+	mov rsi, [rax+8]
+	mov rdi, r8
+	call rt_region_queue
+	mov rax, r9
+	jmp 1b
+2:
+	ret
+
+rt_region_queue:
+	mov rax, rdi
+	sub rax, [rip+rt_region_start]
+	shr rax, REGION_SHIFT
+	shl rsi, 32
+	or rax, rsi
+	mov rcx, [rip+rt_rq_count]
+	mov rdx, [rip+rt_rq]
+	mov [rdx+8*rcx], rax
+	inc rcx
+	mov [rip+rt_rq_count], rcx
 	ret
 
 rt_region_chunk:
@@ -719,17 +793,9 @@ rt_region_release:
 	shl rsi, cl
 	call rt_region_decommit
 	call rt_heap_acquire
-	mov rax, rbx
-	sub rax, [rip+rt_region_start]
-	shr rax, REGION_SHIFT
-	mov rdx, r12
-	shl rdx, 32
-	or rax, rdx
-	mov rcx, [rip+rt_rq_count]
-	mov rdx, [rip+rt_rq]
-	mov [rdx+8*rcx], rax
-	inc rcx
-	mov [rip+rt_rq_count], rcx
+	mov rdi, rbx
+	mov esi, r12d
+	call rt_region_queue
 	mov qword ptr [rip+rt_heap_lock], 0
 3:
 	pop r13
