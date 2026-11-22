@@ -88,7 +88,7 @@
 	.set POOL_TAKE, 512
 	.set HUNGRY_MIN, 16
 	.set GCW_SPIN, 4096
-	.set PAR_MIN, 1048576
+	.set PAR_MIN, 262144
 	.set ROOT_BATCH, 8
 	.set SWEEP_WORDS, 8192
 	.set SWEEP_SHIFT, 13
