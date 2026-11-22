@@ -1243,6 +1243,14 @@ rt_alloc_refill:
 	mov r13, rcx
 	jmp 8f
 7:
+	mov rax, [rip+rt_alloc_since]
+	mov rcx, [rip+rt_gc_threshold]
+	shr rcx, 1
+	cmp rax, rcx
+	jb 17f
+	call rt_gc
+	jmp 1b
+17:
 	mov r13, ALLOC_BUFFER
 	mov rax, [rip+rt_heap_bump]
 	lea rdx, [rax+8*ALLOC_BUFFER]
@@ -1336,6 +1344,16 @@ rt_alloc_body:
 	mov rsi, rdx
 	jmp 6f
 5:
+	mov rax, [rip+rt_alloc_since]
+	mov rcx, [rip+rt_gc_threshold]
+	shr rcx, 1
+	cmp rax, rcx
+	jb 9f
+	push rsi
+	call rt_gc
+	pop rsi
+	jmp 1b
+9:
 	push rsi
 	call rt_heap_release
 	pop rsi
