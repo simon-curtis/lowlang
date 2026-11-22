@@ -1340,6 +1340,19 @@ rt_schedule:
 	call rt_gc_wait
 	jmp 7b
 8:
+	mov rax, [rbx+M_KEEP_FIRST]
+	or rax, [rbx+M_KEEP_NEXT]
+	jz 23f
+	lea rdi, [rbx+M_PARK]
+	xor esi, esi
+	call rt_futex_wait_idle
+	cmp qword ptr [rbx+M_PARK], 0
+	jne 7b
+	cmp dword ptr [rip+rt_stop], 0
+	jne 7b
+	call rt_region_keep_idle
+	jmp 7b
+23:
 	lea rdi, [rbx+M_PARK]
 	xor esi, esi
 	call rt_futex_wait

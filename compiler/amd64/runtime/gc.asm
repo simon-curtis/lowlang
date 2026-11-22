@@ -49,12 +49,10 @@ rt_rq_count:
 	.zero 8
 rt_rp:
 	.zero 8
+rt_region_pending:
+	.zero 8
 rt_rp_count:
 	.zero 8*21
-rt_region_spare:
-	.zero 8*21
-rt_region_spare_bytes:
-	.zero 8
 
 	.text
 rt_gc_env:
@@ -320,6 +318,78 @@ rt_region_unkeep:
 2:
 	ret
 
+rt_region_keep_idle:
+	push r13
+	push r14
+	push rbp
+	lea r13, [rbx+M_KEEP_FIRST]
+	mov r14d, REGION_FIRST
+	call rt_region_keep_drop
+	lea r13, [rbx+M_KEEP_NEXT]
+	mov r14d, REGION_NEXT
+	call rt_region_keep_drop
+	pop rbp
+	pop r14
+	pop r13
+	ret
+
+rt_region_keep_drop:
+	mov rbp, [r13]
+	test rbp, rbp
+	jz 1f
+	mov rdi, rbp
+	call rt_region_link
+	mov rdx, [rax]
+	mov [r13], rdx
+	mov rdi, rbp
+	mov ecx, r14d
+	mov esi, 65536
+	shl rsi, cl
+	call rt_region_decommit
+	mov rdi, rbp
+	call rt_region_link
+	mov [rax+8], r14
+	mov rcx, rax
+	mov rax, [rip+rt_region_pending]
+2:
+	mov [rcx], rax
+	lock cmpxchg [rip+rt_region_pending], rbp
+	jne 2b
+	jmp rt_region_keep_drop
+1:
+	ret
+
+rt_region_pending_queue:
+	xor eax, eax
+	xchg [rip+rt_region_pending], rax
+1:
+	test rax, rax
+	jz 2f
+	mov r8, rax
+	mov rdi, r8
+	call rt_region_link
+	mov r9, [rax]
+	mov rsi, [rax+8]
+	mov rdi, r8
+	call rt_region_queue
+	mov rax, r9
+	jmp 1b
+2:
+	ret
+
+rt_region_queue:
+	mov rax, rdi
+	sub rax, [rip+rt_region_start]
+	shr rax, REGION_SHIFT
+	shl rsi, 32
+	or rax, rsi
+	mov rcx, [rip+rt_rq_count]
+	mov rdx, [rip+rt_rq]
+	mov [rdx+8*rcx], rax
+	inc rcx
+	mov [rip+rt_rq_count], rcx
+	ret
+
 rt_region_chunk:
 	push rbx
 	push r12
@@ -334,24 +404,6 @@ rt_region_chunk:
 	jnz 5f
 .endif
 	call rt_heap_acquire
-.if RT_REGION_GUARD
-.else
-	lea rcx, [rip+rt_region_spare]
-	mov rdi, [rcx+8*rbx]
-	test rdi, rdi
-	jz 7f
-	call rt_region_link
-	mov rdx, [rax]
-	mov [rcx+8*rbx], rdx
-	mov ecx, ebx
-	mov edx, 65536
-	shl rdx, cl
-	sub [rip+rt_region_spare_bytes], rdx
-	mov qword ptr [rip+rt_heap_lock], 0
-	mov rax, rdi
-	jmp 5f
-7:
-.endif
 	xor r13d, r13d
 1:
 	mov esi, ebx
@@ -725,6 +777,21 @@ rt_region_release:
 	inc r9
 	mov [rax+8], r9
 	mov [r13], rbx
+	cmp r12d, REGION_NEXT
+	jne 7f
+	lea rdi, [rbx+REGION_KEEP_RESIDENT]
+	mov rsi, [rbx+CH_DIRTY]
+	cmp rsi, rdi
+	jbe 7f
+	add rsi, 4095
+	and rsi, -4096
+	sub rsi, rdi
+	call rt_region_trim
+	test rax, rax
+	jnz 7f
+	lea rax, [rbx+REGION_KEEP_RESIDENT]
+	mov [rbx+CH_DIRTY], rax
+7:
 .if RT_REGION_GUARD
 	mov rdi, rbx
 	mov ecx, r12d
@@ -735,48 +802,15 @@ rt_region_release:
 .endif
 	jmp 3f
 2:
-.if RT_REGION_GUARD
-.else
-	cmp r12d, REGION_NEXT
-	ja 5f
-	mov ecx, r12d
-	mov r13d, 65536
-	shl r13, cl
-	call rt_heap_acquire
-	mov rax, [rip+rt_region_spare_bytes]
-	add rax, r13
-	cmp rax, REGION_SPARE_LIMIT
-	ja 4f
-	mov [rip+rt_region_spare_bytes], rax
-	mov rdi, rbx
-	call rt_region_link
-	lea rcx, [rip+rt_region_spare]
-	mov rdx, [rcx+8*r12]
-	mov [rax], rdx
-	mov [rcx+8*r12], rbx
-	mov qword ptr [rip+rt_heap_lock], 0
-	jmp 3f
-4:
-	mov qword ptr [rip+rt_heap_lock], 0
-5:
-.endif
 	mov rdi, rbx
 	mov ecx, r12d
 	mov esi, 65536
 	shl rsi, cl
 	call rt_region_decommit
 	call rt_heap_acquire
-	mov rax, rbx
-	sub rax, [rip+rt_region_start]
-	shr rax, REGION_SHIFT
-	mov rdx, r12
-	shl rdx, 32
-	or rax, rdx
-	mov rcx, [rip+rt_rq_count]
-	mov rdx, [rip+rt_rq]
-	mov [rdx+8*rcx], rax
-	inc rcx
-	mov [rip+rt_rq_count], rcx
+	mov rdi, rbx
+	mov esi, r12d
+	call rt_region_queue
 	mov qword ptr [rip+rt_heap_lock], 0
 3:
 	pop r13

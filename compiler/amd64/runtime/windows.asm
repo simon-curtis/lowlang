@@ -7,6 +7,8 @@
 	.p2align 3
 rt_tls_slot:
 	.zero 8
+rt_release_bin:
+	.zero 8
 rt_qpc_freq:
 	.zero 8
 rt_heap_committed:
@@ -142,6 +144,17 @@ rt_mmap_sparse:
 rt_heap_release:
 	ret
 
+rt_release_floor:
+	mov qword ptr [rip+rt_release_bin], 256
+	ret
+
+rt_prefault:
+	ret
+
+rt_release_chunk:
+	xor r10d, r10d
+	ret
+
 rt_mmap_stack:
 	OS_ENTER
 	xor ecx, ecx
@@ -173,6 +186,10 @@ rt_region_commit:
 	mov rcx, rdi
 	mov rdx, rsi
 	jmp rt_commit
+
+rt_region_trim:
+	mov rax, -1
+	ret
 
 rt_region_stash:
 rt_region_decommit:
@@ -264,6 +281,17 @@ rt_futex_wait:
 	lea rdx, [rsp+48]
 	mov r8d, 4
 	mov r9d, -1
+	WIN WaitOnAddress
+	OS_LEAVE
+	ret
+
+rt_futex_wait_idle:
+	OS_ENTER
+	mov [rsp+48], esi
+	mov rcx, rdi
+	lea rdx, [rsp+48]
+	mov r8d, 4
+	mov r9d, REGION_KEEP_IDLE_NS/1000000
 	WIN WaitOnAddress
 	OS_LEAVE
 	ret

@@ -20,6 +20,8 @@ rt_poll_lock:
 	.zero 8
 rt_scratch:
 	.zero 128
+rt_release_bin:
+	.zero 8
 
 	.text
 rt_write:
@@ -127,7 +129,6 @@ rt_env_byte:
 	xor eax, eax
 	ret
 
-rt_mmap_stack:
 rt_mmap:
 	xor edi, edi
 	mov edx, 3
@@ -167,6 +168,12 @@ rt_region_stash:
 	syscall
 	ret
 
+rt_region_trim:
+	mov edx, 4
+	mov eax, 28
+	syscall
+	ret
+
 rt_region_decommit:
 	push rdi
 	push rsi
@@ -180,6 +187,7 @@ rt_region_decommit:
 	syscall
 	ret
 
+rt_mmap_stack:
 rt_mmap_sparse:
 	push rsi
 	call rt_mmap
@@ -192,11 +200,75 @@ rt_mmap_sparse:
 	pop rax
 	ret
 
+rt_release_floor:
+	push rax
+	mov eax, BIN_RELEASE
+	mov rcx, [rip+rt_heap_bump]
+	sub rcx, [rip+rt_heap_start]
+	shr rcx, 3
+	mov rdx, [rip+rt_live_words]
+	add rdx, rdx
+	cmp rdx, rcx
+	jae 1f
+	mov eax, BIN_RELEASE_SPARSE
+1:
+	mov [rip+rt_release_bin], rax
+	pop rax
+	ret
+
+rt_prefault:
+	add rdi, 4095
+	and rdi, -4096
+	and rsi, -4096
+	sub rsi, rdi
+	jbe 1f
+	mov edx, 23
+	mov eax, 28
+	syscall
+1:
+	ret
+
+rt_release_chunk:
+	push rdi
+	push rsi
+	push rax
+	push r11
+	lea r8, [rdi+8*rsi]
+	and r8, -4096
+	lea rdi, [rdi+16+4095]
+	and rdi, -4096
+	mov rsi, r8
+	sub rsi, rdi
+	push r8
+	mov edx, 4
+	mov eax, 28
+	syscall
+	pop r8
+	xor r10d, r10d
+	test rax, rax
+	jnz 1f
+	mov rcx, [rip+rt_heap_start]
+	sub rdi, rcx
+	shr rdi, PAGE_SHIFT
+	sub r8, rcx
+	shr r8, PAGE_SHIFT
+	dec r8
+	mov rsi, r8
+	call rt_page_clear
+	mov r10d, BIN_CLEAN
+1:
+	pop r11
+	pop rax
+	pop rsi
+	pop rdi
+	ret
+
 rt_heap_release:
 	push rbx
 	push r12
 	push r13
-	mov ebx, BIN_RELEASE
+	call rt_release_floor
+	mov rbx, [rip+rt_release_bin]
 1:
 	mov rdi, rbx
 	lea rsi, [rip+rt_bin_bits]
@@ -305,6 +377,19 @@ rt_futex_wait:
 	mov esi, 128
 	xor r10d, r10d
 	syscall
+	ret
+
+rt_futex_wait_idle:
+	mov eax, REGION_KEEP_IDLE_NS
+	push rax
+	xor eax, eax
+	push rax
+	mov r10, rsp
+	mov eax, 202
+	mov rdx, rsi
+	mov esi, 128
+	syscall
+	add rsp, 16
 	ret
 
 rt_futex_wake:
