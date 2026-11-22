@@ -2192,11 +2192,11 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
 - Dirty pages:
   - A bitmap with one bit per 4096-byte heap page records which pages may hold non-zero words. Pages never handed out are zero from the operating system and are clean.
   - An allocation zeroes only the dirty pages of its range and then marks the whole range dirty, so a large zeroed object that is never written costs no resident memory.
-  - Every free chunk of 1 MB or more whose interior pages are all clean is filed in a clean bin.
+  - Every free chunk of 256 KB or more whose interior pages are all clean is filed in a clean bin.
 - Returning memory:
-  - Before the heap end moves for an allocation, every dirty free chunk of at least 1 MB returns its whole interior pages to the operating system on Linux with `madvise(MADV_DONTNEED)`, clears their dirty bits and moves to a clean bin.
+  - After every collection's sweep, and before the heap end moves for an allocation, every dirty free chunk of at least 256 KB returns its whole interior pages to the operating system on Linux with `madvise(MADV_DONTNEED)`, clears their dirty bits and moves to a clean bin.
   - The walk starts at the first bin that can hold such a chunk and visits dirty bins only, so a chunk is advised once and not again until it is reused and freed.
-  - Resident memory holds the live objects and the new one rather than also the chunks that were too small.
+  - Resident memory holds the live objects and the chunks too small to return, rather than also the garbage the last collection freed.
   - On Windows the pages stay committed and chunks stay dirty.
 - Collection runs when the words allocated since the last one exceed the words that survived it, with a 4 MB floor. An allocation that would move the heap end collects first once the words allocated since the last collection reach half that threshold, so the heap grows only when the free chunks a collection leaves cannot hold the allocation. A thread's allocation buffer counts by the size of the chunk it receives, so refilling from small free chunks after a sweep counts no more than the memory handed out. Region allocation does not count.
 - Regions (`region { ... }`, see `### Regions`) allocate outside the heap:

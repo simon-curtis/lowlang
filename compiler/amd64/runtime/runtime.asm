@@ -1518,6 +1518,7 @@ rt_gc:
 	call rt_region_reclaim
 	call rt_region_pending_queue
 	call rt_sweep
+	call rt_heap_release
 	mov edi, TICK_SWEPT
 	call rt_gc_stamp
 	call rt_world_start
