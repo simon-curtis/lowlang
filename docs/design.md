@@ -2150,7 +2150,7 @@ Standard library:
 - It lives in `std/` and is embedded in `low` with `embed_dir`.
 - An import whose path is `std` or starts with `std/` is read from there, never from the project root.
 - Its files are lexed like the prelude, so they may use `__` names and intrinsics, and they are left out of the sources `low dev` watches.
-- `embed` in a standard library file reads from the embedded tree. The unit holds the bytes of each standard embedded file and each file the overlay holds unsaved, by path, and the content hash of every other embedded file. The assembler resolves `.incbin` from the held bytes first and otherwise reads the file, failing when its hash differs from the one the unit holds; WebAssembly generation reads each other file again through the overlay with the same check. The assembler creates `.rodata` with room for the bytes of every embedded file and a quarter more, so appending the files does not copy the section as it grows.
+- `embed` in a standard library file reads from the embedded tree. The unit holds the bytes of each standard embedded file and each file the overlay holds unsaved, by path, and the content hash of every other embedded file. The assembler resolves `.incbin` from the held bytes first and otherwise reads the file in 64 KiB pieces straight into the section, failing when the hash of the appended bytes differs from the one the unit holds; WebAssembly generation reads each other file again through the overlay with the same check. The assembler creates `.rodata` with room for the bytes of every embedded file and a quarter more, so appending the files does not copy the section as it grows.
 
 Standard library intrinsics:
 
