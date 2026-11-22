@@ -1246,6 +1246,10 @@ rt_alloc_refill:
 	mov rax, [rip+rt_alloc_since]
 	mov rcx, [rip+rt_gc_threshold]
 	shr rcx, 1
+	cmp rcx, GROW_TIGHT
+	jb 47f
+	shr rcx, 1
+47:
 	cmp rax, rcx
 	jb 17f
 	call rt_gc
@@ -1347,6 +1351,10 @@ rt_alloc_body:
 	mov rax, [rip+rt_alloc_since]
 	mov rcx, [rip+rt_gc_threshold]
 	shr rcx, 1
+	cmp rcx, GROW_TIGHT
+	jb 47f
+	shr rcx, 1
+47:
 	cmp rax, rcx
 	jb 9f
 	push rsi
