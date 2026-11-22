@@ -7,6 +7,8 @@
 	.p2align 3
 rt_tls_slot:
 	.zero 8
+rt_release_bin:
+	.zero 8
 rt_qpc_freq:
 	.zero 8
 rt_heap_committed:
@@ -140,6 +142,17 @@ rt_mmap_sparse:
 	jmp rt_mmap
 
 rt_heap_release:
+	ret
+
+rt_release_floor:
+	mov qword ptr [rip+rt_release_bin], 256
+	ret
+
+rt_prefault:
+	ret
+
+rt_release_chunk:
+	xor r10d, r10d
 	ret
 
 rt_mmap_stack:

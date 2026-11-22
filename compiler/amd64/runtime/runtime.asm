@@ -734,6 +734,15 @@ rt_link_chunk:
 	mov r10d, BIN_CLEAN
 2:
 	call rt_bin_of
+	test r10, r10
+	jnz 6f
+	cmp rax, [rip+rt_release_bin]
+	jb 6f
+	lea rcx, [rip+rt_bins]
+	cmp r11, rcx
+	je 6f
+	call rt_release_chunk
+6:
 	add rax, r10
 	mov rcx, r11
 	mov rdx, [rcx+8*rax]
@@ -958,6 +967,29 @@ rt_page_write:
 	cmp rdi, rsi
 	jbe 1b
 	ret
+
+rt_zero_buffer:
+	push rdi
+	push rsi
+	mov rax, [rip+rt_heap_start]
+	lea rcx, [rdi+8*rsi-1]
+	sub rcx, rax
+	shr rcx, PAGE_SHIFT
+	sub rdi, rax
+	shr rdi, PAGE_SHIFT
+	mov rsi, rcx
+	mov rdx, -1
+	call rt_page_scan
+	cmp rax, rsi
+	ja 1f
+	mov rdi, [rsp+8]
+	mov rsi, [rsp]
+	lea rsi, [rdi+8*rsi]
+	call rt_prefault
+1:
+	pop rsi
+	pop rdi
+	jmp rt_zero_range
 
 rt_zero_range:
 	push rbx
@@ -1277,7 +1309,7 @@ rt_alloc_refill:
 	mov qword ptr [rip+rt_heap_lock], 0
 	mov rdi, [rbx+M_ALLOC_CUR]
 	mov rsi, r13
-	call rt_zero_range
+	call rt_zero_buffer
 	pop r13
 	pop r12
 	pop rbx
@@ -2293,6 +2325,7 @@ rt_sweep:
 	shr rax, SWEEP_SHIFT
 	mov [rip+rt_gcw_sweep_count], rax
 	mov qword ptr [rip+rt_gcw_sweep_next], 0
+	call rt_release_floor
 	test rax, rax
 	jz 1f
 	mov rdi, [rip+rt_gcw_sweep_desc]
