@@ -127,7 +127,6 @@ rt_env_byte:
 	xor eax, eax
 	ret
 
-rt_mmap_stack:
 rt_mmap:
 	xor edi, edi
 	mov edx, 3
@@ -180,6 +179,7 @@ rt_region_decommit:
 	syscall
 	ret
 
+rt_mmap_stack:
 rt_mmap_sparse:
 	push rsi
 	call rt_mmap
