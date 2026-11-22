@@ -55,6 +55,7 @@ Source at release N compiles with release N-1, so the compiler cannot use a lang
 - A struct copy is `new(*p)`. `ast/clone.low` copies each node that way and then replaces its children.
 - A local cannot share the name of a function it calls, and a function cannot be named after a keyword or a type.
 - An enum converts to an integer only through `.index`, which needs `= n` on every variant.
+- A `diag.Pos` is read through `pos_file`, `pos_line` and `pos_col` and built with `diag.pos_in` or `at_col`.
 - `diag.quote` and `diag.quote_char` format a string with escapes and quotes. `lexer.quote` is the dump format.
 - The compiler runs on a 1 MB green thread stack, so no pass recurses once per link of a left-deep binary chain or an `else if` chain. `ast.left_spine` and `ast.else_chain` list the links outermost first; a pass visits them in a loop with open and close steps (`ir.binary`, `ir.if_expr`, `check.binary`, `check.if_expr`), and the walkers, printers and clones iterate the same lists. The same holds for the SSA reader (`ir.read_recursive`) and the optimiser's dominator walk (`ir.visit`), which keep their own frames. `testdata/run/long_chains.low` and `testdata/fail/long_chain_error.low` hold chains of 20,000 terms.
 - Assignments are statements: a `match` arm that assigns takes a `{ }` block.
