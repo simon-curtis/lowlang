@@ -2194,7 +2194,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
   - An allocation zeroes only the dirty pages of its range and then marks the whole range dirty, so a large zeroed object that is never written costs no resident memory.
   - Every free chunk of 256 KB or more whose interior pages are all clean is filed in a clean bin.
 - Returning memory:
-  - After every collection's sweep, and before the heap end moves for an allocation, every dirty free chunk of at least 256 KB returns its whole interior pages to the operating system on Linux with `madvise(MADV_DONTNEED)`, clears their dirty bits and moves to a clean bin.
+  - After every collection's sweep, and before the heap end moves for an allocation, every dirty free chunk of at least 256 KB returns its whole interior pages to the operating system on Linux with `madvise(MADV_DONTNEED)`, clears their dirty bits and moves to a clean bin. While the last collection's live words are under half the heap, the floor is 16 KB, so a heap that has shrunk to a fraction of its size does not keep its free fragments resident.
   - The walk starts at the first bin that can hold such a chunk and visits dirty bins only, so a chunk is advised once and not again until it is reused and freed.
   - Resident memory holds the live objects and the chunks too small to return, rather than also the garbage the last collection freed.
   - On Windows the pages stay committed and chunks stay dirty.

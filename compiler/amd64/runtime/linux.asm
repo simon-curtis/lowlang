@@ -197,6 +197,14 @@ rt_heap_release:
 	push r12
 	push r13
 	mov ebx, BIN_RELEASE
+	mov rax, [rip+rt_heap_bump]
+	sub rax, [rip+rt_heap_start]
+	shr rax, 3
+	mov rcx, [rip+rt_live_words]
+	add rcx, rcx
+	cmp rcx, rax
+	jae 1f
+	mov ebx, BIN_RELEASE_SPARSE
 1:
 	mov rdi, rbx
 	lea rsi, [rip+rt_bin_bits]
