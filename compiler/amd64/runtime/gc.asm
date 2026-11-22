@@ -51,10 +51,6 @@ rt_rp:
 	.zero 8
 rt_rp_count:
 	.zero 8*21
-rt_region_spare:
-	.zero 8*21
-rt_region_spare_bytes:
-	.zero 8
 
 	.text
 rt_gc_env:
@@ -334,24 +330,6 @@ rt_region_chunk:
 	jnz 5f
 .endif
 	call rt_heap_acquire
-.if RT_REGION_GUARD
-.else
-	lea rcx, [rip+rt_region_spare]
-	mov rdi, [rcx+8*rbx]
-	test rdi, rdi
-	jz 7f
-	call rt_region_link
-	mov rdx, [rax]
-	mov [rcx+8*rbx], rdx
-	mov ecx, ebx
-	mov edx, 65536
-	shl rdx, cl
-	sub [rip+rt_region_spare_bytes], rdx
-	mov qword ptr [rip+rt_heap_lock], 0
-	mov rax, rdi
-	jmp 5f
-7:
-.endif
 	xor r13d, r13d
 1:
 	mov esi, ebx
@@ -735,31 +713,6 @@ rt_region_release:
 .endif
 	jmp 3f
 2:
-.if RT_REGION_GUARD
-.else
-	cmp r12d, REGION_NEXT
-	ja 5f
-	mov ecx, r12d
-	mov r13d, 65536
-	shl r13, cl
-	call rt_heap_acquire
-	mov rax, [rip+rt_region_spare_bytes]
-	add rax, r13
-	cmp rax, REGION_SPARE_LIMIT
-	ja 4f
-	mov [rip+rt_region_spare_bytes], rax
-	mov rdi, rbx
-	call rt_region_link
-	lea rcx, [rip+rt_region_spare]
-	mov rdx, [rcx+8*r12]
-	mov [rax], rdx
-	mov [rcx+8*r12], rbx
-	mov qword ptr [rip+rt_heap_lock], 0
-	jmp 3f
-4:
-	mov qword ptr [rip+rt_heap_lock], 0
-5:
-.endif
 	mov rdi, rbx
 	mov ecx, r12d
 	mov esi, 65536
