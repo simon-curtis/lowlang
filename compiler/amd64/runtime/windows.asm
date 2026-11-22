@@ -187,6 +187,10 @@ rt_region_commit:
 	mov rdx, rsi
 	jmp rt_commit
 
+rt_region_trim:
+	mov rax, -1
+	ret
+
 rt_region_stash:
 rt_region_decommit:
 	OS_ENTER

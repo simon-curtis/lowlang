@@ -777,6 +777,21 @@ rt_region_release:
 	inc r9
 	mov [rax+8], r9
 	mov [r13], rbx
+	cmp r12d, REGION_NEXT
+	jne 7f
+	lea rdi, [rbx+REGION_KEEP_RESIDENT]
+	mov rsi, [rbx+CH_DIRTY]
+	cmp rsi, rdi
+	jbe 7f
+	add rsi, 4095
+	and rsi, -4096
+	sub rsi, rdi
+	call rt_region_trim
+	test rax, rax
+	jnz 7f
+	lea rax, [rbx+REGION_KEEP_RESIDENT]
+	mov [rbx+CH_DIRTY], rax
+7:
 .if RT_REGION_GUARD
 	mov rdi, rbx
 	mov ecx, r12d
